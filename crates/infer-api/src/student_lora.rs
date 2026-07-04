@@ -28,9 +28,12 @@ pub enum LoraHalf {
 /// `(layer_idx, projection, half)`. Returns `None` for non-linear adapters
 /// such as norms or conv state tensors.
 pub fn parse_student_adapter_name(name: &str) -> Option<(usize, StudentLoraProjection, LoraHalf)> {
-    let half = if name.ends_with(".lora_a") {
+    // Two on-disk conventions: the internal `save_lora_adapters` suffix
+    // (`…q_proj.lora_a`) and the PEFT layout `--save-lora-adapters` emits
+    // (`…q_proj.lora_A.weight`). Accept both.
+    let half = if name.ends_with(".lora_a") || name.contains(".lora_A.") {
         LoraHalf::A
-    } else if name.ends_with(".lora_b") {
+    } else if name.ends_with(".lora_b") || name.contains(".lora_B.") {
         LoraHalf::B
     } else {
         return None;
