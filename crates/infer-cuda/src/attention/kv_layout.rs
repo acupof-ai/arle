@@ -210,6 +210,17 @@ impl Dsv4BlockMap {
     pub(crate) fn comp_row(&self, r: usize) -> (usize, usize) {
         (self.sw_blocks + r / self.page_size, r % self.page_size)
     }
+
+    /// SW sub-pool block count — the compressed region's page base.
+    pub(crate) fn sw_blocks(&self) -> usize {
+        self.sw_blocks
+    }
+
+    /// FlashMLA MODEL1 page size (64). The ONE page-size source the pack/index
+    /// kernel params draw from, so `Dsv4BlockMap` and those params cannot drift.
+    pub(crate) fn page_size(&self) -> usize {
+        self.page_size
+    }
 }
 
 pub(crate) struct Dsv4LayerKvLayout {

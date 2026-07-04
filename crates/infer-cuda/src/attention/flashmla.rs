@@ -7,6 +7,17 @@ pub(super) struct Dsv4FlashMlaDecodeShape {
     pub(super) topk_unified: usize,
     pub(super) total_blocks: usize,
     pub(super) h_q: usize,
+    /// FlashMLA MODEL1 page size (== `kv_arena.page_block_size`, asserted 64).
+    /// Stored so the block→(page,row) map and the pack/index kernel params draw
+    /// page size from ONE source (the arena), never a re-typed literal.
+    pub(super) page_block_size: usize,
+}
+
+impl Dsv4FlashMlaDecodeShape {
+    /// The ONE block→(page,row) map for this shape's band.
+    pub(super) fn block_map(&self) -> Dsv4BlockMap {
+        Dsv4BlockMap::new(self.sw_blocks, self.page_block_size)
+    }
 }
 
 impl Dsv4FlashMlaDecodeShape {
@@ -84,6 +95,7 @@ impl Dsv4FlashMlaDecodeShape {
             topk_unified,
             total_blocks,
             h_q,
+            page_block_size: kv_arena.page_block_size,
         })
     }
 }
@@ -95,6 +107,9 @@ pub(crate) struct Dsv4FlashMlaDecodeState {
     pub(super) comp_blocks: usize,
     pub(super) max_compressed_keys: usize,
     pub(super) topk_unified: usize,
+    /// FlashMLA page size (== arena `page_block_size`, asserted 64) — the ONE
+    /// page-size source for this slot's block map and pack/index kernel params.
+    pub(super) page_block_size: usize,
     pub(super) fp8_kv_sw_bootstrapped: bool,
     pub(super) fp8_kv_comp_packed_rows: usize,
     // CONSTANT-after-init scheduler metadata + slot-shape constants. The 13
@@ -177,6 +192,7 @@ impl Dsv4FlashMlaDecodeState {
             comp_blocks: shape.comp_blocks,
             max_compressed_keys: shape.max_compressed_keys,
             topk_unified: shape.topk_unified,
+            page_block_size: shape.page_block_size,
             fp8_kv_sw_bootstrapped: false,
             fp8_kv_comp_packed_rows: 0,
             topk_length: ctx.stream.alloc_zeros::<i32>(1)?,
@@ -242,6 +258,13 @@ impl Dsv4FlashMlaDecodeState {
     /// across a layer's slots); the batched compressed-delta pack's `sw_blocks`.
     pub(crate) fn sw_blocks(&self) -> usize {
         self.sw_blocks
+    }
+
+    /// The ONE block→(page,row) map for this slot's band. The pack/index kernel
+    /// `sw_blocks`/`page_block_size` params draw from this same source so they
+    /// cannot drift from the map (#146 Index-layer single-source).
+    pub(crate) fn block_map(&self) -> Dsv4BlockMap {
+        Dsv4BlockMap::new(self.sw_blocks, self.page_block_size)
     }
 
     /// Exact requested device bytes owned by this per-(slot,layer) FlashMLA
@@ -864,6 +887,8 @@ impl Dsv4FlashMlaDecodeBatchScratch {
             self.max_topk_unified
         );
         let mode_int = flashmla_mode_int(mode);
+        // Single-source sw_blocks / page_block_size for the batched index build.
+        let bmap = shape.block_map();
         let (indices_ptr, indices_guard) = self.indices.device_ptr_mut(&ctx.stream);
         let (start_ptr, start_guard) = self.start_pos.device_ptr(&ctx.stream);
         let (off_ptr, off_guard) = self.slot_block_offsets.device_ptr(&ctx.stream);
@@ -876,7 +901,7 @@ impl Dsv4FlashMlaDecodeBatchScratch {
             selected_ptr,
             topk_ptr,
             n,
-            shape.sw_blocks,
+            bmap.sw_blocks(),
             config.sliding_window,
             shape.max_compressed_keys,
             // GLM SparseIndexed: full-sequence indexer, every token a key
@@ -890,7 +915,7 @@ impl Dsv4FlashMlaDecodeBatchScratch {
                 compress_ratio
             },
             mode_int,
-            64,
+            bmap.page_size(),
             // POOL-absolute offset bound (Phase-B correctness fix). `slot_block_offsets[r]`
             // = slot_idx × shape.total_blocks is a POOL-absolute block offset (the pool
             // packs `num_slots == max_batch` contiguous per-slot bands), so the batched
