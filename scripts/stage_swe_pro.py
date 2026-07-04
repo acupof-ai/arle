@@ -278,9 +278,9 @@ def cmd_stage(args):
         tmp = Path(tempfile.mkdtemp(prefix=f"{iid}.", dir=args.staged_root))
         repo_dir, scratch = tmp / "repo", tmp / "scratch"
         try:
-            extra = SHA_RE.findall(task.get("before_repo_set_cmd") or "")
-            err = clone_at_commit(task["repo"], task["base_commit"], repo_dir,
-                                  extra)
+            # Only base_commit is needed: the git-state lines of
+            # before_repo_set_cmd (which referenced other shas) are dropped below.
+            err = clone_at_commit(task["repo"], task["base_commit"], repo_dir)
             if err:
                 rejected += 1
                 print(f"[stage] {iid}: REJECT clone: {err}", flush=True)
