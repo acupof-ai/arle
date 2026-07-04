@@ -29,6 +29,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 PYTEST_TIMEOUT = 300
@@ -176,8 +177,15 @@ def clone_at_commit(repo, sha, dest, extra_shas=()):
         if s in seen:
             continue
         seen.add(s)
-        r = run(["git", "fetch", "-q", "--depth", "1", "origin", s], dest,
-                timeout=SETUP_TIMEOUT)
+        # Pod egress to github.com is intermittent (transient 443 connect
+        # timeouts drop ~1/3 of fetches). Retry with backoff so a flaky moment
+        # doesn't waste a candidate.
+        for attempt in range(5):
+            r = run(["git", "fetch", "-q", "--depth", "1", "origin", s], dest,
+                    timeout=SETUP_TIMEOUT)
+            if r.returncode == 0:
+                break
+            time.sleep(5 * (attempt + 1))
         if r.returncode != 0 and s == sha:
             return f"git fetch {s[:12]} rc={r.returncode}: {r.stderr.strip()[:200]}"
     r = run(["git", "checkout", "-q", sha], dest, timeout=SETUP_TIMEOUT)
