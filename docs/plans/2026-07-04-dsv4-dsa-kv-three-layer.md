@@ -1,9 +1,12 @@
 # DSv4 DSA KV storage — three-layer redesign (Shape / Index / Physical)
 
-> Status: Active — 2026-07-04. Design ratified with ckl; implementation gated on
-> the #146 attribution dump (confirm the corruption is in the value staging
-> before deleting it — "先归因清楚再推翻"). Supersedes the ad-hoc bf16-shadow +
-> FP8-pool + dsa-key-cache addressing once landed.
+> Status: Active — 2026-07-04. Design ratified with ckl. Deletion-style refactor:
+> the bug CLASS is already attributed (rounds 2-4 — corruption is upstream of the
+> decode read, in the value staging/mapping, **layout-dependent** ⇒ not compute
+> math, which is deterministic across restarts). Deleting the drift-prone parallel
+> maps removes the class whatever the exact off-by; no separate attribution pod
+> round — the new `BlockMap` invariant assert + per-phase needle gate verify it.
+> Supersedes the ad-hoc bf16-shadow + FP8-pool + dsa-key-cache addressing.
 
 ## Why (the problem in one paragraph)
 
@@ -71,14 +74,26 @@ indexer block `k` and value block `k` are the same token range, asserted.
   before any read), `selected[k] ∈ [0, compressed_count)` (already sane per round
   3 — keep it enforced).
 
-## Implementation DAG (file:line)
+## Scope: what is touched, what is NOT
 
-**P0 — attribution gate (precondition, cheap, 1 pod run).** Dump
-`compressor.compressed` bytes for a needle block (~948) vs a good block (~500) at
-end of a >2048 prefill. Zero/stale ⇒ high blocks never written (write-path bug);
-wrong-nonzero ⇒ mis-written (offset/chunk-boundary). Confirms the deletion target
-before we delete it. Probe site: after the prefill compressor in
-`mla_attention_prepare` (`attention.rs:~5155`).
+**Compute kernels are untouched.** Attention math (`flash_fwd_*`), the compressor
+kernels (`dsv4_compressor_block/finalize`), MQA scoring, and every GEMM stay
+byte-for-byte — #146 is a storage/mapping bug, not a math bug. Only two kernel
+classes move, both toward deletion:
+
+- **Mapping kernels** (`dsv4_flashmla_decode_build_indices.cu`,
+  `arle_flashmla_csa_prep.cu` index build): they wrongly recompute block→slot
+  *inside the kernel*. Correct paged-attention form is a host-built page table the
+  kernel blindly consumes (the SW region already does this). These shrink to a
+  page-table lookup or vanish.
+- **The redundant scalar attention lane** (`dsv4_hybrid_attention_*`,
+  `dsv4_swa_attention_*`): deleted wholesale.
+
+Net: Rust-side `BlockMap` + delete/shrink mapping kernels + delete the scalar
+lane. No compute-logic rewrite — the surface is large in file count, small in
+risk.
+
+## Implementation DAG (file:line)
 
 **P1 — introduce the `BlockMap` type (no behavior change).**
 `crates/infer-cuda/src/attention/kv_layout.rs` — add `Dsv4BlockMap { cr, sw_blocks,
@@ -109,13 +124,17 @@ store can demote/promote per page instead of whole-slot blobs
 (`executor.rs:2469` prefix store) — unblocks >200K contexts. Out of this plan's
 scope; noted as the payoff.
 
-## Verification
+## Verification (replaces the dropped P0 attribution round)
 
-Correct-inference gate at each phase: needle retrieval ×3 at the phase's target
-length (2K→8K→32K), MTP-on + spec-none, SGLang as the reference oracle (exact on
-the same checkpoint/quad). A phase that regresses ≤2048 or fails its new length is
-reverted, not patched forward. Bench entry per landed phase (`wins/`), decode
-tok/s A/B to prove the deletion didn't regress the fast path.
+The `BlockMap` invariant assert is the standing substitute for a one-shot
+attribution dump: a residual drift fails LOUD at the boundary instead of
+silently garbling, and it keeps guarding forever. Plus a correct-inference gate
+per phase: needle retrieval ×3 at the phase's target length (2K→8K→32K), MTP-on +
+spec-none, SGLang as the reference oracle (exact on the same checkpoint/quad). A
+phase that regresses ≤2048 or fails its new length is reverted, not patched
+forward — and it is debugged on the CLEAN single-map baseline (which is what
+"root-cause on a clean baseline" wants). Bench entry per landed phase (`wins/`),
+decode tok/s A/B to prove the deletion didn't regress the fast path.
 
 ## Non-goals
 
