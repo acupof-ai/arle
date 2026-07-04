@@ -86,12 +86,18 @@ Physical   page → FP8 pool byte offset                    real memory
 - **P1 ✅** (611d18cd) — `Dsv4BlockMap` collapses the inline comp-row→(page,row) map. Byte-identical.
 - **P2 ✅** (2dd9d07c) — single-source `sw_blocks`/`page_size` from the arena through the pack/index kernels (no host-transform move; the decode kernel already routes via page_table). Byte-identical.
 - **P4 ✅** (2dd9d07c) — CSA-only select-boundary assert `indexer_rows == value_rows`, mode-gated off GLM/frozen.
-- **P3 (remaining) — delete the bf16 value shadow + scalar lane.** Remove
-  `compressor.compressed`'s VALUE-read role and `dsv4_swa/hybrid_attention_*`
-  (kernels + 6 dispatch sites). Compressor packs straight into the FP8 pool via
-  `Dsv4BlockMap`. Precondition: prove `flashmla_used` is unconditionally true for
-  every supported DSv4 mode (else the scalar path is live — stop). Pure hygiene;
-  gate on H20: decode tok/s A/B non-regression + needle ≤2K unchanged (NOT a #146 fix).
+- **P3 — BLOCKED. The scalar lane is a LIVE path, not dead.** The precondition
+  ("prove `flashmla_used` unconditionally true") FAILS: `try_flashmla_prefill_
+  attention` bails `Ok(false)` for `mode == SlidingWindow && chain_verify.is_none()`
+  (attention.rs:2121), so **every DSv4-Flash SlidingWindow-layer prefill runs the
+  scalar `dsv4_swa_attention`** (DSv4-Flash interleaves SW + CSA layers; SW =
+  `compress_ratio==0`, v4.rs:492). `sw_window_cache` (bf16) is that lane's read
+  source AND the FP8-pool SW-region pack staging — double duty. Deleting the scalar
+  lane / bf16 shadow / collapsing to one value pool all break SW-layer prefill.
+  **Real prerequisite: teach `try_flashmla_prefill_attention` to handle SW-mode
+  prefill (a feature, not a hygiene deletion) — THEN delete the scalar lane.** Until
+  then P3 does not proceed; the map single-sourcing (P1/P2) already removed the
+  drift debt without touching the live lane.
 - **P5 (follow-on)** — page-granular L2/L3: value KV as flat FP8 pages → tier
   demote/promote per page not whole slot (`executor.rs:2469`) → unblocks >200K.
 
