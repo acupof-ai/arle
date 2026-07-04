@@ -33,8 +33,11 @@ from pathlib import Path
 
 PYTEST_TIMEOUT = 300
 SETUP_TIMEOUT = 600
-# Repos known to need pre-3.12 interpreters on the pod (python3.12-only box).
-EXCLUDE_REPO_RE = re.compile(r"ansible", re.IGNORECASE)
+# Only ansible is Docker-free tractable: openlibrary needs web.py+infogami+solr,
+# qutebrowser needs PyQt+display+bdd plugins — both are Docker-image benchmarks
+# with no runnable env on a bare pod. ansible is pure-python (vendored deps),
+# runs under a py3.11 venv + PYTHONPATH=lib:test (the proven 07-04 recipe).
+INCLUDE_REPO_RE = re.compile(r"ansible", re.IGNORECASE)
 
 
 # ---------------------------------------------------------------- select ----
@@ -89,9 +92,9 @@ def cmd_select(args):
         rows = _load_via_hub()
 
     python_rows = [r for r in rows if r.get("repo_language") == "python"]
-    kept = [r for r in python_rows if not EXCLUDE_REPO_RE.search(r["repo"])]
+    kept = [r for r in python_rows if INCLUDE_REPO_RE.search(r["repo"])]
     print(f"[select] dataset rows={len(rows)} python={len(python_rows)} "
-          f"after-exclude={len(kept)}", flush=True)
+          f"ansible-kept={len(kept)}", flush=True)
 
     # Round-robin across repos so the candidate list is repo-diverse; the pod
     # gate over-rejects, so over-select (default 60 for a 12+12 target).
@@ -151,15 +154,22 @@ def run(cmd, cwd, timeout=None, env=None):
 
 
 def clone_at_commit(repo, sha, dest):
-    """Shallow-fetch `sha` (may not be a branch head) into `dest`. Every git
-    command runs with cwd inside `dest` — never the launch cwd (the pod's
-    default cwd has a poisoned .git/config auth extraheader)."""
+    """Fetch `sha` WITH ancestry into `dest`. NOT --depth 1: SWE-Pro
+    `before_repo_set_cmd` does its own `git reset --hard <setup_commit>` to a
+    commit that differs from `base_commit`, so a shallow tree yields `fatal:
+    reference is not a tree`. Every git command runs with cwd inside `dest` —
+    never the launch cwd (the pod's default cwd has a poisoned .git/config auth
+    extraheader)."""
     dest.mkdir(parents=True)
     url = f"https://github.com/{repo}.git"
+    # Fetch ALL branch heads (not just `sha`): before_repo_set_cmd frequently
+    # `git checkout <fix_commit> -- test/...` to inject hidden tests, and the
+    # fix commit is a DESCENDANT of base_commit — unreachable from base_commit's
+    # ancestry. All ansible SWE-Pro shas live on devel/stable-* branch tips.
     for cmd in (["git", "init", "-q"],
                 ["git", "remote", "add", "origin", url],
-                ["git", "fetch", "--depth", "1", "origin", sha],
-                ["git", "checkout", "-q", "FETCH_HEAD"]):
+                ["git", "fetch", "-q", "origin"],
+                ["git", "checkout", "-q", sha]):
         r = run(cmd, dest, timeout=SETUP_TIMEOUT)
         if r.returncode != 0:
             return f"{' '.join(cmd[:3])} rc={r.returncode}: {r.stderr.strip()[:200]}"
@@ -182,18 +192,19 @@ def fail_to_pass_list(task):
     return f2p
 
 
-def run_pytest(workdir, f2p, python):
+def run_pytest(workdir, f2p, python, pythonpath=None):
     """Returns (rc, summary_tail). rc None on timeout."""
+    env = {"PYTHONPATH": pythonpath} if pythonpath else None
     try:
         r = run([python, "-m", "pytest", "-q", "-p", "no:cacheprovider", *f2p],
-                workdir, timeout=PYTEST_TIMEOUT)
+                workdir, timeout=PYTEST_TIMEOUT, env=env)
     except subprocess.TimeoutExpired:
         return None, "pytest timeout"
     tail = (r.stdout + r.stderr).strip().splitlines()[-1:] or [""]
     return r.returncode, tail[0][:200]
 
 
-def self_check(repo_dir, task, scratch, python):
+def self_check(repo_dir, task, scratch, python, pythonpath=None):
     """Mirror cc_swe_baseline.py score() semantics in a scratch copy:
     test_patch alone must FAIL with real test failures (pytest rc 1, no
     collection errors), gold_patch on top must PASS (rc 0)."""
@@ -207,7 +218,7 @@ def self_check(repo_dir, task, scratch, python):
     err = apply_patch(scratch, task.get("test_patch", ""), ".t.diff")
     if err:
         return False, err
-    rc, tail = run_pytest(scratch, f2p, python)
+    rc, tail = run_pytest(scratch, f2p, python, pythonpath)
     if rc is None:
         return False, f"pre-fix {tail}"
     if rc == 0:
@@ -220,7 +231,7 @@ def self_check(repo_dir, task, scratch, python):
     err = apply_patch(scratch, task.get("gold_patch", ""), ".g.diff")
     if err:
         return False, err
-    rc, tail = run_pytest(scratch, f2p, python)
+    rc, tail = run_pytest(scratch, f2p, python, pythonpath)
     if rc != 0:
         return False, f"gold does not pass (rc={rc}): {tail}"
     return True, tail
@@ -276,7 +287,8 @@ def cmd_stage(args):
                     print(f"[stage] {iid}: WARN before_repo_set_cmd timeout",
                           flush=True)
 
-            ok, note = self_check(repo_dir, task, scratch, args.python)
+            ok, note = self_check(repo_dir, task, scratch, args.python,
+                                   args.pythonpath)
             if not ok:
                 rejected += 1
                 print(f"[stage] {iid}: REJECT gate: {note}", flush=True)
@@ -328,7 +340,9 @@ def main():
     stg.add_argument("--train-n", type=int, default=12)
     stg.add_argument("--eval-n", type=int, default=12)
     stg.add_argument("--python", default="python3",
-                     help="gate interpreter (pod default python3 = 3.12)")
+                     help="gate interpreter (ansible needs a py3.11 venv)")
+    stg.add_argument("--pythonpath", default=None,
+                     help="PYTHONPATH for the gate pytest, e.g. lib:test (ansible)")
     stg.set_defaults(fn=cmd_stage)
 
     args = ap.parse_args()
