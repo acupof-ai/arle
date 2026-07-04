@@ -1900,6 +1900,10 @@ fn flashmla_pack_compressed_delta(
     let Some(compressed) = compressed else {
         return Ok(());
     };
+    // The ONE block→(page,row) map for this slot's band. Both the single-row
+    // device pack (below) and the bulk host-derived block_ids draw sw_blocks /
+    // page_size from here, so the two write paths cannot drift (#146).
+    let bmap = flash.block_map();
     // Steady-state decode adds AT MOST one compressed row per step
     // ((pos+1) % ratio == 0). That row is packed by the DEVICE kernel below —
     // fully derived from `start_pos_device`, so it records into CUDA-graph
@@ -1923,8 +1927,8 @@ fn flashmla_pack_compressed_delta(
             pool_ptr,
             start_ptr,
             compress_ratio,
-            flash.sw_blocks,
-            64,
+            bmap.sw_blocks(),
+            bmap.page_size(),
             config.head_dim,
             Some(&page_table),
         )?;
@@ -1943,7 +1947,6 @@ fn flashmla_pack_compressed_delta(
         return Ok(());
     }
     let n = end_row - start_row;
-    let bmap = Dsv4BlockMap::new(flash.sw_blocks, 64);
     let (block_ids, rows): (Vec<i32>, Vec<i32>) = (start_row..end_row)
         .map(|row| {
             let (page, in_page) = bmap.comp_row(row);
@@ -1975,7 +1978,7 @@ fn flashmla_pack_compressed_delta(
         &scratch.comp_block_ids,
         &scratch.comp_rows,
         n,
-        64,
+        bmap.page_size(),
         config.head_dim,
         config.head_dim,
         Some(&page_table),
@@ -2706,6 +2709,8 @@ fn try_flashmla_decode_attention(
     // lacks a V32 device-page-table kernel; the read-side table is mode-neutral
     // and their contiguous identity band stays byte-equal.
     let build_page_table = Some(pool.flashmla_device_page_table(ctx, flash.slot_idx)?);
+    // Single-source sw_blocks / page_block_size for the index-build kernel.
+    let bmap = flash.block_map();
     let (indices_ptr, indices_guard) = scratch.indices.device_ptr_mut(&ctx.stream);
     let (start_ptr, start_guard) = start_pos_device.device_ptr(&ctx.stream);
     {
@@ -2714,7 +2719,7 @@ fn try_flashmla_decode_attention(
             ctx,
             indices_ptr,
             selected_ptr_u64,
-            flash.sw_blocks,
+            bmap.sw_blocks(),
             config.sliding_window,
             start_ptr,
             flash.max_compressed_keys,
@@ -2728,7 +2733,7 @@ fn try_flashmla_decode_attention(
                 compress_ratio
             },
             mode_int,
-            64,
+            bmap.page_size(),
             build_page_table.as_ref(),
             // M1: whole-pool page count — mask any routed physical page >= this.
             pool.flashmla_total_pages(),
@@ -5230,6 +5235,25 @@ pub(crate) fn mla_attention_prepare(
                 .as_ref()
                 .map(|s| s.compressed.seq_len)
                 .unwrap_or(0);
+            // #146 Index-layer guard: for CSA the value compressor and the indexer
+            // key compressor consume the same token stream at the same start_pos
+            // with the same compress_ratio, so their row counts MUST match. GLM
+            // SparseIndexed runs the indexer at ratio=1 vs value ratio>1 (rows
+            // differ by design), and frozen chain-verify advances neither — gate
+            // to CSA's live path so this never false-fires. Turns a silent Shape
+            // drift past 2048 into a loud boundary fail.
+            if mode == DeepSeekV4AttentionMode::CompressedSparse && !skip_frozen_compressor {
+                let value_rows = state
+                    .compressor
+                    .as_ref()
+                    .map(|s| s.compressed.seq_len)
+                    .unwrap_or(0);
+                ensure!(
+                    indexer_rows_after == value_rows,
+                    "DSv4 CSA select boundary: indexer rows {indexer_rows_after} != \
+                     value compressor rows {value_rows} (Shape drift — #146 guard)"
+                );
+            }
             let keys_capacity = state
                 .indexer
                 .as_ref()
