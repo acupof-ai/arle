@@ -1943,8 +1943,12 @@ fn flashmla_pack_compressed_delta(
         return Ok(());
     }
     let n = end_row - start_row;
+    let bmap = Dsv4BlockMap::new(flash.sw_blocks, 64);
     let (block_ids, rows): (Vec<i32>, Vec<i32>) = (start_row..end_row)
-        .map(|row| ((flash.sw_blocks + row / 64) as i32, (row % 64) as i32))
+        .map(|row| {
+            let (page, in_page) = bmap.comp_row(row);
+            (page as i32, in_page as i32)
+        })
         .unzip();
     ctx.stream
         .memcpy_htod(&block_ids, &mut scratch.comp_block_ids)

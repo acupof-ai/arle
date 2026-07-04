@@ -186,6 +186,32 @@ pub(crate) struct Dsv4KvAdapter {
     pub(super) prefill_linear: Option<Dsv4PrefillDeepGemmLinearScratch>,
 }
 
+/// Index-layer map: the ONE `compressed-row → (slot-logical page, in-page row)`
+/// function for a DSv4 FlashMLA band. The SW ring owns pages `[0, sw_blocks)`;
+/// the compressed region follows. `page_size` is the FlashMLA MODEL1 block (64).
+/// Replaces the inline `sw_blocks + r/64, r%64` scattered across the write paths
+/// so drift between sites is structurally impossible (#146: above 2048 the
+/// per-path maps diverged and a shared wrong-row write garbled both read lanes).
+#[derive(Clone, Copy)]
+pub(crate) struct Dsv4BlockMap {
+    sw_blocks: usize,
+    page_size: usize,
+}
+
+impl Dsv4BlockMap {
+    pub(crate) fn new(sw_blocks: usize, page_size: usize) -> Self {
+        Self {
+            sw_blocks,
+            page_size,
+        }
+    }
+
+    /// Compressed row `r` → `(slot-logical page, in-page row)`.
+    pub(crate) fn comp_row(&self, r: usize) -> (usize, usize) {
+        (self.sw_blocks + r / self.page_size, r % self.page_size)
+    }
+}
+
 pub(crate) struct Dsv4LayerKvLayout {
     /// Shared FP8 MLA latent pool for this layer (#85 P2 Stage A): a
     /// `TokenKVPool` of opaque packed records (`KVFormat::PackedBytes`,
