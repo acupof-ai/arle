@@ -153,26 +153,36 @@ def run(cmd, cwd, timeout=None, env=None):
                           timeout=timeout, check=False, env=e)
 
 
-def clone_at_commit(repo, sha, dest):
-    """Fetch `sha` WITH ancestry into `dest`. NOT --depth 1: SWE-Pro
-    `before_repo_set_cmd` does its own `git reset --hard <setup_commit>` to a
-    commit that differs from `base_commit`, so a shallow tree yields `fatal:
-    reference is not a tree`. Every git command runs with cwd inside `dest` —
-    never the launch cwd (the pod's default cwd has a poisoned .git/config auth
-    extraheader)."""
+SHA_RE = re.compile(r"\b[0-9a-f]{40}\b")
+
+
+def clone_at_commit(repo, sha, dest, extra_shas=()):
+    """Depth-1 fetch of `sha` plus every extra sha into `dest`. before_repo_set_cmd
+    `git checkout <fix_commit> -- test/...` to inject hidden tests, and the fix
+    commit is a DESCENDANT of base_commit — not in its ancestry. A full
+    `git fetch origin` on ansible's history times out (>600s), so instead fetch
+    each referenced sha individually --depth 1 (GitHub allows reachable-sha
+    wants). Every git command runs with cwd inside `dest` — never the launch cwd
+    (the pod's default cwd has a poisoned .git/config auth extraheader)."""
     dest.mkdir(parents=True)
     url = f"https://github.com/{repo}.git"
-    # Fetch ALL branch heads (not just `sha`): before_repo_set_cmd frequently
-    # `git checkout <fix_commit> -- test/...` to inject hidden tests, and the
-    # fix commit is a DESCENDANT of base_commit — unreachable from base_commit's
-    # ancestry. All ansible SWE-Pro shas live on devel/stable-* branch tips.
     for cmd in (["git", "init", "-q"],
-                ["git", "remote", "add", "origin", url],
-                ["git", "fetch", "-q", "origin"],
-                ["git", "checkout", "-q", sha]):
+                ["git", "remote", "add", "origin", url]):
         r = run(cmd, dest, timeout=SETUP_TIMEOUT)
         if r.returncode != 0:
             return f"{' '.join(cmd[:3])} rc={r.returncode}: {r.stderr.strip()[:200]}"
+    seen = set()
+    for s in (sha, *extra_shas):
+        if s in seen:
+            continue
+        seen.add(s)
+        r = run(["git", "fetch", "-q", "--depth", "1", "origin", s], dest,
+                timeout=SETUP_TIMEOUT)
+        if r.returncode != 0 and s == sha:
+            return f"git fetch {s[:12]} rc={r.returncode}: {r.stderr.strip()[:200]}"
+    r = run(["git", "checkout", "-q", sha], dest, timeout=SETUP_TIMEOUT)
+    if r.returncode != 0:
+        return f"git checkout rc={r.returncode}: {r.stderr.strip()[:200]}"
     return None
 
 
@@ -268,7 +278,9 @@ def cmd_stage(args):
         tmp = Path(tempfile.mkdtemp(prefix=f"{iid}.", dir=args.staged_root))
         repo_dir, scratch = tmp / "repo", tmp / "scratch"
         try:
-            err = clone_at_commit(task["repo"], task["base_commit"], repo_dir)
+            extra = SHA_RE.findall(task.get("before_repo_set_cmd") or "")
+            err = clone_at_commit(task["repo"], task["base_commit"], repo_dir,
+                                  extra)
             if err:
                 rejected += 1
                 print(f"[stage] {iid}: REJECT clone: {err}", flush=True)
