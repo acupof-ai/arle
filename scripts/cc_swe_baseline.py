@@ -85,9 +85,15 @@ def cc_attempt(workdir, task, args):
     prompt = (
         f"Fix a bug in this repository (cwd = repo root).\n\n"
         f"Problem statement:\n{task['problem_statement'][:3000]}\n\n"
-        "Make the SMALLEST correct change that resolves the issue. You MUST "
-        "edit at least one file. Do not write or run the hidden tests — they "
-        "are applied at scoring time. Do not commit."
+        "Work in this order and be decisive:\n"
+        "1. Briefly locate the buggy code (a few reads/greps — do NOT read the "
+        "whole codebase).\n"
+        "2. As soon as you have identified the fix, EDIT the source file. Do "
+        "not keep exploring after you understand the bug — make the edit.\n"
+        "3. Make the SMALLEST correct change that resolves the issue.\n\n"
+        "You MUST edit at least one source file before you finish; an answer "
+        "with no edit is a failure. Do not write or run the hidden tests (they "
+        "are applied at scoring time). Do not commit."
     )
     cmd = ["claude", "-p", "--model", args.model,
            "--max-turns", str(args.max_turns),
