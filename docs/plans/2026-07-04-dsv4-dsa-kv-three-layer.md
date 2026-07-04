@@ -6,7 +6,7 @@
 > architecture work** — the "collapse to one FP8 value pool" redesign was dropped
 > (both premises wrong, §Retracted) and the budget layer is a fail-closed capacity
 > gate, not a correctness or architecture issue. Two things remain but are NOT this
-> refactor: #146 (a value-content bug) and a num_slots serve flag (capacity). Every
+> refactor: #146 (a value-content bug) and long-context VRAM headroom (capacity). Every
 > claim is tagged **[V]** verified (code/measured, file:line) or **[I]** inferred
 > (follows from code, not measured); no untagged conclusions.
 
@@ -60,7 +60,7 @@ is `ensure!` — fits → build succeeds and runs the audited race-free path; do
 fit → engine build **aborts** (never silently wrong). Chain (all file:line-verified):
 
 ```
-requested num_slots (default 256; NOT a serve flag — test num_slots_is_not_a_serve_flag)
+requested num_slots (default 256; NOT a serve flag — fully budget-derived)
    │  reserved_for_slots = per_slot × min(requested, affordable)      dsv4.rs:1810-1812
    ▼
 pool_budget_total = total_budget − reserved_for_slots                 dsv4.rs:1813-1814
@@ -71,7 +71,7 @@ pool.max_total_pages  must be ≥ flashmla_slot_pages (= one band)      kv_layou
 
 **Both `per_slot` (DSA key-cache + batched scratch) and `flashmla_slot_pages` (=sw_blocks+comp_blocks) scale with `max_seq_len`, drawn from one budget [V].** At long `max_seq_len` the remainder after reserving slots can fall below one band → engine build aborts (`FlashMLA pool page mismatch`). So the three — num_slots, per-slot cost, pool size — **cannot be changed in isolation** [V].
 
-- **Lever, not measured [I]:** `requested` enters only via `min(requested, affordable)`. Lowering it (e.g. 8) shrinks `reserved_for_slots`, enlarging the pool remainder — plausibly fitting longer `max_seq_len` (trade concurrency for context). Follows from the formula; **not run.** To act on it, measure on the H20 pod first.
+`requested` num_slots is NOT user-settable — serve exposes no `--num-slots` flag; it is fixed at the default and fully budget-derived. So there is no knob to trade concurrency for context; a config that doesn't fit needs more VRAM (TP=8 / bigger GPUs), not a flag.  [V]
 
 ## What shipped  [V]
 
@@ -87,7 +87,7 @@ pool.max_total_pages  must be ≥ flashmla_slot_pages (= one band)      kv_layou
 ## Open, separate from storage access
 
 - **#146** — not storage access [V]; cause ∈ {compressor high-pos compute, FP8 quant, model}, undecided [I]. Split with a value-dump A/B (dequant FP8 pool row vs bf16 `compressed.data` row vs high-precision recompute). Own ticket.
-- **Long-context cap** — the budget chain above; requires the pod measurement of the num_slots lever before deciding a fix. Own ticket.
+- **Long-context cap** — the budget chain above is genuine VRAM exhaustion at long `max_seq_len` (both per-slot DSA cost and the FlashMLA band scale with it); fail-closed, no user knob. Reaching 32K needs more memory (TP=8 / bigger GPUs), not a code change. Own ticket.
 
 ## Non-goals
 

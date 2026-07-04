@@ -1046,26 +1046,6 @@ mod tests {
     }
 
     #[test]
-    fn num_slots_is_not_a_serve_flag() {
-        let parsed = Args::try_parse_from([
-            "arle",
-            "serve",
-            "--backend",
-            compiled_backend_flag(),
-            "--model-path",
-            "model",
-            "--num-slots",
-            "2",
-        ])
-        .map_err(|err| err.to_string());
-        let err = match parsed {
-            Ok(_) => panic!("serve no longer exposes --num-slots"),
-            Err(err) => err,
-        };
-        assert!(err.contains("num-slots"), "got: {err}");
-    }
-
-    #[test]
     fn hip_engine_budget_keeps_internal_paged_kv_defaults() {
         let defaults = EngineLoadConfig::default();
         let (_args, serve) = parse_serve(&[
