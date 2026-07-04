@@ -1,165 +1,111 @@
-# DSv4 DSA KV storage — three-layer redesign (Shape / Index / Physical)
+# DSv4 KV storage — three-layer redesign (Shape / Index / Physical)
 
-> Status: Active — 2026-07-04. **Deletion-style refactor that eliminates #146 as
-> a side effect.** DSv4 stores the same logical KV in 4 physical layouts, each
-> with its own block→(page,row) write map on a separate path. Above 2048 tokens
-> the maps drift → #146: needle garble past `index_topk·cr = 2048`, depth-locked,
-> identical wrong bytes on both read lanes (round 4 — a single shared *write*
-> point writing to the wrong row, read back by both lanes). Collapse to ONE
-> asserted `BlockMap` and ONE FP8 value pool; the drift class is gone whatever
-> the exact off-by, and the invariant assert + per-phase needle gate verify it.
-> No attribution A/B — the deletion removes the class; the assert catches any
-> residual LOUD. (SGLang is exact on the same ckpt with the same vendored
-> compressor kernel ⇒ the compressor math is not the ARLE-vs-SGLang delta; the
-> excess deep-pos error lives in ARLE's own storage/pack/mapping layer, which is
-> exactly what this deletes. Residual guard: if needle still garbles >2048 after
-> P3 lands on the clean single-map baseline, the root cause is compressor
-> precision, not mapping — file separately. Low prior, not silent.)
+> Status: Active — 2026-07-04. **Architecture cleanup, decoupled from #146.**
+> An audit of the value-pool write→read path (below) proves the storage layer is
+> race-free and bounded on the #146 repro config, so #146 is NOT a storage/mapping
+> bug — it lives in compressed VALUE *content* (compressor high-position compute /
+> FP8 quant / model), tracked separately. This refactor's value is purely
+> structural: collapse 4 value layouts to 1 paged pool, delete the quality-
+> defective scalar lane, single-source the block map, and unblock page-granular
+> L2/L3 tiering (P5). P1/P2/P4 landed (commits 611d18cd, 2dd9d07c); P3 remains.
 
-## The chain, top to bottom
+## Audit — the storage layer is constructionally correct (why #146 ≠ storage)
+
+First principles: on HBM, a KV access is correct iff **index correct + physical
+correct + write-happens-before-read**. GPU adds the third term — kernels are async,
+so a cross-stream write/read without an event fence can race. Audit of the
+eager-decode / spec-none path (the #146 baseline):
+
+| Check | Finding | Source |
+|---|---|---|
+| write (pack) stream | all `ctx.stream` | `flashmla_pack_compressed_delta` |
+| read (FlashMLA decode) stream | build-indices + pool_ptr + kernel launch all `ctx.stream` | `try_flashmla_decode_attention`, flashmla.rs:238 `cu_stream()` |
+| comm_stream / pipeline fence touch value pool? | **never** (zero hits in attention/flashmla) | grep |
+| read range | `start_row = fp8_kv_comp_packed_rows`; reads `[0, packed_rows)` only | attention.rs:1936 |
+| bound assert | `packed_rows ≤ indexer_rows_before` | attention.rs:7935 |
+| index/physical | P1 BlockMap single-source + P4 CSA assert + kernel page_table routing masked by `flashmla_total_pages()` | — |
+
+**Single stream ⇒ stream order guarantees write-before-read ⇒ no race.** The only
+other CUDA streams (`comm_stream` for NCCL, the MTP persistent verify stream) never
+touch the value pool on this path (MTP is off at spec-none). All three correctness
+terms hold. **#146 is therefore compressed VALUE content, not storage** — the
+refactor below does not target it.
+
+(The "race" in the 07-03 #138 note — MTP-off context-129 wall, lens-maskable — is a
+*different* symptom, most likely a scratch-buffer premature-free, not the value pool.)
+
+## Current state — 5 KV stores, 2 read lanes
+
+Per (slot, layer), the same logical KV is materialized in multiple layouts:
+
+| Store | Type | Role | Read by |
+|---|---|---|---|
+| `sw_window_cache` | `CudaSlice<bf16>` | sliding-window ring (128 tok), bf16 staging | scalar lane **+** packed into FP8 pool SW region |
+| `state.compressor.compressed` | `HiddenStates` bf16 [head_dim, rows] | **VALUE** compressor output | scalar lane **+** packed into FP8 pool comp region |
+| `state.indexer.compressor.compressed` | `HiddenStates` bf16 [index_head_dim=128, rows] | **INDEX-KEY** (scoring only) | DSA top-k selector |
+| `dsa_key_cache` | `CudaSlice<u8>` | rotated keys for official DSA selection | DSA selector |
+| `flashmla_kv_pool` | `TokenKVPool` FP8 PackedBytes, 584 B/tok, page=64 | paged pool: SW region `[0,sw_blocks)` + comp region `[sw_blocks,total)` | FlashMLA lane (default) |
+
+Two attention read lanes over the SAME logical KV:
+- **Scalar lane** (`dsv4_swa_attention` / `dsv4_hybrid_attention`, `if !flashmla_used`): reads `sw_window_cache` + `compressor.compressed` (bf16). Documented quality-defective (2026-07-03 win) — inferior, effectively dead.
+- **FlashMLA lane** (default): reads `flashmla_kv_pool` (FP8) via host page_table.
+
+Problem: the VALUE lives in 3 bf16 buffers (`sw_window_cache`, `compressor.compressed`) *and* the FP8 pool, each with its own write path. Not a correctness bug (audit above) but latent debt: 3× the value memory, two divergent read lanes, and the pool can't be tiered per-page while a parallel bf16 copy exists.
+
+## Final state — one paged value pool, three layers
 
 ```
-Shape      block k  ==  tokens [k·cr, k·cr+cr-1]        pure semantics, no bytes
-   │  Dsv4BlockMap  (the ONE index — new)
-Index      block k  →  (page p, row r)                  single block↔location truth
-   │  page_table    (host-built, drawn at admission)
-Physical   page p   →  FP8 pool byte offset, record     real memory
-   │  budget + pre-allocation
-Backing    pool.max_total_pages  ←  kv_budget_plan       VRAM ledger, admission gate
+Shape      block k  ==  tokens [k·cr, k·cr+cr-1]        pure semantics
+   │  Dsv4BlockMap  (the ONE index — landed P1)
+Index      comp row r → (slot-logical page, in-page row)  single map
+   │  page_table  (host-built, drawn at admission)
+Physical   page → FP8 pool byte offset                    real memory
 ```
 
-### 1. Shape — the KV abstraction (length-agnostic)
+- **Value collapses to `flashmla_kv_pool` only** (FP8). `sw_window_cache` and
+  `compressor.compressed` lose their VALUE-read role; the compressor packs straight
+  into the pool via `Dsv4BlockMap`. bf16 value shadows deleted.
+- **Scalar lane deleted** (both kernels + 6 dispatch sites).
+- **KEPT unchanged**: `indexer.compressor.compressed` (128-dim scores ≠ 512-dim
+  values — different data), `dsa_key_cache` (scoring side), `pending_kv`/`prev_overlap`
+  (cross-chunk accumulators — irreducible).
 
-"Compressed block `k` covers tokens `[k·cr, k·cr+cr-1]`." A longer sequence is
-just a larger `k`. No pool, no page, no bytes here. Both the value pool and the
-indexer-key side share this one block count — indexer block `k` and value block
-`k` are the same token range, asserted (`attention.rs:5224`).
+## Difference (current → final)
 
-### 2. Index — `Dsv4BlockMap`, the ONE block→location authority
+| | Current | Final |
+|---|---|---|
+| VALUE stores | `sw_window_cache` bf16 + `compressor.compressed` bf16 + FP8 pool | FP8 pool only |
+| block→(page,row) map | inline `sw_blocks + r/64` at ≥3 sites | one `Dsv4BlockMap` (landed) |
+| attention read lanes | scalar (bf16) + FlashMLA (FP8) | FlashMLA only |
+| value memory / slot | ~3× (bf16 shadows + FP8) | 1× (FP8) |
+| L2/L3 tiering | whole-slot blobs (can't split a tangle) | per-page (flat FP8 pages) |
+| indexer key / dsa_key_cache | separate stores | **unchanged** |
 
-Today 4 write paths each recompute `block→(page,row)` (`sw_window_cache`,
-`compressor.compressed`, `dsa_key_cache`, FP8 pool). Below 2048 the top-k is
-exhaustive (`naive_paged_transform`, `dsv4_dsa_official.cu:646`) so the map is
-never exercised and they agree by accident; above 2048 real `radix_topk` runs and
-they drift → #146. **`Dsv4BlockMap { cr, sw_blocks, page_size }`
-(`kv_layout.rs`) becomes the single function** `block_to_page_row(k)->(page,row)`
-+ `token_range(k)`, owned by `Dsv4LayerKvLayout` (`kv_layout.rs:189`), consumed by
-every write path. One computation, asserted, no drift possible.
+## Phases (P1/P2/P4 landed; P3 remaining)
 
-Layout: SW ring at slot-logical pages `[0, sw_blocks)`, compressed region at
-`[sw_blocks, sw_blocks+comp_blocks)`. Fixed slot-logical block ids — `BlockMap`
-is the only place that math lives.
+- **P1 ✅** (611d18cd) — `Dsv4BlockMap` collapses the inline comp-row→(page,row) map. Byte-identical.
+- **P2 ✅** (2dd9d07c) — single-source `sw_blocks`/`page_size` from the arena through the pack/index kernels (no host-transform move; the decode kernel already routes via page_table). Byte-identical.
+- **P4 ✅** (2dd9d07c) — CSA-only select-boundary assert `indexer_rows == value_rows`, mode-gated off GLM/frozen.
+- **P3 (remaining) — delete the bf16 value shadow + scalar lane.** Remove
+  `compressor.compressed`'s VALUE-read role and `dsv4_swa/hybrid_attention_*`
+  (kernels + 6 dispatch sites). Compressor packs straight into the FP8 pool via
+  `Dsv4BlockMap`. Precondition: prove `flashmla_used` is unconditionally true for
+  every supported DSv4 mode (else the scalar path is live — stop). Pure hygiene;
+  gate on H20: decode tok/s A/B non-regression + needle ≤2K unchanged (NOT a #146 fix).
+- **P5 (follow-on)** — page-granular L2/L3: value KV as flat FP8 pages → tier
+  demote/promote per page not whole slot (`executor.rs:2469`) → unblocks >200K.
 
-### 3. Physical — one FP8 paged pool
+## #146 — tracked separately (content precision, not this refactor)
 
-The existing `flashmla_kv_pool` (`kv_layout.rs:199`): a `TokenKVPool` of opaque
-PackedBytes records, **584 B/token, page = FlashMLA block = 64 tokens**, single
-plane. Every slot's band is addressed ONLY through its page table
-(`flashmla_page_table`), **never `slot_idx × slot_bytes` arithmetic**. The value
-side collapses to this ONE pool — `compressor.compressed`'s value role and the 3
-bf16 shadows are deleted. One value coordinate, one consumer (FlashMLA).
+Signature: deep-position compressed-value content, trailing-digit loss,
+deterministic. Candidates: (a) compressor bf16 compute at high abs_pos, (b) FP8
+quant precision. Split with a value-dump A/B (dequant FP8 pool row vs bf16
+`compressed.data` row vs high-precision recompute), NOT with a needle depth-sweep
+(no control ⇒ confounded by model recall). A separate issue; this refactor neither
+fixes nor blocks it.
 
-### 4. Budget + pre-allocation — the backing that makes paging real
-
-**Budget (`kv_budget_plan`, `dsv4.rs:1669`, #67).** Slots are not fixed — a fixed
-count OOM-crashes at high `c` × long `max_seq_len`. Dynamic:
-`affordable = cudaMemGetInfo × 0.9 ÷ per_slot_bytes`, clamp `requested`. The
-per-slot ledger (`per_slot_device_bytes`, `dsv4.rs:1612`, MUST track
-`Dsv4SlotState::new`): FP8 arena `max_seq_len × 584 × num_layers` ×2 (compressor/SW
-+ activations) **+** DSA indexer scratch (`logits` tile ~`max_seq/cr`, dwarfs the
-arena at long ctx). **NCCL min-reduced across ranks** — per-rank `mem_get_info`
-diverges, and a divergent slot count desyncs the deterministic planner →
-NCCL deadlock; a rank that can't query contributes `i32::MAX` (doesn't bind) but
-still joins the collective.
-
-**Pre-allocation (the non-obvious part).** The FlashMLA band is NOT a growing
-`ceil(seq_len/page)` cache — **all `sw_blocks + comp_blocks` pages are resident
-from token 1** (`flashmla_alloc_append`, `kv_layout.rs:239`). Because the SW ring
-and compressed region sit at FIXED slot-logical block ids, the pack/read kernels
-need every page mapped before the first write; a growing draw would leave the SW
-ring / comp region unmapped. So `flashmla_alloc_append` only advances the logical
-cursor — the band is drawn once at admission from the host slot page table
-(`prepare_kv_batch`), never re-drawn. Truncate on MTP reject
-(`flashmla_truncate_slot`, `kv_layout.rs:290`) is cursor-only; band pages stay
-resident (never recycled).
-
-**Admission gate.** `pool.max_total_pages` → `flashmla_total_pages()`
-(`kv_layout.rs:211`) → `effective_total_pages()` (`lib.rs:387`) → the scheduler's
-host admission pool. The budget is the single number the scheduler and the pool
-agree on.
-
-## Relation to paged attention — and to the model kernels
-
-**To paged attention:** the SW region ALREADY does it right — host builds the page
-table, the kernel blindly consumes it. This refactor makes the compressed value
-region do the same. The correct paged form is: `BlockMap` (host) → page_table
-(host) → kernel reads by table index, zero block math in the kernel.
-
-**To the model kernels — untouched.** Attention math (`flash_fwd_*`), compressor
-(`dsv4_compressor_block/finalize`), MQA scoring, every GEMM stay byte-for-byte.
-Only two kernel classes move, both toward deletion:
-
-- **Mapping kernels** (`dsv4_flashmla_decode_build_indices.cu:118-151`,
-  `arle_flashmla_csa_prep.cu` index build) wrongly recompute `block→slot` INSIDE
-  the kernel — the drift source. Replace with a `BlockMap`-built host page table
-  the kernel indexes blindly. They shrink to a lookup or vanish.
-- **Redundant scalar lane** (`dsv4_hybrid_attention_*`, `dsv4_swa_attention_*`,
-  `dsv4_attention.cu:717,1723`): deleted wholesale — already the quality-defective
-  inferior lane (`wins/2026-07-03-dsv4-138-decoded-case-context129-wall.md`).
-
-Net: Rust-side `BlockMap` + shrink/delete mapping kernels + delete scalar lane.
-No compute rewrite — large in file count, small in risk.
-
-## Implementation DAG (file:line)
-
-**P1 — `Dsv4BlockMap`, no behavior change.** Add the type to `kv_layout.rs`, wire
-into `Dsv4LayerKvLayout` (`kv_layout.rs:189`). Replace inline math in
-`flashmla_pack_compressed_delta` (`attention.rs:1948`), `arle_flashmla_csa_prep.cu`
-index build, `dsv4_flashmla_decode_build_indices.cu:118-151` with `BlockMap`
-lookups. Byte-identical. Gate: needle 3/3 ≤2048 unchanged.
-
-**P2 — value reads through the pool only.** `csa_select_official`
-(`attention.rs:8747`) emits block ids in Shape coordinate; value gather resolves
-`BlockMap`→page_table. Kill the `raw_indices`(logical)/`selected`(slot)
-two-coordinate ambiguity — one coordinate downstream.
-
-**P3 — delete the bf16 value shadow + scalar value lane (this is where #146
-dies).** Remove `compressor.compressed`'s value role and `dsv4_swa/hybrid_
-attention_*` once P2 lands. Compressor packs straight into the FP8 pool via
-`BlockMap`, never a parallel bf16 buffer. Keep `pending_kv`/`prev_overlap`
-(cross-chunk accumulator — irreducible). Gate: needle 3/3 at 8K/32K + MTP-on.
-
-**P4 — indexer-key side shares Shape.** `dsa_key_cache` stays non-paged
-(128-dim scores ≠ 512-dim values, forced union adds entropy), block count derived
-from `BlockMap`; assert `indexer_rows == compressor_rows` at the select boundary
-(`attention.rs:5224`).
-
-## Invariants asserted (turn silent >2048 garble into a loud fail)
-
-At the select→gather boundary: `indexer.compressed.seq_len ==
-compressor_block_count`, `packed_rows == compressed_count` (pool fully packed
-before any read), `selected[k] ∈ [0, compressed_count)`. Any residual drift fails
-LOUD at the boundary and keeps guarding forever — this is the standing substitute
-for a one-shot attribution dump.
-
-## Verification
-
-Correct-inference gate per phase: needle ×3 at the phase length (2K→8K→32K),
-MTP-on + spec-none, SGLang as reference oracle (exact on same ckpt/quad). A phase
-that regresses ≤2048 or fails its length is reverted, not patched forward, and
-debugged on the clean single-map baseline. Bench entry per landed phase (`wins/`),
-decode tok/s A/B to prove the deletion didn't regress the fast path.
-
-## L2/L3 tier adaptation (the payoff, once value KV is pure pages — P5 follow-on)
-
-Today the tier store demotes/promotes whole-slot blobs (`executor.rs:2469` prefix
-store) because the value KV is a tangle of 4 layouts — you can't move half of it.
-After P3, value KV is a flat sequence of 64-token FP8 pages addressed by one
-`page_table`. That is exactly the granularity a tier store wants: **demote/promote
-per page**, not per slot. The path becomes `BlockMap`(which blocks are cold) →
-page_table(their pages) → tier transport(those page byte ranges via
-`kv-native-sys`). Out of this plan's scope — noted as what the three-layer split
-unblocks: page-granular L2/L3 → >200K contexts without whole-slot copies.
+Also surfaced by the audit: **`num_slots` hardcoded 256** caps TP=4 at max_seq≲8800
+(32K needs TP=8) — the real blocker for long-context testing. Separate ticket.
 
 ## Non-goals
 
