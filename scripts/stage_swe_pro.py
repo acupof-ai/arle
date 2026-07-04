@@ -286,7 +286,15 @@ def cmd_stage(args):
                 print(f"[stage] {iid}: REJECT clone: {err}", flush=True)
                 continue
 
-            setup = (task.get("before_repo_set_cmd") or "").strip()
+            # Drop git-state lines from before_repo_set_cmd: raw SWE-Pro rows
+            # `git checkout <fix_sha> -- test/...` to inject hidden tests, which
+            # conflicts with test_patch (the sandbox.rs contract brings tests via
+            # test_patch on a base-state tree). Keep real setup (pip/apt); for
+            # ansible rows this leaves nothing, so the tree stays at base_commit.
+            setup = "\n".join(
+                ln for ln in (task.get("before_repo_set_cmd") or "").splitlines()
+                if not re.match(r"\s*git\s+(reset|clean|checkout)\b", ln)
+            ).strip()
             if setup:
                 try:
                     r = run(["bash", "-lc", setup], repo_dir,
