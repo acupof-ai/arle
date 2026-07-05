@@ -258,18 +258,47 @@ the actual terminal mechanism — an unbounded `Throttled` retry with no
 now returns a fast, correct abort instead of freezing the server forever, and
 the server keeps serving normal traffic afterward.
 
-**One separate, explicitly out-of-scope gap remains** (not touched by any of
-these 5 rounds' fixes), next-session starting point:
+## Round 6 — `InFlightGuard` cancellation propagation, landed (`d9222a29a`, `b7ec09160`)
 
-1. **`InFlightGuard::drop` (`coordinator.rs`) still does not propagate
-   cancellation into the engine** — a client that disconnects/times out only
-   decrements coordinator-side `in_flight` and unregisters the sink; the
-   engine-side request state (whatever slot/queue entry it holds) is never
-   told to stop. Round 5's fix rejects a request that can never fit, but a
-   request that COULD eventually fit (just slowly, or waiting on other active
-   requests) and whose client gave up is still a zombie occupying `waiting`
-   or a slot forever. Real gap, independent of rounds 4/5's fixes, still open.
-2. `InFlightGuard`/cancellation is an `infer-core`/`infer-server` cross-cutting
-   change (bigger blast radius than rounds 4-5's targeted fixes) — re-scope
-   with its own plan doc before touching code, per the project's own
-   >3-files/architectural-decision rule.
+The one gap rounds 1-5 left open, deliberately deferred pending a scope
+check-in: `InFlightGuard::drop` only decremented coordinator-side `in_flight`
+and unregistered the sink — a client that disconnects/times out left its
+request a permanent zombie in every rank's engine (`waiting` or an active
+slot), never told to stop.
+
+Fix, two commits:
+- `d9222a29a` (`infer-core`, self-contained, unit-tested): new
+  `Engine::cancel_request(handle)` — drops a queued request from `waiting`
+  (same `complete_immediately(Abort)` path as the `max_prompt_tokens`
+  rejection), or frees an active request's slot through the exact same
+  `finish_slot` release path a natural completion uses. Safe no-op for an
+  already-finished or unknown handle. Same MULTIPROC INVARIANT as admission:
+  must be called identically, same tick, on every SPMD rank.
+- `b7ec09160` (multiproc wiring): new `RelayEnvelope::CancelRequest`,
+  broadcast BEFORE the tick's `TickAdmissions` (same locked `coord` scope) so
+  every rank applies it at the identical point relative to that tick's step.
+  `CoordSubmission::Cancel(u64)` carries it from `InFlightGuard::drop`
+  (sent unconditionally — cancelling an already-finished handle is a no-op,
+  so `Drop` doesn't need to know whether the stream ended naturally or was
+  abandoned) into the same channel `lockstep_loop` already drains for new
+  submissions. `CudaWorkerEngine.tracked` (request_id -> handle) is now
+  populated on every rank, not just the output owner, with a
+  `prune_finished()` cleanup step for followers (who never `drain_completions`).
+
+Tests: 3 new `infer-core` tests (cancel while waiting / cancel while active /
+no-op on finished-or-unknown), 1 new `infer-server` test proving the wire
+ordering (`CancelRequest` arrives before its paired `TickAdmissions`). Full
+downstream typecheck clean (cuda+no-cuda, cpu+no-cuda, metal+no-cuda), 0 new
+clippy warnings. **Not yet pod-verified** as of this writing — the actual
+cross-rank symmetry (the exact hazard class round 4 hit) has only been
+typechecked and unit-tested, never run on real multi-rank hardware.
+
+Deliberately out of scope: the single-process/local relay driver
+(`infer-server/src/lib.rs`'s "local-relay-driver" loop, used for single-GPU
+serve) does not handle `CancelRequest` — it falls into that loop's existing
+`Ok(Some(other)) => log::debug!(...)` catch-all, a silent no-op. This
+investigation was scoped to the multiproc (TP>1) hang that was actually
+reported; single-GPU serving never had this gap surfaced as a real issue, and
+wiring it would need its own exploration of `execution.rs`'s engine-thread
+command channel (a different structure than the multiproc `RequestHandle`
+tracking this fix uses). Own follow-up if it's ever needed.
