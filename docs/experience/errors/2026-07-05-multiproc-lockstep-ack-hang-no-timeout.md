@@ -176,33 +176,87 @@ Two separate open questions this surfaces, not one:
   permanent hang. Each attempt's unit tests were real and each fix was
   individually correct for the mechanism it targeted; none of that licenses
   "therefore the user-facing bug is fixed" without a fresh gdb/log check on
-  the actual repro, every time.
+  the actual repro, every time. It happened AGAIN between rounds 4 and 5 —
+  the correct, pod-verified TP fix still left the identical repro hanging,
+  via a plain capacity check with no reject path.
+- **Any "wait and retry" admission/scheduling loop needs its own "can this
+  ever succeed" check, separate from "can it succeed on THIS tick."**
+  `Throttled` (retry later, capacity may free up) and "structurally
+  impossible" (capacity will never exist) look identical from inside the
+  retry loop unless something explicitly distinguishes them — the loop
+  cannot tell the difference on its own, so it must be told.
 
-## Status — paused here, not closed
+## Round 4 — SPMD admission livelock, fixed (`5fd6a8984`)
 
-The relay layer (`coordinator.rs`, `multiproc_relay.rs`) is done: both fixes
-landed, unit-tested, and this retest independently confirms it's no longer
-the stuck component. **The user-facing hang is NOT fixed** — it now lives in
-`infer-core`, a bigger/different area than this doc's original scope
-(multiproc relay). Paused for a scope check-in rather than continuing
-unilaterally into scheduler/engine-cancellation changes. Next-session
-starting points, decomposed to the implementation level so a fresh session
-doesn't have to re-derive them:
+Design doc: [plans/2026-07-05-spmd-admission-page-sync.md](../../plans/2026-07-05-spmd-admission-page-sync.md).
+Live simultaneous 5-process gdb snapshots (coordinator + all 4 workers, 3
+timepoints ~15-40s apart) proved the stuck rank ROTATES (rank3 →
+{rank1,rank2} → rank1) while others idle — proof against a static 4-way NCCL
+deadlock, proof for a moving cross-rank mismatch. Pinned to
+`crates/infer-core/src/lib.rs:1087` `admit_waiting`'s `remaining_pages`
+starting from `self.kv.free_pages()` (rank-local, unsynced) while the
+collective it gates (`cached_prefix_match_len`) requires every rank to call
+it symmetrically every tick — a rank that Admits stops calling the
+collective forever, a rank that Throttles keeps calling it, and NCCL matches
+calls by order not content, so they can never realign.
 
-1. **Is `all_reduce_min_scalar_i32` actually stuck, or just slow?** Add
-   per-tick timing/instrumentation around `try_admit_front_waiter` /
-   `cached_prefix_match_len` (`crates/infer-core/src/lib.rs:1128`,
-   `crates/infer-core/src/prefix.rs:19`) for the specific 8106-token shape at
-   TP=4/EP=4, and let it run far longer than the ~10-16 min already observed
-   before concluding either way — a genuinely stuck NCCL collective and a
-   legitimately-very-slow one look identical from `/v1/stats` alone.
-2. **`InFlightGuard::drop` (`coordinator.rs`) needs to propagate cancellation
-   into the engine**, not just decrement `in_flight` and unregister the sink.
-   Whatever `try_admit_front_waiter`/the per-rank engine queue is currently
-   waiting on for an abandoned request needs an explicit cancel path — this
-   is a real gap independent of (1)'s answer, since even a "just slow"
-   admission still permanently head-of-line-blocks every later request once
-   its owning HTTP client has given up.
-3. Both are `infer-core`/scheduler-level changes (bigger blast radius than
-   the relay), not `infer-server` — re-scope before touching code, per the
-   project's own >3-files/architectural-decision rule.
+Fix: new `BackendExecutor::tp_sync_min` seam method (default identity for
+single-rank/no-TP backends), syncing `remaining_pages`' starting value once
+per `admit_waiting()` call via the same min-reduce pattern
+`cached_prefix_match_len` already uses.
+
+**Pod-verified correct for its target**: 4 ranks now cycle symmetrically
+through the collective, never diverging. This closes the SPMD-livelock CLASS
+of bug.
+
+## Round 5 — the SAME repro still hung, different mechanism, fixed (`eeac3d2b9`)
+
+With round 4's fix confirmed working, the identical `prompt_tokens=8106`
+repro **still hung** — this time with all 4 ranks staying symmetric (no
+divergence). A temporary diagnostic pinned it exactly, identical every tick,
+every rank: `pages_needed=127 > remaining_pages=121`. This pod's TP=4 /
+`mem_fraction_static=0.97` config has a hard ceiling of 121 KV pages: an
+8106-token prompt (+ 1 min decode token) needs 127. With
+`--max-running-requests=1`, nothing else can ever finish to free pages, so
+`try_admit_front_waiter` returned `AdmitOutcome::Throttled` every tick,
+forever — no error, no timeout surfaced anywhere.
+
+This is NOT the TP livelock recurring: it reproduced identically on a
+completely fresh server (`host_demoted_pages:0`, no preceding control
+request) — a plain, deterministic capacity shortfall, not a cross-request or
+cross-rank divergence. The `host_demoted_pages:13` residual that seemed
+load-bearing in earlier rounds' hypothesis turned out not to matter for this
+mechanism.
+
+Fix: new `AdmitOutcome::Rejected` — when the pool is completely idle
+(`self.active.is_empty()`, so nothing else could ever free more pages) and
+the candidate still doesn't fit after maximal eviction, complete it with
+`FinishReason::Abort` (the same path `submit_request_with_options` already
+uses for `prompt_tokens.len() > max_prompt_tokens`) instead of throttling
+forever. Deliberately conservative: with other requests still active,
+behavior is unchanged (Throttle — they may free enough pages on finish), so
+there is no false-positive-rejection path.
+
+## Status — round 5's fix pod-verification pending
+
+Both `infer-server` (relay, rounds 2-3) and `infer-core` (scheduler, rounds
+4-5) fixes are landed, locally tested, and typechecked end-to-end. Round 4's
+fix is pod-verified; round 5's is not yet (as of this writing). Next-session
+starting points if round 5 does not fully close it:
+
+1. ~~Is `all_reduce_min_scalar_i32` actually stuck, or just slow?~~ **Answered
+   by round 4/5**: not stuck — pod-confirmed symmetric and fast on every
+   tick. The apparent hang was rounds 4's (now-fixed) divergence, then round
+   5's (now-fixed) unbounded-retry-with-no-reject-path.
+2. **`InFlightGuard::drop` (`coordinator.rs`) still does not propagate
+   cancellation into the engine** — a client that disconnects/times out only
+   decrements coordinator-side `in_flight` and unregisters the sink; the
+   engine-side request state (whatever slot/queue entry it holds) is never
+   told to stop. Round 5's fix rejects a request that can never fit, but a
+   request that COULD eventually fit (just slowly, or waiting on other active
+   requests) and whose client gave up is still a zombie occupying `waiting`
+   or a slot forever. Real gap, independent of rounds 4/5's fixes, still open.
+3. `InFlightGuard`/cancellation is an `infer-core`/`infer-server` cross-cutting
+   change (bigger blast radius than rounds 4-5's targeted fixes) — re-scope
+   with its own plan doc before touching code, per the project's own
+   >3-files/architectural-decision rule.
