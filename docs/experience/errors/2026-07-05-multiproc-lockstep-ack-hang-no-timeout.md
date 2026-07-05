@@ -177,3 +177,32 @@ Two separate open questions this surfaces, not one:
   individually correct for the mechanism it targeted; none of that licenses
   "therefore the user-facing bug is fixed" without a fresh gdb/log check on
   the actual repro, every time.
+
+## Status — paused here, not closed
+
+The relay layer (`coordinator.rs`, `multiproc_relay.rs`) is done: both fixes
+landed, unit-tested, and this retest independently confirms it's no longer
+the stuck component. **The user-facing hang is NOT fixed** — it now lives in
+`infer-core`, a bigger/different area than this doc's original scope
+(multiproc relay). Paused for a scope check-in rather than continuing
+unilaterally into scheduler/engine-cancellation changes. Next-session
+starting points, decomposed to the implementation level so a fresh session
+doesn't have to re-derive them:
+
+1. **Is `all_reduce_min_scalar_i32` actually stuck, or just slow?** Add
+   per-tick timing/instrumentation around `try_admit_front_waiter` /
+   `cached_prefix_match_len` (`crates/infer-core/src/lib.rs:1128`,
+   `crates/infer-core/src/prefix.rs:19`) for the specific 8106-token shape at
+   TP=4/EP=4, and let it run far longer than the ~10-16 min already observed
+   before concluding either way — a genuinely stuck NCCL collective and a
+   legitimately-very-slow one look identical from `/v1/stats` alone.
+2. **`InFlightGuard::drop` (`coordinator.rs`) needs to propagate cancellation
+   into the engine**, not just decrement `in_flight` and unregister the sink.
+   Whatever `try_admit_front_waiter`/the per-rank engine queue is currently
+   waiting on for an abandoned request needs an explicit cancel path — this
+   is a real gap independent of (1)'s answer, since even a "just slow"
+   admission still permanently head-of-line-blocks every later request once
+   its owning HTTP client has given up.
+3. Both are `infer-core`/scheduler-level changes (bigger blast radius than
+   the relay), not `infer-server` — re-scope before touching code, per the
+   project's own >3-files/architectural-decision rule.
