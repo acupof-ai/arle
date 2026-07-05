@@ -267,8 +267,16 @@ enum AdmitOutcome {
     Admitted,
     /// No waiting request to admit.
     NoWaiter,
-    /// The front waiter does not fit the current per-tick budget.
+    /// The front waiter does not fit the current per-tick budget, but might
+    /// once other active requests finish and free pages — keep it in
+    /// `waiting` and retry on a later tick.
     Throttled,
+    /// The front waiter was popped and failed: it needs more pages than the
+    /// pool can EVER provide (checked only when the pool is completely idle,
+    /// so no other request could still free more) — retrying would wait
+    /// forever. Not a slot consumption; the caller should keep admitting
+    /// whatever is now at the front of `waiting`.
+    Rejected,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1105,6 +1113,9 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                 AdmitOutcome::Admitted => {
                     free_slots.remove(0);
                 }
+                // Rejected: the front waiter is gone (failed, not admitted) —
+                // no slot consumed, keep going against the new front.
+                AdmitOutcome::Rejected => {}
                 AdmitOutcome::NoWaiter | AdmitOutcome::Throttled => break,
             }
         }
@@ -1185,6 +1196,30 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             let reclaimed = self.evict_prefix_cache_for_pages(pages_needed - *remaining_pages);
             *remaining_pages = remaining_pages.saturating_add(reclaimed);
             if pages_needed > *remaining_pages {
+                // `self.active.is_empty()`: the pool is completely idle right
+                // now, so nothing else could ever finish and free more pages
+                // — this candidate structurally exceeds the pool's total
+                // capacity and retrying it forever would hang every later
+                // request queued behind it (2026-07-05 round 5 — see
+                // docs/experience/errors/2026-07-05-multiproc-lockstep-ack-hang-no-timeout.md).
+                // Conservative on purpose: with other requests still active,
+                // Throttle as before — they may free enough pages on finish.
+                if self.active.is_empty() {
+                    let request = self
+                        .waiting
+                        .pop_front()
+                        .expect("waiting.front() was Some above");
+                    log::warn!(
+                        "admission reject: request needs {pages_needed} KV pages, pool has \
+                         {remaining_pages} free with no other request active (prompt_len={})",
+                        request.prompt_len()
+                    );
+                    self.completed.insert(
+                        request.handle,
+                        request.complete_immediately(FinishReason::Abort).into(),
+                    );
+                    return Ok(AdmitOutcome::Rejected);
+                }
                 return Ok(AdmitOutcome::Throttled);
             }
         }
@@ -1271,9 +1306,10 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                 remaining_pages,
             )? {
                 AdmitOutcome::Admitted => preempted += 1,
-                // Demoted but the waiter still won't fit (throttle) or vanished:
-                // stop rather than churn the parked victim back and forth.
-                AdmitOutcome::Throttled | AdmitOutcome::NoWaiter => break,
+                // Demoted but the waiter still won't fit (throttle), vanished,
+                // or was rejected outright: stop rather than churn the parked
+                // victim back and forth.
+                AdmitOutcome::Throttled | AdmitOutcome::NoWaiter | AdmitOutcome::Rejected => break,
             }
         }
         Ok(())
@@ -3795,6 +3831,35 @@ mod tests {
         let completed = engine.completed(handle).expect("request rejected");
         assert!(matches!(completed.finish, Some(FinishReason::Abort)));
         assert!(completed.generated_tokens.is_empty());
+        Ok(())
+    }
+
+    /// 2026-07-05 round 5: a prompt that fits `max_prompt_tokens` but needs
+    /// more KV pages than the pool could EVER provide must be rejected once
+    /// the pool is idle, not retried (Throttled) forever — an unfittable
+    /// request stuck in `waiting` would hang every request queued behind it.
+    #[test]
+    fn request_exceeding_total_pool_capacity_is_rejected_not_throttled_forever() -> Result<()> {
+        let config = test_config(1);
+        // page_size=1, total_pages=2: 5 prompt tokens + 1 max_tokens needs 6
+        // pages, more than the pool could ever hold, even fully idle.
+        let mut engine = Engine::with_config(
+            MockExecutor::ready(),
+            MockKvPool::with_capacity(1, 1, 2),
+            config,
+        );
+
+        let handle = engine.submit_request(vec![1, 2, 3, 4, 5], 1);
+        engine.admit_waiting()?;
+
+        assert_eq!(engine.active_count(), 0, "must not have been admitted");
+        assert_eq!(
+            engine.waiting_count(),
+            0,
+            "must be rejected out of waiting, not left to retry forever"
+        );
+        let completed = engine.completed(handle).expect("request rejected");
+        assert!(matches!(completed.finish, Some(FinishReason::Abort)));
         Ok(())
     }
 
