@@ -157,18 +157,23 @@ fn init(config: LoggingConfig) {
             }) as Box<dyn logforth::Layout>,
             None => layout,
         };
-        let file_append = build_file_append(&prefix);
+        // Both sinks run on one dedicated background thread (bounded queue,
+        // drop-on-overflow) so a caller thread — inference included — never
+        // blocks on a stderr/disk write. Formatting still happens on the
+        // caller (cheap); only the actual I/O is offloaded.
+        let mut async_append = logforth::append::asynchronous::AsyncBuilder::new("arle-log")
+            .buffered_lines_limit(Some(8192))
+            .overflow_drop_incoming()
+            .append(logforth::append::Stderr::default().with_layout(layout));
+        if let Some(file_append) = build_file_append(&prefix) {
+            async_append = async_append.append(file_append);
+        }
 
         logforth::starter_log::builder()
             .dispatch(|d| {
-                let d = d
-                    .filter(filter)
+                d.filter(filter)
                     .diagnostic(ThreadLocalDiagnostic::default())
-                    .append(logforth::append::Stderr::default().with_layout(layout));
-                match file_append {
-                    Some(file_append) => d.append(file_append),
-                    None => d,
-                }
+                    .append(async_append.build())
             })
             .apply();
     });
