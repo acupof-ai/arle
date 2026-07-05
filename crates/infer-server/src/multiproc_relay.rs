@@ -96,6 +96,14 @@ pub fn broadcast_tick(seq: u64, requests: Vec<WireRequest>) -> Result<()> {
     Ok(())
 }
 
+/// Bound on one blocking `send()` syscall on a relay socket. Shorter than the
+/// coordinator's `ACK_STALL_TIMEOUT` (120s, tolerates a legitimately slow
+/// compute step) — a write that doesn't drain means the peer's TCP receive
+/// buffer is full, a more acute symptom than "still computing," so it fails
+/// fast and lets the caller's existing broadcast-error teardown path run
+/// instead of blocking the lockstep thread (and the mutex it holds) forever.
+const BROADCAST_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Transport seam for length-prefixed JSON [`RelayEnvelope`]s between coordinator
 /// and worker ranks. Only impl today is [`TcpChannel`]; the trait exists so a
 /// shm ring can plug in later without touching the loops.
@@ -109,6 +117,15 @@ pub trait RelayChannel: Send {
     /// Set a read timeout (used by the completion reader to poll for shutdown);
     /// `None` blocks indefinitely. Default is a no-op for transports without one.
     fn set_read_timeout(&mut self, _timeout: Option<Duration>) -> Result<()> {
+        Ok(())
+    }
+    /// Set a write timeout. `send()` otherwise blocks indefinitely on a full
+    /// socket buffer (the peer not draining) — the 2026-07-05 livelock had the
+    /// coordinator's lockstep thread wedged inside exactly this write, holding
+    /// the `RelayCoordinator` mutex, one call before `wait_for_ack_window` (whose
+    /// own timeout never got a chance to run). Default is a no-op for
+    /// transports without one.
+    fn set_write_timeout(&mut self, _timeout: Option<Duration>) -> Result<()> {
         Ok(())
     }
 }
@@ -142,6 +159,12 @@ impl RelayChannel for TcpChannel {
         self.0
             .set_read_timeout(timeout)
             .context("TcpChannel set_read_timeout")
+    }
+
+    fn set_write_timeout(&mut self, timeout: Option<Duration>) -> Result<()> {
+        self.0
+            .set_write_timeout(timeout)
+            .context("TcpChannel set_write_timeout")
     }
 }
 
@@ -640,7 +663,12 @@ impl PendingRelayCoordinator {
                     if rank >= world_size {
                         bail!("RelayCoordinator worker rank {rank} out of range [0, {world_size})");
                     }
-                    let channel: Box<dyn RelayChannel> = Box::new(TcpChannel::new(stream));
+                    let mut channel: Box<dyn RelayChannel> = Box::new(TcpChannel::new(stream));
+                    channel
+                        .set_write_timeout(Some(BROADCAST_WRITE_TIMEOUT))
+                        .with_context(|| {
+                            format!("RelayCoordinator worker rank {rank} set_write_timeout")
+                        })?;
                     if workers.insert(rank, channel).is_some() {
                         bail!("RelayCoordinator duplicate worker rank {rank}");
                     }
@@ -1008,9 +1036,13 @@ impl RelayWorker {
                     log::info!(
                         "[relay-worker] rank {rank}/{world_size} connected to coordinator at {coordinator}"
                     );
-                    return Ok(Self {
-                        channel: Box::new(TcpChannel::new(stream)),
-                    });
+                    let mut channel: Box<dyn RelayChannel> = Box::new(TcpChannel::new(stream));
+                    channel
+                        .set_write_timeout(Some(BROADCAST_WRITE_TIMEOUT))
+                        .with_context(|| {
+                            format!("RelayWorker rank {rank}/{world_size} set_write_timeout")
+                        })?;
+                    return Ok(Self { channel });
                 }
                 Err(err) => {
                     last_err = Some(err);
@@ -1187,6 +1219,43 @@ fn read_envelope(stream: &mut TcpStream) -> Result<Option<RelayEnvelope>> {
 mod tests {
     use super::*;
     use std::thread;
+
+    /// The 2026-07-05 livelock's actual freeze point: the coordinator wedged
+    /// inside `send()` on a peer that stopped reading. A non-reading peer
+    /// fills the socket buffer after enough writes; `set_write_timeout` must
+    /// turn that block into a bounded `Err`, not a permanent hang.
+    #[test]
+    fn write_timeout_bounds_a_send_to_a_non_reading_peer() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Accept and hold the connection open, but never read from it —
+        // simulates the stuck-peer symptom without needing a real second process.
+        let _peer = thread::spawn(move || listener.accept().unwrap().0);
+        let mut client = TcpChannel::new(TcpStream::connect(addr).unwrap());
+        client
+            .set_write_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        let envelope = RelayEnvelope::TickAdmissions {
+            seq: 0,
+            requests: vec![],
+        };
+        let started = Instant::now();
+        let err = loop {
+            if let Err(err) = client.send(&envelope) {
+                break err;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "socket buffer never filled after 5s of sends"
+            );
+        };
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "send() only errored after {:?}, longer than any reasonable write timeout",
+            started.elapsed()
+        );
+        drop(err); // just needs to be an Err; message is OS/timing-dependent.
+    }
 
     #[test]
     fn envelope_round_trip() {
