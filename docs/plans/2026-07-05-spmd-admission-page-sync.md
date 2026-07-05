@@ -6,7 +6,9 @@
 > unrelated mechanism (a plain capacity shortfall with no reject path) — see
 > "Round 5" in
 > [errors/2026-07-05-multiproc-lockstep-ack-hang-no-timeout.md](../experience/errors/2026-07-05-multiproc-lockstep-ack-hang-no-timeout.md),
-> fixed separately in `eeac3d2b9`.
+> fixed and pod-verified separately in `eeac3d2b9`. **The original
+> user-reported hang (`prompt_tokens≈8106` at TP=4/EP=4) is now fully
+> resolved end-to-end** — both fixes confirmed on real hardware.
 
 ## Root cause — proven, not inferred
 
