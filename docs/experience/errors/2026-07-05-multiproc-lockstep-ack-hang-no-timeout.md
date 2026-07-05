@@ -105,6 +105,50 @@ write now surfaces as an `Err` through the existing `write_all`/`?` chain,
 which `lockstep_loop`'s pre-existing broadcast-error branch already tears
 down on — no new plumbing needed for that half.
 
+## Second fix (`57606c63c`) is sound but doesn't fix the reported hang — the freeze is one layer deeper
+
+Retest 2 (same repro, `prompt_tokens=8106`, fresh build with both fixes):
+**still hangs forever** — 590s+ client timeout, zero bytes, zero HTTP
+response (not even an error). `grep` for every fix's log signature
+(`"lockstep stalled"`, `"lockstep ack wait exceeded"`, any broadcast-error
+line) on the server log: **zero matches, neither fired.** gdb this time
+shows a clean relay layer — all 4 workers parked normally in
+`TcpChannel::recv` waiting for a tick, the coordinator's lockstep thread
+parked in the fully-idle branch (`submit_rx.recv_timeout(IDLE_PARK)`,
+`in_flight == 0`). One snapshot caught rank0 inside `Engine::step →
+try_admit_front_waiter → cached_prefix_match_len →
+TpRuntime::all_reduce_min_scalar_i32` (an NCCL collective in the admission
+path) — real engine-side work, not a relay block.
+
+**Both TCP fixes are validated correct and kept** (their own unit/repro tests
+pass, and this run's regression check confirms the relay layer itself is
+healthy — sockets clean, `/v1/stats` round-trips throughout). They were
+just never the actual mechanism for *this* specific hang.
+
+**New mechanism, inferred from the evidence (not yet file:line pinned):** the
+HTTP client's own timeout fires and cancels the request client-side;
+`InFlightGuard::drop` (`coordinator.rs`) decrements `in_flight` and
+unregisters the sink, but does **not** cancel anything inside the engine —
+the request is still sitting half-admitted in each worker's internal state.
+Once `in_flight` hits 0, `lockstep_loop` stops broadcasting ticks entirely
+(idle), so the abandoned request never gets popped, retried, or torn down —
+a permanent head-of-line zombie. The control request (`prompt_tokens=7661`,
+independently verified healthy standalone: 4.97s, HTTP 200) queued behind
+this zombie in the same per-rank FIFO and **also hung forever** — reproducing
+the original "hangs the entire server" symptom through a third, different
+mechanism than either landed fix.
+
+Two separate open questions this surfaces, not one:
+1. Why does `try_admit_front_waiter`'s admission (the `all_reduce_min_scalar_i32`
+   cross-rank collective) never complete or error for this specific
+   8106-token shape — an actual stuck collective, or just legitimately very
+   slow and never given long enough to finish? Not distinguished yet.
+2. **`InFlightGuard::drop` only touches coordinator-side bookkeeping — it
+   never propagates a cancellation into the engine.** This looks like a real,
+   separate gap regardless of (1): a client that disconnects/times out should
+   free the engine-side resources its abandoned request holds, not leave a
+   zombie that head-of-line-blocks every later request on the same rank.
+
 ## Rule
 
 - **A retry/wait loop gating shared server state (here: every HTTP request)
@@ -125,3 +169,11 @@ down on — no new plumbing needed for that half.
   just a unit test of the fixed function in isolation) is what caught this —
   the unit test for `wait_for_ack_window_impl` passed and proved nothing
   about the call site the fix didn't reach.
+- **"Same symptom" does not mean "same mechanism" — retest after every fix,
+  don't assume the second hang is the first hang unresolved.** Two fixes into
+  the relay layer, gdb showed a THIRD, unrelated freeze point (engine
+  admission, not the TCP relay at all) producing an identical-looking
+  permanent hang. Each attempt's unit tests were real and each fix was
+  individually correct for the mechanism it targeted; none of that licenses
+  "therefore the user-facing bug is fixed" without a fresh gdb/log check on
+  the actual repro, every time.
