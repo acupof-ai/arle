@@ -60,18 +60,25 @@ independent of this gap; it does not by itself validate that the tripwire
 would fire on a real drift in the batched lane (no drift was injected to
 test it — the gate is a correctness gate, not a guard-fires fuzz test).
 
-## Problems — orthogonal TP=4 engine hang (not this diff)
+## Problems — orthogonal multiproc lockstep hang (not this diff), now root-caused
 
 Prompts with `prompt_tokens` ≳8106 froze the entire multiproc engine
 indefinitely (`/v1/stats` `steps` frozen, zero progress, reproducible on the
 very first request — not a leak). Bisected: 7661 pt OK, 8106 pt hangs.
 **Controlled A/B**: reproduced the identical hang at the identical length on
 a second pod tree built at `c89c26ae` (immediately before P1), same
-TP=4/EP=4/`INFER_DSV4_MAX_SEQ_LEN=16384` config — confirms this is a
-**pre-existing TP=4-specific ceiling, not a regression from this refactor**.
-Most likely cause (not isolated further, out of scope here): the VRAM squeeze
-from halving rank count vs the TP=8 baseline. 12K–32K therefore unreachable
-under TP=4 in this session.
+TP=4/EP=4/`INFER_DSV4_MAX_SEQ_LEN=16384` config — confirms this is
+**pre-existing, not a regression from this refactor**.
+
+The initial "VRAM squeeze" guess from that A/B alone was **measured and
+refuted** in a follow-up investigation: GPU memory stays flat at
+96999/97871 MiB for the entire hang (no growth, no OOM, no fresh Xid), and
+gdb backtraces on a symbol build show the real mechanism is a livelock in
+the multiproc coordinator's lockstep ack-wait (`coordinator.rs:88-109`
+`wait_for_ack_window` has no timeout — see
+[errors/2026-07-05-multiproc-lockstep-ack-hang-no-timeout.md](../errors/2026-07-05-multiproc-lockstep-ack-hang-no-timeout.md)
+for the full mechanism). 12K–32K therefore unreachable under TP=4 in this
+session, independent of the DSv4 KV-storage refactor either way.
 
 ## Verdict
 

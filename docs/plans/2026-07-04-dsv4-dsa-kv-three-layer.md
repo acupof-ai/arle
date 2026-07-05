@@ -13,11 +13,13 @@
 >
 > **Pod needle gate** (2000/4000/8000/8500 tokens, crossing the 2048 comp-row
 > boundary): all-exact, no partial/miss — PASS. 32K leg blocked by an orthogonal
-> pre-existing TP=4 engine hang (control-verified against pre-P1 `c89c26ae`, not a
-> regression from this diff); recommend re-testing at TP=8/EP=8. Review during this
-> verification also found the P4 shape guard wired into only 1 of 3 live
-> `CompressedSparse` call sites (missing the default batched-decode lane and the
-> graph-decode lane) — fixed same day. Full write-up:
+> pre-existing bug, root-caused (not this diff, not VRAM — a livelock in the
+> multiproc lockstep coordinator's un-timed ack wait,
+> [errors/2026-07-05-multiproc-lockstep-ack-hang-no-timeout.md](../experience/errors/2026-07-05-multiproc-lockstep-ack-hang-no-timeout.md)).
+> Review during this verification also found the P4 shape guard wired into
+> only 1 of 3 live `CompressedSparse` call sites (missing the default
+> batched-decode lane and the graph-decode lane) — fixed same day. Full
+> write-up:
 > [wins/2026-07-05-dsv4-p1-p2-p4-needle-gate.md](../experience/wins/2026-07-05-dsv4-p1-p2-p4-needle-gate.md).
 
 ## Audit — storage access is race-free on every path  [V]
