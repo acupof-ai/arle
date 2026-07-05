@@ -549,6 +549,19 @@ impl TickAckLedger {
             .min()
             .unwrap_or(0)
     }
+
+    /// Ranks currently holding back [`Self::min_acked`] — the stragglers a
+    /// stalled ack-window wait should name in its log line, instead of just
+    /// reporting the aggregate count.
+    #[must_use]
+    pub fn stragglers(&self) -> Vec<(usize, u64)> {
+        let min = self.min_acked();
+        self.per_rank
+            .iter()
+            .map(|(rank, count)| (*rank, count.load(Ordering::Acquire)))
+            .filter(|(_, count)| *count == min)
+            .collect()
+    }
 }
 
 /// Coordinator-side TCP relay. Binds a port, accepts N-1 worker connections at
@@ -801,6 +814,14 @@ impl RelayCoordinator {
     #[must_use]
     pub fn min_acked_ticks(&self) -> u64 {
         self.tick_acks.min_acked()
+    }
+
+    /// `(rank, acked_ticks)` for the rank(s) currently holding back
+    /// [`Self::min_acked_ticks`] — named so a stalled ack-window wait can log
+    /// which rank(s), not just the aggregate count.
+    #[must_use]
+    pub fn stalled_ranks(&self) -> Vec<(usize, u64)> {
+        self.tick_acks.stragglers()
     }
 
     /// Whether any rank's completion reader has died (EOF / hard error). The
