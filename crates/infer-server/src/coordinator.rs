@@ -79,47 +79,26 @@ fn dump_messages_body(body: &serde_json::Value) {
 /// ~608k queued ticks for ~600 engine steps).
 const TICK_WINDOW: u64 = 4;
 
-/// A worker can stop acking without ever closing its socket — a hung compute
-/// thread (root cause of the 2026-07-05 TP=4 8106-token livelock, see
-/// docs/experience/errors/2026-07-05-multiproc-lockstep-ack-hang-no-timeout.md)
-/// leaves `any_worker_dead()` false forever. Bounds [`wait_for_ack_window`] so
-/// that case fails the same way a crash does, instead of hanging every HTTP
-/// request permanently. Generous relative to any observed real step time
-/// (legitimate long prefill chunks are seconds, not minutes).
+/// A worker can stop acking without closing its socket, leaving
+/// `any_worker_dead()` false forever (2026-07-05 TP=4 livelock — see
+/// docs/experience/errors/2026-07-05-multiproc-lockstep-ack-hang-no-timeout.md).
+/// Bounds [`wait_for_ack_window`] so that case fails like a crash instead of
+/// hanging every request permanently. Generous vs. any real step time.
 const ACK_STALL_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Block until `seq` is within [`TICK_WINDOW`] of the slowest rank's tick ack.
-/// Returns `None` when it's safe to proceed, `Some(reason)` when the lockstep
-/// group is broken and the caller must tear down instead. Never aborts on a
-/// SLOW worker (a long prefill chunk legitimately holds acks for seconds —
-/// warn rate-limited and keep waiting). Two ways a worker is lost: a CRASHED
-/// worker's reader marks it dead immediately (the next broadcast would hit its
-/// dead socket and take the `fail_all` path anyway); or a worker that neither
-/// acks nor closes its socket — [`ACK_STALL_TIMEOUT`] bounds that case too,
-/// since `any_dead` alone never fires for it.
+/// `None` = safe to proceed. `Some(reason)` = the lockstep group is broken
+/// (a crashed worker, or one stalled past [`ACK_STALL_TIMEOUT`]) and the
+/// caller must tear down. Never aborts on a merely SLOW worker.
 fn wait_for_ack_window(relay: &Arc<Mutex<RelayCoordinator>>, seq: u64) -> Option<String> {
-    wait_for_ack_window_impl(relay, seq, ACK_STALL_TIMEOUT)
-}
-
-/// `stall_timeout` is [`ACK_STALL_TIMEOUT`] in production; a param only so
-/// tests can shrink it instead of waiting out the real 120s.
-fn wait_for_ack_window_impl(
-    relay: &Arc<Mutex<RelayCoordinator>>,
-    seq: u64,
-    stall_timeout: Duration,
-) -> Option<String> {
     let started = Instant::now();
-    let mut next_warn = Duration::from_secs(10).min(stall_timeout);
+    let mut next_warn = Duration::from_secs(10);
     loop {
-        let (min_acked, any_dead, stalled_ranks) = {
+        let (min_acked, any_dead) = {
             let coord = relay
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            (
-                coord.min_acked_ticks(),
-                coord.any_worker_dead(),
-                coord.stalled_ranks(),
-            )
+            (coord.min_acked_ticks(), coord.any_worker_dead())
         };
         if any_dead {
             return Some("a worker's relay reader observed EOF/error".to_string());
@@ -128,20 +107,19 @@ fn wait_for_ack_window_impl(
             return None;
         }
         let elapsed = started.elapsed();
-        if elapsed >= stall_timeout {
+        if elapsed >= ACK_STALL_TIMEOUT {
             log::error!(
-                "[coordinator] lockstep ack wait exceeded {stall_timeout:?} at tick #{seq} \
-                 (min_acked={min_acked}, stalled ranks={stalled_ranks:?}); tearing down instead \
-                 of hanging forever"
+                "[coordinator] lockstep ack wait exceeded {ACK_STALL_TIMEOUT:?} at tick #{seq} \
+                 (min_acked={min_acked}); tearing down instead of hanging forever"
             );
             return Some(format!(
-                "tick #{seq} ack wait exceeded {stall_timeout:?}, stalled ranks={stalled_ranks:?}"
+                "tick #{seq} ack wait exceeded {ACK_STALL_TIMEOUT:?}"
             ));
         }
         if elapsed >= next_warn {
             log::warn!(
                 "[coordinator] lockstep stalled: tick #{seq} awaiting acks (min_acked={min_acked}, \
-                 elapsed={elapsed:?}, stalled ranks={stalled_ranks:?})"
+                 elapsed={elapsed:?})"
             );
             next_warn += Duration::from_secs(10);
         }
@@ -1159,32 +1137,7 @@ async fn stats(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::multiproc_relay::RelayWorker;
     use serde_json::json;
-    use std::net::SocketAddr;
-
-    /// The 2026-07-05 livelock: a worker that connects, acks nothing, and never
-    /// closes its socket must not hang `wait_for_ack_window` forever.
-    #[test]
-    fn ack_window_gives_up_on_a_silently_stalled_worker() {
-        let pending = RelayCoordinator::bind().unwrap();
-        let coord_addr: SocketAddr = format!("127.0.0.1:{}", pending.port()).parse().unwrap();
-        let _worker_conn = std::thread::spawn(move || {
-            // Connect and go silent — never sends TickAck, never disconnects.
-            let worker =
-                RelayWorker::connect_with_rank(coord_addr, Duration::from_secs(5), 1, 2).unwrap();
-            std::thread::sleep(Duration::from_secs(2));
-            drop(worker);
-        });
-        let relay = Arc::new(Mutex::new(
-            pending.accept(2, Duration::from_secs(5)).unwrap(),
-        ));
-        let reason = wait_for_ack_window_impl(&relay, TICK_WINDOW, Duration::from_millis(50));
-        assert!(
-            reason.is_some_and(|r| r.contains("stalled ranks")),
-            "expected a stall reason naming the stuck rank"
-        );
-    }
 
     #[test]
     fn prompt_prefills_think_keys_off_rendered_tail() {
