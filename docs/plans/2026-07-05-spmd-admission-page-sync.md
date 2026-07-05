@@ -1,8 +1,12 @@
 # SPMD admission divergence — sync the free-pages check across TP ranks
 
-> Status: Active — approach written, awaiting go-ahead before touching
-> `infer-core`/`infer-seam`/`infer-cuda` (>3-file, cross-crate change to the
-> core scheduler's admission path, affects every TP>1 config).
+> Status: Shipped (`5fd6a8984`) and pod-verified — all 4 ranks now call the
+> admission collective symmetrically, no divergence. This closed the
+> SPMD-livelock class of bug, but the same repro hung again via a separate,
+> unrelated mechanism (a plain capacity shortfall with no reject path) — see
+> "Round 5" in
+> [errors/2026-07-05-multiproc-lockstep-ack-hang-no-timeout.md](../experience/errors/2026-07-05-multiproc-lockstep-ack-hang-no-timeout.md),
+> fixed separately in `eeac3d2b9`.
 
 ## Root cause — proven, not inferred
 
