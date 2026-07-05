@@ -237,18 +237,31 @@ forever. Deliberately conservative: with other requests still active,
 behavior is unchanged (Throttle — they may free enough pages on finish), so
 there is no false-positive-rejection path.
 
-## Status — round 5's fix pod-verification pending
+**Pod-verified** (two independently launched fresh servers, 4 repeats): the
+`prompt_tokens=8106` repro now returns HTTP 200 in **0.017s** with
+`{"finish_reason":"abort", "usage":{"prompt_tokens":8106,"completion_tokens":0}}`
+instead of hanging — deterministic across every run. Log line, all 4 ranks,
+every run: `admission reject: request needs 127 KV pages, pool has 121 free
+with no other request active (prompt_len=8106)` — matches the diagnostic's
+127-vs-121 numbers exactly. The `prompt_tokens=7661` control still completes
+normally (HTTP 200, 4.97s cold / 0.66s prefix-cached, `finish_reason:length`)
+on both servers — no false-positive rejection. Server health after
+rejection: control → repro → repro → repro → control, all correct, no
+degradation, no zombie state.
 
-Both `infer-server` (relay, rounds 2-3) and `infer-core` (scheduler, rounds
-4-5) fixes are landed, locally tested, and typechecked end-to-end. Round 4's
-fix is pod-verified; round 5's is not yet (as of this writing). Next-session
-starting points if round 5 does not fully close it:
+## Status — CLOSED. The original user-reported hang is fully resolved end-to-end
 
-1. ~~Is `all_reduce_min_scalar_i32` actually stuck, or just slow?~~ **Answered
-   by round 4/5**: not stuck — pod-confirmed symmetric and fast on every
-   tick. The apparent hang was rounds 4's (now-fixed) divergence, then round
-   5's (now-fixed) unbounded-retry-with-no-reject-path.
-2. **`InFlightGuard::drop` (`coordinator.rs`) still does not propagate
+Five rounds: 1-3 fixed real relay-layer gaps (kept, not the root cause); 4
+fixed a genuine SPMD admission-collective divergence (pod-verified); 5 fixed
+the actual terminal mechanism — an unbounded `Throttled` retry with no
+"can this ever fit" check (pod-verified). `prompt_tokens≈8106` at TP=4/EP=4
+now returns a fast, correct abort instead of freezing the server forever, and
+the server keeps serving normal traffic afterward.
+
+**One separate, explicitly out-of-scope gap remains** (not touched by any of
+these 5 rounds' fixes), next-session starting point:
+
+1. **`InFlightGuard::drop` (`coordinator.rs`) still does not propagate
    cancellation into the engine** — a client that disconnects/times out only
    decrements coordinator-side `in_flight` and unregisters the sink; the
    engine-side request state (whatever slot/queue entry it holds) is never
@@ -256,7 +269,7 @@ starting points if round 5 does not fully close it:
    request that COULD eventually fit (just slowly, or waiting on other active
    requests) and whose client gave up is still a zombie occupying `waiting`
    or a slot forever. Real gap, independent of rounds 4/5's fixes, still open.
-3. `InFlightGuard`/cancellation is an `infer-core`/`infer-server` cross-cutting
+2. `InFlightGuard`/cancellation is an `infer-core`/`infer-server` cross-cutting
    change (bigger blast radius than rounds 4-5's targeted fixes) — re-scope
    with its own plan doc before touching code, per the project's own
    >3-files/architectural-decision rule.
