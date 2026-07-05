@@ -371,12 +371,20 @@ fn run_lockstep_driver(
                             )
                         })?;
                 }
+                // Followers never drain_completions (owns_output-gated), so
+                // without this their request_id->handle map (kept for
+                // CancelRequest lookups) would grow for the process lifetime.
+                engine.prune_finished();
                 // Flow-control ack, sent unconditionally (an idle skip still
                 // consumes the tick — the coordinator may legitimately over-send
                 // decode-only ticks). Paces the coordinator's tick window.
                 relay
                     .send(&RelayEnvelope::TickAck { rank, seq })
                     .with_context(|| format!("worker rank {rank} tick ack (tick #{seq})"))?;
+            }
+            Some(RelayEnvelope::CancelRequest { request_id }) => {
+                log::debug!("[arle-worker rank={rank}] cancel req#{request_id}");
+                engine.cancel(request_id);
             }
             Some(RelayEnvelope::StatsQuery { request_id }) => {
                 let prefix = engine.prefix_cache_stats();

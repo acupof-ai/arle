@@ -453,6 +453,14 @@ pub enum RelayEnvelope {
         seq: u64,
         requests: Vec<WireRequest>,
     },
+    /// A request's HTTP client disconnected/timed out — cancel it in every
+    /// rank's engine (`InFlightGuard::drop`, coordinator.rs). Broadcast
+    /// BEFORE the tick's `TickAdmissions` so every rank applies it at the
+    /// identical point relative to that tick's step, same discipline as
+    /// admissions (2026-07-05 multiproc hang investigation —
+    /// docs/experience/errors/2026-07-05-multiproc-lockstep-ack-hang-no-timeout.md).
+    /// A no-op on a rank where the request already finished naturally.
+    CancelRequest { request_id: u64 },
     /// Worker→coordinator flow control: rank consumed the tick with this seq
     /// (sent whether or not the engine stepped — an idle skip still consumes).
     /// The coordinator caps unacked ticks at a fixed window so the tick stream
