@@ -289,9 +289,29 @@ Tests: 3 new `infer-core` tests (cancel while waiting / cancel while active /
 no-op on finished-or-unknown), 1 new `infer-server` test proving the wire
 ordering (`CancelRequest` arrives before its paired `TickAdmissions`). Full
 downstream typecheck clean (cuda+no-cuda, cpu+no-cuda, metal+no-cuda), 0 new
-clippy warnings. **Not yet pod-verified** as of this writing — the actual
-cross-rank symmetry (the exact hazard class round 4 hit) has only been
-typechecked and unit-tested, never run on real multi-rank hardware.
+clippy warnings.
+
+**Pod-verified** (TP=4/EP=4, `RUST_LOG=debug`): 3 client-disconnect cycles
+(client timeout + 2× `kill -9` mid-decode), each restored `kv_free_pages` to
+the full 121-page pool immediately (no zombie slot) and left the server fully
+healthy — a follow-up normal request completed in 1.44-1.59s every time (vs.
+1.63s baseline), no hang, no desync, no `lockstep stalled`/panic/error lines
+anywhere. Per-rank log evidence across the whole session: `grep 'cancel
+req#'` → exactly 40 lines = 10 request IDs × 4 ranks, e.g. all 4 ranks
+logging `cancel req#7` within ~20μs of each other — same-tick delivery,
+exactly the invariant this fix exists to guarantee. Round 5's capacity
+rejection (0.017s abort) and the 7661-token control (4.78s, matches
+baseline) both unregressed.
+
+## Status — CLOSED. All 6 rounds pod-verified; the multiproc investigation is done.
+
+Rounds 1-3: relay-layer hardening (kept). Round 4: SPMD admission-collective
+divergence (pod-verified). Round 5: capacity-shortfall reject path
+(pod-verified). Round 6: `InFlightGuard` cancellation propagation
+(pod-verified). No further gaps identified. One explicitly deferred,
+low-priority item: single-GPU/local-relay-driver serve does not handle
+`CancelRequest` (silent no-op) — own follow-up if ever needed, not a gap in
+the multiproc path this investigation covered.
 
 Deliberately out of scope: the single-process/local relay driver
 (`infer-server/src/lib.rs`'s "local-relay-driver" loop, used for single-GPU
