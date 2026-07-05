@@ -72,6 +72,39 @@ again").
   TP>1-specific by construction (`TP=1 never reaches here`), so it cannot
   reproduce at TP=1, but whether TP=8 also breaks at ~8106 tokens is open.
 
+## First fix attempt was incomplete — retested, found the real blocking site
+
+`b595b0e95` added `ACK_STALL_TIMEOUT` (120s) to `wait_for_ack_window`,
+bounding the "poll `min_acked`, sleep, repeat" loop. Pod retest (same
+TP=4/EP=4, `prompt_tokens=8106`) showed **the request still hung forever** —
+two independent repro attempts, one waited out a 600s client timeout with
+zero response. gdb on a symbol build caught the actual freeze:
+
+```
+#0  send() [libc]
+#3  infer_server::multiproc_relay::write_envelope
+#4  infer_server::multiproc_relay::RelayCoordinator::broadcast
+#5  infer_server::coordinator::lockstep_loop
+```
+
+The coordinator's lockstep thread was wedged **one call earlier** than the
+fix reaches — inside the raw blocking `send()` that `broadcast()` does to
+push a tick, while holding the `RelayCoordinator` mutex. `TcpStream` has no
+write timeout by default, so a peer not draining its receive buffer blocks
+this write indefinitely; `wait_for_ack_window` never gets a chance to run
+(and its new timeout never fires) because the loop never reaches it for that
+tick. `grep -c "lockstep stalled\|lockstep ack wait exceeded"` on the retest
+logs was `0` — direct confirmation the new code path was never reached. This
+is exactly the "rank2 was in `send()`" alternate freeze point the original
+investigation had already flagged as a second, distinct freeze location.
+
+**Second fix**: `set_write_timeout` (30s, shorter than `ACK_STALL_TIMEOUT` —
+a full send buffer is a more acute symptom than "still computing") on every
+`TcpChannel`, coordinator and worker side, at connection setup. A timed-out
+write now surfaces as an `Err` through the existing `write_all`/`?` chain,
+which `lockstep_loop`'s pre-existing broadcast-error branch already tears
+down on — no new plumbing needed for that half.
+
 ## Rule
 
 - **A retry/wait loop gating shared server state (here: every HTTP request)
@@ -84,3 +117,11 @@ again").
   diff caused it" but said nothing about *why*. Root-cause hypotheses need
   their own verification (here: `nvidia-smi` during the hang + gdb
   backtraces), same as any other claim.
+- **A fix for "the retry loop can hang" must bound every blocking call in the
+  call chain, not just the one with the obvious retry loop** — the ack-wait
+  loop was the visible poll-and-sleep pattern, but the actual freeze was one
+  synchronous, unrelated-looking `write_all()` call earlier in the same
+  function that nothing in the loop protects. Retest on the real repro (not
+  just a unit test of the fixed function in isolation) is what caught this —
+  the unit test for `wait_for_ack_window_impl` passed and proved nothing
+  about the call site the fix didn't reach.
