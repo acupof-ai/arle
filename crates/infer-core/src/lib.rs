@@ -1081,7 +1081,14 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         let mut remaining_prefill_tokens = self.config.prefill_step_budget();
         let mut active_prefills = self.active_prefill_count();
         let max_prefills = self.config.max_concurrent_prefill();
-        let mut remaining_pages = self.kv.free_pages();
+        // TP-synced: a rank-local `free_pages()` can differ across ranks (e.g.
+        // per-rank KV-tier host-demote residuals), and this value gates the
+        // same Admit/Throttle decision as the `cached_prefix_match_len`
+        // collective below — a diverging decision means one rank stops
+        // calling that collective while another keeps calling it every tick,
+        // a permanent cross-rank admission livelock (2026-07-05 TP=4 hang,
+        // docs/experience/errors/2026-07-05-multiproc-lockstep-ack-hang-no-timeout.md).
+        let mut remaining_pages = self.executor.tp_sync_min(self.kv.free_pages())?;
         self.evict_prefix_cache_if_below_low_water();
 
         while self.active.len() < running_cap {

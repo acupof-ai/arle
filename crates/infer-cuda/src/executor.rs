@@ -426,6 +426,16 @@ impl RealCudaExecutor {
         }
     }
 
+    /// `BackendExecutor::tp_sync_min` — see there for why the scheduler needs
+    /// this (2026-07-05 TP=4 admission livelock).
+    pub(crate) fn tp_sync_min(&self, local: usize) -> Result<usize> {
+        match self {
+            Self::Qwen(q) => q.tp_sync_min(local),
+            Self::Qwen35(q) => q.tp_sync_min(local),
+            Self::Dsv4(d) => d.tp_sync_min(local),
+        }
+    }
+
     pub(crate) fn capture_cached_prefix(&mut self, slot: usize, tokens: &[u32]) -> Result<()> {
         match self {
             Self::Dsv4(d) => d.capture_cached_prefix(slot, tokens),
@@ -797,6 +807,19 @@ impl std::fmt::Debug for QwenCudaExecutor {
 }
 
 impl QwenCudaExecutor {
+    /// `BackendExecutor::tp_sync_min` — see there for why the scheduler needs
+    /// this (2026-07-05 TP=4 admission livelock). Dense Qwen3 has no existing
+    /// `tp_min_usize` helper (unlike DSv4/Qwen3.6, which already use one for
+    /// KV-budget clamping), so this inlines the same all-reduce.
+    pub(crate) fn tp_sync_min(&self, local: usize) -> Result<usize> {
+        let capped = i32::try_from(local.min(i32::MAX as usize)).unwrap_or(i32::MAX);
+        self.model
+            .tp
+            .all_reduce_min_scalar_i32(&self.model.ctx, capped)
+            .map(|v| v.max(0) as usize)
+            .map_err(|e| anyhow::anyhow!("Qwen3 TP min-reduce admission free pages failed: {e}"))
+    }
+
     /// `mem_fraction_static` (default 0.9): the dense shared paged pool is sized
     /// from MEASURED free VRAM after weights load (`infer_seam::profile_kv_pool_tokens`,
     /// SGLang-style), NOT the requested `total_pages`. `total_pages` becomes a
@@ -2491,6 +2514,12 @@ impl Dsv4CudaExecutor {
         self.tp_min_usize(local, "prefix match len")
     }
 
+    /// `BackendExecutor::tp_sync_min` — see there for why the scheduler needs
+    /// this (2026-07-05 TP=4 admission livelock).
+    pub(crate) fn tp_sync_min(&self, local: usize) -> Result<usize> {
+        self.tp_min_usize(local, "admission free pages")
+    }
+
     /// Capture `slot`'s whole-slot KV snapshot into the position-0 prefix store,
     /// keyed by `tokens` (the full prompt).
     ///
@@ -3608,6 +3637,12 @@ impl Qwen35CudaExecutor {
             .all_reduce_min_scalar_i32(&self.model.ctx, capped)
             .map(|v| v.max(0) as usize)
             .map_err(|e| anyhow::anyhow!("Qwen3.6 TP min-reduce {what} failed: {e}"))
+    }
+
+    /// `BackendExecutor::tp_sync_min` — see there for why the scheduler needs
+    /// this (2026-07-05 TP=4 admission livelock).
+    pub(crate) fn tp_sync_min(&self, local: usize) -> Result<usize> {
+        self.tp_min_usize(local, "admission free pages")
     }
 
     /// Demote `slot`'s entire device state into the host `slot_tier` under `key`.

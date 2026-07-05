@@ -696,6 +696,14 @@ impl BackendExecutor for CudaExecutor {
         }
     }
 
+    fn tp_sync_min(&self, local: usize) -> anyhow::Result<usize> {
+        match &self.inner {
+            CudaExecutorInner::Placeholder => Ok(local),
+            #[cfg(feature = "cuda")]
+            CudaExecutorInner::Real(real) => real.tp_sync_min(local),
+        }
+    }
+
     fn capture_cached_prefix(&mut self, slot: usize, tokens: &[u32]) -> anyhow::Result<()> {
         match &mut self.inner {
             CudaExecutorInner::Placeholder => {
