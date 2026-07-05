@@ -1049,6 +1049,41 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         self.completed.insert(request.handle, request.into());
     }
 
+    /// Cancel `handle`: drop it from `waiting` if not yet admitted, or free
+    /// its slot (same release path as a natural finish) if active/decoding.
+    /// A no-op if `handle` already finished or is unknown — safe to call
+    /// unconditionally on a request that may have already completed on its
+    /// own (e.g. a client-disconnect guard that fires after the stream
+    /// already ended naturally).
+    ///
+    /// MULTIPROC INVARIANT: like admission, this mutates scheduler-visible
+    /// state (`waiting`, `active`, KV page counts) — call it identically, on
+    /// the same tick, on every rank in an SPMD group, or ranks desync (the
+    /// same hazard class as the 2026-07-05 TP=4 admission livelock; see
+    /// docs/experience/errors/2026-07-05-multiproc-lockstep-ack-hang-no-timeout.md).
+    /// The multiproc driver carries cancellations through the same
+    /// `TickAdmissions` broadcast as new admissions for exactly this reason.
+    pub fn cancel_request(&mut self, handle: RequestHandle) -> bool {
+        if let Some(pos) = self.waiting.iter().position(|r| r.handle == handle) {
+            let request = self.waiting.remove(pos).expect("position found above");
+            self.completed.insert(
+                handle,
+                request.complete_immediately(FinishReason::Abort).into(),
+            );
+            return true;
+        }
+        if let Some(&slot) = self
+            .active
+            .iter()
+            .find(|(_, r)| r.handle == handle)
+            .map(|(slot, _)| slot)
+        {
+            self.finish_slot(slot, FinishReason::Abort);
+            return true;
+        }
+        false
+    }
+
     fn record_attached_prefix_metrics(&mut self, attached_pages: usize) {
         if !self.config.enable_prefix_cache {
             return;
@@ -3860,6 +3895,72 @@ mod tests {
         );
         let completed = engine.completed(handle).expect("request rejected");
         assert!(matches!(completed.finish, Some(FinishReason::Abort)));
+        Ok(())
+    }
+
+    /// `InFlightGuard`'s cancellation propagation (2026-07-05 follow-up):
+    /// a still-queued request must be droppable without ever occupying a
+    /// slot.
+    #[test]
+    fn cancel_waiting_request_completes_it_aborted() -> Result<()> {
+        let config = test_config(1);
+        let mut engine = Engine::with_config(MockExecutor::ready(), MockKvPool::new(1), config);
+        let first = engine.submit_request(vec![1], 4);
+        let second = engine.submit_request(vec![2], 4);
+        engine.admit_waiting()?;
+        assert_eq!(engine.active_count(), 1, "only one slot");
+        assert_eq!(engine.waiting_count(), 1, "second is still queued");
+
+        assert!(engine.cancel_request(second));
+
+        assert_eq!(engine.waiting_count(), 0);
+        assert!(matches!(
+            engine.completed(second).expect("cancelled").finish,
+            Some(FinishReason::Abort)
+        ));
+        // Unaffected: the admitted request keeps running.
+        assert_eq!(engine.active_count(), 1);
+        assert!(engine.completed(first).is_none());
+        Ok(())
+    }
+
+    /// Cancelling an ACTIVE (decoding) request must free its slot/KV pages
+    /// through the same release path a natural finish uses, not leak them.
+    #[test]
+    fn cancel_active_request_frees_its_slot() -> Result<()> {
+        let mut engine = Engine::new(MockExecutor::ready(), MockKvPool::new(1), 1);
+        let handle = engine.submit_request(vec![1, 2, 3], 4);
+        engine.step()?; // admit + run at least one step so pages are actually held
+        assert_eq!(engine.active_count(), 1);
+        let free_before = engine.kv_free_pages();
+
+        assert!(engine.cancel_request(handle));
+
+        assert_eq!(engine.active_count(), 0, "slot must be released");
+        assert!(
+            engine.kv_free_pages() > free_before,
+            "cancelling must free the pages the active request held"
+        );
+        assert!(matches!(
+            engine.completed(handle).expect("cancelled").finish,
+            Some(FinishReason::Abort)
+        ));
+        Ok(())
+    }
+
+    /// Cancelling a handle that already finished, or was never submitted,
+    /// must be a safe no-op — the client-disconnect guard fires unconditionally
+    /// and cannot know whether the stream already ended naturally.
+    #[test]
+    fn cancel_already_completed_or_unknown_handle_is_a_noop() -> Result<()> {
+        let mut engine = Engine::new(MockExecutor::ready(), MockKvPool::new(1), 1);
+        let handle = engine.submit_request(vec![1], 1);
+        engine.run_to_idle()?;
+        assert!(engine.completed(handle).is_some(), "finished naturally");
+
+        assert!(!engine.cancel_request(handle), "already completed");
+        let unknown = engine.next_handle();
+        assert!(!engine.cancel_request(unknown), "unknown handle");
         Ok(())
     }
 
