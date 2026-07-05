@@ -2013,8 +2013,12 @@ mod backend {
             })
         }
 
-        /// Inject one relayed request. The output owner records the `request_id` ->
-        /// engine handle map so [`Self::drain_completions`] can route the result back.
+        /// Inject one relayed request. Tracks the `request_id` -> engine handle
+        /// map on EVERY rank (not just the output owner): the owner needs it to
+        /// route [`Self::drain_completions`]' result back, and every rank needs
+        /// it so [`Self::cancel`] can find the handle for a relayed cancellation
+        /// (2026-07-05 multiproc hang investigation's `InFlightGuard`
+        /// cancellation gap — docs/experience/errors/2026-07-05-multiproc-lockstep-ack-hang-no-timeout.md).
         pub fn inject(
             &mut self,
             request_id: u64,
@@ -2030,9 +2034,38 @@ mod backend {
                     ..infer_core::RequestOptions::default()
                 },
             );
-            if self.owns_output {
-                self.tracked.insert(handle, request_id);
+            self.tracked.insert(handle, request_id);
+        }
+
+        /// Cancel the request the coordinator relayed `request_id` for (a
+        /// client disconnected/timed out). No-op if unknown (already finished
+        /// and pruned, or never tracked on this rank). MULTIPROC INVARIANT:
+        /// must be called with identical `request_id`s, at the identical
+        /// lockstep tick, on every rank — see [`infer_core::Engine::cancel_request`].
+        pub fn cancel(&mut self, request_id: u64) {
+            let Some(&handle) = self
+                .tracked
+                .iter()
+                .find(|(_, rid)| **rid == request_id)
+                .map(|(h, _)| h)
+            else {
+                return;
+            };
+            self.tracked.remove(&handle);
+            self.engine.cancel_request(handle);
+        }
+
+        /// Drop `tracked` entries whose request already finished. The output
+        /// owner prunes for free inside [`Self::drain_completions`]; followers
+        /// never call that, so without this their `cancel`-lookup map would
+        /// grow for the process lifetime.
+        pub fn prune_finished(&mut self) {
+            if self.owns_output || self.tracked.is_empty() {
+                return;
             }
+            let engine_idle = self.engine.is_idle();
+            self.tracked
+                .retain(|&handle, _| self.engine.completed(handle).is_none() && !engine_idle);
         }
 
         /// Whether the engine has no queued/active/in-flight work — same state
