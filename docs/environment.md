@@ -73,6 +73,16 @@ mandate exists for GPU builds only.
 
 ## 2. User-Facing Runtime Variables
 
+### `ARLE_LOG_DIR`
+
+Rolling log-file directory, default `logs` (relative to CWD). Every `arle`
+invocation writes stderr-mirrored logs there too (daily rotation, 256 MiB/file
+cap, 14 files retained) — the file sink exists so a hung/killed process still
+leaves a log on disk instead of only the terminal/tmux scrollback. Multiproc
+workers each get their own file (`arle-rank<N>.log`) so ranks don't clobber
+each other. Set to `off`, `none`, or `""` to disable the file sink entirely
+(stderr logging is unaffected either way). `RUST_LOG` still controls level.
+
 ### `ARLE_MODEL`
 
 Default model path for the top-level CLI when `--model-path` is omitted.
