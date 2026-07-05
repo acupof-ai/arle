@@ -127,8 +127,14 @@ fn wait_for_ack_window(relay: &Arc<Mutex<RelayCoordinator>>, seq: u64) -> Option
     }
 }
 
-struct CoordSubmission {
-    request: WireRequest,
+enum CoordSubmission {
+    Submit(WireRequest),
+    /// A request's HTTP client disconnected/timed out (`InFlightGuard::drop`).
+    /// Sent unconditionally on every drop, including normal completions —
+    /// `RelayEnvelope::CancelRequest` is a no-op on a rank where the request
+    /// already finished, so there's no need to distinguish "aborted early"
+    /// from "finished normally" here.
+    Cancel(u64),
 }
 
 /// The coordinator's HTTP-facing state (lives behind `Arc` in the axum router).
@@ -222,6 +228,19 @@ pub fn coordinator_router(
         .with_state(state)
 }
 
+/// Broadcast one `CancelRequest` per id, in order, before the caller's next
+/// broadcast on the same locked `coord` — every rank applies a tick's
+/// cancellations before that tick's admissions/step.
+fn broadcast_cancellations(
+    coord: &mut RelayCoordinator,
+    cancellations: &[u64],
+) -> anyhow::Result<()> {
+    for &request_id in cancellations {
+        coord.broadcast(&RelayEnvelope::CancelRequest { request_id })?;
+    }
+    Ok(())
+}
+
 /// Broadcasts exactly one `TickAdmissions` per step to every worker (carrying
 /// that step's drained submissions, empty on pure-decode ticks), stepping while
 /// `in_flight` remains and parking when idle. Per-rank tick acks pace the busy
@@ -272,9 +291,11 @@ fn lockstep_loop(
 
         // Drain queued submissions without blocking.
         let mut drained: Vec<WireRequest> = Vec::new();
+        let mut cancellations: Vec<u64> = Vec::new();
         loop {
             match submit_rx.try_recv() {
-                Ok(sub) => drained.push(sub.request),
+                Ok(CoordSubmission::Submit(request)) => drained.push(request),
+                Ok(CoordSubmission::Cancel(request_id)) => cancellations.push(request_id),
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     submit_open = false;
@@ -283,13 +304,18 @@ fn lockstep_loop(
             }
         }
 
-        if !drained.is_empty() || busy {
+        if !drained.is_empty() || !cancellations.is_empty() || busy {
             let requests = drained;
             let send = {
                 let mut coord = relay
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                coord.broadcast(&RelayEnvelope::TickAdmissions { seq, requests })
+                // Cancellations broadcast BEFORE this tick's admissions, same
+                // lock scope, so every rank applies them at the identical
+                // point relative to the step they gate.
+                broadcast_cancellations(&mut coord, &cancellations).and_then(|()| {
+                    coord.broadcast(&RelayEnvelope::TickAdmissions { seq, requests })
+                })
             };
             if let Err(err) = send {
                 log::error!(
@@ -313,14 +339,14 @@ fn lockstep_loop(
             return;
         }
         match submit_rx.recv_timeout(IDLE_PARK) {
-            Ok(sub) => {
+            Ok(CoordSubmission::Submit(request)) => {
                 let send = {
                     let mut coord = relay
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     coord.broadcast(&RelayEnvelope::TickAdmissions {
                         seq,
-                        requests: vec![sub.request],
+                        requests: vec![request],
                     })
                 };
                 if let Err(err) = send {
@@ -335,6 +361,30 @@ fn lockstep_loop(
                     return;
                 }
                 seq += 1;
+            }
+            // `in_flight == 0` here (the idle branch) means every rank's
+            // engine is provably idle (the LOCKSTEP INVARIANT above), so this
+            // is always a no-op — broadcast anyway rather than special-case
+            // "known no-op", the coordinator has no visibility into engine
+            // state to verify that itself. No seq/tick consumed: nothing to
+            // admit, no step for workers to run.
+            Ok(CoordSubmission::Cancel(request_id)) => {
+                let send = {
+                    let mut coord = relay
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    coord.broadcast(&RelayEnvelope::CancelRequest { request_id })
+                };
+                if let Err(err) = send {
+                    log::error!(
+                        "[coordinator] idle cancel broadcast failed; stopping lockstep loop: {err:#}"
+                    );
+                    teardown(
+                        &sinks,
+                        "multiproc worker group failed (cancel broadcast error)",
+                    );
+                    return;
+                }
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => submit_open = false,
@@ -357,12 +407,22 @@ struct InFlightGuard {
     in_flight: Arc<AtomicUsize>,
     sinks: CompletionSinks,
     request_id: u64,
+    submit_tx: SyncSender<CoordSubmission>,
 }
 
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
         self.in_flight.fetch_sub(1, Ordering::AcqRel);
         self.sinks.unregister(self.request_id);
+        // Tell every rank's engine to stop working on this request if it's
+        // still queued/active — closes the gap where a client disconnecting
+        // only released coordinator-side bookkeeping and left the request a
+        // permanent zombie in the engine (2026-07-05 multiproc hang
+        // investigation's last open item — docs/experience/errors/2026-07-05-multiproc-lockstep-ack-hang-no-timeout.md).
+        // Best-effort: a closed channel means the lockstep loop already exited.
+        let _ = self
+            .submit_tx
+            .send(CoordSubmission::Cancel(self.request_id));
     }
 }
 
@@ -392,17 +452,16 @@ fn streaming_submit(
         in_flight: Arc::clone(&state.in_flight),
         sinks: state.sinks.clone(),
         request_id,
+        submit_tx: state.submit_tx.clone(),
     };
     state
         .submit_tx
-        .send(CoordSubmission {
-            request: WireRequest {
-                request_id,
-                prompt_tokens,
-                max_tokens,
-                sampling,
-            },
-        })
+        .send(CoordSubmission::Submit(WireRequest {
+            request_id,
+            prompt_tokens,
+            max_tokens,
+            sampling,
+        }))
         .map_err(|_| ApiError::internal("coordinator lockstep loop closed; cannot submit"))?;
     Ok((rx, guard))
 }
@@ -1137,7 +1196,52 @@ async fn stats(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::multiproc_relay::RelayWorker;
     use serde_json::json;
+    use std::net::SocketAddr;
+
+    /// A tick's cancellations must reach every rank BEFORE the `TickAdmissions`
+    /// they're ordered against — `lockstep_loop` relies on `broadcast_cancellations`
+    /// running inside the same locked `coord` scope as the paired
+    /// `TickAdmissions` broadcast (2026-07-05 `InFlightGuard` cancellation fix).
+    #[test]
+    fn cancellations_broadcast_before_the_paired_tick_admissions() {
+        let pending = RelayCoordinator::bind().unwrap();
+        let coord_addr: SocketAddr = format!("127.0.0.1:{}", pending.port()).parse().unwrap();
+        let world_size = 2;
+        let worker_thread = std::thread::spawn(move || {
+            let mut worker =
+                RelayWorker::connect_with_rank(coord_addr, Duration::from_secs(5), 1, world_size)
+                    .unwrap();
+            let first = worker.recv().unwrap().expect("first envelope");
+            let second = worker.recv().unwrap().expect("second envelope");
+            (first, second)
+        });
+        let mut relay = pending.accept(world_size, Duration::from_secs(5)).unwrap();
+
+        broadcast_cancellations(&mut relay, &[99]).unwrap();
+        relay
+            .broadcast(&RelayEnvelope::TickAdmissions {
+                seq: 0,
+                requests: vec![WireRequest {
+                    request_id: 1,
+                    prompt_tokens: vec![1],
+                    max_tokens: 1,
+                    sampling: SamplingParams::default(),
+                }],
+            })
+            .unwrap();
+
+        let (first, second) = worker_thread.join().unwrap();
+        assert!(
+            matches!(first, RelayEnvelope::CancelRequest { request_id: 99 }),
+            "expected CancelRequest first, got {first:?}"
+        );
+        assert!(
+            matches!(second, RelayEnvelope::TickAdmissions { seq: 0, .. }),
+            "expected the paired TickAdmissions second, got {second:?}"
+        );
+    }
 
     #[test]
     fn prompt_prefills_think_keys_off_rendered_tail() {
