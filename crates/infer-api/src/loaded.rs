@@ -438,6 +438,12 @@ mod backend {
             config.chunked_prefill_size = self.chunked_prefill_size;
             config.max_running_requests = self.max_running_requests;
             config.slot_oversubscription = self.slot_oversubscription;
+            // Diagnostic-only escape hatch (not a shipped feature) for the
+            // concurrent-decode digit-corruption investigation — see
+            // docs/experience/errors/2026-07-06-dsv4-concurrent-decode-digit-corruption-unresolved.md.
+            if std::env::var("ARLE_DISABLE_PREFIX_CACHE").is_ok() {
+                config.enable_prefix_cache = false;
+            }
             config
         }
     }
