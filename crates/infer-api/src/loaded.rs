@@ -1990,22 +1990,17 @@ mod backend {
         std::cell::RefCell<std::collections::HashMap<infer_core::RequestHandle, Vec<u32>>>,
     >;
 
-    /// Multiproc worker rank's directly-driven engine (rank 0..N-1; every rank is
-    /// a child worker under the SPMD / B split).
-    ///
-    /// A worker steps its engine SYNCHRONOUSLY — once per relayed `TickAdmissions`
-    /// — so admission lands at the same step index on every rank (the lockstep
-    /// contract). The output owner (rank 0) also tracks each request and emits its
-    /// terminal generation back via [`Self::drain_completions`]; followers discard
-    /// their TP-replicated tokens.
+    /// One multiproc worker rank's engine. Steps SYNCHRONOUSLY per relayed
+    /// `TickAdmissions` so every rank admits at the same step index (lockstep).
+    /// Rank 0 (`owns_output`) also tracks + emits completions; followers
+    /// discard their TP-replicated tokens.
     #[cfg(feature = "cuda")]
     pub struct CudaWorkerEngine {
         engine: infer_core::Engine<CudaExecutor, CudaKvPool>,
         /// Rank 0 owns the visible output; followers skip all output bookkeeping.
         owns_output: bool,
-        /// engine handle -> coordinator request_id (output owner only). A handle is
-        /// removed once its terminal delta is emitted, which also prevents
-        /// re-emitting — no separate "already emitted" set needed.
+        /// engine handle -> coordinator request_id (output owner only); removed
+        /// once its terminal delta is emitted.
         tracked: std::collections::HashMap<infer_core::RequestHandle, u64>,
         /// Fed by the token observer inside `engine.step()`, drained right after
         /// by `drain_completions()` (same thread, never concurrent).
@@ -2014,9 +2009,8 @@ mod backend {
 
     #[cfg(feature = "cuda")]
     impl CudaWorkerEngine {
-        /// Build the rank-R engine from the SAME config rank 0 resolved
-        /// (`ARLE_WORKER_ENGINE_CONFIG`); NCCL rank/world come from env. `owns_output`
-        /// (rank 0) tracks + emits completions over the relay.
+        /// Build the rank-R engine from rank 0's resolved config
+        /// (`ARLE_WORKER_ENGINE_CONFIG`); NCCL rank/world come from env.
         pub fn load(
             model_path: &str,
             config: &EngineLoadConfig,
@@ -2042,12 +2036,8 @@ mod backend {
             })
         }
 
-        /// Inject one relayed request. Tracks the `request_id` -> engine handle
-        /// map on EVERY rank (not just the output owner): the owner needs it to
-        /// route [`Self::drain_completions`]' result back, and every rank needs
-        /// it so [`Self::cancel`] can find the handle for a relayed cancellation
-        /// (2026-07-05 multiproc hang investigation's `InFlightGuard`
-        /// cancellation gap — docs/experience/errors/2026-07-05-multiproc-lockstep-ack-hang-no-timeout.md).
+        /// Inject one relayed request. Every rank tracks `request_id` -> handle
+        /// (not just the output owner) so [`Self::cancel`] can find it too.
         pub fn inject(
             &mut self,
             request_id: u64,
@@ -2066,11 +2056,9 @@ mod backend {
             self.tracked.insert(handle, request_id);
         }
 
-        /// Cancel the request the coordinator relayed `request_id` for (a
-        /// client disconnected/timed out). No-op if unknown (already finished
-        /// and pruned, or never tracked on this rank). MULTIPROC INVARIANT:
-        /// must be called with identical `request_id`s, at the identical
-        /// lockstep tick, on every rank — see [`infer_core::Engine::cancel_request`].
+        /// Cancel a relayed request (client disconnected/timed out); no-op if
+        /// unknown. Must be called with the same `request_id`, at the same
+        /// lockstep tick, on every rank.
         pub fn cancel(&mut self, request_id: u64) {
             let Some(&handle) = self
                 .tracked
@@ -2084,10 +2072,8 @@ mod backend {
             self.engine.cancel_request(handle);
         }
 
-        /// Drop `tracked` entries whose request already finished. The output
-        /// owner prunes for free inside [`Self::drain_completions`]; followers
-        /// never call that, so without this their `cancel`-lookup map would
-        /// grow for the process lifetime.
+        /// Followers never call `drain_completions` (which prunes for free), so
+        /// without this their `tracked` map grows for the process lifetime.
         pub fn prune_finished(&mut self) {
             if self.owns_output || self.tracked.is_empty() {
                 return;
