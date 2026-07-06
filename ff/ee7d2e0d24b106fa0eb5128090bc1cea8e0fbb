@@ -1,0 +1,21 @@
+crates/cuda-kernels/src/tensor.rs
+  s_be4680708f64a9::t_ca2d9340eeeba3 189-195,234-238,408-412,424,545-548,553-560
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "ffee7d2e0d24b106fa0eb5128090bc1cea8e0fbb",
+  "prompts": {},
+  "sessions": {
+    "s_be4680708f64a9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aacb30afc86236626",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
