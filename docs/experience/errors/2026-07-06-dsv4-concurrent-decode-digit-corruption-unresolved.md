@@ -1,4 +1,4 @@
-# DSv4 concurrent-decode digit corruption — localized, not fixed
+# DSv4 concurrent-decode digit corruption — FlashMLA-lane hypothesis KILLED
 
 ## Context
 
@@ -54,14 +54,43 @@ positioning even with identical prompts).
 ## Fix
 
 None yet. `ARLE_DSV4_FLASHMLA_DECODE=0` (the existing lever to route around
-this lane entirely) could not be used for a clean A/B: that fallback path's
-KV-pool sizing is still keyed to the FlashMLA banded layout and
-admission-rejects almost every request at typical `--max-total-tokens`
-ceilings — tracked separately as a blocker (task #7 in this session, needs
-its own doc entry once picked up). Confirming the hypothesis needs
-`cuda-memcheck`/`compute-sanitizer racecheck` or an nsys trace correlating
-split-count with the corrupted row — source reading alone cannot localize a
-race to the exact buffer/line.
+this lane entirely) could not be used for a clean A/B at first: that
+fallback path's KV-pool sizing was keyed to the FlashMLA banded layout and
+admission-rejected almost every request at typical `--max-total-tokens`
+ceilings — fixed same day in `4e44b0209` (decoupled
+`dsv4_flashmla_decode_alloc_enabled`, a compile-time `HAS_FLASHMLA` question,
+from the runtime `ARLE_DSV4_FLASHMLA_DECODE` kernel-choice flag). Pod-verified
+the unblock: booting at the exact previously-rejecting config (TP=4,
+`--max-total-tokens 2048`, GPUs 2/3/4/5, `ARLE_DSV4_FLASHMLA_DECODE=0`) and
+re-sending the same 1706-prompt-token/1722-KV-page request that used to hit
+`admission reject: request needs 1722 KV pages, pool has 1 free` — now 24/24
+admit cleanly (3 trials × n=8, zero rejections in `serve_job1verify2.log`).
+
+**A/B result (same day, same binary, same harness, same n/length sweep):
+corruption REPRODUCES on the scalar eager kernel — hypothesis KILLED.**
+Ran `concurrent_needle_v3.py` n∈{3,4,6,8} × prompt_len∈{100,250,500,900} × 3
+reps, TP=4 GPUs 2/3/4/5, `--max-total-tokens 2048`:
+
+| Arm | Requests | Exact | Miss | Miss rate |
+|---|---|---|---|---|
+| `ARLE_DSV4_FLASHMLA_DECODE=0` (scalar) | 252 | 200 | 52 | 20.6% |
+| default (batched FlashMLA/CSA) | 196 (41/48 trials before an external SIGTERM tore the server down) | 146 | 50 | 25.5% |
+
+Same failure signature on **both** arms — truncation (`'The secret access
+code is 738.'`, correct prefix + missing tail) and digit corruption from
+digit 4 onward (`738292`, `7382391`, `738123` vs needle `738291`) — at
+comparable rates. If the batched FlashMLA/CSA lane (`flashmla.rs:815-1001`,
+split-KV scheduler metadata + shared `lse_accum`/`o_accum` scratch) were the
+root cause, routing around it entirely should have produced a clean 100%
+match on the scalar arm. It didn't.
+
+**Conclusion: not FlashMLA-specific.** The bug is in something shared between
+both kernel paths — scheduler batch construction, tokenizer/sampler
+concurrency handling, or the KV pool itself (allocation/addressing, not the
+attention math) — not `flashmla.rs`. Next localization step: same n/length
+sweep with `compute-sanitizer racecheck` (unblocked now — no lever flag
+needed), targeting the scheduler's batch-row assembly and KV-pool slot
+addressing rather than the FlashMLA scratch buffers.
 
 ## Rule
 
@@ -71,4 +100,8 @@ baseline when A/B-testing other DSv4 decode-path changes. Case-as-fact
 paid off here: the aggregate "~40% failure" number alone pointed nowhere;
 decoding actual failing text (truncation vs. digit corruption, first-3-
 correct/last-N-wrong) narrowed the search to one subsystem before any code
-was touched.
+was touched. **And the localization itself needed the same discipline**:
+a plausible single-lane hypothesis (batched FlashMLA/CSA) looked clean from
+source reading alone, but the licensed A/B (route around the lane entirely)
+killed it in one measured pass — inference from code reading is not evidence,
+a lever-gated A/B is.
