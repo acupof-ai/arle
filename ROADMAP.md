@@ -48,6 +48,14 @@ semi-autoregressive draft + confidence-scheduled verify (children #124–#131),
 the spec-decode acceptance-wall attack after the Phase-2 re-scope; off-path
 until a child earns a license.
 
+OPD substrate maintenance (off-path, 2026-07-06 review): local-verifiable
+hardening landed (KL scale guard, `--rollout-engine`/`--engine-offload` flags,
+`gkd_anchor` split, dead-code + naming de-drift); three pod-gated follow-ups
+planned —
+[Metal OPD training backend](docs/plans/2026-07-06-opd-metal-training-backend.md),
+[real-SWE teacher-in-loop curve](docs/plans/2026-07-06-opd-real-swe-eval-teacher-in-loop.md),
+[opd_step overload-chain collapse](docs/plans/2026-07-06-opd-step-overload-chain-collapse.md).
+
 Killed/deferred work (B=1 per-kernel micro-levers, deepep_ll default-on,
 classical spec, 5–6 ms-on-H20 framing, FlashInfer migration, ROCm, …) is
 enumerated in master strategy v2 §5 — re-doing a KILLED item requires
