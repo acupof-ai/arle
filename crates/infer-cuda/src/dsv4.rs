@@ -1853,7 +1853,7 @@ impl Dsv4Model {
             affordable > 0,
             "DSv4 KV budget rejected startup: post-weights free VRAM affords 0 slots at \
              max_seq_len {max_seq_len} (per_slot ~{}MB + shared DSA {}MB + shared MoE decode {}MB \
-             + shared expert scratch {}MB + shared MLA decode {}MB exceed {MEM_FRACTION} of free). Lower INFER_DSV4_MAX_SEQ_LEN or free VRAM.",
+             + shared expert scratch {}MB + shared MLA decode {}MB exceed {MEM_FRACTION} of free). Lower --max-total-tokens or free VRAM.",
             per_slot >> 20,
             dsa_shared_bytes >> 20,
             moe_decode_shared_bytes >> 20,

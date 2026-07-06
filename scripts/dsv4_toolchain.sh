@@ -371,6 +371,7 @@ serve_args() {
         --model-path "$MODEL_PATH"
         --port "$PORT"
         --spec-type "$SPEC_TYPE"
+        --max-total-tokens "$MAX_SEQ_LEN"
     )
     [[ -z "$MAX_RUNNING_REQUESTS" ]] || out+=(--max-running-requests "$MAX_RUNNING_REQUESTS")
     [[ -z "$MTP_DRAFT_TOKENS" ]] || out+=(--mtp-draft-tokens "$MTP_DRAFT_TOKENS")
@@ -398,14 +399,13 @@ smoke() {
     # reports land in this server.log). Unset by default → zero change to
     # production runs. Intentionally unquoted so the multi-word command
     # word-splits into argv.
-    # Rewrite-stack serve: DSv4 runtime knobs ride env vars (INFER_DSV4_MAX_SEQ_LEN,
-    # ARLE_DSV4_*); request-shape knobs stay explicit CLI args for reproducible
-    # smoke/nsys runs.
+    # Rewrite-stack serve: DSv4 runtime knobs ride ARLE_DSV4_* env vars;
+    # request-shape knobs (including max-seq-len) stay explicit CLI args for
+    # reproducible smoke/nsys runs.
     local -a args
     serve_args args
     (
         cd "$ROOT"
-        export INFER_DSV4_MAX_SEQ_LEN="$MAX_SEQ_LEN"
         exec ${ARLE_SERVER_WRAP:-} "$SERVER_BIN" "${args[@]}"
     ) >"$server_log" 2>&1 &
     server_pid=$!
@@ -477,7 +477,6 @@ nsys_profile() {
     serve_args args
     (
         cd "$ROOT"
-        export INFER_DSV4_MAX_SEQ_LEN="$MAX_SEQ_LEN"
         exec ${ARLE_SERVER_WRAP:-} "$SERVER_BIN" "${args[@]}"
     ) >"$server_log" 2>&1 &
     server_pid=$!

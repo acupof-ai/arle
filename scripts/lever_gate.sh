@@ -41,19 +41,20 @@ export RUST_LOG="${RUST_LOG:-info}"
 # DSv4 multi-GPU profile: the TP=8 + DSv4 kernel env. Defaults to dsv4 so the
 # existing DSv4 gate is byte-identical; any other GATE_PROFILE (generic, qwen)
 # skips it for a single-GPU model that brings its own config via SERVE_FLAGS.
+DSV4_FLAGS=()
 if [ "${GATE_PROFILE:-dsv4}" = "dsv4" ]; then
     export INFER_CUDA_DEVICES="${INFER_CUDA_DEVICES:-0,1,2,3,4,5,6,7}"
     export INFER_TP_SIZE="${INFER_TP_SIZE:-8}"
-    export INFER_DSV4_MAX_SEQ_LEN="${INFER_DSV4_MAX_SEQ_LEN:-16384}"
     export ARLE_DSV4_MOE_BACKEND="${ARLE_DSV4_MOE_BACKEND:-allreduce}"
     export ARLE_DSV4_INCREMENTAL_KV=1
     export ARLE_DSV4_EXPERT_BACKEND="${ARLE_DSV4_EXPERT_BACKEND:-deepgemm}"
+    DSV4_FLAGS=(--max-total-tokens "${MAX_TOTAL_TOKENS:-16384}")
 fi
 # Lever env flips ride the CLI: lever_gate.sh <label> KEY=VAL ...
 for kv in "$@"; do export "${kv?}"; done
 
 # shellcheck disable=SC2086  # SERVE_FLAGS is an intentional word-split passthrough
-"$BIN" serve --backend cuda --model-path "$MODEL" --port "$PORT" $SERVE_FLAGS \
+"$BIN" serve --backend cuda --model-path "$MODEL" --port "$PORT" "${DSV4_FLAGS[@]}" $SERVE_FLAGS \
     > "serve_${LABEL}.log" 2>&1 &
 SERVE_PID=$!
 trap 'kill $SERVE_PID 2>/dev/null; wait $SERVE_PID 2>/dev/null' EXIT

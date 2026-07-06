@@ -107,8 +107,6 @@ pub use qwen35::{
 #[cfg(feature = "cuda")]
 pub use executor::CudaKvCacheDtype;
 #[cfg(feature = "cuda")]
-pub use executor::dsv4_max_seq_len;
-#[cfg(feature = "cuda")]
 pub use executor::set_decode_graph_default;
 /// Tier budget resolution: machine-derived disk budget when `--kv-disk` has no
 /// `--kv-disk-limit` (probes free disk), and the per-rank L2 share from a
@@ -331,10 +329,11 @@ impl CudaExecutor {
     /// DSv4 owns its MLA KV state inside the forward, so no `total_pages`/
     /// `CudaKvPool` page budget is needed (a host pool is still attached for slot
     /// bookkeeping).
-    /// `max_seq_len` is a runtime knob: the serve/run path threads it from
-    /// `--max-seq-len`; tests pass [`dsv4_max_seq_len`] (the env-overridable
-    /// default). The executor no longer reads the env internally (per the
-    /// runtime-config-as-CLI-flag rule).
+    /// `max_seq_len` is a runtime knob: the serve path threads it from
+    /// `--max-total-tokens`/`EngineConfig::max_total_tokens` — the same global
+    /// cap every backend uses, no DSv4-only knob. Standalone microbenchmarks
+    /// with no CLI-args layer (agent-bench, `dsv4_resident_ab`) pass their own
+    /// literal constant. The executor itself never reads an env var for this.
     /// `mtp_draft_tokens`: `Some(n)` turns on the checkpoint-native MTP
     /// speculative-decode head with draft depth `n` (config-driven, the serve
     /// path's `--spec-type mtp` / `--mtp-draft-tokens`); `mtp_draft_topk`

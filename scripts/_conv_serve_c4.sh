@@ -14,7 +14,6 @@ setsid bash -lc '
   export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
   export INFER_CUDA_DEVICES=0,1,2,3,4,5,6,7
   export INFER_TP_SIZE=8
-  export INFER_DSV4_MAX_SEQ_LEN=2000000
   export RUST_LOG=info
   export NCCL_DEBUG=WARN
   export ARLE_DSV4_MOE_BACKEND=allreduce
@@ -27,6 +26,6 @@ setsid bash -lc '
   export LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu
   exec /data01/build/arle/target/release-fast/arle serve --backend cuda \
     --model-path /data01/models/DeepSeek-V4-Flash --port 18188 \
-    --max-running-requests 8 --kv-cache-dtype auto
+    --max-running-requests 8 --kv-cache-dtype auto --max-total-tokens 2000000
 ' < /dev/null > "$LOG" 2>&1 &
 echo "c4-reject serve launched pid=$!"
