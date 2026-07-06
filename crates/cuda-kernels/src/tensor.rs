@@ -166,10 +166,13 @@ impl CudaAllocTraceExt for Arc<CudaStream> {
 
 /// CUDA device context holding compute stream and optional copy stream.
 ///
-/// Two-stream architecture for overlapping H2D/D2H transfers with compute:
+/// Multi-stream architecture for overlapping independent work with compute:
 /// - `stream` (compute): all GPU kernels, CUDA Graph capture/replay
 /// - `copy_stream`: async H2D/D2H transfers, runs concurrently with compute
 /// - `comm_stream`: communication collectives that can overlap independent compute
+/// - `aux_stream`: a spare compute lane for work independent of `stream`;
+///   callers must supply scratch that never aliases what `stream` is
+///   concurrently using.
 ///
 /// Cross-stream sync uses raw CUDA events (not cudarc's automatic tracking,
 /// which breaks CUDA Graph capture).
@@ -181,6 +184,8 @@ pub struct DeviceContext {
     pub copy_stream: Arc<CudaStream>,
     /// Separate stream for NCCL/communication work that can overlap compute.
     pub comm_stream: Arc<CudaStream>,
+    /// Spare compute lane (see [`CudaPipelineStreamKind::Aux`]).
+    pub aux_stream: Arc<CudaStream>,
     /// CUDA device ordinal this context is bound to.
     pub ordinal: u32,
 }
@@ -199,6 +204,9 @@ pub enum CudaPipelineStreamKind {
     Copy,
     /// Dedicated communication stream for NCCL collectives and P2P exchanges.
     Comm,
+    /// Spare compute lane for overlapping independent work with `Compute`;
+    /// callers must give it scratch that never aliases `Compute`'s.
+    Aux,
 }
 
 /// Result of a non-blocking CUDA pipeline fence poll.
@@ -382,6 +390,10 @@ impl DeviceContext {
             .new_stream()
             .map_err(|e| anyhow!("Failed to create CUDA communication stream: {}", e))?;
 
+        let aux_stream = ctx
+            .new_stream()
+            .map_err(|e| anyhow!("Failed to create CUDA aux stream: {}", e))?;
+
         // Initialize cuBLAS handle
         unsafe {
             ffi::cublas_init();
@@ -392,6 +404,7 @@ impl DeviceContext {
             stream,
             copy_stream,
             comm_stream,
+            aux_stream,
             ordinal,
         })
     }
@@ -488,6 +501,13 @@ impl DeviceContext {
             .map_err(|e| anyhow!("Communication stream sync failed: {}", e))
     }
 
+    /// Synchronize aux stream.
+    pub fn sync_aux(&self) -> Result<()> {
+        self.aux_stream
+            .synchronize()
+            .map_err(|e| anyhow!("Aux stream sync failed: {}", e))
+    }
+
     /// Return the raw stream that backs a pipeline lane.
     #[must_use]
     pub fn pipeline_stream(&self, kind: CudaPipelineStreamKind) -> &Arc<CudaStream> {
@@ -495,7 +515,20 @@ impl DeviceContext {
             CudaPipelineStreamKind::Compute => &self.stream,
             CudaPipelineStreamKind::Copy => &self.copy_stream,
             CudaPipelineStreamKind::Comm => &self.comm_stream,
+            CudaPipelineStreamKind::Aux => &self.aux_stream,
         }
+    }
+
+    /// `self` with `.stream` swapped for `kind`'s lane — redirects any existing
+    /// `&DeviceContext`-taking call site onto another lane with no callee
+    /// changes (cheap: every field is `Arc`). Caller must fence the two lanes
+    /// via [`Self::record_pipeline_fence`]/[`Self::wait_on_pipeline_fence`] and
+    /// must not pass scratch the `Compute`-lane call is concurrently using.
+    #[must_use]
+    pub fn with_stream_view(&self, kind: CudaPipelineStreamKind) -> Self {
+        let mut view = self.clone();
+        view.stream = self.pipeline_stream(kind).clone();
+        view
     }
 
     /// Record a fence on the selected producer stream.

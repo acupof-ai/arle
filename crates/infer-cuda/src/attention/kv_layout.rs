@@ -184,6 +184,12 @@ pub(crate) struct Dsv4KvAdapter {
     /// never aliased concurrently (exactly like `dsa_shared`/`flashmla_batch`/
     /// decode-graph scratch). `None` when native DeepGEMM is unavailable.
     pub(super) prefill_linear: Option<Dsv4PrefillDeepGemmLinearScratch>,
+    /// SECOND `prefill_linear`-shaped scratch for the Aux-stream decode
+    /// overlap lane (`ARLE_DSV4_DECODE_MULTISTREAM_OVERLAP`) — reusing
+    /// `prefill_linear` would alias a buffer the concurrent main-stream
+    /// projection GEMM is still reading/writing. `None` unless both native
+    /// DeepGEMM is available AND the overlap lever is on.
+    pub(super) prefill_linear_aux: Option<Dsv4PrefillDeepGemmLinearScratch>,
 }
 
 /// Index-layer map: the ONE `compressed-row → (slot-logical page, in-page row)`
@@ -554,6 +560,17 @@ impl Dsv4KvAdapter {
         } else {
             None
         };
+        // See field doc comment; gated on the same DeepGEMM availability.
+        let prefill_linear_aux =
+            if prefill_linear.is_some() && dsv4_decode_multistream_overlap_enabled()? {
+                Some(Dsv4PrefillDeepGemmLinearScratch::new(
+                    ctx,
+                    config,
+                    max_seq_len,
+                )?)
+            } else {
+                None
+            };
         Ok(Self {
             layers,
             num_slots,
@@ -566,6 +583,7 @@ impl Dsv4KvAdapter {
             flashmla_batch,
             flashmla_scratch,
             prefill_linear,
+            prefill_linear_aux,
         })
     }
 
@@ -629,6 +647,12 @@ impl Dsv4KvAdapter {
             (
                 "prefill_linear",
                 self.prefill_linear.as_ref().map_or(0, |s| s.device_bytes()),
+            ),
+            (
+                "prefill_linear_aux",
+                self.prefill_linear_aux
+                    .as_ref()
+                    .map_or(0, |s| s.device_bytes()),
             ),
         ]
     }
@@ -718,6 +742,15 @@ impl Dsv4KvAdapter {
     #[allow(dead_code)]
     pub(crate) fn prefill_linear_mut(&mut self) -> Option<&mut Dsv4PrefillDeepGemmLinearScratch> {
         self.prefill_linear.as_mut()
+    }
+
+    /// `&mut` accessor for the Aux-stream decode-overlap scratch (see the field
+    /// doc comment). `None` unless [`dsv4_decode_multistream_overlap_enabled`]
+    /// was on when the adapter was built.
+    pub(crate) fn prefill_linear_aux_mut(
+        &mut self,
+    ) -> Option<&mut Dsv4PrefillDeepGemmLinearScratch> {
+        self.prefill_linear_aux.as_mut()
     }
 
     /// Split-borrow accessor for the batched (`b = N`) FlashMLA decode lane
@@ -998,9 +1031,13 @@ impl Dsv4LayerKvLayout {
                 kv_arena.page_block_size
             );
             // #85 Stage-B: the MLA pool is the COHERENT REMAINDER from kv_budget_plan
-            // (MEM_FRACTION×free − weights − fixed − per_slot×num_slots). Slots draw
-            // bands dynamically (admission-gated by free pages), NOT num_slots×max_seq
-            // reserved — that lifts the num_slots ceiling without OOM.
+            // (MEM_FRACTION×free − weights − fixed − per_slot×num_slots). Each slot
+            // draws its FULL fixed band up front on first alloc
+            // (`HostPagedKvPool::alloc_fixed_band`, never incremental), so
+            // `kv_budget_plan`'s pool-affordable-slots re-clamp (pod-verified
+            // 2026-07-06) already sizes `num_slots` to fit `num_slots` whole bands
+            // in this exact remainder — `budget_bytes` below is sized for that many
+            // pages by construction, not just one.
             let budget_bytes = flashmla_pool_budget_bytes_per_layer;
             let pool = TokenKVPool::with_format(
                 ctx,
@@ -1012,16 +1049,18 @@ impl Dsv4LayerKvLayout {
                 format,
             )
             .map_err(|e| anyhow!("DSv4 shared FlashMLA pool alloc failed: {e}"))?;
-            // Shared dynamic pool: needs only ONE slot's band worth of pages (sanity);
-            // capacity is admission-gated by free pages, NOT num_slots×max_seq reserved.
+            // Sanity: the pool must cover every slot's band, not just one — catches
+            // a `kv_budget_plan` clamp regression here instead of a mid-serve
+            // `alloc_fixed_band` bail (pod-verified 2026-07-06: a 2-request
+            // concurrent burst crashed the coordinator before this was in place).
             ensure!(
                 pool.page_size == kv_arena.page_block_size
-                    && pool.max_total_pages >= flashmla_slot_pages,
+                    && pool.max_total_pages >= num_slots.saturating_mul(flashmla_slot_pages),
                 "DSv4 FlashMLA pool page mismatch: page_size={} pages={} need page_size={} pages>={}",
                 pool.page_size,
                 pool.max_total_pages,
                 kv_arena.page_block_size,
-                flashmla_slot_pages
+                num_slots.saturating_mul(flashmla_slot_pages)
             );
             Some(pool)
         } else {

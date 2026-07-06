@@ -1890,15 +1890,29 @@ impl Dsv4Model {
             .into_iter()
             .max()
             .unwrap_or(0);
+        let flashmla_band_bytes_per_slot = flashmla_slot_pages.saturating_mul(flashmla_page_bytes);
         anyhow::ensure!(
-            flashmla_slot_pages.saturating_mul(flashmla_page_bytes) <= pool_budget_bytes_per_layer,
+            flashmla_band_bytes_per_slot <= pool_budget_bytes_per_layer,
             "DSv4 KV budget rejected startup: the shared FlashMLA pool's per-layer \
              remainder ({}MB) cannot hold even one slot's band at max_seq_len \
              {max_seq_len} ({flashmla_slot_pages} pages, {}MB). Lower --max-total-tokens \
              or free VRAM.",
             pool_budget_bytes_per_layer >> 20,
-            flashmla_slot_pages.saturating_mul(flashmla_page_bytes) >> 20,
+            flashmla_band_bytes_per_slot >> 20,
         );
+        // The FlashMLA pool draws a FULL fixed band per slot up front (never
+        // incremental, `HostPagedKvPool::alloc_fixed_band`), so concurrency is
+        // ALSO capped by how many whole bands the remainder affords — the
+        // `affordable` gate above only sized per-slot STATE, excluding the band.
+        // Re-clamp `num_slots` to that so the scheduler never admits more
+        // concurrent requests than the pool can hand fixed bands to (pod-verified
+        // 2026-07-06: without this, a 2-request concurrent burst exhausted the
+        // pool and `bail!`'d inside `alloc_fixed_band` mid-serve instead of this
+        // clean startup-time slot count).
+        let pool_affordable_slots = pool_budget_bytes_per_layer
+            .checked_div(flashmla_band_bytes_per_slot)
+            .unwrap_or(usize::MAX);
+        let affordable = affordable.min(pool_affordable_slots);
         // Neutral clamp (infer-seam): planned = min(requested, affordable);
         // clamped == requested > affordable. NCCL min-reduce stays CUDA-side.
         let (planned, clamped) = infer_seam::clamp_to_affordable(requested, affordable);
@@ -1906,7 +1920,8 @@ impl Dsv4Model {
             log::warn!(
                 "DSv4 KV budget: requested {requested} slots × ~{}MB/slot (slot-state {}MB + DSA key-cache/batched; \
                  FP8 arena out of divisor) exceeds the cross-rank-min affordable {affordable} \
-                 (local affordable {affordable_local}, {MEM_FRACTION} of post-weights free); clamping num_slots to {affordable}.",
+                 (local affordable {affordable_local}, pool-band-affordable {pool_affordable_slots}, \
+                 {MEM_FRACTION} of post-weights free); clamping num_slots to {affordable}.",
                 per_slot >> 20,
                 slot_state_bytes >> 20,
             );
@@ -2725,6 +2740,55 @@ impl Dsv4Model {
                 let positions = batched_positions.as_ref().ok_or_else(|| {
                     anyhow!("DSv4 batched decode lane: batched positions buffer missing")
                 })?;
+                // Opt-in (`dsv4_decode_multistream_overlap_enabled`): `normed` is
+                // independent of the projection GEMM below, so fork the compressor +
+                // indexer-key prepass onto Aux before that GEMM is enqueued.
+                // `indexer_query_batch_prepass` needs `proj.c_q_normed` so it can't
+                // join and stays on the main stream. `None` here (lever off, `n`
+                // below threshold, no compressor, or no Aux scratch) falls through
+                // to the byte-identical sequential path in the "0b" block below.
+                let overlap_prepass = if n >= crate::attention::DSV4_MULTISTREAM_OVERLAP_MIN_BATCH
+                    && crate::attention::dsv4_decode_multistream_overlap_enabled()?
+                {
+                    if let (Some(compressor), Some(aux_scratch)) = (
+                        layer.attention.compressor.as_ref(),
+                        kv_adapter.prefill_linear_aux_mut(),
+                    ) {
+                        let aux_ctx = self.ctx.with_stream_view(CudaPipelineStreamKind::Aux);
+                        let normed_ready =
+                            ctx.record_pipeline_fence(CudaPipelineStreamKind::Compute)?;
+                        aux_ctx
+                            .wait_on_pipeline_fence(&normed_ready, CudaPipelineStreamKind::Aux)?;
+                        let main = crate::attention::compressor_batch_prepass(
+                            &aux_ctx,
+                            compressor,
+                            &normed,
+                            Some(&mut *aux_scratch),
+                            &mut keepalive,
+                        )?;
+                        let indexer = match (layer.mode, layer.attention.indexer.as_ref()) {
+                            (DeepSeekV4AttentionMode::CompressedSparse, Some(idx)) => {
+                                crate::attention::compressor_batch_prepass(
+                                    &aux_ctx,
+                                    idx.compressor
+                                        .as_ref()
+                                        .expect("DSv4 CSA indexer has a key compressor"),
+                                    &normed,
+                                    Some(&mut *aux_scratch),
+                                    &mut keepalive,
+                                )?
+                            }
+                            _ => None,
+                        };
+                        let aux_done =
+                            aux_ctx.record_pipeline_fence(CudaPipelineStreamKind::Aux)?;
+                        Some((main, indexer, aux_done))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
                 // Borrow the model-wide shared FP8 prefill DeepGEMM scratch for the
                 // batched (m=N) projection. `None` when DeepGEMM is disabled — the
                 // pre-pass then takes its scalar fallback. This borrow is scoped to
@@ -2767,29 +2831,42 @@ impl Dsv4Model {
                 let (compressor_kv_score, indexer_kv_score, indexer_query_kv_score) = {
                     let (_lp, _dsa, _fb, _fs, mut prefill_shared) =
                         kv_adapter.layer_dsa_and_flashmla_batch_mut(layer_idx)?;
-                    let main = match layer.attention.compressor.as_ref() {
-                        Some(c) => crate::attention::compressor_batch_prepass(
-                            &self.ctx,
-                            c,
-                            &normed,
-                            prefill_shared.as_deref_mut(),
-                            &mut keepalive,
-                        )?,
-                        None => None,
-                    };
-                    let indexer = match (layer.mode, layer.attention.indexer.as_ref()) {
-                        (DeepSeekV4AttentionMode::CompressedSparse, Some(idx)) => {
-                            crate::attention::compressor_batch_prepass(
-                                &self.ctx,
-                                idx.compressor
-                                    .as_ref()
-                                    .expect("DSv4 CSA indexer has a key compressor"),
-                                &normed,
-                                prefill_shared.as_deref_mut(),
-                                &mut keepalive,
-                            )?
+                    let (main, indexer) = match overlap_prepass {
+                        // Aux-stream prepass already computed these concurrently
+                        // with `proj` above; join before anything below reads them.
+                        Some((main, indexer, aux_done)) => {
+                            ctx.wait_on_pipeline_fence(&aux_done, CudaPipelineStreamKind::Compute)?;
+                            (main, indexer)
                         }
-                        _ => None,
+                        // Overlap lever off (or not applicable this layer/step): the
+                        // original fully-sequential main-stream path, unchanged.
+                        None => {
+                            let main = match layer.attention.compressor.as_ref() {
+                                Some(c) => crate::attention::compressor_batch_prepass(
+                                    &self.ctx,
+                                    c,
+                                    &normed,
+                                    prefill_shared.as_deref_mut(),
+                                    &mut keepalive,
+                                )?,
+                                None => None,
+                            };
+                            let indexer = match (layer.mode, layer.attention.indexer.as_ref()) {
+                                (DeepSeekV4AttentionMode::CompressedSparse, Some(idx)) => {
+                                    crate::attention::compressor_batch_prepass(
+                                        &self.ctx,
+                                        idx.compressor
+                                            .as_ref()
+                                            .expect("DSv4 CSA indexer has a key compressor"),
+                                        &normed,
+                                        prefill_shared.as_deref_mut(),
+                                        &mut keepalive,
+                                    )?
+                                }
+                                _ => None,
+                            };
+                            (main, indexer)
+                        }
                     };
                     let query = match (layer.mode, layer.attention.indexer.as_ref()) {
                         (DeepSeekV4AttentionMode::CompressedSparse, Some(idx)) => {
@@ -3985,16 +4062,71 @@ impl Dsv4Model {
                 // Phase 6a: grouped shared expert over [N] (dense FFN, prefill path)
                 // — one batched SwiGLU GEMM pair, replacing the per-row loop + N
                 // host syncs.
+                //
+                // Waterfill lever (see `dsv4_moe_waterfill_active` doc): shards the
+                // redundant `world`-way shared-expert compute by token count.
                 let mut shared = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
-                crate::moe::dsv4_shared_expert_forward(
-                    &self.ctx,
-                    &self.ctx.stream,
-                    layer.moe.as_ref().expect("DSv4 layer.moe"),
-                    &normed,
-                    &mut shared,
-                    self.config.swiglu_limit,
-                    &mut keepalive,
-                )?;
+                let world = self.tp.config().world_size;
+                if crate::moe::dsv4_moe_waterfill_active(seq_len, world) {
+                    let rank = self.tp.config().rank;
+                    let per = seq_len.div_ceil(world);
+                    let start = (rank * per).min(seq_len);
+                    let end = ((rank + 1) * per).min(seq_len);
+                    let owned_n = end - start;
+                    self.ctx
+                        .stream
+                        .memset_zeros(&mut shared.data)
+                        .map_err(|e| anyhow!("waterfill shared-expert zero failed: {e}"))?;
+                    if owned_n > 0 {
+                        let mut owned_in =
+                            unsafe { HiddenStates::uninit(&self.ctx, hidden_size, owned_n)? };
+                        self.ctx
+                            .stream
+                            .memcpy_dtod(
+                                &normed.data.slice(start * hidden_size..end * hidden_size),
+                                &mut owned_in.data.slice_mut(0..owned_n * hidden_size),
+                            )
+                            .map_err(|e| {
+                                anyhow!("waterfill shared-expert owned-in copy failed: {e}")
+                            })?;
+                        let mut owned_out =
+                            unsafe { HiddenStates::uninit(&self.ctx, hidden_size, owned_n)? };
+                        crate::moe::dsv4_shared_expert_forward(
+                            &self.ctx,
+                            &self.ctx.stream,
+                            layer.moe.as_ref().expect("DSv4 layer.moe"),
+                            &owned_in,
+                            &mut owned_out,
+                            self.config.swiglu_limit,
+                            &mut keepalive,
+                        )?;
+                        self.ctx
+                            .stream
+                            .memcpy_dtod(
+                                &owned_out.data.slice(0..owned_n * hidden_size),
+                                &mut shared
+                                    .data
+                                    .slice_mut(start * hidden_size..end * hidden_size),
+                            )
+                            .map_err(|e| {
+                                anyhow!("waterfill shared-expert scatter-out failed: {e}")
+                            })?;
+                        keepalive.keep_hidden(&owned_in);
+                        keepalive.keep_hidden(&owned_out);
+                    }
+                    let _nvtx = crate::nvtx::range("dsv4/moe_shared_waterfill_allreduce");
+                    self.tp.all_reduce_sum(&self.ctx, &mut shared)?;
+                } else {
+                    crate::moe::dsv4_shared_expert_forward(
+                        &self.ctx,
+                        &self.ctx.stream,
+                        layer.moe.as_ref().expect("DSv4 layer.moe"),
+                        &normed,
+                        &mut shared,
+                        self.config.swiglu_limit,
+                        &mut keepalive,
+                    )?;
+                }
                 keepalive.keep_hidden(&shared);
                 // SAFETY: add_batch writes the full [seq_len, hidden_size] buffer.
                 crate::ops::add_batch(&self.ctx, &moe_out, &shared, &mut moe_with_shared)?;
