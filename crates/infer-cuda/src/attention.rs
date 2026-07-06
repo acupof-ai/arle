@@ -1731,11 +1731,17 @@ pub(crate) fn dsv4_flashmla_slot_pages(
     Ok(sw_blocks + comp_blocks)
 }
 
+/// Whether the FlashMLA shared-band pool is built at all. This is a compile-
+/// time question (does the arena exist), not the runtime kernel-choice
+/// question `dsv4_flashmla_decode_enabled` answers — `ARLE_DSV4_FLASHMLA_DECODE=0`
+/// (picking the scalar kernel for an A/B or a correctness reference) must NOT
+/// also zero the pool's page budget, since the scalar kernel still reads the
+/// same compressed/sliding-window layout (pod-verified 2026-07-06: the
+/// fallthrough this replaced sized every slot's band at 0 pages whenever the
+/// decode-kernel flag was off, so admission then rejected almost every
+/// request against the real per-request page need).
 fn dsv4_flashmla_decode_alloc_enabled() -> Result<bool> {
-    if env_flag("ARLE_DSV4_FLASHMLA_DECODE_ALLOC")? {
-        return Ok(true);
-    }
-    dsv4_flashmla_decode_enabled()
+    Ok(cuda_kernels::HAS_FLASHMLA)
 }
 
 pub(crate) fn dsv4_fused_wqkv_decode_alloc_enabled() -> Result<bool> {
