@@ -27,11 +27,11 @@ use crate::multiproc_relay::{
 };
 use crate::schema::{
     ApiError, ChatCompletionRequest, ChatCompletionResponse, CompletionRequest, CompletionResponse,
-    ModelsResponse, ResponseToolCall, StatsResponse,
+    ModelsResponse, ResponseToolCall, StatsResponse, Usage,
 };
 use crate::sse_util::{
     ChatDelta, StreamPipeline, chat_stream_chunk, completion_stream_chunk, finish_reason,
-    unix_time_secs,
+    stream_usage_chunk, unix_time_secs,
 };
 use crate::tokenizer::OpenAiTokenizer;
 
@@ -426,6 +426,27 @@ impl Drop for InFlightGuard {
     }
 }
 
+/// The last SSE frame of a stream: the finish-reason chunk, an optional
+/// `stream_options.include_usage` trailer (empty `choices`, populated
+/// `usage`), then `[DONE]`.
+fn sse_final_frame(
+    final_chunk: &serde_json::Value,
+    usage_chunk: Option<serde_json::Value>,
+) -> Vec<u8> {
+    let mut out = format!(
+        "data: {}\n\n",
+        serde_json::to_string(final_chunk).unwrap_or_default()
+    );
+    if let Some(usage_chunk) = usage_chunk {
+        out.push_str(&format!(
+            "data: {}\n\n",
+            serde_json::to_string(&usage_chunk).unwrap_or_default()
+        ));
+    }
+    out.push_str("data: [DONE]\n\n");
+    out.into_bytes()
+}
+
 /// Set up the relay sink + in_flight guard + submit for a streaming request.
 /// Returns the per-token delta receiver and the guard (caller must keep alive
 /// until streaming ends so `in_flight` is decremented only after the last delta).
@@ -562,8 +583,13 @@ async fn completions(
     let sampling = request.sampling_params();
     let max_tokens = sampling.max_new_tokens.unwrap_or(16);
     let prompt_tokens = encode(&state, &request.prompt)?;
+    let include_usage = request
+        .stream_options
+        .as_ref()
+        .is_some_and(|o| o.include_usage);
 
     if request.stream.unwrap_or(false) {
+        let prompt_len = prompt_tokens.len();
         let (mut rx, guard) = streaming_submit(&state, prompt_tokens, max_tokens, sampling)?;
         let id = format!("cmpl-{}", Uuid::new_v4().simple());
         let created = unix_time_secs();
@@ -575,6 +601,7 @@ async fn completions(
         tokio::spawn(async move {
             // `guard` dropped when this task exits, decrementing in_flight + unregistering sink.
             let _guard = guard;
+            let mut completion_count = 0usize;
             while let Some(delta) = rx.recv().await {
                 if let Some(err) = delta.error {
                     let chunk = serde_json::to_string(&completion_stream_chunk(
@@ -592,6 +619,7 @@ async fn completions(
                     break;
                 }
                 if !delta.token_ids.is_empty() {
+                    completion_count += delta.token_ids.len();
                     let text = {
                         let tok = state_clone
                             .tokenizer
@@ -613,19 +641,21 @@ async fn completions(
                 }
                 if delta.finish {
                     let fr = finish_reason(delta.finish_reason.as_ref());
-                    let final_chunk = serde_json::to_string(&completion_stream_chunk(
+                    let final_chunk = completion_stream_chunk(
                         &id,
                         created,
                         &model,
                         String::new(),
                         Some(fr),
                         None,
-                    ))
-                    .unwrap_or_default();
+                    );
+                    let usage_chunk = include_usage.then(|| {
+                        let usage = serde_json::to_value(Usage::new(prompt_len, completion_count))
+                            .unwrap_or_default();
+                        stream_usage_chunk(&id, created, &model, "text_completion", usage)
+                    });
                     let _ = chunk_tx
-                        .send(Ok(
-                            format!("data: {final_chunk}\n\ndata: [DONE]\n\n").into_bytes()
-                        ))
+                        .send(Ok(sse_final_frame(&final_chunk, usage_chunk)))
                         .await;
                     break;
                 }
@@ -667,6 +697,10 @@ async fn chat_completions(
     request.validate()?;
     let sampling = request.sampling_params();
     let stream = request.stream.unwrap_or(false);
+    let include_usage = request
+        .stream_options
+        .as_ref()
+        .is_some_and(|o| o.include_usage);
     // Thinking defaults on when a budget is configured OR the checkpoint is a
     // reasoning model (DeepSeek-V4-Flash) that degenerates when forced
     // non-thinking; `0` + non-reasoning keeps it off and byte-identical.
@@ -775,6 +809,7 @@ async fn chat_completions(
     let thinking = thinking || prompt_prefills_think(&prompt);
 
     if stream {
+        let prompt_len = prompt_tokens.len();
         let (mut rx, guard) = streaming_submit(&state, prompt_tokens, max_tokens, sampling)?;
         let id = format!("chatcmpl-{}", Uuid::new_v4().simple());
         let created = unix_time_secs();
@@ -786,6 +821,7 @@ async fn chat_completions(
         tokio::spawn(async move {
             // `guard` dropped when this task exits, decrementing in_flight + unregistering sink.
             let _guard = guard;
+            let mut completion_count = 0usize;
             // Converged reasoning-then-tools pipeline (shared with /v1/messages).
             let mut pipeline = StreamPipeline::new(thinking, tools_active);
             let mut completed_calls: Vec<chat::ToolCall> = Vec::new();
@@ -813,6 +849,7 @@ async fn chat_completions(
                     break;
                 }
                 if !delta.token_ids.is_empty() {
+                    completion_count += delta.token_ids.len();
                     let text = {
                         let tok = state_clone
                             .tokenizer
@@ -892,18 +929,20 @@ async fn chat_completions(
                     } else {
                         "tool_calls"
                     };
-                    let final_chunk = serde_json::to_string(&chat_stream_chunk(
+                    let final_chunk = chat_stream_chunk(
                         &id,
                         created,
                         &model,
                         with_role(serde_json::json!({})),
                         Some(fr),
-                    ))
-                    .unwrap_or_default();
+                    );
+                    let usage_chunk = include_usage.then(|| {
+                        let usage = serde_json::to_value(Usage::new(prompt_len, completion_count))
+                            .unwrap_or_default();
+                        stream_usage_chunk(&id, created, &model, "chat.completion.chunk", usage)
+                    });
                     let _ = chunk_tx
-                        .send(Ok(
-                            format!("data: {final_chunk}\n\ndata: [DONE]\n\n").into_bytes()
-                        ))
+                        .send(Ok(sse_final_frame(&final_chunk, usage_chunk)))
                         .await;
                     break;
                 }
