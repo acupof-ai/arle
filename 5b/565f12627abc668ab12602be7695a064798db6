@@ -1,0 +1,23 @@
+docs/experience/wins/2026-07-06-dsv4-decode-multistream-overlap-pending-remote.md
+  s_16b22c20f68f43::t_a55ff4a399e2ff 127-145,211-284
+docs/experience/wins/2026-07-06-dsv4-deepep-waterfill-pending-remote.md
+  s_16b22c20f68f43::t_cb9108700d7f3a 110-170,174-178,180-182
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "5b565f12627abc668ab12602be7695a064798db6",
+  "prompts": {},
+  "sessions": {
+    "s_16b22c20f68f43": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a54f18c439030ca75",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
