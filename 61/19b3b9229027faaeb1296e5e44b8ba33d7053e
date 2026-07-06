@@ -1,0 +1,29 @@
+crates/cuda-kernels/src/tensor.rs
+  s_5c1fc8c970e0a6::t_b0a87c5c2ff249 169,173-177,189-191,210-213,397-400,411,508-514,522,526-541
+crates/infer-cuda/src/attention.rs
+  s_5c1fc8c970e0a6::t_8e90b11c6f21cd 1688-1709
+crates/infer-cuda/src/attention/kv_layout.rs
+  s_5c1fc8c970e0a6::t_1cb9c8127ee411 187-194,565-578,591,656-661,752-760
+crates/infer-cuda/src/dsv4.rs
+  s_5c1fc8c970e0a6::t_01e3d44c34d43e 2728-2783,2826-2860
+docs/experience/wins/2026-07-06-dsv4-decode-multistream-overlap-pending-remote.md
+  s_5c1fc8c970e0a6::t_7fa43bbbee707c 1-161
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "6119b3b9229027faaeb1296e5e44b8ba33d7053e",
+  "prompts": {},
+  "sessions": {
+    "s_5c1fc8c970e0a6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a4c00ae9652d4e98a",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
