@@ -1,0 +1,21 @@
+AGENTS.md
+  s_94c3bae66fa1e8::t_82b74bf00c12d1 120-146
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "68e2ef53d9da12fd2fc4f01bbc3ecf136103dfb8",
+  "prompts": {},
+  "sessions": {
+    "s_94c3bae66fa1e8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5a82110a-23b9-41d7-928a-694778310502",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
