@@ -1102,17 +1102,9 @@ pub(crate) struct TrainOpdArgs {
 
     /// Rollout engine (CUDA only). `infer` = in-process infer engine (CUDA
     /// graph + paged KV, ~5× faster; default); `train` = train-crate O(n²)
-    /// decode A/B arm. Unset defers to the legacy `ARLE_OPD_INFER_ROLLOUT` env.
+    /// decode A/B arm. Unset defaults to `infer`.
     #[arg(long, value_enum)]
     pub(crate) rollout_engine: Option<OpdRolloutEngineArg>,
-
-    /// Engine weight time-share (CUDA only) to fit long rollouts on small VRAM.
-    /// `off` (default) keeps weights resident; `student`/`teacher` offload one
-    /// idle engine; `all` offloads both (frees the most VRAM but has a known
-    /// step-2 illegal-address on the W4A8 Marlin teacher reload — prefer
-    /// `teacher`). Unset defers to the legacy `ARLE_OPD_ENGINE_OFFLOAD` env.
-    #[arg(long, value_enum)]
-    pub(crate) engine_offload: Option<OpdEngineOffloadArg>,
 
     /// Render output as JSON for scripts and CI.
     #[arg(long, default_value_t = false)]
@@ -1126,19 +1118,6 @@ pub(crate) enum OpdRolloutEngineArg {
     Infer,
     /// Train-crate hand-written decode (A/B baseline arm).
     Train,
-}
-
-/// Engine offload time-share selector for `arle train opd --engine-offload`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-pub(crate) enum OpdEngineOffloadArg {
-    /// Keep both engines resident (default).
-    Off,
-    /// Offload only the rollout infer-student; keep the teacher resident.
-    Student,
-    /// Offload only the scoring teacher; keep the student resident.
-    Teacher,
-    /// Offload both idle engines (known step-2 illegal-address; prefer teacher).
-    All,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
