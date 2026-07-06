@@ -367,6 +367,91 @@ impl TpRuntime {
         self.all_reduce_sum_over(&self.comm, ctx, buf)
     }
 
+    /// Token-owned shard + all-reduce: split `input`'s `[seq_len]` rows into
+    /// contiguous `world_size`-way blocks (`div_ceil`), run `compute_fn` over
+    /// just this rank's owned rows, scatter the result into `out`'s owned
+    /// slice, then all-reduce so every rank ends up holding the full
+    /// `[seq_len]` result (unowned rows are zero going into the reduction).
+    ///
+    /// Shared by DSv4's DeepEP-LL token-owned MoE dispatch and the Waterfill
+    /// shared-expert shard — both need the identical shard/zero/scatter/
+    /// all-reduce bookkeeping and differ only in what runs over the owned rows.
+    ///
+    /// `compute_fn(owned_in, owned_out, start, owned_n)` always runs, even at
+    /// `owned_n == 0` (`seq_len < world_size` starves some ranks): DeepEP LL
+    /// dispatch/combine are collectives that every rank must enter regardless;
+    /// callers whose per-rank work is not a collective (e.g. a plain GEMM)
+    /// should no-op when `owned_n == 0` inside the closure, matching what
+    /// today's hand-rolled call sites do. `start` is the owned range's first
+    /// row index (into `input`'s `[seq_len]` rows) — callers slicing a
+    /// parallel per-token array (e.g. token ids) need it alongside `owned_n`.
+    /// `allreduce_nvtx_label`, if set, scopes an nvtx range to just the final
+    /// all-reduce (matching a caller's existing narrow profiling range);
+    /// `None` emits no range, same as a call site with no wrapper today.
+    ///
+    /// # Errors
+    /// Propagates device alloc/copy, `compute_fn`, and all-reduce errors.
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn shard_rows_and_allreduce(
+        &self,
+        ctx: &cuda_kernels::prelude::DeviceContext,
+        input: &cuda_kernels::prelude::HiddenStates,
+        out: &mut cuda_kernels::prelude::HiddenStates,
+        hidden_size: usize,
+        seq_len: usize,
+        allreduce_nvtx_label: Option<&str>,
+        compute_fn: impl FnOnce(
+            &cuda_kernels::prelude::HiddenStates,
+            &mut cuda_kernels::prelude::HiddenStates,
+            usize,
+            usize,
+        ) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        use cuda_kernels::prelude::HiddenStates;
+
+        let cfg = self.config();
+        let per = seq_len.div_ceil(cfg.world_size);
+        let start = (cfg.rank * per).min(seq_len);
+        let end = ((cfg.rank + 1) * per).min(seq_len);
+        let owned_n = end - start;
+
+        ctx.stream
+            .memset_zeros(&mut out.data)
+            .map_err(|e| anyhow::anyhow!("shard_rows_and_allreduce: out zero failed: {e}"))?;
+
+        let mut owned_in = HiddenStates::zeros(ctx, hidden_size, owned_n.max(1))?;
+        owned_in.seq_len = owned_n;
+        if owned_n > 0 {
+            ctx.stream
+                .memcpy_dtod(
+                    &input.data.slice(start * hidden_size..end * hidden_size),
+                    &mut owned_in.data.slice_mut(0..owned_n * hidden_size),
+                )
+                .map_err(|e| {
+                    anyhow::anyhow!("shard_rows_and_allreduce: owned-in copy failed: {e}")
+                })?;
+        }
+
+        let mut owned_out = HiddenStates::zeros(ctx, hidden_size, owned_n.max(1))?;
+        owned_out.seq_len = owned_n;
+        compute_fn(&owned_in, &mut owned_out, start, owned_n)?;
+
+        if owned_n > 0 {
+            ctx.stream
+                .memcpy_dtod(
+                    &owned_out.data.slice(0..owned_n * hidden_size),
+                    &mut out.data.slice_mut(start * hidden_size..end * hidden_size),
+                )
+                .map_err(|e| {
+                    anyhow::anyhow!("shard_rows_and_allreduce: owned-out copy failed: {e}")
+                })?;
+        }
+
+        let _nvtx = allreduce_nvtx_label.map(crate::nvtx::range);
+        self.all_reduce_sum(ctx, out)
+    }
+
     /// All-reduce (sum) in place over an explicit communicator (the global TP
     /// comm, or one of the [`Self::attn_tp`] / [`Self::moe_ep`] sub-comms).
     /// Same body as [`Self::all_reduce_sum`] but on the passed `comm`.

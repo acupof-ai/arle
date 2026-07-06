@@ -1267,6 +1267,48 @@ impl std::fmt::Debug for Dsv4Model {
     }
 }
 
+/// One `compressor_batch_prepass` output: `(compressed_kv, gate_or_score)`.
+type PrepassOutput = Option<(HiddenStates, HiddenStates)>;
+
+/// Shared compressor+indexer batch prepass body for one layer — used both by
+/// the sequential main-stream path and the Aux-lane multistream-overlap fork
+/// in `Dsv4Model::forward_decode_batch_stream_impl`. The two call sites differ
+/// only in which `ctx`/scratch backs the DeepGEMM path; callers fence around
+/// this call rather than duplicating the compressor/indexer logic itself.
+fn run_compressor_indexer_prepass(
+    ctx: &DeviceContext,
+    layer: &Dsv4Layer,
+    normed: &HiddenStates,
+    mut scratch: Option<&mut crate::attention::Dsv4PrefillDeepGemmLinearScratch>,
+    keepalive: &mut Dsv4ForwardKeepalive,
+) -> Result<(PrepassOutput, PrepassOutput)> {
+    let main = match layer.attention.compressor.as_ref() {
+        Some(c) => crate::attention::compressor_batch_prepass(
+            ctx,
+            c,
+            normed,
+            scratch.as_deref_mut(),
+            keepalive,
+        )?,
+        None => None,
+    };
+    let indexer = match (layer.mode, layer.attention.indexer.as_ref()) {
+        (DeepSeekV4AttentionMode::CompressedSparse, Some(idx)) => {
+            crate::attention::compressor_batch_prepass(
+                ctx,
+                idx.compressor
+                    .as_ref()
+                    .expect("DSv4 CSA indexer has a key compressor"),
+                normed,
+                scratch,
+                keepalive,
+            )?
+        }
+        _ => None,
+    };
+    Ok((main, indexer))
+}
+
 impl Dsv4Model {
     /// Per-forward owned-token cap when the deepep_ll MoE transport is booted
     /// (`None` for allreduce / intranode / non-deepep builds → unbounded). Core
@@ -1909,9 +1951,13 @@ impl Dsv4Model {
         // 2026-07-06: without this, a 2-request concurrent burst exhausted the
         // pool and `bail!`'d inside `alloc_fixed_band` mid-serve instead of this
         // clean startup-time slot count).
-        let pool_affordable_slots = pool_budget_bytes_per_layer
-            .checked_div(flashmla_band_bytes_per_slot)
-            .unwrap_or(usize::MAX);
+        let pool_affordable_slots = infer_seam::SlotBudget::from_limit(
+            pool_budget_bytes_per_layer,
+            0,
+            flashmla_band_bytes_per_slot,
+        )
+        .affordable()
+        .unwrap_or(usize::MAX);
         let affordable = affordable.min(pool_affordable_slots);
         // Neutral clamp (infer-seam): planned = min(requested, affordable);
         // clamped == requested > affordable. NCCL min-reduce stays CUDA-side.
@@ -2621,6 +2667,18 @@ impl Dsv4Model {
         if lens_from.is_some() {
             crate::probe::lens_begin();
         }
+        // Multistream-overlap eligibility (`n`, the lever, batch size) is
+        // identical every layer of this decode step — resolve once and clone
+        // the Aux-lane view once (5 `Arc` bumps) instead of per layer. `None`
+        // when ineligible, so the per-layer branch below still falls through
+        // to the byte-identical sequential path with zero extra cost.
+        let aux_overlap_ctx = if n >= crate::attention::DSV4_MULTISTREAM_OVERLAP_MIN_BATCH
+            && crate::attention::dsv4_decode_multistream_overlap_enabled()?
+        {
+            Some(self.ctx.with_stream_view(CudaPipelineStreamKind::Aux))
+        } else {
+            None
+        };
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             let _layer_nvtx = crate::nvtx::range(&format!("dsv4/layer_{layer_idx:02}"));
             let full_flatten = layer.mode != DeepSeekV4AttentionMode::SparseIndexed;
@@ -2747,45 +2805,23 @@ impl Dsv4Model {
                 // join and stays on the main stream. `None` here (lever off, `n`
                 // below threshold, no compressor, or no Aux scratch) falls through
                 // to the byte-identical sequential path in the "0b" block below.
-                let overlap_prepass = if n >= crate::attention::DSV4_MULTISTREAM_OVERLAP_MIN_BATCH
-                    && crate::attention::dsv4_decode_multistream_overlap_enabled()?
-                {
-                    if let (Some(compressor), Some(aux_scratch)) = (
-                        layer.attention.compressor.as_ref(),
-                        kv_adapter.prefill_linear_aux_mut(),
-                    ) {
-                        let aux_ctx = self.ctx.with_stream_view(CudaPipelineStreamKind::Aux);
-                        let normed_ready =
-                            ctx.record_pipeline_fence(CudaPipelineStreamKind::Compute)?;
-                        aux_ctx
-                            .wait_on_pipeline_fence(&normed_ready, CudaPipelineStreamKind::Aux)?;
-                        let main = crate::attention::compressor_batch_prepass(
-                            &aux_ctx,
-                            compressor,
-                            &normed,
-                            Some(&mut *aux_scratch),
-                            &mut keepalive,
-                        )?;
-                        let indexer = match (layer.mode, layer.attention.indexer.as_ref()) {
-                            (DeepSeekV4AttentionMode::CompressedSparse, Some(idx)) => {
-                                crate::attention::compressor_batch_prepass(
-                                    &aux_ctx,
-                                    idx.compressor
-                                        .as_ref()
-                                        .expect("DSv4 CSA indexer has a key compressor"),
-                                    &normed,
-                                    Some(&mut *aux_scratch),
-                                    &mut keepalive,
-                                )?
-                            }
-                            _ => None,
-                        };
-                        let aux_done =
-                            aux_ctx.record_pipeline_fence(CudaPipelineStreamKind::Aux)?;
-                        Some((main, indexer, aux_done))
-                    } else {
-                        None
-                    }
+                let overlap_prepass = if let (Some(aux_ctx), Some(_compressor), Some(aux_scratch)) = (
+                    aux_overlap_ctx.as_ref(),
+                    layer.attention.compressor.as_ref(),
+                    kv_adapter.prefill_linear_aux_mut(),
+                ) {
+                    let normed_ready =
+                        ctx.record_pipeline_fence(CudaPipelineStreamKind::Compute)?;
+                    aux_ctx.wait_on_pipeline_fence(&normed_ready, CudaPipelineStreamKind::Aux)?;
+                    let (main, indexer) = run_compressor_indexer_prepass(
+                        aux_ctx,
+                        layer,
+                        &normed,
+                        Some(&mut *aux_scratch),
+                        &mut keepalive,
+                    )?;
+                    let aux_done = aux_ctx.record_pipeline_fence(CudaPipelineStreamKind::Aux)?;
+                    Some((main, indexer, aux_done))
                 } else {
                     None
                 };
@@ -2840,33 +2876,13 @@ impl Dsv4Model {
                         }
                         // Overlap lever off (or not applicable this layer/step): the
                         // original fully-sequential main-stream path, unchanged.
-                        None => {
-                            let main = match layer.attention.compressor.as_ref() {
-                                Some(c) => crate::attention::compressor_batch_prepass(
-                                    &self.ctx,
-                                    c,
-                                    &normed,
-                                    prefill_shared.as_deref_mut(),
-                                    &mut keepalive,
-                                )?,
-                                None => None,
-                            };
-                            let indexer = match (layer.mode, layer.attention.indexer.as_ref()) {
-                                (DeepSeekV4AttentionMode::CompressedSparse, Some(idx)) => {
-                                    crate::attention::compressor_batch_prepass(
-                                        &self.ctx,
-                                        idx.compressor
-                                            .as_ref()
-                                            .expect("DSv4 CSA indexer has a key compressor"),
-                                        &normed,
-                                        prefill_shared.as_deref_mut(),
-                                        &mut keepalive,
-                                    )?
-                                }
-                                _ => None,
-                            };
-                            (main, indexer)
-                        }
+                        None => run_compressor_indexer_prepass(
+                            &self.ctx,
+                            layer,
+                            &normed,
+                            prefill_shared.as_deref_mut(),
+                            &mut keepalive,
+                        )?,
                     };
                     let query = match (layer.mode, layer.attention.indexer.as_ref()) {
                         (DeepSeekV4AttentionMode::CompressedSparse, Some(idx)) => {
@@ -3954,79 +3970,41 @@ impl Dsv4Model {
                             )
                         })?;
                         if transport.is_low_latency() {
-                            // Token-owned LL path: this rank owns the contiguous
-                            // token cols [start..end) of the replicated `normed`.
-                            // Every rank participates in the dispatch/combine
-                            // COLLECTIVES even with owned_n == 0 (seq_len < world).
-                            let world = self.tp.config().world_size;
-                            let rank = self.tp.config().rank;
-                            let per = seq_len.div_ceil(world);
-                            let start = (rank * per).min(seq_len);
-                            let end = ((rank + 1) * per).min(seq_len);
-                            let owned_n = end - start;
-                            // Zero the full output; each rank scatters its owned
-                            // cols, then an all-reduce gathers them (replacing the
-                            // moe all-reduce — DeepEP combine already EP-reduced).
-                            self.ctx
-                                .stream
-                                .memset_zeros(&mut moe_out.data)
-                                .map_err(|e| {
-                                    anyhow!("deepep_ll batched moe_out zero failed: {e}")
-                                })?;
-                            let mut owned_in =
-                                HiddenStates::zeros(&self.ctx, hidden_size, owned_n.max(1))?;
-                            owned_in.seq_len = owned_n;
-                            keepalive.keep_hidden(&owned_in);
-                            if owned_n > 0 {
-                                self.ctx
-                                    .stream
-                                    .memcpy_dtod(
-                                        &normed.data.slice(start * hidden_size..end * hidden_size),
-                                        &mut owned_in.data.slice_mut(0..owned_n * hidden_size),
-                                    )
-                                    .map_err(|e| {
-                                        anyhow!("deepep_ll batched owned-slice copy failed: {e}")
-                                    })?;
-                            }
-                            let mut owned_out =
-                                HiddenStates::zeros(&self.ctx, hidden_size, owned_n.max(1))?;
-                            owned_out.seq_len = owned_n;
-                            keepalive.keep_hidden(&owned_out);
-                            // The LL scratch is whole-forward scratch (fully
-                            // overwritten per call); it is parked per-slot for the
-                            // single-row path, so the batch borrows row 0's.
+                            // Token-owned LL path: DeepEP dispatch/combine are
+                            // collectives every rank enters even at owned_n == 0
+                            // (seq_len < world). The LL scratch is whole-forward
+                            // scratch (fully overwritten per call); it is parked
+                            // per-slot for the single-row path, so the batch
+                            // borrows row 0's.
                             let scratch = slots[slot_ids[0]]
                                 .deepep_ll_scratch
                                 .as_mut()
                                 .ok_or_else(|| {
                                     anyhow!("deepep_ll selected but slot LL scratch not allocated")
                                 })?;
-                            crate::moe::dsv4_moe_forward_deepep_ll(
-                                self,
-                                transport,
-                                scratch,
-                                layer.moe.as_ref().expect("DSv4 layer.moe"),
-                                &tokens[start..end],
-                                tokens.len(),
-                                &owned_in,
-                                &mut owned_out,
-                                &mut keepalive,
-                            )?;
-                            if owned_n > 0 {
-                                self.ctx
-                                    .stream
-                                    .memcpy_dtod(
-                                        &owned_out.data.slice(0..owned_n * hidden_size),
-                                        &mut moe_out
-                                            .data
-                                            .slice_mut(start * hidden_size..end * hidden_size),
+                            self.tp.shard_rows_and_allreduce(
+                                &self.ctx,
+                                &normed,
+                                &mut moe_out,
+                                hidden_size,
+                                seq_len,
+                                None,
+                                |owned_in, owned_out, start, owned_n| {
+                                    keepalive.keep_hidden(owned_in);
+                                    keepalive.keep_hidden(owned_out);
+                                    crate::moe::dsv4_moe_forward_deepep_ll(
+                                        self,
+                                        transport,
+                                        scratch,
+                                        layer.moe.as_ref().expect("DSv4 layer.moe"),
+                                        &tokens[start..start + owned_n],
+                                        tokens.len(),
+                                        owned_in,
+                                        owned_out,
+                                        &mut keepalive,
                                     )
-                                    .map_err(|e| {
-                                        anyhow!("deepep_ll batched owned scatter failed: {e}")
-                                    })?;
-                            }
-                            // All-gather via all-reduce: only owned cols are nonzero.
-                            self.tp.all_reduce_sum(&self.ctx, &mut moe_out)?;
+                                },
+                            )?;
                         } else {
                             // Intranode normal-mode DeepEP: already [N]-shaped; its
                             // combine reduces across EP, no moe all-reduce needed.
@@ -4068,54 +4046,35 @@ impl Dsv4Model {
                 let mut shared = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
                 let world = self.tp.config().world_size;
                 if crate::moe::dsv4_moe_waterfill_active(seq_len, world) {
-                    let rank = self.tp.config().rank;
-                    let per = seq_len.div_ceil(world);
-                    let start = (rank * per).min(seq_len);
-                    let end = ((rank + 1) * per).min(seq_len);
-                    let owned_n = end - start;
-                    self.ctx
-                        .stream
-                        .memset_zeros(&mut shared.data)
-                        .map_err(|e| anyhow!("waterfill shared-expert zero failed: {e}"))?;
-                    if owned_n > 0 {
-                        let mut owned_in =
-                            unsafe { HiddenStates::uninit(&self.ctx, hidden_size, owned_n)? };
-                        self.ctx
-                            .stream
-                            .memcpy_dtod(
-                                &normed.data.slice(start * hidden_size..end * hidden_size),
-                                &mut owned_in.data.slice_mut(0..owned_n * hidden_size),
-                            )
-                            .map_err(|e| {
-                                anyhow!("waterfill shared-expert owned-in copy failed: {e}")
-                            })?;
-                        let mut owned_out =
-                            unsafe { HiddenStates::uninit(&self.ctx, hidden_size, owned_n)? };
-                        crate::moe::dsv4_shared_expert_forward(
-                            &self.ctx,
-                            &self.ctx.stream,
-                            layer.moe.as_ref().expect("DSv4 layer.moe"),
-                            &owned_in,
-                            &mut owned_out,
-                            self.config.swiglu_limit,
-                            &mut keepalive,
-                        )?;
-                        self.ctx
-                            .stream
-                            .memcpy_dtod(
-                                &owned_out.data.slice(0..owned_n * hidden_size),
-                                &mut shared
-                                    .data
-                                    .slice_mut(start * hidden_size..end * hidden_size),
-                            )
-                            .map_err(|e| {
-                                anyhow!("waterfill shared-expert scatter-out failed: {e}")
-                            })?;
-                        keepalive.keep_hidden(&owned_in);
-                        keepalive.keep_hidden(&owned_out);
-                    }
-                    let _nvtx = crate::nvtx::range("dsv4/moe_shared_waterfill_allreduce");
-                    self.tp.all_reduce_sum(&self.ctx, &mut shared)?;
+                    self.tp.shard_rows_and_allreduce(
+                        &self.ctx,
+                        &normed,
+                        &mut shared,
+                        hidden_size,
+                        seq_len,
+                        Some("dsv4/moe_shared_waterfill_allreduce"),
+                        |owned_in, owned_out, _start, owned_n| {
+                            // Unlike DeepEP-LL's collectives, the shared-expert
+                            // GEMM is per-rank local — a starved rank (owned_n
+                            // == 0) skips it entirely, matching the pre-refactor
+                            // behavior (no keep_hidden either, since nothing ran).
+                            if owned_n == 0 {
+                                return Ok(());
+                            }
+                            crate::moe::dsv4_shared_expert_forward(
+                                &self.ctx,
+                                &self.ctx.stream,
+                                layer.moe.as_ref().expect("DSv4 layer.moe"),
+                                owned_in,
+                                owned_out,
+                                self.config.swiglu_limit,
+                                &mut keepalive,
+                            )?;
+                            keepalive.keep_hidden(owned_in);
+                            keepalive.keep_hidden(owned_out);
+                            Ok(())
+                        },
+                    )?;
                 } else {
                     crate::moe::dsv4_shared_expert_forward(
                         &self.ctx,
@@ -5412,83 +5371,39 @@ impl Dsv4Model {
                             // ── deepep_ll token-owned path ──────────────────────
                             // TP8 replicates `normed` [hidden, n]; HiddenStates is
                             // token-major (token i at i*hidden), so this rank's owned
-                            // shard cols [start..end] is a CONTIGUOUS byte range.
-                            let world = self.tp.config().world_size;
-                            let rank = self.tp.config().rank;
-                            let per = seq_len.div_ceil(world);
-                            let start = (rank * per).min(seq_len);
-                            let end = ((rank + 1) * per).min(seq_len);
-                            let owned_n = end - start;
-                            // Zero the full output; every rank scatters its owned cols
-                            // then an all-reduce gathers them (replaces the moe AR).
-                            self.ctx
-                                .stream
-                                .memset_zeros(&mut moe_out.data)
-                                .map_err(|e| anyhow!("deepep_ll moe_out zero failed: {e}"))?;
-                            // The LL dispatch + combine are COLLECTIVES: EVERY rank must
-                            // participate every step or the symmetric protocol deadlocks
-                            // (DeepEP "timeout for dispatch receive"). A rank that owns 0
-                            // tokens (when seq_len < world) still dispatches 0 tokens and
-                            // runs the masked GEMMs over the tokens routed to ITS local
-                            // experts. So always call the LL forward — it internally
-                            // handles owned_n == 0 — and only scatter when owned_n > 0.
+                            // shard cols [start..end] is a CONTIGUOUS byte range. The
+                            // LL dispatch + combine are COLLECTIVES: EVERY rank must
+                            // participate every step or the symmetric protocol
+                            // deadlocks (DeepEP "timeout for dispatch receive") — the
+                            // shared helper always runs `compute_fn`, even at
+                            // owned_n == 0. This REPLACES the moe all-reduce
+                            // (needs_moe_allreduce=false).
                             let scratch = slot.deepep_ll_scratch.as_mut().ok_or_else(|| {
                                 anyhow!("deepep_ll selected but slot LL scratch not allocated")
                             })?;
-                            // Copy this rank's owned contiguous columns of `normed`
-                            // into a compact `[hidden, owned_n]` buffer (the LL dispatch
-                            // needs a standalone `[owned_n, hidden]` input; `.slice()`
-                            // yields a borrowed CudaView, not an owned CudaSlice, so we
-                            // materialize it — same one-copy pattern as the per-row
-                            // attention slab path above). owned_n may be 0.
-                            let mut owned_in =
-                                HiddenStates::zeros(&self.ctx, hidden_size, owned_n.max(1))?;
-                            owned_in.seq_len = owned_n;
-                            keepalive.keep_hidden(&owned_in);
-                            if owned_n > 0 {
-                                self.ctx
-                                    .stream
-                                    .memcpy_dtod(
-                                        &normed.data.slice(start * hidden_size..end * hidden_size),
-                                        &mut owned_in.data.slice_mut(0..owned_n * hidden_size),
+                            self.tp.shard_rows_and_allreduce(
+                                &self.ctx,
+                                &normed,
+                                &mut moe_out,
+                                hidden_size,
+                                seq_len,
+                                None,
+                                |owned_in, owned_out, start, owned_n| {
+                                    keepalive.keep_hidden(owned_in);
+                                    keepalive.keep_hidden(owned_out);
+                                    crate::moe::dsv4_moe_forward_deepep_ll(
+                                        self,
+                                        transport,
+                                        scratch,
+                                        layer.moe.as_ref().expect("DSv4 layer.moe"),
+                                        &tokens[start..start + owned_n],
+                                        tokens.len(),
+                                        owned_in,
+                                        owned_out,
+                                        &mut keepalive,
                                     )
-                                    .map_err(|e| {
-                                        anyhow!("deepep_ll owned-slice copy failed: {e}")
-                                    })?;
-                            }
-                            let mut owned_out =
-                                HiddenStates::zeros(&self.ctx, hidden_size, owned_n.max(1))?;
-                            owned_out.seq_len = owned_n;
-                            keepalive.keep_hidden(&owned_out);
-                            crate::moe::dsv4_moe_forward_deepep_ll(
-                                self,
-                                transport,
-                                scratch,
-                                layer.moe.as_ref().expect("DSv4 layer.moe"),
-                                &tokens[start..end],
-                                tokens.len(),
-                                &owned_in,
-                                &mut owned_out,
-                                &mut keepalive,
+                                },
                             )?;
-                            if owned_n > 0 {
-                                // Scatter owned_out into moe_out's owned cols (contiguous).
-                                self.ctx
-                                    .stream
-                                    .memcpy_dtod(
-                                        &owned_out.data.slice(0..owned_n * hidden_size),
-                                        &mut moe_out
-                                            .data
-                                            .slice_mut(start * hidden_size..end * hidden_size),
-                                    )
-                                    .map_err(|e| {
-                                        anyhow!("deepep_ll owned scatter into moe_out failed: {e}")
-                                    })?;
-                            }
-                            // All-gather via all-reduce: each rank contributed only its
-                            // owned cols (rest zero), so the sum is the full gather.
-                            // This REPLACES the moe all-reduce (needs_moe_allreduce=false).
-                            self.tp.all_reduce_sum(&self.ctx, &mut moe_out)?;
                         } else {
                             crate::moe::dsv4_moe_forward_deepep(
                                 self,

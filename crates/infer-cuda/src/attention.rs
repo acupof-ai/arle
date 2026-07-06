@@ -1694,7 +1694,12 @@ pub(crate) const DSV4_MULTISTREAM_OVERLAP_MIN_BATCH: usize = 4;
 /// concurrent with the main-stream projection GEMM; requires native DeepGEMM
 /// (`prefill_linear_aux` is only built when that's on). `ARLE_DSV4_DECODE_MULTISTREAM_OVERLAP=1`.
 pub(crate) fn dsv4_decode_multistream_overlap_enabled() -> Result<bool> {
-    env_flag("ARLE_DSV4_DECODE_MULTISTREAM_OVERLAP")
+    // Process-static — read once (hot path: per layer per decode step).
+    static ENV_GATE: std::sync::OnceLock<Result<bool, String>> = std::sync::OnceLock::new();
+    ENV_GATE
+        .get_or_init(|| env_flag("ARLE_DSV4_DECODE_MULTISTREAM_OVERLAP").map_err(|e| e.to_string()))
+        .clone()
+        .map_err(|e| anyhow!(e))
 }
 
 /// Single-row decode-graph CSA READ via the graph-safe n=1 batched device-meta
