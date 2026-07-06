@@ -1,0 +1,21 @@
+crates/infer-cuda/src/attention.rs
+  s_965ce2db4386cb::t_42b457d1521266 1734-1742,1744
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "4e44b0209cd6daa5886b676ac1611048c3dd5384",
+  "prompts": {},
+  "sessions": {
+    "s_965ce2db4386cb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "124b0ccd-6ba1-4679-a1ec-a259030026b8",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
