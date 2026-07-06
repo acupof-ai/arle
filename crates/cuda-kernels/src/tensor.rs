@@ -186,6 +186,13 @@ pub struct DeviceContext {
     pub comm_stream: Arc<CudaStream>,
     /// Spare compute lane (see [`CudaPipelineStreamKind::Aux`]).
     pub aux_stream: Arc<CudaStream>,
+    /// Pre-allocated event backing every `Aux`-producer [`CudaPipelineFence`]
+    /// (see [`DeviceContext::record_pipeline_fence`]) — the Aux lane is always
+    /// a single fork-then-join per layer (record, then immediately wait),
+    /// never multiple in-flight recordings, so reusing one `cuEvent` instead of
+    /// create/destroy per call is safe and avoids a driver round trip on every
+    /// decode-step layer the multistream-overlap lever touches.
+    aux_fence_event: Arc<CudaEvent>,
     /// CUDA device ordinal this context is bound to.
     pub ordinal: u32,
 }
@@ -224,7 +231,11 @@ pub enum CudaPipelineFenceStatus {
 pub struct CudaPipelineFence {
     device_ordinal: u32,
     producer: CudaPipelineStreamKind,
-    event: CudaEvent,
+    // `Arc` so the `Aux` producer can share `DeviceContext::aux_fence_event`
+    // instead of owning (and destroying) a fresh event per fence; every other
+    // producer wraps a freshly-created event exactly as before (refcount 1,
+    // dropped with the fence).
+    event: Arc<CudaEvent>,
 }
 
 impl CudaPipelineFence {
@@ -394,6 +405,11 @@ impl DeviceContext {
             .new_stream()
             .map_err(|e| anyhow!("Failed to create CUDA aux stream: {}", e))?;
 
+        let aux_fence_event = Arc::new(
+            ctx.new_event(None)
+                .map_err(|e| anyhow!("Failed to create CUDA aux fence event: {}", e))?,
+        );
+
         // Initialize cuBLAS handle
         unsafe {
             ffi::cublas_init();
@@ -405,6 +421,7 @@ impl DeviceContext {
             copy_stream,
             comm_stream,
             aux_stream,
+            aux_fence_event,
             ordinal,
         })
     }
@@ -501,13 +518,6 @@ impl DeviceContext {
             .map_err(|e| anyhow!("Communication stream sync failed: {}", e))
     }
 
-    /// Synchronize aux stream.
-    pub fn sync_aux(&self) -> Result<()> {
-        self.aux_stream
-            .synchronize()
-            .map_err(|e| anyhow!("Aux stream sync failed: {}", e))
-    }
-
     /// Return the raw stream that backs a pipeline lane.
     #[must_use]
     pub fn pipeline_stream(&self, kind: CudaPipelineStreamKind) -> &Arc<CudaStream> {
@@ -532,14 +542,22 @@ impl DeviceContext {
     }
 
     /// Record a fence on the selected producer stream.
+    ///
+    /// `Aux` reuses the pre-allocated [`Self::aux_fence_event`] instead of
+    /// creating a fresh `cuEvent` (see its field doc); every other producer
+    /// allocates one as before.
     pub fn record_pipeline_fence(
         &self,
         producer: CudaPipelineStreamKind,
     ) -> Result<CudaPipelineFence> {
-        let event = self
-            .ctx
-            .new_event(None)
-            .map_err(|e| anyhow!("Alloc CUDA pipeline fence failed: {e}"))?;
+        let event = match producer {
+            CudaPipelineStreamKind::Aux => self.aux_fence_event.clone(),
+            _ => Arc::new(
+                self.ctx
+                    .new_event(None)
+                    .map_err(|e| anyhow!("Alloc CUDA pipeline fence failed: {e}"))?,
+            ),
+        };
         event
             .record(self.pipeline_stream(producer))
             .map_err(|e| anyhow!("Record CUDA pipeline fence on {producer:?} failed: {e}"))?;
