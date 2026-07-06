@@ -112,12 +112,12 @@ Measured on the runtime, not projected — fresh `arle serve` benches, one binar
 
 The same loop lifts *agentic* capability: with think-on OPD the 4B student learns to **decline irrelevant tool calls — BFCL-live abstention 0.60 → 1.00**. [<a href="docs/experience/wins/2026-06-20-agentic-opd-thinkon-abstention-win.md">method</a>]
 
-**And it lifts *agentic* capability on a standardized benchmark.** `arle train agent-opd` distils execution-passing agent trajectories (masked next-token CE, LoRA re-synced into the rollout engine every round; student and engine share one set of FP8 base weights — train-infer-unified, zero-copy — on **one H20 at ~11.75 s/round, 37× vs the naive loop**). Pointed at **Terminal-Bench** (terminus agent driving a 27B FP8 student, execution-scored in Docker), it lifts **pass@1 20.5% → 25.6% (+5.1pp)**:
+**And it lifts *agentic* capability on a standardized benchmark.** `arle train agent-opd` distils a 27B FP8 student on its execution-passing **Terminal-Bench** rollouts (train-infer-unified, ~11.75 s/round on one H20) — **pass@1 20.5% → 25.6% (+5.1pp)**:
 
 <p align="center">
-  <img src="docs/assets/tbench-opd-lift.png" alt="Terminal-Bench agentic OPD: 27B pass@1 20.5%→25.6% (+5.1pp); hello-world 0/3→3/3 as unparseable output becomes clean terminus-JSON" width="760">
+  <img src="docs/assets/tbench-opd-lift.png" alt="Terminal-Bench agentic OPD: 27B pass@1 20.5%→25.6% (+5.1pp)" width="760">
 </p>
-<p align="center"><sub>Terminal-Bench-core 0.1.1, 13 tasks × pass@3, terminus + Qwen3.6-27B-FP8 · the gradient is <b>output-format conformance</b>: ~22/31 baseline fails were terminus-JSON parse errors / runaway-reasoning timeouts, not capability — decoded from the failure taxonomy, distilled from the 8 passing trials. hello-world <b>0/3→3/3</b> confirms the mechanism (unparseable → clean JSON). Hatched bars = uv-installer test-timeout artifacts, not regressions; git-workflow-hack 2→0 = a real format-vs-logic tradeoff · preliminary n=13. <a href="docs/experience/wins/2026-07-07-terminal-bench-opd-format-distill-lift.md">method</a> · <a href="docs/experience/wins/2026-07-03-opd-full20-curve.md">loop perf</a></sub></p>
+<p align="center"><sub>13 tasks × pass@3, terminus + Qwen3.6-27B-FP8 · the distilled gradient is output-format conformance (hello-world 0/3→3/3: unparseable → clean JSON). <a href="docs/experience/wins/2026-07-07-terminal-bench-opd-format-distill-lift.md">method &amp; caveats</a></sub></p>
 
 **Stability:** CUDA **Stable** · Metal **Beta** (DFlash + Qwen3.6 NextN-MTP: bit-identical spec decode) · OPD train **Beta** (~2× vs HF TRL `GKDTrainer` — measured 2.04–2.49× on Qwen3-0.6B; LoRA fits 4 GB cards) · CPU dev-only. Models: Qwen3-dense + Qwen3.5/3.6 (hybrid · MoE) on CUDA + Metal · DeepSeek-V4-Flash + GLM-5.2 (CUDA 8×H20 TP=8/EP=8; GLM-5.2 verify pending) · Qwen3.6 + Gemma4 · DeepSeek-OCR VLMs + DiffusionGemma (Metal). Full tiers: [support-matrix](docs/support-matrix.md) · [stability-policy](docs/stability-policy.md).
 
