@@ -166,13 +166,10 @@ impl CudaAllocTraceExt for Arc<CudaStream> {
 
 /// CUDA device context holding compute stream and optional copy stream.
 ///
-/// Multi-stream architecture for overlapping independent work with compute:
+/// Two-stream architecture for overlapping H2D/D2H transfers with compute:
 /// - `stream` (compute): all GPU kernels, CUDA Graph capture/replay
 /// - `copy_stream`: async H2D/D2H transfers, runs concurrently with compute
 /// - `comm_stream`: communication collectives that can overlap independent compute
-/// - `aux_stream`: a spare compute lane for work independent of `stream`;
-///   callers must supply scratch that never aliases what `stream` is
-///   concurrently using.
 ///
 /// Cross-stream sync uses raw CUDA events (not cudarc's automatic tracking,
 /// which breaks CUDA Graph capture).
@@ -184,15 +181,6 @@ pub struct DeviceContext {
     pub copy_stream: Arc<CudaStream>,
     /// Separate stream for NCCL/communication work that can overlap compute.
     pub comm_stream: Arc<CudaStream>,
-    /// Spare compute lane (see [`CudaPipelineStreamKind::Aux`]).
-    pub aux_stream: Arc<CudaStream>,
-    /// Pre-allocated event backing every `Aux`-producer [`CudaPipelineFence`]
-    /// (see [`DeviceContext::record_pipeline_fence`]) — the Aux lane is always
-    /// a single fork-then-join per layer (record, then immediately wait),
-    /// never multiple in-flight recordings, so reusing one `cuEvent` instead of
-    /// create/destroy per call is safe and avoids a driver round trip on every
-    /// decode-step layer the multistream-overlap lever touches.
-    aux_fence_event: Arc<CudaEvent>,
     /// CUDA device ordinal this context is bound to.
     pub ordinal: u32,
 }
@@ -211,9 +199,6 @@ pub enum CudaPipelineStreamKind {
     Copy,
     /// Dedicated communication stream for NCCL collectives and P2P exchanges.
     Comm,
-    /// Spare compute lane for overlapping independent work with `Compute`;
-    /// callers must give it scratch that never aliases `Compute`'s.
-    Aux,
 }
 
 /// Result of a non-blocking CUDA pipeline fence poll.
@@ -231,11 +216,7 @@ pub enum CudaPipelineFenceStatus {
 pub struct CudaPipelineFence {
     device_ordinal: u32,
     producer: CudaPipelineStreamKind,
-    // `Arc` so the `Aux` producer can share `DeviceContext::aux_fence_event`
-    // instead of owning (and destroying) a fresh event per fence; every other
-    // producer wraps a freshly-created event exactly as before (refcount 1,
-    // dropped with the fence).
-    event: Arc<CudaEvent>,
+    event: CudaEvent,
 }
 
 impl CudaPipelineFence {
@@ -401,15 +382,6 @@ impl DeviceContext {
             .new_stream()
             .map_err(|e| anyhow!("Failed to create CUDA communication stream: {}", e))?;
 
-        let aux_stream = ctx
-            .new_stream()
-            .map_err(|e| anyhow!("Failed to create CUDA aux stream: {}", e))?;
-
-        let aux_fence_event = Arc::new(
-            ctx.new_event(None)
-                .map_err(|e| anyhow!("Failed to create CUDA aux fence event: {}", e))?,
-        );
-
         // Initialize cuBLAS handle
         unsafe {
             ffi::cublas_init();
@@ -420,8 +392,6 @@ impl DeviceContext {
             stream,
             copy_stream,
             comm_stream,
-            aux_stream,
-            aux_fence_event,
             ordinal,
         })
     }
@@ -525,39 +495,18 @@ impl DeviceContext {
             CudaPipelineStreamKind::Compute => &self.stream,
             CudaPipelineStreamKind::Copy => &self.copy_stream,
             CudaPipelineStreamKind::Comm => &self.comm_stream,
-            CudaPipelineStreamKind::Aux => &self.aux_stream,
         }
     }
 
-    /// `self` with `.stream` swapped for `kind`'s lane — redirects any existing
-    /// `&DeviceContext`-taking call site onto another lane with no callee
-    /// changes (cheap: every field is `Arc`). Caller must fence the two lanes
-    /// via [`Self::record_pipeline_fence`]/[`Self::wait_on_pipeline_fence`] and
-    /// must not pass scratch the `Compute`-lane call is concurrently using.
-    #[must_use]
-    pub fn with_stream_view(&self, kind: CudaPipelineStreamKind) -> Self {
-        let mut view = self.clone();
-        view.stream = self.pipeline_stream(kind).clone();
-        view
-    }
-
     /// Record a fence on the selected producer stream.
-    ///
-    /// `Aux` reuses the pre-allocated [`Self::aux_fence_event`] instead of
-    /// creating a fresh `cuEvent` (see its field doc); every other producer
-    /// allocates one as before.
     pub fn record_pipeline_fence(
         &self,
         producer: CudaPipelineStreamKind,
     ) -> Result<CudaPipelineFence> {
-        let event = match producer {
-            CudaPipelineStreamKind::Aux => self.aux_fence_event.clone(),
-            _ => Arc::new(
-                self.ctx
-                    .new_event(None)
-                    .map_err(|e| anyhow!("Alloc CUDA pipeline fence failed: {e}"))?,
-            ),
-        };
+        let event = self
+            .ctx
+            .new_event(None)
+            .map_err(|e| anyhow!("Alloc CUDA pipeline fence failed: {e}"))?;
         event
             .record(self.pipeline_stream(producer))
             .map_err(|e| anyhow!("Record CUDA pipeline fence on {producer:?} failed: {e}"))?;

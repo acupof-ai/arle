@@ -1,5 +1,14 @@
 # DSv4 decode multi-stream overlap (Aux stream) - 2026-07-06
 
+> Status: **Killed — 2026-07-06.** Round 3's real matched A/B (n=8, 3 trials/arm,
+> trial-nonced cold prompts) showed a ~9% wall-clock **regression** with the
+> lever ON (9.65s -> 10.53s mean, zero overlap across 6 trials — see the final
+> section below). Lever code deleted same day: `ARLE_DSV4_DECODE_MULTISTREAM_OVERLAP`,
+> the Aux-stream fork in `forward_decode_batch_stream_impl`, `DeviceContext::aux_stream`/
+> `with_stream_view`, and the `prefill_linear_aux` scratch. `shard_rows_and_allreduce`
+> (extracted `abc4826e9`) and the KV-budget clamp fix (`51c31b44f`/`77d60fd4d`) are
+> unrelated to this verdict and were kept.
+
 ## Goal
 
 - Add a Aux CUDA stream lever to DSv4's batched (n>1) eager decode lane
@@ -282,3 +291,49 @@ license. No perf evidence either way. Re-verify once the pre-existing n>1
 decode-correctness bug is fixed, or via a position-controlled repeat-count
 large enough to resolve the lever's effect against the baseline's own noise
 floor.
+
+## Round 3 (2026-07-06) — real matched A/B, post-refactor `abc4826e9` — KILL
+
+**Context.** After today's simplification refactor (`abc4826e9`, extracting
+`TpRuntime::shard_rows_and_allreduce`), a fresh pod session re-verified this
+lever's serial correctness (unaffected — see the sibling regression-check task)
+and then ran the perf A/B round 1/2 deferred on: guidellm is still incompatible
+with this checkpoint's rope config, but wall-clock timing does not require
+correct decode, only a fixed request shape — the pre-existing n>1
+correctness bug (documented above) is orthogonal to speed.
+
+**Method.** `concurrent_needle_v3.py` (trial-nonced prompts: every trial's 64/8
+prompts are byte-distinct from every other trial run against the same
+long-lived server, so prefix-cache reuse cannot bias ANY arm regardless of
+boot/trial order — a stronger control than alternating boot order). n=8
+(above `DSV4_MULTISTREAM_OVERLAP_MIN_BATCH=4`), TP=4 on GPUs 2,3,4,5,
+`--max-total-tokens 2048`, `ARLE_DSV4_MOE_BACKEND=allreduce`. One server boot
+per arm, 3 trials per boot, `WALL_TOTAL` = submit-to-last-completion wall time.
+
+| Arm | trial 0 | trial 1 | trial 2 | mean |
+|---|---:|---:|---:|---:|
+| OFF | 9.682s | 9.568s | 9.692s | **9.647s** |
+| ON | 10.611s | 10.588s | 10.378s | **10.526s** |
+
+**Δ% = (9.647 − 10.526) / 9.647 = −9.1%** (negative = ON is SLOWER). Every ON
+trial (10.378–10.611s) is slower than every OFF trial (9.568–9.692s) — zero
+overlap between the two distributions across 6 trials, so this is a real,
+repeatable regression, not noise. Artifact check: trial-nonce design
+guarantees every trial is cold by construction (never-before-seen prompt
+text), so the "warm second arm" cache-reuse artifact flagged in Round 2 cannot
+explain this result — if anything it would only help the LATER-run arm (ON),
+yet ON is the slower one.
+
+**Verdict: KILL.** No wall-clock benefit; a measurable regression instead.
+Deleted the same day: `ARLE_DSV4_DECODE_MULTISTREAM_OVERLAP` env gate and
+`DSV4_MULTISTREAM_OVERLAP_MIN_BATCH` (`attention.rs`), the `aux_overlap_ctx`/
+`overlap_prepass` fork in `forward_decode_batch_stream_impl` (`dsv4.rs` —
+`run_compressor_indexer_prepass` now runs unconditionally on the main stream,
+byte-identical to the lever-OFF path), `prefill_linear_aux` scratch
+(`kv_layout.rs`), and `CudaPipelineStreamKind::Aux` / `DeviceContext::aux_stream`
+/ `with_stream_view` (`tensor.rs` — confirmed dead via workspace-wide grep,
+zero remaining callers). Post-deletion smoke gate (TP=4, GPUs 2-5, lengths
+115/300/446/2000): exact=3/3 DET at every length, matching the pre-deletion
+envelope exactly. `cargo clippy -p infer-cuda -p cuda-kernels --features
+cuda,no-cuda -- -D warnings`: 23 findings before and after (git-stash A/B),
+zero new.

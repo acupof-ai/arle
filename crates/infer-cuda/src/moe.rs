@@ -2535,30 +2535,6 @@ mod dsv4_gpu {
         )
     }
 
-    /// Below this token count the extra all-reduce isn't worth sharding for.
-    const DSV4_MOE_WATERFILL_MIN_TOKENS: usize = 64;
-
-    /// Static (opt-in, `ARLE_DSV4_MOE_WATERFILL=1`, default OFF, UNVERIFIED —
-    /// no pod A/B yet) shared-expert token sharding: `normed` is TP-replicated,
-    /// so the shared-expert dense FFN runs `world_size`-redundantly today. When
-    /// active, splits `N` tokens evenly by count across ranks and combines via
-    /// one all-reduce, cutting shared-expert FLOPs by `(world_size-1)/world_size`.
-    /// A static even split, NOT literal DeepSeek-V4 Waterfill (weighted-random
-    /// dispatch to the least-loaded rank) — that needs a gather/scatter-by-
-    /// arbitrary-index kernel not hand-written here; see the wins doc follow-ups.
-    pub(crate) fn dsv4_moe_waterfill_active(seq_len: usize, world_size: usize) -> bool {
-        // Process-static — read once (hot path: per layer per prefill step).
-        static ENV_GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        world_size > 1
-            && seq_len >= DSV4_MOE_WATERFILL_MIN_TOKENS
-            && *ENV_GATE.get_or_init(|| {
-                matches!(
-                    std::env::var("ARLE_DSV4_MOE_WATERFILL").as_deref(),
-                    Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
-                )
-            })
-    }
-
     fn dsv4_route_device(
         model: &Dsv4Model,
         layer: &Dsv4MoeLayer,
@@ -4839,7 +4815,7 @@ mod dsv4_gpu {
 pub(crate) use dsv4_gpu::{
     Dsv4GemvTables, Dsv4MoeDecodeScratch, Dsv4SharedDecodeScratch, GroupedCache,
     build_grouped_cache, dsv4_moe_forward, dsv4_moe_forward_decode_graph,
-    dsv4_moe_waterfill_active, dsv4_shared_expert_forward, dsv4_shared_expert_forward_decode_graph,
+    dsv4_shared_expert_forward, dsv4_shared_expert_forward_decode_graph,
     dsv4_shared_expert_forward_decode_scratch,
 };
 #[cfg(feature = "deepep")]

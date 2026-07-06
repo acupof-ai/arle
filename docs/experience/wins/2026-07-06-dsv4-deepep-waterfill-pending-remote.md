@@ -1,5 +1,17 @@
 # DSv4 shared-expert static token sharding ("Waterfill", static-mode only) - 2026-07-06
 
+> Status: **Killed — 2026-07-06.** Round 3's real matched A/B (n=64, 3
+> trials/arm, trial-nonced cold prompts) showed no measurable wall-clock gain
+> — 75.94s (OFF) vs 73.81s (ON) mean, a 2.8% difference well within the
+> arms' own trial-to-trial spread (overlapping ranges, not statistically
+> distinguishable) — see the final section below. Lever code deleted same
+> day: `ARLE_DSV4_MOE_WATERFILL`, `DSV4_MOE_WATERFILL_MIN_TOKENS`, and
+> `dsv4_moe_waterfill_active` (the shared-expert shard call site in
+> `forward_decode_batch_stream_impl` now unconditionally takes the
+> full-`[N]`-batch path). `shard_rows_and_allreduce` (still used by DeepEP-LL)
+> and the KV-budget clamp fix (`51c31b44f`/`77d60fd4d`) are unrelated to this
+> verdict and were kept.
+
 ## Goal
 
 - Close part of gap #1 from the DSv4 MoE audit against SGLang's DeepSeek-V4
@@ -227,3 +239,53 @@ against the baseline's own noise floor.
   transport, adding one extra all-reduce even where the routed-expert combine
   already provided one to piggyback on) — a targeted follow-up once a CUDA
   host can measure whether the extra collective is a net win.
+- **Superseded by the Round 3 KILL below** — the static-split lever itself is
+  deleted; a load-aware Waterfill would need to be re-justified from scratch
+  against a fresh perf baseline, not resumed from this scaffold.
+
+## Round 3 (2026-07-06) — real matched A/B, post-refactor `abc4826e9` — KILL
+
+**Context.** Same session as the multistream-overlap Round 3 (see that doc for
+the shared method rationale: guidellm is still incompatible with this
+checkpoint, but wall-clock timing doesn't need correct decode — the
+pre-existing n>1 correctness bug documented above is orthogonal to speed).
+
+**Method.** `concurrent_needle_v3.py`, trial-nonced (every trial's 64 prompts
+are byte-distinct from every other trial run against the same server — cold
+by construction regardless of arm/boot order). n=64 (above
+`DSV4_MOE_WATERFILL_MIN_TOKENS=64`), TP=4 on GPUs 2,3,4,5,
+`--max-total-tokens 2048` (pool-affordable=256 slots — the same recipe Round
+2 proved reaches this gate), `ARLE_DSV4_MOE_BACKEND=allreduce`. One server
+boot per arm, 3 trials per boot, `WALL_TOTAL` = submit-to-last-completion.
+
+| Arm | trial 0 | trial 1 | trial 2 | mean |
+|---|---:|---:|---:|---:|
+| OFF | 77.228s | 73.473s | 77.125s | **75.942s** |
+| ON | 74.568s | 73.042s | 73.830s | **73.813s** |
+
+**Δ% = (75.942 − 73.813) / 75.942 = +2.8%** (positive = ON nominally faster).
+But the two arms' own ranges overlap substantially (OFF: 73.473–77.228, ON:
+73.042–74.568 — OFF's *minimum* trial is inside ON's range), and the 2.1s gap
+between means is smaller than OFF's own 3.75s trial-to-trial spread. This is
+not a statistically distinguishable signal — it reads as noise, not a real
+effect. Artifact check: trial-nonce design guarantees every trial is cold
+(never-before-seen prompt text) regardless of run order, so the Round 2
+warm-cache artifact cannot explain the small ON-favoring gap either.
+
+**Verdict: KILL** (no measurable improvement, per the license-or-kill
+criterion — a modest, statistically-insignificant delta does not license a
+default-on flip, and per this session's "verify the gain or delete" directive
+an unproven opt-in flag is dead weight). Deleted the same day:
+`ARLE_DSV4_MOE_WATERFILL` env gate and `DSV4_MOE_WATERFILL_MIN_TOKENS`
+(`moe.rs`), and `dsv4_moe_waterfill_active` (`moe.rs`) plus its call site in
+`forward_decode_batch_stream_impl` (`dsv4.rs` — the shared-expert FFN now
+unconditionally runs `dsv4_shared_expert_forward` over the full `[N]` batch,
+byte-identical to the lever-OFF path). `TpRuntime::shard_rows_and_allreduce`
+(`tp.rs`) is KEPT — DeepEP-LL's two token-owned MoE call sites still use it;
+only its doc comment was updated to drop the now-dead Waterfill mention and
+its `#[cfg]` narrowed to `all(feature = "cuda", feature = "deepep")` (its only
+remaining callers are deepep-gated). Post-deletion smoke gate (TP=4, GPUs
+2-5, lengths 115/300/446/2000): exact=3/3 DET at every length, matching the
+pre-deletion envelope exactly. `cargo clippy -p infer-cuda -p cuda-kernels
+--features cuda,no-cuda -- -D warnings`: 23 findings before and after
+(git-stash A/B), zero new.
