@@ -58,17 +58,14 @@ lifecycle & progress spine).
 
 ### Train / OPD
 
-- **OPD stack review-driven hardening (2026-07-06).** Six-item review of the
-  OPD training stack: **(landed)** KL `batchmean` scale centralized behind one
-  `kl_batchmean_scale` helper + analytic gradient regression test (guards the
-  2026-06-16 LR-collapse); the OPD rollout arm moved to `--rollout-engine
-  {infer,train}` (env toggle `ARLE_OPD_INFER_ROLLOUT` deleted, no fallback);
-  the 490-line `gkd_anchor` step split into phase helpers (490→251 lines, zero
-  behavior change); dead `rubric_writeback_ce_step` (singular, zero callers)
-  deleted; OPD-vs-RFT naming de-drifted (`agent-opd`/`rubric-opd` are on-policy
-  RFT, not KL distillation) across `lib.rs`/`architecture.md`/pivot doc.
-  **(planned, pod-gated)** OPD Metal training backend, real-SWE teacher-in-loop
-  capability curve, and the overload-chain collapse.
+- **OPD stack review-driven hardening (2026-07-06).** **Landed:** KL scale
+  centralized behind `kl_batchmean_scale` + gradient regression test (guards the
+  2026-06-16 LR-collapse); rollout arm → `--rollout-engine {infer,train}`
+  (`ARLE_OPD_INFER_ROLLOUT` deleted); 490-line `gkd_anchor` split into phase
+  helpers (490→251, zero behavior change); dead `rubric_writeback_ce_step`
+  deleted; OPD-vs-RFT naming de-drifted (`agent-opd`/`rubric-opd` are RFT, not
+  distillation). **Planned (pod-gated):** Metal OPD backend, real-SWE
+  teacher-in-loop curve, overload-chain collapse.
   ([kl-guard](docs/experience/wins/2026-07-06-opd-kl-batchmean-scale-guard.md) ·
   [flags](docs/experience/wins/2026-07-06-opd-engine-knobs-cli-flags-pending-remote.md) ·
   [split](docs/experience/wins/2026-07-06-opd-gkd-anchor-phase-helpers-pending-remote.md) ·

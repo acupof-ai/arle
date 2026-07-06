@@ -1100,9 +1100,8 @@ pub(crate) struct TrainOpdArgs {
     #[arg(long, value_enum, default_value_t = OpdBackendArg::Auto)]
     pub(crate) backend: OpdBackendArg,
 
-    /// Rollout engine (CUDA only). `infer` = in-process infer engine (CUDA
-    /// graph + paged KV, ~5× faster; default); `train` = train-crate O(n²)
-    /// decode A/B arm. Unset defaults to `infer`.
+    /// Rollout engine (CUDA only). `infer` = in-process infer engine (~5×
+    /// faster; default); `train` = train-crate O(n²) A/B arm.
     #[arg(long, value_enum)]
     pub(crate) rollout_engine: Option<OpdRolloutEngineArg>,
 

@@ -2,17 +2,13 @@
 
 **Status**: Active · **Decision date**: 2026-05-18 · **Driver**: ckl
 
-> **Naming clarification (2026-07-06).** "OPD-only" is the runtime-led
-> *positioning* (one substrate: teacher/scorer via `infer-api`, student LoRA,
-> rollout→score→LoRA-backward), not a claim that every subcommand is a KL
-> distillation. As the substrate matured it grew **two objective families**:
-> (a) **OPD** proper (`opd`, `self-opd`) — teacher/EMA logits + KL distill;
-> (b) **RFT / rejection-sampling** (`agent-opd`, `rubric-opd`) — execution or
-> rubric-judge reward selects trajectories, trained by completion/response-masked
-> CE with no teacher forward and no KL. Both are on-policy and share the loop;
-> the `opd` in the RFT subcommand names refers to the shared substrate, not the
-> objective. Code axis map: `crates/train/src/lib.rs` header;
-> architecture table: `docs/architecture.md` (`train` row).
+> **Naming clarification (2026-07-06).** "OPD-only" is the *positioning* (one
+> substrate: teacher/scorer via `infer-api`, student LoRA, rollout→score→backward),
+> not that every subcommand is KL distillation. Two families share the loop:
+> **OPD** (`opd`, `self-opd`) — teacher/EMA + KL; **RFT** (`agent-opd`,
+> `rubric-opd`) — reward-selected trajectories + masked CE, no teacher/KL. The
+> `opd` in the RFT names is the substrate, not the objective. See
+> `crates/train/src/lib.rs` header + `docs/architecture.md` (`train` row).
 
 ## The decision
 

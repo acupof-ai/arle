@@ -124,13 +124,10 @@ jobs:
               -p infer-moe -p infer-topo -p infer-util -p deepseek-spec -p agent
           - name: support
             cmd: cargo test -p chat -p tools -p qwen3-spec -p qwen35-spec -p kv-native-sys --profile release-fast
-          # autograd + train are the heavy compiles. Split off support so no
-          # single lane cold-builds the full heavy set at once: bundled together
-          # the support lane OOM-killed the 16 GB runner at ~48 min every run
-          # (0 successes across 40 runs, 2026-07-06), never completing so its
-          # rust-cache never saved → perpetually cold. A dedicated lane cold-
-          # builds only this subset (which `cli` already builds within budget),
-          # completes, and saves its cache → warm thereafter.
+          # autograd+train split off support: bundled, the lane OOM-killed the
+          # 16 GB runner at ~48 min every run (0/40 successes, 2026-07-06) → never
+          # saved its cache → always cold. This subset (which `cli` builds in
+          # budget) completes and warms.
           - name: train
             cmd: |
               cargo test -p autograd --profile release-fast --features no-cuda --lib
@@ -144,10 +141,8 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          # `v2` prefix bump abandons the poisoned `test-support` cache (an
-          # OOM-killed job never runs the save step, so `cache-on-failure`
-          # couldn't rescue it — it stayed corrupt across 40 runs). New keys
-          # seed clean; the support lane split (above) makes each fit.
+          # `v2` prefix abandons the poisoned `test-support` cache (an OOM-killed
+          # job never runs the save step, so `cache-on-failure` couldn't rescue it).
           key: test-v2-${{ matrix.lane.name }}
           # A failed/cancelled lane still saves its build cache — otherwise one
           # broken test strands every later run cold (support lane, 2026-07-02).

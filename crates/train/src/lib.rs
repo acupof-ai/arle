@@ -1,21 +1,14 @@
-//! ARLE runtime-led post-training substrate.
+//! ARLE runtime-led post-training substrate (2026-05-18 OPD-only pivot): one
+//! surface — teacher via `infer-api`, student LoRA, rollout→score→LoRA-backward.
+//! Two objective families ride it:
+//! - **OPD** (`opd`, `self-opd`): teacher / EMA-self-teacher KL distill.
+//! - **RFT** (`agent-opd`, `rubric-opd`): execution- or rubric-reward selects
+//!   trajectories, trained by masked CE — no teacher, no KL. The `opd` in these
+//!   names is the shared substrate, not the objective.
 //!
-//! Per the 2026-05-18 OPD-only pivot, ARLE keeps ONE runtime-led training
-//! surface (teacher via `infer-api`, student LoRA, shared rollout→score→LoRA
-//! backward loop). Two objective families ride that substrate:
-//!
-//! - **OPD** (`opd`, `self-opd`) — a teacher / EMA-self-teacher scores the
-//!   student's on-policy rollout and a KL distill loss drives backward. This is
-//!   the "On-Policy Distillation" the pivot is named for.
-//! - **RFT / rejection-sampling** (`agent-opd`, `rubric-opd`) — an execution
-//!   reward (hidden tests pass) or a rubric judge selects trajectories, trained
-//!   by completion/response-masked next-token CE. **No teacher forward, no KL** —
-//!   these are on-policy RFT built on the same loop, not distillation. The `opd`
-//!   in their names is the shared substrate, not the objective.
-//!
-//! "OPD-only" is the runtime-led *positioning* (vs the retired pretrain / SFT /
-//! GRPO / multi-turn surfaces), not a claim that every subcommand is a KL
-//! distillation. See `docs/projects/2026-05-18-opd-only-pivot.md`.
+//! "OPD-only" is the positioning (vs the retired pretrain/SFT/GRPO/multi-turn),
+//! not a claim every subcommand is KL distillation.
+//! See `docs/projects/2026-05-18-opd-only-pivot.md`.
 
 #[path = "agent_opd.rs"]
 pub mod agent_opd;

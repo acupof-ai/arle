@@ -116,16 +116,9 @@ fn kl_distill_loss_drops_over_three_steps() {
 }
 
 /// Regression guard for `errors/2026-06-16-opd-kl-vocab-reduction-lr-collapse.md`.
-///
-/// The forward-KL gradient w.r.t. a student logit is analytically
-/// `(s_j - t_j) / positions` under the correct `batchmean` reduction, and
-/// `(s_j - t_j) / (positions * vocab)` under the buggy `mean`-over-all-logits
-/// reduction. This test computes the student-logit gradient directly (student
-/// logits are the trainable leaf, so backward stops there) and asserts the
-/// gradient magnitude matches the `1/positions` scale — it fails by exactly
-/// `vocab×` if the `kl_batchmean_scale` correction is ever dropped, which is
-/// the regime that pushed the gradient below AdamW `eps=1e-8` and collapsed the
-/// effective LR by ~vocab×.
+/// The forward-KL student-logit gradient is `(s_j - t_j)/positions` under
+/// `batchmean` vs `.../(positions*vocab)` under the buggy reduction — so this
+/// fails by exactly `vocab×` if `kl_batchmean_scale` is dropped.
 #[test]
 fn kl_distill_gradient_is_batchmean_scaled_not_vocab_collapsed() {
     let positions = 4usize;
@@ -167,15 +160,13 @@ fn kl_distill_gradient_is_batchmean_scaled_not_vocab_collapsed() {
         .expect("student grad");
     let grads = store.to_host(grad_id).expect("grad host");
 
-    // Analytic forward-KL gradient under batchmean: d/ds_j = (softmax(s)_j - t_j)/positions.
-    // Recompute softmax(student) and teacher-prob targets on host.
+    // Analytic batchmean gradient: d/ds_j = (softmax(s)_j - t_j)/positions.
     let mut expected = vec![0.0f32; positions * vocab];
     for p in 0..positions {
         let s = &student_data[p * vocab..(p + 1) * vocab];
         let max = s.iter().cloned().fold(f32::MIN, f32::max);
         let exps: Vec<f32> = s.iter().map(|v| (v - max).exp()).collect();
         let sum: f32 = exps.iter().sum();
-        // teacher token 5 gets all mass (its logit was 3.0, rest 0.0) → softmax.
         let t_logits: Vec<f32> = (0..vocab).map(|j| if j == 5 { 3.0 } else { 0.0 }).collect();
         let t_max = t_logits.iter().cloned().fold(f32::MIN, f32::max);
         let t_exps: Vec<f32> = t_logits.iter().map(|v| (v - t_max).exp()).collect();
@@ -188,8 +179,7 @@ fn kl_distill_gradient_is_batchmean_scaled_not_vocab_collapsed() {
     }
 
     let max_abs_grad = grads.iter().cloned().fold(0.0f32, |a, g| a.max(g.abs()));
-    // Under the collapsed `mean`/vocab reduction this max would be ~1/vocab of
-    // the batchmean value (≈1e-3/16 here) — far below any grad-clip threshold.
+    // Collapsed reduction would be ~1/vocab of this — below any grad-clip.
     assert!(
         max_abs_grad > 1.0e-3,
         "grad magnitude {max_abs_grad:.3e} looks vocab-collapsed (batchmean scale dropped?)"
