@@ -1,0 +1,25 @@
+crates/cuda-kernels/src/tensor.rs
+  s_965ce2db4386cb::t_be1ab021f5a16b 169,219,506-509
+crates/infer-cuda/src/dsv4.rs
+  s_965ce2db4386cb::t_a9eefec93fa5a7 2794-2817
+crates/infer-cuda/src/tp.rs
+  s_965ce2db4386cb::t_3f3af49edee5ee 387
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "55daf72021fa25b56613265fa02e910ba34f42ee",
+  "prompts": {},
+  "sessions": {
+    "s_965ce2db4386cb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "124b0ccd-6ba1-4679-a1ec-a259030026b8",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
