@@ -1986,6 +1986,7 @@ mod backend {
     }
 
     /// New tokens since the last drain, per handle.
+    #[cfg(feature = "cuda")]
     type PendingTokens = std::rc::Rc<
         std::cell::RefCell<std::collections::HashMap<infer_core::RequestHandle, Vec<u32>>>,
     >;
