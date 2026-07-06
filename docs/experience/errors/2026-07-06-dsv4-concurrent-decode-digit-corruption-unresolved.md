@@ -1,4 +1,4 @@
-# DSv4 concurrent-decode digit corruption — FlashMLA-lane hypothesis KILLED
+# DSv4 concurrent-decode digit corruption — FlashMLA-lane AND KV-reuse hypotheses KILLED
 
 ## Context
 
@@ -92,6 +92,89 @@ sweep with `compute-sanitizer racecheck` (unblocked now — no lever flag
 needed), targeting the scheduler's batch-row assembly and KV-pool slot
 addressing rather than the FlashMLA scratch buffers.
 
+## KV cache/page-reuse hypothesis — KILLED (2026-07-07)
+
+Next candidate after FlashMLA-lane: a host/GPU synchronization gap around
+freeing and reassigning physical KV pages — either via `RadixCache`
+(`crates/infer-core/src/radix.rs`) matching a shared prompt prefix across
+concurrent requests, or via raw same-slot page reuse
+(`crates/infer-seam/src/host_paged_kv_pool.rs::free_slot`/`alloc`, pure
+host bookkeeping, no sync/fence calls by design) racing a still-in-flight
+GPU read from the prior occupant.
+
+**Step 1 — prefix-sharing check (structural).** Read
+`/host/arle-build/concurrent_needle_v3.py`: every concurrent request's
+prompt is `"Trial{TRIAL}-Req{i}: " + TOPIC*n + PRE + CUE` — the per-request
+salt sits at the very front of the filler, so every concurrent row's tokens
+diverge within the first few tokens. The only shared prefix across ALL
+requests, all trials, all runs is the fixed `wrap()` system preamble
+(`<｜begin▁of▁sentence｜>You are a helpful assistant.<｜User｜>`), a handful of
+tokens present identically even in the n=1/short-prompt cases that are
+clean. A shared prefix that constant can't explain an (n≥3, length>250)-gated
+defect — **cross-request `RadixCache` prefix reuse is structurally
+implausible** as the sole mechanism before running anything.
+
+**Step 2 — prefix-cache-off A/B (empirical).** Added a temporary,
+diagnostic-only escape hatch (not a shipped feature) —
+`crates/infer-api/src/loaded.rs`, `EngineLoadConfig::scheduler_config`: if
+`ARLE_DISABLE_PREFIX_CACHE` is set, force `config.enable_prefix_cache =
+false`. Rebuilt (`BUILD_EXIT=0`), reran the identical `job2_ab.sh` sweep
+(n∈{3,4,6,8} × len∈{100,250,500,900} × 3 reps, TP=4 GPUs 2/3/4/5,
+`--max-total-tokens 2048`) with `ARLE_DISABLE_PREFIX_CACHE=1`:
+
+| Arm | Requests | Exact | Miss | Miss rate |
+|---|---|---|---|---|
+| default (prefix cache on) | 196 | 146 | 50 | 25.5% |
+| `ARLE_DSV4_FLASHMLA_DECODE=0` (scalar) | 252 | 200 | 52 | 20.6% |
+| `ARLE_DISABLE_PREFIX_CACHE=1` | 252 | 155 | 97 | 38.5% |
+
+Same failure signature (truncation + digit-4-onward corruption, e.g.
+`738231`/`7382`/`738.`  vs needle `738291`), zero admission errors/rejections
+in either the client or server log. Disabling prefix cache entirely did
+**not** reduce corruption — if anything the rate is comparably high (noise
+at n=48 trials, not a real reduction). **Kills cross-request RadixCache
+reuse as the mechanism**, confirming step 1's structural read.
+
+**Step 3 — decisive fresh-boot-first-request test.** The narrower version
+(same-slot/page reuse across *sequential* requests, independent of radix
+matching — no fencing between a finished request's `free_slot` and a new
+occupant's write to the same physical page) predicts corruption should be
+*absent* on a server's very first-ever forward, since no page has ever been
+freed/reused yet. Booted a fresh DSv4 server (TP=4, GPUs 2/3/4/5) and fired
+n=8/len=500 as the literal first request batch (no warmup: DSv4's
+`warmup()` is a no-op, `crates/infer-cuda/src/executor.rs`) — 8 concurrent
+rows landing on 8 slots/physical KV bands never touched before:
+
+```
+CONCURRENT_SUMMARY N=8 trial=j3-fresh-1 exact=3 miss=[1, 3, 4, 6, 7]
+```
+
+5/8 miss **on the very first request this server ever processed** — same
+truncation/digit-4 signature (`738.`, `7382.`, `**738292**`). Four more reps
+against the same now-warm slots: exact 5/8, 5/8, 6/8, 2/8 — comparable to
+the steady-state rate, no first-use vs. steady-state gap.
+
+**This kills the entire KV-page-reuse framing, both variants.** There is no
+reuse event on iteration 1 — every physical KV page these first 8 rows
+write is being touched for the first time in the process's life, and the
+bug already fires at the established rate. A host/GPU fencing gap around
+page free-then-reuse cannot be the mechanism when the defect needs no reuse
+to manifest.
+
+**Signature re-read.** First-3-digits-always-right /
+divergence-from-digit-4-onward, and truncation dropping only the *last* 2
+digits, is a within-row late-decode-step pattern (something drifts across
+successive decode steps of the SAME multi-token generation), not a
+cross-row aliasing-at-a-point-in-time pattern — a sharper lead for the next
+pass than "shared scratch buffer" or "stale page," but not chased further
+in this pass (out of scope: verify-or-kill one hypothesis per pass).
+
+The diagnostic-only `ARLE_DISABLE_PREFIX_CACHE` toggle in
+`crates/infer-api/src/loaded.rs` is intentionally left in place (harmless,
+env-gated, off by default) as a reusable A/B knob for future prefix-cache
+investigations — it is not a user-facing feature and carries no default
+behavior change.
+
 ## Rule
 
 Concurrent DSv4 serving (n>=3, prompt length >~100-250 tokens) has a real,
@@ -105,3 +188,8 @@ a plausible single-lane hypothesis (batched FlashMLA/CSA) looked clean from
 source reading alone, but the licensed A/B (route around the lane entirely)
 killed it in one measured pass — inference from code reading is not evidence,
 a lever-gated A/B is.
+
+**The fresh-boot-first-request test is the cheapest kill for any
+cross-request-reuse hypothesis** — if the defect needs no history to
+manifest, no reuse-based mechanism (cache, page, slot) can be the cause;
+run it before reasoning further about *how* reuse might race, not after.
