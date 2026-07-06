@@ -220,21 +220,24 @@ mod tests {
         unsafe { std::env::set_var("ARLE_LOG_DIR", &dir) };
         init_stderr("info");
         log::info!("logging file-sink self-check");
-        for _ in 0..50 {
-            if std::fs::read_dir(&dir).is_ok_and(|mut d| d.next().is_some()) {
+        // logforth's file appender flushes on a background thread, so the
+        // file can exist before the record lands in it — poll the content,
+        // not just the file's presence.
+        let mut contents = String::new();
+        for _ in 0..100 {
+            contents = std::fs::read_dir(&dir)
+                .ok()
+                .and_then(|d| d.filter_map(|e| e.ok()).next())
+                .and_then(|e| std::fs::read_to_string(e.path()).ok())
+                .unwrap_or_default();
+            if contents.contains("logging file-sink self-check") {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        let entries: Vec<_> = std::fs::read_dir(&dir)
-            .unwrap_or_else(|e| panic!("ARLE_LOG_DIR {dir:?} was never created: {e}"))
-            .filter_map(|e| e.ok())
-            .collect();
-        assert!(!entries.is_empty(), "no log file written under {dir:?}");
-        let contents = std::fs::read_to_string(entries[0].path()).unwrap();
         assert!(
             contents.contains("logging file-sink self-check"),
-            "log file missing the test record: {contents:?}"
+            "log file under {dir:?} missing the test record after 2s: {contents:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
