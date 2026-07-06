@@ -175,6 +175,88 @@ env-gated, off by default) as a reusable A/B knob for future prefix-cache
 investigations — it is not a user-facing feature and carries no default
 behavior change.
 
+## DSA topk row-ordinal-vs-slot-identity hypothesis — KILLED (2026-07-07)
+
+Next candidate: the batched CSA/DSA indexer top-k SELECT step (never isolated
+by the FlashMLA-lane A/B, which only swapped the final attention KERNEL, not
+the selection feeding it) conflates a row's ordinal position `r` in this
+step's batch (`0..n`) with its stable physical `slot_ids[r]`, so a row's
+top-k selection silently reads/writes the wrong row once slot composition
+churns mid-generation.
+
+**Code read (write vs read addressing).** Traced the full write→read chain
+in `csa_select_official_batched`
+(`crates/infer-cuda/src/attention.rs:9339-9683`, called from
+`dsv4.rs:3468`): the per-row prepare loop (`dsv4.rs:3031-3329`) gathers each
+row's `q_i`/`weights`/`key_count` into the batch staging buffers at ordinal
+offset `r` (`attention.rs:8778-8813`, `Dsv4DsaBatchedGather::row`), and
+`slot_ids[r]` is used ONLY to build the block-table/page-table translation
+(`attention.rs:9518-9540`, `csa_select_official_batched`'s `(b1)` block,
+and the on-device twin `dsv4_dsa_build_select_meta_kernel`,
+`dsv4_dsa_official.cu:665-690` — `block_table[r*num_pages+b] =
+slot_ids[r]*num_pages+b`). The topk kernel itself
+(`deepseek_v4_topk_transform_kernel`, `dsv4_dsa_official.cu:634-659`) reads
+block `bid = blockIdx.x` (== the launch's row index, i.e. `r`, since the
+grid is sized `batch_size = n`) and writes `out_selected`/`raw_indices` at
+`bid * output_stride` — the SAME `r`. The consumer
+(`Dsv4FlashMlaDecodeBatch::build_layer_batch_meta` →
+`build_indices_batched`, `flashmla.rs:815-856`) reads `selected_batched` at
+row stride `csa_topk`, populated by the SAME per-row loop via
+`gather_selected_row`/`selected_batched_mut` at ordinal `r`
+(`flashmla.rs:760-805`). **Write and read sides agree on `r` addressing
+throughout — `slot_ids[r]` never leaks into the scratch-buffer offset
+computation.** No static mismatch found by reading.
+
+**Empirical confirmation (not just code reading).** Added a temporary
+env-gated trace (`ARLE_DSV4_DSA_TRACE=1`, gated `n>1` only so it never fires
+inside the n=1 CUDA-graph-capture decode lane) printing, per batched-select
+call per row: `r`, `slot_ids[r]`, `context_lens[r]`, `positions[r]`, and a
+selected-indices fingerprint. Pod-built (`cuda,nccl`), booted DSv4 TP=4
+(GPUs 2/3/4/5), ran 5×`concurrent_needle_v3.py` n=4/len=500 trials
+(3 reproduced corruption). Across every trace line in every trial —
+including steps where the batch shrank (n=4→3, a row finished) and steps
+where a slot was reused by a brand-new request within the same run —
+**`r == slot_ids[r]` held in 100% of ~1500 trace lines.** The scheduler in
+this workload always presents `slot_ids` in ordinal-sorted order, so the
+conflation this hypothesis needs never gets an opportunity to manifest here.
+**Hypothesis killed: r-vs-slot addressing is not the mechanism** (or at
+least not reachable from this harness's admission pattern).
+
+**Side observations, not chased further (out of scope for one pass):**
+- `sel_first4` (first 4 selected block indices) was `[0,1,2,3]` in every
+  single trace line regardless of row/step/context length — plausibly an
+  attention-sink effect (the indexer scoring the first few compressed blocks
+  highest every step), not inspected further.
+- One trial showed a slot reused twice within the same short run (a fast
+  request finished and freed slot 0; a new request was admitted into slot 0
+  seconds later) — the freed-then-reused occupant happened to be the one
+  request that corrupted that trial. This looked promising as a "stale
+  per-slot ring-buffer bookkeeping on reuse" lead, but did NOT replicate: in
+  a later trial the request that raced ahead and reused a slot finished
+  CORRECTLY while two same-batch peers with no reuse history corrupted, and
+  in two other trials multiple rows corrupted with no reuse event visible at
+  all. Slot reuse is not a consistent predictor; not chased further this
+  pass (would need a dedicated reuse-vs-no-reuse controlled A/B, not
+  inference from 5 uncontrolled trials).
+
+## Custom one-shot allreduce (`ARLE_COMM_BACKEND=auto`) — ruled out, no pod run needed (2026-07-07)
+
+Considered whether the vendored one-shot `CustomAllreduce` kernel
+(`crates/cuda-kernels/csrc/comm/custom_all_reduce.cu`, gated by
+`TpRuntime::init_oneshot_comm`, `tp.rs:311`) could be a private-stream/flag
+race (the codebase's own prior failure mode, see
+`feedback_private_stream_needs_stream_wait` — DeepEP's dispatch/combine
+missing a `stream_wait`), especially since it's licensed only by an isolated
+comm bench, not the real serving workload. **Ruled out without a pod run**:
+`crates/cli/src/args.rs:684` defaults `--comm-backend` to
+`ServeCommBackendArg::Nccl`, not `Auto` — every prior A/B in this
+investigation (and this session's own boots) logged `[comm-oneshot] disabled
+via ARLE_COMM_BACKEND=nccl` (confirmed via `grep` across
+`/host/arle-build/serve_*.log`). The one-shot kernel was never active in any
+run that reproduced corruption; plain NCCL `all_reduce` is the only comm
+path exercised, and it launches on `ctx.stream` (not a private stream) per
+`tp.rs:462-490`. No further investigation needed on this lead.
+
 ## Rule
 
 Concurrent DSv4 serving (n>=3, prompt length >~100-250 tokens) has a real,
