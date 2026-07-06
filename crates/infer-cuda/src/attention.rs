@@ -1685,6 +1685,18 @@ pub(crate) fn dsv4_dsa_device_meta_enabled() -> Result<bool> {
     env_flag("ARLE_DSV4_DSA_DEVICE_META")
 }
 
+/// Minimum batched-decode row count before the Aux-stream fork engages.
+/// Unlicensed placeholder (no nsys evidence), not a measured knee.
+pub(crate) const DSV4_MULTISTREAM_OVERLAP_MIN_BATCH: usize = 4;
+
+/// Decode multi-stream overlap (opt-in, default OFF, UNVERIFIED — no pod A/B
+/// yet). Forks the compressor/indexer-key prepass onto `Aux` to run
+/// concurrent with the main-stream projection GEMM; requires native DeepGEMM
+/// (`prefill_linear_aux` is only built when that's on). `ARLE_DSV4_DECODE_MULTISTREAM_OVERLAP=1`.
+pub(crate) fn dsv4_decode_multistream_overlap_enabled() -> Result<bool> {
+    env_flag("ARLE_DSV4_DECODE_MULTISTREAM_OVERLAP")
+}
+
 /// Single-row decode-graph CSA READ via the graph-safe n=1 batched device-meta
 /// select (opt-in, default OFF). When ON, the CSA decode-graph path runs the
 /// READ (logits + topk) through `csa_select_official_batched` at n=1 with
