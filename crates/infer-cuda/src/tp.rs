@@ -373,26 +373,22 @@ impl TpRuntime {
     /// slice, then all-reduce so every rank ends up holding the full
     /// `[seq_len]` result (unowned rows are zero going into the reduction).
     ///
-    /// Shared by DSv4's DeepEP-LL token-owned MoE dispatch and the Waterfill
-    /// shared-expert shard — both need the identical shard/zero/scatter/
-    /// all-reduce bookkeeping and differ only in what runs over the owned rows.
+    /// Used by DSv4's DeepEP-LL token-owned MoE dispatch (both prefill and
+    /// decode call sites) for its shard/zero/scatter/all-reduce bookkeeping.
+    /// (The Waterfill shared-expert shard also routed through this primitive
+    /// briefly, then was KILLed 2026-07-06 for no measurable perf gain — see
+    /// `docs/experience/wins/2026-07-06-dsv4-deepep-waterfill-pending-remote.md`.)
     ///
     /// `compute_fn(owned_in, owned_out, start, owned_n)` always runs, even at
     /// `owned_n == 0` (`seq_len < world_size` starves some ranks): DeepEP LL
-    /// dispatch/combine are collectives that every rank must enter regardless;
-    /// callers whose per-rank work is not a collective (e.g. a plain GEMM)
-    /// should no-op when `owned_n == 0` inside the closure, matching what
-    /// today's hand-rolled call sites do. `start` is the owned range's first
-    /// row index (into `input`'s `[seq_len]` rows) — callers slicing a
-    /// parallel per-token array (e.g. token ids) need it alongside `owned_n`.
-    /// `allreduce_nvtx_label`, if set, scopes an nvtx range to just the final
-    /// all-reduce (matching a caller's existing narrow profiling range);
-    /// `None` emits no range, same as a call site with no wrapper today.
+    /// dispatch/combine are collectives that every rank must enter regardless.
+    /// `start` is the owned range's first row index (into `input`'s
+    /// `[seq_len]` rows) — callers slicing a parallel per-token array (e.g.
+    /// token ids) need it alongside `owned_n`.
     ///
     /// # Errors
     /// Propagates device alloc/copy, `compute_fn`, and all-reduce errors.
-    #[cfg(feature = "cuda")]
-    #[allow(clippy::too_many_arguments)]
+    #[cfg(all(feature = "cuda", feature = "deepep"))]
     pub(crate) fn shard_rows_and_allreduce(
         &self,
         ctx: &cuda_kernels::prelude::DeviceContext,
@@ -400,7 +396,6 @@ impl TpRuntime {
         out: &mut cuda_kernels::prelude::HiddenStates,
         hidden_size: usize,
         seq_len: usize,
-        allreduce_nvtx_label: Option<&str>,
         compute_fn: impl FnOnce(
             &cuda_kernels::prelude::HiddenStates,
             &mut cuda_kernels::prelude::HiddenStates,
@@ -448,7 +443,6 @@ impl TpRuntime {
                 })?;
         }
 
-        let _nvtx = allreduce_nvtx_label.map(crate::nvtx::range);
         self.all_reduce_sum(ctx, out)
     }
 

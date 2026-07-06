@@ -1267,48 +1267,6 @@ impl std::fmt::Debug for Dsv4Model {
     }
 }
 
-/// One `compressor_batch_prepass` output: `(compressed_kv, gate_or_score)`.
-type PrepassOutput = Option<(HiddenStates, HiddenStates)>;
-
-/// Shared compressor+indexer batch prepass body for one layer — used both by
-/// the sequential main-stream path and the Aux-lane multistream-overlap fork
-/// in `Dsv4Model::forward_decode_batch_stream_impl`. The two call sites differ
-/// only in which `ctx`/scratch backs the DeepGEMM path; callers fence around
-/// this call rather than duplicating the compressor/indexer logic itself.
-fn run_compressor_indexer_prepass(
-    ctx: &DeviceContext,
-    layer: &Dsv4Layer,
-    normed: &HiddenStates,
-    mut scratch: Option<&mut crate::attention::Dsv4PrefillDeepGemmLinearScratch>,
-    keepalive: &mut Dsv4ForwardKeepalive,
-) -> Result<(PrepassOutput, PrepassOutput)> {
-    let main = match layer.attention.compressor.as_ref() {
-        Some(c) => crate::attention::compressor_batch_prepass(
-            ctx,
-            c,
-            normed,
-            scratch.as_deref_mut(),
-            keepalive,
-        )?,
-        None => None,
-    };
-    let indexer = match (layer.mode, layer.attention.indexer.as_ref()) {
-        (DeepSeekV4AttentionMode::CompressedSparse, Some(idx)) => {
-            crate::attention::compressor_batch_prepass(
-                ctx,
-                idx.compressor
-                    .as_ref()
-                    .expect("DSv4 CSA indexer has a key compressor"),
-                normed,
-                scratch,
-                keepalive,
-            )?
-        }
-        _ => None,
-    };
-    Ok((main, indexer))
-}
-
 impl Dsv4Model {
     /// Per-forward owned-token cap when the deepep_ll MoE transport is booted
     /// (`None` for allreduce / intranode / non-deepep builds → unbounded). Core
@@ -2667,18 +2625,6 @@ impl Dsv4Model {
         if lens_from.is_some() {
             crate::probe::lens_begin();
         }
-        // Multistream-overlap eligibility (`n`, the lever, batch size) is
-        // identical every layer of this decode step — resolve once and clone
-        // the Aux-lane view once (5 `Arc` bumps) instead of per layer. `None`
-        // when ineligible, so the per-layer branch below still falls through
-        // to the byte-identical sequential path with zero extra cost.
-        let aux_overlap_ctx = if n >= crate::attention::DSV4_MULTISTREAM_OVERLAP_MIN_BATCH
-            && crate::attention::dsv4_decode_multistream_overlap_enabled()?
-        {
-            Some(self.ctx.with_stream_view(CudaPipelineStreamKind::Aux))
-        } else {
-            None
-        };
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             let _layer_nvtx = crate::nvtx::range(&format!("dsv4/layer_{layer_idx:02}"));
             let full_flatten = layer.mode != DeepSeekV4AttentionMode::SparseIndexed;
@@ -2798,33 +2744,6 @@ impl Dsv4Model {
                 let positions = batched_positions.as_ref().ok_or_else(|| {
                     anyhow!("DSv4 batched decode lane: batched positions buffer missing")
                 })?;
-                // Opt-in (`dsv4_decode_multistream_overlap_enabled`): `normed` is
-                // independent of the projection GEMM below, so fork the compressor +
-                // indexer-key prepass onto Aux before that GEMM is enqueued.
-                // `indexer_query_batch_prepass` needs `proj.c_q_normed` so it can't
-                // join and stays on the main stream. `None` here (lever off, `n`
-                // below threshold, no compressor, or no Aux scratch) falls through
-                // to the byte-identical sequential path in the "0b" block below.
-                let overlap_prepass = if let (Some(aux_ctx), Some(_compressor), Some(aux_scratch)) = (
-                    aux_overlap_ctx.as_ref(),
-                    layer.attention.compressor.as_ref(),
-                    kv_adapter.prefill_linear_aux_mut(),
-                ) {
-                    let normed_ready =
-                        ctx.record_pipeline_fence(CudaPipelineStreamKind::Compute)?;
-                    aux_ctx.wait_on_pipeline_fence(&normed_ready, CudaPipelineStreamKind::Aux)?;
-                    let (main, indexer) = run_compressor_indexer_prepass(
-                        aux_ctx,
-                        layer,
-                        &normed,
-                        Some(&mut *aux_scratch),
-                        &mut keepalive,
-                    )?;
-                    let aux_done = aux_ctx.record_pipeline_fence(CudaPipelineStreamKind::Aux)?;
-                    Some((main, indexer, aux_done))
-                } else {
-                    None
-                };
                 // Borrow the model-wide shared FP8 prefill DeepGEMM scratch for the
                 // batched (m=N) projection. `None` when DeepGEMM is disabled — the
                 // pre-pass then takes its scalar fallback. This borrow is scoped to
@@ -2867,22 +2786,34 @@ impl Dsv4Model {
                 let (compressor_kv_score, indexer_kv_score, indexer_query_kv_score) = {
                     let (_lp, _dsa, _fb, _fs, mut prefill_shared) =
                         kv_adapter.layer_dsa_and_flashmla_batch_mut(layer_idx)?;
-                    let (main, indexer) = match overlap_prepass {
-                        // Aux-stream prepass already computed these concurrently
-                        // with `proj` above; join before anything below reads them.
-                        Some((main, indexer, aux_done)) => {
-                            ctx.wait_on_pipeline_fence(&aux_done, CudaPipelineStreamKind::Compute)?;
-                            (main, indexer)
-                        }
-                        // Overlap lever off (or not applicable this layer/step): the
-                        // original fully-sequential main-stream path, unchanged.
-                        None => run_compressor_indexer_prepass(
+                    // Decode multi-stream overlap (Aux-stream fork of this prepass)
+                    // was KILLed 2026-07-06: pod A/B at n=8 (above its own
+                    // activation threshold) showed a ~9% wall-clock REGRESSION
+                    // (9.65s -> 10.53s mean, zero overlap across 6 trials) — see
+                    // docs/experience/wins/2026-07-06-dsv4-decode-multistream-overlap-pending-remote.md.
+                    let main = match layer.attention.compressor.as_ref() {
+                        Some(c) => crate::attention::compressor_batch_prepass(
                             &self.ctx,
-                            layer,
+                            c,
                             &normed,
                             prefill_shared.as_deref_mut(),
                             &mut keepalive,
                         )?,
+                        None => None,
+                    };
+                    let indexer = match (layer.mode, layer.attention.indexer.as_ref()) {
+                        (DeepSeekV4AttentionMode::CompressedSparse, Some(idx)) => {
+                            crate::attention::compressor_batch_prepass(
+                                &self.ctx,
+                                idx.compressor
+                                    .as_ref()
+                                    .expect("DSv4 CSA indexer has a key compressor"),
+                                &normed,
+                                prefill_shared.as_deref_mut(),
+                                &mut keepalive,
+                            )?
+                        }
+                        _ => None,
                     };
                     let query = match (layer.mode, layer.attention.indexer.as_ref()) {
                         (DeepSeekV4AttentionMode::CompressedSparse, Some(idx)) => {
@@ -3988,7 +3919,6 @@ impl Dsv4Model {
                                 &mut moe_out,
                                 hidden_size,
                                 seq_len,
-                                None,
                                 |owned_in, owned_out, start, owned_n| {
                                     keepalive.keep_hidden(owned_in);
                                     keepalive.keep_hidden(owned_out);
@@ -4041,51 +3971,22 @@ impl Dsv4Model {
                 // — one batched SwiGLU GEMM pair, replacing the per-row loop + N
                 // host syncs.
                 //
-                // Waterfill lever (see `dsv4_moe_waterfill_active` doc): shards the
-                // redundant `world`-way shared-expert compute by token count.
+                // Waterfill (per-rank token-sharded shared-expert compute) was
+                // KILLed 2026-07-06: pod A/B at n=64 (its own activation
+                // threshold) showed no measurable wall-clock gain over this
+                // unconditional path (75.9s vs 73.8s mean, well within
+                // trial-to-trial noise — see
+                // docs/experience/wins/2026-07-06-dsv4-deepep-waterfill-pending-remote.md).
                 let mut shared = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
-                let world = self.tp.config().world_size;
-                if crate::moe::dsv4_moe_waterfill_active(seq_len, world) {
-                    self.tp.shard_rows_and_allreduce(
-                        &self.ctx,
-                        &normed,
-                        &mut shared,
-                        hidden_size,
-                        seq_len,
-                        Some("dsv4/moe_shared_waterfill_allreduce"),
-                        |owned_in, owned_out, _start, owned_n| {
-                            // Unlike DeepEP-LL's collectives, the shared-expert
-                            // GEMM is per-rank local — a starved rank (owned_n
-                            // == 0) skips it entirely, matching the pre-refactor
-                            // behavior (no keep_hidden either, since nothing ran).
-                            if owned_n == 0 {
-                                return Ok(());
-                            }
-                            crate::moe::dsv4_shared_expert_forward(
-                                &self.ctx,
-                                &self.ctx.stream,
-                                layer.moe.as_ref().expect("DSv4 layer.moe"),
-                                owned_in,
-                                owned_out,
-                                self.config.swiglu_limit,
-                                &mut keepalive,
-                            )?;
-                            keepalive.keep_hidden(owned_in);
-                            keepalive.keep_hidden(owned_out);
-                            Ok(())
-                        },
-                    )?;
-                } else {
-                    crate::moe::dsv4_shared_expert_forward(
-                        &self.ctx,
-                        &self.ctx.stream,
-                        layer.moe.as_ref().expect("DSv4 layer.moe"),
-                        &normed,
-                        &mut shared,
-                        self.config.swiglu_limit,
-                        &mut keepalive,
-                    )?;
-                }
+                crate::moe::dsv4_shared_expert_forward(
+                    &self.ctx,
+                    &self.ctx.stream,
+                    layer.moe.as_ref().expect("DSv4 layer.moe"),
+                    &normed,
+                    &mut shared,
+                    self.config.swiglu_limit,
+                    &mut keepalive,
+                )?;
                 keepalive.keep_hidden(&shared);
                 // SAFETY: add_batch writes the full [seq_len, hidden_size] buffer.
                 crate::ops::add_batch(&self.ctx, &moe_out, &shared, &mut moe_with_shared)?;
@@ -5387,7 +5288,6 @@ impl Dsv4Model {
                                 &mut moe_out,
                                 hidden_size,
                                 seq_len,
-                                None,
                                 |owned_in, owned_out, start, owned_n| {
                                     keepalive.keep_hidden(owned_in);
                                     keepalive.keep_hidden(owned_out);
