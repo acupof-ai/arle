@@ -1698,6 +1698,39 @@ pub(crate) fn dsv4_decode_graph_csa_read_enabled() -> Result<bool> {
     env_flag("ARLE_DSV4_DECODE_GRAPH_CSA")
 }
 
+/// Pages one layer's FlashMLA shared-pool band needs at `max_seq_len` —
+/// `sw_blocks + comp_blocks` from [`Dsv4FlashMlaDecodeShape::new`], without
+/// the `local_heads`/`tp_world`/`kv_arena` plumbing that formula also
+/// validates (irrelevant to a page-count budget check; real construction
+/// still runs those checks for real). `Ok(0)` when the FlashMLA decode-alloc
+/// path is disabled — the shared pool isn't built at all, so nothing to
+/// check. Lets [`crate::dsv4::Dsv4Model::dsv4_kv_budget_plan`] reject a
+/// startup that can't afford even one slot's band with the same clean error
+/// the `affordable` gate already produces, instead of a hard panic deep in
+/// `kv_layout.rs`'s pool constructor (pod-verified 2026-07-06: the two gates
+/// disagreeing crashes every worker rank).
+pub(crate) fn dsv4_flashmla_slot_pages(
+    config: &DeepSeekV4Config,
+    mode: DeepSeekV4AttentionMode,
+    compress_ratio: usize,
+    max_seq_len: usize,
+    page_block_size: usize,
+) -> Result<usize> {
+    if !dsv4_flashmla_decode_alloc_enabled()? {
+        return Ok(0);
+    }
+    let sw_blocks = config.sliding_window.div_ceil(page_block_size);
+    let comp_blocks = if mode == DeepSeekV4AttentionMode::SlidingWindow {
+        0
+    } else {
+        max_seq_len
+            .div_ceil(compress_ratio.max(1))
+            .max(1)
+            .div_ceil(page_block_size)
+    };
+    Ok(sw_blocks + comp_blocks)
+}
+
 fn dsv4_flashmla_decode_alloc_enabled() -> Result<bool> {
     if env_flag("ARLE_DSV4_FLASHMLA_DECODE_ALLOC")? {
         return Ok(true);

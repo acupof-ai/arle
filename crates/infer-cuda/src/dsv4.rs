@@ -1860,6 +1860,45 @@ impl Dsv4Model {
             shared_expert_scratch_bytes >> 20,
             mla_decode_bytes >> 20,
         );
+        // The `affordable` gate above only covers PER-SLOT costs; the shared
+        // FlashMLA pool (`pool_budget_bytes_per_layer`, the coherent remainder
+        // after those) separately needs at least one slot's fixed band
+        // (`kv_layout.rs`'s `flashmla_slot_pages`, which scales with
+        // `max_seq_len` via the compressed region — NOT covered by the
+        // per-slot reservation above). Pod-verified 2026-07-06: without this
+        // check, a `max_seq_len` that clears `affordable > 0` can still be
+        // too large for the pool's own band, and the mismatch previously
+        // surfaced as a hard `ensure!` panic in `kv_layout.rs` that crashes
+        // every worker rank instead of this same clean startup rejection.
+        let flashmla_page_bytes = self
+            .kv_arena
+            .page_block_size
+            .saturating_mul(self.kv_arena.bytes_per_token);
+        let flashmla_slot_pages = self
+            .layers
+            .iter()
+            .map(|layer| {
+                crate::attention::dsv4_flashmla_slot_pages(
+                    &self.config,
+                    layer.mode,
+                    layer.compress_ratio,
+                    max_seq_len,
+                    self.kv_arena.page_block_size,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .max()
+            .unwrap_or(0);
+        anyhow::ensure!(
+            flashmla_slot_pages.saturating_mul(flashmla_page_bytes) <= pool_budget_bytes_per_layer,
+            "DSv4 KV budget rejected startup: the shared FlashMLA pool's per-layer \
+             remainder ({}MB) cannot hold even one slot's band at max_seq_len \
+             {max_seq_len} ({flashmla_slot_pages} pages, {}MB). Lower --max-total-tokens \
+             or free VRAM.",
+            pool_budget_bytes_per_layer >> 20,
+            flashmla_slot_pages.saturating_mul(flashmla_page_bytes) >> 20,
+        );
         // Neutral clamp (infer-seam): planned = min(requested, affordable);
         // clamped == requested > affordable. NCCL min-reduce stays CUDA-side.
         let (planned, clamped) = infer_seam::clamp_to_affordable(requested, affordable);
