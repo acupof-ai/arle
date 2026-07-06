@@ -1,0 +1,29 @@
+crates/cuda-kernels/src/tensor.rs
+  s_18cd7f3e0fb636::t_e33c787fb89b7e 173-175,187,207-208,522-526
+crates/infer-cuda/src/attention.rs
+  s_18cd7f3e0fb636::t_d6ddcab72f5cad 1688-1689,1693-1695
+crates/infer-cuda/src/attention/kv_layout.rs
+  s_18cd7f3e0fb636::t_fdf826ffb3baac 187-191,563
+crates/infer-cuda/src/dsv4.rs
+  s_18cd7f3e0fb636::t_ded5a8a7c494a2 2728-2734,4051-4052
+crates/infer-cuda/src/moe.rs
+  s_18cd7f3e0fb636::t_918a28bbc9d9aa 2538,2541-2548
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "0bd41bfccedbd4ab8472d9993abdcf92f588ddb5",
+  "prompts": {},
+  "sessions": {
+    "s_18cd7f3e0fb636": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a9d7e9485bd1ee49b",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
