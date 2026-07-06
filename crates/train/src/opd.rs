@@ -57,11 +57,11 @@ use autograd::ops::{add, fused_linear_distill::fused_linear_ce_loss_indexed, mul
 
 /// Context to route the OPD student rollout through the in-process infer engine
 /// (`InferStudent`) instead of the train-crate hand-written decode kernel. This
-/// is the CUDA default; `ARLE_OPD_INFER_ROLLOUT=0` selects the fallback A/B arm.
+/// is the CUDA default; `--rollout-engine train` selects the fallback A/B arm.
 ///
-/// The caller constructs this only when both (a) the env flag is set and
-/// (b) an `InferStudent` was loaded; when `None`, the train-crate rollout
-/// runs unchanged (the A/B baseline arm).
+/// The caller constructs this only when both (a) the infer rollout arm is
+/// selected and (b) an `InferStudent` was loaded; when `None`, the train-crate
+/// rollout runs unchanged (the A/B baseline arm).
 #[cfg(feature = "cuda")]
 pub struct InferRolloutCtx<'a> {
     /// In-process infer student engine (LoRA-synced from the train store).
