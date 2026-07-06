@@ -11,20 +11,12 @@ use autograd::{
 
 pub const DEFAULT_KL_CHUNK_SIZE: usize = 32;
 
-/// `batchmean` vocab-correction factor for the KL distill reductions.
-///
-/// The KL graphs reduce with `mean` over every logit element (positions ×
-/// vocab); multiplying by `vocab` recovers the mathematically-correct
-/// `batchmean` scale (`sum_v / positions`). This factor is **load-bearing, not
-/// optimizer-invariant**: dropping it leaves a constant `1/vocab` (≈1/152k)
-/// rescale that pushes the per-parameter gradient second moment `sqrt(v_hat)`
-/// below AdamW `eps=1e-8`, degenerating adaptive normalization into
-/// `eps`-dominated scaled-SGD and collapsing the effective LR by ~vocab×
-/// (`errors/2026-06-16-opd-kl-vocab-reduction-lr-collapse.md`). Any blended
-/// term (e.g. the GKD CE anchor) must be scaled at this same face value —
-/// never re-divided by `vocab` to "match" the KL. All three KL reductions
-/// (forward / reverse / chunked) route through this single helper so the scale
-/// cannot silently drift between them.
+/// `batchmean` correction for the KL reductions: `mean` reduces over
+/// positions×vocab, so `×vocab` recovers `sum_v / positions`. Load-bearing —
+/// dropping it collapses the AdamW effective LR by ~vocab×
+/// (`errors/2026-06-16-opd-kl-vocab-reduction-lr-collapse.md`); a blended CE
+/// anchor must use this same scale, never re-divide by vocab. All three KL
+/// reductions route through here so it can't drift.
 #[inline]
 fn kl_batchmean_scale(vocab: usize) -> f32 {
     debug_assert!(vocab > 0, "kl_batchmean_scale: vocab must be > 0");
@@ -50,31 +42,12 @@ pub fn cross_entropy_loss(
     mul_scalar(mean_log_prob, -1.0, store, tape)
 }
 
-/// Forward KL divergence `KL(teacher || student)` used as the OPD distill
-/// objective. Student logits must carry `requires_grad = true`; teacher
-/// logits must carry `requires_grad = false`; the returned loss only
-/// backpropagates through `student_logits`.
-///
-/// Implementation note: `KL(t || s) = sum_v t_p * (log t_p - log s_p)
-///                                   = -H(t) - sum_v t_p * log s_p`.
-/// The `-H(t)` term is constant w.r.t. student parameters, so we drop it
-/// and minimise the soft cross-entropy `-sum_v t_p * log s_p`.
-///
-/// `num_positions` is validated against `logits.numel() / vocab` so a stale
-/// rollout length does not silently train against the wrong tensor shape.
-///
-/// Normalization = **`batchmean`** (sum over vocab, mean over positions):
-/// `sum_v / num_positions`, the mathematically-correct KL reduction PyTorch's
-/// `KLDivLoss` documents (`reduction='mean'`, i.e. dividing by `positions *
-/// vocab` too, is the form PyTorch warns is *not* the correct KL). The earlier
-/// `mean`-over-all-logits path was a constant `1 / vocab` (≈1/152k) rescale of
-/// this; that is **not** absorbed by AdamW, because the per-parameter gradient
-/// second moment `sqrt(v_hat)` is then pushed near/below `eps=1e-8`, so AdamW
-/// degenerates from adaptive normalization to `eps`-dominated scaled-SGD and the
-/// effective LR collapses by up to ~vocab×; it also makes `--grad-clip` never
-/// fire and the displayed loss `1/vocab` too small. We multiply the `mean` by
-/// `vocab` to recover `batchmean` while keeping the tested `mul_scalar`+`mean`
-/// fast path (no `sum_backward` scalar-broadcast).
+/// Forward KL divergence `KL(teacher || student)`, the OPD distill objective.
+/// Student logits require grad, teacher logits do not; the loss backprops only
+/// through the student. Drops the constant `-H(t)` and minimises the soft
+/// cross-entropy `-Σ_v t·log s`. `num_positions` is checked against
+/// `numel()/vocab` to catch a stale rollout length. Reduction is `batchmean`
+/// (see [`kl_batchmean_scale`]).
 pub fn kl_distill_loss(
     student_logits: TensorId,
     teacher_logits: TensorId,
@@ -96,12 +69,6 @@ pub fn kl_distill_loss(
             let teacher_probs = softmax(teacher_logits, store, tape)?;
             let student_log_probs = log_softmax(student_logits, store, tape)?;
             let weighted = mul(teacher_probs, student_log_probs, store, tape)?;
-            // `mean` reduces across all dims (positions × vocab); multiplying by
-            // `vocab` recovers the `batchmean` reduction (`sum_v / positions`)
-            // while reusing the tested `mul_scalar`+`mean` device path instead of
-            // `sum_backward`'s untested scalar broadcast. The `1/vocab` factor is
-            // NOT optimizer-invariant (see fn doc): it would push the gradient
-            // below AdamW `eps` and collapse the effective LR.
             let avg = mean(weighted, store, tape)?;
             mul_scalar(avg, -temperature_sq * vocab_scale, store, tape)
         }
@@ -210,9 +177,8 @@ pub fn kl_distill_loss_chunked(
     let total = total.ok_or(AutogradError::TapeInvariant(
         "kl_distill_loss_chunked: no chunks were produced",
     ))?;
-    // Multiply by `vocab` so the chunked path matches the `batchmean`
-    // (`sum_v / positions`) scale of `kl_distill_loss`; each `chunk_avg` is a
-    // `mean` over (positions × vocab), so the recovered scale is identical.
+    // Each `chunk_avg` is a `mean` over positions×vocab, so `×vocab` recovers
+    // the same `batchmean` scale as `kl_distill_loss`.
     let vocab_scale = kl_batchmean_scale(shape.vocab);
     match direction {
         KlDirection::Forward => mul_scalar(total, -temperature_sq * vocab_scale, store, tape),
