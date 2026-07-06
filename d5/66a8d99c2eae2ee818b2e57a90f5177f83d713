@@ -1,0 +1,23 @@
+crates/cuda-kernels/csrc/attention/decode_prep_paged.cu
+  s_965ce2db4386cb::t_0f24edb1cee27a 38-43
+crates/cuda-kernels/csrc/attention/decode_prep_paged_hd256.cu
+  s_965ce2db4386cb::t_a2510798b9a4cf 37-42
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "d566a8d99c2eae2ee818b2e57a90f5177f83d713",
+  "prompts": {},
+  "sessions": {
+    "s_965ce2db4386cb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "124b0ccd-6ba1-4679-a1ec-a259030026b8",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
