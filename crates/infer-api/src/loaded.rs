@@ -1985,6 +1985,11 @@ mod backend {
         Ok(infer_core::Engine::with_config(executor, kv, scheduler))
     }
 
+    /// New tokens since the last drain, per handle.
+    type PendingTokens = std::rc::Rc<
+        std::cell::RefCell<std::collections::HashMap<infer_core::RequestHandle, Vec<u32>>>,
+    >;
+
     /// Multiproc worker rank's directly-driven engine (rank 0..N-1; every rank is
     /// a child worker under the SPMD / B split).
     ///
@@ -2002,6 +2007,9 @@ mod backend {
         /// removed once its terminal delta is emitted, which also prevents
         /// re-emitting — no separate "already emitted" set needed.
         tracked: std::collections::HashMap<infer_core::RequestHandle, u64>,
+        /// Fed by the token observer inside `engine.step()`, drained right after
+        /// by `drain_completions()` (same thread, never concurrent).
+        pending: PendingTokens,
     }
 
     #[cfg(feature = "cuda")]
@@ -2014,10 +2022,23 @@ mod backend {
             config: &EngineLoadConfig,
             owns_output: bool,
         ) -> Result<Self> {
+            let mut engine = build_cuda_engine(model_path, config)?;
+            let pending = PendingTokens::default();
+            if owns_output {
+                let pending = std::rc::Rc::clone(&pending);
+                engine.set_token_observer(Box::new(move |handle, token| {
+                    pending
+                        .borrow_mut()
+                        .entry(handle)
+                        .or_default()
+                        .push(token.token);
+                }));
+            }
             Ok(Self {
-                engine: build_cuda_engine(model_path, config)?,
+                engine,
                 owns_output,
                 tracked: std::collections::HashMap::new(),
+                pending,
             })
         }
 
@@ -2124,48 +2145,54 @@ mod backend {
             self.engine.kv_free_pages()
         }
 
-        /// Drain terminal completions (output owner only): emit one terminal delta
-        /// per finished tracked request, keyed by `request_id`. No-op on followers.
-        /// Abort propagation: once the engine is idle, a still-tracked handle that
-        /// never `completed` was dropped, so it gets a terminal ERROR delta rather
-        /// than leaving the HTTP client hanging.
+        /// Drain this tick's new tokens per tracked request (output owner only),
+        /// plus a terminal delta for any that just finished or were dropped.
+        /// No-op on followers.
         pub fn drain_completions(&mut self) -> Vec<(u64, infer_server::RelayCompletionDelta)> {
             if !self.owns_output || self.tracked.is_empty() {
                 return Vec::new();
             }
             // Idle engine: a tracked-but-not-completed handle was dropped.
             let engine_idle = self.engine.is_idle();
-            let terminal: Vec<(infer_core::RequestHandle, u64)> = self
-                .tracked
-                .iter()
-                .filter(|(handle, _request_id)| {
-                    self.engine.completed(**handle).is_some() || engine_idle
-                })
-                .map(|(handle, request_id)| (*handle, *request_id))
-                .collect();
-            let mut out = Vec::with_capacity(terminal.len());
-            for (handle, request_id) in terminal {
-                let delta = match self.engine.completed(handle) {
-                    Some(completed) => infer_server::RelayCompletionDelta {
-                        text_delta: String::new(),
-                        token_ids: completed.generated_tokens.clone(),
-                        finish: true,
-                        finish_reason: completed.finish.clone(),
-                        error: None,
-                    },
-                    // Engine idle but the handle never completed → dropped request.
-                    None => infer_server::RelayCompletionDelta {
-                        text_delta: String::new(),
-                        token_ids: Vec::new(),
-                        finish: true,
-                        finish_reason: None,
-                        error: Some(format!(
+            let mut out = Vec::new();
+            let mut finished = Vec::new();
+            for (&handle, &request_id) in &self.tracked {
+                let new_tokens = self
+                    .pending
+                    .borrow_mut()
+                    .remove(&handle)
+                    .unwrap_or_default();
+                let (finish, finish_reason, error) = match self.engine.completed(handle) {
+                    Some(completed) => (true, completed.finish.clone(), None),
+                    None if engine_idle => (
+                        true,
+                        None,
+                        Some(format!(
                             "request dropped by engine without completing (handle={handle:?})"
                         )),
-                    },
+                    ),
+                    None => (false, None, None),
                 };
+                if new_tokens.is_empty() && !finish {
+                    continue; // nothing new to report this tick
+                }
+                out.push((
+                    request_id,
+                    infer_server::RelayCompletionDelta {
+                        text_delta: String::new(),
+                        token_ids: new_tokens,
+                        finish,
+                        finish_reason,
+                        error,
+                    },
+                ));
+                if finish {
+                    finished.push(handle);
+                }
+            }
+            for handle in finished {
                 self.tracked.remove(&handle);
-                out.push((request_id, delta));
+                self.pending.borrow_mut().remove(&handle);
             }
             out
         }
