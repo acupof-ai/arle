@@ -1,0 +1,25 @@
+crates/infer-cuda/src/dsv4.rs
+  s_e13178c39468d4::t_f3a9c891248d27 4057-4061,4063-4123
+crates/infer-cuda/src/moe.rs
+  s_e13178c39468d4::t_4ec388b4cdc91e 2538-2563,4844
+docs/experience/wins/2026-07-06-dsv4-deepep-waterfill-pending-remote.md
+  s_e13178c39468d4::t_c3d6d22e691ec5 1-122
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "ded3d6a9690ae2d891fef8f00069d2baa2173397",
+  "prompts": {},
+  "sessions": {
+    "s_e13178c39468d4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a32f3db1aa9264f22",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
