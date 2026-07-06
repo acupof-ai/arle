@@ -582,7 +582,7 @@ pub mod app {
         lora: LoraConfig,
     ) -> AnyResult<Option<InferStudent>> {
         if !infer_rollout_flag_enabled() {
-            println!("infer_student_disabled env=ARLE_OPD_INFER_ROLLOUT=0");
+            println!("infer_student_disabled (--rollout-engine train)");
             return Ok(None);
         }
 
