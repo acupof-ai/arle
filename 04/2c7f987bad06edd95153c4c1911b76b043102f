@@ -1,0 +1,16 @@
+.gitignore
+  h_b3e54bc063a8b4 49
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "042c7f987bad06edd95153c4c1911b76b043102f",
+  "prompts": {},
+  "humans": {
+    "h_b3e54bc063a8b4": {
+      "author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
