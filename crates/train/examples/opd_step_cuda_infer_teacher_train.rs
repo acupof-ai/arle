@@ -245,7 +245,7 @@ mod app {
         let student_host_evict_params = host_evict_param_ids(&student);
 
         // P4: load the in-process infer student engine (now the default
-        // rollout path). Opt out with `ARLE_OPD_INFER_ROLLOUT=0`. The engine
+        // rollout path). Opt out with `--rollout-engine train`. The engine
         // loads from the *student* model dir with **no** disk adapter: the
         // pristine BF16 base is snapshotted lazily on the first
         // `remerge_lora` (driven by the per-step `sync_lora_from_store`), so
