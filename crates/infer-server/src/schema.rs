@@ -17,6 +17,16 @@ use serde_json::json;
 
 use crate::multiproc_relay::WireStats;
 
+/// OpenAI `stream_options`: `{"include_usage": true}` asks the streaming
+/// response for a trailing usage-only chunk (empty `choices`, populated
+/// `usage`) right before `[DONE]` — mirrors vLLM/SGLang. Absent/false keeps
+/// every streamed chunk's `usage: null`, byte-identical to before this field.
+#[derive(Debug, Clone, Deserialize)]
+pub struct StreamOptions {
+    #[serde(default)]
+    pub include_usage: bool,
+}
+
 /// Minimal `/v1/completions` request body.
 #[derive(Debug, Clone, Deserialize)]
 pub struct CompletionRequest {
@@ -35,6 +45,8 @@ pub struct CompletionRequest {
     pub ignore_eos: Option<bool>,
     pub seed: Option<u64>,
     pub stream: Option<bool>,
+    #[serde(default)]
+    pub stream_options: Option<StreamOptions>,
     pub stop: Option<Vec<String>>,
     pub return_token_ids: Option<bool>,
 }
@@ -84,6 +96,8 @@ pub struct ChatCompletionRequest {
     pub ignore_eos: Option<bool>,
     pub seed: Option<u64>,
     pub stream: Option<bool>,
+    #[serde(default)]
+    pub stream_options: Option<StreamOptions>,
     pub stop: Option<Vec<String>>,
     /// Pass-through extra arguments for the checkpoint's Jinja chat template
     /// (vLLM / SGLang field name). The HF chat-template render receives these
@@ -768,7 +782,7 @@ pub struct Usage {
 }
 
 impl Usage {
-    fn new(prompt_tokens: usize, completion_tokens: usize) -> Self {
+    pub(crate) fn new(prompt_tokens: usize, completion_tokens: usize) -> Self {
         Self {
             prompt_tokens,
             completion_tokens,
