@@ -1,0 +1,23 @@
+crates/infer-api/src/loaded.rs
+  s_6975f39c425454::t_b424a2ef9b27f1 441-446
+docs/experience/errors/2026-07-06-dsv4-concurrent-decode-digit-corruption-unresolved.md
+  s_6975f39c425454::t_6545f02e0e58e0 1,95-177,191-195
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "68129c461d1197204e228a5eec8b3463fd1c39bd",
+  "prompts": {},
+  "sessions": {
+    "s_6975f39c425454": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a757874fbe5bee873",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
