@@ -11,6 +11,26 @@ use autograd::{
 
 pub const DEFAULT_KL_CHUNK_SIZE: usize = 32;
 
+/// `batchmean` vocab-correction factor for the KL distill reductions.
+///
+/// The KL graphs reduce with `mean` over every logit element (positions ×
+/// vocab); multiplying by `vocab` recovers the mathematically-correct
+/// `batchmean` scale (`sum_v / positions`). This factor is **load-bearing, not
+/// optimizer-invariant**: dropping it leaves a constant `1/vocab` (≈1/152k)
+/// rescale that pushes the per-parameter gradient second moment `sqrt(v_hat)`
+/// below AdamW `eps=1e-8`, degenerating adaptive normalization into
+/// `eps`-dominated scaled-SGD and collapsing the effective LR by ~vocab×
+/// (`errors/2026-06-16-opd-kl-vocab-reduction-lr-collapse.md`). Any blended
+/// term (e.g. the GKD CE anchor) must be scaled at this same face value —
+/// never re-divided by `vocab` to "match" the KL. All three KL reductions
+/// (forward / reverse / chunked) route through this single helper so the scale
+/// cannot silently drift between them.
+#[inline]
+fn kl_batchmean_scale(vocab: usize) -> f32 {
+    debug_assert!(vocab > 0, "kl_batchmean_scale: vocab must be > 0");
+    vocab as f32
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum KlDirection {
     #[default]
@@ -65,7 +85,7 @@ pub fn kl_distill_loss(
     tape: &mut Tape,
 ) -> Result<TensorId> {
     let shape = validate_kl_distill_inputs(student_logits, teacher_logits, num_positions, store)?;
-    let vocab_scale = shape.vocab as f32;
+    let vocab_scale = kl_batchmean_scale(shape.vocab);
     validate_kl_temperature(temperature)?;
     let inv_temperature = 1.0 / temperature;
     let temperature_sq = temperature * temperature;
@@ -193,7 +213,7 @@ pub fn kl_distill_loss_chunked(
     // Multiply by `vocab` so the chunked path matches the `batchmean`
     // (`sum_v / positions`) scale of `kl_distill_loss`; each `chunk_avg` is a
     // `mean` over (positions × vocab), so the recovered scale is identical.
-    let vocab_scale = shape.vocab as f32;
+    let vocab_scale = kl_batchmean_scale(shape.vocab);
     match direction {
         KlDirection::Forward => mul_scalar(total, -temperature_sq * vocab_scale, store, tape),
         KlDirection::Reverse => mul_scalar(total, temperature_sq * vocab_scale, store, tape),

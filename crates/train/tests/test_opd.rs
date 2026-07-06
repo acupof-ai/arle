@@ -114,3 +114,92 @@ fn kl_distill_loss_drops_over_three_steps() {
         "expected KL distill loss to decrease, got {losses:?}"
     );
 }
+
+/// Regression guard for `errors/2026-06-16-opd-kl-vocab-reduction-lr-collapse.md`.
+///
+/// The forward-KL gradient w.r.t. a student logit is analytically
+/// `(s_j - t_j) / positions` under the correct `batchmean` reduction, and
+/// `(s_j - t_j) / (positions * vocab)` under the buggy `mean`-over-all-logits
+/// reduction. This test computes the student-logit gradient directly (student
+/// logits are the trainable leaf, so backward stops there) and asserts the
+/// gradient magnitude matches the `1/positions` scale — it fails by exactly
+/// `vocab×` if the `kl_batchmean_scale` correction is ever dropped, which is
+/// the regime that pushed the gradient below AdamW `eps=1e-8` and collapsed the
+/// effective LR by ~vocab×.
+#[test]
+fn kl_distill_gradient_is_batchmean_scaled_not_vocab_collapsed() {
+    let positions = 4usize;
+    let vocab = 16usize;
+
+    // Trainable student logits (the leaf we read grads from) + frozen teacher.
+    let student_data: Vec<f32> = (0..positions * vocab)
+        .map(|i| ((i % 7) as f32 - 3.0) * 0.1)
+        .collect();
+    let teacher_data: Vec<f32> = (0..positions * vocab)
+        .map(|i| if i % vocab == 5 { 3.0 } else { 0.0 })
+        .collect();
+
+    let mut store = TensorStore::default();
+    let mut tape = Tape::new();
+    tape.set_enabled(true);
+
+    let student = store.alloc(
+        Tensor::new(student_data.clone(), vec![positions, vocab], true).expect("student logits"),
+    );
+    let teacher = store
+        .alloc(Tensor::new(teacher_data, vec![positions, vocab], false).expect("teacher logits"));
+
+    let loss = kl_distill_loss(
+        student,
+        teacher,
+        positions,
+        1.0,
+        KlDirection::Forward,
+        &mut store,
+        &mut tape,
+    )
+    .expect("kl loss");
+    tape.backward(loss, &mut store).expect("backward");
+
+    let grad_id = store
+        .get(student)
+        .and_then(|t| t.grad)
+        .expect("student grad");
+    let grads = store.to_host(grad_id).expect("grad host");
+
+    // Analytic forward-KL gradient under batchmean: d/ds_j = (softmax(s)_j - t_j)/positions.
+    // Recompute softmax(student) and teacher-prob targets on host.
+    let mut expected = vec![0.0f32; positions * vocab];
+    for p in 0..positions {
+        let s = &student_data[p * vocab..(p + 1) * vocab];
+        let max = s.iter().cloned().fold(f32::MIN, f32::max);
+        let exps: Vec<f32> = s.iter().map(|v| (v - max).exp()).collect();
+        let sum: f32 = exps.iter().sum();
+        // teacher token 5 gets all mass (its logit was 3.0, rest 0.0) → softmax.
+        let t_logits: Vec<f32> = (0..vocab).map(|j| if j == 5 { 3.0 } else { 0.0 }).collect();
+        let t_max = t_logits.iter().cloned().fold(f32::MIN, f32::max);
+        let t_exps: Vec<f32> = t_logits.iter().map(|v| (v - t_max).exp()).collect();
+        let t_sum: f32 = t_exps.iter().sum();
+        for j in 0..vocab {
+            let s_prob = exps[j] / sum;
+            let t_prob = t_exps[j] / t_sum;
+            expected[p * vocab + j] = (s_prob - t_prob) / positions as f32;
+        }
+    }
+
+    let max_abs_grad = grads.iter().cloned().fold(0.0f32, |a, g| a.max(g.abs()));
+    // Under the collapsed `mean`/vocab reduction this max would be ~1/vocab of
+    // the batchmean value (≈1e-3/16 here) — far below any grad-clip threshold.
+    assert!(
+        max_abs_grad > 1.0e-3,
+        "grad magnitude {max_abs_grad:.3e} looks vocab-collapsed (batchmean scale dropped?)"
+    );
+    for (got, want) in grads.iter().zip(expected.iter()) {
+        let tol = 1.0e-4 + want.abs() * 1.0e-3;
+        assert!(
+            (got - want).abs() <= tol,
+            "grad {got:.6e} != analytic batchmean grad {want:.6e} (tol {tol:.2e}); \
+             a vocab× mismatch means the kl_batchmean_scale correction regressed"
+        );
+    }
+}
