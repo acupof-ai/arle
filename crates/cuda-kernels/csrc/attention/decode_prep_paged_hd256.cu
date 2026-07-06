@@ -34,10 +34,12 @@ __device__ __forceinline__ float rms_norm_head_offset_hd256(
     if (lane_id == 0) scratch[warp_id] = sq_sum;
     __syncthreads();
 
-    if (tid == 0) {
-        float total = 0.0f;
-        for (int i = 0; i < NUM_WARPS_HD256; i++) total += scratch[i];
-        scratch[0] = 1.0f / sqrtf(total / HD256 + eps);
+    // Cross-warp reduce in warp 0 via shuffle (NUM_WARPS_HD256=8<=32), not a
+    // tid==0 serial loop — matches prefill_attention_paged_prep's idiom.
+    if (warp_id == 0) {
+        float warp_sum = (lane_id < NUM_WARPS_HD256) ? scratch[lane_id] : 0.0f;
+        float total = warp_reduce_sum(warp_sum);
+        if (lane_id == 0) scratch[0] = 1.0f / sqrtf(total / HD256 + eps);
     }
     __syncthreads();
 
