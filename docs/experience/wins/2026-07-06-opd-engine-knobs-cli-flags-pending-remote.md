@@ -1,44 +1,40 @@
-# OPD rollout-engine + engine-offload magic env → CLI flags
+# OPD rollout arm: `--rollout-engine {infer,train}` replaces the env toggle
 
-`bench-exempt` — a flag-surface refactor: `--rollout-engine` / `--engine-offload`
-now resolve the same values the `ARLE_OPD_*` env vars did (env kept as fallback),
-so behavior is byte-identical for existing runs. The CUDA offload/rollout paths
-themselves are unchanged; a perf A/B would only re-measure the already-benched
-P4 infer-rollout default and the 05-30 offload win. CUDA typecheck is
+`bench-exempt` — CLI-surface refactor. `--rollout-engine` selects the OPD rollout
+arm (default `infer`); the CUDA rollout paths are unchanged, so a perf A/B would
+only re-measure the already-benched P4 infer-rollout default. CUDA build is
 `pending-remote` (no nvcc on this Mac); non-CUDA build + full train test suite
 green locally.
 
 ## Context
 
-`AGENTS.md` / the user's standing preference is "env 就删除 … 默认用模型派生"
-— magic env vars should become CLI flags with model-derived defaults. Two
-*functional* OPD knobs were env-only: `ARLE_OPD_INFER_ROLLOUT` (rollout engine
-arm) and `ARLE_OPD_ENGINE_OFFLOAD` (VRAM time-share mode). Pure diagnostic env
-(`ARLE_OPD_STEP_TRACE`, `_VRAM_TRACE`, `_BACKWARD_PROFILE`, `_LOG_GRAD_NORM`, …)
-are left as-is — they are trace toggles, not run-shaping switches.
+`AGENTS.md` / the user's standing preference: run-shaping knobs should be CLI
+flags, not magic env. The rollout arm was env-only (`ARLE_OPD_INFER_ROLLOUT`).
+Per the user's "只保留 `--rollout-engine`, 其他全部删除" — this lands the one
+flag as the sole entry and deletes the env fallback entirely (deletion-style
+refactor, no migration layer, no half-state).
 
 ## What Worked
 
-- **`--rollout-engine {infer,train}`** and **`--engine-offload
-  {off,student,teacher,all}`** added to `TrainOpdArgs` (`crates/cli/src/args.rs`),
-  wired via `apply_opd_engine_overrides` at the top of `run_opd_from_dirs`.
-- **Resolution order = flag > env > default**, via set-once `OnceLock`
-  overrides consulted by the existing `infer_rollout_flag_enabled()` /
-  `engine_offload_mode()` resolvers (`crates/train/src/opd.rs`). No call-site
-  signature churn (the resolvers are read from deep CUDA-gated call sites), no
-  parallel old+new path, legacy env still honored for one migration cycle.
-- The `all` offload flag doc names its known step-2 illegal-address on the W4A8
-  Marlin teacher reload and points to `teacher` as the safe choice.
-- Non-CUDA build accepts the flags but they are inert (`#[cfg(not(cuda))]` stub);
-  the CPU path has no infer engine and no VRAM to offload.
+- **`--rollout-engine {infer,train}`** on `TrainOpdArgs` (`crates/cli/src/args.rs`);
+  `apply_opd_rollout_engine` installs it into a set-once `OnceLock` that
+  `infer_rollout_flag_enabled()` reads (`crates/train/src/opd.rs`). Unset →
+  `infer` (the fast default); `train` → the train-crate O(n²) A/B baseline arm.
+- **Deleted**: the `ARLE_OPD_INFER_ROLLOUT` env branch, the never-landed
+  `--engine-offload` flag + its `OpdEngineOffloadArg` enum + the
+  `set_engine_offload_override` machinery. `engine_offload_mode()` reverts to its
+  original env-only form (`ARLE_OPD_ENGINE_OFFLOAD`) — untouched pre-existing
+  behavior, not part of this flag surface.
+- Non-CUDA build accepts the flag but it is inert (`#[cfg(not(cuda))]` stub); the
+  CPU path has no infer engine.
 
 Verification: `cargo check -p cli --features metal,no-cuda` green; `cargo test -p
-train --features no-cuda` 163 + all integration tests green. CUDA build =
+train --features no-cuda` 163 lib + integration green; clippy clean. CUDA build =
 pending-remote (cudarc needs nvcc).
 
 ## Rule
 
-Promote run-shaping env vars to CLI flags but keep the env as a set-once
-fallback consulted by the *same* resolver — this avoids touching deep gated
-call-site signatures and leaves a clean migration cycle, rather than forking a
-parallel flag-only path (a half-state).
+When a flag replaces an env toggle, delete the env path rather than keeping a
+"flag > env > default" fallback — one entry, one default, no migration layer.
+The set-once `OnceLock` read by the existing resolver avoids churning the deep
+CUDA-gated call sites that consume the value.

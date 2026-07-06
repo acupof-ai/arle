@@ -70,38 +70,29 @@ pub struct InferRolloutCtx<'a> {
     pub lora_config: LoraConfig,
 }
 
-/// True when the infer-engine rollout path is selected (OPD P4: now the
-/// **default**). The in-process infer student engine (CUDA graph + paged KV)
-/// is 4.99× faster end-to-end than the train-crate hand-written O(n²) decode
+/// True when the infer-engine rollout path is selected (the **default**). The
+/// in-process infer student engine (CUDA graph + paged KV) is 4.99× faster
+/// end-to-end than the train-crate hand-written O(n²) decode
 /// (see `docs/experience/wins/2026-05-29-opd-infer-rollout-default-p4.md`).
 ///
-/// Resolution order: the CLI `--rollout-engine` flag (via
-/// [`set_infer_rollout_override`]) wins when set; otherwise the legacy
-/// `ARLE_OPD_INFER_ROLLOUT` env is honored as a migration fallback
-/// (`0`/`false` selects the train-crate arm; unset/other keeps infer on).
+/// Selected via the CLI `--rollout-engine {infer,train}` flag (through
+/// [`set_infer_rollout_override`]); unset defaults to `infer`. `train` selects
+/// the train-crate A/B baseline arm.
 #[cfg(feature = "cuda")]
 pub fn infer_rollout_flag_enabled() -> bool {
-    if let Some(forced) = INFER_ROLLOUT_OVERRIDE.get().copied().flatten() {
-        return forced;
-    }
-    match std::env::var("ARLE_OPD_INFER_ROLLOUT") {
-        Ok(value) => !(value == "0" || value.eq_ignore_ascii_case("false")),
-        Err(_) => true,
-    }
+    INFER_ROLLOUT_OVERRIDE.get().copied().unwrap_or(true)
 }
 
 /// CLI override for [`infer_rollout_flag_enabled`], set once from the
-/// `--rollout-engine {infer,train}` flag. `None` (unset) defers to the env
-/// fallback; `Some(bool)` forces the rollout path.
+/// `--rollout-engine {infer,train}` flag; unset defaults to `infer`.
 #[cfg(feature = "cuda")]
-static INFER_ROLLOUT_OVERRIDE: LazyLock<std::sync::OnceLock<Option<bool>>> =
-    LazyLock::new(std::sync::OnceLock::new);
+static INFER_ROLLOUT_OVERRIDE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
 /// Install the CLI `--rollout-engine` override. Idempotent (first write wins),
 /// so the loop reads a stable value even if called on multiple arms.
 #[cfg(feature = "cuda")]
 pub fn set_infer_rollout_override(use_infer: bool) {
-    let _ = INFER_ROLLOUT_OVERRIDE.set(Some(use_infer));
+    let _ = INFER_ROLLOUT_OVERRIDE.set(use_infer);
 }
 
 /// OPD engine weight time-share mode (`ARLE_OPD_ENGINE_OFFLOAD`). When on, the
@@ -153,11 +144,8 @@ impl EngineOffloadMode {
     }
 }
 
-/// Resolve the OPD engine offload mode.
+/// Parse the OPD engine offload mode from `ARLE_OPD_ENGINE_OFFLOAD`.
 ///
-/// Resolution order: the CLI `--engine-offload` flag (via
-/// [`set_engine_offload_override`]) wins when set; otherwise the legacy
-/// `ARLE_OPD_ENGINE_OFFLOAD` env is honored as a migration fallback:
 /// - `1` / `true` / `yes` / `on` / `all` → [`EngineOffloadMode::All`].
 /// - `student` → [`EngineOffloadMode::Student`] (keep the teacher resident).
 /// - `teacher` → [`EngineOffloadMode::Teacher`] (keep the student resident —
@@ -166,28 +154,12 @@ impl EngineOffloadMode {
 /// - anything else / unset → [`EngineOffloadMode::Off`].
 #[cfg(feature = "cuda")]
 pub fn engine_offload_mode() -> EngineOffloadMode {
-    if let Some(forced) = ENGINE_OFFLOAD_OVERRIDE.get().copied().flatten() {
-        return forced;
-    }
     match std::env::var("ARLE_OPD_ENGINE_OFFLOAD").as_deref() {
         Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON" | "all" | "ALL") => EngineOffloadMode::All,
         Ok("student" | "STUDENT" | "Student") => EngineOffloadMode::Student,
         Ok("teacher" | "TEACHER" | "Teacher") => EngineOffloadMode::Teacher,
         _ => EngineOffloadMode::Off,
     }
-}
-
-/// CLI override for [`engine_offload_mode`], set once from the
-/// `--engine-offload {off,student,teacher,all}` flag. `None` defers to the env
-/// fallback.
-#[cfg(feature = "cuda")]
-static ENGINE_OFFLOAD_OVERRIDE: LazyLock<std::sync::OnceLock<Option<EngineOffloadMode>>> =
-    LazyLock::new(std::sync::OnceLock::new);
-
-/// Install the CLI `--engine-offload` override. Idempotent (first write wins).
-#[cfg(feature = "cuda")]
-pub fn set_engine_offload_override(mode: EngineOffloadMode) {
-    let _ = ENGINE_OFFLOAD_OVERRIDE.set(Some(mode));
 }
 
 #[derive(Debug, thiserror::Error)]

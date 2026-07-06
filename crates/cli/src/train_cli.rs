@@ -791,7 +791,7 @@ fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
         );
     }
     let teacher_dir = args.teacher_model.as_deref().unwrap_or(student_dir);
-    apply_opd_engine_overrides(args.rollout_engine, args.engine_offload);
+    apply_opd_rollout_engine(args.rollout_engine);
     let target_set = parse_lora_target_set(&args.lora_target_set)?;
     let lora = LoraConfig {
         rank: args.lora_rank,
@@ -3294,36 +3294,18 @@ fn load_opd_infer_teacher(
     ))
 }
 
-/// Install the CLI `--rollout-engine` / `--engine-offload` overrides into the
-/// OPD resolver statics. CUDA-only knobs; on a non-CUDA build the flags are
-/// accepted but inert (the CPU path has neither an infer engine nor VRAM
-/// offload). `None` args leave the legacy env fallbacks in effect.
+/// Install the CLI `--rollout-engine` selection into the OPD resolver. CUDA-only;
+/// on a non-CUDA build the flag is accepted but inert (no infer engine on CPU).
+/// Unset leaves the `infer` default in effect.
 #[cfg(feature = "cuda")]
-fn apply_opd_engine_overrides(
-    rollout_engine: Option<crate::args::OpdRolloutEngineArg>,
-    engine_offload: Option<crate::args::OpdEngineOffloadArg>,
-) {
-    use crate::args::{OpdEngineOffloadArg, OpdRolloutEngineArg};
-    if let Some(engine) = rollout_engine {
-        train::opd::set_infer_rollout_override(matches!(engine, OpdRolloutEngineArg::Infer));
-    }
-    if let Some(offload) = engine_offload {
-        let mode = match offload {
-            OpdEngineOffloadArg::Off => train::opd::EngineOffloadMode::Off,
-            OpdEngineOffloadArg::Student => train::opd::EngineOffloadMode::Student,
-            OpdEngineOffloadArg::Teacher => train::opd::EngineOffloadMode::Teacher,
-            OpdEngineOffloadArg::All => train::opd::EngineOffloadMode::All,
-        };
-        train::opd::set_engine_offload_override(mode);
+fn apply_opd_rollout_engine(engine: Option<crate::args::OpdRolloutEngineArg>) {
+    if let Some(engine) = engine {
+        train::opd::set_infer_rollout_override(engine == crate::args::OpdRolloutEngineArg::Infer);
     }
 }
 
 #[cfg(not(feature = "cuda"))]
-fn apply_opd_engine_overrides(
-    _rollout_engine: Option<crate::args::OpdRolloutEngineArg>,
-    _engine_offload: Option<crate::args::OpdEngineOffloadArg>,
-) {
-}
+fn apply_opd_rollout_engine(_engine: Option<crate::args::OpdRolloutEngineArg>) {}
 
 #[cfg(feature = "cuda")]
 fn load_opd_infer_student(
