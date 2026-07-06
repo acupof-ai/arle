@@ -1602,6 +1602,7 @@ mod backend {
     /// checkpoint-auto-resolved default at this known-safe ceiling; an
     /// explicit `--max-total-tokens` (e.g. the C4 budget-reject regression
     /// test's deliberate 2,000,000) still bypasses it untouched.
+    #[cfg(feature = "cuda")]
     pub const DSV4_AUTO_CONTEXT_CEILING: usize = 32768;
 
     #[cfg(feature = "cuda")]

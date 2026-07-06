@@ -39,6 +39,28 @@ pub(crate) fn chat_stream_chunk(
     })
 }
 
+/// OpenAI `stream_options.include_usage` trailer: sent once, after the
+/// finish-reason chunk and before `[DONE]`, with EMPTY `choices` and the
+/// populated `usage` — mirrors vLLM/SGLang so clients that only look for
+/// usage on the empty-choices chunk (guidellm included) find it. `object` is
+/// `"text_completion"` (completions) or `"chat.completion.chunk"` (chat).
+pub(crate) fn stream_usage_chunk(
+    id: &str,
+    created: u64,
+    model: &str,
+    object: &str,
+    usage: serde_json::Value,
+) -> serde_json::Value {
+    json!({
+        "id": id,
+        "object": object,
+        "created": created,
+        "model": model,
+        "choices": [],
+        "usage": usage,
+    })
+}
+
 pub(crate) fn finish_reason(reason: Option<&FinishReason>) -> &'static str {
     match reason {
         Some(FinishReason::Stop) => "stop",
@@ -285,6 +307,23 @@ mod tests {
         let done = chat_stream_chunk("chatcmpl-x", 123, "m", json!({}), Some("stop"));
         assert_eq!(done["choices"][0]["finish_reason"], "stop");
         assert_eq!(done["choices"][0]["delta"], json!({}));
+    }
+
+    /// `stream_options.include_usage` trailer: empty `choices` (so it can't be
+    /// mistaken for a content delta), populated `usage`, `object` matching the
+    /// endpoint that sent it.
+    #[test]
+    fn stream_usage_chunk_shape() {
+        let chunk = stream_usage_chunk(
+            "chatcmpl-x",
+            123,
+            "m",
+            "chat.completion.chunk",
+            json!({"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7}),
+        );
+        assert_eq!(chunk["object"], "chat.completion.chunk");
+        assert_eq!(chunk["choices"], json!([]));
+        assert_eq!(chunk["usage"]["total_tokens"], 7);
     }
 
     #[test]
