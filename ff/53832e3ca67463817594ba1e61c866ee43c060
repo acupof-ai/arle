@@ -1,0 +1,21 @@
+crates/infer-api/src/loaded.rs
+  s_fac30cf123e2ca::t_9e1c11a5399c37 1988-1992,2010-2012,2025-2036,2038,2041,2148-2150,2157-2170,2173-2174,2176-2193,2195
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "ff53832e3ca67463817594ba1e61c866ee43c060",
+  "prompts": {},
+  "sessions": {
+    "s_fac30cf123e2ca": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7191b863-9a0e-476b-8b4a-c92cb06f1263",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
