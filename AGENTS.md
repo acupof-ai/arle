@@ -118,6 +118,33 @@ multi-day new infra"; reading the code collapsed it to "one per-row `for` loop a
 
 ---
 
+## §0.2 天条 — extreme concision (code · comments · docs)
+
+**Say the most with the least. Every token earns its place; cut the rest.** The
+default bar for all output, not a style preference. Omit needless words (Strunk).
+
+- **Code — say it once, name it well.** Delete before you add; reuse over new
+  surface. Prefer the stdlib verb that names the operation exactly (`.unzip()`,
+  `ensure!`, `.is_some_and()`) over a hand-rolled block. Self-documenting names
+  kill most comments (Kernighan & Pike). Named temporary that only aliases the
+  prior line = noise. Test: a reader parses the intent in **one pass**.
+- **Comments — the *why*, never the *what*.** ≤1–2 lines on the non-obvious
+  reason / invariant / ordering (Ousterhout: "self-documenting" is a beautiful
+  lie — write only what the code *can't* say). A comment restating the code is
+  debt; delete it. No essay blocks.
+- **Docs — conclusion first, one type per doc.** Lead with the verdict, then
+  reason, then detail (inverted pyramid). One doc = one Diátaxis mode
+  (tutorial | how-to | reference | explanation) — mixing bloats. One idea per
+  sentence. No filler, no hedging, no restating the question. Fits in one line →
+  one line. A figure only for a relationship prose can't carry.
+- **Self-check before shipping any output:** "What here carries no information?
+  Cut it." If the explanation outruns the code, delete the explanation — prose
+  defending a simplification is complexity smuggled back in.
+
+**Not concise enough → keep cutting.** Same ratchet as §0's SOLID bar.
+
+---
+
 ## Project shape
 
 `ARLE` is a Rust-native, device-neutral inference runtime with integrated local
