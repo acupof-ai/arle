@@ -724,8 +724,21 @@ mod tests {
         ToolCall::new(name, args)
     }
 
+    /// `plain_output`/`run_captured` both gate on the process-global
+    /// `ARLE_SPAWNER_SOCKET` (`SpawnClient::from_env`) — any test that spawns a
+    /// subprocess must hold this lock so `spawner_routing_matches_direct` /
+    /// `spawner::tests::server_client_echo_roundtrip` (which set that env var
+    /// mid-test) can never race a concurrent, unrelated subprocess spawn onto
+    /// their helper socket.
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        crate::spawner::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn bash_does_not_hang_on_backgrounded_child() {
+        let _guard = env_guard();
         // Regression: a tool command that backgrounds a process inheriting the
         // stdout pipe used to block `wait_with_output()` until that grandchild
         // exited (forever for a daemon), stranding the parent in `wait4()`.
@@ -746,6 +759,7 @@ mod tests {
 
     #[test]
     fn missing_args_name_the_schema() {
+        let _guard = env_guard();
         // The decoded 0-accept vector: `read` called with `command` instead of
         // `path` must come back naming the schema, not "is a directory".
         let tmp = tempfile::tempdir().unwrap();
@@ -771,6 +785,7 @@ mod tests {
 
     #[test]
     fn executor_read_write_replace_bash() {
+        let _guard = env_guard();
         let tmp = tempfile::tempdir().unwrap();
         let exec = SandboxToolExecutor::new(tmp.path().to_path_buf(), 30, None);
 
@@ -808,6 +823,7 @@ mod tests {
 
     #[test]
     fn boot_diff_reset_roundtrip() {
+        let _guard = env_guard();
         let work_root = tempfile::tempdir().unwrap();
         let staged = tempfile::tempdir().unwrap();
         fs::write(staged.path().join("a.txt"), "x\n").unwrap();
@@ -832,6 +848,7 @@ mod tests {
 
     #[test]
     fn bash_rejects_absolute_cd_into_sibling_task() {
+        let _guard = env_guard();
         // Mirror the decoded accept-wall: two task workdirs are flat-siblings
         // under one work_root; the agent's bash must not `cd` into the other.
         let work_root = tempfile::tempdir().unwrap();
@@ -877,6 +894,7 @@ mod tests {
 
     #[test]
     fn score_detects_failing_test() {
+        let _guard = env_guard();
         // Gate on pytest availability — skip if python3/pytest is absent.
         let probe = Command::new("python3")
             .args(["-m", "pytest", "--version"])
@@ -902,6 +920,7 @@ mod tests {
 
     #[test]
     fn score_resets_student_dirtied_test_file_before_applying_patch() {
+        let _guard = env_guard();
         // Regression: a rollout that edits a (hidden) test file used to make the
         // plain `git apply` of the base-context test_patch fail "patch does not
         // apply", mis-scoring a real fix as failing. score_workdir now resets the
