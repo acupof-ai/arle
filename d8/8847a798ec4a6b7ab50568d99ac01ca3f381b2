@@ -1,0 +1,69 @@
+ROADMAP.md
+  s_5c1fc8c970e0a6::t_187439fd52fdbd 51-54,56
+crates/cli/src/train_cli.rs
+  s_fac30cf123e2ca::t_8d8154822de13a 3297-3298
+crates/train/src/lib.rs
+  s_0432e410d8794a::t_5c69a629b69cd5 1-7,9-11
+crates/train/src/loss.rs
+  s_fac30cf123e2ca::t_9e4bd95b6a29b1 14-19,45-50,180-181
+crates/train/tests/test_opd.rs
+  s_06f37645870b8d::t_5ef0adfbf42d8d 119-121,163,182
+docs/architecture.md
+  s_0432e410d8794a::t_5165c6f71d7153 59
+docs/plans/2026-07-06-opd-real-swe-eval-teacher-in-loop.md
+  s_965ce2db4386cb::t_a1e23411b84a8b 5-30
+docs/plans/2026-07-06-opd-step-overload-chain-collapse.md
+  s_965ce2db4386cb::t_e6222f9da632a6 4,6-7,9-12,14-17,19-23,25,27-28
+docs/projects/2026-05-18-opd-only-pivot.md
+  s_0432e410d8794a::t_4c154d11eeadc5 5-11
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "d88847a798ec4a6b7ab50568d99ac01ca3f381b2",
+  "prompts": {},
+  "sessions": {
+    "s_0432e410d8794a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a0c258f969a828d5b",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_06f37645870b8d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ade348279c813fb6c",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_5c1fc8c970e0a6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a4c00ae9652d4e98a",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_965ce2db4386cb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "124b0ccd-6ba1-4679-a1ec-a259030026b8",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_fac30cf123e2ca": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7191b863-9a0e-476b-8b4a-c92cb06f1263",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
