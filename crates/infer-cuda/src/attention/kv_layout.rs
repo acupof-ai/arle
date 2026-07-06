@@ -184,12 +184,6 @@ pub(crate) struct Dsv4KvAdapter {
     /// never aliased concurrently (exactly like `dsa_shared`/`flashmla_batch`/
     /// decode-graph scratch). `None` when native DeepGEMM is unavailable.
     pub(super) prefill_linear: Option<Dsv4PrefillDeepGemmLinearScratch>,
-    /// SECOND `prefill_linear`-shaped scratch for the Aux-stream decode
-    /// overlap lane (`ARLE_DSV4_DECODE_MULTISTREAM_OVERLAP`) — reusing
-    /// `prefill_linear` would alias a buffer the concurrent main-stream
-    /// projection GEMM is still reading/writing. `None` unless both native
-    /// DeepGEMM is available AND the overlap lever is on.
-    pub(super) prefill_linear_aux: Option<Dsv4PrefillDeepGemmLinearScratch>,
 }
 
 /// Index-layer map: the ONE `compressed-row → (slot-logical page, in-page row)`
@@ -560,17 +554,6 @@ impl Dsv4KvAdapter {
         } else {
             None
         };
-        // See field doc comment; gated on the same DeepGEMM availability.
-        let prefill_linear_aux =
-            if prefill_linear.is_some() && dsv4_decode_multistream_overlap_enabled()? {
-                Some(Dsv4PrefillDeepGemmLinearScratch::new(
-                    ctx,
-                    config,
-                    max_seq_len,
-                )?)
-            } else {
-                None
-            };
         Ok(Self {
             layers,
             num_slots,
@@ -583,7 +566,6 @@ impl Dsv4KvAdapter {
             flashmla_batch,
             flashmla_scratch,
             prefill_linear,
-            prefill_linear_aux,
         })
     }
 
@@ -647,12 +629,6 @@ impl Dsv4KvAdapter {
             (
                 "prefill_linear",
                 self.prefill_linear.as_ref().map_or(0, |s| s.device_bytes()),
-            ),
-            (
-                "prefill_linear_aux",
-                self.prefill_linear_aux
-                    .as_ref()
-                    .map_or(0, |s| s.device_bytes()),
             ),
         ]
     }
@@ -742,15 +718,6 @@ impl Dsv4KvAdapter {
     #[allow(dead_code)]
     pub(crate) fn prefill_linear_mut(&mut self) -> Option<&mut Dsv4PrefillDeepGemmLinearScratch> {
         self.prefill_linear.as_mut()
-    }
-
-    /// `&mut` accessor for the Aux-stream decode-overlap scratch (see the field
-    /// doc comment). `None` unless [`dsv4_decode_multistream_overlap_enabled`]
-    /// was on when the adapter was built.
-    pub(crate) fn prefill_linear_aux_mut(
-        &mut self,
-    ) -> Option<&mut Dsv4PrefillDeepGemmLinearScratch> {
-        self.prefill_linear_aux.as_mut()
     }
 
     /// Split-borrow accessor for the batched (`b = N`) FlashMLA decode lane
