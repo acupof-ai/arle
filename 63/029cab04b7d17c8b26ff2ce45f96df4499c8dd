@@ -1,0 +1,21 @@
+docs/experience/wins/2026-07-06-dsv4-mtp-guidellm-canonical-bench.md
+  s_5e69088ecb4004::t_37eeb1312fe968 1-375
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "63029cab04b7d17c8b26ff2ce45f96df4499c8dd",
+  "prompts": {},
+  "sessions": {
+    "s_5e69088ecb4004": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a0ef061e357207e25",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
