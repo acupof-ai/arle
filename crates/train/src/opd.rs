@@ -2784,69 +2784,6 @@ pub fn opd_step<O: Optimizer>(
     )
 }
 
-/// Rubric-OPD writeback: one CE training step on a single accepted `(prompt,
-/// completion)` pair. Completion-masked next-token CE (loss only on the completion
-/// tokens), backward, optimizer step, cleanup. Returns the CE loss value.
-///
-/// Used by the rubric-OPD RFT loop ([`crate::rubric_opd::run_rubric_rounds`]): the
-/// student trains on its OWN rubric-accepted rollout (Mode A) or on a Flash
-/// correction (Mode B) — both are just `(prompt, completion)` token pairs here, so
-/// this one entry serves both. No teacher forward, no KL: the judge already did the
-/// selection at the text level (the cross-vocab sidestep), so writeback is pure CE.
-///
-/// `all_model_params` are kept (with grads) through cleanup so frozen base weights
-/// are not freed; `trainable_params` (the LoRA adapters) receive the optimizer step.
-#[allow(clippy::too_many_arguments)]
-pub fn rubric_writeback_ce_step<O: Optimizer>(
-    student: &Qwen35Model,
-    all_model_params: &[TensorId],
-    trainable_params: &[TensorId],
-    optimizer: &mut O,
-    prompt_ids: &[u32],
-    completion_ids: &[u32],
-    vocab: usize,
-    store: &mut TensorStore,
-) -> Result<f32> {
-    if prompt_ids.is_empty() {
-        return Err(OpdError::InvalidInput(
-            "rubric writeback requires a non-empty prompt".to_owned(),
-        ));
-    }
-    if completion_ids.is_empty() {
-        return Err(OpdError::InvalidInput(
-            "rubric writeback requires a non-empty completion".to_owned(),
-        ));
-    }
-    let mut tape = Tape::new();
-    let full: Vec<usize> = prompt_ids
-        .iter()
-        .map(|&t| t as usize)
-        .chain(completion_ids.iter().map(|&t| t as usize))
-        .collect();
-    let logits = student
-        .forward_tokens(&full, store, &mut tape)
-        .map_err(OpdError::from)?;
-    // Logits at position p predict token p+1. The first completion token sits at
-    // index `prompt_len`, so its predictor is the logits at `prompt_len - 1`;
-    // target the completion tokens (completion-masked CE).
-    let loss = next_token_sft_loss_from_logits(
-        logits,
-        full.len(),
-        prompt_ids.len() - 1,
-        completion_ids,
-        vocab,
-        store,
-        &mut tape,
-    )?;
-    let loss_value = store.to_host(loss).map_err(OpdError::from)?[0];
-    backward_with_optional_profile(loss, loss_value, store, &mut tape)?;
-    optimizer.step(store, trainable_params)?;
-    optimizer.zero_grad(store, trainable_params);
-    let keep_extra: HashSet<TensorId> = HashSet::new();
-    cleanup_after_backward(store, &mut tape, all_model_params, &keep_extra);
-    Ok(loss_value)
-}
-
 /// Batched rubric-OPD writeback: one forward+backward over B accepted `(prompt,
 /// completion)` pairs (padded to a common length), completion-masked CE summed over
 /// rows. The 27B CE is overhead-bound (host op-dispatch, GPU ~0% util), so batching
