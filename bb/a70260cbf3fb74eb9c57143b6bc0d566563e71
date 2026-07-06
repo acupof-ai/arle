@@ -1,0 +1,33 @@
+crates/cuda-kernels/src/tensor.rs
+  s_965ce2db4386cb::t_1bf10f5560c62b 169,173-175,187-188,207-209,393-396,407,504-510,518,522-533
+crates/infer-cuda/src/attention.rs
+  s_965ce2db4386cb::t_fd6f4bb060130c 1688-1699
+crates/infer-cuda/src/attention/kv_layout.rs
+  s_965ce2db4386cb::t_c6b60f24be8e2e 187-192,563-573,586,651-656,747-755,1034-1040,1052-1055,1058,1063
+crates/infer-cuda/src/dsv4.rs
+  s_965ce2db4386cb::t_080af52c608494 1893,1895,1901,1903-1915,1923-1924,2743-2791,2834-2868,4065-4067,4069-4129
+crates/infer-cuda/src/moe.rs
+  s_965ce2db4386cb::t_f92a7cd1c4b72b 2538-2557,4838
+docs/experience/wins/2026-07-06-dsv4-decode-multistream-overlap-pending-remote.md
+  s_965ce2db4386cb::t_e73719c8f0c3b7 1-284
+docs/experience/wins/2026-07-06-dsv4-deepep-waterfill-pending-remote.md
+  s_965ce2db4386cb::t_2fdf4fb8cacfbe 1-229
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "bba70260cbf3fb74eb9c57143b6bc0d566563e71",
+  "prompts": {},
+  "sessions": {
+    "s_965ce2db4386cb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "124b0ccd-6ba1-4679-a1ec-a259030026b8",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
