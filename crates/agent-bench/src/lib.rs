@@ -1702,13 +1702,12 @@ mod tests {
             std::env::set_var("ARLE_DSV4_DECODE_GRAPH", "0");
         }
 
-        let mut exec = infer_cuda::CudaExecutor::from_dsv4_fp8_safetensors(
-            &model_path,
-            1,
-            infer_cuda::dsv4_max_seq_len(),
-            None,
-        )
-        .map_err(|e| anyhow::anyhow!("from_dsv4_fp8_safetensors failed: {e:#}"))?;
+        // KV parity/precision audit: short prompts, <=64 decode steps
+        // (`dsv4_kv_parity_max_tokens`) — 4096 is generous headroom, not a
+        // tunable knob.
+        let mut exec =
+            infer_cuda::CudaExecutor::from_dsv4_fp8_safetensors(&model_path, 1, 4096, None)
+                .map_err(|e| anyhow::anyhow!("from_dsv4_fp8_safetensors failed: {e:#}"))?;
 
         // Reference = scalar bf16.
         let ref_case = cases

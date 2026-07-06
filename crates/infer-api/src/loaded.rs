@@ -1774,21 +1774,6 @@ mod backend {
         // CUDA arms fail closed without an API-layer model branch.
         if matches!(kind, CudaModelKind::Dsv4) {
             scheduler.chunked_prefill_size = 4096;
-            // Bind the ingress prompt/total caps DOWN to the executor's real slot
-            // capacity (`dsv4_max_seq_len()`). The DSv4 forward asserts
-            // `start_pos + tokens.len() <= slot.max_seq_len` (dsv4.rs); an over-
-            // length prompt that clears ingress reaches that assert, returns Err
-            // from engine.step(), and the multiproc worker propagates the Err →
-            // EVERY TP worker process exits. Reject such prompts gracefully at
-            // ingress instead (FinishReason::Abort → empty/finished completion).
-            // Use `.min()`, not assign: scheduler_config() already copied the
-            // user's `--max-prompt-tokens` in, and a stricter user cap must be
-            // RESPECTED — assigning would clobber the flag in both directions.
-            // `max_seq` is identical on every rank (env or const), so the
-            // lockstep-determinism invariant holds.
-            let max_seq = infer_cuda::dsv4_max_seq_len();
-            scheduler.max_prompt_tokens = scheduler.max_prompt_tokens.min(max_seq);
-            scheduler.max_total_tokens = scheduler.max_total_tokens.min(max_seq + 4096);
         }
         let num_slots = config.hot_workspace_slots();
         let page_size = config.page_size;
@@ -1830,12 +1815,17 @@ mod backend {
             // single GPU (world_size==1) it loads as one rank. DSv4 owns its
             // MLA KV state inside the forward, so the host `CudaKvPool` is
             // only present to satisfy the `submit(.., &mut dyn KvPool)`
-            // signature; `max_seq_len` threads from `dsv4_max_seq_len()`
-            // (`INFER_DSV4_MAX_SEQ_LEN`).
+            // signature; `max_seq_len` is `config.max_total_tokens` — the same
+            // global cap `--max-total-tokens` sets for every backend (DSv4
+            // multiproc auto-resolves it from the checkpoint's
+            // `max_position_embeddings` when unset, `serve.rs`). No separate
+            // DSv4-only knob: a slot's arena must hold prompt+generated tokens
+            // up to exactly that cap, so there is nothing left to reconcile
+            // between the scheduler's admission cap and the executor's arena.
             CudaModelKind::Dsv4 => CudaExecutor::from_dsv4_fp8_safetensors(
                 model_path,
                 num_slots,
-                infer_cuda::dsv4_max_seq_len(),
+                config.max_total_tokens,
                 config.mtp_draft_tokens,
                 config.mtp_draft_topk,
             )?,
