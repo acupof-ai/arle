@@ -44,13 +44,6 @@ pub(crate) fn tier_block_u64(session: u64, block: u64) -> u64 {
     const WRITETHROUGH_BIT: u64 = 1 << 63;
     WRITETHROUGH_BIT | ((session & 0x7FFF_FFFF) << 32) | (block & 0xFFFF_FFFF)
 }
-// Default DSv4 per-slot max KV sequence length when `INFER_DSV4_MAX_SEQ_LEN` is
-// unset. 32768 admits realistic agentic prompts out of the box. NOT 262144: the
-// O(N^2) DSA-indexer logits scratch OOMs above ~200K (16384 is a known-good
-// floor). The executor clamps `num_slots` to HBM (`kv_budget_num_slots`), so a
-// larger default degrades to fewer slots, never OOM.
-const DSV4_DEFAULT_MAX_SEQ_LEN: usize = 32768;
-
 /// Seq-len budget the captured decode graph's fixed `kv_indices` is sized to;
 /// pages beyond it fall back to eager rather than replay a stale graph.
 const DECODE_GRAPH_MAX_SEQ_LEN: usize = 32_768;
@@ -3233,18 +3226,6 @@ impl Dsv4CudaExecutor {
         }
         Ok(())
     }
-}
-
-/// The DSv4 executor's configured max KV sequence length (`INFER_DSV4_MAX_SEQ_LEN`,
-/// default [`DSV4_DEFAULT_MAX_SEQ_LEN`]). Exposed so harnesses size their host KV
-/// pool to the design max (length-agnostic — any prompt up to this works) instead
-/// of the specific test prompt length.
-pub fn dsv4_max_seq_len() -> usize {
-    std::env::var("INFER_DSV4_MAX_SEQ_LEN")
-        .ok()
-        .and_then(|raw| raw.parse::<usize>().ok())
-        .filter(|&v| v > 0)
-        .unwrap_or(DSV4_DEFAULT_MAX_SEQ_LEN)
 }
 
 /// Whole-step Qwen3.5/3.6 decode graph enabled? `ARLE_QWEN35_DECODE_GRAPH=1`

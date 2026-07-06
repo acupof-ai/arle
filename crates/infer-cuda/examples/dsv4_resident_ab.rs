@@ -38,10 +38,9 @@ mod real {
 mod real {
     use anyhow::{Context, Result, bail};
     use infer_cuda::{
-        CudaExecutor, CudaKvPool, dsv4_max_seq_len, print_dsv4_linear_profile,
-        print_dsv4_stage_profile, reset_dsv4_linear_profile, reset_dsv4_stage_profile,
-        set_dsv4_flashmla_decode_override, set_dsv4_fused_wqkv_decode_override,
-        set_dsv4_stage_profile_active,
+        CudaExecutor, CudaKvPool, print_dsv4_linear_profile, print_dsv4_stage_profile,
+        reset_dsv4_linear_profile, reset_dsv4_stage_profile, set_dsv4_flashmla_decode_override,
+        set_dsv4_fused_wqkv_decode_override, set_dsv4_stage_profile_active,
     };
     use infer_plan::{ForwardMode, ForwardPlan, PrefillRow, SamplingParams};
     use infer_seam::{BackendExecutor, KvAllocator, KvPool, KvQuery, PollResult};
@@ -49,6 +48,9 @@ mod real {
 
     const DEFAULT_PROMPT_IDS: &str = "671,6102,294,8760,344";
     const DEFAULT_MAX_NEW: usize = 128;
+    /// Design-max KV arena for this A/B harness — length-agnostic (handles any
+    /// prompt up to this without per-test sizing), not a tunable knob.
+    const AB_MAX_SEQ_LEN: usize = 32768;
     const DEFAULT_WARMUP_NEW: usize = 16;
     const ORACLE_16: [u32; 16] = [
         11111, 603, 671, 6102, 294, 8760, 344, 11111, 603, 671, 6102, 294, 8760, 344, 11111, 603,
@@ -200,7 +202,7 @@ mod real {
 
         let load_t0 = Instant::now();
         let mut exec =
-            CudaExecutor::from_dsv4_fp8_safetensors(&model_path, 1, dsv4_max_seq_len(), None, None)
+            CudaExecutor::from_dsv4_fp8_safetensors(&model_path, 1, AB_MAX_SEQ_LEN, None, None)
                 .context("from_dsv4_fp8_safetensors failed")?;
         let load_ms = load_t0.elapsed().as_secs_f64() * 1000.0;
 
@@ -254,10 +256,10 @@ mod real {
         // DSv4 does not use the host page pool for real KV, but the seam's
         // KvBatchDescriptor check reads kv.seq_len(slot) (set by materialize_plan_kv
         // below), so size the host pool to the executor's DESIGN max context
-        // (dsv4_max_seq_len) — length-agnostic, handles any prompt up to the max
+        // (AB_MAX_SEQ_LEN) — length-agnostic, handles any prompt up to the max
         // without per-test sizing. Recreated per variant for clean bookkeeping.
         let page_size = 16usize;
-        let kv_pages = dsv4_max_seq_len().div_ceil(page_size) + 1;
+        let kv_pages = AB_MAX_SEQ_LEN.div_ceil(page_size) + 1;
         let mut kv = CudaKvPool::new(1, kv_pages, page_size);
 
         let prefill_t0 = Instant::now();
