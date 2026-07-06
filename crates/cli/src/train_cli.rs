@@ -3294,9 +3294,8 @@ fn load_opd_infer_teacher(
     ))
 }
 
-/// Install the CLI `--rollout-engine` selection into the OPD resolver. CUDA-only;
-/// on a non-CUDA build the flag is accepted but inert (no infer engine on CPU).
-/// Unset leaves the `infer` default in effect.
+/// Install the `--rollout-engine` selection (CUDA only; inert on CPU, which has
+/// no infer engine). Unset → `infer` default.
 #[cfg(feature = "cuda")]
 fn apply_opd_rollout_engine(engine: Option<crate::args::OpdRolloutEngineArg>) {
     if let Some(engine) = engine {

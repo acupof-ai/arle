@@ -55,13 +55,9 @@ use crate::{
 use crate::{infer_student::InferStudent, lora::LoraConfig};
 use autograd::ops::{add, fused_linear_distill::fused_linear_ce_loss_indexed, mul_scalar, slice};
 
-/// Context to route the OPD student rollout through the in-process infer engine
-/// (`InferStudent`) instead of the train-crate hand-written decode kernel. This
-/// is the CUDA default; `--rollout-engine train` selects the fallback A/B arm.
-///
-/// The caller constructs this only when both (a) the infer rollout arm is
-/// selected and (b) an `InferStudent` was loaded; when `None`, the train-crate
-/// rollout runs unchanged (the A/B baseline arm).
+/// Routes the OPD rollout through the in-process infer engine (`InferStudent`)
+/// instead of the train-crate decode. Built only when the infer arm is selected
+/// and an `InferStudent` loaded; `None` → train-crate rollout (A/B baseline).
 #[cfg(feature = "cuda")]
 pub struct InferRolloutCtx<'a> {
     /// In-process infer student engine (LoRA-synced from the train store).
@@ -70,26 +66,20 @@ pub struct InferRolloutCtx<'a> {
     pub lora_config: LoraConfig,
 }
 
-/// True when the infer-engine rollout path is selected (the **default**). The
-/// in-process infer student engine (CUDA graph + paged KV) is 4.99× faster
-/// end-to-end than the train-crate hand-written O(n²) decode
-/// (see `docs/experience/wins/2026-05-29-opd-infer-rollout-default-p4.md`).
-///
-/// Selected via the CLI `--rollout-engine {infer,train}` flag (through
-/// [`set_infer_rollout_override`]); unset defaults to `infer`. `train` selects
-/// the train-crate A/B baseline arm.
+/// True when the infer-engine rollout path is selected (the default). The
+/// in-process infer student (CUDA graph + paged KV) is 4.99× faster than the
+/// train-crate O(n²) decode (`wins/2026-05-29-opd-infer-rollout-default-p4.md`).
+/// Set by `--rollout-engine {infer,train}`; unset → `infer`.
 #[cfg(feature = "cuda")]
 pub fn infer_rollout_flag_enabled() -> bool {
     INFER_ROLLOUT_OVERRIDE.get().copied().unwrap_or(true)
 }
 
-/// CLI override for [`infer_rollout_flag_enabled`], set once from the
-/// `--rollout-engine {infer,train}` flag; unset defaults to `infer`.
+/// `--rollout-engine` selection; unset defaults to `infer`.
 #[cfg(feature = "cuda")]
 static INFER_ROLLOUT_OVERRIDE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
-/// Install the CLI `--rollout-engine` override. Idempotent (first write wins),
-/// so the loop reads a stable value even if called on multiple arms.
+/// Install the `--rollout-engine` selection (idempotent, first write wins).
 #[cfg(feature = "cuda")]
 pub fn set_infer_rollout_override(use_infer: bool) {
     let _ = INFER_ROLLOUT_OVERRIDE.set(use_infer);
@@ -3479,10 +3469,8 @@ pub fn opd_step_with_teacher_forward_profiled_gkd<O: Optimizer, T: TeacherForwar
     )
 }
 
-/// Student rollout phase: mirror the LoRA into the infer student (cuda) or run
-/// the train-crate decode, producing the `rollout: Vec<u32>` that downstream
-/// KL/backward consumes. `engine_offload` is resolved by the caller so all three
-/// routes (windowed / chunked / fall-through) share one value.
+/// Student rollout phase: infer-student decode (cuda) or train-crate decode,
+/// producing the `rollout` that downstream KL/backward consumes.
 #[allow(clippy::too_many_arguments)]
 #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
 fn run_opd_rollout_phase(
@@ -3598,9 +3586,8 @@ fn run_opd_rollout_phase(
     Ok(rollout)
 }
 
-/// Shared borrowed context for the two GKD backward routes (windowed / chunked
-/// KL). Holds the `&`/Copy fields common to both; the `&mut` store/tape/optimizer
-/// and profile are threaded explicitly so the borrows stay local to each call.
+/// Shared borrowed context for the two GKD backward routes. Holds the `&`/Copy
+/// fields common to both; `&mut` store/tape/optimizer/profile stay explicit.
 struct GkdRouteCtx<'a, T: TeacherForward + ?Sized> {
     student: &'a Qwen35Model,
     teacher: &'a T,
@@ -3619,9 +3606,8 @@ struct GkdRouteCtx<'a, T: TeacherForward + ?Sized> {
     infer_rollout: Option<&'a InferRolloutCtx<'a>>,
 }
 
-/// Route B — windowed scoring/backward: the memory path for long rollouts and
-/// large vocabs. `kl_chunk_size` still chunks softmax work inside each window,
-/// but must not preempt windowed forward.
+/// Route B — windowed scoring/backward: the memory path for long rollouts /
+/// large vocabs. `kl_chunk_size` chunks softmax inside each window.
 fn run_windowed_gkd_route<O: Optimizer, T: TeacherForward + ?Sized>(
     rt: &GkdRouteCtx<'_, T>,
     window_size: usize,
@@ -3720,9 +3706,9 @@ fn run_windowed_gkd_route<O: Optimizer, T: TeacherForward + ?Sized>(
     })
 }
 
-/// Route — pure chunked-KL (lambda == 0.0): a single full-prefix teacher +
-/// student forward with chunked softmax inside the backward, with the cuda-only
-/// rollout-student offload/reload hooks wired around the teacher scoring.
+/// Route — pure chunked-KL (lambda == 0.0): full-prefix teacher + student
+/// forward, chunked softmax in the backward, cuda-only offload/reload hooks
+/// around teacher scoring.
 fn run_chunked_kl_route<O: Optimizer, T: TeacherForward + ?Sized>(
     rt: &GkdRouteCtx<'_, T>,
     chunk_size: usize,
