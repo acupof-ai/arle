@@ -468,6 +468,107 @@ content-position (or vice versa) — not run this pass (information budget).
 (`dsv4_decode_trace`) and its executor.rs B=1 call site — off by default, one
 `env::var_os` check per decode tick when unset, zero behavior change.
 
+## compute-sanitizer racecheck/synccheck/memcheck — intra-kernel race KILLED, cross-kernel-fence still open (2026-07-07)
+
+Per the token-trace round's own scope caveat ("the mechanism is invisible to
+`CUDA_LAUNCH_BLOCKING`... exactly what `compute-sanitizer --tool racecheck`
+is designed to catch"), ran the three genuinely batch-launched candidates
+under `compute-sanitizer` against the live n=4 repro.
+
+**Setup.** Pod ships `compute-sanitizer` 2025.2.1.0 at `/usr/local/cuda/bin/`.
+`--kernel-name kernel_substring=<name>` (additive, matches inside the mangled
+name) targeted three kernels, chosen from the source (`crates/cuda-kernels/csrc/misc/`)
+by which ones are **actually launched `<<<n, BLOCK>>>` with `blockIdx.x` =
+row/token ordinal in ONE call spanning the whole batch** (a prerequisite for
+an *intra-kernel* cross-block race — a kernel launched once-per-row in a
+host loop can't have one, since CUDA serializes same-stream launches):
+- `dsv4_compressor_update_batched_kernel` (`dsv4_attention.cu:1136`, `<<<n,BLOCK>>>`,
+  `rowi = blockIdx.x`) — genuinely batched, always (`full_flatten`, MODEL1
+  B>1 canonical path per `dsv4.rs:2675` comment).
+- `deepseek_v4_topk_transform_kernel` (`dsv4_dsa_official.cu:634`, `bid =
+  blockIdx.x`) — genuinely batched, always.
+- `dsv4_hybrid_attention_kernel` (`dsv4_attention.cu:1534`) — **traced this
+  round and it is NOT the batched-race candidate the priority list assumed**:
+  its `start_pos`/`start_pos_ptr` arg is a single SCALAR (`dsv4_graph_start_pos`
+  derefs `*start_pos_ptr` unconditionally, no per-row array), and
+  `forward_decode_batch_stream_impl` (`dsv4.rs:2519-2531`) memcpys each row's
+  own position into its OWN `slot.start_pos_device` before a **per-row** call
+  — so unless `batched_attn_lane` (FlashMLA's own batched decode kernels,
+  already A/B-killed as a hypothesis in an earlier round) is active, this
+  kernel is launched once per row, serialized on `ctx.stream`, never
+  concurrently with itself. Included anyway (cheap, additive filter) but
+  structurally can't have an intra-launch race under the non-FlashMLA fallback.
+
+**Repro under instrumentation.** TP=4 hit a wall first: compute-sanitizer's
+own device-memory overhead OOM'd model load (`DSv4 grouped weight alloc
+failed`) — the **unsanitized** boot already runs at ~98% VRAM (`used
+95561MB free 1947MB` after all slots, per a prior round's log), so ANY
+added overhead breaks it. `--force-synchronization-limit 1` (trades
+perf for lower tool memory — "reduces tool's device memory at the cost of
+performance" per `--help`) fixed it; booted clean at `used 95595MB` across
+GPUs 2/3/4/5. (Aside, addressing a mid-task steer: TP=1 on a single GPU was
+tried first as a simpler alternative since TP/NCCL is orthogonal to an
+intra-kernel batched-row race — but this checkpoint is 274GB on disk vs.
+97GB/card, confirmed OOM at the identical `grouped weight alloc` step even
+unsanitized; TP=4 is the real minimum shard for this model on H20.)
+
+Confirmed the sanitizer library (`libsanitizer-public.so`) was mapped into
+all 4 forked rank-worker PIDs (not just the coordinator) via `/proc/<pid>/maps`,
+and that all 4 shared one inherited log fd (`/proc/<pid>/fd/3` →
+`racecheck_<label>_<coordinator-pid>.out`) — the single-file-per-run output
+is expected (fork before exec inherits the fd), not evidence of missed
+coverage.
+
+**Results** (`concurrent_needle_v3.py`, n=4, len=2000, `max_tokens=16`,
+GPUs 2/3/4/5):
+
+| Tool | Trials | Corrupted / total | Output |
+|---|---|---|---|
+| `racecheck` | 6 | 9/24 (37.5%) | Clean — only the `========= COMPUTE-SANITIZER` header, zero hazards, across all 6 trials |
+| `synccheck` | 3 | 3/12 (25%) | Clean — same header-only result |
+| `memcheck` (bonus) | 3 | 7/12 (58%, likely timing-shifted by ~3x heavier instrumentation — 105-126s/trial vs. 33-43s for racecheck/synccheck) | Clean w.r.t. the 3 target kernels — only 4x benign `CUDA_ERROR_INVALID_VALUE` on `cuCtxGetLimit` inside `cublasLtCreate` (a known harmless cuBLASLt/sanitizer init interaction, unrelated to DSv4) |
+
+The corruption signature reproduced under every tool pass (the digit-4-onward
+truncation/substitution bucket), so these are not "didn't trigger" clean
+results — the bug fired repeatedly while instrumented, and none of the three
+tools flagged anything in the targeted kernels.
+
+**memcheck scope caveat (why this bonus check is weaker evidence than it
+looks):** `radix_topk`'s un-bounded-checked write (`dsv4_dsa_official.cu:613`,
+`output[pos] = idx` with `pos` from `atomicAdd(&s_counter,...)`, no `pos <
+topk` guard in the `bin > threshold_bin` branch) was the motivating hypothesis
+for adding memcheck — if a row's radix select ever counts more than `topk`
+items above threshold, `pos` could exceed the row's own slice and spill into
+the **next row's** region of `page_indices`. Memcheck did NOT flag this, but
+memcheck only detects accesses **outside the whole `cudaMalloc`'d allocation**
+— if `page_indices` is one contiguous `[n, output_stride]` buffer (likely,
+matching the pattern of every other batched buffer in this file), a row
+spilling into its NEIGHBOR's slice is still "in bounds" of the parent
+allocation and structurally invisible to memcheck. This hypothesis is
+**not ruled out** by this round; it needs either a source-level bound check
+(read `radix_topk`'s round-3 exact-count invariant) or a deliberately
+undersized/padded per-row allocation to make memcheck's boundary meaningful.
+
+**Verdict: intra-kernel (cross-thread-block) race KILLED for the two
+genuinely-batched kernels** (`dsv4_compressor_update_batched_kernel`,
+`deepseek_v4_topk_transform_kernel`) — racecheck is purpose-built for exactly
+this hazard class and stayed silent across 9 corrupted repros. Combined with
+the prior round's `CUDA_LAUNCH_BLOCKING=1` result (host-launch-ordering ruled
+out) and the single-engine-thread architecture (host-thread races ruled out),
+**every race-class explanation this investigation can name is now closed**.
+What's left, per this doc's own framing from the prior round: (a) a
+cross-kernel memory-visibility gap (a missing fence/sync assumption between
+two kernels on the same stream — CUDA's same-stream ordering guarantees
+sequencing but not by itself a memory-consistency issue class racecheck
+doesn't check inter-launch, only intra-launch), (b) the unbounded
+`radix_topk` write spilling cross-row within one allocation (memcheck-blind
+per above, not yet source-verified against the actual round-3 count
+invariant), or (c) a genuine data/routing-dependent numerical edge case
+(the FP8 MoE path, not re-examined this round). None of these three is a
+"race" in the sense compute-sanitizer's two race-specific tools can catch —
+next step is source-level (not tooling), reading `radix_topk`'s exact
+round-3 termination guarantee against `topk`.
+
 ## Rule
 
 Concurrent DSv4 serving (n>=3, prompt length >~100-250 tokens) has a real,
@@ -505,3 +606,25 @@ timing varied 4x across trials with zero effect on when the corruption
 fired). Next: separate content-relative position from absolute-KV-depth
 with a second differently-lengthed tracked prompt — the two are
 confounded when every trial reuses the same fixed prompt.
+
+**`compute-sanitizer --tool racecheck`/`synccheck` only cover intra-kernel
+(cross-thread-block) hazards — verify a kernel is genuinely `<<<n,BLOCK>>>`-
+batched-in-one-launch (grep the `<<<...>>>` call site, not just "looks
+batched from its name") before spending a GPU-memory-constrained pass on it**;
+one of this round's three priority kernels turned out to be launched once
+per row in a host loop (serialized by same-stream ordering), making an
+intra-launch race structurally impossible there regardless of tool output.
+**A production model already near 98% VRAM (near-zero headroom even
+unsanitized) will OOM under any sanitizer tool's overhead** —
+`--force-synchronization-limit 1` (trade perf for lower tool memory) is the
+first lever to reach for, before concluding TP needs to go up (which only
+helps because it reduces per-GPU weight-shard size, not because TP/NCCL has
+anything to do with the race hypothesis itself — same lesson as the
+`CUDA_LAUNCH_BLOCKING` GPU-launch-vs-host-thread distinction: know exactly
+which layer a mitigation operates on before reaching for it).
+**Memcheck/racecheck are allocation-boundary-scoped, not layout-scoped** — a
+kernel writing past its own logical slice into a NEIGHBOR's region within the
+SAME parent allocation is invisible to both tools; an un-bounded-checked
+`atomicAdd`-then-index write (`radix_topk`'s `output[pos]`, no `pos < topk`
+guard on one branch) needs a source-level invariant check, not a sanitizer
+pass, to rule in or out.
