@@ -1,0 +1,21 @@
+docs/plans/2026-07-07-agentic-opd-tbench-optimization.md
+  s_92bdc8f4baebc7::t_0fba5ac2bb3023 56,61-65
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "72de6818f4666fa758c4505c70f30d1292c79b19",
+  "prompts": {},
+  "sessions": {
+    "s_92bdc8f4baebc7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-afc755777304129ee",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
