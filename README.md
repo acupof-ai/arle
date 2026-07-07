@@ -67,13 +67,13 @@ Build from source, full install matrix, uninstall: [docs/install.md](docs/instal
 
 | Command | What it does |
 |---|---|
-| `arle` (no args) | Picks a model, serves it locally, and hands the session to the [Eli](https://github.com/cklxx/eli) agent framework against it — or the built-in `python`/`shell` REPL if Eli isn't installed. `--agent arle` forces the REPL; `--gateway` runs Eli's serve mode. Remembers the choice (defaults to Eli next run). |
+| `arle` (no args) | Picks a model, serves it, hands the session to the [Eli](https://github.com/cklxx/eli) agent — or a built-in `python`/`shell` REPL if Eli's absent. `--agent arle` forces the REPL; `--gateway` runs Eli's serve mode. |
 | `arle run --prompt "…"` | One-shot agent prompt. `--no-tools` to disable tools. |
 | `arle serve --backend …` | OpenAI-compatible HTTP server. |
 | `arle train opd` | **On-Policy Distillation** — teacher on the serving runtime, student in `train`. [Manual](docs/projects/2026-05-21-arle-opd-cuda-usage-manual.md). |
 | `arle --doctor [--json]` | Backend / hardware / model-resolution self-check. |
 
-<sub><b>Eli is an optional runtime dependency</b> — discovered via <code>$ELI_BIN</code>, <code>PATH</code>, or a sibling <code>../eli</code> build; never a Cargo build-dep. Install it for the full agent runtime (governed self-evolution, gateway channels); without it <code>arle</code> uses its own REPL. arle points Eli at the local server through Eli's keyless <code>local</code> provider, leaving <code>~/.eli/config.toml</code> untouched.</sub>
+<sub><b>Eli is an optional runtime dependency</b> — found via <code>$ELI_BIN</code>, <code>PATH</code>, or a sibling <code>../eli</code> build, never a Cargo dep. Without it <code>arle</code> uses its own REPL; with it, arle drives Eli through its keyless <code>local</code> provider, leaving <code>~/.eli/config.toml</code> untouched.</sub>
 
 ---
 
@@ -120,7 +120,7 @@ Agent and RL workloads waste compute re-processing the same prompt + history + t
 
 - **KV stays hot across turns.** Prior-turn KV stays on GPU so only new tokens prefill; prefix pages are shared across requests via the host radix cache, demote to a host-RAM tier under pressure (opt-in disk spill), and promote back on the next hit instead of re-prefilling. ([support-matrix §4b](docs/support-matrix.md#4b-multi-turn-kv-reuse--tiered-kv-matrix))
 - **Quantized KV on CUDA.** INT8/FP8/INT4 paged-KV kernels behind a `--kv-cache-dtype` serve flag — correctness-gated, opt-in (default stays BF16).
-- **KV-recall = long-context memory (Metal, opt-in).** When a session outgrows the window, decode attends only `sink + recent + top-k recalled` older blocks (scored by mean-key relevance to the current query) instead of the whole history. On Qwen3.6-35B a mid-context passkey resolves at **9.6% of the KV, identical to full attention** — where plain sliding-window truncation forgets it ([note](docs/notes/2026-06-23-kv-as-infinite-memory.md)). Behind `--kv-recall` (bf16, default off); the recall mechanism is live (compute-saving), L3 tier offload for the flat-VRAM-vs-history win is in progress.
+- **KV-recall = long-context memory (Metal, opt-in).** Past the window, decode attends only `sink + recent + top-k recalled` older blocks (scored by key relevance), not the whole history. On Qwen3.6-35B a mid-context passkey resolves at **9.6% of the KV, identical to full attention** — where sliding-window truncation forgets it ([note](docs/notes/2026-06-23-kv-as-infinite-memory.md)). Behind `--kv-recall` (default off).
 - **One runtime, three surfaces.** Serving, the local agent, and OPD training run the same Rust + model code — the OPD teacher *is* the production server.
 
 ```mermaid
