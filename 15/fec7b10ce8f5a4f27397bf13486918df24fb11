@@ -1,0 +1,27 @@
+crates/cli/src/args.rs
+  s_cef8c2b40f258d::t_9218987c5501f5 205-214,1693-1717
+crates/cli/src/train_cli.rs
+  s_cef8c2b40f258d::t_c81fe1ea349207 2078-2079,2083-2084,2133-2145,2156-2162,2170-2212
+crates/train/src/opd.rs
+  s_cef8c2b40f258d::t_ffa06153b71d7d 56-58,3389-3601
+docs/experience/errors/2026-07-07-dsv4-alloc-removal-sweep-wall-wash.md
+  s_cef8c2b40f258d::t_623e22a9eaf366 1-56
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "15fec7b10ce8f5a4f27397bf13486918df24fb11",
+  "prompts": {},
+  "sessions": {
+    "s_cef8c2b40f258d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a93a2dd3a5c77620e",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
