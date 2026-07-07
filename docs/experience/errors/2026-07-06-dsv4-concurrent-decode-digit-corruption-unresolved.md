@@ -3005,3 +3005,157 @@ deterministic repeat-restore signature specifically.
 
 No code changed this round (source-read-only, local tree only — no pod tree
 touched, no GPU time spent). `git diff` clean.
+
+## Layer-16 structural fact + bit-level input-tensor trace — decisive new localization: layer 16's OWN compressor/indexer state is bit-identical fresh-vs-restored; the divergence is already present in the residual stream arriving at layer 16 (2026-07-08)
+
+Executes the prior round's own named next step ("a genuinely new
+instrumentation target... per-tensor bit-level comparison of the ACTUAL INPUT
+to layer 16's first kernel between a live and a restored slot").
+
+**Step 1 — structural fact.** Live pod checkpoint
+`/host/DeepSeek-V4-Flash-FP8/config.json`'s `compress_ratios[16] = 4` (0-indexed;
+full array: `[0,0,4,128,4,128,...,4,128,4,0]`, 43 entries). Per
+`DeepSeekV4AttentionMode::from_compress_ratio`
+(`crates/deepseek-spec/src/v4.rs:490-496`, `1..=15 => CompressedSparse`), layer
+16 is `CompressedSparse` (CSA) — `has_compressor() && has_indexer()` both true.
+Confirms layer 16 sits squarely in the mid-stack CSA/DSA-indexer territory this
+doc's Logit-lens round already flagged qualitatively; no surprise, but now a
+verified fact rather than an assumption.
+
+**Step 2 — instrumentation.** Two complementary env-gated traces
+(`ARLE_DSV4_LAYER16_INPUT_TRACE=1`), reverted after use:
+1. `crates/infer-cuda/src/attention.rs`, `mla_attention_decode_graph` (the
+   ONE call site the SOLO n=1 / MODEL1-decode path actually uses for layer 16 —
+   **not** the batched `mla_attention_compressor_defer_row` full-flatten lane,
+   which only the n≥2 path exercises). Right before each of the two
+   `compressor_forward_decode_graph` calls (main compressor, DSA indexer),
+   D2H's the persistent `Dsv4CompressorState` via the already-proven-correct
+   `Dsv4CompressorImage::capture` (the idempotency round's own snapshot type)
+   and hashes `pending_kv`/`pending_score`/`prev_overlap_kv`/
+   `prev_overlap_score`/`compressed_data`/`compressed_seq_len` bit-for-bit
+   (`DefaultHasher` over every `f32`/`bf16`'s raw bits, not a sum/argmax —
+   the substage-diff round's own lesson that coarse fingerprints miss small
+   drifts).
+2. `crates/infer-cuda/src/dsv4.rs`, `forward_tokens_stream_impl`'s per-layer
+   loop, immediately after `normed` (the RMSNorm'd residual-stream input to
+   attention) is computed — an FNV-1a hash over the full `[hidden_size]`
+   bf16 tensor's raw bits, rank-0-gated. This is the tensor arriving AT layer
+   16, upstream of either compressor/indexer call.
+
+Also reused the pod's own pre-staged `boot_layer16_trace.sh` (left over from
+an interrupted prior session, matching this round's exact plan — same TP=4
+GPUs 2/3/4/5 config, same `trace_probe.py` solo-repeat harness, 8 reps) and
+`executor.rs`'s existing `LAYER16_INPUT_TRACE_RESTORE` marker in
+`restore_cached_prefix` to confirm restore boundaries independently.
+
+**Run.** `scripts/pod.sh build` (`BUILD_EXIT=0`, 54s incremental), booted TP=4
+(GPUs 2/3/4/5, all 8 GPUs free at boot time), `trace_probe.py` solo (n=1),
+8 sequential reps of the byte-identical TRACKED prompt (len=500 config, prompt
+456 tokens). **Reproduced the established signature exactly**: call 1
+(`'The secret access code is 738291.'`, correct) then calls 2-8 (7/7)
+byte-identical `'...738292.'` (wrong) — matching every prior round's own
+`17979→18307` substitution. 7 `LAYER16_INPUT_TRACE_RESTORE` lines (calls 2-8),
+0 for call 1 — confirms call 1 is genuinely live/fresh, calls 2-8 genuinely
+restored.
+
+**Result 1 — layer 16's OWN compressor+indexer state: bit-identical, 100%,
+fresh vs. restored.** Every `LAYER16_INPUT_TRACE kind={main,indexer}
+start_pos=456` line (32 = 8 reps × 4 TP-rank-redundant executors, for EACH
+kind) carries the exact SAME hash — `0x4a80afc9e57a0c22` (main) /
+`0x6aa5419e5da21ac1` (indexer) — with **zero exceptions across all 8 reps**,
+including the correct rep 1 and all 7 corrupted reps 2-8. The persistent
+compressor/indexer ring-buffer state consumed by layer 16's own update kernel
+at the first decode step is bit-for-bit identical whether it was
+live-computed (rep 1) or D2H/H2D round-tripped through a prefix-cache restore
+(reps 2-8).
+
+**Result 2 — the residual-stream INPUT arriving at layer 16 already differs,
+deterministically, before either compressor/indexer call runs.** The `normed`
+hash trajectory at positions 456-465 (rep 1 vs. reps 2-8):
+
+| pos | rep 1 (fresh, correct) | reps 2-8 (restored, corrupted — IDENTICAL across all 7) |
+|---|---|---|
+| 456 | `2106d61d9c5e0756` | `10191eb7930547ec` |
+| 457 | `aae7fa2c8ccace13` | `1fcba621fb14b10e` |
+| 458 | `7a0309d9c62cded2` | `e1574d397d54091f` |
+| 459 | `e76e7b0c80aa2602` | `46e3ff6cf848c89e` |
+| 460 | `f549fd0154f987e3` | `733830c354505db0` |
+| 461 | `f3e4abc740da74b4` | `49040240234fe686` |
+| 462 | `e22499dc912305e7` | `c7fa180374b14182` |
+| 463 | `3ec4e696e7d28efe` | `ac79805029623488` |
+| 464 | `14454b9ee2b317a4` | `51ee3df7ae38e147` |
+
+Rep 1 is unique at every position (as expected — it's the only fresh-live
+trajectory). Reps 2-8 (7 independent restore events, 7 independent decode
+runs) agree with each other **exactly** at every position, 100% — not noise,
+not a rare tie, a fully deterministic alternate trajectory. And that
+trajectory **differs from rep 1's own** at every position from the very first
+decode step (456) onward, well before the eventual wrong-digit output token.
+
+**Verdict: localizes the divergence to strictly BEFORE layer 16, and
+positively clears layer 16's own persistent state as a candidate — a sharper
+result than the pre-#8 Logit-lens round's top-1-argmax comparison, which
+could only see layers 0-15 as "bit-identical" because an argmax over the
+LM-head projection collapses small real differences to the same discretized
+token.** This full-precision hash of the actual 4096-dim tensor proves a real,
+deterministic numeric difference already exists in the residual stream by the
+time it reaches layer 16 — meaning the mechanism lives in one (or more) of
+layers 0-15's own restore path, not in layer 16's compressor/indexer
+consumption specifically. Combined with the idempotency round's proof that
+every layer's OWN stored `Image` bytes round-trip clean, this narrows the
+open question to precisely the gap flagged as guess #3 last round: something
+about the FIRST compute step consuming a restored layer's state (0-15, not
+just 16) produces a different — but fully deterministic, not random — result
+than the same computation would produce on a slot that was never captured/
+restored at all. The determinism (7/7 restores agreeing exactly) is itself a
+clue: this reads as a fixed, reproducible discrepancy (e.g. a derived value
+computed differently post-restore vs. post-live-prefill, or a deterministic
+allocator/memory-reuse pattern), not a race or floating-point-order artifact.
+
+**What this round does NOT establish (honest scope limit).** Which of the 16
+upstream layers (or which specific buffer/derived-value within them) is the
+actual source was not bisected this round — the brief's Step 2 asked
+specifically for the layer-16 input-tensor comparison, which is now answered
+decisively. A natural, cheap follow-up (not run this round, scope discipline)
+would repeat this exact `normed`-hash trace at an early layer (e.g. layer 0
+or 1) to see whether the divergence is present from the very first layer
+(implicating the token embedding / initial residual-stream construction
+itself, or slot-level bookkeeping like `start_pos_device`) or only appears
+partway through the stack (implicating a specific layer's own
+compressor/indexer/sw_window/FlashMLA restore) — a binary-search bisection
+across layers 0-15 using the identical hash technique validated here.
+
+**Step 3 (same-slot-vs-different-slot A/B) — not attempted this round.**
+Per the task's own sequencing, out of scope once Steps 1-2 produced a
+decisive, actionable result; the natural next move is the layer-0-15
+bisection above, not Step 3, since Step 2 already shows the mechanism is
+restore-path-general (not layer-16-specific) — a different-slot A/B would
+answer "does it need to be the SAME slot" but not "which of layers 0-15 is
+the source," which is now the sharper open question.
+
+**Cleanup.** Both instrumentation additions (`crates/infer-cuda/src/attention.rs`'s
+`dsv4_layer16_input_trace` + two call sites in `mla_attention_decode_graph`,
+`crates/infer-cuda/src/dsv4.rs`'s `dsv4_layer16_input_trace` + one call site in
+`forward_tokens_stream_impl`) reverted after use — `git diff` clean on both
+local and pod trees (pod tree required an explicit `git checkout --`, since
+`scripts/pod.sh sync`'s no-arg form only resets to the local HEAD commit, it
+does not discard a pushed working-tree modification of an already-current
+commit). `executor.rs`'s pre-existing `LAYER16_INPUT_TRACE_RESTORE` marker
+(reused, not newly added) was also reverted with the same command. Pod-side
+scratch harnesses/logs (`boot_layer16_trace.sh`, `serve_l16run1.log`, etc.)
+left in place, untracked, per this doc's established convention.
+
+**Status — genuinely open, but the open question is now sharper.** Every
+CUDA-level mechanism this investigation has named across ten-plus rounds
+(races/fences, arithmetic batch-invariance, field completeness, capture/
+restore byte-fidelity, and now layer 16's own state bit-fidelity) is closed.
+What remains is concretely scoped for the first time: a deterministic,
+restore-path-specific numeric discrepancy that originates somewhere in layers
+0-15's own restore, invisible to a top-1 logit-lens, invisible to a
+field-presence byte-diff, but visible to a full-precision tensor hash. Best-
+supported guess (explicitly a guess, not a finding): the same class of gap
+the enumeration audit already found once for `flashmla_set_band_cursor` (a
+value derived from, but not stored inside, an `Image` struct) likely exists
+at an EARLIER layer too and hasn't been checked — the layer-0-15 hash
+bisection above is the concrete, cheap (one build + one boot + one 8-rep
+sweep, ~10 minutes total per this round's own timing) next step to find it.
