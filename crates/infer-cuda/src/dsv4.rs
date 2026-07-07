@@ -4024,19 +4024,37 @@ impl Dsv4Model {
                 // unconditional path (75.9s vs 73.8s mean, well within
                 // trial-to-trial noise — see
                 // docs/experience/wins/2026-07-06-dsv4-deepep-waterfill-pending-remote.md).
-                let mut shared = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
-                crate::moe::dsv4_shared_expert_forward(
+                // Reuse the model-wide shared-expert output + FP8 scratch held on
+                // the kv_adapter (#29) instead of a per-layer `uninit` + fresh
+                // `dsv4_shared_expert` temporaries — batched decode was the last
+                // path still allocating these every layer (launch-bound Step 1).
+                // Same kernel sequence as the eager/verify template
+                // (dsv4.rs:5440), byte-identical math, pooled provenance only.
+                let (shared_out, shared_scratch) = kv_adapter.shared_expert_decode_mut();
+                let shared = shared_out.ok_or_else(|| {
+                    anyhow!("DSv4 batched decode requires shared-expert output buffer")
+                })?;
+                let scratch = shared_scratch.ok_or_else(|| {
+                    anyhow!("DSv4 batched decode requires shared-expert scratch")
+                })?;
+                shared.seq_len = seq_len; // rows ≤ MAX_SPEC_VERIFY_ROWS ≤ max_m
+                ensure!(
+                    shared.hidden_dim == hidden_size,
+                    "DSv4 batched shared out hidden {} != {}",
+                    shared.hidden_dim,
+                    hidden_size
+                );
+                crate::moe::dsv4_shared_expert_forward_decode_scratch(
                     &self.ctx,
                     &self.ctx.stream,
                     layer.moe.as_ref().expect("DSv4 layer.moe"),
                     &normed,
-                    &mut shared,
+                    shared,
                     self.config.swiglu_limit,
-                    &mut keepalive,
+                    scratch,
                 )?;
-                keepalive.keep_hidden(&shared);
                 // SAFETY: add_batch writes the full [seq_len, hidden_size] buffer.
-                crate::ops::add_batch(&self.ctx, &moe_out, &shared, &mut moe_with_shared)?;
+                crate::ops::add_batch(&self.ctx, &moe_out, shared, &mut moe_with_shared)?;
                 keepalive.keep_hidden(&moe_with_shared);
             }
             // SAFETY: hc_post / add_batch writes the full stream buffer.
