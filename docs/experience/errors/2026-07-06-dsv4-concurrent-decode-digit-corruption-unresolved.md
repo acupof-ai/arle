@@ -569,6 +569,74 @@ invariant), or (c) a genuine data/routing-dependent numerical edge case
 next step is source-level (not tooling), reading `radix_topk`'s exact
 round-3 termination guarantee against `topk`.
 
+## Needle-content type A/B — NUMERIC needle drives the corruption, TEXT needle near-immune (2026-07-07)
+
+Discriminating test between "near-tie-sensitivity" (a numeric answer is more
+likely to have a close second-place logit candidate than a word completion,
+making it sensitive to tiny batched-vs-solo numerical noise) vs.
+"needle-content-independent" (the bug fires at a similar rate regardless of
+what's being recalled).
+
+**Setup — single-variable change.** New harness `concurrent_needle_text.py`
+(mirrors `concurrent_needle_v3.py` byte-for-byte except `NEEDLE`/`PRE`/`CUE`):
+swapped the numeric needle `"738291"` (tokenizes `['738','291']`, 2 tokens) for
+the word `"CASTLE"` (tokenizes `['CAST','LE']`, also 2 tokens — same
+prefix-token + completion-token + `.` shape, so the corrupted step's *position*
+in the generation is structurally comparable). One server boot, one config
+(matches `job2_ab.sh`'s default arm: `ARLE_DSV4_MOE_BACKEND=allreduce`,
+`ARLE_DSV4_INCREMENTAL_KV=1`, `ARLE_DSV4_EXPERT_BACKEND=deepgemm`,
+`--max-total-tokens 2048`; only the GPU set differs — 3/4/5/7 instead of
+2/3/4/5, since GPUs 1/2 were occupied by another user's Qwen3.6 servers this
+session), n=4, len=500, both needle sweeps run back-to-back against the same
+running server. SOLO (n=1) sanity checked first for both needles — 3/3 exact
+each, clean baseline, no hedging/commentary behavior in any solo response.
+
+**Result (n=4, len=500, 15 reps = 60 requests/arm):**
+
+| Needle | Exact | Miss | Miss rate | Truncation-class | Corruption-class (wrong final token) |
+|---|---|---|---|---|---|
+| Numeric (`738291`) | 26/60 | 34/60 | 56.7% | 32/60 (53.3%) | 2/60 (3.3%) — both `738292`, the exact same `17979`→`18307` substitution as the prior token-trace round |
+| Text (`CASTLE`) | 59/60 | 1/60 | 1.7% | 1/60 (1.7%, `'CAST'` — dropped the final `LE` token) | 0/60 (0%) |
+
+A 33x gap in overall miss rate, and **zero** wrong-token substitutions on the
+text needle across 60 requests vs. 2 on the numeric needle in the same boot.
+Full log: every numeric truncation is preceded by a hedging/meta-commentary
+fragment absent from every solo numeric response and every text response —
+`'The secret access code is 7382. (Note: The repeated text in'`, `'...**738**.
+(The full code was stated as '` — the model starts qualifying its answer
+instead of committing to it, then runs out of the fixed 16-token budget before
+finishing the digits. This hedging never appears in any of the 60 text-needle
+outputs or any of the 6 solo-needle sanity responses (both needle types),
+which localizes it to the (n>=3, numeric-needle) joint condition, not a
+general model quirk.
+
+**Implication for the near-tie-sensitivity hypothesis: SUPPORTED for the
+truncation-class failure (the majority mode, 53.3% vs 1.7%), and directionally
+consistent (not separately decisive at n=2 events) for the true digit-
+substitution class (3.3% vs 0%, matching the historical ~3-12% absolute
+corruption rate from other rounds — this pass's elevated *overall* miss rate
+is plausibly page/box contention from the two unrelated Qwen3.6 servers
+sharing the node this session, but that confound applies equally to both arms
+of this same-boot A/B and doesn't explain the needle-content gap).** The
+numeric needle is not just "sometimes flips a digit" — under concurrent
+batching it also measurably increases the model's tendency to hedge/qualify
+its answer (something-drifts-then-the-model-notices-and-backpedals), which is
+itself consistent with an upstream score (DSA indexer or MoE router top-k)
+being subtly perturbed by batching in a way that specifically destabilizes
+close-call numeric-token decisions while leaving a word completion's dominant,
+non-tied candidate untouched. Does not by itself distinguish DSA-indexer vs.
+MoE-router as the perturbed subsystem (out of scope this pass — diagnostic
+only, no fix attempted).
+
+**Caveat.** n=2 true wrong-token-substitution events is a small sample to rest
+the whole hypothesis on in isolation; the truncation-class result (53.3% vs
+1.7%, n=34 vs n=1) is the statistically solid half of this result. A future
+pass could raise the numeric corruption event count (more reps, or the
+fixed-tracked-prompt trace harness) to tighten the corruption-class-specific
+comparison, and/or run a second text needle word to rule out `CASTLE`-specific
+idiosyncrasy — not done this pass (one clean single-variable result was the
+information-budget target).
+
 ## Rule
 
 Concurrent DSv4 serving (n>=3, prompt length >~100-250 tokens) has a real,
@@ -628,3 +696,14 @@ SAME parent allocation is invisible to both tools; an un-bounded-checked
 `atomicAdd`-then-index write (`radix_topk`'s `output[pos]`, no `pos < topk`
 guard on one branch) needs a source-level invariant check, not a sanitizer
 pass, to rule in or out.
+
+**Needle CONTENT type is not a free confound — swap it as its own controlled
+variable before trusting an aggregate rate across investigation rounds.** A
+same-boot, same-config A/B (numeric `738291` vs. word `CASTLE`, same n=4/
+len=500/60-request sample) showed a 33x miss-rate gap (56.7% vs 1.7%) and zero
+wrong-token substitutions on the text needle vs. two on the numeric — the
+defect is real but strongly needle-content-dependent, consistent with a
+near-tie/close-competing-candidate sensitivity (digit sequences have plausible
+near-tied next-token competitors; a common word's completion doesn't). Any
+future rate comparison across rounds that changed the needle string alongside
+other variables should be re-read with this in mind.
