@@ -1,0 +1,21 @@
+scripts/gen_terminal_tasks.py
+  s_b7c54ef9873087::t_4650a0bd7687f9 50,536-932,937-938
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "fbe6cc693ae620bbd0b4b2f3026af703b12a4d0f",
+  "prompts": {},
+  "sessions": {
+    "s_b7c54ef9873087": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aba702426a48070e7",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
