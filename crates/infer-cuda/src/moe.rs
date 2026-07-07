@@ -2017,6 +2017,128 @@ mod dsv4_gpu {
         masked_m: CudaSlice<i32>,
     }
 
+    /// Model-wide reusable scratch for the compact FP8 decode-band MoE tail
+    /// (`dsv4_moe_forward_decode_fp8`). Sized to the band's hard route ceiling
+    /// (`DSV4_DECODE_CONTIG_MAX_ROUTES = 128`) so one instance serves every layer
+    /// and step — layers run sequentially, one forward at a time, serial on
+    /// `ctx.stream`, so no concurrent aliasing (same discipline as the shared /
+    /// flashmla scratch). Replaces the ~8 per-layer allocs on the launch-bound
+    /// batched decode path. Six buffers are pure-output (writer fully overwrites
+    /// the rows it later reads); four need per-step re-init before dispatch:
+    /// `counts`/`cursors`/`route_out` → 0, `packed_route_slot` → -1 (the scatter
+    /// sentinel that keeps `packed_weight`/`expert_out` pure-output).
+    pub(crate) struct Dsv4MoeTailScratch {
+        max_rows: usize,
+        experts_per_rank: usize,
+        counts: CudaSlice<i32>,
+        offsets: CudaSlice<i32>,
+        scan_total: CudaSlice<i32>,
+        cursors: CudaSlice<i32>,
+        packed_hidden: HiddenStates,
+        packed_route_slot: CudaSlice<i32>,
+        packed_weight: CudaSlice<f32>,
+        act: HiddenStates,
+        expert_out: HiddenStates,
+        route_out: HiddenStates,
+    }
+
+    impl Dsv4MoeTailScratch {
+        pub(crate) fn new(
+            ctx: &DeviceContext,
+            hidden_dim: usize,
+            intermediate: usize,
+            experts_per_rank: usize,
+        ) -> Result<Self> {
+            let max_rows = DSV4_DECODE_CONTIG_MAX_ROUTES;
+            Ok(Self {
+                max_rows,
+                experts_per_rank,
+                counts: ctx.stream.alloc_zeros::<i32>(experts_per_rank)?,
+                offsets: ctx.stream.alloc_zeros::<i32>(experts_per_rank)?,
+                scan_total: ctx.stream.alloc_zeros::<i32>(1)?,
+                cursors: ctx.stream.alloc_zeros::<i32>(experts_per_rank)?,
+                packed_hidden: HiddenStates::zeros(ctx, hidden_dim, max_rows)?,
+                packed_route_slot: alloc_neg1_i32(ctx, max_rows)?,
+                packed_weight: ctx.stream.alloc_zeros::<f32>(max_rows)?,
+                act: HiddenStates::zeros(ctx, intermediate, max_rows)?,
+                expert_out: HiddenStates::zeros(ctx, hidden_dim, max_rows)?,
+                route_out: HiddenStates::zeros(ctx, hidden_dim, max_rows)?,
+            })
+        }
+
+        pub(crate) fn device_bytes(
+            hidden_dim: usize,
+            intermediate: usize,
+            experts_per_rank: usize,
+        ) -> usize {
+            let max_rows = DSV4_DECODE_CONTIG_MAX_ROUTES;
+            let i32b = |n: usize| n * std::mem::size_of::<i32>();
+            let f32b = |n: usize| n * std::mem::size_of::<f32>();
+            let bf16 = |h: usize, s: usize| h * s * std::mem::size_of::<half::bf16>();
+            i32b(experts_per_rank) * 3
+                + i32b(1)
+                + bf16(hidden_dim, max_rows) * 3
+                + i32b(max_rows)
+                + f32b(max_rows)
+                + bf16(intermediate, max_rows)
+        }
+
+        /// Re-init the four non-pure-output buffers before a decode dispatch:
+        /// `counts`/`cursors`/`route_out` → 0, `packed_route_slot` → -1. The
+        /// other six are fully overwritten by their writers this step.
+        fn reinit(&mut self, ctx: &DeviceContext, rows: usize) -> Result<()> {
+            use cudarc::driver::DevicePtrMut;
+            ensure!(
+                rows <= self.max_rows,
+                "DSv4 MoE tail scratch rows {rows} > max_rows {}",
+                self.max_rows
+            );
+            let zero_i32 = |buf: &mut CudaSlice<i32>, n: usize| -> Result<()> {
+                let (ptr, _g) = buf.device_ptr_mut(&ctx.stream);
+                // SAFETY: live device alloc of >= n i32 on this stream.
+                unsafe {
+                    cudarc::driver::result::memset_d8_async(
+                        ptr,
+                        0x00,
+                        n * std::mem::size_of::<i32>(),
+                        ctx.stream.cu_stream(),
+                    )?;
+                }
+                Ok(())
+            };
+            zero_i32(&mut self.counts, self.experts_per_rank)?;
+            zero_i32(&mut self.cursors, self.experts_per_rank)?;
+            // route_out is bf16 [hidden_dim, rows]; zero the live [0, rows) span.
+            {
+                let hidden_dim = self.route_out.hidden_dim;
+                let (ptr, _g) = self.route_out.data.device_ptr_mut(&ctx.stream);
+                // SAFETY: live device alloc of hidden_dim*max_rows bf16 on this stream.
+                unsafe {
+                    cudarc::driver::result::memset_d8_async(
+                        ptr,
+                        0x00,
+                        hidden_dim * rows * std::mem::size_of::<half::bf16>(),
+                        ctx.stream.cu_stream(),
+                    )?;
+                }
+            }
+            // packed_route_slot → -1 (0xFF bytes) over the live [0, rows) span.
+            {
+                let (ptr, _g) = self.packed_route_slot.device_ptr_mut(&ctx.stream);
+                // SAFETY: live device alloc of >= rows i32 on this stream.
+                unsafe {
+                    cudarc::driver::result::memset_d8_async(
+                        ptr,
+                        0xFF,
+                        rows * std::mem::size_of::<i32>(),
+                        ctx.stream.cu_stream(),
+                    )?;
+                }
+            }
+            Ok(())
+        }
+    }
+
     impl Dsv4MoeDecodeScratch {
         pub(crate) fn new(
             ctx: &DeviceContext,
@@ -2732,6 +2854,7 @@ mod dsv4_gpu {
         hidden: &HiddenStates,
         out: &mut HiddenStates,
         keepalive: &mut Dsv4ForwardKeepalive,
+        tail: Option<&mut Dsv4MoeTailScratch>,
     ) -> Result<()> {
         let ctx = &model.ctx;
         let cfg = &model.moe_config;
@@ -2792,6 +2915,7 @@ mod dsv4_gpu {
             hidden,
             out,
             keepalive,
+            tail,
         )
     }
 
@@ -2925,7 +3049,8 @@ mod dsv4_gpu {
         route_weights: &CudaSlice<f32>,
         hidden: &HiddenStates,
         out: &mut HiddenStates,
-        keepalive: &mut Dsv4ForwardKeepalive,
+        _keepalive: &mut Dsv4ForwardKeepalive,
+        tail: Option<&mut Dsv4MoeTailScratch>,
     ) -> Result<()> {
         let ctx = &model.ctx;
         let cfg = &model.moe_config;
@@ -2937,27 +3062,42 @@ mod dsv4_gpu {
         let experts_per_rank = split.experts_per_rank;
         let local_start = split.local_expert_start;
         let total_routes = num_tokens * topk;
+        let rows = total_routes.max(1);
 
-        let counts = ctx
-            .stream
-            .alloc_zeros::<i32>(experts_per_rank)
-            .map_err(|e| anyhow::anyhow!("DSv4 gemv count alloc failed: {e}"))?;
-        let offsets = ctx
-            .stream
-            .alloc_zeros::<i32>(experts_per_rank)
-            .map_err(|e| anyhow::anyhow!("DSv4 gemv offset alloc failed: {e}"))?;
-        let scan_total = ctx
-            .stream
-            .alloc_zeros::<i32>(1)
-            .map_err(|e| anyhow::anyhow!("DSv4 gemv scan-total alloc failed: {e}"))?;
-        keepalive.keep_i32(&counts);
-        keepalive.keep_i32(&offsets);
-        keepalive.keep_i32(&scan_total);
+        // Reuse the model-wide tail scratch when provided (launch-bound Step 1):
+        // pre-allocated to the band ceiling, so no per-layer alloc/free churn.
+        // Fall back to a throwaway scratch (byte-identical to the old per-call
+        // allocs) when None. `reinit` re-zeros the 4 non-pure-output buffers;
+        // the throwaway path is born zero/-1 so it skips reinit.
+        let mut owned_tail;
+        let scratch: &mut Dsv4MoeTailScratch = match tail {
+            Some(s) => {
+                s.reinit(ctx, rows)?;
+                s
+            }
+            None => {
+                owned_tail = Dsv4MoeTailScratch::new(ctx, hidden_dim, i_dim, experts_per_rank)?;
+                &mut owned_tail
+            }
+        };
+        // Bind the buffers (kernels take `rows` as the explicit work bound; the
+        // scratch capacity is `max_rows >= rows`).
+        let counts = &scratch.counts;
+        let offsets = &scratch.offsets;
+        let scan_total = &scratch.scan_total;
+        let cursors = &scratch.cursors;
+        let packed_hidden = &scratch.packed_hidden;
+        let packed_route_slot = &scratch.packed_route_slot;
+        let packed_weight = &scratch.packed_weight;
+        let act = &scratch.act;
+        let expert_out = &scratch.expert_out;
+        let route_out = &scratch.route_out;
+
         // SAFETY: all buffers valid on ctx.stream for the given shapes.
         unsafe {
             moe::dsv4_count_local_experts(
                 cache_ptr(route_indices, ctx),
-                cache_ptr(&counts, ctx),
+                cache_ptr(counts, ctx),
                 num_tokens,
                 topk,
                 local_start,
@@ -2965,41 +3105,25 @@ mod dsv4_gpu {
                 ctx.stream.cu_stream(),
             )?;
             moe::dsv4_exclusive_scan_i32(
-                cache_ptr(&counts, ctx),
-                cache_ptr(&offsets, ctx),
-                cache_ptr(&scan_total, ctx),
+                cache_ptr(counts, ctx),
+                cache_ptr(offsets, ctx),
+                cache_ptr(scan_total, ctx),
                 experts_per_rank,
                 ctx.stream.cu_stream(),
             )?;
         }
 
-        // Compact pack: ≤ total_routes real rows, no pad rows at all.
-        let rows = total_routes.max(1);
-        let packed_hidden = HiddenStates::zeros(ctx, hidden_dim, rows)?;
-        let packed_route_slot = alloc_neg1_i32(ctx, rows)?;
-        let packed_weight = ctx
-            .stream
-            .alloc_zeros::<f32>(rows)
-            .map_err(|e| anyhow::anyhow!("DSv4 gemv packed_weight alloc failed: {e}"))?;
-        let cursors = ctx
-            .stream
-            .alloc_zeros::<i32>(experts_per_rank)
-            .map_err(|e| anyhow::anyhow!("DSv4 gemv cursors alloc failed: {e}"))?;
-        keepalive.keep_hidden(&packed_hidden);
-        keepalive.keep_i32(&packed_route_slot);
-        keepalive.keep_f32(&packed_weight);
-        keepalive.keep_i32(&cursors);
         // SAFETY: buffers valid on ctx.stream; shapes checked by the kernel.
         unsafe {
             moe::dsv4_pack_local_experts_with_slots(
                 cache_ptr(&hidden.data, ctx),
                 cache_ptr(route_indices, ctx),
                 cache_ptr(route_weights, ctx),
-                cache_ptr(&offsets, ctx),
-                cache_ptr(&cursors, ctx),
+                cache_ptr(offsets, ctx),
+                cache_ptr(cursors, ctx),
                 cache_ptr(&packed_hidden.data, ctx),
-                cache_ptr(&packed_route_slot, ctx),
-                cache_ptr(&packed_weight, ctx),
+                cache_ptr(packed_route_slot, ctx),
+                cache_ptr(packed_weight, ctx),
                 num_tokens,
                 hidden_dim,
                 topk,
@@ -3015,10 +3139,6 @@ mod dsv4_gpu {
         // real routed rows — no pad rows, no activation quantize. max_count =
         // total_routes is the safe host upper bound on per-expert row count
         // (kernels exit early on `chunk_base >= counts[e]`).
-        let act = HiddenStates::zeros(ctx, i_dim, rows)?;
-        let expert_out = HiddenStates::zeros(ctx, hidden_dim, rows)?;
-        keepalive.keep_hidden(&act);
-        keepalive.keep_hidden(&expert_out);
         // SAFETY: pointer tables hold experts_per_rank entries built over the
         // layer's grouped caches; packed rows are bounded by offsets+counts.
         unsafe {
@@ -3029,8 +3149,8 @@ mod dsv4_gpu {
                 cache_ptr(&tables.up_s, ctx),
                 cache_ptr(&packed_hidden.data, ctx),
                 cache_ptr(&act.data, ctx),
-                cache_ptr(&offsets, ctx),
-                cache_ptr(&counts, ctx),
+                cache_ptr(offsets, ctx),
+                cache_ptr(counts, ctx),
                 experts_per_rank,
                 rows,
                 i_dim,
@@ -3044,8 +3164,8 @@ mod dsv4_gpu {
                 cache_ptr(&tables.w2_s, ctx),
                 cache_ptr(&act.data, ctx),
                 cache_ptr(&expert_out.data, ctx),
-                cache_ptr(&offsets, ctx),
-                cache_ptr(&counts, ctx),
+                cache_ptr(offsets, ctx),
+                cache_ptr(counts, ctx),
                 experts_per_rank,
                 rows,
                 hidden_dim,
@@ -3057,15 +3177,13 @@ mod dsv4_gpu {
 
         // Scatter weighted expert outputs to route slots, combine topk —
         // identical tail to the contiguous lane.
-        let route_out = HiddenStates::zeros(ctx, hidden_dim, rows)?;
-        keepalive.keep_hidden(&route_out);
         // SAFETY: all buffers valid on ctx.stream for the given shapes.
         unsafe {
             moe::dsv4_scatter_all_route_slots(
                 cache_ptr(&expert_out.data, ctx),
                 cache_ptr(&route_out.data, ctx),
-                cache_ptr(&packed_route_slot, ctx),
-                cache_ptr(&packed_weight, ctx),
+                cache_ptr(packed_route_slot, ctx),
+                cache_ptr(packed_weight, ctx),
                 rows,
                 hidden_dim,
                 ctx.stream.cu_stream(),
@@ -3096,6 +3214,7 @@ mod dsv4_gpu {
         hidden: &HiddenStates,
         out: &mut HiddenStates,
         keepalive: &mut Dsv4ForwardKeepalive,
+        tail: Option<&mut Dsv4MoeTailScratch>,
     ) -> Result<()> {
         let ctx = &model.ctx;
         let cfg = &model.moe_config;
@@ -3129,6 +3248,7 @@ mod dsv4_gpu {
                     hidden,
                     out,
                     keepalive,
+                    tail,
                 );
             }
         }
@@ -4813,8 +4933,8 @@ mod dsv4_gpu {
 #[cfg(feature = "cuda")]
 #[allow(unused_imports)] // consumed by the Piece 2 model.rs DSv4 branch
 pub(crate) use dsv4_gpu::{
-    Dsv4GemvTables, Dsv4MoeDecodeScratch, Dsv4SharedDecodeScratch, GroupedCache,
-    build_grouped_cache, dsv4_moe_forward, dsv4_moe_forward_decode_graph,
+    Dsv4GemvTables, Dsv4MoeDecodeScratch, Dsv4MoeTailScratch, Dsv4SharedDecodeScratch,
+    GroupedCache, build_grouped_cache, dsv4_moe_forward, dsv4_moe_forward_decode_graph,
     dsv4_shared_expert_forward, dsv4_shared_expert_forward_decode_graph,
     dsv4_shared_expert_forward_decode_scratch,
 };
