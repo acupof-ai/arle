@@ -2075,9 +2075,12 @@ fn run_agent_opd_replay(
 ) -> Result<()> {
     use autograd::optim::AdamW;
     use train::{
-        opd::masked_writeback_ce_step_dispatch,
+        ema_self_teacher::EmaSelfTeacher,
+        opd::{gkd_writeback_step, masked_writeback_ce_step_dispatch},
         qwen35_loader::load_qwen35_lora_from_hf_dir_with_shared_base,
     };
+
+    use crate::args::GkdTeacherArg;
 
     let student_dir = args.student_model.as_path();
     let raw = fs::read_to_string(records_path)
@@ -2127,6 +2130,19 @@ fn run_agent_opd_replay(
     if args.grad_checkpointing {
         student.set_gradient_checkpointing(true);
     }
+    // GKD teacher (built here — immediately after the student and BEFORE any
+    // other store scratch, per EmaSelfTeacher::from_student's retain_ids contract).
+    // `ema` EMA-updates each step; `self` stays frozen at the student's initial
+    // adapter+base snapshot (never updated). Both reuse the EmaSelfTeacher
+    // machinery — the only difference is whether `update()` runs.
+    let mut gkd_teacher = if args.gkd {
+        Some(
+            EmaSelfTeacher::from_student(&student, lora, target_set, &mut store)
+                .context("build GKD EMA self-teacher")?,
+        )
+    } else {
+        None
+    };
     let all_params: Vec<TensorId> = student.all_parameter_ids();
     let trainable: Vec<TensorId> = all_params
         .iter()
@@ -2137,6 +2153,13 @@ fn run_agent_opd_replay(
         bail!("agent-opd student has no trainable (LoRA) parameters; check --lora-target-set");
     }
     let mut optimizer = AdamW::new(args.lr, (0.9, 0.999), 1.0e-8, 0.0);
+    if args.gkd {
+        eprintln!(
+            "[arle train agent-opd] replay GKD mode: teacher={:?} temperature={} \
+             entropy_weight={} ema_alpha={}",
+            args.gkd_teacher, args.gkd_temperature, args.gkd_entropy_weight, args.gkd_ema_alpha
+        );
+    }
     log_opd_vram("replay: after student load", &train_backend);
 
     let epochs = args.replay_epochs.max(1);
@@ -2144,19 +2167,49 @@ fn run_agent_opd_replay(
     for epoch in 0..epochs {
         let mut losses = Vec::new();
         for record in records.iter().take(per_epoch_cap) {
-            let loss = masked_writeback_ce_step_dispatch(
-                &student,
-                all_params.as_slice(),
-                trainable.as_slice(),
-                &mut optimizer,
-                &record.prompt_ids,
-                &record.response_ids,
-                &record.response_mask,
-                vocab,
-                args.writeback_window,
-                &mut store,
-            )
-            .with_context(|| format!("replay writeback ({:?})", record.label))?;
+            let loss = if let Some(ema) = gkd_teacher.as_mut() {
+                // GKD: distil the teacher's per-position distribution on the same
+                // masked trajectory tokens (forward-KL), then (ema only) nudge the
+                // EMA teacher toward the just-updated student.
+                let step_loss = {
+                    let teacher = ema.as_teacher();
+                    gkd_writeback_step(
+                        &student,
+                        &teacher,
+                        all_params.as_slice(),
+                        trainable.as_slice(),
+                        &mut optimizer,
+                        &record.prompt_ids,
+                        &record.response_ids,
+                        &record.response_mask,
+                        vocab,
+                        args.writeback_window,
+                        args.gkd_temperature,
+                        args.gkd_entropy_weight,
+                        &mut store,
+                    )
+                    .with_context(|| format!("replay GKD writeback ({:?})", record.label))?
+                };
+                if matches!(args.gkd_teacher, GkdTeacherArg::Ema) {
+                    ema.update(&student, &mut store, args.gkd_ema_alpha)
+                        .context("GKD EMA teacher update")?;
+                }
+                step_loss
+            } else {
+                masked_writeback_ce_step_dispatch(
+                    &student,
+                    all_params.as_slice(),
+                    trainable.as_slice(),
+                    &mut optimizer,
+                    &record.prompt_ids,
+                    &record.response_ids,
+                    &record.response_mask,
+                    vocab,
+                    args.writeback_window,
+                    &mut store,
+                )
+                .with_context(|| format!("replay writeback ({:?})", record.label))?
+            };
             losses.push(loss);
         }
         let mean_loss = losses.iter().sum::<f32>() / losses.len() as f32;
