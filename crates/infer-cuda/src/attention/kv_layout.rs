@@ -1172,27 +1172,6 @@ impl Dsv4LayerKvLayout {
         Ok(self.flashmla_pool()?.page_indices(slot_idx))
     }
 
-    /// Publish one slot's page table (slot-logical → physical pool block) to a
-    /// device `i32` buffer for the Stage-B pack kernel: the kernel reads
-    /// `block_id = page_table[token_block_id[t]]`, so the host hands it logical
-    /// pages and this device table routes them to the (dynamically-drawn)
-    /// physical blocks. Identity-table == band (Phase 1 gate), so this is
-    /// correct under the contiguous-band invariant and ready for fragmentation.
-    pub(crate) fn flashmla_device_page_table(
-        &self,
-        ctx: &DeviceContext,
-        slot_idx: usize,
-    ) -> Result<CudaSlice<i32>> {
-        let table_i32: Vec<i32> = self
-            .flashmla_page_table(slot_idx)?
-            .iter()
-            .map(|&p| p as i32)
-            .collect();
-        ctx.stream
-            .clone_htod(&table_i32)
-            .map_err(|e| anyhow!("DSv4 FlashMLA device page table H2D failed: {e}"))
-    }
-
     /// Table-routed byte range of one slot's FlashMLA band.
     ///
     /// Invariant (#85 P2 Stage A): the range derives from the slot's PAGE

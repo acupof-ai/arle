@@ -300,7 +300,6 @@ pub(crate) fn commit_layer_fold(
                 )
             })
             .unzip();
-        let page_table = pool.flashmla_device_page_table(ctx, flash.slot_idx)?;
         ctx.stream
             .memcpy_htod(&block_ids, &mut scratch.sw_bulk_block_ids)
             .map_err(|e| anyhow!("DSv4 commit fold FP8 block_ids H2D failed: {e}"))?;
@@ -323,7 +322,7 @@ pub(crate) fn commit_layer_fold(
             page_block_size,
             config.head_dim,
             config.head_dim,
-            Some(&page_table),
+            Some(&flash.device_page_table),
         )?;
     }
     Ok(())
@@ -1816,7 +1815,6 @@ pub(crate) fn flashmla_pack_sw_ring(
             )
         })
         .unzip();
-    let page_table = pool.flashmla_device_page_table(ctx, flash.slot_idx)?;
     ctx.stream
         .memcpy_htod(&block_ids, &mut scratch.sw_bulk_block_ids)
         .map_err(|e| anyhow!("DSv4 FlashMLA SW block_ids H2D failed: {e}"))?;
@@ -1839,7 +1837,7 @@ pub(crate) fn flashmla_pack_sw_ring(
         page_block_size,
         config.head_dim,
         config.head_dim,
-        Some(&page_table),
+        Some(&flash.device_page_table),
     )?;
     flash.fp8_kv_sw_bootstrapped = true;
     Ok(())
@@ -1907,7 +1905,6 @@ fn flashmla_pack_one_sw_token(
         // MODEL1 Stage-B: the device fill kernel produced a slot-LOGICAL block
         // id; hand the POOL base + device page table so it routes to the dynamic
         // physical block (`block_id = table[logical]`).
-        let page_table = pool.flashmla_device_page_table(ctx, flash.slot_idx)?;
         let pool_buf = pool.flashmla_pool_data_mut()?;
         let (pool_ptr, _pg) = pool_buf.device_ptr_mut(&ctx.stream);
         flash_kv::dsv4_fp8_kv_pack_strided_raw(
@@ -1921,7 +1918,7 @@ fn flashmla_pack_one_sw_token(
             64,
             config.head_dim,
             config.head_dim,
-            Some(&page_table),
+            Some(&flash.device_page_table),
         )
     }
 }
@@ -1955,7 +1952,6 @@ fn flashmla_pack_compressed_delta(
         // Stage-B: hand the POOL base + device page table so the kernel routes
         // the slot-LOGICAL compressed block to its physical pool block (fragmented
         // band safe; identity table == band byte-for-byte).
-        let page_table = pool.flashmla_device_page_table(ctx, flash.slot_idx)?;
         let pool_buf = pool.flashmla_pool_data_mut()?;
         let (pool_ptr, _pg) = pool_buf.device_ptr_mut(&ctx.stream);
         let (compressed_ptr, _cg) = compressed.data.device_ptr(&ctx.stream);
@@ -1969,7 +1965,7 @@ fn flashmla_pack_compressed_delta(
             bmap.sw_blocks(),
             bmap.page_size(),
             config.head_dim,
-            Some(&page_table),
+            Some(&flash.device_page_table),
         )?;
     }
     let start_row = flash.fp8_kv_comp_packed_rows;
@@ -2003,7 +1999,6 @@ fn flashmla_pack_compressed_delta(
     // hand the POOL base + device page table so the kernel routes each to its
     // dynamic physical block (`block_id = table[logical]`).
     let (compressed_ptr, _cg) = compressed.data.device_ptr(&ctx.stream);
-    let page_table = pool.flashmla_device_page_table(ctx, flash.slot_idx)?;
     let pool_buf = pool.flashmla_pool_data_mut()?;
     let (pool_ptr, _pg) = pool_buf.device_ptr_mut(&ctx.stream);
     let row_offset_bytes = start_row as u64 * config.head_dim as u64 * 2;
@@ -2020,7 +2015,7 @@ fn flashmla_pack_compressed_delta(
         bmap.page_size(),
         config.head_dim,
         config.head_dim,
-        Some(&page_table),
+        Some(&flash.device_page_table),
     )?;
     flash.fp8_kv_comp_packed_rows = end_row;
     Ok(())
@@ -2747,7 +2742,7 @@ fn try_flashmla_decode_attention(
     // non-contiguous pages. V32/GLM also route here: only the WRITE/pack side
     // lacks a V32 device-page-table kernel; the read-side table is mode-neutral
     // and their contiguous identity band stays byte-equal.
-    let build_page_table = Some(pool.flashmla_device_page_table(ctx, flash.slot_idx)?);
+    let build_page_table = Some(&flash.device_page_table);
     // Single-source sw_blocks / page_block_size for the index-build kernel.
     let bmap = flash.block_map();
     let (indices_ptr, indices_guard) = scratch.indices.device_ptr_mut(&ctx.stream);
@@ -2773,7 +2768,7 @@ fn try_flashmla_decode_attention(
             },
             mode_int,
             bmap.page_size(),
-            build_page_table.as_ref(),
+            build_page_table,
             // M1: whole-pool page count — mask any routed physical page >= this.
             pool.flashmla_total_pages(),
         )?;
