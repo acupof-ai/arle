@@ -2654,25 +2654,37 @@ impl Dsv4CudaExecutor {
         }
         let image = image?;
         let image_len = image.seq_len();
-        // Rank-local: mirror host pages for the FULL image, restore it, then
-        // truncate down to the consensus matched_len (a longer stored prompt
-        // covers a shorter consensus prefix). Spec (MTP) draft state resets;
-        // the tail prefill re-seeds it.
-        let restored = (image_len >= matched_len)
+        // Rank-local: mirror host pages and restore the image ONLY on an EXACT
+        // length match. A longer stored image (`image_len > matched_len`) is
+        // deliberately rejected rather than restored-then-truncated: the
+        // compressor/indexer's `pending_kv`/`pending_score`/`prev_overlap_*`
+        // and every layer's `sw_window_cache` are ring/carry buffers with no
+        // absolute-position tag, captured to reflect state as of `image_len`.
+        // Truncating the seq_len counter back to `matched_len` does not (and,
+        // short of a full from-position-0 recompute, structurally cannot)
+        // rewind their CONTENT — `prev_overlap` is a single-slot "most
+        // recently completed block" register with no second copy of the
+        // block before it, and `sw_window_cache[pos % sliding_window]` is
+        // overwritten by any later same-residue write in `[matched_len,
+        // image_len)`. See docs/experience/errors/2026-07-06-dsv4-concurrent-decode-digit-corruption-unresolved.md
+        // ("Full persistent-buffer enumeration audit") for the full derivation.
+        // `lookup_covering` still intentionally prefers the LONGEST covering
+        // entry (TP-consensus: a peer rank may lack an exact-length entry) —
+        // rejecting here, rather than there, keeps that consensus lookup
+        // untouched and falls back to the already-correct full-reprefill path
+        // (`attach_cached_prefix`'s existing restore-failure branch).
+        let restored = (image_len == matched_len)
             .then_some(())
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "DSv4 cached prefix snapshot len {image_len} < requested matched_len {matched_len}"
+                    "DSv4 cached prefix snapshot len {image_len} != requested matched_len {matched_len} \
+                     (partial-block reuse is unsafe for compressor/SW-ring state, rejecting)"
                 )
             })
             .and_then(|()| self.mirror_restore_pages(slot, slot_pages, image_len))
             .and_then(|()| {
                 self.spec_slots[slot] = Dsv4SpecSlotState::default();
                 self.slots[slot].swap_in_image(&self.model.ctx, &mut self.kv_adapter, &image)
-            })
-            .and_then(|()| match image_len > matched_len {
-                true => self.slots[slot].truncate(&self.model.layers, &mut self.kv_adapter, matched_len),
-                false => Ok(()),
             });
         let restore_ok = usize::from(restored.is_ok());
         if self.tp_min_usize(restore_ok, "prefix restore snapshot")? == 0 {
