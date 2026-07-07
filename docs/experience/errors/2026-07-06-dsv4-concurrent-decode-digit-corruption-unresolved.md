@@ -637,6 +637,82 @@ comparison, and/or run a second text needle word to rule out `CASTLE`-specific
 idiosyncrasy — not done this pass (one clean single-variable result was the
 information-budget target).
 
+## Cross-architecture check — Qwen3-4B dense shows ZERO corruption on either needle type (2026-07-07)
+
+Steer: is the numeric-vs-text corruption gap DSv4-specific, or a general
+batched-CUDA-kernel property of ARLE's inference stack? Ran the identical
+harness methodology against a completely different architecture family —
+**Qwen3-4B dense** (`Qwen3ForCausalLM`, 36 layers, GQA 32Q/8KV heads, no MoE,
+no indexer/compressor/sliding-window-compression/MHC/Waterfill — none of
+DSv4's machinery, but the same `infer-cuda` batched-decode/paged-KV/scheduler
+substrate) — one boot, TP=1, GPU 1 (the shared-box-safe pin; `/host/Qwen3-4B`,
+7.6 GB bf16, fits trivially on one H20).
+
+**Harness.** Byte-for-byte copies of `concurrent_needle_v3.py`/
+`concurrent_needle_text.py` (`concurrent_needle_v3_qwen.py`/
+`concurrent_needle_text_qwen.py`, `/host/arle-build/`) — only change is
+`wrap()`: Qwen3's ChatML (`<|im_start|>system...<|im_start|>user...
+<|im_start|>assistant\n<think>\n\n</think>\n\n`, forcing a direct non-reasoning
+completion) instead of DeepSeek's special tokens. Needle/PRE/CUE/TOPIC filler/
+trial-salting/`max_tokens=16`/`temperature=0` identical. `--max-total-tokens
+4096`, no other DSv4-only env flags (none apply to Qwen3 dense).
+
+**Solo (n=1) sanity**, 3 reps each: 3/3 exact both needles, clean baseline —
+`'The secret access code stated earlier is **738291**.'` /
+`'...secret password stated earlier is **CASTLE**.'`.
+
+**Concurrent (n=4, len=500, 15 reps = 60 requests/arm)**, same server boot,
+back-to-back:
+
+| Needle | Exact | Miss | Miss rate |
+|---|---|---|---|
+| Numeric (`738291`) | 60/60 | 0/60 | **0%** |
+| Text (`CASTLE`) | 60/60 | 0/60 | **0%** |
+
+Zero truncation, zero digit substitution, zero hedging/meta-commentary on
+either needle across all 120 concurrent requests. Wall-clock confirms real
+batching occurred (not accidental serialization masking the effect): solo
+numeric 0.61-0.71s -> n=4 concurrent 2.18-2.30s (sub-4x, consistent with a
+shared batched forward call, not 4 serial single-row calls); solo text
+0.42s -> n=4 concurrent 1.38-1.56s, same pattern.
+
+**Comparison to DSv4** (same n=4/len=500/15-rep design, `job3_text_needle.sh`,
+TP=4 GPUs 3/4/5/7): numeric 56.7% miss / text 1.7% miss, a 33x gap. Qwen3-4B
+dense: **0%/0%, no gap at all** — not "smaller gap," a clean floor on both
+arms.
+
+**Verdict: this is the "near-zero on both" outcome, not the "general property"
+outcome — DSv4-specific, not a general batched-inference/floating-point-
+non-associativity property of ARLE's shared CUDA batching substrate.** Qwen3
+dense shares the same `infer-cuda` scheduler, paged-KV pool, continuous-batching
+engine-thread architecture, and batched-decode CUDA kernel family as DSv4, and
+shows no measurable corruption under the identical concurrent-batching stress
+at n=4. This redirects the investigation back to DSv4-specific mechanisms —
+DSA/CSA indexer top-k selection, the compressor/MHC sliding-window-compression
+path, MoE routing/FP8 grouped-GEMM, or the FlashMLA/CSA split-KV
+scratch-accumulator layout — none of which Qwen3 dense exercises at all. Does
+**not** distinguish which DSv4-specific subsystem (out of scope this pass,
+diagnostic only); the FP8 MoE decode path (flagged but not chased in the prior
+source-review round) and the DSA `radix_topk` unbounded-write hypothesis
+(memcheck-blind per the compute-sanitizer round) are the two concrete leads
+still open, and this result doesn't discriminate between them since Qwen3
+dense has neither.
+
+**Caveat — model-scale and batch-depth not matched.** Qwen3-4B (4B dense) vs
+DeepSeek-V4-Flash (much larger MoE, TP=4) differ in more than architecture
+family alone: parameter count, FP8 vs BF16 compute path, TP=1 vs TP=4 (no
+cross-GPU allreduce in the Qwen arm), and per-step FLOPs per row. A `0%` floor
+on a small dense model at TP=1 is consistent with "no DSv4-specific mechanism
+needed to see corruption" but doesn't independently prove TP/allreduce is
+clean — that variable was already ruled out separately (custom one-shot
+allreduce ruled out above; plain NCCL `all_reduce` on `ctx.stream`, not a
+private stream). A stronger (but not run this pass, information-budget) next
+step would be Qwen3.6-27B-FP8 MoE at TP>1 (already loaded/available on this
+node per the process table) — same batched-decode substrate but with MoE
+routing and multi-GPU TP, narrowing the "DSv4-specific" verdict from
+"non-MoE-non-DSv4" down to "specifically DSv4's indexer/compressor/MHC," not
+just "any MoE router."
+
 ## Rule
 
 Concurrent DSv4 serving (n>=3, prompt length >~100-250 tokens) has a real,
@@ -707,3 +783,15 @@ near-tie/close-competing-candidate sensitivity (digit sequences have plausible
 near-tied next-token competitors; a common word's completion doesn't). Any
 future rate comparison across rounds that changed the needle string alongside
 other variables should be re-read with this in mind.
+
+**"Shares the same batched CUDA substrate" is not "shares the same bug" —
+run the identical harness on a structurally different model before
+generalizing a defect found in one architecture.** DSv4's 56.7%/1.7%
+numeric-vs-text gap did not reproduce at all on Qwen3-4B dense (0%/0% over
+60 requests/arm, same n=4/len=500 design) despite both models running through
+the identical `infer-cuda` scheduler/paged-KV/continuous-batching-engine-thread
+substrate. A shared-infra hypothesis needs a shared-infra control, not just a
+plausible mechanism story (floating-point non-associativity in batched
+kernels) — the control killed it here in one pod boot (~2 minutes of GPU time,
+7.6 GB model) at negligible cost relative to the DSv4 TP=4 passes that
+preceded it.
