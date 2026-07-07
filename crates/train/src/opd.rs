@@ -3518,7 +3518,11 @@ pub fn gkd_writeback_step<O: Optimizer, T: TeacherForward + ?Sized>(
     );
     tape.set_offload_checkpoints(offload_checkpoints);
     tape.set_enabled(true);
-    let keep_extra: HashSet<TensorId> = HashSet::new();
+    // Retain the teacher's params across the post-backward `retain_ids` prune:
+    // the EMA adapter (and any teacher-only weights) are NOT in the student's
+    // `all_model_params`, so without this they would be freed and the next step's
+    // teacher forward / EMA update would read dropped tensors.
+    let keep_extra: HashSet<TensorId> = teacher.parameter_ids().iter().copied().collect();
     eprintln!(
         "[gkd-writeback] seq_len={seq_len} total_targets={total_targets} \
          windows={} temperature={temperature} offload_checkpoints={offload_checkpoints}",
