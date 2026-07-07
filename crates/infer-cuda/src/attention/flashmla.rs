@@ -208,7 +208,15 @@ impl Dsv4FlashMlaDecodeState {
             device_page_table: ctx.stream.alloc_zeros::<i32>(shape.total_blocks)?,
         };
         state.init_constant_sched_meta(ctx)?;
-        state.refresh_device_page_table(ctx, pool)?;
+        // NOT refreshed here: at slot-pool construction the host page table is
+        // legitimately EMPTY (band drawn on first admission, see #85 P2 Stage B
+        // above), so it can never match `device_page_table`'s fixed
+        // `shape.total_blocks` length — calling refresh here made every slot's
+        // `ensure!` fail 100% of the time at engine startup. The zeroed
+        // `alloc_zeros` placeholder is safe until the first real band draw
+        // (`Dsv4SlotState::refresh_flashmla_device_page_tables`, called right
+        // after the slot's first prefill row's `prepare_kv_batch`); FlashMLA
+        // kernels never read this buffer before that point.
         Ok(state)
     }
 

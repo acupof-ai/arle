@@ -1147,6 +1147,23 @@ impl Dsv4SlotState {
         Ok(())
     }
 
+    /// Re-sync every layer's FlashMLA device page table from the host pool.
+    /// Caller must invoke this exactly once, right after `prepare_kv_batch`
+    /// mirrors this slot's band for the first time post-reset (the slot's
+    /// first prefill row, `start_pos == 0`) — see
+    /// [`crate::attention::Dsv4LayerAttentionState::refresh_flashmla_device_page_table`].
+    pub(crate) fn refresh_flashmla_device_page_tables(
+        &mut self,
+        ctx: &DeviceContext,
+        kv_adapter: &crate::attention::Dsv4KvAdapter,
+    ) -> Result<()> {
+        for (layer_idx, layer) in self.attention.iter_mut().enumerate() {
+            let pool = kv_adapter.layer(layer_idx)?;
+            layer.refresh_flashmla_device_page_table(ctx, pool)?;
+        }
+        Ok(())
+    }
+
     /// Serialize this slot's state into a host image for whole-slot swap. The
     /// engine may free the slot right after `demote_slot`, so `ctx.sync()` is
     /// required before returning. Snapshotted state is the per-layer attention

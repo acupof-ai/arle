@@ -1415,6 +1415,24 @@ impl Dsv4LayerAttentionState {
         self.flashmla.as_ref().map(|f| f.slot_idx)
     }
 
+    /// Re-sync this layer's persistent FlashMLA device page table from the
+    /// host table. Call exactly once per slot lifetime, right after the
+    /// slot's first prefill row's `prepare_kv_batch` mirrors its (previously
+    /// empty) band — the fixed identity band never changes afterward, so
+    /// later prefill/decode rows don't need this (and calling it every decode
+    /// step would be a CUDA-graph capture hazard, #8). No-op when this layer
+    /// has no FlashMLA decode.
+    pub(crate) fn refresh_flashmla_device_page_table(
+        &mut self,
+        ctx: &DeviceContext,
+        pool: &Dsv4LayerKvLayout,
+    ) -> Result<()> {
+        if let Some(flash) = &mut self.flashmla {
+            flash.refresh_device_page_table(ctx, pool)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn truncate_decode_len(
         &mut self,
         mode: DeepSeekV4AttentionMode,
