@@ -86,6 +86,26 @@ below.
   → CC streaming reset), not capability. Pre-warmed images + optimized binary +
   host-side terminus + pass@3 were each required to get a trustworthy number.
 
+## Automated STaR loop (3 rounds, `scripts/tbench_opd_loop.sh`)
+
+Serve→pass@3→collect-passing→append→distill→re-serve, cumulative corpus:
+
+| round | LoRA | pass@1 | passing trials | cum records |
+|---|---|---|---|---|
+| 0 | base | 6/39 | 18 | 69 |
+| 1 | +r0 | **7/39** | 19 | 136 |
+| 2 | +r1 | 7/39 | 20 | 216 |
+
+**+1 trial round-0→1 (format conformance), then FLAT** — the corpus kept growing
+(136→216) but pass@1 did not. The format-conformance gradient is **one-shot**:
+once the student emits clean terminus-JSON, self-generated passing trajectories
+carry no new gradient (remaining fails are capability, not format). Confirms the
+first-principles read — beyond the format fix, lift needs a *teacher* (stronger
+per-step distribution on the tasks the student still fails), not more
+self-distillation. (The manual-run +5.1pp sits at the optimistic end of the
+single-pass@3 noise floor of ±~2 trials; the loop's base-round 6/39 vs the
+manual 8/39 shows that variance directly.)
+
 ## Next
 
 - Kill the residual uv-installer re-curl timeout (bake uv itself + a pinned
