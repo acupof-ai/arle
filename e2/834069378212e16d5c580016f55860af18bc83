@@ -1,0 +1,21 @@
+docs/experience/wins/2026-07-07-prefix-cache-graph-page-table-fix.md
+  s_b3b5c340d89689::t_ea9c31e32b587a 58-74
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "e2834069378212e16d5c580016f55860af18bc83",
+  "prompts": {},
+  "sessions": {
+    "s_b3b5c340d89689": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9c2c33cd-ad2a-4398-944f-e13bf0f4385a",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
