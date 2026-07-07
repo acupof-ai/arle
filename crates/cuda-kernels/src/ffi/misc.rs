@@ -777,6 +777,9 @@ unsafe extern "C" {
         batch_size: i32,
         topk: i32,
         page_size: i32,
+        // ARLE_DSA_TIEBREAK_TRACE diagnostic (null disables): caller-owned
+        // [batch_size*2] i32 scratch, zeroed by the caller before each launch.
+        tie_trace: *mut i32,
         stream: super::CUstream,
     ) -> super::CUresult;
 
