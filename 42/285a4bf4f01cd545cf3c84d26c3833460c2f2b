@@ -1,0 +1,23 @@
+docs/experience/errors/2026-07-06-dsv4-concurrent-decode-digit-corruption-unresolved.md
+  s_f6590607052cd9::t_bb1f620c78a367 2721-2736
+docs/experience/wins/2026-07-08-dsv4-straddled-prefix-restore-reject.md
+  s_f6590607052cd9::t_cba5db21fef281 1-158
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "42285a4bf4f01cd545cf3c84d26c3833460c2f2b",
+  "prompts": {},
+  "sessions": {
+    "s_f6590607052cd9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a3104a2a0c57b9e87",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
