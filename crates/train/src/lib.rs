@@ -30,6 +30,8 @@ pub mod grad_clip;
 pub mod infer_student;
 #[path = "lora.rs"]
 pub mod lora;
+#[path = "lora_shard.rs"]
+pub mod lora_shard;
 #[path = "loss.rs"]
 pub mod loss;
 #[path = "metrics.rs"]
