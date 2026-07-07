@@ -1,0 +1,21 @@
+crates/train/src/lib.rs
+  s_11171e48589aa6::t_b066554af38c38 33-34
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "20871e5310b23e05fc4a6c66bf722b42bc72663a",
+  "prompts": {},
+  "sessions": {
+    "s_11171e48589aa6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ab10967bee0835707",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
