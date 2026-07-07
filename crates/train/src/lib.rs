@@ -48,6 +48,8 @@ pub mod qwen35;
 pub mod qwen35_checkpoint;
 #[path = "qwen35_loader.rs"]
 pub mod qwen35_loader;
+#[path = "replay_buffer.rs"]
+pub mod replay_buffer;
 #[path = "rubric.rs"]
 pub mod rubric;
 #[path = "rubric_opd.rs"]
