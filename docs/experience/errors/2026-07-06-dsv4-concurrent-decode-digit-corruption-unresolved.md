@@ -1691,3 +1691,162 @@ dispatch branch ("FP8 DeepGEMM vs scalar fallback") is not automatically an
 (as it is here, `dsv4_fp8_gemv_batch_cuda`) when the weight was never stored in
 bf16 to begin with; verify the fallback's actual output precision before
 building an A/B around the assumption that "not-DeepGEMM" means "bf16."
+
+## FP8 grouped-GEMM decode-MoE — DEAD-END, no bf16 alternative in the checkpoint (2026-07-08)
+
+Doc's own #1 residual-corruption shortlist item: the decode-MoE grouped-GEMM
+kernels (`dsv4_fp8_grouped_swiglu_decode_kernel`/
+`dsv4_fp8_grouped_down_decode_kernel`, `crates/cuda-kernels/csrc/gemm/dsv4_fp8_decode_moe.cu`,
+called from `dsv4_moe_forward_decode_fp8`, `crates/infer-cuda/src/moe.rs:3044`)
+had never been precision-A/B'd. Checked the checkpoint dtype **before**
+attempting any code change, per this round's brief — same discipline as the
+"Second FP8 gate" round that killed `mla_attention_prepare_proj_batch` as an
+A/B target.
+
+**Weight-load path traced.** `crates/infer-cuda/src/loader.rs:3323`
+(`load_dsv4_moe_layer`) loads every routed AND shared expert's `w1`/`w2`/`w3`
+(gate/down/up) via `load_fp8 = |name| self.load_dsv4_block_scaled(ctx, name)`
+(non-GLM branch) — the exact same function the prior round already proved
+`bail!`s on any raw tensor dtype other than `F8_E4M3` (no `BF16`/`F32` arm
+exists). Only the router gate (`names.gate_weight`) loads via
+`load_dsv4_bf16_matrix` — a different tensor, not on the grouped-GEMM path at
+all (it feeds `dsv4_route_kernel`'s routing decision, not the expert compute).
+
+**Checkpoint-level verification (not source inference alone).** Parsed the
+live pod checkpoint's safetensors header directly
+(`/host/DeepSeek-V4-Flash-FP8/model-00005-of-00046.safetensors`, layer 3):
+
+| Tensor | dtype | shape | Sidecar |
+|---|---|---|---|
+| `layers.3.ffn.experts.0.w1.weight` (gate) | **F8_E4M3** | [2048,4096] | `.scale` F32 [16,32] |
+| `layers.3.ffn.experts.0.w2.weight` (down) | **F8_E4M3** | [4096,2048] | `.scale` F32 [32,16] |
+| `layers.3.ffn.experts.0.w3.weight` (up) | **F8_E4M3** | [2048,4096] | `.scale` F32 [16,32] |
+| `layers.3.ffn.shared_experts.w{1,2,3}.weight` | **F8_E4M3** (all three) | — | `.scale` F32 |
+| `layers.3.ffn.gate.weight` (router, not the GEMM) | BF16 | [256,4096] | none |
+
+Every routed expert (checked expert 0; the loop over `local_expert_start..end`
+uses the identical `load_dsv4_block_scaled` call for every index, so this
+generalizes) and the shared expert are `F8_E4M3`-only, no bf16 sibling tensor
+anywhere in the checkpoint. Identical dead-end shape to the second FP8 gate
+(`wq_a`/`wq_b`/`wkv`): the only way to get a bf16 alternative would be adding
+host-side FP8→bf16 block-dequantization to the loader — new feature work, not
+a same-day precision A/B.
+
+**Verdict: DEAD-END — confirmed via checkpoint header, no code change
+attempted, no GPU run needed.** The MoE decode-FP8 grouped-GEMM kernels cannot
+be given a bf16 A/B without new dequantization infrastructure, same as the
+second gate. This item is closed for this investigation's remaining scope
+(same pattern the doc already established once); it stays on the suspect list
+only in the weaker "FP8-numerics-in-general" sense that applies to every
+still-standing FP8 path here, not as an actionable next lever.
+
+## DSA `radix_topk` round==3 tie-break — real non-invariance found, causal link INCONCLUSIVE (source-only, 2026-07-08)
+
+Per the doc's #2 shortlist item, with #1 now cleanly dead-ended: re-read
+`radix_topk` (`crates/cuda-kernels/csrc/misc/dsv4_dsa_official.cu:487-632`)
+line by line to check whether the round==3 tie-break (`s_last_remain` atomic,
+`:616-618`) produces a SET of selected indices invariant to thread execution
+order, or only a COUNT-invariant one — the distinction the brief asked to
+resolve.
+
+**Mechanism.** `radix_topk` is a standard MSB-first radix top-k: a coarse
+first pass buckets by the top byte of a float→sortable-uint16 key
+(`convert_to_uint8`), then 4 further rounds (round 0-3) refine within the
+tied bucket using successive bytes of the full sortable-uint32 key
+(`convert_to_uint32`, `offset = 24 - round*8`), so by the end of round 3 every
+remaining tied candidate has agreed on **all 32 bits** of its sortable key —
+i.e. round-3 ties are genuine bit-identical-float ties, not near-ties. Within
+round 3, elements landing in the final threshold bin race for the last
+`R = s_last_remain` slots via `pos = atomicAdd(&s_last_remain, -1); if (pos >
+0) output[topk-pos] = idx`.
+
+**Proof 1 — COUNT is invariant to execution order (verified from the atomic's
+own semantics, not a guess).** `atomicAdd` serializes: every call against the
+same address returns a distinct value from a strictly-decreasing sequence
+starting at `R`, regardless of which thread/idx issues which call or in what
+order. Exactly `R` of the `num_input` (≥ `R`, guaranteed by the histogram
+cascade that selected `threshold_bin`) calls receive `pos ∈ [1, R]` and write;
+the rest get `pos ≤ 0` and are dropped. Total writes = `R` in every run,
+every schedule — the kernel can never under- or over-select `topk` total
+indices from a batch-composition or scheduling effect. **This kills a
+"corrupts the total selected-block count" framing of the hypothesis.**
+
+**Proof 2 — the exact SET of the R winning indices is NOT invariant to
+execution order.** `atomicAdd`'s serialization guarantees a decreasing value
+sequence, but CUDA gives no ordering guarantee for *which* thread's call is
+issued first among threads in different warps/blocks touching the same
+`__shared__` address — the assignment of `pos` values to specific `idx`s among
+the tied candidates is a genuine function of physical thread-scheduling order,
+which is not part of the CUDA execution model's guarantees for a `__shared__`
+atomic across warps. **So: COUNT-STABLE confirmed, SET-invariance disproven at
+the source level** — this is a real, not hypothetical, race-shaped
+nondeterminism, distinct in kind from the already-KILLED FlashMLA/RMSNorm/
+`dsv4_fp8_gemv_batch_cuda` mechanisms (those were proven arithmetically
+identical regardless of dispatch; this one is proven to genuinely vary).
+
+**Why `compute-sanitizer racecheck` never caught this.** `s_last_remain` is
+accessed exclusively through `atomicAdd`, which is by definition
+race-free (no unsynchronized read-modify-write) — racecheck flags
+*unsynchronized* shared-memory access, not "correctly-synchronized-but-
+order-dependent" outcomes. This mechanism is invisible to every tool this
+investigation has already run (racecheck/synccheck/memcheck,
+`CUDA_LAUNCH_BLOCKING=1`) by construction, not by bad luck — none of them
+detect "the atomic is safe but its winner is schedule-dependent."
+
+**Why this is plausible in THIS harness specifically, not asserted from
+principle alone.** A round-3 tie requires bit-identical `float` DSA indexer
+scores. Genuinely improbable for arbitrary content — but this investigation's
+own needle harnesses (`concurrent_needle_v3.py` et al.) pad every prompt with
+many repetitions of the same `TOPIC` filler text specifically to reach the
+target length, i.e. by design produce many KV-cache blocks with highly
+repetitive or identical underlying content. Combined with the DSA
+indexer/compressor pipeline's bf16 intermediate precision (established
+elsewhere in this doc), bit-identical scores across several filler blocks are
+structurally plausible in this specific synthetic-benchmark shape — more so
+than they would be in typical non-repetitive production prompts.
+
+**Not batch-size-coupled by construction — a weaker mechanism than the
+already-CONFIRMED `proj_batched` gate.** `s_last_remain` is `__shared__`,
+scoped per-block, and `deepseek_v4_topk_transform_kernel` launches one block
+per row (`bid = blockIdx.x`) — there is no cross-row/cross-block aliasing of
+this variable, so batch size `n` cannot directly perturb which winner a given
+row's own tie-break selects. The only route from `n` to this mechanism is
+indirect: more concurrently-resident blocks (rows) change SM occupancy/
+warp-scheduling pressure, which *could* shift one block's own internal thread
+execution order relative to a solo (n=1) run of the identical row — but this
+is a second-order GPU-scheduler effect, not proven from source, and is a
+weaker causal story than `proj_batched`'s direct, unconditional `input.seq_len
+> 1` branch switch.
+
+**Verdict: INCONCLUSIVE — real, tool-invisible, structurally-plausible
+mechanism confirmed present in source; not confirmed causal for the observed
+corruption.** Source-only pass per the brief's own scope (no GPU run
+attempted); would need a dedicated instrumented pass (thread a debug flag
+through `TopKParams`/the FFI signature to count/log actual round-3
+tie-arbitration events — `num_input > R` at round==3 — correlated against the
+`7381239`-vs-`738291` repro) to move this from "plausible mechanism" to
+"confirmed contributor," comparable effort to the `proj_batched` trace round.
+Flagged as the strongest still-open lead for a future pass, ranked above
+"genuine data/routing-dependent numerical edge case" (too unfalsifiable to
+action directly) and below the two now-closed FP8-precision gates.
+
+## Rule (addendum 4)
+
+**"Race-free" (atomic-serialized) is not the same claim as "output
+schedule-invariant."** `compute-sanitizer racecheck` proved `s_last_remain`'s
+accesses are properly synchronized (an atomic, no raw read-modify-write hazard)
+— and that is a real, correct finding — but it does not and cannot prove the
+*outcome* is independent of thread execution order when multiple threads
+compete for a shared, strictly-decreasing counter and the counter's exact
+value picks a WINNER among candidates. A kernel can pass every race detector
+in the toolbox and still be schedule-nondeterministic in its *selection*
+logic; separate "is this access safe" from "is this outcome invariant" before
+declaring a tie-break-shaped mechanism closed by a clean sanitizer run.
+
+**A checkpoint-header check generalizes across "sibling" weight groups once
+the loader function is shared.** The MoE expert weights (`w1`/`w2`/`w3`) use
+the exact same `load_dsv4_block_scaled` call as the already-checked
+`wq_a`/`wq_b`/`wkv` — reading the *loader call site*, not just the *weight
+name*, is what tells you a new dead-end will match a prior one before spending
+a pod round confirming it independently; the checkpoint read here was a
+confirmation of an already-strong prior, not a blind probe.
