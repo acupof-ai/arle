@@ -2270,3 +2270,117 @@ study (here: two CONCURRENT attempts, matched by output text length/style,
 one clean one corrupted) — not solo vs. concurrent, even same-boot same-content
 solo vs. concurrent, whenever the two lanes are structurally different code
 paths (as they are here: B=1 CUDA-graph-replay vs. B>1 batched prepass).
+
+## Sibling MLA FP8 gate's DeepGEMM path — arithmetic-invariance PROVEN, source-only (2026-07-08)
+
+Part A localized the layer-16 divergence onset to BEFORE `proj_batched`,
+implicating `mla_attention_prepare_proj_batch`'s own FP8 gate
+(`attention.rs:5510-5513`, `use_deepgemm`) — always true at n≥2 for this
+checkpoint (DeepGEMM caches loaded, non-GLM). The "Second FP8 gate" round
+only proved this gate has **no bf16 alternative to A/B against** (checkpoint
+is F8_E4M3-only); it never checked whether the gate's *actual* dispatch
+target — the real DeepGEMM dense GEMM, not the scalar-GEMV fallback already
+killed in "Batch-invariance sweep 2/3" — is itself arithmetically
+batch-invariant. That's the gap this round closes, by source read only, no
+pod GPU time spent (fully conclusive without one).
+
+**Kernel traced end to end.** `use_deepgemm=true` → `run_fused_wqkv_prefill`
+(fused `wq_a`) + `prefill_proj_deepgemm` (`wq_b`) (`attention.rs:1201-1276`,
+`:1356-1450`) → both call the *same* two-step primitive:
+`cuda_moe::dsv4_deepgemm_pack_quantize_bf16_to_fp8` (activation quantize) then
+`cuda_moe::dsv4_deepgemm_fp8_gemm_nt` (`crates/cuda-kernels/src/moe.rs:1206`)
+→ `dsv4_deepgemm_fp8_gemm_nt_cuda` → `launch_sm90_dense_nt`
+(`crates/cuda-kernels/csrc/gemm/deepgemm_native.cu:1541`) → JIT-instantiates
+`deep_gemm::sm90_fp8_gemm_1d2d_impl<..., GemmType::Normal>`, the **actual
+vendored DeepGEMM SM90 "1D2D" persistent kernel**
+(`crates/cuda-kernels/vendor/deepgemm/deep_gemm/include/deep_gemm/impls/sm90_fp8_gemm_1d2d.cuh`)
+— genuinely different from `proj_batched`'s hand-rolled
+`dsv4_fp8_gemv_batch_cuda` GEMV, exactly as the brief expected.
+
+**Step 1 — activation quantize is per-row, per-128-column-block, independent
+of batch composition.** `dsv4_deepgemm_pack_quantize_bf16_to_fp8_kernel`
+(`crates/cuda-kernels/csrc/gemm/dsv4_deepgemm_ops.cu:63-118`): grid =
+`active_count * max_m * scale_k_blocks`, one block per `(expert, row,
+k_block)`. Each block reads `count = active_counts[active]` (the CURRENT
+call's own `m`, H2D-copied fresh per call at `prefill_proj_deepgemm:1241-1243`)
+and early-returns for `row >= count` — no read of, or dependency on, any
+other row's content. `local_max`/`scale`/the FP8 byte written for row R,
+column-block K are a pure function of row R's own bf16 input values in that
+128-column range. Batch size can only add MORE independent blocks to the
+grid; it cannot change what an existing block computes.
+
+**Step 2 — the dense GEMM has no split-K, no cross-CTA reduction, one tile
+per persistent CTA, in a fixed accumulation order.** `get_best_config`
+(`:671-688`) does select `block_m`/`block_n`/`cluster_m`/`cluster_n`/
+`num_stages`/`num_math_threads` as a cost-model function of `(m, n, k,
+num_sms)` — confirming the brief's premise that M drives config selection.
+But tracing what that config controls, from the kernel body itself
+(`sm90_fp8_gemm_1d2d_impl`, `:37-445`):
+- `BLOCK_K` is compile-time-asserted to **always be 128**
+  (`DG_STATIC_ASSERT(BLOCK_K == 128, ...)`, `:56`) regardless of block_m/n —
+  `num_total_k_blocks = ceil_div(shape_k, 128)` is identical for every
+  config. The K-reduction loop (`:278`, `for k_block_idx = 0..
+  num_total_k_blocks`) always runs in the same ascending order, accumulating
+  into float32 WGMMA registers (`accum`/`final_accum`), promoted with
+  `scale_a * scale_b` in float32 (`:326-342`) — same precision, same order,
+  every config.
+- Tile→CTA assignment is a **closed-form deterministic index formula**, not
+  a race: `Scheduler<GemmType::Normal>::get_next_block`
+  (`crates/cuda-kernels/vendor/deepgemm/deep_gemm/include/deep_gemm/scheduler/gemm.cuh:171,246-257`)
+  computes `next_block_idx = (++current_iter) * kNumSMs + blockIdx.x` — each
+  of the `kNumSMs` persistent CTAs claims a disjoint, deterministic sequence
+  of tile indices via `get_swizzled_block_idx` (a pure function of
+  `block_idx`/`num_m_blocks`/`num_n_blocks`, no atomics). **Exactly one CTA
+  computes each output tile, start to finish, with its own private
+  `accum`/`final_accum` registers** — no split-K, no
+  atomicAdd-across-CTAs, no partial-sum combine step anywhere in
+  `GemmType::Normal`'s scheduler or kernel body.
+- `block_m` (64 vs 128) only changes how many **sibling rows share the same
+  weight-tile TMA load** within one CTA's tile (the `WAVE_BLOCK_M` loop,
+  `:249,293-343` — each wave still runs its own private, identical K-block
+  loop over the same shared `smem_b`/`smem_sfb`) — the exact same
+  "amortize-the-weight-read-across-rows, never reorder one row's own
+  reduction" shape already proven for `proj_batched`'s tiled GEMV
+  (`quantized_gemv.cu:321-384`).
+
+**Verdict: PROVEN INVARIANT.** M (batch/row count) selects a JIT-compiled
+kernel *config* (`block_m`/`block_n`/`cluster`/`stages`/`num_math_threads`)
+via a cost model, exactly as the brief anticipated — but that config only
+changes tile packing and SM occupancy. It provably does **not** change, for
+any individual row: the K-reduction order (fixed ascending `BLOCK_K=128`
+chunks), the accumulation precision (float32 WGMMA + float32 scale-promote),
+or the number of thread blocks contributing to that row's own output (always
+exactly one, assigned by a deterministic closed-form formula, never split-K,
+never atomic-combined). Combined with the fallback branch's kernel
+(`dsv4_fp8_gemv_batch_cuda`, already proven invariant in "Batch-invariance
+sweep 2/3"), **both branches of `mla_attention_prepare_proj_batch`'s
+dispatch are now arithmetically proven batch-composition-invariant** — this
+closes the gate more completely than the "Second FP8 gate" round's BLOCKED
+verdict (which only established "can't A/B for lack of bf16 weights," leaving
+it as the top open suspect); it is now proven innocent of *this specific*
+mechanism by construction, not merely untested.
+
+**Implication for Part A's layer-16 finding.** Since the identical-M,
+identical-content row genuinely cannot get a different numeric result from
+this gate depending on which other row(s) share its batch, the layer-16
+divergence between a matched clean/corrupt concurrent pair is **not**
+explained by "this gate's FP8 kernel computes the row differently depending
+on batch composition." The divergence must originate upstream of this
+gate's own computation — i.e., the two runs' `normed` hidden-state INPUT to
+`mla_attention_prepare_proj_batch` already differs (in low bits, invisible
+to a top-1 logit-lens token comparison across layers 0-15) before this gate
+ever executes. Per the brief's own disjunction: this is the **PROVEN
+INVARIANT** branch, not CONFIRMED NON-INVARIANT — this positively-implicated
+candidate is innocent by arithmetic proof. Next-round candidates for the
+actual source of the pre-layer-16 numeric drift: the residual-stream
+accumulation / MHC mixing feeding into layer 16 (not yet examined at the
+per-buffer arithmetic level this investigation has now applied to every
+named attention/MoE kernel), or a genuinely non-deterministic upstream
+reduction this doc hasn't yet enumerated (e.g. TP=4 NCCL allreduce's
+non-associative FP summation order, which the "Custom one-shot allreduce"
+round ruled out only for the *custom* backend, not plain NCCL's own
+run-to-run reduction-order variance).
+
+No code changed this round (source-read-only, both local and pod trees
+untouched — `git diff` clean save for this doc). No GPU time spent; the
+proof did not require one.
