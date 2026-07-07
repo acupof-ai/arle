@@ -1,0 +1,21 @@
+docs/experience/errors/2026-07-06-dsv4-concurrent-decode-digit-corruption-unresolved.md
+  s_dea2db9bc28562::t_ab6b044821adbb 1239-1481
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "3d433c3af57b5ed3257d0ee7ff6c90dc75cbb77b",
+  "prompts": {},
+  "sessions": {
+    "s_dea2db9bc28562": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a7dcb38b4e905fa6c",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
