@@ -2384,3 +2384,168 @@ run-to-run reduction-order variance).
 No code changed this round (source-read-only, both local and pod trees
 untouched — `git diff` clean save for this doc). No GPU time spent; the
 proof did not require one.
+
+## Full persistent-buffer enumeration audit — one real gap found (structurally live, experimentally ruled OUT for this repro); exact-match restore ALSO corrupts, root cause still open (2026-07-08)
+
+Per §0.1's "every state change enumerates each mutated buffer" discipline,
+applied to the same class of bug the #8 `device_page_table` UAF fix closed
+once already: every slot-lifetime (not per-call-temporary) device buffer on
+the DSv4 decode path, layers 0–~20, with a disposition + exact citation for
+each. Struct definitions read directly from source, not from memory of prior
+rounds' summaries.
+
+### Enumeration table
+
+| Buffer | Owning struct | Disposition | Citation |
+|---|---|---|---|
+| `sw_window_cache` | `Dsv4LayerAttentionState` | (a) reset on admission + (c) captured/restored on swap | `dsa.rs:1287-1308` (`reset`, memset), `dsa.rs:1351-1365` (`swap_in_image`) |
+| `compressor.{pending_kv,pending_score,prev_overlap_kv,prev_overlap_score,compressed.data,compressed.seq_len}` | `Dsv4CompressorState` (`Dsv4LayerAttentionState.compressor`) | (a) + (c) on admission/swap; **(b) self-heal FAILS on truncate** | `kv_layout.rs:61-79` (`reset`), `dsa.rs:815-891` (`Dsv4CompressorImage` capture/restore), `dsa.rs:1436-1450` (`truncate_decode_len` — gap, see below) |
+| `indexer.*` (same 6 sub-fields) | `Dsv4CompressorState` (`Dsv4LayerAttentionState.indexer`) | same as `compressor` — same gap | same citations |
+| `dsa_official.{packed_rows,key_cache band}` | `Dsv4DsaOfficialState` | (a) + (c); `packed_rows` clamped (not fully re-derived) on truncate — see gap | `dsa.rs:65-73` (`reset`), `dsa.rs:963-1010` (`Dsv4DsaOfficialImage`), `dsa.rs:1446-1449` (truncate clamp) |
+| `dsa_official.rotated_keys` | `Dsv4DsaOfficialState` | (b) self-heals — per-forward staging buffer, doc comment confirms "transient... needs no snapshot"; excluded from `Dsv4DsaOfficialImage` on purpose | `dsa.rs:29` field doc, `dsa.rs:966-967` |
+| `flashmla.{fp8_kv_sw_bootstrapped,fp8_kv_comp_packed_rows,fp8_kv_pool_pages}` | `Dsv4FlashMlaDecodeState` | (a) + (c); **not re-derived on truncate** — see gap | `flashmla.rs:286-289` (`reset`), `dsa.rs:895-958` (`Dsv4FlashMlaImage`) |
+| `flashmla.device_page_table` | `Dsv4FlashMlaDecodeState` | (c) explicit refresh, the already-fixed #8 path; NOT part of `Dsv4LayerImage` (derived from the pool's page table post-swap instead) | `flashmla.rs:260-284` (`refresh_device_page_table`), called from `dsa.rs:1381-1385` inside `swap_in_image` and from `executor.rs:3102-3103`/`dsv4.rs:1155-1164` on fresh admission |
+| `flashmla.{topk_length,sched_meta,num_splits,num_sm_parts,fixed_overhead_num_blocks,block_size_topk}` | `Dsv4FlashMlaDecodeState` | (b) self-heals — pure functions of slot-constant SHAPE (config/compress_ratio/topk), computed once at construction, never content-dependent; correctly untouched by reset/swap | `flashmla.rs:223-258` (`init_constant_sched_meta`) |
+| `fused_wqkv.*` (input_fp8/input_scales/qkv_raw/active_*) | `Dsv4FusedWqkvDecodeScratch` | (b) self-heals — B=1-only scratch, fully overwritten with the CURRENT row's own data before every read; not part of any Image, not reset on admission | `flashmla.rs:1434-1497`; call sites `attention.rs:4952-4954` (`token_count==1` gate) |
+| `start_pos_device` | `Dsv4SlotState` | (b) self-heals — `memcpy_htod` fresh before every decode kernel read, every call site | `dsv4.rs:538`, write sites `dsv4.rs:2569,5091,6142` |
+| `seq_len` | `Dsv4SlotState` | (a) + (c) | `dsv4.rs:1132` (reset), `dsv4.rs:1189-1230` (`Dsv4SlotSnapshot`/`swap_in_image`) |
+| `decode_graph` (`Dsv4DecodeGraphScratch`, incl. per-layer `attn_mhc`/`ffn_mhc` MHC scratch + all attn/ffn intermediates) | `Dsv4SlotState` | (b) self-heals — full recompute every CUDA-graph replay from `token_ids` input; re-armed (not restored) on admission/swap; **UNREACHED in this whole investigation** (`ARLE_DSV4_DECODE_GRAPH` defaults off, confirmed by this doc's own "DSA `radix_topk`" round) | `dsv4.rs:662-770`; rearm at `dsv4.rs:1144-1146`/`1231-1236` |
+| `spec_rings`/`spec_normed`/`spec_verify` | `Dsv4SlotState` | Not touched by `reset()` or `swap_in_image()` at all — **but inert**: `Some` only when `model.spec_decode_on`, which is off by default and confirmed off in every boot this investigation has used | `dsv4.rs:524-537` field docs; `Dsv4SlotState::reset` (`dsv4.rs:1127-1148`) never mentions them |
+| `deepep_ll_scratch` | `Dsv4SlotState` | (b) self-heals — overwritten in place every `dsv4_moe_forward_deepep_ll` call; `Some` only when the deepep_ll transport is booted (not this investigation's config, `ARLE_DSV4_MOE_BACKEND=allreduce`) | `dsv4.rs:540-545` |
+| MHC (`hc.rs`) mixing weights/scratch | none (stateless outside the unreached decode-graph lane) | (b) — `gen_mhc_params`/`gen_mhc_params_into` allocate fresh per-forward scratch for prefill/eager-decode; the ONLY persistent MHC scratch (`MhcDecodeScratch`, `attn_mhc`/`ffn_mhc`) lives inside the unreached `decode_graph` | `hc.rs:33-82`; confirmed no other persistent field anywhere in `hc.rs` (grep, 9 pub fns, none stateful outside the scratch above) |
+| DSA/CSA shared per-forward scratch (`logits`,`q_fp8`,`weights`,`context_lens`,`positions`,`sched_meta`,`raw_indices`) | `Dsv4DsaSharedScratch` (model-wide, not per-slot) | (b) self-heals by construction — single `ctx.stream`, overwrite-before-read, doc-asserted | `dsa.rs:85-100` header comment (pre-existing, re-verified field-by-field against current struct, not re-trusted from memory) |
+
+19 buffers/buffer-groups enumerated. 17 clean (comprehensive reset-on-admission
++ capture/restore-on-swap, or a genuinely content-independent self-heal with a
+stated precondition). 2 groups (compressor + indexer's 5 sub-fields each, plus
+`dsa_official.packed_rows` and `flashmla`'s two bootstrap scalars) share
+**one real gap**, detailed below.
+
+### The gap: `truncate_decode_len` does not re-derive `pending_kv`/`prev_overlap_*`/`sw_window_cache`/FlashMLA bootstrap flags
+
+`Dsv4SlotState::truncate` (`dsv4.rs:1242-1270`) has exactly ONE call site in
+the entire codebase: `executor.rs:2673-2674`, inside `restore_cached_prefix`
+— fired whenever a position-0 prefix-cache restore's stored snapshot
+(`image_len`) is LONGER than the new request's own matched prefix
+(`matched_len`), i.e. `image_len > matched_len`. Per layer,
+`truncate_decode_len` (`dsa.rs:1436-1450`) only does two things:
+
+```rust
+self.advance_decode_len(mode, ratio, total_len);   // sets compressed.seq_len = total_len/ratio
+if let Some(dsa) = &mut self.dsa_official {
+    dsa.packed_rows = dsa.packed_rows.min(total_len/ratio.max(1));  // clamp only
+}
+```
+
+It never touches `sw_window_cache`, `compressor`/`indexer`'s
+`pending_kv`/`pending_score`/`prev_overlap_kv`/`prev_overlap_score`, or
+`flashmla.{fp8_kv_sw_bootstrapped,fp8_kv_comp_packed_rows}` — all of which
+`swap_in_image` (called immediately before, `executor.rs:2671`) just set to
+values reflecting the LONGER `image_len` history, not the truncated
+`matched_len` position. Traced the actual read side to confirm this is a
+genuine stale-content hazard, not just an unclamped-but-harmless counter:
+`dsv4_compressor_update_body` (`dsv4_attention.cu:913-1081`) receives a
+caller-resolved `pending_len` (== `new_len % ratio` post-truncate) and reads
+`pending_kv[0..pending_len*width]` via `dsv4_compressor_raw_value`, TRUSTING
+those bytes hold tokens `[new_len-pending_len, new_len)` — i.e. the block
+immediately preceding the new position. If `image_len` and `matched_len` fall
+in **different** compress-ratio blocks (`image_len/ratio != matched_len/ratio`
+— a real "block straddle"), `pending_kv` still holds bytes from the
+snapshot's OWN last partial block (positions near `image_len`), not the
+truncated block near `matched_len` — the compressor kernel then computes a
+compressed KV/DSA-indexer-score row from **wrong input content**, exactly the
+"otherwise-correct computation fed stale/corrupted input" class this round
+was commissioned to find. `advance_decode_len` additionally early-returns for
+`SlidingWindow`-mode layers entirely (`dsa.rs:1400-1402`) — consistent with
+those layers needing no truncate correction (their ring addressing is a pure
+function of absolute position, not a rolling counter) and correctly narrowing
+this gap to CSA/DSA-indexer layers only.
+
+This is structurally the same bug shape as the already-fixed 2026-06-06 DSv4
+EAGLE rollback anchor cited in this task's brief (CLAUDE.md §0.1) — but that
+fix (`Dsv4SpecRingSnapshot`/`capture_spec_rings`/`restore_spec_ring_tail`,
+`dsv4.rs:1073-1121`) is wired ONLY into the MTP-verify commit-fold path
+(`dsv4.rs:2024-2044`) and is never called from `restore_cached_prefix` at
+all — the EAGLE fix and this call site's truncate are structurally unrelated
+despite calling the same `truncate_decode_len` function.
+
+### Experimental result: REFUTED as the mechanism for this investigation's own repro; confirmed structurally live for a different, untested case
+
+Instrumented `restore_cached_prefix` (env-gated `ARLE_DSV4_TRUNCATE_TRACE`,
+reverted after use) to log `matched_len`/`image_len`/block-straddle on every
+call. Pod-verified (TP=4, GPUs 2/3/4/5, `BUILD_EXIT=0` both passes) against
+`trace_probe.py`'s solo (n=1) repeat-prompt harness — the SAME harness this
+doc's "Comprehensive substage-diff round" already established reproduces the
+`17979→18307` ("291"→"292") corruption deterministically from the 2nd
+identical call onward, prefix cache ON, zero concurrency:
+
+- **Reproduced identically**: call 1 correct (`738291`), calls 2-20 (19/20)
+  wrong, byte-identical `'The secret access code is 738292.'` every time.
+- **`DSV4_TRUNCATE_TRACE` fired on every one of the 4×19 TP-rank-redundant
+  restore calls, and EVERY one logged `matched_len=456 image_len=456
+  straddle=Some(false)`** — `truncate()` is NEVER invoked in this repro.
+
+**Root cause, read from source (`executor.rs:1845-1881`,
+`PrefixIndex::lookup_covering`/`match_len`)**: the position-0 prefix store
+holds TWO kinds of entries per finished request — a prefill-boundary capture
+at exactly `prompt.len()` tokens (`infer-core/src/lib.rs:964`) and a
+finish-boundary "sidecar" capture at `prompt.len() + generated.len()` tokens
+(`infer-core/src/lib.rs:1031-1037`, added to unblock multi-turn/agentic prefix
+reuse). `lookup_covering`'s own filter (`l >= len && l <= tokens.len()`,
+`executor.rs:1873`) can never select an entry LONGER than the query's own
+token count — for a same-prompt repeat (query length == prompt length
+exactly), the longer finish-boundary entry is structurally unreachable;
+only the exact-length prefill-boundary entry can ever match, so
+`image_len == matched_len` always and `truncate()` never fires.
+
+**Verdict: the gap is real and unfixed, but NOT the cause of this
+investigation's own repeat-prompt / n≥1 corruption signature — it requires a
+genuinely different query shape** (a NEW request whose prompt is LONGER than
+`prompt.len()` but shorter than some stored `prompt+response` sidecar, i.e.
+`matched_len < image_len < tokens.len()` — the multi-turn/agentic case the
+sidecar capture was explicitly added for, per its own comment "causing full
+re-prefill fallbacks on every subsequent agentic turn"). This scenario was
+**not exercised by any harness in this investigation** (every harness here is
+single-turn) and remains untested — flagged as a live, separate, structurally
+real correctness gap for a follow-up round, not this one's root cause.
+
+**More significant negative finding: the EXACT-match restore path
+(`image_len==matched_len`, `swap_in_image` only, `truncate()` never called)
+still deterministically corrupts.** Since every per-layer Image sub-struct
+(`Dsv4CompressorImage`, `Dsv4FlashMlaImage`, `Dsv4DsaOfficialImage`) was
+independently verified field-complete against its source `State` struct
+earlier in this same round (the enumeration table above), and the restore is
+byte-for-byte (D2H `clone_dtoh` / H2D `memcpy_htod`, no lossy conversion) —
+this rules out `truncate_decode_len` as *any part* of this specific repro's
+mechanism, and narrows the remaining suspect to something in
+`swap_out_image`/`swap_in_image`'s fidelity for the exact-match case that
+this round's field-by-field enumeration did not surface (every named
+buffer's capture/restore code reads correct on paper, matching this doc's
+own recurring lesson that source-reading-clean is not the same as
+mechanism-cleared). **Not chased further this round** (scope: enumeration +
+one targeted experiment); the next test should decode/hash each captured
+`Dsv4LayerImage` byte-for-byte at capture time vs. what a hypothetical
+"continue in the same live slot, never demoted" run would have held at the
+same position — since `trace_probe.py`'s repeat harness always lands on
+`slot=0` in this boot's trace output, a same-slot self-restore is itself
+suspicious and worth an explicit same-slot-vs-different-slot A/B.
+
+### Ranked suspect list (this round's output)
+
+1. **Exact-match `swap_out_image`/`swap_in_image` fidelity for the
+   same-slot-self-restore case** — experimentally confirmed to still
+   corrupt with `truncate()` fully excluded; mechanism not yet identified.
+   Highest priority: it is the ONLY path proven (not just plausible) to
+   reproduce the corruption in isolation from every other named mechanism in
+   this doc.
+2. **`truncate_decode_len`'s incomplete re-derivation of
+   `pending_kv`/`prev_overlap_*`/`sw_window_cache`/flashmla bootstrap flags**
+   — real, source-proven, live gap, but confirmed NOT reachable by any
+   harness this investigation has used. Worth a dedicated multi-turn/agentic
+   repro in a future round (out of scope here).
+3. Every other buffer in the enumeration table — cleared this round with an
+   explicit disposition + citation, not carried forward as a suspect.
+
+All instrumentation reverted after use (`ARLE_DSV4_TRUNCATE_TRACE` trace in
+`executor.rs`) — `git diff` clean on both local and pod trees, confirmed via
+`scripts/pod.sh sync`.
