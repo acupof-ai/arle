@@ -63,7 +63,19 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             self.prefix_cache_stats.lookups = self.prefix_cache_stats.lookups.saturating_add(1);
         }
 
-        let prefix_match = self.clamp_prefix_to_backend(prefix_match);
+        let mut prefix_match = self.clamp_prefix_to_backend(prefix_match);
+        // A full-prompt match must still run one genuine forward+sample step —
+        // jumping straight to `Decoding` leaves `generated_tokens` empty, and the
+        // planner's decode-seed `.or_else` fallback then silently re-feeds the
+        // prompt's own last token as the seed, duplicating it into KV (see
+        // docs/experience/errors/2026-07-06-dsv4-concurrent-decode-digit-corruption-unresolved.md,
+        // "Layer-0-15 residual bisection" section). Trim the last matched block
+        // so the tail always re-prefills through the standard chunked-prefill
+        // path, which samples the first token from real logits.
+        if !prefix_match.is_empty() && prefix_match.matched_len == request.prompt_len() {
+            prefix_match.block_ids.pop();
+            prefix_match.matched_len = prefix_match.block_ids.len() * self.radix.block_size();
+        }
         if prefix_match.is_empty() {
             request.prefill_start_pos = 0;
             request.phase = RequestPhase::Prefilling { progress: 0 };
@@ -120,6 +132,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
 
         request.prefill_start_pos = prefix_match.matched_len.min(request.prompt_len());
         request.reused_prefix_pages = prefix_match.block_ids;
+        request.used_prefix_restore = true;
         request.waiting_hint.immediate_reuse_tokens = request.prefill_start_pos;
         request.waiting_hint.total_reuse_tokens = request.prefill_start_pos;
         request.phase = if request.prefill_start_pos == request.prompt_len() {
@@ -160,6 +173,22 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         if matched_len == 0 {
             return Ok(0);
         }
+        // Never restore the full prompt: the last token must still go through
+        // a genuine forward+sample (matching fresh-prefill's own final-chunk
+        // behavior), never a direct jump to `Decoding` with empty
+        // `generated_tokens` — see
+        // docs/experience/errors/2026-07-06-dsv4-concurrent-decode-digit-corruption-unresolved.md,
+        // "Layer-0-15 residual bisection" section. This route allocates a
+        // fresh, private slot (no radix page sharing), so shaving one raw
+        // token off is safe without any block-alignment concern.
+        let matched_len = if matched_len == request.prompt_len() {
+            matched_len - 1
+        } else {
+            matched_len
+        };
+        if matched_len == 0 {
+            return Ok(0);
+        }
         // Allocate the prefix KV pages (sets the host pool's slot seq_len to
         // matched_len), then restore the device image into them.
         if let Err(err) = self.alloc_with_prefix_reclaim(slot, matched_len) {
@@ -187,6 +216,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         }
 
         request.prefill_start_pos = matched_len;
+        request.used_prefix_restore = true;
         request.waiting_hint.immediate_reuse_tokens = matched_len;
         request.waiting_hint.total_reuse_tokens = matched_len;
         request.phase = if matched_len == request.prompt_len() {
