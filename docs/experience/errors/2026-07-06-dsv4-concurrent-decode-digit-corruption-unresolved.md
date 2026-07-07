@@ -1236,3 +1236,246 @@ numbers (`num_sm_parts`, `topk_len`) pulled from the device. Same lesson as
 this doc's `CUDA_LAUNCH_BLOCKING`/`compute-sanitizer` rounds, applied to
 arithmetic instead of tooling: compute the actual threshold, don't infer
 activity from source shape alone.
+
+## Batch-invariance sweep 2/3 — RMSNorm KILLED structurally, `dsv4_fp8_gemv_batch_cuda` KILLED by arithmetic proof; `proj_batched`'s DeepGEMM-FP8-vs-bf16 switch CONFIRMED-CANDIDATE (2026-07-07)
+
+Continuing the Thinking Machines / vLLM / SGLang "batch invariance" framing
+past the FlashMLA `num_splits` mechanism (killed above): checked the other two
+documented mechanisms — RMSNorm data-parallel↔split-reduction switching, and
+GEMM Split-K/tile-config switching — plus a full grep for any other
+batch-count-conditional dispatch in the DSv4 kernel call chain.
+
+### 1. RMSNorm data-parallel↔split-reduction switching — KILLED structurally, no GPU run needed
+
+Every RMSNorm/LayerNorm kernel DSv4's decode path touches
+(`crates/cuda-kernels/csrc/misc/norm.cu`: `rms_norm_kernel`,
+`rms_norm_batched_kernel`, `fused_add_rms_norm_batched_kernel`,
+`rms_norm_batched_f32_in_kernel`; `crates/cuda-kernels/csrc/misc/dsv4_mhc.cu`:
+`dsv4_mhc_pre_rms_norm_kernel`, `dsv4_mhc_params_pre_rms_norm_kernel`) is
+launched `<<<seq_len (or num_tokens), FIXED_BLOCK>>>` — **one block per row,
+always**, with a compile-time-fixed block size (`NORM_BLOCK=256` in
+`norm.cu`, `1024` in `dsv4_mhc.cu`) and a fixed warp-shuffle + shared-memory
+tree reduction (`warp_reduce_sum`/`block_sum`) inside every kernel, with zero
+branch on `n`/`num_tokens`/`seq_len` inside the reduction itself. The Rust
+call sites (`crates/infer-cuda/src/ops.rs::rms_norm_batch`/`rms_norm_vec`)
+dispatch unconditionally to `rms_norm_batched_cuda`/`rms_norm_cuda` — no
+batch-size-conditional kernel selection exists at the call-site level either.
+
+Grid size (`seq_len`) only changes how many *independent, per-row* blocks run
+side-by-side in the SAME kernel launch — it cannot alter a single row's own
+reduction order, since each block's arithmetic (which elements it sums, in
+what order, via which shuffle/shared-mem steps) is a pure function of
+`hidden_dim` and `threadIdx.x`, never of `blockIdx.x`'s sibling count. This
+matches the reasoning already established for the FlashMLA/scalar-kernel
+distinction in this doc's KV-page-reuse section — the same *class* of
+argument, verified against the actual kernel body rather than assumed.
+**Verdict: KILLED, structural** — this codebase's RMSNorm kernels are
+batch-invariant by construction; no code path exists that could vary with
+batch size, so no GPU run was needed to rule it out.
+
+### 2a. `dsv4_fp8_gemv_batch_cuda` (MHC `mix_fn` / low-rank GEMV path) — prior round's claim VERIFIED, refined to arithmetic proof
+
+Re-read `crates/cuda-kernels/csrc/gemm/quantized_gemv.cu:2561-2590`
+(`dsv4_fp8_gemv_batch_cuda`) directly, per the brief's instruction not to
+trust the prior report's summary. **The prior claim ("never takes a
+tensor-core Split-K path, always the scalar GEMV kernel") is INCOMPLETE**:
+the dispatcher genuinely selects between kernels by batch size —
+`B==1` → `dsv4_fp8_gemv_batch_kernel` (one column per block-column,
+`grid.y=1`); `B>1` → `dsv4_fp8_gemv_batch_tiled_kernel<TILE>` with
+`TILE ∈ {2,4,8,16,32}` chosen by `B`'s bracket
+(`quantized_gemv.cu:2578-2582`) — a real batch-size-conditional kernel
+*selection*.
+
+**But this selection is arithmetically batch-invariant, proven at the source
+level, not inferred.** `dot16_with_decoded` (the tiled kernel's per-column dot
+product, `quantized_gemv.cu:357-384`) and `fp8_f32_dot16` (the untiled
+kernel's, `:321-350`) are **byte-identical expression trees** — same 16 terms,
+same left-to-right `+` order, same intermediate types — the comment at
+`:355-356` ("Same arithmetic + accumulation order... so numerics are
+identical") checks out against the actual code, not just the prose. Both
+kernels use the same `GEMV_THREADS=256`/`GEMV_ROWS=4` constants, the same
+`tid_in_row`/`threads_per_row` thread-to-K-range assignment, the same
+`warp_reduce_sum`, and the same shared-memory inter-warp combine order — for
+a FIXED (row, batch-column), the untiled and every tiled-`TILE` variant
+compute the identical sequence of floating-point operations. The `TILE`
+selection only changes how many *sibling* columns amortize one decoded-weight
+read per k-chunk; it never reorders or reshapes one column's own reduction.
+(The K-alignment fallback path, `(K%16)!=0`, does have a different loop
+nesting order between tiled/untiled variants — but confirmed against the live
+checkpoint's `config.json` (`hidden_size=4096`, `q_lora_rank=1024`,
+`o_lora_rank=1024`, `head_dim=512`, `weight_block_size=[128,128]`) every real
+K this kernel is called with is a multiple of 128, so `K%16==0` always holds
+here — the fallback path is unreachable at this model's dims, moot.)
+**Verdict: KILLED, structural** — real batch-size-conditional kernel
+*selection* exists, but is proven arithmetically invariant per-row/per-column;
+no GPU run needed since the claim is an exact code-equivalence, not an
+inference.
+
+### 2b. `proj_batched` (compressor/indexer/wqkv batched-decode projection) — CONFIRMED-CANDIDATE, pod-verified
+
+Grepping the indexer/compressor call chain (the brief's actual target,
+`crates/infer-cuda/src/attention/dsa.rs` + `dsv4.rs`) past the MHC GEMV led to
+a different, genuinely precision-switching dispatcher:
+`proj_batched` (`crates/infer-cuda/src/attention.rs:7700-7714`), the single
+routing point for the compressor's `wkv`/`wgate` projections
+(`compressor_batch_prepass`), the DSA indexer's `wq_b`/`weights_proj`
+projections (`indexer_query_batch_prepass`), and (a structurally identical
+sibling branch) the fused `wq_a`/`wkv` LoRA projection
+(`attention.rs:4968`, `mla_attention_prepare_proj_batch`):
+
+```rust
+match (cache, scratch) {
+    (Some(cache), Some(scratch)) if input.seq_len > 1 => {
+        prefill_proj_deepgemm(ctx, scratch, cache, input, out)   // FP8-quantized, tensor-core DeepGEMM
+    }
+    _ => dsv4_linear(ctx, weight, input, out),                    // bf16 weight → cublasLt GEMM, full precision
+}
+```
+
+`cache`/`scratch` are the model-wide FP8 DeepGEMM weight cache + prefill
+scratch, populated whenever `dsv4_fp8_linear_deepgemm_enabled()` (= native
+DeepGEMM preflight succeeds — **default ON**, `attention.rs:1630-1637`) — true
+on every pod build/boot in this whole investigation (confirmed: build log
+prints `DeepGEMM native enabled`). `input.seq_len` at these call sites is the
+CURRENT DECODE STEP's row count `n` (the batched-decode prepass operates over
+`normed`, the full N-row batch — `dsv4.rs:2820-2917`). Per this doc's own
+prior substage-diff round: **solo (n=1) decode bypasses this whole batched
+prepass entirely**, running through a separate cached-meta/CUDA-graph-replay
+single-row lane that never calls `proj_batched`. So the real dichotomy is:
+
+- **n=1 (solo decode):** `proj_batched` is never even called — the compressor
+  KV, DSA indexer query/weights, and `wq_a`/`wkv` LoRA projections for THIS
+  decode step run through the single-row lane's own bf16/fused-scalar path.
+- **n≥2 (any concurrent decode):** `proj_batched` is called with
+  `input.seq_len = n > 1`, ALWAYS taking the FP8-quantized DeepGEMM
+  tensor-core branch (given the cache/scratch are populated, true by default)
+  — a materially different numerical pipeline (bf16 activation → FP8 E4M3
+  block-quantize → tensor-core GEMM → dequant) feeding the compressor's
+  latent KV and the DSA/CSA sparse-attention indexer's top-k selection score,
+  not just a different reduction order within the same precision.
+
+**Pod verification (not inference from source reading alone).** Added a
+temporary env-gated trace (`ARLE_DSV4_PROJ_BATCHED_TRACE=1`, reverted after
+use, same precedent as `ARLE_DSV4_SCHED_TRACE`) printing which branch
+`proj_batched` takes + `input.seq_len`. Built (`BUILD_EXIT=0`, log confirms
+`DeepGEMM native enabled`), booted DSv4 TP=4 (GPUs 2/3/4/5, same
+`ARLE_DSV4_MOE_BACKEND=allreduce`/`ARLE_DSV4_INCREMENTAL_KV=1`/
+`ARLE_DSV4_EXPERT_BACKEND=deepgemm`/`--max-total-tokens 2048` config as every
+prior A/B in this doc), ran `concurrent_needle_v3.py` n∈{1,2,3,4}, len=500:
+
+- **`branch=deepgemm_fp8` fired at every observed `seq_len∈{2,3,4}`** —
+  60395+ trace lines at `seq_len=2` alone across the sweep, **100% of
+  observed n≥2 calls**, confirming the FP8 branch is not just reachable but
+  the ONLY branch taken for every concurrent-decode step in this repro.
+- **`branch=scalar_bf16` never fired, at any `n`, including n=1** — confirming
+  solo decode bypasses `proj_batched` entirely (the single-row lane doesn't
+  route through this function at all, matching the prior substage-diff
+  round's finding).
+
+(One instrumentation defect, same failure mode this doc already documented
+once for `eprintln!` under concurrent TP-rank writers: multiple format
+arguments in one `eprintln!` are not one `write()` syscall, so 4 TP-rank
+processes sharing a log fd interleaved trace lines byte-wise. Cosmetic only —
+`grep -o "branch=... seq_len=[0-9]"` recovers clean per-line counts regardless
+of interleaving, and the counts above are read that way.)
+
+**n=2 corrupts — and at a rate exceeding the established n≥3 baseline,
+overturning this investigation's own "requires n≥3" framing.** The entire
+prior investigation swept `n∈{3,4,6,8}` (`job2_ab.sh` and every derived
+harness) — **n=2 was never tested**, so "requires n≥3" was an artifact of
+which values happened to get swept, not a verified floor. Two independent
+same-config boots, `concurrent_needle_v3.py` len=500:
+
+| Boot | n=1 (solo) | n=2 | n=3 | n=4 |
+|---|---|---|---|---|
+| run1 | 2/3 exact (33% miss, n=3 tiny) | 5/30 exact (**83.3% miss**) | 16/24 exact (33.3% miss) | 13/32 exact (59.4% miss) |
+| run2 (replication) | 8/10 exact (20% miss) | 25/40 exact (**37.5% miss**) | — | — |
+| combined n=1 vs n=2 | 10/13 exact (23.1% miss) | 30/70 exact (**57.1% miss**) | | |
+
+Same failure signature as every prior round in this doc — truncation
+(`'The secret access code is 738.'`, both rows in `run1`'s tid=4/tid=6) and
+digit corruption — confirmed by reading the actual decoded text, not just the
+miss count (case-as-fact). n=2's miss rate is **2-4x n=1's floor in both
+independent boots**, comparable to or exceeding n=3/n=4's rate in the same
+boot (not monotonically increasing with n, but decisively non-zero and
+elevated starting exactly at n=2) — matching `proj_batched`'s own structural
+boundary (`input.seq_len > 1`, i.e. any n≥2) far better than a hypothesis that
+requires n≥3 specifically.
+
+**Verdict: CONFIRMED-CANDIDATE — the strongest lead this investigation has
+produced.** A real, structurally-verified batch-count-conditional precision
+switch (bf16 cublasLt at n=1, FP8-quantized DeepGEMM tensor-core GEMM at
+n≥2) exists across four decode-batch projections feeding the compressor's
+latent KV + DSA/CSA indexer's top-k selection score, is confirmed via live
+trace to be the ONLY branch taken at every observed n≥2 in the real repro,
+and its on/off boundary (n=1 vs n≥2) matches a newly-measured corruption
+onset at n=2 that the whole prior investigation had never tested. This is
+independently consistent with three signatures already established
+elsewhere in this doc without this mechanism in view: the **mid-stack
+(layer ~19-21) divergence onset** (squarely in DSv4's CSA/DSA-indexer +
+compressor territory), the **numeric-vs-text 33x needle-content gap** (FP8
+quantization noise plausibly flips a close-call numeric-token decision while
+leaving a word completion's dominant candidate untouched), and the
+**per-row-independent corruption on byte-identical concurrent prompts**
+(FP8 block-quantization of each row's own activation is a per-row op, so
+per-row-random near-tie flips are the expected signature, not
+batch-position-dependent aliasing). **Not yet root-caused to "this is THE
+bug"** — no fix attempted (out of scope this round) and no isolated
+single-variable A/B (disabling native DeepGEMM entirely, the only available
+lever, would also flip `dsv4_decode_proj_deepgemm_enabled`/
+`dsv4_prefill_proj_deepgemm_enabled`/`dsv4_fused_wqkv_decode_enabled`'s
+siblings and the `ARLE_DSV4_EXPERT_BACKEND=deepgemm` MoE requirement
+simultaneously — a genuine multi-variable confound flagged for the next
+pass, not run this round to stay within scope: "confirm, don't fix").
+
+### 3. Other batch-count-conditional dispatch — full grep, one more hit (already covered), rest benign
+
+Grepped `dsv4.rs`/`attention.rs`/`moe.rs`/`hc.rs`/`attention/dsa.rs` for
+`if num_tokens`, `if batch_size`, `if n <`, `seq_len >`/`seq_len ==`-style
+branches selecting between kernel variants:
+
+- **`proj_batched`'s `input.seq_len > 1` branch** (attention.rs:7709) — the
+  confirmed candidate above, counted once.
+- **`mla_attention_prepare_proj_batch`'s `token_count == 1` (fused_wqkv) vs
+  `token_count > 1 && dsv4_fp8_linear_deepgemm_enabled()`** branch
+  (attention.rs:4957-4968) — the sibling of the above for the `wq_a`/`wkv`
+  fused LoRA projection; same mechanism, same gate, not a separate finding.
+- **`dsv4_fp8_gemv_batch_cuda`'s `B==1` vs `B>1` kernel selection**
+  (quantized_gemv.cu:2569) — covered in §2a, proven arithmetically invariant.
+- **`dsv4_flashmla_decode_batched_enabled`/`sched_meta_for_batch`'s
+  `num_splits`** — already covered and KILLED quantitatively in the FlashMLA
+  section above (this doc, same day).
+- **DeepGEMM's own `num_waves`-driven grouped-GEMM config selection**
+  (`deepgemm_native.cu:595-618`) — real, but (per the prior FlashMLA-round's
+  own grep, re-confirmed) not on DSv4's actual decode-MoE call path; the
+  decode lane uses the hand-written fixed-tile
+  `dsv4_fp8_grouped_swiglu_decode_kernel`/`dsv4_fp8_grouped_down_decode_kernel`
+  instead, no `num_sms`/wave-quantization term.
+- **No other `if n ==`/`if batch_size ==`-style branch found** in the
+  DSA/CSA/MHC/MoE kernel call chain beyond the ones above — every other
+  batched kernel launched in this call chain (`deepseek_v4_topk_transform_kernel`,
+  `dsv4_compressor_update_batched_kernel`, the FP8 grouped decode-MoE kernels)
+  is `<<<n, FIXED_BLOCK>>>`/`<<<num_experts, FIXED_BLOCK>>>` with no
+  occupancy- or batch-size-conditional launch-config selection, consistent
+  with the RMSNorm finding in §1.
+
+## Rule (addendum 2)
+
+**"Requires n≥K" is a property of what was swept, not a verified floor, until
+the boundary value is tested.** This whole investigation characterized the
+bug as "n≥3" from its very first localization round and never revisited that
+premise — every subsequent sweep (`job2_ab.sh`, `job3_text_needle.sh`, the
+Qwen3/Qwen3.6 controls) inherited `n∈{3,4,6,8}` without re-testing n=2. n=2
+turned out to corrupt at 37-83% across two independent boots (vs n=1's
+20-33% floor) — a boundary value the whole investigation had silently assumed
+clean. Before trusting an established repro envelope's stated boundary, test
+the boundary itself, not just values comfortably inside it.
+
+**A batch-size-conditional kernel *selection* is not automatically a
+batch-invariance bug — check whether the selected variants are
+arithmetically identical before or after concluding "confirmed."** §2a's
+`dsv4_fp8_gemv_batch_cuda` genuinely dispatches to different kernel code by
+`B`, exactly matching the industry mechanism's shape, yet is proven
+byte-for-byte invariant per-column by reading the two dot-product functions
+side by side — a real dispatch branch is necessary but not sufficient
+evidence; the actual arithmetic (or a live trace + A/B, per §2b) decides it.
