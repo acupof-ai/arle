@@ -97,16 +97,12 @@ print(client.chat.completions.create(
 </p>
 <p align="center"><sub>DSv4 B=1 decode,<b>33.5 → 53.3 tok/s</b>,2026-06-13 → 06-14 campaign —— 每一步都对应一条 <code>docs/experience/wins/</code> 记录。</sub></p>
 
-**On-Policy Distillation 真能提升 student。** 一个 Qwen3.5-4B LoRA student,在自己的 rollout 上对 Qwen3.6-35B-A3B teacher 做蒸馏(teacher 就跑在同一套服务运行时上),把 MATH-500 从 **0.518 → 0.792**(**+27pp、CI 完全分离**),逼近 teacher 的水平(**0.82**):
+**On-Policy Distillation 在 student 自己的 rollout 上真能提升它** —— teacher 就是生产服务本身。Qwen3.5-4B:MATH-500 **+27pp**(0.518 → 0.792,CI 完全分离)· BFCL-live abstention **0.60 → 1.00**。27B 在 **Terminal-Bench** 上:pass@1 **+5.1pp**(20.5 → 25.6%),蒸馏的梯度是输出格式规范性。
 
 <p align="center">
-  <img src="docs/assets/opd-multiseed-curve.png" alt="OPD 多 seed 锁定:Qwen3.5-4B student MATH-500 从 0.518 提升到 0.792(reverse-KL,5 seed 最优),逼近 35B teacher 的 0.82" width="680">
+  <img src="docs/assets/tbench-opd-loss-curve.png" alt="Terminal-Bench OPD 蒸馏 loss:逐步 masked-CE + EMA 趋势,3 epoch 均值 0.2165 → 0.1796 → 0.1453" width="720">
 </p>
-<p align="center"><sub>MATH-500 greedy exact-match,<b>n=500/seed</b> @4096 tokens,0 request-error · 3 recipe × 5 seed,base→step25→step50 · 误差棒 = ±1σ(跨 seed)· base <b>0.518</b> → reverse-KL <b>0.792</b>,CI 完全分离 · 2026-06-20。<a href="docs/experience/wins/2026-06-20-opd-multiseed-math500-lock.md">method</a>。</sub></p>
-
-同一套 loop 也提升 *agentic* 能力:think-on OPD 下 4B student 学会**拒绝不相关的工具调用 —— BFCL-live abstention 0.60 → 1.00**。[<a href="docs/experience/wins/2026-06-20-agentic-opd-thinkon-abstention-win.md">method</a>]
-
-**并且在 agent 轨迹上端到端闭环。** `arle train agent-opd` 让 27B FP8 student 在每任务的 repo 沙箱里驱动真实的 read/write/replace/bash 工具循环;奖励就是执行(对 `git diff` 跑隐藏测试);通过的轨迹以 masked next-token CE 写回,LoRA 每轮同步回 rollout 引擎 —— student 与 rollout 引擎共享同一份 FP8 base 权重(训推一体、零拷贝),**单张 H20 上 ~11.75 s/轮(比朴素 loop 快 37×)**,自带 held-out 执行评测通道(baseline → 逐轮 Δ),12 轮多任务运行 loss 下行、pass-rate ≥ baseline、零 OOM。[<a href="docs/experience/wins/2026-07-03-opd-full20-curve.md">loop perf</a> · <a href="docs/experience/wins/2026-07-03-agent-opd-27b-loop-stability-12rounds.md">12 轮运行</a>]
+<p align="center"><sub>TB-OPD 蒸馏 loss,27B student · 41 records × 3 epochs · <b>0.2165 → 0.1796 → 0.1453</b>。<a href="docs/experience/wins/2026-06-20-opd-multiseed-math500-lock.md">MATH</a> · <a href="docs/experience/wins/2026-07-07-terminal-bench-opd-format-distill-lift.md">Terminal-Bench</a></sub></p>
 
 **稳定度:** CUDA **Stable** · Metal **Beta**(DFlash + Qwen3.6 NextN-MTP:推测解码比特一致)· OPD 训练 **Beta**(比 HF TRL `GKDTrainer` 快 ~2×,Qwen3-0.6B 实测 2.04–2.49×;LoRA 4 GB 显卡可跑)· CPU 仅开发用。模型:Qwen3-dense + Qwen3.5/3.6(hybrid·MoE)on CUDA + Metal;DeepSeek-V4-Flash + GLM-5.2(CUDA 8×H20 TP=8/EP=8;GLM-5.2 verify pending)· Qwen3.6 + Gemma4 · DeepSeek-OCR VLMs + DiffusionGemma(Metal)。完整等级:[support-matrix](docs/support-matrix.md) · [stability-policy](docs/stability-policy.md)。
 
