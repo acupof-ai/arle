@@ -15,7 +15,10 @@ N_ATTEMPTS=${N_ATTEMPTS:-3}
 EPOCHS=${EPOCHS:-2}
 GPU=${GPU:-1}
 DS=terminal-bench-core==0.1.1
-TASKS=${TASKS:-"hello-world chess-best-move fibonacci-server fix-git fix-permissions csv-to-parquet openssl-selfsigned-cert configure-git-webserver git-workflow-hack nginx-request-logging password-recovery heterogeneous-dates grid-pattern-transform"}
+# Wider difficulty spread (Tmax: a calibrated range keeps a sweet-spot band with
+# gradient) — light/medium tasks only; heavy builds (qemu/kernel/torch/HF-dataset)
+# excluded. The soft-filter above then distils only the sweet-spot subset.
+TASKS=${TASKS:-"hello-world chess-best-move fibonacci-server fix-git fix-permissions csv-to-parquet openssl-selfsigned-cert configure-git-webserver git-workflow-hack nginx-request-logging password-recovery heterogeneous-dates grid-pattern-transform crack-7z-hash extract-safely fix-pandas-version organization-json-generator polyglot-c-py polyglot-rust-c processing-pipeline get-bitcoin-nodes cron-broken-network new-encrypt-command git-multibranch conda-env-conflict-resolution create-bucket intrusion-detection jupyter-notebook-server"}
 TASK_FLAGS=""; for t in $TASKS; do TASK_FLAGS="$TASK_FLAGS -t $t"; done
 
 mkdir -p $WORK
@@ -45,22 +48,24 @@ for r in $(seq 0 $((ROUNDS-1))); do
     --output-path $RUNDIR > $WORK/eval_r$r.log 2>&1
   RUN=$(ls -td $RUNDIR/*/ 2>/dev/null | head -1)
 
-  # 3. pass@1 + passing trials
+  # 3. pass@1 + SWEET-SPOT passing trials (Tmax soft-filter: only tasks with
+  #    0<passes<attempts carry gradient; always-pass = 0-gradient, drop them).
   read PASS1 TRIALS PASSING < <($PY - "$RUN/results.json" <<'PYEOF'
-import json,sys,collections
+import json,sys,collections,re
 d=json.load(open(sys.argv[1])); rows=d.get("results",[])
 by=collections.defaultdict(dict)
 for x in rows:
     tn=x.get("trial_name",""); tid=x.get("task_id"); ok=1 if x.get("is_resolved") else 0
-    # attempt idx from "task.N-of-K"
-    import re; m=re.search(r"\.(\d+)-of-\d+", tn); a=int(m.group(1)) if m else 1
+    m=re.search(r"\.(\d+)-of-\d+", tn); a=int(m.group(1)) if m else 1
     by[tid][a]=(ok,tn)
 p1=sum(1 for t in by if by[t].get(1,(0,))[0]==1)  # attempt-1 = pass@1
-passing=[v[1] for t in by for a,v in by[t].items() if v[0]==1]
+# sweet spot: 0 < task-passes < attempts (drops always-pass zero-gradient tasks)
+sweet=[t for t in by if 0 < sum(o for o,_ in by[t].values()) < len(by[t])]
+passing=[v[1] for t in sweet for a,v in by[t].items() if v[0]==1]
 print(p1, len(rows), " ".join(passing))
 PYEOF
 )
-  echo "round $r: pass@1=$PASS1/${TRIALS:-?}  passing_trials=$(echo $PASSING | wc -w)"
+  echo "round $r: pass@1=$PASS1/${TRIALS:-?}  sweet-spot passing_trials=$(echo $PASSING | wc -w)"
 
   # 4. collect passing trajectories -> records, append to cumulative
   NEWREC=0
