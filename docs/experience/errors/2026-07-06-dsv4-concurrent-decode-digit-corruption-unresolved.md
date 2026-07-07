@@ -1567,3 +1567,127 @@ same scope-discipline reason Experiment A was skipped): force bf16 at BOTH
 gates simultaneously — if digit corruption then reaches zero at n=2, that
 closes the loop from "confirmed-candidate" to "confirmed root cause."
 Reverted cleanly after the run (`git diff` clean, pod tree re-synced to match).
+
+## Second FP8 gate bf16-force — BLOCKED, no bf16 weight exists for this gate (2026-07-07)
+
+Follow-up to Experiment B's own next step: force bf16 at the sibling gate too
+(`mla_attention_prepare_proj_batch`, cited last round as "attention.rs:~4968")
+and see if the residual 4/40 `7381239`-vs-`738291` corruption goes to zero.
+**Blocked before any code was touched** — read the gate and its fallback branch
+first, per this round's own brief, and the premise doesn't hold.
+
+**Line-number correction.** attention.rs:4968 is inside `mla_attention_prepare`
+(the single-row/prefill/chunked-prefill PREPARE, called only from `mla_attention`,
+`attention.rs:3918`) — **not** `mla_attention_prepare_proj_batch`, which is a
+separate function starting at `attention.rs:5435` and is the *only* caller on the
+n≥2 batched-decode path (`dsv4.rs:2846`, the sole call site). Last round's citation
+conflated the two similarly-named functions; `mla_attention_prepare`'s
+`token_count > 1` branch fires only for a single request's own multi-token
+prefill, never for concurrent-decode batching. The actual gate for this
+investigation is `mla_attention_prepare_proj_batch`'s `use_deepgemm`
+(`attention.rs:5511-5515`:
+`dsv4_fp8_linear_deepgemm_enabled()? && attention.wqkv_a_deepgemm.is_some() &&
+attention.wq_b_deepgemm.is_some() && prefill_shared.is_some()`), guarding the
+same `wq_a`/`wq_b`/`wkv` LoRA projections as `proj_batched`'s sibling call but for
+the main MLA Q/KV path instead of the compressor/indexer.
+
+**Premise check: does the fallback branch compute in bf16?** Read the `else`
+branch (`attention.rs:5554-5588`) — it calls `dsv4_linear(ctx, &attention.wq_a,
+normed, &mut c_q)` / `&attention.wq_b` / `&attention.wkv`, the same three
+`DeviceMatrix`es. `dsv4_linear` (`attention.rs:1566-1579`) dispatches on
+`weight.weight_format`: `DenseBf16` → `gemm_batch` (bf16 cublasLt, the true bf16
+path); `Dsv4Fp8BlockScaled`/`Dsv4Fp4BlockScaled` → `mla_linear`
+(`attention.rs:992-1058`), which for `Dsv4Fp8BlockScaled` calls
+`ffi::dsv4_fp8_gemv_batch_cuda` — **the exact kernel this same investigation
+already analyzed in "Batch-invariance sweep 2/3" §2a and proved byte-for-byte
+arithmetically identical between its `B==1` and `B>1` tiled-dispatch variants**
+(`quantized_gemv.cu:321-350` vs `:357-384`, same 16-term expression tree, same
+accumulation order).
+
+**Checkpoint-level verification (not source inference alone) — no bf16 raw
+tensor exists for these weights.** `crates/infer-cuda/src/loader.rs:3737-3746`:
+for non-GLM DSv4 (this checkpoint), `wq_a`/`wkv` load via
+`load_dsv4_block_scaled` (`loader.rs:3024-3073`), which **requires the raw
+checkpoint tensor dtype to be `F8_E4M3`** — `bail!`s on anything else (I8/FP4
+fail-closed per #137, all other dtypes rejected outright; no `BF16`/`F32` arm
+exists in this function, unlike the compressor/indexer's dtype-dispatching
+`load_dsv4_global_matrix`). Read the actual pod checkpoint header directly
+(`/host/DeepSeek-V4-Flash-FP8/model-00005-of-00046.safetensors`, layer 3, both
+local grep of `deepseek-spec` tensor-name mapping and a pod-side Python
+safetensors-header parse):
+
+| Tensor | dtype | Sidecar `.scale`? |
+|---|---|---|
+| `layers.3.attn.wq_a.weight` | **F8_E4M3** | yes |
+| `layers.3.attn.wq_b.weight` | **F8_E4M3** | yes |
+| `layers.3.attn.wkv.weight` | **F8_E4M3** | yes |
+| `layers.3.attn.compressor.wkv.weight` | **BF16** | no |
+| `layers.3.attn.compressor.wgate.weight` | **BF16** | no |
+
+Confirms the asymmetry directly from the checkpoint bytes: the compressor
+weights (first gate, `proj_batched`, already forced last round) really are
+bf16 in this checkpoint — Experiment B's "bf16-forced" label was accurate there.
+The main MLA `wq_a`/`wq_b`/`wkv` weights (this second gate) are **F8_E4M3 in the
+checkpoint with no bf16 sibling tensor at all** — there is nothing on disk to
+load as a dense-bf16 alternative.
+
+**Every code path touching `wq_a`/`wq_b`/`wkv` computes in FP8, never bf16** —
+checked all three: the B=1 fused-decode path (`run_fused_wqkv_decode`,
+`attention.rs:3407-3506`, quantizes into FP8 and runs DeepGEMM tensor-core);
+the batched-decode `use_deepgemm=true` branch (`run_fused_wqkv_prefill` +
+`prefill_proj_deepgemm`, `attention.rs:5511-5554`, same FP8 DeepGEMM); and the
+`use_deepgemm=false` fallback just analyzed above (`dsv4_linear` →
+`mla_linear` → `dsv4_fp8_gemv_batch_cuda`, scalar FP8 GEMV). There is no third
+option and no dormant bf16 branch to flip on — matching this doc's own
+`MHC TF32-prenorm eager-fallback test` precedent (a hypothesis blocked because
+the premise it needed didn't exist in ARLE's code, not because the flip was
+merely inconvenient).
+
+**Verdict: BLOCKED — not "hard to flip," genuinely nothing to flip to.**
+Forcing `use_deepgemm=false` on this gate would not test "bf16 vs FP8" (the
+brief's stated hypothesis); it would reroute to `dsv4_fp8_gemv_batch_cuda`,
+a *different* FP8 kernel this investigation already proved arithmetically
+batch-invariant in an earlier round of the *same day*. Running it would not
+distinguish "this gate doesn't contribute to the corruption" from "this gate's
+only alternative was already proven to never vary with batch size regardless" —
+a confound in the interpretation, not just a perf tradeoff, so declined per this
+round's own scope guardrail (item 4: don't force a fix that introduces a new
+confound). A genuine bf16 alternative for `wq_a`/`wq_b`/`wkv` would require
+adding host-side FP8→bf16 block-dequantization to the loader (`loader.rs`) —
+real feature work, not a same-day, single-variable correctness probe.
+
+**Net position, unchanged from Experiment B.** `proj_batched`'s FP8 gate
+(compressor/indexer projections) is a confirmed, measured, causal contributor
+(57.1% → 30.0% at n=2, digit-corruption reduced but not eliminated). The
+sibling gate on the main MLA Q/KV path cannot be given an equivalent bf16 A/B
+without new dequantization infrastructure; its only non-DeepGEMM alternative
+(scalar FP8 GEMV) was independently already shown batch-invariant, so it's a
+weak suspect for the *batch-count-dependent* part of the corruption specifically
+(though it remains an FP8-numerics suspect in general, untested). The residual
+4/40 `7381239` corruption from Experiment B is still unattributed — next
+candidates, per this doc's existing shortlist, are the FP8 grouped-GEMM
+decode-MoE kernels (`dsv4_fp8_grouped_swiglu_decode_kernel`/
+`dsv4_fp8_grouped_down_decode_kernel`, never precision-A/B'd) or the DSA
+`radix_topk` unbounded-write hypothesis (memcheck-blind, still not
+source-verified against its round-3 count invariant).
+
+**No code changed this round** (`git diff` clean on both local and pod trees —
+the blocking determination came from reading `attention.rs`/`loader.rs` plus a
+direct pod-side safetensors-header parse, not from a build/run). No new
+pod-side diagnostic left in place; nothing to revert.
+
+## Rule (addendum 3)
+
+**A "bf16 alternative" claim needs the actual weight dtype checked, not
+assumed from a sibling code path's comment.** `proj_batched`'s inline comment
+("the DSv4 compressor weights are bf16") was correct for *that* function's
+weights but doesn't transfer to a structurally similar sibling gate
+(`mla_attention_prepare_proj_batch`) guarding *different* tensors — checked
+directly against the checkpoint's safetensors header (`F8_E4M3` for
+`wq_a`/`wq_b`/`wkv`, `BF16` for `compressor.wkv`/`wgate`, same layer, same file)
+rather than inferring from the first gate's precedent. **A same-named-looking
+dispatch branch ("FP8 DeepGEMM vs scalar fallback") is not automatically an
+"FP8 vs bf16" dispatch** — the fallback can itself be a *different FP8 kernel*
+(as it is here, `dsv4_fp8_gemv_batch_cuda`) when the weight was never stored in
+bf16 to begin with; verify the fallback's actual output precision before
+building an A/B around the assumption that "not-DeepGEMM" means "bf16."
