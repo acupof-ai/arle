@@ -280,12 +280,6 @@ impl Dsv4FlashMlaDecodeState {
         self.fp8_kv_comp_packed_rows = 0;
     }
 
-    /// This (slot, layer) FlashMLA decode state's pool slot index — the ONLY
-    /// per-row varying input selecting the page table in the batched pack (op "c").
-    pub(crate) fn slot_idx(&self) -> usize {
-        self.slot_idx
-    }
-
     /// SW sub-pool block count (= `ceil(sliding_window/page_block_size)`, uniform
     /// across a layer's slots); the batched compressed-delta pack's `sw_blocks`.
     pub(crate) fn sw_blocks(&self) -> usize {
