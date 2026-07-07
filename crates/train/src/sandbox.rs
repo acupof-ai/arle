@@ -630,7 +630,12 @@ pub fn score_workdir(
             after_minus_header = line.starts_with("--- ");
         }
 
-        let patch_file = workdir.join(".arle_test_patch.diff");
+        // Write via the full (possibly-relative) path from the process cwd, but
+        // hand `git apply` the bare filename: `git -C workdir` resolves a
+        // file-arg relative to workdir, so a workdir-relative path would double
+        // the prefix ("can't open patch") whenever work_root is relative.
+        let patch_name = ".arle_test_patch.diff";
+        let patch_file = workdir.join(patch_name);
         fs::write(&patch_file, test_patch)
             .with_context(|| format!("failed to write test patch {}", patch_file.display()))?;
         let mut apply_cmd = Command::new("git");
@@ -638,7 +643,7 @@ pub fn score_workdir(
             .arg("-C")
             .arg(workdir)
             .arg("apply")
-            .arg(&patch_file);
+            .arg(patch_name);
         let apply = plain_output(&mut apply_cmd, "git apply")?;
         let _ = fs::remove_file(&patch_file);
         if !apply.success {
