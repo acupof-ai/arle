@@ -1479,3 +1479,91 @@ arithmetically identical before or after concluding "confirmed."** §2a's
 byte-for-byte invariant per-column by reading the two dot-product functions
 side by side — a real dispatch branch is necessary but not sufficient
 evidence; the actual arithmetic (or a live trace + A/B, per §2b) decides it.
+
+## `proj_batched` bf16-force A/B (Experiment B) — PARTIALLY CONFIRMS: precision-path is a real, measured contributor, not the sole cause (2026-07-07)
+
+Single-variable follow-up to §2b's CONFIRMED-CANDIDATE: hold `proj_batched`'s
+kernel selection **constant** (always bf16 cublasLt, never the FP8 DeepGEMM
+branch) and re-run the exact same n=1×10/n=2×20/len=500 sweep
+(`job_projtrace2.sh`, unmodified) that produced §2b's 20-33%(n=1)/37.5-83.3%(n=2)
+table, on the same config (TP=4, GPUs 2/3/4/5, `ARLE_DSV4_MOE_BACKEND=allreduce`,
+`ARLE_DSV4_INCREMENTAL_KV=1`, `ARLE_DSV4_EXPERT_BACKEND=deepgemm`,
+`--max-total-tokens 2048`, `DeepSeek-V4-Flash-FP8`).
+
+**Experiment A (force FP8 at n=1) — not run, precondition fails.** Re-checked
+against the actual call graph before attempting it: `executor.rs:2865`
+special-cases `batch.rows.len() == 1` into `forward_decode_row` →
+`forward_tokens_decode_graph`, a CUDA-graph-replay single-row lane that never
+calls `Dsv4Model::forward_decode_batch` (`dsv4.rs:2542`, "N=1 never reaches
+this function") and therefore never calls `proj_batched` at all — confirmed by
+static read, matching §2b's own finding. Flipping `proj_batched`'s gate is
+therefore a no-op for n=1 regardless of direction; the only way to make n=1
+take the FP8 branch would be to ALSO force it through the batched multi-row
+lane, which confounds precision with lane-selection (graph-replay vs not,
+different scratch, different keepalive discipline) — not a single-variable
+test. Skipped per this doc's own "isolate confounders" discipline rather than
+run a confounded experiment.
+
+**Experiment B (force bf16 at n≥2) — one-line change, pod-verified.**
+`crates/infer-cuda/src/attention.rs:7700-7714`, changed only the match guard:
+
+```rust
+(Some(cache), Some(scratch)) if false && input.seq_len > 1 => {   // was: input.seq_len > 1
+```
+
+Built (`BUILD_EXIT=0`, `--release --features cuda,nccl` — TP=4 serve needs
+`nccl`, a build-config gap hit and fixed en route, not a code change), booted,
+ran the sweep on a fresh port:
+
+| Arm | n | Requests | Exact | Miss | Miss rate | Digit-corruption instances |
+|---|---|---|---|---|---|---|
+| bf16-forced (this experiment) | 1 | 10 | 7 | 3 | 30.0% | 0 |
+| bf16-forced (this experiment) | 2 | 40 | 28 | 12 | 30.0% | 4 (10.0%) |
+| default FP8 (§2b, run1+run2 combined) | 1 | 13 | 10 | 3 | 23.1% | — |
+| default FP8 (§2b, run1+run2 combined) | 2 | 70 | 30 | 40 | 57.1% | — |
+
+n=2's overall miss rate drops from the established 57.1% (default FP8) to
+30.0% (bf16-forced) — landing almost exactly on n=1's own floor (30.0% here,
+20-33% established) instead of 2-4x above it. Read as raw miss rate this looks
+like a clean confirmation.
+
+**But decoded at the case level (case-as-fact, not aggregate-only) it's only a
+partial explanation.** Breaking n=2's 12 misses down by failure signature
+(same method as this doc's original Root Cause section): 8/12 are truncation
+(`'The secret access code is 738.'`-style, same signature seen throughout this
+doc, mechanism outside `proj_batched`'s scope) and **4/12 are digit
+corruption** — all four are the *same* wrong string, `'**7381239**'` (needle
+`738291`), recurring byte-identical across four different trials with
+byte-distinct salted prompts (tid=14, 20, 26, 27). Digit corruption did **not**
+go to zero.
+
+**Root cause of the residual 4/40: the untouched sibling switch, not a gap in
+the hypothesis.** §2b's own text already named a second, structurally
+identical FP8 gate that this experiment deliberately did not touch, per the
+brief's "change ONLY the seq_len gate condition, nothing else" scope:
+`mla_attention_prepare_proj_batch` (`attention.rs:4968`,
+`token_count > 1 && dsv4_fp8_linear_deepgemm_enabled()`), which projects the
+fused `wq_a`/`wkv` LoRA for the *same* n=2 decode step and still takes its FP8
+DeepGEMM branch in this experiment (this branch's bf16 alternative is not a
+one-line flip — it computes into different-shaped intermediates via a
+completely different fused-decode code path sized for B=1 — genuinely out of
+scope for a single-gate change). The residual corruption's determinism (same
+exact wrong digit string 4/4 times, not 4 different random near-tie flips) is
+consistent with a systematic FP8 quantization bias in that remaining path
+producing a repeatable wrong logit at the same near-tied token position,
+rather than evidence against the precision-path mechanism.
+
+**Verdict: PARTIALLY CONFIRMS — precision-path is a real, measured, causal
+contributor to the n≥2 digit-corruption failure mode (not batch-count per
+se), but `proj_batched` alone is not the sole source; a second FP8 gate
+(`mla_attention_prepare_proj_batch`) on the same decode step remains
+unattributed.** This is the strongest evidence this investigation has
+produced: a single-line, single-variable change to one of (at least) two
+known FP8-switching call sites cut n=2's overall miss rate by ~1.9x (57.1% →
+30.0%) and brought it to parity with n=1's own floor, while the residual
+digit-corruption instances land entirely on the one sibling gate this
+experiment left untouched by design. Next clean step (not run this round,
+same scope-discipline reason Experiment A was skipped): force bf16 at BOTH
+gates simultaneously — if digit corruption then reaches zero at n=2, that
+closes the loop from "confirmed-candidate" to "confirmed root cause."
+Reverted cleanly after the run (`git diff` clean, pod tree re-synced to match).
