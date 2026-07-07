@@ -823,7 +823,9 @@ pub(crate) enum TrainCommand {
     /// against a per-task repo sandbox (SWE-bench-Pro). The reward is execution
     /// (run the hidden tests), no text judge — passing trajectories are written
     /// back as CE targets.
-    AgentOpd(TrainAgentOpdArgs),
+    // Boxed: the largest command variant — keeps `TrainCommand` compact
+    // (clippy::large_enum_variant).
+    AgentOpd(Box<TrainAgentOpdArgs>),
     /// Convert captured `/v1/messages` dumps (`arle serve --dump-messages-dir`)
     /// into verl-style token records for the agent-OPD masked-CE replay
     /// (`agent-opd --replay-records`).
@@ -1538,6 +1540,12 @@ pub(crate) struct TrainAgentOpdArgs {
     /// then --save-checkpoint, then the current dir.
     #[arg(long, value_name = "DIR")]
     pub(crate) eval_out_dir: Option<PathBuf>,
+
+    /// Structured per-round metrics sink (one JSON line per round: the full
+    /// round report + phase timers + held-out pass-rate). Defaults to
+    /// <eval-out-dir>/metrics.jsonl.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) metrics_out: Option<PathBuf>,
 
     /// Sampling temperature for the held-out eval rollout (0.0 = greedy). Kept
     /// separate from --rollout-temperature so eval is deterministic-ish while
