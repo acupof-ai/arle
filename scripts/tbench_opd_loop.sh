@@ -19,6 +19,8 @@ DS=terminal-bench-core==0.1.1
 # Optional: run on a generated difficulty-calibrated pool (workstream 4) instead
 # of the curated TB tasks. When set, uses `--dataset-path` over all its tasks.
 DATASET_PATH=${DATASET_PATH:-}
+CURRICULUM=${CURRICULUM:-}   # 1 = generate initial pool + diagnose-then-target each round (③)
+GEN_N=${GEN_N:-40}
 # Wider difficulty spread (Tmax: a calibrated range keeps a sweet-spot band with
 # gradient) — light/medium tasks only; heavy builds (qemu/kernel/torch/HF-dataset)
 # excluded. The soft-filter above then distils only the sweet-spot subset.
@@ -31,6 +33,13 @@ CUM=$WORK/records_cum.jsonl; : > $CUM
 LORA=""
 export PATH="$HOME/.local/bin:$PATH"
 export DOCKER_HOST=unix:///run/podman/podman.sock
+
+# ③ curriculum: seed the initial generated pool
+if [ -n "$CURRICULUM" ]; then
+  DATASET_PATH=$WORK/pool_r0
+  $PY $ROOT/scripts/gen_terminal_tasks.py --out $DATASET_PATH --n $GEN_N --seed 0 --self-check >/dev/null 2>&1
+  echo "curriculum: initial pool $(ls $DATASET_PATH 2>/dev/null | wc -l) tasks"
+fi
 
 kill_serve(){ pkill -f "arle serve.*--port $PORT" 2>/dev/null; sleep 5; }  # port-scoped (parallel-safe)
 wait_serve(){ for i in $(seq 1 60); do curl -s --max-time 3 http://127.0.0.1:$PORT/v1/models >/dev/null 2>&1 && return 0; sleep 10; done; return 1; }
@@ -92,6 +101,37 @@ PYEOF
       --lora-rank 16 --lora-alpha 32 --lora-target-set attention-qv --writeback-window 1024 \
       --writeback-cap 60 --save-lora-adapters $WORK/lora_r$r > $WORK/distill_r$r.log 2>&1
     [ -f "$WORK/lora_r$r/adapters_replay/adapter_model.safetensors" ] && LORA=$WORK/lora_r$r/adapters_replay/adapter_model.safetensors
+  fi
+
+  # ③ Curriculum (Agent-World): diagnose the frontier domain (lowest pass-rate,
+  # non-zero) and regenerate next round's pool oversampling it, so the sweet-spot
+  # band tracks the model's weakness. Only in CURRICULUM + generated-pool mode.
+  if [ -n "$CURRICULUM" ] && [ -n "$DATASET_PATH" ] && [ "$r" -lt "$((ROUNDS-1))" ]; then
+    FRONTIER=$($PY - "$RUN/results.json" "$DATASET_PATH" <<'PYEOF'
+import json,sys,glob,os,collections
+try: import yaml
+except Exception: yaml=None
+res=json.load(open(sys.argv[1])).get("results",[]); pool=sys.argv[2]
+dom={}
+for f in glob.glob(pool+"/*/task.yaml"):
+    cat="?"
+    for ln in open(f):
+        if ln.startswith("category:"): cat=ln.split(":",1)[1].strip(); break
+    dom[os.path.basename(os.path.dirname(f))]=cat
+agg=collections.defaultdict(lambda:[0,0])
+for x in res:
+    d=dom.get(x.get("task_id"),"?"); agg[d][0]+=1 if x.get("is_resolved") else 0; agg[d][1]+=1
+cand=[(p/n,d) for d,(p,n) in agg.items() if 0<p<n]   # struggle-but-not-hopeless
+print(min(cand)[1] if cand else "")
+PYEOF
+)
+    if [ -n "$FRONTIER" ]; then
+      NEXT=$WORK/pool_r$((r+1))
+      $PY $ROOT/scripts/gen_terminal_tasks.py --out $NEXT --n $GEN_N --seed $((r+1)) --self-check >/dev/null 2>&1
+      $PY $ROOT/scripts/gen_terminal_tasks.py --out $NEXT --n $((GEN_N/2)) --seed $((100+r)) --domains "$FRONTIER" --self-check >/dev/null 2>&1
+      DATASET_PATH=$NEXT
+      echo "curriculum: frontier=$FRONTIER -> next pool $(ls $NEXT 2>/dev/null | wc -l) tasks"
+    fi
   fi
 done
 kill_serve
