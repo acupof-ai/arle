@@ -1,0 +1,21 @@
+docs/experience/wins/2026-07-07-dsv4-decode-optimization-fullchain-budget.md
+  s_b3b5c340d89689::t_b326476636daef 1-433
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "4b485aa25683923705bfe5bcd33b9a29fe95a2c0",
+  "prompts": {},
+  "sessions": {
+    "s_b3b5c340d89689": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9c2c33cd-ad2a-4398-944f-e13bf0f4385a",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
