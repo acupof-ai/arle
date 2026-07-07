@@ -53,7 +53,9 @@ use crate::{
 };
 #[cfg(feature = "cuda")]
 use crate::{infer_student::InferStudent, lora::LoraConfig};
-use autograd::ops::{add, fused_linear_distill::fused_linear_ce_loss_indexed, mul_scalar, slice};
+use autograd::ops::{
+    add, fused_linear_distill::fused_linear_ce_loss_indexed, matmul_bt, mul_scalar, reshape, slice,
+};
 
 /// Routes the OPD rollout through the in-process infer engine (`InferStudent`)
 /// instead of the train-crate decode. Built only when the infer arm is selected
@@ -3382,6 +3384,219 @@ pub fn masked_writeback_ce_step_dispatch<O: Optimizer>(
             store,
         )
     }
+}
+
+/// Group the masked (LLM-generated) predicting positions into maximal
+/// contiguous `[start, end)` runs, then sub-window each run by `window_size`.
+///
+/// `masked_positions` are the predicting positions `p` (sorted ascending) whose
+/// next token is LLM-generated — the ones that receive KL loss. Tool/environment
+/// tokens leave gaps, so consecutive `p`s form runs; scoring one run's logit tile
+/// at a time keeps tool-token positions out of the loss (mirroring the masked-CE
+/// path) while bounding each `[1, window, vocab]` tile to `window_size` rows.
+fn masked_gkd_windows(masked_positions: &[usize], window_size: usize) -> Vec<SequenceWindow> {
+    let mut windows = Vec::new();
+    let mut i = 0;
+    while i < masked_positions.len() {
+        let start = masked_positions[i];
+        let mut end = start + 1;
+        let mut j = i + 1;
+        while j < masked_positions.len() && masked_positions[j] == end {
+            end += 1;
+            j += 1;
+        }
+        // Sub-window the contiguous run so no logit tile exceeds window_size rows.
+        let mut s = start;
+        while s < end {
+            let e = (s + window_size).min(end);
+            windows.push(SequenceWindow { start: s, end: e });
+            s = e;
+        }
+        i = j;
+    }
+    windows
+}
+
+/// GKD (per-token teacher-KL) writeback for agent-OPD replay — the distillation
+/// sibling of [`masked_writeback_ce_step`]. Instead of hard next-token CE on the
+/// passing trajectory tokens, it distils a TEACHER's per-position distribution on
+/// the SAME masked (LLM-generated) positions via forward-KL, so the signal is
+/// dense (every vocab logit, not one hard target) rather than pure reproduction.
+///
+/// Mirrors the CE path's structure: ONE gradient-checkpointed
+/// `forward_hidden_states` over `prompt ++ response` → `[1, seq, hidden]`, then
+/// per masked window `[ws, we)` computes the student logits
+/// `hidden[ws..we] @ lm_headᵀ` → `[1, w, vocab]`, forwards the frozen TEACHER over
+/// the same window → `[1, w, vocab]`, and reuses
+/// [`kl_distill_loss_chunked`](crate::loss::kl_distill_loss_chunked) (forward KL,
+/// `batchmean`) — chunking the softmax intermediates. Windows track contiguous
+/// runs of the `response_mask` so tool/environment positions never receive loss.
+/// The returned scalar is the target-count-weighted mean KL per masked token.
+///
+/// `window_size` (reuse `--writeback-window`) bounds each `[1, w, vocab]` tile;
+/// unlike the CE path a full-vocab logit tile is inherent to KL, so prefer a
+/// smaller window here than for masked CE.
+///
+/// `entropy_weight > 0` (AEPO) is not yet wired — per-position entropy weighting
+/// needs the pre-reduction per-position KL, which `kl_distill_loss_chunked`
+/// collapses; it is flagged (loud TODO log), never silently dropped.
+#[allow(clippy::too_many_arguments)]
+pub fn gkd_writeback_step<O: Optimizer, T: TeacherForward + ?Sized>(
+    student: &Qwen35Model,
+    teacher: &T,
+    all_model_params: &[TensorId],
+    trainable_params: &[TensorId],
+    optimizer: &mut O,
+    prompt_ids: &[u32],
+    response_ids: &[u32],
+    response_mask: &[u8],
+    vocab: usize,
+    window_size: usize,
+    temperature: f32,
+    entropy_weight: f32,
+    store: &mut TensorStore,
+) -> Result<f32> {
+    if prompt_ids.is_empty() {
+        return Err(OpdError::InvalidInput(
+            "GKD writeback requires a non-empty prompt".to_owned(),
+        ));
+    }
+    if window_size == 0 {
+        return Err(OpdError::InvalidInput(
+            "GKD writeback window_size must be > 0".to_owned(),
+        ));
+    }
+    if teacher.vocab_size() != vocab {
+        return Err(OpdError::InvalidInput(format!(
+            "GKD writeback teacher vocab_size {} != student vocab {vocab}",
+            teacher.vocab_size()
+        )));
+    }
+    if entropy_weight > 0.0 {
+        // AEPO entropy weighting stub — flagged, not silently dropped. TODO: expose
+        // the per-position KL before reduction so each position can be scaled by
+        // (1 + w * normalized_student_entropy); kl_distill_loss_chunked currently
+        // returns only the reduced mean.
+        eprintln!(
+            "[gkd-writeback] TODO --gkd-entropy-weight={entropy_weight} is NOT YET \
+             IMPLEMENTED (needs pre-reduction per-position KL); running UNWEIGHTED KL"
+        );
+    }
+
+    let prompt_len = prompt_ids.len();
+    let full: Vec<u32> = prompt_ids
+        .iter()
+        .copied()
+        .chain(response_ids.iter().copied())
+        .collect();
+    let seq_len = full.len();
+    if seq_len > u32::MAX as usize {
+        return Err(OpdError::InvalidInput(format!(
+            "GKD writeback trajectory length {seq_len} exceeds u32::MAX position ids."
+        )));
+    }
+    let positions: Vec<u32> = (0..seq_len as u32).collect();
+
+    let loss_targets = build_masked_loss_targets(&full, prompt_len, response_mask);
+    if loss_targets.is_empty() {
+        eprintln!(
+            "[gkd-writeback] no LLM-generated targets (prompt_len={prompt_len}, \
+             response_len={}, mask_ones={}); skipping (nothing to train)",
+            response_ids.len(),
+            response_mask.iter().filter(|&&m| m == 1).count(),
+        );
+        return Ok(0.0);
+    }
+    let masked_positions: Vec<usize> = loss_targets.iter().map(|&(p, _)| p).collect();
+    let total_targets = masked_positions.len();
+    let windows = masked_gkd_windows(&masked_positions, window_size);
+
+    let mut tape = Tape::new();
+    let offload_checkpoints = !matches!(
+        std::env::var("ARLE_OPD_WRITEBACK_OFFLOAD").as_deref(),
+        Ok("0") | Ok("false") | Ok("FALSE")
+    );
+    tape.set_offload_checkpoints(offload_checkpoints);
+    tape.set_enabled(true);
+    let keep_extra: HashSet<TensorId> = HashSet::new();
+    eprintln!(
+        "[gkd-writeback] seq_len={seq_len} total_targets={total_targets} \
+         windows={} temperature={temperature} offload_checkpoints={offload_checkpoints}",
+        windows.len()
+    );
+
+    // ONE checkpointed forward over prompt++response → [1, seq, hidden]; the
+    // student logits for each window are hidden[ws..we] @ lm_headᵀ (never the full
+    // [seq, vocab]). The teacher scores the same window separately (frozen).
+    let hidden = student
+        .forward_hidden_states(store, &mut tape, &full, &positions)
+        .map_err(|err| map_qwen35_forward_error("GKD writeback student hidden", err))?;
+    let hidden_dim = *store
+        .get(hidden)
+        .ok_or(AutogradError::InvalidTensorId(hidden))?
+        .shape
+        .last()
+        .ok_or_else(|| OpdError::InvalidInput("GKD writeback: empty hidden shape".to_owned()))?;
+    let lm_head = student.lm_head_weight_id();
+
+    let mut total_loss: Option<TensorId> = None;
+    for window in &windows {
+        let w = window.end - window.start;
+        // Student logits for this window: slice the hidden rows, project through
+        // the lm_head, reshape to [1, w, vocab] to match the teacher window shape.
+        let hidden_slice = slice(
+            hidden,
+            &[0, window.start, 0],
+            &[1, window.end, hidden_dim],
+            store,
+            &mut tape,
+        )
+        .map_err(OpdError::from)?;
+        let hidden_2d =
+            reshape(hidden_slice, &[w, hidden_dim], store, &mut tape).map_err(OpdError::from)?;
+        let student_logits_2d =
+            matmul_bt(hidden_2d, lm_head, store, &mut tape).map_err(OpdError::from)?;
+        let student_logits =
+            reshape(student_logits_2d, &[1, w, vocab], store, &mut tape).map_err(OpdError::from)?;
+
+        let teacher_logits = teacher
+            .forward_logits_window_device(&full, &positions, *window, store, &mut tape)
+            .map_err(|err| OpdError::InvalidInput(format!("GKD teacher window forward: {err}")))?;
+
+        let kl = kl_distill_loss_chunked(
+            student_logits,
+            teacher_logits.tensor_id,
+            w,
+            DEFAULT_KL_CHUNK_SIZE,
+            temperature,
+            KlDirection::Forward,
+            store,
+            &mut tape,
+        )
+        .map_err(OpdError::from)?;
+        // Target-count weight so the accumulated loss is the mean KL per masked
+        // token (each window contributes its share of the total masked positions).
+        let weighted = mul_scalar(kl, w as f32 / total_targets as f32, store, &mut tape)
+            .map_err(OpdError::from)?;
+        total_loss = Some(match total_loss {
+            Some(prev) => add(prev, weighted, store, &mut tape).map_err(OpdError::from)?,
+            None => weighted,
+        });
+    }
+
+    let loss = total_loss.ok_or_else(|| {
+        OpdError::InvalidInput(
+            "GKD writeback produced no windows despite non-empty targets".to_owned(),
+        )
+    })?;
+    let loss_value = store.to_host(loss).map_err(OpdError::from)?[0];
+    backward_with_optional_profile(loss, loss_value, store, &mut tape)?;
+    optimizer.step(store, trainable_params)?;
+    optimizer.zero_grad(store, trainable_params);
+    cleanup_after_backward(store, &mut tape, all_model_params, &keep_extra);
+
+    eprintln!("[gkd-writeback] DONE mean_kl={loss_value:.6} total_targets={total_targets}");
+    Ok(loss_value)
 }
 
 pub fn opd_step_with_teacher_forward<O: Optimizer, T: TeacherForward + ?Sized>(

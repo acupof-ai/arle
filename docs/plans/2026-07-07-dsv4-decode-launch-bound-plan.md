@@ -1,6 +1,6 @@
 # DSv4 decode: launch-bound attack plan (PDL chaining + per-step alloc/memset + fused epilogue)
 
-> Status: Active | 2026-07-07 | evidence: `/host/kern141_decode2.nsys-rep` (07-03, TP=4/EP=4, #141-post, MTP-on)
+> Status: Killed (wall-clock) — 2026-07-07 | commit 1+2 landed as cleanup (correctness-clean), but the alloc-removal sweep is a wall-clock WASH: async alloc/memset overlap the GPU, so the 16.8% API-share is unrecoverable wall. See [errors/2026-07-07-dsv4-alloc-removal-sweep-wall-wash.md](../experience/errors/2026-07-07-dsv4-alloc-removal-sweep-wall-wash.md). Real lever = foundation (per-step ctx.sync → device sampling; 4-proc TP → single-proc), not allocs. | evidence: `/host/kern141_decode2.nsys-rep`
 
 **Verdict.** DSv4 B=1 decode is **launch-bound, not kernel-bound**. nsys (post-#141)
 measures `cudaLaunchKernel` = **39.8% wall** + `cuStreamSynchronize` = **26.6% wall**
