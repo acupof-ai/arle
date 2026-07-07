@@ -2692,6 +2692,27 @@ impl Dsv4Model {
             let _layer_nvtx = crate::nvtx::range(&format!("dsv4/layer_{layer_idx:02}"));
             let full_flatten = layer.mode != DeepSeekV4AttentionMode::SparseIndexed;
 
+            // Diagnostic-only substage fingerprint (`ARLE_PROBE_STAGES`, see
+            // docs/experience/errors/2026-07-06-dsv4-concurrent-decode-digit-corruption-unresolved.md).
+            // D2H's one row's slice per call; `stage_want` is a cheap OnceLock
+            // compare when off, so this closure costs nothing on the hot path.
+            let stage_all = |name: &str, buf: &HiddenStates| {
+                let width = buf.hidden_dim;
+                for r in 0..buf.seq_len {
+                    let pos = start_positions[r] as u64;
+                    if crate::probe::stage_want(pos) {
+                        crate::probe::stage_bf16(
+                            ctx,
+                            name,
+                            layer_idx,
+                            r,
+                            pos,
+                            buf.data.slice(r * width..(r + 1) * width),
+                        );
+                    }
+                }
+            };
+
             // ── Attention half: HC params + pre + norm over the whole [N] batch.
             // GLM (hc_mult==1): no hyper-connection; the stream IS the hidden, so
             // the pre-mixer is identity. Replace the mhc pre+norm with a plain
@@ -2722,6 +2743,7 @@ impl Dsv4Model {
                 Some(mhc)
             };
             keepalive.keep_hidden(&normed);
+            stage_all("attn_norm", &normed);
 
             // ── Attention: per-row independent single-token MLA into row r.
             // SAFETY: every [r*hidden, (r+1)*hidden) span of attn_out is written by
@@ -2893,6 +2915,9 @@ impl Dsv4Model {
                     };
                     (main, indexer, query)
                 };
+                if let Some((kv, _score)) = compressor_kv_score.as_ref() {
+                    stage_all("compressor_out", kv);
+                }
                 // ── 0c. Full-flatten P1a: per-row compressor
                 // STATE-update DEFER (gather each row's ring-state pointers + advance
                 // compressed.seq_len, NO per-row FFI) → ONE
@@ -3531,6 +3556,7 @@ impl Dsv4Model {
                     crate::attention::csa_select_official_batched(
                         &self.ctx,
                         &self.config,
+                        layer_idx,
                         &q_i_batch,
                         &weights_batch,
                         dsa_shared,
@@ -3878,6 +3904,7 @@ impl Dsv4Model {
                 let _nvtx = crate::nvtx::range("dsv4/attn_allreduce");
                 self.tp.all_reduce_sum(&self.ctx, &mut attn_out)?;
             }
+            stage_all("attn_out", &attn_out);
             // SAFETY: hc_post / add_batch writes the full stream buffer.
             let mut attn_stream = unsafe { HiddenStates::uninit(&self.ctx, stream_dim, seq_len)? };
             if let Some(mhc) = attn_mhc.as_ref() {
@@ -3897,6 +3924,7 @@ impl Dsv4Model {
             }
             keepalive.keep_hidden(&attn_stream);
             stream = attn_stream;
+            stage_all("attn_residual", &stream);
 
             // ── MoE half: HC-wrap the grouped FP8 DeepGEMM MoE over the [N] batch.
             let _moe_t = if phase_time {
@@ -3930,6 +3958,7 @@ impl Dsv4Model {
                 Some(mhc)
             };
             keepalive.keep_hidden(&normed);
+            stage_all("ffn_input", &normed);
             // Routed MoE over the whole [N] batch. allreduce transport: Phase 6a
             // grouped path (one router gemm + one DeepGEMM grouped expert GEMM
             // over N×topk routes, decode_scratch=None) + one EP all-reduce.
@@ -4074,6 +4103,7 @@ impl Dsv4Model {
                 crate::ops::add_batch(&self.ctx, &moe_out, shared, &mut moe_with_shared)?;
                 keepalive.keep_hidden(&moe_with_shared);
             }
+            stage_all("moe_out", &moe_with_shared);
             // SAFETY: hc_post / add_batch writes the full stream buffer.
             let mut ffn_stream = unsafe { HiddenStates::uninit(&self.ctx, stream_dim, seq_len)? };
             if let Some(mhc) = ffn_mhc.as_ref() {
@@ -4093,6 +4123,7 @@ impl Dsv4Model {
             }
             keepalive.keep_hidden(&ffn_stream);
             stream = ffn_stream;
+            stage_all("ffn_residual", &stream);
             if let Some(t) = _moe_t {
                 ctx.stream.synchronize().ok();
                 moe_ms += t.elapsed().as_secs_f64() * 1000.0;

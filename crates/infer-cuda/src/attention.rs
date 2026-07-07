@@ -8494,6 +8494,7 @@ fn csa_select_decode_graph(
         csa_select_official_batched(
             ctx,
             config,
+            layer_idx,
             &*q_i,
             &*weights,
             shared,
@@ -9339,6 +9340,7 @@ fn csa_select_official(
 pub(crate) fn csa_select_official_batched(
     ctx: &DeviceContext,
     config: &DeepSeekV4Config,
+    layer_idx: usize,
     q_i_batch: &HiddenStates,
     weights_batch: &HiddenStates,
     shared: &mut Dsv4DsaSharedScratch,
@@ -9640,6 +9642,31 @@ pub(crate) fn csa_select_official_batched(
             )
             .result()
             .map_err(|e| anyhow!("DSv4 batched DSA paged logits failed: {e}"))?;
+        }
+    }
+
+    // Diagnostic-only (`ARLE_PROBE_STAGES`): DSA raw indexer SCORE fingerprint,
+    // captured AFTER (e) writes `logits_batch` and BEFORE (f)'s topk selection
+    // reads/transforms it — the actual pre-selection float values, not just
+    // which indices topk picks. `positions_host` is empty on the device-meta
+    // (graph) lane, where this capture is skipped (untagged pos is useless).
+    if !positions_host.is_empty() {
+        for r in 0..n {
+            let pos = positions_host[r] as u64;
+            if !crate::probe::stage_want(pos) {
+                continue;
+            }
+            let count = context_lens_host
+                .get(r)
+                .copied()
+                .unwrap_or(shared.logits_stride as i32)
+                .clamp(0, shared.logits_stride as i32) as usize;
+            if count == 0 {
+                continue; // no valid keys yet (early position) — nothing to fingerprint.
+            }
+            let start = r * shared.logits_stride;
+            let view = shared.logits_batch.slice(start..start + count);
+            crate::probe::stage_f32(ctx, "dsa_raw_score", layer_idx, r, pos, view);
         }
     }
 
