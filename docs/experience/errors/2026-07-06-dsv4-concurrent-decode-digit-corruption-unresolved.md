@@ -2718,6 +2718,22 @@ All instrumentation reverted after use (`ARLE_DSV4_TRUNCATE_TRACE` trace in
 `executor.rs`) — `git diff` clean on both local and pod trees, confirmed via
 `scripts/pod.sh sync`.
 
+**Closing note (2026-07-08, suspect #2 above): `truncate_decode_len`'s gap is
+CLOSED, not repaired.** `restore_cached_prefix` no longer restores a longer
+snapshot and truncates it down — it now accepts ONLY an exact `image_len ==
+matched_len` and rejects (falls back to the already-correct full-reprefill
+path) otherwise. Deriving a bit-correct `pending_kv`/`prev_overlap_*` for a
+straddled restore turned out to be structurally impossible without a real
+from-position-0 recompute: `prev_overlap` is a single-slot "most recently
+completed block" register with no second copy of the block before it, so ANY
+block-boundary crossing between `matched_len` and `image_len` leaves it
+holding an unrecoverable value (not a bug in the derivation logic — there is
+no second source for that content). Full writeup + pod verification:
+[wins/2026-07-08-dsv4-straddled-prefix-restore-reject.md](../wins/2026-07-08-dsv4-straddled-prefix-restore-reject.md).
+Suspect #1 (exact-match `swap_out_image`/`swap_in_image` fidelity) remains
+open and is unaffected by this fix (this fix only changes behavior when
+`image_len != matched_len`, which suspect #1's repro never hits).
+
 ## Capture/restore idempotency byte-diff — CLEAN through 5 cycles × 20 independent capture points; capture/restore fidelity KILLED as the mechanism (2026-07-08)
 
 Executes the prior round's #1-priority next step: "hash/byte-compare the
