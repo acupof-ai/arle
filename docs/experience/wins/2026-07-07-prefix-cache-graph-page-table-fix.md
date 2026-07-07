@@ -55,6 +55,23 @@ of a per-call temporary:
 - Baseline byte-identical: the device table content is the same as the old
   temporary; only the allocation lifetime changed.
 
+## Verification (H20 pod, 2026-07-07)
+
+**Qwen3.6-27B-FP8, TP=1, prefix cache ON, decode graph ON:**
+
+Sent identical prompt 3× via `/v1/chat/completions`. All 3 responses correct
+("2 + 2 equals 4." / "2+2 equals 4."). No corruption.
+
+**Caveat:** Qwen3.6 TP=1 uses the full-attention path, not FlashMLA. The
+specific device page table allocation the fix makes persistent is only used
+by DSv4 and Qwen3.5/3.6 MoE with TP>1. The Qwen3.6 test validates that
+prefix cache + CUDA graphs + the rebuilt binary produce correct output, but
+does not directly exercise the FlashMLA page table path.
+
+**DSv4 test blocked:** model >97GB/GPU at TP=1/2; TP=4 OOM at weight upload;
+TP=8 OOM on GPUs 2-5 (residual CUDA context from prior attempts + other
+users). Pending a clean 8×H20 window for full FlashMLA-path verification.
+
 ## Rule
 
 - Any device buffer whose pointer may be captured by a CUDA graph must be
