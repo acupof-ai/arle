@@ -8873,7 +8873,7 @@ fn csa_select_official(
     // every forward), `0` for the full-retention compressor (absolute offsets).
     // Row `r` of the delta is read at `keys.data[(r - keys_window_base) * ihd]`.
     keys_window_base: usize,
-    layer_idx: usize,
+    _layer_idx: usize,
     ratio: usize,
     local_index_heads: usize,
     score_scale: f32,
@@ -9264,19 +9264,6 @@ fn csa_select_official(
                     .raw_indices
                     .slice_mut(t0 * config.index_topk..(t0 + tlen) * config.index_topk);
                 let (raw_ptr, _rig) = raw.device_ptr_mut(&ctx.stream);
-                // ARLE_DSA_TIEBREAK_TRACE diagnostic (see `dsa_tiebreak_trace_report`
-                // in `csa_select_official_batched`'s module): zero-cost when unset.
-                let trace_enabled = dsa_tiebreak_trace_enabled();
-                let mut tie_trace_buf = trace_enabled
-                    .then(|| ctx.stream.alloc_zeros::<i32>(tlen * 2))
-                    .transpose()?;
-                let (tie_trace_ptr, _ttg) = match tie_trace_buf.as_ref() {
-                    Some(buf) => {
-                        let (p, g) = buf.device_ptr(&ctx.stream);
-                        (p as *mut i32, Some(g))
-                    }
-                    None => (std::ptr::null_mut(), None),
-                };
                 unsafe {
                     ffi::dsv4_deepseek_v4_topk_transform_cuda(
                         logits_ptr as *const f32,
@@ -9290,26 +9277,9 @@ fn csa_select_official(
                         i32::try_from(tlen)?,
                         i32::try_from(config.index_topk)?,
                         64,
-                        tie_trace_ptr,
                         ctx.stream.cu_stream(),
                     )
                     .result()?;
-                }
-                drop(_ttg);
-                drop(_rig);
-                if let Some(tie_trace_buf) = tie_trace_buf.take() {
-                    let row_tags: Vec<String> = (0..tlen)
-                        .map(|i| format!("slot{}:qpos{}", official.slot_idx, t0 + i))
-                        .collect();
-                    dsa_tiebreak_trace_report(
-                        ctx,
-                        "solo",
-                        layer_idx,
-                        config.index_topk,
-                        &tie_trace_buf,
-                        &raw,
-                        &row_tags,
-                    )?;
                 }
             }
 
@@ -9710,19 +9680,6 @@ pub(crate) fn csa_select_official_batched(
         let (sel_ptr, _seg) = sel.device_ptr_mut(&ctx.stream);
         let mut raw = shared.raw_indices_batch.slice_mut(0..n * config.index_topk);
         let (raw_ptr, _rig) = raw.device_ptr_mut(&ctx.stream);
-        // ARLE_DSA_TIEBREAK_TRACE diagnostic (see `dsa_tiebreak_trace_report`):
-        // zero-cost when unset (one env::var_os check, no alloc).
-        let trace_enabled = dsa_tiebreak_trace_enabled();
-        let mut tie_trace_buf = trace_enabled
-            .then(|| ctx.stream.alloc_zeros::<i32>(n * 2))
-            .transpose()?;
-        let (tie_trace_ptr, _ttg) = match tie_trace_buf.as_ref() {
-            Some(buf) => {
-                let (p, g) = buf.device_ptr(&ctx.stream);
-                (p as *mut i32, Some(g))
-            }
-            None => (std::ptr::null_mut(), None),
-        };
         unsafe {
             ffi::dsv4_deepseek_v4_topk_transform_cuda(
                 logits_ptr as *const f32,
@@ -9736,79 +9693,13 @@ pub(crate) fn csa_select_official_batched(
                 i32::try_from(n)?,
                 i32::try_from(config.index_topk)?,
                 64,
-                tie_trace_ptr,
                 ctx.stream.cu_stream(),
             )
             .result()?;
-        }
-        drop(_ttg);
-        drop(_rig);
-        if let Some(tie_trace_buf) = tie_trace_buf.take() {
-            let row_tags: Vec<String> = slot_ids.iter().map(|s| format!("slot{s}")).collect();
-            dsa_tiebreak_trace_report(
-                ctx,
-                "batched",
-                layer_idx,
-                config.index_topk,
-                &tie_trace_buf,
-                &raw,
-                &row_tags,
-            )?;
         }
     }
 
     keepalive.keep_u8(&shared.q_fp8_batch);
     keepalive.keep_f32(&shared.weights_batch);
     Ok(())
-}
-
-/// Temporary diagnostic-only tie-break trace for `radix_topk`'s round==3
-/// arbitration
-/// (`docs/experience/errors/2026-07-06-dsv4-concurrent-decode-digit-corruption-unresolved.md`).
-/// Env-gated (`ARLE_DSA_TIEBREAK_TRACE=1`); reads back the `[n*2]` scratch the
-/// kernel wrote `[remain, competitors]` into ONLY when a genuine round-3 tie
-/// fired (`dsv4_dsa_official.cu::radix_topk`), plus the winning raw index for
-/// each tied row (the last `remain` entries of its own `raw_indices` slice —
-/// `radix_topk`'s round-3 writes always land in `output[topk-remain..topk]`,
-/// so no separate device tracking of "which index" is needed). One
-/// `write_all` per tied row — concurrent TP-rank writers may interleave at the
-/// byte level (same caveat as `dsv4_decode_trace`); `grep -o
-/// 'DSA_TIEBREAK[^\n]*'` recovers clean lines regardless.
-fn dsa_tiebreak_trace_report(
-    ctx: &DeviceContext,
-    label: &str,
-    layer_idx: usize,
-    topk: usize,
-    tie_trace: &CudaSlice<i32>,
-    raw_indices: &impl DevicePtr<i32>,
-    row_tags: &[String],
-) -> Result<()> {
-    use std::io::Write;
-    ctx.sync()?;
-    let trace_host: Vec<i32> = ctx.stream.clone_dtoh(tie_trace)?;
-    if !trace_host.chunks_exact(2).any(|c| c[1] > 0) {
-        return Ok(());
-    }
-    let raw_host: Vec<i32> = ctx.stream.clone_dtoh(raw_indices)?;
-    let pid = std::process::id();
-    for (r, tag) in row_tags.iter().enumerate() {
-        let remain = trace_host[r * 2];
-        let competitors = trace_host[r * 2 + 1];
-        if competitors <= 0 || remain <= 0 {
-            continue;
-        }
-        let start = r * topk;
-        let remain = remain as usize;
-        let winners = &raw_host[start + topk - remain..start + topk];
-        let line = format!(
-            "DSA_TIEBREAK label={label} pid={pid} layer={layer_idx} row={r} tag={tag} remain={remain} competitors={competitors} winners={winners:?}\n"
-        );
-        let _ = std::io::stderr().write_all(line.as_bytes());
-    }
-    Ok(())
-}
-
-/// See `dsa_tiebreak_trace_report`. One `env::var_os` read, zero-cost off.
-fn dsa_tiebreak_trace_enabled() -> bool {
-    std::env::var_os("ARLE_DSA_TIEBREAK_TRACE").is_some()
 }
