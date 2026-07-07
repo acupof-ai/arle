@@ -1,0 +1,21 @@
+crates/train/src/sandbox.rs
+  s_32ba0fc66ccbb9::t_fbecb1ec841690 633-638,646
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "b1e81eac93aa2bd5e9bc9a9d1c5e8a69ccf11f55",
+  "prompts": {},
+  "sessions": {
+    "s_32ba0fc66ccbb9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a8678be3b95ba9b5f",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
