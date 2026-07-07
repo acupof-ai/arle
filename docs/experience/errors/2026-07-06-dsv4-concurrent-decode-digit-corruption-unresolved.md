@@ -2024,3 +2024,15 @@ docstring: reduces but does not eliminate n≥2 digit corruption. Treat the
 residual as accepted, measured, partially-understood risk until the
 FP8→bf16 dequant infrastructure lands and the two remaining gates get their
 own A/B.
+
+## Note (2026-07-07): DSv4 boot was broken for part of today
+
+`36835179f` (#8 persistent-page-table fix) introduced a construction-time
+regression that broke **all** DSv4 FlashMLA boots (100% `ensure!` panic at
+startup) — fixed same day, see the "Follow-up" section of
+[wins/2026-07-07-prefix-cache-graph-page-table-fix.md](../wins/2026-07-07-prefix-cache-graph-page-table-fix.md).
+Window: `36835179f..<fix commit>`. No DSv4 commits touching
+`attention/flashmla.rs`, `attention/dsa.rs`, `dsv4.rs`, or `executor.rs` land
+in that range besides the fix itself — this investigation's own rounds each
+built their own binary at various points and are unaffected, but noting the
+window honestly per the case-as-fact discipline.
