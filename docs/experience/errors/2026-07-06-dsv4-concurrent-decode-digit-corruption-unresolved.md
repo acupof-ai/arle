@@ -2036,3 +2036,237 @@ Window: `36835179f..<fix commit>`. No DSv4 commits touching
 in that range besides the fix itself — this investigation's own rounds each
 built their own binary at various points and are unaffected, but noting the
 window honestly per the case-as-fact discipline.
+
+## Part A — Case-level attribution of the residual corruption (post-#8): onset is BEFORE `proj_batched`, implicating the sibling MLA FP8 gate (2026-07-08)
+
+Rebuilt at `main` HEAD (`b0d266838`, which includes `a207a11cc` — #8 fully
+fixed, construction-time regression and all) with the same one-line
+`proj_batched` bf16-force as "Experiment B" (`attention.rs:7704`, `if false &&
+input.seq_len > 1`, reverted after this round). TP=4, GPUs 2/3/4/5, same
+`ARLE_DSV4_MOE_BACKEND=allreduce`/`ARLE_DSV4_INCREMENTAL_KV=1`/
+`ARLE_DSV4_EXPERT_BACKEND=deepgemm`/`--max-total-tokens 2048` config as every
+prior A/B in this doc.
+
+**Residual-rate reconfirmation, n=2, 60×2=120 requests.** 106/120 exact
+(11.7% miss) — in line with Experiment B's own 30.0% n=2 rate given this run's
+smaller/different sample. Case-as-fact breakdown of the 14 misses: 7
+truncation (`'7382.'`/`'738.'`-class), 6 digit-substitution (5.0% of all
+requests), 1 **new signature not previously documented**: degenerate
+repetition (`'The secret access code is **738999999999999999999999999999'`,
+correct 3-digit prefix then the model loops on a single wrong digit until the
+16-token budget expires — not chased further this round, flagged for a future
+pass).
+
+**Signature comparison to Experiment B's own residual (pre-#8, contaminated
+window).** Experiment B's 4/40 residual corruption was uniformly
+`'7381239'` — a garbled, longer-than-needle string. This round's 6 digit-
+substitution instances are uniformly simpler: `738292` (×4, single last-digit
+flip) and `738391` (×1, single mid-string-digit flip), plus one with trailing
+hedging text. **The residual signature changed character once #8 (the
+CUDA-graph device-page-table UAF) was fixed** — direct evidence that
+Experiment B's own residual-corruption sample, run before `a207a11cc` landed,
+was at least partly characterizing #8's own artifact rather than a pure
+picture of whatever remains after `proj_batched`'s fix. This is exactly the
+contamination risk this task was commissioned to check.
+
+**Case replay methodology.** Two new pod-only harnesses (left in place,
+untracked, same convention as this doc's other reusable probes):
+`case_probe.py` (concurrent_needle_v3.py-style fresh-salted prompts for
+initial case-hunting) and `replay_probe.py` (deterministically reconstructs
+`concurrent_needle_v3.py`'s exact `build_prompt(target, trial, req_idx)` text
+for a specific caught-failing `(trial, req_idx)`, so the SAME byte-identical
+prompt content can be resent solo or paired with a staggered-length filler for
+row-disambiguation in the probe JSONL). Reproducing a specific case requires
+resending its content multiple times (corruption is not 100% reproducible even
+for byte-identical content, matching this doc's whole prior record) — to avoid
+conflating this with the **separate, already-documented RadixCache-repeat-
+prefix bug** (which fires deterministically on any repeated identical prompt),
+the replay boot exports `ARLE_DISABLE_PREFIX_CACHE=1` (the existing diagnostic
+toggle from the KV-reuse round). `--probe-out ... --probe-lens-layers 43
+--probe-token-entropy true` (full 43-layer depth, DSv4's whole stack).
+
+**Three digit-substitution cases caught and traced** (of 5 attempted:
+`caseA-sweep1-{6,21,37,48}` from the initial sweep, replayed 15-20x each until
+`TRACKED_MISS=True` fired again): `caseA-sweep1-6`/req0 (attempt 9/15,
+`738292`), `caseA-sweep1-21`/req0 (attempt 12/15, `738292`),
+`caseA-sweep1-37`/req0 (attempt 5/15, `738292` + hedging text —
+`'...**738292**. Wait, let me double-check:'`, matching this doc's own
+established numeric-needle hedging finding); `caseA-sweep1-48`/req1 caught
+only a truncation-class miss in 15 attempts, not chased further.
+
+**Solo reference took a DIFFERENT completion path from token 0, not just a
+different final digit — solo-vs-concurrent lens comparison is invalid here.**
+For all three cases, the SOLO reference (same exact prompt, `replay_probe.py
+... solo`) decoded a terse 3-token completion (`[30143, 17979, 1]` = `"738" +
+"291" + EOS`), while EVERY concurrent attempt (clean or corrupted) decoded a
+verbose 10-token completion (`[671, 8613, 3278, 4181, 344, 2619, 30143, ...,
+42499, 1]` = `"The secret access code is **738" + digit + "**."`). Solo and
+concurrent diverge at the very FIRST generated token, not at some mid-stack
+layer of a shared completion — directly confirming the task's own suspicion
+that a naive solo-vs-concurrent lens diff (as the pre-#8 "Logit-lens layer
+diff" round did) conflates a completion-STYLE difference with the actual
+corruption mechanism. Abandoned solo-vs-concurrent comparison for this round.
+
+**Matched clean-vs-corrupt pairs (same boot, same tracked-prompt content, both
+CONCURRENT, both verbose-style, differing ONLY in the final digit) — the
+correct apples-to-apples comparison.** Two of the three traced cases had a
+same-style clean concurrent attempt available (`caseA-sweep1-6` attempt 2 vs
+attempt 9; `caseA-sweep1-21` attempt 11 vs attempt 12), giving a full
+43-layer top-1 lens diff with zero completion-style confound:
+
+| Case | Final token (pos 470, the row's 8th generated token) | First divergent layer |
+|---|---|---|
+| `caseA-sweep1-6` | clean=17979("291") vs corrupt=18307("292") | **16** (of 42) |
+| `caseA-sweep1-21` | clean=17979("291") vs corrupt=18307("292") | **16** (of 42) |
+
+Both pairs: layers 0–15 bit-identical top-1 (constant `69146`, an early-layer
+lens artifact, decodes to `' económ'`, not otherwise meaningful) between clean
+and corrupt. At layer 16 the CORRUPT run stays "stuck" at `69146` one layer
+longer while CLEAN advances to `32974` — directly replicating (under this
+round's cleaner matched-style methodology) the pre-#8 "Logit-lens layer diff"
+round's own qualitative finding that the corrupted trajectory is MORE stable/
+locked in the mid-stack window while clean is less stable. Layers 17-41 show
+the same previously-documented intermittent (not monotonic) re-agreement
+pattern; the two trajectories permanently fork only at layer 42 (the final
+unembedding), same wrong-token identity (`18307`="292") in both cases —
+tokenizer-confirmed (`tokenizer.json`, pod-side decode: `17979→'291'`,
+`18307→'292'`).
+
+**Layer-16 onset is BEFORE `proj_batched`'s position in that layer's forward
+pass — structurally, not by inference.** `dsv4.rs::forward_decode_batch`'s
+per-layer call order (traced directly): `mla_attention_prepare_proj_batch`
+(line 2863 — the sibling MLA `wq_a`/`wq_b`/`wkv` FP8 gate, **always DeepGEMM
+at n≥2, no bf16 alternative in this checkpoint**, per this doc's own "Second
+FP8 gate" round) runs FIRST; `compressor_batch_prepass`/
+`indexer_query_batch_prepass` (lines 2897–2922, the ONLY callers of
+`proj_batched`, this round's forced-bf16 target) run SECOND, later in the same
+layer. Since `proj_batched` is forced bf16 in this build (its FP8 branch is
+`if false && ...`, unreachable), it structurally cannot be contributing
+ANYTHING to layer 16's divergence — and the divergence still fires there, in
+both independent matched pairs. The onset therefore sits upstream of
+`proj_batched`'s call site, at or before the layer's OWN `mla_attention_
+prepare_proj_batch` computation — **not a new/unnamed mechanism**, but
+positive layer-ordering evidence pointing at the exact sibling gate this doc's
+"Second FP8 gate" round already named as BLOCKED (F8_E4M3-only checkpoint
+weights, no same-day bf16 A/B possible) and flagged as the top remaining
+suspect. Prior evidence for that gate was elimination-by-checkpoint-dtype;
+this round adds direct layer-onset-ordering evidence for the first time.
+
+**Verdict: CONFIRMS the doc's own prior attribution, does not open a new
+mechanism.** `proj_batched`'s bf16-force eliminates its own truncation-class
+contribution and drops the overall n=2 miss rate ~1.9x (Experiment B), but the
+surviving digit-substitution corruption originates BEFORE `proj_batched` runs
+— consistent with, and now positively localized to, `mla_attention_prepare_
+proj_batch`'s always-on FP8 `wq_a`/`wq_b`/`wkv` projection (and/or the FP8
+grouped-GEMM decode-MoE kernels further downstream in the same layer, not
+separately excluded by this round's ordering argument since MoE runs AFTER
+attention within a layer too — this round's evidence pins the onset to layer
+16's INPUT-SIDE computation, i.e. attention/MLA, not FFN/MoE, since MoE output
+would only affect the layer's residual stream after attention already
+completed, and MLA is what's active pre-attention-core). Both remain DEAD-END
+for a same-day precision A/B per this doc's own checkpoint-dtype checks; a
+real fix needs FP8→bf16 host-side dequantization infrastructure in the loader.
+
+## Part B — Solo (n=1) baseline is NOT a separate "genuine-limitation" floor: same bug signatures, one case traced to the already-documented RadixCache-repeat mechanism (2026-07-08)
+
+Two independent solo (n=1, zero concurrency, no batching whatsoever) sweeps
+against the SAME bf16-forced binary (irrelevant at n=1 — solo decode never
+calls `proj_batched`, confirmed earlier in this doc), default prefix cache ON,
+every prompt FRESH-SALTED via `concurrent_needle_v3.py`'s own trial-nonce
+scheme (never repeated within a sweep — structurally immune to the separate
+RadixCache-repeat bug for the INITIAL catch): 40 reps (`boot_caseB_solo.sh`)
++ 60 reps (`boot_caseB_deep.sh` Part 2) = **100 total solo requests, 6
+misses (6.0%)** — markedly lower than this doc's previously-quoted "~20-33%"
+n=1 floor (see caveat below).
+
+**Case-as-fact breakdown, all 6 misses decoded.** 3 truncation (`'7382'`,
+`'738.'` ×2) — same class as concurrent's own majority failure mode. 3
+digit-substitution — **`738292` in all three**, i.e. the identical
+`17979→18307` ("291"→"292") token swap found in every concurrent-corruption
+case traced in Part A above. **Zero instances of any other failure
+signature** — no off-topic answer, no garbled/looping output outside the
+degenerate-repetition class already seen in Part A, no evidence of a
+genuinely-different "hard needle position, plausible-but-wrong" class that
+would indicate a real model-capability limitation. Every single solo failure
+observed falls into one of the two failure-signature classes this whole
+investigation has already established for CONCURRENT corruption.
+
+**Repeat-determinism probe on one digit-substitution case — lands on the
+ALREADY-DOCUMENTED, separate RadixCache-repeat bug.** Replayed
+`caseB-sweep1-21`/req0's exact failing prompt content 15× **purely solo, zero
+concurrency, ever, default prefix cache ON**: call 1 correct (`738291`); calls
+2–15 (14/14) deterministically wrong, byte-identical `'The secret access code
+is 738292.'` every single time. This is an exact signature match to this
+doc's own "Comprehensive substage-diff round" (2026-07-07): "the FIRST-ever
+call to this exact prompt on a boot is correct; every subsequent identical-
+prompt call is wrong, forever, for the rest of that boot's life." **The
+separate RadixCache-repeat bug converges on the SAME near-tied wrong token
+(`18307`="292") as this investigation's main n≥2 subject.**
+
+**Scope caveat — two distinct zero-concurrency triggers, not one.** The
+ORIGINAL `caseB-sweep1-21` miss (in the 40-rep sweep) was that exact prompt's
+FIRST-EVER call on that boot — by the RadixCache-repeat bug's own established
+precondition (needs ≥2 exposures), it CANNOT be attributed to that mechanism.
+It is a genuinely separate, single-shot, zero-history, zero-concurrency
+corruption event with no yet-identified cause. Only the FOLLOW-UP repeat
+probe (which necessarily re-sent the same content 14 more times to test
+determinism) triggered the well-established repeat-cache mechanism. So Part
+B's 3/100 single-shot digit-substitution rate and the repeat-cache bug's
+100%-after-first-exposure rate are two independent, additive sources of the
+identical wrong-token outcome — not the same event counted twice.
+
+**Verdict: the "n=1 floor" is not a separate baseline — it is populated by
+the SAME bug-signature classes as concurrent corruption, at a lower but
+non-zero rate, via at least two distinct trigger paths (a still-unidentified
+single-shot zero-concurrency source, and the separately-documented
+RadixCache-repeat mechanism).** This overturns today's implicit framing that
+n≥2 concurrency is a NECESSARY trigger for the digit-substitution class — it
+is at most a RATE AMPLIFIER (Experiment B: 57.1% at n=2 unpatched vs. this
+round's ~3% single-shot solo digit-substitution rate), not the sole cause.
+The common driver across every mechanism this doc has found today (the
+`proj_batched`/`mla_attention_prepare_proj_batch` FP8 gates, and now the
+RadixCache-repeat state-restore path) is a near-tie between tokens
+`17979`("291") and `18307`("292") at this exact needle-recall position;
+multiple, structurally unrelated perturbation sources can each independently
+tip it. Caution against reading the doc's earlier "~20-33% n=1 floor" figure
+as clean going forward — this round's cleaner, repeat-free 100-sample
+measurement (6.0%) suggests some of that earlier figure was itself inflated
+by harnesses (e.g. `trace_probe.py`'s fixed TRACKED prompt) that inadvertently
+repeated content and tripped the RadixCache-repeat bug rather than measuring
+a pure single-shot solo rate.
+
+## Rule (addendum 5)
+
+**A replay methodology that necessarily repeats one prompt's content to catch
+a rare event needs its own confound control.** Case-level tracing of a
+specific caught failure requires resending byte-identical content multiple
+times (the corruption isn't 100% reproducible even for fixed content) — but
+repeated identical content is exactly the trigger condition for this
+investigation's OWN separately-documented RadixCache-repeat bug.
+`ARLE_DISABLE_PREFIX_CACHE=1` during the replay loop (Part A) isolates the
+mechanism under study from this self-inflicted confound; skipping it (as Part
+B's determinism probe deliberately did, to characterize the OTHER bug) turns
+the same technique into a clean reproduction of the sibling defect instead.
+Know which one you're running before reading the result.
+
+**"Established floor/rate" numbers should be re-measured with the current
+confound understanding before being trusted across investigation rounds.**
+Both this doc's pre-#8 residual-corruption signature (`7381239`, not
+reproduced post-fix) and its ~20-33% n=1-floor figure (not reproduced at
+100-sample scale with repeat-free content, 6.0% instead) turned out to carry
+contamination from mechanisms identified LATER in the same investigation (#8,
+then the RadixCache-repeat bug). A number produced before a confound was known
+is not wrong to have recorded, but is not safe to keep citing as ground truth
+once a cleaner measurement exists — recompute, don't just append.
+
+**Divergent completion STYLE (not just a divergent final answer) invalidates
+a position-aligned lens diff just as thoroughly as a divergent final token
+does.** Solo and concurrent decode chose different first tokens entirely for
+byte-identical prompt content in Part A (terse 3-token vs verbose 10-token) —
+a stronger and earlier divergence than any layer-lens comparison could
+localize. The valid control for isolating a corruption mechanism is two runs
+that share the SAME completion path and differ only in the outcome under
+study (here: two CONCURRENT attempts, matched by output text length/style,
+one clean one corrupted) — not solo vs. concurrent, even same-boot same-content
+solo vs. concurrent, whenever the two lanes are structurally different code
+paths (as they are here: B=1 CUDA-graph-replay vs. B>1 batched prepass).
