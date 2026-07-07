@@ -1,0 +1,21 @@
+docs/experience/wins/2026-07-08-prefix-cache-wrong-seed-token-fix.md
+  s_e781b97b2b3b2b::t_886a9c73f326ce 1-93
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "b8db692c75eadc06b5ec3ed73986dc523d451280",
+  "prompts": {},
+  "sessions": {
+    "s_e781b97b2b3b2b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aec231266ed61faf6",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
