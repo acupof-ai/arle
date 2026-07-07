@@ -1378,6 +1378,11 @@ impl Dsv4LayerAttentionState {
             (None, None) => {}
             _ => bail!("DSv4 swap FlashMLA image presence mismatch"),
         }
+        // Re-sync device page table: mirror_restore_pages may have changed the
+        // host table; stale device table → CUDA graph reads garbage (#8).
+        if let Some(flash) = &mut self.flashmla {
+            flash.refresh_device_page_table(ctx, pool)?;
+        }
         match (&mut self.dsa_official, &image.dsa_official) {
             (Some(official), Some(image)) => image.restore_to(ctx, pool, official)?,
             (None, None) => {}

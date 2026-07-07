@@ -3098,15 +3098,15 @@ impl Dsv4Model {
                     // (the SW-ring BOOTSTRAP stays per-row — once per slot). Gather
                     // each row's k_prepared NoPE/RoPE base, compressor `compressed`
                     // base (0 = no-op for no-compressor rows), and per-slot device
-                    // page table here; the table CudaSlices live in `pack_page_tables`
-                    // to outlive the post-loop launch. V32 (head_dim==576) and
-                    // SparseIndexed (!full_flatten) keep the per-row pack byte-for-byte.
+                    // page-table pointer here; the persistent device page tables live
+                    // in `flash.device_page_table` (not per-call temporaries — #8).
+                    // V32 (head_dim==576) and SparseIndexed (!full_flatten) keep the
+                    // per-row pack byte-for-byte.
                     let pack_batched = full_flatten && self.config.head_dim != 576;
                     let mut pack_nope_ptrs: Vec<u64> = Vec::new();
                     let mut pack_rope_ptrs: Vec<u64> = Vec::new();
                     let mut pack_compressed_ptrs: Vec<u64> = Vec::new();
                     let mut pack_pt_ptrs: Vec<u64> = Vec::new();
-                    let mut pack_page_tables: Vec<CudaSlice<i32>> = Vec::new();
                     let mut pack_sw_blocks: usize = 0;
                     let mut pack_num_logical_pages: usize = 0;
                     if pack_batched {
@@ -3114,7 +3114,6 @@ impl Dsv4Model {
                         pack_rope_ptrs.reserve(n);
                         pack_compressed_ptrs.reserve(n);
                         pack_pt_ptrs.reserve(n);
-                        pack_page_tables.reserve(n);
                     }
                     for r in 0..n {
                         if !full_flatten {
@@ -3331,7 +3330,6 @@ impl Dsv4Model {
                                 sw_window,
                                 &self.config,
                             )?;
-                            let slot_idx = flash.slot_idx();
                             pack_sw_blocks = flash.sw_blocks();
                             let (nope_ptr, ng) =
                                 row_prepared.k_prepared.data.device_ptr(&self.ctx.stream);
@@ -3351,13 +3349,14 @@ impl Dsv4Model {
                                 }
                                 None => pack_compressed_ptrs.push(0),
                             }
-                            let page_table =
-                                layer_pool.flashmla_device_page_table(&self.ctx, slot_idx)?;
-                            pack_num_logical_pages = pack_num_logical_pages.max(page_table.len());
-                            let (pt, pg) = page_table.device_ptr(&self.ctx.stream);
+                            // Use the persistent device page table from flash
+                            // state (not a per-call temporary that would be freed
+                            // before the batched kernel runs — #8 graph UAF).
+                            pack_num_logical_pages =
+                                pack_num_logical_pages.max(flash.device_page_table.len());
+                            let (pt, pg) = flash.device_page_table.device_ptr(&self.ctx.stream);
                             pack_pt_ptrs.push(pt);
                             drop(pg);
-                            pack_page_tables.push(page_table);
                         } else {
                             crate::attention::flashmla_decode_pack_row(
                                 &self.ctx,
@@ -3418,10 +3417,10 @@ impl Dsv4Model {
                     // Op "c": ONE batched SW one-token + compressed-delta pack over
                     // all N rows, replacing the 2×N per-row launches above. Issued
                     // here (after the prepare loop's per-row gathers, before
-                    // build_layer_batch_meta / the batched fwd read the pool). The
-                    // per-slot device page tables (`pack_page_tables`) and the
-                    // uploaded ptr arrays are kept alive past the launch via
-                    // `ptr_keepalive` / `keepalive` (premature-free guard).
+                    // build_layer_batch_meta / the batched fwd read the pool).
+                    // Per-slot device page tables are persistent in
+                    // `flash.device_page_table` (#8 fix); uploaded ptr arrays are
+                    // kept alive past the launch via `ptr_keepalive` / `keepalive`.
                     if pack_batched && n > 0 {
                         let _nvtx = crate::nvtx::range("dsv4/flashmla_pack_batched");
                         let pool_ptr = {
@@ -3455,9 +3454,6 @@ impl Dsv4Model {
                         ptr_keepalive.push(rope_arr);
                         ptr_keepalive.push(compressed_arr);
                         ptr_keepalive.push(pt_arr);
-                        // The per-slot device page-table buffers feed the launch's
-                        // pointer array; hold them to function return.
-                        pack_pt_keepalive.append(&mut pack_page_tables);
                     }
                 }
                 if let Some(t) = _compidx_t {
