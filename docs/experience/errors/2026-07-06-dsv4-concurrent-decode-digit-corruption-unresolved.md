@@ -1151,3 +1151,88 @@ worth of full-stack substage data) and manifests. The instrumentation itself
 (`ARLE_PROBE_STAGES` in `crates/infer-cuda/src/{dsv4,attention,probe}.rs`,
 off by default) is committed alongside this entry — reusable for the next
 pass without re-instrumenting.
+
+## FlashMLA split-KV `num_splits` batch-invariance hypothesis — KILLED, quantitatively (2026-07-07)
+
+External lead (Thinking Machines Lab, "Defeating Nondeterminism in LLM
+Inference"): split-KV decode kernels commonly pick `num_splits` to saturate a
+*fixed* SM budget using the *aggregate* work across all concurrently-batched
+rows, so a row's own reduction order (and thus its exact FP result) depends on
+which other rows share its batch — a documented industry bug class, invisible
+to race-detection tools (matches this investigation's own tool-negative
+results). `flashmla.rs:940-982`'s `sched_meta_for_batch` doc comment ("the
+cached-constant pitfall... wrong split-KV merge for n>1") pattern-matches.
+
+**Source trace.** `sched_meta_for_batch` → vendored
+`get_mla_metadata_kernel` (`vendor/flashmla/csrc/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.cu:30-126`):
+`payload = ceil_div(total_num_blocks, num_sm_parts) + fixed_overhead_num_blocks`,
+where `total_num_blocks` sums `(blocks + overhead)` over **every row in the
+current batch** (line 70) and `num_sm_parts` is a **per-decode-shape constant**
+(`h_q`/`s_q` only, `arle_flashmla_decode_shim.cu:100-139` — no `n` term,
+fixed once at layer-state construction). Rows are then walked **sequentially**
+(row 0 fully consumed before row 1 starts, lines 92-110) — so a row's OWN
+split boundaries depend on batch composition **only through `payload`**, i.e.
+only when aggregate demand crosses a `num_sm_parts` quantization boundary.
+
+**Quantitative kill, not a source-reading inference.** Added a temporary
+env-gated readback (`ARLE_DSV4_SCHED_TRACE`, reverted after use — see below)
+printing `num_sm_parts`, `topk_len`, and the resulting `num_splits` per call.
+Pod-verified (TP=4, GPUs 2-5, DeepSeek-V4-Flash-FP8, `trace_probe.py` n=4/len=500,
+6 reps — corruption reproduced, `miss=[2,3]` etc., consistent with the
+established rate): **`num_sm_parts=78`** (H20). Observed live:
+
+| layer_topk | n | num_blocks/row | payload | num_splits/row |
+|---|---|---|---|---|
+| 128 | 3 | 2 | 6 | 2 |
+| 256 | 3 | 4 | 6 | 4 |
+| 640 (SW 128 + index_topk 512, this checkpoint's max) | 3 | 10 | 6 | 10 |
+
+Hand-computing the same formula at `n=1` for all three rows gives **the
+identical `payload=6` and identical per-row `num_splits`** in every case —
+because `total_num_blocks` (≤ 45 at `n=3`, ≤ 60 at `n=4` for the worst-case
+`topk=640`) never approaches `num_sm_parts=78`, so `ceil(total/78)` floors at
+1 regardless of `n`. The quantization boundary this mechanism needs only
+appears at `n≳6` for this checkpoint's max `topk=640` layers (`6×15=90>78`).
+
+**Verdict: real bug class, wrong repro.** The mechanism is genuine (confirmed
+in the vendored scheduler, not fabricated) but **cannot fire at the
+established n=3/4 repro conditions** — solo and n=3/4 compute byte-identical
+split boundaries for every observed `topk`. This does not merely fail to
+explain the corruption; it's structurally incapable of causing it at this
+investigation's repro shape. Does not rule out the same mechanism mattering at
+`n≥6-8` (tested elsewhere in this doc, not decisively separated by `n` in
+those aggregates) — out of scope this round.
+
+**Fallback candidates (per this doc's own DSv4-specific shortlist) — same
+grep, no batch-size-dependent scheduling found:**
+- `deepseek_v4_topk_transform_kernel` (DSA topk,
+  `dsv4_dsa_official.cu:866`) — `<<<batch_size, FIXED_BLOCK>>>`, one block per
+  row, no `num_sm`/occupancy term.
+- `dsv4_compressor_update_batched_kernel` (`dsv4_attention.cu:1525`) — same
+  `<<<n, FIXED_BLOCK>>>` shape.
+- DSv4's actual decode-MoE kernels, `dsv4_fp8_grouped_swiglu_decode_kernel`/
+  `dsv4_fp8_grouped_down_decode_kernel` (`dsv4_fp8_decode_moe.cu:332,359`) —
+  fixed-tile hand-written kernels (`blockIdx.{x,y,z}` = row-tile/chunk/expert),
+  no `num_sms`/wave-quantization config selection. (DeepGEMM's own
+  `num_waves`-driven GEMM config selection, `deepgemm_native.cu:595-618`, is
+  real but not on this decode call path — the decode lane uses the hand-written
+  kernels above, not DeepGEMM's dynamically-configured grouped GEMM.)
+
+**No fix applied.** The diagnostic readback (`flashmla.rs`,
+`ARLE_DSV4_SCHED_TRACE`) was reverted after extracting the numbers above —
+narrow, single-purpose, no ongoing reuse value unlike this doc's other
+left-in-place traces, so not kept.
+
+## Rule (addendum)
+
+**A real, industry-documented bug class is not evidence without the
+batch-size arithmetic.** "The vendored kernel's `num_splits` is a function of
+aggregate batch demand" is true and mechanism-plausible, but the actual
+quantization boundary (`ceil(total_demand / num_sm_parts)`) only bites once
+aggregate demand crosses a large fixed constant (`num_sm_parts=78` on H20) —
+reading the kernel source correctly still isn't a license to conclude it's
+*active* at a specific `(n, context_len)` repro without plugging in the real
+numbers (`num_sm_parts`, `topk_len`) pulled from the device. Same lesson as
+this doc's `CUDA_LAUNCH_BLOCKING`/`compute-sanitizer` rounds, applied to
+arithmetic instead of tooling: compute the actual threshold, don't infer
+activity from source shape alone.
