@@ -2863,7 +2863,18 @@ impl Dsv4CudaExecutor {
             "DSv4 decode batch surface length mismatch"
         );
         if batch.rows.len() == 1 {
-            return self.forward_decode_row(&batch.rows[0]);
+            let out = self.forward_decode_row(&batch.rows[0])?;
+            // B=1 bypasses `Dsv4Model::forward_decode_batch` (the CUDA-graph
+            // decode-graph lane, `forward_tokens_decode_graph`) — mirror its
+            // trace call here so the diagnostic covers both lanes uniformly.
+            // See ARLE_DSV4_DECODE_TRACE, crate::dsv4::dsv4_decode_trace.
+            crate::dsv4::dsv4_decode_trace(
+                self.model.tp.config().rank,
+                &batch.slot_ids,
+                &batch.start_positions,
+                &out.iter().map(|t| t.token).collect::<Vec<_>>(),
+            );
+            return Ok(out);
         }
 
         // Cross-slot batched MTP decode (batched-MTP Stage 1). B=1 already took

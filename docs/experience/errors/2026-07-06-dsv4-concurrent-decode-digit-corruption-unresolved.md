@@ -393,6 +393,81 @@ sampled token IDs (not just `slot_ids[r]`) at each decode step, diffed
 against a serial n=1 run of the identical prompt, to localize which decode
 step and which subsystem output first diverges — not further source reading.
 
+## Token-ID-level diff trace — fixed-step corruption, NOT join/finish-correlated (2026-07-07)
+
+Repro reconfirmed first (Step 0): `concurrent_needle_v3.py` n=4/len=500 TP=4
+GPUs 2/3/4/5, 8 reps (32 requests) — 4 misses (12.5%), same signature
+(truncation + digit-4-onward corruption). Sample too small to pin the exact
+rate but not a surprise-clean result; proceeded.
+
+**Instrumentation.** Added `ARLE_DSV4_DECODE_TRACE=1` (env-gated, rank==0
+only, single pre-formatted `write_all` — the first cut used `eprintln!` with
+multiple `{}` placeholders, which is *not* one `write()` syscall; 4 TP-rank
+processes writing to the shared serve-log fd produced byte-level
+field-interleaved garbage until fixed). One line per batched decode call:
+`DSV4_TRACE call=<n> n=<batch_size> rows=[slot:start_pos:token,...]` —
+`crate::dsv4::dsv4_decode_trace`, called from both `Dsv4Model::forward_decode_batch`
+(B>1) and (new) `RealCudaExecutor::forward_decode_batch`'s B=1 branch (the
+CUDA-graph decode-graph lane bypasses the model-level call entirely, so B=1
+needed its own trace call site to get a token-level reference at all).
+
+**Harness.** `trace_probe.py` (new, alongside `concurrent_needle_v3.py`): one
+byte-identical fixed "TRACKED" prompt (prompt_tokens=456, deterministic
+across every solo/concurrent invocation) + 3 filler rows offset by only
++1 TOPIC-repeat each (prompt_tokens 467/477/487 — small, unambiguous-but-not-
+length-heterogeneous gaps, to avoid confounding the established near-
+homogeneous-length repro regime while still letting the tracked row be
+identified server-side purely from `start_position` == its own prompt-token
+count).
+
+**Reference (solo, n=1).** TRACKED prompt alone, greedy: tokens
+`[8613,3278,4181,344,223,30143,17979,16,1]` at KV positions 456–464 →
+`"The secret access code is 738291."` (17979 = "291", 16 = ".", 1 = EOS).
+
+**4 corrupted trials, exact token-level diff** (of 14 concurrent n=4 reps,
+4 corrupted — 28.6%, consistent with the established baseline):
+
+| Trial | Join event (other rows enter batch) | TRACKED's own token stream (positions 456→) |
+|---|---|---|
+| rep3  | step index 6 (position 462, batch 1→4) | `[671,8613,3278,4181,344,223,30143,`**`18307`**`,16,1]` |
+| rep4  | step index 6 (position 462, batch 1→4) | `[671,8613,3278,4181,344,223,30143,`**`18307`**`,16,1]` |
+| rep10 | step index 6 (position 462, batch 1→4) | `[671,8613,3278,4181,344,223,30143,`**`18307`**`,16,1]` |
+| rep11 | step index 2 (position 458, batch 1→3) | `[671,8613,3278,4181,344,223,30143,`**`18307`**`,16,1]` |
+
+Every corrupted trial substitutes the **exact same wrong token** (18307 for
+17979 — decodes to the wrong last digit, `738292` vs `738291`) at the
+**exact same position** (KV depth 463 — the row's own 8th generated token),
+regardless of when the join event happened. Rep11 is the decisive case: its
+batch grew from 1→3 rows at TRACKED's step 2 (position 458), five steps
+*before* the corruption; the batch composition was then **completely
+stable** (same 3 slots, no join, no finish) for the 5 ticks bracketing the
+corrupted step (calls 167–174 in the trace, positions 458–465) — the
+corruption fires in the middle of an unchanging batch. Cross-checked rep3/
+rep4/rep10 too: no slot's start_position shows an EOS (token `1`) landing on
+the tick immediately before or at the corrupted tick — no finish event
+correlates either.
+
+**Verdict: (a), not (b).** The corrupted step is a fixed position, not
+correlated with any observable batch-composition churn (neither a row
+joining nor a row finishing at or near the corrupted tick). This directly
+kills the "batch-composition-churn" framing as the trigger.
+
+**Scope caveat — content-position vs. absolute-KV-depth not yet
+separated.** Every trial here uses the *same* fixed TRACKED prompt, so
+"KV depth 463" and "the row's 8th generated token" and "the token
+representing the needle's last two digits" are the same number in every
+trial — this dataset cannot distinguish "a bug tied to an absolute KV depth/
+buffer boundary" from "a bug tied to a content-relative position within the
+answer" (both would look identical here). Deciding between them needs a
+second TRACKED prompt of a different length reproducing the same
+substitution at a *different* absolute depth but the *same* relative
+content-position (or vice versa) — not run this pass (information budget).
+
+**Cheap, left in place** (same precedent as `ARLE_DISABLE_PREFIX_CACHE`):
+`ARLE_DSV4_DECODE_TRACE=1` in `crates/infer-cuda/src/dsv4.rs`
+(`dsv4_decode_trace`) and its executor.rs B=1 call site — off by default, one
+`env::var_os` check per decode tick when unset, zero behavior change.
+
 ## Rule
 
 Concurrent DSv4 serving (n>=3, prompt length >~100-250 tokens) has a real,
@@ -421,3 +496,12 @@ call a race killed or confirmed either way. It also only rules out
 GPU-launch-level races — a single-engine-thread architecture (verified here
 via `ServeHandle`) is what closes the host-thread-race branch, not the env
 var.
+
+**A byte-identical fixed-prompt token-ID trace (one tracked row vs. its own
+solo reference) is the sharpest tool this investigation has used** — it
+localizes the corruption to one fixed step with one fixed wrong-token
+substitution, and directly falsifies "batch-composition churn" (join/finish
+timing varied 4x across trials with zero effect on when the corruption
+fired). Next: separate content-relative position from absolute-KV-depth
+with a second differently-lengthed tracked prompt — the two are
+confounded when every trial reuses the same fixed prompt.
