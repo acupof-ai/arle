@@ -1,0 +1,23 @@
+docs/experience/errors/2026-07-06-dsv4-concurrent-decode-digit-corruption-unresolved.md
+  s_a1a99c8523afd1::t_0bd206625bfc03 2027-2038
+docs/experience/wins/2026-07-07-prefix-cache-graph-page-table-fix.md
+  s_a1a99c8523afd1::t_2976da5baa31ed 71-150,160-164
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "b0d266838232567ca310fab7d46e97fbeaebdb23",
+  "prompts": {},
+  "sessions": {
+    "s_a1a99c8523afd1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a7c38fc35260b988c",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
