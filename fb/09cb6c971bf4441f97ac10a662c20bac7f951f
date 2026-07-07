@@ -1,0 +1,31 @@
+scripts/tbench_calibrate.sh
+  s_0619ea11ae75d5::t_548042f832a472 1-41
+scripts/tbench_opd_loop.sh
+  s_9c91b86ec3fb55::t_8a669ff05b3a72 2-6,9,12-15,22,33,35-38,40-41,44,47-49,51,55,57,68,72-74
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "fb09cb6c971bf4441f97ac10a662c20bac7f951f",
+  "prompts": {},
+  "sessions": {
+    "s_0619ea11ae75d5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-af6c005853c874bf3",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_9c91b86ec3fb55": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4779911a-69b7-49db-bc83-daf5a48d6ca3",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
