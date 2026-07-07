@@ -3093,6 +3093,14 @@ impl Dsv4CudaExecutor {
         validate_dsv4_prefill_kv_view(row, &kv_view)?;
         if row.start_pos == 0 {
             self.kv_adapter.zero_slot_band(&self.model.ctx, row.slot)?;
+            // First real band draw for this (freshly reset) slot: the host
+            // FlashMLA page table just went empty -> populated inside
+            // `prepare_kv_batch` above. Sync the persistent device copy once
+            // here (never on later rows — the identity band never changes
+            // again for this slot's lifetime, and refreshing every decode
+            // step would be a CUDA-graph capture hazard, #8).
+            self.slots[row.slot]
+                .refresh_flashmla_device_page_tables(&self.model.ctx, &self.kv_adapter)?;
         }
         let position = (row.start_pos + row.tokens.len()) as u64;
         let final_prefill = row.start_pos + row.tokens.len() >= row.total_tokens;
