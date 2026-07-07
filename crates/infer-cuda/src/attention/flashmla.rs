@@ -123,6 +123,10 @@ pub(crate) struct Dsv4FlashMlaDecodeState {
     pub(super) num_sm_parts: i32,
     pub(super) fixed_overhead_num_blocks: i32,
     pub(super) block_size_topk: i32,
+    /// Persistent device copy of the slot's page table (`flashmla_page_table`).
+    /// Kept alive for the slot's lifetime so CUDA-graph-captured kernel args
+    /// never reference a freed temporary (prefix-cache restore UAF, #8).
+    pub(crate) device_page_table: CudaSlice<i32>,
 }
 
 impl Dsv4FlashMlaDecodeState {
@@ -201,8 +205,10 @@ impl Dsv4FlashMlaDecodeState {
             num_sm_parts,
             fixed_overhead_num_blocks,
             block_size_topk,
+            device_page_table: ctx.stream.alloc_zeros::<i32>(shape.total_blocks)?,
         };
         state.init_constant_sched_meta(ctx)?;
+        state.refresh_device_page_table(ctx, pool)?;
         Ok(state)
     }
 
@@ -240,6 +246,32 @@ impl Dsv4FlashMlaDecodeState {
             .result()
             .map_err(|e| anyhow!("DSv4 FlashMLA sched_meta failed: {e}"))?;
         }
+        Ok(())
+    }
+
+    /// Re-sync the persistent device page table from the host page table.
+    /// Required after `mirror_restore_pages` (prefix-cache restore) changes the
+    /// host table; otherwise the CUDA-graph-captured kernel arg would point to
+    /// a stale table (#8).
+    pub(super) fn refresh_device_page_table(
+        &mut self,
+        ctx: &DeviceContext,
+        pool: &Dsv4LayerKvLayout,
+    ) -> Result<()> {
+        let table_i32: Vec<i32> = pool
+            .flashmla_page_table(self.slot_idx)?
+            .iter()
+            .map(|&p| p as i32)
+            .collect();
+        ensure!(
+            table_i32.len() == self.device_page_table.len(),
+            "DSv4 FlashMLA device page table size mismatch: host {} vs device {}",
+            table_i32.len(),
+            self.device_page_table.len()
+        );
+        ctx.stream
+            .memcpy_htod(&table_i32, &mut self.device_page_table)
+            .map_err(|e| anyhow!("DSv4 FlashMLA device page table H2D failed: {e}"))?;
         Ok(())
     }
 
