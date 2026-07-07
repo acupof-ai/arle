@@ -17,7 +17,7 @@ export PATH="$HOME/.local/bin:$PATH"; export DOCKER_HOST=unix:///run/podman/podm
 mkdir -p $WORK
 CURVE=$WORK/curve.tsv; echo -e "round\tpass1\ttrials\tnew_records\tcum_records" > $CURVE
 CUM=$WORK/records_cum.jsonl; : > $CUM
-LORA=""
+LORA=${INIT_LORA:-}   # seed from a format-fixed LoRA to isolate the capability gradient
 
 kill_serve(){ pkill -f "arle serve.*--port $PORT" 2>/dev/null; sleep 5; }  # port-scoped
 wait_serve(){ for i in $(seq 1 60); do curl -s --max-time 3 http://127.0.0.1:$PORT/v1/models >/dev/null 2>&1 && return 0; sleep 10; done; return 1; }
