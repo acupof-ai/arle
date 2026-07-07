@@ -1,0 +1,21 @@
+scripts/plot_agent_opd_curve.py
+  s_51584cda255cde::t_a0fa72c20ade4d 57-88,113-115,125-130
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "622795b78ab1296c44ae0afb2c35e123e776d901",
+  "prompts": {},
+  "sessions": {
+    "s_51584cda255cde": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a25e8b372de066289",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
