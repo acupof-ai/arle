@@ -4034,9 +4034,8 @@ impl Dsv4Model {
                 let shared = shared_out.ok_or_else(|| {
                     anyhow!("DSv4 batched decode requires shared-expert output buffer")
                 })?;
-                let scratch = shared_scratch.ok_or_else(|| {
-                    anyhow!("DSv4 batched decode requires shared-expert scratch")
-                })?;
+                let scratch = shared_scratch
+                    .ok_or_else(|| anyhow!("DSv4 batched decode requires shared-expert scratch"))?;
                 shared.seq_len = seq_len; // rows ≤ MAX_SPEC_VERIFY_ROWS ≤ max_m
                 ensure!(
                     shared.hidden_dim == hidden_size,
