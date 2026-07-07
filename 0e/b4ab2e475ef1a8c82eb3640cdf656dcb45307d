@@ -1,0 +1,37 @@
+docs/experience/errors/2026-07-08-calibrated-pool-star-self-distill-wash.md
+  s_9c91b86ec3fb55::t_77ee794c3fbf31 1-40
+scripts/filter_inband.py
+  s_03a014885e3a7d::t_e53d6962ece711 2-5
+scripts/gen_terminal_tasks.py
+  s_03a014885e3a7d::t_2a597435f1d7fe 4-5
+scripts/tbench_calibrate.sh
+  s_9c91b86ec3fb55::t_ad20d25d61c573 2-4
+scripts/tbench_full.sh
+  s_03a014885e3a7d::t_360a91af47f88e 2-4
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "0eb4ab2e475ef1a8c82eb3640cdf656dcb45307d",
+  "prompts": {},
+  "sessions": {
+    "s_03a014885e3a7d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a53e105df4c883981",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_9c91b86ec3fb55": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4779911a-69b7-49db-bc83-daf5a48d6ca3",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
