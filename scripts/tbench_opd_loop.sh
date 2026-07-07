@@ -54,11 +54,12 @@ PYEOF
 )
   echo "round $r: pass@1=$PASS1/${TRIALS:-?}  sweet-spot passing=$(echo $PASSING | wc -w)"
 
-  # collect passing trajectories -> records, append to cumulative corpus
+  # collect passing trajectories -> records, append to cumulative corpus.
+  # Pass the raw trial names — terminus_to_records globs `{name}*`, so no brittle
+  # regex strip (the [a-z0-9-] class silently dropped underscored gen families).
   NEWREC=0
   if [ -n "$PASSING" ]; then
-    PATS=$(for p in $PASSING; do echo "$p" | grep -oE '^[a-z0-9_-]+\.[0-9]+-of-[0-9]+'; done | sort -u)  # _ : generated family names
-    $PY $ROOT/scripts/terminus_to_records.py "$RUN" $MODEL $WORK/records_r$r.jsonl $PATS > $WORK/conv_r$r.log 2>&1
+    $PY $ROOT/scripts/terminus_to_records.py "$RUN" $MODEL $WORK/records_r$r.jsonl $PASSING > $WORK/conv_r$r.log 2>&1
     NEWREC=$(wc -l < $WORK/records_r$r.jsonl 2>/dev/null)
     cat $WORK/records_r$r.jsonl >> $CUM
   fi
