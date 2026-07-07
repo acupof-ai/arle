@@ -83,7 +83,7 @@ pub(crate) fn run_train(train: TrainArgs) -> ExitCode {
         TrainCommand::Opd(args) => run_opd(args),
         TrainCommand::SelfOpd(args) => run_self_opd(args),
         TrainCommand::RubricOpd(args) => exit_from_result(run_rubric_opd_impl(args)),
-        TrainCommand::AgentOpd(args) => exit_from_result(run_agent_opd_impl(args)),
+        TrainCommand::AgentOpd(args) => exit_from_result(run_agent_opd_impl(*args)),
         TrainCommand::CcConvert(args) => exit_from_result(run_cc_convert_impl(args)),
     }
 }
@@ -2367,6 +2367,12 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
         .or_else(|| args.save_lora_adapters.clone())
         .or_else(|| args.save_checkpoint.clone())
         .unwrap_or_else(|| PathBuf::from("."));
+    // Structured per-round metrics sink (one JSON line/round). Machine-readable
+    // replacement for stderr regex-scraping; defaults beside the eval dumps.
+    let metrics_path: PathBuf = args
+        .metrics_out
+        .clone()
+        .unwrap_or_else(|| eval_out_dir.join("metrics.jsonl"));
 
     // Rollout engine (student) — own KV/scheduler path for the multi-turn agent
     // tool loop. Size for the full accumulated agent conversation: up to
@@ -2721,10 +2727,8 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
         infer_student
             .sync_lora_from_store(&mut store, &student.adapter_name_map(), lora)
             .context("sync trained LoRA into rollout engine")?;
-        eprintln!(
-            "[agent-opd] phase=sync_lora seconds={:.3}",
-            sync_started.elapsed().as_secs_f64()
-        );
+        let sync_lora_secs = sync_started.elapsed().as_secs_f64();
+        eprintln!("[agent-opd] phase=sync_lora seconds={sync_lora_secs:.3}");
 
         // HELD-OUT eval of THIS round's student (rollout engine now holds the
         // round-N LoRA). Eval-only: drives the same rollout+score harness with no
@@ -2735,6 +2739,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
         let is_final_round = round + 1 == args.rounds;
         let do_eval = !eval_tasks.is_empty()
             && (is_final_round || (args.eval_every > 0 && (round + 1) % args.eval_every == 0));
+        let mut held_out_pass_rate: Option<f32> = None;
         if do_eval {
             if let Err(err) = infer_student.ensure_kv_pool() {
                 eprintln!("[agent-opd] ensure KV pool before eval (round {round}) failed: {err}");
@@ -2747,6 +2752,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
                 &eval_out_dir,
                 &(round + 1).to_string(),
             )?;
+            held_out_pass_rate = Some(pass_rate);
             match baseline_pass_rate {
                 Some(base) => eprintln!(
                     "[arle train agent-opd] round {round}: held-out pass_rate={pass_rate:.4} (baseline={base:.4}, Δ={:+.4}) train_mean_loss={:.4}",
@@ -2790,10 +2796,50 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
             &mut store,
             &mut ckpt_tape,
         )?;
-        eprintln!(
-            "[agent-opd] phase=round_tail_save seconds={:.3}",
-            save_started.elapsed().as_secs_f64()
-        );
+        let save_secs = save_started.elapsed().as_secs_f64();
+        eprintln!("[agent-opd] phase=round_tail_save seconds={save_secs:.3}");
+
+        // Structured per-round metrics: one JSON line appended to metrics.jsonl.
+        // `report` flattens to its own fields (incl. the T2 rollout aggregates);
+        // held_out_* is present only on eval rounds. Machine-readable sink that
+        // replaces the stderr regex-scraping in plot_agent_opd_curve.py.
+        if let Err(err) = (|| -> Result<()> {
+            use std::io::Write;
+            let mut row = serde_json::to_value(&report)?;
+            let obj = row
+                .as_object_mut()
+                .expect("AgentRoundReport serializes to object");
+            obj.insert("round".into(), serde_json::json!(round));
+            obj.insert("sync_lora_secs".into(), serde_json::json!(sync_lora_secs));
+            obj.insert("save_secs".into(), serde_json::json!(save_secs));
+            obj.insert(
+                "held_out_pass_rate".into(),
+                serde_json::json!(held_out_pass_rate),
+            );
+            obj.insert(
+                "baseline_pass_rate".into(),
+                serde_json::json!(baseline_pass_rate),
+            );
+            obj.insert(
+                "delta".into(),
+                serde_json::json!(
+                    held_out_pass_rate
+                        .zip(baseline_pass_rate)
+                        .map(|(p, b)| p - b)
+                ),
+            );
+            if let Some(parent) = metrics_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let mut file = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&metrics_path)?;
+            writeln!(file, "{row}")?;
+            Ok(())
+        })() {
+            eprintln!("[agent-opd] metrics.jsonl write (round {round}) failed: {err}");
+        }
     }
 
     eprintln!("[arle train agent-opd] done ({} rounds)", args.rounds);
