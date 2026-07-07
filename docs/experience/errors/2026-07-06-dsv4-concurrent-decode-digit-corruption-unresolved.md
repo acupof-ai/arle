@@ -1152,6 +1152,174 @@ worth of full-stack substage data) and manifests. The instrumentation itself
 off by default) is committed alongside this entry — reusable for the next
 pass without re-instrumenting.
 
+## Capture/restore CUDA stream-discipline audit — RULED OUT, source-only, no pod time needed (2026-07-08)
+
+Follow-up to the enumeration audit's #1 ranked suspect ("exact-match
+`swap_out_image`/`swap_in_image` fidelity... mechanism not yet identified"):
+checked whether an async D2H (capture) or H2D (restore) copy could race a
+still-in-flight compute kernel — a missing-fence hazard invisible to a
+field-presence enumeration. Read every capture/restore call site end to end
+(`crates/infer-cuda/src/attention/dsa.rs`, `crates/infer-cuda/src/dsv4.rs`,
+`crates/infer-cuda/src/attention/flashmla.rs`, `crates/infer-cuda/src/attention/kv_layout.rs`,
+`crates/cuda-kernels/src/paged_kv.rs`, `crates/cuda-kernels/src/tensor.rs`) —
+no pod GPU run, fully conclusive from source (same precedent as the MHC
+TF32-fallback and RMSNorm-batch-invariance rounds).
+
+**The codebase has three device streams, by design, for exactly this
+class of hazard.** `DeviceContext` (`crates/cuda-kernels/src/tensor.rs:170-186`)
+carries `stream` (compute: all kernels + CUDA Graph capture/replay),
+`copy_stream` (async H2D/D2H, meant to overlap compute), and `comm_stream`
+(NCCL). Cross-stream deps are explicit (`CudaPipelineFence`/
+`record_pipeline_fence`/`wait_on_pipeline_fence`, `tensor.rs:216-252`) —
+cudarc's automatic same-object dependency tracking is disabled at context
+creation (`tensor.rs:339-341`) specifically so CUDA Graph capture isn't
+poisoned by hidden waits, which means a stray `copy_stream` use with no
+matching fence is a genuine, unguarded hazard class in this codebase (this
+is the shape the task's hypothesis predicted).
+
+**Every capture/restore call in this path uses `ctx.stream` — the compute
+stream — exclusively; `copy_stream` never appears.** Checked all four
+per-buffer `capture`/`restore_to` pairs:
+- `Dsv4CompressorImage::capture`/`restore_to` (`dsa.rs:825-882`) —
+  `ctx.stream.clone_dtoh`/`ctx.stream.memcpy_htod`, 5 buffers each way.
+- `Dsv4FlashMlaImage::capture`/`restore_to` (`dsa.rs:904-953`) — via
+  `pool.flashmla_pool()?.copy_pages_to_host(ctx, ...)` /
+  `.copy_pages_from_host(ctx, ...)`. `copy_pages_to_host`
+  (`crates/cuda-kernels/src/paged_kv.rs:940-1022`) has no `copy_stream`
+  variant at all — every `clone_dtoh` inside it is `ctx.stream`, followed by
+  its own internal `ctx.sync()` (`:1011`). `copy_pages_from_host`
+  (`paged_kv.rs:1024-1031`) forwards to `copy_pages_from_host_impl` with
+  `on_copy_stream=false`, i.e. `ctx.stream` (`:1055-1058`) — confirmed by
+  reading the call site in `Dsv4FlashMlaImage::restore_to`
+  (`dsa.rs:947-949`), which calls the plain (non-`_on_copy_stream`) variant.
+  A `copy_pages_from_host_on_copy_stream` variant *does* exist
+  (`paged_kv.rs:1035-1042`, doc-commented "Pair with `ctx.sync_copy()`"), but
+  it has exactly **one** call site in the whole codebase
+  (`executor.rs:1013`, a different, opt-in NVMe-recall lane, not this swap
+  path) and is correctly paired with `ctx.sync_copy()` on the very next line
+  (`executor.rs:1014`) — a real copy-stream use, real fence, not this
+  mechanism.
+- `Dsv4DsaOfficialImage::capture`/`restore_to` (`dsa.rs:972-1024`) —
+  `ctx.stream.clone_dtoh`/`ctx.stream.memcpy_htod` on the shared DSA
+  key-cache band.
+- `sw_window_cache` (`dsa.rs:1321-1324` capture, `:1363-1365` restore) and
+  `flashmla.refresh_device_page_table` (`flashmla.rs:264-284`, called inside
+  `swap_in_image` at `dsa.rs:1383-1385`) — same, `ctx.stream` only.
+
+**Both the per-layer and per-slot swap functions end in an explicit,
+blocking, same-stream `synchronize()` — stronger than mere in-order
+scheduling.** `Dsv4LayerAttentionState::swap_out_image`/`swap_in_image`
+(`dsa.rs:1315-1392`) enqueue all of the above on `ctx.stream` per layer, no
+sync themselves; the per-**slot** wrappers close the loop:
+`Dsv4SlotState::swap_out_image` (`dsv4.rs:1172-1193`) calls every layer's
+`swap_out_image` then `ctx.sync()` once (`:1188`); `Dsv4SlotState::swap_in_image`
+(`dsv4.rs:1198-1240`) calls every layer's `swap_in_image` (incl.
+`refresh_device_page_table`) then `ctx.sync()` once (`:1238`). `ctx.sync()` =
+`self.stream.synchronize()` (`tensor.rs:471-475`) — a hard host-blocking
+drain of exactly the stream every copy above and every decode-compute kernel
+also runs on. Not a partial guarantee: CUDA's same-stream FIFO ordering
+alone would already make a race impossible here; the trailing sync is
+redundant belt-and-braces on top of that, not the only thing preventing one.
+
+**`mirror_restore_pages`/`mirror_band` (the FlashMLA page-table remap that
+runs immediately before `swap_in_image` in `restore_cached_prefix`) is pure
+host bookkeeping — zero device memory touched, zero stream involvement, not
+a race candidate at all.** `Dsv4KvAdapter::mirror_slot_pages`
+(`kv_layout.rs:843-865`) → `TokenKVPool::mirror_band`
+(`crates/cuda-kernels/src/paged_kv.rs:847-878`): reassigns `page_indices[slot]`,
+decrements/increments `page_attach_count`, sets `seq_lens[slot]` — plain
+`Vec`/counter mutation on the host. The actual KV bytes for those physical
+pages either already sit there from a still-live page (RadixCache-style
+publish-by-page-id reuse) or get H2D-written by the immediately-following
+`swap_in_image`'s `copy_pages_from_host` (`ctx.stream`, per above) — no
+separate device-side move happens in the mirror step itself.
+
+**Called synchronously, in program order, by the one engine thread — never
+speculatively ahead of the compute that produced the data.**
+`ServeHandle::spawn_with_shutdown` (`crates/infer-server/src/lib.rs:220-252`)
+spawns exactly one `infer-engine` thread running `engine_loop`; HTTP handlers
+only push onto `submit_tx`/`control_tx` channels, matching this doc's own
+already-established `CUDA_LAUNCH_BLOCKING=1` round. `capture_cached_prefix`
+fires in the *same* scheduler step, right after the just-completed prefill's
+per-row bookkeeping (`crates/infer-core/src/lib.rs:952-966`) — i.e. the
+forward call that wrote `sw_window_cache`/`compressor`/`dsa_official` for
+that slot has already returned (its kernels already enqueued, in order, on
+`ctx.stream`) before `capture_cached_prefix`'s own `ctx.stream` copies are
+enqueued *after* them on the identical stream, by the identical thread.
+`restore_cached_prefix` (`crates/infer-core/src/prefix.rs:173`,
+`crates/infer-core/src/lib.rs`'s planner call sites) runs to completion
+(through its own trailing `ctx.sync()`) before the engine issues the tail
+prefill's forward for that slot in a later step — never concurrently, never
+out of order.
+
+**Verdict: RULED OUT, structurally — not just "looks clean," proven.** Three
+independent guarantees stack here, any one of which alone would already
+suffice: (1) every copy in this path uses the compute stream, not a private
+one — no cross-stream gap exists to leave unfenced; (2) the single
+engine-thread architecture issues every CUDA call (compute and copy alike)
+in one strict program order onto that one stream, so CUDA's own FIFO
+same-stream semantics guarantee sequencing even without (1)'s narrower
+scoping; (3) both capture and restore end in an explicit
+`stream.synchronize()` that hard-blocks the host until every enqueued op —
+copies and any compute ahead of them — has physically completed, which is
+sufficient on its own even if (1) or (2) were wrong. Point 3's premise (a
+partially-written buffer producing a small numerical perturbation) cannot
+occur in this code as written: there is no window, sync-scoped or
+otherwise, where a capture could observe write-in-flight bytes or a restore
+could be read before its own H2D lands. This directly falsifies the async
+copy/fence-gap hypothesis for the exact-match restore path — the doc's own
+prior enumeration-audit round already showed every *field* is present and
+wired; this round shows the *timing* around those fields is also
+provably sound, closing both halves of "what" and "when" for this specific
+mechanism.
+
+**Net effect on the investigation.** Every concrete mechanism this doc's
+shortlist has named — six killed races/dispatch-invariance results, three
+FP8-precision gates (one confirmed-partial, two dead-ended on
+checkpoint-only-FP8 weights), the enumeration audit's one real-but-elsewhere
+gap (`truncate_decode_len`), and now this stream-discipline check — is
+closed. The exact-match restore case (`image_len==matched_len`,
+`truncate()` never invoked) still deterministically corrupts
+(`docs/experience/errors/2026-07-06-...md`'s own "Comprehensive
+substage-diff round": 20/20 wrong from call 2 onward, same boot, same slot),
+and no async/race/precision/field-completeness explanation for it survives.
+
+**Next-round proposal (not executed this round — a method change, not
+another hypothesis).** With every CUDA-level mechanism (race, fence,
+arithmetic invariance, field completeness) closed, the remaining candidate
+class is a **deterministic host-side logic/bookkeeping bug** in the
+capture→restore round-trip itself, not a GPU numerics or timing bug — the
+"call 1 correct, every subsequent identical call wrong, forever" signature
+is 100%-reproducible, which is the signature of a systematic value error
+(an off-by-something position/phase/counter), not a race. Two concrete,
+cheap next experiments, in priority order:
+1. **Pure data-integrity byte-diff.** Hash (or full byte-compare) the
+   captured `Dsv4LayerImage` at capture time against a second capture taken
+   immediately after restoring it back into the *same* slot with *zero*
+   compute in between (`capture → restore → capture`, same content, same
+   slot) — the enumeration audit proved every field is present and the
+   copies are correctly sequenced, but never checked whether
+   `capture(restore(capture(state)))` is bit-identical to `capture(state)`.
+   If it isn't, the mismatch pinpoints the exact byte range/field
+   responsible without any GPU-numerics reasoning at all. If it is
+   bit-identical, the round-trip mechanism itself is innocent and the bug
+   must be in what happens on the FIRST compute step *after* restore
+   (a stale-but-technically-present derived value — e.g. a ring
+   phase/cursor computed from `seq_len` that the image's raw bytes
+   don't encode).
+2. **Same-slot-vs-different-slot A/B**, the enumeration audit's own named
+   follow-up: `trace_probe.py`'s repeat harness always lands the repeated
+   prompt on slot 0 (self-restore). Force the scheduler to admit the repeat
+   onto a *different*, previously-unused slot (e.g. by holding slot 0 busy
+   with a filler request) — if the corruption disappears, the mechanism is
+   specific to restoring a slot into itself (a stale-read-of-own-prior-state
+   hazard distinct from every "async copy" or "arithmetic" framing tested
+   so far); if it persists on a fresh slot, that rules out "self-restore"
+   as the necessary condition and re-opens the search to any restore target.
+
+No code changed this round (source-read-only). `git diff` clean on the local
+tree; no pod tree touched, no GPU time spent.
+
 ## FlashMLA split-KV `num_splits` batch-invariance hypothesis — KILLED, quantitatively (2026-07-07)
 
 External lead (Thinking Machines Lab, "Defeating Nondeterminism in LLM
