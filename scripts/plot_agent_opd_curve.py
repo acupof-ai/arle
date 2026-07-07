@@ -54,6 +54,38 @@ def read_eval_dir(eval_dir):
     return points
 
 
+def read_metrics_jsonl(path):
+    """Per-round rows from the structured metrics.jsonl sink (one JSON/round).
+
+    Preferred over regex-scraping the stderr log: the Rust loop emits the full
+    AgentRoundReport + phase timers here. Returns [] if the file is absent.
+    """
+    path = Path(path)
+    if not path.exists():
+        return []
+    rounds = []
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        row = json.loads(line)
+        rollouts = int(row.get("rollouts", 0))
+        passed = int(row.get("passed", 0))
+        rounds.append(
+            {
+                "round": int(row["round"]),
+                "tasks": int(row.get("tasks", 0)),
+                "rollouts": rollouts,
+                "passed": passed,
+                "distinct": int(row.get("distinct_passed", 0)),
+                "trained_pairs": int(row.get("trained_pairs", 0)),
+                "accept_rate": passed / rollouts if rollouts else 0.0,
+                "mean_loss": float(row.get("mean_train_loss", 0.0)),
+            }
+        )
+    return rounds
+
+
 def read_train_log(log_path):
     rounds = []
     for m in ROUND_RE.finditer(Path(log_path).read_text(errors="replace")):
@@ -78,6 +110,9 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--eval-dir", type=Path, required=True)
     ap.add_argument("--train-log", type=Path)
+    ap.add_argument("--metrics", type=Path,
+                    help="structured metrics.jsonl; defaults to "
+                         "<eval-dir>/metrics.jsonl. Preferred over --train-log.")
     ap.add_argument("--baseline-extra", type=Path, nargs="*", default=[],
                     help="eval dirs of same-config baseline repeats (envelope)")
     ap.add_argument("--out", type=Path, default=Path("agent_opd_curve.png"))
@@ -87,7 +122,12 @@ def main():
     evals = read_eval_dir(args.eval_dir)
     if not evals:
         sys.exit(f"no eval_round_*.jsonl under {args.eval_dir}")
-    train = read_train_log(args.train_log) if args.train_log else []
+    # Prefer the structured metrics.jsonl sink; fall back to regex-scraping the
+    # stderr train log only when the sink is absent.
+    metrics_path = args.metrics or (args.eval_dir / "metrics.jsonl")
+    train = read_metrics_jsonl(metrics_path)
+    if not train and args.train_log:
+        train = read_train_log(args.train_log)
 
     baseline = evals.get(0, {}).get("pass_rate")
     envelope = [baseline] if baseline is not None else []

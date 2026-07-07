@@ -195,7 +195,7 @@ mod cuda_rollout {
     }
 
     /// One round's roll-up.
-    #[derive(Clone, Debug, Default)]
+    #[derive(Clone, Debug, Default, serde::Serialize)]
     pub struct AgentRoundReport {
         pub tasks: usize,
         pub rollouts: usize,
@@ -208,6 +208,16 @@ mod cuda_rollout {
         /// Rescue-pass rollouts run on 0-accept tasks (and how many passed).
         pub rescue_rollouts: usize,
         pub rescue_passed: usize,
+        // --- T2: observed-only rollout aggregates (never affect accept/train) ---
+        /// Summed `AgentTurnResult` counts/timings over ALL rollouts this round.
+        pub sum_completion_tokens: u64,
+        pub sum_prompt_tokens: u64,
+        pub sum_tool_calls: u64,
+        pub sum_rollout_secs: f64,
+        /// Distinct train tasks with ≥1 passing rollout (train pass-rate numerator).
+        pub train_tasks_passed: usize,
+        /// Rollout terminal-state histogram (Debug name → count).
+        pub terminal_state_counts: std::collections::BTreeMap<String, u32>,
     }
 
     /// Per-task held-out eval outcome: did the current student (greedy, no
@@ -489,6 +499,17 @@ mod cuda_rollout {
                         }
                     };
 
+                    // T2: observe rollout counts/timings BEFORE the accept path drops
+                    // them. Pure aggregation — does not gate accept/train.
+                    report.sum_completion_tokens += result.completion_tokens;
+                    report.sum_prompt_tokens += result.prompt_tokens;
+                    report.sum_tool_calls += result.tool_calls_executed as u64;
+                    report.sum_rollout_secs += result.wall_secs;
+                    *report
+                        .terminal_state_counts
+                        .entry(format!("{:?}", result.terminal_state))
+                        .or_insert(0) += 1;
+
                     // DEBUG (temporary): decode the FULL trajectory of sample 0 — every
                     // sub-turn's action — to see whether the student locates the bug and
                     // attempts an edit, or just explores. Case-as-fact, not a guess.
@@ -582,6 +603,7 @@ mod cuda_rollout {
                 }
                 if distinct_passed_this_task > 0 {
                     report.distinct_passed += 1;
+                    report.train_tasks_passed += 1; // distinct train task with ≥1 pass
                 }
             }
 
