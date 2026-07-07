@@ -257,6 +257,142 @@ run that reproduced corruption; plain NCCL `all_reduce` is the only comm
 path exercised, and it launches on `ctx.stream` (not a private stream) per
 `tp.rs:462-490`. No further investigation needed on this lead.
 
+## CUDA_LAUNCH_BLOCKING=1 A/B — GPU-async-race hypothesis KILLED (2026-07-07)
+
+Cheapest remaining decisive test: does forcing every kernel launch to run
+synchronously (no host-side launch queueing, no GPU-side overlap between
+kernels/streams) change the corruption rate? If it disappears, the mechanism
+is a missing-fence/async-ordering hazard exposed only by real overlap. If it
+reproduces identically, the bug is not timing-dependent at the GPU-launch
+level at all.
+
+**Setup.** Smallest reliable repro from the DSA-hypothesis pass: n=4,
+len=500, TP=4 GPUs 2/3/4/5, same env as `job2_ab.sh`
+(`ARLE_DSV4_MOE_BACKEND=allreduce`, `ARLE_DSV4_INCREMENTAL_KV=1`,
+`ARLE_DSV4_EXPERT_BACKEND=deepgemm`). Two server boots, control vs
+`CUDA_LAUNCH_BLOCKING=1` exported before `arle serve`, otherwise identical.
+
+**Pass 1 (5 reps/arm, 20 requests/arm)** — ambiguous on its own (Fisher exact
+p=0.20), so extended to a second, bigger pass before concluding anything:
+
+| Arm | Requests | Exact | Miss | Miss rate |
+|---|---|---|---|---|
+| control | 20 | 8 | 12 | 60% |
+| `CUDA_LAUNCH_BLOCKING=1` | 20 | 13 | 7 | 35% |
+
+**Pass 2 (15 reps/arm, 60 requests/arm)** — the decisive sample:
+
+| Arm | Requests | Exact | Miss | Miss rate |
+|---|---|---|---|---|
+| control | 60 | 43 | 17 | 28.3% |
+| `CUDA_LAUNCH_BLOCKING=1` | 60 | 43 | 17 | 28.3% |
+
+Identical counts. Fisher exact on pass 2 alone: p=1.0. Combined pass1+pass2
+(80 requests/arm): control 29/80 miss (36.25%), LB 24/80 miss (30%), p=0.50 —
+no significant difference. Pass 1's apparent gap was noise from a small n.
+
+Failure signature under `CUDA_LAUNCH_BLOCKING=1` is byte-for-byte the same
+class as every prior pass — truncation (`'The secret access code is 738.'`)
+and digit-4-onward corruption (`738292`, `738123`, `73829` vs needle
+`738291`) — no new signature, no reduction in severity.
+
+**Conclusion: not a GPU-kernel-launch-ordering race.** `CUDA_LAUNCH_BLOCKING=1`
+removes all host-side launch queueing and inter-kernel/inter-stream overlap;
+a hazard that depends on that overlap (a missing `stream_wait`, an async
+memcpy racing a kernel read) would have been exposed as a rate change. It
+was not — the mechanism is either a deterministic logic/numerics bug that
+depends on (N, routing/content) rather than on timing, or a hazard outside
+GPU-launch overlap entirely (see scope caveat below).
+
+**Scope caveat, not fully closed by this test.** `CUDA_LAUNCH_BLOCKING=1`
+only serializes GPU kernel launches; it says nothing about a *host-side*
+(CPU-thread) data race. Closed separately, for free, by the architecture:
+`ServeHandle`'s continuous-batching scheduler + backend executor live on one
+dedicated engine thread (`crates/infer-api/src/serve_engine.rs`,
+`crates/infer-server`'s `ServeHandle`) — HTTP handler threads only submit
+tickets and collect results over a channel; the per-step batch construction,
+`Dsv4DecodeBatch::from_rows`, and the forward call all execute on that single
+thread, never concurrently with themselves. No host-thread race is possible
+in the scheduler/decode-step-construction path regardless of how many HTTP
+requests arrive simultaneously. Combined with the LB result, this narrows the
+mechanism to a deterministic bug inside the single engine-thread's per-step
+logic that only misfires when N>=3 real rows are coalesced into the same
+batched forward call (and the prompt is long enough) — not a race of any
+kind.
+
+## Source-level review of the batched-decode chain — no static bug found (2026-07-07)
+
+Per the non-race branch: reviewed every N-batched, content-shared (i.e., not
+excluded by the earlier FlashMLA-vs-scalar A/B, which only swapped the
+*attention* kernel) subsystem on the path from scheduler to sampled token,
+looking for something simply WRONG and tied to (N, length) rather than a
+race. No fix applied — flagging as reviewed-clean, not as a license to stop
+looking.
+
+- **`Dsv4DecodeBatch::from_rows`** (`crates/infer-cuda/src/executor.rs:1942`):
+  builds `slot_ids`/`tokens`/`start_positions`/`positions` from `&[DecodeRow]`
+  purely per-row (`row.slot`, `row.kv_seq_len`, `row.last_token`) — no
+  batch-size-dependent arithmetic, no shared index. Asserts
+  `slots[row.slot].seq_len() == row.kv_seq_len` per row.
+- **`forward_decode_batch`'s row-selection** (`crates/infer-cuda/src/dsv4.rs:2369-2419`):
+  samples row `r`'s token via `forward_stream_last_token(&stream, r + 1, ...)`,
+  i.e. reads stream row `r`. This assumes the batched stream's row order
+  matches `slot_ids` order throughout the whole layer stack, not just the
+  DSA-select step already traced (`r == slot_ids[r]` 100% in ~1500 prior trace
+  lines) — read `forward_stream_last_token`
+  (`crates/infer-cuda/src/dsv4.rs:4516`) itself: a plain `seq_len - 1` row
+  index into `copy_row_to_vec`/`head_hidden_from_stream`, no batch-size term.
+- **Full MoE compact-decode pipeline** (allreduce transport, the path this
+  config's `ARLE_DSV4_MOE_BACKEND=allreduce` actually takes — traced end to
+  end since the FlashMLA A/B never excluded MoE, only the attention kernel):
+  `dsv4_moe_forward` → `dsv4_moe_forward_masked_tail` → (`total_routes <= 128`
+  for every n∈{3,4,6,8} tested here, so always) `dsv4_moe_forward_decode_fp8`
+  (`crates/infer-cuda/src/moe.rs:2728-3083`) — router gemm → device routing
+  (`dsv4_route_kernel`) → count/scan (`dsv4_count_local_experts_kernel`,
+  `dsv4_exclusive_scan_i32_kernel`) → pack
+  (`dsv4_pack_local_experts_with_slots_kernel`) → fused FP8 grouped
+  gate/up/SwiGLU + down GEMM (`dsv4_fp8_grouped_swiglu_decode_kernel`/
+  `dsv4_fp8_grouped_down_decode_kernel`,
+  `crates/cuda-kernels/csrc/gemm/dsv4_fp8_decode_moe.cu`) → scatter
+  (`dsv4_scatter_all_route_slots_kernel`) → combine
+  (`dsv4_combine_route_slot_outputs_kernel`), all in
+  `crates/cuda-kernels/csrc/moe/dsv4_route.cu`. Verified: `route =
+  token*topk+k` layout is consistent between the router kernel that writes
+  `indices[token*topk+k]` and the pack kernel that reads `token = route/topk`;
+  the pack kernel's `packed_route_slot[slot] = route` and the scatter
+  kernel's `route_out[route_slot*hidden_dim+col]` correctly round-trip
+  packed-slot ↔ original-route-index; the two FP8 grouped-GEMM kernels' grid
+  (`num_experts` in `blockIdx.z`, `max_count`-derived `blockIdx.y`) and their
+  Rust FFI bindings (`crates/cuda-kernels/src/moe.rs:1567-1647`) pass
+  `num_experts`/`max_count`/`n`/`k` in the same order the C signature expects
+  — no positional-argument swap.
+- **Also checked**: no `n == 2`/`n >= 3`-style batch-size special-casing
+  anywhere in `dsv4.rs`; `DSV4_DECODE_GEMV_MAX_ROUTES = 128` and
+  `DSV4_DECODE_CONTIG_MAX_ROUTES = 128` are both far above this repro's
+  total-route counts (≤ 64), so no route-capacity ceiling is in play; the
+  `ARLE_DSV4_MOE_CONTIG_DECODE` lever does not apply here — it only gates
+  `dsv4_moe_forward_decode_pooled` (`moe.rs:3293`), a function not on this
+  call path (`dsv4_moe_forward_masked_tail` branches straight to the FP8
+  compact lane before that lever is ever consulted), so it can't be reused as
+  an A/B knob for this specific repro without new code.
+
+**Conclusion: still unresolved.** Every N-batched subsystem reachable from
+source reading in this pass round-trips its indices correctly on paper. This
+is consistent with either (a) a genuine numerical edge case in the FP8
+dot-product / clamped-SwiGLU kernels that is data/routing-dependent rather
+than an indexing bug (not exercised — would need per-step token-id-level
+tracing of a corrupted row against its serial-n=1 reference, comparable
+effort to the DSA trace but for the MoE path), or (b) a bug in a part of the
+chain not yet reviewed this pass (the shared KV-batch-descriptor prep,
+`prepare_kv_batch`, and the attention layers' non-kernel-choice-dependent
+scaffolding around FlashMLA/scalar). No fix applied — inference from source
+reading is not evidence per this doc's own prior lesson (the FlashMLA lane
+"looked clean from source reading alone" too, and needed the lever A/B to
+kill). Next step needs the same discipline: an env-gated per-row trace of
+sampled token IDs (not just `slot_ids[r]`) at each decode step, diffed
+against a serial n=1 run of the identical prompt, to localize which decode
+step and which subsystem output first diverges — not further source reading.
+
 ## Rule
 
 Concurrent DSv4 serving (n>=3, prompt length >~100-250 tokens) has a real,
@@ -275,3 +411,13 @@ a lever-gated A/B is.
 cross-request-reuse hypothesis** — if the defect needs no history to
 manifest, no reuse-based mechanism (cache, page, slot) can be the cause;
 run it before reasoning further about *how* reuse might race, not after.
+
+**`CUDA_LAUNCH_BLOCKING=1` is the cheapest kill for a GPU-launch-ordering
+race** — run it before compute-sanitizer/nsys, but size the sample first: a
+5-rep/arm pass here gave p=0.20 (looked like a real reduction, wasn't), and
+only a 15-rep/arm pass resolved it to bit-identical miss rates (p=1.0). A
+single-digit rep count on a ~30% baseline miss rate is not enough signal to
+call a race killed or confirmed either way. It also only rules out
+GPU-launch-level races — a single-engine-thread architecture (verified here
+via `ServeHandle`) is what closes the host-thread-race branch, not the env
+var.
