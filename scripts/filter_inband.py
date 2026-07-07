@@ -1,16 +1,10 @@
 #!/usr/bin/env python3
-"""Calibrate a task pool to the model's sweet-spot band (0 < pass < attempts).
-
-The ONLY ground truth for "is this task the right difficulty" is the model's own
-pass rate (Tmax difficulty calibration). Given a tb results.json over a pool and
-the pool dir, symlink the in-band tasks into an output dir — that dir IS the
-difficulty-calibrated substrate for the STaR loop. Source-agnostic: works on
-real TB tasks or generated ones.
+"""Symlink a pool's sweet-spot tasks (0 < pass < attempts) into an out dir — the
+difficulty-calibrated substrate. Difficulty = the model's own pass rate (Tmax),
+the only ground truth. Prints the per-family band (all-100% too easy / all-0%
+too hard). Source-agnostic (real TB or generated tasks).
 
     filter_inband.py <results.json> <pool_dir> <out_dir> [attempts]
-
-Prints the per-task pass histogram + per-family band so you can see whether the
-pool spans the band at all (all-100% = too easy, all-0% = too hard/format-broken).
 """
 import collections
 import json

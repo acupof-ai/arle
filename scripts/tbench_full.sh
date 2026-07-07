@@ -1,9 +1,7 @@
 #!/bin/bash
-# Full Terminal-Bench (all 80 core==0.1.1 tasks) on the 27B, an empty GPU.
-# Served with the +5pp format LoRA so the score is capability, not JSON-format
-# noise. --dataset-path over the local cache (no GitHub registry fetch). pass@1.
-# Heavy tasks (qemu/kernel/swe-bench) are slow and some fail on pod infra, not
-# capability — read per-task before trusting the aggregate.
+# Full Terminal-Bench (80 core==0.1.1 tasks) on the 27B + format LoRA, pass@1,
+# --dataset-path over the local cache (no registry fetch). Heavy tasks
+# (qemu/kernel/swe-bench) fail on pod infra not capability — read per-task.
 set +e
 ROOT=/host/arle-build; ARLE=$ROOT/target/release/arle; MODEL=/host/Qwen3.6-27B-FP8
 PY=/host/guidellm-venv/bin/python

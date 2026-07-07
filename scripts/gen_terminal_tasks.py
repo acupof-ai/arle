@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """Compositional, self-verifying Terminal-Bench task GENERATOR (Tmax §5.1).
 
-WHY: the agentic-OPD loop plateaus (pass@1 6->7->7) because the fixed hand-picked
-task set isn't difficulty-calibrated — once the model learns them the rest are
-always-pass (0 gradient) or always-fail (0 gradient). Tmax's fix: sample over
-ORTHOGONAL difficulty axes so a "sweet-spot" band (sometimes-pass) always exists.
+WHY: a fixed task set plateaus — once learned, tasks are all-pass or all-fail (0
+gradient). Sample orthogonal difficulty axes so a sweet-spot band always exists.
 
 Axes (sampled + combined per task):
   DOMAIN      {file-ops, text-processing, data-transform, config-parsing,
