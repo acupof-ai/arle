@@ -1,0 +1,21 @@
+scripts/tbench_opd_loop.sh
+  s_92bdc8f4baebc7::t_4111afb6b5df87 22-23,37-43,105-135
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "17fdf228758b8b32bbd0ea83704c08a7fc7d0bea",
+  "prompts": {},
+  "sessions": {
+    "s_92bdc8f4baebc7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-afc755777304129ee",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
