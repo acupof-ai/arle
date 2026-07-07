@@ -444,6 +444,11 @@ struct TopKParams {
   uint32_t page_bits;
   uint32_t topk;
   int64_t output_stride;
+  // ARLE_DSA_TIEBREAK_TRACE diagnostic (2026-07 concurrent-decode digit-
+  // corruption investigation), nullptr disables: per-row [remain, competitors]
+  // i32 pair, written only when radix_topk's round==3 tie-break genuinely
+  // fires (more bit-identical-tied candidates than remaining output slots).
+  int32_t* tie_trace;
 };
 
 __device__ __forceinline__ uint8_t convert_to_uint8(float x) {
@@ -488,7 +493,10 @@ __device__ void radix_topk(
     const float* __restrict__ input,
     int32_t* __restrict__ output,
     uint32_t length,
-    uint32_t topk) {
+    uint32_t topk,
+    // ARLE_DSA_TIEBREAK_TRACE diagnostic (nullptr disables): this block's own
+    // 2-int slot, written [remain, competitors] iff round==3 genuinely ties.
+    int32_t* __restrict__ tie_trace_row) {
   constexpr uint32_t RADIX = 256;
   constexpr uint32_t BLOCK_SIZE = kTopKBlockSize;
   constexpr uint32_t SMEM_INPUT_SIZE = kTopKSmem / (2 * sizeof(int32_t));
@@ -498,6 +506,10 @@ __device__ void radix_topk(
   alignas(128) __shared__ uint32_t s_threshold_bin_id;
   alignas(128) __shared__ uint32_t s_num_input[2];
   alignas(128) __shared__ int32_t s_last_remain;
+  // ARLE_DSA_TIEBREAK_TRACE diagnostic-only: round-3 remaining-slot count
+  // (captured before decrement) + count of bit-identical-tied competitors.
+  alignas(128) __shared__ int32_t s_r3_remain;
+  alignas(128) __shared__ uint32_t s_tie_competitors;
 
   extern __shared__ uint32_t s_input_idx[][SMEM_INPUT_SIZE];
 
@@ -582,6 +594,7 @@ __device__ void radix_topk(
       s_threshold_bin_id = tx;
       s_num_input[r_idx ^ 1] = 0;
       s_last_remain = static_cast<int32_t>(remain_topk - s_histogram[tx + 1]);
+      if (round == 3) s_r3_remain = s_last_remain;
     }
     __syncthreads();
 
@@ -603,6 +616,7 @@ __device__ void radix_topk(
     }
     __syncthreads();
     if (tx < RADIX + 1) s_histogram[tx] = 0;
+    if (round == 3 && tx == 0) s_tie_competitors = 0;
     __syncthreads();
     for (uint32_t i = tx; i < num_input; i += BLOCK_SIZE) {
       const auto idx = s_input_idx[r_idx][i];
@@ -614,6 +628,7 @@ __device__ void radix_topk(
         output[pos] = static_cast<int32_t>(idx);
       } else if (bin == threshold_bin) {
         if (round == 3) {
+          atomicAdd(&s_tie_competitors, 1);
           const auto pos = atomicAdd(&s_last_remain, -1);
           if (pos > 0) output[topk - pos] = static_cast<int32_t>(idx);
         } else {
@@ -628,6 +643,15 @@ __device__ void radix_topk(
       }
     }
     __syncthreads();
+    // ARLE_DSA_TIEBREAK_TRACE: a genuine tie is s_tie_competitors > s_r3_remain
+    // (more bit-identical candidates than remaining slots — the arbitration
+    // this investigation is probing). Equal counts mean every competitor wins
+    // regardless of schedule, i.e. not a real arbitration event.
+    if (round == 3 && tie_trace_row != nullptr && tx == 0 &&
+        s_tie_competitors > static_cast<uint32_t>(s_r3_remain)) {
+      tie_trace_row[0] = s_r3_remain;
+      tie_trace_row[1] = static_cast<int32_t>(s_tie_competitors);
+    }
   }
 }
 
@@ -648,7 +672,8 @@ __global__ __launch_bounds__(kTopKBlockSize) void deepseek_v4_topk_transform_ker
   }
 
   __shared__ int32_t s_topk_indices[kMaxTopK];
-  radix_topk(score_ptr, s_topk_indices, static_cast<uint32_t>(seq_len), topk);
+  const auto tie_trace_row = params.tie_trace != nullptr ? params.tie_trace + bid * 2 : nullptr;
+  radix_topk(score_ptr, s_topk_indices, static_cast<uint32_t>(seq_len), topk, tie_trace_row);
 
   __syncthreads();
   for (uint32_t i = threadIdx.x; i < topk; i += kTopKBlockSize) {
@@ -839,6 +864,9 @@ extern "C" CUresult dsv4_deepseek_v4_topk_transform_cuda(
     int batch_size,
     int topk,
     int page_size,
+    // ARLE_DSA_TIEBREAK_TRACE diagnostic (nullptr disables): caller-owned
+    // [batch_size*2] i32 scratch, zeroed by the caller before each launch.
+    int32_t* tie_trace,
     CUstream stream) {
   if (scores == nullptr || seq_lens == nullptr || page_table == nullptr ||
       page_indices == nullptr || stream == nullptr || batch_size <= 0 || topk <= 0 ||
@@ -859,6 +887,7 @@ extern "C" CUresult dsv4_deepseek_v4_topk_transform_cuda(
       .page_bits = page_bits,
       .topk = static_cast<uint32_t>(topk),
       .output_stride = output_stride,
+      .tie_trace = tie_trace,
   };
   cudaError_t attr = cudaFuncSetAttribute(
       deepseek_v4_topk_transform_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kTopKSmem);
