@@ -1,0 +1,21 @@
+scripts/plot_tbench_opd_loss.py
+  s_0619ea11ae75d5::t_8a0140de776e0f 1-53
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "63a7a579c8b04871d8f9fa9a46a7a902160eb136",
+  "prompts": {},
+  "sessions": {
+    "s_0619ea11ae75d5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-af6c005853c874bf3",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
