@@ -3159,3 +3159,158 @@ value derived from, but not stored inside, an `Image` struct) likely exists
 at an EARLIER layer too and hasn't been checked — the layer-0-15 hash
 bisection above is the concrete, cheap (one build + one boot + one 8-rep
 sweep, ~10 minutes total per this round's own timing) next step to find it.
+
+## Layer-0-15 residual bisection — divergence present at LAYER 0 (not progressive); root-caused to a scheduler-level wrong-seed-token bug, NOT a GPU restore-fidelity bug (2026-07-08)
+
+Generalized the prior round's layer-16 `normed`-hash technique to
+`ARLE_DSV4_RESIDUAL_TRACE=1` + `ARLE_DSV4_RESIDUAL_TRACE_LAYERS=<comma list>`
+(env-gated, rank==0, seq_len==1 only — same call site,
+`forward_tokens_stream_impl`'s per-layer loop right after `normed` is
+computed, immediately before `mla_attention_decode_graph`), instrumented at
+layers `{0,1,2,4,8,12,16}` simultaneously in one build
+(`crates/infer-cuda/src/dsv4.rs`, `dsv4_residual_trace` + one call site;
+reverted after use, `git diff` clean on both trees).
+
+**Run.** `scripts/pod.sh build nccl --release --features cuda,nccl --bin
+arle` (BUILD_EXIT=0 both passes — TP=4 requires the `nccl` feature; the
+default `pod.sh build` omits it and the server dies at boot with
+`Multi-rank TP serve (world_size=4) requires the nccl feature`, caught and
+fixed same round). Booted TP=4 (GPUs 2/3/4/5, all 8 free), `trace_probe.py`
+solo (n=1), 8 sequential reps of the byte-identical TRACKED prompt (len=500,
+prompt_tokens=456). Reproduced the established signature exactly twice
+(2 independent boots): call 1 correct (`'The secret access code is
+738291.'` / terse `'738291'` depending on boot), calls 2-8 (7/7)
+byte-identical `'...738292.'`.
+
+**Result — every traced layer, including layer 0, already diverges; NOT a
+progressive/onset-at-some-layer pattern.**
+
+| layer | rep1 (fresh) vs reps2-8 (restored) hash | reps 2-8 mutual agreement |
+|---|---|---|
+| 0 | **diverges** | 7/7 identical |
+| 1 | **diverges** | 7/7 identical |
+| 2 | **diverges** | 7/7 identical |
+| 4 | **diverges** | 7/7 identical |
+| 8 | **diverges** | 7/7 identical |
+| 12 | **diverges** | 7/7 identical |
+| 16 | **diverges** | 7/7 identical |
+
+Every one of the 7 checkpoints shows the identical qualitative pattern the
+prior round found at layer 16 alone: rep 1 is unique, reps 2-8 agree with
+each other bit-for-bit, and reps 2-8 differ from rep 1 — at **layer 0**, the
+very first checkpoint in the stack. This falsifies the prior round's own
+working hypothesis ("something about the first compute step consuming a
+restored layer's state... likely exists at an EARLIER layer too") in its
+specific form: there is no earlier LAYER to find, because the divergence
+predates the layer stack entirely. Layer 0's `normed` is a pure function of
+`RMSNorm(HC-expand(embed(tokens[0])))` — none of layer 0's own persistent
+attention state (`sw_window_cache`, since `compress_ratios[0]=0` ⇒
+`SlidingWindow` mode, not `CompressedSparse`) is even read before `normed`
+is computed, so a layer-0 divergence in `normed` cannot be a layer-0
+restore-fidelity bug either — it has to be upstream of the whole per-layer
+loop.
+
+**Extended the trace one field (`input_token=tokens[0]`) to test the
+sharpest upstream hypothesis directly, not by inference.** Re-synced,
+rebuilt (`BUILD_EXIT=0`), reran the identical 8-rep sweep. Decisive:
+
+| pos | rep1 input_token | reps2-8 input_token (7/7 agree) |
+|---|---|---|
+| 456 | 671 (`"The"`) | 128822 (`"</think>"`) |
+| 457 | 8613 (`" secret"`) | 671 (`"The"`) |
+| 458 | 3278 (`" access"`) | 8613 (`" secret"`) |
+| 459 | 4181 (`" code"`) | 3278 (`" access"`) |
+| 460 | 344 (`" is"`) | 4181 (`" code"`) |
+| 461 | 223 (`" "`) | 344 (`" is"`) |
+| 462 | 30143 (`"738"`) | 223 (`" "`) |
+| 463 | 17979 (`"291"`) | 30143 (`"738"`) |
+| 464 | — | 18307 (`"292"`) — first genuine divergence |
+
+**The corrupted trajectory is rep 1's own correct trajectory, shifted by
+exactly one KV position, for 7 of 8 steps** — `reps2-8[pos] ==
+rep1[pos-1]` holds exactly through position 463, then breaks at position
+464 (where a real numeric substitution, `291→292`, finally appears — the
+same near-tied-digit flip this doc's needle-content A/B round already
+characterized). Token 128822 (`</think>`) is the literal LAST token of the
+fixed prompt itself (`wrap()` appends `<｜Assistant｜></think>` to force
+non-reasoning mode) — i.e. **the restored decode step re-feeds the prompt's
+own final token as if it were a freshly generated one**, duplicating it
+into KV at position 456 and shifting every subsequent RoPE position +
+generated token by one slot relative to a fresh run, for the rest of that
+generation.
+
+**Root-caused to file:line, not just localized.** Read the admission path
+that sets up decode after a full prefix-cache hit:
+- `crates/infer-core/src/prefix.rs:189-198` (`attach_cached_prefix`, DSv4's
+  position-0 whole-slot restore route) and the structurally identical
+  `crates/infer-core/src/prefix.rs:121-131` (`attach_prefix_to_request`,
+  the general page-radix route): on `matched_len == request.prompt_len()`
+  (a full match — exactly this repro's condition, since the byte-identical
+  TRACKED prompt hits RadixCache in full on every call after the first),
+  both set `request.phase = RequestPhase::Decoding` **directly**, with zero
+  forward pass having run and `generated_tokens` still empty. Contrast the
+  FRESH-prefill path (`crates/infer-core/src/lib.rs:920-942`,
+  `apply_output`'s prefill loop): the *final* prefill chunk's forward call
+  samples the model's genuine first token and `request.generated_tokens.push(token.token)`
+  happens in the SAME tick the phase flips to `Decoding` — a full-match
+  restore skips this forward pass entirely, so `generated_tokens` is never
+  populated for it.
+- `crates/infer-core/src/planner.rs:24-31` (`build_forward_plan`'s decode-row
+  builder) then runs on the very next tick:
+  ```rust
+  let Some(last_token) = request.generated_tokens.last().copied()
+      .or_else(|| request.prompt_tokens.last().copied())
+  else { continue };
+  ```
+  With `generated_tokens` empty, this silently falls through to
+  `request.prompt_tokens.last()` — the prompt's own final token — and feeds
+  it as the decode row's `last_token`, duplicating it into the sequence.
+  On the fresh-prefill path this `.or_else` branch is structurally
+  unreachable (`generated_tokens` already has an entry by the time
+  `Decoding` phase is visible to the planner); the full-prefix-match restore
+  path is the one caller that walks straight into it as normal steady-state
+  behavior, not an edge case.
+
+**Verdict: this is a deterministic, host-side scheduler bug — a wrong seed
+token fed to the first post-restore decode step — not a GPU numerics, race,
+precision, or capture/restore byte-fidelity bug.** It fully explains every
+observation this repeat-prompt harness produced across this and the prior
+several rounds: 100% reproducibility (same wrong token, every time, on any
+full-match restore), why the first 3-4 generated tokens/digits are usually
+right (the shift is a 1-token perturbation the model's own decode easily
+absorbs for several steps) and later ones flip (a near-tied token
+eventually lands on the wrong side once the shifted context accumulates
+enough difference — consistent with the doc's own numeric-vs-text needle
+A/B), and why solo (n=1), no-concurrency-at-all repeats reproduce it
+identically (`ARLE_DISABLE_PREFIX_CACHE=1` already fully eliminates this
+class per the "Comprehensive substage-diff round" above — this directly
+answers that round's own open question about *why*). This mechanism is not
+DSv4-specific in the code that causes it (`planner.rs`'s fallback and the
+general `attach_prefix_to_request` full-match branch are backend-neutral);
+it simply requires an exact full-prompt-length RadixCache hit to trigger,
+which this investigation's repeat-prompt harnesses manufacture directly and
+the cross-architecture Qwen3/Qwen3.6 controls never did (their harnesses
+uniquely salt every prompt, so they never produce a `matched_len ==
+prompt_len` hit on any backend).
+
+**Scope — this explains the RadixCache-repeat corruption class, not (yet)
+the doc's original concurrent (n≥3, unique-content) corruption.** The two
+were already shown independent by the "Comprehensive substage-diff round"
+above; this round's harness (`trace_probe.py` solo mode, byte-identical
+repeated TRACKED prompt) exercises exactly the repeat/restore path, not the
+original fresh-content concurrency bug, which remains open. No fix applied
+this round (root-cause localization was the ask); the two candidate fixes
+are (a) `attach_cached_prefix`/`attach_prefix_to_request`'s full-match
+branch should schedule one more forward step to sample a genuine first
+token before entering `Decoding` (mirroring the fresh-prefill path's own
+last-chunk behavior), or (b) `planner.rs`'s `.or_else` fallback should be
+removed/made a hard error, since a `Decoding`-phase request with empty
+`generated_tokens` is itself the bug signal, not a valid state to paper
+over.
+
+**Cleanup.** `dsv4_residual_trace` (`crates/infer-cuda/src/dsv4.rs`) and its
+one call site reverted after use — `git diff` clean on both local and pod
+trees (`git checkout --` on both, matching the layer-16 round's own note).
+Pod-side scratch (`boot_residual_trace.sh`, `serve_run{1,2,3}.log`,
+`residualtrace-run{1,2,3}.log`) left in place, untracked, per this doc's
+convention.
