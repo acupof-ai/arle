@@ -14,6 +14,7 @@ ROUNDS=${ROUNDS:-3}
 N_ATTEMPTS=${N_ATTEMPTS:-3}
 EPOCHS=${EPOCHS:-2}
 GPU=${GPU:-1}
+PORT=${PORT:-18200}
 DS=terminal-bench-core==0.1.1
 # Optional: run on a generated difficulty-calibrated pool (workstream 4) instead
 # of the curated TB tasks. When set, uses `--dataset-path` over all its tasks.
@@ -31,22 +32,22 @@ LORA=""
 export PATH="$HOME/.local/bin:$PATH"
 export DOCKER_HOST=unix:///run/podman/podman.sock
 
-kill_serve(){ pkill -f "arle serve" 2>/dev/null; sleep 5; }
-wait_serve(){ for i in $(seq 1 60); do curl -s --max-time 3 http://127.0.0.1:18200/v1/models >/dev/null 2>&1 && return 0; sleep 10; done; return 1; }
+kill_serve(){ pkill -f "arle serve.*--port $PORT" 2>/dev/null; sleep 5; }  # port-scoped (parallel-safe)
+wait_serve(){ for i in $(seq 1 60); do curl -s --max-time 3 http://127.0.0.1:$PORT/v1/models >/dev/null 2>&1 && return 0; sleep 10; done; return 1; }
 
 for r in $(seq 0 $((ROUNDS-1))); do
   echo "===== ROUND $r $(date -u) (lora=${LORA:-base}) ====="
   # 1. serve
   kill_serve
   LORA_FLAGS=""; [ -n "$LORA" ] && LORA_FLAGS="--lora-adapters $LORA --lora-alpha 32"
-  CUDA_VISIBLE_DEVICES=$GPU nohup $ARLE serve --model-path $MODEL --bind 0.0.0.0 --port 18200 \
+  CUDA_VISIBLE_DEVICES=$GPU nohup $ARLE serve --model-path $MODEL --bind 0.0.0.0 --port $PORT \
     --max-running-requests 4 $LORA_FLAGS > $WORK/serve_r$r.log 2>&1 &
   wait_serve || { echo "serve failed round $r"; break; }
 
   # 2. eval pass@N
   RUNDIR=$WORK/round$r
   if [ -n "$DATASET_PATH" ]; then DS_FLAGS="--dataset-path $DATASET_PATH"; TFLAGS=""; else DS_FLAGS="-d $DS"; TFLAGS="$TASK_FLAGS"; fi
-  OPENAI_API_BASE=http://127.0.0.1:18200/v1 OPENAI_API_KEY=dummy NO_PROXY=127.0.0.1,localhost,::1 \
+  OPENAI_API_BASE=http://127.0.0.1:$PORT/v1 OPENAI_API_KEY=dummy NO_PROXY=127.0.0.1,localhost,::1 \
     tb run $DS_FLAGS -a terminus -m openai/Qwen3.6-27B-FP8 $TFLAGS \
     --n-attempts $N_ATTEMPTS --n-concurrent 3 --global-agent-timeout-sec 900 --global-test-timeout-sec 300 \
     --output-path $RUNDIR > $WORK/eval_r$r.log 2>&1
