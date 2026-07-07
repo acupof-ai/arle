@@ -2819,3 +2819,189 @@ All instrumentation reverted after use (`diff_summary` methods on the four
 `*Image` types + the `ARLE_DSV4_ROUNDTRIP_TRACE` hook in
 `capture_cached_prefix`) — `git diff` clean on both local and pod trees
 (confirmed `git diff --stat` empty on both, both at `20871e531`).
+
+## Post-idempotency follow-up — both pre-registered targets checked out clean, source-proven (2026-07-08)
+
+Per the prior round's own fallback list (`what remains`): checked (1) derived
+state set outside the `*Image` structs after restore, and (2)
+`mirror_restore_pages`/`mirror_band`'s page-table remap, against the fresh-
+admission path they were never diffed against before. Source-only — no pod
+GPU time spent; both call graphs traced to a level where no branching or
+computed-value ambiguity remains (not "reads clean," fully enumerated).
+
+### Target 1: `flashmla_set_band_cursor(slot_idx, image.seq_len)` — the ONLY outside-Image derived write, and it is PROVEN a no-op
+
+Grepped every `image.` use in `dsv4.rs`/`dsa.rs`'s whole `swap_in_image` call
+chain (`grep -n "image\."`, both files, full output inspected) — exactly one
+site touches state outside the four `*Image` structs' own `restore_to`
+methods: `Dsv4SlotState::swap_in_image` (`dsv4.rs:1219-1228`), inside the
+per-layer loop, right after `state.swap_in_image(ctx, pool, layer_image)`:
+
+```rust
+if let Some(slot_idx) = flashmla_slot_idx {
+    pool.flashmla_set_band_cursor(slot_idx, image.seq_len)?;
+}
+```
+
+**Traced the value flow, not just the call site.** Both real callers of this
+`swap_in_image` (`executor.rs`'s `promote_slot:2482-2486` and
+`restore_cached_prefix:2656-2671`) compute `image_len = image.seq_len()` and
+call `self.mirror_restore_pages(slot, slot_pages, image_len)` **immediately
+before** `swap_in_image`. `mirror_restore_pages` → `Dsv4KvAdapter::mirror_slot_pages`
+(`kv_layout.rs:843-865`) → per layer, `pool.mirror_band(slot, layer_pages,
+seq_len)` (`paged_kv.rs:847-878`), whose last line is `self.seq_lens[slot] =
+seq_len`. So by the time `swap_in_image`'s own `flashmla_set_band_cursor`
+runs, `pool.seq_lens[slot]` is **already** `image_len` — and
+`flashmla_set_band_cursor(slot_idx, image.seq_len)` sets it to
+`image.seq_len`, the same `Dsv4SlotSnapshot`'s same field, i.e. the identical
+number (`image_len == image.seq_len()` by construction, no second source).
+`TokenKVPool::set_band_cursor` (`paged_kv.rs:745-759`) is a bare `self.seq_lens[slot]
+= new_len` assignment — no branch, no history-dependence, no way for two
+calls with the same argument to produce different pool state. **This is a
+provable, not inferred, no-op**: `x = f(v); …; y = f(v)` where `f` is pure and
+`v` is unchanged in between (the layer loop between the two calls only writes
+`*Image` fields already covered by the idempotency round). Not the mechanism.
+
+**(a) fresh admission vs (b) restore — same function, not a divergent
+formula.** Checked whether fresh admission (`submit_prefill_row`,
+`executor.rs:3082-3104`, `row.start_pos == 0`) sets this same conceptual value
+(`pool.seq_lens[slot]`) through a *different* code path. It does not: every
+prefill/decode row, fresh or not, flows through `Dsv4KvAdapter::prepare_kv_batch`
+(`kv_layout.rs:919-955`), which for FlashMLA layers calls the **identical**
+`pool.mirror_band(row.slot, layer_pages, row.append_pos)` (line 926 prefill,
+line 941 decode) that the restore path also calls. There is exactly one
+function that ever writes `TokenKVPool::seq_lens[slot]` for a FlashMLA band
+(`mirror_band`/`set_band_cursor`, both funnelling into the same field) — no
+fresh-vs-restore asymmetry exists to diff. `flashmla_set_band_cursor`'s own
+doc comment ("`restore_to` draws the band with cursor 0, then the slot-level
+swap-in sets it to the restored length") is **stale/inaccurate** — by the time
+it runs, the cursor was never 0; `mirror_restore_pages` already set it to the
+correct value one call earlier. Left uncorrected (not code-changed this
+round, doc-comment-only issue, out of scope for a diagnosis pass) but flagged
+for the eventual fix pass.
+
+### Target 2: `mirror_band` — same allocator, same claim/release discipline, fresh admission and restore are the SAME code, not parallel implementations
+
+Read `mirror_band` (`paged_kv.rs:847-878`) and its host-side counterpart
+`HostPagedKvPool::alloc_fixed_band` (`infer-seam/src/host_paged_kv_pool.rs:88-106`)
+end to end, then traced both call sites that feed them.
+
+- **Restore's page allocation is not a separate mechanism.**
+  `attach_cached_prefix` (`infer-core/src/prefix.rs:148-218`) calls
+  `alloc_with_prefix_reclaim(slot, matched_len)` → `self.kv.alloc(slot, tokens)`
+  → `KvAllocator::alloc` (`host_paged_kv_pool.rs:173-193`) → for a
+  `fixed_pages_per_slot`-configured pool (DSv4 FlashMLA, set once via
+  `set_fixed_pages_per_slot`), dispatches straight to `alloc_fixed_band`. This
+  is the **exact same function and the exact same trait method** the fresh
+  prefill path uses (the scheduler's own row construction for
+  `submit_prefill_row`'s `row.start_pos == 0` case draws pages via the same
+  `KvAllocator::alloc`). There is no restore-specific allocator to diverge
+  from a fresh one.
+- **"Assumes drawn fresh" checked directly — only draws when the slot is
+  actually empty, and it is.** `alloc_fixed_band` only pops new physical pages
+  from `self.free` when `self.slot_pages[slot].is_empty()`
+  (`host_paged_kv_pool.rs:92`); otherwise it's a cursor-only append
+  (`slot_len[slot] = slot_len[slot].saturating_add(tokens)`, line 104). For
+  the repeat-restore repro (`trace_probe.py`, same slot 0 every call), the
+  PREVIOUS occupant's completion path calls `free_slot` (`host_paged_kv_pool.rs:217-228`),
+  which resets `slot_pages[slot]` to empty AND `slot_len[slot]` to `0` — so
+  the next `alloc_fixed_band` call's `saturating_add` starts from a genuine
+  zero, not stale residue from the prior occupant. No off-by-one or
+  "assumes-fresh" bug found for this sequential-reuse shape (the only shape
+  this investigation's harnesses exercise — a slot with an interleaved,
+  never-freed prior occupant was not tested, flagged below).
+- **Device-side `mirror_band`'s release/claim is phase-separated, safe even
+  when old pages == new pages.** All of `old_pages` are released first
+  (`page_attach_count -= 1`, `recycle_page_if_unreferenced` pushes onto
+  `free_pages` at count 0) in one loop, THEN all of the new `pages` are
+  claimed (`claim_mirrored_page`) in a second loop — never interleaved
+  per-page. `claim_mirrored_page` (`paged_kv.rs:402-411`) explicitly checks
+  `free_pages` and `swap_remove`s a page found there before incrementing its
+  attach count, so a page released-then-immediately-reclaimed within the same
+  `mirror_band` call (the case where the host handed back literally the same
+  physical ids on a repeat restore) round-trips to `attach_count == 1`, not
+  left in `free_pages` — no double-allocation leak. Traced this specifically
+  because a LIFO free-list (`HostPagedKvPool.free`/`TokenKVPool.free_pages`
+  are both `Vec`-as-stack) plausibly hands back the same physical pages on an
+  isolated single-slot free-then-realloc with no interleaving traffic, making
+  this exact interaction (not just a theoretical one) reachable in the real
+  repro.
+- **Content copy is index-based, not physical-address-based, so page
+  reassignment (same or different ids) can't corrupt content by
+  construction.** `Dsv4FlashMlaImage::restore_to` (`dsa.rs:929-953`) reads
+  `table = pool.flashmla_page_table(flash.slot_idx)` **after**
+  `mirror_restore_pages` has already run, and writes `payload[i] → table[i]`
+  positionally — it never depends on `table[i]`'s *value* matching what it
+  was at capture time, only on `table`'s *length* and *order* (band-slot
+  order, which `mirror_band` preserves by taking `slot_pages` in the order
+  the host handed them). The DSA official key cache
+  (`Dsv4DsaOfficialImage`, `dsa.rs:971-1029`) is not even page-table-indirected
+  — it writes into a byte range computed directly from `slot_idx`
+  (`pool.dsa_slot_range(official.slot_idx)`), a fixed per-slot offset into a
+  shared buffer, immune to physical-page-id churn entirely.
+
+**Verdict: both targets check out clean — source-proven, not inferred from
+reading alone.** Every value-flow was traced through to either a literal
+duplicate-write (Target 1) or a shared, single, non-branching code path used
+identically by fresh admission and restore (Target 2). No pod GPU time was
+spent verifying this: both proofs rest on tracing a fixed, small set of
+non-branching function calls to their unique definitions, the same standard
+of certainty this doc's `MHC TF32-prenorm` and `stream-discipline` rounds used
+to justify a source-only RULED OUT verdict without a GPU run.
+
+**Net position — this is a genuinely hard residual.** Combined with the prior
+rounds: the `*Image` struct fields are complete (enumeration audit) and their
+capture/restore round-trip is byte-exact to 5 cycles (idempotency round);
+every stream/race/fence hypothesis is closed (stream-discipline audit,
+`CUDA_LAUNCH_BLOCKING=1`, `compute-sanitizer`); every arithmetic-precision
+path reachable from source is proven batch-invariant (RMSNorm, both FP8 GEMM
+paths); and now the two most plausible remaining "state outside the byte
+image" classes (a derived cursor, and the page-table remap) are also clean.
+There is no further named candidate in this doc's own shortlist for the
+deterministic repeat-restore signature specifically.
+
+**What's actually left, concretely (not another blind round):**
+1. **Untested shape**: every allocator trace above assumed the
+   sequential-single-slot-reuse case (prior occupant fully `free_slot`'d
+   before the next admission). This investigation has never run the repeat
+   probe with slot 0 pinned busy by a filler request so the repeat lands on a
+   **different, previously-unused** slot index — the enumeration audit's own
+   still-open "same-slot-vs-different-slot A/B" from two rounds ago. If the
+   corruption persists on a fresh slot, "restore" generalizes past self-restore;
+   if it disappears, the mechanism is specific to slot 0's own history in a way
+   neither target here would catch (e.g. a slot-0-specific residue this
+   investigation hasn't enumerated). This is the single cheapest pod
+   experiment still on the table and was not run this round (scope: diagnose
+   the two named targets, not open a new one).
+2. **The layer-16-specific-mechanism angle** (per this round's brief): the
+   prior "Logit-lens layer diff" and Part A rounds established the divergence
+   onset at layer 16/19-21 in every traced case, always the SAME wrong token
+   (`18307` vs `17979`, "292" vs "291"). Whether anything about layer 16
+   itself is structurally special (a `SlidingWindow`↔CSA mode boundary, a
+   compress-ratio change, an indexer-shape transition) was not checked this
+   round — this doc's `deepseek-spec` fixtures show `compress_ratios` patterns
+   like `[0,4,0,128,0,16,...]` (mode alternates layer-to-layer) for *test*
+   configs; the live pod checkpoint's actual per-layer `compress_ratios` array
+   (needed to know what layer 16 specifically is on THIS model) was not read
+   this round — pull it from `/host/DeepSeek-V4-Flash-FP8/config.json` before
+   the next pass, it's a one-`grep` fact, not a hypothesis.
+3. Per Part B's own "near-tie, multiple independent triggers" framing: the
+   restore-repeat mechanism may not be a *distinct* bug at all but simply
+   another way to perturb the SAME near-tied `17979`/`18307` decision that
+   `proj_batched`'s FP8 gate, its sibling gate, and the FP8 grouped-MoE
+   kernels already perturb at n≥2 — i.e., a residual, structural, sub-ULP-level
+   FP8/bf16 rounding difference between "restored-from-bytes" and
+   "computed-live" activations feeding layer 16, too small for any per-field
+   byte-diff to catch (the idempotency test only proves the STORED bytes are
+   exact; it says nothing about whether the FIRST kernel to CONSUME those
+   bytes on a cold-restored slot takes a bit-identical arithmetic path to the
+   same kernel consuming a live, continuously-computed slot's tensors — e.g. an
+   uninitialized-padding-byte difference in a restored buffer feeding a
+   quantization kernel that reads a few bytes past the logical length). Not
+   verified either way this round; would need per-tensor bit-level (not just
+   byte-count) comparison of the ACTUAL INPUT to layer 16's first kernel
+   between a live and a restored slot at the same logical position — a
+   genuinely new instrumentation target, not a re-run of either target above.
+
+No code changed this round (source-read-only, local tree only — no pod tree
+touched, no GPU time spent). `git diff` clean.
