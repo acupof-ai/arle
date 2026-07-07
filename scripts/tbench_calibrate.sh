@@ -1,11 +1,7 @@
 #!/bin/bash
-# Difficulty-calibrate a generated task pool to the model's sweet-spot band
-# (pod-side). Gen a hard pool -> serve on a FORMAT-FIXED model (a format LoRA,
-# else base's terminus-JSON deficit reads every task as fail) -> pass@3 label ->
-# keep 0<pass<attempts. That in-band pool ($WORK/calib) feeds tbench_opd_loop.sh.
-#
-# Measured, not assumed: the self-check gate proves a task is solvable, NOT that
-# it is hard *for the model* — only this eval pass supplies that axis.
+# Gen a hard pool -> pass@3 label on a format-fixed model (base's JSON deficit
+# else reads every task as fail) -> keep 0<pass<attempts -> $WORK/calib feeds
+# tbench_opd_loop.sh. The eval is the only signal for "hard *for the model*".
 set +e
 
 ROOT=/host/arle-build; ARLE=$ROOT/target/release/arle; MODEL=/host/Qwen3.6-27B-FP8
