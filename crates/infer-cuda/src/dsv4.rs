@@ -1267,6 +1267,47 @@ impl std::fmt::Debug for Dsv4Model {
     }
 }
 
+/// Temporary diagnostic-only trace for the 2026-07 concurrent-decode digit-
+/// corruption investigation (`docs/experience/errors/2026-07-06-dsv4-concurrent-decode-digit-corruption-unresolved.md`).
+/// Env-gated (`ARLE_DSV4_DECODE_TRACE=1`), zero cost otherwise (one env::var
+/// read per batched decode call). Rank-gated to `rank==0` only: all TP ranks
+/// redundantly execute this per-row loop with identical results, and letting
+/// >1 rank's process write to the shared serve-log fd caused byte-level
+/// interleaving between processes even with a single `write_all` call.
+/// Prints one line per call: the batch's slot/start_position/token triples,
+/// so a post-hoc script can (a) pick out a tracked slot's per-step token-id
+/// sequence via its `start_position` == its own prompt-token count, and (b)
+/// see the exact batch composition (which other slots were co-resident) at
+/// each step, without touching the hot sampling path's signature.
+pub(crate) fn dsv4_decode_trace(
+    rank: usize,
+    slot_ids: &[usize],
+    start_positions: &[usize],
+    out_tokens: &[u32],
+) {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    if rank != 0 || std::env::var_os("ARLE_DSV4_DECODE_TRACE").is_none() {
+        return;
+    }
+    static CALL_ID: AtomicU64 = AtomicU64::new(0);
+    let call = CALL_ID.fetch_add(1, Ordering::Relaxed);
+    let rows: Vec<String> = slot_ids
+        .iter()
+        .zip(start_positions)
+        .zip(out_tokens)
+        .map(|((slot, start_pos), tok)| format!("{slot}:{start_pos}:{tok}"))
+        .collect();
+    // Single pre-formatted `write_all` call (one write() syscall) so the line
+    // can't tear even if another writer shares the fd.
+    let line = format!(
+        "DSV4_TRACE call={call} n={} rows=[{}]\n",
+        slot_ids.len(),
+        rows.join(",")
+    );
+    let _ = std::io::stderr().write_all(line.as_bytes());
+}
+
 impl Dsv4Model {
     /// Per-forward owned-token cap when the deepep_ll MoE transport is booted
     /// (`None` for allreduce / intranode / non-deepep builds → unbounded). Core
@@ -2413,6 +2454,12 @@ impl Dsv4Model {
             .collect::<Result<Vec<_>>>()?;
         // Post-sampling sync point: all rows' emitted tokens are known.
         crate::probe::lens_flush(&self.ctx, positions, &out_tokens);
+        dsv4_decode_trace(
+            self.tp.config().rank,
+            slot_ids,
+            start_positions,
+            &out_tokens,
+        );
         std::hint::black_box(keepalive.len());
         drop(keepalive);
         Ok(out_tokens)
