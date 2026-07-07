@@ -1,0 +1,37 @@
+crates/infer-cuda/src/attention.rs
+  s_b3b5c340d89689::t_ad6580e61eedf0 325,1840,1921,1968,2018,2745,2771
+crates/infer-cuda/src/attention/dsa.rs
+  s_b3b5c340d89689::t_399c8394fa226d 1381-1385
+crates/infer-cuda/src/attention/flashmla.rs
+  s_9f603b436dac51::t_54956b9d95ccfe 126-129,208,211,252-277
+crates/infer-cuda/src/dsv4.rs
+  s_9f603b436dac51::t_8829c02b9fd51c 3101-3104,3352-3357,3420-3423
+docs/experience/wins/2026-07-07-prefix-cache-graph-page-table-fix.md
+  s_9f603b436dac51::t_60e41a14ba6b85 1-65
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "36835179f4e25e02a08ed2b060855bebb96245e3",
+  "prompts": {},
+  "sessions": {
+    "s_9f603b436dac51": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-adb57944a1b6758da",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_b3b5c340d89689": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9c2c33cd-ad2a-4398-944f-e13bf0f4385a",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
