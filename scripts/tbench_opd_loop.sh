@@ -15,6 +15,9 @@ N_ATTEMPTS=${N_ATTEMPTS:-3}
 EPOCHS=${EPOCHS:-2}
 GPU=${GPU:-1}
 DS=terminal-bench-core==0.1.1
+# Optional: run on a generated difficulty-calibrated pool (workstream 4) instead
+# of the curated TB tasks. When set, uses `--dataset-path` over all its tasks.
+DATASET_PATH=${DATASET_PATH:-}
 # Wider difficulty spread (Tmax: a calibrated range keeps a sweet-spot band with
 # gradient) — light/medium tasks only; heavy builds (qemu/kernel/torch/HF-dataset)
 # excluded. The soft-filter above then distils only the sweet-spot subset.
@@ -42,8 +45,9 @@ for r in $(seq 0 $((ROUNDS-1))); do
 
   # 2. eval pass@N
   RUNDIR=$WORK/round$r
+  if [ -n "$DATASET_PATH" ]; then DS_FLAGS="--dataset-path $DATASET_PATH"; TFLAGS=""; else DS_FLAGS="-d $DS"; TFLAGS="$TASK_FLAGS"; fi
   OPENAI_API_BASE=http://127.0.0.1:18200/v1 OPENAI_API_KEY=dummy NO_PROXY=127.0.0.1,localhost,::1 \
-    tb run -d $DS -a terminus -m openai/Qwen3.6-27B-FP8 $TASK_FLAGS \
+    tb run $DS_FLAGS -a terminus -m openai/Qwen3.6-27B-FP8 $TFLAGS \
     --n-attempts $N_ATTEMPTS --n-concurrent 3 --global-agent-timeout-sec 900 --global-test-timeout-sec 300 \
     --output-path $RUNDIR > $WORK/eval_r$r.log 2>&1
   RUN=$(ls -td $RUNDIR/*/ 2>/dev/null | head -1)
