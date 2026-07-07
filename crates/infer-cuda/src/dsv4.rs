@@ -1776,6 +1776,21 @@ impl Dsv4Model {
                 )
             })
             .unwrap_or(0);
+        // Compact-FP8 MoE tail scratch (launch-bound Step 1) is allocated on the
+        // adapter whenever the model has a MoE layer; count it as a fixed term so
+        // the KV pool sizing doesn't over-commit → OOM.
+        let moe_tail_scratch_bytes = self
+            .layers
+            .iter()
+            .find_map(|layer| layer.moe.as_ref())
+            .map(|layer| {
+                crate::moe::Dsv4MoeTailScratch::device_bytes(
+                    layer.hidden_dim,
+                    layer.intermediate,
+                    self.split.experts_per_rank,
+                )
+            })
+            .unwrap_or(0);
         let mla_decode_bytes: usize = self
             .layers
             .iter()
@@ -1838,6 +1853,7 @@ impl Dsv4Model {
                     let fixed_without_pool = dsa_shared_bytes
                         .saturating_add(moe_decode_shared_bytes)
                         .saturating_add(shared_expert_scratch_bytes)
+                        .saturating_add(moe_tail_scratch_bytes)
                         .saturating_add(mla_decode_bytes);
                     let budget_before_pool = infer_seam::SlotBudget::from_free(
                         free,
@@ -3999,6 +4015,7 @@ impl Dsv4Model {
                     #[cfg(not(feature = "deepep"))]
                     bail!("ARLE_DSV4_MOE_TRANSPORT=deepep requires infer-cuda feature deepep");
                 } else {
+                    let tail = kv_adapter.moe_tail_scratch_mut();
                     crate::moe::dsv4_moe_forward(
                         self,
                         layer.moe.as_ref().expect("DSv4 layer.moe"),
@@ -4006,6 +4023,7 @@ impl Dsv4Model {
                         &normed,
                         &mut moe_out,
                         &mut keepalive,
+                        tail,
                     )?;
                     keepalive.keep_hidden(&moe_out);
                     // Routed experts are EP-sharded → sum, then add the replicated
@@ -4467,6 +4485,7 @@ impl Dsv4Model {
                         &normed,
                         &mut moe_out,
                         &mut keepalive,
+                        None,
                     )?;
                     keepalive.keep_hidden(&moe_out);
                     {
@@ -4886,6 +4905,7 @@ impl Dsv4Model {
                         normed,
                         &mut current.moe_out,
                         &mut keepalive,
+                        None,
                     )?;
 
                     let _nvtx = crate::nvtx::range("dsv4/moe_allreduce");
@@ -5392,6 +5412,7 @@ impl Dsv4Model {
                         &normed,
                         &mut moe_out,
                         &mut keepalive,
+                        None,
                     )?;
                 }
                 keepalive.keep_hidden(&moe_out);
@@ -5791,6 +5812,7 @@ impl Dsv4Model {
             &ffn_normed,
             &mut moe_out,
             &mut keepalive,
+            None,
         )?;
         self.tp.all_reduce_sum(ctx, &mut moe_out)?;
         let mut shared = unsafe { HiddenStates::uninit(ctx, hidden_size, m)? };
