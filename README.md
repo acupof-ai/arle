@@ -103,21 +103,12 @@ Measured on the runtime, not projected — fresh `arle serve` benches, one binar
 </p>
 <p align="center"><sub>DSv4 B=1 decode, <b>33.5 → 53.3 tok/s</b> across the 2026-06-13 → 06-14 campaign — every step traced to a <code>docs/experience/wins/</code> entry.</sub></p>
 
-**On-Policy Distillation lifts the student for real.** A Qwen3.5-4B LoRA student distilled on its *own* rollouts against the Qwen3.6-35B-A3B teacher (same serving runtime) lifts MATH-500 **0.518 → 0.792** (**+27pp, CI-separated**), reaching the teacher's neighborhood (**0.82**):
+**On-Policy Distillation lifts the student on its own rollouts** — the teacher *is* the production server. Qwen3.5-4B: MATH-500 **+27pp** (0.518 → 0.792, CI-separated) · BFCL-live abstention **0.60 → 1.00**. 27B on **Terminal-Bench**: pass@1 **+5.1pp** (20.5 → 25.6%), the gradient being output-format conformance.
 
 <p align="center">
-  <img src="docs/assets/opd-multiseed-curve.png" alt="OPD multi-seed lock: Qwen3.5-4B student lifts from 0.518 to 0.792 MATH-500 accuracy (reverse-KL best across 5 seeds), approaching the 35B teacher's 0.82" width="680">
+  <img src="docs/assets/tbench-opd-loss-curve.png" alt="Terminal-Bench OPD distill loss: per-step masked-CE + EMA trend, 3-epoch means 0.2165 → 0.1796 → 0.1453" width="720">
 </p>
-<p align="center"><sub>MATH-500 greedy exact-match, <b>n=500/seed</b> @4096 tokens, 0 request-error · 3 recipe arms × 5 seeds, base→step25→step50 trajectory · error bars = ±1σ across seeds · base <b>0.518</b> (n=500) → reverse-KL <b>0.792</b>, fully CI-separated · 2026-06-20. <a href="docs/experience/wins/2026-06-20-opd-multiseed-math500-lock.md">method</a>.</sub></p>
-
-The same loop lifts *agentic* capability: with think-on OPD the 4B student learns to **decline irrelevant tool calls — BFCL-live abstention 0.60 → 1.00**. [<a href="docs/experience/wins/2026-06-20-agentic-opd-thinkon-abstention-win.md">method</a>]
-
-**And it lifts *agentic* capability on a standardized benchmark.** `arle train agent-opd` distils a 27B FP8 student on its execution-passing **Terminal-Bench** rollouts (train-infer-unified, ~11.75 s/round on one H20) — **pass@1 20.5% → 25.6% (+5.1pp)**:
-
-<p align="center">
-  <img src="docs/assets/tbench-opd-lift.png" alt="Terminal-Bench agentic OPD: 27B pass@1 20.5%→25.6% (+5.1pp)" width="760">
-</p>
-<p align="center"><sub>13 tasks × pass@3, terminus + Qwen3.6-27B-FP8 · the distilled gradient is output-format conformance (hello-world 0/3→3/3: unparseable → clean JSON). <a href="docs/experience/wins/2026-07-07-terminal-bench-opd-format-distill-lift.md">method &amp; caveats</a></sub></p>
+<p align="center"><sub>TB-OPD distill loss, 27B student · 41 records × 3 epochs · <b>0.2165 → 0.1796 → 0.1453</b>. <a href="docs/experience/wins/2026-06-20-opd-multiseed-math500-lock.md">MATH</a> · <a href="docs/experience/wins/2026-07-07-terminal-bench-opd-format-distill-lift.md">Terminal-Bench</a></sub></p>
 
 **Stability:** CUDA **Stable** · Metal **Beta** (DFlash + Qwen3.6 NextN-MTP: bit-identical spec decode) · OPD train **Beta** (~2× vs HF TRL `GKDTrainer` — measured 2.04–2.49× on Qwen3-0.6B; LoRA fits 4 GB cards) · CPU dev-only. Models: Qwen3-dense + Qwen3.5/3.6 (hybrid · MoE) on CUDA + Metal · DeepSeek-V4-Flash + GLM-5.2 (CUDA 8×H20 TP=8/EP=8; GLM-5.2 verify pending) · Qwen3.6 + Gemma4 · DeepSeek-OCR VLMs + DiffusionGemma (Metal). Full tiers: [support-matrix](docs/support-matrix.md) · [stability-policy](docs/stability-policy.md).
 
