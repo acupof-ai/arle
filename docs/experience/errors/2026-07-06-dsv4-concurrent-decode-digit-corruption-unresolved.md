@@ -910,3 +910,78 @@ early-layer or late-layer culprit. n=2 corrupted trials; a third/fourth
 would strengthen confidence in "layer ~19-21" as the exact onset boundary
 rather than "somewhere in 19-21" — not run this pass (information budget;
 this round's job was localization-to-a-region, not fix-finding).
+
+## MHC TF32-prenorm eager-fallback test — BLOCKED, premise doesn't hold in ARLE's code (2026-07-07)
+
+Proposed test: force MHC's mixing GEMM off a "TF32-fused DeepGEMM prenorm"
+path onto an eager FP32 reference path, to see if corruption disappears
+(the mid-stack, whole-network-boundary signature from the layer-diff pass
+matches MHC's structural footprint — present at every attn/FFN sub-layer
+boundary across all 43 layers — better than a layer-localized mechanism).
+
+**Traced every MHC call site and its underlying kernel/GEMM to check the
+premise before running anything.** `crates/infer-cuda/src/hc.rs` (all 6
+public functions) + `crates/cuda-kernels/csrc/misc/dsv4_mhc.cu` (every
+`dsv4_mhc_*_kernel`) + the `mix_fn` weight-load path
+(`crates/infer-cuda/src/loader.rs:3542` `load_dsv4_global_matrix`):
+
+- **The MHC sinkhorn/mixing kernels themselves are scalar CUDA-core FP32,
+  full stop — there is no TF32 or tensor-core variant to fall back from.**
+  `dsv4_mhc_params_kernel`/`dsv4_mhc_params_pre_rms_norm_kernel`
+  (`dsv4_mhc.cu:161`, `:331`) both call the *same* shared device function
+  `dsv4_mhc_params_tail` (`:84`) — plain `expf`/`fmaxf` scalar sinkhorn math,
+  bf16 in/out, fp32 internal accumulation. No `wmma`/`mma.` instruction, no
+  `tf32` cast anywhere in the file (`grep -n "tf32\|wmma\|mma\."` — zero hits).
+- **MHC's one GEMM (`mix_fn` projecting the wide stream into pre/post/comb
+  weights) never touches DeepGEMM or tensor cores either.** `hc.rs`'s
+  `gen_mhc_params`/`gen_mhc_params_into` route it through
+  `crate::attention::dsv4_linear` → `mla_linear`
+  (`attention.rs:992`) → `ffi::dsv4_fp8_gemv_batch_cuda`
+  (`crates/cuda-kernels/csrc/gemm/quantized_gemv.cu:399`) — a hand-rolled
+  scalar FP8-block-scaled GEMV kernel, zero `wmma`/`mma.` instructions. This
+  is forced structurally, not by a runtime flag: `load_dsv4_global_matrix`
+  host-quantizes `mix_fn` to `Dsv4Fp8BlockScaled` unconditionally for BF16/F32
+  source tensors (`loader.rs:3554-3567`), so `dsv4_linear`'s match arm always
+  takes the `mla_linear` branch for `hc.mix_fn` — never `DenseBf16`/`gemm_batch`.
+- **Repo-wide grep for the exact terms in the task brief — zero hits.**
+  `hc_prenorm`, `prenorm_gemm`, `HC_PRENORM`, `SGLANG_OPT`, and `tf32`/`TF32`
+  anywhere under `vendor/` or `crates/cuda-kernels/`: no matches. `docs/environment.md`
+  has zero `mhc`/`hyper-connection`/`hc_mult`/`hc_eps`/`hc_sinkhorn` entries.
+  The only fused-vs-unfused distinction that *does* exist in `hc.rs` is
+  kernel-launch-count fusion, explicitly labeled as such in the doc comments
+  (`gen_mhc_params_into` / `hc_pre`, `#[allow(dead_code)]`, "kept as the
+  unfused primitive (A/B reference)") — and both variants call the identical
+  shared scalar device functions as their fused counterparts
+  (`dsv4_mhc_params_tail`, confirmed shared by both `dsv4_mhc_params_kernel`
+  and `dsv4_mhc_params_pre_rms_norm_kernel`). Forcing the "unfused" primitives
+  would produce bit-identical numerics, just more kernel launches — not a
+  test of any precision hypothesis.
+
+**Conclusion: the premise doesn't hold.** ARLE never ported (under any name)
+a TF32/DeepGEMM-tensor-core prenorm path for MHC — the `SGLANG_OPT_DEEPGEMM_HC_PRENORM`
+framing in the task brief describes upstream SGLang's implementation, not
+ARLE's. ARLE's from-scratch `dsv4_mhc.cu` has been scalar-CUDA/"eager" by
+construction since it was written; there is no faster/lower-precision sibling
+path to disable. **This diagnostic is blocked — not "toggle exists but
+untested," but "there is nothing to toggle."**
+
+**Improvising a toggle is not a small, low-risk move here — declined.** The
+only way to give this hypothesis a genuine A/B would be to build a *new*
+TF32/tensor-core GEMM implementation of the `mix_fn` projection and/or the
+sinkhorn kernel from scratch, then compare it against the existing scalar
+path. That is net-new kernel development, not flipping a dormant flag — it
+risks introducing a *different* bug that would confound this investigation
+rather than isolate it, and doesn't fit a same-day diagnostic pass. Declined
+per this round's scope (discriminating test only, no new code this pass).
+
+**MHC not fully cleared as a suspect, just this specific angle.** MHC's own
+kernels ARE genuinely batched in the multi-row decode lane (`gen_mhc_params`/
+`mhc_pre_rms_norm`, used by every batched decode call site in `dsv4.rs`, e.g.
+`:4783-4877`, `:5130-5304`, `:5722-5831` — `dsv4_mhc_params_kernel<<<num_tokens,
+1024,...>>>` launches one block per batch row) — the same *class* of
+per-row-batched kernel where the DSA topk hypothesis's row-vs-slot addressing
+question was worth checking (and was killed there via trace instrumentation,
+not code reading alone). A parallel row-addressing/shared-scratch-sizing
+check on the MHC kernels specifically (not a precision A/B) is the more
+promising next step if MHC stays on the suspect list — not run this pass
+(out of scope; this pass tested one specific, now-refuted premise).
