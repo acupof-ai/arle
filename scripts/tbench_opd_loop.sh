@@ -57,7 +57,7 @@ PYEOF
   # collect passing trajectories -> records, append to cumulative corpus
   NEWREC=0
   if [ -n "$PASSING" ]; then
-    PATS=$(for p in $PASSING; do echo "$p" | grep -oE '^[a-z0-9-]+\.[0-9]+-of-[0-9]+'; done | sort -u)
+    PATS=$(for p in $PASSING; do echo "$p" | grep -oE '^[a-z0-9_-]+\.[0-9]+-of-[0-9]+'; done | sort -u)  # _ : generated family names
     $PY $ROOT/scripts/terminus_to_records.py "$RUN" $MODEL $WORK/records_r$r.jsonl $PATS > $WORK/conv_r$r.log 2>&1
     NEWREC=$(wc -l < $WORK/records_r$r.jsonl 2>/dev/null)
     cat $WORK/records_r$r.jsonl >> $CUM
