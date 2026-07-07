@@ -1850,3 +1850,177 @@ the exact same `load_dsv4_block_scaled` call as the already-checked
 name*, is what tells you a new dead-end will match a prior one before spending
 a pod round confirming it independently; the checkpoint read here was a
 confirmation of an already-strong prior, not a blind probe.
+
+## DSA `radix_topk` round==3 tie-break — RULED OUT, instrumented (2026-07-08)
+
+Per the doc's #2 shortlist item ("INCONCLUSIVE, source-only"): resolved with
+device-side instrumentation rather than further source reading, per the prior
+round's own next step.
+
+**Structural fact, confirmed by source read (not assumed from the prior
+round's summary).** `deepseek_v4_topk_transform_kernel` is launched **ONCE per
+call, grid=n blocks, one block per row** —
+`crates/cuda-kernels/csrc/misc/dsv4_dsa_official.cu:891`:
+`deepseek_v4_topk_transform_kernel<<<batch_size, kTopKBlockSize, kTopKSmem,
+stream>>>(params)`, `bid = blockIdx.x`, `params` built with `batch_size =
+n` in `dsv4_deepseek_v4_topk_transform_cuda`. The two Rust call sites
+(`crates/infer-cuda/src/attention.rs`, `csa_select_official` — the SOLO/
+per-tile path — and `csa_select_official_batched` — the N≥2 concurrent-decode
+path, `dsv4.rs:3556`) both pass `n`/`tlen` as `batch_size` in one FFI call;
+neither loops the kernel launch per row. **This is one grid=n-blocks launch,
+not n separate launches** — the "SM-occupancy-driven scheduling shift"
+framing from the prior round means "more co-resident blocks changes one
+block's own internal warp-scheduling order vs a smaller grid," not
+true concurrent-kernel contention between separate launches (there's only
+ever one launch per call, at any n).
+
+Correction to the prior round's citation: solo (n=1) decode does **not**
+bypass this kernel — `ARLE_DSV4_DECODE_GRAPH` defaults off in every boot this
+investigation has used, so `forward_tokens_impl` never takes the
+`forward_tokens_decode_graph` branch; n=1 decode runs through
+`forward_tokens_stream_impl` → `csa_select_official` (line 9269's call site,
+tiled per-query-position, tile size 1 for decode), which calls the *same*
+`dsv4_deepseek_v4_topk_transform_cuda` kernel with `batch_size=1`. Solo and
+concurrent decode share one kernel; only `n` (grid size) differs.
+
+**Instrumentation.** Added `ARLE_DSA_TIEBREAK_TRACE=1` (env-gated, reverted
+after use): a `TopKParams::tie_trace` nullable `int32_t*` scratch
+(`[n*2]`, one `[remain, competitors]` pair per row), threaded through
+`radix_topk`. `radix_topk` writes `[s_r3_remain, s_tie_competitors]` for a row
+only when round==3's tie-break code actually executes (the `bin ==
+threshold_bin` branch inside round 3's refinement loop, i.e. `s_last_remain`
+is genuinely consumed — not just "the round index reached 3"). Both Rust call
+sites allocate+zero the scratch, pass it through the FFI call, and (only when
+any row shows `competitors > 0`) D2H-read it plus the corresponding
+`raw_indices` slice and print one `DSA_TIEBREAK` line per tied row (block/row
+id, `remain`, `competitors`, and the winning raw index(es) — read directly
+from `raw_indices[topk-remain..topk]`, since round-3 writes always land in
+that exact slice, so no separate device tracking of "which index won" is
+needed).
+
+**Experiment.** Reused the established repro
+(`concurrent_needle_v3.py`, len=500, TP=4 GPUs 2/3/4/5, same
+`ARLE_DSV4_MOE_BACKEND=allreduce`/`ARLE_DSV4_INCREMENTAL_KV=1`/
+`ARLE_DSV4_EXPERT_BACKEND=deepgemm`/`--max-total-tokens 2048` config as every
+prior A/B): `job_tiebreak.sh`, 10× solo (n=1) reps then 30× concurrent (n=2,
+two independently-salted prompts/needles per trial — not duplicates) reps on
+one boot, `ARLE_DSA_TIEBREAK_TRACE=1` exported. Corruption reproduced at the
+established rate — 40 requests, 13 misses (32.5%), including exact matches to
+the doc's own previously-documented signature: `738292` (twice, byte-identical
+to the "Batch-invariance sweep 2/3" round's substitution), `7389382`,
+`7383921`, plus the standard truncation class (`738.`, `7382.`).
+
+**`DSA_TIEBREAK` count across this run: 0.** Zero genuine round-3 arbitrated
+ties (`competitors > remain`), across every row, every CSA layer, every decode
+step, solo and concurrent, including the corrupted trials.
+
+**Progressively loosened the trigger to rule out an instrumentation bug
+before trusting the zero** (per this doc's own precedent — a clean sanitizer
+result needed the kernel-shape check first, an env-var A/B needed the sample
+size checked first):
+1. `competitors > remain` (genuine arbitration) → 0/40 requests, ~20 corrupted.
+2. Loosened to `competitors > 0` (ANY round-3 tie, arbitrated or not) →
+   still 0, across a fresh 20-request sweep with further corruption observed.
+3. Loosened to unconditional — write a sentinel `[999, seq_len*100000+topk]`
+   for **every** call that reaches `radix_topk` at all (before the function
+   even runs), independent of ties or rounds → still 0, across a fresh
+   3-request sweep.
+4. Root-caused step 3's zero: added an unconditional `TOPK_SHAPE` device
+   `printf` (bid, seq_len, topk, naive-branch-taken) at the kernel's own
+   naive-vs-radix dispatch point. **197,249 calls logged across the n=1/n=2
+   sweep — `naive=1` on all 197,249, `naive=0` on zero.** Observed `seq_len`
+   spans 0–~125 (compressed-KV candidate count at len=500, growing with
+   context), `topk=512` constant for these CSA layers. `seq_len <= topk`
+   (512) holds for every single call at this repro's context length, so
+   `deepseek_v4_topk_transform_kernel`'s `if (seq_len <= topk) {
+   naive_paged_transform(...); return; }` fires **every time** —
+   `radix_topk` (and therefore its round==3 tie-break) is never entered at
+   all, structurally, not merely tie-free.
+
+**Verdict: RULED OUT for this investigation's established repro (n=1/n=2,
+len=500).** Not because genuine round-3 ties are rare or resolve
+deterministically when reached (the prior round's source-level proof that
+`atomicAdd`-arbitrated ties are schedule-dependent still stands as a fact
+about the kernel) — because `radix_topk` itself is **never invoked** at this
+context length. Every CSA-layer topk-transform call in this repro's regime
+has fewer candidate compressed-KV positions (≤~125) than the configured
+`index_topk` (512), so the kernel's own naive-path guard (`seq_len <= topk`)
+short-circuits before any sorting/tie-break code runs. The `738292`-class
+corruption reproduced in the very same instrumented runs is therefore
+**not** attributable to `radix_topk`'s tie-break by any mechanism — the code
+path is dead weight at this repro shape. (At a much longer context, once
+compressed candidates exceed 512, `radix_topk` would become reachable and
+this mechanism would need re-testing — out of scope: no established repro at
+that length exists in this doc.)
+
+**Aside — an unrelated, broken commit blocked GPU access mid-round.**
+`36835179f` ("persistent device page table for CUDA graph safety (#8)",
+authored by a concurrent session working the SAME pod tree — see
+`docs/experience/wins/2026-07-07-prefix-cache-graph-page-table-fix.md`)
+landed on `main` mid-investigation and unconditionally fails
+`Dsv4FlashMlaDecodeState::new()` (`ensure!(table_i32.len() ==
+self.device_page_table.len(), ...)` — the host page table is legitimately
+empty at construction time, before any pages are assigned) — **every DSv4
+FlashMLA boot fails at engine build** with this commit present, regardless of
+prefix cache / CUDA graph settings. Worked around **pod-tree-only** (never
+touched local git) by reverting to the pre-`#8` behavior (fresh
+`pool.flashmla_device_page_table()` lookup per call, the code every prior
+round in this doc already ran on) for the duration of this round's boots,
+then `scripts/pod.sh sync` (no-arg form: pod-side `git fetch`+`reset` to
+local HEAD) restored the pod tree exactly — `git diff` empty on both trees
+before finishing. Not fixed, not this task's scope; flagging since it will
+block the next DSv4 pod round too until landed correctly.
+
+**All code changes reverted.** `ARLE_DSA_TIEBREAK_TRACE`, the `tie_trace`
+FFI/kernel plumbing, and the diagnostic `printf`s were reverted after
+extracting the numbers above (unlike `ARLE_DSV4_DECODE_TRACE`/
+`ARLE_PROBE_STAGES`, this round's instrumentation has no ongoing reuse value
+now that the mechanism is ruled out) — `git diff` clean on both local and pod
+trees, confirmed via `scripts/pod.sh sync`'s no-arg reset.
+
+## Investigation status — all named candidate mechanisms exhausted (2026-07-08)
+
+Every concrete mechanism this doc's own shortlist has named is now closed:
+
+| Mechanism | Verdict |
+|---|---|
+| Batched FlashMLA/CSA attention kernel | KILLED (scalar-lane A/B reproduced identically) |
+| Cross-request `RadixCache`/KV-page reuse | KILLED (fresh-boot-first-request test) |
+| DSA topk row-ordinal-vs-slot-identity | KILLED (trace: `r==slot_ids[r]` 100%) |
+| Custom one-shot allreduce | Ruled out (never active — plain NCCL only) |
+| GPU-kernel-launch-ordering race | KILLED (`CUDA_LAUNCH_BLOCKING=1`, 80-req sample) |
+| Host-thread race | KILLED (single-engine-thread architecture) |
+| Intra-kernel (cross-block) race, 2 batched kernels | KILLED (`compute-sanitizer racecheck/synccheck`) |
+| FlashMLA split-KV `num_splits` batch-invariance | KILLED quantitatively (arithmetic never crosses the threshold at n≤4) |
+| RMSNorm data-parallel↔split-reduction | KILLED structurally (no batch-size branch exists) |
+| `dsv4_fp8_gemv_batch_cuda` B==1-vs-B>1 dispatch | KILLED (byte-identical arithmetic both branches) |
+| **`proj_batched` FP8-DeepGEMM-vs-bf16 gate** | **CONFIRMED partial cause** — bf16-force cut n=2 miss 57.1%→30.0%, digit-corruption 4/40→0 truncation-class but 4/40 substitution-class residual |
+| Sibling FP8 gate (`mla_attention_prepare_proj_batch`) | BLOCKED — no bf16 alternative exists in the checkpoint (F8_E4M3-only weights) |
+| FP8 grouped-GEMM decode-MoE | DEAD-END — same reason (checkpoint has no bf16 alternative) |
+| DSA `radix_topk` round==3 tie-break | **RULED OUT** — structurally unreachable at this repro's context length (always takes the naive path) |
+
+**Net position.** `proj_batched`'s FP8-vs-bf16 precision switch is the one
+measured, causal, partial contributor this investigation found: forcing it to
+bf16 cuts n=2's overall miss rate ~1.9x (57.1%→30.0%, landing at n=1's own
+floor) and eliminates its own truncation-class corruption, but a residual
+digit-substitution corruption (`7381239` vs needle `738291`, byte-identical
+across 4/4 trials) survives — attributed to the sibling FP8 gate
+(`mla_attention_prepare_proj_batch`) and/or the FP8 grouped-GEMM MoE decode
+kernels, neither of which can be given a same-day bf16 A/B (their checkpoint
+weights are F8_E4M3-only, no dense-bf16 tensor exists to fall back to; a real
+fix needs new FP8→bf16 host-side dequantization infrastructure in the
+loader). With `radix_topk` now ruled out, **every concrete mechanism named
+across nine investigation days is closed** — six killed, three FP8-precision
+gates identified (one confirmed-causal-partial, two dead-ended on missing
+bf16 weights). There is no further named hypothesis to test without either
+(a) building the FP8→bf16 dequant path to A/B the two remaining gates
+properly, or (b) a fresh instrumentation idea from outside this doc's own
+shortlist.
+
+**Recommendation.** Land `proj_batched`'s bf16-force as an opt-in mitigation
+lever (not a default flip — it trades DeepGEMM tensor-core throughput for
+correctness on the compressor/indexer projections at n≥2) with an honest
+docstring: reduces but does not eliminate n≥2 digit corruption. Treat the
+residual as accepted, measured, partially-understood risk until the
+FP8→bf16 dequant infrastructure lands and the two remaining gates get their
+own A/B.
