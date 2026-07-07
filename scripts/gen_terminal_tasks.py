@@ -47,6 +47,7 @@ import hashlib
 import importlib.util
 import json
 import random
+import re
 import shutil
 import subprocess
 import sys
@@ -532,10 +533,409 @@ def b_http_service(rng):
     )
 
 
+# --------------------------------------------------------------------------
+# Hard families (complexity 3): genuine multi-step reasoning — a naive one-liner
+# gets them WRONG (missing nesting / typing / stateful grouping / tie-break).
+# Excluded from the default max-complexity=2 pool, so baseline runs are unchanged.
+# --------------------------------------------------------------------------
+
+
+def b_ini_sections_typed(rng):
+    """Sectioned INI -> nested typed JSON. Naive flat partition() dict fails:
+    no [section] nesting, no int/bool coercion, no inline-comment strip."""
+    secs = rng.sample(["server", "db", "cache", "auth", "log"], rng.randint(2, 3))
+    keypool = ["host", "port", "debug", "enabled", "name", "retries", "level"]
+    conf, lines = {}, ["# global settings", ""]
+    for sec in secs:
+        conf[sec] = {}
+        lines.append(f"[{sec}]")
+        keys = rng.sample(keypool, rng.randint(2, 4))
+        for k in keys:
+            typ = rng.choice(["int", "bool", "str"])
+            if typ == "int":
+                v = rng.randint(-100, 9999)
+                raw = str(v)
+            elif typ == "bool":
+                v = rng.choice([True, False])
+                raw = rng.choice(
+                    {True: ["true", "True", "TRUE"],
+                     False: ["false", "False", "FALSE"]}[v]
+                )
+            else:
+                v = rng.choice(WORDS)
+                raw = v
+            comment = f"  # {rng.choice(WORDS)}" if rng.random() < 0.4 else ""
+            lines.append(f"{k}={raw}{comment}")
+            conf[sec][k] = v
+        if rng.random() < 0.5:  # duplicate key in section -> last wins
+            dk, dv = rng.choice(keys), rng.randint(0, 999)
+            lines.append(f"{dk}={dv}")
+            conf[sec][dk] = dv
+        lines.append("")
+    return dict(
+        domain="config-parsing", complexity=3, verifier="output-format-json",
+        n_steps="medium",
+        instruction=(
+            "settings.ini has '[section]' headers followed by KEY=VALUE lines, "
+            "with blank lines, '#'-comment lines, and inline '# ...' comments after "
+            "some values.\n"
+            "Write config.json: a nested object {section: {key: value}}. Coerce "
+            "each value: all-digits (optional leading '-') -> integer; 'true'/"
+            "'false' (any case) -> boolean; otherwise the trimmed string with any "
+            "inline comment removed. If a key repeats in a section, the last "
+            "assignment wins."
+        ),
+        fixtures={"settings.ini": "\n".join(lines) + "\n"},
+        solution=py_heredoc(
+            "import json, re\n"
+            "conf, sec = {}, None\n"
+            "for line in open('settings.ini'):\n"
+            "    s = line.strip()\n"
+            "    if not s or s.startswith('#'):\n"
+            "        continue\n"
+            "    if s.startswith('[') and s.endswith(']'):\n"
+            "        sec = s[1:-1].strip()\n"
+            "        conf.setdefault(sec, {})\n"
+            "        continue\n"
+            "    k, _, v = s.partition('=')\n"
+            "    val = v.split('#')[0].strip()\n"
+            "    if re.fullmatch(r'-?\\d+', val):\n"
+            "        val = int(val)\n"
+            "    elif val.lower() in ('true', 'false'):\n"
+            "        val = val.lower() == 'true'\n"
+            "    conf[sec][k.strip()] = val\n"
+            "json.dump(conf, open('config.json', 'w'))\n"
+        ),
+        test_body=(
+            "def test_ini_sections_typed():\n"
+            "    p = APP / 'config.json'\n"
+            "    assert p.exists(), 'config.json missing'\n"
+            f"    assert json.loads(p.read_text()) == {conf!r}\n"
+        ),
+    )
+
+
+def b_csv_pivot_sum(rng):
+    """category,sub,value CSV -> {category: {sub: sum}}. Empty value -> 0,
+    malformed (<3 fields) rows skipped. Naive one-pass sum ignores both + nesting."""
+    cats = rng.sample(CATEGORIES, rng.randint(2, 3))
+    subs = ["x", "y", "z"]
+    rows, pivot = [], {}
+    for _ in range(rng.randint(10, 18)):
+        c, s, v = rng.choice(cats), rng.choice(subs), rng.randint(1, 100)
+        rows.append(f"{c},{s},{v}")
+        pivot.setdefault(c, {}).setdefault(s, 0)
+        pivot[c][s] += v
+    for _ in range(rng.randint(1, 2)):  # empty value -> counts as 0
+        c, s = rng.choice(cats), rng.choice(subs)
+        rows.append(f"{c},{s},")
+        pivot.setdefault(c, {}).setdefault(s, 0)
+    rows.append(rng.choice(cats))  # malformed (<3 fields) -> skipped
+    rng.shuffle(rows)
+    return dict(
+        domain="data-transform", complexity=3, verifier="output-format-json",
+        n_steps="medium",
+        instruction=(
+            "data.csv has rows 'category,sub,value' (no header). A row with an "
+            "empty value field counts as 0; a malformed row with fewer than 3 "
+            "fields is skipped.\n"
+            "Write pivot.json: a nested object {category: {sub: sum_of_values}} "
+            "with integer sums."
+        ),
+        fixtures={"data.csv": "\n".join(rows) + "\n"},
+        solution=py_heredoc(
+            "import csv, json\n"
+            "pivot = {}\n"
+            "with open('data.csv') as f:\n"
+            "    for row in csv.reader(f):\n"
+            "        if len(row) < 3:\n"
+            "            continue\n"
+            "        c, s, v = row[0], row[1], row[2]\n"
+            "        val = int(v) if v.strip() else 0\n"
+            "        pivot.setdefault(c, {}).setdefault(s, 0)\n"
+            "        pivot[c][s] += val\n"
+            "json.dump(pivot, open('pivot.json', 'w'))\n"
+        ),
+        test_body=(
+            "def test_csv_pivot_sum():\n"
+            "    p = APP / 'pivot.json'\n"
+            "    assert p.exists(), 'pivot.json missing'\n"
+            f"    assert json.loads(p.read_text()) == {pivot!r}\n"
+        ),
+    )
+
+
+def b_log_sessions(rng):
+    """Per-user sessionization: sort a user's events by time, a gap > 300s starts
+    a new session. Naive event-count fails — needs stateful per-user grouping."""
+    users = ["alice", "bob", "carol"]
+    base = rng.randint(1_600_000_000, 1_700_000_000)
+    user_times = {}
+    for u in users:
+        t = base + rng.randint(0, 1000)
+        times = []
+        for _ in range(rng.randint(4, 8)):
+            times.append(t)
+            t += rng.randint(400, 2000) if rng.random() < 0.35 else rng.randint(1, 250)
+        user_times[u] = times
+    for i in range(1, len(user_times["alice"])):  # guarantee alice has >=2 sessions
+        user_times["alice"][i] += 400
+    lines, sessions = [], {}
+    for u in users:
+        ts = sorted(user_times[u])
+        sessions[u] = 1 + sum(ts[i] - ts[i - 1] > 300 for i in range(1, len(ts)))
+        for t in user_times[u]:
+            lines.append(f"{t} {u} {rng.choice(['login', 'click', 'view', 'logout'])}")
+    rng.shuffle(lines)
+    return dict(
+        domain="log-analysis", complexity=3, verifier="output-format-json",
+        n_steps="medium",
+        instruction=(
+            "events.log has lines 'TIMESTAMP USER ACTION' (unix ts, unsorted). For "
+            "each user, sort that user's events by time and split them into "
+            "sessions: a gap greater than 300 seconds between consecutive events "
+            "starts a new session.\n"
+            "Write sessions.json: an object {user: session_count} for every user."
+        ),
+        fixtures={"events.log": "\n".join(lines) + "\n"},
+        solution=py_heredoc(
+            "import json\n"
+            "from collections import defaultdict\n"
+            "ev = defaultdict(list)\n"
+            "for line in open('events.log'):\n"
+            "    parts = line.split()\n"
+            "    if len(parts) < 3:\n"
+            "        continue\n"
+            "    ev[parts[1]].append(int(parts[0]))\n"
+            "out = {}\n"
+            "for user, times in ev.items():\n"
+            "    times.sort()\n"
+            "    out[user] = 1 + sum(\n"
+            "        times[i] - times[i - 1] > 300 for i in range(1, len(times)))\n"
+            "json.dump(out, open('sessions.json', 'w'))\n"
+        ),
+        test_body=(
+            "def test_log_sessions():\n"
+            "    p = APP / 'sessions.json'\n"
+            "    assert p.exists(), 'sessions.json missing'\n"
+            f"    assert json.loads(p.read_text()) == {sessions!r}\n"
+        ),
+    )
+
+
+def b_toposort_build(rng):
+    """Kahn topological order with lexicographic tie-break. A plain sort or
+    DFS-without-tie-break yields a different valid order that won't match."""
+    names = ["build", "test", "lint", "deploy", "compile", "package", "docs"]
+    nodes = rng.sample(names, rng.randint(5, 7))
+    deps = {n: [] for n in nodes}
+    for i in range(1, len(nodes)):
+        k = rng.randint(0, min(i, 2))
+        if k:
+            deps[nodes[i]] = rng.sample(nodes[:i], k)
+    if nodes[0] not in deps[nodes[1]]:  # guarantee >=1 edge (else no lines emitted)
+        deps[nodes[1]] = deps[nodes[1]] + [nodes[0]]
+    lines = [f"{n}: {' '.join(deps[n])}" for n in nodes if deps[n]]
+    rng.shuffle(lines)
+    fixture = "\n".join(lines) + "\n"
+
+    # Compute expected from the SAME parse the oracle does (authoritative node set).
+    import heapq
+    dd, alln = {}, set()
+    for line in fixture.strip().split("\n"):
+        tgt, _, rest = line.partition(":")
+        tgt, ds = tgt.strip(), rest.split()
+        dd[tgt] = ds
+        alln.add(tgt)
+        alln.update(ds)
+    for n in alln:
+        dd.setdefault(n, [])
+    indeg = {n: len(dd[n]) for n in alln}
+    rev = {n: [] for n in alln}
+    for n in alln:
+        for d in dd[n]:
+            rev[d].append(n)
+    avail = [n for n in alln if indeg[n] == 0]
+    heapq.heapify(avail)
+    order = []
+    while avail:
+        x = heapq.heappop(avail)
+        order.append(x)
+        for m in rev[x]:
+            indeg[m] -= 1
+            if indeg[m] == 0:
+                heapq.heappush(avail, m)
+    return dict(
+        domain="data-transform", complexity=3, verifier="exact-file-content",
+        n_steps="medium",
+        instruction=(
+            "deps.txt has lines 'TARGET: DEP1 DEP2' meaning TARGET depends on the "
+            "listed deps; a name that never appears as a target is a leaf.\n"
+            "Write order.txt: a topological build order (every dep before its "
+            "dependents), one name per line. Break ties deterministically — among "
+            "nodes whose deps are all already emitted, pick the lexicographically "
+            "smallest. The graph is a DAG."
+        ),
+        fixtures={"deps.txt": fixture},
+        solution=py_heredoc(
+            "import heapq\n"
+            "deps, alln = {}, set()\n"
+            "for line in open('deps.txt'):\n"
+            "    line = line.strip()\n"
+            "    if not line:\n"
+            "        continue\n"
+            "    tgt, _, rest = line.partition(':')\n"
+            "    tgt, ds = tgt.strip(), rest.split()\n"
+            "    deps[tgt] = ds\n"
+            "    alln.add(tgt)\n"
+            "    alln.update(ds)\n"
+            "for n in alln:\n"
+            "    deps.setdefault(n, [])\n"
+            "indeg = {n: len(deps[n]) for n in alln}\n"
+            "rev = {n: [] for n in alln}\n"
+            "for n in alln:\n"
+            "    for d in deps[n]:\n"
+            "        rev[d].append(n)\n"
+            "avail = [n for n in alln if indeg[n] == 0]\n"
+            "heapq.heapify(avail)\n"
+            "order = []\n"
+            "while avail:\n"
+            "    x = heapq.heappop(avail)\n"
+            "    order.append(x)\n"
+            "    for m in rev[x]:\n"
+            "        indeg[m] -= 1\n"
+            "        if indeg[m] == 0:\n"
+            "            heapq.heappush(avail, m)\n"
+            "open('order.txt', 'w').write('\\n'.join(order) + '\\n')\n"
+        ),
+        test_body=(
+            "def test_toposort_build():\n"
+            "    p = APP / 'order.txt'\n"
+            "    assert p.exists(), 'order.txt missing'\n"
+            f"    assert p.read_text().splitlines() == {order!r}\n"
+        ),
+    )
+
+
+def b_template_render(rng):
+    """Mini template: {{var}}, {{var|default}}, {{#if var}}INNER{{/if}}. Naive
+    per-key str.replace fails on conditional blocks and defaults."""
+    vals = {"name": rng.choice(WORDS), "title": rng.choice(WORDS)}  # nickname absent
+    template = (
+        "Hello {{name}}!\n"
+        "Role: {{title|guest}}\n"
+        "Alias: {{nickname|none}}\n"
+        "{{#if name}}Welcome, {{name}}.{{/if}}\n"
+        "{{#if nickname}}Nick: {{nickname}}{{/if}}\n"
+        "End.\n"
+    )
+    out = re.sub(
+        r"\{\{#if (\w+)\}\}(.*?)\{\{/if\}\}",
+        lambda m: m.group(2) if vals.get(m.group(1)) else "",
+        template, flags=re.S,
+    )
+
+    def _var(m):
+        v = vals.get(m.group(1), "")
+        return m.group(2) if (v == "" and m.group(2) is not None) else v
+    out = re.sub(r"\{\{(\w+)(?:\|([^}]*))?\}\}", _var, out)
+    return dict(
+        domain="text-processing", complexity=3, verifier="exact-file-content",
+        n_steps="medium",
+        instruction=(
+            "template.txt contains literal text plus placeholders: {{var}}, "
+            "{{var|default}} (use the default if var is missing or empty), and "
+            "{{#if var}}INNER{{/if}} blocks (keep INNER only if var is present and "
+            "non-empty). vars.json supplies the variable map.\n"
+            "Write out.txt: the rendered result."
+        ),
+        fixtures={"template.txt": template, "vars.json": json.dumps(vals) + "\n"},
+        solution=py_heredoc(
+            r"""import re, json
+tpl = open('template.txt').read()
+vals = json.load(open('vars.json'))
+tpl = re.sub(r'\{\{#if (\w+)\}\}(.*?)\{\{/if\}\}',
+             lambda m: m.group(2) if vals.get(m.group(1)) else '',
+             tpl, flags=re.S)
+def _var(m):
+    v = vals.get(m.group(1), '')
+    return m.group(2) if (v == '' and m.group(2) is not None) else v
+tpl = re.sub(r'\{\{(\w+)(?:\|([^}]*))?\}\}', _var, tpl)
+open('out.txt', 'w').write(tpl)
+"""
+        ),
+        test_body=(
+            "def test_template_render():\n"
+            "    p = APP / 'out.txt'\n"
+            "    assert p.exists(), 'out.txt missing'\n"
+            f"    assert p.read_text() == {out!r}\n"
+        ),
+    )
+
+
+def b_fixedwidth_reformat(rng):
+    """Fixed-width columns (name[0:10], age[10:14], city[14:]), NOT delimited —
+    .split() fails. Two outputs with distinct multi-key sorts."""
+    pool = [w for w in dict.fromkeys(WORDS) if len(w) <= 8]
+    cities = rng.sample(["london", "paris", "tokyo", "berlin", "cairo", "osaka"],
+                        rng.randint(2, 3))
+    n = rng.randint(6, 10)
+    people, records = [], []
+    for name in rng.sample(pool, n):
+        age, city = rng.randint(18, 95), rng.choice(cities)
+        records.append(name.ljust(10) + str(age).ljust(4) + city)
+        people.append({"name": name, "age": age, "city": city})
+    people_sorted = sorted(people, key=lambda p: (-p["age"], p["name"]))
+    cc = Counter(p["city"] for p in people)
+    city_lines = [f"{c} {k}" for c, k in
+                  sorted(cc.items(), key=lambda kv: (-kv[1], kv[0]))]
+    return dict(
+        domain="text-processing", complexity=3, verifier="multi-file-state",
+        n_steps="medium",
+        instruction=(
+            "records.txt has fixed-width columns (space-padded, NOT delimited): "
+            "name is characters [0:10], age is [10:14], city is [14:].\n"
+            "Write people.json: a list of {\"name\", \"age\" (int), \"city\"} with "
+            "fields stripped, sorted by age descending then name ascending.\n"
+            "Write count_by_city.txt: 'CITY N' lines (people per city), sorted by "
+            "count descending then city ascending."
+        ),
+        fixtures={"records.txt": "\n".join(records) + "\n"},
+        solution=py_heredoc(
+            "import json\n"
+            "from collections import Counter\n"
+            "people = []\n"
+            "for line in open('records.txt'):\n"
+            "    line = line.rstrip('\\n')\n"
+            "    if not line.strip():\n"
+            "        continue\n"
+            "    people.append({'name': line[0:10].strip(),\n"
+            "                   'age': int(line[10:14].strip()),\n"
+            "                   'city': line[14:].strip()})\n"
+            "people.sort(key=lambda p: (-p['age'], p['name']))\n"
+            "json.dump(people, open('people.json', 'w'))\n"
+            "cc = Counter(p['city'] for p in people)\n"
+            "lines = [f'{c} {k}' for c, k in\n"
+            "         sorted(cc.items(), key=lambda kv: (-kv[1], kv[0]))]\n"
+            "open('count_by_city.txt', 'w').write('\\n'.join(lines) + '\\n')\n"
+        ),
+        test_body=(
+            "def test_fixedwidth_reformat():\n"
+            "    pj = APP / 'people.json'\n"
+            "    cc = APP / 'count_by_city.txt'\n"
+            "    assert pj.exists() and cc.exists(), 'output files missing'\n"
+            f"    assert json.loads(pj.read_text()) == {people_sorted!r}\n"
+            f"    assert cc.read_text().splitlines() == {city_lines!r}\n"
+        ),
+    )
+
+
 BUILDERS = [
     b_linecount, b_grepcount, b_sortuniq, b_sha256, b_base64, b_split,
     b_awk_window, b_csv_groupsum, b_mean, b_ini_json, b_json_filter,
     b_topwords, b_http_service,
+    b_ini_sections_typed, b_csv_pivot_sum, b_log_sessions, b_toposort_build,
+    b_template_render, b_fixedwidth_reformat,
 ]
 
 
