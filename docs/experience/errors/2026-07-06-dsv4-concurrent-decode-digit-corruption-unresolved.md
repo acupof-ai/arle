@@ -795,3 +795,118 @@ plausible mechanism story (floating-point non-associativity in batched
 kernels) — the control killed it here in one pod boot (~2 minutes of GPU time,
 7.6 GB model) at negligible cost relative to the DSv4 TP=4 passes that
 preceded it.
+
+## Qwen3.6-27B-FP8 MoE control — clean, same as dense Qwen3-4B (2026-07-07)
+
+Dense Qwen3-4B (prior round) rules out "any batched-inference substrate," but
+doesn't separate "any MoE router" from "DSv4-specific indexer/compressor/MHC"
+as the shared mechanism, since Qwen3-4B has no MoE routing at all. Reran the
+identical numeric-vs-text needle A/B (`concurrent_needle_v3_qwen.py` /
+`concurrent_needle_text_qwen.py`, ChatML wrap, n=4/len=500/15 reps = 60
+requests/arm, greedy) against **Qwen3.6-27B-FP8** (qwen35-hybrid MoE path,
+`sqrtsoftplus`/`noaux_tc` top-k routing — the same MoE routing family DSv4
+itself uses) at TP=1/GPU=1 (fits 1×H20 per
+[wins/2026-06-29-cuda-qwen36-paged-batched-decode.md](wins/2026-06-29-cuda-qwen36-paged-batched-decode.md)).
+Solo (n=1) sanity 3/3 exact on both needles first.
+
+| Needle | Requests | Exact | Miss rate |
+|---|---|---|---|
+| Numeric (`738291`) | 60 | 60 | **0%** |
+| Text (`CASTLE`) | 60 | 60 | **0%** |
+
+Zero misses on either needle — identical to the dense Qwen3-4B control, in
+contrast to DSv4's 56.7%/1.7%. **Rules out "any MoE router" as the shared
+mechanism**: Qwen3.6-27B-FP8's batched decode goes through the same
+`infer-cuda` paged-KV/continuous-batching substrate AND exercises MoE top-k
+routing under concurrency, yet shows no elevated numeric-vs-text gap. The
+defect narrows further to something DSv4-specific that neither Qwen3
+architecture has: the DSA/CSA sparse-attention indexer, the compressor
+(latent KV compression), or MHC — not FP8 grouped-GEMM MoE routing in
+general, and not batched-decode concurrency in general.
+
+## Logit-lens layer diff — divergence onset at layer ~19-21 of 43, final split only at the last layer (2026-07-07)
+
+Localizes WHICH layer first diverges between a clean and a corrupted decode,
+using the built-in decode logit-lens probe (`crates/infer-cuda/src/probe.rs`,
+`--probe-out`/`--probe-lens-layers 43`/`--probe-token-entropy true` — 43 =
+DSv4's full `num_hidden_layers`, so this covers the entire stack, not a
+partial window).
+
+**Setup.** Booted DSv4 TP=4 (GPUs 2/3/4/5) with the probe flags, ran
+`trace_probe.py`'s fixed TRACKED prompt (byte-identical every call,
+prompt_tokens=456) SOLO (n=1) first as a clean reference, then looped n=4
+concurrent attempts (TRACKED + 3 filler rows) until `TRACKED_MISS=True`.
+Repeated as two independent server boots for a same-mechanism replication
+check (not just one sample) — both hit the corruption on their 5th concurrent
+attempt. Extracted the TRACKED row's `decode`/`lens` JSONL records per
+capture by `pos` (concurrent fillers' prompt lengths, 471/481/491, keep their
+own prefill/decode records at disjoint positions ≥467, so TRACKED's own
+456-464 range is unambiguous even mid-batch — this required filtering out
+`phase:"prefill"` lines too, since a longer filler's OWN prefill sweep passes
+through position values that numerically overlap TRACKED's decode range).
+
+**Alignment caveat (important, not a bug in the capture).** The two runs'
+`pos` numbering is offset by a constant +1 (corrupt `pos` = solo `pos` + 1) —
+confirmed by exact token-content matching, not assumed: both trajectories
+emit the identical token sequence `[671, 8613, 3278, 4181, 344, 223, 30143,
+...]` for their first 7 generated tokens, just one KV-slot position apart
+(plausibly a cached-vs-fresh prefill boundary artifact from `trace_probe.py`'s
+byte-identical TRACKED prompt hitting `RadixCache` on every call after the
+first). Also found: solo generations are **not bit-reproducible across
+separate server boots** for the identical prompt (boot 1's solo produced the
+verbose completion `"The secret access code is 738291."` — 10 tokens
+starting `671,8613,...`; boot 2's solo produced the terse `"738291"` — 3
+tokens starting `30143,17979,1`, a different greedy path from token 0). This
+is itself a side finding (boot-to-boot kernel/heuristic selection variance,
+e.g. cuBLASLt's autotuned algorithm choice, plausibly) not chased further
+here — it does NOT confound the layer-diff analysis below, since both
+corrupted captures are compared against **boot 1's own solo reference**
+(which shares their first-7-token trajectory exactly), not cross-boot.
+
+**Result — two independent corrupted trials, same qualitative signature.**
+Aligned by generation step `g` (0-indexed; `g=7` is the corrupted step,
+solo's correct `17979` = "291" vs the corrupted `18307` = "292", matching the
+prior token-ID-trace round's substitution exactly):
+
+| layer range | solo1 top1 sequence | corrupt trial 1 | corrupt trial 2 |
+|---|---|---|---|
+| 0–18 (19 layers) | `69146` (constant) | `69146` (constant) — **bit-identical to solo** | `69146` (constant) — **bit-identical to solo** |
+| 19 | `34366` | `34366` (agrees) | `33180` (diverges — first hint) |
+| 20 | `19607` | `19607` (agrees) | `19607` (agrees) |
+| 21–34 | oscillates `{0, 19607, 53869, 68468}` | **locked at `19607`**, 13/14 layers | **locked at `19607`**, 13/14 layers |
+| 35–41 | mostly re-converges (`68468`/`127442`/`31942`/`17986`) | mostly re-converges, same values | mostly re-converges, same values |
+| 42 (final) | `17979` (correct) | `18307` (wrong) | `18307` (wrong — same substitution) |
+
+**Divergence onset: layer ~19-21 of 43 (mid-stack, ~46-49% depth) — not an
+early layer, not a clean single late-layer culprit, and not a smoothly
+accumulating drift either.** Layers 0–18 (embedding, RoPE, and the first
+~18 attention/MoE blocks) are **bit-for-bit identical** between solo and
+corrupted in both independent trials — rules out the embedding/RoPE/earliest
+attention blocks as the entry point. From layer 21 onward the pattern is
+**intermittent, not monotonic**: the corrupted run's lens top-1 becomes MORE
+stable (locks onto `19607` for 13 of the next 14 layers) while the clean
+run's lens top-1 is LESS stable in that exact same span (bounces between 4
+different candidates) — both trials show this same inversion. The two
+trajectories then mostly re-converge through layers 35-41 (same top-1 in
+5 of 7 layers) before permanently forking only at the very last layer (42),
+where the final unembedding projection resolves the accumulated difference
+into two adjacent-vocabulary numeric tokens (`17979`="291" vs `18307`="292").
+
+**Reading:** the onset at layer ~19-21 is a reproducible, non-noise signal
+(two independent boots agree), landing squarely in DSv4's **mid-stack
+CSA/DSA hybrid-attention and MoE block range** — consistent with (not yet
+proof of) the indexer/compressor/MoE-routing hypotheses already on the
+suspect list, and inconsistent with an embedding/RoPE-level or a
+purely-final-layer-only mechanism. But the INTERMITTENT (not
+monotonically-widening) pattern from layer 21 to layer 41 — re-agreement at
+24-28/30/33/35-39/41 — argues against "one single kernel computes a wrong
+value once, and the error propagates cleanly forward from there." It reads
+more like a small, layer-local numerical perturbation that nudges the
+residual stream toward a different (but not yet decisive) region of
+representation space starting mid-stack, without permanently committing to
+a different answer until the LM head's projection — i.e., closer to
+"accumulated drift with a mid-stack onset" than to a single clean
+early-layer or late-layer culprit. n=2 corrupted trials; a third/fourth
+would strengthen confidence in "layer ~19-21" as the exact onset boundary
+rather than "somewhere in 19-21" — not run this pass (information budget;
+this round's job was localization-to-a-region, not fix-finding).
