@@ -658,10 +658,17 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--self-check", action="store_true")
     ap.add_argument("--max-complexity", type=int, default=2, choices=[1, 2, 3])
+    ap.add_argument("--domains", type=str, default="",
+                    help="comma-separated domains to restrict to (curriculum "
+                         "targeting; empty = all)")
     args = ap.parse_args()
 
+    want = {d.strip() for d in args.domains.split(",") if d.strip()}
     pool = [b for b in BUILDERS
-            if b(random.Random(0))["complexity"] <= args.max_complexity]
+            if b(random.Random(0))["complexity"] <= args.max_complexity
+            and (not want or b(random.Random(0))["domain"] in want)]
+    if not pool:
+        sys.exit(f"no builders match domains={want} max_complexity={args.max_complexity}")
     # Round-robin over builders (shuffled by seed) so axes stay evenly spread.
     order = list(pool)
     random.Random(args.seed).shuffle(order)

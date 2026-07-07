@@ -145,6 +145,12 @@ pub(crate) struct Dsv4KvAdapter {
     /// One shared MoE decode-graph scratch for ALL layers and slots (issue #60).
     /// `None` unless the DSv4 decode-graph path is enabled.
     pub(super) moe_decode_shared: Option<crate::moe::Dsv4MoeDecodeScratch>,
+    /// One shared compact-FP8 decode-band MoE tail scratch for ALL layers and
+    /// slots (launch-bound Step 1). Sized to the band ceiling (128 routes), so
+    /// one instance serves every layer/step. `None` only when the model has no
+    /// MoE layer; independent of the decode graph (the batched-stream decode
+    /// path — the launch-bound target — never captures a graph).
+    pub(super) moe_tail_scratch: Option<crate::moe::Dsv4MoeTailScratch>,
     /// One persistent B=1 MLA decode scratch per MODEL1 layer. This is not graph
     /// state; eager no-spec decode reuses it to avoid allocating q/kv/CSA/O-proj
     /// temporaries inside every per-layer MLA dispatch.
@@ -483,6 +489,20 @@ impl Dsv4KvAdapter {
                 crate::moe::Dsv4MoeDecodeScratch::new(ctx, cfg, split, layer)
             })
             .transpose()?;
+        // Compact-FP8 decode-band MoE tail scratch — allocated whenever the model
+        // has a MoE layer (from the same `moe_decode` tuple), independent of the
+        // decode graph, since the batched-stream decode path (launch-bound Step 1
+        // target) is the primary consumer.
+        let moe_tail_scratch = moe_decode
+            .map(|(_cfg, split, layer)| {
+                crate::moe::Dsv4MoeTailScratch::new(
+                    ctx,
+                    layer.hidden_dim,
+                    layer.intermediate,
+                    split.experts_per_rank,
+                )
+            })
+            .transpose()?;
         // ALWAYS allocate the model-wide shared-expert output. Capacity is the
         // bounded MTP verify chunk (`MAX_SPEC_VERIFY_ROWS`); B=1 decode simply
         // sets `seq_len = 1` before dispatch. Keeping it pre-allocated avoids a
@@ -560,6 +580,7 @@ impl Dsv4KvAdapter {
             slot_epochs: vec![None; num_slots],
             dsa_shared,
             moe_decode_shared,
+            moe_tail_scratch,
             mla_decode,
             shared_expert_out,
             shared_expert_scratch,
@@ -761,6 +782,10 @@ impl Dsv4KvAdapter {
         &mut self,
     ) -> Option<&mut crate::moe::Dsv4MoeDecodeScratch> {
         self.moe_decode_shared.as_mut()
+    }
+
+    pub(crate) fn moe_tail_scratch_mut(&mut self) -> Option<&mut crate::moe::Dsv4MoeTailScratch> {
+        self.moe_tail_scratch.as_mut()
     }
 
     pub(crate) fn shared_expert_decode_mut(
