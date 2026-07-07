@@ -22,6 +22,7 @@ use cuda_kernels::prelude::{DeviceContext, HiddenStates};
 pub(crate) struct ProbeConfig {
     lens_layers: usize,
     token_entropy: bool,
+    stages: bool,
     path: PathBuf,
 }
 
@@ -49,9 +50,13 @@ fn init_config() -> Option<ProbeConfig> {
     let token_entropy = std::env::var("ARLE_PROBE_TOKEN_ENTROPY")
         .ok()
         .is_none_or(|value| value.trim() != "0");
+    let stages = std::env::var("ARLE_PROBE_STAGES")
+        .ok()
+        .is_some_and(|value| value.trim() != "0" && !value.trim().is_empty());
     Some(ProbeConfig {
         lens_layers,
         token_entropy,
+        stages,
         path: PathBuf::from(path),
     })
 }
@@ -276,6 +281,109 @@ pub(crate) fn lens_flush(ctx: &DeviceContext, positions: &[u64], final_tokens: &
             }
         }
     }
+}
+
+// ── Substage fingerprint (`ARLE_PROBE_STAGES`, diagnostic-only) ─────────────
+// Per-row, per-substage checksum along the decode layer stack (attn-norm, DSA
+// raw score, compressor output, attn output, hc-post x2, ffn input, MoE out),
+// added for the 2026-07-07 concurrent-decode digit-corruption investigation
+// (docs/experience/errors/2026-07-06-dsv4-concurrent-decode-digit-corruption-unresolved.md).
+// D2H's only the ONE row's slice (not the whole batched buffer), gated by an
+// optional decode-position window so a full sweep isn't required — off (no
+// `ARLE_PROBE_STAGES`) costs one bool compare per call site.
+
+/// Substage capture on + `pos` inside the optional `ARLE_PROBE_STAGE_POS_{MIN,MAX}`
+/// window (both default unbounded — set to bracket the known corruption tick
+/// and skip D2H on the surrounding steps).
+#[cfg(feature = "cuda")]
+pub(crate) fn stage_want(pos: u64) -> bool {
+    config().is_some_and(|cfg| cfg.stages) && {
+        static WINDOW: OnceLock<(u64, u64)> = OnceLock::new();
+        let (lo, hi) = *WINDOW.get_or_init(|| {
+            let bound = |var: &str, default: u64| {
+                std::env::var(var)
+                    .ok()
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(default)
+            };
+            (
+                bound("ARLE_PROBE_STAGE_POS_MIN", 0),
+                bound("ARLE_PROBE_STAGE_POS_MAX", u64::MAX),
+            )
+        });
+        pos >= lo && pos <= hi
+    }
+}
+
+/// Sum (f64 accumulation) + first/last 3 elements + extremum (value, index) of
+/// one row's slice — cheap (all from the ALREADY-fetched host `Vec`, no extra
+/// D2H), order-sensitive enough to catch a single-ULP-class drift, and the
+/// argmin/argmax pinpoint WHICH element an anomaly lives at (a whole-array sum
+/// can hide a single wild outlier behind cancellation).
+fn emit_stage(stage: &str, layer: usize, row: usize, pos: u64, values: &[f32]) {
+    if values.is_empty() {
+        return; // never crash inference over an empty (e.g. zero-key-count) slice.
+    }
+    let sum: f64 = values.iter().map(|&v| f64::from(v)).sum();
+    let head: Vec<f32> = values.iter().take(3).copied().collect();
+    let tail: Vec<f32> = values.iter().rev().take(3).copied().collect();
+    let (argmin, argmax) = values
+        .iter()
+        .enumerate()
+        .fold((0usize, 0usize), |(mn, mx), (i, &v)| {
+            (
+                if v < values[mn] { i } else { mn },
+                if v > values[mx] { i } else { mx },
+            )
+        });
+    emit(format_args!(
+        "{{\"phase\":\"stage\",\"stage\":\"{stage}\",\"layer\":{layer},\"row\":{row},\"pos\":{pos},\"n\":{},\"sum\":{sum:.6},\"head\":{head:?},\"tail\":{tail:?},\"min\":{:.6},\"argmin\":{argmin},\"max\":{:.6},\"argmax\":{argmax}}}",
+        values.len(),
+        values.get(argmin).copied().unwrap_or(f32::NAN),
+        values.get(argmax).copied().unwrap_or(f32::NAN),
+    ));
+}
+
+/// D2H + emit one row's bf16 slice (e.g. a `HiddenStates` row-major column).
+/// Blocking (syncs the stream) — caller must already have gated on `stage_want`.
+#[cfg(feature = "cuda")]
+pub(crate) fn stage_bf16(
+    ctx: &DeviceContext,
+    stage: &str,
+    layer: usize,
+    row: usize,
+    pos: u64,
+    view: cudarc::driver::CudaView<'_, half::bf16>,
+) {
+    let host: Vec<half::bf16> = match ctx.stream.clone_dtoh(&view) {
+        Ok(host) => host,
+        Err(err) => return fail(&format_args!("stage[{stage}] bf16 D2H failed: {err}")),
+    };
+    if let Err(err) = ctx.sync() {
+        return fail(&format_args!("stage[{stage}] sync failed: {err}"));
+    }
+    let values: Vec<f32> = host.iter().map(|x| x.to_f32()).collect();
+    emit_stage(stage, layer, row, pos, &values);
+}
+
+/// D2H + emit one row's f32 slice (e.g. the DSA raw-score `logits_batch`).
+#[cfg(feature = "cuda")]
+pub(crate) fn stage_f32(
+    ctx: &DeviceContext,
+    stage: &str,
+    layer: usize,
+    row: usize,
+    pos: u64,
+    view: cudarc::driver::CudaView<'_, f32>,
+) {
+    let host: Vec<f32> = match ctx.stream.clone_dtoh(&view) {
+        Ok(host) => host,
+        Err(err) => return fail(&format_args!("stage[{stage}] f32 D2H failed: {err}")),
+    };
+    if let Err(err) = ctx.sync() {
+        return fail(&format_args!("stage[{stage}] sync failed: {err}"));
+    }
+    emit_stage(stage, layer, row, pos, &host);
 }
 
 #[cfg(test)]

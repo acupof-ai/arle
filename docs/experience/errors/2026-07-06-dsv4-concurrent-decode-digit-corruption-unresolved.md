@@ -985,3 +985,169 @@ not code reading alone). A parallel row-addressing/shared-scratch-sizing
 check on the MHC kernels specifically (not a precision A/B) is the more
 promising next step if MHC stays on the suspect list — not run this pass
 (out of scope; this pass tested one specific, now-refuted premise).
+
+## Comprehensive substage-diff round — RadixCache-repeat confound found + KILLED for the original bug; SOLID substage localization inconclusive (2026-07-07)
+
+Resumed a killed prior session (`af6c005853c874bf3`) mid-task on per-substage
+instrumentation. **Salvaged, not redone**: `git status` on the pod tree showed
+uncommitted local edits to `crates/infer-cuda/src/{dsv4,attention,probe}.rs`
+adding `ARLE_PROBE_STAGES` — a per-row, per-substage fingerprint (sum + head/
+tail-3 + argmin/argmax of each row's slice) at 8 call sites spanning layers
+0–42 (`attn_norm`, `dsa_raw_score`, `compressor_out`, `attn_out`,
+`attn_residual`, `ffn_input`, `moe_out`, `ffn_residual` — covering post-
+attention, the DSA raw indexer score, compressor output, attention output,
+MHC pre/post at both boundaries, and MoE output per the brief). It compiled
+clean (`BUILD_EXIT=0`) and matched the brief's substage list, so it was reused
+as-is. Also found partial pod-side capture files (`stage_probe.jsonl`,
+`stage_manifest.txt`, `diff_stage_probe{,2}.py`, `trace_probe.py`,
+`boot_stage_probe.sh`, `drive_stage_probe.sh`, `drive_more_clean.sh`) —
+6/26 planned concurrent attempts had real data (conc1–conc6, conc6 corrupted),
+but re-running the diff surfaced the killed session's own last note was
+correct: **zero position overlap** between the corrupted attempt's captured
+window (pos 462–465, where the join event/corruption tick actually falls per
+this doc's earlier token-trace round) and the 5 clean attempts' window
+(pos 456–460, where clean/terse completions had already hit EOS) — the
+`diff_stage_probe.py` "0 divergent points" result on that partial data was
+**vacuous** (nothing to compare), not a real finding.
+
+**GPU check.** `scripts/pod.sh gpus` showed GPUs 1/2/3/4/6/7 free (0% util,
+~0 MiB) and 0/5 busy (~95%, another tenant) — 6 free GPUs, well above the
+TP=4 minimum; no poller, no wait, proceeded directly on GPUs 1/3/4/6.
+
+### Attempt 1: fix the overlap gap with `ignore_eos` — surfaced a bigger, separate bug
+
+To force every trial (clean or corrupted) to run the full 16-token budget
+(guaranteeing position-window overlap regardless of completion length), added
+`"ignore_eos": true` to a copy of `trace_probe.py`. First concurrent (n=4)
+attempt under this harness caught corruption immediately — but so did a
+**solo (n=1) sanity check run right before it**: `solo2` (the second-ever
+call to the fixed `TRACKED-FIXED...` prompt on that boot) produced
+`'The secret access code is 738292. 738292.'` — the exact same digit
+substitution (738292 for 738291) documented in every corrupted-concurrent
+case all day, but at **n=1, no concurrency at all**.
+
+**Isolated `ignore_eos` as irrelevant.** Reran with the plain (no
+`ignore_eos`) `trace_probe.py`, 20 solo (n=1) reps back-to-back on one boot:
+**20/20 wrong**, byte-identical output every time
+(`'The secret access code is 738292.'`). This is not racy — it's
+deterministic. The first-ever call to this exact prompt on a boot is correct;
+every subsequent identical-prompt call is wrong, forever, for the rest of
+that boot's life.
+
+**Decisive A/B: `ARLE_DISABLE_PREFIX_CACHE=1` eliminates it completely.**
+Rebooted with the diagnostic prefix-cache-off toggle (left in place from an
+earlier round) and reran the identical 20-rep solo-repeat sweep:
+**20/20 correct** (`'The secret access code is 738291.'` / `'738291'`,
+matching natural EOS-driven length variation, zero corruption). Cache ON
+20/20 wrong vs cache OFF 20/20 correct, same prompt, same boot type, only the
+toggle differs — clean, decisive, 100%-reproducible A/B.
+
+**This is a genuinely separate bug from the one this doc has been chasing all
+day**, isolated to a harness design point: `trace_probe.py`'s
+`TRACKED-FIXED...` prompt is intentionally byte-identical across every
+solo/concurrent call within a boot (needed for token-level tracking). Once
+any call populates `RadixCache` for that exact token sequence, every later
+call reading that cached prefix — solo or concurrent, doesn't matter —
+produces a wrong decode, deterministically. **This directly implicates the
+`Token-ID-level diff trace`, `Logit-lens layer diff`, and `MHC TF32`-blocked
+rounds above**, all of which used this same fixed, repeated prompt as their
+"solo reference" / "TRACKED row" — those rounds' "corrupted concurrent vs
+clean solo" comparisons may have been characterizing *this* RadixCache-reuse
+defect (or a superset including it), not cleanly isolating the original
+n≥3-concurrency-only race. (The earlier `ARLE_DISABLE_PREFIX_CACHE` A/B in
+the KV-reuse section did **not** already cover this: it ran against
+`concurrent_needle_v3.py`, whose every prompt is uniquely salted per trial —
+structurally incapable of ever hitting a stale self-prefix, so that test
+never touched this mechanism.)
+
+**Root cause not localized this pass** (out of scope — this was a discovery,
+not a chase): whether the wrong cached value stems from an incomplete
+snapshot/restore of DSv4's non-KV per-request state (compressor ring
+position, DSA indexer history, MHC intermediate buffers — the exact class of
+gap the `2026-06-06 DSv4 EAGLE rollback` anchor already found once, i.e.
+`truncate_decode_len` restoring `compressed.seq_len` but not
+`pending_kv`/`prev_overlap`) versus a lossy KV store/reload path, is an open
+question for a dedicated follow-up. **Left in the tree as a live, licensed
+follow-up target** — cheap to reproduce (20 reps, ~10s, one boot, one toggle).
+
+### Confirmed the original (fresh-content, n≥3) bug is real and independent of the RadixCache-repeat defect
+
+Wrote `concurrent_stage_probe.py` — same digit-needle design, but **every
+row's prompt is uniquely salted every call** (no repeated exact prompt,
+structurally immune to the RadixCache-repeat defect above). Fresh boot
+(prefix cache ON, default), fired the **literal first-ever request** as a
+concurrent n=4 call: clean, 4/4 exact. Five more concurrent reps against the
+now-warm server: the **uniquely-salted filler rows** (never repeated, never
+cache-hit) corrupted at the classic truncation rate (1–3 of 3 non-tracked
+rows missing per rep, `'The secret access code is 738.'` /
+`'...7382.'`-class truncations) while a row using the OLD fixed/repeated
+`TRACKED-FIXED` prompt stayed content-correct throughout (only a cosmetic
+leading `"\n\n"` difference after its first repeat) — confirming the
+fresh-content bug and the repeat-cache bug are two distinct, independently
+reproducible mechanisms, and the original one is still live and unexplained.
+
+### Cleanest reproduction of the day: byte-identical concurrent rows, same instant
+
+Sent **N=4 byte-identical prompts** (same exact text, same token IDs, same
+KV-page-population history — a fresh boot, first admissions) concurrently,
+with prefix cache OFF (avoids the repeat-cache defect while preserving the
+real batching path). Result across 8 trials: a **mix of hit/miss every time**
+(e.g. `miss=[0,2,3]`, `miss=[2,3]`, `miss=[1,3]`, `miss=[1,2]`) — proof the
+defect is a pure per-row/slot effect, **fully independent of prompt content**
+(every row has literally the same tokens), the tightest isolation of the
+"requires n≥3" characterization obtained all day.
+
+**Substage diff on this design** (5 mixed trials captured with the full
+0–42-layer, full-16-step stage window): re-ran the killed session's
+sum-based per-row fingerprint diff, comparing corrupted-output rows against
+clean-output rows **within the same batched call** (zero cross-trial timing
+noise, zero content confound — only row/slot identity differs).
+
+- **Floor-computation caveat found**: 2 of 5 trials had only ONE clean row
+  available, making the clean-vs-clean floor trivially `0` (no pair to
+  compare) and the derived threshold degenerate (`max(0*5, 1e-3)`) — this
+  falsely flagged nearly every stage/layer/position as "divergent" starting
+  at layer 0, which is a floor-computation artifact, not a real finding
+  (needs ≥2 clean instances for a meaningful floor; `diff_stage_probe.py`/
+  `diff_identical.py` should skip or flag single-clean-row trials, not silently
+  produce a near-zero threshold).
+- **The 3 of 5 trials with a real floor (≥2 clean rows, floor ≈ 700–2100)
+  showed ZERO sum-level divergent points anywhere** in the full captured
+  window (all 43 layers × all 8 substages × the row's own full 9-step decode
+  range) between eventually-corrupted rows and clean rows.
+- A finer per-element check (comparing the `argmax`/`argmin` element-index
+  fields, not just the row sum) found a weak, scattered signal in one of the
+  three floor-valid trials (`attn_out` argmax cluster-split at layers 3, 5,
+  and 39) and zero in the other two — not a single, clean, reproducible
+  localization.
+
+**Conclusion: the sum/index-level substage fingerprint this pass reused is
+too coarse for this defect class.** This is consistent with (not
+contradicting) the earlier `Logit-lens layer diff` round's own
+characterization — "a small, layer-local numerical perturbation... not a
+single clean early-layer or late-layer culprit" — a whole-row `sum` or a
+single extremum index can miss a change confined to one or a few of a row's
+~thousands of hidden dimensions. **The exact first-divergent-substage
+localization asked for by this round's brief remains open** — the right next
+probe is a per-dimension trajectory (max-abs-diff vector, not a scalar sum)
+or the LM-head top-1 lens the earlier round already proved sensitive, applied
+to *this* pass's byte-identical/same-instant design (which is a strictly
+cleaner control than that round's cross-boot solo-vs-concurrent comparison,
+since it removes the B=1-CUDA-graph-vs-B>1-batched structural confound
+entirely — solo/n=1 decode bypasses `stage_all`'s call site altogether,
+running through a separate, uninstrumented CUDA-graph-replay lane, so a
+solo-vs-concurrent substage comparison was never apples-to-apples in the
+first place; same-instant same-content cross-row comparison is).
+
+**Pod-side artifacts left for reuse** (not committed — pod-only harness
+scripts, consistent with this doc's existing pattern):
+`/host/arle-build/concurrent_stage_identical.py` (byte-identical-prompt
+harness — the cleanest repro), `concurrent_stage_probe.py` (unique-salt
+harness), `concurrent_stage_probe_fixed.py`, `diff_identical.py`,
+`diff_cstage_fixed.py`, `boot_stage_probe_nopfx_wide.sh` (prefix-cache-off,
+wide `ARLE_PROBE_STAGE_POS_MIN/MAX=440/510` boot), `drive_cstage_fixed.sh`,
+plus the captured `stage_probe.jsonl` (~32 MB, 8 identical-prompt trials'
+worth of full-stack substage data) and manifests. The instrumentation itself
+(`ARLE_PROBE_STAGES` in `crates/infer-cuda/src/{dsv4,attention,probe}.rs`,
+off by default) is committed alongside this entry — reusable for the next
+pass without re-instrumenting.
