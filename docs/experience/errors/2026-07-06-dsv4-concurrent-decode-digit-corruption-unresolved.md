@@ -2717,3 +2717,105 @@ suspicious and worth an explicit same-slot-vs-different-slot A/B.
 All instrumentation reverted after use (`ARLE_DSV4_TRUNCATE_TRACE` trace in
 `executor.rs`) — `git diff` clean on both local and pod trees, confirmed via
 `scripts/pod.sh sync`.
+
+## Capture/restore idempotency byte-diff — CLEAN through 5 cycles × 20 independent capture points; capture/restore fidelity KILLED as the mechanism (2026-07-08)
+
+Executes the prior round's #1-priority next step: "hash/byte-compare the
+captured `Dsv4LayerImage` at capture time against a second capture taken
+immediately after restoring it back into the *same* slot with *zero* compute
+in between."
+
+**Harness.** Added a field-by-field `diff_summary` to `Dsv4SlotSnapshot` /
+`Dsv4LayerImage` / `Dsv4CompressorImage` / `Dsv4FlashMlaImage` /
+`Dsv4DsaOfficialImage` (compares every `Vec<half::bf16>`/`Vec<u8>` element-wise
+and every scalar, reports element/byte count + first divergent index +
+before/after value on mismatch — empty result = bit-identical). Wired an
+env-gated probe (`ARLE_DSV4_ROUNDTRIP_TRACE=<n>`) directly into
+`capture_cached_prefix` (`executor.rs:2547`, right after the real
+`swap_out_image` call that produces the production `image`): for `n` cycles,
+`swap_in_image(prev)` into the SAME live slot (no `mirror_restore_pages`, no
+page reallocation — the slot's page table is untouched) → `swap_out_image()`
+→ diff `prev` vs the new capture → log → `prev = new capture`; the slot is
+left holding the original image afterward so the request's own decode is
+unaffected. This tests the `swap_out_image ∘ swap_in_image` composition in
+total isolation from every other moving part in the real restore path
+(`mirror_restore_pages`'s page-table remap, `truncate_decode_len`,
+cross-request bookkeeping) — and needs only ONE real request per capture
+point, not a multi-request orchestration, since the round trip runs inline at
+the capture site.
+
+**Run.** Pod-built (`cargo build --release --features cuda,nccl --bin arle`,
+`BUILD_EXIT=0`). Booted DSv4 TP=4 (GPUs 2/3/4/5, all otherwise-idle; GPU 0
+carries another user's job and was avoided), same env as the prior
+`ARLE_DSV4_TRUNCATE_TRACE` round (`ARLE_DSV4_MOE_BACKEND=allreduce`,
+`ARLE_DSV4_INCREMENTAL_KV=1`, `ARLE_DSV4_EXPERT_BACKEND=deepgemm`) plus
+`ARLE_DSV4_ROUNDTRIP_TRACE=5`. Ran `trace_probe.py`'s solo (n=1) repeat-prompt
+harness for 20 reps — the SAME harness/config that reproduces the
+`738291`→`738292` corruption at 19/20 from call 2 onward.
+
+**Corruption reconfirmed, same signature, same run:** call 1 correct
+(`'The secret access code is 738291.'`), calls 2-20 (19/20) wrong, all
+byte-identical `'The secret access code is 738292.'`.
+
+**Every one of the 400 round-trip probe log lines (20 capture points × 5
+cycles × 4 TP-rank-redundant executor instances) reports CLEAN — zero byte
+diffs, zero exceptions:**
+
+```
+DSV4_ROUNDTRIP_TRACE slot=0 cycle=1: CLEAN (image_1 == image_2)
+DSV4_ROUNDTRIP_TRACE slot=0 cycle=2: CLEAN (image_2 == image_3)
+DSV4_ROUNDTRIP_TRACE slot=0 cycle=3: CLEAN (image_3 == image_4)
+DSV4_ROUNDTRIP_TRACE slot=0 cycle=4: CLEAN (image_4 == image_5)
+DSV4_ROUNDTRIP_TRACE slot=0 cycle=5: CLEAN (image_5 == image_6)
+```
+(×4 ranks, ×20 capture points — `grep -c CLEAN serve_rt2.log` = 400, `grep
+DSV4_ROUNDTRIP_TRACE serve_rt2.log | grep -v CLEAN` = empty.) Critically, the
+capture points for reps 2-20 are the exact same capture events that sit
+immediately downstream of a request whose OWN prior restore (via the
+production `restore_cached_prefix` path, not this probe) had just produced a
+corrupted `738292` decode — i.e. the round-trip probe stayed clean even on a
+live slot whose content, moments earlier, drove a wrong output. This is 5×
+the minimum cycle depth the task asked for (image₁→restore→image₂ compared,
+then extended to image₂→restore→image₃, ... image₅→restore→image₆), run 20
+independent times, with zero divergence at any point.
+
+**Verdict: capture/restore fidelity (the `swap_out_image ∘ swap_in_image`
+composition itself, isolated from page-table remap and cross-request
+bookkeeping) is definitively NOT the mechanism.** This kills the prior
+round's #1-ranked suspect outright, not just deprioritizes it — the doc's own
+falsification criterion ("if it is bit-identical, the round-trip mechanism
+itself is innocent") is met at 5× the required depth. Every CUDA-level
+mechanism this investigation has named is now closed: races/fences (RULED
+OUT, stream-discipline audit), arithmetic invariance (RMSNorm + both FP8 GEMM
+paths, PROVEN), field completeness (enumeration audit, all 19 buffer groups
+accounted for), and now round-trip fidelity (this round, PROVEN clean to 5
+cycles).
+
+**What remains, per the doc's own pre-registered fallback.** Two candidates,
+neither attempted this round (scope: diagnosis only):
+1. **A stale-but-technically-present derived value computed on the FIRST
+   compute step after restore, not encoded in the `Image` bytes at all** —
+   e.g. `flashmla_set_band_cursor(slot_idx, image.seq_len)`
+   (`dsv4.rs:1219-1221`, called by the production `swap_in_image` wrapper
+   AFTER the per-layer `restore_to` calls, not part of any `*Image` struct)
+   or any other post-restore recomputation keyed off `seq_len`/position that
+   this round's per-`Image`-field diff cannot see by construction (the probe
+   only diffs what `Dsv4SlotSnapshot`/`Dsv4LayerImage` serialize — anything
+   mutated outside that struct is invisible to it, by design of this specific
+   test, not because it was checked and found clean).
+2. **`mirror_restore_pages`'s page-table remap step**, the enumeration
+   audit's other named follow-up: this round's probe deliberately avoided
+   this variable (same slot, untouched page table, no remap) specifically to
+   isolate `swap_out_image`/`swap_in_image` in the pure sense; the production
+   `restore_cached_prefix` path (`executor.rs:2668`) calls
+   `mirror_restore_pages(slot, slot_pages, image_len)` BEFORE `swap_in_image`
+   on every real repeat-prompt restore, reassigning `page_indices[slot]` to a
+   freshly-resolved `slot_pages` set — a variable this round's harness holds
+   constant by construction. The same-slot-vs-different-slot A/B named in the
+   enumeration-audit round remains the right next probe for this axis, and
+   was not attempted here per this round's brief.
+
+All instrumentation reverted after use (`diff_summary` methods on the four
+`*Image` types + the `ARLE_DSV4_ROUNDTRIP_TRACE` hook in
+`capture_cached_prefix`) — `git diff` clean on both local and pod trees
+(confirmed `git diff --stat` empty on both, both at `20871e531`).
