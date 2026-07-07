@@ -1,0 +1,33 @@
+scripts/gen_terminal_tasks.py
+  s_a85c4fa69afb58::t_62e646468970c7 668-669
+  s_a85c4fa69afb58::t_6b8e14088b5dd2 670-671
+  s_9c91b86ec3fb55::t_b7cb8ddeb9b73c 661-663,666
+crates/infer-cuda/src/attention/kv_layout.rs
+  s_9c91b86ec3fb55::t_ba09ded248e5a6 148-153,492-505,583,787-790
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "4f589cfb22a4d58430c5e70505e6a54d25f943fe",
+  "prompts": {},
+  "sessions": {
+    "s_9c91b86ec3fb55": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4779911a-69b7-49db-bc83-daf5a48d6ca3",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_a85c4fa69afb58": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a2f6ff7fcd81fc70f",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
