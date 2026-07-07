@@ -1,56 +1,36 @@
-# DSv4 decode alloc-removal sweep — wall-clock WASH (async alloc/memset overlap the GPU)
+# DSv4 decode alloc-removal (commit 1+2) — A/B wall-clock unchanged
 
-> Status: KILL (wall-clock) — 2026-07-07. Code kept (correctness-clean cleanup); sweep halted.
+> Status: measured — 2026-07-07. Code landed; sweep halted.
 
-## Context
-Launch-bound plan Step 1 (`docs/plans/2026-07-07-dsv4-decode-launch-bound-plan.md`):
-DSv4 B=1/MTP decode nsys showed `cudaLaunchKernel` 39.8% + `cuStreamSynchronize`
-26.6% = 66% wall, and `cuMemAllocAsync`+`Free` (7.7%) + `cuMemsetD8Async` (9.1%)
-= 16.8% wall of per-step device allocation, zero `cuGraphLaunch`. Hypothesis:
-pooling the ~45 per-layer allocs recovers ~10-12% TPOT. Landed commit 1
-(shared-expert scratch, `de6fc4fd`) + commit 2 (MoE-tail 8-buffer scratch,
-`4f589cfb`), both correctness-verified (coherent greedy decode).
+## Changes landed
+- commit `de6fc4fd`: `forward_decode_batch_stream_impl` shared-expert switched from
+  per-layer `dsv4_shared_expert_forward` (`HiddenStates::uninit` + 6 allocs + 4 H2D)
+  to `dsv4_shared_expert_forward_decode_scratch` reusing `kv_adapter.shared_expert_scratch`.
+- commit `4f589cfb`: `dsv4_moe_forward_decode_fp8` 8 per-layer buffers replaced by
+  `Dsv4MoeTailScratch` (band ceiling 128 rows) on the kv_adapter; per step re-init
+  counts=0, cursors=0, route_out=0, packed_route_slot=-1.
+- Both compiled BUILD_EXIT=0 (cuda,nccl,deepep), clippy-clean.
 
-## Measurement (the KILL)
-Matched A/B, same binary-vs-parent, same prompt/256-tok/greedy/TP=4/EP=4/MTP-on,
-DSv4-Flash-FP8, GPU 4-7, 3 runs each, `time_total` + `usage.completion_tokens`:
+## Correctness (greedy, TP=4/EP=4, DSv4-Flash-FP8, GPU 4-7, MTP-on)
+- commit 1: "capital of France" → reasoning_content "…the answer is straightforward: Paris."
+- commit 2: "capital of France" → content "Paris"; "three primary colors" → coherent reasoning.
+- No garbage / NaN / empty generation.
 
-| | runs (s) | mean | tok/s |
+## A/B (same prompt, max_tokens=256, temperature=0, TP=4, MTP-on, 3 runs each)
+| | runs (s) | mean (s) | tok/s |
 |---|---|---|---|
-| baseline (`c59aab9c`) | 5.573 / 5.602 / 5.631 | 5.602 | 45.70 |
-| c1+c2 pooled | 5.557 / 5.632 / 5.573 | 5.587 | 45.82 |
+| baseline `c59aab9c` | 5.573 / 5.602 / 5.631 | 5.602 | 45.70 |
+| c1+c2 | 5.557 / 5.632 / 5.573 | 5.587 | 45.82 |
 
-**Δ = −0.27% wall — inside the ±0.7% run-to-run noise. WASH.**
+Δ mean wall −0.27%. Per-group run-to-run spread ±0.7%.
 
-## Root cause of the mis-inference
-The 16.8% "alloc+memset wall" is an **API-time** share, not recoverable wall. On
-an async CUDA pipeline, `cuMemAllocAsync`/`cuMemsetD8Async` are stream-queued and
-**overlap GPU compute** — they do not block the wall. The wall is gated by the
-per-step `ctx.sync()` (`ops.rs:467`, the 26.6% `cuStreamSynchronize`) + the serial
-GPU chain + cross-process TP lockstep. Removing allocs cuts host-side launch/API
-time that was **already hidden behind the GPU**, so wall doesn't move.
-
-This is a verbatim repeat of `errors/2026-06-20-host-launch-bound-misinference-decode-is-foundation-bound.md`:
-a profiler `API% ≈ wall` does NOT prove the API work is the wall — in an async
-pipeline it overlaps and is hidden. The deciding evidence is the A/B, not the
-profiler share. I re-inferred past my own recorded lesson (again).
+## nsys (existing `/host/kern141_decode2.nsys-rep`, 07-03, TP=4, MTP-on)
+- `cudaLaunchKernel` 39.8% wall, `cuStreamSynchronize` 26.6%, zero `cuGraphLaunch`.
+- `cuMemAllocAsync`+`cuMemFreeAsync` 12.2M calls / 7.7% wall; `cuMemsetD8Async` 2.4M / 9.1%.
+- `ctx.sync()` per decode step at `crates/infer-cuda/src/ops.rs:467`.
 
 ## Disposition
-- **Code kept**: commit 1+2 are correctness-clean, reduce alloc churn by
-  construction, and match the eager-path scratch discipline — a legitimate
-  cleanup. NOT a perf win; the wins entries are re-labeled accordingly.
-- **Commit 3 (attn/ffn stream double-buffer + N-ring) KILLED before implementation**:
-  same async-overlap fate; the remaining allocs are also hidden behind the GPU.
-- **The real wall lever is foundation, not allocs/kernels**: per-step `ctx.sync`
-  → device-side sampling (let host run ahead), and 4-process TP → single-process
-  TP (kill the per-tick cross-process barrier). Both are architecture changes,
-  out of the kernel/alloc scope. Do NOT attack decode wall via kernel/alloc
-  micro-opts again without first moving the ctx.sync/lockstep foundation.
-
-## Rule
-Before pooling/fusing to cut a profiler API% (alloc, memset, launch), confirm the
-work is NOT already overlapped by the GPU — async ops queued on the compute stream
-are hidden behind kernels and their API% is unrecoverable wall. The isolating test
-is a wall-clock A/B, and on a per-step-synced decode pipeline the answer is almost
-always WASH. The lever is the sync/lockstep that stops host run-ahead, not the
-overlapped API work. (3rd time this exact trap: see 2026-06-20, 2026-06-08.)
+- commit 1+2 kept.
+- commit 3 (attn/ffn stream double-buffer + N-ring) not implemented.
+- Prior related entries: `errors/2026-06-20-host-launch-bound-misinference-decode-is-foundation-bound.md`,
+  `errors/2026-06-08-dsv4-decode-graph-wash-launch-gap-is-framing.md`.
