@@ -1,0 +1,21 @@
+crates/infer-cuda/src/executor.rs
+  s_f6590607052cd9::t_690a21741d5f1b 2657-2676,2680-2681
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "da1135f2bcbeb0d5de28a8d8860cfd47957f46f9",
+  "prompts": {},
+  "sessions": {
+    "s_f6590607052cd9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a3104a2a0c57b9e87",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
