@@ -202,6 +202,16 @@ pub(crate) enum SaveDtypeArg {
     Bf16,
 }
 
+/// Teacher source for `agent-opd --gkd` (per-token teacher-KL) replay.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+pub(crate) enum GkdTeacherArg {
+    /// A slow EMA of the student (a stabilizing self-teacher, zero extra model).
+    Ema,
+    /// The student's frozen initial adapter+base snapshot (never EMA-updated).
+    #[value(name = "self")]
+    SelfFrozen,
+}
+
 impl SaveDtypeArg {
     pub(crate) fn as_train_dtype(self) -> &'static str {
         match self {
@@ -1680,6 +1690,31 @@ pub(crate) struct TrainAgentOpdArgs {
     /// Render output as JSON for scripts and CI.
     #[arg(long, default_value_t = false)]
     pub(crate) json: bool,
+
+    /// GKD mode for --replay-records: distil a TEACHER's per-position
+    /// distribution on the trajectory tokens (forward-KL) instead of masked
+    /// next-token CE. Denser signal than reproduction-only RFT. CUDA only.
+    #[arg(long, default_value_t = false)]
+    pub(crate) gkd: bool,
+
+    /// GKD teacher source (with --gkd): `ema` (a slow EMA of the student) or
+    /// `self` (the student's frozen initial adapter+base snapshot).
+    #[arg(long, value_enum, default_value_t = GkdTeacherArg::Ema)]
+    pub(crate) gkd_teacher: GkdTeacherArg,
+
+    /// GKD softmax temperature for the teacher-KL distill loss.
+    #[arg(long, default_value_t = 1.0)]
+    pub(crate) gkd_temperature: f32,
+
+    /// AEPO entropy weighting for --gkd: scale each position's KL by
+    /// `(1 + w * normalized_student_entropy)`. 0 = off. NOTE: not yet wired —
+    /// a positive value logs a TODO and runs unweighted KL.
+    #[arg(long, default_value_t = 0.0)]
+    pub(crate) gkd_entropy_weight: f32,
+
+    /// EMA decay for `--gkd-teacher ema` (θ_ema ← α·θ_ema + (1−α)·θ_student).
+    #[arg(long, default_value_t = 0.999)]
+    pub(crate) gkd_ema_alpha: f32,
 }
 
 #[cfg(test)]
