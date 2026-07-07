@@ -297,6 +297,14 @@ struct RequestState {
     phase: RequestPhase,
     prefill_start_pos: usize,
     reused_prefix_pages: Vec<BlockId>,
+    /// Set once a restore (page-radix attach or DSv4 position-0 image
+    /// restore) supplied any of this request's KV. A position-0 image
+    /// captured from a slot whose KV is part-restored, part-recomputed is
+    /// not proven equivalent to a genuinely fresh single-pass capture (see
+    /// docs/experience/errors/2026-07-06-dsv4-concurrent-decode-digit-corruption-unresolved.md,
+    /// "full-match wrong-seed-token fix" follow-up) — never re-publish from
+    /// such a slot, only from a slot that prefilled entirely from scratch.
+    used_prefix_restore: bool,
     /// Whole-slot tier key while this request's complete restore image is
     /// swapped out. Re-admission promotes and resumes decode; generated tokens
     /// are kept.
@@ -340,6 +348,7 @@ impl RequestState {
             phase: RequestPhase::Prefilling { progress: 0 },
             prefill_start_pos: 0,
             reused_prefix_pages: Vec::new(),
+            used_prefix_restore: false,
             swap_key: None,
             swap_seq_len: 0,
             finish: None,
@@ -360,6 +369,7 @@ impl RequestState {
         self.phase = RequestPhase::Prefilling { progress: 0 };
         self.prefill_start_pos = 0;
         self.reused_prefix_pages.clear();
+        self.used_prefix_restore = false;
         // Store-entry lifetime is the caller's job (drop before reset); the
         // key is cleared so a recomputed request can never promote stale state.
         self.swap_key = None;
@@ -928,8 +938,14 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                 // after the loop to keep the `&mut self` capture call disjoint
                 // from the request borrow; the executor re-asserts
                 // `slot.seq_len == prompt_len` and stores nothing if the slot is
-                // misaligned (no-op when the store is disabled).
-                prefill_completed_slots.push(row.slot);
+                // misaligned (no-op when the store is disabled). Skip entirely
+                // if any of this slot's KV came from a restore — the capture is
+                // supposed to be a from-scratch position-0 image; publishing one
+                // built on a restore hop is unproven and, empirically, corrupts
+                // the NEXT restore (see the errors doc's fix-verification round).
+                if !request.used_prefix_restore {
+                    prefill_completed_slots.push(row.slot);
+                }
                 if let Some(token) = tokens_by_slot
                     .get_mut(&row.slot)
                     .and_then(VecDeque::pop_front)
@@ -1034,8 +1050,13 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             .chain(request.generated_tokens.iter())
             .copied()
             .collect();
-        if let Err(err) = self.executor.capture_cached_prefix(slot, &full_tokens) {
-            log::debug!("finish_slot sidecar capture failed for slot {slot}: {err:#}");
+        // Gated the same way as the prefill-completion capture above: a
+        // restore-derived slot's snapshot is not a proven from-scratch
+        // position-0 image (see the errors doc's fix-verification round).
+        if !request.used_prefix_restore {
+            if let Err(err) = self.executor.capture_cached_prefix(slot, &full_tokens) {
+                log::debug!("finish_slot sidecar capture failed for slot {slot}: {err:#}");
+            }
         }
         self.publish_prefix_blocks(slot, &full_tokens);
         // free_slot BEFORE release_reused_prefix: reclaim_page sees page_refs>0
@@ -4311,6 +4332,47 @@ mod tests {
         );
         assert_eq!(engine.radix.cached_page_count(), 1);
         assert_eq!(engine.kv_free_pages(), engine.kv.total_pages() - 1);
+        Ok(())
+    }
+
+    #[test]
+    fn full_prefix_match_still_prefills_the_last_block() -> Result<()> {
+        // Regression for the wrong-seed-token bug
+        // (docs/experience/errors/2026-07-06-dsv4-concurrent-decode-digit-corruption-unresolved.md,
+        // "Layer-0-15 residual bisection"): a full-prompt radix match must
+        // never jump straight to `Decoding` with an empty `generated_tokens`,
+        // since the planner would then silently re-feed the prompt's own
+        // last token as the decode seed, duplicating it into KV. Two
+        // full 4-token blocks give the radix trie a full match on repeat.
+        let mut engine = Engine::with_config(
+            MockExecutor::ready(),
+            MockKvPool::with_capacity(1, 4, 8),
+            test_config(1),
+        );
+        let first = engine.submit_request(vec![1, 2, 3, 4, 5, 6, 7, 8], 1);
+        engine.run_to_idle()?;
+        assert_finished(engine.completed(first).expect("first completed"));
+        assert_eq!(engine.radix.cached_page_count(), 2, "both blocks published");
+
+        let second = engine.submit_request(vec![1, 2, 3, 4, 5, 6, 7, 8], 1);
+        engine.step()?; // admission + attach only; output not yet applied.
+
+        let (_, request) = engine
+            .active
+            .iter()
+            .find(|(_, request)| request.handle == second)
+            .expect("second admitted");
+        assert_eq!(
+            request.phase,
+            RequestPhase::Prefilling { progress: 4 },
+            "the last matched block must still be re-prefilled for real, \
+             never a direct jump to Decoding"
+        );
+        assert_eq!(
+            request.reused_prefix_pages.len(),
+            1,
+            "only the non-final matched block is reused from cache"
+        );
         Ok(())
     }
 
