@@ -53,14 +53,16 @@ generated tasks of that category (needs ⑤). Turns the flat STaR into a curricu
 that keeps producing gradient. *Depends on ⑤ for the "generate more" half; the
 "oversample" half is a loop-side reweight, doable now.*
 
-### ④ Compositional task generator (Tmax §5.1) — IN PROGRESS
+### ④ Compositional task generator (Tmax §5.1) — SHIPPED (`2d05f33fc`)
 `scripts/gen_terminal_tasks.py`: difficulty-calibrated, self-verifying,
 TB-compatible tasks over axes {domain × command-complexity × verifier × n-steps},
 each with a reference `solution.sh` + `tests/test_outputs.py`, gated by a
 Docker-free self-check (solution passes / un-solved fails). Feeds `tb run
---dataset-path`. This is the **root fix** — an unbounded difficulty-calibrated
-pool so the sweet-spot band never runs dry — and the supply side ③ consumes.
-*Leverage: highest · Cost: high.* **Delegated, building.**
+--dataset-path` (wired into the loop via `DATASET_PATH`). This is the **root
+fix** — an unbounded difficulty-calibrated pool so the sweet-spot band never runs
+dry — and the supply side ③ consumes. 40-task pool validated on the pod
+(easy/medium/hard 13/14/13, 6 domains, 24/24 self-check). *Leverage: highest.*
+**Next: run a loop on `DATASET_PATH=/host/gen_tasks` once ② reports (GPU-serial).**
 
 ### ⑤ Entropy-aware rollout + update (ARPO/AEPO) — DESIGN
 Our failure taxonomy is entropy-shaped: ~22/31 baseline fails were runaway
