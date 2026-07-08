@@ -24,6 +24,8 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 
@@ -31,6 +33,24 @@ def run(cmd, cwd, timeout=None, env=None):
     e = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1", **(env or {})}
     return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
                           timeout=timeout, check=False, env=e)
+
+
+def preflight(base):
+    """Fail fast if the serve isn't up — else every task eats CC's ~38s backoff."""
+    try:
+        with urllib.request.urlopen(f"{base}/v1/models", timeout=5) as r:
+            if r.status != 200:
+                sys.exit(f"serve at {base} returned {r.status}, not 200")
+    except (urllib.error.URLError, OSError) as e:
+        sys.exit(f"serve not reachable at {base}/v1/models: {e}")
+
+
+def cc_version():
+    try:
+        return subprocess.run(["claude", "--version"], capture_output=True,
+                              text=True, timeout=10).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
 
 
 def boot_workdir(staged, workdir, setup_cmd=None):
@@ -95,10 +115,15 @@ def cc_attempt(workdir, task, args):
         "with no edit is a failure. Do not write or run the hidden tests (they "
         "are applied at scoring time). Do not commit."
     )
+    # Allowlist keeps CC off WebFetch/WebSearch/Task — the sandbox is offline and
+    # one web call stalls on CC's ~38s retry-backoff. No turn-cap flag exists in
+    # CC 2.1.204; --cc-timeout is the runaway bound.
     cmd = ["claude", "-p", "--model", args.model,
-           "--max-turns", str(args.max_turns),
+           "--allowedTools", "Bash Read Write Edit Grep Glob",
            "--output-format", "json", "--dangerously-skip-permissions", prompt]
-    env = {"ANTHROPIC_API_KEY": "dummy-local", "ANTHROPIC_AUTH_TOKEN": ""}
+    # IS_SANDBOX=1 is mandatory: this container is root (uid 0) and
+    # --dangerously-skip-permissions refuses under root without it.
+    env = {"ANTHROPIC_API_KEY": "dummy-local", "IS_SANDBOX": "1"}
     try:
         r = subprocess.run(cmd, cwd=workdir, capture_output=True, text=True,
                            timeout=args.cc_timeout,
@@ -118,7 +143,8 @@ def main():
     ap.add_argument("--staged-root", type=Path, required=True)
     ap.add_argument("--work-root", type=Path, default=Path("/tmp/cc_baseline"))
     ap.add_argument("--model", default="default")
-    ap.add_argument("--max-turns", type=int, default=30)
+    ap.add_argument("--max-turns", type=int, default=30,
+                    help="no-op: CC 2.1.204 has no turn cap; bound via --cc-timeout")
     ap.add_argument("--cc-timeout", type=int, default=1800)
     ap.add_argument("--test-timeout", type=int, default=300)
     ap.add_argument("--task-limit", type=int)
@@ -134,11 +160,21 @@ def main():
     ap.add_argument("--out", type=Path, default=Path("cc_baseline_results.jsonl"))
     args = ap.parse_args()
 
-    if not os.environ.get("ANTHROPIC_BASE_URL"):
+    base = os.environ.get("ANTHROPIC_BASE_URL")
+    if not base:
         sys.exit("set ANTHROPIC_BASE_URL to the ARLE serve")
+    preflight(base)  # fail fast instead of eating CC's ~38s backoff per task
 
     tasks = [json.loads(l) for l in args.dataset.read_text().splitlines()
              if l.strip()][: args.task_limit]
+    # Config envelope — first line of the run, for reproducibility.
+    print("[cc-baseline] " + json.dumps({
+        "envelope": True, "base_url": base, "model": args.model,
+        "cc_version": cc_version(), "cc_timeout": args.cc_timeout,
+        "allowed_tools": "Bash Read Write Edit Grep Glob",
+        "dataset": str(args.dataset), "tasks": len(tasks),
+        "samples": args.samples,
+    }), flush=True)
     results, windows = [], []
     for task in tasks:
         iid = task["instance_id"]
