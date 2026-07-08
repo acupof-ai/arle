@@ -1672,7 +1672,7 @@ impl QwenCudaExecutor {
             // Mirror to the tier first; only drop if it took a durable copy.
             let key = tier_block_u64(slot as u64, logical as u64);
             if !self.write_through(key, physical)? {
-                continue; // tier full → keep the page resident (no KV loss)
+                continue; // tier full → keep page resident (no KV loss)
             }
             // Free the physical page from BOTH pools (the real free). Host first so
             // the device pool's `page_indices` (read above) is still valid for the
@@ -2472,18 +2472,10 @@ impl Dsv4CudaExecutor {
         true
     }
 
-    /// The ring-snapshot pool only fires when a forward call's END position
-    /// lands on a `sliding_window` multiple. A prompt completed in one call
-    /// only ever visits one such position — its own end — so without forcing
-    /// prefill chunk ends onto this alignment, `reusable_prefix_blocks`'s
-    /// first checked boundary is never resident and every match fails.
+    /// The ring snapshot only fires at a call's own end position — without
+    /// this, a single-call prefill never visits an earlier boundary.
     pub(crate) fn prefill_restore_boundary_alignment(&self) -> usize {
-        let sliding_window = self.model.config.sliding_window;
-        if sliding_window > 0 {
-            sliding_window
-        } else {
-            1
-        }
+        self.model.config.sliding_window.max(1)
     }
 
     /// Only the LAST compress-block in each KV page needs to be resident
@@ -4425,33 +4417,18 @@ impl Qwen35CudaExecutor {
         )
     }
 
-    /// One prefill row over the paged recall pool (`--kv-recall`), and the ONE
-    /// place the whole recall cycle runs (the write-through model's non-negotiable
-    /// rule: "decode 不召回; prefetch 只在 prefill; 其他时机不交互").
+    /// One prefill row over the recall pool (`--kv-recall`). The ONLY place the whole
+    /// recall cycle runs (write-through model: "decode 不召回; prefetch 只在 prefill").
     ///
-    /// 1. Self-allocate the prompt tokens, build the full-resident page table, run
-    ///    the paged forward — this writes the new KV and reads back the layer-0
-    ///    prefill query (`rc.layer0_query`, the mean of the last `m` prompt tokens'
-    ///    post-RoPE queries; see `full_attention_paged`).
-    /// 2. Score the whole history against that query (`recompute_recall_plan`,
-    ///    `allow_prefetch=true`): pick the working set (sink + local + top-k
-    ///    relevant blocks), choosing `evict_pages` (cold middle to drop) and
-    ///    `prefetch_pages` (chosen blocks that are tier-resident sentinels).
-    /// 3. Batched-H2D prefetch the chosen tier-resident blocks back into HBM
-    ///    (`reinstate_slot_page` + `copy_pages_from_host`), then resolve the FIXED
-    ///    `recall_pages` working set the decode steps will attend.
-    /// 4. Write-back-evict the cold middle (`copy_pages_to_host` → `tier.insert`)
-    ///    and free its physical pages IMMEDIATELY (`evict_slot_page`): prefill's
-    ///    forward + sampling already drained the compute stream, so there is no
-    ///    in-flight attention to race — no decode-step keepalive needed.
+    /// 1. Self-allocate tokens, run paged forward — captures layer-0 query for scoring.
+    /// 2. Score history (`recompute_recall_plan`): select evict + prefetch pages.
+    /// 3. Batched-H2D prefetch tier-resident blocks, resolve fixed `recall_pages` working set.
+    /// 4. Write-back-evict cold middle to tier, free physical pages immediately (no in-flight attn race).
     ///
-    /// After this returns, `self.recall[slot].recall_pages()` holds the immutable
-    /// working set; decode does nothing but append + attend it (see
-    /// [`Self::decode_row_recall`]).
+    /// After return, `recall[slot].recall_pages()` is the immutable working set for decode.
     fn prefill_row_recall(&mut self, row: &infer_plan::PrefillRow, position: u64) -> Result<u32> {
         let slot = row.slot;
         let cfg = self.recall_cfg;
-        // Self-allocate the new tokens (extends the page table + pool seq_len).
         {
             let pool = self
                 .full_attn_kv
@@ -4469,9 +4446,7 @@ impl Qwen35CudaExecutor {
                 row.tokens.len(),
             )?
         };
-        // (1) Forward (paged prefill). Borrow split: forward needs &model +
-        // &mut slots[slot] + &mut workspace + &mut pool (through rc). `rc` carries
-        // back the layer-0 prefill query for the recall score below.
+        // (1) Forward. Borrow split: &model + &mut slot + &mut workspace + &mut pool (via rc). `rc` carries back layer-0 query.
         let (token, layer0_query) = {
             let Self {
                 model,
@@ -4511,8 +4486,7 @@ impl Qwen35CudaExecutor {
             ps
         );
 
-        // Score history against prefill query, plan fixed working set.
-        // `allow_prefetch=true` lets tier-resident blocks re-enter.
+        // Score history against prefill query, plan fixed working set. `allow_prefetch=true` lets tier-resident blocks re-enter.
         let num_q_heads = self.model.local_q_heads();
         let num_kv_heads = self.model.local_kv_heads();
         let head_dim = self.model.config.head_dim;
@@ -4543,8 +4517,7 @@ impl Qwen35CudaExecutor {
             }
         };
 
-        // Prefetch tier-resident blocks back into HBM (alloc fresh page, H2D, patch sentinel).
-        // Decode never does this — one batched prefill sync point.
+        // Prefetch tier-resident blocks back into HBM. Decode never does this — one batched prefill sync point.
         for logical in prefetch_pages {
             let key = tier_block_u64(slot as u64, logical as u64);
             let Some(tier) = self.recall_tier.as_mut() else {
@@ -4552,7 +4525,7 @@ impl Qwen35CudaExecutor {
             };
             let payload = match tier.read(key) {
                 Ok(p) => p.into_owned(),
-                Err(_) => continue, // tier dropped it (LRU/capacity) → stays evicted
+                Err(_) => continue,
             };
             if let Some(pool) = self.full_attn_kv.as_mut() {
                 if let Some(new_page) = pool.reinstate_slot_page(slot, logical) {
@@ -4561,15 +4534,13 @@ impl Qwen35CudaExecutor {
             }
         }
 
-        // Resolve fixed working-set page list now that prefetch patched sentinels.
         if let Some(state) = self.recall.get_mut(slot) {
             if let Some(pool) = self.full_attn_kv.as_ref() {
                 state.resolve_recall_pages(pool, slot);
             }
         }
 
-        // Write-back-evict cold middle: mirror to L3 tier, free physical pages immediately.
-        // Prefill already drained compute stream — no in-flight attention race.
+        // Write-back-evict cold middle: mirror to L3, free physical pages. Prefill drained compute stream — no in-flight attn race.
         for logical in evict_pages {
             let physical = {
                 let pool = self.full_attn_kv.as_ref().expect("full_attn_kv");
@@ -4579,7 +4550,7 @@ impl Qwen35CudaExecutor {
                     .filter(|&p| p != cuda_kernels::prelude::EVICTED_PAGE)
             };
             let Some(physical) = physical else {
-                continue; // already evicted
+                continue;
             };
             let key = tier_block_u64(slot as u64, logical as u64);
             let mirrored = {
@@ -4593,7 +4564,7 @@ impl Qwen35CudaExecutor {
                 }
             };
             if !mirrored {
-                continue; // tier full → keep the page resident (no KV loss)
+                continue; // tier full → keep page resident (no KV loss)
             }
             if let Some(pool) = self.full_attn_kv.as_mut() {
                 pool.evict_slot_page(slot, logical);
@@ -4602,12 +4573,8 @@ impl Qwen35CudaExecutor {
         Ok(token)
     }
 
-    /// One decode row over the paged recall pool (`--kv-recall`): append + attend,
-    /// ZERO tier I/O (write-through model rule: "decode 不召回; prefetch 只在 prefill").
-    /// Whole recall cycle ran once at prefill and fixed the working set.
-    /// 1. Alloc this step's token (extends tail page).
-    /// 2. Read fixed `recall_pages` working set (or full list if under budget).
-    /// 3. Forward over that page table (paged decode) + sample.
+    /// One decode row over the recall pool (`--kv-recall`): append + attend, ZERO tier I/O.
+    /// Working set fixed at prefill. Alloc token, read fixed `recall_pages`, forward + sample.
     fn decode_row_recall(&mut self, row: &DecodeRow, position: u64) -> Result<u32> {
         let slot = row.slot;
         {
@@ -4618,7 +4585,6 @@ impl Qwen35CudaExecutor {
             pool.alloc_tokens(slot, 1)?;
         }
         let cache_len = row.kv_seq_len + 1;
-        // Fixed working set from prefill; else full resident list (under budget). Read-only.
         let recall_pages: Vec<u32> = match self.recall.get(slot).and_then(|s| s.recall_pages()) {
             Some(p) => p.to_vec(),
             None => {
