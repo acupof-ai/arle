@@ -166,6 +166,7 @@ pub(crate) fn commit_layer_fold(
             compressor,
             gathered,
             compressor_state,
+            pool.compress_state_pool_mut(),
             head_dim,
             compress_ratio,
             overlap,
@@ -202,6 +203,7 @@ pub(crate) fn commit_layer_fold(
                     .expect("DSv4 CSA indexer has a key compressor"),
                 gathered,
                 indexer_state,
+                pool.indexer_compress_state_pool_mut(),
                 config.index_head_dim,
                 compress_ratio,
                 true,
@@ -3956,6 +3958,7 @@ fn compressor_forward_decode_graph(
     compressor: &Dsv4Compressor,
     hidden: &HiddenStates,
     state: &mut Dsv4CompressorState,
+    compress_pool: Option<&mut Dsv4CompressStatePool>,
     head_dim: usize,
     ratio: usize,
     overlap: bool,
@@ -3995,6 +3998,7 @@ fn compressor_forward_decode_graph(
         compressor,
         hidden,
         state,
+        compress_pool,
         head_dim,
         ratio,
         overlap,
@@ -4198,6 +4202,7 @@ pub(crate) fn mla_attention_decode_graph(
             state.compressor.as_mut().ok_or_else(|| {
                 anyhow!("DSv4 layer {layer_idx} is {mode:?} but has no compressor state")
             })?,
+            pool.compress_state_pool_mut(),
             head_dim,
             compress_ratio,
             compress_ratio < 16,
@@ -4263,6 +4268,7 @@ pub(crate) fn mla_attention_decode_graph(
                 indexer_compressor,
                 hidden,
                 indexer_state,
+                pool.indexer_compress_state_pool_mut(),
                 config.index_head_dim,
                 compress_ratio,
                 true,
@@ -5195,6 +5201,7 @@ pub(crate) fn mla_attention_prepare(
                     compressor,
                     hidden,
                     compressor_state,
+                    pool.compress_state_pool_mut(),
                     head_dim,
                     compress_ratio,
                     overlap,
@@ -5255,6 +5262,7 @@ pub(crate) fn mla_attention_prepare(
                             .expect("DSv4 CSA indexer has a key compressor"),
                         hidden,
                         indexer_state,
+                        pool.indexer_compress_state_pool_mut(),
                         config.index_head_dim,
                         compress_ratio,
                         true,
@@ -5659,6 +5667,10 @@ pub(crate) fn mla_attention_compressor_defer_row(
     layer_idx: usize,
     normed_row: &HiddenStates,
     state: &mut Dsv4LayerAttentionState,
+    // This layer's KV layout, for the main/indexer compress-state pool
+    // accessors (mirrors the other `mla_attention_*` orchestration functions,
+    // all of which already take `pool`).
+    pool: &mut Dsv4LayerKvLayout,
     start_pos: usize,
     start_pos_device: Option<&CudaSlice<i32>>,
     original_seq_len: i32,
@@ -5692,6 +5704,7 @@ pub(crate) fn mla_attention_compressor_defer_row(
             compressor,
             normed_row,
             compressor_state,
+            pool.compress_state_pool_mut(),
             head_dim,
             compress_ratio,
             overlap,
@@ -5736,6 +5749,7 @@ pub(crate) fn mla_attention_compressor_defer_row(
                 .expect("DSv4 CSA indexer has a key compressor"),
             normed_row,
             indexer_state,
+            pool.indexer_compress_state_pool_mut(),
             config.index_head_dim,
             compress_ratio,
             true,
@@ -5886,6 +5900,7 @@ pub(crate) fn mla_attention_prepare_compressed_only(
                     compressor,
                     normed_row,
                     compressor_state,
+                    pool.compress_state_pool_mut(),
                     head_dim,
                     compress_ratio,
                     overlap,
@@ -5950,6 +5965,7 @@ pub(crate) fn mla_attention_prepare_compressed_only(
                             .expect("DSv4 CSA indexer has a key compressor"),
                         normed_row,
                         indexer_state,
+                        pool.indexer_compress_state_pool_mut(),
                         config.index_head_dim,
                         compress_ratio,
                         true,
@@ -7439,6 +7455,13 @@ fn compressor_forward(
     compressor: &Dsv4Compressor,
     hidden: &HiddenStates,
     state: &mut Dsv4CompressorState,
+    // This layer's/sub-state's (main vs indexer) shared page-addressable pool
+    // for `prev_overlap_kv/score`. `Some` redirects BOTH the direct-FFI path
+    // and the deferred/batched path (via
+    // `Dsv4CompressorState::batched_update_ptrs`) to the pool instead of
+    // `state`'s own per-slot buffers. `None` is byte-identical to the
+    // single-register form.
+    compress_pool: Option<&mut Dsv4CompressStatePool>,
     head_dim: usize,
     ratio: usize,
     overlap: bool,
@@ -7516,7 +7539,7 @@ fn compressor_forward(
         );
         // Frozen-KV verify never advances state (P1-1) — same guard as the FFI path.
         if !dsv4_verify_frozen() {
-            sink.push(state.batched_update_ptrs(ctx));
+            sink.push(state.batched_update_ptrs(ctx, compress_pool));
             state.compressed.seq_len = compressed_rows;
         }
         return Ok(());
@@ -7593,8 +7616,25 @@ fn compressor_forward(
         let (norm_ptr, _ng) = compressor.norm.data.device_ptr(&ctx.stream);
         let (pkv_ptr, _pkg) = state.pending_kv.device_ptr_mut(&ctx.stream);
         let (psc_ptr, _psg) = state.pending_score.device_ptr_mut(&ctx.stream);
-        let (prkv_ptr, _prkg) = state.prev_overlap_kv.device_ptr_mut(&ctx.stream);
-        let (prsc_ptr, _prsg) = state.prev_overlap_score.device_ptr_mut(&ctx.stream);
+        // `compress_pool` present ⇒ resolve prev_overlap from the shared
+        // pool's base and pass its `ratio*head_dim` page stride; `None` ⇒
+        // resolve from `state`'s own per-slot buffer with stride 0 (collapses
+        // the kernel's indexing to the single-register form).
+        let (prkv_ptr, prsc_ptr, overlap_page_stride) = match compress_pool {
+            Some(pool) => {
+                let (kv, score) = pool.base_ptrs_mut(ctx);
+                (
+                    kv,
+                    score,
+                    Dsv4CompressStatePool::page_stride(head_dim, ratio),
+                )
+            }
+            None => {
+                let (kv, _kg2) = state.prev_overlap_kv.device_ptr_mut(&ctx.stream);
+                let (score, _sg2) = state.prev_overlap_score.device_ptr_mut(&ctx.stream);
+                (kv, score, 0)
+            }
+        };
         let (comp_ptr, _cg) = state.compressed.data.device_ptr_mut(&ctx.stream);
         let has_prev_overlap = i32::from(compressed_base > 0);
         // SAFETY: all buffers valid on ctx.stream; state carries the pending and
@@ -7619,6 +7659,7 @@ fn compressor_forward(
                         ratio as i32,
                         width as i32,
                         i32::from(overlap),
+                        overlap_page_stride as i32,
                         config.rms_norm_eps,
                         rope_dim as i32,
                         rope_base,
@@ -7649,6 +7690,7 @@ fn compressor_forward(
                         width as i32,
                         i32::from(overlap),
                         has_prev_overlap,
+                        overlap_page_stride as i32,
                         config.rms_norm_eps,
                         rope_dim as i32,
                         rope_base,
@@ -7859,10 +7901,13 @@ pub(crate) struct Dsv4IndexerQueryPrecomputed<'a> {
 }
 
 /// Host-gathered per-row device pointer arrays for one compressor's batched
-/// state update. Each `Vec`
-/// holds the N rows' `Dsv4CompressorState` ring-buffer pointers (as `u64`),
-/// uploaded to device `*_arr` arrays by [`dsv4_compressor_update_batched`]. Built
-/// over the prepare loop's row order (push exactly one entry per row).
+/// state update, uploaded to device `*_arr` arrays by
+/// [`dsv4_compressor_update_batched`]. Built over the prepare loop's row order
+/// (push exactly one entry per row). `pending_kv`/`pending_score`/`compressed`
+/// are always per-row; `prev_overlap_kv`/`_score` are per-row ONLY when the
+/// layer has no compress-state pool (`compress_pool: None`) — when it does
+/// (compress_ratio==4), every row's entry is the SAME shared pool base
+/// pointer, not a distinct per-row buffer (see `Dsv4CompressStatePool`).
 #[derive(Default)]
 pub(crate) struct Dsv4CompressorBatchPtrs {
     pub(crate) pending_kv: Vec<u64>,
@@ -8222,6 +8267,10 @@ pub(crate) fn dsv4_compressor_update_batched(
     head_dim: usize,
     ratio: usize,
     overlap: bool,
+    // `ratio*head_dim` when `ptrs.prev_overlap_kv/_score` point at a shared
+    // `Dsv4CompressStatePool` (compress_ratio==4); `0` otherwise — see
+    // `compressor_forward`/`Dsv4CompressorBatchPtrs`.
+    overlap_page_stride: usize,
     apply_rope: bool,
     rope_original_seq_len: i32,
     ptr_keepalive: &mut Vec<CudaSlice<u64>>,
@@ -8302,6 +8351,7 @@ pub(crate) fn dsv4_compressor_update_batched(
                 ratio as i32,
                 width as i32,
                 i32::from(overlap),
+                overlap_page_stride as i32,
                 config.rms_norm_eps,
                 rope_dim as i32,
                 rope_base,
