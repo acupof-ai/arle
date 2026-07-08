@@ -419,19 +419,12 @@ mechanical changes.
   `model/qwen3/`.
 - Weights `&self` (immutable, pool-shared); per-request mutable state in `State`
   associated types.
-- **Comments concise** — ≤1-2 lines on the non-obvious *why*, not what the code
-  does; no essay blocks. Load-bearing invariant/ordering notes stay, compressed.
-- **No task/step/ticket tags as the comment's lead-in.** `// Route A (#85 Step
-  4): ...` or `// added for the Y refactor: ...` is construction history, not a
-  why — it rots the moment the task ships and the reader has no way to tell if
-  it's still true. An issue number is fine ONLY when it names a concrete bug
-  the code guards against (`// #146: above 2048 the per-path maps diverged and
-  garbled both read lanes`) — that's a why, evaluable from the code alone.
-  "Which task/step added this parameter" is not; put it in the commit message
-  or PR description, never the comment. Test: delete the tag — if the
-  remaining sentence still explains an invariant/behavior, keep it minus the
-  tag; if it goes empty or becomes "see the other function," delete the whole
-  comment (found recurring in Route A Step 4's diff, 2026-07-08).
+- **Default to no comment.** Comment only a non-obvious invariant, ordering
+  requirement, or bug workaround — never what the code does (a clearer name
+  beats a comment) and never which task/ticket/step added it (that rots;
+  belongs in the commit message). An issue number is fine only when it names
+  a concrete bug the code guards against (`// #146: above 2048 the per-path
+  maps diverged`). ≤1 line when warranted.
 - **Code as poetry — every expression earns its place.** Use the stdlib's
   vocabulary when it names the operation exactly: `.unzip()` over a 4-line match,
   `ensure!` over `if { return Err }`, `.is_some_and()` over `.map().unwrap_or()`,
