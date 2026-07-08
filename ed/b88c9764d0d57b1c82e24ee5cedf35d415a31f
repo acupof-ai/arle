@@ -1,0 +1,21 @@
+docs/experience/wins/2026-07-08-dsv4-route-a-prefix-reuse-end-to-end.md
+  s_8ed17943fcd258::t_1cf94d1ee8ae7b 1-111
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "edb88c9764d0d57b1c82e24ee5cedf35d415a31f",
+  "prompts": {},
+  "sessions": {
+    "s_8ed17943fcd258": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2b082648-4bd8-4483-9790-ecdcc74a7070",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
