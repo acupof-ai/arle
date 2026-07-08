@@ -1703,7 +1703,7 @@ pub(crate) fn dsv4_decode_graph_csa_read_enabled() -> Result<bool> {
 /// validates (irrelevant to a page-count budget check; real construction
 /// still runs those checks for real). `Ok(0)` when the FlashMLA decode-alloc
 /// path is disabled — the shared pool isn't built at all, so nothing to
-/// check. Lets [`crate::dsv4::Dsv4Model::dsv4_kv_budget_plan`] reject a
+/// check. Lets [`crate::dsv4::Dsv4Model::kv_budget_plan`] reject a
 /// startup that can't afford even one slot's band with the same clean error
 /// the `affordable` gate already produces, instead of a hard panic deep in
 /// `kv_layout.rs`'s pool constructor (pod-verified 2026-07-06: the two gates
