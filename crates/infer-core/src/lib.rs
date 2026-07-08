@@ -899,6 +899,8 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
 
         // Advance chunked prefill. A non-final chunk only moves progress; the
         // final chunk transitions the slot to decode and consumes its first token.
+        // Slots whose prefill just completed are sealed at the prompt boundary below.
+        let mut prompt_sealed_slots: Vec<usize> = Vec::new();
         for row in &plan.prefill_rows {
             let Some(request) = self.active.get_mut(&row.slot) else {
                 continue;
@@ -915,6 +917,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             request.prefill_start_pos = new_start;
             if new_start >= prompt_len {
                 request.phase = RequestPhase::Decoding;
+                prompt_sealed_slots.push(row.slot);
                 if let Some(token) = tokens_by_slot
                     .get_mut(&row.slot)
                     .and_then(VecDeque::pop_front)
@@ -932,6 +935,21 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                 // A non-final chunk produces no committed token.
                 tokens_by_slot.remove(&row.slot);
             }
+        }
+
+        // Seal each just-prefilled prompt into the radix at the PROMPT boundary,
+        // capturing the recurrent sidecar while device state is exactly at
+        // `prompt_len` — the boundary a chat/messages-resend restores at. Finish
+        // only captures the post-generation boundary, so without this a prompt-only
+        // resend keys at a block boundary that was never saved and full-recomputes.
+        // `radix.insert` dedups, so `published_pages` is unchanged; a slot that also
+        // finishes this step re-publishes the superset at finish. Runs after the loop.
+        for slot in prompt_sealed_slots {
+            let Some(prompt_tokens) = self.active.get(&slot).map(|r| r.prompt_tokens.clone())
+            else {
+                continue;
+            };
+            self.publish_prefix_blocks(slot, &prompt_tokens);
         }
 
         // Decode rows: append sampled token(s) and check stop/length after each.
