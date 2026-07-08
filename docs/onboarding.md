@@ -100,6 +100,9 @@ crates/cli/src/train_cli.rs → train::opd → autograd
 
 `default = ["cli"]` — 不会隐式拉 CUDA/Metal 依赖（根 `Cargo.toml`）。
 
+> **Tip:** 切换 feature lane 时用不同的 `CARGO_TARGET_DIR` 避免全量重编：
+> `CARGO_TARGET_DIR=target-metal cargo build --release --no-default-features --features metal,no-cuda,cli`
+
 ---
 
 ## 5. 按任务选阅读清单

@@ -347,7 +347,7 @@ pub(crate) struct Args {
     )]
     pub(crate) temperature: f32,
 
-    /// Disable CUDA graph (useful for debugging)
+    /// Disable CUDA graph capture (CUDA only; no-op on other backends).
     #[arg(long, default_value_t = false)]
     pub(crate) no_cuda_graph: bool,
 
@@ -356,6 +356,7 @@ pub(crate) struct Args {
     pub(crate) cuda_graph_max_bs: Option<usize>,
 
     /// Disable built-in shell/python tools for the local agent runtime.
+    /// Also honored per-run via `arle run --no-tools`.
     #[arg(long, default_value_t = false)]
     pub(crate) no_tools: bool,
 
@@ -763,6 +764,11 @@ pub(crate) struct ServeArgs {
     pub(crate) pool_models: Vec<String>,
 
     /// Forward additional backend-specific flags after `--`.
+    ///
+    /// Always rejected — the in-process serve stack does not forward to a
+    /// standalone binary. Kept as a parse target so users migrating from
+    /// vLLM/SGLang get a clear error instead of a generic clap "unexpected
+    /// argument".
     #[arg(last = true, allow_hyphen_values = true)]
     pub(crate) extra_args: Vec<String>,
 }
