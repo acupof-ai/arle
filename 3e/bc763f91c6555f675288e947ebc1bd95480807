@@ -1,0 +1,27 @@
+crates/infer-cuda/src/attention.rs
+  s_8ed17943fcd258::t_f2667aa18b7a10 1706
+crates/infer-cuda/src/attention/dsa.rs
+  s_8ed17943fcd258::t_59264c51b1aefe 344,388,422
+crates/infer-cuda/src/attention/kv_layout.rs
+  s_8ed17943fcd258::t_3083d6911da1d5 1022-1031
+crates/infer-cuda/src/dsv4.rs
+  s_8ed17943fcd258::t_b7510c893cabb0 1865,1891,1901,1904,1911-1915,1917,1937-1946,1953,1965-1967,1969-1974,1986-1989,2004
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "3ebc763f91c6555f675288e947ebc1bd95480807",
+  "prompts": {},
+  "sessions": {
+    "s_8ed17943fcd258": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2b082648-4bd8-4483-9790-ecdcc74a7070",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
