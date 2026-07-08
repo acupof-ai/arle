@@ -187,6 +187,17 @@ pub trait BackendExecutor {
         0
     }
 
+    /// Extra alignment (in tokens) the planner must round prefill chunk ends
+    /// down to, beyond KV page alignment — e.g. DSv4's `sliding_window`, the
+    /// unit its ring-snapshot pool materializes at. A prompt completed in one
+    /// forward call only ever produces a snapshot at whichever position that
+    /// call ends at; forcing chunk ends onto this alignment gives every
+    /// intermediate boundary a chance to materialize too. Default `1`: no
+    /// additional constraint beyond page alignment.
+    fn prefill_restore_boundary_alignment(&self) -> usize {
+        1
+    }
+
     /// Notify the backend that host prefix-cache pages were evicted from the
     /// radix cache and released by the host KV pool. Backends that mirror page
     /// contents or restore-boundary side state below the seam can drop those
