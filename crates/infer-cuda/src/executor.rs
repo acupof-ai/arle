@@ -3525,10 +3525,19 @@ impl Qwen35CudaExecutor {
 
     /// Serialize the slot's recurrent state + full-attn KV as ONE atomic blob
     /// and store it into `slot_tier` under `NS_SIDECAR`, keyed by the token hash
-    /// of the just-published radix prefix `tokens[..matched_len]`. Records the
-    /// prefix's tail page → key so `release_sidecar_pages` drops the blob when the
-    /// radix evicts that page. `matched_len` comes from the radix (block-aligned);
-    /// re-aligned to the page grain here defensively.
+    /// of the published radix prefix. Records the prefix's tail page → key so
+    /// `release_sidecar_pages` drops the blob when the radix evicts that page.
+    ///
+    /// Boundary: the sidecar is keyed at `L* = align_down16(tokens.len() - 1)` —
+    /// the largest page boundary strictly below the sequence length, i.e. the
+    /// restore target a future exact resend lands on (pop-trimmed for aligned,
+    /// un-popped for non-aligned; `prefix.rs:72`). When a prefill boundary
+    /// snapshot was captured at exactly `L*` (`submit_prefill_row`), it is used
+    /// verbatim — snapshot-position == key-position, so restore's re-prefill of
+    /// `[L*..len]` advances the recurrent state exactly once. Otherwise (finish/
+    /// decode publish, recall path, or tiny prompt) fall back to the live
+    /// snapshot keyed at the sealed page grain — the pre-existing best-effort
+    /// path for supersequence (agentic follow-up) reuse.
     pub(crate) fn save_recurrent_sidecar(
         &mut self,
         slot: usize,
@@ -3536,23 +3545,35 @@ impl Qwen35CudaExecutor {
         matched_len: usize,
         prefix_pages: &[u32],
     ) -> anyhow::Result<()> {
-        let slot_state = &self.slots[slot];
-        if !slot_state.has_recurrent() {
+        if !self.slots[slot].has_recurrent() {
             return Ok(()); // pure full-attn path — nothing to capture
         }
-        // Page-align so capture key == restore's matched_len (radix returns a
-        // page-16-aligned length; raw seq_len aligns ~1/16 of the time → always-miss).
-        let mat_len = (matched_len.min(slot_state.seq_len()).min(tokens.len())
-            / SUPPORTED_PAGE_SIZE)
-            * SUPPORTED_PAGE_SIZE;
-        if mat_len == 0 {
-            return Ok(());
-        }
+        let boundary = tokens.len().saturating_sub(1) / SUPPORTED_PAGE_SIZE * SUPPORTED_PAGE_SIZE;
+        let pending = self.prefill_boundary_snapshot[slot].take();
+        let (mat_len, mut snap) = match pending {
+            Some((pos, snap)) if pos == boundary && boundary > 0 => (pos, snap),
+            _ => {
+                // Legacy best-effort: raw seq_len aligns to a page ~1/16 of the
+                // time, so page-align to keep capture-key == restore's matched_len.
+                let mat_len = matched_len
+                    .min(self.slots[slot].seq_len())
+                    .min(tokens.len())
+                    / SUPPORTED_PAGE_SIZE
+                    * SUPPORTED_PAGE_SIZE;
+                if mat_len == 0 {
+                    return Ok(());
+                }
+                (
+                    mat_len,
+                    self.slots[slot].snapshot_recurrent(&self.model.ctx)?,
+                )
+            }
+        };
         let key = crate::qwen35::hash_prefix_tokens(&tokens[..mat_len]);
-        let mut snap = self.slots[slot].snapshot_recurrent(&self.model.ctx)?;
         // snapshot_recurrent synchronizes the stream so pages are flushed before D2H.
         if let Some(pool) = self.full_attn_kv.as_ref() {
-            // Limit to mat_len pages; slot may have one extra allocated-but-not-full page.
+            // full-attn KV is position-indexed and append-only, so pages [0..mat_len)
+            // are byte-identical whether copied at `mat_len` or at the current end.
             let n_pages = mat_len / SUPPORTED_PAGE_SIZE;
             let all_pages = pool.page_indices(slot);
             let pages = all_pages[..n_pages.min(all_pages.len())].to_vec();
@@ -3574,9 +3595,11 @@ impl Qwen35CudaExecutor {
             .slot_tier
             .insert_chunked(NS_SIDECAR, NS_SIDECAR_CHUNK, key, &bytes)
         {
-            // Coordinate eviction off the prefix tail page (leaves evict first, so
-            // the tail drops the sidecar the moment the prefix leaves the radix).
-            if let Some(&tail) = prefix_pages.last() {
+            // Coordinate eviction off the last page the sidecar COVERS (leaves
+            // evict deepest-first, so this drops the blob the moment its own
+            // prefix erodes) — `mat_len` may be one page short of the sealed run.
+            let cover_idx = (mat_len / SUPPORTED_PAGE_SIZE).saturating_sub(1);
+            if let Some(&tail) = prefix_pages.get(cover_idx).or_else(|| prefix_pages.last()) {
                 if let Some(old) = self.sidecar_page_key.insert(tail, key) {
                     if old != key {
                         self.slot_tier
@@ -3954,6 +3977,7 @@ impl Qwen35CudaExecutor {
             kv_pool_mem_fraction_static: mem_fraction_static,
             kv_pool_requested_pages: total_pages.max(1),
             sidecar_page_key: std::collections::HashMap::new(),
+            prefill_boundary_snapshot: (0..num_slots).map(|_| None).collect(),
         };
         cuda_startup_log(
             "qwen35_executor_total",
@@ -4922,6 +4946,9 @@ impl Qwen35CudaExecutor {
             // zero it for the new occupant. This replaces the old in-place
             // `reset()` zeroing; the block MUST be resident before the forward.
             self.slots[row.slot].release_recurrent(&mut self.recurrent_pool);
+            // Drop any prior occupant's pending boundary snapshot: this slot is a
+            // new request, so a stale snapshot must never key a future sidecar.
+            self.prefill_boundary_snapshot[row.slot] = None;
             let (num_linear, gdr_len, conv_len) = self.model.recurrent_dims();
             self.slots[row.slot].acquire_recurrent(
                 &self.model.ctx,
@@ -4978,12 +5005,49 @@ impl Qwen35CudaExecutor {
         }
         let position = (row.start_pos + row.tokens.len()) as u64;
         if self.recall_active() {
-            self.prefill_row_recall(row, position)
-        } else {
-            // Default paged prefill: full attention over all resident pages, no
-            // eviction (the dense model applied to Qwen3.6 — Phase 2).
-            self.prefill_row_paged_default(row, position)
+            return self.prefill_row_recall(row, position);
         }
+        // Default paged prefill: full attention over all resident pages, no
+        // eviction (the dense model applied to Qwen3.6 — Phase 2).
+        //
+        // Recurrent-sidecar boundary capture: on the FINAL prefill chunk, split
+        // the forward at the last-page boundary `L* = align_down16(total - 1)`
+        // and snapshot the recurrent state there, so the sidecar keyed at `L*`
+        // matches a resend's restore target (popped for aligned, un-popped for
+        // non-aligned) with snapshot-position == key-position. Without the split
+        // the state is only observable at `P` (prompt end), and keying it at
+        // `L* < P` bakes the residue `[L*..P]` — double-advanced on restore. For
+        // a non-aligned prompt the planner already ends a chunk at `L*` (residue
+        // split), so `head_len == 0` and we only snapshot; for an aligned prompt
+        // the final chunk spans `L*`, so we forward `[start..L*]`, snapshot, then
+        // forward the last page.
+        let is_final = row.start_pos + row.tokens.len() == row.total_tokens;
+        let lstar = row.total_tokens.saturating_sub(1) / SUPPORTED_PAGE_SIZE * SUPPORTED_PAGE_SIZE;
+        if is_final && lstar > 0 && lstar >= row.start_pos && self.slots[row.slot].has_recurrent() {
+            let head_len = lstar - row.start_pos;
+            if head_len > 0 {
+                let head = infer_plan::PrefillRow {
+                    slot: row.slot,
+                    tokens: row.tokens[..head_len].to_vec(),
+                    start_pos: row.start_pos,
+                    total_tokens: row.total_tokens,
+                    params: row.params.clone(),
+                };
+                self.prefill_row_paged_default(&head, lstar as u64)?; // token discarded
+            }
+            // State is now materialized at exactly `L*`; snapshot before the tail.
+            let snap = self.slots[row.slot].snapshot_recurrent(&self.model.ctx)?;
+            self.prefill_boundary_snapshot[row.slot] = Some((lstar, snap));
+            let tail = infer_plan::PrefillRow {
+                slot: row.slot,
+                tokens: row.tokens[head_len..].to_vec(),
+                start_pos: lstar,
+                total_tokens: row.total_tokens,
+                params: row.params.clone(),
+            };
+            return self.prefill_row_paged_default(&tail, position);
+        }
+        self.prefill_row_paged_default(row, position)
     }
 
     /// One decode row as a single-row forward (the pre-batching single-row
