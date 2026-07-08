@@ -309,11 +309,10 @@ impl KvPrefixStore for HostPagedKvPool {
                     self.free.len()
                 );
             }
-            let extra: Vec<u32> = (0..top_up).map(|_| self.free.pop().unwrap()).collect();
             let dst = &mut self.slot_pages[slot];
             dst.clear();
             dst.extend_from_slice(pages);
-            dst.extend(extra);
+            dst.extend((0..top_up).map(|_| self.free.pop().unwrap()));
         } else {
             self.slot_pages[slot].extend_from_slice(pages);
         }
