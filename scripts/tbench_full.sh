@@ -9,6 +9,7 @@ W=/host/tb_full; rm -rf $W; mkdir -p $W
 PORT=${PORT:-18300}; GPU=${GPU:-5}   # 5-7 free; 1-4 held by another pod job
 LORA=/host/tb_lora/adapters_replay/adapter_model.safetensors
 POOL=/root/.cache/terminal-bench/terminal-bench-core/0.1.1
+bash "$(dirname "$0")/tb_exclude_security.sh" "$POOL"   # strip HIDS-tripping tasks
 export PATH="$HOME/.local/bin:$PATH"; export DOCKER_HOST=unix:///run/podman/podman.sock
 
 CUDA_VISIBLE_DEVICES=$GPU nohup $ARLE serve --model-path $MODEL --bind 0.0.0.0 --port $PORT \
