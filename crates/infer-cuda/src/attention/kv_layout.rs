@@ -344,28 +344,6 @@ impl Dsv4CompressStatePool {
         (self.overlap_kv.len() + self.overlap_score.len()) * bf16
     }
 
-    // TEMP (Task 2 cross-rank verify, scratch — not for main): hash one
-    // block's resident pool bytes for cross-rank bit-identity comparison.
-    pub(crate) fn debug_hash(&self, ctx: &DeviceContext, block_index: usize) -> Result<(u64, u64)> {
-        let range = self.block_range(block_index);
-        let kv = ctx
-            .stream
-            .clone_dtoh(&self.overlap_kv.slice(range.clone()))
-            .map_err(|e| anyhow!("debug_hash kv dtoh: {e}"))?;
-        let score = ctx
-            .stream
-            .clone_dtoh(&self.overlap_score.slice(range))
-            .map_err(|e| anyhow!("debug_hash score dtoh: {e}"))?;
-        let mut sum: u64 = 0;
-        let mut xor: u64 = 0;
-        for v in kv.iter().chain(score.iter()) {
-            let bits = v.to_bits() as u64;
-            sum = sum.wrapping_add(bits);
-            xor ^= bits;
-        }
-        Ok((sum, xor))
-    }
-
     /// STATIC predictor of `device_bytes` from `new`'s dims — MUST mirror `new`.
     /// Feeds `Dsv4Model::kv_budget_plan`'s summed-per-layer term.
     pub(crate) fn device_bytes_for(head_dim: usize, ratio: usize, max_seq_len: usize) -> usize {

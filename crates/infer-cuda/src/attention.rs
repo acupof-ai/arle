@@ -5264,41 +5264,6 @@ pub(crate) fn mla_attention_prepare(
                     None,
                     keepalive,
                 )?;
-                // TEMP (Task 2 cross-rank verify, scratch — not for main):
-                // hash `hidden` (this layer's compressor input) and the
-                // just-written pool block, per rank, for bit-identity check.
-                if std::env::var("DSV4_HASH_DEBUG").is_ok() && compress_ratio == 4 {
-                    let hbytes = ctx
-                        .stream
-                        .clone_dtoh(&hidden.data)
-                        .map_err(|e| anyhow!("debug hidden dtoh: {e}"))?;
-                    let (mut hsum, mut hxor) = (0u64, 0u64);
-                    for v in &hbytes {
-                        let bits = v.to_bits() as u64;
-                        hsum = hsum.wrapping_add(bits);
-                        hxor ^= bits;
-                    }
-                    let block_index = compressor_state.compressed.seq_len.saturating_sub(1);
-                    let pool_hash = pool
-                        .compress_state_pool_mut()
-                        .map(|p| p.debug_hash(ctx, block_index))
-                        .transpose()?;
-                    // Per-rank file, not eprintln!: the multiproc relay
-                    // interleaves concurrent ranks' stderr mid-message in the
-                    // shared server log, corrupting parsing.
-                    use std::io::Write as _;
-                    if let Ok(mut f) = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(format!("/root/dsv4_hash_rank{}.log", tp.config().rank))
-                    {
-                        let _ = writeln!(
-                            f,
-                            "layer={layer_idx} start_pos={start_pos} block={block_index} \
-                             hidden_sum={hsum:#x} hidden_xor={hxor:#x} pool_hash={pool_hash:?}"
-                        );
-                    }
-                }
             }
         }
 
