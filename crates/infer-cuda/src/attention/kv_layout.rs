@@ -344,12 +344,387 @@ impl Dsv4CompressStatePool {
         (self.overlap_kv.len() + self.overlap_score.len()) * bf16
     }
 
+    // TEMP (Task 2 cross-rank verify, scratch — not for main): hash one
+    // block's resident pool bytes for cross-rank bit-identity comparison.
+    pub(crate) fn debug_hash(&self, ctx: &DeviceContext, block_index: usize) -> Result<(u64, u64)> {
+        let range = self.block_range(block_index);
+        let kv = ctx
+            .stream
+            .clone_dtoh(&self.overlap_kv.slice(range.clone()))
+            .map_err(|e| anyhow!("debug_hash kv dtoh: {e}"))?;
+        let score = ctx
+            .stream
+            .clone_dtoh(&self.overlap_score.slice(range))
+            .map_err(|e| anyhow!("debug_hash score dtoh: {e}"))?;
+        let mut sum: u64 = 0;
+        let mut xor: u64 = 0;
+        for v in kv.iter().chain(score.iter()) {
+            let bits = v.to_bits() as u64;
+            sum = sum.wrapping_add(bits);
+            xor ^= bits;
+        }
+        Ok((sum, xor))
+    }
+
     /// STATIC predictor of `device_bytes` from `new`'s dims — MUST mirror `new`.
     /// Feeds `Dsv4Model::kv_budget_plan`'s summed-per-layer term.
     pub(crate) fn device_bytes_for(head_dim: usize, ratio: usize, max_seq_len: usize) -> usize {
         let bf16 = std::mem::size_of::<half::bf16>();
         let capacity_blocks = max_seq_len.div_ceil(ratio.max(1)).max(1);
         2 * capacity_blocks * ratio * head_dim * bf16
+    }
+}
+
+/// Page-addressable, cross-request-shared FULL-HISTORY mirror of this layer's
+/// DSA-official indexer key cache (`Dsv4LayerKvLayout::dsa_key_cache`), keyed
+/// by absolute compressed row (`start_pos / index_ratio` — CSA: `compress_ratio`;
+/// GLM SparseIndexed: `1`). Unlike [`Dsv4CompressStatePool`] this does NOT
+/// replace the live per-slot band: `dsa_key_cache`'s slot-keyed physical layout
+/// (`slot_idx * num_pages`) is baked into the CUDA-graph batched-decode
+/// meta-build kernel (`dsv4_dsa_build_select_meta_cuda`), out of reach without
+/// nvcc. Instead this pool is a write-mirrored shadow — every live cache-write
+/// also copies its newly-packed rows here (append-only, so a straight D2D copy
+/// keyed by the same row range), and a restore copies the matched row range
+/// back OUT into the freshly-assigned slot's own band, leaving the slot-keyed
+/// live read/write kernels untouched.
+pub(crate) struct Dsv4DsaKeyCachePool {
+    pub(super) key_cache: CudaSlice<u8>,
+    row_bytes: usize,
+    resident: Vec<bool>,
+}
+
+impl Dsv4DsaKeyCachePool {
+    pub(super) fn new(
+        ctx: &DeviceContext,
+        config: &DeepSeekV4Config,
+        index_ratio: usize,
+        max_seq_len: usize,
+    ) -> Result<Self> {
+        let bytes = dsv4_dsa_key_cache_bytes(config, index_ratio, max_seq_len)?;
+        let capacity_rows = max_seq_len.div_ceil(index_ratio.max(1)).max(1);
+        Ok(Self {
+            key_cache: ctx
+                .stream
+                .alloc_zeros::<u8>(bytes)
+                .map_err(|e| anyhow!("DSv4 DSA key-cache pool alloc failed: {e}"))?,
+            row_bytes: config.index_head_dim + std::mem::size_of::<f32>(),
+            resident: vec![false; capacity_rows],
+        })
+    }
+
+    pub(crate) fn is_resident(&self, row: usize) -> bool {
+        self.resident.get(row).copied().unwrap_or(false)
+    }
+
+    pub(crate) fn mark_written_range(&mut self, first: usize, count: usize) {
+        for r in first..first.saturating_add(count) {
+            if let Some(slot) = self.resident.get_mut(r) {
+                *slot = true;
+            }
+        }
+    }
+
+    /// Mirror newly-written rows `[first, first+count)` from a slot's live
+    /// `dsa_key_cache` band into this shared pool, right after the slot-keyed
+    /// live cache-write kernel — keeps the pool durable across slot reuse
+    /// without touching the live read/write kernels.
+    pub(crate) fn mirror_from_slot_band(
+        &mut self,
+        ctx: &DeviceContext,
+        slot_dsa_key_cache: &CudaSlice<u8>,
+        slot_range: std::ops::Range<usize>,
+        first_row: usize,
+        row_count: usize,
+    ) -> Result<()> {
+        if row_count == 0 {
+            return Ok(());
+        }
+        let rel = first_row * self.row_bytes..(first_row + row_count) * self.row_bytes;
+        ensure!(
+            slot_range.start + rel.end <= slot_range.end && rel.end <= self.key_cache.len(),
+            "DSv4 DSA key-cache mirror: rows [{first_row},{}) exceed slot band or pool capacity",
+            first_row + row_count
+        );
+        let src =
+            slot_dsa_key_cache.slice(slot_range.start + rel.start..slot_range.start + rel.end);
+        ctx.stream
+            .memcpy_dtod(&src, &mut self.key_cache.slice_mut(rel.clone()))
+            .map_err(|e| anyhow!("DSv4 DSA key-cache mirror D2D failed: {e}"))?;
+        self.mark_written_range(first_row, row_count);
+        Ok(())
+    }
+
+    /// Copy this pool's prefix `[0, row_count)` into a freshly-assigned slot's
+    /// own `dsa_key_cache` band. Append-only + written in row order, so a
+    /// resident boundary row (`row_count - 1`) implies every earlier row in
+    /// the prefix is resident too — callers gate on the boundary alone.
+    pub(crate) fn restore_prefix_into_slot_band(
+        &self,
+        ctx: &DeviceContext,
+        slot_dsa_key_cache: &mut CudaSlice<u8>,
+        slot_range: std::ops::Range<usize>,
+        row_count: usize,
+    ) -> Result<()> {
+        let bytes = row_count * self.row_bytes;
+        ensure!(
+            bytes <= self.key_cache.len() && slot_range.start + bytes <= slot_range.end,
+            "DSv4 DSA key-cache restore: {row_count} rows ({bytes}B) exceeds pool or slot band"
+        );
+        let mut dst = slot_dsa_key_cache.slice_mut(slot_range.start..slot_range.start + bytes);
+        ctx.stream
+            .memcpy_dtod(&self.key_cache.slice(0..bytes), &mut dst)
+            .map_err(|e| anyhow!("DSv4 DSA key-cache restore D2D failed: {e}"))
+    }
+
+    /// Not called yet — same dormant-until-eviction posture as
+    /// `Dsv4CompressStatePool::demote`.
+    #[allow(dead_code)]
+    pub(crate) fn demote(
+        &mut self,
+        ctx: &DeviceContext,
+        tier: &mut CudaKvTierStore,
+        key: u64,
+        row: usize,
+    ) -> Result<bool> {
+        ensure!(
+            row < self.resident.len(),
+            "DSv4 DSA key-cache demote: row {row} outside capacity {}",
+            self.resident.len()
+        );
+        if !self.is_resident(row) {
+            return Ok(false);
+        }
+        let range = row * self.row_bytes..(row + 1) * self.row_bytes;
+        let bytes = ctx
+            .stream
+            .clone_dtoh(&self.key_cache.slice(range))
+            .map_err(|e| anyhow!("DSv4 DSA key-cache demote dtoh failed: {e}"))?;
+        if !tier.insert(key, bytes) {
+            return Ok(false);
+        }
+        self.resident[row] = false;
+        Ok(true)
+    }
+
+    pub(crate) fn ensure_resident(
+        &mut self,
+        ctx: &DeviceContext,
+        tier: &mut CudaKvTierStore,
+        key: u64,
+        row: usize,
+    ) -> Result<bool> {
+        ensure!(
+            row < self.resident.len(),
+            "DSv4 DSA key-cache promote: row {row} outside capacity {}",
+            self.resident.len()
+        );
+        if self.is_resident(row) {
+            return Ok(true);
+        }
+        let payload = match tier.read(key) {
+            Ok(payload) => payload.into_owned(),
+            Err(_) => return Ok(false),
+        };
+        ensure!(
+            payload.len() == self.row_bytes,
+            "DSv4 DSA key-cache tier payload size mismatch for row {row}: got {} expected {}",
+            payload.len(),
+            self.row_bytes
+        );
+        let range = row * self.row_bytes..(row + 1) * self.row_bytes;
+        ctx.stream
+            .memcpy_htod(&payload, &mut self.key_cache.slice_mut(range))
+            .map_err(|e| anyhow!("DSv4 DSA key-cache promote htod failed: {e}"))?;
+        self.resident[row] = true;
+        tier.remove(&[key]);
+        Ok(true)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn device_bytes(&self) -> usize {
+        self.key_cache.len()
+    }
+
+    /// STATIC predictor — one slot-equivalent band, NOT `× num_slots` (this
+    /// pool is shared). Feeds `Dsv4Model::kv_budget_plan` as a fixed term.
+    pub(crate) fn device_bytes_for(
+        config: &DeepSeekV4Config,
+        index_ratio: usize,
+        max_seq_len: usize,
+    ) -> usize {
+        dsv4_dsa_key_cache_bytes(config, index_ratio, max_seq_len).unwrap_or(0)
+    }
+}
+
+/// Page-addressable, cross-request-shared periodic snapshot of this layer's
+/// per-slot sliding-window ring (`Dsv4LayerAttentionState::sw_window_cache`,
+/// `update_bf16_sw_window` in `attention.rs`). The ring is overwrite-in-place
+/// (`pos % sliding_window`), so unlike the compressor/DSA pools it has no
+/// natural append-only representation — instead, at every position where
+/// `pos % sliding_window == 0`, the ENTIRE live ring is copied into a new
+/// snapshot slot keyed by `block_index = pos / sliding_window`. Since
+/// `sliding_window` IS the reuse granularity for this buffer, one full-ring
+/// copy is exactly one reuse unit — no incremental-copy complexity needed.
+/// Every layer has a ring (including the 3 pure-SlidingWindow layers with no
+/// compressor), so this pool is built unconditionally whenever
+/// `config.sliding_window > 0`.
+pub(crate) struct Dsv4SwRingSnapshotPool {
+    pub(super) snapshots: CudaSlice<half::bf16>,
+    ring_elems: usize,
+    resident: Vec<bool>,
+}
+
+impl Dsv4SwRingSnapshotPool {
+    pub(super) fn new(
+        ctx: &DeviceContext,
+        head_dim: usize,
+        sliding_window: usize,
+        max_seq_len: usize,
+    ) -> Result<Self> {
+        let ring_elems = sliding_window * head_dim;
+        let capacity_blocks = max_seq_len.div_ceil(sliding_window.max(1)).max(1);
+        Ok(Self {
+            snapshots: ctx
+                .stream
+                .alloc_zeros::<half::bf16>(capacity_blocks * ring_elems)
+                .map_err(|e| anyhow!("DSv4 SW ring snapshot pool alloc failed: {e}"))?,
+            ring_elems,
+            resident: vec![false; capacity_blocks],
+        })
+    }
+
+    pub(crate) fn is_resident(&self, block_index: usize) -> bool {
+        self.resident.get(block_index).copied().unwrap_or(false)
+    }
+
+    /// Copy the whole live ring into snapshot slot `block_index` — called
+    /// right after `update_bf16_sw_window` returns, only when the position it
+    /// just advanced to is a `sliding_window` multiple.
+    pub(crate) fn snapshot_from_ring(
+        &mut self,
+        ctx: &DeviceContext,
+        ring: &CudaSlice<half::bf16>,
+        block_index: usize,
+    ) -> Result<()> {
+        let range = self.block_range(block_index)?;
+        ensure!(
+            ring.len() == self.ring_elems,
+            "DSv4 SW ring snapshot: live ring len {} != expected {}",
+            ring.len(),
+            self.ring_elems
+        );
+        ctx.stream
+            .memcpy_dtod(ring, &mut self.snapshots.slice_mut(range))
+            .map_err(|e| anyhow!("DSv4 SW ring snapshot D2D failed: {e}"))?;
+        self.resident[block_index] = true;
+        Ok(())
+    }
+
+    /// Restore snapshot `block_index` into a freshly-assigned slot's own ring.
+    pub(crate) fn restore_into_ring(
+        &self,
+        ctx: &DeviceContext,
+        ring: &mut CudaSlice<half::bf16>,
+        block_index: usize,
+    ) -> Result<()> {
+        let range = self.block_range(block_index)?;
+        ensure!(
+            ring.len() == self.ring_elems,
+            "DSv4 SW ring restore: live ring len {} != expected {}",
+            ring.len(),
+            self.ring_elems
+        );
+        ctx.stream
+            .memcpy_dtod(&self.snapshots.slice(range), ring)
+            .map_err(|e| anyhow!("DSv4 SW ring restore D2D failed: {e}"))
+    }
+
+    fn block_range(&self, block_index: usize) -> Result<std::ops::Range<usize>> {
+        ensure!(
+            block_index < self.resident.len(),
+            "DSv4 SW ring snapshot: block {block_index} outside capacity {}",
+            self.resident.len()
+        );
+        let start = block_index * self.ring_elems;
+        Ok(start..start + self.ring_elems)
+    }
+
+    /// Not called yet — same dormant-until-eviction posture as
+    /// `Dsv4CompressStatePool::demote`.
+    #[allow(dead_code)]
+    pub(crate) fn demote(
+        &mut self,
+        ctx: &DeviceContext,
+        tier: &mut CudaKvTierStore,
+        key: u64,
+        block_index: usize,
+    ) -> Result<bool> {
+        if !self.is_resident(block_index) {
+            return Ok(false);
+        }
+        let range = self.block_range(block_index)?;
+        let vals = ctx
+            .stream
+            .clone_dtoh(&self.snapshots.slice(range))
+            .map_err(|e| anyhow!("DSv4 SW ring demote dtoh failed: {e}"))?;
+        let mut payload = Vec::with_capacity(vals.len() * 2);
+        for v in &vals {
+            payload.extend_from_slice(&v.to_bits().to_le_bytes());
+        }
+        if !tier.insert(key, payload) {
+            return Ok(false);
+        }
+        self.resident[block_index] = false;
+        Ok(true)
+    }
+
+    pub(crate) fn ensure_resident(
+        &mut self,
+        ctx: &DeviceContext,
+        tier: &mut CudaKvTierStore,
+        key: u64,
+        block_index: usize,
+    ) -> Result<bool> {
+        if self.is_resident(block_index) {
+            return Ok(true);
+        }
+        let payload = match tier.read(key) {
+            Ok(payload) => payload.into_owned(),
+            Err(_) => return Ok(false),
+        };
+        ensure!(
+            payload.len() == self.ring_elems * 2,
+            "DSv4 SW ring tier payload size mismatch for block {block_index}: got {} expected {}",
+            payload.len(),
+            self.ring_elems * 2
+        );
+        let vals: Vec<half::bf16> = payload
+            .chunks_exact(2)
+            .map(|c| half::bf16::from_bits(u16::from_le_bytes([c[0], c[1]])))
+            .collect();
+        let range = self.block_range(block_index)?;
+        ctx.stream
+            .memcpy_htod(&vals, &mut self.snapshots.slice_mut(range))
+            .map_err(|e| anyhow!("DSv4 SW ring promote htod failed: {e}"))?;
+        self.resident[block_index] = true;
+        tier.remove(&[key]);
+        Ok(true)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn device_bytes(&self) -> usize {
+        self.snapshots.len() * std::mem::size_of::<half::bf16>()
+    }
+
+    /// STATIC predictor — feeds `Dsv4Model::kv_budget_plan` as a fixed term.
+    pub(crate) fn device_bytes_for(
+        head_dim: usize,
+        sliding_window: usize,
+        max_seq_len: usize,
+    ) -> usize {
+        let bf16 = std::mem::size_of::<half::bf16>();
+        let capacity_blocks = max_seq_len.div_ceil(sliding_window.max(1)).max(1);
+        capacity_blocks * sliding_window * head_dim * bf16
     }
 }
 
@@ -475,6 +850,14 @@ pub(crate) struct Dsv4LayerKvLayout {
     /// sub-state (`index_head_dim` width, not `head_dim`). `Some` only for
     /// `compress_ratio == 4` layers with an indexer (`mode.has_indexer()`).
     pub(super) indexer_compress_state_pool: Option<Dsv4CompressStatePool>,
+    /// Write-mirrored shared shadow of `dsa_key_cache`, keyed by absolute row.
+    /// `Some` whenever `dsa_key_cache` itself is (`mode.has_indexer()` +
+    /// DSA-official enabled) — every has_indexer layer, not ratio-gated.
+    pub(super) dsa_key_cache_pool: Option<Dsv4DsaKeyCachePool>,
+    /// Periodic full-ring snapshot pool for this layer's SW ring. `Some` for
+    /// EVERY layer whenever `config.sliding_window > 0` (every layer has a
+    /// ring, unlike the compressor/indexer pools above).
+    pub(super) sw_ring_pool: Option<Dsv4SwRingSnapshotPool>,
 }
 
 impl Dsv4LayerKvLayout {
@@ -497,6 +880,41 @@ impl Dsv4LayerKvLayout {
 
     pub(crate) fn indexer_compress_state_pool(&self) -> Option<&Dsv4CompressStatePool> {
         self.indexer_compress_state_pool.as_ref()
+    }
+
+    pub(crate) fn dsa_key_cache_pool_mut(&mut self) -> Option<&mut Dsv4DsaKeyCachePool> {
+        self.dsa_key_cache_pool.as_mut()
+    }
+
+    pub(crate) fn dsa_key_cache_pool(&self) -> Option<&Dsv4DsaKeyCachePool> {
+        self.dsa_key_cache_pool.as_ref()
+    }
+
+    pub(crate) fn sw_ring_pool_mut(&mut self) -> Option<&mut Dsv4SwRingSnapshotPool> {
+        self.sw_ring_pool.as_mut()
+    }
+
+    pub(crate) fn sw_ring_pool(&self) -> Option<&Dsv4SwRingSnapshotPool> {
+        self.sw_ring_pool.as_ref()
+    }
+
+    /// Copy `dsa_key_cache_pool`'s prefix `[0, row_count)` into `slot`'s own
+    /// `dsa_key_cache` band. No-op without a pool (model has no indexer) or
+    /// band (DSA-official disabled).
+    pub(crate) fn restore_dsa_prefix_into_slot(
+        &mut self,
+        ctx: &DeviceContext,
+        slot: usize,
+        row_count: usize,
+    ) -> Result<()> {
+        let Some(dsa_pool) = self.dsa_key_cache_pool.as_ref() else {
+            return Ok(());
+        };
+        let slot_range = self.dsa_slot_range(slot)?;
+        let Some(slot_band) = self.dsa_key_cache.as_mut() else {
+            return Ok(());
+        };
+        dsa_pool.restore_prefix_into_slot_band(ctx, slot_band, slot_range, row_count)
     }
 
     pub(crate) fn flashmla_total_pages(&self) -> usize {
@@ -1380,6 +1798,28 @@ impl Dsv4LayerKvLayout {
         } else {
             None
         };
+        // Shares `dsa_key_cache`'s own gate (every has_indexer layer, not
+        // ratio-restricted like the compress-state pools above).
+        let dsa_key_cache_pool = if dsa_slot_bytes > 0 {
+            Some(Dsv4DsaKeyCachePool::new(
+                ctx,
+                config,
+                index_ratio,
+                max_seq_len,
+            )?)
+        } else {
+            None
+        };
+        let sw_ring_pool = if config.sliding_window > 0 {
+            Some(Dsv4SwRingSnapshotPool::new(
+                ctx,
+                config.head_dim,
+                config.sliding_window,
+                max_seq_len,
+            )?)
+        } else {
+            None
+        };
         Ok(Self {
             flashmla_kv_pool,
             dsa_key_cache,
@@ -1389,6 +1829,8 @@ impl Dsv4LayerKvLayout {
             num_slots,
             compress_state_pool,
             indexer_compress_state_pool,
+            dsa_key_cache_pool,
+            sw_ring_pool,
         })
     }
 
@@ -1411,6 +1853,11 @@ impl Dsv4LayerKvLayout {
                 .indexer_compress_state_pool
                 .as_ref()
                 .map_or(0, |p| p.device_bytes())
+            + self
+                .dsa_key_cache_pool
+                .as_ref()
+                .map_or(0, |p| p.device_bytes())
+            + self.sw_ring_pool.as_ref().map_or(0, |p| p.device_bytes())
     }
 
     pub(super) fn slot_range(
@@ -1507,7 +1954,7 @@ impl Dsv4LayerKvLayout {
         Ok(range)
     }
 
-    pub(super) fn dsa_slot_range(&self, slot_idx: usize) -> Result<std::ops::Range<usize>> {
+    pub(crate) fn dsa_slot_range(&self, slot_idx: usize) -> Result<std::ops::Range<usize>> {
         Self::slot_range(slot_idx, self.dsa_slot_bytes, self.num_slots)
     }
 
