@@ -12,9 +12,6 @@ use infer_seam::{BackendExecutor, KvPool, KvTierLocation, PrefixBlock};
 
 use crate::{BlockId, Engine, PrefixMatch, RequestPhase, RequestState};
 
-// `RequestPhase` is used by both `attach_prefix_to_request` and
-// `attach_cached_prefix`.
-
 impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
     pub(crate) fn request_pages_needed_after_prefix(
         &self,
@@ -143,108 +140,6 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             }
         };
         Ok(())
-    }
-
-    /// Cross-request position-0 prefix reuse for backends whose KV cannot be
-    /// page-reattached at arbitrary positions (DSv4). The host radix page route
-    /// returns no match for these backends (`reusable_prefix_blocks == 0`), so
-    /// the engine asks the executor whether it holds a whole-slot image captured
-    /// at absolute position 0 whose tokens are a leading prefix of this prompt.
-    /// On a hit it allocates the prefix KV pages on `slot`, restores the image
-    /// (KV lands at the same positions it was captured at), and sets
-    /// `prefill_start_pos = matched_len` so the existing tail-prefill flow runs.
-    ///
-    /// Returns the matched length (0 ⇒ no reuse; caller falls through to the
-    /// page-radix attach, which is the no-op `PrefixMatch::empty()` for DSv4).
-    /// On any restore failure the slot's KV pages are freed and 0 is returned so
-    /// the caller re-prefills the whole prompt from a clean slot.
-    pub(crate) fn attach_cached_prefix(
-        &mut self,
-        slot: usize,
-        request: &mut RequestState,
-    ) -> Result<usize> {
-        if !self.config.enable_prefix_cache {
-            return Ok(0);
-        }
-        let matched_len = self
-            .executor
-            .cached_prefix_match_len(&request.prompt_tokens)?
-            .min(request.prompt_len());
-        if matched_len == 0 {
-            return Ok(0);
-        }
-        // Never restore the full prompt: the last token must still go through
-        // a genuine forward+sample (matching fresh-prefill's own final-chunk
-        // behavior), never a direct jump to `Decoding` with empty
-        // `generated_tokens` — see
-        // docs/experience/errors/2026-07-06-dsv4-concurrent-decode-digit-corruption-unresolved.md,
-        // "Layer-0-15 residual bisection" section. This route allocates a
-        // fresh, private slot (no radix page sharing), so shaving one raw
-        // token off is safe without any block-alignment concern.
-        let matched_len = if matched_len == request.prompt_len() {
-            matched_len - 1
-        } else {
-            matched_len
-        };
-        if matched_len == 0 {
-            return Ok(0);
-        }
-        // Allocate the prefix KV pages (sets the host pool's slot seq_len to
-        // matched_len), then restore the device image into them.
-        if let Err(err) = self.alloc_with_prefix_reclaim(slot, matched_len) {
-            log::warn!(
-                "position-0 prefix reuse skipped for request {}: KV alloc failed: {err:#}",
-                request.handle.id()
-            );
-            return Ok(0);
-        }
-        let slot_pages = self.kv.page_indices(slot).to_vec();
-        if let Err(err) = self.executor.restore_cached_prefix(
-            slot,
-            &request.prompt_tokens,
-            matched_len,
-            &slot_pages,
-        ) {
-            log::warn!(
-                "position-0 prefix restore failed for request {}: {err:#}; recomputing",
-                request.handle.id()
-            );
-            self.kv.free_slot(slot);
-            self.kv_system_metrics.fallback_recompute =
-                self.kv_system_metrics.fallback_recompute.saturating_add(1);
-            return Ok(0);
-        }
-
-        request.prefill_start_pos = matched_len;
-        request.used_prefix_restore = true;
-        request.waiting_hint.immediate_reuse_tokens = matched_len;
-        request.waiting_hint.total_reuse_tokens = matched_len;
-        request.phase = if matched_len == request.prompt_len() {
-            RequestPhase::Decoding
-        } else {
-            RequestPhase::Prefilling {
-                progress: matched_len,
-            }
-        };
-        // Placement-neutral counters only: the engine cannot see whether the
-        // whole-slot blob was served from host RAM or NVMe, so the page-route
-        // `reuse_hit_{resident,host_demoted,disk}` buckets stay untouched
-        // (they would lie under `--kv-dram 0`). Reuse truth for this route =
-        // prefix_cache hits/hit_tokens + prefix_match_full_blocks.
-        let block_size = self.radix.block_size().max(1);
-        let pages = (matched_len / block_size) as u64;
-        if pages > 0 {
-            self.prefix_cache_stats.hits = self.prefix_cache_stats.hits.saturating_add(1);
-            self.prefix_cache_stats.hit_tokens = self
-                .prefix_cache_stats
-                .hit_tokens
-                .saturating_add(matched_len as u64);
-            self.kv_system_metrics.prefix_match_full_blocks = self
-                .kv_system_metrics
-                .prefix_match_full_blocks
-                .saturating_add(pages);
-        }
-        Ok(matched_len)
     }
 
     // record_prefix_tier_hits moved into materialize_prefix_blocks.
