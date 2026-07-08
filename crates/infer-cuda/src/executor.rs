@@ -410,13 +410,12 @@ impl RealCudaExecutor {
         }
     }
 
-    /// Cross-request position-0 prefix reuse. Only the DSv4 arm holds a store;
-    /// page-radix-reusing arms (dense Qwen) report no match here.
-    pub(crate) fn cached_prefix_match_len(&self, tokens: &[u32]) -> Result<usize> {
-        match self {
-            Self::Dsv4(d) => d.cached_prefix_match_len(tokens),
-            Self::Qwen(_) | Self::Qwen35(_) => Ok(0),
-        }
+    /// Cross-request position-0 prefix reuse. Route B (the whole-slot store)
+    /// was removed 2026-07-08 pending Route A's page-granular replacement
+    /// (docs/plans/2026-07-08-dsv4-route-a-page-granular-prefix-reuse.md) — no
+    /// arm holds a store today, every backend reports no match.
+    pub(crate) fn cached_prefix_match_len(&self, _tokens: &[u32]) -> Result<usize> {
+        Ok(0)
     }
 
     /// `BackendExecutor::tp_sync_min` — see there for why the scheduler needs
@@ -431,7 +430,10 @@ impl RealCudaExecutor {
 
     pub(crate) fn capture_cached_prefix(&mut self, slot: usize, tokens: &[u32]) -> Result<()> {
         match self {
-            Self::Dsv4(d) => d.capture_cached_prefix(slot, tokens),
+            // DSv4's Route B capture is gone (see cached_prefix_match_len doc);
+            // Qwen35 reuses this same seam hook for its own, unrelated
+            // recurrent-sidecar capture — that stays.
+            Self::Dsv4(_) => Ok(()),
             Self::Qwen35(q) => q.capture_recurrent_sidecar(slot, tokens),
             Self::Qwen(_) => Ok(()),
         }
@@ -439,17 +441,13 @@ impl RealCudaExecutor {
 
     pub(crate) fn restore_cached_prefix(
         &mut self,
-        slot: usize,
-        tokens: &[u32],
-        matched_len: usize,
-        slot_pages: &[u32],
+        _slot: usize,
+        _tokens: &[u32],
+        _matched_len: usize,
+        _slot_pages: &[u32],
     ) -> Result<()> {
-        match self {
-            Self::Dsv4(d) => d.restore_cached_prefix(slot, tokens, matched_len, slot_pages),
-            Self::Qwen(_) | Self::Qwen35(_) => {
-                anyhow::bail!("position-0 prefix store is implemented only for DSv4 CUDA")
-            }
-        }
+        // Never called: cached_prefix_match_len always returns 0 today.
+        anyhow::bail!("backend has no position-0 prefix store")
     }
 
     /// Restore the page-radix sidecar recurrent state for `slot` when reusing a
@@ -1794,15 +1792,10 @@ pub(crate) struct Dsv4CudaExecutor {
     /// promote to a `--mtp-adaptive` CLI flag once pod-calibrated).
     mtp_accept_ema: f32,
     mtp_skip_streak: usize,
-    /// THE tier store (L2 DRAM + optional L3 NVMe): every demoted blob —
-    /// parked slots AND position-0 prefix snapshots — lives here as 16 MiB
-    /// chunks under a per-key manifest, partitioned by `NS_*` key namespaces.
+    /// THE tier store (L2 DRAM + optional L3 NVMe): every demoted blob — parked
+    /// slots — lives here as 16 MiB chunks under a per-key manifest,
+    /// partitioned by `NS_*` key namespaces.
     slot_tier: CudaKvTierStore,
-    /// Position-0 prefix reuse (default-on; pod-verified 11.7x prefill
-    /// speedup): token index over snapshot blobs stored in `slot_tier` under
-    /// the `NS_PREFIX*` namespaces. Budgeted by the ONE store — no private
-    /// cache, no size knob.
-    prefix_index: PrefixIndex,
 }
 
 /// `slot_tier` key namespaces (top byte, see `kv_tier::tier_key`), so features
@@ -1811,104 +1804,6 @@ pub(crate) struct Dsv4CudaExecutor {
 /// Parked whole-slot images (key = engine-minted swap key).
 const NS_SLOT: u64 = 1;
 const NS_SLOT_CHUNK: u64 = 2;
-/// Position-0 prefix snapshots (key = executor-minted, see [`PrefixIndex`]).
-const NS_PREFIX: u64 = 3;
-const NS_PREFIX_CHUNK: u64 = 4;
-
-/// Token index over position-0 prefix snapshots whose payload bytes live in
-/// the shared tier store. Owns only match + LRU policy (host-only testable);
-/// budget enforcement is the store's. Match returns the LONGEST stored prompt
-/// that is an exact leading prefix of the query — the longest skip-able
-/// prefill; a stored prompt is only reusable whole, never truncated by match.
-#[derive(Default)]
-struct PrefixIndex {
-    entries: Vec<PrefixIndexEntry>,
-    /// Minted UNCONDITIONALLY once per capture call so rank-local insert
-    /// outcomes can diverge without desyncing the counters across TP ranks.
-    next_key: u64,
-    clock: u64,
-}
-
-struct PrefixIndexEntry {
-    tokens: Vec<u32>,
-    key: u64,
-    /// LRU recency stamp (max = hottest).
-    stamp: u64,
-}
-
-impl PrefixIndex {
-    fn mint_key(&mut self) -> u64 {
-        self.next_key += 1;
-        self.next_key
-    }
-
-    fn match_len(&self, tokens: &[u32]) -> usize {
-        self.entries
-            .iter()
-            .map(|e| e.tokens.len())
-            .filter(|&len| len <= tokens.len() && self.covers(tokens, len))
-            .max()
-            .unwrap_or(0)
-    }
-
-    fn covers(&self, tokens: &[u32], len: usize) -> bool {
-        self.entries
-            .iter()
-            .any(|e| e.tokens.len() == len && tokens[..len] == e.tokens[..])
-    }
-
-    /// Longest stored prompt that leads `tokens` and covers `len` — the entry
-    /// a TP-consensus `matched_len` (possibly shorter than the local best)
-    /// resolves to. Bumps recency. Returns `(tier key, stored prompt len)`.
-    fn lookup_covering(&mut self, tokens: &[u32], len: usize) -> Option<(u64, usize)> {
-        if len == 0 || len > tokens.len() {
-            return None;
-        }
-        let idx = self
-            .entries
-            .iter()
-            .enumerate()
-            .filter(|(_, e)| {
-                let l = e.tokens.len();
-                l >= len && l <= tokens.len() && tokens[..l] == e.tokens[..]
-            })
-            .max_by_key(|(_, e)| e.tokens.len())
-            .map(|(i, _)| i)?;
-        self.clock += 1;
-        let entry = &mut self.entries[idx];
-        entry.stamp = self.clock;
-        Some((entry.key, entry.tokens.len()))
-    }
-
-    /// Register a stored prompt under `key`, hottest. An identical prompt is
-    /// replaced in place; its superseded tier key is returned so the caller
-    /// drops the orphaned blob.
-    fn insert(&mut self, tokens: Vec<u32>, key: u64) -> Option<u64> {
-        self.clock += 1;
-        let stamp = self.clock;
-        if let Some(entry) = self.entries.iter_mut().find(|e| e.tokens == tokens) {
-            let superseded = entry.key;
-            entry.key = key;
-            entry.stamp = stamp;
-            return Some(superseded);
-        }
-        self.entries.push(PrefixIndexEntry { tokens, key, stamp });
-        None
-    }
-
-    /// Remove and return the coldest entry's tier key (store-pressure
-    /// eviction: prefixes yield, parked slots are engine-owned and never
-    /// touched). `None` when the index is empty.
-    fn pop_coldest(&mut self) -> Option<u64> {
-        let idx = self
-            .entries
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, e)| e.stamp)
-            .map(|(i, _)| i)?;
-        Some(self.entries.swap_remove(idx).key)
-    }
-}
 
 /// One demoted slot: the device-state image plus the executor-level MTP spec
 /// chain. `spec_pending`/`spec_hidden` MUST ride along (not reset): under
@@ -2382,7 +2277,6 @@ impl Dsv4CudaExecutor {
                 default_t1_budget_bytes(DEFAULT_DRAM_FRACTION),
                 BLOB_CHUNK_BYTES,
             ),
-            prefix_index: PrefixIndex::default(),
         })
     }
 
@@ -2396,12 +2290,9 @@ impl Dsv4CudaExecutor {
             .set_disk(root, budget_bytes, BLOB_CHUNK_BYTES)
     }
 
-    /// Pre-serve re-budget rebuilds THE store, orphaning every stored blob —
-    /// the prefix index must reset with it (rank-symmetric: every rank
-    /// rebuilds from the same config, so key counters stay aligned).
+    /// Pre-serve re-budget rebuilds THE store, orphaning every stored blob.
     pub(crate) fn set_kv_tier_budget_bytes(&mut self, bytes: usize) {
         self.slot_tier = CudaKvTierStore::with_budget(bytes, BLOB_CHUNK_BYTES);
-        self.prefix_index = PrefixIndex::default();
     }
 
     pub(crate) fn kv_tier_host_demoted_pages(&self) -> usize {
@@ -2500,199 +2391,10 @@ impl Dsv4CudaExecutor {
         }
     }
 
-    /// Length of the longest stored position-0 prompt that is an exact leading
-    /// prefix of `tokens`. `0` when the store is disabled or has no match.
-    pub(crate) fn cached_prefix_match_len(&self, tokens: &[u32]) -> Result<usize> {
-        let local = self.prefix_index.match_len(tokens);
-        self.tp_min_usize(local, "prefix match len")
-    }
-
     /// `BackendExecutor::tp_sync_min` — see there for why the scheduler needs
     /// this (2026-07-05 TP=4 admission livelock).
     pub(crate) fn tp_sync_min(&self, local: usize) -> Result<usize> {
         self.tp_min_usize(local, "admission free pages")
-    }
-
-    /// Capture `slot`'s whole-slot KV snapshot into the position-0 prefix store,
-    /// keyed by `tokens` (the full prompt).
-    ///
-    /// CORRECTNESS INVARIANT: the request must have prefilled from absolute
-    /// position 0, so the slot's materialized KV is exactly `tokens` at
-    /// positions `[0, tokens.len())`. We assert the slot's materialized length
-    /// equals the prompt length (start_pos==0 ⇒ every prompt token's KV is
-    /// resident and no generated token's KV is included — the engine calls this
-    /// before the next decode write). A mismatch means the request did not start
-    /// at 0 (already had a reattached prefix) or generated past the prompt; we
-    /// refuse to cache rather than store a misaligned image.
-    pub(crate) fn capture_cached_prefix(&mut self, slot: usize, tokens: &[u32]) -> Result<()> {
-        if tokens.is_empty() {
-            return Ok(());
-        }
-        ensure!(
-            slot < self.num_slots,
-            "DSv4 capture_cached_prefix slot {slot} outside executor slots {}",
-            self.num_slots
-        );
-        let materialized = self.slots[slot].seq_len();
-        // start_pos==0 anchor: the slot must hold exactly the prompt prefix.
-        // Caching is best-effort, so a misaligned slot is skipped (not fatal):
-        // the engine only loses the reuse opportunity for this request.
-        if materialized != tokens.len() {
-            return Ok(());
-        }
-        // Minted BEFORE anything fallible so rank-local capture/insert
-        // outcomes never desync the cross-rank key counters (match is
-        // TP-min'd, so a divergent rank just yields no reuse — no collectives).
-        let key = self.prefix_index.mint_key();
-        let image = self.slots[slot].swap_out_image(&self.model.ctx, &self.kv_adapter)?;
-        debug_assert_eq!(
-            image.seq_len(),
-            tokens.len(),
-            "DSv4 position-0 prefix snapshot seq_len must equal prompt length"
-        );
-        let bytes = image.to_bytes();
-        if bytes.len().div_ceil(self.slot_tier.page_bytes()) >= self.slot_tier.capacity_pages() {
-            return Ok(()); // larger than the whole store — never insertable
-        }
-        // Best-effort under store pressure: evict coldest PREFIX blobs until
-        // the new one fits. Parked slots (NS_SLOT*) are engine-owned and
-        // never touched by prefix eviction.
-        let mut inserted = self
-            .slot_tier
-            .insert_chunked(NS_PREFIX, NS_PREFIX_CHUNK, key, &bytes);
-        while !inserted {
-            let Some(coldest) = self.prefix_index.pop_coldest() else {
-                break;
-            };
-            log::info!(
-                "DSv4 prefix capture: evicting coldest blob key={coldest} to fit key={key} \
-                 ({} bytes; store host={} disk={})",
-                bytes.len(),
-                self.slot_tier.host_demoted_pages(),
-                self.slot_tier.disk_pages()
-            );
-            self.slot_tier
-                .remove_chunked(NS_PREFIX, NS_PREFIX_CHUNK, coldest);
-            inserted = self
-                .slot_tier
-                .insert_chunked(NS_PREFIX, NS_PREFIX_CHUNK, key, &bytes);
-        }
-        if inserted && let Some(superseded) = self.prefix_index.insert(tokens.to_vec(), key) {
-            self.slot_tier
-                .remove_chunked(NS_PREFIX, NS_PREFIX_CHUNK, superseded);
-            log::info!(
-                "DSv4 prefix capture: key={key} ({} tokens, {} bytes) superseded key={superseded} \
-                 (store after: host={} disk={})",
-                tokens.len(),
-                bytes.len(),
-                self.slot_tier.host_demoted_pages(),
-                self.slot_tier.disk_pages()
-            );
-        } else {
-            log::debug!(
-                "DSv4 prefix capture: key={key} ({} tokens, {} bytes) inserted={inserted} \
-                 (store: host={} disk={})",
-                tokens.len(),
-                bytes.len(),
-                self.slot_tier.host_demoted_pages(),
-                self.slot_tier.disk_pages()
-            );
-        }
-        Ok(())
-    }
-
-    /// Restore the cached position-0 prefix snapshot for `tokens[..matched_len]`
-    /// into `slot`. The engine has already allocated `matched_len` tokens of
-    /// host KV pages on `slot` and resumes prefill from absolute position
-    /// `matched_len` right after.
-    ///
-    /// CORRECTNESS INVARIANT: the cached image was captured at start_pos==0, so
-    /// its KV lands at the SAME absolute positions `[0, matched_len)` here —
-    /// `swap_in_image` re-resolves the target slot's page table but never
-    /// re-rotates positions, so the RoPE-rotated K, the SW ring slot
-    /// (`abs_pos % window`), and the DSA indexer keys are all position-identical.
-    /// The spec (MTP) draft state is reset to empty: the tail prefill re-seeds it
-    /// (it is per-request, not part of the prefix KV).
-    pub(crate) fn restore_cached_prefix(
-        &mut self,
-        slot: usize,
-        tokens: &[u32],
-        matched_len: usize,
-        slot_pages: &[u32],
-    ) -> Result<()> {
-        ensure!(
-            slot < self.num_slots,
-            "DSv4 restore_cached_prefix slot {slot} outside executor slots {}",
-            self.num_slots
-        );
-        ensure!(
-            matched_len > 0 && matched_len <= tokens.len(),
-            "DSv4 restore_cached_prefix matched_len {matched_len} invalid for prompt len {}",
-            tokens.len()
-        );
-        // Rank-local: resolve the covering entry (bumps LRU — the blob stays
-        // in the store) and reassemble its snapshot. Exactly TWO collectives
-        // on every path (read consensus, restore consensus).
-        let image = self
-            .prefix_index
-            .lookup_covering(tokens, matched_len)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "DSv4 prefix store has no snapshot covering prompt prefix len {matched_len}"
-                )
-            })
-            .and_then(|(key, _)| self.slot_tier.read_chunked(NS_PREFIX, NS_PREFIX_CHUNK, key))
-            .and_then(|bytes| {
-                crate::dsv4::Dsv4SlotSnapshot::from_bytes(&bytes)
-                    .map_err(|e| anyhow::anyhow!("DSv4 prefix snapshot parse: {e:#}"))
-            });
-        let image_ok = usize::from(image.is_ok());
-        if self.tp_min_usize(image_ok, "prefix restore read")? == 0 {
-            return Err(image
-                .err()
-                .unwrap_or_else(|| anyhow::anyhow!("peer rank failed DSv4 prefix restore read")));
-        }
-        let image = image?;
-        let image_len = image.seq_len();
-        // Rank-local: mirror host pages and restore the image ONLY on an EXACT
-        // length match. A longer stored image (`image_len > matched_len`) is
-        // deliberately rejected rather than restored-then-truncated: the
-        // compressor/indexer's `pending_kv`/`pending_score`/`prev_overlap_*`
-        // and every layer's `sw_window_cache` are ring/carry buffers with no
-        // absolute-position tag, captured to reflect state as of `image_len`.
-        // Truncating the seq_len counter back to `matched_len` does not (and,
-        // short of a full from-position-0 recompute, structurally cannot)
-        // rewind their CONTENT — `prev_overlap` is a single-slot "most
-        // recently completed block" register with no second copy of the
-        // block before it, and `sw_window_cache[pos % sliding_window]` is
-        // overwritten by any later same-residue write in `[matched_len,
-        // image_len)`. See docs/experience/errors/2026-07-06-dsv4-concurrent-decode-digit-corruption-unresolved.md
-        // ("Full persistent-buffer enumeration audit") for the full derivation.
-        // `lookup_covering` still intentionally prefers the LONGEST covering
-        // entry (TP-consensus: a peer rank may lack an exact-length entry) —
-        // rejecting here, rather than there, keeps that consensus lookup
-        // untouched and falls back to the already-correct full-reprefill path
-        // (`attach_cached_prefix`'s existing restore-failure branch).
-        let restored = (image_len == matched_len)
-            .then_some(())
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "DSv4 cached prefix snapshot len {image_len} != requested matched_len {matched_len} \
-                     (partial-block reuse is unsafe for compressor/SW-ring state, rejecting)"
-                )
-            })
-            .and_then(|()| self.mirror_restore_pages(slot, slot_pages, image_len))
-            .and_then(|()| {
-                self.spec_slots[slot] = Dsv4SpecSlotState::default();
-                self.slots[slot].swap_in_image(&self.model.ctx, &mut self.kv_adapter, &image)
-            });
-        let restore_ok = usize::from(restored.is_ok());
-        if self.tp_min_usize(restore_ok, "prefix restore snapshot")? == 0 {
-            return Err(restored
-                .err()
-                .unwrap_or_else(|| anyhow::anyhow!("peer rank failed DSv4 prefix restore")));
-        }
-        restored
     }
 
     /// One no-spec greedy forward that ALSO stages the MTP draft state (pending
@@ -5664,83 +5366,17 @@ fn maybe_dump_sample_topk(ctx: &DeviceContext, logits: &DeviceVec, position: u64
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        CudaKvCacheDtype, NS_PREFIX, NS_PREFIX_CHUNK, NS_SLOT, NS_SLOT_CHUNK, PrefixIndex,
-    };
+    use super::{CudaKvCacheDtype, NS_SLOT, NS_SLOT_CHUNK};
     use crate::kv_tier::{chunk_sub, tier_key};
     use infer_seam::KvCacheDtype;
 
     #[test]
-    fn prefix_index_matches_longest_leading_prefix() {
-        let mut idx = PrefixIndex::default();
-        let k1 = idx.mint_key();
-        idx.insert(vec![10, 20], k1);
-        let k2 = idx.mint_key();
-        idx.insert(vec![10, 20, 30, 40], k2);
-        // A query extending the longer stored prompt matches the longer one.
-        assert_eq!(idx.match_len(&[10, 20, 30, 40, 50]), 4);
-        // A query that only extends the shorter prompt matches the shorter one.
-        assert_eq!(idx.match_len(&[10, 20, 99]), 2);
-        // An exact full match returns the full length.
-        assert_eq!(idx.match_len(&[10, 20]), 2);
-        // A divergent query matches nothing.
-        assert_eq!(idx.match_len(&[10, 99]), 0);
-        // A query SHORTER than every stored prompt matches nothing (a stored
-        // prompt may only be reused as a leading prefix, never truncated).
-        assert_eq!(idx.match_len(&[10]), 0);
-    }
-
-    #[test]
-    fn prefix_index_lookup_covering_resolves_consensus_len() {
-        let mut idx = PrefixIndex::default();
-        let key = idx.mint_key();
-        idx.insert(vec![1, 2, 3, 4], key);
-        // A TP-consensus matched_len shorter than the stored prompt resolves
-        // to the covering entry (restore truncates down afterwards).
-        assert_eq!(idx.lookup_covering(&[1, 2, 3, 4, 5], 2), Some((key, 4)));
-        // No covering entry → None (divergent tokens / len 0 / len too long).
-        assert_eq!(idx.lookup_covering(&[9, 9, 9], 1), None);
-        assert_eq!(idx.lookup_covering(&[1, 2, 3, 4], 0), None);
-        assert_eq!(idx.lookup_covering(&[1, 2], 5), None);
-    }
-
-    #[test]
-    fn prefix_index_pop_coldest_respects_lookup_recency() {
-        let mut idx = PrefixIndex::default();
-        let k1 = idx.mint_key();
-        idx.insert(vec![1], k1);
-        let k2 = idx.mint_key();
-        idx.insert(vec![2], k2);
-        // Touch entry 1 so entry 2 becomes the coldest.
-        assert!(idx.lookup_covering(&[1, 5], 1).is_some());
-        assert_eq!(idx.pop_coldest(), Some(k2), "coldest = untouched entry");
-        assert_eq!(idx.pop_coldest(), Some(k1));
-        assert_eq!(idx.pop_coldest(), None, "empty index pops nothing");
-    }
-
-    #[test]
-    fn prefix_index_identical_prompt_replaces_and_returns_superseded_key() {
-        let mut idx = PrefixIndex::default();
-        let k1 = idx.mint_key();
-        assert_eq!(idx.insert(vec![1, 2], k1), None);
-        let k2 = idx.mint_key();
-        assert_eq!(
-            idx.insert(vec![1, 2], k2),
-            Some(k1),
-            "superseded blob key returned for cleanup"
-        );
-        assert_eq!(idx.lookup_covering(&[1, 2], 2), Some((k2, 2)));
-    }
-
-    #[test]
     fn tier_key_namespaces_never_collide() {
-        // Same feature key across all four namespaces → four distinct store keys.
+        // Same feature key across both namespaces → distinct store keys.
         let key = 7u64;
         let keys = [
             tier_key(NS_SLOT, key),
             tier_key(NS_SLOT_CHUNK, chunk_sub(key, 0)),
-            tier_key(NS_PREFIX, key),
-            tier_key(NS_PREFIX_CHUNK, chunk_sub(key, 0)),
         ];
         for (i, a) in keys.iter().enumerate() {
             for b in keys.iter().skip(i + 1) {
