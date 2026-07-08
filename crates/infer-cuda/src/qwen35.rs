@@ -537,6 +537,108 @@ impl Qwen35RecurrentSnapshot {
             + self.conv.iter().map(|v| v.len() * 2).sum::<usize>()
             + self.full_attn_kv.as_ref().map_or(0, |v| v.len())
     }
+
+    /// Flatten the recurrent + full-attn KV snapshot into ONE length-prefixed
+    /// buffer for the sidecar [`crate::kv_tier::CudaKvTierStore`] (opaque-`u64`
+    /// key). The recurrent state and the full-attn KV are serialized together as
+    /// one atomic blob — a partial store/restore corrupts model output. Exact
+    /// byte-inverse of [`Self::from_bytes`] (proven in `recurrent_snapshot_byte_inverse`).
+    /// Header: `[num_gdr][num_conv][has_kv][kv_len]` (u64 LE), then the KV bytes,
+    /// then each gdr vec `[len:u64][f32 LE...]` and each conv vec `[len:u64][bf16 LE...]`.
+    pub(crate) fn to_bytes(&self) -> Vec<u8> {
+        let kv = self.full_attn_kv.as_deref().unwrap_or(&[]);
+        let mut buf = Vec::with_capacity(self.host_bytes() + 64);
+        buf.extend_from_slice(&(self.gdr.len() as u64).to_le_bytes());
+        buf.extend_from_slice(&(self.conv.len() as u64).to_le_bytes());
+        buf.extend_from_slice(&(self.full_attn_kv.is_some() as u64).to_le_bytes());
+        buf.extend_from_slice(&(kv.len() as u64).to_le_bytes());
+        buf.extend_from_slice(kv);
+        for gdr in &self.gdr {
+            buf.extend_from_slice(&(gdr.len() as u64).to_le_bytes());
+            for &x in gdr {
+                buf.extend_from_slice(&x.to_le_bytes());
+            }
+        }
+        for conv in &self.conv {
+            buf.extend_from_slice(&(conv.len() as u64).to_le_bytes());
+            for &x in conv {
+                buf.extend_from_slice(&x.to_le_bytes());
+            }
+        }
+        buf
+    }
+
+    /// Reconstruct a snapshot from [`Self::to_bytes`] — the exact byte-inverse.
+    /// Any short/over-long buffer (corrupt or foreign payload) errors rather than
+    /// restore garbage, so the caller falls through to clean recompute.
+    pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let mut pos = 0usize;
+        let take_u64 = |pos: &mut usize| -> Result<u64> {
+            let end = pos
+                .checked_add(8)
+                .ok_or_else(|| anyhow!("recurrent snapshot header overflow"))?;
+            let slice = bytes
+                .get(*pos..end)
+                .ok_or_else(|| anyhow!("recurrent snapshot truncated reading u64 at {pos}"))?;
+            *pos = end;
+            Ok(u64::from_le_bytes(slice.try_into().expect("8 bytes")))
+        };
+        let num_gdr = take_u64(&mut pos)? as usize;
+        let num_conv = take_u64(&mut pos)? as usize;
+        let has_kv = take_u64(&mut pos)? != 0;
+        let kv_len = take_u64(&mut pos)? as usize;
+        let kv_end = pos
+            .checked_add(kv_len)
+            .ok_or_else(|| anyhow!("recurrent snapshot kv length overflow"))?;
+        let kv_bytes = bytes
+            .get(pos..kv_end)
+            .ok_or_else(|| anyhow!("recurrent snapshot truncated reading full-attn kv"))?
+            .to_vec();
+        pos = kv_end;
+        let full_attn_kv = has_kv.then_some(kv_bytes);
+        let mut gdr = Vec::with_capacity(num_gdr);
+        for _ in 0..num_gdr {
+            let len = take_u64(&mut pos)? as usize;
+            let end = pos
+                .checked_add(len * 4)
+                .ok_or_else(|| anyhow!("recurrent snapshot gdr length overflow"))?;
+            let raw = bytes
+                .get(pos..end)
+                .ok_or_else(|| anyhow!("recurrent snapshot truncated reading gdr state"))?;
+            gdr.push(
+                raw.chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect(),
+            );
+            pos = end;
+        }
+        let mut conv = Vec::with_capacity(num_conv);
+        for _ in 0..num_conv {
+            let len = take_u64(&mut pos)? as usize;
+            let end = pos
+                .checked_add(len * 2)
+                .ok_or_else(|| anyhow!("recurrent snapshot conv length overflow"))?;
+            let raw = bytes
+                .get(pos..end)
+                .ok_or_else(|| anyhow!("recurrent snapshot truncated reading conv state"))?;
+            conv.push(
+                raw.chunks_exact(2)
+                    .map(|c| bf16::from_le_bytes([c[0], c[1]]))
+                    .collect(),
+            );
+            pos = end;
+        }
+        ensure!(
+            pos == bytes.len(),
+            "recurrent snapshot has {} trailing bytes after deserialize",
+            bytes.len() - pos
+        );
+        Ok(Self {
+            gdr,
+            conv,
+            full_attn_kv,
+        })
+    }
 }
 
 /// FNV-1a hash of a token id slice — used to key the recurrent sidecar.

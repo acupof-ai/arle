@@ -7,9 +7,10 @@
 use std::path::Path;
 use std::time::Instant;
 
-use anyhow::{Result, ensure};
+use anyhow::{Result, anyhow, ensure};
 use cuda_kernels::KVFormat;
 use cuda_kernels::prelude::{DeviceContext, DeviceVec, PagedKVPool};
+use deepseek_spec::DeepSeekV4AttentionMode;
 use infer_plan::{DecodeRow, ForwardPlan, SamplingParams, SlotToken, StepOutput};
 use infer_seam::{
     KvBatchDescriptor, KvBatchRowKind, KvPool, PrefixBlock, pages_only_reusable_prefix_blocks,
@@ -428,17 +429,6 @@ impl RealCudaExecutor {
         }
     }
 
-    pub(crate) fn capture_cached_prefix(&mut self, slot: usize, tokens: &[u32]) -> Result<()> {
-        match self {
-            // DSv4's Route B capture is gone (see cached_prefix_match_len doc);
-            // Qwen35 reuses this same seam hook for its own, unrelated
-            // recurrent-sidecar capture — that stays.
-            Self::Dsv4(_) => Ok(()),
-            Self::Qwen35(q) => q.capture_recurrent_sidecar(slot, tokens),
-            Self::Qwen(_) => Ok(()),
-        }
-    }
-
     pub(crate) fn restore_cached_prefix(
         &mut self,
         _slot: usize,
@@ -462,8 +452,33 @@ impl RealCudaExecutor {
     ) -> Result<()> {
         match self {
             Self::Qwen35(q) => q.restore_recurrent_sidecar(slot, tokens, matched_len, prefix_pages),
-            Self::Dsv4(d) => d.restore_compress_state_prefix(matched_len),
+            Self::Dsv4(d) => d.restore_route_a_prefix_state(slot, matched_len),
             Self::Qwen(_) => Ok(()),
+        }
+    }
+
+    /// Capture the page-radix sidecar for `slot` at the just-published prefix
+    /// `tokens[..matched_len]`. Qwen3.5/3.6 hybrid stores recurrent + full-attn
+    /// KV atomically into the tier; no-op for DSv4/Qwen3.
+    pub(crate) fn save_prefix_sidecar(
+        &mut self,
+        slot: usize,
+        tokens: &[u32],
+        matched_len: usize,
+        prefix_pages: &[u32],
+    ) -> Result<()> {
+        match self {
+            Self::Qwen35(q) => q.save_recurrent_sidecar(slot, tokens, matched_len, prefix_pages),
+            Self::Dsv4(_) | Self::Qwen(_) => Ok(()),
+        }
+    }
+
+    /// Radix evicted these host-pool prefix pages: drop any sidecar keyed to
+    /// them (eviction rides the radix, no independent sidecar LRU). Qwen3.5/3.6
+    /// hybrid only; other arms hold no per-page mirror below the seam.
+    pub(crate) fn release_prefix_pages(&mut self, pages: &[u32]) {
+        if let Self::Qwen35(q) = self {
+            q.release_sidecar_pages(pages);
         }
     }
 
@@ -712,6 +727,7 @@ impl RealCudaExecutor {
 
 use crate::kv_tier::{
     BLOB_CHUNK_BYTES, CudaKvTierStore, compress_state_tier_key, default_t1_budget_bytes,
+    dsa_official_tier_key, sw_ring_tier_key,
 };
 
 /// Placeholder, not measurement-derived — dormant until `demote` is wired.
@@ -1809,6 +1825,12 @@ pub(crate) struct Dsv4CudaExecutor {
     /// Same as `compress_tier`, for the CSA indexer's `index_head_dim`-width
     /// pool (different page byte size, hence its own store).
     indexer_compress_tier: CudaKvTierStore,
+    /// Dedicated tier store for `dsa_official`'s write-mirrored shadow pool
+    /// (row-granularity pages, `index_head_dim + 4` bytes each).
+    dsa_official_tier: CudaKvTierStore,
+    /// Dedicated tier store for the SW-ring periodic snapshot pool
+    /// (`sliding_window * head_dim` bf16 pages).
+    sw_ring_tier: CudaKvTierStore,
 }
 
 /// `slot_tier` key namespaces (top byte, see `kv_tier::tier_key`), so features
@@ -1817,6 +1839,11 @@ pub(crate) struct Dsv4CudaExecutor {
 /// Parked whole-slot images (key = engine-minted swap key).
 const NS_SLOT: u64 = 1;
 const NS_SLOT_CHUNK: u64 = 2;
+/// Qwen3.5/3.6 recurrent prefix sidecars (key = token-prefix hash). Disjoint
+/// namespace from `NS_SLOT`, so the Qwen3.6 arm's ONE `slot_tier` holds both the
+/// whole-slot spill images and the page-radix sidecars without key aliasing.
+const NS_SIDECAR: u64 = 3;
+const NS_SIDECAR_CHUNK: u64 = 4;
 
 /// `Dsv4CompressStatePool` only exists for `compress_ratio == 4` layers.
 const DSV4_COMPRESS_STATE_RATIO: usize = 4;
@@ -2287,6 +2314,14 @@ impl Dsv4CudaExecutor {
             .saturating_mul(DSV4_COMPRESS_STATE_RATIO)
             .saturating_mul(model.config.index_head_dim)
             .saturating_mul(2);
+        // Must match `Dsv4DsaKeyCachePool`/`Dsv4SwRingSnapshotPool`'s own
+        // per-row / per-block payload layout.
+        let dsa_official_page_bytes = model.config.index_head_dim + std::mem::size_of::<f32>();
+        let sw_ring_page_bytes = model
+            .config
+            .sliding_window
+            .saturating_mul(model.config.head_dim)
+            .saturating_mul(2);
         Ok(Self {
             model,
             slots,
@@ -2306,6 +2341,14 @@ impl Dsv4CudaExecutor {
             indexer_compress_tier: CudaKvTierStore::with_budget(
                 COMPRESS_STATE_TIER_BUDGET_BYTES,
                 indexer_compress_page_bytes.max(1),
+            ),
+            dsa_official_tier: CudaKvTierStore::with_budget(
+                COMPRESS_STATE_TIER_BUDGET_BYTES,
+                dsa_official_page_bytes.max(1),
+            ),
+            sw_ring_tier: CudaKvTierStore::with_budget(
+                COMPRESS_STATE_TIER_BUDGET_BYTES,
+                sw_ring_page_bytes.max(1),
             ),
             slot_tier: CudaKvTierStore::with_budget(
                 default_t1_budget_bytes(DEFAULT_DRAM_FRACTION),
@@ -2364,9 +2407,69 @@ impl Dsv4CudaExecutor {
         true
     }
 
+    /// The uniform indexer ratio across every `has_indexer()` layer (CSA:
+    /// `compress_ratio`; GLM SparseIndexed: `1`) — mirrors `Dsv4Model::
+    /// kv_budget_plan`'s `idx_cr`. `None` when the model has no indexer layer
+    /// at all (dsa_official imposes no constraint).
+    fn dsa_index_ratio(&self) -> Option<usize> {
+        self.model
+            .layers
+            .iter()
+            .find(|layer| layer.mode.has_indexer())
+            .map(|layer| {
+                if layer.mode == DeepSeekV4AttentionMode::SparseIndexed {
+                    1
+                } else {
+                    layer.compress_ratio
+                }
+            })
+    }
+
+    /// Resident or tier-backed, across every `has_indexer()` layer's
+    /// write-mirrored shadow pool (`None` pools impose no constraint).
+    fn dsa_official_boundary_available(&self, row: usize) -> bool {
+        for layer_idx in 0..self.kv_adapter.num_layers() {
+            let Ok(layer) = self.kv_adapter.layer(layer_idx) else {
+                return false;
+            };
+            if let Some(pool) = layer.dsa_key_cache_pool()
+                && !pool.is_resident(row)
+                && !self
+                    .dsa_official_tier
+                    .contains(dsa_official_tier_key(layer_idx, row))
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Resident or tier-backed, across every layer's SW-ring snapshot pool.
+    fn sw_ring_boundary_available(&self, block_index: usize) -> bool {
+        for layer_idx in 0..self.kv_adapter.num_layers() {
+            let Ok(layer) = self.kv_adapter.layer(layer_idx) else {
+                return false;
+            };
+            if let Some(pool) = layer.sw_ring_pool()
+                && !pool.is_resident(block_index)
+                && !self
+                    .sw_ring_tier
+                    .contains(sw_ring_tier_key(layer_idx, block_index))
+            {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Only the LAST compress-block in each KV page needs to be resident
     /// (`compressed_base - 1` is the only cross-request read a restore
-    /// depends on) — not every block the page covers.
+    /// depends on) — not every block the page covers. The SW ring only
+    /// materializes at `sliding_window`-token boundaries, so a candidate KV
+    /// page only COMMITS (extends the returned count) when its token count is
+    /// also a `sliding_window` multiple — finer-grained pages that pass the
+    /// compress-state/dsa checks but aren't ring-aligned keep the scan going
+    /// without advancing the commit point.
     pub(crate) fn reusable_prefix_blocks(&self, blocks: &[PrefixBlock]) -> usize {
         let Some(kv_page_size) = self.kv_adapter.flashmla_page_size() else {
             return 0;
@@ -2375,47 +2478,120 @@ impl Dsv4CudaExecutor {
             return 0;
         }
         let blocks_per_page = kv_page_size / DSV4_COMPRESS_STATE_RATIO;
-        let mut reusable = 0usize;
-        for block in blocks {
+        let sliding_window = self.model.config.sliding_window;
+        let dsa_index_ratio = self.dsa_index_ratio();
+        let mut committed = 0usize;
+        for (page_idx, block) in blocks.iter().enumerate() {
             if !matches!(block, PrefixBlock::ResidentPage(_)) {
                 break;
             }
-            let boundary_block = (reusable + 1) * blocks_per_page - 1;
-            if self.compress_state_boundary_available(boundary_block) {
-                reusable += 1;
-            } else {
+            let pages = page_idx + 1;
+            let boundary_block = pages * blocks_per_page - 1;
+            if !self.compress_state_boundary_available(boundary_block) {
                 break;
             }
+            let boundary_tokens = pages * kv_page_size;
+            if let Some(ratio) = dsa_index_ratio
+                && ratio > 0
+                && boundary_tokens.is_multiple_of(ratio)
+                && !self.dsa_official_boundary_available(boundary_tokens / ratio - 1)
+            {
+                break;
+            }
+            if sliding_window > 0 {
+                if !boundary_tokens.is_multiple_of(sliding_window) {
+                    continue; // available, but not yet ring-aligned — keep scanning
+                }
+                if !self.sw_ring_boundary_available(boundary_tokens / sliding_window - 1) {
+                    break;
+                }
+            }
+            committed = pages;
         }
-        reusable
+        committed
     }
 
-    /// Promotes the boundary block `reusable_prefix_blocks` gated the match
-    /// on. An `Err` here propagates to the engine's fallback (free slot, full
+    /// Promotes the boundary state `reusable_prefix_blocks` gated the match
+    /// on, across all three Route-A pools, into `slot`'s own per-slot bands
+    /// (`dsa_key_cache`, `sw_window_cache` — the compress-state pool needs no
+    /// copy-in, its live kernels already address the shared pool directly).
+    /// An `Err` here propagates to the engine's fallback (free slot, full
     /// recompute) — never proceeds with an unpromoted boundary.
-    pub(crate) fn restore_compress_state_prefix(&mut self, matched_len: usize) -> Result<()> {
-        if matched_len < DSV4_COMPRESS_STATE_RATIO {
-            return Ok(());
-        }
-        let block_index = matched_len / DSV4_COMPRESS_STATE_RATIO - 1;
+    pub(crate) fn restore_route_a_prefix_state(
+        &mut self,
+        slot: usize,
+        matched_len: usize,
+    ) -> Result<()> {
         let ctx = self.model.ctx.clone();
-        for layer_idx in 0..self.kv_adapter.num_layers() {
-            let layer = self.kv_adapter.layer_mut(layer_idx)?;
-            if let Some(pool) = layer.compress_state_pool_mut() {
-                let key = compress_state_tier_key(layer_idx, block_index);
-                ensure!(
-                    pool.ensure_resident(&ctx, &mut self.compress_tier, key, block_index)?,
-                    "DSv4 compress-state restore: main pool block {block_index} (layer \
-                     {layer_idx}) is neither resident nor tier-backed"
-                );
+        if matched_len >= DSV4_COMPRESS_STATE_RATIO {
+            let block_index = matched_len / DSV4_COMPRESS_STATE_RATIO - 1;
+            for layer_idx in 0..self.kv_adapter.num_layers() {
+                let layer = self.kv_adapter.layer_mut(layer_idx)?;
+                if let Some(pool) = layer.compress_state_pool_mut() {
+                    let key = compress_state_tier_key(layer_idx, block_index);
+                    ensure!(
+                        pool.ensure_resident(&ctx, &mut self.compress_tier, key, block_index)?,
+                        "DSv4 compress-state restore: main pool block {block_index} (layer \
+                         {layer_idx}) is neither resident nor tier-backed"
+                    );
+                }
+                if let Some(pool) = layer.indexer_compress_state_pool_mut() {
+                    let key = compress_state_tier_key(layer_idx, block_index);
+                    ensure!(
+                        pool.ensure_resident(
+                            &ctx,
+                            &mut self.indexer_compress_tier,
+                            key,
+                            block_index
+                        )?,
+                        "DSv4 compress-state restore: indexer pool block {block_index} (layer \
+                         {layer_idx}) is neither resident nor tier-backed"
+                    );
+                }
             }
-            if let Some(pool) = layer.indexer_compress_state_pool_mut() {
-                let key = compress_state_tier_key(layer_idx, block_index);
+        }
+        if let Some(ratio) = self.dsa_index_ratio()
+            && ratio > 0
+            && matched_len >= ratio
+        {
+            let row_count = matched_len / ratio;
+            let row_boundary = row_count - 1;
+            for layer_idx in 0..self.kv_adapter.num_layers() {
+                let layer = self.kv_adapter.layer_mut(layer_idx)?;
+                let Some(pool) = layer.dsa_key_cache_pool_mut() else {
+                    continue;
+                };
+                let key = dsa_official_tier_key(layer_idx, row_boundary);
                 ensure!(
-                    pool.ensure_resident(&ctx, &mut self.indexer_compress_tier, key, block_index)?,
-                    "DSv4 compress-state restore: indexer pool block {block_index} (layer \
-                     {layer_idx}) is neither resident nor tier-backed"
+                    pool.ensure_resident(&ctx, &mut self.dsa_official_tier, key, row_boundary)?,
+                    "DSv4 DSA key-cache restore: row {row_boundary} (layer {layer_idx}) is \
+                     neither resident nor tier-backed"
                 );
+                layer.restore_dsa_prefix_into_slot(&ctx, slot, row_count)?;
+            }
+        }
+        let sliding_window = self.model.config.sliding_window;
+        if sliding_window > 0 && matched_len.is_multiple_of(sliding_window) && matched_len > 0 {
+            let block_index = matched_len / sliding_window - 1;
+            for layer_idx in 0..self.kv_adapter.num_layers() {
+                let layer = self.kv_adapter.layer_mut(layer_idx)?;
+                let Some(pool) = layer.sw_ring_pool_mut() else {
+                    continue;
+                };
+                let key = sw_ring_tier_key(layer_idx, block_index);
+                ensure!(
+                    pool.ensure_resident(&ctx, &mut self.sw_ring_tier, key, block_index)?,
+                    "DSv4 SW ring restore: block {block_index} (layer {layer_idx}) is neither \
+                     resident nor tier-backed"
+                );
+                let slot_state = self
+                    .slots
+                    .get_mut(slot)
+                    .ok_or_else(|| anyhow!("DSv4 SW ring restore: slot {slot} outside range"))?;
+                let ring = slot_state
+                    .attention_layer_mut(layer_idx)?
+                    .sw_window_cache_mut();
+                pool.restore_into_ring(&ctx, ring, block_index)?;
             }
         }
         Ok(())
@@ -3281,18 +3457,17 @@ pub(crate) struct Qwen35CudaExecutor {
     /// re-acquired before the next round's rollout). Not on the serve path.
     kv_pool_mem_fraction_static: f64,
     kv_pool_requested_pages: usize,
-    /// Sidecar snapshot store: token-prefix hash → recurrent state at that boundary.
-    /// Enables page-radix prefix reuse for hybrid models by restoring the
-    /// recurrent layers when a KV prefix is reattached (issue #85).
-    /// Capped at `RECURRENT_SIDECAR_CAP` entries, least-recently-used evicted
-    /// (`sidecar_order` front = coldest; capture and restore-hit both touch).
-    prefix_sidecar: std::collections::HashMap<u64, crate::qwen35::Qwen35RecurrentSnapshot>,
-    sidecar_order: std::collections::VecDeque<u64>,
+    /// Recurrent prefix sidecars live in `slot_tier` under `NS_SIDECAR` (blob =
+    /// recurrent state + full-attn KV, keyed by token-prefix hash), so they share
+    /// the ONE budget-managed store instead of a private capped RAM map — the
+    /// 32-cap that always-missed beyond the hottest prefixes is gone (issue #85).
+    /// This map is eviction coordination ONLY: the tail host-pool page of each
+    /// published prefix → its sidecar key. `release_prefix_pages` drops the blob
+    /// when the radix evicts that page, so the sidecar's lifetime rides the radix
+    /// blocks — no independent LRU. (The store's own budget is the memory
+    /// backstop for any blob whose tail page LRU-evicted before drop reached it.)
+    sidecar_page_key: std::collections::HashMap<u32, u64>,
 }
-
-/// Maximum number of recurrent sidecar snapshots to keep. Each entry is
-/// ~49 MiB for Qwen3.6-27B (3 linear layers × ~16 MiB each).
-const RECURRENT_SIDECAR_CAP: usize = 32;
 
 impl std::fmt::Debug for Qwen35CudaExecutor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -3317,32 +3492,32 @@ impl Qwen35CudaExecutor {
         pages_only_reusable_prefix_blocks(blocks, |_| false)
     }
 
-    pub(crate) fn capture_recurrent_sidecar(
+    /// Serialize the slot's recurrent state + full-attn KV as ONE atomic blob
+    /// and store it into `slot_tier` under `NS_SIDECAR`, keyed by the token hash
+    /// of the just-published radix prefix `tokens[..matched_len]`. Records the
+    /// prefix's tail page → key so `release_sidecar_pages` drops the blob when the
+    /// radix evicts that page. `matched_len` comes from the radix (block-aligned);
+    /// re-aligned to the page grain here defensively.
+    pub(crate) fn save_recurrent_sidecar(
         &mut self,
         slot: usize,
         tokens: &[u32],
+        matched_len: usize,
+        prefix_pages: &[u32],
     ) -> anyhow::Result<()> {
         let slot_state = &self.slots[slot];
         if !slot_state.has_recurrent() {
             return Ok(()); // pure full-attn path — nothing to capture
         }
-        // ponytail: page-align so capture key == restore's matched_len (radix returns
+        // Page-align so capture key == restore's matched_len (radix returns a
         // page-16-aligned length; raw seq_len aligns ~1/16 of the time → always-miss).
-        let mat_len =
-            (slot_state.seq_len().min(tokens.len()) / SUPPORTED_PAGE_SIZE) * SUPPORTED_PAGE_SIZE;
+        let mat_len = (matched_len.min(slot_state.seq_len()).min(tokens.len())
+            / SUPPORTED_PAGE_SIZE)
+            * SUPPORTED_PAGE_SIZE;
         if mat_len == 0 {
             return Ok(());
         }
         let key = crate::qwen35::hash_prefix_tokens(&tokens[..mat_len]);
-        // LRU eviction — the old `keys().next()` picked an ARBITRARY HashMap
-        // victim and could drop the boundary key captured moments earlier.
-        self.sidecar_order.retain(|&k| k != key);
-        while self.prefix_sidecar.len() >= RECURRENT_SIDECAR_CAP {
-            let Some(evict_key) = self.sidecar_order.pop_front() else {
-                break;
-            };
-            self.prefix_sidecar.remove(&evict_key);
-        }
         let mut snap = self.slots[slot].snapshot_recurrent(&self.model.ctx)?;
         // snapshot_recurrent synchronizes the stream so pages are flushed before D2H.
         if let Some(pool) = self.full_attn_kv.as_ref() {
@@ -3357,14 +3532,40 @@ impl Qwen35CudaExecutor {
                         log::warn!(
                             "slot {slot}: full-attn KV D2H failed: {e}; skipping sidecar entry"
                         );
-                        return Ok(()); // don't add incomplete sidecar
+                        return Ok(()); // don't store an incomplete (KV-less) blob
                     }
                 }
             }
         }
-        self.prefix_sidecar.insert(key, snap);
-        self.sidecar_order.push_back(key);
+        // Atomic: recurrent + full-attn KV as ONE blob under ONE key.
+        let bytes = snap.to_bytes();
+        if self
+            .slot_tier
+            .insert_chunked(NS_SIDECAR, NS_SIDECAR_CHUNK, key, &bytes)
+        {
+            // Coordinate eviction off the prefix tail page (leaves evict first, so
+            // the tail drops the sidecar the moment the prefix leaves the radix).
+            if let Some(&tail) = prefix_pages.last() {
+                if let Some(old) = self.sidecar_page_key.insert(tail, key) {
+                    if old != key {
+                        self.slot_tier
+                            .remove_chunked(NS_SIDECAR, NS_SIDECAR_CHUNK, old);
+                    }
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// Radix evicted these host-pool prefix pages: drop the sidecar blob keyed to
+    /// any of them. Eviction rides the radix — no independent sidecar LRU.
+    pub(crate) fn release_sidecar_pages(&mut self, pages: &[u32]) {
+        for &page in pages {
+            if let Some(key) = self.sidecar_page_key.remove(&page) {
+                self.slot_tier
+                    .remove_chunked(NS_SIDECAR, NS_SIDECAR_CHUNK, key);
+            }
+        }
     }
 
     /// Acquires recurrent buffers before restore so the tail-prefill sees populated state.
@@ -3405,12 +3606,14 @@ impl Qwen35CudaExecutor {
             &mut self.recurrent_pool,
         )?;
 
-        let snap = self.prefix_sidecar.get(&key).cloned();
-        if snap.is_some() {
-            // LRU touch: a restored boundary is the hottest key.
-            self.sidecar_order.retain(|&k| k != key);
-            self.sidecar_order.push_back(key);
-        }
+        // Read the atomic blob from the tier (transparently spans L1/L2 host →
+        // L3 disk); a MISS or corrupt/foreign payload deserializes to None and
+        // falls through to the clean-recompute reset below — never a partial restore.
+        let snap = self
+            .slot_tier
+            .read_chunked(NS_SIDECAR, NS_SIDECAR_CHUNK, key)
+            .ok()
+            .and_then(|bytes| crate::qwen35::Qwen35RecurrentSnapshot::from_bytes(&bytes).ok());
 
         // restore_recurrent_from_snapshot doesn't advance seq_len; set it for submit_decode_row invariant.
         match snap.as_ref() {
@@ -3719,8 +3922,7 @@ impl Qwen35CudaExecutor {
             disk_budget: None,
             kv_pool_mem_fraction_static: mem_fraction_static,
             kv_pool_requested_pages: total_pages.max(1),
-            prefix_sidecar: std::collections::HashMap::new(),
-            sidecar_order: std::collections::VecDeque::new(),
+            sidecar_page_key: std::collections::HashMap::new(),
         };
         cuda_startup_log(
             "qwen35_executor_total",
@@ -5190,10 +5392,14 @@ impl Qwen35CudaExecutor {
         // captured decode graphs bake the old ones — drop and recapture lazily.
         self.decode_graph = None;
         // Weight epoch changed: sidecar recurrent snapshots are as stale as the
-        // radix the caller invalidates — a skipped capture must never serve
-        // old-epoch state.
-        self.prefix_sidecar.clear();
-        self.sidecar_order.clear();
+        // radix the caller invalidates — drop every tracked sidecar blob from the
+        // tier so a skipped capture never serves old-epoch state. (Blobs whose
+        // tail page already LRU-evicted are unreachable — the radix is invalidated
+        // too — and are reclaimed by the store's budget.)
+        for (_, key) in self.sidecar_page_key.drain() {
+            self.slot_tier
+                .remove_chunked(NS_SIDECAR, NS_SIDECAR_CHUNK, key);
+        }
         self.model.remerge_student_lora(update)
     }
 

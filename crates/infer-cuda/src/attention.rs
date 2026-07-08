@@ -277,6 +277,14 @@ pub(crate) fn commit_layer_fold(
         None,
         config,
     )?;
+    snapshot_sw_ring_at_boundary(
+        ctx,
+        pool,
+        &state.sw_window_cache,
+        start_pos,
+        k_prepared.seq_len,
+        config.sliding_window,
+    )?;
 
     // ── FP8 SW ring pack for the accepted positions (table-routed strided
     // pack, mirrors flashmla_pack_sw_ring's math for m explicit slots).
@@ -2069,6 +2077,38 @@ fn update_bf16_sw_window(
     Ok(())
 }
 
+/// Snapshot the whole live ring into `pool`'s SW-ring pool when this call's
+/// end position lands on a `sliding_window` boundary — the chunked-prefill
+/// chunk size (a `sliding_window` multiple) plus the radix-floor restore
+/// invariant keep every real call boundary aligned (see
+/// `Dsv4SwRingSnapshotPool`'s doc in `kv_layout.rs`). No-op without a ring
+/// pool (GLM pure-SparseIndexed) or off-boundary.
+///
+/// UNVERIFIED for the decode call site: if this ever runs during CUDA-graph
+/// capture, the D2D copy below bakes into the graph at the CAPTURE-time
+/// boundary state and would not react to a different REPLAY-time position —
+/// needs pod verification before shipping wider than eager decode.
+fn snapshot_sw_ring_at_boundary(
+    ctx: &DeviceContext,
+    pool: &mut Dsv4LayerKvLayout,
+    sw_window_cache: &CudaSlice<half::bf16>,
+    start_pos: usize,
+    seq_len: usize,
+    sliding_window: usize,
+) -> Result<()> {
+    if seq_len == 0 || sliding_window == 0 {
+        return Ok(());
+    }
+    let new_pos = start_pos + seq_len;
+    if !new_pos.is_multiple_of(sliding_window) {
+        return Ok(());
+    }
+    let Some(ring_pool) = pool.sw_ring_pool_mut() else {
+        return Ok(());
+    };
+    ring_pool.snapshot_from_ring(ctx, sw_window_cache, new_pos / sliding_window - 1)
+}
+
 /// Batched DSv4 sparse-verify attention metadata. Row `r` is at
 /// `positions[r]` and attends committed KV plus the listed earlier chunk
 /// ancestors and self. The caller decides whether those rows are a linear chain
@@ -2135,6 +2175,7 @@ fn try_flashmla_prefill_attention(
     selected: Option<&CudaSlice<i32>>,
     compressed: Option<&HiddenStates>,
     sw_window_cache: &mut CudaSlice<half::bf16>,
+    pool: &mut Dsv4LayerKvLayout,
     start_pos: usize,
     chain_verify: Option<&Dsv4ChainVerifyAttnMeta>,
     tp: &TpRuntime,
@@ -2600,6 +2641,14 @@ fn try_flashmla_prefill_attention(
 
     if chain_verify.is_none() {
         update_bf16_sw_window(ctx, sw_window_cache, k_prepared, start_pos, None, config)?;
+        snapshot_sw_ring_at_boundary(
+            ctx,
+            pool,
+            sw_window_cache,
+            start_pos,
+            k_prepared.seq_len,
+            config.sliding_window,
+        )?;
     }
 
     // Keep temporary buffers in scope until all launches that use their raw
@@ -5215,6 +5264,41 @@ pub(crate) fn mla_attention_prepare(
                     None,
                     keepalive,
                 )?;
+                // TEMP (Task 2 cross-rank verify, scratch — not for main):
+                // hash `hidden` (this layer's compressor input) and the
+                // just-written pool block, per rank, for bit-identity check.
+                if std::env::var("DSV4_HASH_DEBUG").is_ok() && compress_ratio == 4 {
+                    let hbytes = ctx
+                        .stream
+                        .clone_dtoh(&hidden.data)
+                        .map_err(|e| anyhow!("debug hidden dtoh: {e}"))?;
+                    let (mut hsum, mut hxor) = (0u64, 0u64);
+                    for v in &hbytes {
+                        let bits = v.to_bits() as u64;
+                        hsum = hsum.wrapping_add(bits);
+                        hxor ^= bits;
+                    }
+                    let block_index = compressor_state.compressed.seq_len.saturating_sub(1);
+                    let pool_hash = pool
+                        .compress_state_pool_mut()
+                        .map(|p| p.debug_hash(ctx, block_index))
+                        .transpose()?;
+                    // Per-rank file, not eprintln!: the multiproc relay
+                    // interleaves concurrent ranks' stderr mid-message in the
+                    // shared server log, corrupting parsing.
+                    use std::io::Write as _;
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(format!("/root/dsv4_hash_rank{}.log", tp.config().rank))
+                    {
+                        let _ = writeln!(
+                            f,
+                            "layer={layer_idx} start_pos={start_pos} block={block_index} \
+                             hidden_sum={hsum:#x} hidden_xor={hxor:#x} pool_hash={pool_hash:?}"
+                        );
+                    }
+                }
             }
         }
 
@@ -6155,6 +6239,7 @@ fn mla_attention_fwd(
                 None,
                 None,
                 &mut state.sw_window_cache,
+                pool,
                 start_pos,
                 Some(meta),
                 tp,
@@ -6326,6 +6411,7 @@ fn mla_attention_fwd(
             selected.as_ref(),
             compressed,
             &mut state.sw_window_cache,
+            pool,
             start_pos,
             chain_verify,
             tp,
@@ -9085,6 +9171,22 @@ fn csa_select_official(
                 )
                 .result()?;
             }
+        }
+        // Write-mirror into the cross-request-shared shadow pool: keeps this
+        // row range durably readable across slot reuse without touching the
+        // slot-keyed live read/write kernels above.
+        let mirror_range = pool.dsa_slot_range(official.slot_idx)?;
+        if let (Some(slot_band), Some(dsa_pool)) = (
+            pool.dsa_key_cache.as_ref(),
+            pool.dsa_key_cache_pool.as_mut(),
+        ) {
+            dsa_pool.mirror_from_slot_band(
+                ctx,
+                slot_band,
+                mirror_range,
+                official.packed_rows,
+                newly_packed,
+            )?;
         }
         official.packed_rows = indexer_rows_after;
     }

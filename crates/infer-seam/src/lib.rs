@@ -306,18 +306,6 @@ pub trait BackendExecutor {
         Ok(local)
     }
 
-    /// Capture `slot`'s complete restore image into the backend's
-    /// position-0-anchored prefix store, keyed by `tokens`.
-    ///
-    /// Called on request finish ONLY when the request's prefill started at
-    /// absolute position 0, so the captured KV is exactly the materialization of
-    /// `tokens` at positions `[0, tokens.len())`. The copy MUST be complete
-    /// before returning (the engine frees the slot right after). The default is
-    /// a no-op for backends without the store.
-    fn capture_cached_prefix(&mut self, _slot: usize, _tokens: &[u32]) -> anyhow::Result<()> {
-        Ok(())
-    }
-
     /// Restore the cached position-0 prefix snapshot for `tokens[..matched_len]`
     /// into `slot`, setting the slot's materialized length to `matched_len`.
     ///
@@ -344,6 +332,25 @@ pub trait BackendExecutor {
     /// `prefix_pages` are the physical host-pool page ids already attached to the
     /// slot — the hybrid override uses them to sync the device KV pool seq_len.
     fn restore_prefix_sidecar(
+        &mut self,
+        _slot: usize,
+        _tokens: &[u32],
+        _matched_len: usize,
+        _prefix_pages: &[u32],
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Capture the sidecar restore-boundary side state for `slot` at the
+    /// just-published radix prefix `tokens[..matched_len]`, keyed so a later
+    /// [`Self::restore_prefix_sidecar`] at the same boundary hits it. Called by
+    /// `publish_prefix_blocks` right after the radix insert, while the slot's
+    /// device state is still resident. `prefix_pages` are the resident host-pool
+    /// pages the published prefix covers — the backend keys eviction
+    /// coordination ([`Self::release_prefix_pages`]) off them so the sidecar's
+    /// lifetime rides the radix blocks. Default no-op for full-attention-only
+    /// backends; only Qwen3.5/3.6 hybrid overrides this.
+    fn save_prefix_sidecar(
         &mut self,
         _slot: usize,
         _tokens: &[u32],

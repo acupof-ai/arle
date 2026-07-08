@@ -297,14 +297,6 @@ struct RequestState {
     phase: RequestPhase,
     prefill_start_pos: usize,
     reused_prefix_pages: Vec<BlockId>,
-    /// Set once a restore (page-radix attach or DSv4 position-0 image
-    /// restore) supplied any of this request's KV. A position-0 image
-    /// captured from a slot whose KV is part-restored, part-recomputed is
-    /// not proven equivalent to a genuinely fresh single-pass capture (see
-    /// docs/experience/errors/2026-07-06-dsv4-concurrent-decode-digit-corruption-unresolved.md,
-    /// "full-match wrong-seed-token fix" follow-up) — never re-publish from
-    /// such a slot, only from a slot that prefilled entirely from scratch.
-    used_prefix_restore: bool,
     /// Whole-slot tier key while this request's complete restore image is
     /// swapped out. Re-admission promotes and resumes decode; generated tokens
     /// are kept.
@@ -348,7 +340,6 @@ impl RequestState {
             phase: RequestPhase::Prefilling { progress: 0 },
             prefill_start_pos: 0,
             reused_prefix_pages: Vec::new(),
-            used_prefix_restore: false,
             swap_key: None,
             swap_seq_len: 0,
             finish: None,
@@ -369,7 +360,6 @@ impl RequestState {
         self.phase = RequestPhase::Prefilling { progress: 0 };
         self.prefill_start_pos = 0;
         self.reused_prefix_pages.clear();
-        self.used_prefix_restore = false;
         // Store-entry lifetime is the caller's job (drop before reset); the
         // key is cleared so a recomputed request can never promote stale state.
         self.swap_key = None;
@@ -901,10 +891,6 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                 .push_back(token);
         }
         let mut finished_slots = Vec::new();
-        // Slots whose prefill completed this step: capture their position-0
-        // prefix image AFTER the prefill loop so the capture's `&mut self` does
-        // not collide with the `self.active` request borrow inside the loop.
-        let mut prefill_completed_slots: Vec<usize> = Vec::new();
         // Tokens committed this step, in commit order (prefill rows then decode
         // rows), forwarded to `on_token` after the request-borrowing loops so the
         // `self.active` and `self.on_token` borrows stay disjoint.
@@ -929,23 +915,6 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             request.prefill_start_pos = new_start;
             if new_start >= prompt_len {
                 request.phase = RequestPhase::Decoding;
-                // Capture-on-prefill-complete for the position-0 prefix store.
-                // At this exact moment the slot's KV holds the full prompt at
-                // absolute positions [0, prompt_len): the final prefill chunk is
-                // committed and no decode token's KV is written yet. This is the
-                // only moment the slot is a clean position-0 prompt image — a
-                // later finish_slot would see prompt+generated KV. Deferred to
-                // after the loop to keep the `&mut self` capture call disjoint
-                // from the request borrow; the executor re-asserts
-                // `slot.seq_len == prompt_len` and stores nothing if the slot is
-                // misaligned (no-op when the store is disabled). Skip entirely
-                // if any of this slot's KV came from a restore — the capture is
-                // supposed to be a from-scratch position-0 image; publishing one
-                // built on a restore hop is unproven and, empirically, corrupts
-                // the NEXT restore (see the errors doc's fix-verification round).
-                if !request.used_prefix_restore {
-                    prefill_completed_slots.push(row.slot);
-                }
                 if let Some(token) = tokens_by_slot
                     .get_mut(&row.slot)
                     .and_then(VecDeque::pop_front)
@@ -962,23 +931,6 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                 };
                 // A non-final chunk produces no committed token.
                 tokens_by_slot.remove(&row.slot);
-            }
-        }
-
-        // Capture the just-completed prefills into the position-0 prefix store.
-        // The request borrow from the prefill loop has ended, so the capture's
-        // `&mut self` is free. Clone the prompt tokens (the store needs the key)
-        // and skip vanished slots defensively.
-        for slot in prefill_completed_slots {
-            let Some(prompt_tokens) = self
-                .active
-                .get(&slot)
-                .map(|request| request.prompt_tokens.clone())
-            else {
-                continue;
-            };
-            if let Err(err) = self.executor.capture_cached_prefix(slot, &prompt_tokens) {
-                log::warn!("position-0 prefix capture failed for slot {slot}: {err:#}");
             }
         }
 
@@ -1040,24 +992,17 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             self.throughput_stats.requests_completed.saturating_add(1);
         request.phase = RequestPhase::Finished;
         request.finish = Some(reason);
-        // Capture sidecar at final seq_len (prompt + decode tokens) before publishing
-        // radix pages. Without this, decode tokens advance the radix cache past the
-        // last prefill-time sidecar capture, causing full re-prefill fallbacks on every
-        // subsequent agentic turn that generates ≥16 tokens.
+        // Publish the full sequence (prompt + decode tokens) into the radix, which
+        // now also captures the recurrent sidecar at that exact boundary (see
+        // `publish_prefix_blocks`). Publishing runs unconditionally — including a
+        // restore-derived turn — so an agentic follow-up matches THROUGH the
+        // previous turn's generated tokens and restores instead of re-prefilling.
         let full_tokens: Vec<u32> = request
             .prompt_tokens
             .iter()
             .chain(request.generated_tokens.iter())
             .copied()
             .collect();
-        // Gated the same way as the prefill-completion capture above: a
-        // restore-derived slot's snapshot is not a proven from-scratch
-        // position-0 image (see the errors doc's fix-verification round).
-        if !request.used_prefix_restore {
-            if let Err(err) = self.executor.capture_cached_prefix(slot, &full_tokens) {
-                log::debug!("finish_slot sidecar capture failed for slot {slot}: {err:#}");
-            }
-        }
         self.publish_prefix_blocks(slot, &full_tokens);
         // free_slot BEFORE release_reused_prefix: reclaim_page sees page_refs>0
         // and skips retained prefix pages; release_reused_prefix then drops the

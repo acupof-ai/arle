@@ -123,7 +123,7 @@ case "$cmd" in
     # No args => standard arle build (label "arle"). Else: first arg = label.
     if [ $# -eq 0 ]; then label="arle"; set -- --release --features cuda --bin arle
     else label="$1"; shift; fi
-    "$POD" "setsid bash $TREE/scripts/pod-remote-build.sh $label $* </dev/null >/dev/null 2>&1 &"
+    "$POD" "POD_TREE=$TREE setsid bash $TREE/scripts/pod-remote-build.sh $label $* </dev/null >/dev/null 2>&1 &"
     echo "build '$label' launched (detached). poll: scripts/pod.sh status $label"
     ;;
   run)
@@ -136,7 +136,7 @@ case "$cmd" in
       if ! [[ "$gpu" =~ ^[0-9]+$ ]]; then echo "no free GPU (all >2GB used or claimed)"; exit 1; fi
     fi
     [ -z "$label" ] && label="g$gpu"   # default label derived from the GPU => collision-free across agents
-    "$POD" "setsid bash $TREE/scripts/pod-remote-run.sh $label $gpu $* </dev/null >/dev/null 2>&1 &"
+    "$POD" "POD_TREE=$TREE setsid bash $TREE/scripts/pod-remote-run.sh $label $gpu $* </dev/null >/dev/null 2>&1 &"
     echo "run '$label' launched on GPU $gpu. poll: scripts/pod.sh status $label"
     ;;
   gpus)

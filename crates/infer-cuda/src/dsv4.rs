@@ -1123,6 +1123,18 @@ impl Dsv4SlotState {
         self.seq_len
     }
 
+    /// One layer's attention state (Route-A restore needs `&mut` access to
+    /// `sw_window_cache` from outside this module — `executor.rs`).
+    pub(crate) fn attention_layer_mut(
+        &mut self,
+        layer_idx: usize,
+    ) -> Result<&mut crate::attention::Dsv4LayerAttentionState> {
+        let len = self.attention.len();
+        self.attention
+            .get_mut(layer_idx)
+            .ok_or_else(|| anyhow!("DSv4 slot attention layer {layer_idx} outside len {len}"))
+    }
+
     pub(crate) fn reset(
         &mut self,
         ctx: &DeviceContext,
@@ -1848,6 +1860,43 @@ impl Dsv4Model {
                 main.saturating_add(indexer)
             })
             .sum();
+        // Write-mirrored shadow of `dsa_key_cache`: one slot-equivalent band
+        // per `has_indexer()` layer, num_slots-independent like the
+        // compress-state pool above (not ratio-restricted — every indexer
+        // layer gets one, matching `dsa_key_cache`'s own gate).
+        let dsa_key_cache_pool_bytes: usize = self
+            .layers
+            .iter()
+            .filter(|layer| layer.mode.has_indexer())
+            .map(|layer| {
+                let index_ratio = if layer.mode == DeepSeekV4AttentionMode::SparseIndexed {
+                    1
+                } else {
+                    layer.compress_ratio
+                };
+                crate::attention::Dsv4DsaKeyCachePool::device_bytes_for(
+                    &self.config,
+                    index_ratio,
+                    max_seq_len,
+                )
+            })
+            .sum();
+        // SW-ring periodic snapshot pool: every layer has a ring, not
+        // ratio-restricted.
+        let sw_ring_pool_bytes: usize = if self.config.sliding_window > 0 {
+            self.layers
+                .iter()
+                .map(|_| {
+                    crate::attention::Dsv4SwRingSnapshotPool::device_bytes_for(
+                        self.config.head_dim,
+                        self.config.sliding_window,
+                        max_seq_len,
+                    )
+                })
+                .sum()
+        } else {
+            0
+        };
         // TRUE per-slot cost = the slot struct itself (statically — no slot exists
         // yet). Fixes the 43→382 MB under-count — the old hand-roll missed
         // spec_verify, the dominant term — that ran `affordable` ~9× high.
@@ -1901,7 +1950,9 @@ impl Dsv4Model {
                         .saturating_add(shared_expert_scratch_bytes)
                         .saturating_add(moe_tail_scratch_bytes)
                         .saturating_add(mla_decode_bytes)
-                        .saturating_add(compress_state_pool_bytes);
+                        .saturating_add(compress_state_pool_bytes)
+                        .saturating_add(dsa_key_cache_pool_bytes)
+                        .saturating_add(sw_ring_pool_bytes);
                     let budget_before_pool = infer_seam::SlotBudget::from_free(
                         free,
                         MEM_FRACTION,
@@ -1920,7 +1971,8 @@ impl Dsv4Model {
                     log::info!(
                         "DSv4 KV budget: free {}MB, per_slot {}MB (slot-state {}MB + DSA key-cache {}MB + DSA batched {}MB; \
                          FP8 arena in shared pool), shared DSA {}MB, shared MoE decode {}MB, shared expert scratch {}MB, \
-                         shared MLA decode {}MB, shared compress-state pool {}MB, pool_total {}MB, affordable {}",
+                         shared MLA decode {}MB, shared compress-state pool {}MB, shared DSA key-cache pool {}MB, \
+                         shared SW ring pool {}MB, pool_total {}MB, affordable {}",
                         free >> 20,
                         per_slot >> 20,
                         slot_state_bytes >> 20,
@@ -1931,6 +1983,8 @@ impl Dsv4Model {
                         shared_expert_scratch_bytes >> 20,
                         mla_decode_bytes >> 20,
                         compress_state_pool_bytes >> 20,
+                        dsa_key_cache_pool_bytes >> 20,
+                        sw_ring_pool_bytes >> 20,
                         pool_budget_total >> 20,
                         affordable,
                     );

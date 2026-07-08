@@ -703,17 +703,6 @@ impl BackendExecutor for CudaExecutor {
         }
     }
 
-    fn capture_cached_prefix(&mut self, slot: usize, tokens: &[u32]) -> anyhow::Result<()> {
-        match &mut self.inner {
-            CudaExecutorInner::Placeholder => {
-                let _ = (slot, tokens);
-                Ok(())
-            }
-            #[cfg(feature = "cuda")]
-            CudaExecutorInner::Real(real) => real.capture_cached_prefix(slot, tokens),
-        }
-    }
-
     fn restore_cached_prefix(
         &mut self,
         slot: usize,
@@ -749,6 +738,35 @@ impl BackendExecutor for CudaExecutor {
             CudaExecutorInner::Real(real) => {
                 real.restore_prefix_sidecar(slot, tokens, matched_len, prefix_pages)
             }
+        }
+    }
+
+    fn save_prefix_sidecar(
+        &mut self,
+        slot: usize,
+        tokens: &[u32],
+        matched_len: usize,
+        prefix_pages: &[u32],
+    ) -> anyhow::Result<()> {
+        match &mut self.inner {
+            CudaExecutorInner::Placeholder => {
+                let _ = (slot, tokens, matched_len, prefix_pages);
+                Ok(())
+            }
+            #[cfg(feature = "cuda")]
+            CudaExecutorInner::Real(real) => {
+                real.save_prefix_sidecar(slot, tokens, matched_len, prefix_pages)
+            }
+        }
+    }
+
+    fn release_prefix_pages(&mut self, pages: &[u32]) {
+        match &mut self.inner {
+            CudaExecutorInner::Placeholder => {
+                let _ = pages;
+            }
+            #[cfg(feature = "cuda")]
+            CudaExecutorInner::Real(real) => real.release_prefix_pages(pages),
         }
     }
 
