@@ -298,14 +298,25 @@ impl KvPrefixStore for HostPagedKvPool {
         pages: &[u32],
         token_count: usize,
     ) -> anyhow::Result<()> {
-        let dst = self
-            .slot_pages
-            .get_mut(slot)
-            .ok_or_else(|| anyhow::anyhow!("attach_pages: slot {slot} out of range"))?;
-        if self.fixed_pages_per_slot.is_some() {
-            dst.clear();
+        if slot >= self.slot_pages.len() {
+            bail!("attach_pages: slot {slot} out of range");
         }
-        dst.extend_from_slice(pages);
+        if let Some(fixed) = self.fixed_pages_per_slot {
+            let top_up = fixed.saturating_sub(pages.len());
+            if top_up > self.free.len() {
+                bail!(
+                    "attach_pages: fixed-band slot {slot} needs {top_up} more pages, free {}",
+                    self.free.len()
+                );
+            }
+            let extra: Vec<u32> = (0..top_up).map(|_| self.free.pop().unwrap()).collect();
+            let dst = &mut self.slot_pages[slot];
+            dst.clear();
+            dst.extend_from_slice(pages);
+            dst.extend(extra);
+        } else {
+            self.slot_pages[slot].extend_from_slice(pages);
+        }
         self.slot_len[slot] = self.slot_len[slot].max(token_count);
         self.slot_epoch[slot] = self.slot_epoch[slot].wrapping_add(1);
         Ok(())
@@ -390,6 +401,26 @@ mod tests {
         pool.alloc(0, 1).unwrap();
         assert_eq!(pool.seq_len(0), 17);
         assert_eq!(pool.page_indices(0), pages.as_slice());
+    }
+
+    #[test]
+    fn fixed_band_attach_tops_up_short_page_list() {
+        let mut pool = HostPagedKvPool::new(2, 8, 16);
+        pool.set_fixed_pages_per_slot(4);
+        pool.alloc(0, 64).unwrap();
+        let reused: Vec<u32> = pool.page_indices(0)[..2].to_vec();
+        pool.attach_pages(1, &reused, 32).unwrap();
+        assert_eq!(pool.page_indices(1).len(), 4);
+        assert_eq!(&pool.page_indices(1)[..2], reused.as_slice());
+        assert_eq!(pool.seq_len(1), 32);
+    }
+
+    #[test]
+    fn fixed_band_attach_rejects_when_free_cannot_top_up() {
+        let mut pool = HostPagedKvPool::new(2, 4, 16);
+        pool.set_fixed_pages_per_slot(4);
+        pool.alloc(0, 64).unwrap();
+        assert!(pool.attach_pages(1, &[], 0).is_err());
     }
 
     #[test]
