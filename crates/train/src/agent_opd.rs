@@ -179,6 +179,13 @@ mod cuda_rollout {
         /// Per-sub-turn token budget for rescue rollouts (thinking needs
         /// room; the normal `max_tokens` stays cheap).
         pub rescue_max_tokens: usize,
+        /// Turn budget for rescue rollouts. The binding constraint on hard
+        /// real-repo tasks is turns-to-first-edit: at `max_turns`=8 they burn
+        /// every turn on on-target investigation and never reach the edit phase
+        /// (empty diff → unscored → 0-accept), yet the SAME 27B teacher edits
+        /// and passes them at 20 turns (measured A/B 2026-07-08). Rescue tuned
+        /// only `max_tokens` before — the wrong axis.
+        pub rescue_max_turns: usize,
         /// Legacy CE micro-batch size (inert under masked single-trajectory CE,
         /// which forwards one trajectory per window; retained for CLI back-compat).
         pub writeback_batch: usize,
@@ -455,6 +462,7 @@ mod cuda_rollout {
                 // tasks at the bigger token budget.
                 let rescue_settings = AgentSettings {
                     max_tokens: cfg.rescue_max_tokens,
+                    max_turns: cfg.rescue_max_turns,
                     ..settings
                 };
                 let total_samples = cfg.samples_per_prompt + cfg.rescue_samples;
