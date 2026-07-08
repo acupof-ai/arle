@@ -63,6 +63,11 @@ print(client.chat.completions.create(
 
 Build from source, full install matrix, uninstall: [docs/install.md](docs/install.md) · more copy-paste: [`examples/`](examples/).
 
+> **Source build requires a backend.** `cargo build --release` alone produces a
+> CLI-only binary that cannot serve models. Add `--features cuda` (NVIDIA) or
+> `--no-default-features --features metal,no-cuda,cli` (Apple Silicon).
+> See [docs/install.md](docs/install.md).
+
 `arle` is one binary:
 
 | Command | What it does |

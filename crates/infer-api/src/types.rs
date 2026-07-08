@@ -109,6 +109,47 @@ pub struct CompletionRequest {
     pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
+impl CompletionRequest {
+    /// Build a request with the two always-specified fields; all others default.
+    #[must_use]
+    pub fn new(prompt: impl Into<String>, max_tokens: usize) -> Self {
+        Self {
+            prompt: prompt.into(),
+            max_tokens,
+            sampling: SamplingParams::default(),
+            stop: None,
+            logprobs: false,
+            session_id: None,
+            trace_context: None,
+            cancel: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_sampling(mut self, sampling: SamplingParams) -> Self {
+        self.sampling = sampling;
+        self
+    }
+
+    #[must_use]
+    pub fn with_stop(mut self, stop: Vec<String>) -> Self {
+        self.stop = Some(stop);
+        self
+    }
+
+    #[must_use]
+    pub fn with_session(mut self, session_id: impl Into<SessionId>) -> Self {
+        self.session_id = Some(session_id.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_logprobs(mut self, logprobs: bool) -> Self {
+        self.logprobs = logprobs;
+        self
+    }
+}
+
 /// Raw image bytes attached to a backend-native chat message.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChatPromptImage {
@@ -140,6 +181,23 @@ pub struct MultimodalChatRequest {
     pub messages: Vec<ChatPromptMessage>,
     pub max_tokens: usize,
     pub sampling: SamplingParams,
+}
+
+impl MultimodalChatRequest {
+    #[must_use]
+    pub fn new(messages: Vec<ChatPromptMessage>, max_tokens: usize) -> Self {
+        Self {
+            messages,
+            max_tokens,
+            sampling: SamplingParams::default(),
+        }
+    }
+
+    #[must_use]
+    pub fn with_sampling(mut self, sampling: SamplingParams) -> Self {
+        self.sampling = sampling;
+        self
+    }
 }
 
 /// Why generation stopped (the legacy 2-state public shape;
