@@ -146,10 +146,23 @@ echo "[tb-eval]   model:     openai/${MODEL_ID}  @ ${API_BASE}"
 echo "[tb-eval]   subset:    ${TASK_ARGS[*]:-<none>}"
 echo "[tb-eval]   output:    ${OUTPUT_DIR}"
 
+# Prefer --dataset-path over a scrubbed local cache: strips HIDS-tripping
+# security tasks durably AND dodges the registry SSL-EOF fetch flakiness. Fall
+# back to the registry name only on a cold cache (that first fetch can't be
+# pre-scrubbed — rerun to scrub).
+CACHE_DIR="${CACHE_DIR:-$HOME/.cache/terminal-bench/${DATASET_NAME}/${DATASET_VER}}"
+if [[ -d "$CACHE_DIR" ]]; then
+  bash "$(dirname "$0")/tb_exclude_security.sh" "$CACHE_DIR"
+  DATASET_ARGS=(--dataset-path "$CACHE_DIR")
+else
+  echo "[tb-eval] WARN: cache $CACHE_DIR absent; using registry (first fetch not pre-scrubbed)"
+  DATASET_ARGS=(--dataset "${DATASET_NAME}==${DATASET_VER}")
+fi
+
 set -x
 # `${arr[@]:-}` keeps empty arrays safe under `set -u` (macOS bash 3.2).
 "${TB_CMD[@]}" run \
-  --dataset "${DATASET_NAME}==${DATASET_VER}" \
+  "${DATASET_ARGS[@]}" \
   --agent terminus \
   --model "openai/${MODEL_ID}" \
   -k "api_base=${API_BASE}" \
