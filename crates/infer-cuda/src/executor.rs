@@ -345,6 +345,16 @@ impl RealCudaExecutor {
         }
     }
 
+    /// Only DSv4 needs prefill chunks to stop on a coarser-than-page boundary
+    /// (its ring-snapshot pool's `sliding_window` unit); other arms are
+    /// page-reattachable at any boundary.
+    pub(crate) fn prefill_restore_boundary_alignment(&self) -> usize {
+        match self {
+            Self::Qwen(_) | Self::Qwen35(_) => 1,
+            Self::Dsv4(d) => d.prefill_restore_boundary_alignment(),
+        }
+    }
+
     pub(crate) fn demote_prefix_pages(&mut self, entries: &[(u32, u64)]) -> Result<usize> {
         match self {
             Self::Qwen(q) => q.demote_prefix_pages(entries),
@@ -2462,6 +2472,20 @@ impl Dsv4CudaExecutor {
         true
     }
 
+    /// The ring-snapshot pool only fires when a forward call's END position
+    /// lands on a `sliding_window` multiple. A prompt completed in one call
+    /// only ever visits one such position — its own end — so without forcing
+    /// prefill chunk ends onto this alignment, `reusable_prefix_blocks`'s
+    /// first checked boundary is never resident and every match fails.
+    pub(crate) fn prefill_restore_boundary_alignment(&self) -> usize {
+        let sliding_window = self.model.config.sliding_window;
+        if sliding_window > 0 {
+            sliding_window
+        } else {
+            1
+        }
+    }
+
     /// Only the LAST compress-block in each KV page needs to be resident
     /// (`compressed_base - 1` is the only cross-request read a restore
     /// depends on) — not every block the page covers. The SW ring only
@@ -4487,10 +4511,8 @@ impl Qwen35CudaExecutor {
             ps
         );
 
-        // (2) Score the whole history against the prefill query and plan the FIXED
-        // working set (sink + local + top-k relevant). `allow_prefetch=true` lets a
-        // tier-resident (previously evicted) block re-enter the set; page-list
-        // resolution is deferred until after the prefetch patches the table.
+        // Score history against prefill query, plan fixed working set.
+        // `allow_prefetch=true` lets tier-resident blocks re-enter.
         let num_q_heads = self.model.local_q_heads();
         let num_kv_heads = self.model.local_kv_heads();
         let head_dim = self.model.config.head_dim;
@@ -4521,11 +4543,8 @@ impl Qwen35CudaExecutor {
             }
         };
 
-        // (3) Prefetch the chosen tier-resident blocks back into HBM (alloc a fresh
-        // page, H2D from the tier, patch the sentinel). Decode never does this; it
-        // is the one batched prefill sync point. If the pool is out of free pages or
-        // the tier lost the entry, the block stays evicted (no crash; it simply
-        // won't be in the working set).
+        // Prefetch tier-resident blocks back into HBM (alloc fresh page, H2D, patch sentinel).
+        // Decode never does this — one batched prefill sync point.
         for logical in prefetch_pages {
             let key = tier_block_u64(slot as u64, logical as u64);
             let Some(tier) = self.recall_tier.as_mut() else {
@@ -4542,20 +4561,15 @@ impl Qwen35CudaExecutor {
             }
         }
 
-        // (3b) Resolve the FIXED working-set page list now that prefetch has patched
-        // any reinstated sentinels to real ids. Decode reads this and never mutates it.
+        // Resolve fixed working-set page list now that prefetch patched sentinels.
         if let Some(state) = self.recall.get_mut(slot) {
             if let Some(pool) = self.full_attn_kv.as_ref() {
                 state.resolve_recall_pages(pool, slot);
             }
         }
 
-        // (4) Write-back-evict the cold middle pages: mirror each to the L3 tier,
-        // then free its physical page IMMEDIATELY (`evict_slot_page`). Prefill's
-        // forward + sampling already drained the compute stream, so no in-flight
-        // attention can be reading these pages — the deferred-keepalive dance that
-        // the per-decode-step path needed is unnecessary here. A tier-full
-        // write_through keeps the page resident (no KV loss).
+        // Write-back-evict cold middle: mirror to L3 tier, free physical pages immediately.
+        // Prefill already drained compute stream — no in-flight attention race.
         for logical in evict_pages {
             let physical = {
                 let pool = self.full_attn_kv.as_ref().expect("full_attn_kv");
@@ -4588,27 +4602,14 @@ impl Qwen35CudaExecutor {
         Ok(token)
     }
 
-    /// One decode row over the paged recall pool (`--kv-recall`): **append +
-    /// attend, ZERO tier I/O** (the write-through model's non-negotiable rule —
-    /// "decode 不召回; prefetch 只在 prefill; 其他时机不交互"). The whole recall
-    /// cycle (score → evict → H2D prefetch) ran ONCE at prefill
-    /// ([`Self::prefill_row_recall`]) and fixed the working set; decode only:
-    ///
-    /// 1. Alloc this step's token (extends the tail page).
-    /// 2. Read the FIXED `recall_pages` working set (immutable for this decode
-    ///    run; never mutated here) — or the full contiguous list if the session
-    ///    still fits the budget (prefill chose no restriction).
+    /// One decode row over the paged recall pool (`--kv-recall`): append + attend,
+    /// ZERO tier I/O (write-through model rule: "decode 不召回; prefetch 只在 prefill").
+    /// Whole recall cycle ran once at prefill and fixed the working set.
+    /// 1. Alloc this step's token (extends tail page).
+    /// 2. Read fixed `recall_pages` working set (or full list if under budget).
     /// 3. Forward over that page table (paged decode) + sample.
-    ///
-    /// There is NO `recompute_recall_plan`, NO `copy_pages_to_host`/`_from_host`,
-    /// NO `write_through`, NO `reinstate_slot_page`, NO keepalive release — none of
-    /// the tier machinery is reachable from here (that is the whole point: a
-    /// 6000-token recall request must not pay the per-step cycle that took >10 min).
-    /// A single ultra-long generation with no re-prefill keeps whatever working set
-    /// prefill chose (accepted boundary, ckl's design).
     fn decode_row_recall(&mut self, row: &DecodeRow, position: u64) -> Result<u32> {
         let slot = row.slot;
-        // (1) Alloc this step's token so the tail page exists.
         {
             let pool = self
                 .full_attn_kv
@@ -4616,9 +4617,8 @@ impl Qwen35CudaExecutor {
                 .expect("full_attn_kv present (recall_active)");
             pool.alloc_tokens(slot, 1)?;
         }
-        let cache_len = row.kv_seq_len + 1; // incl. this step's token
-        // (2) The FIXED working set chosen at prefill; else the full resident list
-        // (session under budget → prefill left no restriction). Read-only here.
+        let cache_len = row.kv_seq_len + 1;
+        // Fixed working set from prefill; else full resident list (under budget). Read-only.
         let recall_pages: Vec<u32> = match self.recall.get(slot).and_then(|s| s.recall_pages()) {
             Some(p) => p.to_vec(),
             None => {
@@ -4636,9 +4636,7 @@ impl Qwen35CudaExecutor {
                 &recall_pages,
             )?
         };
-        // (3) Forward (paged decode) + sample. Borrow split. `rc.layer0_query` is
-        // collected by the forward but UNUSED on decode — no recall re-scoring,
-        // no eviction, no prefetch happens here.
+        // Forward (paged decode) + sample. `rc.layer0_query` collected but unused on decode.
         let Self {
             model,
             slots,
@@ -4664,21 +4662,17 @@ impl Qwen35CudaExecutor {
     }
 
     /// Run one decode step through the captured whole-step graph. Returns
-    /// `Ok(None)` for eager fallback (gate off, out-of-budget position, or a
-    /// capture/replay failure — which permanently downgrades to eager with a
-    /// warn, never fatal). On `Some`, the sampled token is final and the
-    /// slot's seq_len has been advanced.
+    /// `Ok(None)` for eager fallback (gate off, out-of-budget, or capture/replay
+    /// failure which permanently downgrades to eager, never fatal).
     ///
     /// See [`crate::qwen35::Qwen35Model::forward_decode_step_captured`] for
-    /// the captured-kernel capture-safety table and the perf formula.
+    /// capture-safety table and perf formula.
     fn try_graph_decode(&mut self, row: &DecodeRow, position: u64) -> Result<Option<u32>> {
         if !self.decode_graph_armed {
             return Ok(None);
         }
-        // Replay-time invariant: host `ensure!`s inside the captured closure
-        // run only on warm/capture steps, so the budget check must live here,
-        // on EVERY step. Out-of-budget falls back to eager for the canonical
-        // error message.
+        // Budget check must run every step — host ensures inside captured closure
+        // only run on warm/capture steps. Out-of-budget falls back to eager.
         if row.kv_seq_len + 1 > self.model.max_seq_len() {
             return Ok(None);
         }
@@ -4688,8 +4682,7 @@ impl Qwen35CudaExecutor {
                 &self.model.ctx.stream,
             ));
         }
-        // Split borrows: the capture closure needs &model + &mut slot state +
-        // &mut decode workspace while the graph entry itself is borrowed.
+        // Split borrows: capture closure needs &model + &mut slot + &mut workspace.
         let Self {
             model,
             slots,
@@ -4702,9 +4695,7 @@ impl Qwen35CudaExecutor {
         let Qwen35DecodeGraph { ws, graphs, baked } = dg;
         let slot_idx = row.slot;
 
-        // Stage the per-step device scalars OUTSIDE the graph (dense
-        // stage1_write pattern): token id + position into fixed device
-        // buffers the captured kernels read.
+        // Stage per-step device scalars outside graph (dense stage1_write pattern).
         let (token_ids_ptr, start_pos_ptr) =
             model.stage_step_inputs(ws, &[row.last_token], row.kv_seq_len)?;
         let logits_ptr = model.workspace_logits_ptr(ws)?;
@@ -4716,9 +4707,8 @@ impl Qwen35CudaExecutor {
         };
         match baked[slot_idx] {
             Some(prev) if prev != bake => {
-                // Decode-workspace addresses drifted since capture (release →
-                // re-alloc). Replaying would launch against freed memory —
-                // drop the capture and re-capture against the new addresses.
+                // Workspace addresses drifted since capture (release → re-alloc).
+                // Drop and re-capture against new addresses.
                 info!(
                     "[qwen35-decode-graph] slot {slot_idx}: workspace addresses changed; \
                      dropping stale capture and recapturing"
@@ -4737,10 +4727,8 @@ impl Qwen35CudaExecutor {
         let run = state
             .run_or_capture(|| model.forward_decode_step_captured(slot_state, ws, row.kv_seq_len));
         if let Err(e) = run {
-            // Any capture/replay failure downgrades to eager permanently —
-            // never fatal (dense pattern). A mid-CAPTURE error recorded (not
-            // executed) its kernels, so device state is untouched and the
-            // eager re-run of this step is clean.
+            // Any capture/replay failure downgrades to eager permanently — never fatal.
+            // Mid-capture error only recorded kernels, so device state untouched.
             warn!(
                 "Qwen3.5 whole-step decode graph failed (slot {slot_idx}), \
                  downgrading to eager forward: {e}"
@@ -4749,12 +4737,10 @@ impl Qwen35CudaExecutor {
             self.decode_graph = None;
             return Ok(None);
         }
-        // Host-side state advance happens exactly once per step HERE — the
-        // captured closure is host-state-free (replay skips host code).
+        // Host-side state advance happens here — captured closure is host-state-free.
         slots[slot_idx].advance_seq_len(1);
 
-        // Reuse-evidence probes (license needs replay counts, not
-        // capture-exists). Key cardinality must stay ≤ num_slots.
+        // Reuse-evidence probes (license needs replay counts, not capture-exists).
         let state = &self.decode_graph.as_ref().expect("still present").graphs[slot_idx];
         if !was_captured && state.is_captured() {
             let captures =

@@ -12,6 +12,18 @@ use infer_seam::{BackendExecutor, KvPool};
 
 use crate::{Engine, RequestPhase, RequestState, WaitingInsertBias};
 
+fn gcd(a: usize, b: usize) -> usize {
+    if b == 0 { a } else { gcd(b, a % b) }
+}
+
+/// `0` means "no constraint" (identity for LCM's purposes), not zero-alignment.
+fn lcm(a: usize, b: usize) -> usize {
+    if a == 0 || b == 0 {
+        return a.max(b);
+    }
+    a / gcd(a, b) * b
+}
+
 impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
     pub(crate) fn build_forward_plan(&self) -> ForwardPlan {
         let mut prefill_rows = Vec::new();
@@ -64,18 +76,35 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             if chunk == 0 {
                 continue;
             }
-            // Stop a prefill chunk on a page boundary when it would otherwise
-            // cross one mid-chunk. Some backends can only restore KV plus
-            // backend-owned side state at forward-end restore boundaries, while
-            // the radix can cache every page boundary. Aligning chunk ends keeps
-            // the deepest cached boundary reusable; `clamp_prefix_to_backend`
+            // Stop a prefill chunk on a boundary that is a common multiple of
+            // the KV page size AND the executor's restore-boundary alignment
+            // (LCM, not max — neither is guaranteed to divide the other).
+            // Some backends can only restore KV plus backend-owned side state
+            // (ring/compressor snapshots) at their own coarser boundary, while
+            // the radix can cache every page boundary. `clamp_prefix_to_backend`
             // remains the safety floor for boundaries the executor cannot
-            // restore. The final sub-page tail (no full boundary left, i.e.
-            // `aligned_end <= start_pos`) is emitted as-is. Page-sliceable
-            // backends are unaffected except for at most one extra tiny tick.
+            // restore.
+            //
+            // When `restore_alignment > 1` the chunk is additionally CAPPED to
+            // one alignment unit, not just trailing-edge-floored: a forward
+            // call only ever snapshots restore-boundary side state at its OWN
+            // end position, so a chunk spanning multiple units in one call
+            // (the default `chunk_cap`/budget easily allow this) silently
+            // skips every earlier unit's snapshot inside that call — the exact
+            // gap that made a whole-prompt single-call prefill produce a
+            // snapshot only at its own end, never at the first boundary the
+            // restore path checks. Capping forces one call per unit, so every
+            // unit gets its own end-of-call snapshot. Page-only backends
+            // (`restore_alignment == 1`, the default) keep the pre-existing
+            // trailing-edge-only floor — no cap, no behavior change.
             let page_size = self.kv.page_size().max(1);
+            let restore_alignment = self.executor.prefill_restore_boundary_alignment().max(1);
+            let alignment_unit = lcm(page_size, restore_alignment);
+            if restore_alignment > 1 {
+                chunk = chunk.min(alignment_unit);
+            }
             let chunk_end = start_pos + chunk;
-            let aligned_end = chunk_end - (chunk_end % page_size);
+            let aligned_end = chunk_end - (chunk_end % alignment_unit);
             if aligned_end > start_pos {
                 chunk = aligned_end - start_pos;
             }
