@@ -170,6 +170,18 @@ pub(crate) fn chunk_sub(key: u64, idx: usize) -> u64 {
     (key << CHUNK_IDX_BITS) | idx as u64
 }
 
+/// Its own dedicated `CudaKvTierStore` instance, never shared with
+/// `NS_SLOT`/`NS_SLOT_CHUNK` (different page-size accounting).
+pub(crate) const NS_COMPRESS_STATE: u64 = 3;
+
+/// Folds `layer_id` in: block indices alone collide across layers.
+pub(crate) fn compress_state_tier_key(layer_id: usize, block_index: usize) -> u64 {
+    tier_key(
+        NS_COMPRESS_STATE,
+        ((layer_id as u64) << 40) | block_index as u64,
+    )
+}
+
 fn chunk_manifest(chunks: usize, bytes: usize) -> Vec<u8> {
     format!("DSCHUNK {chunks} {bytes}\n").into_bytes()
 }
