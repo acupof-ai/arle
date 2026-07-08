@@ -36,13 +36,13 @@ for _ in $(seq 1 90); do
   kill -0 "$SERVE_PID" 2>/dev/null || { echo "serve died — see $OUT_DIR/serve.log"; exit 1; }
   sleep 10
 done
-export ANTHROPIC_MODEL=$(curl -s "$ANTHROPIC_BASE_URL/v1/models" \
+MODEL_ID=$(curl -s "$ANTHROPIC_BASE_URL/v1/models" \
   | python3 -c "import sys,json;print(json.load(sys.stdin)['data'][0]['id'])")
-export ANTHROPIC_SMALL_FAST_MODEL=$ANTHROPIC_MODEL
+export ANTHROPIC_MODEL=$MODEL_ID ANTHROPIC_SMALL_FAST_MODEL=$MODEL_ID
 echo "[cc-run] serve up, model=$ANTHROPIC_MODEL"
 
 python3 "$ROOT/scripts/cc_swe_baseline.py" \
-  --dataset "$DATASET" --staged-root "$STAGED" --model "$ANTHROPIC_MODEL" \
+  --dataset "$DATASET" --staged-root "$STAGED" --model "$MODEL_ID" \
   --pythonpath "$PYTHONPATH_TASK" --work-root "$OUT_DIR/work" \
   --windows-out "$OUT_DIR/windows.jsonl" --out "$OUT_DIR/results.jsonl"
 
