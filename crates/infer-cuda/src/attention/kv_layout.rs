@@ -930,9 +930,15 @@ impl Dsv4KvAdapter {
         self.layers.len()
     }
 
+    /// Must track the same layer `flashmla_max_slot_pages` maximizes over —
+    /// each layer's pool is sized to its OWN `flashmla_slot_pages` (per-layer
+    /// budget), so `.first()` (often the cheapest layer) under-sized the host
+    /// page-id space below `fixed_pages_per_slot` (#85; see
+    /// docs/experience/errors/2026-07-08-dsv4-slot-abort-band-leak-crash.md).
     pub(crate) fn flashmla_total_pages(&self) -> Option<usize> {
         self.layers
-            .first()
+            .iter()
+            .max_by_key(|l| l.flashmla_slot_pages())
             .map(Dsv4LayerKvLayout::flashmla_total_pages)
     }
 
@@ -968,10 +974,21 @@ impl Dsv4KvAdapter {
             "DSv4 mirror slot {slot} has no pages"
         );
         for layer in &mut self.layers {
-            let n = layer.flashmla_slot_pages().min(slot_pages.len());
-            if let Some(pool) = layer.flashmla_kv_pool.as_mut() {
-                pool.mirror_band(slot, &slot_pages[..n], seq_len)?;
+            let layer_slot_pages = layer.flashmla_slot_pages();
+            let n = layer_slot_pages.min(slot_pages.len());
+            if n == 0 {
+                continue;
             }
+            let Some(pool) = layer.flashmla_kv_pool.as_mut() else {
+                continue;
+            };
+            // This layer's own local id space (sized to `num_slots *
+            // layer_slot_pages`), NOT a slice of the host's shared ids —
+            // those are sized to the largest layer and go out of range here.
+            // Page values carry no cross-layer meaning (no page-radix reuse).
+            let base = (slot * layer_slot_pages) as u32;
+            let local: Vec<u32> = (0..n as u32).map(|i| base + i).collect();
+            pool.mirror_band(slot, &local, seq_len)?;
         }
         Ok(())
     }
@@ -1031,7 +1048,13 @@ impl ModelKvAdapter for Dsv4KvAdapter {
             let layer_count = self.layers.len();
             for layer_idx in 0..layer_count {
                 let layer = self.layer_mut(layer_idx)?;
-                let layer_pages = &slot_pages[..layer.flashmla_slot_pages().min(slot_pages.len())];
+                // Local id space per layer, not a slice of `desc.flat_slot_page_ids`
+                // (sized to the largest layer) — see `mirror_slot_pages` above.
+                let layer_slot_pages = layer.flashmla_slot_pages();
+                let n = layer_slot_pages.min(slot_pages.len());
+                let base = (row.slot * layer_slot_pages) as u32;
+                let layer_pages: Vec<u32> = (0..n as u32).map(|i| base + i).collect();
+                let layer_pages = layer_pages.as_slice();
                 match row.kind {
                     KvBatchRowKind::Prefill => {
                         if let Some(pool) = layer.flashmla_kv_pool.as_mut() {

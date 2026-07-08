@@ -58,27 +58,21 @@ full build+boot at the parent commit; time-boxed out). The admission-boundary
 exactness proof is the load-bearing correctness evidence, not the pre/post
 delta.
 
-## Problems — orthogonal finding, NOT a `3ebc763f9` defect, newly *reachable* because of it
+## Problems — orthogonal finding, NOT a `3ebc763f9` defect, newly *reachable* because of it, now FIXED
 
 At the tight `num_slots ∈ {1,2}` boundary this fix makes reachable for the
-first time, the scheduler's admission-reject path
-(`crates/infer-core/src/lib.rs:1268`, the 2026-07-05 "reject-not-hang" fix
-for oversized single prompts) aborts a too-large request cleanly, but the
-DSv4 slot's FlashMLA fixed-band reservation is **not released** on that
-abort. The next request assigned to the same slot then hits
-`HostPagedKvPool::alloc_fixed_band` with a shortfall ("slot 0 needs 130, free
-2" / "needs 81, free 4") and `bail!`s — crashing **all 4 worker ranks**.
-Reproduced identically at `num_slots=1` (32768) and `num_slots=2` (20000);
-did NOT reproduce at `num_slots=129` (4096) — there the oversized prompt hit
-a different (graceful, 0-token-completion) path instead.
-
-Root cause lives in DSv4's slot-abort cleanup lifecycle
-(`infer-core/src/lib.rs:1250-1281`), not in `kv_budget_plan`/
-`Dsv4LayerKvLayout::new`'s arithmetic. Pre-fix, `max_seq_len` values yielding
-`num_slots ≤ 2` were rejected outright at *startup* (per
-`2026-07-06-dsv4-flashmla-budget-reconciliation-verified.md`) — a live server
-in this tight-budget regime never previously existed to expose this path.
-Filed as `docs/experience/errors/2026-07-08-dsv4-slot-abort-band-leak-crash.md`.
+first time, the server crashed on the very first request. **Corrected same
+day** — the initial hypothesis (an admission-reject path leaking a band
+reservation) was filed without reproducing the actual sequence and was
+wrong; a pod repro traced the real cause to two per-layer FlashMLA pool
+sizing/addressing bugs in `Dsv4KvAdapter` (`flashmla_total_pages()` reading
+`.first()` instead of the max-by-`flashmla_slot_pages` layer;
+`mirror_slot_pages`/`prepare_kv_batch` slicing the host's shared page-id
+list instead of deriving each layer's own local range) — both exposed by
+`3ebc763f9`'s per-layer heterogeneity, neither in its arithmetic. Fixed and
+re-verified (3 reject→retry cycles PASS, `needle_gate.py` PASS at
+500/2000 tokens). Full writeup:
+`docs/experience/errors/2026-07-08-dsv4-slot-abort-band-leak-crash.md`.
 
 ## Learnings
 
