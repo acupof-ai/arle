@@ -7461,7 +7461,7 @@ fn compressor_forward(
     // `Dsv4CompressorState::batched_update_ptrs`) to the pool instead of
     // `state`'s own per-slot buffers. `None` is byte-identical to the
     // single-register form.
-    compress_pool: Option<&mut Dsv4CompressStatePool>,
+    mut compress_pool: Option<&mut Dsv4CompressStatePool>,
     head_dim: usize,
     ratio: usize,
     overlap: bool,
@@ -7539,6 +7539,10 @@ fn compressor_forward(
         );
         // Frozen-KV verify never advances state (P1-1) — same guard as the FFI path.
         if !dsv4_verify_frozen() {
+            if let Some(pool) = compress_pool.as_deref_mut() {
+                let n_new = compressed_rows.saturating_sub(compressed_base);
+                pool.mark_written_range(compressed_base, n_new);
+            }
             sink.push(state.batched_update_ptrs(ctx, compress_pool));
             state.compressed.seq_len = compressed_rows;
         }
@@ -7622,6 +7626,8 @@ fn compressor_forward(
         // the kernel's indexing to the single-register form).
         let (prkv_ptr, prsc_ptr, overlap_page_stride) = match compress_pool {
             Some(pool) => {
+                let n_new = compressed_rows.saturating_sub(compressed_base);
+                pool.mark_written_range(compressed_base, n_new);
                 let (kv, score) = pool.base_ptrs_mut(ctx);
                 (
                     kv,

@@ -340,7 +340,7 @@ impl RealCudaExecutor {
         match self {
             Self::Qwen(q) => q.reusable_prefix_blocks(blocks),
             Self::Qwen35(q) => q.reusable_prefix_blocks(blocks),
-            Self::Dsv4(_) => 0,
+            Self::Dsv4(d) => d.reusable_prefix_blocks(blocks),
         }
     }
 
@@ -451,8 +451,8 @@ impl RealCudaExecutor {
     }
 
     /// Restore the page-radix sidecar recurrent state for `slot` when reusing a
-    /// prefix of length `matched_len`. Only meaningful for hybrid Qwen35 models;
-    /// no-op for all other arms.
+    /// prefix of length `matched_len`. Qwen3.5/3.6 hybrid restores recurrent
+    /// state; DSv4 promotes its compress-state boundary block. No-op for Qwen3.
     pub(crate) fn restore_prefix_sidecar(
         &mut self,
         slot: usize,
@@ -462,7 +462,8 @@ impl RealCudaExecutor {
     ) -> Result<()> {
         match self {
             Self::Qwen35(q) => q.restore_recurrent_sidecar(slot, tokens, matched_len, prefix_pages),
-            Self::Qwen(_) | Self::Dsv4(_) => Ok(()),
+            Self::Dsv4(d) => d.restore_compress_state_prefix(matched_len),
+            Self::Qwen(_) => Ok(()),
         }
     }
 
@@ -709,7 +710,12 @@ impl RealCudaExecutor {
     }
 }
 
-use crate::kv_tier::{BLOB_CHUNK_BYTES, CudaKvTierStore, default_t1_budget_bytes};
+use crate::kv_tier::{
+    BLOB_CHUNK_BYTES, CudaKvTierStore, compress_state_tier_key, default_t1_budget_bytes,
+};
+
+/// Placeholder, not measurement-derived — dormant until `demote` is wired.
+const COMPRESS_STATE_TIER_BUDGET_BYTES: usize = 64 << 20;
 
 /// Construction-time default fraction of available host DRAM the L2 KV tier
 /// may claim — the shared-box-safe 0.5 (the store is pageable host memory; see
@@ -1796,6 +1802,13 @@ pub(crate) struct Dsv4CudaExecutor {
     /// slots — lives here as 16 MiB chunks under a per-key manifest,
     /// partitioned by `NS_*` key namespaces.
     slot_tier: CudaKvTierStore,
+    /// Dedicated tier store for every ratio==4 layer's main compressor pool —
+    /// separate from `slot_tier` (its `bytes_per_page` is 16 MiB, wrong unit
+    /// for a few-KB compress-state page).
+    compress_tier: CudaKvTierStore,
+    /// Same as `compress_tier`, for the CSA indexer's `index_head_dim`-width
+    /// pool (different page byte size, hence its own store).
+    indexer_compress_tier: CudaKvTierStore,
 }
 
 /// `slot_tier` key namespaces (top byte, see `kv_tier::tier_key`), so features
@@ -1804,6 +1817,9 @@ pub(crate) struct Dsv4CudaExecutor {
 /// Parked whole-slot images (key = engine-minted swap key).
 const NS_SLOT: u64 = 1;
 const NS_SLOT_CHUNK: u64 = 2;
+
+/// `Dsv4CompressStatePool` only exists for `compress_ratio == 4` layers.
+const DSV4_COMPRESS_STATE_RATIO: usize = 4;
 
 /// One demoted slot: the device-state image plus the executor-level MTP spec
 /// chain. `spec_pending`/`spec_hidden` MUST ride along (not reset): under
@@ -2261,6 +2277,16 @@ impl Dsv4CudaExecutor {
         let spec_slots = (0..num_slots)
             .map(|_| Dsv4SpecSlotState::default())
             .collect();
+        // Must match `Dsv4CompressStatePool::demote`'s payload layout: 2
+        // buffers (kv, score) x ratio x head_dim x 2 bytes (bf16).
+        let main_compress_page_bytes = 2usize
+            .saturating_mul(DSV4_COMPRESS_STATE_RATIO)
+            .saturating_mul(model.config.head_dim)
+            .saturating_mul(2);
+        let indexer_compress_page_bytes = 2usize
+            .saturating_mul(DSV4_COMPRESS_STATE_RATIO)
+            .saturating_mul(model.config.index_head_dim)
+            .saturating_mul(2);
         Ok(Self {
             model,
             slots,
@@ -2273,6 +2299,14 @@ impl Dsv4CudaExecutor {
             mtp_rejects: 0,
             mtp_accept_ema: 1.0,
             mtp_skip_streak: 0,
+            compress_tier: CudaKvTierStore::with_budget(
+                COMPRESS_STATE_TIER_BUDGET_BYTES,
+                main_compress_page_bytes.max(1),
+            ),
+            indexer_compress_tier: CudaKvTierStore::with_budget(
+                COMPRESS_STATE_TIER_BUDGET_BYTES,
+                indexer_compress_page_bytes.max(1),
+            ),
             slot_tier: CudaKvTierStore::with_budget(
                 default_t1_budget_bytes(DEFAULT_DRAM_FRACTION),
                 BLOB_CHUNK_BYTES,
@@ -2301,6 +2335,93 @@ impl Dsv4CudaExecutor {
 
     pub(crate) fn kv_tier_disk_pages(&self) -> usize {
         self.slot_tier.disk_pages()
+    }
+
+    /// Resident or tier-backed, across every ratio==4 layer's main+indexer
+    /// pool (`None` pools impose no constraint).
+    fn compress_state_boundary_available(&self, block_index: usize) -> bool {
+        for layer_idx in 0..self.kv_adapter.num_layers() {
+            let Ok(layer) = self.kv_adapter.layer(layer_idx) else {
+                return false;
+            };
+            if let Some(pool) = layer.compress_state_pool()
+                && !pool.is_resident(block_index)
+                && !self
+                    .compress_tier
+                    .contains(compress_state_tier_key(layer_idx, block_index))
+            {
+                return false;
+            }
+            if let Some(pool) = layer.indexer_compress_state_pool()
+                && !pool.is_resident(block_index)
+                && !self
+                    .indexer_compress_tier
+                    .contains(compress_state_tier_key(layer_idx, block_index))
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Was hardcoded `0`. DSv4 has no page-granular KV tier, so every block
+    /// is `ResidentPage` — `pages_only_reusable_prefix_blocks` only gates
+    /// `DemotedKey` and would trivially return `blocks.len()`, so this is a
+    /// bespoke loop. Only the LAST compress-block in each KV page needs to be
+    /// available (`compressed_base - 1` is the only cross-request read a
+    /// restore depends on) — not every block the page covers.
+    pub(crate) fn reusable_prefix_blocks(&self, blocks: &[PrefixBlock]) -> usize {
+        let Some(kv_page_size) = self.kv_adapter.flashmla_page_size() else {
+            return 0;
+        };
+        if kv_page_size == 0 || kv_page_size % DSV4_COMPRESS_STATE_RATIO != 0 {
+            return 0;
+        }
+        let blocks_per_page = kv_page_size / DSV4_COMPRESS_STATE_RATIO;
+        let mut reusable = 0usize;
+        for block in blocks {
+            if !matches!(block, PrefixBlock::ResidentPage(_)) {
+                break;
+            }
+            let boundary_block = (reusable + 1) * blocks_per_page - 1;
+            if self.compress_state_boundary_available(boundary_block) {
+                reusable += 1;
+            } else {
+                break;
+            }
+        }
+        reusable
+    }
+
+    /// Promotes the boundary block `reusable_prefix_blocks` gated the match
+    /// on. An `Err` here propagates to the engine's fallback (free slot, full
+    /// recompute) — never proceeds with an unpromoted boundary.
+    pub(crate) fn restore_compress_state_prefix(&mut self, matched_len: usize) -> Result<()> {
+        if matched_len < DSV4_COMPRESS_STATE_RATIO {
+            return Ok(());
+        }
+        let block_index = matched_len / DSV4_COMPRESS_STATE_RATIO - 1;
+        let ctx = self.model.ctx.clone();
+        for layer_idx in 0..self.kv_adapter.num_layers() {
+            let layer = self.kv_adapter.layer_mut(layer_idx)?;
+            if let Some(pool) = layer.compress_state_pool_mut() {
+                let key = compress_state_tier_key(layer_idx, block_index);
+                ensure!(
+                    pool.ensure_resident(&ctx, &mut self.compress_tier, key, block_index)?,
+                    "DSv4 compress-state restore: main pool block {block_index} (layer \
+                     {layer_idx}) is neither resident nor tier-backed"
+                );
+            }
+            if let Some(pool) = layer.indexer_compress_state_pool_mut() {
+                let key = compress_state_tier_key(layer_idx, block_index);
+                ensure!(
+                    pool.ensure_resident(&ctx, &mut self.indexer_compress_tier, key, block_index)?,
+                    "DSv4 compress-state restore: indexer pool block {block_index} (layer \
+                     {layer_idx}) is neither resident nor tier-backed"
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Whole-slot swap is rank-local bytes plus TP-wide scalar consensus.
