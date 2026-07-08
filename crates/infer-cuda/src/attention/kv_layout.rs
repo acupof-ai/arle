@@ -1,4 +1,5 @@
 use super::*;
+use crate::kv_tier::CudaKvTierStore;
 pub(super) const DSV4_PREFILL_QUERY_CHUNK: usize = 4096;
 pub(crate) struct Dsv4CompressorState {
     pub(super) pending_kv: CudaSlice<half::bf16>,
@@ -165,9 +166,18 @@ impl Dsv4CompressorState {
 /// `pending_score` stay per-slot (provably zero live rows at every
 /// block-aligned restore boundary, `dsv4_attention.cu:1115`); `compressed` is
 /// already covered by the FlashMLA page-addressable band.
+///
+/// `resident[b]` tracks whether block `b` has been written. Allocation still
+/// sized to `capacity_blocks`, not shrunk: `dsv4_attention.cu` addresses
+/// `prev_overlap_kv/score` by absolute block index (host-passed or
+/// on-device-recomputed from `start_pos`), so a smaller ring needs a kernel
+/// change (out of reach without nvcc — see the plan doc's step 6 note).
 pub(crate) struct Dsv4CompressStatePool {
     pub(super) overlap_kv: CudaSlice<half::bf16>,
     pub(super) overlap_score: CudaSlice<half::bf16>,
+    ratio: usize,
+    head_dim: usize,
+    resident: Vec<bool>,
 }
 
 impl Dsv4CompressStatePool {
@@ -188,6 +198,9 @@ impl Dsv4CompressStatePool {
                 .stream
                 .alloc_zeros::<half::bf16>(elems)
                 .map_err(|e| anyhow!("DSv4 compress-state pool overlap score alloc failed: {e}"))?,
+            ratio,
+            head_dim,
+            resident: vec![false; capacity_blocks],
         })
     }
 
@@ -210,6 +223,119 @@ impl Dsv4CompressStatePool {
         drop(g0);
         drop(g1);
         (kv, score)
+    }
+
+    /// `false` covers both "never written" and "demoted to the tier store".
+    pub(crate) fn is_resident(&self, block_index: usize) -> bool {
+        self.resident.get(block_index).copied().unwrap_or(false)
+    }
+
+    pub(crate) fn mark_written(&mut self, block_index: usize) {
+        if let Some(slot) = self.resident.get_mut(block_index) {
+            *slot = true;
+        }
+    }
+
+    pub(crate) fn mark_written_range(&mut self, first: usize, count: usize) {
+        for b in first..first.saturating_add(count) {
+            self.mark_written(b);
+        }
+    }
+
+    fn block_range(&self, block_index: usize) -> std::ops::Range<usize> {
+        let per_block = self.ratio * self.head_dim;
+        let start = block_index * per_block;
+        start..start + per_block
+    }
+
+    /// Not called yet: no memory win until the ring shrinks (see struct doc).
+    #[allow(dead_code)]
+    pub(crate) fn demote(
+        &mut self,
+        ctx: &DeviceContext,
+        tier: &mut CudaKvTierStore,
+        key: u64,
+        block_index: usize,
+    ) -> Result<bool> {
+        ensure!(
+            block_index < self.resident.len(),
+            "DSv4 compress-state demote: block {block_index} outside capacity {}",
+            self.resident.len()
+        );
+        if !self.is_resident(block_index) {
+            return Ok(false);
+        }
+        let range = self.block_range(block_index);
+        let kv_vals = ctx
+            .stream
+            .clone_dtoh(&self.overlap_kv.slice(range.clone()))
+            .map_err(|e| anyhow!("DSv4 compress-state demote kv dtoh failed: {e}"))?;
+        let score_vals = ctx
+            .stream
+            .clone_dtoh(&self.overlap_score.slice(range))
+            .map_err(|e| anyhow!("DSv4 compress-state demote score dtoh failed: {e}"))?;
+        let mut payload = Vec::with_capacity((kv_vals.len() + score_vals.len()) * 2);
+        for v in &kv_vals {
+            payload.extend_from_slice(&v.to_bits().to_le_bytes());
+        }
+        for v in &score_vals {
+            payload.extend_from_slice(&v.to_bits().to_le_bytes());
+        }
+        if !tier.insert(key, payload) {
+            return Ok(false);
+        }
+        self.resident[block_index] = false;
+        Ok(true)
+    }
+
+    /// `Ok(false)` = absent from both device and tier (never written) —
+    /// caller must fall back, never proceed with a stale/garbage read.
+    pub(crate) fn ensure_resident(
+        &mut self,
+        ctx: &DeviceContext,
+        tier: &mut CudaKvTierStore,
+        key: u64,
+        block_index: usize,
+    ) -> Result<bool> {
+        ensure!(
+            block_index < self.resident.len(),
+            "DSv4 compress-state promote: block {block_index} outside capacity {}",
+            self.resident.len()
+        );
+        if self.is_resident(block_index) {
+            return Ok(true);
+        }
+        let payload = match tier.read(key) {
+            Ok(payload) => payload,
+            Err(_) => return Ok(false),
+        };
+        let per_block = self.ratio * self.head_dim;
+        ensure!(
+            payload.len() == per_block * 2 * 2,
+            "DSv4 compress-state tier payload size mismatch for block {block_index}: got {} \
+             expected {}",
+            payload.len(),
+            per_block * 2 * 2
+        );
+        let (kv_bytes, score_bytes) = payload.split_at(per_block * 2);
+        let to_bf16 = |bytes: &[u8]| -> Vec<half::bf16> {
+            bytes
+                .chunks_exact(2)
+                .map(|c| half::bf16::from_bits(u16::from_le_bytes([c[0], c[1]])))
+                .collect()
+        };
+        let kv_vals = to_bf16(kv_bytes);
+        let score_vals = to_bf16(score_bytes);
+        let range = self.block_range(block_index);
+        ctx.stream
+            .memcpy_htod(&kv_vals, &mut self.overlap_kv.slice_mut(range.clone()))
+            .map_err(|e| anyhow!("DSv4 compress-state promote kv htod failed: {e}"))?;
+        ctx.stream
+            .memcpy_htod(&score_vals, &mut self.overlap_score.slice_mut(range))
+            .map_err(|e| anyhow!("DSv4 compress-state promote score htod failed: {e}"))?;
+        self.resident[block_index] = true;
+        tier.remove(&[key]);
+        Ok(true)
     }
 
     #[allow(dead_code)]
@@ -363,6 +489,14 @@ impl Dsv4LayerKvLayout {
     /// `None` for every layer except compress_ratio==4 with an indexer.
     pub(crate) fn indexer_compress_state_pool_mut(&mut self) -> Option<&mut Dsv4CompressStatePool> {
         self.indexer_compress_state_pool.as_mut()
+    }
+
+    pub(crate) fn compress_state_pool(&self) -> Option<&Dsv4CompressStatePool> {
+        self.compress_state_pool.as_ref()
+    }
+
+    pub(crate) fn indexer_compress_state_pool(&self) -> Option<&Dsv4CompressStatePool> {
+        self.indexer_compress_state_pool.as_ref()
     }
 
     pub(crate) fn flashmla_total_pages(&self) -> usize {
