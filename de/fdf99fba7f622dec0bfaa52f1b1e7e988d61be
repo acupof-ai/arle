@@ -1,0 +1,27 @@
+README.md
+  s_51dcb143cc924c::t_7922d01b344b8e 66-70
+crates/infer-api/src/types.rs
+  s_51dcb143cc924c::t_364637a96a55e5 112-152,186-202
+crates/infer-util/src/hf_hub.rs
+  s_51dcb143cc924c::t_4963c3c0a4f39a 128-129,138-146,160
+docs/onboarding.md
+  s_51dcb143cc924c::t_b68832c2c1eaa1 103-105
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "defdf99fba7f622dec0bfaa52f1b1e7e988d61be",
+  "prompts": {},
+  "sessions": {
+    "s_51dcb143cc924c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "bf6ec1b6-bc07-4f14-a251-b795e2b27613",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
