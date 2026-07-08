@@ -125,7 +125,8 @@ pub fn discover_local_model_from(candidates: &[&str]) -> Option<(String, PathBuf
 
 /// Resolve a model source for CLI-style callers.
 ///
-/// Prefers an explicit flag value, then `AGENT_INFER_MODEL`, then local model
+/// Prefers an explicit flag value, then `ARLE_MODEL` (primary) /
+/// `AGENT_INFER_MODEL` (legacy fallback), then local model
 /// auto-discovery using [`discover_local_model`].
 pub fn resolve_model_source(explicit_model_path: Option<&str>) -> Result<String> {
     if let Some(model_path) = explicit_model_path
@@ -134,9 +135,15 @@ pub fn resolve_model_source(explicit_model_path: Option<&str>) -> Result<String>
         return Ok(model_path.to_string());
     }
 
-    if let Ok(model) = std::env::var("AGENT_INFER_MODEL")
-        && !model.trim().is_empty()
-    {
+    // ARLE_MODEL is primary; AGENT_INFER_MODEL is legacy fallback.
+    let env_model = std::env::var("ARLE_MODEL")
+        .or_else(|_| std::env::var("AGENT_INFER_MODEL"))
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    if let Some(model) = env_model {
+        if std::env::var("ARLE_MODEL").is_err() && std::env::var("AGENT_INFER_MODEL").is_ok() {
+            eprintln!("[ARLE] warning: AGENT_INFER_MODEL is deprecated; use ARLE_MODEL");
+        }
         return Ok(model);
     }
 
@@ -150,7 +157,7 @@ pub fn resolve_model_source(explicit_model_path: Option<&str>) -> Result<String>
     }
 
     anyhow::bail!(
-        "No model specified and no local model was auto-detected. Pass --model-path or set AGENT_INFER_MODEL."
+        "No model specified and no local model was auto-detected. Pass --model-path or set ARLE_MODEL."
     )
 }
 

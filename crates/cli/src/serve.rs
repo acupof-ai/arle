@@ -47,7 +47,6 @@ impl ServeBackend {
 struct ServeConfig {
     backend: ServeBackend,
     options: ServeHttpOptions,
-    bind_warning: Option<String>,
 }
 
 pub(crate) fn run_serve(args: &Args, serve_args: ServeArgs) -> ExitCode {
@@ -180,10 +179,6 @@ fn apply_probe_env(serve_args: &ServeArgs) {
 }
 
 fn run_config(config: ServeConfig) -> ExitCode {
-    if let Some(warning) = config.bind_warning.as_deref() {
-        eprintln!("[ARLE serve] warning: {warning}");
-    }
-
     // Multi-rank TP CUDA models (DSv4, Qwen3.5/3.6 MoE): SPMD (B) split. The parent
     // becomes the engine-less coordinator — binds the relay, spawns all N workers,
     // and runs the thin coordinator HTTP loop. Single GPU returns `None` and falls
@@ -258,21 +253,6 @@ fn resolve_config(args: &Args, serve_args: &ServeArgs) -> Result<ServeConfig, St
             "no model selected; pass `arle serve --model-path ...`, top-level `--model-path`, or set ARLE_MODEL".to_string()
         })?;
 
-    // Metal is the only backend whose router honors a custom bind address today;
-    // CUDA/CPU still bind, but flag a non-default `--bind` as Metal-only so the
-    // surface matches what the legacy `metal_serve` bin exposed.
-    let bind_warning = if backend == ServeBackend::Metal {
-        None
-    } else if serve_args.bind != "127.0.0.1" {
-        Some(format!(
-            "--bind={} was historically Metal-only; the {} backend now honors it in-process",
-            serve_args.bind,
-            backend.label()
-        ))
-    } else {
-        None
-    };
-
     // Speculative / MTP routing is checkpoint-native CUDA-only in the rewrite
     // serve stack. DSv4's depth-K MTP head lowers through `mtp_draft_tokens`;
     // Metal's monolith-era external draft route has not been re-ported, so the
@@ -313,7 +293,6 @@ fn resolve_config(args: &Args, serve_args: &ServeArgs) -> Result<ServeConfig, St
             serve_args.extra_args.join(" ")
         ));
     }
-
     if serve_args.lora_adapters.is_some() && backend != ServeBackend::Cuda {
         return Err("--lora-adapters is currently only supported by the CUDA backend".to_string());
     }
@@ -389,11 +368,7 @@ fn resolve_config(args: &Args, serve_args: &ServeArgs) -> Result<ServeConfig, St
         spec,
     };
 
-    Ok(ServeConfig {
-        backend,
-        options,
-        bind_warning,
-    })
+    Ok(ServeConfig { backend, options })
 }
 
 fn resolve_spec_options(backend: ServeBackend, serve_args: &ServeArgs) -> ServeSpecOptions {

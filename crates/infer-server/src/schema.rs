@@ -624,6 +624,7 @@ fn ratio(numerator: u64, denominator: u64) -> Option<f64> {
 pub struct CompletionChoice {
     pub text: String,
     pub index: usize,
+    /// Per-token logprobs (always `null` — not yet surfaced by the engine).
     pub logprobs: Option<serde_json::Value>,
     pub finish_reason: String,
     #[serde(skip_serializing_if = "Option::is_none")]
