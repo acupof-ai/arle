@@ -1,0 +1,21 @@
+docs/plans/2026-07-08-dp-attn-shared-kv-pool.md
+  s_abc4c4f5482a68::t_5ecfbc2a92dbc6 1-818
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "2adedf623ced2f502476eb6056af612e6d138839",
+  "prompts": {},
+  "sessions": {
+    "s_abc4c4f5482a68": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "142dc58a-f181-40d0-9e28-093388229279",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
