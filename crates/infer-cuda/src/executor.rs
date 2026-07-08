@@ -2541,6 +2541,7 @@ impl Dsv4CudaExecutor {
         let ctx = self.model.ctx.clone();
         if matched_len >= DSV4_COMPRESS_STATE_RATIO {
             let block_index = matched_len / DSV4_COMPRESS_STATE_RATIO - 1;
+            let compressor_seq_len = block_index + 1;
             for layer_idx in 0..self.kv_adapter.num_layers() {
                 let layer = self.kv_adapter.layer_mut(layer_idx)?;
                 if let Some(pool) = layer.compress_state_pool_mut() {
@@ -2550,6 +2551,11 @@ impl Dsv4CudaExecutor {
                         "DSv4 compress-state restore: main pool block {block_index} (layer \
                          {layer_idx}) is neither resident nor tier-backed"
                     );
+                    self.slots
+                        .get_mut(slot)
+                        .ok_or_else(|| anyhow!("DSv4 Route A restore: slot {slot} outside range"))?
+                        .attention_layer_mut(layer_idx)?
+                        .set_compressor_seq_len(compressor_seq_len);
                 }
                 if let Some(pool) = layer.indexer_compress_state_pool_mut() {
                     let key = compress_state_tier_key(layer_idx, block_index);
@@ -2584,6 +2590,13 @@ impl Dsv4CudaExecutor {
                      neither resident nor tier-backed"
                 );
                 layer.restore_dsa_prefix_into_slot(&ctx, slot, row_count)?;
+                let attn = self
+                    .slots
+                    .get_mut(slot)
+                    .ok_or_else(|| anyhow!("DSv4 Route A restore: slot {slot} outside range"))?
+                    .attention_layer_mut(layer_idx)?;
+                attn.set_indexer_seq_len(row_count);
+                attn.set_dsa_official_packed_rows(row_count);
             }
         }
         let sliding_window = self.model.config.sliding_window;
