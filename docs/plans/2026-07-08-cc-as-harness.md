@@ -74,12 +74,18 @@ a broken serve stalls for minutes rather than failing fast.
 ### 3. Per-task headless call — inside the sandbox, no egress, no prompts
 ```bash
 cd $workdir
-claude -p "$INSTRUCTION" \
+timeout ${TASK_WALL_SECS:-1200} claude -p "$INSTRUCTION" \
   --model "$ANTHROPIC_MODEL" \
   --allowedTools Bash Read Write Edit Grep Glob \
   --dangerously-skip-permissions \
-  --output-format stream-json --verbose > $workdir/.cc_session.jsonl
+  --output-format stream-json --verbose > $sessions_dir/$task_id.jsonl
 ```
+The session transcript goes **outside** `$workdir` — writing it into the repo
+pollutes the `git diff` the scorer keys on. `--allowedTools` is an allowlist;
+`WebFetch`/`WebSearch`/`Task` must stay off — the sandbox is offline, and one web
+call stalls on the 10-retry ~38s backoff. `timeout` replaces the missing
+`--max-turns`; size it against the ~15s ttft (hard tasks legitimately take 20+
+turns — the turns-to-first-edit wall).
 CC 2.1.204 has **no `--max-turns` flag** — cap via the prompt or a wall-clock
 timeout on the process, not a turn count. `stream-json` gives a local transcript
 for debugging/scoring; training records come from the **server-side**
@@ -117,6 +123,35 @@ capability-lift measurement.
 `-a terminus -m openai/…` path in `terminal_bench_eval.sh`, and the terminus
 calls in `tbench_*.sh` — all replaced by `--agent claude-code` or
 `cc_swe_baseline.py`.
+
+## End-to-end refinements (found in the chain audit)
+
+**Correctness:**
+- **Training-record capture must be serial per task.** `cc-convert` attributes
+  dumps to attempts by **time window** (`cc_convert.rs:26` `CcWindow`,
+  fullest-messages dump in `[t_start,t_end)`); the dump filename is
+  `<epoch_ms>_<seq>` with no task/session id (`coordinator.rs:42`). Concurrent
+  tasks overlap in time → windows cross-contaminate. So: **eval lane runs
+  concurrent** (needs only pass/fail, no cc-convert); **the OPD training-record
+  lane runs one CC at a time**, snapshotting `t_start/t_end` around each call and
+  passing labelled windows. Intra-session concurrency (count_tokens etc.) is
+  safe — the "fullest dump" heuristic ignores the small requests.
+- **Session transcript outside `$workdir`** and **web/subagent tools off** — see §3.
+
+**Performance:**
+- **RadixCache the ~20k-token CC system prompt.** It is constant across every
+  task and every turn — the single biggest throughput lever. Verify the serve
+  prefix-cache hits it; if not, each task re-prefills 20k tokens for nothing.
+
+**Control:**
+- **Greedy eval.** The held-out pass-rate needs temp=0 for reproducibility, but
+  CC exposes no sampling params — force it serve-side (an eval mode) rather than
+  through CC.
+
+**Design choice (not a bug):** distillation is conditioned on CC's 20k system
+prompt, so the student learns behaviour given that prompt. Consistent only if
+production serving also goes through the CC harness; otherwise it is train/serve
+skew to account for.
 
 ## The one knob to watch (a property, not a gate)
 Whether the model's tool calls parse cleanly at the `anthropic.rs` → OpenAI
