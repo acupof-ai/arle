@@ -1,0 +1,47 @@
+crates/infer-core/src/lib.rs
+  s_e1fe4113931506::t_9b6ef5718029a6 995-999
+crates/infer-core/src/prefix.rs
+  s_e1fe4113931506::t_d48fe09656ff6a 232-245
+crates/infer-cuda/src/attention/kv_layout.rs
+  s_e1fe4113931506::t_500aa5cfe34956 347-368,378-730,853-860,885-919,1801-1822,1832-1833,1856-1860,1957
+crates/infer-cuda/src/dsv4.rs
+  s_02a80f07df5184::t_91f92c0e093fb8 1126-1137,1863-1899,1953-1955,1974-1975,1986-1987
+crates/infer-cuda/src/executor.rs
+  s_e1fe4113931506::t_469451de753cc6 10,13,455,460-484,730,1828-1833,1842-1846,2317-2324,2345-2352,2410-2464,2467-2472,2481-2484,2488-2498,2501-2509,2511,2514-2518,2520-2524,2526-2564,2566-2568,2570,2572-2581,2583-2585,2587-2594,3460-3469,3495-3501,3505-3506,3512,3514-3516,3535-3552,3560-3570,3609-3616,3925,5395-5402
+crates/infer-cuda/src/kv_tier.rs
+  s_e1fe4113931506::t_a46701f9e91bab 185-206
+crates/infer-cuda/src/lib.rs
+  s_e1fe4113931506::t_58f9dfbaee9a11 744-772
+crates/infer-cuda/src/qwen35.rs
+  s_e1fe4113931506::t_d1ffe5eec0f5bd 540-641
+crates/infer-seam/src/lib.rs
+  s_e1fe4113931506::t_2e28f42b424901 337-355
+scripts/pod.sh
+  s_e1fe4113931506::t_c1e147fb28059a 126,139
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "95a2fab948d9dbaccf42103d1ca61d1dd04dc612",
+  "prompts": {},
+  "sessions": {
+    "s_02a80f07df5184": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a42728cf8bfa2f3ae",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_e1fe4113931506": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a237c80a66ad20b7f",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
