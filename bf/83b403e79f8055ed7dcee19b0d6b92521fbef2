@@ -1,0 +1,33 @@
+scripts/tb_exclude_security.sh
+  s_64b9a07f96ec2c::t_bb36eefd1be897 1-25
+scripts/tbench_full.sh
+  s_9c91b86ec3fb55::t_cefeccd6911068 12
+scripts/terminal_bench_eval.sh
+  s_9c91b86ec3fb55::t_20aa07f4b9ba55 149-161,165
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "bf83b403e79f8055ed7dcee19b0d6b92521fbef2",
+  "prompts": {},
+  "sessions": {
+    "s_64b9a07f96ec2c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a1200a17fa4859bfa",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_9c91b86ec3fb55": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4779911a-69b7-49db-bc83-daf5a48d6ca3",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
