@@ -856,9 +856,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                 .saturating_sub(prompt_tokens.len()),
         );
         let mut sampling = options.sampling;
-        // `max_tokens` is the scheduler-admitted budget after max-total clamping.
-        // Keep the sampling copy normalized too: diffusion executors consume it
-        // directly as their generation length.
+        // Normalize sampling max_new_tokens too — diffusion executors consume it directly.
         sampling.max_new_tokens = Some(max_tokens);
         if max_tokens == 0 {
             return NormalizedRequest::Completed(
@@ -891,15 +889,11 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                 .push_back(token);
         }
         let mut finished_slots = Vec::new();
-        // Tokens committed this step, in commit order (prefill rows then decode
-        // rows), forwarded to `on_token` after the request-borrowing loops so the
-        // `self.active` and `self.on_token` borrows stay disjoint.
+        // Committed tokens (prefill then decode), forwarded to `on_token` after request loops.
         let mut committed: Vec<(RequestHandle, SlotToken)> = Vec::new();
         let model_stops = self.model_stop_token_ids.clone();
 
-        // Advance chunked prefill. A non-final chunk only moves progress; the
-        // final chunk transitions the slot to decode and consumes its first token.
-        // Slots whose prefill just completed are sealed at the prompt boundary below.
+        // Advance chunked prefill. Non-final chunk only moves progress; final chunk transitions to decode.
         let mut prompt_sealed_slots: Vec<usize> = Vec::new();
         for row in &plan.prefill_rows {
             let Some(request) = self.active.get_mut(&row.slot) else {
@@ -932,18 +926,12 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                 request.phase = RequestPhase::Prefilling {
                     progress: new_start,
                 };
-                // A non-final chunk produces no committed token.
                 tokens_by_slot.remove(&row.slot);
             }
         }
 
-        // Seal each just-prefilled prompt into the radix at the PROMPT boundary,
-        // capturing the recurrent sidecar while device state is exactly at
-        // `prompt_len` — the boundary a chat/messages-resend restores at. Finish
-        // only captures the post-generation boundary, so without this a prompt-only
-        // resend keys at a block boundary that was never saved and full-recomputes.
-        // `radix.insert` dedups, so `published_pages` is unchanged; a slot that also
-        // finishes this step re-publishes the superset at finish. Runs after the loop.
+        // Seal just-prefilled prompts into radix at PROMPT boundary — a chat/messages-resend restores at
+        // prompt_len, not post-generation. Without this, prompt-only resends full-recompute. `radix.insert` dedups.
         for slot in prompt_sealed_slots {
             let Some(prompt_tokens) = self.active.get(&slot).map(|r| r.prompt_tokens.clone())
             else {
@@ -952,11 +940,8 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             self.publish_prefix_blocks(slot, &prompt_tokens);
         }
 
-        // Decode rows: append sampled token(s) and check stop/length after each.
-        // Speculative backends may return multiple committed tokens for one
-        // decode row; the host KV pool pre-allocated the first one in
-        // `allocate_for_plan`, so each extra token gets one more logical append
-        // before it is exposed to scheduling.
+        // Decode rows: append token(s) + check stop/length. Speculative backends may return multiple tokens
+        // per row; first was pre-allocated in `allocate_for_plan`, extras get one more logical append.
         for row in &plan.decode_rows {
             let Some(mut tokens) = tokens_by_slot.remove(&row.slot) else {
                 continue;
@@ -988,8 +973,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             .generated_tokens
             .saturating_add(committed.len() as u64);
 
-        // Stream committed tokens to the observer (if any) before finishing slots,
-        // so a serving layer sees the terminal token ahead of completion.
+        // Stream tokens before finishing — serving layer sees terminal token ahead of completion.
         if let Some(observer) = &mut self.on_token {
             for (handle, token) in &committed {
                 observer(*handle, token);
@@ -1929,6 +1913,40 @@ mod testing {
         }
     }
 
+    /// Mock executor reporting a coarser-than-page restore alignment,
+    /// mirroring DSv4's ring-snapshot `sliding_window` unit — proves the
+    /// planner combines it with KV page size via LCM, not `.max()`.
+    #[derive(Debug, Clone)]
+    pub(super) struct RestoreAlignmentExecutor {
+        inner: MockExecutor,
+        alignment: usize,
+    }
+
+    impl RestoreAlignmentExecutor {
+        pub(super) fn with_alignment(alignment: usize) -> Self {
+            Self {
+                inner: MockExecutor::ready(),
+                alignment,
+            }
+        }
+    }
+
+    impl BackendExecutor for RestoreAlignmentExecutor {
+        type Inflight = MockInflight;
+
+        fn submit(&mut self, plan: &ForwardPlan, kv: &mut dyn KvPool) -> Result<Self::Inflight> {
+            self.inner.submit(plan, kv)
+        }
+
+        fn poll(&mut self, inflight: Self::Inflight) -> Result<PollResult<Self::Inflight>> {
+            self.inner.poll(inflight)
+        }
+
+        fn prefill_restore_boundary_alignment(&self) -> usize {
+            self.alignment
+        }
+    }
+
     /// Mock executor that records how many times `warmup` was called, so a test
     /// can assert the engine warms the backend exactly once.
     #[derive(Debug, Clone, Default)]
@@ -2563,9 +2581,9 @@ mod tests {
 
     use super::testing::{
         DeviceMirrorExecutor, HoldGovernor, HybridReprefillMirror, LimitedPrefixExecutor,
-        MockExecutor, MockKvPool, SamplingExecutor, SingleRowExecutor, SlotTierMockExecutor,
-        SpecMirrorExecutor, StopTokenExecutor, TierMockExecutor, TokenBudgetGovernor,
-        WarmupCountingExecutor,
+        MockExecutor, MockKvPool, RestoreAlignmentExecutor, SamplingExecutor, SingleRowExecutor,
+        SlotTierMockExecutor, SpecMirrorExecutor, StopTokenExecutor, TierMockExecutor,
+        TokenBudgetGovernor, WarmupCountingExecutor,
     };
     use super::*;
 
@@ -4410,6 +4428,42 @@ mod tests {
         assert!(
             prefilling_positions.contains(&8),
             "prefill chunk must stop on page boundary 8, got {prefilling_positions:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn prefill_chunk_stops_on_lcm_of_page_size_and_restore_alignment() -> Result<()> {
+        // page_size=4, restore_alignment=6: neither divides the other, so
+        // lcm(4,6)=12 is required (max(4,6)=6 would land on 30, NOT a
+        // multiple of page_size 4). restore_alignment>1 also caps each chunk
+        // to one alignment unit (12), so a 32-token prompt hits EVERY
+        // boundary — 12, then 24 — not just the deepest one a single
+        // oversized chunk could reach (28, page-only) or (30, max-only).
+        let mut engine = Engine::with_config(
+            RestoreAlignmentExecutor::with_alignment(6),
+            MockKvPool::with_capacity(1, 4, 16),
+            test_config(1),
+        );
+        engine.submit_request((1u32..=32).collect(), 1);
+
+        let mut prefilling_positions = Vec::new();
+        for _ in 0..8 {
+            engine.step()?;
+            if let Some(request) = engine.active.values().next() {
+                if matches!(request.phase, RequestPhase::Prefilling { .. }) {
+                    prefilling_positions.push(request.prefill_start_pos);
+                }
+            }
+        }
+        assert!(
+            prefilling_positions.contains(&12) && prefilling_positions.contains(&24),
+            "prefill must stop at EVERY lcm(4,6)=12 boundary (12, 24), got {prefilling_positions:?}"
+        );
+        assert!(
+            !prefilling_positions.contains(&28) && !prefilling_positions.contains(&30),
+            "chunk must not skip ahead to page-size-only (28) or max-only (30) boundaries, \
+             got {prefilling_positions:?}"
         );
         Ok(())
     }
