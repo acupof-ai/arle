@@ -1,21 +1,23 @@
 #!/usr/bin/env python3
 """SWE-bench_Pro corpus staging for the agentic-OPD phase-2 curve.
 
-Two subcommands running on different machines:
+Both subcommands run locally (HF + GitHub egress); the offline pod only
+receives the resulting staged-root tarball + JSONL — never clones itself.
 
-  select  (local, HF access)  — pick python-language candidates from
-          ScaleAI/SWE-bench_Pro and emit a SweTask-schema JSONL
-          (crates/train/src/swe_dataset.rs field names + gold_patch for the
-          pod-side scoring gate).
-  stage   (pod, GitHub access) — clone each candidate at base_commit, run the
-          self-check gate (test_patch alone must FAIL, gold_patch on top must
-          PASS — mirrors scripts/cc_swe_baseline.py score()), and land accepted
-          trees at <staged-root>/<instance_id>/ plus train/eval JSONL rows.
+  select — pick python (ansible) candidates from ScaleAI/SWE-bench_Pro into a
+           SweTask-schema JSONL (crates/train/src/swe_dataset.rs fields +
+           gold_patch for the scoring gate).
+  stage  — clone each candidate at base_commit, run the self-check gate
+           (test_patch alone FAILS, gold_patch on top PASSES — mirrors
+           scripts/cc_swe_baseline.py score()), land accepted trees at
+           <staged-root>/<instance_id>/ + train/eval JSONL. Then ship to the
+           pod (pod builds offline, local-fed):
+             tar czf staged.tgz <staged-root> train.jsonl eval.jsonl
 
 Usage:
   python3 scripts/stage_swe_pro.py select --out candidates.jsonl --limit 60
   python3 scripts/stage_swe_pro.py stage --candidates candidates.jsonl \
-      --staged-root /host/staged --train-out train.jsonl --eval-out eval.jsonl \
+      --staged-root staged --train-out train.jsonl --eval-out eval.jsonl \
       --train-n 12 --eval-n 12
 
 Plan: docs/plans/2026-07-03-agentic-opd-27b-capability-curve.md (phase 2).
@@ -29,7 +31,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import time
 from pathlib import Path
 
 PYTEST_TIMEOUT = 300
@@ -154,43 +155,19 @@ def run(cmd, cwd, timeout=None, env=None):
                           timeout=timeout, check=False, env=e)
 
 
-SHA_RE = re.compile(r"\b[0-9a-f]{40}\b")
-
-
-def clone_at_commit(repo, sha, dest, extra_shas=()):
-    """Depth-1 fetch of `sha` plus every extra sha into `dest`. before_repo_set_cmd
-    `git checkout <fix_commit> -- test/...` to inject hidden tests, and the fix
-    commit is a DESCENDANT of base_commit — not in its ancestry. A full
-    `git fetch origin` on ansible's history times out (>600s), so instead fetch
-    each referenced sha individually --depth 1 (GitHub allows reachable-sha
-    wants). Every git command runs with cwd inside `dest` — never the launch cwd
-    (the pod's default cwd has a poisoned .git/config auth extraheader)."""
+def clone_at_commit(repo, sha, dest):
+    """Depth-1 fetch of one reachable sha (a full `git fetch origin` on ansible
+    history times out >600s). Every git cmd runs with cwd inside `dest`, never
+    the launch cwd (whose .git/config may carry a poisoned auth extraheader)."""
     dest.mkdir(parents=True)
     url = f"https://github.com/{repo}.git"
     for cmd in (["git", "init", "-q"],
-                ["git", "remote", "add", "origin", url]):
+                ["git", "remote", "add", "origin", url],
+                ["git", "fetch", "-q", "--depth", "1", "origin", sha],
+                ["git", "checkout", "-q", sha]):
         r = run(cmd, dest, timeout=SETUP_TIMEOUT)
         if r.returncode != 0:
             return f"{' '.join(cmd[:3])} rc={r.returncode}: {r.stderr.strip()[:200]}"
-    seen = set()
-    for s in (sha, *extra_shas):
-        if s in seen:
-            continue
-        seen.add(s)
-        # Pod egress to github.com is intermittent (transient 443 connect
-        # timeouts drop ~1/3 of fetches). Retry with backoff so a flaky moment
-        # doesn't waste a candidate.
-        for attempt in range(5):
-            r = run(["git", "fetch", "-q", "--depth", "1", "origin", s], dest,
-                    timeout=SETUP_TIMEOUT)
-            if r.returncode == 0:
-                break
-            time.sleep(5 * (attempt + 1))
-        if r.returncode != 0 and s == sha:
-            return f"git fetch {s[:12]} rc={r.returncode}: {r.stderr.strip()[:200]}"
-    r = run(["git", "checkout", "-q", sha], dest, timeout=SETUP_TIMEOUT)
-    if r.returncode != 0:
-        return f"git checkout rc={r.returncode}: {r.stderr.strip()[:200]}"
     return None
 
 
@@ -327,7 +304,10 @@ def cmd_stage(args):
             shutil.rmtree(repo_dir / ".git")
             repo_dir.rename(staged)
 
-            row = dict(task)
+            # Persist the git-state-stripped setup, not the raw row: the tree is
+            # .git-removed below, so a row carrying `git reset/checkout <sha>`
+            # crashes the runner's boot with "not a git repository".
+            row = dict(task, before_repo_set_cmd=setup)
             if len(train_rows) < args.train_n:
                 train_rows.append(row)
                 out, split = args.train_out, "train"
