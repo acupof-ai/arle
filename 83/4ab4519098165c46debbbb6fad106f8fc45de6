@@ -1,0 +1,21 @@
+scripts/stage_swe_pro.py
+  s_5426bff29e562b::t_fd9c738e6ec061 4-15,20,158-161,165-167,307-310
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "834ab4519098165c46debbbb6fad106f8fc45de6",
+  "prompts": {},
+  "sessions": {
+    "s_5426bff29e562b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-af97e24504ada537c",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
