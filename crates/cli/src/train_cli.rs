@@ -2378,7 +2378,16 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
     // tool loop. Size for the full accumulated agent conversation: up to
     // `max_turns` sub-turns, each generating up to `max_tokens`, plus tool
     // outputs / context. Generous budget, floored, bounds total KV pages.
-    let student_seq = (args.max_turns * args.max_tokens + 8192).max(16384);
+    // KV must cover the longest rollout — rescue runs at the bigger of its own
+    // turn/token budget and the normal one.
+    let rescue_turns = if args.rescue_max_turns == 0 {
+        args.max_turns
+    } else {
+        args.rescue_max_turns
+    };
+    let student_seq =
+        (rescue_turns.max(args.max_turns) * args.rescue_max_tokens.max(args.max_tokens) + 8192)
+            .max(16384);
 
     // Load order: default loads the autograd student FIRST (engine then sees
     // post-student free VRAM — byte-identical). --share-frozen-base loads the
@@ -2604,6 +2613,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
         think: args.think_rollouts,
         rescue_samples: args.rescue_samples,
         rescue_max_tokens: args.rescue_max_tokens,
+        rescue_max_turns: rescue_turns,
         writeback_batch: args.writeback_batch,
         writeback_cap: args.writeback_cap,
         work_root: args.work_root.clone(),

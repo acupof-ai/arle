@@ -1628,6 +1628,14 @@ pub(crate) struct TrainAgentOpdArgs {
     #[arg(long, default_value_t = 8192)]
     pub(crate) rescue_max_tokens: usize,
 
+    /// Turn budget for rescue rollouts (0 = inherit --max-turns). Hard real-repo
+    /// tasks are turns-to-first-edit bound: they burn `max_turns` on on-target
+    /// investigation and never edit (empty diff → 0-accept), yet the same
+    /// teacher edits and passes at 20 turns (measured A/B 2026-07-08). Raising
+    /// tokens alone (the old rescue) tunes the wrong axis.
+    #[arg(long, default_value_t = 0, value_name = "N")]
+    pub(crate) rescue_max_turns: usize,
+
     /// Rollout nucleus sampling threshold (1.0 disables top-p).
     #[arg(long, default_value_t = 1.0)]
     pub(crate) rollout_top_p: f32,
