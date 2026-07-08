@@ -6327,6 +6327,14 @@ fn mla_attention_fwd(
                 }
             }
         }
+        snapshot_sw_ring_at_boundary(
+            ctx,
+            pool,
+            &state.sw_window_cache,
+            start_pos,
+            token_count,
+            config.sliding_window,
+        )?;
     } else {
         // ── 4b(fwd). CSA / HCA: hybrid windowed+compressed attention over the
         // compressor pool (re-borrowed from `state`) + PREPARE's `selected`.
