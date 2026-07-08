@@ -341,7 +341,7 @@ impl Dsv4DsaSharedScratch {
 
 /// Device bytes of the ONE [`Dsv4DsaSharedScratch`] (per model, NOT per slot).
 /// MUST mirror [`Dsv4DsaSharedScratch::new`]'s allocations (kept adjacent so
-/// drift is visible). Feeds `Dsv4Model::kv_budget_num_slots` as a one-off
+/// drift is visible). Feeds `Dsv4Model::kv_budget_plan` as a one-off
 /// subtraction from the budget.
 pub(crate) fn dsv4_dsa_shared_scratch_bytes(
     config: &DeepSeekV4Config,
@@ -385,7 +385,7 @@ pub(crate) fn dsv4_dsa_shared_scratch_bytes(
 /// MUST mirror [`Dsv4DsaSharedScratch::new`]'s `*_batch` allocations. This is a
 /// per-slot term (NOT a fixed subtraction): `decode_max_batch == num_slots`, so
 /// the total batched-scratch cost is `num_slots * (this)`. It is fed into
-/// `kv_budget_num_slots`'s per-slot budget rather than `dsv4_dsa_shared_scratch_bytes`
+/// `kv_budget_plan`'s per-slot budget rather than `dsv4_dsa_shared_scratch_bytes`
 /// — putting it in the fixed subtraction would be CIRCULAR (the budget computes
 /// `num_slots` FROM that subtraction).
 pub(crate) fn dsv4_dsa_batched_scratch_bytes_per_slot(
@@ -419,7 +419,7 @@ pub(crate) fn dsv4_dsa_batched_scratch_bytes_per_slot(
 
 /// Device bytes of ONE per-(slot, CSA-layer) [`Dsv4DsaOfficialState`] — the
 /// transient `rotated_keys` staging buffer. Feeds the per-slot term of
-/// `Dsv4Model::kv_budget_num_slots`.
+/// `Dsv4Model::kv_budget_plan`.
 pub(crate) fn dsv4_dsa_rotated_keys_bytes(
     config: &DeepSeekV4Config,
     compress_ratio: usize,

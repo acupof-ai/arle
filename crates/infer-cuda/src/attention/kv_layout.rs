@@ -417,7 +417,6 @@ impl Dsv4KvAdapter {
         kv_arena: &Dsv4MlaKvArena,
         tp_world: usize,
         num_slots: usize,
-        flashmla_pool_budget_bytes_per_layer: usize,
         mla_decode: Vec<Option<Dsv4MlaDecodeGraphScratch>>,
         moe_decode: Option<(
             &infer_moe::MoeConfig,
@@ -447,7 +446,6 @@ impl Dsv4KvAdapter {
                     local_heads,
                     tp_world,
                     num_slots,
-                    flashmla_pool_budget_bytes_per_layer,
                 )
             })
             .collect::<Result<Vec<_>>>()?;
@@ -986,7 +984,6 @@ impl Dsv4LayerKvLayout {
         local_heads: usize,
         tp_world: usize,
         num_slots: usize,
-        flashmla_pool_budget_bytes_per_layer: usize,
     ) -> Result<Self> {
         let flashmla_slot_pages = if dsv4_flashmla_decode_alloc_enabled()? {
             let shape = Dsv4FlashMlaDecodeShape::new(
@@ -1022,15 +1019,16 @@ impl Dsv4LayerKvLayout {
                 format.default_page_size(),
                 kv_arena.page_block_size
             );
-            // #85 Stage-B: the MLA pool is the COHERENT REMAINDER from kv_budget_plan
-            // (MEM_FRACTION×free − weights − fixed − per_slot×num_slots). Each slot
-            // draws its FULL fixed band up front on first alloc
-            // (`HostPagedKvPool::alloc_fixed_band`, never incremental), so
-            // `kv_budget_plan`'s pool-affordable-slots re-clamp (pod-verified
-            // 2026-07-06) already sizes `num_slots` to fit `num_slots` whole bands
-            // in this exact remainder — `budget_bytes` below is sized for that many
-            // pages by construction, not just one.
-            let budget_bytes = flashmla_pool_budget_bytes_per_layer;
+            // #85 Stage-B / KV-budget convergence: each layer is sized for its
+            // OWN real need — `num_slots` whole bands of this layer's own
+            // `flashmla_slot_pages` — not a uniform per-layer share of the
+            // pool total. `kv_budget_plan`'s pool-affordable-slots re-clamp
+            // (pod-verified 2026-07-06) already sizes `num_slots` against the
+            // SUM of every layer's pages, so summing each layer's own exact
+            // band here reconstructs that same total, per layer, exactly.
+            let budget_bytes = num_slots
+                .saturating_mul(flashmla_slot_pages)
+                .saturating_mul(flashmla_page_bytes);
             let pool = TokenKVPool::with_format(
                 ctx,
                 1,
