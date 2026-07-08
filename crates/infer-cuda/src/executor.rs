@@ -2364,12 +2364,9 @@ impl Dsv4CudaExecutor {
         true
     }
 
-    /// Was hardcoded `0`. DSv4 has no page-granular KV tier, so every block
-    /// is `ResidentPage` — `pages_only_reusable_prefix_blocks` only gates
-    /// `DemotedKey` and would trivially return `blocks.len()`, so this is a
-    /// bespoke loop. Only the LAST compress-block in each KV page needs to be
-    /// available (`compressed_base - 1` is the only cross-request read a
-    /// restore depends on) — not every block the page covers.
+    /// Only the LAST compress-block in each KV page needs to be resident
+    /// (`compressed_base - 1` is the only cross-request read a restore
+    /// depends on) — not every block the page covers.
     pub(crate) fn reusable_prefix_blocks(&self, blocks: &[PrefixBlock]) -> usize {
         let Some(kv_page_size) = self.kv_adapter.flashmla_page_size() else {
             return 0;
