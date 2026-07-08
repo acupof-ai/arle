@@ -2610,6 +2610,10 @@ impl Dsv4CudaExecutor {
                 pool.restore_into_ring(&ctx, ring, block_index)?;
             }
         }
+        self.slots
+            .get_mut(slot)
+            .ok_or_else(|| anyhow!("DSv4 Route A restore: slot {slot} outside range"))?
+            .set_seq_len(matched_len);
         Ok(())
     }
 
@@ -3483,6 +3487,17 @@ pub(crate) struct Qwen35CudaExecutor {
     /// blocks — no independent LRU. (The store's own budget is the memory
     /// backstop for any blob whose tail page LRU-evicted before drop reached it.)
     sidecar_page_key: std::collections::HashMap<u32, u64>,
+    /// Per-slot recurrent snapshot captured DURING prefill exactly at the
+    /// last-page boundary `L* = align_down16(prompt_len - 1)` — the restore
+    /// target for an exact resend (un-popped for non-aligned, pop-trimmed for
+    /// aligned; see `prefix.rs:72`). The device recurrent state has no position
+    /// index and cannot rewind, so a snapshot taken at prompt-completion (`P`)
+    /// keyed at `L*` would bake the residue `[L*..P]` and double-advance it on
+    /// restore's re-prefill — corrupting page-aligned lengths. Capturing at `L*`
+    /// makes snapshot-position == key-position. Consumed by
+    /// `save_recurrent_sidecar`; cleared on the next request (`start_pos == 0`)
+    /// so no cross-request state leaks.
+    prefill_boundary_snapshot: Vec<Option<(usize, crate::qwen35::Qwen35RecurrentSnapshot)>>,
 }
 
 impl std::fmt::Debug for Qwen35CudaExecutor {
