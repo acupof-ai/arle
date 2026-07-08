@@ -78,23 +78,39 @@ impl Dsv4CompressorState {
         Ok(())
     }
 
-    /// Raw mutable device pointers (as `u64`) to this row's five ring-state
-    /// buffers, for gathering into the batched-compressor-update pointer arrays:
-    /// `(pending_kv, pending_score, prev_overlap_kv, prev_overlap_score,
-    /// compressed)`. Resolved on `ctx.stream`; the returned `u64`s stay valid
-    /// because the buffers are not reallocated for the rest of the forward (same
-    /// single-stream discipline the per-row path uses). The cudarc borrow guards
-    /// are dropped before returning so the caller can re-borrow `state` later.
-    pub(crate) fn batched_update_ptrs(&mut self, ctx: &DeviceContext) -> (u64, u64, u64, u64, u64) {
+    /// Raw mutable device pointers (as `u64`) for gathering into the
+    /// batched-compressor-update pointer arrays: `(pending_kv, pending_score,
+    /// prev_overlap_kv, prev_overlap_score, compressed)`. `pending_kv`/
+    /// `pending_score`/`compressed` are always THIS ROW's own per-slot buffers.
+    /// `prev_overlap_kv`/`_score` are per-slot ONLY when `compress_pool` is
+    /// `None`; when `Some`, they instead resolve to the SAME shared per-layer
+    /// pool base for every row — the kernel addresses the actual page via
+    /// `compressed_base`/`block`, not a per-row offset (see
+    /// `Dsv4CompressStatePool`). Resolved on `ctx.stream`; the returned `u64`s
+    /// stay valid because the buffers are not reallocated for the rest of the
+    /// forward (same single-stream discipline the per-row path uses). The
+    /// cudarc borrow guards are dropped before returning so the caller can
+    /// re-borrow `state`/`compress_pool` later.
+    pub(crate) fn batched_update_ptrs(
+        &mut self,
+        ctx: &DeviceContext,
+        compress_pool: Option<&mut Dsv4CompressStatePool>,
+    ) -> (u64, u64, u64, u64, u64) {
         let (pkv, g0) = self.pending_kv.device_ptr_mut(&ctx.stream);
         let (psc, g1) = self.pending_score.device_ptr_mut(&ctx.stream);
-        let (prkv, g2) = self.prev_overlap_kv.device_ptr_mut(&ctx.stream);
-        let (prsc, g3) = self.prev_overlap_score.device_ptr_mut(&ctx.stream);
+        let (prkv, prsc) = match compress_pool {
+            Some(pool) => pool.base_ptrs_mut(ctx),
+            None => {
+                let (k, g2) = self.prev_overlap_kv.device_ptr_mut(&ctx.stream);
+                let (s, g3) = self.prev_overlap_score.device_ptr_mut(&ctx.stream);
+                drop(g2);
+                drop(g3);
+                (k, s)
+            }
+        };
         let (comp, g4) = self.compressed.data.device_ptr_mut(&ctx.stream);
         drop(g0);
         drop(g1);
-        drop(g2);
-        drop(g3);
         drop(g4);
         (pkv, psc, prkv, prsc, comp)
     }
@@ -132,6 +148,82 @@ impl Dsv4CompressorState {
         // pending_kv + pending_score (ratio*width each) + prev_overlap_kv +
         // prev_overlap_score (ratio*head_dim each) + compressed[head_dim, ring_rows].
         (2 * ratio * width + 2 * ratio * head_dim + head_dim * ring_rows) * bf16
+    }
+}
+
+/// Page-addressable, cross-request-shared pool for ONE layer's compressor
+/// `prev_overlap_kv`/`_score` carry-state, replacing the per-slot single
+/// register in [`Dsv4CompressorState`] for `compress_ratio == 4` layers only
+/// (other ratios keep the per-slot register). One page holds exactly one
+/// compress-block's `ratio*head_dim` rows; `capacity_blocks` covers every
+/// block position across `max_seq_len`, so a page is addressed by ABSOLUTE
+/// block index (`start_pos / ratio`), not by which slot wrote it — two
+/// different requests at the same prefix position read/write the same page,
+/// which is the whole point (SGLang `CompressStatePool` precedent).
+///
+/// Only 2 of `Dsv4CompressorState`'s buffers move here: `pending_kv`/
+/// `pending_score` stay per-slot (provably zero live rows at every
+/// block-aligned restore boundary, `dsv4_attention.cu:1115`); `compressed` is
+/// already covered by the FlashMLA page-addressable band.
+pub(crate) struct Dsv4CompressStatePool {
+    pub(super) overlap_kv: CudaSlice<half::bf16>,
+    pub(super) overlap_score: CudaSlice<half::bf16>,
+}
+
+impl Dsv4CompressStatePool {
+    pub(super) fn new(
+        ctx: &DeviceContext,
+        head_dim: usize,
+        ratio: usize,
+        max_seq_len: usize,
+    ) -> Result<Self> {
+        let capacity_blocks = max_seq_len.div_ceil(ratio.max(1)).max(1);
+        let elems = capacity_blocks * ratio * head_dim;
+        Ok(Self {
+            overlap_kv: ctx
+                .stream
+                .alloc_zeros::<half::bf16>(elems)
+                .map_err(|e| anyhow!("DSv4 compress-state pool overlap kv alloc failed: {e}"))?,
+            overlap_score: ctx
+                .stream
+                .alloc_zeros::<half::bf16>(elems)
+                .map_err(|e| anyhow!("DSv4 compress-state pool overlap score alloc failed: {e}"))?,
+        })
+    }
+
+    /// Elements-per-page stride for the kernel's `overlap_page_stride` param
+    /// (`ratio * head_dim`) — passed whenever this pool backs a call, `0`
+    /// otherwise (collapses the kernel's indexing to the old single-register
+    /// form; see `dsv4_compressor_update_body` in `dsv4_attention.cu`).
+    pub(crate) fn page_stride(head_dim: usize, ratio: usize) -> usize {
+        ratio * head_dim
+    }
+
+    /// Base device pointers `(overlap_kv, overlap_score)` — IDENTICAL for every
+    /// row/slot sharing this layer's pool (the kernel resolves the actual page
+    /// via `compressed_base`/`block`, not a per-row offset). Guards dropped
+    /// immediately; the raw pointers stay valid under the same single-stream,
+    /// no-realloc discipline `Dsv4CompressorState::batched_update_ptrs` uses.
+    pub(crate) fn base_ptrs_mut(&mut self, ctx: &DeviceContext) -> (u64, u64) {
+        let (kv, g0) = self.overlap_kv.device_ptr_mut(&ctx.stream);
+        let (score, g1) = self.overlap_score.device_ptr_mut(&ctx.stream);
+        drop(g0);
+        drop(g1);
+        (kv, score)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn device_bytes(&self) -> usize {
+        let bf16 = std::mem::size_of::<half::bf16>();
+        (self.overlap_kv.len() + self.overlap_score.len()) * bf16
+    }
+
+    /// STATIC predictor of `device_bytes` from `new`'s dims — MUST mirror `new`.
+    /// Feeds `Dsv4Model::kv_budget_plan`'s summed-per-layer term.
+    pub(crate) fn device_bytes_for(head_dim: usize, ratio: usize, max_seq_len: usize) -> usize {
+        let bf16 = std::mem::size_of::<half::bf16>();
+        let capacity_blocks = max_seq_len.div_ceil(ratio.max(1)).max(1);
+        2 * capacity_blocks * ratio * head_dim * bf16
     }
 }
 
@@ -248,9 +340,31 @@ pub(crate) struct Dsv4LayerKvLayout {
     pub(super) flashmla_page_bytes: usize,
     pub(super) dsa_slot_bytes: usize,
     pub(super) num_slots: usize,
+    /// Page-addressable, cross-request-shared `prev_overlap_kv`/`_score` pool
+    /// for this layer's MAIN compressor. `Some` only for `compress_ratio == 4`
+    /// layers with a compressor (`mode.has_compressor()`); `None` for every
+    /// other ratio or a SlidingWindow layer with no compressor at all.
+    pub(super) compress_state_pool: Option<Dsv4CompressStatePool>,
+    /// Same pool species, for the CSA indexer's OWN key compressor
+    /// sub-state (`index_head_dim` width, not `head_dim`). `Some` only for
+    /// `compress_ratio == 4` layers with an indexer (`mode.has_indexer()`).
+    pub(super) indexer_compress_state_pool: Option<Dsv4CompressStatePool>,
 }
 
 impl Dsv4LayerKvLayout {
+    /// `&mut` accessor for this layer's MAIN compressor compress-state pool
+    /// (mirrors `dsa_shared`/`flashmla_batch`-style shared-scratch accessors). `None`
+    /// for every layer except compress_ratio==4 with a compressor.
+    pub(crate) fn compress_state_pool_mut(&mut self) -> Option<&mut Dsv4CompressStatePool> {
+        self.compress_state_pool.as_mut()
+    }
+
+    /// `&mut` accessor for this layer's CSA INDEXER compress-state pool.
+    /// `None` for every layer except compress_ratio==4 with an indexer.
+    pub(crate) fn indexer_compress_state_pool_mut(&mut self) -> Option<&mut Dsv4CompressStatePool> {
+        self.indexer_compress_state_pool.as_mut()
+    }
+
     pub(crate) fn flashmla_total_pages(&self) -> usize {
         self.flashmla_kv_pool
             .as_ref()
@@ -1085,6 +1199,30 @@ impl Dsv4LayerKvLayout {
         } else {
             None
         };
+        // compress_ratio==4 only. Main pool needs a compressor
+        // (`mode.has_compressor()`); indexer pool needs an indexer
+        // (`mode.has_indexer()`) — a CSA layer at ratio==4 has both, a
+        // SlidingWindow layer at ratio==0 has neither.
+        let compress_state_pool = if compress_ratio == 4 && mode.has_compressor() {
+            Some(Dsv4CompressStatePool::new(
+                ctx,
+                config.head_dim,
+                compress_ratio,
+                max_seq_len,
+            )?)
+        } else {
+            None
+        };
+        let indexer_compress_state_pool = if compress_ratio == 4 && mode.has_indexer() {
+            Some(Dsv4CompressStatePool::new(
+                ctx,
+                config.index_head_dim,
+                compress_ratio,
+                max_seq_len,
+            )?)
+        } else {
+            None
+        };
         Ok(Self {
             flashmla_kv_pool,
             dsa_key_cache,
@@ -1092,19 +1230,30 @@ impl Dsv4LayerKvLayout {
             flashmla_page_bytes,
             dsa_slot_bytes,
             num_slots,
+            compress_state_pool,
+            indexer_compress_state_pool,
         })
     }
 
     /// Exact requested device bytes owned by this ONE layer's KV layout (sized
     /// for ALL slots): the shared FlashMLA FP8 latent `TokenKVPool` (the
-    /// dominant DSv4 KV byte sink) + the shared DSA key-cache band. The
-    /// `flashmla_page_table` / scalar shape fields are host-only.
+    /// dominant DSv4 KV byte sink) + the shared DSA key-cache band + the
+    /// compressor/indexer compress-state pools. The `flashmla_page_table` /
+    /// scalar shape fields are host-only.
     #[allow(dead_code)]
     pub(crate) fn device_bytes(&self) -> usize {
         self.flashmla_kv_pool
             .as_ref()
             .map_or(0, |p| p.device_bytes())
             + self.dsa_key_cache.as_ref().map_or(0, |s| s.len())
+            + self
+                .compress_state_pool
+                .as_ref()
+                .map_or(0, |p| p.device_bytes())
+            + self
+                .indexer_compress_state_pool
+                .as_ref()
+                .map_or(0, |p| p.device_bytes())
     }
 
     pub(super) fn slot_range(

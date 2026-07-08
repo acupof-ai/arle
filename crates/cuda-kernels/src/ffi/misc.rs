@@ -336,6 +336,10 @@ unsafe extern "C" {
         width: i32,
         overlap: i32,
         has_prev_overlap: i32,
+        // Elements-per-page stride for `prev_overlap_kv/score` pool
+        // addressing. `0` = per-slot single-register buffer; `ratio*head_dim`
+        // = shared, page-addressable pool.
+        overlap_page_stride: i32,
         eps: f32,
         rope_dim: i32,
         rope_base: f32,
@@ -362,6 +366,7 @@ unsafe extern "C" {
         ratio: i32,
         width: i32,
         overlap: i32,
+        overlap_page_stride: i32,
         eps: f32,
         rope_dim: i32,
         rope_base: f32,
@@ -396,6 +401,9 @@ unsafe extern "C" {
         ratio: i32,
         width: i32,
         overlap: i32,
+        // Uniform across all n rows (one launch is always one (layer,
+        // compress_ratio) class).
+        overlap_page_stride: i32,
         eps: f32,
         rope_dim: i32,
         rope_base: f32,
