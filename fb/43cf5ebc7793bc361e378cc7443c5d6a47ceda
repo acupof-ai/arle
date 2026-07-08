@@ -1,0 +1,23 @@
+docs/experience/errors/2026-07-08-dsv4-slot-abort-band-leak-crash.md
+  s_8ed17943fcd258::t_1767111889d207 1-63
+docs/experience/wins/2026-07-08-dsv4-flashmla-budget-needle-gate-pass.md
+  s_8ed17943fcd258::t_cb6a319d05d354 1-94
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "fb43cf5ebc7793bc361e378cc7443c5d6a47ceda",
+  "prompts": {},
+  "sessions": {
+    "s_8ed17943fcd258": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2b082648-4bd8-4483-9790-ecdcc74a7070",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
