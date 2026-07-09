@@ -1,0 +1,31 @@
+.gitignore
+  s_4570086626aeb6::t_b80924d9cfad1a 50
+scripts/fetch_opd_corpora.py
+  s_d086c1e5d92103::t_c086c182e30c37 1-144
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "4f874b505000344c8ee1b702f7593e523494f3fb",
+  "prompts": {},
+  "sessions": {
+    "s_4570086626aeb6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a90bd27a83f68583d",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_d086c1e5d92103": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-adfced33a3dd6c93f",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
