@@ -1,0 +1,25 @@
+crates/infer-core/src/prefix.rs
+  s_4b7198573dd014::t_33c0ab5df2af24 27-39,96-107
+crates/infer-seam/src/host_paged_kv_pool.rs
+  s_4b7198573dd014::t_63de21954c8f24 155-158
+crates/infer-seam/src/kv_query.rs
+  s_4b7198573dd014::t_3f1903e745030c 46-51
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "9ee4357007d35da3e31b99668f1c062e4edec3a1",
+  "prompts": {},
+  "sessions": {
+    "s_4b7198573dd014": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "92cc6785-573b-445c-9517-2aca75a48773",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
