@@ -6,7 +6,7 @@ gradient). Sample orthogonal difficulty axes so a sweet-spot band always exists.
 
 Axes (sampled + combined per task):
   DOMAIN      {file-ops, text-processing, data-transform, config-parsing,
-               crypto-encoding, log-analysis, service}
+               encoding, log-analysis, service}
   COMPLEXITY  {1: bash+coreutils, 2: bash+python(stdlib), 3: a background service}
   VERIFIER    {exact-file-content, metric-threshold, multi-file-state,
                output-format-json}
@@ -52,6 +52,9 @@ import sys
 import tempfile
 from collections import Counter
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from opd_security_filter import is_security_flagged  # noqa: E402
 
 # --------------------------------------------------------------------------
 # Shared fixture vocabulary (ascii-only so GNU `sort` == python `sorted`).
@@ -222,18 +225,18 @@ def b_sha256(rng):
     msg = " ".join(rng.choice(WORDS) for _ in range(rng.randint(6, 14)))
     digest = hashlib.sha256(msg.encode()).hexdigest()
     return dict(
-        domain="crypto-encoding", complexity=1, verifier="exact-file-content",
+        domain="encoding", complexity=1, verifier="exact-file-content",
         n_steps="short",
         instruction=(
-            "Compute the SHA-256 checksum of the file payload.dat and write ONLY "
-            "the 64-character lowercase hex digest to payload.sha256."
+            "Compute the SHA-256 checksum of the file report.dat and write ONLY "
+            "the 64-character lowercase hex digest to report.sha256."
         ),
-        fixtures={"payload.dat": msg},
-        solution=SHA256_CMD.format(f="payload.dat", out="payload.sha256"),
+        fixtures={"report.dat": msg},
+        solution=SHA256_CMD.format(f="report.dat", out="report.sha256"),
         test_body=(
             "def test_sha256():\n"
-            "    p = APP / 'payload.sha256'\n"
-            "    assert p.exists(), 'payload.sha256 missing'\n"
+            "    p = APP / 'report.sha256'\n"
+            "    assert p.exists(), 'report.sha256 missing'\n"
             f"    assert p.read_text().strip() == {digest!r}\n"
         ),
     )
@@ -243,19 +246,19 @@ def b_base64(rng):
     msg = " ".join(rng.choice(WORDS) for _ in range(rng.randint(6, 14)))
     enc = base64.b64encode(msg.encode()).decode()
     return dict(
-        domain="crypto-encoding", complexity=1, verifier="exact-file-content",
+        domain="encoding", complexity=1, verifier="exact-file-content",
         n_steps="short",
         instruction=(
-            "secret.b64 contains Base64-encoded text.\n"
-            "Decode it and write the original text to secret.txt (exact bytes; "
+            "encoded.b64 contains Base64-encoded text.\n"
+            "Decode it and write the original text to decoded.txt (exact bytes; "
             "do not add a trailing newline)."
         ),
-        fixtures={"secret.b64": enc + "\n"},
-        solution=BASE64_DECODE.format(f="secret.b64", out="secret.txt"),
+        fixtures={"encoded.b64": enc + "\n"},
+        solution=BASE64_DECODE.format(f="encoded.b64", out="decoded.txt"),
         test_body=(
             "def test_decoded():\n"
-            "    p = APP / 'secret.txt'\n"
-            "    assert p.exists(), 'secret.txt missing'\n"
+            "    p = APP / 'decoded.txt'\n"
+            "    assert p.exists(), 'decoded.txt missing'\n"
             f"    assert p.read_text() == {msg!r}\n"
         ),
     )
@@ -1087,6 +1090,18 @@ def main() -> int:
         task_id = f"gen-{builder.__name__[2:]}-{i:03d}"
         task_dir = args.out / task_id
         write_task(task_dir, spec, difficulty)
+
+        # Final security gate: nothing an agent sees (instruction, fixtures,
+        # tests, oracle) may carry security offense/defense wording.
+        gate_text = "\n".join(
+            [spec["instruction"], spec["solution"], spec["test_body"],
+             *spec["fixtures"].values()]
+        )
+        rule = is_security_flagged(gate_text)
+        if rule is not None:
+            rejected.append((task_id, f"security-filter: {rule}"))
+            shutil.rmtree(task_dir)
+            continue
 
         if args.self_check:
             reason = self_check(task_dir)
