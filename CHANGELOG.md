@@ -25,6 +25,14 @@ lifecycle & progress spine).
 
 ### Verdicts
 
+- **2026-07-10 — DSpark sampled (temp>0) spec decode LICENSED**: device-side
+  filter/chain-rejection kernels (`e22a41637`/`9f2dd5b3b`) take sampled spec
+  from 34.8 (−7.5% vs plain) to **64–106 tok/s = 1.8–3.0× plain sampling**;
+  determinism (cache-off same-seed byte-identical), needle 3/3, greedy lane
+  regression-free. OPD 3-turn rollout shape: 62–77 tok/s sampled vs ~36 plain.
+  Next walls: 16 per-step draft syncs (~36 ms sampled draft), greedy
+  prefix-hit accept drop (3.11→1.92).
+  [wins](docs/experience/wins/2026-07-10-dspark-sampled-device-path.md)
 - **2026-07-10 — DSpark partial-ctx drafting (P2.5) LICENSED; sampling RNG
   cleared**: prefix-hit requests re-seed speculation (`8edde59c7`); multi-turn
   accept −11/−22% within band, 101–112 tok/s vs 42–44 plain; whole-restore
