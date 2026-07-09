@@ -266,8 +266,13 @@ static cudaError_t gemm_cublas_fallback(const __nv_bfloat16 *W, const __nv_bfloa
 }
 
 static bool gemm_small_n_uses_gemv(int N, int K) {
+  // The per-column GEMV loop re-streams the whole weight N times; one
+  // cuBLASLt pass reads it once. At N=16 the loop measured 21.6 ms on the
+  // Qwen3.6-27B lm_head (16 x 1.5 GB) vs ~1 ms for a single tensor-core pass
+  // (H20, DSpark block-16 spec decode) — keep the loop only where launch
+  // overhead can plausibly beat a weight pass.
   static constexpr size_t kMaxGemvSharedBytes = 48 * 1024;
-  return N > 0 && N <= 16 &&
+  return N > 0 && N <= 4 &&
          static_cast<size_t>(K) * sizeof(__nv_bfloat16) <= kMaxGemvSharedBytes;
 }
 
