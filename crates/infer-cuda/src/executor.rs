@@ -203,6 +203,7 @@ impl RealCudaExecutor {
         kv_dtype: CudaKvCacheDtype,
         mem_fraction_static: f64,
         dspark_draft_model: Option<&Path>,
+        dspark_conf_threshold: f32,
     ) -> Result<Self> {
         Ok(Self::Qwen35(Box::new(
             Qwen35CudaExecutor::from_qwen35_safetensors(
@@ -212,6 +213,7 @@ impl RealCudaExecutor {
                 kv_dtype,
                 mem_fraction_static,
                 dspark_draft_model,
+                dspark_conf_threshold,
             )?,
         )))
     }
@@ -3595,6 +3597,7 @@ impl Qwen35CudaExecutor {
         kv_dtype: CudaKvCacheDtype,
         mem_fraction_static: f64,
         dspark_draft_model: Option<&Path>,
+        dspark_conf_threshold: f32,
     ) -> Result<Self> {
         let total_t0 = Instant::now();
         ensure!(
@@ -3638,6 +3641,7 @@ impl Qwen35CudaExecutor {
                     model.config.hidden_size,
                     model.config.num_hidden_layers,
                     model.config.vocab_size,
+                    dspark_conf_threshold,
                 )?;
                 model.set_spec_draft_tokens(head.block_size());
                 log::info!(
