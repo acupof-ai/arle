@@ -1,0 +1,23 @@
+scripts/clean_opd_corpora.py
+  s_d086c1e5d92103::t_aaa02f092bcffd 31-32,103-116,118,123-126,128,130,135-137
+scripts/fetch_opd_corpora.py
+  s_d086c1e5d92103::t_0e287d32fb11d8 30-31,34-35,41-44,57-59,61-62,98-105,113-118,120-148,151-175,177-178
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "35a3d21d46ee30be77a41f5b25f053827613cc15",
+  "prompts": {},
+  "sessions": {
+    "s_d086c1e5d92103": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-adfced33a3dd6c93f",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
