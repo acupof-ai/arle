@@ -351,10 +351,6 @@ pub(crate) struct Args {
     #[arg(long, default_value_t = false)]
     pub(crate) no_cuda_graph: bool,
 
-    /// Maximum CUDA decode batch size to pre-capture for graph replay.
-    #[arg(long)]
-    pub(crate) cuda_graph_max_bs: Option<usize>,
-
     /// Disable built-in shell/python tools for the local agent runtime.
     /// Also honored per-run via `arle run --no-tools`.
     #[arg(long, default_value_t = false)]
@@ -2043,20 +2039,6 @@ pub(crate) struct TrainAgentOpdArgs {
     /// EMA decay for `--gkd-teacher ema` (θ_ema ← α·θ_ema + (1−α)·θ_student).
     #[arg(long, default_value_t = 0.999)]
     pub(crate) gkd_ema_alpha: f32,
-
-    /// Streaming replay-buffer capacity (WS1). Oldest trajectory evicts at cap.
-    /// Not yet wired into the rollout loop.
-    #[arg(long, default_value_t = 256)]
-    pub(crate) buffer_cap: usize,
-
-    /// Max LoRA-epoch staleness a buffered trajectory may reach before the
-    /// learner drops it (WS1 depth-bound). Not yet wired.
-    #[arg(long, default_value_t = 1)]
-    pub(crate) max_staleness: u64,
-
-    /// Hot-swap the rollout LoRA every K learner updates (WS1). Not yet wired.
-    #[arg(long, default_value_t = 1)]
-    pub(crate) sync_every_k: usize,
 }
 
 #[cfg(test)]
