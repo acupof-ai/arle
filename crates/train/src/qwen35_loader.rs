@@ -448,10 +448,10 @@ impl Qwen35HfConfig {
 fn merge_token_ids(mut text: serde_json::Value, parent: &serde_json::Value) -> serde_json::Value {
     if let Some(obj) = text.as_object_mut() {
         for key in ["eos_token_id", "bos_token_id"] {
-            if obj.get(key).is_none() {
-                if let Some(v) = parent.get(key) {
-                    obj.insert(key.to_string(), v.clone());
-                }
+            if obj.get(key).is_none()
+                && let Some(v) = parent.get(key)
+            {
+                obj.insert(key.to_string(), v.clone());
             }
         }
     }

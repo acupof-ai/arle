@@ -197,10 +197,11 @@ fn run_impl(args: Args, run_args: Option<RunArgs>) -> Result<()> {
         let interactive_tty = !args.non_interactive
             && std::io::stdin().is_terminal()
             && std::io::stderr().is_terminal();
-        if !one_shot && interactive_tty {
-            if let Some(action) = decide_eli_launch(&args) {
-                return run_eli_frontend(&args, action);
-            }
+        if !one_shot
+            && interactive_tty
+            && let Some(action) = decide_eli_launch(&args)
+        {
+            return run_eli_frontend(&args, action);
         }
 
         // Interactive startup: hardware detection + model picker + download.
@@ -241,16 +242,16 @@ fn run_impl(args: Args, run_args: Option<RunArgs>) -> Result<()> {
                 // "tokenizer.json not found", which is opaque. The picker
                 // filters them out as of 0.1.5, but `--model-path` can still
                 // hit one directly.
-                if let Some(arch) = peek_model_architecture(&model_source) {
-                    if arch == "DFlashDraftModel" {
-                        return Err(anyhow::anyhow!(
-                            "`{model_source}` is a DFlash *draft* model (architecture `DFlashDraftModel`), \
-                             not a standalone target. Drafts ship without a tokenizer and only assist \
-                             speculative decoding for a paired target.\n\
-                             Hint: load the matching target instead — e.g. `mlx-community/Qwen3.6-35B-A3B-4bit` \
-                             for the `z-lab/Qwen3.6-35B-A3B-DFlash` draft."
-                        ));
-                    }
+                if let Some(arch) = peek_model_architecture(&model_source)
+                    && arch == "DFlashDraftModel"
+                {
+                    return Err(anyhow::anyhow!(
+                        "`{model_source}` is a DFlash *draft* model (architecture `DFlashDraftModel`), \
+                         not a standalone target. Drafts ship without a tokenizer and only assist \
+                         speculative decoding for a paired target.\n\
+                         Hint: load the matching target instead — e.g. `mlx-community/Qwen3.6-35B-A3B-4bit` \
+                         for the `z-lab/Qwen3.6-35B-A3B-DFlash` draft."
+                    ));
                 }
                 return Err(anyhow::anyhow!(
                     "failed to load model from `{model_source}`: {err:#}\n\

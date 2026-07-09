@@ -1205,8 +1205,8 @@ pub(crate) fn linear_attention_backward(
     // that re-seeds the carry below. The default path (no carry) keeps the device
     // backward unchanged.
     let has_carry = initial_state.is_some() || initial_conv_window.is_some();
-    if !has_carry {
-        if let Some(grads) = try_linear_attention_backward_device(
+    if !has_carry
+        && let Some(grads) = try_linear_attention_backward_device(
             output_grad_id,
             qkv,
             z,
@@ -1229,9 +1229,9 @@ pub(crate) fn linear_attention_backward(
             raw_output,
             params,
             store,
-        )? {
-            return Ok(grads);
-        }
+        )?
+    {
+        return Ok(grads);
     }
 
     let mut profile =

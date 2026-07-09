@@ -322,14 +322,14 @@ pub fn build_deepseek_ocr_prompt(messages: &[ChatMessage]) -> String {
                 }
                 let mut wrote_text = false;
                 for part in parts {
-                    if part.normalized_kind() == "text" {
-                        if let Some(text) = &part.text {
-                            if image_count > 0 && !wrote_text {
-                                prompt.push('\n');
-                            }
-                            prompt.push_str(text);
-                            wrote_text = true;
+                    if part.normalized_kind() == "text"
+                        && let Some(text) = &part.text
+                    {
+                        if image_count > 0 && !wrote_text {
+                            prompt.push('\n');
                         }
+                        prompt.push_str(text);
+                        wrote_text = true;
                     }
                 }
             }

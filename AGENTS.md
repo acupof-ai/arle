@@ -414,28 +414,32 @@ mechanical changes.
 
 ### Code conventions
 
-- **Flat module layout, no `mod.rs`.** `src/ops.rs` declares `#[path =
-  "ops/attention.rs"] mod attention;` siblings; models follow `model/qwen3.rs` +
-  `model/qwen3/`.
-- Weights `&self` (immutable, pool-shared); per-request mutable state in `State`
-  associated types.
-- **Default to no comment.** Comment only a non-obvious invariant, ordering
-  requirement, or bug workaround — never what the code does (a clearer name
-  beats a comment) and never which task/ticket/step added it (that rots;
-  belongs in the commit message). An issue number is fine only when it names
-  a concrete bug the code guards against (`// #146: above 2048 the per-path
-  maps diverged`). ≤1 line when warranted.
-- **Code as poetry — every expression earns its place.** Use the stdlib's
-  vocabulary when it names the operation exactly: `.unzip()` over a 4-line match,
-  `ensure!` over `if { return Err }`, `.is_some_and()` over `.map().unwrap_or()`,
-  iterator chains over for-push when the shape is a direct formula. The test:
-  *can a reader parse the intent in one pass without re-reading?* Named
-  temporaries that just alias the previous line add noise; the range
-  `i * tp_size..(i+1) * tp_size` is already named.
-- **Module ordering is part of the design.** Items should appear in dependency
-  order — helpers before callers, types before impls that use them, public API
-  before internals. Arbitrary ordering forces readers to scroll; ordered code
-  reads like a proof.
+**Formatting:** `rustfmt` 默认 + `version = "Two"`（见 `rustfmt.toml`）。CI 强制 `cargo fmt --check`。
+
+**Linting:** `cargo clippy --all-targets --all-features -- -D warnings` 是 verify 退出条件。Workspace lints 在根 `Cargo.toml` `[workspace.lints]`。
+
+**13 条代码风格规则（Rust 最佳实践，不是主流）：**
+
+1. **Early return（卫语句）** — 用 `let-else` / `if !cond { return }` / `?` 压平嵌套，不用 `if/else` 包裹主逻辑。Clippy `collapsible_if` 强制。
+2. **Newtype 零成本类型安全** — 语义不同的相同底层类型（slot index vs layer index vs seq len）必须用 `struct X(usize)` 包装，实现 `AsRef`/`Borrow`，不实现 `Deref`。能 `Copy` 就 `Copy`。构造时验证不变量。
+3. **入参借，出参拥有** — 函数参数用 `&T` / `&[T]` / `&str` / `impl AsRef<Path>`，返回值用拥有的 `T` / `Vec<T>` / `String`。Clippy `needless_pass_by_value` / `redundant_clone` 强制。
+4. **零拷贝优先** — 解析路径直接借用输入缓冲区（`#[serde(borrow)]`），安全类型转换用 `zerocopy`/`bytemuck`，不手写 unsafe transmute。
+5. **命名约定（RFC 430）** — 类型 `CamelCase`（缩写当一个词：`HttpServer` 不是 `HTTPServer`），函数/变量 `snake_case`，常量 `SCREAMING_SNAKE_CASE`，错误类型 `*Error` 后缀，trait 名词或 `-able`。
+6. **转换方法三件套** — `as_*(&self)` 零成本借用；`to_*(&self)` 可能分配；`into_*(self)` 消费转移。不混用。
+7. **构造器约定** — `new()` 无副作用必成功；`try_new()` 可能失败；参数 >4 个用 Builder 模式（`X::builder().a(1).b(2).build()?`）；可选配置 `with_*` 链式。
+8. **Trait 小而专注** — 一个 trait 一件事。不用"上帝 trait"。1:1 关系用 associated type；1:N 用泛型。`impl Trait` 静态分发优先；`dyn Trait` 只在需要运行时多态时用。
+9. **迭代器优先于命令式循环** — `map`/`filter`/`collect` 胜过 `for` + `push`。直接公式形状的用迭代器链；有副作用或复杂控制流的用 `for`。
+10. **`Option`/`Result` 组合子** — `map`/`and_then`/`or_else`/`ok_or`/`?` 胜过嵌套 `match`。
+11. **不可变优先** — 默认 `let`，只有真正需要修改时才 `let mut`。Clippy `unnecessary_mut_passed` 强制。
+12. **`#[must_use]` 标不该忽略的返回值** — 释放/分配/计算结果如果被忽略会出 bug，加 `#[must_use]` 并说明原因。
+13. **模块按依赖顺序排列** — 类型在前，辅助函数居中，公开 API 在后，内部实现最后。有序代码读起来像证明。
+
+**附加项目特定规则：**
+
+- **Flat module layout, no `mod.rs`.** `src/ops.rs` 声明 `#[path = "ops/attention.rs"] mod attention;` 同级；模型遵循 `model/qwen3.rs` + `model/qwen3/`。
+- Weights `&self`（不可变，池共享）；per-request 可变状态在 `State` 关联类型。
+- **默认无注释。** 只注释非显然的不变量、排序要求、bug workaround — 不注释代码做了什么（更清晰的名字胜过注释），不注释哪个任务/工单/步骤加的（那属于 commit message）。issue 号仅在命名具体 bug 时使用（`// #146: above 2048 the per-path maps diverged`）。需要时 ≤1 行。
+- **代码如诗 — 每个表达式都有其位置。** stdlib 能精确命名操作的就用：`.unzip()` 胜过 4 行 match，`ensure!` 胜过 `if { return Err }`，`.is_some_and()` 胜过 `.map().unwrap_or()`。检验标准：*读者能一遍读懂意图吗？* 别名上一行的临时变量 = 噪声；范围 `i * tp_size..(i+1) * tp_size` 已经被命名了。
 
 ### GPU kernel work
 
