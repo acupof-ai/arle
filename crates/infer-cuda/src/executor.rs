@@ -3612,7 +3612,8 @@ impl Qwen35CudaExecutor {
         )?;
 
         // A sidecar-restored prefix has no draft ctx features for the matched
-        // span — clear any stale DSpark state so the request runs plain decode.
+        // span — clear stale DSpark state; the tail prefill rebases the draft
+        // ctx at start_pos (suffix-only drafting).
         if let Some(df) = self.dspark.as_mut().and_then(|ds| ds.slots[slot].as_mut()) {
             df.reset();
         }
@@ -3756,8 +3757,8 @@ impl Qwen35CudaExecutor {
             "Qwen3.6 promote slot {slot} outside executor slots {}",
             self.num_slots
         );
-        // The slot image carries no draft ctx cache — the promoted request
-        // decodes non-speculatively (seeded check fails on ctx_len).
+        // The slot image carries no draft ctx cache — clear stale state; the
+        // first warm decode rebases the draft ctx at the promoted position.
         if let Some(df) = self.dspark.as_mut().and_then(|ds| ds.slots[slot].as_mut()) {
             df.reset();
         }
@@ -4436,20 +4437,23 @@ impl Qwen35CudaExecutor {
             )?);
         }
         let df = ds.slots[slot].as_mut().expect("built above");
-        if df.ctx_len == row.start_pos {
-            model.dspark_append_ctx(
-                &ds.head,
-                df,
-                &mut ds.taps,
-                &mut ds.scratch,
-                row.tokens.len(),
-                row.start_pos,
-            )?;
+        if df.ctx_end != row.start_pos {
+            // Gap (prefix-cache / sidecar-restored prefix): rebase the draft
+            // ctx at the suffix instead of degrading to plain decode — exact
+            // for sliding draft layers once the tail ≥ window, approximate
+            // only for the full-attention layer.
+            df.rebase(row.start_pos);
         }
+        model.dspark_append_ctx(
+            &ds.head,
+            df,
+            &mut ds.taps,
+            &mut ds.scratch,
+            row.tokens.len(),
+            row.start_pos,
+        )?;
         let is_final = row.start_pos + row.tokens.len() == row.total_tokens;
-        // Speculation resumes only when the whole prompt made it into the ctx
-        // cache; a gap (e.g. sidecar-restored prefix) degrades to plain decode.
-        df.pending = (is_final && df.ctx_len == row.total_tokens).then_some(token);
+        df.pending = (is_final && df.ctx_end == row.total_tokens).then_some(token);
         Ok(token)
     }
 
@@ -4536,7 +4540,7 @@ impl Qwen35CudaExecutor {
             && start + ds.head.block_size() < self.model.max_seq_len()
             && matches!(
                 ds.slots[row.slot].as_ref(),
-                Some(s) if s.pending == Some(row.last_token) && s.ctx_len == start
+                Some(s) if s.pending == Some(row.last_token) && s.ctx_end == start
             );
         if !seeded {
             let token = self.dspark_warm_decode_row(row, position)?;
@@ -4592,8 +4596,14 @@ impl Qwen35CudaExecutor {
             layer0_query: Vec::new(),
         };
         let ds = dspark.as_mut().expect("dspark warm without dspark");
-        let contiguous = matches!(ds.slots[slot].as_ref(), Some(s) if s.ctx_len == row.kv_seq_len);
-        let taps = if contiguous {
+        // Gap (whole-slot promote / restored prefix): rebase at the current
+        // position and start rebuilding the suffix-only ctx from this step.
+        if let Some(df) = ds.slots[slot].as_mut()
+            && df.ctx_end != row.kv_seq_len
+        {
+            df.rebase(row.kv_seq_len);
+        }
+        let taps = if ds.slots[slot].is_some() {
             ds.taps
                 .prepare(ds.head.target_layer_ids(), model.config.hidden_size, 1);
             Some(&mut ds.taps)
@@ -4611,19 +4621,15 @@ impl Qwen35CudaExecutor {
             taps,
         )?;
         if let Some(df) = ds.slots[slot].as_mut() {
-            if contiguous {
-                model.dspark_append_ctx(
-                    &ds.head,
-                    df,
-                    &mut ds.taps,
-                    &mut ds.scratch,
-                    1,
-                    row.kv_seq_len,
-                )?;
-                df.pending = Some(token);
-            } else {
-                df.pending = None;
-            }
+            model.dspark_append_ctx(
+                &ds.head,
+                df,
+                &mut ds.taps,
+                &mut ds.scratch,
+                1,
+                row.kv_seq_len,
+            )?;
+            df.pending = Some(token);
         }
         Ok(token)
     }
@@ -4745,8 +4751,9 @@ impl Qwen35CudaExecutor {
         let append_ms = crate::qwen35::mtp_phase_lap(&model.ctx, &mut pt);
         if pt.is_some() {
             eprintln!(
-                "[dspark-phase] chain={} accept={k} draft={draft_ms:.2} snap={snap_ms:.2} verify={verify_ms:.2} accept_commit={accept_ms:.2} append={append_ms:.2} ms",
-                chain.len()
+                "[dspark-phase] chain={} accept={k} base={} draft={draft_ms:.2} snap={snap_ms:.2} verify={verify_ms:.2} accept_commit={accept_ms:.2} append={append_ms:.2} ms",
+                chain.len(),
+                df.ctx_base
             );
         }
         df.pending = Some(bonus);
