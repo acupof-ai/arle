@@ -204,6 +204,15 @@ pub trait BackendExecutor {
     /// mirrors here; the default is a no-op for executors with no such mirrors.
     fn release_prefix_pages(&mut self, _pages: &[u32]) {}
 
+    /// Notify the backend that a slot's pages are returning to the free pool
+    /// (slot free/abort/preempt). Backends drop any NON-confirmed (write-only,
+    /// never radix-published) prefix state keyed to these page ids — a freed
+    /// id recycles, and a stale provisional entry under a recycled id could
+    /// later be confirmed as if it were the new occupant's content. Confirmed
+    /// entries ride the radix lifetime ([`Self::release_prefix_pages`]) and
+    /// are untouched. Default no-op.
+    fn release_provisional_prefix_pages(&mut self, _pages: &[u32]) {}
+
     /// Number of KV pages the backend's host-demoted store can
     /// hold. `0` (the default) means the backend has no tier store and the
     /// engine never calls the demote/promote hooks — the baseline eviction
@@ -359,14 +368,19 @@ pub trait BackendExecutor {
     /// device state is still resident. `prefix_pages` are the resident host-pool
     /// pages the published prefix covers — the backend keys eviction
     /// coordination ([`Self::release_prefix_pages`]) off them so the sidecar's
-    /// lifetime rides the radix blocks. Default no-op for full-attention-only
-    /// backends; only Qwen3.5/3.6 hybrid overrides this.
+    /// lifetime rides the radix blocks. `newly_cached` is the subset the radix
+    /// insert actually adopted (and retained) this call — pages the radix
+    /// deduped away will be freed and their ids recycled, so a backend must
+    /// never key durable state to anything outside `newly_cached`. Default
+    /// no-op for full-attention-only backends; Qwen3.5/3.6 hybrid and DSv4
+    /// override this.
     fn save_prefix_sidecar(
         &mut self,
         _slot: usize,
         _tokens: &[u32],
         _matched_len: usize,
         _prefix_pages: &[u32],
+        _newly_cached: &[u32],
     ) -> anyhow::Result<()> {
         Ok(())
     }

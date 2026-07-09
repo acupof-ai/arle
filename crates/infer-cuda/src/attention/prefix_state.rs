@@ -8,7 +8,7 @@
 //! Zero HBM footprint: the pool IS the L2 tier (`CudaKvTierStore` host level);
 //! L3 is the same store's mmap spill.
 //!
-//! Entry sections split by observability: content sections (band/staging/dsa
+//! Entry sections split by observability: content sections (staging/dsa
 //! rows) are positional storage, capturable post-forward for every completed
 //! page; boundary sections (overlap registers + ring) are transient — the
 //! registers are overwritten every `ratio` tokens and the ring wraps every
@@ -35,18 +35,23 @@ use crate::kv_tier::{CudaKvTierStore, NS_PREFIX_STATE, tier_key};
 /// `kPageBytes = 132 << 6` = 64 rows × (128 B data + 4 B f32 scale)).
 const DSA_PAGE_ROWS: usize = 64;
 
-/// One layer's share of a per-page entry. Content sections (`band_*`,
-/// `staging`, `dsa_*`) are captured for EVERY completed page; boundary
-/// sections (`overlap_*`, `idx_overlap_*`, `ring`) only when the forward
-/// ended exactly at the page end (the registers/ring for an overshot
-/// boundary are already advanced past it and unrecoverable). Empty vec =
-/// section absent for this layer/page.
+/// One layer's share of a per-page entry. Content sections (`staging`,
+/// `dsa_*`) are captured for EVERY completed page; boundary sections
+/// (`overlap_*`, `idx_overlap_*`, `ring`) only when the forward ended
+/// exactly at the page end (the registers/ring for an overshot boundary are
+/// already advanced past it and unrecoverable). Empty vec = section absent
+/// for this layer/page.
+///
+/// The FP8 compressed band is NOT captured: it is derived state (staging
+/// quantized), only written on the DECODE lane (`flashmla_pack_compressed_delta`),
+/// so at prefill-time capture it is still the `zero_slot_band` zeros —
+/// restoring it corrupted every warm decode (E2, pod-proven 2026-07-09:
+/// publish fingerprints showed `band=0/196224` for every prefill-published
+/// page). Restore instead leaves `fp8_kv_comp_packed_rows=0` and the first
+/// post-restore decode's bulk pack rebuilds the band from the restored
+/// staging.
 #[derive(Default, PartialEq)]
 pub(crate) struct Dsv4LayerPageState {
-    /// FP8 band compressed-row payload (`comp_row` region, data bytes).
-    pub(super) band_data: Vec<u8>,
-    /// FP8 band compressed-row e8m0 scales.
-    pub(super) band_scale: Vec<u8>,
     /// Main compressor bf16 staging rows (A2: read as full history by the
     /// hybrid CSA/HCA attention). Indexer staging is NOT captured — its only
     /// reader drains the delta `[packed_rows, seq_len)`, empty at a boundary.
@@ -133,8 +138,6 @@ impl Dsv4PrefixPageEntry {
         buf.push(u8::from(self.boundary));
         buf.extend_from_slice(&(self.layers.len() as u32).to_le_bytes());
         for layer in &self.layers {
-            push_bytes(&mut buf, &layer.band_data);
-            push_bytes(&mut buf, &layer.band_scale);
             push_bf16(&mut buf, &layer.staging);
             push_bytes(&mut buf, &layer.dsa_data);
             push_bytes(&mut buf, &layer.dsa_scale);
@@ -159,8 +162,6 @@ impl Dsv4PrefixPageEntry {
         let layers = (0..n_layers)
             .map(|_| {
                 Ok(Dsv4LayerPageState {
-                    band_data: read_bytes(&mut pos, bytes)?,
-                    band_scale: read_bytes(&mut pos, bytes)?,
                     staging: read_bf16(&mut pos, bytes)?,
                     dsa_data: read_bytes(&mut pos, bytes)?,
                     dsa_scale: read_bytes(&mut pos, bytes)?,
@@ -184,9 +185,7 @@ impl Dsv4PrefixPageEntry {
         self.layers
             .iter()
             .map(|l| {
-                l.band_data.len()
-                    + l.band_scale.len()
-                    + l.dsa_data.len()
+                l.dsa_data.len()
                     + l.dsa_scale.len()
                     + (l.staging.len()
                         + l.overlap_kv.len()
@@ -205,22 +204,17 @@ impl Dsv4PrefixPageEntry {
 /// fixed page slots (worst case = boundary entry with ring).
 pub(crate) fn dsv4_prefix_entry_max_bytes(
     config: &DeepSeekV4Config,
-    kv_arena: &Dsv4MlaKvArena,
     layer_specs: &[(DeepSeekV4AttentionMode, usize)],
     page_tokens: usize,
 ) -> usize {
     let bf16 = 2usize;
     let mut total = 13usize; // entry header
     for &(mode, ratio) in layer_specs {
-        total += 10 * 4; // section length prefixes
+        total += 8 * 4; // section length prefixes
         // ring — every layer has an SW window cache.
         total += config.sliding_window * config.head_dim * bf16;
         // ceil, not floor: for ratio > page_tokens a page can still complete
         // one row (page_row_span), and the predictor must never undersize.
-        if mode != DeepSeekV4AttentionMode::SlidingWindow && ratio > 0 {
-            let rpp = page_tokens.div_ceil(ratio);
-            total += rpp * kv_arena.bytes_per_token; // band data+scale
-        }
         if mode.has_compressor() && ratio > 0 {
             let rpp = page_tokens.div_ceil(ratio);
             total += rpp * config.head_dim * bf16; // staging
@@ -376,9 +370,19 @@ impl Dsv4PrefixStatePool {
         let bytes = self.store.read(key)?.into_owned();
         let entry = Dsv4PrefixPageEntry::from_bytes(&bytes)?;
         // Read-on-miss promote: a disk-resident entry that restores is hot —
-        // re-insert to the host level (its LRU spills something colder).
-        if promote {
-            self.store.insert(key, bytes);
+        // re-insert to the host level (its LRU spills something colder), then
+        // drop the now-superseded disk record (else the key is double-resident
+        // and the soft-cap math counts it twice). Only when the insert actually
+        // landed in HOST — a full host level routes the insert back to disk,
+        // and removing the record then would lose the entry.
+        if promote
+            && self.store.insert(key, bytes)
+            && matches!(
+                self.store.location(key),
+                Some(infer_seam::KvTierLocation::HostDemoted)
+            )
+        {
+            self.store.remove_disk_only(key);
         }
         Ok(entry)
     }
@@ -395,6 +399,20 @@ impl Dsv4PrefixStatePool {
             self.store.remove(&keys);
         }
     }
+
+    /// A slot freed these pages back to the pool: drop only the NON-confirmed
+    /// entries (write-only, never radix-published). A freed id recycles, and a
+    /// lingering provisional entry could later be confirmed as if it held the
+    /// new occupant's content. Confirmed entries are radix-retained (their
+    /// pages never free while the entry lives) and stay.
+    pub(crate) fn remove_provisional_pages(&mut self, pages: &[u32]) {
+        let provisional: Vec<u32> = pages
+            .iter()
+            .filter(|p| self.meta.get(p).is_some_and(|m| !m.confirmed))
+            .copied()
+            .collect();
+        self.remove_pages(&provisional);
+    }
 }
 
 impl Dsv4LayerAttentionState {
@@ -407,7 +425,6 @@ impl Dsv4LayerAttentionState {
         &self,
         ctx: &DeviceContext,
         pool: &Dsv4LayerKvLayout,
-        kv_arena: &Dsv4MlaKvArena,
         mode: DeepSeekV4AttentionMode,
         compress_ratio: usize,
         index_head_dim: usize,
@@ -416,33 +433,6 @@ impl Dsv4LayerAttentionState {
         boundary: bool,
     ) -> Result<Dsv4LayerPageState> {
         let mut out = Dsv4LayerPageState::default();
-        if let Some(flash) = &self.flashmla
-            && mode != DeepSeekV4AttentionMode::SlidingWindow
-            && flash.comp_blocks > 0
-            && let Some((data_range, scale_range)) = band_row_ranges(
-                flash,
-                pool,
-                kv_arena,
-                compress_ratio,
-                page_tokens,
-                page_index,
-            )?
-        {
-            let buf = pool.flashmla_pool_data()?;
-            ensure!(
-                data_range.end <= buf.len() && scale_range.end <= buf.len(),
-                "DSv4 prefix capture band range outside pool bytes {}",
-                buf.len()
-            );
-            out.band_data = ctx
-                .stream
-                .clone_dtoh(&buf.slice(data_range))
-                .map_err(|e| anyhow!("DSv4 prefix capture band data D2H failed: {e}"))?;
-            out.band_scale = ctx
-                .stream
-                .clone_dtoh(&buf.slice(scale_range))
-                .map_err(|e| anyhow!("DSv4 prefix capture band scale D2H failed: {e}"))?;
-        }
         if let Some(c) = &self.compressor {
             if let Some(range) = staging_row_range(c, compress_ratio, page_tokens, page_index)? {
                 out.staging = ctx
@@ -519,7 +509,6 @@ impl Dsv4LayerAttentionState {
         &mut self,
         ctx: &DeviceContext,
         pool: &mut Dsv4LayerKvLayout,
-        kv_arena: &Dsv4MlaKvArena,
         mode: DeepSeekV4AttentionMode,
         compress_ratio: usize,
         index_head_dim: usize,
@@ -528,44 +517,6 @@ impl Dsv4LayerAttentionState {
         state: &Dsv4LayerPageState,
         boundary: bool,
     ) -> Result<()> {
-        if let Some(flash) = &self.flashmla
-            && mode != DeepSeekV4AttentionMode::SlidingWindow
-            && flash.comp_blocks > 0
-            && let Some((data_range, scale_range)) = band_row_ranges(
-                flash,
-                pool,
-                kv_arena,
-                compress_ratio,
-                page_tokens,
-                page_index,
-            )?
-        {
-            ensure!(
-                state.band_data.len() == data_range.len()
-                    && state.band_scale.len() == scale_range.len(),
-                "DSv4 prefix restore band section {}+{} != live {}+{}",
-                state.band_data.len(),
-                state.band_scale.len(),
-                data_range.len(),
-                scale_range.len()
-            );
-            let buf = pool.flashmla_pool_data_mut()?;
-            ensure!(
-                data_range.end <= buf.len() && scale_range.end <= buf.len(),
-                "DSv4 prefix restore band range outside pool bytes {}",
-                buf.len()
-            );
-            {
-                let mut data = buf.slice_mut(data_range);
-                ctx.stream
-                    .memcpy_htod(&state.band_data, &mut data)
-                    .map_err(|e| anyhow!("DSv4 prefix restore band data H2D failed: {e}"))?;
-            }
-            let mut scale = buf.slice_mut(scale_range);
-            ctx.stream
-                .memcpy_htod(&state.band_scale, &mut scale)
-                .map_err(|e| anyhow!("DSv4 prefix restore band scale H2D failed: {e}"))?;
-        }
         if let Some(c) = &mut self.compressor {
             if let Some(range) = staging_row_range(c, compress_ratio, page_tokens, page_index)? {
                 ensure!(
@@ -672,9 +623,12 @@ impl Dsv4LayerAttentionState {
     /// Host counters for a restore at `matched_len` (a page-aligned boundary):
     /// staging/indexer row counts, DSA packed rows, and the FlashMLA FP8
     /// counters. `fp8_kv_sw_bootstrapped=false` forces the SW-ring repack from
-    /// the restored bf16 ring (A14); comp packed rows equal the restored band
-    /// rows. `pending_kv/score` need no restore: `matched_len % ratio == 0` ⇒
-    /// no partial block, so the next compress overwrites before any read.
+    /// the restored bf16 ring (A14); `fp8_kv_comp_packed_rows=0` forces the
+    /// first post-restore decode's bulk pack to rebuild the FP8 band from the
+    /// restored staging (the band itself is never captured — see
+    /// [`Dsv4LayerPageState`]). `pending_kv/score` need no restore:
+    /// `matched_len % ratio == 0` ⇒ no partial block, so the next compress
+    /// overwrites before any read.
     pub(crate) fn restore_prefix_counters(
         &mut self,
         mode: DeepSeekV4AttentionMode,
@@ -706,7 +660,7 @@ impl Dsv4LayerAttentionState {
             dsa.packed_rows = index_rows;
         }
         if let Some(flash) = &mut self.flashmla {
-            flash.fp8_kv_comp_packed_rows = comp_rows;
+            flash.fp8_kv_comp_packed_rows = 0;
             flash.fp8_kv_sw_bootstrapped = false;
         }
     }
@@ -720,56 +674,6 @@ fn page_row_span(page_tokens: usize, ratio: usize, page_index: usize) -> (usize,
     let start = (page_index * page_tokens) / ratio;
     let end = ((page_index + 1) * page_tokens) / ratio;
     (start, end - start)
-}
-
-/// Byte ranges of one host page's compressed FP8 band rows inside the shared
-/// FlashMLA pool (`None` when the page completes no row): MODEL1 page layout
-/// is `[64×token data][64×e8m0 scales]` (`dsv4_fp8_kv_pack.cu`) — the same
-/// layout `Dsv4SpecRingSnapshot::fp8_sw_offsets` addresses. Table-routed
-/// through the slot's page table (#85 P2), never `slot_idx × slot_bytes`
-/// arithmetic.
-#[allow(clippy::type_complexity)]
-fn band_row_ranges(
-    flash: &Dsv4FlashMlaDecodeState,
-    pool: &Dsv4LayerKvLayout,
-    kv_arena: &Dsv4MlaKvArena,
-    compress_ratio: usize,
-    page_tokens: usize,
-    page_index: usize,
-) -> Result<Option<(std::ops::Range<usize>, std::ops::Range<usize>)>> {
-    ensure!(compress_ratio > 0, "DSv4 prefix band: zero compress ratio");
-    let (row0, count) = page_row_span(page_tokens, compress_ratio, page_index);
-    if count == 0 {
-        return Ok(None);
-    }
-    let bmap = flash.block_map();
-    // The span must live inside ONE FlashMLA block for a contiguous copy
-    // (holds for every ratio dividing the page and for ≤1-row spans).
-    ensure!(
-        row0 / bmap.page_size() == (row0 + count - 1) / bmap.page_size(),
-        "DSv4 prefix band rows {row0}..{} straddle a {}-row FlashMLA block",
-        row0 + count,
-        bmap.page_size()
-    );
-    let (block, in_row) = bmap.comp_row(row0);
-    let page = physical_page(pool.flashmla_page_table(flash.slot_idx)?, block)?;
-    let data_bytes = kv_arena
-        .nope_dim
-        .checked_add(kv_arena.rope_dim * 2)
-        .ok_or_else(|| anyhow!("DSv4 prefix band token data byte overflow"))?;
-    ensure!(
-        kv_arena.bytes_per_token >= data_bytes,
-        "DSv4 prefix band: bytes/token {} smaller than data bytes {data_bytes}",
-        kv_arena.bytes_per_token
-    );
-    let scale_bytes = kv_arena.bytes_per_token - data_bytes;
-    let block_base = page as usize * (bmap.page_size() * kv_arena.bytes_per_token);
-    let data_start = block_base + in_row * data_bytes;
-    let scale_start = block_base + bmap.page_size() * data_bytes + in_row * scale_bytes;
-    Ok(Some((
-        data_start..data_start + count * data_bytes,
-        scale_start..scale_start + count * scale_bytes,
-    )))
 }
 
 /// Element range of one host page's rows in the main compressor's bf16
@@ -868,8 +772,6 @@ mod tests {
             boundary: true,
             layers: vec![
                 Dsv4LayerPageState {
-                    band_data: vec![1, 2, 3, 4],
-                    band_scale: vec![9],
                     staging: bf(&[0.5, -1.25]),
                     dsa_data: vec![5, 6],
                     dsa_scale: vec![0, 0, 128, 63],

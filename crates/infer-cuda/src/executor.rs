@@ -2148,28 +2148,6 @@ fn validate_dsv4_prefill_kv_view(
     Ok(())
 }
 
-/// TEMP (#154 Phase 2a E2 probe): env-gated (`ARLE_DSV4_PREFIX_PROBE=1`),
-/// rank-0-only entry fingerprints at publish and restore. Removed once the
-/// E2 root cause is verified.
-fn dsv4_prefix_probe(
-    rank: usize,
-    tag: &str,
-    page_id: u32,
-    page_index: usize,
-    boundary: bool,
-    entry: &crate::attention::Dsv4PrefixPageEntry,
-) {
-    use std::io::Write;
-    if rank != 0 || std::env::var_os("ARLE_DSV4_PREFIX_PROBE").is_none() {
-        return;
-    }
-    let line = format!(
-        "DSV4_PFXPROBE {tag} page={page_id} idx={page_index} boundary={boundary} {}\n",
-        entry.debug_fingerprint()
-    );
-    let _ = std::io::stderr().write_all(line.as_bytes());
-}
-
 impl std::fmt::Debug for Dsv4CudaExecutor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Dsv4CudaExecutor")
@@ -2402,8 +2380,7 @@ impl Dsv4CudaExecutor {
         }
         let align = self.model.config.sliding_window.max(1);
         // Phase 1: enqueue every page's D2H clones (stream-ordered, no sync).
-        let mut captured: Vec<(u32, usize, bool, crate::attention::Dsv4PrefixPageEntry)> =
-            Vec::new();
+        let mut captured: Vec<(u32, usize, crate::attention::Dsv4PrefixPageEntry)> = Vec::new();
         for page_index in (start_pos / page_tokens)..(end_pos / page_tokens) {
             let page_end = (page_index + 1) * page_tokens;
             let Some(&page_id) = slot_pages.get(page_index) else {
@@ -2416,10 +2393,11 @@ impl Dsv4CudaExecutor {
             // Boundary sections exist only when the forward ended exactly here;
             // restore commits only at `align` multiples, so skip odd page ends.
             // An MTP multi-token commit that CROSSES a boundary (page_end <
-            // end_pos) also skips: the overlap registers and the SW ring have
-            // already advanced past the boundary and are unrecoverable —
-            // correctness over coverage; the presence-check
-            // (`reusable_prefix_blocks`) simply won't commit there.
+            // end_pos) also skips: the SW ring advances every token, so the
+            // boundary-instant ring (and, once a compress block completes, the
+            // overlap registers) is unrecoverable — correctness over coverage;
+            // the presence-check (`reusable_prefix_blocks`) simply won't
+            // commit there.
             let boundary = page_end == end_pos && page_end.is_multiple_of(align);
             match self.slots[slot].capture_prefix_page(
                 &self.model.ctx,
@@ -2430,7 +2408,7 @@ impl Dsv4CudaExecutor {
                 page_index,
                 boundary,
             ) {
-                Ok(entry) => captured.push((page_id, page_index, boundary, entry)),
+                Ok(entry) => captured.push((page_id, page_index, entry)),
                 Err(err) => {
                     warn!("DSv4 prefix publish failed for slot {slot} page {page_index}: {err:#}")
                 }
@@ -2444,15 +2422,7 @@ impl Dsv4CudaExecutor {
             warn!("DSv4 prefix publish sync failed for slot {slot}: {err:#}");
             return;
         }
-        for (page_id, page_index, boundary, entry) in captured {
-            dsv4_prefix_probe(
-                self.model.tp.config().rank,
-                "pub",
-                page_id,
-                page_index,
-                boundary,
-                &entry,
-            );
+        for (page_id, page_index, entry) in captured {
             if !self.prefix_state.publish(page_id, &entry) {
                 warn!(
                     "DSv4 prefix publish: pool refused host page {page_id} \
@@ -2591,16 +2561,6 @@ impl Dsv4CudaExecutor {
             .iter()
             .map(|&page_id| self.prefix_state.read_entry(page_id))
             .collect::<Result<Vec<_>>>()?;
-        for (page_id, entry) in prefix_pages.iter().zip(&entries) {
-            dsv4_prefix_probe(
-                self.model.tp.config().rank,
-                "res",
-                *page_id,
-                entry.page_index as usize,
-                entry.boundary,
-                entry,
-            );
-        }
         self.kv_adapter.mirror_full_band(slot, matched_len)?;
         // A17: a restored occupant enters Decoding without a tail warm step
         // for its MTP chain; stale spec state belongs to the prior occupant.

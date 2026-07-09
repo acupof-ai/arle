@@ -760,6 +760,24 @@ impl CudaKvTierStore {
         self.remove(&all);
     }
 
+    /// Drop a key's DISK record only (host copy untouched) — the read-on-miss
+    /// promote's cleanup: after the host re-insert, keeping the disk record
+    /// would double-count the key in `disk_pages` and pin a spill slot.
+    pub(crate) fn remove_disk_only(&mut self, key: u64) {
+        let Some(disk) = &mut self.disk else {
+            return;
+        };
+        let Some(record) = disk.keys.remove(&key) else {
+            return;
+        };
+        disk.store.free_slot(record.slot);
+        if disk.durable
+            && let Err(err) = disk.write_manifest()
+        {
+            log::warn!("KV recall manifest update failed dropping key {key}: {err}");
+        }
+    }
+
     /// Drop entries from both levels. In the mmap store, freed slots return to
     /// the free list (no file unlink needed — the slot bytes are simply
     /// overwritten on next allocation).
