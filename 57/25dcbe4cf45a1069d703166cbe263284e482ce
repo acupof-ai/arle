@@ -1,0 +1,21 @@
+docs/experience/wins/2026-07-09-dsv4-route-a-flashmla-page-sharing.md
+  s_0755657a3f5507::t_fd73acfb7c7bff 3,9,48,50,52,56-76,80-88,92-94,100-104
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "5725dcbe4cf45a1069d703166cbe263284e482ce",
+  "prompts": {},
+  "sessions": {
+    "s_0755657a3f5507": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aa7e48ccf73d27449",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
