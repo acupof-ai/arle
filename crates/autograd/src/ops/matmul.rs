@@ -390,18 +390,11 @@ pub(crate) fn matmul_bt_backward(
 }
 
 fn legacy_lora_linear_backward_enabled() -> bool {
-    matches!(
-        std::env::var("ARLE_OPD_LEGACY_LORA_LINEAR_BWD").as_deref(),
-        Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
-    )
+    crate::runtime_flags::legacy_lora_linear_bwd()
 }
 
 fn lora_linear_backward_tile_rows() -> usize {
-    std::env::var("ARLE_OPD_LORA_LINEAR_BWD_TILE_ROWS")
-        .ok()
-        .and_then(|raw| raw.parse::<usize>().ok())
-        .filter(|&rows| rows > 0)
-        .unwrap_or(1024)
+    crate::runtime_flags::lora_linear_bwd_tile_rows()
 }
 
 fn is_lora_matmul_site(site: &str) -> bool {

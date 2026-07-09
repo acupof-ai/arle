@@ -427,10 +427,7 @@ pub(crate) fn causal_sdpa_recompute_backward(
 }
 
 fn legacy_sdpa_backward_enabled() -> bool {
-    matches!(
-        std::env::var("ARLE_OPD_LEGACY_SDPA_BWD").as_deref(),
-        Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
-    )
+    crate::runtime_flags::legacy_sdpa_bwd()
 }
 
 /// Per-q-chunk rows for the chunked SDPA backward recompute — bounds the live

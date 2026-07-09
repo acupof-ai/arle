@@ -898,7 +898,7 @@ fn forward_layers_resident<'a>(
     // throughout — no host bridge), then `submit_and_wait` ONCE at token end. This
     // collapses the old 64 per-layer fence-wait GPU stalls into a single submit.
     // The descriptor rings are sized to a whole token (see `DecodeResources::new`),
-    // so no slot is reused while its dispatch is still in flight. `ARLE_SUBMIT_CAP`
+    // so no slot is reused while its dispatch is still in flight. `--vulkan-submit-cap`
     // (default: whole token) caps the per-batch dispatch count as a TDR safety valve;
     // a flush at a layer boundary stays numerically identical because the `hid`
     // hand-off across the flush is fence-ordered by the next `begin()`.
@@ -1372,19 +1372,20 @@ fn record_full_attention<'a>(
 /// residual-resident loop flushes (submit + re-begin) at the next layer boundary.
 /// Default `usize::MAX` = a whole token in ONE submit (the perf-parity target). A
 /// flush is numerically transparent — the `hid` hand-off is fence-ordered by the
-/// reopening `begin()` — so `ARLE_SUBMIT_CAP=<n>` is a pure TDR/latency safety
+/// reopening `begin()` — so `--vulkan-submit-cap <n>` is a pure TDR/latency safety
 /// valve (lower → more submits, smaller command buffers) with no effect on output.
-/// Cached after first read.
+static SUBMIT_DISPATCH_CAP: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// `--vulkan-submit-cap`, set once pre-load (values `> 0`).
+pub fn set_submit_cap(cap: usize) {
+    if cap > 0 {
+        SUBMIT_DISPATCH_CAP.store(cap, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 fn submit_dispatch_cap() -> usize {
-    use std::sync::OnceLock;
-    static CAP: OnceLock<usize> = OnceLock::new();
-    *CAP.get_or_init(|| {
-        std::env::var("ARLE_SUBMIT_CAP")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or(usize::MAX)
-    })
+    SUBMIT_DISPATCH_CAP.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Record (NO begin/submit) the WHOLE linear (gated-delta) attention block

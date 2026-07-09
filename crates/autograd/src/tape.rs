@@ -850,10 +850,7 @@ fn backward_vram_profile_enabled() -> bool {
 }
 
 fn trim_after_checkpoint_replay(store: &TensorStore) -> Result<()> {
-    if matches!(
-        std::env::var("ARLE_OPD_TRIM_AFTER_CHECKPOINT_REPLAY").as_deref(),
-        Ok(value) if !matches!(value, "0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF")
-    ) {
+    if crate::runtime_flags::trim_after_checkpoint_replay() {
         store.backend().trim_memory_pool()?;
     }
     Ok(())

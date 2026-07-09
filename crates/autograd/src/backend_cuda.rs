@@ -110,26 +110,14 @@ fn linear_attention_debug_stage_done(
 
 #[cfg(not(feature = "no-cuda"))]
 fn linear_attention_gdr_chunkwise_prefill_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        matches!(
-            std::env::var("ARLE_GDR_CHUNKWISE_PREFILL").as_deref(),
-            Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
-        )
-    })
+    crate::runtime_flags::gdr_chunkwise_prefill()
 }
 
 /// A/B escape hatch: force the legacy monolithic chunked-scan backward (one
 /// block per batch x value_head) instead of the staged chunk-parallel path.
 #[cfg(not(feature = "no-cuda"))]
 fn linear_attention_mono_backward_forced() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        matches!(
-            std::env::var("ARLE_LA_BACKWARD_MONO").as_deref(),
-            Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
-        )
-    })
+    crate::runtime_flags::la_backward_mono()
 }
 
 /// Max concurrent chunk lanes in the stage-3 grad kernel. Bounds the per-block
@@ -4303,7 +4291,7 @@ fn cuda_linear_attention_backward_device(
 
     if linear_attention_mono_backward_forced() {
         // Legacy monolithic scan: one block per (batch x value_head) walks every
-        // chunk sequentially. Kept as the A/B fallback (ARLE_LA_BACKWARD_MONO=1).
+        // chunk sequentially. Kept as the A/B fallback (--la-backward-mono).
         let mut grad_state_scratch = backend
             .stream
             .alloc_zeros::<f32>(state_len)
@@ -7899,11 +7887,11 @@ fn cuda_causal_sdpa_decode_gqa_cache(
     let head_dim = q_shape[3];
 
     // Online-softmax fast path for Qwen3.5-style head_dim=256 (default knob:
-    // ARLE_AUTOGRAD_DECODE_ATTN_LEGACY=1 to force the original two-pass kernel).
+    // --autograd-decode-attn-legacy forces the original two-pass kernel).
     // The online kernel uses HEAD_DIM threads per block (vs 256 in the legacy),
     // one-pass running-max softmax (vs two-pass with shared-mem scores buffer),
     // and warp-level reductions throughout.
-    let use_online = head_dim == 256 && !env_force_legacy_decode_attn();
+    let use_online = head_dim == 256 && !force_legacy_decode_attn();
     if use_online {
         const BLOCK_ONLINE: u32 = 256; // = HEAD_DIM
         let n_warps = BLOCK_ONLINE / 32;
@@ -7973,17 +7961,8 @@ fn cuda_causal_sdpa_decode_gqa_cache(
 }
 
 #[cfg(not(feature = "no-cuda"))]
-fn env_force_legacy_decode_attn() -> bool {
-    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHED.get_or_init(|| {
-        matches!(
-            std::env::var("ARLE_AUTOGRAD_DECODE_ATTN_LEGACY")
-                .as_deref()
-                .map(str::to_ascii_lowercase)
-                .as_deref(),
-            Ok("1" | "true" | "yes" | "on")
-        )
-    })
+fn force_legacy_decode_attn() -> bool {
+    crate::runtime_flags::decode_attn_legacy()
 }
 
 #[cfg(not(feature = "no-cuda"))]

@@ -46,7 +46,7 @@
 
 use std::{
     collections::HashMap,
-    env, fs, io,
+    fs, io,
     path::{Path, PathBuf},
 };
 
@@ -760,9 +760,7 @@ enum LoadMode {
 }
 
 fn opd_gradient_checkpointing_enabled() -> bool {
-    env::var("ARLE_OPD_GRADIENT_CHECKPOINTING")
-        .ok()
-        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "on"))
+    crate::runtime_flags::gradient_checkpointing()
 }
 
 fn load_qwen35_from_hf_dir_inner(

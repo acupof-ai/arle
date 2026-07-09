@@ -87,7 +87,7 @@ pub fn set_infer_rollout_override(use_infer: bool) {
     let _ = INFER_ROLLOUT_OVERRIDE.set(use_infer);
 }
 
-/// OPD engine weight time-share mode (`ARLE_OPD_ENGINE_OFFLOAD`). When on, the
+/// OPD engine weight time-share mode (`--engine-offload`). When on, the
 /// idle infer engines offload their device weights to host RAM during the
 /// student backward, freeing VRAM so long rollouts (≥256) fit on a 16 GB card.
 ///
@@ -136,22 +136,13 @@ impl EngineOffloadMode {
     }
 }
 
-/// Parse the OPD engine offload mode from `ARLE_OPD_ENGINE_OFFLOAD`.
-///
-/// - `1` / `true` / `yes` / `on` / `all` → [`EngineOffloadMode::All`].
-/// - `student` → [`EngineOffloadMode::Student`] (keep the teacher resident).
-/// - `teacher` → [`EngineOffloadMode::Teacher`] (keep the student resident —
-///   frees ~3 GB and avoids the multi-engine pool interleaving that corrupts
-///   the W4A8 Marlin reload under `All`).
-/// - anything else / unset → [`EngineOffloadMode::Off`].
+/// The OPD engine offload mode (`--engine-offload off|all|student|teacher`;
+/// `teacher` keeps the student resident — frees ~3 GB and avoids the
+/// multi-engine pool interleaving that corrupts the W4A8 Marlin reload under
+/// `all`).
 #[cfg(feature = "cuda")]
 pub fn engine_offload_mode() -> EngineOffloadMode {
-    match std::env::var("ARLE_OPD_ENGINE_OFFLOAD").as_deref() {
-        Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON" | "all" | "ALL") => EngineOffloadMode::All,
-        Ok("student" | "STUDENT" | "Student") => EngineOffloadMode::Student,
-        Ok("teacher" | "TEACHER" | "Teacher") => EngineOffloadMode::Teacher,
-        _ => EngineOffloadMode::Off,
-    }
+    crate::runtime_flags::engine_offload()
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -616,30 +607,12 @@ fn use_device_rollout_argmax(store: &TensorStore, rollout_len: usize, vocab: usi
     matches!(store.backend().device(), Device::Cuda) && (rollout_len >= 4 || vocab >= 65_536)
 }
 
-const ROLLOUT_RETAIN_INTERVAL: usize = 2;
-
-static ROLLOUT_RETAIN_INTERVAL_RUNTIME: LazyLock<usize> = LazyLock::new(|| {
-    std::env::var("ARLE_OPD_ROLLOUT_RETAIN_INTERVAL")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|&value| value > 0)
-        .unwrap_or(ROLLOUT_RETAIN_INTERVAL)
-});
-
 static ROLLOUT_PROGRESS_ENABLED: LazyLock<bool> =
     LazyLock::new(|| std::env::var_os("ARLE_OPD_ROLLOUT_PROGRESS").is_some());
 
-static ROLLOUT_PROGRESS_INTERVAL: LazyLock<usize> = LazyLock::new(|| {
-    std::env::var("ARLE_OPD_ROLLOUT_PROGRESS_INTERVAL")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|&value| value > 0)
-        .unwrap_or(16)
-});
-
 fn should_retain_rollout_step(step: usize, rollout_len: usize) -> bool {
     let completed_steps = step + 1;
-    completed_steps.is_multiple_of(*ROLLOUT_RETAIN_INTERVAL_RUNTIME)
+    completed_steps.is_multiple_of(crate::runtime_flags::rollout_retain_interval())
         || completed_steps == rollout_len
 }
 
@@ -648,13 +621,14 @@ fn maybe_log_rollout_progress(path: &str, step: usize, rollout_len: usize, start
         return;
     }
     let completed_steps = step + 1;
-    if completed_steps.is_multiple_of(*ROLLOUT_PROGRESS_INTERVAL) || completed_steps == rollout_len
+    if completed_steps.is_multiple_of(crate::runtime_flags::rollout_progress_interval())
+        || completed_steps == rollout_len
     {
         eprintln!(
             "opd_rollout_progress path={path} step={completed_steps}/{rollout_len} \
              elapsed_seconds={:.3} retain_interval={}",
             started.elapsed().as_secs_f64(),
-            *ROLLOUT_RETAIN_INTERVAL_RUNTIME
+            crate::runtime_flags::rollout_retain_interval()
         );
     }
 }
@@ -2929,17 +2903,11 @@ fn writeback_vram_trace_enabled() -> bool {
 }
 
 fn trim_after_writeback_enabled() -> bool {
-    matches!(
-        std::env::var("ARLE_OPD_TRIM_AFTER_WRITEBACK").as_deref(),
-        Ok(v) if !matches!(v, "0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF")
-    )
+    crate::runtime_flags::trim_after_writeback()
 }
 
 fn trim_before_backward_enabled() -> bool {
-    matches!(
-        std::env::var("ARLE_OPD_TRIM_BEFORE_BACKWARD").as_deref(),
-        Ok(v) if !matches!(v, "0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF")
-    )
+    crate::runtime_flags::trim_before_backward()
 }
 
 /// Log device VRAM at a writeback milestone when `ARLE_OPD_VRAM_TRACE` is set
@@ -3094,12 +3062,9 @@ pub fn masked_writeback_ce_step<O: Optimizer>(
     // Default ON (long agentic trajectories need it to fit). The H2D re-upload is
     // serialized on the host thread and starves the GPU (gdb: the writeback's host
     // wall is `cuMemcpyHtoDAsync`), so for SHORT sequences that already fit
-    // resident, set `ARLE_OPD_WRITEBACK_OFFLOAD=0` to keep checkpoints on-device
+    // resident, set `--writeback-offload false` to keep checkpoints on-device
     // and run fully GPU-bound. errors/2026-06-28-agent-opd-writeback-host-bound-is-checkpoint-offload-htod-not-host-ce.
-    let offload_checkpoints = !matches!(
-        std::env::var("ARLE_OPD_WRITEBACK_OFFLOAD").as_deref(),
-        Ok("0") | Ok("false") | Ok("FALSE")
-    );
+    let offload_checkpoints = crate::runtime_flags::writeback_offload();
     tape.set_offload_checkpoints(offload_checkpoints);
     tape.set_enabled(true);
     eprintln!("[masked-writeback] offload_checkpoints={offload_checkpoints}");
@@ -3174,7 +3139,7 @@ pub fn masked_writeback_ce_step<O: Optimizer>(
 /// the cached prefix covers absolute positions `0..gen_start`. The dropped term
 /// (LoRA gradient on the prompt KV) is exactly zero at lora_b=0 and small
 /// otherwise, so the loss + response-position grads match the full path. Gated
-/// behind `ARLE_OPD_WRITEBACK_FROZEN_PROMPT_KV` via
+/// behind `--writeback-frozen-prompt-kv` via
 /// `masked_writeback_ce_step_dispatch`; this function is NOT a branch inside the
 /// byte-identical baseline `masked_writeback_ce_step`.
 #[allow(clippy::too_many_arguments)]
@@ -3252,10 +3217,7 @@ pub fn masked_writeback_ce_step_frozen_prompt_kv<O: Optimizer>(
     }
 
     let mut tape = Tape::new();
-    let offload_checkpoints = !matches!(
-        std::env::var("ARLE_OPD_WRITEBACK_OFFLOAD").as_deref(),
-        Ok("0") | Ok("false") | Ok("FALSE")
-    );
+    let offload_checkpoints = crate::runtime_flags::writeback_offload();
     tape.set_offload_checkpoints(offload_checkpoints);
     tape.set_enabled(true);
     eprintln!("[masked-writeback-frozen] offload_checkpoints={offload_checkpoints}");
@@ -3353,10 +3315,7 @@ pub fn masked_writeback_ce_step_dispatch<O: Optimizer>(
     window_size: usize,
     store: &mut TensorStore,
 ) -> Result<f32> {
-    let frozen = matches!(
-        std::env::var("ARLE_OPD_WRITEBACK_FROZEN_PROMPT_KV").as_deref(),
-        Ok("1") | Ok("true") | Ok("TRUE")
-    );
+    let frozen = crate::runtime_flags::writeback_frozen_prompt_kv();
     if frozen {
         masked_writeback_ce_step_frozen_prompt_kv(
             student,
@@ -3512,10 +3471,7 @@ pub fn gkd_writeback_step<O: Optimizer, T: TeacherForward + ?Sized>(
     let windows = masked_gkd_windows(&masked_positions, window_size);
 
     let mut tape = Tape::new();
-    let offload_checkpoints = !matches!(
-        std::env::var("ARLE_OPD_WRITEBACK_OFFLOAD").as_deref(),
-        Ok("0") | Ok("false") | Ok("FALSE")
-    );
+    let offload_checkpoints = crate::runtime_flags::writeback_offload();
     tape.set_offload_checkpoints(offload_checkpoints);
     tape.set_enabled(true);
     // Retain the teacher's params across the post-backward `retain_ids` prune:
