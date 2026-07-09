@@ -25,6 +25,19 @@ lifecycle & progress spine).
 
 ### Verdicts
 
+- **2026-07-10 — DSv4 Route A prefix reuse KILLED pending content-keyed
+  redesign; warm-cache needle regression FIXED**: the Route A machinery
+  (state pools, per-namespace tiers, restore path, host→FlashMLA page
+  translation) deleted entirely (`bbaaea93b`, +67/−1553) after #154's
+  bisection (origin `0198c3ba7`, amplifier page-sharing series) and a
+  9-defect restore-path review; device page tables now refresh via a
+  dirty-bit contract on every host-band change. Pod acceptance 6/6 (solo
+  15/15 both cache states, concurrent 120/120, +193 MB pool budget
+  reclaimed, park intact):
+  [wins](docs/experience/wins/2026-07-10-dsv4-route-a-deletion-regression-fix-acceptance.md) ·
+  [errors](docs/experience/errors/2026-07-09-dsv4-route-a-flashmla-needle-regression-bisected.md) ·
+  reland plan [Phase 2](docs/plans/2026-07-09-dsv4-kv-reuse-seam-refactor.md).
+
 - **2026-07-10 — Qwen3.6 DSpark block draft LICENSED (short-ctx greedy)**:
   36.2 ms/step, 104–108 tok/s = 2.4× plain decode on H20 after quant-lane
   routing (row-serial GEMV → DeepGEMM/cuBLASLt at B≥16); needle ×3 +
