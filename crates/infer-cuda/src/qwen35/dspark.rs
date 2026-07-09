@@ -277,6 +277,118 @@ fn argmax_hs_row(
     Ok(token[0] as u32)
 }
 
+/// Sparse `(token, prob)` sampling distribution retained for the rejection test.
+pub(crate) type DsparkDist = Vec<(u32, f32)>;
+
+/// Uniform-stream salts: draft draw / accept test / residual+bonus draw at the
+/// same position must be independent or the rejection identity breaks.
+const SALT_DRAW: u64 = 0;
+const SALT_ACCEPT: u64 = 0x9E37_79B9_7F4A_7C15;
+const SALT_RESIDUAL: u64 = 0xC2B2_AE3D_27D4_EB4F;
+
+/// SplitMix64 — mirrors `infer_plan::sample`'s private mixer bit-for-bit.
+fn splitmix64(x: u64) -> u64 {
+    let mut z = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// Deterministic uniform in [0, 1) from `(seed, salt, position)` — the engine
+/// sampler's `(seed, position)` stream (`infer_plan::sample_token`), so
+/// same-config-twice reproduces. `SALT_DRAW = 0` makes the draft draw consume
+/// exactly the uniform plain decode would at that position.
+fn unit_uniform(seed: Option<u64>, salt: u64, position: u64) -> f32 {
+    let bits = splitmix64(
+        seed.unwrap_or(0)
+            .wrapping_add(salt)
+            .wrapping_add(position)
+            .wrapping_add(1),
+    );
+    (bits >> 40) as f32 / (1u32 << 24) as f32
+}
+
+/// Filtered, renormalized sampling distribution of one logits row — the exact
+/// temperature/top-k/top-p/min-p semantics (including candidate order and the
+/// degenerate-row argmax fallback) of `infer_plan::sample_token`, so the
+/// rejection test measures against the distribution plain decode samples from.
+fn filtered_dist(logits: &[f32], params: &SamplingParams) -> DsparkDist {
+    let inv_t = 1.0 / params.temperature;
+    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut cand: Vec<(u32, f32)> = logits
+        .iter()
+        .enumerate()
+        .map(|(i, &l)| (i as u32, ((l - max) * inv_t).exp()))
+        .collect();
+    let sum: f32 = cand.iter().map(|(_, p)| *p).sum();
+    if sum > 0.0 {
+        for c in &mut cand {
+            c.1 /= sum;
+        }
+    }
+    if params.top_k > 0 || params.top_p < 1.0 || params.min_p > 0.0 {
+        cand.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+        if params.top_k > 0 && (params.top_k as usize) < cand.len() {
+            cand.truncate(params.top_k as usize);
+        }
+        if params.top_p < 1.0 {
+            let mut cum = 0.0;
+            let mut cut = cand.len();
+            for (i, (_, p)) in cand.iter().enumerate() {
+                cum += *p;
+                if cum >= params.top_p {
+                    cut = i + 1;
+                    break;
+                }
+            }
+            cand.truncate(cut.max(1));
+        }
+        if params.min_p > 0.0 {
+            let top = cand.first().map_or(0.0, |(_, p)| *p);
+            cand.retain(|(_, p)| *p >= params.min_p * top);
+        }
+    }
+    let total: f32 = cand.iter().map(|(_, p)| *p).sum();
+    if cand.is_empty() || !total.is_finite() || total <= 0.0 {
+        return vec![(infer_plan::argmax_logit(logits), 1.0)];
+    }
+    for c in &mut cand {
+        c.1 /= total;
+    }
+    cand
+}
+
+fn dist_prob(dist: &[(u32, f32)], tok: u32) -> f32 {
+    dist.iter()
+        .find(|&&(t, _)| t == tok)
+        .map_or(0.0, |&(_, p)| p)
+}
+
+/// Multinomial draw over a normalized distribution (CDF scan in `dist` order —
+/// the same scan `infer_plan::sample_token` performs).
+fn draw(dist: &[(u32, f32)], unit: f32) -> u32 {
+    let mut acc = 0.0;
+    for &(t, p) in dist {
+        acc += p;
+        if unit < acc {
+            return t;
+        }
+    }
+    dist.last().map_or(0, |&(t, _)| t)
+}
+
+/// One token row of a `[vocab, seq]` bf16 buffer, D2H as f32.
+fn host_hs_row_f32(ctx: &DeviceContext, logits: &HiddenStates, row: usize) -> Result<Vec<f32>> {
+    let vocab = logits.hidden_dim;
+    ensure!(row < logits.seq_len, "dspark sample row {row} oob");
+    let host = ctx
+        .stream
+        .clone_dtoh(&logits.data.slice(row * vocab..(row + 1) * vocab))
+        .map_err(|e| anyhow!("D2H dspark logits row failed: {e}"))?;
+    ctx.sync()?;
+    Ok(host.iter().map(|x| x.to_f32()).collect())
+}
+
 /// Executor-side DSpark runtime: the loaded head + per-slot draft state + the
 /// shared tap/scratch buffers. Built only under `--spec-type dspark`, so the
 /// baseline executor allocates nothing.
@@ -619,10 +731,12 @@ impl Qwen35Model {
         Ok(())
     }
 
-    /// One DSpark block draft: propose up to `max_draft_tokens` greedy tokens
-    /// from a single non-causal 5-layer forward over `[ctx cache ++ block]`.
+    /// One DSpark block draft: propose up to `max_draft_tokens` tokens from a
+    /// single non-causal 5-layer forward over `[ctx cache ++ block]`.
     /// Returns the verify chain `[anchor, d1..dL]` (`L` truncated by the
-    /// confidence head when present).
+    /// confidence head when present) plus, in sampling mode
+    /// (`!params.is_greedy()`), the per-row filtered draft distributions
+    /// `q[i]` for `chain[i+1]` (empty for greedy — argmax path unchanged).
     pub(crate) fn dspark_draft_block(
         &self,
         head: &Qwen35DsparkHead,
@@ -630,7 +744,8 @@ impl Qwen35Model {
         scratch: &mut DsparkScratch,
         anchor: u32,
         start: usize,
-    ) -> Result<Vec<u32>> {
+        params: &SamplingParams,
+    ) -> Result<(Vec<u32>, Vec<DsparkDist>)> {
         let cfg = &head.cfg;
         let ctx = &self.ctx;
         let block = cfg.block_size;
@@ -794,13 +909,18 @@ impl Qwen35Model {
         gemm_batch(ctx, self.output_projection(), final_normed, logits)?;
         let head_ms = super::mtp_phase_lap(ctx, &mut pt);
 
-        // Greedy left-to-right sampling. Next-token heads (DSpark) draft from
-        // every row; same-position (DFlash) rows 1.. fill their own positions.
+        // Left-to-right token selection: argmax (greedy) or a rejection-ready
+        // draw from the engine-sampler-filtered distribution q (retained per
+        // row). Next-token heads (DSpark) draft from every row; same-position
+        // (DFlash) rows 1.. fill their own positions.
+        let sampling = !params.is_greedy();
+        let mut q_dists: Vec<DsparkDist> = Vec::new();
         let first_row = usize::from(!cfg.next_token_heads);
         let mut drafts = Vec::with_capacity(block);
         let mut prev = anchor;
         for row in first_row..block {
-            let tok = if let Some(m) = &head.markov {
+            // Corrected logits row: base + markov bias when the head is present.
+            let (src, src_row) = if let Some(m) = &head.markov {
                 // step_logits = base_row + markov_w2 · markov_w1[prev]
                 let tok_dev = scratch.markov_tok.upload(ctx, &[prev as i32])?;
                 let emb = scratch.markov_emb.get(ctx, m.rank, 1)?;
@@ -822,12 +942,20 @@ impl Qwen35Model {
                     scratch.markov_bias.get(ctx, vocab, 1)?,
                     sum,
                 )?;
-                let am = scratch.argmax.get(ctx, 1)?;
-                argmax_hs_row(ctx, scratch.step_sum.get(ctx, vocab, 1)?, 0, am)?
+                (scratch.step_sum.get(ctx, vocab, 1)?, 0)
             } else {
-                let logits = scratch.logits.get(ctx, vocab, block)?;
-                let am = scratch.argmax.get(ctx, 1)?;
-                argmax_hs_row(ctx, logits, row, am)?
+                (scratch.logits.get(ctx, vocab, block)?, row)
+            };
+            let tok = if sampling {
+                let dist = filtered_dist(&host_hs_row_f32(ctx, src, src_row)?, params);
+                let tok = draw(
+                    &dist,
+                    unit_uniform(params.seed, SALT_DRAW, (start + row) as u64),
+                );
+                q_dists.push(dist);
+                tok
+            } else {
+                argmax_hs_row(ctx, src, src_row, scratch.argmax.get(ctx, 1)?)?
             };
             drafts.push(tok);
             prev = tok;
@@ -847,11 +975,12 @@ impl Qwen35Model {
         }
         let keep = self.dspark_confident_prefix_len(head, scratch, &prev_tokens)?;
         drafts.truncate(keep.min(drafts.len()));
+        q_dists.truncate(drafts.len());
 
         let mut chain = Vec::with_capacity(1 + drafts.len());
         chain.push(anchor);
         chain.extend(drafts);
-        Ok(chain)
+        Ok((chain, q_dists))
     }
 
     /// Confidence-head seam: acceptance-confident prefix length over the block
@@ -949,6 +1078,74 @@ impl Qwen35Model {
             // snapshot, then linear-only replay of the accepted prefix from the
             // verify capture; the paged full-attn KV self-heals under the pool
             // truncate + seq_len rewind (position-indexed rows).
+            spec.restore_trunk(&self.ctx, slot)?;
+            self.replay_linear_only(slot, ws, &spec.capture, k)?;
+            slot.set_seq_len(start_pos + k + 1);
+        }
+        Ok((emitted, bonus, k))
+    }
+
+    /// Rejection-sampling twin of [`Self::dspark_accept_commit`] (mirrors
+    /// DeepSpec `verify_draft_tokens`): accept `chain[j+1]` with prob
+    /// min(1, p_j(tok)/q_j(tok)) under the engine-sampler-filtered
+    /// distributions; the first reject commits a residual `max(0, p−q)` draw
+    /// (falling back to `p` on ~0 mass), full accept a bonus draw from the
+    /// last row — committed tokens are distributed exactly as filtered target
+    /// sampling. ONE D2H of the verify logits; all uniforms come from salted
+    /// `(seed, position)` streams, so same-config-twice reproduces.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn dspark_accept_commit_sampled(
+        &self,
+        slot: &mut Qwen35SlotState,
+        spec: &mut Qwen35SpecSlotState,
+        ws: &mut Qwen35Workspace,
+        chain: &[u32],
+        q: &[DsparkDist],
+        logits: &DeviceVec,
+        start_pos: usize,
+        params: &SamplingParams,
+    ) -> Result<(Vec<u32>, u32, usize)> {
+        let depth = chain.len() - 1;
+        ensure!(
+            q.len() == depth,
+            "dspark sampled verify: {} q rows for depth {depth}",
+            q.len()
+        );
+        let vocab = self.output_projection().rows;
+        let host = logits.to_host(&self.ctx)?;
+        let p_row = |j: usize| filtered_dist(&host[j * vocab..(j + 1) * vocab], params);
+        let mut k = 0usize;
+        let bonus = loop {
+            let p = p_row(k);
+            let pos = (start_pos + k + 1) as u64;
+            if k == depth {
+                break draw(&p, unit_uniform(params.seed, SALT_RESIDUAL, pos));
+            }
+            let tok = chain[k + 1];
+            let accept = (dist_prob(&p, tok) / dist_prob(&q[k], tok).max(1e-8)).min(1.0);
+            if unit_uniform(params.seed, SALT_ACCEPT, pos) < accept {
+                k += 1;
+                continue;
+            }
+            // Residual support ⊆ supp(p): max(0, p−q) is positive only where p is.
+            let q_prob: HashMap<u32, f32> = q[k].iter().copied().collect();
+            let mut residual: Vec<(u32, f32)> = p
+                .iter()
+                .map(|&(t, tp)| (t, (tp - q_prob.get(&t).copied().unwrap_or(0.0)).max(0.0)))
+                .collect();
+            let mass: f32 = residual.iter().map(|(_, r)| *r).sum();
+            let u = unit_uniform(params.seed, SALT_RESIDUAL, pos);
+            if mass <= 1e-8 {
+                break draw(&p, u);
+            }
+            for r in &mut residual {
+                r.1 /= mass;
+            }
+            break draw(&residual, u);
+        };
+        let mut emitted: Vec<u32> = chain[1..=k].to_vec();
+        emitted.push(bonus);
+        if k < depth {
             spec.restore_trunk(&self.ctx, slot)?;
             self.replay_linear_only(slot, ws, &spec.capture, k)?;
             slot.set_seq_len(start_pos + k + 1);
