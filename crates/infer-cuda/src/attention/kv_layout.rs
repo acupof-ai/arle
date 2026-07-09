@@ -1577,8 +1577,11 @@ impl Dsv4KvAdapter {
             };
             // Pad to full lsp so the device page table has the expected size.
             let mut pages = per_layer_pages[layer_idx].clone();
+            if pages.is_empty() {
+                continue;
+            }
             pages.truncate(lsp);
-            pages.resize(lsp, *pages.last().unwrap_or(&0));
+            pages.resize(lsp, *pages.last().unwrap());
             pool.mirror_band(slot, &pages, seq_len)?;
         }
         Ok(())
@@ -1666,7 +1669,8 @@ impl Dsv4KvAdapter {
             // Pad to full lsp so the device page table has the expected size.
             // Positions beyond prefix are never read (decode bounded by matched_len).
             let mut pages = per_layer_pages[layer_idx].clone();
-            pages.resize(lsp, *pages.last().unwrap_or(&0));
+            pages.truncate(lsp);
+            pages.resize(lsp, *pages.last().unwrap());
             pool.mirror_band(slot, &pages, token_count)?;
         }
         Ok(())
@@ -1735,8 +1739,11 @@ impl ModelKvAdapter for Dsv4KvAdapter {
                 let lsp = layer.flashmla_slot_pages();
                 // Pad to full lsp so device page table size matches.
                 let mut layer_pages = per_layer_pages[layer_idx].clone();
+                if layer_pages.is_empty() {
+                    continue;
+                }
                 layer_pages.truncate(lsp);
-                layer_pages.resize(lsp, *layer_pages.last().unwrap_or(&0));
+                layer_pages.resize(lsp, *layer_pages.last().unwrap());
                 match row.kind {
                     KvBatchRowKind::Prefill => {
                         if let Some(pool) = layer.flashmla_kv_pool.as_mut() {
