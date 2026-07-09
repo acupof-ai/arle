@@ -123,7 +123,7 @@ def build_doc(target_tokens: int, needle: str, needle_pos: float = 0.88) -> tupl
     k = max(1, int(n * needle_pos))
 
     pre = " ".join(f"Note {i+1}: {FILLER_SENTS[i % len(FILLER_SENTS)]}" for i in range(k))
-    block = f"\n\nImportant: the secret access code is {needle}. Memorize it.\n\n"
+    block = f"\n\nThe treasure chest contains exactly {needle}. Remember this.\n\n"
     post = " ".join(
         f"Note {i+1}: {FILLER_SENTS[(i + k) % len(FILLER_SENTS)]}" for i in range(n - k)
     )
