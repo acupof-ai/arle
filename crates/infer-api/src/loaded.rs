@@ -121,6 +121,14 @@ pub struct EngineLoadConfig {
     /// ranks load it too. `None` = spec off (baseline byte-identical).
     #[serde(default)]
     pub dspark_draft_model: Option<std::path::PathBuf>,
+    /// Confidence-head truncation threshold (checkpoints without the head
+    /// ignore it).
+    #[serde(default = "default_dspark_conf_threshold")]
+    pub dspark_conf_threshold: f32,
+}
+
+fn default_dspark_conf_threshold() -> f32 {
+    0.5
 }
 
 /// `--lora-alpha` default (the common rank-32 PEFT convention); a free function
@@ -171,6 +179,7 @@ impl Default for EngineLoadConfig {
             student_lora_adapters: None,
             student_lora_alpha: default_student_lora_alpha(),
             dspark_draft_model: None,
+            dspark_conf_threshold: default_dspark_conf_threshold(),
         }
     }
 }
@@ -1842,6 +1851,7 @@ mod backend {
                 kv_dtype,
                 config.mem_fraction_static,
                 config.dspark_draft_model.as_deref(),
+                config.dspark_conf_threshold,
             )?,
             // DSv4 multi-rank serve. The DSv4 executor resolves its TP
             // rank/world-size + EP expert split + NCCL communicator from the
