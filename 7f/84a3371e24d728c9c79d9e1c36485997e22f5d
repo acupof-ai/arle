@@ -1,0 +1,23 @@
+crates/cuda-kernels/csrc/gemm/gemv.cu
+  s_10666936ac5bd4::t_7eca0704528b8d 269-273,275
+crates/infer-cuda/src/ops/quant_linear.rs
+  s_10666936ac5bd4::t_0857288ad572d0 20-25
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "7f84a3371e24d728c9c79d9e1c36485997e22f5d",
+  "prompts": {},
+  "sessions": {
+    "s_10666936ac5bd4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a30b9b96bccf06c7e",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
