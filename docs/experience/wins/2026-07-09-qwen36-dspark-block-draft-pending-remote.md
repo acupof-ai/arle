@@ -1,6 +1,7 @@
-# Qwen3.6 DSpark block drafter — pending-remote
+# Qwen3.6 DSpark block drafter — correctness PASS, perf attribution pending
 
-> Status: pending-remote — code landed, H20 gates + A/B not yet run.
+> Status: pending-remote — correctness gates PASS on H20; net perf is a LOSS
+> pending fixed-cost attribution (below).
 
 ## Context
 
@@ -10,15 +11,24 @@ drafter as an alternative draft source for the Qwen3.6 CUDA spec-decode path
 Verify/rollback substrate reused verbatim; baseline (spec off) byte-identical —
 taps cost one `Option` branch per layer.
 
-## Pending gates (H20)
+## Gate results (H20, GPU 1, binary @ 4b4e1905f, backbone-only z-lab)
 
-- Correctness: needle x3 + same-config-twice (correct-inference, not
-  byte-vs-baseline); acceptance sanity (wrong tap/layout ⇒ acceptance ≈ 0).
-- Perf A/B, OPD rollout shape (20–45K ctx, B=1, greedy): no-spec vs MTP-d2 vs
-  DSpark backbone-only (z-lab) vs +markov (AEON). Kill: ≤1.15× vs no-spec.
-- Known perf debt to re-measure: markov/confidence per-row H2D/D2H syncs,
-  80 attn launches per draft block.
+- **Correctness PASS**: load `mode=dflash-backbone block=16 taps=[1,16,31,46,61]`;
+  same-config-twice byte-identical; needle exact; spec-off output coherent.
+- **Acceptance real**: 2.79–5.41 tok/step (code prompts, greedy).
+- **Net perf LOSS**: dspark 11.2–18.5 tok/s vs no-spec 41.8–42.8 tok/s.
+  Step cost ~**250 ms/step constant** (249/251 ms across prompts) vs
+  23.4 ms/step no-spec — a fixed per-block cost, not acceptance-dependent.
+  Break-even needs ≤108 ms/step at the observed 4.63 tok/step.
 
-Checkpoints staged on pod: `/root/Qwen3.6-27B-DFlash` (backbone),
+## Next: attribute the 250 ms fixed cost
+
+Hypotheses to measure (env-gated phase log, ARLE_MTP_PHASE-style): draft-block
+per-row argmax D2H syncs (~15/step), 80 per-row attn launches/step, verify
+16-row eager forward, append_ctx feat path, per-step H2D uploads + `ctx.sync`.
+No conclusion until the phase table lands.
+
+Checkpoints on pod: `/root/Qwen3.6-27B-DFlash` (backbone, complete),
 `/root/dspark-aeon` (+markov), `/root/dspark-fr` (full DSpark, speculators
-format — needs conversion).
+format — convert with `scripts/convert_dspark_speculators.py`); fr/aeon
+downloads in flight.
