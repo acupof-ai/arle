@@ -1,0 +1,25 @@
+crates/infer-cuda/src/attention/kv_layout.rs
+  s_4b7198573dd014::t_6de9f7a4be3ea9 3,765-774,1243-1244,1504-1567,1583-1595,1604-1605,1621-1711,1748-1749,1755-1763,1768
+crates/infer-cuda/src/executor.rs
+  s_4b7198573dd014::t_5128a152519dd8 465,482-483,491-496,2495-2497,2548,2635-2644
+docs/experience/wins/2026-07-09-dsv4-route-a-flashmla-page-sharing.md
+  s_4b7198573dd014::t_59e82a74fcb4ad 1-67
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "1354650f7de9be28369cd1835ea0da35d6042385",
+  "prompts": {},
+  "sessions": {
+    "s_4b7198573dd014": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "92cc6785-573b-445c-9517-2aca75a48773",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
