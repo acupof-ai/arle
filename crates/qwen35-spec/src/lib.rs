@@ -1109,6 +1109,196 @@ impl Qwen35Config {
     }
 }
 
+/// Attention reach of one DSpark/DFlash draft layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DsparkLayerType {
+    Full,
+    /// Sliding-window attention; the window comes from `DsparkConfig::sliding_window`.
+    Sliding,
+}
+
+/// DSpark block-draft config, parsed from the DRAFT checkpoint dir's
+/// `config.json`. Covers both checkpoint flavors:
+/// - **DFlash** (z-lab): `dflash_config.{mask_token_id,target_layer_ids}`,
+///   same-position denoising — block rows `1..block_size` fill their OWN
+///   positions, so a block proposes `block_size - 1` draft tokens.
+/// - **DSpark** (DeepSpec): top-level `mask_token_id`/`target_layer_ids`,
+///   next-token labels — every block row predicts position+1, so a block
+///   proposes up to `block_size` draft tokens. Markov/confidence heads are
+///   detected from the safetensors, not the config.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DsparkConfig {
+    pub hidden_size: usize,
+    pub intermediate_size: usize,
+    pub num_hidden_layers: usize,
+    pub num_attention_heads: usize,
+    pub num_key_value_heads: usize,
+    pub head_dim: usize,
+    pub rms_norm_eps: f32,
+    pub rope_theta: f32,
+    pub sliding_window: usize,
+    pub layer_types: Vec<DsparkLayerType>,
+    pub block_size: usize,
+    pub mask_token_id: u32,
+    /// Trunk layers whose residual-stream OUTPUT is tapped (`-1` = the
+    /// embedding output, i.e. the residual stream before layer 0).
+    pub target_layer_ids: Vec<i64>,
+    /// `true` = DSpark next-token proposal; `false` = DFlash same-position.
+    pub next_token_heads: bool,
+}
+
+impl DsparkConfig {
+    pub fn from_dir(dir: impl AsRef<Path>) -> Result<Self> {
+        let content = fs::read_to_string(dir.as_ref().join("config.json"))?;
+        let v: serde_json::Value = serde_json::from_str(&content)?;
+        let usize_of = |name: &'static str| -> Result<usize> {
+            v.get(name)
+                .and_then(serde_json::Value::as_u64)
+                .map(|n| n as usize)
+                .ok_or(Qwen35ConfigError::InvalidConfig(name))
+        };
+        let f32_of = |name: &'static str, default: f32| -> f32 {
+            v.get(name)
+                .and_then(serde_json::Value::as_f64)
+                .map_or(default, |f| f as f32)
+        };
+        // DFlash nests mask/target ids under "dflash_config"; DSpark keeps them
+        // top-level. The nesting also selects the proposal convention.
+        let dflash = v.get("dflash_config").filter(|d| d.is_object());
+        let field = |name: &str| dflash.and_then(|d| d.get(name)).or_else(|| v.get(name));
+        let mask_token_id = field("mask_token_id")
+            .and_then(serde_json::Value::as_u64)
+            .map(|n| n as u32)
+            .ok_or(Qwen35ConfigError::InvalidConfig("mask_token_id"))?;
+        let target_layer_ids: Vec<i64> = field("target_layer_ids")
+            .and_then(serde_json::Value::as_array)
+            .map(|a| a.iter().filter_map(serde_json::Value::as_i64).collect())
+            .ok_or(Qwen35ConfigError::InvalidConfig("target_layer_ids"))?;
+        if target_layer_ids.is_empty() {
+            return Err(Qwen35ConfigError::InvalidConfig("empty target_layer_ids"));
+        }
+        let num_hidden_layers = usize_of("num_hidden_layers")?;
+        let layer_types = match v.get("layer_types").and_then(serde_json::Value::as_array) {
+            Some(a) => a
+                .iter()
+                .map(|t| match t.as_str() {
+                    Some("sliding_attention") => Ok(DsparkLayerType::Sliding),
+                    Some("full_attention") => Ok(DsparkLayerType::Full),
+                    _ => Err(Qwen35ConfigError::InvalidConfig("layer_types")),
+                })
+                .collect::<Result<Vec<_>>>()?,
+            None => vec![DsparkLayerType::Full; num_hidden_layers],
+        };
+        if layer_types.len() != num_hidden_layers {
+            return Err(Qwen35ConfigError::InvalidConfig(
+                "layer_types length != num_hidden_layers",
+            ));
+        }
+        Ok(Self {
+            hidden_size: usize_of("hidden_size")?,
+            intermediate_size: usize_of("intermediate_size")?,
+            num_hidden_layers,
+            num_attention_heads: usize_of("num_attention_heads")?,
+            num_key_value_heads: usize_of("num_key_value_heads")?,
+            head_dim: usize_of("head_dim")?,
+            rms_norm_eps: f32_of("rms_norm_eps", 1e-6),
+            rope_theta: f32_of("rope_theta", 1e7),
+            sliding_window: v
+                .get("sliding_window")
+                .and_then(serde_json::Value::as_u64)
+                .map_or(2048, |n| n as usize),
+            layer_types,
+            block_size: usize_of("block_size")?,
+            mask_token_id,
+            target_layer_ids,
+            next_token_heads: dflash.is_none(),
+        })
+    }
+
+    /// Draft tokens one block proposes: next-token heads draft from every block
+    /// row; same-position (DFlash) row 0 carries the already-known anchor.
+    #[must_use]
+    pub fn max_draft_tokens(&self) -> usize {
+        if self.next_token_heads {
+            self.block_size
+        } else {
+            self.block_size - 1
+        }
+    }
+}
+
+/// Tensor names of one DSpark draft decoder layer (standard Qwen3 layer shape).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DsparkLayerTensorNames {
+    pub q_proj: String,
+    pub k_proj: String,
+    pub v_proj: String,
+    pub o_proj: String,
+    pub q_norm: String,
+    pub k_norm: String,
+    pub input_layernorm: String,
+    pub post_attention_layernorm: String,
+    pub gate_proj: String,
+    pub up_proj: String,
+    pub down_proj: String,
+}
+
+/// DSpark draft checkpoint tensor names. `fc`/`hidden_norm`/`norm` + per-layer
+/// tensors are the always-present backbone; the markov + confidence entries
+/// name OPTIONAL heads (absent in z-lab DFlash checkpoints — probe with
+/// `has_tensor` before loading). Embeddings + lm_head are SHARED with the
+/// trunk and not listed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DsparkTensorNames {
+    pub fc: String,
+    pub hidden_norm: String,
+    pub norm: String,
+    pub markov_w1: String,
+    pub markov_w2: String,
+    /// Present only in gated/RNN markov variants — probed to fail closed
+    /// (vanilla w1/w2 is the only wired kind).
+    pub markov_gate_proj: String,
+    pub markov_joint_proj: String,
+    pub confidence_weight: String,
+    pub confidence_bias: String,
+    pub layers: Vec<DsparkLayerTensorNames>,
+}
+
+#[must_use]
+pub fn dspark_tensor_names(num_layers: usize) -> DsparkTensorNames {
+    let layers = (0..num_layers)
+        .map(|i| {
+            let attn = format!("layers.{i}.self_attn");
+            let mlp = format!("layers.{i}.mlp");
+            DsparkLayerTensorNames {
+                q_proj: format!("{attn}.q_proj.weight"),
+                k_proj: format!("{attn}.k_proj.weight"),
+                v_proj: format!("{attn}.v_proj.weight"),
+                o_proj: format!("{attn}.o_proj.weight"),
+                q_norm: format!("{attn}.q_norm.weight"),
+                k_norm: format!("{attn}.k_norm.weight"),
+                input_layernorm: format!("layers.{i}.input_layernorm.weight"),
+                post_attention_layernorm: format!("layers.{i}.post_attention_layernorm.weight"),
+                gate_proj: format!("{mlp}.gate_proj.weight"),
+                up_proj: format!("{mlp}.up_proj.weight"),
+                down_proj: format!("{mlp}.down_proj.weight"),
+            }
+        })
+        .collect();
+    DsparkTensorNames {
+        fc: "fc.weight".to_string(),
+        hidden_norm: "hidden_norm.weight".to_string(),
+        norm: "norm.weight".to_string(),
+        markov_w1: "markov_head.markov_w1.weight".to_string(),
+        markov_w2: "markov_head.markov_w2.weight".to_string(),
+        markov_gate_proj: "markov_head.gate_proj.weight".to_string(),
+        markov_joint_proj: "markov_head.joint_proj.weight".to_string(),
+        confidence_weight: "confidence_head.proj.weight".to_string(),
+        confidence_bias: "confidence_head.proj.bias".to_string(),
+        layers,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
