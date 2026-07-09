@@ -208,15 +208,11 @@ impl Dsv4FlashMlaDecodeState {
             device_page_table: ctx.stream.alloc_zeros::<i32>(shape.total_blocks)?,
         };
         state.init_constant_sched_meta(ctx)?;
-        // NOT refreshed here: at slot-pool construction the host page table is
-        // legitimately EMPTY (band drawn on first admission, see #85 P2 Stage B
-        // above), so it can never match `device_page_table`'s fixed
-        // `shape.total_blocks` length — calling refresh here made every slot's
-        // `ensure!` fail 100% of the time at engine startup. The zeroed
-        // `alloc_zeros` placeholder is safe until the first real band draw
-        // (`Dsv4SlotState::refresh_flashmla_device_page_tables`, called right
-        // after the slot's first prefill row's `prepare_kv_batch`); FlashMLA
-        // kernels never read this buffer before that point.
+        // NOT refreshed here: at construction the host page table is
+        // legitimately EMPTY (band drawn on first admission, #85 P2 Stage B).
+        // The zeroed placeholder is safe — FlashMLA kernels never read this
+        // buffer before the first band mirror marks the slot dirty and the
+        // executor's dirty-driven refresh fills it.
         Ok(state)
     }
 
@@ -257,10 +253,11 @@ impl Dsv4FlashMlaDecodeState {
         Ok(())
     }
 
-    /// Re-sync the persistent device page table from the host page table.
-    /// Required after `mirror_restore_pages` (prefix-cache restore) changes the
-    /// host table; otherwise the CUDA-graph-captured kernel arg would point to
-    /// a stale table (#8).
+    /// Re-sync the persistent device page table from the host page table —
+    /// the CUDA-graph-captured kernel arg points at this fixed buffer, so a
+    /// stale copy reads garbage. Dirty-bit driven (#154 Phase 0:
+    /// `Dsv4KvAdapter::take_device_table_dirty`), plus the whole-slot promote
+    /// path after `mirror_restore_pages` rewrites the host table.
     pub(super) fn refresh_device_page_table(
         &mut self,
         ctx: &DeviceContext,
