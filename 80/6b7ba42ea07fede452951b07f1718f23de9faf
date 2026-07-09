@@ -1,0 +1,31 @@
+crates/cuda-kernels/src/paged_kv.rs
+  s_764555636edde6::t_2d3979fef5badd 771-804
+crates/infer-cuda/src/attention/kv_layout.rs
+  s_1f8becb9d0f231::t_96cfb874e2b082 380,435-441
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "806b7ba42ea07fede452951b07f1718f23de9faf",
+  "prompts": {},
+  "sessions": {
+    "s_1f8becb9d0f231": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f4942-8f61-7743-bf25-4bb3410e3cf0",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_764555636edde6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-af7dae10a760f74ef",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
