@@ -1,0 +1,53 @@
+crates/infer-cuda/src/executor.rs
+  s_4b7198573dd014::t_0f71786b28111c 198-199,206,215,3535-3538,3701-3705,3846-3850,3910,3927-3930,3939-3965,4058,4344-4348,4470,4479-4497,4505-4528,4584-4815,5218-5222,5266-5273,5322-5329
+crates/cli/src/args.rs
+  s_4b7198573dd014::t_3fc6a9111b0586 684-685,698-699,788-790
+crates/cli/src/serve.rs
+  s_dae527a3fc10d3::t_8a9d65df55b539 265,270-280,372-377,401,1257,1260
+crates/infer-api/src/loaded.rs
+  s_dae527a3fc10d3::t_2bc378b5b9ba81 119-123,173,1817-1822,1844
+crates/infer-api/src/serve.rs
+  s_dae527a3fc10d3::t_00766a60763129 149-151,161,218-223,227,238-245
+crates/infer-cuda/src/lib.rs
+  s_dae527a3fc10d3::t_b2bd9f0d4e71b3 304-305,313,323
+crates/infer-cuda/src/qwen35.rs
+  s_dae527a3fc10d3::t_ab71bf43ab9a54 64-66,3013,3030,3050,3095,3138-3141,3280-3283,3328-3347,3355,3491,3627
+crates/infer-cuda/src/qwen35/dspark.rs
+  s_9c91b86ec3fb55::t_2b760999d6e578 1-987
+docs/plans/2026-07-09-dspark-dflash-spec-decode-qwen36.md
+  s_9c91b86ec3fb55::t_6553f49bb74386 67-78,80-82,84-88,90-98
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "dd79c713e688dccb4e947aaf1cbae1469b105881",
+  "prompts": {},
+  "sessions": {
+    "s_4b7198573dd014": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "92cc6785-573b-445c-9517-2aca75a48773",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_9c91b86ec3fb55": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4779911a-69b7-49db-bc83-daf5a48d6ca3",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_dae527a3fc10d3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a84c3a2953f785dfc",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
