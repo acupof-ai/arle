@@ -462,7 +462,7 @@ impl RealCudaExecutor {
     ) -> Result<()> {
         match self {
             Self::Qwen35(q) => q.restore_recurrent_sidecar(slot, tokens, matched_len, prefix_pages),
-            Self::Dsv4(d) => d.restore_route_a_prefix_state(slot, matched_len),
+            Self::Dsv4(d) => d.restore_route_a_prefix_state(slot, matched_len, prefix_pages),
             Self::Qwen(_) => Ok(()),
         }
     }
@@ -479,7 +479,8 @@ impl RealCudaExecutor {
     ) -> Result<()> {
         match self {
             Self::Qwen35(q) => q.save_recurrent_sidecar(slot, tokens, matched_len, prefix_pages),
-            Self::Dsv4(_) | Self::Qwen(_) => Ok(()),
+            Self::Dsv4(d) => d.kv_adapter.retain_flashmla_pages(prefix_pages),
+            Self::Qwen(_) => Ok(()),
         }
     }
 
@@ -487,8 +488,12 @@ impl RealCudaExecutor {
     /// them (eviction rides the radix, no independent sidecar LRU). Qwen3.5/3.6
     /// hybrid only; other arms hold no per-page mirror below the seam.
     pub(crate) fn release_prefix_pages(&mut self, pages: &[u32]) {
-        if let Self::Qwen35(q) = self {
-            q.release_sidecar_pages(pages);
+        match self {
+            Self::Qwen35(q) => q.release_sidecar_pages(pages),
+            Self::Dsv4(d) => {
+                let _ = d.kv_adapter.release_flashmla_pages(pages);
+            }
+            Self::Qwen(_) => {}
         }
     }
 
@@ -2487,6 +2492,9 @@ impl Dsv4CudaExecutor {
     /// compress-state/dsa checks but aren't ring-aligned keep the scan going
     /// without advancing the commit point.
     pub(crate) fn reusable_prefix_blocks(&self, blocks: &[PrefixBlock]) -> usize {
+        if !self.kv_adapter.supports_flashmla_page_sharing() {
+            return 0;
+        }
         let Some(kv_page_size) = self.kv_adapter.flashmla_page_size() else {
             return 0;
         };
@@ -2537,6 +2545,7 @@ impl Dsv4CudaExecutor {
         &mut self,
         slot: usize,
         matched_len: usize,
+        prefix_pages: &[u32],
     ) -> Result<()> {
         let ctx = self.model.ctx.clone();
         if matched_len >= DSV4_COMPRESS_STATE_RATIO {
@@ -2622,6 +2631,16 @@ impl Dsv4CudaExecutor {
                     .sw_window_cache_mut();
                 pool.restore_into_ring(&ctx, ring, block_index)?;
             }
+        }
+        // Attach FlashMLA KV pages via host→FlashMLA mapping so decode reads
+        // the shared physical pages instead of fresh identity-mapped ones.
+        if !prefix_pages.is_empty() {
+            self.kv_adapter
+                .attach_slot_flashmla_pages(slot, prefix_pages, matched_len)?;
+            self.slots
+                .get_mut(slot)
+                .ok_or_else(|| anyhow!("DSv4 Route A restore: slot {slot} outside range"))?
+                .refresh_flashmla_device_page_tables(&ctx, &self.kv_adapter)?;
         }
         self.slots
             .get_mut(slot)
