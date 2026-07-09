@@ -87,6 +87,26 @@ the exact reported draft distribution (incl. Markov bias) — required for the
 rollout lane regardless of drafter. Gate: rollout-lane A/B inside a real OPD
 round (tok/s + pass-rate unchanged).
 
+### P2.5 — Prefix-restore partial-ctx drafting (OPD-decisive)
+Prefix-cache-hit requests silently degrade to plain decode: after restore the
+draft ctx has a gap, so `executor.rs` never re-seeds `pending`
+(`df.ctx_len == row.start_pos` fails, then `ctx_len == total_tokens` fails).
+At OPD's ~91% hit rate DSpark is near-inert in the rollout lane until fixed.
+Draft = 4× sliding(2048) + 1× full_attention (measured, DFlash config), so a
+suffix-only ctx is exact for the sliding layers once the tail ≥ window and
+approximate only for the full layer. Cheapest-first:
+
+1. **Partial-ctx (this phase)** — `Qwen35DsparkSlotState.ctx_base` absolute
+   offset; draft attn `lo = max(ctx_base, …)`, buffer index = abs − base
+   (RoPE already keyed to absolute positions); prefill gate resets the ctx at
+   `start_pos` on gap instead of bailing; `pending` requires
+   `ctx_end == total_tokens`, not coverage from 0. No flag — activates only
+   where today's path degrades to plain. Gate: per-chain accept counter split
+   by `ctx_base>0` vs `==0`; accept collapsing toward ~1/16 (verify overhead
+   eats the win) → KILL, go to 2.
+2. **Fallback: sidecar the draft ctx K/V** (exact, ~61 KB/token, roughly
+   doubles sidecar) — only if 1 kills.
+
 ### P3 — Train our DSpark heads (DeepSpec, warm-start z-lab backbone)
 No public DSpark checkpoint exists for Qwen3.6-27B; the Markov + confidence
 heads must be trained. DeepSpec `Qwen3DSparkTrainer`, backbone warm-started
