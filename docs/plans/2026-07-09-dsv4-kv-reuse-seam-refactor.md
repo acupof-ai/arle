@@ -50,9 +50,39 @@ pad-with-last-real device-format convention is safe: a page is real in the
 host table (and the refreshed device table) before any kernel launch that
 can touch it.
 
+**Phase 0b — identity contract (restore-path review findings, 2026-07-09,
+full table in #154).** The dirty-bit fixes coherence; the review found the
+pool/mapping DESIGN also violates identity:
+
+- **D1 (top)**: `Dsv4CompressStatePool` keys by absolute block index with
+  NO content identity, and the live kernel routes `prev_overlap` through
+  the shared pool whenever it exists (`attention.rs:7698-7714`) — two
+  concurrent different-content requests clobber each other. SGLang keys by
+  swa-page identity (radix-allocated = content-bearing); the port dropped
+  that half. Immediate fix: live path back to per-slot registers (stride 0),
+  pool becomes restore-only storage; durable fix: key the pool by the KV
+  page id the block belongs to (content identity via the radix), not by
+  position.
+- **D2**: `host_to_flashmla` entries never die without radix eviction —
+  recycled host page ids resolve to dead requests' physical bands.
+  Lifecycle: remove on host-page free, not only on radix evict; assert
+  owner-slot on resolve.
+- **D3**: `claim_mirrored_page` ignores `page_ref_count` — a published
+  prefix's physical pages can be zeroed/overwritten by a fresh slot while
+  resident bits still advertise the boundary. Claim must respect published
+  (`ref_count>0`) pages.
+- **D4**: engine pop-trim (`prefix.rs:72-75`) runs AFTER
+  `clamp_prefix_to_backend`, un-aligning `matched_len` → SW-ring restore
+  silently skipped. Trim before clamp, and make the executor's alignment
+  predicate a hard error, not a silent skip.
+- **Restore completeness** (A2/A10+B1-B3/A14/A15/A16/A17): every ③ item in
+  the #154 table gets disposition ① or ② with evidence — the same
+  full-enumeration bar as the DSv4 EAGLE rollback anchor.
+
 Gate: pod needle sweep — pt=462 solo ×15 must return to the `943bacda`
-baseline (0/15 miss, byte-identical outputs), plus n=2 ×30 clean of the
-`738.` signature.
+baseline (0/15 miss, byte-identical outputs), cache-on AND
+`ARLE_DISABLE_PREFIX_CACHE=1`, plus a concurrent n≥2 unique-content sweep
+clean of both signature classes (D1 kill-test arm included).
 
 ## Phase 1 — `mirror_band` churn deletion
 
