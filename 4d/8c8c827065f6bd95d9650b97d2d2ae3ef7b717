@@ -1,0 +1,43 @@
+crates/autograd/src/lib.rs
+  s_94ce5908b6c7bb::t_964f2eab335119 19-22
+crates/autograd/src/runtime_flags.rs
+  s_94ce5908b6c7bb::t_5177081bfaafee 1-98
+crates/infer-metal/src/lib.rs
+  s_94ce5908b6c7bb::t_43aeca65f0aa6e 13-16
+crates/infer-metal/src/runtime_flags.rs
+  s_94ce5908b6c7bb::t_d6b1e57ef5d290 1-42
+crates/infer-seam/src/lib.rs
+  s_019214967d126e::t_44dddd736e57ea 35-36,51
+crates/infer-seam/src/runtime_flags.rs
+  s_94ce5908b6c7bb::t_17fab05791a755 1-185
+crates/train/src/lib.rs
+  s_94ce5908b6c7bb::t_b77a40d383ed0b 55-58
+crates/train/src/runtime_flags.rs
+  s_94ce5908b6c7bb::t_9c1be3cbcced4f 1-99
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "4d8c8c827065f6bd95d9650b97d2d2ae3ef7b717",
+  "prompts": {},
+  "sessions": {
+    "s_019214967d126e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aa50035bcd677a837",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_94ce5908b6c7bb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a8744832334b16ddb",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
