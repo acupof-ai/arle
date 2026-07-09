@@ -107,10 +107,7 @@ fn qwen_quant_profile_enabled() -> bool {
 fn qwen_fp8_deepgemm_dense_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        if matches!(
-            std::env::var("ARLE_QWEN35_DEEPGEMM").as_deref(),
-            Ok("0" | "false" | "FALSE" | "no" | "off" | "OFF")
-        ) {
+        if !crate::runtime_flags::qwen35_deepgemm() {
             return false;
         }
         match cuda_moe::dsv4_deepgemm_native_preflight() {

@@ -1587,30 +1587,18 @@ pub(crate) fn dsv4_flashmla_decode_enabled() -> Result<bool> {
         DSV4_FLASHMLA_OVERRIDE_ON => return Ok(true),
         _ => {}
     }
-    // Runtime A/B gate (documented in environment.md; the serve-side knob the
-    // #138 lane isolation needs): `ARLE_DSV4_FLASHMLA_DECODE=0` forces the eager
-    // dsv4_swa/hybrid fallback kernels, `=1` forces on (still compile-gated),
-    // unset keeps the default below. Read once — hot path (per layer per token).
-    static ENV_GATE: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
-    if let Some(forced) = ENV_GATE.get_or_init(|| {
-        std::env::var("ARLE_DSV4_FLASHMLA_DECODE")
-            .ok()
-            .and_then(|v| match v.as_str() {
-                "0" | "false" | "off" => Some(false),
-                "1" | "true" | "on" => Some(true),
-                _ => None,
-            })
-    }) {
-        return Ok(*forced && cuda_kernels::HAS_FLASHMLA);
-    }
+    // Runtime A/B gate (the serve-side knob the #138 lane isolation needs):
+    // `--dsv4-flashmla-decode false` forces the eager dsv4_swa/hybrid fallback
+    // kernels, `true` forces on (still compile-gated in apply_runtime_flags),
+    // unset keeps the default below.
     // Default ON: FlashMLA SM90 sparse decode is the adopted decode attention — the
     // same vendored kernel SGLang uses. Licensed 2026-06-06 on the TP=8/EP=8 pod:
     // 64-tok resident same-load A/B token-exact vs scalar, 29.47 -> 36.59 tok/s
     // (+24%). `dsv4_flashmla_decode_alloc_enabled` falls through to this, so the
     // arena allocates under the default. Compile-gated via `cuda_kernels::HAS_FLASHMLA`
     // (build.rs sets it from `enable_flashmla`); a build without the FlashMLA kernels
-    // reports false and falls back to scalar — no env var. The AtomicI8 override
-    // above stays for tests/A-B.
+    // reports false and falls back to scalar. The AtomicI8 override above also
+    // serves tests/A-B.
     Ok(cuda_kernels::HAS_FLASHMLA)
 }
 
@@ -1748,7 +1736,7 @@ pub(crate) fn dsv4_flashmla_slot_pages(
 
 /// Whether the FlashMLA shared-band pool is built at all. This is a compile-
 /// time question (does the arena exist), not the runtime kernel-choice
-/// question `dsv4_flashmla_decode_enabled` answers — `ARLE_DSV4_FLASHMLA_DECODE=0`
+/// question `dsv4_flashmla_decode_enabled` answers — `--dsv4-flashmla-decode false`
 /// (picking the scalar kernel for an A/B or a correctness reference) must NOT
 /// also zero the pool's page budget, since the scalar kernel still reads the
 /// same compressed/sliding-window layout (pod-verified 2026-07-06: the
@@ -4441,10 +4429,10 @@ pub(crate) fn mla_attention_decode_graph(
     if mode == DeepSeekV4AttentionMode::SlidingWindow {
         let flashmla_used = if dsv4_flashmla_decode_enabled()? {
             let flash = state.flashmla.as_mut().ok_or_else(|| {
-                anyhow!("ARLE_DSV4_FLASHMLA_DECODE=1 but layer state has no FlashMLA arena")
+                anyhow!("FlashMLA decode enabled but layer state has no FlashMLA arena")
             })?;
             let flash_scratch = flashmla_scratch.ok_or_else(|| {
-                anyhow!("ARLE_DSV4_FLASHMLA_DECODE=1 but shared FlashMLA decode scratch missing")
+                anyhow!("FlashMLA decode enabled but shared FlashMLA decode scratch missing")
             })?;
             try_flashmla_decode_attention(
                 ctx,
@@ -4540,10 +4528,10 @@ pub(crate) fn mla_attention_decode_graph(
         };
         let flashmla_used = if dsv4_flashmla_decode_enabled()? {
             let flash = state.flashmla.as_mut().ok_or_else(|| {
-                anyhow!("ARLE_DSV4_FLASHMLA_DECODE=1 but layer state has no FlashMLA arena")
+                anyhow!("FlashMLA decode enabled but layer state has no FlashMLA arena")
             })?;
             let flash_scratch = flashmla_scratch.ok_or_else(|| {
-                anyhow!("ARLE_DSV4_FLASHMLA_DECODE=1 but shared FlashMLA decode scratch missing")
+                anyhow!("FlashMLA decode enabled but shared FlashMLA decode scratch missing")
             })?;
             try_flashmla_decode_attention(
                 ctx,
@@ -6174,12 +6162,10 @@ fn mla_attention_fwd(
         } else {
             let flashmla_used = if dsv4_flashmla_decode_enabled()? {
                 let flash = state.flashmla.as_mut().ok_or_else(|| {
-                    anyhow!("ARLE_DSV4_FLASHMLA_DECODE=1 but layer state has no FlashMLA arena")
+                    anyhow!("FlashMLA decode enabled but layer state has no FlashMLA arena")
                 })?;
                 let scratch = flashmla_scratch.ok_or_else(|| {
-                    anyhow!(
-                        "ARLE_DSV4_FLASHMLA_DECODE=1 but shared FlashMLA decode scratch missing"
-                    )
+                    anyhow!("FlashMLA decode enabled but shared FlashMLA decode scratch missing")
                 })?;
                 try_flashmla_decode_attention(
                     ctx,
@@ -6343,10 +6329,10 @@ fn mla_attention_fwd(
             bail!("DSv4 chain verify requires the FlashMLA sparse prefill path");
         } else if dsv4_flashmla_decode_enabled()? {
             let flash = state.flashmla.as_mut().ok_or_else(|| {
-                anyhow!("ARLE_DSV4_FLASHMLA_DECODE=1 but layer state has no FlashMLA arena")
+                anyhow!("FlashMLA decode enabled but layer state has no FlashMLA arena")
             })?;
             let scratch = flashmla_scratch.ok_or_else(|| {
-                anyhow!("ARLE_DSV4_FLASHMLA_DECODE=1 but shared FlashMLA decode scratch missing")
+                anyhow!("FlashMLA decode enabled but shared FlashMLA decode scratch missing")
             })?;
             try_flashmla_decode_attention(
                 ctx,

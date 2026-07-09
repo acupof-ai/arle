@@ -245,10 +245,7 @@ mod real {
     ) -> Result<VariantResult> {
         set_dsv4_flashmla_decode_override(Some(variant.flashmla));
         set_dsv4_fused_wqkv_decode_override(Some(variant.fused_wqkv));
-        set_env_var(
-            "ARLE_DSV4_MOE_CONTIG_DECODE",
-            if variant.contig_moe { "1" } else { "0" },
-        );
+        infer_cuda::set_dsv4_moe_contig_decode(variant.contig_moe);
         set_env_var("INFER_DSV4_AB_CURRENT_VARIANT", variant.name);
         reset_dsv4_linear_profile();
         reset_dsv4_stage_profile();

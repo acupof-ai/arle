@@ -2061,7 +2061,7 @@ fn main() {
             // CPU-side decode scheduler. 4 model×head instantiations
             // (MODEL1×{64,128}, V32×{64,128}) + combine + sched-meta kernel.
             // Requires CUDA headers with __nv_fp8_e8m0 and is runtime-gated by
-            // ARLE_DSV4_FLASHMLA_DECODE, default OFF.
+            // --dsv4-flashmla-decode, default OFF.
             let decode_sparse_fp8 = flashmla_root.join("csrc/sm90/decode/sparse_fp8");
             for entry in [
                 "instantiations/model1_persistent_h64.cu",

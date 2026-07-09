@@ -8,18 +8,15 @@
 //! disjoint core slice of its GPU's NUMA node removes the scheduler-placement
 //! lottery (the documented ±6% session drift is the same lottery).
 //!
-//! Default ON for multi-rank CUDA workers; `ARLE_NUMA_PIN=0` opts out. Every
+//! Default ON for multi-rank CUDA workers; `--numa-pin false` opts out. Every
 //! decision is logged loudly; ANY failure leaves the process unpinned and
 //! boots normally (pinning is never load-bearing for correctness).
 
 #[cfg(target_os = "linux")]
 #[cfg_attr(not(feature = "nccl"), allow(dead_code))]
 pub(crate) fn pin_to_gpu_numa(ordinal: usize, world_size: usize) {
-    if matches!(
-        std::env::var("ARLE_NUMA_PIN").as_deref(),
-        Ok("0" | "false" | "FALSE" | "off" | "OFF" | "no" | "NO")
-    ) {
-        log::info!("[numa-pin] disabled via ARLE_NUMA_PIN=0");
+    if !crate::runtime_flags::numa_pin() {
+        log::info!("[numa-pin] disabled via --numa-pin false");
         return;
     }
     match try_pin(ordinal, world_size) {
