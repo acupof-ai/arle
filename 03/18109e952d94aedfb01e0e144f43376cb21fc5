@@ -1,0 +1,69 @@
+crates/agent-bench/src/lib.rs
+  s_94ce5908b6c7bb::t_1adf3244578dc8 1050-1052,1071,1246,1248,1262,1289,1491
+crates/cuda-kernels/build.rs
+  s_94ce5908b6c7bb::t_3b012ca78ff2d9 2064
+crates/cuda-kernels/src/ffi/misc.rs
+  s_94ce5908b6c7bb::t_bcb0dc7320ecc2 598
+crates/cuda-kernels/src/tensor.rs
+  s_019214967d126e::t_45bf8a6394159d 309-322,324,362-365
+crates/cuda-kernels/src/tilelang.rs
+  s_019214967d126e::t_366bad545caf31 92-99,101
+crates/infer-cuda/examples/dsv4_resident_ab.rs
+  s_94ce5908b6c7bb::t_6f2116411b416d 248
+crates/infer-cuda/src/attention.rs
+  s_94ce5908b6c7bb::t_8b7bcd84296ed9 1590-1593,1600-1601,1739,4432,4435,4531,4534,6165,6168,6332,6335
+crates/infer-cuda/src/attention/dsa.rs
+  s_94ce5908b6c7bb::t_71022a375985ac 202
+crates/infer-cuda/src/deepep.rs
+  s_94ce5908b6c7bb::t_02637e0effd08e 128-130,132-137,325
+crates/infer-cuda/src/executor.rs
+  s_94ce5908b6c7bb::t_307dfd19558fc3 51-55,59-62,67-69,71,264,1445,1468,1825,3231,3237,3245,3251,3310,4181,5456
+crates/infer-cuda/src/executor/spec_decode.rs
+  s_94ce5908b6c7bb::t_bbc2cb3258ee83 42-45,47,52,56,556
+crates/infer-cuda/src/loader.rs
+  s_94ce5908b6c7bb::t_e641f45bb99b15 733,4520,4539
+crates/infer-cuda/src/moe.rs
+  s_4570086626aeb6::t_bba9cf005f6710 7,15,28,147,159,163,166,169,177,311,444,448,528,632,817,1074,1194,2645,2805
+crates/infer-cuda/src/numa_pin.rs
+  s_94ce5908b6c7bb::t_eb66fb7ea3eef9 11,18-19
+crates/infer-cuda/src/ops/quant_linear.rs
+  s_94ce5908b6c7bb::t_009c83f5d543cf 110
+crates/infer-cuda/src/qwen35.rs
+  s_4570086626aeb6::t_b53625c51b3e6c 79,138,146,161,168,171,173,183,186,196,1203,1208,1246,3490,5788,6569
+crates/infer-cuda/src/tp.rs
+  s_94ce5908b6c7bb::t_7dcede4af006e7 100,306-308,311-313
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "0318109e952d94aedfb01e0e144f43376cb21fc5",
+  "prompts": {},
+  "sessions": {
+    "s_019214967d126e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aa50035bcd677a837",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_4570086626aeb6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a90bd27a83f68583d",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_94ce5908b6c7bb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a8744832334b16ddb",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
