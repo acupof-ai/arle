@@ -1598,11 +1598,11 @@ impl Dsv4KvAdapter {
     /// Called from `save_prefix_sidecar` when the engine publishes a prefix.
     pub(crate) fn retain_flashmla_pages(&mut self, host_pages: &[u32]) -> Result<()> {
         for layer_idx in 0..self.layers.len() {
-            let Some(pool) = self.layers[layer_idx].flashmla_kv_pool.as_mut() else {
-                continue;
-            };
             let pages = self.resolve_layer_pages(host_pages, layer_idx);
-            if !pages.is_empty() {
+            if pages.is_empty() {
+                continue;
+            }
+            if let Some(pool) = self.layers[layer_idx].flashmla_kv_pool.as_mut() {
                 pool.retain_pages(&pages)?;
             }
         }
@@ -1613,11 +1613,11 @@ impl Dsv4KvAdapter {
     /// Called from `release_prefix_pages` when the radix evicts a prefix.
     pub(crate) fn release_flashmla_pages(&mut self, host_pages: &[u32]) -> Result<()> {
         for layer_idx in 0..self.layers.len() {
-            let Some(pool) = self.layers[layer_idx].flashmla_kv_pool.as_mut() else {
-                continue;
-            };
             let pages = self.resolve_layer_pages(host_pages, layer_idx);
-            if !pages.is_empty() {
+            if pages.is_empty() {
+                continue;
+            }
+            if let Some(pool) = self.layers[layer_idx].flashmla_kv_pool.as_mut() {
                 pool.release_pages(&pages)?;
             }
         }
@@ -1657,10 +1657,10 @@ impl Dsv4KvAdapter {
             );
         }
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
+            let lsp = layer.flashmla_slot_pages();
             let Some(pool) = layer.flashmla_kv_pool.as_mut() else {
                 continue;
             };
-            let lsp = layer.flashmla_slot_pages();
             let n = lsp.min(host_pages.len());
             pool.mirror_band(slot, &per_layer_pages[layer_idx][..n], token_count)?;
         }
