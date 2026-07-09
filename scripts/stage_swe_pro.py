@@ -188,7 +188,9 @@ def clone_at_commit(repo, sha, dest):
     for cmd in (["git", "init", "-q"],
                 ["git", "remote", "add", "origin", url],
                 ["git", "fetch", "-q", "--depth", "1", "origin", sha],
-                ["git", "checkout", "-q", sha]):
+                # FETCH_HEAD works for both a sha and a branch ref (SWE-smith
+                # rows carry the instance branch, which has no local ref).
+                ["git", "checkout", "-q", "FETCH_HEAD"]):
         r = run(cmd, dest, timeout=SETUP_TIMEOUT)
         if r.returncode != 0:
             return f"{' '.join(cmd[:3])} rc={r.returncode}: {r.stderr.strip()[:200]}"
