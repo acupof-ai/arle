@@ -157,6 +157,11 @@ pub(crate) const TIER_NS_SHIFT: u32 = 56;
 pub(crate) const CHUNK_IDX_BITS: u32 = 16;
 /// Canonical chunk/page size for whole-slot blob stores (DSv4 + Qwen3.6).
 pub(crate) const BLOB_CHUNK_BYTES: usize = 16 << 20;
+/// DSv4 cross-request prefix-state entries (key = host page id) — the
+/// content-keyed per-page pool (#154 Phase 2, `attention/prefix_state.rs`).
+/// Registry note: NS 1-4 (slot park + sidecar) live in `executor.rs`.
+#[allow(dead_code)] // wired by the publish executor commit in this series
+pub(crate) const NS_PREFIX_STATE: u64 = 5;
 
 pub(crate) fn tier_key(ns: u64, sub: u64) -> u64 {
     debug_assert!(
