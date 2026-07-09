@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Generate the synthetic agent-OPD bug-fix corpus (SWE-bench-Pro schema).
 
-36 distinct single-bug tasks over small self-contained Python packages —
-12 train / 24 eval, split by FUNCTION (no eval function ever appears in
+60 distinct single-bug tasks over small self-contained Python packages —
+20 train / 40 eval, split by FUNCTION (no eval function ever appears in
 train), so the held-out pass-rate measures behavior-level generalization
-(locate → minimal edit → hidden tests pass), not memorization.
+(locate → minimal edit → hidden tests pass), not memorization. All content
+is plain business/data-processing — the opd_security_filter gate keeps
+security offense/defense wording out of every statement and staged tree.
 
 Each task emits:
   - a staged repo tree under  <out>/staged/<instance_id>/   (plain files;
@@ -38,6 +40,9 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from opd_security_filter import is_security_flagged  # noqa: E402
 
 # --------------------------------------------------------------------------
 # Task pool. Each entry: slug, module, archetype, split, buggy, gold, extra
@@ -948,6 +953,625 @@ TASKS = [
         "show raw asterisks.\n\nRepro:\n>>> bold(\"**a** and **b**\")\n"
         "'<b>a</b> and **b**'   # expected: '<b>a</b> and <b>b</b>'",
     ),
+    # ------- expansion 2026-07-10: 8 new archetypes, 8 train / 16 eval -------
+    dict(
+        slug="sales-range",
+        module="salesrange",
+        archetype="range-end-exclusive",
+        split="train",
+        buggy="def total_for_days(sales, first, last):\n"
+        '    """Total sales for day numbers first..last inclusive."""\n'
+        "    return sum(sales.get(d, 0) for d in range(first, last))\n",
+        gold="def total_for_days(sales, first, last):\n"
+        '    """Total sales for day numbers first..last inclusive."""\n'
+        "    return sum(sales.get(d, 0) for d in range(first, last + 1))\n",
+        extra="def best_day(sales):\n"
+        '    """Day number with the highest sales."""\n'
+        "    return max(sales, key=sales.get)\n",
+        test="from salesrange import total_for_days\n\n\n"
+        "def test_inclusive_range():\n"
+        "    assert total_for_days({1: 10, 2: 20, 3: 30}, 1, 3) == 60\n\n\n"
+        "def test_single_day():\n"
+        "    assert total_for_days({5: 7}, 5, 5) == 7\n",
+        statement="Range totals always miss the final day, and a single-day "
+        "report totals zero.\n\nRepro:\n"
+        ">>> total_for_days({1: 10, 2: 20, 3: 30}, 1, 3)\n"
+        "30   # expected: 60",
+    ),
+    dict(
+        slug="slots-hourly",
+        module="slots",
+        archetype="range-end-exclusive",
+        split="eval",
+        buggy="def hourly_slots(start, end):\n"
+        '    """Whole-hour slot labels from start to end inclusive."""\n'
+        "    return [f\"{h:02d}:00\" for h in range(start, end)]\n",
+        gold="def hourly_slots(start, end):\n"
+        '    """Whole-hour slot labels from start to end inclusive."""\n'
+        "    return [f\"{h:02d}:00\" for h in range(start, end + 1)]\n",
+        extra="def slot_label(hour):\n"
+        '    """HH:00 label for an hour."""\n'
+        "    return f\"{hour:02d}:00\"\n",
+        test="from slots import hourly_slots\n\n\n"
+        "def test_end_hour_included():\n"
+        "    assert hourly_slots(9, 11) == [\"09:00\", \"10:00\", \"11:00\"]\n\n\n"
+        "def test_single_hour():\n"
+        "    assert hourly_slots(14, 14) == [\"14:00\"]\n",
+        statement="The last bookable hour never appears in the picker, and a "
+        "one-hour window shows no slots at all.\n\nRepro:\n"
+        ">>> hourly_slots(9, 11)\n"
+        "['09:00', '10:00']   # expected: ['09:00', '10:00', '11:00']",
+    ),
+    dict(
+        slug="report-weeks",
+        module="weeks",
+        archetype="range-end-exclusive",
+        split="eval",
+        buggy="def week_numbers(n):\n"
+        '    """Week numbers 1..n covered by an n-week report."""\n'
+        "    return list(range(1, n))\n",
+        gold="def week_numbers(n):\n"
+        '    """Week numbers 1..n covered by an n-week report."""\n'
+        "    return list(range(1, n + 1))\n",
+        extra="def week_label(w):\n"
+        '    """Display label for a week number."""\n'
+        "    return f\"Week {w}\"\n",
+        test="from weeks import week_numbers\n\n\n"
+        "def test_final_week_included():\n"
+        "    assert week_numbers(3) == [1, 2, 3]\n\n\n"
+        "def test_one_week_report():\n"
+        "    assert week_numbers(1) == [1]\n",
+        statement="Every report is one week short: the final week is missing "
+        "and a 1-week report comes out empty.\n\nRepro:\n"
+        ">>> week_numbers(3)\n[1, 2]   # expected: [1, 2, 3]",
+    ),
+    dict(
+        slug="inv-onhand",
+        module="onhand",
+        archetype="wrong-dict-default",
+        split="train",
+        buggy="def on_hand(inventory, sku):\n"
+        '    """Units in stock for a SKU; 0 when the SKU is unknown."""\n'
+        "    return inventory.get(sku, 1)\n",
+        gold="def on_hand(inventory, sku):\n"
+        '    """Units in stock for a SKU; 0 when the SKU is unknown."""\n'
+        "    return inventory.get(sku, 0)\n",
+        extra="def in_stock(inventory, sku):\n"
+        '    """True when at least one unit is on hand."""\n'
+        "    return on_hand(inventory, sku) > 0\n",
+        test="from onhand import on_hand\n\n\n"
+        "def test_unknown_sku_is_zero():\n"
+        "    assert on_hand({}, \"A1\") == 0\n\n\n"
+        "def test_known_sku_count():\n"
+        "    assert on_hand({\"B2\": 5}, \"B2\") == 5\n",
+        statement="SKUs that were never stocked report one unit on hand, so "
+        "sold-out items keep selling.\n\nRepro:\n"
+        ">>> on_hand({}, \"A1\")\n1   # expected: 0",
+    ),
+    dict(
+        slug="votes-tally",
+        module="votes",
+        archetype="wrong-dict-default",
+        split="eval",
+        buggy="def tally_votes(ballots):\n"
+        '    """Vote counts per candidate."""\n'
+        "    counts = {}\n"
+        "    for name in ballots:\n"
+        "        counts[name] = counts.get(name, 1) + 1\n"
+        "    return counts\n",
+        gold="def tally_votes(ballots):\n"
+        '    """Vote counts per candidate."""\n'
+        "    counts = {}\n"
+        "    for name in ballots:\n"
+        "        counts[name] = counts.get(name, 0) + 1\n"
+        "    return counts\n",
+        extra="def winner(counts):\n"
+        '    """Candidate with the most votes."""\n'
+        "    return max(counts, key=counts.get)\n",
+        test="from votes import tally_votes\n\n\n"
+        "def test_single_ballot():\n"
+        "    assert tally_votes([\"a\"]) == {\"a\": 1}\n\n\n"
+        "def test_mixed_ballots():\n"
+        "    assert tally_votes([\"a\", \"b\", \"a\"]) == {\"a\": 2, \"b\": 1}\n",
+        statement="Every candidate ends up with exactly one more vote than "
+        "the ballots cast for them.\n\nRepro:\n"
+        ">>> tally_votes([\"a\"])\n{'a': 2}   # expected: {'a': 1}",
+    ),
+    dict(
+        slug="codes-label",
+        module="codelabels",
+        archetype="wrong-dict-default",
+        split="eval",
+        buggy="def label_for(names, code):\n"
+        '    """Display name for a code; the code itself when unmapped."""\n'
+        "    return names.get(code, \"\")\n",
+        gold="def label_for(names, code):\n"
+        '    """Display name for a code; the code itself when unmapped."""\n'
+        "    return names.get(code, code)\n",
+        extra="def known_codes(names):\n"
+        '    """Sorted list of mapped codes."""\n'
+        "    return sorted(names)\n",
+        test="from codelabels import label_for\n\n\n"
+        "def test_unmapped_falls_back_to_code():\n"
+        "    assert label_for({}, \"X1\") == \"X1\"\n\n\n"
+        "def test_mapped_code():\n"
+        "    assert label_for({\"X1\": \"Alpha Unit\"}, \"X1\") == \"Alpha Unit\"\n",
+        statement="Rows with unmapped codes render a BLANK label instead of "
+        "falling back to the raw code.\n\nRepro:\n"
+        ">>> label_for({}, \"X1\")\n''   # expected: 'X1'",
+    ),
+    dict(
+        slug="qty-clamp",
+        module="qtyclamp",
+        archetype="min-max-confusion",
+        split="train",
+        buggy="def clamp_qty(qty, lo, hi):\n"
+        '    """qty bounded to the inclusive range [lo, hi]."""\n'
+        "    return max(hi, min(lo, qty))\n",
+        gold="def clamp_qty(qty, lo, hi):\n"
+        '    """qty bounded to the inclusive range [lo, hi]."""\n'
+        "    return max(lo, min(hi, qty))\n",
+        extra="def is_valid_qty(qty, lo, hi):\n"
+        '    """True when qty already lies within [lo, hi]."""\n'
+        "    return lo <= qty <= hi\n",
+        test="from qtyclamp import clamp_qty\n\n\n"
+        "def test_in_range_untouched():\n"
+        "    assert clamp_qty(5, 1, 10) == 5\n\n\n"
+        "def test_below_range_raised():\n"
+        "    assert clamp_qty(0, 1, 10) == 1\n",
+        statement="Every order quantity gets pushed to the maximum: asking "
+        "for 5 of an item (limits 1-10) orders 10.\n\nRepro:\n"
+        ">>> clamp_qty(5, 1, 10)\n10   # expected: 5",
+    ),
+    dict(
+        slug="temp-coldest",
+        module="extremes",
+        archetype="min-max-confusion",
+        split="eval",
+        buggy="def coldest(readings):\n"
+        '    """The lowest temperature reading."""\n'
+        "    return max(readings)\n",
+        gold="def coldest(readings):\n"
+        '    """The lowest temperature reading."""\n'
+        "    return min(readings)\n",
+        extra="def average(readings):\n"
+        '    """Mean of the readings."""\n'
+        "    return sum(readings) / len(readings)\n",
+        test="from extremes import coldest\n\n\n"
+        "def test_picks_the_minimum():\n"
+        "    assert coldest([3, -2, 7]) == -2\n\n\n"
+        "def test_single_reading():\n"
+        "    assert coldest([10]) == 10\n",
+        statement="The 'coldest reading' panel shows the HOTTEST temperature "
+        "of the day.\n\nRepro:\n>>> coldest([3, -2, 7])\n"
+        "7   # expected: -2",
+    ),
+    dict(
+        slug="budget-cap",
+        module="capspend",
+        archetype="min-max-confusion",
+        split="eval",
+        buggy="def cap_spend(amount, budget):\n"
+        '    """The amount actually spent, capped at the budget."""\n'
+        "    return max(amount, budget)\n",
+        gold="def cap_spend(amount, budget):\n"
+        '    """The amount actually spent, capped at the budget."""\n'
+        "    return min(amount, budget)\n",
+        extra="def remaining(amount, budget):\n"
+        '    """Budget left after a capped spend."""\n'
+        "    return budget - cap_spend(amount, budget)\n",
+        test="from capspend import cap_spend\n\n\n"
+        "def test_under_budget_unchanged():\n"
+        "    assert cap_spend(50, 100) == 50\n\n\n"
+        "def test_over_budget_capped():\n"
+        "    assert cap_spend(150, 100) == 100\n",
+        statement="Capping returns the LARGER of spend and budget — a $50 "
+        "spend against a $100 budget books $100.\n\nRepro:\n"
+        ">>> cap_spend(50, 100)\n100   # expected: 50",
+    ),
+    dict(
+        slug="shifts-longest",
+        module="shifts",
+        archetype="missing-early-return",
+        split="train",
+        buggy="def longest_shift(hours):\n"
+        '    """Longest shift of the day; 0 when there were no shifts."""\n'
+        "    return max(hours)\n",
+        gold="def longest_shift(hours):\n"
+        '    """Longest shift of the day; 0 when there were no shifts."""\n'
+        "    if not hours:\n        return 0\n"
+        "    return max(hours)\n",
+        extra="def total_hours(hours):\n"
+        '    """Total hours worked."""\n'
+        "    return sum(hours)\n",
+        test="from shifts import longest_shift\n\n\n"
+        "def test_no_shifts_is_zero():\n"
+        "    assert longest_shift([]) == 0\n\n\n"
+        "def test_picks_longest():\n"
+        "    assert longest_shift([4, 8, 6]) == 8\n",
+        statement="The staffing report crashes on any day that had no "
+        "shifts.\n\nRepro:\n>>> longest_shift([])\n"
+        "ValueError: max() arg is an empty sequence\n# expected: 0",
+    ),
+    dict(
+        slug="orders-average",
+        module="avgorder",
+        archetype="missing-early-return",
+        split="eval",
+        buggy="def avg_order(amounts):\n"
+        '    """Average order value; 0.0 when there are no orders."""\n'
+        "    return sum(amounts) / len(amounts)\n",
+        gold="def avg_order(amounts):\n"
+        '    """Average order value; 0.0 when there are no orders."""\n'
+        "    if not amounts:\n        return 0.0\n"
+        "    return sum(amounts) / len(amounts)\n",
+        extra="def largest_order(amounts):\n"
+        '    """Largest order, or 0.0 when empty."""\n'
+        "    return max(amounts) if amounts else 0.0\n",
+        test="from avgorder import avg_order\n\n\n"
+        "def test_no_orders_is_zero():\n"
+        "    assert avg_order([]) == 0.0\n\n\n"
+        "def test_mean_of_orders():\n"
+        "    assert avg_order([10.0, 20.0]) == 15.0\n",
+        statement="Dashboards for brand-new stores crash instead of showing "
+        "$0.\n\nRepro:\n>>> avg_order([])\n"
+        "ZeroDivisionError: division by zero\n# expected: 0.0",
+    ),
+    dict(
+        slug="notes-firstline",
+        module="firstline",
+        archetype="missing-early-return",
+        split="eval",
+        buggy="def first_line(text):\n"
+        '    """First line of the note; empty string for an empty note."""\n'
+        "    return text.splitlines()[0]\n",
+        gold="def first_line(text):\n"
+        '    """First line of the note; empty string for an empty note."""\n'
+        "    lines = text.splitlines()\n"
+        "    if not lines:\n        return \"\"\n"
+        "    return lines[0]\n",
+        extra="def line_count(text):\n"
+        '    """Number of lines in the note."""\n'
+        "    return len(text.splitlines())\n",
+        test="from firstline import first_line\n\n\n"
+        "def test_empty_note():\n"
+        "    assert first_line(\"\") == \"\"\n\n\n"
+        "def test_multiline_note():\n"
+        "    assert first_line(\"alpha\\nbeta\") == \"alpha\"\n",
+        statement="Opening an empty note crashes the preview pane.\n\n"
+        "Repro:\n>>> first_line(\"\")\n"
+        "IndexError: list index out of range\n# expected: ''",
+    ),
+    dict(
+        slug="sales-peak",
+        module="peak",
+        archetype="wrong-aggregation-init",
+        split="train",
+        buggy="def peak_sales(daily):\n"
+        '    """Highest daily total (refund days can make totals negative)."""\n'
+        "    best = 0\n"
+        "    for x in daily:\n"
+        "        if x > best:\n            best = x\n"
+        "    return best\n",
+        gold="def peak_sales(daily):\n"
+        '    """Highest daily total (refund days can make totals negative)."""\n'
+        "    best = daily[0]\n"
+        "    for x in daily:\n"
+        "        if x > best:\n            best = x\n"
+        "    return best\n",
+        extra="def worst_day_total(daily):\n"
+        '    """Lowest daily total."""\n'
+        "    return min(daily)\n",
+        test="from peak import peak_sales\n\n\n"
+        "def test_all_negative_week():\n"
+        "    assert peak_sales([-5, -2, -9]) == -2\n\n\n"
+        "def test_positive_week():\n"
+        "    assert peak_sales([3, 7, 1]) == 7\n",
+        statement="On weeks where every day was net refunds, the 'peak day' "
+        "reports 0 — a value no day had.\n\nRepro:\n"
+        ">>> peak_sales([-5, -2, -9])\n0   # expected: -2",
+    ),
+    dict(
+        slug="stats-product",
+        module="seqprod",
+        archetype="wrong-aggregation-init",
+        split="eval",
+        buggy="def product(xs):\n"
+        '    """Product of a non-empty sequence of numbers."""\n'
+        "    total = 0\n"
+        "    for x in xs:\n"
+        "        total *= x\n"
+        "    return total\n",
+        gold="def product(xs):\n"
+        '    """Product of a non-empty sequence of numbers."""\n'
+        "    total = 1\n"
+        "    for x in xs:\n"
+        "        total *= x\n"
+        "    return total\n",
+        extra="def running_products(xs):\n"
+        '    """Prefix products of the sequence."""\n'
+        "    out, acc = [], 1\n"
+        "    for x in xs:\n"
+        "        acc *= x\n        out.append(acc)\n"
+        "    return out\n",
+        test="from seqprod import product\n\n\n"
+        "def test_product_of_three():\n"
+        "    assert product([2, 3, 4]) == 24\n\n\n"
+        "def test_single_element():\n"
+        "    assert product([5]) == 5\n",
+        statement="Every product computed comes out ZERO regardless of the "
+        "inputs.\n\nRepro:\n>>> product([2, 3, 4])\n"
+        "0   # expected: 24",
+    ),
+    dict(
+        slug="price-cheapest",
+        module="mintrack",
+        archetype="wrong-aggregation-init",
+        split="eval",
+        buggy="def cheapest(prices):\n"
+        '    """Lowest quoted price (all quotes are positive)."""\n'
+        "    low = 0\n"
+        "    for p in prices:\n"
+        "        if p < low:\n            low = p\n"
+        "    return low\n",
+        gold="def cheapest(prices):\n"
+        '    """Lowest quoted price (all quotes are positive)."""\n'
+        "    low = prices[0]\n"
+        "    for p in prices:\n"
+        "        if p < low:\n            low = p\n"
+        "    return low\n",
+        extra="def priciest(prices):\n"
+        '    """Highest quoted price."""\n'
+        "    return max(prices)\n",
+        test="from mintrack import cheapest\n\n\n"
+        "def test_picks_lowest_quote():\n"
+        "    assert cheapest([5, 3, 8]) == 3\n\n\n"
+        "def test_single_quote():\n"
+        "    assert cheapest([4]) == 4\n",
+        statement="The price comparator always shows $0 as the best quote — "
+        "a price no vendor offered.\n\nRepro:\n"
+        ">>> cheapest([5, 3, 8])\n0   # expected: 3",
+    ),
+    dict(
+        slug="cache-discount",
+        module="pricecache",
+        archetype="stale-cache-key",
+        split="train",
+        buggy="_cache = {}\n\n\n"
+        "def discounted(price, rate):\n"
+        '    """Price after a fractional discount, memoized."""\n'
+        "    key = price\n"
+        "    if key not in _cache:\n"
+        "        _cache[key] = price * (1 - rate)\n"
+        "    return _cache[key]\n",
+        gold="_cache = {}\n\n\n"
+        "def discounted(price, rate):\n"
+        '    """Price after a fractional discount, memoized."""\n'
+        "    key = (price, rate)\n"
+        "    if key not in _cache:\n"
+        "        _cache[key] = price * (1 - rate)\n"
+        "    return _cache[key]\n",
+        extra="def cache_size():\n"
+        '    """Number of memoized entries."""\n'
+        "    return len(_cache)\n",
+        test="from pricecache import discounted\n\n\n"
+        "def test_rate_is_part_of_the_key():\n"
+        "    assert discounted(100.0, 0.1) == 90.0\n"
+        "    assert discounted(100.0, 0.5) == 50.0\n",
+        statement="Changing the discount rate has no effect for any price "
+        "that was already quoted once.\n\nRepro:\n"
+        ">>> discounted(100.0, 0.1)\n90.0\n"
+        ">>> discounted(100.0, 0.5)\n90.0   # expected: 50.0",
+    ),
+    dict(
+        slug="cache-greeting",
+        module="greetcache",
+        archetype="stale-cache-key",
+        split="eval",
+        buggy="GREETINGS = {\"en\": \"Hello\", \"fr\": \"Bonjour\"}\n"
+        "_cache = {}\n\n\n"
+        "def greeting(name, lang):\n"
+        '    """Localized greeting line, memoized."""\n'
+        "    key = name\n"
+        "    if key not in _cache:\n"
+        "        _cache[key] = f\"{GREETINGS[lang]}, {name}!\"\n"
+        "    return _cache[key]\n",
+        gold="GREETINGS = {\"en\": \"Hello\", \"fr\": \"Bonjour\"}\n"
+        "_cache = {}\n\n\n"
+        "def greeting(name, lang):\n"
+        '    """Localized greeting line, memoized."""\n'
+        "    key = (name, lang)\n"
+        "    if key not in _cache:\n"
+        "        _cache[key] = f\"{GREETINGS[lang]}, {name}!\"\n"
+        "    return _cache[key]\n",
+        extra="def languages():\n"
+        '    """Supported language codes."""\n'
+        "    return sorted(GREETINGS)\n",
+        test="from greetcache import greeting\n\n\n"
+        "def test_language_is_part_of_the_key():\n"
+        "    assert greeting(\"Ann\", \"en\") == \"Hello, Ann!\"\n"
+        "    assert greeting(\"Ann\", \"fr\") == \"Bonjour, Ann!\"\n",
+        statement="After switching the display language, greetings for any "
+        "user seen before stay in the OLD language.\n\nRepro:\n"
+        ">>> greeting(\"Ann\", \"en\")\n'Hello, Ann!'\n"
+        ">>> greeting(\"Ann\", \"fr\")\n"
+        "'Hello, Ann!'   # expected: 'Bonjour, Ann!'",
+    ),
+    dict(
+        slug="cache-area",
+        module="areacache",
+        archetype="stale-cache-key",
+        split="eval",
+        buggy="_cache = {}\n\n\n"
+        "def rect_area(width, height):\n"
+        '    """width * height, memoized."""\n'
+        "    key = width\n"
+        "    if key not in _cache:\n"
+        "        _cache[key] = width * height\n"
+        "    return _cache[key]\n",
+        gold="_cache = {}\n\n\n"
+        "def rect_area(width, height):\n"
+        '    """width * height, memoized."""\n'
+        "    key = (width, height)\n"
+        "    if key not in _cache:\n"
+        "        _cache[key] = width * height\n"
+        "    return _cache[key]\n",
+        extra="def rect_perimeter(width, height):\n"
+        '    """Perimeter of the rectangle."""\n'
+        "    return 2 * (width + height)\n",
+        test="from areacache import rect_area\n\n\n"
+        "def test_height_is_part_of_the_key():\n"
+        "    assert rect_area(2, 3) == 6\n"
+        "    assert rect_area(2, 5) == 10\n",
+        statement="Resizing a room's height does not change its computed "
+        "floor area when the same width was measured before.\n\nRepro:\n"
+        ">>> rect_area(2, 3)\n6\n>>> rect_area(2, 5)\n"
+        "6   # expected: 10",
+    ),
+    dict(
+        slug="billing-roundhours",
+        module="hoursbill",
+        archetype="wrong-rounding-mode",
+        split="train",
+        buggy="def billable_hours(minutes):\n"
+        '    """Hours billed, rounded to the NEAREST whole hour."""\n'
+        "    return minutes // 60\n",
+        gold="def billable_hours(minutes):\n"
+        '    """Hours billed, rounded to the NEAREST whole hour."""\n'
+        "    return round(minutes / 60)\n",
+        extra="def minutes_of(hours):\n"
+        '    """Whole minutes in a span of hours."""\n'
+        "    return hours * 60\n",
+        test="from hoursbill import billable_hours\n\n\n"
+        "def test_rounds_to_nearest():\n"
+        "    assert billable_hours(100) == 2\n\n\n"
+        "def test_short_call_rounds_down():\n"
+        "    assert billable_hours(25) == 0\n",
+        statement="Consultations are systematically underbilled: a "
+        "100-minute session bills 1 hour instead of the nearest 2.\n\n"
+        "Repro:\n>>> billable_hours(100)\n1   # expected: 2",
+    ),
+    dict(
+        slug="survey-percent",
+        module="pct",
+        archetype="wrong-rounding-mode",
+        split="eval",
+        buggy="def percent(part, whole):\n"
+        '    """Integer percentage, rounded to the nearest point."""\n'
+        "    return part * 100 // whole\n",
+        gold="def percent(part, whole):\n"
+        '    """Integer percentage, rounded to the nearest point."""\n'
+        "    return round(part * 100 / whole)\n",
+        extra="def out_of(part, whole):\n"
+        '    """Display string \'part/whole\'."""\n'
+        "    return f\"{part}/{whole}\"\n",
+        test="from pct import percent\n\n\n"
+        "def test_rounds_to_nearest_point():\n"
+        "    assert percent(2, 3) == 67\n\n\n"
+        "def test_exact_quarter():\n"
+        "    assert percent(1, 4) == 25\n",
+        statement="Survey percentages always round DOWN, so answer columns "
+        "sum to less than 100%.\n\nRepro:\n>>> percent(2, 3)\n"
+        "66   # expected: 67",
+    ),
+    dict(
+        slug="freight-chargeable",
+        module="freight",
+        archetype="wrong-rounding-mode",
+        split="eval",
+        buggy="import math\n\n\n"
+        "def chargeable_kg(kg):\n"
+        '    """Billable weight: rounded UP to the next whole kilogram."""\n'
+        "    return round(kg)\n",
+        gold="import math\n\n\n"
+        "def chargeable_kg(kg):\n"
+        '    """Billable weight: rounded UP to the next whole kilogram."""\n'
+        "    return math.ceil(kg)\n",
+        extra="def shipping_cost(kg, per_kg):\n"
+        '    """Cost at a per-kilogram rate."""\n'
+        "    return chargeable_kg(kg) * per_kg\n",
+        test="from freight import chargeable_kg\n\n\n"
+        "def test_rounds_up():\n"
+        "    assert chargeable_kg(2.2) == 3\n\n\n"
+        "def test_whole_weight_unchanged():\n"
+        "    assert chargeable_kg(3.0) == 3\n",
+        statement="Light parcels are undercharged: a 2.2 kg parcel bills "
+        "only 2 kg instead of rounding up to 3.\n\nRepro:\n"
+        ">>> chargeable_kg(2.2)\n2   # expected: 3",
+    ),
+    dict(
+        slug="promo-window",
+        module="promo",
+        archetype="boundary-inclusive-filter",
+        split="train",
+        buggy="def in_promo(day, start, end):\n"
+        '    """True when day falls within the promo window [start, end]."""\n'
+        "    return start < day < end\n",
+        gold="def in_promo(day, start, end):\n"
+        '    """True when day falls within the promo window [start, end]."""\n'
+        "    return start <= day <= end\n",
+        extra="def promo_length(start, end):\n"
+        '    """Number of promo days, endpoints included."""\n'
+        "    return end - start + 1\n",
+        test="from promo import in_promo\n\n\n"
+        "def test_first_and_last_day_count():\n"
+        "    assert in_promo(1, 1, 5) is True\n"
+        "    assert in_promo(5, 1, 5) is True\n\n\n"
+        "def test_outside_window():\n"
+        "    assert in_promo(6, 1, 5) is False\n",
+        statement="Discounts never apply on a promotion's first or last "
+        "day.\n\nRepro:\n>>> in_promo(1, 1, 5)\n"
+        "False   # expected: True",
+    ),
+    dict(
+        slug="report-rows",
+        module="reportrange",
+        archetype="boundary-inclusive-filter",
+        split="eval",
+        buggy="def rows_between(rows, lo, hi):\n"
+        '    """Rows whose day number lies in [lo, hi] inclusive."""\n'
+        "    return [r for r in rows if lo < r[\"day\"] < hi]\n",
+        gold="def rows_between(rows, lo, hi):\n"
+        '    """Rows whose day number lies in [lo, hi] inclusive."""\n'
+        "    return [r for r in rows if lo <= r[\"day\"] <= hi]\n",
+        extra="def days_of(rows):\n"
+        '    """Sorted distinct day numbers present."""\n'
+        "    return sorted({r[\"day\"] for r in rows})\n",
+        test="from reportrange import rows_between\n\n\n"
+        "def test_endpoints_included():\n"
+        "    rows = [{\"day\": 1}, {\"day\": 2}, {\"day\": 3}]\n"
+        "    assert rows_between(rows, 1, 3) == rows\n\n\n"
+        "def test_outside_excluded():\n"
+        "    assert rows_between([{\"day\": 9}], 1, 3) == []\n",
+        statement="Range exports silently drop the first and the last day's "
+        "rows.\n\nRepro:\n"
+        ">>> rows_between([{\"day\": 1}, {\"day\": 2}, {\"day\": 3}], 1, 3)\n"
+        "[{'day': 2}]   # expected: all three rows",
+    ),
+    dict(
+        slug="scores-band",
+        module="scoreband",
+        archetype="boundary-inclusive-filter",
+        split="eval",
+        buggy="def scores_in_band(scores, lo, hi):\n"
+        '    """Scores from lo to hi, both ends included."""\n'
+        "    return [s for s in scores if lo < s < hi]\n",
+        gold="def scores_in_band(scores, lo, hi):\n"
+        '    """Scores from lo to hi, both ends included."""\n'
+        "    return [s for s in scores if lo <= s <= hi]\n",
+        extra="def band_width(lo, hi):\n"
+        '    """Number of integer scores in the band."""\n'
+        "    return hi - lo + 1\n",
+        test="from scoreband import scores_in_band\n\n\n"
+        "def test_edges_included():\n"
+        "    assert scores_in_band([70, 80, 90], 70, 90) == [70, 80, 90]\n\n\n"
+        "def test_below_band_excluded():\n"
+        "    assert scores_in_band([60], 70, 90) == []\n",
+        statement="Students scoring exactly a band's edges are missing from "
+        "the band roster.\n\nRepro:\n"
+        ">>> scores_in_band([70, 80, 90], 70, 90)\n"
+        "[80]   # expected: [70, 80, 90]",
+    ),
 ]
 
 
@@ -1317,6 +1941,15 @@ def main():
     modules = [t["module"] for t in TASKS]
     assert len(set(modules)) == len(modules), "duplicate module name"
 
+    # Security gate: every statement + all code an agent sees must be clean.
+    for task in TASKS:
+        text = "\n".join([task["slug"], task["statement"], task["buggy"],
+                          task["gold"], task["extra"], task["test"]])
+        rule = is_security_flagged(text)
+        assert rule is None, f"security-filter flagged {task['slug']}: {rule}"
+    shared = "\n".join([HELPERS_PY, *DISTRACTOR_POOL.values()])
+    assert is_security_flagged(shared) is None, "security-filter flagged scenery"
+
     staged_root = args.out / "staged"
     staged_root.mkdir(parents=True, exist_ok=True)
 
@@ -1354,6 +1987,7 @@ def main():
             print(f"SELF-CHECK FAILED for {len(failures)}: {failures}")
             return 1
         print(f"self-check: all {len(TASKS)} tasks base-FAIL / gold-PASS")
+        print(f"security-filter: all {len(TASKS)} tasks + scenery clean")
     return 0
 
 
