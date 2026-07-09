@@ -25,6 +25,17 @@ lifecycle & progress spine).
 
 ### Verdicts
 
+- **2026-07-10 — DSv4 prefix reuse RELICENSED (Phase 2a, content-keyed
+  host-resident state pool)**: cross-request reuse relanded on the
+  post-Route-A-deletion baseline — entries keyed by radix host-page identity
+  (D1 unrepresentable), pool = L2 (zero HBM), L3 mmap spill unbudgeted. Pod
+  evidence gate green: warm TTFT **4.19×** (0.768→0.184 s), resend 10/10
+  after the derived-state fix (`0b5bd3d55` — the FP8 band is decode-lane
+  DERIVED state, never captured/restored; rebuilt from restored bf16
+  staging), L3 read-back exact, publish overhead −0.35% (free).
+  [wins](docs/experience/wins/2026-07-10-dsv4-prefix-state-pool-phase2a.md) ·
+  plan [Phase 2](docs/plans/2026-07-09-dsv4-kv-reuse-seam-refactor.md).
+
 - **2026-07-10 — DSpark sampled (temp>0) spec decode LICENSED**: device-side
   filter/chain-rejection kernels (`e22a41637`/`9f2dd5b3b`) take sampled spec
   from 34.8 (−7.5% vs plain) to **64–106 tok/s = 1.8–3.0× plain sampling**;
