@@ -59,7 +59,7 @@ pub(crate) struct Qwen35DsparkHead {
     layers: Vec<DsparkLayer>,
     markov: Option<DsparkMarkovHead>,
     confidence: Option<DsparkConfidenceHead>,
-    /// sigmoid(conf) < threshold truncates the proposal (`ARLE_DSPARK_CONF_THRESHOLD`).
+    /// sigmoid(conf) < threshold truncates the proposal (`--dspark-conf-threshold`).
     confidence_threshold: f32,
     /// Draft RoPE tables (full rotary over head_dim, `rope_theta`), `cap` positions.
     cos_cache: DeviceVec,
@@ -416,13 +416,6 @@ impl Qwen35DsparkExec {
     }
 }
 
-fn dspark_confidence_threshold() -> f32 {
-    std::env::var("ARLE_DSPARK_CONF_THRESHOLD")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0.5)
-}
-
 /// Load a raw 1D bf16/f32 vector as host bf16.
 fn load_host_vec(loader: &SafetensorLoader, name: &str) -> Result<Vec<bf16>> {
     let t = loader.load_raw_tensor(name)?;
@@ -473,6 +466,7 @@ pub(crate) fn load_dspark_head(
     trunk_hidden: usize,
     trunk_layers: usize,
     trunk_vocab: usize,
+    confidence_threshold: f32,
 ) -> Result<Qwen35DsparkHead> {
     let cfg = DsparkConfig::from_dir(dir)
         .map_err(|e| anyhow!("dspark draft config at {}: {e}", dir.display()))?;
@@ -604,7 +598,7 @@ pub(crate) fn load_dspark_head(
     let (cos_cache, sin_cache) =
         crate::ops::precompute_rope(ctx, cfg.head_dim, cap, cfg.rope_theta, None)?;
     Ok(Qwen35DsparkHead {
-        confidence_threshold: dspark_confidence_threshold(),
+        confidence_threshold,
         cfg,
         fc,
         hidden_norm: loader.load_vec_any(ctx, &names.hidden_norm)?,

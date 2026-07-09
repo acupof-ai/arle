@@ -700,6 +700,12 @@ pub(crate) struct ServeArgs {
     #[arg(long, value_name = "PATH_OR_REPO")]
     pub(crate) mtp_draft_model: Option<String>,
 
+    /// DSpark confidence-head truncation threshold: proposals are cut at the
+    /// first position with sigmoid(confidence) below it. Checkpoints without
+    /// the head ignore it.
+    #[arg(long, default_value_t = 0.5, value_name = "T")]
+    pub(crate) dspark_conf_threshold: f32,
+
     /// Number of MTP draft tokens to propose per verify block on CUDA.
     #[arg(long, value_name = "N")]
     pub(crate) mtp_draft_tokens: Option<usize>,

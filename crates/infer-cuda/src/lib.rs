@@ -311,6 +311,7 @@ impl CudaExecutor {
         kv_dtype: CudaKvCacheDtype,
         mem_fraction_static: f64,
         dspark_draft_model: Option<&std::path::Path>,
+        dspark_conf_threshold: f32,
     ) -> anyhow::Result<Self> {
         Ok(Self {
             inner: CudaExecutorInner::Real(Box::new(
@@ -321,6 +322,7 @@ impl CudaExecutor {
                     kv_dtype,
                     mem_fraction_static,
                     dspark_draft_model,
+                    dspark_conf_threshold,
                 )?,
             )),
         })

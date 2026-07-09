@@ -164,10 +164,11 @@ impl ServeSpecType {
 }
 
 /// Speculative decode options carried by [`ServeHttpOptions`].
-#[derive(Debug, Clone, Default, Eq, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct ServeSpecOptions {
     pub spec_type: ServeSpecType,
     pub mtp_draft_model: Option<String>,
+    pub dspark_conf_threshold: f32,
     pub mtp_draft_tokens: Option<usize>,
     pub mtp_draft_topk: Option<usize>,
 }
@@ -242,6 +243,7 @@ pub fn serve_http(opts: ServeHttpOptions) -> Result<()> {
                 )
             })?;
             engine_config.dspark_draft_model = Some(std::path::PathBuf::from(dir));
+            engine_config.dspark_conf_threshold = opts.spec.dspark_conf_threshold;
         }
     }
 
