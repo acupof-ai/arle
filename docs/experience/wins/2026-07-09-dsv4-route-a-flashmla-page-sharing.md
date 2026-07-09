@@ -24,18 +24,18 @@ off (`supports_flashmla_page_sharing()` returns false for head_dim=576).
 ## Changes
 
 - `crates/infer-cuda/src/attention/kv_layout.rs`:
-  - Added `head_dim` to `Dsv4KvAdapter`
   - `host_to_flashmla: HashMap<u32, Vec<u32>>` maps host page ID → per-layer
     FlashMLA page IDs
   - `record_host_mapping()` records the identity convention used by fresh
     allocations (called from `mirror_slot_pages` / `prepare_kv_batch`)
+  - `resolve_layer_pages()` resolves host page IDs to one layer's physical pages
   - `retain_flashmla_pages()` / `release_flashmla_pages()` bump refcounts on
     physical pages across all layers
   - `attach_slot_flashmla_pages()` wires a slot to existing physical pages via
     the host→FlashMLA mapping
   - `supports_flashmla_page_sharing()` returns `head_dim != 576`
   - `mirror_slot_pages` and `prepare_kv_batch` branch: MODEL1 records mapping +
-    uses `layer_pages_from_host`; V32 uses `identity_layer_pages`
+    uses `resolve_layer_pages`; V32 uses inline identity pages
 - `crates/infer-cuda/src/executor.rs`:
   - `save_prefix_sidecar` DSv4 arm calls `retain_flashmla_pages(prefix_pages)`
   - `release_prefix_pages` DSv4 arm calls `release_flashmla_pages(pages)`
@@ -84,21 +84,20 @@ off (`supports_flashmla_page_sharing()` returns false for head_dim=576).
    for gibberish/random input. Expected behavior — model refuses to complete
    nonsense. TTFT measurement still valid (includes full prefill + first decode).
 3. **Concurrent reuse advantage narrows (5% vs 49% single)**: Under c=4, all
-   requests share GPU; the faster prefill of reuse requests is masked by
-   waiting for the cold requests' prefill to finish in the same batch window.
+   requests share GPU; faster prefill of reuse requests is masked by waiting
+   for cold requests' prefill in the same batch window.
 
 ## Learnings
 
-- **2x TTFT speedup confirmed.** Cross-request FlashMLA page sharing halves
-  prefill time when a 1152-token prefix is cached. The engine correctly
-  reduces `prefill_tokens` from 1425 to 273 (−81%), and TTFT drops proportionally.
+- **2× TTFT speedup confirmed.** Cross-request FlashMLA page sharing halves
+  prefill time when a 1152-token prefix is cached. Engine correctly reduces
+  prefill_tokens from 1425 to 273 (−81%), and TTFT drops proportionally.
 - V32/GLM (head_dim=576) pack kernel requires contiguous identity-mapped bands;
   non-contiguous sharing is MODEL1-only.
 - `retain_flashmla_pages`/`release_flashmla_pages` are naturally no-op for V32
-  since `host_to_flashmla` stays empty (V32 path never calls
-  `record_host_mapping`).
+  since `host_to_flashmla` stays empty (V32 path never calls `record_host_mapping`).
 - **All 738 matched blocks were usable** (prefix_match_full_blocks == clamped).
   No boundary rejections — DSv4 compression/SW/DSA boundaries aligned with
   page granularity for these test prompts.
-- Concurrent benefit is real but smaller; the primary win is single-request
-  latency for repeated-prefix workloads (agent loops, multi-turn chat).
+- Concurrent benefit is real but smaller; primary win is single-request latency
+  for repeated-prefix workloads (agent loops, multi-turn chat).
