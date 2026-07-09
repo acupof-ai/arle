@@ -198,6 +198,8 @@ def clone_at_commit(repo, sha, dest):
 
 
 def apply_patch(workdir, patch, name):
+    if not (patch or "").strip():  # SWE-smith rows carry an empty test_patch
+        return None
     (workdir / name).write_text(patch)
     r = run(["git", "apply", name], workdir)
     (workdir / name).unlink(missing_ok=True)
@@ -213,12 +215,16 @@ def fail_to_pass_list(task):
     return f2p
 
 
-def run_pytest(workdir, f2p, python, pythonpath=None):
+def run_pytest(workdir, f2p, python, pythonpath=None, timeout=None):
     """Returns (rc, summary_tail). rc None on timeout."""
     env = {"PYTHONPATH": pythonpath} if pythonpath else None
+    if timeout is None:
+        timeout = PYTEST_TIMEOUT
     try:
+        if timeout <= 0:
+            return None, "pytest timeout"
         r = run([python, "-m", "pytest", "-q", "-p", "no:cacheprovider", *f2p],
-                workdir, timeout=PYTEST_TIMEOUT, env=env)
+                workdir, timeout=timeout, env=env)
     except subprocess.TimeoutExpired:
         return None, "pytest timeout"
     tail = (r.stdout + r.stderr).strip().splitlines()[-1:] or [""]
