@@ -1501,19 +1501,14 @@ impl Dsv4KvAdapter {
         (pages > 0).then_some(pages)
     }
 
-    /// True when the model (MODEL1, head_dim=512) supports non-contiguous
-    /// FlashMLA bands via Stage B device-page-table routing. V32/GLM
-    /// (head_dim=576) uses band-base pack addressing and requires contiguous
-    /// identity-mapped bands, so cross-request page sharing is disabled.
+    /// MODEL1 (head_dim=512) uses Stage B device-page-table routing so bands
+    /// may be non-contiguous. V32/GLM (head_dim=576) uses band-base pack
+    /// addressing requiring contiguous identity-mapped bands — sharing disabled.
     pub(crate) fn supports_flashmla_page_sharing(&self) -> bool {
-        self.supports_noncontiguous_bands()
+        self.head_dim != 576
     }
 
-    /// Record the host→FlashMLA mapping for a slot's page table. Each host page
-    /// at position `i` in the slot maps to layer L's FlashMLA page at
-    /// `slot * lsp[L] + i` (the identity convention used by fresh allocations).
-    /// Called from `prepare_kv_batch` / `mirror_slot_pages` so later prefix
-    /// reuse hits the same physical pages.
+    /// Record host→FlashMLA mapping for a slot's fresh identity-mapped pages.
     fn record_host_mapping(&mut self, slot_pages: &[u32], slot: usize) {
         for (i, &host_page) in slot_pages.iter().enumerate() {
             self.host_to_flashmla.entry(host_page).or_insert_with(|| {
@@ -1527,41 +1522,16 @@ impl Dsv4KvAdapter {
         }
     }
 
-    /// MODEL1 (head_dim=512) uses Stage B device-page-table routing so bands
-    /// may be non-contiguous. V32/GLM (head_dim=576) uses band-base pack
-    /// addressing and requires contiguous identity-mapped bands.
-    fn supports_noncontiguous_bands(&self) -> bool {
-        self.head_dim != 576
-    }
-
-    /// Look up the FlashMLA physical page for a single host page at `layer_idx`.
-    fn flashmla_page_for_host(&self, host_page: u32, layer_idx: usize) -> Option<u32> {
-        self.host_to_flashmla
-            .get(&host_page)
-            .and_then(|v| v.get(layer_idx).copied())
-            .filter(|&p| p != u32::MAX)
-    }
-
-    /// Build the per-layer FlashMLA page list for a slice of host page IDs.
-    /// Panics-free: missing mappings are skipped (caller validates coverage).
-    fn layer_pages_from_host(&self, host_pages: &[u32], layer_idx: usize) -> Vec<u32> {
+    /// Resolve host page IDs to one layer's FlashMLA physical pages.
+    fn resolve_layer_pages(&self, host_pages: &[u32], layer_idx: usize) -> Vec<u32> {
         host_pages
             .iter()
-            .filter_map(|&hp| self.flashmla_page_for_host(hp, layer_idx))
-            .collect()
-    }
-
-    /// Identity-convention per-layer FlashMLA pages for `slot`: page at
-    /// position `i` maps to `slot * lsp + min(i, lsp-1)`. V32/GLM requires this
-    /// contiguous layout for its band-base pack kernel.
-    fn identity_layer_pages(&self, slot: usize, page_count: usize) -> Vec<Vec<u32>> {
-        (0..self.layers.len())
-            .map(|li| {
-                let lsp = self.layers[li].flashmla_slot_pages();
-                (0..page_count)
-                    .map(|i| (slot * lsp + i.min(lsp.saturating_sub(1))) as u32)
-                    .collect()
+            .filter_map(|&hp| {
+                self.host_to_flashmla
+                    .get(&hp)
+                    .and_then(|v| v.get(layer_idx).copied())
             })
+            .filter(|&p| p != u32::MAX)
             .collect()
     }
 
@@ -1581,16 +1551,21 @@ impl Dsv4KvAdapter {
             "DSv4 mirror slot {slot} has no pages"
         );
         let layer_count = self.layers.len();
-        let per_layer_pages: Vec<Vec<u32>> = if self.supports_noncontiguous_bands() {
-            // MODEL1: record host→FlashMLA mapping for cross-request sharing.
+        let per_layer_pages: Vec<Vec<u32>> = if self.supports_flashmla_page_sharing() {
             self.record_host_mapping(slot_pages, slot);
             (0..layer_count)
-                .map(|li| self.layer_pages_from_host(slot_pages, li))
+                .map(|li| self.resolve_layer_pages(slot_pages, li))
                 .collect()
         } else {
-            // V32/GLM: identity convention keeps bands contiguous for the
-            // band-base pack kernel. Don't record into the shared map.
-            self.identity_layer_pages(slot, slot_pages.len())
+            let pc = slot_pages.len();
+            (0..layer_count)
+                .map(|li| {
+                    let lsp = self.layers[li].flashmla_slot_pages();
+                    (0..pc)
+                        .map(|i| (slot * lsp + i.min(lsp.saturating_sub(1))) as u32)
+                        .collect()
+                })
+                .collect()
         };
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
             let layer_slot_pages = layer.flashmla_slot_pages();
@@ -1619,41 +1594,31 @@ impl Dsv4KvAdapter {
         Ok(())
     }
 
-    /// Bump ref_count on the FlashMLA physical pages backing these host page IDs
-    /// (all layers). Called from `save_prefix_sidecar` when the engine publishes
-    /// a prefix to the radix tree — keeps the physical KV pages alive even after
-    /// their originating slot is freed.
+    /// Bump refcount on FlashMLA physical pages backing these host IDs (all layers).
+    /// Called from `save_prefix_sidecar` when the engine publishes a prefix.
     pub(crate) fn retain_flashmla_pages(&mut self, host_pages: &[u32]) -> Result<()> {
         for layer_idx in 0..self.layers.len() {
             let Some(pool) = self.layers[layer_idx].flashmla_kv_pool.as_mut() else {
                 continue;
             };
-            let flashmla_pages = self.layer_pages_from_host(host_pages, layer_idx);
-            if !flashmla_pages.is_empty() {
-                pool.retain_pages(&flashmla_pages)?;
+            let pages = self.resolve_layer_pages(host_pages, layer_idx);
+            if !pages.is_empty() {
+                pool.retain_pages(&pages)?;
             }
         }
         Ok(())
     }
 
-    /// Decrement ref_count on FlashMLA physical pages backing these host IDs.
-    /// Called from `release_prefix_pages` when the radix tree evicts a prefix.
+    /// Drop refcount on FlashMLA physical pages backing these host IDs.
+    /// Called from `release_prefix_pages` when the radix evicts a prefix.
     pub(crate) fn release_flashmla_pages(&mut self, host_pages: &[u32]) -> Result<()> {
         for layer_idx in 0..self.layers.len() {
             let Some(pool) = self.layers[layer_idx].flashmla_kv_pool.as_mut() else {
                 continue;
             };
-            let flashmla_pages: Vec<u32> = host_pages
-                .iter()
-                .filter_map(|&hp| {
-                    self.host_to_flashmla
-                        .get(&hp)
-                        .and_then(|v| v.get(layer_idx).copied())
-                })
-                .filter(|&p| p != u32::MAX)
-                .collect();
-            if !flashmla_pages.is_empty() {
-                pool.release_pages(&flashmla_pages)?;
+            let pages = self.resolve_layer_pages(host_pages, layer_idx);
+            if !pages.is_empty() {
+                pool.release_pages(&pages)?;
             }
         }
         for hp in host_pages {
@@ -1662,22 +1627,15 @@ impl Dsv4KvAdapter {
         Ok(())
     }
 
-    /// Attach a slot to existing FlashMLA physical pages via the host→FlashMLA
-    /// mapping. Used for prefix reuse: the engine calls this after
-    /// `restore_prefix_sidecar` provides matched host page IDs. `token_count`
-    /// sets the pool's seq_len so decode reads the right number of pages.
-    ///
-    /// No-op for V32/GLM: its band-base pack kernel requires contiguous
-    /// identity-mapped bands; sharing pages from a different slot would
-    /// fragment the table. V32 falls back to full prefill (the engine's
-    /// `reusable_prefix_blocks` also returns 0 for V32).
+    /// Attach a slot to existing FlashMLA pages via the host→FlashMLA mapping.
+    /// No-op for V32/GLM (contiguous identity bands required).
     pub(crate) fn attach_slot_flashmla_pages(
         &mut self,
         slot: usize,
         host_pages: &[u32],
         token_count: usize,
     ) -> Result<()> {
-        if !self.supports_noncontiguous_bands() {
+        if !self.supports_flashmla_page_sharing() {
             return Ok(());
         }
         ensure!(
@@ -1687,13 +1645,13 @@ impl Dsv4KvAdapter {
         );
         let layer_count = self.layers.len();
         let per_layer_pages: Vec<Vec<u32>> = (0..layer_count)
-            .map(|li| self.layer_pages_from_host(host_pages, li))
+            .map(|li| self.resolve_layer_pages(host_pages, li))
             .collect();
         for (li, pages) in per_layer_pages.iter().enumerate() {
             ensure!(
                 pages.len() == host_pages.len(),
                 "DSv4 attach slot {slot}: layer {li} mapped {}/{} host pages — \
-                 prefix pages not recorded (missing save_prefix_sidecar?)",
+                 prefix not recorded (missing save_prefix_sidecar?)",
                 pages.len(),
                 host_pages.len()
             );
@@ -1702,10 +1660,9 @@ impl Dsv4KvAdapter {
             let Some(pool) = layer.flashmla_kv_pool.as_mut() else {
                 continue;
             };
-            let layer_slot_pages = layer.flashmla_slot_pages();
-            let n = layer_slot_pages.min(host_pages.len());
-            let local = &per_layer_pages[layer_idx][..n];
-            pool.mirror_band(slot, local, token_count)?;
+            let lsp = layer.flashmla_slot_pages();
+            let n = lsp.min(host_pages.len());
+            pool.mirror_band(slot, &per_layer_pages[layer_idx][..n], token_count)?;
         }
         Ok(())
     }
@@ -1752,14 +1709,21 @@ impl ModelKvAdapter for Dsv4KvAdapter {
                 "DSv4 KV batch row {idx} has empty slot page table"
             );
             let layer_count = self.layers.len();
-            let per_layer_pages: Vec<Vec<u32>> = if self.supports_noncontiguous_bands() {
+            let per_layer_pages: Vec<Vec<u32>> = if self.supports_flashmla_page_sharing() {
                 self.record_host_mapping(&slot_pages, row.slot);
                 (0..layer_count)
-                    .map(|li| self.layer_pages_from_host(&slot_pages, li))
+                    .map(|li| self.resolve_layer_pages(&slot_pages, li))
                     .collect()
             } else {
-                // V32/GLM: identity pages keep the band contiguous for pack.
-                self.identity_layer_pages(row.slot, slot_pages.len())
+                let pc = slot_pages.len();
+                (0..layer_count)
+                    .map(|li| {
+                        let lsp = self.layers[li].flashmla_slot_pages();
+                        (0..pc)
+                            .map(|i| (row.slot * lsp + i.min(lsp.saturating_sub(1))) as u32)
+                            .collect()
+                    })
+                    .collect()
             };
             for layer_idx in 0..layer_count {
                 let layer = self.layer_mut(layer_idx)?;
