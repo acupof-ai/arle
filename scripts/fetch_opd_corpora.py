@@ -27,17 +27,21 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fnmatch
 import json
 import os
+import re
+import shutil
 import sys
 from pathlib import Path
 
 RAW_DIR = Path("data/opd-corpora/raw")
 
-# name -> (hf glob, row cap, columns to keep; None = all).
-# Row caps keep each pull well under the 2 GB budget (code_contests rows are
-# huge: solutions + generated_tests are dropped below, but the shard bytes
-# still stream through — the cap bounds that).
+# name -> (hf glob, row cap, columns to keep). Reads go through pyarrow with
+# column projection over HfFileSystem range requests, so dropped columns
+# (code_contests solutions/generated_tests = the bulk of its 2.2 GB parquet)
+# are never downloaded; row caps bound the rest well under the 2 GB budget.
 SOURCES = {
     "swe_gym": {
         "data_files": "hf://datasets/SWE-Gym/SWE-Gym/data/train-*.parquet",
@@ -50,9 +54,12 @@ SOURCES = {
     "swe_smith": {
         "data_files": "hf://datasets/SWE-bench/SWE-smith/data/train-*.parquet",
         "cap": 20000,
+        # No PASS_TO_PASS: ~69 KB/row of test names (2.3 GB over the cap'd
+        # pull) that the SweTask lane never reads. No base_commit column
+        # exists — tasks are branches of swesmith/<repo>.<shortsha> mirrors.
         "columns": [
-            "instance_id", "problem_statement", "repo", "base_commit",
-            "patch", "FAIL_TO_PASS", "PASS_TO_PASS", "image_name",
+            "instance_id", "problem_statement", "repo",
+            "patch", "FAIL_TO_PASS", "image_name",
         ],
     },
     "taco": {
@@ -88,7 +95,14 @@ def _jsonable(value):
 
 
 def fetch(name: str, spec: dict, force: bool) -> tuple[int, int]:
-    from datasets import load_dataset
+    # Whole-shard GETs (~760 KB/s each on the mirror, 3 in flight) beat fsspec
+    # streaming (~130 KB/s) and projected range reads (~9 KB/s) by 6-80x;
+    # column projection then happens locally and shards are deleted right after.
+    from concurrent.futures import ThreadPoolExecutor
+
+    import pyarrow.parquet as pq
+    import requests
+    from huggingface_hub import list_repo_files
 
     out = RAW_DIR / f"{name}.jsonl"
     if out.exists() and out.stat().st_size > 0 and not force:
@@ -96,25 +110,72 @@ def fetch(name: str, spec: dict, force: bool) -> tuple[int, int]:
         print(f"[{name}] SKIP (exists: {rows} rows, {out.stat().st_size:,} bytes)")
         return rows, out.stat().st_size
 
-    print(f"[{name}] streaming {spec['data_files']} (cap {spec['cap']} rows)")
-    ds = load_dataset(
-        "parquet", data_files={"train": spec["data_files"]},
-        split="train", streaming=True,
+    org, repo = spec["data_files"].removeprefix("hf://datasets/").split("/")[:2]
+    repo_id = f"{org}/{repo}"
+    prefix = spec["data_files"].split(repo_id + "/")[1]
+    shard_re = re.compile(fnmatch.translate(prefix))
+    shards = sorted(
+        f for f in list_repo_files(repo_id, repo_type="dataset") if shard_re.match(f)
     )
+    print(f"[{name}] {len(shards)} shards in {repo_id}, cap {spec['cap']} rows",
+          flush=True)
+
+    cache = RAW_DIR / ".hf-cache"
+    cache.mkdir(parents=True, exist_ok=True)
+    endpoint = os.environ.get("HF_ENDPOINT", "https://huggingface.co").rstrip("/")
+
+    def pull(shard: str) -> Path:
+        # Plain resolve-URL GET with Range resume: hf_hub_download's metadata
+        # HEAD 401s on the mirror, and mirror connections drop mid-stream.
+        local = cache / shard.replace("/", "__")
+        url = f"{endpoint}/datasets/{repo_id}/resolve/main/{shard}"
+        local.write_bytes(b"")
+        for attempt in range(12):
+            headers = {"Range": f"bytes={local.stat().st_size}-"}
+            try:
+                with requests.get(url, stream=True, allow_redirects=True,
+                                  timeout=60, headers=headers) as r:
+                    if r.status_code == 416:  # already complete
+                        return local
+                    r.raise_for_status()
+                    with local.open("ab") as fh:
+                        for chunk in r.iter_content(1 << 20):
+                            fh.write(chunk)
+                return local
+            except requests.RequestException as e:
+                print(f"[{name}]   retry {attempt + 1} {shard}: {e}", flush=True)
+        raise RuntimeError(f"download failed after retries: {url}")
+
     cols = spec["columns"]
     tmp = out.with_suffix(".jsonl.tmp")
-    rows = 0
-    with tmp.open("w") as f:
-        for row in ds:
-            rec = {c: _jsonable(row.get(c)) for c in cols}
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-            rows += 1
-            if rows % 2000 == 0:
-                print(f"[{name}]   {rows} rows, {tmp.stat().st_size:,} bytes")
-            if rows >= spec["cap"]:
-                break
+    rows = dl_bytes = 0
+    with tmp.open("w") as f, ThreadPoolExecutor(max_workers=3) as pool:
+        pending = [pool.submit(pull, s) for s in shards[:3]]
+        next_shard = 3
+        while pending and rows < spec["cap"]:
+            local = pending.pop(0).result()
+            dl_bytes += local.stat().st_size
+            for batch in pq.ParquetFile(local).iter_batches(batch_size=512, columns=cols):
+                for rec in batch.to_pylist():
+                    f.write(json.dumps(_jsonable(rec), ensure_ascii=False) + "\n")
+                    rows += 1
+                    if rows >= spec["cap"]:
+                        break
+                if rows >= spec["cap"]:
+                    break
+            local.unlink()
+            print(f"[{name}]   {rows} rows, downloaded {dl_bytes:,} bytes",
+                  flush=True)
+            if next_shard < len(shards) and rows < spec["cap"]:
+                pending.append(pool.submit(pull, shards[next_shard]))
+                next_shard += 1
+        for fut in pending:  # cap reached: drain prefetched shards
+            with contextlib.suppress(Exception):
+                fut.result().unlink()
+    shutil.rmtree(cache, ignore_errors=True)
     tmp.rename(out)
-    print(f"[{name}] DONE {rows} rows, {out.stat().st_size:,} bytes -> {out}")
+    print(f"[{name}] DONE {rows} rows, {out.stat().st_size:,} bytes jsonl "
+          f"({dl_bytes:,} bytes downloaded) -> {out}")
     return rows, out.stat().st_size
 
 
