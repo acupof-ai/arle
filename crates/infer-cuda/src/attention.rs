@@ -1685,6 +1685,18 @@ pub(crate) fn dsv4_dsa_official_enabled() -> Result<bool> {
     Ok(true)
 }
 
+/// #150 opt-in correctness lever (default OFF): `ARLE_DSV4_PROJ_BATCHED_BF16=1`
+/// forces the bf16 cublasLt path in [`proj_batched`] even at m>1, skipping the
+/// FP8-repack DeepGEMM lane. Measured partial mitigation for the concurrent-
+/// decode digit corruption: n=2 needle miss 57.1%→30.0% (= the n=1 floor),
+/// truncation-class corruption from this lane eliminated. Residual digit-
+/// substitution originates upstream (`mla_attention_prepare_proj_batch`,
+/// F8_E4M3-only weights — no bf16 fallback exists) and is NOT covered. Trades
+/// tensor-core throughput at n≥2 — no default flip without a perf license.
+fn dsv4_proj_batched_bf16_forced() -> Result<bool> {
+    env_flag("ARLE_DSV4_PROJ_BATCHED_BF16")
+}
+
 /// Batched-decode CSA select-metadata DEVICE build (default OFF). When ON, the
 /// per-step block_table/context_lens/positions host builds + 3 `memcpy_htod` are
 /// replaced by ONE on-device kernel (removes the per-step H2D a CUDA graph can't
@@ -7807,8 +7819,9 @@ fn proj_batched(
     input: &HiddenStates,
     out: &mut HiddenStates,
 ) -> Result<()> {
+    let force_bf16 = dsv4_proj_batched_bf16_forced()?;
     match (cache, scratch) {
-        (Some(cache), Some(scratch)) if input.seq_len > 1 => {
+        (Some(cache), Some(scratch)) if input.seq_len > 1 && !force_bf16 => {
             prefill_proj_deepgemm(ctx, scratch, cache, input, out)
         }
         _ => dsv4_linear(ctx, weight, input, out),
