@@ -3973,7 +3973,8 @@ impl Qwen35CudaExecutor {
         if let Err(e) = model.ctx.trim_memory_pool() {
             log::warn!("pre-KV-budget trim_memory_pool failed (non-fatal): {e}");
         }
-        let num_slots = model.kv_budget_num_slots(num_slots)?;
+        let dspark_slot_bytes = dspark_head.as_ref().map_or(0, |h| h.slot_state_bytes());
+        let num_slots = model.kv_budget_num_slots(num_slots, dspark_slot_bytes)?;
         cuda_startup_log(
             "qwen35_kv_budget",
             budget_t0,
@@ -4006,6 +4007,7 @@ impl Qwen35CudaExecutor {
             requested_pages,
             mem_fraction_static,
             kv_format,
+            dspark_slot_bytes,
         )?;
         cuda_startup_log("qwen35_paged_pool_alloc", pool_t0, format_args!("built"));
 
@@ -4075,6 +4077,7 @@ impl Qwen35CudaExecutor {
         requested_pages: usize,
         mem_fraction_static: f64,
         kv_format: KVFormat,
+        dspark_slot_bytes: usize,
     ) -> Result<PagedKVPool> {
         let num_full = model.config.num_full_attention_layers();
         let local_kv_heads = model.local_kv_heads();
@@ -4088,7 +4091,12 @@ impl Qwen35CudaExecutor {
         // weights + recurrent×slots + pool ≤ mem_fraction×free (mirrors DSv4
         // dsv4.rs:1687-1691). Per-rank free, num_slots already min-reduced.
         let (_per_slot, _kv_bytes, gdr_bytes, conv_bytes) = model.per_slot_kv_bytes();
-        let per_slot_recurrent = gdr_bytes.saturating_add(conv_bytes);
+        // DSpark draft ctx caches are per-slot lazily-allocated device buffers —
+        // reserve them here too, or the pool eats the VRAM the first dspark
+        // prefill needs.
+        let per_slot_recurrent = gdr_bytes
+            .saturating_add(conv_bytes)
+            .saturating_add(dspark_slot_bytes);
         let recurrent_reservation = per_slot_recurrent.saturating_mul(num_slots) as u64;
         let total_pool_pages = match model.ctx.mem_info_bytes() {
             Ok((free, total)) => {
@@ -4207,6 +4215,9 @@ impl Qwen35CudaExecutor {
             self.kv_pool_requested_pages,
             self.kv_pool_mem_fraction_static,
             self.kv_format,
+            self.dspark
+                .as_ref()
+                .map_or(0, |ds| ds.head.slot_state_bytes()),
         )?;
         log::info!(
             "Qwen3.6 re-acquired full-attn KV pool: {}MB (agent-OPD next-round rollout)",
@@ -4717,6 +4728,7 @@ impl Qwen35CudaExecutor {
             let st = self.model.new_spec_slot_state()?;
             self.dspark.as_mut().expect("dspark").spec[slot] = Some(st);
         }
+        let mut pt = crate::qwen35::dspark_phase_start(&self.model.ctx);
         // 1. Draft the block (draft-head-only; no trunk/pool state touched —
         //    the speculative noise K/V rows in the draft cache self-heal).
         let chain = {
@@ -4725,6 +4737,7 @@ impl Qwen35CudaExecutor {
             let df = ds.slots[slot].as_mut().expect("seeded slot");
             model.dspark_draft_block(&ds.head, df, &mut ds.scratch, row.last_token, start)?
         };
+        let draft_ms = crate::qwen35::mtp_phase_lap(&self.model.ctx, &mut pt);
         if chain.len() < 2 {
             // Confidence head rejected the whole block — warm step instead.
             let position = start.saturating_add(1) as u64;
@@ -4749,6 +4762,7 @@ impl Qwen35CudaExecutor {
         let spec = ds.spec[slot].as_mut().expect("built above");
         // 2. Snapshot the trunk linear state (partial-accept rollback base).
         spec.snapshot_trunk(&model.ctx, &slots[slot])?;
+        let snap_ms = crate::qwen35::mtp_phase_lap(&model.ctx, &mut pt);
         // 3. Verify the chain over the paged pool, capturing linear inputs
         //    (replay substrate) + trunk taps (ctx features of accepted rows).
         let pool = full_attn_kv.as_mut().expect("paged (gated by seeded)");
@@ -4778,6 +4792,7 @@ impl Qwen35CudaExecutor {
             &mut rc,
             &mut ds.taps,
         )?;
+        let verify_ms = crate::qwen35::mtp_phase_lap(&model.ctx, &mut pt);
         // 4. Accept scan + trunk rollback (linear replay; full-attn KV
         //    self-heals under the pool crop below).
         let (emitted, bonus, k) = model.dspark_accept_commit(
@@ -4795,10 +4810,18 @@ impl Qwen35CudaExecutor {
                 .expect("paged (gated by seeded)")
                 .truncate_slot(slot, start + k + 1)?;
         }
+        let accept_ms = crate::qwen35::mtp_phase_lap(&model.ctx, &mut pt);
         // 5. Extend the draft ctx cache with the accepted rows' features and
         //    stage the bonus as the next block's anchor.
         let df = ds.slots[slot].as_mut().expect("seeded slot");
         model.dspark_append_ctx(&ds.head, df, &mut ds.taps, &mut ds.scratch, k + 1, start)?;
+        let append_ms = crate::qwen35::mtp_phase_lap(&model.ctx, &mut pt);
+        if pt.is_some() {
+            eprintln!(
+                "[dspark-phase] chain={} accept={k} draft={draft_ms:.2} snap={snap_ms:.2} verify={verify_ms:.2} accept_commit={accept_ms:.2} append={append_ms:.2} ms",
+                chain.len()
+            );
+        }
         df.pending = Some(bonus);
         ds.accepts += k;
         ds.rejects += chain.len() - 1 - k;
