@@ -1,0 +1,21 @@
+crates/infer-cuda/src/attention/prefix_state.rs
+  s_019214967d126e::t_b1278ffda7510f 218-219,221,225,235
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "14b264ea7aba89bf6d1fec6477c764d17ade02ac",
+  "prompts": {},
+  "sessions": {
+    "s_019214967d126e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aa50035bcd677a837",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
