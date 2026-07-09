@@ -475,13 +475,14 @@ impl RealCudaExecutor {
         }
     }
 
-    /// Radix evicted these host-pool prefix pages: drop any sidecar keyed to
+    /// Radix evicted these host-pool prefix pages: drop any state keyed to
     /// them (eviction rides the radix, no independent sidecar LRU). Qwen3.5/3.6
-    /// hybrid only; other arms hold no per-page mirror below the seam.
+    /// drops recurrent sidecars; DSv4 drops prefix-state pool entries.
     pub(crate) fn release_prefix_pages(&mut self, pages: &[u32]) {
         match self {
             Self::Qwen35(q) => q.release_sidecar_pages(pages),
-            Self::Dsv4(_) | Self::Qwen(_) => {}
+            Self::Dsv4(d) => d.release_prefix_pages(pages),
+            Self::Qwen(_) => {}
         }
     }
 
@@ -1817,6 +1818,10 @@ pub(crate) struct Dsv4CudaExecutor {
     /// slots — lives here as 16 MiB chunks under a per-key manifest,
     /// partitioned by `NS_*` key namespaces.
     slot_tier: CudaKvTierStore,
+    /// Content-keyed cross-request prefix-state pool (#154 Phase 2): one
+    /// host-resident entry per completed host page, written from the
+    /// post-forward choke point, consumed by the prefix restore path.
+    prefix_state: crate::attention::Dsv4PrefixStatePool,
 }
 
 /// `slot_tier` key namespaces (top byte, see `kv_tier::tier_key`), so features
@@ -2287,6 +2292,17 @@ impl Dsv4CudaExecutor {
         let spec_slots = (0..num_slots)
             .map(|_| Dsv4SpecSlotState::default())
             .collect();
+        let layer_specs: Vec<_> = model
+            .layers
+            .iter()
+            .map(|layer| (layer.mode, layer.compress_ratio))
+            .collect();
+        let prefix_entry_bytes = crate::attention::dsv4_prefix_entry_max_bytes(
+            &model.config,
+            &model.kv_arena,
+            &layer_specs,
+            model.kv_arena.page_block_size,
+        );
         Ok(Self {
             model,
             slots,
@@ -2303,7 +2319,72 @@ impl Dsv4CudaExecutor {
                 default_t1_budget_bytes(DEFAULT_DRAM_FRACTION),
                 BLOB_CHUNK_BYTES,
             ),
+            prefix_state: crate::attention::Dsv4PrefixStatePool::new(
+                default_t1_budget_bytes(DEFAULT_DRAM_FRACTION),
+                prefix_entry_bytes,
+            ),
         })
+    }
+
+    /// Publish every host page this forward completed for `slot` into the
+    /// content-keyed prefix-state pool (#154 Phase 2 write hook). Best-effort:
+    /// a publish failure only forfeits a future reuse, never the forward.
+    fn publish_completed_prefix_pages(
+        &mut self,
+        slot: usize,
+        slot_pages: &[u32],
+        start_pos: usize,
+        end_pos: usize,
+    ) {
+        if self.prefix_state.is_inactive() {
+            return;
+        }
+        let page_tokens = self.model.kv_arena.page_block_size;
+        if page_tokens == 0 || end_pos <= start_pos {
+            return;
+        }
+        let align = self.model.config.sliding_window.max(1);
+        for page_index in (start_pos / page_tokens)..(end_pos / page_tokens) {
+            let page_end = (page_index + 1) * page_tokens;
+            let Some(&page_id) = slot_pages.get(page_index) else {
+                warn!(
+                    "DSv4 prefix publish: slot {slot} page {page_index} outside host table ({} pages)",
+                    slot_pages.len()
+                );
+                return;
+            };
+            // Boundary sections exist only when the forward ended exactly here;
+            // restore commits only at `align` multiples, so skip odd page ends.
+            let boundary = page_end == end_pos && page_end.is_multiple_of(align);
+            match self.slots[slot].capture_prefix_page(
+                &self.model.ctx,
+                &self.model.layers,
+                &self.kv_adapter,
+                &self.model.kv_arena,
+                self.model.config.index_head_dim,
+                page_tokens,
+                page_index,
+                boundary,
+            ) {
+                Ok(entry) => {
+                    if !self.prefix_state.publish(page_id, &entry) {
+                        warn!(
+                            "DSv4 prefix publish: pool refused host page {page_id} \
+                             (slot {slot} idx {page_index})"
+                        );
+                    }
+                }
+                Err(err) => {
+                    warn!("DSv4 prefix publish failed for slot {slot} page {page_index}: {err:#}")
+                }
+            }
+        }
+    }
+
+    /// Radix evicted these host pages: drop their pool entries (the pool's
+    /// lifetime rides the radix, no independent lifetime above the DRAM budget).
+    pub(crate) fn release_prefix_pages(&mut self, pages: &[u32]) {
+        self.prefix_state.remove_pages(pages);
     }
 
     /// Attach the opt-in NVMe disk spill level (pre-serve only).
@@ -2316,9 +2397,10 @@ impl Dsv4CudaExecutor {
             .set_disk(root, budget_bytes, BLOB_CHUNK_BYTES)
     }
 
-    /// Pre-serve re-budget rebuilds THE store, orphaning every stored blob.
+    /// Pre-serve re-budget rebuilds THE stores, orphaning every stored blob.
     pub(crate) fn set_kv_tier_budget_bytes(&mut self, bytes: usize) {
         self.slot_tier = CudaKvTierStore::with_budget(bytes, BLOB_CHUNK_BYTES);
+        self.prefix_state.set_budget_bytes(bytes);
     }
 
     pub(crate) fn kv_tier_host_demoted_pages(&self) -> usize {
@@ -2596,7 +2678,24 @@ impl Dsv4CudaExecutor {
             .collect())
     }
 
+    /// One decode sub-batch, then the prefix-state publish hook: any row that
+    /// crossed a host-page boundary this tick (MTP may commit several tokens)
+    /// publishes its completed pages from the post-forward device state.
     fn forward_decode_batch(
+        &mut self,
+        rows: &[DecodeRow],
+        kv_batch: &KvBatchDescriptor,
+    ) -> Result<Vec<SlotToken>> {
+        let out = self.forward_decode_batch_inner(rows, kv_batch)?;
+        for (row, kv_row) in rows.iter().zip(&kv_batch.rows) {
+            let slot_pages = &kv_batch.flat_slot_page_ids[kv_row.slot_page_range.clone()];
+            let end_pos = self.slots[row.slot].seq_len();
+            self.publish_completed_prefix_pages(row.slot, slot_pages, row.kv_seq_len, end_pos);
+        }
+        Ok(out)
+    }
+
+    fn forward_decode_batch_inner(
         &mut self,
         rows: &[DecodeRow],
         kv_batch: &KvBatchDescriptor,
@@ -2864,6 +2963,15 @@ impl Dsv4CudaExecutor {
             final_prefill,
         )?;
         let slot = row.slot;
+        // Prefix-state publish hook: this chunk completed pages
+        // [start_pos/page, (start_pos+len)/page).
+        let slot_pages = &kv_batch.flat_slot_page_ids[kv_batch.rows[0].slot_page_range.clone()];
+        self.publish_completed_prefix_pages(
+            slot,
+            slot_pages,
+            row.start_pos,
+            row.start_pos + row.tokens.len(),
+        );
         Ok(tokens
             .into_iter()
             .map(|token| SlotToken {

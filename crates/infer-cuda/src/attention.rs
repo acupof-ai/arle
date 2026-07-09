@@ -40,7 +40,6 @@ pub(crate) use dsa::*;
 
 #[path = "attention/prefix_state.rs"]
 mod prefix_state;
-#[allow(unused_imports)] // consumed by the publish/restore executor commits
 pub(crate) use prefix_state::*;
 const DSV4_FLASHMLA_MODEL1: i32 = 1;
 /// GLM-5.2 V32 model-type int passed to the FlashMLA sparse decode shim

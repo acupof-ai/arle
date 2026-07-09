@@ -1239,6 +1239,57 @@ impl Dsv4SlotState {
         Ok(())
     }
 
+    /// D2H one completed host page's state across every layer into a
+    /// content-keyed pool entry (#154 Phase 2 publish hook). `boundary` = the
+    /// forward ended exactly at this page's end (the only moment the page-end
+    /// overlap registers + ring are observable).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn capture_prefix_page(
+        &self,
+        ctx: &DeviceContext,
+        layers: &[Dsv4Layer],
+        kv_adapter: &crate::attention::Dsv4KvAdapter,
+        kv_arena: &Dsv4MlaKvArena,
+        index_head_dim: usize,
+        page_tokens: usize,
+        page_index: usize,
+        boundary: bool,
+    ) -> Result<crate::attention::Dsv4PrefixPageEntry> {
+        ensure!(
+            layers.len() == self.attention.len(),
+            "DSv4 prefix capture layer count {} != attention states {}",
+            layers.len(),
+            self.attention.len()
+        );
+        let states = self
+            .attention
+            .iter()
+            .enumerate()
+            .map(|(idx, state)| {
+                let pool = kv_adapter.layer(idx)?;
+                state.capture_prefix_page(
+                    ctx,
+                    pool,
+                    kv_arena,
+                    layers[idx].mode,
+                    layers[idx].compress_ratio,
+                    index_head_dim,
+                    page_tokens,
+                    page_index,
+                    boundary,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        // clone_dtoh copies are stream-ordered; host vectors valid after drain.
+        ctx.sync()?;
+        Ok(crate::attention::Dsv4PrefixPageEntry {
+            page_index: u32::try_from(page_index)
+                .map_err(|_| anyhow!("DSv4 prefix page index {page_index} exceeds u32"))?,
+            boundary,
+            layers: states,
+        })
+    }
+
     pub(crate) fn truncate(
         &mut self,
         layers: &[Dsv4Layer],

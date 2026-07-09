@@ -8,7 +8,7 @@
 //! Zero HBM footprint: the pool IS the L2 tier (`CudaKvTierStore` host level);
 //! L3 is the same store's mmap spill.
 
-// Wired by the publish/restore executor commits in this series.
+// Restore/L3 halves are wired by the later commits in this series.
 #![allow(dead_code)]
 
 use std::collections::BTreeMap;
