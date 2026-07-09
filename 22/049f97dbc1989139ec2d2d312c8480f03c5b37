@@ -1,0 +1,21 @@
+docs/experience/wins/2026-07-10-dsv4-park-deletion-phase2b.md
+  s_764555636edde6::t_54809547fbdf46 1-65
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "22049f97dbc1989139ec2d2d312c8480f03c5b37",
+  "prompts": {},
+  "sessions": {
+    "s_764555636edde6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-af7dae10a760f74ef",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
