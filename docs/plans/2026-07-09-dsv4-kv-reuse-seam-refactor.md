@@ -138,9 +138,48 @@ reinstated = `sliding_window` (128); the full-match pop-trim in
 clamped length stays ring-aligned. `reusable_prefix_blocks` returns
 consecutive pool-present pages floored to the alignment.
 
+**Gap audit (2026-07-10) — folded into the design:**
+- **G13 (design-critical)**: overlap/ring are boundary-TRANSIENT (register
+  overwritten every ratio tokens; ring wraps) — a post-forward hook can only
+  capture the LAST boundary per forward call. Entries therefore split:
+  *per-page section* (FP8 band rows / bf16 staging rows / dsa rows —
+  positionally stored, capturable for every completed page) and
+  *per-boundary section* (overlap + ring — captured only at prefill chunk
+  ends + decode 128-crossings; `f317a7e27` already forces chunks onto
+  128-alignment so every capture point aligns). Restore floor = highest
+  128-boundary with a per-boundary entry whose lower pages are all present.
+  v1 ships with chunk-granular prefill reuse; v2 (page-granular) = kernel
+  per-block overlap output into a per-slot capture buffer (the kernel's
+  `overlap_page_stride` param survives; no sharing, no D1 recurrence) —
+  deferred until reuse-hit telemetry justifies it.
+- **G1/G2**: host page ids RECYCLE — entries are provisional at capture,
+  confirmed at radix publish, dropped unconditionally on page free/abort
+  (the D2 lesson, now at L2). Whether generated-token pages enter the radix
+  (multi-turn reuse) must be read from `prefix.rs`'s publish path, not
+  assumed.
+- **G6**: entry schema is per-layer-ratio-shaped (`rows_per_page = 64/ratio`;
+  cr=128 rows span pages, stored at completion page; SWA layers ring-only;
+  GLM dsa ratio=1) — no hardcoded cr=4 shapes.
+- **G8**: capture sits AFTER the spec-decode commit point — rejected drafts
+  never enter the pool. **G11**: pool + L3 entries carry the weight-epoch
+  tag (#9 `recall_tier` pattern); weight hot-swap flushes. **G3**: TP ranks
+  each hold a replicated copy (rank-identical writes proven) — 4× DRAM,
+  named and accepted.
+- **Exhaustion cascade (2b/3b)**: HBM page exhaustion → preempt = flush
+  in-flight D2H + free pages + requeue (completed pages are ALREADY in L2 —
+  publish-is-the-demotion, zero-copy preemption); L2 over budget → LRU to
+  NVMe; NVMe over soft cap → self-evict oldest (only here is reuse history
+  lost). "Complete exhaustion" is not a correctness event anywhere on the
+  cascade; admission watermark tunes preemption frequency. Evidence gate
+  gains a lane: deliberately breach the watermark, verify preempt-resume
+  correctness.
+
 **Sequencing**: 2a pools + cross-request reuse + L2/L3 (this design) →
 pod evidence gate → 2b park replacement (delete `Dsv4LayerImage`/swap,
-promote = attach + tail re-prefill) only after 2a's gate is green.
+promote = attach + tail re-prefill; preemption rides the cascade above) →
+3b on-demand band paging (admission watermark; enablers already landed:
+dirty-bit contract, `flashmla_alloc_append`, page-granular admission
+machinery) — each with its own pod gate, one variable per gate.
 
 ## Phase 2 — direct reuse = cross-request reuse (delete Route B leftovers)
 
