@@ -25,6 +25,13 @@ lifecycle & progress spine).
 
 ### Verdicts
 
+- **2026-07-10 — Qwen3.6 DSpark block draft LICENSED (short-ctx greedy)**:
+  36.2 ms/step, 104–108 tok/s = 2.4× plain decode on H20 after quant-lane
+  routing (row-serial GEMV → DeepGEMM/cuBLASLt at B≥16); needle ×3 +
+  self-consistency PASS, plain-decode control unregressed. OPD-rollout claim
+  still gated on long-ctx A/B + the prefix-restore draft-ctx gap.
+  [wins](docs/experience/wins/2026-07-10-qwen36-dspark-block-draft-licensed-2p4x.md)
+
 - **DSv4 decode-kernel levers #141/#142/#143 LICENSED (2026-07-04).** uint4-vectorized
   FP8 GEMVs + TILE-templated batch accumulator + warp-parallel mhc_params tail with a
   fused params|pre_rms_norm decode-graph pair. Matched binary-pair A/B (TP=4/EP=4,
