@@ -36,6 +36,7 @@ mod serve_engine;
 mod student_lora;
 mod types;
 
+pub use infer_seam::{CommBackend, CudaRuntimeFlags, MetalRuntimeFlags};
 #[cfg(feature = "cuda")]
 pub use loaded::CudaWorkerEngine;
 #[cfg(any(

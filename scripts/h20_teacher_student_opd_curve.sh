@@ -98,6 +98,11 @@ fi
 [[ "$GSM8K_MAX_TOKENS" -ge 2048 ]] || die "GSM8K_MAX_TOKENS must be >=2048 for untruncated GSM8K eval"
 [[ "$TEACHER_RUNTIME" =~ ^(infer|in-process)$ ]] || die "TEACHER_RUNTIME must be infer or in-process"
 [[ "$ENGINE_OFFLOAD" =~ ^(off|0|false|student|teacher|all|1|true)$ ]] || die "ENGINE_OFFLOAD must be off/0/false/student/teacher/all/1/true"
+# Normalize legacy env spellings to the `--engine-offload` flag values.
+case "$ENGINE_OFFLOAD" in
+  0|false) ENGINE_OFFLOAD=off ;;
+  1|true) ENGINE_OFFLOAD=all ;;
+esac
 if [[ -z "$LR_WARMUP_STEPS" ]]; then
   LR_WARMUP_STEPS=$(((STEPS * 3 + 99) / 100))
 fi
@@ -243,11 +248,11 @@ if [[ "$RUN_TRAIN" == "1" ]]; then
     train_args+=(--eval-ids "$EVAL_IDS")
   fi
 
+  train_args+=(--engine-offload "$ENGINE_OFFLOAD")
   log "train command:"
-  printf '  ARLE_OPD_ENGINE_OFFLOAD=%q' "$ENGINE_OFFLOAD"
   printf '  %q' "$ARLE_BIN" "${train_args[@]}"
   printf '\n'
-  ARLE_OPD_ENGINE_OFFLOAD="$ENGINE_OFFLOAD" "$ARLE_BIN" "${train_args[@]}" 2>&1 | tee "$LOG_DIR/train.log"
+  "$ARLE_BIN" "${train_args[@]}" 2>&1 | tee "$LOG_DIR/train.log"
   check_checkpoint_dirs
 else
   log "RUN_TRAIN=0; manifest was written but checkpoints were not produced"
