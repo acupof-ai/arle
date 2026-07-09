@@ -52,6 +52,10 @@ pub mod qwen35_checkpoint;
 pub mod qwen35_loader;
 #[path = "replay_buffer.rs"]
 pub mod replay_buffer;
+// CLI-driven runtime toggles (train flags -> statics; no env reads).
+#[path = "runtime_flags.rs"]
+mod runtime_flags;
+pub use runtime_flags::{TrainRuntimeFlags, apply_runtime_flags};
 #[path = "rubric.rs"]
 pub mod rubric;
 #[path = "rubric_opd.rs"]

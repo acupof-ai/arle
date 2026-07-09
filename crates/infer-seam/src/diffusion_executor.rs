@@ -80,12 +80,6 @@ impl<M> BufferedDiffusionExecutor<M> {
         if let Some(max_new_tokens) = params.max_new_tokens {
             config.max_new_tokens = max_new_tokens;
         }
-        if let Ok(raw) = std::env::var("ARLE_DIFFUSION_MAX_DENOISING_STEPS")
-            && let Ok(steps) = raw.parse::<usize>()
-            && steps > 0
-        {
-            config.max_denoising_steps = steps;
-        }
         if let Some(seed) = params.seed {
             config.seed = seed;
         }
