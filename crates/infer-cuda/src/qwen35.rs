@@ -61,6 +61,9 @@ use crate::ops::{
 };
 use crate::workspace::{HiddenSlot, SliceSlot, VecSlot};
 
+#[path = "qwen35/dspark.rs"]
+pub(crate) mod dspark;
+
 const DEFAULT_ROPE_CACHE_LEN: usize = 32_768;
 const QWEN35_BATCHED_DECODE_KV_SPLITS: usize = 4;
 
@@ -3007,7 +3010,7 @@ impl Qwen35Model {
         tokens: &[u32],
         start_pos: usize,
     ) -> Result<()> {
-        self.forward_hidden_capture(slot, ws, tokens, start_pos, None, None)
+        self.forward_hidden_capture(slot, ws, tokens, start_pos, None, None, None)
     }
 
     /// [`Self::forward_hidden`] with an optional per-linear-layer gated-delta
@@ -3024,6 +3027,7 @@ impl Qwen35Model {
         start_pos: usize,
         capture: Option<&mut Qwen35LinearCapture>,
         recall: Option<&mut Qwen35RecallForward>,
+        taps: Option<&mut dspark::Qwen35DsparkTaps>,
     ) -> Result<()> {
         ensure!(
             !tokens.is_empty(),
@@ -3043,7 +3047,7 @@ impl Qwen35Model {
             self.max_seq_len
         );
         self.stage_step_inputs(ws, tokens, start_pos)?;
-        self.forward_hidden_staged(slot, ws, seq_len, start_pos, capture, recall)?;
+        self.forward_hidden_staged(slot, ws, seq_len, start_pos, capture, recall, taps)?;
         slot.seq_len += seq_len;
         Ok(())
     }
@@ -3088,6 +3092,7 @@ impl Qwen35Model {
         start_pos: usize,
         mut capture: Option<&mut Qwen35LinearCapture>,
         mut recall: Option<&mut Qwen35RecallForward>,
+        mut taps: Option<&mut dspark::Qwen35DsparkTaps>,
     ) -> Result<()> {
         // Single chokepoint for every recurrent-reading forward (prefill /
         // decode / spec-capture / OPD): the slot's recurrent block MUST be
@@ -3130,6 +3135,10 @@ impl Qwen35Model {
         qwen35_profile(&self.ctx, "qwen/embedding", None, seq_len, || {
             embedding_batch(&self.ctx, &self.embed_tokens, token_ids, hidden)
         })?;
+        // DSpark tap: `-1` = the embedding output (residual stream pre-layer-0).
+        if let Some(t) = taps.as_deref_mut() {
+            t.capture(&self.ctx, -1, hidden)?;
+        }
         let normed = normed.get(&self.ctx, hidden_size, seq_len)?;
         let hidden_mid = hidden_mid.get(&self.ctx, hidden_size, seq_len)?;
         let attn_out = attn_out.get(&self.ctx, hidden_size, seq_len)?;
@@ -3268,6 +3277,10 @@ impl Qwen35Model {
                 seq_len,
                 || add_batch(&self.ctx, hidden_mid, mlp_out, hidden),
             )?;
+            // DSpark tap: the residual-stream OUTPUT of this layer.
+            if let Some(t) = taps.as_deref_mut() {
+                t.capture(&self.ctx, layer_idx as i64, hidden)?;
+            }
         }
 
         Ok(())
@@ -3313,13 +3326,33 @@ impl Qwen35Model {
         position: u64,
         recall: &mut Qwen35RecallForward,
     ) -> Result<u32> {
+        self.forward_tokens_recall_tapped(
+            slot, ws, tokens, start_pos, params, position, recall, None,
+        )
+    }
+
+    /// [`Self::forward_tokens_recall`] with an optional DSpark trunk-tap
+    /// capture (`--spec-type dspark` prefill/warm steps). `None` is
+    /// byte-identical to the untapped path.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_tokens_recall_tapped(
+        &self,
+        slot: &mut Qwen35SlotState,
+        ws: &mut Qwen35Workspace,
+        tokens: &[u32],
+        start_pos: usize,
+        params: &SamplingParams,
+        position: u64,
+        recall: &mut Qwen35RecallForward,
+        taps: Option<&mut dspark::Qwen35DsparkTaps>,
+    ) -> Result<u32> {
         ensure!(
             !tokens.is_empty(),
             "Qwen3.5 recall forward requires at least one token"
         );
         let seq_len = tokens.len();
         self.stage_step_inputs(ws, tokens, start_pos)?;
-        self.forward_hidden_staged(slot, ws, seq_len, start_pos, None, Some(recall))?;
+        self.forward_hidden_staged(slot, ws, seq_len, start_pos, None, Some(recall), taps)?;
         slot.seq_len += seq_len;
         self.lm_head_logits(ws, seq_len)?;
         self.sample_workspace_logits(ws, params, position)
@@ -3455,7 +3488,7 @@ impl Qwen35Model {
         ws: &mut Qwen35Workspace,
         start_pos: usize,
     ) -> Result<()> {
-        self.forward_hidden_staged(slot, ws, 1, start_pos, None, None)?;
+        self.forward_hidden_staged(slot, ws, 1, start_pos, None, None, None)?;
         self.lm_head_logits(ws, 1)
     }
 
@@ -3591,7 +3624,7 @@ impl Qwen35Model {
         start_pos: usize,
         capture: Option<&mut Qwen35LinearCapture>,
     ) -> Result<(DeviceVec, [usize; 2], DeviceVec)> {
-        self.forward_hidden_capture(slot, ws, tokens, start_pos, capture, None)?;
+        self.forward_hidden_capture(slot, ws, tokens, start_pos, capture, None, None)?;
         let seq_len = tokens.len();
         let eps = self.config.rms_norm_eps;
         let hidden_size = self.config.hidden_size;
