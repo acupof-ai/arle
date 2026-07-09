@@ -1,0 +1,21 @@
+scripts/clean_opd_corpora.py
+  s_94ce5908b6c7bb::t_bf1e745a191dd0 1-345
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "f5695011eef6c868dff03485a3d5377eb79a6d35",
+  "prompts": {},
+  "sessions": {
+    "s_94ce5908b6c7bb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a8744832334b16ddb",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
