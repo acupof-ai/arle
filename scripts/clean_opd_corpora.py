@@ -122,8 +122,8 @@ def _swe_task(row: dict, name: str) -> dict:
         "repo": row["repo"],
         # SWE-smith has no base_commit: tasks are branches (named by
         # instance_id) of the swesmith/<repo>.<shortsha> mirror; carry the
-        # short sha from the repo slug so the field stays truthful.
-        "base_commit": row.get("base_commit") or row["repo"].rsplit(".", 1)[-1],
+        # branch name — the repo-slug short sha is not a fetchable ref.
+        "base_commit": row.get("base_commit") or row["instance_id"],
         "test_patch": row.get("test_patch") or "",
         "fail_to_pass": fail_to_pass,
         "selected_test_files_to_run": sorted(
