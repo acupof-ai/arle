@@ -7,8 +7,8 @@ from __future__ import annotations
 
 from . import Gate, Verdict, build_doc, query
 
-QUESTION = "\n\nQuestion: What is the secret access code?\nAnswer:"
-NEEDLE = "738291"
+QUESTION = "\n\nQuestion: What does the treasure chest contain?\nAnswer:"
+NEEDLE = "427 gold coins"
 
 
 class NeedleLadderGate(Gate):

@@ -25,8 +25,8 @@ from . import (
     stat_delta,
 )
 
-QUESTION = "\n\nQuestion: What is the secret access code stated in the document?\nAnswer:"
-NEEDLE = "738291"
+QUESTION = "\n\nQuestion: What does the treasure chest contain?\nAnswer:"
+NEEDLE = "427 gold coins"
 
 
 class PrefixReuseGate(Gate):
