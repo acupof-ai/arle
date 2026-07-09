@@ -4534,8 +4534,7 @@ impl Qwen35CudaExecutor {
         let is_final = row.start_pos + row.tokens.len() == row.total_tokens;
         // Speculation resumes only when the whole prompt made it into the ctx
         // cache; a gap (e.g. sidecar-restored prefix) degrades to plain decode.
-        df.pending =
-            (is_final && df.ctx_len == row.total_tokens && row.params.is_greedy()).then_some(token);
+        df.pending = (is_final && df.ctx_len == row.total_tokens).then_some(token);
         Ok(token)
     }
 
@@ -4616,9 +4615,9 @@ impl Qwen35CudaExecutor {
             .as_ref()
             .expect("dspark_decode_row without dspark");
         // The verify appends block_size+1 rows, so the whole chain must fit the
-        // trunk cap; near the cap, degrade to single-token steps.
-        let seeded = row.params.is_greedy()
-            && self.full_attn_paged()
+        // trunk cap; near the cap, degrade to single-token steps. Greedy rows
+        // verify by argmax match; sampling rows by rejection sampling.
+        let seeded = self.full_attn_paged()
             && start + ds.head.block_size() < self.model.max_seq_len()
             && matches!(
                 ds.slots[row.slot].as_ref(),
@@ -4638,12 +4637,11 @@ impl Qwen35CudaExecutor {
 
     /// One no-spec decode step that keeps the DSpark draft warm: paged decode
     /// with tap capture, extending the ctx cache + pending anchor when the
-    /// cache is contiguous. Non-greedy / non-paged rows run plain and clear the
-    /// draft state (speculation re-seeds at the next greedy step).
+    /// cache is contiguous. Non-paged rows run plain and clear the draft state
+    /// (speculation re-seeds at the next paged step).
     fn dspark_warm_decode_row(&mut self, row: &DecodeRow, position: u64) -> Result<u32> {
         let slot = row.slot;
-        let greedy = row.params.is_greedy();
-        if !greedy || !self.full_attn_paged() {
+        if !self.full_attn_paged() {
             if let Some(df) = self.dspark.as_mut().and_then(|ds| ds.slots[slot].as_mut()) {
                 df.pending = None;
             }
@@ -4719,8 +4717,9 @@ impl Qwen35CudaExecutor {
     /// cache, verify the chain in ONE trunk forward over the paged pool
     /// (linear-capture + taps), accept the longest matching prefix, roll the
     /// trunk back on partial accept, crop the pool, and extend the draft ctx
-    /// with the accepted rows' features. Token-exact to greedy no-spec decode
-    /// (every committed token is a trunk argmax).
+    /// with the accepted rows' features. Greedy rows are token-exact to no-spec
+    /// decode (every committed token is a trunk argmax); sampling rows commit
+    /// rejection-sampled tokens distributed exactly as filtered target sampling.
     fn dspark_spec_row(&mut self, row: &DecodeRow) -> Result<Vec<SlotToken>> {
         let slot = row.slot;
         let start = row.kv_seq_len;
@@ -4731,11 +4730,18 @@ impl Qwen35CudaExecutor {
         let mut pt = crate::qwen35::dspark_phase_start(&self.model.ctx);
         // 1. Draft the block (draft-head-only; no trunk/pool state touched —
         //    the speculative noise K/V rows in the draft cache self-heal).
-        let chain = {
+        let (chain, q) = {
             let Self { model, dspark, .. } = self;
             let ds = dspark.as_mut().expect("dspark");
             let df = ds.slots[slot].as_mut().expect("seeded slot");
-            model.dspark_draft_block(&ds.head, df, &mut ds.scratch, row.last_token, start)?
+            model.dspark_draft_block(
+                &ds.head,
+                df,
+                &mut ds.scratch,
+                row.last_token,
+                start,
+                &row.params,
+            )?
         };
         let draft_ms = crate::qwen35::mtp_phase_lap(&self.model.ctx, &mut pt);
         if chain.len() < 2 {
@@ -4795,14 +4801,20 @@ impl Qwen35CudaExecutor {
         let verify_ms = crate::qwen35::mtp_phase_lap(&model.ctx, &mut pt);
         // 4. Accept scan + trunk rollback (linear replay; full-attn KV
         //    self-heals under the pool crop below).
-        let (emitted, bonus, k) = model.dspark_accept_commit(
-            &mut slots[slot],
-            spec,
-            workspace,
-            &chain,
-            &logits,
-            start,
-        )?;
+        let (emitted, bonus, k) = if row.params.is_greedy() {
+            model.dspark_accept_commit(&mut slots[slot], spec, workspace, &chain, &logits, start)?
+        } else {
+            model.dspark_accept_commit_sampled(
+                &mut slots[slot],
+                spec,
+                workspace,
+                &chain,
+                &q,
+                &logits,
+                start,
+                &row.params,
+            )?
+        };
         drop(rc);
         if k + 1 < chain.len() {
             full_attn_kv
