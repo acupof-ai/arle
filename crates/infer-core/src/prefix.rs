@@ -93,6 +93,11 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             return Ok(());
         }
 
+        // Pin matched pages first (page_refs++ / radix ref_count++) so the
+        // pre-eviction below can't reclaim pages we're about to attach.
+        self.kv.retain_pages(&prefix_match.block_ids);
+        self.radix.retain_blocks(&prefix_match.block_ids);
+
         // Fixed-band pools (DSv4): attach_pages tops up to `fixed_pages_per_slot`
         // from the free pool. Pre-evict prefix cache if free is short, so the
         // attach doesn't bail mid-flight (the admission guard's token-based
@@ -105,8 +110,6 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             }
         }
 
-        self.kv.retain_pages(&prefix_match.block_ids);
-        self.radix.retain_blocks(&prefix_match.block_ids);
         if let Err(err) =
             self.kv
                 .attach_pages(slot, &prefix_match.block_ids, prefix_match.matched_len)

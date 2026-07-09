@@ -2602,6 +2602,15 @@ impl Dsv4CudaExecutor {
         validate_dsv4_decode_kv_batch(rows, kv_batch)?;
         let kv_view = self.kv_adapter.prepare_kv_batch(kv_batch)?;
         validate_dsv4_decode_kv_view(rows, &kv_view)?;
+        // Host band changed since last sync (page growth at a page boundary) —
+        // refresh the graph-referenced device tables BEFORE the forward. Decode
+        // growth previously never resynced the device table (#154 Phase 0).
+        for row in rows {
+            if self.kv_adapter.take_device_table_dirty(row.slot) {
+                self.slots[row.slot]
+                    .refresh_flashmla_device_page_tables(&self.model.ctx, &self.kv_adapter)?;
+            }
+        }
         let batch = Dsv4DecodeBatch::from_rows(rows, &self.slots, self.num_slots)?;
         ensure!(
             batch.slot_ids.len() == batch.rows.len()
@@ -2837,9 +2846,11 @@ impl Dsv4CudaExecutor {
         if row.start_pos == 0 {
             self.kv_adapter.zero_slot_band(&self.model.ctx, row.slot)?;
         }
-        // Sync the graph-referenced device tables to the freshly mirrored band.
-        self.slots[row.slot]
-            .refresh_flashmla_device_page_tables(&self.model.ctx, &self.kv_adapter)?;
+        // Host band changed since last sync — refresh the graph-referenced device tables.
+        if self.kv_adapter.take_device_table_dirty(row.slot) {
+            self.slots[row.slot]
+                .refresh_flashmla_device_page_tables(&self.model.ctx, &self.kv_adapter)?;
+        }
         let position = (row.start_pos + row.tokens.len()) as u64;
         let final_prefill = row.start_pos + row.tokens.len() >= row.total_tokens;
         let tokens = self.forward_prefill_tokens(

@@ -266,17 +266,22 @@ impl Dsv4FlashMlaDecodeState {
         ctx: &DeviceContext,
         pool: &Dsv4LayerKvLayout,
     ) -> Result<()> {
-        let table_i32: Vec<i32> = pool
+        let mut table_i32: Vec<i32> = pool
             .flashmla_page_table(self.slot_idx)?
             .iter()
             .map(|&p| p as i32)
             .collect();
         ensure!(
-            table_i32.len() == self.device_page_table.len(),
+            table_i32.len() <= self.device_page_table.len(),
             "DSv4 FlashMLA device page table size mismatch: host {} vs device {}",
             table_i32.len(),
             self.device_page_table.len()
         );
+        // Host tables carry only real pages (#154 Phase 0); the graph-captured
+        // device table is fixed-size, so pad HERE — the one device-format
+        // padding boundary.
+        let pad = table_i32.last().copied().unwrap_or(0);
+        table_i32.resize(self.device_page_table.len(), pad);
         ctx.stream
             .memcpy_htod(&table_i32, &mut self.device_page_table)
             .map_err(|e| anyhow!("DSv4 FlashMLA device page table H2D failed: {e}"))?;

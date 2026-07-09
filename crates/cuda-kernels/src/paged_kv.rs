@@ -844,7 +844,10 @@ impl TokenKVPool {
     /// Mirror a fixed logical page band for a slot while setting an independent
     /// logical token cursor. Used by DSv4 FlashMLA: the slot page table is
     /// `[SW ring | compressed region]`, not `ceil(seq_len / page_size)`.
-    pub fn mirror_band(&mut self, slot: usize, pages: &[u32], seq_len: usize) -> Result<()> {
+    /// Returns whether the slot's page list CHANGED (#154 Phase 0: the caller's
+    /// device-table refresh is dirty-driven). An unchanged page list only
+    /// updates the token cursor — no release/claim refcount churn.
+    pub fn mirror_band(&mut self, slot: usize, pages: &[u32], seq_len: usize) -> Result<bool> {
         ensure!(
             slot < self.num_slots,
             "TokenKVPool::mirror_band slot {slot} out of range {}",
@@ -856,6 +859,10 @@ impl TokenKVPool {
                 "TokenKVPool::mirror_band page {page} out of range {}",
                 self.max_total_pages
             );
+        }
+        if pages == self.page_indices[slot] {
+            self.seq_lens[slot] = seq_len;
+            return Ok(false);
         }
         let old_pages = std::mem::take(&mut self.page_indices[slot]);
         for page in old_pages.iter().copied() {
@@ -874,7 +881,7 @@ impl TokenKVPool {
         }
         self.page_indices[slot].extend_from_slice(pages);
         self.seq_lens[slot] = seq_len;
-        Ok(())
+        Ok(true)
     }
 
     /// Attach already-live pages to an empty slot.
@@ -2704,7 +2711,11 @@ mod tests {
             self.page_attach_count[idx] = self.page_attach_count[idx].saturating_add(1);
         }
 
-        fn mirror_band(&mut self, slot: usize, pages: &[u32], seq_len: usize) {
+        fn mirror_band(&mut self, slot: usize, pages: &[u32], seq_len: usize) -> bool {
+            if pages == self.page_indices[slot] {
+                self.seq_lens[slot] = seq_len;
+                return false;
+            }
             let old = std::mem::take(&mut self.page_indices[slot]);
             for page in old {
                 self.page_attach_count[page as usize] =
@@ -2716,6 +2727,7 @@ mod tests {
             }
             self.page_indices[slot].extend_from_slice(pages);
             self.seq_lens[slot] = seq_len;
+            true
         }
 
         fn retain(&mut self, pages: &[u32]) {
@@ -3013,7 +3025,7 @@ mod tests {
     #[test]
     fn mirror_band_claims_pages_and_releases_old_band() {
         let mut pool = MockPool::new(8, 2, 16);
-        pool.mirror_band(0, &[2, 3, 4], 0);
+        assert!(pool.mirror_band(0, &[2, 3, 4], 0), "fresh band = changed");
         assert_eq!(pool.page_indices[0], vec![2, 3, 4]);
         assert_eq!(pool.seq_lens[0], 0);
         for page in [2, 3, 4] {
@@ -3024,7 +3036,15 @@ mod tests {
             );
         }
 
-        pool.mirror_band(0, &[5, 6], 7);
+        // Unchanged page list (decode tick): cursor-only update, no refcount
+        // churn, reports unchanged (#154 Phase 0).
+        assert!(!pool.mirror_band(0, &[2, 3, 4], 5));
+        assert_eq!(pool.seq_lens[0], 5);
+        for page in [2, 3, 4] {
+            assert_eq!(pool.page_attach_count[page as usize], 1);
+        }
+
+        assert!(pool.mirror_band(0, &[5, 6], 7), "new band = changed");
         assert_eq!(pool.page_indices[0], vec![5, 6]);
         assert_eq!(pool.seq_lens[0], 7);
         for page in [2, 3, 4] {
