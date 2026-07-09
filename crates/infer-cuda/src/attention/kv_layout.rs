@@ -193,6 +193,11 @@ pub(crate) struct Dsv4KvAdapter {
     /// never aliased concurrently (exactly like `dsa_shared`/`flashmla_batch`/
     /// decode-graph scratch). `None` when native DeepGEMM is unavailable.
     pub(super) prefill_linear: Option<Dsv4PrefillDeepGemmLinearScratch>,
+    /// Per-slot "host FlashMLA band changed since last device-table sync" bit
+    /// (#154 Phase 0). Set by the mirror/attach sites; consumed once per
+    /// forward via [`Self::take_device_table_dirty`] to drive the
+    /// graph-referenced device-table refresh.
+    pub(super) device_table_dirty: Vec<bool>,
 }
 
 /// Index-layer map: the ONE `compressed-row → (slot-logical page, in-page row)`
@@ -292,9 +297,10 @@ impl Dsv4LayerKvLayout {
         }
         let band_pages = self.flashmla_slot_pages;
         let pool = self.flashmla_pool_mut()?;
+        // Host tables carry only real pages (#154 Phase 0): non-empty, ≤ band.
         ensure!(
-            pool.page_indices(slot_idx).len() == band_pages,
-            "DSv4 FlashMLA slot {slot_idx} band not mirrored ({} pages, need {band_pages}) before cursor advance",
+            (1..=band_pages).contains(&pool.page_indices(slot_idx).len()),
+            "DSv4 FlashMLA slot {slot_idx} band not mirrored ({} pages, band capacity {band_pages}) before cursor advance",
             pool.page_indices(slot_idx).len()
         );
         let new_cursor = pool.seq_len(slot_idx) + append_len;
@@ -588,6 +594,7 @@ impl Dsv4KvAdapter {
             flashmla_batch,
             flashmla_scratch,
             prefill_linear,
+            device_table_dirty: vec![false; num_slots],
         })
     }
 
@@ -859,6 +866,7 @@ impl Dsv4KvAdapter {
             "DSv4 mirror slot {slot} has no pages"
         );
         let pc = slot_pages.len();
+        let mut changed = false;
         for layer in &mut self.layers {
             let lsp = layer.flashmla_slot_pages();
             if lsp == 0 {
@@ -867,13 +875,13 @@ impl Dsv4KvAdapter {
             let Some(pool) = layer.flashmla_kv_pool.as_mut() else {
                 continue;
             };
-            // Identity band: host page i of this slot is band page slot*lsp + i,
-            // padded to full lsp so the graph-referenced device table keeps its
-            // fixed size.
-            let mut pages: Vec<u32> = (0..pc.min(lsp)).map(|i| (slot * lsp + i) as u32).collect();
-            pages.resize(lsp, *pages.last().unwrap());
-            pool.mirror_band(slot, &pages, seq_len)?;
+            // Identity band, real pages only (#154): host page i of this slot is
+            // band page slot*lsp + i; padding to the fixed device-table size
+            // lives at the device-format boundary (flashmla refresh).
+            let pages: Vec<u32> = (0..pc.min(lsp)).map(|i| (slot * lsp + i) as u32).collect();
+            changed |= pool.mirror_band(slot, &pages, seq_len)?;
         }
+        self.device_table_dirty[slot] |= changed;
         Ok(())
     }
 
@@ -887,6 +895,13 @@ impl Dsv4KvAdapter {
             layer.flashmla_zero_band(ctx, slot)?;
         }
         Ok(())
+    }
+
+    /// Consume the slot's "host band changed since last device-table sync" bit
+    /// (#154 Phase 0). `true` ⇒ the caller must refresh the graph-referenced
+    /// device page tables before the forward.
+    pub(crate) fn take_device_table_dirty(&mut self, slot: usize) -> bool {
+        std::mem::take(&mut self.device_table_dirty[slot])
     }
 
     /// Free a slot's FlashMLA band across all layers.
@@ -939,23 +954,24 @@ impl ModelKvAdapter for Dsv4KvAdapter {
                 "DSv4 KV batch row {idx} has empty slot page table"
             );
             let layer_count = self.layers.len();
+            let mut band_changed = false;
             for layer_idx in 0..layer_count {
                 let layer = self.layer_mut(layer_idx)?;
                 let lsp = layer.flashmla_slot_pages();
                 if lsp == 0 {
                     continue;
                 }
-                // Identity band: host page i of this slot is band page
-                // slot*lsp + i, padded to full lsp so the graph-referenced
-                // device table keeps its fixed size.
-                let mut layer_pages: Vec<u32> = (0..slot_pages.len().min(lsp))
+                // Identity band, real pages only (#154): host page i of this
+                // slot is band page slot*lsp + i; the fixed-size device table
+                // is padded at the device-format boundary (flashmla refresh).
+                let layer_pages: Vec<u32> = (0..slot_pages.len().min(lsp))
                     .map(|i| (row.slot * lsp + i) as u32)
                     .collect();
-                layer_pages.resize(lsp, *layer_pages.last().unwrap());
                 match row.kind {
                     KvBatchRowKind::Prefill => {
                         if let Some(pool) = layer.flashmla_kv_pool.as_mut() {
-                            pool.mirror_band(row.slot, &layer_pages, row.append_pos)?;
+                            band_changed |=
+                                pool.mirror_band(row.slot, &layer_pages, row.append_pos)?;
                         }
                         ensure!(
                             layer
@@ -970,7 +986,8 @@ impl ModelKvAdapter for Dsv4KvAdapter {
                     }
                     KvBatchRowKind::Decode => {
                         if let Some(pool) = layer.flashmla_kv_pool.as_mut() {
-                            pool.mirror_band(row.slot, &layer_pages, row.append_pos)?;
+                            band_changed |=
+                                pool.mirror_band(row.slot, &layer_pages, row.append_pos)?;
                         }
                         ensure!(
                             layer
@@ -985,6 +1002,7 @@ impl ModelKvAdapter for Dsv4KvAdapter {
                     }
                 }
             }
+            self.device_table_dirty[row.slot] |= band_changed;
             self.slot_epochs[row.slot] = Some(row.slot_epoch);
             rows.push(Dsv4KvBatchRowView {
                 slot: row.slot,
