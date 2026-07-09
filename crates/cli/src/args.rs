@@ -577,7 +577,10 @@ pub(crate) struct ServeArgs {
 
     /// L2 (host DRAM) KV tier budget for the WHOLE deployment, split across
     /// TP ranks: bytes ("64GiB"), a fraction of available DRAM ("50%"), or
-    /// 0/off to disable. A cap, not a reservation.
+    /// 0/off to disable. A cap, not a reservation. DSv4 further splits each
+    /// rank's share between the whole-slot park store and the prefix-state
+    /// pool (50/50; park floored at one 16 MiB chunk so a small budget never
+    /// silently disables it).
     #[arg(long, value_parser = parse_kv_budget, default_value = "50%")]
     pub(crate) kv_dram: infer_api::KvTierBudget,
 

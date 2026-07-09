@@ -939,6 +939,17 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         Ok(())
     }
 
+    /// Free a slot's pages, then drop the backend's provisional prefix-state
+    /// entries for them — a freed id recycles, and a stale write-only entry
+    /// under a recycled id could later be confirmed as new content. The page
+    /// list is snapshotted BEFORE the free (free_slot clears it). Radix-retained
+    /// pages don't actually free (refcount) and their confirmed entries stay.
+    fn free_slot_pages(&mut self, slot: usize) {
+        let pages = self.kv.page_indices(slot).to_vec();
+        self.kv.free_slot(slot);
+        self.executor.release_provisional_prefix_pages(&pages);
+    }
+
     fn finish_slot(&mut self, slot: usize, reason: FinishReason) {
         let Some(mut request) = self.active.remove(&slot) else {
             return;
@@ -964,7 +975,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         // last ref and the page enters the free pool exactly once. Reversed order
         // caused a double-push: release_pages dropped page_refs to 0 and pushed
         // to free, then reclaim_page (page_refs absent → 0) pushed again.
-        self.kv.free_slot(slot);
+        self.free_slot_pages(slot);
         self.release_reused_prefix(&request.reused_prefix_pages);
         self.evict_prefix_cache_if_below_low_water();
         self.completed.insert(request.handle, request.into());
