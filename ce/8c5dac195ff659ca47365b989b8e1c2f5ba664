@@ -1,0 +1,21 @@
+docs/experience/wins/2026-07-10-dspark-sampled-device-path.md
+  s_a706793fea2d2e::t_a1e55848d54b35 1-28
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "ce8c5dac195ff659ca47365b989b8e1c2f5ba664",
+  "prompts": {},
+  "sessions": {
+    "s_a706793fea2d2e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a443112a3cd498ba8",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
