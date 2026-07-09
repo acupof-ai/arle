@@ -1,0 +1,21 @@
+crates/infer-core/src/planner.rs
+  s_764555636edde6::t_8c87e70c2cb6aa 265-273
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "fc850c7c6ca53356100ee0ba15a556040701ce98",
+  "prompts": {},
+  "sessions": {
+    "s_764555636edde6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-af7dae10a760f74ef",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
