@@ -17,7 +17,12 @@ use std::time::Instant;
 // prefill 138 tok/s vs 453 tok/s for the same trajectory's training forward
 // (docs/plans/rollout-optimization.md). Tool-result tail prefills are 64-128
 // tokens, so the floor belongs at the decode/prefill boundary, not at 1024.
-const QWEN_FP8_DEEPGEMM_DENSE_MIN_M: usize = 64;
+// Lowered 64→16 for the DSpark block-16 spec verify: the same bug class one
+// tier down — B=16 on the batched GEMV measured dense_ffn 94 ms/step vs the
+// DeepGEMM lane's ~6 ms at the same row count (H20, Qwen3.6-27B-FP8); the
+// masked DeepGEMM tile makes M=16 cost ≈ one weight pass. Spec depths ≤8 stay
+// on the TILE==B amortizing GEMV (1.04-1.14× a single decode — already optimal).
+const QWEN_FP8_DEEPGEMM_DENSE_MIN_M: usize = 16;
 
 #[derive(Default)]
 struct QwenFp8DenseScratch {
