@@ -199,10 +199,7 @@ impl Dsv4DsaSharedScratch {
         let page_table_h: Vec<i32> = (0..query_tile)
             .flat_map(|_| (0..num_pages).map(|v| i32::try_from(v).expect("page table fits i32")))
             .collect();
-        let num_sms = std::env::var("ARLE_DSV4_DSA_INDEXER_SMS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(78);
+        let num_sms = crate::runtime_flags::dsv4_dsa_indexer_sms();
         // ── N-row batched-decode scratch sizing (#60). `decode_max_batch` is one
         // decode row per slot. All buffers are overwritten-before-read each forward.
         let decode_max_batch = num_slots.max(1);

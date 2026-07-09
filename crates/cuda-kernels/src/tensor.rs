@@ -306,11 +306,22 @@ fn parse_device_ordinal(value: Option<&str>) -> Result<u32> {
     }
 }
 
+/// `--marlin-w4-fp8-prefill` (default off), set once pre-load.
+static MARLIN_W4_FP8_PREFILL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// `--cuda-mempool-retain` (default on), set once BEFORE context creation.
+static MEMPOOL_RETAIN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+pub fn set_marlin_w4_fp8_prefill(enabled: bool) {
+    MARLIN_W4_FP8_PREFILL.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn set_mempool_retain(enabled: bool) {
+    MEMPOOL_RETAIN.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
 fn marlin_w4_fp8_prefill_enabled_for_load() -> bool {
-    matches!(
-        std::env::var("INFER_MARLIN_W4_FP8_PREFILL").as_deref(),
-        Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
-    )
+    MARLIN_W4_FP8_PREFILL.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 impl DeviceContext {
@@ -348,13 +359,10 @@ impl DeviceContext {
         // #29 only fixed for the MoE scratch. PyTorch's caching allocator + SGLang do
         // exactly this. `trim_memory_pool()` still reclaims VRAM explicitly when needed
         // (e.g. weight offload). Best-effort: a failure here is not fatal.
-        // Default on; opt out with `ARLE_CUDA_MEMPOOL_RETAIN=0` to restore the old
-        // release-at-sync behavior (for an A/B of the decode-alloc win, or if a
-        // memory-tight shape needs aggressive release).
-        let retain_pool = !matches!(
-            std::env::var("ARLE_CUDA_MEMPOOL_RETAIN").as_deref(),
-            Ok("0" | "false" | "off" | "OFF")
-        );
+        // Default on; opt out with `--cuda-mempool-retain false` to restore the
+        // old release-at-sync behavior (for an A/B of the decode-alloc win, or
+        // if a memory-tight shape needs aggressive release).
+        let retain_pool = MEMPOOL_RETAIN.load(std::sync::atomic::Ordering::Relaxed);
         if retain_pool {
             unsafe {
                 if let Ok(pool) = cudarc::driver::result::device::get_mem_pool(ctx.cu_device()) {

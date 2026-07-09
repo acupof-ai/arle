@@ -97,7 +97,7 @@ pub struct TpRuntime {
     moe_ep: TpComm,
     /// One-shot small-message collective path (vendored sgl-kernel/vLLM custom
     /// allreduce + ARLE one-shot all-gather) for the decode critical chain.
-    /// `None` = NCCL everywhere (single rank, `ARLE_COMM_BACKEND=nccl`, or any
+    /// `None` = NCCL everywhere (single rank, `--comm-backend nccl`, or any
     /// boot probe/self-test failure — every degrade logs WARN, never silent).
     #[cfg(all(feature = "cuda", feature = "nccl"))]
     oneshot: Option<oneshot::OneShotComm>,
@@ -303,22 +303,14 @@ impl TpRuntime {
     /// Propagates the NCCL all-reduce error on multi-rank builds.
     /// Bring up the one-shot small-message collective path (default-on with
     /// automatic loud degrade). COLLECTIVE: every rank must call at the same
-    /// construction point. `ARLE_COMM_BACKEND=nccl` (CLI `--comm-backend nccl`)
-    /// skips it entirely; any probe/boot/self-test failure on ANY rank degrades
-    /// EVERY rank to NCCL via the built-in ok-votes (never a silent fallback,
-    /// never a desynced boot).
+    /// construction point. `--comm-backend nccl` skips it entirely; any
+    /// probe/boot/self-test failure on ANY rank degrades EVERY rank to NCCL via
+    /// the built-in ok-votes (never a silent fallback, never a desynced boot).
     #[cfg(all(feature = "cuda", feature = "nccl"))]
     pub fn init_oneshot_comm(&mut self, ctx: &cuda_kernels::prelude::DeviceContext) {
-        let mode = std::env::var("ARLE_COMM_BACKEND").unwrap_or_else(|_| "auto".to_string());
-        match mode.as_str() {
-            "nccl" => {
-                log::info!("[comm-oneshot] disabled via ARLE_COMM_BACKEND=nccl");
-                return;
-            }
-            "auto" | "oneshot" => {}
-            other => {
-                log::warn!("[comm-oneshot] unknown ARLE_COMM_BACKEND={other}; treating as auto");
-            }
+        if crate::runtime_flags::comm_nccl_only() {
+            log::info!("[comm-oneshot] disabled via --comm-backend nccl");
+            return;
         }
         let TpComm::Nccl(backend) = &self.comm else {
             return; // single rank — nothing to accelerate

@@ -39,36 +39,21 @@ fn mtp_phase_mark(ctx: &DeviceContext, last: &mut Instant, enabled: bool) -> f64
     ms
 }
 
-/// Adaptive MTP gate (B=1), opt-in via `ARLE_DSV4_MTP_ADAPTIVE` (bring-up flag;
-/// promote to `--mtp-adaptive` once pod-calibrated). MTP only beats no-spec when
-/// it emits more than `t_mtp/t_nospec` tok/step; below the matching acceptance
-/// rate the gate runs a warm no-spec step instead so typical prompts stop paying
-/// the speculation tax.
+/// Adaptive MTP gate (B=1), opt-in via `--mtp-adaptive`. MTP only beats
+/// no-spec when it emits more than `t_mtp/t_nospec` tok/step; below the
+/// matching acceptance rate the gate runs a warm no-spec step instead so
+/// typical prompts stop paying the speculation tax.
 fn mtp_adaptive_gate_enabled() -> bool {
-    // Cached: read once, then checked on every B=1 decode step (critical path).
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        matches!(
-            std::env::var("ARLE_DSV4_MTP_ADAPTIVE").as_deref(),
-            Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
-        )
-    })
+    crate::runtime_flags::mtp_adaptive()
 }
 
 /// Minimum running accept-rate EMA to keep speculating. Default 0.55 = the dt=3
 /// break-even on 8xH20 TP4 (t_mtp ~68ms / t_nospec ~26ms => need >2.6 tok/step =>
-/// accept >~0.55). Override with `ARLE_DSV4_MTP_MIN_ACCEPT` for other depths.
+/// accept >~0.55). Override with `--mtp-min-accept` for other depths.
 /// ponytail: a fixed depth-tuned threshold; upgrade path is to self-calibrate
 /// from measured step times.
 fn mtp_min_accept() -> f32 {
-    static MIN_ACCEPT: OnceLock<f32> = OnceLock::new();
-    *MIN_ACCEPT.get_or_init(|| {
-        std::env::var("ARLE_DSV4_MTP_MIN_ACCEPT")
-            .ok()
-            .and_then(|v| v.parse::<f32>().ok())
-            .filter(|v| v.is_finite() && *v >= 0.0)
-            .unwrap_or(0.55)
-    })
+    crate::runtime_flags::mtp_min_accept()
 }
 
 /// Force one real spec step after this many consecutive gated skips, to refresh
@@ -568,7 +553,7 @@ impl Dsv4CudaExecutor {
     }
 
     /// Adaptive gate (B=1): true when MTP should be skipped for a warm no-spec
-    /// step this decode. Off unless `ARLE_DSV4_MTP_ADAPTIVE` is set.
+    /// step this decode. Off unless `--mtp-adaptive` is set.
     pub(super) fn mtp_adaptive_skip(&self) -> bool {
         mtp_adaptive_gate_enabled()
             && !mtp_should_speculate(
