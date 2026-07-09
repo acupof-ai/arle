@@ -1,0 +1,31 @@
+crates/infer-cuda/src/executor.rs
+  s_8326f06e8d99a2::t_be2e48165c3a05 471-474,481,486,504-512,2151-2172,2378-2380,2382,2404-2406,2418-2422,2433,2439-2462,2471-2476,2594-2603,4729,4807-4808
+crates/infer-cuda/src/qwen35/dspark.rs
+  s_a706793fea2d2e::t_433279a09afb04 260-278,693-696,705,882-884,887,920-955,982,1088-1089,1093-1096,1103-1104,1110,1112,1114-1116,1119-1182,1184-1194,1198
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "9f2dd5b3b5035458298c9b8440e1304335170309",
+  "prompts": {},
+  "sessions": {
+    "s_8326f06e8d99a2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a81e2962d96fd6bb4",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_a706793fea2d2e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a443112a3cd498ba8",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
