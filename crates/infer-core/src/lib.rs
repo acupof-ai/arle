@@ -948,6 +948,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         let pages = self.kv.page_indices(slot).to_vec();
         self.kv.free_slot(slot);
         self.executor.release_provisional_prefix_pages(&pages);
+        self.executor.release_kv_slot(slot);
     }
 
     fn finish_slot(&mut self, slot: usize, reason: FinishReason) {

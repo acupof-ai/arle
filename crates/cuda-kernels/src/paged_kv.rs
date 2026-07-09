@@ -734,6 +734,40 @@ impl TokenKVPool {
         Ok(new_pages)
     }
 
+    /// Extend a fixed-layout band's page table by `count` pages from the free
+    /// list WITHOUT moving the logical token cursor — the band-demand-paging
+    /// counterpart of [`Self::alloc_tokens`] (#154 Phase 3b: DSv4 grows the
+    /// comp region at page boundaries; `set_band_cursor` owns the cursor).
+    /// Returns the newly attached page ids; the caller must zero them (a
+    /// recycled page carries a prior occupant's bytes).
+    pub fn band_extend(&mut self, slot: usize, count: usize) -> Result<Vec<u32>> {
+        ensure!(
+            slot < self.num_slots,
+            "TokenKVPool::band_extend slot {slot} out of range {}",
+            self.num_slots
+        );
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        if count > self.free_pages.len() {
+            return Err(anyhow!(
+                "TokenKVPool: out of pages (band_extend {count} pages, available {})",
+                self.free_pages.len()
+            ));
+        }
+        let mut new_pages = Vec::with_capacity(count);
+        for _ in 0..count {
+            let idx = self
+                .free_pages
+                .pop()
+                .expect("invariant: free_pages.len() >= count checked above");
+            self.page_attach_count[idx as usize] = 1;
+            new_pages.push(idx);
+        }
+        self.page_indices[slot].extend_from_slice(&new_pages);
+        Ok(new_pages)
+    }
+
     /// Roll the logical cursor back to `new_len` tokens WITHOUT recycling any
     /// band pages — the fixed-layout-band counterpart of [`Self::truncate_slot`].
     ///

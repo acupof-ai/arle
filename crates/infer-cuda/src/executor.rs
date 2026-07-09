@@ -507,6 +507,17 @@ impl RealCudaExecutor {
         }
     }
 
+    /// Engine freed `slot`'s host pages: DSv4 returns the slot's demand-paged
+    /// FlashMLA band pages to the layer pools (#154 Phase 3b — waiting for
+    /// the next occupant would starve the free lists); no-op elsewhere.
+    pub(crate) fn release_kv_slot(&mut self, slot: usize) {
+        if let Self::Dsv4(d) = self {
+            if let Err(err) = d.kv_adapter.flashmla_free_slot(slot) {
+                warn!("DSv4 release_kv_slot({slot}) failed: {err:#}");
+            }
+        }
+    }
+
     /// Re-budget the host-demoted tier store (`0` disables; pre-serve only). No-op on
     /// arms without a tier store.
     pub(crate) fn set_kv_tier_budget_bytes(&mut self, bytes: usize) {
@@ -2516,7 +2527,8 @@ impl Dsv4CudaExecutor {
             .iter()
             .map(|&page_id| self.prefix_state.read_entry(page_id))
             .collect::<Result<Vec<_>>>()?;
-        self.kv_adapter.mirror_full_band(slot, matched_len)?;
+        self.kv_adapter
+            .mirror_full_band(&self.model.ctx, slot, matched_len)?;
         // A17: a restored occupant enters Decoding without a tail warm step
         // for its MTP chain; stale spec state belongs to the prior occupant.
         self.spec_slots[slot] = Dsv4SpecSlotState::default();
@@ -3007,6 +3019,25 @@ impl Dsv4CudaExecutor {
             .collect())
     }
 
+    /// Selftest band prep: free + reset, then materialize the band and
+    /// refresh the device page tables — the selftest drives `forward_tokens`
+    /// directly (no `prepare_kv_batch`), which used to run kernels against
+    /// never-refreshed all-zero device tables (#154 Phase 3b fix).
+    fn selftest_reset_band(&mut self, slot_idx: usize, prompt_len: usize) -> Result<()> {
+        self.kv_adapter.flashmla_free_slot(slot_idx)?;
+        self.slots[slot_idx].reset(&self.model.ctx, &mut self.kv_adapter)?;
+        self.kv_adapter.prepare_direct_forward(
+            &self.model.ctx,
+            slot_idx,
+            prompt_len + crate::dsv4::MAX_SPEC_DRAFT_DEPTH + 2,
+        )?;
+        self.kv_adapter.zero_slot_band(&self.model.ctx, slot_idx)?;
+        if self.kv_adapter.take_device_table_dirty(slot_idx) {
+            self.slots[slot_idx]
+                .refresh_flashmla_device_page_tables(&self.model.ctx, &self.kv_adapter)?;
+        }
+        Ok(())
+    }
     pub(crate) fn verify_forward_selftest(&mut self, prompt: &[u32]) -> Result<()> {
         ensure!(
             !prompt.is_empty(),
@@ -3016,7 +3047,7 @@ impl Dsv4CudaExecutor {
         let params = SamplingParams::default();
         let start_pos = prompt.len();
 
-        self.slots[slot_idx].reset(&self.model.ctx, &mut self.kv_adapter)?;
+        self.selftest_reset_band(slot_idx, prompt.len())?;
         let token_a = self.model.forward_tokens(
             &mut self.slots[slot_idx],
             &mut self.kv_adapter,
@@ -3033,7 +3064,7 @@ impl Dsv4CudaExecutor {
             (start_pos + 1) as u64,
         )?;
 
-        self.slots[slot_idx].reset(&self.model.ctx, &mut self.kv_adapter)?;
+        self.selftest_reset_band(slot_idx, prompt.len())?;
         let token_a_again = self.model.forward_tokens(
             &mut self.slots[slot_idx],
             &mut self.kv_adapter,
@@ -3060,7 +3091,7 @@ impl Dsv4CudaExecutor {
             verify_one.argmax
         );
 
-        self.slots[slot_idx].reset(&self.model.ctx, &mut self.kv_adapter)?;
+        self.selftest_reset_band(slot_idx, prompt.len())?;
         let token_a = self.model.forward_tokens(
             &mut self.slots[slot_idx],
             &mut self.kv_adapter,
@@ -3082,7 +3113,7 @@ impl Dsv4CudaExecutor {
             wrong_b = token_b.wrapping_add(3);
         }
 
-        self.slots[slot_idx].reset(&self.model.ctx, &mut self.kv_adapter)?;
+        self.selftest_reset_band(slot_idx, prompt.len())?;
         let token_a = self.model.forward_tokens(
             &mut self.slots[slot_idx],
             &mut self.kv_adapter,
@@ -3118,6 +3149,7 @@ impl Dsv4CudaExecutor {
         // path. The single MTP head caps multi-step drafts; tree-EAGLE (top-K) is the
         // amortization lever beyond depth-1. See the consolidated decode-6ms report.
 
+        self.kv_adapter.flashmla_free_slot(slot_idx)?;
         self.slots[slot_idx].reset(&self.model.ctx, &mut self.kv_adapter)?;
         self.spec_slots[slot_idx] = Dsv4SpecSlotState::default();
         if self.model.tp.config().rank == 0 {
