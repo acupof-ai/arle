@@ -1,0 +1,41 @@
+crates/autograd/src/backend_cuda.rs
+  s_94ce5908b6c7bb::t_e323e3c2e7bb01 113,120,4294,7890,7894,7964-7965
+crates/autograd/src/ops/attention.rs
+  s_94ce5908b6c7bb::t_2f7f04743b3258 430
+crates/autograd/src/ops/matmul.rs
+  s_94ce5908b6c7bb::t_8308ba4f884e5f 393,397
+crates/autograd/src/ops/moe.rs
+  s_94ce5908b6c7bb::t_4b0b49d86f630c 122,126
+crates/autograd/src/tape.rs
+  s_94ce5908b6c7bb::t_864321a9210a97 853
+crates/autograd/src/tensor.rs
+  s_94ce5908b6c7bb::t_5de470bc30c806 485
+crates/autograd/tests/test_linear_attention.rs
+  s_94ce5908b6c7bb::t_9ebd0bcd7ae4ba 1221
+crates/infer-metal/src/executor.rs
+  s_94ce5908b6c7bb::t_20a133cedf1036 130,136-137,168,174-175,242,291,301,702,704-705,1575-1577,1579-1581,1590-1591,1595-1600,1602,1624,1626
+crates/infer-vulkan/src/forward.rs
+  s_94ce5908b6c7bb::t_1bb22f9ec9ca73 901,1375,1377-1386,1388
+crates/train/src/opd.rs
+  s_94ce5908b6c7bb::t_f9affc26f14c57 90,139-142,145,615,624-625,631,2906,2910,3065,3067,3142,3220,3318,3474
+crates/train/src/qwen35_loader.rs
+  s_94ce5908b6c7bb::t_eca03b0d2945d7 49,763
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "4adeb4656d997d39efd7b0c66b30326da1c0d8fb",
+  "prompts": {},
+  "sessions": {
+    "s_94ce5908b6c7bb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a8744832334b16ddb",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
