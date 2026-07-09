@@ -1208,7 +1208,10 @@ impl DsparkConfig {
                 .and_then(serde_json::Value::as_u64)
                 .map_or(2048, |n| n as usize),
             layer_types,
-            block_size: usize_of("block_size")?,
+            block_size: field("block_size")
+                .and_then(serde_json::Value::as_u64)
+                .map(|n| n as usize)
+                .ok_or(Qwen35ConfigError::InvalidConfig("block_size"))?,
             mask_token_id,
             target_layer_ids,
             next_token_heads: dflash.is_none(),
