@@ -596,6 +596,268 @@ __global__ void gpu_sample_kernel(
   }
 }
 
+// ============================================================================
+// DSpark sampled spec-decode device path.
+// Mirrors infer-plan `sample_token` filtering semantics: temperature softmax
+// normalized by the FULL vocab sum, then top-k -> top-p -> min-p applied to
+// those full-softmax probs (no renormalize between filters), one final
+// renormalize; a degenerate row (empty/NaN/zero mass) falls back to a one-hot
+// at the row argmax. All uniforms are host-supplied salted splitmix64 draws —
+// no curand, so same-seed-twice stays byte-identical.
+// Single-row kernels run one block (the existing gpu_sample_kernel shape);
+// the batched verify filter runs one block per row.
+// ============================================================================
+
+// Block-wide sum with broadcast to all threads. `scratch` needs
+// SAMPLE_NUM_WARPS floats; safe to reuse across calls (trailing barrier).
+__device__ __forceinline__ float dspark_block_sum(float v, float *scratch) {
+  int warp_id = threadIdx.x / WARP_SIZE, lane_id = threadIdx.x % WARP_SIZE;
+  v = warp_reduce_sum(v);
+  if (lane_id == 0) scratch[warp_id] = v;
+  __syncthreads();
+  if (warp_id == 0) {
+    float s = (lane_id < SAMPLE_NUM_WARPS) ? scratch[lane_id] : 0.0f;
+    s = warp_reduce_sum(s);
+    if (lane_id == 0) scratch[0] = s;
+  }
+  __syncthreads();
+  float out = scratch[0];
+  __syncthreads();
+  return out;
+}
+
+__device__ __forceinline__ float dspark_block_max(float v, float *scratch) {
+  int warp_id = threadIdx.x / WARP_SIZE, lane_id = threadIdx.x % WARP_SIZE;
+  v = warp_reduce_max(v);
+  if (lane_id == 0) scratch[warp_id] = v;
+  __syncthreads();
+  if (warp_id == 0) {
+    float s = (lane_id < SAMPLE_NUM_WARPS) ? scratch[lane_id] : -INFINITY;
+    s = warp_reduce_max(s);
+    if (lane_id == 0) scratch[0] = s;
+  }
+  __syncthreads();
+  float out = scratch[0];
+  __syncthreads();
+  return out;
+}
+
+// probs := filtered, renormalized sampling distribution of one bf16 logits row.
+__device__ void dspark_filter_row(const __nv_bfloat16 *__restrict__ logits,
+                                  float *__restrict__ probs, int vocab,
+                                  float inv_temperature, int top_k, float top_p,
+                                  float min_p) {
+  __shared__ float red[SAMPLE_NUM_WARPS];
+  __shared__ float wv[SAMPLE_NUM_WARPS];
+  __shared__ int wi[SAMPLE_NUM_WARPS];
+  __shared__ int s_argmax;
+  int tid = threadIdx.x;
+  int warp_id = tid / WARP_SIZE, lane_id = tid % WARP_SIZE;
+
+  // Row max + argmax (argmax = degenerate-row fallback token).
+  float local_max = -INFINITY;
+  int local_idx = 0;
+  for (int i = tid; i < vocab; i += SAMPLE_BLOCK) {
+    float v = __bfloat162float(logits[i]);
+    if (v > local_max) { local_max = v; local_idx = i; }
+  }
+  warp_reduce_argmax(local_max, local_idx);
+  if (lane_id == 0) { wv[warp_id] = local_max; wi[warp_id] = local_idx; }
+  __syncthreads();
+  if (warp_id == 0) {
+    float v = (lane_id < SAMPLE_NUM_WARPS) ? wv[lane_id] : -INFINITY;
+    int ix = (lane_id < SAMPLE_NUM_WARPS) ? wi[lane_id] : 0;
+    warp_reduce_argmax(v, ix);
+    if (lane_id == 0) { wv[0] = v; s_argmax = ix; }
+  }
+  __syncthreads();
+  float row_max = wv[0];
+  __syncthreads();
+
+  // Temperature softmax normalized by the FULL vocab sum (pre-filter).
+  float local_sum = 0.0f;
+  for (int i = tid; i < vocab; i += SAMPLE_BLOCK) {
+    float e = expf((__bfloat162float(logits[i]) - row_max) * inv_temperature);
+    probs[i] = e;
+    local_sum += e;
+  }
+  float sum = dspark_block_sum(local_sum, red);
+  if (sum > 0.0f) {
+    float inv = 1.0f / sum;
+    for (int i = tid; i < vocab; i += SAMPLE_BLOCK) probs[i] *= inv;
+  }
+  __syncthreads();
+
+  // Top-k: keep the k largest via threshold binary search (same scheme as
+  // gpu_sample_kernel; boundary ties may over-keep — distributionally exact).
+  if (top_k > 0 && top_k < vocab) {
+    float local_pmax = 0.0f;
+    for (int i = tid; i < vocab; i += SAMPLE_BLOCK)
+      local_pmax = fmaxf(local_pmax, probs[i]);
+    float pmax = dspark_block_max(local_pmax, red);
+    float lo = 0.0f, hi = pmax;
+    for (int iter = 0; iter < 32; iter++) {
+      float mid = (lo + hi) * 0.5f;
+      float local_count = 0.0f;
+      for (int i = tid; i < vocab; i += SAMPLE_BLOCK)
+        if (probs[i] >= mid) local_count += 1.0f;
+      float count = dspark_block_sum(local_count, red);
+      if (count > (float)top_k) lo = mid; else hi = mid;
+    }
+    for (int i = tid; i < vocab; i += SAMPLE_BLOCK)
+      if (probs[i] < lo) probs[i] = 0.0f;
+    __syncthreads();
+  }
+
+  // Top-p: smallest threshold-set of surviving full-softmax probs whose mass
+  // reaches top_p (host: smallest sorted prefix with cum >= top_p; if the
+  // surviving mass never reaches top_p everything is kept, matching the host).
+  if (top_p < 1.0f) {
+    float local_pmax = 0.0f;
+    for (int i = tid; i < vocab; i += SAMPLE_BLOCK)
+      local_pmax = fmaxf(local_pmax, probs[i]);
+    float pmax = dspark_block_max(local_pmax, red);
+    float lo = 0.0f, hi = pmax;
+    for (int iter = 0; iter < 32; iter++) {
+      float mid = (lo + hi) * 0.5f;
+      float local_above = 0.0f;
+      for (int i = tid; i < vocab; i += SAMPLE_BLOCK)
+        if (probs[i] >= mid) local_above += probs[i];
+      float mass = dspark_block_sum(local_above, red);
+      if (mass >= top_p) lo = mid; else hi = mid;
+    }
+    for (int i = tid; i < vocab; i += SAMPLE_BLOCK)
+      if (probs[i] < lo) probs[i] = 0.0f;
+    __syncthreads();
+  }
+
+  // Min-p: drop survivors below min_p * (max surviving prob).
+  if (min_p > 0.0f) {
+    float local_pmax = 0.0f;
+    for (int i = tid; i < vocab; i += SAMPLE_BLOCK)
+      local_pmax = fmaxf(local_pmax, probs[i]);
+    float pmax = dspark_block_max(local_pmax, red);
+    float thresh = min_p * pmax;
+    for (int i = tid; i < vocab; i += SAMPLE_BLOCK)
+      if (probs[i] < thresh) probs[i] = 0.0f;
+    __syncthreads();
+  }
+
+  // Final renormalize; degenerate row -> one-hot at the row argmax.
+  float local_total = 0.0f;
+  for (int i = tid; i < vocab; i += SAMPLE_BLOCK) local_total += probs[i];
+  float total = dspark_block_sum(local_total, red);
+  if (!isfinite(total) || total <= 0.0f) {
+    for (int i = tid; i < vocab; i += SAMPLE_BLOCK) probs[i] = 0.0f;
+    __syncthreads();
+    if (tid == 0) probs[s_argmax] = 1.0f;
+  } else {
+    float inv = 1.0f / total;
+    for (int i = tid; i < vocab; i += SAMPLE_BLOCK) probs[i] *= inv;
+  }
+  __syncthreads();
+}
+
+// Multinomial CDF draw over `p` (or the residual max(0, p - q) when `q` is
+// non-null) with `target` in [0, mass). Thread-strided CDF order — a
+// deterministic reordering of the host scan, same distribution. Returns the
+// winning index in every thread.
+__device__ int dspark_multinomial(const float *__restrict__ p,
+                                  const float *__restrict__ q, int vocab,
+                                  float target) {
+  __shared__ float thread_sums[SAMPLE_BLOCK];
+  __shared__ int s_winner;
+  int tid = threadIdx.x;
+  float my_sum = 0.0f;
+  for (int i = tid; i < vocab; i += SAMPLE_BLOCK)
+    my_sum += q ? fmaxf(p[i] - q[i], 0.0f) : p[i];
+  thread_sums[tid] = my_sum;
+  if (tid == 0) s_winner = -1;
+  __syncthreads();
+  // Exclusive prefix over 256 thread sums (serial: 256 adds, negligible).
+  if (tid == 0) {
+    float acc = 0.0f;
+    for (int t = 0; t < SAMPLE_BLOCK; t++) {
+      float s = thread_sums[t];
+      thread_sums[t] = acc;
+      acc += s;
+    }
+  }
+  __syncthreads();
+  float acc = thread_sums[tid];
+  if (target >= acc && target < acc + my_sum) {
+    for (int i = tid; i < vocab; i += SAMPLE_BLOCK) {
+      acc += q ? fmaxf(p[i] - q[i], 0.0f) : p[i];
+      if (target < acc) { s_winner = i; break; }
+    }
+  }
+  __syncthreads();
+  // FP tail (target beyond the summed mass): last positive-mass token,
+  // the host `draw` fallback. Rare corner; serial backward scan is fine.
+  if (s_winner < 0 && tid == 0) {
+    for (int i = vocab - 1; i >= 0; i--) {
+      float v = q ? fmaxf(p[i] - q[i], 0.0f) : p[i];
+      if (v > 0.0f) { s_winner = i; break; }
+    }
+    if (s_winner < 0) s_winner = 0;
+  }
+  __syncthreads();
+  return s_winner;
+}
+
+// Batched verify filter: one block per logits row, full filtered dist per row.
+__global__ void dspark_filter_probs_kernel(
+    const __nv_bfloat16 *__restrict__ logits, float *__restrict__ probs,
+    int vocab, float inv_temperature, int top_k, float top_p, float min_p) {
+  long long off = (long long)blockIdx.x * vocab;
+  dspark_filter_row(logits + off, probs + off, vocab, inv_temperature, top_k,
+                    top_p, min_p);
+}
+
+// Draft markov step: filter one row into the persistent q scratch row AND
+// sample from it — only the 4-byte token id returns to the host.
+__global__ void dspark_draft_sample_kernel(
+    const __nv_bfloat16 *__restrict__ logits, float *__restrict__ q_row,
+    int *__restrict__ token_out, int vocab, float inv_temperature, int top_k,
+    float top_p, float min_p, float random_val) {
+  dspark_filter_row(logits, q_row, vocab, inv_temperature, top_k, top_p,
+                    min_p);
+  int tok = dspark_multinomial(q_row, nullptr, vocab, random_val);
+  if (threadIdx.x == 0) token_out[0] = tok;
+}
+
+// Chain rejection over pre-filtered dists (flashinfer/SGLang
+// chain_speculative_sampling semantics, host-uniform variant): accept
+// draft[j] with prob min(1, p_j(tok)/q_j(tok)); first reject commits a
+// renormalized max(0, p - q) residual draw (falling back to p on ~0 mass),
+// full accept a bonus draw from row `depth`. out = [accepted_len, token].
+__global__ void dspark_chain_accept_kernel(
+    const float *__restrict__ q, const float *__restrict__ p,
+    const int *__restrict__ draft, const float *__restrict__ u_accept,
+    const float *__restrict__ u_residual, int *__restrict__ out, int depth,
+    int vocab) {
+  __shared__ float red[SAMPLE_NUM_WARPS];
+  for (int j = 0; j < depth; j++) {
+    const float *pj = p + (long long)j * vocab;
+    const float *qj = q + (long long)j * vocab;
+    int tok = draft[j];
+    float accept = fminf(pj[tok] / fmaxf(qj[tok], 1e-8f), 1.0f);
+    if (u_accept[j] < accept) continue;
+    float local = 0.0f;
+    for (int i = threadIdx.x; i < vocab; i += SAMPLE_BLOCK)
+      local += fmaxf(pj[i] - qj[i], 0.0f);
+    float mass = dspark_block_sum(local, red);
+    int tok_out = (mass <= 1e-8f)
+                      ? dspark_multinomial(pj, nullptr, vocab, u_residual[j])
+                      : dspark_multinomial(pj, qj, vocab, u_residual[j] * mass);
+    if (threadIdx.x == 0) { out[0] = j; out[1] = tok_out; }
+    return;
+  }
+  const float *pd = p + (long long)depth * vocab;
+  int bonus = dspark_multinomial(pd, nullptr, vocab, u_residual[depth]);
+  if (threadIdx.x == 0) { out[0] = depth; out[1] = bonus; }
+}
+
 extern "C" {
 cudaError_t argmax_logprob_cuda(const __nv_bfloat16 *x, int *out_idx, float *out_logprob,
                                 int n, cudaStream_t stream) {
@@ -628,5 +890,30 @@ cudaError_t gpu_sample_cuda(const __nv_bfloat16 *logits, float *probs_scratch, i
   gpu_sample_kernel<<<1, SAMPLE_BLOCK, 0, stream>>>(
       logits, probs_scratch, output, vocab_size, inv_temperature, top_k, top_p, random_val);
     return cudaGetLastError();
+}
+
+cudaError_t dspark_filter_probs_cuda(const __nv_bfloat16 *logits, float *probs, int rows,
+                                     int vocab, float inv_temperature, int top_k,
+                                     float top_p, float min_p, cudaStream_t stream) {
+  dspark_filter_probs_kernel<<<rows, SAMPLE_BLOCK, 0, stream>>>(
+      logits, probs, vocab, inv_temperature, top_k, top_p, min_p);
+  return cudaGetLastError();
+}
+
+cudaError_t dspark_draft_sample_cuda(const __nv_bfloat16 *logits, float *q_row,
+                                     int *token_out, int vocab, float inv_temperature,
+                                     int top_k, float top_p, float min_p, float random_val,
+                                     cudaStream_t stream) {
+  dspark_draft_sample_kernel<<<1, SAMPLE_BLOCK, 0, stream>>>(
+      logits, q_row, token_out, vocab, inv_temperature, top_k, top_p, min_p, random_val);
+  return cudaGetLastError();
+}
+
+cudaError_t dspark_chain_accept_cuda(const float *q, const float *p, const int *draft,
+                                     const float *u_accept, const float *u_residual,
+                                     int *out, int depth, int vocab, cudaStream_t stream) {
+  dspark_chain_accept_kernel<<<1, SAMPLE_BLOCK, 0, stream>>>(
+      q, p, draft, u_accept, u_residual, out, depth, vocab);
+  return cudaGetLastError();
 }
 }
