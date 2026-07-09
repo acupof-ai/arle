@@ -1,0 +1,21 @@
+docs/experience/errors/2026-07-10-dsv4-16k-mtt-solo-needle-truncation-preexisting.md
+  s_764555636edde6::t_c28971fbc9e39a 1-33
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "611f4d5bace77e767bea7da1564b5340458dbee3",
+  "prompts": {},
+  "sessions": {
+    "s_764555636edde6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-af7dae10a760f74ef",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
