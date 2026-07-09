@@ -1086,28 +1086,6 @@ impl Dsv4LayerAttentionState {
         &mut self.sw_window_cache
     }
 
-    /// Prefix-reuse restore: reset the row counters `compressor_forward`/
-    /// `csa_select_official` otherwise only ever advance, which else carry a
-    /// stale value from the slot's prior occupant. No-op if the layer has no
-    /// such state.
-    pub(crate) fn set_compressor_seq_len(&mut self, seq_len: usize) {
-        if let Some(s) = self.compressor.as_mut() {
-            s.compressed.seq_len = seq_len;
-        }
-    }
-
-    pub(crate) fn set_indexer_seq_len(&mut self, seq_len: usize) {
-        if let Some(s) = self.indexer.as_mut() {
-            s.compressed.seq_len = seq_len;
-        }
-    }
-
-    pub(crate) fn set_dsa_official_packed_rows(&mut self, packed_rows: usize) {
-        if let Some(s) = self.dsa_official.as_mut() {
-            s.packed_rows = packed_rows;
-        }
-    }
-
     pub(crate) fn new(
         ctx: &DeviceContext,
         config: &DeepSeekV4Config,
