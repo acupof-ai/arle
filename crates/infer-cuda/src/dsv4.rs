@@ -1147,9 +1147,11 @@ impl Dsv4SlotState {
     }
 
     /// Re-sync every layer's FlashMLA device page table from the host pool.
-    /// Called after `prepare_kv_batch` mirrors a prefill row's band — the
-    /// graph-captured kernel arg would otherwise point at a stale table (#8).
-    /// See [`crate::attention::Dsv4LayerAttentionState::refresh_flashmla_device_page_table`].
+    /// Called whenever the adapter reports the slot's host band changed —
+    /// dirty-bit driven, prefill AND decode (see
+    /// `Dsv4KvAdapter::take_device_table_dirty`); host tables carry only real
+    /// pages, padding to the fixed device size happens in
+    /// [`crate::attention::Dsv4LayerAttentionState::refresh_flashmla_device_page_table`].
     pub(crate) fn refresh_flashmla_device_page_tables(
         &mut self,
         ctx: &DeviceContext,
