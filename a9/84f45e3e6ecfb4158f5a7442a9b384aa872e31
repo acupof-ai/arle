@@ -1,0 +1,23 @@
+CHANGELOG.md
+  s_9c91b86ec3fb55::t_24d845c4037756 28-35
+docs/experience/wins/2026-07-10-qwen36-dspark-dual-head-and-sampling-verdicts.md
+  s_9c91b86ec3fb55::t_f741dc397f349e 1-70
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "a984f45e3e6ecfb4158f5a7442a9b384aa872e31",
+  "prompts": {},
+  "sessions": {
+    "s_9c91b86ec3fb55": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4779911a-69b7-49db-bc83-daf5a48d6ca3",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
