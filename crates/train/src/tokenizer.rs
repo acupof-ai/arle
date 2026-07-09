@@ -90,12 +90,12 @@ impl ChatTokenizer {
             let id = self.token_to_id(token).ok_or_else(|| {
                 tokenizer_message(&format!("tokenizer is missing {name} token {token:?}"))
             })?;
-            if let Some(explicit_id) = explicit_id {
-                if explicit_id != id {
-                    return Err(tokenizer_message(&format!(
-                        "{name} token/id mismatch: token {token:?} maps to {id}, not {explicit_id}"
-                    )));
-                }
+            if let Some(explicit_id) = explicit_id
+                && explicit_id != id
+            {
+                return Err(tokenizer_message(&format!(
+                    "{name} token/id mismatch: token {token:?} maps to {id}, not {explicit_id}"
+                )));
             }
             return Ok(Some(ResolvedSpecialToken {
                 id,

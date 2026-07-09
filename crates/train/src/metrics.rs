@@ -908,10 +908,10 @@ impl MetricSink for MlflowSink {
         if let Err(err) = self.post_json("api/2.0/mlflow/runs/log-batch", &body) {
             eprintln!("[metrics] MlflowSink event export failed: {err}");
         }
-        if event.kind == "checkpoint" {
-            if let Err(err) = self.upload_checkpoint_artifacts(&run_id, event) {
-                eprintln!("[metrics] MlflowSink artifact upload failed: {err}");
-            }
+        if event.kind == "checkpoint"
+            && let Err(err) = self.upload_checkpoint_artifacts(&run_id, event)
+        {
+            eprintln!("[metrics] MlflowSink artifact upload failed: {err}");
         }
         if event.kind == "run_end" {
             let status = event

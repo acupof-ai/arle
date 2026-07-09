@@ -627,33 +627,29 @@ fn fused_linear_ce_loss_indexed_device(
 
         if requires_grad {
             let grads = chunk_tape.backward_collect(chunk_loss, store)?;
-            if need_hidden_grad {
-                if let Some(&g) = grads.get(&hidden_2d) {
-                    grad_hidden_2d_accum = Some(match grad_hidden_2d_accum.take() {
-                        None => store.clone_tensor(g)?,
-                        Some(acc) => {
-                            let next = crate::ops::add(acc, g, store, &mut view_tape)?;
-                            if store.get(acc).is_some() {
-                                store.free(acc)?;
-                            }
-                            next
+            if need_hidden_grad && let Some(&g) = grads.get(&hidden_2d) {
+                grad_hidden_2d_accum = Some(match grad_hidden_2d_accum.take() {
+                    None => store.clone_tensor(g)?,
+                    Some(acc) => {
+                        let next = crate::ops::add(acc, g, store, &mut view_tape)?;
+                        if store.get(acc).is_some() {
+                            store.free(acc)?;
                         }
-                    });
-                }
+                        next
+                    }
+                });
             }
-            if need_weight_grad {
-                if let Some(&g) = grads.get(&weight) {
-                    grad_weight_accum = Some(match grad_weight_accum.take() {
-                        None => store.clone_tensor(g)?,
-                        Some(acc) => {
-                            let next = crate::ops::add(acc, g, store, &mut view_tape)?;
-                            if store.get(acc).is_some() {
-                                store.free(acc)?;
-                            }
-                            next
+            if need_weight_grad && let Some(&g) = grads.get(&weight) {
+                grad_weight_accum = Some(match grad_weight_accum.take() {
+                    None => store.clone_tensor(g)?,
+                    Some(acc) => {
+                        let next = crate::ops::add(acc, g, store, &mut view_tape)?;
+                        if store.get(acc).is_some() {
+                            store.free(acc)?;
                         }
-                    });
-                }
+                        next
+                    }
+                });
             }
         }
 

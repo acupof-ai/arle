@@ -366,10 +366,10 @@ fn wait_for_serve(guard: &mut ServeGuard, interrupted: &AtomicBool) -> Result<St
             Err(e) => bail!("failed to poll serve child status: {e}"),
         }
 
-        if let Some(id) = query_served_model(guard.port) {
-            if !id.trim().is_empty() {
-                return Ok(id);
-            }
+        if let Some(id) = query_served_model(guard.port)
+            && !id.trim().is_empty()
+        {
+            return Ok(id);
         }
 
         if Instant::now() >= deadline {

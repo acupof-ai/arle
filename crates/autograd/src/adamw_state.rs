@@ -97,15 +97,15 @@ impl AdamW {
                 continue;
             };
 
-            if let Some(existing_shape) = self.param_shape(id) {
-                if existing_shape != param.shape {
-                    anyhow::bail!(
-                        "AdamW shape mismatch for '{}' (id {id}): existing {:?}, loaded {:?}",
-                        param.name,
-                        existing_shape,
-                        param.shape,
-                    );
-                }
+            if let Some(existing_shape) = self.param_shape(id)
+                && existing_shape != param.shape
+            {
+                anyhow::bail!(
+                    "AdamW shape mismatch for '{}' (id {id}): existing {:?}, loaded {:?}",
+                    param.name,
+                    existing_shape,
+                    param.shape,
+                );
             }
 
             let expected_len: usize = if param.shape.is_empty() {

@@ -269,11 +269,11 @@ pub fn build_api() -> Result<Api> {
     let mut builder = ApiBuilder::new();
 
     // Honour HF_TOKEN for private / gated models.
-    if let Ok(token) = std::env::var("HF_TOKEN") {
-        if !token.is_empty() {
-            log::debug!("HF_TOKEN found — using for authentication");
-            builder = builder.with_token(Some(token));
-        }
+    if let Ok(token) = std::env::var("HF_TOKEN")
+        && !token.is_empty()
+    {
+        log::debug!("HF_TOKEN found — using for authentication");
+        builder = builder.with_token(Some(token));
     }
 
     builder.build().context("ApiBuilder::build failed")

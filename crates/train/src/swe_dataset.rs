@@ -65,15 +65,14 @@ fn normalize_string_list(value: &serde_json::Value) -> Vec<String> {
         // SWE-bench-Pro shape), otherwise treat it as a single entry.
         serde_json::Value::String(s) => {
             let trimmed = s.trim();
-            if trimmed.starts_with('[') {
-                if let Ok(serde_json::Value::Array(items)) =
+            if trimmed.starts_with('[')
+                && let Ok(serde_json::Value::Array(items)) =
                     serde_json::from_str::<serde_json::Value>(trimmed)
-                {
-                    return items
-                        .iter()
-                        .filter_map(|v| v.as_str().map(str::to_owned))
-                        .collect();
-                }
+            {
+                return items
+                    .iter()
+                    .filter_map(|v| v.as_str().map(str::to_owned))
+                    .collect();
             }
             if trimmed.is_empty() {
                 Vec::new()

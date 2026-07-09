@@ -105,6 +105,8 @@ pub(crate) fn run_serve(args: &Args, serve_args: ServeArgs) -> ExitCode {
 /// SAFETY: single CLI thread, pre-tokio, pre-engine-build (same contract as the
 /// `ARLE_COMM_BACKEND` export above).
 fn apply_metal_speculative_env(serve_args: &ServeArgs) {
+    // SAFETY: single CLI thread, pre-tokio, pre-engine-build (same contract as
+    // the `ARLE_COMM_BACKEND` export above).
     unsafe {
         if serve_args.no_speculative {
             std::env::set_var("INFER_METAL_NO_SPECULATIVE", "1");
@@ -155,6 +157,8 @@ fn apply_probe_env(serve_args: &ServeArgs) {
             .map(|dir| dir.join(path))
             .unwrap_or_else(|_| path.clone())
     };
+    // SAFETY: single CLI thread, pre-spawn, pre-tokio (same contract as the
+    // `ARLE_COMM_BACKEND` export above).
     unsafe {
         std::env::set_var("ARLE_PROBE_JSONL", &abs);
         std::env::set_var(
