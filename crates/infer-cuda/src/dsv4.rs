@@ -50,6 +50,11 @@ pub(crate) struct Dsv4MlaKvArena {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Dsv4KvBudgetPlan {
     pub(crate) num_slots: usize,
+    /// Shared FlashMLA comp token capacity the demand-paged layer pools are
+    /// sized for (#154 Phase 3b) — the engine's admission page count is
+    /// `flashmla_pool_tokens / page_block_size`. For identity (V32) models
+    /// this is bookkeeping only (`num_slots × max_seq_len`).
+    pub(crate) flashmla_pool_tokens: usize,
 }
 
 /// Packed bytes per token the FlashMLA sparse-FP8 decode reads for the canonical
@@ -1633,6 +1638,7 @@ impl Dsv4Model {
             &self.kv_arena,
             self.tp.config().world_size,
             budget.num_slots,
+            budget.flashmla_pool_tokens,
             mla_decode,
             if needs_moe_decode_shared {
                 self.layers.first().map(|layer| {
@@ -1871,7 +1877,7 @@ impl Dsv4Model {
         let per_slot = slot_state_bytes
             .saturating_add(dsa_key_cache_per_slot)
             .saturating_add(dsa_batched_per_slot);
-        let (affordable_local, pool_budget_total_local): (i32, usize) =
+        let (affordable_local, budget_bytes_local): (i32, usize) =
             match cudarc::driver::result::mem_get_info() {
                 Ok((free, _total)) => {
                     let fixed_without_pool = dsa_shared_bytes
@@ -1910,20 +1916,21 @@ impl Dsv4Model {
                         pool_budget_total >> 20,
                         affordable,
                     );
-                    (affordable, pool_budget_total)
+                    (affordable, budget_before_pool.budget_bytes)
                 }
                 Err(_) => (i32::MAX, 0),
             };
         let affordable =
             self.tp
                 .all_reduce_min_scalar_i32(&self.ctx, affordable_local)? as usize;
-        // Reduce the pre-division total, not a per-layer share — the divisor
-        // this used to apply (`num_layers`) assumed uniform per-layer need,
-        // which SlidingWindow-only layers (few FlashMLA pages) and
-        // CompressedSparse layers (many) both violate.
-        let pool_budget_total = self.tp.all_reduce_min_scalar_i32(
+        // Reduce the pre-reservation budget (not a per-layer share, and not
+        // the post-reservation remainder): the joint (num_slots, pool_tokens)
+        // solve below needs the budget at ARBITRARY slot counts, and the
+        // actual reservation (`per_slot × planned`) is rank-identical once
+        // `planned` derives from reduced scalars.
+        let budget_bytes = self.tp.all_reduce_min_scalar_i32(
             &self.ctx,
-            i32::try_from(pool_budget_total_local.min(i32::MAX as usize)).unwrap_or(i32::MAX),
+            i32::try_from(budget_bytes_local.min(i32::MAX as usize)).unwrap_or(i32::MAX),
         )? as usize;
         // Reject-below-fixed guard (parity with Metal's fits_fixed): a
         // cross-rank-min affordable of 0 means post-weights free VRAM cannot
@@ -1974,43 +1981,125 @@ impl Dsv4Model {
             .collect::<Result<Vec<_>>>()?;
         let total_slot_pages: usize = per_layer_flashmla_pages.iter().sum();
         let flashmla_band_bytes_per_slot = total_slot_pages.saturating_mul(flashmla_page_bytes);
-        anyhow::ensure!(
-            flashmla_band_bytes_per_slot <= pool_budget_total,
-            "DSv4 KV budget rejected startup: the shared FlashMLA pool's \
-             remainder ({}MB) cannot hold even one slot's band across all \
-             layers at max_seq_len {max_seq_len} ({total_slot_pages} pages, \
-             {}MB). Lower --max-total-tokens or free VRAM.",
-            pool_budget_total >> 20,
-            flashmla_band_bytes_per_slot >> 20,
-        );
-        // The FlashMLA pool draws a FULL fixed band per slot up front (never
-        // incremental, `HostPagedKvPool::alloc_fixed_band`), so concurrency is
-        // ALSO capped by how many whole bands the remainder affords — the
-        // `affordable` gate above only sized per-slot STATE, excluding the band.
-        // Re-clamp `num_slots` to that so the scheduler never admits more
-        // concurrent requests than the pool can hand fixed bands to (pod-verified
-        // 2026-07-06: without this, a 2-request concurrent burst exhausted the
-        // pool and `bail!`'d inside `alloc_fixed_band` mid-serve instead of this
-        // clean startup-time slot count).
-        let pool_affordable_slots =
-            infer_seam::SlotBudget::from_limit(pool_budget_total, 0, flashmla_band_bytes_per_slot)
+        let demand_paged =
+            crate::attention::dsv4_flashmla_demand_paged(&self.config) && total_slot_pages > 0;
+        if !demand_paged {
+            // Identity (V32) bands: the pool draws a FULL fixed band per slot
+            // up front, so concurrency is ALSO capped by how many whole bands
+            // the post-reservation remainder affords (pod-verified
+            // 2026-07-06: without this, a 2-request concurrent burst
+            // exhausted the pool mid-serve).
+            let pool_budget_total = budget_bytes
+                .saturating_sub(per_slot.saturating_mul(requested.max(1).min(affordable)));
+            anyhow::ensure!(
+                total_slot_pages == 0 || flashmla_band_bytes_per_slot <= pool_budget_total,
+                "DSv4 KV budget rejected startup: the shared FlashMLA pool's \
+                 remainder ({}MB) cannot hold even one slot's band across all \
+                 layers at max_seq_len {max_seq_len} ({total_slot_pages} pages, \
+                 {}MB). Lower --max-total-tokens or free VRAM.",
+                pool_budget_total >> 20,
+                flashmla_band_bytes_per_slot >> 20,
+            );
+            let pool_affordable_slots = if flashmla_band_bytes_per_slot == 0 {
+                usize::MAX
+            } else {
+                infer_seam::SlotBudget::from_limit(
+                    pool_budget_total,
+                    0,
+                    flashmla_band_bytes_per_slot,
+                )
                 .affordable()
-                .unwrap_or(usize::MAX);
-        let affordable = affordable.min(pool_affordable_slots);
-        // Neutral clamp (infer-seam): planned = min(requested, affordable);
-        // clamped == requested > affordable. NCCL min-reduce stays CUDA-side.
-        let (planned, clamped) = infer_seam::clamp_to_affordable(requested, affordable);
-        if clamped {
+                .unwrap_or(usize::MAX)
+            };
+            let affordable = affordable.min(pool_affordable_slots);
+            // Neutral clamp (infer-seam): planned = min(requested, affordable);
+            // clamped == requested > affordable. NCCL min-reduce stays CUDA-side.
+            let (planned, clamped) = infer_seam::clamp_to_affordable(requested, affordable);
+            if clamped {
+                log::warn!(
+                    "DSv4 KV budget: requested {requested} slots × ~{}MB/slot (slot-state {}MB + DSA key-cache/batched; \
+                     FP8 arena out of divisor) exceeds the cross-rank-min affordable {affordable} \
+                     (local affordable {affordable_local}, pool-band-affordable {pool_affordable_slots}, \
+                     {MEM_FRACTION} of post-weights free); clamping num_slots to {affordable}.",
+                    per_slot >> 20,
+                    slot_state_bytes >> 20,
+                );
+            }
+            return Ok(Dsv4KvBudgetPlan {
+                num_slots: planned,
+                flashmla_pool_tokens: planned.saturating_mul(max_seq_len),
+            });
+        }
+        // #154 Phase 3b — demand-paged bands: num_slots stops being the
+        // pool's sizing unit. Jointly pick (num_slots, pool_tokens): the
+        // largest state-affordable slot count whose pool remainder still
+        // holds the per-slot ring/safety reserve PLUS one full-length
+        // request's comp capacity, then the largest shared token capacity
+        // that remainder funds (capped at num_slots × max_seq_len — beyond
+        // that no admissible mix can consume it). Feasibility is monotone in
+        // decreasing n, so the first feasible n scanning down is the max.
+        // All inputs are cross-rank-reduced ⇒ the loop is lockstep-identical.
+        let page = self.kv_arena.page_block_size;
+        let pages_needed = |n: usize, pool_tokens: usize| -> Result<usize> {
+            let mut acc = 0usize;
+            for layer in &self.layers {
+                acc = acc.saturating_add(crate::attention::dsv4_flashmla_layer_pool_pages(
+                    &self.config,
+                    layer.mode,
+                    layer.compress_ratio,
+                    max_seq_len,
+                    page,
+                    n,
+                    pool_tokens,
+                )?);
+            }
+            Ok(acc)
+        };
+        let n_max = requested.max(1).min(affordable);
+        let mut chosen: Option<(usize, usize)> = None;
+        for n in (1..=n_max).rev() {
+            let pool_pages = budget_bytes.saturating_sub(per_slot.saturating_mul(n))
+                / flashmla_page_bytes.max(1);
+            if pages_needed(n, max_seq_len)? > pool_pages {
+                continue;
+            }
+            let (mut lo, mut hi) = (max_seq_len, n.saturating_mul(max_seq_len));
+            while lo < hi {
+                let mid = lo + (hi - lo).div_ceil(2);
+                if pages_needed(n, mid)? <= pool_pages {
+                    lo = mid;
+                } else {
+                    hi = mid - 1;
+                }
+            }
+            chosen = Some((n, lo));
+            break;
+        }
+        let Some((planned, flashmla_pool_tokens)) = chosen else {
+            anyhow::bail!(
+                "DSv4 KV budget rejected startup: even one slot's ring reserve plus a \
+                 full-length comp band ({total_slot_pages} pages, {}MB) does not fit the \
+                 pool remainder at max_seq_len {max_seq_len}. Lower --max-total-tokens or free VRAM.",
+                flashmla_band_bytes_per_slot >> 20,
+            );
+        };
+        if planned < requested {
             log::warn!(
-                "DSv4 KV budget: requested {requested} slots × ~{}MB/slot (slot-state {}MB + DSA key-cache/batched; \
-                 FP8 arena out of divisor) exceeds the cross-rank-min affordable {affordable} \
-                 (local affordable {affordable_local}, pool-band-affordable {pool_affordable_slots}, \
-                 {MEM_FRACTION} of post-weights free); clamping num_slots to {affordable}.",
-                per_slot >> 20,
-                slot_state_bytes >> 20,
+                "DSv4 KV budget: requested {requested} slots clamped to {planned} \
+                 (cross-rank-min state-affordable {affordable}, local {affordable_local})."
             );
         }
-        Ok(Dsv4KvBudgetPlan { num_slots: planned })
+        log::info!(
+            "DSv4 KV budget (demand-paged bands): num_slots {planned}, shared comp capacity \
+             {flashmla_pool_tokens} tokens ({} engine pages), per_slot {}MB, budget {}MB",
+            flashmla_pool_tokens / page.max(1),
+            per_slot >> 20,
+            budget_bytes >> 20,
+        );
+        Ok(Dsv4KvBudgetPlan {
+            num_slots: planned,
+            flashmla_pool_tokens,
+        })
     }
 
     pub(crate) fn truncate_slot(

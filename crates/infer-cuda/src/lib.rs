@@ -807,6 +807,16 @@ impl BackendExecutor for CudaExecutor {
         }
     }
 
+    fn release_kv_slot(&mut self, slot: usize) {
+        match &mut self.inner {
+            CudaExecutorInner::Placeholder => {
+                let _ = slot;
+            }
+            #[cfg(feature = "cuda")]
+            CudaExecutorInner::Real(real) => real.release_kv_slot(slot),
+        }
+    }
+
     fn offload_weights(&mut self) -> anyhow::Result<usize> {
         match &mut self.inner {
             // No real device weights to offload without the cuda backend.
