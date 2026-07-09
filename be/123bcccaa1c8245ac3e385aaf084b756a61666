@@ -1,0 +1,21 @@
+crates/infer-cuda/src/attention/kv_layout.rs
+  s_4b7198573dd014::t_7aaa818d6d88a0 1740-1742
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "be123bcccaa1c8245ac3e385aaf084b756a61666",
+  "prompts": {},
+  "sessions": {
+    "s_4b7198573dd014": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "92cc6785-573b-445c-9517-2aca75a48773",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
