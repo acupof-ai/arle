@@ -1,0 +1,79 @@
+crates/infer-core/src/lib.rs
+  s_4b7198573dd014::t_6ecb7ed1f71d05 3281-3282,3285-3289,3291-3298
+crates/infer-core/src/planner.rs
+  s_4b7198573dd014::t_6209e856eddc1c 218-220,242-248
+docs/experience/archive/errors/2026-05-02-agent-load-w3-h1-sglang-gate-miss.md
+  s_4b7198573dd014::t_01dd52e319f7c9 1-203
+docs/experience/archive/errors/2026-05-02-bench-agent-load-a5-trtllm-w3-session-id-rejected.md
+  s_4b7198573dd014::t_8b3bc8a8b4de24 1-149
+docs/experience/archive/errors/2026-05-06-cuda-complete-stream-async-violates-contract.md
+  s_4b7198573dd014::t_7b65308058df6d 1-71
+docs/experience/archive/errors/2026-05-07-m_b22-bf16-splitkv-killed-regression-and-hang.md
+  s_4b7198573dd014::t_82eaa7ff5c11aa 1-67
+docs/experience/archive/errors/2026-05-07-perf-model-audit-c4-not-leftpad.md
+  s_4b7198573dd014::t_702d97866b4ecf 1-164
+docs/experience/archive/errors/2026-05-07-qwen35-rust-mode-too-slow-for-production.md
+  s_4b7198573dd014::t_08fd6b81264412 1-95
+docs/experience/archive/errors/2026-05-07-radix-cache-no-tokenizer-fingerprint.md
+  s_4b7198573dd014::t_48545ce48591e8 1-116
+docs/experience/archive/errors/2026-05-08-m_quant-cutlass-fp8-smoke-killed-sm89.md
+  s_4b7198573dd014::t_338da693fb5cd2 1-78
+docs/experience/archive/wins/2026-04-15-bench-tiered-kv-m2b-remote.json
+  s_4b7198573dd014::t_6d841af1eae864 1-189
+docs/experience/archive/wins/2026-04-15-bench-tiered-kv-m3c-remote.json
+  s_4b7198573dd014::t_4da1dd170b9621 1-189
+docs/experience/archive/wins/2026-04-16-bench-kv-baseline-agent-trace.json
+  s_4b7198573dd014::t_defc6728170a2d 1-197
+docs/experience/archive/wins/2026-04-16-bench-tiered-kv-tier-abc-remote.json
+  s_4b7198573dd014::t_c823c5b9e814cb 1-189
+docs/experience/archive/wins/2026-05-01-f1-parallel-state-tp-load-context.md
+  s_4b7198573dd014::t_c82e007d051353 1-62
+docs/experience/archive/wins/2026-05-01-f2-qwen3-qwen35-tp-forward-sharding.md
+  s_4b7198573dd014::t_63584769be704c 1-62
+docs/experience/archive/wins/2026-05-01-nccl-group-coordinator-smoke.md
+  s_4b7198573dd014::t_b32e36c2cae7c9 1-56
+docs/experience/archive/wins/2026-05-02-bench-agent-load-w3-harness-pending.md
+  s_4b7198573dd014::t_ab6ad3e9d030fa 1-200
+docs/experience/archive/wins/2026-05-02-bench-agent-load-w4-harness-pending.md
+  s_4b7198573dd014::t_835ca9cbf5a3d1 1-201
+docs/experience/archive/wins/2026-05-03-bench-metal-qwen35-prefix-publish-fix.md
+  s_4b7198573dd014::t_7ca0b6bc6e59fa 1-310
+docs/experience/archive/wins/2026-05-05-bench-kv-tier-rust-substrate.md
+  s_4b7198573dd014::t_06b79763aa1445 1-189
+docs/experience/archive/wins/2026-05-06-bench-guidellm-cuda-stream-blocking-fix-pending-remote.md
+  s_4b7198573dd014::t_e2cf3da47f3923 1-49
+docs/experience/archive/wins/2026-05-07-cuda-greedy-consistency-deterministic-gemm.md
+  s_4b7198573dd014::t_e0334f49babd47 1-44
+docs/experience/archive/wins/2026-05-07-f4small-disabled-mixed-path.md
+  s_4b7198573dd014::t_a8f2b373e3039a 1-128
+docs/experience/archive/wins/2026-05-07-m3-decode-slot-recovery.md
+  s_4b7198573dd014::t_db966ca9c97408 1-39
+docs/experience/archive/wins/2026-05-07-m3.6-f4small-async-greedy-readback.md
+  s_4b7198573dd014::t_fce55a78de5914 1-53
+docs/experience/archive/wins/2026-05-07-m3.6-vllm-longctx-8k-comparison.md
+  s_4b7198573dd014::t_06d545bb28e8f3 1-170
+docs/experience/archive/wins/2026-05-07-m3.7-b1.2-async-prefill-completion.md
+  s_4b7198573dd014::t_c8dbd210658740 1-88
+docs/experience/archive/wins/2026-05-07-nvtx-scaffolding-for-nsight.md
+  s_4b7198573dd014::t_eedfe78eea26f4 1-111
+docs/experience/archive/wins/2026-05-07-session-arc-deferred-bug-to-combo-plan.md
+  s_4b7198573dd014::t_e3524d51b22c18 1-178
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "eeeff99eb903e19e28ad258556e6b9e6737dfc34",
+  "prompts": {},
+  "sessions": {
+    "s_4b7198573dd014": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "92cc6785-573b-445c-9517-2aca75a48773",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
