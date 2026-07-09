@@ -421,10 +421,10 @@ impl RealCudaExecutor {
         }
     }
 
-    /// Cross-request position-0 prefix reuse. Route B (the whole-slot store)
-    /// was removed 2026-07-08 pending Route A's page-granular replacement
-    /// (docs/plans/2026-07-08-dsv4-route-a-page-granular-prefix-reuse.md) — no
-    /// arm holds a store today, every backend reports no match.
+    /// Generic engine-level prefix match hook (`BackendExecutor` trait).
+    /// DSv4's own cross-request reuse runs through `reusable_prefix_blocks`/
+    /// `restore_prefix_reuse_state` instead, so every DSv4 arm reports no
+    /// match here.
     pub(crate) fn cached_prefix_match_len(&self, _tokens: &[u32]) -> Result<usize> {
         Ok(0)
     }
@@ -462,7 +462,7 @@ impl RealCudaExecutor {
     ) -> Result<()> {
         match self {
             Self::Qwen35(q) => q.restore_recurrent_sidecar(slot, tokens, matched_len, prefix_pages),
-            Self::Dsv4(d) => d.restore_route_a_prefix_state(slot, matched_len, prefix_pages),
+            Self::Dsv4(d) => d.restore_prefix_reuse_state(slot, matched_len, prefix_pages),
             Self::Qwen(_) => Ok(()),
         }
     }
@@ -2536,12 +2536,13 @@ impl Dsv4CudaExecutor {
     }
 
     /// Promotes the boundary state `reusable_prefix_blocks` gated the match
-    /// on, across all three Route-A pools, into `slot`'s own per-slot bands
-    /// (`dsa_key_cache`, `sw_window_cache` — the compress-state pool needs no
-    /// copy-in, its live kernels already address the shared pool directly).
+    /// on, across all three shared prefix-reuse pools, into `slot`'s own
+    /// per-slot bands (`dsa_key_cache`, `sw_window_cache` — the compress-state
+    /// pool needs no copy-in, its live kernels already address the shared
+    /// pool directly).
     /// An `Err` here propagates to the engine's fallback (free slot, full
     /// recompute) — never proceeds with an unpromoted boundary.
-    pub(crate) fn restore_route_a_prefix_state(
+    pub(crate) fn restore_prefix_reuse_state(
         &mut self,
         slot: usize,
         matched_len: usize,
@@ -2562,7 +2563,9 @@ impl Dsv4CudaExecutor {
                     );
                     self.slots
                         .get_mut(slot)
-                        .ok_or_else(|| anyhow!("DSv4 Route A restore: slot {slot} outside range"))?
+                        .ok_or_else(|| {
+                            anyhow!("DSv4 prefix-reuse restore: slot {slot} outside range")
+                        })?
                         .attention_layer_mut(layer_idx)?
                         .set_compressor_seq_len(compressor_seq_len);
                 }
@@ -2602,7 +2605,7 @@ impl Dsv4CudaExecutor {
                 let attn = self
                     .slots
                     .get_mut(slot)
-                    .ok_or_else(|| anyhow!("DSv4 Route A restore: slot {slot} outside range"))?
+                    .ok_or_else(|| anyhow!("DSv4 prefix-reuse restore: slot {slot} outside range"))?
                     .attention_layer_mut(layer_idx)?;
                 attn.set_indexer_seq_len(row_count);
                 attn.set_dsa_official_packed_rows(row_count);
@@ -2639,12 +2642,12 @@ impl Dsv4CudaExecutor {
                 .attach_slot_flashmla_pages(slot, prefix_pages, matched_len)?;
             self.slots
                 .get_mut(slot)
-                .ok_or_else(|| anyhow!("DSv4 Route A restore: slot {slot} outside range"))?
+                .ok_or_else(|| anyhow!("DSv4 prefix-reuse restore: slot {slot} outside range"))?
                 .refresh_flashmla_device_page_tables(&ctx, &self.kv_adapter)?;
         }
         self.slots
             .get_mut(slot)
-            .ok_or_else(|| anyhow!("DSv4 Route A restore: slot {slot} outside range"))?
+            .ok_or_else(|| anyhow!("DSv4 prefix-reuse restore: slot {slot} outside range"))?
             .set_seq_len(matched_len);
         Ok(())
     }
