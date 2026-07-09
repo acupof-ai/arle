@@ -28,6 +28,8 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import ast
+import contextlib
 import hashlib
 import json
 import random
@@ -98,21 +100,41 @@ class NearDupIndex:
 
 # ------------------------------------------------------ per-dataset shape ----
 
+def _as_list(value) -> list[str]:
+    """List columns arrive as real lists, JSON arrays, or python-repr strings
+    (SWE-smith's FAIL_TO_PASS is `"['a', 'b']"`)."""
+    if isinstance(value, list):
+        return [str(v) for v in value]
+    if isinstance(value, str) and value.strip().startswith("["):
+        try:
+            return [str(v) for v in json.loads(value)]
+        except json.JSONDecodeError:
+            with contextlib.suppress(ValueError, SyntaxError):
+                return [str(v) for v in ast.literal_eval(value)]
+    return []
+
+
 def _swe_task(row: dict, name: str) -> dict:
+    fail_to_pass = _as_list(row.get("FAIL_TO_PASS"))
     return {
         "instance_id": row["instance_id"],
         "problem_statement": row["problem_statement"],
         "repo": row["repo"],
-        "base_commit": row["base_commit"],
+        # SWE-smith has no base_commit: tasks are branches (named by
+        # instance_id) of the swesmith/<repo>.<shortsha> mirror; carry the
+        # short sha from the repo slug so the field stays truthful.
+        "base_commit": row.get("base_commit") or row["repo"].rsplit(".", 1)[-1],
         "test_patch": row.get("test_patch") or "",
-        "fail_to_pass": row.get("FAIL_TO_PASS") or [],
+        "fail_to_pass": fail_to_pass,
         "selected_test_files_to_run": sorted(
-            {t.split("::")[0] for t in (row.get("FAIL_TO_PASS") or [])}
+            {t.split("::")[0] for t in fail_to_pass}
         ),
         "before_repo_set_cmd": None,
         "requirements": None,
         "gold_patch": row.get("patch") or "",
-        "pass_to_pass": row.get("PASS_TO_PASS") or [],
+        # swe_smith lists ~2k pass-to-pass names per row (69 KB) the SweTask
+        # lane never reads; keep a regression-check sample only.
+        "pass_to_pass": _as_list(row.get("PASS_TO_PASS"))[:100],
         "source": name,
     }
 
