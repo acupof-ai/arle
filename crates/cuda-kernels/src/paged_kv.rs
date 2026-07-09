@@ -768,6 +768,40 @@ impl TokenKVPool {
         Ok(new_pages)
     }
 
+    /// Zero `pages`' data planes with DEVICE memsets (async, stream-ordered).
+    /// The band-demand-paging claim-zero path: an H2D of host zeros blocks on
+    /// pageable memory per call (~290 blocking copies per DSv4 request —
+    /// measured +3.7% on the E6 shape), a memset does not.
+    pub fn zero_pages(&mut self, ctx: &DeviceContext, pages: &[u32]) -> Result<()> {
+        #[cfg(feature = "cuda")]
+        {
+            self.validate_page_ids(pages, "zero_pages")?;
+            let token_bytes = self.data_plane_bytes_per_page();
+            let single_plane = self.is_single_plane();
+            for &page in pages {
+                let start = page as usize * token_bytes;
+                for layer in 0..self.num_layers {
+                    let mut k_view = self.k_data[layer].slice_mut(start..start + token_bytes);
+                    ctx.stream
+                        .memset_zeros(&mut k_view)
+                        .map_err(|e| anyhow!("paged_kv zero_pages K memset failed: {e}"))?;
+                    if !single_plane {
+                        let mut v_view = self.v_data[layer].slice_mut(start..start + token_bytes);
+                        ctx.stream
+                            .memset_zeros(&mut v_view)
+                            .map_err(|e| anyhow!("paged_kv zero_pages V memset failed: {e}"))?;
+                    }
+                }
+            }
+            Ok(())
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = (ctx, pages);
+            anyhow::bail!("GPU required: TokenKVPool::zero_pages")
+        }
+    }
+
     /// Roll the logical cursor back to `new_len` tokens WITHOUT recycling any
     /// band pages — the fixed-layout-band counterpart of [`Self::truncate_slot`].
     ///
