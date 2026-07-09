@@ -215,12 +215,14 @@ pub(crate) fn dsv4_prefix_entry_max_bytes(
         total += 10 * 4; // section length prefixes
         // ring — every layer has an SW window cache.
         total += config.sliding_window * config.head_dim * bf16;
+        // ceil, not floor: for ratio > page_tokens a page can still complete
+        // one row (page_row_span), and the predictor must never undersize.
         if mode != DeepSeekV4AttentionMode::SlidingWindow && ratio > 0 {
-            let rpp = page_tokens / ratio;
+            let rpp = page_tokens.div_ceil(ratio);
             total += rpp * kv_arena.bytes_per_token; // band data+scale
         }
         if mode.has_compressor() && ratio > 0 {
-            let rpp = page_tokens / ratio;
+            let rpp = page_tokens.div_ceil(ratio);
             total += rpp * config.head_dim * bf16; // staging
             total += 2 * ratio * config.head_dim * bf16; // overlap kv+score
         }
@@ -230,7 +232,7 @@ pub(crate) fn dsv4_prefix_entry_max_bytes(
             } else {
                 ratio.max(1)
             };
-            let rpp = page_tokens / index_ratio;
+            let rpp = page_tokens.div_ceil(index_ratio);
             total += rpp * (config.index_head_dim + 4); // dsa data+scale
             total += 2 * index_ratio * config.index_head_dim * bf16; // idx overlap
         }
