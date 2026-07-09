@@ -26,9 +26,6 @@
 //! and the engine's `invalidate_prefix_cache` drops every entry through the
 //! `release_prefix_pages` seam — no cross-epoch reuse window.
 
-// Restore/L3 halves are wired by the later commits in this series.
-#![allow(dead_code)]
-
 use std::collections::BTreeMap;
 
 use super::*;
@@ -370,8 +367,18 @@ impl Dsv4PrefixStatePool {
             "prefix-state pool has no confirmed entry for host page {page_id}"
         );
         let key = tier_key(NS_PREFIX_STATE, u64::from(page_id));
-        let bytes = self.store.read(key)?;
-        Dsv4PrefixPageEntry::from_bytes(&bytes)
+        let promote = matches!(
+            self.store.location(key),
+            Some(infer_seam::KvTierLocation::Disk)
+        );
+        let bytes = self.store.read(key)?.into_owned();
+        let entry = Dsv4PrefixPageEntry::from_bytes(&bytes)?;
+        // Read-on-miss promote: a disk-resident entry that restores is hot —
+        // re-insert to the host level (its LRU spills something colder).
+        if promote {
+            self.store.insert(key, bytes);
+        }
+        Ok(entry)
     }
 
     /// Radix evicted these host pages: drop their entries (eviction rides the

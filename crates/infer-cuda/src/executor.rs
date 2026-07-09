@@ -2321,6 +2321,8 @@ impl Dsv4CudaExecutor {
             &layer_specs,
             model.kv_arena.page_block_size,
         );
+        let (park_budget, prefix_budget) =
+            Self::split_dram_share(default_t1_budget_bytes(DEFAULT_DRAM_FRACTION));
         Ok(Self {
             model,
             slots,
@@ -2333,15 +2335,22 @@ impl Dsv4CudaExecutor {
             mtp_rejects: 0,
             mtp_accept_ema: 1.0,
             mtp_skip_streak: 0,
-            slot_tier: CudaKvTierStore::with_budget(
-                default_t1_budget_bytes(DEFAULT_DRAM_FRACTION),
-                BLOB_CHUNK_BYTES,
-            ),
+            slot_tier: CudaKvTierStore::with_budget(park_budget, BLOB_CHUNK_BYTES),
             prefix_state: crate::attention::Dsv4PrefixStatePool::new(
-                default_t1_budget_bytes(DEFAULT_DRAM_FRACTION),
+                prefix_budget,
                 prefix_entry_bytes,
             ),
         })
+    }
+
+    /// ONE `--kv-dram` share funds BOTH host stores — whole-slot park and
+    /// prefix-state pool split it 50/50, an explicit deterministic partition,
+    /// never two independent draws of the default fraction. Three tiers,
+    /// three independent questions: HBM sizes slots (`kv_budget_plan`), this
+    /// DRAM share sizes pool heat, `--kv-disk` alone sizes the spill.
+    fn split_dram_share(bytes: usize) -> (usize, usize) {
+        let park = bytes / 2;
+        (park, bytes - park)
     }
 
     /// Publish every host page this forward completed for `slot` into the
@@ -2411,28 +2420,41 @@ impl Dsv4CudaExecutor {
         self.prefix_state.confirm_pages(pages);
     }
 
-    /// Attach the opt-in NVMe disk spill level (pre-serve only).
+    /// Attach the opt-in NVMe disk spill level (pre-serve only) to BOTH host
+    /// stores, splitting the ONE `--kv-disk` cap the same way as the DRAM
+    /// share. The cap is soft for the prefix pool: over it, publish drops the
+    /// pool's oldest entries — capacity never blocks a forward and never
+    /// enters the reuse license.
     pub(crate) fn set_kv_tier_disk(
         &mut self,
         root: std::path::PathBuf,
         budget_bytes: usize,
     ) -> bool {
-        self.slot_tier
-            .set_disk(root, budget_bytes, BLOB_CHUNK_BYTES)
+        let (park_disk, prefix_disk) = Self::split_dram_share(budget_bytes);
+        let park_ok = self
+            .slot_tier
+            .set_disk(root.clone(), park_disk, BLOB_CHUNK_BYTES);
+        let prefix_ok = self.prefix_state.set_disk(root, prefix_disk);
+        if !park_ok || !prefix_ok {
+            warn!("DSv4 --kv-disk attach incomplete: park={park_ok} prefix={prefix_ok}");
+        }
+        park_ok && prefix_ok
     }
 
     /// Pre-serve re-budget rebuilds THE stores, orphaning every stored blob.
+    /// The share is split across both stores — see [`Self::split_dram_share`].
     pub(crate) fn set_kv_tier_budget_bytes(&mut self, bytes: usize) {
-        self.slot_tier = CudaKvTierStore::with_budget(bytes, BLOB_CHUNK_BYTES);
-        self.prefix_state.set_budget_bytes(bytes);
+        let (park_budget, prefix_budget) = Self::split_dram_share(bytes);
+        self.slot_tier = CudaKvTierStore::with_budget(park_budget, BLOB_CHUNK_BYTES);
+        self.prefix_state.set_budget_bytes(prefix_budget);
     }
 
     pub(crate) fn kv_tier_host_demoted_pages(&self) -> usize {
-        self.slot_tier.host_demoted_pages()
+        self.slot_tier.host_demoted_pages() + self.prefix_state.host_pages()
     }
 
     pub(crate) fn kv_tier_disk_pages(&self) -> usize {
-        self.slot_tier.disk_pages()
+        self.slot_tier.disk_pages() + self.prefix_state.disk_pages()
     }
 
     /// Content-keyed reuse license (#154 Phase 2): a leading page is
