@@ -257,6 +257,25 @@ pub(crate) struct DsparkScratch {
     conf_feat: VecSlot,
     conf_out: VecSlot,
     argmax: SliceSlot<i32>,
+    /// Sampled-mode device buffers (allocated on first temp>0 spec step only;
+    /// greedy never touches them). Fixed caps — no per-step realloc:
+    /// `q_probs [block, vocab] f32` draft filtered dists (row i fully written
+    /// by the markov-step filter kernel before the chain kernel reads it);
+    /// `p_probs [block+1, vocab] f32` verify filtered dists (leading
+    /// `chain_len` rows fully written per accept; the stale tail is never
+    /// read — the chain kernel indexes rows `<= depth < chain_len`);
+    /// `sample_tok [1]` / `accept_out [2]` fully written before D2H;
+    /// `chain_draft [block]` / `u_accept [block]` / `u_residual [block+1]`
+    /// host-uploaded prefixes — the kernel reads only the uploaded prefix.
+    q_probs: SliceSlot<f32>,
+    p_probs: SliceSlot<f32>,
+    sample_tok: SliceSlot<i32>,
+    accept_out: SliceSlot<i32>,
+    chain_draft: SliceSlot<i32>,
+    u_accept: SliceSlot<f32>,
+    u_residual: SliceSlot<f32>,
+    /// Valid draft rows in `q_probs` (set by the draft, checked by the accept).
+    q_rows: usize,
 }
 
 /// On-device argmax over one token row of a `[vocab, seq]` bf16 buffer
@@ -292,9 +311,6 @@ fn argmax_hs_row(
     Ok(token[0] as u32)
 }
 
-/// Sparse `(token, prob)` sampling distribution retained for the rejection test.
-pub(crate) type DsparkDist = Vec<(u32, f32)>;
-
 /// Uniform-stream salts: draft draw / accept test / residual+bonus draw at the
 /// same position must be independent or the rejection identity breaks.
 const SALT_DRAW: u64 = 0;
@@ -321,87 +337,6 @@ fn unit_uniform(seed: Option<u64>, salt: u64, position: u64) -> f32 {
             .wrapping_add(1),
     );
     (bits >> 40) as f32 / (1u32 << 24) as f32
-}
-
-/// Filtered, renormalized sampling distribution of one logits row — the exact
-/// temperature/top-k/top-p/min-p semantics (including candidate order and the
-/// degenerate-row argmax fallback) of `infer_plan::sample_token`, so the
-/// rejection test measures against the distribution plain decode samples from.
-fn filtered_dist(logits: &[f32], params: &SamplingParams) -> DsparkDist {
-    let inv_t = 1.0 / params.temperature;
-    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let mut cand: Vec<(u32, f32)> = logits
-        .iter()
-        .enumerate()
-        .map(|(i, &l)| (i as u32, ((l - max) * inv_t).exp()))
-        .collect();
-    let sum: f32 = cand.iter().map(|(_, p)| *p).sum();
-    if sum > 0.0 {
-        for c in &mut cand {
-            c.1 /= sum;
-        }
-    }
-    if params.top_k > 0 || params.top_p < 1.0 || params.min_p > 0.0 {
-        cand.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
-        if params.top_k > 0 && (params.top_k as usize) < cand.len() {
-            cand.truncate(params.top_k as usize);
-        }
-        if params.top_p < 1.0 {
-            let mut cum = 0.0;
-            let mut cut = cand.len();
-            for (i, (_, p)) in cand.iter().enumerate() {
-                cum += *p;
-                if cum >= params.top_p {
-                    cut = i + 1;
-                    break;
-                }
-            }
-            cand.truncate(cut.max(1));
-        }
-        if params.min_p > 0.0 {
-            let top = cand.first().map_or(0.0, |(_, p)| *p);
-            cand.retain(|(_, p)| *p >= params.min_p * top);
-        }
-    }
-    let total: f32 = cand.iter().map(|(_, p)| *p).sum();
-    if cand.is_empty() || !total.is_finite() || total <= 0.0 {
-        return vec![(infer_plan::argmax_logit(logits), 1.0)];
-    }
-    for c in &mut cand {
-        c.1 /= total;
-    }
-    cand
-}
-
-fn dist_prob(dist: &[(u32, f32)], tok: u32) -> f32 {
-    dist.iter()
-        .find(|&&(t, _)| t == tok)
-        .map_or(0.0, |&(_, p)| p)
-}
-
-/// Multinomial draw over a normalized distribution (CDF scan in `dist` order —
-/// the same scan `infer_plan::sample_token` performs).
-fn draw(dist: &[(u32, f32)], unit: f32) -> u32 {
-    let mut acc = 0.0;
-    for &(t, p) in dist {
-        acc += p;
-        if unit < acc {
-            return t;
-        }
-    }
-    dist.last().map_or(0, |&(t, _)| t)
-}
-
-/// One token row of a `[vocab, seq]` bf16 buffer, D2H as f32.
-fn host_hs_row_f32(ctx: &DeviceContext, logits: &HiddenStates, row: usize) -> Result<Vec<f32>> {
-    let vocab = logits.hidden_dim;
-    ensure!(row < logits.seq_len, "dspark sample row {row} oob");
-    let host = ctx
-        .stream
-        .clone_dtoh(&logits.data.slice(row * vocab..(row + 1) * vocab))
-        .map_err(|e| anyhow!("D2H dspark logits row failed: {e}"))?;
-    ctx.sync()?;
-    Ok(host.iter().map(|x| x.to_f32()).collect())
 }
 
 /// Executor-side DSpark runtime: the loaded head + per-slot draft state + the
@@ -755,9 +690,10 @@ impl Qwen35Model {
     /// One DSpark block draft: propose up to `max_draft_tokens` tokens from a
     /// single non-causal 5-layer forward over `[ctx cache ++ block]`.
     /// Returns the verify chain `[anchor, d1..dL]` (`L` truncated by the
-    /// confidence head when present) plus, in sampling mode
-    /// (`!params.is_greedy()`), the per-row filtered draft distributions
-    /// `q[i]` for `chain[i+1]` (empty for greedy — argmax path unchanged).
+    /// confidence head when present). In sampling mode (`!params.is_greedy()`)
+    /// each draft is a device draw from the engine-sampler-filtered dist `q`,
+    /// retained on device in `scratch.q_probs` row `i` for `chain[i+1]`
+    /// (greedy: argmax path, byte-identical, no q buffers touched).
     pub(crate) fn dspark_draft_block(
         &self,
         head: &Qwen35DsparkHead,
@@ -766,7 +702,7 @@ impl Qwen35Model {
         anchor: u32,
         start: usize,
         params: &SamplingParams,
-    ) -> Result<(Vec<u32>, Vec<DsparkDist>)> {
+    ) -> Result<Vec<u32>> {
         let cfg = &head.cfg;
         let ctx = &self.ctx;
         let block = cfg.block_size;
@@ -943,11 +879,12 @@ impl Qwen35Model {
         let head_ms = super::mtp_phase_lap(ctx, &mut pt);
 
         // Left-to-right token selection: argmax (greedy) or a rejection-ready
-        // draw from the engine-sampler-filtered distribution q (retained per
-        // row). Next-token heads (DSpark) draft from every row; same-position
+        // device draw from the engine-sampler-filtered distribution q (full
+        // row retained in `scratch.q_probs` — only the token id comes back).
+        // Next-token heads (DSpark) draft from every row; same-position
         // (DFlash) rows 1.. fill their own positions.
         let sampling = !params.is_greedy();
-        let mut q_dists: Vec<DsparkDist> = Vec::new();
+        scratch.q_rows = 0;
         let first_row = usize::from(!cfg.next_token_heads);
         let mut drafts = Vec::with_capacity(block);
         let mut prev = anchor;
@@ -980,12 +917,42 @@ impl Qwen35Model {
                 (scratch.logits.get(ctx, vocab, block)?, row)
             };
             let tok = if sampling {
-                let dist = filtered_dist(&host_hs_row_f32(ctx, src, src_row)?, params);
-                let tok = draw(
-                    &dist,
-                    unit_uniform(params.seed, SALT_DRAW, (start + row) as u64),
-                );
-                q_dists.push(dist);
+                // Filter + q-row store + multinomial draw in one device call;
+                // uniform from the host (seed, position) stream plain decode
+                // would consume at this position (SALT_DRAW = 0).
+                let u = unit_uniform(params.seed, SALT_DRAW, (start + row) as u64);
+                let q_all = scratch.q_probs.get(ctx, block * vocab)?;
+                let tok_out = scratch.sample_tok.get(ctx, 1)?;
+                {
+                    let elem = std::mem::size_of::<bf16>() as u64;
+                    let (l_ptr, _gl) = src.data.device_ptr(&ctx.stream);
+                    let (q_ptr, _gq) = q_all.device_ptr_mut(&ctx.stream);
+                    let (t_ptr, _gt) = tok_out.device_ptr_mut(&ctx.stream);
+                    // SAFETY: `src` row holds `vocab` bf16 (src_row bounded by
+                    // its seq_len); q row index == drafts.len() < block.
+                    unsafe {
+                        ffi::dspark_draft_sample_cuda(
+                            (l_ptr + (src_row * vocab) as u64 * elem) as *const ffi::Half,
+                            (q_ptr + (drafts.len() * vocab * 4) as u64) as *mut f32,
+                            t_ptr as *mut i32,
+                            vocab as i32,
+                            1.0 / params.temperature,
+                            params.top_k,
+                            params.top_p,
+                            params.min_p,
+                            u,
+                            ctx.stream.cu_stream(),
+                        )
+                        .result()?;
+                    }
+                }
+                ctx.sync()?;
+                let tok = ctx
+                    .stream
+                    .clone_dtoh(tok_out)
+                    .map_err(|e| anyhow!("D2H dspark draft token failed: {e}"))?[0]
+                    as u32;
+                scratch.q_rows += 1;
                 tok
             } else {
                 argmax_hs_row(ctx, src, src_row, scratch.argmax.get(ctx, 1)?)?
@@ -1008,12 +975,11 @@ impl Qwen35Model {
         }
         let keep = self.dspark_confident_prefix_len(head, scratch, &prev_tokens)?;
         drafts.truncate(keep.min(drafts.len()));
-        q_dists.truncate(drafts.len());
 
         let mut chain = Vec::with_capacity(1 + drafts.len());
         chain.push(anchor);
         chain.extend(drafts);
-        Ok((chain, q_dists))
+        Ok(chain)
     }
 
     /// Confidence-head seam: acceptance-confident prefix length over the block
@@ -1119,67 +1085,117 @@ impl Qwen35Model {
     }
 
     /// Rejection-sampling twin of [`Self::dspark_accept_commit`] (mirrors
-    /// DeepSpec `verify_draft_tokens`): accept `chain[j+1]` with prob
-    /// min(1, p_j(tok)/q_j(tok)) under the engine-sampler-filtered
+    /// flashinfer/SGLang `chain_speculative_sampling`): accept `chain[j+1]`
+    /// with prob min(1, p_j(tok)/q_j(tok)) under the engine-sampler-filtered
     /// distributions; the first reject commits a residual `max(0, p−q)` draw
     /// (falling back to `p` on ~0 mass), full accept a bonus draw from the
     /// last row — committed tokens are distributed exactly as filtered target
-    /// sampling. ONE D2H of the verify logits; all uniforms come from salted
-    /// `(seed, position)` streams, so same-config-twice reproduces.
+    /// sampling. Fully on device: one batched filter launch over the verify
+    /// logits + one chain kernel; the host receives only `[accepted_len,
+    /// token]` (8 bytes). All uniforms come from host salted `(seed, position)`
+    /// streams, so same-config-twice reproduces.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn dspark_accept_commit_sampled(
         &self,
         slot: &mut Qwen35SlotState,
         spec: &mut Qwen35SpecSlotState,
         ws: &mut Qwen35Workspace,
+        head: &Qwen35DsparkHead,
+        scratch: &mut DsparkScratch,
         chain: &[u32],
-        q: &[DsparkDist],
         logits: &DeviceVec,
         start_pos: usize,
         params: &SamplingParams,
     ) -> Result<(Vec<u32>, u32, usize)> {
+        let ctx = &self.ctx;
         let depth = chain.len() - 1;
+        let block = head.cfg.block_size;
         ensure!(
-            q.len() == depth,
-            "dspark sampled verify: {} q rows for depth {depth}",
-            q.len()
+            scratch.q_rows >= depth && depth <= block,
+            "dspark sampled verify: {} q rows for depth {depth} (block {block})",
+            scratch.q_rows
         );
         let vocab = self.output_projection().rows;
-        let host = logits.to_host(&self.ctx)?;
-        let p_row = |j: usize| filtered_dist(&host[j * vocab..(j + 1) * vocab], params);
-        let mut k = 0usize;
-        let bonus = loop {
-            let p = p_row(k);
-            let pos = (start_pos + k + 1) as u64;
-            if k == depth {
-                break draw(&p, unit_uniform(params.seed, SALT_RESIDUAL, pos));
+        // Uniform streams at pos = start_pos + j + 1 (identical to the host
+        // path's per-step draws — position-salted, so batching changes nothing).
+        let pos = |j: usize| (start_pos + j + 1) as u64;
+        let u_acc: Vec<f32> = (0..depth)
+            .map(|j| unit_uniform(params.seed, SALT_ACCEPT, pos(j)))
+            .collect();
+        let u_res: Vec<f32> = (0..=depth)
+            .map(|j| unit_uniform(params.seed, SALT_RESIDUAL, pos(j)))
+            .collect();
+        let draft: Vec<i32> = chain[1..].iter().map(|&t| t as i32).collect();
+
+        let p_all = scratch.p_probs.get(ctx, (block + 1) * vocab)?;
+        let q_all = scratch.q_probs.get(ctx, block * vocab)?;
+        let draft_dev = scratch.chain_draft.get(ctx, block)?;
+        let ua_dev = scratch.u_accept.get(ctx, block)?;
+        let ur_dev = scratch.u_residual.get(ctx, block + 1)?;
+        let out_dev = scratch.accept_out.get(ctx, 2)?;
+        ctx.stream
+            .memcpy_htod(&draft, &mut draft_dev.slice_mut(0..depth))
+            .and_then(|()| {
+                ctx.stream
+                    .memcpy_htod(&u_acc, &mut ua_dev.slice_mut(0..depth))
+            })
+            .and_then(|()| {
+                ctx.stream
+                    .memcpy_htod(&u_res, &mut ur_dev.slice_mut(0..=depth))
+            })
+            .map_err(|e| anyhow!("H2D dspark chain inputs failed: {e}"))?;
+        {
+            let (l_ptr, _gl) = logits.data.device_ptr(&ctx.stream);
+            let (p_ptr, _gp) = p_all.device_ptr_mut(&ctx.stream);
+            let (q_ptr, _gq) = q_all.device_ptr(&ctx.stream);
+            let (d_ptr, _gd) = draft_dev.device_ptr(&ctx.stream);
+            let (ua_ptr, _gua) = ua_dev.device_ptr(&ctx.stream);
+            let (ur_ptr, _gur) = ur_dev.device_ptr(&ctx.stream);
+            let (o_ptr, _go) = out_dev.device_ptr_mut(&ctx.stream);
+            // SAFETY: logits holds chain.len()*vocab bf16; p/q scratches hold
+            // (block+1)/block vocab-rows and depth <= block (ensured above);
+            // draft/u prefixes uploaded just above.
+            unsafe {
+                ffi::dspark_filter_probs_cuda(
+                    l_ptr as *const ffi::Half,
+                    p_ptr as *mut f32,
+                    chain.len() as i32,
+                    vocab as i32,
+                    1.0 / params.temperature,
+                    params.top_k,
+                    params.top_p,
+                    params.min_p,
+                    ctx.stream.cu_stream(),
+                )
+                .result()?;
+                ffi::dspark_chain_accept_cuda(
+                    q_ptr as *const f32,
+                    p_ptr as *const f32,
+                    d_ptr as *const i32,
+                    ua_ptr as *const f32,
+                    ur_ptr as *const f32,
+                    o_ptr as *mut i32,
+                    depth as i32,
+                    vocab as i32,
+                    ctx.stream.cu_stream(),
+                )
+                .result()?;
             }
-            let tok = chain[k + 1];
-            let accept = (dist_prob(&p, tok) / dist_prob(&q[k], tok).max(1e-8)).min(1.0);
-            if unit_uniform(params.seed, SALT_ACCEPT, pos) < accept {
-                k += 1;
-                continue;
-            }
-            // Residual support ⊆ supp(p): max(0, p−q) is positive only where p is.
-            let q_prob: HashMap<u32, f32> = q[k].iter().copied().collect();
-            let mut residual: Vec<(u32, f32)> = p
-                .iter()
-                .map(|&(t, tp)| (t, (tp - q_prob.get(&t).copied().unwrap_or(0.0)).max(0.0)))
-                .collect();
-            let mass: f32 = residual.iter().map(|(_, r)| *r).sum();
-            let u = unit_uniform(params.seed, SALT_RESIDUAL, pos);
-            if mass <= 1e-8 {
-                break draw(&p, u);
-            }
-            for r in &mut residual {
-                r.1 /= mass;
-            }
-            break draw(&residual, u);
-        };
+        }
+        ctx.sync()?;
+        let out = ctx
+            .stream
+            .clone_dtoh(out_dev)
+            .map_err(|e| anyhow!("D2H dspark chain verdict failed: {e}"))?;
+        let (k, bonus) = (out[0] as usize, out[1] as u32);
+        ensure!(
+            k <= depth,
+            "dspark chain kernel returned k {k} > depth {depth}"
+        );
         let mut emitted: Vec<u32> = chain[1..=k].to_vec();
         emitted.push(bonus);
         if k < depth {
-            spec.restore_trunk(&self.ctx, slot)?;
+            spec.restore_trunk(ctx, slot)?;
             self.replay_linear_only(slot, ws, &spec.capture, k)?;
             slot.set_seq_len(start_pos + k + 1);
         }
