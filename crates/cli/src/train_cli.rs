@@ -77,13 +77,27 @@ struct OpdSummary {
 }
 
 pub(crate) fn run_train(train: TrainArgs) -> ExitCode {
+    // OPD runtime toggles land in the train/autograd statics once, before any
+    // model load or step (runtime config = CLI flags, not env).
     match train.command {
         TrainCommand::Env(args) => exit_from_result(run_train_env(args)),
         TrainCommand::EstimateMemory(args) => exit_from_result(run_train_estimate_memory(args)),
-        TrainCommand::Opd(args) => run_opd(args),
-        TrainCommand::SelfOpd(args) => run_self_opd(args),
-        TrainCommand::RubricOpd(args) => exit_from_result(run_rubric_opd_impl(args)),
-        TrainCommand::AgentOpd(args) => exit_from_result(run_agent_opd_impl(*args)),
+        TrainCommand::Opd(args) => {
+            train::apply_runtime_flags(&args.runtime.to_flags());
+            run_opd(args)
+        }
+        TrainCommand::SelfOpd(args) => {
+            train::apply_runtime_flags(&args.runtime.to_flags());
+            run_self_opd(args)
+        }
+        TrainCommand::RubricOpd(args) => {
+            train::apply_runtime_flags(&args.runtime.to_flags());
+            exit_from_result(run_rubric_opd_impl(args))
+        }
+        TrainCommand::AgentOpd(args) => {
+            train::apply_runtime_flags(&args.runtime.to_flags());
+            exit_from_result(run_agent_opd_impl(*args))
+        }
         TrainCommand::CcConvert(args) => exit_from_result(run_cc_convert_impl(args)),
     }
 }
