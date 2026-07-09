@@ -31,7 +31,11 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from collections import Counter
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from opd_security_filter import is_security_flagged  # noqa: E402
 
 PYTEST_TIMEOUT = 300
 SETUP_TIMEOUT = 600
@@ -97,6 +101,26 @@ def cmd_select(args):
     kept = [r for r in python_rows if INCLUDE_REPO_RE.search(r["repo"])]
     print(f"[select] dataset rows={len(rows)} python={len(python_rows)} "
           f"ansible-kept={len(kept)}", flush=True)
+
+    # Security gate: drop any candidate whose id/repo/statement/patches carry
+    # security offense/defense wording (opd_security_filter blocklist).
+    tally = Counter()
+    clean = []
+    for r in kept:
+        text = "\n".join(
+            str(r.get(k) or "")
+            for k in ("instance_id", "repo", "problem_statement",
+                      "test_patch", "patch")
+        )
+        rule = is_security_flagged(text)
+        if rule is None:
+            clean.append(r)
+        else:
+            tally[rule] += 1
+    per_rule = ", ".join(f"{k}={v}" for k, v in sorted(tally.items())) or "-"
+    print(f"[select] security-filter dropped {len(kept) - len(clean)}/"
+          f"{len(kept)} candidates ({per_rule})", flush=True)
+    kept = clean
 
     # Round-robin across repos so the candidate list is repo-diverse; the pod
     # gate over-rejects, so over-select (default 60 for a 12+12 target).
