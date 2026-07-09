@@ -212,11 +212,12 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         // backends demote the complete slot restore image and resume decode
         // with `generated_tokens` intact. Without a tier store the behavior is
         // the plain recompute path.
-        let mut published = Vec::new();
         let mut slot_swap_key = None;
         let demoted_seq_len = self.kv.seq_len(slot);
         if self.kv_tier_capacity() > 0 {
-            published = self.publish_prefix_blocks(slot, &request.prompt_tokens);
+            // Publish ensures radix + sidecar are captured (idempotent for
+            // already-cached prompts — returns empty in that case).
+            let _ = self.publish_prefix_blocks(slot, &request.prompt_tokens);
         } else if self.executor.kv_slot_tier_enabled()
             && matches!(request.phase, RequestPhase::Decoding)
             && demoted_seq_len > 0
@@ -238,8 +239,13 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         // free_slot before release_reused_prefix — same ordering fix as finish_slot.
         self.kv.free_slot(slot);
         self.release_reused_prefix(&request.reused_prefix_pages);
-        if !published.is_empty() {
-            self.demote_published_pages(&published);
+        // Demote cached prompt pages to tier (includes already-cached ones from
+        // the normal step() publish, not just newly-published above).
+        if self.kv_tier_capacity() > 0 {
+            let matched = self.radix.peek_longest_prefix_match(&request.prompt_tokens);
+            if !matched.block_ids.is_empty() {
+                self.demote_published_pages(&matched.block_ids);
+            }
         }
         let request = if let Some(key) = slot_swap_key {
             // Keep the generation: decode resumes at the demoted position

@@ -1,0 +1,189 @@
+{
+  "label": "tiered-kv-m2b-remote",
+  "server": "http://localhost:8000",
+  "trace": "/content/workspace/agent-infer/scripts/data/agent_trace_default.jsonl",
+  "num_concurrent": 4,
+  "timestamp": "2026-04-15T08:05:48.242237+00:00",
+  "turns": [
+    {
+      "session_id": "agent-001",
+      "turn_idx": 0,
+      "prompt_messages": 2,
+      "wall_ms": 5151.42,
+      "ttft_ms": 47.25,
+      "itl_ms": 34.58,
+      "tokens_out": 144,
+      "finish_reason": "stop",
+      "error": null
+    },
+    {
+      "session_id": "agent-001",
+      "turn_idx": 2,
+      "prompt_messages": 4,
+      "wall_ms": 9137.58,
+      "ttft_ms": 152.71,
+      "itl_ms": 34.82,
+      "tokens_out": 256,
+      "finish_reason": "length",
+      "error": null
+    },
+    {
+      "session_id": "agent-001",
+      "turn_idx": 4,
+      "prompt_messages": 6,
+      "wall_ms": 9153.65,
+      "ttft_ms": 215.23,
+      "itl_ms": 34.84,
+      "tokens_out": 256,
+      "finish_reason": "length",
+      "error": null
+    },
+    {
+      "session_id": "agent-002",
+      "turn_idx": 0,
+      "prompt_messages": 2,
+      "wall_ms": 9092.01,
+      "ttft_ms": 124.24,
+      "itl_ms": 34.69,
+      "tokens_out": 256,
+      "finish_reason": "length",
+      "error": null
+    },
+    {
+      "session_id": "agent-002",
+      "turn_idx": 2,
+      "prompt_messages": 4,
+      "wall_ms": 9154.74,
+      "ttft_ms": 113.12,
+      "itl_ms": 34.84,
+      "tokens_out": 256,
+      "finish_reason": "length",
+      "error": null
+    },
+    {
+      "session_id": "agent-002",
+      "turn_idx": 4,
+      "prompt_messages": 6,
+      "wall_ms": 8893.87,
+      "ttft_ms": 157.49,
+      "itl_ms": 34.33,
+      "tokens_out": 256,
+      "finish_reason": "length",
+      "error": null
+    },
+    {
+      "session_id": "agent-003",
+      "turn_idx": 0,
+      "prompt_messages": 2,
+      "wall_ms": 9091.06,
+      "ttft_ms": 165.65,
+      "itl_ms": 34.67,
+      "tokens_out": 256,
+      "finish_reason": "length",
+      "error": null
+    },
+    {
+      "session_id": "agent-003",
+      "turn_idx": 2,
+      "prompt_messages": 4,
+      "wall_ms": 9137.82,
+      "ttft_ms": 208.62,
+      "itl_ms": 34.82,
+      "tokens_out": 256,
+      "finish_reason": "length",
+      "error": null
+    },
+    {
+      "session_id": "agent-004",
+      "turn_idx": 0,
+      "prompt_messages": 2,
+      "wall_ms": 9091.48,
+      "ttft_ms": 207.1,
+      "itl_ms": 34.68,
+      "tokens_out": 256,
+      "finish_reason": "length",
+      "error": null
+    },
+    {
+      "session_id": "agent-004",
+      "turn_idx": 2,
+      "prompt_messages": 4,
+      "wall_ms": 9150.31,
+      "ttft_ms": 114.99,
+      "itl_ms": 34.83,
+      "tokens_out": 256,
+      "finish_reason": "length",
+      "error": null
+    },
+    {
+      "session_id": "agent-005",
+      "turn_idx": 0,
+      "prompt_messages": 2,
+      "wall_ms": 9122.3,
+      "ttft_ms": 112.58,
+      "itl_ms": 34.77,
+      "tokens_out": 256,
+      "finish_reason": "length",
+      "error": null
+    },
+    {
+      "session_id": "agent-005",
+      "turn_idx": 2,
+      "prompt_messages": 4,
+      "wall_ms": 9153.67,
+      "ttft_ms": 159.38,
+      "itl_ms": 34.85,
+      "tokens_out": 256,
+      "finish_reason": "length",
+      "error": null
+    },
+    {
+      "session_id": "agent-006",
+      "turn_idx": 0,
+      "prompt_messages": 2,
+      "wall_ms": 9139.0,
+      "ttft_ms": 107.48,
+      "itl_ms": 34.82,
+      "tokens_out": 256,
+      "finish_reason": "length",
+      "error": null
+    },
+    {
+      "session_id": "agent-006",
+      "turn_idx": 2,
+      "prompt_messages": 4,
+      "wall_ms": 9050.75,
+      "ttft_ms": 114.16,
+      "itl_ms": 34.61,
+      "tokens_out": 256,
+      "finish_reason": "length",
+      "error": null
+    }
+  ],
+  "stats_before": {
+    "raw": "requests=0 active=0 waiting=0 tokens_out=0 kv_util=0.0% ttft_p50=\u2014 ttft_p99=\u2014 tpot_p50=\u2014",
+    "fields": {
+      "requests": "0",
+      "active": "0",
+      "waiting": "0",
+      "tokens_out": "0",
+      "kv_util": "0.0%",
+      "ttft_p50": "\u2014",
+      "ttft_p99": "\u2014",
+      "tpot_p50": "\u2014"
+    }
+  },
+  "stats_after": {
+    "raw": "requests=0 active=0 waiting=0 tokens_out=0 kv_util=0.0% ttft_p50=\u2014 ttft_p99=\u2014 tpot_p50=\u2014",
+    "fields": {
+      "requests": "0",
+      "active": "0",
+      "waiting": "0",
+      "tokens_out": "0",
+      "kv_util": "0.0%",
+      "ttft_p50": "\u2014",
+      "ttft_p99": "\u2014",
+      "tpot_p50": "\u2014"
+    }
+  }
+}
