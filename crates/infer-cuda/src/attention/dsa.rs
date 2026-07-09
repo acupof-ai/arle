@@ -1416,12 +1416,11 @@ impl Dsv4LayerAttentionState {
     }
 
     /// Re-sync this layer's persistent FlashMLA device page table from the
-    /// host table. Call exactly once per slot lifetime, right after the
-    /// slot's first prefill row's `prepare_kv_batch` mirrors its (previously
-    /// empty) band — the fixed identity band never changes afterward, so
-    /// later prefill/decode rows don't need this (and calling it every decode
-    /// step would be a CUDA-graph capture hazard, #8). No-op when this layer
-    /// has no FlashMLA decode.
+    /// host table. Dirty-bit driven (#154 Phase 0): called via
+    /// `Dsv4SlotState::refresh_flashmla_device_page_tables` whenever
+    /// `Dsv4KvAdapter::take_device_table_dirty` reports the slot's host band
+    /// changed — never unconditionally per step (a CUDA-graph capture hazard,
+    /// #8). No-op when this layer has no FlashMLA decode.
     pub(crate) fn refresh_flashmla_device_page_table(
         &mut self,
         ctx: &DeviceContext,

@@ -741,14 +741,6 @@ impl Dsv4KvAdapter {
         ))
     }
 
-    /// `&mut` accessor for the model-wide shared FP8 prefill DeepGEMM linear
-    /// scratch alone (mirrors `dsa_shared`/`flashmla_batch` accessors). `None`
-    /// when native DeepGEMM is unavailable.
-    #[allow(dead_code)]
-    pub(crate) fn prefill_linear_mut(&mut self) -> Option<&mut Dsv4PrefillDeepGemmLinearScratch> {
-        self.prefill_linear.as_mut()
-    }
-
     /// Split-borrow accessor for the batched (`b = N`) FlashMLA decode lane
     /// (#60): one layer's KV layout, the model-wide shared DSA scratch, the
     /// model-wide batched-decode scratch, AND the model-wide shared FP8 prefill
@@ -867,6 +859,7 @@ impl Dsv4KvAdapter {
         );
         let pc = slot_pages.len();
         let mut changed = false;
+        let mut pages: Vec<u32> = Vec::new();
         for layer in &mut self.layers {
             let lsp = layer.flashmla_slot_pages();
             if lsp == 0 {
@@ -878,7 +871,8 @@ impl Dsv4KvAdapter {
             // Identity band, real pages only (#154): host page i of this slot is
             // band page slot*lsp + i; padding to the fixed device-table size
             // lives at the device-format boundary (flashmla refresh).
-            let pages: Vec<u32> = (0..pc.min(lsp)).map(|i| (slot * lsp + i) as u32).collect();
+            pages.clear();
+            pages.extend((0..pc.min(lsp)).map(|i| (slot * lsp + i) as u32));
             changed |= pool.mirror_band(slot, &pages, seq_len)?;
         }
         self.device_table_dirty[slot] |= changed;
@@ -918,6 +912,9 @@ impl ModelKvAdapter for Dsv4KvAdapter {
 
     fn prepare_kv_batch(&mut self, desc: &KvBatchDescriptor) -> Result<Self::BatchView> {
         let mut rows = Vec::with_capacity(desc.rows.len());
+        // Reused per (row, layer) — the identity band is rebuilt in place so a
+        // decode tick doesn't heap-alloc per layer.
+        let mut layer_pages: Vec<u32> = Vec::new();
         for (idx, row) in desc.rows.iter().enumerate() {
             ensure!(
                 row.slot < self.num_slots,
@@ -947,12 +944,15 @@ impl ModelKvAdapter for Dsv4KvAdapter {
                 row.slot_page_range,
                 desc.flat_slot_page_ids.len()
             );
-            let slot_pages: Vec<u32> =
-                desc.flat_slot_page_ids[row.slot_page_range.clone()].to_vec();
+            let slot_pages = &desc.flat_slot_page_ids[row.slot_page_range.clone()];
             ensure!(
                 !slot_pages.is_empty(),
                 "DSv4 KV batch row {idx} has empty slot page table"
             );
+            let kind = match row.kind {
+                KvBatchRowKind::Prefill => "prefill",
+                KvBatchRowKind::Decode => "decode",
+            };
             let layer_count = self.layers.len();
             let mut band_changed = false;
             for layer_idx in 0..layer_count {
@@ -964,43 +964,22 @@ impl ModelKvAdapter for Dsv4KvAdapter {
                 // Identity band, real pages only (#154): host page i of this
                 // slot is band page slot*lsp + i; the fixed-size device table
                 // is padded at the device-format boundary (flashmla refresh).
-                let layer_pages: Vec<u32> = (0..slot_pages.len().min(lsp))
-                    .map(|i| (row.slot * lsp + i) as u32)
-                    .collect();
-                match row.kind {
-                    KvBatchRowKind::Prefill => {
-                        if let Some(pool) = layer.flashmla_kv_pool.as_mut() {
-                            band_changed |=
-                                pool.mirror_band(row.slot, &layer_pages, row.append_pos)?;
-                        }
-                        ensure!(
-                            layer
-                                .flashmla_pool()
-                                .map_or(true, |p| p.seq_len(row.slot) == row.append_pos),
-                            "DSv4 prefill slot {} layer {layer_idx} pool seq_len {} != append_pos {}",
-                            row.slot,
-                            layer.flashmla_pool().map_or(0, |p| p.seq_len(row.slot)),
-                            row.append_pos
-                        );
-                        layer.flashmla_alloc_append(row.slot, row.append_len)?;
-                    }
-                    KvBatchRowKind::Decode => {
-                        if let Some(pool) = layer.flashmla_kv_pool.as_mut() {
-                            band_changed |=
-                                pool.mirror_band(row.slot, &layer_pages, row.append_pos)?;
-                        }
-                        ensure!(
-                            layer
-                                .flashmla_pool()
-                                .map_or(true, |p| p.seq_len(row.slot) == row.append_pos),
-                            "DSv4 decode slot {} layer {layer_idx} pool seq_len {} != append_pos {}",
-                            row.slot,
-                            layer.flashmla_pool().map_or(0, |p| p.seq_len(row.slot)),
-                            row.append_pos
-                        );
-                        layer.flashmla_alloc_append(row.slot, row.append_len)?;
-                    }
+                layer_pages.clear();
+                layer_pages
+                    .extend((0..slot_pages.len().min(lsp)).map(|i| (row.slot * lsp + i) as u32));
+                if let Some(pool) = layer.flashmla_kv_pool.as_mut() {
+                    band_changed |= pool.mirror_band(row.slot, &layer_pages, row.append_pos)?;
                 }
+                ensure!(
+                    layer
+                        .flashmla_pool()
+                        .map_or(true, |p| p.seq_len(row.slot) == row.append_pos),
+                    "DSv4 {kind} slot {} layer {layer_idx} pool seq_len {} != append_pos {}",
+                    row.slot,
+                    layer.flashmla_pool().map_or(0, |p| p.seq_len(row.slot)),
+                    row.append_pos
+                );
+                layer.flashmla_alloc_append(row.slot, row.append_len)?;
             }
             self.device_table_dirty[row.slot] |= band_changed;
             self.slot_epochs[row.slot] = Some(row.slot_epoch);
@@ -1281,5 +1260,3 @@ impl Dsv4LayerKvLayout {
         Ok(())
     }
 }
-use crate::attention::DeviceContext;
-use anyhow::Result;
