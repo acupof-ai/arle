@@ -1927,11 +1927,14 @@ impl Dsv4Model {
         // the post-reservation remainder): the joint (num_slots, pool_tokens)
         // solve below needs the budget at ARBITRARY slot counts, and the
         // actual reservation (`per_slot × planned`) is rank-identical once
-        // `planned` derives from reduced scalars.
-        let budget_bytes = self.tp.all_reduce_min_scalar_i32(
+        // `planned` derives from reduced scalars. Reduced in MiB — a byte
+        // count saturates the i32 collective at 2047MB (the old
+        // pool_budget_total reduce silently did exactly that).
+        let budget_bytes = (self.tp.all_reduce_min_scalar_i32(
             &self.ctx,
-            i32::try_from(budget_bytes_local.min(i32::MAX as usize)).unwrap_or(i32::MAX),
-        )? as usize;
+            i32::try_from((budget_bytes_local >> 20).min(i32::MAX as usize)).unwrap_or(i32::MAX),
+        )? as usize)
+            << 20;
         // Reject-below-fixed guard (parity with Metal's fits_fixed): a
         // cross-rank-min affordable of 0 means post-weights free VRAM cannot
         // hold even one slot's KV arena + selector/compressor state at this

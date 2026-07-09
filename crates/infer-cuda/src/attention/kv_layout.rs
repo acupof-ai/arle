@@ -1224,10 +1224,13 @@ impl Dsv4LayerKvLayout {
             // regression here instead of a mid-serve exhaustion bail
             // (pod-verified 2026-07-06: the two gates disagreeing crashed
             // every worker rank).
+            // Demand floor: every slot's ring + ONE full-length comp region
+            // (`lsp − sw` — zero for ring-only SW layers, whose pool is
+            // exactly `num_slots × sw_blocks`).
             let min_pages = if flashmla_demand_paged {
                 num_slots
                     .saturating_mul(flashmla_sw_blocks)
-                    .saturating_add(flashmla_slot_pages)
+                    .saturating_add(flashmla_slot_pages - flashmla_sw_blocks)
             } else {
                 num_slots.saturating_mul(flashmla_slot_pages)
             };
