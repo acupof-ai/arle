@@ -1086,7 +1086,7 @@ impl Dsv4LayerAttentionState {
         &mut self.sw_window_cache
     }
 
-    /// Route A prefix restore: reset the row counters `compressor_forward`/
+    /// Prefix-reuse restore: reset the row counters `compressor_forward`/
     /// `csa_select_official` otherwise only ever advance, which else carry a
     /// stale value from the slot's prior occupant. No-op if the layer has no
     /// such state.

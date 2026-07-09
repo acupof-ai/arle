@@ -1127,8 +1127,8 @@ impl Dsv4SlotState {
         self.seq_len = seq_len;
     }
 
-    /// One layer's attention state (Route-A restore needs `&mut` access to
-    /// `sw_window_cache` from outside this module — `executor.rs`).
+    /// One layer's attention state (the prefix-reuse restore in `executor.rs`
+    /// needs `&mut` access to `sw_window_cache` from outside this module).
     pub(crate) fn attention_layer_mut(
         &mut self,
         layer_idx: usize,

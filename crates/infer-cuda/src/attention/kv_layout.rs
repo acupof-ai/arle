@@ -1603,7 +1603,7 @@ impl Dsv4KvAdapter {
                 continue;
             }
             if let Some(pool) = self.layers[layer_idx].flashmla_kv_pool.as_mut() {
-                pool.retain_pages(&pages)?;
+                pool.retain_pages(&pages);
             }
         }
         Ok(())
@@ -1618,7 +1618,7 @@ impl Dsv4KvAdapter {
                 continue;
             }
             if let Some(pool) = self.layers[layer_idx].flashmla_kv_pool.as_mut() {
-                pool.release_pages(&pages)?;
+                pool.release_pages(&pages);
             }
         }
         for hp in host_pages {
