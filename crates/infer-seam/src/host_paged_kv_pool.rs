@@ -152,6 +152,10 @@ impl KvQuery for HostPagedKvPool {
         after.saturating_sub(have)
     }
 
+    fn fixed_pages_per_slot(&self) -> Option<usize> {
+        self.fixed_pages_per_slot
+    }
+
     fn page_indices(&self, slot: usize) -> &[u32] {
         self.slot_pages.get(slot).map_or(&[], Vec::as_slice)
     }

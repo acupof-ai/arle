@@ -43,6 +43,12 @@ pub trait KvQuery {
     /// Return the number of extra pages needed to append `tokens` to `slot`.
     fn append_pages_needed(&self, slot: usize, tokens: usize) -> usize;
 
+    /// For fixed-band pools (DSv4), return the number of physical pages each
+    /// slot is pre-allocated. `None` for token-grown pools (Qwen dense/Metal).
+    fn fixed_pages_per_slot(&self) -> Option<usize> {
+        None
+    }
+
     /// Return physical page ids for `slot` in logical-page order.
     fn page_indices(&self, slot: usize) -> &[u32];
 

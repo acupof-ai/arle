@@ -24,7 +24,19 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             .len()
             .saturating_sub(matched_tokens)
             .saturating_add(request.max_tokens);
-        tokens.div_ceil(page_size)
+        let token_pages = tokens.div_ceil(page_size);
+
+        // Fixed-band pools (DSv4): each slot consumes exactly
+        // `fixed_pages_per_slot` physical pages regardless of token count.
+        // A prefix-matched slot still needs the full band (top-up from free).
+        if let Some(fixed) = self.kv.fixed_pages_per_slot() {
+            let matched_pages = matched_tokens / page_size;
+            return fixed
+                .saturating_sub(matched_pages)
+                .max(token_pages.min(fixed));
+        }
+
+        token_pages
     }
 
     /// Clamp a radix prefix match to leading pages that are complete backend
@@ -79,6 +91,18 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             request.waiting_hint.immediate_reuse_tokens = 0;
             request.waiting_hint.total_reuse_tokens = 0;
             return Ok(());
+        }
+
+        // Fixed-band pools (DSv4): attach_pages tops up to `fixed_pages_per_slot`
+        // from the free pool. Pre-evict prefix cache if free is short, so the
+        // attach doesn't bail mid-flight (the admission guard's token-based
+        // estimate undercounts band consumption — see request_pages_needed_after_prefix).
+        if let Some(fixed) = self.kv.fixed_pages_per_slot() {
+            let top_up = fixed.saturating_sub(prefix_match.block_ids.len());
+            let free = self.kv.free_pages();
+            if top_up > free {
+                self.evict_prefix_cache_for_pages(top_up.saturating_sub(free));
+            }
         }
 
         self.kv.retain_pages(&prefix_match.block_ids);
