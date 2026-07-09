@@ -59,6 +59,8 @@ impl SafetensorsRegistry {
                 path.display()
             ))
         })?;
+        // SAFETY: Mmap::map reads the file contents; the file is kept open by `file`
+        // for the lifetime of the mmap, so no use-after-close.
         let mmap = unsafe { Mmap::map(&file) }.map_err(|err| {
             tape_invariant(format!(
                 "failed to memory-map safetensors file {}: {err}",

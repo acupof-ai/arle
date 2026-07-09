@@ -50,8 +50,6 @@ publish = false
 # Default-level lints that this codebase disables because they fire on
 # legitimate patterns.
 too_many_arguments = "allow"
-collapsible_if = "allow"
-collapsible_else_if = "allow"
 # Restriction lints worth enforcing workspace-wide.
 dbg_macro = "warn"
 exit = "warn"
@@ -59,9 +57,12 @@ get_unwrap = "warn"
 rc_buffer = "warn"
 rc_mutex = "warn"
 rest_pat_in_fully_bound_structs = "warn"
+# Safety: every unsafe block must have a SAFETY comment.
+undocumented_unsafe_blocks = "deny"
+missing_safety_doc = "deny"
 
 [workspace.lints.rust]
-unsafe_op_in_unsafe_fn = "warn"
+unsafe_op_in_unsafe_fn = "deny"
 
 [workspace.dependencies]
 blake3 = { version = "1", default-features = false, features = ["std"] }

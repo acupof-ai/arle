@@ -209,10 +209,10 @@ fn fetch_with_bar(
             .collect::<String>();
         bail!("ModelScope returned {status} for {url}: {snippet}");
     }
-    if let Some(len) = response.content_length() {
-        if len > 0 {
-            pb.set_length(len);
-        }
+    if let Some(len) = response.content_length()
+        && len > 0
+    {
+        pb.set_length(len);
     }
 
     let tmp = dest.with_extension(format!(

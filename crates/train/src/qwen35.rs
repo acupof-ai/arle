@@ -2973,12 +2973,12 @@ impl Qwen35Model {
             Qwen35InitMode::LoraOrFrozen { .. } => cfg.validate_train_lora_or_frozen_contract()?,
         }
         tp.validate(cfg)?;
-        if let Some(start) = lora_layer_start {
-            if start >= cfg.num_hidden_layers {
-                return Err(Qwen35Error::InvalidConfig(
-                    "lora_layer_start must be less than num_hidden_layers",
-                ));
-            }
+        if let Some(start) = lora_layer_start
+            && start >= cfg.num_hidden_layers
+        {
+            return Err(Qwen35Error::InvalidConfig(
+                "lora_layer_start must be less than num_hidden_layers",
+            ));
         }
         let mut param_names = HashMap::new();
         let mut adapter_names = HashMap::new();
@@ -3988,25 +3988,25 @@ impl Qwen35Model {
                 layer_fn,
             )?;
 
-            if profile_enabled {
-                if let (Ok(times), Ok(counts)) = (layer_times.lock(), layer_counts.lock()) {
-                    let total: Duration = times.iter().sum();
-                    eprintln!(
-                        "[opd-profile] masked-writeback forward layer wall \
+            if profile_enabled
+                && let (Ok(times), Ok(counts)) = (layer_times.lock(), layer_counts.lock())
+            {
+                let total: Duration = times.iter().sum();
+                eprintln!(
+                    "[opd-profile] masked-writeback forward layer wall \
                          (checkpointed, sync={profile_sync}); counts include backward recompute:"
-                    );
-                    for (idx, (t, c)) in times.iter().zip(counts.iter()).enumerate() {
-                        eprintln!(
-                            "[opd-profile]   layer[{idx:>2}] wall={:>10.3}ms calls={}",
-                            t.as_secs_f64() * 1000.0,
-                            c
-                        );
-                    }
+                );
+                for (idx, (t, c)) in times.iter().zip(counts.iter()).enumerate() {
                     eprintln!(
-                        "[opd-profile] forward layers sum: {:.3}s across {num_layers} layers",
-                        total.as_secs_f64()
+                        "[opd-profile]   layer[{idx:>2}] wall={:>10.3}ms calls={}",
+                        t.as_secs_f64() * 1000.0,
+                        c
                     );
                 }
+                eprintln!(
+                    "[opd-profile] forward layers sum: {:.3}s across {num_layers} layers",
+                    total.as_secs_f64()
+                );
             }
         } else {
             for (layer_index, layer) in self.layers.iter().enumerate() {

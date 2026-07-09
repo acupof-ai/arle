@@ -26,10 +26,10 @@ use crate::model_picker::{self, PickerResult};
 /// - stdin/stdout is not a TTY (piped)
 pub(crate) fn resolve_model_interactive(args: &Args) -> Result<String> {
     // Fast path: explicit model path bypasses everything.
-    if let Some(ref model_path) = args.model_path {
-        if !model_path.trim().is_empty() {
-            return Ok(model_path.clone());
-        }
+    if let Some(ref model_path) = args.model_path
+        && !model_path.trim().is_empty()
+    {
+        return Ok(model_path.clone());
     }
 
     // Non-interactive: fall back to existing auto-discovery.

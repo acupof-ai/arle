@@ -77,10 +77,10 @@ where
         // `input_ids[0]` (the hidden); `input_ids[1..]` are shared frozen weights.
         // Gated to the OPD offload path; the default forward never sets
         // `offload_checkpoints`, so it stays byte-identical.
-        if let Some(&hidden_id) = input_ids.first() {
-            if hidden_id != output_id {
-                store.drop_device_residency(hidden_id)?;
-            }
+        if let Some(&hidden_id) = input_ids.first()
+            && hidden_id != output_id
+        {
+            store.drop_device_residency(hidden_id)?;
         }
     }
 
@@ -118,10 +118,11 @@ where
     while li < num_layers {
         let mut end = (li + group_size.max(1)).min(num_layers);
         // Don't let a group span the frozen/LoRA boundary.
-        if let Some(b) = detach_at {
-            if li < b && b < end {
-                end = b;
-            }
+        if let Some(b) = detach_at
+            && li < b
+            && b < end
+        {
+            end = b;
         }
         // Boundary detach, outside the recompute (matches per-layer detach).
         if detach_at == Some(li) {

@@ -547,11 +547,9 @@ impl<E: BackendExecutor, K: KvPool> Drop for ServeHandle<E, K> {
 
 // ServeHandle<E, K> is Send regardless of whether E or K are Send: every field
 // is independently Send (channels, Arc, AtomicUsize, PhantomData<fn()->(E,K)>).
-// The E/K values themselves live exclusively on the engine thread and are never
-// moved out through the public ServeHandle API. Rust's conservative auto-trait
-// inference denies Send because of the generic parameters, but the send-safety
-// proof is field-by-field: Sender<Submission>, Sender<ControlMessage<E,K>>
+// SAFETY: Field-by-field Send proof: Sender<Submission>, Sender<ControlMessage<E,K>>
 // (ControlMessage is Box<dyn FnOnce+Send>, always Send), Arc<Mutex<_>>, etc.
+// E/K values live exclusively on the engine thread, never moved through the public API.
 unsafe impl<E: BackendExecutor, K: KvPool> Send for ServeHandle<E, K> {}
 
 /// A tiny in-crate executor that echoes each row's input forward by `+1`.

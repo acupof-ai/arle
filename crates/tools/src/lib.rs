@@ -1177,10 +1177,10 @@ fn execute_read(path: &str, start: Option<i64>, end: Option<i64>) -> String {
 /// Create parent directories and (over)write `content` to `path`.
 fn execute_write(path: &str, content: &str) -> String {
     let resolved = resolve_sandbox_path(path);
-    if let Some(parent) = resolved.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            return format!("ERROR: failed to create parent dirs for {path}: {e}");
-        }
+    if let Some(parent) = resolved.parent()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        return format!("ERROR: failed to create parent dirs for {path}: {e}");
     }
     match std::fs::write(&resolved, content) {
         Ok(()) => format!("wrote {} bytes to {path}", content.len()),
