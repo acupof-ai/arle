@@ -93,6 +93,55 @@ the new list is a superset. Port it; full release/claim only on real band
 replacement (attach/free). Pure deletion of per-tick work; A/B-guard the
 baseline tok/s.
 
+## Phase 2 — implementation design (2026-07-10, supersedes the sketch below)
+
+**One pool, content-keyed, copy-based, HOST-resident.** Per layer, a
+`Dsv4PrefixStatePool` keyed by **host page id** (content identity: the
+radix dedupes prefix chains, so matching prefixes share host page ids;
+non-matching content never collides — the D1 flaw is unrepresentable).
+Entries are written ONCE (first producer wins; content-identical by keying)
+and live in host pinned DRAM — **the pool IS the L2 tier**; zero HBM
+footprint, zero slot-capacity cost (the V5 class of regression cannot
+recur). L3 = LRU spill of the same entries through `CudaKvTierStore`'s
+existing mmap substrate under the `--kv-dram` budget.
+
+Entry contents per (layer, host page k) — everything a restore at boundary
+64·(k+1) needs, D2H'd at page completion from the single executor
+choke point:
+- 16 compressed FP8 band rows (contiguous 16×584 B slice via
+  `Dsv4BlockMap::comp_row` — the ONE addressing source, B1-B3 lesson);
+- 16 bf16 staging rows (`compressed.data`, A2 consumers);
+- 16 dsa key-cache rows (paged data+scale copied via the same map);
+- overlap kv/score registers at page end (`ratio×head_dim×2` bf16);
+- at 128-aligned pages only: the full bf16 ring (ring restore source;
+  FP8 ring region is NOT stored — restore sets
+  `fp8_kv_sw_bootstrapped=false` and the existing bootstrap repacks from
+  the restored bf16 ring, so the bf16 ring stays the single source, A14
+  resolved by design).
+
+**Write hook**: one executor post-forward choke point — for each slot,
+for each host page completed this tick, D2H the entry (async, off the
+critical path). No attention.rs changes.
+
+**Restore** (`restore_prefix_sidecar` reinstated): for matched host pages
+(present in DRAM or promoted from L3; per-page presence = the min-rule),
+H2D pool→slot: band rows + staging + dsa rows + boundary overlap + ring;
+set `compressed.seq_len`/`packed_rows`/`fp8_kv_comp_packed_rows` =
+matched/4, `fp8_kv_sw_bootstrapped=false`, rearm the decode graph (A16),
+reset `spec_slots` (A17), `seq_len=matched`. Tail re-prefills. Every ③
+item in #154's table now has disposition ① or ② — the full-enumeration
+bar, met by construction.
+
+**Alignment (D4 fixed at the engine)**: `prefill_restore_boundary_alignment`
+reinstated = `sliding_window` (128); the full-match pop-trim in
+`infer-core/src/prefix.rs` must run BEFORE the backend clamp so the
+clamped length stays ring-aligned. `reusable_prefix_blocks` returns
+consecutive pool-present pages floored to the alignment.
+
+**Sequencing**: 2a pools + cross-request reuse + L2/L3 (this design) →
+pod evidence gate → 2b park replacement (delete `Dsv4LayerImage`/swap,
+promote = attach + tail re-prefill) only after 2a's gate is green.
+
 ## Phase 2 — direct reuse = cross-request reuse (delete Route B leftovers)
 
 The whole-slot tier (`demote_slot`/`promote_slot`, `executor.rs:2672/2706`)
