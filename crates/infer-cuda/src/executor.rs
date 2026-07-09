@@ -443,9 +443,11 @@ impl RealCudaExecutor {
         anyhow::bail!("backend has no position-0 prefix store")
     }
 
-    /// Restore the page-radix sidecar recurrent state for `slot` when reusing a
-    /// prefix of length `matched_len`. Qwen3.5/3.6 hybrid restores recurrent
-    /// state; no-op for DSv4 (reuse unlicensed, #154) and Qwen3.
+    /// Restore backend side state for `slot` when reusing a prefix of length
+    /// `matched_len`. Qwen3.5/3.6 hybrid restores the recurrent sidecar; DSv4
+    /// restores the content-keyed prefix-state pool entries (#154 Phase 2);
+    /// no-op for Qwen3 (pages-only). An `Err` makes the engine free the slot
+    /// and fall back to full recompute — never a partial restore.
     pub(crate) fn restore_prefix_sidecar(
         &mut self,
         slot: usize,
@@ -455,13 +457,25 @@ impl RealCudaExecutor {
     ) -> Result<()> {
         match self {
             Self::Qwen35(q) => q.restore_recurrent_sidecar(slot, tokens, matched_len, prefix_pages),
-            Self::Dsv4(_) | Self::Qwen(_) => Ok(()),
+            Self::Dsv4(d) => d.restore_prefix_state(slot, matched_len, prefix_pages),
+            Self::Qwen(_) => Ok(()),
+        }
+    }
+
+    /// Extra chunk-end alignment beyond KV pages (seam contract): DSv4's
+    /// boundary sections (overlap registers + ring) only materialize at a
+    /// forward's own end, so every intermediate boundary must be forced.
+    pub(crate) fn prefill_restore_boundary_alignment(&self) -> usize {
+        match self {
+            Self::Dsv4(d) => d.prefill_restore_boundary_alignment(),
+            Self::Qwen(_) | Self::Qwen35(_) => 1,
         }
     }
 
     /// Capture the page-radix sidecar for `slot` at the just-published prefix
     /// `tokens[..matched_len]`. Qwen3.5/3.6 hybrid stores recurrent + full-attn
-    /// KV atomically into the tier; no-op for DSv4/Qwen3.
+    /// KV atomically into the tier; DSv4 confirms the pages' pool entries
+    /// (radix retention makes their ids recycle-proof); no-op for Qwen3.
     pub(crate) fn save_prefix_sidecar(
         &mut self,
         slot: usize,
@@ -471,7 +485,11 @@ impl RealCudaExecutor {
     ) -> Result<()> {
         match self {
             Self::Qwen35(q) => q.save_recurrent_sidecar(slot, tokens, matched_len, prefix_pages),
-            Self::Dsv4(_) | Self::Qwen(_) => Ok(()),
+            Self::Dsv4(d) => {
+                d.confirm_prefix_pages(prefix_pages);
+                Ok(())
+            }
+            Self::Qwen(_) => Ok(()),
         }
     }
 
@@ -2387,6 +2405,12 @@ impl Dsv4CudaExecutor {
         self.prefix_state.remove_pages(pages);
     }
 
+    /// Radix publish confirmed these pages (engine `save_prefix_sidecar` arm):
+    /// flip their pool entries from provisional to readable.
+    pub(crate) fn confirm_prefix_pages(&mut self, pages: &[u32]) {
+        self.prefix_state.confirm_pages(pages);
+    }
+
     /// Attach the opt-in NVMe disk spill level (pre-serve only).
     pub(crate) fn set_kv_tier_disk(
         &mut self,
@@ -2411,14 +2435,94 @@ impl Dsv4CudaExecutor {
         self.slot_tier.disk_pages()
     }
 
-    /// #154: DSv4 prefix reuse is unlicensed — the deleted Route A restore
-    /// machinery had no content identity, so every restore-lane path could
-    /// silently corrupt a restored request; full re-prefill is always correct.
-    /// Relanding = the content-keyed rebuild,
-    /// docs/plans/2026-07-09-dsv4-kv-reuse-seam-refactor.md Phase 2 (the
-    /// deleted implementation lives in git history at this commit's parent).
-    pub(crate) fn reusable_prefix_blocks(&self, _blocks: &[PrefixBlock]) -> usize {
-        0
+    /// Content-keyed reuse license (#154 Phase 2): a leading page is
+    /// attachable only while every page before and including it has a pool
+    /// entry; the COMMIT point additionally requires the page to carry
+    /// boundary sections at a restore-alignment end. Pages between commit
+    /// points keep the scan alive without advancing it. Pool presence covers
+    /// host DRAM and disk alike — licensing never does capacity math.
+    pub(crate) fn reusable_prefix_blocks(&self, blocks: &[PrefixBlock]) -> usize {
+        let page_tokens = self.model.kv_arena.page_block_size;
+        if page_tokens == 0 {
+            return 0;
+        }
+        let align = self.model.config.sliding_window.max(1);
+        let mut committed = 0usize;
+        for (idx, block) in blocks.iter().enumerate() {
+            // Fail closed on demoted keys: DSv4 pages never demote through
+            // the radix tier (demote_prefix_pages returns 0).
+            let PrefixBlock::ResidentPage(page_id) = *block else {
+                break;
+            };
+            let Some(meta) = self.prefix_state.page_meta(page_id) else {
+                break;
+            };
+            let page_end = (idx + 1) * page_tokens;
+            if meta.boundary && page_end.is_multiple_of(align) {
+                committed = idx + 1;
+            }
+        }
+        committed
+    }
+
+    /// The boundary sections only exist at a forward's own end position —
+    /// without this, a single-call prefill never visits an earlier boundary.
+    pub(crate) fn prefill_restore_boundary_alignment(&self) -> usize {
+        self.model.config.sliding_window.max(1)
+    }
+
+    /// Restore a radix-matched prefix into `slot` from the content-keyed pool
+    /// (#154 Phase 2 read hook; engine calls via the restore_prefix_sidecar
+    /// seam AFTER attaching the host pages). Every entry decodes to owned
+    /// host state first, so a missing/undecodable page aborts before any
+    /// device byte moves; an `Err` propagates to the engine's fallback
+    /// (free slot, full recompute) — never a partial restore.
+    pub(crate) fn restore_prefix_state(
+        &mut self,
+        slot: usize,
+        matched_len: usize,
+        prefix_pages: &[u32],
+    ) -> Result<()> {
+        ensure!(
+            slot < self.num_slots,
+            "DSv4 prefix restore slot {slot} outside executor slots {}",
+            self.num_slots
+        );
+        let page_tokens = self.model.kv_arena.page_block_size;
+        let align = self.model.config.sliding_window.max(1);
+        ensure!(
+            page_tokens > 0 && matched_len > 0,
+            "DSv4 prefix restore needs a non-empty match (matched_len {matched_len})"
+        );
+        // D4 hard error: an unaligned match means the engine trim/clamp
+        // ordering regressed — fail loud, never silently skip the ring restore.
+        ensure!(
+            matched_len.is_multiple_of(align) && matched_len.is_multiple_of(page_tokens),
+            "DSv4 prefix restore matched_len {matched_len} not aligned to ring {align} / page {page_tokens}"
+        );
+        ensure!(
+            prefix_pages.len() == matched_len / page_tokens,
+            "DSv4 prefix restore {} pages != matched_len {matched_len} / page {page_tokens}",
+            prefix_pages.len()
+        );
+        let entries = prefix_pages
+            .iter()
+            .map(|&page_id| self.prefix_state.read_entry(page_id))
+            .collect::<Result<Vec<_>>>()?;
+        self.kv_adapter.mirror_full_band(slot, matched_len)?;
+        // A17: a restored occupant enters Decoding without a tail warm step
+        // for its MTP chain; stale spec state belongs to the prior occupant.
+        self.spec_slots[slot] = Dsv4SpecSlotState::default();
+        self.slots[slot].restore_prefix_state(
+            &self.model.ctx,
+            &self.model.layers,
+            &mut self.kv_adapter,
+            &self.model.kv_arena,
+            self.model.config.index_head_dim,
+            &entries,
+            matched_len,
+            page_tokens,
+        )
     }
 
     /// Whole-slot swap is rank-local bytes plus TP-wide scalar consensus.
@@ -2679,8 +2783,10 @@ impl Dsv4CudaExecutor {
     }
 
     /// One decode sub-batch, then the prefix-state publish hook: any row that
-    /// crossed a host-page boundary this tick (MTP may commit several tokens)
-    /// publishes its completed pages from the post-forward device state.
+    /// crossed a host-page boundary this tick publishes its completed pages.
+    /// The hook runs AFTER the inner forward's MTP verify+commit+truncate, so
+    /// `seq_len` reflects only committed tokens — rejected drafts never enter
+    /// the pool.
     fn forward_decode_batch(
         &mut self,
         rows: &[DecodeRow],
