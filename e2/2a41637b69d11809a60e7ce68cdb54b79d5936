@@ -1,0 +1,31 @@
+crates/cuda-kernels/csrc/misc/sampling.cu
+  s_a706793fea2d2e::t_02470b0769632a 599-860,894-918
+crates/cuda-kernels/src/ffi/sampling.rs
+  s_8326f06e8d99a2::t_77905e3aeacf7a 43-86
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "e22a41637b69d11809a60e7ce68cdb54b79d5936",
+  "prompts": {},
+  "sessions": {
+    "s_8326f06e8d99a2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a81e2962d96fd6bb4",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_a706793fea2d2e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a443112a3cd498ba8",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
