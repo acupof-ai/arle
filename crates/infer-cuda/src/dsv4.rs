@@ -1242,14 +1242,15 @@ impl Dsv4SlotState {
     /// D2H one completed host page's state across every layer into a
     /// content-keyed pool entry (#154 Phase 2 publish hook). `boundary` = the
     /// forward ended exactly at this page's end (the only moment the page-end
-    /// overlap registers + ring are observable).
+    /// overlap registers + ring are observable). The D2H clones are
+    /// stream-ordered; the CALLER syncs once after all pages of the tick
+    /// before reading any entry (one sync per tick, not per page).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn capture_prefix_page(
         &self,
         ctx: &DeviceContext,
         layers: &[Dsv4Layer],
         kv_adapter: &crate::attention::Dsv4KvAdapter,
-        kv_arena: &Dsv4MlaKvArena,
         index_head_dim: usize,
         page_tokens: usize,
         page_index: usize,
@@ -1270,7 +1271,6 @@ impl Dsv4SlotState {
                 state.capture_prefix_page(
                     ctx,
                     pool,
-                    kv_arena,
                     layers[idx].mode,
                     layers[idx].compress_ratio,
                     index_head_dim,
@@ -1280,8 +1280,6 @@ impl Dsv4SlotState {
                 )
             })
             .collect::<Result<Vec<_>>>()?;
-        // clone_dtoh copies are stream-ordered; host vectors valid after drain.
-        ctx.sync()?;
         Ok(crate::attention::Dsv4PrefixPageEntry {
             page_index: u32::try_from(page_index)
                 .map_err(|_| anyhow!("DSv4 prefix page index {page_index} exceeds u32"))?,
@@ -1301,7 +1299,6 @@ impl Dsv4SlotState {
         ctx: &DeviceContext,
         layers: &[Dsv4Layer],
         kv_adapter: &mut crate::attention::Dsv4KvAdapter,
-        kv_arena: &Dsv4MlaKvArena,
         index_head_dim: usize,
         entries: &[crate::attention::Dsv4PrefixPageEntry],
         matched_len: usize,
@@ -1348,7 +1345,6 @@ impl Dsv4SlotState {
                 state.restore_prefix_page(
                     ctx,
                     pool,
-                    kv_arena,
                     layers[idx].mode,
                     layers[idx].compress_ratio,
                     index_head_dim,

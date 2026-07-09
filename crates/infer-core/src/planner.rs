@@ -179,7 +179,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         self.kv_tier_stats.demoted_slots = self.kv_tier_stats.demoted_slots.saturating_add(1);
         let mut request = self.active.remove(&slot).expect("checked above");
         // free_slot before release_reused_prefix — same ordering as finish_slot.
-        self.kv.free_slot(slot);
+        self.free_slot_pages(slot);
         self.release_reused_prefix(&request.reused_prefix_pages);
         // Keep the generation: decode resumes at the demoted position after
         // promote (see requeue_preempted_decode_with_bias for the length note).
@@ -237,7 +237,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             }
         }
         // free_slot before release_reused_prefix — same ordering fix as finish_slot.
-        self.kv.free_slot(slot);
+        self.free_slot_pages(slot);
         self.release_reused_prefix(&request.reused_prefix_pages);
         // Demote cached prompt pages to tier (includes already-cached ones from
         // the normal step() publish, not just newly-published above).
@@ -301,7 +301,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                     request.handle.id()
                 );
                 self.executor.drop_kv_slot_entries(&[key]);
-                self.kv.free_slot(slot);
+                self.free_slot_pages(slot);
                 self.kv_tier_stats.slot_promote_failures =
                     self.kv_tier_stats.slot_promote_failures.saturating_add(1);
                 self.kv_system_metrics.fallback_recompute =

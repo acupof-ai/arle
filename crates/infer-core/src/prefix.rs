@@ -137,7 +137,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                  full recompute fallback"
             );
             // Undo retain_pages + attach_pages; executor already reset full_attn_kv.
-            self.kv.free_slot(slot);
+            self.free_slot_pages(slot);
             self.radix.release_blocks(&prefix_match.block_ids);
             self.kv.release_pages(&prefix_match.block_ids);
             // request.prefill_start_pos stays at 0 (the pre-attach default).
@@ -259,6 +259,9 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                 .saturating_add(newly_cached.len() as u64);
             self.kv.retain_pages(&newly_cached);
         }
+        // Only `newly_cached` pages are radix-retained; a deduped page's id
+        // will be freed and recycled, so backends must not key durable state
+        // (e.g. DSv4's pool-entry confirm) to the full page list.
         // Capture the recurrent sidecar at the SAME boundary and pages just
         // sealed into the radix, so a hybrid backend (Qwen3.5/3.6) restores the
         // recurrent state on a future prefix hit instead of full-recomputing, and
@@ -267,10 +270,13 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         // backends. Runs on EVERY publish — including a restore-derived finish —
         // so a repeat turn's sidecar is always re-published. Best-effort: a save
         // failure only forfeits the next reuse, never blocks the publish.
-        if let Err(err) =
-            self.executor
-                .save_prefix_sidecar(slot, tokens, token_len, &pages[..publish_blocks])
-        {
+        if let Err(err) = self.executor.save_prefix_sidecar(
+            slot,
+            tokens,
+            token_len,
+            &pages[..publish_blocks],
+            &newly_cached,
+        ) {
             log::debug!("recurrent sidecar save failed for slot {slot}: {err:#}");
         }
         // Publishing over a demoted node revives it with the re-prefilled
