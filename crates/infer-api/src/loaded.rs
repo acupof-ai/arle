@@ -1924,7 +1924,8 @@ mod backend {
             anyhow::ensure!(
                 executor.kv_slot_tier_enabled(),
                 "--kv-oversubscription: {kind:?} has no whole-slot tier \
-                 (dense Qwen3 preempts via its page tier instead)"
+                 (dense Qwen3 preempts via its page tier; DSv4 preempts via \
+                 KV-overflow requeue + prefix-state pool restore, #154 Phase 2b)"
             );
         }
         // L2 budget: deployment-total → per-rank share, resolved at the ONE

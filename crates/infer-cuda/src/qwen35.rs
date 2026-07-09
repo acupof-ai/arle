@@ -890,8 +890,7 @@ impl Qwen35SlotState {
 
     /// Serialize this slot's COMPLETE device state into a host image for G3
     /// whole-slot spill, then FREE the device buffers (pages back to
-    /// `full_attn_kv`, recurrent block back to `pool`). Mirror of
-    /// [`crate::dsv4::Dsv4SlotState::swap_out_image`]. The engine frees the slot
+    /// `full_attn_kv`, recurrent block back to `pool`). The engine frees the slot
     /// right after `demote_slot`, so the trailing `ctx.sync()` (inside
     /// `copy_pages_to_host` for pages, explicit here for the recurrent D2H) makes
     /// the host image complete before any device buffer is reused.
@@ -947,7 +946,7 @@ impl Qwen35SlotState {
             })
             .collect::<Result<Vec<_>>>()?;
         // The clone_dtoh copies above are stream-ordered; drain before the host
-        // image is stored/read (matches DSv4 swap_out_image's trailing sync).
+        // image is stored/read.
         ctx.sync()?;
         let image = Qwen35SlotImage {
             full_attn_pages,

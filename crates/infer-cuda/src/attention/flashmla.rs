@@ -256,8 +256,7 @@ impl Dsv4FlashMlaDecodeState {
     /// Re-sync the persistent device page table from the host page table —
     /// the CUDA-graph-captured kernel arg points at this fixed buffer, so a
     /// stale copy reads garbage. Dirty-bit driven (#154 Phase 0:
-    /// `Dsv4KvAdapter::take_device_table_dirty`), plus the whole-slot promote
-    /// path after `mirror_restore_pages` rewrites the host table.
+    /// `Dsv4KvAdapter::take_device_table_dirty`).
     pub(super) fn refresh_device_page_table(
         &mut self,
         ctx: &DeviceContext,
@@ -335,7 +334,7 @@ impl Dsv4FlashMlaDecodeState {
 /// SINGLE-ROW (`s_q = 1`) FlashMLA sparse decode lane (#85 P3). These are the
 /// per-step accumulators / staging buffers that the single-row pack + decode +
 /// TP path overwrite-before-read every layer step; they carry NO cross-call or
-/// cross-slot state (the SCRATCH verdict in `Dsv4LayerAttentionState::swap_out_image`).
+/// cross-slot state (the 2026-06 whole-slot-swap SCRATCH verdict).
 /// They were wrongly allocated PER (slot, layer) inside `Dsv4FlashMlaDecodeState`
 /// — `o_accum` alone is `(num_sm_parts+1) × h_q × head_dim × f32 ≈ 33.7 MB/layer`,
 /// so 43 FlashMLA layers cost ~1392 MB PER SLOT. DSv4 runs its layers

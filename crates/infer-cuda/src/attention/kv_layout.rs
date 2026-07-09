@@ -185,8 +185,8 @@ pub(crate) struct Dsv4KvAdapter {
     /// ALL layers and slots. Hoisted out of the per-slot `Dsv4LayerAttentionState`
     /// (it was the biggest single per-(slot,layer) offender, ~30 MB/layer): the
     /// scratch is M-chunk-bounded and fully overwritten from each chunk's
-    /// activations before read, carrying NO cross-call/cross-slot state (see the
-    /// SCRATCH verdict in `Dsv4LayerAttentionState::swap_out_image`). Sized by
+    /// activations before read, carrying NO cross-call/cross-slot state (the
+    /// 2026-06 whole-slot-swap SCRATCH verdict). Sized by
     /// `config` + `max_seq_len` only (no layer-specific dimensions), so a single
     /// instance is valid for every layer and slot — DSv4 forward runs layers
     /// sequentially and the engine runs one forward at a time, so it is reused,
@@ -314,23 +314,6 @@ impl Dsv4LayerKvLayout {
         }
         self.flashmla_pool_mut()?.free_slot(slot_idx);
         Ok(())
-    }
-
-    /// Set the FlashMLA band's logical cursor to `seq_len` (band stays resident).
-    /// Used by the position-0 prefix-restore path: `restore_to` draws the band
-    /// with cursor 0, then the slot-level swap-in sets it to the restored length
-    /// so the tail prefill's `seq_len == append_pos` invariant holds.
-    pub(crate) fn flashmla_set_band_cursor(
-        &mut self,
-        slot_idx: usize,
-        seq_len: usize,
-    ) -> Result<()> {
-        if self.flashmla_slot_pages == 0 {
-            return Ok(());
-        }
-        self.flashmla_pool_mut()?
-            .set_band_cursor(slot_idx, seq_len)
-            .map_err(|e| anyhow!("DSv4 FlashMLA slot {slot_idx} band cursor set failed: {e}"))
     }
 
     /// H2: clamp the FlashMLA pool's per-slot append cursor back to `new_len`
@@ -842,49 +825,11 @@ impl Dsv4KvAdapter {
         (pages > 0).then_some(pages)
     }
 
-    pub(crate) fn mirror_slot_pages(
-        &mut self,
-        slot: usize,
-        slot_pages: &[u32],
-        seq_len: usize,
-    ) -> Result<()> {
-        ensure!(
-            slot < self.num_slots,
-            "DSv4 mirror slot {slot} outside adapter slots {}",
-            self.num_slots
-        );
-        ensure!(
-            !slot_pages.is_empty(),
-            "DSv4 mirror slot {slot} has no pages"
-        );
-        let pc = slot_pages.len();
-        let mut changed = false;
-        let mut pages: Vec<u32> = Vec::new();
-        for layer in &mut self.layers {
-            let lsp = layer.flashmla_slot_pages();
-            if lsp == 0 {
-                continue;
-            }
-            let Some(pool) = layer.flashmla_kv_pool.as_mut() else {
-                continue;
-            };
-            // Identity band, real pages only (#154): host page i of this slot is
-            // band page slot*lsp + i; padding to the fixed device-table size
-            // lives at the device-format boundary (flashmla refresh).
-            pages.clear();
-            pages.extend((0..pc.min(lsp)).map(|i| (slot * lsp + i) as u32));
-            changed |= pool.mirror_band(slot, &pages, seq_len)?;
-        }
-        self.device_table_dirty[slot] |= changed;
-        Ok(())
-    }
-
     /// Mirror the FULL identity band for `slot` (all `flashmla_slot_pages` of
     /// every layer) at logical cursor `seq_len`. The prefix restore path needs
     /// band pages beyond the matched host-page count (SW ring + comp region
-    /// are fixed slot-logical blocks), so it cannot ride `mirror_slot_pages`'
-    /// host page count; `prepare_kv_batch` later mirrors the same identity
-    /// list — a no-op under `mirror_band`'s equality fast path.
+    /// are fixed slot-logical blocks); `prepare_kv_batch` later mirrors the
+    /// same identity list — a no-op under `mirror_band`'s equality fast path.
     pub(crate) fn mirror_full_band(&mut self, slot: usize, seq_len: usize) -> Result<()> {
         ensure!(
             slot < self.num_slots,
