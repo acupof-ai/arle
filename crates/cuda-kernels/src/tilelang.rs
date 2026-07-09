@@ -89,11 +89,16 @@ pub struct TileLangWorkspace {
 
 unsafe impl Send for TileLangWorkspace {}
 
+/// `--decode-metadata-fast-page16` (default off), set once pre-load.
+static DECODE_METADATA_FAST_PAGE16: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_decode_metadata_fast_page16(enabled: bool) {
+    DECODE_METADATA_FAST_PAGE16.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
 fn decode_metadata_fast_page16_enabled() -> bool {
-    matches!(
-        std::env::var("INFER_DECODE_METADATA_FAST_PAGE16").as_deref(),
-        Ok("1" | "true" | "TRUE" | "yes" | "on")
-    )
+    DECODE_METADATA_FAST_PAGE16.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 impl TileLangWorkspace {

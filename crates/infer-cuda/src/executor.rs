@@ -48,33 +48,27 @@ pub(crate) fn tier_block_u64(session: u64, block: u64) -> u64 {
 /// pages beyond it fall back to eager rather than replay a stale graph.
 const DECODE_GRAPH_MAX_SEQ_LEN: usize = 32_768;
 
-/// Decode-graph default when `INFER_CUDA_DECODE_GRAPH` is unset. Set once at load
-/// from the `enable_cuda_graph` load flag (CLI `--cuda-graph`/`--no-cuda-graph`,
-/// default on) via [`set_decode_graph_default`]; the env var, when present, always
-/// overrides it. Single-GPU Qwen dense only — `warmup` still hard-disables the
-/// graph under TP (NCCL not graph-capturable) and MoE (host routing per step).
+/// Decode-graph gate. Set once at load from the `enable_cuda_graph` load flag
+/// (CLI `--cuda-graph`/`--no-cuda-graph`, default on) via
+/// [`set_decode_graph_default`]. Single-GPU Qwen dense only — `warmup` still
+/// hard-disables the graph under TP (NCCL not graph-capturable) and MoE (host
+/// routing per step).
 static DECODE_GRAPH_DEFAULT_ENABLED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(true);
 
-/// Set the load-time decode-graph default (honored only when the env override is
-/// unset). Wired from `LoadedInferenceEngine::load(.., enable_cuda_graph)` so the
-/// CLI `--cuda-graph`/`--no-cuda-graph` flag actually controls the graph instead
-/// of being discarded — single set at load, read once at `warmup`.
+/// Set the load-time decode-graph default. Wired from
+/// `LoadedInferenceEngine::load(.., enable_cuda_graph)` so the CLI
+/// `--cuda-graph`/`--no-cuda-graph` flag controls the graph — single set at
+/// load, read once at `warmup`.
 pub fn set_decode_graph_default(enabled: bool) {
     DECODE_GRAPH_DEFAULT_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Captured B=1 decode graph enabled? `INFER_CUDA_DECODE_GRAPH` is an explicit
-/// override (`1`/`true`/`on` → on, `0`/`false`/`off` → off); when unset, falls
-/// back to the load-time default ([`set_decode_graph_default`], CLI-driven,
-/// default on). The eager path stays the correctness floor; `warmup` still gates
-/// TP and MoE off regardless of this.
+/// Captured B=1 decode graph enabled? CLI-driven (`--cuda-graph`/
+/// `--no-cuda-graph`, default on). The eager path stays the correctness floor;
+/// `warmup` still gates TP and MoE off regardless of this.
 fn decode_graph_enabled() -> bool {
-    match std::env::var("INFER_CUDA_DECODE_GRAPH").as_deref() {
-        Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON") => true,
-        Ok("0" | "false" | "FALSE" | "no" | "off" | "OFF") => false,
-        _ => DECODE_GRAPH_DEFAULT_ENABLED.load(std::sync::atomic::Ordering::Relaxed),
-    }
+    DECODE_GRAPH_DEFAULT_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 fn cuda_startup_profile_enabled() -> bool {
@@ -267,7 +261,7 @@ impl RealCudaExecutor {
         match self {
             Self::Qwen(q) => q.warmup(),
             // Qwen3.5/3.6 hybrid: whole-step decode graph (opt-in,
-            // ARLE_QWEN35_DECODE_GRAPH=1) — warmup logs the gate verdict;
+            // --qwen35-decode-graph) — warmup logs the gate verdict;
             // capture itself is lazy per slot.
             Self::Qwen35(q) => q.warmup(),
             // DSv4 drives its own per-portion/whole-step graph gates inside
@@ -1448,7 +1442,7 @@ impl QwenCudaExecutor {
     /// Captures the smallest shape (`num_pages = 1`) so the machinery is proven
     /// before the first request; later page counts capture lazily on first decode
     /// (capture-once, replay-after, per key). Opt-in via
-    /// `INFER_CUDA_DECODE_GRAPH=1`; any capture failure downgrades to eager-only
+    /// `--cuda-graph`; any capture failure downgrades to eager-only
     /// (never fatal — eager is the correctness floor).
     pub(crate) fn warmup(&mut self) -> Result<()> {
         // NCCL all-reduce is not graph-capturable, so multi-rank TP stays eager
@@ -1471,7 +1465,7 @@ impl QwenCudaExecutor {
             return Ok(());
         }
         if !decode_graph_enabled() {
-            info!("CUDA decode graph disabled (set INFER_CUDA_DECODE_GRAPH=1 to enable)");
+            info!("CUDA decode graph disabled (set --cuda-graph to enable)");
             return Ok(());
         }
         if self.decode_ctx.is_some() {
@@ -1828,7 +1822,7 @@ pub(crate) struct Dsv4CudaExecutor {
     /// probe). MTP only beats no-spec when it emits > t_mtp/t_nospec tok/step, so
     /// below that acceptance the gate runs a warm no-spec step instead. Init
     /// optimistic (1.0) so MTP runs until the running acceptance proves it loses.
-    /// See `mtp_should_speculate`. Opt-in via `ARLE_DSV4_MTP_ADAPTIVE` (bring-up;
+    /// See `mtp_should_speculate`. Opt-in via `--mtp-adaptive` (bring-up;
     /// promote to a `--mtp-adaptive` CLI flag once pod-calibrated).
     mtp_accept_ema: f32,
     mtp_skip_streak: usize,
@@ -3234,16 +3228,13 @@ impl Dsv4CudaExecutor {
     }
 }
 
-/// Whole-step Qwen3.5/3.6 decode graph enabled? `ARLE_QWEN35_DECODE_GRAPH=1`
+/// Whole-step Qwen3.5/3.6 decode graph enabled? `--qwen35-decode-graph true`
 /// opt-in, default OFF until the pod license (≥ +10% tok/s + needle gate +
 /// replay-reuse evidence per the bench spec). The eager path stays the
 /// correctness floor; `Qwen35CudaExecutor::warmup` additionally gates TP and
 /// host-routed MoE off regardless of this.
 fn qwen35_decode_graph_enabled() -> bool {
-    matches!(
-        std::env::var("ARLE_QWEN35_DECODE_GRAPH").as_deref(),
-        Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
-    )
+    crate::runtime_flags::qwen35_decode_graph()
 }
 
 /// Batched rows>1 decode for Qwen3.5/3.6 (stage 1, contiguous KV) — re-port
@@ -3251,16 +3242,13 @@ fn qwen35_decode_graph_enabled() -> bool {
 /// ([`crate::qwen35::Qwen35BatchDecodeState`]). DEFAULT ON: before this path
 /// existed, a rows>1 plan was a hard executor error (`rows == 1` ensure →
 /// engine death), so even a conservative batched path strictly dominates the
-/// status quo. `ARLE_QWEN35_BATCHED_DECODE=0` is the escape hatch AND the
+/// status quo. `--qwen35-batched-decode false` is the escape hatch AND the
 /// honest same-binary A/B arm: it processes rows>1 decode plans as sequential
 /// per-row single-row forwards instead (a NEW loop — the old behavior was
 /// death, not a fallback). rows==1 plans never consult this gate (the
 /// single-row path is byte-identical either way).
 fn qwen35_batched_decode_enabled() -> bool {
-    !matches!(
-        std::env::var("ARLE_QWEN35_BATCHED_DECODE").as_deref(),
-        Ok("0" | "false" | "FALSE" | "no" | "off" | "OFF")
-    )
+    crate::runtime_flags::qwen35_batched_decode()
 }
 
 /// Decode-graph replay/capture probes — static so the pod bench can PROVE
@@ -3319,7 +3307,7 @@ impl Qwen35DecodeGraph {
 /// inside the model (full-attn contiguous caches + gated-delta recurrent
 /// state), so it does NOT use a [`PagedKVPool`]; it relies on the host
 /// [`KvPool`] only for the slot's logical `seq_len` to derive `start_pos`.
-/// The whole-step decode graph is opt-in (`ARLE_QWEN35_DECODE_GRAPH=1`,
+/// The whole-step decode graph is opt-in (`--qwen35-decode-graph`,
 /// single-GPU + device-routed MoE only, rows==1 plans only).
 ///
 /// Scope: prefill stays single-row (mixed plans run per-prefill sub-steps,
@@ -4190,7 +4178,7 @@ impl Qwen35CudaExecutor {
         if !qwen35_decode_graph_enabled() {
             info!(
                 "Qwen3.5 whole-step decode graph disabled \
-                 (set ARLE_QWEN35_DECODE_GRAPH=1 to enable)"
+                 (set --qwen35-decode-graph to enable)"
             );
             cuda_startup_log(
                 "qwen35_warmup_total",
@@ -5465,7 +5453,7 @@ impl Qwen35CudaExecutor {
     /// ([`crate::qwen35::Qwen35Model::forward_decode_batch`] — stage 1
     /// re-port of the monolith batched decode; the c=4 amortization formula
     /// and the TP/all-reduce proof live on that method). With
-    /// `ARLE_QWEN35_BATCHED_DECODE=0`, runs the rows sequentially as
+    /// `--qwen35-batched-decode false`, runs the rows sequentially as
     /// single-row forwards instead (the honest A/B arm; the pre-batching
     /// behavior was a hard error, not a fallback).
     ///

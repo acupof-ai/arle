@@ -1047,8 +1047,9 @@ mod tests {
 
     /// REAL Metal c=1 greedy fingerprint (Qwen3.5-0.8B). Drives a single greedy
     /// request to a fixed length and prints the FNV fingerprint of the generated
-    /// ids + the pipeline fast-path hit count. Run once with
-    /// `INFER_METAL_PIPELINE=1` (or default-on) and once with `=0`; greedy is
+    /// ids + the pipeline fast-path hit count. Run once with the pipeline on
+    /// (default) and once off (`infer_metal::apply_runtime_flags` with
+    /// `pipeline: false` before engine build); greedy is
     /// deterministic given the prompt, so the fingerprints MUST match
     /// bit-for-bit — the pipeline path feeds the same argmax token into the next
     /// `step_session` the HEAD path would. The hit count proves the fast path
@@ -1067,9 +1068,8 @@ mod tests {
         let res = drive_concurrent(&mut engine, &[(prompt, 32)]);
         let hits_after = infer_metal::pipeline_fast_path_hits();
         eprintln!(
-            "[metal c=1 greedy Qwen3.5-0.8B] pipeline_env={:?} step_error={:?} \
+            "[metal c=1 greedy Qwen3.5-0.8B] step_error={:?} \
              gen_len={} fingerprint={:#018x} pipeline_hits_delta={} gen={:?}",
-            std::env::var("INFER_METAL_PIPELINE").ok(),
             res.step_error,
             res.generated.first().map_or(0, Vec::len),
             res.fingerprint(),
@@ -1243,9 +1243,9 @@ mod tests {
     // enum (those were `infer::model::*` types deleted in the R5 cutover), but
     // via process-local dispatch overrides + gate envs:
     //   * scalar bf16 REFERENCE — `set_dsv4_flashmla_decode_override(Some(false))`
-    //     (== `ARLE_DSV4_FLASHMLA_DECODE=0`). Decode reads the BF16 window cache.
+    //     (== `--dsv4-flashmla-decode false`). Decode reads the BF16 window cache.
     //   * FlashMLA FP8-KV     — `set_dsv4_flashmla_decode_override(Some(true))`
-    //     (== `ARLE_DSV4_FLASHMLA_DECODE=1`). Decode packs the KV into the FP8
+    //     (== `--dsv4-flashmla-decode true`). Decode packs the KV into the FP8
     //     arena (`dsv4.rs` `fp8_kv_pool`, `dsv4_fp8_kv_pack`).
     // There is NO INT8 / TQ4 / TurboQuant KV path for DSv4 — the legacy
     // `KVFormat::{INT8, FP8E4M3, TurboQuant}` matrix targeted the dense Qwen3
@@ -1259,7 +1259,7 @@ mod tests {
     // GATE (legacy thresholds, mapped to the precisions that exist):
     //   * scalar self-parity = 100% (sanity: the reference vs itself).
     //   * FlashMLA FP8-KV ≥ 95% trajectory match vs scalar bf16 — THIS is the
-    //     gate that licenses the `ARLE_DSV4_FLASHMLA_DECODE` default flip.
+    //     gate that licenses the `--dsv4-flashmla-decode` default flip.
     //   * fused-wqkv / contig-MoE rows are report-only (compute fusions, not a
     //     new KV precision; license via the perf A/B + this trajectory monitor).
     //
@@ -1286,7 +1286,7 @@ mod tests {
     #[derive(Clone, Copy, Debug)]
     struct Dsv4PrecisionCase {
         name: &'static str,
-        /// `ARLE_DSV4_FLASHMLA_DECODE` dispatch (false = scalar bf16 reference).
+        /// `--dsv4-flashmla-decode` dispatch (false = scalar bf16 reference).
         flashmla: bool,
         /// Fused wqkv decode linear (compute variant on the FP8-KV path).
         fused_wqkv: bool,
@@ -1488,15 +1488,7 @@ mod tests {
     ) -> Result<Dsv4PrecisionResult> {
         infer_cuda::set_dsv4_flashmla_decode_override(Some(case.flashmla));
         infer_cuda::set_dsv4_fused_wqkv_decode_override(Some(case.fused_wqkv));
-        // SAFETY: the gate drives a single thread per precision and mutates env
-        // only between (not during) executor steps; the DSv4 decode path reads
-        // ARLE_DSV4_MOE_CONTIG_DECODE per step.
-        unsafe {
-            std::env::set_var(
-                "ARLE_DSV4_MOE_CONTIG_DECODE",
-                if case.contig_moe { "1" } else { "0" },
-            );
-        }
+        infer_cuda::set_dsv4_moe_contig_decode(case.contig_moe);
 
         let mut sequences = Vec::with_capacity(prompts.len());
         for (idx, prompt) in prompts.iter().enumerate() {

@@ -125,13 +125,16 @@ impl DeepEpTransport {
             .map(|ll| ll.num_max_dispatch_tokens_per_rank as usize)
     }
 
-    /// `num_max_dispatch_tokens_per_rank` knob — env-overridable, default 256,
-    /// asserted `<= 1024` per DeepEP LL layout limits.
+    /// `num_max_dispatch_tokens_per_rank` knob — CLI
+    /// `--deepep-max-dispatch-tokens-per-rank`, else the SGLang ecosystem env,
+    /// default 256; asserted `<= 1024` per DeepEP LL layout limits.
     fn num_max_dispatch_tokens_per_rank() -> Result<u32> {
-        let value = std::env::var("SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK")
-            .ok()
-            .or_else(|| std::env::var("ARLE_DSV4_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK").ok())
-            .and_then(|v| v.parse::<u32>().ok())
+        let value = crate::runtime_flags::deepep_max_dispatch_tokens_per_rank()
+            .or_else(|| {
+                std::env::var("SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK")
+                    .ok()
+                    .and_then(|v| v.parse::<u32>().ok())
+            })
             .unwrap_or(256);
         ensure!(
             value > 0 && value <= 1024,
@@ -319,10 +322,7 @@ impl DeepEpTransport {
     }
 
     pub(crate) fn num_sms() -> Result<u32> {
-        let value = std::env::var("ARLE_DSV4_DEEPEP_NUM_SMS")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(20);
+        let value = crate::runtime_flags::deepep_num_sms();
         ensure!(
             value > 0 && value.is_multiple_of(2),
             "DeepEP num_sms must be positive and even, got {value}"

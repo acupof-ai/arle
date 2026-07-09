@@ -76,12 +76,7 @@ fn qwen35_profile_enabled() -> bool {
 }
 
 fn qwen35_batched_decode_attention_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("ARLE_QWEN35_BATCHED_DECODE_ATTENTION")
-            .map(|v| v != "0")
-            .unwrap_or(true)
-    })
+    crate::runtime_flags::qwen35_batched_decode_attention()
 }
 
 fn qwen35_startup_profile_enabled() -> bool {
@@ -140,7 +135,7 @@ fn qwen35_profile<T>(
 /// `docs/reviews/2026-06-11-qwen35-post-license-reprofile-rerank.md`).
 /// Default ON (licensed 2026-06-11: 3k prefill −36%, multi-shape verified —
 /// see `wins/2026-06-11-qwen35-fa3-prefill-licensed.md`);
-/// `ARLE_QWEN35_FA3=0` is the same-binary fallback arm. On stub builds
+/// `--qwen35-fa3 false` is the same-binary fallback arm. On stub builds
 /// (no `ARLE_CUDA_ENABLE_FA3`) the link marker is 0 and the gate silently
 /// keeps the in-tree kernel, so the default is safe across build flavors.
 /// Read once — prefill is never graph-captured, so a process-lifetime latch
@@ -148,11 +143,7 @@ fn qwen35_profile<T>(
 fn qwen35_fa3_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
-        let on = !matches!(
-            std::env::var("ARLE_QWEN35_FA3").as_deref(),
-            Ok("0" | "false" | "FALSE" | "no" | "off" | "OFF")
-        );
-        if !on {
+        if !crate::runtime_flags::qwen35_fa3() {
             return false;
         }
         // SAFETY: pure host query exported by both the real shim and the stub.
@@ -167,27 +158,19 @@ fn qwen35_fa3_enabled() -> bool {
     })
 }
 
-/// `ARLE_QWEN35_FA3_DECODE=1`: route single-token full-attention decode through
+/// `--qwen35-fa3-decode true`: route single-token full-attention decode through
 /// the vendored FA3 split-KV + PackGQA path. Default OFF until the 4K/c=1
 /// needle + ITL gate licenses it. This path uses a host `seqlen_k` launch
 /// parameter, so keep it out of the whole-step decode graph for now.
 fn qwen35_fa3_decode_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
-        let on = matches!(
-            std::env::var("ARLE_QWEN35_FA3_DECODE").as_deref(),
-            Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
-        );
-        if !on {
+        if !crate::runtime_flags::qwen35_fa3_decode() {
             return false;
         }
-        let graph_on = matches!(
-            std::env::var("ARLE_QWEN35_DECODE_GRAPH").as_deref(),
-            Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
-        );
-        if graph_on {
+        if crate::runtime_flags::qwen35_decode_graph() {
             log::info!(
-                "ARLE_QWEN35_FA3_DECODE ignored while ARLE_QWEN35_DECODE_GRAPH=1; \
+                "--qwen35-fa3-decode ignored while --qwen35-decode-graph is on; \
                  FA3 split decode uses host seqlen_k and is not graph-replay safe"
             );
             return false;
@@ -197,17 +180,10 @@ fn qwen35_fa3_decode_enabled() -> bool {
 }
 
 fn qwen35_fa3_decode_splits() -> usize {
-    static SPLITS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *SPLITS.get_or_init(|| {
-        std::env::var("ARLE_QWEN35_FA3_DECODE_SPLITS")
-            .ok()
-            .and_then(|raw| raw.parse::<usize>().ok())
-            .unwrap_or(8)
-            .clamp(2, 256)
-    })
+    crate::runtime_flags::qwen35_fa3_decode_splits()
 }
 
-/// `ARLE_QWEN35_GDR_CHUNKED=1`: route GDN prefill chunks (`seq_len > 1`)
+/// `--qwen35-gdr-chunked true`: route GDN prefill chunks (`seq_len > 1`)
 /// through the FlashQLA chunked kernels (TileLang AOT, sm_90a) instead of
 /// the serial `gated_delta_rule_prefill_recurrent` kernel (28.0% of prefill
 /// GPU time pre-FA3 —
@@ -217,13 +193,7 @@ fn qwen35_fa3_decode_splits() -> usize {
 /// builds without an sm_90 target link NOT_SUPPORTED stubs, so keep the gate
 /// off there. Decode (`seq_len == 1`) always stays on the recurrent kernel.
 fn qwen35_gdr_chunked_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        matches!(
-            std::env::var("ARLE_QWEN35_GDR_CHUNKED").as_deref(),
-            Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
-        )
-    })
+    crate::runtime_flags::qwen35_gdr_chunked()
 }
 
 /// Raw (un-scaled) LoRA A/B matrices for one student projection, pushed from
@@ -1230,12 +1200,12 @@ pub(crate) struct FullAttnScratch {
     v_batch: HiddenSlot,
     q_prepped: HiddenSlot,
     attn_heads: HiddenSlot,
-    /// FA3 prefill scratch (`ARLE_QWEN35_FA3`): fp32 softmax LSE
+    /// FA3 prefill scratch (`--qwen35-fa3`): fp32 softmax LSE
     /// `[local_q_heads * seq_len]` (write-only output of the fwd kernel) and
     /// the persistent-scheduler semaphore (1 i32, zeroed by the shim per
     /// launch).
     fa3_lse: SliceSlot<f32>,
-    /// FA3 split-decode scratch (`ARLE_QWEN35_FA3_DECODE`): fp32 partial
+    /// FA3 split-decode scratch (`--qwen35-fa3-decode`): fp32 partial
     /// outputs `[splits, b=1, local_q_heads, seq_len, head_dim]`.
     fa3_oaccum: SliceSlot<f32>,
     /// FA3 split-decode scratch: fp32 partial LSE
@@ -1273,7 +1243,7 @@ pub(crate) struct LinearAttnScratch {
     qkv_conv: HiddenSlot,
     gdr_out: HiddenSlot,
     normed_out: HiddenSlot,
-    /// FlashQLA chunked-prefill scratch (`ARLE_QWEN35_GDR_CHUNKED`), all
+    /// FlashQLA chunked-prefill scratch (`--qwen35-gdr-chunked`), all
     /// token-major dense: q/k `[S, Hg, 128]` bf16 l2norm'd, v `[S, H, 128]`
     /// bf16, a_inv `[S, H, 64]` bf16, g/g_cumsum/beta `[S, H]` f32.
     fq_q: HiddenSlot,
@@ -3517,7 +3487,7 @@ impl Qwen35Model {
         if !crate::moe::qwen35_decode_moe_graph_capturable(cfg) {
             return Some(
                 "MoE decode is not device-routable (host router fallback active — \
-                 ARLE_QWEN35_GPU_ROUTER=0 or non-greedy/grouped routing)",
+                 --qwen35-gpu-router false or non-greedy/grouped routing)",
             );
         }
         None
@@ -5815,7 +5785,7 @@ impl Qwen35Model {
 
         // ── gated-delta rule. Decode (seq_len==1) is always the recurrent
         //    kernel. Prefill chunks default to the recurrent kernel; the
-        //    FlashQLA chunked path (ARLE_QWEN35_GDR_CHUNKED) replaces the
+        //    FlashQLA chunked path (--qwen35-gdr-chunked) replaces the
         //    serial token scan with chunk-parallel TileLang kernels on the
         //    baked Qwen3.6 single-GPU shard. The legacy in-tree chunkwise
         //    TileLang path stays dead (sm_90 hang was in ITS kernels). ──
@@ -6596,7 +6566,7 @@ impl Qwen35Model {
     /// rows, then one split-KV fused decode launch over grid.z = B. The kernel
     /// reads per-row positions / seq_lens and per-row K/V cache pointers from
     /// device arrays, so the host never loops over rows for full-attn decode.
-    /// `ARLE_QWEN35_BATCHED_DECODE_ATTENTION=0` keeps the old per-row path only
+    /// `--qwen35-batched-decode-attention false` keeps the old per-row path only
     /// for same-binary A/B.
     #[allow(clippy::too_many_arguments)]
     fn full_attention_batch_rows(

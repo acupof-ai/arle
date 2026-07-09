@@ -4,7 +4,7 @@
 //!  router gemm  → logits[T, E]
 //!    → dsv4_route (DEVICE, zero bias)  → route_indices[T*topk], route_weights[T*topk]
 //!    → qwen36_renorm_topk_weights      → norm_topk_prob renorm (in-place)
-//!      [ARLE_QWEN35_GPU_ROUTER=0 fallback: infer_moe::route (HOST) + flatten_routing
+//!      [--qwen35-gpu-router false fallback: infer_moe::route (HOST) + flatten_routing
 //!       + ctx.sync + logits D2H + indices/weights H2D]
 //!    → dsv4_count_local_experts        → counts[E]
 //!    → dsv4_exclusive_scan_i32         → offsets[E]
@@ -12,7 +12,7 @@
 //!                                      → packed_hidden[R,H], packed_route_slot[R],
 //!                                        packed_weight[R]   (R = T*topk)
 //!    → R ≤ 256: moe_bf16_grouped_gemm_swiglu_decode (fused gate+up+SwiGLU,
-//!               weight-read-bound decode kernels; ARLE_QWEN35_MOE_DECODE_KERNEL=0
+//!               weight-read-bound decode kernels; --qwen35-moe-decode-kernel false
 //!               opts out) → moe_bf16_grouped_gemm_decode (down)
 //!      R > 256: moe_bf16_grouped_gemm_pair_batch (gate+up)
 //!               → silu_mul (unclamped SwiGLU — Qwen3.6 has no clamp)
@@ -25,7 +25,7 @@
 //! Routing runs on DEVICE by default (`dsv4_route` with a zero selection bias is
 //! exactly greedy top-k; audit lane MOE-OK-3 established host/device semantic
 //! identity for Qwen3.6). The Qwen host `infer_moe::route` path stays as the
-//! `ARLE_QWEN35_GPU_ROUTER=0` fallback for the pod A/B license — it costs a
+//! `--qwen35-gpu-router false` fallback for the pod A/B license — it costs a
 //! full-stream `ctx.sync` + logits D2H + 2×H2D per layer per step. DSv4 uses the
 //! same device route kernel unconditionally.
 //! W4/4-bit is a separate follow-up: the two `moe_bf16_grouped_gemm_*` call sites
@@ -144,7 +144,7 @@ pub(crate) const QWEN35_DEEPGEMM_MIN_ROUTES: usize = 1024;
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 pub(crate) const QWEN35_MOE_DECODE_MAX_ROUTES: usize = 256;
 
-/// `ARLE_QWEN35_DEEPGEMM=1`: swap the Qwen3.5/3.6 hand CUDA-core grouped
+/// `--qwen35-deepgemm` (default on): swap the Qwen3.5/3.6 hand CUDA-core grouped
 /// expert GEMMs (~3.9 TFLOP/s class) for DeepGEMM SM90 BF16 m-grouped GEMMs
 /// (vendored official kernels, JIT-compiled through the torch-free native
 /// bridge; default-on for sm_90 builds with vendored DeepGEMM present, with
@@ -156,20 +156,17 @@ pub(crate) const QWEN35_MOE_DECODE_MAX_ROUTES: usize = 256;
 /// 9.10 -> 2.32 s (-74.5%); smoke x3 consistent + needle PASS both arms.
 /// First-ever run on a box pays the DeepGEMM JIT compile into
 /// `~/.deep_gemm` (~3.7 s across needle shapes, once per cache lifetime).
-/// `ARLE_QWEN35_DEEPGEMM=0` restores the hand-kernel-only path. Read at
+/// `--qwen35-deepgemm false` restores the hand-kernel-only path. Read at
 /// LOAD time as well: the loader builds the contiguous grouped-B weight
 /// caches (and drops the per-expert copies) only when enabled, so flipping
 /// requires a process restart. Native DeepGEMM is default-on when buildable;
-/// `=0` is the operator's escape hatch.
+/// `false` is the operator's escape hatch.
 #[cfg(feature = "cuda")]
 pub(crate) fn qwen35_deepgemm_enabled() -> bool {
-    !matches!(
-        std::env::var("ARLE_QWEN35_DEEPGEMM").as_deref(),
-        Ok("0" | "false" | "FALSE" | "no" | "off" | "OFF")
-    )
+    crate::runtime_flags::qwen35_deepgemm()
 }
 
-/// `ARLE_QWEN35_MOE_DECODE_KERNEL=0`: run the original hand batch grouped
+/// `--qwen35-moe-decode-kernel false`: run the original hand batch grouped
 /// kernels at every routed-row count below the DeepGEMM floor — the
 /// same-binary A/B arm for the pod license of the decode-band
 /// weight-read-bound kernels. Default ON. Read per call (per layer per
@@ -177,10 +174,7 @@ pub(crate) fn qwen35_deepgemm_enabled() -> bool {
 /// graph the value read at capture time is what replays.
 #[cfg(feature = "cuda")]
 pub(crate) fn qwen35_moe_decode_kernel_enabled() -> bool {
-    !matches!(
-        std::env::var("ARLE_QWEN35_MOE_DECODE_KERNEL").as_deref(),
-        Ok("0" | "false" | "FALSE" | "no" | "off" | "OFF")
-    )
+    crate::runtime_flags::qwen35_moe_decode_kernel()
 }
 
 /// Allocate an i32 buffer pre-filled with `-1` ON DEVICE (memset 0xFF).
@@ -314,7 +308,7 @@ mod gpu {
     /// The caller-provided `out` (`[H, T]`) needs no init: the combine kernel
     /// writes every element before `qwen36_add_shared_expert_gated` RMWs it.
     ///
-    /// DeepGEMM path (`ARLE_QWEN35_DEEPGEMM=1`) — extra slots + reused slots
+    /// DeepGEMM path (`--qwen35-deepgemm`) — extra slots + reused slots
     /// at PADDED shapes (`rows_p` = `G·128` masked band / `contig_rows_cap`):
     ///
     /// | slot                 | shape        | init on reuse | proof |
@@ -447,14 +441,11 @@ mod gpu {
 
     /// Default ON: route fully on-device (no per-layer logits D2H +
     /// `ctx.sync()` full-stream drain). Opt out with
-    /// `ARLE_QWEN35_GPU_ROUTER=0` (or `false`) to run the verified
+    /// `--qwen35-gpu-router false` to run the verified
     /// `infer_moe::route` host reference — the pod A/B license lever. DSv4
     /// routing is device-only.
     fn use_gpu_router() -> bool {
-        !matches!(
-            std::env::var("ARLE_QWEN35_GPU_ROUTER").as_deref(),
-            Ok("0" | "false")
-        )
+        crate::runtime_flags::qwen35_gpu_router()
     }
 
     /// Whether this routing config can run on the DEVICE route kernel (greedy
@@ -534,7 +525,7 @@ mod gpu {
             num_experts
         );
         // DeepGEMM expert path: grouped-B caches present (built at load when
-        // `ARLE_QWEN35_DEEPGEMM=1`) and the env gate still set. HYBRID
+        // `--qwen35-deepgemm`) and the flag still set. HYBRID
         // dispatch by routed-row count (pod A/B 2026-06-11, same binary,
         // n=3): at decode R=8 the masked grouped path loses to the hand
         // CUDA-core kernels (37.5 vs 40.8 tok/s, JIT/TMA fixed overhead on
@@ -638,7 +629,7 @@ mod gpu {
             (&*route_indices, &*route_weights)
         } else {
             // HOST route (verified infer_moe reference,
-            // `ARLE_QWEN35_GPU_ROUTER=0` or a non-greedy/grouped config).
+            // `--qwen35-gpu-router false` or a non-greedy/grouped config).
             // Sync so the gemm has landed before the D2H read.
             ctx.sync()?;
             let logits_bf16: Vec<bf16> = ctx
@@ -823,7 +814,7 @@ mod gpu {
         // loads, weights of touched experts read once per <=8-row activation
         // chunk — see the formula on the const). Both contraction dims must
         // be 16B-vector rows (gate/up k = H, down k = I); otherwise the batch
-        // kernels keep the shape. `ARLE_QWEN35_MOE_DECODE_KERNEL=0` is the
+        // kernels keep the shape. `--qwen35-moe-decode-kernel false` is the
         // same-binary A/B arm. Shape-constant pure kernel launches — decode
         // CUDA-graph capture-safe, same as the batch kernels.
         let use_bf16_decode_kernels = weights.expert_weight_format == WeightFormat::DenseBf16
@@ -1080,7 +1071,7 @@ mod gpu {
     }
 
     /// Steps 4-8 of the MoE block on the DeepGEMM SM90 BF16 m-grouped GEMMs
-    /// (`ARLE_QWEN35_DEEPGEMM=1`): pack → gate GEMM + up GEMM → silu_mul →
+    /// (`--qwen35-deepgemm`): pack → gate GEMM + up GEMM → silu_mul →
     /// down GEMM → scatter/combine into `out`. `counts` was already filled by
     /// step 3's count kernel.
     ///
@@ -1200,7 +1191,7 @@ mod gpu {
             moe_inter
         } else {
             anyhow::bail!(
-                "DeepGEMM MoE path requires grouped expert caches (load with ARLE_QWEN35_DEEPGEMM=1)"
+                "DeepGEMM MoE path requires grouped expert caches (load with --qwen35-deepgemm)"
             )
         };
         // Fail loud if the native DeepGEMM bridge is a build-time stub.
@@ -2651,10 +2642,7 @@ mod dsv4_gpu {
     }
 
     fn use_contiguous_decode_moe() -> bool {
-        matches!(
-            std::env::var("ARLE_DSV4_MOE_CONTIG_DECODE").as_deref(),
-            Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
-        )
+        crate::runtime_flags::dsv4_moe_contig_decode()
     }
 
     fn dsv4_route_device(
@@ -2814,7 +2802,7 @@ mod dsv4_gpu {
         // Rust-side frees land after capture, so replays write/read aliased
         // VAs and the MoE partially no-ops. Captured bodies must allocate
         // NOTHING. The pooled padded-GEMM tax is avoided by the contiguous
-        // variant (ARLE_DSV4_MOE_CONTIG_DECODE=1): same persistent buffers,
+        // variant (--dsv4-moe-contig-decode): same persistent buffers,
         // compact 8-row GEMM shape.
         let route_indices = cache_ptr(&scratch.route_indices, ctx);
         let route_weights = cache_ptr(&scratch.route_weights, ctx);

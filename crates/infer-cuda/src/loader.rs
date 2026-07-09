@@ -5,7 +5,6 @@
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::env;
 use std::fs;
 use std::io::Read;
 use std::ops::Deref;
@@ -731,10 +730,7 @@ struct ShardedBytesCow<'a> {
 }
 
 fn shard_cache_bytes_limit() -> usize {
-    env::var("ARLE_CUDA_SHARD_CACHE_BYTES")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(DEFAULT_SHARD_CACHE_BYTES)
+    crate::runtime_flags::shard_cache_bytes().unwrap_or(DEFAULT_SHARD_CACHE_BYTES)
 }
 
 impl SafetensorLoader {
@@ -4521,7 +4517,7 @@ fn routed_expert_weight_format(
 /// consumed by [`crate::moe::moe_forward`].
 pub(crate) struct MoeLayerWeights {
     /// Per-expert weight matrices (hand grouped-GEMM path). EMPTY when the
-    /// DeepGEMM grouped caches below are built (`ARLE_QWEN35_DEEPGEMM=1` at
+    /// DeepGEMM grouped caches below are built (`--qwen35-deepgemm` at
     /// load) — the grouped buffer then owns the only copy of the bytes and
     /// the `*_ptrs` tables point into it, so the hand kernels stay runnable.
     pub(crate) gate: Vec<DeviceMatrix>,
@@ -4540,7 +4536,7 @@ pub(crate) struct MoeLayerWeights {
     pub(crate) up_global_ptrs: Option<CudaSlice<u64>>,
     pub(crate) down_global_ptrs: Option<CudaSlice<u64>>,
     /// DeepGEMM grouped-B caches (`[groups, n, k]` contiguous row-major BF16,
-    /// this rank's EP experts only). `Some` iff `ARLE_QWEN35_DEEPGEMM=1` at
+    /// this rank's EP experts only). `Some` iff `--qwen35-deepgemm` at
     /// load; the default load path is byte-identical (fields stay `None`).
     pub(crate) gate_grouped: Option<MoeExpertGroup>,
     pub(crate) up_grouped: Option<MoeExpertGroup>,
