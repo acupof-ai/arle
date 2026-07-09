@@ -1,0 +1,23 @@
+crates/infer-cuda/src/attention/kv_layout.rs
+  s_bb974d20ff7814::t_39b00abfcd75e6 1975-1981,1986-2007,2010,2020
+crates/infer-cuda/src/dsv4.rs
+  s_bb974d20ff7814::t_11d5d45fb92be0 1842-1845,1849,1879,1895
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "91981b737b7c158c270c33eeaf3a12d2fb6b0d3e",
+  "prompts": {},
+  "sessions": {
+    "s_bb974d20ff7814": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ad32cb33ef5334634",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
