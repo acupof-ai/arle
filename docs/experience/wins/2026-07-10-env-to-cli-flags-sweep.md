@@ -17,9 +17,9 @@ env-unset behavior); gates green locally: cuda,no-cuda + metal + vulkan
 typechecks, cpu test lane, new `metal_speculative_flags_ride_engine_config`
 test, clippy clean on changed files.
 
-**Bench: pending-remote.** One `scripts/bench_guidellm.sh` smoke vs the
-latest CUDA baseline is owed at the next pod session to confirm the
-flag-plumbing added no load-path regression (expected Δ ≈ 0%).
+**Bench: settled** (same-day pod round): plain-decode 42.7 tok/s decode-only
+vs the 42.6–43.6 baseline band → **Δ≈0%** — no load-path regression.
+Details: [partial-ctx round](2026-07-10-dspark-partial-ctx-drafting.md).
 
 ## Rule
 
