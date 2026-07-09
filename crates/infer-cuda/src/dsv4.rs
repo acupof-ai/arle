@@ -1866,6 +1866,9 @@ impl Dsv4Model {
         requested: usize,
         max_seq_len: usize,
     ) -> Result<Dsv4KvBudgetPlan> {
+        // NO term here for the prefix-state pool (#154 Phase 2): it is
+        // host-DRAM-resident by design (`attention/prefix_state.rs`), funded
+        // by the --kv-dram share — HBM sizes slots, DRAM sizes pool heat.
         const MEM_FRACTION: f64 = 0.9;
         // Official-DSA selector memory splits into the ONE model-wide shared
         // scratch (a fixed subtraction from the budget) and the per-(slot,
