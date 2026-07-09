@@ -69,16 +69,6 @@ impl MetalDflashRuntime {
         target_config: &MetalModelConfig,
     ) -> Result<Self> {
         options.validate()?;
-        if std::env::var("DFLASH_DRAFT_MASK")
-            .ok()
-            .is_some_and(|value| value.eq_ignore_ascii_case("causal"))
-        {
-            anyhow::bail!(
-                "DFLASH_DRAFT_MASK=causal is not supported in the rewrite Metal DFlash path; \
-                 the compiled draft graph supports only the reference mask=none path"
-            );
-        }
-
         let draft_dir =
             model_source::resolve_model_path(&options.draft_model).with_context(|| {
                 format!(
