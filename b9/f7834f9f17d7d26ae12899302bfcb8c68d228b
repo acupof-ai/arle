@@ -1,0 +1,31 @@
+scripts/gen_terminal_tasks.py
+  s_94ce5908b6c7bb::t_0ca96cd9e121d4 9,56-58,228,231-232,234-235,238-239,249,252-253,256-257,260-261,1094-1105
+scripts/stage_swe_pro.py
+  s_9909d04362af6f::t_95bef7a756715c 34,37-39,105-124
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "b9f7834f9f17d7d26ae12899302bfcb8c68d228b",
+  "prompts": {},
+  "sessions": {
+    "s_94ce5908b6c7bb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a8744832334b16ddb",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_9909d04362af6f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a3db630ee27e3d103",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
