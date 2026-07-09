@@ -1123,22 +1123,6 @@ impl Dsv4SlotState {
         self.seq_len
     }
 
-    pub(crate) fn set_seq_len(&mut self, seq_len: usize) {
-        self.seq_len = seq_len;
-    }
-
-    /// One layer's attention state (the prefix-reuse restore in `executor.rs`
-    /// needs `&mut` access to `sw_window_cache` from outside this module).
-    pub(crate) fn attention_layer_mut(
-        &mut self,
-        layer_idx: usize,
-    ) -> Result<&mut crate::attention::Dsv4LayerAttentionState> {
-        let len = self.attention.len();
-        self.attention
-            .get_mut(layer_idx)
-            .ok_or_else(|| anyhow!("DSv4 slot attention layer {layer_idx} outside len {len}"))
-    }
-
     pub(crate) fn reset(
         &mut self,
         ctx: &DeviceContext,
@@ -1163,10 +1147,9 @@ impl Dsv4SlotState {
     }
 
     /// Re-sync every layer's FlashMLA device page table from the host pool.
-    /// Caller must invoke this exactly once, right after `prepare_kv_batch`
-    /// mirrors this slot's band for the first time post-reset (the slot's
-    /// first prefill row, `start_pos == 0`) — see
-    /// [`crate::attention::Dsv4LayerAttentionState::refresh_flashmla_device_page_table`].
+    /// Called after `prepare_kv_batch` mirrors a prefill row's band — the
+    /// graph-captured kernel arg would otherwise point at a stale table (#8).
+    /// See [`crate::attention::Dsv4LayerAttentionState::refresh_flashmla_device_page_table`].
     pub(crate) fn refresh_flashmla_device_page_tables(
         &mut self,
         ctx: &DeviceContext,
@@ -1833,74 +1816,6 @@ impl Dsv4Model {
                 )
             })
             .sum();
-        // Compress-state pool: shared per-layer, same sum-per-layer pattern as
-        // `mla_decode_bytes` above (num_slots-independent — this pool is
-        // cross-request-shared, not per-slot). Only compress_ratio==4 layers
-        // build one (main compressor, and the CSA indexer's own sub-state at
-        // `index_head_dim`); every other layer contributes 0.
-        let compress_state_pool_bytes: usize = self
-            .layers
-            .iter()
-            .filter(|layer| layer.compress_ratio == 4)
-            .map(|layer| {
-                let main = if layer.mode.has_compressor() {
-                    crate::attention::Dsv4CompressStatePool::device_bytes_for(
-                        self.config.head_dim,
-                        layer.compress_ratio,
-                        max_seq_len,
-                    )
-                } else {
-                    0
-                };
-                let indexer = if layer.mode.has_indexer() {
-                    crate::attention::Dsv4CompressStatePool::device_bytes_for(
-                        self.config.index_head_dim,
-                        layer.compress_ratio,
-                        max_seq_len,
-                    )
-                } else {
-                    0
-                };
-                main.saturating_add(indexer)
-            })
-            .sum();
-        // Write-mirrored shadow of `dsa_key_cache`: one slot-equivalent band
-        // per `has_indexer()` layer, num_slots-independent like the
-        // compress-state pool above (not ratio-restricted — every indexer
-        // layer gets one, matching `dsa_key_cache`'s own gate).
-        let dsa_key_cache_pool_bytes: usize = self
-            .layers
-            .iter()
-            .filter(|layer| layer.mode.has_indexer())
-            .map(|layer| {
-                let index_ratio = if layer.mode == DeepSeekV4AttentionMode::SparseIndexed {
-                    1
-                } else {
-                    layer.compress_ratio
-                };
-                crate::attention::Dsv4DsaKeyCachePool::device_bytes_for(
-                    &self.config,
-                    index_ratio,
-                    max_seq_len,
-                )
-            })
-            .sum();
-        // SW-ring periodic snapshot pool: every layer has a ring, not
-        // ratio-restricted.
-        let sw_ring_pool_bytes: usize = if self.config.sliding_window > 0 {
-            self.layers
-                .iter()
-                .map(|_| {
-                    crate::attention::Dsv4SwRingSnapshotPool::device_bytes_for(
-                        self.config.head_dim,
-                        self.config.sliding_window,
-                        max_seq_len,
-                    )
-                })
-                .sum()
-        } else {
-            0
-        };
         // TRUE per-slot cost = the slot struct itself (statically — no slot exists
         // yet). Fixes the 43→382 MB under-count — the old hand-roll missed
         // spec_verify, the dominant term — that ran `affordable` ~9× high.
@@ -1953,10 +1868,7 @@ impl Dsv4Model {
                         .saturating_add(moe_decode_shared_bytes)
                         .saturating_add(shared_expert_scratch_bytes)
                         .saturating_add(moe_tail_scratch_bytes)
-                        .saturating_add(mla_decode_bytes)
-                        .saturating_add(compress_state_pool_bytes)
-                        .saturating_add(dsa_key_cache_pool_bytes)
-                        .saturating_add(sw_ring_pool_bytes);
+                        .saturating_add(mla_decode_bytes);
                     let budget_before_pool = infer_seam::SlotBudget::from_free(
                         free,
                         MEM_FRACTION,
@@ -1975,8 +1887,7 @@ impl Dsv4Model {
                     log::info!(
                         "DSv4 KV budget: free {}MB, per_slot {}MB (slot-state {}MB + DSA key-cache {}MB + DSA batched {}MB; \
                          FP8 arena in shared pool), shared DSA {}MB, shared MoE decode {}MB, shared expert scratch {}MB, \
-                         shared MLA decode {}MB, shared compress-state pool {}MB, shared DSA key-cache pool {}MB, \
-                         shared SW ring pool {}MB, pool_total {}MB, affordable {}",
+                         shared MLA decode {}MB, pool_total {}MB, affordable {}",
                         free >> 20,
                         per_slot >> 20,
                         slot_state_bytes >> 20,
@@ -1986,9 +1897,6 @@ impl Dsv4Model {
                         moe_decode_shared_bytes >> 20,
                         shared_expert_scratch_bytes >> 20,
                         mla_decode_bytes >> 20,
-                        compress_state_pool_bytes >> 20,
-                        dsa_key_cache_pool_bytes >> 20,
-                        sw_ring_pool_bytes >> 20,
                         pool_budget_total >> 20,
                         affordable,
                     );
@@ -3045,7 +2953,6 @@ impl Dsv4Model {
                         // seq_len==1 — exactly the shape `compressor_forward`'s asserts
                         // require for the token_count==1 decode path.
                         let slot = &mut slots[slot_ids[r]];
-                        let layer_pool = kv_adapter.layer_mut(layer_idx)?;
                         let b = crate::attention::mla_attention_compressor_defer_row(
                             &self.ctx,
                             &self.config,
@@ -3055,7 +2962,6 @@ impl Dsv4Model {
                             layer_idx,
                             &normed_row,
                             &mut slot.attention[layer_idx],
-                            layer_pool,
                             start_positions[r],
                             Some(&slot.start_pos_device),
                             original_seq_len,
@@ -3068,19 +2974,8 @@ impl Dsv4Model {
                     // ONE batched update each for the main + indexer compressor (only
                     // when this layer's rows actually have that compressor; the sinks
                     // are all-or-nothing per layer since `layer.mode` is uniform).
-                    // `ptrs.prev_overlap_*` already resolved to the shared pool base
-                    // per row (in the loop above); this pure function of
-                    // `layer.compress_ratio` reconstructs the SAME stride the kernel
-                    // needs — no separate pool borrow required here.
+                    // `ptrs.prev_overlap_*` are per-row per-slot registers (#154).
                     let overlap = layer.compress_ratio < 16;
-                    let main_overlap_stride = if layer.compress_ratio == 4 {
-                        crate::attention::Dsv4CompressStatePool::page_stride(
-                            self.config.head_dim,
-                            layer.compress_ratio,
-                        )
-                    } else {
-                        0
-                    };
                     if let (Some((kv, score)), Some(compressor)) = (
                         compressor_kv_score.as_ref(),
                         layer.attention.compressor.as_ref(),
@@ -3100,7 +2995,6 @@ impl Dsv4Model {
                             self.config.head_dim,
                             layer.compress_ratio,
                             overlap,
-                            main_overlap_stride,
                             true,
                             proj.original_seq_len,
                             &mut ptr_keepalive,
@@ -3124,14 +3018,6 @@ impl Dsv4Model {
                             let positions = batched_positions.as_ref().ok_or_else(|| {
                                 anyhow!("DSv4 full-flatten P1a: batched positions missing")
                             })?;
-                            let indexer_overlap_stride = if layer.compress_ratio == 4 {
-                                crate::attention::Dsv4CompressStatePool::page_stride(
-                                    self.config.index_head_dim,
-                                    layer.compress_ratio,
-                                )
-                            } else {
-                                0
-                            };
                             crate::attention::dsv4_compressor_update_batched(
                                 &self.ctx,
                                 &self.config,
@@ -3147,7 +3033,6 @@ impl Dsv4Model {
                                 self.config.index_head_dim,
                                 layer.compress_ratio,
                                 true, // indexer compressor always overlap
-                                indexer_overlap_stride,
                                 use_official_dsa,
                                 indexer_rope_original_seq_len,
                                 &mut ptr_keepalive,

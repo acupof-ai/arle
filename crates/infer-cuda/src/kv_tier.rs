@@ -170,40 +170,6 @@ pub(crate) fn chunk_sub(key: u64, idx: usize) -> u64 {
     (key << CHUNK_IDX_BITS) | idx as u64
 }
 
-/// Its own dedicated `CudaKvTierStore` instance, never shared with
-/// `NS_SLOT`/`NS_SLOT_CHUNK` (different page-size accounting).
-pub(crate) const NS_COMPRESS_STATE: u64 = 3;
-
-/// Folds `layer_id` in: block indices alone collide across layers.
-pub(crate) fn compress_state_tier_key(layer_id: usize, block_index: usize) -> u64 {
-    tier_key(
-        NS_COMPRESS_STATE,
-        ((layer_id as u64) << 40) | block_index as u64,
-    )
-}
-
-/// Own dedicated `CudaKvTierStore` instance (`dsa_official`'s write-mirrored
-/// shadow pool — row granularity, few-hundred-byte pages).
-pub(crate) const NS_DSA_OFFICIAL_STATE: u64 = 4;
-
-pub(crate) fn dsa_official_tier_key(layer_id: usize, row: usize) -> u64 {
-    tier_key(
-        NS_DSA_OFFICIAL_STATE,
-        ((layer_id as u64) << 40) | row as u64,
-    )
-}
-
-/// Own dedicated `CudaKvTierStore` instance (SW-ring periodic full-snapshot
-/// pool — 128 KiB pages, keyed by `pos / sliding_window`).
-pub(crate) const NS_SW_RING_STATE: u64 = 5;
-
-pub(crate) fn sw_ring_tier_key(layer_id: usize, block_index: usize) -> u64 {
-    tier_key(
-        NS_SW_RING_STATE,
-        ((layer_id as u64) << 40) | block_index as u64,
-    )
-}
-
 fn chunk_manifest(chunks: usize, bytes: usize) -> Vec<u8> {
     format!("DSCHUNK {chunks} {bytes}\n").into_bytes()
 }
