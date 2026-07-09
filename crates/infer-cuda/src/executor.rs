@@ -370,43 +370,40 @@ impl RealCudaExecutor {
         }
     }
 
-    /// Whole-slot KV tier hooks. CUDA implements these for the DSv4 and Qwen3.6
-    /// (G3 capacity spill) executor arms; dense Qwen3 reports no slot tier (its
-    /// page-granular radix tier handles capacity).
+    /// Whole-slot KV tier hooks. CUDA implements these only for the Qwen3.6
+    /// (G3 capacity spill) executor arm; dense Qwen3 reports no slot tier (its
+    /// page-granular radix tier handles capacity), and DSv4 preemption rides
+    /// the content-keyed prefix-state pool instead (#154 Phase 2b): preempt =
+    /// free pages + requeue, resume = prefix-attach restore + tail re-prefill.
     pub(crate) fn kv_slot_tier_enabled(&self) -> bool {
         match self {
-            Self::Dsv4(d) => d.kv_slot_tier_enabled(),
             Self::Qwen35(q) => q.kv_slot_tier_enabled(),
-            Self::Qwen(_) => false,
+            Self::Dsv4(_) | Self::Qwen(_) => false,
         }
     }
 
     pub(crate) fn demote_slot(&mut self, slot: usize, key: u64) -> Result<bool> {
         match self {
-            Self::Dsv4(d) => d.demote_slot(slot, key),
             Self::Qwen35(q) => q.demote_slot(slot, key),
-            Self::Qwen(_) => Ok(false),
+            Self::Dsv4(_) | Self::Qwen(_) => Ok(false),
         }
     }
 
     pub(crate) fn promote_slot(&mut self, key: u64, slot: usize, slot_pages: &[u32]) -> Result<()> {
         match self {
-            Self::Dsv4(d) => d.promote_slot(key, slot, slot_pages),
             Self::Qwen35(q) => {
                 let _ = slot_pages;
                 q.promote_slot(key, slot)
             }
-            Self::Qwen(_) => {
-                anyhow::bail!("whole-slot KV tier store is not implemented for dense Qwen3 CUDA")
+            Self::Dsv4(_) | Self::Qwen(_) => {
+                anyhow::bail!("whole-slot KV tier store is only implemented for Qwen3.6 CUDA")
             }
         }
     }
 
     pub(crate) fn drop_kv_slot_entries(&mut self, keys: &[u64]) {
-        match self {
-            Self::Dsv4(d) => d.drop_kv_slot_entries(keys),
-            Self::Qwen35(q) => q.drop_kv_slot_entries(keys),
-            Self::Qwen(_) => {}
+        if let Self::Qwen35(q) = self {
+            q.drop_kv_slot_entries(keys);
         }
     }
 
@@ -1838,13 +1835,11 @@ pub(crate) struct Dsv4CudaExecutor {
     /// promote to a `--mtp-adaptive` CLI flag once pod-calibrated).
     mtp_accept_ema: f32,
     mtp_skip_streak: usize,
-    /// THE tier store (L2 DRAM + optional L3 NVMe): every demoted blob — parked
-    /// slots — lives here as 16 MiB chunks under a per-key manifest,
-    /// partitioned by `NS_*` key namespaces.
-    slot_tier: CudaKvTierStore,
     /// Content-keyed cross-request prefix-state pool (#154 Phase 2): one
     /// host-resident entry per completed host page, written from the
-    /// post-forward choke point, consumed by the prefix restore path.
+    /// post-forward choke point, consumed by the prefix restore path. Also
+    /// the preemption store (Phase 2b): published pages are already captured
+    /// here, so preempt = free pages + requeue, resume = prefix-attach.
     prefix_state: crate::attention::Dsv4PrefixStatePool,
 }
 
@@ -2167,19 +2162,6 @@ impl Dsv4CudaExecutor {
             .map_err(|e| anyhow::anyhow!("DSv4 TP min-reduce {what} failed: {e}"))
     }
 
-    fn mirror_restore_pages(
-        &mut self,
-        slot: usize,
-        slot_pages: &[u32],
-        seq_len: usize,
-    ) -> Result<()> {
-        ensure!(
-            !slot_pages.is_empty(),
-            "DSv4 restore slot {slot} has empty host slot page table"
-        );
-        self.kv_adapter.mirror_slot_pages(slot, slot_pages, seq_len)
-    }
-
     pub(crate) fn from_dsv4_fp8_safetensors(
         model_path: impl AsRef<Path>,
         num_slots: usize,
@@ -2326,8 +2308,6 @@ impl Dsv4CudaExecutor {
             &layer_specs,
             model.kv_arena.page_block_size,
         );
-        let (park_budget, prefix_budget) =
-            Self::split_dram_share(default_t1_budget_bytes(DEFAULT_DRAM_FRACTION));
         Ok(Self {
             model,
             slots,
@@ -2340,25 +2320,11 @@ impl Dsv4CudaExecutor {
             mtp_rejects: 0,
             mtp_accept_ema: 1.0,
             mtp_skip_streak: 0,
-            slot_tier: CudaKvTierStore::with_budget(park_budget, BLOB_CHUNK_BYTES),
             prefix_state: crate::attention::Dsv4PrefixStatePool::new(
-                prefix_budget,
+                default_t1_budget_bytes(DEFAULT_DRAM_FRACTION),
                 prefix_entry_bytes,
             ),
         })
-    }
-
-    /// ONE `--kv-dram` share funds BOTH host stores — whole-slot park and
-    /// prefix-state pool split it 50/50, an explicit deterministic partition,
-    /// never two independent draws of the default fraction. Three tiers,
-    /// three independent questions: HBM sizes slots (`kv_budget_plan`), this
-    /// DRAM share sizes pool heat, `--kv-disk` alone sizes the spill.
-    /// Park's store is chunked at `BLOB_CHUNK_BYTES` — a naive 50/50 of a
-    /// small share zeroes park's chunk capacity, so park floors at one chunk
-    /// whenever the share can fund it.
-    fn split_dram_share(bytes: usize) -> (usize, usize) {
-        let park = (bytes / 2).max(BLOB_CHUNK_BYTES.min(bytes));
-        (park, bytes - park)
     }
 
     /// Publish every host page this forward completed for `slot` into the
@@ -2450,41 +2416,30 @@ impl Dsv4CudaExecutor {
         self.prefix_state.confirm_pages(pages);
     }
 
-    /// Attach the opt-in NVMe disk spill level (pre-serve only) to BOTH host
-    /// stores, splitting the ONE `--kv-disk` cap the same way as the DRAM
-    /// share. The cap is soft for the prefix pool: over it, publish drops the
-    /// pool's oldest entries — capacity never blocks a forward and never
-    /// enters the reuse license.
+    /// Attach the opt-in NVMe disk spill level (pre-serve only). The whole
+    /// `--kv-disk` cap funds the prefix pool (Phase 2b deleted the whole-slot
+    /// park store). The cap is soft: over it, publish drops the pool's oldest
+    /// entries — capacity never blocks a forward and never enters the reuse
+    /// license.
     pub(crate) fn set_kv_tier_disk(
         &mut self,
         root: std::path::PathBuf,
         budget_bytes: usize,
     ) -> bool {
-        let (park_disk, prefix_disk) = Self::split_dram_share(budget_bytes);
-        let park_ok = self
-            .slot_tier
-            .set_disk(root.clone(), park_disk, BLOB_CHUNK_BYTES);
-        let prefix_ok = self.prefix_state.set_disk(root, prefix_disk);
-        if !park_ok || !prefix_ok {
-            warn!("DSv4 --kv-disk attach incomplete: park={park_ok} prefix={prefix_ok}");
-        }
-        park_ok && prefix_ok
+        self.prefix_state.set_disk(root, budget_bytes)
     }
 
-    /// Pre-serve re-budget rebuilds THE stores, orphaning every stored blob.
-    /// The share is split across both stores — see [`Self::split_dram_share`].
+    /// Pre-serve re-budget: the whole `--kv-dram` share funds the prefix pool.
     pub(crate) fn set_kv_tier_budget_bytes(&mut self, bytes: usize) {
-        let (park_budget, prefix_budget) = Self::split_dram_share(bytes);
-        self.slot_tier = CudaKvTierStore::with_budget(park_budget, BLOB_CHUNK_BYTES);
-        self.prefix_state.set_budget_bytes(prefix_budget);
+        self.prefix_state.set_budget_bytes(bytes);
     }
 
     pub(crate) fn kv_tier_host_demoted_pages(&self) -> usize {
-        self.slot_tier.host_demoted_pages() + self.prefix_state.host_pages()
+        self.prefix_state.host_pages()
     }
 
     pub(crate) fn kv_tier_disk_pages(&self) -> usize {
-        self.slot_tier.disk_pages() + self.prefix_state.disk_pages()
+        self.prefix_state.disk_pages()
     }
 
     /// Content-keyed reuse license (#154 Phase 2): a leading page is
@@ -2574,94 +2529,6 @@ impl Dsv4CudaExecutor {
             matched_len,
             page_tokens,
         )
-    }
-
-    /// Whole-slot swap is rank-local bytes plus TP-wide scalar consensus.
-    pub(crate) fn kv_slot_tier_enabled(&self) -> bool {
-        true
-    }
-
-    /// Demote `slot`'s entire device state into the tier store under the
-    /// engine-minted `key`. Contract (see
-    /// `infer_seam::BackendExecutor::demote_slot`): the copy is complete
-    /// before returning — `swap_out_image` ends in `ctx.sync()` — so the
-    /// engine may free the slot immediately. `Ok(false)` = no room on some
-    /// rank (engine falls back to plain recompute). Exactly TWO collectives
-    /// on every path (capture consensus, insert consensus), so the lockstep
-    /// collective count is rank-invariant.
-    pub(crate) fn demote_slot(&mut self, slot: usize, key: u64) -> Result<bool> {
-        ensure!(
-            slot < self.num_slots,
-            "DSv4 demote slot {slot} outside executor slots {}",
-            self.num_slots
-        );
-        let image = self.slots[slot].swap_out_image(&self.model.ctx, &self.kv_adapter);
-        let capture_ok = usize::from(image.is_ok());
-        if self.tp_min_usize(capture_ok, "slot demote capture")? == 0 {
-            return Err(image
-                .err()
-                .unwrap_or_else(|| anyhow::anyhow!("peer rank failed DSv4 slot demote capture")));
-        }
-        let bytes = image?.to_bytes();
-        let inserted = self
-            .slot_tier
-            .insert_chunked(NS_SLOT, NS_SLOT_CHUNK, key, &bytes);
-        if self.tp_min_usize(usize::from(inserted), "slot demote insert")? == 0 {
-            if inserted {
-                self.slot_tier.remove_chunked(NS_SLOT, NS_SLOT_CHUNK, key);
-            }
-            return Ok(false);
-        }
-        Ok(true)
-    }
-
-    /// Restore the whole-slot snapshot stored under `key` into `slot`. The engine
-    /// resumes decode at the demoted position right after this returns, and
-    /// drops the entry via [`Self::drop_kv_slot_entries`] — the entry
-    /// intentionally stays in the store here. `swap_in_image` ends in
-    /// `ctx.sync()`, so both the device restore and the spec-hidden H2D (same
-    /// stream, ordered before it) are complete before the host image can be
-    /// dropped. Exactly TWO collectives on every path (read+parse consensus,
-    /// restore consensus) — nothing rank-local errs between them.
-    pub(crate) fn promote_slot(&mut self, key: u64, slot: usize, slot_pages: &[u32]) -> Result<()> {
-        ensure!(
-            slot < self.num_slots,
-            "DSv4 promote slot {slot} outside executor slots {}",
-            self.num_slots
-        );
-        let image = self
-            .slot_tier
-            .read_chunked(NS_SLOT, NS_SLOT_CHUNK, key)
-            .and_then(|bytes| {
-                crate::dsv4::Dsv4SlotSnapshot::from_bytes(&bytes)
-                    .map_err(|e| anyhow::anyhow!("DSv4 promote slot: {e:#}"))
-            });
-        let image_ok = usize::from(image.is_ok());
-        if self.tp_min_usize(image_ok, "slot promote read")? == 0 {
-            return Err(image
-                .err()
-                .unwrap_or_else(|| anyhow::anyhow!("peer rank failed DSv4 slot promote read")));
-        }
-        let image = image?;
-        let restored = self
-            .mirror_restore_pages(slot, slot_pages, image.seq_len())
-            .and_then(|()| {
-                self.spec_slots[slot] = Dsv4SpecSlotState::default();
-                self.slots[slot].swap_in_image(&self.model.ctx, &mut self.kv_adapter, &image)
-            });
-        let restore_ok = usize::from(restored.is_ok());
-        if self.tp_min_usize(restore_ok, "slot promote restore")? == 0 {
-            return Err(restored
-                .err()
-                .unwrap_or_else(|| anyhow::anyhow!("peer rank failed DSv4 slot promote restore")));
-        }
-        restored
-    }
-
-    pub(crate) fn drop_kv_slot_entries(&mut self, keys: &[u64]) {
-        for &key in keys {
-            self.slot_tier.remove_chunked(NS_SLOT, NS_SLOT_CHUNK, key);
-        }
     }
 
     /// `BackendExecutor::tp_sync_min` — see there for why the scheduler needs
