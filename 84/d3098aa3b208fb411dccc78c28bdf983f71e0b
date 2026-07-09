@@ -1,0 +1,21 @@
+scripts/opd_security_filter.py
+  s_9909d04362af6f::t_3df28d19a37a31 1-154
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "84d3098aa3b208fb411dccc78c28bdf983f71e0b",
+  "prompts": {},
+  "sessions": {
+    "s_9909d04362af6f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a3db630ee27e3d103",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
