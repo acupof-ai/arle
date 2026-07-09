@@ -468,19 +468,22 @@ impl RealCudaExecutor {
 
     /// Capture the page-radix sidecar for `slot` at the just-published prefix
     /// `tokens[..matched_len]`. Qwen3.5/3.6 hybrid stores recurrent + full-attn
-    /// KV atomically into the tier; DSv4 confirms the pages' pool entries
-    /// (radix retention makes their ids recycle-proof); no-op for Qwen3.
+    /// KV atomically into the tier; DSv4 confirms ONLY the newly-cached pages'
+    /// pool entries (radix retention makes those ids recycle-proof — a deduped
+    /// page frees and recycles, so confirming it would leave a stale confirmed
+    /// entry under a reusable id); no-op for Qwen3.
     pub(crate) fn save_prefix_sidecar(
         &mut self,
         slot: usize,
         tokens: &[u32],
         matched_len: usize,
         prefix_pages: &[u32],
+        newly_cached: &[u32],
     ) -> Result<()> {
         match self {
             Self::Qwen35(q) => q.save_recurrent_sidecar(slot, tokens, matched_len, prefix_pages),
             Self::Dsv4(d) => {
-                d.confirm_prefix_pages(prefix_pages);
+                d.confirm_prefix_pages(newly_cached);
                 Ok(())
             }
             Self::Qwen(_) => Ok(()),
@@ -495,6 +498,15 @@ impl RealCudaExecutor {
             Self::Qwen35(q) => q.release_sidecar_pages(pages),
             Self::Dsv4(d) => d.release_prefix_pages(pages),
             Self::Qwen(_) => {}
+        }
+    }
+
+    /// A slot's pages returned to the free pool: DSv4 drops their provisional
+    /// (never-confirmed) pool entries so a recycled id can't resurrect stale
+    /// content; no-op elsewhere.
+    pub(crate) fn release_provisional_prefix_pages(&mut self, pages: &[u32]) {
+        if let Self::Dsv4(d) = self {
+            d.release_provisional_prefix_pages(pages);
         }
     }
 
@@ -2136,6 +2148,28 @@ fn validate_dsv4_prefill_kv_view(
     Ok(())
 }
 
+/// TEMP (#154 Phase 2a E2 probe): env-gated (`ARLE_DSV4_PREFIX_PROBE=1`),
+/// rank-0-only entry fingerprints at publish and restore. Removed once the
+/// E2 root cause is verified.
+fn dsv4_prefix_probe(
+    rank: usize,
+    tag: &str,
+    page_id: u32,
+    page_index: usize,
+    boundary: bool,
+    entry: &crate::attention::Dsv4PrefixPageEntry,
+) {
+    use std::io::Write;
+    if rank != 0 || std::env::var_os("ARLE_DSV4_PREFIX_PROBE").is_none() {
+        return;
+    }
+    let line = format!(
+        "DSV4_PFXPROBE {tag} page={page_id} idx={page_index} boundary={boundary} {}\n",
+        entry.debug_fingerprint()
+    );
+    let _ = std::io::stderr().write_all(line.as_bytes());
+}
+
 impl std::fmt::Debug for Dsv4CudaExecutor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Dsv4CudaExecutor")
@@ -2311,7 +2345,6 @@ impl Dsv4CudaExecutor {
             .collect();
         let prefix_entry_bytes = crate::attention::dsv4_prefix_entry_max_bytes(
             &model.config,
-            &model.kv_arena,
             &layer_specs,
             model.kv_arena.page_block_size,
         );
@@ -2342,8 +2375,11 @@ impl Dsv4CudaExecutor {
     /// never two independent draws of the default fraction. Three tiers,
     /// three independent questions: HBM sizes slots (`kv_budget_plan`), this
     /// DRAM share sizes pool heat, `--kv-disk` alone sizes the spill.
+    /// Park's store is chunked at `BLOB_CHUNK_BYTES` — a naive 50/50 of a
+    /// small share zeroes park's chunk capacity, so park floors at one chunk
+    /// whenever the share can fund it.
     fn split_dram_share(bytes: usize) -> (usize, usize) {
-        let park = bytes / 2;
+        let park = (bytes / 2).max(BLOB_CHUNK_BYTES.min(bytes));
         (park, bytes - park)
     }
 
@@ -2365,6 +2401,9 @@ impl Dsv4CudaExecutor {
             return;
         }
         let align = self.model.config.sliding_window.max(1);
+        // Phase 1: enqueue every page's D2H clones (stream-ordered, no sync).
+        let mut captured: Vec<(u32, usize, bool, crate::attention::Dsv4PrefixPageEntry)> =
+            Vec::new();
         for page_index in (start_pos / page_tokens)..(end_pos / page_tokens) {
             let page_end = (page_index + 1) * page_tokens;
             let Some(&page_id) = slot_pages.get(page_index) else {
@@ -2376,28 +2415,49 @@ impl Dsv4CudaExecutor {
             };
             // Boundary sections exist only when the forward ended exactly here;
             // restore commits only at `align` multiples, so skip odd page ends.
+            // An MTP multi-token commit that CROSSES a boundary (page_end <
+            // end_pos) also skips: the overlap registers and the SW ring have
+            // already advanced past the boundary and are unrecoverable —
+            // correctness over coverage; the presence-check
+            // (`reusable_prefix_blocks`) simply won't commit there.
             let boundary = page_end == end_pos && page_end.is_multiple_of(align);
             match self.slots[slot].capture_prefix_page(
                 &self.model.ctx,
                 &self.model.layers,
                 &self.kv_adapter,
-                &self.model.kv_arena,
                 self.model.config.index_head_dim,
                 page_tokens,
                 page_index,
                 boundary,
             ) {
-                Ok(entry) => {
-                    if !self.prefix_state.publish(page_id, &entry) {
-                        warn!(
-                            "DSv4 prefix publish: pool refused host page {page_id} \
-                             (slot {slot} idx {page_index})"
-                        );
-                    }
-                }
+                Ok(entry) => captured.push((page_id, page_index, boundary, entry)),
                 Err(err) => {
                     warn!("DSv4 prefix publish failed for slot {slot} page {page_index}: {err:#}")
                 }
+            }
+        }
+        if captured.is_empty() {
+            return;
+        }
+        // Phase 2: ONE sync for the whole tick's clones, then publish.
+        if let Err(err) = self.model.ctx.sync() {
+            warn!("DSv4 prefix publish sync failed for slot {slot}: {err:#}");
+            return;
+        }
+        for (page_id, page_index, boundary, entry) in captured {
+            dsv4_prefix_probe(
+                self.model.tp.config().rank,
+                "pub",
+                page_id,
+                page_index,
+                boundary,
+                &entry,
+            );
+            if !self.prefix_state.publish(page_id, &entry) {
+                warn!(
+                    "DSv4 prefix publish: pool refused host page {page_id} \
+                     (slot {slot} idx {page_index})"
+                );
             }
         }
     }
@@ -2406,6 +2466,12 @@ impl Dsv4CudaExecutor {
     /// lifetime rides the radix, no independent lifetime above the DRAM budget).
     pub(crate) fn release_prefix_pages(&mut self, pages: &[u32]) {
         self.prefix_state.remove_pages(pages);
+    }
+
+    /// Slot free/abort returned these pages to the pool: drop provisional
+    /// entries only (see `Dsv4PrefixStatePool::remove_provisional_pages`).
+    pub(crate) fn release_provisional_prefix_pages(&mut self, pages: &[u32]) {
+        self.prefix_state.remove_provisional_pages(pages);
     }
 
     /// Radix publish confirmed these pages (engine `save_prefix_sidecar` arm):
@@ -2525,6 +2591,16 @@ impl Dsv4CudaExecutor {
             .iter()
             .map(|&page_id| self.prefix_state.read_entry(page_id))
             .collect::<Result<Vec<_>>>()?;
+        for (page_id, entry) in prefix_pages.iter().zip(&entries) {
+            dsv4_prefix_probe(
+                self.model.tp.config().rank,
+                "res",
+                *page_id,
+                entry.page_index as usize,
+                entry.boundary,
+                entry,
+            );
+        }
         self.kv_adapter.mirror_full_band(slot, matched_len)?;
         // A17: a restored occupant enters Decoding without a tail warm step
         // for its MTP chain; stale spec state belongs to the prior occupant.
@@ -2533,7 +2609,6 @@ impl Dsv4CudaExecutor {
             &self.model.ctx,
             &self.model.layers,
             &mut self.kv_adapter,
-            &self.model.kv_arena,
             self.model.config.index_head_dim,
             &entries,
             matched_len,
@@ -4651,7 +4726,7 @@ impl Qwen35CudaExecutor {
         let mut pt = crate::qwen35::dspark_phase_start(&self.model.ctx);
         // 1. Draft the block (draft-head-only; no trunk/pool state touched —
         //    the speculative noise K/V rows in the draft cache self-heal).
-        let (chain, q) = {
+        let chain = {
             let Self { model, dspark, .. } = self;
             let ds = dspark.as_mut().expect("dspark");
             let df = ds.slots[slot].as_mut().expect("seeded slot");
@@ -4729,8 +4804,9 @@ impl Qwen35CudaExecutor {
                 &mut slots[slot],
                 spec,
                 workspace,
+                &ds.head,
+                &mut ds.scratch,
                 &chain,
-                &q,
                 &logits,
                 start,
                 &row.params,
