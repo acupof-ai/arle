@@ -2012,6 +2012,9 @@ impl Qwen35Model {
             if seen.insert((weight.rows, weight.cols))
                 && warm_fp8_deepgemm_dense(&self.ctx, weight, warm_m)?
             {
+                // Also JIT-warm the spec-verify row count so the first DSpark
+                // block step doesn't compile DeepGEMM M=16 kernels in-request.
+                warm_fp8_deepgemm_dense(&self.ctx, weight, 16)?;
                 warmed += 1;
             }
             Ok(())
@@ -2222,20 +2225,26 @@ impl Qwen35Model {
     /// Unified with DSv4 through the infer-seam budget kernel; the affordable
     /// count is NCCL min-reduced for TP-consistent slot counts. Call AFTER
     /// weights load so `mem_get_info().free` already excludes them.
-    pub(crate) fn kv_budget_num_slots(&self, requested: usize) -> Result<usize> {
+    pub(crate) fn kv_budget_num_slots(
+        &self,
+        requested: usize,
+        extra_per_slot_bytes: usize,
+    ) -> Result<usize> {
         const MEM_FRACTION: f64 = 0.9;
         let (per_slot, kv_bytes, gdr_bytes, conv_bytes) = self.per_slot_kv_bytes();
+        let per_slot = per_slot.saturating_add(extra_per_slot_bytes);
         let affordable_local: i32 = match cudarc::driver::result::mem_get_info() {
             Ok((free, _total)) => {
                 // Same neutral kernel as DSv4: floor(free × fraction) / per_slot.
                 let budget = infer_seam::SlotBudget::from_free(free, MEM_FRACTION, 0, per_slot);
                 log::info!(
-                    "Qwen3.5 KV budget: free {}MB, per_slot {}MB (K+V {}MB + gdr {}MB + conv {}MB)",
+                    "Qwen3.5 KV budget: free {}MB, per_slot {}MB (K+V {}MB + gdr {}MB + conv {}MB + draft {}MB)",
                     free >> 20,
                     per_slot >> 20,
                     kv_bytes >> 20,
                     gdr_bytes >> 20,
                     conv_bytes >> 20,
+                    extra_per_slot_bytes >> 20,
                 );
                 budget
                     .affordable()
@@ -7354,7 +7363,16 @@ fn v_head_shard_range(name: &str, total_v_heads: usize, tp: &TpConfig) -> Result
 /// `ARLE_MTP_PHASE` is set (the per-phase sync needed for accurate GPU timing is
 /// opt-in, so the default spec-decode path pays nothing).
 fn mtp_phase_start(ctx: &DeviceContext) -> Option<std::time::Instant> {
-    if std::env::var("ARLE_MTP_PHASE").is_ok() {
+    phase_start(ctx, "ARLE_MTP_PHASE")
+}
+
+/// Same opt-in phase timer keyed on `ARLE_DSPARK_PHASE` (DSpark block step).
+pub(crate) fn dspark_phase_start(ctx: &DeviceContext) -> Option<std::time::Instant> {
+    phase_start(ctx, "ARLE_DSPARK_PHASE")
+}
+
+fn phase_start(ctx: &DeviceContext, var: &str) -> Option<std::time::Instant> {
+    if std::env::var(var).is_ok() {
         let _ = ctx.sync();
         Some(std::time::Instant::now())
     } else {
@@ -7363,7 +7381,7 @@ fn mtp_phase_start(ctx: &DeviceContext) -> Option<std::time::Instant> {
 }
 
 /// Sync + return ms since the last lap (or 0.0 when phase timing is off).
-fn mtp_phase_lap(ctx: &DeviceContext, t: &mut Option<std::time::Instant>) -> f64 {
+pub(crate) fn mtp_phase_lap(ctx: &DeviceContext, t: &mut Option<std::time::Instant>) -> f64 {
     match t {
         Some(prev) => {
             let _ = ctx.sync();

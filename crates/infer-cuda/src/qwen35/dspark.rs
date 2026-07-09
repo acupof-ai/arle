@@ -82,6 +82,17 @@ impl Qwen35DsparkHead {
     pub(crate) fn target_layer_ids(&self) -> &[i64] {
         &self.cfg.target_layer_ids
     }
+    /// Per-slot draft ctx K/V cache bytes ([`Qwen35DsparkSlotState`], lazily
+    /// allocated at first prefill) — reserved out of the KV budget so slot
+    /// admission and pool profiling account for them (else startup passes and
+    /// the first dspark prefill OOMs).
+    pub(crate) fn slot_state_bytes(&self) -> usize {
+        2 * self.cfg.num_hidden_layers
+            * self.cfg.num_key_value_heads
+            * self.cap
+            * self.cfg.head_dim
+            * std::mem::size_of::<bf16>()
+    }
     pub(crate) fn mode_label(&self) -> &'static str {
         match (
             self.cfg.next_token_heads,
@@ -630,11 +641,14 @@ impl Qwen35Model {
         let eps = cfg.rms_norm_eps;
         let kv_len_total = start + block;
 
+        let mut pt = super::dspark_phase_start(ctx);
+        let (mut prep_ms, mut attn_ms, mut mlp_ms) = (0.0f64, 0.0f64, 0.0f64);
         let mut ids = vec![cfg.mask_token_id as i32; block];
         ids[0] = anchor as i32;
         let ids_dev = scratch.ids.upload(ctx, &ids)?;
         let h = scratch.hidden.get(ctx, hidden, block)?;
         embedding_batch(ctx, &self.embed_tokens, ids_dev, h)?;
+        let embed_ms = super::mtp_phase_lap(ctx, &mut pt);
 
         let start_dev = scratch.start_pos.upload(&self.ctx, &[start as i32])?;
         for (li, layer) in head.layers.iter().enumerate() {
@@ -692,6 +706,7 @@ impl Qwen35Model {
                 }
             }
 
+            prep_ms += super::mtp_phase_lap(ctx, &mut pt);
             // Non-causal attention: every noise row attends the whole
             // `[ctx ++ block]` key range. Per-row launches with `seq_len=1` and
             // `kv_len = start+block` express the non-causal window through the
@@ -737,6 +752,7 @@ impl Qwen35Model {
                 }
             }
 
+            attn_ms += super::mtp_phase_lap(ctx, &mut pt);
             let attn_out_h = scratch.attn_out_h.get(ctx, hidden, block)?;
             gemm_batch(ctx, &layer.o_proj, attn_heads, attn_out_h)?;
             let hidden_mid = scratch.hidden_mid.get(ctx, hidden, block)?;
@@ -762,6 +778,7 @@ impl Qwen35Model {
                 mlp_out,
                 scratch.hidden.get(ctx, hidden, block)?,
             )?;
+            mlp_ms += super::mtp_phase_lap(ctx, &mut pt);
         }
 
         let final_normed = scratch.final_normed.get(ctx, hidden, block)?;
@@ -775,6 +792,7 @@ impl Qwen35Model {
         let vocab = self.output_projection().rows;
         let logits = scratch.logits.get(ctx, vocab, block)?;
         gemm_batch(ctx, self.output_projection(), final_normed, logits)?;
+        let head_ms = super::mtp_phase_lap(ctx, &mut pt);
 
         // Greedy left-to-right sampling. Next-token heads (DSpark) draft from
         // every row; same-position (DFlash) rows 1.. fill their own positions.
@@ -821,6 +839,12 @@ impl Qwen35Model {
             .chain(drafts.iter().copied())
             .take(drafts.len())
             .collect();
+        let argmax_ms = super::mtp_phase_lap(ctx, &mut pt);
+        if pt.is_some() {
+            eprintln!(
+                "[dspark-draft] embed={embed_ms:.2} prep={prep_ms:.2} attn={attn_ms:.2} mlp={mlp_ms:.2} head={head_ms:.2} argmax={argmax_ms:.2} ms"
+            );
+        }
         let keep = self.dspark_confident_prefix_len(head, scratch, &prev_tokens)?;
         drafts.truncate(keep.min(drafts.len()));
 
