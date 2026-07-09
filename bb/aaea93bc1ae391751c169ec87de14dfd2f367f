@@ -1,0 +1,35 @@
+crates/infer-cuda/src/attention.rs
+  s_bb974d20ff7814::t_fbfc538a2be406 7531,7608-7613,7638,7669,7883-7884,8324
+crates/infer-cuda/src/attention/kv_layout.rs
+  s_5f2cab45245fd9::t_195aaaffe22a95 2,84-91,94-95,99-100,861-862,864,870-873,892-895,948-953,1134-1135
+crates/infer-cuda/src/dsv4.rs
+  s_5f2cab45245fd9::t_767da4dcc63691 1150-1152,1871,1890,2977
+crates/infer-cuda/src/executor.rs
+  s_5f2cab45245fd9::t_0858ca50aa4c13 10,418,446,456,472,482,729,2330-2337,2831,2840
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "bbaaea93bc1ae391751c169ec87de14dfd2f367f",
+  "prompts": {},
+  "sessions": {
+    "s_5f2cab45245fd9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a107dc110b2bf604c",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_bb974d20ff7814": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ad32cb33ef5334634",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
