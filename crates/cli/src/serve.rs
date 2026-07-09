@@ -50,24 +50,6 @@ struct ServeConfig {
 }
 
 pub(crate) fn run_serve(args: &Args, serve_args: ServeArgs) -> ExitCode {
-    // CLI-fronted comm-backend knob, exported via env BEFORE the multiproc
-    // coordinator spawns workers (children inherit it) and before any engine
-    // build reads it (`TpRuntime::init_oneshot_comm`).
-    // SAFETY: single CLI thread, pre-spawn, pre-tokio.
-    unsafe {
-        std::env::set_var(
-            "ARLE_COMM_BACKEND",
-            match serve_args.comm_backend {
-                crate::args::ServeCommBackendArg::Auto => "auto",
-                crate::args::ServeCommBackendArg::Nccl => "nccl",
-            },
-        );
-    }
-    // Lower the Metal speculative-decode CLI flags into the env the Metal
-    // executor reads at construction (the executor also auto-resolves the
-    // Qwen3.6-27B NextN-MTP head when neither a flag nor env draft is given).
-    // CLI flag wins over a pre-existing env value; env is the fallback.
-    apply_metal_speculative_env(&serve_args);
     // Lower the probe flags into the env the CUDA executor reads at first use.
     // MUST run pre-spawn: multiproc TP rank children inherit the parent env
     // (env is the transport; flags are the only public interface).
@@ -96,56 +78,12 @@ pub(crate) fn run_serve(args: &Args, serve_args: ServeArgs) -> ExitCode {
     }
 }
 
-/// Lower the Metal speculative-decode flags into the env the `infer-metal`
-/// executor reads at construction. The flag is the authority; a pre-existing
-/// env value is the fallback (only overwritten when the corresponding flag is
-/// given). `--no-speculative` sets a disable marker that the executor honors
-/// before any auto-resolve, so it overrides both flags and env.
-///
-/// SAFETY: single CLI thread, pre-tokio, pre-engine-build (same contract as the
-/// `ARLE_COMM_BACKEND` export above).
-fn apply_metal_speculative_env(serve_args: &ServeArgs) {
-    // SAFETY: single CLI thread, pre-tokio, pre-engine-build (same contract as
-    // the `ARLE_COMM_BACKEND` export above).
-    unsafe {
-        if serve_args.no_speculative {
-            std::env::set_var("INFER_METAL_NO_SPECULATIVE", "1");
-            return;
-        }
-        std::env::remove_var("INFER_METAL_NO_SPECULATIVE");
-        // Acceptance width applies on both the explicit-draft and auto-resolve
-        // paths, so export it whenever speculation is active. Default 1 keeps the
-        // verify bit-identical to exact greedy.
-        std::env::set_var(
-            "INFER_METAL_DFLASH_ACCEPT_TOPK",
-            serve_args.spec_accept_topk.to_string(),
-        );
-        if let Some(draft) = serve_args
-            .draft_model
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            std::env::set_var("INFER_METAL_DFLASH_DRAFT_MODEL", draft);
-        }
-        // The depth flag defaults to 2; export it whenever a draft is active so
-        // the executor's resolver gets the CLI value (env stays the fallback for
-        // the auto-resolve-only path, where no draft flag was passed).
-        if serve_args.draft_model.is_some() {
-            std::env::set_var(
-                "INFER_METAL_DFLASH_TOKENS",
-                serve_args.speculative_tokens.to_string(),
-            );
-        }
-    }
-}
-
 /// Lower `--probe-out` / `--probe-lens-layers` / `--probe-token-entropy` into
 /// the `ARLE_PROBE_*` env the `infer-cuda` probe reads once (`OnceLock`). The
 /// path is absolutized so multiproc rank children resolve the same file.
 ///
 /// SAFETY: single CLI thread, pre-spawn, pre-tokio (same contract as the
-/// `ARLE_COMM_BACKEND` export above).
+/// env pre-spawn).
 fn apply_probe_env(serve_args: &ServeArgs) {
     let Some(path) = serve_args.probe_out.as_ref() else {
         return;
@@ -157,8 +95,8 @@ fn apply_probe_env(serve_args: &ServeArgs) {
             .map(|dir| dir.join(path))
             .unwrap_or_else(|_| path.clone())
     };
-    // SAFETY: single CLI thread, pre-spawn, pre-tokio (same contract as the
-    // `ARLE_COMM_BACKEND` export above).
+    // SAFETY: single CLI thread, pre-spawn, pre-tokio (children inherit the
+    // env pre-spawn).
     unsafe {
         std::env::set_var("ARLE_PROBE_JSONL", &abs);
         std::env::set_var(
@@ -542,6 +480,12 @@ fn resolve_engine_config(
     config.memory_budget_bytes = serve_args.memory_budget_bytes;
     config.system_reserve_bytes = serve_args.system_reserve_bytes;
     config.allow_swap = serve_args.allow_swap;
+    // Backend runtime toggles ride the engine config (multiproc worker ranks
+    // see only ARLE_WORKER_ENGINE_CONFIG, so flags must live here, not env).
+    config.cuda = serve_args.cuda_runtime_flags();
+    config.metal = serve_args.metal_runtime_flags();
+    config.diffusion_max_denoising_steps = serve_args.diffusion_max_denoising_steps;
+    config.vulkan_submit_cap = serve_args.vulkan_submit_cap;
 
     // A user-supplied --max-prompt-tokens above the total is a genuine
     // contradiction and stays a hard error. The built-in default cap, however,
@@ -1264,19 +1208,8 @@ mod tests {
     }
 
     #[test]
-    fn metal_speculative_env_lowers_flags_and_honors_no_spec() {
-        let _env = crate::test_env_lock();
-        // env is process-global, so this single test drives all three states in
-        // sequence (flag -> no-spec -> clean default) to stay self-contained.
-        let clear = || unsafe {
-            std::env::remove_var("INFER_METAL_DFLASH_DRAFT_MODEL");
-            std::env::remove_var("INFER_METAL_DFLASH_TOKENS");
-            std::env::remove_var("INFER_METAL_NO_SPECULATIVE");
-            std::env::remove_var("INFER_METAL_DFLASH_ACCEPT_TOPK");
-        };
-
-        // Explicit draft + depth: both env vars set from the flags.
-        clear();
+    fn metal_speculative_flags_ride_engine_config() {
+        // Explicit draft + depth + width map into MetalRuntimeFlags verbatim.
         let (_args, serve) = parse_serve(&[
             "arle",
             "serve",
@@ -1291,23 +1224,16 @@ mod tests {
             "--spec-accept-topk",
             "2",
         ]);
-        apply_metal_speculative_env(&serve);
+        let flags = serve.metal_runtime_flags();
+        assert!(flags.speculative);
         assert_eq!(
-            std::env::var("INFER_METAL_DFLASH_DRAFT_MODEL").as_deref(),
-            Ok("mlx-community/Qwen3.6-27B-MTP-4bit")
+            flags.draft_model.as_deref(),
+            Some("mlx-community/Qwen3.6-27B-MTP-4bit")
         );
-        assert_eq!(
-            std::env::var("INFER_METAL_DFLASH_TOKENS").as_deref(),
-            Ok("3")
-        );
-        assert_eq!(
-            std::env::var("INFER_METAL_DFLASH_ACCEPT_TOPK").as_deref(),
-            Ok("2")
-        );
-        assert!(std::env::var("INFER_METAL_NO_SPECULATIVE").is_err());
+        assert_eq!(flags.speculative_tokens, Some(3));
+        assert_eq!(flags.spec_accept_topk, 2);
 
-        // --no-speculative sets the disable marker and short-circuits.
-        clear();
+        // --no-speculative clears the master switch (auto-resolve suppressed).
         let (_args, serve) = parse_serve(&[
             "arle",
             "serve",
@@ -1317,39 +1243,21 @@ mod tests {
             "models/qwen36-27b",
             "--no-speculative",
         ]);
-        apply_metal_speculative_env(&serve);
-        assert_eq!(
-            std::env::var("INFER_METAL_NO_SPECULATIVE").as_deref(),
-            Ok("1")
-        );
-        assert!(std::env::var("INFER_METAL_DFLASH_DRAFT_MODEL").is_err());
-        assert!(
-            std::env::var("INFER_METAL_DFLASH_ACCEPT_TOPK").is_err(),
-            "--no-speculative short-circuits before exporting acceptance width"
-        );
+        let flags = serve.metal_runtime_flags();
+        assert!(!flags.speculative);
+        assert!(flags.draft_model.is_none());
 
-        // No spec flags: no draft is exported (auto-resolve path), the disable
-        // marker is cleared, and any pre-existing env draft survives as fallback.
-        clear();
-        unsafe { std::env::set_var("INFER_METAL_DFLASH_DRAFT_MODEL", "env-fallback-draft") };
+        // No spec flags: auto-resolve path — no explicit draft, no forced
+        // depth (the resolver's default applies), exact-greedy width 1.
         let (_args, serve) = parse_serve(&["arle", "serve", "--model-path", "models/qwen36-27b"]);
-        apply_metal_speculative_env(&serve);
-        assert!(std::env::var("INFER_METAL_NO_SPECULATIVE").is_err());
+        let flags = serve.metal_runtime_flags();
+        assert!(flags.speculative);
+        assert!(flags.draft_model.is_none());
         assert_eq!(
-            std::env::var("INFER_METAL_DFLASH_DRAFT_MODEL").as_deref(),
-            Ok("env-fallback-draft"),
-            "env draft must survive as the fallback when no flag is given"
+            flags.speculative_tokens, None,
+            "depth is not forced on the auto-resolve-only path"
         );
-        assert!(
-            std::env::var("INFER_METAL_DFLASH_TOKENS").is_err(),
-            "depth is not exported on the auto-resolve-only path"
-        );
-        assert_eq!(
-            std::env::var("INFER_METAL_DFLASH_ACCEPT_TOPK").as_deref(),
-            Ok("1"),
-            "acceptance width is always exported (default 1) when speculation is active"
-        );
-        clear();
+        assert_eq!(flags.spec_accept_topk, 1);
     }
 
     #[test]

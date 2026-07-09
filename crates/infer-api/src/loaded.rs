@@ -125,6 +125,21 @@ pub struct EngineLoadConfig {
     /// ignore it).
     #[serde(default = "default_dspark_conf_threshold")]
     pub dspark_conf_threshold: f32,
+    /// CUDA runtime toggles (CLI flags → `infer_cuda::apply_runtime_flags`
+    /// before executor construction; multiproc workers included).
+    #[serde(default)]
+    pub cuda: infer_seam::CudaRuntimeFlags,
+    /// Metal runtime toggles (CLI flags → `infer_metal::apply_runtime_flags`).
+    #[serde(default)]
+    pub metal: infer_seam::MetalRuntimeFlags,
+    /// `--diffusion-max-denoising-steps`: cap block-diffusion denoising steps
+    /// per row. `None` = checkpoint default.
+    #[serde(default)]
+    pub diffusion_max_denoising_steps: Option<usize>,
+    /// `--vulkan-submit-cap`: max compute dispatches per Vulkan command buffer
+    /// (TDR/latency safety valve). `None` = whole token in one submit.
+    #[serde(default)]
+    pub vulkan_submit_cap: Option<usize>,
 }
 
 fn default_dspark_conf_threshold() -> f32 {
@@ -180,6 +195,10 @@ impl Default for EngineLoadConfig {
             student_lora_alpha: default_student_lora_alpha(),
             dspark_draft_model: None,
             dspark_conf_threshold: default_dspark_conf_threshold(),
+            cuda: infer_seam::CudaRuntimeFlags::default(),
+            metal: infer_seam::MetalRuntimeFlags::default(),
+            diffusion_max_denoising_steps: None,
+            vulkan_submit_cap: None,
         }
     }
 }
@@ -1055,7 +1074,7 @@ mod backend {
             // Single-GPU CUDA load: dispatch by checkpoint kind (Qwen3 dense +
             // Qwen3.5/3.6 MoE; DSv4 is multi-GPU only and errors). `enable_cuda_graph`
             // (CLI --cuda-graph, default on) sets the decode-graph default;
-            // `INFER_CUDA_DECODE_GRAPH` overrides, `warmup` gates it off under TP/MoE.
+            // `--no-cuda-graph` controls it, `warmup` gates it off under TP/MoE.
             // Shares the engine builder with `router_cuda` via `cuda_serve_handle`.
             let (serve, tokenizer, model_id) = cuda_serve_handle(
                 model_path,
@@ -1211,6 +1230,9 @@ mod backend {
         if config.mtp_enabled() {
             anyhow::bail!("MTP speculative decode is only supported by the CUDA backend");
         }
+        // Flags land in the statics before executor construction (spec-decode
+        // resolver + pipeline/warmup/paged-read/sampling gates).
+        infer_metal::apply_runtime_flags(&config.metal);
         let metal_kv_dtype = infer_metal::MetalKvCacheDtype::resolve(config.kv_cache_dtype)?;
         let resolved = infer_metal::resolve_model_path(model_path)?;
         let tokenizer = OpenAiTokenizer::from_model_dir(&resolved)?;
@@ -1390,6 +1412,7 @@ mod backend {
             },
         )?;
         let cancel = shutdown.cancel_flag();
+        let max_denoising_steps = config.diffusion_max_denoising_steps.filter(|&s| s > 0);
 
         let serve = ServeHandle::spawn_with_engine_builder_and_shutdown(
             move || {
@@ -1397,11 +1420,12 @@ mod backend {
                     std::path::Path::new(&model_source),
                     Some(resource_plan),
                 )?;
-                let executor = BufferedDiffusionExecutor::new_with_cancel(
-                    loaded.model,
-                    loaded.generation,
-                    cancel,
-                );
+                let mut generation = loaded.generation;
+                if let Some(steps) = max_denoising_steps {
+                    generation.max_denoising_steps = steps;
+                }
+                let executor =
+                    BufferedDiffusionExecutor::new_with_cancel(loaded.model, generation, cancel);
                 let kv = HostPagedKvPool::new(1, total_pages, page_size);
                 if low_impact {
                     let governor = infer_seam::CooperativeGovernor::new(infer_seam::StepBudget {
@@ -1464,6 +1488,7 @@ mod backend {
             },
         )?;
         let cancel = shutdown.cancel_flag();
+        let max_denoising_steps = config.diffusion_max_denoising_steps.filter(|&s| s > 0);
 
         let serve = ServeHandle::spawn_with_engine_builder_and_shutdown(
             move || {
@@ -1478,11 +1503,12 @@ mod backend {
                         loaded.vision_soft_tokens_per_image
                     );
                 }
-                let executor = BufferedDiffusionExecutor::new_with_cancel(
-                    loaded.model,
-                    loaded.generation,
-                    cancel,
-                );
+                let mut generation = loaded.generation;
+                if let Some(steps) = max_denoising_steps {
+                    generation.max_denoising_steps = steps;
+                }
+                let executor =
+                    BufferedDiffusionExecutor::new_with_cancel(loaded.model, generation, cancel);
                 let kv = HostPagedKvPool::new(1, total_pages, page_size);
                 if low_impact {
                     let governor = infer_seam::CooperativeGovernor::new(infer_seam::StepBudget {
@@ -1549,6 +1575,7 @@ mod backend {
             },
         )?;
         let cancel = shutdown.cancel_flag();
+        let max_denoising_steps = config.diffusion_max_denoising_steps.filter(|&s| s > 0);
 
         let serve = ServeHandle::spawn_with_engine_builder_and_shutdown(
             move || {
@@ -1560,11 +1587,12 @@ mod backend {
                     "DeepSeek-OCR VLM loaded: image_token_id={}; Metal DeepEncoder soft-token bridge enabled",
                     loaded.image_token_id
                 );
-                let executor = BufferedDiffusionExecutor::new_with_cancel(
-                    loaded.model,
-                    loaded.generation,
-                    cancel,
-                );
+                let mut generation = loaded.generation;
+                if let Some(steps) = max_denoising_steps {
+                    generation.max_denoising_steps = steps;
+                }
+                let executor =
+                    BufferedDiffusionExecutor::new_with_cancel(loaded.model, generation, cancel);
                 let kv = HostPagedKvPool::new(1, total_pages, page_size);
                 if low_impact {
                     let governor = infer_seam::CooperativeGovernor::new(infer_seam::StepBudget {
@@ -1764,6 +1792,9 @@ mod backend {
         model_path: &str,
         config: &EngineLoadConfig,
     ) -> Result<infer_core::Engine<CudaExecutor, CudaKvPool>> {
+        // Single funnel for single-proc serve AND multiproc workers — flags
+        // land in the statics before any CUDA context/executor exists.
+        infer_cuda::apply_runtime_flags(&config.cuda);
         let kind = detect_cuda_model_kind(model_path)?;
         if matches!(kind, CudaModelKind::DiffusionGemma) {
             anyhow::bail!(
@@ -2346,6 +2377,9 @@ mod backend {
 
         if config.mtp_enabled() {
             anyhow::bail!("MTP speculative decode is only supported by the CUDA backend");
+        }
+        if let Some(cap) = config.vulkan_submit_cap {
+            infer_vulkan::forward::set_submit_cap(cap);
         }
         anyhow::ensure!(
             !config.kv_ssd_requested(),

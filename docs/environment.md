@@ -26,6 +26,53 @@ any other magic env var for runtime tuning. If you want an env-var
 escape hatch for a specific tuning knob, justify it as a debug aid and
 document the debug-only status here.
 
+**Converted to CLI flags (2026-07-10)** — these env vars no longer exist; the
+flag is the single surface (serve flags ride `EngineLoadConfig`, so multiproc
+workers see them; train flags apply via `train::apply_runtime_flags`):
+
+| Removed env var | Flag |
+| --- | --- |
+| `ARLE_QWEN35_DECODE_GRAPH` | `arle serve --qwen35-decode-graph` |
+| `ARLE_QWEN35_BATCHED_DECODE` | `arle serve --qwen35-batched-decode` |
+| `ARLE_QWEN35_BATCHED_DECODE_ATTENTION` | `arle serve --qwen35-batched-decode-attention` |
+| `ARLE_QWEN35_DEEPGEMM` | `arle serve --qwen35-deepgemm` |
+| `ARLE_QWEN35_MOE_DECODE_KERNEL` | `arle serve --qwen35-moe-decode-kernel` |
+| `ARLE_QWEN35_GPU_ROUTER` | `arle serve --qwen35-gpu-router` |
+| `ARLE_QWEN35_FA3` / `_FA3_DECODE` / `_FA3_DECODE_SPLITS` | `arle serve --qwen35-fa3` / `--qwen35-fa3-decode` / `--qwen35-fa3-decode-splits` |
+| `ARLE_QWEN35_GDR_CHUNKED` | `arle serve --qwen35-gdr-chunked` |
+| `INFER_CUDA_DECODE_GRAPH` | `arle serve --cuda-graph` / `--no-cuda-graph` (env override removed) |
+| `INFER_DECODE_METADATA_FAST_PAGE16` | `arle serve --decode-metadata-fast-page16` |
+| `INFER_MARLIN_W4_FP8_PREFILL` | `arle serve --marlin-w4-fp8-prefill` |
+| `ARLE_CUDA_MEMPOOL_RETAIN` | `arle serve --cuda-mempool-retain` |
+| `ARLE_CUDA_SHARD_CACHE_BYTES` | `arle serve --shard-cache-bytes` |
+| `ARLE_NUMA_PIN` | `arle serve --numa-pin` |
+| `ARLE_COMM_BACKEND` | `arle serve --comm-backend` (already existed; env transport removed) |
+| `ARLE_DSV4_FLASHMLA_DECODE` | `arle serve --dsv4-flashmla-decode` |
+| `ARLE_DSV4_DSA_INDEXER_SMS` | `arle serve --dsv4-dsa-indexer-sms` |
+| `ARLE_DSV4_MOE_CONTIG_DECODE` | `arle serve --dsv4-moe-contig-decode` (A/B harness: `infer_cuda::set_dsv4_moe_contig_decode`) |
+| `ARLE_DSV4_MTP_ADAPTIVE` / `ARLE_DSV4_MTP_MIN_ACCEPT` | `arle serve --mtp-adaptive` / `--mtp-min-accept` |
+| `ARLE_DSV4_DEEPEP_NUM_SMS` | `arle serve --deepep-num-sms` |
+| `ARLE_DSV4_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK` | `arle serve --deepep-max-dispatch-tokens-per-rank` (SGLANG env still honored when unset) |
+| `INFER_METAL_PIPELINE` / `_WARMUP` / `_PAGED_KV_READ` / `_HOST_SAMPLING` | `arle serve --metal-pipeline` / `--metal-warmup` / `--metal-paged-kv-read` / `--metal-host-sampling` |
+| `INFER_METAL_NO_SPECULATIVE` / `_DFLASH_DRAFT_MODEL` / `_DFLASH_TOKENS` / `_DFLASH_ACCEPT_TOPK` | `arle serve --no-speculative` / `--draft-model` / `--speculative-tokens` / `--spec-accept-topk` (env transport removed; flags ride `EngineLoadConfig.metal`) |
+| `DFLASH_DRAFT_MASK` | removed (rewrite path is mask=none only) |
+| `ARLE_DIFFUSION_MAX_DENOISING_STEPS` | `arle serve --diffusion-max-denoising-steps` |
+| `ARLE_SUBMIT_CAP` | `arle serve --vulkan-submit-cap` |
+| `ARLE_OPD_WRITEBACK_OFFLOAD` | `arle train <opd> --writeback-offload` |
+| `ARLE_OPD_ENGINE_OFFLOAD` | `arle train <opd> --engine-offload off\|all\|student\|teacher` |
+| `ARLE_OPD_GRADIENT_CHECKPOINTING` | `arle train <opd> --gradient-checkpointing` |
+| `ARLE_OPD_CHECKPOINT_OFFLOAD_MIN_BYTES` | `arle train <opd> --checkpoint-offload-min-bytes` |
+| `ARLE_OPD_TRIM_BEFORE_BACKWARD` / `_TRIM_AFTER_WRITEBACK` / `_TRIM_AFTER_CHECKPOINT_REPLAY` | `arle train <opd> --trim-before-backward` / `--trim-after-writeback` / `--trim-after-checkpoint-replay` |
+| `ARLE_OPD_ROLLOUT_RETAIN_INTERVAL` / `_ROLLOUT_PROGRESS_INTERVAL` | `arle train <opd> --rollout-retain-interval` / `--rollout-progress-interval` |
+| `ARLE_OPD_MOE_LORA_BWD_EXPERT_TILE` / `_LORA_LINEAR_BWD_TILE_ROWS` | `arle train <opd> --moe-lora-bwd-expert-tile` / `--lora-linear-bwd-tile-rows` |
+| `ARLE_OPD_WRITEBACK_FROZEN_PROMPT_KV` | `arle train <opd> --writeback-frozen-prompt-kv` |
+| `ARLE_OPD_LEGACY_LORA_LINEAR_BWD` / `_LEGACY_SDPA_BWD` | `arle train <opd> --legacy-lora-linear-bwd` / `--legacy-sdpa-bwd` |
+| `ARLE_GDR_CHUNKWISE_PREFILL` / `ARLE_LA_BACKWARD_MONO` / `ARLE_AUTOGRAD_DECODE_ATTN_LEGACY` | `arle train <opd> --gdr-chunkwise-prefill` / `--la-backward-mono` / `--autograd-decode-attn-legacy` |
+
+Deferred (read site inside frozen DSv4 files this pass):
+`ARLE_DSV4_SPEC_DECODE`, `ARLE_DSV4_DECODE_GRAPH`, `ARLE_DSV4_WHOLE_STEP_GRAPH`,
+`ARLE_DSV4_MOE_TRANSPORT`/`ARLE_DSV4_MOE_BACKEND`, `ARLE_DSV4_LM_HEAD_SHARD`.
+
 ---
 
 ## 1. Naming Rule
@@ -200,8 +247,9 @@ reports the actual split between prompt prefill, denoise work, host scalar sync,
 self-conditioning, and final canvas commit. Set it to `0`, `false`, `off`, or
 `no` to suppress the line for clean operator logs or pure wall-clock benchmarks.
 
-`ARLE_DIFFUSION_MAX_DENOISING_STEPS=N` overrides the checkpoint's max denoise
-step budget for explicit speed/quality profiles. Lower values can improve
+The max denoise step budget is a CLI flag:
+`arle serve --diffusion-max-denoising-steps N` (replaced
+`ARLE_DIFFUSION_MAX_DENOISING_STEPS`, 2026-07-10). Lower values can improve
 output tok/s but are not a quality-preserving default unless separately gated.
 
 ```bash
@@ -209,7 +257,7 @@ ARLE_DIFFUSION_CPP_PROFILE=0 ./target/release/arle \
   --model-path mlx-community/diffusiongemma-26B-A4B-it-4bit \
   --max-tokens 64 --non-interactive run --prompt "Say hi" --no-tools
 
-ARLE_DIFFUSION_MAX_DENOISING_STEPS=4 ./target/release/arle serve \
+./target/release/arle serve --diffusion-max-denoising-steps 4 \
   --backend metal \
   --model-path mlx-community/diffusiongemma-26B-A4B-it-4bit
 ```
@@ -357,7 +405,7 @@ as diagnostics and validation gates, not stable tuning API.
 | `ARLE_CUDA_KERNELS_PREBUILT_DIR` | path | unset | Build-time fast path for CUDA kernel artifacts. The directory must contain `libkernels_cuda.a` and `libtilelang_kernels_aot.a`; when set, `crates/cuda-kernels/build.rs` links those archives and skips all `nvcc` and TileLang AOT work. If the directory also contains `arle_deepep_sidecar`, the sidecar path is baked into the binary. Keep the artifact key tied to CUDA toolkit, SM list, feature flags, TileLang version, DeepGEMM root, and the `crates/cuda-kernels` source hash. Produce a pack from a built target tree with `scripts/export_prebuilt_cuda_kernels.sh <dest>`; the consumer key is `arle-cuda-kernels.manifest`, with `manifest.json` kept as human-readable provenance. |
 | `ARLE_DEEPEP_SIDECAR_PREBUILT` | path | unset | Build-time fast path for only the ARLE DeepEP sidecar binary. When set, `crates/cuda-kernels/build.rs` bakes this path into `ARLE_DEEPEP_SIDECAR_PATH` and skips sidecar compilation even if `ARLE_DEEPEP_DIR` is set. |
 | `ARLE_CUDA_KERNEL_SET` | `full`, `dsv4_flash` | `full` | Build-time kernel-set selector. `dsv4_flash` keeps native CUDA C + FlashMLA compilation but replaces non-DSv4 TileLang AOT families with `CUDA_ERROR_NOT_SUPPORTED` stubs so DSv4-Flash builds do not pay Qwen/GDR TileLang AOT cost or fail on unrelated TileLang kernels. Use only for DSv4-Flash validation binaries. |
-| `ARLE_CUDA_ENABLE_FLASHMLA_DECODE` | `1`, unset | unset | Build-time opt-in for vendored FlashMLA sparse-FP8 decode instantiations. Leave unset on CUDA 12.5 H20 builds: those headers do not provide `__nv_fp8_e8m0`, and the runtime decode path is default-off behind `ARLE_DSV4_FLASHMLA_DECODE`. Sparse prefill still builds when FlashMLA is enabled. |
+| `ARLE_CUDA_ENABLE_FLASHMLA_DECODE` | `1`, unset | unset | Build-time opt-in for vendored FlashMLA sparse-FP8 decode instantiations. Leave unset on CUDA 12.5 H20 builds: those headers do not provide `__nv_fp8_e8m0`, and the runtime decode path is controlled by the `--dsv4-flashmla-decode` flag. Sparse prefill still builds when FlashMLA is enabled. |
 | `ARLE_CUDA_DISABLE_FLASHMLA_DECODE` | `1`, unset | unset | Build-time kill switch for FlashMLA sparse-FP8 decode compilation. Decode FFI symbols are satisfied by stubs while sparse prefill can remain enabled. |
 | `ARLE_NVCC_WRAPPER` | command | unset | Optional wrapper for CUDA compilation in `crates/cuda-kernels/build.rs` and `crates/deepep-sys/build.rs`. Typical value: `sccache`, which runs `sccache /usr/local/cuda/bin/nvcc ...`. |
 | `ARLE_NVCC_SPLIT_COMPILE` | integer | unset | Optional `nvcc --split-compile=<N>` value for CUDA compilation in `crates/cuda-kernels/build.rs` and `crates/deepep-sys/build.rs`. Use a bounded value such as `8` or `16` on high-core build hosts; unset preserves the current nvcc behavior. |

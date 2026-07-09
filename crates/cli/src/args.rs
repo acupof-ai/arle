@@ -712,8 +712,8 @@ pub(crate) struct ServeArgs {
 
     /// Metal speculative-decode draft head (HF id or local dir). When set, the
     /// Metal backend drafts with this NextN/MTP head and verifies on the base
-    /// (bit-identical to greedy). Overrides the `INFER_METAL_DFLASH_DRAFT_MODEL`
-    /// env fallback. Auto-resolved for Qwen3.6-27B unless `--no-speculative`.
+    /// (bit-identical to greedy). Auto-resolved for Qwen3.6-27B unless
+    /// `--no-speculative`.
     #[arg(long, value_name = "HF_ID_OR_PATH")]
     pub(crate) draft_model: Option<String>,
 
@@ -760,6 +760,122 @@ pub(crate) struct ServeArgs {
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set, value_name = "BOOL")]
     pub(crate) probe_token_entropy: bool,
 
+    // ── CUDA runtime toggles (EngineLoadConfig.cuda; defaults = shipped behavior) ──
+    /// Whole-step Qwen3.5/3.6 decode graph (opt-in until the pod license).
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set, value_name = "BOOL")]
+    pub(crate) qwen35_decode_graph: bool,
+
+    /// Batched rows>1 Qwen3.5/3.6 decode; false = sequential per-row A/B arm.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set, value_name = "BOOL")]
+    pub(crate) qwen35_batched_decode: bool,
+
+    /// Batched decode attention kernel; false = per-row attention A/B arm.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set, value_name = "BOOL")]
+    pub(crate) qwen35_batched_decode_attention: bool,
+
+    /// DeepGEMM grouped expert GEMMs (read at load: builds grouped weight caches).
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set, value_name = "BOOL")]
+    pub(crate) qwen35_deepgemm: bool,
+
+    /// Decode-band batch grouped MoE kernels; false = hand batch kernels A/B arm.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set, value_name = "BOOL")]
+    pub(crate) qwen35_moe_decode_kernel: bool,
+
+    /// On-device MoE router; false = host `infer_moe::route` reference.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set, value_name = "BOOL")]
+    pub(crate) qwen35_gpu_router: bool,
+
+    /// FA3 full-attention prefill (silently in-tree on stub builds).
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set, value_name = "BOOL")]
+    pub(crate) qwen35_fa3: bool,
+
+    /// FA3 split-KV decode (ignored while the decode graph is on).
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set, value_name = "BOOL")]
+    pub(crate) qwen35_fa3_decode: bool,
+
+    /// FA3 decode split count (clamped to [2, 256]).
+    #[arg(long, default_value_t = 8, value_name = "N")]
+    pub(crate) qwen35_fa3_decode_splits: usize,
+
+    /// FlashQLA chunked GDN prefill (sm_90a baked Qwen3.6 shard only).
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set, value_name = "BOOL")]
+    pub(crate) qwen35_gdr_chunked: bool,
+
+    /// Fast page-16 decode-metadata kernel path.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set, value_name = "BOOL")]
+    pub(crate) decode_metadata_fast_page16: bool,
+
+    /// Marlin W4 FP8 prefill weights at load.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set, value_name = "BOOL")]
+    pub(crate) marlin_w4_fp8_prefill: bool,
+
+    /// Retain the cuMemAllocAsync pool across syncs (caching allocator).
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set, value_name = "BOOL")]
+    pub(crate) cuda_mempool_retain: bool,
+
+    /// Safetensor shard read-ahead cache budget in bytes (unset = built-in default).
+    #[arg(long, value_name = "BYTES")]
+    pub(crate) shard_cache_bytes: Option<usize>,
+
+    /// Pin multi-rank CUDA workers to their GPU's NUMA node.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set, value_name = "BOOL")]
+    pub(crate) numa_pin: bool,
+
+    /// DSv4 FlashMLA sparse decode; unset = default (on when compiled in),
+    /// false = eager scalar fallback (A/B lever).
+    #[arg(long, value_name = "BOOL")]
+    pub(crate) dsv4_flashmla_decode: Option<bool>,
+
+    /// DSv4 DSA indexer SM budget.
+    #[arg(long, default_value_t = 78, value_name = "N")]
+    pub(crate) dsv4_dsa_indexer_sms: usize,
+
+    /// DSv4 contiguous-decode MoE path (KILLED as default; A/B lever).
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set, value_name = "BOOL")]
+    pub(crate) dsv4_moe_contig_decode: bool,
+
+    /// Adaptive MTP gate at B=1: skip speculation below the accept break-even.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set, value_name = "BOOL")]
+    pub(crate) mtp_adaptive: bool,
+
+    /// Minimum accept-rate EMA to keep speculating under --mtp-adaptive.
+    #[arg(long, default_value_t = 0.55, value_name = "F")]
+    pub(crate) mtp_min_accept: f32,
+
+    /// DeepEP intranode SM budget (positive, even).
+    #[arg(long, default_value_t = 20, value_name = "N")]
+    pub(crate) deepep_num_sms: u32,
+
+    /// DeepEP LL per-rank dispatch-token cap (unset = SGLANG env or 256).
+    #[arg(long, value_name = "N")]
+    pub(crate) deepep_max_dispatch_tokens_per_rank: Option<u32>,
+
+    // ── Metal runtime toggles (EngineLoadConfig.metal) ──
+    /// Overlapped c=1 greedy decode pipeline.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set, value_name = "BOOL")]
+    pub(crate) metal_pipeline: bool,
+
+    /// Load-time JIT warmup forward.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set, value_name = "BOOL")]
+    pub(crate) metal_warmup: bool,
+
+    /// Paged-prefix SDPA read path for single-token decode.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set, value_name = "BOOL")]
+    pub(crate) metal_paged_kv_read: bool,
+
+    /// Host (blocking D2H) non-greedy sampler; false = device greedy argmax.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set, value_name = "BOOL")]
+    pub(crate) metal_host_sampling: bool,
+
+    /// Cap block-diffusion denoising steps per row (unset = checkpoint default).
+    #[arg(long, value_name = "N")]
+    pub(crate) diffusion_max_denoising_steps: Option<usize>,
+
+    /// Max compute dispatches per Vulkan command buffer (TDR/latency safety
+    /// valve; unset = whole token in one submit).
+    #[arg(long, value_name = "N")]
+    pub(crate) vulkan_submit_cap: Option<usize>,
+
     /// Additional engine-pool model metadata to expose from the serving control plane.
     ///
     /// Format: `id=path[,type=text-generation|embedding|reranker][,aliases=a|b][,pinned=true][,memory_bytes=N][,ttl_secs=N]`.
@@ -776,6 +892,58 @@ pub(crate) struct ServeArgs {
     /// argument".
     #[arg(last = true, allow_hyphen_values = true)]
     pub(crate) extra_args: Vec<String>,
+}
+
+impl ServeArgs {
+    /// CUDA runtime toggles for `EngineLoadConfig.cuda`.
+    pub(crate) fn cuda_runtime_flags(&self) -> infer_api::CudaRuntimeFlags {
+        infer_api::CudaRuntimeFlags {
+            qwen35_decode_graph: self.qwen35_decode_graph,
+            qwen35_batched_decode: self.qwen35_batched_decode,
+            qwen35_batched_decode_attention: self.qwen35_batched_decode_attention,
+            qwen35_deepgemm: self.qwen35_deepgemm,
+            qwen35_moe_decode_kernel: self.qwen35_moe_decode_kernel,
+            qwen35_gpu_router: self.qwen35_gpu_router,
+            qwen35_fa3: self.qwen35_fa3,
+            qwen35_fa3_decode: self.qwen35_fa3_decode,
+            qwen35_fa3_decode_splits: self.qwen35_fa3_decode_splits,
+            qwen35_gdr_chunked: self.qwen35_gdr_chunked,
+            decode_metadata_fast_page16: self.decode_metadata_fast_page16,
+            marlin_w4_fp8_prefill: self.marlin_w4_fp8_prefill,
+            mempool_retain: self.cuda_mempool_retain,
+            shard_cache_bytes: self.shard_cache_bytes,
+            numa_pin: self.numa_pin,
+            comm_backend: match self.comm_backend {
+                ServeCommBackendArg::Auto => infer_api::CommBackend::Auto,
+                ServeCommBackendArg::Nccl => infer_api::CommBackend::Nccl,
+            },
+            dsv4_flashmla_decode: self.dsv4_flashmla_decode,
+            dsv4_dsa_indexer_sms: self.dsv4_dsa_indexer_sms,
+            dsv4_moe_contig_decode: self.dsv4_moe_contig_decode,
+            mtp_adaptive: self.mtp_adaptive,
+            mtp_min_accept: self.mtp_min_accept,
+            deepep_num_sms: self.deepep_num_sms,
+            deepep_max_dispatch_tokens_per_rank: self.deepep_max_dispatch_tokens_per_rank,
+        }
+    }
+
+    /// Metal runtime toggles for `EngineLoadConfig.metal`. The speculative
+    /// fields ride here (not env) so the executor's resolver sees the flags.
+    pub(crate) fn metal_runtime_flags(&self) -> infer_api::MetalRuntimeFlags {
+        infer_api::MetalRuntimeFlags {
+            pipeline: self.metal_pipeline,
+            warmup: self.metal_warmup,
+            paged_kv_read: self.metal_paged_kv_read,
+            host_sampling: self.metal_host_sampling,
+            speculative: !self.no_speculative,
+            draft_model: self.draft_model.clone(),
+            speculative_tokens: self
+                .draft_model
+                .is_some()
+                .then_some(self.speculative_tokens),
+            spec_accept_topk: i32::try_from(self.spec_accept_topk).unwrap_or(i32::MAX),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -806,6 +974,124 @@ pub(crate) enum ServeKvCacheDtypeArg {
     Fp8,
     /// Trellis 4-bit paged KV — CUDA only, same #68 T3 staging as `Fp8`.
     Tq4,
+}
+
+/// OPD runtime toggles shared by every OPD subcommand
+/// (`train::apply_runtime_flags`; defaults = shipped behavior).
+#[derive(Debug, Clone, ClapArgs)]
+pub(crate) struct OpdRuntimeArgs {
+    /// Offload per-layer grad-checkpoints to host RAM during the writeback
+    /// forward; false keeps them on-device (short sequences, GPU-bound).
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set, value_name = "BOOL")]
+    pub(crate) writeback_offload: bool,
+
+    /// Idle-engine offload time-share between scoring phases.
+    #[arg(long, value_enum, default_value_t = OpdEngineOffloadArg::Off)]
+    pub(crate) engine_offload: OpdEngineOffloadArg,
+
+    /// Per-layer gradient checkpointing at student load.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set, value_name = "BOOL")]
+    pub(crate) gradient_checkpointing: bool,
+
+    /// Min tensor bytes for checkpoint host offload.
+    #[arg(long, default_value_t = 2 << 20, value_name = "BYTES")]
+    pub(crate) checkpoint_offload_min_bytes: usize,
+
+    /// Trim the device memory pool before backward.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set, value_name = "BOOL")]
+    pub(crate) trim_before_backward: bool,
+
+    /// Trim the device memory pool after writeback.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set, value_name = "BOOL")]
+    pub(crate) trim_after_writeback: bool,
+
+    /// Trim the device memory pool after each checkpoint replay.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set, value_name = "BOOL")]
+    pub(crate) trim_after_checkpoint_replay: bool,
+
+    /// Rollout tensor retain interval (steps).
+    #[arg(long, default_value_t = 2, value_name = "N")]
+    pub(crate) rollout_retain_interval: usize,
+
+    /// Rollout progress log interval (steps; the log line itself is gated by
+    /// the ARLE_OPD_ROLLOUT_PROGRESS instrumentation env).
+    #[arg(long, default_value_t = 16, value_name = "N")]
+    pub(crate) rollout_progress_interval: usize,
+
+    /// Expert tile for the MoE LoRA backward.
+    #[arg(long, default_value_t = 16, value_name = "N")]
+    pub(crate) moe_lora_bwd_expert_tile: usize,
+
+    /// Row tile for the LoRA linear backward.
+    #[arg(long, default_value_t = 1024, value_name = "N")]
+    pub(crate) lora_linear_bwd_tile_rows: usize,
+
+    /// Frozen-prompt-KV writeback path.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set, value_name = "BOOL")]
+    pub(crate) writeback_frozen_prompt_kv: bool,
+
+    /// Legacy full-matmul LoRA linear backward (A/B arm).
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set, value_name = "BOOL")]
+    pub(crate) legacy_lora_linear_bwd: bool,
+
+    /// Legacy unchunked SDPA backward (A/B arm).
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set, value_name = "BOOL")]
+    pub(crate) legacy_sdpa_bwd: bool,
+
+    /// FlashQLA chunkwise GDN prefill in the autograd CUDA backend.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set, value_name = "BOOL")]
+    pub(crate) gdr_chunkwise_prefill: bool,
+
+    /// Force the monolithic chunked-scan linear-attention backward (A/B arm).
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set, value_name = "BOOL")]
+    pub(crate) la_backward_mono: bool,
+
+    /// Force the legacy two-pass decode attention kernel (A/B arm).
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set, value_name = "BOOL")]
+    pub(crate) autograd_decode_attn_legacy: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum OpdEngineOffloadArg {
+    /// Resident weights (default).
+    Off,
+    /// Offload both idle engines.
+    All,
+    /// Offload only the rollout student.
+    Student,
+    /// Offload only the scoring teacher.
+    Teacher,
+}
+
+impl OpdRuntimeArgs {
+    pub(crate) fn to_flags(&self) -> train::TrainRuntimeFlags {
+        train::TrainRuntimeFlags {
+            writeback_offload: self.writeback_offload,
+            engine_offload: match self.engine_offload {
+                OpdEngineOffloadArg::Off => train::opd::EngineOffloadMode::Off,
+                OpdEngineOffloadArg::All => train::opd::EngineOffloadMode::All,
+                OpdEngineOffloadArg::Student => train::opd::EngineOffloadMode::Student,
+                OpdEngineOffloadArg::Teacher => train::opd::EngineOffloadMode::Teacher,
+            },
+            gradient_checkpointing: self.gradient_checkpointing,
+            trim_before_backward: self.trim_before_backward,
+            trim_after_writeback: self.trim_after_writeback,
+            writeback_frozen_prompt_kv: self.writeback_frozen_prompt_kv,
+            rollout_retain_interval: self.rollout_retain_interval,
+            rollout_progress_interval: self.rollout_progress_interval,
+            autograd: autograd::AutogradRuntimeFlags {
+                checkpoint_offload_min_bytes: self.checkpoint_offload_min_bytes,
+                trim_after_checkpoint_replay: self.trim_after_checkpoint_replay,
+                legacy_lora_linear_bwd: self.legacy_lora_linear_bwd,
+                lora_linear_bwd_tile_rows: self.lora_linear_bwd_tile_rows,
+                legacy_sdpa_bwd: self.legacy_sdpa_bwd,
+                moe_lora_bwd_expert_tile: self.moe_lora_bwd_expert_tile,
+                gdr_chunkwise_prefill: self.gdr_chunkwise_prefill,
+                la_backward_mono: self.la_backward_mono,
+                decode_attn_legacy: self.autograd_decode_attn_legacy,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, clap::Args)]
@@ -962,6 +1248,9 @@ pub(crate) struct TrainEstimateMemoryArgs {
     after_help = "On-Policy Distillation. The student samples a rollout greedily, the\nteacher re-scores it, and forward KL drives backward through the student.\n\nSmoke (no model load, tiny embedded Qwen3.5 config):\n  arle train opd --smoke --steps 5\n\nReal (HF / ModelScope-cached model directory, pending loader):\n  arle train opd --student-model ~/.cache/modelscope/hub/models/Qwen/Qwen3-0.6B \\\n                 --teacher-model ~/.cache/modelscope/hub/models/Qwen/Qwen3-0.6B \\\n                 --steps 20 --rollout-len 16"
 )]
 pub(crate) struct TrainOpdArgs {
+    #[command(flatten)]
+    pub(crate) runtime: OpdRuntimeArgs,
+
     /// Student model directory in HF safetensors layout. If unset and
     /// `--smoke` is given, uses the embedded tiny Qwen3.5 config.
     #[arg(long, alias = "student")]
@@ -1158,6 +1447,9 @@ pub(crate) enum OpdBackendArg {
     after_help = "Self-OPD (SOPD): inline self-training. The student samples a rollout,\nan EMA self-teacher (base + lagged EMA adapter) re-scores it, GKD blends a\nλ·CE self-anchor with (1−λ)·KL(student‖EMA), and the EMA adapter trails the\nstudent θ_ema ← α·θ_ema + (1−α)·θ_student. Every N steps a held-out NLL gate\nreverts {student, EMA, AdamW} together on regress.\n\nSmoke (no model load, embedded tiny Qwen3.5 config):\n  arle train self-opd --smoke --steps 5\n\nReal:\n  arle train self-opd --student-model <dir> --steps 20 --rollout-len 16 --gate-every-n 10"
 )]
 pub(crate) struct TrainSelfOpdArgs {
+    #[command(flatten)]
+    pub(crate) runtime: OpdRuntimeArgs,
+
     /// Student model directory in HF safetensors layout. Required unless --smoke.
     #[arg(long, alias = "student")]
     pub(crate) student_model: Option<PathBuf>,
@@ -1309,6 +1601,9 @@ pub(crate) enum RubricWritebackArg {
     after_help = "Rubric-OPD: the student samples N rollouts/prompt; DeepSeek-V4-Flash judges\neach against a text-level rubric (vocab-agnostic, so a DeepSeek teacher can grade a\nQwen student); accepted rollouts are written back as CE targets (RFT). Selection-only\n(--writeback accepted) caps at the student's best-of-N; --writeback correction lets the\nteacher rewrite rejected rollouts to break that ceiling.\n\n  arle train rubric-opd --student-model <qwen3.6-27b-dir> --teacher-model <dsv4-flash-dir> \\\n    --prompts-file <jsonl> --rubric-task math --rounds 3 --samples-per-prompt 4"
 )]
 pub(crate) struct TrainRubricOpdArgs {
+    #[command(flatten)]
+    pub(crate) runtime: OpdRuntimeArgs,
+
     /// Student model directory (HF safetensors layout). The trained LoRA student.
     #[arg(long, alias = "student")]
     pub(crate) student_model: PathBuf,
@@ -1487,6 +1782,9 @@ pub(crate) struct TrainRubricOpdArgs {
     after_help = "Agent-OPD: the student drives the read/write/replace/bash tool loop against a\nper-task repo sandbox (SWE-bench-Pro). The reward is EXECUTION — `git diff` is the\ncandidate patch, the hidden test_patch + fail_to_pass tests are run, exit-0 = pass.\nNo text judge/teacher is loaded; passing trajectories are written back as CE targets\n(verl-style response_mask keeps tool/environment tokens out of the loss).\n\n  arle train agent-opd --student-model <qwen3.6-27b-dir> \\\n    --dataset <swe-bench-pro.jsonl> --staged-root <repos-checked-out-at-base_commit> \\\n    --rounds 3 --samples-per-prompt 4"
 )]
 pub(crate) struct TrainAgentOpdArgs {
+    #[command(flatten)]
+    pub(crate) runtime: OpdRuntimeArgs,
+
     /// Student model directory (HF safetensors layout). The trained LoRA student.
     #[arg(long, alias = "student")]
     pub(crate) student_model: PathBuf,
