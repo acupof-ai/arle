@@ -25,6 +25,14 @@ lifecycle & progress spine).
 
 ### Verdicts
 
+- **2026-07-10 — DSpark trained heads NO-LICENSE (z-lab backbone stays);
+  P2 sampling verify KILLED as-is**: FR Markov head +0.3–0.9 accept but
+  draft 8.1→16.6 ms (per-row host loop) → ≤ z-lab tok/s; confidence
+  truncation strictly harmful (conf=0 dominates); AEON block=11 −9% (12-row
+  verify misses the B≥16 GEMM lane). Sampling lane: same-seed-twice FAILS
+  (spec-path bug, plain lane passes) and host-side sampling lands −7.5% vs
+  plain — fix determinism + device-side sampling before OPD rollout use.
+  [wins](docs/experience/wins/2026-07-10-qwen36-dspark-dual-head-and-sampling-verdicts.md)
 - **2026-07-10 — DSv4 Route A prefix reuse KILLED pending content-keyed
   redesign; warm-cache needle regression FIXED**: the Route A machinery
   (state pools, per-namespace tiers, restore path, host→FlashMLA page
