@@ -301,6 +301,8 @@ impl CudaExecutor {
     /// is the per-request ceiling + the host-admission floor. The ACTUAL device
     /// pool page count the host [`CudaKvPool`] must mirror is reported by
     /// [`Self::effective_total_pages`].
+    /// `dspark_draft_model`: `Some(dir)` loads the DSpark/DFlash block drafter
+    /// checkpoint and enables `--spec-type dspark` speculative decode.
     #[cfg(feature = "cuda")]
     pub fn from_qwen35_safetensors(
         model_path: impl AsRef<Path>,
@@ -308,6 +310,7 @@ impl CudaExecutor {
         total_pages: usize,
         kv_dtype: CudaKvCacheDtype,
         mem_fraction_static: f64,
+        dspark_draft_model: Option<&std::path::Path>,
     ) -> anyhow::Result<Self> {
         Ok(Self {
             inner: CudaExecutorInner::Real(Box::new(
@@ -317,6 +320,7 @@ impl CudaExecutor {
                     total_pages,
                     kv_dtype,
                     mem_fraction_static,
+                    dspark_draft_model,
                 )?,
             )),
         })

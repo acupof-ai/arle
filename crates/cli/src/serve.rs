@@ -262,13 +262,22 @@ fn resolve_config(args: &Args, serve_args: &ServeArgs) -> Result<ServeConfig, St
     // Metal's monolith-era external draft route has not been re-ported, so the
     // CLI fails closed before startup rather than letting infer-api fail later.
     if serve_args.spec_type == ServeSpecTypeArg::Auto {
-        return Err("--spec-type auto is not implemented; use mtp".to_string());
+        return Err("--spec-type auto is not implemented; use mtp or dspark".to_string());
     }
     if serve_args.spec_type != ServeSpecTypeArg::None && backend != ServeBackend::Cuda {
         return Err("--spec-type is currently only supported by the CUDA backend".to_string());
     }
-    if serve_args.mtp_draft_model.is_some() {
-        return Err("--mtp-draft-model is not supported by the rewrite serve stack".to_string());
+    if serve_args.spec_type == ServeSpecTypeArg::Dspark && serve_args.mtp_draft_model.is_none() {
+        return Err(
+            "--spec-type dspark requires --mtp-draft-model <DSpark/DFlash checkpoint dir>"
+                .to_string(),
+        );
+    }
+    if serve_args.mtp_draft_model.is_some() && serve_args.spec_type != ServeSpecTypeArg::Dspark {
+        return Err(
+            "--mtp-draft-model is only consumed by --spec-type dspark on this serve stack"
+                .to_string(),
+        );
     }
     if serve_args.mtp_draft_tokens.is_some() && backend != ServeBackend::Cuda {
         return Err(
@@ -360,6 +369,12 @@ fn resolve_config(args: &Args, serve_args: &ServeArgs) -> Result<ServeConfig, St
             Some(spec.mtp_draft_tokens.unwrap_or(DEFAULT_MTP_DRAFT_TOKENS));
         engine_config.mtp_draft_topk = Some(spec.mtp_draft_topk.unwrap_or(DEFAULT_MTP_DRAFT_TOPK));
     }
+    if spec.spec_type == ServeSpecType::Dspark {
+        // Validated non-None above; lowered here so multiproc worker ranks
+        // (which see only ARLE_WORKER_ENGINE_CONFIG) load the drafter too.
+        engine_config.dspark_draft_model =
+            spec.mtp_draft_model.clone().map(std::path::PathBuf::from);
+    }
 
     let options = ServeHttpOptions {
         model_path,
@@ -383,6 +398,7 @@ fn resolve_spec_options(backend: ServeBackend, serve_args: &ServeArgs) -> ServeS
         ServeSpecTypeArg::None => ServeSpecType::None,
         ServeSpecTypeArg::Auto => ServeSpecType::Auto,
         ServeSpecTypeArg::Mtp => ServeSpecType::Mtp,
+        ServeSpecTypeArg::Dspark => ServeSpecType::Dspark,
     };
     if spec_type == ServeSpecType::None
         && (serve_args.mtp_draft_model.is_some()
@@ -1238,10 +1254,10 @@ mod tests {
             "--mtp-draft-tokens",
             "2",
         ]);
-        let err = resolve_config(&args, &serve).expect_err("external draft model is not re-ported");
+        let err = resolve_config(&args, &serve).expect_err("draft model needs --spec-type dspark");
         assert_eq!(
             err,
-            "--mtp-draft-model is not supported by the rewrite serve stack"
+            "--mtp-draft-model is only consumed by --spec-type dspark on this serve stack"
         );
     }
 

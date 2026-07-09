@@ -64,31 +64,38 @@ correct. What changes is ONLY the drafter: 1-layer NextN chain (depth 2) →
    requires target internals we don't expose (then Eagle3-from-DeepSpec is the
    fallback drafter, same substrate).
 
-### P1 — DFlash block drafter behind `--spec-type dflash`
-1. `qwen35-spec`: add DFlash tensor-name contract beside `mtp_tensor_names`.
-2. `infer-cuda/qwen35.rs`: draft source = one DFlash block forward (K=7) in
-   place of the depth-loop `mtp_forward_level`; verify/rollback path untouched
-   (chain of K feeds the existing depth+1 verify rows — `Qwen35LinearCapture`
-   is already sized `[(depth+1), width]`, parameterized not hardcoded).
+### P1 — DSpark superset behind `--spec-type dspark` (heads optional)
+Scope per ckl 2026-07-09: the deliverable is the DSpark SCHEME — Markov head +
+confidence-scheduled dynamic draft length — not DFlash. One module, both heads
+optional (present iff their tensors exist in the checkpoint), `layer_types`
+config-driven, so the z-lab DFlash checkpoint loads as a backbone-only DSpark
+for end-to-end path validation until our own trained checkpoint adds the heads.
+1. `qwen35-spec`: DSpark tensor-name contract beside `mtp_tensor_names`
+   (backbone + optional `markov_w1/w2` + confidence head).
+2. `infer-cuda`: block draft forward (K from config); Markov left-to-right
+   block sampling (`logits_i += markov_w2·markov_w1[prev]`); confidence
+   truncation seam (`confident_prefix_len`, = K when head absent); verify/
+   rollback untouched (`Qwen35LinearCapture` is depth-parameterized).
 3. A/B on H20, OPD rollout shape (20–45K ctx, tool-call heavy, B=1):
-   no-spec vs MTP-d2 vs DFlash-K7. Gates: needle x3 + same-config-twice
-   (correct-inference, NOT byte-vs-baseline), tok/s Δ. Kill: ≤1.15× vs no-spec.
+   no-spec vs MTP-d2 vs DSpark-backbone-only. Gates: needle x3 +
+   same-config-twice (correct-inference, NOT byte-vs-baseline), tok/s Δ.
+   Kill: ≤1.15× vs no-spec.
 
-### P2 — DSpark head + confidence scheduling + temp>0 verify
-1. Markov head (rank-256 prev-token logit bias) on the block sample loop.
-2. Confidence-scheduled block length → extends the existing accept-EMA
-   adaptive gate from binary skip to per-step K choice.
-3. **Rejection-sampling verify** for temp>0 losslessness — current verify is
-   argmax-only; OPD think-rollouts sample. This piece is required for the
-   rollout lane regardless of drafter.
-   Gate: rollout-lane A/B inside a real OPD round (tok/s + pass-rate
-   unchanged). Kill: <5% over P1.
+### P2 — temp>0 rejection-sampling verify
+Current verify is argmax-only; OPD think-rollouts sample. Verify draws from
+the exact reported draft distribution (incl. Markov bias) — required for the
+rollout lane regardless of drafter. Gate: rollout-lane A/B inside a real OPD
+round (tok/s + pass-rate unchanged).
 
-### P3 — Draft specialization on our on-policy corpus (optional, DeepSpec)
-Fine-tune the drafter on rollout dumps (tool-call-enriched, on-policy — the
-aeon recipe; data is free from `--dump-messages-dir`). Refresh per N OPD
-rounds to track LoRA drift. Enter only if P1/P2 acceptance visibly degrades on
-our domain vs the published accept rates.
+### P3 — Train our DSpark heads (DeepSpec, warm-start z-lab backbone)
+No public DSpark checkpoint exists for Qwen3.6-27B; the Markov + confidence
+heads must be trained. DeepSpec `Qwen3DSparkTrainer`, backbone warm-started
+from z-lab DFlash (shape-compatible), corpus = rollout dumps (on-policy
+tool-call — the aeon recipe, +14.1% tool-call vs generic). Cache math:
+61.4 KB/token (6×5120 bf16) → 50–200M tokens = 3–12 TB, fits pod NVMe;
+full-perfectblend-from-scratch (~76 TB) is storage-infeasible. Small patches:
+`text_config` nesting, mask_token_id 248070, max_length. Refresh per N OPD
+rounds to track LoRA drift.
 
 ## Risks (named, not priced)
 

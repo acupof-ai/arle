@@ -116,6 +116,11 @@ pub struct EngineLoadConfig {
     /// rank is read from the adapter tensor shapes).
     #[serde(default = "default_student_lora_alpha")]
     pub student_lora_alpha: f32,
+    /// `--spec-type dspark`: DSpark/DFlash block-drafter checkpoint dir for the
+    /// CUDA Qwen3.5/3.6 executor. Rides the engine config so multiproc worker
+    /// ranks load it too. `None` = spec off (baseline byte-identical).
+    #[serde(default)]
+    pub dspark_draft_model: Option<std::path::PathBuf>,
 }
 
 /// `--lora-alpha` default (the common rank-32 PEFT convention); a free function
@@ -165,6 +170,7 @@ impl Default for EngineLoadConfig {
             slot_oversubscription: false,
             student_lora_adapters: None,
             student_lora_alpha: default_student_lora_alpha(),
+            dspark_draft_model: None,
         }
     }
 }
@@ -1808,6 +1814,12 @@ mod backend {
                  model kind {kind:?} would otherwise ignore the request"
             );
         }
+        if config.dspark_draft_model.is_some() && !matches!(kind, CudaModelKind::Qwen35) {
+            anyhow::bail!(
+                "--spec-type dspark is only wired for CUDA Qwen3.5/3.6 checkpoints; \
+                 model kind {kind:?} would otherwise ignore the request"
+            );
+        }
         // Executors receive the CONFIGURED `total_pages` (Dense: shared device
         // pool size; Qwen3.5/3.6: per-slot token budget / page_size). The host
         // admission pool capacity is derived separately below — after the
@@ -1829,6 +1841,7 @@ mod backend {
                 config.total_pages,
                 kv_dtype,
                 config.mem_fraction_static,
+                config.dspark_draft_model.as_deref(),
             )?,
             // DSv4 multi-rank serve. The DSv4 executor resolves its TP
             // rank/world-size + EP expert split + NCCL communicator from the

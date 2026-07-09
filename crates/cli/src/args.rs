@@ -681,8 +681,8 @@ pub(crate) struct ServeArgs {
     #[arg(long, default_value_t = 32.0)]
     pub(crate) lora_alpha: f32,
 
-    /// Speculative decode route. Currently only CUDA accepts checkpoint-native
-    /// `mtp`; external draft-model routes are not re-ported in the rewrite.
+    /// Speculative decode route (CUDA): checkpoint-native `mtp` (DSv4) or the
+    /// external `dspark` block drafter (Qwen3.6, dir via `--mtp-draft-model`).
     #[arg(long, value_enum, default_value_t = ServeSpecTypeArg::None)]
     pub(crate) spec_type: ServeSpecTypeArg,
 
@@ -695,9 +695,8 @@ pub(crate) struct ServeArgs {
     #[arg(long, value_enum, default_value_t = ServeCommBackendArg::Nccl)]
     pub(crate) comm_backend: ServeCommBackendArg,
 
-    /// External split MTP drafter model path or HuggingFace repo.
-    /// Parsed for compatibility, but rejected by the rewrite serve path until
-    /// external draft-model speculative decode is re-ported.
+    /// External drafter checkpoint dir. Consumed by `--spec-type dspark`
+    /// (DSpark/DFlash block drafter, CUDA Qwen3.6); rejected otherwise.
     #[arg(long, value_name = "PATH_OR_REPO")]
     pub(crate) mtp_draft_model: Option<String>,
 
@@ -786,6 +785,9 @@ pub(crate) enum ServeSpecTypeArg {
     None,
     Auto,
     Mtp,
+    /// DSpark/DFlash block drafter (CUDA Qwen3.6; draft checkpoint dir via
+    /// `--mtp-draft-model`).
+    Dspark,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

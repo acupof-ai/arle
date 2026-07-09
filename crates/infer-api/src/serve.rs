@@ -146,6 +146,9 @@ pub enum ServeSpecType {
     Auto,
     /// Multi-token prediction / MTP route.
     Mtp,
+    /// DSpark/DFlash block drafter (external draft checkpoint dir via
+    /// `--mtp-draft-model`; CUDA Qwen3.5/3.6 only).
+    Dspark,
 }
 
 impl ServeSpecType {
@@ -155,6 +158,7 @@ impl ServeSpecType {
             Self::None => "none",
             Self::Auto => "auto",
             Self::Mtp => "mtp",
+            Self::Dspark => "dspark",
         }
     }
 }
@@ -206,21 +210,21 @@ pub fn serve_http(opts: ServeHttpOptions) -> Result<()> {
     // checkpoint-native MTP head via `mtp_draft_tokens`. The per-backend
     // fail-close (MTP is CUDA-only) lives in `router_for_backend`'s `load_*`.
     let mut engine_config = opts.engine_config;
-    if opts.spec.mtp_draft_model.is_some() {
-        anyhow::bail!(
-            "--mtp-draft-model (external draft model) is not supported on this serve path; \
-             CUDA DSv4 uses the checkpoint-native MTP head"
-        );
-    }
     let spec_type = if opts.spec.spec_type == ServeSpecType::None && opts.spec.mtp_enabled() {
         ServeSpecType::Mtp
     } else {
         opts.spec.spec_type
     };
+    if opts.spec.mtp_draft_model.is_some() && spec_type != ServeSpecType::Dspark {
+        anyhow::bail!(
+            "--mtp-draft-model (external draft model) is only consumed by --spec-type dspark; \
+             CUDA DSv4 MTP uses the checkpoint-native head"
+        );
+    }
     match spec_type {
         ServeSpecType::None => {}
         ServeSpecType::Auto => {
-            anyhow::bail!("--spec-type auto is not implemented; use mtp");
+            anyhow::bail!("--spec-type auto is not implemented; use mtp or dspark");
         }
         ServeSpecType::Mtp => {
             engine_config.mtp_draft_tokens = Some(
@@ -230,6 +234,14 @@ pub fn serve_http(opts: ServeHttpOptions) -> Result<()> {
             );
             engine_config.mtp_draft_topk =
                 Some(opts.spec.mtp_draft_topk.unwrap_or(DEFAULT_MTP_DRAFT_TOPK));
+        }
+        ServeSpecType::Dspark => {
+            let dir = opts.spec.mtp_draft_model.as_deref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--spec-type dspark requires --mtp-draft-model <DSpark/DFlash checkpoint dir>"
+                )
+            })?;
+            engine_config.dspark_draft_model = Some(std::path::PathBuf::from(dir));
         }
     }
 
