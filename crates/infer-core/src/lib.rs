@@ -3278,12 +3278,25 @@ mod tests {
         let (&slot, _) = engine.active.iter().next().expect("request active");
 
         engine.requeue_preempted_decode(slot);
+        // Prompt was sealed into radix (L1 cache) during normal step — that's
+        // always-on, independent of tier store. No tier demotion should occur.
         assert_eq!(
             engine.radix.cached_page_count(),
-            0,
-            "no publish on the plain recompute path"
+            2,
+            "prompt sealed into L1 radix"
         );
-        assert_eq!(engine.kv_free_pages(), free_before, "all pages freed");
+        assert_eq!(
+            engine.kv_tier_stats().demoted_pages,
+            0,
+            "no tier demote without store"
+        );
+        // Radix retains 2 cached prompt pages (L1 always-on); the rest freed.
+        let cached = engine.radix.cached_page_count();
+        assert_eq!(
+            engine.kv_free_pages(),
+            free_before - cached,
+            "all pages freed except radix-cached"
+        );
 
         engine.run_to_idle()?;
         assert_finished(engine.completed(handle).expect("completed"));
