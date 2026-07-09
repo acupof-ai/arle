@@ -127,16 +127,14 @@ impl MetalKvCacheDtype {
 /// layers. The HTTP frontend rejects a second live request, while the executor's
 /// single-row submit guard remains an internal fail-closed fence before any
 /// pipeline logic. The default-on flip therefore changes only the c=1 greedy
-/// path. Opt OUT with `INFER_METAL_PIPELINE=0`.
+/// path. Opt OUT with `--metal-pipeline false`.
 #[cfg(feature = "metal")]
 fn pipeline_decode_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        let on = std::env::var("INFER_METAL_PIPELINE")
-            .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
-            .unwrap_or(true);
-        eprintln!("[infer-metal] decode pipeline (INFER_METAL_PIPELINE) = {on}");
+        let on = crate::runtime_flags::pipeline();
+        eprintln!("[infer-metal] decode pipeline (--metal-pipeline) = {on}");
         on
     })
 }
@@ -167,16 +165,14 @@ pub fn pipeline_fast_path_hits() -> u64 {
 
 /// Paged-prefix read path for single-token decode. The C++ session still owns
 /// K/V writes; only SDPA's prefix read source changes. Default on after BF16
-/// and INT8 reachability gates; opt out with `INFER_METAL_PAGED_KV_READ=0`.
+/// and INT8 reachability gates; opt out with `--metal-paged-kv-read false`.
 #[cfg(feature = "metal")]
 fn paged_kv_read_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        let on = std::env::var("INFER_METAL_PAGED_KV_READ")
-            .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
-            .unwrap_or(true);
-        eprintln!("[infer-metal] paged KV read (INFER_METAL_PAGED_KV_READ) = {on}");
+        let on = crate::runtime_flags::paged_kv_read();
+        eprintln!("[infer-metal] paged KV read (--metal-paged-kv-read) = {on}");
         on
     })
 }
@@ -243,7 +239,7 @@ impl std::fmt::Debug for MetalInflight {
 /// used to materialize host f32 logits and sample on CPU every token, which
 /// creates synchronous D2H stalls on the local desktop path. Default behavior is
 /// therefore constrained to device greedy; opt back into the old host sampler
-/// with `INFER_METAL_HOST_SAMPLING=1` for debugging.
+/// with `--metal-host-sampling` for debugging.
 #[cfg(feature = "metal")]
 fn sample_inflight(
     slot: usize,
@@ -292,13 +288,7 @@ fn materialize_inflight_now(inflight: MetalInflight) -> anyhow::Result<StepOutpu
 
 #[cfg(feature = "metal")]
 fn host_sampling_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("INFER_METAL_HOST_SAMPLING")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-    })
+    crate::runtime_flags::host_sampling()
 }
 
 #[cfg(feature = "metal")]
@@ -308,7 +298,7 @@ fn warn_host_sampling_downgrade() {
     if !WARNED.swap(true, Ordering::Relaxed) {
         log::warn!(
             "Metal non-greedy sampling requested, but host logits sampling is disabled; \
-             using device greedy argmax. Set INFER_METAL_HOST_SAMPLING=1 to opt into \
+             using device greedy argmax. Set --metal-host-sampling to opt into \
              the blocking D2H sampler."
         );
     }
@@ -709,12 +699,10 @@ impl RealMetalExecutor {
     /// turn-wall gap is turn-0's lazy graph build + first MoE encode landing on
     /// the first real request. A tiny throwaway forward on a reserved warmup slot
     /// (never published to the kv pool) pre-pays that JIT at load instead. Opt
-    /// out with `INFER_METAL_WARMUP=0`.
+    /// out with `--metal-warmup false`.
     fn warmup(&mut self) -> anyhow::Result<()> {
-        let on = std::env::var("INFER_METAL_WARMUP")
-            .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
-            .unwrap_or(true);
-        eprintln!("[infer-metal] warmup (INFER_METAL_WARMUP) = {on}");
+        let on = crate::runtime_flags::warmup();
+        eprintln!("[infer-metal] warmup (--metal-warmup) = {on}");
         if !on {
             return Ok(());
         }
@@ -1584,13 +1572,13 @@ fn is_qwen36_27b_model(resolved: &Path) -> bool {
     resolved.to_string_lossy().contains("Qwen3.6-27B")
 }
 
-/// Resolve the Metal DFlash speculative-decode runtime for the served model.
+/// Resolve the Metal DFlash speculative-decode runtime for the served model,
+/// from the applied runtime flags (CLI `--no-speculative` / `--draft-model` /
+/// `--speculative-tokens` / `--spec-accept-topk`).
 ///
-/// Precedence (single canonical path; the CLI lowers its flags into the same env
-/// before this runs, so a CLI flag wins over a stale user env value):
-///   1. `INFER_METAL_NO_SPECULATIVE` set → speculative decode disabled (the
-///      `--no-speculative` opt-out, also suppressing the Qwen3.6-27B auto-enable).
-///   2. `INFER_METAL_DFLASH_DRAFT_MODEL` non-empty → explicit draft head.
+/// Precedence:
+///   1. `--no-speculative` → disabled (also suppresses the Qwen3.6-27B auto-enable).
+///   2. `--draft-model` non-empty → explicit draft head.
 ///   3. Qwen3.6-27B-family served model → auto-enable the NextN-MTP draft head at
 ///      the default depth, downloading it on first use.
 ///   4. otherwise → no speculative decode.
@@ -1599,16 +1587,19 @@ fn resolve_dflash(
     resolved: &Path,
     config: &config::MetalModelConfig,
 ) -> anyhow::Result<Option<dflash::MetalDflashRuntime>> {
-    if env_flag_set("INFER_METAL_NO_SPECULATIVE") {
+    let flags = crate::runtime_flags::spec_flags();
+    if !flags.speculative {
         return Ok(None);
     }
 
-    let env_draft = std::env::var("INFER_METAL_DFLASH_DRAFT_MODEL")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
+    let flag_draft = flags
+        .draft_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
 
-    let (draft_model, default_tokens) = match env_draft {
+    let (draft_model, default_tokens) = match flag_draft {
         Some(draft) => (draft, None),
         None if is_qwen36_27b_model(resolved) => {
             eprintln!(
@@ -1622,47 +1613,19 @@ fn resolve_dflash(
         None => return Ok(None),
     };
 
-    let speculative_tokens = match std::env::var("INFER_METAL_DFLASH_TOKENS") {
-        Ok(value) if !value.trim().is_empty() => {
-            Some(value.trim().parse::<usize>().map_err(|err| {
-                anyhow::anyhow!("invalid INFER_METAL_DFLASH_TOKENS='{value}': {err}")
-            })?)
-        }
-        _ => default_tokens,
-    };
     let max_rows = match std::env::var("INFER_METAL_DFLASH_MAX_ROWS") {
         Ok(value) if !value.trim().is_empty() => value.trim().parse::<usize>().map_err(|err| {
             anyhow::anyhow!("invalid INFER_METAL_DFLASH_MAX_ROWS='{value}': {err}")
         })?,
         _ => 4,
     };
-    let accept_topk = match std::env::var("INFER_METAL_DFLASH_ACCEPT_TOPK") {
-        Ok(value) if !value.trim().is_empty() => value
-            .trim()
-            .parse::<i32>()
-            .map_err(|err| {
-                anyhow::anyhow!("invalid INFER_METAL_DFLASH_ACCEPT_TOPK='{value}': {err}")
-            })?
-            .max(1),
-        _ => 1,
-    };
     let options = dflash::MetalDflashOptions {
         draft_model,
-        speculative_tokens,
+        speculative_tokens: flags.speculative_tokens.or(default_tokens),
         max_rows,
-        accept_topk,
+        accept_topk: flags.spec_accept_topk.max(1),
     };
     dflash::MetalDflashRuntime::load(&options, config).map(Some)
-}
-
-/// True when an env var is set to a non-empty, non-`0`/`false` value. Used for
-/// the `--no-speculative` opt-out marker the CLI exports.
-#[cfg(feature = "metal")]
-fn env_flag_set(name: &str) -> bool {
-    std::env::var(name).is_ok_and(|value| {
-        let v = value.trim();
-        !v.is_empty() && !v.eq_ignore_ascii_case("0") && !v.eq_ignore_ascii_case("false")
-    })
 }
 
 #[cfg(feature = "metal")]

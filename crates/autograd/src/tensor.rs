@@ -482,11 +482,7 @@ impl TensorStore {
     /// Checkpoint-only host offload with a reusable host buffer and a minimum
     /// tensor size threshold. Returns device bytes freed.
     pub fn offload_checkpoint_to_host(&mut self, id: TensorId) -> Result<usize> {
-        const DEFAULT_MIN_BYTES: usize = 2 << 20;
-        let min_bytes = std::env::var("ARLE_OPD_CHECKPOINT_OFFLOAD_MIN_BYTES")
-            .ok()
-            .and_then(|raw| raw.parse::<usize>().ok())
-            .unwrap_or(DEFAULT_MIN_BYTES);
+        let min_bytes = crate::runtime_flags::checkpoint_offload_min_bytes();
         let (size, bytes, handle) = {
             let tensor = self.tensor(id)?;
             let bytes = tensor.size.saturating_mul(std::mem::size_of::<f32>());

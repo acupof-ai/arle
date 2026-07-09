@@ -1218,7 +1218,7 @@ fn cuda_linear_attention_chunk_parallel_grad_matches_cpu() -> Result<()> {
     // exercises the staged chunk-parallel backward end to end: parallel
     // per-chunk transfer operators (M_c, B_c), a multi-step reverse boundary
     // carry, and the parallel per-chunk grad replay, vs the CPU reference.
-    // (`ARLE_LA_BACKWARD_MONO=1` re-routes to the legacy monolithic scan for
+    // (`--la-backward-mono` re-routes to the legacy monolithic scan for
     // manual A/B on the same shapes.)
     let params = LinearAttentionParams {
         batch: 1,

@@ -119,18 +119,11 @@ impl MoeGroupedLinearProfile {
 }
 
 fn legacy_lora_linear_backward_enabled() -> bool {
-    matches!(
-        std::env::var("ARLE_OPD_LEGACY_LORA_LINEAR_BWD").as_deref(),
-        Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
-    )
+    crate::runtime_flags::legacy_lora_linear_bwd()
 }
 
 fn moe_lora_backward_expert_tile() -> usize {
-    std::env::var("ARLE_OPD_MOE_LORA_BWD_EXPERT_TILE")
-        .ok()
-        .and_then(|raw| raw.parse::<usize>().ok())
-        .filter(|&experts| experts > 0)
-        .unwrap_or(16)
+    crate::runtime_flags::moe_lora_bwd_expert_tile()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
