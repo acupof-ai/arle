@@ -1,0 +1,21 @@
+scripts/gen_agent_opd_tasks.py
+  s_9909d04362af6f::t_35593d0cd9c164 4-5,7-9,44-46,956-1574,1944-1952,1990
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "f7f750a60a325c0f61d93ecb361ef9dddadf65b6",
+  "prompts": {},
+  "sessions": {
+    "s_9909d04362af6f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a3db630ee27e3d103",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
