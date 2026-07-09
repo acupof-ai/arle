@@ -195,12 +195,15 @@ impl RealCudaExecutor {
         )))
     }
 
+    /// `dspark_draft_model`: `Some(dir)` loads the DSpark/DFlash block drafter
+    /// from that checkpoint dir and enables `--spec-type dspark` decode.
     pub(crate) fn from_qwen35_safetensors(
         model_path: impl AsRef<Path>,
         num_slots: usize,
         total_pages: usize,
         kv_dtype: CudaKvCacheDtype,
         mem_fraction_static: f64,
+        dspark_draft_model: Option<&Path>,
     ) -> Result<Self> {
         Ok(Self::Qwen35(Box::new(
             Qwen35CudaExecutor::from_qwen35_safetensors(
@@ -209,6 +212,7 @@ impl RealCudaExecutor {
                 total_pages,
                 kv_dtype,
                 mem_fraction_static,
+                dspark_draft_model,
             )?,
         )))
     }
@@ -3528,6 +3532,10 @@ pub(crate) struct Qwen35CudaExecutor {
     /// `save_recurrent_sidecar`; cleared on the next request (`start_pos == 0`)
     /// so no cross-request state leaks.
     prefill_boundary_snapshot: Vec<Option<(usize, crate::qwen35::Qwen35RecurrentSnapshot)>>,
+    /// DSpark block-draft runtime (`--spec-type dspark`): draft head + per-slot
+    /// ctx caches + tap/scratch buffers. `None` (the default) keeps the
+    /// baseline executor byte-identical — nothing is allocated or captured.
+    dspark: Option<crate::qwen35::dspark::Qwen35DsparkExec>,
 }
 
 impl std::fmt::Debug for Qwen35CudaExecutor {
@@ -3690,6 +3698,11 @@ impl Qwen35CudaExecutor {
             &mut self.recurrent_pool,
         )?;
 
+        // A sidecar-restored prefix has no draft ctx features for the matched
+        // span — clear any stale DSpark state so the request runs plain decode.
+        if let Some(df) = self.dspark.as_mut().and_then(|ds| ds.slots[slot].as_mut()) {
+            df.reset();
+        }
         // Read the atomic blob from the tier (transparently spans L1/L2 host →
         // L3 disk); a MISS or corrupt/foreign payload deserializes to None and
         // falls through to the clean-recompute reset below — never a partial restore.
@@ -3830,6 +3843,11 @@ impl Qwen35CudaExecutor {
             "Qwen3.6 promote slot {slot} outside executor slots {}",
             self.num_slots
         );
+        // The slot image carries no draft ctx cache — the promoted request
+        // decodes non-speculatively (seeded check fails on ctx_len).
+        if let Some(df) = self.dspark.as_mut().and_then(|ds| ds.slots[slot].as_mut()) {
+            df.reset();
+        }
         // Read the serialized image out of the tier (host hit or NVMe read) and
         // deserialize it byte-exact before touching the device.
         let image = self
@@ -3889,6 +3907,7 @@ impl Qwen35CudaExecutor {
         total_pages: usize,
         kv_dtype: CudaKvCacheDtype,
         mem_fraction_static: f64,
+        dspark_draft_model: Option<&Path>,
     ) -> Result<Self> {
         let total_t0 = Instant::now();
         ensure!(
@@ -3905,9 +3924,10 @@ impl Qwen35CudaExecutor {
         // contiguous cache, so this no longer scales VRAM by num_slots.
         let max_seq_len = total_pages * SUPPORTED_PAGE_SIZE;
         let model_t0 = Instant::now();
-        // `None`: MTP spec-decode flag wiring lands in a later increment; the
-        // baseline load is byte-identical (no draft head loaded).
-        let model =
+        // `None`: the checkpoint-native NextN-MTP head stays unwired here; the
+        // baseline load is byte-identical (no draft head loaded). DSpark is the
+        // external block drafter, loaded below from its own checkpoint dir.
+        let mut model =
             crate::qwen35::Qwen35Model::from_safetensors(model_path.as_ref(), max_seq_len, None)?;
         cuda_startup_log(
             "qwen35_model_load",
@@ -3916,6 +3936,33 @@ impl Qwen35CudaExecutor {
                 "requested_slots={num_slots} total_pages={total_pages} max_seq_len={max_seq_len}"
             ),
         );
+        // DSpark draft head: loaded BEFORE the KV budget/pool profiling so its
+        // weights are subtracted from the measured free VRAM.
+        let dspark_head = dspark_draft_model
+            .map(|dir| {
+                ensure!(
+                    model.tp.is_single(),
+                    "--spec-type dspark is single-GPU only (draft lm_head/argmax are rank-local)"
+                );
+                let head = crate::qwen35::dspark::load_dspark_head(
+                    &model.ctx,
+                    dir,
+                    max_seq_len,
+                    model.config.hidden_size,
+                    model.config.num_hidden_layers,
+                    model.config.vocab_size,
+                )?;
+                model.set_spec_draft_tokens(head.block_size());
+                log::info!(
+                    "CUDA Qwen3.6 DSpark drafter loaded from {}: mode={} block={} taps={:?}",
+                    dir.display(),
+                    head.mode_label(),
+                    head.block_size(),
+                    head.target_layer_ids(),
+                );
+                Ok(head)
+            })
+            .transpose()?;
         // Dynamic KV mem budget (unified with DSv4 via the infer-seam kernel):
         // clamp num_slots to what post-weights free VRAM affords. Qwen3.5/3.6
         // previously admitted the requested count as-is → OOM at large
@@ -4008,6 +4055,7 @@ impl Qwen35CudaExecutor {
             kv_pool_requested_pages: total_pages.max(1),
             sidecar_page_key: std::collections::HashMap::new(),
             prefill_boundary_snapshot: (0..num_slots).map(|_| None).collect(),
+            dspark: dspark_head.map(|h| crate::qwen35::dspark::Qwen35DsparkExec::new(h, num_slots)),
         };
         cuda_startup_log(
             "qwen35_executor_total",
@@ -4293,6 +4341,11 @@ impl Qwen35CudaExecutor {
     /// SAME pool (working-set restriction) and lazily builds its L3 tier on the
     /// first enable. Default-off keeps the full resident attention.
     pub(crate) fn set_kv_recall(&mut self, enabled: bool) -> Result<()> {
+        ensure!(
+            !(enabled && self.dspark.is_some()),
+            "--kv-recall is not supported with --spec-type dspark (the verify \
+             forward would race the recall eviction cycle)"
+        );
         self.kv_recall = enabled;
         if enabled && self.recall_tier.is_none() {
             // L3 write-through tier: source of truth for evict-dropped middle
@@ -4414,6 +4467,7 @@ impl Qwen35CudaExecutor {
             slots,
             workspace,
             full_attn_kv,
+            dspark,
             ..
         } = self;
         let pool = full_attn_kv.as_mut().expect("full_attn_kv present");
@@ -4422,7 +4476,25 @@ impl Qwen35CudaExecutor {
             meta: &meta,
             layer0_query: Vec::new(),
         };
-        model.forward_tokens_recall(
+        let Some(ds) = dspark.as_mut() else {
+            return model.forward_tokens_recall(
+                &mut slots[slot],
+                workspace,
+                &row.tokens,
+                row.start_pos,
+                &row.params,
+                position,
+                &mut rc,
+            );
+        };
+        // DSpark: capture the trunk taps, extend the draft ctx cache with this
+        // chunk's rows, and stage the pending anchor on the final chunk.
+        ds.taps.prepare(
+            ds.head.target_layer_ids(),
+            model.config.hidden_size,
+            row.tokens.len(),
+        );
+        let token = model.forward_tokens_recall_tapped(
             &mut slots[slot],
             workspace,
             &row.tokens,
@@ -4430,7 +4502,30 @@ impl Qwen35CudaExecutor {
             &row.params,
             position,
             &mut rc,
-        )
+            Some(&mut ds.taps),
+        )?;
+        if ds.slots[slot].is_none() {
+            ds.slots[slot] = Some(crate::qwen35::dspark::Qwen35DsparkSlotState::new(
+                &model.ctx, &ds.head,
+            )?);
+        }
+        let df = ds.slots[slot].as_mut().expect("built above");
+        if df.ctx_len == row.start_pos {
+            model.dspark_append_ctx(
+                &ds.head,
+                df,
+                &mut ds.taps,
+                &mut ds.scratch,
+                row.tokens.len(),
+                row.start_pos,
+            )?;
+        }
+        let is_final = row.start_pos + row.tokens.len() == row.total_tokens;
+        // Speculation resumes only when the whole prompt made it into the ctx
+        // cache; a gap (e.g. sidecar-restored prefix) degrades to plain decode.
+        df.pending =
+            (is_final && df.ctx_len == row.total_tokens && row.params.is_greedy()).then_some(token);
+        Ok(token)
     }
 
     /// One DEFAULT paged decode row (no recall cycle): append this step's token
@@ -4484,6 +4579,238 @@ impl Qwen35CudaExecutor {
             position,
             &mut rc,
         )
+    }
+
+    /// One DSpark decode row: the block spec step when the slot is seeded
+    /// (pending anchor + contiguous draft ctx), else a tapped warm step that
+    /// re-seeds it. Emits 1..=block_size+1 tokens for this slot.
+    fn dspark_decode_row(&mut self, row: &DecodeRow) -> Result<Vec<SlotToken>> {
+        ensure!(
+            row.slot < self.num_slots,
+            "decode slot {} outside Qwen3.5 executor slots {}",
+            row.slot,
+            self.num_slots
+        );
+        ensure!(
+            self.slots[row.slot].seq_len() == row.kv_seq_len,
+            "Qwen3.5 materialized state len {} != DecodeRow.kv_seq_len {} for slot {}",
+            self.slots[row.slot].seq_len(),
+            row.kv_seq_len,
+            row.slot
+        );
+        let position = row.kv_seq_len.saturating_add(1) as u64;
+        let start = row.kv_seq_len;
+        let ds = self
+            .dspark
+            .as_ref()
+            .expect("dspark_decode_row without dspark");
+        // The verify appends block_size+1 rows, so the whole chain must fit the
+        // trunk cap; near the cap, degrade to single-token steps.
+        let seeded = row.params.is_greedy()
+            && self.full_attn_paged()
+            && start + ds.head.block_size() < self.model.max_seq_len()
+            && matches!(
+                ds.slots[row.slot].as_ref(),
+                Some(s) if s.pending == Some(row.last_token) && s.ctx_len == start
+            );
+        if !seeded {
+            let token = self.dspark_warm_decode_row(row, position)?;
+            return Ok(vec![SlotToken {
+                slot: row.slot,
+                token,
+                logprob: None,
+                finish: None,
+            }]);
+        }
+        self.dspark_spec_row(row)
+    }
+
+    /// One no-spec decode step that keeps the DSpark draft warm: paged decode
+    /// with tap capture, extending the ctx cache + pending anchor when the
+    /// cache is contiguous. Non-greedy / non-paged rows run plain and clear the
+    /// draft state (speculation re-seeds at the next greedy step).
+    fn dspark_warm_decode_row(&mut self, row: &DecodeRow, position: u64) -> Result<u32> {
+        let slot = row.slot;
+        let greedy = row.params.is_greedy();
+        if !greedy || !self.full_attn_paged() {
+            if let Some(df) = self.dspark.as_mut().and_then(|ds| ds.slots[slot].as_mut()) {
+                df.pending = None;
+            }
+            return self.submit_decode_row(row, false);
+        }
+        {
+            let pool = self.full_attn_kv.as_mut().expect("paged (checked)");
+            ensure!(
+                pool.seq_len(slot) == row.kv_seq_len,
+                "Qwen3.6 dspark warm decode: pool seq_len {} != kv_seq_len {} for slot {}",
+                pool.seq_len(slot),
+                row.kv_seq_len,
+                slot
+            );
+            pool.alloc_tokens(slot, 1)?;
+        }
+        let meta = {
+            let pool = self.full_attn_kv.as_ref().expect("paged (checked)");
+            crate::loader::PageMeta::for_slot(&self.model.ctx, pool, slot, row.kv_seq_len, 1)?
+        };
+        let Self {
+            model,
+            slots,
+            workspace,
+            full_attn_kv,
+            dspark,
+            ..
+        } = self;
+        let pool = full_attn_kv.as_mut().expect("paged (checked)");
+        let mut rc = crate::qwen35::Qwen35RecallForward {
+            pool,
+            meta: &meta,
+            layer0_query: Vec::new(),
+        };
+        let ds = dspark.as_mut().expect("dspark warm without dspark");
+        let contiguous = matches!(ds.slots[slot].as_ref(), Some(s) if s.ctx_len == row.kv_seq_len);
+        let taps = if contiguous {
+            ds.taps
+                .prepare(ds.head.target_layer_ids(), model.config.hidden_size, 1);
+            Some(&mut ds.taps)
+        } else {
+            None
+        };
+        let token = model.forward_tokens_recall_tapped(
+            &mut slots[slot],
+            workspace,
+            &[row.last_token],
+            row.kv_seq_len,
+            &row.params,
+            position,
+            &mut rc,
+            taps,
+        )?;
+        if let Some(df) = ds.slots[slot].as_mut() {
+            if contiguous {
+                model.dspark_append_ctx(
+                    &ds.head,
+                    df,
+                    &mut ds.taps,
+                    &mut ds.scratch,
+                    1,
+                    row.kv_seq_len,
+                )?;
+                df.pending = Some(token);
+            } else {
+                df.pending = None;
+            }
+        }
+        Ok(token)
+    }
+
+    /// One DSpark block spec step: draft a block from the draft head's ctx
+    /// cache, verify the chain in ONE trunk forward over the paged pool
+    /// (linear-capture + taps), accept the longest matching prefix, roll the
+    /// trunk back on partial accept, crop the pool, and extend the draft ctx
+    /// with the accepted rows' features. Token-exact to greedy no-spec decode
+    /// (every committed token is a trunk argmax).
+    fn dspark_spec_row(&mut self, row: &DecodeRow) -> Result<Vec<SlotToken>> {
+        let slot = row.slot;
+        let start = row.kv_seq_len;
+        if self.dspark.as_ref().expect("dspark").spec[slot].is_none() {
+            let st = self.model.new_spec_slot_state()?;
+            self.dspark.as_mut().expect("dspark").spec[slot] = Some(st);
+        }
+        // 1. Draft the block (draft-head-only; no trunk/pool state touched —
+        //    the speculative noise K/V rows in the draft cache self-heal).
+        let chain = {
+            let Self { model, dspark, .. } = self;
+            let ds = dspark.as_mut().expect("dspark");
+            let df = ds.slots[slot].as_mut().expect("seeded slot");
+            model.dspark_draft_block(&ds.head, df, &mut ds.scratch, row.last_token, start)?
+        };
+        if chain.len() < 2 {
+            // Confidence head rejected the whole block — warm step instead.
+            let position = start.saturating_add(1) as u64;
+            let token = self.dspark_warm_decode_row(row, position)?;
+            return Ok(vec![SlotToken {
+                slot,
+                token,
+                logprob: None,
+                finish: None,
+            }]);
+        }
+
+        let Self {
+            model,
+            slots,
+            workspace,
+            full_attn_kv,
+            dspark,
+            ..
+        } = self;
+        let ds = dspark.as_mut().expect("dspark");
+        let spec = ds.spec[slot].as_mut().expect("built above");
+        // 2. Snapshot the trunk linear state (partial-accept rollback base).
+        spec.snapshot_trunk(&model.ctx, &slots[slot])?;
+        // 3. Verify the chain over the paged pool, capturing linear inputs
+        //    (replay substrate) + trunk taps (ctx features of accepted rows).
+        let pool = full_attn_kv.as_mut().expect("paged (gated by seeded)");
+        ensure!(
+            pool.seq_len(slot) == start,
+            "Qwen3.6 dspark verify: pool seq_len {} != start {start} for slot {slot}",
+            pool.seq_len(slot)
+        );
+        pool.alloc_tokens(slot, chain.len())?;
+        let meta = crate::loader::PageMeta::for_slot(&model.ctx, pool, slot, start, chain.len())?;
+        let mut rc = crate::qwen35::Qwen35RecallForward {
+            pool,
+            meta: &meta,
+            layer0_query: Vec::new(),
+        };
+        ds.taps.prepare(
+            ds.head.target_layer_ids(),
+            model.config.hidden_size,
+            chain.len(),
+        );
+        let logits = model.dspark_verify_logits(
+            &mut slots[slot],
+            workspace,
+            &chain,
+            start,
+            spec,
+            &mut rc,
+            &mut ds.taps,
+        )?;
+        // 4. Accept scan + trunk rollback (linear replay; full-attn KV
+        //    self-heals under the pool crop below).
+        let (emitted, bonus, k) = model.dspark_accept_commit(
+            &mut slots[slot],
+            spec,
+            workspace,
+            &chain,
+            &logits,
+            start,
+        )?;
+        drop(rc);
+        if k + 1 < chain.len() {
+            full_attn_kv
+                .as_mut()
+                .expect("paged (gated by seeded)")
+                .truncate_slot(slot, start + k + 1)?;
+        }
+        // 5. Extend the draft ctx cache with the accepted rows' features and
+        //    stage the bonus as the next block's anchor.
+        let df = ds.slots[slot].as_mut().expect("seeded slot");
+        model.dspark_append_ctx(&ds.head, df, &mut ds.taps, &mut ds.scratch, k + 1, start)?;
+        df.pending = Some(bonus);
+        ds.accepts += k;
+        ds.rejects += chain.len() - 1 - k;
+        Ok(emitted
+            .into_iter()
+            .map(|token| SlotToken {
+                slot,
+                token,
+                logprob: None,
+                finish: None,
+            })
+            .collect())
     }
 
     /// One prefill row over the recall pool (`--kv-recall`). The ONLY place the whole
@@ -4888,6 +5215,11 @@ impl Qwen35CudaExecutor {
                 (row.slot, self.submit_prefill_row(row)?)
             } else {
                 let row = &plan.decode_rows[0];
+                if self.dspark.is_some() {
+                    return Ok(StepOutput {
+                        tokens: self.dspark_decode_row(row)?,
+                    });
+                }
                 (
                     row.slot,
                     self.submit_decode_row(row, /* allow_graph = */ true)?,
@@ -4930,6 +5262,14 @@ impl Qwen35CudaExecutor {
                 logprob: None,
                 finish: None,
             });
+        }
+        if self.dspark.is_some() {
+            // DSpark decode is per-row (each row runs its own draft + block
+            // verify); batched spec verify is a later increment.
+            for row in &plan.decode_rows {
+                tokens.extend(self.dspark_decode_row(row)?);
+            }
+            return Ok(StepOutput { tokens });
         }
         match plan.decode_rows.len() {
             0 => {}
@@ -4979,6 +5319,14 @@ impl Qwen35CudaExecutor {
             // Drop any prior occupant's pending boundary snapshot: this slot is a
             // new request, so a stale snapshot must never key a future sidecar.
             self.prefill_boundary_snapshot[row.slot] = None;
+            // New occupant: the prior request's draft ctx cache is dead.
+            if let Some(df) = self
+                .dspark
+                .as_mut()
+                .and_then(|ds| ds.slots[row.slot].as_mut())
+            {
+                df.reset();
+            }
             let (num_linear, gdr_len, conv_len) = self.model.recurrent_dims();
             self.slots[row.slot].acquire_recurrent(
                 &self.model.ctx,
