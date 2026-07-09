@@ -879,6 +879,36 @@ impl Dsv4KvAdapter {
         Ok(())
     }
 
+    /// Mirror the FULL identity band for `slot` (all `flashmla_slot_pages` of
+    /// every layer) at logical cursor `seq_len`. The prefix restore path needs
+    /// band pages beyond the matched host-page count (SW ring + comp region
+    /// are fixed slot-logical blocks), so it cannot ride `mirror_slot_pages`'
+    /// host page count; `prepare_kv_batch` later mirrors the same identity
+    /// list — a no-op under `mirror_band`'s equality fast path.
+    pub(crate) fn mirror_full_band(&mut self, slot: usize, seq_len: usize) -> Result<()> {
+        ensure!(
+            slot < self.num_slots,
+            "DSv4 full-band mirror slot {slot} outside adapter slots {}",
+            self.num_slots
+        );
+        let mut changed = false;
+        let mut pages: Vec<u32> = Vec::new();
+        for layer in &mut self.layers {
+            let lsp = layer.flashmla_slot_pages();
+            if lsp == 0 {
+                continue;
+            }
+            let Some(pool) = layer.flashmla_kv_pool.as_mut() else {
+                continue;
+            };
+            pages.clear();
+            pages.extend((0..lsp).map(|i| (slot * lsp + i) as u32));
+            changed |= pool.mirror_band(slot, &pages, seq_len)?;
+        }
+        self.device_table_dirty[slot] |= changed;
+        Ok(())
+    }
+
     pub(crate) fn zero_slot_band(&mut self, ctx: &DeviceContext, slot: usize) -> Result<()> {
         ensure!(
             slot < self.num_slots,
