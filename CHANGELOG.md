@@ -25,6 +25,14 @@ lifecycle & progress spine).
 
 ### Verdicts
 
+- **2026-07-10 — DSpark partial-ctx drafting (P2.5) LICENSED; sampling RNG
+  cleared**: prefix-hit requests re-seed speculation (`8edde59c7`); multi-turn
+  accept −11/−22% within band, 101–112 tok/s vs 42–44 plain; whole-restore
+  −67% accept but 95 tok/s ≥ anchor, greedy byte-identical, needle 3/3 —
+  sidecar fallback not needed. Same-seed-twice PASSES with prefix cache
+  disabled → the 07-10 "determinism bug" was the lane/ctx confound, not RNG;
+  determinism gates must control cache state. Env-sweep smoke Δ≈0%.
+  [wins](docs/experience/wins/2026-07-10-dspark-partial-ctx-drafting.md)
 - **2026-07-10 — DSpark trained heads NO-LICENSE (z-lab backbone stays);
   P2 sampling verify KILLED as-is**: FR Markov head +0.3–0.9 accept but
   draft 8.1→16.6 ms (per-row host loop) → ≤ z-lab tok/s; confidence
