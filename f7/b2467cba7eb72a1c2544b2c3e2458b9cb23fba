@@ -1,0 +1,35 @@
+crates/cli/src/args.rs
+  s_94ce5908b6c7bb::t_5c81aa0dded1db 715-716,763-878,897-948,979-1096,1251-1253,1450-1452,1604-1606,1785-1787
+crates/cli/src/serve.rs
+  s_94ce5908b6c7bb::t_f4fdc634baf80f 86,98-99,483-488,1211-1212,1227-1228,1230-1231,1233-1234,1236,1246-1248,1250-1251,1253-1255,1257-1258,1260
+crates/cli/src/train_cli.rs
+  s_94ce5908b6c7bb::t_dd834ee38be707 80-81,85-100
+crates/infer-api/src/lib.rs
+  s_94ce5908b6c7bb::t_43c7dec17c0e50 39
+crates/infer-api/src/loaded.rs
+  s_94ce5908b6c7bb::t_f5aa60bc9f6cb2 128-142,198-201,1077,1233-1235,1415,1423-1428,1491,1506-1511,1578,1590-1595,1795-1797,2381-2383
+docs/environment.md
+  s_94ce5908b6c7bb::t_51918b78bc9b2d 29-75,250-252,260,408
+scripts/h20_teacher_student_opd_curve.sh
+  s_94ce5908b6c7bb::t_b45034e8049b89 101-105,251,255
+scripts/lever_gate.sh
+  s_94ce5908b6c7bb::t_815445ad148df6 13-14
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "f7b2467cba7eb72a1c2544b2c3e2458b9cb23fba",
+  "prompts": {},
+  "sessions": {
+    "s_94ce5908b6c7bb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a8744832334b16ddb",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
