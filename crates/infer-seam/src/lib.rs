@@ -213,6 +213,13 @@ pub trait BackendExecutor {
     /// are untouched. Default no-op.
     fn release_provisional_prefix_pages(&mut self, _pages: &[u32]) {}
 
+    /// The engine freed `slot`'s host pages (finish/preempt/abort): release
+    /// any backend device-side per-slot KV the executor allocates on demand
+    /// (#154 Phase 3b: DSv4's FlashMLA band pages return to the layer pools
+    /// here — waiting for the next occupant would starve the free lists).
+    /// Default no-op for backends whose per-slot device KV is slot-fixed.
+    fn release_kv_slot(&mut self, _slot: usize) {}
+
     /// Number of KV pages the backend's host-demoted store can
     /// hold. `0` (the default) means the backend has no tier store and the
     /// engine never calls the demote/promote hooks — the baseline eviction

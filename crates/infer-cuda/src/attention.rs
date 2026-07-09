@@ -1734,6 +1734,58 @@ pub(crate) fn dsv4_flashmla_slot_pages(
     Ok(sw_blocks + comp_blocks)
 }
 
+/// Whether a layer's FlashMLA band is DEMAND-PAGED (#154 Phase 3b): comp
+/// pages allocate from the layer pool's free list as the sequence grows,
+/// instead of a full identity band per slot. MODEL1 only — every MODEL1
+/// pack/index kernel routes slot-logical blocks through the device page
+/// table (Stage B), so arbitrary physical pages are safe. V32/GLM
+/// (`head_dim == 576`) keeps the identity full band: its pack lane still
+/// uses contiguous band-base addressing (`flashmla_pages_byte_range`).
+pub(crate) fn dsv4_flashmla_demand_paged(config: &DeepSeekV4Config) -> bool {
+    config.head_dim != 576
+}
+
+/// Per-slot safety pages a demand-paged comp region needs on top of the
+/// shared `pool_tokens` capacity: ceil-rounding of per-slot comp pages (+1)
+/// plus the MTP verify margin crossing one extra page boundary (+1) — see
+/// `Dsv4KvAdapter::prepare_kv_batch`'s `DSV4_BAND_ENSURE_MARGIN_TOKENS`.
+pub(crate) const DSV4_COMP_SAFETY_PAGES_PER_SLOT: usize = 2;
+
+/// Pages ONE layer's FlashMLA shared pool is sized to (#154 Phase 3b) — the
+/// ONE sizing formula shared by `kv_budget_plan` (solving `pool_tokens`)
+/// and `Dsv4LayerKvLayout::new` (allocating), so the two cannot drift.
+///
+/// Identity layers (V32, or FlashMLA off): `num_slots` full bands.
+/// Demand-paged layers: per-slot ring blocks (+ comp safety, see
+/// [`DSV4_COMP_SAFETY_PAGES_PER_SLOT`]) + the SHARED comp capacity for
+/// `pool_tokens` total tokens across all slots.
+pub(crate) fn dsv4_flashmla_layer_pool_pages(
+    config: &DeepSeekV4Config,
+    mode: DeepSeekV4AttentionMode,
+    compress_ratio: usize,
+    max_seq_len: usize,
+    page_block_size: usize,
+    num_slots: usize,
+    pool_tokens: usize,
+) -> Result<usize> {
+    let lsp = dsv4_flashmla_slot_pages(config, mode, compress_ratio, max_seq_len, page_block_size)?;
+    if lsp == 0 {
+        return Ok(0);
+    }
+    if !dsv4_flashmla_demand_paged(config) {
+        return Ok(num_slots.saturating_mul(lsp));
+    }
+    let sw_blocks = config.sliding_window.div_ceil(page_block_size);
+    if mode == DeepSeekV4AttentionMode::SlidingWindow {
+        return Ok(num_slots.saturating_mul(sw_blocks));
+    }
+    let comp_tokens_per_page = page_block_size.saturating_mul(compress_ratio.max(1));
+    let shared_comp = pool_tokens.div_ceil(comp_tokens_per_page.max(1));
+    Ok(num_slots
+        .saturating_mul(sw_blocks + DSV4_COMP_SAFETY_PAGES_PER_SLOT)
+        .saturating_add(shared_comp))
+}
+
 /// Whether the FlashMLA shared-band pool is built at all. This is a compile-
 /// time question (does the arena exist), not the runtime kernel-choice
 /// question `dsv4_flashmla_decode_enabled` answers — `--dsv4-flashmla-decode false`

@@ -142,6 +142,13 @@ pub(crate) struct Dsv4KvAdapter {
     pub(super) layers: Vec<Dsv4LayerKvLayout>,
     pub(super) num_slots: usize,
     pub(super) slot_epochs: Vec<Option<u64>>,
+    /// Stream handle for `prepare_kv_batch`-time demand-page zeroing (#154
+    /// Phase 3b) — the `ModelKvAdapter` trait signature carries no ctx.
+    pub(super) ctx: DeviceContext,
+    /// Shared comp token capacity the demand-paged pools were sized for
+    /// (`kv_budget_plan`); the engine host pool mirrors `pool_tokens / page`
+    /// as its admission page count.
+    pub(super) flashmla_pool_tokens: usize,
     /// One shared official-DSA selector scratch for ALL CSA layers and slots
     /// (issue #67). `None` only when the model has no CSA/DSA indexer layer.
     pub(super) dsa_shared: Option<Dsv4DsaSharedScratch>,
@@ -250,10 +257,19 @@ pub(crate) struct Dsv4LayerKvLayout {
     pub(super) flashmla_kv_pool: Option<TokenKVPool>,
     pub(super) dsa_key_cache: Option<CudaSlice<u8>>,
     /// Slot-logical FlashMLA blocks per slot (`sw_blocks + comp_blocks` for
-    /// this layer's shape) — every slot's block-table length.
+    /// this layer's shape) — every slot's MAX block-table length.
     pub(super) flashmla_slot_pages: usize,
     /// Bytes of one pool page (`page_block_size × packed record bytes`).
     pub(super) flashmla_page_bytes: usize,
+    /// Demand-paged band (#154 Phase 3b, `dsv4_flashmla_demand_paged`): comp
+    /// pages come from the pool free list as the sequence grows; false = the
+    /// V32 identity full band (its pack lane needs band-base contiguity).
+    pub(super) flashmla_demand_paged: bool,
+    /// Ring blocks at the band's logical head (`[0, sw_blocks)`).
+    pub(super) flashmla_sw_blocks: usize,
+    /// Tokens one comp page covers (`page_block_size × compress_ratio`);
+    /// 0 = no comp region (SlidingWindow-only layer).
+    pub(super) flashmla_comp_tokens_per_page: usize,
     pub(super) dsa_slot_bytes: usize,
     pub(super) num_slots: usize,
 }
@@ -314,6 +330,58 @@ impl Dsv4LayerKvLayout {
         }
         self.flashmla_pool_mut()?.free_slot(slot_idx);
         Ok(())
+    }
+
+    /// Band pages a demand-paged slot needs to hold `tokens`: the ring blocks
+    /// plus `ceil(tokens / (page × ratio))` comp pages (floored at one comp
+    /// page — the shape's `compressed_rows.max(1)` capacity floor), capped at
+    /// the full band.
+    pub(super) fn flashmla_band_pages_for(&self, tokens: usize) -> usize {
+        let comp = if self.flashmla_comp_tokens_per_page == 0 {
+            0
+        } else {
+            tokens.div_ceil(self.flashmla_comp_tokens_per_page).max(1)
+        };
+        (self.flashmla_sw_blocks + comp).min(self.flashmla_slot_pages)
+    }
+
+    /// Grow `slot_idx`'s demand-paged band to cover `tokens` (#154 Phase 3b):
+    /// missing pages come from the layer pool's free list and are ZEROED
+    /// before use (a recycled page carries a prior occupant's bytes; the ring
+    /// bootstrap and comp readers assume zeroed tails). Returns whether the
+    /// table changed (drives the device-table dirty bit). No-op (false) on
+    /// identity (V32) layers — `mirror_band` owns their tables — and when the
+    /// table already covers `tokens`. Exhaustion here is a HARD error: the
+    /// engine's page-availability admission (conservative full-projection
+    /// reserve) must make it unreachable.
+    pub(crate) fn flashmla_ensure_band(
+        &mut self,
+        ctx: &DeviceContext,
+        slot_idx: usize,
+        tokens: usize,
+    ) -> Result<bool> {
+        if !self.flashmla_demand_paged {
+            return Ok(false);
+        }
+        let needed = self.flashmla_band_pages_for(tokens);
+        let page_bytes = self.flashmla_page_bytes;
+        let pool = self.flashmla_pool_mut()?;
+        let have = pool.page_indices(slot_idx).len();
+        if have >= needed {
+            return Ok(false);
+        }
+        let new_pages = pool.band_extend(slot_idx, needed - have).map_err(|e| {
+            anyhow!(
+                "DSv4 FlashMLA layer pool exhausted growing slot {slot_idx} to {tokens} tokens \
+                 ({have}->{needed} pages) — page-availability admission should make this \
+                 unreachable: {e}"
+            )
+        })?;
+        let payload = vec![0u8; new_pages.len() * page_bytes];
+        self.flashmla_pool_mut()?
+            .copy_pages_from_host(ctx, &new_pages, &payload)
+            .map_err(|e| anyhow!("DSv4 FlashMLA demand-page zero failed: {e}"))?;
+        Ok(true)
     }
 
     /// H2: clamp the FlashMLA pool's per-slot append cursor back to `new_len`
@@ -409,6 +477,7 @@ impl Dsv4KvAdapter {
         kv_arena: &Dsv4MlaKvArena,
         tp_world: usize,
         num_slots: usize,
+        pool_tokens: usize,
         mla_decode: Vec<Option<Dsv4MlaDecodeGraphScratch>>,
         moe_decode: Option<(
             &infer_moe::MoeConfig,
@@ -438,6 +507,7 @@ impl Dsv4KvAdapter {
                     local_heads,
                     tp_world,
                     num_slots,
+                    pool_tokens,
                 )
             })
             .collect::<Result<Vec<_>>>()?;
@@ -568,6 +638,8 @@ impl Dsv4KvAdapter {
             layers,
             num_slots,
             slot_epochs: vec![None; num_slots],
+            ctx: ctx.clone(),
+            flashmla_pool_tokens: pool_tokens,
             dsa_shared,
             moe_decode_shared,
             moe_tail_scratch,
@@ -797,12 +869,24 @@ impl Dsv4KvAdapter {
             .ok_or_else(|| anyhow!("DSv4 attention pool layer {layer_idx} outside len {len}"))
     }
 
-    /// Must track the same layer `flashmla_max_slot_pages` maximizes over —
-    /// each layer's pool is sized to its OWN `flashmla_slot_pages` (per-layer
-    /// budget), so `.first()` (often the cheapest layer) under-sized the host
-    /// page-id space below `fixed_pages_per_slot` (#85; see
+    /// Whether the model's FlashMLA bands are demand-paged (#154 Phase 3b) —
+    /// uniform across layers (MODEL1 vs V32 is a model-wide shape).
+    pub(crate) fn flashmla_demand_paged(&self) -> bool {
+        self.layers.iter().any(|l| l.flashmla_demand_paged)
+    }
+
+    /// Engine-facing admission page count. Demand-paged (#154 Phase 3b): the
+    /// solved shared token capacity in engine 64-token pages — the host pool
+    /// gates admission on token-projection availability against this.
+    /// Identity (V32): the physical page count of the binding layer's pool,
+    /// which must track the same layer `flashmla_max_slot_pages` maximizes
+    /// over (#85; see
     /// docs/experience/errors/2026-07-08-dsv4-slot-abort-band-leak-crash.md).
     pub(crate) fn flashmla_total_pages(&self) -> Option<usize> {
+        if self.flashmla_demand_paged() {
+            let page = self.flashmla_page_size().unwrap_or(0).max(1);
+            return Some(self.flashmla_pool_tokens / page);
+        }
         self.layers
             .iter()
             .max_by_key(|l| l.flashmla_slot_pages())
@@ -815,7 +899,13 @@ impl Dsv4KvAdapter {
             .map(Dsv4LayerKvLayout::flashmla_page_size)
     }
 
+    /// Fixed-band admission (identity/V32 only): every slot draws its whole
+    /// band up front. Demand-paged models return None — admission becomes
+    /// token-projection page availability (#154 Phase 3b).
     pub(crate) fn flashmla_max_slot_pages(&self) -> Option<usize> {
+        if self.flashmla_demand_paged() {
+            return None;
+        }
         let pages = self
             .layers
             .iter()
@@ -825,12 +915,17 @@ impl Dsv4KvAdapter {
         (pages > 0).then_some(pages)
     }
 
-    /// Mirror the FULL identity band for `slot` (all `flashmla_slot_pages` of
-    /// every layer) at logical cursor `seq_len`. The prefix restore path needs
-    /// band pages beyond the matched host-page count (SW ring + comp region
-    /// are fixed slot-logical blocks); `prepare_kv_batch` later mirrors the
-    /// same identity list — a no-op under `mirror_band`'s equality fast path.
-    pub(crate) fn mirror_full_band(&mut self, slot: usize, seq_len: usize) -> Result<()> {
+    /// Materialize `slot`'s band for a prefix restore at `seq_len` matched
+    /// tokens. Demand-paged layers allocate ring + comp pages for exactly
+    /// `seq_len` (growth continues page-wise in `prepare_kv_batch`); identity
+    /// (V32) layers mirror the FULL band (SW ring + comp region are fixed
+    /// slot-logical blocks). Both set the logical cursor to `seq_len`.
+    pub(crate) fn mirror_full_band(
+        &mut self,
+        ctx: &DeviceContext,
+        slot: usize,
+        seq_len: usize,
+    ) -> Result<()> {
         ensure!(
             slot < self.num_slots,
             "DSv4 full-band mirror slot {slot} outside adapter slots {}",
@@ -843,12 +938,57 @@ impl Dsv4KvAdapter {
             if lsp == 0 {
                 continue;
             }
+            if layer.flashmla_demand_paged {
+                changed |= layer.flashmla_ensure_band(ctx, slot, seq_len)?;
+                layer.flashmla_pool_mut()?.set_band_cursor(slot, seq_len)?;
+                continue;
+            }
             let Some(pool) = layer.flashmla_kv_pool.as_mut() else {
                 continue;
             };
             pages.clear();
             pages.extend((0..lsp).map(|i| (slot * lsp + i) as u32));
             changed |= pool.mirror_band(slot, &pages, seq_len)?;
+        }
+        self.device_table_dirty[slot] |= changed;
+        Ok(())
+    }
+
+    /// Materialize `slot`'s band for a DIRECT forward that bypasses
+    /// `prepare_kv_batch` (boot selftest / parity examples), cursor at 0:
+    /// demand layers allocate ring + comp pages for `tokens` (claim-zeroed);
+    /// identity layers mirror their full identity band. The caller must
+    /// consume the dirty bit and refresh the device page tables before the
+    /// forward — the codex-flagged selftest bug was running kernels against
+    /// never-refreshed (all-zero) device tables.
+    pub(crate) fn prepare_direct_forward(
+        &mut self,
+        ctx: &DeviceContext,
+        slot: usize,
+        tokens: usize,
+    ) -> Result<()> {
+        ensure!(
+            slot < self.num_slots,
+            "DSv4 direct-forward prep slot {slot} outside adapter slots {}",
+            self.num_slots
+        );
+        let mut changed = false;
+        let mut pages: Vec<u32> = Vec::new();
+        for layer in &mut self.layers {
+            let lsp = layer.flashmla_slot_pages();
+            if lsp == 0 {
+                continue;
+            }
+            if layer.flashmla_demand_paged {
+                changed |= layer.flashmla_ensure_band(ctx, slot, tokens)?;
+                continue;
+            }
+            let Some(pool) = layer.flashmla_kv_pool.as_mut() else {
+                continue;
+            };
+            pages.clear();
+            pages.extend((0..lsp).map(|i| (slot * lsp + i) as u32));
+            changed |= pool.mirror_band(slot, &pages, 0)?;
         }
         self.device_table_dirty[slot] |= changed;
         Ok(())
@@ -930,20 +1070,35 @@ impl ModelKvAdapter for Dsv4KvAdapter {
             };
             let layer_count = self.layers.len();
             let mut band_changed = false;
+            // Demand bands ensure past the appended range by the MTP verify
+            // margin: a spec step writes ring/comp state for up to depth+1
+            // draft positions beyond the committed cursor, and the commit
+            // fold advances by up to the same — all inside ONE tick, after
+            // this (the only) alloc point. ≤ one extra comp page, budgeted by
+            // `DSV4_COMP_SAFETY_PAGES_PER_SLOT`.
+            let ensure_tokens =
+                row.append_pos + row.append_len + crate::dsv4::MAX_SPEC_DRAFT_DEPTH + 1;
+            let ctx = self.ctx.clone();
             for layer_idx in 0..layer_count {
                 let layer = self.layer_mut(layer_idx)?;
                 let lsp = layer.flashmla_slot_pages();
                 if lsp == 0 {
                     continue;
                 }
-                // Identity band, real pages only (#154): host page i of this
-                // slot is band page slot*lsp + i; the fixed-size device table
-                // is padded at the device-format boundary (flashmla refresh).
-                layer_pages.clear();
-                layer_pages
-                    .extend((0..slot_pages.len().min(lsp)).map(|i| (row.slot * lsp + i) as u32));
-                if let Some(pool) = layer.flashmla_kv_pool.as_mut() {
-                    band_changed |= pool.mirror_band(row.slot, &layer_pages, row.append_pos)?;
+                if layer.flashmla_demand_paged {
+                    band_changed |= layer.flashmla_ensure_band(&ctx, row.slot, ensure_tokens)?;
+                } else {
+                    // Identity band, real pages only (#154): host page i of
+                    // this slot is band page slot*lsp + i; the fixed-size
+                    // device table is padded at the device-format boundary
+                    // (flashmla refresh).
+                    layer_pages.clear();
+                    layer_pages.extend(
+                        (0..slot_pages.len().min(lsp)).map(|i| (row.slot * lsp + i) as u32),
+                    );
+                    if let Some(pool) = layer.flashmla_kv_pool.as_mut() {
+                        band_changed |= pool.mirror_band(row.slot, &layer_pages, row.append_pos)?;
+                    }
                 }
                 ensure!(
                     layer
@@ -990,8 +1145,9 @@ impl Dsv4LayerKvLayout {
         local_heads: usize,
         tp_world: usize,
         num_slots: usize,
+        pool_tokens: usize,
     ) -> Result<Self> {
-        let flashmla_slot_pages = if dsv4_flashmla_decode_alloc_enabled()? {
+        let (flashmla_slot_pages, flashmla_sw_blocks) = if dsv4_flashmla_decode_alloc_enabled()? {
             let shape = Dsv4FlashMlaDecodeShape::new(
                 config,
                 mode,
@@ -1001,10 +1157,20 @@ impl Dsv4LayerKvLayout {
                 local_heads,
                 tp_world,
             )?;
-            shape.total_blocks
+            (shape.total_blocks, shape.sw_blocks)
         } else {
-            0
+            (0, 0)
         };
+        let flashmla_demand_paged =
+            flashmla_slot_pages > 0 && super::dsv4_flashmla_demand_paged(config);
+        let flashmla_comp_tokens_per_page =
+            if flashmla_demand_paged && mode != DeepSeekV4AttentionMode::SlidingWindow {
+                kv_arena
+                    .page_block_size
+                    .saturating_mul(compress_ratio.max(1))
+            } else {
+                0
+            };
         let flashmla_page_bytes = kv_arena
             .page_block_size
             .checked_mul(kv_arena.bytes_per_token)
@@ -1025,16 +1191,23 @@ impl Dsv4LayerKvLayout {
                 format.default_page_size(),
                 kv_arena.page_block_size
             );
-            // #85 Stage-B / KV-budget convergence: each layer is sized for its
-            // OWN real need — `num_slots` whole bands of this layer's own
-            // `flashmla_slot_pages` — not a uniform per-layer share of the
-            // pool total. `kv_budget_plan`'s pool-affordable-slots re-clamp
-            // (pod-verified 2026-07-06) already sizes `num_slots` against the
-            // SUM of every layer's pages, so summing each layer's own exact
-            // band here reconstructs that same total, per layer, exactly.
-            let budget_bytes = num_slots
-                .saturating_mul(flashmla_slot_pages)
-                .saturating_mul(flashmla_page_bytes);
+            // #154 Phase 3b: each layer is sized by the ONE shared formula
+            // (`dsv4_flashmla_layer_pool_pages`) — identity layers get
+            // `num_slots` whole bands; demand-paged layers get per-slot
+            // ring/safety pages plus the SHARED comp capacity for
+            // `pool_tokens` total tokens. `kv_budget_plan` solves
+            // `pool_tokens` against the SAME formula, so budget and alloc
+            // cannot drift.
+            let pool_pages = super::dsv4_flashmla_layer_pool_pages(
+                config,
+                mode,
+                compress_ratio,
+                max_seq_len,
+                kv_arena.page_block_size,
+                num_slots,
+                pool_tokens,
+            )?;
+            let budget_bytes = pool_pages.saturating_mul(flashmla_page_bytes);
             let pool = TokenKVPool::with_format(
                 ctx,
                 1,
@@ -1045,18 +1218,25 @@ impl Dsv4LayerKvLayout {
                 format,
             )
             .map_err(|e| anyhow!("DSv4 shared FlashMLA pool alloc failed: {e}"))?;
-            // Sanity: the pool must cover every slot's band, not just one — catches
-            // a `kv_budget_plan` clamp regression here instead of a mid-serve
-            // `alloc_fixed_band` bail (pod-verified 2026-07-06: a 2-request
-            // concurrent burst crashed the coordinator before this was in place).
+            // Sanity: identity pools must cover every slot's whole band;
+            // demand pools at least one full-length request's band on top of
+            // the per-slot ring/safety reserve — catches a `kv_budget_plan`
+            // regression here instead of a mid-serve exhaustion bail
+            // (pod-verified 2026-07-06: the two gates disagreeing crashed
+            // every worker rank).
+            let min_pages = if flashmla_demand_paged {
+                num_slots
+                    .saturating_mul(flashmla_sw_blocks)
+                    .saturating_add(flashmla_slot_pages)
+            } else {
+                num_slots.saturating_mul(flashmla_slot_pages)
+            };
             ensure!(
-                pool.page_size == kv_arena.page_block_size
-                    && pool.max_total_pages >= num_slots.saturating_mul(flashmla_slot_pages),
-                "DSv4 FlashMLA pool page mismatch: page_size={} pages={} need page_size={} pages>={}",
+                pool.page_size == kv_arena.page_block_size && pool.max_total_pages >= min_pages,
+                "DSv4 FlashMLA pool page mismatch: page_size={} pages={} need page_size={} pages>={min_pages}",
                 pool.page_size,
                 pool.max_total_pages,
                 kv_arena.page_block_size,
-                num_slots.saturating_mul(flashmla_slot_pages)
             );
             Some(pool)
         } else {
@@ -1096,6 +1276,9 @@ impl Dsv4LayerKvLayout {
             dsa_key_cache,
             flashmla_slot_pages,
             flashmla_page_bytes,
+            flashmla_demand_paged,
+            flashmla_sw_blocks,
+            flashmla_comp_tokens_per_page,
             dsa_slot_bytes,
             num_slots,
         })
