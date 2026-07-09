@@ -47,3 +47,4 @@ scripts/_pod_*
 .kami-lark/*
 .pod_pipeline_ref
 logs/
+data/opd-corpora/
