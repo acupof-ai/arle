@@ -10,6 +10,10 @@
 // `infer-server`/agent-bench builds and unit tests compile without `metal`.
 mod executor;
 mod kv_pool;
+// CLI-driven runtime toggles (EngineLoadConfig.metal → statics; no env reads).
+// Feature-free: plain host statics, applied by infer-api before construction.
+mod runtime_flags;
+pub use runtime_flags::apply_runtime_flags;
 
 #[cfg(feature = "metal")]
 mod config;

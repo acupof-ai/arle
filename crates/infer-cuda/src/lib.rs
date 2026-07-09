@@ -66,6 +66,11 @@ mod loader;
 mod model;
 #[cfg(feature = "cuda")]
 mod numa_pin;
+// CLI-driven runtime toggles (EngineLoadConfig.cuda → statics; no env reads).
+#[cfg(feature = "cuda")]
+mod runtime_flags;
+#[cfg(feature = "cuda")]
+pub use runtime_flags::apply_runtime_flags;
 #[cfg(feature = "cuda")]
 mod nvtx;
 #[cfg(feature = "cuda")]
@@ -101,7 +106,7 @@ pub use qwen35::{
 
 // Load-time decode-graph default setter (CLI `--cuda-graph` → engine). Lets the
 // `enable_cuda_graph` load flag actually gate the B=1 decode graph instead of
-// being discarded; the `INFER_CUDA_DECODE_GRAPH` env var still overrides.
+// being discarded; the `--no-cuda-graph` flag controls it.
 /// CUDA KV-cache dtype resolution (#68): resolves the seam request against the
 /// CUDA support matrix, failing loud on unwired paged quant modes.
 #[cfg(feature = "cuda")]
@@ -116,9 +121,9 @@ pub use kv_tier::{default_t2_budget_bytes, resolve_dram_budget_bytes};
 #[cfg(feature = "nccl")]
 pub use loader::mint_nccl_unique_id_hex;
 
-/// Process-local override for DSv4 FlashMLA decode dispatch. `None` restores the
-/// `ARLE_DSV4_FLASHMLA_DECODE` env gate. Intended for resident A/B harnesses
-/// that need to compare scalar vs FlashMLA after one model load.
+/// Process-local override for DSv4 FlashMLA decode dispatch. `None` restores
+/// the `--dsv4-flashmla-decode` flag default. Intended for resident A/B
+/// harnesses that need to compare scalar vs FlashMLA after one model load.
 #[cfg(feature = "cuda")]
 pub fn set_dsv4_flashmla_decode_override(enabled: Option<bool>) {
     attention::set_dsv4_flashmla_decode_override(enabled);
@@ -127,6 +132,13 @@ pub fn set_dsv4_flashmla_decode_override(enabled: Option<bool>) {
 #[cfg(feature = "cuda")]
 pub fn set_dsv4_fused_wqkv_decode_override(enabled: Option<bool>) {
     attention::set_dsv4_fused_wqkv_decode_override(enabled);
+}
+
+/// Process-local toggle for the DSv4 contiguous-decode MoE path
+/// (`--dsv4-moe-contig-decode`). Same A/B-harness intent as the overrides above.
+#[cfg(feature = "cuda")]
+pub fn set_dsv4_moe_contig_decode(enabled: bool) {
+    runtime_flags::set_dsv4_moe_contig_decode(enabled);
 }
 
 #[cfg(feature = "cuda")]

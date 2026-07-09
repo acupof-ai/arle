@@ -32,6 +32,8 @@ mod kv_query;
 mod prefix_store;
 #[path = "resource.rs"]
 mod resource;
+#[path = "runtime_flags.rs"]
+mod runtime_flags;
 
 pub use allocator::KvAllocator;
 pub use diffusion_executor::BufferedDiffusionExecutor;
@@ -46,6 +48,7 @@ pub use resource::{
     DramTierPolicy, NvmeTierPolicy, PROFILE_KV_TOKENS_FLOOR, SlotBudget, clamp_mem_fraction_static,
     clamp_to_affordable, dram_l2_budget, nvme_l3_budget, profile_kv_pool_tokens,
 };
+pub use runtime_flags::{CommBackend, CudaRuntimeFlags, MetalRuntimeFlags};
 
 /// Result of polling a submitted executor step.
 #[derive(Debug, Clone)]

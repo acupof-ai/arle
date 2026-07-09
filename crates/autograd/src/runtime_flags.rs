@@ -1,0 +1,98 @@
+//! Train-time runtime toggles: `arle train … --flag` →
+//! [`apply_runtime_flags`] once at CLI start. The statics are the single
+//! truth — no env reads.
+
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
+
+/// Autograd knobs the OPD CLI flags control (defaults = shipped behavior).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AutogradRuntimeFlags {
+    /// Min tensor bytes for checkpoint host offload (`--checkpoint-offload-min-bytes`).
+    pub checkpoint_offload_min_bytes: usize,
+    /// Trim the device pool after each checkpoint replay (`--trim-after-checkpoint-replay`).
+    pub trim_after_checkpoint_replay: bool,
+    /// Legacy full-matmul LoRA linear backward A/B arm (`--legacy-lora-linear-bwd`).
+    pub legacy_lora_linear_bwd: bool,
+    /// Row tile for the LoRA linear backward (`--lora-linear-bwd-tile-rows`).
+    pub lora_linear_bwd_tile_rows: usize,
+    /// Legacy unchunked SDPA backward A/B arm (`--legacy-sdpa-bwd`).
+    pub legacy_sdpa_bwd: bool,
+    /// Expert tile for the MoE LoRA backward (`--moe-lora-bwd-expert-tile`).
+    pub moe_lora_bwd_expert_tile: usize,
+    /// FlashQLA chunkwise GDN prefill in the CUDA backend (`--gdr-chunkwise-prefill`).
+    pub gdr_chunkwise_prefill: bool,
+    /// Force the monolithic chunked-scan linear-attention backward (`--la-backward-mono`).
+    pub la_backward_mono: bool,
+    /// Force the legacy two-pass decode attention kernel (`--autograd-decode-attn-legacy`).
+    pub decode_attn_legacy: bool,
+}
+
+impl Default for AutogradRuntimeFlags {
+    fn default() -> Self {
+        Self {
+            checkpoint_offload_min_bytes: 2 << 20,
+            trim_after_checkpoint_replay: false,
+            legacy_lora_linear_bwd: false,
+            lora_linear_bwd_tile_rows: 1024,
+            legacy_sdpa_bwd: false,
+            moe_lora_bwd_expert_tile: 16,
+            gdr_chunkwise_prefill: false,
+            la_backward_mono: false,
+            decode_attn_legacy: false,
+        }
+    }
+}
+
+static CHECKPOINT_OFFLOAD_MIN_BYTES: AtomicUsize = AtomicUsize::new(2 << 20);
+static TRIM_AFTER_CHECKPOINT_REPLAY: AtomicBool = AtomicBool::new(false);
+static LEGACY_LORA_LINEAR_BWD: AtomicBool = AtomicBool::new(false);
+static LORA_LINEAR_BWD_TILE_ROWS: AtomicUsize = AtomicUsize::new(1024);
+static LEGACY_SDPA_BWD: AtomicBool = AtomicBool::new(false);
+static MOE_LORA_BWD_EXPERT_TILE: AtomicUsize = AtomicUsize::new(16);
+static GDR_CHUNKWISE_PREFILL: AtomicBool = AtomicBool::new(false);
+static LA_BACKWARD_MONO: AtomicBool = AtomicBool::new(false);
+static DECODE_ATTN_LEGACY: AtomicBool = AtomicBool::new(false);
+
+pub fn apply_runtime_flags(f: &AutogradRuntimeFlags) {
+    CHECKPOINT_OFFLOAD_MIN_BYTES.store(f.checkpoint_offload_min_bytes, Relaxed);
+    TRIM_AFTER_CHECKPOINT_REPLAY.store(f.trim_after_checkpoint_replay, Relaxed);
+    LEGACY_LORA_LINEAR_BWD.store(f.legacy_lora_linear_bwd, Relaxed);
+    LORA_LINEAR_BWD_TILE_ROWS.store(f.lora_linear_bwd_tile_rows.max(1), Relaxed);
+    LEGACY_SDPA_BWD.store(f.legacy_sdpa_bwd, Relaxed);
+    MOE_LORA_BWD_EXPERT_TILE.store(f.moe_lora_bwd_expert_tile.max(1), Relaxed);
+    GDR_CHUNKWISE_PREFILL.store(f.gdr_chunkwise_prefill, Relaxed);
+    LA_BACKWARD_MONO.store(f.la_backward_mono, Relaxed);
+    DECODE_ATTN_LEGACY.store(f.decode_attn_legacy, Relaxed);
+}
+
+pub(crate) fn checkpoint_offload_min_bytes() -> usize {
+    CHECKPOINT_OFFLOAD_MIN_BYTES.load(Relaxed)
+}
+pub(crate) fn trim_after_checkpoint_replay() -> bool {
+    TRIM_AFTER_CHECKPOINT_REPLAY.load(Relaxed)
+}
+pub(crate) fn legacy_lora_linear_bwd() -> bool {
+    LEGACY_LORA_LINEAR_BWD.load(Relaxed)
+}
+pub(crate) fn lora_linear_bwd_tile_rows() -> usize {
+    LORA_LINEAR_BWD_TILE_ROWS.load(Relaxed)
+}
+pub(crate) fn legacy_sdpa_bwd() -> bool {
+    LEGACY_SDPA_BWD.load(Relaxed)
+}
+pub(crate) fn moe_lora_bwd_expert_tile() -> usize {
+    MOE_LORA_BWD_EXPERT_TILE.load(Relaxed)
+}
+#[cfg_attr(feature = "no-cuda", allow(dead_code))]
+pub(crate) fn gdr_chunkwise_prefill() -> bool {
+    GDR_CHUNKWISE_PREFILL.load(Relaxed)
+}
+/// Also a test A/B lever (`set_la_backward_mono`).
+#[cfg_attr(feature = "no-cuda", allow(dead_code))]
+pub(crate) fn la_backward_mono() -> bool {
+    LA_BACKWARD_MONO.load(Relaxed)
+}
+#[cfg_attr(feature = "no-cuda", allow(dead_code))]
+pub(crate) fn decode_attn_legacy() -> bool {
+    DECODE_ATTN_LEGACY.load(Relaxed)
+}
