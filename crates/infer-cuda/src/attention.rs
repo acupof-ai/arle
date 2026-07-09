@@ -166,7 +166,6 @@ pub(crate) fn commit_layer_fold(
             compressor,
             gathered,
             compressor_state,
-            pool.compress_state_pool_mut(),
             head_dim,
             compress_ratio,
             overlap,
@@ -203,7 +202,6 @@ pub(crate) fn commit_layer_fold(
                     .expect("DSv4 CSA indexer has a key compressor"),
                 gathered,
                 indexer_state,
-                pool.indexer_compress_state_pool_mut(),
                 config.index_head_dim,
                 compress_ratio,
                 true,
@@ -276,14 +274,6 @@ pub(crate) fn commit_layer_fold(
         start_pos,
         None,
         config,
-    )?;
-    snapshot_sw_ring_at_boundary(
-        ctx,
-        pool,
-        &state.sw_window_cache,
-        start_pos,
-        k_prepared.seq_len,
-        config.sliding_window,
     )?;
 
     // ── FP8 SW ring pack for the accepted positions (table-routed strided
@@ -2089,38 +2079,6 @@ fn update_bf16_sw_window(
     Ok(())
 }
 
-/// Snapshot the whole live ring into `pool`'s SW-ring pool when this call's
-/// end position lands on a `sliding_window` boundary — the chunked-prefill
-/// chunk size (a `sliding_window` multiple) plus the radix-floor restore
-/// invariant keep every real call boundary aligned (see
-/// `Dsv4SwRingSnapshotPool`'s doc in `kv_layout.rs`). No-op without a ring
-/// pool (GLM pure-SparseIndexed) or off-boundary.
-///
-/// UNVERIFIED for the decode call site: if this ever runs during CUDA-graph
-/// capture, the D2D copy below bakes into the graph at the CAPTURE-time
-/// boundary state and would not react to a different REPLAY-time position —
-/// needs pod verification before shipping wider than eager decode.
-fn snapshot_sw_ring_at_boundary(
-    ctx: &DeviceContext,
-    pool: &mut Dsv4LayerKvLayout,
-    sw_window_cache: &CudaSlice<half::bf16>,
-    start_pos: usize,
-    seq_len: usize,
-    sliding_window: usize,
-) -> Result<()> {
-    if seq_len == 0 || sliding_window == 0 {
-        return Ok(());
-    }
-    let new_pos = start_pos + seq_len;
-    if !new_pos.is_multiple_of(sliding_window) {
-        return Ok(());
-    }
-    let Some(ring_pool) = pool.sw_ring_pool_mut() else {
-        return Ok(());
-    };
-    ring_pool.snapshot_from_ring(ctx, sw_window_cache, new_pos / sliding_window - 1)
-}
-
 /// Batched DSv4 sparse-verify attention metadata. Row `r` is at
 /// `positions[r]` and attends committed KV plus the listed earlier chunk
 /// ancestors and self. The caller decides whether those rows are a linear chain
@@ -2187,7 +2145,6 @@ fn try_flashmla_prefill_attention(
     selected: Option<&CudaSlice<i32>>,
     compressed: Option<&HiddenStates>,
     sw_window_cache: &mut CudaSlice<half::bf16>,
-    pool: &mut Dsv4LayerKvLayout,
     start_pos: usize,
     chain_verify: Option<&Dsv4ChainVerifyAttnMeta>,
     tp: &TpRuntime,
@@ -2653,14 +2610,6 @@ fn try_flashmla_prefill_attention(
 
     if chain_verify.is_none() {
         update_bf16_sw_window(ctx, sw_window_cache, k_prepared, start_pos, None, config)?;
-        snapshot_sw_ring_at_boundary(
-            ctx,
-            pool,
-            sw_window_cache,
-            start_pos,
-            k_prepared.seq_len,
-            config.sliding_window,
-        )?;
     }
 
     // Keep temporary buffers in scope until all launches that use their raw
@@ -4019,7 +3968,6 @@ fn compressor_forward_decode_graph(
     compressor: &Dsv4Compressor,
     hidden: &HiddenStates,
     state: &mut Dsv4CompressorState,
-    compress_pool: Option<&mut Dsv4CompressStatePool>,
     head_dim: usize,
     ratio: usize,
     overlap: bool,
@@ -4059,7 +4007,6 @@ fn compressor_forward_decode_graph(
         compressor,
         hidden,
         state,
-        compress_pool,
         head_dim,
         ratio,
         overlap,
@@ -4263,7 +4210,6 @@ pub(crate) fn mla_attention_decode_graph(
             state.compressor.as_mut().ok_or_else(|| {
                 anyhow!("DSv4 layer {layer_idx} is {mode:?} but has no compressor state")
             })?,
-            pool.compress_state_pool_mut(),
             head_dim,
             compress_ratio,
             compress_ratio < 16,
@@ -4329,7 +4275,6 @@ pub(crate) fn mla_attention_decode_graph(
                 indexer_compressor,
                 hidden,
                 indexer_state,
-                pool.indexer_compress_state_pool_mut(),
                 config.index_head_dim,
                 compress_ratio,
                 true,
@@ -5262,7 +5207,6 @@ pub(crate) fn mla_attention_prepare(
                     compressor,
                     hidden,
                     compressor_state,
-                    pool.compress_state_pool_mut(),
                     head_dim,
                     compress_ratio,
                     overlap,
@@ -5323,7 +5267,6 @@ pub(crate) fn mla_attention_prepare(
                             .expect("DSv4 CSA indexer has a key compressor"),
                         hidden,
                         indexer_state,
-                        pool.indexer_compress_state_pool_mut(),
                         config.index_head_dim,
                         compress_ratio,
                         true,
@@ -5728,10 +5671,6 @@ pub(crate) fn mla_attention_compressor_defer_row(
     layer_idx: usize,
     normed_row: &HiddenStates,
     state: &mut Dsv4LayerAttentionState,
-    // This layer's KV layout, for the main/indexer compress-state pool
-    // accessors (mirrors the other `mla_attention_*` orchestration functions,
-    // all of which already take `pool`).
-    pool: &mut Dsv4LayerKvLayout,
     start_pos: usize,
     start_pos_device: Option<&CudaSlice<i32>>,
     original_seq_len: i32,
@@ -5765,7 +5704,6 @@ pub(crate) fn mla_attention_compressor_defer_row(
             compressor,
             normed_row,
             compressor_state,
-            pool.compress_state_pool_mut(),
             head_dim,
             compress_ratio,
             overlap,
@@ -5810,7 +5748,6 @@ pub(crate) fn mla_attention_compressor_defer_row(
                 .expect("DSv4 CSA indexer has a key compressor"),
             normed_row,
             indexer_state,
-            pool.indexer_compress_state_pool_mut(),
             config.index_head_dim,
             compress_ratio,
             true,
@@ -5961,7 +5898,6 @@ pub(crate) fn mla_attention_prepare_compressed_only(
                     compressor,
                     normed_row,
                     compressor_state,
-                    pool.compress_state_pool_mut(),
                     head_dim,
                     compress_ratio,
                     overlap,
@@ -6026,7 +5962,6 @@ pub(crate) fn mla_attention_prepare_compressed_only(
                             .expect("DSv4 CSA indexer has a key compressor"),
                         normed_row,
                         indexer_state,
-                        pool.indexer_compress_state_pool_mut(),
                         config.index_head_dim,
                         compress_ratio,
                         true,
@@ -6216,7 +6151,6 @@ fn mla_attention_fwd(
                 None,
                 None,
                 &mut state.sw_window_cache,
-                pool,
                 start_pos,
                 Some(meta),
                 tp,
@@ -6339,14 +6273,6 @@ fn mla_attention_fwd(
                 }
             }
         }
-        snapshot_sw_ring_at_boundary(
-            ctx,
-            pool,
-            &state.sw_window_cache,
-            start_pos,
-            token_count,
-            config.sliding_window,
-        )?;
     } else {
         // ── 4b(fwd). CSA / HCA: hybrid windowed+compressed attention over the
         // compressor pool (re-borrowed from `state`) + PREPARE's `selected`.
@@ -6396,7 +6322,6 @@ fn mla_attention_fwd(
             selected.as_ref(),
             compressed,
             &mut state.sw_window_cache,
-            pool,
             start_pos,
             chain_verify,
             tp,
@@ -7526,13 +7451,6 @@ fn compressor_forward(
     compressor: &Dsv4Compressor,
     hidden: &HiddenStates,
     state: &mut Dsv4CompressorState,
-    // This layer's/sub-state's (main vs indexer) shared page-addressable pool
-    // for `prev_overlap_kv/score`. `Some` redirects BOTH the direct-FFI path
-    // and the deferred/batched path (via
-    // `Dsv4CompressorState::batched_update_ptrs`) to the pool instead of
-    // `state`'s own per-slot buffers. `None` is byte-identical to the
-    // single-register form.
-    mut compress_pool: Option<&mut Dsv4CompressStatePool>,
     head_dim: usize,
     ratio: usize,
     overlap: bool,
@@ -7610,11 +7528,7 @@ fn compressor_forward(
         );
         // Frozen-KV verify never advances state (P1-1) — same guard as the FFI path.
         if !dsv4_verify_frozen() {
-            if let Some(pool) = compress_pool.as_deref_mut() {
-                let n_new = compressed_rows.saturating_sub(compressed_base);
-                pool.mark_written_range(compressed_base, n_new);
-            }
-            sink.push(state.batched_update_ptrs(ctx, compress_pool));
+            sink.push(state.batched_update_ptrs(ctx));
             state.compressed.seq_len = compressed_rows;
         }
         return Ok(());
@@ -7691,27 +7605,12 @@ fn compressor_forward(
         let (norm_ptr, _ng) = compressor.norm.data.device_ptr(&ctx.stream);
         let (pkv_ptr, _pkg) = state.pending_kv.device_ptr_mut(&ctx.stream);
         let (psc_ptr, _psg) = state.pending_score.device_ptr_mut(&ctx.stream);
-        // `compress_pool` present ⇒ resolve prev_overlap from the shared
-        // pool's base and pass its `ratio*head_dim` page stride; `None` ⇒
-        // resolve from `state`'s own per-slot buffer with stride 0 (collapses
-        // the kernel's indexing to the single-register form).
-        let (prkv_ptr, prsc_ptr, overlap_page_stride) = match compress_pool {
-            Some(pool) => {
-                let n_new = compressed_rows.saturating_sub(compressed_base);
-                pool.mark_written_range(compressed_base, n_new);
-                let (kv, score) = pool.base_ptrs_mut(ctx);
-                (
-                    kv,
-                    score,
-                    Dsv4CompressStatePool::page_stride(head_dim, ratio),
-                )
-            }
-            None => {
-                let (kv, _kg2) = state.prev_overlap_kv.device_ptr_mut(&ctx.stream);
-                let (score, _sg2) = state.prev_overlap_score.device_ptr_mut(&ctx.stream);
-                (kv, score, 0)
-            }
-        };
+        // #154: prev_overlap always resolves from `state`'s own per-slot
+        // buffer; stride 0 collapses the kernel's indexing to the
+        // single-register form (the shared pool was deleted with Route A).
+        let (prkv_ptr, _kg2) = state.prev_overlap_kv.device_ptr_mut(&ctx.stream);
+        let (prsc_ptr, _sg2) = state.prev_overlap_score.device_ptr_mut(&ctx.stream);
+        let overlap_page_stride = 0i32;
         let (comp_ptr, _cg) = state.compressed.data.device_ptr_mut(&ctx.stream);
         let has_prev_overlap = i32::from(compressed_base > 0);
         // SAFETY: all buffers valid on ctx.stream; state carries the pending and
@@ -7736,7 +7635,7 @@ fn compressor_forward(
                         ratio as i32,
                         width as i32,
                         i32::from(overlap),
-                        overlap_page_stride as i32,
+                        overlap_page_stride,
                         config.rms_norm_eps,
                         rope_dim as i32,
                         rope_base,
@@ -7767,7 +7666,7 @@ fn compressor_forward(
                         width as i32,
                         i32::from(overlap),
                         has_prev_overlap,
-                        overlap_page_stride as i32,
+                        overlap_page_stride,
                         config.rms_norm_eps,
                         rope_dim as i32,
                         rope_base,
@@ -7981,11 +7880,8 @@ pub(crate) struct Dsv4IndexerQueryPrecomputed<'a> {
 /// Host-gathered per-row device pointer arrays for one compressor's batched
 /// state update, uploaded to device `*_arr` arrays by
 /// [`dsv4_compressor_update_batched`]. Built over the prepare loop's row order
-/// (push exactly one entry per row). `pending_kv`/`pending_score`/`compressed`
-/// are always per-row; `prev_overlap_kv`/`_score` are per-row ONLY when the
-/// layer has no compress-state pool (`compress_pool: None`) — when it does
-/// (compress_ratio==4), every row's entry is the SAME shared pool base
-/// pointer, not a distinct per-row buffer (see `Dsv4CompressStatePool`).
+/// (push exactly one entry per row); all five arrays hold per-row per-slot
+/// buffers (#154: the shared compress-state pool was deleted with Route A).
 #[derive(Default)]
 pub(crate) struct Dsv4CompressorBatchPtrs {
     pub(crate) pending_kv: Vec<u64>,
@@ -8345,10 +8241,6 @@ pub(crate) fn dsv4_compressor_update_batched(
     head_dim: usize,
     ratio: usize,
     overlap: bool,
-    // `ratio*head_dim` when `ptrs.prev_overlap_kv/_score` point at a shared
-    // `Dsv4CompressStatePool` (compress_ratio==4); `0` otherwise — see
-    // `compressor_forward`/`Dsv4CompressorBatchPtrs`.
-    overlap_page_stride: usize,
     apply_rope: bool,
     rope_original_seq_len: i32,
     ptr_keepalive: &mut Vec<CudaSlice<u64>>,
@@ -8429,7 +8321,7 @@ pub(crate) fn dsv4_compressor_update_batched(
                 ratio as i32,
                 width as i32,
                 i32::from(overlap),
-                overlap_page_stride as i32,
+                0, // overlap_page_stride: per-slot register form (#154 D1)
                 config.rms_norm_eps,
                 rope_dim as i32,
                 rope_base,
@@ -9157,22 +9049,6 @@ fn csa_select_official(
                 )
                 .result()?;
             }
-        }
-        // Write-mirror into the cross-request-shared shadow pool: keeps this
-        // row range durably readable across slot reuse without touching the
-        // slot-keyed live read/write kernels above.
-        let mirror_range = pool.dsa_slot_range(official.slot_idx)?;
-        if let (Some(slot_band), Some(dsa_pool)) = (
-            pool.dsa_key_cache.as_ref(),
-            pool.dsa_key_cache_pool.as_mut(),
-        ) {
-            dsa_pool.mirror_from_slot_band(
-                ctx,
-                slot_band,
-                mirror_range,
-                official.packed_rows,
-                newly_packed,
-            )?;
         }
         official.packed_rows = indexer_rows_after;
     }
