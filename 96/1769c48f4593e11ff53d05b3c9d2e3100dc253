@@ -1,0 +1,25 @@
+scripts/eval_harness/__init__.py
+  s_3a83af03f773ba::t_aa0efafb28886b 126
+scripts/eval_harness/needle_ladder.py
+  s_3a83af03f773ba::t_51cd8491a4defb 10-11
+scripts/eval_harness/prefix_reuse.py
+  s_3a83af03f773ba::t_3367af409372c4 28-29
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "961769c48f4593e11ff53d05b3c9d2e3100dc253",
+  "prompts": {},
+  "sessions": {
+    "s_3a83af03f773ba": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aaac82b8c031ea081",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
