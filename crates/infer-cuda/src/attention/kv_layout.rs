@@ -1737,6 +1737,9 @@ impl ModelKvAdapter for Dsv4KvAdapter {
             for layer_idx in 0..layer_count {
                 let layer = self.layer_mut(layer_idx)?;
                 let lsp = layer.flashmla_slot_pages();
+                if lsp == 0 {
+                    continue;
+                }
                 // Pad to full lsp so device page table size matches.
                 let mut layer_pages = per_layer_pages[layer_idx].clone();
                 if layer_pages.is_empty() {
