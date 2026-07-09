@@ -262,6 +262,15 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             request.waiting_hint = crate::WaitingRequestHint::default();
             request
         } else {
+            // Preempt-requeue without a slot image = recompute fallback:
+            // count it (the gate's preempt-fired evidence) and log it.
+            self.kv_system_metrics.fallback_recompute =
+                self.kv_system_metrics.fallback_recompute.saturating_add(1);
+            log::info!(
+                "KV-overflow preempt: requeued request {} for recompute (slot {slot}, \
+                 seq_len {demoted_seq_len})",
+                request.handle.id()
+            );
             request.reset_for_recompute()
         };
         self.enqueue_waiting_request(request, bias);
