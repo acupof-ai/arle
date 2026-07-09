@@ -1,0 +1,25 @@
+CHANGELOG.md
+  s_9c91b86ec3fb55::t_c0992b07ecf7c9 28-35
+docs/experience/wins/2026-07-10-dspark-partial-ctx-drafting.md
+  s_9c91b86ec3fb55::t_0cb58bf6557ab7 1,9-10,20-43,47-51
+docs/experience/wins/2026-07-10-env-to-cli-flags-sweep.md
+  s_9c91b86ec3fb55::t_a5823e51dc05b2 20-22
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "ac78d357f0aec3206afbf8c119f5a9e8752873e0",
+  "prompts": {},
+  "sessions": {
+    "s_9c91b86ec3fb55": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4779911a-69b7-49db-bc83-daf5a48d6ca3",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
