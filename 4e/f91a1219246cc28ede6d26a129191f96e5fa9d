@@ -1,0 +1,21 @@
+docs/plans/2026-07-08-dsv4-route-a-page-granular-prefix-reuse.md
+  s_8ed17943fcd258::t_7b1ad16f130871 786-797
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "4ef91a1219246cc28ede6d26a129191f96e5fa9d",
+  "prompts": {},
+  "sessions": {
+    "s_8ed17943fcd258": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2b082648-4bd8-4483-9790-ecdcc74a7070",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
