@@ -66,13 +66,12 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         &mut self,
         slot: usize,
         request: &mut RequestState,
-        prefix_match: PrefixMatch,
+        mut prefix_match: PrefixMatch,
     ) -> Result<()> {
         if self.config.enable_prefix_cache {
             self.prefix_cache_stats.lookups = self.prefix_cache_stats.lookups.saturating_add(1);
         }
 
-        let mut prefix_match = self.clamp_prefix_to_backend(prefix_match);
         // A full-prompt match must still run one genuine forward+sample step —
         // jumping straight to `Decoding` leaves `generated_tokens` empty, and the
         // planner's decode-seed `.or_else` fallback then silently re-feeds the
@@ -80,11 +79,15 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         // docs/experience/errors/2026-07-06-dsv4-concurrent-decode-digit-corruption-unresolved.md,
         // "Layer-0-15 residual bisection" section). Trim the last matched block
         // so the tail always re-prefills through the standard chunked-prefill
-        // path, which samples the first token from real logits.
+        // path, which samples the first token from real logits. The trim runs
+        // BEFORE `clamp_prefix_to_backend` (#154 D4): the clamp's alignment
+        // floor must see the post-trim length, or the pop un-aligns
+        // `matched_len` and the backend's restore predicate rejects it.
         if !prefix_match.is_empty() && prefix_match.matched_len == request.prompt_len() {
             prefix_match.block_ids.pop();
             prefix_match.matched_len = prefix_match.block_ids.len() * self.radix.block_size();
         }
+        let prefix_match = self.clamp_prefix_to_backend(prefix_match);
         if prefix_match.is_empty() {
             request.prefill_start_pos = 0;
             request.phase = RequestPhase::Prefilling { progress: 0 };

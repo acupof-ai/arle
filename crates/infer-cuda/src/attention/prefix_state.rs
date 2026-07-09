@@ -7,6 +7,24 @@
 //! non-matching content never collides (the D1 flaw is unrepresentable).
 //! Zero HBM footprint: the pool IS the L2 tier (`CudaKvTierStore` host level);
 //! L3 is the same store's mmap spill.
+//!
+//! Entry sections split by observability: content sections (band/staging/dsa
+//! rows) are positional storage, capturable post-forward for every completed
+//! page; boundary sections (overlap registers + ring) are transient — the
+//! registers are overwritten every `ratio` tokens and the ring wraps every
+//! `sliding_window` tokens, so they exist only at the forward's own end.
+//! v1 therefore restores at chunk/tick-end boundaries (the planner already
+//! forces prefill chunk ends onto `sliding_window` alignment). v2 (per-page
+//! boundary granularity) needs a kernel-side per-block overlap output buffer
+//! — the CUDA compressor's `overlap_page_stride` param can target a per-slot
+//! capture buffer (no sharing, no D1 risk); design-only, not implemented.
+//!
+//! Under TP every rank redundantly holds its own shard's entries (state is
+//! rank-replicated by construction) — DRAM cost is ×world; a rank-0-only
+//! layout is a later optimization. Weight updates: DSv4 has no live-reload
+//! path (both executor arms bail), the L3 namespace is per-process ephemeral,
+//! and the engine's `invalidate_prefix_cache` drops every entry through the
+//! `release_prefix_pages` seam — no cross-epoch reuse window.
 
 // Restore/L3 halves are wired by the later commits in this series.
 #![allow(dead_code)]
@@ -227,6 +245,10 @@ pub(crate) fn dsv4_prefix_entry_max_bytes(
 pub(crate) struct Dsv4PrefixPageMeta {
     /// Entry carries the boundary sections (restore may commit here).
     pub(crate) boundary: bool,
+    /// Radix publish confirmed this page (executor `save_prefix_sidecar` arm).
+    /// A provisional entry's page id may recycle after an unpublished free —
+    /// its content stays write-only (restore rejects) until confirmed.
+    pub(crate) confirmed: bool,
 }
 
 /// Host-resident content-keyed pool: page id → encoded [`Dsv4PrefixPageEntry`].
@@ -297,12 +319,17 @@ impl Dsv4PrefixStatePool {
                 }
             }
         }
+        // Carry `confirmed` forward: a confirmed id still present is still
+        // radix-held (evict would have dropped it), so any overwrite is a
+        // content-identical sharer's republish.
+        let confirmed = self.meta.get(&page_id).is_some_and(|m| m.confirmed);
         if self
             .meta
             .insert(
                 page_id,
                 Dsv4PrefixPageMeta {
                     boundary: entry.boundary,
+                    confirmed,
                 },
             )
             .is_none()
@@ -310,6 +337,16 @@ impl Dsv4PrefixStatePool {
             self.order.push_back(page_id);
         }
         true
+    }
+
+    /// Radix publish confirmed these pages (they are now radix-retained, so
+    /// their ids cannot recycle while the entries live).
+    pub(crate) fn confirm_pages(&mut self, pages: &[u32]) {
+        for page_id in pages {
+            if let Some(meta) = self.meta.get_mut(page_id) {
+                meta.confirmed = true;
+            }
+        }
     }
 
     fn pop_oldest_other(&mut self, publishing: u32) -> Option<u32> {
@@ -329,8 +366,8 @@ impl Dsv4PrefixStatePool {
 
     pub(crate) fn read_entry(&mut self, page_id: u32) -> Result<Dsv4PrefixPageEntry> {
         ensure!(
-            self.meta.contains_key(&page_id),
-            "prefix-state pool has no entry for host page {page_id}"
+            self.meta.get(&page_id).is_some_and(|m| m.confirmed),
+            "prefix-state pool has no confirmed entry for host page {page_id}"
         );
         let key = tier_key(NS_PREFIX_STATE, u64::from(page_id));
         let bytes = self.store.read(key)?;
@@ -373,15 +410,15 @@ impl Dsv4LayerAttentionState {
         if let Some(flash) = &self.flashmla
             && mode != DeepSeekV4AttentionMode::SlidingWindow
             && flash.comp_blocks > 0
-        {
-            let (data_range, scale_range) = band_row_ranges(
+            && let Some((data_range, scale_range)) = band_row_ranges(
                 flash,
                 pool,
                 kv_arena,
                 compress_ratio,
                 page_tokens,
                 page_index,
-            )?;
+            )?
+        {
             let buf = pool.flashmla_pool_data()?;
             ensure!(
                 data_range.end <= buf.len() && scale_range.end <= buf.len(),
@@ -398,11 +435,12 @@ impl Dsv4LayerAttentionState {
                 .map_err(|e| anyhow!("DSv4 prefix capture band scale D2H failed: {e}"))?;
         }
         if let Some(c) = &self.compressor {
-            let range = staging_row_range(c, compress_ratio, page_tokens, page_index)?;
-            out.staging = ctx
-                .stream
-                .clone_dtoh(&c.compressed.data.slice(range))
-                .map_err(|e| anyhow!("DSv4 prefix capture staging D2H failed: {e}"))?;
+            if let Some(range) = staging_row_range(c, compress_ratio, page_tokens, page_index)? {
+                out.staging = ctx
+                    .stream
+                    .clone_dtoh(&c.compressed.data.slice(range))
+                    .map_err(|e| anyhow!("DSv4 prefix capture staging D2H failed: {e}"))?;
+            }
             if boundary {
                 out.overlap_kv = ctx
                     .stream
@@ -426,8 +464,8 @@ impl Dsv4LayerAttentionState {
                 .clone_dtoh(&ix.prev_overlap_score)
                 .map_err(|e| anyhow!("DSv4 prefix capture idx overlap score D2H failed: {e}"))?;
         }
-        if let Some(dsa) = &self.dsa_official {
-            let (data_range, scale_range) = dsa_row_ranges(
+        if let Some(dsa) = &self.dsa_official
+            && let Some((data_range, scale_range)) = dsa_row_ranges(
                 pool,
                 dsa,
                 mode,
@@ -435,7 +473,8 @@ impl Dsv4LayerAttentionState {
                 index_head_dim,
                 page_tokens,
                 page_index,
-            )?;
+            )?
+        {
             let cache = pool
                 .dsa_key_cache
                 .as_ref()
@@ -483,15 +522,15 @@ impl Dsv4LayerAttentionState {
         if let Some(flash) = &self.flashmla
             && mode != DeepSeekV4AttentionMode::SlidingWindow
             && flash.comp_blocks > 0
-        {
-            let (data_range, scale_range) = band_row_ranges(
+            && let Some((data_range, scale_range)) = band_row_ranges(
                 flash,
                 pool,
                 kv_arena,
                 compress_ratio,
                 page_tokens,
                 page_index,
-            )?;
+            )?
+        {
             ensure!(
                 state.band_data.len() == data_range.len()
                     && state.band_scale.len() == scale_range.len(),
@@ -519,18 +558,24 @@ impl Dsv4LayerAttentionState {
                 .map_err(|e| anyhow!("DSv4 prefix restore band scale H2D failed: {e}"))?;
         }
         if let Some(c) = &mut self.compressor {
-            let range = staging_row_range(c, compress_ratio, page_tokens, page_index)?;
-            ensure!(
-                state.staging.len() == range.len(),
-                "DSv4 prefix restore staging section {} != live rows {}",
-                state.staging.len(),
-                range.len()
-            );
-            {
+            if let Some(range) = staging_row_range(c, compress_ratio, page_tokens, page_index)? {
+                ensure!(
+                    state.staging.len() == range.len(),
+                    "DSv4 prefix restore staging section {} != live rows {}",
+                    state.staging.len(),
+                    range.len()
+                );
                 let mut view = c.compressed.data.slice_mut(range);
                 ctx.stream
                     .memcpy_htod(&state.staging, &mut view)
                     .map_err(|e| anyhow!("DSv4 prefix restore staging H2D failed: {e}"))?;
+            } else {
+                // Capture derives the same span from the same config — a
+                // stored section here means capture-era shape drift.
+                ensure!(
+                    state.staging.is_empty(),
+                    "DSv4 prefix restore: entry has staging rows for a page the live shape completes none"
+                );
             }
             if boundary {
                 ensure!(
@@ -561,8 +606,8 @@ impl Dsv4LayerAttentionState {
                 .memcpy_htod(&state.idx_overlap_score, &mut ix.prev_overlap_score)
                 .map_err(|e| anyhow!("DSv4 prefix restore idx overlap score H2D failed: {e}"))?;
         }
-        if let Some(dsa) = &self.dsa_official {
-            let (data_range, scale_range) = dsa_row_ranges(
+        if let Some(dsa) = &self.dsa_official
+            && let Some((data_range, scale_range)) = dsa_row_ranges(
                 pool,
                 dsa,
                 mode,
@@ -570,7 +615,8 @@ impl Dsv4LayerAttentionState {
                 index_head_dim,
                 page_tokens,
                 page_index,
-            )?;
+            )?
+        {
             ensure!(
                 state.dsa_data.len() == data_range.len()
                     && state.dsa_scale.len() == scale_range.len(),
@@ -657,11 +703,23 @@ impl Dsv4LayerAttentionState {
     }
 }
 
+/// Compressed rows newly COMPLETED by host page `page_index`:
+/// `[page_start/ratio, page_end/ratio)`. Uniform over every ratio — cr=4 →
+/// 16 rows/page; cr=128 → a row lands on the page whose tokens complete it
+/// (0 rows on the other page); ratio=1 → 64 rows/page.
+fn page_row_span(page_tokens: usize, ratio: usize, page_index: usize) -> (usize, usize) {
+    let start = (page_index * page_tokens) / ratio;
+    let end = ((page_index + 1) * page_tokens) / ratio;
+    (start, end - start)
+}
+
 /// Byte ranges of one host page's compressed FP8 band rows inside the shared
-/// FlashMLA pool: MODEL1 page layout is `[64×token data][64×e8m0 scales]`
-/// (`dsv4_fp8_kv_pack.cu`) — the same layout `Dsv4SpecRingSnapshot::fp8_sw_offsets`
-/// addresses. Table-routed through the slot's page table (#85 P2), never
-/// `slot_idx × slot_bytes` arithmetic.
+/// FlashMLA pool (`None` when the page completes no row): MODEL1 page layout
+/// is `[64×token data][64×e8m0 scales]` (`dsv4_fp8_kv_pack.cu`) — the same
+/// layout `Dsv4SpecRingSnapshot::fp8_sw_offsets` addresses. Table-routed
+/// through the slot's page table (#85 P2), never `slot_idx × slot_bytes`
+/// arithmetic.
+#[allow(clippy::type_complexity)]
 fn band_row_ranges(
     flash: &Dsv4FlashMlaDecodeState,
     pool: &Dsv4LayerKvLayout,
@@ -669,19 +727,22 @@ fn band_row_ranges(
     compress_ratio: usize,
     page_tokens: usize,
     page_index: usize,
-) -> Result<(std::ops::Range<usize>, std::ops::Range<usize>)> {
-    ensure!(
-        compress_ratio > 0 && page_tokens.is_multiple_of(compress_ratio),
-        "DSv4 prefix band: page tokens {page_tokens} not a multiple of ratio {compress_ratio}"
-    );
-    let rpp = page_tokens / compress_ratio;
+) -> Result<Option<(std::ops::Range<usize>, std::ops::Range<usize>)>> {
+    ensure!(compress_ratio > 0, "DSv4 prefix band: zero compress ratio");
+    let (row0, count) = page_row_span(page_tokens, compress_ratio, page_index);
+    if count == 0 {
+        return Ok(None);
+    }
     let bmap = flash.block_map();
+    // The span must live inside ONE FlashMLA block for a contiguous copy
+    // (holds for every ratio dividing the page and for ≤1-row spans).
     ensure!(
-        rpp > 0 && bmap.page_size().is_multiple_of(rpp),
-        "DSv4 prefix band: {rpp} rows/page straddle the {}-row FlashMLA block",
+        row0 / bmap.page_size() == (row0 + count - 1) / bmap.page_size(),
+        "DSv4 prefix band rows {row0}..{} straddle a {}-row FlashMLA block",
+        row0 + count,
         bmap.page_size()
     );
-    let (block, in_row) = bmap.comp_row(page_index * rpp);
+    let (block, in_row) = bmap.comp_row(row0);
     let page = physical_page(pool.flashmla_page_table(flash.slot_idx)?, block)?;
     let data_bytes = kv_arena
         .nope_dim
@@ -696,34 +757,34 @@ fn band_row_ranges(
     let block_base = page as usize * (bmap.page_size() * kv_arena.bytes_per_token);
     let data_start = block_base + in_row * data_bytes;
     let scale_start = block_base + bmap.page_size() * data_bytes + in_row * scale_bytes;
-    Ok((
-        data_start..data_start + rpp * data_bytes,
-        scale_start..scale_start + rpp * scale_bytes,
-    ))
+    Ok(Some((
+        data_start..data_start + count * data_bytes,
+        scale_start..scale_start + count * scale_bytes,
+    )))
 }
 
 /// Element range of one host page's rows in the main compressor's bf16
-/// staging (`compressed.data`, row-major `[row][head_dim]`).
+/// staging (`compressed.data`, row-major `[row][head_dim]`); `None` when the
+/// page completes no row.
 fn staging_row_range(
     c: &Dsv4CompressorState,
     compress_ratio: usize,
     page_tokens: usize,
     page_index: usize,
-) -> Result<std::ops::Range<usize>> {
+) -> Result<Option<std::ops::Range<usize>>> {
     ensure!(
         c.ring_rows == c.compressed_capacity,
         "DSv4 prefix staging: main compressor staging must be full-history, not a ring"
     );
+    ensure!(compress_ratio > 0, "DSv4 prefix staging: zero ratio");
+    let (row0, count) = page_row_span(page_tokens, compress_ratio, page_index);
+    if count == 0 {
+        return Ok(None);
+    }
     ensure!(
-        compress_ratio > 0 && page_tokens.is_multiple_of(compress_ratio),
-        "DSv4 prefix staging: page tokens {page_tokens} not a multiple of ratio {compress_ratio}"
-    );
-    let rpp = page_tokens / compress_ratio;
-    let row0 = page_index * rpp;
-    ensure!(
-        row0 + rpp <= c.compressed_capacity,
+        row0 + count <= c.compressed_capacity,
         "DSv4 prefix staging rows {row0}..{} outside capacity {}",
-        row0 + rpp,
+        row0 + count,
         c.compressed_capacity
     );
     let head_dim = c.compressed.data.len() / c.ring_rows.max(1);
@@ -733,12 +794,14 @@ fn staging_row_range(
         c.compressed.data.len(),
         c.ring_rows
     );
-    Ok(row0 * head_dim..(row0 + rpp) * head_dim)
+    Ok(Some(row0 * head_dim..(row0 + count) * head_dim))
 }
 
-/// Byte ranges of one host page's rows in the slot's FP8 DSA key-cache band:
-/// paged layout `[64×index_head_dim data][64×f32 scales]` per page — the
-/// B1-B3 lesson: never flat `row × (dim+4)` math.
+/// Byte ranges of one host page's rows in the slot's FP8 DSA key-cache band
+/// (`None` when the page completes no row): paged layout
+/// `[64×index_head_dim data][64×f32 scales]` per page — the B1-B3 lesson:
+/// never flat `row × (dim+4)` math.
+#[allow(clippy::type_complexity)]
 fn dsa_row_ranges(
     pool: &Dsv4LayerKvLayout,
     dsa: &Dsv4DsaOfficialState,
@@ -747,22 +810,22 @@ fn dsa_row_ranges(
     index_head_dim: usize,
     page_tokens: usize,
     page_index: usize,
-) -> Result<(std::ops::Range<usize>, std::ops::Range<usize>)> {
+) -> Result<Option<(std::ops::Range<usize>, std::ops::Range<usize>)>> {
     let index_ratio = if mode == DeepSeekV4AttentionMode::SparseIndexed {
         1
     } else {
         compress_ratio
     };
+    ensure!(index_ratio > 0, "DSv4 prefix DSA: zero index ratio");
+    let (row0, count) = page_row_span(page_tokens, index_ratio, page_index);
+    if count == 0 {
+        return Ok(None);
+    }
     ensure!(
-        index_ratio > 0 && page_tokens.is_multiple_of(index_ratio),
-        "DSv4 prefix DSA: page tokens {page_tokens} not a multiple of index ratio {index_ratio}"
+        row0 / DSA_PAGE_ROWS == (row0 + count - 1) / DSA_PAGE_ROWS,
+        "DSv4 prefix DSA rows {row0}..{} straddle a {DSA_PAGE_ROWS}-row cache page",
+        row0 + count
     );
-    let rpp = page_tokens / index_ratio;
-    ensure!(
-        rpp > 0 && rpp <= DSA_PAGE_ROWS && DSA_PAGE_ROWS.is_multiple_of(rpp),
-        "DSv4 prefix DSA: {rpp} rows/page straddle the {DSA_PAGE_ROWS}-row cache page"
-    );
-    let row0 = page_index * rpp;
     let cache_page = row0 / DSA_PAGE_ROWS;
     let in_row = row0 % DSA_PAGE_ROWS;
     let page_bytes = DSA_PAGE_ROWS * (index_head_dim + std::mem::size_of::<f32>());
@@ -775,10 +838,10 @@ fn dsa_row_ranges(
     let data_start = page_base + in_row * index_head_dim;
     let scale_start =
         page_base + DSA_PAGE_ROWS * index_head_dim + in_row * std::mem::size_of::<f32>();
-    Ok((
-        data_start..data_start + rpp * index_head_dim,
-        scale_start..scale_start + rpp * std::mem::size_of::<f32>(),
-    ))
+    Ok(Some((
+        data_start..data_start + count * index_head_dim,
+        scale_start..scale_start + count * std::mem::size_of::<f32>(),
+    )))
 }
 
 #[cfg(test)]
@@ -816,6 +879,11 @@ mod tests {
         let mut pool = Dsv4PrefixStatePool::new(1 << 20, 1 << 16);
         assert!(pool.publish(42, &entry));
         assert!(pool.page_meta(42).is_some_and(|m| m.boundary));
+        assert!(
+            pool.read_entry(42).is_err(),
+            "provisional entries are write-only until radix publish confirms"
+        );
+        pool.confirm_pages(&[42]);
         let back = pool.read_entry(42).expect("entry readable");
         assert_eq!(back.page_index, entry.page_index);
         assert_eq!(back.boundary, entry.boundary);

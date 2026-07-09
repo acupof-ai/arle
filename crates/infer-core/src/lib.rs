@@ -1866,6 +1866,41 @@ mod testing {
         }
     }
 
+    /// Mock executor whose restore boundaries exist only at every
+    /// `align_blocks` pages, mirroring DSv4's ring-aligned commit points:
+    /// `reusable_prefix_blocks` floors the leading run to that alignment.
+    #[derive(Debug, Clone)]
+    pub(super) struct AlignedPrefixExecutor {
+        inner: MockExecutor,
+        align_blocks: usize,
+    }
+
+    impl AlignedPrefixExecutor {
+        pub(super) fn with_align_blocks(align_blocks: usize) -> Self {
+            Self {
+                inner: MockExecutor::ready(),
+                align_blocks,
+            }
+        }
+    }
+
+    impl BackendExecutor for AlignedPrefixExecutor {
+        type Inflight = MockInflight;
+
+        fn submit(&mut self, plan: &ForwardPlan, kv: &mut dyn KvPool) -> Result<Self::Inflight> {
+            self.inner.submit(plan, kv)
+        }
+
+        fn poll(&mut self, inflight: Self::Inflight) -> Result<PollResult<Self::Inflight>> {
+            self.inner.poll(inflight)
+        }
+
+        fn reusable_prefix_blocks(&self, blocks: &[PrefixBlock]) -> usize {
+            let n = pages_only_reusable_prefix_blocks(blocks, |_| false);
+            n - n % self.align_blocks.max(1)
+        }
+    }
+
     /// Mock executor reporting a coarser-than-page restore alignment,
     /// mirroring DSv4's ring-snapshot `sliding_window` unit — proves the
     /// planner combines it with KV page size via LCM, not `.max()`.
@@ -2533,10 +2568,10 @@ mod tests {
     use infer_seam::{BufferedDiffusionExecutor, HostPagedKvPool, KvAllocator, KvQuery};
 
     use super::testing::{
-        DeviceMirrorExecutor, HoldGovernor, HybridReprefillMirror, LimitedPrefixExecutor,
-        MockExecutor, MockKvPool, RestoreAlignmentExecutor, SamplingExecutor, SingleRowExecutor,
-        SlotTierMockExecutor, SpecMirrorExecutor, StopTokenExecutor, TierMockExecutor,
-        TokenBudgetGovernor, WarmupCountingExecutor,
+        AlignedPrefixExecutor, DeviceMirrorExecutor, HoldGovernor, HybridReprefillMirror,
+        LimitedPrefixExecutor, MockExecutor, MockKvPool, RestoreAlignmentExecutor,
+        SamplingExecutor, SingleRowExecutor, SlotTierMockExecutor, SpecMirrorExecutor,
+        StopTokenExecutor, TierMockExecutor, TokenBudgetGovernor, WarmupCountingExecutor,
     };
     use super::*;
 
@@ -4151,6 +4186,44 @@ mod tests {
             1,
             "only the non-final matched block is reused from cache"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn full_prefix_match_trim_runs_before_backend_clamp() -> Result<()> {
+        // #154 D4 regression: the full-match one-block trim must run BEFORE
+        // `clamp_prefix_to_backend`. With an alignment-flooring backend
+        // (commit points every 2 blocks), the old clamp-then-trim order left
+        // an UNALIGNED 3-block match (12 tokens) that the backend restore
+        // predicate rejects; trim-then-clamp floors it to 2 blocks (8).
+        let mut engine = Engine::with_config(
+            AlignedPrefixExecutor::with_align_blocks(2),
+            MockKvPool::with_capacity(1, 4, 8),
+            test_config(1),
+        );
+        let prompt: Vec<u32> = (1..=16).collect();
+        let first = engine.submit_request(prompt.clone(), 1);
+        engine.run_to_idle()?;
+        assert_finished(engine.completed(first).expect("first completed"));
+        assert_eq!(
+            engine.radix.cached_page_count(),
+            4,
+            "all 4 blocks published"
+        );
+
+        let second = engine.submit_request(prompt, 1);
+        engine.step()?; // admission + attach only.
+        let (_, request) = engine
+            .active
+            .iter()
+            .find(|(_, request)| request.handle == second)
+            .expect("second admitted");
+        assert_eq!(
+            request.phase,
+            RequestPhase::Prefilling { progress: 8 },
+            "trim-then-clamp must land on the 2-block-aligned boundary"
+        );
+        assert_eq!(request.reused_prefix_pages.len(), 2);
         Ok(())
     }
 

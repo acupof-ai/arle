@@ -1290,6 +1290,93 @@ impl Dsv4SlotState {
         })
     }
 
+    /// Restore a cross-request prefix into this slot from content-keyed pool
+    /// entries (#154 Phase 2 read hook). `entries[k]` is host page k's state;
+    /// the last entry must carry the boundary sections. The caller has already
+    /// mirrored the identity band (`Dsv4KvAdapter::mirror_full_band`), which
+    /// also set the band cursor and the device-table dirty bit.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn restore_prefix_state(
+        &mut self,
+        ctx: &DeviceContext,
+        layers: &[Dsv4Layer],
+        kv_adapter: &mut crate::attention::Dsv4KvAdapter,
+        kv_arena: &Dsv4MlaKvArena,
+        index_head_dim: usize,
+        entries: &[crate::attention::Dsv4PrefixPageEntry],
+        matched_len: usize,
+        page_tokens: usize,
+    ) -> Result<()> {
+        ensure!(
+            layers.len() == self.attention.len(),
+            "DSv4 prefix restore layer count {} != attention states {}",
+            layers.len(),
+            self.attention.len()
+        );
+        ensure!(
+            page_tokens > 0 && matched_len == entries.len() * page_tokens,
+            "DSv4 prefix restore matched_len {matched_len} != {} pages × {page_tokens}",
+            entries.len()
+        );
+        ensure!(
+            matched_len <= self.max_seq_len,
+            "DSv4 prefix restore matched_len {matched_len} exceeds slot max_seq_len {}",
+            self.max_seq_len
+        );
+        ensure!(
+            entries.last().is_some_and(|e| e.boundary),
+            "DSv4 prefix restore: final matched page lacks boundary sections"
+        );
+        for (k, entry) in entries.iter().enumerate() {
+            ensure!(
+                entry.page_index as usize == k,
+                "DSv4 prefix restore: entry captured at page {} restored at {k} \
+                 (recycled host page id?)",
+                entry.page_index
+            );
+            ensure!(
+                entry.layers.len() == self.attention.len(),
+                "DSv4 prefix restore: entry layer count {} != attention states {}",
+                entry.layers.len(),
+                self.attention.len()
+            );
+            let boundary = k + 1 == entries.len();
+            for (idx, (state, layer_state)) in
+                self.attention.iter_mut().zip(&entry.layers).enumerate()
+            {
+                let pool = kv_adapter.layer_mut(idx)?;
+                state.restore_prefix_page(
+                    ctx,
+                    pool,
+                    kv_arena,
+                    layers[idx].mode,
+                    layers[idx].compress_ratio,
+                    index_head_dim,
+                    page_tokens,
+                    k,
+                    layer_state,
+                    boundary,
+                )?;
+            }
+        }
+        for (idx, state) in self.attention.iter_mut().enumerate() {
+            state.restore_prefix_counters(
+                layers[idx].mode,
+                layers[idx].compress_ratio,
+                matched_len,
+            );
+        }
+        self.seq_len = matched_len;
+        // Same request-boundary discipline as reset/swap_in: re-arm one eager
+        // warm step so per-request host work (SW ring bootstrap, compressed
+        // bulk pack) reruns against the restored bands before replay resumes.
+        if let Some(graph) = self.decode_graph.as_mut() {
+            graph.rearm_for_new_request();
+        }
+        ctx.sync()?;
+        Ok(())
+    }
+
     pub(crate) fn truncate(
         &mut self,
         layers: &[Dsv4Layer],

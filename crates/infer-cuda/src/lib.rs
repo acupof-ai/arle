@@ -602,6 +602,14 @@ impl BackendExecutor for CudaExecutor {
         }
     }
 
+    fn prefill_restore_boundary_alignment(&self) -> usize {
+        match &self.inner {
+            CudaExecutorInner::Placeholder => 1,
+            #[cfg(feature = "cuda")]
+            CudaExecutorInner::Real(real) => real.prefill_restore_boundary_alignment(),
+        }
+    }
+
     fn model_stop_token_ids(&self) -> Vec<u32> {
         match &self.inner {
             CudaExecutorInner::Placeholder => Vec::new(),
