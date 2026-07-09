@@ -783,6 +783,18 @@ per this directive, not an oversight.
    page-granular events** — since Route B is already deleted (step 3), this
    is not "extend Route B's relay," it's a fresh design against real
    measured page-granular event rates from steps 4-6.
+
+   **CLOSED 2026-07-09 — no build needed.** The compressor pool's
+   no-relay-required finding (rank-diff MD5, bit-identical across 4 ranks —
+   see the design pass above) is confirmed by source to extend to the ring
+   and `dsa_official` pools: neither `update_bf16_sw_window`
+   (`attention.rs:2034`, writes the ring) nor `csa_select_official`
+   (`attention.rs:8972`, writes `dsa_official`) takes a `tp_world`/rank
+   parameter — same architectural shape as `compressor_forward`, same shared
+   replicated input (`k_prepared`/`hidden`). No new broadcast primitive
+   built; `tp.rs` unchanged. This is source-level analogy, not a separate
+   rank-diff measurement for these two pools specifically — flag as the one
+   residual gap if a future correctness issue ever looks rank-dependent.
 8. **Verify, then fix what verification finds** (final phase, not an
    afterthought):
    - *Correctness*: `needle_gate.py` across multiple context lengths,
