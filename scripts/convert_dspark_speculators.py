@@ -10,6 +10,7 @@ Usage: convert_dspark_speculators.py <src_dir> <dst_dir>
 """
 
 import json
+import os
 import shutil
 import struct
 import sys
@@ -83,7 +84,7 @@ def main():
     dst = dst_dir / "model.safetensors"
     if not dst.exists():
         try:
-            dst.hardlink_to(weights)
+            os.link(weights, dst)
         except OSError:
             shutil.copyfile(weights, dst)
     conv = "same-position" if "dflash_config" in cfg else "next-token"
