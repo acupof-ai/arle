@@ -364,7 +364,6 @@ impl Dsv4LayerKvLayout {
             return Ok(false);
         }
         let needed = self.flashmla_band_pages_for(tokens);
-        let page_bytes = self.flashmla_page_bytes;
         let pool = self.flashmla_pool_mut()?;
         let have = pool.page_indices(slot_idx).len();
         if have >= needed {
@@ -377,9 +376,8 @@ impl Dsv4LayerKvLayout {
                  unreachable: {e}"
             )
         })?;
-        let payload = vec![0u8; new_pages.len() * page_bytes];
         self.flashmla_pool_mut()?
-            .copy_pages_from_host(ctx, &new_pages, &payload)
+            .zero_pages(ctx, &new_pages)
             .map_err(|e| anyhow!("DSv4 FlashMLA demand-page zero failed: {e}"))?;
         Ok(true)
     }
@@ -432,6 +430,13 @@ impl Dsv4LayerKvLayout {
         slot_idx: usize,
     ) -> Result<()> {
         if self.flashmla_slot_pages == 0 {
+            return Ok(());
+        }
+        // Demand-paged bands are claim-zeroed page-by-page (`ensure_band`);
+        // a fresh occupant's table only ever holds pages zeroed for THIS
+        // occupancy (free_slot empties it at request end), so the occupancy
+        // whole-band zero is both redundant and a blocking H2D.
+        if self.flashmla_demand_paged {
             return Ok(());
         }
         let table = self.flashmla_page_table(slot_idx)?.to_vec();
