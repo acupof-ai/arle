@@ -1,0 +1,23 @@
+scripts/clean_opd_corpora.py
+  s_9c91b86ec3fb55::t_ecb8e35410ac9c 125-126
+scripts/stage_swe_pro.py
+  s_9c91b86ec3fb55::t_ed1476aebf495a 191-193
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "2d9f9572f3e3136c1db4ab6f967443eca83420e4",
+  "prompts": {},
+  "sessions": {
+    "s_9c91b86ec3fb55": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4779911a-69b7-49db-bc83-daf5a48d6ca3",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
