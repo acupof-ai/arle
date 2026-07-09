@@ -1,0 +1,37 @@
+scripts/eval_harness/__init__.py
+  s_12a91b8e91a931::t_24c61544c29b48 1-195
+scripts/eval_harness/__main__.py
+  s_4b7198573dd014::t_10dc135997089b 1-48
+scripts/eval_harness/needle_ladder.py
+  s_4b7198573dd014::t_c65fd3771bad52 1-64
+scripts/eval_harness/prefix_reuse.py
+  s_12a91b8e91a931::t_f74126ca3130db 1-134
+scripts/prefix_reuse_gate.py
+  s_12a91b8e91a931::t_166eeaeaef9c90 1-26
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "2f28637cdbbe86ad8766849be5c64381472f3833",
+  "prompts": {},
+  "sessions": {
+    "s_12a91b8e91a931": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a26270eedd4a5a141",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_4b7198573dd014": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "92cc6785-573b-445c-9517-2aca75a48773",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
