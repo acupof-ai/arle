@@ -97,11 +97,20 @@ def query(prompt: str, max_tokens: int = 32) -> dict:
 
 
 def get_stats() -> dict:
-    return json.loads(urllib.request.urlopen(BASE + "/v1/stats", timeout=30).read())
+    raw = json.loads(urllib.request.urlopen(BASE + "/v1/stats", timeout=30).read())
+    flat = {}
+    for group, vals in raw.items():
+        if isinstance(vals, dict):
+            for k, v in vals.items():
+                flat[f"{group}_{k}"] = v
+                flat[k] = v
+        else:
+            flat[group] = vals
+    return flat
 
 
 def stat_delta(before: dict, after: dict, key: str) -> int:
-    return after.get(key, 0) - before.get(key, 0)
+    return int(after.get(key, 0)) - int(before.get(key, 0))
 
 
 def build_doc(target_tokens: int, needle: str, needle_pos: float = 0.88) -> tuple[str, int]:
