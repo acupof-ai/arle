@@ -25,6 +25,15 @@ lifecycle & progress spine).
 
 ### Verdicts
 
+- **2026-07-10 — Qwen FP8 small-M dense GEMM: DeepGEMM from M=2 LICENSED;
+  M=1 GEMV variants KILLED**: measured crossover (DeepGEMM flat 47.5–57.8 µs
+  in M vs ~linear GEMV) moves `QWEN_FP8_DEEPGEMM_DENSE_MIN_M` 16→2 — matched
+  same-tree A/B +5–9% dspark greedy csv / +2–5% rust, needle ×3 exact DET on
+  both lanes. M=1 stays on the GEMV: smem-x and x-in-registers variants both
+  measured slower (attributed via the new `fp8_wread_probe`: the per-row x
+  tail is the whole 1.78-vs-2.9 TB/s gap; achievable read BW is 3.5 TB/s,
+  not the 4.0 spec).
+  [wins](docs/experience/wins/2026-07-10-qwen-fp8-smallm-deepgemm-crossover.md)
 - **2026-07-10 — DSv4 KV-reuse Phases 2b+3b SHIPPED** (#154): whole-slot
   park deleted (−869 LOC; preemption rides the 2a prefix-state pool;
   `--kv-oversubscription` on DSv4 now fails loud) and FlashMLA bands are
