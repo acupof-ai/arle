@@ -2058,14 +2058,7 @@ impl Dsv4Model {
             }
             Ok(acc)
         };
-        // Diagnostic slot cap (perf attribution only, e.g. matching a
-        // pre-3b baseline's clamped slot count in an A/B): not a product
-        // knob — remove once the E6 wall delta is attributed.
-        let diag_cap = std::env::var("ARLE_DSV4_SLOTS_CAP")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(usize::MAX);
-        let n_max = requested.max(1).min(affordable).min(diag_cap.max(1));
+        let n_max = requested.max(1).min(affordable);
         let mut chosen: Option<(usize, usize)> = None;
         for n in (1..=n_max).rev() {
             let pool_pages = budget_bytes.saturating_sub(per_slot.saturating_mul(n))
@@ -3227,9 +3220,8 @@ impl Dsv4Model {
                     // with fp8_kv_comp_packed_rows=0 and needs the single-row
                     // path's [packed_rows, seq_len) bulk rebuild — run the whole
                     // layer per-row this tick. Batched gap-fill is future work.
-                    let comp_bulk_gap = (0..n).any(|r| {
-                        slots[slot_ids[r]].attention[layer_idx].flashmla_comp_bulk_gap()
-                    });
+                    let comp_bulk_gap = (0..n)
+                        .any(|r| slots[slot_ids[r]].attention[layer_idx].flashmla_comp_bulk_gap());
                     let pack_batched =
                         full_flatten && self.config.head_dim != 576 && !comp_bulk_gap;
                     let mut pack_nope_ptrs: Vec<u64> = Vec::new();
