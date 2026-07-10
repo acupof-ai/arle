@@ -1209,7 +1209,6 @@ impl Dsv4SlotState {
             page_index: u32::try_from(page_index)
                 .map_err(|_| anyhow!("DSv4 prefix page index {page_index} exceeds u32"))?,
             boundary,
-            finish_tail_len: 0,
             layers: states,
         })
     }
@@ -1270,12 +1269,6 @@ impl Dsv4SlotState {
             page_index: u32::try_from(page_index)
                 .map_err(|_| anyhow!("DSv4 frontier page index {page_index} exceeds u32"))?,
             boundary: true,
-            finish_tail_len: u32::try_from(finish_len - matched_len).map_err(|_| {
-                anyhow!(
-                    "DSv4 frontier tail_len {} exceeds u32",
-                    finish_len - matched_len
-                )
-            })?,
             layers: states,
         })
     }

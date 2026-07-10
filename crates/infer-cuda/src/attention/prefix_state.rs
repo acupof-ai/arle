@@ -108,11 +108,6 @@ pub(crate) struct Dsv4PrefixPageEntry {
     pub(crate) page_index: u32,
     /// Boundary sections present (forward ended exactly at this page's end).
     pub(crate) boundary: bool,
-    /// Sub-page tail length carried by this entry's frontier-tail sections
-    /// (`finish_len - matched_len`, < page_tokens); `0` = no tail (aligned
-    /// finish or a non-frontier page). Restore reads it off the last matched
-    /// entry to set `finish_len = matched_len + finish_tail_len`.
-    pub(crate) finish_tail_len: u32,
     pub(crate) layers: Vec<Dsv4LayerPageState>,
 }
 
@@ -166,7 +161,6 @@ impl Dsv4PrefixPageEntry {
         buf.extend_from_slice(ENTRY_MAGIC);
         buf.extend_from_slice(&self.page_index.to_le_bytes());
         buf.push(u8::from(self.boundary));
-        buf.extend_from_slice(&self.finish_tail_len.to_le_bytes());
         buf.extend_from_slice(&(self.layers.len() as u32).to_le_bytes());
         for layer in &self.layers {
             push_bf16(&mut buf, &layer.staging);
@@ -188,14 +182,13 @@ impl Dsv4PrefixPageEntry {
 
     pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Self> {
         ensure!(
-            bytes.len() >= 17 && &bytes[..4] == ENTRY_MAGIC,
+            bytes.len() >= 13 && &bytes[..4] == ENTRY_MAGIC,
             "bad prefix-state entry header"
         );
         let page_index = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
         let boundary = bytes[8] != 0;
-        let finish_tail_len = u32::from_le_bytes(bytes[9..13].try_into().unwrap());
-        let n_layers = u32::from_le_bytes(bytes[13..17].try_into().unwrap()) as usize;
-        let mut pos = 17usize;
+        let n_layers = u32::from_le_bytes(bytes[9..13].try_into().unwrap()) as usize;
+        let mut pos = 13usize;
         let layers = (0..n_layers)
             .map(|_| {
                 Ok(Dsv4LayerPageState {
@@ -219,7 +212,6 @@ impl Dsv4PrefixPageEntry {
         Ok(Self {
             page_index,
             boundary,
-            finish_tail_len,
             layers,
         })
     }
@@ -256,7 +248,7 @@ pub(crate) fn dsv4_prefix_entry_max_bytes(
     page_tokens: usize,
 ) -> usize {
     let bf16 = 2usize;
-    let mut total = 17usize; // entry header (magic + page_index + boundary + finish_tail_len)
+    let mut total = 13usize; // entry header (magic + page_index + boundary + n_layers)
     for &(mode, ratio) in layer_specs {
         total += 13 * 4; // section length prefixes
         // ring — every layer has an SW window cache.
@@ -1221,7 +1213,6 @@ mod tests {
         let entry = Dsv4PrefixPageEntry {
             page_index: 7,
             boundary: true,
-            finish_tail_len: 3,
             layers: vec![
                 Dsv4LayerPageState {
                     staging: bf(&[0.5, -1.25]),
@@ -1266,7 +1257,6 @@ mod tests {
         Dsv4PrefixPageEntry {
             page_index,
             boundary: true,
-            finish_tail_len: 0,
             layers: vec![Dsv4LayerPageState {
                 ring: vec![half::bf16::from_f32(page_index as f32)],
                 ..Default::default()
