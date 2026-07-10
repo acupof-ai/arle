@@ -1,9 +1,9 @@
 # DSv4 decode-region reuse — replay-tail carry rebuild (graph-compatible)
 
-> Status: Killed 2026-07-10 — replay-tail incorrect (stale prev_overlap). Superseded by [finish write-through](2026-07-10-dsv4-finish-writethrough-reuse.md).
-> model. Superseded by the design options below (needs an ROI decision before
-> reland). Graph-incompatibility of the per-decode-step capture (the real,
-> confirmed problem) still stands and any reland must fix it.
+> Status: Killed 2026-07-10 — replay-tail incorrect (stale prev_overlap).
+> Superseded by [finish write-through](2026-07-10-dsv4-finish-writethrough-reuse.md).
+> The graph-incompatibility of the per-decode-step capture (the real, confirmed
+> problem) still stands; the successor plan fixes it.
 
 **KILL REASON (source-grounded)**: The core claim "the tail re-prefill leaves
 the carry live, no separate carry restore needed" is FALSE for every
