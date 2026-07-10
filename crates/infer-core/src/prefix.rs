@@ -270,13 +270,22 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         // backends. Runs on EVERY publish — including a restore-derived finish —
         // so a repeat turn's sidecar is always re-published. Best-effort: a save
         // failure only forfeits the next reuse, never blocks the publish.
-        if let Err(err) = self.executor.save_prefix_sidecar(
-            slot,
-            tokens,
-            token_len,
-            &pages[..publish_blocks],
-            &newly_cached,
-        ) {
+        //
+        // #155: a deduped block keeps its ORIGINAL radix page, so on any dedupe
+        // (restore-miss → full-recompute resend) the slot's pages are not the
+        // chain the sidecar rides — key it to the radix's own pages, else the
+        // eviction key is a finish-freed slot page: the blob leaks, then drops
+        // on page-id reuse while the cached prefix still expects it.
+        let radix_pages = (newly_cached.len() != publish_blocks).then(|| {
+            self.radix
+                .peek_longest_prefix_match(&tokens[..token_len])
+                .block_ids
+        });
+        let sidecar_pages = radix_pages.as_deref().unwrap_or(&pages[..publish_blocks]);
+        if let Err(err) =
+            self.executor
+                .save_prefix_sidecar(slot, tokens, token_len, sidecar_pages, &newly_cached)
+        {
             log::debug!("recurrent sidecar save failed for slot {slot}: {err:#}");
         }
         // Publishing over a demoted node revives it with the re-prefilled

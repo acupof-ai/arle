@@ -1919,6 +1919,68 @@ mod testing {
         }
     }
 
+    /// `(prefix_pages, newly_cached)` recorded per `save_prefix_sidecar` call.
+    pub(super) type SidecarSaves = std::rc::Rc<std::cell::RefCell<Vec<(Vec<u32>, Vec<u32>)>>>;
+
+    /// Hybrid-sidecar mirror for the #155 lifetime bug: `restore_prefix_sidecar`
+    /// always MISSES (the engine falls back to full recompute), and every
+    /// `save_prefix_sidecar` call is recorded so a test can assert which pages
+    /// the sidecar's eviction lifetime was keyed to.
+    #[derive(Debug, Clone)]
+    pub(super) struct SidecarMissExecutor {
+        inner: MockExecutor,
+        pub(super) saves: SidecarSaves,
+    }
+
+    impl SidecarMissExecutor {
+        pub(super) fn new() -> Self {
+            Self {
+                inner: MockExecutor::ready(),
+                saves: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+            }
+        }
+    }
+
+    impl BackendExecutor for SidecarMissExecutor {
+        type Inflight = MockInflight;
+
+        fn submit(&mut self, plan: &ForwardPlan, kv: &mut dyn KvPool) -> Result<Self::Inflight> {
+            self.inner.submit(plan, kv)
+        }
+
+        fn poll(&mut self, inflight: Self::Inflight) -> Result<PollResult<Self::Inflight>> {
+            self.inner.poll(inflight)
+        }
+
+        fn reusable_prefix_blocks(&self, blocks: &[PrefixBlock]) -> usize {
+            pages_only_reusable_prefix_blocks(blocks, |_| false)
+        }
+
+        fn restore_prefix_sidecar(
+            &mut self,
+            _slot: usize,
+            _tokens: &[u32],
+            _matched_len: usize,
+            _prefix_pages: &[u32],
+        ) -> Result<()> {
+            bail!("sidecar miss")
+        }
+
+        fn save_prefix_sidecar(
+            &mut self,
+            _slot: usize,
+            _tokens: &[u32],
+            _matched_len: usize,
+            prefix_pages: &[u32],
+            newly_cached: &[u32],
+        ) -> Result<()> {
+            self.saves
+                .borrow_mut()
+                .push((prefix_pages.to_vec(), newly_cached.to_vec()));
+            Ok(())
+        }
+    }
+
     /// Mock executor reporting a coarser-than-page restore alignment,
     /// mirroring DSv4's ring-snapshot `sliding_window` unit — proves the
     /// planner combines it with KV page size via LCM, not `.max()`.
@@ -2588,8 +2650,9 @@ mod tests {
     use super::testing::{
         AlignedPrefixExecutor, DeviceMirrorExecutor, HoldGovernor, HybridReprefillMirror,
         LimitedPrefixExecutor, MockExecutor, MockKvPool, RestoreAlignmentExecutor,
-        SamplingExecutor, SingleRowExecutor, SlotTierMockExecutor, SpecMirrorExecutor,
-        StopTokenExecutor, TierMockExecutor, TokenBudgetGovernor, WarmupCountingExecutor,
+        SamplingExecutor, SidecarMissExecutor, SingleRowExecutor, SlotTierMockExecutor,
+        SpecMirrorExecutor, StopTokenExecutor, TierMockExecutor, TokenBudgetGovernor,
+        WarmupCountingExecutor,
     };
     use super::*;
 
@@ -4242,6 +4305,63 @@ mod tests {
             "trim-then-clamp must land on the 2-block-aligned boundary"
         );
         assert_eq!(request.reused_prefix_pages.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn resend_sidecar_save_keys_to_radix_pages_not_recomputed_slot_pages() -> Result<()> {
+        // #155: turn 2 resends turn 1's prompt, the sidecar restore misses and
+        // the request full-recomputes on fresh slot pages. Its publishes fully
+        // dedupe (`newly_cached` empty), so the sidecar save must be keyed to
+        // the radix's ORIGINAL chain — keying it to the recomputed slot pages
+        // (freed at finish, never radix-evicted) leaks the blob, then drops it
+        // on page-id reuse while the cached prefix still expects it.
+        let executor = SidecarMissExecutor::new();
+        let saves = executor.saves.clone();
+        let mut engine = Engine::with_config(
+            executor,
+            MockKvPool::with_capacity(1, 4, 16),
+            test_config(1),
+        );
+
+        // Turn 1: publish prompt (2 blocks) at prefill-seal + the sealed
+        // prompt+generated boundary (3 blocks: echo mock generates 9..=13,
+        // KV holds 12) at finish.
+        let prompt: Vec<u32> = (1..=8).collect();
+        let first = engine.submit_request(prompt.clone(), 5);
+        engine.run_to_idle()?;
+        assert_finished(engine.completed(first).expect("first completed"));
+        let full_sequence: Vec<u32> = (1..=12).collect();
+        let chain = engine
+            .radix
+            .peek_longest_prefix_match(&full_sequence)
+            .block_ids;
+        assert_eq!(chain.len(), 3, "turn 1 published the full sequence");
+        saves.borrow_mut().clear();
+
+        // Turn 2: radix match + forced restore miss → full recompute.
+        let second = engine.submit_request(prompt, 5);
+        engine.run_to_idle()?;
+        assert_finished(engine.completed(second).expect("second completed"));
+
+        let saves = saves.borrow();
+        assert!(
+            !saves.is_empty(),
+            "resend must still re-publish the sidecar"
+        );
+        for (prefix_pages, newly_cached) in saves.iter() {
+            assert!(
+                newly_cached.is_empty(),
+                "resend publishes must fully dedupe, got {newly_cached:?}"
+            );
+            assert_eq!(
+                prefix_pages[..],
+                chain[..prefix_pages.len()],
+                "sidecar keyed to recomputed slot pages instead of the radix \
+                 chain — those pages free at finish, so the blob's lifetime \
+                 no longer rides the radix (#155)"
+            );
+        }
         Ok(())
     }
 
