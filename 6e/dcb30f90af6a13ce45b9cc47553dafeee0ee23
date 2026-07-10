@@ -1,0 +1,31 @@
+crates/infer-cuda/examples/fp8_smallm_gemm_probe.rs
+  s_9c91b86ec3fb55::t_63d5b7ba4696da 29,104,375-396,401-405,407-410,413-433,435,437,440-441,445-447,466-468
+scripts/pod-build-env.sh
+  s_5ef2cd6ab52350::t_790422165874a6 42
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "6edcb30f90af6a13ce45b9cc47553dafeee0ee23",
+  "prompts": {},
+  "sessions": {
+    "s_5ef2cd6ab52350": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-abdf498dccc73e90a",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_9c91b86ec3fb55": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4779911a-69b7-49db-bc83-daf5a48d6ca3",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
