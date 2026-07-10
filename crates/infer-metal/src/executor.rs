@@ -18,61 +18,11 @@ use crate::{config, dflash, mlx, model_source, qwen35, wired_limit};
 
 #[cfg(feature = "metal")]
 const KV_CACHE_CHUNK: i32 = 256;
-#[cfg(feature = "metal")]
-const METAL_T2_MAGIC: &[u8; 8] = b"AMT2KV1\0";
-#[cfg(feature = "metal")]
-const METAL_T2_VERSION: u8 = 1;
-#[cfg(feature = "metal")]
-const METAL_T2_PAGE_RECORD: u8 = 1;
-#[cfg(feature = "metal")]
-const METAL_T2_PREFIX_RECORD: u8 = 2;
 
+/// Machine-derived **L3 (NVMe)** spill budget for the Metal disk tier
+/// (unified with the CUDA policy — same probe, same clamp).
 #[cfg(feature = "metal")]
-static METAL_T2_NAMESPACE_COUNTER: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(1);
-
-/// Machine-derived **L3 (NVMe)** spill budget for the Metal disk tier rooted at
-/// `root` (unified with the CUDA policy): `budget = clamp(ssd_fraction ×
-/// free_disk, [8 GiB, free_disk − max(50 GiB, 0.1 × total_disk)])`. A probe miss
-/// falls back to the 8 GiB floor.
-#[cfg(feature = "metal")]
-#[must_use]
-pub fn default_t2_budget_bytes(root: &Path, ssd_fraction: f64) -> usize {
-    let (free, total) = disk_free_total_bytes(root).unzip();
-    infer_seam::nvme_l3_budget(
-        free,
-        total,
-        infer_seam::NvmeTierPolicy {
-            fraction: ssd_fraction,
-            ..infer_seam::NvmeTierPolicy::default()
-        },
-    )
-}
-
-/// `statvfs` of `root` → `(free_bytes, total_bytes)`. `free = f_bavail × f_frsize`,
-/// `total = f_blocks × f_frsize`. `None` off unix or on probe failure.
-#[cfg(all(feature = "metal", unix))]
-fn disk_free_total_bytes(path: &Path) -> Option<(usize, usize)> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-    let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
-    let stat = unsafe {
-        let mut stat: libc::statvfs = std::mem::zeroed();
-        if libc::statvfs(c_path.as_ptr(), &mut stat) != 0 {
-            return None;
-        }
-        stat
-    };
-    let frsize = u128::from(stat.f_frsize);
-    let free = usize::try_from(frsize.saturating_mul(u128::from(stat.f_bavail))).ok()?;
-    let total = usize::try_from(frsize.saturating_mul(u128::from(stat.f_blocks))).ok()?;
-    Some((free, total))
-}
-
-#[cfg(all(feature = "metal", not(unix)))]
-fn disk_free_total_bytes(_path: &Path) -> Option<(usize, usize)> {
-    None
-}
+pub use kv_native_sys::default_t2_budget_bytes;
 
 /// Metal KV-cache storage dtype. The host `MetalKvPool` remains a logical page
 /// allocator; this controls the MLX arrays inside each Metal slot.
@@ -575,6 +525,8 @@ impl BackendExecutor for MetalExecutor {
     }
 
     fn kv_tier_transfer_is_zero_copy(&self) -> bool {
+        // KvTierStore disk reads are Cow::Borrowed mmap slices; the decode into
+        // MLX arrays is the payload materialization, not a staging copy.
         true
     }
 
@@ -2266,10 +2218,7 @@ mod tests {
             .logical_key_for_pages(&pages)
             .expect("published logical key");
         assert!(
-            store
-                .ssd
-                .as_ref()
-                .is_some_and(|ssd| ssd.has_prefix(&logical_key)),
+            store.has_disk_prefix(&logical_key),
             "write-through must persist the prefix snapshot"
         );
         assert_eq!(
