@@ -3189,6 +3189,45 @@ impl SafetensorLoader {
         }
     }
 
+    /// #150: dense-bf16 dequant copy of one DSv4 FP8 block-scaled tensor
+    /// (host-side, via the shared block-dequant helper — the scale sidecar's
+    /// shape defines the block dims), TP-sharded like the FP8 original. Built
+    /// only under `ARLE_DSV4_MLA_PROJ_BF16=1`; costs 2× the F8 bytes in VRAM.
+    fn load_dsv4_block_scaled_bf16_copy(
+        &self,
+        ctx: &DeviceContext,
+        name: &str,
+        shard: Shard,
+        tp: &TpConfig,
+    ) -> Result<DeviceMatrix> {
+        let tensor = self.borrow_raw_tensor(name)?;
+        ensure!(
+            tensor.shape.len() == 2,
+            "{name}: expected 2D quantized tensor, got shape {:?}",
+            tensor.shape
+        );
+        let (rows, cols) = (tensor.shape[0], tensor.shape[1]);
+        let f32 = self.dequantize_dsv4_block_scaled_to_f32_host(name, rows, cols)?;
+        let bytes: Vec<u8> = f32
+            .iter()
+            .flat_map(|v| half::bf16::from_f32(*v).to_le_bytes())
+            .collect();
+        if tp.is_single() || shard == Shard::Replicated {
+            return DeviceMatrix::from_safetensors(ctx, &bytes, rows, cols)
+                .with_context(|| format!("upload bf16 dequant copy {name}"));
+        }
+        match shard {
+            Shard::Column { dim: 0 } => {
+                let spec = infer_topo::column_shard(rows, tp);
+                let sharded =
+                    crate::shard_slice::shard_column_parallel(&bytes, rows, cols, 2, &spec)?;
+                DeviceMatrix::from_safetensors(ctx, &sharded.bytes, sharded.rows, sharded.cols)
+                    .with_context(|| format!("upload sharded bf16 dequant copy {name}"))
+            }
+            other => bail!("{name}: unsupported bf16-copy TP shard policy {other:?}"),
+        }
+    }
+
     fn build_dsv4_wo_a_group_tables(
         ctx: &DeviceContext,
         weight: &DeviceMatrix,
@@ -3765,6 +3804,50 @@ impl SafetensorLoader {
         // DeepGEMM-layout cache for the decode wq_b projection (residual scalar
         // GEMV → tensor-core).
         let wq_b_deepgemm = self.decode_proj_cache(ctx, &wq_b)?;
+        // #150: opt-in dense-bf16 dequant copies of the F8-only wq_a/wq_b/wkv so
+        // BOTH decode lanes can share one bf16 arithmetic; the FP8 originals stay
+        // (prefill DeepGEMM untouched). None when the flag is off — no VRAM cost.
+        let mla_proj_bf16 = if !glm && crate::attention::dsv4_mla_proj_bf16_enabled()? {
+            let copies = crate::dsv4::Dsv4MlaProjBf16 {
+                wq_a: self.load_dsv4_block_scaled_bf16_copy(
+                    ctx,
+                    &names.wq_a,
+                    Shard::Replicated,
+                    tp,
+                )?,
+                wq_b: self.load_dsv4_block_scaled_bf16_copy(
+                    ctx,
+                    &names.wq_b,
+                    names
+                        .shard_for(config, &names.wq_b, tp.world_size)
+                        .unwrap_or(Shard::Replicated),
+                    tp,
+                )?,
+                wkv: self.load_dsv4_block_scaled_bf16_copy(
+                    ctx,
+                    &names.wkv,
+                    Shard::Replicated,
+                    tp,
+                )?,
+            };
+            let layer_bytes = 2
+                * (copies.wq_a.rows * copies.wq_a.cols
+                    + copies.wq_b.rows * copies.wq_b.cols
+                    + copies.wkv.rows * copies.wkv.cols);
+            static DSV4_MLA_BF16_BYTES: std::sync::atomic::AtomicUsize =
+                std::sync::atomic::AtomicUsize::new(0);
+            let total = DSV4_MLA_BF16_BYTES
+                .fetch_add(layer_bytes, std::sync::atomic::Ordering::Relaxed)
+                + layer_bytes;
+            log::info!(
+                "DSv4 MLA bf16 proj copies (#150, ARLE_DSV4_MLA_PROJ_BF16): +{:.1} MiB, running total {:.1} MiB",
+                layer_bytes as f64 / (1 << 20) as f64,
+                total as f64 / (1 << 20) as f64,
+            );
+            Some(copies)
+        } else {
+            None
+        };
         // Output projection. DSv4: low-rank wo_a→wo_b (+ per-group tables). GLM
         // (`plain_o_proj`): a single plain `o_proj` [hidden, num_heads*v_head_dim],
         // and the kv_b absorption split (w_kc/w_vc).
@@ -3885,6 +3968,7 @@ impl SafetensorLoader {
             wq_b_deepgemm,
             wkv,
             kv_norm: self.load_dsv4_vec(ctx, &names.kv_norm)?,
+            mla_proj_bf16,
             wo_a,
             wo_a_groups,
             wo_b,
