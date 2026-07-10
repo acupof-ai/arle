@@ -1,0 +1,25 @@
+crates/cuda-kernels/src/lib.rs
+  s_3f4f69ed86caaf::t_343d1fe3b4ec8b 27
+crates/cuda-kernels/src/paged_kv.rs
+  s_3f4f69ed86caaf::t_26b2a4164afb0e 39-44,749,771-772,781,786-791,928,934,941-945,958,964,2497-2498,2818-2823,2833,2836,3136-3139,3152,3158-3161
+crates/infer-cuda/src/attention.rs
+  s_3f4f69ed86caaf::t_b0cb162371be74 15
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "42a619f3c10170706e02e77688dcdfb555a4d942",
+  "prompts": {},
+  "sessions": {
+    "s_3f4f69ed86caaf": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ab0988d375e0bc940",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
