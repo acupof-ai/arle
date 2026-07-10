@@ -121,9 +121,19 @@ rounds to track LoRA drift.
 
 > Verdict 2026-07-10: MIN_M 16→2 LICENSED (+5–9% dspark greedy, matched A/B);
 > memoize + M=1 GEMV variants KILLED by measurement; achievable read BW is
-> 3.5 TB/s (not 4.0), so the honest M=1 residual is ~1.6× — next lever =
-> Marlin-style tensor-core W8A16 FP8 port.
+> 3.5 TB/s (not 4.0), so the honest M=1 residual is ~1.6×.
 > [wins](../experience/wins/2026-07-10-qwen-fp8-smallm-deepgemm-crossover.md)
+>
+> **Marlin W8A16 next-lever: NO-GO (2026-07-10 research).** DeepGEMM is already
+> a Hopper wgmma tensor-core FP8 GEMM and is already benched at M=1:
+> 1.4–1.87 TB/s, tied with / below the 1.78 TB/s GEMV in 2/3 shapes (that's why
+> MIN_M=2 keeps M=1 on the GEMV). The M=1 wall is the shared x-load + fp8→f32
+> decode tail (2.8–3.0 TB/s hard ceiling), NOT the MAC path — CUDA-core→tensor-
+> core cannot move it. In-tree Marlin is all W4/INT4 + sm_89 (ERR_ARCH on
+> Hopper); a W8A16 port would be net-new and compile to DeepGEMM's already-measured
+> class. GEMM is ~66% of M=1 (15/23 ms); even a hypothetical 3.0 TB/s kernel caps
+> at ~17 ms/tok (−26%) and nothing on this stack reaches 3.0 at M=1. The only
+> lever that moves M=1 is raising M — spec decode (done) and concurrency (#17).
 
 Evidence: dense_ffn 26 ms/step profiled at M=16 vs ~3.2 ms weight-read floor
 (~8×); plain decode 23 ms/tok vs ~7 ms roofline (27 GB FP8 / 4 TB/s H20).
