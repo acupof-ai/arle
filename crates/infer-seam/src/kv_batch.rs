@@ -43,6 +43,11 @@ pub struct KvBatchRow {
     pub append_pos: usize,
     /// Number of logical tokens this row will append.
     pub append_len: usize,
+    /// The request's KNOWN final logical length for this phase (prefill: the
+    /// full prompt; decode: `append_pos + append_len`). Demand-paged backends
+    /// reserve device pages for the whole known span at the first chunk
+    /// instead of growing per chunk (#154 Phase 3b).
+    pub total_tokens: usize,
     /// Occupant epoch for stale device-view invalidation.
     pub slot_epoch: u64,
     /// Range in [`KvBatchDescriptor::flat_token_ids`].
@@ -92,6 +97,7 @@ impl KvBatchDescriptor {
             row.start_pos,
             row.start_pos,
             row.tokens.len(),
+            row.total_tokens,
             &row.tokens,
             kv,
         )
@@ -104,6 +110,7 @@ impl KvBatchDescriptor {
             row.kv_seq_len,
             row.kv_seq_len,
             1,
+            row.kv_seq_len + 1,
             &[row.last_token],
             kv,
         )
@@ -158,6 +165,7 @@ impl KvBatchDescriptor {
         Ok(desc)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn push_row(
         &mut self,
         slot: usize,
@@ -165,6 +173,7 @@ impl KvBatchDescriptor {
         seq_len: usize,
         append_pos: usize,
         append_len: usize,
+        total_tokens: usize,
         tokens: &[u32],
         kv: &dyn KvPool,
     ) -> Result<()> {
@@ -203,6 +212,7 @@ impl KvBatchDescriptor {
             seq_len,
             append_pos,
             append_len,
+            total_tokens,
             slot_epoch: kv.slot_epoch(slot),
             token_range,
             page_range,

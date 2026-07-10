@@ -1075,14 +1075,20 @@ impl ModelKvAdapter for Dsv4KvAdapter {
             };
             let layer_count = self.layers.len();
             let mut band_changed = false;
-            // Demand bands ensure past the appended range by the MTP verify
-            // margin: a spec step writes ring/comp state for up to depth+1
-            // draft positions beyond the committed cursor, and the commit
-            // fold advances by up to the same — all inside ONE tick, after
-            // this (the only) alloc point. ≤ one extra comp page, budgeted by
-            // `DSV4_COMP_SAFETY_PAGES_PER_SLOT`.
-            let ensure_tokens =
-                row.append_pos + row.append_len + crate::dsv4::MAX_SPEC_DRAFT_DEPTH + 1;
+            // Demand bands reserve the row's KNOWN span (prefill: the whole
+            // prompt at the FIRST chunk — one growth event + one device-table
+            // refresh per request instead of one per 256-token chunk crossing;
+            // the pages are needed regardless, so capacity cost is zero) plus
+            // the MTP verify margin: a spec step writes ring/comp state for up
+            // to depth+1 draft positions beyond the committed cursor, and the
+            // commit fold advances by up to the same — all inside ONE tick,
+            // after this (the only) alloc point. ≤ one extra comp page,
+            // budgeted by `DSV4_COMP_SAFETY_PAGES_PER_SLOT`.
+            let ensure_tokens = row
+                .total_tokens
+                .max(row.append_pos + row.append_len)
+                + crate::dsv4::MAX_SPEC_DRAFT_DEPTH
+                + 1;
             let ctx = self.ctx.clone();
             for layer_idx in 0..layer_count {
                 let layer = self.layer_mut(layer_idx)?;
