@@ -1,0 +1,67 @@
+crates/cuda-kernels/src/tensor.rs
+  s_3d949abe53b900::t_020004e2ff39c9 3272-3279,3282
+crates/infer-cuda/src/attention.rs
+  s_c4df2de9b7a605::t_d48d84e62c1c13 224,240,242,717,806,941,1131,1333,1448,2126,2310,2324,2373,2400,2506,2520,2586,2592,2632,2652,2899,2913,2965,2991,3048,3074,3487,3489,3513,3515,3517,3601,3708,3846,3848,3865,3867,3880,3882,3903,3905,3907,3909,3911,3913,3915,3917,3919,4278,4597,4625-4632,4692,4702,4831,4834,4837,4930,4933,4936,5091,5093,5106,5208,5664,5740,6721,6723,6735,6753,6767,6907,6947,6994,6996,7006,7036,7150,7334-7340,7764,7928,8004,8329,9047,9155,9189,9296,9341,9360,9397,9439,9500,9664,9736,9757,9793,9827-9828,9861
+crates/infer-cuda/src/attention/flashmla.rs
+  s_c4df2de9b7a605::t_4a3003228bea70 174,236,436,620,999,1090,1472,1602
+crates/infer-cuda/src/dsv4.rs
+  s_c4df2de9b7a605::t_02998cd07afe70 549,553,589,591,593,595,597,599,603,696,698,707,709,711,748,750,752,754,756,758,760,762,764,766,1352-1357,2207,2464,2468,2490,2493,2748,2798,2816,2870-2871,2891,3080,3163-3164,3166-3199,3331,3375,3736-3737,4113,4151,4164,4474,4476,4497,4646,4680,4712,5133-5134,5193,5235-5241,5537,5870,5873,5879,5889,5892,5896,5945,5958,5961,5963,6005,6021,6035,6047,6058,6061,6079,6103,6218,6784,6789,6798
+crates/infer-cuda/src/hc.rs
+  s_c4df2de9b7a605::t_d888f948a8e46a 59,61,67,73,157,163,169
+crates/infer-cuda/src/kv_tier.rs
+  s_c4df2de9b7a605::t_e10ab855e2828f 78,498-502,639-642,680-688,790-794,797-802,834-838
+crates/infer-cuda/src/loader.rs
+  s_90c2de813ae5be::t_b5e5236e7fb7aa 681,703,710,2998,3755
+crates/infer-cuda/src/moe.rs
+  s_c4df2de9b7a605::t_3b581ce03ba280 893,962,1242,1270,1304,1361,1384,1409,1432,1465,1506,1552,1603,1748,1774,1805,1850,1874,1902,2186,2657,2801,3447,3536,4116,4240,4360
+crates/infer-cuda/src/nvtx.rs
+  s_c4df2de9b7a605::t_6e1fe8e4202641 87,104
+crates/infer-cuda/src/ops.rs
+  s_c4df2de9b7a605::t_9d847f326015c5 79,104,130,184,228,260,291,337,383,466
+crates/infer-cuda/src/ops/quant_linear.rs
+  s_c4df2de9b7a605::t_7f302d9afaa1f5 265,338,354,442,468,512,663
+crates/infer-cuda/src/qwen35.rs
+  s_89390f18fb950a::t_ca1b4dc698ffc8 2125,4306,4334-4337,4920,4971,5108,5226,5371,5417,5465,5675,5774,5841,5911
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "ebcc8d475fa34aaaa2ee0973b4a613d89a640c6f",
+  "prompts": {},
+  "sessions": {
+    "s_3d949abe53b900": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "92f2c43c-22c8-4f1d-8b27-d06d6f3c59ad",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_89390f18fb950a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f49f6-caaa-7600-bc7e-b25ce5c6da1b",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_90c2de813ae5be": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a09468c89cc9b247f",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_c4df2de9b7a605": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a10d38209047c12dd",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
