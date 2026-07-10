@@ -70,7 +70,39 @@ and report the restored length as P1 so the engine prefills from P1, not B.
   carry per finished turn (small), tier-budgeted.
 - Bench entry per §Benchmarks; wins/ on pass.
 
+## Decompose finding (2026-07-10) — this is a cross-crate SEAM project, not a flag flip
+
+The whole feature is jointly gated on a restore-at-P1 seam change; the pieces
+CANNOT land separately (a flag whose ON-path can't reuse = speculative
+interface shaping). Land as ONE unit behind the flag:
+
+1. **`infer-seam`**: `restore_prefix_sidecar -> Result<usize>` (restored token
+   length). Default + Qwen3.5 return `matched_len` → every other backend
+   byte-identical. DSv4 returns P1.
+2. **`infer-core` `attach_prefix_to_request`** (`prefix.rs:129-160`): if
+   `restored_len > matched_len`, advance the host cursor into the slot-owned
+   top-up band (`alloc(slot, restored_len - matched_len)`; partial page never
+   radix-published → no retain/release) + `prefill_start_pos = restored_len`.
+3. **`infer-core` `finish_slot`** (`lib.rs:979-985`): `capture_finish_frontier`
+   between `publish_prefix_blocks` and `free_slot_pages` (new default-noop seam).
+4. **DSv4** (`executor/dsv4.rs`, `attention/prefix_state.rs`): capture partial
+   `[B,P1)` content + carry + NEW `pending` section; relax `reusable_prefix_blocks`
+   (drop `% 128` gate, `:666`) and `restore_prefix_state` (drop `% 128` ensure
+   `:704`, restore partial page + carry, set seq_len=P1, return P1). All behind
+   `dsv4_decode_reuse_enabled()`; OFF = byte-identical.
+
+**Correctness spine (enumerate-every-buffer, §0.1 — the discipline whose breach
+killed replay-tail)**: before coding step 4, write the per-buffer disposition
+table for the partial region `[B,P1)`: `staging` rows `[B/ratio, P1/ratio)`,
+DSA rows, `pending_kv/score` (holds the trailing sub-`ratio` block that
+`compressed.data` does NOT yet have), `prev_overlap`/`idx_overlap` (the 21
+`ratio<16` layers, `attention.rs:7760`), FP8 band + SW-ring rebuild counters
+(`restore_prefix_counters` currently ASSUMES `matched_len % ratio == 0` →
+`prefix_state.rs:714`; `pending` fills the gap). Each buffer: exact range +
+disposition, proven, not guessed.
+
 ## ROI note
-v1 is correct today; this is opt-in and reuses the pool + Qwen3.5 pattern (not
-greenfield). Reland decision: implement behind the flag, pod-verify, flip
-default only if the long-re-sent-turn workload shows the win.
+v1 is correct today; this is a real cross-crate project (~5 files, delicate DSv4
+partial-region core, pod-gated incl. a graph lane), NOT a quick win. The win is
+concentrated in long-re-sent-turn (agentic) workloads. Build now vs. measure
+that workload first is an ROI call.
