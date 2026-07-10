@@ -350,6 +350,10 @@ pub(crate) struct Qwen35DsparkExec {
     pub(crate) scratch: DsparkScratch,
     pub(crate) accepts: usize,
     pub(crate) rejects: usize,
+    /// Verified draft chains, and the subset drafted from a partial
+    /// (ctx_base > 0) draft context.
+    pub(crate) chains: usize,
+    pub(crate) partial_ctx_chains: usize,
 }
 
 impl Qwen35DsparkExec {
@@ -362,6 +366,8 @@ impl Qwen35DsparkExec {
             scratch: DsparkScratch::default(),
             accepts: 0,
             rejects: 0,
+            chains: 0,
+            partial_ctx_chains: 0,
         }
     }
 }

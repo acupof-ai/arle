@@ -296,6 +296,7 @@ impl Dsv4CudaExecutor {
 
         self.mtp_accepts += accepted;
         self.mtp_rejects += depth - accepted;
+        self.mtp_chains += 1;
         self.mtp_note_accept(accepted, depth);
         if self.model.tp.config().rank == 0 {
             eprintln!(
@@ -470,6 +471,7 @@ impl Dsv4CudaExecutor {
             let accepted = path.len() - 1;
             self.mtp_accepts += accepted;
             self.mtp_rejects += depth - accepted;
+            self.mtp_chains += 1;
             if self.model.tp.config().rank == 0 {
                 eprintln!(
                     "[dsv4-mtp-batched] slot={slot_idx} depth={depth} topk={topk} \

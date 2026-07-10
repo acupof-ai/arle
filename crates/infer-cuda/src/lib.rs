@@ -584,6 +584,14 @@ impl BackendExecutor for CudaExecutor {
         }
     }
 
+    fn spec_decode_stats(&self) -> infer_seam::SpecDecodeStats {
+        match &self.inner {
+            CudaExecutorInner::Placeholder => infer_seam::SpecDecodeStats::default(),
+            #[cfg(feature = "cuda")]
+            CudaExecutorInner::Real(real) => real.spec_decode_stats(),
+        }
+    }
+
     fn kv_tier_disk_pages(&self) -> usize {
         match &self.inner {
             CudaExecutorInner::Placeholder => 0,

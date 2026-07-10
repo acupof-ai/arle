@@ -2178,6 +2178,11 @@ mod backend {
             self.engine.kv_system_metrics()
         }
 
+        /// Snapshot spec-decode counters for the coordinator `/v1/stats` relay.
+        pub fn spec_decode_stats(&self) -> infer_seam::SpecDecodeStats {
+            self.engine.spec_decode_stats()
+        }
+
         /// Active (running) request count.
         pub fn active_count(&self) -> usize {
             self.engine.active_count()
