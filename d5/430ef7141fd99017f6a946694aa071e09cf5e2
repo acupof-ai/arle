@@ -1,0 +1,21 @@
+docs/experience/errors/2026-07-11-fp8-probe-numeric-gate-4-iters.md
+  s_9ef059a5bbb199::t_c79088bdd3d62c 1-38
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "d5430ef7141fd99017f6a946694aa071e09cf5e2",
+  "prompts": {},
+  "sessions": {
+    "s_9ef059a5bbb199": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0b4e7f58-825f-4410-ad74-7dd92c504bd3",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
