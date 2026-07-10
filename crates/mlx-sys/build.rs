@@ -124,16 +124,16 @@ fn main() {
             .join("metal")
             .join("kernels")
             .join("mlx.metallib");
-        if metallib_src.is_file() {
-            if let Some(profile_dir) = target_profile_dir(&out_dir) {
-                let metallib_dst = profile_dir.join("mlx.metallib");
-                if let Err(err) = fs::copy(&metallib_src, &metallib_dst) {
-                    println!(
-                        "cargo:warning=mlx-sys: failed to stage {} -> {}: {err}",
-                        metallib_src.display(),
-                        metallib_dst.display()
-                    );
-                }
+        if metallib_src.is_file()
+            && let Some(profile_dir) = target_profile_dir(&out_dir)
+        {
+            let metallib_dst = profile_dir.join("mlx.metallib");
+            if let Err(err) = fs::copy(&metallib_src, &metallib_dst) {
+                println!(
+                    "cargo:warning=mlx-sys: failed to stage {} -> {}: {err}",
+                    metallib_src.display(),
+                    metallib_dst.display()
+                );
             }
         }
     }
