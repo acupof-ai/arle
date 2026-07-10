@@ -1048,6 +1048,17 @@ pub(crate) struct OpdRuntimeArgs {
     /// Force the legacy two-pass decode attention kernel (A/B arm).
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set, value_name = "BOOL")]
     pub(crate) autograd_decode_attn_legacy: bool,
+
+    /// DSpark/DFlash block-drafter checkpoint dir for the in-process rollout
+    /// engine (spec decode; CUDA Qwen3.5/3.6, single-GPU only — mirrors serve's
+    /// `--spec-type dspark --mtp-draft-model`).
+    #[arg(long, value_name = "DIR")]
+    pub(crate) dspark_draft_model: Option<PathBuf>,
+
+    /// DSpark confidence-head truncation threshold for --dspark-draft-model
+    /// (matches serve's default).
+    #[arg(long, default_value_t = 0.5, value_name = "T")]
+    pub(crate) dspark_conf_threshold: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
