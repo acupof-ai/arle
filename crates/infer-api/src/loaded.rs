@@ -2183,6 +2183,11 @@ mod backend {
             self.engine.spec_decode_stats()
         }
 
+        /// Snapshot operator-dispatch counters for the coordinator `/v1/stats` relay.
+        pub fn operator_dispatch_stats(&self) -> infer_seam::OperatorDispatchStats {
+            self.engine.operator_dispatch_stats()
+        }
+
         /// Active (running) request count.
         pub fn active_count(&self) -> usize {
             self.engine.active_count()
