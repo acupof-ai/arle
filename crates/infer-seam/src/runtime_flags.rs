@@ -92,6 +92,11 @@ pub struct CudaRuntimeFlags {
     /// DSv4 contiguous-decode MoE path (KILLED as default; A/B lever).
     #[serde(default)]
     pub dsv4_moe_contig_decode: bool,
+    /// DSv4 decode-region prefix reuse: capture the finished slot's frontier at
+    /// finish, restore a later turn to the exact finish position (opt-in until
+    /// the pod perf+correctness license; OFF = byte-identical).
+    #[serde(default)]
+    pub dsv4_decode_reuse: bool,
     /// Adaptive MTP gate at B=1 (skip speculation below the accept break-even).
     #[serde(default)]
     pub mtp_adaptive: bool,
@@ -128,6 +133,7 @@ impl Default for CudaRuntimeFlags {
             dsv4_flashmla_decode: None,
             dsv4_dsa_indexer_sms: d_dsa_indexer_sms(),
             dsv4_moe_contig_decode: false,
+            dsv4_decode_reuse: false,
             mtp_adaptive: false,
             mtp_min_accept: d_mtp_min_accept(),
             deepep_num_sms: d_deepep_num_sms(),

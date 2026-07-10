@@ -1209,6 +1209,73 @@ impl Dsv4SlotState {
             page_index: u32::try_from(page_index)
                 .map_err(|_| anyhow!("DSv4 prefix page index {page_index} exceeds u32"))?,
             boundary,
+            finish_tail_len: 0,
+            layers: states,
+        })
+    }
+
+    /// Capture the finish frontier page (`--dsv4-decode-reuse`): the frontier
+    /// page's own content + carry (boundary) PLUS the sub-page tail the radix
+    /// match can't cover (`[matched_len, finish_len)`). `page_index =
+    /// matched_len/page_tokens − 1`; the whole carry reflects `finish_len`
+    /// because capture runs at the finish sync point.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn capture_frontier_page(
+        &self,
+        ctx: &DeviceContext,
+        layers: &[Dsv4Layer],
+        kv_adapter: &crate::attention::Dsv4KvAdapter,
+        index_head_dim: usize,
+        page_tokens: usize,
+        page_index: usize,
+        matched_len: usize,
+        finish_len: usize,
+    ) -> Result<crate::attention::Dsv4PrefixPageEntry> {
+        ensure!(
+            layers.len() == self.attention.len(),
+            "DSv4 frontier capture layer count {} != attention states {}",
+            layers.len(),
+            self.attention.len()
+        );
+        let states = self
+            .attention
+            .iter()
+            .enumerate()
+            .map(|(idx, state)| {
+                let pool = kv_adapter.layer(idx)?;
+                let mut s = state.capture_prefix_page(
+                    ctx,
+                    pool,
+                    layers[idx].mode,
+                    layers[idx].compress_ratio,
+                    index_head_dim,
+                    page_tokens,
+                    page_index,
+                    true,
+                )?;
+                state.capture_frontier_tail(
+                    ctx,
+                    pool,
+                    layers[idx].mode,
+                    layers[idx].compress_ratio,
+                    index_head_dim,
+                    matched_len,
+                    finish_len,
+                    &mut s,
+                )?;
+                Ok(s)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(crate::attention::Dsv4PrefixPageEntry {
+            page_index: u32::try_from(page_index)
+                .map_err(|_| anyhow!("DSv4 frontier page index {page_index} exceeds u32"))?,
+            boundary: true,
+            finish_tail_len: u32::try_from(finish_len - matched_len).map_err(|_| {
+                anyhow!(
+                    "DSv4 frontier tail_len {} exceeds u32",
+                    finish_len - matched_len
+                )
+            })?,
             layers: states,
         })
     }
@@ -1227,6 +1294,7 @@ impl Dsv4SlotState {
         index_head_dim: usize,
         entries: &[crate::attention::Dsv4PrefixPageEntry],
         matched_len: usize,
+        finish_len: usize,
         page_tokens: usize,
     ) -> Result<()> {
         ensure!(
@@ -1240,9 +1308,15 @@ impl Dsv4SlotState {
             "DSv4 prefix restore matched_len {matched_len} != {} pages × {page_tokens}",
             entries.len()
         );
+        // finish_len is the exact frontier: matched_len (aligned) plus the last
+        // entry's sub-page tail. The tail is < page_tokens by construction.
         ensure!(
-            matched_len <= self.max_seq_len,
-            "DSv4 prefix restore matched_len {matched_len} exceeds slot max_seq_len {}",
+            (matched_len..matched_len + page_tokens).contains(&finish_len),
+            "DSv4 prefix restore finish_len {finish_len} not in [matched_len {matched_len}, +{page_tokens})"
+        );
+        ensure!(
+            finish_len <= self.max_seq_len,
+            "DSv4 prefix restore finish_len {finish_len} exceeds slot max_seq_len {}",
             self.max_seq_len
         );
         ensure!(
@@ -1280,14 +1354,30 @@ impl Dsv4SlotState {
                 )?;
             }
         }
-        for (idx, state) in self.attention.iter_mut().enumerate() {
-            state.restore_prefix_counters(
-                layers[idx].mode,
-                layers[idx].compress_ratio,
-                matched_len,
-            );
+        // Frontier tail: the sub-page leftover the last matched page's own rows
+        // don't cover. A no-op when finish_len == matched_len (aligned finish /
+        // plain restore) — every tail section is then empty.
+        if let Some(frontier) = entries.last() {
+            for (idx, (state, layer_state)) in
+                self.attention.iter_mut().zip(&frontier.layers).enumerate()
+            {
+                let pool = kv_adapter.layer_mut(idx)?;
+                state.restore_frontier_tail(
+                    ctx,
+                    pool,
+                    layers[idx].mode,
+                    layers[idx].compress_ratio,
+                    index_head_dim,
+                    matched_len,
+                    finish_len,
+                    layer_state,
+                )?;
+            }
         }
-        self.seq_len = matched_len;
+        for (idx, state) in self.attention.iter_mut().enumerate() {
+            state.restore_prefix_counters(layers[idx].mode, layers[idx].compress_ratio, finish_len);
+        }
+        self.seq_len = finish_len;
         // Same request-boundary discipline as reset/swap_in: re-arm one eager
         // warm step so per-request host work (SW ring bootstrap, compressed
         // bulk pack) reruns against the restored bands before replay resumes.
