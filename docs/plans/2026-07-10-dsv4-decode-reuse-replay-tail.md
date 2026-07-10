@@ -1,6 +1,57 @@
 # DSv4 decode-region reuse — replay-tail carry rebuild (graph-compatible)
 
-> Status: Active
+> Status: Killed 2026-07-10 — replay-tail is incorrect for the production
+> model. Superseded by the design options below (needs an ROI decision before
+> reland). Graph-incompatibility of the per-decode-step capture (the real,
+> confirmed problem) still stands and any reland must fix it.
+
+**KILL REASON (source-grounded)**: The core claim "the tail re-prefill leaves
+the carry live, no separate carry restore needed" is FALSE for every
+`compress_ratio < 16` (`overlap=true`) layer — 21 such layers in
+`DeepSeek-V4-Flash-FP8`. The replay starts at `compressed_base > 0`, so the
+compressor kernel READS `prev_overlap` (`attention.rs:7760`,
+`has_prev_overlap = compressed_base > 0`) for its first block — the raw
+kv/score of the block BEFORE the replay window, which the replay never
+recomputes. This plan deletes that overlap section and never restores it →
+stale register → first replayed compressed row corrupt. Same class as the
+EAGLE-rollback anchor (restored `compressed.seq_len`, missed `prev_overlap`).
+The band-double-write worry was a red herring (restore/replay staging ranges
+are disjoint); the real defect is the adjacent stale-`prev_overlap` read.
+
+**CONFIRMED & still valid**: the decode-path content capture is itself a
+per-decode-step D2H+sync (`executor.rs:2432`, `capture_prefix_page` +
+`ctx.sync()` every tick) → graph-incompatible. Any reland must make the
+decode-step publish a no-op and capture the generated region once at finish.
+
+## Corrected design options (pick before reland)
+
+- **Option A — finish full-state snapshot, no replay.** At `finish_slot`
+  (eager sync point, before `free_slot_pages`), D2H the full slot state
+  (content + pending + `prev_overlap` + ring) at the exact finish position P1,
+  content-keyed via the radix chain. Restore the full image at P1; the next
+  turn re-prefills only its new suffix. Correct (carry captured live at P1,
+  not rebuilt), graph-safe (finish-only), hits the W1 multi-turn target. Needs
+  the restore path to accept a non-128-aligned frontier (the whole-slot
+  park/demote machinery already restores an arbitrary position — content-key
+  it). Cost: storage = a small carry snapshot per finished turn + the content
+  captured anyway.
+- **Option B — page-granular via position-addressable overlap.** The other
+  active plan `docs/plans/2026-07-08-dsv4-route-a-page-granular-prefix-reuse.md`
+  (resolve `prev_overlap` by position lookup at `write_pos - ratio`, not a
+  trusted last-write register). Heavier (Route-A compressor pool underneath);
+  reuse at any page boundary, not just finish. Reconcile with that plan before
+  either lands.
+
+## ROI note
+
+v1 today is CORRECT (multi-turn reuses the prompt prefix, re-prefills the
+generated tail). The correct fix is non-trivial (A or B, both real projects).
+So decode-region reuse is ROI-gated: reland only after the long-re-sent-turn
+workload is measured as a bottleneck. Do NOT ship a wrong fix to close it.
+
+---
+
+## Original (killed) design follows
 
 **Verdict**: Replace the eager-only per-decode-step boundary capture with a
 graph-compatible design: capture positional CONTENT at natural sync points
