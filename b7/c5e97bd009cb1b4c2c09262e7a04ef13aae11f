@@ -1,0 +1,21 @@
+README.md
+  s_6f1c32ae5dad71::t_80d6765e8e4d26 6,10,18,23-24,40-41,43,46,49-54,56-61,64-65,68,71,76-77,80,84-85,87-88,90,96-98,100,102,107,109,111,113,115-118,120,122,124-125,127,133,135-145,149-152,155-157,160-161,163-165,178-191,197
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "b7c5e97bd009cb1b4c2c09262e7a04ef13aae11f",
+  "prompts": {},
+  "sessions": {
+    "s_6f1c32ae5dad71": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b5791c44-4150-4ea6-a3e0-180acab9a811",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
