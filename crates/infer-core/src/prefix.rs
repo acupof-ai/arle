@@ -151,12 +151,12 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         };
 
         // DSv4 finish-write-through restores PAST the 64-block-aligned radix
-        // `matched_len` by `extra` tokens (< page) to an exact frontier P1
-        // (partial last block from the pool entry's pending). Grow the slot into
-        // its OWN partial page (never radix-published, so no retain/release) so
-        // the cursor reaches P1 and the tail prefills only from P1. Clamp to the
-        // prompt: a match cannot extend past this request's own prompt. extra==0
-        // is today's page-aligned path, unchanged.
+        // `matched_len` by `extra` tokens (< page) up to the finished turn's exact
+        // length (its sub-page tail block from the pool entry's pending). Grow the
+        // slot into its OWN partial page (never radix-published, so no
+        // retain/release) so the cursor reaches that length and only the leftover
+        // suffix prefills. Clamp to the prompt: a match cannot extend past this
+        // request's own prompt. extra==0 is today's page-aligned path, unchanged.
         let restored_len = (prefix_match.matched_len + extra).min(request.prompt_len());
         if restored_len > prefix_match.matched_len {
             self.kv
