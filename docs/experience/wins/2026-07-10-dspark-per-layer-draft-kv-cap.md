@@ -101,9 +101,22 @@ floor is 128K, so `cap_full` is larger and the measured after is 544 MB (the
   per-step overhead scaling with batch, not queueing. Crossover ~C=4; at C=8
   dspark loses on both tok/s (0.63×) and p50. No OOM/timeout, `kv_free_pages`
   7100–8100 (no KV pressure).
-- **Reading:** DSpark is a low-concurrency (c≤2) latency optimization that does
-  not batch. The per-layer memory fix is what makes it *affordable at all* on a
-  shared GPU — 24 vs ~6 slots. Keep dspark opt-in; gate off above c≈4.
+- **Reading (SCOPED — corrected against the DSpark paper, arXiv:2607.05147):**
+  what does not batch is **OUR config** — DFlash-backbone-only, static
+  `conf` threshold, fixed block=16, and NO hardware-aware scheduler. That is
+  exactly the "indiscriminate fixed-length verification wastes batch capacity"
+  failure mode the paper's §1/§3.2 names as the problem it solves. DSpark *as
+  designed* is built to hold throughput at high concurrency via the confidence
+  head + **Hardware-Aware Prefix Scheduler (Algorithm 1)**, which shrinks each
+  request's verify length ℓ against a profiled `SPS(B)` curve to maximize
+  `Θ = τ·SPS(B)` — DeepSeek-V4 production reports 57–85% per-user speedup *at
+  matched aggregate throughput* and specifically unlocking strict-SLA tiers.
+  We run neither the scheduler nor a trained confidence head (NO-LICENSE here),
+  so our flat aggregate is the DFlash baseline, not a DSpark-with-scheduler
+  verdict. **For OPD (B=1 rollout) the config is right and the 2× stands.** To
+  get the concurrency leg would take implementing Algorithm 1 + a trained
+  confidence head (P3) — not attempted; gate dspark off above c≈4 *for this
+  config*. The per-layer memory fix makes it affordable at all (24 vs ~6 slots).
 
 ## Rule
 
