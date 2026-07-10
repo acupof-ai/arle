@@ -124,13 +124,17 @@ jobs:
               -p infer-moe -p infer-topo -p infer-util -p deepseek-spec -p agent
           - name: support
             cmd: cargo test -p chat -p tools -p qwen3-spec -p qwen35-spec -p kv-native-sys --profile release-fast
-          # autograd+train split off support: bundled, the lane OOM-killed the
-          # 16 GB runner at ~48 min every run (0/40 successes, 2026-07-06) → never
-          # saved its cache → always cold. This subset (which `cli` builds in
-          # budget) completes and warms.
+          # autograd: leaf crate, lightweight. Always completes, warms the
+          # shared dep cache for the train lane below.
+          - name: autograd
+            cmd: cargo test -p autograd --profile release-fast --features no-cuda --lib
+          # train: heaviest compile chain (train → agent → infer-api → infer-core).
+          # Cold build OOMs the 16 GB runner at default parallelism ("lost
+          # communication" at ~48 min). Cap parallelism to stay under memory;
+          # once warm cache lands the lane runs in budget.
           - name: train
-            cmd: |
-              cargo test -p autograd --profile release-fast --features no-cuda --lib
+            cmd: >-
+              CARGO_BUILD_JOBS=2 CARGO_PROFILE_RELEASE_FAST_CODEGEN_UNITS=4
               cargo test -p train --profile release-fast --features no-cuda --lib
     steps:
       - uses: actions/checkout@v7
