@@ -1,0 +1,158 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://arle.dev/schemas/operator-evidence-v1.json",
+  "title": "ARLE operator evidence run",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "run_id",
+    "source",
+    "product",
+    "operator_id",
+    "model_revision",
+    "hardware",
+    "software",
+    "timing",
+    "e2e_gate",
+    "measurements"
+  ],
+  "properties": {
+    "schema_version": { "const": "arle.operator-evidence/v1" },
+    "run_id": { "type": "string", "minLength": 1 },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["commit", "dirty"],
+      "properties": {
+        "commit": { "type": "string", "minLength": 1 },
+        "dirty": { "type": "boolean" }
+      }
+    },
+    "product": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["binary_id", "bundle_id"],
+      "properties": {
+        "binary_id": { "type": "string", "minLength": 1 },
+        "bundle_id": { "type": "string", "minLength": 1 }
+      }
+    },
+    "operator_id": { "const": "qwen.fp8_dense_projection" },
+    "model_revision": { "type": "string", "minLength": 1 },
+    "hardware": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["gpu", "sm_major", "sm_minor", "sm_count"],
+      "properties": {
+        "gpu": { "type": "string", "minLength": 1 },
+        "sm_major": { "type": "integer", "minimum": 1 },
+        "sm_minor": { "type": "integer", "minimum": 0 },
+        "sm_count": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "software": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["driver", "toolkit", "provider"],
+      "properties": {
+        "driver": { "type": "string", "minLength": 1 },
+        "toolkit": { "type": "string", "minLength": 1 },
+        "provider": { "type": "string", "minLength": 1 }
+      }
+    },
+    "timing": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["method", "warmup", "iterations_per_sample", "samples"],
+      "properties": {
+        "method": { "const": "cuda_event_batched" },
+        "warmup": { "type": "integer", "minimum": 1 },
+        "iterations_per_sample": { "type": "integer", "minimum": 1 },
+        "samples": { "type": "integer", "minimum": 3 }
+      }
+    },
+    "e2e_gate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["passed", "artifact_sha256"],
+      "properties": {
+        "passed": { "type": "boolean" },
+        "artifact_sha256": {
+          "type": ["string", "null"],
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    },
+    "measurements": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/measurement" }
+    }
+  },
+  "$defs": {
+    "route": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "cuda_us"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "cuda_us": {
+          "type": "array",
+          "minItems": 3,
+          "items": { "type": "number", "exclusiveMinimum": 0 }
+        },
+        "components": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/samples" }
+        }
+      }
+    },
+    "samples": {
+      "type": "array",
+      "minItems": 3,
+      "items": { "type": "number", "exclusiveMinimum": 0 }
+    },
+    "measurement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["label", "position", "m", "n", "k", "dtype", "layout", "reference", "candidate", "numeric", "engagement"],
+      "properties": {
+        "label": { "type": "string", "minLength": 1 },
+        "position": { "type": "string", "minLength": 1 },
+        "m": { "type": "integer", "minimum": 1 },
+        "n": { "type": "integer", "minimum": 1 },
+        "k": { "type": "integer", "minimum": 1 },
+        "dtype": { "const": "bf16xfp8_e4m3_block128->bf16" },
+        "layout": { "const": "row_major_activation+nt_weight" },
+        "reference": { "$ref": "#/$defs/route" },
+        "candidate": { "$ref": "#/$defs/route" },
+        "numeric": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["max_abs", "max_rel", "rmse", "max_abs_tolerance", "max_rel_tolerance", "tolerance_mode", "max_tolerance_ratio", "violations", "passed"],
+          "properties": {
+            "max_abs": { "type": "number", "minimum": 0 },
+            "max_rel": { "type": "number", "minimum": 0 },
+            "rmse": { "type": "number", "minimum": 0 },
+            "max_abs_tolerance": { "const": 1.0 },
+            "max_rel_tolerance": { "const": 0.02 },
+            "tolerance_mode": { "const": "abs+rel*abs(reference)" },
+            "max_tolerance_ratio": { "type": "number", "minimum": 0 },
+            "violations": { "type": "integer", "minimum": 0 },
+            "passed": { "type": "boolean" }
+          }
+        },
+        "engagement": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["reference_launches", "candidate_pack_launches", "candidate_gemm_launches"],
+          "properties": {
+            "reference_launches": { "type": "integer", "minimum": 1 },
+            "candidate_pack_launches": { "type": "integer", "minimum": 1 },
+            "candidate_gemm_launches": { "type": "integer", "minimum": 1 }
+          }
+        }
+      }
+    }
+  }
+}

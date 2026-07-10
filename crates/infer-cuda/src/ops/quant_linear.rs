@@ -9,22 +9,9 @@ use std::cell::RefCell;
 use std::sync::OnceLock;
 use std::time::Instant;
 
-// Dense-GEMM floor for FP8 weights: at or above this M, DeepGEMM dense (or
-// the dequant+cuBLAS fallback) takes the GEMM; below it the scalar
-// warp-per-row GEMV keeps decode-sized calls. The old 1024 floor sent every
-// sub-1024 prefill chunk to the GEMV the code itself forbids for prefill —
-// measured on the agent-OPD toy round: 52k gemv_batch calls, zero DeepGEMM,
-// prefill 138 tok/s vs 453 tok/s for the same trajectory's training forward
-// (docs/plans/rollout-optimization.md). Tool-result tail prefills are 64-128
-// tokens, so the floor belongs at the decode/prefill boundary, not at 1024.
-// Lowered 64→16 for the DSpark block-16 spec verify, then 16→2 off the
-// fp8_smallm_gemm_probe M-sweep (H20, Qwen3.6-27B shapes): DeepGEMM dense is
-// FLAT in M (45.9-57.6 us/call, one weight pass) while the tiled GEMV scales
-// ~linearly (M=2 already 1.6-1.8x a single decode; M=8 4.3x; M=16 9x), so
-// DeepGEMM wins every shape from M=2. M=1 stays on the GEMV: 50.1/49.6/16.5 us
-// vs DeepGEMM 50.6/60.8/21.9 us incl. activation pack — GEMV wins 2 of 3
-// shapes (wins/2026-07-10-qwen-fp8-smallm-deepgemm-crossover.md).
-const QWEN_FP8_DEEPGEMM_DENSE_MIN_M: usize = 2;
+mod qwen_fp8_dense_policy {
+    include!("generated/qwen_fp8_dense_projection.rs");
+}
 
 /// Pre-Hopper dequant→BF16-cuBLAS floor. Stays at the old 16: that path pays a
 /// full weight dequant (1 read + 2 bf16 writes) per call, so tiny M belongs on
@@ -151,6 +138,25 @@ fn qwen_fp8_dense_sm_supports_deepgemm(ctx: &DeviceContext) -> bool {
     })
 }
 
+fn qwen_fp8_dense_route(
+    ctx: &DeviceContext,
+    m: usize,
+    n: usize,
+    k: usize,
+) -> qwen_fp8_dense_policy::Route {
+    let _ = qwen_fp8_dense_policy::POLICY_ID;
+    if !qwen_fp8_dense_policy::HAS_EXACT_CELLS {
+        return qwen_fp8_dense_policy::fallback(m);
+    }
+    static HARDWARE: OnceLock<(i32, i32, usize)> = OnceLock::new();
+    let &(sm_major, sm_minor, sm_count) = HARDWARE.get_or_init(|| {
+        let (major, minor) = ctx.compute_capability();
+        (major, minor, ctx.sm_count())
+    });
+    qwen_fp8_dense_policy::select_exact(sm_major, sm_minor, sm_count, m, n, k)
+        .unwrap_or_else(|| qwen_fp8_dense_policy::fallback(m))
+}
+
 fn qwen_quant_profile<T>(
     ctx: &DeviceContext,
     label: &'static str,
@@ -220,7 +226,8 @@ fn fp8_f32_scale_shape(weight: &DeviceMatrix) -> Result<(i32, i32, i32, i32)> {
 
 fn fp8_deepgemm_dense_shape(ctx: &DeviceContext, weight: &DeviceMatrix, seq_len: usize) -> bool {
     weight.weight_format == WeightFormat::Fp8BlockScaled
-        && seq_len >= QWEN_FP8_DEEPGEMM_DENSE_MIN_M
+        && qwen_fp8_dense_route(ctx, seq_len, weight.rows, weight.cols)
+            == qwen_fp8_dense_policy::Route::PackDeepGemm
         && weight.quant_block_m == 128
         && weight.quant_block_k == 128
         && weight.rows.is_multiple_of(8)

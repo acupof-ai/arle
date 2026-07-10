@@ -28,6 +28,7 @@ override it without affecting unknown hardware or shapes.
 - Operator: `qwen.fp8_dense_projection`
 - Current fallback: M=1 GEMV; M>=2 pack+DeepGEMM
 - Evidence status: no qualified exact cells
+- Numeric gate: per element `abs <= 1.0 + 0.02 * abs(reference)`
 - Stats fields: policy, product, bundle, implementation hits, fallback count
 
 ## Environment
@@ -41,7 +42,7 @@ override it without affecting unknown hardware or shapes.
 
 | Gate | Result |
 |---|---|
-| seam/core/server tests | 200 run; 199 passed, 1 ignored |
+| seam/core/server tests | 201 run; 200 passed, 1 ignored |
 | GuideLLM stats regression | 1 passed |
 | invalid stats JSON | rejected and recorded as `ok:false` |
 | multiprocess stats relay | policy/identity/hit/fallback preserved |
@@ -63,7 +64,7 @@ override it without affecting unknown hardware or shapes.
 
 ## Pending H20 gates
 
-- numeric candidate/reference probe with predeclared mixed tolerance;
+- numeric candidate/reference probe with the committed mixed tolerance;
 - same-binary E2E A/B and independent launch engagement;
 - canonical GuideLLM SLO run and wall-clock delta;
 - exact policy/product/bundle identity in `/v1/stats`.
