@@ -1,0 +1,31 @@
+crates/autograd/src/runtime_flags.rs
+  s_4b7198573dd014::t_255d95d42b16ee 86,91,95
+crates/infer-gguf/src/gguf.rs
+  s_4b7198573dd014::t_01a74785b5a040 319-320
+crates/infer-metal/src/runtime_flags.rs
+  s_4b7198573dd014::t_5a0dd18ee9d11c 28,32,36,40,44
+crates/mlx-sys/build.rs
+  s_4b7198573dd014::t_b788deda94e8d1 127-136
+docs/experience/errors/archive/2026-05-02-bench-agent-load-a3-tool-resume-gate-miss.md
+  s_4b7198573dd014::t_16e791391646d1 1-253
+docs/experience/errors/archive/2026-05-02-bench-agent-load-a6-t1-retention-gate-miss.md
+  s_4b7198573dd014::t_5c5c76f699206b 1-89
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "a3130373fc7c293944ffd8248f2381d9f917c153",
+  "prompts": {},
+  "sessions": {
+    "s_4b7198573dd014": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "92cc6785-573b-445c-9517-2aca75a48773",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
