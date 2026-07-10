@@ -1,0 +1,43 @@
+Cargo.lock
+  s_5dfeefc95c0b28::t_1aeae5149b5d3d 1836-1837,1839
+crates/infer-cuda/src/attention/prefix_state.rs
+  s_5d959760849e12::t_47d6c777216c37 8,32-37,255,259,275,286
+crates/infer-cuda/src/executor.rs
+  s_5d959760849e12::t_6a30c9c7373abe 33,795,808,989,1039,1107,1890,3306,3316,3372,3677,3912,3916,3925,4211,4261,4271,6044
+crates/infer-cuda/src/lib.rs
+  s_5dfeefc95c0b28::t_8ba135d0ed12f4 115
+crates/infer-cuda/src/qwen35.rs
+  s_5d959760849e12::t_08eba525c79ea3 343,353,515,2716
+crates/kv-native-sys/Cargo.toml
+  s_5dfeefc95c0b28::t_ebd02f09dafede 9-10,12
+crates/kv-native-sys/src/kv_tier.rs
+  s_5dfeefc95c0b28::t_b5e88239413e03 1,4,8-10,14,27,31,47,101,159-160,162,164,172,201,203,223,273,318,320,326-327,339,350,384,405,427-435,438-439,485,510,518,523,527,531,535,546,555,563,657,686,714,732,748,766,790,855,868,889,909,925,952,987,992,1009,1035,1059,1070,1091,1109,1132,1146,1225,1242,1252,1268,1282
+crates/kv-native-sys/src/lib.rs
+  s_5dfeefc95c0b28::t_e8baef63b67fb2 4-14
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "b87826e6f1cd7d782b347cd503d85edbbcac12ce",
+  "prompts": {},
+  "sessions": {
+    "s_5d959760849e12": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ae88c2942a4db2ba6",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_5dfeefc95c0b28": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ace8e2c4f30c66a76",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
