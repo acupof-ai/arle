@@ -27,11 +27,32 @@ pub struct StreamOptions {
     pub include_usage: bool,
 }
 
+/// `/v1/completions` `prompt`: a text string (tokenized as usual) OR a raw
+/// token-id array (fed to the engine verbatim, skipping tokenization). The
+/// token-id form preserves EXACT ids across a multi-turn feed-back — re-encoding
+/// a decoded completion shifts boundary tokens and truncates prefix reuse.
+/// Untagged: a JSON string → [`Self::Text`], a JSON number array → [`Self::Tokens`].
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum PromptInput {
+    Text(String),
+    Tokens(Vec<u32>),
+}
+
+impl PromptInput {
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Text(text) => text.trim().is_empty(),
+            Self::Tokens(ids) => ids.is_empty(),
+        }
+    }
+}
+
 /// Minimal `/v1/completions` request body.
 #[derive(Debug, Clone, Deserialize)]
 pub struct CompletionRequest {
     pub model: Option<String>,
-    pub prompt: String,
+    pub prompt: PromptInput,
     #[serde(default, alias = "max_completion_tokens")]
     pub max_tokens: Option<usize>,
     pub temperature: Option<f32>,
@@ -53,7 +74,7 @@ pub struct CompletionRequest {
 
 impl CompletionRequest {
     pub(crate) fn validate(&self) -> Result<(), ApiError> {
-        if self.prompt.trim().is_empty() {
+        if self.prompt.is_empty() {
             return Err(ApiError::bad_request("prompt must not be empty"));
         }
         validate_common(self.stream, self.max_tokens)
@@ -393,6 +414,7 @@ impl CompletionResponse {
         completion_tokens: usize,
         finish: Option<&FinishReason>,
         token_ids: Option<Vec<u32>>,
+        prompt_token_ids: Option<Vec<u32>>,
     ) -> Self {
         Self {
             id: format!("cmpl-{}", uuid::Uuid::new_v4().simple()),
@@ -405,6 +427,7 @@ impl CompletionResponse {
                 logprobs: None,
                 finish_reason: finish_reason(finish).to_string(),
                 token_ids,
+                prompt_token_ids,
             }],
             usage: Usage::new(prompt_tokens, completion_tokens),
         }
@@ -654,6 +677,11 @@ pub struct CompletionChoice {
     pub finish_reason: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub token_ids: Option<Vec<u32>>,
+    /// The PROMPT's token ids — paired with `token_ids` under `return_token_ids`,
+    /// so one turn-1 call yields both the prompt ids and the generated ids for an
+    /// exact-token multi-turn feed-back. Omitted (default) → byte-identical wire.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_token_ids: Option<Vec<u32>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -953,9 +981,11 @@ mod tests {
             2,
             Some(&FinishReason::Length),
             None,
+            None,
         );
         let hidden_json = serde_json::to_value(&hidden).expect("serialize hidden");
         assert!(hidden_json["choices"][0].get("token_ids").is_none());
+        assert!(hidden_json["choices"][0].get("prompt_token_ids").is_none());
 
         let visible = CompletionResponse::from_parts(
             "m".to_string(),
@@ -964,9 +994,36 @@ mod tests {
             2,
             Some(&FinishReason::Length),
             Some(vec![1, 2]),
+            Some(vec![7, 8, 9]),
         );
         let visible_json = serde_json::to_value(&visible).expect("serialize visible");
         assert_eq!(visible_json["choices"][0]["token_ids"], json!([1, 2]));
+        assert_eq!(
+            visible_json["choices"][0]["prompt_token_ids"],
+            json!([7, 8, 9])
+        );
+    }
+
+    #[test]
+    fn prompt_input_accepts_string_or_token_ids() {
+        // String prompt → Text (wire-byte-identical to the pre-enum String path).
+        let text: CompletionRequest = serde_json::from_value(json!({"prompt": "hello"})).unwrap();
+        assert!(matches!(text.prompt, PromptInput::Text(ref t) if t == "hello"));
+        assert!(text.validate().is_ok());
+
+        // Token-id array prompt → Tokens (fed verbatim, no re-tokenization).
+        let tokens: CompletionRequest =
+            serde_json::from_value(json!({"prompt": [1, 2, 3]})).unwrap();
+        assert!(matches!(tokens.prompt, PromptInput::Tokens(ref ids) if ids == &[1, 2, 3]));
+        assert!(tokens.validate().is_ok());
+
+        // Empty in either form is rejected.
+        let empty_text: CompletionRequest =
+            serde_json::from_value(json!({"prompt": "  "})).unwrap();
+        assert!(empty_text.validate().is_err());
+        let empty_tokens: CompletionRequest =
+            serde_json::from_value(json!({"prompt": []})).unwrap();
+        assert!(empty_tokens.validate().is_err());
     }
 
     #[test]
