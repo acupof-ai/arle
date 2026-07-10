@@ -618,6 +618,17 @@ impl BackendExecutor for CudaExecutor {
         }
     }
 
+    fn reusable_prefix_blocks_for_prompt(&self, blocks: &[PrefixBlock], tokens: &[u32]) -> usize {
+        match &self.inner {
+            CudaExecutorInner::Placeholder => {
+                let _ = (blocks, tokens);
+                0
+            }
+            #[cfg(feature = "cuda")]
+            CudaExecutorInner::Real(real) => real.reusable_prefix_blocks_for_prompt(blocks, tokens),
+        }
+    }
+
     fn prefill_restore_boundary_alignment(&self) -> usize {
         match &self.inner {
             CudaExecutorInner::Placeholder => 1,

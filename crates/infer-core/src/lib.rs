@@ -1146,7 +1146,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             let matched = self
                 .radix
                 .peek_longest_prefix_match(&candidate.prompt_tokens);
-            self.clamp_prefix_to_backend(matched)
+            self.clamp_prefix_to_backend(matched, &candidate.prompt_tokens)
         } else {
             PrefixMatch::empty()
         };

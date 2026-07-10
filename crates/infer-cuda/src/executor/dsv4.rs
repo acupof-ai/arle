@@ -674,6 +674,15 @@ impl Dsv4CudaExecutor {
                 warn!("DSv4 finish frontier: pool refused host page {page_id} (slot {slot})");
             }
         }
+        // Record the frontier's sub-page tail token ids so a later restore that
+        // extends into [matched_len, finish_len) verifies content identity — the
+        // radix only proves it to matched_len. `publish` cleared any stale one.
+        if finish_len > matched_len {
+            self.prefix_state.set_frontier_tail(
+                slot_pages[frontier],
+                tokens[matched_len..finish_len].to_vec(),
+            );
+        }
         Ok(())
     }
 
@@ -767,6 +776,56 @@ impl Dsv4CudaExecutor {
         committed
     }
 
+    /// Request-admission reuse length: like [`Self::reusable_prefix_blocks`] but
+    /// a finish-write-through frontier (a boundary page carrying a sub-page tail)
+    /// commits ONLY when `prompt` is a verified continuation through the finish
+    /// position — `prompt[page_end..page_end+tail] == entry.tail_tokens`. The
+    /// radix proves content identity to the page boundary; the tail is a prior
+    /// turn's continuation and a divergent/shorter prompt must not restore it
+    /// (else a page-prefix collision injects a different request's KV, or the
+    /// over-restore crashes on `seq_len > append_pos`). A tail-less boundary page
+    /// (carry at its own page boundary) commits unconditionally. Flag OFF →
+    /// strict page-aligned count, unchanged.
+    pub(crate) fn reusable_prefix_blocks_for_prompt(
+        &self,
+        blocks: &[PrefixBlock],
+        tokens: &[u32],
+    ) -> usize {
+        if !crate::runtime_flags::dsv4_decode_reuse_enabled() {
+            return self.reusable_prefix_blocks(blocks);
+        }
+        let page_tokens = self.model.kv_arena.page_block_size;
+        if page_tokens == 0 {
+            return 0;
+        }
+        let mut committed = 0usize;
+        for (idx, block) in blocks.iter().enumerate() {
+            let PrefixBlock::ResidentPage(page_id) = *block else {
+                break;
+            };
+            let Some(meta) = self.prefix_state.page_meta(page_id) else {
+                break;
+            };
+            if !meta.boundary {
+                continue;
+            }
+            let page_end = (idx + 1) * page_tokens;
+            let commit = match self.prefix_state.frontier_tail_tokens(page_id) {
+                // Carry at this page's own boundary — always valid.
+                None => true,
+                // Frontier tail: valid only for a verified continuation.
+                Some(tail) => {
+                    let finish = page_end + tail.len();
+                    tokens.len() >= finish && tokens[page_end..finish] == *tail
+                }
+            };
+            if commit {
+                committed = idx + 1;
+            }
+        }
+        committed
+    }
+
     /// The boundary sections only exist at a forward's own end position —
     /// without this, a single-call prefill never visits an earlier boundary.
     pub(crate) fn prefill_restore_boundary_alignment(&self) -> usize {
@@ -786,6 +845,7 @@ impl Dsv4CudaExecutor {
     pub(crate) fn restore_prefix_state(
         &mut self,
         slot: usize,
+        tokens: &[u32],
         matched_len: usize,
         prefix_pages: &[u32],
     ) -> Result<usize> {
@@ -819,9 +879,24 @@ impl Dsv4CudaExecutor {
             .iter()
             .map(|&page_id| self.prefix_state.read_entry(page_id))
             .collect::<Result<Vec<_>>>()?;
-        // The frontier entry carries the sub-page tail (0 unless a finish
-        // write-through landed off a page boundary) → the exact finish position.
-        let tail_len = entries.last().map_or(0, |e| e.finish_tail_len as usize);
+        // The frontier entry may carry a sub-page tail (a finish write-through
+        // that landed off a page boundary). Reuse it ONLY for a verified
+        // continuation: the tail `[matched_len, finish_len)` has no radix key,
+        // so the prompt must actually contain those exact tokens. A divergent or
+        // shorter prompt falls back to the page-aligned match (`tail_len 0`) —
+        // never restore a prior turn's tail. The carry lives only at the finish
+        // position, so restore is atomic to `finish_len`.
+        let frontier = *prefix_pages.last().expect("matched_len > 0 ⇒ ≥1 page");
+        let tail_len = match self.prefix_state.frontier_tail_tokens(frontier) {
+            Some(tail)
+                if reuse
+                    && tokens.len() >= matched_len + tail.len()
+                    && tokens[matched_len..matched_len + tail.len()] == *tail =>
+            {
+                tail.len()
+            }
+            _ => 0,
+        };
         let finish_len = matched_len + tail_len;
         self.kv_adapter
             .mirror_full_band(&self.model.ctx, slot, finish_len)?;

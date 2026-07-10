@@ -214,6 +214,18 @@ pub trait BackendExecutor {
         0
     }
 
+    /// Reuse length for admitting a REQUEST, when the backend may reuse content
+    /// that extends PAST the radix page-match and must verify it against the
+    /// request's prompt `tokens`. DSv4 finish-write-through caches a sub-page
+    /// tail whose content the radix key does not cover — it reuses that tail
+    /// only for a verified continuation (`tokens` contains the cached sequence
+    /// through the finish position), else falls back to the strict page-aligned
+    /// count. Default ignores `tokens` and defers to [`Self::reusable_prefix_blocks`].
+    fn reusable_prefix_blocks_for_prompt(&self, blocks: &[PrefixBlock], tokens: &[u32]) -> usize {
+        let _ = tokens;
+        self.reusable_prefix_blocks(blocks)
+    }
+
     /// Extra chunk-end alignment beyond KV pages, in tokens — a backend whose
     /// side state snapshots only at its own forward-call end (e.g. DSv4's
     /// ring) needs every intermediate boundary forced, not just the deepest.

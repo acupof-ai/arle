@@ -44,16 +44,22 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
     /// a backend may only be able to restore KV plus side state at boundaries
     /// it explicitly snapshotted. Trim the match to the executor-reported
     /// reusable page count and re-prefill the tail.
-    pub(crate) fn clamp_prefix_to_backend(&self, mut prefix_match: PrefixMatch) -> PrefixMatch {
+    pub(crate) fn clamp_prefix_to_backend(
+        &self,
+        mut prefix_match: PrefixMatch,
+        tokens: &[u32],
+    ) -> PrefixMatch {
         let blocks: Vec<_> = prefix_match
             .block_ids
             .iter()
             .copied()
             .map(PrefixBlock::ResidentPage)
             .collect();
+        // `_for_prompt`: a finish-write-through frontier is reusable only when
+        // `tokens` continues through the cached tail (the tail has no radix key).
         let serveable = self
             .executor
-            .reusable_prefix_blocks(&blocks)
+            .reusable_prefix_blocks_for_prompt(&blocks, tokens)
             .min(prefix_match.block_ids.len());
         if serveable < prefix_match.block_ids.len() {
             prefix_match.block_ids.truncate(serveable);
@@ -87,7 +93,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             prefix_match.block_ids.pop();
             prefix_match.matched_len = prefix_match.block_ids.len() * self.radix.block_size();
         }
-        let prefix_match = self.clamp_prefix_to_backend(prefix_match);
+        let prefix_match = self.clamp_prefix_to_backend(prefix_match, &request.prompt_tokens);
         if prefix_match.is_empty() {
             request.prefill_start_pos = 0;
             request.phase = RequestPhase::Prefilling { progress: 0 };
@@ -564,12 +570,12 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
     pub(crate) fn lookup_prefix_for_attach(&mut self, tokens: &[u32]) -> PrefixMatch {
         if self.kv_tier_capacity() == 0 {
             let matched = self.radix.longest_prefix_match(tokens);
-            return self.clamp_prefix_to_backend(matched);
+            return self.clamp_prefix_to_backend(matched, tokens);
         }
         let mut blocks = self.radix.tiered_longest_prefix_match(tokens).blocks;
         let reusable = self
             .executor
-            .reusable_prefix_blocks(&blocks)
+            .reusable_prefix_blocks_for_prompt(&blocks, tokens)
             .min(blocks.len());
         blocks.truncate(reusable);
         let block_ids = self.materialize_prefix_blocks(&blocks);
