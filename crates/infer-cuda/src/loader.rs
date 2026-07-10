@@ -678,6 +678,7 @@ impl MmapShard {
             "{} length {len} exceeds mmap addressable range",
             path.display()
         );
+        // SAFETY: fd is a live read-only file; 0 < len <= isize::MAX checked above; MAP_FAILED handled below.
         let mapped = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -699,12 +700,14 @@ impl MmapShard {
     }
 
     fn as_slice(&self) -> &[u8] {
+        // SAFETY: ptr/len are the live PROT_READ mapping owned by self.
         unsafe { slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
     }
 }
 
 impl Drop for MmapShard {
     fn drop(&mut self) {
+        // SAFETY: ptr/len are the exact mmap result; unmapped once, in Drop.
         let rc = unsafe { libc::munmap(self.ptr.as_ptr().cast(), self.len) };
         if rc != 0 {
             log::warn!(
@@ -2992,7 +2995,7 @@ impl SafetensorLoader {
             Dtype::F8_E8M0 => Ok(bytes.to_vec()),
             Dtype::F32 => {
                 ensure!(
-                    bytes.len() % 4 == 0,
+                    bytes.len().is_multiple_of(4),
                     "{scale_name}: F32 scale byte length {} not a multiple of 4",
                     bytes.len()
                 );
@@ -3749,6 +3752,7 @@ impl SafetensorLoader {
                 .map_err(|e| anyhow!("DSv4 attn_sink f32 mirror alloc failed: {e}"))?;
             let (src_ptr, _sg) = attn_sink.data.device_ptr(&ctx.stream);
             let (dst_ptr, _dg) = dst.device_ptr_mut(&ctx.stream);
+            // SAFETY: ptrs from live device allocations sized to the dims passed.
             unsafe {
                 ffi::arle_bf16_to_f32_cuda(
                     src_ptr as *const ffi::Half,

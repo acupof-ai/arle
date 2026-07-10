@@ -75,6 +75,7 @@ fn disk_free_total_bytes(path: &Path) -> Option<(usize, usize)> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
     let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: zeroed statvfs out-param filled by libc; rc checked before use.
     let stat = unsafe {
         let mut stat: libc::statvfs = std::mem::zeroed();
         if libc::statvfs(c_path.as_ptr(), &mut stat) != 0 {
@@ -494,12 +495,11 @@ impl CudaKvTierStore {
     }
 
     pub(crate) fn persist(&self) {
-        if let Some(disk) = self.disk.as_ref() {
-            if disk.durable {
-                if let Err(err) = disk.write_manifest() {
-                    log::warn!("KV recall manifest persist failed: {err}");
-                }
-            }
+        if let Some(disk) = self.disk.as_ref()
+            && disk.durable
+            && let Err(err) = disk.write_manifest()
+        {
+            log::warn!("KV recall manifest persist failed: {err}");
         }
     }
 
@@ -636,10 +636,10 @@ impl CudaKvTierStore {
                 len: payload.len(),
             },
         );
-        if disk.durable {
-            if let Err(err) = disk.write_manifest() {
-                log::warn!("KV recall manifest update failed for key {key}: {err}");
-            }
+        if disk.durable
+            && let Err(err) = disk.write_manifest()
+        {
+            log::warn!("KV recall manifest update failed for key {key}: {err}");
         }
         true
     }
@@ -677,15 +677,15 @@ impl CudaKvTierStore {
             return Ok(Cow::Borrowed(entry.payload.as_slice()));
         }
         // Disk hit: zero-copy mmap slice.
-        if let Some(disk) = self.disk.as_ref() {
-            if let Some(record) = disk.keys.get(&key) {
-                let len = if record.len == 0 {
-                    self.bytes_per_page
-                } else {
-                    record.len.min(self.bytes_per_page)
-                };
-                return Ok(Cow::Borrowed(&disk.store.read_slot(record.slot)[..len]));
-            }
+        if let Some(disk) = self.disk.as_ref()
+            && let Some(record) = disk.keys.get(&key)
+        {
+            let len = if record.len == 0 {
+                self.bytes_per_page
+            } else {
+                record.len.min(self.bytes_per_page)
+            };
+            return Ok(Cow::Borrowed(&disk.store.read_slot(record.slot)[..len]));
         }
         Err(anyhow!("KV tier store has no entry for key {key}"))
     }
@@ -787,21 +787,19 @@ impl CudaKvTierStore {
             if let Some(entry) = self.host.remove(key) {
                 self.host_lru.remove(&(entry.stamp, *key));
             }
-            if let Some(disk) = &mut self.disk {
-                if let Some(record) = disk.keys.remove(key) {
-                    disk.store.free_slot(record.slot);
-                    disk_index_changed = true;
-                }
+            if let Some(disk) = &mut self.disk
+                && let Some(record) = disk.keys.remove(key)
+            {
+                disk.store.free_slot(record.slot);
+                disk_index_changed = true;
             }
         }
-        if disk_index_changed {
-            if let Some(disk) = self.disk.as_ref() {
-                if disk.durable {
-                    if let Err(err) = disk.write_manifest() {
-                        log::warn!("KV recall manifest update after remove failed: {err}");
-                    }
-                }
-            }
+        if disk_index_changed
+            && let Some(disk) = self.disk.as_ref()
+            && disk.durable
+            && let Err(err) = disk.write_manifest()
+        {
+            log::warn!("KV recall manifest update after remove failed: {err}");
         }
     }
 }
@@ -833,11 +831,11 @@ pub(crate) fn weights_epoch_tag(model_path: &Path) -> String {
             mix(name_str.as_bytes());
             if let Ok(meta) = entry.metadata() {
                 mix(&meta.len().to_le_bytes());
-                if let Ok(modified) = meta.modified() {
-                    if let Ok(dur) = modified.duration_since(std::time::UNIX_EPOCH) {
-                        mix(&dur.as_secs().to_le_bytes());
-                        mix(&dur.subsec_nanos().to_le_bytes());
-                    }
+                if let Ok(modified) = meta.modified()
+                    && let Ok(dur) = modified.duration_since(std::time::UNIX_EPOCH)
+                {
+                    mix(&dur.as_secs().to_le_bytes());
+                    mix(&dur.subsec_nanos().to_le_bytes());
                 }
             }
         }

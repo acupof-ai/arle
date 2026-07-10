@@ -56,17 +56,21 @@ impl MhcDecodeScratch {
             "DSv4 MHC scratch mix rows {} cannot cover {mix_dim}",
             hc.mix_fn.rows
         );
+        // SAFETY: uninit device scratch; fully written before first read.
         let mixes = unsafe { HiddenStates::uninit(ctx, hc.mix_fn.rows, 1)? };
+        // SAFETY: uninit device scratch; fully written before first read.
         let pre = unsafe {
             ctx.stream
                 .alloc::<f32>(hc_mult)
                 .map_err(|e| anyhow!("DSv4 HC pre scratch alloc failed: {e}"))?
         };
+        // SAFETY: uninit device scratch; fully written before first read.
         let post = unsafe {
             ctx.stream
                 .alloc::<f32>(hc_mult)
                 .map_err(|e| anyhow!("DSv4 HC post scratch alloc failed: {e}"))?
         };
+        // SAFETY: uninit device scratch; fully written before first read.
         let comb = unsafe {
             ctx.stream
                 .alloc::<f32>(hc_mult * hc_mult)
@@ -150,16 +154,19 @@ pub(crate) fn gen_mhc_params(
     let mut mixes = unsafe { HiddenStates::uninit(ctx, hc.mix_fn.rows, stream.seq_len)? };
     crate::attention::dsv4_linear(ctx, &hc.mix_fn, stream, &mut mixes)?;
 
+    // SAFETY: uninit device scratch; fully written before first read.
     let mut pre = unsafe {
         ctx.stream
             .alloc::<f32>(stream.seq_len * hc_mult)
             .map_err(|e| anyhow!("DSv4 HC pre alloc failed: {e}"))?
     };
+    // SAFETY: uninit device scratch; fully written before first read.
     let mut post = unsafe {
         ctx.stream
             .alloc::<f32>(stream.seq_len * hc_mult)
             .map_err(|e| anyhow!("DSv4 HC post alloc failed: {e}"))?
     };
+    // SAFETY: uninit device scratch; fully written before first read.
     let mut comb = unsafe {
         ctx.stream
             .alloc::<f32>(stream.seq_len * hc_mult * hc_mult)

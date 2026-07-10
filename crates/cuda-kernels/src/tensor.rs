@@ -3269,15 +3269,17 @@ impl DeviceMatrix {
             .stream
             .clone_htod(packed)
             .map_err(|e| anyhow!("H2D tq_packed failed: {}", e))?;
+        // SAFETY: every u16 bit pattern is a valid f16 half; align_to yields
+        // whole u16s and the prefix/suffix check proves 2-alignment.
+        let (pre, scale_halves, post) = unsafe { scales.align_to::<u16>() };
+        ensure!(
+            pre.is_empty() && post.is_empty(),
+            "tq scales byte slice not 2-aligned/even ({} bytes)",
+            scales.len()
+        );
         let tq_s: CudaSlice<u16> = ctx
             .stream
-            // SAFETY: reinterprets the f16 scale bytes as u16 halves (every bit
-            // pattern valid, length halved to whole u16s); requires the byte
-            // slice to be 2-aligned, which safetensors buffers are in practice;
-            // TODO(#154-sweep): verify alignment or route through align_to.
-            .clone_htod(unsafe {
-                std::slice::from_raw_parts(scales.as_ptr().cast::<u16>(), scales.len() / 2)
-            })
+            .clone_htod(scale_halves)
             .map_err(|e| anyhow!("H2D tq_scales failed: {}", e))?;
         let tq_sg = ctx
             .stream

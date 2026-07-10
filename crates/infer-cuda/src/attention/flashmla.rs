@@ -171,6 +171,7 @@ impl Dsv4FlashMlaDecodeState {
         let mut num_sm_parts = 0_i32;
         let mut fixed_overhead_num_blocks = 0_i32;
         let mut block_size_topk = 0_i32;
+        // SAFETY: ptrs from live device allocations sized to the dims passed.
         unsafe {
             ffi::arle_flashmla_sm90_sparse_decode_get_meta(
                 shape.h_q as i32,
@@ -232,6 +233,7 @@ impl Dsv4FlashMlaDecodeState {
         let (topk_ptr, _tg) = self.topk_length.device_ptr(&ctx.stream);
         let (sched_ptr, _sg) = self.sched_meta.device_ptr_mut(&ctx.stream);
         let (splits_ptr, _pg) = self.num_splits.device_ptr_mut(&ctx.stream);
+        // SAFETY: ptrs from live device allocations sized to the dims passed.
         unsafe {
             ffi::arle_flashmla_sm90_sparse_decode_sched_meta(
                 1,
@@ -431,6 +433,7 @@ impl Dsv4FlashMlaDecodeScratch {
         let mut num_sm_parts = 0_i32;
         let mut fixed_overhead_num_blocks = 0_i32;
         let mut block_size_topk = 0_i32;
+        // SAFETY: ptrs from live device allocations sized to the dims passed.
         unsafe {
             ffi::arle_flashmla_sm90_sparse_decode_get_meta(
                 h_q as i32,
@@ -614,6 +617,7 @@ impl Dsv4FlashMlaDecodeBatchScratch {
         let mut num_sm_parts = 0_i32;
         let mut fixed_overhead_num_blocks = 0_i32;
         let mut block_size_topk = 0_i32;
+        // SAFETY: ptrs from live device allocations sized to the dims passed.
         unsafe {
             ffi::arle_flashmla_sm90_sparse_decode_get_meta(
                 h_q as i32,
@@ -992,6 +996,7 @@ impl Dsv4FlashMlaDecodeBatchScratch {
         let (topk_ptr, topk_guard) = self.topk_length.device_ptr(&ctx.stream);
         let (sched_ptr, sched_guard) = self.sched_meta.device_ptr_mut(&ctx.stream);
         let (splits_ptr, splits_guard) = self.num_splits.device_ptr_mut(&ctx.stream);
+        // SAFETY: ptrs from live device allocations sized to the dims passed.
         unsafe {
             ffi::arle_flashmla_sm90_sparse_decode_sched_meta(
                 n as i32,
@@ -1082,6 +1087,7 @@ impl Dsv4FlashMlaDecodeBatchScratch {
         let (lse_out_ptr, lse_guard) = self.lse_out.device_ptr_mut(&ctx.stream);
         let (lse_accum_ptr, lse_accum_guard) = self.lse_accum.device_ptr_mut(&ctx.stream);
         let (o_accum_ptr, o_accum_guard) = self.o_accum.device_ptr_mut(&ctx.stream);
+        // SAFETY: ptrs from live device allocations sized to the dims passed.
         unsafe {
             ffi::arle_flashmla_sm90_sparse_decode_fwd(
                 q_ptr,
@@ -1463,6 +1469,7 @@ impl Dsv4FusedWqkvDecodeScratch {
                 .stream
                 .alloc_zeros::<f32>(scale_stride_m * scale_cols)
                 .map_err(|e| anyhow!("DSv4 fused wqkv input scale scratch alloc failed: {e}"))?,
+            // SAFETY: uninit device scratch; fully written before first read.
             qkv_raw: unsafe { HiddenStates::uninit(ctx, q_lora_rank + head_dim, 1)? },
             active_experts: ctx
                 .stream
@@ -1592,6 +1599,7 @@ impl Dsv4PrefillDeepGemmLinearScratch {
                     },
                 )?)
                 .map_err(|e| anyhow!("DSv4 prefill DeepGEMM linear scales alloc failed: {e}"))?,
+            // SAFETY: uninit device scratch; fully written before first read.
             qkv_raw: unsafe { HiddenStates::uninit(ctx, q_lora_rank + head_dim, max_m)? },
             oproj_group_in: ctx
                 .stream

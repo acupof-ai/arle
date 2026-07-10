@@ -262,6 +262,7 @@ pub(super) fn warm_fp8_deepgemm_dense(
         .stream
         .alloc_zeros::<bf16>(m * n)
         .map_err(|e| anyhow!("Qwen FP8 dense DeepGEMM warm output alloc failed: {e}"))?;
+    // SAFETY: ptrs from live device allocations sized to the dims passed.
     qwen_quant_profile(ctx, "qwen/fp8/dense_deepgemm_warm", m, n, k, || unsafe {
         cuda_moe::dsv4_deepgemm_fp8_gemm_nt(
             cache_ptr(&input_fp8, ctx),
@@ -334,6 +335,7 @@ fn try_fp8_deepgemm_dense_batch(
             .as_ref()
             .ok_or_else(|| anyhow!("Qwen FP8 dense DeepGEMM active_counts missing"))?;
 
+        // SAFETY: ptrs from live device allocations sized to the dims passed.
         qwen_quant_profile(ctx, "qwen/fp8/dense_pack_quantize", m, n, k, || unsafe {
             cuda_moe::dsv4_deepgemm_pack_quantize_bf16_to_fp8(
                 cache_ptr(&x.data, ctx),
@@ -349,6 +351,7 @@ fn try_fp8_deepgemm_dense_batch(
                 ctx.stream.cu_stream(),
             )
         })?;
+        // SAFETY: ptrs from live device allocations sized to the dims passed.
         qwen_quant_profile(ctx, "qwen/fp8/dense_deepgemm", m, n, k, || unsafe {
             cuda_moe::dsv4_deepgemm_fp8_gemm_nt(
                 cache_ptr(input_fp8, ctx),
@@ -436,6 +439,7 @@ fn try_fp8_dequant_bf16_gemm_batch(
             x.seq_len,
             n,
             k,
+            // SAFETY: ptrs from live device allocations sized to the dims passed.
             || unsafe {
                 ffi::dequantize_fp8_block_scaled_to_bf16_cuda(
                     qw_ptr as *const u8,
@@ -461,6 +465,7 @@ fn try_fp8_dequant_bf16_gemm_batch(
             x.seq_len,
             n,
             k,
+            // SAFETY: ptrs from live device allocations sized to the dims passed.
             || unsafe {
                 ffi::gemm_cuda(
                     wbf16_ptr as *const ffi::Half,
@@ -504,6 +509,7 @@ pub(super) fn gemm_batch(
     let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
     let stream = ctx.stream.cu_stream();
 
+    // SAFETY: ptrs from live device allocations sized to the dims passed.
     unsafe {
         match weight.weight_format {
             WeightFormat::Dsv4Fp8BlockScaled | WeightFormat::Dsv4Fp4BlockScaled => {
@@ -654,6 +660,7 @@ pub(super) fn gemv(
     let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
     let stream = ctx.stream.cu_stream();
 
+    // SAFETY: ptrs from live device allocations sized to the dims passed.
     unsafe {
         match weight.weight_format {
             WeightFormat::Fp8BlockScaled | WeightFormat::Fp8PerShard => {

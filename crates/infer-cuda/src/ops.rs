@@ -76,6 +76,7 @@ pub(crate) fn embedding_batch(
     let (embed_ptr, _ge) = embed.data.device_ptr(&ctx.stream);
     let (token_ptr, _gt) = token_ids.device_ptr(&ctx.stream);
     let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
+    // SAFETY: ptrs from live device allocations sized to the dims passed.
     unsafe {
         ffi::embedding_batched_cuda(
             embed_ptr as *const ffi::Half,
@@ -100,6 +101,7 @@ pub(crate) fn rms_norm_batch(
     let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
     let (w_ptr, _gw) = weight.data.device_ptr(&ctx.stream);
     let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
+    // SAFETY: ptrs from live device allocations sized to the dims passed.
     unsafe {
         ffi::rms_norm_batched_cuda(
             x_ptr as *const ffi::Half,
@@ -125,6 +127,7 @@ pub(crate) fn rms_norm_vec(
     let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
     let (w_ptr, _gw) = weight.data.device_ptr(&ctx.stream);
     let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
+    // SAFETY: ptrs from live device allocations sized to the dims passed.
     unsafe {
         ffi::rms_norm_cuda(
             x_ptr as *const ffi::Half,
@@ -178,6 +181,7 @@ pub(crate) fn gemm_batch(
     let (w_ptr, _gw) = weight.data.device_ptr(&ctx.stream);
     let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
     let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
+    // SAFETY: ptrs from live device allocations sized to the dims passed.
     unsafe {
         ffi::gemm_cuda(
             w_ptr as *const ffi::Half,
@@ -221,6 +225,7 @@ pub(crate) fn gemv(
     let (w_ptr, _gw) = weight.data.device_ptr(&ctx.stream);
     let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
     let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
+    // SAFETY: ptrs from live device allocations sized to the dims passed.
     unsafe {
         ffi::gemv_cuda(
             w_ptr as *const ffi::Half,
@@ -252,6 +257,7 @@ pub(crate) fn add_batch(
     let (a_ptr, _ga) = a.data.device_ptr(&ctx.stream);
     let (b_ptr, _gb) = b.data.device_ptr(&ctx.stream);
     let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
+    // SAFETY: ptrs from live device allocations sized to the dims passed.
     unsafe {
         ffi::add_cuda(
             a_ptr as *const ffi::Half,
@@ -282,6 +288,7 @@ pub(crate) fn silu_mul(
     let (gate_ptr, _gg) = gate.data.device_ptr(&ctx.stream);
     let (up_ptr, _gu) = up.data.device_ptr(&ctx.stream);
     let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
+    // SAFETY: ptrs from live device allocations sized to the dims passed.
     unsafe {
         ffi::silu_mul_cuda(
             gate_ptr as *const ffi::Half,
@@ -327,6 +334,7 @@ where
     let (w_ptr, _gw) = a_t.device_ptr(&ctx.stream);
     let (x_ptr, _gx) = b.device_ptr(&ctx.stream);
     let (out_ptr, _go) = out.device_ptr_mut(&ctx.stream);
+    // SAFETY: ptrs from live device allocations sized to the dims passed.
     unsafe {
         ffi::gemm_cuda(
             w_ptr as *const ffi::Half,
@@ -372,6 +380,7 @@ where
         .map_err(|e| anyhow!("lora_scaled_add_into: base D2D copy failed: {e}"))?;
     let (delta_ptr, _gd) = delta.device_ptr(&ctx.stream);
     let (out_ptr, _go) = out.device_ptr_mut(&ctx.stream);
+    // SAFETY: ptrs from live device allocations sized to the dims passed.
     unsafe {
         ffi::add_scaled_row_cuda(
             delta_ptr as *const ffi::Half,
@@ -454,6 +463,7 @@ pub(crate) fn argmax_into(
     {
         let (logits_ptr, _gl) = logits.data.device_ptr(&ctx.stream);
         let (out_ptr, _go) = out.device_ptr_mut(&ctx.stream);
+        // SAFETY: ptrs from live device allocations sized to the dims passed.
         unsafe {
             ffi::argmax_cuda(
                 logits_ptr as *const ffi::Half,

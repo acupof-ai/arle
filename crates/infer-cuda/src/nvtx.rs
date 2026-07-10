@@ -84,6 +84,7 @@ pub(crate) fn range(name: &str) -> Range {
     let Ok(name) = CString::new(name) else {
         return Range { active: false };
     };
+    // SAFETY: push is a resolved nvToolsExt symbol; name is a live NUL-terminated CString.
     unsafe {
         push(name.as_ptr());
     }
@@ -100,6 +101,7 @@ impl Drop for Range {
         let Some(pop) = NVTX.get_or_init(load).pop else {
             return;
         };
+        // SAFETY: pop is a resolved nvToolsExt symbol, paired with the successful push in range().
         unsafe {
             pop();
         }

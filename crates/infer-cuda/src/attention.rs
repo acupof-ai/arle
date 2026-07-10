@@ -221,6 +221,7 @@ pub(crate) fn commit_layer_fold(
     }
 
     // ── K re-derivation: wkv → kv_norm → rope at chain positions.
+    // SAFETY: uninit device scratch; fully written before first read.
     let mut kv_raw = unsafe { HiddenStates::uninit(ctx, head_dim, m)? };
     dsv4_linear(ctx, &attention.wkv, gathered, &mut kv_raw)?;
     keepalive.keep_hidden(&kv_raw);
@@ -236,7 +237,9 @@ pub(crate) fn commit_layer_fold(
         hidden_dim: local_width,
         seq_len: m,
     };
+    // SAFETY: uninit device scratch; fully written before first read.
     let mut q_discard = unsafe { HiddenStates::uninit(ctx, local_width, m)? };
+    // SAFETY: uninit device scratch; fully written before first read.
     let mut k_prepared = unsafe { HiddenStates::uninit(ctx, head_dim, m)? };
     {
         let (q_raw_ptr, _qr) = q_dummy.data.device_ptr(&ctx.stream);
@@ -711,6 +714,7 @@ fn prefill_attention(
         let k_pool_ptr = pool.k_ptr(layer_idx, &ctx.stream);
         let v_pool_ptr = pool.v_ptr(layer_idx, &ctx.stream);
 
+        // SAFETY: ptrs from live device allocations sized to the dims passed.
         unsafe {
             ffi::prefill_attention_paged_prep_cuda(
                 q_ptr as *mut ffi::Half,
@@ -799,6 +803,7 @@ fn decode_attention(
         let v_pool_ptr = pool.v_ptr(layer_idx, &ctx.stream);
         let stride_page = pool.kv_dim * pool.page_size;
 
+        // SAFETY: ptrs from live device allocations sized to the dims passed.
         unsafe {
             ffi::decode_prep_paged_cuda(
                 q_ptr as *mut ffi::Half,
@@ -933,6 +938,7 @@ fn run_tilelang_paged(
     } else {
         (1, meta.seq_len as i32, meta.seq_len as i32)
     };
+    // SAFETY: ptrs from live device allocations sized to the dims passed.
     unsafe {
         kernel(
             q_ptr as *mut ffi::Half,
@@ -1122,6 +1128,7 @@ where
     let (weight_ptr, _weight_guard) = cache.weight.device_ptr(&ctx.stream);
     let (weight_scale_ptr, _weight_scale_guard) = cache.scales.device_ptr(&ctx.stream);
     let (out_ptr, _out_guard) = out.device_ptr_mut(&ctx.stream);
+    // SAFETY: ptrs from live device allocations sized to the dims passed.
     unsafe {
         ffi::dsv4_deepgemm_pack_quantize_bf16_to_fp8_cuda(
             input_ptr as *const ffi::Half,
@@ -1323,6 +1330,7 @@ fn prefill_proj_deepgemm_group_scratch(
     let (weight_ptr, _weight_guard) = cache.weight.device_ptr(&ctx.stream);
     let (weight_scale_ptr, _weight_scale_guard) = cache.scales.device_ptr(&ctx.stream);
     let (out_ptr, _out_guard) = scratch.oproj_group_out.device_ptr_mut(&ctx.stream);
+    // SAFETY: ptrs from live device allocations sized to the dims passed.
     unsafe {
         ffi::dsv4_deepgemm_pack_quantize_bf16_to_fp8_cuda(
             input_ptr as *const ffi::Half,
@@ -1437,6 +1445,7 @@ fn run_fused_wqkv_prefill(
         .memcpy_htod(&[active_count], &mut scratch.active_counts)
         .map_err(|e| anyhow!("DSv4 fused wqkv prefill active_counts H2D failed: {e}"))?;
     let stream = ctx.stream.cu_stream();
+    // SAFETY: ptrs from live device allocations sized to the dims passed.
     unsafe {
         cuda_moe::dsv4_deepgemm_pack_quantize_bf16_to_fp8(
             cache_ptr(&hidden.data, ctx),
@@ -2114,6 +2123,7 @@ fn update_bf16_sw_window(
     }
     let (k_ptr, _kg) = k_prepared.data.device_ptr(&ctx.stream);
     let (window_ptr, _wg) = sw_window_cache.device_ptr_mut(&ctx.stream);
+    // SAFETY: ptrs from live device allocations sized to the dims passed.
     unsafe {
         if let Some(start_pos_device) = start_pos_device {
             let (start_ptr, _sg) = start_pos_device.device_ptr(&ctx.stream);
@@ -2297,6 +2307,7 @@ fn try_flashmla_prefill_attention(
 
     // FlashMLA prefill consumes one unified bf16 pool:
     // [rolling SW cache rebased | current chunk K | compressed pool].
+    // SAFETY: uninit device scratch; fully written before first read.
     let mut kv_unified = unsafe { HiddenStates::uninit(ctx, config.head_dim, kv_rows)? };
     {
         let _nvtx = crate::nvtx::range("dsv4/flashmla_prefill_pack_kv");
@@ -2310,6 +2321,7 @@ fn try_flashmla_prefill_attention(
             }
             None => (std::ptr::null(), None),
         };
+        // SAFETY: ptrs from live device allocations sized to the dims passed.
         unsafe {
             ffi::arle_flashmla_csa_pack_kv(
                 kv_ptr as *mut ffi::Half,
@@ -2358,6 +2370,7 @@ fn try_flashmla_prefill_attention(
             } else {
                 0
             };
+            // SAFETY: ptrs from live device allocations sized to the dims passed.
             unsafe {
                 ffi::arle_flashmla_chain_verify_build_indices(
                     indices_ptr as *mut i32,
@@ -2384,6 +2397,7 @@ fn try_flashmla_prefill_attention(
                 .map_err(|e| anyhow!("DSv4 FlashMLA chain verify indices failed: {e}"))?;
             }
         } else {
+            // SAFETY: ptrs from live device allocations sized to the dims passed.
             unsafe {
                 match mode {
                     DeepSeekV4AttentionMode::CompressedSparse => {
@@ -2489,6 +2503,7 @@ fn try_flashmla_prefill_attention(
             let (gather_ptr, gather_guard) = gathered.device_ptr_mut(&ctx.stream);
             {
                 let _nvtx = crate::nvtx::range("dsv4/flashmla_prefill_q_allgather");
+                // SAFETY: q spans token_count*local_width; gathered holds tp_world x that, on ctx.stream.
                 unsafe {
                     tp.all_gather_bf16_raw(
                         ctx,
@@ -2502,6 +2517,7 @@ fn try_flashmla_prefill_attention(
             let (packed_ptr, packed_guard) = packed.device_ptr_mut(&ctx.stream);
             {
                 let _nvtx = crate::nvtx::range("dsv4/flashmla_prefill_q_repack");
+                // SAFETY: ptrs from live device allocations sized to the dims passed.
                 unsafe {
                     ffi::dsv4_tp_q_repack_cuda(
                         gather_ptr as *const ffi::Half,
@@ -2567,11 +2583,13 @@ fn try_flashmla_prefill_attention(
     let sink_ptr = if tp_world > 1 {
         sink_base as *const f32
     } else {
+        // SAFETY: ensure! above bounds tp_rank*local_heads + local_heads <= sink len.
         unsafe { (sink_base as *const f32).add(tp_rank * local_heads) }
     };
 
     {
         let _nvtx = crate::nvtx::range("dsv4/flashmla_prefill_fwd");
+        // SAFETY: ptrs from live device allocations sized to the dims passed.
         unsafe {
             ffi::arle_flashmla_sm90_sparse_prefill_fwd(
                 q_for_flashmla,
@@ -2611,6 +2629,7 @@ fn try_flashmla_prefill_attention(
         let (full_out_ptr, full_out_guard) = full_out.device_ptr(&ctx.stream);
         {
             let _nvtx = crate::nvtx::range("dsv4/flashmla_prefill_out_slice");
+            // SAFETY: ptrs from live device allocations sized to the dims passed.
             unsafe {
                 ffi::dsv4_tp_out_slice_cuda(
                     full_out_ptr as *const ffi::Half,
@@ -2630,6 +2649,7 @@ fn try_flashmla_prefill_attention(
 
     {
         let _nvtx = crate::nvtx::range("dsv4/flashmla_prefill_inverse_rope");
+        // SAFETY: ptrs from live device allocations sized to the dims passed.
         unsafe {
             if let Some(meta) = chain_verify {
                 let (pos_ptr, _pg) = meta.positions.device_ptr(&ctx.stream);
@@ -2876,6 +2896,7 @@ fn try_flashmla_decode_attention(
         let (gather_ptr, gather_guard) = scratch.tp_gathered_q.device_ptr_mut(&ctx.stream);
         {
             let _nvtx = crate::nvtx::range("dsv4/flashmla_q_allgather");
+            // SAFETY: q spans token_count*local_width; gathered holds tp_world x that, on ctx.stream.
             unsafe {
                 tp.all_gather_bf16_raw(
                     ctx,
@@ -2889,6 +2910,7 @@ fn try_flashmla_decode_attention(
         let (packed_ptr, packed_guard) = scratch.tp_packed_q.device_ptr_mut(&ctx.stream);
         {
             let _nvtx = crate::nvtx::range("dsv4/flashmla_q_repack");
+            // SAFETY: ptrs from live device allocations sized to the dims passed.
             unsafe {
                 ffi::dsv4_tp_q_repack_cuda(
                     gather_ptr as *const ffi::Half,
@@ -2940,6 +2962,7 @@ fn try_flashmla_decode_attention(
     let sink_ptr = if tp_world > 1 {
         sink_base as *const f32
     } else {
+        // SAFETY: ensure! above bounds tp_rank*local_heads + local_heads <= sink len.
         unsafe { (sink_base as *const f32).add(tp_rank * local_heads) }
     };
 
@@ -2965,6 +2988,7 @@ fn try_flashmla_decode_attention(
     let stride_lse = global_heads as i32;
     {
         let _nvtx = crate::nvtx::range("dsv4/flashmla_fwd");
+        // SAFETY: ptrs from live device allocations sized to the dims passed.
         unsafe {
             ffi::arle_flashmla_sm90_sparse_decode_fwd(
                 q_for_flashmla,
@@ -3021,6 +3045,7 @@ fn try_flashmla_decode_attention(
         let (full_out_ptr, full_out_guard) = scratch.tp_full_out.device_ptr(&ctx.stream);
         {
             let _nvtx = crate::nvtx::range("dsv4/flashmla_out_slice");
+            // SAFETY: ptrs from live device allocations sized to the dims passed.
             unsafe {
                 ffi::dsv4_tp_out_slice_cuda(
                     full_out_ptr as *const ffi::Half,
@@ -3046,6 +3071,7 @@ fn try_flashmla_decode_attention(
     // ponytail: pod-verify V32 skips output inverse-RoPE (512 latent is pure NoPE)
     if !is_v32 {
         let _nvtx = crate::nvtx::range("dsv4/flashmla_inverse_rope");
+        // SAFETY: ptrs from live device allocations sized to the dims passed.
         unsafe {
             ffi::arle_dsv4_output_inverse_rope_start_pos_ptr_cuda(
                 out_ptr as *mut ffi::Half,
@@ -3458,7 +3484,9 @@ fn mla_rms_norm_decode_slice_into(
         let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
         let (w_ptr, _gw) = weight.data.device_ptr(&ctx.stream);
         let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
+        // SAFETY: ensure! above bounds offset+width within x.
         let x_ptr = unsafe { (x_ptr as *const ffi::Half).add(offset) };
+        // SAFETY: ptrs from live device allocations sized to the dims passed.
         unsafe {
             ffi::rms_norm_batched_cuda(
                 x_ptr,
@@ -3482,8 +3510,11 @@ fn run_fused_wqkv_decode(
     hidden: &HiddenStates,
     scratch: &mut Dsv4FusedWqkvDecodeScratch,
 ) -> Result<(HiddenStates, HiddenStates, HiddenStates)> {
+    // SAFETY: uninit device scratch; fully written before first read.
     let mut c_q_normed = unsafe { HiddenStates::uninit(ctx, scratch.q_lora_rank, 1)? };
+    // SAFETY: uninit device scratch; fully written before first read.
     let mut q_raw = unsafe { HiddenStates::uninit(ctx, attention.wq_b.rows, 1)? };
+    // SAFETY: uninit device scratch; fully written before first read.
     let mut kv_normed = unsafe { HiddenStates::uninit(ctx, scratch.head_dim, 1)? };
     run_fused_wqkv_decode_into(
         ctx,
@@ -3567,6 +3598,7 @@ fn run_fused_wqkv_decode_into(
         scratch.head_dim
     );
     let stream = ctx.stream.cu_stream();
+    // SAFETY: ptrs from live device allocations sized to the dims passed.
     unsafe {
         cuda_moe::dsv4_deepgemm_pack_quantize_bf16_to_fp8(
             cache_ptr(&hidden.data, ctx),
@@ -3673,7 +3705,7 @@ fn run_fused_wqkv_decode_into(
         }
         _ => {
             crate::linear_profile::profile(ctx, "dsv4/linear/wq_b", || {
-                dsv4_linear(ctx, &attention.wq_b, &c_q_normed, &mut *q_raw)
+                dsv4_linear(ctx, &attention.wq_b, c_q_normed, &mut *q_raw)
             })?;
         }
     }
@@ -3811,7 +3843,9 @@ impl Dsv4MlaDecodeGraphScratch {
                 anyhow!("DSv4 graph scratch mode {mode:?} requires compressor weights")
             })?;
             (
+                // SAFETY: uninit device scratch; fully written before first read.
                 Some(unsafe { HiddenStates::uninit(ctx, compressor.wkv.rows, 1)? }),
+                // SAFETY: uninit device scratch; fully written before first read.
                 Some(unsafe { HiddenStates::uninit(ctx, compressor.wgate.rows, 1)? }),
             )
         } else {
@@ -3828,7 +3862,9 @@ impl Dsv4MlaDecodeGraphScratch {
                     .as_ref()
                     .ok_or_else(|| anyhow!("DSv4 CSA graph scratch requires indexer compressor"))?;
                 (
+                    // SAFETY: uninit device scratch; fully written before first read.
                     Some(unsafe { HiddenStates::uninit(ctx, compressor.wkv.rows, 1)? }),
+                    // SAFETY: uninit device scratch; fully written before first read.
                     Some(unsafe { HiddenStates::uninit(ctx, compressor.wgate.rows, 1)? }),
                 )
             } else {
@@ -3841,7 +3877,9 @@ impl Dsv4MlaDecodeGraphScratch {
                     .as_ref()
                     .ok_or_else(|| anyhow!("DSv4 graph scratch mode {mode:?} requires indexer"))?;
                 (
+                    // SAFETY: uninit device scratch; fully written before first read.
                     Some(unsafe { HiddenStates::uninit(ctx, indexer.wq_b.rows, 1)? }),
+                    // SAFETY: uninit device scratch; fully written before first read.
                     Some(unsafe { HiddenStates::uninit(ctx, indexer.weights_proj.rows, 1)? }),
                     Some(
                         ctx.stream
@@ -3862,14 +3900,23 @@ impl Dsv4MlaDecodeGraphScratch {
                 (None, None, None, None, None)
             };
         Ok(Self {
+            // SAFETY: uninit device scratch; fully written before first read.
             c_q: unsafe { HiddenStates::uninit(ctx, attention.wq_a.rows, 1)? },
+            // SAFETY: uninit device scratch; fully written before first read.
             c_q_normed: unsafe { HiddenStates::uninit(ctx, attention.wq_a.rows, 1)? },
+            // SAFETY: uninit device scratch; fully written before first read.
             q_raw: unsafe { HiddenStates::uninit(ctx, local_width, 1)? },
+            // SAFETY: uninit device scratch; fully written before first read.
             kv_raw: unsafe { HiddenStates::uninit(ctx, config.head_dim, 1)? },
+            // SAFETY: uninit device scratch; fully written before first read.
             kv_normed: unsafe { HiddenStates::uninit(ctx, config.head_dim, 1)? },
+            // SAFETY: uninit device scratch; fully written before first read.
             q_prepared: unsafe { HiddenStates::uninit(ctx, local_width, 1)? },
+            // SAFETY: uninit device scratch; fully written before first read.
             k_prepared: unsafe { HiddenStates::uninit(ctx, config.head_dim, 1)? },
+            // SAFETY: uninit device scratch; fully written before first read.
             local_attn: unsafe { HiddenStates::uninit(ctx, local_width, 1)? },
+            // SAFETY: uninit device scratch; fully written before first read.
             oproj_latent: unsafe { HiddenStates::uninit(ctx, oproj_rows, 1)? },
             compressor_main_kv,
             compressor_main_score,
@@ -4228,6 +4275,7 @@ pub(crate) fn mla_attention_decode_graph(
         let (k_out_ptr, _ko) = scratch.k_prepared.data.device_ptr_mut(&ctx.stream);
         let start_pos_device = start_pos_device.expect("checked above");
         let (start_ptr, _sg) = start_pos_device.device_ptr(&ctx.stream);
+        // SAFETY: ptrs from live device allocations sized to the dims passed.
         unsafe {
             ffi::dsv4_prepare_qk_start_pos_ptr_cuda(
                 q_raw_ptr as *const ffi::Half,
@@ -4546,6 +4594,7 @@ pub(crate) fn mla_attention_decode_graph(
             let (out_ptr, _og) = scratch.local_attn.data.device_ptr_mut(&ctx.stream);
             let start_pos_device = start_pos_device.expect("checked above");
             let (start_ptr, _spg) = start_pos_device.device_ptr(&ctx.stream);
+            // SAFETY: ptrs from live device allocations sized to the dims passed.
             unsafe {
                 ffi::dsv4_swa_attention_start_pos_ptr_cuda(
                     q_ptr as *const ffi::Half,
@@ -4573,17 +4622,14 @@ pub(crate) fn mla_attention_decode_graph(
             }
         }
     } else {
-        let compressed = Some(
-            &state
-                .compressor
-                .as_ref()
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "DSv4 layer {layer_idx} is {mode:?} but has no compressor state"
-                    )
-                })?
-                .compressed,
-        );
+        let compressed_hidden = &state
+            .compressor
+            .as_ref()
+            .ok_or_else(|| {
+                anyhow::anyhow!("DSv4 layer {layer_idx} is {mode:?} but has no compressor state")
+            })?
+            .compressed;
+        let compressed = Some(compressed_hidden);
         let compressed_capacity = compressed.map_or(0, |c| c.data.len() / head_dim);
         let compressed_count_arg = if start_pos_device.is_some() {
             compressed_capacity
@@ -4643,10 +4689,7 @@ pub(crate) fn mla_attention_decode_graph(
                 .data
                 .device_ptr(&ctx.stream);
             let (out_ptr, _og) = scratch.local_attn.data.device_ptr_mut(&ctx.stream);
-            let (comp_ptr, _cguard) = compressed
-                .expect("compressed present for non-SW graph mode")
-                .data
-                .device_ptr(&ctx.stream);
+            let (comp_ptr, _cguard) = compressed_hidden.data.device_ptr(&ctx.stream);
             let (sel_ptr, _sguard) = match selected {
                 Some(sel) => {
                     let (p, g) = sel.device_ptr(&ctx.stream);
@@ -4656,6 +4699,7 @@ pub(crate) fn mla_attention_decode_graph(
             };
             let start_pos_device = start_pos_device.expect("checked above");
             let (start_ptr, _spg) = start_pos_device.device_ptr(&ctx.stream);
+            // SAFETY: ptrs from live device allocations sized to the dims passed.
             unsafe {
                 ffi::dsv4_hybrid_attention_start_pos_ptr_cuda(
                     q_ptr as *const ffi::Half,
@@ -4784,10 +4828,13 @@ fn glm_absorb_q(
         let (out_ptr, _go) = q_absorbed.data.device_ptr_mut(&ctx.stream);
         for h in 0..local_heads {
             // q_nope[h] = q_raw[h*qk_head .. h*qk_head+qk_nope] (token 0).
+            // SAFETY: h < local_heads keeps this per-head offset in bounds.
             let q_nope_h = unsafe { (q_ptr as *const ffi::Half).add(h * qk_head) };
             // w_kc[h] block: rows [h*kv_lora, (h+1)*kv_lora), [kv_lora, qk_nope].
+            // SAFETY: h < local_heads keeps this per-head offset in bounds.
             let w_h = unsafe { (w_ptr as *const ffi::Half).add(h * kv_lora * qk_nope) };
             // q_latent[h] → q_absorbed[h*head_dim .. h*head_dim+kv_lora].
+            // SAFETY: h < local_heads keeps this per-head offset in bounds.
             let out_h = unsafe { (out_ptr as *mut ffi::Half).add(h * head_dim) };
             // SAFETY: per-head bf16 GEMM weight[kv_lora, qk_nope] · q_nope[qk_nope, 1].
             unsafe {
@@ -4880,10 +4927,13 @@ fn glm_absorb_v(
         let (out_ptr, _go) = v_out.data.device_ptr_mut(&ctx.stream);
         for h in 0..local_heads {
             // attn_out[h] = local_attn[h*kv_lora .. (h+1)*kv_lora] (token 0).
+            // SAFETY: h < local_heads keeps this per-head offset in bounds.
             let a_h = unsafe { (a_ptr as *const ffi::Half).add(h * kv_lora) };
             // w_vc[h] block rows [h*v_head, (h+1)*v_head), [v_head, kv_lora].
+            // SAFETY: h < local_heads keeps this per-head offset in bounds.
             let w_h = unsafe { (w_ptr as *const ffi::Half).add(h * v_head * kv_lora) };
             // v[h] → v_out[h*v_head .. (h+1)*v_head].
+            // SAFETY: h < local_heads keeps this per-head offset in bounds.
             let out_h = unsafe { (out_ptr as *mut ffi::Half).add(h * v_head) };
             // SAFETY: per-head bf16 GEMM weight[v_head, kv_lora] · attn_out[kv_lora, 1].
             unsafe {
@@ -5038,7 +5088,9 @@ pub(crate) fn mla_attention_prepare(
         drop(nvtx_wqkv);
         out
     } else if token_count > 1 && dsv4_fp8_linear_deepgemm_enabled()? {
+        // SAFETY: uninit device scratch; fully written before first read.
         let mut c_q = unsafe { HiddenStates::uninit(ctx, attention.wq_a.rows, token_count)? };
+        // SAFETY: uninit device scratch; fully written before first read.
         let mut kv_raw = unsafe { HiddenStates::uninit(ctx, head_dim, token_count)? };
         let scratch = prefill_shared.as_deref_mut().ok_or_else(|| {
             anyhow!("DSv4 fused wqkv prefill requested but prefill scratch was not allocated")
@@ -5051,6 +5103,7 @@ pub(crate) fn mla_attention_prepare(
         keepalive.keep_hidden(&c_q);
         let c_q_normed = mla_rms_norm(ctx, &c_q, &attention.q_norm, config.rms_norm_eps)?;
         keepalive.keep_hidden(&c_q_normed);
+        // SAFETY: uninit device scratch; fully written before first read.
         let mut q_raw = unsafe { HiddenStates::uninit(ctx, local_width, token_count)? };
         let nvtx_wq_b = crate::nvtx::range("dsv4/linear/wq_b");
         // Prefill wq_b → DeepGEMM (off the scalar dsv4_fp8_gemv_batch, the 62% of
@@ -5152,6 +5205,7 @@ pub(crate) fn mla_attention_prepare(
     // ── 3. Partial RoPE on the trailing rope_dim cols of Q (per head) and K.
     // SAFETY: dsv4_prepare_qk_cuda writes both full output buffers.
     let mut q_prepared = unsafe { HiddenStates::uninit(ctx, local_width, token_count)? };
+    // SAFETY: uninit device scratch; fully written before first read.
     let mut k_prepared = unsafe { HiddenStates::uninit(ctx, head_dim, token_count)? };
     {
         let (q_raw_ptr, _qr) = q_raw.data.device_ptr(&ctx.stream);
@@ -5607,6 +5661,7 @@ pub(crate) fn mla_attention_prepare_proj_batch(
         // kv_raw[N] sliced out of the fused output. Weight read ONCE across N rows.
         // SAFETY: run_fused_wqkv_prefill writes the full c_q / kv_raw buffers.
         let mut c_q = unsafe { HiddenStates::uninit(ctx, attention.wq_a.rows, n)? };
+        // SAFETY: uninit device scratch; fully written before first read.
         let mut kv_raw = unsafe { HiddenStates::uninit(ctx, head_dim, n)? };
         let nvtx_wqkv = crate::nvtx::range("dsv4/linear/wqkv_a_fused_batched");
         crate::linear_profile::profile(ctx, "dsv4/linear/wqkv_a_fused_batched", || {
@@ -5682,6 +5737,7 @@ pub(crate) fn mla_attention_prepare_proj_batch(
     // exactly what makes the batched RoPE equal the N per-row RoPE calls.
     // SAFETY: dsv4_prepare_qk_fused_batch writes both full output buffers.
     let mut q_prepared = unsafe { HiddenStates::uninit(ctx, local_width, n)? };
+    // SAFETY: uninit device scratch; fully written before first read.
     let mut k_prepared = unsafe { HiddenStates::uninit(ctx, head_dim, n)? };
     {
         let (q_raw_ptr, _qr) = q_raw.data.device_ptr(&ctx.stream);
@@ -6662,7 +6718,9 @@ fn dsv4_wo_a_grouped_linear(
         let cols = shape.cols_per_group;
         let rows = shape.rows_per_group;
         let wo_a = attention.wo_a.as_ref().expect("DSv4 wo_a");
+        // SAFETY: uninit device scratch; fully written before first read.
         let mut in_g = unsafe { HiddenStates::uninit(ctx, cols, seq)? };
+        // SAFETY: uninit device scratch; fully written before first read.
         let mut out_g = unsafe { HiddenStates::uninit(ctx, rows, seq)? };
         // Cache raw pointers once: the buffers are not reallocated across the
         // group loop (same single inference stream), so per-iteration mutable +
@@ -6674,6 +6732,7 @@ fn dsv4_wo_a_grouped_linear(
         let (dst_ptr, _dg) = latent.data.device_ptr_mut(&ctx.stream);
         let stream = ctx.stream.cu_stream();
         for group in 0..shape.groups {
+            // SAFETY: ptrs from live device allocations sized to the dims passed.
             unsafe {
                 ffi::dsv4_oproj_group_gather_cuda(
                     src_ptr as *const ffi::Half,
@@ -6691,6 +6750,7 @@ fn dsv4_wo_a_grouped_linear(
             // `[g*rows, (g+1)*rows)` of the `[groups*rows, cols]` dense `wo_a`,
             // i.e. offset `g*rows*cols` bf16 elements from the base pointer.
             let w_g = unsafe { (wo_a_base as *const ffi::Half).add(group * rows * cols) };
+            // SAFETY: ptrs from live device allocations sized to the dims passed.
             unsafe {
                 ffi::gemm_cuda(
                     w_g,
@@ -6704,6 +6764,7 @@ fn dsv4_wo_a_grouped_linear(
                 .result()
                 .map_err(|e| anyhow!("DSv4 dense grouped O-LoRA gemm failed: {e}"))?;
             }
+            // SAFETY: ptrs from live device allocations sized to the dims passed.
             unsafe {
                 ffi::dsv4_oproj_group_scatter_cuda(
                     out_ptr as *const ffi::Half,
@@ -6843,6 +6904,7 @@ fn dsv4_oproj_group_gather(
     );
     let (src_ptr, _src_guard) = src.data.device_ptr(&ctx.stream);
     let (dst_ptr, _dst_guard) = scratch.oproj_group_in.device_ptr_mut(&ctx.stream);
+    // SAFETY: ptrs from live device allocations sized to the dims passed.
     unsafe {
         ffi::dsv4_oproj_group_gather_cuda(
             src_ptr as *const ffi::Half,
@@ -6882,6 +6944,7 @@ fn dsv4_oproj_group_scatter(
     );
     let (src_ptr, _src_guard) = scratch.oproj_group_out.device_ptr(&ctx.stream);
     let (dst_ptr, _dst_guard) = dst.data.device_ptr_mut(&ctx.stream);
+    // SAFETY: ptrs from live device allocations sized to the dims passed.
     unsafe {
         ffi::dsv4_oproj_group_scatter_cuda(
             src_ptr as *const ffi::Half,
@@ -6928,7 +6991,9 @@ fn dsv4_wo_a_grouped_deepgemm_decode(
     );
     let cols = shape.cols_per_group;
     let rows = shape.rows_per_group;
+    // SAFETY: uninit device scratch; fully written before first read.
     let mut in_g = unsafe { HiddenStates::uninit(ctx, cols, n)? };
+    // SAFETY: uninit device scratch; fully written before first read.
     let mut out_g = unsafe { HiddenStates::uninit(ctx, rows, n)? };
     let in_len = in_g.data.len();
     let out_len = out_g.data.len();
@@ -6938,6 +7003,7 @@ fn dsv4_wo_a_grouped_deepgemm_decode(
         {
             let (src_ptr, _src_guard) = local_attn.data.device_ptr(&ctx.stream);
             let (in_ptr, _in_guard) = in_g.data.device_ptr_mut(&ctx.stream);
+            // SAFETY: ptrs from live device allocations sized to the dims passed.
             unsafe {
                 ffi::dsv4_oproj_group_gather_cuda(
                     src_ptr as *const ffi::Half,
@@ -6967,6 +7033,7 @@ fn dsv4_wo_a_grouped_deepgemm_decode(
         {
             let (out_ptr, _out_guard) = out_g.data.device_ptr(&ctx.stream);
             let (dst_ptr, _dst_guard) = latent.data.device_ptr_mut(&ctx.stream);
+            // SAFETY: ptrs from live device allocations sized to the dims passed.
             unsafe {
                 ffi::dsv4_oproj_group_scatter_cuda(
                     out_ptr as *const ffi::Half,
@@ -7080,6 +7147,7 @@ pub(crate) fn mla_oproj(
         local_attn.hidden_dim,
         token_count,
     )?;
+    // SAFETY: uninit device scratch; fully written before first read.
     let mut latent = unsafe {
         HiddenStates::uninit(
             ctx,
@@ -7263,12 +7331,13 @@ pub(crate) fn mla_oproj(
     // active_counts=[n] when token_count>1; every per-row M=1 reader (the next
     // layer's wq decode, the per-row grouped fallback) relies on it being [1].
     // No-op (and no H2D) at token_count==1 — preserves byte+launch identity.
-    if token_count > 1 && is_decode {
-        if let Some(scratch) = state.fused_wqkv.as_mut() {
-            ctx.stream
-                .memcpy_htod(&[1_i32], &mut scratch.active_counts)
-                .map_err(|e| anyhow!("DSv4 batched O-LoRA active_counts restore failed: {e}"))?;
-        }
+    if token_count > 1
+        && is_decode
+        && let Some(scratch) = state.fused_wqkv.as_mut()
+    {
+        ctx.stream
+            .memcpy_htod(&[1_i32], &mut scratch.active_counts)
+            .map_err(|e| anyhow!("DSv4 batched O-LoRA active_counts restore failed: {e}"))?;
     }
     Ok(())
 }
@@ -7692,6 +7761,7 @@ fn compressor_forward(
         // SAFETY: all buffers valid on ctx.stream; state carries the pending and
         // overlap rows from previous contiguous appends.
         if !dsv4_verify_frozen() {
+            // SAFETY: ptrs from live device allocations sized to the dims passed.
             unsafe {
                 if let Some(start_pos_device) = start_pos_device {
                     let (start_ptr, _spg) = start_pos_device.device_ptr(&ctx.stream);
@@ -7855,7 +7925,7 @@ pub(crate) fn compressor_batch_prepass(
             ctx,
             &compressor.wgate,
             compressor.wgate_deepgemm.as_ref(),
-            scratch.as_deref_mut(),
+            scratch,
             normed_batch,
             &mut score_raw_batch,
         )
@@ -7931,7 +8001,7 @@ pub(crate) fn indexer_query_batch_prepass(
             ctx,
             &indexer.weights_proj,
             indexer.weights_proj_deepgemm.as_ref(),
-            scratch.as_deref_mut(),
+            scratch,
             normed_batch,
             &mut weights_batch,
         )
@@ -8256,6 +8326,7 @@ pub(crate) fn dsv4_dsa_cache_write_batched(
             )
             .result()?;
         }
+        // SAFETY: ptrs from live device allocations sized to the dims passed.
         unsafe {
             ffi::dsv4_dsa_fused_store_index_k_cache_batched_cuda(
                 rotated_src_a as *const *const ffi::Half,
@@ -8973,7 +9044,7 @@ fn csa_select_official(
     ratio: usize,
     local_index_heads: usize,
     score_scale: f32,
-    mut selected_out: Option<&mut CudaSlice<i32>>,
+    selected_out: Option<&mut CudaSlice<i32>>,
     // Batched-decode lane (#60): run block (a) (per-row CACHE WRITES) only, then
     // return `Ok(None)` BEFORE the per-row read/select (b)-(f). The READ is
     // deferred to ONE `csa_select_official_batched`. The single-row / prefill path
@@ -9081,6 +9152,7 @@ fn csa_select_official(
                 .slice_mut(dst_offset..dst_offset + newly_packed * ihd);
             let (src_ptr, _sg) = src.device_ptr(&ctx.stream);
             let (rot_ptr, _rg) = rotated.device_ptr_mut(&ctx.stream);
+            // SAFETY: ptrs from live device allocations sized to the dims passed.
             unsafe {
                 ffi::dsv4_dsa_hadamard128_bf16_cuda(
                     src_ptr as *const ffi::Half,
@@ -9114,6 +9186,7 @@ fn csa_select_official(
             let mut cache_view = cache_pool.slice_mut(cache_range);
             let (cache_ptr_u8, _cg) = cache_view.device_ptr_mut(&ctx.stream);
             let (locs_ptr, _lg) = locs.device_ptr(&ctx.stream);
+            // SAFETY: ptrs from live device allocations sized to the dims passed.
             unsafe {
                 ffi::dsv4_dsa_fused_store_index_k_cache_cuda(
                     rot_store_ptr as *const ffi::Half,
@@ -9165,7 +9238,6 @@ fn csa_select_official(
 
     {
         let selected = selected_out
-            .as_deref_mut()
             .unwrap_or_else(|| owned_selected.as_mut().expect("owned selected allocated"));
         ensure!(
             selected.len() >= token_count * config.index_topk,
@@ -9221,6 +9293,7 @@ fn csa_select_official(
                     let (lens_ptr, _lg) = context_lens.device_ptr_mut(&ctx.stream);
                     let (positions_ptr, _pg) = positions.device_ptr_mut(&ctx.stream);
                     let (start_ptr, _sg) = start_pos_device.device_ptr(&ctx.stream);
+                    // SAFETY: ptrs from live device allocations sized to the dims passed.
                     unsafe {
                         ffi::dsv4_dsa_fill_context_lens_positions_start_pos_cuda(
                             lens_ptr as *mut i32,
@@ -9265,6 +9338,7 @@ fn csa_select_official(
                 let (freqs_ptr, _fg) = shared.freqs_cis.device_ptr(&ctx.stream);
                 let positions = shared.positions.slice(0..tlen);
                 let (positions_ptr, _pg) = positions.device_ptr(&ctx.stream);
+                // SAFETY: ptrs from live device allocations sized to the dims passed.
                 unsafe {
                     ffi::dsv4_dsa_fused_q_indexer_rope_hadamard_quant_cuda(
                         q_ptr as *const ffi::Half,
@@ -9283,6 +9357,7 @@ fn csa_select_official(
             }
 
             // (d) paged MQA logits scheduling metadata for the tile.
+            // SAFETY: ptrs from live device allocations sized to the dims passed.
             unsafe {
                 cuda_moe::dsv4_deepgemm_paged_mqa_logits_metadata(
                     cache_ptr(&shared.context_lens, ctx),
@@ -9319,6 +9394,7 @@ fn csa_select_official(
                 let (page_ptr, _pg) = shared.page_table_identity.device_ptr(&ctx.stream);
                 let (sched_ptr, _sg) = shared.sched_meta.device_ptr(&ctx.stream);
                 let (logits_ptr, _og) = shared.logits.device_ptr_mut(&ctx.stream);
+                // SAFETY: ptrs from live device allocations sized to the dims passed.
                 unsafe {
                     ffi::dsv4_deepgemm_fp8_paged_mqa_logits_fused_cache_cuda(
                         q_ptr as *const u8,
@@ -9360,6 +9436,7 @@ fn csa_select_official(
                     .raw_indices
                     .slice_mut(t0 * config.index_topk..(t0 + tlen) * config.index_topk);
                 let (raw_ptr, _rig) = raw.device_ptr_mut(&ctx.stream);
+                // SAFETY: ptrs from live device allocations sized to the dims passed.
                 unsafe {
                     ffi::dsv4_deepseek_v4_topk_transform_cuda(
                         logits_ptr as *const f32,
@@ -9420,6 +9497,7 @@ fn csa_select_official(
 ///     FlashMLA batch scratch's `selected_batched`; written here BEFORE
 ///     `build_layer_batch_meta` reads it)
 ///   - `shared.page_table_identity_batch` is READ-ONLY (identity).
+///
 /// `use_device_meta` (gate, default OFF): when true the (b1)/(b2) host builds +
 /// 3 `memcpy_htod` are replaced by ONE on-device `dsv4_dsa_build_select_meta_cuda`
 /// launch from device inputs (`start_pos_device`/slot_ids/key_counts), removing
@@ -9583,6 +9661,7 @@ pub(crate) fn csa_select_official_batched(
             let (slot_ptr, _sg) = slot_ids_ref.device_ptr(&ctx.stream);
             let (sp_ptr, _spg) = start_pos.device_ptr(&ctx.stream);
             let (kc_ptr, _kcg) = key_counts_ref.device_ptr(&ctx.stream);
+            // SAFETY: ptrs from live device allocations sized to the dims passed.
             unsafe {
                 ffi::dsv4_dsa_build_select_meta_cuda(
                     bt_ptr as *mut i32,
@@ -9654,6 +9733,7 @@ pub(crate) fn csa_select_official_batched(
         let (freqs_ptr, _fg) = shared.freqs_cis.device_ptr(&ctx.stream);
         let positions = shared.positions_batch.slice(0..n);
         let (positions_ptr, _pg) = positions.device_ptr(&ctx.stream);
+        // SAFETY: ptrs from live device allocations sized to the dims passed.
         unsafe {
             ffi::dsv4_dsa_fused_q_indexer_rope_hadamard_quant_cuda(
                 q_ptr as *const ffi::Half,
@@ -9674,6 +9754,7 @@ pub(crate) fn csa_select_official_batched(
     // (d) paged-MQA logits scheduling metadata for the N-row batch. sched_meta is
     // sized `(num_sms+1)*2` — batch-INDEPENDENT — but the kernel reads all N
     // context_lens to partition KV across SMs, so pass batch_size=n.
+    // SAFETY: ptrs from live device allocations sized to the dims passed.
     unsafe {
         cuda_moe::dsv4_deepgemm_paged_mqa_logits_metadata(
             cache_ptr(&shared.context_lens_batch, ctx),
@@ -9709,6 +9790,7 @@ pub(crate) fn csa_select_official_batched(
             .decode_max_batch
             .checked_mul(num_pages)
             .ok_or_else(|| anyhow!("DSv4 batched DSA num_kv_blocks overflow"))?;
+        // SAFETY: ptrs from live device allocations sized to the dims passed.
         unsafe {
             ffi::dsv4_deepgemm_fp8_paged_mqa_logits_fused_cache_cuda(
                 q_ptr as *const u8,
@@ -9742,8 +9824,8 @@ pub(crate) fn csa_select_official_batched(
     // which indices topk picks. `positions_host` is empty on the device-meta
     // (graph) lane, where this capture is skipped (untagged pos is useless).
     if !positions_host.is_empty() {
-        for r in 0..n {
-            let pos = positions_host[r] as u64;
+        for (r, &pos) in positions_host.iter().enumerate().take(n) {
+            let pos = pos as u64;
             if !crate::probe::stage_want(pos) {
                 continue;
             }
@@ -9776,6 +9858,7 @@ pub(crate) fn csa_select_official_batched(
         let (sel_ptr, _seg) = sel.device_ptr_mut(&ctx.stream);
         let mut raw = shared.raw_indices_batch.slice_mut(0..n * config.index_topk);
         let (raw_ptr, _rig) = raw.device_ptr_mut(&ctx.stream);
+        // SAFETY: ptrs from live device allocations sized to the dims passed.
         unsafe {
             ffi::dsv4_deepseek_v4_topk_transform_cuda(
                 logits_ptr as *const f32,
