@@ -588,6 +588,14 @@ impl BackendExecutor for CudaExecutor {
         }
     }
 
+    fn operator_dispatch_stats(&self) -> infer_seam::OperatorDispatchStats {
+        match &self.inner {
+            CudaExecutorInner::Placeholder => infer_seam::OperatorDispatchStats::default(),
+            #[cfg(feature = "cuda")]
+            CudaExecutorInner::Real(real) => real.operator_dispatch_stats(),
+        }
+    }
+
     fn kv_tier_disk_pages(&self) -> usize {
         match &self.inner {
             CudaExecutorInner::Placeholder => 0,

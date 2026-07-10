@@ -12,6 +12,7 @@ use std::sync::OnceLock;
 
 #[path = "ops/quant_linear.rs"]
 mod quant_linear;
+pub(crate) use quant_linear::qwen_fp8_dense_operator_stats;
 
 fn qwen_gemm_profile_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();

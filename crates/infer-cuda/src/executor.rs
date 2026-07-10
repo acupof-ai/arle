@@ -356,6 +356,12 @@ impl RealCudaExecutor {
         }
     }
 
+    /// Cumulative operator dispatch counters for migrated families (currently
+    /// Qwen FP8 dense only). Host atomics — no device sync, no allocation.
+    pub(crate) fn operator_dispatch_stats(&self) -> infer_seam::OperatorDispatchStats {
+        crate::ops::qwen_fp8_dense_operator_stats()
+    }
+
     pub(crate) fn kv_tier_disk_pages(&self) -> usize {
         match self {
             Self::Qwen(q) => q.kv_tier_disk_pages(),
