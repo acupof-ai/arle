@@ -39,6 +39,7 @@ if timeout 1 bash -lc '</dev/tcp/127.0.0.1/1080' >/dev/null 2>&1; then
 else
   unset all_proxy https_proxy http_proxy
 fi
+export ARLE_CUDA_KERNEL_SET="${ARLE_CUDA_KERNEL_SET:-dsv4_flash}"
 # Shared compile cache: sccache caches each rustc compilation keyed by content, so a
 # FRESH tree (or a toolchain-switch rebuild) reuses unchanged crates instead of
 # recompiling — the cross-POD_TREE / cross-restart reuse the per-tree target/ can't give.
