@@ -1,0 +1,17 @@
+{
+  "exact_cells": [],
+  "fallback": {
+    "candidate": "cuda.qwen.fp8_pack_deepgemm",
+    "min_m": 2,
+    "reference": "cuda.qwen.fp8_gemv",
+    "status": "legacy-default-unqualified"
+  },
+  "numeric_gate": {
+    "abs_tolerance": 1.0,
+    "rel_tolerance": 0.02,
+    "tolerance_mode": "abs+rel*abs(reference)"
+  },
+  "operator_id": "qwen.fp8_dense_projection",
+  "policy_id": "sha256:b222f26a2cbaf2e54f8bf405add4679fcc11ca2b680a3f1d97c1a79378dfc279",
+  "schema_version": "arle.operator-policy/v1"
+}
