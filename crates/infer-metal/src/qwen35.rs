@@ -503,6 +503,7 @@ fn register_qwen35_moe_layer(model: *mut std::ffi::c_void, moe: &MetalQwen35MoeW
         return false;
     };
 
+    // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
     unsafe {
         mlx_sys::qwen35_compiled_set_last_moe_mlp(
             model,
@@ -566,6 +567,7 @@ pub(crate) struct Qwen35GdrTape {
 
 impl Drop for CppQwen35Model {
     fn drop(&mut self) {
+        // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
         unsafe {
             mlx_sys::qwen35_compiled_free(self.raw);
         }
@@ -578,12 +580,14 @@ impl CppQwen35Model {
         config: &MetalModelConfig,
         arch: &MetalQwen35ArchConfig,
     ) -> Option<Self> {
+        // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
         let model = unsafe { mlx_sys::qwen35_compiled_new() };
         if model.is_null() {
             return None;
         }
 
         let add_weight = |weight: &WeightTensor| -> Option<i32> {
+            // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
             let id = unsafe {
                 match weight {
                     WeightTensor::Dense(w) => {
@@ -621,6 +625,7 @@ impl CppQwen35Model {
                 match add_weight($weight) {
                     Some(id) => id,
                     None => {
+                        // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
                         unsafe { mlx_sys::qwen35_compiled_free(model) };
                         return None;
                     }
@@ -628,6 +633,7 @@ impl CppQwen35Model {
             };
         }
 
+        // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
         unsafe {
             mlx_sys::qwen35_compiled_set_config(
                 model,
@@ -644,6 +650,7 @@ impl CppQwen35Model {
 
         let lm_head_id = add_or_free!(&weights.lm_head);
         match &weights.embedding {
+            // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
             Qwen35Embedding::Dense(embed_tokens) => unsafe {
                 mlx_sys::qwen35_compiled_set_embed_v2(
                     model,
@@ -654,12 +661,13 @@ impl CppQwen35Model {
             },
         }
 
-        if matches!(weights.lm_head, WeightTensor::Dense(_)) {
-            if let Some(embed_quantized) = &weights.embed_quantized {
-                let embed_id = add_or_free!(embed_quantized);
-                unsafe {
-                    mlx_sys::qwen35_compiled_set_embed_as_linear_v2(model, embed_id);
-                }
+        if matches!(weights.lm_head, WeightTensor::Dense(_))
+            && let Some(embed_quantized) = &weights.embed_quantized
+        {
+            let embed_id = add_or_free!(embed_quantized);
+            // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
+            unsafe {
+                mlx_sys::qwen35_compiled_set_embed_as_linear_v2(model, embed_id);
             }
         }
 
@@ -697,6 +705,7 @@ impl CppQwen35Model {
                     let k_id = add_or_free!(&attn.k_proj);
                     let v_id = add_or_free!(&attn.v_proj);
                     let o_id = add_or_free!(&attn.o_proj);
+                    // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
                     unsafe {
                         mlx_sys::qwen35_compiled_push_full_attn_v2(
                             model,
@@ -718,6 +727,7 @@ impl CppQwen35Model {
                     if mlp_is_separate && let Some(dense) = dense {
                         let gate_id = add_or_free!(&dense.gate_proj);
                         let up_id = add_or_free!(&dense.up_proj);
+                        // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
                         unsafe {
                             mlx_sys::qwen35_compiled_set_full_separate_mlp_v2(
                                 model, gate_id, up_id,
@@ -735,6 +745,7 @@ impl CppQwen35Model {
                         None => -1,
                     };
                     let out_id = add_or_free!(&attn.out_proj);
+                    // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
                     unsafe {
                         mlx_sys::qwen35_compiled_push_gdr_v2(
                             model,
@@ -774,6 +785,7 @@ impl CppQwen35Model {
                         } else {
                             (-1, -1)
                         };
+                        // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
                         unsafe {
                             mlx_sys::qwen35_compiled_set_separate_proj_v2(
                                 model, qkv_id, z_id, b_id, a_id, gate_id, up_id,
@@ -782,6 +794,7 @@ impl CppQwen35Model {
                     } else if let Some(dense) = dense {
                         let gate_id = add_or_free!(&dense.gate_proj);
                         let up_id = add_or_free!(&dense.up_proj);
+                        // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
                         unsafe {
                             mlx_sys::qwen35_compiled_set_separate_mlp_v2(model, gate_id, up_id);
                         }
@@ -792,14 +805,17 @@ impl CppQwen35Model {
             if let MlpKind::Moe(moe) = &layer.mlp
                 && !register_qwen35_moe_layer(model, moe)
             {
+                // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
                 unsafe { mlx_sys::qwen35_compiled_free(model) };
                 return None;
             }
         }
 
+        // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
         let rc = unsafe { mlx_sys::qwen35_compiled_finalize(model) };
         if rc != 0 {
             log::warn!("C++ Qwen3.5 model finalize failed");
+            // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
             unsafe { mlx_sys::qwen35_compiled_free(model) };
             return None;
         }
@@ -819,6 +835,7 @@ impl CppQwen35Model {
             kv_caches.iter().map(MlxArray::as_raw).collect();
         let mut gdr_ptrs: Vec<*mut mlx_sys::mlx_array> =
             gdr_states.iter().map(MlxArray::as_raw).collect();
+        // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
         let rc = unsafe {
             mlx_sys::qwen35_session_begin(
                 self.raw,
@@ -841,6 +858,7 @@ impl CppQwen35Model {
     ) -> Result<(Vec<MlxArray>, Vec<MlxArray>)> {
         let mut out_kv: Vec<*mut mlx_sys::mlx_array> = vec![std::ptr::null_mut(); n_kv];
         let mut out_gdr: Vec<*mut mlx_sys::mlx_array> = vec![std::ptr::null_mut(); n_gdr];
+        // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
         let rc = unsafe {
             mlx_sys::qwen35_session_end(
                 self.raw,
@@ -855,10 +873,12 @@ impl CppQwen35Model {
         }
         let kv = out_kv
             .into_iter()
+            // SAFETY: the bridge wrote a valid owned MLX handle to this out-param on success.
             .map(|ptr| unsafe { MlxArray::from_raw(ptr) })
             .collect();
         let gdr = out_gdr
             .into_iter()
+            // SAFETY: the bridge wrote a valid owned MLX handle to this out-param on success.
             .map(|ptr| unsafe { MlxArray::from_raw(ptr) })
             .collect();
         Ok((kv, gdr))
@@ -871,6 +891,7 @@ impl CppQwen35Model {
         cache_pos: i32,
     ) -> Result<MlxArray> {
         let mut out_logits: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+        // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
         let rc = unsafe {
             mlx_sys::qwen35_compiled_prefill_session(
                 self.raw,
@@ -883,11 +904,13 @@ impl CppQwen35Model {
         if rc != 0 {
             return Err(mlx::check_mlx_error().unwrap_err());
         }
+        // SAFETY: the bridge wrote a valid owned MLX handle to this out-param on success.
         Ok(unsafe { MlxArray::from_raw(out_logits) })
     }
 
     pub(crate) fn step_session(&self, token: &MlxArray, cache_pos: i32) -> Result<MlxArray> {
         let mut out_logits: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+        // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
         let rc = unsafe {
             mlx_sys::qwen35_compiled_step_session(
                 self.raw,
@@ -899,12 +922,14 @@ impl CppQwen35Model {
         if rc != 0 {
             return Err(mlx::check_mlx_error().unwrap_err());
         }
+        // SAFETY: the bridge wrote a valid owned MLX handle to this out-param on success.
         Ok(unsafe { MlxArray::from_raw(out_logits) })
     }
 
     /// Session KV-recall: toggle the layer-0 decode query emit on the C++ model.
     /// Off by default; only the recall-enabled executor turns it on.
     pub(crate) fn set_recall_emit_query(&self, enabled: bool) {
+        // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
         unsafe {
             mlx_sys::qwen35_compiled_set_recall_emit_query(self.raw, i32::from(enabled));
         }
@@ -915,10 +940,12 @@ impl CppQwen35Model {
     /// stashed since the last enable (e.g. the first decode step).
     pub(crate) fn take_recall_query(&self) -> Result<Option<MlxArray>> {
         let mut out: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+        // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
         let rc = unsafe { mlx_sys::qwen35_compiled_take_recall_query(self.raw, &raw mut out) };
         if rc != 0 || out.is_null() {
             return Ok(None);
         }
+        // SAFETY: the bridge wrote a valid owned MLX handle to this out-param on success.
         Ok(Some(unsafe { MlxArray::from_raw(out) }))
     }
 
@@ -940,6 +967,7 @@ impl CppQwen35Model {
         let mut empty_int8_k: Vec<*mut mlx_sys::mlx_array> = Vec::new();
         let mut empty_int8_v: Vec<*mut mlx_sys::mlx_array> = Vec::new();
         let mut out_logits: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+        // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
         let rc = unsafe {
             mlx_sys::qwen35_compiled_step_session_paged(
                 self.raw,
@@ -957,6 +985,7 @@ impl CppQwen35Model {
         if rc != 0 {
             return Err(mlx::check_mlx_error().unwrap_err());
         }
+        // SAFETY: the bridge wrote a valid owned MLX handle to this out-param on success.
         Ok(unsafe { MlxArray::from_raw(out_logits) })
     }
 
@@ -982,6 +1011,7 @@ impl CppQwen35Model {
         let mut v_ptrs: Vec<*mut mlx_sys::mlx_array> =
             v_int8_full_per_layer.iter().map(MlxArray::as_raw).collect();
         let mut out_logits: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+        // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
         let rc = unsafe {
             mlx_sys::qwen35_compiled_step_session_paged(
                 self.raw,
@@ -999,10 +1029,12 @@ impl CppQwen35Model {
         if rc != 0 {
             return Err(mlx::check_mlx_error().unwrap_err());
         }
+        // SAFETY: the bridge wrote a valid owned MLX handle to this out-param on success.
         Ok(unsafe { MlxArray::from_raw(out_logits) })
     }
 
     pub(crate) fn set_tape_mode(&self, enabled: bool) {
+        // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
         unsafe {
             mlx_sys::qwen35_set_tape_mode(self.raw, enabled);
         }
@@ -1013,6 +1045,7 @@ impl CppQwen35Model {
             .iter()
             .map(|&id| i32::try_from(id).context("capture layer id does not fit in i32"))
             .collect::<Result<Vec<_>>>()?;
+        // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
         unsafe {
             mlx_sys::qwen35_set_capture_layers(self.raw, ids.as_ptr(), ids.len() as i32);
         }
@@ -1020,12 +1053,14 @@ impl CppQwen35Model {
     }
 
     pub(crate) fn clear_capture_layers(&self) {
+        // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
         unsafe {
             mlx_sys::qwen35_set_capture_layers(self.raw, std::ptr::null(), 0);
         }
     }
 
     pub(crate) fn drain_captured_hidden(&self) -> Result<Vec<MlxArray>> {
+        // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
         let n_cap = unsafe { mlx_sys::qwen35_get_captured_hidden_count(self.raw) };
         anyhow::ensure!(
             n_cap >= 0,
@@ -1035,6 +1070,7 @@ impl CppQwen35Model {
             .map(|idx| {
                 let mut h_ptr: *mut mlx_sys::mlx_array = std::ptr::null_mut();
                 let rc =
+                    // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
                     unsafe { mlx_sys::qwen35_get_captured_hidden(self.raw, idx, &raw mut h_ptr) };
                 if rc != 0 {
                     return Err(mlx::check_mlx_error().unwrap_err());
@@ -1043,6 +1079,7 @@ impl CppQwen35Model {
                     !h_ptr.is_null(),
                     "Qwen3.5 captured-hidden handle #{idx} was null"
                 );
+                // SAFETY: the bridge wrote a valid owned MLX handle to this out-param on success.
                 Ok(unsafe { MlxArray::from_raw(h_ptr) })
             })
             .collect()
@@ -1060,6 +1097,7 @@ impl CppQwen35Model {
             vec![std::ptr::null_mut(); expected_tape_count];
         let mut out_qkv: Vec<*mut mlx_sys::mlx_array> =
             vec![std::ptr::null_mut(); expected_tape_count];
+        // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
         let count = unsafe {
             mlx_sys::qwen35_read_and_clear_gdr_tapes(
                 self.raw,
@@ -1087,9 +1125,13 @@ impl CppQwen35Model {
                     "Qwen3.5 DFlash GDR tape #{idx} contained a null handle"
                 );
                 Ok(Qwen35GdrTape {
+                    // SAFETY: the bridge wrote a valid owned MLX handle to this out-param on success.
                     innovation_tape: unsafe { MlxArray::from_raw(out_tapes[idx]) },
+                    // SAFETY: the bridge wrote a valid owned MLX handle to this out-param on success.
                     k: unsafe { MlxArray::from_raw(out_k[idx]) },
+                    // SAFETY: the bridge wrote a valid owned MLX handle to this out-param on success.
                     g: unsafe { MlxArray::from_raw(out_g[idx]) },
+                    // SAFETY: the bridge wrote a valid owned MLX handle to this out-param on success.
                     qkv: unsafe { MlxArray::from_raw(out_qkv[idx]) },
                 })
             })
@@ -1119,6 +1161,7 @@ impl CppQwen35Model {
         let mut next_token = 0i32;
         let mut out_kv: Vec<*mut mlx_sys::mlx_array> = vec![std::ptr::null_mut(); n_kv as usize];
         let mut out_gdr: Vec<*mut mlx_sys::mlx_array> = vec![std::ptr::null_mut(); n_gdr as usize];
+        // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
         let rc = unsafe {
             mlx_sys::qwen35_compiled_verify_block_summary(
                 self.raw,
@@ -1144,9 +1187,11 @@ impl CppQwen35Model {
         }
 
         for (i, ptr) in out_kv.into_iter().enumerate() {
+            // SAFETY: the bridge wrote a valid owned MLX handle to this out-param on success.
             kv_caches[i] = unsafe { MlxArray::from_raw(ptr) };
         }
         for (i, ptr) in out_gdr.into_iter().enumerate() {
+            // SAFETY: the bridge wrote a valid owned MLX handle to this out-param on success.
             gdr_states[i] = unsafe { MlxArray::from_raw(ptr) };
         }
         anyhow::ensure!(

@@ -53,31 +53,31 @@ pub(crate) fn load_proj_from_tensors(
     base: &str,
     quantization: Option<QuantConfig>,
 ) -> Result<WeightTensor> {
-    if let Some(qc) = quantization.as_ref() {
-        if let Some(scales) = tensors.get(&format!("{base}.scales")).cloned() {
-            let w = tensors
-                .get(&format!("{base}.weight"))
-                .cloned()
-                .with_context(|| format!("missing quantized weight '{base}.weight'"))?;
-            let biases = tensors
-                .get(&format!("{base}.biases"))
-                .cloned()
-                .with_context(|| format!("missing quantized biases '{base}.biases'"))?;
-            // Honor per-weight quant overrides (mixed bits/group_size, e.g. OptiQ);
-            // fall back to the global config for weights without an override.
-            let (bits, group_size) = qc
-                .per_weight
-                .get(base)
-                .copied()
-                .unwrap_or((qc.bits, qc.group_size));
-            return Ok(WeightTensor::Quantized {
-                w,
-                scales,
-                biases,
-                group_size,
-                bits,
-            });
-        }
+    if let Some(qc) = quantization.as_ref()
+        && let Some(scales) = tensors.get(&format!("{base}.scales")).cloned()
+    {
+        let w = tensors
+            .get(&format!("{base}.weight"))
+            .cloned()
+            .with_context(|| format!("missing quantized weight '{base}.weight'"))?;
+        let biases = tensors
+            .get(&format!("{base}.biases"))
+            .cloned()
+            .with_context(|| format!("missing quantized biases '{base}.biases'"))?;
+        // Honor per-weight quant overrides (mixed bits/group_size, e.g. OptiQ);
+        // fall back to the global config for weights without an override.
+        let (bits, group_size) = qc
+            .per_weight
+            .get(base)
+            .copied()
+            .unwrap_or((qc.bits, qc.group_size));
+        return Ok(WeightTensor::Quantized {
+            w,
+            scales,
+            biases,
+            group_size,
+            bits,
+        });
     }
 
     let w = tensor_get(tensors, &format!("{base}.weight"))?;
@@ -92,20 +92,20 @@ pub(crate) fn load_embed_tokens_from_tensors(
     quantization: Option<QuantConfig>,
 ) -> Result<MlxArray> {
     let w = tensor_get(tensors, &format!("{base}.weight"))?;
-    if let Some(qc) = quantization.as_ref() {
-        if let Some(scales) = tensors.get(&format!("{base}.scales")).cloned() {
-            let biases = tensors
-                .get(&format!("{base}.biases"))
-                .cloned()
-                .with_context(|| format!("missing biases '{base}.biases'"))?;
-            let (bits, group_size) = qc
-                .per_weight
-                .get(base)
-                .copied()
-                .unwrap_or((qc.bits, qc.group_size));
-            log::info!("  dequantizing embed_tokens at load time");
-            return Ok(dequantize(&w, &scales, &biases, group_size, bits));
-        }
+    if let Some(qc) = quantization.as_ref()
+        && let Some(scales) = tensors.get(&format!("{base}.scales")).cloned()
+    {
+        let biases = tensors
+            .get(&format!("{base}.biases"))
+            .cloned()
+            .with_context(|| format!("missing biases '{base}.biases'"))?;
+        let (bits, group_size) = qc
+            .per_weight
+            .get(base)
+            .copied()
+            .unwrap_or((qc.bits, qc.group_size));
+        log::info!("  dequantizing embed_tokens at load time");
+        return Ok(dequantize(&w, &scales, &biases, group_size, bits));
     }
     Ok(w)
 }
