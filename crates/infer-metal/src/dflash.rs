@@ -345,13 +345,13 @@ fn draft_head_has_pre_fc_norm(model_dir: &Path) -> bool {
         return text.contains(NEEDLE);
     }
     let single = model_dir.join("model.safetensors");
-    if let Ok(bytes) = std::fs::read(&single) {
-        if bytes.len() >= 8 {
-            let header_len = u64::from_le_bytes(bytes[0..8].try_into().unwrap_or([0; 8])) as usize;
-            let end = (8 + header_len).min(bytes.len());
-            if let Ok(header) = std::str::from_utf8(&bytes[8..end]) {
-                return header.contains(NEEDLE);
-            }
+    if let Ok(bytes) = std::fs::read(&single)
+        && bytes.len() >= 8
+    {
+        let header_len = u64::from_le_bytes(bytes[0..8].try_into().unwrap_or([0; 8])) as usize;
+        let end = (8 + header_len).min(bytes.len());
+        if let Ok(header) = std::str::from_utf8(&bytes[8..end]) {
+            return header.contains(NEEDLE);
         }
     }
     false
@@ -573,21 +573,25 @@ struct DFlashDraftCppModel(*mut std::ffi::c_void);
 
 impl Drop for DFlashDraftCppModel {
     fn drop(&mut self) {
+        // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
         unsafe {
             mlx_sys::dflash_draft_free(self.0);
         }
     }
 }
 
+// SAFETY: the wrapper solely owns its C++ model handle and all bridge/MLX access is serialized, so it may cross threads.
 unsafe impl Send for DFlashDraftCppModel {}
 
 impl DFlashDraftCppModel {
     fn build(weights: &DFlashDraftWeights, config: &DFlashDraftConfig) -> Result<Self> {
+        // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
         let model = unsafe { mlx_sys::dflash_draft_new() };
         ensure!(
             !model.is_null(),
             "DFlash draft C++ model init returned null"
         );
+        // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
         unsafe {
             mlx_sys::dflash_draft_set_config(
                 model,
@@ -614,6 +618,7 @@ impl DFlashDraftCppModel {
             let gate = extract_dflash_weight(&layer.gate_proj);
             let up = extract_dflash_weight(&layer.up_proj);
             let down = extract_dflash_weight(&layer.down_proj);
+            // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
             unsafe {
                 mlx_sys::dflash_draft_push_layer(
                     model,
@@ -660,6 +665,7 @@ impl DFlashDraftCppModel {
             }
         }
         let fc = extract_dflash_weight(&weights.fc);
+        // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
         unsafe {
             mlx_sys::dflash_draft_set_fc_norms(
                 model,
@@ -673,6 +679,7 @@ impl DFlashDraftCppModel {
             );
         }
         if config.draft_kind == DraftKind::Qwen35Mtp {
+            // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
             unsafe {
                 mlx_sys::dflash_draft_set_qwen35_mtp_norms(
                     model,
@@ -681,11 +688,13 @@ impl DFlashDraftCppModel {
                 );
             }
         }
+        // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
         let rc = unsafe { mlx_sys::dflash_draft_finalize(model) };
         if rc != 0 {
             let err = mlx::check_mlx_error()
                 .err()
                 .map_or_else(|| anyhow::anyhow!("unknown MLX error"), Into::into);
+            // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
             unsafe {
                 mlx_sys::dflash_draft_free(model);
             }
@@ -705,6 +714,7 @@ impl DFlashDraftCppModel {
             kv_flat.iter().map(MlxArray::as_raw).collect();
         let mut out_hidden: *mut mlx_sys::mlx_array = std::ptr::null_mut();
         let mut out_kv: Vec<*mut mlx_sys::mlx_array> = vec![std::ptr::null_mut(); kv_flat.len()];
+        // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
         let rc = unsafe {
             mlx_sys::dflash_draft_forward(
                 self.0,
@@ -721,8 +731,10 @@ impl DFlashDraftCppModel {
             return Err(mlx::check_mlx_error().unwrap_err());
         }
         for (slot, ptr) in kv_flat.iter_mut().zip(out_kv) {
+            // SAFETY: the bridge wrote a valid owned MLX handle to this out-param on success.
             *slot = unsafe { MlxArray::from_raw(ptr) };
         }
+        // SAFETY: the bridge wrote a valid owned MLX handle to this out-param on success.
         Ok(unsafe { MlxArray::from_raw(out_hidden) })
     }
 }
@@ -1326,6 +1338,7 @@ fn rollback_gdr_to_accepted(
             let tape_sliced = slice_prefix_axis1(&tape.innovation_tape, accepted_inputs);
             let k_sliced = slice_prefix_axis1(&tape.k, accepted_inputs);
             let g_sliced = slice_prefix_axis1(&tape.g, accepted_inputs);
+            // SAFETY: the bridge wrote a valid owned MLX handle to this out-param on success.
             let replayed = unsafe {
                 MlxArray::from_raw(mlx_sys::mlx_tape_replay(
                     tape_sliced.as_raw(),

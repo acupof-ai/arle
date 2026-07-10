@@ -178,10 +178,10 @@ fn resolve_image_token_id(model_dir: &Path) -> Result<u32> {
         .and_then(serde_json::Value::as_object)
     {
         for (id, entry) in table {
-            if entry.get("content").and_then(serde_json::Value::as_str) == Some("<image>") {
-                if let Ok(parsed) = id.parse::<u32>() {
-                    return Ok(parsed);
-                }
+            if entry.get("content").and_then(serde_json::Value::as_str) == Some("<image>")
+                && let Ok(parsed) = id.parse::<u32>()
+            {
+                return Ok(parsed);
             }
         }
     }
