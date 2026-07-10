@@ -40,3 +40,12 @@ The host pool (`attach_pages`) correctly populates `slot_pages[slot]` with `[pre
 ## Rule
 
 When adding a capability that breaks an invariant (identity page mapping), audit **every** place that invariant is assumed. Here the assumption was in two separate device-table-setup paths, not the one the host-pool fix touched.
+
+---
+
+**Correction (2026-07-10, codex R4)**: the mapping change verified here never
+executes on DSv4-Flash — `head_dim != 576` routes every FlashMLA layer through
+the demand-paged branch, which skips it. The passing numbers license the
+existing copy-restore path, not this commit; the identity-branch change also
+broke V32/GLM band contiguity and was reverted. Full attribution:
+[errors/2026-07-10-dsv4-prefix-reuse-identity-fix-was-noop-and-v32-hazard.md](../errors/2026-07-10-dsv4-prefix-reuse-identity-fix-was-noop-and-v32-hazard.md).

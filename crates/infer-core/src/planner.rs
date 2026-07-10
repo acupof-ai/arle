@@ -249,8 +249,9 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         } else {
             // Plain-recompute arms (e.g. DSv4 #154 2b — pool entries are the
             // demotion, device bands free via release_kv_slot): seal the
-            // committed sequence so generated pages enter the radix and their
-            // backend entries confirm BEFORE free_slot_pages drops them.
+            // committed sequence BEFORE free_slot_pages drops it. Serves
+            // follow-up matches only — the requeued request resets to
+            // prompt-only (#156 tracks resume-at-committed).
             let _ = self.publish_prefix_blocks(slot, &committed_tokens);
         }
         // free_slot before release_reused_prefix — same ordering fix as finish_slot.

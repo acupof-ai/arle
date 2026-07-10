@@ -542,10 +542,10 @@ impl RealCudaExecutor {
     /// FlashMLA band pages to the layer pools (#154 Phase 3b — waiting for
     /// the next occupant would starve the free lists); no-op elsewhere.
     pub(crate) fn release_kv_slot(&mut self, slot: usize) {
-        if let Self::Dsv4(d) = self {
-            if let Err(err) = d.kv_adapter.flashmla_free_slot(slot) {
-                warn!("DSv4 release_kv_slot({slot}) failed: {err:#}");
-            }
+        if let Self::Dsv4(d) = self
+            && let Err(err) = d.kv_adapter.flashmla_free_slot(slot)
+        {
+            warn!("DSv4 release_kv_slot({slot}) failed: {err:#}");
         }
     }
 
@@ -795,7 +795,7 @@ impl RealCudaExecutor {
 use crate::kv_tier::{BLOB_CHUNK_BYTES, CudaKvTierStore, default_t1_budget_bytes};
 
 /// Placeholder, not measurement-derived — dormant until `demote` is wired.
-
+///
 /// Construction-time default fraction of available host DRAM the L2 KV tier
 /// may claim — the shared-box-safe 0.5 (the store is pageable host memory; see
 /// `infer_seam::DramTierPolicy`). The engine builder re-budgets pre-serve with
@@ -2434,7 +2434,7 @@ impl Dsv4CudaExecutor {
             return;
         }
         for (page_id, page_index, entry) in captured {
-            if !self.prefix_state.publish(page_id, &entry) {
+            if !self.prefix_state.publish(page_id, &entry, slot_pages) {
                 warn!(
                     "DSv4 prefix publish: pool refused host page {page_id} \
                      (slot {slot} idx {page_index})"
@@ -2574,7 +2574,7 @@ impl Dsv4CudaExecutor {
             .map(|&page_id| self.prefix_state.read_entry(page_id))
             .collect::<Result<Vec<_>>>()?;
         self.kv_adapter
-            .mirror_full_band(&self.model.ctx, slot, matched_len, prefix_pages)?;
+            .mirror_full_band(&self.model.ctx, slot, matched_len)?;
         // A17: a restored occupant enters Decoding without a tail warm step
         // for its MTP chain; stale spec state belongs to the prior occupant.
         self.spec_slots[slot] = Dsv4SpecSlotState::default();
@@ -2838,15 +2838,15 @@ impl Dsv4CudaExecutor {
             if needs_seed {
                 let mut tokens = Vec::with_capacity(batch.rows.len());
                 for row in &batch.rows {
-                    if let Some(pending) = self.spec_slots[row.slot].pending {
-                        if pending != row.last_token {
-                            log::warn!(
-                                "DSv4 MTP batched stream desync (slot {}): pending {pending} != \
+                    if let Some(pending) = self.spec_slots[row.slot].pending
+                        && pending != row.last_token
+                    {
+                        log::warn!(
+                            "DSv4 MTP batched stream desync (slot {}): pending {pending} != \
                                  last_token {}; re-seeding",
-                                row.slot,
-                                row.last_token
-                            );
-                        }
+                            row.slot,
+                            row.last_token
+                        );
                     }
                     let token = self.forward_mtp_warm_step(
                         row.slot,
@@ -3530,13 +3530,12 @@ impl Qwen35CudaExecutor {
             // evict deepest-first, so this drops the blob the moment its own
             // prefix erodes) — `mat_len` may be one page short of the sealed run.
             let cover_idx = (mat_len / SUPPORTED_PAGE_SIZE).saturating_sub(1);
-            if let Some(&tail) = prefix_pages.get(cover_idx).or_else(|| prefix_pages.last()) {
-                if let Some(old) = self.sidecar_page_key.insert(tail, key) {
-                    if old != key {
-                        self.slot_tier
-                            .remove_chunked(NS_SIDECAR, NS_SIDECAR_CHUNK, old);
-                    }
-                }
+            if let Some(&tail) = prefix_pages.get(cover_idx).or_else(|| prefix_pages.last())
+                && let Some(old) = self.sidecar_page_key.insert(tail, key)
+                && old != key
+            {
+                self.slot_tier
+                    .remove_chunked(NS_SIDECAR, NS_SIDECAR_CHUNK, old);
             }
         }
         Ok(())
@@ -3632,7 +3631,7 @@ impl Qwen35CudaExecutor {
                 anyhow::anyhow!("device pool prefix alloc failed for slot {slot}: {e}")
             })?;
             if let Some(kv_data) = snap.as_ref().and_then(|s| s.full_attn_kv.as_deref()) {
-                pool.copy_pages_from_host(&mut self.model.ctx, &new_pages, kv_data)
+                pool.copy_pages_from_host(&self.model.ctx, &new_pages, kv_data)
                     .map_err(|e| {
                         anyhow::anyhow!("device pool KV H2D restore failed for slot {slot}: {e}")
                     })?;
@@ -4865,17 +4864,17 @@ impl Qwen35CudaExecutor {
                 Ok(p) => p.into_owned(),
                 Err(_) => continue,
             };
-            if let Some(pool) = self.full_attn_kv.as_mut() {
-                if let Some(new_page) = pool.reinstate_slot_page(slot, logical) {
-                    pool.copy_pages_from_host(&self.model.ctx, &[new_page], &payload)?;
-                }
+            if let Some(pool) = self.full_attn_kv.as_mut()
+                && let Some(new_page) = pool.reinstate_slot_page(slot, logical)
+            {
+                pool.copy_pages_from_host(&self.model.ctx, &[new_page], &payload)?;
             }
         }
 
-        if let Some(state) = self.recall.get_mut(slot) {
-            if let Some(pool) = self.full_attn_kv.as_ref() {
-                state.resolve_recall_pages(pool, slot);
-            }
+        if let Some(state) = self.recall.get_mut(slot)
+            && let Some(pool) = self.full_attn_kv.as_ref()
+        {
+            state.resolve_recall_pages(pool, slot);
         }
 
         // Write-back-evict cold middle: mirror to L3, free physical pages. Prefill drained compute stream — no in-flight attn race.
