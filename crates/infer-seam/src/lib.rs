@@ -116,6 +116,24 @@ pub struct SpecDecodeStats {
     pub partial_ctx_chains: u64,
 }
 
+/// One implementation's cumulative dispatch count. IDs are stable registry
+/// keys, never request shapes or other unbounded labels.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OperatorImplementationHits {
+    pub implementation_id: String,
+    pub hits: u64,
+}
+
+/// Device-neutral operator-policy identity and cumulative dispatch counters.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OperatorDispatchStats {
+    pub policy_hash: String,
+    pub product_id: String,
+    pub bundle_digest: String,
+    pub implementation_hits: Vec<OperatorImplementationHits>,
+    pub fallback_count: u64,
+}
+
 /// Host-only engine-core to backend-executor seam.
 ///
 /// The plan and step output contain only host data. Any device tensors needed
@@ -149,6 +167,12 @@ pub trait BackendExecutor {
     /// (or configs) without spec decode.
     fn spec_decode_stats(&self) -> SpecDecodeStats {
         SpecDecodeStats::default()
+    }
+
+    /// Cumulative operator dispatch counters and the identities that selected
+    /// them. Default empty until a backend family adopts generated policy.
+    fn operator_dispatch_stats(&self) -> OperatorDispatchStats {
+        OperatorDispatchStats::default()
     }
 
     /// Optional direct multimodal generation path for scalar backends whose
