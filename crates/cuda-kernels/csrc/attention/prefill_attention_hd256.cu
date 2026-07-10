@@ -37,7 +37,8 @@ __global__ void prefill_qk_norm_rope_kernel(
     const int* __restrict__ start_pos_ptr,           // GPU-resident for CUDA Graph safety
     int rotary_dim,
     float rms_eps,
-    int max_seq_len
+    int max_seq_len,
+    int ring_modulus                                 // >0: cache row = pos % modulus (sliding-window ring)
 ) {
     int start_pos = *start_pos_ptr;
     int head_global = blockIdx.x;
@@ -84,7 +85,10 @@ __global__ void prefill_qk_norm_rope_kernel(
     }
     __syncthreads();
 
+    // RoPE always indexes the ABSOLUTE position `pos`; the cache write row wraps
+    // through the ring modulus for sliding-window layers (else linear `pos`).
     int pos = start_pos + token;
+    int cache_row = ring_modulus > 0 ? (pos % ring_modulus) : pos;
     int half_rotary = rotary_dim / 2;
 
     if (d < half_rotary) {
@@ -102,7 +106,7 @@ __global__ void prefill_qk_norm_rope_kernel(
             q_batch_out[dst + d] = lo;
             q_batch_out[dst + d + half_rotary] = hi;
         } else {
-            int dst = head_local * max_seq_len * head_dim + pos * head_dim;
+            int dst = head_local * max_seq_len * head_dim + cache_row * head_dim;
             k_cache[dst + d] = lo;
             k_cache[dst + d + half_rotary] = hi;
         }
@@ -113,7 +117,7 @@ __global__ void prefill_qk_norm_rope_kernel(
             int dst = token * q_dim + head_local * head_dim;
             q_batch_out[dst + d] = smem[d];
         } else {
-            int dst = head_local * max_seq_len * head_dim + pos * head_dim;
+            int dst = head_local * max_seq_len * head_dim + cache_row * head_dim;
             k_cache[dst + d] = smem[d];
         }
     }
@@ -126,7 +130,8 @@ __global__ void prefill_v_cache_write_kernel(
     int head_dim,
     int seq_len,
     const int* __restrict__ start_pos_ptr,      // GPU-resident
-    int max_seq_len
+    int max_seq_len,
+    int ring_modulus                            // >0: cache row = pos % modulus
 ) {
     int start_pos = *start_pos_ptr;
     int kv_head = blockIdx.x;
@@ -135,8 +140,10 @@ __global__ void prefill_v_cache_write_kernel(
     if (d >= head_dim) return;
 
     int kv_dim = num_kv_heads * head_dim;
+    int pos = start_pos + token;
+    int cache_row = ring_modulus > 0 ? (pos % ring_modulus) : pos;
     int src = token * kv_dim + kv_head * head_dim + d;
-    int dst = kv_head * max_seq_len * head_dim + (start_pos + token) * head_dim + d;
+    int dst = kv_head * max_seq_len * head_dim + cache_row * head_dim + d;
     v_cache[dst] = v_batch[src];
 }
 
@@ -167,7 +174,7 @@ __global__ void attention_gate_batch_kernel(
 
 extern "C" {
 
-cudaError_t prefill_attention_hd256_prep_cuda(
+static cudaError_t prefill_attention_hd256_prep_impl(
     const __nv_bfloat16* q_full_batch,
     const __nv_bfloat16* k_batch,
     const __nv_bfloat16* v_batch,
@@ -186,12 +193,14 @@ cudaError_t prefill_attention_hd256_prep_cuda(
     int rotary_dim,
     float rms_eps,
     int max_seq_len,
+    int ring_modulus,
     cudaStream_t stream
 ) {
     if (num_q_heads <= 0 || num_kv_heads <= 0 || (head_dim != 128 && head_dim != 256) ||
         seq_len < 0 || start_pos_ptr == nullptr || rotary_dim <= 0 ||
         rotary_dim > head_dim || (rotary_dim % 2) != 0 || max_seq_len < seq_len ||
-        (num_q_heads % num_kv_heads) != 0) {
+        (num_q_heads % num_kv_heads) != 0 || ring_modulus < 0 ||
+        (ring_modulus > 0 && max_seq_len < ring_modulus)) {
         return cudaErrorInvalidValue;
     }
     if (seq_len == 0) {
@@ -214,7 +223,8 @@ cudaError_t prefill_attention_hd256_prep_cuda(
         start_pos_ptr,
         rotary_dim,
         rms_eps,
-        max_seq_len
+        max_seq_len,
+        ring_modulus
     );
 
     dim3 v_grid(num_kv_heads, seq_len);
@@ -225,9 +235,73 @@ cudaError_t prefill_attention_hd256_prep_cuda(
         head_dim,
         seq_len,
         start_pos_ptr,
-        max_seq_len
+        max_seq_len,
+        ring_modulus
     );
     return cudaGetLastError();
+}
+
+cudaError_t prefill_attention_hd256_prep_cuda(
+    const __nv_bfloat16* q_full_batch,
+    const __nv_bfloat16* k_batch,
+    const __nv_bfloat16* v_batch,
+    const __nv_bfloat16* q_norm_weight,
+    const __nv_bfloat16* k_norm_weight,
+    const __nv_bfloat16* cos_cache,
+    const __nv_bfloat16* sin_cache,
+    __nv_bfloat16* q_batch_out,
+    __nv_bfloat16* k_cache,
+    __nv_bfloat16* v_cache,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int seq_len,
+    const int* start_pos_ptr,
+    int rotary_dim,
+    float rms_eps,
+    int max_seq_len,
+    cudaStream_t stream
+) {
+    return prefill_attention_hd256_prep_impl(
+        q_full_batch, k_batch, v_batch, q_norm_weight, k_norm_weight,
+        cos_cache, sin_cache, q_batch_out, k_cache, v_cache,
+        num_q_heads, num_kv_heads, head_dim, seq_len, start_pos_ptr,
+        rotary_dim, rms_eps, max_seq_len, /*ring_modulus=*/0, stream);
+}
+
+// Sliding-window ring variant: the K/V cache write row wraps as `pos %
+// ring_modulus` (ring_modulus == the per-head stride == window+block). Callers
+// pass an ABSOLUTE `start_pos` (RoPE indexes it directly, unshifted). A single
+// launch must write <= ring_modulus rows, else two tokens alias one ring row.
+cudaError_t prefill_attention_hd256_prep_ring_cuda(
+    const __nv_bfloat16* q_full_batch,
+    const __nv_bfloat16* k_batch,
+    const __nv_bfloat16* v_batch,
+    const __nv_bfloat16* q_norm_weight,
+    const __nv_bfloat16* k_norm_weight,
+    const __nv_bfloat16* cos_cache,
+    const __nv_bfloat16* sin_cache,
+    __nv_bfloat16* q_batch_out,
+    __nv_bfloat16* k_cache,
+    __nv_bfloat16* v_cache,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int seq_len,
+    const int* start_pos_ptr,
+    int rotary_dim,
+    float rms_eps,
+    int ring_modulus,
+    cudaStream_t stream
+) {
+    if (ring_modulus <= 0 || seq_len > ring_modulus) {
+        return cudaErrorInvalidValue;
+    }
+    return prefill_attention_hd256_prep_impl(
+        q_full_batch, k_batch, v_batch, q_norm_weight, k_norm_weight,
+        cos_cache, sin_cache, q_batch_out, k_cache, v_cache,
+        num_q_heads, num_kv_heads, head_dim, seq_len, start_pos_ptr,
+        rotary_dim, rms_eps, /*max_seq_len=*/ring_modulus, ring_modulus, stream);
 }
 
 cudaError_t attention_gate_batch_hd256_cuda(

@@ -45,6 +45,32 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    /// Sliding-window ring variant of [`prefill_attention_hd256_prep_cuda`]:
+    /// the K/V cache write row wraps as `pos % ring_modulus` (== the per-head
+    /// stride == window+block). `start_pos_ptr` is ABSOLUTE (RoPE reads it
+    /// unshifted). One launch must write `<= ring_modulus` rows.
+    pub fn prefill_attention_hd256_prep_ring_cuda(
+        q_full_batch: *const Half,
+        k_batch: *const Half,
+        v_batch: *const Half,
+        q_norm_weight: *const Half,
+        k_norm_weight: *const Half,
+        cos_cache: *const Half,
+        sin_cache: *const Half,
+        q_batch_out: *mut Half,
+        k_cache: *mut Half,
+        v_cache: *mut Half,
+        num_q_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        seq_len: i32,
+        start_pos_ptr: *const i32,
+        rotary_dim: i32,
+        rms_eps: f32,
+        ring_modulus: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn attention_gate_batch_hd256_cuda(
         q_full_batch: *const Half,
         attn_out: *mut Half,
@@ -102,6 +128,26 @@ unsafe extern "C" {
         seq_len: i32,
         kv_len: i32,
         max_seq_len: i32,
+        sm_scale: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    /// Sliding-window ring variant of [`nonpaged_prefill_attention_cuda`]:
+    /// physical row = `(ring_base + logical) % ring_modulus` (== per-head stride
+    /// == window+block). Pass the K/V base at the head-0 origin (no pre-offset),
+    /// `ring_base` = absolute position of logical key 0 (= lo), `seq_len` = 1.
+    pub fn nonpaged_prefill_attention_ring_cuda(
+        q: *const Half,
+        k_cache: *const Half,
+        v_cache: *const Half,
+        out: *mut Half,
+        num_q_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        seq_len: i32,
+        kv_len: i32,
+        ring_base: i32,
+        ring_modulus: i32,
         sm_scale: f32,
         stream: CUstream,
     ) -> CUresult;

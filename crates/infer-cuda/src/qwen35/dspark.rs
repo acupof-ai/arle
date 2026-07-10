@@ -61,12 +61,18 @@ pub(crate) struct Qwen35DsparkHead {
     confidence: Option<DsparkConfidenceHead>,
     /// sigmoid(conf) < threshold truncates the proposal (`--dspark-conf-threshold`).
     confidence_threshold: f32,
-    /// Draft RoPE tables (full rotary over head_dim, `rope_theta`), `cap` positions.
+    /// Draft RoPE tables (full rotary over head_dim, `rope_theta`), `rope_cap`
+    /// absolute positions (== the full-attention layer cap).
     cos_cache: DeviceVec,
     sin_cache: DeviceVec,
-    /// Per-layer ctx-cache rows: `max_seq_len + block_size` (noise rows extend
-    /// past the trunk cap by at most one block).
-    cap: usize,
+    /// Per-layer ctx-cache rows (== per-head cache stride): sliding layers hold
+    /// `sliding_window + block_size` addressed as an absolute-position ring
+    /// (`row = pos % cap`); the full-attention layer holds `max_seq_len +
+    /// block_size` addressed linearly (`row = pos − ctx_base`).
+    caps: Vec<usize>,
+    /// RoPE table length + full-layer cap = `max_seq_len + block_size` (noise
+    /// rows extend past the trunk cap by at most one block).
+    rope_cap: usize,
 }
 
 impl Qwen35DsparkHead {
@@ -87,11 +93,8 @@ impl Qwen35DsparkHead {
     /// admission and pool profiling account for them (else startup passes and
     /// the first dspark prefill OOMs).
     pub(crate) fn slot_state_bytes(&self) -> usize {
-        2 * self.cfg.num_hidden_layers
-            * self.cfg.num_key_value_heads
-            * self.cap
-            * self.cfg.head_dim
-            * std::mem::size_of::<bf16>()
+        let per_head = self.cfg.num_key_value_heads * self.cfg.head_dim;
+        2 * self.caps.iter().map(|c| c * per_head).sum::<usize>() * std::mem::size_of::<bf16>()
     }
     pub(crate) fn mode_label(&self) -> &'static str {
         match (
@@ -112,12 +115,16 @@ impl Qwen35DsparkHead {
 }
 
 /// Per-slot draft context K/V cache: for each draft layer, the RoPE'd/normed K
-/// and raw V of accepted positions, laid out `[kv_head][cap][head_dim]`
-/// (the trunk contiguous-cache layout, so the existing prep + attention
-/// kernels index it directly). Buffer row `i` holds absolute trunk position
-/// `ctx_base + i`; RoPE/attention positions stay absolute. Noise rows are
-/// written speculatively at their positions and self-heal: rejected rows are
-/// overwritten by the next block's ctx/noise writes before any read.
+/// and raw V of accepted positions, laid out `[kv_head][cap][head_dim]`.
+/// Addressing is per layer type (see `Qwen35DsparkHead::caps`): the full layer
+/// is LINEAR (`row = abs − ctx_base`, `cap = max_seq + block`); sliding layers
+/// are an absolute-position RING (`row = abs % cap`, `cap = window + block`),
+/// keeping only the last `window` keys the sliding attention ever reads. Noise
+/// rows are written speculatively at their positions and self-heal: rejected
+/// rows are overwritten by the next block's ctx/noise writes before any read.
+/// A ring never aliases a live key within a block — the live span
+/// (window ctx + block noise) equals `cap`, so distinct positions never collide
+/// mod `cap`.
 pub(crate) struct Qwen35DsparkSlotState {
     k_ctx: Vec<DeviceVec>,
     v_ctx: Vec<DeviceVec>,
@@ -134,10 +141,11 @@ pub(crate) struct Qwen35DsparkSlotState {
 
 impl Qwen35DsparkSlotState {
     pub(crate) fn new(ctx: &DeviceContext, head: &Qwen35DsparkHead) -> Result<Self> {
-        let per_layer = head.cfg.num_key_value_heads * head.cap * head.cfg.head_dim;
+        let per_head = head.cfg.num_key_value_heads * head.cfg.head_dim;
         let alloc = || -> Result<Vec<DeviceVec>> {
-            (0..head.cfg.num_hidden_layers)
-                .map(|_| DeviceVec::zeros(ctx, per_layer))
+            head.caps
+                .iter()
+                .map(|&cap| DeviceVec::zeros(ctx, cap * per_head))
                 .collect()
         };
         Ok(Self {
@@ -230,6 +238,8 @@ impl Qwen35DsparkTaps {
 pub(crate) struct DsparkScratch {
     ids: SliceSlot<i32>,
     start_pos: SliceSlot<i32>,
+    /// Absolute (unshifted) start position for sliding-ring prep launches.
+    start_pos_abs: SliceSlot<i32>,
     hidden: HiddenSlot,
     normed: HiddenSlot,
     hidden_mid: HiddenSlot,
@@ -550,9 +560,23 @@ pub(crate) fn load_dspark_head(
         );
     }
 
-    let cap = max_seq_len + cfg.block_size;
+    // Per-layer cache stride: sliding layers only ever read the last `window`
+    // keys, so a `window + block` ring suffices; the full-attention layer needs
+    // the whole `max_seq_len + block`. This is the memory win — 4/5 DFlash
+    // layers drop from the pool-sized cap to ~window.
+    let rope_cap = max_seq_len + cfg.block_size;
+    let caps: Vec<usize> = layers
+        .iter()
+        .map(|l| {
+            if l.sliding {
+                cfg.sliding_window + cfg.block_size
+            } else {
+                rope_cap
+            }
+        })
+        .collect();
     let (cos_cache, sin_cache) =
-        crate::ops::precompute_rope(ctx, cfg.head_dim, cap, cfg.rope_theta, None)?;
+        crate::ops::precompute_rope(ctx, cfg.head_dim, rope_cap, cfg.rope_theta, None)?;
     Ok(Qwen35DsparkHead {
         confidence_threshold,
         cfg,
@@ -564,7 +588,8 @@ pub(crate) fn load_dspark_head(
         confidence,
         cos_cache,
         sin_cache,
-        cap,
+        caps,
+        rope_cap,
     })
 }
 
@@ -595,10 +620,10 @@ impl Qwen35Model {
             df.ctx_end
         );
         ensure!(rows >= 1 && rows <= taps.seq, "dspark ctx rows {rows}");
-        // Capacity is buffer rows (abs − ctx_base), not absolute position.
+        // Absolute positions must index the shared cos/sin table.
         ensure!(
-            start + rows - df.ctx_base <= head.cap,
-            "dspark ctx overflow"
+            start + rows <= head.rope_cap,
+            "dspark ctx overflow past rope_cap"
         );
         let ctx = &self.ctx;
         let hidden = head.cfg.hidden_size;
@@ -633,16 +658,18 @@ impl Qwen35Model {
         taps.disarm();
 
         let kv_dim = head.kv_dim();
-        // The prep kernel derives both the cache write row and the RoPE table
-        // index from `start_pos + token`, so pass the buffer-relative start and
-        // shift the cos/sin base pointers by `ctx_base` rows: writes land at
-        // `abs - ctx_base`, RoPE stays at the absolute position.
+        // Full layers: buffer-relative start + `ctx_base`-shifted RoPE tables →
+        // linear write at `abs − ctx_base`. Sliding layers: ABSOLUTE start into
+        // the ring prep kernel (RoPE unshifted, cache row = `abs % cap`).
         let rope_off = (df.ctx_base * head.cfg.head_dim) as u64 * 2;
-        let start_dev = scratch
+        let start_rel = scratch
             .start_pos
             .upload(&self.ctx, &[(start - df.ctx_base) as i32])?;
-        let (sp_ptr, _gsp) = start_dev.device_ptr(&ctx.stream);
+        let (sp_rel, _gr) = start_rel.device_ptr(&ctx.stream);
+        let start_abs = scratch.start_pos_abs.upload(&self.ctx, &[start as i32])?;
+        let (sp_abs, _ga) = start_abs.device_ptr(&ctx.stream);
         for (li, layer) in head.layers.iter().enumerate() {
+            let cap_li = head.caps[li];
             let k_new = scratch.ctx_k.get(ctx, kv_dim, rows)?;
             gemm_batch(ctx, &layer.k_proj, feat_rows, k_new)?;
             let v_new = scratch.ctx_v.get(ctx, kv_dim, rows)?;
@@ -661,32 +688,68 @@ impl Qwen35Model {
             let (qo_ptr, _g6) = q_out.data.device_ptr_mut(&ctx.stream);
             let (kc_ptr, _g7) = df.k_ctx[li].data.device_ptr_mut(&ctx.stream);
             let (vc_ptr, _g8) = df.v_ctx[li].data.device_ptr_mut(&ctx.stream);
-            // SAFETY: buffers valid on ctx.stream; caches sized cap*kv_dim and
-            // start+rows-ctx_base <= cap (ensured above); rope_off stays inside
-            // the cap-position cos/sin tables (absolute positions < cap).
-            unsafe {
-                ffi::prefill_attention_hd256_prep_cuda(
-                    qd_ptr as *const ffi::Half,
-                    k_ptr as *const ffi::Half,
-                    v_ptr as *const ffi::Half,
-                    kn_ptr as *const ffi::Half,
-                    kn_ptr as *const ffi::Half,
-                    (cos_ptr + rope_off) as *const ffi::Half,
-                    (sin_ptr + rope_off) as *const ffi::Half,
-                    qo_ptr as *mut ffi::Half,
-                    kc_ptr as *mut ffi::Half,
-                    vc_ptr as *mut ffi::Half,
-                    head.cfg.num_key_value_heads as i32,
-                    head.cfg.num_key_value_heads as i32,
-                    head.cfg.head_dim as i32,
-                    rows as i32,
-                    sp_ptr as *const i32,
-                    head.cfg.head_dim as i32,
-                    head.cfg.rms_norm_eps,
-                    head.cap as i32,
-                    ctx.stream.cu_stream(),
-                )
-                .result()?;
+            let nkv = head.cfg.num_key_value_heads as i32;
+            let hd = head.cfg.head_dim as i32;
+            if layer.sliding {
+                // One launch must not wrap the ring (else two tokens alias one
+                // row); chunk sizes (≤32) sit far below cap here.
+                ensure!(
+                    rows <= cap_li,
+                    "dspark sliding append rows {rows} > ring cap {cap_li}; lower chunked_prefill_size"
+                );
+                // SAFETY: ring cache sized cap_li*kv_dim; rows <= cap_li (no
+                // aliasing); abs positions < rope_cap index the cos/sin tables.
+                unsafe {
+                    ffi::prefill_attention_hd256_prep_ring_cuda(
+                        qd_ptr as *const ffi::Half,
+                        k_ptr as *const ffi::Half,
+                        v_ptr as *const ffi::Half,
+                        kn_ptr as *const ffi::Half,
+                        kn_ptr as *const ffi::Half,
+                        cos_ptr as *const ffi::Half,
+                        sin_ptr as *const ffi::Half,
+                        qo_ptr as *mut ffi::Half,
+                        kc_ptr as *mut ffi::Half,
+                        vc_ptr as *mut ffi::Half,
+                        nkv,
+                        nkv,
+                        hd,
+                        rows as i32,
+                        sp_abs as *const i32,
+                        hd,
+                        head.cfg.rms_norm_eps,
+                        cap_li as i32,
+                        ctx.stream.cu_stream(),
+                    )
+                    .result()?;
+                }
+            } else {
+                // SAFETY: linear cache sized cap_li*kv_dim; abs − ctx_base <
+                // cap_li; rope_off stays inside the cos/sin tables.
+                unsafe {
+                    ffi::prefill_attention_hd256_prep_cuda(
+                        qd_ptr as *const ffi::Half,
+                        k_ptr as *const ffi::Half,
+                        v_ptr as *const ffi::Half,
+                        kn_ptr as *const ffi::Half,
+                        kn_ptr as *const ffi::Half,
+                        (cos_ptr + rope_off) as *const ffi::Half,
+                        (sin_ptr + rope_off) as *const ffi::Half,
+                        qo_ptr as *mut ffi::Half,
+                        kc_ptr as *mut ffi::Half,
+                        vc_ptr as *mut ffi::Half,
+                        nkv,
+                        nkv,
+                        hd,
+                        rows as i32,
+                        sp_rel as *const i32,
+                        hd,
+                        head.cfg.rms_norm_eps,
+                        cap_li as i32,
+                        ctx.stream.cu_stream(),
+                    )
+                    .result()?;
+                }
             }
         }
         df.ctx_end = start + rows;
@@ -714,7 +777,7 @@ impl Qwen35Model {
         let block = cfg.block_size;
         ensure!(df.ctx_end == start, "dspark draft: ctx_end != start");
         ensure!(
-            start + block - df.ctx_base <= head.cap,
+            start + block <= head.rope_cap,
             "dspark draft past cache cap"
         );
         let hidden = cfg.hidden_size;
@@ -731,13 +794,15 @@ impl Qwen35Model {
         embedding_batch(ctx, &self.embed_tokens, ids_dev, h)?;
         let embed_ms = super::mtp_phase_lap(ctx, &mut pt);
 
-        // Buffer-relative start + ctx_base-shifted RoPE tables (see
-        // `dspark_append_ctx`): cache rows at `abs - ctx_base`, RoPE absolute.
+        // Full layers: buffer-relative start + ctx_base-shifted RoPE. Sliding
+        // layers: absolute start into the ring prep (see `dspark_append_ctx`).
         let rope_off = (df.ctx_base * cfg.head_dim) as u64 * 2;
-        let start_dev = scratch
+        let start_rel = scratch
             .start_pos
             .upload(&self.ctx, &[(start - df.ctx_base) as i32])?;
+        let start_abs = scratch.start_pos_abs.upload(&self.ctx, &[start as i32])?;
         for (li, layer) in head.layers.iter().enumerate() {
+            let cap_li = head.caps[li];
             let h = scratch.hidden.get(ctx, hidden, block)?;
             let normed = scratch.normed.get(ctx, hidden, block)?;
             rms_norm_batch(ctx, h, &layer.input_layernorm, eps, normed)?;
@@ -764,32 +829,65 @@ impl Qwen35Model {
                 let (qp_ptr, _g7) = q_prepped.data.device_ptr_mut(&ctx.stream);
                 let (kc_ptr, _g8) = df.k_ctx[li].data.device_ptr_mut(&ctx.stream);
                 let (vc_ptr, _g9) = df.v_ctx[li].data.device_ptr_mut(&ctx.stream);
-                let (sp_ptr, _g10) = start_dev.device_ptr(&ctx.stream);
-                // SAFETY: shapes as above; cache holds cap*kv_dim,
-                // start+block-ctx_base <= cap.
-                unsafe {
-                    ffi::prefill_attention_hd256_prep_cuda(
-                        qf_ptr as *const ffi::Half,
-                        k_ptr as *const ffi::Half,
-                        v_ptr as *const ffi::Half,
-                        qn_ptr as *const ffi::Half,
-                        kn_ptr as *const ffi::Half,
-                        (cos_ptr + rope_off) as *const ffi::Half,
-                        (sin_ptr + rope_off) as *const ffi::Half,
-                        qp_ptr as *mut ffi::Half,
-                        kc_ptr as *mut ffi::Half,
-                        vc_ptr as *mut ffi::Half,
-                        cfg.num_attention_heads as i32,
-                        cfg.num_key_value_heads as i32,
-                        cfg.head_dim as i32,
-                        block as i32,
-                        sp_ptr as *const i32,
-                        cfg.head_dim as i32,
-                        eps,
-                        head.cap as i32,
-                        ctx.stream.cu_stream(),
-                    )
-                    .result()?;
+                let nq = cfg.num_attention_heads as i32;
+                let nkv = cfg.num_key_value_heads as i32;
+                let hd = cfg.head_dim as i32;
+                if layer.sliding {
+                    let (sp_ptr, _g10) = start_abs.device_ptr(&ctx.stream);
+                    // block (≤ cap_li) noise rows write distinct ring rows.
+                    // SAFETY: ring cache cap_li*kv_dim; abs pos < rope_cap.
+                    unsafe {
+                        ffi::prefill_attention_hd256_prep_ring_cuda(
+                            qf_ptr as *const ffi::Half,
+                            k_ptr as *const ffi::Half,
+                            v_ptr as *const ffi::Half,
+                            qn_ptr as *const ffi::Half,
+                            kn_ptr as *const ffi::Half,
+                            cos_ptr as *const ffi::Half,
+                            sin_ptr as *const ffi::Half,
+                            qp_ptr as *mut ffi::Half,
+                            kc_ptr as *mut ffi::Half,
+                            vc_ptr as *mut ffi::Half,
+                            nq,
+                            nkv,
+                            hd,
+                            block as i32,
+                            sp_ptr as *const i32,
+                            hd,
+                            eps,
+                            cap_li as i32,
+                            ctx.stream.cu_stream(),
+                        )
+                        .result()?;
+                    }
+                } else {
+                    let (sp_ptr, _g10) = start_rel.device_ptr(&ctx.stream);
+                    // SAFETY: shapes as above; cache holds cap_li*kv_dim,
+                    // start+block-ctx_base <= cap_li.
+                    unsafe {
+                        ffi::prefill_attention_hd256_prep_cuda(
+                            qf_ptr as *const ffi::Half,
+                            k_ptr as *const ffi::Half,
+                            v_ptr as *const ffi::Half,
+                            qn_ptr as *const ffi::Half,
+                            kn_ptr as *const ffi::Half,
+                            (cos_ptr + rope_off) as *const ffi::Half,
+                            (sin_ptr + rope_off) as *const ffi::Half,
+                            qp_ptr as *mut ffi::Half,
+                            kc_ptr as *mut ffi::Half,
+                            vc_ptr as *mut ffi::Half,
+                            nq,
+                            nkv,
+                            hd,
+                            block as i32,
+                            sp_ptr as *const i32,
+                            hd,
+                            eps,
+                            cap_li as i32,
+                            ctx.stream.cu_stream(),
+                        )
+                        .result()?;
+                    }
                 }
             }
 
@@ -807,37 +905,64 @@ impl Qwen35Model {
                 let (kc_ptr, _g1) = df.k_ctx[li].data.device_ptr(&ctx.stream);
                 let (vc_ptr, _g2) = df.v_ctx[li].data.device_ptr(&ctx.stream);
                 let (o_ptr, _g3) = attn_heads.data.device_ptr_mut(&ctx.stream);
+                let nq = cfg.num_attention_heads as i32;
+                let nkv = cfg.num_key_value_heads as i32;
+                let hd = cfg.head_dim as i32;
                 for row in 0..block {
                     let q_pos = start + row;
-                    let lo = if layer.sliding {
+                    let q_off = (q_ptr + (row * q_dim) as u64 * elem) as *const ffi::Half;
+                    let o_off = (o_ptr + (row * q_dim) as u64 * elem) as *mut ffi::Half;
+                    if layer.sliding {
                         // HF sliding window keeps keys with q_pos - k_pos < window;
-                        // never below ctx_base (no rows exist before the rebase).
-                        q_pos
+                        // never below ctx_base. The ctx buffer is an absolute
+                        // ring: walk `[lo, start+block)` mapped through `% cap_li`
+                        // (order-independent softmax → identical to a linear walk).
+                        let lo = q_pos
                             .saturating_sub(cfg.sliding_window - 1)
-                            .max(df.ctx_base)
+                            .max(df.ctx_base);
+                        let kv_len = kv_len_total - lo;
+                        // SAFETY: kv_len == q_pos+1−lo ≤ window+block == cap_li,
+                        // so the ring read never revisits a physical row.
+                        unsafe {
+                            ffi::nonpaged_prefill_attention_ring_cuda(
+                                q_off,
+                                kc_ptr as *const ffi::Half,
+                                vc_ptr as *const ffi::Half,
+                                o_off,
+                                nq,
+                                nkv,
+                                hd,
+                                1,
+                                kv_len as i32,
+                                lo as i32,
+                                cap_li as i32,
+                                sm_scale,
+                                ctx.stream.cu_stream(),
+                            )
+                            .result()?;
+                        }
                     } else {
-                        df.ctx_base
-                    };
-                    let kv_len = kv_len_total - lo;
-                    let base = ((lo - df.ctx_base) * cfg.head_dim) as u64 * elem;
-                    // SAFETY: row/lo offsets stay inside the per-head bands
-                    // (lo-ctx_base + kv_len == start+block-ctx_base <= cap).
-                    unsafe {
-                        ffi::nonpaged_prefill_attention_cuda(
-                            (q_ptr + (row * q_dim) as u64 * elem) as *const ffi::Half,
-                            (kc_ptr + base) as *const ffi::Half,
-                            (vc_ptr + base) as *const ffi::Half,
-                            (o_ptr + (row * q_dim) as u64 * elem) as *mut ffi::Half,
-                            cfg.num_attention_heads as i32,
-                            cfg.num_key_value_heads as i32,
-                            cfg.head_dim as i32,
-                            1,
-                            kv_len as i32,
-                            head.cap as i32,
-                            sm_scale,
-                            ctx.stream.cu_stream(),
-                        )
-                        .result()?;
+                        let lo = df.ctx_base;
+                        let kv_len = kv_len_total - lo;
+                        let base = ((lo - df.ctx_base) * cfg.head_dim) as u64 * elem;
+                        // SAFETY: lo-ctx_base + kv_len == start+block-ctx_base <= cap_li.
+                        unsafe {
+                            ffi::nonpaged_prefill_attention_cuda(
+                                q_off,
+                                (kc_ptr + base) as *const ffi::Half,
+                                (vc_ptr + base) as *const ffi::Half,
+                                o_off,
+                                nq,
+                                nkv,
+                                hd,
+                                1,
+                                kv_len as i32,
+                                cap_li as i32,
+                                sm_scale,
+                                ctx.stream.cu_stream(),
+                            )
+                            .result()?;
+                        }
                     }
                 }
             }

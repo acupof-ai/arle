@@ -17,6 +17,8 @@ __global__ void nonpaged_prefill_attention_kernel(
     int start_pos,
     const int *__restrict__ start_pos_dev,
     int max_seq_len,
+    int ring_base,        // sliding-window ring: absolute position of logical key 0
+    int ring_modulus,     // >0: physical row = (ring_base + abs_pos) % ring_modulus
     float sm_scale) {
   int q_head = blockIdx.x;
   int token = blockIdx.y;
@@ -66,7 +68,10 @@ __global__ void nonpaged_prefill_attention_kernel(
 
     for (int pos = 0; pos < tile_len; ++pos) {
       int abs_pos = tile_start + pos;
-      int k_idx = (kv_head * max_seq_len + abs_pos) * head_dim + dim;
+      // Softmax is permutation-invariant, so a wrapped ring walk accumulates
+      // identically to a contiguous one — only the physical row differs.
+      int row = ring_modulus > 0 ? ((ring_base + abs_pos) % ring_modulus) : abs_pos;
+      int k_idx = (kv_head * max_seq_len + row) * head_dim + dim;
       float partial = q_val * __bfloat162float(k_cache[k_idx]);
       partial = warp_reduce_sum(partial);
       if (lane == 0) {
@@ -113,7 +118,8 @@ __global__ void nonpaged_prefill_attention_kernel(
     for (int pos = 0; pos < tile_len; ++pos) {
       float weight = expf(scores[pos] - current_max);
       int abs_pos = tile_start + pos;
-      int v_idx = (kv_head * max_seq_len + abs_pos) * head_dim + dim;
+      int row = ring_modulus > 0 ? ((ring_base + abs_pos) % ring_modulus) : abs_pos;
+      int v_idx = (kv_head * max_seq_len + row) * head_dim + dim;
       row_sum += weight;
       o_acc += weight * __bfloat162float(v_cache[v_idx]);
     }
@@ -163,6 +169,56 @@ extern "C" cudaError_t nonpaged_prefill_attention_cuda(
       start_pos,
       /*start_pos_dev=*/nullptr,
       max_seq_len,
+      /*ring_base=*/0,
+      /*ring_modulus=*/0,
+      sm_scale);
+  return cudaGetLastError();
+}
+
+// Sliding-window ring variant: physical key/value row = (ring_base + logical) %
+// ring_modulus (ring_modulus == the per-head stride == window+block). Used by
+// DSpark sliding draft layers whose ctx cache is an absolute-position ring; the
+// caller passes the base K/V pointer at the head-0 origin (no pre-offset),
+// `ring_base` = the absolute position of logical key 0 (= lo), `kv_len` = the
+// non-causal key count. seq_len is 1 (per-row non-causal launch).
+extern "C" cudaError_t nonpaged_prefill_attention_ring_cuda(
+    const uint16_t *q,
+    const uint16_t *k_cache,
+    const uint16_t *v_cache,
+    uint16_t *out,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int seq_len,
+    int kv_len,
+    int ring_base,
+    int ring_modulus,
+    float sm_scale,
+    cudaStream_t stream) {
+  if (num_q_heads <= 0 || num_kv_heads <= 0 || seq_len < 0 || kv_len < seq_len ||
+      ring_modulus <= 0 || kv_len > ring_modulus || (head_dim != 128 && head_dim != 256) ||
+      num_q_heads % num_kv_heads != 0) {
+    return cudaErrorInvalidValue;
+  }
+  if (seq_len == 0) {
+    return cudaSuccess;
+  }
+  int start_pos = kv_len - seq_len;
+  dim3 grid(num_q_heads, seq_len);
+  nonpaged_prefill_attention_kernel<<<grid, head_dim, 0, stream>>>(
+      reinterpret_cast<const __nv_bfloat16 *>(q),
+      reinterpret_cast<const __nv_bfloat16 *>(k_cache),
+      reinterpret_cast<const __nv_bfloat16 *>(v_cache),
+      reinterpret_cast<__nv_bfloat16 *>(out),
+      num_q_heads,
+      num_kv_heads,
+      head_dim,
+      seq_len,
+      start_pos,
+      /*start_pos_dev=*/nullptr,
+      /*max_seq_len=*/ring_modulus,
+      ring_base,
+      ring_modulus,
       sm_scale);
   return cudaGetLastError();
 }
@@ -210,6 +266,8 @@ extern "C" cudaError_t nonpaged_prefill_attention_devpos_cuda(
       /*start_pos=*/0,
       start_pos_dev,
       max_seq_len,
+      /*ring_base=*/0,
+      /*ring_modulus=*/0,
       sm_scale);
   return cudaGetLastError();
 }
