@@ -1084,9 +1084,7 @@ impl ModelKvAdapter for Dsv4KvAdapter {
             // commit fold advances by up to the same — all inside ONE tick,
             // after this (the only) alloc point. ≤ one extra comp page,
             // budgeted by `DSV4_COMP_SAFETY_PAGES_PER_SLOT`.
-            let ensure_tokens = row
-                .total_tokens
-                .max(row.append_pos + row.append_len)
+            let ensure_tokens = row.total_tokens.max(row.append_pos + row.append_len)
                 + crate::dsv4::MAX_SPEC_DRAFT_DEPTH
                 + 1;
             let ctx = self.ctx.clone();
