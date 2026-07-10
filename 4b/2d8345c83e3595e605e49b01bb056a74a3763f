@@ -1,0 +1,23 @@
+docs/experience/wins/2026-07-10-dspark-concurrency-derisk-kill.md
+  s_9c91b86ec3fb55::t_92b502e7b9853c 1-68
+scripts/agent_opd_curve.sh
+  s_9c91b86ec3fb55::t_eea335ed17f52b 16-17,56-60,62-64
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "4b2d8345c83e3595e605e49b01bb056a74a3763f",
+  "prompts": {},
+  "sessions": {
+    "s_9c91b86ec3fb55": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4779911a-69b7-49db-bc83-daf5a48d6ca3",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
