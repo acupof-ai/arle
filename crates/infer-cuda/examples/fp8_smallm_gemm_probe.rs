@@ -472,36 +472,29 @@ mod real {
         }
     }
 
-    /// Quantize BF16 activations to FP8 block-scaled (4×128 tiles, matching DeepGEMM
-    /// pack_quantize) then dequantize back to BF16. This gives the GEMV reference the
-    /// same activation precision floor as DeepGEMM, so numeric comparison is valid.
+    /// Quantize BF16 activations to FP8 block-scaled then dequantize back to BF16.
+    /// Matches DeepGEMM pack_quantize's per-row, per-128-col-block scaling so the
+    /// GEMV reference and DeepGEMM share one activation precision floor.
     fn quantize_dequantize_bf16_fp8(x: &[bf16], m: usize, k: usize) -> Vec<bf16> {
         const MAX_FP8: f32 = 448.0; // max finite E4M3 value
         let mut out = vec![bf16::from_f32(0.0); m * k];
-        let tile_rows = 4;
         let tile_cols = FP8_BLOCK;
-        for tile_r in (0..m).step_by(tile_rows) {
+        for r in 0..m {
             for tile_c in (0..k).step_by(tile_cols) {
-                let h = tile_rows.min(m - tile_r);
                 let w = tile_cols.min(k - tile_c);
                 let mut max_abs = 0.0f32;
-                for dr in 0..h {
-                    for dc in 0..w {
-                        let val = x[(tile_r + dr) * k + tile_c + dc].to_f32();
-                        max_abs = max_abs.max(val.abs());
-                    }
+                for dc in 0..w {
+                    max_abs = max_abs.max(x[r * k + tile_c + dc].to_f32().abs());
                 }
                 let scale = if max_abs > 0.0 {
                     max_abs / MAX_FP8
                 } else {
                     1.0
                 };
-                for dr in 0..h {
-                    for dc in 0..w {
-                        let val = x[(tile_r + dr) * k + tile_c + dc].to_f32();
-                        let q = (val / scale).round().clamp(-MAX_FP8, MAX_FP8);
-                        out[(tile_r + dr) * k + tile_c + dc] = bf16::from_f32(q * scale);
-                    }
+                for dc in 0..w {
+                    let val = x[r * k + tile_c + dc].to_f32();
+                    let q = (val / scale).round().clamp(-MAX_FP8, MAX_FP8);
+                    out[r * k + tile_c + dc] = bf16::from_f32(q * scale);
                 }
             }
         }
