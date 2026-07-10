@@ -2671,10 +2671,16 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
 
     for round in 0..args.rounds {
         eprintln!("[dbg-aopd] E: round={round} start");
+        // Anchor the per-stage profiler (opt-in via ARLE_AOPD_PROFILE; no-op off).
+        train::aopd_profile::begin_round();
         // Re-acquire the rollout KV pool the PREVIOUS round's writeback closure
         // dropped (no-op on round 0 / when the pool is resident). The rollout
         // below needs it; the writeback frees it again at the end of the round.
-        if let Err(err) = infer_student.ensure_kv_pool() {
+        if let Err(err) =
+            train::aopd_profile::time_try("kv_pool_ensure", train::aopd_profile::GPU, || {
+                infer_student.ensure_kv_pool()
+            })
+        {
             eprintln!("[agent-opd] ensure KV pool (round {round}) failed: {err}");
         }
         eprintln!("[dbg-aopd] F: post-ensure-kv-pool round={round}");
@@ -2757,6 +2763,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
             .sync_lora_from_store(&mut store, &student.adapter_name_map(), lora)
             .context("sync trained LoRA into rollout engine")?;
         let sync_lora_secs = sync_started.elapsed().as_secs_f64();
+        train::aopd_profile::record("sync_lora", train::aopd_profile::GPU, sync_lora_secs);
         eprintln!("[agent-opd] phase=sync_lora seconds={sync_lora_secs:.3}");
 
         // HELD-OUT eval of THIS round's student (rollout engine now holds the
@@ -2773,14 +2780,17 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
             if let Err(err) = infer_student.ensure_kv_pool() {
                 eprintln!("[agent-opd] ensure KV pool before eval (round {round}) failed: {err}");
             }
-            let pass_rate = run_agent_opd_eval_pass(
-                &infer_student,
-                &eval_tasks,
-                &cfg,
-                args.eval_temperature,
-                &eval_out_dir,
-                &(round + 1).to_string(),
-            )?;
+            let pass_rate =
+                train::aopd_profile::time_try("eval", train::aopd_profile::GPU, || {
+                    run_agent_opd_eval_pass(
+                        &infer_student,
+                        &eval_tasks,
+                        &cfg,
+                        args.eval_temperature,
+                        &eval_out_dir,
+                        &(round + 1).to_string(),
+                    )
+                })?;
             held_out_pass_rate = Some(pass_rate);
             match baseline_pass_rate {
                 Some(base) => eprintln!(
@@ -2800,15 +2810,17 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
         // / vLLM / SGLang. Avoids the full-materialize host-loop hang.
         if let Some(adapter_dir) = args.save_lora_adapters.as_deref() {
             if should_save_step_checkpoint(round + 1, args.rounds, args.save_every) {
-                save_agent_opd_adapters(
-                    adapter_dir,
-                    &format!("adapters_round{}", round + 1),
-                    round + 1,
-                    student_dir,
-                    &student,
-                    &mut store,
-                    &lora_adapter_config,
-                )?;
+                train::aopd_profile::time_try("save_adapters", train::aopd_profile::DISK, || {
+                    save_agent_opd_adapters(
+                        adapter_dir,
+                        &format!("adapters_round{}", round + 1),
+                        round + 1,
+                        student_dir,
+                        &student,
+                        &mut store,
+                        &lora_adapter_config,
+                    )
+                })?;
             }
         }
 
@@ -2826,6 +2838,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
             &mut ckpt_tape,
         )?;
         let save_secs = save_started.elapsed().as_secs_f64();
+        train::aopd_profile::record("save_checkpoint", train::aopd_profile::DISK, save_secs);
         eprintln!("[agent-opd] phase=round_tail_save seconds={save_secs:.3}");
 
         // Structured per-round metrics: one JSON line appended to metrics.jsonl.
@@ -2869,6 +2882,9 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
         })() {
             eprintln!("[agent-opd] metrics.jsonl write (round {round}) failed: {err}");
         }
+
+        // Per-stage ms + %-of-round breakdown (opt-in ARLE_AOPD_PROFILE; no-op off).
+        train::aopd_profile::print_round(round);
     }
 
     eprintln!("[arle train agent-opd] done ({} rounds)", args.rounds);
