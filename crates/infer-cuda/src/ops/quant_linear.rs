@@ -7,6 +7,7 @@ use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut, sys::CUevent_flags};
 use half::bf16;
 use std::cell::RefCell;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 mod qwen_fp8_dense_policy {
@@ -48,6 +49,97 @@ thread_local! {
 thread_local! {
     static QWEN_FP8_DENSE_SCRATCH: RefCell<QwenFp8DenseScratch> =
         RefCell::new(QwenFp8DenseScratch::default());
+}
+
+// ponytail: global atomics for Qwen FP8 dense dispatch counters. Per-family
+// split if/when more operator families migrate to generated policy.
+static DEEPGEMM_HITS: AtomicU64 = AtomicU64::new(0);
+static GEMV_HITS: AtomicU64 = AtomicU64::new(0);
+static DEQUANT_GEMM_HITS: AtomicU64 = AtomicU64::new(0);
+static FALLBACK_COUNT: AtomicU64 = AtomicU64::new(0);
+
+static PRODUCT_IDENTITY: OnceLock<(String, String)> = OnceLock::new();
+
+/// (binary_sha256, git_commit) — computed once on first call.
+fn product_identity() -> &'static (String, String) {
+    PRODUCT_IDENTITY.get_or_init(|| {
+        let binary = std::env::current_exe()
+            .ok()
+            .and_then(|p| file_sha256(p.to_str()?))
+            .unwrap_or_else(|| "unreported".into());
+        let commit = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "unreported".into());
+        (binary, commit)
+    })
+}
+
+fn file_sha256(path: &str) -> Option<String> {
+    use std::process::Command;
+    [
+        ("sha256sum", vec![path]),
+        ("shasum", vec!["-a", "256", path]),
+    ]
+    .into_iter()
+    .find_map(|(program, args)| {
+        Command::new(program)
+            .args(args)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .and_then(|o| o.split_whitespace().next().map(str::to_owned))
+            .filter(|d| d.len() == 64)
+    })
+}
+
+/// Cumulative operator dispatch stats for Qwen FP8 dense projection.
+///
+/// Reads global atomics — safe to call from any thread, no allocation on the
+/// hot path (the returned `Vec` only contains implementations that have
+/// actually been hit).
+pub(crate) fn qwen_fp8_dense_operator_stats() -> infer_seam::OperatorDispatchStats {
+    use infer_seam::OperatorImplementationHits;
+
+    let deepgemm = DEEPGEMM_HITS.load(Ordering::Relaxed);
+    let gemv = GEMV_HITS.load(Ordering::Relaxed);
+    let dequant = DEQUANT_GEMM_HITS.load(Ordering::Relaxed);
+    let fallback = FALLBACK_COUNT.load(Ordering::Relaxed);
+
+    let mut implementation_hits = Vec::new();
+    if deepgemm > 0 {
+        implementation_hits.push(OperatorImplementationHits {
+            implementation_id: "cuda.qwen.fp8_pack_deepgemm".into(),
+            hits: deepgemm,
+        });
+    }
+    if gemv > 0 {
+        implementation_hits.push(OperatorImplementationHits {
+            implementation_id: "cuda.qwen.fp8_gemv".into(),
+            hits: gemv,
+        });
+    }
+    if dequant > 0 {
+        implementation_hits.push(OperatorImplementationHits {
+            implementation_id: "cuda.qwen.fp8_dequant_bf16_gemm".into(),
+            hits: dequant,
+        });
+    }
+
+    let (product_id, bundle_digest) = product_identity();
+    infer_seam::OperatorDispatchStats {
+        policy_hash: qwen_fp8_dense_policy::POLICY_ID.into(),
+        product_id: product_id.clone(),
+        bundle_digest: bundle_digest.clone(),
+        implementation_hits,
+        fallback_count: fallback,
+    }
 }
 
 impl QwenFp8DenseScratch {
@@ -502,6 +594,7 @@ pub(super) fn gemm_batch(
         WeightFormat::Fp8BlockScaled | WeightFormat::Fp8PerShard
     ) && try_fp8_deepgemm_dense_batch(ctx, weight, x, out)?
     {
+        DEEPGEMM_HITS.fetch_add(1, Ordering::Relaxed);
         return Ok(());
     }
 
@@ -509,6 +602,8 @@ pub(super) fn gemm_batch(
     // above, so dequant → BF16 cuBLAS GEMM here (small-M decode keeps the scalar
     // GEMV below). No-op on Hopper (returns false).
     if try_fp8_dequant_bf16_gemm_batch(ctx, weight, x, out)? {
+        DEQUANT_GEMM_HITS.fetch_add(1, Ordering::Relaxed);
+        FALLBACK_COUNT.fetch_add(1, Ordering::Relaxed);
         return Ok(());
     }
 
@@ -600,6 +695,8 @@ pub(super) fn gemm_batch(
                         .result()?)
                     },
                 )?;
+                GEMV_HITS.fetch_add(1, Ordering::Relaxed);
+                FALLBACK_COUNT.fetch_add(1, Ordering::Relaxed);
             }
             WeightFormat::Fp4E2M1Group => {
                 ensure!(
@@ -696,6 +793,8 @@ pub(super) fn gemv(
                     stream,
                 )
                 .result()?;
+                GEMV_HITS.fetch_add(1, Ordering::Relaxed);
+                FALLBACK_COUNT.fetch_add(1, Ordering::Relaxed);
             }
             WeightFormat::Fp4E2M1Group => {
                 ensure!(

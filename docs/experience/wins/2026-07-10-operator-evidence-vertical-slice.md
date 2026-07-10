@@ -1,6 +1,11 @@
 # Operator evidence vertical slice — Qwen FP8 dense, 2026-07-10
 
-> Status: Active — H20 component, engagement, and GuideLLM gates pending.
+> Status: Active — H20 probe evidence and GuideLLM engagement gate pending.
+> P1 update (2026-07-11): backend dispatch counters wired in `quant_linear.rs` — all 4 FP8 dense
+> paths (DeepGEMM, dequant GEMM, GEMV in gemm_batch, GEMV in gemv) increment global atomics.
+> `/v1/stats` now returns real `implementation_hits` + `fallback_count`.
+> P1 update 2 (2026-07-11): `product_id` (binary sha256) + `bundle_digest` (git commit) now
+> runtime-computed via `OnceLock`. `scripts/run_fp8_probe.sh` auto-sets all qualification env vars.
 
 ## SLO-shape probed? N
 
@@ -52,8 +57,10 @@ override it without affecting unknown hardware or shapes.
 
 - The shared `/host/arle-build` tree had concurrent users. Final H20 evidence
   must use an isolated `POD_TREE`.
-- Backend counters remain empty until the family-local fixed-counter path is
-  wired without per-token heap allocation.
+- **FIXED 2026-07-11:** Backend dispatch counters wired in `quant_linear.rs`.
+  `DEEPGEMM_HITS`, `GEMV_HITS`, `DEQUANT_GEMM_HITS`, `FALLBACK_COUNT` global
+  atomics incremented at all 4 call entry points (`gemm_batch` × 3 paths,
+  `gemv` × FP8 path). Reachable via `/v1/stats → operator_dispatch`.
 
 ## Learnings
 
@@ -72,6 +79,10 @@ override it without affecting unknown hardware or shapes.
 ## Artefacts
 
 - Schema: `benchmarks/operators/schema.json`
+- Registry: `operators/registry.toml`
 - Policy: `benchmarks/operators/optimal.json`
 - Reducer: `scripts/reduce_operator_evidence.py`
+- Probe: `crates/infer-cuda/examples/fp8_smallm_gemm_probe.rs`
+- Probe runner: `scripts/run_fp8_probe.sh`
+- Generated selector: `crates/infer-cuda/src/ops/generated/qwen_fp8_dense_projection.rs`
 - Plan: `docs/plans/2026-07-10-operator-artifact-dev-release-system.md`
