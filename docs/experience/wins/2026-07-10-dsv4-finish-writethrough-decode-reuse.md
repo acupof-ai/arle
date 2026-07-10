@@ -50,11 +50,16 @@ v2 (`28b8cd7bb`) added the continuation guard and re-verified:
 
 ## Still pending (default flip)
 
-- **Perf Δ%**: the exact turn-2 reuse-length delta (640→704) needs a
-  token-id-preserving multi-turn driver — the text-reconstruction driver
-  re-tokenizes the fed-back completion, so the match truncates at 512 (OFF==ON,
-  so decode-reuse is exonerated, but the delta is unmeasurable). Bake a
-  token-preserving W1 into `prefix_reuse_gate.py`, then restore-vs-cold-prefill Δ%.
+- **Perf Δ%**: the token-id-preserving multi-turn driver is now BUILT
+  (`3461a37c8`: server accepts a token-id `prompt` array + returns
+  `prompt_token_ids`; `scripts/eval_harness/token_reuse.py` replays turn-1's
+  exact `prompt_ids + generated_ids` into turn-2). The clean OFF-vs-ON delta run
+  is **blocked on infra, not the feature**: the pod's GPU 1 is pinned by foreign
+  jobs (~13 GB free; DSv4 TP=8 needs ~37 GB/rank), so the serve can't boot.
+  Harness + serve recipe staged on the pod (`reuse_measure.sh`); rerun when
+  GPU 1 frees ≥40 GB through the ~25s weight-load window. Mechanism already
+  confirmed twice: v1 measured 640→704 (+1 page), v2 published 10 pages into the
+  decode region (past the 9-page prefill floor).
 - Graph lane is code-structural (no DSv4 decode graph under TP/MoE): the
   decode-lane publish is a no-op under the flag, so no per-step D2H is added —
   graph-safe by construction, not runnable against a DSv4 graph today.
