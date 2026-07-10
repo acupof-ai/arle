@@ -78,6 +78,26 @@ pub(crate) struct Dsv4LayerPageState {
     /// bootstrap repacks from this ring — the bf16 ring stays the single
     /// source, A14 resolved by design).
     pub(super) ring: Vec<half::bf16>,
+    /// Frontier-tail sections (finish write-through, `--dsv4-decode-reuse`):
+    /// the sub-page `tail` the radix match can't cover (`[matched_len,
+    /// finish_len)`, < page_tokens). Present ONLY on the frontier entry when a
+    /// finish landed off a page boundary; empty otherwise (aligned finishes and
+    /// every non-frontier page). Captured at the finish sync point, so the whole
+    /// frontier carry (overlap/idx_overlap/ring/pending) reflects `finish_len`.
+    ///
+    /// `pending_kv/score`: the incomplete compress block's raw rows (`finish_len
+    /// % ratio` tokens × width) — the next forward derives `pending_len =
+    /// finish_len % ratio` and reads exactly these.
+    pub(super) pending_kv: Vec<half::bf16>,
+    pub(super) pending_score: Vec<half::bf16>,
+    /// Completed compress rows of the tail page (`[matched_len/ratio,
+    /// finish_len/ratio)`), restored past the frontier page's own rows.
+    pub(super) tail_staging: Vec<half::bf16>,
+    /// FP8 DSA key-cache rows of the tail page (`[matched_len/ir,
+    /// finish_len/ir)`, no cache-page straddle: starts at a 16-row multiple,
+    /// < 16 rows).
+    pub(super) tail_dsa_data: Vec<u8>,
+    pub(super) tail_dsa_scale: Vec<u8>,
 }
 
 /// One host page's captured state across all layers.
@@ -88,6 +108,11 @@ pub(crate) struct Dsv4PrefixPageEntry {
     pub(crate) page_index: u32,
     /// Boundary sections present (forward ended exactly at this page's end).
     pub(crate) boundary: bool,
+    /// Sub-page tail length carried by this entry's frontier-tail sections
+    /// (`finish_len - matched_len`, < page_tokens); `0` = no tail (aligned
+    /// finish or a non-frontier page). Restore reads it off the last matched
+    /// entry to set `finish_len = matched_len + finish_tail_len`.
+    pub(crate) finish_tail_len: u32,
     pub(crate) layers: Vec<Dsv4LayerPageState>,
 }
 
@@ -141,6 +166,7 @@ impl Dsv4PrefixPageEntry {
         buf.extend_from_slice(ENTRY_MAGIC);
         buf.extend_from_slice(&self.page_index.to_le_bytes());
         buf.push(u8::from(self.boundary));
+        buf.extend_from_slice(&self.finish_tail_len.to_le_bytes());
         buf.extend_from_slice(&(self.layers.len() as u32).to_le_bytes());
         for layer in &self.layers {
             push_bf16(&mut buf, &layer.staging);
@@ -151,19 +177,25 @@ impl Dsv4PrefixPageEntry {
             push_bf16(&mut buf, &layer.idx_overlap_kv);
             push_bf16(&mut buf, &layer.idx_overlap_score);
             push_bf16(&mut buf, &layer.ring);
+            push_bf16(&mut buf, &layer.pending_kv);
+            push_bf16(&mut buf, &layer.pending_score);
+            push_bf16(&mut buf, &layer.tail_staging);
+            push_bytes(&mut buf, &layer.tail_dsa_data);
+            push_bytes(&mut buf, &layer.tail_dsa_scale);
         }
         buf
     }
 
     pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Self> {
         ensure!(
-            bytes.len() >= 13 && &bytes[..4] == ENTRY_MAGIC,
+            bytes.len() >= 17 && &bytes[..4] == ENTRY_MAGIC,
             "bad prefix-state entry header"
         );
         let page_index = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
         let boundary = bytes[8] != 0;
-        let n_layers = u32::from_le_bytes(bytes[9..13].try_into().unwrap()) as usize;
-        let mut pos = 13usize;
+        let finish_tail_len = u32::from_le_bytes(bytes[9..13].try_into().unwrap());
+        let n_layers = u32::from_le_bytes(bytes[13..17].try_into().unwrap()) as usize;
+        let mut pos = 17usize;
         let layers = (0..n_layers)
             .map(|_| {
                 Ok(Dsv4LayerPageState {
@@ -175,6 +207,11 @@ impl Dsv4PrefixPageEntry {
                     idx_overlap_kv: read_bf16(&mut pos, bytes)?,
                     idx_overlap_score: read_bf16(&mut pos, bytes)?,
                     ring: read_bf16(&mut pos, bytes)?,
+                    pending_kv: read_bf16(&mut pos, bytes)?,
+                    pending_score: read_bf16(&mut pos, bytes)?,
+                    tail_staging: read_bf16(&mut pos, bytes)?,
+                    tail_dsa_data: read_bytes(&mut pos, bytes)?,
+                    tail_dsa_scale: read_bytes(&mut pos, bytes)?,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -182,6 +219,7 @@ impl Dsv4PrefixPageEntry {
         Ok(Self {
             page_index,
             boundary,
+            finish_tail_len,
             layers,
         })
     }
@@ -192,12 +230,17 @@ impl Dsv4PrefixPageEntry {
             .map(|l| {
                 l.dsa_data.len()
                     + l.dsa_scale.len()
+                    + l.tail_dsa_data.len()
+                    + l.tail_dsa_scale.len()
                     + (l.staging.len()
                         + l.overlap_kv.len()
                         + l.overlap_score.len()
                         + l.idx_overlap_kv.len()
                         + l.idx_overlap_score.len()
-                        + l.ring.len())
+                        + l.ring.len()
+                        + l.pending_kv.len()
+                        + l.pending_score.len()
+                        + l.tail_staging.len())
                         * 2
             })
             .sum()
@@ -213,17 +256,20 @@ pub(crate) fn dsv4_prefix_entry_max_bytes(
     page_tokens: usize,
 ) -> usize {
     let bf16 = 2usize;
-    let mut total = 13usize; // entry header
+    let mut total = 17usize; // entry header (magic + page_index + boundary + finish_tail_len)
     for &(mode, ratio) in layer_specs {
-        total += 8 * 4; // section length prefixes
+        total += 13 * 4; // section length prefixes
         // ring — every layer has an SW window cache.
         total += config.sliding_window * config.head_dim * bf16;
         // ceil, not floor: for ratio > page_tokens a page can still complete
         // one row (page_row_span), and the predictor must never undersize.
         if mode.has_compressor() && ratio > 0 {
             let rpp = page_tokens.div_ceil(ratio);
-            total += rpp * config.head_dim * bf16; // staging
+            // staging + tail_staging (both ≤ one page of compress rows).
+            total += 2 * rpp * config.head_dim * bf16;
             total += 2 * ratio * config.head_dim * bf16; // overlap kv+score
+            // pending kv+score: `ratio·width`, width ≤ 2·head_dim (overlap).
+            total += 2 * ratio * (2 * config.head_dim) * bf16;
         }
         if mode.has_indexer() {
             let index_ratio = if mode == DeepSeekV4AttentionMode::SparseIndexed {
@@ -232,7 +278,8 @@ pub(crate) fn dsv4_prefix_entry_max_bytes(
                 ratio.max(1)
             };
             let rpp = page_tokens.div_ceil(index_ratio);
-            total += rpp * (config.index_head_dim + 4); // dsa data+scale
+            // dsa data+scale + tail dsa data+scale (both ≤ one page of rows).
+            total += 2 * rpp * (config.index_head_dim + 4);
             total += 2 * index_ratio * config.index_head_dim * bf16; // idx overlap
         }
     }
@@ -705,25 +752,214 @@ impl Dsv4LayerAttentionState {
         Ok(())
     }
 
-    /// Host counters for a restore at `matched_len` (a page-aligned boundary):
-    /// staging/indexer row counts, DSA packed rows, and the FlashMLA FP8
-    /// counters. `fp8_kv_sw_bootstrapped=false` forces the SW-ring repack from
-    /// the restored bf16 ring (A14); `fp8_kv_comp_packed_rows=0` forces the
-    /// first post-restore decode's bulk pack to rebuild the FP8 band from the
-    /// restored staging (the band itself is never captured — see
-    /// [`Dsv4LayerPageState`]). `pending_kv/score` need no restore:
-    /// `matched_len % ratio == 0` ⇒ no partial block, so the next compress
-    /// overwrites before any read.
+    /// D2H the frontier-tail sections onto `out` (already holding this frontier
+    /// page's own content+carry): the sub-page tail the radix match can't cover,
+    /// `[matched_len, finish_len)`. `pending_kv/score` = the incomplete compress
+    /// block (`finish_len % ratio` tokens); `tail_staging`/`tail_dsa_*` = the
+    /// tail page's completed compress / DSA rows. All live at the finish sync
+    /// point; the caller syncs once after all layers.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn capture_frontier_tail(
+        &self,
+        ctx: &DeviceContext,
+        pool: &Dsv4LayerKvLayout,
+        mode: DeepSeekV4AttentionMode,
+        compress_ratio: usize,
+        index_head_dim: usize,
+        matched_len: usize,
+        finish_len: usize,
+        out: &mut Dsv4LayerPageState,
+    ) -> Result<()> {
+        if let Some(c) = &self.compressor {
+            let ratio = compress_ratio.max(1);
+            let pending_len = finish_len % ratio;
+            if pending_len > 0 {
+                ensure!(
+                    c.pending_kv.len().is_multiple_of(ratio),
+                    "DSv4 frontier tail: pending buffer {} not ratio-{ratio} divisible",
+                    c.pending_kv.len()
+                );
+                let n = pending_len * (c.pending_kv.len() / ratio);
+                ensure!(
+                    n <= c.pending_kv.len() && n <= c.pending_score.len(),
+                    "DSv4 frontier tail: pending rows {n} outside buffer {}",
+                    c.pending_kv.len()
+                );
+                out.pending_kv = ctx
+                    .stream
+                    .clone_dtoh(&c.pending_kv.slice(0..n))
+                    .map_err(|e| anyhow!("DSv4 frontier tail pending kv D2H failed: {e}"))?;
+                out.pending_score = ctx
+                    .stream
+                    .clone_dtoh(&c.pending_score.slice(0..n))
+                    .map_err(|e| anyhow!("DSv4 frontier tail pending score D2H failed: {e}"))?;
+            }
+            if let Some(range) = staging_tail_range(c, ratio, matched_len, finish_len)? {
+                out.tail_staging = ctx
+                    .stream
+                    .clone_dtoh(&c.compressed.data.slice(range))
+                    .map_err(|e| anyhow!("DSv4 frontier tail staging D2H failed: {e}"))?;
+            }
+        }
+        if let Some(dsa) = &self.dsa_official
+            && let Some((data_range, scale_range)) = dsa_tail_ranges(
+                pool,
+                dsa,
+                mode,
+                compress_ratio,
+                index_head_dim,
+                matched_len,
+                finish_len,
+            )?
+        {
+            let cache = pool
+                .dsa_key_cache
+                .as_ref()
+                .ok_or_else(|| anyhow!("DSv4 frontier tail: DSA shared key-cache missing"))?;
+            ensure!(
+                data_range.end <= cache.len() && scale_range.end <= cache.len(),
+                "DSv4 frontier tail DSA range outside cache bytes {}",
+                cache.len()
+            );
+            out.tail_dsa_data = ctx
+                .stream
+                .clone_dtoh(&cache.slice(data_range))
+                .map_err(|e| anyhow!("DSv4 frontier tail DSA data D2H failed: {e}"))?;
+            out.tail_dsa_scale = ctx
+                .stream
+                .clone_dtoh(&cache.slice(scale_range))
+                .map_err(|e| anyhow!("DSv4 frontier tail DSA scale D2H failed: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// H2D the inverse of [`Self::capture_frontier_tail`]. Every section length
+    /// is checked against the live tail shape before any byte moves; an absent
+    /// section must be empty (else capture-era shape drift).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn restore_frontier_tail(
+        &mut self,
+        ctx: &DeviceContext,
+        pool: &mut Dsv4LayerKvLayout,
+        mode: DeepSeekV4AttentionMode,
+        compress_ratio: usize,
+        index_head_dim: usize,
+        matched_len: usize,
+        finish_len: usize,
+        state: &Dsv4LayerPageState,
+    ) -> Result<()> {
+        if let Some(c) = &mut self.compressor {
+            let ratio = compress_ratio.max(1);
+            let pending_len = finish_len % ratio;
+            let n = if pending_len > 0 {
+                pending_len * (c.pending_kv.len() / ratio)
+            } else {
+                0
+            };
+            ensure!(
+                state.pending_kv.len() == n && state.pending_score.len() == n,
+                "DSv4 frontier tail restore pending {}+{} != live {n}",
+                state.pending_kv.len(),
+                state.pending_score.len()
+            );
+            if n > 0 {
+                let mut kv = c.pending_kv.slice_mut(0..n);
+                ctx.stream
+                    .memcpy_htod(&state.pending_kv, &mut kv)
+                    .map_err(|e| anyhow!("DSv4 frontier tail pending kv H2D failed: {e}"))?;
+                let mut score = c.pending_score.slice_mut(0..n);
+                ctx.stream
+                    .memcpy_htod(&state.pending_score, &mut score)
+                    .map_err(|e| anyhow!("DSv4 frontier tail pending score H2D failed: {e}"))?;
+            }
+            match staging_tail_range(c, ratio, matched_len, finish_len)? {
+                Some(range) => {
+                    ensure!(
+                        state.tail_staging.len() == range.len(),
+                        "DSv4 frontier tail restore staging {} != live {}",
+                        state.tail_staging.len(),
+                        range.len()
+                    );
+                    let mut view = c.compressed.data.slice_mut(range);
+                    ctx.stream
+                        .memcpy_htod(&state.tail_staging, &mut view)
+                        .map_err(|e| anyhow!("DSv4 frontier tail staging H2D failed: {e}"))?;
+                }
+                None => ensure!(
+                    state.tail_staging.is_empty(),
+                    "DSv4 frontier tail restore: entry has staging for a tail the live shape completes none"
+                ),
+            }
+        }
+        if let Some(dsa) = &self.dsa_official {
+            match dsa_tail_ranges(
+                pool,
+                dsa,
+                mode,
+                compress_ratio,
+                index_head_dim,
+                matched_len,
+                finish_len,
+            )? {
+                Some((data_range, scale_range)) => {
+                    ensure!(
+                        state.tail_dsa_data.len() == data_range.len()
+                            && state.tail_dsa_scale.len() == scale_range.len(),
+                        "DSv4 frontier tail restore DSA {}+{} != live {}+{}",
+                        state.tail_dsa_data.len(),
+                        state.tail_dsa_scale.len(),
+                        data_range.len(),
+                        scale_range.len()
+                    );
+                    let cache = pool.dsa_key_cache.as_mut().ok_or_else(|| {
+                        anyhow!("DSv4 frontier tail restore: DSA key-cache missing")
+                    })?;
+                    ensure!(
+                        data_range.end <= cache.len() && scale_range.end <= cache.len(),
+                        "DSv4 frontier tail restore DSA range outside cache bytes {}",
+                        cache.len()
+                    );
+                    {
+                        let mut data = cache.slice_mut(data_range);
+                        ctx.stream
+                            .memcpy_htod(&state.tail_dsa_data, &mut data)
+                            .map_err(|e| anyhow!("DSv4 frontier tail DSA data H2D failed: {e}"))?;
+                    }
+                    let mut scale = cache.slice_mut(scale_range);
+                    ctx.stream
+                        .memcpy_htod(&state.tail_dsa_scale, &mut scale)
+                        .map_err(|e| anyhow!("DSv4 frontier tail DSA scale H2D failed: {e}"))?;
+                }
+                None => ensure!(
+                    state.tail_dsa_data.is_empty() && state.tail_dsa_scale.is_empty(),
+                    "DSv4 frontier tail restore: entry has DSA for a tail the live shape completes none"
+                ),
+            }
+        }
+        Ok(())
+    }
+
+    /// Host counters for a restore at `restore_len` (the frontier position:
+    /// page-aligned `matched_len` for a plain restore, or `finish_len` for a
+    /// finish write-through — the formula floors either way): staging/indexer
+    /// row counts, DSA packed rows, and the FlashMLA FP8 counters.
+    /// `fp8_kv_sw_bootstrapped=false` forces the SW-ring repack from the restored
+    /// bf16 ring (A14); `fp8_kv_comp_packed_rows=0` forces the first post-restore
+    /// decode's bulk pack to rebuild the FP8 band from the restored staging (the
+    /// band itself is never captured — see [`Dsv4LayerPageState`]). `pending_kv/
+    /// score` are NOT zeroed here: an off-`ratio` `restore_len` carries a
+    /// sub-`ratio` tail that [`Self::restore_frontier_tail`] wrote and the next
+    /// forward reads (`pending_len = restore_len % ratio`, `attention.rs:7638`).
     pub(crate) fn restore_prefix_counters(
         &mut self,
         mode: DeepSeekV4AttentionMode,
         compress_ratio: usize,
-        matched_len: usize,
+        restore_len: usize,
     ) {
         let comp_rows = if mode == DeepSeekV4AttentionMode::SlidingWindow {
             0
         } else {
-            matched_len / compress_ratio.max(1)
+            restore_len / compress_ratio.max(1)
         };
         let index_ratio = if mode == DeepSeekV4AttentionMode::SparseIndexed {
             1
@@ -731,7 +967,7 @@ impl Dsv4LayerAttentionState {
             compress_ratio.max(1)
         };
         let index_rows = if mode.has_indexer() {
-            matched_len / index_ratio
+            restore_len / index_ratio
         } else {
             0
         };
@@ -761,24 +997,17 @@ fn page_row_span(page_tokens: usize, ratio: usize, page_index: usize) -> (usize,
     (start, end - start)
 }
 
-/// Element range of one host page's rows in the main compressor's bf16
-/// staging (`compressed.data`, row-major `[row][head_dim]`); `None` when the
-/// page completes no row.
-fn staging_row_range(
+/// Element range of compressor staging rows `[row0, row0+count)` in
+/// `compressed.data` (row-major `[row][head_dim]`).
+fn staging_elem_range(
     c: &Dsv4CompressorState,
-    compress_ratio: usize,
-    page_tokens: usize,
-    page_index: usize,
-) -> Result<Option<std::ops::Range<usize>>> {
+    row0: usize,
+    count: usize,
+) -> Result<std::ops::Range<usize>> {
     ensure!(
         c.ring_rows == c.compressed_capacity,
         "DSv4 prefix staging: main compressor staging must be full-history, not a ring"
     );
-    ensure!(compress_ratio > 0, "DSv4 prefix staging: zero ratio");
-    let (row0, count) = page_row_span(page_tokens, compress_ratio, page_index);
-    if count == 0 {
-        return Ok(None);
-    }
     ensure!(
         row0 + count <= c.compressed_capacity,
         "DSv4 prefix staging rows {row0}..{} outside capacity {}",
@@ -792,7 +1021,41 @@ fn staging_row_range(
         c.compressed.data.len(),
         c.ring_rows
     );
-    Ok(Some(row0 * head_dim..(row0 + count) * head_dim))
+    Ok(row0 * head_dim..(row0 + count) * head_dim)
+}
+
+/// Element range of one host page's rows in the main compressor's bf16
+/// staging; `None` when the page completes no row.
+fn staging_row_range(
+    c: &Dsv4CompressorState,
+    compress_ratio: usize,
+    page_tokens: usize,
+    page_index: usize,
+) -> Result<Option<std::ops::Range<usize>>> {
+    ensure!(compress_ratio > 0, "DSv4 prefix staging: zero ratio");
+    let (row0, count) = page_row_span(page_tokens, compress_ratio, page_index);
+    if count == 0 {
+        return Ok(None);
+    }
+    Ok(Some(staging_elem_range(c, row0, count)?))
+}
+
+/// Element range of the frontier tail's completed compress rows
+/// `[matched_len/ratio, finish_len/ratio)`; `None` when the tail completes no
+/// row (aligned finish or a sub-`ratio` tail).
+fn staging_tail_range(
+    c: &Dsv4CompressorState,
+    compress_ratio: usize,
+    matched_len: usize,
+    finish_len: usize,
+) -> Result<Option<std::ops::Range<usize>>> {
+    ensure!(compress_ratio > 0, "DSv4 prefix staging tail: zero ratio");
+    let row0 = matched_len / compress_ratio;
+    let count = finish_len / compress_ratio - row0;
+    if count == 0 {
+        return Ok(None);
+    }
+    Ok(Some(staging_elem_range(c, row0, count)?))
 }
 
 /// Byte ranges of one host page's rows in the slot's FP8 DSA key-cache band
@@ -800,25 +1063,13 @@ fn staging_row_range(
 /// `[64×index_head_dim data][64×f32 scales]` per page — the B1-B3 lesson:
 /// never flat `row × (dim+4)` math.
 #[allow(clippy::type_complexity)]
-fn dsa_row_ranges(
+fn dsa_byte_ranges(
     pool: &Dsv4LayerKvLayout,
     dsa: &Dsv4DsaOfficialState,
-    mode: DeepSeekV4AttentionMode,
-    compress_ratio: usize,
     index_head_dim: usize,
-    page_tokens: usize,
-    page_index: usize,
-) -> Result<Option<(std::ops::Range<usize>, std::ops::Range<usize>)>> {
-    let index_ratio = if mode == DeepSeekV4AttentionMode::SparseIndexed {
-        1
-    } else {
-        compress_ratio
-    };
-    ensure!(index_ratio > 0, "DSv4 prefix DSA: zero index ratio");
-    let (row0, count) = page_row_span(page_tokens, index_ratio, page_index);
-    if count == 0 {
-        return Ok(None);
-    }
+    row0: usize,
+    count: usize,
+) -> Result<(std::ops::Range<usize>, std::ops::Range<usize>)> {
     ensure!(
         row0 / DSA_PAGE_ROWS == (row0 + count - 1) / DSA_PAGE_ROWS,
         "DSv4 prefix DSA rows {row0}..{} straddle a {DSA_PAGE_ROWS}-row cache page",
@@ -836,10 +1087,72 @@ fn dsa_row_ranges(
     let data_start = page_base + in_row * index_head_dim;
     let scale_start =
         page_base + DSA_PAGE_ROWS * index_head_dim + in_row * std::mem::size_of::<f32>();
-    Ok(Some((
+    Ok((
         data_start..data_start + count * index_head_dim,
         scale_start..scale_start + count * std::mem::size_of::<f32>(),
-    )))
+    ))
+}
+
+fn dsa_index_ratio(mode: DeepSeekV4AttentionMode, compress_ratio: usize) -> usize {
+    if mode == DeepSeekV4AttentionMode::SparseIndexed {
+        1
+    } else {
+        compress_ratio
+    }
+}
+
+#[allow(clippy::type_complexity)]
+fn dsa_row_ranges(
+    pool: &Dsv4LayerKvLayout,
+    dsa: &Dsv4DsaOfficialState,
+    mode: DeepSeekV4AttentionMode,
+    compress_ratio: usize,
+    index_head_dim: usize,
+    page_tokens: usize,
+    page_index: usize,
+) -> Result<Option<(std::ops::Range<usize>, std::ops::Range<usize>)>> {
+    let index_ratio = dsa_index_ratio(mode, compress_ratio);
+    ensure!(index_ratio > 0, "DSv4 prefix DSA: zero index ratio");
+    let (row0, count) = page_row_span(page_tokens, index_ratio, page_index);
+    if count == 0 {
+        return Ok(None);
+    }
+    Ok(Some(dsa_byte_ranges(
+        pool,
+        dsa,
+        index_head_dim,
+        row0,
+        count,
+    )?))
+}
+
+/// DSA byte ranges of the frontier tail rows `[matched_len/ir, finish_len/ir)`.
+/// No cache-page straddle: `matched_len/ir` is a 16-row multiple and the tail
+/// completes < 16 rows.
+#[allow(clippy::type_complexity)]
+fn dsa_tail_ranges(
+    pool: &Dsv4LayerKvLayout,
+    dsa: &Dsv4DsaOfficialState,
+    mode: DeepSeekV4AttentionMode,
+    compress_ratio: usize,
+    index_head_dim: usize,
+    matched_len: usize,
+    finish_len: usize,
+) -> Result<Option<(std::ops::Range<usize>, std::ops::Range<usize>)>> {
+    let index_ratio = dsa_index_ratio(mode, compress_ratio);
+    ensure!(index_ratio > 0, "DSv4 prefix DSA tail: zero index ratio");
+    let row0 = matched_len / index_ratio;
+    let count = finish_len / index_ratio - row0;
+    if count == 0 {
+        return Ok(None);
+    }
+    Ok(Some(dsa_byte_ranges(
+        pool,
+        dsa,
+        index_head_dim,
+        row0,
+        count,
+    )?))
 }
 
 #[cfg(test)]
@@ -855,6 +1168,7 @@ mod tests {
         let entry = Dsv4PrefixPageEntry {
             page_index: 7,
             boundary: true,
+            finish_tail_len: 3,
             layers: vec![
                 Dsv4LayerPageState {
                     staging: bf(&[0.5, -1.25]),
@@ -865,6 +1179,11 @@ mod tests {
                     idx_overlap_kv: bf(&[0.125]),
                     idx_overlap_score: bf(&[4.0]),
                     ring: bf(&[1.0, 2.0, 3.0]),
+                    pending_kv: bf(&[0.75, -0.5]),
+                    pending_score: bf(&[1.5]),
+                    tail_staging: bf(&[-2.25]),
+                    tail_dsa_data: vec![9, 10, 11],
+                    tail_dsa_scale: vec![64, 0],
                 },
                 Dsv4LayerPageState {
                     ring: bf(&[7.0]),
@@ -894,6 +1213,7 @@ mod tests {
         Dsv4PrefixPageEntry {
             page_index,
             boundary: true,
+            finish_tail_len: 0,
             layers: vec![Dsv4LayerPageState {
                 ring: vec![half::bf16::from_f32(page_index as f32)],
                 ..Default::default()

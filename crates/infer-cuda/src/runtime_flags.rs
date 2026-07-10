@@ -25,6 +25,7 @@ static NUMA_PIN: AtomicBool = AtomicBool::new(true);
 static COMM_NCCL_ONLY: AtomicBool = AtomicBool::new(false);
 static DSV4_DSA_INDEXER_SMS: AtomicUsize = AtomicUsize::new(78);
 static DSV4_MOE_CONTIG_DECODE: AtomicBool = AtomicBool::new(false);
+static DSV4_DECODE_REUSE: AtomicBool = AtomicBool::new(false);
 static MTP_ADAPTIVE: AtomicBool = AtomicBool::new(false);
 static MTP_MIN_ACCEPT_BITS: AtomicU32 = AtomicU32::new(0x3F0C_CCCD); // 0.55f32
 static DEEPEP_NUM_SMS: AtomicU32 = AtomicU32::new(20);
@@ -48,6 +49,7 @@ pub fn apply_runtime_flags(f: &CudaRuntimeFlags) {
     COMM_NCCL_ONLY.store(f.comm_backend == CommBackend::Nccl, Relaxed);
     DSV4_DSA_INDEXER_SMS.store(f.dsv4_dsa_indexer_sms, Relaxed);
     DSV4_MOE_CONTIG_DECODE.store(f.dsv4_moe_contig_decode, Relaxed);
+    DSV4_DECODE_REUSE.store(f.dsv4_decode_reuse, Relaxed);
     MTP_ADAPTIVE.store(f.mtp_adaptive, Relaxed);
     MTP_MIN_ACCEPT_BITS.store(f.mtp_min_accept.to_bits(), Relaxed);
     DEEPEP_NUM_SMS.store(f.deepep_num_sms, Relaxed);
@@ -118,6 +120,9 @@ pub(crate) fn dsv4_moe_contig_decode() -> bool {
 /// A/B-harness lever (`infer_cuda::set_dsv4_moe_contig_decode`).
 pub(crate) fn set_dsv4_moe_contig_decode(enabled: bool) {
     DSV4_MOE_CONTIG_DECODE.store(enabled, Relaxed);
+}
+pub(crate) fn dsv4_decode_reuse_enabled() -> bool {
+    DSV4_DECODE_REUSE.load(Relaxed)
 }
 pub(crate) fn mtp_adaptive() -> bool {
     MTP_ADAPTIVE.load(Relaxed)

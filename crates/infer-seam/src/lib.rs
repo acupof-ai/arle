@@ -401,6 +401,23 @@ pub trait BackendExecutor {
         Ok(0)
     }
 
+    /// Write the finishing slot's full frontier state THROUGH to the backend's
+    /// content-keyed prefix store, so a later turn restores to the exact finish
+    /// position. Called by `finish_slot` BEFORE `publish_prefix_blocks` (whose
+    /// confirm/repair reconciles the provisional entries this publishes) and
+    /// before `free_slot_pages`, at the eager finish sync point (graph-safe).
+    /// `slot_pages` is the slot's own host page chain. Best-effort: a failure
+    /// only forfeits future reuse, never the finish. Default no-op; only DSv4
+    /// (behind `--dsv4-decode-reuse`) overrides.
+    fn capture_finish_frontier(
+        &mut self,
+        _slot: usize,
+        _tokens: &[u32],
+        _slot_pages: &[u32],
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Capture the sidecar restore-boundary side state for `slot` at the
     /// just-published radix prefix `tokens[..matched_len]`, keyed so a later
     /// [`Self::restore_prefix_sidecar`] at the same boundary hits it. Called by

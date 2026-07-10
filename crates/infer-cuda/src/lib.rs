@@ -771,6 +771,22 @@ impl BackendExecutor for CudaExecutor {
         }
     }
 
+    fn capture_finish_frontier(
+        &mut self,
+        slot: usize,
+        tokens: &[u32],
+        slot_pages: &[u32],
+    ) -> anyhow::Result<()> {
+        match &mut self.inner {
+            CudaExecutorInner::Placeholder => {
+                let _ = (slot, tokens, slot_pages);
+                Ok(())
+            }
+            #[cfg(feature = "cuda")]
+            CudaExecutorInner::Real(real) => real.capture_finish_frontier(slot, tokens, slot_pages),
+        }
+    }
+
     fn save_prefix_sidecar(
         &mut self,
         slot: usize,

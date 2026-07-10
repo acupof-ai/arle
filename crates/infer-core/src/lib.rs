@@ -976,6 +976,20 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             .chain(request.generated_tokens.iter())
             .copied()
             .collect();
+        // Write the finish frontier (generated content + live carry at the exact
+        // finish position) through to the content-keyed prefix store while the
+        // slot's device state is still resident. BEFORE publish_prefix_blocks:
+        // it publishes PROVISIONAL entries that publish's save_prefix_sidecar
+        // confirm/repair then reconciles to the radix's canonical ids (the same
+        // path the prefill publish rides). Best-effort; default no-op (only DSv4
+        // under --dsv4-decode-reuse captures).
+        let slot_pages = self.kv.page_indices(slot).to_vec();
+        if let Err(err) = self
+            .executor
+            .capture_finish_frontier(slot, &full_tokens, &slot_pages)
+        {
+            log::warn!("finish frontier capture failed for slot {slot}: {err:#}");
+        }
         self.publish_prefix_blocks(slot, &full_tokens);
         // free_slot BEFORE release_reused_prefix: reclaim_page sees page_refs>0
         // and skips retained prefix pages; release_reused_prefix then drops the

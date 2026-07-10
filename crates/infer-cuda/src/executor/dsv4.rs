@@ -584,6 +584,99 @@ impl Dsv4CudaExecutor {
         }
     }
 
+    /// Finish write-through (`--dsv4-decode-reuse`): publish content-keyed pool
+    /// entries for the finished slot's whole sealed region + the frontier tail,
+    /// so a later turn restores to the EXACT finish position instead of flooring
+    /// at a page boundary. Runs at the finish sync point (graph-safe — the
+    /// decode-lane per-tick publish is a no-op under this flag). Publishes
+    /// PROVISIONAL onto the slot's own page ids exactly like the prefill publish;
+    /// the finish's `save_prefix_sidecar` confirm/repair (running right after)
+    /// reconciles them to the radix's canonical ids. Best-effort: a failure only
+    /// forfeits a future reuse, never the finish.
+    pub(crate) fn capture_finish_frontier(
+        &mut self,
+        slot: usize,
+        tokens: &[u32],
+        slot_pages: &[u32],
+    ) -> Result<()> {
+        if !crate::runtime_flags::dsv4_decode_reuse_enabled() || self.prefix_state.is_inactive() {
+            return Ok(());
+        }
+        let page_tokens = self.model.kv_arena.page_block_size;
+        if page_tokens == 0 {
+            return Ok(());
+        }
+        let finish_len = tokens.len().min(self.slots[slot].seq_len());
+        let sealed_pages = finish_len / page_tokens;
+        if sealed_pages == 0 {
+            return Ok(()); // < one page: no radix anchor to reuse
+        }
+        let matched_len = sealed_pages * page_tokens;
+        let index_head_dim = self.model.config.index_head_dim;
+        let frontier = sealed_pages - 1;
+        // Phase 1: enqueue D2H clones (stream-ordered, no sync). A content page
+        // the prefill publish already stored is skipped; the frontier is always
+        // (re)captured to attach its tail + carry at finish_len.
+        let mut captured: Vec<(u32, crate::attention::Dsv4PrefixPageEntry)> = Vec::new();
+        for page_index in 0..sealed_pages {
+            let Some(&page_id) = slot_pages.get(page_index) else {
+                warn!(
+                    "DSv4 finish frontier: slot {slot} page {page_index} outside host table ({} pages)",
+                    slot_pages.len()
+                );
+                return Ok(());
+            };
+            let is_frontier = page_index == frontier;
+            if !is_frontier && self.prefix_state.page_meta(page_id).is_some() {
+                continue;
+            }
+            let entry = if is_frontier {
+                self.slots[slot].capture_frontier_page(
+                    &self.model.ctx,
+                    &self.model.layers,
+                    &self.kv_adapter,
+                    index_head_dim,
+                    page_tokens,
+                    page_index,
+                    matched_len,
+                    finish_len,
+                )
+            } else {
+                self.slots[slot].capture_prefix_page(
+                    &self.model.ctx,
+                    &self.model.layers,
+                    &self.kv_adapter,
+                    index_head_dim,
+                    page_tokens,
+                    page_index,
+                    false,
+                )
+            };
+            match entry {
+                Ok(e) => captured.push((page_id, e)),
+                Err(err) => {
+                    warn!(
+                        "DSv4 finish frontier capture failed for slot {slot} page {page_index}: {err:#}"
+                    );
+                    return Ok(());
+                }
+            }
+        }
+        if captured.is_empty() {
+            return Ok(());
+        }
+        if let Err(err) = self.model.ctx.sync() {
+            warn!("DSv4 finish frontier sync failed for slot {slot}: {err:#}");
+            return Ok(());
+        }
+        for (page_id, entry) in captured {
+            if !self.prefix_state.publish(page_id, &entry, slot_pages) {
+                warn!("DSv4 finish frontier: pool refused host page {page_id} (slot {slot})");
+            }
+        }
+        Ok(())
+    }
+
     /// Radix evicted these host pages: drop their pool entries (the pool's
     /// lifetime rides the radix, no independent lifetime above the DRAM budget).
     pub(crate) fn release_prefix_pages(&mut self, pages: &[u32]) {
@@ -642,16 +735,20 @@ impl Dsv4CudaExecutor {
 
     /// Content-keyed reuse license (#154 Phase 2): a leading page is
     /// attachable only while every page before and including it has a pool
-    /// entry; the COMMIT point additionally requires the page to carry
-    /// boundary sections at a restore-alignment end. Pages between commit
-    /// points keep the scan alive without advancing it. Pool presence covers
-    /// host DRAM and disk alike — licensing never does capacity math.
+    /// entry; the COMMIT point additionally requires the page to carry the
+    /// carry (boundary) sections. Pages between commit points keep the scan
+    /// alive without advancing it. Pool presence covers host DRAM and disk
+    /// alike — licensing never does capacity math. Finish write-through
+    /// (`--dsv4-decode-reuse`) captures the carry at the exact finish position
+    /// (rides the frontier entry, not a ring boundary), so it commits at any
+    /// carry-bearing page; the default path keeps the `sliding_window` gate.
     pub(crate) fn reusable_prefix_blocks(&self, blocks: &[PrefixBlock]) -> usize {
         let page_tokens = self.model.kv_arena.page_block_size;
         if page_tokens == 0 {
             return 0;
         }
         let align = self.model.config.sliding_window.max(1);
+        let reuse = crate::runtime_flags::dsv4_decode_reuse_enabled();
         let mut committed = 0usize;
         for (idx, block) in blocks.iter().enumerate() {
             // Fail closed on demoted keys: DSv4 pages never demote through
@@ -663,7 +760,7 @@ impl Dsv4CudaExecutor {
                 break;
             };
             let page_end = (idx + 1) * page_tokens;
-            if meta.boundary && page_end.is_multiple_of(align) {
+            if meta.boundary && (reuse || page_end.is_multiple_of(align)) {
                 committed = idx + 1;
             }
         }
@@ -682,12 +779,16 @@ impl Dsv4CudaExecutor {
     /// host state first, so a missing/undecodable page aborts before any
     /// device byte moves; an `Err` propagates to the engine's fallback
     /// (free slot, full recompute) — never a partial restore.
+    /// Returns the EXTRA tokens restored beyond `matched_len` (`0` = restored
+    /// exactly the page-aligned match). Finish write-through (`--dsv4-decode-
+    /// reuse`) restores the sub-page tail carried on the last entry, so the slot
+    /// advances to the exact finish position and the engine prefills only past it.
     pub(crate) fn restore_prefix_state(
         &mut self,
         slot: usize,
         matched_len: usize,
         prefix_pages: &[u32],
-    ) -> Result<()> {
+    ) -> Result<usize> {
         ensure!(
             slot < self.num_slots,
             "DSv4 prefix restore slot {slot} outside executor slots {}",
@@ -695,14 +796,18 @@ impl Dsv4CudaExecutor {
         );
         let page_tokens = self.model.kv_arena.page_block_size;
         let align = self.model.config.sliding_window.max(1);
+        let reuse = crate::runtime_flags::dsv4_decode_reuse_enabled();
         ensure!(
             page_tokens > 0 && matched_len > 0,
             "DSv4 prefix restore needs a non-empty match (matched_len {matched_len})"
         );
         // D4 hard error: an unaligned match means the engine trim/clamp
         // ordering regressed — fail loud, never silently skip the ring restore.
+        // Finish write-through reuses at any page boundary (the ring alignment
+        // rides the frontier entry's captured carry, not `matched_len`), so it
+        // only requires page alignment.
         ensure!(
-            matched_len.is_multiple_of(align) && matched_len.is_multiple_of(page_tokens),
+            matched_len.is_multiple_of(page_tokens) && (reuse || matched_len.is_multiple_of(align)),
             "DSv4 prefix restore matched_len {matched_len} not aligned to ring {align} / page {page_tokens}"
         );
         ensure!(
@@ -714,8 +819,12 @@ impl Dsv4CudaExecutor {
             .iter()
             .map(|&page_id| self.prefix_state.read_entry(page_id))
             .collect::<Result<Vec<_>>>()?;
+        // The frontier entry carries the sub-page tail (0 unless a finish
+        // write-through landed off a page boundary) → the exact finish position.
+        let tail_len = entries.last().map_or(0, |e| e.finish_tail_len as usize);
+        let finish_len = matched_len + tail_len;
         self.kv_adapter
-            .mirror_full_band(&self.model.ctx, slot, matched_len)?;
+            .mirror_full_band(&self.model.ctx, slot, finish_len)?;
         // A17: a restored occupant enters Decoding without a tail warm step
         // for its MTP chain; stale spec state belongs to the prior occupant.
         self.spec_slots[slot] = Dsv4SpecSlotState::default();
@@ -726,8 +835,10 @@ impl Dsv4CudaExecutor {
             self.model.config.index_head_dim,
             &entries,
             matched_len,
+            finish_len,
             page_tokens,
-        )
+        )?;
+        Ok(tail_len)
     }
 
     /// `BackendExecutor::tp_sync_min` — see there for why the scheduler needs
@@ -910,10 +1021,15 @@ impl Dsv4CudaExecutor {
         kv_batch: &KvBatchDescriptor,
     ) -> Result<Vec<SlotToken>> {
         let out = self.forward_decode_batch_inner(rows, kv_batch)?;
-        for (row, kv_row) in rows.iter().zip(&kv_batch.rows) {
-            let slot_pages = &kv_batch.flat_slot_page_ids[kv_row.slot_page_range.clone()];
-            let end_pos = self.slots[row.slot].seq_len();
-            self.publish_completed_prefix_pages(row.slot, slot_pages, row.kv_seq_len, end_pos);
+        // Finish write-through owns the decode region: the per-tick publish is a
+        // D2H+sync (graph-incompatible), so under --dsv4-decode-reuse it's a
+        // no-op and the whole generated region is captured once at finish.
+        if !crate::runtime_flags::dsv4_decode_reuse_enabled() {
+            for (row, kv_row) in rows.iter().zip(&kv_batch.rows) {
+                let slot_pages = &kv_batch.flat_slot_page_ids[kv_row.slot_page_range.clone()];
+                let end_pos = self.slots[row.slot].seq_len();
+                self.publish_completed_prefix_pages(row.slot, slot_pages, row.kv_seq_len, end_pos);
+            }
         }
         Ok(out)
     }

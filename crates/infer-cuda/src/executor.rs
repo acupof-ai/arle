@@ -486,10 +486,28 @@ impl RealCudaExecutor {
             Self::Qwen35(q) => q
                 .restore_recurrent_sidecar(slot, tokens, matched_len, prefix_pages)
                 .map(|()| 0),
-            Self::Dsv4(d) => d
-                .restore_prefix_state(slot, matched_len, prefix_pages)
-                .map(|()| 0),
+            Self::Dsv4(d) => d.restore_prefix_state(slot, matched_len, prefix_pages),
             Self::Qwen(_) => Ok(0),
+        }
+    }
+
+    /// Write the finishing slot's full frontier state through to the content-keyed
+    /// prefix store (DSv4 finish-write-through, behind `--dsv4-decode-reuse`);
+    /// no-op for the other backends. `slot_pages` is the slot's OWN host page
+    /// chain (the pool keys entries by these ids, reconciled to the radix's
+    /// canonical ids by the subsequent `save_prefix_sidecar` confirm/repair).
+    pub(crate) fn capture_finish_frontier(
+        &mut self,
+        slot: usize,
+        tokens: &[u32],
+        slot_pages: &[u32],
+    ) -> Result<()> {
+        match self {
+            Self::Dsv4(d) => d.capture_finish_frontier(slot, tokens, slot_pages),
+            Self::Qwen(_) | Self::Qwen35(_) => {
+                let _ = (slot, tokens, slot_pages);
+                Ok(())
+            }
         }
     }
 
