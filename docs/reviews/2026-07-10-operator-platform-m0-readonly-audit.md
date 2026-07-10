@@ -4,9 +4,10 @@ Date: 2026-07-10
 
 ## Verdict
 
-The ideal operator-platform direction is licensed for planning, not yet for M1
-implementation. Static inventory and existing build/runtime evidence confirm the
-structural problem, but canonical GPU measurements remain incomplete because the
+The evidence licenses a scope-reduced vertical slice, not a global operator
+platform. Static inventory confirms the truth/engagement problem, while current
+build and artifact sizes do not justify OCI, a build farm, or an all-at-once
+registry migration. Canonical GPU measurements remain incomplete because the
 local and pod source trees are not at the same commit.
 
 The first implementation target should be the evidence plumbing and the exact
@@ -54,8 +55,11 @@ commit on both hosts plus binary symbol verification.
 
 ### FFI
 
-There are 312 CUDA FFI declarations, not 313. The earlier count included the
-ordinary Rust helper `ffi/nccl.rs::check`.
+There are 312 checked-in handwritten CUDA FFI declarations, not 313. The earlier
+count included the ordinary Rust helper `ffi/nccl.rs::check`. The generated
+TileLang include contributes 39 more declarations, so the declared Rust FFI
+surface is 351 for the inspected build shape. Final authority remains the
+lane-specific generated file plus archive/link evidence.
 
 | Domain | Declarations |
 | --- | ---: |
@@ -145,10 +149,14 @@ Static reachability:
 
 - eight HD128/KV8 BF16 rows are reachable by default through
   `infer-cuda/src/attention.rs:874-920`;
+- six legacy GDR rows are conditionally called by
+  `autograd/src/backend_cuda.rs:3913-4075` under the chunkwise-prefill and short
+  sequence gates;
 - three FlashQLA rows are reachable only with the build gate, sm90, the default
   false runtime option, and the required recurrent shape
   (`build.rs:1415-1437`, `qwen35.rs:5791-5880`);
-- 37 rows have no current runtime resolver path.
+- 31 rows have no current runtime caller: 12 BF16 HD64/HD256, eight split, and
+  11 FP8 rows.
 
 This is source evidence only. Runtime counters per product lane must prove
 engagement or non-engagement before deletion.
@@ -386,7 +394,7 @@ strings producer*/libkernels_cuda.a | rg '/(workspace|home|tmp|usr/local/cuda)'
 ## Remaining uncertainty
 
 - No CUDA archive was available locally for `nm` or linker-map validation.
-- No model ran during this audit; TileLang 8+3 reachability is static.
+- No model ran during this audit; TileLang 8+6+3 reachability is static.
 - No cold DeepGEMM cache was traced.
 - No source-aligned pod build was run because local and pod commits differ and
   both trees contain unrelated/concurrent work.
