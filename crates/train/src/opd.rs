@@ -3057,17 +3057,14 @@ pub fn masked_writeback_ce_step<O: Optimizer>(
     }
 
     let mut tape = Tape::new();
-    // Offload per-layer grad-checkpoints to host RAM during the (single)
-    // long-trajectory forward (re-fetched on backward) so it doesn't pin ~30 GB.
-    // Default ON (long agentic trajectories need it to fit). The H2D re-upload is
-    // serialized on the host thread and starves the GPU (gdb: the writeback's host
-    // wall is `cuMemcpyHtoDAsync`), so for SHORT sequences that already fit
-    // resident, set `--writeback-offload false` to keep checkpoints on-device
-    // and run fully GPU-bound. errors/2026-06-28-agent-opd-writeback-host-bound-is-checkpoint-offload-htod-not-host-ce.
-    let offload_checkpoints = crate::runtime_flags::writeback_offload();
+    // Offload per-layer grad-checkpoints to host RAM only past a length that needs
+    // it: the H2D re-upload serializes on the host thread and starves the GPU on
+    // short trajectories, but resident checkpoints OOM the allocator on long ones.
+    // Seq-adaptive gate + rationale + anchors: `writeback_offload_for_seq`.
+    let offload_checkpoints = crate::runtime_flags::writeback_offload_for_seq(seq_len);
     tape.set_offload_checkpoints(offload_checkpoints);
     tape.set_enabled(true);
-    eprintln!("[masked-writeback] offload_checkpoints={offload_checkpoints}");
+    eprintln!("[masked-writeback] offload_checkpoints={offload_checkpoints} seq_len={seq_len}");
     let keep_extra: HashSet<TensorId> = HashSet::new();
     eprintln!(
         "[masked-writeback] seq_len={seq_len} total_targets={total_targets} chunk_rows={chunk_rows}"
@@ -3217,7 +3214,7 @@ pub fn masked_writeback_ce_step_frozen_prompt_kv<O: Optimizer>(
     }
 
     let mut tape = Tape::new();
-    let offload_checkpoints = crate::runtime_flags::writeback_offload();
+    let offload_checkpoints = crate::runtime_flags::writeback_offload_for_seq(seq_len);
     tape.set_offload_checkpoints(offload_checkpoints);
     tape.set_enabled(true);
     eprintln!("[masked-writeback-frozen] offload_checkpoints={offload_checkpoints}");
@@ -3471,7 +3468,7 @@ pub fn gkd_writeback_step<O: Optimizer, T: TeacherForward + ?Sized>(
     let windows = masked_gkd_windows(&masked_positions, window_size);
 
     let mut tape = Tape::new();
-    let offload_checkpoints = crate::runtime_flags::writeback_offload();
+    let offload_checkpoints = crate::runtime_flags::writeback_offload_for_seq(seq_len);
     tape.set_offload_checkpoints(offload_checkpoints);
     tape.set_enabled(true);
     // Retain the teacher's params across the post-backward `retain_ids` prune:
