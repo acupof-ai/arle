@@ -1919,8 +1919,10 @@ mod testing {
         }
     }
 
-    /// `(prefix_pages, newly_cached)` recorded per `save_prefix_sidecar` call.
-    pub(super) type SidecarSaves = std::rc::Rc<std::cell::RefCell<Vec<(Vec<u32>, Vec<u32>)>>>;
+    /// `(prefix_pages, slot_pages, newly_cached)` recorded per
+    /// `save_prefix_sidecar` call.
+    pub(super) type SidecarSaves =
+        std::rc::Rc<std::cell::RefCell<Vec<(Vec<u32>, Vec<u32>, Vec<u32>)>>>;
 
     /// Hybrid-sidecar mirror for the #155 lifetime bug: `restore_prefix_sidecar`
     /// always MISSES (the engine falls back to full recompute), and every
@@ -1972,11 +1974,14 @@ mod testing {
             _tokens: &[u32],
             _matched_len: usize,
             prefix_pages: &[u32],
+            slot_pages: &[u32],
             newly_cached: &[u32],
         ) -> Result<()> {
-            self.saves
-                .borrow_mut()
-                .push((prefix_pages.to_vec(), newly_cached.to_vec()));
+            self.saves.borrow_mut().push((
+                prefix_pages.to_vec(),
+                slot_pages.to_vec(),
+                newly_cached.to_vec(),
+            ));
             Ok(())
         }
     }
@@ -4349,7 +4354,7 @@ mod tests {
             !saves.is_empty(),
             "resend must still re-publish the sidecar"
         );
-        for (prefix_pages, newly_cached) in saves.iter() {
+        for (prefix_pages, slot_pages, newly_cached) in saves.iter() {
             assert!(
                 newly_cached.is_empty(),
                 "resend publishes must fully dedupe, got {newly_cached:?}"
@@ -4361,7 +4366,60 @@ mod tests {
                  chain — those pages free at finish, so the blob's lifetime \
                  no longer rides the radix (#155)"
             );
+            // #157 repair plumbing: the save also carries the slot's OWN chain
+            // position-aligned with the canonical one, so a backend can adopt
+            // the recomputed entry where a canonical pool entry evicted.
+            assert_eq!(
+                slot_pages.len(),
+                prefix_pages.len(),
+                "slot chain must be position-aligned with the canonical chain"
+            );
         }
+        Ok(())
+    }
+
+    /// #157 H2: a preempted decode must seal prompt+GENERATED (the finish
+    /// boundary), not prompt-only — otherwise every generated page drops as a
+    /// provisional backend entry at the free and the whole generated region
+    /// recomputes on resume / follow-up turns.
+    #[test]
+    fn requeue_publishes_generated_pages() -> Result<()> {
+        let mut engine = Engine::with_config(
+            MockExecutor::ready(),
+            MockKvPool::with_capacity(1, 4, 16),
+            test_config(1),
+        );
+        let prompt: Vec<u32> = (1..=8).collect();
+        let handle = engine.submit_request(prompt, 8);
+        // Step until 5 tokens committed: KV holds 12 tokens = 3 sealed blocks.
+        for _ in 0..16 {
+            engine.step()?;
+            let generated = engine
+                .active
+                .values()
+                .find(|r| r.handle == handle)
+                .map_or(0, |r| r.generated_tokens.len());
+            if generated == 5 {
+                break;
+            }
+        }
+        let (&slot, request) = engine
+            .active
+            .iter()
+            .find(|(_, r)| r.handle == handle)
+            .expect("victim still active");
+        assert_eq!(request.generated_tokens.len(), 5);
+        engine.requeue_preempted_decode(slot);
+        let committed: Vec<u32> = (1..=12).collect();
+        assert_eq!(
+            engine
+                .radix
+                .peek_longest_prefix_match(&committed)
+                .block_ids
+                .len(),
+            3,
+            "requeue sealed the committed sequence through the generated region"
+        );
         Ok(())
     }
 

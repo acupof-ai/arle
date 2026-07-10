@@ -781,17 +781,30 @@ impl BackendExecutor for CudaExecutor {
         tokens: &[u32],
         matched_len: usize,
         prefix_pages: &[u32],
+        slot_pages: &[u32],
         newly_cached: &[u32],
     ) -> anyhow::Result<()> {
         match &mut self.inner {
             CudaExecutorInner::Placeholder => {
-                let _ = (slot, tokens, matched_len, prefix_pages, newly_cached);
+                let _ = (
+                    slot,
+                    tokens,
+                    matched_len,
+                    prefix_pages,
+                    slot_pages,
+                    newly_cached,
+                );
                 Ok(())
             }
             #[cfg(feature = "cuda")]
-            CudaExecutorInner::Real(real) => {
-                real.save_prefix_sidecar(slot, tokens, matched_len, prefix_pages, newly_cached)
-            }
+            CudaExecutorInner::Real(real) => real.save_prefix_sidecar(
+                slot,
+                tokens,
+                matched_len,
+                prefix_pages,
+                slot_pages,
+                newly_cached,
+            ),
         }
     }
 

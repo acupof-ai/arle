@@ -214,10 +214,21 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         // the plain recompute path.
         let mut slot_swap_key = None;
         let demoted_seq_len = self.kv.seq_len(slot);
+        // The full COMMITTED sequence — the same boundary finish_slot
+        // publishes. Prompt-only publish dropped every generated page's
+        // provisional backend entry at the free below, so resume / follow-up
+        // turns recomputed the whole generated region instead of attaching
+        // through it.
+        let committed_tokens: Vec<u32> = request
+            .prompt_tokens
+            .iter()
+            .chain(request.generated_tokens.iter())
+            .copied()
+            .collect();
         if self.kv_tier_capacity() > 0 {
             // Publish ensures radix + sidecar are captured (idempotent for
-            // already-cached prompts — returns empty in that case).
-            let _ = self.publish_prefix_blocks(slot, &request.prompt_tokens);
+            // already-cached blocks — returns empty in that case).
+            let _ = self.publish_prefix_blocks(slot, &committed_tokens);
         } else if self.executor.kv_slot_tier_enabled()
             && matches!(request.phase, RequestPhase::Decoding)
             && demoted_seq_len > 0
@@ -235,14 +246,20 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                     log::warn!("whole-slot KV demote failed for slot {slot}: {err:#}");
                 }
             }
+        } else {
+            // Plain-recompute arms (e.g. DSv4 #154 2b — pool entries are the
+            // demotion, device bands free via release_kv_slot): seal the
+            // committed sequence so generated pages enter the radix and their
+            // backend entries confirm BEFORE free_slot_pages drops them.
+            let _ = self.publish_prefix_blocks(slot, &committed_tokens);
         }
         // free_slot before release_reused_prefix — same ordering fix as finish_slot.
         self.free_slot_pages(slot);
         self.release_reused_prefix(&request.reused_prefix_pages);
-        // Demote cached prompt pages to tier (includes already-cached ones from
-        // the normal step() publish, not just newly-published above).
+        // Demote the cached committed chain to tier (includes already-cached
+        // blocks from the normal step() publish, not just newly-published above).
         if self.kv_tier_capacity() > 0 {
-            let matched = self.radix.peek_longest_prefix_match(&request.prompt_tokens);
+            let matched = self.radix.peek_longest_prefix_match(&committed_tokens);
             if !matched.block_ids.is_empty() {
                 self.demote_published_pages(&matched.block_ids);
             }
