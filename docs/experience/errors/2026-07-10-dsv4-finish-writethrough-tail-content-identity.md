@@ -37,14 +37,17 @@ the one invariant the radix does not cover.
 Guard the tail on content identity (store it, verify it), + two smaller wires:
 1. **Tail token ids**: the pool entry stores the tail token ids `[matched_len,
    finish_len)`.
-2. **Restore guard**: reuse the tail ONLY if `prompt_len >= finish_len` AND
-   `prompt[matched_len..finish_len] == entry.tail_tokens`. Full match → restore
-   to `finish_len`, return `extra = tail_len`. Otherwise return `extra = 0`
-   (the entry does not apply to this request; normal page-aligned reuse stands).
-   This makes the crash case (shorter/divergent prompt) fall back to
-   `extra = 0` ⇒ `seq_len = matched_len = append_pos`.
-3. **env attr** on `--dsv4-decode-reuse` (`args.rs:838`) so
-   `ARLE_DSV4_DECODE_REUSE=1` engages it.
+2. **Restore + admission guard**: reuse the tail ONLY if `prompt_len >=
+   finish_len` AND `prompt[matched_len..finish_len] == entry.tail_tokens`. Full
+   match → restore to `finish_len`, return `extra = tail_len`. Otherwise the
+   frontier page is not committed: `committed` drops to the last verified
+   boundary at/below `matched_len` (the last prompt-side boundary — NOT
+   necessarily `matched_len` itself, since the intra-decode-region pages carry
+   `boundary=false`), `extra = 0`, and the slot restores to that page-aligned
+   length ⇒ `seq_len <= matched_len = append_pos`. Never over-restores → the
+   crash (`seq_len > append_pos`) is unreachable.
+3. **CLI flag** `--dsv4-decode-reuse true` engages it (CLI-only per
+   §runtime-config-CLI-flags; the env var is intentionally NOT wired).
 
 ## Rule
 
