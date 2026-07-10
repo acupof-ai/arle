@@ -1,0 +1,29 @@
+crates/infer-core/src/planner.rs
+  s_3d949abe53b900::t_56638f441244a7 252-254
+crates/infer-cuda/src/attention/kv_layout.rs
+  s_3d949abe53b900::t_6c804e1db3ae3e 476-483,584,789,927-930,958,1103-1105,1107-1109
+crates/infer-cuda/src/attention/prefix_state.rs
+  s_3d949abe53b900::t_9cd784572652ee 326-333,341,424,428,871,907-908,913,919-943,953,958,965,969
+crates/infer-cuda/src/executor.rs
+  s_3d949abe53b900::t_b2ac5f09e249fa 545-548,798,2437,2577,2841-2845,2847-2849,3533-3538,3634,4867-4870,4874-4877
+docs/experience/errors/2026-07-10-dsv4-prefix-reuse-identity-fix-was-noop-and-v32-hazard.md
+  s_3d949abe53b900::t_d61f6614564cc4 1-44
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "4ad32362e3e2f2c45198779e22610550b50cf950",
+  "prompts": {},
+  "sessions": {
+    "s_3d949abe53b900": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "92f2c43c-22c8-4f1d-8b27-d06d6f3c59ad",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
