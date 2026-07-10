@@ -1,0 +1,33 @@
+crates/infer-cuda/src/executor.rs
+  s_9ef059a5bbb199::t_5bb9069e75245b 359-364
+crates/infer-cuda/src/lib.rs
+  s_9ef059a5bbb199::t_9cf7b0fc8eaa0b 591-598
+crates/infer-cuda/src/ops.rs
+  s_9ef059a5bbb199::t_5c30b56f611440 15
+crates/infer-cuda/src/ops/quant_linear.rs
+  s_9ef059a5bbb199::t_83de6e5efc0b22 10,54-144,597,605-606,698-699,796-797
+docs/experience/wins/2026-07-10-operator-evidence-vertical-slice.md
+  s_9ef059a5bbb199::t_9e4ad6219bb77f 3-8,60-63,82,85-87
+operators/registry.toml
+  s_9ef059a5bbb199::t_f523d4fc23c59a 4-5,10,12-15,18,20-22,25-32,41-42
+scripts/run_fp8_probe.sh
+  s_9ef059a5bbb199::t_b1f0130090bf4c 1-73
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "e28c5c02417bf8764310c1831c338e1c4b7eeb2b",
+  "prompts": {},
+  "sessions": {
+    "s_9ef059a5bbb199": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0b4e7f58-825f-4410-ad74-7dd92c504bd3",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
