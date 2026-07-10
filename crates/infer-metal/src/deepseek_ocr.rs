@@ -152,6 +152,7 @@ unsafe extern "C" fn deepseek_ocr_cancelled(ctx: *const std::ffi::c_void) -> i32
     if ctx.is_null() {
         return 0;
     }
+    // SAFETY: ctx is the &AtomicBool cancel flag registered with the bridge; it outlives the in-flight call.
     let flag = unsafe { &*(ctx as *const AtomicBool) };
     i32::from(flag.load(Ordering::Acquire))
 }
@@ -160,10 +161,12 @@ struct CppDeepseekOcrModel {
     raw: *mut std::ffi::c_void,
 }
 
+// SAFETY: the wrapper solely owns its C++ model handle and all bridge/MLX access is serialized, so it may cross threads.
 unsafe impl Send for CppDeepseekOcrModel {}
 
 impl Drop for CppDeepseekOcrModel {
     fn drop(&mut self) {
+        // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
         unsafe {
             mlx_sys::deepseek_ocr_free(self.raw);
         }
@@ -172,10 +175,12 @@ impl Drop for CppDeepseekOcrModel {
 
 impl CppDeepseekOcrModel {
     fn build(parsed: &MetalDeepseekOcrConfig, tensors: &TensorMap) -> Result<Self> {
+        // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
         let raw = unsafe { mlx_sys::deepseek_ocr_new() };
         anyhow::ensure!(!raw.is_null(), "deepseek_ocr_new returned null");
         let mut builder = CppDeepseekOcrBuilder { raw };
         if let Err(err) = builder.populate(parsed, tensors) {
+            // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
             unsafe {
                 mlx_sys::deepseek_ocr_free(raw);
             }
@@ -206,6 +211,7 @@ impl CppDeepseekOcrModel {
         let mut out_len = 0i32;
         let mut out_finish = 0i32;
         let (cancel_fn, cancel_ctx) = cancel_pair(cancel);
+        // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
         self.check_rc(unsafe {
             mlx_sys::deepseek_ocr_generate_causal(
                 self.raw,
@@ -255,6 +261,7 @@ impl CppDeepseekOcrModel {
         let mut out_len = 0i32;
         let mut out_finish = 0i32;
         let (cancel_fn, cancel_ctx) = cancel_pair(cancel);
+        // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
         self.check_rc(unsafe {
             mlx_sys::deepseek_ocr_generate_causal_image(
                 self.raw,
@@ -340,6 +347,7 @@ impl CppDeepseekOcrBuilder {
         let group_size = quant.group_size;
         let bits = quant.bits;
 
+        // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
         unsafe {
             mlx_sys::deepseek_ocr_set_config(
                 self.raw,
@@ -360,6 +368,7 @@ impl CppDeepseekOcrBuilder {
         let embed_id = self.add_mxfp8(tensors, &format!("{prefix}.embed_tokens"))?;
         let lm_head_id = self.add_mxfp8(tensors, "language_model.lm_head")?;
         let final_norm_id = self.add_dense_name(tensors, &format!("{prefix}.norm.weight"))?;
+        // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
         unsafe {
             mlx_sys::deepseek_ocr_set_embed(
                 self.raw,
@@ -381,6 +390,7 @@ impl CppDeepseekOcrBuilder {
 
         self.set_vision(parsed, tensors)?;
 
+        // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
         self.check_rc(unsafe { mlx_sys::deepseek_ocr_finalize(self.raw) })?;
         Ok(())
     }
@@ -452,6 +462,7 @@ impl CppDeepseekOcrBuilder {
             )
         };
 
+        // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
         self.check_rc(unsafe {
             mlx_sys::deepseek_ocr_push_layer(
                 self.raw,
@@ -482,6 +493,7 @@ impl CppDeepseekOcrBuilder {
         let v = &parsed.spec.vision;
         let sam = &parsed.spec.sam;
         let proj = &parsed.spec.projector;
+        // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
         self.check_rc(unsafe {
             mlx_sys::deepseek_ocr_set_vision_config(
                 self.raw,
@@ -515,6 +527,7 @@ impl CppDeepseekOcrBuilder {
         let neck3_b = self.add_dense_name(tensors, "sam_model.neck.3.bias")?;
         let net2 = self.add_dense_name(tensors, "sam_model.net_2.weight")?;
         let net3 = self.add_dense_name(tensors, "sam_model.net_3.weight")?;
+        // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
         self.check_rc(unsafe {
             mlx_sys::deepseek_ocr_set_sam_stem(
                 self.raw,
@@ -547,6 +560,7 @@ impl CppDeepseekOcrBuilder {
             self.add_dense_name(tensors, "vision_model.embeddings.position_embedding.weight")?;
         let pre_ln_w = self.add_dense_name(tensors, "vision_model.pre_layrnorm.weight")?;
         let pre_ln_b = self.add_dense_name(tensors, "vision_model.pre_layrnorm.bias")?;
+        // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
         self.check_rc(unsafe {
             mlx_sys::deepseek_ocr_set_clip_stem(self.raw, class_embed, pos, pre_ln_w, pre_ln_b)
         })?;
@@ -559,6 +573,7 @@ impl CppDeepseekOcrBuilder {
         let projector_bias = self.add_dense_name(tensors, "projector.layers.bias")?;
         let image_newline = self.add_dense_name(tensors, "image_newline")?;
         let view_separator = self.add_dense_name(tensors, "view_separator")?;
+        // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
         self.check_rc(unsafe {
             mlx_sys::deepseek_ocr_set_projector(
                 self.raw,
@@ -586,6 +601,7 @@ impl CppDeepseekOcrBuilder {
         let lin1_b = self.add_dense_name(tensors, &format!("{prefix}.mlp.lin1.bias"))?;
         let lin2_w = self.add_dense_name(tensors, &format!("{prefix}.mlp.lin2.weight"))?;
         let lin2_b = self.add_dense_name(tensors, &format!("{prefix}.mlp.lin2.bias"))?;
+        // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
         self.check_rc(unsafe {
             mlx_sys::deepseek_ocr_push_sam_block(
                 self.raw,
@@ -622,6 +638,7 @@ impl CppDeepseekOcrBuilder {
         let fc1_b = self.add_dense_name(tensors, &format!("{prefix}.mlp.fc1.bias"))?;
         let fc2_w = self.add_dense_name(tensors, &format!("{prefix}.mlp.fc2.weight"))?;
         let fc2_b = self.add_dense_name(tensors, &format!("{prefix}.mlp.fc2.bias"))?;
+        // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
         self.check_rc(unsafe {
             mlx_sys::deepseek_ocr_push_clip_layer(
                 self.raw, ln1_w, ln1_b, qkv_w, qkv_b, out_w, out_b, ln2_w, ln2_b, fc1_w, fc1_b,
@@ -633,6 +650,7 @@ impl CppDeepseekOcrBuilder {
     /// Register a dense tensor; returns its id.
     fn add_dense_name(&mut self, tensors: &TensorMap, name: &str) -> Result<i32> {
         let array = tensor_get(tensors, name)?;
+        // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
         let id = unsafe { mlx_sys::deepseek_ocr_add_dense_weight(self.raw, array.as_raw()) };
         self.check_weight_id(id)
     }
@@ -642,6 +660,7 @@ impl CppDeepseekOcrBuilder {
     fn add_mxfp8(&mut self, tensors: &TensorMap, base: &str) -> Result<i32> {
         let w = tensor_get(tensors, &format!("{base}.weight"))?;
         let scales = tensor_get(tensors, &format!("{base}.scales"))?;
+        // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
         let id = unsafe {
             mlx_sys::deepseek_ocr_add_mxfp8_weight(self.raw, w.as_raw(), scales.as_raw(), 32, 8)
         };

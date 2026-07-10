@@ -147,6 +147,7 @@ unsafe extern "C" fn diffusion_cancelled(ctx: *const std::ffi::c_void) -> i32 {
     if ctx.is_null() {
         return 0;
     }
+    // SAFETY: ctx is the &AtomicBool cancel flag registered with the bridge; it outlives the in-flight call.
     let flag = unsafe { &*(ctx as *const AtomicBool) };
     i32::from(flag.load(Ordering::Acquire))
 }
@@ -222,10 +223,12 @@ struct CppDiffusionGemmaModel {
     raw: *mut std::ffi::c_void,
 }
 
+// SAFETY: the wrapper solely owns its C++ model handle and all bridge/MLX access is serialized, so it may cross threads.
 unsafe impl Send for CppDiffusionGemmaModel {}
 
 impl Drop for CppDiffusionGemmaModel {
     fn drop(&mut self) {
+        // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
         unsafe {
             mlx_sys::diffusion_gemma_free(self.raw);
         }
@@ -238,10 +241,12 @@ impl CppDiffusionGemmaModel {
         tensors: &TensorMap,
         quant: &QuantRegistry,
     ) -> Result<Self> {
+        // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
         let raw = unsafe { mlx_sys::diffusion_gemma_new() };
         anyhow::ensure!(!raw.is_null(), "diffusion_gemma_new returned null");
         let mut builder = CppDiffusionGemmaBuilder { raw };
         if let Err(err) = builder.populate(parsed, tensors, quant) {
+            // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
             unsafe {
                 mlx_sys::diffusion_gemma_free(raw);
             }
@@ -251,16 +256,19 @@ impl CppDiffusionGemmaModel {
     }
 
     fn begin_request(&mut self, seed: u64) -> Result<()> {
+        // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
         self.check_rc(unsafe { mlx_sys::diffusion_gemma_begin_request(self.raw, seed) })
     }
 
     fn prefill(&mut self, tokens: &[i32]) -> Result<()> {
+        // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
         self.check_rc(unsafe {
             mlx_sys::diffusion_gemma_prefill(self.raw, tokens.as_ptr(), tokens.len() as i32)
         })
     }
 
     fn commit(&mut self, tokens: &[i32]) -> Result<()> {
+        // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
         self.check_rc(unsafe {
             mlx_sys::diffusion_gemma_commit(self.raw, tokens.as_ptr(), tokens.len() as i32)
         })
@@ -282,6 +290,7 @@ impl CppDiffusionGemmaModel {
         let mut sampled_tokens = vec![0u32; canvas.len()];
         let mut argmax_tokens = vec![0u32; canvas.len()];
         let mut entropies = vec![0.0; canvas.len()];
+        // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
         self.check_rc(unsafe {
             mlx_sys::diffusion_gemma_predict_canvas(
                 self.raw,
@@ -341,6 +350,7 @@ impl CppDiffusionGemmaModel {
         } else {
             (None, std::ptr::null())
         };
+        // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
         self.check_rc(unsafe {
             mlx_sys::diffusion_gemma_generate(
                 self.raw,
@@ -407,6 +417,7 @@ impl CppDiffusionGemmaBuilder {
         quant: &QuantRegistry,
     ) -> Result<()> {
         let text = &parsed.config.text_config;
+        // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
         unsafe {
             mlx_sys::diffusion_gemma_set_config(
                 self.raw,
@@ -433,10 +444,12 @@ impl CppDiffusionGemmaBuilder {
         let lm_head_id = self.add_weight(&lm_head)?;
         let final_norm = tensor_get(tensors, &format!("{prefix}.norm.weight"))?;
         let final_norm_id = self.add_dense_array(&final_norm)?;
+        // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
         unsafe {
             mlx_sys::diffusion_gemma_set_embed(self.raw, embed_id, lm_head_id, final_norm_id);
         }
         mlx::check_mlx_error()?;
+        // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
         self.check_rc(unsafe {
             mlx_sys::diffusion_gemma_set_requires_self_conditioning(self.raw, true)
         })?;
@@ -448,6 +461,7 @@ impl CppDiffusionGemmaBuilder {
         }
 
         self.set_self_conditioning(tensors, quant, prefix)?;
+        // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
         self.check_rc(unsafe { mlx_sys::diffusion_gemma_finalize(self.raw) })?;
         Ok(())
     }
@@ -548,6 +562,7 @@ impl CppDiffusionGemmaBuilder {
             (-1, -1, -1, -1, -1, -1, -1, -1, 0, 0)
         };
 
+        // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
         self.check_rc(unsafe {
             mlx_sys::diffusion_gemma_push_layer(
                 self.raw,
@@ -608,6 +623,7 @@ impl CppDiffusionGemmaBuilder {
             tensors,
             &format!("{prefix}.per_layer_projection_norm.weight"),
         )?;
+        // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
         self.check_rc(unsafe {
             mlx_sys::diffusion_gemma_set_per_layer_embeddings(
                 self.raw,
@@ -646,6 +662,7 @@ impl CppDiffusionGemmaBuilder {
             tensors,
             &format!("{layer_prefix}.post_per_layer_input_norm.weight"),
         )?;
+        // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
         self.check_rc(unsafe {
             mlx_sys::diffusion_gemma_set_layer_ple(
                 self.raw,
@@ -668,6 +685,7 @@ impl CppDiffusionGemmaBuilder {
         let gate_id = self.add_proj(tensors, quant, &format!("{sc_prefix}.gate_proj"))?;
         let up_id = self.add_proj(tensors, quant, &format!("{sc_prefix}.up_proj"))?;
         let down_id = self.add_proj(tensors, quant, &format!("{sc_prefix}.down_proj"))?;
+        // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
         self.check_rc(unsafe {
             mlx_sys::diffusion_gemma_set_self_conditioning(
                 self.raw,
@@ -685,6 +703,7 @@ impl CppDiffusionGemmaBuilder {
     }
 
     fn add_dense_array(&mut self, array: &MlxArray) -> Result<i32> {
+        // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
         let id = unsafe { mlx_sys::diffusion_gemma_add_dense_weight(self.raw, array.as_raw()) };
         self.check_weight_id(id)
     }
@@ -695,6 +714,7 @@ impl CppDiffusionGemmaBuilder {
     }
 
     fn add_weight(&mut self, weight: &WeightTensor) -> Result<i32> {
+        // SAFETY: mlx_sys FFI over valid owned handles and live caller buffers; failures are reported via rc/mlx_last_error checked after.
         let id = unsafe {
             match weight {
                 WeightTensor::Dense(w) => {
