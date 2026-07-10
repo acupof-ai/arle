@@ -1,0 +1,25 @@
+crates/cuda-kernels/csrc/gemm/quantized_gemv.cu
+  s_1112c7217a3966::t_64570ada48a292 808-862,2679-2689
+crates/cuda-kernels/src/ffi/gemm.rs
+  s_1112c7217a3966::t_5521510141ab0a 272-282
+crates/infer-cuda/examples/fp8_smallm_gemm_probe.rs
+  s_1112c7217a3966::t_11a1683c811ccb 129-141,172-197
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "ce288ea176a84100ecc13a00040a660f00206671",
+  "prompts": {},
+  "sessions": {
+    "s_1112c7217a3966": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aa6b28f3141cd606e",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
