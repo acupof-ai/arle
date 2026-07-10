@@ -25,6 +25,12 @@ lifecycle & progress spine).
 
 ### Verdicts
 
+- **2026-07-10 — DSv4 Route A prefix reuse: LICENSED (identity formula fix)**:
+  `prepare_kv_batch` and `mirror_full_band` hardcoded `slot*lsp + i` instead of
+  using engine-provided `slot_pages[i]`. Fixed in 2 files (+10/-14 LOC).
+  Verified: 89.7% prefix hit rate, 3.3× cold→hot speedup, 15/15 needle exact
+  (sequential 500–4000 tok), 8/8 concurrent same-prompt, 0 errors.
+  [wins](docs/experience/wins/2026-07-10-dsv4-prefix-reuse-identity-fix.md)
 - **2026-07-10 — Qwen FP8 small-M dense GEMM: DeepGEMM from M=2 LICENSED;
   M=1 GEMV variants KILLED**: measured crossover (DeepGEMM flat 47.5–57.8 µs
   in M vs ~linear GEMV) moves `QWEN_FP8_DEEPGEMM_DENSE_MIN_M` 16→2 — matched
