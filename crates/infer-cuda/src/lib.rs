@@ -44,10 +44,6 @@ pub mod graph;
 // Not cuda-gated: pure host math, CPU-testable without nvcc.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 mod paged_kv_table;
-// Not cuda-gated: pure host two-level (RAM + kv-native-sys disk) store for
-// demoted prefix-KV pages, CPU-testable without nvcc.
-#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-mod kv_tier;
 // Not cuda-gated under the explicit `no-cuda` feature: host-only resident
 // weight-quant checkpoint ABI detection and numeric codecs.
 #[cfg(any(feature = "cuda", feature = "no-cuda"))]
@@ -116,7 +112,7 @@ pub use executor::set_decode_graph_default;
 /// Tier budget resolution: machine-derived disk budget when `--kv-disk` has no
 /// `--kv-disk-limit` (probes free disk), and the per-rank L2 share from a
 /// deployment-total `--kv-dram` request.
-pub use kv_tier::{default_t2_budget_bytes, resolve_dram_budget_bytes};
+pub use kv_native_sys::{default_t2_budget_bytes, resolve_dram_budget_bytes};
 /// Rank-0 NCCL `unique_id` mint for multiproc launchers (see [`loader::mint_nccl_unique_id_hex`]).
 #[cfg(feature = "nccl")]
 pub use loader::mint_nccl_unique_id_hex;

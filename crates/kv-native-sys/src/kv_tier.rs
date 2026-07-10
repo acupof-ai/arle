@@ -1,15 +1,17 @@
-//! Two-level host store for demoted KV blocks.
+//! Two-level (host RAM + disk) store for demoted KV blocks — backend-neutral.
 //!
 //! Host-demoted blocks live in a capacity-capped in-RAM map (default-on, 4 GiB).
-//! Disk spill is optional on the `kv-native-sys` block substrate
+//! Disk spill is optional on the `KvMmapStore` block substrate
 //! (`--kv-disk`, opt-in): when host RAM fills, the coldest host entry spills
 //! to a file-backed mmap page-slot store, so the capacity the engine sees is
 //! host-demoted + disk slots. Payloads are opaque fixed-limit blocks (paged-KV
-//! pages or DSv4 slot-image chunks); this module never touches the device.
+//! pages, slot-image chunks, or encoded MLX pages); this module never touches
+//! the device. Metal runs the disk-only degenerate case (host budget 0 —
+//! unified memory makes a DRAM L2 a no-op).
 //!
 //! ## Mmap store
 //!
-//! The disk tier uses [`kv_native_sys::KvMmapStore`] — one file per namespace,
+//! The disk tier uses [`crate::KvMmapStore`] — one file per namespace,
 //! fixed-size page slots. Writes memcpy into the mapping (no per-page syscall);
 //! reads return `&[u8]` slices directly from the mapping (zero-copy). This
 //! replaces the prior sharded per-page block-file approach (~4 ms/page) with
@@ -22,11 +24,11 @@
 //! KV-recall tier instead opts into a **durable** disk namespace ([`set_disk`]
 //! with `durable = true`): the namespace is stable across restarts, survives
 //! drop, and carries a [`MANIFEST_FILE`] persisting each disk-resident block's
-//! `{key, slot_idx}` plus an epoch tag. [`CudaKvTierStore::load`] replays the
+//! `{key, slot_idx}` plus an epoch tag. [`KvTierStore::load`] replays the
 //! manifest so a prior session's evicted KV is addressable again; a stale epoch
 //! (e.g. after an OPD weight update) discards the prior memory.
 //!
-//! [`set_disk`]: CudaKvTierStore::set_disk
+//! [`set_disk`]: KvTierStore::set_disk
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
@@ -42,7 +44,7 @@ use infer_seam::{DramTierPolicy, NvmeTierPolicy, dram_l2_budget, nvme_l3_budget}
 const MANIFEST_FILE: &str = "manifest.kvm";
 
 /// Manifest header magic + version. A mismatch — or a missing manifest — makes
-/// [`CudaKvTierStore::load`] start cold rather than trust a foreign layout.
+/// [`KvTierStore::load`] start cold rather than trust a foreign layout.
 const MANIFEST_MAGIC: &str = "ARLE-KVTIER-MANIFEST-V2";
 
 static DISK_TIER_NAMESPACE_COUNTER: std::sync::atomic::AtomicU64 =
@@ -96,7 +98,7 @@ fn disk_free_total_bytes(_path: &Path) -> Option<(usize, usize)> {
 
 // ---- Budget helpers (unchanged) ----
 
-pub(crate) fn default_t1_budget_bytes(dram_fraction: f64) -> usize {
+pub fn default_t1_budget_bytes(dram_fraction: f64) -> usize {
     let budget = dram_l2_budget(
         available_ram_bytes(),
         total_ram_bytes(),
@@ -154,16 +156,12 @@ pub fn default_t2_budget_bytes(root: &Path, ssd_fraction: f64) -> usize {
 /// store never collide; callers own the namespace constants. Manifest keys
 /// carry the feature key in the low bits; chunk keys carry
 /// `key << CHUNK_IDX_BITS | idx` (a blob is ≤ 2^16 × page_bytes).
-pub(crate) const TIER_NS_SHIFT: u32 = 56;
-pub(crate) const CHUNK_IDX_BITS: u32 = 16;
+pub const TIER_NS_SHIFT: u32 = 56;
+pub const CHUNK_IDX_BITS: u32 = 16;
 /// Canonical chunk/page size for whole-slot blob stores (DSv4 + Qwen3.6).
-pub(crate) const BLOB_CHUNK_BYTES: usize = 16 << 20;
-/// DSv4 cross-request prefix-state entries (key = host page id) — the
-/// content-keyed per-page pool (#154 Phase 2, `attention/prefix_state.rs`).
-/// Registry note: NS 1-4 (slot park + sidecar) live in `executor.rs`.
-pub(crate) const NS_PREFIX_STATE: u64 = 5;
+pub const BLOB_CHUNK_BYTES: usize = 16 << 20;
 
-pub(crate) fn tier_key(ns: u64, sub: u64) -> u64 {
+pub fn tier_key(ns: u64, sub: u64) -> u64 {
     debug_assert!(
         sub >> TIER_NS_SHIFT == 0,
         "tier sub-key overflows namespace"
@@ -171,7 +169,7 @@ pub(crate) fn tier_key(ns: u64, sub: u64) -> u64 {
     (ns << TIER_NS_SHIFT) | sub
 }
 
-pub(crate) fn chunk_sub(key: u64, idx: usize) -> u64 {
+pub fn chunk_sub(key: u64, idx: usize) -> u64 {
     (key << CHUNK_IDX_BITS) | idx as u64
 }
 
@@ -200,9 +198,9 @@ fn parse_chunk_manifest(bytes: &[u8]) -> Result<(usize, usize)> {
     Ok((chunks, bytes))
 }
 
-// ---- CudaKvTierStore ----
+// ---- KvTierStore ----
 
-pub(crate) struct CudaKvTierStore {
+pub struct KvTierStore {
     host_capacity_pages: usize,
     bytes_per_page: usize,
     host: BTreeMap<u64, HostDemotedEntry>,
@@ -222,7 +220,7 @@ struct DiskTier {
     /// Namespace directory (contains `kv.mmap` + `manifest.kvm`).
     root_dir: PathBuf,
     /// Fixed-size page-slot mmap store.
-    store: kv_native_sys::KvMmapStore,
+    store: crate::KvMmapStore,
     /// Key -> slot index plus valid payload length in the mmap store.
     keys: BTreeMap<u64, DiskRecord>,
     /// Durable tier: suppress drop-time wipe, persist manifest on mutation.
@@ -272,7 +270,7 @@ impl DiskTier {
             )
             .expect("write to String never fails");
         }
-        kv_native_sys::write_file_atomic_cache(&self.manifest_path(), buf.as_bytes())
+        crate::write_file_atomic_cache(&self.manifest_path(), buf.as_bytes())
             .with_context(|| format!("KV recall manifest write under {}", self.root_dir.display()))
     }
 
@@ -317,16 +315,16 @@ impl DiskTier {
     }
 }
 
-// ---- CudaKvTierStore impl ----
+// ---- KvTierStore impl ----
 
-impl Drop for CudaKvTierStore {
+impl Drop for KvTierStore {
     fn drop(&mut self) {
         self.persist();
     }
 }
 
-impl CudaKvTierStore {
-    pub(crate) fn with_budget(budget_bytes: usize, bytes_per_page: usize) -> Self {
+impl KvTierStore {
+    pub fn with_budget(budget_bytes: usize, bytes_per_page: usize) -> Self {
         let host_capacity_pages = budget_bytes.checked_div(bytes_per_page).unwrap_or(0);
         Self {
             host_capacity_pages,
@@ -338,12 +336,7 @@ impl CudaKvTierStore {
         }
     }
 
-    pub(crate) fn set_disk(
-        &mut self,
-        root: PathBuf,
-        budget_bytes: usize,
-        bytes_per_page: usize,
-    ) -> bool {
+    pub fn set_disk(&mut self, root: PathBuf, budget_bytes: usize, bytes_per_page: usize) -> bool {
         let namespace = self.ephemeral_namespace(root);
         self.attach_disk(
             namespace,
@@ -354,7 +347,7 @@ impl CudaKvTierStore {
         )
     }
 
-    pub(crate) fn set_disk_durable(
+    pub fn set_disk_durable(
         &mut self,
         root: PathBuf,
         budget_bytes: usize,
@@ -388,7 +381,7 @@ impl CudaKvTierStore {
             );
             return false;
         }
-        match kv_native_sys::KvMmapStore::create(&mmap_path, capacity_pages, bytes_per_page) {
+        match crate::KvMmapStore::create(&mmap_path, capacity_pages, bytes_per_page) {
             Ok(store) => {
                 self.disk = Some(DiskTier {
                     root_dir: namespace,
@@ -409,7 +402,7 @@ impl CudaKvTierStore {
         }
     }
 
-    pub(crate) fn load(
+    pub fn load(
         &mut self,
         root: PathBuf,
         budget_bytes: usize,
@@ -431,24 +424,19 @@ impl CudaKvTierStore {
         }
 
         // Try to open existing mmap store.
-        let mut store =
-            match kv_native_sys::KvMmapStore::open(&mmap_path, capacity_pages, bytes_per_page) {
-                Ok(s) => s,
-                Err(_) => {
-                    // No existing store — create fresh.
-                    match kv_native_sys::KvMmapStore::create(
-                        &mmap_path,
-                        capacity_pages,
-                        bytes_per_page,
-                    ) {
-                        Ok(s) => s,
-                        Err(err) => {
-                            log::warn!("KV mmap store create failed: {err}");
-                            return false;
-                        }
+        let mut store = match crate::KvMmapStore::open(&mmap_path, capacity_pages, bytes_per_page) {
+            Ok(s) => s,
+            Err(_) => {
+                // No existing store — create fresh.
+                match crate::KvMmapStore::create(&mmap_path, capacity_pages, bytes_per_page) {
+                    Ok(s) => s,
+                    Err(err) => {
+                        log::warn!("KV mmap store create failed: {err}");
+                        return false;
                     }
                 }
-            };
+            }
+        };
 
         let parsed = std::fs::read(&manifest_path)
             .ok()
@@ -494,7 +482,7 @@ impl CudaKvTierStore {
         true
     }
 
-    pub(crate) fn persist(&self) {
+    pub fn persist(&self) {
         if let Some(disk) = self.disk.as_ref()
             && disk.durable
             && let Err(err) = disk.write_manifest()
@@ -519,7 +507,7 @@ impl CudaKvTierStore {
         root.join(format!("arle-kv-recall-{}", std::process::id()))
     }
 
-    pub(crate) fn capacity_pages(&self) -> usize {
+    pub fn capacity_pages(&self) -> usize {
         self.host_capacity_pages.saturating_add(
             self.disk
                 .as_ref()
@@ -527,24 +515,24 @@ impl CudaKvTierStore {
         )
     }
 
-    pub(crate) fn available_pages(&self) -> usize {
+    pub fn available_pages(&self) -> usize {
         self.capacity_pages()
             .saturating_sub(self.host.len().saturating_add(self.disk_pages()))
     }
 
-    pub(crate) fn page_bytes(&self) -> usize {
+    pub fn page_bytes(&self) -> usize {
         self.bytes_per_page
     }
 
-    pub(crate) fn host_demoted_pages(&self) -> usize {
+    pub fn host_demoted_pages(&self) -> usize {
         self.host.len()
     }
 
-    pub(crate) fn disk_pages(&self) -> usize {
+    pub fn disk_pages(&self) -> usize {
         self.disk.as_ref().map_or(0, |d| d.keys.len())
     }
 
-    pub(crate) fn location(&self, key: u64) -> Option<infer_seam::KvTierLocation> {
+    pub fn location(&self, key: u64) -> Option<infer_seam::KvTierLocation> {
         if self.host.contains_key(&key) {
             return Some(infer_seam::KvTierLocation::HostDemoted);
         }
@@ -555,7 +543,7 @@ impl CudaKvTierStore {
         })
     }
 
-    pub(crate) fn is_full(&self) -> bool {
+    pub fn is_full(&self) -> bool {
         let host_full = self.host.len() >= self.host_capacity_pages;
         let disk_full = self
             .disk
@@ -564,7 +552,7 @@ impl CudaKvTierStore {
         host_full && disk_full
     }
 
-    pub(crate) fn contains(&self, key: u64) -> bool {
+    pub fn contains(&self, key: u64) -> bool {
         self.host.contains_key(&key)
             || self
                 .disk
@@ -572,7 +560,7 @@ impl CudaKvTierStore {
                 .is_some_and(|disk| disk.keys.contains_key(&key))
     }
 
-    pub(crate) fn insert(&mut self, key: u64, payload: Vec<u8>) -> bool {
+    pub fn insert(&mut self, key: u64, payload: Vec<u8>) -> bool {
         // ONE size contract for both levels: a payload that cannot land in a
         // disk slot is refused up front. Without this, the host level accepts
         // it and a later cold-spill (or a `--kv-dram 0` direct write) hits
@@ -666,7 +654,7 @@ impl CudaKvTierStore {
     /// owned payload. Disk hit returns a **zero-copy** mmap slice — no allocation,
     /// no copy. The caller (promote) copies the slice into a device buffer, so
     /// the borrowed lifetime is sufficient.
-    pub(crate) fn read(&mut self, key: u64) -> Result<Cow<'_, [u8]>> {
+    pub fn read(&mut self, key: u64) -> Result<Cow<'_, [u8]>> {
         // Host hit: bump LRU, return owned payload.
         if let Some(old_stamp) = self.host.get(&key).map(|entry| entry.stamp) {
             let stamp = self.next_stamp();
@@ -695,13 +683,7 @@ impl CudaKvTierStore {
     /// `tier_key(ns_chunk, chunk_sub(key, i))`. On any failed insert removes
     /// everything already added and returns false. No collectives — callers
     /// own any TP consensus.
-    pub(crate) fn insert_chunked(
-        &mut self,
-        ns: u64,
-        ns_chunk: u64,
-        key: u64,
-        bytes: &[u8],
-    ) -> bool {
+    pub fn insert_chunked(&mut self, ns: u64, ns_chunk: u64, key: u64, bytes: &[u8]) -> bool {
         debug_assert!(!bytes.is_empty(), "chunked blob must be non-empty");
         let chunks = bytes.len().div_ceil(self.bytes_per_page);
         // Refuse blobs whose chunk index would alias the next key's chunks
@@ -729,7 +711,7 @@ impl CudaKvTierStore {
 
     /// Rank-LOCAL chunked-blob read-back (host hit or zero-copy mmap slices,
     /// assembled owned). Err on any missing piece.
-    pub(crate) fn read_chunked(&mut self, ns: u64, ns_chunk: u64, key: u64) -> Result<Vec<u8>> {
+    pub fn read_chunked(&mut self, ns: u64, ns_chunk: u64, key: u64) -> Result<Vec<u8>> {
         let manifest = self.read(tier_key(ns, key))?.into_owned();
         let (chunks, total) = parse_chunk_manifest(&manifest)?;
         let mut bytes = Vec::with_capacity(total);
@@ -747,7 +729,7 @@ impl CudaKvTierStore {
 
     /// Rank-LOCAL chunked-blob drop (manifest + chunks). Tolerates a missing
     /// or unparsable manifest (drops whatever resolves).
-    pub(crate) fn remove_chunked(&mut self, ns: u64, ns_chunk: u64, key: u64) {
+    pub fn remove_chunked(&mut self, ns: u64, ns_chunk: u64, key: u64) {
         let manifest_key = tier_key(ns, key);
         let chunks = self
             .read(manifest_key)
@@ -763,7 +745,7 @@ impl CudaKvTierStore {
     /// Drop a key's DISK record only (host copy untouched) — the read-on-miss
     /// promote's cleanup: after the host re-insert, keeping the disk record
     /// would double-count the key in `disk_pages` and pin a spill slot.
-    pub(crate) fn remove_disk_only(&mut self, key: u64) {
+    pub fn remove_disk_only(&mut self, key: u64) {
         let Some(disk) = &mut self.disk else {
             return;
         };
@@ -781,7 +763,7 @@ impl CudaKvTierStore {
     /// Drop entries from both levels. In the mmap store, freed slots return to
     /// the free list (no file unlink needed — the slot bytes are simply
     /// overwritten on next allocation).
-    pub(crate) fn remove(&mut self, keys: &[u64]) {
+    pub fn remove(&mut self, keys: &[u64]) {
         let mut disk_index_changed = false;
         for key in keys {
             if let Some(entry) = self.host.remove(key) {
@@ -805,7 +787,7 @@ impl CudaKvTierStore {
 }
 
 /// Cheap content-version tag for a model checkpoint directory.
-pub(crate) fn weights_epoch_tag(model_path: &Path) -> String {
+pub fn weights_epoch_tag(model_path: &Path) -> String {
     const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
     let mut hash = FNV_OFFSET;
@@ -870,7 +852,7 @@ mod tests {
 
     #[test]
     fn host_only_store_caps_at_budget() {
-        let mut store = CudaKvTierStore::with_budget(16, 8);
+        let mut store = KvTierStore::with_budget(16, 8);
         assert_eq!(store.capacity_pages(), 2);
         assert!(store.insert(1, vec![1; 8]));
         assert!(store.insert(2, vec![2; 8]));
@@ -883,7 +865,7 @@ mod tests {
     fn chunked_blob_round_trips_and_accounts() {
         // 32-byte pages (the manifest must fit ONE page); an 80-byte blob =
         // 1 manifest + 3 chunks = 4 pages.
-        let mut store = CudaKvTierStore::with_budget(32 * 10, 32);
+        let mut store = KvTierStore::with_budget(32 * 10, 32);
         let baseline = store.available_pages();
         let blob: Vec<u8> = (0..80u8).collect();
         assert!(store.insert_chunked(3, 4, 7, &blob));
@@ -904,7 +886,7 @@ mod tests {
     /// as monotonic page counts.
     #[test]
     fn superseded_chunked_blob_removal_returns_store_to_baseline() {
-        let mut store = CudaKvTierStore::with_budget(32 * 20, 32);
+        let mut store = KvTierStore::with_budget(32 * 20, 32);
         let baseline = store.available_pages();
         let blob: Vec<u8> = (0..80u8).collect();
         assert!(store.insert_chunked(3, 4, 1, &blob), "v1 inserts");
@@ -924,7 +906,7 @@ mod tests {
         // Zero host pages: everything goes straight to the mmap level
         // (the --kv-dram 0 shape used on the pod).
         let root = temp_root("chunked_disk");
-        let mut store = CudaKvTierStore::with_budget(0, 32);
+        let mut store = KvTierStore::with_budget(0, 32);
         assert!(store.set_disk(root.clone(), 32 * 20, 32));
         let baseline = store.available_pages();
         let blob: Vec<u8> = (0..80u8).collect();
@@ -940,7 +922,7 @@ mod tests {
 
     #[test]
     fn remove_chunked_tolerates_missing_manifest() {
-        let mut store = CudaKvTierStore::with_budget(32 * 10, 32);
+        let mut store = KvTierStore::with_budget(32 * 10, 32);
         let baseline = store.available_pages();
         store.remove_chunked(3, 4, 99); // never inserted
         assert_eq!(store.available_pages(), baseline);
@@ -967,7 +949,7 @@ mod tests {
             .unwrap_or_else(|_| temp_root("bw"))
             .join(format!("arle-bw-probe-{}", std::process::id()));
         std::fs::create_dir_all(&root).expect("bench root");
-        let mut store = CudaKvTierStore::with_budget(0, page);
+        let mut store = KvTierStore::with_budget(0, page);
         assert!(store.set_disk(root.clone(), (NUM as usize + 8) * 3 * page, page));
         let blob = vec![0xA5u8; BLOB];
 
@@ -1002,12 +984,12 @@ mod tests {
     fn oversized_payload_fails_closed_on_both_levels() {
         // Disk-only shape (--kv-dram 0): refusal, not the write_slot assert.
         let root = temp_root("oversize");
-        let mut store = CudaKvTierStore::with_budget(0, 8);
+        let mut store = KvTierStore::with_budget(0, 8);
         assert!(store.set_disk(root.clone(), 64, 8));
         assert!(!store.insert(1, vec![0; 13]), "oversize refused, no panic");
         assert_eq!(store.disk_pages(), 0);
         // Host shape: refused up front too (one contract for both levels).
-        let mut host_store = CudaKvTierStore::with_budget(64, 8);
+        let mut host_store = KvTierStore::with_budget(64, 8);
         assert!(!host_store.insert(1, vec![0; 13]));
         assert_eq!(host_store.host_demoted_pages(), 0);
         let _ = std::fs::remove_dir_all(root);
@@ -1024,7 +1006,7 @@ mod tests {
     #[test]
     fn host_overflow_spills_coldest_to_disk_and_reads_back() {
         let root = temp_root("spill");
-        let mut store = CudaKvTierStore::with_budget(16, 8);
+        let mut store = KvTierStore::with_budget(16, 8);
         assert!(store.set_disk(root.clone(), 32, 8));
         assert_eq!(store.capacity_pages(), 2 + 4);
 
@@ -1050,7 +1032,7 @@ mod tests {
     #[test]
     fn disk_read_is_zero_copy_mmap_slice() {
         let root = temp_root("mmap_read");
-        let mut store = CudaKvTierStore::with_budget(0, 8);
+        let mut store = KvTierStore::with_budget(0, 8);
         assert!(store.set_disk(root.clone(), 32, 8));
         assert!(store.insert(1, vec![1; 8]));
 
@@ -1074,7 +1056,7 @@ mod tests {
     #[test]
     fn disk_read_respects_recorded_payload_length() {
         let root = temp_root("disk_len");
-        let mut store = CudaKvTierStore::with_budget(0, 16);
+        let mut store = KvTierStore::with_budget(0, 16);
         assert!(store.set_disk(root.clone(), 32, 16));
         assert!(store.insert(7, b"short".to_vec()));
         let read = store.read(7).expect("disk read");
@@ -1085,7 +1067,7 @@ mod tests {
     #[test]
     fn disk_full_allows_replacing_existing_key() {
         let root = temp_root("replace");
-        let mut store = CudaKvTierStore::with_budget(0, 8);
+        let mut store = KvTierStore::with_budget(0, 8);
         assert!(store.set_disk(root.clone(), 8, 8));
 
         assert!(store.insert(1, vec![1; 8]));
@@ -1106,7 +1088,7 @@ mod tests {
     #[test]
     fn disk_only_config_writes_straight_to_disk() {
         let root = temp_root("disk_only");
-        let mut store = CudaKvTierStore::with_budget(0, 8);
+        let mut store = KvTierStore::with_budget(0, 8);
         assert!(store.set_disk(root.clone(), 16, 8));
         assert_eq!(store.capacity_pages(), 2);
 
@@ -1124,7 +1106,7 @@ mod tests {
     #[test]
     fn available_pages_counts_host_and_disk_blocks() {
         let root = temp_root("available_pages");
-        let mut store = CudaKvTierStore::with_budget(8, 4);
+        let mut store = KvTierStore::with_budget(8, 4);
         assert!(store.set_disk(root.clone(), 8, 4));
         assert_eq!(store.capacity_pages(), 4);
         assert_eq!(store.available_pages(), 4);
@@ -1147,7 +1129,7 @@ mod tests {
     #[test]
     fn full_means_both_levels_full() {
         let root = temp_root("full");
-        let mut store = CudaKvTierStore::with_budget(8, 8);
+        let mut store = KvTierStore::with_budget(8, 8);
         assert!(store.set_disk(root.clone(), 8, 8));
         assert!(store.insert(1, vec![1; 8]));
         assert!(!store.is_full(), "disk still has room");
@@ -1161,7 +1143,7 @@ mod tests {
     #[test]
     fn disk_slot_is_reused_after_remove() {
         let root = temp_root("reuse");
-        let mut store = CudaKvTierStore::with_budget(0, 8);
+        let mut store = KvTierStore::with_budget(0, 8);
         assert!(store.set_disk(root.clone(), 8, 8));
         assert!(store.insert(1, vec![1; 8]));
         assert_eq!(store.disk_pages(), 1);
@@ -1240,7 +1222,7 @@ mod tests {
         // session 1: write three blocks, then drop.
         let namespace;
         {
-            let mut store = CudaKvTierStore::with_budget(0, 8);
+            let mut store = KvTierStore::with_budget(0, 8);
             assert!(store.set_disk_durable(root.clone(), 32, 8, epoch.clone()));
             namespace = root.join(format!("arle-kv-recall-{}", std::process::id()));
             assert!(namespace.exists());
@@ -1257,7 +1239,7 @@ mod tests {
 
         // session 2: load() rebuilds index from manifest.
         {
-            let mut store = CudaKvTierStore::with_budget(0, 8);
+            let mut store = KvTierStore::with_budget(0, 8);
             let reloaded = store.load(root.clone(), 32, 8, epoch.clone());
             assert!(reloaded, "load reports prior blocks reloaded");
             assert_eq!(store.disk_pages(), 3, "all three keys re-indexed");
@@ -1267,7 +1249,7 @@ mod tests {
 
         // session 3: mismatched epoch discards stale memory.
         {
-            let mut store = CudaKvTierStore::with_budget(0, 8);
+            let mut store = KvTierStore::with_budget(0, 8);
             let reloaded = store.load(root.clone(), 32, 8, "epoch-B".to_string());
             assert!(reloaded, "durable disk tier still attaches");
             assert_eq!(store.disk_pages(), 0, "stale-epoch index starts cold");
@@ -1283,7 +1265,7 @@ mod tests {
         let epoch = "epoch-A".to_string();
 
         {
-            let mut store = CudaKvTierStore::with_budget(0, 16);
+            let mut store = KvTierStore::with_budget(0, 16);
             assert!(store.set_disk_durable(root.clone(), 32, 16, epoch.clone()));
             assert!(store.insert(11, b"tiny".to_vec()));
             assert!(store.insert(12, b"payload-123".to_vec()));
@@ -1297,7 +1279,7 @@ mod tests {
         }
 
         {
-            let mut store = CudaKvTierStore::with_budget(0, 16);
+            let mut store = KvTierStore::with_budget(0, 16);
             let reloaded = store.load(root.clone(), 32, 16, epoch.clone());
             assert!(reloaded, "load reports prior blocks reloaded");
             assert_eq!(store.read(11).expect("reload read 11").as_ref(), b"tiny");

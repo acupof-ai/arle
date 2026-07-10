@@ -5,7 +5,7 @@
 //! page completes. Content identity rides the host page id — the radix
 //! dedupes prefix chains, so matching prefixes share host page ids and
 //! non-matching content never collides (the D1 flaw is unrepresentable).
-//! Zero HBM footprint: the pool IS the L2 tier (`CudaKvTierStore` host level);
+//! Zero HBM footprint: the pool IS the L2 tier (`KvTierStore` host level);
 //! L3 is the same store's mmap spill.
 //!
 //! Entry sections split by observability: content sections (staging/dsa
@@ -29,7 +29,12 @@
 use std::collections::BTreeMap;
 
 use super::*;
-use crate::kv_tier::{CudaKvTierStore, NS_PREFIX_STATE, tier_key};
+use kv_native_sys::{KvTierStore, tier_key};
+
+/// DSv4 cross-request prefix-state entries (key = host page id) — the
+/// content-keyed per-page pool (#154 Phase 2). Registry note: NS 1-4 (slot
+/// park + sidecar) live in `executor.rs`.
+const NS_PREFIX_STATE: u64 = 5;
 
 /// Rows per FP8 DSA key-cache page (`dsv4_dsa_official.cu` fused-store:
 /// `kPageBytes = 132 << 6` = 64 rows × (128 B data + 4 B f32 scale)).
@@ -247,11 +252,11 @@ pub(crate) struct Dsv4PrefixPageMeta {
 }
 
 /// Host-resident content-keyed pool: page id → encoded [`Dsv4PrefixPageEntry`].
-/// Storage rides ONE dedicated [`CudaKvTierStore`] (host DRAM level = L2;
+/// Storage rides ONE dedicated [`KvTierStore`] (host DRAM level = L2;
 /// `set_disk` adds the mmap L3). `meta` is the exact host index — the store
 /// never drops keys on its own, so the two cannot drift.
 pub(crate) struct Dsv4PrefixStatePool {
-    store: CudaKvTierStore,
+    store: KvTierStore,
     meta: BTreeMap<u32, Dsv4PrefixPageMeta>,
     /// Over-cap eviction index `(confirmed, stamp, page id)`: provisional
     /// entries drop before confirmed ones (a confirmed boundary entry is the
@@ -267,7 +272,7 @@ pub(crate) struct Dsv4PrefixStatePool {
 impl Dsv4PrefixStatePool {
     pub(crate) fn new(budget_bytes: usize, entry_bytes: usize) -> Self {
         Self {
-            store: CudaKvTierStore::with_budget(budget_bytes, entry_bytes.max(1)),
+            store: KvTierStore::with_budget(budget_bytes, entry_bytes.max(1)),
             meta: BTreeMap::new(),
             lru: std::collections::BTreeSet::new(),
             clock: 0,
@@ -278,7 +283,7 @@ impl Dsv4PrefixStatePool {
     /// Pre-serve re-budget rebuilds the store, dropping every entry (same
     /// contract as the slot tier's re-budget).
     pub(crate) fn set_budget_bytes(&mut self, bytes: usize) {
-        self.store = CudaKvTierStore::with_budget(bytes, self.entry_bytes);
+        self.store = KvTierStore::with_budget(bytes, self.entry_bytes);
         self.meta.clear();
         self.lru.clear();
     }

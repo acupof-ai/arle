@@ -1,8 +1,17 @@
 //! Pure-Rust persistence substrate for the KV tier.
 //!
 //! POSIX-only (Linux + macOS); uses `nix`, `memmap2`, and `libc` directly
-//! with no FFI of its own. Surface: file/block I/O, WAL, file mmap, POSIX
-//! shm, and a host arena (anonymous mmap + bump pointer + free-list).
+//! with no FFI of its own. Surface: file/block I/O, file mmap, and the
+//! backend-neutral two-level [`KvTierStore`] (host RAM + mmap disk spill)
+//! shared by the CUDA and Metal executors.
+
+mod kv_tier;
+
+pub use kv_tier::{
+    BLOB_CHUNK_BYTES, CHUNK_IDX_BITS, KvTierStore, TIER_NS_SHIFT, chunk_sub,
+    default_t1_budget_bytes, default_t2_budget_bytes, resolve_dram_budget_bytes, tier_key,
+    weights_epoch_tag,
+};
 
 use std::fs::OpenOptions;
 use std::io;
