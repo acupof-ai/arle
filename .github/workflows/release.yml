@@ -75,11 +75,9 @@ jobs:
           cuda: '12.8.0'
           method: network
 
-      - name: Fetch prebuilt TileLang kernel bundle (zero-Python lane)
-        # The T1 bundle from the rolling `kernel-artifacts` release feeds
-        # build.rs's vendored tier (SRC_HASH-verified per kernel). A stale
-        # bundle fails the build loudly at the regen step — re-run after the
-        # kernels-publish workflow refreshes it; no tilelang/torch installed.
+      - name: Fetch exact prebuilt TileLang kernel bundle (zero-Python lane)
+        # The checkout, T1 target, and compiler contract select one immutable
+        # asset. Missing content fails; release builds never consume `latest`.
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: scripts/kernel_artifacts.sh fetch
