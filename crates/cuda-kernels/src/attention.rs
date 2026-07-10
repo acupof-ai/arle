@@ -50,6 +50,11 @@ pub fn dsv4_fp8_kv_pack(
     let (tbid_ptr, _gt) = token_block_id.device_ptr(&ctx.stream);
     let (tibr_ptr, _gi) = token_in_block_row.device_ptr(&ctx.stream);
 
+    // SAFETY: NoPE/RoPE/index pointers come from live device buffers pinned by
+    // the `_g*` guards, each holding `n_tokens` rows; `packed_kv_ptr` is the
+    // caller's FP8 pool sized per the doc contract (`num_blocks *
+    // page_block_size * 584` B). Writes land only at `[block_id, row]` slots
+    // named per token, stream-ordered on `ctx.stream`.
     unsafe {
         ffi::arle_dsv4_fp8_kv_pack_cuda(
             nope_ptr as *const ffi::Half,
@@ -88,6 +93,9 @@ pub fn dsv4_fp8_kv_pack_raw(
     let (tbid_ptr, _gt) = token_block_id.device_ptr(&ctx.stream);
     let (tibr_ptr, _gi) = token_in_block_row.device_ptr(&ctx.stream);
 
+    // SAFETY: same kernel contract as `dsv4_fp8_kv_pack`; `nope_ptr`/`rope_ptr`
+    // are caller-lifted device addresses covering `n_tokens` bf16 rows on
+    // `ctx.stream`, index slices are pinned by the `_g*` guards.
     unsafe {
         ffi::arle_dsv4_fp8_kv_pack_cuda(
             nope_ptr as *const ffi::Half,
@@ -149,6 +157,11 @@ pub fn dsv4_fp8_kv_pack_strided_raw(
         None => (std::ptr::null(), 0, None),
     };
 
+    // SAFETY: `nope_ptr`/`rope_ptr` are caller device addresses valid for
+    // `n_tokens` rows at the given element strides (≥ 448 / 64 per the doc
+    // contract); index slices are pinned by `_g*`; `pt_ptr` is null exactly
+    // when no Stage-B table is supplied (the kernel then uses band addressing,
+    // bounds-checked by `num_logical_pages`). Stream-ordered on `ctx.stream`.
     unsafe {
         ffi::arle_dsv4_fp8_kv_pack_strided_cuda(
             nope_ptr as *const ffi::Half,
@@ -195,6 +208,10 @@ pub fn dsv4_v32_fp8_kv_pack_strided_raw(
     let (tbid_ptr, _gt) = token_block_id.device_ptr(&ctx.stream);
     let (tibr_ptr, _gi) = token_in_block_row.device_ptr(&ctx.stream);
 
+    // SAFETY: `nope_ptr`/`rope_ptr` are caller device addresses valid for
+    // `n_tokens` rows at the given strides; `packed_kv_ptr` is the V32 pool
+    // (656 B/token layout per the doc contract); index slices pinned by `_g*`.
+    // Stream-ordered on `ctx.stream`.
     unsafe {
         ffi::arle_dsv4_v32_fp8_kv_pack_strided_cuda(
             nope_ptr as *const ffi::Half,
@@ -224,6 +241,10 @@ pub fn dsv4_fp8_kv_fill_one_sw_slot_from_start_pos_raw(
     sliding_window: usize,
     page_block_size: usize,
 ) -> Result<()> {
+    // SAFETY: the three raw pointers are caller device addresses — one i32
+    // scratch pair to write plus a device-resident `start_pos` scalar to read —
+    // all live on `ctx.stream`; the kernel writes exactly one `[block_id, row]`
+    // pair, stream-ordered.
     unsafe {
         ffi::arle_dsv4_fp8_kv_fill_one_sw_slot_from_start_pos_cuda(
             token_block_id_ptr as *mut i32,
@@ -251,6 +272,10 @@ pub fn dsv4_fp8_kv_fill_sw_slots_from_start_pos_raw(
     sliding_window: usize,
     page_block_size: usize,
 ) -> Result<()> {
+    // SAFETY: all raw pointers are caller device addresses valid for
+    // `n_tokens` i32 entries (scratch outputs, per-row `start_pos`, per-slot
+    // block offsets) on `ctx.stream`; writes are bounded by `n_tokens`,
+    // stream-ordered.
     unsafe {
         ffi::arle_dsv4_fp8_kv_fill_sw_slots_from_start_pos_cuda(
             token_block_id_ptr as *mut i32,
@@ -288,6 +313,11 @@ pub fn dsv4_fp8_kv_pack_completed_compressor_row_start_pos_raw(
         }
         None => (std::ptr::null(), 0, None),
     };
+    // SAFETY: `compressed_ptr`/`packed_kv_ptr`/`start_pos_ptr` are caller
+    // device addresses (compressor row source, FP8 pool, device i32 scalar) on
+    // `ctx.stream`; the kernel early-outs unless this step completes a
+    // compressor row, `pt_ptr` is null exactly when no Stage-B table is
+    // supplied. Stream-ordered (graph-replay safe: row derived on device).
     unsafe {
         ffi::arle_dsv4_fp8_kv_pack_completed_compressor_row_start_pos_cuda(
             compressed_ptr as *const ffi::Half,
@@ -336,6 +366,11 @@ pub fn dsv4_fp8_kv_pack_strided_batched_raw(
     let (rope_a, _gr) = rope_arr.device_ptr(&ctx.stream);
     let (start_a, _gs) = start_pos.device_ptr(&ctx.stream);
     let (pt_a, _gp) = page_table_arr.device_ptr(&ctx.stream);
+    // SAFETY: the pointer arrays (`nope_arr`/`rope_arr`/`page_table_arr`) and
+    // `start_pos` are live `[n]` CudaSlices pinned by `_g*`; each embedded
+    // device pointer is a live per-row `k_prepared` / page-table base per the
+    // batched-lane contract. Ring slot + route are computed on device from
+    // `start_pos[row]`; writes go to the shared pool only. Stream-ordered.
     unsafe {
         ffi::arle_dsv4_fp8_kv_pack_strided_batched_cuda(
             nope_a as *const *const ffi::Half,
@@ -382,6 +417,10 @@ pub fn dsv4_fp8_kv_pack_completed_compressor_row_batched_raw(
     let (comp_a, _gc) = compressed_arr.device_ptr(&ctx.stream);
     let (start_a, _gs) = start_pos.device_ptr(&ctx.stream);
     let (pt_a, _gp) = page_table_arr.device_ptr(&ctx.stream);
+    // SAFETY: `compressed_arr`/`start_pos`/`page_table_arr` are live `[n]`
+    // CudaSlices pinned by `_g*`; embedded per-row compressor pointers may be
+    // null (kernel no-ops that row) and each row early-outs unless it completes
+    // a compressor row. Writes go to the shared FP8 pool only, stream-ordered.
     unsafe {
         ffi::arle_dsv4_fp8_kv_pack_completed_compressor_row_batched_cuda(
             comp_a as *const *const ffi::Half,
@@ -448,6 +487,11 @@ pub fn dsv4_flashmla_decode_build_indices_raw(
         }
         None => (std::ptr::null(), 0, None),
     };
+    // SAFETY: `indices_ptr` is the caller's `int32[topk_unified]` output and
+    // `selected_ptr` the CSA selection row (0/null in HCA mode, which the
+    // kernel never dereferences); `pt_ptr` is null exactly when no Stage-B
+    // table is supplied, else bounds-checked by `num_logical_pages`.
+    // Stream-ordered on `ctx.stream`.
     unsafe {
         ffi::arle_dsv4_flashmla_decode_build_indices_cuda(
             indices_ptr as *mut i32,
@@ -494,6 +538,10 @@ pub fn dsv4_flashmla_decode_build_indices_start_pos_ptr_raw(
         }
         None => (std::ptr::null(), 0, None),
     };
+    // SAFETY: same contract as the non-`_start_pos_ptr` variant above, except
+    // `start_pos_ptr` is a device i32 scalar read in-kernel (graph-replay
+    // safe). All pointers live on `ctx.stream`; `pt_ptr` null ⇔ no Stage-B
+    // table. Stream-ordered.
     unsafe {
         ffi::arle_dsv4_flashmla_decode_build_indices_start_pos_ptr_cuda(
             indices_ptr as *mut i32,
@@ -573,6 +621,12 @@ pub fn dsv4_flashmla_decode_build_indices_batched_raw(
         }
         None => (std::ptr::null(), 0, None),
     };
+    // SAFETY: raw pointers are caller device addresses sized for `b` rows
+    // (`indices[b, topk_unified]`, `start_pos[b]`, offsets, `topk_length[b]`;
+    // `selected_ptr` null ⇔ HCA mode). The page table, when present, was
+    // bounds-checked above (`b * row_width <= len`) and is pinned by `_gp`;
+    // the kernel bounds-checks logical pages per row. Stream-ordered on
+    // `ctx.stream`.
     unsafe {
         ffi::arle_dsv4_flashmla_decode_build_indices_batched_cuda(
             indices_ptr as *mut i32,

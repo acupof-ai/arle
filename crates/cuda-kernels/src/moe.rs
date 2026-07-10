@@ -125,6 +125,8 @@ pub unsafe fn moe_bf16_grouped_gemm_batch(
     stream: CUstream,
 ) -> Result<()> {
     let (wp, _g) = weight_ptrs.device_ptr(&ctx.stream);
+    // SAFETY: forwarded — the caller upholds this fn's `# Safety` contract;
+    // the expert-pointer tables are live CudaSlices pinned by the `_g*` guards.
     unsafe {
         ffi::moe_bf16_grouped_gemm_batch_cuda(
             wp as *const u64,
@@ -170,6 +172,8 @@ pub unsafe fn moe_bf16_grouped_gemm_pair_batch(
 ) -> Result<()> {
     let (wa, _ga) = weight_a_ptrs.device_ptr(&ctx.stream);
     let (wb, _gb) = weight_b_ptrs.device_ptr(&ctx.stream);
+    // SAFETY: forwarded — the caller upholds this fn's `# Safety` contract;
+    // the expert-pointer tables are live CudaSlices pinned by the `_g*` guards.
     unsafe {
         ffi::moe_bf16_grouped_gemm_pair_batch_cuda(
             wa as *const u64,
@@ -224,6 +228,8 @@ pub unsafe fn moe_bf16_grouped_gemm_decode(
         "decode grouped GEMM needs k % 8 == 0 for 16B vector loads, got n={n} k={k}"
     );
     let (wp, _g) = weight_ptrs.device_ptr(&ctx.stream);
+    // SAFETY: forwarded — the caller upholds this fn's `# Safety` contract;
+    // the expert-pointer tables are live CudaSlices pinned by the `_g*` guards.
     unsafe {
         ffi::moe_bf16_grouped_gemm_decode_cuda(
             wp as *const u64,
@@ -278,6 +284,8 @@ pub unsafe fn moe_bf16_grouped_gemm_swiglu_decode(
     );
     let (wg, _gg) = weight_gate_ptrs.device_ptr(&ctx.stream);
     let (wu, _gu) = weight_up_ptrs.device_ptr(&ctx.stream);
+    // SAFETY: forwarded — the caller upholds this fn's `# Safety` contract;
+    // the expert-pointer tables are live CudaSlices pinned by the `_g*` guards.
     unsafe {
         ffi::moe_bf16_grouped_gemm_swiglu_decode_cuda(
             wg as *const u64,
@@ -327,6 +335,8 @@ pub unsafe fn moe_fp8_block_scaled_grouped_gemv_batch(
 ) -> Result<()> {
     let (wp, _g) = weight_ptrs.device_ptr(&ctx.stream);
     let (sp, _sg) = scale_ptrs.device_ptr(&ctx.stream);
+    // SAFETY: forwarded — the caller upholds this fn's `# Safety` contract;
+    // the expert-pointer tables are live CudaSlices pinned by the `_g*` guards.
     unsafe {
         ffi::moe_fp8_block_scaled_grouped_gemv_batch_cuda(
             wp as *const u64,
@@ -385,6 +395,8 @@ pub unsafe fn moe_fp8_block_scaled_grouped_gemv_pair_batch(
     let (sa, _gsa) = scale_a_ptrs.device_ptr(&ctx.stream);
     let (wb, _gb) = weight_b_ptrs.device_ptr(&ctx.stream);
     let (sb, _gsb) = scale_b_ptrs.device_ptr(&ctx.stream);
+    // SAFETY: forwarded — the caller upholds this fn's `# Safety` contract;
+    // the expert-pointer tables are live CudaSlices pinned by the `_g*` guards.
     unsafe {
         ffi::moe_fp8_block_scaled_grouped_gemv_pair_batch_cuda(
             wa as *const u64,
@@ -441,6 +453,8 @@ pub unsafe fn moe_fp4_e2m1_grouped_gemv_batch(
     let (wp, _gw) = weight_ptrs.device_ptr(&ctx.stream);
     let (sp, _gs) = scale_ptrs.device_ptr(&ctx.stream);
     let (gp, _gg) = global_ptrs.device_ptr(&ctx.stream);
+    // SAFETY: forwarded — the caller upholds this fn's `# Safety` contract;
+    // the expert-pointer tables are live CudaSlices pinned by the `_g*` guards.
     unsafe {
         ffi::moe_fp4_e2m1_grouped_gemv_batch_cuda(
             wp as *const u64,
@@ -500,6 +514,8 @@ pub unsafe fn moe_fp4_e2m1_grouped_gemv_pair_batch(
     let (wb, _gwb) = weight_b_ptrs.device_ptr(&ctx.stream);
     let (sb, _gsb) = scale_b_ptrs.device_ptr(&ctx.stream);
     let (gb, _ggb) = global_b_ptrs.device_ptr(&ctx.stream);
+    // SAFETY: forwarded — the caller upholds this fn's `# Safety` contract;
+    // the expert-pointer tables are live CudaSlices pinned by the `_g*` guards.
     unsafe {
         ffi::moe_fp4_e2m1_grouped_gemv_pair_batch_cuda(
             wa as *const u64,
@@ -542,6 +558,8 @@ pub unsafe fn dsv4_count_local_experts(
     experts_per_rank: usize,
     stream: CUstream,
 ) -> Result<()> {
+    // SAFETY: forwarded — the caller upholds this fn's `# Safety` contract
+    // (all raw pointers valid on `stream` for the shape); i32 casts are checked.
     unsafe {
         ffi::dsv4_count_local_experts_cuda(
             indices.as_ptr(),
@@ -606,6 +624,9 @@ pub unsafe fn dsv4_route(
         (0, None) => anyhow::bail!("DSv4 hash route requires token_ids pointer"),
         _ => std::ptr::null(),
     };
+    // SAFETY: forwarded — the caller upholds this fn's `# Safety` contract;
+    // the optional pointers were validated per routing_kind above (a null is
+    // never dereferenced by the branch that receives it).
     unsafe {
         ffi::dsv4_route_cuda(
             logits.as_ptr() as *const Half,
@@ -637,6 +658,8 @@ pub unsafe fn dsv4_cast_i32_to_i64(
     n: usize,
     stream: CUstream,
 ) -> Result<()> {
+    // SAFETY: forwarded — the caller upholds this fn's `# Safety` contract
+    // (all raw pointers valid on `stream` for the shape); i32 casts are checked.
     unsafe {
         ffi::dsv4_cast_i32_to_i64_cuda(src.as_ptr(), dst.as_mut_ptr(), i32::try_from(n)?, stream)
             .result()?;
@@ -661,6 +684,8 @@ pub unsafe fn moe_exclusive_scan_aligned_i32(
     alignment: usize,
     stream: CUstream,
 ) -> Result<()> {
+    // SAFETY: forwarded — the caller upholds this fn's `# Safety` contract
+    // (all raw pointers valid on `stream` for the shape); i32 casts are checked.
     unsafe {
         ffi::moe_exclusive_scan_aligned_i32_cuda(
             counts.as_ptr(),
@@ -688,6 +713,8 @@ pub unsafe fn dsv4_exclusive_scan_i32(
     n: usize,
     stream: CUstream,
 ) -> Result<()> {
+    // SAFETY: forwarded — the caller upholds this fn's `# Safety` contract
+    // (all raw pointers valid on `stream` for the shape); i32 casts are checked.
     unsafe {
         ffi::dsv4_exclusive_scan_i32_cuda(
             counts.as_ptr(),
@@ -724,6 +751,8 @@ pub unsafe fn dsv4_pack_local_experts_with_slots(
     experts_per_rank: usize,
     stream: CUstream,
 ) -> Result<()> {
+    // SAFETY: forwarded — the caller upholds this fn's `# Safety` contract
+    // (all raw pointers valid on `stream` for the shape); i32 casts are checked.
     unsafe {
         ffi::dsv4_pack_local_experts_with_slots_cuda(
             hidden.as_ptr() as *const Half,
@@ -759,6 +788,8 @@ pub unsafe fn dsv4_fill_m_indices_from_counts(
     row_capacity: usize,
     stream: CUstream,
 ) -> Result<()> {
+    // SAFETY: forwarded — the caller upholds this fn's `# Safety` contract
+    // (all raw pointers valid on `stream` for the shape); i32 casts are checked.
     unsafe {
         ffi::dsv4_fill_m_indices_from_counts_cuda(
             counts.as_ptr(),
@@ -797,6 +828,8 @@ pub unsafe fn dsv4_pack_local_experts_with_slots_and_indices(
     experts_per_rank: usize,
     stream: CUstream,
 ) -> Result<()> {
+    // SAFETY: forwarded — the caller upholds this fn's `# Safety` contract
+    // (all raw pointers valid on `stream` for the shape); i32 casts are checked.
     unsafe {
         ffi::dsv4_pack_local_experts_with_slots_and_indices_cuda(
             hidden.as_ptr() as *const Half,
@@ -838,6 +871,8 @@ pub unsafe fn dsv4_swiglu_clamped_routes(
     limit: f32,
     stream: CUstream,
 ) -> Result<()> {
+    // SAFETY: forwarded — the caller upholds this fn's `# Safety` contract
+    // (all raw pointers valid on `stream` for the shape); i32 casts are checked.
     unsafe {
         ffi::dsv4_swiglu_clamped_routes_cuda(
             gate.as_ptr() as *const Half,
@@ -872,6 +907,8 @@ pub unsafe fn dsv4_scatter_all_route_slots(
     hidden_dim: usize,
     stream: CUstream,
 ) -> Result<()> {
+    // SAFETY: forwarded — the caller upholds this fn's `# Safety` contract
+    // (all raw pointers valid on `stream` for the shape); i32 casts are checked.
     unsafe {
         ffi::dsv4_scatter_all_route_slots_cuda(
             expert_out.as_ptr() as *const Half,
@@ -900,6 +937,8 @@ pub unsafe fn dsv4_combine_route_slot_outputs(
     hidden_dim: usize,
     stream: CUstream,
 ) -> Result<()> {
+    // SAFETY: forwarded — the caller upholds this fn's `# Safety` contract
+    // (all raw pointers valid on `stream` for the shape); i32 casts are checked.
     unsafe {
         ffi::dsv4_combine_route_slot_outputs_cuda(
             route_slot_out.as_ptr() as *const Half,
@@ -928,6 +967,8 @@ pub unsafe fn qwen36_add_shared_expert_gated(
     hidden_dim: usize,
     stream: CUstream,
 ) -> Result<()> {
+    // SAFETY: forwarded — the caller upholds this fn's `# Safety` contract
+    // (all raw pointers valid on `stream` for the shape); i32 casts are checked.
     unsafe {
         ffi::qwen36_add_shared_expert_gated_cuda(
             routed.as_mut_ptr() as *mut Half,
@@ -956,6 +997,8 @@ pub unsafe fn qwen36_renorm_topk_weights(
     topk: usize,
     stream: CUstream,
 ) -> Result<()> {
+    // SAFETY: forwarded — the caller upholds this fn's `# Safety` contract
+    // (all raw pointers valid on `stream` for the shape); i32 casts are checked.
     unsafe {
         ffi::qwen36_renorm_topk_weights_cuda(
             weights.as_mut_ptr(),
@@ -997,6 +1040,8 @@ pub unsafe fn dsv4_deepgemm_pack_quantize_bf16_to_fp8(
     scale_stride_m: usize,
     stream: CUstream,
 ) -> Result<()> {
+    // SAFETY: forwarded — the caller upholds this fn's `# Safety` contract
+    // (all raw pointers valid on `stream` for the shape); i32 casts are checked.
     unsafe {
         ffi::dsv4_deepgemm_pack_quantize_bf16_to_fp8_cuda(
             input.as_ptr() as *const Half,
@@ -1040,6 +1085,8 @@ pub unsafe fn dsv4_deepgemm_m_grouped_fp8_gemm_nt_masked(
     sfa_aligned_m: usize,
     stream: CUstream,
 ) -> Result<()> {
+    // SAFETY: forwarded — the caller upholds this fn's `# Safety` contract
+    // (all raw pointers valid on `stream` for the shape); i32 casts are checked.
     unsafe {
         ffi::dsv4_deepgemm_m_grouped_fp8_gemm_nt_masked_cuda(
             a.as_ptr(),
@@ -1088,6 +1135,8 @@ pub unsafe fn dsv4_deepgemm_m_grouped_fp8_gemm_nt_contiguous(
     mk_align: usize,
     stream: CUstream,
 ) -> Result<()> {
+    // SAFETY: forwarded — the caller upholds this fn's `# Safety` contract
+    // (all raw pointers valid on `stream` for the shape); i32 casts are checked.
     unsafe {
         ffi::dsv4_deepgemm_m_grouped_fp8_gemm_nt_contiguous_cuda(
             a.as_ptr(),
@@ -1134,6 +1183,8 @@ pub unsafe fn deepgemm_m_grouped_bf16_gemm_nt_masked(
     expected_m: usize,
     stream: CUstream,
 ) -> Result<()> {
+    // SAFETY: forwarded — the caller upholds this fn's `# Safety` contract
+    // (all raw pointers valid on `stream` for the shape); i32 casts are checked.
     unsafe {
         ffi::deepgemm_m_grouped_bf16_gemm_nt_masked_cuda(
             a.as_ptr() as *const Half,
@@ -1178,6 +1229,8 @@ pub unsafe fn deepgemm_m_grouped_bf16_gemm_nt_contiguous(
     k: usize,
     stream: CUstream,
 ) -> Result<()> {
+    // SAFETY: forwarded — the caller upholds this fn's `# Safety` contract
+    // (all raw pointers valid on `stream` for the shape); i32 casts are checked.
     unsafe {
         ffi::deepgemm_m_grouped_bf16_gemm_nt_contiguous_cuda(
             a.as_ptr() as *const Half,
@@ -1215,6 +1268,8 @@ pub unsafe fn dsv4_deepgemm_fp8_gemm_nt(
     sfa_aligned_m: usize,
     stream: CUstream,
 ) -> Result<()> {
+    // SAFETY: forwarded — the caller upholds this fn's `# Safety` contract
+    // (all raw pointers valid on `stream` for the shape); i32 casts are checked.
     unsafe {
         ffi::dsv4_deepgemm_fp8_gemm_nt_cuda(
             a.as_ptr(),
@@ -1252,6 +1307,8 @@ pub unsafe fn dsv4_deepgemm_paged_mqa_logits_metadata(
     num_sms: usize,
     stream: CUstream,
 ) -> Result<()> {
+    // SAFETY: forwarded — the caller upholds this fn's `# Safety` contract
+    // (all raw pointers valid on `stream` for the shape); i32 casts are checked.
     unsafe {
         ffi::dsv4_deepgemm_paged_mqa_logits_metadata_cuda(
             context_lens.as_ptr(),
@@ -1299,6 +1356,8 @@ pub unsafe fn dsv4_deepgemm_fp8_paged_mqa_logits(
     num_sms: usize,
     stream: CUstream,
 ) -> Result<()> {
+    // SAFETY: forwarded — the caller upholds this fn's `# Safety` contract
+    // (all raw pointers valid on `stream` for the shape); i32 casts are checked.
     unsafe {
         ffi::dsv4_deepgemm_fp8_paged_mqa_logits_cuda(
             q.as_ptr(),
@@ -1355,6 +1414,8 @@ pub unsafe fn dsv4_deepgemm_fp8_paged_mqa_logits_fused_cache(
     num_sms: usize,
     stream: CUstream,
 ) -> Result<()> {
+    // SAFETY: forwarded — the caller upholds this fn's `# Safety` contract
+    // (all raw pointers valid on `stream` for the shape); i32 casts are checked.
     unsafe {
         ffi::dsv4_deepgemm_fp8_paged_mqa_logits_fused_cache_cuda(
             q.as_ptr(),
@@ -1403,6 +1464,8 @@ pub unsafe fn dsv4_deepgemm_swiglu_quantize_w13(
     limit: f32,
     stream: CUstream,
 ) -> Result<()> {
+    // SAFETY: forwarded — the caller upholds this fn's `# Safety` contract
+    // (all raw pointers valid on `stream` for the shape); i32 casts are checked.
     unsafe {
         ffi::dsv4_deepgemm_swiglu_quantize_w13_cuda(
             w13.as_ptr() as *const Half,
@@ -1456,6 +1519,8 @@ pub unsafe fn dsv4_deepgemm_silu_mul_masked_quant(
     swiglu_limit: f32,
     stream: CUstream,
 ) -> Result<()> {
+    // SAFETY: forwarded — the caller upholds this fn's `# Safety` contract
+    // (all raw pointers valid on `stream` for the shape); i32 casts are checked.
     unsafe {
         ffi::dsv4_deepgemm_silu_mul_masked_quant_cuda(
             input.as_ptr() as *const Half,
@@ -1492,6 +1557,8 @@ pub unsafe fn dsv4_deepgemm_unpad_grouped_bf16(
     hidden_dim: usize,
     stream: CUstream,
 ) -> Result<()> {
+    // SAFETY: forwarded — the caller upholds this fn's `# Safety` contract
+    // (all raw pointers valid on `stream` for the shape); i32 casts are checked.
     unsafe {
         ffi::dsv4_deepgemm_unpad_grouped_bf16_cuda(
             grouped.as_ptr() as *const Half,
@@ -1514,8 +1581,13 @@ pub unsafe fn dsv4_deepgemm_unpad_grouped_bf16(
 /// string on success. Wraps [`ffi::dsv4_deepgemm_native_preflight_cuda`].
 pub fn dsv4_deepgemm_native_preflight() -> Result<String> {
     let mut report = vec![0 as std::ffi::c_char; 4096];
+    // SAFETY: `report` is a live 4096-byte zeroed buffer; the FFI writes a
+    // NUL-terminated report within `report.len()` bytes.
     let result =
         unsafe { ffi::dsv4_deepgemm_native_preflight_cuda(report.as_mut_ptr(), report.len()) };
+    // SAFETY: the zero-initialized buffer guarantees NUL termination within its
+    // 4096 bytes even if the FFI wrote nothing, so CStr::from_ptr stays in
+    // bounds; `report` outlives the borrow.
     let report = unsafe { std::ffi::CStr::from_ptr(report.as_ptr()) }
         .to_string_lossy()
         .into_owned();
@@ -1540,6 +1612,8 @@ pub unsafe fn dsv4_swiglu_clamped_batch(
     limit: f32,
     stream: CUstream,
 ) -> Result<()> {
+    // SAFETY: forwarded — the caller upholds this fn's `# Safety` contract
+    // (all raw pointers valid on `stream` for the shape); i32 casts are checked.
     unsafe {
         ffi::dsv4_swiglu_clamped_cuda(
             gate.as_ptr() as *const Half,
@@ -1581,6 +1655,8 @@ pub unsafe fn dsv4_fp8_grouped_swiglu_decode(
     limit: f32,
     stream: CUstream,
 ) -> Result<()> {
+    // SAFETY: forwarded — the caller upholds this fn's `# Safety` contract
+    // (all raw pointers valid on `stream` for the shape); i32 casts are checked.
     unsafe {
         ffi::dsv4_fp8_grouped_swiglu_decode_cuda(
             weight_gate_ptrs.as_ptr(),
@@ -1625,6 +1701,8 @@ pub unsafe fn dsv4_fp8_grouped_down_decode(
     scale_cols: usize,
     stream: CUstream,
 ) -> Result<()> {
+    // SAFETY: forwarded — the caller upholds this fn's `# Safety` contract
+    // (all raw pointers valid on `stream` for the shape); i32 casts are checked.
     unsafe {
         ffi::dsv4_fp8_grouped_down_decode_cuda(
             weight_ptrs.as_ptr(),
