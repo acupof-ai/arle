@@ -320,6 +320,32 @@ impl RealCudaExecutor {
         }
     }
 
+    /// Cumulative spec-decode counters: DSpark on Qwen3.5/3.6, MTP on DSv4.
+    /// Host-side integers maintained in the accept-commit paths — no device sync.
+    pub(crate) fn spec_decode_stats(&self) -> infer_seam::SpecDecodeStats {
+        match self {
+            Self::Qwen(_) => infer_seam::SpecDecodeStats::default(),
+            Self::Qwen35(q) => {
+                q.dspark
+                    .as_ref()
+                    .map_or_else(Default::default, |ds| infer_seam::SpecDecodeStats {
+                        chains: ds.chains as u64,
+                        drafted: (ds.accepts + ds.rejects) as u64,
+                        accepted: ds.accepts as u64,
+                        rejected: ds.rejects as u64,
+                        partial_ctx_chains: ds.partial_ctx_chains as u64,
+                    })
+            }
+            Self::Dsv4(d) => infer_seam::SpecDecodeStats {
+                chains: d.mtp_chains as u64,
+                drafted: (d.mtp_accepts + d.mtp_rejects) as u64,
+                accepted: d.mtp_accepts as u64,
+                rejected: d.mtp_rejects as u64,
+                partial_ctx_chains: 0,
+            },
+        }
+    }
+
     pub(crate) fn kv_tier_disk_pages(&self) -> usize {
         match self {
             Self::Qwen(q) => q.kv_tier_disk_pages(),
@@ -1837,6 +1863,8 @@ pub(crate) struct Dsv4CudaExecutor {
     num_slots: usize,
     mtp_accepts: usize,
     mtp_rejects: usize,
+    /// Verified MTP draft chains (one per spec row that reached verify).
+    mtp_chains: usize,
     /// Adaptive MTP gate (B=1): EMA of per-step accepted/depth, plus the count of
     /// consecutive gated skips since the last real spec step (drives the periodic
     /// probe). MTP only beats no-spec when it emits > t_mtp/t_nospec tok/step, so
@@ -2329,6 +2357,7 @@ impl Dsv4CudaExecutor {
             num_slots,
             mtp_accepts: 0,
             mtp_rejects: 0,
+            mtp_chains: 0,
             mtp_accept_ema: 1.0,
             mtp_skip_streak: 0,
             prefix_state: crate::attention::Dsv4PrefixStatePool::new(
@@ -4585,18 +4614,20 @@ impl Qwen35CudaExecutor {
         let mut pt = crate::qwen35::dspark_phase_start(&self.model.ctx);
         // 1. Draft the block (draft-head-only; no trunk/pool state touched —
         //    the speculative noise K/V rows in the draft cache self-heal).
-        let chain = {
+        let (chain, partial_ctx) = {
             let Self { model, dspark, .. } = self;
             let ds = dspark.as_mut().expect("dspark");
             let df = ds.slots[slot].as_mut().expect("seeded slot");
-            model.dspark_draft_block(
+            let partial_ctx = df.ctx_base > 0;
+            let chain = model.dspark_draft_block(
                 &ds.head,
                 df,
                 &mut ds.scratch,
                 row.last_token,
                 start,
                 &row.params,
-            )?
+            )?;
+            (chain, partial_ctx)
         };
         let draft_ms = crate::qwen35::mtp_phase_lap(&self.model.ctx, &mut pt);
         if chain.len() < 2 {
@@ -4694,6 +4725,8 @@ impl Qwen35CudaExecutor {
         df.pending = Some(bonus);
         ds.accepts += k;
         ds.rejects += chain.len() - 1 - k;
+        ds.chains += 1;
+        ds.partial_ctx_chains += usize::from(partial_ctx);
         Ok(emitted
             .into_iter()
             .map(|token| SlotToken {

@@ -98,6 +98,24 @@ pub fn pages_only_reusable_prefix_blocks(
     reusable
 }
 
+/// Cumulative speculative-decode counters (host-side integers, monotonic since
+/// engine start; all zero when spec decode is off). Fed by the backend from its
+/// accept-commit path — no device sync involved.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SpecDecodeStats {
+    /// Verified draft chains (one per spec step that reached verify).
+    pub chains: u64,
+    /// Draft tokens proposed across all chains (excludes the anchor/bonus).
+    pub drafted: u64,
+    /// Draft tokens accepted by verify.
+    pub accepted: u64,
+    /// Draft tokens rejected by verify (`drafted = accepted + rejected`).
+    pub rejected: u64,
+    /// Chains drafted from a partial (base > 0) draft context — the
+    /// partial-ctx share after a rebase/prefix-restore gap.
+    pub partial_ctx_chains: u64,
+}
+
 /// Host-only engine-core to backend-executor seam.
 ///
 /// The plan and step output contain only host data. Any device tensors needed
@@ -125,6 +143,12 @@ pub trait BackendExecutor {
     /// that do not expose model defaults keep their existing behavior.
     fn model_stop_token_ids(&self) -> Vec<u32> {
         Vec::new()
+    }
+
+    /// Cumulative speculative-decode counters. Default all-zero for backends
+    /// (or configs) without spec decode.
+    fn spec_decode_stats(&self) -> SpecDecodeStats {
+        SpecDecodeStats::default()
     }
 
     /// Optional direct multimodal generation path for scalar backends whose

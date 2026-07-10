@@ -449,6 +449,7 @@ pub struct StatsResponse {
     pub kv_tier: KvTierStatsResponse,
     pub kv_system: KvSystemMetricsResponse,
     pub ssd_recall: SsdRecallStats,
+    pub spec_decode: SpecDecodeStatsResponse,
 }
 
 impl StatsResponse {
@@ -534,6 +535,15 @@ impl StatsResponse {
                 },
                 ..SsdRecallStats::default()
             },
+            spec_decode: SpecDecodeStatsResponse {
+                available: counters.spec_decode.chains > 0,
+                chains: counters.spec_decode.chains,
+                drafted: counters.spec_decode.drafted,
+                accepted: counters.spec_decode.accepted,
+                rejected: counters.spec_decode.rejected,
+                partial_ctx_chains: counters.spec_decode.partial_ctx_chains,
+                accept_rate: ratio(counters.spec_decode.accepted, counters.spec_decode.drafted),
+            },
         }
     }
 }
@@ -601,6 +611,19 @@ pub struct PrefixCacheStatsResponse {
     pub hit_pages: u64,
     pub published_pages: u64,
     pub cached_pages: usize,
+}
+
+/// Cumulative speculative-decode counters (MTP or DSpark). All zero (and
+/// `available: false`) until a verified draft chain commits.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct SpecDecodeStatsResponse {
+    pub available: bool,
+    pub chains: u64,
+    pub drafted: u64,
+    pub accepted: u64,
+    pub rejected: u64,
+    pub partial_ctx_chains: u64,
+    pub accept_rate: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]

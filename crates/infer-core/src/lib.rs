@@ -762,6 +762,12 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         stats
     }
 
+    /// Cumulative speculative-decode counters from the backend executor.
+    #[must_use]
+    pub fn spec_decode_stats(&self) -> infer_seam::SpecDecodeStats {
+        self.executor.spec_decode_stats()
+    }
+
     #[must_use]
     pub fn kv_system_metrics(&self) -> KvSystemMetrics {
         let mut metrics = self.kv_system_metrics;

@@ -290,6 +290,16 @@ pub struct WireStats {
     pub kv_system_fallback_recompute: u64,
     pub kv_system_prefix_match_full_blocks: u64,
     pub kv_system_prefix_match_clamped_blocks: u64,
+    #[serde(default)]
+    pub spec_chains: u64,
+    #[serde(default)]
+    pub spec_drafted: u64,
+    #[serde(default)]
+    pub spec_accepted: u64,
+    #[serde(default)]
+    pub spec_rejected: u64,
+    #[serde(default)]
+    pub spec_partial_ctx_chains: u64,
 }
 
 impl WireStats {
@@ -344,6 +354,13 @@ impl WireStats {
                 prefix_match_full_blocks: self.kv_system_prefix_match_full_blocks,
                 prefix_match_clamped_blocks: self.kv_system_prefix_match_clamped_blocks,
             },
+            spec_decode: infer_seam::SpecDecodeStats {
+                chains: self.spec_chains,
+                drafted: self.spec_drafted,
+                accepted: self.spec_accepted,
+                rejected: self.spec_rejected,
+                partial_ctx_chains: self.spec_partial_ctx_chains,
+            },
         }
     }
 
@@ -389,6 +406,11 @@ impl WireStats {
             kv_system_fallback_recompute: c.kv_system.fallback_recompute,
             kv_system_prefix_match_full_blocks: c.kv_system.prefix_match_full_blocks,
             kv_system_prefix_match_clamped_blocks: c.kv_system.prefix_match_clamped_blocks,
+            spec_chains: c.spec_decode.chains,
+            spec_drafted: c.spec_decode.drafted,
+            spec_accepted: c.spec_decode.accepted,
+            spec_rejected: c.spec_decode.rejected,
+            spec_partial_ctx_chains: c.spec_decode.partial_ctx_chains,
         }
     }
 }
