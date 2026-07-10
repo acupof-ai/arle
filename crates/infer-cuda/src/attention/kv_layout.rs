@@ -940,7 +940,7 @@ impl Dsv4KvAdapter {
             self.num_slots
         );
         let mut changed = false;
-        let mut pages: Vec<u32> = Vec::new();
+        let mut pages: Vec<BandPage> = Vec::new();
         for layer in &mut self.layers {
             let lsp = layer.flashmla_slot_pages();
             if lsp == 0 {
@@ -955,7 +955,7 @@ impl Dsv4KvAdapter {
                 continue;
             };
             pages.clear();
-            pages.extend((0..lsp).map(|i| (slot * lsp + i) as u32));
+            pages.extend((0..lsp).map(|i| BandPage((slot * lsp + i) as u32)));
             changed |= pool.mirror_band(slot, &pages, seq_len)?;
         }
         self.device_table_dirty[slot] |= changed;
@@ -981,7 +981,7 @@ impl Dsv4KvAdapter {
             self.num_slots
         );
         let mut changed = false;
-        let mut pages: Vec<u32> = Vec::new();
+        let mut pages: Vec<BandPage> = Vec::new();
         for layer in &mut self.layers {
             let lsp = layer.flashmla_slot_pages();
             if lsp == 0 {
@@ -995,7 +995,7 @@ impl Dsv4KvAdapter {
                 continue;
             };
             pages.clear();
-            pages.extend((0..lsp).map(|i| (slot * lsp + i) as u32));
+            pages.extend((0..lsp).map(|i| BandPage((slot * lsp + i) as u32)));
             changed |= pool.mirror_band(slot, &pages, 0)?;
         }
         self.device_table_dirty[slot] |= changed;
@@ -1037,7 +1037,7 @@ impl ModelKvAdapter for Dsv4KvAdapter {
         let mut rows = Vec::with_capacity(desc.rows.len());
         // Reused per (row, layer) — the identity band is rebuilt in place so a
         // decode tick doesn't heap-alloc per layer.
-        let mut layer_pages: Vec<u32> = Vec::new();
+        let mut layer_pages: Vec<BandPage> = Vec::new();
         for (idx, row) in desc.rows.iter().enumerate() {
             ensure!(
                 row.slot < self.num_slots,
@@ -1105,7 +1105,8 @@ impl ModelKvAdapter for Dsv4KvAdapter {
                     // needs band contiguity; reuse crosses slots by copy.
                     layer_pages.clear();
                     layer_pages.extend(
-                        (0..slot_pages.len().min(lsp)).map(|i| (row.slot * lsp + i) as u32),
+                        (0..slot_pages.len().min(lsp))
+                            .map(|i| BandPage((row.slot * lsp + i) as u32)),
                     );
                     if let Some(pool) = layer.flashmla_kv_pool.as_mut() {
                         band_changed |= pool.mirror_band(row.slot, &layer_pages, row.append_pos)?;

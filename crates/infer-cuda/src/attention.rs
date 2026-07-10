@@ -12,7 +12,7 @@ use cuda_kernels::prelude::{
     DeviceContext, DeviceMatrix, DeviceVec, HiddenStates, HiddenStatesView, PagedKVPool,
 };
 use cuda_kernels::tensor::{WeightFormat, cache_ptr};
-use cuda_kernels::{KVFormat, TokenKVPool};
+use cuda_kernels::{BandPage, KVFormat, TokenKVPool};
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 use deepseek_spec::{DeepSeekV4AttentionMode, DeepSeekV4Config};
 use infer_seam::{KvBatchDescriptor, KvBatchRowKind};

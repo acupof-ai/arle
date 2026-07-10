@@ -24,7 +24,7 @@ pub mod turboquant_state;
 pub use kv_types::{KVCacheDtype, KVFormat};
 
 #[cfg(feature = "cuda")]
-pub use paged_kv::TokenKVPool;
+pub use paged_kv::{BandPage, TokenKVPool};
 
 /// Compile-time capability flags: whether the conditional kernel families were
 /// built into this binary. `build.rs` sets the backing `cfg` from the SAME
