@@ -57,6 +57,7 @@ pub struct CounterSnapshot {
     pub throughput: ThroughputStats,
     pub kv_tier: KvTierStats,
     pub kv_system: KvSystemMetrics,
+    pub spec_decode: infer_seam::SpecDecodeStats,
 }
 
 /// Cross-thread handle to the latest [`CounterSnapshot`]: the engine loop writes
@@ -76,6 +77,7 @@ fn publish_counters<E: BackendExecutor, K: KvPool>(
         snap.throughput = engine.throughput_stats();
         snap.kv_tier = engine.kv_tier_stats();
         snap.kv_system = engine.kv_system_metrics();
+        snap.spec_decode = engine.spec_decode_stats();
     }
 }
 
