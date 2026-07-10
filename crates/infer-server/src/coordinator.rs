@@ -583,7 +583,11 @@ async fn completions(
     request.validate()?;
     let sampling = request.sampling_params();
     let max_tokens = sampling.max_new_tokens.unwrap_or(16);
-    let prompt_tokens = encode(&state, &request.prompt)?;
+    // Token-id prompt → feed verbatim (exact-token multi-turn); text → tokenize.
+    let prompt_tokens = match &request.prompt {
+        crate::schema::PromptInput::Tokens(ids) => ids.clone(),
+        crate::schema::PromptInput::Text(text) => encode(&state, text)?,
+    };
     let include_usage = request
         .stream_options
         .as_ref()
@@ -675,6 +679,8 @@ async fn completions(
             .into_response());
     }
 
+    let return_token_ids = request.return_token_ids.unwrap_or(false);
+    let prompt_token_ids = return_token_ids.then(|| prompt_tokens.clone());
     let outcome = submit_and_collect(&state, prompt_tokens, max_tokens, sampling).await?;
     let text = decode(&state, &outcome.generated_tokens)?;
     Ok(Json(CompletionResponse::from_parts(
@@ -683,10 +689,8 @@ async fn completions(
         outcome.prompt_tokens,
         outcome.generated_tokens.len(),
         outcome.finish.as_ref(),
-        request
-            .return_token_ids
-            .unwrap_or(false)
-            .then_some(outcome.generated_tokens),
+        return_token_ids.then_some(outcome.generated_tokens),
+        prompt_token_ids,
     ))
     .into_response())
 }
