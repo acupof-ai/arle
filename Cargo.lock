@@ -1833,7 +1833,10 @@ dependencies = [
 name = "kv-native-sys"
 version = "0.2.1"
 dependencies = [
+ "anyhow",
+ "infer-seam",
  "libc",
+ "log",
  "memmap2",
  "nix 0.31.3",
  "tempfile",
