@@ -1,0 +1,35 @@
+crates/infer-metal/src/config.rs
+  s_54407b338363d4::t_1ebef822cab409 181-184
+crates/infer-metal/src/deepseek_ocr.rs
+  s_54407b338363d4::t_aa3fa386f61907 155,164,169,178,183,214,264,350,371,393,465,496,530,563,576,604,641,653,663
+crates/infer-metal/src/dflash.rs
+  s_54407b338363d4::t_ebf811ccfb0728 348-354,576,583,588,594,621,668,682,691,697,717,734,737,1341
+crates/infer-metal/src/diffusion_gemma.rs
+  s_54407b338363d4::t_54f7182e781276 150,226,231,244,249,259,264,271,293,353,420,447,452,464,565,626,665,688,706,717
+crates/infer-metal/src/gemma4.rs
+  s_54407b338363d4::t_1c461a94b5e81a 158,167,172,185,190,228,307,366,389,394,411,430,498,642,703,742,760,771
+crates/infer-metal/src/loader.rs
+  s_54407b338363d4::t_f36ae571fcd1c4 56-80,95-108
+crates/infer-metal/src/mlx.rs
+  s_54407b338363d4::t_b4aaa0db3e60b5 12,25,114,125,138,157,171,176,182,189,196,214,222,230,244,251,265,282,293,300,306,314,322,330,348,370,388,395,401,415,431,443,452,460,467,474,489,491,493,501,509,518,532,534,539
+crates/infer-metal/src/qwen35.rs
+  s_54407b338363d4::t_5dea3100fa8234 506,570,583,590,628,636,653,664-670,708,730,748,788,797,808,814,818,838,861,876,881,894,907,913,925,932,943,948,970,988,1014,1032,1037,1048,1056,1063,1073,1082,1100,1128,1130,1132,1134,1164,1190,1194
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "242f010cabb36ea512d84728ced0702284766d55",
+  "prompts": {},
+  "sessions": {
+    "s_54407b338363d4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a352f2dfbebb51b51",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
