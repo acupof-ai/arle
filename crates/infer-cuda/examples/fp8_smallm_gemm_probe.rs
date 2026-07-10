@@ -26,7 +26,7 @@ mod real {
 #[cfg(feature = "cuda")]
 mod real {
     use std::process::Command;
-    use std::time::{Instant, SystemTime, UNIX_EPOCH};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use anyhow::Result;
     use cuda_kernels::ffi;
@@ -52,18 +52,7 @@ mod real {
 
     #[derive(Default, Clone)]
     struct Sample {
-        host_us: Vec<f64>,
         cuda_us: Vec<f64>,
-    }
-
-    impl Sample {
-        fn mean_host_us(&self) -> f64 {
-            self.host_us.iter().sum::<f64>() / self.host_us.len() as f64
-        }
-
-        fn mean_cuda_us(&self) -> f64 {
-            self.cuda_us.iter().sum::<f64>() / self.cuda_us.len() as f64
-        }
     }
 
     #[derive(Serialize)]
@@ -110,11 +99,9 @@ mod real {
 
         let mut measurements = Vec::new();
         for &(label, n, k) in SHAPES {
-            let weight_gb = (n * k) as f64 / 1e9;
-            copy_ceiling(&ctx, label, n, k, iters, samples, weight_gb)?;
             for &m in M_SWEEP {
                 if let Some(measurement) =
-                    probe_one(&ctx, label, m, n, k, iters, samples, weight_gb, deepgemm)?
+                    probe_one(&ctx, label, m, n, k, iters, samples, deepgemm)?
                 {
                     measurements.push(measurement);
                 }
@@ -165,35 +152,6 @@ mod real {
         Ok(())
     }
 
-    /// DtoD copy of the weight buffer: measured copy rate X GB/s moves 2X
-    /// bytes/s through HBM — the achievable-bandwidth ceiling for a
-    /// streaming weight pass on this device (floor = weight_gb / (2X)).
-    fn copy_ceiling(
-        ctx: &DeviceContext,
-        label: &'static str,
-        n: usize,
-        k: usize,
-        iters: usize,
-        samples: usize,
-        weight_gb: f64,
-    ) -> Result<()> {
-        let src = ctx.stream.alloc_zeros::<u8>(n * k)?;
-        let mut dst = ctx.stream.alloc_zeros::<u8>(n * k)?;
-        ctx.sync()?;
-        let s = timed(ctx, iters, samples, || {
-            ctx.stream.memcpy_dtod(&src, &mut dst)?;
-            Ok(())
-        })?;
-        let hbm_gbps = 2.0 * weight_gb / (s.mean_cuda_us() / 1e6);
-        eprintln!(
-            "[smallm-probe] shape={label} route=dtod_ceiling n={n} k={k} cuda_us={:.1} \
-             hbm_gbps={hbm_gbps:.0} read_floor_us={:.1}",
-            s.mean_cuda_us(),
-            weight_gb / hbm_gbps * 1e6,
-        );
-        Ok(())
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn probe_one(
         ctx: &DeviceContext,
@@ -203,7 +161,6 @@ mod real {
         k: usize,
         iters: usize,
         samples: usize,
-        weight_gb: f64,
         deepgemm: bool,
     ) -> Result<Option<serde_json::Value>> {
         let scale_rows = n.div_ceil(FP8_BLOCK);
@@ -264,7 +221,6 @@ mod real {
             .result()?;
             Ok(())
         })?;
-        report(label, "gemv", m, n, k, weight_gb, &gemv);
         let reference_out = ctx.stream.clone_dtoh(&out)?;
 
         if !deepgemm {
@@ -294,7 +250,6 @@ mod real {
                 ctx.stream.cu_stream(),
             )
         })?;
-        report(label, "dg_pack", m, n, k, weight_gb, &pack);
 
         // SAFETY: packed input, weight, scales, and output cover this exact cell.
         let gemm = timed(ctx, iters, samples, || unsafe {
@@ -311,7 +266,6 @@ mod real {
                 ctx.stream.cu_stream(),
             )
         })?;
-        report(label, "dg_gemm", m, n, k, weight_gb, &gemm);
         let candidate_out = ctx.stream.clone_dtoh(&out)?;
         let numeric = numeric_delta(&reference_out, &candidate_out);
         let candidate_cuda_us: Vec<f64> = pack
@@ -342,16 +296,6 @@ mod real {
                 "candidate_gemm_launches": launches,
             },
         })))
-    }
-
-    fn report(label: &str, route: &str, m: usize, n: usize, k: usize, weight_gb: f64, s: &Sample) {
-        let cuda_us = s.mean_cuda_us();
-        let gbps = weight_gb / (cuda_us / 1e6);
-        eprintln!(
-            "[smallm-probe] shape={label} route={route} m={m} n={n} k={k} \
-             cuda_us={cuda_us:.1} host_us={:.1} weight_gbps={gbps:.0}",
-            s.mean_host_us(),
-        );
     }
 
     fn numeric_delta(reference: &[bf16], candidate: &[bf16]) -> NumericDelta {
@@ -428,53 +372,79 @@ mod real {
         }
     }
 
-    /// Encode an f32 to FP8 E4M3 (unsigned, no inf, no NaN). Clips to E4M3 range.
+    /// Decode FP8 E4M3 byte to f32 (host-side reference).
+    fn fp8_e4m3_to_f32(byte: u8) -> f32 {
+        let sign = (byte >> 7) & 1;
+        let exp = ((byte >> 3) & 0x0F) as i32;
+        let mant = byte & 0x07;
+        if exp == 0 && mant == 0 {
+            return 0.0;
+        }
+        if exp == 15 {
+            // NVIDIA E4M3: mant=7 → Inf; mant<7 → max finite (448)
+            let val = if mant == 7 { f32::INFINITY } else { 448.0 };
+            return if sign != 0 { -val } else { val };
+        }
+        let val = if exp == 0 {
+            (mant as f32 / 8.0) * (-6.0f32).exp2()
+        } else {
+            (1.0 + mant as f32 / 8.0) * ((exp - 7) as f32).exp2()
+        };
+        if sign != 0 { -val } else { val }
+    }
+
+    /// Encode an f32 to FP8 E4M3. Clips to ±448 (max finite). Rounds to nearest.
     fn f32_to_fp8_e4m3(value: f32) -> u8 {
-        let bits = value.to_bits();
-        let sign = (bits >> 31) as u8;
-        let exp = ((bits >> 23) & 0xff) as i32 - 127 + 7; // rebias to e4m3 (bias=7)
-        let mant = bits & 0x007f_ffff;
         if !value.is_finite() || value == 0.0 {
             return 0;
         }
-        if exp <= 0 {
-            // subnormal or underflow
-            let shift = 1 - exp;
-            if shift > 11 {
+        let sign = if value < 0.0 { 1u8 } else { 0u8 };
+        let abs_val = value.abs();
+        // Max finite E4M3 = 448 = (1+6/8)*2^8
+        if abs_val >= 448.0 {
+            return if sign != 0 { 0xfe } else { 0x7e };
+        }
+        let ln2 = abs_val.log2();
+        let exp_unbiased = ln2.floor() as i32;
+        let exp_rebiased = exp_unbiased + 7; // E4M3 bias = 7
+        if exp_rebiased >= 15 {
+            return if sign != 0 { 0xfe } else { 0x7e };
+        }
+        if exp_rebiased <= 0 {
+            // Subnormal: exp field = 0, mant = round(abs_val / 2^-6 * 8)
+            // Smallest subnormal: 2^-6 * 1/8 = 2^-9 ≈ 0.00195
+            let scaled = abs_val * (6.0f32).exp2() * 8.0; // abs_val / 2^-6 * 8
+            let mant = (scaled + 0.5) as u8;
+            if mant == 0 {
                 return 0;
             }
-            let sub_mant = (0x0080_0000 | mant) >> (shift + 16);
-            let rounded = (sub_mant + 1) >> 1; // round to nearest
-            return if sign != 0 {
-                (-(rounded as i8)) as u8
-            } else {
-                rounded as u8
-            };
+            if mant >= 8 {
+                // Rounds up to smallest normal (exp=1, mant=0)
+                let byte = (1u8 << 3) | 0;
+                return if sign != 0 { byte | 0x80 } else { byte };
+            }
+            return if sign != 0 { mant | 0x80 } else { mant };
         }
-        if exp >= 15 {
-            // overflow → clip to max finite (s 0 1110 110 = 240 * sign)
-            return if sign != 0 { 0xfe } else { 0x7e };
-        }
-        let mant3 = (mant >> 20) + if mant & 0x0008_0000 != 0 { 1 } else { 0 }; // round to 3 bits
-        let (exp, mant3) = if mant3 >= 8 {
-            (exp + 1, 0)
+        // Normal: exp in [1, 14]
+        let mant_val = abs_val * ((7 - exp_unbiased) as f32).exp2(); // = abs_val / 2^exp_unbiased
+        let mant_frac = mant_val - 1.0; // fractional part, in [0, 1)
+        let mant = ((mant_frac * 8.0) + 0.5) as u8;
+        let (exp_final, mant_final) = if mant >= 8 {
+            (exp_rebiased + 1, 0u8)
         } else {
-            (exp, mant3)
+            (exp_rebiased, mant)
         };
-        if exp >= 15 {
+        if exp_final >= 15 {
             return if sign != 0 { 0xfe } else { 0x7e };
         }
-        let byte = ((exp as u8) << 3) | (mant3 as u8);
-        if sign != 0 {
-            (-(byte as i8)) as u8
-        } else {
-            byte
-        }
+        let byte = ((exp_final as u8) << 3) | mant_final;
+        if sign != 0 { byte | 0x80 } else { byte }
     }
 
     /// Quantize BF16 activations to FP8 block-scaled then dequantize back to BF16.
-    /// Matches DeepGEMM pack_quantize's per-row, per-128-col-block scaling so the
-    /// GEMV reference and DeepGEMM share one activation precision floor.
+    /// Matches DeepGEMM pack_quantize's per-row, per-128-col-block scaling and uses
+    /// the FP8 E4M3 grid for rounding (not integer), so the GEMV reference and
+    /// DeepGEMM share one activation precision floor.
     fn quantize_dequantize_bf16_fp8(x: &[bf16], m: usize, k: usize) -> Vec<bf16> {
         const MAX_FP8: f32 = 448.0; // max finite E4M3 value
         let mut out = vec![bf16::from_f32(0.0); m * k];
@@ -493,8 +463,9 @@ mod real {
                 };
                 for dc in 0..w {
                     let val = x[r * k + tile_c + dc].to_f32();
-                    let q = (val / scale).round().clamp(-MAX_FP8, MAX_FP8);
-                    out[r * k + tile_c + dc] = bf16::from_f32(q * scale);
+                    let fp8_byte = f32_to_fp8_e4m3(val / scale);
+                    let dequant = fp8_e4m3_to_f32(fp8_byte) * scale;
+                    out[r * k + tile_c + dc] = bf16::from_f32(dequant);
                 }
             }
         }
@@ -570,14 +541,11 @@ mod real {
         let mut sample = Sample::default();
         for _ in 0..samples {
             start.record(&ctx.stream)?;
-            let host_t0 = Instant::now();
             for _ in 0..iters {
                 f()?;
             }
-            let host_us = host_t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
             stop.record(&ctx.stream)?;
             stop.synchronize()?;
-            sample.host_us.push(host_us);
             sample
                 .cuda_us
                 .push(start.elapsed_ms(&stop)? as f64 * 1e3 / iters as f64);
