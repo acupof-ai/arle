@@ -51,12 +51,18 @@ thread_local! {
         RefCell::new(QwenFp8DenseScratch::default());
 }
 
-// ponytail: global atomics for Qwen FP8 dense dispatch counters. Per-family
-// split if/when more operator families migrate to generated policy.
+// Qwen FP8 dense dispatch counters. Per-family split if/when more operator
+// families migrate to generated policy. fallback_count is derived (gemv +
+// dequant), not an independent atomic.
 static DEEPGEMM_HITS: AtomicU64 = AtomicU64::new(0);
 static GEMV_HITS: AtomicU64 = AtomicU64::new(0);
 static DEQUANT_GEMM_HITS: AtomicU64 = AtomicU64::new(0);
-static FALLBACK_COUNT: AtomicU64 = AtomicU64::new(0);
+
+static FP8_IMPLEMENTATION_IDS: &[(&AtomicU64, &str)] = &[
+    (&DEEPGEMM_HITS, "cuda.qwen.fp8_pack_deepgemm"),
+    (&GEMV_HITS, "cuda.qwen.fp8_gemv"),
+    (&DEQUANT_GEMM_HITS, "cuda.qwen.fp8_dequant_bf16_gemm"),
+];
 
 static PRODUCT_IDENTITY: OnceLock<(String, String)> = OnceLock::new();
 
@@ -107,30 +113,18 @@ fn file_sha256(path: &str) -> Option<String> {
 pub(crate) fn qwen_fp8_dense_operator_stats() -> infer_seam::OperatorDispatchStats {
     use infer_seam::OperatorImplementationHits;
 
-    let deepgemm = DEEPGEMM_HITS.load(Ordering::Relaxed);
-    let gemv = GEMV_HITS.load(Ordering::Relaxed);
-    let dequant = DEQUANT_GEMM_HITS.load(Ordering::Relaxed);
-    let fallback = FALLBACK_COUNT.load(Ordering::Relaxed);
-
-    let mut implementation_hits = Vec::new();
-    if deepgemm > 0 {
-        implementation_hits.push(OperatorImplementationHits {
-            implementation_id: "cuda.qwen.fp8_pack_deepgemm".into(),
-            hits: deepgemm,
-        });
-    }
-    if gemv > 0 {
-        implementation_hits.push(OperatorImplementationHits {
-            implementation_id: "cuda.qwen.fp8_gemv".into(),
-            hits: gemv,
-        });
-    }
-    if dequant > 0 {
-        implementation_hits.push(OperatorImplementationHits {
-            implementation_id: "cuda.qwen.fp8_dequant_bf16_gemm".into(),
-            hits: dequant,
-        });
-    }
+    let implementation_hits: Vec<_> = FP8_IMPLEMENTATION_IDS
+        .iter()
+        .filter_map(|(counter, id)| {
+            let hits = counter.load(Ordering::Relaxed);
+            (hits > 0).then(|| OperatorImplementationHits {
+                implementation_id: (*id).into(),
+                hits,
+            })
+        })
+        .collect();
+    let fallback_count =
+        GEMV_HITS.load(Ordering::Relaxed) + DEQUANT_GEMM_HITS.load(Ordering::Relaxed);
 
     let (product_id, bundle_digest) = product_identity();
     infer_seam::OperatorDispatchStats {
@@ -138,7 +132,7 @@ pub(crate) fn qwen_fp8_dense_operator_stats() -> infer_seam::OperatorDispatchSta
         product_id: product_id.clone(),
         bundle_digest: bundle_digest.clone(),
         implementation_hits,
-        fallback_count: fallback,
+        fallback_count,
     }
 }
 
@@ -603,7 +597,6 @@ pub(super) fn gemm_batch(
     // GEMV below). No-op on Hopper (returns false).
     if try_fp8_dequant_bf16_gemm_batch(ctx, weight, x, out)? {
         DEQUANT_GEMM_HITS.fetch_add(1, Ordering::Relaxed);
-        FALLBACK_COUNT.fetch_add(1, Ordering::Relaxed);
         return Ok(());
     }
 
@@ -696,7 +689,6 @@ pub(super) fn gemm_batch(
                     },
                 )?;
                 GEMV_HITS.fetch_add(1, Ordering::Relaxed);
-                FALLBACK_COUNT.fetch_add(1, Ordering::Relaxed);
             }
             WeightFormat::Fp4E2M1Group => {
                 ensure!(
@@ -794,7 +786,6 @@ pub(super) fn gemv(
                 )
                 .result()?;
                 GEMV_HITS.fetch_add(1, Ordering::Relaxed);
-                FALLBACK_COUNT.fetch_add(1, Ordering::Relaxed);
             }
             WeightFormat::Fp4E2M1Group => {
                 ensure!(

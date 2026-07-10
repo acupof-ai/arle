@@ -1,6 +1,11 @@
+#[allow(unused_imports)]
+use fs4::FileExt;
 use std::collections::BTreeSet;
+use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 
 /// Tier-1 SMs: default-compiled fat-binary set. A100 / A10·3090 / L4·4090 / H100.
 const T1_SMS: &[&str] = &["80", "86", "89", "90"];
@@ -324,6 +329,7 @@ fn format_dispatch_wrapper(
 // `*_EXTERN_DECL` / `*_CALL_ARGS` C-signature consts were deleted in favor of
 // the registry rows + `[abi.*]` blocks.
 
+#[derive(Clone)]
 struct TileLangKernelSpec {
     artifact_dir: String,
     kernel_path: String,
@@ -824,62 +830,132 @@ impl LazyTilelang {
     }
 }
 
-/// FNV-1a-64 incremental update over `bytes`.
-fn fnv1a_update(h: &mut u64, bytes: &[u8]) {
-    for &b in bytes {
-        *h ^= b as u64;
-        *h = h.wrapping_mul(0x100000001b3);
+fn sha256_bytes(bytes: &[u8]) -> String {
+    for (program, args) in [("sha256sum", &[][..]), ("shasum", &["-a", "256"][..])] {
+        let Ok(mut child) = Command::new(program)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+        else {
+            continue;
+        };
+        child
+            .stdin
+            .take()
+            .expect("SHA-256 stdin is piped")
+            .write_all(bytes)
+            .expect("write SHA-256 input");
+        let output = child.wait_with_output().expect("wait for SHA-256 tool");
+        if output.status.success()
+            && let Some(hash) = String::from_utf8_lossy(&output.stdout)
+                .split_whitespace()
+                .next()
+            && hash.len() == 64
+            && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return hash.to_ascii_lowercase();
+        }
+    }
+    panic!("SHA-256 tool unavailable: install sha256sum or shasum")
+}
+
+fn identity_file(path: impl AsRef<Path>) -> Vec<u8> {
+    let path = path.as_ref();
+    std::fs::read(path)
+        .unwrap_or_else(|err| panic!("read identity input {}: {err}", path.display()))
+}
+
+fn add_identity_part(identity: &mut Vec<u8>, name: &str, value: &[u8]) {
+    writeln!(identity, "{name}\t{}", value.len()).expect("write identity header");
+    identity.extend_from_slice(value);
+    identity.push(b'\n');
+}
+
+fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    for entry in std::fs::read_dir(dir)
+        .unwrap_or_else(|err| panic!("read identity directory {}: {err}", dir.display()))
+    {
+        let path = entry.expect("read identity directory entry").path();
+        if path.is_dir() {
+            collect_files(&path, out);
+        } else if path.is_file() {
+            out.push(path);
+        }
     }
 }
 
-/// Hash the generation inputs for one (kernel, SM) so a changed kernel `.py`
-/// (or the generator, or the spec params) forces a regen instead of consuming
-/// a stale vendored `.c`.
+fn add_identity_tree(identity: &mut Vec<u8>, root: &Path) {
+    let mut files = Vec::new();
+    collect_files(root, &mut files);
+    files.sort();
+    for file in files {
+        add_identity_part(identity, &file.to_string_lossy(), &identity_file(&file));
+    }
+}
+
+fn tilelang_nvcc_argv(sm_token: &str) -> String {
+    let arch = if sm_token == "90" {
+        "90a".to_string()
+    } else {
+        sm_token.to_string()
+    };
+    format!(
+        "nvcc -cubin -O3 -gencode=arch=compute_{arch},code=sm_{arch} -std=c++17 \
+         --expt-relaxed-constexpr -Xcompiler=-fPIC \
+         -I$TILELANG_SRC -I$CUTLASS_INCLUDE -I$CUDA_INCLUDE \
+         -DENABLE_BF16 -DCUDA_ARCH={sm_token}0 $DEVICE_CU -o $CUBIN"
+    )
+}
+
 fn tilelang_kernel_src_hash(base_spec: &TileLangKernelSpec, sm_token: &str) -> String {
-    let mut h: u64 = 0xcbf29ce484222325;
+    let mut identity = Vec::new();
     for path in [
         base_spec.kernel_path.as_str(),
         "tools/tilelang/gen_tilelang_aot.py",
+        "kernels.toml",
+        "build.rs",
+        "../../requirements-build.txt",
     ] {
-        let bytes = std::fs::read(path).unwrap_or_else(|_| b"<missing-source>".to_vec());
-        fnv1a_update(&mut h, &bytes);
+        add_identity_part(&mut identity, path, &identity_file(path));
     }
-    fnv1a_update(&mut h, base_spec.kernel_name.as_bytes());
-    fnv1a_update(&mut h, base_spec.out_name.as_bytes());
-    fnv1a_update(&mut h, base_spec.kernel_family.as_bytes());
-    fnv1a_update(
-        &mut h,
-        base_spec.kernel_key.as_deref().unwrap_or("").as_bytes(),
-    );
-    fnv1a_update(
-        &mut h,
+    add_identity_tree(&mut identity, Path::new("tools/tilelang/patches"));
+    for (name, value) in [
+        ("kernel_name", base_spec.kernel_name.as_str()),
+        ("out_name", base_spec.out_name.as_str()),
+        ("kernel_family", base_spec.kernel_family.as_str()),
+        ("kernel_key", base_spec.kernel_key.as_deref().unwrap_or("")),
+        ("sm", sm_token),
+        ("public_decl", base_spec.public_decl.as_str()),
+        ("extern_decl", base_spec.extern_decl.as_str()),
+        ("call_args", base_spec.call_args.as_str()),
+    ] {
+        add_identity_part(&mut identity, name, value.as_bytes());
+    }
+    add_identity_part(
+        &mut identity,
+        "num_q_heads",
         base_spec
             .num_q_heads
-            .map(|n| n.to_string())
             .unwrap_or_default()
+            .to_string()
             .as_bytes(),
     );
-    fnv1a_update(
-        &mut h,
+    add_identity_part(
+        &mut identity,
+        "num_kv_heads",
         base_spec
             .num_kv_heads
-            .map(|n| n.to_string())
             .unwrap_or_default()
+            .to_string()
             .as_bytes(),
     );
-    fnv1a_update(&mut h, sm_token.as_bytes());
-    // ABI signature (kernels.toml [abi.*]): the SM-dispatch wrapper extern-declares
-    // each symbol from these; a cached .c carrying the OLD signature is silent UB.
-    fnv1a_update(&mut h, base_spec.public_decl.as_bytes());
-    fnv1a_update(&mut h, base_spec.extern_decl.as_bytes());
-    fnv1a_update(&mut h, base_spec.call_args.as_bytes());
-    // tilelang library pin — the package (not the hashed .py) emits the .cu/cubin, so
-    // a deliberate tilelang bump must bust the cache. Hash the pin file (load_registry
-    // emits rerun-if-changed on it so a pin edit alone re-triggers the build).
-    let reqs =
-        std::fs::read("../../requirements-build.txt").unwrap_or_else(|_| b"<no-reqs>".to_vec());
-    fnv1a_update(&mut h, &reqs);
-    format!("{h:016x}")
+    add_identity_part(
+        &mut identity,
+        "nvcc_argv",
+        tilelang_nvcc_argv(sm_token).as_bytes(),
+    );
+    sha256_bytes(&identity)
 }
 
 /// Per-SM TileLang AOT artifact: (sm token, exported func name, generated .c path).
@@ -906,23 +982,165 @@ fn kernel_cache_root() -> Option<PathBuf> {
     Some(root)
 }
 
-/// nvcc-version fingerprint for the cache key — the cubin-as-text depends on the
-/// compiler, while `tilelang_kernel_src_hash` covers only the kernel source.
-fn nvcc_cache_tag(cuda_path: &str) -> String {
-    let out = Command::new(format!("{cuda_path}/bin/nvcc"))
+fn resolve_executable(program: &str) -> PathBuf {
+    let path = Path::new(program);
+    if path.components().count() > 1 && path.is_file() {
+        return path.to_path_buf();
+    }
+    std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
+        .map(|dir| dir.join(program))
+        .find(|candidate| candidate.is_file())
+        .unwrap_or_else(|| panic!("compiler executable not found: {program}"))
+}
+
+fn compiler_identity(program: &str) -> Vec<u8> {
+    let executable = resolve_executable(program);
+    let output = Command::new(&executable)
         .arg("--version")
         .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-        .unwrap_or_default();
-    let rel = out
+        .unwrap_or_else(|err| panic!("run compiler {}: {err}", executable.display()));
+    assert!(
+        output.status.success(),
+        "compiler identity probe failed: {}",
+        executable.display()
+    );
+    let mut identity = Vec::new();
+    add_identity_part(&mut identity, "binary", &identity_file(executable));
+    add_identity_part(&mut identity, "stdout", &output.stdout);
+    add_identity_part(&mut identity, "stderr", &output.stderr);
+    identity
+}
+
+fn tilelang_toolchain_id(cuda_path: &str) -> &'static str {
+    static ID: OnceLock<String> = OnceLock::new();
+    ID.get_or_init(|| {
+        let mut identity = Vec::new();
+        add_identity_part(
+            &mut identity,
+            "nvcc",
+            &compiler_identity(&format!("{cuda_path}/bin/nvcc")),
+        );
+        add_identity_part(
+            &mut identity,
+            "host_compiler",
+            &compiler_identity(&std::env::var("NVCC_CCBIN").unwrap_or_else(|_| "g++".to_string())),
+        );
+        sha256_bytes(&identity)
+    })
+}
+
+fn tilelang_cache_id(src_hash: &str, sm_token: &str, toolchain_id: &str) -> String {
+    let mut identity = Vec::new();
+    add_identity_part(&mut identity, "source", src_hash.as_bytes());
+    add_identity_part(&mut identity, "toolchain", toolchain_id.as_bytes());
+    add_identity_part(
+        &mut identity,
+        "nvcc_argv",
+        tilelang_nvcc_argv(sm_token).as_bytes(),
+    );
+    sha256_bytes(&identity)
+}
+
+fn metadata_value<'a>(metadata: &'a str, key: &str) -> Option<&'a str> {
+    metadata
         .lines()
-        .find(|l| l.contains("release"))
-        .unwrap_or("")
-        .trim();
-    let mut h: u64 = 0xcbf29ce484222325;
-    fnv1a_update(&mut h, rel.as_bytes());
-    format!("{h:08x}")
+        .find_map(|line| line.strip_prefix(key).map(str::trim))
+        .filter(|value| !value.is_empty())
+}
+
+fn validate_tilelang_artifact(
+    dir: &Path,
+    out_name: &str,
+    src_hash: &str,
+    cache_id: Option<&str>,
+) -> Result<String, String> {
+    let metadata = std::fs::read_to_string(dir.join("meta.txt"))
+        .map_err(|err| format!("read meta.txt: {err}"))?;
+    let value =
+        |key| metadata_value(&metadata, key).ok_or_else(|| format!("meta.txt missing {key}"));
+    if value("SRC_HASH=")? != src_hash {
+        return Err("source hash mismatch".to_string());
+    }
+    let recorded_cache_id = value("CACHE_ID=")?;
+    if cache_id.is_some_and(|expected| recorded_cache_id != expected) {
+        return Err("cache ID mismatch".to_string());
+    }
+    let c_path = dir.join(format!("{out_name}.c"));
+    let output_hash = sha256_bytes(
+        &std::fs::read(&c_path).map_err(|err| format!("read {}: {err}", c_path.display()))?,
+    );
+    if value("OUTPUT_SHA256=")? != output_hash {
+        return Err("output hash mismatch".to_string());
+    }
+    if let Some(expected_cache_id) = cache_id {
+        let marker = std::fs::read_to_string(dir.join(".complete"))
+            .map_err(|err| format!("read .complete: {err}"))?;
+        if metadata_value(&marker, "CACHE_ID=") != Some(expected_cache_id)
+            || metadata_value(&marker, "OUTPUT_SHA256=") != Some(output_hash.as_str())
+        {
+            return Err("completion marker mismatch".to_string());
+        }
+    }
+    Ok(value("FUNC_NAME=")?.to_string())
+}
+
+fn lock_tilelang_cache(root: &Path, cache_id: &str) -> File {
+    let lock_dir = root.join("locks");
+    std::fs::create_dir_all(&lock_dir)
+        .unwrap_or_else(|err| panic!("create cache lock directory {}: {err}", lock_dir.display()));
+    let path = lock_dir.join(format!("{cache_id}.lock"));
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap_or_else(|err| panic!("open cache lock {}: {err}", path.display()));
+    file.lock()
+        .unwrap_or_else(|err| panic!("lock TileLang cache {}: {err}", path.display()));
+    file
+}
+
+fn run_tilelang_cache_identity_self_test(registry: &Registry, out_dir: &Path) {
+    assert_eq!(
+        sha256_bytes(b"abc"),
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    );
+    let (spec, _) = registry_to_specs(registry, false)
+        .into_iter()
+        .next()
+        .expect("registry has a TileLang kernel");
+    let base = tilelang_kernel_src_hash(&spec, "90");
+    let mut changed = spec.clone();
+    changed.public_decl.push_str(" changed");
+    assert_ne!(base, tilelang_kernel_src_hash(&changed, "90"));
+    assert_ne!(base, tilelang_kernel_src_hash(&spec, "89"));
+
+    let dir = out_dir.join("tilelang_cache_identity_self_test");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create cache identity self-test dir");
+    let out_name = "probe";
+    let output = b"int probe(void) { return 0; }\n";
+    let output_hash = sha256_bytes(output);
+    std::fs::write(dir.join("probe.c"), output).expect("write self-test output");
+    std::fs::write(
+        dir.join("meta.txt"),
+        format!(
+            "FUNC_NAME=probe_cuda\nSRC_HASH={base}\nCACHE_ID=cache\nOUTPUT_SHA256={output_hash}\n"
+        ),
+    )
+    .expect("write self-test metadata");
+    std::fs::write(
+        dir.join(".complete"),
+        format!("CACHE_ID=cache\nOUTPUT_SHA256={output_hash}\n"),
+    )
+    .expect("write self-test marker");
+    validate_tilelang_artifact(&dir, out_name, &base, Some("cache")).expect("valid cache fixture");
+    std::fs::write(dir.join("probe.c"), b"corrupt").expect("corrupt self-test output");
+    assert!(validate_tilelang_artifact(&dir, out_name, &base, Some("cache")).is_err());
+    std::fs::remove_dir_all(&dir).expect("remove cache identity self-test dir");
 }
 
 // The shared C ABI signatures (the old TILELANG_DISPATCH_* / GDR_* / FQ_*
@@ -1006,7 +1224,7 @@ fn generate_tilelang_artifacts_per_sm(
     );
     let force_regen = env_truthy("ARLE_TILELANG_REGEN");
     let cache_root = kernel_cache_root();
-    let nvcc_tag = nvcc_cache_tag(cuda_path);
+    let toolchain_id = tilelang_toolchain_id(cuda_path);
     let mut results = Vec::new();
 
     for sm in sm_targets {
@@ -1017,12 +1235,7 @@ fn generate_tilelang_artifacts_per_sm(
         let target = format!("cuda -arch=sm_{sm_token}");
 
         let src_hash = tilelang_kernel_src_hash(base_spec, sm_token);
-        // The dispatch wrapper calls `<kernel_name>_sm<sm>_cuda` (e.g.
-        // `tilelang_batch_decode_paged_hd128_fp8_q32_kv8_run_sm120_cuda`). The
-        // generator's own FUNC_NAME equals this; we derive it for consumed
-        // legacy dirs that don't record a FUNC_NAME in meta.txt.
-        let func_name = format!("{}_sm{sm_token}_cuda", base_spec.kernel_name);
-
+        let cache_id = tilelang_cache_id(&src_hash, sm_token, toolchain_id);
         let per_sm_artifact_dir = format!("{}_sm{sm_token}", base_spec.artifact_dir);
         let per_sm_out_name = format!("{}_sm{sm_token}", base_spec.out_name);
         let per_sm_kernel_name = format!("{}_sm{sm_token}", base_spec.kernel_name);
@@ -1030,21 +1243,22 @@ fn generate_tilelang_artifacts_per_sm(
         let out_artifact_dir = out_dir.join("tilelang_aot").join(&per_sm_artifact_dir);
         let vendored_c = vendored_dir.join(format!("{per_sm_out_name}.c"));
 
-        // Decide consume-vs-regen: a vendored `.c` plus a matching (or
-        // legacy-absent) SRC_HASH lets us skip tilelang entirely.
-        let meta_path = vendored_dir.join("meta.txt");
-        let vendored_meta = std::fs::read_to_string(&meta_path).ok();
-        let vendored_src_hash = vendored_meta.as_deref().and_then(|m| {
-            m.lines()
-                .find_map(|line| line.strip_prefix("SRC_HASH=").map(|h| h.trim().to_string()))
-        });
-        let hash_ok = match &vendored_src_hash {
-            Some(h) => h == &src_hash, // recorded hash must match the current source
-            None => true,              // legacy / no SRC_HASH line — trust the vendored artifact
+        let vendored_func = if !force_regen && vendored_dir.exists() {
+            match validate_tilelang_artifact(&vendored_dir, &per_sm_out_name, &src_hash, None) {
+                Ok(func) => Some(func),
+                Err(err) => {
+                    println!(
+                        "cargo:warning=rejecting invalid vendored TileLang artifact {}: {err}",
+                        vendored_dir.display()
+                    );
+                    None
+                }
+            }
+        } else {
+            None
         };
-        let can_consume = !force_regen && vendored_c.is_file() && hash_ok;
-
-        if can_consume {
+        if let Some(func) = vendored_func {
+            let _ = std::fs::remove_dir_all(&out_artifact_dir);
             copy_dir_recursive(&vendored_dir, &out_artifact_dir).unwrap_or_else(|err| {
                 panic!(
                     "consume vendored TileLang artifact {} -> {}: {err}",
@@ -1052,62 +1266,49 @@ fn generate_tilelang_artifacts_per_sm(
                     out_artifact_dir.display()
                 )
             });
-            let func = vendored_meta
-                .as_deref()
-                .and_then(|m| {
-                    m.lines().find_map(|line| {
-                        line.strip_prefix("FUNC_NAME=")
-                            .map(|f| f.trim().to_string())
-                    })
-                })
-                .unwrap_or_else(|| func_name.clone());
             let consumed_c = out_artifact_dir.join(format!("{per_sm_out_name}.c"));
-            // Re-trigger build.rs if the vendored `.c` or the kernel source changes.
             println!("cargo:rerun-if-changed={}", vendored_c.display());
             println!("cargo:rerun-if-changed={}", base_spec.kernel_path);
             results.push((sm_token.clone(), func, consumed_c));
             continue;
         }
 
-        // Cache tier: restore a prior build's identical regen — keyed on the
-        // source hash + nvcc — from the persistent cache, skipping TileLang+nvcc.
-        let cache_entry = cache_root.as_ref().map(|r| {
-            r.join(format!("{src_hash}-{nvcc_tag}"))
-                .join(&per_sm_artifact_dir)
-        });
-        if let Some(entry) = &cache_entry {
-            // Require the .complete marker (written last under an atomic rename), not
-            // just the .c — a torn/killed/concurrent store must read as a miss.
-            // M3: a concurrent store's `remove_dir_all` can race this restore copy.
-            // On copy error, fall through to regen (log + continue to the build
-            // path below) instead of aborting the whole build.
-            if !force_regen && entry.join(".complete").is_file() {
-                match copy_dir_recursive(entry, &out_artifact_dir) {
-                    Ok(()) => {
-                        let func = std::fs::read_to_string(entry.join("meta.txt"))
-                            .ok()
-                            .and_then(|m| {
-                                m.lines().find_map(|line| {
-                                    line.strip_prefix("FUNC_NAME=")
-                                        .map(|f| f.trim().to_string())
-                                })
-                            })
-                            .unwrap_or_else(|| func_name.clone());
-                        println!("cargo:rerun-if-changed={}", base_spec.kernel_path);
-                        results.push((
-                            sm_token.clone(),
-                            func,
-                            out_artifact_dir.join(format!("{per_sm_out_name}.c")),
-                        ));
-                        continue;
-                    }
-                    Err(err) => {
-                        println!(
-                            "cargo:warning=cache restore raced (regenerating): {} -> {}: {err}",
+        let cache_entry = cache_root
+            .as_ref()
+            .map(|root| root.join("objects").join(&cache_id));
+        let _cache_lock = cache_root
+            .as_ref()
+            .map(|root| lock_tilelang_cache(root, &cache_id));
+        if let Some(entry) = &cache_entry
+            && !force_regen
+        {
+            match validate_tilelang_artifact(entry, &per_sm_out_name, &src_hash, Some(&cache_id)) {
+                Ok(func) => {
+                    let _ = std::fs::remove_dir_all(&out_artifact_dir);
+                    copy_dir_recursive(entry, &out_artifact_dir).unwrap_or_else(|err| {
+                        panic!(
+                            "restore TileLang cache {} -> {}: {err}",
                             entry.display(),
                             out_artifact_dir.display()
-                        );
-                    }
+                        )
+                    });
+                    println!("cargo:rerun-if-changed={}", base_spec.kernel_path);
+                    results.push((
+                        sm_token.clone(),
+                        func,
+                        out_artifact_dir.join(format!("{per_sm_out_name}.c")),
+                    ));
+                    continue;
+                }
+                Err(_) if !entry.exists() => {}
+                Err(err) => {
+                    println!(
+                        "cargo:warning=discarding invalid TileLang cache {}: {err}",
+                        entry.display()
+                    );
+                    std::fs::remove_dir_all(entry).unwrap_or_else(|remove_err| {
+                        panic!("remove invalid cache {}: {remove_err}", entry.display())
+                    });
                 }
             }
         }
@@ -1115,6 +1316,7 @@ fn generate_tilelang_artifacts_per_sm(
         // Regen: resolve tilelang lazily (panics if unavailable) and run the
         // generator exactly as before.
         let (python, tilelang_src, cutlass_include) = tl.get();
+        let _ = std::fs::remove_dir_all(&out_artifact_dir);
 
         let output = Command::new(python)
             .arg(&generator_path)
@@ -1202,37 +1404,45 @@ fn generate_tilelang_artifacts_per_sm(
         }
         let gen_func_name = gen_func_name.expect("TileLang generator did not print FUNC_NAME");
         let c_path = c_path.expect("TileLang generator did not print C_PATH");
+        let output_hash = sha256_bytes(
+            &std::fs::read(&c_path)
+                .unwrap_or_else(|err| panic!("read generated output {}: {err}", c_path.display())),
+        );
 
-        // Record the generator's authoritative FUNC_NAME + the source hash so the
-        // export path vendors them and future builds can verify consume-safety.
         std::fs::write(
             out_artifact_dir.join("meta.txt"),
-            format!("FUNC_NAME={gen_func_name}\nSRC_HASH={src_hash}\n"),
+            format!(
+                "FUNC_NAME={gen_func_name}\nSRC_HASH={src_hash}\nCACHE_ID={cache_id}\nOUTPUT_SHA256={output_hash}\n"
+            ),
         )
         .unwrap_or_else(|err| panic!("write meta.txt for {}: {err}", out_artifact_dir.display()));
+        validate_tilelang_artifact(&out_artifact_dir, &per_sm_out_name, &src_hash, None)
+            .unwrap_or_else(|err| panic!("validate generated artifact: {err}"));
 
-        // Populate the persistent cache so future clean/CI builds skip this regen.
-        // Atomic + parallel-safe: stage in a per-pid temp dir, write the .complete
-        // marker LAST, then rename into place. A torn/killed/concurrent store reads as
-        // a miss (redundant regen), never a corrupt or partial kernel.
-        // ponytail: the remove-then-rename window degrades a racing restore to a
-        // redundant regen, not corruption — acceptable; per-key flock if it churns.
         if let Some(entry) = &cache_entry {
-            if let Some(parent) = entry.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let staging = entry.with_file_name(format!(
-                "{per_sm_artifact_dir}.staging.{}",
-                std::process::id()
-            ));
+            let parent = entry.parent().expect("cache entry has parent");
+            std::fs::create_dir_all(parent)
+                .unwrap_or_else(|err| panic!("create cache directory {}: {err}", parent.display()));
+            let staging =
+                entry.with_file_name(format!("{cache_id}.staging.{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&staging);
-            if copy_dir_recursive(&out_artifact_dir, &staging).is_ok()
-                && std::fs::write(staging.join(".complete"), src_hash.as_bytes()).is_ok()
-            {
-                let _ = std::fs::remove_dir_all(entry);
-                let _ = std::fs::rename(&staging, entry);
-            }
-            let _ = std::fs::remove_dir_all(&staging);
+            copy_dir_recursive(&out_artifact_dir, &staging)
+                .unwrap_or_else(|err| panic!("stage TileLang cache {}: {err}", staging.display()));
+            std::fs::write(
+                staging.join(".complete"),
+                format!("CACHE_ID={cache_id}\nOUTPUT_SHA256={output_hash}\n"),
+            )
+            .unwrap_or_else(|err| panic!("write cache marker {}: {err}", staging.display()));
+            validate_tilelang_artifact(&staging, &per_sm_out_name, &src_hash, Some(&cache_id))
+                .unwrap_or_else(|err| panic!("validate staged cache {}: {err}", staging.display()));
+            let _ = std::fs::remove_dir_all(entry);
+            std::fs::rename(&staging, entry).unwrap_or_else(|err| {
+                panic!(
+                    "publish TileLang cache {} -> {}: {err}",
+                    staging.display(),
+                    entry.display()
+                )
+            });
         }
 
         results.push((sm_token.clone(), gen_func_name, c_path));
@@ -1920,6 +2130,11 @@ fn main() {
     let registry = load_registry();
     let early_out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     emit_ffi_generated(&registry, &early_out_dir);
+    println!("cargo:rerun-if-env-changed=ARLE_TILELANG_CACHE_ID_SELF_TEST");
+    if env_truthy("ARLE_TILELANG_CACHE_ID_SELF_TEST") {
+        run_tilelang_cache_identity_self_test(&registry, &early_out_dir);
+        println!("cargo:warning=TileLang cache identity self-test passed");
+    }
 
     if std::env::var("CARGO_FEATURE_CUDA").is_err() {
         println!("cargo:warning=cuda feature inactive: skipping CUDA/TileLang kernel compilation.");

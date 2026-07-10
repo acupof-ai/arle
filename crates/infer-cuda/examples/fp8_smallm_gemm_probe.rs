@@ -262,33 +262,6 @@ mod real {
         report(label, "gemv", m, n, k, weight_gb, &gemv);
         let reference_out = ctx.stream.clone_dtoh(&out)?;
 
-        if m == 1 {
-            let mut probe_out = ctx.stream.alloc_zeros::<f32>(n)?;
-            for mode in [0i32, 1] {
-                // SAFETY: the weight and probe output allocations cover N*K and N.
-                let s = timed(ctx, iters, samples, || unsafe {
-                    let (wp, _gw) = w.device_ptr(&ctx.stream);
-                    let (op, _go) = probe_out.device_ptr_mut(&ctx.stream);
-                    ffi::gemv_fp8_wread_probe_cuda(
-                        wp as *const u8,
-                        op as *mut f32,
-                        n as i32,
-                        k as i32,
-                        mode,
-                        ctx.stream.cu_stream(),
-                    )
-                    .result()?;
-                    Ok(())
-                })?;
-                let route = if mode == 0 {
-                    "wread_raw"
-                } else {
-                    "wread_decode"
-                };
-                report(label, route, m, n, k, weight_gb, &s);
-            }
-        }
-
         if !deepgemm {
             return Ok(None);
         }
