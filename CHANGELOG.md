@@ -25,6 +25,15 @@ lifecycle & progress spine).
 
 ### Verdicts
 
+- **2026-07-10 — DSpark-on-OPD default flip: quality-neutral LICENSED
+  (opt-in), concurrency ≥4 DEFERRED**: final gate — pass-rate quality-neutral
+  (n=16 dspark 9/16 ≥ plain 7/16, zero systematic per-task loss, CIs overlap;
+  lossless-spec expectation confirmed). c=1 aggregate 1.9×; c≥4 unattributable
+  under shared-box KV clamp (DFlash draft reserves 2560 MB/slot → co-tenant
+  46 GB squeezes slots 256→6, OOM — not a dspark structural failure). No code
+  default changed: dspark stays the licensed opt-in (`--dspark-draft-model`)
+  until a clean-GPU c-sweep clears the concurrency leg.
+  [wins](docs/experience/wins/2026-07-10-dspark-opd-default-flip-gate.md)
 - **2026-07-10 — DSv4 Route A prefix reuse: LICENSED (identity formula fix)**:
   `prepare_kv_batch` and `mirror_full_band` hardcoded `slot*lsp + i` instead of
   using engine-provided `slot_pages[i]`. Fixed in 2 files (+10/-14 LOC).
