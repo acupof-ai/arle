@@ -7,19 +7,41 @@
 # -> curve PNG/JSON. One H20 GPU. Plan:
 # docs/plans/2026-07-03-agentic-opd-27b-capability-curve.md
 #
-# Required env:
-#   STUDENT_MODEL   student model dir (27B Qwen3.6-FP8 safetensors layout)
+# Models auto-download from HF if not local (set HF_ENDPOINT=https://hf-mirror.com
+# for the mirror). DSpark spec decode is ON by default (draft auto-fetched).
 # Optional env (full-run defaults; SMOKE=1 = 2-round sizing run):
-#   ARLE_BIN=target/release/arle  OUT_ROOT=runs  GPU=0
+#   ARLE_BIN=target/release/arle  OUT_ROOT=runs  GPU=0  MODEL_CACHE=models
+#   STUDENT_MODEL=<dir>           override student (else fetch STUDENT_MODEL_HF_ID)
+#   STUDENT_MODEL_HF_ID=Qwen/Qwen3.6-27B-FP8
+#   DSPARK=1                      1=spec decode on (default), 0=plain rollout
+#   DSPARK_DRAFT_HF_ID=z-lab/Qwen3.6-27B-DFlash   DSPARK_CONF_THRESHOLD=0.0
 #   ROUNDS=16 SAMPLES=2 MAX_TURNS=8 MAX_TOKENS=768 EVAL_EVERY=2 EVAL_N=24
 #   TASK_LIMIT=12 WRITEBACK_CAP=8 BASE_REPEATS=2 DIFFICULTY=easy SEED=0
 set -euo pipefail
 
 LABEL=${1:?usage: agent_opd_curve.sh <label>}
-STUDENT_MODEL=${STUDENT_MODEL:?set STUDENT_MODEL to the student model dir}
 ARLE_BIN=${ARLE_BIN:-target/release/arle}
 OUT=${OUT_ROOT:-runs}/agent-opd-"$LABEL"
 GPU=${GPU:-0}
+
+# Models: use a local dir if given, else auto-fetch from HF (honors HF_ENDPOINT
+# mirror, e.g. https://hf-mirror.com). STUDENT + DSpark draft both auto-download.
+MODEL_CACHE=${MODEL_CACHE:-models}
+STUDENT_MODEL_HF_ID=${STUDENT_MODEL_HF_ID:-Qwen/Qwen3.6-27B-FP8}
+DSPARK_DRAFT_HF_ID=${DSPARK_DRAFT_HF_ID:-z-lab/Qwen3.6-27B-DFlash}
+
+ensure_hf_model() {  # <hf_id> -> echoes local dir, downloads if absent
+    local hf_id=$1 dst="$MODEL_CACHE/${1##*/}"
+    if [[ ! -f $dst/config.json ]]; then
+        echo "[curve] fetching $hf_id -> $dst (HF_ENDPOINT=${HF_ENDPOINT:-huggingface.co})" >&2
+        huggingface-cli download "$hf_id" --local-dir "$dst" >&2 \
+            || { echo "download failed: $hf_id" >&2; return 1; }
+    fi
+    echo "$dst"
+}
+
+command -v huggingface-cli >/dev/null || { echo "huggingface-cli missing (pip install huggingface_hub)" >&2; exit 1; }
+STUDENT_MODEL=${STUDENT_MODEL:-$(ensure_hf_model "$STUDENT_MODEL_HF_ID")}
 
 if [[ ${SMOKE:-0} == 1 ]]; then
     ROUNDS=${ROUNDS:-2} SAMPLES=${SAMPLES:-2} EVAL_EVERY=${EVAL_EVERY:-1}
@@ -30,6 +52,15 @@ else
 fi
 MAX_TURNS=${MAX_TURNS:-8} MAX_TOKENS=${MAX_TOKENS:-768}
 WRITEBACK_CAP=${WRITEBACK_CAP:-8} DIFFICULTY=${DIFFICULTY:-easy} SEED=${SEED:-0}
+# DSpark spec decode on the B=1 rollout lane (licensed 2026-07-10: quality-neutral,
+# ~1.9x single-stream). ON by default — auto-fetches the draft; DSPARK=0 disables.
+# conf=0 is the licensed default (truncation strictly hurt at this shape).
+DSPARK_CONF_THRESHOLD=${DSPARK_CONF_THRESHOLD:-0.0}
+if [[ ${DSPARK:-1} == 1 ]]; then
+    DSPARK_DRAFT_MODEL=${DSPARK_DRAFT_MODEL:-$(ensure_hf_model "$DSPARK_DRAFT_HF_ID")}
+else
+    DSPARK_DRAFT_MODEL=""
+fi
 
 command -v python3 >/dev/null || { echo "python3 missing" >&2; exit 1; }
 python3 -m pytest --version >/dev/null 2>&1 || { echo "pytest missing (scoring needs it)" >&2; exit 1; }
@@ -65,6 +96,11 @@ train_args=(
     --save-lora-adapters "$OUT/adapters"
     --save-every 0
 )
+if [[ -n $DSPARK_DRAFT_MODEL ]]; then
+    train_args+=(--dspark-draft-model "$DSPARK_DRAFT_MODEL"
+                 --dspark-conf-threshold "$DSPARK_CONF_THRESHOLD")
+    echo "[curve] DSpark spec decode ON: draft=$DSPARK_DRAFT_MODEL conf=$DSPARK_CONF_THRESHOLD"
+fi
 
 # 2. Baseline non-determinism envelope: same-config eval-only repeats
 #    (--rounds 0 runs just the round-0 baseline eval, trains nothing).
