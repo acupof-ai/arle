@@ -25,18 +25,23 @@ pub fn apply_runtime_flags(f: &MetalRuntimeFlags) {
     *SPEC.lock().expect("metal runtime flags lock") = f.clone();
 }
 
+#[cfg_attr(not(feature = "metal"), allow(dead_code))]
 pub(crate) fn pipeline() -> bool {
     PIPELINE.load(Relaxed)
 }
+#[cfg_attr(not(feature = "metal"), allow(dead_code))]
 pub(crate) fn warmup() -> bool {
     WARMUP.load(Relaxed)
 }
+#[cfg_attr(not(feature = "metal"), allow(dead_code))]
 pub(crate) fn paged_kv_read() -> bool {
     PAGED_KV_READ.load(Relaxed)
 }
+#[cfg_attr(not(feature = "metal"), allow(dead_code))]
 pub(crate) fn host_sampling() -> bool {
     HOST_SAMPLING.load(Relaxed)
 }
+#[cfg_attr(not(feature = "metal"), allow(dead_code))]
 pub(crate) fn spec_flags() -> MetalRuntimeFlags {
     SPEC.lock().expect("metal runtime flags lock").clone()
 }
