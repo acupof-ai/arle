@@ -312,6 +312,13 @@ pub(crate) struct Dsv4PrefixStatePool {
     /// evicted the hottest first-published preamble under DRAM pressure and
     /// floor-0-locked the whole chain.
     lru: std::collections::BTreeSet<(bool, u64, u32)>,
+    /// Frontier page id → the sub-page tail token ids `[matched_len, finish_len)`
+    /// carried by that page's finish-write-through entry. The content-identity
+    /// index: the radix proves identity only to the page boundary, so a restore
+    /// that extends into the tail MUST verify these against the requesting
+    /// prompt (a `&self` reusable scan can't `read_entry`, which is `&mut`, so
+    /// the ids live here in memory, not just in the serialized entry).
+    frontier_tails: BTreeMap<u32, Vec<u32>>,
     clock: u64,
     entry_bytes: usize,
 }
@@ -322,6 +329,7 @@ impl Dsv4PrefixStatePool {
             store: KvTierStore::with_budget(budget_bytes, entry_bytes.max(1)),
             meta: BTreeMap::new(),
             lru: std::collections::BTreeSet::new(),
+            frontier_tails: BTreeMap::new(),
             clock: 0,
             entry_bytes: entry_bytes.max(1),
         }
@@ -333,6 +341,22 @@ impl Dsv4PrefixStatePool {
         self.store = KvTierStore::with_budget(bytes, self.entry_bytes);
         self.meta.clear();
         self.lru.clear();
+        self.frontier_tails.clear();
+    }
+
+    /// Record the finish-frontier tail token ids for `page_id` (empty ⇒ clear).
+    /// Set by `capture_finish_frontier` after publishing the frontier entry.
+    pub(crate) fn set_frontier_tail(&mut self, page_id: u32, tokens: Vec<u32>) {
+        if tokens.is_empty() {
+            self.frontier_tails.remove(&page_id);
+        } else {
+            self.frontier_tails.insert(page_id, tokens);
+        }
+    }
+
+    /// The finish-frontier tail token ids for `page_id`, if it carries one.
+    pub(crate) fn frontier_tail_tokens(&self, page_id: u32) -> Option<&[u32]> {
+        self.frontier_tails.get(&page_id).map(Vec::as_slice)
     }
 
     fn next_stamp(&mut self) -> u64 {
@@ -415,6 +439,9 @@ impl Dsv4PrefixStatePool {
                 stamp,
             },
         );
+        // A republish overwrites content; the finish tail (if any) is set
+        // separately by `set_frontier_tail` right after — clear any stale one.
+        self.frontier_tails.remove(&page_id);
         true
     }
 
@@ -456,10 +483,15 @@ impl Dsv4PrefixStatePool {
         let Ok(bytes) = self.store.read(own_key).map(|b| b.into_owned()) else {
             return;
         };
+        // Carry the frontier tail across the re-key (remove_pages drops own's).
+        let own_tail = self.frontier_tails.get(&own).cloned();
         self.remove_pages(&[own]);
         let canonical_key = tier_key(NS_PREFIX_STATE, u64::from(canonical));
         if !self.store.insert(canonical_key, bytes) {
             return;
+        }
+        if let Some(tail) = own_tail {
+            self.frontier_tails.insert(canonical, tail);
         }
         let stamp = self.next_stamp();
         self.lru.insert((true, stamp, canonical));
@@ -522,6 +554,7 @@ impl Dsv4PrefixStatePool {
         let keys: Vec<u64> = pages
             .iter()
             .filter_map(|&p| {
+                self.frontier_tails.remove(&p);
                 let meta = self.meta.remove(&p)?;
                 self.lru.remove(&(meta.confirmed, meta.stamp, p));
                 Some(tier_key(NS_PREFIX_STATE, u64::from(p)))

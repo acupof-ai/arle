@@ -380,6 +380,21 @@ impl RealCudaExecutor {
         }
     }
 
+    /// Reuse length for admitting a request whose prompt is `tokens`. Only DSv4
+    /// finish-write-through differs from the plain count (it content-verifies its
+    /// sub-page tail against the prompt); the others ignore `tokens`.
+    pub(crate) fn reusable_prefix_blocks_for_prompt(
+        &self,
+        blocks: &[PrefixBlock],
+        tokens: &[u32],
+    ) -> usize {
+        match self {
+            Self::Dsv4(d) => d.reusable_prefix_blocks_for_prompt(blocks, tokens),
+            Self::Qwen(q) => q.reusable_prefix_blocks(blocks),
+            Self::Qwen35(q) => q.reusable_prefix_blocks(blocks),
+        }
+    }
+
     pub(crate) fn demote_prefix_pages(&mut self, entries: &[(u32, u64)]) -> Result<usize> {
         match self {
             Self::Qwen(q) => q.demote_prefix_pages(entries),
@@ -486,7 +501,7 @@ impl RealCudaExecutor {
             Self::Qwen35(q) => q
                 .restore_recurrent_sidecar(slot, tokens, matched_len, prefix_pages)
                 .map(|()| 0),
-            Self::Dsv4(d) => d.restore_prefix_state(slot, matched_len, prefix_pages),
+            Self::Dsv4(d) => d.restore_prefix_state(slot, tokens, matched_len, prefix_pages),
             Self::Qwen(_) => Ok(0),
         }
     }
