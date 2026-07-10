@@ -1,0 +1,27 @@
+.github/workflows/kernels-publish.yml
+  s_085ea8e74b8fbb::t_0e095b291596cc 4-6,28-29,71,74-76,79-85,107
+.github/workflows/release.yml
+  s_085ea8e74b8fbb::t_54e46491277472 78-80
+scripts/cuda_prebuilt_manifest.sh
+  s_085ea8e74b8fbb::t_ab12c354c76c01 11-51,57-88,91-97,102-111,113,115-116,120-128,131,134-145,148-149,151,153-155
+scripts/kernel_artifacts.sh
+  s_085ea8e74b8fbb::t_b14527229e080e 2-4,6,10-16,18-27,29-119,121-141,143-265
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "6319e2de55e8766944e533ccd9c46faf1e4ef745",
+  "prompts": {},
+  "sessions": {
+    "s_085ea8e74b8fbb": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f4abd-5663-70d2-b878-3ff064995c01",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
