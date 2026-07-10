@@ -1,0 +1,25 @@
+CHANGELOG.md
+  s_1112c7217a3966::t_431b81ad24e0fb 28-36
+docs/experience/wins/2026-07-10-qwen-fp8-smallm-deepgemm-crossover.md
+  s_1112c7217a3966::t_6ef3ae1797e5d4 1-103
+docs/plans/2026-07-09-dspark-dflash-spec-decode-qwen36.md
+  s_1112c7217a3966::t_e5ef83cc8344d0 122-127
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "095dcca6ab4abfe84499746d7d589e9b3299a7f1",
+  "prompts": {},
+  "sessions": {
+    "s_1112c7217a3966": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aa6b28f3141cd606e",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
