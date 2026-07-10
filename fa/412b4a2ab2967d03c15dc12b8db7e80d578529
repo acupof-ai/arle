@@ -1,0 +1,21 @@
+scripts/run_fp8_probe.sh
+  s_9ef059a5bbb199::t_ca363382fbe4ec 46-48,51-52
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "fa412b4a2ab2967d03c15dc12b8db7e80d578529",
+  "prompts": {},
+  "sessions": {
+    "s_9ef059a5bbb199": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0b4e7f58-825f-4410-ad74-7dd92c504bd3",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
