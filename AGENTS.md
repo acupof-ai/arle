@@ -261,7 +261,7 @@ source of truth: [`docs/codebase-map.md`](docs/codebase-map.md).
 |-------|----------------|
 | **Explore** (trace callers, grep prior art, list trait implementors) | You can name every file you will touch. |
 | **Plan** (ask "how would this fail?" first; >5 files or irreversible → stop + flag) | Written approach the user accepted. |
-| **Implement** (check prior art in `crates/infer-*/src/` + `docs/`; outside plan → update plan) | Diff compiles under the relevant feature set. |
+| **Implement** (check prior art in `crates/infer-*/src/` + `docs/`; outside plan → update plan) | Diff compiles + passed a **simplify pass** (§0.2: delete before add, collapse duplication, lowest-entropy correct form). |
 | **Verify** (`cargo test --workspace`; justify every new `unwrap()`/alloc/async path; **bench entry per §Benchmarks** if in-scope) | Tests green, `cargo clippy -- -D warnings` clean, **wins/ entry committed (or stub `pending-remote`)**. |
 | **Reflect** (bug >1 attempt → `docs/experience/errors/`; correction → feedback memory) | Experience entry committed. |
 
