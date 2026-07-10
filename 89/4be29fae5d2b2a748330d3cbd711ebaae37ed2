@@ -1,0 +1,25 @@
+crates/train/src/opd.rs
+  s_9c91b86ec3fb55::t_42411d8c0b036e 3060-3064,3067,3217,3471
+crates/train/src/runtime_flags.rs
+  s_9c91b86ec3fb55::t_a4662810d08c0a 73-87
+docs/experience/wins/2026-07-11-agent-opd-dspark-decode-and-seq-adaptive-offload.md
+  s_9c91b86ec3fb55::t_ae5cbae52838e5 1-77
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "894be29fae5d2b2a748330d3cbd711ebaae37ed2",
+  "prompts": {},
+  "sessions": {
+    "s_9c91b86ec3fb55": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4779911a-69b7-49db-bc83-daf5a48d6ca3",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
