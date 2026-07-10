@@ -25,6 +25,18 @@ lifecycle & progress spine).
 
 ### Verdicts
 
+- **2026-07-10 — DSv4 KV-reuse Phases 2b+3b SHIPPED** (#154): whole-slot
+  park deleted (−869 LOC; preemption rides the 2a prefix-state pool;
+  `--kv-oversubscription` on DSv4 now fails loud) and FlashMLA bands are
+  demand-paged — the 16K slot cliff dissolves (**3 → 117 slots** at
+  `--max-total-tokens 16384`, same-day paired A/B). Correctness lanes
+  green (E1 15/15 ×2 arms, E2 10/10 @4.16× warm TTFT, restore→batched
+  kill-test 25/30→30/30 post codex-R3 fix); E6 c=4 wall **+3.8%** miss
+  documented with attribution (slots 0.9pp; zeroing/growth-storm ruled out
+  by ablation; residual needs nsys). Wins:
+  `docs/experience/wins/2026-07-10-dsv4-park-deletion-phase2b.md`,
+  `docs/experience/wins/2026-07-10-dsv4-band-demand-paging-phase3b.md`.
+
 - **2026-07-10 — DSpark on the OPD rollout serve: wall-clock POSITIVE**
   (first e2e A/B, CC-as-harness, 16 real swe_smith tasks): matched-task
   rollout wall **−25.1%**, 4.11 tok/step, partial-ctx engaged on 90% of
