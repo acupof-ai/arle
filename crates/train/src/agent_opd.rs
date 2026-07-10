@@ -133,6 +133,7 @@ mod cuda_rollout {
     use chat::{ToolCall, ToolDefinition};
     use serde_json::json;
 
+    use crate::aopd_profile;
     use crate::infer_student::InferStudent;
     use crate::sandbox::{
         SandboxToolExecutor, boot_workdir, diff_workdir, reset_workdir, score_workdir,
@@ -424,12 +425,14 @@ mod cuda_rollout {
             for (task, staged_tree) in tasks {
                 eprintln!("[dbg-opd] boot_workdir for {}", task.instance_id);
                 report.tasks += 1;
-                let workdir = boot_workdir(
-                    &cfg.work_root,
-                    &task.instance_id,
-                    staged_tree,
-                    task.before_repo_set_cmd.as_deref(),
-                )
+                let workdir = aopd_profile::time_try("sandbox_boot", aopd_profile::WALL, || {
+                    boot_workdir(
+                        &cfg.work_root,
+                        &task.instance_id,
+                        staged_tree,
+                        task.before_repo_set_cmd.as_deref(),
+                    )
+                })
                 .with_context(|| format!("boot sandbox for {}", task.instance_id))?;
                 eprintln!("[dbg-opd] boot_workdir done for {}", task.instance_id);
                 let executor = SandboxToolExecutor::new(
@@ -446,10 +449,12 @@ mod cuda_rollout {
                     task.instance_id,
                     std::env::var("ARLE_SPAWNER_SOCKET").ok()
                 );
-                let overview = executor.execute(&ToolCall::new(
-                    "bash",
-                    json!({ "command": "ls && echo '---' && git log -1 --oneline 2>/dev/null" }),
-                ));
+                let overview = aopd_profile::time("sandbox_overview", aopd_profile::WALL, || {
+                    executor.execute(&ToolCall::new(
+                        "bash",
+                        json!({ "command": "ls && echo '---' && git log -1 --oneline 2>/dev/null" }),
+                    ))
+                });
                 eprintln!("[dbg-opd] overview done len={}", overview.len());
                 let user_prompt = format!(
                     "{}\n\nRepo layout (cwd = repo root):\n{}",
@@ -475,11 +480,14 @@ mod cuda_rollout {
                         report.rescue_rollouts += 1;
                     }
                     eprintln!("[dbg-opd] sample={sample} rescue={rescue} reset_workdir");
-                    reset_workdir(&workdir)
-                        .with_context(|| format!("reset sandbox for {}", task.instance_id))?;
+                    aopd_profile::time_try("sandbox_reset", aopd_profile::WALL, || {
+                        reset_workdir(&workdir)
+                    })
+                    .with_context(|| format!("reset sandbox for {}", task.instance_id))?;
                     eprintln!("[dbg-opd] sample={sample} run_turn START");
                     let mut session =
                         AgentSession::with_system_prompt(agent_system_prompt(task, cfg.think));
+                    let rollout_t0 = std::time::Instant::now();
                     let result = {
                         let mut guard = student
                             .engine()
@@ -495,10 +503,14 @@ mod cuda_rollout {
                             if rescue { rescue_settings } else { settings },
                         )
                     };
+                    let rollout_wall = rollout_t0.elapsed().as_secs_f64();
                     report.rollouts += 1;
                     let result = match result {
                         Ok(r) => r,
                         Err(e) => {
+                            // Failed rollout wall is unattributable to a sub-turn; bill it
+                            // to decode (the engine call is where it died).
+                            aopd_profile::record("rollout_decode", aopd_profile::GPU, rollout_wall);
                             eprintln!(
                                 "[agent-opd] {} sample {sample}: rollout error: {e}",
                                 task.instance_id
@@ -506,6 +518,16 @@ mod cuda_rollout {
                             continue;
                         }
                     };
+                    // Split the rollout wall: per-sub-turn engine decode (GPU-bound,
+                    // captured by the agent loop) vs the residual (tool exec — bash /
+                    // pytest via the sandbox executor, pure host wall).
+                    let decode_secs: f64 = result.sub_turns.iter().map(|st| st.decode_secs).sum();
+                    aopd_profile::record("rollout_decode", aopd_profile::GPU, decode_secs);
+                    aopd_profile::record(
+                        "rollout_tool_exec",
+                        aopd_profile::WALL,
+                        (rollout_wall - decode_secs).max(0.0),
+                    );
 
                     // T2: observe rollout counts/timings BEFORE the accept path drops
                     // them. Pure aggregation — does not gate accept/train.
@@ -549,7 +571,9 @@ mod cuda_rollout {
                         }
                     }
 
-                    let diff = diff_workdir(&workdir).unwrap_or_default();
+                    let diff = aopd_profile::time("rollout_diff", aopd_profile::WALL, || {
+                        diff_workdir(&workdir).unwrap_or_default()
+                    });
                     if diff.trim().is_empty() {
                         eprintln!(
                             "[agent-opd] {} sample {sample}: no edits (turns={}, {:?})",
@@ -558,12 +582,18 @@ mod cuda_rollout {
                         continue;
                     }
 
-                    let passed = match score_workdir(
-                        &workdir,
-                        &task.test_patch,
-                        &task.fail_to_pass(),
-                        cfg.pythonpath.as_deref(),
-                        cfg.test_timeout_secs,
+                    let passed = match aopd_profile::time(
+                        "score_pytest",
+                        aopd_profile::WALL,
+                        || {
+                            score_workdir(
+                                &workdir,
+                                &task.test_patch,
+                                &task.fail_to_pass(),
+                                cfg.pythonpath.as_deref(),
+                                cfg.test_timeout_secs,
+                            )
+                        },
                     ) {
                         Ok((passed, log)) => {
                             eprintln!(
@@ -622,8 +652,13 @@ mod cuda_rollout {
             report.trained_pairs = accepted_trajectories.len();
 
             for (prompt_ids, response_ids, response_mask) in &accepted_trajectories {
-                let loss = train_on_accepted(prompt_ids, response_ids, response_mask)
-                    .with_context(|| format!("masked CE writeback (round {round})"))?;
+                // `train_on_accepted` = scratch/KV release + masked-CE forward +
+                // backward + optimizer step (one accepted trajectory). GPU-bound; the
+                // loss D2H forces a device sync so the wall is GPU-inclusive.
+                let loss = aopd_profile::time_try("writeback", aopd_profile::GPU, || {
+                    train_on_accepted(prompt_ids, response_ids, response_mask)
+                })
+                .with_context(|| format!("masked CE writeback (round {round})"))?;
                 loss_sum += loss;
                 loss_steps += 1;
             }

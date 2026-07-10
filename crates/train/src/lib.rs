@@ -12,6 +12,8 @@
 
 #[path = "agent_opd.rs"]
 pub mod agent_opd;
+#[path = "aopd_profile.rs"]
+pub mod aopd_profile;
 #[path = "causal_lm.rs"]
 pub mod causal_lm;
 #[path = "cc_convert.rs"]
