@@ -768,6 +768,12 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         self.executor.spec_decode_stats()
     }
 
+    /// Cumulative operator-policy identity and dispatch counters from the backend.
+    #[must_use]
+    pub fn operator_dispatch_stats(&self) -> infer_seam::OperatorDispatchStats {
+        self.executor.operator_dispatch_stats()
+    }
+
     #[must_use]
     pub fn kv_system_metrics(&self) -> KvSystemMetrics {
         let mut metrics = self.kv_system_metrics;
