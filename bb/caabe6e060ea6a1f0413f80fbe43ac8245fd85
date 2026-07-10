@@ -1,0 +1,33 @@
+docs/index.md
+  s_471d059b5d23bf::t_3657e91c26c6f5 77
+docs/plans/2026-07-10-operator-artifact-dev-release-system.md
+  s_89390f18fb950a::t_1f052f5d1e0288 1-1258
+docs/reviews/2026-07-10-operator-platform-m0-readonly-audit.md
+  s_89390f18fb950a::t_e91ca2a5375212 1-396
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "bbcaabe6e060ea6a1f0413f80fbe43ac8245fd85",
+  "prompts": {},
+  "sessions": {
+    "s_471d059b5d23bf": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ac6eac45d6177aa79",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_89390f18fb950a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f49f6-caaa-7600-bc7e-b25ce5c6da1b",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
