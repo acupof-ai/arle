@@ -1,0 +1,21 @@
+crates/infer-cuda/examples/fp8_smallm_gemm_probe.rs
+  s_9ef059a5bbb199::t_f31fc8584b340f 231-236,238,248,475-510
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "9ff435b22e851f8f6215702751f226b8fbde42f9",
+  "prompts": {},
+  "sessions": {
+    "s_9ef059a5bbb199": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0b4e7f58-825f-4410-ad74-7dd92c504bd3",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
