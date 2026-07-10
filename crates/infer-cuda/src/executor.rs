@@ -481,11 +481,15 @@ impl RealCudaExecutor {
         tokens: &[u32],
         matched_len: usize,
         prefix_pages: &[u32],
-    ) -> Result<()> {
+    ) -> Result<usize> {
         match self {
-            Self::Qwen35(q) => q.restore_recurrent_sidecar(slot, tokens, matched_len, prefix_pages),
-            Self::Dsv4(d) => d.restore_prefix_state(slot, matched_len, prefix_pages),
-            Self::Qwen(_) => Ok(()),
+            Self::Qwen35(q) => q
+                .restore_recurrent_sidecar(slot, tokens, matched_len, prefix_pages)
+                .map(|()| 0),
+            Self::Dsv4(d) => d
+                .restore_prefix_state(slot, matched_len, prefix_pages)
+                .map(|()| 0),
+            Self::Qwen(_) => Ok(0),
         }
     }
 
