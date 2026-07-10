@@ -25,6 +25,15 @@ lifecycle & progress spine).
 
 ### Verdicts
 
+- **2026-07-10 — DSpark on the OPD rollout serve: wall-clock POSITIVE**
+  (first e2e A/B, CC-as-harness, 16 real swe_smith tasks): matched-task
+  rollout wall **−25.1%**, 4.11 tok/step, partial-ctx engaged on 90% of
+  chains, deep-ctx accept 3.46 > cold 2.08; pass-rate movement within
+  single-sample noise (9/16 vs 6/16, ~1.1σ). Default flip still gated on:
+  multi-sample pass-rate, `/v1/stats` accept export, and wiring
+  `dspark_draft_model` into the in-process `train agent-opd` engine
+  (train_cli.rs:2434 — serve-only today).
+  [wins](docs/experience/wins/2026-07-10-opd-e2e-dspark-rollout-ab.md)
 - **2026-07-10 — DSv4 prefix reuse RELICENSED (Phase 2a, content-keyed
   host-resident state pool)**: cross-request reuse relanded on the
   post-Route-A-deletion baseline — entries keyed by radix host-page identity
