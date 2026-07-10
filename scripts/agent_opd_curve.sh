@@ -13,8 +13,8 @@
 #   ARLE_BIN=target/release/arle  OUT_ROOT=runs  GPU=0  MODEL_CACHE=models
 #   STUDENT_MODEL=<dir>           override student (else fetch STUDENT_MODEL_HF_ID)
 #   STUDENT_MODEL_HF_ID=Qwen/Qwen3.6-27B-FP8
-#   DSPARK=                       auto: on iff SAMPLES==1 (serial); at SAMPLES>1
-#                                 plain-batched wins ~2.4x. 1/0 to force.
+#   DSPARK=1                      spec decode on (default; agent-OPD is serial
+#                                 B=1 so dspark ~1.9x applies at any SAMPLES). 0=off.
 #   DSPARK_DRAFT_HF_ID=z-lab/Qwen3.6-27B-DFlash   DSPARK_CONF_THRESHOLD=0.0
 #   ROUNDS=16 SAMPLES=2 MAX_TURNS=8 MAX_TOKENS=768 EVAL_EVERY=2 EVAL_N=24
 #   TASK_LIMIT=12 WRITEBACK_CAP=8 BASE_REPEATS=2 DIFFICULTY=easy SEED=0
@@ -53,15 +53,13 @@ else
 fi
 MAX_TURNS=${MAX_TURNS:-8} MAX_TOKENS=${MAX_TOKENS:-768}
 WRITEBACK_CAP=${WRITEBACK_CAP:-8} DIFFICULTY=${DIFFICULTY:-easy} SEED=${SEED:-0}
-# DSpark spec decode wins ONLY on serial c=1 decode (licensed 2026-07-10:
-# ~1.9x single-stream). At SAMPLES>1 the sample group decodes CONCURRENTLY and
-# plain-batched beats dspark 2.37x (spike 2026-07-10: per-row spec throws away
-# the batch dim, aggregate flat ~40 vs plain 94 tok/s @ C=8). So default DSpark
-# ON only when SAMPLES==1; DSPARK=1 forces it, DSPARK=0 disables.
+# DSpark ON by default — agent-OPD rollout is SERIAL B=1 regardless of SAMPLES
+# (agent_opd.rs:473 runs samples in a sequential per-sample engine-lock loop, NOT
+# concurrently — the concurrent best-of-N path is rubric-OPD's generate_batch,
+# infer_student.rs:212, a different variant). So dspark's licensed ~1.9x serial
+# win applies at every SAMPLES here. DSPARK=0 disables. conf=0 is licensed.
 DSPARK_CONF_THRESHOLD=${DSPARK_CONF_THRESHOLD:-0.0}
-DSPARK_DEFAULT=$([[ $SAMPLES == 1 ]] && echo 1 || echo 0)
-if [[ ${DSPARK:-$DSPARK_DEFAULT} == 1 ]]; then
-    [[ $SAMPLES != 1 ]] && echo "[curve] WARN: DSpark forced ON with SAMPLES=$SAMPLES — plain-batched is ~2.4x faster at concurrency (see 2026-07-10-dspark-concurrency-derisk-kill)"
+if [[ ${DSPARK:-1} == 1 ]]; then
     DSPARK_DRAFT_MODEL=${DSPARK_DRAFT_MODEL:-$(ensure_hf_model "$DSPARK_DRAFT_HF_ID")}
 else
     DSPARK_DRAFT_MODEL=""
