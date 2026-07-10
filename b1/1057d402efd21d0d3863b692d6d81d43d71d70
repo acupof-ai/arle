@@ -1,0 +1,21 @@
+docs/experience/wins/2026-07-11-agent-opd-round-profile-ms-breakdown.md
+  s_2732d6ab8404a1::t_9621ed780248aa 1-63
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "b11057d402efd21d0d3863b692d6d81d43d71d70",
+  "prompts": {},
+  "sessions": {
+    "s_2732d6ab8404a1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a69df7481aa0cddd1",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
