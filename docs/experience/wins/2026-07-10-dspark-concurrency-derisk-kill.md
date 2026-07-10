@@ -59,15 +59,30 @@ ABI edit. Caveat: that's the DSv4 MLA path; Qwen dspark verify routes through
 the FA3 nonpaged-prefill shim (qwen35.rs:132), which must be re-checked
 separately — not settled here.
 
-## Verdict — KILL the scheduler, take the free win
+## ⚠ Scope correction (2026-07-11): which OPD variant is concurrent
+
+Direct code read resolved a conflict between two decompose passes:
+- **agent-OPD** (`agent_opd.rs:473`) runs samples in a **SERIAL per-sample
+  engine-lock loop — B=1 regardless of SAMPLES.** dspark's licensed ~1.9×
+  applies here at every SAMPLES; plain-batched does NOT (nothing is concurrent).
+- **rubric-OPD** (`infer_student.rs:212 generate_batch`) submits best-of-N
+  **concurrently** — that is the only path where the c-sweep below applies and
+  plain-batched wins.
+
+So the `agent_opd_curve.sh` gate that turned dspark off at SAMPLES>1 was WRONG
+(reverted): agent-OPD is serial, keep dspark on. The plain-batched free-win is
+for the concurrent rubric-OPD/`generate_batch` path only.
+
+## Verdict — KILL the scheduler, take the free win (on the concurrent path)
 
 - **KILL** the batched-verify substrate + Algorithm 1 as motivated: marginal
-  gain over free plain-batched is +24% at 18% accept — not worth ≥1 week +
+  gain over free plain-batched is +24% at 10-17% accept — not worth ≥1 week +
   frozen-file risk.
-- **Free win, zero code:** OPD *concurrent* rollout (best-of-N groups) should run
-  `--spec-type none` (plain-batched) — reclaims the 2.37× today.
-- **DSpark stays the win only for genuinely serial c=1 decode** (single-sample
-  rollout, latency-bound interactive) — its licensed 2× holds there.
+- **Free win, zero code (rubric-OPD / concurrent best-of-N only):** that path
+  should run `--spec-type none` (plain-batched) — reclaims 1.5-3.5× at C≥4.
+- **DSpark stays the win for serial B=1 decode** — which is **agent-OPD rollout
+  (40% of the round), single-sample, and interactive**. Licensed ~1.9× greedy /
+  ~1.8× sampled holds there.
 - **Correct next lever is the DRAFTER, not the scheduler:** batched spec only
   becomes worth building after the DFlash drafter's acceptance is lifted
   18%→>50% (P3: train our own DSpark heads on rollout dumps). Order was inverted;
