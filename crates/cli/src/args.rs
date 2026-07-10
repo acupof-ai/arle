@@ -833,6 +833,11 @@ pub(crate) struct ServeArgs {
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set, value_name = "BOOL")]
     pub(crate) dsv4_moe_contig_decode: bool,
 
+    /// DSv4 decode-region prefix reuse: restore a later turn to the exact prior
+    /// finish position (opt-in; OFF = byte-identical, pending pod license).
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set, value_name = "BOOL")]
+    pub(crate) dsv4_decode_reuse: bool,
+
     /// Adaptive MTP gate at B=1: skip speculation below the accept break-even.
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set, value_name = "BOOL")]
     pub(crate) mtp_adaptive: bool,
@@ -919,6 +924,7 @@ impl ServeArgs {
             dsv4_flashmla_decode: self.dsv4_flashmla_decode,
             dsv4_dsa_indexer_sms: self.dsv4_dsa_indexer_sms,
             dsv4_moe_contig_decode: self.dsv4_moe_contig_decode,
+            dsv4_decode_reuse: self.dsv4_decode_reuse,
             mtp_adaptive: self.mtp_adaptive,
             mtp_min_accept: self.mtp_min_accept,
             deepep_num_sms: self.deepep_num_sms,
