@@ -1,6 +1,8 @@
 # DSv4 finish-write-through decode-region reuse — `--dsv4-decode-reuse`
 
-> Status: pending-remote (opt-in flag; needs the pod correctness+perf license).
+> Status: pod-verified opt-in (crash-fix gate PASS, `28b8cd7bb`, binary
+> `b1d9f968…`, TP=8 H20). OFF byte-identical; ON no-crash + reuse engages.
+> Default flip still pending a token-id-preserving perf harness (below).
 
 ## Context
 
@@ -30,19 +32,37 @@ entry) and prefills only the new suffix.
 - Gates: `cargo clippy -p infer-cuda … -D warnings` clean; `cargo check -p
   infer-api …` clean; `cargo test -p infer-core` green; `cargo fmt` clean.
 
-## Pending (remote / pod)
+## Pod verification (TP=8 H20, DSv4-Flash-FP8, `--dsv4-decode-reuse true`)
 
-- `needle_gate.py` x3 same-config vs baseline envelope, TP=4 DSv4-Flash-FP8.
-- W1 multi-turn (`prefix_reuse_gate.py`): P + R + follow-up → turn-2 restores to
-  `finish_len` (whole prior turn), reuse length ≈ `finish_len` not the prompt
-  floor; needle exact.
-- Graph lane: single-GPU decode graph ON + a reuse turn → decode graph captures
-  (no eager fallback) AND reuse works.
-- Perf: restore vs cold-prefill of the reused span; Δ% vs baseline.
+Two rounds. v1 (`79b5dbb17`): mechanism engaged (multi-turn match 640→704, +1
+page into the decode region) but the ON path CRASHED the TP serve — `pool
+seq_len 494 != append_pos 485`: a shorter request restored a prior turn's
+sub-page tail (the tail has no radix content identity;
+[errors](../errors/2026-07-10-dsv4-finish-writethrough-tail-content-identity.md)).
+v2 (`28b8cd7bb`) added the continuation guard and re-verified:
+
+| Lane | Result |
+|---|---|
+| Baseline OFF (needle_gate 446–512 ×3) | 15/15 exact DET — byte-identical |
+| **Crash-repro ON** (24 alternating pt499/pt485) | **24/24 exact, serve alive, ZERO `seq_len != append_pos`, zero panic** — 23 hits / 8832 hit_tokens / 7 write-through pages. v2 fixed the v1 crash. |
+| Multi-turn ON (637-tok prompt) | no crash, guard does NOT over-restrict — write-through published **10 pages** (past the 9-page/576-tok prefill floor, into the decode region); fresh 640-tok needle 738291 exact 3/3 DET |
+| Repeat-storm ON (8-concurrent ×2, the v1-crashing lane) | no crash, serve alive; a `738231` flip attributed to pre-existing concurrent-MoE non-determinism by OFF/ON A/B (OFF 8/16 vs ON 7/16, identical batch pattern), NOT decode-reuse |
+
+## Still pending (default flip)
+
+- **Perf Δ%**: the exact turn-2 reuse-length delta (640→704) needs a
+  token-id-preserving multi-turn driver — the text-reconstruction driver
+  re-tokenizes the fed-back completion, so the match truncates at 512 (OFF==ON,
+  so decode-reuse is exonerated, but the delta is unmeasurable). Bake a
+  token-preserving W1 into `prefix_reuse_gate.py`, then restore-vs-cold-prefill Δ%.
+- Graph lane is code-structural (no DSv4 decode graph under TP/MoE): the
+  decode-lane publish is a no-op under the flag, so no per-step D2H is added —
+  graph-safe by construction, not runnable against a DSv4 graph today.
 
 ## Rule
 
 Finish write-through captures the carry LIVE at `finish_len` (never rebuilt) —
-dodges the replay-tail stale-`prev_overlap` KILL. Content divergence within the
-sub-page tail `[matched_len, finish_len)` is trusted (agentic turns extend
-verbatim); the pod needle gate is the correctness license before any default flip.
+dodges the replay-tail stale-`prev_overlap` KILL. The sub-page tail
+`[matched_len, finish_len)` has NO radix content identity, so it is reused ONLY
+for a VERIFIED continuation (`prompt[matched_len..finish_len] == entry.tail_tokens`)
+— trusting it verbatim was the v1 crash. Default flip still needs the perf Δ%.
