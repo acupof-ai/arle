@@ -1,7 +1,11 @@
 # DSv4 KV reuse — abstraction/physical seam refactor (deletion-first)
 
-> Status: Active — design grounded in code read 2026-07-09; Phase 0 blocked
-> only on the running #150b bisect conviction (expected: `e05a467e6`).
+> Status: Shipped — Phases 0-2a landed earlier; 2b (park deletion) + 3b
+> (demand-paged bands) pod-gated 2026-07-10
+> ([2b wins](../experience/wins/2026-07-10-dsv4-park-deletion-phase2b.md),
+> [3b wins](../experience/wins/2026-07-10-dsv4-band-demand-paging-phase3b.md);
+> E6 c=4 +3.8% wall miss documented there). Remaining 3c/3d items fold into
+> follow-up issues.
 
 ## Verdict
 
