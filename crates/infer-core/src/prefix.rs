@@ -126,25 +126,40 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         // full-attention-only backends. On miss, release the attached pages and fall
         // back to full recompute — a zeroed linear-attn state with non-zero full-attn
         // KV causes a cross-type mismatch that corrupts model output.
-        if let Err(err) = self.executor.restore_prefix_sidecar(
+        let restored_len = match self.executor.restore_prefix_sidecar(
             slot,
             &request.prompt_tokens,
             prefix_match.matched_len,
             &prefix_match.block_ids,
         ) {
-            log::warn!(
-                "recurrent sidecar restore failed for slot {slot}: {err:#}; \
-                 full recompute fallback"
-            );
-            // Undo retain_pages + attach_pages; executor already reset full_attn_kv.
-            self.free_slot_pages(slot);
-            self.radix.release_blocks(&prefix_match.block_ids);
-            self.kv.release_pages(&prefix_match.block_ids);
-            // request.prefill_start_pos stays at 0 (the pre-attach default).
-            request.phase = RequestPhase::Prefilling { progress: 0 };
-            request.waiting_hint.immediate_reuse_tokens = 0;
-            request.waiting_hint.total_reuse_tokens = 0;
-            return Ok(());
+            Ok(len) => len.max(prefix_match.matched_len),
+            Err(err) => {
+                log::warn!(
+                    "recurrent sidecar restore failed for slot {slot}: {err:#}; \
+                     full recompute fallback"
+                );
+                // Undo retain_pages + attach_pages; executor already reset full_attn_kv.
+                self.free_slot_pages(slot);
+                self.radix.release_blocks(&prefix_match.block_ids);
+                self.kv.release_pages(&prefix_match.block_ids);
+                // request.prefill_start_pos stays at 0 (the pre-attach default).
+                request.phase = RequestPhase::Prefilling { progress: 0 };
+                request.waiting_hint.immediate_reuse_tokens = 0;
+                request.waiting_hint.total_reuse_tokens = 0;
+                return Ok(());
+            }
+        };
+
+        // DSv4 finish-write-through restores PAST the 64-block-aligned radix
+        // `matched_len` to an exact frontier P1 (partial last block from the
+        // pool entry's pending). Grow the slot into its OWN partial page (never
+        // radix-published, so no retain/release) so the cursor reaches P1 and
+        // the tail prefills only from P1. Clamp to the prompt: a match cannot
+        // extend past this request's own prompt.
+        let restored_len = restored_len.min(request.prompt_len());
+        if restored_len > prefix_match.matched_len {
+            self.kv
+                .alloc(slot, restored_len - prefix_match.matched_len)?;
         }
 
         self.prefix_cache_stats.hits = self.prefix_cache_stats.hits.saturating_add(1);
@@ -157,7 +172,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             .hit_pages
             .saturating_add(prefix_match.block_ids.len() as u64);
 
-        request.prefill_start_pos = prefix_match.matched_len.min(request.prompt_len());
+        request.prefill_start_pos = restored_len;
         request.reused_prefix_pages = prefix_match.block_ids;
         request.waiting_hint.immediate_reuse_tokens = request.prefill_start_pos;
         request.waiting_hint.total_reuse_tokens = request.prefill_start_pos;
