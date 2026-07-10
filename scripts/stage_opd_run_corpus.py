@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -295,7 +296,17 @@ def gate_in_place(tree: Path, task: dict, py: str):
         if r.returncode != 0:
             return False, (f"git apply -R gold rc={r.returncode}: "
                            f"{r.stderr.strip()[:200]}"), None
+        # Synthesized test files are untracked, so they can't appear here —
+        # but the scorer applies test_patch before gold_patch, so an overlap
+        # would double-apply. Assert the invariant instead of trusting it.
+        tpaths = {m.group(1) for m in
+                  re.finditer(r"^\+\+\+ b/(\S+)", task.get("test_patch", ""),
+                              re.M)}
         fix = swe.run(["git", "diff"], tree).stdout
+        gpaths = {m.group(1) for m in
+                  re.finditer(r"^(?:\+\+\+|---) [ab]/(\S+)", fix, re.M)}
+        if tpaths & gpaths:
+            return False, f"fix diff touches test files {sorted(tpaths & gpaths)[:3]}", None
     else:
         err = swe.apply_patch(tree, gold, ".g.diff")
         if err:
