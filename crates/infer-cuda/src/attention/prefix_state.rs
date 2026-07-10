@@ -455,6 +455,18 @@ impl Dsv4PrefixStatePool {
         }
     }
 
+    /// Fill a canonical id's frontier tail from the finishing slot's own id
+    /// when the canonical lacks one (content-identical by construction) — never
+    /// clobber an existing tail. Lets a finish tail attach to an already-present
+    /// canonical entry across the `adopt_canonical` early returns (#159).
+    fn adopt_frontier_tail(&mut self, canonical: u32, own: u32) {
+        if !self.frontier_tails.contains_key(&canonical)
+            && let Some(tail) = self.frontier_tails.get(&own).cloned()
+        {
+            self.frontier_tails.insert(canonical, tail);
+        }
+    }
+
     /// #157 repair — the floor-0 self-lock breaker. Radix dedup keeps the
     /// CANONICAL page id; a recomputing slot publishes onto its OWN page id,
     /// so once a canonical entry evicts, nothing ever re-attaches state to
@@ -464,11 +476,19 @@ impl Dsv4PrefixStatePool {
     /// an existing confirmed canonical entry.
     pub(crate) fn adopt_canonical(&mut self, canonical: u32, own: u32) {
         match self.meta.get(&canonical) {
-            Some(m) if m.confirmed => return,
+            // Canonical entry already exists (confirmed or provisional). Carry
+            // the finishing slot's frontier tail onto it — else a continuation
+            // after radix dedup loses the sub-page tail reuse (#159). Content is
+            // identical by construction; only fill a gap, never clobber.
+            Some(m) if m.confirmed => {
+                self.adopt_frontier_tail(canonical, own);
+                return;
+            }
             // Canonical id is radix-retained (never recycled while cached), so
             // a provisional entry under it holds the canonical content —
             // confirm in place.
             Some(_) => {
+                self.adopt_frontier_tail(canonical, own);
                 self.touch(canonical, true);
                 return;
             }
@@ -1328,5 +1348,35 @@ mod tests {
         pool.adopt_canonical(20, 78);
         assert!(pool.page_meta(20).is_some_and(|m| m.confirmed));
         assert_eq!(pool.read_entry(20).expect("confirmed").page_index, 3);
+    }
+
+    /// #159: a canonical entry present WITHOUT a frontier tail must adopt the
+    /// finishing slot's tail (else a continuation after radix dedup loses the
+    /// sub-page tail reuse). Never clobbers an existing canonical tail.
+    #[test]
+    fn adopt_canonical_carries_frontier_tail_onto_present_entry() {
+        let entry_bytes = small_entry(0).to_bytes().len();
+        let mut pool = Dsv4PrefixStatePool::new(8 * entry_bytes, entry_bytes);
+        // Canonical page 30 present but tail-less (a prior plain-boundary entry).
+        assert!(pool.publish(30, &small_entry(0), &[]));
+        assert!(pool.frontier_tail_tokens(30).is_none());
+        // Finishing slot's own page 88 carries a finish tail.
+        assert!(pool.publish(88, &small_entry(0), &[]));
+        pool.set_frontier_tail(88, vec![7, 8, 9]);
+        pool.adopt_canonical(30, 88);
+        assert_eq!(
+            pool.frontier_tail_tokens(30),
+            Some(&[7u32, 8, 9][..]),
+            "canonical adopted the finish tail"
+        );
+        // Guard: an existing canonical tail is never clobbered by a later adopt.
+        assert!(pool.publish(99, &small_entry(0), &[]));
+        pool.set_frontier_tail(99, vec![1, 2]);
+        pool.adopt_canonical(30, 99);
+        assert_eq!(
+            pool.frontier_tail_tokens(30),
+            Some(&[7u32, 8, 9][..]),
+            "kept"
+        );
     }
 }
