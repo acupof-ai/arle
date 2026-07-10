@@ -473,6 +473,14 @@ pub(crate) struct Dsv4KvBatchRowView {
     pub(crate) slot_page_range: std::ops::Range<usize>,
 }
 
+/// Split borrow: one layer's KV layout + shared DSA / FlashMLA / per-layer MLA decode scratch.
+pub(crate) type LayerFlashMlaAndMlaDecode<'a> = (
+    &'a mut Dsv4LayerKvLayout,
+    Option<&'a mut Dsv4DsaSharedScratch>,
+    Option<&'a mut Dsv4FlashMlaDecodeScratch>,
+    Option<&'a mut Dsv4MlaDecodeGraphScratch>,
+);
+
 impl Dsv4KvAdapter {
     pub(crate) fn new(
         ctx: &DeviceContext,
@@ -573,6 +581,7 @@ impl Dsv4KvAdapter {
         // sets `seq_len = 1` before dispatch. Keeping it pre-allocated avoids a
         // per-layer `uninit` on both the default decode and scheduled verify
         // paths.
+        // SAFETY: uninit device scratch; fully written before first read.
         let shared_expert_out = Some(unsafe {
             HiddenStates::uninit(ctx, hidden_size, crate::dsv4::MAX_SPEC_VERIFY_ROWS)?
         });
@@ -777,12 +786,7 @@ impl Dsv4KvAdapter {
     pub(crate) fn layer_flashmla_and_mla_decode_mut(
         &mut self,
         layer_idx: usize,
-    ) -> Result<(
-        &mut Dsv4LayerKvLayout,
-        Option<&mut Dsv4DsaSharedScratch>,
-        Option<&mut Dsv4FlashMlaDecodeScratch>,
-        Option<&mut Dsv4MlaDecodeGraphScratch>,
-    )> {
+    ) -> Result<LayerFlashMlaAndMlaDecode<'_>> {
         let len = self.layers.len();
         let layer = self
             .layers
@@ -920,15 +924,15 @@ impl Dsv4KvAdapter {
         (pages > 0).then_some(pages)
     }
 
-    /// Materialize `slot`'s band for prefix restore at `seq_len`.
-    /// Demand-paged: ring+comp for `seq_len`. Identity: `prefix_pages` head,
-    /// identity tail (overwritten by next `prepare_kv_batch`). Cursor = `seq_len`.
+    /// Materialize `slot`'s band for a prefix restore at `seq_len` matched
+    /// tokens: demand-paged layers allocate ring + comp pages for `seq_len`;
+    /// identity (V32) layers mirror the full identity band (restored content
+    /// is copied into the slot's own pages). Cursor set to `seq_len`.
     pub(crate) fn mirror_full_band(
         &mut self,
         ctx: &DeviceContext,
         slot: usize,
         seq_len: usize,
-        prefix_pages: &[u32],
     ) -> Result<()> {
         ensure!(
             slot < self.num_slots,
@@ -951,9 +955,7 @@ impl Dsv4KvAdapter {
                 continue;
             };
             pages.clear();
-            let take = prefix_pages.len().min(lsp);
-            pages.extend(prefix_pages.iter().take(take).copied());
-            pages.extend((take..lsp).map(|i| (slot * lsp + i) as u32));
+            pages.extend((0..lsp).map(|i| (slot * lsp + i) as u32));
             changed |= pool.mirror_band(slot, &pages, seq_len)?;
         }
         self.device_table_dirty[slot] |= changed;
@@ -1098,9 +1100,13 @@ impl ModelKvAdapter for Dsv4KvAdapter {
                 if layer.flashmla_demand_paged {
                     band_changed |= layer.flashmla_ensure_band(&ctx, row.slot, ensure_tokens)?;
                 } else {
-                    // Fresh alloc = identity; prefix-reuse = foreign band.
+                    // Identity band (#154): band page = slot*lsp + i. Engine
+                    // logical ids never enter physical tables — V32 pack
+                    // needs band contiguity; reuse crosses slots by copy.
                     layer_pages.clear();
-                    layer_pages.extend((0..slot_pages.len().min(lsp)).map(|i| slot_pages[i]));
+                    layer_pages.extend(
+                        (0..slot_pages.len().min(lsp)).map(|i| (row.slot * lsp + i) as u32),
+                    );
                     if let Some(pool) = layer.flashmla_kv_pool.as_mut() {
                         band_changed |= pool.mirror_band(row.slot, &layer_pages, row.append_pos)?;
                     }

@@ -323,7 +323,14 @@ impl Dsv4PrefixStatePool {
     /// is either radix-shared (content-identical) or slot-exclusive, so the
     /// newest content is always the correct one. When both levels are full,
     /// drop oldest entries and retry (capacity never blocks the forward).
-    pub(crate) fn publish(&mut self, page_id: u32, entry: &Dsv4PrefixPageEntry) -> bool {
+    /// Eviction skips `protected` (the publishing slot's chain) — else page k
+    /// evicts its own provisional page k-1 and the chain never confirms.
+    pub(crate) fn publish(
+        &mut self,
+        page_id: u32,
+        entry: &Dsv4PrefixPageEntry,
+        protected: &[u32],
+    ) -> bool {
         let bytes = entry.to_bytes();
         let key = tier_key(NS_PREFIX_STATE, u64::from(page_id));
         let mut payload = bytes;
@@ -331,7 +338,7 @@ impl Dsv4PrefixStatePool {
             match self.store.insert(key, payload) {
                 true => break,
                 false => {
-                    let Some(oldest) = self.pop_oldest_other(page_id) else {
+                    let Some(oldest) = self.pop_oldest_excluding(page_id, protected) else {
                         return false;
                     };
                     self.remove_pages(&[oldest]);
@@ -414,11 +421,11 @@ impl Dsv4PrefixStatePool {
         );
     }
 
-    fn pop_oldest_other(&mut self, publishing: u32) -> Option<u32> {
+    fn pop_oldest_excluding(&self, publishing: u32, protected: &[u32]) -> Option<u32> {
         self.lru
             .iter()
             .map(|&(_, _, id)| id)
-            .find(|&id| id != publishing)
+            .find(|&id| id != publishing && !protected.contains(&id))
     }
 
     pub(crate) fn page_meta(&self, page_id: u32) -> Option<Dsv4PrefixPageMeta> {
@@ -861,7 +868,7 @@ mod tests {
             ],
         };
         let mut pool = Dsv4PrefixStatePool::new(1 << 20, 1 << 16);
-        assert!(pool.publish(42, &entry));
+        assert!(pool.publish(42, &entry, &[]));
         assert!(pool.page_meta(42).is_some_and(|m| m.boundary));
         assert!(
             pool.read_entry(42).is_err(),
@@ -897,16 +904,41 @@ mod tests {
         // Host level fits exactly 2 entries; no disk.
         let entry_bytes = small_entry(0).to_bytes().len();
         let mut pool = Dsv4PrefixStatePool::new(2 * entry_bytes, entry_bytes);
-        assert!(pool.publish(1, &small_entry(0))); // oldest, will be confirmed
-        assert!(pool.publish(2, &small_entry(1))); // younger, provisional
+        assert!(pool.publish(1, &small_entry(0), &[])); // oldest, will be confirmed
+        assert!(pool.publish(2, &small_entry(1), &[])); // younger, provisional
         pool.confirm_pages(&[1]);
         pool.read_entry(1).expect("confirmed entry readable");
         // Pool full: publishing a third entry must evict the provisional page
         // 2, NOT the older-but-confirmed-and-hot page 1.
-        assert!(pool.publish(3, &small_entry(2)));
+        assert!(pool.publish(3, &small_entry(2), &[]));
         assert!(pool.page_meta(1).is_some_and(|m| m.confirmed));
         assert!(pool.page_meta(2).is_none(), "provisional evicted first");
         assert!(pool.page_meta(3).is_some());
+    }
+
+    /// Eviction never victimizes the publishing chain: a full-of-confirmed
+    /// pool yields to an incoming chain, and a chain longer than the pool is
+    /// refused at the overflow page with its head intact (no self-evict).
+    #[test]
+    fn eviction_protects_publishing_chain() {
+        let entry_bytes = small_entry(0).to_bytes().len();
+        let mut pool = Dsv4PrefixStatePool::new(2 * entry_bytes, entry_bytes);
+        // Pool full of confirmed entries.
+        assert!(pool.publish(1, &small_entry(0), &[]));
+        assert!(pool.publish(2, &small_entry(1), &[]));
+        pool.confirm_pages(&[1, 2]);
+        // Chain [10, 11]: page 11's eviction must victimize confirmed 1/2,
+        // never the chain's own provisional page 10.
+        let chain = [10u32, 11];
+        assert!(pool.publish(10, &small_entry(0), &chain));
+        assert!(pool.publish(11, &small_entry(1), &chain));
+        assert!(pool.page_meta(10).is_some(), "chain head survived");
+        assert!(pool.page_meta(11).is_some());
+        // Chain longer than the pool: overflow page refused, head intact.
+        let long = [10u32, 11, 12];
+        assert!(!pool.publish(12, &small_entry(2), &long));
+        assert!(pool.page_meta(10).is_some());
+        assert!(pool.page_meta(11).is_some());
     }
 
     /// #157 repair: canonical entry evicted → recompute publishes onto the
@@ -918,23 +950,23 @@ mod tests {
         let entry_bytes = small_entry(0).to_bytes().len();
         let mut pool = Dsv4PrefixStatePool::new(8 * entry_bytes, entry_bytes);
         // Canonical page 10 confirmed, then evicted (radix chain intact).
-        assert!(pool.publish(10, &small_entry(0)));
+        assert!(pool.publish(10, &small_entry(0), &[]));
         pool.confirm_pages(&[10]);
         pool.remove_pages(&[10]);
         assert!(pool.read_entry(10).is_err(), "canonical entry gone");
         // Recompute lands on the slot's own page 77 (provisional).
-        assert!(pool.publish(77, &small_entry(0)));
+        assert!(pool.publish(77, &small_entry(0), &[]));
         pool.adopt_canonical(10, 77);
         let back = pool.read_entry(10).expect("canonical chain repaired");
         assert_eq!(back.page_index, 0);
         assert!(back.boundary);
         assert!(pool.page_meta(77).is_none(), "own id re-keyed away");
         // Guard: an existing confirmed canonical entry is never clobbered.
-        assert!(pool.publish(78, &small_entry(1)));
+        assert!(pool.publish(78, &small_entry(1), &[]));
         pool.adopt_canonical(10, 78);
         assert_eq!(pool.read_entry(10).expect("kept").page_index, 0);
         // A provisional entry already under the canonical id confirms in place.
-        assert!(pool.publish(20, &small_entry(3)));
+        assert!(pool.publish(20, &small_entry(3), &[]));
         pool.adopt_canonical(20, 78);
         assert!(pool.page_meta(20).is_some_and(|m| m.confirmed));
         assert_eq!(pool.read_entry(20).expect("confirmed").page_index, 3);
