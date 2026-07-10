@@ -69,7 +69,7 @@ def _hit_delta(prompt: list[int], max_tokens: int = 8) -> tuple[int, dict]:
     r = post_completion(prompt, max_tokens=max_tokens, return_token_ids=True)
     time.sleep(0.3)
     s1 = get_stats()
-    return stat_delta(s0, s1, "prefix_hit_tokens"), r
+    return stat_delta(s0, s1, "prefix_cache_hit_tokens"), r
 
 
 class TokenReuseGate(Gate):
