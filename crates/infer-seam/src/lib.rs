@@ -384,9 +384,10 @@ pub trait BackendExecutor {
     /// full-attention-only backends (CUDA Qwen dense, Metal) and Qwen3.5/3.6
     /// hybrid; a backend that forgets to override falls back to the conservative
     /// correct `0`. DSv4 finish-write-through may restore PAST the 64-block-aligned
-    /// `matched_len` to an exact frontier `P1` (the partial last block lives in the
-    /// pool entry's pending section); it returns `P1 - matched_len` (< 64) and the
-    /// engine grows the slot's own partial page and prefills only from `P1`.
+    /// `matched_len` to the finished turn's exact length (its sub-page tail block
+    /// lives in the pool entry's pending section); it returns that tail length
+    /// (< 64) and the engine grows the slot's own partial page and prefills only
+    /// from the extended length.
     ///
     /// `prefix_pages` are the physical host-pool page ids already attached to the
     /// slot — the hybrid override uses them to sync the device KV pool seq_len.
