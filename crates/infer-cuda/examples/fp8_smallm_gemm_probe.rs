@@ -228,7 +228,14 @@ mod real {
         let w_scales_host: Vec<f32> = (0..scale_rows * scale_cols)
             .map(|_| rng.uniform_range(0.5, 2.0))
             .collect();
+        // DeepGEMM quantizes activations to FP8 block-scaled (4×128 tiles); GEMV keeps
+        // them in BF16. For an apples-to-apples numeric comparison, degrade the GEMV
+        // activations through the same FP8 quantization + dequantization so both paths
+        // share one precision floor. Performance timing uses the original BF16 x for
+        // both (DeepGEMM's pack_quantize times its own quantize; GEMV times raw BF16).
+        let x_gemv_host = quantize_dequantize_bf16_fp8(&x_host, m, k);
         let x = ctx.stream.clone_htod(&x_host)?;
+        let x_gemv = ctx.stream.clone_htod(&x_gemv_host)?;
         let w = ctx.stream.clone_htod(&w_host)?;
         let w_scales = ctx.stream.clone_htod(&w_scales_host)?;
         let mut out = ctx.stream.alloc_zeros::<bf16>(m * n)?;
@@ -238,7 +245,7 @@ mod real {
         let gemv = timed(ctx, iters, samples, || unsafe {
             let (wp, _gw) = w.device_ptr(&ctx.stream);
             let (sp, _gs) = w_scales.device_ptr(&ctx.stream);
-            let (xp, _gx) = x.device_ptr(&ctx.stream);
+            let (xp, _gx) = x_gemv.device_ptr(&ctx.stream);
             let (op, _go) = out.device_ptr_mut(&ctx.stream);
             ffi::gemv_fp8_block_scaled_batch_cuda(
                 wp as *const u8,
@@ -463,6 +470,42 @@ mod real {
         } else {
             byte
         }
+    }
+
+    /// Quantize BF16 activations to FP8 block-scaled (4×128 tiles, matching DeepGEMM
+    /// pack_quantize) then dequantize back to BF16. This gives the GEMV reference the
+    /// same activation precision floor as DeepGEMM, so numeric comparison is valid.
+    fn quantize_dequantize_bf16_fp8(x: &[bf16], m: usize, k: usize) -> Vec<bf16> {
+        const MAX_FP8: f32 = 448.0; // max finite E4M3 value
+        let mut out = vec![bf16::from_f32(0.0); m * k];
+        let tile_rows = 4;
+        let tile_cols = FP8_BLOCK;
+        for tile_r in (0..m).step_by(tile_rows) {
+            for tile_c in (0..k).step_by(tile_cols) {
+                let h = tile_rows.min(m - tile_r);
+                let w = tile_cols.min(k - tile_c);
+                let mut max_abs = 0.0f32;
+                for dr in 0..h {
+                    for dc in 0..w {
+                        let val = x[(tile_r + dr) * k + tile_c + dc].to_f32();
+                        max_abs = max_abs.max(val.abs());
+                    }
+                }
+                let scale = if max_abs > 0.0 {
+                    max_abs / MAX_FP8
+                } else {
+                    1.0
+                };
+                for dr in 0..h {
+                    for dc in 0..w {
+                        let val = x[(tile_r + dr) * k + tile_c + dc].to_f32();
+                        let q = (val / scale).round().clamp(-MAX_FP8, MAX_FP8);
+                        out[(tile_r + dr) * k + tile_c + dc] = bf16::from_f32(q * scale);
+                    }
+                }
+            }
+        }
+        out
     }
 
     fn env_or_unreported(name: &str) -> String {
