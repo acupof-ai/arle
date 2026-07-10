@@ -1,0 +1,21 @@
+docs/plans/2026-07-09-dspark-dflash-spec-decode-qwen36.md
+  s_9c91b86ec3fb55::t_7720b6ca1024a0 124,126-136
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "51e17f210187af2cf37e33203d81a46a73453ab6",
+  "prompts": {},
+  "sessions": {
+    "s_9c91b86ec3fb55": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4779911a-69b7-49db-bc83-daf5a48d6ca3",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
