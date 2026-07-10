@@ -1,0 +1,27 @@
+crates/cli/src/train_cli.rs
+  s_54407b338363d4::t_36fe5f8bc1df5b 2674-2675,2679-2683,2766,2783-2793,2813-2823,2841,2885-2887
+crates/train/src/agent_opd.rs
+  s_54407b338363d4::t_c256edfed5562f 136,428-435,452-457,483-486,490,506,511-513,521-530,574-576,585-596,655-661
+crates/train/src/aopd_profile.rs
+  s_54407b338363d4::t_c3bf40cda62179 1-164
+crates/train/src/lib.rs
+  s_54407b338363d4::t_a827de48ad7953 15-16
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "6d5ba119bcab3f1920d3a5108934970b736c263b",
+  "prompts": {},
+  "sessions": {
+    "s_54407b338363d4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a352f2dfbebb51b51",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
