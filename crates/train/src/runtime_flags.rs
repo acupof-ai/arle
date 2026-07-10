@@ -70,6 +70,21 @@ pub fn apply_runtime_flags(f: &TrainRuntimeFlags) {
 pub(crate) fn writeback_offload() -> bool {
     WRITEBACK_OFFLOAD.load(Relaxed)
 }
+
+/// Grad-checkpoint host-offload gate: seq-adaptive under the default flag, hard
+/// off when the user passes `--writeback-offload false`.
+///
+/// The H2D re-upload serializes on the host thread and starves the GPU on short
+/// trajectories (measured: backward −36%, writeback −33%/round at seq≈1276, no
+/// OOM); resident checkpoints instead OOM the allocator at seq≥~9600 where the
+/// long forward fragments the pool (errors/2026-06-28). So offload only past a
+/// length that needs it. 4096 is conservative (2.3× margin below the OOM anchor;
+/// nested-SDPA checkpointing `0b7a1d89` already bounds inner O(seq²) memory).
+/// Refine with a measured seq sweep before widening.
+pub(crate) fn writeback_offload_for_seq(seq_len: usize) -> bool {
+    const WRITEBACK_OFFLOAD_MIN_SEQ: usize = 4096;
+    writeback_offload() && seq_len >= WRITEBACK_OFFLOAD_MIN_SEQ
+}
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 pub(crate) fn engine_offload() -> EngineOffloadMode {
     match ENGINE_OFFLOAD.load(Relaxed) {
