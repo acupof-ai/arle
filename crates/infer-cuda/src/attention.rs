@@ -2038,6 +2038,14 @@ fn flashmla_pack_compressed_delta(
         return Ok(());
     }
     let n = end_row - start_row;
+    // Bulk rebuild observability (codex R3): volume scales with the restored/
+    // prefilled length (~584 B/row/layer, e.g. matched=8064 → ~1.2 MB/layer,
+    // ~25 MB across the 21 CSA layers) — NVTX for traces, debug for counters.
+    let _nvtx = crate::nvtx::range("dsv4/flashmla_bulk_comp_rebuild");
+    log::debug!(
+        "DSv4 FlashMLA bulk comp rebuild: rows {start_row}..{end_row} ({n} rows, {} bytes)",
+        n * config.head_dim * 2
+    );
     let (block_ids, rows): (Vec<i32>, Vec<i32>) = (start_row..end_row)
         .map(|row| {
             let (page, in_page) = bmap.comp_row(row);

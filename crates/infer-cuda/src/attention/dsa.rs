@@ -601,6 +601,19 @@ impl Dsv4LayerAttentionState {
         self.indexer.as_ref().map(|s| s.compressed.seq_len)
     }
 
+    /// Whether this layer's FP8 compressed band lags the committed compressed
+    /// rows by MORE than the current step's delta — i.e. a post-restore (or
+    /// post-prefill) bulk gap that only `flashmla_decode_pack_row`'s
+    /// `[packed_rows, seq_len)` bulk rebuild can close. The batched decode
+    /// pack (op "c") packs ONLY this step's row, so a gapped layer must run
+    /// per-row this tick (codex R3; true batched gap-fill is future work).
+    pub(crate) fn flashmla_comp_bulk_gap(&self) -> bool {
+        match (&self.compressor, &self.flashmla) {
+            (Some(c), Some(f)) => c.compressed.seq_len > f.fp8_kv_comp_packed_rows + 1,
+            _ => false,
+        }
+    }
+
     /// This layer-state's official-DSA slot index, or `None` if there is no
     /// per-slot DSA state. Constant for the slot's lifetime — used to lazy-init
     /// the graph CSA select's persistent n=1 device-meta slot-id buffer.
