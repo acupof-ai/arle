@@ -146,6 +146,28 @@ Ratio-0 (SlidingWindow) layers: only `ring`; no compressor/overlap/pending/dsa.
 == 0` precondition — it must set `pending_len = P1 % ratio` and leave `pending`
 restored, not zeroed.
 
+## Pod v1 result (2026-07-10) — mechanism PASS, ON path KILLED on a content-identity gap
+
+`79b5dbb17` pod-verified: OFF byte-identical (15/15 DET); mechanism ENGAGES
+(turn-2 match 640→704, +1 page to the exact finished length, deterministic ×5).
+But the ON path crashes the TP serve: `pool seq_len 494 != append_pos 485` — a
+shorter request matched a longer prior turn's write-through tail and restored to
+the stored length. **The tail `[matched_len, finish_len)` has no radix content
+identity** (radix matches only to `matched_len`); the disposition table proved
+every device buffer but not "are the tail TOKENS this request's tokens?".
+
+**Fix (v2, required before reland):**
+1. Pool entry stores the **tail token ids** `[matched_len, finish_len)`.
+2. Restore reuses the tail ONLY if `prompt_len >= finish_len` AND
+   `prompt[matched_len..finish_len] == entry.tail_tokens`; else return
+   `extra = 0` (fall back to page-aligned reuse → `seq_len = matched_len =
+   append_pos`, no crash).
+3. Clamp the restored `seq_len` to the engine's restored length, never the
+   entry's stored `finish_len`.
+4. Wire the `env` attr on `--dsv4-decode-reuse` (`args.rs:838`).
+
+Errors: [tail-content-identity](../experience/errors/2026-07-10-dsv4-finish-writethrough-tail-content-identity.md).
+
 ## ROI note
 v1 is correct today; this is a real cross-crate project (~5 files, delicate DSv4
 partial-region core, pod-gated incl. a graph lane). ckl 2026-07-10: **build
