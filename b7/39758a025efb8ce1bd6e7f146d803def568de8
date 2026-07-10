@@ -1,0 +1,21 @@
+docs/experience/wins/2026-07-10-dspark-per-layer-draft-kv-cap.md
+  s_b970143f0ddc48::t_7f0b08a60d1d7f 1-86
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "b739758a025efb8ce1bd6e7f146d803def568de8",
+  "prompts": {},
+  "sessions": {
+    "s_b970143f0ddc48": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ad9b0501d92b47c3f",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
