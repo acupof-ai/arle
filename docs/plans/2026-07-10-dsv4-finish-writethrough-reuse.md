@@ -76,13 +76,17 @@ The whole feature is jointly gated on a restore-at-P1 seam change; the pieces
 CANNOT land separately (a flag whose ON-path can't reuse = speculative
 interface shaping). Land as ONE unit behind the flag:
 
-1. **`infer-seam`**: `restore_prefix_sidecar -> Result<usize>` (restored token
-   length). Default + Qwen3.5 return `matched_len` → every other backend
-   byte-identical. DSv4 returns P1.
-2. **`infer-core` `attach_prefix_to_request`** (`prefix.rs:129-160`): if
-   `restored_len > matched_len`, advance the host cursor into the slot-owned
-   top-up band (`alloc(slot, restored_len - matched_len)`; partial page never
-   radix-published → no retain/release) + `prefill_start_pos = restored_len`.
+1. **`infer-seam`**: `restore_prefix_sidecar -> Result<usize>` = **EXTRA tokens
+   restored BEYOND `matched_len`** (0 = restored exactly the match). NOT
+   `matched_len` — echoing the input is a tautology and unsafe. Default +
+   Qwen3.5 + Qwen dense + Metal return **0** (byte-identical; a backend that
+   forgets → 0 → conservative-correct). DSv4 returns `P1 − B` (< 64).
+2. **`infer-core` `attach_prefix_to_request`** (`prefix.rs:129-160`):
+   `let extra = restore(...)?; let restored_len = matched_len + extra;`
+   if `extra > 0`, `alloc(slot, extra)` into the slot-owned top-up band
+   (partial page never radix-published → no retain/release) +
+   `prefill_start_pos = restored_len.min(prompt_len)`. `extra == 0` path is
+   exactly today's.
 3. **`infer-core` `finish_slot`** (`lib.rs:979-985`): `capture_finish_frontier`
    between `publish_prefix_blocks` and `free_slot_pages` (new default-noop seam).
 4. **DSv4** (`executor/dsv4.rs`, `attention/prefix_state.rs`): capture partial
