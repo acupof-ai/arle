@@ -25,6 +25,19 @@ lifecycle & progress spine).
 
 ### Verdicts
 
+- **2026-07-10 — DSv4 finish-write-through decode-region reuse: crash-fix gate
+  PASS (opt-in `--dsv4-decode-reuse`), default flip pending perf**: v1
+  (`79b5dbb17`) engaged (multi-turn match 640→704, +1 page into the decode
+  region) but crashed the TP serve (`pool seq_len 494 != append_pos 485`) —
+  the sub-page tail beyond `matched_len` has no radix content identity. v2
+  (`28b8cd7bb`) added a continuation guard (reuse the tail only when
+  `prompt[matched_len..finish_len] == entry.tail_tokens`). Pod re-verify TP=8:
+  OFF 15/15 DET byte-identical; crash-repro 24/24 exact, zero
+  `seq_len != append_pos`; multi-turn published 10 pages into the decode region,
+  no over-restrict. OFF default byte-identical; flip needs a
+  token-id-preserving perf harness.
+  [wins](docs/experience/wins/2026-07-10-dsv4-finish-writethrough-decode-reuse.md)
+  · [errors](docs/experience/errors/2026-07-10-dsv4-finish-writethrough-tail-content-identity.md)
 - **2026-07-10 — DSpark-on-OPD default flip: quality-neutral LICENSED
   (opt-in), concurrency ≥4 DEFERRED**: final gate — pass-rate quality-neutral
   (n=16 dspark 9/16 ≥ plain 7/16, zero systematic per-task loss, CIs overlap;
@@ -34,12 +47,13 @@ lifecycle & progress spine).
   default changed: dspark stays the licensed opt-in (`--dspark-draft-model`)
   until a clean-GPU c-sweep clears the concurrency leg.
   [wins](docs/experience/wins/2026-07-10-dspark-opd-default-flip-gate.md)
-- **2026-07-10 — DSv4 Route A prefix reuse: LICENSED (identity formula fix)**:
-  `prepare_kv_batch` and `mirror_full_band` hardcoded `slot*lsp + i` instead of
-  using engine-provided `slot_pages[i]`. Fixed in 2 files (+10/-14 LOC).
-  Verified: 89.7% prefix hit rate, 3.3× cold→hot speedup, 15/15 needle exact
-  (sequential 500–4000 tok), 8/8 concurrent same-prompt, 0 errors.
-  [wins](docs/experience/wins/2026-07-10-dsv4-prefix-reuse-identity-fix.md)
+- **2026-07-10 — DSv4 Route A prefix reuse "identity formula fix": REVERTED
+  (`4ad32362e`)**. The original claim below was wrong: the change never executed
+  on DSv4-Flash (demand-paged skips it; its pod numbers licensed the
+  copy-restore path) and broke V32/GLM band contiguity. Kept for the record:
+  ~~`prepare_kv_batch` and `mirror_full_band` hardcoded `slot*lsp + i` instead of
+  using engine-provided `slot_pages[i]`; 89.7% hit rate, 3.3× cold→hot~~.
+  [errors](docs/experience/errors/2026-07-10-dsv4-prefix-reuse-identity-fix-was-noop-and-v32-hazard.md)
 - **2026-07-10 — Qwen FP8 small-M dense GEMM: DeepGEMM from M=2 LICENSED;
   M=1 GEMV variants KILLED**: measured crossover (DeepGEMM flat 47.5–57.8 µs
   in M vs ~linear GEMV) moves `QWEN_FP8_DEEPGEMM_DENSE_MIN_M` 16→2 — matched
