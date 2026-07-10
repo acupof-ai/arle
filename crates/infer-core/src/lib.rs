@@ -977,13 +977,6 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             .copied()
             .collect();
         self.publish_prefix_blocks(slot, &full_tokens);
-        // Write the finish frontier (generated content + live carry at P1) through
-        // to the content-keyed prefix store BEFORE the slot's device state is torn
-        // down. Best-effort: a failure only forfeits future reuse. Default no-op;
-        // only DSv4 (behind --dsv4-decode-reuse) captures.
-        if let Err(err) = self.executor.capture_finish_frontier(slot, &full_tokens) {
-            log::warn!("finish frontier capture failed for slot {slot}: {err:#}");
-        }
         // free_slot BEFORE release_reused_prefix: reclaim_page sees page_refs>0
         // and skips retained prefix pages; release_reused_prefix then drops the
         // last ref and the page enters the free pool exactly once. Reversed order
@@ -2361,7 +2354,7 @@ mod testing {
             if self.rewind_on_attach {
                 self.materialized.borrow_mut().insert(slot, matched_len);
             }
-            Ok(matched_len)
+            Ok(0)
         }
 
         fn submit(&mut self, plan: &ForwardPlan, _kv: &mut dyn KvPool) -> Result<Self::Inflight> {
