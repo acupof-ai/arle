@@ -40,13 +40,6 @@ mod real {
     use serde_json::json;
 
     const FP8_BLOCK: usize = 128;
-    const BF16_PATTERN: &[f32] = &[
-        1.0, 2.0, 0.5, 3.0, 0.75, 1.5, -1.0, -2.0, -0.5, -3.0, -0.75, -1.5,
-    ];
-    const FP8_E4M3_PATTERN: &[u8] = &[
-        0x38, 0x40, 0x30, 0x48, 0x34, 0x3c, 0xb8, 0xc0, 0xb0, 0xc8, 0xb4, 0xbc,
-    ];
-    const SCALE_PATTERN: &[f32] = &[0.25, 0.5, 1.0, 2.0, 4.0];
     const NUMERIC_ABS_TOLERANCE: f64 = 1.0;
     const NUMERIC_REL_TOLERANCE: f64 = 0.02;
     const M_SWEEP: &[usize] = &[1, 2, 4, 8, 16, 17, 32];
@@ -215,23 +208,28 @@ mod real {
     ) -> Result<Option<serde_json::Value>> {
         let scale_rows = n.div_ceil(FP8_BLOCK);
         let scale_cols = k.div_ceil(FP8_BLOCK);
-        let x_host: Vec<bf16> = (0..m)
-            .flat_map(|row| {
-                (0..k).map(move |col| bf16::from_f32(BF16_PATTERN[pattern_index(row, col, 0x51)]))
-            })
-            .collect();
-        let w_host: Vec<u8> = (0..n)
-            .flat_map(|row| (0..k).map(move |col| FP8_E4M3_PATTERN[pattern_index(row, col, 0xa7)]))
+        // Deterministic random data: normal(0, 1) for activations and weight
+        // values, uniform(0.5, 2.0) for block scales. This gives well-conditioned
+        // block-scaled quantization (unlike repeating patterns where per-block
+        // statistics are degenerate).
+        // Deterministic seed from label bytes + shape dims (not the &str fat
+        // pointer address, which is ASLR-non-deterministic).
+        let mut seed: u64 = 0xcbf2_9ce4_8422_2325; // FNV offset basis
+        for byte in label.as_bytes() {
+            seed ^= *byte as u64;
+            seed = seed.wrapping_mul(0x0000_0100_0000_01b3); // FNV prime
+        }
+        seed ^= m as u64 * 0x9e37_79b9_7f4a_7c15;
+        seed ^= n as u64 * 0x7f4a_7c15_517c_c1cc;
+        seed ^= k as u64 * 0x517c_c1cc_9e37_79b9;
+        let mut rng = Rng::new(seed as u64);
+        let x_host: Vec<bf16> = (0..m * k).map(|_| bf16::from_f32(rng.normal())).collect();
+        let w_host: Vec<u8> = (0..n * k).map(|_| f32_to_fp8_e4m3(rng.normal())).collect();
+        let w_scales_host: Vec<f32> = (0..scale_rows * scale_cols)
+            .map(|_| rng.uniform_range(0.5, 2.0))
             .collect();
         let x = ctx.stream.clone_htod(&x_host)?;
         let w = ctx.stream.clone_htod(&w_host)?;
-        let w_scales_host: Vec<f32> = (0..scale_rows)
-            .flat_map(|row| {
-                (0..scale_cols).map(move |col| {
-                    SCALE_PATTERN[pattern_index(row, col, 0x3d) % SCALE_PATTERN.len()]
-                })
-            })
-            .collect();
         let w_scales = ctx.stream.clone_htod(&w_scales_host)?;
         let mut out = ctx.stream.alloc_zeros::<bf16>(m * n)?;
         ctx.sync()?;
@@ -385,12 +383,86 @@ mod real {
         }
     }
 
-    fn pattern_index(row: usize, col: usize, salt: usize) -> usize {
-        let mixed = row.wrapping_mul(131)
-            ^ col.wrapping_mul(313)
-            ^ row.wrapping_mul(col.wrapping_add(17))
-            ^ salt;
-        (mixed ^ (mixed >> 3) ^ (mixed >> 7)) % BF16_PATTERN.len()
+    /// xorshift64* — deterministic, no-std, seedable.
+    struct Rng(u64);
+
+    impl Rng {
+        fn new(seed: u64) -> Self {
+            Self(if seed == 0 {
+                0x9e37_79b9_7f4a_7c15
+            } else {
+                seed
+            })
+        }
+
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_f491_4f6c_dd1d)
+        }
+
+        /// Uniform f32 in [0, 1).
+        fn uniform(&mut self) -> f32 {
+            (self.next() >> 40) as f32 / (1u64 << 24) as f32
+        }
+
+        fn uniform_range(&mut self, lo: f32, hi: f32) -> f32 {
+            lo + self.uniform() * (hi - lo)
+        }
+
+        /// Standard normal via Box-Muller.
+        fn normal(&mut self) -> f32 {
+            let u1 = self.uniform().max(f32::EPSILON);
+            let u2 = self.uniform();
+            (-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos()
+        }
+    }
+
+    /// Encode an f32 to FP8 E4M3 (unsigned, no inf, no NaN). Clips to E4M3 range.
+    fn f32_to_fp8_e4m3(value: f32) -> u8 {
+        let bits = value.to_bits();
+        let sign = (bits >> 31) as u8;
+        let exp = ((bits >> 23) & 0xff) as i32 - 127 + 7; // rebias to e4m3 (bias=7)
+        let mant = bits & 0x007f_ffff;
+        if !value.is_finite() || value == 0.0 {
+            return 0;
+        }
+        if exp <= 0 {
+            // subnormal or underflow
+            let shift = 1 - exp;
+            if shift > 11 {
+                return 0;
+            }
+            let sub_mant = (0x0080_0000 | mant) >> (shift + 16);
+            let rounded = (sub_mant + 1) >> 1; // round to nearest
+            return if sign != 0 {
+                (-(rounded as i8)) as u8
+            } else {
+                rounded as u8
+            };
+        }
+        if exp >= 15 {
+            // overflow → clip to max finite (s 0 1110 110 = 240 * sign)
+            return if sign != 0 { 0xfe } else { 0x7e };
+        }
+        let mant3 = (mant >> 20) + if mant & 0x0008_0000 != 0 { 1 } else { 0 }; // round to 3 bits
+        let (exp, mant3) = if mant3 >= 8 {
+            (exp + 1, 0)
+        } else {
+            (exp, mant3)
+        };
+        if exp >= 15 {
+            return if sign != 0 { 0xfe } else { 0x7e };
+        }
+        let byte = ((exp as u8) << 3) | (mant3 as u8);
+        if sign != 0 {
+            (-(byte as i8)) as u8
+        } else {
+            byte
+        }
     }
 
     fn env_or_unreported(name: &str) -> String {
