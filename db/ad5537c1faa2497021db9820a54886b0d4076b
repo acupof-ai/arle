@@ -1,0 +1,23 @@
+CHANGELOG.md
+  s_9c91b86ec3fb55::t_22c2dfedb25815 28-36
+docs/experience/wins/2026-07-10-dspark-opd-default-flip-gate.md
+  s_9c91b86ec3fb55::t_20dc8e77d3f622 1-72
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "dbad5537c1faa2497021db9820a54886b0d4076b",
+  "prompts": {},
+  "sessions": {
+    "s_9c91b86ec3fb55": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4779911a-69b7-49db-bc83-daf5a48d6ca3",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
