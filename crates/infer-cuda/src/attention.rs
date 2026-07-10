@@ -1679,6 +1679,18 @@ fn dsv4_proj_batched_bf16_forced() -> Result<bool> {
     env_flag("ARLE_DSV4_PROJ_BATCHED_BF16")
 }
 
+/// #150 opt-in correctness lever (default OFF): `ARLE_DSV4_MLA_PROJ_BF16=1`
+/// dequantizes the F8-only MLA `wq_a`/`wq_b`/`wkv` to dense bf16 at LOAD
+/// (host-side block dequant, `loader.rs`) and routes BOTH decode lanes — the
+/// n=1 fused-wqkv path and the n≥2 batched `mla_attention_prepare_proj_batch`
+/// — through bf16 cublasLt, so every decode batch size shares one arithmetic
+/// (the #150 near-tie digit-flip mechanism is batch-size-DEPENDENT numerics).
+/// Prefill keeps FP8 DeepGEMM (licensed −47%). Checked at load only; runtime
+/// gates on `Dsv4Attention::mla_proj_bf16` presence.
+pub(crate) fn dsv4_mla_proj_bf16_enabled() -> Result<bool> {
+    env_flag("ARLE_DSV4_MLA_PROJ_BF16")
+}
+
 /// Batched-decode CSA select-metadata DEVICE build (default OFF). When ON, the
 /// per-step block_table/context_lens/positions host builds + 3 `memcpy_htod` are
 /// replaced by ONE on-device kernel (removes the per-step H2D a CUDA graph can't
@@ -4156,7 +4168,9 @@ pub(crate) fn mla_attention_decode_graph(
     } else {
         (config.rope_theta, 0i32)
     };
-    if dsv4_fused_wqkv_decode_enabled()? {
+    // #150: with the bf16 dequant copies present, force the scalar route so the
+    // n=1 decode arithmetic (bf16 cublasLt) matches the n≥2 batched lane's.
+    if attention.mla_proj_bf16.is_none() && dsv4_fused_wqkv_decode_enabled()? {
         let fused = state.fused_wqkv.as_mut().ok_or_else(|| {
             anyhow!("DSv4 fused wqkv decode requested but decode scratch was not allocated")
         })?;
@@ -4175,9 +4189,10 @@ pub(crate) fn mla_attention_decode_graph(
         })?;
         drop(nvtx_wqkv);
     } else {
+        let (wq_a, wq_b, wkv) = attention.decode_proj_weights();
         let nvtx_wq_a = crate::nvtx::range("dsv4/linear/wq_a");
         crate::linear_profile::profile(ctx, "dsv4/linear/wq_a", || {
-            dsv4_linear(ctx, &attention.wq_a, hidden, &mut scratch.c_q)
+            dsv4_linear(ctx, wq_a, hidden, &mut scratch.c_q)
         })?;
         drop(nvtx_wq_a);
         mla_rms_norm_into(
@@ -4189,17 +4204,12 @@ pub(crate) fn mla_attention_decode_graph(
         )?;
         let nvtx_wq_b = crate::nvtx::range("dsv4/linear/wq_b");
         crate::linear_profile::profile(ctx, "dsv4/linear/wq_b", || {
-            dsv4_linear(
-                ctx,
-                &attention.wq_b,
-                &scratch.c_q_normed,
-                &mut scratch.q_raw,
-            )
+            dsv4_linear(ctx, wq_b, &scratch.c_q_normed, &mut scratch.q_raw)
         })?;
         drop(nvtx_wq_b);
         let nvtx_wkv = crate::nvtx::range("dsv4/linear/wkv");
         crate::linear_profile::profile(ctx, "dsv4/linear/wkv", || {
-            dsv4_linear(ctx, &attention.wkv, hidden, &mut scratch.kv_raw)
+            dsv4_linear(ctx, wkv, hidden, &mut scratch.kv_raw)
         })?;
         drop(nvtx_wkv);
         mla_rms_norm_into(
@@ -5013,7 +5023,10 @@ pub(crate) fn mla_attention_prepare(
     // ── 1+2. Q/KV LoRA. Decode uses the existing B=1 fused (`wq_a | wkv`)
     // path. Prefill uses the same fused weight cache when native DeepGEMM is
     // available; otherwise the scalar reference order remains intact.
-    let fused_wqkv = token_count == 1 && dsv4_fused_wqkv_decode_enabled()?;
+    // #150: bf16 dequant copies present ⇒ decode (token_count==1) takes the
+    // scalar route with the bf16 weights; prefill (token_count>1) keeps FP8.
+    let decode_bf16 = token_count == 1 && attention.mla_proj_bf16.is_some();
+    let fused_wqkv = token_count == 1 && !decode_bf16 && dsv4_fused_wqkv_decode_enabled()?;
     let (c_q_normed, q_raw, kv_normed) = if fused_wqkv {
         let scratch = state.fused_wqkv.as_mut().ok_or_else(|| {
             anyhow!("DSv4 fused wqkv decode requested but decode scratch was not allocated")
@@ -5069,11 +5082,18 @@ pub(crate) fn mla_attention_prepare(
         (c_q_normed, q_raw, kv_normed)
     } else {
         // Q-LoRA: wq_a (down) → q_norm RMSNorm → wq_b (up to per-head Q).
+        // #150: decode with the bf16 copies present takes them (DenseBf16 ⇒
+        // gemm_batch); prefill/no-copies keeps the FP8 originals.
+        let (wq_a, wq_b, wkv) = if decode_bf16 {
+            attention.decode_proj_weights()
+        } else {
+            (&attention.wq_a, &attention.wq_b, &attention.wkv)
+        };
         // SAFETY: dsv4_linear writes the full c_q buffer.
-        let mut c_q = unsafe { HiddenStates::uninit(ctx, attention.wq_a.rows, token_count)? };
+        let mut c_q = unsafe { HiddenStates::uninit(ctx, wq_a.rows, token_count)? };
         let nvtx_wq_a = crate::nvtx::range("dsv4/linear/wq_a");
         crate::linear_profile::profile(ctx, "dsv4/linear/wq_a", || {
-            dsv4_linear(ctx, &attention.wq_a, hidden, &mut c_q)
+            dsv4_linear(ctx, wq_a, hidden, &mut c_q)
         })?;
         drop(nvtx_wq_a);
         keepalive.keep_hidden(&c_q);
@@ -5083,7 +5103,7 @@ pub(crate) fn mla_attention_prepare(
         let mut q_raw = unsafe { HiddenStates::uninit(ctx, local_width, token_count)? };
         let nvtx_wq_b = crate::nvtx::range("dsv4/linear/wq_b");
         crate::linear_profile::profile(ctx, "dsv4/linear/wq_b", || {
-            dsv4_linear(ctx, &attention.wq_b, &c_q_normed, &mut q_raw)
+            dsv4_linear(ctx, wq_b, &c_q_normed, &mut q_raw)
         })?;
         drop(nvtx_wq_b);
         keepalive.keep_hidden(&q_raw);
@@ -5093,7 +5113,7 @@ pub(crate) fn mla_attention_prepare(
         let mut kv_raw = unsafe { HiddenStates::uninit(ctx, head_dim, token_count)? };
         let nvtx_wkv = crate::nvtx::range("dsv4/linear/wkv");
         crate::linear_profile::profile(ctx, "dsv4/linear/wkv", || {
-            dsv4_linear(ctx, &attention.wkv, hidden, &mut kv_raw)
+            dsv4_linear(ctx, wkv, hidden, &mut kv_raw)
         })?;
         drop(nvtx_wkv);
         keepalive.keep_hidden(&kv_raw);
@@ -5571,7 +5591,11 @@ pub(crate) fn mla_attention_prepare_proj_batch(
     // (max_m = DSV4_PREFILL_QUERY_CHUNK = 4096 >= N) stages the FP8 activation;
     // the per-(out_row,token) GEMV `else` branch is the DeepGEMM-disabled fallback
     // (byte-identical to the prior batched path).
-    let use_deepgemm = dsv4_fp8_linear_deepgemm_enabled()?
+    // #150: bf16 dequant copies present ⇒ skip FP8 DeepGEMM, take the scalar
+    // route with the DenseBf16 weights (dsv4_linear ⇒ gemm_batch) so the n≥2
+    // decode arithmetic matches the n=1 lane's.
+    let use_deepgemm = attention.mla_proj_bf16.is_none()
+        && dsv4_fp8_linear_deepgemm_enabled()?
         && attention.wqkv_a_deepgemm.is_some()
         && attention.wq_b_deepgemm.is_some()
         && prefill_shared.is_some();
@@ -5611,15 +5635,17 @@ pub(crate) fn mla_attention_prepare_proj_batch(
         keepalive.keep_hidden(&kv_normed);
         (c_q_normed, q_raw, kv_normed)
     } else {
-        // Fallback (DeepGEMM disabled / caches not loaded / scratch absent): the
-        // scalar batched dsv4_linear path. Weights read once across the N-token
-        // grid in-kernel but NOT amortized (per-(out_row, token) grid). Byte path
-        // == the non-fused `else` branch of `mla_attention_prepare`, at seq_len=N.
+        // Fallback (bf16 copies present / DeepGEMM disabled / caches not loaded /
+        // scratch absent): the scalar batched dsv4_linear path. With the #150
+        // bf16 copies this dispatches DenseBf16 ⇒ gemm_batch (cublasLt); with the
+        // FP8 originals, the per-(out_row, token) GEMV grid — byte path == the
+        // non-fused `else` branch of `mla_attention_prepare`, at seq_len=N.
+        let (wq_a, wq_b, wkv) = attention.decode_proj_weights();
         // SAFETY: dsv4_linear writes the full c_q buffer.
-        let mut c_q = unsafe { HiddenStates::uninit(ctx, attention.wq_a.rows, n)? };
+        let mut c_q = unsafe { HiddenStates::uninit(ctx, wq_a.rows, n)? };
         let nvtx_wq_a = crate::nvtx::range("dsv4/linear/wq_a_batched");
         crate::linear_profile::profile(ctx, "dsv4/linear/wq_a_batched", || {
-            dsv4_linear(ctx, &attention.wq_a, normed, &mut c_q)
+            dsv4_linear(ctx, wq_a, normed, &mut c_q)
         })?;
         drop(nvtx_wq_a);
         keepalive.keep_hidden(&c_q);
@@ -5629,7 +5655,7 @@ pub(crate) fn mla_attention_prepare_proj_batch(
         let mut q_raw = unsafe { HiddenStates::uninit(ctx, local_width, n)? };
         let nvtx_wq_b = crate::nvtx::range("dsv4/linear/wq_b_batched");
         crate::linear_profile::profile(ctx, "dsv4/linear/wq_b_batched", || {
-            dsv4_linear(ctx, &attention.wq_b, &c_q_normed, &mut q_raw)
+            dsv4_linear(ctx, wq_b, &c_q_normed, &mut q_raw)
         })?;
         drop(nvtx_wq_b);
         keepalive.keep_hidden(&q_raw);
@@ -5637,7 +5663,7 @@ pub(crate) fn mla_attention_prepare_proj_batch(
         let mut kv_raw = unsafe { HiddenStates::uninit(ctx, head_dim, n)? };
         let nvtx_wkv = crate::nvtx::range("dsv4/linear/wkv_batched");
         crate::linear_profile::profile(ctx, "dsv4/linear/wkv_batched", || {
-            dsv4_linear(ctx, &attention.wkv, normed, &mut kv_raw)
+            dsv4_linear(ctx, wkv, normed, &mut kv_raw)
         })?;
         drop(nvtx_wkv);
         keepalive.keep_hidden(&kv_raw);

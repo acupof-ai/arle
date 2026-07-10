@@ -198,6 +198,12 @@ pub(crate) struct Dsv4Attention {
     pub wq_b_deepgemm: Option<Dsv4Fp8DeepGemmWeightCache>,
     pub wkv: DeviceMatrix,
     pub kv_norm: DeviceVec,
+    /// #150: dense-bf16 dequant copies of `wq_a`/`wq_b`/`wkv`, built at load only
+    /// under `ARLE_DSV4_MLA_PROJ_BF16=1` (the checkpoint ships these F8_E4M3-only).
+    /// Presence routes BOTH decode lanes (n=1 fused and n≥2 batched) through bf16
+    /// cublasLt so every decode batch size shares one arithmetic; prefill keeps
+    /// the FP8 originals (DeepGEMM prefill licensed −47%). `None` ⇒ no VRAM cost.
+    pub mla_proj_bf16: Option<Dsv4MlaProjBf16>,
     /// DSv4 low-rank output down-projection. `None` ⇔ GLM (`config.plain_o_proj`,
     /// which uses `o_proj` instead).
     pub wo_a: Option<DeviceMatrix>,
@@ -240,6 +246,25 @@ pub(crate) struct Dsv4Attention {
     pub w_kc: Option<DeviceMatrix>,
     #[allow(dead_code)]
     pub w_vc: Option<DeviceMatrix>,
+}
+
+/// #150 bf16 dequant copies of the MLA Q/KV LoRA projections (see
+/// [`Dsv4Attention::mla_proj_bf16`]).
+pub(crate) struct Dsv4MlaProjBf16 {
+    pub wq_a: DeviceMatrix,
+    pub wq_b: DeviceMatrix,
+    pub wkv: DeviceMatrix,
+}
+
+impl Dsv4Attention {
+    /// #150: decode-lane `wq_a`/`wq_b`/`wkv` — the bf16 dequant copies when
+    /// `ARLE_DSV4_MLA_PROJ_BF16` built them at load, else the FP8 originals.
+    pub(crate) fn decode_proj_weights(&self) -> (&DeviceMatrix, &DeviceMatrix, &DeviceMatrix) {
+        match &self.mla_proj_bf16 {
+            Some(p) => (&p.wq_a, &p.wq_b, &p.wkv),
+            None => (&self.wq_a, &self.wq_b, &self.wkv),
+        }
+    }
 }
 
 pub(crate) struct Dsv4WoAGroupTables {
