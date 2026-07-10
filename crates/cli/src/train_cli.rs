@@ -2570,7 +2570,6 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
     );
 
     let mut optimizer = AdamW::new(args.lr, (0.9, 0.999), 1.0e-8, 0.0);
-    eprintln!("[dbg-aopd] A: optimizer ready");
 
     // Diagnostic: skip the (slow, stochastic) agent rollout and drive ONE masked-CE
     // writeback on a synthetic trajectory of length N, so the writeback's OOM
@@ -2651,13 +2650,8 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
     // baseline → round-N improvement (the whole point — train loss alone cannot
     // tell you the model got better at coding). The KV pool is resident here
     // (just loaded); the round loop re-acquires it via `ensure_kv_pool`.
-    eprintln!("[dbg-aopd] B: lora_adapter_config ready");
     let mut baseline_pass_rate: Option<f32> = None;
     if !eval_tasks.is_empty() {
-        eprintln!(
-            "[dbg-aopd] C: entering eval pass ({} tasks)",
-            eval_tasks.len()
-        );
         baseline_pass_rate = Some(run_agent_opd_eval_pass(
             &infer_student,
             &eval_tasks,
@@ -2667,10 +2661,8 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
             "base",
         )?);
     }
-    eprintln!("[dbg-aopd] D: pre-round-loop baseline={baseline_pass_rate:?}");
 
     for round in 0..args.rounds {
-        eprintln!("[dbg-aopd] E: round={round} start");
         // Anchor the per-stage profiler (opt-in via ARLE_AOPD_PROFILE; no-op off).
         train::aopd_profile::begin_round();
         // Re-acquire the rollout KV pool the PREVIOUS round's writeback closure
@@ -2683,7 +2675,6 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
         {
             eprintln!("[agent-opd] ensure KV pool (round {round}) failed: {err}");
         }
-        eprintln!("[dbg-aopd] F: post-ensure-kv-pool round={round}");
         // Fresh closures each round so the &mut store / &mut optimizer borrows
         // are released before the per-round checkpoint reuses the store.
         let report = {
@@ -2693,7 +2684,6 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
             let store_ref = &mut store;
             let opt_ref = &mut optimizer;
             let writeback_window = args.writeback_window;
-            eprintln!("[dbg-aopd] G: calling run_agentic_opd_round round={round}");
             train::agent_opd::run_agentic_opd_round(
                 &infer_student,
                 &tasks,
