@@ -119,6 +119,12 @@ rounds to track LoRA drift.
 
 ## Next wall — small-M FP8 dense GEMM (2026-07-10)
 
+> Verdict 2026-07-10: MIN_M 16→2 LICENSED (+5–9% dspark greedy, matched A/B);
+> memoize + M=1 GEMV variants KILLED by measurement; achievable read BW is
+> 3.5 TB/s (not 4.0), so the honest M=1 residual is ~1.6× — next lever =
+> Marlin-style tensor-core W8A16 FP8 port.
+> [wins](../experience/wins/2026-07-10-qwen-fp8-smallm-deepgemm-crossover.md)
+
 Evidence: dense_ffn 26 ms/step profiled at M=16 vs ~3.2 ms weight-read floor
 (~8×); plain decode 23 ms/tok vs ~7 ms roofline (27 GB FP8 / 4 TB/s H20).
 Wins here speed BOTH plain decode (M=1 GEMV lane) and DSpark verify (M=17
