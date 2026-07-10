@@ -126,13 +126,13 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         // full-attention-only backends. On miss, release the attached pages and fall
         // back to full recompute — a zeroed linear-attn state with non-zero full-attn
         // KV causes a cross-type mismatch that corrupts model output.
-        let restored_len = match self.executor.restore_prefix_sidecar(
+        let extra = match self.executor.restore_prefix_sidecar(
             slot,
             &request.prompt_tokens,
             prefix_match.matched_len,
             &prefix_match.block_ids,
         ) {
-            Ok(len) => len.max(prefix_match.matched_len),
+            Ok(extra) => extra,
             Err(err) => {
                 log::warn!(
                     "recurrent sidecar restore failed for slot {slot}: {err:#}; \
@@ -151,12 +151,13 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         };
 
         // DSv4 finish-write-through restores PAST the 64-block-aligned radix
-        // `matched_len` to an exact frontier P1 (partial last block from the
-        // pool entry's pending). Grow the slot into its OWN partial page (never
-        // radix-published, so no retain/release) so the cursor reaches P1 and
-        // the tail prefills only from P1. Clamp to the prompt: a match cannot
-        // extend past this request's own prompt.
-        let restored_len = restored_len.min(request.prompt_len());
+        // `matched_len` by `extra` tokens (< page) to an exact frontier P1
+        // (partial last block from the pool entry's pending). Grow the slot into
+        // its OWN partial page (never radix-published, so no retain/release) so
+        // the cursor reaches P1 and the tail prefills only from P1. Clamp to the
+        // prompt: a match cannot extend past this request's own prompt. extra==0
+        // is today's page-aligned path, unchanged.
+        let restored_len = (prefix_match.matched_len + extra).min(request.prompt_len());
         if restored_len > prefix_match.matched_len {
             self.kv
                 .alloc(slot, restored_len - prefix_match.matched_len)?;
