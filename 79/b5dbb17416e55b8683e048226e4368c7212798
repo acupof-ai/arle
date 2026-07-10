@@ -1,0 +1,39 @@
+crates/cli/src/args.rs
+  s_935bdc28dbbace::t_93c0ca71b7d02f 836-840,927
+crates/infer-core/src/lib.rs
+  s_935bdc28dbbace::t_fd81ce1c4cf0f5 979-992
+crates/infer-cuda/src/attention/prefix_state.rs
+  s_935bdc28dbbace::t_75fafae35cafbf 81-100,111-115,169,180-184,191,196-198,210-214,222,233-234,240-243,259,261,268-269,271-272,281-282,755-840,842-843,846,848-957,962,970,1000-1002,1004-1006,1024-1058,1066,1070-1072,1090,1093-1155,1171,1182-1186,1216
+crates/infer-cuda/src/dsv4.rs
+  s_935bdc28dbbace::t_714ce6fd8fe486 1212-1278,1297,1311-1312,1314-1319,1357-1376,1378,1380
+crates/infer-cuda/src/executor.rs
+  s_935bdc28dbbace::t_ec08bfef1d79fc 489,494-513
+crates/infer-cuda/src/executor/dsv4.rs
+  s_935bdc28dbbace::t_9aea6bea7e73b6 587-679,738-744,751,763,782-785,791,799,806-808,810,822-825,827,838,840-841,1024-1032
+crates/infer-cuda/src/lib.rs
+  s_935bdc28dbbace::t_0deea690f7055a 774-789
+crates/infer-cuda/src/runtime_flags.rs
+  s_935bdc28dbbace::t_c5f07f59e17a3c 28,52,124-126
+crates/infer-seam/src/lib.rs
+  s_935bdc28dbbace::t_8807b31ad8cd65 404-420
+crates/infer-seam/src/runtime_flags.rs
+  s_935bdc28dbbace::t_c913459664cbaa 95-99,136
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "79b5dbb17416e55b8683e048226e4368c7212798",
+  "prompts": {},
+  "sessions": {
+    "s_935bdc28dbbace": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ae97229fe57b2c34d",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
