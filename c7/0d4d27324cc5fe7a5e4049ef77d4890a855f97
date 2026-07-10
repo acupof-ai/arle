@@ -1,0 +1,21 @@
+docs/experience/wins/2026-07-10-dsv4-finish-writethrough-decode-reuse.md
+  s_3d949abe53b900::t_71419bd565156f 53-62
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "c70d4d27324cc5fe7a5e4049ef77d4890a855f97",
+  "prompts": {},
+  "sessions": {
+    "s_3d949abe53b900": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "92f2c43c-22c8-4f1d-8b27-d06d6f3c59ad",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
