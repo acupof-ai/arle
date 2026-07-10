@@ -25,6 +25,15 @@ lifecycle & progress spine).
 
 ### Verdicts
 
+- **2026-07-11 — Agent-OPD round −30.1% wall (H20 GPU1 3-arm A/B), quality-neutral
+  (`894be29fa`)**: DSpark serial-B=1 decode LICENSED (rollout −29% / eval −30%,
+  1.41×; engagement proven by net speedup + 78 `[dspark-draft]` lines; already
+  default-on). Writeback grad-checkpoint offload now **seq-adaptive**
+  (`writeback_offload_for_seq` = flag && seq_len≥4096) — short trajectories skip
+  the host round-trip (backward −36%, writeback −33% at seq≈1276), long ones
+  self-protect from the seq≥~9600 allocator OOM (errors/2026-06-28). Wins:
+  [dspark-decode-and-seq-adaptive-offload](docs/experience/wins/2026-07-11-agent-opd-dspark-decode-and-seq-adaptive-offload.md).
+
 - **2026-07-10 — DSv4 finish-write-through decode-region reuse: crash-fix gate
   PASS (opt-in `--dsv4-decode-reuse`), default flip pending perf**: v1
   (`79b5dbb17`) engaged (multi-turn match 640→704, +1 page into the decode
