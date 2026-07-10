@@ -1,4 +1,4 @@
-# DSpark concurrency scheduler (P3 Algorithm 1) — KILLED by a one-afternoon spike; OPD concurrent rollout should use plain-batched
+# DSpark concurrency scheduler (P3 Algorithm 1) — KILLED (decode-phase re-measured); OPD concurrent rollout uses plain-batched
 
 ## Context
 
@@ -9,25 +9,42 @@ ragged-verify substrate, terminates in frozen attention files), one spike
 measured whether there's a prize. 8×H20 GPU1, Qwen3.6-27B-FP8 + DFlash draft,
 ctx=2048 gen=256 temp=0.7, per-row dspark vs plain, C∈{1,2,4,8}.
 
-## What the spike found
+## ⚠ First spike was wall-diluted — superseded by a clean decode-phase re-measure
 
-| C | dspark agg tok/s | plain agg tok/s | dspark util | plain util |
-|---|---|---|---|---|
-| 1 | 40.2 | 32.4 | 82% | 86% |
-| 2 | 39.8 | 40.8 | 84% | 68% |
-| 4 | 40.1 | 53.6 | 88% | 66% |
-| 8 | 39.5 | **93.6** | 88% | 56% |
+The first spike measured request-WALL tok/s (gen ÷ total_wall) at ctx=2048
+gen=256 — the 2048-token prefill diluted decode ~3×, reporting a bogus
+"dspark 40 tok/s at C=1" that contradicted our own licensed 87–175 decode band.
+ckl caught it ("c1 dspark 都能做到 120 t/s"). Arithmetic reconciles: decode
+~87 → wall 256/(2.1s decode + ~3.5s prefill) ≈ 40. The **relative** shape held
+(util-corroborated) but the **magnitude was wrong**. Re-measured decode-phase
+(ITL = (N−1)/(t_last−t_first), prefill excluded; cross-validated by an
+independent prefill-subtracted method, 77.7 vs 79.8 agree; C streams as separate
+processes; short ~180-tok prompt, gen 512; one frozen binary copy).
 
-- **dspark aggregate is dead flat (~40 tok/s); plain scales 2.9× to C=8.** Per-row
-  spec verify saturates the weight-read path at C=1 and throws away the batch
-  dimension — concurrency just divides a fixed pie (p50 40→22→10→5). Plain packs
-  all rows into one forward; util *drops* 86→56% as batching amortizes weight
+### Clean decode-phase aggregate tok/s
+
+**greedy (temp 0):**
+| C | dspark agg | plain agg | winner | dspark util | plain util |
+|---|---|---|---|---|---|
+| 1 | **87.6** | 45.4 | dspark 1.93× | 90% | 96% |
+| 2 | **75.0** | 70.1 | dspark 1.07× | 93% | 100% |
+| 4 | 73.5 | **109.3** | plain 1.49× | 93% | 91% |
+| 8 | 72.7 | **252.0** | plain **3.47×** | 94% | 79% |
+
+**temp 0.7 (OPD-realistic):** C=1 dspark 79.2 vs 45.4 (1.81×); C=2 plain 64.4>59.4;
+C=8 plain 197.7 vs 58.2 = **3.40×**.
+
+- **C=1 sanity gate PASSED first:** dspark 87.6 = 1.93× plain, in the licensed
+  band — proving the harness clean before trusting the sweep.
+- **dspark aggregate dead flat** (88→75→74→73); TTFT explodes 0.5s→48s —
+  requests QUEUE, not batch. util pegs 90-94% = per-row saturation.
+- **plain aggregate SCALES**; util DROPS 96→79% — batching amortizes weight
   reads, converting concurrency into throughput.
-- **The reframe that matters: OPD rollout is NOT B=1.** best-of-N /
-  samples-per-prompt submit the sample group concurrently to the continuous-
-  batching engine (`infer_student.rs:195` — "decode all N concurrently, batching
-  amortizes the weight reads"). Realistic OPD concurrency ≈ C=8, exactly where
-  plain-batched beats dspark **2.37×** (93.6 vs 39.5).
+- **Crossover (true): greedy C=2→4, sampled C=2.** OPD best-of-N is C≈4-8,
+  squarely in plain's win region.
+- **Corrected deciding number: at C=8, plain 252 vs dspark 73 = 3.47× greedy**
+  (the wall-diluted spike under-reported this as 2.37×). Verdict unchanged,
+  stronger.
 - The drafter is weak: accept ≈18%, so the single-stream spec win is only +24%
   at C=1 and gone by C=2. The ≥1-week batched-verify+scheduler substrate's
   marginal prize *over free plain-batched* is at best +24% — and only if 18%
@@ -58,10 +75,15 @@ separately — not settled here.
 
 ## Rule
 
+- **Decode-phase tok/s, never request-wall tok/s, for a spec-decode A/B.**
+  gen÷total_wall folds prefill into the number; at gen=256/ctx=2048 it diluted
+  decode 3× and produced a self-contradicting "40 tok/s" that a glance at our
+  own licensed 87-175 band should have caught. ALWAYS gate a new spec harness
+  with a C=1 sanity check against the known decode band before trusting a sweep.
 - A "does not batch" measurement on a weak drafter conflates two things: the
   *architecture* (per-row vs batched verify) and the *drafter quality* (accept
   rate). Separate them — a batched-verify substrate is worthless while accept is
-  18% because plain-batched already captures the concurrency win for free.
+  10-17% because plain-batched already captures the concurrency win for free.
 - Decompose-then-spike before a multi-file hot-path build: this ≥1-week,
   frozen-file-blocked item was killed by one afternoon of measurement on the
   existing path. The prize must be quantified against the *free alternative*
