@@ -101,8 +101,32 @@ DSA rows, `pending_kv/score` (holds the trailing sub-`ratio` block that
 `prefix_state.rs:714`; `pending` fills the gap). Each buffer: exact range +
 disposition, proven, not guessed.
 
+## Per-buffer disposition at restore-to-P1 (the correctness spine — implement verbatim)
+
+`B = floor(P1/64)·64` (radix frontier); partial region `[B, P1)` ≤ 63 tokens.
+Per (slot, layer), for the FRONTIER entry restore. `ratio = compress_ratio`,
+`ir = index_ratio` (1 for SparseIndexed else ratio). Decision: **prove each,
+don't skip** — the row that killed replay-tail is `pending`.
+
+| Buffer | State/range at P1 | Capture (finish) | Restore |
+|---|---|---|---|
+| `compressed.data` (staging) | completed blocks, rows `[0, P1/ratio)` | per-page content, incl. partial page rows `[B/ratio, P1/ratio)` | memcpy per page; `seq_len = P1/ratio` |
+| **`pending_kv/score`** | the incomplete tail block, `P1 % ratio` tokens × `width` | **NEW section — clone_dtoh `[0, (P1%ratio)·width)`** | **memcpy_htod; the next forward derives `pending_len = P1 % ratio`** (today `restore_prefix_counters` ASSUMES this is empty — the fix) |
+| `prev_overlap_kv/score` | block `P1/ratio − 1` raw rows | live at finish (existing section) | memcpy (needed by the 21 `ratio<16` layers, `attention.rs:7760`) |
+| `idx_overlap_kv/score` | indexer, same | live at finish | memcpy |
+| `ring` (`sw_window_cache`) | raw bf16 `[P1−128, P1)` | live at finish | memcpy (SlidingWindow layers need ONLY this) |
+| `dsa_data/scale` | rows `[0, P1/ir)` | per-page content, incl. partial page | memcpy per page; `packed_rows = P1/ir` |
+| `compressed.seq_len` / `indexer.seq_len` | `P1/ratio` / `P1/ir` | — | `restore_prefix_counters` (formula already floors; just feed P1, and STOP zeroing pending) |
+| `fp8_kv_comp_packed_rows` / `fp8_kv_sw_bootstrapped` | `0` / `false` | — | unchanged (first decode rebuilds band from staging + ring) |
+| host KvPool seq_len / `prefill_start_pos` | `P1` (not B) | — | infer-core: `alloc(slot, P1−B)` into the slot-owned partial page; cursor = P1 |
+| device band cursor | `P1` | — | `mirror_full_band` already accepts an arbitrary cursor |
+
+Ratio-0 (SlidingWindow) layers: only `ring`; no compressor/overlap/pending/dsa.
+`restore_prefix_counters` (`prefix_state.rs:717`) loses its `matched_len % ratio
+== 0` precondition — it must set `pending_len = P1 % ratio` and leave `pending`
+restored, not zeroed.
+
 ## ROI note
 v1 is correct today; this is a real cross-crate project (~5 files, delicate DSv4
-partial-region core, pod-gated incl. a graph lane), NOT a quick win. The win is
-concentrated in long-re-sent-turn (agentic) workloads. Build now vs. measure
-that workload first is an ROI call.
+partial-region core, pod-gated incl. a graph lane). ckl 2026-07-10: **build
+now**. The win is concentrated in long-re-sent-turn (agentic) workloads.
