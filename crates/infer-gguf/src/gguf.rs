@@ -316,7 +316,8 @@ impl GgufFile {
         let path = path.as_ref();
         let file =
             std::fs::File::open(path).with_context(|| format!("open GGUF {}", path.display()))?;
-        // Read-only map of an immutable model artifact.
+        // SAFETY: read-only mmap of an immutable model artifact file;
+        // the file outlives the returned `Self` (caller owns both).
         let mmap = unsafe { memmap2::Mmap::map(&file) }
             .with_context(|| format!("mmap GGUF {}", path.display()))?;
         Self::from_mmap(mmap)

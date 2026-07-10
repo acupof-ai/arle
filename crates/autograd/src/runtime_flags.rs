@@ -83,16 +83,16 @@ pub(crate) fn legacy_sdpa_bwd() -> bool {
 pub(crate) fn moe_lora_bwd_expert_tile() -> usize {
     MOE_LORA_BWD_EXPERT_TILE.load(Relaxed)
 }
-#[cfg_attr(feature = "no-cuda", allow(dead_code))]
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 pub(crate) fn gdr_chunkwise_prefill() -> bool {
     GDR_CHUNKWISE_PREFILL.load(Relaxed)
 }
 /// Also a test A/B lever (`set_la_backward_mono`).
-#[cfg_attr(feature = "no-cuda", allow(dead_code))]
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 pub(crate) fn la_backward_mono() -> bool {
     LA_BACKWARD_MONO.load(Relaxed)
 }
-#[cfg_attr(feature = "no-cuda", allow(dead_code))]
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 pub(crate) fn decode_attn_legacy() -> bool {
     DECODE_ATTN_LEGACY.load(Relaxed)
 }
