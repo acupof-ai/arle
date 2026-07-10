@@ -1,0 +1,23 @@
+CHANGELOG.md
+  s_4b7198573dd014::t_b4b9bf2b4baa85 28-33
+docs/experience/wins/2026-07-10-dsv4-prefix-reuse-identity-fix.md
+  s_4b7198573dd014::t_8e23eebf6fa431 1-42
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "945720f552fceacf13fbd8f2514fd6308ecffc10",
+  "prompts": {},
+  "sessions": {
+    "s_4b7198573dd014": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "92cc6785-573b-445c-9517-2aca75a48773",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
