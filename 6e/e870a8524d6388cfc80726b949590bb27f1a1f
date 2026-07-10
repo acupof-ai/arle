@@ -1,0 +1,21 @@
+crates/infer-cuda/examples/dsv4_parity.rs
+  s_3eaaf30e925e95::t_b3f9f02b3591af 255-257,436,527-555
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "6ee870a8524d6388cfc80726b949590bb27f1a1f",
+  "prompts": {},
+  "sessions": {
+    "s_3eaaf30e925e95": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ab3d5ebd30209b5aa",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
