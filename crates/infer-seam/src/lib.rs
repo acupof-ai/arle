@@ -402,15 +402,19 @@ pub trait BackendExecutor {
     /// lifetime rides the radix blocks. `newly_cached` is the subset the radix
     /// insert actually adopted (and retained) this call — pages the radix
     /// deduped away will be freed and their ids recycled, so a backend must
-    /// never key durable state to anything outside `newly_cached`. Default
-    /// no-op for full-attention-only backends; Qwen3.5/3.6 hybrid and DSv4
-    /// override this.
+    /// never key durable state to anything outside `newly_cached`.
+    /// `slot_pages` is the slot's OWN page chain over the same token range —
+    /// where radix dedup diverged it from `prefix_pages`, a backend can repair
+    /// canonical-keyed state from the slot's freshly recomputed (content-
+    /// identical) pages. Default no-op for full-attention-only backends;
+    /// Qwen3.5/3.6 hybrid and DSv4 override this.
     fn save_prefix_sidecar(
         &mut self,
         _slot: usize,
         _tokens: &[u32],
         _matched_len: usize,
         _prefix_pages: &[u32],
+        _slot_pages: &[u32],
         _newly_cached: &[u32],
     ) -> anyhow::Result<()> {
         Ok(())

@@ -282,10 +282,14 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                 .block_ids
         });
         let sidecar_pages = radix_pages.as_deref().unwrap_or(&pages[..publish_blocks]);
-        if let Err(err) =
-            self.executor
-                .save_prefix_sidecar(slot, tokens, token_len, sidecar_pages, &newly_cached)
-        {
+        if let Err(err) = self.executor.save_prefix_sidecar(
+            slot,
+            tokens,
+            token_len,
+            sidecar_pages,
+            &pages[..publish_blocks],
+            &newly_cached,
+        ) {
             log::debug!("recurrent sidecar save failed for slot {slot}: {err:#}");
         }
         // Publishing over a demoted node revives it with the re-prefilled

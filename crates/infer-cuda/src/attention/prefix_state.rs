@@ -242,6 +242,8 @@ pub(crate) struct Dsv4PrefixPageMeta {
     /// A provisional entry's page id may recycle after an unpublished free —
     /// its content stays write-only (restore rejects) until confirmed.
     pub(crate) confirmed: bool,
+    /// Last publish/read stamp — the entry's key into `lru`.
+    stamp: u64,
 }
 
 /// Host-resident content-keyed pool: page id → encoded [`Dsv4PrefixPageEntry`].
@@ -251,8 +253,14 @@ pub(crate) struct Dsv4PrefixPageMeta {
 pub(crate) struct Dsv4PrefixStatePool {
     store: CudaKvTierStore,
     meta: BTreeMap<u32, Dsv4PrefixPageMeta>,
-    /// Publish order (oldest first) for over-cap oldest-drop.
-    order: std::collections::VecDeque<u32>,
+    /// Over-cap eviction index `(confirmed, stamp, page id)`: provisional
+    /// entries drop before confirmed ones (a confirmed boundary entry is the
+    /// most valuable byte in the pool), LRU within each tier. Reads touch
+    /// (restore traffic keeps a hot shared preamble resident); a FIFO here
+    /// evicted the hottest first-published preamble under DRAM pressure and
+    /// floor-0-locked the whole chain.
+    lru: std::collections::BTreeSet<(bool, u64, u32)>,
+    clock: u64,
     entry_bytes: usize,
 }
 
@@ -261,7 +269,8 @@ impl Dsv4PrefixStatePool {
         Self {
             store: CudaKvTierStore::with_budget(budget_bytes, entry_bytes.max(1)),
             meta: BTreeMap::new(),
-            order: std::collections::VecDeque::new(),
+            lru: std::collections::BTreeSet::new(),
+            clock: 0,
             entry_bytes: entry_bytes.max(1),
         }
     }
@@ -271,7 +280,25 @@ impl Dsv4PrefixStatePool {
     pub(crate) fn set_budget_bytes(&mut self, bytes: usize) {
         self.store = CudaKvTierStore::with_budget(bytes, self.entry_bytes);
         self.meta.clear();
-        self.order.clear();
+        self.lru.clear();
+    }
+
+    fn next_stamp(&mut self) -> u64 {
+        self.clock = self.clock.saturating_add(1);
+        self.clock
+    }
+
+    /// Move `page_id` to the back of its LRU tier (and optionally across
+    /// tiers on confirm). Meta must exist.
+    fn touch(&mut self, page_id: u32, confirm: bool) {
+        let stamp = self.next_stamp();
+        let Some(meta) = self.meta.get_mut(&page_id) else {
+            return;
+        };
+        self.lru.remove(&(meta.confirmed, meta.stamp, page_id));
+        meta.confirmed |= confirm;
+        meta.stamp = stamp;
+        self.lru.insert((meta.confirmed, stamp, page_id));
     }
 
     pub(crate) fn set_disk(&mut self, root: std::path::PathBuf, budget_bytes: usize) -> bool {
@@ -316,41 +343,82 @@ impl Dsv4PrefixStatePool {
         // radix-held (evict would have dropped it), so any overwrite is a
         // content-identical sharer's republish.
         let confirmed = self.meta.get(&page_id).is_some_and(|m| m.confirmed);
-        if self
-            .meta
-            .insert(
-                page_id,
-                Dsv4PrefixPageMeta {
-                    boundary: entry.boundary,
-                    confirmed,
-                },
-            )
-            .is_none()
-        {
-            self.order.push_back(page_id);
+        if let Some(old) = self.meta.get(&page_id) {
+            self.lru.remove(&(old.confirmed, old.stamp, page_id));
         }
+        let stamp = self.next_stamp();
+        self.lru.insert((confirmed, stamp, page_id));
+        self.meta.insert(
+            page_id,
+            Dsv4PrefixPageMeta {
+                boundary: entry.boundary,
+                confirmed,
+                stamp,
+            },
+        );
         true
     }
 
     /// Radix publish confirmed these pages (they are now radix-retained, so
     /// their ids cannot recycle while the entries live).
     pub(crate) fn confirm_pages(&mut self, pages: &[u32]) {
-        for page_id in pages {
-            if let Some(meta) = self.meta.get_mut(page_id) {
-                meta.confirmed = true;
+        for &page_id in pages {
+            if self.meta.get(&page_id).is_some_and(|m| !m.confirmed) {
+                self.touch(page_id, true);
             }
         }
     }
 
-    fn pop_oldest_other(&mut self, publishing: u32) -> Option<u32> {
-        while let Some(oldest) = self.order.front().copied() {
-            if oldest == publishing || !self.meta.contains_key(&oldest) {
-                self.order.pop_front();
-                continue;
+    /// #157 repair — the floor-0 self-lock breaker. Radix dedup keeps the
+    /// CANONICAL page id; a recomputing slot publishes onto its OWN page id,
+    /// so once a canonical entry evicts, nothing ever re-attaches state to
+    /// the canonical chain. At confirm time, adopt the finishing slot's
+    /// provisional entry for the same position: content is identical by
+    /// construction (same token positions, recomputed). Guard: never clobber
+    /// an existing confirmed canonical entry.
+    pub(crate) fn adopt_canonical(&mut self, canonical: u32, own: u32) {
+        match self.meta.get(&canonical) {
+            Some(m) if m.confirmed => return,
+            // Canonical id is radix-retained (never recycled while cached), so
+            // a provisional entry under it holds the canonical content —
+            // confirm in place.
+            Some(_) => {
+                self.touch(canonical, true);
+                return;
             }
-            return Some(oldest);
+            None => {}
         }
-        None
+        // Re-key the slot's own provisional entry to the canonical id.
+        let Some(own_meta) = self.meta.get(&own).copied().filter(|m| !m.confirmed) else {
+            return;
+        };
+        let boundary = own_meta.boundary;
+        let own_key = tier_key(NS_PREFIX_STATE, u64::from(own));
+        let Ok(bytes) = self.store.read(own_key).map(|b| b.into_owned()) else {
+            return;
+        };
+        self.remove_pages(&[own]);
+        let canonical_key = tier_key(NS_PREFIX_STATE, u64::from(canonical));
+        if !self.store.insert(canonical_key, bytes) {
+            return;
+        }
+        let stamp = self.next_stamp();
+        self.lru.insert((true, stamp, canonical));
+        self.meta.insert(
+            canonical,
+            Dsv4PrefixPageMeta {
+                boundary,
+                confirmed: true,
+                stamp,
+            },
+        );
+    }
+
+    fn pop_oldest_other(&mut self, publishing: u32) -> Option<u32> {
+        self.lru
+            .iter()
+            .map(|&(_, _, id)| id)
+            .find(|&id| id != publishing)
     }
 
     pub(crate) fn page_meta(&self, page_id: u32) -> Option<Dsv4PrefixPageMeta> {
@@ -384,6 +452,8 @@ impl Dsv4PrefixStatePool {
         {
             self.store.remove_disk_only(key);
         }
+        // Touch-on-read: a restored entry is hot — LRU, not publish-order FIFO.
+        self.touch(page_id, false);
         Ok(entry)
     }
 
@@ -392,8 +462,11 @@ impl Dsv4PrefixStatePool {
     pub(crate) fn remove_pages(&mut self, pages: &[u32]) {
         let keys: Vec<u64> = pages
             .iter()
-            .filter(|p| self.meta.remove(p).is_some())
-            .map(|&p| tier_key(NS_PREFIX_STATE, u64::from(p)))
+            .filter_map(|&p| {
+                let meta = self.meta.remove(&p)?;
+                self.lru.remove(&(meta.confirmed, meta.stamp, p));
+                Some(tier_key(NS_PREFIX_STATE, u64::from(p)))
+            })
             .collect();
         if !keys.is_empty() {
             self.store.remove(&keys);
@@ -803,5 +876,67 @@ mod tests {
         pool.remove_pages(&[42]);
         assert!(pool.page_meta(42).is_none());
         assert!(pool.read_entry(42).is_err());
+    }
+
+    fn small_entry(page_index: u32) -> Dsv4PrefixPageEntry {
+        Dsv4PrefixPageEntry {
+            page_index,
+            boundary: true,
+            layers: vec![Dsv4LayerPageState {
+                ring: vec![half::bf16::from_f32(page_index as f32)],
+                ..Default::default()
+            }],
+        }
+    }
+
+    /// Over-cap eviction is provisional-first LRU, not publish-order FIFO: a
+    /// confirmed + recently-read entry (the hot shared preamble) survives a
+    /// younger provisional one.
+    #[test]
+    fn eviction_prefers_provisional_and_respects_read_lru() {
+        // Host level fits exactly 2 entries; no disk.
+        let entry_bytes = small_entry(0).to_bytes().len();
+        let mut pool = Dsv4PrefixStatePool::new(2 * entry_bytes, entry_bytes);
+        assert!(pool.publish(1, &small_entry(0))); // oldest, will be confirmed
+        assert!(pool.publish(2, &small_entry(1))); // younger, provisional
+        pool.confirm_pages(&[1]);
+        pool.read_entry(1).expect("confirmed entry readable");
+        // Pool full: publishing a third entry must evict the provisional page
+        // 2, NOT the older-but-confirmed-and-hot page 1.
+        assert!(pool.publish(3, &small_entry(2)));
+        assert!(pool.page_meta(1).is_some_and(|m| m.confirmed));
+        assert!(pool.page_meta(2).is_none(), "provisional evicted first");
+        assert!(pool.page_meta(3).is_some());
+    }
+
+    /// #157 repair: canonical entry evicted → recompute publishes onto the
+    /// slot's OWN page id → radix dedup keeps the canonical id → confirm-time
+    /// adoption re-keys the provisional entry back to the canonical id, so the
+    /// canonical chain is readable again (self-lock broken).
+    #[test]
+    fn adopt_canonical_rekeys_provisional_onto_canonical_chain() {
+        let entry_bytes = small_entry(0).to_bytes().len();
+        let mut pool = Dsv4PrefixStatePool::new(8 * entry_bytes, entry_bytes);
+        // Canonical page 10 confirmed, then evicted (radix chain intact).
+        assert!(pool.publish(10, &small_entry(0)));
+        pool.confirm_pages(&[10]);
+        pool.remove_pages(&[10]);
+        assert!(pool.read_entry(10).is_err(), "canonical entry gone");
+        // Recompute lands on the slot's own page 77 (provisional).
+        assert!(pool.publish(77, &small_entry(0)));
+        pool.adopt_canonical(10, 77);
+        let back = pool.read_entry(10).expect("canonical chain repaired");
+        assert_eq!(back.page_index, 0);
+        assert!(back.boundary);
+        assert!(pool.page_meta(77).is_none(), "own id re-keyed away");
+        // Guard: an existing confirmed canonical entry is never clobbered.
+        assert!(pool.publish(78, &small_entry(1)));
+        pool.adopt_canonical(10, 78);
+        assert_eq!(pool.read_entry(10).expect("kept").page_index, 0);
+        // A provisional entry already under the canonical id confirms in place.
+        assert!(pool.publish(20, &small_entry(3)));
+        pool.adopt_canonical(20, 78);
+        assert!(pool.page_meta(20).is_some_and(|m| m.confirmed));
+        assert_eq!(pool.read_entry(20).expect("confirmed").page_index, 3);
     }
 }

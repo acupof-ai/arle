@@ -494,19 +494,24 @@ impl RealCudaExecutor {
     /// KV atomically into the tier; DSv4 confirms ONLY the newly-cached pages'
     /// pool entries (radix retention makes those ids recycle-proof — a deduped
     /// page frees and recycles, so confirming it would leave a stale confirmed
-    /// entry under a reusable id); no-op for Qwen3.
+    /// entry under a reusable id), then repairs deduped positions whose
+    /// canonical pool entry evicted (#157: re-key the slot's own provisional
+    /// entry — content-identical by construction — else the canonical chain
+    /// floor-0-locks until radix eviction); no-op for Qwen3.
     pub(crate) fn save_prefix_sidecar(
         &mut self,
         slot: usize,
         tokens: &[u32],
         matched_len: usize,
         prefix_pages: &[u32],
+        slot_pages: &[u32],
         newly_cached: &[u32],
     ) -> Result<()> {
         match self {
             Self::Qwen35(q) => q.save_recurrent_sidecar(slot, tokens, matched_len, prefix_pages),
             Self::Dsv4(d) => {
                 d.confirm_prefix_pages(newly_cached);
+                d.repair_prefix_pool_chain(prefix_pages, slot_pages);
                 Ok(())
             }
             Self::Qwen(_) => Ok(()),
@@ -2454,6 +2459,18 @@ impl Dsv4CudaExecutor {
     /// flip their pool entries from provisional to readable.
     pub(crate) fn confirm_prefix_pages(&mut self, pages: &[u32]) {
         self.prefix_state.confirm_pages(pages);
+    }
+
+    /// #157 confirm-time repair. `canonical` is the radix chain the sidecar
+    /// rides; `slot_pages` is the finishing slot's own chain at the same
+    /// positions. Where dedup diverged them and the canonical entry is
+    /// missing, adopt the slot's provisional entry under the canonical id.
+    pub(crate) fn repair_prefix_pool_chain(&mut self, canonical: &[u32], slot_pages: &[u32]) {
+        for (&canon, &own) in canonical.iter().zip(slot_pages) {
+            if canon != own {
+                self.prefix_state.adopt_canonical(canon, own);
+            }
+        }
     }
 
     /// Attach the opt-in NVMe disk spill level (pre-serve only). The whole
