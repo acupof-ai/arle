@@ -169,6 +169,12 @@ consecutive pool-present pages floored to the alignment.
   tag (#9 `recall_tier` pattern); weight hot-swap flushes. **G3**: TP ranks
   each hold a replicated copy (rank-identical writes proven) — 4× DRAM,
   named and accepted.
+- **Publish is LAST-producer-wins, not first-wins as planned** (deviation,
+  benign — `prefix_state.rs` `Dsv4PrefixStatePool::publish`): host page ids
+  recycle when freed, so a
+  republish under a recycled id MUST overwrite; a page a slot completes is
+  either radix-shared (content-identical) or slot-exclusive, so the newest
+  content is always correct.
 - **Exhaustion cascade (2b/3b)**: HBM page exhaustion → preempt = flush
   in-flight D2H + free pages + requeue (completed pages are ALREADY in L2 —
   publish-is-the-demotion, zero-copy preemption); L2 over budget → LRU to
