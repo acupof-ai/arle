@@ -2058,7 +2058,14 @@ impl Dsv4Model {
             }
             Ok(acc)
         };
-        let n_max = requested.max(1).min(affordable);
+        // Diagnostic slot cap (perf attribution only, e.g. matching a
+        // pre-3b baseline's clamped slot count in an A/B): not a product
+        // knob — remove once the E6 wall delta is attributed.
+        let diag_cap = std::env::var("ARLE_DSV4_SLOTS_CAP")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(usize::MAX);
+        let n_max = requested.max(1).min(affordable).min(diag_cap.max(1));
         let mut chosen: Option<(usize, usize)> = None;
         for n in (1..=n_max).rev() {
             let pool_pages = budget_bytes.saturating_sub(per_slot.saturating_mul(n))
