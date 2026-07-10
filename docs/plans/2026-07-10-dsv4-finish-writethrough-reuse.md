@@ -51,12 +51,22 @@ the exact finish position P1, where it is live. No rebuild, no stale read.
 6. **Opt-in flag** first (`--dsv4-decode-reuse` / env), default OFF; baseline
    byte-identical. Flip default only after the pod perf+correctness license.
 
-## Hardest sub-problem (flag, don't guess)
-Restore-at-P1 with a non-64-block-aligned frontier: the radix matches at 64-block
-granularity (frontier B = floor(P1/64)·64 full blocks), but the pool entry
-extends to P1 (the partial block [B, P1) lives in `pending`). Restore must set
-the slot to P1 (content [0,B) from pages + [B,P1) from pending + carry at P1),
-and report the restored length as P1 so the engine prefills from P1, not B.
+## Hardest sub-problem — RESOLVED (2026-07-10, verified against code)
+Restore-at-P1 with a non-64-block-aligned frontier `B = floor(P1/64)·64`. The
+partial region `[B, P1)` (≤63 tokens) splits (the disposition table is the
+authority; the earlier "from pending" phrasing was imprecise):
+- **completed compress blocks** in `[B, P1)` → `staging` tail rows
+  `[B/ratio, P1/ratio)` (the partial page's `staging_row_range`), + the DSA tail;
+- **sub-`ratio` remainder** `P1 % ratio` tokens (< ratio) → `pending_kv/score`
+  (sized `ratio·width` → holds a sub-ratio tail, NO resize, NO kernel change;
+  the forward derives `pending_len = P1 % ratio`, `attention.rs:7638`).
+
+**Storage anchor (forced):** `[B, P1)` has no radix page id
+(`publish_prefix_blocks` seals only complete blocks, `prefix.rs:227`), so the
+frontier tail (partial staging/DSA rows + pending + carry) attaches to the LAST
+radix page's pool entry, index `B/64 − 1`. Restore attaches radix pages
+`[0, B/64)`, reads that entry, applies tail + carry, sets seq_len = P1, returns
+`extra = P1 − B` (< 64).
 
 ## Verification (pod, opt-in flag ON)
 - Correctness: `needle_gate.py` x3 same-config vs baseline envelope, TP=4.
