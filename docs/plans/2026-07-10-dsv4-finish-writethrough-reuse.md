@@ -2,6 +2,12 @@
 
 > Status: Active — supersedes the killed replay-tail plan
 > (`2026-07-10-dsv4-decode-reuse-replay-tail.md`).
+>
+> **Names** (code uses these, not the shorthand below): `finish_len` = the
+> finished turn's total length (prompt+generated; the restore target).
+> `matched_len` = the engine's radix-matched, page-aligned length. `tail_len` =
+> `finish_len − matched_len`, the sub-page leftover (< 64). This doc's `P1`=
+> `finish_len`, `B`=`matched_len` for brevity only.
 
 **Model (ckl 2026-07-10)**: working area (live HBM slot) stores NO carry — it's
 live in registers. On settle (request finish), write the full state THROUGH to
