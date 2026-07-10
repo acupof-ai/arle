@@ -920,16 +920,15 @@ impl Dsv4KvAdapter {
         (pages > 0).then_some(pages)
     }
 
-    /// Materialize `slot`'s band for a prefix restore at `seq_len` matched
-    /// tokens. Demand-paged layers allocate ring + comp pages for exactly
-    /// `seq_len` (growth continues page-wise in `prepare_kv_batch`); identity
-    /// (V32) layers mirror the FULL band (SW ring + comp region are fixed
-    /// slot-logical blocks). Both set the logical cursor to `seq_len`.
+    /// Materialize `slot`'s band for prefix restore at `seq_len`.
+    /// Demand-paged: ring+comp for `seq_len`. Identity: `prefix_pages` head,
+    /// identity tail (overwritten by next `prepare_kv_batch`). Cursor = `seq_len`.
     pub(crate) fn mirror_full_band(
         &mut self,
         ctx: &DeviceContext,
         slot: usize,
         seq_len: usize,
+        prefix_pages: &[u32],
     ) -> Result<()> {
         ensure!(
             slot < self.num_slots,
@@ -952,7 +951,9 @@ impl Dsv4KvAdapter {
                 continue;
             };
             pages.clear();
-            pages.extend((0..lsp).map(|i| (slot * lsp + i) as u32));
+            let take = prefix_pages.len().min(lsp);
+            pages.extend(prefix_pages.iter().take(take).copied());
+            pages.extend((take..lsp).map(|i| (slot * lsp + i) as u32));
             changed |= pool.mirror_band(slot, &pages, seq_len)?;
         }
         self.device_table_dirty[slot] |= changed;
@@ -1097,14 +1098,9 @@ impl ModelKvAdapter for Dsv4KvAdapter {
                 if layer.flashmla_demand_paged {
                     band_changed |= layer.flashmla_ensure_band(&ctx, row.slot, ensure_tokens)?;
                 } else {
-                    // Identity band, real pages only (#154): host page i of
-                    // this slot is band page slot*lsp + i; the fixed-size
-                    // device table is padded at the device-format boundary
-                    // (flashmla refresh).
+                    // Fresh alloc = identity; prefix-reuse = foreign band.
                     layer_pages.clear();
-                    layer_pages.extend(
-                        (0..slot_pages.len().min(lsp)).map(|i| (row.slot * lsp + i) as u32),
-                    );
+                    layer_pages.extend((0..slot_pages.len().min(lsp)).map(|i| slot_pages[i]));
                     if let Some(pool) = layer.flashmla_kv_pool.as_mut() {
                         band_changed |= pool.mirror_band(row.slot, &layer_pages, row.append_pos)?;
                     }

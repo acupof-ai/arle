@@ -2557,7 +2557,7 @@ impl Dsv4CudaExecutor {
             .map(|&page_id| self.prefix_state.read_entry(page_id))
             .collect::<Result<Vec<_>>>()?;
         self.kv_adapter
-            .mirror_full_band(&self.model.ctx, slot, matched_len)?;
+            .mirror_full_band(&self.model.ctx, slot, matched_len, prefix_pages)?;
         // A17: a restored occupant enters Decoding without a tail warm step
         // for its MTP chain; stale spec state belongs to the prior occupant.
         self.spec_slots[slot] = Dsv4SpecSlotState::default();
