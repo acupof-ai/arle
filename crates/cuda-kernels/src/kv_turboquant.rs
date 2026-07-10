@@ -46,6 +46,10 @@ pub fn turboquant_quantize_paged_single(
     let (idx_ptr, _g4) = pool_indices.device_ptr(&ctx.stream);
     let (bound_ptr, _g6) = codebook.boundaries.device_ptr(&ctx.stream);
 
+    // SAFETY: pool/codebook pointers come from live CudaSlices pinned by the
+    // `_g*` guards; `kv_bf16_ptr` is the caller's device address for
+    // `batch_size * kv_dim` bf16 on `ctx.stream`. The kernel writes one token
+    // per request at the pool slots named by `pool_indices`, stream-ordered.
     unsafe {
         match state.mode {
             RotationMode::Full => {
@@ -127,6 +131,10 @@ pub fn turboquant_dequantize_inplace(
     let (idx_ptr, _g3) = pool_indices.device_ptr(&ctx.stream);
     let (cent_ptr, _g5) = codebook.centroids.device_ptr(&ctx.stream);
 
+    // SAFETY: pool/codebook pointers come from live CudaSlices pinned by the
+    // `_g*` guards; `work_bf16_ptr` is the caller's device buffer covering the
+    // same physical pool index range as `pool_indices` (writes land at the
+    // identical index positions), stream-ordered on `ctx.stream`.
     unsafe {
         match state.mode {
             RotationMode::Full => {
@@ -197,6 +205,9 @@ pub fn turboquant_rotate_query(
     let rotation = &state.rotations[layer_idx];
     let (signs_ptr, _g) = rotation.hadamard_signs_ptr().device_ptr(&ctx.stream);
 
+    // SAFETY: `q_ptr`/`q_rot_ptr` are caller-supplied device addresses each
+    // covering `num_heads_total * head_dim` bf16 on `ctx.stream`; `signs_ptr`
+    // is a live `[head_dim]` CudaSlice pinned by `_g`. Stream-ordered launch.
     unsafe {
         ffi::tq_rotate_query_cuda(
             q_ptr as *const ffi::Half,
@@ -242,6 +253,10 @@ pub fn turboquant_fused_decode_attention(
     let (ck_ptr, _g7) = k_state.codebook.centroids.device_ptr(&ctx.stream);
     let (cv_ptr, _g8) = v_state.codebook.centroids.device_ptr(&ctx.stream);
 
+    // SAFETY: all pool/index/codebook pointers come from live CudaSlices pinned
+    // by the `_g*` guards; `q_rot_ptr`/`output_ptr` are caller device buffers
+    // sized `batch_size * num_qo_heads * head_dim` bf16 on `ctx.stream`. The
+    // kernel reads pages named by `kv_indices`/`kv_indptr` only, stream-ordered.
     unsafe {
         ffi::tq_decode_attention_cuda(
             q_rot_ptr as *const ffi::Half,

@@ -147,6 +147,8 @@ pub trait CudaAllocTraceExt {
 impl CudaAllocTraceExt for Arc<CudaStream> {
     #[track_caller]
     unsafe fn alloc_traced<T: DeviceRepr>(&self, len: usize) -> Result<CudaSlice<T>, DriverError> {
+        // SAFETY: forwards `CudaStream::alloc`'s uninitialized-memory contract
+        // to our own caller (this method is `unsafe` with the same `# Safety`).
         let out = unsafe { self.alloc(len)? };
         record_cuda_alloc::<T>("alloc", "CudaStream::alloc", len);
         Ok(out)
@@ -157,6 +159,9 @@ impl CudaAllocTraceExt for Arc<CudaStream> {
         &self,
         len: usize,
     ) -> Result<CudaSlice<T>, DriverError> {
+        // SAFETY: the uninitialized allocation is zeroed by the stream-ordered
+        // `memset_zeros` below before the slice is returned, so no caller can
+        // observe uninitialized bytes.
         let mut out = unsafe { self.alloc(len)? };
         record_cuda_alloc::<T>("alloc_zeros", "CudaStream::alloc_zeros", len);
         self.memset_zeros(&mut out)?;
@@ -236,6 +241,8 @@ impl CudaPipelineFence {
             .context()
             .bind_to_thread()
             .map_err(|e| anyhow!("Bind CUDA context before pipeline fence query failed: {e}"))?;
+        // SAFETY: `self.event` is a live CudaEvent owned by this fence and its
+        // context was bound to the thread above; query has no other effects.
         match unsafe { cudarc::driver::result::event::query(self.event.cu_event()) } {
             Ok(()) => Ok(CudaPipelineFenceStatus::Ready),
             Err(err) if err.0 == cudarc::driver::sys::CUresult::CUDA_ERROR_NOT_READY => {
@@ -347,6 +354,9 @@ impl DeviceContext {
         // Serving owns cross-stream dependencies explicitly via
         // CudaPipelineFence, which avoids hidden waits in CUDA Graph capture
         // paths while still allowing a dedicated copy stream.
+        // SAFETY: called before any stream or buffer exists on this context, so
+        // no in-flight cudarc dependency tracking is discarded; all cross-stream
+        // ordering is owned explicitly by CudaPipelineFence afterwards.
         unsafe {
             ctx.disable_event_tracking();
         }
@@ -364,6 +374,9 @@ impl DeviceContext {
         // if a memory-tight shape needs aggressive release).
         let retain_pool = MEMPOOL_RETAIN.load(std::sync::atomic::Ordering::Relaxed);
         if retain_pool {
+            // SAFETY: `cu_device()` is the live device of the context created
+            // above; the attribute write passes a valid pointer to a local u64
+            // that outlives the call. Failure is tolerated (logged, non-fatal).
             unsafe {
                 if let Ok(pool) = cudarc::driver::result::device::get_mem_pool(ctx.cu_device()) {
                     let mut threshold: u64 = u64::MAX;
@@ -390,7 +403,9 @@ impl DeviceContext {
             .new_stream()
             .map_err(|e| anyhow!("Failed to create CUDA communication stream: {}", e))?;
 
-        // Initialize cuBLAS handle
+        // SAFETY: no pointers cross the FFI; `cublas_init` is idempotent,
+        // mutex-guarded per device, and requires the current CUDA context to be
+        // set — `CudaContext::new(ordinal)` above did exactly that.
         unsafe {
             ffi::cublas_init();
         }
@@ -412,6 +427,8 @@ impl DeviceContext {
     pub fn sm_count(&self) -> usize {
         use cudarc::driver::sys::*;
         let mut count: i32 = 0;
+        // SAFETY: writes one i32 through a valid pointer to the local `count`;
+        // `cu_device()` is this context's live device handle.
         unsafe {
             cuDeviceGetAttribute(
                 &mut count,
@@ -427,6 +444,8 @@ impl DeviceContext {
         use cudarc::driver::sys::*;
         let mut major: i32 = 0;
         let mut minor: i32 = 0;
+        // SAFETY: writes one i32 each through valid pointers to the locals
+        // `major`/`minor`; `cu_device()` is this context's live device handle.
         unsafe {
             cuDeviceGetAttribute(
                 &mut major,
@@ -673,6 +692,9 @@ fn bf16_safetensor_host_slice(data: &[u8]) -> Result<Cow<'_, [bf16]>> {
     // Safetensors are little-endian. If a mmap-backed tensor starts at an
     // unaligned byte offset, casting `u8*` to `bf16*` would be undefined
     // behavior; fall back to a small decode buffer only for that case.
+    // SAFETY: bf16 is a 2-byte POD for which every bit pattern is valid;
+    // `align_to` itself confines the reinterpret to the correctly-aligned
+    // middle, and the unaligned prefix/suffix case falls back to a decode copy.
     let (prefix, aligned, suffix) = unsafe { data.align_to::<bf16>() };
     if prefix.is_empty() && suffix.is_empty() {
         return Ok(Cow::Borrowed(aligned));
@@ -1205,7 +1227,11 @@ impl Dsv4Fp8DeepGemmWeightCache {
             )
         })?;
         Ok(Self {
+            // SAFETY: both buffers start uninitialized by design — every row is
+            // written by `dsv4_fill_fp8_deepgemm_weight_cache` (the only
+            // producer) before any DeepGEMM launch reads the cache.
             weight: unsafe { ctx.stream.alloc_traced::<u8>(weight_len)? },
+            // SAFETY: see `weight` above; filled before first read.
             scales: unsafe { ctx.stream.alloc_traced::<f32>(scale_len)? },
             rows,
             cols,
@@ -1509,9 +1535,17 @@ fn dsv4_fill_fp8_deepgemm_weight_cache(
     let (src_scale_ptr, _src_scale_guard) = src_scales.device_ptr(&ctx.stream);
     let (dst_weight_ptr, _dst_weight_guard) = dst.weight.device_ptr_mut(&ctx.stream);
     let (dst_scale_ptr, _dst_scale_guard) = dst.scales.device_ptr_mut(&ctx.stream);
+    // SAFETY: `dst_row_offset + src.rows <= dst.rows` was ensured above, so the
+    // offset stays inside `dst.weight` (`dst.rows * dst.cols` bytes).
     let dst_weight_ptr = unsafe { (dst_weight_ptr as *mut u8).add(dst_row_offset * dst.cols) };
+    // SAFETY: `dst_scale_row_offset + src_scale_rows <= dst.scale_rows` was
+    // ensured above, so the offset stays inside `dst.scales`.
     let dst_scale_ptr =
         unsafe { (dst_scale_ptr as *mut f32).add(dst_scale_row_offset * dst.scale_cols) };
+    // SAFETY: src pointers are live CudaSlices pinned by the `_g*` guards with
+    // lengths matching the ensured shapes; the kernel writes `src.rows` weight
+    // rows and `src_scale_rows` scale rows at the bounded offsets above,
+    // stream-ordered on `ctx.stream`.
     unsafe {
         ffi::dsv4_block_scaled_to_fp8_deepgemm_cuda(
             src_ptr as *const u8,
@@ -1642,12 +1676,23 @@ fn dsv4_fill_fp8_deepgemm_weight_cache_row_range(
     let (src_scale_ptr, _src_scale_guard) = src_scales.device_ptr(&ctx.stream);
     let (dst_weight_ptr, _dst_weight_guard) = dst.weight.device_ptr_mut(&ctx.stream);
     let (dst_scale_ptr, _dst_scale_guard) = dst.scales.device_ptr_mut(&ctx.stream);
+    // SAFETY: `src_row_start + src_rows <= src.rows` and the qweight length
+    // check above keep this offset inside the source weight buffer.
     let src_ptr = unsafe { (src_ptr as *const u8).add(src_row_start * bytes_per_src_row) };
+    // SAFETY: `src_scale_row_start + src_scale_rows <= src.dsv4_scale_rows` was
+    // ensured above, keeping the offset inside the source scale buffer.
     let src_scale_ptr =
         unsafe { (src_scale_ptr as *const u8).add(src_scale_row_start * src.dsv4_scale_cols) };
+    // SAFETY: `dst_row_offset + src_rows <= dst.rows` was ensured above, so the
+    // offset stays inside `dst.weight`.
     let dst_weight_ptr = unsafe { (dst_weight_ptr as *mut u8).add(dst_row_offset * dst.cols) };
+    // SAFETY: `dst_scale_row_offset + src_scale_rows <= dst.scale_rows` was
+    // ensured above, so the offset stays inside `dst.scales`.
     let dst_scale_ptr =
         unsafe { (dst_scale_ptr as *mut f32).add(dst_scale_row_offset * dst.scale_cols) };
+    // SAFETY: all four pointers were bounds-offset above from live CudaSlices
+    // pinned by the `_g*` guards; the kernel touches `src_rows` weight rows and
+    // `src_scale_rows` scale rows only, stream-ordered on `ctx.stream`.
     unsafe {
         ffi::dsv4_block_scaled_to_fp8_deepgemm_cuda(
             src_ptr,
@@ -2133,6 +2178,8 @@ impl DeviceMatrix {
         // Upload packed INT4 data directly — native W4 kernel handles nibble extraction
         let qw: CudaSlice<i8> = ctx
             .stream
+            // SAFETY: same-size reinterpret of `&[u8]` as `&[i8]` (align 1,
+            // every bit pattern valid) for the typed H2D upload.
             .clone_htod(unsafe {
                 std::slice::from_raw_parts(packed_data.as_ptr().cast::<i8>(), packed_data.len())
             })
@@ -2209,6 +2256,8 @@ impl DeviceMatrix {
 
         let qw: CudaSlice<i8> = ctx
             .stream
+            // SAFETY: same-size reinterpret of `&[u8]` as `&[i8]` (align 1,
+            // every bit pattern valid) for the typed H2D upload.
             .clone_htod(unsafe {
                 std::slice::from_raw_parts(weight_bytes.as_ptr().cast::<i8>(), weight_bytes.len())
             })
@@ -2287,6 +2336,8 @@ impl DeviceMatrix {
 
         let qw: CudaSlice<i8> = ctx
             .stream
+            // SAFETY: same-size reinterpret of `&[u8]` as `&[i8]` (align 1,
+            // every bit pattern valid) for the typed H2D upload.
             .clone_htod(unsafe {
                 std::slice::from_raw_parts(packed_bytes.as_ptr().cast::<i8>(), packed_bytes.len())
             })
@@ -2732,6 +2783,9 @@ impl DeviceMatrix {
             {
                 let (src, _src_guard) = w4a8_packed.device_ptr(&ctx.stream);
                 let (dst, _dst_guard) = packed.device_ptr_mut(&ctx.stream);
+                // SAFETY: src/dst come from live CudaSlices of identical byte
+                // length pinned by the guards; the kernel rewrites exactly
+                // `len / 4` i32 words in place-shape, stream-ordered.
                 unsafe {
                     ffi::marlin_int4_fp8_preprocess_without_zp_cuda(
                         src as *const i32,
@@ -2810,6 +2864,8 @@ impl DeviceMatrix {
 
         let qw: CudaSlice<i8> = ctx
             .stream
+            // SAFETY: same-size reinterpret of `&[u8]` as `&[i8]` (align 1,
+            // every bit pattern valid) for the typed H2D upload.
             .clone_htod(unsafe {
                 std::slice::from_raw_parts(packed_bytes.as_ptr().cast::<i8>(), packed_bytes.len())
             })
@@ -2879,6 +2935,8 @@ impl DeviceMatrix {
 
         let qw: CudaSlice<i8> = ctx
             .stream
+            // SAFETY: same-size reinterpret of `&[u8]` as `&[i8]` (align 1,
+            // every bit pattern valid) for the typed H2D upload.
             .clone_htod(unsafe {
                 std::slice::from_raw_parts(packed_bytes.as_ptr().cast::<i8>(), packed_bytes.len())
             })
@@ -2954,6 +3012,8 @@ impl DeviceMatrix {
 
         let qw: CudaSlice<i8> = ctx
             .stream
+            // SAFETY: same-size reinterpret of `&[u8]` as `&[i8]` (align 1,
+            // every bit pattern valid) for the typed H2D upload.
             .clone_htod(unsafe {
                 std::slice::from_raw_parts(packed_bytes.as_ptr().cast::<i8>(), packed_bytes.len())
             })
@@ -3023,6 +3083,8 @@ impl DeviceMatrix {
 
         let qw: CudaSlice<i8> = ctx
             .stream
+            // SAFETY: same-size reinterpret of `&[u8]` as `&[i8]` (align 1,
+            // every bit pattern valid) for the typed H2D upload.
             .clone_htod(unsafe {
                 std::slice::from_raw_parts(packed_bytes.as_ptr().cast::<i8>(), packed_bytes.len())
             })
@@ -3091,6 +3153,8 @@ impl DeviceMatrix {
         // Upload packed data directly (native W2 kernel handles bit extraction)
         let qw: CudaSlice<i8> = ctx
             .stream
+            // SAFETY: same-size reinterpret of `&[u8]` as `&[i8]` (align 1,
+            // every bit pattern valid) for the typed H2D upload.
             .clone_htod(unsafe {
                 std::slice::from_raw_parts(packed_data.as_ptr().cast::<i8>(), packed_data.len())
             })
@@ -3207,6 +3271,10 @@ impl DeviceMatrix {
             .map_err(|e| anyhow!("H2D tq_packed failed: {}", e))?;
         let tq_s: CudaSlice<u16> = ctx
             .stream
+            // SAFETY: reinterprets the f16 scale bytes as u16 halves (every bit
+            // pattern valid, length halved to whole u16s); requires the byte
+            // slice to be 2-aligned, which safetensors buffers are in practice;
+            // TODO(#154-sweep): verify alignment or route through align_to.
             .clone_htod(unsafe {
                 std::slice::from_raw_parts(scales.as_ptr().cast::<u16>(), scales.len() / 2)
             })
@@ -3283,6 +3351,8 @@ impl DeviceMatrix {
             .stream
             .clone_dtoh(qw)
             .map_err(|e| anyhow!("D2H qweight: {}", e))?;
+        // SAFETY: same-size reinterpret of `&[i8]` as `&[u8]` (align 1, every
+        // bit pattern valid) for the host-side nibble unpack below.
         let packed: &[u8] = unsafe {
             std::slice::from_raw_parts(packed_host.as_ptr().cast::<u8>(), packed_host.len())
         };
@@ -3306,6 +3376,8 @@ impl DeviceMatrix {
         }
 
         // Upload GPTQ weights as raw bytes
+        // SAFETY: views the live `Vec<u32>` as its exact byte representation
+        // (u8 align 1, length = len * 4); `gptq` outlives the borrow.
         let gptq_bytes: &[u8] =
             unsafe { std::slice::from_raw_parts(gptq.as_ptr().cast::<u8>(), gptq.len() * 4) };
         let gptq_gpu: CudaSlice<u8> = ctx
@@ -3324,6 +3396,10 @@ impl DeviceMatrix {
         {
             let (gptq_ptr, _g1) = gptq_gpu.device_ptr(&ctx.stream);
             let (marlin_ptr, _g2) = marlin_gpu.device_ptr_mut(&ctx.stream);
+            // SAFETY: both pointers come from live CudaSlices pinned by the
+            // `_g*` guards, each `k * n / 2` bytes (checked above with K%16==0,
+            // N%64==0); the repack reads/writes exactly that range,
+            // stream-ordered on `ctx.stream`.
             unsafe {
                 ffi::gptq_marlin_repack_cuda(
                     gptq_ptr as *const u32,
@@ -3613,6 +3689,8 @@ impl HiddenStates {
     #[track_caller]
     pub unsafe fn uninit(ctx: &DeviceContext, hidden_dim: usize, seq_len: usize) -> Result<Self> {
         let len = hidden_dim * seq_len;
+        // SAFETY: forwards the uninitialized-memory contract to our caller per
+        // this method's `# Safety` doc (must be fully written before any read).
         let data: CudaSlice<bf16> = unsafe {
             ctx.stream
                 .alloc(len)

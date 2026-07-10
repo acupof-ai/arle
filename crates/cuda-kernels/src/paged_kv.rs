@@ -1314,6 +1314,11 @@ impl TokenKVPool {
             (std::ptr::null(), None)
         };
 
+        // SAFETY: the K/V layer tables and page-id arrays are freshly uploaded
+        // device buffers pinned by the `_g*` guards; V tables are null exactly
+        // when the format has no separate V plane (the kernel skips V then).
+        // Each (layer, page) copy stays within `bytes_per_page`, stream-ordered
+        // on `ctx.stream`.
         unsafe {
             ffi::transfer_kv_pages_layer_table_cuda(
                 src_k_ptr as *const u64,
@@ -1723,10 +1728,8 @@ impl TokenKVPool {
             );
             let next = cur.saturating_sub(1);
             self.page_ref_count[usize_idx] = next;
-            if next == 0 {
-                if self.recycle_page_if_unreferenced(idx) {
-                    newly_freed.push(idx);
-                }
+            if next == 0 && self.recycle_page_if_unreferenced(idx) {
+                newly_freed.push(idx);
             }
         }
         newly_freed
@@ -2132,6 +2135,13 @@ impl TokenKVPool {
         for layer in 0..self.num_layers.min(contiguous_k_caches.len()) {
             let (k_src_ptr, _gk) = contiguous_k_caches[layer].data.device_ptr(&ctx.stream);
             let (v_src_ptr, _gv) = contiguous_v_caches[layer].data.device_ptr(&ctx.stream);
+            // SAFETY: src pointers are this layer's live contiguous caches and
+            // `pi_ptr` the uploaded page table, all pinned by `_g*` guards;
+            // `k_dst_ptr`/`v_dst_ptr` map `layer` to this pool's device planes.
+            // The kernel copies `token_count` tokens from rows
+            // `[start_pos, start_pos + token_count)` (within
+            // `max_seq_len_contiguous`) into pages named by the table,
+            // stream-ordered on `ctx.stream`.
             unsafe {
                 ffi::kv_cache_to_paged_range_hnd_cuda(
                     k_src_ptr as *const ffi::Half,
@@ -2237,6 +2247,11 @@ impl TokenKVPool {
             let (ks_dst_ptr, _gksd) = self.k_scales[layer].device_ptr(&ctx.stream);
             let (vs_dst_ptr, _gvsd) = self.v_scales[layer].device_ptr(&ctx.stream);
 
+            // SAFETY: all eight data/scale pointers are this layer's live
+            // CudaSlices pinned by `_g*` guards; `ti_ptr` is the uploaded
+            // token-row table. The kernel moves exactly `token_count` tokens
+            // from contiguous rows `[start_pos, ..)` into the pool rows named
+            // by the table, stream-ordered on `ctx.stream`.
             unsafe {
                 ffi::kv_cache_to_paged_int8_range_cuda(
                     k_src_ptr as *const i8,
@@ -2398,6 +2413,12 @@ impl TokenKVPool {
         for layer in 0..self.num_layers.min(contiguous_k_caches.len()) {
             let (k_src_ptr, _gk) = contiguous_k_caches[layer].data.device_ptr(&ctx.stream);
             let (v_src_ptr, _gv) = contiguous_v_caches[layer].data.device_ptr(&ctx.stream);
+            // SAFETY: src pointers are this layer's live contiguous caches
+            // pinned by `_g*` guards; dst is the pool-owned bf16 K/V work
+            // buffer (sized for every pool token row). The kernel writes only
+            // the `token_count` rows named by `ti_ptr`, stream-ordered on
+            // `ctx.stream` — the TQ quantize pass below consumes them on the
+            // same stream.
             unsafe {
                 ffi::kv_cache_to_paged_range_cuda(
                     k_src_ptr as *const ffi::Half,

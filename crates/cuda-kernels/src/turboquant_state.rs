@@ -54,6 +54,8 @@ impl TurboQuantCodebook {
         let mut centroids_host = vec![0.0f32; num_levels];
         let mut boundaries_host = vec![0.0f32; num_levels + 1];
 
+        // SAFETY: host-side CPU routine; writes exactly `num_levels` centroids
+        // and `num_levels + 1` boundaries into the two freshly sized Vecs.
         unsafe {
             ffi::turboquant_lloyd_max(
                 centroids_host.as_mut_ptr(),
@@ -97,6 +99,8 @@ impl TurboQuantRotation {
         let n = head_dim * head_dim;
         let mut pi_host = vec![0.0f32; n];
 
+        // SAFETY: host-side CPU routine; writes exactly `head_dim * head_dim`
+        // f32 into `pi_host`, which was sized to `n` above.
         unsafe {
             ffi::turboquant_generate_rotation(pi_host.as_mut_ptr(), head_dim as i32, seed);
         }
@@ -113,6 +117,8 @@ impl TurboQuantRotation {
     pub fn new_hadamard(ctx: &DeviceContext, head_dim: usize, seed: u64) -> Result<Self> {
         let mut signs_host = vec![0i8; head_dim];
 
+        // SAFETY: host-side CPU routine; writes exactly `head_dim` i8 signs
+        // into `signs_host`, which was sized to `head_dim` above.
         unsafe {
             ffi::turboquant_generate_signs(signs_host.as_mut_ptr(), head_dim as i32, seed);
         }

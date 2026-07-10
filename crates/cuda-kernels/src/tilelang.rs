@@ -87,6 +87,9 @@ pub struct TileLangWorkspace {
     _extra_float_workspace: Option<CudaSlice<f32>>,
 }
 
+// SAFETY: all fields are owned `CudaSlice` device buffers plus plain counters;
+// device memory handles are not thread-affine (frees are stream-ordered via the
+// slice's own stream handle), so moving the workspace across threads is sound.
 unsafe impl Send for TileLangWorkspace {}
 
 /// `--decode-metadata-fast-page16` (default off), set once pre-load.
@@ -583,6 +586,10 @@ impl TileLangDecodeMetadata {
                     let (indices_ptr, _gidx) = self.kv_indices.device_ptr_mut(&ctx.stream);
                     let (indptr_ptr, _gindptr) = self.kv_indptr.device_ptr(&ctx.stream);
                     let (last_ptr, _glast) = self.last_token_indices.device_ptr(&ctx.stream);
+                    // SAFETY: all three pointers come from live CudaSlices bound
+                    // to `ctx.stream` (the `_g*` guards pin them for the call);
+                    // the kernel reads/writes one i32 per request, bounded by
+                    // `slot_indices.len()`, stream-ordered on the same stream.
                     unsafe {
                         ffi::paged_kv_append_last_token_indices_cuda(
                             indices_ptr as *mut i32,
@@ -1088,6 +1095,10 @@ fn append_new_page_indices_kernel(
     let (next_indptr_ptr, _gnext) = next_kv_indptr.device_ptr(&ctx.stream);
     let (append_indptr_ptr, _gappend) = append_indptr.device_ptr(&ctx.stream);
     let (appended_ptr, _gappended) = appended_page_indices.device_ptr(&ctx.stream);
+    // SAFETY: every pointer comes from a live CudaSlice bound to `ctx.stream`
+    // (guards `_g*` pin them for the call); the H2D copies of the indptr /
+    // appended-page tables above are stream-ordered before the launch, and the
+    // kernel writes only within `next_kv_indptr[batch_size]` bounds.
     unsafe {
         ffi::paged_kv_append_new_page_indices_cuda(
             indices_ptr as *mut i32,

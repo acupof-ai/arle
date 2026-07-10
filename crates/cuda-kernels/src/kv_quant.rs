@@ -36,6 +36,9 @@ pub fn quantize_kv(
     let (int8_ptr, _g2) = kv_int8.device_ptr_mut(&ctx.stream);
     let (scales_ptr, _g3) = scales.device_ptr_mut(&ctx.stream);
 
+    // SAFETY: all three pointers come from live device buffers pinned by the
+    // `_g*` guards, each in HND layout over `max_seq_len`; the kernel touches
+    // only rows `[start_pos, start_pos + token_count)`, stream-ordered.
     unsafe {
         ffi::quantize_kv_bf16_to_int8_cuda(
             bf16_ptr as *const ffi::Half,
@@ -75,6 +78,9 @@ pub fn dequantize_kv(
     let (scales_ptr, _g2) = scales.device_ptr(&ctx.stream);
     let (bf16_ptr, _g3) = kv_bf16.data.device_ptr_mut(&ctx.stream);
 
+    // SAFETY: all three pointers come from live device buffers pinned by the
+    // `_g*` guards, each in HND layout over `max_seq_len`; the kernel touches
+    // only rows `[0, token_count)`, stream-ordered on `ctx.stream`.
     unsafe {
         ffi::dequantize_kv_int8_to_bf16_cuda(
             int8_ptr as *const i8,
@@ -117,6 +123,10 @@ pub fn dequantize_paged_kv(
 
     let (ti_ptr, _gti) = token_indices_gpu.device_ptr(&ctx.stream);
 
+    // SAFETY: the raw u64 args are the pool's live INT8/scales/bf16-work device
+    // buffers (u64 only because their element types differ); `ti_ptr` is pinned
+    // by `_gti`. Reads/writes are limited to the `total_tokens` rows it names,
+    // stream-ordered on `ctx.stream`.
     unsafe {
         ffi::dequantize_paged_kv_cuda(
             kv_int8_ptr as *const i8,
@@ -159,6 +169,9 @@ pub fn quantize_paged_kv_fp8(
         let chunk_tokens = (batch_size - offset).min(MAX_TOKEN_ROWS_PER_PAGED_KV_LAUNCH);
         let rows = new_token_indices_gpu.slice(offset..offset + chunk_tokens);
         let (nti_ptr, _g) = rows.device_ptr(&ctx.stream);
+        // SAFETY: raw u64 args are the pool's live bf16-work/FP8/scale device
+        // buffers; the chunked `rows` slice is pinned by `_g`. Writes are
+        // limited to the `chunk_tokens` pool rows it names, stream-ordered.
         unsafe {
             ffi::quantize_paged_kv_fp8_cuda(
                 kv_bf16_ptr as *const ffi::Half,
@@ -204,6 +217,9 @@ pub fn quantize_paged_kv_fp8_per_channel(
         let chunk_tokens = (batch_size - offset).min(MAX_TOKEN_ROWS_PER_PAGED_KV_LAUNCH);
         let rows = new_token_indices_gpu.slice(offset..offset + chunk_tokens);
         let (nti_ptr, _g) = rows.device_ptr(&ctx.stream);
+        // SAFETY: raw u64 args are the pool's live bf16-work/FP8 buffers plus
+        // the `[num_kv_heads, head_dim]` static scale table; chunked `rows`
+        // pinned by `_g`. Writes bounded by `chunk_tokens`, stream-ordered.
         unsafe {
             ffi::quantize_paged_kv_fp8_per_channel_cuda(
                 kv_bf16_ptr as *const ffi::Half,
@@ -246,6 +262,10 @@ pub fn compute_k_per_channel_absmax(
         let chunk_tokens = (batch_size - offset).min(MAX_TOKEN_ROWS_PER_PAGED_KV_LAUNCH);
         let rows = token_rows_gpu.slice(offset..offset + chunk_tokens);
         let (nti_ptr, _g) = rows.device_ptr(&ctx.stream);
+        // SAFETY: raw u64 args are the pool's live bf16-work buffer and the
+        // `[num_kv_heads, head_dim]` absmax accumulator (safe to accumulate
+        // across chunks); chunked `rows` pinned by `_g`. Reads bounded by
+        // `chunk_tokens`, stream-ordered.
         unsafe {
             ffi::compute_k_per_channel_absmax_cuda(
                 kv_bf16_ptr as *const ffi::Half,
@@ -275,6 +295,9 @@ pub fn finalize_k_per_channel_scales(
     if num_channels == 0 {
         return Ok(());
     }
+    // SAFETY: `k_static_scales_ptr` is the caller's live `[num_channels]` f32
+    // scale table on `ctx.stream`; in-place divide bounded by `num_channels`,
+    // stream-ordered.
     unsafe {
         ffi::finalize_k_per_channel_scales_cuda(
             k_static_scales_ptr as *mut f32,
@@ -297,6 +320,8 @@ pub fn finalize_k_per_channel_scales_int8(
     if num_channels == 0 {
         return Ok(());
     }
+    // SAFETY: same contract as `finalize_k_per_channel_scales` — live
+    // `[num_channels]` f32 table, in-place divide, stream-ordered.
     unsafe {
         ffi::finalize_k_per_channel_scales_int8_cuda(
             k_static_scales_ptr as *mut f32,
@@ -332,6 +357,9 @@ pub fn quantize_paged_kv_int8_per_channel(
         let chunk_tokens = (batch_size - offset).min(MAX_TOKEN_ROWS_PER_PAGED_KV_LAUNCH);
         let rows = new_token_indices_gpu.slice(offset..offset + chunk_tokens);
         let (nti_ptr, _g) = rows.device_ptr(&ctx.stream);
+        // SAFETY: raw u64 args are the pool's live bf16-work/INT8 buffers plus
+        // the static per-channel scale table; chunked `rows` pinned by `_g`.
+        // Writes bounded by `chunk_tokens`, stream-ordered.
         unsafe {
             ffi::quantize_paged_kv_int8_per_channel_cuda(
                 kv_bf16_ptr as *const ffi::Half,
@@ -361,6 +389,8 @@ pub fn finalize_k_per_channel_scales_int4(
     if num_channels == 0 {
         return Ok(());
     }
+    // SAFETY: same contract as `finalize_k_per_channel_scales` — live
+    // `[num_channels]` f32 table, in-place divide, stream-ordered.
     unsafe {
         ffi::finalize_k_per_channel_scales_int4_cuda(
             k_static_scales_ptr as *mut f32,
@@ -395,6 +425,9 @@ pub fn quantize_paged_kv_int4_per_channel(
         let chunk_tokens = (batch_size - offset).min(MAX_TOKEN_ROWS_PER_PAGED_KV_LAUNCH);
         let rows = new_token_indices_gpu.slice(offset..offset + chunk_tokens);
         let (nti_ptr, _g) = rows.device_ptr(&ctx.stream);
+        // SAFETY: raw u64 args are the pool's live bf16-work/INT4-packed
+        // buffers plus static + dynamic scale tables; chunked `rows` pinned by
+        // `_g`. Writes bounded by `chunk_tokens`, stream-ordered.
         unsafe {
             ffi::quantize_paged_kv_int4_per_channel_cuda(
                 kv_bf16_ptr as *const ffi::Half,
@@ -437,6 +470,9 @@ pub fn quantize_paged_kv_single_int4(
         let chunk_tokens = (batch_size - offset).min(MAX_TOKEN_ROWS_PER_PAGED_KV_LAUNCH);
         let rows = new_token_indices_gpu.slice(offset..offset + chunk_tokens);
         let (nti_ptr, _g) = rows.device_ptr(&ctx.stream);
+        // SAFETY: raw u64 args are the pool's live bf16-work/INT4-packed/scale
+        // buffers; chunked `rows` pinned by `_g`. Writes bounded by
+        // `chunk_tokens`, stream-ordered.
         unsafe {
             ffi::quantize_paged_kv_single_int4_cuda(
                 kv_bf16_ptr as *const ffi::Half,
@@ -486,6 +522,11 @@ pub fn decode_attention_int4_per_channel_k(
     let (ip_ptr, _g3) = kv_meta.device_ptr(&ctx.stream);
     let (o_ptr, _g4) = o.data.device_ptr_mut(&ctx.stream);
     let (ws_ptr, _g5) = workspace.device_ptr(&ctx.stream);
+    // SAFETY: Q/indices/meta/output/workspace pointers come from live buffers
+    // pinned by `_g*`; raw u64 args are the pool's INT4-packed K/V planes and
+    // scale tables. Reads only pages named by `kv_indices`/`kv_meta`, writes
+    // `batch_size * num_qo_heads` output rows; workspace caller-sized via the
+    // matching `_workspace_bytes` query. Stream-ordered.
     unsafe {
         ffi::decode_attention_int4_per_channel_k_cuda(
             q_ptr as *const ffi::Half,
@@ -531,6 +572,10 @@ pub fn quantize_scatter_kv_fp8(
     }
     let (cont_ptr, _g1) = kv_cont.data.device_ptr(&ctx.stream);
     let (pi_ptr, _g2) = page_indices_gpu.device_ptr(&ctx.stream);
+    // SAFETY: `cont_ptr`/`pi_ptr` come from live device buffers pinned by
+    // `_g*`; raw u64 args are the pool's FP8/scale planes. The kernel reads
+    // `seq_len` contiguous HND rows (within `max_seq_len`) and writes only the
+    // pool rows named by `page_indices_gpu`, stream-ordered.
     unsafe {
         ffi::quantize_scatter_kv_fp8_cuda(
             cont_ptr as *const ffi::Half,
@@ -569,6 +614,9 @@ pub fn quantize_scatter_kv_fp8_range(
     }
     let (cont_ptr, _g1) = kv_cont.data.device_ptr(&ctx.stream);
     let (pi_ptr, _g2) = page_indices_gpu.device_ptr(&ctx.stream);
+    // SAFETY: same contract as `quantize_scatter_kv_fp8`, restricted to source
+    // rows `[start_pos, start_pos + token_count)`; guards `_g*` pin the live
+    // slices, stream-ordered on `ctx.stream`.
     unsafe {
         ffi::quantize_scatter_kv_fp8_range_cuda(
             cont_ptr as *const ffi::Half,
@@ -609,6 +657,9 @@ pub fn dequantize_paged_kv_fp8_to_hnd(
         let chunk_tokens = (total_tokens - offset).min(MAX_TOKEN_ROWS_PER_PAGED_KV_LAUNCH);
         let rows = token_rows_gpu.slice(offset..offset + chunk_tokens);
         let (rows_ptr, _g) = rows.device_ptr(&ctx.stream);
+        // SAFETY: raw u64 args are the pool's live FP8/scale planes and the
+        // bf16 HND work buffer; chunked `rows` pinned by `_g`. Reads/writes
+        // bounded by the `chunk_tokens` rows it names, stream-ordered.
         unsafe {
             ffi::dequantize_paged_kv_fp8_to_hnd_cuda(
                 kv_fp8_ptr as *const u8,
@@ -649,6 +700,9 @@ pub fn dequantize_paged_kv_int8_to_hnd(
         let chunk_tokens = (total_tokens - offset).min(MAX_TOKEN_ROWS_PER_PAGED_KV_LAUNCH);
         let rows = token_rows_gpu.slice(offset..offset + chunk_tokens);
         let (rows_ptr, _g) = rows.device_ptr(&ctx.stream);
+        // SAFETY: same contract as `dequantize_paged_kv_fp8_to_hnd`, reading
+        // the INT8 plane instead; chunked `rows` pinned by `_g`, writes bounded
+        // by `chunk_tokens`, stream-ordered.
         unsafe {
             ffi::dequantize_paged_kv_int8_to_hnd_cuda(
                 kv_int8_ptr as *const i8,
@@ -693,6 +747,9 @@ pub fn dequantize_paged_kv_fp8_per_channel_k_to_hnd(
         let chunk_tokens = (total_tokens - offset).min(MAX_TOKEN_ROWS_PER_PAGED_KV_LAUNCH);
         let rows = token_rows_gpu.slice(offset..offset + chunk_tokens);
         let (rows_ptr, _g) = rows.device_ptr(&ctx.stream);
+        // SAFETY: same contract as `dequantize_paged_kv_fp8_to_hnd`, but the
+        // scale arg is the static `[num_kv_heads, head_dim]` channel table;
+        // chunked `rows` pinned by `_g`, writes bounded by `chunk_tokens`.
         unsafe {
             ffi::dequantize_paged_kv_fp8_per_channel_k_to_hnd_cuda(
                 kv_fp8_ptr as *const u8,
@@ -735,6 +792,9 @@ pub fn dequantize_paged_kv_int8_per_channel_k_to_hnd(
         let chunk_tokens = (total_tokens - offset).min(MAX_TOKEN_ROWS_PER_PAGED_KV_LAUNCH);
         let rows = token_rows_gpu.slice(offset..offset + chunk_tokens);
         let (rows_ptr, _g) = rows.device_ptr(&ctx.stream);
+        // SAFETY: same contract as the FP8 per-channel-K sibling above, reading
+        // the INT8 plane; chunked `rows` pinned by `_g`, writes bounded by
+        // `chunk_tokens`, stream-ordered.
         unsafe {
             ffi::dequantize_paged_kv_int8_per_channel_k_to_hnd_cuda(
                 kv_int8_ptr as *const i8,
@@ -763,6 +823,7 @@ pub fn decode_attention_int8_workspace_bytes(
     head_dim: usize,
     num_splits: usize,
 ) -> usize {
+    // SAFETY: pure host-side size computation — no pointers, no device work.
     unsafe {
         ffi::decode_attention_int8_workspace_bytes(
             batch_size as i32,
@@ -805,6 +866,11 @@ pub fn decode_attention_fp8_per_channel_k(
     let (ip_ptr, _g3) = kv_meta.device_ptr(&ctx.stream);
     let (o_ptr, _g4) = o.data.device_ptr_mut(&ctx.stream);
     let (ws_ptr, _g5) = workspace.device_ptr(&ctx.stream);
+    // SAFETY: Q/indices/meta/output/workspace pointers come from live buffers
+    // pinned by `_g*`; raw u64 args are the pool's FP8 K/V planes, the static
+    // K channel-scale table and per-(row, head) V scales. Reads only pages
+    // named by `kv_indices`/`kv_meta`, writes `batch_size * num_qo_heads`
+    // output rows; workspace caller-sized via the `_workspace_bytes` query.
     unsafe {
         ffi::decode_attention_fp8_per_channel_k_cuda(
             q_ptr as *const ffi::Half,
@@ -862,6 +928,9 @@ pub fn decode_attention_int8_per_channel_k(
     let (ip_ptr, _g3) = kv_meta.device_ptr(&ctx.stream);
     let (o_ptr, _g4) = o.data.device_ptr_mut(&ctx.stream);
     let (ws_ptr, _g5) = workspace.device_ptr(&ctx.stream);
+    // SAFETY: same contract as `decode_attention_fp8_per_channel_k`, reading
+    // INT8 K/V planes instead; guards `_g*` pin the live slices, workspace
+    // caller-sized, stream-ordered.
     unsafe {
         ffi::decode_attention_int8_per_channel_k_cuda(
             q_ptr as *const ffi::Half,
@@ -905,6 +974,7 @@ pub fn decode_attention_varlen_fp8_workspace_bytes(
     head_dim: usize,
     num_splits: usize,
 ) -> usize {
+    // SAFETY: pure host-side size computation — no pointers, no device work.
     unsafe {
         ffi::decode_attention_varlen_fp8_workspace_bytes(
             total_q_tokens as i32,
@@ -952,6 +1022,11 @@ pub fn decode_attention_varlen_fp8(
     let (o_ptr, _go) = output.data.device_ptr_mut(&ctx.stream);
     let (ws_ptr, _gws) = workspace.device_ptr(&ctx.stream);
 
+    // SAFETY: packed-Q/indptr/indices/last-page/output/workspace pointers come
+    // from live buffers pinned by `_g*`; raw u64 args are the pool's FP8/INT8
+    // K/V planes, scale pointers are 0 exactly when the format carries none
+    // (kernel skips them). Reads only pages named by `kv_indptr`/`kv_indices`,
+    // writes `total_q_tokens` output rows, stream-ordered.
     unsafe {
         ffi::decode_attention_varlen_fp8_cuda(
             q_ptr as *const ffi::Half,
@@ -1003,6 +1078,9 @@ pub fn quantize_paged_kv_single(
         let chunk_tokens = (batch_size - offset).min(MAX_TOKEN_ROWS_PER_PAGED_KV_LAUNCH);
         let rows = new_token_indices_gpu.slice(offset..offset + chunk_tokens);
         let (nti_ptr, _gnti) = rows.device_ptr(&ctx.stream);
+        // SAFETY: raw u64 args are the pool's live bf16-work/INT8/scale
+        // buffers; chunked `rows` pinned by `_gnti`. Writes bounded by the
+        // `chunk_tokens` pool rows it names, stream-ordered.
         unsafe {
             ffi::quantize_paged_kv_single_cuda(
                 kv_bf16_ptr as *const ffi::Half,

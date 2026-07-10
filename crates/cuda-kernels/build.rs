@@ -222,14 +222,13 @@ fn nvcc_arch_args(sm_targets: &[SmSpec]) -> Vec<String> {
     if let Some(max_spec) = sm_targets
         .iter()
         .max_by_key(|s| s.sm.parse::<u32>().unwrap_or(0))
+        && !max_spec.ptx
     {
-        if !max_spec.ptx {
-            args.push("-gencode".to_string());
-            args.push(format!(
-                "arch=compute_{sm},code=compute_{sm}",
-                sm = max_spec.sm
-            ));
-        }
+        args.push("-gencode".to_string());
+        args.push(format!(
+            "arch=compute_{sm},code=compute_{sm}",
+            sm = max_spec.sm
+        ));
     }
 
     args
