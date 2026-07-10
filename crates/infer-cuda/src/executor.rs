@@ -30,7 +30,7 @@ mod spec_decode;
 const SUPPORTED_PAGE_SIZE: usize = 16;
 
 /// Flatten a `(session, block)` [`infer_seam::TierBlockKey`] into the
-/// `CudaKvTierStore`'s opaque `u64` key namespace. The prefix tier already keys
+/// `KvTierStore`'s opaque `u64` key namespace. The prefix tier already keys
 /// the same store by sequentially-assigned `u64`s (`next_tier_key`), so the
 /// write-through namespace must never collide with it: we reserve the high bit
 /// for write-through keys and pack `session` (low 31 bits) and `block` (low 32
@@ -792,7 +792,7 @@ impl RealCudaExecutor {
     }
 }
 
-use crate::kv_tier::{BLOB_CHUNK_BYTES, CudaKvTierStore, default_t1_budget_bytes};
+use kv_native_sys::{BLOB_CHUNK_BYTES, KvTierStore, default_t1_budget_bytes};
 
 /// Placeholder, not measurement-derived — dormant until `demote` is wired.
 ///
@@ -805,7 +805,7 @@ pub(crate) const DEFAULT_DRAM_FRACTION: f64 = 0.5;
 pub(crate) struct QwenCudaExecutor {
     model: CudaModel,
     kv: PagedKVPool,
-    tier: CudaKvTierStore,
+    tier: KvTierStore,
     num_slots: usize,
     /// Per-slot (occupant epoch, materialized token count) continuity guard.
     ///
@@ -986,7 +986,7 @@ impl QwenCudaExecutor {
         );
 
         let slot_progress = vec![SlotProgress::default(); num_slots];
-        let tier = CudaKvTierStore::with_budget(
+        let tier = KvTierStore::with_budget(
             default_t1_budget_bytes(DEFAULT_DRAM_FRACTION),
             kv.storage_bytes_per_page(),
         );
@@ -1036,7 +1036,7 @@ impl QwenCudaExecutor {
     /// existing entries are dropped, so callers configure this right after
     /// construction, before the engine demotes anything.
     pub(crate) fn set_kv_tier_budget_bytes(&mut self, bytes: usize) {
-        self.tier = CudaKvTierStore::with_budget(bytes, self.kv.storage_bytes_per_page());
+        self.tier = KvTierStore::with_budget(bytes, self.kv.storage_bytes_per_page());
     }
 
     /// Opt into session KV-recall (`--kv-recall`, default off). Mirrors the Metal
@@ -1104,7 +1104,7 @@ impl QwenCudaExecutor {
 
     /// **Write-through**: mirror a filled device `page` into the host tier under
     /// `key`, so a later evict-drop of that page is free (the tier keeps the
-    /// source of truth). Reuses the same `CudaKvTierStore` as the prefix tier —
+    /// source of truth). Reuses the same `KvTierStore` as the prefix tier —
     /// there is ONE session-keyed store (R5), not a parallel one. `key` is a
     /// `(session, block)` pair flattened to the store's `u64` namespace by
     /// [`tier_block_u64`].
@@ -1887,7 +1887,7 @@ pub(crate) struct Dsv4CudaExecutor {
     prefix_state: crate::attention::Dsv4PrefixStatePool,
 }
 
-/// `slot_tier` key namespaces (top byte, see `kv_tier::tier_key`), so features
+/// `slot_tier` key namespaces (top byte, see `kv_native_sys::tier_key`), so features
 /// sharing THE store never collide and a future kind (e.g. a suffix cache) is
 /// one new constant.
 /// Parked whole-slot images (key = engine-minted swap key).
@@ -3303,7 +3303,7 @@ pub(crate) struct Qwen35CudaExecutor {
     slots: Vec<crate::qwen35::Qwen35SlotState>,
     /// G3 whole-slot capacity spill: an inactive/retracted request parks its
     /// whole slot snapshot here (instead of being dropped + recomputed) and is
-    /// restored byte-exact on resume. Routes through the SAME `CudaKvTierStore`
+    /// restored byte-exact on resume. Routes through the SAME `KvTierStore`
     /// transport as the page-granular `recall_tier` (the unified-tier plan — all
     /// grains move bytes through ONE store kind by opaque `u64` key), so G3 gets
     /// the managed 850 GB DRAM budget + NVMe spill + durability for free instead
@@ -3313,7 +3313,7 @@ pub(crate) struct Qwen35CudaExecutor {
     /// default-on and independent of `--kv-recall` (the page grain). Keyed by the
     /// engine's session key, a namespace disjoint from `recall_tier`'s
     /// `tier_block_u64(slot, page)` keys (separate store ⇒ no aliasing).
-    slot_tier: CudaKvTierStore,
+    slot_tier: KvTierStore,
     /// Per-unit size (one whole-slot recurrent-block image) for the `slot_tier`
     /// budget, stored so `set_kv_tier_budget_bytes` can
     /// re-budget the tier post-construction without recomputing it (L2).
@@ -3369,7 +3369,7 @@ pub(crate) struct Qwen35CudaExecutor {
     /// the first `set_kv_recall(true)` and sized to ONE pool page image. Keyed by
     /// `tier_block_u64(slot, logical_page)` — a session-scoped namespace, so slot A
     /// never prefetches slot B's KV. `None` until `--kv-recall` is enabled.
-    recall_tier: Option<CudaKvTierStore>,
+    recall_tier: Option<KvTierStore>,
     /// Per-slot one-step eviction keepalive (the race fix). A page evict-dropped at
     /// decode step N is parked here, NOT returned to `free_pages`, until the START
     /// of step N+1 — by which point step N's attention (and its argmax `ctx.sync()`
@@ -3674,7 +3674,7 @@ impl Qwen35CudaExecutor {
     /// The copy is complete before returning (`swap_out_image` ends in
     /// `ctx.sync()`), so the engine may free the slot immediately. The image is
     /// serialized byte-exact ([`Qwen35SlotImage::to_bytes`]) and handed to the
-    /// shared `CudaKvTierStore` transport, which manages the 850 GB DRAM budget
+    /// shared `KvTierStore` transport, which manages the 850 GB DRAM budget
     /// (+ optional NVMe spill). Returns `Ok(false)` when the tier is at budget
     /// on ANY rank (engine falls back to plain recompute, same contract as the
     /// old cap). Exactly TWO collectives on every path (capture consensus,
@@ -3909,11 +3909,11 @@ impl Qwen35CudaExecutor {
         // G3 whole-slot spill tier: snapshots stored as 16 MiB chunked blobs
         // (manifest + chunks, the DSv4 pattern) — a whole image never fits one
         // fixed page, and the store's size contract is per-page. Same
-        // `CudaKvTierStore` transport as the page-granular recall tier — the
+        // `KvTierStore` transport as the page-granular recall tier — the
         // unified plan: every grain moves bytes through ONE store kind. NVMe
         // spill is opt-in via `set_kv_tier_disk` (shared with the dense arm).
         let tier_budget_bytes = default_t1_budget_bytes(DEFAULT_DRAM_FRACTION);
-        let slot_tier = CudaKvTierStore::with_budget(tier_budget_bytes, BLOB_CHUNK_BYTES);
+        let slot_tier = KvTierStore::with_budget(tier_budget_bytes, BLOB_CHUNK_BYTES);
 
         // Whole-step decode graph: env opt-in ∧ single-GPU (NCCL all-reduce is
         // not graph-capturable on this stack — TP≥2 stays eager, same as
@@ -3922,7 +3922,7 @@ impl Qwen35CudaExecutor {
             && model.tp.is_single()
             && model.decode_graph_unsupported_reason().is_none();
         let model_path_buf = model_path.as_ref().to_path_buf();
-        let weights_epoch = crate::kv_tier::weights_epoch_tag(&model_path_buf);
+        let weights_epoch = kv_native_sys::weights_epoch_tag(&model_path_buf);
         let executor = Self {
             model,
             slots,
@@ -4208,7 +4208,7 @@ impl Qwen35CudaExecutor {
     /// only (drops any existing entries).
     pub(crate) fn set_kv_tier_budget_bytes(&mut self, bytes: usize) {
         self.recall_budget_bytes = bytes;
-        self.slot_tier = CudaKvTierStore::with_budget(bytes, BLOB_CHUNK_BYTES);
+        self.slot_tier = KvTierStore::with_budget(bytes, BLOB_CHUNK_BYTES);
     }
 
     /// Attach NVMe spill (`--kv-disk`): an ephemeral disk level under the
@@ -4258,7 +4258,7 @@ impl Qwen35CudaExecutor {
             // blocks. One entry == one pool page image (all `num_full` layers,
             // K+V). Host-DRAM budget is the resolved per-rank `--kv-dram` share
             // (same cap as the slot tier); NVMe spill is opt-in via the
-            // prefix-tier `--kv-disk` wiring. Reuses the SAME `CudaKvTierStore`
+            // prefix-tier `--kv-disk` wiring. Reuses the SAME `KvTierStore`
             // transport the dense arm's prefix/write-through tier uses (R5 —
             // one store kind).
             let page_bytes = self
@@ -4268,7 +4268,7 @@ impl Qwen35CudaExecutor {
                 .ok_or_else(|| {
                     anyhow::anyhow!("--kv-recall: full-attn paged pool not allocated")
                 })?;
-            let mut tier = CudaKvTierStore::with_budget(self.recall_budget_bytes, page_bytes);
+            let mut tier = KvTierStore::with_budget(self.recall_budget_bytes, page_bytes);
             // Try loading prior session durable NVMe spill if disk is configured.
             // Falls through to set_disk_durable on first run or epoch mismatch.
             if let (Some(root), Some(budget)) = (self.disk_root.as_ref(), self.disk_budget) {
@@ -6041,7 +6041,7 @@ fn maybe_dump_sample_topk(ctx: &DeviceContext, logits: &DeviceVec, position: u64
 #[cfg(test)]
 mod tests {
     use super::{CudaKvCacheDtype, NS_SLOT, NS_SLOT_CHUNK};
-    use crate::kv_tier::{chunk_sub, tier_key};
+    use kv_native_sys::{chunk_sub, tier_key};
     use infer_seam::KvCacheDtype;
 
     #[test]

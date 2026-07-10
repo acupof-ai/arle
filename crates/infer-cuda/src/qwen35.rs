@@ -340,7 +340,7 @@ pub(crate) struct Qwen35SlotImage {
 
 impl Qwen35SlotImage {
     /// Approximate device-state byte size of a whole-slot image (the unit the G3
-    /// `CudaKvTierStore` budgets one entry against). Used only to size the tier's
+    /// `KvTierStore` budgets one entry against). Used only to size the tier's
     /// count cap — exactness isn't required, but it must scale with the image.
     pub(crate) fn dram_bytes(&self) -> usize {
         self.full_attn_pages.len()
@@ -350,7 +350,7 @@ impl Qwen35SlotImage {
     }
 
     /// Flatten the whole-slot image into ONE length-prefixed byte buffer for the
-    /// G3 [`crate::kv_tier::CudaKvTierStore`] (opaque-`u64`-keyed transport). The
+    /// G3 [`kv_native_sys::KvTierStore`] (opaque-`u64`-keyed transport). The
     /// exact byte-inverse of [`Self::from_bytes`] — proven field-for-field in the
     /// `slot_image_byte_inverse` unit test. No serde: a small fixed header
     /// (`seq_len`, `full_attn_page_count`, `full_attn_pages` byte length, the two
@@ -512,7 +512,7 @@ impl Qwen35RecurrentSnapshot {
     }
 
     /// Flatten the recurrent + full-attn KV snapshot into ONE length-prefixed
-    /// buffer for the sidecar [`crate::kv_tier::CudaKvTierStore`] (opaque-`u64`
+    /// buffer for the sidecar [`kv_native_sys::KvTierStore`] (opaque-`u64`
     /// key). The recurrent state and the full-attn KV are serialized together as
     /// one atomic blob — a partial store/restore corrupts model output. Exact
     /// byte-inverse of [`Self::from_bytes`] (proven in `recurrent_snapshot_byte_inverse`).
@@ -2713,7 +2713,7 @@ impl Qwen35Model {
             frozen_base_ptrs_exported: AtomicBool::new(false),
             lora_delta_scratch: None,
             lora_dirty: HashSet::new(),
-            weights_epoch: crate::kv_tier::weights_epoch_tag(model_path),
+            weights_epoch: kv_native_sys::weights_epoch_tag(model_path),
         })
     }
 
