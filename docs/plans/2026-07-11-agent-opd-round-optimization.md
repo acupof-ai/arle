@@ -41,22 +41,27 @@ Together: **round −30.1%**, quality unchanged (eval 4/4).
 
 ## To do, best return first
 
-1. **Skip recompute on short sequences** — −7.5% round, no quality cost.
-   Backward spends 30.7% (2.4 s/call) recomputing the forward. `should_checkpoint`
-   (`qwen35.rs:2601`) already skips checkpointing when activations fit free VRAM,
-   but the writeback forward still checkpointed at seq≈1300. Find why (was
-   gradient-checkpointing forced on, or is the writeback path unconditional?),
-   make it honor the memory check. Same seq switch as the offload win.
+No backward lever is risk-free. The runtime already picks checkpoint-vs-resident
+by a memory estimate, and training fewer layers trades quality — each needs one
+check before shipping.
 
-2. **Eval less often** — −5% round. `--eval-every 2 → 4`. Pure config, no code.
-   Cost: half as many points on the capability curve. Confirm that's acceptable
-   for the run, then set it.
+1. **Eval less often** — −5% round, zero risk. `--eval-every 2 → 4`. Config only.
+   Cost: half as many points on the capability curve. Set it if that's fine for
+   the run. This is the only change with no measurement gate.
 
-3. **Train only the top half of layers** — −12% round, but trades capability.
+2. **Skip recompute on short sequences** — −7.5% round, no quality cost, but needs
+   an OOM check first. Backward spends 30.7% (2.4 s/call) recomputing the forward.
+   The CLI forces checkpointing on (`train_cli.rs:2550`); `should_checkpoint`
+   (`qwen35.rs:2601`) then keeps it because its estimate (a ×3 headroom) says the
+   activations won't fit at seq≈1300. Real residency is ~1/3 of that, so the
+   margin is likely too conservative — but the ×3 may cover the backward's own
+   peak. Gate: cut the margin at short seq, sweep production trajectory lengths,
+   confirm no OOM. Then it's the offload win's twin.
+
+3. **Train only the top half of layers** — −12% round, trades quality.
    `--lora-layer-start 32` detaches the tape at layer 32 (`detach_before_lora_layer`,
-   `qwen35.rs:3453`), so backward runs 32 layers instead of 64 — mechanism
-   confirmed. Gate: does training half the layers still learn as well? Needs a
-   pass-rate/needle A/B before shipping. Not free.
+   `qwen35.rs:3453`), so backward runs 32 layers instead of 64 — confirmed. Gate:
+   does training half the layers learn as well? Needs a pass-rate A/B first.
 
 ## Killed / deferred
 
