@@ -904,6 +904,7 @@ fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
             args.prompt_max_tokens + args.rollout_len + 32,
             train_backend.clone(),
             cfg.vocab_size,
+            &args.runtime,
         )?
     };
     #[cfg(not(feature = "cuda"))]
@@ -1615,6 +1616,8 @@ fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
             max_prompt_tokens: student_seq,
             max_total_tokens: student_seq,
             chunked_prefill_size: student_seq,
+            dspark_draft_model: args.runtime.dspark_draft_model.clone(),
+            dspark_conf_threshold: args.runtime.dspark_conf_threshold,
             ..EngineLoadConfig::default()
         },
     )
@@ -2453,6 +2456,8 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
             // its KV pool is num_slots-based (small). Cap the static reservation
             // so the student's weights + writeback activations fit alongside.
             mem_fraction_static: 0.2,
+            dspark_draft_model: args.runtime.dspark_draft_model.clone(),
+            dspark_conf_threshold: args.runtime.dspark_conf_threshold,
             ..EngineLoadConfig::default()
         },
     )
@@ -2984,6 +2989,7 @@ fn run_self_opd_from_dir(args: TrainSelfOpdArgs) -> Result<()> {
         prompt_ids.len() + args.rollout_len + 32,
         train_backend.clone(),
         vocab,
+        &args.runtime,
     )?;
     #[cfg(not(feature = "cuda"))]
     let _ = &train_backend;
@@ -3435,6 +3441,7 @@ fn load_opd_infer_student(
     max_seq_len: usize,
     train_backend: std::sync::Arc<dyn autograd::Backend>,
     vocab_size: usize,
+    runtime: &crate::args::OpdRuntimeArgs,
 ) -> Result<Option<train::infer_student::InferStudent>> {
     if !train::opd::infer_rollout_flag_enabled() {
         return Ok(None);
@@ -3462,6 +3469,8 @@ fn load_opd_infer_student(
             max_prompt_tokens: max_seq_len,
             max_total_tokens: max_seq_len,
             chunked_prefill_size: max_seq_len,
+            dspark_draft_model: runtime.dspark_draft_model.clone(),
+            dspark_conf_threshold: runtime.dspark_conf_threshold,
             ..EngineLoadConfig::default()
         },
     )
