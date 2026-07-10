@@ -117,6 +117,48 @@ full-perfectblend-from-scratch (~76 TB) is storage-infeasible. Small patches:
 `text_config` nesting, mask_token_id 248070, max_length. Refresh per N OPD
 rounds to track LoRA drift.
 
+## Next wall — small-M FP8 dense GEMM (2026-07-10)
+
+Evidence: dense_ffn 26 ms/step profiled at M=16 vs ~3.2 ms weight-read floor
+(~8×); plain decode 23 ms/tok vs ~7 ms roofline (27 GB FP8 / 4 TB/s H20).
+Wins here speed BOTH plain decode (M=1 GEMV lane) and DSpark verify (M=17
+DeepGEMM lane).
+
+**Survey (adopt-official-first).** SGLang on Hopper routes FP8 block-scaled
+dense GEMM to DeepGEMM `gemm_fp8_fp8_bf16_nt` for ALL M (decode M=1 included;
+persistent scheduler + TMA keeps it BW-bound), Triton `w8a8_block_fp8_matmul`
+as fallback. vLLM uses CUTLASS SM90 blockwise with swap-AB at M≤64, DeepGEMM
+optional. We already carry the DeepGEMM native bridge
+(`deepgemm_native.cu::launch_sm90_dense_nt`) — the highest-leverage adoption
+is extending that lane down the M axis, not a new kernel.
+
+**Decomposition (file:line).**
+1. Per-call host overhead in the DeepGEMM bridge: every
+   `dsv4_deepgemm_fp8_gemm_nt_cuda` call re-runs `get_best_config` (layout
+   search), `generate_kernel_code` (multi-KB string build), `hex_digest`
+   (hash of the full source), and 2× `std::filesystem::exists`
+   (`deepgemm_native.cu:1334-1346,1573-1576`). At M=16 verify that is
+   ~200 calls/step — hypothesis for most of the 26−4 ms gap. Fix: memoize
+   `(kind, m, n, k)` → `{config, runtime}` in a host map; TMA descriptors
+   stay per-call (they embed device pointers).
+2. Routing floor `QWEN_FP8_DEEPGEMM_DENSE_MIN_M = 16`
+   (`quant_linear.rs:25`): M∈[1,16) runs the scalar warp-per-row GEMV
+   (`quantized_gemv.cu::fp8_f32_block_gemv_batch_kernel`), measured ~30% of
+   HBM BW at B=1 e2e. After (1), A/B GEMV vs DeepGEMM per
+   M∈{1,2,4,8,16,17,32} per shape (FFN 17408×5120 / 5120×17408, attn-sized
+   5120×5120) and set the constant to the measured crossover.
+
+**Expected ceiling.** Per-op: weight-read floor + ~10 µs/call (pack_quantize
+one K-pass + launch). dense_ffn @M=16 → ~4–5 ms/step (floor 4.3 ms:
+64×3×89 MB / 4 TB/s). Plain decode GEMM share → near-floor; e2e gain bounded
+by attention/gdr share — measured, not promised. If DeepGEMM at M∈{1..8}
+loses to the GEMV (occupancy at 78 persistent CTAs), keep the GEMV where it
+wins and report the measured residual gap honestly.
+
+License gates: micro-bench table old/new/floor per M; e2e vs 07-10 anchors
+(42.6–43.6 plain / 104–108 dspark greedy / 64–106 sampled); needle 738291 ×3
+exact both lanes + same-config-twice self-consistency.
+
 ## Risks (named, not priced)
 
 - z-lab weights may target a different Qwen3.6-27B base revision → P0 decides.
