@@ -805,6 +805,61 @@ __global__ void fp8_f32_block_gemv_batch_kernel(
     }
 }
 
+// Probe-only weight-read diagnostic (fp8_smallm_gemm_probe): same block
+// geometry + access pattern as fp8_f32_block_gemv_batch_kernel, x-work
+// removed. mode 0 sums raw uint4 words (pure bandwidth); mode 1 adds the
+// fp8->f32 decode (isolates decode ALU). H20 attribution (2026-07-10):
+// mode0 2.9-3.7 TB/s, mode1 2.8-3.0, full GEMV 1.78 — the per-row x
+// load+convert tail is the whole gap. Two fix attempts measured SLOWER and
+// were killed (smem-staged x: LDS wavefronts cost the same as L1; x-in-regs
+// 4-row tile: 62 vs 50 us) — keep this probe for the next attempt's A/B.
+__global__ void fp8_wread_probe_kernel(
+    const uint8_t* __restrict__ weight,
+    float* __restrict__ output,
+    int N, int K, int mode)
+{
+    int row = blockIdx.x * GEMV_ROWS + threadIdx.x / (GEMV_THREADS / GEMV_ROWS);
+    int tid_in_row = threadIdx.x % (GEMV_THREADS / GEMV_ROWS);
+    int threads_per_row = GEMV_THREADS / GEMV_ROWS;
+    int lane_id = threadIdx.x % WARP_SIZE;
+    int row_in_block = threadIdx.x / threads_per_row;
+    if (row >= N) return;
+
+    const uint8_t* weight_row = weight + (int64_t)row * K;
+    const int kv = K / 16;
+    float sum = 0.0f;
+    if (mode == 0) {
+        unsigned acc = 0;
+        for (int v = tid_in_row; v < kv; v += threads_per_row) {
+            const uint4 w = *reinterpret_cast<const uint4*>(weight_row + v * 16);
+            acc += w.x + w.y + w.z + w.w;
+        }
+        sum = (float)acc;
+    } else {
+        for (int v = tid_in_row; v < kv; v += threads_per_row) {
+            const auto* w4 = reinterpret_cast<const __nv_fp8x4_e4m3*>(weight_row + v * 16);
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const float4 wf = static_cast<float4>(w4[i]);
+                sum += wf.x + wf.y + wf.z + wf.w;
+            }
+        }
+    }
+
+    sum = warp_reduce_sum(sum);
+    __shared__ float smem[GEMV_ROWS * 8];
+    int warps_per_row = threads_per_row / WARP_SIZE;
+    int warp_in_row = (threadIdx.x % threads_per_row) / WARP_SIZE;
+    if (lane_id == 0) smem[row_in_block * warps_per_row + warp_in_row] = sum;
+    __syncthreads();
+    if (tid_in_row == 0) {
+        float total = 0.0f;
+        for (int w = 0; w < warps_per_row; w++)
+            total += smem[row_in_block * warps_per_row + w];
+        output[row] = total;
+    }
+}
+
 // Weight-amortizing batch GEMV for the Qwen FP8 block-scaled decode path
 // (default for B>1). grid.y maps to a tile of
 // QWEN_GEMV_BATCH_TILE columns: each 16-byte weight chunk is read once
@@ -2619,6 +2674,17 @@ cudaError_t gemv_fp8_block_scaled_cuda(
 {
     return gemv_fp8_block_scaled_batch_cuda(
         weight, scales, input, output, 1, N, K, scale_rows, scale_cols, block_m, block_k, stream);
+}
+
+cudaError_t gemv_fp8_wread_probe_cuda(
+    const uint8_t* weight, float* output, int N, int K, int mode,
+    cudaStream_t stream)
+{
+    if (N <= 0 || K <= 0 || (K % 16) != 0) return cudaErrorInvalidValue;
+    dim3 grid((N + GEMV_ROWS - 1) / GEMV_ROWS);
+    dim3 block(GEMV_THREADS);
+    fp8_wread_probe_kernel<<<grid, block, 0, stream>>>(weight, output, N, K, mode);
+    return cudaGetLastError();
 }
 
 cudaError_t gemv_fp8_block_scaled_batch_cuda(

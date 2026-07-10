@@ -269,6 +269,17 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    // Probe-only weight-read diagnostic (same access pattern as the batch
+    // GEMV, x-work removed): mode 0 = raw bytes, mode 1 = +fp8 decode.
+    pub fn gemv_fp8_wread_probe_cuda(
+        weight: *const u8,
+        output: *mut f32,
+        n: i32,
+        k: i32,
+        mode: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     // Software dequant of an FP8 E4M3 2D-block-scaled weight `[n, k]` (row-major)
     // into a dense BF16 weight `[n, k]` (`output`, `Half` = bf16 raw bits). Block
     // scale layout: `scales[(row/block_m)*scale_cols + (col/block_k)]` (matches

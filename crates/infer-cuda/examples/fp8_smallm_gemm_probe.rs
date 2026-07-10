@@ -126,8 +126,19 @@ mod real {
     ) -> Result<()> {
         let scale_rows = n.div_ceil(FP8_BLOCK);
         let scale_cols = k.div_ceil(FP8_BLOCK);
-        let x = ctx.stream.alloc_zeros::<bf16>(m * k)?;
-        let w = ctx.stream.alloc_zeros::<u8>(n * k)?;
+        // Deterministic non-zero fill (zeros hide decode/accumulate costs).
+        let x_host: Vec<bf16> = (0..m * k)
+            .map(|i| bf16::from_f32(((i % 61) as f32 - 30.0) / 61.0))
+            .collect();
+        // Skip 0x7F/0xFF (e4m3 NaN encodings) so outputs stay finite.
+        let w_host: Vec<u8> = (0..n * k)
+            .map(|i| {
+                let v = ((i * 37 + 13) % 256) as u8;
+                if v & 0x7f == 0x7f { v ^ 0x08 } else { v }
+            })
+            .collect();
+        let x = ctx.stream.clone_htod(&x_host)?;
+        let w = ctx.stream.clone_htod(&w_host)?;
         let w_scales = ctx
             .stream
             .clone_htod(&vec![1.0f32; scale_rows * scale_cols])?;
@@ -157,6 +168,32 @@ mod real {
             Ok(())
         })?;
         report(label, "gemv", m, n, k, weight_gb, gemv);
+
+        if m == 1 {
+            let mut probe_out = ctx.stream.alloc_zeros::<f32>(n)?;
+            for mode in [0i32, 1] {
+                let s = timed(ctx, iters, || unsafe {
+                    let (wp, _gw) = w.device_ptr(&ctx.stream);
+                    let (op, _go) = probe_out.device_ptr_mut(&ctx.stream);
+                    ffi::gemv_fp8_wread_probe_cuda(
+                        wp as *const u8,
+                        op as *mut f32,
+                        n as i32,
+                        k as i32,
+                        mode,
+                        ctx.stream.cu_stream(),
+                    )
+                    .result()?;
+                    Ok(())
+                })?;
+                let route = if mode == 0 {
+                    "wread_raw"
+                } else {
+                    "wread_decode"
+                };
+                report(label, route, m, n, k, weight_gb, s);
+            }
+        }
 
         if !deepgemm {
             return Ok(());
