@@ -1,0 +1,21 @@
+scripts/eval_harness/token_reuse.py
+  s_351f5d8cb518c4::t_f8713a73818f90 72
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "6b0eda830b7e9631f545e7b3a3f3361b5c89285d",
+  "prompts": {},
+  "sessions": {
+    "s_351f5d8cb518c4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ae9403bd9c59a97bb",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
