@@ -4298,19 +4298,13 @@ impl SafetensorLoader {
             } else {
                 let dsv4_scale = format!("{base}.scale");
                 let s = self.borrow_raw_tensor(&dsv4_scale)?;
-                ensure!(
-                    s.dtype == Dtype::F8_E8M0,
-                    "{dsv4_scale}: DSv4 block scale expected F8_E8M0, got {:?}",
-                    s.dtype
-                );
                 ensure!(s.shape.len() == 2, "{dsv4_scale}: expected 2D scale");
                 let (sr, sc) = (s.shape[0], s.shape[1]);
-                // E8M0 byte = biased exponent (bias 127) → scale = 2^(byte-127).
-                let vals: Vec<f32> = s
-                    .bytes()
-                    .iter()
-                    .map(|&b| 2.0f32.powi(b as i32 - 127))
-                    .collect();
+                // Same dtype policy as the main FP8 load path: E8M0 bytes or F32
+                // power-of-two, normalized to E8M0 (= biased exponent, bias 127)
+                // → scale = 2^(byte-127).
+                let e8m0 = Self::dsv4_block_scale_e8m0(&dsv4_scale, s.dtype, s.bytes())?;
+                let vals: Vec<f32> = e8m0.iter().map(|&b| 2.0f32.powi(b as i32 - 127)).collect();
                 let block_m = rows.div_ceil(sr);
                 let block_k = cols.div_ceil(sc);
                 (vals, sr, sc, block_m, block_k)
