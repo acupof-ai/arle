@@ -890,6 +890,7 @@ mod gpu {
             // family as the DSv4 FP8 lane, but with Qwen's unclamped SwiGLU
             // (`limit = inf`). This avoids the generic grouped batch GEMV's
             // [num_experts, max_count] launch grid on the R<=256 decode band.
+            // SAFETY: ptrs from live device allocations sized to the dims passed.
             unsafe {
                 moe::dsv4_fp8_grouped_swiglu_decode(
                     cache_ptr(&weights.gate_ptrs, ctx),
@@ -958,6 +959,7 @@ mod gpu {
                 )?;
             }
         } else if let Some((_gate_scale_cols, down_scale_cols)) = fp8_decode_scale_cols {
+            // SAFETY: ptrs from live device allocations sized to the dims passed.
             unsafe {
                 moe::dsv4_fp8_grouped_down_decode(
                     cache_ptr(&weights.down_ptrs, ctx),
@@ -1237,6 +1239,7 @@ mod gpu {
                 rows,
                 local_experts,
                 0,
+                // SAFETY: ptrs from live device allocations sized to the dims passed.
                 || unsafe {
                     moe::moe_exclusive_scan_aligned_i32(
                         counts,
@@ -1264,6 +1267,7 @@ mod gpu {
             rows,
             hidden_dim,
             topk,
+            // SAFETY: ptrs from live device allocations sized to the dims passed.
             || unsafe {
                 moe::dsv4_pack_local_experts_with_slots(
                     cache_ptr(&normed.data, ctx),
@@ -1297,6 +1301,7 @@ mod gpu {
                 rows,
                 local_experts,
                 0,
+                // SAFETY: ptrs from live device allocations sized to the dims passed.
                 || unsafe {
                     moe::dsv4_fill_m_indices_from_counts(
                         counts,
@@ -1353,6 +1358,7 @@ mod gpu {
                 rows,
                 hidden_dim,
                 0,
+                // SAFETY: ptrs from live device allocations sized to the dims passed.
                 || unsafe {
                     moe::dsv4_deepgemm_pack_quantize_bf16_to_fp8(
                         packed_hidden,
@@ -1375,6 +1381,7 @@ mod gpu {
                 rows,
                 2 * moe_inter,
                 hidden_dim,
+                // SAFETY: ptrs from live device allocations sized to the dims passed.
                 || unsafe {
                     moe::dsv4_deepgemm_m_grouped_fp8_gemm_nt_contiguous(
                         cache_ptr(input_fp8, ctx),
@@ -1399,6 +1406,7 @@ mod gpu {
                 rows,
                 moe_inter,
                 0,
+                // SAFETY: ptrs from live device allocations sized to the dims passed.
                 || unsafe {
                     moe::dsv4_deepgemm_swiglu_quantize_w13(
                         cache_ptr(&w13_out.data, ctx),
@@ -1421,6 +1429,7 @@ mod gpu {
                 rows,
                 hidden_dim,
                 moe_inter,
+                // SAFETY: ptrs from live device allocations sized to the dims passed.
                 || unsafe {
                     moe::dsv4_deepgemm_m_grouped_fp8_gemm_nt_contiguous(
                         cache_ptr(act_fp8, ctx),
@@ -1453,6 +1462,7 @@ mod gpu {
                 rows,
                 hidden_dim,
                 topk,
+                // SAFETY: ptrs from live device allocations sized to the dims passed.
                 || unsafe {
                     moe::dsv4_scatter_all_route_slots(
                         cache_ptr(&expert_out.data, ctx),
@@ -1493,6 +1503,7 @@ mod gpu {
             ("qwen/bf16/gemm_gate", gate_g, &*gate_out),
             ("qwen/bf16/gemm_up", up_g, &*up_out),
         ] {
+            // SAFETY: ptrs from live device allocations sized to the dims passed.
             qwen_moe_profile(ctx, label, rows, moe_inter, hidden_dim, || unsafe {
                 if use_masked {
                     moe::deepgemm_m_grouped_bf16_gemm_nt_masked(
@@ -1538,6 +1549,7 @@ mod gpu {
             rows,
             hidden_dim,
             moe_inter,
+            // SAFETY: ptrs from live device allocations sized to the dims passed.
             || unsafe {
                 if use_masked {
                     moe::deepgemm_m_grouped_bf16_gemm_nt_masked(
@@ -1588,6 +1600,7 @@ mod gpu {
             rows,
             hidden_dim,
             topk,
+            // SAFETY: ptrs from live device allocations sized to the dims passed.
             || unsafe {
                 moe::dsv4_scatter_all_route_slots(
                     cache_ptr(&expert_out.data, ctx),
@@ -1732,6 +1745,7 @@ mod gpu {
         k: usize,
     ) -> Result<()> {
         match weights.expert_weight_format {
+            // SAFETY: ptrs from live device allocations sized to the dims passed.
             WeightFormat::DenseBf16 => unsafe {
                 moe::moe_bf16_grouped_gemm_pair_batch(
                     &weights.gate_ptrs,
@@ -1757,6 +1771,7 @@ mod gpu {
                     } else {
                         fp8_signature_shape(weights.gate_up_quant_signature, "gate/up")?
                     };
+                // SAFETY: ptrs from live device allocations sized to the dims passed.
                 unsafe {
                     moe::moe_fp8_block_scaled_grouped_gemv_pair_batch(
                         &weights.gate_ptrs,
@@ -1787,6 +1802,7 @@ mod gpu {
                     .gate
                     .first()
                     .ok_or_else(|| anyhow::anyhow!("FP4 MoE pair batch has no gate experts"))?;
+                // SAFETY: ptrs from live device allocations sized to the dims passed.
                 unsafe {
                     moe::moe_fp4_e2m1_grouped_gemv_pair_batch(
                         &weights.gate_ptrs,
@@ -1831,6 +1847,7 @@ mod gpu {
         k: usize,
     ) -> Result<()> {
         match weights.expert_weight_format {
+            // SAFETY: ptrs from live device allocations sized to the dims passed.
             WeightFormat::DenseBf16 => unsafe {
                 moe::moe_bf16_grouped_gemm_batch(
                     &weights.down_ptrs,
@@ -1854,6 +1871,7 @@ mod gpu {
                     } else {
                         fp8_signature_shape(weights.down_quant_signature, "down")?
                     };
+                // SAFETY: ptrs from live device allocations sized to the dims passed.
                 unsafe {
                     moe::moe_fp8_block_scaled_grouped_gemv_batch(
                         &weights.down_ptrs,
@@ -1881,6 +1899,7 @@ mod gpu {
                     .down
                     .first()
                     .ok_or_else(|| anyhow::anyhow!("FP4 MoE down batch has no down experts"))?;
+                // SAFETY: ptrs from live device allocations sized to the dims passed.
                 unsafe {
                     moe::moe_fp4_e2m1_grouped_gemv_batch(
                         &weights.down_ptrs,
@@ -2164,6 +2183,7 @@ mod dsv4_gpu {
                 .stream
                 .alloc_zeros::<u32>(1)
                 .map_err(|e| anyhow::anyhow!("DSv4 decode token-id scratch alloc failed: {e}"))?;
+            // SAFETY: uninit device scratch; fully written before first read.
             let router_logits = unsafe { HiddenStates::uninit(ctx, cfg.num_experts, 1)? };
             let counts = ctx
                 .stream
@@ -2634,6 +2654,7 @@ mod dsv4_gpu {
     fn memset_i32_minus_one(ctx: &DeviceContext, slice: &mut CudaSlice<i32>) -> Result<()> {
         let bytes = slice.len() * std::mem::size_of::<i32>();
         let (ptr, _record) = slice.device_ptr_mut(&ctx.stream);
+        // SAFETY: ptr/bytes span exactly the live slice, memset async on its own stream.
         unsafe {
             cudarc::driver::result::memset_d8_async(ptr, 0xFF, bytes, ctx.stream.cu_stream())
                 .map_err(|e| anyhow::anyhow!("DSv4 decode i32 -1 memset failed: {e}"))?;
@@ -2777,6 +2798,7 @@ mod dsv4_gpu {
         } else {
             None
         };
+        // SAFETY: ptrs from live device allocations sized to the dims passed.
         unsafe {
             moe::dsv4_route(
                 cache_ptr(&scratch.router_logits.data, ctx),
@@ -3422,6 +3444,7 @@ mod dsv4_gpu {
         let use_contiguous = use_contiguous_decode_moe();
         crate::stage_profile::profile(ctx, "dsv4/stage/moe_pack", || -> Result<()> {
             scratch.reset_routed(ctx)?;
+            // SAFETY: ptrs from live device allocations sized to the dims passed.
             unsafe {
                 moe::dsv4_count_local_experts(
                     route_indices,
@@ -3510,6 +3533,7 @@ mod dsv4_gpu {
 
         let nvtx_combine = crate::nvtx::range("dsv4/combine_scatter");
         crate::stage_profile::profile(ctx, "dsv4/stage/moe_combine_scatter", || -> Result<()> {
+            // SAFETY: ptrs from live device allocations sized to the dims passed.
             unsafe {
                 if use_contiguous {
                     moe::dsv4_scatter_all_route_slots(
@@ -4089,6 +4113,7 @@ mod dsv4_gpu {
         let p_out_compact = cache_ptr(&scratch.out_compact.data, ctx);
         let stream = ctx.stream.cu_stream();
 
+        // SAFETY: ptrs from live device allocations sized to the dims passed.
         unsafe {
             moe::dsv4_deepgemm_pack_quantize_bf16_to_fp8(
                 p_hidden,
@@ -4212,6 +4237,7 @@ mod dsv4_gpu {
         let p_out = cache_ptr(&scratch.out.data, ctx);
         let stream = ctx.stream.cu_stream();
 
+        // SAFETY: ptrs from live device allocations sized to the dims passed.
         unsafe {
             moe::dsv4_deepgemm_pack_quantize_bf16_to_fp8(
                 p_hidden,
@@ -4331,6 +4357,7 @@ mod dsv4_gpu {
         let p_out = cache_ptr(&scratch.out.data, ctx);
         let cu_stream = stream.cu_stream();
 
+        // SAFETY: ptrs from live device allocations sized to the dims passed.
         unsafe {
             moe::dsv4_deepgemm_pack_quantize_bf16_to_fp8(
                 p_hidden,
