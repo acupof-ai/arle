@@ -145,29 +145,27 @@ default bar for all output, not a style preference. Omit needless words (Strunk)
 
 ---
 
-## §0.3 为最快的那条路设计,不是为兜底路
+## §0.3 Design for the fast path, not the fallback
 
-**系统几乎总有两条路:一条"快路"(生产默认、被整体优化 / 预录制 / 批处理
-/ 图捕获)和一条"慢路"(灵活但兜底)。一个方案如果只在慢路上成立,就是没
-做完——快路一开就失效或被绕过,而快路才是线上真正在跑的那条。**
+**A feature that only works on the slow, flexible fallback (eager, un-batched,
+un-captured) is not done — the fast production path (CUDA graph, fusion,
+batching) bypasses or breaks it.** Don't inject per-step side-ops (host
+readback, sync, callbacks) into a hot loop that gets optimized as one fixed
+unit; do them at natural sync points (finish, phase boundary), and rebuild
+transient state on restore instead of capturing it every step. Self-check:
+*does this hold in the system's fastest execution mode?* Anchor: DSv4
+decode-reuse boundary capture did a per-step D2H+sync — eager-only, dead the
+moment CUDA graph (the default) turns on; replaced by finish-capture +
+replay-tail (zero decode-path change → graph-safe).
 
-- **别往"会被整体固定成一段"的热路径里插逐步旁路操作。** 把中间数据拉回主
-  机看一眼、等一次同步、回调 host——这些让热路径没法被整体优化(CUDA graph
-  捕获、批处理融合、编译期固化都会被它打断)。热循环里每多一个这种操作,快
-  路就少一分。
-- **副操作放到天然停顿点做。** 一次请求结束、一个阶段边界、一次已有的同步点
-  ——在那里做捕获 / 落盘 / 统计,不要摊到每一步。
-- **中间状态能重算就重算,别每步都存 / 拷。** 瞬态状态(最近窗口、carry、
-  滚动缓冲)通常是"最后一小段输入的函数",恢复时重跑那一小段即可,不必在热
-  路径上逐步捕获它——既省存储,又不打断快路。
-- **自检:"这个特性在系统最快的执行模式下还成立吗?"** 只在最慢的兜底模式
-  下能跑 = 没做完,写下来并给出快路方案,别默认"图以后再兼容"。
+## §0.4 Say it plainly — honest and clear
 
-**Empirical anchor**: DSv4 decode 复用的 boundary 捕获在每步把 GPU 状态 D2H
-+sync 回主机——只能在 eager 慢路跑,一开 CUDA graph(生产默认)就失效。它对
-着慢路设计,注定被删掉重做(改为 finish 点捕获内容 + restore 时重放尾巴重建
-carry,decode 热路径零改动 → 天然兼容 graph)。见
-[`docs/plans/2026-07-10-dsv4-decode-reuse-replay-tail.md`](docs/plans/2026-07-10-dsv4-decode-reuse-replay-tail.md)。
+**Explain in plain words, not jargon or a codename the reader never agreed
+to.** Coin a shorthand ("replay the tail") only after defining it in one plain
+sentence. State uncertainty honestly ("source says X, the measurement says Y —
+unresolved"); never smooth a gap over with confident phrasing. Lead with the
+answer, then the reason. If the reader has to ask "what does that mean," the
+explanation failed — that's the bar, not word count.
 
 ---
 
