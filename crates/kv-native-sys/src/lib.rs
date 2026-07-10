@@ -88,10 +88,10 @@ pub fn read_file_into(path: &Path, dst: &mut Vec<u8>) -> io::Result<()> {
     }
     dst.clear();
     let mut file = OpenOptions::new().read(true).open(path)?;
-    if let Ok(metadata) = file.metadata() {
-        if let Ok(len) = usize::try_from(metadata.len()) {
-            dst.reserve(len);
-        }
+    if let Ok(metadata) = file.metadata()
+        && let Ok(len) = usize::try_from(metadata.len())
+    {
+        dst.reserve(len);
     }
     if let Err(err) = file.read_to_end(dst) {
         dst.clear();
@@ -202,10 +202,10 @@ impl KvMmapStore {
             .and_then(|t| usize::try_from(t).ok())
             .ok_or_else(|| invalid("total bytes overflow"))?;
 
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
-            }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
         }
 
         let file = OpenOptions::new()
@@ -218,6 +218,10 @@ impl KvMmapStore {
         // set_len creates a sparse file: logical size without block allocation.
         file.set_len(total_bytes as u64)?;
 
+        // SAFETY: the file was just created+truncated by this process and sized
+        // to exactly `total_bytes` via set_len; `_file` keeps it open for the
+        // mapping's lifetime. Sound as long as no external process truncates the
+        // backing file while mapped (mmap's inherent contract).
         let mapping = unsafe {
             memmap2::MmapOptions::new()
                 .len(total_bytes)
@@ -260,6 +264,10 @@ impl KvMmapStore {
             ));
         }
 
+        // SAFETY: the file length was verified >= `total_bytes` above and
+        // `_file` keeps it open for the mapping's lifetime. Sound as long as no
+        // external process truncates the backing file while mapped (mmap's
+        // inherent contract).
         let mapping = unsafe {
             memmap2::MmapOptions::new()
                 .len(total_bytes)
