@@ -1,0 +1,21 @@
+docs/experience/errors/2026-07-10-dsv4-mla-proj-bf16-null-on-truncation-basin.md
+  s_16005ee3d18314::t_650cd949a23d90 1-85
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "1eba5bcdbeb0ad11bc7bc8f6c25880415bf6b701",
+  "prompts": {},
+  "sessions": {
+    "s_16005ee3d18314": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-afb34a37371396876",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
