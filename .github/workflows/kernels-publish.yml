@@ -1,11 +1,9 @@
 name: Kernels Publish
 
 # Regenerate the TileLang AOT kernel bundle whenever a kernel-relevant source
-# changes and publish it to the rolling `kernel-artifacts` release. Consumers
-# (release/docker/CI) fetch the bundle instead of installing the tilelang
-# Python stack — this job is the ONE place that needs it. build.rs hashes the
-# kernel sources + ABI + requirements into each artifact's SRC_HASH, so a
-# stale bundle is rejected per-kernel at consume time, never silently used.
+# changes and publish an immutable, source-addressed asset to the
+# `kernel-artifacts` release. Consumers compute the same exact identity; there
+# is no mutable latest asset. This job is the one place that needs TileLang.
 on:
   push:
     branches: [main]
@@ -27,6 +25,8 @@ env:
 
 permissions:
   contents: write
+  attestations: write
+  id-token: write
 
 jobs:
   publish:
@@ -68,10 +68,20 @@ jobs:
           ARLE_CUDA_KERNEL_CACHE: '0'
         run: cargo build --release --features cuda -p cuda-kernels
 
-      - name: Publish bundle to the rolling release
+      - name: Publish exact immutable bundle
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # This workflow has no GPU correctness lane; record that fact rather
+          # than promoting a successful build to a correctness claim.
+          ARLE_KERNEL_CORRECTNESS_STATUS: not-run
         run: scripts/kernel_artifacts.sh publish
+
+      - name: Attest immutable bundle
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: |
+            arle-kernels-t1-*.tar.gz
+            arle-kernels-t1-*.tar.gz.sha256
 
   # The consumer contract, proven cold on every refresh: a fresh runner with
   # NO Python kernel stack fetches the bundle and builds the full T1 set —
@@ -94,7 +104,7 @@ jobs:
           cuda: '12.8.0'
           method: network
 
-      - name: Fetch the just-published bundle
+      - name: Fetch the exact just-published bundle
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: scripts/kernel_artifacts.sh fetch
