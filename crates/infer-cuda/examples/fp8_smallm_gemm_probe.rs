@@ -381,8 +381,15 @@ mod real {
             return 0.0;
         }
         if exp == 15 {
-            // NVIDIA E4M3: mant=7 → Inf; mant<7 → max finite (448)
-            let val = if mant == 7 { f32::INFINITY } else { 448.0 };
+            // NVIDIA E4M3: mant=7 → Inf; mant<7 → finite 2^8*(1+mant/8)
+            if mant == 7 {
+                return if sign != 0 {
+                    f32::NEG_INFINITY
+                } else {
+                    f32::INFINITY
+                };
+            }
+            let val = (1.0 + mant as f32 / 8.0) * 256.0; // 2^(15-7) = 256
             return if sign != 0 { -val } else { val };
         }
         let val = if exp == 0 {
@@ -393,7 +400,19 @@ mod real {
         if sign != 0 { -val } else { val }
     }
 
-    /// Encode an f32 to FP8 E4M3. Clips to ±448 (max finite). Rounds to nearest.
+    /// Round-half-to-even (banker's rounding) to match device __nv_fp8_e4m3.
+    fn rint_ne(x: f32) -> u8 {
+        let fl = x.floor();
+        let frac = x - fl;
+        let fl_u = fl as u8;
+        if frac > 0.5 || (frac == 0.5 && fl_u % 2 == 1) {
+            fl_u + 1
+        } else {
+            fl_u
+        }
+    }
+
+    /// Encode an f32 to FP8 E4M3. Clips to ±448 (max finite). Rounds to nearest even.
     fn f32_to_fp8_e4m3(value: f32) -> u8 {
         if !value.is_finite() || value == 0.0 {
             return 0;
@@ -407,14 +426,14 @@ mod real {
         let ln2 = abs_val.log2();
         let exp_unbiased = ln2.floor() as i32;
         let exp_rebiased = exp_unbiased + 7; // E4M3 bias = 7
-        if exp_rebiased >= 15 {
+        if exp_rebiased > 15 {
             return if sign != 0 { 0xfe } else { 0x7e };
         }
         if exp_rebiased <= 0 {
             // Subnormal: exp field = 0, mant = round(abs_val / 2^-6 * 8)
             // Smallest subnormal: 2^-6 * 1/8 = 2^-9 ≈ 0.00195
             let scaled = abs_val * (6.0f32).exp2() * 8.0; // abs_val / 2^-6 * 8
-            let mant = (scaled + 0.5) as u8;
+            let mant = rint_ne(scaled);
             if mant == 0 {
                 return 0;
             }
@@ -426,15 +445,15 @@ mod real {
             return if sign != 0 { mant | 0x80 } else { mant };
         }
         // Normal: exp in [1, 14]
-        let mant_val = abs_val * ((7 - exp_unbiased) as f32).exp2(); // = abs_val / 2^exp_unbiased
+        let mant_val = abs_val * ((-exp_unbiased) as f32).exp2(); // = abs_val / 2^exp_unbiased
         let mant_frac = mant_val - 1.0; // fractional part, in [0, 1)
-        let mant = ((mant_frac * 8.0) + 0.5) as u8;
+        let mant = rint_ne(mant_frac * 8.0);
         let (exp_final, mant_final) = if mant >= 8 {
             (exp_rebiased + 1, 0u8)
         } else {
             (exp_rebiased, mant)
         };
-        if exp_final >= 15 {
+        if exp_final > 15 {
             return if sign != 0 { 0xfe } else { 0x7e };
         }
         let byte = ((exp_final as u8) << 3) | mant_final;
