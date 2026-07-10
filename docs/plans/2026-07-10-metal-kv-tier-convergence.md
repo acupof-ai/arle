@@ -1,6 +1,6 @@
 # Metal KV tier convergence — retire substrate S3, share the CUDA tier store
 
-> Status: Active
+> Status: Shipped 2026-07-11 — runtime demote/promote smoke PASS ([wins](../experience/wins/2026-07-11-metal-kv-tier-convergence-smoke.md)).
 
 **Verdict**: Metal's disk tier (`MetalSsdTier`, `infer-metal/src/kv_ssd.rs`) is a
 full parallel reimplementation — own store, LRU, budget accounting,
