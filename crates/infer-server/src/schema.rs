@@ -450,6 +450,7 @@ pub struct StatsResponse {
     pub kv_system: KvSystemMetricsResponse,
     pub ssd_recall: SsdRecallStats,
     pub spec_decode: SpecDecodeStatsResponse,
+    pub operator_dispatch: infer_seam::OperatorDispatchStats,
 }
 
 impl StatsResponse {
@@ -544,6 +545,7 @@ impl StatsResponse {
                 partial_ctx_chains: counters.spec_decode.partial_ctx_chains,
                 accept_rate: ratio(counters.spec_decode.accepted, counters.spec_decode.drafted),
             },
+            operator_dispatch: counters.operator_dispatch,
         }
     }
 }
@@ -968,20 +970,34 @@ mod tests {
     }
 
     #[test]
-    fn stats_response_relays_tier_counters() {
+    fn stats_response_relays_counters() {
         let mut counters = crate::execution::CounterSnapshot::default();
         counters.prefix_cache.lookups = 2;
         counters.prefix_cache.hits = 5;
         counters.kv_tier.demoted_slots = 2;
         counters.kv_system.reuse_hit_host_demoted = 3;
         counters.kv_system.disk_pages = 4;
-        let stats = StatsResponse::from_counters(counters);
+        counters.operator_dispatch = infer_seam::OperatorDispatchStats {
+            policy_hash: "policy-1".to_string(),
+            product_id: "arle-1".to_string(),
+            bundle_digest: "sha256:abc".to_string(),
+            implementation_hits: vec![infer_seam::OperatorImplementationHits {
+                implementation_id: "cuda.test".to_string(),
+                hits: 9,
+            }],
+            fallback_count: 2,
+        };
+        let stats =
+            StatsResponse::from_wire(crate::multiproc_relay::WireStats::from_counters(&counters));
         assert_eq!(stats.prefix_cache.hit_rate, Some(1.0));
         assert_eq!(stats.prefix_cache.hits, 5);
         assert!(stats.kv_tier.available);
         assert_eq!(stats.kv_tier.demoted_slots, 2);
         assert_eq!(stats.kv_system.reuse_hit_host_demoted, 3);
         assert!(stats.ssd_recall.available);
+        assert_eq!(stats.operator_dispatch.policy_hash, "policy-1");
+        assert_eq!(stats.operator_dispatch.implementation_hits[0].hits, 9);
+        assert_eq!(stats.operator_dispatch.fallback_count, 2);
     }
 
     #[test]

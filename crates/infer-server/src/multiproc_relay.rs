@@ -300,6 +300,8 @@ pub struct WireStats {
     pub spec_rejected: u64,
     #[serde(default)]
     pub spec_partial_ctx_chains: u64,
+    #[serde(default)]
+    pub operator_dispatch: infer_seam::OperatorDispatchStats,
 }
 
 impl WireStats {
@@ -361,6 +363,7 @@ impl WireStats {
                 rejected: self.spec_rejected,
                 partial_ctx_chains: self.spec_partial_ctx_chains,
             },
+            operator_dispatch: self.operator_dispatch,
         }
     }
 
@@ -411,6 +414,7 @@ impl WireStats {
             spec_accepted: c.spec_decode.accepted,
             spec_rejected: c.spec_decode.rejected,
             spec_partial_ctx_chains: c.spec_decode.partial_ctx_chains,
+            operator_dispatch: c.operator_dispatch.clone(),
         }
     }
 }

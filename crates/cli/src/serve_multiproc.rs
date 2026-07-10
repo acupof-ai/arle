@@ -392,6 +392,7 @@ fn run_lockstep_driver(
                 let tier = engine.kv_tier_stats();
                 let system = engine.kv_system_metrics();
                 let spec = engine.spec_decode_stats();
+                let operator_dispatch = engine.operator_dispatch_stats();
                 let data = WireStats {
                     active_requests: engine.active_count(),
                     queue_depth: engine.waiting_count(),
@@ -437,6 +438,7 @@ fn run_lockstep_driver(
                     spec_accepted: spec.accepted,
                     spec_rejected: spec.rejected,
                     spec_partial_ctx_chains: spec.partial_ctx_chains,
+                    operator_dispatch,
                 };
                 if let Err(e) = relay.send(&RelayEnvelope::StatsResponse {
                     request_id,
