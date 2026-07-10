@@ -418,12 +418,7 @@ mod cuda_rollout {
             let mut loss_sum = 0.0f32;
             let mut loss_steps = 0usize;
 
-            eprintln!(
-                "[dbg-opd] run_agentic_opd_round entered, {} tasks",
-                tasks.len()
-            );
             for (task, staged_tree) in tasks {
-                eprintln!("[dbg-opd] boot_workdir for {}", task.instance_id);
                 report.tasks += 1;
                 let workdir = aopd_profile::time_try("sandbox_boot", aopd_profile::WALL, || {
                     boot_workdir(
@@ -434,7 +429,6 @@ mod cuda_rollout {
                     )
                 })
                 .with_context(|| format!("boot sandbox for {}", task.instance_id))?;
-                eprintln!("[dbg-opd] boot_workdir done for {}", task.instance_id);
                 let executor = SandboxToolExecutor::new(
                     workdir.clone(),
                     cfg.bash_timeout_secs,
@@ -444,18 +438,12 @@ mod cuda_rollout {
                 // Env-info reflecting the SANDBOX (not the host): a one-shot repo
                 // overview prepended to the first user turn so the agent doesn't
                 // burn turns rediscovering the layout.
-                eprintln!(
-                    "[dbg-opd] executor.execute(bash ls) for {} spawner_socket={:?}",
-                    task.instance_id,
-                    std::env::var("ARLE_SPAWNER_SOCKET").ok()
-                );
                 let overview = aopd_profile::time("sandbox_overview", aopd_profile::WALL, || {
                     executor.execute(&ToolCall::new(
                         "bash",
                         json!({ "command": "ls && echo '---' && git log -1 --oneline 2>/dev/null" }),
                     ))
                 });
-                eprintln!("[dbg-opd] overview done len={}", overview.len());
                 let user_prompt = format!(
                     "{}\n\nRepo layout (cwd = repo root):\n{}",
                     agent_user_prompt(task, cfg.think),
@@ -479,12 +467,10 @@ mod cuda_rollout {
                     if rescue {
                         report.rescue_rollouts += 1;
                     }
-                    eprintln!("[dbg-opd] sample={sample} rescue={rescue} reset_workdir");
                     aopd_profile::time_try("sandbox_reset", aopd_profile::WALL, || {
                         reset_workdir(&workdir)
                     })
                     .with_context(|| format!("reset sandbox for {}", task.instance_id))?;
-                    eprintln!("[dbg-opd] sample={sample} run_turn START");
                     let mut session =
                         AgentSession::with_system_prompt(agent_system_prompt(task, cfg.think));
                     let rollout_t0 = std::time::Instant::now();
@@ -493,7 +479,6 @@ mod cuda_rollout {
                             .engine()
                             .lock()
                             .map_err(|e| anyhow::anyhow!("rollout engine lock poisoned: {e}"))?;
-                        eprintln!("[dbg-opd] sample={sample} engine locked, calling run_turn");
                         session.run_turn(
                             &mut *guard,
                             &user_prompt,
