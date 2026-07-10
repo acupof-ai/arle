@@ -1,0 +1,21 @@
+crates/kv-native-sys/src/lib.rs
+  s_3eaaf30e925e95::t_207185ba43afb3 91-94,205-208,221-224,267-270
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "27393b01dd4c4c6cc166081bd41595dab2f710d3",
+  "prompts": {},
+  "sessions": {
+    "s_3eaaf30e925e95": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ab3d5ebd30209b5aa",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
