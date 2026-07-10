@@ -1,0 +1,23 @@
+docs/experience/wins/2026-07-10-dsv4-prefix-pool-lru-repair-requeue-publish.md
+  s_34ffa5dadec89a::t_a2760423e4aace 1-47
+docs/plans/2026-07-09-dsv4-kv-reuse-seam-refactor.md
+  s_34ffa5dadec89a::t_6bc623ba00141c 172-177
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "20d96b5e0b9a52ab9f798ff9467bb035e752f598",
+  "prompts": {},
+  "sessions": {
+    "s_34ffa5dadec89a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a9b5d71e533db4321",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
