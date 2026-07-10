@@ -17,12 +17,19 @@ use std::time::Instant;
 // prefill 138 tok/s vs 453 tok/s for the same trajectory's training forward
 // (docs/plans/rollout-optimization.md). Tool-result tail prefills are 64-128
 // tokens, so the floor belongs at the decode/prefill boundary, not at 1024.
-// Lowered 64→16 for the DSpark block-16 spec verify: the same bug class one
-// tier down — B=16 on the batched GEMV measured dense_ffn 94 ms/step vs the
-// DeepGEMM lane's ~6 ms at the same row count (H20, Qwen3.6-27B-FP8); the
-// masked DeepGEMM tile makes M=16 cost ≈ one weight pass. Spec depths ≤8 stay
-// on the TILE==B amortizing GEMV (1.04-1.14× a single decode — already optimal).
-const QWEN_FP8_DEEPGEMM_DENSE_MIN_M: usize = 16;
+// Lowered 64→16 for the DSpark block-16 spec verify, then 16→2 off the
+// fp8_smallm_gemm_probe M-sweep (H20, Qwen3.6-27B shapes): DeepGEMM dense is
+// FLAT in M (45.9-57.6 us/call, one weight pass) while the tiled GEMV scales
+// ~linearly (M=2 already 1.6-1.8x a single decode; M=8 4.3x; M=16 9x), so
+// DeepGEMM wins every shape from M=2. M=1 stays on the GEMV: 50.1/49.6/16.5 us
+// vs DeepGEMM 50.6/60.8/21.9 us incl. activation pack — GEMV wins 2 of 3
+// shapes (wins/2026-07-10-qwen-fp8-smallm-deepgemm-crossover.md).
+const QWEN_FP8_DEEPGEMM_DENSE_MIN_M: usize = 2;
+
+/// Pre-Hopper dequant→BF16-cuBLAS floor. Stays at the old 16: that path pays a
+/// full weight dequant (1 read + 2 bf16 writes) per call, so tiny M belongs on
+/// the GEMV there even though Hopper's DeepGEMM lane wins from M=2.
+const QWEN_FP8_DEQUANT_GEMM_MIN_M: usize = 16;
 
 #[derive(Default)]
 struct QwenFp8DenseScratch {
@@ -375,8 +382,8 @@ fn try_fp8_deepgemm_dense_batch(
 ///
 /// Only engages when:
 ///  - the weight is `Fp8BlockScaled` with the canonical 128x128 block shape,
-///  - `M >= QWEN_FP8_DEEPGEMM_DENSE_MIN_M` (small-M decode keeps the scalar GEMV,
-///    which is already coalesced + occupancy-friendly there).
+///  - `M >= QWEN_FP8_DEQUANT_GEMM_MIN_M` (small-M decode keeps the scalar GEMV:
+///    a full-weight dequant per call is never worth it at tiny M).
 ///
 /// Returns `Ok(false)` when it does not apply (small-M decode), leaving
 /// `gemm_batch` to fall through to the scalar/MMA block-scaled GEMV.
@@ -387,7 +394,7 @@ fn try_fp8_dequant_bf16_gemm_batch(
     out: &mut HiddenStates,
 ) -> Result<bool> {
     if weight.weight_format != WeightFormat::Fp8BlockScaled
-        || x.seq_len < QWEN_FP8_DEEPGEMM_DENSE_MIN_M
+        || x.seq_len < QWEN_FP8_DEQUANT_GEMM_MIN_M
         || weight.quant_block_m != 128
         || weight.quant_block_k != 128
     {
