@@ -1,0 +1,47 @@
+crates/cli/src/serve_multiproc.rs
+  s_89390f18fb950a::t_a441565182ec25 395,441
+crates/infer-core/src/lib.rs
+  s_89390f18fb950a::t_a844a4bd4db00d 771-776
+crates/infer-seam/src/lib.rs
+  s_89390f18fb950a::t_4cd0e4bbdc857e 119-136,172-177
+crates/infer-server/src/execution.rs
+  s_89390f18fb950a::t_d682cc22c5b00a 51,61,82
+crates/infer-server/src/lib.rs
+  s_89390f18fb950a::t_2028cdf5bf52e6 414
+crates/infer-server/src/metrics.rs
+  s_89390f18fb950a::t_20eefedb9c9973 349
+crates/infer-server/src/multiproc_relay.rs
+  s_89390f18fb950a::t_993b1fcd7c182e 303-304,366,417
+crates/infer-server/src/schema.rs
+  s_f7ed4f3e11d0b0::t_0ccc804602edbc 453,548,973,980-991,998-1000
+scripts/bench_guidellm.sh
+  s_f7ed4f3e11d0b0::t_2e9d168d9e5b31 520-535,552,595-617,623-624,627,634-635,638,672,686-687,690-691,695,700-719,728-731,745-750
+scripts/tests/test_bench_guidellm_stats.py
+  s_89390f18fb950a::t_ed4a637c477bbc 1-121
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "992e55ee52bd79029a81d15fe81c52634f9a4ada",
+  "prompts": {},
+  "sessions": {
+    "s_89390f18fb950a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f49f6-caaa-7600-bc7e-b25ce5c6da1b",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_f7ed4f3e11d0b0": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f4abd-66cf-7760-8afc-0bed582ad336",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
