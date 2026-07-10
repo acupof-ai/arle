@@ -147,25 +147,15 @@ default bar for all output, not a style preference. Omit needless words (Strunk)
 
 ## §0.3 Design for the fast path, not the fallback
 
-**A feature that only works on the slow, flexible fallback (eager, un-batched,
-un-captured) is not done — the fast production path (CUDA graph, fusion,
-batching) bypasses or breaks it.** Don't inject per-step side-ops (host
-readback, sync, callbacks) into a hot loop that gets optimized as one fixed
-unit; do them at natural sync points (finish, phase boundary), and rebuild
-transient state on restore instead of capturing it every step. Self-check:
-*does this hold in the system's fastest execution mode?* Anchor: DSv4
-decode-reuse boundary capture did a per-step D2H+sync — eager-only, dead the
-moment CUDA graph (the default) turns on; replaced by finish-capture +
-replay-tail (zero decode-path change → graph-safe).
+**If it only works on the eager/un-captured fallback, it's not done** — the
+production path (CUDA graph, fusion, batching) skips or breaks it. No per-step
+readback/sync in the hot loop; capture at sync points, rebuild transient state
+on restore.
 
 ## §0.4 Say it plainly — honest and clear
 
-**Explain in plain words, not jargon or a codename the reader never agreed
-to.** Coin a shorthand ("replay the tail") only after defining it in one plain
-sentence. State uncertainty honestly ("source says X, the measurement says Y —
-unresolved"); never smooth a gap over with confident phrasing. Lead with the
-answer, then the reason. If the reader has to ask "what does that mean," the
-explanation failed — that's the bar, not word count.
+**Plain words over jargon; define any coined shorthand once; state uncertainty
+as uncertainty; answer first.**
 
 ---
 
