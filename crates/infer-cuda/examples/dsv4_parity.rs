@@ -217,9 +217,6 @@ mod real {
             nccl_file_rendezvous(rank, std::path::Path::new(&id_file))?;
         }
 
-        // DSv4 owns its MLA KV state inside the forward, so the host pool is only
-        // present to satisfy the `submit(.., &mut dyn KvPool)` signature — the
-        // DSv4 executor never touches it. A 1-slot/1-page pool is sufficient.
         let batch_decode_validate = parse_batch_decode_validate()?;
         let num_slots = batch_decode_validate
             .iter()
@@ -255,7 +252,9 @@ mod real {
         }
 
         for (case_idx, prompt) in prompts.iter().enumerate() {
-            let mut kv = CudaKvPool::new(1, 1, 16);
+            // Fresh pool per case = clean slot state; the device band resets on
+            // the case's start_pos=0 prefill.
+            let mut kv = build_host_pool(&exec, num_slots, max_prompt_len + max_new);
             run_prompt_case(
                 &mut exec,
                 &mut kv,
@@ -434,12 +433,7 @@ mod real {
     ) -> Result<()> {
         let validate_new = std::cmp::min(max_new, 16).max(2);
         let max_batch = batch_sizes.iter().copied().max().unwrap_or(1);
-        // Size the page budget for the ACTUAL prompt+decode across all slots, not
-        // the old 5-token default (a long needle prompt otherwise starves slot 1).
-        let page_size = 16usize;
-        let pages_per_slot = (prompt.len() + validate_new).div_ceil(page_size) + 1;
-        let total_pages = max_batch.max(1) * pages_per_slot;
-        let mut kv = CudaKvPool::new(max_batch, total_pages, page_size);
+        let mut kv = build_host_pool(exec, max_batch, prompt.len() + validate_new);
         // First-divergence index of `b` vs `a` (None ⇒ identical over the overlap).
         let first_div = |a: &[u32], b: &[u32]| -> Option<usize> {
             a.iter().zip(b.iter()).position(|(x, y)| x != y)
@@ -528,6 +522,35 @@ mod real {
             }
         }
         Ok(())
+    }
+
+    /// Host admission pool mirroring the executor's device KV pool, exactly as
+    /// the engine builds it (`infer-api` `loaded.rs`). The DSv4 executor arm
+    /// builds a `KvBatchDescriptor` from this pool at every `submit`
+    /// (`executor.rs`), so the pool is NOT a signature placeholder: slot count,
+    /// page count, and page size must mirror the device pool (64-token FlashMLA
+    /// pages, not config 16), and fixed-band models draw each slot's whole
+    /// `[SW ring | compressed]` band up front via `set_fixed_pages_per_slot`
+    /// so the descriptor carries the row's complete page table.
+    fn build_host_pool(
+        exec: &CudaExecutor,
+        requested_slots: usize,
+        budget_tokens: usize,
+    ) -> CudaKvPool {
+        let num_slots = exec.effective_num_slots().unwrap_or(requested_slots).max(1);
+        let page_size = exec.effective_page_size().unwrap_or(16).max(1);
+        // No device paged pool to mirror (band-arena mode) → size the pool from
+        // the harness's own prompt+decode budget, one spare page per slot.
+        let budget_pages = num_slots * (budget_tokens.div_ceil(page_size) + 1);
+        let total_pages = exec
+            .effective_total_pages()
+            .filter(|&pages| pages > 0)
+            .unwrap_or(budget_pages);
+        let mut kv = CudaKvPool::new(num_slots, total_pages, page_size);
+        if let Some(pages) = exec.effective_fixed_pages_per_slot() {
+            kv.set_fixed_pages_per_slot(pages);
+        }
+        kv
     }
 
     fn run_slot_sequence(
