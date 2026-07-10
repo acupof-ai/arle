@@ -36,6 +36,12 @@ use crate::turboquant_state::TurboQuantLayerState;
 /// sentinel survives the round-trip through `mirror_slot`.
 pub const EVICTED_PAGE: u32 = u32::MAX;
 
+/// PHYSICAL FlashMLA band page id. Engine LOGICAL page ids share the same u32
+/// representation; constructing `BandPage` is the explicit domain assertion
+/// (f7891c3f0 fed logical ids into physical band tables undetected).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct BandPage(pub u32);
+
 /// Paged KV cache pool — shared across all request slots.
 ///
 /// Storage is format-aware via `KVFormat`:
@@ -740,7 +746,7 @@ impl TokenKVPool {
     /// comp region at page boundaries; `set_band_cursor` owns the cursor).
     /// Returns the newly attached page ids; the caller must zero them (a
     /// recycled page carries a prior occupant's bytes).
-    pub fn band_extend(&mut self, slot: usize, count: usize) -> Result<Vec<u32>> {
+    pub fn band_extend(&mut self, slot: usize, count: usize) -> Result<Vec<BandPage>> {
         ensure!(
             slot < self.num_slots,
             "TokenKVPool::band_extend slot {slot} out of range {}",
@@ -762,9 +768,9 @@ impl TokenKVPool {
                 .pop()
                 .expect("invariant: free_pages.len() >= count checked above");
             self.page_attach_count[idx as usize] = 1;
-            new_pages.push(idx);
+            self.page_indices[slot].push(idx);
+            new_pages.push(BandPage(idx));
         }
-        self.page_indices[slot].extend_from_slice(&new_pages);
         Ok(new_pages)
     }
 
@@ -772,13 +778,17 @@ impl TokenKVPool {
     /// The band-demand-paging claim-zero path: an H2D of host zeros blocks on
     /// pageable memory per call (~290 blocking copies per DSv4 request —
     /// measured +3.7% on the E6 shape), a memset does not.
-    pub fn zero_pages(&mut self, ctx: &DeviceContext, pages: &[u32]) -> Result<()> {
+    pub fn zero_pages(&mut self, ctx: &DeviceContext, pages: &[BandPage]) -> Result<()> {
         #[cfg(feature = "cuda")]
         {
-            self.validate_page_ids(pages, "zero_pages")?;
             let token_bytes = self.data_plane_bytes_per_page();
             let single_plane = self.is_single_plane();
-            for &page in pages {
+            for &BandPage(page) in pages {
+                anyhow::ensure!(
+                    (page as usize) < self.max_total_pages,
+                    "paged_kv zero_pages: page id {page} outside pool ({} pages)",
+                    self.max_total_pages
+                );
                 let start = page as usize * token_bytes;
                 for layer in 0..self.num_layers {
                     let mut k_view = self.k_data[layer].slice_mut(start..start + token_bytes);
@@ -915,20 +925,24 @@ impl TokenKVPool {
     /// Returns whether the slot's page list CHANGED (#154 Phase 0: the caller's
     /// device-table refresh is dirty-driven). An unchanged page list only
     /// updates the token cursor — no release/claim refcount churn.
-    pub fn mirror_band(&mut self, slot: usize, pages: &[u32], seq_len: usize) -> Result<bool> {
+    pub fn mirror_band(&mut self, slot: usize, pages: &[BandPage], seq_len: usize) -> Result<bool> {
         ensure!(
             slot < self.num_slots,
             "TokenKVPool::mirror_band slot {slot} out of range {}",
             self.num_slots
         );
-        for &page in pages {
+        for &BandPage(page) in pages {
             ensure!(
                 page == EVICTED_PAGE || (page as usize) < self.max_total_pages,
                 "TokenKVPool::mirror_band page {page} out of range {}",
                 self.max_total_pages
             );
         }
-        if pages == self.page_indices[slot] {
+        if pages
+            .iter()
+            .map(|p| p.0)
+            .eq(self.page_indices[slot].iter().copied())
+        {
             self.seq_lens[slot] = seq_len;
             return Ok(false);
         }
@@ -941,13 +955,13 @@ impl TokenKVPool {
             self.page_attach_count[idx] = self.page_attach_count[idx].saturating_sub(1);
             self.recycle_page_if_unreferenced(page);
         }
-        for &page in pages {
+        for &BandPage(page) in pages {
             if page == EVICTED_PAGE {
                 continue;
             }
             self.claim_mirrored_page(page);
         }
-        self.page_indices[slot].extend_from_slice(pages);
+        self.page_indices[slot].extend(pages.iter().map(|p| p.0));
         self.seq_lens[slot] = seq_len;
         Ok(true)
     }
@@ -2480,7 +2494,8 @@ pub const DEFAULT_PAGE_SIZE: usize = 16;
 #[cfg(test)]
 mod tests {
     use super::{
-        BudgetBreakdown, EVICTED_PAGE, TokenKVPool, compute_budget_breakdown, validate_format_shape,
+        BandPage, BudgetBreakdown, EVICTED_PAGE, TokenKVPool, compute_budget_breakdown,
+        validate_format_shape,
     };
     use crate::KVFormat;
 
@@ -2800,8 +2815,12 @@ mod tests {
             self.page_attach_count[idx] = self.page_attach_count[idx].saturating_add(1);
         }
 
-        fn mirror_band(&mut self, slot: usize, pages: &[u32], seq_len: usize) -> bool {
-            if pages == self.page_indices[slot] {
+        fn mirror_band(&mut self, slot: usize, pages: &[BandPage], seq_len: usize) -> bool {
+            if pages
+                .iter()
+                .map(|p| p.0)
+                .eq(self.page_indices[slot].iter().copied())
+            {
                 self.seq_lens[slot] = seq_len;
                 return false;
             }
@@ -2811,10 +2830,10 @@ mod tests {
                     self.page_attach_count[page as usize].saturating_sub(1);
                 self.recycle_page_if_unreferenced(page);
             }
-            for &page in pages {
+            for &BandPage(page) in pages {
                 self.claim_mirrored_page(page);
             }
-            self.page_indices[slot].extend_from_slice(pages);
+            self.page_indices[slot].extend(pages.iter().map(|p| p.0));
             self.seq_lens[slot] = seq_len;
             true
         }
@@ -3114,7 +3133,10 @@ mod tests {
     #[test]
     fn mirror_band_claims_pages_and_releases_old_band() {
         let mut pool = MockPool::new(8, 2, 16);
-        assert!(pool.mirror_band(0, &[2, 3, 4], 0), "fresh band = changed");
+        assert!(
+            pool.mirror_band(0, &[2, 3, 4].map(BandPage), 0),
+            "fresh band = changed"
+        );
         assert_eq!(pool.page_indices[0], vec![2, 3, 4]);
         assert_eq!(pool.seq_lens[0], 0);
         for page in [2, 3, 4] {
@@ -3127,13 +3149,16 @@ mod tests {
 
         // Unchanged page list (decode tick): cursor-only update, no refcount
         // churn, reports unchanged (#154 Phase 0).
-        assert!(!pool.mirror_band(0, &[2, 3, 4], 5));
+        assert!(!pool.mirror_band(0, &[2, 3, 4].map(BandPage), 5));
         assert_eq!(pool.seq_lens[0], 5);
         for page in [2, 3, 4] {
             assert_eq!(pool.page_attach_count[page as usize], 1);
         }
 
-        assert!(pool.mirror_band(0, &[5, 6], 7), "new band = changed");
+        assert!(
+            pool.mirror_band(0, &[5, 6].map(BandPage), 7),
+            "new band = changed"
+        );
         assert_eq!(pool.page_indices[0], vec![5, 6]);
         assert_eq!(pool.seq_lens[0], 7);
         for page in [2, 3, 4] {
