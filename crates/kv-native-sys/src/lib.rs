@@ -1,7 +1,7 @@
 //! Pure-Rust persistence substrate for the KV tier.
 //!
 //! POSIX-only (Linux + macOS); uses `nix`, `memmap2`, and `libc` directly
-//! with no FFI of its own. Surface: file/block I/O, file mmap, and the
+//! with no FFI of its own. Surface: atomic file writes, the page-slot file mmap, and the
 //! backend-neutral two-level [`KvTierStore`] (host RAM + mmap disk spill)
 //! shared by the CUDA and Metal executors.
 
@@ -15,7 +15,6 @@ pub use kv_tier::{
 
 use std::fs::OpenOptions;
 use std::io;
-use std::io::Read;
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
@@ -74,105 +73,6 @@ fn write_file_atomic_impl(path: &Path, bytes: &[u8], durable: bool) -> io::Resul
         let _ = std::fs::remove_file(&tmp_path);
     }
     result
-}
-
-pub fn read_file(path: &Path) -> io::Result<Vec<u8>> {
-    if path.as_os_str().is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "read_file: empty path",
-        ));
-    }
-    // 0-byte file returns Ok(empty); missing file surfaces as NotFound.
-    // `std::fs::read` already handles both correctly.
-    std::fs::read(path)
-}
-
-pub fn read_file_into(path: &Path, dst: &mut Vec<u8>) -> io::Result<()> {
-    if path.as_os_str().is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "read_file_into: empty path",
-        ));
-    }
-    dst.clear();
-    let mut file = OpenOptions::new().read(true).open(path)?;
-    if let Ok(metadata) = file.metadata()
-        && let Ok(len) = usize::try_from(metadata.len())
-    {
-        dst.reserve(len);
-    }
-    if let Err(err) = file.read_to_end(dst) {
-        dst.clear();
-        return Err(err);
-    }
-    Ok(())
-}
-
-pub fn remove_file(path: &Path, ignore_not_found: bool) -> io::Result<()> {
-    if path.as_os_str().is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "remove_file: empty path",
-        ));
-    }
-    match std::fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == io::ErrorKind::NotFound && ignore_not_found => Ok(()),
-        Err(err) => Err(err),
-    }
-}
-
-pub fn block_path_sharded(root: &Path, fingerprint: [u8; 16]) -> io::Result<PathBuf> {
-    let filename = block_filename(fingerprint);
-    Ok(root
-        .join(&filename[0..2])
-        .join(&filename[2..4])
-        .join(filename))
-}
-
-fn block_filename(fingerprint: [u8; 16]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    fingerprint
-        .iter()
-        .flat_map(|b| {
-            [
-                HEX[(b >> 4) as usize] as char,
-                HEX[(b & 0xf) as usize] as char,
-            ]
-        })
-        .chain(".kv".chars())
-        .collect()
-}
-
-pub fn write_block_cache_sharded(
-    root: &Path,
-    fingerprint: [u8; 16],
-    bytes: &[u8],
-) -> io::Result<()> {
-    let path = block_path_sharded(root, fingerprint)?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    write_file_atomic_cache(&path, bytes)
-}
-
-pub fn read_block_into_sharded(
-    root: &Path,
-    fingerprint: [u8; 16],
-    dst: &mut Vec<u8>,
-) -> io::Result<()> {
-    let path = block_path_sharded(root, fingerprint)?;
-    read_file_into(&path, dst)
-}
-
-pub fn remove_block_sharded(
-    root: &Path,
-    fingerprint: [u8; 16],
-    ignore_not_found: bool,
-) -> io::Result<()> {
-    let path = block_path_sharded(root, fingerprint)?;
-    remove_file(&path, ignore_not_found)
 }
 
 /// File-backed mmap page-slot store — one file per disk tier namespace, a
@@ -342,10 +242,6 @@ impl KvMmapStore {
         self.free_list.retain(|i| !indices.contains(i));
     }
 
-    /// Flush the store to disk (msync). Best-effort for cache durability.
-    pub fn flush(&self) -> io::Result<()> {
-        self.mapping.flush()
-    }
 }
 
 fn invalid(msg: &str) -> io::Error {
@@ -389,15 +285,4 @@ mod tests {
         assert_eq!(s.alloc_slot().unwrap(), s0);
     }
 
-    #[test]
-    fn mmap_store_flush_is_best_effort() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("fl.mmap");
-        let mut s = KvMmapStore::create(&path, 2, 8).unwrap();
-        let ss = s.alloc_slot().unwrap();
-        s.write_slot(ss, b"testdata").unwrap();
-        s.flush().unwrap();
-        drop(s);
-        assert!(path.exists());
-    }
 }

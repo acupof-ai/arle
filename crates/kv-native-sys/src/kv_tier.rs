@@ -246,11 +246,6 @@ impl Drop for DiskTier {
 }
 
 impl DiskTier {
-    #[allow(dead_code)]
-    fn mmap_path(&self) -> PathBuf {
-        self.root_dir.join("kv.mmap")
-    }
-
     fn manifest_path(&self) -> PathBuf {
         self.root_dir.join(MANIFEST_FILE)
     }
