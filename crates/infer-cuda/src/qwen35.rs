@@ -2122,6 +2122,7 @@ impl Qwen35Model {
             .map_err(|e| anyhow!("Qwen FP8 grouped DeepGEMM warm m_indices alloc failed: {e}"))?;
         let stream = ctx.stream.cu_stream();
 
+        // SAFETY: ptrs from live device allocations sized to the dims passed.
         unsafe {
             cuda_moe::dsv4_deepgemm_m_grouped_fp8_gemm_nt_contiguous(
                 cache_ptr(&input_fp8, ctx),
@@ -4302,6 +4303,7 @@ impl Qwen35Model {
             let (qw_ptr, _gq) = qweight.device_ptr(&ctx.stream);
             let (scale_ptr, _gs) = scales.device_ptr(&ctx.stream);
             let (dense_ptr, _gd) = dense.device_ptr_mut(&ctx.stream);
+            // SAFETY: ptrs from live device allocations sized to the dims passed.
             unsafe {
                 ffi::dequantize_fp8_block_scaled_to_bf16_cuda(
                     qw_ptr as *const u8,
@@ -4329,10 +4331,10 @@ impl Qwen35Model {
         matrix.quant_scale_cols = 0;
         matrix.quant_block_m = 0;
         matrix.quant_block_k = 0;
-        if self.frozen_base_ptrs_exported.load(Ordering::Relaxed) {
-            if let (Some(qweight), Some(scales)) = retired {
-                self.lora_promoted_fp8_keepalive.push((qweight, scales));
-            }
+        if self.frozen_base_ptrs_exported.load(Ordering::Relaxed)
+            && let (Some(qweight), Some(scales)) = retired
+        {
+            self.lora_promoted_fp8_keepalive.push((qweight, scales));
         }
         Ok(())
     }
@@ -4914,8 +4916,8 @@ impl Qwen35Model {
             let (kc_ptr, _g8) = k_cache.data.device_ptr_mut(&self.ctx.stream);
             let (vc_ptr, _g9) = v_cache.data.device_ptr_mut(&self.ctx.stream);
             let (sp_ptr, _g10) = start_pos_dev.device_ptr(&self.ctx.stream);
-            // SAFETY: all buffers valid on ctx.stream; cache sized max_seq_len*kv_dim.
             qwen35_profile(&self.ctx, "qwen/full/prep", Some(full_idx), seq_len, || {
+                // SAFETY: all buffers valid on ctx.stream; cache sized max_seq_len*kv_dim.
                 unsafe {
                     ffi::prefill_attention_hd256_prep_cuda(
                         qf_ptr as *const ffi::Half,
@@ -4966,6 +4968,7 @@ impl Qwen35Model {
                 Some(full_idx),
                 seq_len,
                 || {
+                    // SAFETY: ptrs from live device allocations sized to the dims passed.
                     unsafe {
                         if seq_len == 1 && c.head_dim == 256 && qwen35_fa3_decode_enabled() {
                             // FA3 split-KV decode mirrors SGLang/FlashInfer's
@@ -5101,8 +5104,8 @@ impl Qwen35Model {
         {
             let (qf_ptr, _g0) = q_full.data.device_ptr(&self.ctx.stream);
             let (o_ptr, _g1) = attn_out.data.device_ptr_mut(&self.ctx.stream);
-            // SAFETY: q_full/attn_out valid on ctx.stream; gate layout per full-attn prep.
             qwen35_profile(&self.ctx, "qwen/full/gate", Some(full_idx), seq_len, || {
+                // SAFETY: q_full/attn_out valid on ctx.stream; gate layout per full-attn prep.
                 unsafe {
                     ffi::attention_gate_batch_hd256_cuda(
                         qf_ptr as *const ffi::Half,
@@ -5214,13 +5217,13 @@ impl Qwen35Model {
             let (kv_indptr_ptr, _gpi) = rc.meta.kv_indptr.device_ptr(&self.ctx.stream);
             let (last_page_len_ptr, _gl) = rc.meta.kv_last_page_len.device_ptr(&self.ctx.stream);
             let (start_pos_ptr, _gs) = rc.meta.start_positions.device_ptr(&self.ctx.stream);
-            // SAFETY: all buffers valid on ctx.stream; pool tail page allocated.
             qwen35_profile(
                 &self.ctx,
                 "qwen/full_paged/prep",
                 Some(full_idx),
                 seq_len,
                 || {
+                    // SAFETY: all buffers valid on ctx.stream; pool tail page allocated.
                     unsafe {
                         if decode {
                             ffi::decode_prep_paged_hd256_cuda(
@@ -5365,6 +5368,7 @@ impl Qwen35Model {
                                     self.local_kv_heads
                                 )
                             })?;
+                            // SAFETY: ptrs from live device allocations sized to the dims passed.
                             unsafe {
                                 kernel(
                                     qp_ptr as *mut ffi::Half,
@@ -5410,6 +5414,7 @@ impl Qwen35Model {
                             let v_data = rc.pool.v_data_ptr(full_idx, &self.ctx.stream);
                             let k_scales = rc.pool.k_scales_ptr(full_idx, &self.ctx.stream);
                             let v_scales = rc.pool.v_scales_ptr(full_idx, &self.ctx.stream);
+                            // SAFETY: ptrs from live device allocations sized to the dims passed.
                             unsafe {
                                 kernel(
                                     qp_ptr as *mut ffi::Half,
@@ -5457,6 +5462,7 @@ impl Qwen35Model {
                 Some(full_idx),
                 seq_len,
                 || {
+                    // SAFETY: ptrs from live device allocations sized to the dims passed.
                     unsafe {
                         ffi::attention_gate_paged_hd256_cuda(
                             qf_ptr as *const ffi::Half,
@@ -5666,6 +5672,7 @@ impl Qwen35Model {
                 Some(linear_idx),
                 seq_len,
                 || {
+                    // SAFETY: ptrs from live device allocations sized to the dims passed.
                     unsafe {
                         ffi::rms_norm_gated_cuda(
                             x_ptr as *const ffi::Half,
@@ -5764,6 +5771,7 @@ impl Qwen35Model {
                 Some(linear_idx),
                 seq_len,
                 || {
+                    // SAFETY: ptrs from live device allocations sized to the dims passed.
                     unsafe {
                         ffi::conv1d_prefill_cuda(
                             x_ptr as *const ffi::Half,
@@ -5830,6 +5838,7 @@ impl Qwen35Model {
                 Some(linear_idx),
                 seq_len,
                 || {
+                    // SAFETY: ptrs from live device allocations sized to the dims passed.
                     unsafe {
                         ffi::gdr_fq_prep_cuda(
                             qkv_ptr as *const ffi::Half,
@@ -5893,13 +5902,13 @@ impl Qwen35Model {
             let (alog_ptr, _g4) = attn.a_log.device_ptr(&self.ctx.stream);
             let (s_ptr, _g5) = gdr_state.device_ptr_mut(&self.ctx.stream);
             let (o_ptr, _g6) = gdr_out.data.device_ptr_mut(&self.ctx.stream);
-            // SAFETY: all buffers valid on ctx.stream; head dims from config.
             qwen35_profile(
                 &self.ctx,
                 "qwen/linear/gdr_recurrent",
                 Some(linear_idx),
                 seq_len,
                 || {
+                    // SAFETY: all buffers valid on ctx.stream; head dims from config.
                     unsafe {
                         if seq_len == 1 {
                             ffi::gated_delta_rule_decode_cuda(

@@ -546,9 +546,11 @@ impl Dsv4SpecVerifyScratch {
             .map(|_| Dsv4SpecVerifyLayerScratch::new(&model.ctx, hidden_size, stream_dim))
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
+            // SAFETY: uninit device scratch; fully written before first read.
             embeddings: unsafe {
                 HiddenStates::uninit(&model.ctx, hidden_size, MAX_SPEC_VERIFY_ROWS)?
             },
+            // SAFETY: uninit device scratch; fully written before first read.
             initial_stream: unsafe {
                 HiddenStates::uninit(&model.ctx, stream_dim, MAX_SPEC_VERIFY_ROWS)?
             },
@@ -584,14 +586,21 @@ impl Dsv4SpecVerifyScratch {
 impl Dsv4SpecVerifyLayerScratch {
     fn new(ctx: &DeviceContext, hidden_size: usize, stream_dim: usize) -> Result<Self> {
         Ok(Self {
+            // SAFETY: uninit device scratch; fully written before first read.
             attn_normed: unsafe { HiddenStates::uninit(ctx, hidden_size, MAX_SPEC_VERIFY_ROWS)? },
+            // SAFETY: uninit device scratch; fully written before first read.
             attn_out: unsafe { HiddenStates::uninit(ctx, hidden_size, MAX_SPEC_VERIFY_ROWS)? },
+            // SAFETY: uninit device scratch; fully written before first read.
             attn_stream: unsafe { HiddenStates::uninit(ctx, stream_dim, MAX_SPEC_VERIFY_ROWS)? },
+            // SAFETY: uninit device scratch; fully written before first read.
             ffn_normed: unsafe { HiddenStates::uninit(ctx, hidden_size, MAX_SPEC_VERIFY_ROWS)? },
+            // SAFETY: uninit device scratch; fully written before first read.
             moe_out: unsafe { HiddenStates::uninit(ctx, hidden_size, MAX_SPEC_VERIFY_ROWS)? },
+            // SAFETY: uninit device scratch; fully written before first read.
             moe_with_shared: unsafe {
                 HiddenStates::uninit(ctx, hidden_size, MAX_SPEC_VERIFY_ROWS)?
             },
+            // SAFETY: uninit device scratch; fully written before first read.
             ffn_stream: unsafe { HiddenStates::uninit(ctx, stream_dim, MAX_SPEC_VERIFY_ROWS)? },
         })
     }
@@ -684,7 +693,9 @@ impl Dsv4DecodeGraphScratch {
             .stream
             .alloc_zeros::<u32>(1)
             .map_err(|e| anyhow!("DSv4 decode graph u32 token-id scratch alloc failed: {e}"))?;
+        // SAFETY: uninit device scratch; fully written before first read.
         let embeddings = unsafe { HiddenStates::uninit(&model.ctx, hidden_size, 1)? };
+        // SAFETY: uninit device scratch; fully written before first read.
         let initial_stream = unsafe { HiddenStates::uninit(&model.ctx, stream_dim, 1)? };
         let layers: Vec<_> = model
             .layers
@@ -693,8 +704,11 @@ impl Dsv4DecodeGraphScratch {
             .collect::<Result<Vec<_>>>()?;
         let last_hidden = DeviceVec::zeros(&model.ctx, hidden_size)?;
         let last_normed = DeviceVec::zeros(&model.ctx, hidden_size)?;
+        // SAFETY: uninit device scratch; fully written before first read.
         let head_stream_row = unsafe { HiddenStates::uninit(&model.ctx, stream_dim, 1)? };
+        // SAFETY: uninit device scratch; fully written before first read.
         let head_mixes = unsafe { HiddenStates::uninit(&model.ctx, model.head_hc.mix_fn.rows, 1)? };
+        // SAFETY: uninit device scratch; fully written before first read.
         let logits_batch = unsafe { HiddenStates::uninit(&model.ctx, model.lm_head.rows, 1)? };
         let logits = DeviceVec::zeros(&model.ctx, model.lm_head.rows)?;
         Ok(Self {
@@ -731,15 +745,25 @@ impl Dsv4DecodeLayerGraphScratch {
                 layer.mode,
                 layer.compress_ratio,
             )?,
+            // SAFETY: uninit device scratch; fully written before first read.
             attn_in: unsafe { HiddenStates::uninit(&model.ctx, hidden_size, 1)? },
+            // SAFETY: uninit device scratch; fully written before first read.
             attn_normed: unsafe { HiddenStates::uninit(&model.ctx, hidden_size, 1)? },
+            // SAFETY: uninit device scratch; fully written before first read.
             attn_out: unsafe { HiddenStates::uninit(&model.ctx, hidden_size, 1)? },
+            // SAFETY: uninit device scratch; fully written before first read.
             attn_stream: unsafe { HiddenStates::uninit(&model.ctx, stream_dim, 1)? },
+            // SAFETY: uninit device scratch; fully written before first read.
             ffn_in: unsafe { HiddenStates::uninit(&model.ctx, hidden_size, 1)? },
+            // SAFETY: uninit device scratch; fully written before first read.
             ffn_normed: unsafe { HiddenStates::uninit(&model.ctx, hidden_size, 1)? },
+            // SAFETY: uninit device scratch; fully written before first read.
             moe_out: unsafe { HiddenStates::uninit(&model.ctx, hidden_size, 1)? },
+            // SAFETY: uninit device scratch; fully written before first read.
             shared: unsafe { HiddenStates::uninit(&model.ctx, hidden_size, 1)? },
+            // SAFETY: uninit device scratch; fully written before first read.
             moe_with_shared: unsafe { HiddenStates::uninit(&model.ctx, hidden_size, 1)? },
+            // SAFETY: uninit device scratch; fully written before first read.
             ffn_stream: unsafe { HiddenStates::uninit(&model.ctx, stream_dim, 1)? },
         })
     }
@@ -1325,12 +1349,12 @@ impl std::fmt::Debug for Dsv4Model {
 /// read per batched decode call). Rank-gated to `rank==0` only: all TP ranks
 /// redundantly execute this per-row loop with identical results, and letting
 /// >1 rank's process write to the shared serve-log fd caused byte-level
-/// interleaving between processes even with a single `write_all` call.
-/// Prints one line per call: the batch's slot/start_position/token triples,
-/// so a post-hoc script can (a) pick out a tracked slot's per-step token-id
-/// sequence via its `start_position` == its own prompt-token count, and (b)
-/// see the exact batch composition (which other slots were co-resident) at
-/// each step, without touching the hot sampling path's signature.
+/// > interleaving between processes even with a single `write_all` call.
+/// > Prints one line per call: the batch's slot/start_position/token triples,
+/// > so a post-hoc script can (a) pick out a tracked slot's per-step token-id
+/// > sequence via its `start_position` == its own prompt-token count, and (b)
+/// > see the exact batch composition (which other slots were co-resident) at
+/// > each step, without touching the hot sampling path's signature.
 pub(crate) fn dsv4_decode_trace(
     rank: usize,
     slot_ids: &[usize],
@@ -2180,6 +2204,7 @@ impl Dsv4Model {
         let hidden_size = self.config.hidden_size;
         let mut keepalive = Dsv4ForwardKeepalive::new(false);
         // Gather scratch reused across layers.
+        // SAFETY: uninit device scratch; fully written before first read.
         let mut gathered = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, m)? };
         keepalive.keep_hidden(&gathered);
         for (layer_idx, layer) in self.layers.iter().enumerate() {
@@ -2436,9 +2461,11 @@ impl Dsv4Model {
             stream.seq_len
         );
         let hidden_size = self.config.hidden_size;
+        // SAFETY: uninit device scratch; fully written before first read.
         let mut head_normed = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, rows)? };
         self.head_normed_rows(stream, 0..rows, &mut head_normed)?;
         keepalive.keep_hidden(&head_normed);
+        // SAFETY: uninit device scratch; fully written before first read.
         let mut logits = unsafe { HiddenStates::uninit(&self.ctx, self.lm_head.rows, rows)? };
         self.lm_head_project_batch(&head_normed, &mut logits)?;
         Ok(logits)
@@ -2460,8 +2487,10 @@ impl Dsv4Model {
         for chunk_start in (0..tokens.len()).step_by(CHUNK) {
             let chunk_end = (chunk_start + CHUNK).min(tokens.len());
             let rows = chunk_end - chunk_start;
+            // SAFETY: uninit device scratch; fully written before first read.
             let mut head_normed = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, rows)? };
             self.head_normed_rows(stream, chunk_start..chunk_end, &mut head_normed)?;
+            // SAFETY: uninit device scratch; fully written before first read.
             let mut logits = unsafe { HiddenStates::uninit(&self.ctx, vocab, rows)? };
             self.lm_head_project_batch(&head_normed, &mut logits)?;
             let host = crate::probe::stream_to_host_f32(&self.ctx, &logits)?;
@@ -2716,6 +2745,7 @@ impl Dsv4Model {
         // ops run on `ctx.stream` (WAR/RAW resolved by stream ordering).
         // SAFETY: fully written by the copy-in / mla_attention each row before read.
         let mut normed_row = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, 1)? };
+        // SAFETY: uninit device scratch; fully written before first read.
         let mut attn_out_row = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, 1)? };
         keepalive.keep_hidden(&normed_row);
         keepalive.keep_hidden(&attn_out_row);
@@ -2765,6 +2795,7 @@ impl Dsv4Model {
             cq
         } else {
             // Unused (per-row lane); zero-sized stand-in keeps the binding typed.
+            // SAFETY: zero-size placeholder; never read.
             unsafe { HiddenStates::uninit(&self.ctx, 0, 1)? }
         };
 
@@ -2782,6 +2813,7 @@ impl Dsv4Model {
             keepalive.keep_hidden(&lab);
             lab
         } else {
+            // SAFETY: zero-size placeholder; never read.
             unsafe { HiddenStates::uninit(&self.ctx, 0, 1)? }
         };
         // Full-flatten is canonical for MODEL1 B>1 decode. Per layer it batches
@@ -2835,8 +2867,8 @@ impl Dsv4Model {
             // compare when off, so this closure costs nothing on the hot path.
             let stage_all = |name: &str, buf: &HiddenStates| {
                 let width = buf.hidden_dim;
-                for r in 0..buf.seq_len {
-                    let pos = start_positions[r] as u64;
+                for (r, &pos) in start_positions.iter().enumerate().take(buf.seq_len) {
+                    let pos = pos as u64;
                     if crate::probe::stage_want(pos) {
                         crate::probe::stage_bf16(
                             ctx,
@@ -2856,6 +2888,7 @@ impl Dsv4Model {
             // RMSNorm of the stream (the C identity placeholders are 1x1 ZERO
             // mixers — running them through gen_mhc/mhc_pre would zero the stream).
             // ponytail: pod-verify GLM hc_mult==1 plain residual + identity stream (no hyper-connection)
+            // SAFETY: uninit device scratch; fully written before first read.
             let mut normed = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
             let attn_mhc = if self.config.hc_mult == 1 {
                 crate::ops::rms_norm_batch(&self.ctx, &stream, &layer.attn_norm, eps, &mut normed)?;
@@ -3044,7 +3077,7 @@ impl Dsv4Model {
                                 idx,
                                 &proj.c_q_normed,
                                 &normed,
-                                prefill_shared.as_deref_mut(),
+                                prefill_shared,
                                 &mut keepalive,
                             )?)
                         }
@@ -3127,44 +3160,43 @@ impl Dsv4Model {
                             &mut ptr_keepalive,
                         )?;
                     }
-                    if layer.mode == DeepSeekV4AttentionMode::CompressedSparse {
-                        if let (Some((kv, score)), Some(indexer)) =
+                    if layer.mode == DeepSeekV4AttentionMode::CompressedSparse
+                        && let (Some((kv, score)), Some(indexer)) =
                             (indexer_kv_score.as_ref(), layer.attention.indexer.as_ref())
-                        {
-                            let use_official_dsa = crate::attention::dsv4_dsa_official_enabled()?;
-                            let indexer_rope_original_seq_len = if use_official_dsa {
-                                i32::try_from(
-                                    self.config.rope_parameters.original_max_position_embeddings,
-                                )
-                                .map_err(|_| {
-                                    anyhow!("DSv4 full-flatten indexer rope len overflows i32")
-                                })?
-                            } else {
-                                0
-                            };
-                            let positions = batched_positions.as_ref().ok_or_else(|| {
-                                anyhow!("DSv4 full-flatten P1a: batched positions missing")
-                            })?;
-                            crate::attention::dsv4_compressor_update_batched(
-                                &self.ctx,
-                                &self.config,
-                                indexer
-                                    .compressor
-                                    .as_ref()
-                                    .expect("DSv4 CSA indexer has a key compressor"),
-                                kv,
-                                score,
-                                &indexer_sink,
-                                positions,
-                                n,
-                                self.config.index_head_dim,
-                                layer.compress_ratio,
-                                true, // indexer compressor always overlap
-                                use_official_dsa,
-                                indexer_rope_original_seq_len,
-                                &mut ptr_keepalive,
-                            )?;
-                        }
+                    {
+                        let use_official_dsa = crate::attention::dsv4_dsa_official_enabled()?;
+                        let indexer_rope_original_seq_len = if use_official_dsa {
+                            i32::try_from(
+                                self.config.rope_parameters.original_max_position_embeddings,
+                            )
+                            .map_err(|_| {
+                                anyhow!("DSv4 full-flatten indexer rope len overflows i32")
+                            })?
+                        } else {
+                            0
+                        };
+                        let positions = batched_positions.as_ref().ok_or_else(|| {
+                            anyhow!("DSv4 full-flatten P1a: batched positions missing")
+                        })?;
+                        crate::attention::dsv4_compressor_update_batched(
+                            &self.ctx,
+                            &self.config,
+                            indexer
+                                .compressor
+                                .as_ref()
+                                .expect("DSv4 CSA indexer has a key compressor"),
+                            kv,
+                            score,
+                            &indexer_sink,
+                            positions,
+                            n,
+                            self.config.index_head_dim,
+                            layer.compress_ratio,
+                            true, // indexer compressor always overlap
+                            use_official_dsa,
+                            indexer_rope_original_seq_len,
+                            &mut ptr_keepalive,
+                        )?;
                     }
                     before
                 } else {
@@ -3296,6 +3328,7 @@ impl Dsv4Model {
                                 })?;
                         }
                         let mut k_prepared_owned =
+                            // SAFETY: uninit device scratch; fully written before first read.
                             unsafe { HiddenStates::uninit(&self.ctx, mla_head_dim, 1)? };
                         {
                             let kp_src = proj
@@ -3339,6 +3372,7 @@ impl Dsv4Model {
                             // SAFETY: each row's slice is fully written by the per-row
                             // gather before the batched select reads it.
                             let q_b = unsafe { HiddenStates::uninit(&self.ctx, q_width, n)? };
+                            // SAFETY: uninit device scratch; fully written before first read.
                             let w_b = unsafe { HiddenStates::uninit(&self.ctx, index_heads, n)? };
                             keepalive.keep_hidden(&q_b);
                             keepalive.keep_hidden(&w_b);
@@ -3699,8 +3733,8 @@ impl Dsv4Model {
                         &self.ctx,
                         &self.config,
                         layer_idx,
-                        &q_i_batch,
-                        &weights_batch,
+                        q_i_batch,
+                        weights_batch,
                         dsa_shared,
                         layer_pool,
                         n,
@@ -4076,6 +4110,7 @@ impl Dsv4Model {
                 None
             };
             // GLM (hc_mult==1): plain RMSNorm of the stream (no ffn hyper-connection).
+            // SAFETY: uninit device scratch; fully written before first read.
             let mut normed = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
             let ffn_mhc = if self.config.hc_mult == 1 {
                 crate::ops::rms_norm_batch(&self.ctx, &stream, &layer.ffn_norm, eps, &mut normed)?;
@@ -4113,6 +4148,7 @@ impl Dsv4Model {
             // GLM dense layer (`per_layer_dense_mlp[i]`): a plain SwiGLU FFN
             // replaces the routed-expert + shared-expert MoE entirely.
             let mut moe_with_shared =
+                // SAFETY: uninit device scratch; fully written before first read.
                 unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
             if let Some(dense) = layer.dense_mlp.as_ref() {
                 dsv4_dense_mlp_forward(
@@ -4125,6 +4161,7 @@ impl Dsv4Model {
                 )?;
                 keepalive.keep_hidden(&moe_with_shared);
             } else {
+                // SAFETY: uninit device scratch; fully written before first read.
                 let mut moe_out = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
                 if use_deepep_transport {
                     #[cfg(feature = "deepep")]
@@ -4434,7 +4471,9 @@ impl Dsv4Model {
         // chunk per layer. The prefix metadata expresses row r -> ancestors
         // explicitly. Current topk does not add rows: D2 verifies 3 rows.
         let max_chunk = *lens.iter().max().unwrap_or(&1);
+        // SAFETY: uninit device scratch; fully written before first read.
         let mut normed_chunk = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, max_chunk)? };
+        // SAFETY: uninit device scratch; fully written before first read.
         let mut attn_chunk = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, max_chunk)? };
         keepalive.keep_hidden(&normed_chunk);
         keepalive.keep_hidden(&attn_chunk);
@@ -4455,6 +4494,7 @@ impl Dsv4Model {
                 let _layer_nvtx = crate::nvtx::range(&format!("dsv4/layer_{layer_idx:02}"));
                 // ── Attention half: HC params + pre-norm over the whole [M] batch.
                 // ponytail: pod-verify GLM hc_mult==1 plain residual + identity stream (no hyper-connection)
+                // SAFETY: uninit device scratch; fully written before first read.
                 let mut normed = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
                 let attn_mhc = if self.config.hc_mult == 1 {
                     // GLM: plain RMSNorm of the stream (stream IS the hidden).
@@ -4603,6 +4643,7 @@ impl Dsv4Model {
                 // parity NOT expected: grouped GEMM tiles over M differently;
                 // gated on needle, not byte-parity). Allreduce transport only.
                 // GLM (hc_mult==1): plain RMSNorm of the stream (no ffn hyper-connection).
+                // SAFETY: uninit device scratch; fully written before first read.
                 let mut normed = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
                 let ffn_mhc = if self.config.hc_mult == 1 {
                     crate::ops::rms_norm_batch(
@@ -4636,6 +4677,7 @@ impl Dsv4Model {
                 // GLM dense layer (`per_layer_dense_mlp[i]`): a plain SwiGLU FFN
                 // replaces the routed-expert + shared-expert MoE entirely.
                 let mut moe_with_shared =
+                    // SAFETY: uninit device scratch; fully written before first read.
                     unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
                 if let Some(dense) = layer.dense_mlp.as_ref() {
                     dsv4_dense_mlp_forward(
@@ -4667,6 +4709,7 @@ impl Dsv4Model {
                     }
                     // Grouped shared expert over [M] (dense FFN, prefill path).
                     let mut shared =
+                        // SAFETY: uninit device scratch; fully written before first read.
                         unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
                     crate::moe::dsv4_shared_expert_forward(
                         &self.ctx,
@@ -5087,9 +5130,8 @@ impl Dsv4Model {
                     })?;
 
                     let _nvtx_shared_hc = crate::nvtx::range("dsv4/shared_hc");
-                    let (mut shared_out, mut shared_scratch) =
-                        kv_adapter.shared_expert_decode_mut();
-                    let shared = shared_out.as_deref_mut().ok_or_else(|| {
+                    let (shared_out, shared_scratch) = kv_adapter.shared_expert_decode_mut();
+                    let shared = shared_out.ok_or_else(|| {
                         anyhow!("DSv4 verify requires shared-expert output buffer")
                     })?;
                     shared.seq_len = seq_len;
@@ -5100,7 +5142,6 @@ impl Dsv4Model {
                         hidden_size
                     );
                     let shared_scratch = shared_scratch
-                        .as_deref_mut()
                         .ok_or_else(|| anyhow!("DSv4 verify requires shared-expert scratch"))?;
                     crate::stage_profile::profile(ctx, "dsv4/stage/shared_expert", || {
                         crate::moe::dsv4_shared_expert_forward_decode_scratch(
@@ -5149,6 +5190,7 @@ impl Dsv4Model {
             }
         }
 
+        // SAFETY: uninit device scratch; fully written before first read.
         let mut stream_out = unsafe { HiddenStates::uninit(ctx, stream_dim, seq_len)? };
         let elems = stream_dim * seq_len;
         let final_stream = scratch
@@ -5190,12 +5232,13 @@ impl Dsv4Model {
             start_pos + tokens.len(),
             slot.max_seq_len
         );
-        if let Some(sched) = verify {
-            if tokens.len() <= MAX_SPEC_VERIFY_ROWS && !dsv4_use_deepep_transport()? {
-                return self.forward_tokens_verify_stream_persistent(
-                    slot, kv_adapter, tokens, start_pos, sched,
-                );
-            }
+        if let Some(sched) = verify
+            && tokens.len() <= MAX_SPEC_VERIFY_ROWS
+            && !dsv4_use_deepep_transport()?
+        {
+            return self.forward_tokens_verify_stream_persistent(
+                slot, kv_adapter, tokens, start_pos, sched,
+            );
         }
 
         let hidden_size = self.config.hidden_size;
@@ -5491,6 +5534,7 @@ impl Dsv4Model {
             // GLM dense layer (`per_layer_dense_mlp[i]`): a plain SwiGLU FFN
             // replaces the routed-expert + shared-expert MoE entirely.
             let mut moe_with_shared =
+                // SAFETY: uninit device scratch; fully written before first read.
                 unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
             if let Some(dense) = layer.dense_mlp.as_ref() {
                 dsv4_dense_mlp_forward(
@@ -5679,7 +5723,6 @@ impl Dsv4Model {
                         hidden_size
                     );
                     let scratch = shared_scratch
-                        .as_deref_mut()
                         .ok_or_else(|| anyhow!("DSv4 verify requires shared-expert scratch"))?;
                     crate::stage_profile::profile(ctx, "dsv4/stage/shared_expert", || {
                         crate::moe::dsv4_shared_expert_forward_decode_scratch(
@@ -5824,13 +5867,16 @@ impl Dsv4Model {
         // SAFETY: embedding_batch writes the full [m, hidden_size] buffer.
         let mut emb = unsafe { HiddenStates::uninit(ctx, hidden_size, m)? };
         crate::ops::embedding_batch(ctx, &self.embed_tokens, &token_ids, &mut emb)?;
+        // SAFETY: uninit device scratch; fully written before first read.
         let mut emb_normed = unsafe { HiddenStates::uninit(ctx, hidden_size, m)? };
         crate::ops::rms_norm_batch(ctx, &emb, &mtp.enorm, eps, &mut emb_normed)?;
+        // SAFETY: uninit device scratch; fully written before first read.
         let mut e_proj = unsafe { HiddenStates::uninit(ctx, hidden_size, m)? };
         crate::attention::dsv4_linear(ctx, &mtp.e_proj, &emb_normed, &mut e_proj)?;
 
         // Gather h_prev streams into [m * hc_mult, hidden] (a stream is
         // hc_mult consecutive hidden rows, token-major).
+        // SAFETY: uninit device scratch; fully written before first read.
         let mut h_prev_batch = unsafe { HiddenStates::uninit(ctx, hidden_size, m * hc_mult)? };
         for (r, h) in h_prevs.iter().enumerate() {
             let mut dst = h_prev_batch
@@ -5840,11 +5886,14 @@ impl Dsv4Model {
                 .memcpy_dtod(&h.data, &mut dst)
                 .map_err(|e| anyhow!("DSv4 MTP h_prev D2D gather failed: {e}"))?;
         }
+        // SAFETY: uninit device scratch; fully written before first read.
         let mut h_normed = unsafe { HiddenStates::uninit(ctx, hidden_size, m * hc_mult)? };
         crate::ops::rms_norm_batch(ctx, &h_prev_batch, &mtp.hnorm, eps, &mut h_normed)?;
+        // SAFETY: uninit device scratch; fully written before first read.
         let mut h_proj = unsafe { HiddenStates::uninit(ctx, hidden_size, m * hc_mult)? };
         crate::attention::dsv4_linear(ctx, &mtp.h_proj, &h_normed, &mut h_proj)?;
 
+        // SAFETY: uninit device scratch; fully written before first read.
         let mut stream = unsafe { HiddenStates::uninit(ctx, stream_dim, m)? };
         {
             let (e_ptr, _ge) = e_proj.data.device_ptr(&ctx.stream);
@@ -5893,6 +5942,7 @@ impl Dsv4Model {
             .map_err(|e| anyhow!("DSv4 MTP start_pos H2D failed: {e}"))?;
 
         let attn_mhc = crate::hc::gen_mhc_params(ctx, &self.config, &layer.hc_attn, &stream)?;
+        // SAFETY: uninit device scratch; fully written before first read.
         let mut attn_normed = unsafe { HiddenStates::uninit(ctx, hidden_size, m)? };
         crate::hc::mhc_pre_rms_norm(
             ctx,
@@ -5905,9 +5955,12 @@ impl Dsv4Model {
             &mut attn_normed,
         )?;
         keepalive.keep_hidden(&attn_normed);
+        // SAFETY: uninit device scratch; fully written before first read.
         let mut attn_out = unsafe { HiddenStates::uninit(ctx, hidden_size, m)? };
         {
+            // SAFETY: uninit device scratch; fully written before first read.
             let mut normed_row = unsafe { HiddenStates::uninit(ctx, hidden_size, 1)? };
+            // SAFETY: uninit device scratch; fully written before first read.
             let mut attn_row = unsafe { HiddenStates::uninit(ctx, hidden_size, 1)? };
             keepalive.keep_hidden(&normed_row);
             keepalive.keep_hidden(&attn_row);
@@ -5949,6 +6002,7 @@ impl Dsv4Model {
             }
         }
         self.tp.all_reduce_sum(ctx, &mut attn_out)?;
+        // SAFETY: uninit device scratch; fully written before first read.
         let mut attn_stream = unsafe { HiddenStates::uninit(ctx, stream_dim, m)? };
         crate::hc::hc_post(
             ctx,
@@ -5964,6 +6018,7 @@ impl Dsv4Model {
         keepalive.keep_hidden(&attn_stream);
 
         let ffn_mhc = crate::hc::gen_mhc_params(ctx, &self.config, &layer.hc_ffn, &attn_stream)?;
+        // SAFETY: uninit device scratch; fully written before first read.
         let mut ffn_normed = unsafe { HiddenStates::uninit(ctx, hidden_size, m)? };
         crate::hc::mhc_pre_rms_norm(
             ctx,
@@ -5977,6 +6032,7 @@ impl Dsv4Model {
         )?;
         keepalive.keep_hidden(&ffn_normed);
         let level_tokens: Vec<u32> = rows.iter().map(|r| r.token).collect();
+        // SAFETY: uninit device scratch; fully written before first read.
         let mut moe_out = unsafe { HiddenStates::uninit(ctx, hidden_size, m)? };
         crate::moe::dsv4_moe_forward(
             self,
@@ -5988,6 +6044,7 @@ impl Dsv4Model {
             None,
         )?;
         self.tp.all_reduce_sum(ctx, &mut moe_out)?;
+        // SAFETY: uninit device scratch; fully written before first read.
         let mut shared = unsafe { HiddenStates::uninit(ctx, hidden_size, m)? };
         crate::moe::dsv4_shared_expert_forward(
             ctx,
@@ -5998,8 +6055,10 @@ impl Dsv4Model {
             self.config.swiglu_limit,
             &mut keepalive,
         )?;
+        // SAFETY: uninit device scratch; fully written before first read.
         let mut moe_with_shared = unsafe { HiddenStates::uninit(ctx, hidden_size, m)? };
         crate::ops::add_batch(ctx, &moe_out, &shared, &mut moe_with_shared)?;
+        // SAFETY: uninit device scratch; fully written before first read.
         let mut ffn_stream = unsafe { HiddenStates::uninit(ctx, stream_dim, m)? };
         crate::hc::hc_post(
             ctx,
@@ -6017,6 +6076,7 @@ impl Dsv4Model {
         keepalive.keep_hidden(&ffn_stream);
 
         // ── Head: per-row HC fold + norm, batched lm_head, device top-k.
+        // SAFETY: uninit device scratch; fully written before first read.
         let mut head_normed = unsafe { HiddenStates::uninit(ctx, hidden_size, m)? };
         {
             let mut last_hidden = DeviceVec::zeros(ctx, hidden_size)?;
@@ -6040,6 +6100,7 @@ impl Dsv4Model {
             }
         }
         keepalive.keep_hidden(&head_normed);
+        // SAFETY: uninit device scratch; fully written before first read.
         let mut logits = unsafe { HiddenStates::uninit(ctx, self.lm_head.rows, m)? };
         self.lm_head_project_batch(&head_normed, &mut logits)?;
         keepalive.keep_hidden(&logits);
@@ -6154,6 +6215,7 @@ impl Dsv4Model {
             {
                 let (logits_ptr, _lg) = logits.data.device_ptr(&ctx.stream);
                 let (ids_ptr, _ig) = ids_dev.device_ptr_mut(&ctx.stream);
+                // SAFETY: ptrs from live device allocations sized to the dims passed.
                 unsafe {
                     ffi::argmax_batch_cuda(
                         logits_ptr as *const ffi::Half,
@@ -6719,10 +6781,12 @@ fn dsv4_dense_mlp_forward(
     let tok = x.seq_len;
     let inter = dense.intermediate;
     // gate = gate_w · x  → [intermediate, tok]
+    // SAFETY: uninit device scratch; fully written before first read.
     let mut gate = unsafe { HiddenStates::uninit(ctx, inter, tok)? };
     crate::attention::dsv4_linear(ctx, &dense.gate, x, &mut gate)?;
     keepalive.keep_hidden(&gate);
     // up = up_w · x  → [intermediate, tok]
+    // SAFETY: uninit device scratch; fully written before first read.
     let mut up = unsafe { HiddenStates::uninit(ctx, inter, tok)? };
     crate::attention::dsv4_linear(ctx, &dense.up, x, &mut up)?;
     keepalive.keep_hidden(&up);
@@ -6731,6 +6795,7 @@ fn dsv4_dense_mlp_forward(
     // so use the unclamped silu_mul.
     // ponytail: pod-verify GLM dense FFN activation = silu(gate)*up (unclamped)
     let _ = swiglu_limit;
+    // SAFETY: uninit device scratch; fully written before first read.
     let mut act = unsafe { HiddenStates::uninit(ctx, inter, tok)? };
     crate::ops::silu_mul(ctx, &gate, &up, &mut act)?;
     keepalive.keep_hidden(&act);
