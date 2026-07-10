@@ -1,6 +1,6 @@
-# DSpark per-layer draft-KV cap — sliding-window ring, ~2560→~640 MB/slot
+# DSpark per-layer draft-KV cap — sliding-window ring, 2560→544 MB/slot
 
-> Status: Active — pod license (needle + VRAM + c-sweep) pending-remote
+> Status: Shipped — LICENSED (pod H20 GPU1: byte-correct + −4.7× draft VRAM)
 
 ## Context
 
@@ -58,23 +58,52 @@ linear buffer would have overflowed at `ctx_end − ctx_base > cap_full`).
 ### Per-slot draft VRAM
 
 `before = 2·5·kv·hd·cap_full`; `after = 2·kv·hd·(4·cap_sw + cap_full)`.
-Ratio `= (4·cap_sw + cap_full)/(5·cap_full) ≈ 0.25` at `max_seq≈32K`
-(`cap_sw/cap_full ≈ 2050/32770 ≈ 1/16`). Documented baseline 2560 MB → ~640 MB.
+Measured on H20 GPU1 at the KV-pool floor `max_seq_len = 131072` (128K,
+`kv=8`, `hd=128`, `block=16`) — the `draft {}MB` line at `qwen35.rs:2210`:
 
-| metric | before | after |
-|---|---|---|
-| per_slot draft bytes | ~2560 MB (pending-remote confirm) | ~600–640 MB (pending-remote) |
+| metric | before | after | Δ |
+|---|---|---|---|
+| draft bytes/slot | **2560 MB** (analytic, same config) | **544 MB** (measured) | **−4.7× (−2016 MB)** |
+| per-slot total | ~2707 MB | 691 MB | 691 = K/V 0 + gdr 144 + conv 2 + draft 544 |
+| affordable slots (18965 MB free) | ~6 | **24** | 4× more concurrency |
+
+Note the earlier "~640" estimate was loose (used `max_seq≈32K`); the real pool
+floor is 128K, so `cap_full` is larger and the measured after is 544 MB (the
+4 sliding layers collapse to ~2064 rows each, near-zero vs the 128K full layer).
 
 ## Verification
 
 - **Local gates (green):** `infer-api` cuda,no-cuda + `cli` metal,no-cuda
   typecheck; `clippy -D warnings` clean on `infer-cuda`+`cuda-kernels`;
-  `arle` cpu tests pass. CUDA-on-Mac cannot compile the kernels — pod is the
-  kernel-correctness gate.
-- **Pod license (pending-remote, devops):** build `--features cuda --bin arle` +
-  `strings … | grep dspark-sp`; needle 738291 ×3 exact + same-config-twice on the
-  dspark greedy lane (`max_tokens 768`); per_slot draft bytes before/after;
-  c-sweep c∈{1,4,8} dspark vs plain (the deferred #17 batching measurement).
+  `arle` cpu tests pass.
+- **Pod license — LICENSED** (H20 GPU1, `arle serve --backend cuda --model-path
+  Qwen3.6-27B-FP8 --spec-type dspark --mtp-draft-model Qwen3.6-27B-DFlash`,
+  drafter `dflash-backbone block=16 taps=[1,16,31,46,61]`; dspark is single-GPU,
+  the binary rejects TP for it):
+  - Build `BUILD_EXIT=0` (27 crates); `strings arle | grep dspark-sp` → hit.
+  - **Correctness (byte-correct sliding attention):** needle 738291 greedy,
+    exact **3/3** at ctx 1000 / 4000 / **8000 (> window, ring wrap exercised)**.
+    Warm re-runs byte-identical (DET); the one cold-8000 NONDET was a leading
+    `</think>` template token on run0 only — trunk prefix-cache boundary, not the
+    ring (warm pair already identical).
+
+### Concurrency c-sweep (deferred #17) — Qwen3.6-27B-FP8, ctx=1000, max_tokens=256, eager, errs=0
+
+| c | dspark tok/s | dspark p50 | plain tok/s | plain p50 | dspark active_req |
+|---|---|---|---|---|---|
+| 1 | **71.9** | 3.56s | 34.8 | 7.35s | 1 |
+| 4 | 72.9 | 14.04s | 73.1 | 13.62s | 3 |
+| 8 | 80.6 | 25.41s | **127.0** | 14.82s | 7 |
+
+- **C=1: dspark 2.07× plain** single-stream (spec-decode latency win).
+- **dspark aggregate is flat (72→73→81); plain batches 3.65×.** The scheduler
+  admits all requests (`active_requests=7` at C=8) — flatness is draft/verify
+  per-step overhead scaling with batch, not queueing. Crossover ~C=4; at C=8
+  dspark loses on both tok/s (0.63×) and p50. No OOM/timeout, `kv_free_pages`
+  7100–8100 (no KV pressure).
+- **Reading:** DSpark is a low-concurrency (c≤2) latency optimization that does
+  not batch. The per-layer memory fix is what makes it *affordable at all* on a
+  shared GPU — 24 vs ~6 slots. Keep dspark opt-in; gate off above c≈4.
 
 ## Rule
 
