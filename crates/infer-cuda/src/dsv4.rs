@@ -3222,7 +3222,16 @@ impl Dsv4Model {
                     // in `flash.device_page_table` (not per-call temporaries — #8).
                     // V32 (head_dim==576) and SparseIndexed (!full_flatten) keep the
                     // per-row pack byte-for-byte.
-                    let pack_batched = full_flatten && self.config.head_dim != 576;
+                    // Post-restore/bulk gap (codex R3): the batched pack only
+                    // packs THIS step's delta; a restored slot re-enters decode
+                    // with fp8_kv_comp_packed_rows=0 and needs the single-row
+                    // path's [packed_rows, seq_len) bulk rebuild — run the whole
+                    // layer per-row this tick. Batched gap-fill is future work.
+                    let comp_bulk_gap = (0..n).any(|r| {
+                        slots[slot_ids[r]].attention[layer_idx].flashmla_comp_bulk_gap()
+                    });
+                    let pack_batched =
+                        full_flatten && self.config.head_dim != 576 && !comp_bulk_gap;
                     let mut pack_nope_ptrs: Vec<u64> = Vec::new();
                     let mut pack_rope_ptrs: Vec<u64> = Vec::new();
                     let mut pack_compressed_ptrs: Vec<u64> = Vec::new();
