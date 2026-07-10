@@ -217,6 +217,7 @@ pub fn coordinator_router(
     });
 
     Router::new()
+        .route("/health", get(health))
         .route("/v1/completions", post(completions))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/messages", post(anthropic_messages))
@@ -1169,6 +1170,10 @@ async fn anthropic_count_tokens(
     request.validate_for_count()?;
     let (_, _, _, prompt_tokens) = anthropic_prompt(&state, &request)?;
     Ok(Json(serde_json::json!({"input_tokens": prompt_tokens.len()})).into_response())
+}
+
+async fn health() -> Json<serde_json::Value> {
+    Json(serde_json::json!({"status": "healthy"}))
 }
 
 async fn list_models(State(state): State<Arc<CoordinatorHandle>>) -> Json<ModelsResponse> {
