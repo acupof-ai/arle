@@ -1,0 +1,23 @@
+crates/infer-metal/src/executor.rs
+  s_5dfeefc95c0b28::t_261b7b42e11bb1 22-23,25,528-529,2221
+crates/infer-metal/src/kv_ssd.rs
+  s_5dfeefc95c0b28::t_e351d7da9d137c 1-9,13-24,29-35,44-46,71-81,84-85,87-92,94-96,98-99,101,113-116,118,120-122,124,129,133,137,141-147,179,200,206,213-215,217-222,228,232,236,239,246-247,256-273,275-304,359-362,364-365,368-381,387-396,402-423,522-688
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "ae7a1d5b47424916bffe96168cce5d936e2996b9",
+  "prompts": {},
+  "sessions": {
+    "s_5dfeefc95c0b28": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ace8e2c4f30c66a76",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
