@@ -241,7 +241,6 @@ impl KvMmapStore {
     pub fn reserve_indices(&mut self, indices: &[u32]) {
         self.free_list.retain(|i| !indices.contains(i));
     }
-
 }
 
 fn invalid(msg: &str) -> io::Error {
@@ -284,5 +283,4 @@ mod tests {
         s.free_slot(s0);
         assert_eq!(s.alloc_slot().unwrap(), s0);
     }
-
 }

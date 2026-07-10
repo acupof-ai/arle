@@ -6041,8 +6041,8 @@ fn maybe_dump_sample_topk(ctx: &DeviceContext, logits: &DeviceVec, position: u64
 #[cfg(test)]
 mod tests {
     use super::{CudaKvCacheDtype, NS_SLOT, NS_SLOT_CHUNK};
-    use kv_native_sys::{chunk_sub, tier_key};
     use infer_seam::KvCacheDtype;
+    use kv_native_sys::{chunk_sub, tier_key};
 
     #[test]
     fn tier_key_namespaces_never_collide() {
