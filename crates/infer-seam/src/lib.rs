@@ -376,9 +376,15 @@ pub trait BackendExecutor {
     }
 
     /// Restore the sidecar recurrent state for `slot` when reusing a page-radix
-    /// prefix of length `matched_len`. Called by `attach_prefix_to_request` after
-    /// `kv.attach_pages()` succeeds. Default no-op for full-attention-only backends
-    /// (CUDA Qwen dense, Metal); only Qwen3.5/3.6 hybrid overrides this.
+    /// prefix of length `matched_len`, returning the token length actually
+    /// restored into the slot. Called by `attach_prefix_to_request` after
+    /// `kv.attach_pages()` succeeds. Default returns `matched_len` (byte-identical
+    /// to a page-aligned restore) for full-attention-only backends (CUDA Qwen
+    /// dense, Metal) and Qwen3.5/3.6 hybrid. DSv4 finish-write-through may restore
+    /// PAST the 64-block-aligned `matched_len` to an exact frontier `P1` (the
+    /// partial last block lives in the pool entry's pending section); it returns
+    /// `P1 > matched_len` and the engine grows the slot's own partial page and
+    /// prefills only from `P1`.
     ///
     /// `prefix_pages` are the physical host-pool page ids already attached to the
     /// slot — the hybrid override uses them to sync the device KV pool seq_len.
@@ -386,9 +392,19 @@ pub trait BackendExecutor {
         &mut self,
         _slot: usize,
         _tokens: &[u32],
-        _matched_len: usize,
+        matched_len: usize,
         _prefix_pages: &[u32],
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<usize> {
+        Ok(matched_len)
+    }
+
+    /// Write the finishing slot's full frontier state THROUGH to the backend's
+    /// content-keyed prefix store, so a later turn restores to the exact finish
+    /// position. Called by `finish_slot` after `publish_prefix_blocks` and before
+    /// `free_slot_pages`, at the eager finish sync point (graph-safe). Best-effort:
+    /// a failure only forfeits future reuse, never the finish. Default no-op; only
+    /// DSv4 (behind `--dsv4-decode-reuse`) overrides.
+    fn capture_finish_frontier(&mut self, _slot: usize, _tokens: &[u32]) -> anyhow::Result<()> {
         Ok(())
     }
 
