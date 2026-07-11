@@ -859,8 +859,10 @@ pub(crate) struct ServeArgs {
     pub(crate) dsv4_moe_contig_decode: bool,
 
     /// DSv4 decode-region prefix reuse: restore a later turn to the exact prior
-    /// finish position (opt-in; OFF = byte-identical, pending pod license).
-    #[arg(long, default_value_t = false, action = clap::ArgAction::Set, value_name = "BOOL")]
+    /// finish position. Default ON (2026-07-11 pod license: multi-turn
+    /// concurrent +25% throughput at c=16, no single-shot regression); pass
+    /// `false` to restore the pre-reuse path.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set, value_name = "BOOL")]
     pub(crate) dsv4_decode_reuse: bool,
 
     /// Adaptive MTP gate at B=1: skip speculation below the accept break-even.

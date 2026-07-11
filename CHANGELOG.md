@@ -25,6 +25,18 @@ lifecycle & progress spine).
 
 ### Verdicts
 
+- **2026-07-11 — DSv4 decode-region reuse: DEFAULT FLIPPED ON** (`--dsv4-decode-reuse`,
+  was opt-in). Multi-turn concurrent A/B (token-preserving harness, the shape
+  guidellm can't express) on H20 TP=4: aggregate throughput **+25.3% at c=16**,
+  TTFT p50 halved (−52%), TPOT −18.7% — the win scales monotonically with
+  concurrency. No single-shot regression (guidellm independent-prompt A/B is a
+  byte-wash; finish-capture D2H ~free when reuse doesn't fire). ON-path
+  correctness pod-verified across the campaign (crash-repro 24/24, needle-exact).
+  Two binding shapes cleared → flip. The throughput lever was the reuse feature
+  itself; the pinned-DRAM (#5) and admission-watermark (#6) knobs were KILLED
+  (bad ROI / unsafe-no-cascade → #160).
+  [wins](docs/experience/wins/2026-07-11-dsv4-decode-reuse-multiturn-concurrent-throughput.md)
+
 - **2026-07-11 — Agent-OPD round −30.1% wall (H20 GPU1 3-arm A/B), quality-neutral
   (`894be29fa`)**: DSpark serial-B=1 decode LICENSED (rollout −29% / eval −30%,
   1.41×; engagement proven by net speedup + 78 `[dspark-draft]` lines; already
