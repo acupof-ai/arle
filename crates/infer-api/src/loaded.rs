@@ -174,7 +174,8 @@ impl Default for EngineLoadConfig {
             max_running_requests: None,
             total_pages: 8192,
             page_size: 16,
-            max_prompt_tokens: 32_768,
+            // Sentinel: unset → bound by KV capacity in `scheduler_config` (#145).
+            max_prompt_tokens: usize::MAX,
             max_total_tokens: 65_536,
             chunked_prefill_size: 64,
             mtp_draft_tokens: None,
@@ -459,15 +460,14 @@ mod backend {
     impl EngineLoadConfig {
         pub(super) fn scheduler_config(&self) -> SchedulerConfig {
             let mut config = SchedulerConfig::for_slots(self.hot_workspace_slots());
-            // Prompt cap tracks the real per-request KV capacity
-            // (max_seq_len = total_pages × page_size), minus a generation
-            // reserve — NOT a hardcoded 32K that aborts moderate prompts even
-            // though the page table / model support far more.
+            // Prompt cap = min(requested, KV capacity − gen reserve). Capacity is
+            // a hard ceiling, not a floor: over-length writes past the fixed DSv4
+            // bands (#145). usize::MAX sentinel = unset → capacity-bound.
             let per_req_cap = self.total_pages.saturating_mul(self.page_size);
             let gen_reserve = per_req_cap / 8;
             config.max_prompt_tokens = self
                 .max_prompt_tokens
-                .max(per_req_cap.saturating_sub(gen_reserve));
+                .min(per_req_cap.saturating_sub(gen_reserve));
             config.max_total_tokens = self.max_total_tokens;
             config.chunked_prefill_size = self.chunked_prefill_size;
             config.max_running_requests = self.max_running_requests;
