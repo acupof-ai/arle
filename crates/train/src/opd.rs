@@ -3278,7 +3278,12 @@ pub fn capture_rollout_logprobs(
         let targets: Vec<usize> = chunk.iter().map(|&(_, t)| t).collect();
         // Gather this chunk's hidden rows, project through lm_head, log-softmax,
         // then pick each row's target logprob. Never materializes [seq, vocab].
-        let rows_hidden = embedding(hidden_2d, &rows, store, &mut tape).map_err(OpdError::from)?;
+        // `embedding` row-gathers but emits [1, chunk, hidden]; reshape to rank-2
+        // so the bf16 matmul_bt forward (which rejects rank-3) accepts it.
+        let rows_hidden_3d =
+            embedding(hidden_2d, &rows, store, &mut tape).map_err(OpdError::from)?;
+        let rows_hidden = reshape(rows_hidden_3d, &[rows.len(), hidden_dim], store, &mut tape)
+            .map_err(OpdError::from)?;
         let logits = matmul_bt(rows_hidden, lm_head, store, &mut tape).map_err(OpdError::from)?;
         let logp = log_softmax(logits, store, &mut tape).map_err(OpdError::from)?;
         let gathered = gather_last_dim(logp, &targets, store, &mut tape).map_err(OpdError::from)?;
