@@ -128,10 +128,14 @@ pub struct OperatorImplementationHits {
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct OperatorDispatchStats {
     pub policy_hash: String,
-    pub product_id: String,
-    pub bundle_digest: String,
     pub implementation_hits: Vec<OperatorImplementationHits>,
     pub fallback_count: u64,
+}
+
+/// Backend-owned build artifacts reported only at a stats request boundary.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BackendArtifactIdentity {
+    pub kernel_bundle_id: String,
 }
 
 /// Host-only engine-core to backend-executor seam.
@@ -173,6 +177,11 @@ pub trait BackendExecutor {
     /// them. Default empty until a backend family adopts generated policy.
     fn operator_dispatch_stats(&self) -> OperatorDispatchStats {
         OperatorDispatchStats::default()
+    }
+
+    /// Exact backend artifact identity, if the build verified one.
+    fn artifact_identity(&self) -> BackendArtifactIdentity {
+        BackendArtifactIdentity::default()
     }
 
     /// Optional direct multimodal generation path for scalar backends whose

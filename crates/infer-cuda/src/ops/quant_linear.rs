@@ -64,52 +64,10 @@ static FP8_IMPLEMENTATION_IDS: &[(&AtomicU64, &str)] = &[
     (&DEQUANT_GEMM_HITS, "cuda.qwen.fp8_dequant_bf16_gemm"),
 ];
 
-static PRODUCT_IDENTITY: OnceLock<(String, String)> = OnceLock::new();
-
-/// (binary_sha256, git_commit) — computed once on first call.
-fn product_identity() -> &'static (String, String) {
-    PRODUCT_IDENTITY.get_or_init(|| {
-        let binary = std::env::current_exe()
-            .ok()
-            .and_then(|p| file_sha256(p.to_str()?))
-            .unwrap_or_else(|| "unreported".into());
-        let commit = std::process::Command::new("git")
-            .args(["rev-parse", "HEAD"])
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "unreported".into());
-        (binary, commit)
-    })
-}
-
-fn file_sha256(path: &str) -> Option<String> {
-    use std::process::Command;
-    [
-        ("sha256sum", vec![path]),
-        ("shasum", vec!["-a", "256", path]),
-    ]
-    .into_iter()
-    .find_map(|(program, args)| {
-        Command::new(program)
-            .args(args)
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .and_then(|o| o.split_whitespace().next().map(str::to_owned))
-            .filter(|d| d.len() == 64)
-    })
-}
-
 /// Cumulative operator dispatch stats for Qwen FP8 dense projection.
 ///
-/// Reads global atomics — safe to call from any thread, no allocation on the
-/// hot path (the returned `Vec` only contains implementations that have
-/// actually been hit).
+/// Materialized only at an explicit stats request boundary. Dispatch itself only
+/// increments atomics; no request or engine-tick path allocates telemetry data.
 pub(crate) fn qwen_fp8_dense_operator_stats() -> infer_seam::OperatorDispatchStats {
     use infer_seam::OperatorImplementationHits;
 
@@ -126,11 +84,8 @@ pub(crate) fn qwen_fp8_dense_operator_stats() -> infer_seam::OperatorDispatchSta
     let fallback_count =
         GEMV_HITS.load(Ordering::Relaxed) + DEQUANT_GEMM_HITS.load(Ordering::Relaxed);
 
-    let (product_id, bundle_digest) = product_identity();
     infer_seam::OperatorDispatchStats {
         policy_hash: qwen_fp8_dense_policy::POLICY_ID.into(),
-        product_id: product_id.clone(),
-        bundle_digest: bundle_digest.clone(),
         implementation_hits,
         fallback_count,
     }

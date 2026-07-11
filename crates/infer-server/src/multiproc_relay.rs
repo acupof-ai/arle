@@ -251,6 +251,8 @@ pub fn local_relay_pair() -> (
 /// Stats payload for the coordinator `/v1/stats` relay round-trip.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct WireStats {
+    #[serde(default)]
+    pub build_identity: crate::BuildIdentity,
     pub active_requests: usize,
     pub queue_depth: usize,
     pub kv_free_pages: usize,
@@ -305,8 +307,8 @@ pub struct WireStats {
 }
 
 impl WireStats {
-    /// Reverse of [`from_counters`]: reconstruct a [`crate::CounterSnapshot`] from
-    /// wire stats.
+    /// Reconstruct the per-tick counters; request-boundary operator stats remain
+    /// in the wire payload for `/v1/stats` only.
     pub fn into_counter_snapshot(self) -> crate::CounterSnapshot {
         crate::CounterSnapshot {
             active_requests: self.active_requests,
@@ -363,13 +365,17 @@ impl WireStats {
                 rejected: self.spec_rejected,
                 partial_ctx_chains: self.spec_partial_ctx_chains,
             },
-            operator_dispatch: self.operator_dispatch,
         }
     }
 
-    /// Build from a [`crate::CounterSnapshot`] (single-process local backend).
-    pub fn from_counters(c: &crate::CounterSnapshot) -> Self {
+    /// Own the per-tick counters plus request-boundary operator stats for relay.
+    pub fn from_counters(
+        c: &crate::CounterSnapshot,
+        build_identity: crate::BuildIdentity,
+        operator_dispatch: infer_seam::OperatorDispatchStats,
+    ) -> Self {
         Self {
+            build_identity,
             active_requests: c.active_requests,
             queue_depth: c.queue_depth,
             kv_free_pages: c.kv_free_pages,
@@ -414,7 +420,7 @@ impl WireStats {
             spec_accepted: c.spec_decode.accepted,
             spec_rejected: c.spec_decode.rejected,
             spec_partial_ctx_chains: c.spec_decode.partial_ctx_chains,
-            operator_dispatch: c.operator_dispatch.clone(),
+            operator_dispatch,
         }
     }
 }

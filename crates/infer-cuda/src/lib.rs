@@ -596,6 +596,12 @@ impl BackendExecutor for CudaExecutor {
         }
     }
 
+    fn artifact_identity(&self) -> infer_seam::BackendArtifactIdentity {
+        infer_seam::BackendArtifactIdentity {
+            kernel_bundle_id: cuda_kernels::KERNEL_BUILD_ID.to_string(),
+        }
+    }
+
     fn kv_tier_disk_pages(&self) -> usize {
         match &self.inner {
             CudaExecutorInner::Placeholder => 0,

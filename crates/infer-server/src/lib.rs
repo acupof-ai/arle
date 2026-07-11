@@ -29,7 +29,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -75,6 +75,54 @@ pub use schema::{
     CompletionRequest, CompletionResponse,
 };
 pub use tokenizer::OpenAiTokenizer;
+
+static PRODUCT_BINARY_ID: OnceLock<String> = OnceLock::new();
+
+/// Server-owned product and kernel-bundle identities for `/v1/stats`.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct BuildIdentity {
+    pub product_binary_sha256: String,
+    pub kernel_bundle_id: String,
+}
+
+/// Materialize build identity only at an explicit stats request boundary.
+#[must_use]
+pub fn build_identity(artifact: infer_seam::BackendArtifactIdentity) -> BuildIdentity {
+    let kernel_bundle_id = if artifact.kernel_bundle_id.is_empty() {
+        "unreported".to_string()
+    } else {
+        artifact.kernel_bundle_id
+    };
+    BuildIdentity {
+        product_binary_sha256: PRODUCT_BINARY_ID
+            .get_or_init(|| product_binary_sha256().unwrap_or_else(|_| "unreported".to_string()))
+            .clone(),
+        kernel_bundle_id,
+    }
+}
+
+fn product_binary_sha256() -> Result<String> {
+    use std::fmt::Write;
+    use std::io::Read;
+
+    let path = std::env::current_exe()?;
+    let mut file = std::fs::File::open(path)?;
+    let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    let mut id = String::with_capacity(71);
+    id.push_str("sha256:");
+    for byte in digest.finish().as_ref() {
+        write!(id, "{byte:02x}").expect("writing to String is infallible");
+    }
+    Ok(id)
+}
 
 /// Handle to a running engine thread.
 ///
@@ -411,7 +459,17 @@ where
     /// to zero before the first tick (or if the engine thread has gone).
     #[must_use]
     pub fn counters(&self) -> CounterSnapshot {
-        self.counters.lock().map(|c| c.clone()).unwrap_or_default()
+        self.counters.lock().map(|c| *c).unwrap_or_default()
+    }
+
+    /// Materialize operator-policy identities and counters on the engine thread.
+    pub fn operator_dispatch_stats(&self) -> Result<infer_seam::OperatorDispatchStats> {
+        self.run_on_engine(|engine| engine.operator_dispatch_stats())
+    }
+
+    /// Return the backend artifact identity at a stats request boundary.
+    pub fn artifact_identity(&self) -> Result<infer_seam::BackendArtifactIdentity> {
+        self.run_on_engine(|engine| engine.artifact_identity())
     }
 
     fn acquire_live_request(&self) -> Result<()> {
@@ -776,7 +834,13 @@ fn serve_handle_relay_driver<E, K>(
             }
             Ok(Some(RelayEnvelope::StatsQuery { request_id })) => {
                 let counters = serve.counters();
-                let data = Box::new(WireStats::from_counters(&counters));
+                let operator_dispatch = serve.operator_dispatch_stats().unwrap_or_default();
+                let artifact = serve.artifact_identity().unwrap_or_default();
+                let data = Box::new(WireStats::from_counters(
+                    &counters,
+                    build_identity(artifact),
+                    operator_dispatch,
+                ));
                 let _ = engine_tx.send(RelayEnvelope::StatsResponse { request_id, data });
             }
             Ok(Some(RelayEnvelope::Shutdown)) | Ok(None) => {
@@ -833,6 +897,35 @@ mod tests {
 
         fn poll(&mut self, inflight: Self::Inflight) -> Result<PollResult<Self::Inflight>> {
             Ok(PollResult::NotReady(inflight))
+        }
+    }
+
+    #[derive(Clone)]
+    struct StatsCountingEchoExecutor {
+        materializations: Arc<AtomicUsize>,
+    }
+
+    impl BackendExecutor for StatsCountingEchoExecutor {
+        type Inflight = StepOutput;
+
+        fn submit(&mut self, plan: &ForwardPlan, kv: &mut dyn KvPool) -> Result<Self::Inflight> {
+            EchoExecutor.submit(plan, kv)
+        }
+
+        fn poll(&mut self, inflight: Self::Inflight) -> Result<PollResult<Self::Inflight>> {
+            EchoExecutor.poll(inflight)
+        }
+
+        fn operator_dispatch_stats(&self) -> infer_seam::OperatorDispatchStats {
+            self.materializations.fetch_add(1, Ordering::Relaxed);
+            infer_seam::OperatorDispatchStats {
+                policy_hash: "policy".into(),
+                implementation_hits: vec![infer_seam::OperatorImplementationHits {
+                    implementation_id: "test.echo".into(),
+                    hits: 3,
+                }],
+                fallback_count: 1,
+            }
         }
     }
 
@@ -989,6 +1082,32 @@ mod tests {
             snap.kv_free_pages > 0,
             "free-page count published, not default"
         );
+
+        serve.shutdown().expect("engine thread joins cleanly");
+        Ok(())
+    }
+
+    #[test]
+    fn operator_stats_materialize_only_at_query_boundary() -> Result<()> {
+        let materializations = Arc::new(AtomicUsize::new(0));
+        let executor = StatsCountingEchoExecutor {
+            materializations: Arc::clone(&materializations),
+        };
+        let kv = HostPagedKvPool::new(1, 64, 16);
+        let serve = ServeHandle::spawn(executor, kv, SchedulerConfig::default());
+
+        serve
+            .submit(vec![10, 11], 2, SamplingParams::default())?
+            .collect()?;
+        assert_eq!(materializations.load(Ordering::Relaxed), 0);
+
+        let stats = serve.operator_dispatch_stats()?;
+        assert_eq!(materializations.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.implementation_hits[0].hits, 3);
+        assert_eq!(stats.fallback_count, 1);
+        let identity = build_identity(infer_seam::BackendArtifactIdentity::default());
+        assert!(identity.product_binary_sha256.starts_with("sha256:"));
+        assert_eq!(identity.product_binary_sha256.len(), 71);
 
         serve.shutdown().expect("engine thread joins cleanly");
         Ok(())
