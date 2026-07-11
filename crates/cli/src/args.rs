@@ -212,6 +212,31 @@ pub(crate) enum GkdTeacherArg {
     SelfFrozen,
 }
 
+/// Policy-update algorithm for `agent-opd` (`--update-strategy`).
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+pub(crate) enum UpdateStrategyArg {
+    /// Reject (reward ≤ 0), masked CE on the survivors (default, unchanged).
+    RejectionCe,
+    /// SAO Phase 1: DIS (clipped per-token PG) with a batch-centered advantage.
+    SaoDis,
+}
+
+impl UpdateStrategyArg {
+    // Consumed only by the cuda-gated agent-opd driver (`run_agent_opd_impl`).
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    pub(crate) fn to_strategy(
+        self,
+        eps_low: f32,
+        eps_high: f32,
+    ) -> train::update_strategy::UpdateStrategy {
+        use train::update_strategy::UpdateStrategy;
+        match self {
+            Self::RejectionCe => UpdateStrategy::RejectionCe,
+            Self::SaoDis => UpdateStrategy::SaoDis { eps_low, eps_high },
+        }
+    }
+}
+
 impl SaveDtypeArg {
     pub(crate) fn as_train_dtype(self) -> &'static str {
         match self {
@@ -1923,6 +1948,22 @@ pub(crate) struct TrainAgentOpdArgs {
     /// `[window, vocab]` logits tile, bounding VRAM on long agentic trajectories.
     #[arg(long, default_value_t = 2048)]
     pub(crate) writeback_window: usize,
+
+    /// Policy-update algorithm. `rejection-ce` (default) = today's reject +
+    /// masked CE. `sao-dis` = SAO Phase 1 (trains failing trajectories too, with
+    /// a batch-centered advantage + clipped per-token PG).
+    #[arg(long, value_enum, default_value_t = UpdateStrategyArg::RejectionCe)]
+    pub(crate) update_strategy: UpdateStrategyArg,
+
+    /// SAO DIS lower clip on the importance ratio `exp(logπθ − logπ_rollout)`
+    /// (gate opens above `1 − eps_low`). Only used by `--update-strategy sao-dis`.
+    #[arg(long, default_value_t = 0.8)]
+    pub(crate) sao_eps_low: f32,
+
+    /// SAO DIS upper clip on the importance ratio (gate closes above
+    /// `1 + eps_high`). Only used by `--update-strategy sao-dis`.
+    #[arg(long, default_value_t = 3.0)]
+    pub(crate) sao_eps_high: f32,
 
     /// KV slots for the rollout engine (>1 batches sampling/eval; VRAM-gated).
     #[arg(long, default_value_t = 2)]
