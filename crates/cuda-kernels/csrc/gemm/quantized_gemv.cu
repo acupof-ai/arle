@@ -396,16 +396,19 @@ __device__ __forceinline__ float fp4_e2m1_group_scale(
     return dsv4_decode_fp8_e4m3(scales[row * scale_cols + group]) * global_scales[0];
 }
 
-__global__ void dsv4_fp8_gemv_batch_kernel(
+// Single-output batch GEMV (grid.y = B, one column per block): fp8 weights,
+// bf16 acts, `ScaleFn` picks the DSv4 e8m0 or the f32-block scale (#144 merged
+// the two byte-identical copies — dsv4_fp8_gemv_batch_kernel /
+// fp8_f32_block_gemv_batch_kernel).
+template <class ScaleFn>
+__global__ void fp8_gemv_batch_kernel(
     const uint8_t* __restrict__ weight,
-    const uint8_t* __restrict__ scales,
     const __nv_bfloat16* __restrict__ input,
     __nv_bfloat16* __restrict__ output,
     int B,
     int N,
     int K,
-    int scale_rows,
-    int scale_cols)
+    ScaleFn scale_fn)
 {
     int row = blockIdx.x * GEMV_ROWS + threadIdx.x / (GEMV_THREADS / GEMV_ROWS);
     int batch_idx = blockIdx.y;
@@ -413,34 +416,23 @@ __global__ void dsv4_fp8_gemv_batch_kernel(
     int threads_per_row = GEMV_THREADS / GEMV_ROWS;
     int lane_id = threadIdx.x % WARP_SIZE;
     int row_in_block = threadIdx.x / threads_per_row;
-    if (row >= N) return;
+    if (row >= N || batch_idx >= B) return;
 
-    const int block_h = (N + scale_rows - 1) / scale_rows;
-    const int block_w = (K + scale_cols - 1) / scale_cols;
-    const int sr_raw = row / block_h;
-    const int sr = sr_raw < scale_rows ? sr_raw : (scale_rows - 1);
-    const int scale_row_offset = sr * scale_cols;
     const __nv_bfloat16* x = input + batch_idx * K;
     float sum = 0.0f;
-    // uint4 fast path: weight rows are 16B-aligned when K%16==0 (weight base
-    // from cudaMalloc, row stride K); K%16==0 also keeps the per-batch bf16
-    // pointer input + batch_idx*K 16B-aligned (2*K % 16 == 0).
-    if ((K % 16) == 0 && (block_w % 16) == 0) {
+    // uint4 fast path: weight rows are 16B-aligned when K%16==0, and a 16-chunk
+    // carries one scale when the scale block is 16-aligned in K.
+    if ((K % 16) == 0 && scale_fn.k_block_16_aligned()) {
         const int kv = K / 16;
         const uint8_t* weight_row = weight + (int64_t)row * K;
         for (int v = tid_in_row; v < kv; v += threads_per_row) {
             const int k = v * 16;
-            const int sc_raw = k / block_w;
-            const int sc = sc_raw < scale_cols ? sc_raw : (scale_cols - 1);
-            const float scale = dsv4_decode_e8m0(scales[scale_row_offset + sc]);
+            const float scale = scale_fn(row, k);
             sum += scale * fp8_f32_dot16(weight_row + k, x + k);
         }
     } else {
         for (int k = tid_in_row; k < K; k += threads_per_row) {
-            const int sc_raw = k / block_w;
-            const int sc = sc_raw < scale_cols ? sc_raw : (scale_cols - 1);
-            const float w = dsv4_decode_fp8_e4m3(weight[row * K + k])
-                * dsv4_decode_e8m0(scales[scale_row_offset + sc]);
+            const float w = dsv4_decode_fp8_e4m3(weight[row * K + k]) * scale_fn(row, k);
             sum += w * __bfloat162float(x[k]);
         }
     }
@@ -767,64 +759,8 @@ __global__ void dsv4_fp4_gemv_batch_tiled_kernel(
     }
 }
 
-__global__ void fp8_f32_block_gemv_batch_kernel(
-    const uint8_t* __restrict__ weight,
-    const float* __restrict__ scales,
-    const __nv_bfloat16* __restrict__ input,
-    __nv_bfloat16* __restrict__ output,
-    int B,
-    int N,
-    int K,
-    int scale_rows,
-    int scale_cols,
-    int block_m,
-    int block_k)
-{
-    int row = blockIdx.x * GEMV_ROWS + threadIdx.x / (GEMV_THREADS / GEMV_ROWS);
-    int batch_idx = blockIdx.y;
-    int tid_in_row = threadIdx.x % (GEMV_THREADS / GEMV_ROWS);
-    int threads_per_row = GEMV_THREADS / GEMV_ROWS;
-    int lane_id = threadIdx.x % WARP_SIZE;
-    int row_in_block = threadIdx.x / threads_per_row;
-    if (row >= N || batch_idx >= B) return;
-
-    const __nv_bfloat16* x = input + batch_idx * K;
-    float sum = 0.0f;
-    // Qwen FP8 decode uses K/block_k aligned to 16, so one block scale covers
-    // each vector dot and the scalar fallback stays available for odd shapes.
-    if ((K % 16) == 0 && (block_k % 16) == 0) {
-        const int kv = K / 16;
-        const uint8_t* weight_row = weight + (int64_t)row * K;
-        for (int v = tid_in_row; v < kv; v += threads_per_row) {
-            const int k = v * 16;
-            const float scale =
-                fp8_f32_block_scale(scales, row, k, scale_rows, scale_cols, block_m, block_k);
-            sum += scale * fp8_f32_dot16(weight_row + k, x + k);
-        }
-    } else {
-        for (int k = tid_in_row; k < K; k += threads_per_row) {
-            const float w = dsv4_decode_fp8_e4m3(weight[row * K + k])
-                * fp8_f32_block_scale(scales, row, k, scale_rows, scale_cols, block_m, block_k);
-            sum += w * __bfloat162float(x[k]);
-        }
-    }
-
-    sum = warp_reduce_sum(sum);
-    __shared__ float smem[GEMV_ROWS * 8];
-    int warps_per_row = threads_per_row / WARP_SIZE;
-    int warp_in_row = (threadIdx.x % threads_per_row) / WARP_SIZE;
-    if (lane_id == 0) smem[row_in_block * warps_per_row + warp_in_row] = sum;
-    __syncthreads();
-    if (tid_in_row == 0) {
-        float total = 0.0f;
-        for (int w = 0; w < warps_per_row; w++)
-            total += smem[row_in_block * warps_per_row + w];
-        output[batch_idx * N + row] = __float2bfloat16(total);
-    }
-}
-
 // Probe-only weight-read diagnostic (fp8_smallm_gemm_probe): same block
-// geometry + access pattern as fp8_f32_block_gemv_batch_kernel, x-work
+// geometry + access pattern as fp8_gemv_batch_kernel, x-work
 // removed. mode 0 sums raw uint4 words (pure bandwidth); mode 1 adds the
 // fp8->f32 decode (isolates decode ALU). H20 attribution (2026-07-10):
 // mode0 2.9-3.7 TB/s, mode1 2.8-3.0, full GEMV 1.78 — the per-row x
@@ -2554,8 +2490,10 @@ cudaError_t dsv4_fp8_gemv_batch_cuda(
     }
     dim3 grid((N + GEMV_ROWS - 1) / GEMV_ROWS, B);
     dim3 block(GEMV_THREADS);
-    dsv4_fp8_gemv_batch_kernel<<<grid, block, 0, stream>>>(
-        weight, scales, input, output, B, N, K, scale_rows, scale_cols);
+    const int block_h = (N + scale_rows - 1) / scale_rows;
+    const int block_w = (K + scale_cols - 1) / scale_cols;
+    Fp8E8m0BlockScale scale_fn{scales, scale_rows, scale_cols, block_h, block_w};
+    fp8_gemv_batch_kernel<<<grid, block, 0, stream>>>(weight, input, output, B, N, K, scale_fn);
     return cudaGetLastError();
 }
 
@@ -2641,8 +2579,8 @@ cudaError_t gemv_fp8_block_scaled_batch_cuda(
     }
     dim3 grid((N + GEMV_ROWS - 1) / GEMV_ROWS, B);
     dim3 block(GEMV_THREADS);
-    fp8_f32_block_gemv_batch_kernel<<<grid, block, 0, stream>>>(
-        weight, scales, input, output, B, N, K, scale_rows, scale_cols, block_m, block_k);
+    Fp8F32BlockScale scale_fn{scales, scale_rows, scale_cols, block_m, block_k};
+    fp8_gemv_batch_kernel<<<grid, block, 0, stream>>>(weight, input, output, B, N, K, scale_fn);
     return cudaGetLastError();
 }
 
