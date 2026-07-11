@@ -24,7 +24,9 @@ real E4M3 grid, round-to-nearest-even.
 ## Fix
 
 Proper `fp8_e4m3_to_f32` / `f32_to_fp8_e4m3` with `rint_ne` rounding.
-21/21 cells pass on H20. Policy confirmed: M=1→Gemv, M≥2→PackDeepGemm.
+21/21 component cells pass on H20. This proves numeric parity only. The prior
+runner fabricated E2E and bundle identity, so no exact cell qualifies and the
+M=1 GEMV / M>=2 PackDeepGemm policy remains an unqualified fallback.
 
 ## Rule
 
@@ -33,6 +35,10 @@ quantization behavior.** Not "FP8 means 8-bit floating point" — read the
 specific encode: bias, max-finite, rounding mode, per-row vs per-tile scaling.
 A reference that uses integer rounding is structurally guaranteed to fail
 against real E4M3 hardware.
+
+**A component probe is not an E2E artifact.** Exact policy qualification needs
+the verified kernel manifest and an actual-model E2E result bound to the same
+binary and bundle.
 
 **80/20:** 4 iterations × ~30 min each = 2 hrs wasted on something that
 reading one kernel function (5 min) would have prevented.
