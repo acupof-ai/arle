@@ -1,0 +1,25 @@
+crates/cli/src/args.rs
+  s_3d949abe53b900::t_86df3149d33ad9 862-865
+crates/infer-cuda/src/runtime_flags.rs
+  s_3d949abe53b900::t_99f0c0693f8d91 28
+docs/experience/wins/2026-07-11-dsv4-decode-reuse-multiturn-concurrent-throughput.md
+  s_3d949abe53b900::t_82855b7a42073b 1-62
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "6230d9d3d5a2ae0729f13a00bd846c5b0526e900",
+  "prompts": {},
+  "sessions": {
+    "s_3d949abe53b900": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "92f2c43c-22c8-4f1d-8b27-d06d6f3c59ad",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
