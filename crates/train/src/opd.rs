@@ -3247,6 +3247,11 @@ pub fn capture_rollout_logprobs(
     }
     let positions: Vec<u32> = (0..seq_len as u32).collect();
 
+    // Snapshot live tensors so the tape-off forward + per-chunk projection
+    // intermediates (hidden, logits, logp, gathered) are reclaimed at the end —
+    // `to_host` copies but does not free them, so long trajectories would leak.
+    let keep_ids: HashSet<TensorId> = store.live_ids().into_iter().collect();
+
     // Tape OFF: π_rollout is a frozen reference — no checkpoint, no gradient.
     let mut tape = Tape::new();
     tape.set_enabled(false);
@@ -3275,6 +3280,7 @@ pub fn capture_rollout_logprobs(
         let gathered = gather_last_dim(logp, &targets, store, &mut tape).map_err(OpdError::from)?;
         logprobs.extend_from_slice(&store.to_host(gathered).map_err(OpdError::from)?);
     }
+    store.retain_ids(&keep_ids);
     Ok(logprobs)
 }
 
