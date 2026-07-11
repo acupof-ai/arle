@@ -1,0 +1,25 @@
+CHANGELOG.md
+  s_3d949abe53b900::t_cfa5f331add7e0 28-37
+docs/experience/wins/2026-07-11-dspark-p1-license-qwen36-27b.md
+  s_3d949abe53b900::t_57f30ecbf74029 1-62
+docs/plans/2026-07-09-dspark-dflash-spec-decode-qwen36.md
+  s_3d949abe53b900::t_450e820f46d8f9 3-9
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "587f36e37349933b47f14a334f9213e5d9c47990",
+  "prompts": {},
+  "sessions": {
+    "s_3d949abe53b900": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "92f2c43c-22c8-4f1d-8b27-d06d6f3c59ad",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
