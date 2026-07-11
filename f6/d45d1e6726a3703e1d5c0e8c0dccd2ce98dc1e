@@ -1,0 +1,21 @@
+docs/experience/wins/2026-07-12-max-prompt-tokens-ceiling-145.md
+  s_247944b2ba72de::t_980f0c9b2f1f30 1-39
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "f6d45d1e6726a3703e1d5c0e8c0dccd2ce98dc1e",
+  "prompts": {},
+  "sessions": {
+    "s_247944b2ba72de": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f521f-363f-7b02-b2be-59256eeb91d2",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
