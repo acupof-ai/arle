@@ -2152,9 +2152,19 @@ fn emit_kernel_build_identity(out_dir: &Path, prebuilt_dir: Option<&Path>) {
             format!("bundle:{hash}")
         },
     );
+    // Which linked kernel set this build carries. `dsv4_flash`/`opd_gdr` stub the
+    // Qwen/GDR TileLang attention FFI, so a Qwen serve must reject anything but
+    // `full` at model load instead of dying on the first forward (#161).
+    let kernel_set = match KernelSet::from_env() {
+        KernelSet::Full => "full",
+        KernelSet::Dsv4Flash => "dsv4_flash",
+        KernelSet::OpdGdr => "opd_gdr",
+    };
     std::fs::write(
         out_dir.join("kernel_build_identity.rs"),
-        format!("pub const KERNEL_BUILD_ID: &str = {id:?};\n"),
+        format!(
+            "pub const KERNEL_BUILD_ID: &str = {id:?};\npub const KERNEL_SET: &str = {kernel_set:?};\n"
+        ),
     )
     .expect("write kernel build identity");
 }
