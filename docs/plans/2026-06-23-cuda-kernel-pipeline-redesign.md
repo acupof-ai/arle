@@ -1,6 +1,10 @@
 # CUDA kernel pipeline — first-principles redesign (registry-driven, prebuilt-release)
 
 Status: design locked, execution pending (pod-verified tranches).
+Kernel-set axis SUPERSEDED 2026-07-11: the `full/dsv4/opd` partition (and the
+`ARLE_CUDA_KERNEL_SET`→cargo-feature row + `<kernel-set × SM>` release scheme
+below) was DELETED — one binary builds every kernel, releases key on SM only. See
+`wins/2026-07-11-unified-kernel-set-one-binary-qwen-and-dsv4.md`.
 Frame: this is **our own code** — redesign to best-in-class, not a deletion cleanup.
 Only dead/vendored cruft (`vendor/tilekernels`) is deleted.
 
@@ -74,9 +78,9 @@ The prebuilt path already exists: `ARLE_CUDA_KERNELS_PREBUILT_DIR` →
 entirely. Promote it to primary:
 
 - **Consume (default, serving/offline):** auto-detect a conventional path
-  (`target/kernel-cache/<kernel-set>-<sm-set>/` or `crates/cuda-kernels/prebuilt/`);
+  (`target/kernel-cache/<sm-set>/` or `crates/cuda-kernels/prebuilt/`);
   if the two archives are present, link them. **No env.** Archives are published as
-  a versioned release per (kernel-set × SM); offline pods get them via `tn push`
+  a versioned release per SM (no kernel-set axis, deleted 2026-07-11); offline pods get them via `tn push`
   into the conventional dir — same local-fed path already trusted for deps.
 - **Produce (kernel-dev / CI, on a GPU box):** auto-detected TileLang/Python regen
   → nvcc → the two archives → uploaded as the next release. No committed binaries.
@@ -100,7 +104,7 @@ the serving box — ARLE deliberately chose AOT; Git LFS needs an LFS pull on cl
 | `ARLE_TILELANG_REGEN` | force regen | **deleted** — auto-regen when archive/cubin absent or `kernels.toml` row's src-hash mismatches |
 | `INFER_TILELANG_PYTHON` | pick python | auto (`find_tilelang_python` exists); optional override only |
 | `TORCH_CUDA_ARCH_LIST` / `CMAKE_CUDA_ARCHITECTURES` | pick SM | auto (`sm_targets_from_nvidia_smi` exists); optional override only |
-| `ARLE_CUDA_KERNEL_SET` | full/dsv4/opd | **→ cargo feature** (`kernels-dsv4`, `kernels-opd-gdr`) |
+| `ARLE_CUDA_KERNEL_SET` | ~~full/dsv4/opd~~ | **DELETED 2026-07-11** — no per-model partition; one binary builds all kernels |
 | `ARLE_CUDA_KERNELS_PREBUILT_DIR` | prebuilt selector | auto-detect conventional path; optional override only |
 
 Required env after: **0**. The many `ARLE_CUDA_ENABLE/DISABLE_*` kernel toggles
