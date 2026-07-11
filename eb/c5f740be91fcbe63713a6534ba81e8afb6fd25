@@ -1,0 +1,21 @@
+docs/experience/wins/2026-07-12-quantized-gemv-consolidation-144.md
+  s_6c10e3a3628936::t_6c51a0c57e1e5f 1-56
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "ebc5f740be91fcbe63713a6534ba81e8afb6fd25",
+  "prompts": {},
+  "sessions": {
+    "s_6c10e3a3628936": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d79ef61e-503a-41eb-8cd2-6ddea3068ced",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
