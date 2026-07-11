@@ -1,0 +1,23 @@
+docs/experience/errors/2026-07-11-fp8-probe-numeric-gate-4-iters.md
+  s_89390f18fb950a::t_3ceee0969e69fa 27-29,39-42
+docs/experience/wins/2026-07-10-operator-evidence-vertical-slice.md
+  s_89390f18fb950a::t_dff695ab43d02e 7-10,66-68,80
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "f522ce7829e7a496bafaa1ae4b9c54f5fb39b168",
+  "prompts": {},
+  "sessions": {
+    "s_89390f18fb950a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f49f6-caaa-7600-bc7e-b25ce5c6da1b",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
