@@ -934,6 +934,25 @@ fn fused_linear_pg_loss_indexed_device(
                 -(advantage * gate)
             })
             .collect();
+        // DIS off-policy diagnostics (env-gated → zero prod cost). KL(πθ‖π_rollout)
+        // via Schulman k3 E[r−1−ln r] (≥0, low-variance); clip = hard-mask reject rate.
+        if std::env::var("ARLE_OPD_LOG_DIS_STATS").is_ok() {
+            let (mut kl, mut clipped) = (0.0_f64, 0_usize);
+            for (offset, &logp) in gathered_logp.iter().enumerate() {
+                let d = f64::from(logp - rollout_logprobs[chunk_start + offset]);
+                let r = d.exp();
+                kl += r - 1.0 - d;
+                if !((1.0 - f64::from(eps_low)) < r && r < (1.0 + f64::from(eps_high))) {
+                    clipped += 1;
+                }
+            }
+            let n = gathered_logp.len().max(1);
+            eprintln!(
+                "[dis-stats] adv={advantage:.4} kl={:.4e} clip_frac={:.3} tokens={n}",
+                kl / n as f64,
+                clipped as f64 / n as f64,
+            );
+        }
         let neg_w_id = store.from_slice(&neg_w, &[chunk_len])?;
         // gather_last_dim can return [chunk_len, 1]; flatten to rank-1 so the
         // per-position weight mul (and its backward) stays rank-1 — otherwise the
