@@ -54,7 +54,9 @@ use crate::{
 #[cfg(feature = "cuda")]
 use crate::{infer_student::InferStudent, lora::LoraConfig};
 use autograd::ops::{
-    add, fused_linear_distill::fused_linear_ce_loss_indexed, matmul_bt, mul_scalar, reshape, slice,
+    add, embedding,
+    fused_linear_distill::{fused_linear_ce_loss_indexed, fused_linear_pg_loss_indexed},
+    gather_last_dim, log_softmax, matmul_bt, mul_scalar, reshape, slice,
 };
 
 /// Routes the OPD rollout through the in-process infer engine (`InferStudent`)
@@ -2988,7 +2990,59 @@ fn trim_memory_pool_for_writeback(store: &TensorStore, scope: &str) -> Result<Op
     maybe_trim_after_writeback(store, scope)
 }
 
+/// Per-token loss the shared masked-writeback skeleton applies. `Ce` is the
+/// byte-identical rejection-sampling default; `Dis` is SAO Phase 1 (per-token PG
+/// with a clipped importance-ratio gate). Only the single fused-loss call
+/// branches on this — forward / backward / optimizer / offload are shared.
+pub enum WritebackLoss<'a> {
+    Ce,
+    Dis {
+        /// π_rollout per masked target position, same order as the fused ops.
+        rollout_logprobs: &'a [f32],
+        advantage: f32,
+        eps_low: f32,
+        eps_high: f32,
+    },
+}
+
+/// Thin byte-identical wrapper over [`masked_writeback_step`] for the default
+/// rejection-sampling CE path — public API + behavior unchanged.
 pub fn masked_writeback_ce_step<O: Optimizer>(
+    student: &Qwen35Model,
+    all_model_params: &[TensorId],
+    trainable_params: &[TensorId],
+    optimizer: &mut O,
+    prompt_ids: &[u32],
+    response_ids: &[u32],
+    response_mask: &[u8],
+    vocab: usize,
+    window_size: usize,
+    store: &mut TensorStore,
+) -> Result<f32> {
+    masked_writeback_step(
+        WritebackLoss::Ce,
+        student,
+        all_model_params,
+        trainable_params,
+        optimizer,
+        prompt_ids,
+        response_ids,
+        response_mask,
+        vocab,
+        window_size,
+        store,
+    )
+}
+
+/// Shared masked single-trajectory writeback skeleton: ONE checkpointed forward
+/// over `prompt ++ response` → hidden states, then a CHUNKED fused loss on the
+/// masked (LLM-generated) positions that never materializes `[seq, vocab]`. Only
+/// the fused-loss call branches on `loss_kind` (CE vs DIS); everything else —
+/// forward, backward, optimizer step, seq-adaptive offload, VRAM logging — is
+/// shared. See [`masked_writeback_ce_step`] for the CE-path rationale.
+#[allow(clippy::too_many_arguments)]
+pub fn masked_writeback_step<O: Optimizer>(
+    loss_kind: WritebackLoss,
     student: &Qwen35Model,
     all_model_params: &[TensorId],
     trainable_params: &[TensorId],
@@ -3088,15 +3142,43 @@ pub fn masked_writeback_ce_step<O: Optimizer>(
     // is already the mean CE per masked token and the gradient is scaled by 1/N,
     // so backward (seed 1.0) applies the per-token-mean update directly.
     let t_ce = Instant::now();
-    let loss = fused_linear_ce_loss_indexed(
-        hidden,
-        student.lm_head_weight_id(),
-        &position_indices,
-        &target_tokens,
-        chunk_rows,
-        store,
-        &mut tape,
-    )
+    let loss = match loss_kind {
+        WritebackLoss::Ce => fused_linear_ce_loss_indexed(
+            hidden,
+            student.lm_head_weight_id(),
+            &position_indices,
+            &target_tokens,
+            chunk_rows,
+            store,
+            &mut tape,
+        ),
+        WritebackLoss::Dis {
+            rollout_logprobs,
+            advantage,
+            eps_low,
+            eps_high,
+        } => {
+            if rollout_logprobs.len() != total_targets {
+                return Err(OpdError::InvalidInput(format!(
+                    "masked writeback DIS rollout_logprobs len {} != masked targets {total_targets}",
+                    rollout_logprobs.len(),
+                )));
+            }
+            fused_linear_pg_loss_indexed(
+                hidden,
+                student.lm_head_weight_id(),
+                &position_indices,
+                &target_tokens,
+                rollout_logprobs,
+                advantage,
+                eps_low,
+                eps_high,
+                chunk_rows,
+                store,
+                &mut tape,
+            )
+        }
+    }
     .map_err(OpdError::from)?;
 
     let loss_value = store.to_host(loss).map_err(OpdError::from)?[0];
@@ -3128,6 +3210,72 @@ pub fn masked_writeback_ce_step<O: Optimizer>(
     eprintln!("[masked-writeback] DONE loss={loss_value:.6} total_targets={total_targets}");
     // Mean CE per masked token (the fused loss already applied the 1/N mean).
     Ok(loss_value)
+}
+
+/// Positions per `[rows, vocab]` logits tile in [`capture_rollout_logprobs`];
+/// bounds the transient softmax tile (≈ rows·vocab·4 B) since the capture has no
+/// `window_size` knob of its own.
+const CAPTURE_LOGPROB_CHUNK_ROWS: usize = 256;
+
+/// Capture π_rollout: `log_softmax(logits)[target]` at each masked
+/// (LLM-generated) response position, in the SAME order the fused writeback ops
+/// consume (`build_masked_loss_targets`). Tape-OFF forward over `prompt ++
+/// response` — call BEFORE any optimizer step so θ is still the rollout policy
+/// (V0). Returns one f32 per masked target position (empty if none).
+pub fn capture_rollout_logprobs(
+    student: &Qwen35Model,
+    prompt_ids: &[u32],
+    response_ids: &[u32],
+    response_mask: &[u8],
+    store: &mut TensorStore,
+) -> Result<Vec<f32>> {
+    if prompt_ids.is_empty() {
+        return Err(OpdError::InvalidInput(
+            "capture_rollout_logprobs requires a non-empty prompt".to_owned(),
+        ));
+    }
+    let prompt_len = prompt_ids.len();
+    let full: Vec<u32> = prompt_ids
+        .iter()
+        .copied()
+        .chain(response_ids.iter().copied())
+        .collect();
+    let seq_len = full.len();
+    let loss_targets = build_masked_loss_targets(&full, prompt_len, response_mask);
+    if loss_targets.is_empty() {
+        return Ok(Vec::new());
+    }
+    let positions: Vec<u32> = (0..seq_len as u32).collect();
+
+    // Tape OFF: π_rollout is a frozen reference — no checkpoint, no gradient.
+    let mut tape = Tape::new();
+    tape.set_enabled(false);
+    let hidden = student
+        .forward_hidden_states(store, &mut tape, &full, &positions)
+        .map_err(|err| map_qwen35_forward_error("rollout-logprob student hidden", err))?;
+    let hidden_dim = *store
+        .get(hidden)
+        .ok_or(AutogradError::InvalidTensorId(hidden))?
+        .shape
+        .last()
+        .ok_or_else(|| OpdError::InvalidInput("rollout-logprob: empty hidden shape".to_owned()))?;
+    let hidden_2d =
+        reshape(hidden, &[seq_len, hidden_dim], store, &mut tape).map_err(OpdError::from)?;
+    let lm_head = student.lm_head_weight_id();
+
+    let mut logprobs = Vec::with_capacity(loss_targets.len());
+    for chunk in loss_targets.chunks(CAPTURE_LOGPROB_CHUNK_ROWS) {
+        let rows: Vec<usize> = chunk.iter().map(|&(p, _)| p).collect();
+        let targets: Vec<usize> = chunk.iter().map(|&(_, t)| t).collect();
+        // Gather this chunk's hidden rows, project through lm_head, log-softmax,
+        // then pick each row's target logprob. Never materializes [seq, vocab].
+        let rows_hidden = embedding(hidden_2d, &rows, store, &mut tape).map_err(OpdError::from)?;
+        let logits = matmul_bt(rows_hidden, lm_head, store, &mut tape).map_err(OpdError::from)?;
+        let logp = log_softmax(logits, store, &mut tape).map_err(OpdError::from)?;
+        let gathered = gather_last_dim(logp, &targets, store, &mut tape).map_err(OpdError::from)?;
+        logprobs.extend_from_slice(&store.to_host(gathered).map_err(OpdError::from)?);
+    }
+    Ok(logprobs)
 }
 
 /// Frozen-prompt-KV variant of `masked_writeback_ce_step`: forwards + backwards
