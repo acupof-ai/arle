@@ -38,12 +38,32 @@ H20 sm_90 verification:
   the raw drop is box contention, not the merge. Functors inline → same SASS.
   Clean idle-box A/B deferred to the end of #144.
 
-## Remaining increments (order)
+## Increment 2 (2026-07-12, `90de21f0e`) — fp8 single-output batch pair — VERIFIED
 
-2. fp8 block single-output pair (`dsv4_fp8_gemv_batch_kernel` + `fp8_f32_block_gemv_batch_kernel`) — reuses the Increment-1 functors. ~−55 lines.
-3. wNa16 w2/w4/w8 single+batch (6 kernels) → `template<class UnpackFn>` + wrappers. ~−150 lines.
-4. fp4 route/grouped (4 kernels) → `template<class ScaleFn, class RowFn>`. ~−130 lines. Higher risk (route_meta + ptr-table).
-5. (optional) pair dual-output wrappers.
+Merged `dsv4_fp8_gemv_batch_kernel` + `fp8_f32_block_gemv_batch_kernel` (the B==1
+single-output path) into `template<class ScaleFn> fp8_gemv_batch_kernel`, reusing
+the Increment-1 functors. **−62 lines** (cumulative −147). H20 sm_90: compile PASS
+(`BUILD_EXIT=0`, nccl present), correctness PASS (Qwen3.6-27B-FP8 needle 9/9 exact
+115→8000, samples ` Paris.`/` Tokyo.`, zero garbage). Both fp8 increments green.
+
+**fp8 hot-path consolidation (the #144 core) is done: 4 kernels → 2 templated
+bodies, −147 lines, the 52%-of-decode FP8 GEMV path, correctness double-verified.**
+
+## Remaining increments — DEFERRED (lower ROI / higher risk)
+
+The fp8 merges were byte-identical duplicates on the hot path — clear wins. The
+rest are marginal and left as follow-ups:
+
+3. wNa16 w2/w4/w8 single+batch (6 kernels) — NOT byte-identical: each bit width's
+   unpack core differs (w8 4/word, w4 8/word+zp8, w2 16/word+zp2). Cross-bit-width
+   `UnpackFn` is a fragile abstraction, and wNa16 is the weight-only/GGUF cold path,
+   not FP8 decode. Marginal line savings for real risk on a kernel I can't compile
+   locally. If done, do the safe single+batch merge per bit width only.
+4. fp4 route/grouped (4 kernels) — higher risk (route_meta + ptr-table indirection),
+   also off the FP8 hot path.
+
+A clean idle-box perf A/B for the fp8 merges (inc 1+2) is still owed once the box
+is uncontended.
 
 ## Rule
 
