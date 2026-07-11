@@ -93,6 +93,32 @@ no-spec vs native-MTP vs DSpark, agent-shape c-sweep {1,4,8,16}. Correct-
 inference gate + Δ% per metric. Target: DeepSeek's 1.6–1.85× per-user; license
 the default flip only if it clears TTFT·TPOT·throughput on ≥2 binding shapes.
 
+## P1 implementation spec (file:line reuse map — copy-ready)
+
+Confirmed against the DSv4 native-MTP forward (`dsv4.rs`):
+- `Dsv4MtpLayer` (`dsv4.rs:370`): `layer: Dsv4Layer` (MLA+MoE+HC) reused AS-IS for
+  the draft backbone. DSpark flavor swaps the fusion tensors: drop
+  `enorm/hnorm/e_proj/h_proj`, add `main_proj: DeviceMatrix` (`[hidden, 3*hidden]`)
+  + `main_norm: DeviceVec` + `markov: Option<..>` + `confidence: Option<..>` +
+  `target_layer_ids: [40,41,42]`. Load `mtp.0.{attn,ffn,hc_*}` identically.
+- `mtp_forward_level` (`dsv4.rs:5909`) is the template. Native fusion (5947–6004):
+  `stream = e_proj(enorm(emb(tok))) + h_proj(hnorm(h_prev))` via
+  `dsv4_mtp_add_eproj_hproj_cuda`. DSpark fusion: `stream = main_norm(main_proj(
+  concat(tap40,tap41,tap42)))` combined with `noise_embed = embed(noise_ids)` —
+  one new fuse kernel (analogous to the add kernel), over the block-5 positions.
+- Draft driving: native runs m separate draft rows at one position; DSpark runs
+  ONE non-causal block of `block_size=5` positions (mask = block sees itself +
+  trunk ctx). Reuse the `Dsv4Layer` forward with a non-causal block mask.
+- Markov + confidence: port the procedure from `qwen35/dspark.rs`
+  (`markov_w2·markov_w1[prev]` L→R, `sigmoid(conf)<thr` → confident-prefix len)
+  into a shared target-independent module — both backends call it.
+- Verify/rollback: reuse `forward_tokens_verify` (`dsv4.rs:2453`) + `capture_spec_rings`/
+  `restore_spec_ring_tail` (`dsv4.rs:1072/1098`) — they already verify a
+  multi-token chain + roll back on partial accept; a 5-block is a chain of 5.
+- Tap exposure: native taps 1 trunk layer (`mtp_frozen_target_layer_idx`,
+  `dsv4.rs:6337`); DSpark needs the trunk forward to expose hidden at [40,41,42]
+  — extend the single-tap capture to 3.
+
 ## Risks (named, not priced)
 
 - **EP=8 draft MoE**: mtp.0's 256-expert MoE must shard across the same EP split
