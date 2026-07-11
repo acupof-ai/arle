@@ -645,8 +645,16 @@ pub fn cuda_qwen35_engine_from_model_path(
     // mem_fraction_static 0.9 (the serve default): the full-attn KV is a shared
     // profile-sized paged pool; the host CudaKvPool below admits the requested
     // `total_pages` (a valid subset of the profiled device pool ≥ admission floor).
-    let executor =
-        infer_cuda::CudaExecutor::from_qwen35_safetensors(model_path, 1, total_pages, 0.9)?;
+    let executor = infer_cuda::CudaExecutor::from_qwen35_safetensors(
+        model_path,
+        1,
+        total_pages,
+        config.max_total_tokens,
+        infer_cuda::CudaKvCacheDtype::Bf16,
+        0.9,
+        None,
+        0.0,
+    )?;
     let engine = Engine::with_config(
         executor,
         infer_cuda::CudaKvPool::new(1, total_pages, 16),
