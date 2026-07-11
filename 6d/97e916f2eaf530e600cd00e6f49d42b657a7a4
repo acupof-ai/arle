@@ -1,0 +1,23 @@
+docs/plans/2026-06-23-cuda-kernel-pipeline-redesign.md
+  s_7654d02f396848::t_a41e859c9e5234 4-7,81,83,107
+docs/reviews/2026-07-10-operator-platform-m0-readonly-audit.md
+  s_7654d02f396848::t_389e9e18c6a8bd 130,132-134
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "6d97e916f2eaf530e600cd00e6f49d42b657a7a4",
+  "prompts": {},
+  "sessions": {
+    "s_7654d02f396848": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a84c488fdec8f3e2c",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
