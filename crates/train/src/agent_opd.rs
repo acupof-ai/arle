@@ -139,6 +139,7 @@ mod cuda_rollout {
         SandboxToolExecutor, boot_workdir, diff_workdir, reset_workdir, score_workdir,
     };
     use crate::swe_dataset::{SweTask, agent_system_prompt, agent_user_prompt};
+    use crate::update_strategy::{ScoredTrajectory, UpdateStrategy};
 
     /// A no-op [`ToolPolicy`]: the trained student emits proper tool calls, so
     /// the deterministic recovery / repair hooks stay off (all trait defaults).
@@ -200,6 +201,9 @@ mod cuda_rollout {
         pub bash_timeout_secs: u64,
         /// Test-run timeout (seconds).
         pub test_timeout_secs: u64,
+        /// Pluggable policy-update algorithm (`--update-strategy`). Drives
+        /// trajectory collection (keep-failing?) and the writeback call.
+        pub update_strategy: UpdateStrategy,
     }
 
     /// One round's roll-up.
@@ -381,25 +385,33 @@ mod cuda_rollout {
 
     /// Run the agent-OPD loop. `tasks` pairs each [`SweTask`] with the directory
     /// holding its repo already checked out at `base_commit` (the staged tree).
-    /// `train_on_accepted` performs ONE masked-CE writeback step on a single
-    /// accepted trajectory `(prompt_ids, response_ids, response_mask)` and
-    /// returns the mean CE per masked token — the caller wires
-    /// [`crate::opd::masked_writeback_ce_step`].
+    /// `update_batch` applies the round's policy update over the whole scored
+    /// batch and returns the mean per-trajectory loss — the caller wires
+    /// [`crate::update_strategy::UpdateStrategy::update`] (which for
+    /// [`crate::update_strategy::UpdateStrategy::SaoDis`] first captures
+    /// π_rollout via [`crate::opd::capture_rollout_logprobs`], θ still at V0).
+    /// Batch-level (not per-trajectory) because advantage centering + the
+    /// pre-update logprob capture are batch-scoped.
     ///
     /// Runs ONE round (mirroring `run_rubric_rounds` called with `rounds=1`):
     /// the caller loops over rounds and performs the LoRA→rollout-engine sync
-    /// between calls, because the sync and `train_on_accepted` both need
+    /// between calls, because the sync and `update_batch` both need
     /// `&mut store` and cannot be live simultaneously.
+    ///
+    /// `cfg.update_strategy.needs()` drives collection: `keep_failing` decides
+    /// whether failing rollouts join the batch (SAO advantage needs the 0-reward
+    /// arm), else passing-only (the byte-identical rejection-CE default).
     pub fn run_agentic_opd_round<T>(
         student: &InferStudent,
         tasks: &[(SweTask, PathBuf)],
         cfg: &AgentOpdConfig,
         round: usize,
-        mut train_on_accepted: T,
+        mut update_batch: T,
     ) -> Result<AgentRoundReport>
     where
-        T: FnMut(&[u32], &[u32], &[u8]) -> Result<f32>,
+        T: FnMut(&[ScoredTrajectory]) -> Result<f32>,
     {
+        let needs = cfg.update_strategy.needs();
         let tool_defs = coding_tools();
         let policy = NoPolicy;
         let settings = AgentSettings {
@@ -414,9 +426,7 @@ mod cuda_rollout {
             // verl-style record `(prompt_ids, response_ids, response_mask)` and
             // train each whole trajectory once (windowed), instead of exploding
             // into O(N²) per-turn `(prefix, completion)` pairs.
-            let mut accepted_trajectories: Vec<(Vec<u32>, Vec<u32>, Vec<u8>)> = Vec::new();
-            let mut loss_sum = 0.0f32;
-            let mut loss_steps = 0usize;
+            let mut accepted_trajectories: Vec<ScoredTrajectory> = Vec::new();
 
             for (task, staged_tree) in tasks {
                 report.tasks += 1;
@@ -597,30 +607,39 @@ mod cuda_rollout {
                             false
                         }
                     };
-                    if !passed {
+                    if passed {
+                        report.passed += 1;
+                        if rescue {
+                            report.rescue_passed += 1;
+                        }
+                        distinct_passed_this_task += 1;
+                    }
+                    // Collect passing always; failing only when the strategy needs
+                    // the 0-reward arm (SAO advantage). Reward = execution signal.
+                    if !passed && !needs.keep_failing {
                         continue;
                     }
-                    report.passed += 1;
-                    if rescue {
-                        report.rescue_passed += 1;
-                    }
-                    distinct_passed_this_task += 1;
-
                     match &result.tokens {
                         Some(tok) => {
-                            accepted_trajectories.push((
-                                tok.prompt_ids.clone(),
-                                tok.response_ids.clone(),
-                                tok.response_mask.clone(),
-                            ));
+                            accepted_trajectories.push(ScoredTrajectory {
+                                prompt_ids: tok.prompt_ids.clone(),
+                                response_ids: tok.response_ids.clone(),
+                                response_mask: tok.response_mask.clone(),
+                                reward: if passed { 1.0 } else { 0.0 },
+                                rollout_logprobs: None,
+                            });
                         }
                         None => {
-                            report.no_token_record += 1;
-                            eprintln!(
-                                "[agent-opd] {} sample {sample}: PASSED but no token record — \
-                                 skipped writeback (engine did not populate tokens)",
-                                task.instance_id
-                            );
+                            // Only passing rollouts warn: a dropped pass is a lost
+                            // training signal; a dropped fail is inert.
+                            if passed {
+                                report.no_token_record += 1;
+                                eprintln!(
+                                    "[agent-opd] {} sample {sample}: PASSED but no token record — \
+                                     skipped writeback (engine did not populate tokens)",
+                                    task.instance_id
+                                );
+                            }
                         }
                     }
                 }
@@ -636,21 +655,16 @@ mod cuda_rollout {
             }
             report.trained_pairs = accepted_trajectories.len();
 
-            for (prompt_ids, response_ids, response_mask) in &accepted_trajectories {
-                // `train_on_accepted` = scratch/KV release + masked-CE forward +
-                // backward + optimizer step (one accepted trajectory). GPU-bound; the
-                // loss D2H forces a device sync so the wall is GPU-inclusive.
-                let loss = aopd_profile::time_try("writeback", aopd_profile::GPU, || {
-                    train_on_accepted(prompt_ids, response_ids, response_mask)
-                })
-                .with_context(|| format!("masked CE writeback (round {round})"))?;
-                loss_sum += loss;
-                loss_steps += 1;
-            }
-            report.mean_train_loss = if loss_steps > 0 {
-                loss_sum / loss_steps as f32
-            } else {
+            // ONE strategy update over the whole scored batch: scratch/KV release +
+            // (SAO) π_rollout capture + per-trajectory masked writeback + optimizer
+            // step. GPU-bound; the loss D2H forces a device sync (GPU-inclusive wall).
+            report.mean_train_loss = if accepted_trajectories.is_empty() {
                 0.0
+            } else {
+                aopd_profile::time_try("writeback", aopd_profile::GPU, || {
+                    update_batch(&accepted_trajectories)
+                })
+                .with_context(|| format!("policy update (round {round})"))?
             };
 
             eprintln!(
