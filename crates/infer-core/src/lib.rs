@@ -2080,14 +2080,14 @@ mod testing {
     /// `SamplingParams` and logical position supplied by each plan row.
     #[derive(Debug, Clone)]
     pub(super) struct SamplingExecutor {
-        logits: std::rc::Rc<Vec<f32>>,
+        logits: std::rc::Rc<[f32]>,
         observed: std::rc::Rc<std::cell::RefCell<Vec<(usize, u64, SamplingParams)>>>,
     }
 
     impl SamplingExecutor {
         pub(super) fn new(logits: Vec<f32>) -> Self {
             Self {
-                logits: std::rc::Rc::new(logits),
+                logits: std::rc::Rc::from(logits),
                 observed: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
             }
         }
@@ -3129,7 +3129,7 @@ mod tests {
             "both sealed prompt blocks swapped to the host tier: {tier:?}"
         );
         assert!(
-            engine.executor.demote_batches.iter().any(|&n| n == 2),
+            engine.executor.demote_batches.contains(&2),
             "prompt pages should demote through one mset batch: {:?}",
             engine.executor.demote_batches
         );
@@ -3146,7 +3146,7 @@ mod tests {
         assert!(kv_system.promote_mget_copy_bytes >= 32, "{kv_system:?}");
         assert!(kv_system.reuse_hit_host_demoted >= 1, "{kv_system:?}");
         assert!(
-            engine.executor.promote_batches.iter().any(|&n| n == 2),
+            engine.executor.promote_batches.contains(&2),
             "prompt pages should promote through one mget batch: {:?}",
             engine.executor.promote_batches
         );
@@ -4677,10 +4677,10 @@ mod tests {
         let mut prefilling_positions = Vec::new();
         for _ in 0..6 {
             engine.step()?;
-            if let Some(request) = engine.active.values().next() {
-                if matches!(request.phase, RequestPhase::Prefilling { .. }) {
-                    prefilling_positions.push(request.prefill_start_pos);
-                }
+            if let Some(request) = engine.active.values().next()
+                && matches!(request.phase, RequestPhase::Prefilling { .. })
+            {
+                prefilling_positions.push(request.prefill_start_pos);
             }
         }
         // The chunk landed on page boundary 8 (a Prefilling progress value).
@@ -4711,10 +4711,10 @@ mod tests {
         let mut prefilling_positions = Vec::new();
         for _ in 0..8 {
             engine.step()?;
-            if let Some(request) = engine.active.values().next() {
-                if matches!(request.phase, RequestPhase::Prefilling { .. }) {
-                    prefilling_positions.push(request.prefill_start_pos);
-                }
+            if let Some(request) = engine.active.values().next()
+                && matches!(request.phase, RequestPhase::Prefilling { .. })
+            {
+                prefilling_positions.push(request.prefill_start_pos);
             }
         }
         assert!(
@@ -4739,10 +4739,10 @@ mod tests {
         let mut prefill_start_positions = Vec::new();
         for _ in 0..6 {
             engine.step()?;
-            if let Some(request) = engine.active.values().next() {
-                if matches!(request.phase, RequestPhase::Prefilling { .. }) {
-                    prefill_start_positions.push(request.prefill_start_pos);
-                }
+            if let Some(request) = engine.active.values().next()
+                && matches!(request.phase, RequestPhase::Prefilling { .. })
+            {
+                prefill_start_positions.push(request.prefill_start_pos);
             }
         }
         // start_pos advances in chunk-sized steps (0 -> 2 -> 4) across ticks,
