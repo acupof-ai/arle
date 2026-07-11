@@ -77,11 +77,13 @@ prefills serialize on one GPU — expected single-GPU scaling, not a fault.
 1. **Pod default `dsv4_flash` kernel set cannot serve Qwen.** Non-DSv4 TileLang
    symbols link `CUDA_ERROR_NOT_SUPPORTED` stubs → engine thread dies on the
    first Qwen forward. A Qwen serve/bench must build `ARLE_CUDA_KERNEL_SET=full`.
+   Tracked: cklxx/arle#161.
 2. **Canonical `sweep` profile crashes this model on one H20.** Its `throughput`
    strategy floods unbounded concurrency (observed 83 in-flight) → `TokenKVPool:
    out of pages` → lockstep loop closes fatally. Pre-existing engine gap (no
    KV-admission backpressure under exhaustion), not a regression from these
-   commits. Bounded `--concurrencies` fits the 21460-page pool. Worth a GH issue.
+   commits. Bounded `--concurrencies` fits the 21460-page pool. Tracked:
+   cklxx/arle#162.
 3. A crashed serve's arle child lingers holding ~50 GB after the wrapper `kill`,
    starving the next serve's KV pool — reap by exact PID between runs.
 
