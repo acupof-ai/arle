@@ -1,0 +1,23 @@
+crates/train/src/grad_clip.rs
+  s_9c91b86ec3fb55::t_b9873fd650c534 11
+crates/train/src/opd.rs
+  s_9c91b86ec3fb55::t_125501b2881412 3192-3198,3278-3286,3303-3310
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "a9f1d383453dc286ea726f63aad5e58bfa3a5321",
+  "prompts": {},
+  "sessions": {
+    "s_9c91b86ec3fb55": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4779911a-69b7-49db-bc83-daf5a48d6ca3",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
