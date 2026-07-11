@@ -593,7 +593,10 @@ pub fn diff_workdir(workdir: &Path) -> Result<String> {
 }
 
 /// Apply the hidden `test_patch` (skip if empty), then run the `fail_to_pass`
-/// tests. Returns `(passed, log_tail)`; `passed` is true iff pytest exits 0.
+/// tests. Returns `(reward, log_tail)` where `reward` is the partial-credit
+/// fraction of `fail_to_pass` tests that passed, in `[0.0, 1.0]`; `1.0` iff all
+/// `fail_to_pass` pass (⇔ pytest exit-0). Falls back to binary (exit-0 → 1.0)
+/// when the run is killed or the pytest summary can't be parsed.
 /// The test command runs under a Rust-enforced timeout (like `run_bash`).
 pub fn score_workdir(
     workdir: &Path,
@@ -601,7 +604,7 @@ pub fn score_workdir(
     fail_to_pass: &[String],
     pythonpath: Option<&str>,
     timeout_secs: u64,
-) -> Result<(bool, String)> {
+) -> Result<(f32, String)> {
     if !test_patch.trim().is_empty() {
         // The hidden test_patch is ground truth; the student must not be able to
         // block or skew scoring by editing the (hidden) test files it touches.
@@ -679,9 +682,53 @@ pub fn score_workdir(
 
     let (output, code, killed) = run_captured(command, Duration::from_secs(timeout_secs))
         .with_context(|| "failed to run pytest".to_string())?;
-    let passed = !killed && code == Some(0);
     let log_tail = format_bash_output(&output, &[], code, killed);
-    Ok((passed, log_tail))
+
+    // Partial-credit reward = passed / requested. Fall back to binary (exit-0 →
+    // 1.0) when killed or the summary is unparseable (collection crash / no tail
+    // line), so a timed-out or crashed run never mints spurious credit.
+    let reward = match parse_pytest_counts(&String::from_utf8_lossy(&output)) {
+        Some((passed, _)) if !killed => {
+            (passed as f32 / fail_to_pass.len().max(1) as f32).clamp(0.0, 1.0)
+        }
+        _ => {
+            if code == Some(0) {
+                1.0
+            } else {
+                0.0
+            }
+        }
+    };
+    Ok((reward, log_tail))
+}
+
+/// Parse the LAST pytest `-q` summary line (pytest prints it last) into
+/// `(passed, failed + errored)`. Robust to any subset of
+/// {passed, failed, error(s), skipped, xfailed}: e.g. `"3 passed, 2 failed in
+/// 0.4s"` → `(3, 2)`, `"2 passed, 1 error in 0.3s"` → `(2, 1)`. Returns `None`
+/// when no summary line is present (collection crash / empty output).
+fn parse_pytest_counts(text: &str) -> Option<(usize, usize)> {
+    let count_of = |line: &str, kind: &str| -> Option<usize> {
+        line.split(", ").find_map(|seg| {
+            let seg = seg.strip_prefix("= ").unwrap_or(seg);
+            let (n, rest) = seg.trim().split_once(' ')?;
+            // First word of `rest` is the status ("passed", "error", "in", ...).
+            let word = rest.split_whitespace().next()?;
+            (word == kind).then(|| n.parse().ok()).flatten()
+        })
+    };
+    for line in text.lines().rev() {
+        let passed = count_of(line, "passed");
+        let failed = count_of(line, "failed");
+        let errored = count_of(line, "error").or_else(|| count_of(line, "errors"));
+        if passed.is_some() || failed.is_some() || errored.is_some() {
+            return Some((
+                passed.unwrap_or(0),
+                failed.unwrap_or(0) + errored.unwrap_or(0),
+            ));
+        }
+    }
+    None
 }
 
 /// Discard the agent's edits + any applied `test_patch`, restoring the
@@ -739,6 +786,21 @@ mod tests {
         crate::spawner::TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[test]
+    fn parse_pytest_counts_reads_last_summary() {
+        assert_eq!(
+            parse_pytest_counts("3 passed, 2 failed in 0.4s"),
+            Some((3, 2))
+        );
+        assert_eq!(parse_pytest_counts("5 passed in 0.2s"), Some((5, 0)));
+        assert_eq!(parse_pytest_counts("1 failed in 0.1s"), Some((0, 1)));
+        assert_eq!(
+            parse_pytest_counts("2 passed, 1 error in 0.3s"),
+            Some((2, 1))
+        );
+        assert_eq!(parse_pytest_counts("collection crashed, no summary"), None);
     }
 
     #[test]
@@ -918,8 +980,9 @@ mod tests {
         .unwrap();
 
         let workdir = boot_workdir(work_root.path(), "inst_score", staged.path(), None).unwrap();
-        let (passed, log) =
+        let (reward, log) =
             score_workdir(&workdir, "", &["test_x.py::test_y".into()], None, 60).unwrap();
+        let passed = reward >= 1.0;
         assert!(!passed, "failing test must not pass; log: {log}");
     }
 
@@ -963,7 +1026,7 @@ mod tests {
 
         // Must NOT bail on apply (the reset makes it land), and the patched test
         // (assert False) then fails → passed=false.
-        let (passed, log) = score_workdir(
+        let (reward, log) = score_workdir(
             &workdir,
             test_patch,
             &["test_x.py::test_y".into()],
@@ -971,6 +1034,7 @@ mod tests {
             60,
         )
         .unwrap();
+        let passed = reward >= 1.0;
         assert!(
             !passed,
             "patched test asserts False → must fail; log: {log}"
