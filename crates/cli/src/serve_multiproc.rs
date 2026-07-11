@@ -395,7 +395,7 @@ fn run_lockstep_driver(
                 let operator_dispatch = engine.operator_dispatch_stats();
                 let artifact = engine.artifact_identity();
                 let data = WireStats {
-                    build_identity: infer_server::build_identity(artifact),
+                    build_identity: infer_api::build_identity(artifact),
                     active_requests: engine.active_count(),
                     queue_depth: engine.waiting_count(),
                     kv_free_pages: engine.kv_free_pages(),
