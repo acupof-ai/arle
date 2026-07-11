@@ -56,17 +56,25 @@ already the DSv4 MTP path.
 
 ## Phases (license-or-kill each)
 
-### P0 — Weights + contract (no engine code) — START NOW
-1. Download the 3 `mtp` shards (46–48-of-48, ~10 GB) + config + index via mirror
-   (`HF_ENDPOINT=https://hf-mirror.com`, `/resolve/main/` direct curl — the
-   mirror doesn't proxy `/api`). Do it ON THE POD (DSv4 is TP=8 there).
-2. **Verify frozen-body identity**: the DSpark body shards must match our
-   existing `/host/DeepSeek-V4-Flash` (byte/shape/hash on a sample). If they
-   match, we never download the 45 body shards. If they diverge → the base
-   revision differs (P0 kill → decide: re-download full 167 GB, or retrain).
-3. Extend `deepseek-spec` MTP contract with the DSpark-flavor tensor names
-   (`main_proj`/`main_norm` + optional `markov_head`/`confidence_head`), keyed by
-   config presence. Gate: names + shapes resolve against the 3 shards.
+### P0 — Weights + contract — DONE 2026-07-11 (path chosen: C, requant to fp8)
+1. Draft shard 46 (3.36 GB, complete `mtp.0` backbone: attn + main_proj + 256
+   experts + shared + router + hc + norms; markov/confidence in 47/48, still
+   downloading through a mirror outage) via `hf-mirror.com/resolve/`.
+2. **Frozen-body-identity = FALSE** (measured): DSpark is fp4-requantized — its
+   MoE experts are **MXFP4** (`I8 [2048,2048]`, group-32, E8M0 scale), our base
+   is fp8 (`F8_E4M3 [2048,4096]`). Divergent dtype AND shape → no drop-in. ckl
+   chose **option C**: requant the draft's experts → fp8, load as an all-fp8
+   `mtp.0` over our fp8 base (accept the fp4-trained / fp8-served hidden shift —
+   speculative-safe, measured by accept-rate).
+3. **Requant done + validated** (`scripts/requant_dspark_mxfp4_to_fp8.py`, manual
+   raw-byte safetensors I/O — the numpy framework can't materialize E8M0):
+   Frobenius **0.0000** (fp4 magnitudes {0,.5,1,1.5,2,3,4,6} ⊂ fp8 e4m3 + pow-2
+   scales ⇒ EXACT upcast, zero requant loss). Output `mtp0-fp8.safetensors`
+   (6.63 GB, all-fp8), experts F8_E4M3 [2048,4096] + F8_E8M0 [16,32] block-128 —
+   format-identical to base experts ⇒ loads on the existing `load_dsv4_moe_layer`
+   fp8 path. **C's only residual error is the hidden-state shift, not requant.**
+   (Our fp4 path is NVFP4 group-16, not MXFP4 — native fp4 load was out, which is
+   why requant-to-fp8 is the zero-new-kernel route.)
 
 ### P1 — DSpark draft backbone on DSv4 (`--spec-type dspark`, single flavor)
 Run `mtp.0` as a non-causal block-5 forward with the 3-tap `main_proj` fusion
