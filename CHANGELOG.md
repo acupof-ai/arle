@@ -25,6 +25,17 @@ lifecycle & progress spine).
 
 ### Verdicts
 
+- **2026-07-11 — DSpark draft-KV: cap full-layer at per-request ceiling** (Qwen3.6-27B,
+  CUDA, `1ee72d809`). The DFlash draft full-attention layer sized per-slot KV from the
+  128K KV-pool floor (`max_seq_len`), not `max_total_tokens` — 512 MB/slot, clamping
+  slots and blocking >4K prompts. Cap at `min(max_seq_len, max_total_tokens)`: lossless
+  (scheduler admits nothing longer). Pod-verified: draft/slot **544→64 MB** at
+  `--max-total-tokens 8192`, slots **32→256**, dspark tok-s/accept unchanged (2.49×/3.76×,
+  above the P1 anchors), 13K prompt now fits one slot. P2.5 prefix-restore partial-ctx
+  drafting was ALSO found already-implemented + verified holding (accept 0.18–0.22 on
+  prefix-hit turns, 100% partial-ctx chains, no plain-decode fallback).
+  [win](docs/experience/wins/2026-07-11-dspark-draft-kv-cap-per-request-ceiling.md).
+
 - **2026-07-11 — DSpark/DFlash block-draft spec-decode: P1 LICENSED** (Qwen3.6-27B,
   CUDA). z-lab DFlash backbone drafter (`--spec-type dspark`) nets **2.39× decode
   tok/s short-ctx / 3.14× at ~3K** vs no-spec on H20 TP=1, B=1 greedy, no-prefix-hit
