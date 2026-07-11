@@ -209,6 +209,15 @@ impl RealCudaExecutor {
         dspark_draft_model: Option<&Path>,
         dspark_conf_threshold: f32,
     ) -> Result<Self> {
+        // Qwen3.5/3.6 dense attention dispatches to TileLang paged prefill/decode
+        // kernels that `dsv4_flash`/`opd_gdr` builds stub with
+        // CUDA_ERROR_NOT_SUPPORTED. Fail loud at load, not on the first forward (#161).
+        anyhow::ensure!(
+            cuda_kernels::KERNEL_SET == "full",
+            "kernel set `{}` cannot serve a Qwen model: it stubs the Qwen TileLang \
+             attention FFI. Rebuild with ARLE_CUDA_KERNEL_SET=full.",
+            cuda_kernels::KERNEL_SET,
+        );
         Ok(Self::Qwen35(Box::new(
             Qwen35CudaExecutor::from_qwen35_safetensors(
                 model_path,
