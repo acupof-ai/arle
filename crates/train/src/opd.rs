@@ -3247,14 +3247,18 @@ pub fn capture_rollout_logprobs(
     }
     let positions: Vec<u32> = (0..seq_len as u32).collect();
 
-    // Snapshot live tensors so the tape-off forward + per-chunk projection
-    // intermediates (hidden, logits, logp, gathered) are reclaimed at the end —
-    // `to_host` copies but does not free them, so long trajectories would leak.
+    // Snapshot live tensors so the forward + per-chunk projection intermediates
+    // (hidden, logits, logp, gathered) + the tape's checkpoints are reclaimed at
+    // the end — `to_host` copies but does not free them, so trajectories leak.
     let keep_ids: HashSet<TensorId> = store.live_ids().into_iter().collect();
 
-    // Tape OFF: π_rollout is a frozen reference — no checkpoint, no gradient.
+    // Tape ENABLED (but never backwarded) so `should_checkpoint` engages and the
+    // forward frees per-layer activations instead of piling all 64 layers'
+    // [seq, hidden] resident — a tape-OFF forward has no checkpointing and OOMs on
+    // long trajectories atop the two resident 27B models. Checkpointing is
+    // numerically exact, so π_rollout is unchanged. Needs `--gradient-checkpointing`.
     let mut tape = Tape::new();
-    tape.set_enabled(false);
+    tape.set_enabled(true);
     let hidden = student
         .forward_hidden_states(store, &mut tape, &full, &positions)
         .map_err(|err| map_qwen35_forward_error("rollout-logprob student hidden", err))?;
