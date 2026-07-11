@@ -2188,6 +2188,11 @@ mod backend {
             self.engine.operator_dispatch_stats()
         }
 
+        /// Backend artifact identity for the coordinator `/v1/stats` relay.
+        pub fn artifact_identity(&self) -> infer_seam::BackendArtifactIdentity {
+            self.engine.artifact_identity()
+        }
+
         /// Active (running) request count.
         pub fn active_count(&self) -> usize {
             self.engine.active_count()
