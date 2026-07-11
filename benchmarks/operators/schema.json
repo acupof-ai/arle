@@ -32,14 +32,39 @@
     "product": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["binary_id", "bundle_id"],
+      "required": ["binary_id", "bundle_id", "bundle_id_source", "bundle_manifest_sha256"],
       "properties": {
-        "binary_id": { "type": "string", "minLength": 1 },
-        "bundle_id": { "type": "string", "minLength": 1 }
-      }
+        "binary_id": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+        "bundle_id": {
+          "type": ["string", "null"],
+          "pattern": "^bundle:[0-9a-f]{64}$"
+        },
+        "bundle_id_source": { "enum": ["verified_manifest", "unverified"] },
+        "bundle_manifest_sha256": {
+          "type": ["string", "null"],
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "bundle_id_source": { "const": "verified_manifest" } } },
+          "then": {
+            "properties": {
+              "bundle_id": { "type": "string" },
+              "bundle_manifest_sha256": { "type": "string" }
+            }
+          },
+          "else": {
+            "properties": {
+              "bundle_id": { "type": "null" },
+              "bundle_manifest_sha256": { "type": "null" }
+            }
+          }
+        }
+      ]
     },
     "operator_id": { "const": "qwen.fp8_dense_projection" },
-    "model_revision": { "type": "string", "minLength": 1 },
+    "model_revision": { "$ref": "#/$defs/modelRevision" },
     "hardware": {
       "type": "object",
       "additionalProperties": false,
@@ -75,14 +100,49 @@
     "e2e_gate": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["passed", "artifact_sha256"],
+      "required": ["status", "passed", "artifact_sha256", "model_revision"],
       "properties": {
+        "status": { "enum": ["passed", "failed", "not_run"] },
         "passed": { "type": "boolean" },
         "artifact_sha256": {
           "type": ["string", "null"],
           "pattern": "^[0-9a-f]{64}$"
+        },
+        "model_revision": {
+          "oneOf": [
+            { "$ref": "#/$defs/modelRevision" },
+            { "type": "null" }
+          ]
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "status": { "const": "not_run" } } },
+          "then": {
+            "properties": {
+              "passed": { "const": false },
+              "artifact_sha256": { "type": "null" },
+              "model_revision": { "type": "null" }
+            }
+          },
+          "else": {
+            "properties": {
+              "artifact_sha256": { "type": "string" },
+              "model_revision": {
+                "allOf": [
+                  { "$ref": "#/$defs/modelRevision" },
+                  { "properties": { "kind": { "const": "actual" } } }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "status": { "const": "passed" } } },
+          "then": { "properties": { "passed": { "const": true } } },
+          "else": { "properties": { "passed": { "const": false } } }
+        }
+      ]
     },
     "measurements": {
       "type": "array",
@@ -90,6 +150,15 @@
     }
   },
   "$defs": {
+    "modelRevision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "id"],
+      "properties": {
+        "kind": { "enum": ["actual", "synthetic", "unreported"] },
+        "id": { "type": "string", "minLength": 1 }
+      }
+    },
     "route": {
       "type": "object",
       "additionalProperties": false,

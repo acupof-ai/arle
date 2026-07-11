@@ -109,9 +109,15 @@ mod real {
         }
         let (commit, dirty) = git_source();
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-        let e2e_artifact_sha256 = std::env::var("ARLE_SMALLM_E2E_ARTIFACT")
-            .ok()
-            .and_then(|path| file_sha256(&path));
+        let e2e_status =
+            std::env::var("ARLE_SMALLM_E2E_STATUS").unwrap_or_else(|_| "not_run".to_string());
+        let e2e_artifact_sha256 = std::env::var("ARLE_SMALLM_E2E_ARTIFACT_SHA256").ok();
+        let e2e_model_revision = (e2e_status != "not_run").then(|| {
+            json!({
+                "kind": env_or_unreported("ARLE_SMALLM_E2E_MODEL_KIND"),
+                "id": env_or_unreported("ARLE_SMALLM_E2E_MODEL_REVISION"),
+            })
+        });
         let run_id = std::env::var("ARLE_SMALLM_RUN_ID")
             .unwrap_or_else(|_| format!("smallm-{}-{now}", &commit[..8.min(commit.len())]));
         let run = json!({
@@ -120,10 +126,16 @@ mod real {
             "source": { "commit": commit, "dirty": dirty },
             "product": {
                 "binary_id": env_or_unreported("ARLE_SMALLM_BINARY_ID"),
-                "bundle_id": env_or_unreported("ARLE_SMALLM_BUNDLE_ID"),
+                "bundle_id": std::env::var("ARLE_SMALLM_BUNDLE_ID").ok(),
+                "bundle_id_source": std::env::var("ARLE_SMALLM_BUNDLE_ID_SOURCE")
+                    .unwrap_or_else(|_| "unverified".to_string()),
+                "bundle_manifest_sha256": std::env::var("ARLE_SMALLM_BUNDLE_MANIFEST_SHA256").ok(),
             },
             "operator_id": "qwen.fp8_dense_projection",
-            "model_revision": env_or_unreported("ARLE_SMALLM_MODEL_REVISION"),
+            "model_revision": {
+                "kind": env_or_unreported("ARLE_SMALLM_MODEL_KIND"),
+                "id": env_or_unreported("ARLE_SMALLM_MODEL_REVISION"),
+            },
             "hardware": {
                 "gpu": ctx.ctx.name()?,
                 "sm_major": cc.0,
@@ -142,9 +154,10 @@ mod real {
                 "samples": samples,
             },
             "e2e_gate": {
-                "passed": e2e_artifact_sha256.is_some()
-                    && std::env::var("ARLE_SMALLM_E2E_PASS").as_deref() == Ok("1"),
+                "status": e2e_status,
+                "passed": std::env::var("ARLE_SMALLM_E2E_PASS").as_deref() == Ok("1"),
                 "artifact_sha256": e2e_artifact_sha256,
+                "model_revision": e2e_model_revision,
             },
             "measurements": measurements,
         });
@@ -516,24 +529,6 @@ mod real {
             .and_then(|output| output.lines().next_back().map(str::to_owned))
             .filter(|line| !line.is_empty())
             .unwrap_or_else(|| "unreported".to_string())
-    }
-
-    fn file_sha256(path: &str) -> Option<String> {
-        [
-            ("sha256sum", vec![path]),
-            ("shasum", vec!["-a", "256", path]),
-        ]
-        .into_iter()
-        .find_map(|(program, args)| {
-            Command::new(program)
-                .args(args)
-                .output()
-                .ok()
-                .filter(|output| output.status.success())
-                .and_then(|output| String::from_utf8(output.stdout).ok())
-                .and_then(|output| output.split_whitespace().next().map(str::to_owned))
-                .filter(|digest| digest.len() == 64)
-        })
     }
 
     fn cuda_driver_version() -> String {
