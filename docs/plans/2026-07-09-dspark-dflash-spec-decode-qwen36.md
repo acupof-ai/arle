@@ -1,12 +1,17 @@
 # Plan — DSpark/DFlash draft for Qwen3.6 spec decode (OPD rollout lever)
 
-> Status: Active — P0+P1 LICENSED 2026-07-11 · Driver: OPD rollout is
-> decode-bound (decode 80.4% of rollout wall, B=1 ~11 tok/s @45K). Native
-> NextN-MTP capped at 1.03×; **DSpark/DFlash backbone nets 2.39× (short) /
-> 3.14× (~3K ctx)** vs no-spec, greedy, no-prefix-hit
+> Status: Active — P0+P1 LICENSED, P2.5 + memory-clamp RESOLVED 2026-07-11 ·
+> Driver: OPD rollout is decode-bound (decode 80.4% of rollout wall, B=1 ~11
+> tok/s @45K). Native NextN-MTP capped at 1.03×; **DSpark/DFlash backbone nets
+> 2.4–3.8×** vs no-spec, greedy
 > ([P1 license](../experience/wins/2026-07-11-dspark-p1-license-qwen36-27b.md)).
-> Next lever = P2.5 (prefix-restore) + draft-KV memory clamp — both gate the
-> OPD rollout regime (91% hit, 20–45K ctx).
+> **P2.5 was already implemented** (`ctx_base`/`rebase` partial-ctx drafting) +
+> verified holding under prefix hit (accept 0.18–0.22, 100% partial-ctx chains).
+> **Draft-KV memory clamp fixed** (`1ee72d809`): full layer caps at
+> `min(max_seq_len, max_total_tokens)`, 544→64 MB/slot, slots 32→256, long-ctx
+> unblocked ([win](../experience/wins/2026-07-11-dspark-draft-kv-cap-per-request-ceiling.md)).
+> Remaining before OPD default: P2 temp>0 rejection-sampling verify + P3 train
+> the DSpark heads (Markov/confidence) for the +14.1% tool-call lift.
 
 ## Verdict first
 
