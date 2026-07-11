@@ -1,0 +1,31 @@
+crates/train/src/agent_opd.rs
+  s_4c98a5d49e1e6f::t_de381282f7ee9f 356-358,582,595,597,602,609,612-615,634-636
+crates/train/src/sandbox.rs
+  s_c5e27afc33a331::t_1839e0e769fbc3 596-599,607,686-731,791-805,983,985,1029,1037
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "b49363d679e15ae35908c1fa96896ff000e3e7d4",
+  "prompts": {},
+  "sessions": {
+    "s_4c98a5d49e1e6f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-abf221f338fac9fdc",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_c5e27afc33a331": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a08593ef7eb9c319e",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
