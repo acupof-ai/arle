@@ -2,7 +2,7 @@
 use fs4::FileExt;
 use std::collections::BTreeSet;
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
@@ -2006,6 +2006,19 @@ fn link_prebuilt_cuda_artifacts(prebuilt_dir: &Path, cuda_path: &str) {
         }
         println!("cargo:rerun-if-changed={}", path.display());
     }
+    let manifest = prebuilt_dir.join("arle-cuda-kernels.manifest");
+    if !manifest.is_file() {
+        panic!(
+            "ARLE_CUDA_KERNELS_PREBUILT_DIR={} is missing arle-cuda-kernels.manifest",
+            prebuilt_dir.display()
+        );
+    }
+    println!("cargo:rerun-if-changed={}", manifest.display());
+    validate_prebuilt_manifest(&manifest);
+    emit_kernel_build_identity(
+        &PathBuf::from(std::env::var("OUT_DIR").unwrap()),
+        Some(prebuilt_dir),
+    );
     validate_prebuilt_cuda_archive_symbols(&prebuilt_dir.join("libkernels_cuda.a"));
     // The prebuilt fast-build path returns before the normal-build cfg emission,
     // so set `arle_flashmla` here too — otherwise `cuda_kernels::HAS_FLASHMLA` is
@@ -2037,6 +2050,113 @@ fn link_prebuilt_cuda_artifacts(prebuilt_dir: &Path, cuda_path: &str) {
         "cargo:warning=Using prebuilt CUDA kernel artifacts from {}; skipping nvcc and TileLang AOT.",
         prebuilt_dir.display()
     );
+}
+
+fn validate_prebuilt_manifest(manifest: &Path) {
+    let crate_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+    let repo_root = crate_dir
+        .parent()
+        .and_then(Path::parent)
+        .expect("cuda-kernels is under <repo>/crates");
+    let producer = repo_root.join("scripts/cuda_prebuilt_manifest.sh");
+    println!("cargo:rerun-if-changed={}", producer.display());
+    let output = Command::new("bash")
+        .args([
+            "-c",
+            "source \"$1\"; cuda_prebuilt_manifest",
+            "cuda-prebuilt-manifest",
+        ])
+        .arg(&producer)
+        .current_dir(repo_root)
+        .output()
+        .unwrap_or_else(|err| panic!("Failed to run {}: {err}", producer.display()));
+    if !output.status.success() {
+        panic!(
+            "Failed to produce canonical CUDA prebuilt manifest: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let actual = std::fs::read(manifest)
+        .unwrap_or_else(|err| panic!("Failed to read {}: {err}", manifest.display()));
+    if actual != output.stdout {
+        panic!(
+            "ARLE_CUDA_KERNELS_PREBUILT_DIR manifest does not match current source/toolchain inputs. \
+             Rebuild the prebuilt CUDA artifacts."
+        );
+    }
+}
+
+fn sha256_file(path: &Path) -> String {
+    use std::fmt::Write as _;
+
+    let mut file = File::open(path)
+        .unwrap_or_else(|err| panic!("Failed to open {} for hashing: {err}", path.display()));
+    let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .unwrap_or_else(|err| panic!("Failed to hash {}: {err}", path.display()));
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    digest
+        .finish()
+        .as_ref()
+        .iter()
+        .fold(String::with_capacity(64), |mut output, byte| {
+            write!(output, "{byte:02x}").expect("writing to String is infallible");
+            output
+        })
+}
+
+fn emit_kernel_build_identity(out_dir: &Path, prebuilt_dir: Option<&Path>) {
+    use std::fmt::Write as _;
+
+    let id = prebuilt_dir.map_or_else(
+        || "unreported".to_string(),
+        |dir| {
+            let manifest = dir.join("arle-cuda-kernels.manifest");
+            let mut identity = format!("manifest\t{}\n", sha256_file(&manifest));
+            let external_sidecar = env_nonempty("ARLE_DEEPEP_SIDECAR_PREBUILT");
+            for (name, path) in [
+                ("libkernels_cuda.a", dir.join("libkernels_cuda.a")),
+                (
+                    "libtilelang_kernels_aot.a",
+                    dir.join("libtilelang_kernels_aot.a"),
+                ),
+                (
+                    "arle_deepep_sidecar",
+                    external_sidecar
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|| dir.join("arle_deepep_sidecar")),
+                ),
+            ] {
+                if path.is_file() {
+                    writeln!(identity, "{name}\t{}", sha256_file(&path))
+                        .expect("writing to String is infallible");
+                    println!("cargo:rerun-if-changed={}", path.display());
+                }
+            }
+            let digest = ring::digest::digest(&ring::digest::SHA256, identity.as_bytes());
+            let hash =
+                digest
+                    .as_ref()
+                    .iter()
+                    .fold(String::with_capacity(64), |mut output, byte| {
+                        write!(output, "{byte:02x}").expect("writing to String is infallible");
+                        output
+                    });
+            format!("bundle:{hash}")
+        },
+    );
+    std::fs::write(
+        out_dir.join("kernel_build_identity.rs"),
+        format!("pub const KERNEL_BUILD_ID: &str = {id:?};\n"),
+    )
+    .expect("write kernel build identity");
 }
 
 fn tool_command(tool: &str, wrapper: Option<&str>) -> Command {
@@ -2130,6 +2250,7 @@ fn main() {
     let registry = load_registry();
     let early_out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     emit_ffi_generated(&registry, &early_out_dir);
+    emit_kernel_build_identity(&early_out_dir, None);
     println!("cargo:rerun-if-env-changed=ARLE_TILELANG_CACHE_ID_SELF_TEST");
     if env_truthy("ARLE_TILELANG_CACHE_ID_SELF_TEST") {
         run_tilelang_cache_identity_self_test(&registry, &early_out_dir);

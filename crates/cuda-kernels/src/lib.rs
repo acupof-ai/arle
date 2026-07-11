@@ -23,6 +23,8 @@ pub mod turboquant_state;
 
 pub use kv_types::{KVCacheDtype, KVFormat};
 
+include!(concat!(env!("OUT_DIR"), "/kernel_build_identity.rs"));
+
 #[cfg(feature = "cuda")]
 pub use paged_kv::{BandPage, TokenKVPool};
 

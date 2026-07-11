@@ -626,6 +626,7 @@ dependencies = [
  "fs4",
  "half",
  "log",
+ "ring",
  "toml",
 ]
 
@@ -1718,6 +1719,7 @@ dependencies = [
  "log",
  "minijinja",
  "minijinja-contrib",
+ "ring",
  "serde",
  "serde_json",
  "tokenizers",
