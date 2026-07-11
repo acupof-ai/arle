@@ -462,14 +462,15 @@ where
         self.counters.lock().map(|c| *c).unwrap_or_default()
     }
 
-    /// Materialize operator-policy identities and counters on the engine thread.
-    pub fn operator_dispatch_stats(&self) -> Result<infer_seam::OperatorDispatchStats> {
-        self.run_on_engine(|engine| engine.operator_dispatch_stats())
-    }
-
-    /// Return the backend artifact identity at a stats request boundary.
-    pub fn artifact_identity(&self) -> Result<infer_seam::BackendArtifactIdentity> {
-        self.run_on_engine(|engine| engine.artifact_identity())
+    /// Materialize operator dispatch counters + backend artifact identity in one
+    /// engine-thread round-trip, only at a stats request boundary.
+    pub fn operator_stats(
+        &self,
+    ) -> Result<(
+        infer_seam::OperatorDispatchStats,
+        infer_seam::BackendArtifactIdentity,
+    )> {
+        self.run_on_engine(|engine| (engine.operator_dispatch_stats(), engine.artifact_identity()))
     }
 
     fn acquire_live_request(&self) -> Result<()> {
@@ -834,8 +835,7 @@ fn serve_handle_relay_driver<E, K>(
             }
             Ok(Some(RelayEnvelope::StatsQuery { request_id })) => {
                 let counters = serve.counters();
-                let operator_dispatch = serve.operator_dispatch_stats().unwrap_or_default();
-                let artifact = serve.artifact_identity().unwrap_or_default();
+                let (operator_dispatch, artifact) = serve.operator_stats().unwrap_or_default();
                 let data = Box::new(WireStats::from_counters(
                     &counters,
                     build_identity(artifact),
@@ -1101,11 +1101,11 @@ mod tests {
             .collect()?;
         assert_eq!(materializations.load(Ordering::Relaxed), 0);
 
-        let stats = serve.operator_dispatch_stats()?;
+        let (stats, artifact) = serve.operator_stats()?;
         assert_eq!(materializations.load(Ordering::Relaxed), 1);
         assert_eq!(stats.implementation_hits[0].hits, 3);
         assert_eq!(stats.fallback_count, 1);
-        let identity = build_identity(infer_seam::BackendArtifactIdentity::default());
+        let identity = build_identity(artifact);
         assert!(identity.product_binary_sha256.starts_with("sha256:"));
         assert_eq!(identity.product_binary_sha256.len(), 71);
 
