@@ -1,0 +1,29 @@
+Cargo.lock
+  s_d04b61414cd72f::t_dfae58e9a6b528 629,1722
+crates/cuda-kernels/Cargo.toml
+  s_d04b61414cd72f::t_391fe84e3c5af6 30
+crates/cuda-kernels/build.rs
+  s_d04b61414cd72f::t_e47fca38da0d9a 5,2009-2021,2055-2161,2253
+crates/cuda-kernels/src/lib.rs
+  s_d04b61414cd72f::t_b30a1fb2b838a8 26-27
+scripts/export_prebuilt_cuda_kernels.sh
+  s_d04b61414cd72f::t_796b1bfbcb011a 19-21
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "6cb2c0054887c0a2fe67c492d556dfad0600ed10",
+  "prompts": {},
+  "sessions": {
+    "s_d04b61414cd72f": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f4abd-3be6-7383-8207-dc00136055c2",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
