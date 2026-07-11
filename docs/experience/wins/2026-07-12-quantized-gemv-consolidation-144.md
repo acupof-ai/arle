@@ -62,8 +62,41 @@ rest are marginal and left as follow-ups:
 4. fp4 route/grouped (4 kernels) — higher risk (route_meta + ptr-table indirection),
    also off the FP8 hot path.
 
-A clean idle-box perf A/B for the fp8 merges (inc 1+2) is still owed once the box
-is uncontended.
+## Clean idle-box perf A/B (2026-07-12) — PASS (neutral), debt closed
+
+Two builds (compile-time merge → can't same-binary A/B): baseline `ce288ea17`
+(pre-merge) vs after `90de21f0e` (both fp8 merges). Same idle GPU 1 (100% util @
+1980 MHz full clock, host-fed, NOT starved; foreign loads only ever on 3/4),
+same serve flags (Qwen3.6-27B-FP8, `--max-total-tokens 8192 --max-running-requests
+256`), bounded matched `concurrent` c=1,2,4,8 (4096-in/256-out, 60s, seed
+20260416), back-to-back.
+
+**TPOT (ms, ~256 decode steps/req — the only metric with statistical power):**
+
+| c | baseline | after | Δ |
+|---|---|---|---|
+| 1 | 42.0 | 44.0 | +4.8% |
+| 2 | 62.7 | 61.5 | −2.1% |
+| 4 | 87.7 | 90.5 | +3.2% |
+| 8 | 148.4 | 151.6 | +2.2% |
+
+**Δ TPOT +2.0% mean, non-systematic** (one stage negative, all within ±5%) —
+NEUTRAL, as expected for a `template<ScaleFn>` functor merge (inline → identical
+SASS). TTFT/ITL/out_tps swung ±40–90% scattering both signs = prefill-queue /
+batch-composition noise at n=5–9 reqs (c=8 ITL 10.8→20.6 while TPOT held
+148→152), not kernel signal.
+
+**Caveat (SOLID):** at 5–9 reqs/stage on a single H20, run-to-run noise floor is
+±50%+ — this asserts *no gross/systematic regression* (it does), it cannot
+resolve a 3% effect. That + identical-SASS mechanism closes the debt. A
+<3%-resolving number would need a c=1 max-seconds≥180 decode-isolated pair (~30
+min); verdict won't change.
+
+**Infra note (orthogonal):** canonical guidellm `sweep` hard-hangs this
+single-GPU 27B-FP8 serve — throughput stage floods ~82×4096-tok reqs > KV pool
+(343k < 357k) → engine froze at `TokenKVPool: out of pages (available 0)`, not
+reject/park. Serve-config over-admission bug, not the kernel; switched to bounded
+`concurrent` for the A/B.
 
 ## Rule
 
