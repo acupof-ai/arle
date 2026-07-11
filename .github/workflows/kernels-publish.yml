@@ -12,6 +12,9 @@ on:
       - crates/cuda-kernels/kernels.toml
       - crates/cuda-kernels/build.rs
       - requirements-build.txt
+      # The bundle id + pack/fetch contract — a change here re-addresses the bundle.
+      - scripts/kernel_artifacts.sh
+      - scripts/cuda_prebuilt_manifest.sh
       - .github/workflows/kernels-publish.yml
   workflow_dispatch: {}
 
