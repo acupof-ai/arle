@@ -31,15 +31,28 @@ per-metric, vs the current-best baseline. Order: **1 → 2 → 3 → 5 → 6**.
    finish-capture D2H must not cost more than the reuse saves on short turns).
    Gated on #1+#5 landing first (they reduce the capture/restore cost).
 4. **(skipped this round — page-granular mid-generation reuse, deferred.)**
-5. **Pinned DRAM for the L2 pool** — capture/restore D2H uses pageable host
-   memory (blocking staging copy). Page-locked host buffers cut the
-   capture/restore stall → TTFT (multi-turn) + throughput (less engine stall
-   under concurrency). Opt-in reuse path; measure the restore-latency Δ.
-6. **Aggressive admission watermark** — the band demand-paging admission
-   watermark is conservative → under-admits slots → caps concurrency. Loosen
-   (behind a knob first; default-path so needs multi-shape verify): higher slot
-   count → higher aggregate throughput without OOM. Measure slot count +
-   throughput at c=16.
+5. **Pinned DRAM for the L2 pool — KILLED (bad ROI, 2026-07-11).** cudarc's
+   `alloc_pinned()` is write-combined (correct for H2D, pathological for the
+   D2H-then-host-read the codec needs); the correct path needs net-new unsafe
+   `malloc_host(_,0)` FFI + a capture return-path refactor (the reuse capture is
+   a deferred single-sync, incompatible with one reusable buffer), for a
+   second-order stall win on the opt-in path. If finish-stall ever matters,
+   async off-engine capture is the right design, not pinned. Not built.
+6. **Aggressive admission watermark — KILLED as a knob (unsafe, 2026-07-11).**
+   DSv4's concurrency ceiling is a real invariant, not a conservative guard:
+   each slot reserves its full band on the host, and `band_extend` hard-errors
+   on device-pool exhaustion with NO DSv4 recovery (no preempt/park/demote;
+   `retract_decode_to_fit` is device-blind). A watermark<1 removes the
+   safety invariant with no cascade to catch it; its benefit regime ==
+   its unsafe regime. The REAL lever is the band-exhaustion recovery cascade —
+   **#160** (#154 follow-on infra), not a flag.
+
+## Verdict (2026-07-11)
+#1 landed + measured (+1 page reuse, no single-shot regression). #5/#6 both
+KILLED as specced — the honest throughput lever is #160 (DSv4 band-exhaustion
+cascade), a real infra project. The multi-turn concurrent harness
+(`eval_harness multiturn_concurrent`) is built and ready to quantify the current
+high-concurrency multi-turn TTFT/TPOT/throughput + the reuse-under-concurrency win.
 
 ## Non-goals
 - Page-granular mid-generation reuse (deferred — bigger, concurrent-share case).
