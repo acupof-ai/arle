@@ -16,11 +16,24 @@ CORRECTNESS_STATUS="${ARLE_KERNEL_CORRECTNESS_STATUS:-unverified-local}"
 source "$ROOT/scripts/cuda_prebuilt_manifest.sh"
 
 kernel_bundle_identity() {
+    # Hash git-TRACKED content (blob/tree object per path), not the working tree:
+    # `find -type f` pulls in gitignored __pycache__/*.pyc that any codegen run
+    # drops into tools/tilelang, so the id differed between the publish job (post
+    # codegen, has .pyc) and a pristine consumer (no .pyc) — the bundle was
+    # unfetchable. `git rev-parse HEAD:<path>` is deterministic and pyc-immune
+    # (same helper the prebuilt manifest already uses).
+    local tilelang_inputs
+    tilelang_inputs=$(
+        for path in crates/cuda-kernels/build.rs crates/cuda-kernels/kernels.toml \
+            crates/cuda-kernels/tools/tilelang requirements-build.txt; do
+            printf 'input\t%s\t%s\n' "$path" "$(cuda_prebuilt_tree_hash "$path")"
+        done | cuda_prebuilt_hash_stream
+    )
     cat <<EOF
-schema=2
+schema=3
 lane=$LANE
 arches=$ARCHS
-tilelang_inputs=$(cuda_prebuilt_files_hash crates/cuda-kernels/build.rs crates/cuda-kernels/kernels.toml crates/cuda-kernels/tools/tilelang requirements-build.txt)
+tilelang_inputs=$tilelang_inputs
 cuda_contract=$CUDA_CONTRACT
 flashqla_gdr=${ARLE_CUDA_ENABLE_FLASHQLA_GDR:-}
 EOF
