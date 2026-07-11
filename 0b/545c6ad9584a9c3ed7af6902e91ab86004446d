@@ -1,0 +1,31 @@
+scripts/eval_harness/__main__.py
+  s_c113ccd4b21fd4::t_4654d63d815a46 8-9,20,33-41
+scripts/eval_harness/multiturn_concurrent.py
+  s_9c91b86ec3fb55::t_e8bb0163603d16 1-197
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "0b545c6ad9584a9c3ed7af6902e91ab86004446d",
+  "prompts": {},
+  "sessions": {
+    "s_9c91b86ec3fb55": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4779911a-69b7-49db-bc83-daf5a48d6ca3",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_c113ccd4b21fd4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a2ac7ee0ae072d59f",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
