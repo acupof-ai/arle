@@ -147,6 +147,12 @@ impl UpdateStrategy {
         let mut steps = 0usize;
         for traj in batch {
             let advantage = traj.reward - mean_reward;
+            // No signal → no update. Binary rewards center to exactly 0 when the
+            // batch is all-pass or all-fail; stepping anyway lets AdamW weight
+            // decay / momentum drift the weights on zero gradient.
+            if advantage == 0.0 {
+                continue;
+            }
             let rollout_logprobs = traj.rollout_logprobs.as_deref().ok_or_else(|| {
                 OpdError::InvalidInput(
                     "SaoDis update requires rollout_logprobs (harness must capture π_rollout \
