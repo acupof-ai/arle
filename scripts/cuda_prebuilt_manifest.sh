@@ -117,7 +117,10 @@ requirements_build=$(cuda_prebuilt_tree_hash requirements-build.txt)
 cuda_kernels_tree=$(cuda_prebuilt_tree_hash crates/cuda-kernels)
 deepep_sys_tree=$(cuda_prebuilt_tree_hash crates/deepep-sys)
 dirty_hash=$(cuda_prebuilt_dirty_hash)
-target=${TARGET:-${CARGO_BUILD_TARGET:-}}
+# No `target=`: cargo injects TARGET into build.rs subprocesses but the standalone
+# export script has it unset, which broke the producer/consumer manifest byte-match
+# 100% of the time. It is redundant anyway — rustc_id (`rustc -vV`) already encodes
+# `host: <triple>`, and CUDA cubins key on the SM arch args, not the Rust triple.
 profile=${PROFILE:-}
 features=${FEATURES:-}
 cuda_home=$cuda_home
