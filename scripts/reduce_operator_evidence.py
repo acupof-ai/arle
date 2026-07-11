@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import math
+import re
 import statistics
 import sys
 import tomllib
@@ -80,16 +81,39 @@ def _qualified(run: dict, measurement: dict, config: dict) -> bool:
     _require(numeric["passed"] is numeric_passed, "inconsistent numeric verdict")
     source = run["source"]
     product = run["product"]
+    _require(re.fullmatch(r"sha256:[0-9a-f]{64}", product["binary_id"]) is not None, "invalid binary ID")
+    bundle_source = product["bundle_id_source"]
+    if bundle_source == "verified_manifest":
+        _require(re.fullmatch(r"bundle:[0-9a-f]{64}", product["bundle_id"]) is not None, "invalid bundle ID")
+        _require(
+            re.fullmatch(r"[0-9a-f]{64}", product["bundle_manifest_sha256"] or "") is not None,
+            "verified bundle lacks manifest digest",
+        )
+        bundle_qualified = True
+    elif bundle_source == "unverified":
+        _require(product["bundle_id"] is None, "unverified bundle has an ID")
+        _require(product["bundle_manifest_sha256"] is None, "unverified bundle has manifest digest")
+        bundle_qualified = False
+    else:
+        raise ValueError("invalid bundle ID source")
+    model = run["model_revision"]
+    _require(model["kind"] in ("actual", "synthetic") and model["id"] != "unreported", "invalid model revision")
+    e2e = run["e2e_gate"]
+    e2e_model = e2e["model_revision"] or {}
+    e2e_qualified = (
+        e2e["status"] == "passed"
+        and e2e["passed"] is True
+        and re.fullmatch(r"[0-9a-f]{64}", e2e["artifact_sha256"] or "") is not None
+        and e2e_model.get("kind") == "actual"
+        and e2e_model.get("id") not in (None, "unreported")
+    )
     return (
         not source["dirty"]
+        and bundle_qualified
         and source["commit"] != "unreported"
-        and product["binary_id"] != "unreported"
-        and product["bundle_id"] != "unreported"
-        and run["model_revision"] != "unreported"
         and run["hardware"]["gpu"] != "unreported"
         and all(value != "unreported" for value in run["software"].values())
-        and run["e2e_gate"]["passed"] is True
-        and len(run["e2e_gate"]["artifact_sha256"] or "") == 64
+        and e2e_qualified
         and numeric["passed"] is True
     )
 
@@ -211,12 +235,22 @@ def _self_test() -> None:
         "schema_version": "arle.operator-evidence/v1",
         "operator_id": OPERATOR,
         "source": {"commit": "a" * 40, "dirty": False},
-        "product": {"binary_id": "binary", "bundle_id": "bundle"},
+        "product": {
+            "binary_id": "sha256:" + "1" * 64,
+            "bundle_id": "bundle:" + "2" * 64,
+            "bundle_id_source": "verified_manifest",
+            "bundle_manifest_sha256": "3" * 64,
+        },
         "hardware": {"gpu": "H20", "sm_major": 9, "sm_minor": 0, "sm_count": 78},
-        "model_revision": "model@revision",
+        "model_revision": {"kind": "synthetic", "id": "model@revision"},
         "software": {"driver": "12000", "toolkit": "12.8", "provider": "deepgemm"},
         "timing": {"method": "cuda_event_batched", "warmup": 1, "iterations_per_sample": 2, "samples": 3},
-        "e2e_gate": {"passed": True, "artifact_sha256": "b" * 64},
+        "e2e_gate": {
+            "status": "passed",
+            "passed": True,
+            "artifact_sha256": "b" * 64,
+            "model_revision": {"kind": "actual", "id": "model@revision"},
+        },
         "measurements": [
             {
                 "m": 2,
@@ -266,6 +300,38 @@ def _self_test() -> None:
         _require("duplicate qualified cell" in str(error), "wrong duplicate error")
     else:
         raise ValueError("duplicate qualified cell accepted")
+    run["product"] = {
+        "binary_id": "sha256:" + "1" * 64,
+        "bundle_id": None,
+        "bundle_id_source": "unverified",
+        "bundle_manifest_sha256": None,
+    }
+    _require(
+        not reduce_runs([(run, "digest")], config)["exact_cells"],
+        "unverified bundle qualified",
+    )
+    run["product"] = {
+        "binary_id": "sha256:" + "1" * 64,
+        "bundle_id": "bundle:" + "2" * 64,
+        "bundle_id_source": "verified_manifest",
+        "bundle_manifest_sha256": "3" * 64,
+    }
+    run["e2e_gate"] = {
+        "status": "not_run",
+        "passed": False,
+        "artifact_sha256": None,
+        "model_revision": None,
+    }
+    _require(
+        not reduce_runs([(run, "digest")], config)["exact_cells"],
+        "component-only run qualified",
+    )
+    run["e2e_gate"] = {
+        "status": "passed",
+        "passed": True,
+        "artifact_sha256": "b" * 64,
+        "model_revision": {"kind": "actual", "id": "model@revision"},
+    }
     run["source"]["dirty"] = True
     _require(not reduce_runs([(run, "digest")], config)["exact_cells"], "dirty run qualified")
 
