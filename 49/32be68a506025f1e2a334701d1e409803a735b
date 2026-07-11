@@ -1,0 +1,21 @@
+.github/workflows/kernels-publish.yml
+  s_6c10e3a3628936::t_98cdfa997a8bea 15-17
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "4932be68a506025f1e2a334701d1e409803a735b",
+  "prompts": {},
+  "sessions": {
+    "s_6c10e3a3628936": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d79ef61e-503a-41eb-8cd2-6ddea3068ced",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
