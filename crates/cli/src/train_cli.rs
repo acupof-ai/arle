@@ -2620,6 +2620,11 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
         return Ok(());
     }
 
+    // Pluggable policy update (default rejection-CE = byte-identical to before).
+    let update_strategy = args
+        .update_strategy
+        .to_strategy(args.sao_eps_low, args.sao_eps_high);
+
     // rounds:1 — the round loop is external (mirroring rubric-OPD); each call runs
     // one round, then the caller syncs the trained LoRA into the rollout engine.
     let cfg = train::agent_opd::AgentOpdConfig {
@@ -2638,6 +2643,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
         pythonpath: args.pythonpath.clone(),
         bash_timeout_secs: args.bash_timeout_secs,
         test_timeout_secs: args.test_timeout_secs,
+        update_strategy,
     };
 
     // PEFT adapter config for `--save-lora-adapters` (mainstream HF PEFT dir:
@@ -2684,14 +2690,15 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
             let store_ref = &mut store;
             let opt_ref = &mut optimizer;
             let writeback_window = args.writeback_window;
+            let needs = update_strategy.needs();
             train::agent_opd::run_agentic_opd_round(
                 &infer_student,
                 &tasks,
                 &cfg,
                 round,
-                |prompt_ids: &[u32], response_ids: &[u32], response_mask: &[u8]| {
+                |batch: &[train::update_strategy::ScoredTrajectory]| {
                     // Release the rollout engine's inference forward scratch (24K-shaped
-                    // workspace) BEFORE the masked-CE writeback: the agent-OPD path runs
+                    // workspace) BEFORE the writeback: the agent-OPD path runs
                     // EngineOffloadMode::Off so the scratch otherwise stays resident and
                     // OOMs the writeback's logits alloc. The rollout has synced before the
                     // closure runs, so the release precondition holds; the freed blocks
@@ -2715,20 +2722,35 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
                         eprintln!("[agent-opd] released rollout KV pool");
                     }
                     log_opd_vram("agent-opd pre-writeback", &train_backend);
-                    let writeback_result = masked_writeback_ce_step_dispatch(
-                        student_ref,
-                        all_ref,
-                        trainable_ref,
-                        opt_ref,
-                        prompt_ids,
-                        response_ids,
-                        response_mask,
-                        vocab,
-                        writeback_window,
-                        store_ref,
-                    )
-                    .map_err(anyhow::Error::from);
-                    writeback_result
+                    // Capture π_rollout at V0 (before any optimizer step) when the
+                    // strategy needs it — a tape-off forward per trajectory. θ is
+                    // unchanged until `update` below, so these ARE the rollout logprobs.
+                    let mut scored = batch.to_vec();
+                    if needs.rollout_logprobs {
+                        for traj in &mut scored {
+                            let lp = train::opd::capture_rollout_logprobs(
+                                student_ref,
+                                &traj.prompt_ids,
+                                &traj.response_ids,
+                                &traj.response_mask,
+                                store_ref,
+                            )
+                            .map_err(anyhow::Error::from)?;
+                            traj.rollout_logprobs = Some(lp);
+                        }
+                    }
+                    update_strategy
+                        .update(
+                            &scored,
+                            student_ref,
+                            all_ref,
+                            trainable_ref,
+                            opt_ref,
+                            vocab,
+                            writeback_window,
+                            store_ref,
+                        )
+                        .map_err(anyhow::Error::from)
                 },
             )?
         };
