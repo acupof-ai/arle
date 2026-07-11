@@ -353,7 +353,9 @@ mod cuda_rollout {
                             cfg.pythonpath.as_deref(),
                             cfg.test_timeout_secs,
                         ) {
-                            Ok((passed, log)) => {
+                            Ok((reward, log)) => {
+                                // pass_rate keeps binary semantics: pass ⇔ all green.
+                                let passed = reward >= 1.0;
                                 (passed, true, log.lines().last().unwrap_or("").to_string())
                             }
                             Err(e) => (false, true, format!("score error: {e}")),
@@ -577,7 +579,7 @@ mod cuda_rollout {
                         continue;
                     }
 
-                    let passed = match aopd_profile::time(
+                    let reward = match aopd_profile::time(
                         "score_pytest",
                         aopd_profile::WALL,
                         || {
@@ -590,23 +592,27 @@ mod cuda_rollout {
                             )
                         },
                     ) {
-                        Ok((passed, log)) => {
+                        Ok((reward, log)) => {
                             eprintln!(
-                                "[agent-opd] {} sample {sample}: passed={passed} (turns={}) :: {}",
+                                "[agent-opd] {} sample {sample}: reward={reward:.3} (turns={}) :: {}",
                                 task.instance_id,
                                 result.tool_calls_executed,
                                 log.lines().last().unwrap_or("")
                             );
-                            passed
+                            reward
                         }
                         Err(e) => {
                             eprintln!(
                                 "[agent-opd] {} sample {sample}: score error: {e}",
                                 task.instance_id
                             );
-                            false
+                            0.0
                         }
                     };
+                    // A "pass" still means all fail_to_pass green (reward == 1.0);
+                    // rejection-CE's accept gate stays binary. Only SAO consumes
+                    // the graded reward below.
+                    let passed = reward >= 1.0;
                     if passed {
                         report.passed += 1;
                         if rescue {
@@ -625,7 +631,9 @@ mod cuda_rollout {
                                 prompt_ids: tok.prompt_ids.clone(),
                                 response_ids: tok.response_ids.clone(),
                                 response_mask: tok.response_mask.clone(),
-                                reward: if passed { 1.0 } else { 0.0 },
+                                // Graded reward feeds SAO's advantage; rejection-CE
+                                // still gates on reward == 1.0 (accept only full pass).
+                                reward,
                                 rollout_logprobs: None,
                             });
                         }
