@@ -189,7 +189,7 @@ mod tests {
     #[test]
     fn topk_covering_all_middle_blocks_stays_resident() {
         // top_k >= number of middle blocks → nothing to evict → contiguous.
-        let p = plan_recall(96, &vec![1.0; 9], &cfg(8, 16, 8, 100));
+        let p = plan_recall(96, &[1.0; 9], &cfg(8, 16, 8, 100));
         assert_eq!(p.ranges, vec![(0, 96)]);
     }
 
