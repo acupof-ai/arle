@@ -127,9 +127,11 @@ libtilelang_kernels_aot.a: 93 archive objects, 93 unique defined globals
 Real FA3 and FlashMLA marker symbols plus DeepGEMM preflight are present. This is
 artifact evidence for that pod build only, not proof for every product lane.
 
-`ARLE_CUDA_KERNEL_SET=dsv4_flash` disables TileLang AOT and emits stubs, but the
+~~`ARLE_CUDA_KERNEL_SET=dsv4_flash` disables TileLang AOT and emits stubs, but the
 recursive native `csrc` collection still compiles. It is not a native
-incremental build mode (`build.rs:696-732,1372-1395,1977-1979`).
+incremental build mode.~~ **[removed 2026-07-11]** the whole model-family kernel
+partition was deleted — one binary builds every kernel (see
+`wins/2026-07-11-unified-kernel-set-one-binary-qwen-and-dsv4.md`).
 
 ### TileLang rows and reachability
 
