@@ -466,6 +466,7 @@ impl ModelsResponse {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct StatsResponse {
+    pub build_identity: crate::BuildIdentity,
     pub scheduler: SchedulerStats,
     pub throughput: ThroughputStatsResponse,
     pub prefix_cache: PrefixCacheStatsResponse,
@@ -477,11 +478,17 @@ pub struct StatsResponse {
 }
 
 impl StatsResponse {
-    pub(crate) fn from_wire(w: WireStats) -> Self {
-        Self::from_counters(w.into_counter_snapshot())
+    pub(crate) fn from_wire(mut w: WireStats) -> Self {
+        let build_identity = std::mem::take(&mut w.build_identity);
+        let operator_dispatch = std::mem::take(&mut w.operator_dispatch);
+        Self::from_counters(w.into_counter_snapshot(), build_identity, operator_dispatch)
     }
 
-    pub(crate) fn from_counters(counters: crate::execution::CounterSnapshot) -> Self {
+    pub(crate) fn from_counters(
+        counters: crate::execution::CounterSnapshot,
+        build_identity: crate::BuildIdentity,
+        operator_dispatch: infer_seam::OperatorDispatchStats,
+    ) -> Self {
         let prefix = counters.prefix_cache;
         let tier = counters.kv_tier;
         let system = counters.kv_system;
@@ -499,6 +506,7 @@ impl StatsResponse {
             || system.disk_pages > 0;
         let ssd_available = system.disk_pages > 0 || system.reuse_hit_disk > 0;
         Self {
+            build_identity,
             scheduler: SchedulerStats {
                 active_requests: counters.active_requests,
                 queue_depth: counters.queue_depth,
@@ -568,7 +576,7 @@ impl StatsResponse {
                 partial_ctx_chains: counters.spec_decode.partial_ctx_chains,
                 accept_rate: ratio(counters.spec_decode.accepted, counters.spec_decode.drafted),
             },
-            operator_dispatch: counters.operator_dispatch,
+            operator_dispatch,
         }
     }
 }
@@ -1034,24 +1042,29 @@ mod tests {
         counters.kv_tier.demoted_slots = 2;
         counters.kv_system.reuse_hit_host_demoted = 3;
         counters.kv_system.disk_pages = 4;
-        counters.operator_dispatch = infer_seam::OperatorDispatchStats {
+        let operator_dispatch = infer_seam::OperatorDispatchStats {
             policy_hash: "policy-1".to_string(),
-            product_id: "arle-1".to_string(),
-            bundle_digest: "sha256:abc".to_string(),
             implementation_hits: vec![infer_seam::OperatorImplementationHits {
                 implementation_id: "cuda.test".to_string(),
                 hits: 9,
             }],
             fallback_count: 2,
         };
-        let stats =
-            StatsResponse::from_wire(crate::multiproc_relay::WireStats::from_counters(&counters));
+        let stats = StatsResponse::from_wire(crate::multiproc_relay::WireStats::from_counters(
+            &counters,
+            crate::BuildIdentity {
+                product_binary_sha256: "sha256:abc".to_string(),
+                kernel_bundle_id: "bundle-1".to_string(),
+            },
+            operator_dispatch,
+        ));
         assert_eq!(stats.prefix_cache.hit_rate, Some(1.0));
         assert_eq!(stats.prefix_cache.hits, 5);
         assert!(stats.kv_tier.available);
         assert_eq!(stats.kv_tier.demoted_slots, 2);
         assert_eq!(stats.kv_system.reuse_hit_host_demoted, 3);
         assert!(stats.ssd_recall.available);
+        assert_eq!(stats.build_identity.kernel_bundle_id, "bundle-1");
         assert_eq!(stats.operator_dispatch.policy_hash, "policy-1");
         assert_eq!(stats.operator_dispatch.implementation_hits[0].hits, 9);
         assert_eq!(stats.operator_dispatch.fallback_count, 2);

@@ -774,6 +774,12 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         self.executor.operator_dispatch_stats()
     }
 
+    /// Exact backend artifact identity, if the build verified one.
+    #[must_use]
+    pub fn artifact_identity(&self) -> infer_seam::BackendArtifactIdentity {
+        self.executor.artifact_identity()
+    }
+
     #[must_use]
     pub fn kv_system_metrics(&self) -> KvSystemMetrics {
         let mut metrics = self.kv_system_metrics;

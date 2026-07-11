@@ -346,7 +346,6 @@ mod tests {
                 prefix_match_clamped_blocks: 10,
             },
             spec_decode: infer_seam::SpecDecodeStats::default(),
-            operator_dispatch: infer_seam::OperatorDispatchStats::default(),
         };
         let body = render_prometheus(&counters, "qwen3-dense");
 
