@@ -225,7 +225,7 @@ __device__ __forceinline__ float dot16_dec(
 // Weight-AMORTIZING batched GEMV (the MTP-verify lever): grid.y = 1, each thread
 // reads+decodes each weight chunk ONCE and MACs it across all B columns. Weight
 // HBM read is shared over B (vs the default grid.y=B kernel that re-reads weight
-// B times). Mirrors the production fp8_f32_block_gemv_batch_tiled_kernel.
+// B times). Mirrors the production fp8_gemv_batch_tiled_kernel (Fp8F32BlockScale).
 template <int TILE>
 __global__ void fp8_f32_block_gemv_amort_kernel(
     const uint8_t* __restrict__ weight,
