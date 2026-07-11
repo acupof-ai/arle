@@ -4,8 +4,10 @@
 > P1 update (2026-07-11): backend dispatch counters wired in `quant_linear.rs` — all 4 FP8 dense
 > paths (DeepGEMM, dequant GEMM, GEMV in gemm_batch, GEMV in gemv) increment global atomics.
 > `/v1/stats` now returns real `implementation_hits` + `fallback_count`.
-> P1 update 2 (2026-07-11): `product_id` (binary sha256) + `bundle_digest` (git commit) now
-> runtime-computed via `OnceLock`. `scripts/run_fp8_probe.sh` auto-sets all qualification env vars.
+> Truth-boundary correction (2026-07-11): the old runner's automatic E2E pass,
+> probe-binary E2E artifact, and git-commit bundle identity are invalid. No run
+> from that path qualifies. Qualification now requires a verified full CUDA
+> manifest and an identity-bound actual-model E2E artifact.
 
 ## SLO-shape probed? N
 
@@ -61,6 +63,9 @@ override it without affecting unknown hardware or shapes.
   `DEEPGEMM_HITS`, `GEMV_HITS`, `DEQUANT_GEMM_HITS`, `FALLBACK_COUNT` global
   atomics incremented at all 4 call entry points (`gemm_batch` × 3 paths,
   `gemv` × FP8 path). Reachable via `/v1/stats → operator_dispatch`.
+- **FIXED 2026-07-11:** The probe runner no longer manufactures qualification.
+  Runs without a verified kernel manifest are stored as `unverified` with no
+  bundle ID and cannot produce exact selector cells.
 
 ## Learnings
 
@@ -72,7 +77,7 @@ override it without affecting unknown hardware or shapes.
 ## Pending H20 gates
 
 - numeric candidate/reference probe with the committed mixed tolerance;
-- same-binary E2E A/B and independent launch engagement;
+- same-binary, same-bundle actual-model E2E artifact and independent launch engagement;
 - canonical GuideLLM SLO run and wall-clock delta;
 - exact policy/product/bundle identity in `/v1/stats`.
 
