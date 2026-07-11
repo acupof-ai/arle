@@ -16,10 +16,9 @@
 # Consume with:
 #   export ARLE_CUDA_KERNELS_PREBUILT_DIR=<dest-dir>
 #
-# STALENESS IS ON YOU: build.rs validates required DSv4 symbols but cannot
-# know the pack matches your source tree. manifest.json records the source
-# provenance (cuda-kernels tree object, HEAD, dirty state, SM list) — check
-# it before trusting a pack across branch switches. See
+# build.rs rejects a pack unless arle-cuda-kernels.manifest byte-matches the
+# current canonical source/toolchain manifest and required symbols are present.
+# manifest.json records human-readable provenance. See
 # errors/2026-05-28-dsv4-flashmla-decode-parity-precond-fail.md for why.
 
 set -euo pipefail

@@ -27,6 +27,7 @@ cudarc = { version = "0.19", features = [
 [build-dependencies]
 cc = "1.2"
 fs4 = "1.1"
+ring = "0.17"
 toml = "0.8"
 
 [lints]
