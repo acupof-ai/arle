@@ -129,7 +129,6 @@ python_id=$(cuda_prebuilt_command_id "${INFER_TILELANG_PYTHON:-python3}" --versi
 cudarc_cuda_version=${CUDARC_CUDA_VERSION:-}
 torch_cuda_arch_list=${TORCH_CUDA_ARCH_LIST:-}
 cmake_cuda_architectures=${CMAKE_CUDA_ARCHITECTURES:-}
-kernel_set=${ARLE_CUDA_KERNEL_SET:-}
 disable_deepgemm_native=${ARLE_CUDA_DISABLE_DEEPGEMM_NATIVE:-}
 deepgemm_root=$deepgemm_root
 deepgemm_root_hash=$(cuda_prebuilt_source_hash "$deepgemm_root")

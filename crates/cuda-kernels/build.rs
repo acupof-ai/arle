@@ -503,17 +503,12 @@ fn normalize_ws(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Build the `TileLangKernelSpec` list from the registry, reproducing the old
-/// inline construction. `gdr_only` (OpdGdr) drops the BF16/FP8 paged-attention
-/// families (those are stubbed by `write_tilelang_attention_stub_sources`) but
-/// keeps `gdr` AND `flashqla` rows — exactly as the old `gdr_specs` +
-/// `flashqla_specs` loops ran unconditionally regardless of `gdr_only`. The
-/// flashqla gate (sm90 + env flag) is applied by the caller.
-fn registry_to_specs(reg: &Registry, gdr_only: bool) -> Vec<(TileLangKernelSpec, &RegKernel)> {
+/// Build the `TileLangKernelSpec` list from every registry row. The flashqla
+/// gate (sm90 + env flag) is applied per-row by the caller; SM-tier stubbing
+/// (e.g. sm_70 legacy) happens inside `build_tilelang_kernel`.
+fn registry_to_specs(reg: &Registry) -> Vec<(TileLangKernelSpec, &RegKernel)> {
     reg.kernels
         .iter()
-        // attention/fp8 stubbed by write_tilelang_attention_stub_sources
-        .filter(|k| !gdr_only || k.kernel_family == "gdr" || k.kernel_family == "flashqla")
         .map(|k| {
             let abi = reg.abis.get(&k.abi).unwrap_or_else(|| {
                 panic!("kernel {} references unknown abi {}", k.kernel_name, k.abi)
@@ -697,44 +692,6 @@ fn emit_resolve_mono(s: &mut String, reg: &Registry, abi: &str, fn_name: &str, f
         writeln!(s, "        ({hd}, {q}, {kv}) => {}_cuda,", k.kernel_name).unwrap();
     }
     s.push_str("        _ => return None,\n    })\n}\n\n");
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum KernelSet {
-    Full,
-    Dsv4Flash,
-    OpdGdr,
-}
-
-impl KernelSet {
-    fn from_env() -> Self {
-        println!("cargo:rerun-if-env-changed=ARLE_CUDA_KERNEL_SET");
-        match std::env::var("ARLE_CUDA_KERNEL_SET") {
-            Ok(value) => match value.trim() {
-                "" | "full" | "all" => Self::Full,
-                "dsv4_flash" | "dsv4-flash" => Self::Dsv4Flash,
-                "opd_gdr" | "opd-gdr" => Self::OpdGdr,
-                other => panic!(
-                    "Unsupported ARLE_CUDA_KERNEL_SET={other:?}. Supported values: full, dsv4_flash, opd_gdr."
-                ),
-            },
-            Err(_) => Self::Full,
-        }
-    }
-
-    fn tilelang_aot_enabled(self) -> bool {
-        match self {
-            Self::Full | Self::OpdGdr => true,
-            // DSv4-Flash uses native CUDA C + FlashMLA, not ARLE's TileLang
-            // Qwen/GDR attention families. Stub those FFI symbols so a DSv4
-            // build can link without paying the TileLang AOT tax.
-            Self::Dsv4Flash => false,
-        }
-    }
-
-    fn tilelang_gdr_only(self) -> bool {
-        matches!(self, Self::OpdGdr)
-    }
 }
 
 fn probe_tilelang_python(candidate: &str) -> Result<String, String> {
@@ -1108,7 +1065,7 @@ fn run_tilelang_cache_identity_self_test(registry: &Registry, out_dir: &Path) {
         sha256_bytes(b"abc"),
         "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
     );
-    let (spec, _) = registry_to_specs(registry, false)
+    let (spec, _) = registry_to_specs(registry)
         .into_iter()
         .next()
         .expect("registry has a TileLang kernel");
@@ -1540,91 +1497,18 @@ fn write_tilelang_unsupported_stub(
     generated_sources.push(stub_path);
 }
 
-/// Write a CUDA_ERROR_NOT_SUPPORTED stub for one registry kernel, looking its
-/// public C signature up from the named `[abi.*]` block.
-fn write_tilelang_stub_for_kernel(
-    reg: &Registry,
-    k: &RegKernel,
-    out_dir: &Path,
-    generated_sources: &mut Vec<PathBuf>,
-) {
-    let abi = reg
-        .abis
-        .get(&k.abi)
-        .unwrap_or_else(|| panic!("kernel {} references unknown abi {}", k.kernel_name, k.abi));
-    write_tilelang_unsupported_stub(
-        out_dir,
-        &k.artifact_dir,
-        &k.out_name,
-        &k.kernel_name,
-        &abi.c_decl,
-        generated_sources,
-    );
-}
-
-/// Stub every non-GDR attention symbol (OpdGdr path builds only the GDR family
-/// via AOT and stubs the rest). Registry-driven: covers the same prefill/decode
-/// HD64/HD128/HD256 + split + fp8 rows as the old hardcoded list.
-fn write_tilelang_attention_stub_sources(
-    reg: &Registry,
-    out_dir: &Path,
-    generated_sources: &mut Vec<PathBuf>,
-) {
-    for k in reg
-        .kernels
-        .iter()
-        .filter(|k| k.kernel_family != "gdr" && k.kernel_family != "flashqla")
-    {
-        write_tilelang_stub_for_kernel(reg, k, out_dir, generated_sources);
-    }
-}
-
-fn compile_tilelang_stub_kernels(reg: &Registry, cuda_path: &str, out_dir: &Path) {
-    let mut generated_sources = Vec::new();
-
-    // dsv4_flash links CUDA_ERROR_NOT_SUPPORTED stubs for EVERY TileLang FFI
-    // symbol (attention + GDR + FlashQLA) so the build can link without paying
-    // the TileLang AOT tax. Registry-driven so the stub set tracks kernels.toml.
-    for k in &reg.kernels {
-        write_tilelang_stub_for_kernel(reg, k, out_dir, &mut generated_sources);
-    }
-
-    let mut build = cc::Build::new();
-    build
-        .cuda(false)
-        .include(format!("{}/include", cuda_path))
-        .flag("-std=c11")
-        .warnings(false);
-    for source in &generated_sources {
-        build.file(source);
-    }
-    build.compile("tilelang_kernels_aot");
-
-    println!(
-        "cargo:warning=TileLang AOT skipped for ARLE_CUDA_KERNEL_SET=dsv4_flash; linked CUDA_ERROR_NOT_SUPPORTED stubs for non-DSv4 TileLang FFI symbols."
-    );
-}
-
 fn compile_tilelang_aot_kernels(
     reg: &Registry,
     cuda_path: &str,
     out_dir: &Path,
     sm_targets: &[SmSpec],
-    gdr_only: bool,
 ) {
     let tl = LazyTilelang::new();
     let mut generated_sources = Vec::new();
 
-    if gdr_only {
-        write_tilelang_attention_stub_sources(reg, out_dir, &mut generated_sources);
-        println!(
-            "cargo:warning=ARLE_CUDA_KERNEL_SET=opd_gdr: stubbing non-GDR TileLang attention kernels."
-        );
-    }
-
-    // Registry-driven: one TileLangKernelSpec per kernels.toml row. gdr_only
-    // keeps only the GDR family (attention stubbed above). The flashqla gate
-    // (sm90-only + ARLE_CUDA_ENABLE_FLASHQLA_GDR) is reproduced per-row below.
+    // Registry-driven: one TileLangKernelSpec per kernels.toml row. Every SM
+    // target gets every kernel; the flashqla gate (sm90-only +
+    // ARLE_CUDA_ENABLE_FLASHQLA_GDR) is reproduced per-row below.
     println!("cargo:rerun-if-env-changed=ARLE_CUDA_ENABLE_FLASHQLA_GDR");
     let enable_flashqla_gdr = env_flag("ARLE_CUDA_ENABLE_FLASHQLA_GDR");
     let sm90_targets: Vec<SmSpec> = sm_targets
@@ -1632,7 +1516,7 @@ fn compile_tilelang_aot_kernels(
         .filter(|sm| sm.sm == "90")
         .cloned()
         .collect();
-    for (spec, k) in registry_to_specs(reg, gdr_only) {
+    for (spec, k) in registry_to_specs(reg) {
         if k.gate == "flashqla" {
             if !enable_flashqla_gdr || sm90_targets.is_empty() {
                 write_tilelang_unsupported_stub(
@@ -2152,19 +2036,9 @@ fn emit_kernel_build_identity(out_dir: &Path, prebuilt_dir: Option<&Path>) {
             format!("bundle:{hash}")
         },
     );
-    // Which linked kernel set this build carries. `dsv4_flash`/`opd_gdr` stub the
-    // Qwen/GDR TileLang attention FFI, so a Qwen serve must reject anything but
-    // `full` at model load instead of dying on the first forward (#161).
-    let kernel_set = match KernelSet::from_env() {
-        KernelSet::Full => "full",
-        KernelSet::Dsv4Flash => "dsv4_flash",
-        KernelSet::OpdGdr => "opd_gdr",
-    };
     std::fs::write(
         out_dir.join("kernel_build_identity.rs"),
-        format!(
-            "pub const KERNEL_BUILD_ID: &str = {id:?};\npub const KERNEL_SET: &str = {kernel_set:?};\n"
-        ),
+        format!("pub const KERNEL_BUILD_ID: &str = {id:?};\n"),
     )
     .expect("write kernel build identity");
 }
@@ -2296,7 +2170,6 @@ fn main() {
         return;
     }
 
-    let kernel_set = KernelSet::from_env();
     println!("cargo:rerun-if-env-changed=ARLE_NVCC_WRAPPER");
     println!("cargo:rerun-if-env-changed=ARLE_NVCC_SPLIT_COMPILE");
     let nvcc_wrapper = env_nonempty("ARLE_NVCC_WRAPPER");
@@ -2733,17 +2606,7 @@ fn main() {
         );
     }
 
-    if kernel_set.tilelang_aot_enabled() {
-        compile_tilelang_aot_kernels(
-            &registry,
-            &cuda_path,
-            &out_dir,
-            &sm_targets,
-            kernel_set.tilelang_gdr_only(),
-        );
-    } else {
-        compile_tilelang_stub_kernels(&registry, &cuda_path, &out_dir);
-    }
+    compile_tilelang_aot_kernels(&registry, &cuda_path, &out_dir, &sm_targets);
 
     println!("cargo:rustc-link-search=native={}", out_dir.display());
     println!("cargo:rustc-link-lib=static=kernels_cuda");
