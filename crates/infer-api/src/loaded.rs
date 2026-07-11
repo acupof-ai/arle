@@ -1879,6 +1879,7 @@ mod backend {
                 model_path,
                 num_slots,
                 config.total_pages,
+                config.max_total_tokens,
                 kv_dtype,
                 config.mem_fraction_static,
                 config.dspark_draft_model.as_deref(),

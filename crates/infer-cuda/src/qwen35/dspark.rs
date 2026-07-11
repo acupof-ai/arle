@@ -67,11 +67,14 @@ pub(crate) struct Qwen35DsparkHead {
     sin_cache: DeviceVec,
     /// Per-layer ctx-cache rows (== per-head cache stride): sliding layers hold
     /// `sliding_window + block_size` addressed as an absolute-position ring
-    /// (`row = pos % cap`); the full-attention layer holds `max_seq_len +
+    /// (`row = pos % cap`); the full-attention layer holds `ctx_cap +
     /// block_size` addressed linearly (`row = pos − ctx_base`).
     caps: Vec<usize>,
-    /// RoPE table length + full-layer cap = `max_seq_len + block_size` (noise
-    /// rows extend past the trunk cap by at most one block).
+    /// RoPE table length + full-layer cap = `ctx_cap + block_size`, where
+    /// `ctx_cap = min(max_seq_len, max_total_tokens)` — the per-request token
+    /// ceiling, NOT the whole-pool `max_seq_len`. Sizing the full draft layer
+    /// from the pool floor (128K) cost 512 MB/slot; the scheduler admits nothing
+    /// past `max_total_tokens`, so that is all the full layer ever caches.
     rope_cap: usize,
 }
 
@@ -429,6 +432,7 @@ pub(crate) fn load_dspark_head(
     ctx: &DeviceContext,
     dir: &Path,
     max_seq_len: usize,
+    max_total_tokens: usize,
     trunk_hidden: usize,
     trunk_layers: usize,
     trunk_vocab: usize,
@@ -561,10 +565,12 @@ pub(crate) fn load_dspark_head(
     }
 
     // Per-layer cache stride: sliding layers only ever read the last `window`
-    // keys, so a `window + block` ring suffices; the full-attention layer needs
-    // the whole `max_seq_len + block`. This is the memory win — 4/5 DFlash
-    // layers drop from the pool-sized cap to ~window.
-    let rope_cap = max_seq_len + cfg.block_size;
+    // keys, so a `window + block` ring suffices; the full-attention layer caches
+    // one request's accepted tokens — capped at the per-request ceiling
+    // `min(max_seq_len, max_total_tokens)`, NOT the whole KV-pool `max_seq_len`
+    // (128K floor = 512 MB/slot; the scheduler admits nothing longer).
+    let ctx_cap = max_seq_len.min(max_total_tokens.max(1));
+    let rope_cap = ctx_cap + cfg.block_size;
     let caps: Vec<usize> = layers
         .iter()
         .map(|l| {
