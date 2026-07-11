@@ -1,0 +1,57 @@
+crates/cli/src/serve_multiproc.rs
+  s_d04b61414cd72f::t_04d86bd42e749a 396,398
+crates/infer-core/src/lib.rs
+  s_d04b61414cd72f::t_9de54b807d1742 777-782
+crates/infer-cuda/src/executor.rs
+  s_f7ed4f3e11d0b0::t_3a6cbe53f22e32 359-360
+crates/infer-cuda/src/lib.rs
+  s_d04b61414cd72f::t_462eb19cd8ae1d 599-604
+crates/infer-cuda/src/ops/quant_linear.rs
+  s_cfb253b4119f5e::t_4ed576242335ce 69-70
+crates/infer-seam/src/lib.rs
+  s_d04b61414cd72f::t_3f9d028350d62a 135-140,182-186
+crates/infer-server/Cargo.toml
+  s_f7ed4f3e11d0b0::t_47ecfb27d33019 18
+crates/infer-server/src/execution.rs
+  s_f7ed4f3e11d0b0::t_1917efc992092f 51
+crates/infer-server/src/lib.rs
+  s_f7ed4f3e11d0b0::t_ce31d635337554 32,79-126,462-472,837-843,903-931,1086-1111
+crates/infer-server/src/multiproc_relay.rs
+  s_cfb253b4119f5e::t_3f0fc8099deae9 254-255,310-311,371-376,378,423
+crates/infer-server/src/schema.rs
+  s_f7ed4f3e11d0b0::t_5a3ad2082f2167 469,481-484,487-491,509,579,1045,1053-1060,1067
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "fb1e1896fa3ff51c2c359cb59bdc276392e8b834",
+  "prompts": {},
+  "sessions": {
+    "s_cfb253b4119f5e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-af4b5929e7b4522a0",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_d04b61414cd72f": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f4abd-3be6-7383-8207-dc00136055c2",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_f7ed4f3e11d0b0": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f4abd-66cf-7760-8afc-0bed582ad336",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
