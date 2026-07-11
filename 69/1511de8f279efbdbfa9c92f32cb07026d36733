@@ -1,0 +1,23 @@
+crates/cuda-kernels/build.rs
+  s_6c10e3a3628936::t_61436c437a4d5d 2155-2162,2165-2167
+crates/infer-cuda/src/executor.rs
+  s_6c10e3a3628936::t_4b25139454cfd0 212-220
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "691511de8f279efbdbfa9c92f32cb07026d36733",
+  "prompts": {},
+  "sessions": {
+    "s_6c10e3a3628936": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d79ef61e-503a-41eb-8cd2-6ddea3068ced",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
