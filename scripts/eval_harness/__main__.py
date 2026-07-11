@@ -5,7 +5,8 @@ Usage:
   python3 -m eval_harness prefix_reuse       # run one gate
   python3 -m eval_harness prefix_reuse needle_ladder  # multiple
 
-Env: PORT, MODEL, TEMPLATE, NEEDLE; token_reuse: PROMPT_TOKENS, GEN_TOKENS, PAGE
+Env: PORT, MODEL, TEMPLATE, NEEDLE; token_reuse: PROMPT_TOKENS, GEN_TOKENS, PAGE;
+multiturn_concurrent: CONCURRENCY, TURNS, PROMPT_TOKENS, GEN_TOKENS, PAGE
 Exit 0 = all pass, 1 = any fail.
 """
 from __future__ import annotations
@@ -16,6 +17,7 @@ import sys
 import os
 
 from . import GateRunner
+from .multiturn_concurrent import MultiTurnConcurrentGate
 from .needle_ladder import NeedleLadderGate
 from .prefix_reuse import PrefixReuseGate
 from .token_reuse import TokenReuseGate
@@ -24,6 +26,15 @@ GATES = {
     "needle_ladder": lambda: NeedleLadderGate(),
     "prefix_reuse": lambda: PrefixReuseGate(),
     "token_reuse": lambda: TokenReuseGate(
+        prompt_tokens=int(os.environ.get("PROMPT_TOKENS", "500")),
+        gen_tokens=int(os.environ.get("GEN_TOKENS", "128")),
+        page=int(os.environ.get("PAGE", "16")),
+    ),
+    "multiturn_concurrent": lambda: MultiTurnConcurrentGate(
+        concurrency=[
+            int(x) for x in os.environ.get("CONCURRENCY", "1,4,8,16").split(",") if x.strip()
+        ],
+        turns=int(os.environ.get("TURNS", "4")),
         prompt_tokens=int(os.environ.get("PROMPT_TOKENS", "500")),
         gen_tokens=int(os.environ.get("GEN_TOKENS", "128")),
         page=int(os.environ.get("PAGE", "16")),
