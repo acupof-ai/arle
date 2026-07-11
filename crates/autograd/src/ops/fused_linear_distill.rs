@@ -686,6 +686,320 @@ fn fused_linear_ce_loss_indexed_device(
     Ok(loss_id)
 }
 
+/// Per-token-weighted policy-gradient twin of [`fused_linear_ce_loss_indexed`]
+/// — a REINFORCE surrogate `Σ_p (-w_p · logπθ(t_p))` at a sparse set of hidden
+/// positions, chunked so it never materializes `[seq, vocab]`. Structure,
+/// dispatch, and grad-writeback mirror the CE op exactly; the ONLY difference is
+/// the per-position scale: the CE op uses a uniform `1/N`, this op uses
+/// `w_p = advantage · gate_p`.
+///
+/// Per position `p` with target token `t`:
+/// `logp = log_softmax(logits_p)[t]`; `r = exp(logp − rollout_logprobs[p])`
+/// (importance ratio vs the rollout policy); `gate = 1` iff
+/// `(1−eps_low) < r < (1+eps_high)` (double-sided HARD DIS clip mask, else `0`);
+/// `w = advantage · gate` — a DETACHED scalar weight. `loss += −w · logp`;
+/// `d_logits_p = w · (softmax(logits_p) − onehot(t))`. `r`/`gate`/`advantage`
+/// are weights only — the gradient flows solely through `logp` (no backprop
+/// through the ratio). `d_hidden` flows always (if `hidden.requires_grad`);
+/// `d_weight` only when the lm_head is trainable. f32 numerics throughout.
+#[allow(clippy::too_many_arguments)]
+pub fn fused_linear_pg_loss_indexed(
+    hidden: TensorId,
+    weight: TensorId,
+    position_indices: &[i32],
+    target_tokens: &[i32],
+    rollout_logprobs: &[f32],
+    advantage: f32,
+    eps_low: f32,
+    eps_high: f32,
+    chunk_rows: usize,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<TensorId> {
+    let shape = validate_ce_indexed_inputs(hidden, weight, position_indices, target_tokens, store)?;
+    if chunk_rows == 0 {
+        return Err(AutogradError::TapeInvariant(
+            "fused_linear_pg_loss_indexed: chunk_rows must be > 0",
+        ));
+    }
+    if rollout_logprobs.len() != position_indices.len() {
+        return Err(AutogradError::InvalidIndicesLen {
+            expected: position_indices.len(),
+            got: rollout_logprobs.len(),
+        });
+    }
+    if !(advantage.is_finite() && eps_low.is_finite() && eps_high.is_finite()) {
+        return Err(AutogradError::TapeInvariant(
+            "fused_linear_pg_loss_indexed: advantage/eps_low/eps_high must be finite",
+        ));
+    }
+    if rollout_logprobs.iter().any(|value| !value.is_finite()) {
+        return Err(AutogradError::TapeInvariant(
+            "fused_linear_pg_loss_indexed: rollout_logprobs must be finite",
+        ));
+    }
+
+    if !matches!(store.backend().device(), Device::Cpu) {
+        return fused_linear_pg_loss_indexed_device(
+            hidden,
+            weight,
+            position_indices,
+            target_tokens,
+            rollout_logprobs,
+            advantage,
+            eps_low,
+            eps_high,
+            chunk_rows,
+            &shape,
+            store,
+            tape,
+        );
+    }
+
+    let need_hidden_grad = store.tensor(hidden)?.requires_grad;
+    let need_weight_grad = store.tensor(weight)?.requires_grad;
+    let requires_grad = need_hidden_grad || need_weight_grad;
+    let hidden_data = store.to_host(hidden)?;
+    let weight_data = store.to_host(weight)?;
+
+    let mut grad_hidden = need_hidden_grad.then(|| vec![0.0_f32; hidden_data.len()]);
+    let mut grad_weight = need_weight_grad.then(|| vec![0.0_f32; weight_data.len()]);
+    let num_targets = position_indices.len();
+    let mut loss_sum = 0.0_f32;
+
+    for chunk_start in (0..num_targets).step_by(chunk_rows) {
+        let chunk_end = chunk_start.saturating_add(chunk_rows).min(num_targets);
+        for local in chunk_start..chunk_end {
+            let hidden_row = position_indices[local] as usize;
+            let target = target_tokens[local] as usize;
+            let hidden_base = hidden_row * shape.hidden_dim;
+            let hidden_slice = &hidden_data[hidden_base..hidden_base + shape.hidden_dim];
+
+            let mut logits = vec![0.0_f32; shape.vocab];
+            for (vocab_index, logit) in logits.iter_mut().enumerate() {
+                let weight_base = vocab_index * shape.hidden_dim;
+                let mut dot = 0.0_f32;
+                for hidden_index in 0..shape.hidden_dim {
+                    dot += hidden_slice[hidden_index] * weight_data[weight_base + hidden_index];
+                }
+                *logit = dot;
+            }
+
+            let log_probs = log_softmax_row(&logits);
+            let logp = log_probs[target];
+            // Detached DIS weight: ratio/gate/advantage are scalars, no grad path.
+            let r = (logp - rollout_logprobs[local]).exp();
+            let gate = if (1.0 - eps_low) < r && r < (1.0 + eps_high) {
+                1.0
+            } else {
+                0.0
+            };
+            let w = advantage * gate;
+            loss_sum -= w * logp;
+
+            // d_logits = w · (softmax − onehot), the CE gradient scaled by w.
+            let mut dlogits = vec![0.0_f32; shape.vocab];
+            for (vocab_index, dlogit) in dlogits.iter_mut().enumerate() {
+                *dlogit = w * log_probs[vocab_index].exp();
+            }
+            dlogits[target] -= w;
+
+            if let Some(grad_hidden) = grad_hidden.as_mut() {
+                for hidden_index in 0..shape.hidden_dim {
+                    let mut grad = 0.0_f32;
+                    for (vocab_index, &dlogit) in dlogits.iter().enumerate() {
+                        grad += dlogit * weight_data[vocab_index * shape.hidden_dim + hidden_index];
+                    }
+                    grad_hidden[hidden_base + hidden_index] += grad;
+                }
+            }
+            if let Some(grad_weight) = grad_weight.as_mut() {
+                for (vocab_index, &grad) in dlogits.iter().enumerate() {
+                    let weight_base = vocab_index * shape.hidden_dim;
+                    for hidden_index in 0..shape.hidden_dim {
+                        grad_weight[weight_base + hidden_index] +=
+                            grad * hidden_slice[hidden_index];
+                    }
+                }
+            }
+        }
+    }
+
+    let loss_id = store.alloc(Tensor::new(vec![loss_sum], Vec::new(), requires_grad)?);
+    if requires_grad {
+        let grad_hidden_id = grad_hidden
+            .map(|data| Ok(store.alloc(Tensor::new(data, shape.hidden_shape.clone(), false)?)))
+            .transpose()?;
+        let grad_weight_id = grad_weight
+            .map(|data| Ok(store.alloc(Tensor::new(data, shape.weight_shape.clone(), false)?)))
+            .transpose()?;
+        tape.record(TapeEntry {
+            op: BackwardOp::FusedLinearDistill,
+            output_id: loss_id,
+            input_ids: smallvec![hidden, weight],
+            saved: SavedContext::FusedLinearDistillCtx {
+                grad_hidden: grad_hidden_id,
+                grad_weight: grad_weight_id,
+            },
+        });
+    }
+
+    Ok(loss_id)
+}
+
+/// GPU path for [`fused_linear_pg_loss_indexed`] — mirrors
+/// [`fused_linear_ce_loss_indexed_device`], but replaces the uniform
+/// `mul_scalar(summed, -1/N)` with a per-position detached weight vector
+/// `neg_w_p = -(advantage · gate_p)` applied elementwise to the gathered
+/// target log-probs before the sum. `gate_p` is computed on host from a
+/// per-chunk readback of the gathered log-probs (the only extra readback vs
+/// the CE path); the multiply feeds `d_logits_p = w_p·(softmax − onehot)` back
+/// through log_softmax, matching the host path.
+#[allow(clippy::too_many_arguments)]
+fn fused_linear_pg_loss_indexed_device(
+    hidden: TensorId,
+    weight: TensorId,
+    position_indices: &[i32],
+    target_tokens: &[i32],
+    rollout_logprobs: &[f32],
+    advantage: f32,
+    eps_low: f32,
+    eps_high: f32,
+    chunk_rows: usize,
+    shape: &FusedLinearDistillShape,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<TensorId> {
+    let need_hidden_grad = store.tensor(hidden)?.requires_grad;
+    let need_weight_grad = store.tensor(weight)?.requires_grad;
+    let requires_grad = need_hidden_grad || need_weight_grad;
+    let num_targets = position_indices.len();
+
+    let total_rows = store.tensor(hidden)?.size / shape.hidden_dim;
+    let mut view_tape = Tape::new();
+    view_tape.set_enabled(false);
+    let hidden_2d = crate::ops::reshape(
+        hidden,
+        &[total_rows, shape.hidden_dim],
+        store,
+        &mut view_tape,
+    )?;
+
+    let mut loss_sum = 0.0_f32;
+    let mut grad_hidden_2d_accum: Option<TensorId> = None;
+    let mut grad_weight_accum: Option<TensorId> = None;
+
+    for chunk_start in (0..num_targets).step_by(chunk_rows) {
+        let live_before = store.live_ids().into_iter().collect::<HashSet<_>>();
+        let chunk_end = chunk_start.saturating_add(chunk_rows).min(num_targets);
+        let chunk_positions: Vec<usize> = position_indices[chunk_start..chunk_end]
+            .iter()
+            .map(|&p| p as usize)
+            .collect();
+        let chunk_targets: Vec<usize> = target_tokens[chunk_start..chunk_end]
+            .iter()
+            .map(|&t| t as usize)
+            .collect();
+
+        let mut chunk_tape = Tape::new();
+        chunk_tape.set_enabled(requires_grad);
+
+        let chunk_len = chunk_positions.len();
+        let hidden_rows_3d =
+            crate::ops::embedding(hidden_2d, &chunk_positions, store, &mut chunk_tape)?;
+        let hidden_rows = crate::ops::reshape(
+            hidden_rows_3d,
+            &[chunk_len, shape.hidden_dim],
+            store,
+            &mut chunk_tape,
+        )?;
+        let logits = crate::ops::matmul_bt(hidden_rows, weight, store, &mut chunk_tape)?;
+        let log_probs = crate::ops::log_softmax(logits, store, &mut chunk_tape)?;
+        let gathered =
+            crate::ops::gather_last_dim(log_probs, &chunk_targets, store, &mut chunk_tape)?;
+
+        // Detached per-position DIS weight negated for the -w·logp loss; read
+        // the gathered log-probs back to evaluate the hard ratio gate on host.
+        let gathered_logp = store.to_host(gathered)?;
+        let neg_w: Vec<f32> = gathered_logp
+            .iter()
+            .enumerate()
+            .map(|(offset, &logp)| {
+                let r = (logp - rollout_logprobs[chunk_start + offset]).exp();
+                let gate = if (1.0 - eps_low) < r && r < (1.0 + eps_high) {
+                    1.0
+                } else {
+                    0.0
+                };
+                -(advantage * gate)
+            })
+            .collect();
+        let neg_w_id = store.from_slice(&neg_w, &[chunk_len])?;
+        let weighted = crate::ops::mul(gathered, neg_w_id, store, &mut chunk_tape)?;
+        let chunk_loss = crate::ops::sum(weighted, store, &mut chunk_tape)?;
+        loss_sum += store.to_host(chunk_loss)?[0];
+
+        if requires_grad {
+            let grads = chunk_tape.backward_collect(chunk_loss, store)?;
+            if need_hidden_grad && let Some(&g) = grads.get(&hidden_2d) {
+                grad_hidden_2d_accum = Some(match grad_hidden_2d_accum.take() {
+                    None => store.clone_tensor(g)?,
+                    Some(acc) => {
+                        let next = crate::ops::add(acc, g, store, &mut view_tape)?;
+                        if store.get(acc).is_some() {
+                            store.free(acc)?;
+                        }
+                        next
+                    }
+                });
+            }
+            if need_weight_grad && let Some(&g) = grads.get(&weight) {
+                grad_weight_accum = Some(match grad_weight_accum.take() {
+                    None => store.clone_tensor(g)?,
+                    Some(acc) => {
+                        let next = crate::ops::add(acc, g, store, &mut view_tape)?;
+                        if store.get(acc).is_some() {
+                            store.free(acc)?;
+                        }
+                        next
+                    }
+                });
+            }
+        }
+
+        let keep = [grad_hidden_2d_accum, grad_weight_accum]
+            .into_iter()
+            .flatten()
+            .collect::<HashSet<_>>();
+        store.free_new_except(&live_before, &keep)?;
+    }
+
+    let loss_id = store.alloc(Tensor::new(vec![loss_sum], Vec::new(), requires_grad)?);
+    if requires_grad {
+        let grad_hidden_id = match grad_hidden_2d_accum {
+            Some(g) => {
+                let reshaped = crate::ops::reshape(g, &shape.hidden_shape, store, &mut view_tape)?;
+                if store.get(g).is_some() {
+                    store.free(g)?;
+                }
+                Some(reshaped)
+            }
+            None => None,
+        };
+        tape.record(TapeEntry {
+            op: BackwardOp::FusedLinearDistill,
+            output_id: loss_id,
+            input_ids: smallvec![hidden, weight],
+            saved: SavedContext::FusedLinearDistillCtx {
+                grad_hidden: grad_hidden_id,
+                grad_weight: grad_weight_accum,
+            },
+        });
+    }
+
+    Ok(loss_id)
+}
+
 pub(crate) fn fused_linear_distill_backward(
     entry: &TapeEntry,
     output_grad_id: TensorId,
@@ -1151,4 +1465,184 @@ fn log_softmax_row(row: &[f32]) -> Vec<f32> {
 fn logaddexp(a: f32, b: f32) -> f32 {
     let max_value = a.max(b);
     max_value + ((a - max_value).exp() + (b - max_value).exp()).ln()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn deterministic_vec(len: usize, seed: u64) -> Vec<f32> {
+        let mut state = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        (0..len)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let u = ((state >> 33) as f32) / ((1u64 << 31) as f32);
+                (u - 1.0) * 0.5
+            })
+            .collect()
+    }
+
+    /// The model's own current log-prob at each (position, target) — the
+    /// rollout-policy log-probs that make r = 1 (gate on) in the parity test.
+    fn model_target_logprobs(
+        hidden_data: &[f32],
+        weight_data: &[f32],
+        hidden_dim: usize,
+        vocab: usize,
+        positions: &[i32],
+        targets: &[i32],
+    ) -> Vec<f32> {
+        positions
+            .iter()
+            .zip(targets.iter())
+            .map(|(&p, &t)| {
+                let base = p as usize * hidden_dim;
+                let logits: Vec<f32> = (0..vocab)
+                    .map(|v| {
+                        (0..hidden_dim)
+                            .map(|h| hidden_data[base + h] * weight_data[v * hidden_dim + h])
+                            .sum::<f32>()
+                    })
+                    .collect();
+                log_softmax_row(&logits)[t as usize]
+            })
+            .collect()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_ce(
+        hidden_data: &[f32],
+        weight_data: &[f32],
+        seq: usize,
+        hidden_dim: usize,
+        vocab: usize,
+        positions: &[i32],
+        targets: &[i32],
+        chunk_rows: usize,
+    ) -> Result<(f32, Vec<f32>, Vec<f32>)> {
+        let mut store = TensorStore::default();
+        let mut tape = Tape::new();
+        let hidden = store.from_slice(hidden_data, &[1, seq, hidden_dim])?;
+        store.get_mut(hidden).expect("hidden").requires_grad = true;
+        let weight = store.from_slice(weight_data, &[vocab, hidden_dim])?;
+        store.get_mut(weight).expect("weight").requires_grad = true;
+        let loss = fused_linear_ce_loss_indexed(
+            hidden, weight, positions, targets, chunk_rows, &mut store, &mut tape,
+        )?;
+        let loss_value = store.to_host(loss)?[0];
+        let grads: HashMap<_, _> = tape.backward(loss, &mut store)?;
+        let d_hidden = store.to_host(*grads.get(&hidden).expect("d_hidden"))?;
+        let d_weight = store.to_host(*grads.get(&weight).expect("d_weight"))?;
+        Ok((loss_value, d_hidden, d_weight))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_pg(
+        hidden_data: &[f32],
+        weight_data: &[f32],
+        seq: usize,
+        hidden_dim: usize,
+        vocab: usize,
+        positions: &[i32],
+        targets: &[i32],
+        rollout_logprobs: &[f32],
+        advantage: f32,
+        eps_low: f32,
+        eps_high: f32,
+        chunk_rows: usize,
+    ) -> Result<(f32, Vec<f32>, Vec<f32>)> {
+        let mut store = TensorStore::default();
+        let mut tape = Tape::new();
+        let hidden = store.from_slice(hidden_data, &[1, seq, hidden_dim])?;
+        store.get_mut(hidden).expect("hidden").requires_grad = true;
+        let weight = store.from_slice(weight_data, &[vocab, hidden_dim])?;
+        store.get_mut(weight).expect("weight").requires_grad = true;
+        let loss = fused_linear_pg_loss_indexed(
+            hidden,
+            weight,
+            positions,
+            targets,
+            rollout_logprobs,
+            advantage,
+            eps_low,
+            eps_high,
+            chunk_rows,
+            &mut store,
+            &mut tape,
+        )?;
+        let loss_value = store.to_host(loss)?[0];
+        let grads: HashMap<_, _> = tape.backward(loss, &mut store)?;
+        let d_hidden = store.to_host(*grads.get(&hidden).expect("d_hidden"))?;
+        let d_weight = store.to_host(*grads.get(&weight).expect("d_weight"))?;
+        Ok((loss_value, d_hidden, d_weight))
+    }
+
+    fn max_abs(a: &[f32], b: &[f32]) -> f32 {
+        assert_eq!(a.len(), b.len());
+        a.iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0_f32, f32::max)
+    }
+
+    /// Unit-weight reduction: with `advantage = 1/N` and `rollout_logprobs` set
+    /// to the model's own current log-probs (so r = 1 → gate = 1 → w_p = 1/N),
+    /// the weighted PG op must equal the uniform-`1/N` CE op on loss AND grads.
+    #[test]
+    fn pg_reduces_to_ce_at_unit_weight() -> Result<()> {
+        let (seq, hidden_dim, vocab) = (8usize, 16usize, 32usize);
+        let hidden_data = deterministic_vec(seq * hidden_dim, 7);
+        let weight_data = deterministic_vec(vocab * hidden_dim, 11);
+        let positions: Vec<i32> = vec![0, 2, 3, 5, 6];
+        let targets: Vec<i32> = positions
+            .iter()
+            .map(|&p| ((p * 5 + 3) % 32) as i32)
+            .collect();
+        let n = positions.len();
+
+        let rollout = model_target_logprobs(
+            &hidden_data,
+            &weight_data,
+            hidden_dim,
+            vocab,
+            &positions,
+            &targets,
+        );
+
+        let (ce_loss, ce_dh, ce_dw) = run_ce(
+            &hidden_data,
+            &weight_data,
+            seq,
+            hidden_dim,
+            vocab,
+            &positions,
+            &targets,
+            3,
+        )?;
+        let (pg_loss, pg_dh, pg_dw) = run_pg(
+            &hidden_data,
+            &weight_data,
+            seq,
+            hidden_dim,
+            vocab,
+            &positions,
+            &targets,
+            &rollout,
+            1.0 / n as f32,
+            0.2,
+            0.2,
+            3,
+        )?;
+
+        let loss_err = (ce_loss - pg_loss).abs();
+        let dh_err = max_abs(&ce_dh, &pg_dh);
+        let dw_err = max_abs(&ce_dw, &pg_dw);
+        assert!(loss_err < 1e-5, "loss mismatch: ce={ce_loss} pg={pg_loss}");
+        assert!(dh_err < 1e-5, "d_hidden mismatch: max_abs={dh_err}");
+        assert!(dw_err < 1e-5, "d_weight mismatch: max_abs={dw_err}");
+        Ok(())
+    }
 }
