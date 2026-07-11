@@ -1,10 +1,12 @@
 # Plan — DSpark/DFlash draft for Qwen3.6 spec decode (OPD rollout lever)
 
-> Status: Active — 2026-07-09 · Driver: OPD rollout is decode-bound
-> (decode 80.4% of rollout wall, B=1 ~11 tok/s @45K after the sidecar
-> prefix-reuse fix). Native NextN-MTP nets only **1.03×** at depth 2
-> ([2026-06-23](../experience/wins/2026-06-23-mtp-replay-elimination-h20-net-win.md))
-> — accept-length-limited, not verify-limited anymore.
+> Status: Active — P0+P1 LICENSED 2026-07-11 · Driver: OPD rollout is
+> decode-bound (decode 80.4% of rollout wall, B=1 ~11 tok/s @45K). Native
+> NextN-MTP capped at 1.03×; **DSpark/DFlash backbone nets 2.39× (short) /
+> 3.14× (~3K ctx)** vs no-spec, greedy, no-prefix-hit
+> ([P1 license](../experience/wins/2026-07-11-dspark-p1-license-qwen36-27b.md)).
+> Next lever = P2.5 (prefix-restore) + draft-KV memory clamp — both gate the
+> OPD rollout regime (91% hit, 20–45K ctx).
 
 ## Verdict first
 

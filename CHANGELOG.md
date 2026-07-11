@@ -25,6 +25,16 @@ lifecycle & progress spine).
 
 ### Verdicts
 
+- **2026-07-11 — DSpark/DFlash block-draft spec-decode: P1 LICENSED** (Qwen3.6-27B,
+  CUDA). z-lab DFlash backbone drafter (`--spec-type dspark`) nets **2.39× decode
+  tok/s short-ctx / 3.14× at ~3K** vs no-spec on H20 TP=1, B=1 greedy, no-prefix-hit
+  — clears the 1.15× kill by a wide margin, above the 1.03× native-MTP ceiling that
+  motivated adoption. block-16 verify overhead does NOT eat the win; accept-rate
+  *rises* with ctx (0.199→0.228). Correctness PASS (needle + self-consistent).
+  NOT a default flip: OPD rollout regime (91% prefix hit, 20–45K ctx) still gated on
+  P2.5 (prefix-restore) + the 544 MB/slot draft-KV memory clamp.
+  [win](docs/experience/wins/2026-07-11-dspark-p1-license-qwen36-27b.md).
+
 - **2026-07-11 — DSv4 decode-region reuse: DEFAULT FLIPPED ON** (`--dsv4-decode-reuse`,
   was opt-in). Multi-turn concurrent A/B (token-preserving harness, the shape
   guidellm can't express) on H20 TP=4: aggregate throughput **+25.3% at c=16**,
