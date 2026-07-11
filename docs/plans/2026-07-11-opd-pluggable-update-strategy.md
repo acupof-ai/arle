@@ -46,6 +46,8 @@ impl UpdateStrategy {
 }
 ```
 
+Args passed directly — no `UpdateCtx` wrapper (that would be a speculative bundle).
+
 - `RejectionCe::update` = filter `reward > 0`, per trajectory `masked_writeback_ce_step`, mean.
 - `SaoDis::update` = advantage `A_i = reward_i − mean(reward)`; per trajectory
   `masked_writeback_dis_step(.., rollout_logprobs, A_i, eps_low, eps_high)`, mean.
@@ -64,10 +66,15 @@ impl UpdateStrategy {
    **Self-check** (`#[test]`): `advantage = 1/N`, `rollout_lp = logπθ` (→ r=1,
    gate=1, w=1/N) must reproduce `fused_linear_ce_loss_indexed` bit-for-bit.
 
-2. **opd.rs — DIS step + rollout-logprob capture**:
-   - `masked_writeback_dis_step<O>` = clone of `masked_writeback_ce_step` with the
-     fused call swapped to `fused_linear_pg_loss_indexed`; everything else
-     (forward, backward, optimizer, seq-adaptive offload) identical.
+2. **opd.rs — share the writeback skeleton, add rollout-logprob capture**:
+   - Do NOT clone `masked_writeback_ce_step`. Extract the shared skeleton
+     `masked_writeback_step<O>(loss: WritebackLoss, ..)` where
+     `WritebackLoss = Ce | Dis { rollout_logprobs: &[f32], advantage: f32, eps_low,
+     eps_high }`. Only the one fused-loss call branches on `loss` (Ce →
+     `fused_linear_ce_loss_indexed`, Dis → `fused_linear_pg_loss_indexed`);
+     forward, backward, optimizer, seq-adaptive offload are shared. Keep
+     `masked_writeback_ce_step` as a thin wrapper calling `..step(Ce, ..)` so the
+     public API + byte-identity hold.
    - `capture_rollout_logprobs(student, prompt_ids, response_ids, response_mask,
      store) -> Vec<f32>`: tape-OFF forward over prompt++response, gather
      `log_softmax(logits)[target]` at each response position. This is π_rollout at
