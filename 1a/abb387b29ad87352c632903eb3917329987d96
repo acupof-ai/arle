@@ -1,0 +1,21 @@
+scripts/kernel_artifacts.sh
+  s_6c10e3a3628936::t_048af03f15193a 19-31,33,36
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "1aabb387b29ad87352c632903eb3917329987d96",
+  "prompts": {},
+  "sessions": {
+    "s_6c10e3a3628936": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d79ef61e-503a-41eb-8cd2-6ddea3068ced",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
