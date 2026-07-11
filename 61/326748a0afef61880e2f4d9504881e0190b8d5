@@ -1,0 +1,21 @@
+docs/experience/wins/2026-07-11-unified-kernel-set-one-binary-qwen-and-dsv4.md
+  s_6c10e3a3628936::t_c77065e5ff5229 1-66
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "61326748a0afef61880e2f4d9504881e0190b8d5",
+  "prompts": {},
+  "sessions": {
+    "s_6c10e3a3628936": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d79ef61e-503a-41eb-8cd2-6ddea3068ced",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
