@@ -1,0 +1,35 @@
+benchmarks/operators/schema.json
+  s_89390f18fb950a::t_13f8b7f66d0a87 35,37-64,67,103,105,110-115,117-145,153-161
+crates/infer-cuda/examples/fp8_smallm_gemm_probe.rs
+  s_89390f18fb950a::t_89ba82d901195c 112-120,129-132,135-138,157-158,160
+scripts/reduce_operator_evidence.py
+  s_89390f18fb950a::t_bbc01f174eb6a9 10,84-109,112,116,238-243,245,248-253,303-334
+scripts/run_fp8_probe.sh
+  s_d04b61414cd72f::t_db69ac5b634d85 2,4-7,9-10,13,15-16,18-21,25,27-28,30-34,36-38,40-64,67-103,106-110,113-126,128-130
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "a7fd6ff37036e2ecdb6129b6161f556ca12e6658",
+  "prompts": {},
+  "sessions": {
+    "s_89390f18fb950a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f49f6-caaa-7600-bc7e-b25ce5c6da1b",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_d04b61414cd72f": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f4abd-3be6-7383-8207-dc00136055c2",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
