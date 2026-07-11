@@ -459,24 +459,56 @@ __global__ void dsv4_fp8_gemv_batch_kernel(
     }
 }
 
-// Weight-amortizing batch GEMV for the DSv4 FP8 decode path (default for B>1):
-// each 16-byte weight chunk is decoded ONCE and MAC'd against every batch
-// column in the tile. TILE is a COMPILE-TIME param so sums[TILE] uses exactly
-// TILE registers — the launcher picks the smallest tile covering B instead of
-// a fixed-32 accumulator (the Qwen sibling measured fixed-tile at
-// 2.15x/3.59x/6.50x vs templated 1.04x/1.07x/1.14x for B=2/4/8). Mirrors
-// fp8_f32_block_gemv_batch_tiled_kernel.
-template <int TILE>
-__global__ void dsv4_fp8_gemv_batch_tiled_kernel(
+// Per-16-chunk scale functors: the ONLY axis on which the DSv4 e8m0 and the
+// f32-block-scaled tiled fp8 GEMVs differ (#144). Row-invariant work (sr) is
+// loop-invariant and hoisted, so the hot path matches the hand-written pair this
+// replaces. `operator()(row, k)` returns the scale for the block covering k;
+// `k_block_16_aligned()` gates the uint4 fast path (a 16-chunk stays in one
+// scale block).
+struct Fp8E8m0BlockScale {
+    const uint8_t* scales;
+    int scale_rows;
+    int scale_cols;
+    int block_h;
+    int block_w;
+    __device__ __forceinline__ float operator()(int row, int k) const {
+        int sr = row / block_h;
+        if (sr >= scale_rows) sr = scale_rows - 1;
+        int sc = k / block_w;
+        if (sc >= scale_cols) sc = scale_cols - 1;
+        return dsv4_decode_e8m0(scales[sr * scale_cols + sc]);
+    }
+    __device__ __forceinline__ bool k_block_16_aligned() const { return (block_w % 16) == 0; }
+};
+
+struct Fp8F32BlockScale {
+    const float* scales;
+    int scale_rows;
+    int scale_cols;
+    int block_m;
+    int block_k;
+    __device__ __forceinline__ float operator()(int row, int k) const {
+        return fp8_f32_block_scale(scales, row, k, scale_rows, scale_cols, block_m, block_k);
+    }
+    __device__ __forceinline__ bool k_block_16_aligned() const { return (block_k % 16) == 0; }
+};
+
+// Weight-amortizing batch GEMV for the fp8 decode path (default for B>1): each
+// 16-byte weight chunk is decoded ONCE and MAC'd against every batch column in
+// the tile. TILE is a COMPILE-TIME param so sums[TILE] uses exactly TILE
+// registers — the launcher picks the smallest tile covering B (the Qwen sibling
+// measured fixed-tile at 2.15x/3.59x/6.50x vs templated 1.04x/1.07x/1.14x for
+// B=2/4/8). `ScaleFn` is the DSv4 e8m0 or the f32-block scale (#144 merged the
+// two byte-identical copies).
+template <int TILE, class ScaleFn>
+__global__ void fp8_gemv_batch_tiled_kernel(
     const uint8_t* __restrict__ weight,
-    const uint8_t* __restrict__ scales,
     const __nv_bfloat16* __restrict__ input,
     __nv_bfloat16* __restrict__ output,
     int B,
     int N,
     int K,
-    int scale_rows,
-    int scale_cols)
+    ScaleFn scale_fn)
 {
     int row = blockIdx.x * GEMV_ROWS + threadIdx.x / (GEMV_THREADS / GEMV_ROWS);
     int batch_base = blockIdx.y * TILE;
@@ -486,11 +518,6 @@ __global__ void dsv4_fp8_gemv_batch_tiled_kernel(
     int row_in_block = threadIdx.x / threads_per_row;
     if (row >= N) return;
 
-    const int block_h = (N + scale_rows - 1) / scale_rows;
-    const int block_w = (K + scale_cols - 1) / scale_cols;
-    const int sr_raw = row / block_h;
-    const int sr = sr_raw < scale_rows ? sr_raw : (scale_rows - 1);
-    const uint8_t* scale_row = scales + sr * scale_cols;
     const uint8_t* weight_row = weight + (int64_t)row * K;
     const int tile_batches_raw = B - batch_base;
     const int tile_batches = tile_batches_raw < TILE ? tile_batches_raw : TILE;
@@ -499,16 +526,14 @@ __global__ void dsv4_fp8_gemv_batch_tiled_kernel(
 #pragma unroll
     for (int b = 0; b < TILE; ++b) sums[b] = 0.0f;
 
-    // uint4 fast path (same alignment preconditions as the batch kernel above).
-    if ((K % 16) == 0 && (block_w % 16) == 0) {
+    // uint4 fast path: a 16-chunk carries one scale (guaranteed by K%16==0 and
+    // the scale block being 16-aligned in K). Decode the 16 fp8 weights ONCE,
+    // then MAC against every batch column in the tile (no per-column re-decode).
+    if ((K % 16) == 0 && scale_fn.k_block_16_aligned()) {
         const int kv = K / 16;
         for (int v = tid_in_row; v < kv; v += threads_per_row) {
             const int k = v * 16;
-            const int sc_raw = k / block_w;
-            const int sc = sc_raw < scale_cols ? sc_raw : (scale_cols - 1);
-            const float scale = dsv4_decode_e8m0(scale_row[sc]);
-            // Decode the 16 fp8 weights ONCE, then MAC against every batch
-            // column in the tile (no per-column re-decode).
+            const float scale = scale_fn(row, k);
             const auto* w4 = reinterpret_cast<const __nv_fp8x4_e4m3*>(weight_row + k);
             const float4 wf0 = static_cast<float4>(w4[0]);
             const float4 wf1 = static_cast<float4>(w4[1]);
@@ -523,19 +548,12 @@ __global__ void dsv4_fp8_gemv_batch_tiled_kernel(
             }
         }
     } else {
-        for (int sc = 0; sc < scale_cols; ++sc) {
-            const int k_start = sc * block_w;
-            if (k_start >= K) break;
-            int k_end = k_start + block_w;
-            if (k_end > K) k_end = K;
-            const float scale = dsv4_decode_e8m0(scale_row[sc]);
-            for (int k = k_start + tid_in_row; k < k_end; k += threads_per_row) {
-                const float w = dsv4_decode_fp8_e4m3(weight_row[k]) * scale;
+        for (int k = tid_in_row; k < K; k += threads_per_row) {
+            const float w = dsv4_decode_fp8_e4m3(weight_row[k]) * scale_fn(row, k);
 #pragma unroll
-                for (int b = 0; b < TILE; ++b) {
-                    if (b < tile_batches) {
-                        sums[b] += w * __bfloat162float(input[(int64_t)(batch_base + b) * K + k]);
-                    }
+            for (int b = 0; b < TILE; ++b) {
+                if (b < tile_batches) {
+                    sums[b] += w * __bfloat162float(input[(int64_t)(batch_base + b) * K + k]);
                 }
             }
         }
@@ -857,111 +875,6 @@ __global__ void fp8_wread_probe_kernel(
         for (int w = 0; w < warps_per_row; w++)
             total += smem[row_in_block * warps_per_row + w];
         output[row] = total;
-    }
-}
-
-// Weight-amortizing batch GEMV for the Qwen FP8 block-scaled decode path
-// (default for B>1). grid.y maps to a tile of
-// QWEN_GEMV_BATCH_TILE columns: each 16-byte weight chunk is read once
-// (L1-resident across the inner batch loop) and MAC'd against every column in
-// the tile, vs fp8_f32_block_gemv_batch_kernel which re-streams the weight row
-// per batch element. Numerics identical (same scale, same fp8_f32_dot16, same
-// per-column accumulation order). Mirrors dsv4_fp8_gemv_batch_tiled_kernel.
-// TILE is a COMPILE-TIME template param so sums[TILE] uses exactly TILE
-// registers. The launcher instantiates TILE == B for the small spec-decode
-// verify depths (B<=8) so grid.y=1 (weight read ONCE) and register pressure
-// matches the actual batch — NOT a fixed-8 array that craters occupancy at
-// small B. L4 sm_89 (gemv_bench, cosine 1.0): TILE==B verify costs 1.04x(B=2) /
-// 1.07x(B=4) / 1.14x(B=8) of a single decode vs the default grid.y=B kernel's
-// 2.15x/3.59x/6.50x — the extra columns hide in the B=1 weight-load bubbles.
-template <int TILE>
-__global__ void fp8_f32_block_gemv_batch_tiled_kernel(
-    const uint8_t* __restrict__ weight,
-    const float* __restrict__ scales,
-    const __nv_bfloat16* __restrict__ input,
-    __nv_bfloat16* __restrict__ output,
-    int B,
-    int N,
-    int K,
-    int scale_rows,
-    int scale_cols,
-    int block_m,
-    int block_k)
-{
-    int row = blockIdx.x * GEMV_ROWS + threadIdx.x / (GEMV_THREADS / GEMV_ROWS);
-    int batch_base = blockIdx.y * TILE;
-    int tid_in_row = threadIdx.x % (GEMV_THREADS / GEMV_ROWS);
-    int threads_per_row = GEMV_THREADS / GEMV_ROWS;
-    int lane_id = threadIdx.x % WARP_SIZE;
-    int row_in_block = threadIdx.x / threads_per_row;
-    if (row >= N) return;
-    const int tile_batches_raw = B - batch_base;
-    const int tile_batches = tile_batches_raw < TILE ? tile_batches_raw : TILE;
-
-    float sums[TILE];
-#pragma unroll
-    for (int b = 0; b < TILE; ++b) sums[b] = 0.0f;
-
-    const uint8_t* weight_row = weight + (int64_t)row * K;
-    if ((K % 16) == 0 && (block_k % 16) == 0) {
-        const int kv = K / 16;
-        for (int v = tid_in_row; v < kv; v += threads_per_row) {
-            const int k = v * 16;
-            const float scale =
-                fp8_f32_block_scale(scales, row, k, scale_rows, scale_cols, block_m, block_k);
-            // Decode the 16 fp8 weights ONCE (HBM read amortized via L1 + the
-            // fp8->fp32 conversion done once), then MAC against every batch
-            // column in the tile — the per-column re-decode is what made the
-            // naive tiled variant compute-bound at B>1.
-            const auto* w4 = reinterpret_cast<const __nv_fp8x4_e4m3*>(weight_row + k);
-            const float4 wf0 = static_cast<float4>(w4[0]);
-            const float4 wf1 = static_cast<float4>(w4[1]);
-            const float4 wf2 = static_cast<float4>(w4[2]);
-            const float4 wf3 = static_cast<float4>(w4[3]);
-#pragma unroll
-            for (int b = 0; b < TILE; ++b) {
-                if (b < tile_batches) {
-                    const __nv_bfloat16* x_b = input + (int64_t)(batch_base + b) * K;
-                    sums[b] += scale * dot16_with_decoded(wf0, wf1, wf2, wf3, x_b + k);
-                }
-            }
-        }
-    } else {
-        for (int k = tid_in_row; k < K; k += threads_per_row) {
-            const float w = dsv4_decode_fp8_e4m3(weight_row[k])
-                * fp8_f32_block_scale(scales, row, k, scale_rows, scale_cols, block_m, block_k);
-#pragma unroll
-            for (int b = 0; b < TILE; ++b) {
-                if (b < tile_batches) {
-                    const int64_t batch_idx = (int64_t)(batch_base + b);
-                    sums[b] += w * __bfloat162float(input[batch_idx * K + k]);
-                }
-            }
-        }
-    }
-
-    __shared__ float smem[GEMV_ROWS * 8 * TILE];
-    int warps_per_row = threads_per_row / WARP_SIZE;
-    int warp_in_row = (threadIdx.x % threads_per_row) / WARP_SIZE;
-#pragma unroll
-    for (int b = 0; b < TILE; ++b) {
-        sums[b] = warp_reduce_sum(sums[b]);
-        if (lane_id == 0) {
-            smem[(row_in_block * warps_per_row + warp_in_row) * TILE + b] = sums[b];
-        }
-    }
-    __syncthreads();
-    if (tid_in_row == 0) {
-#pragma unroll
-        for (int b = 0; b < TILE; ++b) {
-            if (b >= tile_batches) continue;
-            const int64_t batch_idx = (int64_t)(batch_base + b);
-            float total = 0.0f;
-            for (int w = 0; w < warps_per_row; ++w) {
-                total += smem[(row_in_block * warps_per_row + w) * TILE + b];
-            }
-            output[batch_idx * N + row] = __float2bfloat16(total);
-        }
     }
 }
 
@@ -2625,16 +2538,18 @@ cudaError_t dsv4_fp8_gemv_batch_cuda(
         dim3 block(GEMV_THREADS);
         // TILE = smallest of {2,4,8,16,32} covering min(B, 32): accumulator
         // register pressure tracks the actual batch, grid.y tiles the rest.
+        const int block_h = (N + scale_rows - 1) / scale_rows;
+        const int block_w = (K + scale_cols - 1) / scale_cols;
+        Fp8E8m0BlockScale scale_fn{scales, scale_rows, scale_cols, block_h, block_w};
         auto launch = [&](auto kern, int tile) {
             dim3 grid((N + GEMV_ROWS - 1) / GEMV_ROWS, (B + tile - 1) / tile);
-            kern<<<grid, block, 0, stream>>>(
-                weight, scales, input, output, B, N, K, scale_rows, scale_cols);
+            kern<<<grid, block, 0, stream>>>(weight, input, output, B, N, K, scale_fn);
         };
-        if (B <= 2) launch(dsv4_fp8_gemv_batch_tiled_kernel<2>, 2);
-        else if (B <= 4) launch(dsv4_fp8_gemv_batch_tiled_kernel<4>, 4);
-        else if (B <= 8) launch(dsv4_fp8_gemv_batch_tiled_kernel<8>, 8);
-        else if (B <= 16) launch(dsv4_fp8_gemv_batch_tiled_kernel<16>, 16);
-        else launch(dsv4_fp8_gemv_batch_tiled_kernel<DSV4_BATCH_TILE>, DSV4_BATCH_TILE);
+        if (B <= 2) launch(fp8_gemv_batch_tiled_kernel<2, Fp8E8m0BlockScale>, 2);
+        else if (B <= 4) launch(fp8_gemv_batch_tiled_kernel<4, Fp8E8m0BlockScale>, 4);
+        else if (B <= 8) launch(fp8_gemv_batch_tiled_kernel<8, Fp8E8m0BlockScale>, 8);
+        else if (B <= 16) launch(fp8_gemv_batch_tiled_kernel<16, Fp8E8m0BlockScale>, 16);
+        else launch(fp8_gemv_batch_tiled_kernel<DSV4_BATCH_TILE, Fp8E8m0BlockScale>, DSV4_BATCH_TILE);
         return cudaGetLastError();
     }
     dim3 grid((N + GEMV_ROWS - 1) / GEMV_ROWS, B);
@@ -2707,20 +2622,20 @@ cudaError_t gemv_fp8_block_scaled_batch_cuda(
         // Instantiate TILE == B for the small spec-verify depths (grid.y=1 →
         // weight read ONCE, register pressure == B). B>8 falls back to the
         // fixed-8 tile with grid.y batching.
+        Fp8F32BlockScale scale_fn{scales, scale_rows, scale_cols, block_m, block_k};
         auto launch = [&](auto kern, int tile) {
             dim3 grid((N + GEMV_ROWS - 1) / GEMV_ROWS, (B + tile - 1) / tile);
-            kern<<<grid, block, 0, stream>>>(
-                weight, scales, input, output, B, N, K, scale_rows, scale_cols, block_m, block_k);
+            kern<<<grid, block, 0, stream>>>(weight, input, output, B, N, K, scale_fn);
         };
         switch (B) {
-            case 2: launch(fp8_f32_block_gemv_batch_tiled_kernel<2>, 2); break;
-            case 3: launch(fp8_f32_block_gemv_batch_tiled_kernel<3>, 3); break;
-            case 4: launch(fp8_f32_block_gemv_batch_tiled_kernel<4>, 4); break;
-            case 5: launch(fp8_f32_block_gemv_batch_tiled_kernel<5>, 5); break;
-            case 6: launch(fp8_f32_block_gemv_batch_tiled_kernel<6>, 6); break;
-            case 7: launch(fp8_f32_block_gemv_batch_tiled_kernel<7>, 7); break;
-            case 8: launch(fp8_f32_block_gemv_batch_tiled_kernel<8>, 8); break;
-            default: launch(fp8_f32_block_gemv_batch_tiled_kernel<QWEN_GEMV_BATCH_TILE>, QWEN_GEMV_BATCH_TILE); break;
+            case 2: launch(fp8_gemv_batch_tiled_kernel<2, Fp8F32BlockScale>, 2); break;
+            case 3: launch(fp8_gemv_batch_tiled_kernel<3, Fp8F32BlockScale>, 3); break;
+            case 4: launch(fp8_gemv_batch_tiled_kernel<4, Fp8F32BlockScale>, 4); break;
+            case 5: launch(fp8_gemv_batch_tiled_kernel<5, Fp8F32BlockScale>, 5); break;
+            case 6: launch(fp8_gemv_batch_tiled_kernel<6, Fp8F32BlockScale>, 6); break;
+            case 7: launch(fp8_gemv_batch_tiled_kernel<7, Fp8F32BlockScale>, 7); break;
+            case 8: launch(fp8_gemv_batch_tiled_kernel<8, Fp8F32BlockScale>, 8); break;
+            default: launch(fp8_gemv_batch_tiled_kernel<QWEN_GEMV_BATCH_TILE, Fp8F32BlockScale>, QWEN_GEMV_BATCH_TILE); break;
         }
         return cudaGetLastError();
     }
