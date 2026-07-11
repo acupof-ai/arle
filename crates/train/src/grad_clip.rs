@@ -8,7 +8,7 @@ use autograd::{Device, Result, TensorId, TensorStore, tensor::Dirty};
 /// Pre-clip global L2 norm across every param's gradient.
 ///
 /// Missing grads are skipped (matches `clip_grad_norm`'s traversal).
-fn compute_global_norm_f64(params: &[TensorId], store: &TensorStore) -> f64 {
+pub fn compute_global_norm_f64(params: &[TensorId], store: &TensorStore) -> f64 {
     let mut total_sq_norm = 0.0_f64;
     for &param_id in params {
         let Some(grad_id) = store.get(param_id).and_then(|tensor| tensor.grad) else {

@@ -3189,6 +3189,13 @@ pub fn masked_writeback_step<O: Optimizer>(
     let bwd_secs = t_bwd.elapsed().as_secs_f64();
     let vram_post_backward = log_writeback_vram(store, "masked-writeback", "post backward");
     eprintln!("[masked-writeback] phase=backward seconds={bwd_secs:.3}");
+    // Pre-step grad-norm telemetry. The prod `clip_grad_norm` logger sits on the
+    // non-writeback OPD paths; the agentic-OPD writeback steps the optimizer here
+    // directly, so surface the global L2 norm at this step too (env-gated).
+    if std::env::var("ARLE_OPD_LOG_GRAD_NORM").is_ok() {
+        let gn = crate::grad_clip::compute_global_norm_f64(trainable_params, store);
+        eprintln!("[writeback-grad] grad_norm={gn:.6e}");
+    }
     let t_opt = Instant::now();
     optimizer.step(store, trainable_params)?;
     optimizer.zero_grad(store, trainable_params);
@@ -3268,6 +3275,15 @@ pub fn capture_rollout_logprobs(
         .shape
         .last()
         .ok_or_else(|| OpdError::InvalidInput("rollout-logprob: empty hidden shape".to_owned()))?;
+    let dbg = std::env::var("ARLE_OPD_LOG_DIS_STATS").is_ok();
+    let shp = |store: &TensorStore, id| store.get(id).map(|t| t.shape.clone());
+    if dbg {
+        eprintln!(
+            "[capture] seq_len={seq_len} targets={} hidden_shape={:?} hidden_dim={hidden_dim}",
+            loss_targets.len(),
+            shp(store, hidden),
+        );
+    }
     let hidden_2d =
         reshape(hidden, &[seq_len, hidden_dim], store, &mut tape).map_err(OpdError::from)?;
     let lm_head = student.lm_head_weight_id();
@@ -3284,6 +3300,14 @@ pub fn capture_rollout_logprobs(
             embedding(hidden_2d, &rows, store, &mut tape).map_err(OpdError::from)?;
         let rows_hidden = reshape(rows_hidden_3d, &[rows.len(), hidden_dim], store, &mut tape)
             .map_err(OpdError::from)?;
+        if dbg {
+            eprintln!(
+                "[capture] chunk rows={} rows_hidden={:?} lm_head={:?}",
+                rows.len(),
+                shp(store, rows_hidden),
+                shp(store, lm_head),
+            );
+        }
         let logits = matmul_bt(rows_hidden, lm_head, store, &mut tape).map_err(OpdError::from)?;
         let logp = log_softmax(logits, store, &mut tape).map_err(OpdError::from)?;
         let gathered = gather_last_dim(logp, &targets, store, &mut tape).map_err(OpdError::from)?;
