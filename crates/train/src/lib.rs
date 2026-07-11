@@ -76,6 +76,8 @@ pub mod tokenizer;
 pub mod trainer;
 #[path = "trajectory_scorer.rs"]
 pub mod trajectory_scorer;
+#[path = "update_strategy.rs"]
+pub mod update_strategy;
 
 pub use causal_lm::CausalLm;
 pub use grad_accum::GradAccumulator;
