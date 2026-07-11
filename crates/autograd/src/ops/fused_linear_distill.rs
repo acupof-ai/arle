@@ -935,7 +935,12 @@ fn fused_linear_pg_loss_indexed_device(
             })
             .collect();
         let neg_w_id = store.from_slice(&neg_w, &[chunk_len])?;
-        let weighted = crate::ops::mul(gathered, neg_w_id, store, &mut chunk_tape)?;
+        // gather_last_dim can return [chunk_len, 1]; flatten to rank-1 so the
+        // per-position weight mul (and its backward) stays rank-1 — otherwise the
+        // broadcast emits a rank-3 grad into matmul_bt's rank-2 backward. CE sums
+        // first then scales by a scalar and sidesteps this; the DIS weight can't.
+        let gathered_1d = crate::ops::reshape(gathered, &[chunk_len], store, &mut chunk_tape)?;
+        let weighted = crate::ops::mul(gathered_1d, neg_w_id, store, &mut chunk_tape)?;
         let chunk_loss = crate::ops::sum(weighted, store, &mut chunk_tape)?;
         loss_sum += store.to_host(chunk_loss)?[0];
 
