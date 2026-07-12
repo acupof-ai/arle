@@ -23,7 +23,11 @@ pip download --no-cache-dir --no-deps --no-binary :all: -d "$work" "apache-tvm-f
 tar -xzf "$work"/apache*tvm*ffi-*.tar.gz -C "$work"
 src="$(ls -d "$work"/apache*tvm*ffi-*/)"
 patch -p1 -d "$src" < "$PATCH"
-# no-build-isolation reuses the runner's cmake/ninja; fall back to isolated.
+# The tvm-ffi sdist's build backend parses PEP 639 license expressions via
+# packaging.licenses (setuptools>=77 / packaging>=24.2); the runner's stock
+# setuptools is too old ("Cannot import packaging.licenses"). Upgrade before
+# building. --no-build-isolation then reuses this env + the runner's cmake/ninja.
+pip install --no-cache-dir -U 'setuptools>=77' 'packaging>=24.2' wheel scikit-build-core
 pip wheel --no-cache-dir --no-deps --no-build-isolation -w "$work" "$src" \
   || pip wheel --no-cache-dir --no-deps -w "$work" "$src"
 pip install --force-reinstall --no-deps "$work"/apache*tvm*ffi-*.whl
