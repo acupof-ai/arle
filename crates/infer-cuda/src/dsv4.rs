@@ -635,6 +635,11 @@ pub(crate) struct Dsv4SlotState {
     /// slot — layers run sequentially so a single scratch suffices.
     #[cfg(feature = "deepep")]
     deepep_ll_scratch: Option<crate::deepep::DeepEpLlScratch>,
+    /// DSpark T3 tap buffers: the wide HC residual stream captured at each
+    /// `config.dspark_target_layer_ids` layer OUTPUT (`hidden_states[layer+1]`),
+    /// one `DeviceVec` of `hidden_size * hc_mult`, index-aligned with the id
+    /// list. The T4 draft fuses these; empty (zero cost) unless `is_dspark()`.
+    dspark_taps: Vec<DeviceVec>,
     seq_len: usize,
     max_seq_len: usize,
 }
@@ -1110,6 +1115,19 @@ impl Dsv4SlotState {
             }
             _ => None,
         };
+        // DSpark tap buffers: one wide-stream capture slot per target layer.
+        // Empty (no alloc) unless this is a DSpark checkpoint.
+        let dspark_taps = if model.config.is_dspark() {
+            let stream_dim = model.config.hidden_size * model.config.hc_mult;
+            model
+                .config
+                .dspark_target_layer_ids
+                .iter()
+                .map(|_| DeviceVec::zeros(&model.ctx, stream_dim))
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
         Ok(Self {
             attention,
             spec_rings,
@@ -1119,6 +1137,7 @@ impl Dsv4SlotState {
             decode_graph: None,
             #[cfg(feature = "deepep")]
             deepep_ll_scratch,
+            dspark_taps,
             seq_len: 0,
             max_seq_len,
         })
@@ -1166,6 +1185,14 @@ impl Dsv4SlotState {
                 self.start_pos_device.len() * std::mem::size_of::<i32>(),
             ),
         ]
+    }
+
+    /// DSpark T3: wide-stream taps captured at `config.dspark_target_layer_ids`
+    /// (index-aligned), empty off the DSpark path. The T4 draft reads these to
+    /// build its fused context; unused until then.
+    #[allow(dead_code)]
+    pub(crate) fn dspark_taps(&self) -> &[DeviceVec] {
+        &self.dspark_taps
     }
 
     /// Sub-struct byte totals summed across ALL attention layers (sw_window /
@@ -2526,8 +2553,12 @@ impl Dsv4Model {
         // indexer/sparse-attention forward) before relying on it for GLM serving.
         // Lens needs the eager layer loop — a graph replay never executes it
         // (the entropy probe is unaffected: sampling runs outside the graph).
+        // DSpark needs the eager per-layer loop to capture the 3 target-layer
+        // taps (a graph replay skips the loop), same reason lens / hidden-capture
+        // fall through here. Byte-identical when `is_dspark()` is false.
         if dsv4_decode_graph_enabled()
             && last_hidden_out.is_none()
+            && !self.config.is_dspark()
             && seq_len == 1
             && !use_deepep_transport
             && crate::probe::lens_layers() == 0
@@ -5447,6 +5478,9 @@ impl Dsv4Model {
         let seq_len = tokens.len();
         let eps = self.config.rms_norm_eps;
         let use_deepep_transport = dsv4_use_deepep_transport()?;
+        // DSpark T3: capture the wide stream at each target layer output. One bool
+        // check per layer when off; the position scan only runs when on.
+        let dspark = self.config.is_dspark();
         let mut keepalive = Dsv4ForwardKeepalive::new(false);
         let ctx = &self.ctx;
         // DEBUG: catch any deferred CUDA error from init/boot before first forward op.
@@ -6002,6 +6036,24 @@ impl Dsv4Model {
             }
             keepalive.keep_hidden(&ffn_stream);
             stream = ffn_stream;
+            // DSpark T3: capture the wide HC stream at this layer's OUTPUT
+            // (hidden_states[layer_idx+1]) for the row being predicted, when this
+            // layer is a DSpark target. D2D copy only (graph-safe, no readback);
+            // gated by `dspark` so the default path is byte-identical.
+            if dspark
+                && let Some(tap_idx) = self
+                    .config
+                    .dspark_target_layer_ids
+                    .iter()
+                    .position(|&l| l == layer_idx)
+            {
+                self.capture_mtp_stream_hidden(
+                    &stream,
+                    seq_len - 1,
+                    &mut slot.dspark_taps[tap_idx],
+                    &mut keepalive,
+                )?;
+            }
             // Lens capture: head-project the layer's final stream (row 0, the
             // decode token) and stash the DEVICE logits (no sync/D2H until
             // lens_flush at the post-sampling sync point).
