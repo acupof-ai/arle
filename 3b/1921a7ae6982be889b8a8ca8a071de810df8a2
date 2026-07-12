@@ -1,0 +1,23 @@
+crates/deepseek-spec/src/glm.rs
+  s_fd5fcc2bbb15fb::t_d4745313d33ca9 299-303
+crates/deepseek-spec/src/v4.rs
+  s_fd5fcc2bbb15fb::t_de77b7b326fc3c 107-116,254-261,1225-1306,1544-1696
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "3b1921a7ae6982be889b8a8ca8a071de810df8a2",
+  "prompts": {},
+  "sessions": {
+    "s_fd5fcc2bbb15fb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a5beb185c2cdc1319",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
