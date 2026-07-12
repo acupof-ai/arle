@@ -104,6 +104,16 @@ pub struct DeepSeekV4Config {
     /// names byte-unchanged; `Glm` ⇒ GLM-5.2 HF names.
     #[serde(skip)]
     pub tensor_dialect: TensorDialect,
+    // DSpark spec-decode config. `dspark_block_size == 0` ⇒ not a DSpark
+    // checkpoint (native MTP / non-spec), byte-unchanged. Real ckpt: 5.
+    #[serde(default)]
+    pub dspark_block_size: usize,
+    #[serde(default)]
+    pub dspark_target_layer_ids: Vec<usize>,
+    #[serde(default)]
+    pub dspark_markov_rank: usize,
+    #[serde(default)]
+    pub dspark_noise_token_id: u32,
 }
 
 impl DeepSeekV4Config {
@@ -239,6 +249,14 @@ impl DeepSeekV4Config {
 
     pub fn mtp_tensor_names(&self, mtp_idx: usize) -> DeepSeekV4MtpTensorNames {
         DeepSeekV4MtpTensorNames::new(format!("mtp.{mtp_idx}"), self.n_shared_experts > 0)
+    }
+
+    pub fn is_dspark(&self) -> bool {
+        self.dspark_block_size > 0
+    }
+
+    pub fn dspark_tensor_names(&self, mtp_idx: usize) -> DeepSeekV4DsparkTensorNames {
+        DeepSeekV4DsparkTensorNames::new(format!("mtp.{mtp_idx}"), self.n_shared_experts > 0)
     }
 
     pub fn shard_for_global_tensor(&self, name: &str) -> Option<Shard> {
@@ -1204,6 +1222,88 @@ impl DeepSeekV4MtpTensorNames {
     }
 }
 
+/// DSpark spec-decode draft tensor set (`mtp.0.*`). Unlike native MTP it drops
+/// the 1-tap combine (`enorm`/`hnorm`/`e_proj`/`h_proj`/bare `norm`) — the draft
+/// reuses the base model's final norm + lm_head — and adds the 3-tap fusion
+/// (`main_proj`/`main_norm`), a low-rank Markov token-transition head
+/// (`markov_w1`/`markov_w2`), and a `confidence_proj` scalar head. The MLA attn
+/// + full MoE body is identical to native MTP.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeepSeekV4DsparkTensorNames {
+    pub prefix: String,
+    pub main_proj: String,
+    pub main_norm: String,
+    pub attn_norm: String,
+    pub ffn_norm: String,
+    pub markov_w1: String,
+    pub markov_w2: String,
+    pub confidence_proj: String,
+    pub hc_attn: DeepSeekV4HyperConnectionTensorNames,
+    pub hc_ffn: DeepSeekV4HyperConnectionTensorNames,
+    pub hc_head: DeepSeekV4HyperConnectionTensorNames,
+    pub attn: DeepSeekV4AttentionTensorNames,
+    pub ffn: DeepSeekV4MoeTensorNames,
+}
+
+impl DeepSeekV4DsparkTensorNames {
+    fn new(prefix: String, include_shared_experts: bool) -> Self {
+        Self {
+            main_proj: format!("{prefix}.main_proj.weight"),
+            main_norm: format!("{prefix}.main_norm.weight"),
+            attn_norm: format!("{prefix}.attn_norm.weight"),
+            ffn_norm: format!("{prefix}.ffn_norm.weight"),
+            markov_w1: format!("{prefix}.markov_head.markov_w1.weight"),
+            markov_w2: format!("{prefix}.markov_head.markov_w2.weight"),
+            confidence_proj: format!("{prefix}.confidence_head.proj.weight"),
+            hc_attn: DeepSeekV4HyperConnectionTensorNames::new(&format!("{prefix}.hc_attn")),
+            hc_ffn: DeepSeekV4HyperConnectionTensorNames::new(&format!("{prefix}.hc_ffn")),
+            hc_head: DeepSeekV4HyperConnectionTensorNames::new(&format!("{prefix}.hc_head")),
+            // DSpark is DSv4-only: DSv4 dialect, no indexer (compress_ratio=0),
+            // no dense MLP — mirrors the native MTP body exactly.
+            attn: DeepSeekV4AttentionTensorNames::new(
+                format!("{prefix}.attn"),
+                0,
+                TensorDialect::Dsv4,
+                false,
+            ),
+            ffn: DeepSeekV4MoeTensorNames::new(
+                format!("{prefix}.ffn"),
+                false,
+                include_shared_experts,
+                TensorDialect::Dsv4,
+                false,
+            ),
+            prefix,
+        }
+    }
+
+    pub fn shard_for(
+        &self,
+        config: &DeepSeekV4Config,
+        name: &str,
+        tensor_parallel_size: usize,
+    ) -> Option<Shard> {
+        if name == self.main_norm || name == self.attn_norm || name == self.ffn_norm {
+            return Some(Shard::Replicated);
+        }
+        // 3-tap fusion over full 3*hidden and the small Markov/confidence heads
+        // are replicated (no TP shard), like the native e_proj/h_proj.
+        if name == self.main_proj
+            || name == self.markov_w1
+            || name == self.markov_w2
+            || name == self.confidence_proj
+        {
+            return Some(Shard::Replicated);
+        }
+        self.hc_attn
+            .shard_for(name)
+            .or_else(|| self.hc_ffn.shard_for(name))
+            .or_else(|| self.hc_head.shard_for(name))
+            .or_else(|| self.attn.shard_for(config, name, tensor_parallel_size))
+            .or_else(|| self.ffn.shard_for(name))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1439,6 +1539,159 @@ mod tests {
             mtp.ffn.shared_experts.as_ref().unwrap().w3,
             "mtp.0.ffn.shared_experts.w3.weight"
         );
+    }
+
+    #[test]
+    fn dspark_tensor_names_match_checkpoint_layout() {
+        let cfg = DeepSeekV4Config::from_json_str(
+            r#"{
+            "architectures": ["DeepseekV4ForCausalLM"],
+            "model_type": "deepseek_v4",
+            "torch_dtype": "bfloat16",
+            "vocab_size": 129280,
+            "hidden_size": 4096,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 64,
+            "num_key_value_heads": 1,
+            "head_dim": 512,
+            "hidden_act": "silu",
+            "swiglu_limit": 10.0,
+            "q_lora_rank": 1024,
+            "o_lora_rank": 1024,
+            "o_groups": 8,
+            "qk_rope_head_dim": 64,
+            "n_routed_experts": 256,
+            "n_shared_experts": 1,
+            "num_experts_per_tok": 6,
+            "moe_intermediate_size": 2048,
+            "routed_scaling_factor": 1.5,
+            "norm_topk_prob": true,
+            "scoring_func": "sqrtsoftplus",
+            "topk_method": "noaux_tc",
+            "index_n_heads": 64,
+            "index_head_dim": 128,
+            "index_topk": 512,
+            "num_hash_layers": 1,
+            "sliding_window": 128,
+            "compress_ratios": [0, 4, 0],
+            "compress_rope_theta": 160000.0,
+            "hc_mult": 4,
+            "hc_sinkhorn_iters": 20,
+            "hc_eps": 1.0e-6,
+            "num_nextn_predict_layers": 1,
+            "max_position_embeddings": 1048576,
+            "rope_theta": 10000.0,
+            "rope_scaling": {
+                "type": "yarn",
+                "factor": 16.0,
+                "original_max_position_embeddings": 65536,
+                "beta_fast": 32.0,
+                "beta_slow": 1.0
+            },
+            "rms_norm_eps": 1.0e-6,
+            "initializer_range": 0.02,
+            "tie_word_embeddings": false,
+            "attention_bias": false,
+            "attention_dropout": 0.0,
+            "bos_token_id": 0,
+            "eos_token_id": 1,
+            "dspark_block_size": 5,
+            "dspark_target_layer_ids": [40, 41, 42],
+            "dspark_markov_rank": 256,
+            "dspark_noise_token_id": 128799
+        }"#,
+        )
+        .unwrap();
+
+        assert!(cfg.is_dspark());
+        assert_eq!(cfg.dspark_block_size, 5);
+        assert_eq!(cfg.dspark_target_layer_ids, vec![40, 41, 42]);
+        assert_eq!(cfg.dspark_markov_rank, 256);
+        assert_eq!(cfg.dspark_noise_token_id, 128799);
+
+        let d = cfg.dspark_tensor_names(0);
+        assert_eq!(d.main_proj, "mtp.0.main_proj.weight");
+        assert_eq!(d.main_norm, "mtp.0.main_norm.weight");
+        assert_eq!(d.attn_norm, "mtp.0.attn_norm.weight");
+        assert_eq!(d.ffn_norm, "mtp.0.ffn_norm.weight");
+        assert_eq!(d.markov_w1, "mtp.0.markov_head.markov_w1.weight");
+        assert_eq!(d.markov_w2, "mtp.0.markov_head.markov_w2.weight");
+        assert_eq!(d.confidence_proj, "mtp.0.confidence_head.proj.weight");
+        assert_eq!(d.attn.attn_sink, "mtp.0.attn.attn_sink");
+        assert_eq!(d.hc_head.scale, "mtp.0.hc_head_scale");
+        assert_eq!(
+            d.ffn.shared_experts.as_ref().unwrap().w3,
+            "mtp.0.ffn.shared_experts.w3.weight"
+        );
+        // Shard policy: new heads + fusion replicated; body delegates to MLA/MoE.
+        assert_eq!(d.shard_for(&cfg, &d.main_proj, 4), Some(Shard::Replicated));
+        assert_eq!(
+            d.shard_for(&cfg, &d.confidence_proj, 4),
+            Some(Shard::Replicated)
+        );
+    }
+
+    #[test]
+    fn non_dspark_config_defaults_are_inert() {
+        let cfg = DeepSeekV4Config::from_json_str(
+            r#"{
+            "architectures": ["DeepseekV4ForCausalLM"],
+            "model_type": "deepseek_v4",
+            "dtype": "bfloat16",
+            "vocab_size": 129280,
+            "hidden_size": 512,
+            "num_hidden_layers": 12,
+            "num_attention_heads": 8,
+            "num_key_value_heads": 1,
+            "head_dim": 64,
+            "hidden_act": "silu",
+            "swiglu_limit": 10.0,
+            "q_lora_rank": 256,
+            "o_lora_rank": 256,
+            "o_groups": 2,
+            "qk_rope_head_dim": 32,
+            "n_routed_experts": 16,
+            "n_shared_experts": 1,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 512,
+            "routed_scaling_factor": 1.5,
+            "norm_topk_prob": true,
+            "scoring_func": "sqrtsoftplus",
+            "topk_method": "noaux_tc",
+            "index_n_heads": 4,
+            "index_head_dim": 64,
+            "index_topk": 128,
+            "num_hash_layers": 2,
+            "sliding_window": 32,
+            "compress_ratios": [0, 4, 0, 128, 0, 16, 0, 4, 0, 128, 0, 16],
+            "compress_rope_theta": 160000.0,
+            "hc_mult": 4,
+            "hc_sinkhorn_iters": 20,
+            "hc_eps": 1.0e-6,
+            "num_nextn_predict_layers": 1,
+            "max_position_embeddings": 1048576,
+            "rope_theta": 10000.0,
+            "rope_scaling": {
+                "type": "yarn",
+                "factor": 16.0,
+                "original_max_position_embeddings": 65536,
+                "beta_fast": 32.0,
+                "beta_slow": 1.0
+            },
+            "rms_norm_eps": 1.0e-6,
+            "initializer_range": 0.02,
+            "tie_word_embeddings": false,
+            "attention_bias": false,
+            "attention_dropout": 0.0,
+            "bos_token_id": 0,
+            "eos_token_id": 1
+        }"#,
+        )
+        .unwrap();
+
+        assert!(!cfg.is_dspark());
+        assert_eq!(cfg.dspark_block_size, 0);
+        assert!(cfg.dspark_target_layer_ids.is_empty());
     }
 
     #[test]
