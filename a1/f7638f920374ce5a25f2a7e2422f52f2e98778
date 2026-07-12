@@ -1,0 +1,23 @@
+crates/cli/src/train_cli.rs
+  s_9c91b86ec3fb55::t_98528a03f21524 1973,1977,1982,1990
+crates/train/src/agent_opd.rs
+  s_9c91b86ec3fb55::t_80bbb2842b436b 247-249,269-276,349-353,361,374-379,381,387,395,400,402
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "a1f7638f920374ce5a25f2a7e2422f52f2e98778",
+  "prompts": {},
+  "sessions": {
+    "s_9c91b86ec3fb55": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4779911a-69b7-49db-bc83-daf5a48d6ca3",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
