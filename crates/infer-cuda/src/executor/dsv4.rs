@@ -392,14 +392,13 @@ impl Dsv4CudaExecutor {
         ensure!(max_seq_len > 0, "Dsv4CudaExecutor requires max_seq_len > 0");
         let mtp_draft_tokens_for_load = mtp_draft_tokens
             .or_else(|| mtp_draft_topk.map(|_| crate::dsv4::DEFAULT_SPEC_DRAFT_DEPTH));
-        // `dspark_on` flips `spec_decode_on` on the model so the per-slot
-        // spec-ring snapshots the DSpark verify/rollback needs get allocated
-        // (MTP and DSpark share `capture_spec_rings`/`restore_spec_ring_tail`).
-        let dspark_on = dspark_draft_model.is_some();
+        // Pass the draft dir through: the builder reads its config for DSpark
+        // metadata and derives `spec_decode_on` (which allocates the per-slot
+        // spec-ring snapshots MTP and DSpark share).
         let model = crate::dsv4::Dsv4Model::from_dsv4_fp8_safetensors(
             model_path.as_ref(),
             mtp_draft_tokens_for_load,
-            dspark_on,
+            dspark_draft_model,
         )?;
         // [vram-probe] TEMP bit-exact VRAM attribution (remove after budget unification).
         // Returns measured-used bytes (or None when mem_get_info fails) so the

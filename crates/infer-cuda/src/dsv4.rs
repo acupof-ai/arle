@@ -1624,6 +1624,141 @@ pub(crate) fn dsv4_decode_trace(
     let _ = std::io::stderr().write_all(line.as_bytes());
 }
 
+/// Merge DSpark spec-decode metadata from the DRAFT checkpoint into the base
+/// `DeepSeekV4Config`. `--spec-type dspark` was explicitly requested, so a draft
+/// config missing the required keys is a hard error, not a silent non-DSpark.
+fn merge_dspark_metadata(config: &mut DeepSeekV4Config, draft_dir: &Path) -> Result<()> {
+    let cfg_path = draft_dir.join("config.json");
+    let raw = std::fs::read_to_string(&cfg_path)
+        .map_err(|e| anyhow!("read DSpark draft config {}: {e}", cfg_path.display()))?;
+    let v: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| anyhow!("parse DSpark draft config {}: {e}", cfg_path.display()))?;
+    let need_u64 = |key: &str| -> Result<u64> {
+        v.get(key)
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| {
+                anyhow!(
+                    "--spec-type dspark needs `{key}` in draft config {}",
+                    cfg_path.display()
+                )
+            })
+    };
+
+    config.dspark_block_size = need_u64("dspark_block_size")? as usize;
+    config.dspark_markov_rank = need_u64("dspark_markov_rank")? as usize;
+    config.dspark_noise_token_id = need_u64("dspark_noise_token_id")? as u32;
+    let ids = v
+        .get("dspark_target_layer_ids")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            anyhow!(
+                "--spec-type dspark needs `dspark_target_layer_ids` in draft config {}",
+                cfg_path.display()
+            )
+        })?;
+    config.dspark_target_layer_ids = ids
+        .iter()
+        .map(|x| {
+            x.as_u64().map(|n| n as usize).ok_or_else(|| {
+                anyhow!(
+                    "dspark_target_layer_ids in {} has a non-integer entry",
+                    cfg_path.display()
+                )
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    // Stage count is NOT in the draft config (`num_nextn_predict_layers: 1` there
+    // is the stale native-MTP field). Derive it by counting distinct `mtp.<N>`
+    // stage prefixes in the draft checkpoint's weight map.
+    config.dspark_num_stages = count_dspark_stages(draft_dir)?;
+    ensure!(
+        config.dspark_num_stages > 0,
+        "DSpark draft {} yielded 0 `mtp.<N>` stages",
+        draft_dir.display()
+    );
+    Ok(())
+}
+
+/// Count distinct `mtp.<N>.` stage prefixes in the draft checkpoint. Primary
+/// source is `model.safetensors.index.json`'s `weight_map`; when absent, fall
+/// back to reading the tensor names from the safetensors headers.
+fn count_dspark_stages(draft_dir: &Path) -> Result<usize> {
+    let index_path = draft_dir.join("model.safetensors.index.json");
+    if index_path.exists() {
+        let raw = std::fs::read_to_string(&index_path)
+            .map_err(|e| anyhow!("read DSpark draft index {}: {e}", index_path.display()))?;
+        let v: serde_json::Value = serde_json::from_str(&raw)
+            .map_err(|e| anyhow!("parse DSpark draft index {}: {e}", index_path.display()))?;
+        let map = v
+            .get("weight_map")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| {
+                anyhow!(
+                    "DSpark draft index {} lacks a weight_map object",
+                    index_path.display()
+                )
+            })?;
+        return Ok(count_distinct_mtp_stages(map.keys().map(String::as_str)));
+    }
+
+    // No index — glob the shards and read their safetensors headers.
+    let mut stages = std::collections::HashSet::new();
+    for entry in std::fs::read_dir(draft_dir)
+        .map_err(|e| anyhow!("read DSpark draft dir {}: {e}", draft_dir.display()))?
+    {
+        let path = entry
+            .map_err(|e| anyhow!("read DSpark draft dir entry: {e}"))?
+            .path();
+        let is_shard = path.extension().is_some_and(|e| e == "safetensors")
+            && path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.contains("mtp") || n.starts_with("model-000"));
+        if !is_shard {
+            continue;
+        }
+        for name in read_safetensors_tensor_names(&path)? {
+            if let Some(n) = mtp_stage_index(&name) {
+                stages.insert(n);
+            }
+        }
+    }
+    Ok(stages.len())
+}
+
+/// Extract the `<N>` from a `mtp.<N>.<...>` tensor name, else `None`.
+fn mtp_stage_index(name: &str) -> Option<usize> {
+    name.strip_prefix("mtp.")
+        .and_then(|rest| rest.split('.').next())
+        .and_then(|n| n.parse::<usize>().ok())
+}
+
+fn count_distinct_mtp_stages<'a>(keys: impl Iterator<Item = &'a str>) -> usize {
+    keys.filter_map(mtp_stage_index)
+        .collect::<std::collections::HashSet<_>>()
+        .len()
+}
+
+/// Read tensor names from a safetensors file header (8-byte LE length prefix +
+/// JSON header keyed by tensor name).
+fn read_safetensors_tensor_names(path: &Path) -> Result<Vec<String>> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).map_err(|e| anyhow!("open {}: {e}", path.display()))?;
+    let mut len_buf = [0u8; 8];
+    f.read_exact(&mut len_buf)
+        .map_err(|e| anyhow!("read header length of {}: {e}", path.display()))?;
+    let header_len = u64::from_le_bytes(len_buf) as usize;
+    let mut header = vec![0u8; header_len];
+    f.read_exact(&mut header)
+        .map_err(|e| anyhow!("read header of {}: {e}", path.display()))?;
+    let v: serde_json::Value = serde_json::from_slice(&header)
+        .map_err(|e| anyhow!("parse header of {}: {e}", path.display()))?;
+    Ok(v.as_object()
+        .map(|o| o.keys().filter(|k| *k != "__metadata__").cloned().collect())
+        .unwrap_or_default())
+}
+
 impl Dsv4Model {
     /// Per-forward owned-token cap when the deepep_ll MoE transport is booted
     /// (`None` for allreduce / intranode / non-deepep builds → unbounded). Core
@@ -1652,18 +1787,27 @@ impl Dsv4Model {
     pub(crate) fn from_dsv4_fp8_safetensors(
         model_path: &Path,
         mtp_draft_tokens: Option<usize>,
-        dspark_on: bool,
+        dspark_draft_model: Option<&Path>,
     ) -> Result<Self> {
         let tp = build_dsv4_tp_runtime()?;
-        Self::from_dsv4_fp8_safetensors_with_tp(model_path, tp, mtp_draft_tokens, dspark_on)
+        Self::from_dsv4_fp8_safetensors_with_tp(
+            model_path,
+            tp,
+            mtp_draft_tokens,
+            dspark_draft_model,
+        )
     }
 
     pub(crate) fn from_dsv4_fp8_safetensors_with_tp(
         model_path: &Path,
         #[cfg_attr(not(feature = "nccl"), allow(unused_mut))] mut tp: crate::tp::TpRuntime,
         mtp_draft_tokens: Option<usize>,
-        dspark_on: bool,
+        dspark_draft_model: Option<&Path>,
     ) -> Result<Self> {
+        // DSpark metadata (block_size / target taps / stage count) ships on the
+        // DRAFT checkpoint, not the base — merged below. `dspark_on` gates the
+        // shared spec-ring snapshots.
+        let dspark_on = dspark_draft_model.is_some();
         // Spec decode is on when the serve config requests it — `Some(n)` from
         // `--spec-type mtp`, `dspark_on` from `--spec-type dspark` — OR the
         // `ARLE_DSV4_SPEC_DECODE` env gate is set (backward-compat fallback).
@@ -1686,7 +1830,7 @@ impl Dsv4Model {
                     .map(str::to_owned)
             })
             .unwrap_or_default();
-        let config = if model_type == "glm_moe_dsa" {
+        let mut config = if model_type == "glm_moe_dsa" {
             deepseek_spec::GlmMoeDsaConfig::from_json_str(&config_json)
                 .and_then(|glm| glm.into_deepseek_v4())
                 .map_err(|e| anyhow!("load GLM config from {}: {e}", config_path.display()))?
@@ -1694,6 +1838,12 @@ impl Dsv4Model {
             DeepSeekV4Config::from_json_str(&config_json)
                 .map_err(|e| anyhow!("load DSv4 config from {}: {e}", config_path.display()))?
         };
+        // DSpark metadata lives on the draft checkpoint; the base config carries
+        // none (is_dspark()/T3 taps read the base). Merge it in so the base model
+        // captures taps on its layers and the executor gates DSpark.
+        if let Some(draft_dir) = dspark_draft_model {
+            merge_dspark_metadata(&mut config, draft_dir)?;
+        }
         ensure_loadable(&config, spec_decode_on)?;
 
         let moe_config = Self::moe_config_from_config(&config)?;
