@@ -1,0 +1,31 @@
+scripts/opd_security_filter.py
+  s_9c91b86ec3fb55::t_436a00a77eb06f 88-115,167-168
+scripts/stage_opd_run_corpus.py
+  s_886399aad4380a::t_fbced2c6a76a47 58,88,128
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "3eea701f7be4baf25b0c42bbeab75c10801be026",
+  "prompts": {},
+  "sessions": {
+    "s_886399aad4380a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-afe1b11c11c6d941d",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_9c91b86ec3fb55": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4779911a-69b7-49db-bc83-daf5a48d6ca3",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
