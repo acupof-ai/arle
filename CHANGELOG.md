@@ -23,6 +23,18 @@ Post-v0.2.1 progress spine. Entry classes recorded here the day they land:
 phase exits, default flips, license-or-kill verdicts (AGENTS.md §Docs
 lifecycle & progress spine).
 
+### Changed
+
+- **2026-07-12 — CUDA kernel `csrc/` reorg** (`a07a48d90`, `9fc53e7e4`,
+  `051edb29b`). Exploded the 19-file `misc/` junk drawer into domain dirs (new
+  `sampling/`·`norm/`·`recurrent/`·`elementwise/`; DSv4 MLA/DSA/MHC + FlashMLA/FA3
+  shims → `attention/`; `kvcacheio/` → `kv/`) — every family now aligns 1:1 with
+  its `src/ffi/*.rs` split. Deleted dead code (−6545 LOC): 3 Marlin W4/W4A8 GEMM
+  `.cu` + `marlin_pf8/`, `kv/{paged_kv_append,scatter_kv}.cu`, and 5 `src/ffi/`
+  extern decls (all 0-caller). `csrc/` now = 56 `.cu` in 10 kernel dirs.
+  Byte-identical, bench-exempt (no runtime path changed).
+  [win](docs/experience/wins/2026-07-12-kernel-csrc-reorg.md).
+
 ### Verdicts
 
 - **2026-07-11 — DSpark draft-KV: cap full-layer at per-request ceiling** (Qwen3.6-27B,

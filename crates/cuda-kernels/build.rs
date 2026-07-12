@@ -1593,7 +1593,8 @@ fn compile_tilelang_aot_kernels(
 }
 
 // Recursively collect every `.cu` file under `dir` so domain subdirs
-// (attention/, gemm/, kv/, quant/, misc/) are picked up automatically.
+// (attention/, gemm/, moe/, kv/, quant/, sampling/, norm/, recurrent/,
+// elementwise/, ...) are picked up automatically.
 fn collect_cu_files(dir: &Path, out: &mut Vec<PathBuf>) {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
@@ -2463,7 +2464,7 @@ fn main() {
         }
         nvcc_args.extend(["--compiler-options".to_string(), "-fPIC".to_string()]);
         // Ensure `#include "common.cuh"` resolves from any domain subdir
-        // (attention/, gemm/, kv/, quant/, misc/).
+        // (attention/, gemm/, moe/, kv/, sampling/, recurrent/, ...).
         nvcc_args.push("-Icsrc".to_string());
 
         if enable_deepgemm_native && stem == "deepgemm_native" {
