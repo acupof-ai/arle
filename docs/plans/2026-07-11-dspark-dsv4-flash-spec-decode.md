@@ -1,6 +1,6 @@
 # Plan — DSpark for DeepSeek-V4-Flash (the DSv4 throughput lever)
 
-> Status: Active (P1 reverted, re-scoped) — 2026-07-12 · Driver: DSv4 native
+> Status: Active (P1 arch re-derived v3 — 3-stage; T1/T2 landed on wrong arch, refitting) — 2026-07-12 · Driver: DSv4 native
 > NextN-MTP nets only ~1.03× (accept-limited); DeepSeek's official DSpark reports
 > **60–85% per-user speedup over MTP-1 on V4-Flash**. This is the DSv4
 > high-concurrency-throughput lever, not the Qwen3.6 track (that was the substrate
@@ -36,13 +36,12 @@ the `mtp.0.{ffn,hc_*}` load path.
   `dspark_target_layer_ids [40,41,42]` (top-3 of 43 layers),
   `dspark_markov_rank 256`, `dspark_noise_token_id 128799`, `tie_word_embeddings
   false` (reuses V4 embed + output head, frozen).
-- **Draft tensors** (`mtp.0.*`, 4705 tensors in 3 dedicated shards
-  46–48-of-48, cleanly separated from the 45 body shards): `attn.*` (MLA:
-  wq_a/b, wkv, wo_a/b, kv_norm, q_norm, attn_sink), `ffn.*` (full 256-expert
-  MoE + shared_experts + gate), `hc_*` (hyper-connections), `main_proj`/
-  `main_norm` (the 3-tap fusion — DSpark flavor, vs native MTP's
-  enorm/e_proj/h_proj 1-tap), `markov_head.markov_w1/w2`, `confidence_head.proj`,
-  `norm`.
+- **Draft tensors** (`mtp.{0,1,2}.*`, 3 stacked DSv4 blocks in shards
+  46–48-of-48; see §P1 corrected v3 for the per-stage split): each stage =
+  `attn.*` (MLA) + `ffn.*` (256-expert MoE + shared + gate) + `attn_norm`/
+  `ffn_norm` + `hc_attn`/`hc_ffn`. Stage extras: `main_proj`/`main_norm` @mtp.0;
+  `hc_head`+`norm`+`markov_head.markov_w1/w2`+`confidence_head.proj` @mtp.2.
+  Output head tied to `embed.weight` (no `lm_head`).
 - **Procedure** (DeepSpec `eval/dspark/draft_ops.py` + `modeling/dspark/
   markov_head.py`, read verbatim): `_forward_backbone(target_hidden, noise_emb=
   embed(noise_ids), is_causal=False)` → crop draft-KV to `start` (noise rows
@@ -110,49 +109,67 @@ no-spec vs native-MTP vs DSpark, agent-shape c-sweep {1,4,8,16}. Correct-
 inference gate + Δ% per metric. Target: DeepSeek's 1.6–1.85× per-user; license
 the default flip only if it clears TTFT·TPOT·throughput on ≥2 binding shapes.
 
-## P1 corrected architecture (2026-07-12 — supersedes the reverted reuse-map)
+## P1 corrected architecture (2026-07-12 v3 — from the FULL checkpoint index + DeepSpec source)
 
-**The draft is NOT a native-MTP `Dsv4Layer` reuse.** Source of truth: DeepSpec
-`modeling/dspark/qwen3/modeling.py` (procedure is target-independent). The draft
-layer is **EAGLE-style dual-stream** on the DSv4 MLA:
+**The draft is a 3-STAGE STACKED pipeline, not a single `mtp.0`.** The prior v2
+("one dual-stream `mtp.0` block") was still wrong — it read only `mtp.0.*`. The
+full `dspark_model.safetensors.index.json` (72,317 keys) + DeepSpec source
+(`ds_common.py`, `ds_markov_head.py`, `ds_eval_draft_ops.py`) are ground truth.
 
+**Draft = mtp.0 → mtp.1 → mtp.2, each a full DSv4 transformer block** (MLA attn +
+256-expert MoE + attn_norm/ffn_norm + `hc_attn`/`hc_ffn`). Per-stage extras:
+
+| Stage | Role | Stage-only tensors |
+|---|---|---|
+| **mtp.0** | entry: 3-tap fusion | `main_proj` `F8_E4M3 [4096,12288]`+scale (fp8-block) · `main_norm` bf16 |
+| **mtp.1** | middle | none (bare block) |
+| **mtp.2** | exit: sampling heads | `hc_head` · `norm` · `markov_head.markov_w1/w2` · `confidence_head.proj` |
+
+Procedure (`forward_dspark_draft_block` + `_forward_backbone`, verbatim):
 ```
-context = main_norm(main_proj(concat(tap40, tap41, tap42)))   # [seq, hidden]; taps = layer OUTPUTS at 40,41,42
-hidden  = noise_embedding = embed(noise_ids)                   # residual stream IS noise; block pos0 = anchor tok, pos1.. = mask 128799
-# per draft layer (MLA), q from noise only; k/v from BOTH streams, concatenated along seq:
-q = q_proj(input_layernorm(hidden))
-k = cat([kv_proj(context), kv_proj(hidden)], dim=seq)
-v = cat([v_proj(context), v_proj(hidden)], dim=seq)
-... MLA attn + MoE + HC ...
-logits = base_lm_head(self.norm(hidden))                       # reuse BASE norm + head (no bare mtp.0.norm in ckpt)
+context = main_norm(main_proj(concat(out40, out41, out42)))   # extract_context_feature: hidden[layer_id+1], ids [40,41,42] → 3×4096=12288; fused ONCE at mtp.0 entry
+noise   = embed(noise_ids)                                     # create_noise_embed: per block pos0 = anchor (last accepted) token, pos1..4 = mask 128799; embed = base embed.weight (tied, no lm_head)
+block_hidden = stack[mtp.0, mtp.1, mtp.2](context, noise, is_causal=False, own draft KV cache cropped to `start` per block)
+base_logits  = compute_logits(block_hidden)                   # base embed.weight^T (tied head), after mtp.2 norm(hc_head(·))
+sample_draft_tokens: semi-AR L→R over block_size=5, step logits += markov_w2(markov_w1[prev_token])   # VanillaMarkov: low-rank [vocab→256→vocab], HIDDEN-INDEPENDENT (mtp.2 has NO gate_proj)
+confidence   = sigmoid(confidence_head.proj(hidden, prev_tok)) ; truncate block at first pos < threshold   # dynamic draft length
 ```
 
-Verified verdicts (checkpoint index + shard-46 header on pod, DeepSpec source):
-- **Noise stream is load-bearing** — not optional even at block_size=1 (pos0 =
-  last accepted token embedding). The reverted impl dropped it → would collapse accept.
-- **Draft has its OWN attention block** (`mtp.0.attn.*` = full MLA wq_a/b, wkv,
-  wo_a/b, q_norm, kv_norm, attn_sink) ⇒ **own draft KV cache** (separate
-  `Dsv4LayerAttentionState`, seeded over context, cropped on reject). NOT the
-  native frozen-target-KV shortcut.
-- **Final norm = base `self.norm`** — checkpoint has attn_norm/ffn_norm/main_norm
-  but **no bare `mtp.0.norm`**; draft reuses base norm + head. (codex flagged a
-  missing draft norm — false, verified twice.)
-- **Quant: no requant beyond experts.** attn + main_proj are already fp8
-  `F8_E4M3` 128×128-block (all dims ÷128) = base format; only the 256 routed
-  experts are MXFP4 → requant to fp8 (done; `mtp0-fp8.safetensors` 6.63 GB on pod).
+Verified verdicts (full index + DeepSpec source, 2026-07-12):
+- **3 stacked draft blocks** (not 1) ⇒ draft cost ≈ 3/43 layer-equiv per block,
+  amortized over accept≈3.5 → **~2–7% of the verify forward**. Re-prices the plan
+  doc's "1 layer" by 3× but is NOT a blocker; **accept-rate stays load-bearing.**
+- **Own draft KV cache** — each stage has full `attn.*` (MLA wq_a/b, wkv, wo_a/b,
+  q_norm, kv_norm, attn_sink); `past_key_values_draft.crop(start)` per block. NOT
+  the frozen-target-KV shortcut (that's only the target-side VERIFY, which DOES
+  reuse frozen KV per the 2026-06-06 amortization wall).
+- **markov is VanillaMarkov, hidden-independent** — mtp.2 ships only `markov_w1`
+  (`nn.Embedding[vocab,256]`) + `markov_w2` (`nn.Linear[256,vocab]`), no
+  `gate_proj` ⇒ the cheap `w2(w1[prev])` transition, no hidden mixing.
+- **confidence is a LEARNED head already in the ckpt** (`mtp.2.confidence_head.proj`)
+  ⇒ P3's dynamic-length signal is a checkpoint tensor, not something to invent.
+- **No `lm_head`** — output head tied to `embed.weight`; reuse base embed for logits.
+- **main_proj is fp8-block** (`F8_E4M3`+`F8_E8M0` scale), NOT bf16 → load via the
+  fp8 path, not `load_dsv4_global_matrix`.
 
-Reusable AS-IS (the scaffolding the revert also discarded — regenerate when P1
-resumes): `deepseek-spec/v4.rs` DSpark config fields + `DeepSeekV4MtpTensorNames`
-dspark flavor; the `mtp.0.{ffn,hc_*}` load path; `forward_tokens_verify`
-(`dsv4.rs:2453`) + `capture_spec_rings`/`restore_spec_ring_tail`
-(`dsv4.rs:1072/1098`) for verify/rollback; the Markov/confidence procedure in
-`qwen35/dspark.rs`. **What must be written NEW**: the dual-stream MLA attention
-forward (q from noise, k/v = cat[context, noise]) + the draft KV cache — this is
-the real P1 cost, ~a few hundred lines, not a fusion-tensor swap.
+Reusable AS-IS: `forward_tokens_verify` (`dsv4.rs:2453`) + `capture_spec_rings`/
+`restore_spec_ring_tail` (`dsv4.rs:1072/1098`) for the frozen-KV target verify;
+the per-stage block load path (`load_dsv4_attention`/`load_dsv4_moe_layer`/
+`load_dsv4_hyper_connection`). **Written NEW**: the 3-stage backbone forward
+(3× dual-stream MLA with per-block own draft KV) + main_proj fp8 fuse + markov
+semi-AR + confidence truncation. This is the real P1+P2 cost.
 
-Safety patch of the reverted (wrong-arch) impl:
-`scratchpad/dsv4_dspark_p1min_wrongarch.patch` (883 lines) — reference only; the
-fusion is wrong, do not re-apply.
+**Landed but on the WRONG (single-stage) arch → returns**: T1/T2 (`3b1921a7a`)
+put markov/confidence + hc_head into a single `mtp.0` flavor. Refit to the
+3-stage model: main_proj@0 (fp8), heads@2, no hc_head@0/1.
+
+**Open before T4** — the exact `_forward_backbone` stage stacking (is `context`
+injected as k/v at EVERY stage or only mtp.0?). Resolve by reading the DSv4/qwen3
+DSpark `modeling.py` `_forward_backbone` before writing the forward; the tensor
+inventory alone doesn't disambiguate per-stage context injection.
+
+Safety patch of the first (wrong-arch) impl:
+`scratchpad/dsv4_dspark_p1min_wrongarch.patch` — reference only; do not re-apply.
 
 ## Risks (named, not priced)
 
