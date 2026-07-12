@@ -8,7 +8,8 @@
 use autograd::{TensorId, TensorStore, optim::Optimizer};
 
 use crate::opd::{
-    OpdError, Result, WritebackLoss, masked_writeback_ce_step_dispatch, masked_writeback_step,
+    OpdError, Result, ValueCritic, WritebackLoss, masked_writeback_ce_step_dispatch,
+    masked_writeback_step,
 };
 use crate::qwen35::Qwen35Model;
 
@@ -42,6 +43,11 @@ pub enum UpdateStrategy {
     /// SAO Phase 1: DIS (per-token PG, clipped importance-ratio gate) with a
     /// batch-centered binary advantage.
     SaoDis { eps_low: f32, eps_high: f32 },
+    /// SAO Phase 2: DIS with per-token Skip-Obs GAE advantages from a learned
+    /// value critic (γ/λ live on the [`ValueCritic`]). The critic supplies the
+    /// baseline (no batch-mean centering) and per-token credit; the caller passes
+    /// `Some(critic)` to [`UpdateStrategy::update`].
+    SaoValue { eps_low: f32, eps_high: f32 },
 }
 
 impl UpdateStrategy {
@@ -51,7 +57,7 @@ impl UpdateStrategy {
                 keep_failing: false,
                 rollout_logprobs: false,
             },
-            Self::SaoDis { .. } => RolloutNeeds {
+            Self::SaoDis { .. } | Self::SaoValue { .. } => RolloutNeeds {
                 keep_failing: true,
                 rollout_logprobs: true,
             },
@@ -68,6 +74,7 @@ impl UpdateStrategy {
         all_params: &[TensorId],
         trainable: &[TensorId],
         opt: &mut O,
+        critic: Option<&mut ValueCritic>,
         vocab: usize,
         window: usize,
         store: &mut TensorStore,
@@ -80,6 +87,17 @@ impl UpdateStrategy {
                 batch, *eps_low, *eps_high, student, all_params, trainable, opt, vocab, window,
                 store,
             ),
+            Self::SaoValue { eps_low, eps_high } => {
+                let critic = critic.ok_or_else(|| {
+                    OpdError::InvalidInput(
+                        "SaoValue update requires a ValueCritic (caller must pass Some)".to_owned(),
+                    )
+                })?;
+                self.update_sao_value(
+                    batch, *eps_low, *eps_high, student, all_params, trainable, opt, critic, vocab,
+                    window, store,
+                )
+            }
         }
     }
 
@@ -160,10 +178,13 @@ impl UpdateStrategy {
                         .to_owned(),
                 )
             })?;
+            // Constant per-token advantage (batch-centered scalar broadcast to
+            // every masked position); SaoValue supplies Skip-Obs GAE instead.
+            let advantages = vec![advantage; rollout_logprobs.len()];
             let loss = masked_writeback_step(
                 WritebackLoss::Dis {
                     rollout_logprobs,
-                    advantage,
+                    advantage: &advantages,
                     eps_low,
                     eps_high,
                 },
@@ -176,6 +197,84 @@ impl UpdateStrategy {
                 &traj.response_mask,
                 vocab,
                 window,
+                store,
+            )?;
+            loss_sum += loss;
+            steps += 1;
+        }
+        Ok(if steps > 0 {
+            loss_sum / steps as f32
+        } else {
+            0.0
+        })
+    }
+
+    /// SAO Phase 2: per-trajectory Skip-Obs GAE from the critic → per-token DIS
+    /// PG on the policy, then one MSE step on the critic. No batch-mean centering
+    /// (the critic IS the baseline). At cold start V≈0 so failing trajectories
+    /// (reward 0) get ~0 advantage — degrading gracefully to rejection-CE — and
+    /// gain a negative signal only as the critic learns to predict >0 on them.
+    #[allow(clippy::too_many_arguments)]
+    fn update_sao_value<O: Optimizer>(
+        &self,
+        batch: &[ScoredTrajectory],
+        eps_low: f32,
+        eps_high: f32,
+        student: &Qwen35Model,
+        all_params: &[TensorId],
+        trainable: &[TensorId],
+        opt: &mut O,
+        critic: &mut ValueCritic,
+        vocab: usize,
+        window: usize,
+        store: &mut TensorStore,
+    ) -> Result<f32> {
+        let mut loss_sum = 0.0f32;
+        let mut steps = 0usize;
+        for traj in batch {
+            let rollout_logprobs = traj.rollout_logprobs.as_deref().ok_or_else(|| {
+                OpdError::InvalidInput(
+                    "SaoValue update requires rollout_logprobs (harness must capture π_rollout \
+                     when needs.rollout_logprobs)"
+                        .to_owned(),
+                )
+            })?;
+            let (advantages, returns) = critic.advantages(
+                student,
+                &traj.prompt_ids,
+                &traj.response_ids,
+                &traj.response_mask,
+                traj.reward,
+                store,
+            )?;
+            if advantages.is_empty() {
+                continue; // no LLM tokens to train
+            }
+            let loss = masked_writeback_step(
+                WritebackLoss::Dis {
+                    rollout_logprobs,
+                    advantage: &advantages,
+                    eps_low,
+                    eps_high,
+                },
+                student,
+                all_params,
+                trainable,
+                opt,
+                &traj.prompt_ids,
+                &traj.response_ids,
+                &traj.response_mask,
+                vocab,
+                window,
+                store,
+            )?;
+            // Fit the critic toward the observed returns (frozen-attention MSE).
+            critic.update(
+                student,
+                &traj.prompt_ids,
+                &traj.response_ids,
+                &traj.response_mask,
+                &returns,
                 store,
             )?;
             loss_sum += loss;
