@@ -56,6 +56,9 @@ pub(crate) struct Dsv4DsparkExec {
     draft: crate::dsv4::Dsv4DsparkDraft,
     /// Confidence-head truncation threshold (`--dspark-conf-threshold`).
     conf_threshold: f32,
+    /// Per-request token ceiling — the block spec step falls back to a single
+    /// non-spec token when the worst-case chain would cross it.
+    max_seq_len: usize,
     slots: Vec<Dsv4DsparkRuntime>,
 }
 
@@ -647,6 +650,7 @@ impl Dsv4CudaExecutor {
         Ok(Dsv4DsparkExec {
             draft,
             conf_threshold,
+            max_seq_len,
             slots,
         })
     }
@@ -1244,6 +1248,28 @@ impl Dsv4CudaExecutor {
         params: &SamplingParams,
         position: u64,
     ) -> Result<Vec<u32>> {
+        // Sequence-cap fallback: the block verify appends the anchor + up to
+        // `block_size` drafts (chain rows at `verify_pos .. verify_pos + block`),
+        // plus a bonus row. Request normalization caps EMITTED tokens but NOT the
+        // speculative chain, so near `max_seq_len` a full block would overflow the
+        // KV/ring and abort an otherwise-valid request. Mirror the Qwen DSpark
+        // guard: when the worst-case chain does not fit, take one non-spec token.
+        let ds = self
+            .dspark
+            .as_ref()
+            .expect("dspark_decode_tokens without dspark");
+        let block = self.model.config.dspark_block_size;
+        if start_pos + 1 + block + 1 > ds.max_seq_len {
+            let token = self.model.forward_tokens(
+                &mut self.slots[slot_idx],
+                &mut self.kv_adapter,
+                &[last_token],
+                start_pos,
+                params,
+                position,
+            )?;
+            return Ok(vec![token]);
+        }
         // (a)/(b) Anchor forward: a normal decode step commits `last_token` and
         // emits the block anchor (a real target greedy token). `is_dspark()` ⇒
         // this runs eager and populates `slot.dspark_taps()` at the target layers
@@ -1274,6 +1300,7 @@ impl Dsv4CudaExecutor {
                 draft,
                 conf_threshold,
                 slots: ds_slots,
+                ..
             } = dspark
                 .as_mut()
                 .expect("dspark_decode_tokens without dspark");
@@ -1714,6 +1741,15 @@ impl Dsv4CudaExecutor {
             position,
             final_prefill,
         )?;
+        // Rebase the DSpark draft cache to the prompt frontier once prefill
+        // completes: prefill never appends prompt rows to `df`, so without this
+        // the first `dspark_forward_block` would RoPE from position 0 (the
+        // `start_pos == 0` reset) instead of the prompt length. Mirrors the
+        // restored-prefix path rebasing to `finish_len`; the final chunk of a
+        // tail prefill after restore lands here too, so the two paths converge.
+        if final_prefill {
+            self.reset_dspark_slot(row.slot, row.start_pos + row.tokens.len());
+        }
         let slot = row.slot;
         // Prefix-state publish hook: this chunk completed pages
         // [start_pos/page, (start_pos+len)/page).
