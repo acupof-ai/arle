@@ -1652,21 +1652,25 @@ impl Dsv4Model {
     pub(crate) fn from_dsv4_fp8_safetensors(
         model_path: &Path,
         mtp_draft_tokens: Option<usize>,
+        dspark_on: bool,
     ) -> Result<Self> {
         let tp = build_dsv4_tp_runtime()?;
-        Self::from_dsv4_fp8_safetensors_with_tp(model_path, tp, mtp_draft_tokens)
+        Self::from_dsv4_fp8_safetensors_with_tp(model_path, tp, mtp_draft_tokens, dspark_on)
     }
 
     pub(crate) fn from_dsv4_fp8_safetensors_with_tp(
         model_path: &Path,
         #[cfg_attr(not(feature = "nccl"), allow(unused_mut))] mut tp: crate::tp::TpRuntime,
         mtp_draft_tokens: Option<usize>,
+        dspark_on: bool,
     ) -> Result<Self> {
-        // Spec decode is on when the serve config requests it (`Some(n)` from
-        // `--spec-type mtp`) OR the `ARLE_DSV4_SPEC_DECODE` env gate is set
-        // (backward-compat fallback). Resolved once and stored on the model so
-        // per-slot construction reads the same decision.
-        let spec_decode_on = mtp_draft_tokens.is_some() || dsv4_spec_decode_enabled();
+        // Spec decode is on when the serve config requests it — `Some(n)` from
+        // `--spec-type mtp`, `dspark_on` from `--spec-type dspark` — OR the
+        // `ARLE_DSV4_SPEC_DECODE` env gate is set (backward-compat fallback).
+        // Both routes need the per-slot spec-ring snapshots, so both flip
+        // `spec_decode_on`. Resolved once and stored on the model so per-slot
+        // construction reads the same decision.
+        let spec_decode_on = mtp_draft_tokens.is_some() || dspark_on || dsv4_spec_decode_enabled();
         // Peek model_type: GLM-5.2 (`glm_moe_dsa`) parses through the GLM dialect
         // adapter (V32 shape, plain-o, hc_mult=1, num_nextn=0, Glm tensor names);
         // every other DSv4 checkpoint loads through the strict DSv4 parser

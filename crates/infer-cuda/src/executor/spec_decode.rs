@@ -537,6 +537,7 @@ impl Dsv4CudaExecutor {
     pub(super) fn spec_requested(&self) -> bool {
         self.spec_draft_tokens.is_some()
             || self.spec_draft_topk.is_some()
+            || self.dspark.is_some()
             || crate::dsv4::dsv4_spec_decode_enabled()
     }
 
