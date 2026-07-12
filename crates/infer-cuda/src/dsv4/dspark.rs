@@ -217,7 +217,13 @@ impl Dsv4Model {
                 &mut keepalive,
             )?;
         }
-        df.ctx_end = block_start;
+        // NOTE (codex T4.1 P1 ×2): do NOT advance the persistent `df.ctx_end`
+        // here. It is SHARED across stages but `latent_kv` is per-stage — a
+        // per-stage advance would push stage>0's ctx_start past its own
+        // still-unwritten rows (stale reads), and advancing before the attention
+        // below (currently the `NotYetImplemented` stub) commits state on the
+        // error path. The stacking caller advances `ctx_end` to `block_start`
+        // ONCE, after all stages of the block succeed.
 
         // ── Noise block. HC pre-norm the stream to the attention input.
         let attn_mhc = crate::hc::gen_mhc_params(ctx, config, &layer.hc_attn, stream_in)?;
@@ -448,9 +454,11 @@ impl Dsv4Model {
         keepalive.keep_hidden(&kv_raw);
         let kv_normed = crate::attention::mla_rms_norm(ctx, &kv_raw, &attention.kv_norm, eps)?;
         keepalive.keep_hidden(&kv_normed);
-        // Dummy q (discarded q_out) — the fused prep requires q heads.
-        // SAFETY: uninit; only its RoPE'd q_out (discarded) is written.
-        let mut q_dummy = unsafe { HiddenStates::uninit(ctx, local_width, rows)? };
+        // Dummy q (discarded q_out) — the fused prep requires q heads. Zeroed,
+        // not uninit: the kernel RoPE's this buffer in place, and reading
+        // uninitialized device memory is UB / can surface NaN (codex T4.1 P2).
+        // RoPE of zeros is zeros; the result is discarded anyway.
+        let mut q_dummy = HiddenStates::zeros(ctx, local_width, rows)?;
         keepalive.keep_hidden(&q_dummy);
         let positions: Vec<i32> = (start..start + rows).map(|p| p as i32).collect();
         let pos_dev = ctx
