@@ -193,6 +193,17 @@ mirrors the shipped `qwen35/dspark.rs`** (draft `SlotState` w/ small `k_ctx`/
 reuse. T4 = "adapt the working Qwen dspark to MLA latent geometry", not design from
 scratch. Kernel is pod-gated (no nvcc on Mac).
 
+**#1 POD-VERIFY CORRECTNESS ITEM — post-attention inverse-RoPE (deferred, ~85%).**
+The base DSv4 MLA attention kernels (`dsv4_swa.cu:86-102`, `dsv4_hybrid.cu`) apply
+a post-attention **inverse-RoPE** (sign −1) to the output's `rope_dim` slice before
+`mla_oproj`. The DSpark draft kernel (`07f454f17`) OMITS it (implemented the frozen
+contract verbatim). Reasoning it's likely NEEDED: the draft feeds the SAME
+`mla_oproj`, and its `wo_a/wo_b` were trained by DeepSpec against the base DSv4
+attention (which de-RoPEs) → the draft expects de-RoPE'd values. Not at 95% (can't
+read the DeepSpec DSv4 attention source locally) → **the pod needle gate arbitrates**
+(decode actual output: incoherent ⇒ add the de-RoPE). Staged fix: copy the `swa`
+post-RoPE block into `dsv4_dspark_draft_attention.cu`, gated on `rope_dim>0`.
+
 **Flag #1 (V-output width) RESOLVED** (pod build + `dsv4_oproj_group_shape`
 `attention.rs:6648`): the draft attention V-output = **`local_heads × head_dim`
 (512), NOT nope 448**. wo_a `[8192,4096]` → `groups = local_width(32768)/wo_a_cols
