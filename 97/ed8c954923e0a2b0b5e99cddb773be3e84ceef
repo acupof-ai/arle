@@ -1,0 +1,23 @@
+crates/cuda-kernels/csrc/attention/dsv4_dspark_draft_attention.cu
+  s_0408a4c41af065::t_ee12a56dded53a 1,8,24-27
+crates/infer-cuda/src/dsv4/dspark.rs
+  s_0408a4c41af065::t_9050cf041f6ba8 1,6-8,10-17,200,217-221,240,476-481,528-529,532-534,551-552,590-591,663,665-667,669-673,675-679,695
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "97ed8c954923e0a2b0b5e99cddb773be3e84ceef",
+  "prompts": {},
+  "sessions": {
+    "s_0408a4c41af065": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aaef39e7a924641e1",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
