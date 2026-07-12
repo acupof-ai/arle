@@ -100,6 +100,14 @@ META_FILES = {
     ".pre-commit-config.yaml", ".bandit", ".bandit.yml", ".bandit.yaml",
     "codecov.yml", ".codecov.yml", "SECURITY.md",
 }
+# Binary media (demo GIFs/images, PDFs, video) bloats the staged tree ~20×
+# (127 alive-progress instances each carried ~50 MB of img/ demos) and is never
+# code or a test the model touches. Strip it OUTSIDE test paths — a test fixture
+# that reads an image stays.
+MEDIA_SUFFIXES = {
+    ".gif", ".png", ".jpg", ".jpeg", ".bmp", ".ico", ".webp",
+    ".pdf", ".mp4", ".mov", ".webm",
+}
 
 
 def blocklisted(repo: str) -> str | None:
@@ -116,6 +124,9 @@ def strip_meta(tree: Path):
         if p.is_dir() and p.name in META_DIRS:
             shutil.rmtree(p)
         elif p.is_file() and p.name in META_FILES:
+            p.unlink()
+        elif (p.is_file() and p.suffix.lower() in MEDIA_SUFFIXES
+              and not any("test" in part.lower() for part in p.relative_to(tree).parts)):
             p.unlink()
     swe.run(["git", "add", "-A"], tree)
     swe.run(["git", "-c", "user.email=a@b.c", "-c", "user.name=arle",

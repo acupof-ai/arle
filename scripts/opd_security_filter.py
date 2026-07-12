@@ -101,7 +101,7 @@ _SKIP_SUFFIXES = frozenset({
 })
 _SKIP_DOC_STEMS = frozenset({
     "changelog", "changes", "history", "readme", "authors", "news",
-    "contributing",
+    "contributing", "license", "copying", "notice",
 })
 
 
