@@ -1,0 +1,21 @@
+scripts/requant_dspark_mxfp4_to_fp8.py
+  s_211f35ecbf6ead::t_06979d140b70df 2-5,111-115
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "bd7bcc4e2ff3fd99b8e5576a9f6283254392346d",
+  "prompts": {},
+  "sessions": {
+    "s_211f35ecbf6ead": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a579491d8cfe1a41f",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
