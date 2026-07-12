@@ -1175,6 +1175,11 @@ impl Dsv4SlotState {
             .spec_verify
             .as_ref()
             .map_or(0, Dsv4SpecVerifyScratch::device_bytes);
+        let dspark_taps_bytes: usize = self
+            .dspark_taps
+            .iter()
+            .map(|v| v.len * std::mem::size_of::<half::bf16>())
+            .sum();
         vec![
             ("attention(per-layer)", attention_bytes),
             ("spec_rings", spec_rings_bytes),
@@ -1184,6 +1189,7 @@ impl Dsv4SlotState {
                 "start_pos_device",
                 self.start_pos_device.len() * std::mem::size_of::<i32>(),
             ),
+            ("dspark_taps", dspark_taps_bytes),
         ]
     }
 
@@ -1987,6 +1993,18 @@ impl Dsv4Model {
             total = total
                 .saturating_add(verify_scratch)
                 .saturating_add(n.saturating_mul(verify_per_layer));
+        }
+        // DSpark T3 taps: one wide-stream (bf16) buffer per target layer, allocated
+        // in `new` under is_dspark() — gated independently of spec_decode_on, so
+        // this term must too (MUST track the constructor).
+        if self.config.is_dspark() {
+            total = total.saturating_add(
+                self.config
+                    .dspark_target_layer_ids
+                    .len()
+                    .saturating_mul(stream_dim)
+                    .saturating_mul(bf16),
+            );
         }
         Ok(total)
     }
