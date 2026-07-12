@@ -43,65 +43,6 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub fn marlin_gemm_cuda(
-        a: *const Half, // [M, K] bf16 activations
-        b: *const u8,   // Marlin-packed int4 weights
-        c: *mut Half,   // [M, N] bf16 output
-        s: *const Half, // [K/group_size, N] fp16 scales
-        prob_m: i32,
-        prob_n: i32,
-        prob_k: i32,
-        workspace: *mut i32, // lock buffer
-        groupsize: i32,
-        dev: i32,
-        stream: CUstream,
-        thread_k: i32,
-        thread_n: i32,
-        sms: i32,
-        max_par: i32,
-    ) -> i32;
-
-    pub fn gemm_w4a8_marlin_cuda(
-        a: *const i8,    // [M, K] row-major INT8 activations
-        b: *const u8,    // W4A8 Marlin-packed INT4 weights
-        c: *mut i32,     // [max_par * 64, N] INT32 reduce buffer
-        d: *mut Half,    // [M, N] FP16 output
-        s1: *const f32,  // [M] activation scales
-        s2: *const f32,  // [N] per-channel weight scales
-        s3: *const Half, // [K/group_size, N] per-group scales
-        prob_m: i32,
-        prob_n: i32,
-        prob_k: i32,
-        workspace: *mut i32, // lock buffer
-        groupsize: i32,
-        dev: i32,
-        stream: CUstream,
-        thread_k: i32,
-        thread_n: i32,
-        sms: i32,
-        max_par: i32,
-    ) -> i32;
-
-    pub fn gemm_w4_fp8_marlin_cuda(
-        a: *const u8,    // [M, K] row-major FP8 e4m3 activations
-        b: *const u8,    // PF8.2-preprocessed Marlin-packed INT4 weights
-        c_tmp: *mut f32, // FP32 global-reduce buffer
-        d: *mut Half,    // [M, N] BF16 output
-        s1: *const f32,  // [M] activation scales
-        s2: *const Half, // [K/group_size, N] BF16 W4 group scales
-        prob_m: i32,
-        prob_n: i32,
-        prob_k: i32,
-        workspace: *mut i32, // lock buffer
-        groupsize: i32,
-        dev: i32,
-        stream: CUstream,
-        thread_k: i32,
-        thread_n: i32,
-        sms: i32,
-        max_par: i32,
-    ) -> i32;
-
     pub fn gptq_marlin_repack_cuda(
         b_q_weight: *const u32,
         out: *mut u32,
