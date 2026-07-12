@@ -3503,6 +3503,9 @@ impl ValueCritic {
             )));
         }
         let hidden_dim = rows_flat.len() / n;
+        // Free the MSE graph after the step (rows is [n, hidden] — tens of MB);
+        // `weight` + optimizer moments live in `keep_ids` and survive.
+        let keep_ids: HashSet<TensorId> = store.live_ids().into_iter().collect();
         let mut tape = Tape::new();
         tape.set_enabled(true);
         // Detached hidden rows (rg=false) → grad flows to `weight` only.
@@ -3522,6 +3525,7 @@ impl ValueCritic {
         tape.backward(mse, store).map_err(OpdError::from)?;
         self.opt.step(&self.params, store);
         self.opt.zero_grad(&self.params, store);
+        store.retain_ids(&keep_ids);
         Ok(mse_value)
     }
 }
