@@ -235,6 +235,8 @@ impl RealCudaExecutor {
         max_seq_len: usize,
         mtp_draft_tokens: Option<usize>,
         mtp_draft_topk: Option<usize>,
+        dspark_draft_model: Option<&Path>,
+        dspark_conf_threshold: f32,
     ) -> Result<Self> {
         Ok(Self::Dsv4(Box::new(
             Dsv4CudaExecutor::from_dsv4_fp8_safetensors(
@@ -243,6 +245,8 @@ impl RealCudaExecutor {
                 max_seq_len,
                 mtp_draft_tokens,
                 mtp_draft_topk,
+                dspark_draft_model,
+                dspark_conf_threshold,
             )?,
         )))
     }

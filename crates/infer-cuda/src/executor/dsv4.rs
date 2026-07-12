@@ -38,6 +38,35 @@ pub(crate) struct Dsv4CudaExecutor {
     /// the preemption store (Phase 2b): published pages are already captured
     /// here, so preempt = free pages + requeue, resume = prefix-attach.
     prefix_state: crate::attention::Dsv4PrefixStatePool,
+    /// DSpark block-drafter state (`--spec-type dspark`). `Some` = the draft is
+    /// loaded and greedy B=1 decode routes through the DSpark
+    /// draft→verify→accept loop instead of MTP; `None` = MTP or no spec. The
+    /// per-slot draft caches ride here (serial spec state, like `spec_slots`).
+    /// NOTE: the underlying block-attention kernel is a pod stub
+    /// (`cudaErrorNotYetImplemented`), so a `dspark` serve is WIRED but not yet
+    /// runnable — the loop errors at the first draft forward until the kernel lands.
+    pub(crate) dspark: Option<Dsv4DsparkExec>,
+}
+
+/// Loaded DSpark drafter + its per-slot runtime caches. Present only under
+/// `--spec-type dspark`; off the DSpark path this whole struct is absent (zero
+/// cost). `draft` is the 3-stage block drafter weights; `slots` holds one
+/// per-request latent cache + attention state set, indexed by slot.
+pub(crate) struct Dsv4DsparkExec {
+    draft: crate::dsv4::Dsv4DsparkDraft,
+    /// Confidence-head truncation threshold (`--dspark-conf-threshold`).
+    conf_threshold: f32,
+    slots: Vec<Dsv4DsparkRuntime>,
+}
+
+/// One slot's DSpark draft runtime: the per-stage latent KV cache (`df`), the
+/// pooled block-shaped scratch, and one attention state per draft stage
+/// (`config.dspark_num_stages()`). Pre-allocated at construction — spec steps
+/// are serial, so exact-shape reuse (no per-step alloc) holds.
+struct Dsv4DsparkRuntime {
+    df: crate::dsv4::dspark::Dsv4DsparkSlotState,
+    scratch: crate::dsv4::dspark::Dsv4DsparkScratch,
+    attn_states: Vec<crate::attention::Dsv4LayerAttentionState>,
 }
 
 /// One demoted slot: the device-state image plus the executor-level MTP spec
@@ -353,14 +382,21 @@ impl Dsv4CudaExecutor {
         max_seq_len: usize,
         mtp_draft_tokens: Option<usize>,
         mtp_draft_topk: Option<usize>,
+        dspark_draft_model: Option<&Path>,
+        dspark_conf_threshold: f32,
     ) -> Result<Self> {
         ensure!(num_slots > 0, "Dsv4CudaExecutor requires at least one slot");
         ensure!(max_seq_len > 0, "Dsv4CudaExecutor requires max_seq_len > 0");
         let mtp_draft_tokens_for_load = mtp_draft_tokens
             .or_else(|| mtp_draft_topk.map(|_| crate::dsv4::DEFAULT_SPEC_DRAFT_DEPTH));
+        // `dspark_on` flips `spec_decode_on` on the model so the per-slot
+        // spec-ring snapshots the DSpark verify/rollback needs get allocated
+        // (MTP and DSpark share `capture_spec_rings`/`restore_spec_ring_tail`).
+        let dspark_on = dspark_draft_model.is_some();
         let model = crate::dsv4::Dsv4Model::from_dsv4_fp8_safetensors(
             model_path.as_ref(),
             mtp_draft_tokens_for_load,
+            dspark_on,
         )?;
         // [vram-probe] TEMP bit-exact VRAM attribution (remove after budget unification).
         // Returns measured-used bytes (or None when mem_get_info fails) so the
@@ -493,6 +529,22 @@ impl Dsv4CudaExecutor {
             &layer_specs,
             model.kv_arena.page_block_size,
         );
+        // DSpark drafter (opt-in, `--spec-type dspark`): load the external block
+        // drafter from its own checkpoint dir + provision one per-slot draft
+        // cache. `is_dspark()` (checkpoint config) gates the T3 taps; the draft
+        // WEIGHTS live in a separate dir. Off the DSpark path: `None`, zero cost.
+        let dspark = dspark_draft_model
+            .map(|dir| {
+                Self::load_dspark_exec(
+                    &model,
+                    &kv_adapter,
+                    dir,
+                    dspark_conf_threshold,
+                    max_seq_len,
+                    num_slots,
+                )
+            })
+            .transpose()?;
         Ok(Self {
             model,
             slots,
@@ -510,6 +562,92 @@ impl Dsv4CudaExecutor {
                 default_t1_budget_bytes(DEFAULT_DRAM_FRACTION),
                 prefix_entry_bytes,
             ),
+            dspark,
+        })
+    }
+
+    /// Load the DSpark drafter weights + provision per-slot draft caches. The
+    /// main checkpoint's config MUST be DSpark-capable (`is_dspark()`, i.e. it
+    /// carries `dspark_block_size` + target-layer ids so the T3 taps exist); the
+    /// draft weights come from `draft_dir` (`--mtp-draft-model`). Each stage's
+    /// isolated MLA attention (`compress_ratio == 0`) gets its own attention
+    /// state; the draft latent cache is sized to the request token ceiling.
+    fn load_dspark_exec(
+        model: &crate::dsv4::Dsv4Model,
+        kv_adapter: &crate::attention::Dsv4KvAdapter,
+        draft_dir: &Path,
+        conf_threshold: f32,
+        max_seq_len: usize,
+        num_slots: usize,
+    ) -> Result<Dsv4DsparkExec> {
+        ensure!(
+            model.config.is_dspark(),
+            "--spec-type dspark needs a DSpark-capable DSv4 checkpoint (config carries \
+             dspark_block_size + dspark_target_layer_ids); this checkpoint is not one"
+        );
+        let loader = crate::loader::SafetensorLoader::new(draft_dir)?;
+        loader.prefetch_shards();
+        let draft = crate::dsv4::load_dspark_draft(
+            &loader,
+            &model.ctx,
+            &model.config,
+            &model.split,
+            model.tp.config(),
+        )?;
+        let num_stages = model.config.dspark_num_stages();
+        let block_size = model.config.dspark_block_size;
+        // Draft-stage attention is pure MLA (`compress_ratio == 0`, no CSA/HCA):
+        // the same mode the trunk uses for a ratio-0 layer. The stage attends its
+        // OWN `latent_kv`, not the trunk KV pool, so the pool arg is a bookkeeping
+        // handle only (layer 0's), and `max_seq_len` sizes the draft's own span.
+        let stage_mode = model.config.attention_mode_for_compress_ratio(0);
+        let stage_pool = kv_adapter.layer(0)?;
+        let draft_span = max_seq_len + block_size;
+        let slots = (0..num_slots)
+            .map(|slot_idx| -> Result<_> {
+                let df = crate::dsv4::dspark::Dsv4DsparkSlotState::new(
+                    &model.ctx,
+                    &model.config,
+                    num_stages,
+                    max_seq_len,
+                    block_size,
+                )?;
+                let attn_states = draft
+                    .stages
+                    .iter()
+                    .map(|stage| {
+                        let local_width = stage.layer.attention.wq_b.rows;
+                        crate::attention::Dsv4LayerAttentionState::new(
+                            &model.ctx,
+                            &model.config,
+                            stage_mode,
+                            0,
+                            draft_span,
+                            &model.kv_arena,
+                            local_width / model.config.head_dim,
+                            model.tp.config().world_size,
+                            slot_idx,
+                            stage_pool,
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(Dsv4DsparkRuntime {
+                    df,
+                    scratch: crate::dsv4::dspark::Dsv4DsparkScratch::default(),
+                    attn_states,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        log::info!(
+            "CUDA DSv4 DSpark drafter loaded from {}: stages={num_stages} block={block_size} \
+             conf_threshold={conf_threshold} target_layers={:?}",
+            draft_dir.display(),
+            model.config.dspark_target_layer_ids,
+        );
+        Ok(Dsv4DsparkExec {
+            draft,
+            conf_threshold,
+            slots,
         })
     }
 
@@ -901,8 +1039,11 @@ impl Dsv4CudaExecutor {
         self.kv_adapter
             .mirror_full_band(&self.model.ctx, slot, finish_len)?;
         // A17: a restored occupant enters Decoding without a tail warm step
-        // for its MTP chain; stale spec state belongs to the prior occupant.
+        // for its MTP chain; stale spec state belongs to the prior occupant. The
+        // DSpark draft latent cache is the same story — rebase it to the restored
+        // frontier so the first block drafts against fresh, in-request features.
         self.spec_slots[slot] = Dsv4SpecSlotState::default();
+        self.reset_dspark_slot(slot, finish_len);
         self.slots[slot].restore_prefix_state(
             &self.model.ctx,
             &self.model.layers,
@@ -1021,6 +1162,12 @@ impl Dsv4CudaExecutor {
             )?;
             return Ok(vec![token]);
         }
+        // DSpark block spec (`--spec-type dspark`): the draft→verify→accept loop
+        // replaces MTP for greedy decode. Off the DSpark path (`dspark` is
+        // `None`), MTP runs below byte-identically.
+        if self.dspark.is_some() {
+            return self.dspark_decode_tokens(slot_idx, last_token, start_pos, params, position);
+        }
         // Self-heal an un-seeded / desynced MTP stream (#140). A request that
         // enters Decoding WITHOUT a tail prefill — a full position-0 prefix-cache
         // hit or a whole-slot promote, both of which reset `spec_slots` to
@@ -1064,6 +1211,170 @@ impl Dsv4CudaExecutor {
             return Ok(vec![token]);
         }
         self.spec_step(slot_idx, start_pos, position)
+    }
+
+    /// Reset the DSpark draft latent cache for `slot`, rebasing it to absolute
+    /// trunk position `pos` (a request boundary: fresh prefill → 0, restored
+    /// prefix → the restored frontier). No-op off the DSpark path.
+    fn reset_dspark_slot(&mut self, slot: usize, pos: usize) {
+        if let Some(ds) = self.dspark.as_mut() {
+            ds.slots[slot].df.rebase(pos);
+        }
+    }
+
+    /// One DSpark block decode step (`--spec-type dspark`, greedy). Forward the
+    /// last token to emit the block anchor + capture the T3 trunk taps, draft a
+    /// whole block from those taps in ONE non-causal pass, verify the chain in one
+    /// contiguous target forward, accept the longest greedy-matching prefix, and
+    /// roll the rejected tail back. Mirrors the MTP `spec_step` bookkeeping
+    /// (`capture_spec_rings` / `truncate_slot` / `restore_spec_ring_tail`),
+    /// swapping the autoregressive MTP draft for the single-pass block drafter and
+    /// the sparse frozen verify for the contiguous commit verify + truncate.
+    ///
+    /// WIRED-NOT-RUNNABLE: `dspark_forward_block`'s block-attention kernel is a
+    /// pod stub (`cudaErrorNotYetImplemented`), so this errors at the draft
+    /// forward until the kernel lands. Every committed token is a target greedy
+    /// argmax (anchor + verified accepted drafts + bonus), so the loop is
+    /// token-exact to no-spec greedy decode once the kernel is real.
+    fn dspark_decode_tokens(
+        &mut self,
+        slot_idx: usize,
+        last_token: u32,
+        start_pos: usize,
+        params: &SamplingParams,
+        position: u64,
+    ) -> Result<Vec<u32>> {
+        // (a)/(b) Anchor forward: a normal decode step commits `last_token` and
+        // emits the block anchor (a real target greedy token). `is_dspark()` ⇒
+        // this runs eager and populates `slot.dspark_taps()` at the target layers
+        // — no separate arming flag (unlike Qwen3.6 DSpark's `armed`).
+        let anchor = self.model.forward_tokens(
+            &mut self.slots[slot_idx],
+            &mut self.kv_adapter,
+            &[last_token],
+            start_pos,
+            params,
+            position,
+        )?;
+        let verify_pos = start_pos + 1;
+
+        // (c)/(d) Draft the block from the taps + anchor, then build the proposal
+        // (tied-head base logits → Markov semi-AR sampling → confidence
+        // truncation). Split-borrow: model (&), the slot taps (&), and the draft +
+        // this slot's draft caches (&mut, disjoint fields) are all disjoint.
+        let temperature = params.temperature;
+        let proposal = {
+            let Self {
+                model,
+                slots,
+                dspark,
+                ..
+            } = self;
+            let Dsv4DsparkExec {
+                draft,
+                conf_threshold,
+                slots: ds_slots,
+            } = dspark
+                .as_mut()
+                .expect("dspark_decode_tokens without dspark");
+            let rt = &mut ds_slots[slot_idx];
+            let taps = slots[slot_idx].dspark_taps();
+            let block_hidden = model.dspark_forward_block(
+                draft,
+                &mut rt.df,
+                &mut rt.scratch,
+                &mut rt.attn_states,
+                taps,
+                anchor,
+            )?;
+            model.dspark_build_proposal(
+                draft,
+                &block_hidden,
+                anchor,
+                temperature,
+                *conf_threshold,
+            )?
+        };
+        let draft_len = proposal.draft_len;
+        ensure!(
+            proposal.chain.len() == draft_len + 1 && proposal.chain[0] == anchor,
+            "DSpark proposal chain {} != draft_len {draft_len} + 1 (anchor {anchor})",
+            proposal.chain.len()
+        );
+
+        // Snapshot the boundary rings the verify will overwrite so a rejected
+        // draft tail rolls back (MTP-shared substrate). Nothing has touched the
+        // rings at `verify_pos..` yet — the draft wrote only its own latent cache.
+        self.model.capture_spec_rings(
+            &mut self.slots[slot_idx],
+            &mut self.kv_adapter,
+            verify_pos,
+            draft_len,
+        )?;
+
+        // (e) Verify the chain [anchor, d0..] as ONE contiguous commit forward at
+        // `verify_pos` (writes every row's KV; the rejected tail is truncated).
+        // Reuses the MTP verify substrate — no new verify path invented.
+        let verify = self.model.forward_tokens_verify(
+            &mut self.slots[slot_idx],
+            &mut self.kv_adapter,
+            &proposal.chain,
+            verify_pos,
+            position,
+        )?;
+        ensure!(
+            verify.argmax.len() == proposal.chain.len(),
+            "DSpark verify rows {} != chain {}",
+            verify.argmax.len(),
+            proposal.chain.len()
+        );
+
+        // (f) Accept scan: `argmax[i]` is the target greedy token AFTER chain[i];
+        // accept draft chain[i+1] while it matches. Longest matching prefix.
+        let mut accepted = 0usize;
+        while accepted < draft_len && verify.argmax[accepted] == proposal.chain[accepted + 1] {
+            accepted += 1;
+        }
+        let bonus = verify.argmax[accepted];
+
+        // Commit: keep anchor + accepted drafts (`accepted + 1` rows), truncate
+        // the rejected tail, restore the rejected ring slots (order: truncate →
+        // ring restore, mirroring MTP).
+        let committed_len = verify_pos + accepted + 1;
+        self.model.truncate_slot(
+            &mut self.slots[slot_idx],
+            &mut self.kv_adapter,
+            committed_len,
+        )?;
+        self.model.restore_spec_ring_tail(
+            &mut self.slots[slot_idx],
+            &mut self.kv_adapter,
+            verify_pos,
+            accepted,
+            draft_len,
+        )?;
+
+        self.mtp_accepts += accepted;
+        self.mtp_rejects += draft_len - accepted;
+        self.mtp_chains += 1;
+        if self.model.tp.config().rank == 0 {
+            log::debug!(
+                "[dsv4-dspark] slot={slot_idx} block={draft_len} accepted={accepted} \
+                 bonus={bonus} accept_total={} reject_total={}",
+                self.mtp_accepts,
+                self.mtp_rejects
+            );
+        }
+
+        // Emit the anchor (committed this step) + accepted drafts + the bonus (the
+        // next block's anchor, committed by the next step's anchor forward). The
+        // DSpark step is self-contained — clear any MTP spec carry.
+        self.spec_slots[slot_idx] = Dsv4SpecSlotState::default();
+        let mut out = Vec::with_capacity(accepted + 2);
+        out.push(anchor);
+        out.extend_from_slice(&proposal.chain[1..accepted + 1]);
+        out.push(bonus);
+        Ok(out)
     }
 
     fn forward_decode_row(&mut self, row: &Dsv4DecodeBatchRow) -> Result<Vec<SlotToken>> {
@@ -1155,7 +1466,29 @@ impl Dsv4CudaExecutor {
         // of the per-row `spec_step` loop.
         let spec_on = self.spec_requested();
         let all_greedy = batch.rows.iter().all(|row| row.params.is_greedy());
-        if spec_on && all_greedy {
+        // DSpark has no batched verify lane yet (B=1 bring-up). Run each greedy
+        // row's block step sequentially; non-greedy rows fall to plain batched
+        // decode below (DSpark uses no `spec_slots`, so nothing to clear).
+        if self.dspark.is_some() && all_greedy {
+            let mut tokens = Vec::with_capacity(batch.rows.len());
+            for row in &batch.rows {
+                let out = self.dspark_decode_tokens(
+                    row.slot,
+                    row.last_token,
+                    row.start_pos,
+                    &row.params,
+                    row.position,
+                )?;
+                tokens.extend(out.into_iter().map(|token| SlotToken {
+                    slot: row.slot,
+                    token,
+                    logprob: None,
+                    finish: None,
+                }));
+            }
+            return Ok(tokens);
+        }
+        if spec_on && all_greedy && self.dspark.is_none() {
             // Self-heal an un-seeded / desynced MTP stream (#140), the batched
             // twin of the B=1 path: a slot entering Decoding without a tail
             // prefill (full prefix-cache hit / whole-slot promote) has pending=
@@ -1359,6 +1692,7 @@ impl Dsv4CudaExecutor {
             self.kv_adapter.flashmla_free_slot(row.slot)?;
             self.slots[row.slot].reset(&self.model.ctx, &mut self.kv_adapter)?;
             self.spec_slots[row.slot] = Dsv4SpecSlotState::default();
+            self.reset_dspark_slot(row.slot, 0);
         }
         let kv_view = self.kv_adapter.prepare_kv_batch(kv_batch)?;
         validate_dsv4_prefill_kv_view(row, &kv_view)?;

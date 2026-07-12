@@ -1705,9 +1705,16 @@ mod tests {
         // KV parity/precision audit: short prompts, <=64 decode steps
         // (`dsv4_kv_parity_max_tokens`) — 4096 is generous headroom, not a
         // tunable knob.
-        let mut exec =
-            infer_cuda::CudaExecutor::from_dsv4_fp8_safetensors(&model_path, 1, 4096, None)
-                .map_err(|e| anyhow::anyhow!("from_dsv4_fp8_safetensors failed: {e:#}"))?;
+        let mut exec = infer_cuda::CudaExecutor::from_dsv4_fp8_safetensors(
+            &model_path,
+            1,
+            4096,
+            None,
+            None,
+            None,
+            0.5,
+        )
+        .map_err(|e| anyhow::anyhow!("from_dsv4_fp8_safetensors failed: {e:#}"))?;
 
         // Reference = scalar bf16.
         let ref_case = cases
