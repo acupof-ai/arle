@@ -1854,9 +1854,11 @@ mod backend {
                  model kind {kind:?} would otherwise ignore the request"
             );
         }
-        if config.dspark_draft_model.is_some() && !matches!(kind, CudaModelKind::Qwen35) {
+        if config.dspark_draft_model.is_some()
+            && !matches!(kind, CudaModelKind::Qwen35 | CudaModelKind::Dsv4)
+        {
             anyhow::bail!(
-                "--spec-type dspark is only wired for CUDA Qwen3.5/3.6 checkpoints; \
+                "--spec-type dspark is only wired for CUDA Qwen3.5/3.6 and DSv4 checkpoints; \
                  model kind {kind:?} would otherwise ignore the request"
             );
         }
@@ -1907,6 +1909,8 @@ mod backend {
                 config.max_total_tokens,
                 config.mtp_draft_tokens,
                 config.mtp_draft_topk,
+                config.dspark_draft_model.as_deref(),
+                config.dspark_conf_threshold,
             )?,
             CudaModelKind::DiffusionGemma | CudaModelKind::Qwen3MoeUnsupported => {
                 unreachable!("checked before CUDA executor build")

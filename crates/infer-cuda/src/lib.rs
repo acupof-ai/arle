@@ -363,6 +363,8 @@ impl CudaExecutor {
         max_seq_len: usize,
         mtp_draft_tokens: Option<usize>,
         mtp_draft_topk: Option<usize>,
+        dspark_draft_model: Option<&std::path::Path>,
+        dspark_conf_threshold: f32,
     ) -> anyhow::Result<Self> {
         Ok(Self {
             inner: CudaExecutorInner::Real(Box::new(
@@ -372,6 +374,8 @@ impl CudaExecutor {
                     max_seq_len,
                     mtp_draft_tokens,
                     mtp_draft_topk,
+                    dspark_draft_model,
+                    dspark_conf_threshold,
                 )?,
             )),
         })
