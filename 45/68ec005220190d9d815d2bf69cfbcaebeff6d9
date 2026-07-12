@@ -1,0 +1,21 @@
+crates/autograd/src/ops/fused_linear_distill.rs
+  s_9c91b86ec3fb55::t_6979fd51e42031 712,731-738,797,804,872,941,957-960,962,1587,1669
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "4568ec005220190d9d815d2bf69cfbcaebeff6d9",
+  "prompts": {},
+  "sessions": {
+    "s_9c91b86ec3fb55": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4779911a-69b7-49db-bc83-daf5a48d6ca3",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
