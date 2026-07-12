@@ -1,11 +1,11 @@
-// DSpark draft dense MLA-latent attention (T4.1).
+// DSpark draft dense MLA-latent attention.
 //
 // Small non-causal dense attention over one head-SHARED compressed latent
 // (K == V — MLA has no separate V). Every one of the `block_size` query rows
 // attends the WHOLE `[kv_len]` latent range (draft context ++ noise block); the
 // single `latent_kv` row is broadcast over all `local_heads` query heads.
 //
-// Contract (mirrors ffi/attention.rs dsv4_dspark_draft_attention_cuda):
+// Frozen contract (mirrors ffi/attention.rs dsv4_dspark_draft_attention_cuda):
 //   q         [block_size, local_heads, head_dim]  token-major, bf16
 //   latent_kv [kv_len,     head_dim]               kv-major,   bf16, head-SHARED
 //   out       [block_size, local_heads, head_dim]  token-major, bf16  (Flag #1)
@@ -21,10 +21,10 @@
 //                // is the whole latent, feeding mla_oproj as local_heads*head_dim).
 //
 // ponytail: naive one-block-per-(query row, head) online softmax — kv_len is
-// tiny (draft context + block, a few dozen), so clarity beats micro-optimization.
-// Mirrors the block/warp structure of dsv4_swa.cu / dsv4_hybrid.cu (shared
-// logits, block-max / block-sum reductions, bf16<->f32 converters), minus the
-// sliding-window/compressed key selection and the sink term.
+// tiny (draft context + block), so clarity beats micro-optimization. Mirrors the
+// block/warp structure of dsv4_swa.cu / dsv4_hybrid.cu (shared logits, block-max
+// / block-sum reductions, bf16<->f32 converters), minus the sliding-window key
+// selection and the sink term.
 
 #include "dsv4_attention_common.cuh"
 
