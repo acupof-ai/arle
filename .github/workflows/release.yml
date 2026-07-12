@@ -191,6 +191,9 @@ jobs:
             https://github.com/tile-ai/tilelang.git /tmp/tilelang-sm70
           pip install --no-cache-dir --no-build-isolation /tmp/tilelang-sm70
 
+      - name: Patch apache-tvm-ffi so `import tilelang` works (tilelang#2367)
+        run: scripts/ci-patch-tvm-ffi.sh
+
       - name: Cache cargo registry
         uses: actions/cache@v6
         with:
@@ -248,6 +251,9 @@ jobs:
 
       - name: Install Python build dependencies (required for AOT kernel compilation)
         run: pip install --no-cache-dir -r requirements-build.txt
+
+      - name: Patch apache-tvm-ffi so `import tilelang` works (tilelang#2367)
+        run: scripts/ci-patch-tvm-ffi.sh
 
       - name: Cache cargo registry
         uses: actions/cache@v6
