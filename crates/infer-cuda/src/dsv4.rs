@@ -1804,9 +1804,15 @@ fn dspark_draft_reserve_bytes(draft_dir: &Path, world_size: usize) -> Result<usi
         "DSpark draft dir {} holds no *.safetensors shards to size the KV budget reserve",
         draft_dir.display()
     );
-    // Round the EP-sharded expert share UP — over-reserving costs a few slots;
-    // under-reserving re-OOMs at draft alloc.
-    Ok(non_expert.saturating_add(expert.div_ceil(world_size.max(1))))
+    // Reserve the FULL per-rank draft footprint (experts NOT divided by
+    // world_size). Measured on-pod: the draft load needs the full ~19.9GB/rank —
+    // each rank prefetches all shards, and the steady-state device (whether the
+    // draft MoE is replicated or a load-time transient stages the full file)
+    // exceeds `expert/world_size`. Over-reserving costs KV slots; under-reserving
+    // re-OOMs at draft alloc (confirmed: expert/world_size = 5175MB OOM'd needing
+    // >7GB). Refine to the sharded steady-state once the transient is eliminated.
+    let _ = world_size;
+    Ok(non_expert.saturating_add(expert))
 }
 
 /// Read `(tensor_name, on-disk byte size)` pairs from a safetensors header. Byte
