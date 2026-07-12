@@ -1,0 +1,37 @@
+CHANGELOG.md
+  s_7c5074a715204d::t_0ced89e9b02fc4 26-37
+crates/cuda-kernels/AGENTS.md
+  s_7c5074a715204d::t_98b0a65a84f827 35-45,73,165-169
+crates/cuda-kernels/build.rs
+  s_0b88340c4f3e4d::t_1d20e9235fe9b6 1596-1597,2467
+docs/experience/wins/2026-07-12-kernel-csrc-reorg.md
+  s_7c5074a715204d::t_f50a324b24fbdf 1-49
+docs/reviews/kernel-registry.md
+  s_7c5074a715204d::t_cb7f2363f1dd17 3-6,8-16,19-20,37,46-50,77-78,94,96-97,101-120,172-175,179-196,207-209,213,232-233,251,254,258,260-261,267-271,274,277-279
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "9397ebfbc3c73e0870de174124ae2026323268c9",
+  "prompts": {},
+  "sessions": {
+    "s_0b88340c4f3e4d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aa2e0c38563885d85",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_7c5074a715204d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-adc67bb89bd6a34c5",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
