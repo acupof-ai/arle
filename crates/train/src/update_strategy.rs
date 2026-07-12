@@ -237,6 +237,12 @@ impl UpdateStrategy {
         let mut mse_sum = 0.0f32;
         let mut adv_abs_sum = 0.0f32;
         let mut adv_tokens = 0usize;
+        // The policy writeback's `cleanup_after_backward` frees every live tensor
+        // not in `all_model_params`; the critic weight isn't a student param, so
+        // it must ride in this keep-set (kept, NOT stepped — `trainable` is still
+        // LoRA-only) or `critic.update` below hits a freed weight.
+        let mut all_with_critic = all_params.to_vec();
+        all_with_critic.extend_from_slice(critic.param_ids());
         for traj in batch {
             let rollout_logprobs = traj.rollout_logprobs.as_deref().ok_or_else(|| {
                 OpdError::InvalidInput(
@@ -264,7 +270,7 @@ impl UpdateStrategy {
                     eps_high,
                 },
                 student,
-                all_params,
+                &all_with_critic,
                 trainable,
                 opt,
                 &traj.prompt_ids,

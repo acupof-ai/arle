@@ -3399,6 +3399,14 @@ impl ValueCritic {
         })
     }
 
+    /// The critic's parameter ids — the policy writeback must keep these in its
+    /// cleanup set (`cleanup_after_backward` frees everything not in
+    /// `all_model_params`, and the critic weight is deliberately NOT a student
+    /// param), else the next `update` hits a freed weight.
+    pub fn param_ids(&self) -> &[TensorId] {
+        &self.params
+    }
+
     /// The masked (LLM-generated) hidden rows as a DETACHED host copy, in
     /// `build_masked_loss_targets` order. One checkpointed forward (tape-on but
     /// never backwarded, like `capture_rollout_logprobs`); returns
