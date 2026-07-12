@@ -3401,7 +3401,7 @@ pub(crate) fn flashmla_decode_sw_window_batched(
 
 /// RMSNorm a `HiddenStates` in place into a fresh buffer (the MLA Q/KV LoRA
 /// norms `q_norm` / `kv_norm`). Thin wrapper over the shared batched RMSNorm.
-fn mla_rms_norm(
+pub(crate) fn mla_rms_norm(
     ctx: &DeviceContext,
     x: &HiddenStates,
     weight: &DeviceVec,
