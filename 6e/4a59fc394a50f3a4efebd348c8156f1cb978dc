@@ -1,0 +1,21 @@
+crates/infer-cuda/src/ops/quant_linear.rs
+  s_3d949abe53b900::t_a06575ac353485 794-838
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "6e4a59fc394a50f3a4efebd348c8156f1cb978dc",
+  "prompts": {},
+  "sessions": {
+    "s_3d949abe53b900": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "92f2c43c-22c8-4f1d-8b27-d06d6f3c59ad",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
