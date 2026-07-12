@@ -25,6 +25,9 @@ use infer_plan::SamplingParams;
 use crate::loader::SafetensorLoader;
 use crate::moe_config::ExpertSplit;
 
+#[path = "dsv4/dspark.rs"]
+pub(crate) mod dspark;
+
 /// MLA latent KV arena descriptor (kv_heads = 1).
 ///
 /// Unlike the per-head BF16 [`cuda_kernels::prelude::PagedKVPool`], MLA caches a
