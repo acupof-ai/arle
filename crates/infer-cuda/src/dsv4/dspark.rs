@@ -661,3 +661,231 @@ impl Dsv4Model {
         Ok(())
     }
 }
+
+// ── T4.3: Markov semi-AR sampling + confidence truncation ────────────────────
+//
+// TODO(P2): dedup with qwen35::dspark into a shared, target-independent
+// dspark_heads module (plan doc P2). Kept separate here to protect the shipped
+// Qwen3.6 B track — DO NOT touch `qwen35/dspark.rs` for this.
+//
+// The draft head is DeepSpec's `VanillaMarkov` (hidden-INDEPENDENT: our exit
+// stage `mtp.2` carries `markov_w1`/`markov_w2` but no `gate_proj`/`joint_proj`,
+// so the step bias is `markov_w2 · markov_w1[prev]`, ignoring the hidden). The
+// confidence head is `AcceptRatePredictor` (`proj = Linear(in_dim, 1)`, no bias
+// tensor in this checkpoint) — its `sigmoid(logit) < threshold` gives the dynamic
+// (per-block) draft length.
+
+/// Proposal from one DSpark block draft (T4.3). `chain[0]` is the anchor,
+/// `chain[1..]` the drafted tokens surviving confidence truncation
+/// (`draft_len`). Consumed by the (T4.4) verify path: `chain` feeds
+/// [`Dsv4Model::forward_tokens_verify`] as `tokens`; `draft_logits` are the
+/// corrected per-step logits (base + Markov bias) retained for the sampled-mode
+/// accept test's draft distribution `q`.
+#[allow(dead_code)]
+pub(crate) struct Dsv4DsparkProposal {
+    /// Verify input ids `[anchor, d0 .. d_{L-1}]` (len == `draft_len + 1`).
+    pub chain: Vec<u32>,
+    /// Number of drafted tokens `L` surviving confidence truncation.
+    pub draft_len: usize,
+    /// Corrected per-step logits `[vocab, draft_len]` for the accepted prefix.
+    /// `None` when the block truncated to zero drafts.
+    pub draft_logits: Option<HiddenStates>,
+}
+
+impl Dsv4Model {
+    /// Turn the draft backbone's `block_hidden` `[hidden, block]` (from
+    /// [`Dsv4Model::dspark_forward_block`]) into a proposed draft-token block:
+    /// tied-head base logits → Markov semi-AR L→R sampling → confidence
+    /// truncation. `dead_code` until the T4.4 verify wiring calls it.
+    #[allow(dead_code)]
+    pub(crate) fn dspark_build_proposal(
+        &self,
+        draft: &Dsv4DsparkDraft,
+        block_hidden: &HiddenStates,
+        anchor: u32,
+        temperature: f32,
+        conf_threshold: f32,
+    ) -> Result<Dsv4DsparkProposal> {
+        let ctx = &self.ctx;
+        let hidden = self.config.hidden_size;
+        let block = self.config.dspark_block_size;
+        let vocab = self.lm_head.rows;
+        ensure!(block > 0, "dspark_build_proposal on a non-DSpark config");
+        ensure!(
+            block_hidden.hidden_dim == hidden && block_hidden.seq_len == block,
+            "DSpark block_hidden [{}, {}] != [hidden {hidden}, block {block}]",
+            block_hidden.hidden_dim,
+            block_hidden.seq_len
+        );
+        let exit = draft
+            .stages
+            .last()
+            .ok_or_else(|| anyhow!("DSpark draft has no stages"))?;
+
+        // Base logits via the tied head (no `lm_head` on the draft — it shares
+        // the target's output projection over the exit-normed `block_hidden`).
+        // SAFETY: uninit scratch; `lm_head_project_batch` writes every row.
+        let mut base_logits = unsafe { HiddenStates::uninit(ctx, vocab, block)? };
+        self.lm_head_project_batch(block_hidden, &mut base_logits)?;
+
+        // Markov semi-AR L→R: step bias = markov_w2 · markov_w1[prev], added to
+        // the base row; sample via the shared DSv4 sampler; feed the sampled
+        // token as the next step's prev. First prev = anchor.
+        let markov = exit.markov_w1.as_ref().zip(exit.markov_w2.as_ref());
+        let params = SamplingParams {
+            temperature,
+            ..Default::default()
+        };
+        // Retained corrected logits (base + bias) for every step, for draft_probs.
+        // SAFETY: uninit scratch; every row written in the loop below.
+        let mut corrected = unsafe { HiddenStates::uninit(ctx, vocab, block)? };
+        let mut base_row = HiddenStates::zeros(ctx, vocab, 1)?;
+        let mut sum_row = HiddenStates::zeros(ctx, vocab, 1)?;
+        let mut step_vec = DeviceVec::zeros(ctx, vocab)?;
+        // Markov bias buffers (allocated once when the head is present).
+        let mut markov_bufs = markov
+            .map(|(w1, _)| -> Result<_> {
+                Ok((
+                    HiddenStates::zeros(ctx, w1.cols, 1)?, // emb [rank, 1]
+                    HiddenStates::zeros(ctx, vocab, 1)?,   // bias [vocab, 1]
+                ))
+            })
+            .transpose()?;
+
+        let mut drafts = Vec::with_capacity(block);
+        let mut prev = anchor;
+        for i in 0..block {
+            // base_row = base_logits[:, i].
+            let src = base_logits.data.slice(i * vocab..(i + 1) * vocab);
+            ctx.stream
+                .memcpy_dtod(&src, &mut base_row.data)
+                .map_err(|e| anyhow!("DSpark base row copy failed: {e}"))?;
+
+            // corrected_row = base_row (+ Markov bias when the head is present).
+            let corrected_row =
+                if let (Some((w1, w2)), Some((emb, bias))) = (markov, markov_bufs.as_mut()) {
+                    let tok = crate::ops::upload_i32(ctx, &[prev as i32])?;
+                    crate::ops::embedding_batch(ctx, w1, &tok, emb)?; // markov_w1[prev]
+                    crate::ops::gemm_batch(ctx, w2, emb, bias)?; // markov_w2 · emb
+                    crate::ops::add_batch(ctx, &base_row, bias, &mut sum_row)?;
+                    &sum_row
+                } else {
+                    &base_row
+                };
+
+            // Retain the corrected row + stage it for the sampler.
+            let dst = i * vocab..(i + 1) * vocab;
+            ctx.stream
+                .memcpy_dtod(&corrected_row.data, &mut corrected.data.slice_mut(dst))
+                .map_err(|e| anyhow!("DSpark corrected retain copy failed: {e}"))?;
+            ctx.stream
+                .memcpy_dtod(&corrected_row.data, &mut step_vec.data)
+                .map_err(|e| anyhow!("DSpark step row copy failed: {e}"))?;
+
+            let tok = crate::executor::sample_cuda_token(ctx, &step_vec, &params, i as u64)?;
+            drafts.push(tok);
+            prev = tok;
+        }
+
+        // Confidence truncation → dynamic draft length. prev_tokens =
+        // [anchor, d0 .. d_{L-2}] (the token preceding each draft position).
+        let prev_tokens: Vec<u32> = std::iter::once(anchor)
+            .chain(drafts.iter().copied())
+            .take(drafts.len())
+            .collect();
+        let keep =
+            self.dspark_confident_prefix_len(exit, block_hidden, conf_threshold, &prev_tokens)?;
+        let draft_len = keep.min(drafts.len());
+        drafts.truncate(draft_len);
+
+        let draft_logits = if draft_len == 0 {
+            None
+        } else {
+            // SAFETY: uninit scratch; the leading `draft_len` rows are copied.
+            let mut out = unsafe { HiddenStates::uninit(ctx, vocab, draft_len)? };
+            let src = corrected.data.slice(0..draft_len * vocab);
+            ctx.stream
+                .memcpy_dtod(&src, &mut out.data)
+                .map_err(|e| anyhow!("DSpark draft logits copy failed: {e}"))?;
+            Some(out)
+        };
+
+        let mut chain = Vec::with_capacity(1 + draft_len);
+        chain.push(anchor);
+        chain.extend(drafts);
+        Ok(Dsv4DsparkProposal {
+            chain,
+            draft_len,
+            draft_logits,
+        })
+    }
+
+    /// Confidence-head seam: the acceptance-confident prefix length over the
+    /// block rows — the first `i` with `sigmoid(proj(feat_i)) < threshold`
+    /// truncates the proposal there. `feat_i = block_hidden[:, i]` for the plain
+    /// head, or `[block_hidden[:, i] ; markov_w1[prev_i]]` for the with-markov
+    /// head (keyed on the loaded `proj` input width: `hidden` vs `hidden + rank`).
+    /// Head absent, or `threshold <= 0`, → the full block survives (`usize::MAX`).
+    fn dspark_confident_prefix_len(
+        &self,
+        exit: &Dsv4DsparkStage,
+        block_hidden: &HiddenStates,
+        threshold: f32,
+        prev_tokens: &[u32],
+    ) -> Result<usize> {
+        let Some(conf) = &exit.confidence_proj else {
+            return Ok(usize::MAX);
+        };
+        if threshold <= 0.0 {
+            return Ok(usize::MAX);
+        }
+        let ctx = &self.ctx;
+        let hidden = self.config.hidden_size;
+        let block = self.config.dspark_block_size;
+        let in_dim = conf.cols;
+        ensure!(conf.rows == 1, "confidence proj rows {} != 1", conf.rows);
+        let with_markov = in_dim > hidden;
+        if with_markov {
+            let rank =
+                exit.markov_w1.as_ref().map(|m| m.cols).ok_or_else(|| {
+                    anyhow!("confidence head expects a markov head (in > hidden)")
+                })?;
+            ensure!(
+                in_dim == hidden + rank,
+                "confidence in {in_dim} != hidden {hidden} + markov rank {rank}"
+            );
+        } else {
+            ensure!(
+                in_dim == hidden,
+                "confidence in {in_dim} != hidden {hidden}"
+            );
+        }
+
+        let mut feat = DeviceVec::zeros(ctx, in_dim)?;
+        let mut out = DeviceVec::zeros(ctx, 1)?;
+        for (i, &prev) in prev_tokens.iter().enumerate().take(block) {
+            // feat[..hidden] = block_hidden[:, i].
+            let src = block_hidden.data.slice(i * hidden..(i + 1) * hidden);
+            ctx.stream
+                .memcpy_dtod(&src, &mut feat.data.slice_mut(0..hidden))
+                .map_err(|e| anyhow!("DSpark conf hidden copy failed: {e}"))?;
+            if with_markov {
+                let w1 = exit.markov_w1.as_ref().expect("validated above");
+                let rank = w1.cols;
+                let tok = crate::ops::upload_i32(ctx, &[prev as i32])?;
+                let mut emb = HiddenStates::zeros(ctx, rank, 1)?;
+                crate::ops::embedding_batch(ctx, w1, &tok, &mut emb)?;
+                ctx.stream
+                    .memcpy_dtod(&emb.data, &mut feat.data.slice_mut(hidden..hidden + rank))
+                    .map_err(|e| anyhow!("DSpark conf markov copy failed: {e}"))?;
+            }
+            // No bias tensor in this checkpoint — the raw proj output is the logit.
+            crate::ops::gemv(ctx, conf, &feat, &mut out)?;
+            let logit = out.to_host(ctx)?[0];
+            if 1.0 / (1.0 + (-logit).exp()) < threshold {
+                return Ok(i);
+            }
+        }
+        Ok(usize::MAX)
+    }
+}
