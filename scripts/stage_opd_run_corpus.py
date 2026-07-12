@@ -55,7 +55,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import stage_swe_pro as swe  # noqa: E402
 from gen_agent_opd_tasks import new_file_diff  # noqa: E402
-from opd_security_filter import is_security_flagged  # noqa: E402
+from opd_security_filter import is_security_flagged, scan_skips  # noqa: E402
 
 SCRIPTS = Path(__file__).resolve().parent
 
@@ -85,7 +85,7 @@ REQ_FILES = [
 
 GATE_BUDGET = 300      # s — both pytest runs combined, per instance
 INSTALL_TIMEOUT = 600  # s — venv + installs, per instance
-SMITH_MIX = {"easy": 0.3, "medium": 0.5, "hard": 0.2}
+SMITH_MIX = {"medium": 0.6, "hard": 0.4}
 
 
 # CI/meta files stripped from every staged tree BEFORE the security scan:
@@ -125,7 +125,7 @@ def strip_meta(tree: Path):
 def scan_tree(root: Path):
     """(rule, relpath) of the first security-flagged file, else (None, None)."""
     for path in sorted(p for p in root.rglob("*") if p.is_file()):
-        if ".git" in path.parts:
+        if ".git" in path.parts or scan_skips(path):
             continue
         try:
             rule = is_security_flagged(path.read_text(errors="replace"))
