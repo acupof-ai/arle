@@ -1,0 +1,21 @@
+docs/reviews/kernel-registry.md
+  s_8af4849a2385f5::t_d5e4ae08106f60 3-16,19-22,35-49,52,57,59-67,74-80,82,84,88,91-107,109,113,117-127,143,145,147-149,151,153-159,163-166,169,171,174,177-178,180-216,218,220-222,232-233,235-244,252-258
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "5ea39b464e5526a71b64b959fcb831b03ce6e935",
+  "prompts": {},
+  "sessions": {
+    "s_8af4849a2385f5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a8cb80fcead6ce26b",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
