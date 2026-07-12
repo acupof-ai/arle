@@ -2252,10 +2252,18 @@ impl Dsv4Model {
                 .saturating_add(verify_scratch)
                 .saturating_add(n.saturating_mul(verify_per_layer));
         }
-        // DSpark T3 taps: one wide-stream (bf16) buffer per target layer, allocated
-        // in `new` under is_dspark() — gated independently of spec_decode_on, so
-        // this term must too (MUST track the constructor).
+        // DSpark per-slot device memory (gated on is_dspark(), independent of
+        // spec_decode_on — MUST track the constructors):
+        //  - T3 taps: one wide-stream (bf16) buffer per target layer (`Dsv4SlotState`).
+        //  - draft caches (`Dsv4DsparkExec`, one runtime per slot, `load_dspark_exec`):
+        //    per stage a `latent_kv` [draft_span, head_dim] bf16 + a ratio-0 MLA
+        //    attention state over draft_span. Counted here so the KV budget's
+        //    per-slot divisor reserves them — the fixed draft-WEIGHT reserve alone
+        //    under-counts these per-slot caches (→ OOM at large slots / max_seq_len).
         if self.config.is_dspark() {
+            let head_dim = self.config.head_dim;
+            let num_stages = self.config.dspark_num_stages();
+            let draft_span = max_seq_len + self.config.dspark_block_size;
             total = total.saturating_add(
                 self.config
                     .dspark_target_layer_ids
@@ -2263,6 +2271,20 @@ impl Dsv4Model {
                     .saturating_mul(stream_dim)
                     .saturating_mul(bf16),
             );
+            total = total.saturating_add(
+                num_stages
+                    .saturating_mul(draft_span)
+                    .saturating_mul(head_dim)
+                    .saturating_mul(bf16),
+            );
+            let stage_mode = self.config.attention_mode_for_compress_ratio(0);
+            let stage_bytes = crate::attention::Dsv4LayerAttentionState::device_bytes_for(
+                &self.config,
+                stage_mode,
+                0,
+                draft_span,
+            )?;
+            total = total.saturating_add(num_stages.saturating_mul(stage_bytes));
         }
         Ok(total)
     }
