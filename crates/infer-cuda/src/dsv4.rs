@@ -389,7 +389,11 @@ pub(crate) struct Dsv4MtpLayer {
 ///   `wq_a`/`wkv` projections) + `main_norm` for the 3-tap context fusion.
 /// - `mtp.{n-1}` (exit): `hc_head`, final `norm`, the low-rank Markov
 ///   token-transition head (`markov_w1`/`markov_w2`), and the scalar
-///   `confidence_proj`. Output logits tie to `embed.weight` (no `lm_head`).
+///   `confidence_proj`. Output logits decode via the base model's separate
+///   `head.weight` output head (`tie_word_embeddings=false`; our loader exposes
+///   it as `model.lm_head`), NOT a draft-local or embed-tied head — the draft
+///   checkpoint ships that same `head.weight`. (codex T4.3 flagged "tie to embed"
+///   — a false positive: DSv4 has a distinct `head.weight`, verified in the index.)
 /// - middle stages: bare block, all extras `None`.
 // Fields are read only by the DSpark forward tranche (T4); inert until then.
 #[allow(dead_code)]
