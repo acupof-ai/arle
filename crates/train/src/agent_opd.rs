@@ -244,6 +244,9 @@ mod cuda_rollout {
         pub edited: bool,
         /// Last line of the test log / a short note (error / no-edit).
         pub note: String,
+        /// Graded (dense) score in [0,1] = fraction of fail_to_pass passing;
+        /// `passed` is `reward >= 1.0`. Surfaces sub-threshold improvement.
+        pub reward: f32,
     }
 
     /// Held-out eval roll-up: per-task pass/fail plus the aggregate pass-rate.
@@ -262,6 +265,14 @@ mod cuda_rollout {
         /// Fraction of held-out tasks the student solved (0.0 when no tasks).
         pub fn pass_rate(&self) -> f32 {
             super::pass_rate(self.passed(), self.tasks.len())
+        }
+        /// Mean dense reward over held-out tasks — finer than binary pass_rate,
+        /// moves when const-partial tasks improve without crossing 1.0.
+        pub fn mean_dense(&self) -> f32 {
+            if self.tasks.is_empty() {
+                return 0.0;
+            }
+            self.tasks.iter().map(|t| t.reward).sum::<f32>() / self.tasks.len() as f32
         }
     }
 
@@ -335,8 +346,11 @@ mod cuda_rollout {
                     settings,
                 )
             };
-            let (passed, edited, note) = match result {
-                Err(e) => (false, false, format!("rollout error: {e}")),
+            // `reward` is the graded (dense) score: pass ⇔ reward==1.0, but the
+            // fraction matters for const-partial held-out tasks whose improvement
+            // never crosses the binary threshold. Non-edit / error paths score 0.
+            let (passed, edited, note, reward) = match result {
+                Err(e) => (false, false, format!("rollout error: {e}"), 0.0),
                 Ok(result) => {
                     let diff = diff_workdir(&workdir).unwrap_or_default();
                     if diff.trim().is_empty() {
@@ -344,6 +358,7 @@ mod cuda_rollout {
                             false,
                             false,
                             format!("no edits (turns={})", result.tool_calls_executed),
+                            0.0,
                         )
                     } else {
                         match score_workdir(
@@ -356,15 +371,20 @@ mod cuda_rollout {
                             Ok((reward, log)) => {
                                 // pass_rate keeps binary semantics: pass ⇔ all green.
                                 let passed = reward >= 1.0;
-                                (passed, true, log.lines().last().unwrap_or("").to_string())
+                                (
+                                    passed,
+                                    true,
+                                    log.lines().last().unwrap_or("").to_string(),
+                                    reward,
+                                )
                             }
-                            Err(e) => (false, true, format!("score error: {e}")),
+                            Err(e) => (false, true, format!("score error: {e}"), 0.0),
                         }
                     }
                 }
             };
             eprintln!(
-                "[agent-opd-eval {label}] {} passed={passed} edited={edited} :: {note}",
+                "[agent-opd-eval {label}] {} passed={passed} edited={edited} reward={reward:.3} :: {note}",
                 task.instance_id
             );
             report.tasks.push(AgentEvalTaskResult {
@@ -372,12 +392,14 @@ mod cuda_rollout {
                 passed,
                 edited,
                 note,
+                reward,
             });
         }
 
         eprintln!(
-            "[agent-opd-eval {label}] held-out pass_rate={:.4} ({}/{} tasks, {} edited)",
+            "[agent-opd-eval {label}] held-out pass_rate={:.4} mean_dense={:.4} ({}/{} tasks, {} edited)",
             report.pass_rate(),
+            report.mean_dense(),
             report.passed(),
             report.tasks.len(),
             report.edited(),
