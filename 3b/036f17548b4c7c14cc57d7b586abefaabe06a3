@@ -1,0 +1,45 @@
+CHANGELOG.md
+  s_c5b532ba176b27::t_ee500190cb6451 22-47,61-64
+Cargo.lock
+  s_c5b532ba176b27::t_09d004a999c40b 13,28,135,177,343,391,621,689,699,708,1121,1273,1277,1581,1608,1618,1643,1653,1666,1685,1692,1700,1709,1733,1740,1752,1847,2686,2695,3665,3753,3993,4002,4565
+Cargo.toml
+  s_c5b532ba176b27::t_f26afc8a4beea6 41,81
+crates/agent/Cargo.toml
+  s_c5b532ba176b27::t_711d996f94ed8f 3
+crates/autograd/Cargo.toml
+  s_c5b532ba176b27::t_5bdf4100100c0c 3
+crates/chat/Cargo.toml
+  s_c5b532ba176b27::t_9a682c1c3c7c48 3
+crates/cli/Cargo.toml
+  s_c5b532ba176b27::t_dc5e3c93f920c8 3
+crates/cuda-kernels/Cargo.toml
+  s_c5b532ba176b27::t_3b5d2b1a724914 3
+crates/hip-kernels/Cargo.toml
+  s_c5b532ba176b27::t_48e56102f26ba6 3
+crates/hip-sys/Cargo.toml
+  s_c5b532ba176b27::t_b3f11307a15ea6 3
+crates/kv-native-sys/Cargo.toml
+  s_c5b532ba176b27::t_7e2a0e45a58ba9 3
+crates/tools/Cargo.toml
+  s_c5b532ba176b27::t_aa303b927f41b9 3
+crates/xgrammar-sys/Cargo.toml
+  s_c5b532ba176b27::t_f2aa98cc294f3e 3
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "3b036f17548b4c7c14cc57d7b586abefaabe06a3",
+  "prompts": {},
+  "sessions": {
+    "s_c5b532ba176b27": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4db221a6-91f5-4cb0-aa41-0e30311ecba8",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
