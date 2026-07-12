@@ -85,8 +85,9 @@ impl Dsv4DsparkSlotState {
 pub(crate) struct Dsv4DsparkScratch {
     /// RoPE'd query for the noise block `[local_width, block]`.
     q_prepped: HsSlot,
-    /// Attention output `[local_heads * nope_dim, block]` — the NoPE-latent value
-    /// side fed to `mla_oproj`.
+    /// Attention output `[local_heads * head_dim, block]` — the full-latent value
+    /// side fed to `mla_oproj` (Flag #1: `local_heads*head_dim == local_width`,
+    /// matching the main model's `local_attn`).
     attn_heads: HsSlot,
 }
 
@@ -306,14 +307,14 @@ impl Dsv4Model {
         // ── Dense non-causal MLA-latent attention over [context ++ block]. Every
         // block row attends the whole kv_len latent range; K==V head-shared latent.
         let kv_len = (block_start + block) - df.ctx_base;
-        let attn_heads = scratch.attn_heads.get(ctx, local_heads * nope_dim, block)?;
+        let attn_heads = scratch.attn_heads.get(ctx, local_heads * head_dim, block)?;
         {
             let sm_scale = 1.0f32 / (head_dim as f32).sqrt();
             let (q_ptr, _gq) = q_prepped.data.device_ptr(&ctx.stream);
             let (lat_ptr, _gl) = df.latent_kv[stage_idx].data.device_ptr(&ctx.stream);
             let (o_ptr, _go) = attn_heads.data.device_ptr_mut(&ctx.stream);
             // SAFETY: q [block,local_heads,head_dim]; latent_kv holds kv_len rows
-            // from ctx_base; out [block,local_heads,nope_dim]. Kernel is pod-stubbed.
+            // from ctx_base; out [block,local_heads,head_dim] (Flag #1).
             unsafe {
                 ffi::dsv4_dspark_draft_attention_cuda(
                     q_ptr as *const ffi::Half,
@@ -336,7 +337,7 @@ impl Dsv4Model {
         // SAFETY: uninit device scratch; fully written by mla_oproj.
         let mut attn_out = unsafe { HiddenStates::uninit(ctx, hidden_size, block)? };
         {
-            let attn_heads = scratch.attn_heads.get(ctx, local_heads * nope_dim, block)?;
+            let attn_heads = scratch.attn_heads.get(ctx, local_heads * head_dim, block)?;
             crate::attention::mla_oproj(
                 ctx,
                 attention,

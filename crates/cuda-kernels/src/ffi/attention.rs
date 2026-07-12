@@ -178,18 +178,21 @@ unsafe extern "C" {
     /// compressed latent, shared across all query heads: `latent_kv` row =
     /// `head_dim` = NoPE(`nope_dim`) ++ RoPE(`rope_dim`).
     ///
-    /// Math contract (pod-side kernel — STUB for now):
+    /// Math contract:
     ///   for each block row r, head h:
     ///     score[j] = sm_scale * dot(q[r,h,0..head_dim], latent_kv[j,0..head_dim])
-    ///               // over the FULL head_dim (NoPE + RoPE)
+    ///               // over the FULL head_dim (NoPE + RoPE); RoPE applied upstream
     ///     w[0..kv_len] = online_softmax(score[0..kv_len])   // non-causal, all keys
-    ///     out[r,h,0..nope_dim] = Σ_j w[j] * latent_kv[j,0..nope_dim]
-    ///               // weighted sum of the NoPE part ONLY (V-side is the NoPE latent)
+    ///     out[r,h,0..head_dim] = Σ_j w[j] * latent_kv[j,0..head_dim]
+    ///               // weighted sum of the FULL head_dim latent (Flag #1: the
+    ///               // value is the whole latent, feeding mla_oproj as
+    ///               // local_heads*head_dim, identical to the main model's local_attn)
     ///
     /// Layout: `q` [block_size, local_heads, head_dim] token-major; `latent_kv`
     /// [kv_len, head_dim] kv-major (one head-shared latent, broadcast over
-    /// `local_heads`); `out` [block_size, local_heads, nope_dim] token-major.
-    /// `sm_scale` is the caller's `1/sqrt(head_dim)`. bf16 in/out.
+    /// `local_heads`); `out` [block_size, local_heads, head_dim] token-major.
+    /// `sm_scale` is the caller's `1/sqrt(head_dim)`. bf16 in/out. `nope_dim` /
+    /// `rope_dim` are unused by the kernel (Flag #1: full head_dim value).
     pub fn dsv4_dspark_draft_attention_cuda(
         q: *const Half,
         latent_kv: *const Half,
