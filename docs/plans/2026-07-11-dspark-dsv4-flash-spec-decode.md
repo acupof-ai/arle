@@ -159,9 +159,21 @@ the per-stage block load path (`load_dsv4_attention`/`load_dsv4_moe_layer`/
 (3× dual-stream MLA with per-block own draft KV) + main_proj fp8 fuse + markov
 semi-AR + confidence truncation. This is the real P1+P2 cost.
 
-**Landed but on the WRONG (single-stage) arch → returns**: T1/T2 (`3b1921a7a`)
-put markov/confidence + hc_head into a single `mtp.0` flavor. Refit to the
-3-stage model: main_proj@0 (fp8), heads@2, no hc_head@0/1.
+**Landed (correct 3-stage)**: T1/T2 tensor-name + `Dsv4DsparkDraft` load scaffolding
+(`3b1921a7a` → refit `59138561b`); P0 requant extended to all 3 stages
+(`mtp{0,1,2}-fp8.safetensors`, 19.92 GB, Frobenius 0, `bd7bcc4e2` — codex found
+mtp0-only was incomplete); **T3 3-tap capture** (`ac9152e3d`): captures the wide
+HC stream at `dspark_target_layer_ids` in the eager forward, gated `is_dspark()`,
+default byte-identical.
+
+**T3 design note — DSpark decode runs EAGER (no CUDA graph)**: T3 adds
+`!is_dspark()` to the decode-graph gate so the tap fires at c=1 decode (mirrors
+native MTP's `last_hidden_out` eager-force). Correct for P1 (spec-decode is a
+different control flow than the single-token decode graph anyway). **P3 caveat**:
+when the confidence scheduler drops draft-len→0 under load, those non-speculating
+steps still pay the eager tax with no spec gain — P3 must re-enable the graph path
+when not speculating. **T4 must rebase on HEAD** — a concurrent session is churning
+`cuda-kernels/csrc` (`9fc53e7e4`/`a07a48d90`).
 
 **Backbone RESOLVED** (DeepSpec `dspark/qwen3/modeling.py` `_forward_backbone`,
 verbatim): `hidden = noise_embed`; `context = main_norm(main_proj(concat taps))`
