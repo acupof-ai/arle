@@ -544,6 +544,12 @@ pub(crate) struct Dsv4Model {
     /// set. Per-slot construction (`Dsv4SlotState::new`) reads this so the
     /// MTP-head load and the per-slot rollback snapshots agree on one decision.
     pub spec_decode_on: bool,
+    /// Per-rank UPPER-BOUND estimate of the DSpark draft head's device
+    /// footprint, computed from the draft dir's fp8 safetensors headers at
+    /// construction. `kv_budget_plan` subtracts it as a fixed term so the KV
+    /// pool leaves room for the ~5GB/rank draft alloc. `0` off the DSpark path
+    /// (byte-identical budget).
+    pub dspark_draft_reserve_bytes: usize,
     pub tp: crate::tp::TpRuntime,
     #[cfg(feature = "deepep")]
     pub deepep: Option<crate::deepep::DeepEpTransport>,
@@ -1759,6 +1765,87 @@ fn read_safetensors_tensor_names(path: &Path) -> Result<Vec<String>> {
         .unwrap_or_default())
 }
 
+/// Conservative UPPER-BOUND estimate of the per-rank device bytes the DSpark
+/// draft head will allocate, read from the draft dir's safetensors HEADERS
+/// BEFORE the weights load. `kv_budget_plan` subtracts it as a fixed term so the
+/// KV slot pool doesn't fill VRAM and OOM the ~5GB/rank draft alloc (TP=4).
+///
+/// Per-rank footprint = Σ(non-expert tensor bytes, replicated full on every
+/// rank) + ⌈Σ(expert tensor bytes) / world_size⌉ (expert tensors — name
+/// contains `.experts.` — are EP-sharded like the base MoE). Byte size per
+/// tensor is `data_offsets[1] - data_offsets[0]` (exact on-disk fp8 bytes =
+/// device footprint; weights load as-is). Rank-identical: same files + same
+/// world_size on every rank ⇒ no planner divergence. This is a PRE-LOAD
+/// estimate; the executor's post-slot-0 drift guard reconciles any residual.
+fn dspark_draft_reserve_bytes(draft_dir: &Path, world_size: usize) -> Result<usize> {
+    let mut non_expert = 0usize;
+    let mut expert = 0usize;
+    let mut shard_count = 0usize;
+    for entry in std::fs::read_dir(draft_dir)
+        .map_err(|e| anyhow!("read DSpark draft dir {}: {e}", draft_dir.display()))?
+    {
+        let path = entry
+            .map_err(|e| anyhow!("read DSpark draft dir entry: {e}"))?
+            .path();
+        if path.extension().is_none_or(|e| e != "safetensors") {
+            continue;
+        }
+        shard_count += 1;
+        for (name, bytes) in read_safetensors_tensor_bytes(&path)? {
+            if name.contains(".experts.") {
+                expert = expert.saturating_add(bytes);
+            } else {
+                non_expert = non_expert.saturating_add(bytes);
+            }
+        }
+    }
+    ensure!(
+        shard_count > 0,
+        "DSpark draft dir {} holds no *.safetensors shards to size the KV budget reserve",
+        draft_dir.display()
+    );
+    // Round the EP-sharded expert share UP — over-reserving costs a few slots;
+    // under-reserving re-OOMs at draft alloc.
+    Ok(non_expert.saturating_add(expert.div_ceil(world_size.max(1))))
+}
+
+/// Read `(tensor_name, on-disk byte size)` pairs from a safetensors header. Byte
+/// size = `data_offsets[1] - data_offsets[0]` (the exact stored extent).
+fn read_safetensors_tensor_bytes(path: &Path) -> Result<Vec<(String, usize)>> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).map_err(|e| anyhow!("open {}: {e}", path.display()))?;
+    let mut len_buf = [0u8; 8];
+    f.read_exact(&mut len_buf)
+        .map_err(|e| anyhow!("read header length of {}: {e}", path.display()))?;
+    let header_len = u64::from_le_bytes(len_buf) as usize;
+    let mut header = vec![0u8; header_len];
+    f.read_exact(&mut header)
+        .map_err(|e| anyhow!("read header of {}: {e}", path.display()))?;
+    let v: serde_json::Value = serde_json::from_slice(&header)
+        .map_err(|e| anyhow!("parse header of {}: {e}", path.display()))?;
+    let obj = v
+        .as_object()
+        .ok_or_else(|| anyhow!("safetensors header of {} is not an object", path.display()))?;
+    obj.iter()
+        .filter(|(k, _)| *k != "__metadata__")
+        .map(|(name, meta)| {
+            let offsets = meta
+                .get("data_offsets")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| anyhow!("tensor {name} in {} lacks data_offsets", path.display()))?;
+            let start = offsets.first().and_then(serde_json::Value::as_u64);
+            let end = offsets.get(1).and_then(serde_json::Value::as_u64);
+            let (start, end) = start.zip(end).ok_or_else(|| {
+                anyhow!(
+                    "tensor {name} in {} has malformed data_offsets",
+                    path.display()
+                )
+            })?;
+            Ok((name.clone(), end.saturating_sub(start) as usize))
+        })
+        .collect()
+}
+
 impl Dsv4Model {
     /// Per-forward owned-token cap when the deepep_ll MoE transport is booted
     /// (`None` for allreduce / intranode / non-deepep builds → unbounded). Core
@@ -2011,6 +2098,15 @@ impl Dsv4Model {
         };
         ctx.sync()?;
 
+        // Reserve the DSpark draft head's per-rank footprint from the KV budget:
+        // it loads AFTER the KV pool is sized (executor `load_dspark_exec`), so
+        // without this the pool fills VRAM and the ~5GB/rank draft alloc OOMs
+        // (TP=4). Rank-identical (same files + world_size). `0` off DSpark.
+        let dspark_draft_reserve_bytes = match dspark_draft_model {
+            Some(draft_dir) => dspark_draft_reserve_bytes(draft_dir, tp_cfg.world_size)?,
+            None => 0,
+        };
+
         Ok(Self {
             ctx,
             config,
@@ -2025,6 +2121,7 @@ impl Dsv4Model {
             head_hc,
             mtp,
             spec_decode_on,
+            dspark_draft_reserve_bytes,
             tp,
             #[cfg(feature = "deepep")]
             deepep,
@@ -2339,7 +2436,8 @@ impl Dsv4Model {
                         .saturating_add(moe_decode_shared_bytes)
                         .saturating_add(shared_expert_scratch_bytes)
                         .saturating_add(moe_tail_scratch_bytes)
-                        .saturating_add(mla_decode_bytes);
+                        .saturating_add(mla_decode_bytes)
+                        .saturating_add(self.dspark_draft_reserve_bytes);
                     let budget_before_pool = infer_seam::SlotBudget::from_free(
                         free,
                         MEM_FRACTION,
@@ -2358,7 +2456,7 @@ impl Dsv4Model {
                     log::info!(
                         "DSv4 KV budget: free {}MB, per_slot {}MB (slot-state {}MB + DSA key-cache {}MB + DSA batched {}MB; \
                          FP8 arena in shared pool), shared DSA {}MB, shared MoE decode {}MB, shared expert scratch {}MB, \
-                         shared MLA decode {}MB, pool_total {}MB, affordable {}",
+                         shared MLA decode {}MB, DSpark draft reserve {}MB, pool_total {}MB, affordable {}",
                         free >> 20,
                         per_slot >> 20,
                         slot_state_bytes >> 20,
@@ -2368,6 +2466,7 @@ impl Dsv4Model {
                         moe_decode_shared_bytes >> 20,
                         shared_expert_scratch_bytes >> 20,
                         mla_decode_bytes >> 20,
+                        self.dspark_draft_reserve_bytes >> 20,
                         pool_budget_total >> 20,
                         affordable,
                     );
@@ -2400,12 +2499,13 @@ impl Dsv4Model {
             affordable > 0,
             "DSv4 KV budget rejected startup: post-weights free VRAM affords 0 slots at \
              max_seq_len {max_seq_len} (per_slot ~{}MB + shared DSA {}MB + shared MoE decode {}MB \
-             + shared expert scratch {}MB + shared MLA decode {}MB exceed {MEM_FRACTION} of free). Lower --max-total-tokens or free VRAM.",
+             + shared expert scratch {}MB + shared MLA decode {}MB + DSpark draft reserve {}MB exceed {MEM_FRACTION} of free). Lower --max-total-tokens or free VRAM.",
             per_slot >> 20,
             dsa_shared_bytes >> 20,
             moe_decode_shared_bytes >> 20,
             shared_expert_scratch_bytes >> 20,
             mla_decode_bytes >> 20,
+            self.dspark_draft_reserve_bytes >> 20,
         );
         // The `affordable` gate above only covers PER-SLOT costs; the shared
         // FlashMLA pool (`pool_budget_total`, the coherent remainder after
