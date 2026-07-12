@@ -1,0 +1,21 @@
+crates/cuda-kernels/csrc/gemm/quantized_gemv.cu
+  s_c5790cf7d0b961::t_0db8f23948cf0b 33-38,2223,2225-2226,2235,2237-2238,2247,2249-2250
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "92ec562d914d5afea972358662efa310b5d6aafb",
+  "prompts": {},
+  "sessions": {
+    "s_c5790cf7d0b961": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a87f5c06a83e9a36f",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
