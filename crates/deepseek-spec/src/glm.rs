@@ -296,6 +296,11 @@ impl GlmMoeDsaConfig {
             per_layer_full_indexer: Some((0..n).map(|l| self.is_full_indexer_layer(l)).collect()),
             // GLM-5.2 HF tensor names.
             tensor_dialect: TensorDialect::Glm,
+            // GLM is not a DSpark checkpoint.
+            dspark_block_size: 0,
+            dspark_target_layer_ids: Vec::new(),
+            dspark_markov_rank: 0,
+            dspark_noise_token_id: 0,
         })
     }
 }
