@@ -1,0 +1,23 @@
+crates/train/src/opd.rs
+  s_9c91b86ec3fb55::t_0518dcc817aff9 3402-3409
+crates/train/src/update_strategy.rs
+  s_9c91b86ec3fb55::t_610b87738dd9c0 240-245,273
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "414795a2b09ffe27e2e0d234dbc0452f938a2cb6",
+  "prompts": {},
+  "sessions": {
+    "s_9c91b86ec3fb55": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4779911a-69b7-49db-bc83-daf5a48d6ca3",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
