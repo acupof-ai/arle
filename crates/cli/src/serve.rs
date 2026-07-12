@@ -717,9 +717,12 @@ mod tests {
             config.options.engine_config.total_pages,
             defaults.total_pages
         );
+        // The unbounded default prompt cap is clamped down to the default
+        // total-token budget (see resolve_engine_config); low-impact leaves
+        // that baseline clamp untouched, it does not shrink it further.
         assert_eq!(
             config.options.engine_config.max_prompt_tokens,
-            defaults.max_prompt_tokens
+            defaults.max_total_tokens
         );
         assert_eq!(
             config.options.engine_config.max_total_tokens,
