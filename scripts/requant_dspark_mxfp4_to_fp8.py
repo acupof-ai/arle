@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
-"""Requant the DSpark mtp.0 draft's MXFP4 routed experts -> fp8 e4m3 block-128,
-so the draft loads as an all-fp8 mtp.0 on the existing DSv4 fp8 MoE path.
+"""Requant the DSpark draft's MXFP4 routed experts -> fp8 e4m3 block-128, so each
+stage loads as all-fp8 on the existing DSv4 fp8 MoE path. Stage-agnostic: the
+tensor match keys on `.ffn.experts.`, so one invocation converts whatever stage(s)
+the given shard(s) hold. Pass one or more src dst pairs (mtp.0/1/2 = shard 46/47/48).
 
 Manual safetensors I/O (raw bytes) — the numpy/torch frameworks can't materialize
 F8_E8M0, so we interpret every tensor's bytes ourselves. Deps: numpy + ml_dtypes.
@@ -106,4 +108,8 @@ def main(src, dst):
     print(f"wrote {dst} ({(off)/1e9:.2f} GB data)", flush=True)
 
 if __name__ == "__main__":
-    main(sys.argv[1], sys.argv[2])
+    args = sys.argv[1:]
+    assert args and len(args) % 2 == 0, "usage: script.py src1 dst1 [src2 dst2 ...]"
+    for src, dst in zip(args[0::2], args[1::2]):
+        print(f"=== {src} -> {dst} ===", flush=True)
+        main(src, dst)
