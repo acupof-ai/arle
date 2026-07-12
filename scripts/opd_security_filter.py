@@ -85,6 +85,34 @@ def is_security_flagged(text: str) -> Optional[str]:
     return None
 
 
+# Files whose CONTENT is not code the model ever trains on: binary assets and
+# documentation prose. Their bytes (an image matching "xss") or prose (a
+# CHANGELOG line "fixed a vulnerability") produce keyword false positives that
+# whole-repo-ban otherwise-clean repos. The file-TREE scans skip these; the text
+# scan (is_security_flagged over .py code, test patches, task statements) is
+# unchanged — real security-offense code is still caught.
+_SKIP_SUFFIXES = frozenset({
+    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".webp", ".pdf",
+    ".woff", ".woff2", ".ttf", ".eot", ".otf",
+    ".zip", ".gz", ".bz2", ".xz", ".tar", ".tgz", ".whl", ".jar",
+    ".so", ".pyc", ".pyd", ".dll", ".dylib", ".o", ".a", ".mo",
+    ".dat", ".bin", ".pickle", ".pkl", ".npy", ".npz", ".parquet",
+    ".rst",  # reStructuredText documentation
+})
+_SKIP_DOC_STEMS = frozenset({
+    "changelog", "changes", "history", "readme", "authors", "news",
+    "contributing",
+})
+
+
+def scan_skips(path: Path) -> bool:
+    """True iff `path`'s content must NOT be security-scanned — binary assets +
+    documentation prose (keyword-false-positive sources, never trained on).
+    Code (.py, .cfg, .txt, .yml, test fixtures) stays scanned. `.svg` stays
+    scanned (XML text can carry real script)."""
+    return path.suffix.lower() in _SKIP_SUFFIXES or path.stem.lower() in _SKIP_DOC_STEMS
+
+
 # ------------------------------------------------------------------- CLI ---
 
 _POSITIVE = [
@@ -136,6 +164,8 @@ def _self_check() -> int:
 def _scan(root: Path) -> int:
     flagged = 0
     for path in sorted(p for p in root.rglob("*") if p.is_file()):
+        if scan_skips(path):
+            continue
         try:
             text = path.read_text(errors="replace")
         except OSError:
