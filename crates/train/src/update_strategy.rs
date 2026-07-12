@@ -231,6 +231,12 @@ impl UpdateStrategy {
     ) -> Result<f32> {
         let mut loss_sum = 0.0f32;
         let mut steps = 0usize;
+        // Critic health telemetry — the load-bearing question for Phase 2: is
+        // V(s) learning (MSE ↓) and producing non-trivial credit (|adv| > 0)? A
+        // null result is unattributable without it.
+        let mut mse_sum = 0.0f32;
+        let mut adv_abs_sum = 0.0f32;
+        let mut adv_tokens = 0usize;
         for traj in batch {
             let rollout_logprobs = traj.rollout_logprobs.as_deref().ok_or_else(|| {
                 OpdError::InvalidInput(
@@ -269,7 +275,7 @@ impl UpdateStrategy {
                 store,
             )?;
             // Fit the critic toward the observed returns (frozen-attention MSE).
-            critic.update(
+            let mse = critic.update(
                 student,
                 &traj.prompt_ids,
                 &traj.response_ids,
@@ -277,8 +283,19 @@ impl UpdateStrategy {
                 &returns,
                 store,
             )?;
+            mse_sum += mse;
+            adv_abs_sum += advantages.iter().map(|a| a.abs()).sum::<f32>();
+            adv_tokens += advantages.len();
             loss_sum += loss;
             steps += 1;
+        }
+        if steps > 0 {
+            eprintln!(
+                "[sao-value] trained={steps} mean_policy_loss={:.4} mean_critic_mse={:.4e} mean_adv_abs={:.4e}",
+                loss_sum / steps as f32,
+                mse_sum / steps as f32,
+                adv_abs_sum / adv_tokens.max(1) as f32,
+            );
         }
         Ok(if steps > 0 {
             loss_sum / steps as f32
