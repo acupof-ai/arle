@@ -1,0 +1,23 @@
+.github/workflows/release.yml
+  s_c5b532ba176b27::t_ef7780d9cd2dc8 194-196,255-257
+scripts/ci-patch-tvm-ffi.sh
+  s_c5b532ba176b27::t_3c1ce588a3ec64 1-30
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "6d0fbf15cbd221fa55bef53a1f83c589cae642f9",
+  "prompts": {},
+  "sessions": {
+    "s_c5b532ba176b27": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4db221a6-91f5-4cb0-aa41-0e30311ecba8",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
