@@ -114,6 +114,10 @@ pub struct DeepSeekV4Config {
     pub dspark_markov_rank: usize,
     #[serde(default)]
     pub dspark_noise_token_id: u32,
+    /// Number of stacked DSpark draft blocks (`mtp.0`…`mtp.{n-1}`). `0` ⇒ not a
+    /// DSpark checkpoint; the real checkpoint = 3.
+    #[serde(default)]
+    pub dspark_num_stages: usize,
 }
 
 impl DeepSeekV4Config {
@@ -255,8 +259,17 @@ impl DeepSeekV4Config {
         self.dspark_block_size > 0
     }
 
+    pub fn dspark_num_stages(&self) -> usize {
+        self.dspark_num_stages
+    }
+
     pub fn dspark_tensor_names(&self, mtp_idx: usize) -> DeepSeekV4DsparkTensorNames {
-        DeepSeekV4DsparkTensorNames::new(format!("mtp.{mtp_idx}"), self.n_shared_experts > 0)
+        DeepSeekV4DsparkTensorNames::new(
+            format!("mtp.{mtp_idx}"),
+            mtp_idx,
+            self.dspark_num_stages(),
+            self.n_shared_experts > 0,
+        )
     }
 
     pub fn shard_for_global_tensor(&self, name: &str) -> Option<Shard> {
@@ -1222,42 +1235,52 @@ impl DeepSeekV4MtpTensorNames {
     }
 }
 
-/// DSpark spec-decode draft tensor set (`mtp.0.*`). Unlike native MTP it drops
-/// the 1-tap combine (`enorm`/`hnorm`/`e_proj`/`h_proj`/bare `norm`) — the draft
-/// reuses the base model's final norm + lm_head — and adds the 3-tap fusion
-/// (`main_proj`/`main_norm`), a low-rank Markov token-transition head
-/// (`markov_w1`/`markov_w2`), and a `confidence_proj` scalar head. The MLA attn
-/// + full MoE body is identical to native MTP.
+/// One stage of the DSpark spec-decode draft — a full DSv4 transformer block
+/// (`attn` MLA + `ffn` 256-expert MoE + `attn_norm`/`ffn_norm` + `hc_attn`/
+/// `hc_ffn`), same body as native MTP. The draft is 3 such blocks stacked
+/// (`mtp.0` → `mtp.1` → `mtp.2`); stage-only extras carry the entry/exit heads:
+///
+/// - `mtp.0` (entry): `main_proj` (fp8-block 3-tap fusion) + `main_norm`.
+/// - `mtp.{n-1}` (exit): `hc_head`, final `norm`, the low-rank Markov
+///   token-transition head (`markov_w1`/`markov_w2`), and the scalar
+///   `confidence_proj`.
+/// - middle stages: bare block, all extras `None`.
+///
+/// The output head is tied to `embed.weight` (no `lm_head` in the checkpoint).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeepSeekV4DsparkTensorNames {
     pub prefix: String,
-    pub main_proj: String,
-    pub main_norm: String,
     pub attn_norm: String,
     pub ffn_norm: String,
-    pub markov_w1: String,
-    pub markov_w2: String,
-    pub confidence_proj: String,
     pub hc_attn: DeepSeekV4HyperConnectionTensorNames,
     pub hc_ffn: DeepSeekV4HyperConnectionTensorNames,
-    pub hc_head: DeepSeekV4HyperConnectionTensorNames,
     pub attn: DeepSeekV4AttentionTensorNames,
     pub ffn: DeepSeekV4MoeTensorNames,
+    /// `Some` iff entry stage (`stage_idx == 0`).
+    pub main_proj: Option<String>,
+    pub main_norm: Option<String>,
+    /// `Some` iff exit stage (`stage_idx == num_stages - 1`).
+    pub hc_head: Option<DeepSeekV4HyperConnectionTensorNames>,
+    pub norm: Option<String>,
+    pub markov_w1: Option<String>,
+    pub markov_w2: Option<String>,
+    pub confidence_proj: Option<String>,
 }
 
 impl DeepSeekV4DsparkTensorNames {
-    fn new(prefix: String, include_shared_experts: bool) -> Self {
+    fn new(
+        prefix: String,
+        stage_idx: usize,
+        num_stages: usize,
+        include_shared_experts: bool,
+    ) -> Self {
+        let is_entry = stage_idx == 0;
+        let is_exit = stage_idx + 1 == num_stages;
         Self {
-            main_proj: format!("{prefix}.main_proj.weight"),
-            main_norm: format!("{prefix}.main_norm.weight"),
             attn_norm: format!("{prefix}.attn_norm.weight"),
             ffn_norm: format!("{prefix}.ffn_norm.weight"),
-            markov_w1: format!("{prefix}.markov_head.markov_w1.weight"),
-            markov_w2: format!("{prefix}.markov_head.markov_w2.weight"),
-            confidence_proj: format!("{prefix}.confidence_head.proj.weight"),
             hc_attn: DeepSeekV4HyperConnectionTensorNames::new(&format!("{prefix}.hc_attn")),
             hc_ffn: DeepSeekV4HyperConnectionTensorNames::new(&format!("{prefix}.hc_ffn")),
-            hc_head: DeepSeekV4HyperConnectionTensorNames::new(&format!("{prefix}.hc_head")),
             // DSpark is DSv4-only: DSv4 dialect, no indexer (compress_ratio=0),
             // no dense MLP — mirrors the native MTP body exactly.
             attn: DeepSeekV4AttentionTensorNames::new(
@@ -1273,6 +1296,14 @@ impl DeepSeekV4DsparkTensorNames {
                 TensorDialect::Dsv4,
                 false,
             ),
+            main_proj: is_entry.then(|| format!("{prefix}.main_proj.weight")),
+            main_norm: is_entry.then(|| format!("{prefix}.main_norm.weight")),
+            hc_head: is_exit
+                .then(|| DeepSeekV4HyperConnectionTensorNames::new(&format!("{prefix}.hc_head"))),
+            norm: is_exit.then(|| format!("{prefix}.norm.weight")),
+            markov_w1: is_exit.then(|| format!("{prefix}.markov_head.markov_w1.weight")),
+            markov_w2: is_exit.then(|| format!("{prefix}.markov_head.markov_w2.weight")),
+            confidence_proj: is_exit.then(|| format!("{prefix}.confidence_head.proj.weight")),
             prefix,
         }
     }
@@ -1283,22 +1314,32 @@ impl DeepSeekV4DsparkTensorNames {
         name: &str,
         tensor_parallel_size: usize,
     ) -> Option<Shard> {
-        if name == self.main_norm || name == self.attn_norm || name == self.ffn_norm {
+        if name == self.attn_norm || name == self.ffn_norm {
             return Some(Shard::Replicated);
         }
-        // 3-tap fusion over full 3*hidden and the small Markov/confidence heads
-        // are replicated (no TP shard), like the native e_proj/h_proj.
-        if name == self.main_proj
-            || name == self.markov_w1
-            || name == self.markov_w2
-            || name == self.confidence_proj
+        // Scaffolding: the fp8-block 3-tap fusion, the final norm, and the small
+        // Markov/confidence heads are replicated (no TP shard); the forward
+        // tranche revisits markov/lm_head vocab-sharding. Guard the position-
+        // dependent `Option` fields before comparing.
+        for extra in [
+            self.main_proj.as_deref(),
+            self.main_norm.as_deref(),
+            self.norm.as_deref(),
+            self.markov_w1.as_deref(),
+            self.markov_w2.as_deref(),
+            self.confidence_proj.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
         {
-            return Some(Shard::Replicated);
+            if name == extra {
+                return Some(Shard::Replicated);
+            }
         }
         self.hc_attn
             .shard_for(name)
             .or_else(|| self.hc_ffn.shard_for(name))
-            .or_else(|| self.hc_head.shard_for(name))
+            .or_else(|| self.hc_head.as_ref().and_then(|hc| hc.shard_for(name)))
             .or_else(|| self.attn.shard_for(config, name, tensor_parallel_size))
             .or_else(|| self.ffn.shard_for(name))
     }
@@ -1598,7 +1639,8 @@ mod tests {
             "dspark_block_size": 5,
             "dspark_target_layer_ids": [40, 41, 42],
             "dspark_markov_rank": 256,
-            "dspark_noise_token_id": 128799
+            "dspark_noise_token_id": 128799,
+            "dspark_num_stages": 3
         }"#,
         )
         .unwrap();
@@ -1608,25 +1650,65 @@ mod tests {
         assert_eq!(cfg.dspark_target_layer_ids, vec![40, 41, 42]);
         assert_eq!(cfg.dspark_markov_rank, 256);
         assert_eq!(cfg.dspark_noise_token_id, 128799);
+        assert_eq!(cfg.dspark_num_stages(), 3);
 
-        let d = cfg.dspark_tensor_names(0);
-        assert_eq!(d.main_proj, "mtp.0.main_proj.weight");
-        assert_eq!(d.main_norm, "mtp.0.main_norm.weight");
-        assert_eq!(d.attn_norm, "mtp.0.attn_norm.weight");
-        assert_eq!(d.ffn_norm, "mtp.0.ffn_norm.weight");
-        assert_eq!(d.markov_w1, "mtp.0.markov_head.markov_w1.weight");
-        assert_eq!(d.markov_w2, "mtp.0.markov_head.markov_w2.weight");
-        assert_eq!(d.confidence_proj, "mtp.0.confidence_head.proj.weight");
-        assert_eq!(d.attn.attn_sink, "mtp.0.attn.attn_sink");
-        assert_eq!(d.hc_head.scale, "mtp.0.hc_head_scale");
+        // Entry stage (mtp.0): fp8 main_proj + main_norm present, no exit heads.
+        let entry = cfg.dspark_tensor_names(0);
+        assert_eq!(entry.attn_norm, "mtp.0.attn_norm.weight");
+        assert_eq!(entry.ffn_norm, "mtp.0.ffn_norm.weight");
+        assert_eq!(entry.attn.attn_sink, "mtp.0.attn.attn_sink");
         assert_eq!(
-            d.ffn.shared_experts.as_ref().unwrap().w3,
+            entry.ffn.shared_experts.as_ref().unwrap().w3,
             "mtp.0.ffn.shared_experts.w3.weight"
         );
-        // Shard policy: new heads + fusion replicated; body delegates to MLA/MoE.
-        assert_eq!(d.shard_for(&cfg, &d.main_proj, 4), Some(Shard::Replicated));
+        assert_eq!(entry.main_proj.as_deref(), Some("mtp.0.main_proj.weight"));
+        assert_eq!(entry.main_norm.as_deref(), Some("mtp.0.main_norm.weight"));
+        assert!(entry.hc_head.is_none());
+        assert!(entry.norm.is_none());
+        assert!(entry.markov_w1.is_none());
+        assert!(entry.markov_w2.is_none());
+        assert!(entry.confidence_proj.is_none());
+
+        // Middle stage (mtp.1): bare block, all extras absent.
+        let mid = cfg.dspark_tensor_names(1);
+        assert_eq!(mid.attn_norm, "mtp.1.attn_norm.weight");
+        assert!(mid.main_proj.is_none());
+        assert!(mid.main_norm.is_none());
+        assert!(mid.hc_head.is_none());
+        assert!(mid.norm.is_none());
+        assert!(mid.markov_w1.is_none());
+        assert!(mid.markov_w2.is_none());
+        assert!(mid.confidence_proj.is_none());
+
+        // Exit stage (mtp.2): sampling heads present, no entry fusion.
+        let exit = cfg.dspark_tensor_names(2);
+        assert!(exit.main_proj.is_none());
+        assert!(exit.main_norm.is_none());
         assert_eq!(
-            d.shard_for(&cfg, &d.confidence_proj, 4),
+            exit.hc_head.as_ref().map(|hc| hc.scale.as_str()),
+            Some("mtp.2.hc_head_scale")
+        );
+        assert_eq!(exit.norm.as_deref(), Some("mtp.2.norm.weight"));
+        assert_eq!(
+            exit.markov_w1.as_deref(),
+            Some("mtp.2.markov_head.markov_w1.weight")
+        );
+        assert_eq!(
+            exit.markov_w2.as_deref(),
+            Some("mtp.2.markov_head.markov_w2.weight")
+        );
+        assert_eq!(
+            exit.confidence_proj.as_deref(),
+            Some("mtp.2.confidence_head.proj.weight")
+        );
+
+        // Shard policy: new heads + fusion replicated; body delegates to MLA/MoE.
+        assert_eq!(
+            entry.shard_for(&cfg, entry.main_proj.as_deref().unwrap(), 4),
+            Some(Shard::Replicated)
+        );
+        assert_eq!(
+            exit.shard_for(&cfg, exit.confidence_proj.as_deref().unwrap(), 4),
             Some(Shard::Replicated)
         );
     }
