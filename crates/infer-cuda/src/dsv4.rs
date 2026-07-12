@@ -377,6 +377,73 @@ pub(crate) struct Dsv4MtpLayer {
     pub norm: DeviceVec,
 }
 
+/// One DSpark spec-decode draft head (`mtp.0.*`). Unlike native MTP it drops the
+/// 1-tap combine (`enorm`/`hnorm`/`e_proj`/`h_proj`/bare `norm`) — the draft
+/// reuses the base model's final norm + lm_head at forward time — and carries a
+/// 3-tap fusion (`main_proj`/`main_norm`), a low-rank Markov token-transition
+/// head (`markov_w1`/`markov_w2`), and a scalar `confidence_proj`. The MLA attn +
+/// full MoE body is identical to `Dsv4MtpLayer`.
+// Fields are read only by the DSpark forward tranche (T4); inert until then.
+#[allow(dead_code)]
+pub(crate) struct Dsv4DsparkLayer {
+    pub layer: Dsv4Layer,
+    pub head_hc: Dsv4HyperConnection,
+    pub main_proj: DeviceMatrix,
+    pub main_norm: DeviceVec,
+    pub markov_w1: DeviceMatrix,
+    pub markov_w2: DeviceMatrix,
+    pub confidence_proj: DeviceMatrix,
+}
+
+/// Load the DSpark draft head from a DSpark checkpoint. Mirrors the native MTP
+/// load (MLA attn + FP8 MoE body via the shared layer path), swapping the 1-tap
+/// combine for the DSpark 3-tap fusion + Markov/confidence heads. DSpark experts
+/// are format-identical to base experts (`mtp0-fp8` all-FP8 block-128), so the
+/// same `load_dsv4_moe_layer` applies.
+// wired by the DSpark forward tranche (T4)
+#[allow(dead_code)]
+pub(crate) fn load_dspark_layer(
+    loader: &SafetensorLoader,
+    ctx: &DeviceContext,
+    config: &DeepSeekV4Config,
+    split: &ExpertSplit,
+    tp_cfg: &infer_topo::TpConfig,
+) -> Result<Dsv4DsparkLayer> {
+    ensure!(
+        config.is_dspark(),
+        "load_dspark_layer called on a non-DSpark config"
+    );
+    let names = config.dspark_tensor_names(0);
+    let attention = loader.load_dsv4_attention(ctx, config, &names.attn, tp_cfg)?;
+    let moe = loader.load_dsv4_moe_layer(
+        ctx,
+        &names.ffn,
+        split,
+        DeepSeekV4MoeRoutingKind::LearnedBias,
+        false,
+    )?;
+    let compress_ratio = 0;
+    Ok(Dsv4DsparkLayer {
+        layer: Dsv4Layer {
+            hc_attn: loader.load_dsv4_hyper_connection(ctx, &names.hc_attn)?,
+            hc_ffn: loader.load_dsv4_hyper_connection(ctx, &names.hc_ffn)?,
+            attn_norm: loader.load_dsv4_vec(ctx, &names.attn_norm)?,
+            ffn_norm: loader.load_dsv4_vec(ctx, &names.ffn_norm)?,
+            attention,
+            moe: Some(moe),
+            mode: config.attention_mode_for_compress_ratio(compress_ratio),
+            compress_ratio,
+            dense_mlp: None,
+        },
+        head_hc: loader.load_dsv4_hyper_connection(ctx, &names.hc_head)?,
+        main_proj: loader.load_dsv4_global_matrix(ctx, &names.main_proj)?,
+        main_norm: loader.load_dsv4_vec(ctx, &names.main_norm)?,
+        markov_w1: loader.load_dsv4_global_matrix(ctx, &names.markov_w1)?,
+        markov_w2: loader.load_dsv4_global_matrix(ctx, &names.markov_w2)?,
+        confidence_proj: loader.load_dsv4_global_matrix(ctx, &names.confidence_proj)?,
+    })
+}
+
 /// Vocab-shard geometry for the opt-in `ARLE_DSV4_LM_HEAD_SHARD=1` lever
 /// (#99, `docs/plans/2026-07-02-dsv4-6ms-token-plan.md` H3). When set,
 /// `lm_head` holds `[rows_per_rank, hidden]` = this rank's contiguous vocab
