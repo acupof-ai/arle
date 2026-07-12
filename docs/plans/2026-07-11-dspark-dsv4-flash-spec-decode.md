@@ -193,6 +193,16 @@ mirrors the shipped `qwen35/dspark.rs`** (draft `SlotState` w/ small `k_ctx`/
 reuse. T4 = "adapt the working Qwen dspark to MLA latent geometry", not design from
 scratch. Kernel is pod-gated (no nvcc on Mac).
 
+**#2 KERNEL ITEM — 9216-key ceiling (codex kernel review P1), coordinate with T4.4.**
+The kernel uses `__shared__ float logits[9216]` and rejects `kv_len > 9216`. The
+draft `latent_kv.ctx_end` GROWS per block; unless T4.4 bounds it (rebase/crop —
+DeepSpec does `past_key_values_draft.crop(start)`), a long prompt (needle gate uses
+long context) pushes `kv_len > 9216` → deterministic fail. Fix is COUPLED with
+T4.4's draft-KV window management: either T4.4 keeps the draft context bounded
+(rebase/crop → `kv_len` stays small, ceiling safe + declared) OR the kernel goes
+dynamic-shared-mem / tiled softmax. Decide once T4.4 lands + shows its cache model.
+Handle in the pod kernel-iteration session (where nvcc can compile-test).
+
 **#1 POD-VERIFY CORRECTNESS ITEM — post-attention inverse-RoPE (deferred, ~85%).**
 The base DSv4 MLA attention kernels (`dsv4_swa.cu:86-102`, `dsv4_hybrid.cu`) apply
 a post-attention **inverse-RoPE** (sign −1) to the output's `rope_dim` slice before
