@@ -28,7 +28,7 @@ __device__ __forceinline__ uint16_t dsv4_attn_f32_to_bf16_bits(const float value
   return *reinterpret_cast<uint16_t *>(&out);
 }
 
-__device__ float dsv4_attn_block_sum(float value) {
+__device__ __forceinline__ float dsv4_attn_block_sum(float value) {
   __shared__ float warp_sums[DSV4_ATTN_BLOCK / WARP_SIZE];
   value = warp_reduce_sum(value);
   if ((threadIdx.x & (WARP_SIZE - 1)) == 0) {
@@ -42,7 +42,7 @@ __device__ float dsv4_attn_block_sum(float value) {
   return value;
 }
 
-__device__ float dsv4_attn_block_max(float value) {
+__device__ __forceinline__ float dsv4_attn_block_max(float value) {
   __shared__ float warp_max[DSV4_ATTN_BLOCK / WARP_SIZE];
   value = warp_reduce_max(value);
   if ((threadIdx.x & (WARP_SIZE - 1)) == 0) {
