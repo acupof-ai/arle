@@ -1,0 +1,25 @@
+crates/deepseek-spec/src/glm.rs
+  s_d2bc2477216da3::t_0a91fe363dd832 304
+crates/deepseek-spec/src/v4.rs
+  s_d2bc2477216da3::t_6e60c3b3e95672 117-120,262-265,267-272,1238-1249,1259-1267,1271-1278,1299-1306,1317,1320-1333,1335-1337,1342,1642-1643,1653,1655-1659,1661,1664-1704,1707-1711
+crates/infer-cuda/src/dsv4.rs
+  s_d2bc2477216da3::t_18aef41f0ee13a 380-390,393,395-408,411-416,419,425,428,431-494
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "59138561b7f29ea77492713a8b0fc9ea83d0a897",
+  "prompts": {},
+  "sessions": {
+    "s_d2bc2477216da3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ad9eb5b32fe5a2adf",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
