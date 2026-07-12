@@ -1,0 +1,21 @@
+docs/experience/errors/2026-07-12-isolated-nvcc-link-false-pass-odr.md
+  s_c5b532ba176b27::t_3c6186586742c3 1-43
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "0fdb7acc7aefe8d0cafbd5cbc4b07c1b7afde318",
+  "prompts": {},
+  "sessions": {
+    "s_c5b532ba176b27": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4db221a6-91f5-4cb0-aa41-0e30311ecba8",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
