@@ -19,9 +19,32 @@ Related governance docs:
 
 ## [Unreleased]
 
-Post-v0.2.1 progress spine. Entry classes recorded here the day they land:
-phase exits, default flips, license-or-kill verdicts (AGENTS.md §Docs
-lifecycle & progress spine).
+Progress spine. Entry classes recorded here the day they land: phase exits,
+default flips, license-or-kill verdicts (AGENTS.md §Docs lifecycle & progress
+spine).
+
+## [0.3.0] - 2026-07-12
+
+Headline: **DSpark speculative decoding** for DSv4/Qwen3.6, a **CUDA kernel
+`csrc/` reorg + content-addressed prebuilt-kernel release**, and a
+**strategy-driven agent-OPD harness**. ~1 month of runtime + training work since
+v0.2.1.
+
+### Added
+
+- **DSpark block-draft speculative decoding** (`--spec-type dspark`) — DSv4
+  dual-stream draft + 3-stage backbone orchestrator + draft→verify→accept loop
+  (T1–T4.4). P1 LICENSED: **2.39× decode short-ctx / 3.14× at ~3K** vs no-spec
+  (Qwen3.6-27B, H20 TP=1). See §Verdicts.
+- **Unified kernel set** — one full-build binary serves Qwen AND DSv4; the
+  model-family kernel partition was deleted, releases key on SM tier only
+  (`89ea8e7c4`). [win](docs/experience/wins/2026-07-11-unified-kernel-set-one-binary-qwen-and-dsv4.md).
+- **Content-addressed prebuilt kernel bundle** — immutable source-addressed
+  TileLang cubin bundle on the `kernel-artifacts` release; the zero-Python T1
+  release lane fetches it instead of regenerating AOT (`6cb2c0054`).
+- **Strategy-driven agent-OPD harness** — pluggable update strategy
+  (`--update-strategy rejection-ce | sao-dis`) + dense partial-credit reward
+  (fraction of fail-to-pass passing), off-policy DIS diagnostics.
 
 ### Changed
 
@@ -34,6 +57,10 @@ lifecycle & progress spine).
   extern decls (all 0-caller). `csrc/` now = 56 `.cu` in 10 kernel dirs.
   Byte-identical, bench-exempt (no runtime path changed).
   [win](docs/experience/wins/2026-07-12-kernel-csrc-reorg.md).
+
+- **2026-07-11 — DSv4 decode-region KV reuse default ON** (`6230d9d3d`).
+  Multi-turn concurrent throughput **+25%**; default flip after multi-shape
+  verification.
 
 ### Verdicts
 
