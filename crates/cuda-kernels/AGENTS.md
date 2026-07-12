@@ -32,11 +32,17 @@ crates/cuda-kernels/
 ├── build.rs             — SM auto-detection, TileLang AOT, CUDA C compile
 ├── csrc/                — CUDA C sources, grouped by concern
 │   ├── common.cuh       — shared header (include with `#include "common.cuh"`)
-│   ├── attention/       — TileLang prep/dispatch helpers, turboquant decode, varlen FP8 split-KV (P0)
-│   ├── gemm/            — gemv, Marlin W4, quantized gemv, turboquant weight gemv
-│   ├── kv/              — kv_cache_to_paged, kv_quant, paged_kv_append, scatter_kv
-│   ├── quant/           — weight quant kernels
-│   └── misc/            — everything else
+│   ├── attention/       — TileLang prep/dispatch, DSv4 MLA/DSA/MHC + TP-repack, FA3/FlashMLA shims, quant decode
+│   ├── gemm/            — gemv, quantized gemv, DeepGEMM, Marlin repack/preprocess, fused_mlp
+│   ├── moe/             — DSv4 + Qwen3.6 expert routing
+│   ├── kv/              — kv_cache_to_paged, kv_quant, paged_kv_metadata, transfer (KV-tier)
+│   ├── quant/           — dtype convert + TurboQuant kernels
+│   ├── comm/            — TP custom all-reduce (CAR)
+│   ├── sampling/        — argmax + DSpark chain-rejection sampling
+│   ├── norm/            — rms_norm variants
+│   ├── recurrent/       — Qwen3.5 gated-delta-rule + conv1d (linear-attn)
+│   ├── elementwise/     — add/silu_mul/embedding + dtype convert
+│   └── deepep_sidecar/  — out-of-process NVSHMEM DeepEP sidecar (.cpp, no .cu)
 ├── src/
 │   ├── lib.rs           — pub module declarations, feature gating
 │   ├── prelude.rs       — **the proto-API contract** (7 types; see Prelude discipline)
@@ -64,7 +70,7 @@ than ~3 functions.
 | `elementwise.rs` | add/silu_mul/extract_vec/etc. batched scalars |
 | `embedding.rs` | embedding_batch / embedding_decode |
 | `gemm.rs` | gemv, gemm, fused_mlp, Marlin W4 |
-| `kv.rs` | scatter_kv, kv_cache_to_paged, paged_kv_append |
+| `kv.rs` | kv_cache_to_paged, paged_kv_metadata, KV-tier transfer, KV quant |
 | `mla.rs` | DeepSeek V4 MLA decode/prep (P0'', design-ready, partial wiring) |
 | `misc.rs` | catch-all |
 | `nccl.rs` | NCCL collective primitives consumed by `collective.rs` |
@@ -156,8 +162,11 @@ Removing a symbol is **encouraged** if it stops meeting the three criteria.
 
 - All CUDA C files end in `.cu`; headers in `.cuh`. One canonical header
   (`common.cuh`) at `csrc/common.cuh`, included by every subdir.
-- Group new kernels by the closest existing subdir (`attention/`, `gemm/`,
-  `kv/`, `quant/`, `misc/`). Don't create a new subdir for fewer than 3 files.
+- Group new kernels by the closest existing domain subdir (`attention/`,
+  `gemm/`, `moe/`, `kv/`, `quant/`, `comm/`, `sampling/`, `norm/`, `recurrent/`,
+  `elementwise/`) — each aligns 1:1 with a `src/ffi/*.rs` file. The `misc/`
+  junk drawer was deleted in the 07-12 reorg; do not recreate it. Don't create
+  a new subdir for fewer than 3 files.
 - TileLang paged prefill/decode kernels are generated from
   `tools/tilelang/` and linked by `build.rs`.
 - Historical external attention wrappers are removed; do not recreate them.
