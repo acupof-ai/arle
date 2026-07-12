@@ -193,6 +193,15 @@ mirrors the shipped `qwen35/dspark.rs`** (draft `SlotState` w/ small `k_ctx`/
 reuse. T4 = "adapt the working Qwen dspark to MLA latent geometry", not design from
 scratch. Kernel is pod-gated (no nvcc on Mac).
 
+**Flag #1 (V-output width) RESOLVED** (pod build + `dsv4_oproj_group_shape`
+`attention.rs:6648`): the draft attention V-output = **`local_heads × head_dim`
+(512), NOT nope 448**. wo_a `[8192,4096]` → `groups = local_width(32768)/wo_a_cols
+(4096) = 8`; `local_attn.hidden_dim = groups × cols_per_group = 32768 = local_width
+= 64h×512`. The value spans the full latent (512/head) and feeds `mla_oproj`
+identically to the main model. The T4.1 stub FFI (`out = local_heads × 448`) must
+change to `head_dim` (512) — resize `scratch.attn_heads` + span the kernel
+weighted-sum over the full 512 — done together with the kernel impl on the pod.
+
 **Backbone RESOLVED** (DeepSpec `dspark/qwen3/modeling.py` `_forward_backbone`,
 verbatim): `hidden = noise_embed`; `context = main_norm(main_proj(concat taps))`
 computed ONCE; `for stage in [mtp.0, mtp.1, mtp.2]: hidden = stage(hidden,
