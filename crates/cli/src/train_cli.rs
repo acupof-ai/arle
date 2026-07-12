@@ -1970,13 +1970,16 @@ fn run_agent_opd_eval_pass(
             "passed": t.passed,
             "edited": t.edited,
             "note": t.note,
+            "reward": t.reward,
         });
         writeln!(file, "{line}")?;
     }
+    let mean_dense = report.mean_dense();
     let agg = serde_json::json!({
         "aggregate": true,
         "label": label,
         "pass_rate": pass_rate,
+        "mean_dense": mean_dense,
         "passed": report.passed(),
         "edited": report.edited(),
         "tasks": report.tasks.len(),
@@ -1984,7 +1987,7 @@ fn run_agent_opd_eval_pass(
     writeln!(file, "{agg}")?;
     file.flush()?;
     eprintln!(
-        "[arle train agent-opd] eval[{label}]: held-out pass_rate={pass_rate:.4} ({}/{} tasks) -> {}",
+        "[arle train agent-opd] eval[{label}]: held-out pass_rate={pass_rate:.4} mean_dense={mean_dense:.4} ({}/{} tasks) -> {}",
         report.passed(),
         report.tasks.len(),
         out_path.display(),
