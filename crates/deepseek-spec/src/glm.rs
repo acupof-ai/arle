@@ -301,6 +301,7 @@ impl GlmMoeDsaConfig {
             dspark_target_layer_ids: Vec::new(),
             dspark_markov_rank: 0,
             dspark_noise_token_id: 0,
+            dspark_num_stages: 0,
         })
     }
 }

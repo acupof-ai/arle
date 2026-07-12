@@ -377,71 +377,121 @@ pub(crate) struct Dsv4MtpLayer {
     pub norm: DeviceVec,
 }
 
-/// One DSpark spec-decode draft head (`mtp.0.*`). Unlike native MTP it drops the
-/// 1-tap combine (`enorm`/`hnorm`/`e_proj`/`h_proj`/bare `norm`) — the draft
-/// reuses the base model's final norm + lm_head at forward time — and carries a
-/// 3-tap fusion (`main_proj`/`main_norm`), a low-rank Markov token-transition
-/// head (`markov_w1`/`markov_w2`), and a scalar `confidence_proj`. The MLA attn +
-/// full MoE body is identical to `Dsv4MtpLayer`.
+/// One stage of the DSpark spec-decode draft — a full DSv4 transformer block
+/// (`layer`: MLA attn + FP8 MoE, same body as `Dsv4MtpLayer`) plus the
+/// position-dependent extras. The draft stacks 3 such stages (`mtp.0` → `mtp.1`
+/// → `mtp.2`):
+///
+/// - `mtp.0` (entry): `main_proj` (fp8-block, F8_E4M3+F8_E8M0 like the attn
+///   `wq_a`/`wkv` projections) + `main_norm` for the 3-tap context fusion.
+/// - `mtp.{n-1}` (exit): `hc_head`, final `norm`, the low-rank Markov
+///   token-transition head (`markov_w1`/`markov_w2`), and the scalar
+///   `confidence_proj`. Output logits tie to `embed.weight` (no `lm_head`).
+/// - middle stages: bare block, all extras `None`.
 // Fields are read only by the DSpark forward tranche (T4); inert until then.
 #[allow(dead_code)]
-pub(crate) struct Dsv4DsparkLayer {
+pub(crate) struct Dsv4DsparkStage {
     pub layer: Dsv4Layer,
-    pub head_hc: Dsv4HyperConnection,
-    pub main_proj: DeviceMatrix,
-    pub main_norm: DeviceVec,
-    pub markov_w1: DeviceMatrix,
-    pub markov_w2: DeviceMatrix,
-    pub confidence_proj: DeviceMatrix,
+    pub main_proj: Option<DeviceMatrix>,
+    pub main_norm: Option<DeviceVec>,
+    pub hc_head: Option<Dsv4HyperConnection>,
+    pub norm: Option<DeviceVec>,
+    pub markov_w1: Option<DeviceMatrix>,
+    pub markov_w2: Option<DeviceMatrix>,
+    pub confidence_proj: Option<DeviceMatrix>,
 }
 
-/// Load the DSpark draft head from a DSpark checkpoint. Mirrors the native MTP
-/// load (MLA attn + FP8 MoE body via the shared layer path), swapping the 1-tap
-/// combine for the DSpark 3-tap fusion + Markov/confidence heads. DSpark experts
-/// are format-identical to base experts (`mtp0-fp8` all-FP8 block-128), so the
-/// same `load_dsv4_moe_layer` applies.
+/// The full 3-stage DSpark draft (`stages[0]` = `mtp.0` … `stages[n-1]` =
+/// `mtp.{n-1}`), loaded from a DSpark checkpoint by [`load_dspark_draft`].
+#[allow(dead_code)]
+pub(crate) struct Dsv4DsparkDraft {
+    pub stages: Vec<Dsv4DsparkStage>,
+}
+
+/// Load the 3-stage DSpark draft from a DSpark checkpoint. Each stage's common
+/// block reuses the native MTP loaders (MLA attn + FP8 MoE + hyper-connections);
+/// the position-dependent extras load conditionally: `main_proj` via the
+/// fp8-block loader the attn `wq_a`/`wkv` projections use (`load_dsv4_block_scaled`,
+/// NOT `load_dsv4_global_matrix`), the norms via `load_dsv4_vec`, and the
+/// bf16/plain Markov + confidence heads via `load_dsv4_global_matrix`.
 // wired by the DSpark forward tranche (T4)
 #[allow(dead_code)]
-pub(crate) fn load_dspark_layer(
+pub(crate) fn load_dspark_draft(
     loader: &SafetensorLoader,
     ctx: &DeviceContext,
     config: &DeepSeekV4Config,
     split: &ExpertSplit,
     tp_cfg: &infer_topo::TpConfig,
-) -> Result<Dsv4DsparkLayer> {
+) -> Result<Dsv4DsparkDraft> {
     ensure!(
         config.is_dspark(),
-        "load_dspark_layer called on a non-DSpark config"
+        "load_dspark_draft called on a non-DSpark config"
     );
-    let names = config.dspark_tensor_names(0);
-    let attention = loader.load_dsv4_attention(ctx, config, &names.attn, tp_cfg)?;
-    let moe = loader.load_dsv4_moe_layer(
-        ctx,
-        &names.ffn,
-        split,
-        DeepSeekV4MoeRoutingKind::LearnedBias,
-        false,
-    )?;
     let compress_ratio = 0;
-    Ok(Dsv4DsparkLayer {
-        layer: Dsv4Layer {
-            hc_attn: loader.load_dsv4_hyper_connection(ctx, &names.hc_attn)?,
-            hc_ffn: loader.load_dsv4_hyper_connection(ctx, &names.hc_ffn)?,
-            attn_norm: loader.load_dsv4_vec(ctx, &names.attn_norm)?,
-            ffn_norm: loader.load_dsv4_vec(ctx, &names.ffn_norm)?,
-            attention,
-            moe: Some(moe),
-            mode: config.attention_mode_for_compress_ratio(compress_ratio),
-            compress_ratio,
-            dense_mlp: None,
-        },
-        head_hc: loader.load_dsv4_hyper_connection(ctx, &names.hc_head)?,
-        main_proj: loader.load_dsv4_global_matrix(ctx, &names.main_proj)?,
-        main_norm: loader.load_dsv4_vec(ctx, &names.main_norm)?,
-        markov_w1: loader.load_dsv4_global_matrix(ctx, &names.markov_w1)?,
-        markov_w2: loader.load_dsv4_global_matrix(ctx, &names.markov_w2)?,
-        confidence_proj: loader.load_dsv4_global_matrix(ctx, &names.confidence_proj)?,
-    })
+    let stages = (0..config.dspark_num_stages())
+        .map(|stage_idx| {
+            let names = config.dspark_tensor_names(stage_idx);
+            let attention = loader.load_dsv4_attention(ctx, config, &names.attn, tp_cfg)?;
+            let moe = loader.load_dsv4_moe_layer(
+                ctx,
+                &names.ffn,
+                split,
+                DeepSeekV4MoeRoutingKind::LearnedBias,
+                false,
+            )?;
+            Ok(Dsv4DsparkStage {
+                layer: Dsv4Layer {
+                    hc_attn: loader.load_dsv4_hyper_connection(ctx, &names.hc_attn)?,
+                    hc_ffn: loader.load_dsv4_hyper_connection(ctx, &names.hc_ffn)?,
+                    attn_norm: loader.load_dsv4_vec(ctx, &names.attn_norm)?,
+                    ffn_norm: loader.load_dsv4_vec(ctx, &names.ffn_norm)?,
+                    attention,
+                    moe: Some(moe),
+                    mode: config.attention_mode_for_compress_ratio(compress_ratio),
+                    compress_ratio,
+                    dense_mlp: None,
+                },
+                // main_proj is fp8-block (F8_E4M3 + F8_E8M0 scale) like the attn
+                // projections — load via the same fp8 path, not the plain loader.
+                main_proj: names
+                    .main_proj
+                    .as_deref()
+                    .map(|n| loader.load_dsv4_block_scaled(ctx, n))
+                    .transpose()?,
+                main_norm: names
+                    .main_norm
+                    .as_deref()
+                    .map(|n| loader.load_dsv4_vec(ctx, n))
+                    .transpose()?,
+                hc_head: names
+                    .hc_head
+                    .as_ref()
+                    .map(|hc| loader.load_dsv4_hyper_connection(ctx, hc))
+                    .transpose()?,
+                norm: names
+                    .norm
+                    .as_deref()
+                    .map(|n| loader.load_dsv4_vec(ctx, n))
+                    .transpose()?,
+                markov_w1: names
+                    .markov_w1
+                    .as_deref()
+                    .map(|n| loader.load_dsv4_global_matrix(ctx, n))
+                    .transpose()?,
+                markov_w2: names
+                    .markov_w2
+                    .as_deref()
+                    .map(|n| loader.load_dsv4_global_matrix(ctx, n))
+                    .transpose()?,
+                confidence_proj: names
+                    .confidence_proj
+                    .as_deref()
+                    .map(|n| loader.load_dsv4_global_matrix(ctx, n))
+                    .transpose()?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Dsv4DsparkDraft { stages })
 }
 
 /// Vocab-shard geometry for the opt-in `ARLE_DSV4_LM_HEAD_SHARD=1` lever
