@@ -1,79 +1,9 @@
-.github/workflows/ci.yml
-  s_963c0049b5ef89::t_a09d2e427ffb05 68,83,102
-.github/workflows/cuda-ci.yml
-  s_0b8bc77f728355::t_93cb3a5e1afce2 50,59
-.github/workflows/metal-ci.yml
-  s_0b8bc77f728355::t_1ea09c871b8652 68,93,101
-.github/workflows/release.yml
-  s_085ea8e74b8fbb::t_ed921d407b8ef6 47,106,205,263
-Cargo.lock
-  s_d04b61414cd72f::t_4d9a30025802e7 124-133
-Cargo.toml
-  s_4b7198573dd014::t_4d4182fb83ca54 79
-Dockerfile
-  s_49d222493e1ef5::t_e2bd668bf4b120 77
-Makefile
-  s_49d222493e1ef5::t_382fe74262a180 30,34,38,63
-pyproject.toml
-  s_49d222493e1ef5::t_ac53e5cfc3e448 9-10
-setup.sh
-  s_49d222493e1ef5::t_5b0d10120cc595 605
 ---
 {
   "schema_version": "authorship/3.0.0",
   "git_ai_version": "1.6.5",
   "base_commit_sha": "dab1044723700a383a8a6c6df016b4efa8ac6010",
   "prompts": {},
-  "sessions": {
-    "s_085ea8e74b8fbb": {
-      "agent_id": {
-        "tool": "codex",
-        "id": "019f4abd-5663-70d2-b878-3ff064995c01",
-        "model": "unknown"
-      },
-      "human_author": "cklxx <q1293822641@gmail.com>"
-    },
-    "s_0b8bc77f728355": {
-      "agent_id": {
-        "tool": "claude",
-        "id": "f45cd811-18a9-457e-94a4-a5427b68bf63",
-        "model": "unknown"
-      },
-      "human_author": "cklxx <q1293822641@gmail.com>"
-    },
-    "s_49d222493e1ef5": {
-      "agent_id": {
-        "tool": "claude",
-        "id": "14f52814-2f7e-42e3-ba9a-c3c9413d13ee",
-        "model": "unknown"
-      },
-      "human_author": "cklxx <q1293822641@gmail.com>"
-    },
-    "s_4b7198573dd014": {
-      "agent_id": {
-        "tool": "claude",
-        "id": "92cc6785-573b-445c-9517-2aca75a48773",
-        "model": "unknown"
-      },
-      "human_author": "cklxx <q1293822641@gmail.com>"
-    },
-    "s_963c0049b5ef89": {
-      "agent_id": {
-        "tool": "claude",
-        "id": "d5be0b40-0e33-477d-86b2-7a4c02241f1e",
-        "model": "unknown"
-      },
-      "human_author": "cklxx <q1293822641@gmail.com>"
-    },
-    "s_d04b61414cd72f": {
-      "agent_id": {
-        "tool": "codex",
-        "id": "019f4abd-3be6-7383-8207-dc00136055c2",
-        "model": "unknown"
-      },
-      "human_author": "cklxx <q1293822641@gmail.com>"
-    }
-  },
   "attestation_metadata": {},
   "remote_transcripts": {}
 }
