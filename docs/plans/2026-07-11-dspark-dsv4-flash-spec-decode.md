@@ -163,10 +163,15 @@ semi-AR + confidence truncation. This is the real P1+P2 cost.
 put markov/confidence + hc_head into a single `mtp.0` flavor. Refit to the
 3-stage model: main_proj@0 (fp8), heads@2, no hc_head@0/1.
 
-**Open before T4** — the exact `_forward_backbone` stage stacking (is `context`
-injected as k/v at EVERY stage or only mtp.0?). Resolve by reading the DSv4/qwen3
-DSpark `modeling.py` `_forward_backbone` before writing the forward; the tensor
-inventory alone doesn't disambiguate per-stage context injection.
+**Backbone RESOLVED** (DeepSpec `dspark/qwen3/modeling.py` `_forward_backbone`,
+verbatim): `hidden = noise_embed`; `context = main_norm(main_proj(concat taps))`
+computed ONCE; `for stage in [mtp.0, mtp.1, mtp.2]: hidden = stage(hidden,
+context)` — **context injected as k/v at EVERY stage** (`k = cat[k_proj(context),
+k_proj(hidden)]`, `v` likewise, `q = q_proj(hidden)`); exit `norm(hc_head(hidden))`
+(DSv4 adds hc_head vs qwen3's bare norm); `logits = hidden @ embed.weight^T`
+(tied, no lm_head). Draft attention is SMALL (q_len=block_size=5, kv_len =
+context_len + draft_kv) — a dense dual-stream MLA, NOT the paged FlashMLA path.
+Architecture is now 100% unambiguous → T4 unblocked.
 
 Safety patch of the first (wrong-arch) impl:
 `scratchpad/dsv4_dspark_p1min_wrongarch.patch` — reference only; do not re-apply.
