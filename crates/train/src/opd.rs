@@ -22,7 +22,8 @@
 
 use autograd::{
     AutogradError, BackwardOp, BackwardProfile, Device, Tape, TensorId, TensorStore,
-    optim::Optimizer, tensor::Dirty,
+    optim::{AdamW, Optimizer},
+    tensor::Dirty,
 };
 use infer_plan::{SamplingParams, sample_token};
 use std::{
@@ -56,7 +57,7 @@ use crate::{infer_student::InferStudent, lora::LoraConfig};
 use autograd::ops::{
     add, embedding,
     fused_linear_distill::{fused_linear_ce_loss_indexed, fused_linear_pg_loss_indexed},
-    gather_last_dim, log_softmax, matmul_bt, mul_scalar, reshape, slice,
+    gather_last_dim, log_softmax, matmul_bt, mean, mul, mul_scalar, reshape, slice,
 };
 
 /// Routes the OPD rollout through the in-process infer engine (`InferStudent`)
@@ -2999,7 +3000,10 @@ pub enum WritebackLoss<'a> {
     Dis {
         /// π_rollout per masked target position, same order as the fused ops.
         rollout_logprobs: &'a [f32],
-        advantage: f32,
+        /// Per-token advantage, same order/len as `rollout_logprobs`. SaoDis
+        /// passes a constant vec (batch-centered scalar); SaoValue passes
+        /// Skip-Obs GAE advantages.
+        advantage: &'a [f32],
         eps_low: f32,
         eps_high: f32,
     },
@@ -3158,10 +3162,11 @@ pub fn masked_writeback_step<O: Optimizer>(
             eps_low,
             eps_high,
         } => {
-            if rollout_logprobs.len() != total_targets {
+            if rollout_logprobs.len() != total_targets || advantage.len() != total_targets {
                 return Err(OpdError::InvalidInput(format!(
-                    "masked writeback DIS rollout_logprobs len {} != masked targets {total_targets}",
+                    "masked writeback DIS rollout_logprobs/advantage len {}/{} != masked targets {total_targets}",
                     rollout_logprobs.len(),
+                    advantage.len(),
                 )));
             }
             // Token-mean the PG objective (÷ masked-token count), mirroring CE's
@@ -3169,14 +3174,15 @@ pub fn masked_writeback_step<O: Optimizer>(
             // DIS grad-norm ~490× CE's, over-large steps at the shared LR (the
             // round-8 regression). The fused op scales loss+grad by this weight,
             // so dividing here is exact. Self-check calls the op directly, unaffected.
-            let advantage_per_token = advantage / total_targets as f32;
+            let advantage_per_token: Vec<f32> =
+                advantage.iter().map(|a| a / total_targets as f32).collect();
             fused_linear_pg_loss_indexed(
                 hidden,
                 student.lm_head_weight_id(),
                 &position_indices,
                 &target_tokens,
                 rollout_logprobs,
-                advantage_per_token,
+                &advantage_per_token,
                 eps_low,
                 eps_high,
                 chunk_rows,
@@ -3321,6 +3327,203 @@ pub fn capture_rollout_logprobs(
     }
     store.retain_ids(&keep_ids);
     Ok(logprobs)
+}
+
+/// Skip-Observation Generalized Advantage Estimation (SAO Phase 2). `values`
+/// holds V(s_t) at the masked (LLM-generated) positions ONLY, in trajectory
+/// order — so the recursion's "next value" is the next LLM token's, and
+/// environment/tool observation tokens are skipped for free. `terminal_reward`
+/// lands on the final generated token (agentic reward is trajectory-terminal).
+/// Returns `(advantages, returns)`, `returns = advantages + values` (the MSE
+/// target for the critic). γ=discount, λ=GAE trace.
+pub fn skip_obs_gae(
+    values: &[f32],
+    terminal_reward: f32,
+    gamma: f32,
+    lam: f32,
+) -> (Vec<f32>, Vec<f32>) {
+    let n = values.len();
+    let mut advantages = vec![0.0f32; n];
+    let mut gae = 0.0f32;
+    for t in (0..n).rev() {
+        let reward = if t == n - 1 { terminal_reward } else { 0.0 };
+        let next_value = if t == n - 1 { 0.0 } else { values[t + 1] };
+        let delta = reward + gamma * next_value - values[t];
+        gae = delta + gamma * lam * gae;
+        advantages[t] = gae;
+    }
+    let returns = advantages.iter().zip(values).map(|(a, v)| a + v).collect();
+    (advantages, returns)
+}
+
+/// SAO Phase 2 value critic: a single linear head `V(s) = hidden · wᵀ` on the
+/// (frozen) student trunk, its own AdamW + LR. **Frozen-Attention**: both the
+/// GAE value read and the MSE update project a DETACHED copy of the masked
+/// hidden rows (host round-trip), so gradient reaches `weight` only — never the
+/// base. Zero-init → V₀(s)=0 → round-0 GAE = discounted reward-to-go (MC), a
+/// stable cold start (no separate value-pretraining phase).
+///
+/// ponytail: one 27B forward per trajectory (`masked_hidden`) feeds BOTH the GAE
+/// values and the MSE update; K=1 update/policy-step. Upgrade to K=2 / a fused
+/// value-in-writeback forward only if the critic's fit lags or the writeback
+/// wall dominates rollout — neither observed yet.
+pub struct ValueCritic {
+    weight: TensorId,
+    params: [TensorId; 1],
+    opt: AdamW,
+    gamma: f32,
+    lam: f32,
+}
+
+impl ValueCritic {
+    pub fn new(
+        hidden_dim: usize,
+        lr: f32,
+        gamma: f32,
+        lam: f32,
+        store: &mut TensorStore,
+    ) -> Result<Self> {
+        let weight = store
+            .from_slice(&vec![0.0f32; hidden_dim], &[1, hidden_dim])
+            .map_err(OpdError::from)?;
+        store
+            .get_mut(weight)
+            .ok_or(AutogradError::InvalidTensorId(weight))?
+            .requires_grad = true;
+        Ok(Self {
+            weight,
+            params: [weight],
+            opt: AdamW::new(lr, (0.9, 0.999), 1.0e-8, 0.0),
+            gamma,
+            lam,
+        })
+    }
+
+    /// The masked (LLM-generated) hidden rows as a DETACHED host copy, in
+    /// `build_masked_loss_targets` order. One checkpointed forward (tape-on but
+    /// never backwarded, like `capture_rollout_logprobs`); returns
+    /// `(rows_flat[n*hidden], n)`, empty when the trajectory has no LLM tokens.
+    fn masked_hidden(
+        &self,
+        student: &Qwen35Model,
+        prompt_ids: &[u32],
+        response_ids: &[u32],
+        response_mask: &[u8],
+        store: &mut TensorStore,
+    ) -> Result<(Vec<f32>, usize)> {
+        let prompt_len = prompt_ids.len();
+        let full: Vec<u32> = prompt_ids
+            .iter()
+            .copied()
+            .chain(response_ids.iter().copied())
+            .collect();
+        let seq_len = full.len();
+        let loss_targets = build_masked_loss_targets(&full, prompt_len, response_mask);
+        if loss_targets.is_empty() {
+            return Ok((Vec::new(), 0));
+        }
+        let positions: Vec<u32> = (0..seq_len as u32).collect();
+        let keep_ids: HashSet<TensorId> = store.live_ids().into_iter().collect();
+        let mut tape = Tape::new();
+        tape.set_enabled(true);
+        let hidden = student
+            .forward_hidden_states(store, &mut tape, &full, &positions)
+            .map_err(|err| map_qwen35_forward_error("value-critic student hidden", err))?;
+        let hidden_dim = *store
+            .get(hidden)
+            .ok_or(AutogradError::InvalidTensorId(hidden))?
+            .shape
+            .last()
+            .ok_or_else(|| OpdError::InvalidInput("value-critic: empty hidden shape".to_owned()))?;
+        let hidden_2d =
+            reshape(hidden, &[seq_len, hidden_dim], store, &mut tape).map_err(OpdError::from)?;
+        let rows: Vec<usize> = loss_targets.iter().map(|&(p, _)| p).collect();
+        let n = rows.len();
+        let rows_hidden_3d =
+            embedding(hidden_2d, &rows, store, &mut tape).map_err(OpdError::from)?;
+        let rows_hidden =
+            reshape(rows_hidden_3d, &[n, hidden_dim], store, &mut tape).map_err(OpdError::from)?;
+        let rows_flat = store.to_host(rows_hidden).map_err(OpdError::from)?;
+        store.retain_ids(&keep_ids);
+        Ok((rows_flat, n))
+    }
+
+    /// Skip-Obs GAE advantages + MSE-target returns for one trajectory, from the
+    /// current (detached) critic values. `advantages`/`returns` are empty when
+    /// the trajectory has no LLM tokens (caller skips it).
+    pub fn advantages(
+        &self,
+        student: &Qwen35Model,
+        prompt_ids: &[u32],
+        response_ids: &[u32],
+        response_mask: &[u8],
+        terminal_reward: f32,
+        store: &mut TensorStore,
+    ) -> Result<(Vec<f32>, Vec<f32>)> {
+        let (rows_flat, n) =
+            self.masked_hidden(student, prompt_ids, response_ids, response_mask, store)?;
+        if n == 0 {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let hidden_dim = rows_flat.len() / n;
+        let w = store.to_host(self.weight).map_err(OpdError::from)?;
+        let values: Vec<f32> = (0..n)
+            .map(|i| {
+                rows_flat[i * hidden_dim..(i + 1) * hidden_dim]
+                    .iter()
+                    .zip(&w)
+                    .map(|(h, wj)| h * wj)
+                    .sum()
+            })
+            .collect();
+        Ok(skip_obs_gae(&values, terminal_reward, self.gamma, self.lam))
+    }
+
+    /// One MSE(V(s), returns) update. Frozen-attention: the masked hidden rows
+    /// are a detached constant, so backward accumulates grad on `weight` only.
+    /// Returns the MSE loss (0.0 when nothing to fit).
+    pub fn update(
+        &mut self,
+        student: &Qwen35Model,
+        prompt_ids: &[u32],
+        response_ids: &[u32],
+        response_mask: &[u8],
+        returns: &[f32],
+        store: &mut TensorStore,
+    ) -> Result<f32> {
+        let (rows_flat, n) =
+            self.masked_hidden(student, prompt_ids, response_ids, response_mask, store)?;
+        if n == 0 {
+            return Ok(0.0);
+        }
+        if returns.len() != n {
+            return Err(OpdError::InvalidInput(format!(
+                "value-critic returns len {} != masked targets {n}",
+                returns.len()
+            )));
+        }
+        let hidden_dim = rows_flat.len() / n;
+        let mut tape = Tape::new();
+        tape.set_enabled(true);
+        // Detached hidden rows (rg=false) → grad flows to `weight` only.
+        let rows = store
+            .from_slice(&rows_flat, &[n, hidden_dim])
+            .map_err(OpdError::from)?;
+        let value = matmul_bt(rows, self.weight, store, &mut tape).map_err(OpdError::from)?; // [n,1]
+        let value_1d = reshape(value, &[n], store, &mut tape).map_err(OpdError::from)?;
+        let neg_returns: Vec<f32> = returns.iter().map(|r| -r).collect();
+        let neg_returns_id = store
+            .from_slice(&neg_returns, &[n])
+            .map_err(OpdError::from)?;
+        let diff = add(value_1d, neg_returns_id, store, &mut tape).map_err(OpdError::from)?;
+        let sq = mul(diff, diff, store, &mut tape).map_err(OpdError::from)?;
+        let mse = mean(sq, store, &mut tape).map_err(OpdError::from)?;
+        let mse_value = store.to_host(mse).map_err(OpdError::from)?[0];
+        tape.backward(mse, store).map_err(OpdError::from)?;
+        self.opt.step(&self.params, store);
+        self.opt.zero_grad(&self.params, store);
+        Ok(mse_value)
+    }
 }
 
 /// Frozen-prompt-KV variant of `masked_writeback_ce_step`: forwards + backwards
@@ -4432,11 +4635,32 @@ mod tests {
         GkdLossConfig, GkdSftAnchor, KlLogitRange, OpdError, OpdKlMask, OpdStepConfig,
         build_masked_loss_targets, greedy_next_token, kl_distill_loss_for_config, kl_logit_range,
         map_qwen35_forward_error, mix_gkd_losses, next_token_sft_loss_from_logits,
-        sequence_windows, shifted_rollout_sft_loss, validate_gkd_lambda, validate_gkd_loss_config,
-        validate_logits_shape, validate_loss_value, validate_rollout_shape, validate_step_config,
-        validate_student_param_ownership, validate_student_params, validate_teacher_params,
+        sequence_windows, shifted_rollout_sft_loss, skip_obs_gae, validate_gkd_lambda,
+        validate_gkd_loss_config, validate_logits_shape, validate_loss_value,
+        validate_rollout_shape, validate_step_config, validate_student_param_ownership,
+        validate_student_params, validate_teacher_params,
     };
     use crate::qwen35::Qwen35Error;
+
+    #[test]
+    fn skip_obs_gae_cold_start_is_reward_to_go() {
+        // V≈0 (zero-init critic) with γ=λ=1 and terminal reward 1 → every
+        // masked position's advantage/return is the reward-to-go = 1.0.
+        let (adv, ret) = skip_obs_gae(&[0.0; 4], 1.0, 1.0, 1.0);
+        assert_eq!(adv, vec![1.0; 4]);
+        assert_eq!(ret, vec![1.0; 4]);
+        // A perfectly-fit critic (V = its own returns) yields advantage 0 → the
+        // baseline cancels the reward, no policy push. Here V predicts the MC
+        // return exactly, so δ telescopes to 0 at every step.
+        let (adv0, _) = skip_obs_gae(&[1.0, 1.0, 1.0, 1.0], 1.0, 1.0, 1.0);
+        assert!(
+            adv0.iter().all(|a| a.abs() < 1e-6),
+            "fit critic → adv≈0, got {adv0:?}"
+        );
+        // Discount γ=0.5, reward 1 at the last of 3 → adv = [0.25, 0.5, 1.0].
+        let (adv1, _) = skip_obs_gae(&[0.0; 3], 1.0, 0.5, 1.0);
+        assert_eq!(adv1, vec![0.25, 0.5, 1.0]);
+    }
 
     #[test]
     fn greedy_next_token_rejects_logits_len_mismatch() {

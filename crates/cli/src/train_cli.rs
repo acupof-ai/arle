@@ -2573,6 +2573,23 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
     );
 
     let mut optimizer = AdamW::new(args.lr, (0.9, 0.999), 1.0e-8, 0.0);
+    // SAO Phase 2 critic: its weight is created AFTER the `trainable` filter and
+    // is not a student param, so the policy optimizer / LoRA sync / adapter save
+    // never touch it — a fully isolated critic with its own AdamW.
+    let mut value_critic = if args.update_strategy.needs_value_critic() {
+        Some(
+            train::opd::ValueCritic::new(
+                student.config().hidden_size,
+                args.value_lr,
+                args.sao_gamma,
+                args.sao_lambda,
+                &mut store,
+            )
+            .map_err(anyhow::Error::from)?,
+        )
+    } else {
+        None
+    };
 
     // Diagnostic: skip the (slow, stochastic) agent rollout and drive ONE masked-CE
     // writeback on a synthetic trajectory of length N, so the writeback's OOM
@@ -2692,6 +2709,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
             let trainable_ref = trainable.as_slice();
             let store_ref = &mut store;
             let opt_ref = &mut optimizer;
+            let critic_slot = &mut value_critic;
             let writeback_window = args.writeback_window;
             let needs = update_strategy.needs();
             train::agent_opd::run_agentic_opd_round(
@@ -2749,6 +2767,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
                             all_ref,
                             trainable_ref,
                             opt_ref,
+                            critic_slot.as_mut(),
                             vocab,
                             writeback_window,
                             store_ref,
