@@ -48,33 +48,6 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub fn paged_kv_append_cuda(
-        k_batch: *const Half,
-        v_batch: *const Half,
-        k_data: *mut Half,
-        v_data: *mut Half,
-        page_indices: *const i32,
-        indptr: *const i32,
-        positions: *const i32,
-        batch_size: i32,
-        num_kv_heads: i32,
-        page_size: i32,
-        head_dim: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
-    pub fn scatter_write_kv_cuda(
-        k_batch: *const Half,
-        v_batch: *const Half,
-        k_pool: *mut Half,
-        v_pool: *mut Half,
-        token_indices: *const i32,
-        seq_len: i32,
-        num_kv_heads: i32,
-        head_dim: i32,
-        stream: CUstream,
-    ) -> CUresult;
-
     pub fn quantize_kv_bf16_to_int8_cuda(
         kv_bf16: *const Half,
         kv_int8: *mut i8,
