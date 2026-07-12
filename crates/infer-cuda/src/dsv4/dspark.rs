@@ -425,6 +425,170 @@ impl Dsv4Model {
         Ok(ffn_stream)
     }
 
+    /// The 3-stage DSpark backbone (`mtp.0 → mtp.1 → mtp.2`). Builds the noise
+    /// block's HC stream + the fused `context` ONCE, chains every stage's
+    /// dual-stream forward ([`Dsv4Model::dspark_stage_forward`]), then advances
+    /// the shared `df.ctx_end` ONE time and folds the exit head. Returns
+    /// `block_hidden` `[hidden, block]` (base-embed logits are the next tranche).
+    ///
+    /// `attn_states` is one caller-provisioned [`Dsv4LayerAttentionState`] per
+    /// stage (no per-block alloc — spec steps are serial). `taps` are the 3 wide
+    /// HC-stream taps from `Dsv4SlotState::dspark_taps()` (trunk layers
+    /// `[40,41,42]`); `anchor` is the last accepted token (noise block position 0).
+    #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn dspark_forward_block(
+        &self,
+        draft: &Dsv4DsparkDraft,
+        df: &mut Dsv4DsparkSlotState,
+        scratch: &mut Dsv4DsparkScratch,
+        attn_states: &mut [crate::attention::Dsv4LayerAttentionState],
+        taps: &[DeviceVec],
+        anchor: u32,
+    ) -> Result<HiddenStates> {
+        let ctx = &self.ctx;
+        let config = &self.config;
+        let eps = config.rms_norm_eps;
+        let hidden = config.hidden_size;
+        let hc_mult = config.hc_mult;
+        let stream_dim = hidden * hc_mult;
+        let block = config.dspark_block_size;
+        let num_stages = config.dspark_num_stages();
+        ensure!(block > 0, "DSpark backbone called on a non-DSpark config");
+        ensure!(
+            draft.stages.len() == num_stages && attn_states.len() == num_stages,
+            "DSpark backbone stages {} / attn_states {} != num_stages {num_stages}",
+            draft.stages.len(),
+            attn_states.len()
+        );
+
+        // ── Noise embedding: pos0 = anchor, pos1.. = mask token; embed via the
+        // base table (draft has no own embed), then HC-expand hidden → stream.
+        let mut ids = vec![config.dspark_noise_token_id as i32; block];
+        ids[0] = anchor as i32;
+        let ids_dev = crate::ops::upload_i32(ctx, &ids)?;
+        // SAFETY: embedding_batch writes the full [hidden, block] buffer.
+        let mut emb = unsafe { HiddenStates::uninit(ctx, hidden, block)? };
+        crate::ops::embedding_batch(ctx, &self.embed_tokens, &ids_dev, &mut emb)?;
+        // SAFETY: initial_stream_from_embeddings writes the full stream buffer.
+        let mut hidden_stream = unsafe { HiddenStates::uninit(ctx, stream_dim, block)? };
+        crate::hc::initial_stream_from_embeddings(ctx, &emb, hidden, hc_mult, &mut hidden_stream)?;
+
+        // ── Context fuse (main_proj @ stage 0, fp8-block). POD-VERIFY layout:
+        // each of the `n_taps` taps is the WIDE HC stream `[hc_mult, hidden]` for
+        // ONE trunk position (hc_mult consecutive hidden rows, row r at
+        // `r*hidden`, matching the token-major stream layout). main_proj is
+        // `[hidden, n_taps*hidden]` — its input is `n_taps*hidden` PER hc_mult
+        // row, NOT `n_taps*stream_dim`. So for each hc_mult row we concat the
+        // three taps' hidden-slices → `n_taps*hidden`, giving a `[n_taps*hidden,
+        // hc_mult]` input; main_proj → `[hidden, hc_mult]`; main_norm → context.
+        let stage0 = &draft.stages[0];
+        let main_proj = stage0
+            .main_proj
+            .as_ref()
+            .ok_or_else(|| anyhow!("DSpark stage 0 missing main_proj"))?;
+        let main_norm = stage0
+            .main_norm
+            .as_ref()
+            .ok_or_else(|| anyhow!("DSpark stage 0 missing main_norm"))?;
+        let n_taps = taps.len();
+        // POD-VERIFY preconditions — the tap stride/interleave and main_proj
+        // input width are not locally verifiable (attention kernel is stubbed).
+        ensure!(
+            main_proj.cols == n_taps * hidden,
+            "DSpark main_proj cols {} != n_taps {n_taps} * hidden {hidden}",
+            main_proj.cols
+        );
+        ensure!(
+            main_proj.rows == hidden,
+            "DSpark main_proj rows {} != hidden {hidden}",
+            main_proj.rows
+        );
+        for (t, tap) in taps.iter().enumerate() {
+            ensure!(
+                tap.len == hidden * hc_mult,
+                "DSpark tap {t} len {} != hidden {hidden} * hc_mult {hc_mult}",
+                tap.len
+            );
+        }
+        // SAFETY: uninit device scratch; every [row r, tap t] slice written below.
+        let mut fuse_in = unsafe { HiddenStates::uninit(ctx, n_taps * hidden, hc_mult)? };
+        for r in 0..hc_mult {
+            for (t, tap) in taps.iter().enumerate() {
+                let src = tap.data.slice(r * hidden..(r + 1) * hidden);
+                let base = r * n_taps * hidden + t * hidden;
+                let mut dst = fuse_in.data.slice_mut(base..base + hidden);
+                ctx.stream
+                    .memcpy_dtod(&src, &mut dst)
+                    .map_err(|e| anyhow!("DSpark tap concat D2D failed: {e}"))?;
+            }
+        }
+        // SAFETY: dsv4_linear writes the full [hidden, hc_mult] buffer.
+        let mut context_raw = unsafe { HiddenStates::uninit(ctx, hidden, hc_mult)? };
+        crate::attention::dsv4_linear(ctx, main_proj, &fuse_in, &mut context_raw)?;
+        let context = crate::attention::mla_rms_norm(ctx, &context_raw, main_norm, eps)?;
+
+        // block_tokens: the noise ids (anchor + mask). MoE routing is LearnedBias
+        // for the draft, so the hash ids are unused — but the stage forward's
+        // shape gate requires `block_tokens.len() == block`.
+        let block_tokens: Vec<u32> = ids.iter().map(|&i| i as u32).collect();
+
+        // ── Chain the 3 stages. `df.ctx_end` is the SHARED cursor; every stage
+        // appends `context` to its OWN `latent_kv` at the same `ctx_start` and
+        // must NOT advance it (T4.1 contract). The one advance happens AFTER all
+        // stages succeed — on any stage `?`, ctx_end stays put.
+        let ctx_start = df.ctx_end;
+        let block_start = ctx_start + context.seq_len;
+        for (stage_idx, attn_state) in attn_states.iter_mut().enumerate() {
+            hidden_stream = self.dspark_stage_forward(
+                draft,
+                stage_idx,
+                df,
+                scratch,
+                attn_state,
+                &hidden_stream,
+                &context,
+                &block_tokens,
+            )?;
+        }
+        df.ctx_end = block_start;
+
+        // ── Exit: block_hidden = mtp.{n-1}.norm(mtp.{n-1}.hc_head(stream)). DSv4
+        // folds the wide stream through the stage's head HC (vs qwen3's bare
+        // norm), then RMSNorm — mirrors `head_normed_rows`, stage-scoped.
+        let exit = &draft.stages[num_stages - 1];
+        let hc_head = exit
+            .hc_head
+            .as_ref()
+            .ok_or_else(|| anyhow!("DSpark exit stage missing hc_head"))?;
+        let norm = exit
+            .norm
+            .as_ref()
+            .ok_or_else(|| anyhow!("DSpark exit stage missing norm"))?;
+        // SAFETY: uninit device scratch; every row written before first read.
+        let mut block_hidden = unsafe { HiddenStates::uninit(ctx, hidden, block)? };
+        let mut row_hidden = DeviceVec::zeros(ctx, hidden)?;
+        let mut row_normed = DeviceVec::zeros(ctx, hidden)?;
+        for row in 0..block {
+            crate::hc::head_hidden_from_stream(
+                ctx,
+                config,
+                hc_head,
+                &hidden_stream,
+                row,
+                &mut row_hidden,
+            )?;
+            crate::ops::rms_norm_vec(ctx, &row_hidden, norm, eps, &mut row_normed)?;
+            let mut dst = block_hidden
+                .data
+                .slice_mut(row * hidden..(row + 1) * hidden);
+            ctx.stream
+                .memcpy_dtod(&row_normed.data, &mut dst)
+                .map_err(|e| anyhow!("DSpark exit head row copy failed: {e}"))?;
+        }
+        Ok(block_hidden)
+    }
+
     /// Compute the compressed latent for `feats` (already hidden-wide fused
     /// features) via `wkv → kv_norm → partial-RoPE` and write it into
     /// `latent_kv[start..start+rows]` at absolute positions `start..`. Context
