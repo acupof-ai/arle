@@ -219,6 +219,8 @@ pub(crate) enum UpdateStrategyArg {
     RejectionCe,
     /// SAO Phase 1: DIS (clipped per-token PG) with a batch-centered advantage.
     SaoDis,
+    /// SAO Phase 2: DIS with per-token Skip-Obs GAE from a learned value critic.
+    SaoValue,
 }
 
 impl UpdateStrategyArg {
@@ -233,7 +235,14 @@ impl UpdateStrategyArg {
         match self {
             Self::RejectionCe => UpdateStrategy::RejectionCe,
             Self::SaoDis => UpdateStrategy::SaoDis { eps_low, eps_high },
+            Self::SaoValue => UpdateStrategy::SaoValue { eps_low, eps_high },
         }
+    }
+
+    /// True for the value-critic strategy — the driver must build a `ValueCritic`.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    pub(crate) fn needs_value_critic(self) -> bool {
+        matches!(self, Self::SaoValue)
     }
 }
 
@@ -1966,6 +1975,18 @@ pub(crate) struct TrainAgentOpdArgs {
     /// `1 + eps_high`). Only used by `--update-strategy sao-dis`.
     #[arg(long, default_value_t = 3.0)]
     pub(crate) sao_eps_high: f32,
+
+    /// SAO Phase 2 GAE discount γ. Only used by `--update-strategy sao-value`.
+    #[arg(long, default_value_t = 1.0)]
+    pub(crate) sao_gamma: f32,
+
+    /// SAO Phase 2 GAE trace λ. Only used by `--update-strategy sao-value`.
+    #[arg(long, default_value_t = 0.95)]
+    pub(crate) sao_lambda: f32,
+
+    /// SAO Phase 2 value-critic learning rate. Only used by `sao-value`.
+    #[arg(long, default_value_t = 1.0e-3)]
+    pub(crate) value_lr: f32,
 
     /// KV slots for the rollout engine (>1 batches sampling/eval; VRAM-gated).
     #[arg(long, default_value_t = 2)]

@@ -709,7 +709,7 @@ pub fn fused_linear_pg_loss_indexed(
     position_indices: &[i32],
     target_tokens: &[i32],
     rollout_logprobs: &[f32],
-    advantage: f32,
+    advantage: &[f32],
     eps_low: f32,
     eps_high: f32,
     chunk_rows: usize,
@@ -728,7 +728,14 @@ pub fn fused_linear_pg_loss_indexed(
             got: rollout_logprobs.len(),
         });
     }
-    if !(advantage.is_finite() && eps_low.is_finite() && eps_high.is_finite()) {
+    // Per-token advantage (Skip-Obs GAE, SAO Phase 2); SaoDis passes a constant.
+    if advantage.len() != position_indices.len() {
+        return Err(AutogradError::InvalidIndicesLen {
+            expected: position_indices.len(),
+            got: advantage.len(),
+        });
+    }
+    if !(advantage.iter().all(|a| a.is_finite()) && eps_low.is_finite() && eps_high.is_finite()) {
         return Err(AutogradError::TapeInvariant(
             "fused_linear_pg_loss_indexed: advantage/eps_low/eps_high must be finite",
         ));
@@ -787,14 +794,14 @@ pub fn fused_linear_pg_loss_indexed(
 
             let log_probs = log_softmax_row(&logits);
             let logp = log_probs[target];
-            // Detached DIS weight: ratio/gate/advantage are scalars, no grad path.
+            // Detached DIS weight: ratio/gate/advantage are constants, no grad path.
             let r = (logp - rollout_logprobs[local]).exp();
             let gate = if (1.0 - eps_low) < r && r < (1.0 + eps_high) {
                 1.0
             } else {
                 0.0
             };
-            let w = advantage * gate;
+            let w = advantage[local] * gate;
             loss_sum -= w * logp;
 
             // d_logits = w · (softmax − onehot), the CE gradient scaled by w.
@@ -862,7 +869,7 @@ fn fused_linear_pg_loss_indexed_device(
     position_indices: &[i32],
     target_tokens: &[i32],
     rollout_logprobs: &[f32],
-    advantage: f32,
+    advantage: &[f32],
     eps_low: f32,
     eps_high: f32,
     chunk_rows: usize,
@@ -931,7 +938,7 @@ fn fused_linear_pg_loss_indexed_device(
                 } else {
                     0.0
                 };
-                -(advantage * gate)
+                -(advantage[chunk_start + offset] * gate)
             })
             .collect();
         // DIS off-policy diagnostics (env-gated → zero prod cost). KL(πθ‖π_rollout)
@@ -947,8 +954,12 @@ fn fused_linear_pg_loss_indexed_device(
                 }
             }
             let n = gathered_logp.len().max(1);
+            let adv_mean = advantage[chunk_start..chunk_start + gathered_logp.len()]
+                .iter()
+                .sum::<f32>()
+                / n as f32;
             eprintln!(
-                "[dis-stats] adv={advantage:.4} kl={:.4e} clip_frac={:.3} tokens={n}",
+                "[dis-stats] adv={adv_mean:.4} kl={:.4e} clip_frac={:.3} tokens={n}",
                 kl / n as f64,
                 clipped as f64 / n as f64,
             );
@@ -1573,7 +1584,7 @@ mod tests {
         positions: &[i32],
         targets: &[i32],
         rollout_logprobs: &[f32],
-        advantage: f32,
+        advantage: &[f32],
         eps_low: f32,
         eps_high: f32,
         chunk_rows: usize,
@@ -1655,7 +1666,7 @@ mod tests {
             &positions,
             &targets,
             &rollout,
-            1.0 / n as f32,
+            &vec![1.0 / n as f32; n],
             0.2,
             0.2,
             3,
