@@ -1,0 +1,21 @@
+crates/infer-cuda/src/dsv4/dspark.rs
+  s_164602d2d1fc2d::t_eb1fee2ffb4e3d 664-891
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "297498a744113a3b830e80b78ee96a893d9e6616",
+  "prompts": {},
+  "sessions": {
+    "s_164602d2d1fc2d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a46d914433fbb92c4",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
