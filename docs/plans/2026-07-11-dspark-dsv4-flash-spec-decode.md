@@ -175,6 +175,24 @@ steps still pay the eager tax with no spec gain — P3 must re-enable the graph 
 when not speculating. **T4 must rebase on HEAD** — a concurrent session is churning
 `cuda-kernels/csrc` (`9fc53e7e4`/`a07a48d90`).
 
+**T4 attention design RESOLVED** (MLA internals map, 2026-07-12): the DSpark-DSv4
+draft attn is **full MLA geometry** (`wq_b [32768,1024]`=64h×512, `wkv [512,4096]`
+single compressed latent, `wo_a/b` O-LoRA) — K==V==latent, NOT the small symmetric
+MHA the Qwen3.6 DSpark track uses. So the dual-stream is `latent =
+cat[wkv(context), wkv(noise)]` and MLA attention runs over that small explicit
+latent. Consequences: ① every existing MLA backend (FlashMLA decode/prefill,
+scalar `dsv4_swa`/`dsv4_hybrid`) is **pool/ring-bound** — none takes explicit
+cat K/V; ② Qwen's `nonpaged_prefill_attention` (the shipped Qwen3.6 DSpark draft
+kernel) is **256-cap + symmetric** — can't hold MLA's 512 asymmetric latent →
+**one new small dense MLA-latent attention kernel is the only new CUDA** (draft KV
+is tiny: `context_len + block_size` rows, no paging/compression). **Structure
+mirrors the shipped `qwen35/dspark.rs`** (draft `SlotState` w/ small `k_ctx`/
+`v_ctx` per stage, `DsparkScratch`, block-draft over explicit KV, per-row RoPE via
+`dsv4_prepare_qk_fused_batch_start_pos`), swapping only that kernel; wq_a/wkv via
+`dsv4_linear`, wo via `mla_oproj`, MoE+HC via the `mtp_forward_level` pattern all
+reuse. T4 = "adapt the working Qwen dspark to MLA latent geometry", not design from
+scratch. Kernel is pod-gated (no nvcc on Mac).
+
 **Backbone RESOLVED** (DeepSpec `dspark/qwen3/modeling.py` `_forward_backbone`,
 verbatim): `hidden = noise_embed`; `context = main_norm(main_proj(concat taps))`
 computed ONCE; `for stage in [mtp.0, mtp.1, mtp.2]: hidden = stage(hidden,
