@@ -3164,13 +3164,19 @@ pub fn masked_writeback_step<O: Optimizer>(
                     rollout_logprobs.len(),
                 )));
             }
+            // Token-mean the PG objective (÷ masked-token count), mirroring CE's
+            // 1/N. Without it the summed −w·logp scales with trajectory length →
+            // DIS grad-norm ~490× CE's, over-large steps at the shared LR (the
+            // round-8 regression). The fused op scales loss+grad by this weight,
+            // so dividing here is exact. Self-check calls the op directly, unaffected.
+            let advantage_per_token = advantage / total_targets as f32;
             fused_linear_pg_loss_indexed(
                 hidden,
                 student.lm_head_weight_id(),
                 &position_indices,
                 &target_tokens,
                 rollout_logprobs,
-                advantage,
+                advantage_per_token,
                 eps_low,
                 eps_high,
                 chunk_rows,
