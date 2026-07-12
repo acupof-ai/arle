@@ -454,6 +454,10 @@ impl Dsv4Model {
         let stream_dim = hidden * hc_mult;
         let block = config.dspark_block_size;
         let num_stages = config.dspark_num_stages();
+        ensure!(
+            num_stages > 0,
+            "DSpark backbone requires >= 1 stage (dspark_num_stages == 0)"
+        );
         ensure!(block > 0, "DSpark backbone called on a non-DSpark config");
         ensure!(
             draft.stages.len() == num_stages && attn_states.len() == num_stages,
@@ -551,7 +555,6 @@ impl Dsv4Model {
                 &block_tokens,
             )?;
         }
-        df.ctx_end = block_start;
 
         // ── Exit: block_hidden = mtp.{n-1}.norm(mtp.{n-1}.hc_head(stream)). DSv4
         // folds the wide stream through the stage's head HC (vs qwen3's bare
@@ -586,6 +589,10 @@ impl Dsv4Model {
                 .memcpy_dtod(&row_normed.data, &mut dst)
                 .map_err(|e| anyhow!("DSpark exit head row copy failed: {e}"))?;
         }
+        // Advance the shared context cursor ONCE, only after the whole block
+        // (all stages AND the exit head) succeeds — a mid-forward advance commits
+        // persistent state on an error path (codex T4.2 P2).
+        df.ctx_end = block_start;
         Ok(block_hidden)
     }
 
