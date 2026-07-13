@@ -88,10 +88,18 @@ struct PartialProj {
 /// the tensor shapes (`lora_A` rows); `alpha` comes from the caller
 /// (`--lora-alpha`) because the adapter file carries matrices only.
 pub fn load_student_lora_update(path: &Path, alpha: f32) -> Result<StudentLoraUpdate> {
+    // Accept either the `.safetensors` file directly or a PEFT adapter DIR
+    // (`--save-lora-adapters` emits `<dir>/adapter_model.safetensors`), matching
+    // the train-side resume loader so a saved adapter loads back into the serve.
+    let file = if path.is_dir() {
+        path.join("adapter_model.safetensors")
+    } else {
+        path.to_path_buf()
+    };
     let bytes =
-        std::fs::read(path).with_context(|| format!("read LoRA adapters {}", path.display()))?;
+        std::fs::read(&file).with_context(|| format!("read LoRA adapters {}", file.display()))?;
     let tensors = safetensors::SafeTensors::deserialize(&bytes)
-        .with_context(|| format!("parse safetensors {}", path.display()))?;
+        .with_context(|| format!("parse safetensors {}", file.display()))?;
 
     let mut layers: BTreeMap<usize, BTreeMap<StudentLoraProjection, PartialProj>> = BTreeMap::new();
     for (name, view) in tensors.tensors() {
