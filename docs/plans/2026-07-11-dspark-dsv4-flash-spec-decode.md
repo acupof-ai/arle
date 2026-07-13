@@ -16,6 +16,47 @@
 > written from the real source. B (Qwen3.6 DSpark) is proven unaffected — the
 > revert touched only DSv4-gated code, no `qwen35/*` file.
 
+## 2026-07-13 — ROOT CAUSE CONFIRMED (SGLang DFlash reference) + reimplementation spec
+
+TP=4 runs correct (lockstep fixed, `d4c25f1c2`) but draft **accept = 0%**. Two
+disproven cheap fixes (both no-ops on the drafts): output inverse-RoPE
+(`f36675d85`, reverted `88360c888`) and absolute-position-shift alone (pure
+relative RoPE → a constant base shift doesn't change scores). **Dominant bug =
+context STRUCTURE**, confirmed verbatim against the operational SGLang DFlash
+reference (`/sgl-workspace/sglang/.../speculative/dflash_worker.py` + `models/dflash.py`):
+
+- **Reference context = a WINDOW of ALL committed tokens.** Each committed token →
+  concat its `K=len(target_layer_ids)=3` post-layer taps → `fc(K*hidden→hidden)` +
+  `hidden_norm` → ONE KV entry, K-RoPE'd at that token's ABSOLUTE position, appended
+  to a persistent draft KV that accumulates the whole sequence. The block attends
+  ALL of it non-causally.
+- **Our impl attends only the LAST token's `hc_mult` context rows.** On block 1 of
+  "The capital of France is → Paris" the draft never sees "France/capital" → can't
+  predict Paris → garbage. This is why drafts are unrelated to the target.
+- Confirmed NON-bugs: wide-tap capture (`main_proj [hidden, 3*hidden]` folds wide
+  taps per-HC-row exactly like the proven MTP `h_proj`; Explore-verified), tied-head
+  (reuses `self.lm_head`), non-causal kernel (already), output de-RoPE (none in ref).
+
+**Reimplementation (per-committed-token context window):**
+1. **Accumulate context per committed token**, not per-block-from-last-token. Each
+   newly committed token (anchor forward + each verify-accepted token) contributes
+   its 3 taps → `main_proj` → `main_norm` → context entries appended to the
+   persistent per-stage `latent_kv` at that token's slot.
+2. **RoPE at ABSOLUTE token positions** (cache offset stays draft-local — separate
+   the two, per DFlash: draft-cache length is for slot alloc ONLY, never RoPE).
+   Block Q/K at `target_seq_len + [0..block)`; each ctx token's entries at its
+   absolute position.
+3. **HC-mapping choice (the one DSv4-specific unknown, no ref):** each committed
+   token yields `hc_mult` context entries (from `main_proj`'s `[hidden, hc_mult]`);
+   place all `hc_mult` at the token's single absolute position. Validate empirically
+   (accept > 0 confirms; if still 0, try `hc_mult` consecutive positions or fold to 1).
+4. Reuse the MTP tap/stream plumbing (proven on DSv4-HC); only the draft HEAD
+   (3-stage + markov + confidence) differs.
+
+Cost: substantial (slot state + per-token tap accumulation + context append +
+absolute RoPE + executor wiring). Multi-cycle. Geometry 95% specced; the HC-mapping
+is the one empirical unknown.
+
 ## Verdict first
 
 Adopt **DeepSeek's official `deepseek-ai/DeepSeek-V4-Flash-DSpark`** draft module
