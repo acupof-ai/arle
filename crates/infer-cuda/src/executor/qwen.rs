@@ -40,6 +40,10 @@ pub(crate) struct QwenCudaExecutor {
     recall: Vec<crate::recall::CudaRecallState>,
     /// One-time non-BF16-KV-with-recall fallback log latch.
     recall_quant_warned: bool,
+    tier_budget_bytes: usize,
+    weights_epoch: String,
+    disk_root: Option<std::path::PathBuf>,
+    disk_budget: Option<usize>,
 }
 
 /// One slot's executor-side materialization watermark (see
@@ -113,6 +117,7 @@ impl QwenCudaExecutor {
             "CudaExecutor requires at least one KV page"
         );
 
+        let weights_epoch = kv_native_sys::weights_epoch_tag(model_path.as_ref());
         let model = CudaModel::from_safetensors(model_path.as_ref())?;
         let kv_format = kv_dtype.kv_format();
 
@@ -184,10 +189,8 @@ impl QwenCudaExecutor {
         );
 
         let slot_progress = vec![SlotProgress::default(); num_slots];
-        let tier = KvTierStore::with_budget(
-            default_t1_budget_bytes(DEFAULT_DRAM_FRACTION),
-            kv.storage_bytes_per_page(),
-        );
+        let tier_budget_bytes = default_t1_budget_bytes(DEFAULT_DRAM_FRACTION);
+        let tier = KvTierStore::with_budget(tier_budget_bytes, kv.storage_bytes_per_page());
         let recall = (0..num_slots)
             .map(|_| crate::recall::CudaRecallState::default())
             .collect();
@@ -203,6 +206,10 @@ impl QwenCudaExecutor {
             recall_cfg: crate::recall::default_recall_config(),
             recall,
             recall_quant_warned: false,
+            tier_budget_bytes,
+            weights_epoch,
+            disk_root: None,
+            disk_budget: None,
         })
     }
 
@@ -234,6 +241,7 @@ impl QwenCudaExecutor {
     /// existing entries are dropped, so callers configure this right after
     /// construction, before the engine demotes anything.
     pub(crate) fn set_kv_tier_budget_bytes(&mut self, bytes: usize) {
+        self.tier_budget_bytes = bytes;
         self.tier = KvTierStore::with_budget(bytes, self.kv.storage_bytes_per_page());
     }
 
@@ -243,6 +251,37 @@ impl QwenCudaExecutor {
     /// (byte-identical baseline — CUDA is the Stable backend).
     pub(crate) fn set_kv_recall(&mut self, enabled: bool) {
         self.kv_recall = enabled;
+        if !enabled || self.tier.host_demoted_pages() != 0 || self.tier.disk_pages() != 0 {
+            return;
+        }
+        let (Some(root), Some(budget)) = (self.disk_root.clone(), self.disk_budget) else {
+            return;
+        };
+        self.attach_recall_disk(root, budget);
+    }
+
+    fn attach_recall_disk(&mut self, root: std::path::PathBuf, budget_bytes: usize) -> bool {
+        let page_bytes = self.kv.storage_bytes_per_page();
+        let mut tier = KvTierStore::with_budget(self.tier_budget_bytes, page_bytes);
+        if !tier.load(
+            root.clone(),
+            budget_bytes,
+            page_bytes,
+            self.weights_epoch.clone(),
+            self.kv
+                .format
+                .stable_tag()
+                .expect("persisted KV format must have a stable tag"),
+            self.model.tp.config().world_size,
+            self.model.tp.config().rank,
+        ) {
+            log::warn!("durable KV recall disk unavailable; using ephemeral disk spill");
+            if !tier.set_disk(root, budget_bytes, page_bytes) {
+                return false;
+            }
+        }
+        self.tier = tier;
+        true
     }
 
     /// Attach the opt-in disk spill level (`--kv-disk`). Pre-serve only.
@@ -251,8 +290,13 @@ impl QwenCudaExecutor {
         root: std::path::PathBuf,
         budget_bytes: usize,
     ) -> bool {
-        self.tier
-            .set_disk(root, budget_bytes, self.kv.storage_bytes_per_page())
+        self.disk_root = Some(root.clone());
+        self.disk_budget = Some(budget_bytes);
+        let page_bytes = self.kv.storage_bytes_per_page();
+        if self.kv_recall {
+            return self.attach_recall_disk(root, budget_bytes);
+        }
+        self.tier.set_disk(root, budget_bytes, page_bytes)
     }
 
     /// Copy device pages into the host tier store (synchronous: the copy is
