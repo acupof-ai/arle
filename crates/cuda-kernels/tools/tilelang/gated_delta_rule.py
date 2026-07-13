@@ -60,6 +60,8 @@ directory is gone. GPU numerical validation compares this path via the
 existing Qwen3.5 e2e tests and JSON baselines.
 """
 
+import os
+
 import tilelang  # noqa: F401  (imported for side-effect-free version probe)
 import tilelang.language as T
 
@@ -83,6 +85,27 @@ BLOCK_K = 64       # key tile width (= KEY_DIM // 2 partitioning for state)
 BLOCK_V = 32       # value tile width for chunk-state / chunk-o sweeps
 BLOCK_K_TILE = 64  # full-KEY_DIM tile width for chunk-o GEMM
 KEY_BLOCK = QWEN35_GDR_KEY_BLOCK
+
+
+def _sm70_gemm_gate(dtype, accum_dtype):
+    """SM-portable T.gemm operand dtype + a trace-time cast helper.
+
+    bf16 tensor cores need sm_80+. On Volta/Turing (sm<80) Volta MMA
+    (GemmMMASm70) only supports m16n16k4 with FP16 inputs, so feed every
+    T.gemm operand fp16 (accum stays f32); on sm_80+ keep bf16 so the AST is
+    byte-identical to the repo kernel. The cast routes bf16->f32->fp16: a
+    direct bf16->fp16 cast lowers to an ambiguous user-defined conversion that
+    nvcc rejects. When gemm_dtype == dtype the helper is a no-op passthrough.
+    """
+    sm_arch = int(os.environ.get("ARLE_TILELANG_CUDA_ARCH", "90"))
+    gemm_dtype = "float16" if sm_arch < 80 else dtype
+
+    def to_gemm(x):
+        if gemm_dtype == dtype:
+            return x
+        return T.cast(T.cast(x, accum_dtype), gemm_dtype)
+
+    return gemm_dtype, to_gemm
 
 
 def _gdr_chunk_prepare_kernel():
@@ -225,6 +248,7 @@ def _gdr_chunk_scaled_dot_kkt_kernel():
     g_dtype = "float32"
     KEY_DIM = QWEN35_GDR_KEY_DIM
     BT = BLOCK_T
+    gemm_dtype, to_gemm = _sm70_gemm_gate(dtype, accum_dtype)
 
     @T.prim_func
     def kernel(
@@ -239,7 +263,7 @@ def _gdr_chunk_scaled_dot_kkt_kernel():
         with T.Kernel(
             T.ceildiv(seq_len, BT), num_value_heads, threads=NUM_THREADS
         ) as (chunk_idx, v_head):
-            k_tile = T.alloc_shared((BT, KEY_DIM), dtype)
+            k_tile = T.alloc_shared((BT, KEY_DIM), gemm_dtype)
             g_shared = T.alloc_shared((BT,), accum_dtype)
             beta_shared = T.alloc_shared((BT,), accum_dtype)
             acc = T.alloc_fragment((BT, BT), accum_dtype)
@@ -249,8 +273,8 @@ def _gdr_chunk_scaled_dot_kkt_kernel():
             for t, d in T.Parallel(BT, KEY_DIM):
                 k_tile[t, d] = T.if_then_else(
                     base + t < seq_len,
-                    k[base + t, v_head, d],
-                    T.cast(0, dtype),
+                    to_gemm(k[base + t, v_head, d]),
+                    T.cast(0, gemm_dtype),
                 )
 
             T.clear(acc)
@@ -573,6 +597,7 @@ def _gdr_recompute_w_u_kernel():
     KEY_DIM = QWEN35_GDR_KEY_DIM
     VALUE_DIM = QWEN35_GDR_VALUE_DIM
     BT = BLOCK_T
+    gemm_dtype, to_gemm = _sm70_gemm_gate(dtype, accum_dtype)
 
     @T.prim_func
     def kernel(
@@ -589,9 +614,9 @@ def _gdr_recompute_w_u_kernel():
         with T.Kernel(
             T.ceildiv(seq_len, BT), num_value_heads, threads=NUM_THREADS
         ) as (chunk_idx, v_head):
-            ai_tile = T.alloc_shared((BT, BT), dtype)
-            v_tile = T.alloc_shared((BT, VALUE_DIM), dtype)
-            k_tile = T.alloc_shared((BT, KEY_DIM), dtype)
+            ai_tile = T.alloc_shared((BT, BT), gemm_dtype)
+            v_tile = T.alloc_shared((BT, VALUE_DIM), gemm_dtype)
+            k_tile = T.alloc_shared((BT, KEY_DIM), gemm_dtype)
             beta_frag = T.alloc_fragment((BT,), accum_dtype)
             g_frag = T.alloc_fragment((BT,), accum_dtype)
             u_acc = T.alloc_fragment((BT, VALUE_DIM), accum_dtype)
@@ -601,8 +626,8 @@ def _gdr_recompute_w_u_kernel():
             for t, j in T.Parallel(BT, BT):
                 ai_tile[t, j] = T.if_then_else(
                     base + t < seq_len,
-                    a_inv[base + t, v_head, j],
-                    T.cast(0, dtype),
+                    to_gemm(a_inv[base + t, v_head, j]),
+                    T.cast(0, gemm_dtype),
                 )
             for t in T.Parallel(BT):
                 in_range = base + t < seq_len
@@ -619,8 +644,8 @@ def _gdr_recompute_w_u_kernel():
             for t, d in T.Parallel(BT, VALUE_DIM):
                 v_tile[t, d] = T.if_then_else(
                     base + t < seq_len,
-                    T.cast(T.cast(v[base + t, v_head, d], accum_dtype) * beta_frag[t], dtype),
-                    T.cast(0, dtype),
+                    T.cast(T.cast(v[base + t, v_head, d], accum_dtype) * beta_frag[t], gemm_dtype),
+                    T.cast(0, gemm_dtype),
                 )
             T.clear(u_acc)
             T.gemm(ai_tile, v_tile, u_acc, policy=T.GemmWarpPolicy.FullRow)
@@ -636,9 +661,9 @@ def _gdr_recompute_w_u_kernel():
                         T.cast(k[base + t, v_head, d], accum_dtype)
                         * beta_frag[t]
                         * g_frag[t],
-                        dtype,
+                        gemm_dtype,
                     ),
-                    T.cast(0, dtype),
+                    T.cast(0, gemm_dtype),
                 )
             T.clear(w_acc)
             T.gemm(ai_tile, k_tile, w_acc, policy=T.GemmWarpPolicy.FullRow)
@@ -667,6 +692,7 @@ def _gdr_chunk_state_kernel():
     BT = BLOCK_T
     BV = BLOCK_V
     KB = KEY_BLOCK
+    gemm_dtype, to_gemm = _sm70_gemm_gate(dtype, accum_dtype)
 
     @T.prim_func
     def kernel(
@@ -690,13 +716,13 @@ def _gdr_chunk_state_kernel():
         ) as (v_tile, v_head):
             h_lo = T.alloc_fragment((KB, BV), accum_dtype)
             h_hi = T.alloc_fragment((KB, BV), accum_dtype)
-            w_lo = T.alloc_shared((BT, KB), dtype)
-            w_hi = T.alloc_shared((BT, KB), dtype)
-            k_lo = T.alloc_shared((KB, BT), dtype)
-            k_hi = T.alloc_shared((KB, BT), dtype)
+            w_lo = T.alloc_shared((BT, KB), gemm_dtype)
+            w_hi = T.alloc_shared((BT, KB), gemm_dtype)
+            k_lo = T.alloc_shared((KB, BT), gemm_dtype)
+            k_hi = T.alloc_shared((KB, BT), gemm_dtype)
             u_tile = T.alloc_shared((BT, BV), dtype)
             v_new_tile = T.alloc_fragment((BT, BV), accum_dtype)
-            v_new_bf = T.alloc_shared((BT, BV), dtype)
+            v_new_bf = T.alloc_shared((BT, BV), gemm_dtype)
             g_frag = T.alloc_fragment((BT,), accum_dtype)
 
             v_off = v_tile * BV
@@ -718,10 +744,10 @@ def _gdr_chunk_state_kernel():
                 # Load w_lo, w_hi for this chunk.
                 for t, c in T.Parallel(BT, KB):
                     w_lo[t, c] = T.if_then_else(
-                        base + t < seq_len, w[base + t, v_head, c], T.cast(0, dtype)
+                        base + t < seq_len, to_gemm(w[base + t, v_head, c]), T.cast(0, gemm_dtype)
                     )
                     w_hi[t, c] = T.if_then_else(
-                        base + t < seq_len, w[base + t, v_head, KB + c], T.cast(0, dtype)
+                        base + t < seq_len, to_gemm(w[base + t, v_head, KB + c]), T.cast(0, gemm_dtype)
                     )
                 # Load u (BLOCK_V column) and compute v_new = u - w @ h.
                 for t, c in T.Parallel(BT, BV):
@@ -738,11 +764,11 @@ def _gdr_chunk_state_kernel():
 
                 # v_new -= w_lo @ h_lo + w_hi @ h_hi. Materialize h_lo/h_hi
                 # into shared for the GEMM.
-                h_lo_sh = T.alloc_shared((KB, BV), dtype)
-                h_hi_sh = T.alloc_shared((KB, BV), dtype)
+                h_lo_sh = T.alloc_shared((KB, BV), gemm_dtype)
+                h_hi_sh = T.alloc_shared((KB, BV), gemm_dtype)
                 for r, c in T.Parallel(KB, BV):
-                    h_lo_sh[r, c] = T.cast(h_lo[r, c], dtype)
-                    h_hi_sh[r, c] = T.cast(h_hi[r, c], dtype)
+                    h_lo_sh[r, c] = T.cast(h_lo[r, c], gemm_dtype)
+                    h_hi_sh[r, c] = T.cast(h_hi[r, c], gemm_dtype)
                 # NOTE: TileLang's T.gemm can subtract via a manual
                 # negation pass; here we emit two add-GEMMs into a tmp
                 # buffer then subtract in T.Parallel.
@@ -778,15 +804,15 @@ def _gdr_chunk_state_kernel():
                     in_range = base + t < seq_len
                     g_v = T.if_then_else(in_range, T.exp(g_last - g_frag[t]), T.cast(0.0, accum_dtype))
                     v_new_tile[t, c] = v_new_tile[t, c] * g_v
-                    v_new_bf[t, c] = T.cast(v_new_tile[t, c], dtype)
+                    v_new_bf[t, c] = T.cast(v_new_tile[t, c], gemm_dtype)
 
                 # Load K^T (key-major layout) for h += k @ v_new.
                 for r, t in T.Parallel(KB, BT):
                     k_lo[r, t] = T.if_then_else(
-                        base + t < seq_len, k[base + t, v_head, r], T.cast(0, dtype)
+                        base + t < seq_len, to_gemm(k[base + t, v_head, r]), T.cast(0, gemm_dtype)
                     )
                     k_hi[r, t] = T.if_then_else(
-                        base + t < seq_len, k[base + t, v_head, KB + r], T.cast(0, dtype)
+                        base + t < seq_len, to_gemm(k[base + t, v_head, KB + r]), T.cast(0, gemm_dtype)
                     )
 
                 kh_lo_acc = T.alloc_fragment((KB, BV), accum_dtype)
@@ -821,6 +847,7 @@ def _gdr_chunk_o_kernel():
     VALUE_DIM = QWEN35_GDR_VALUE_DIM
     BT = BLOCK_T
     BV = BLOCK_V
+    gemm_dtype, to_gemm = _sm70_gemm_gate(dtype, accum_dtype)
 
     @T.prim_func
     def kernel(
@@ -844,10 +871,10 @@ def _gdr_chunk_o_kernel():
             num_value_heads,
             threads=NUM_THREADS,
         ) as (v_tile, chunk_idx, v_head):
-            q_tile = T.alloc_shared((BT, KEY_DIM), dtype)
-            k_tile = T.alloc_shared((KEY_DIM, BT), dtype)
-            h_tile = T.alloc_shared((KEY_DIM, BV), dtype)
-            v_new_tile = T.alloc_shared((BT, BV), dtype)
+            q_tile = T.alloc_shared((BT, KEY_DIM), gemm_dtype)
+            k_tile = T.alloc_shared((KEY_DIM, BT), gemm_dtype)
+            h_tile = T.alloc_shared((KEY_DIM, BV), gemm_dtype)
+            v_new_tile = T.alloc_shared((BT, BV), gemm_dtype)
             acc_o = T.alloc_fragment((BT, BV), accum_dtype)
             acc_a = T.alloc_fragment((BT, BT), accum_dtype)
             g_shared = T.alloc_shared((BT,), accum_dtype)
@@ -857,19 +884,19 @@ def _gdr_chunk_o_kernel():
 
             for t, d in T.Parallel(BT, KEY_DIM):
                 q_tile[t, d] = T.if_then_else(
-                    base + t < seq_len, q[base + t, v_head, d], T.cast(0, dtype)
+                    base + t < seq_len, to_gemm(q[base + t, v_head, d]), T.cast(0, gemm_dtype)
                 )
             for d, t in T.Parallel(KEY_DIM, BT):
                 k_tile[d, t] = T.if_then_else(
-                    base + t < seq_len, k[base + t, v_head, d], T.cast(0, dtype)
+                    base + t < seq_len, to_gemm(k[base + t, v_head, d]), T.cast(0, gemm_dtype)
                 )
             for d, c in T.Parallel(KEY_DIM, BV):
-                h_tile[d, c] = T.cast(chunk_state[chunk_idx, v_head, d, v_off + c], dtype)
+                h_tile[d, c] = T.cast(chunk_state[chunk_idx, v_head, d, v_off + c], gemm_dtype)
             for t, c in T.Parallel(BT, BV):
                 v_new_tile[t, c] = T.if_then_else(
                     base + t < seq_len,
-                    v_new[base + t, v_head, v_off + c],
-                    T.cast(0, dtype),
+                    to_gemm(v_new[base + t, v_head, v_off + c]),
+                    T.cast(0, gemm_dtype),
                 )
 
             T.clear(acc_o)
@@ -898,9 +925,9 @@ def _gdr_chunk_o_kernel():
                 )
 
             # out = (acc_o + acc_a @ v_new) * scale
-            acc_a_bf = T.alloc_shared((BT, BT), dtype)
+            acc_a_bf = T.alloc_shared((BT, BT), gemm_dtype)
             for i, j in T.Parallel(BT, BT):
-                acc_a_bf[i, j] = T.cast(acc_a[i, j], dtype)
+                acc_a_bf[i, j] = T.cast(acc_a[i, j], gemm_dtype)
             T.gemm(acc_a_bf, v_new_tile, acc_o, policy=T.GemmWarpPolicy.FullRow)
             for t, c in T.Parallel(BT, BV):
                 if base + t < seq_len:
