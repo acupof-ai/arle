@@ -65,7 +65,7 @@ for round in $(seq 0 $((ROUNDS - 1))); do
     --student-model "$MODEL_PATH" --replay-records "$records" \
     --lora-rank "$LORA_RANK" --lora-alpha "$LORA_ALPHA" --lora-target-set "$LORA_TARGET_SET" \
     --lr "$LR" --update-strategy "$UPDATE_STRATEGY" ${sao_args[@]+"${sao_args[@]}"} \
-    ${FROZEN_PROMPT_KV:+--writeback-frozen-prompt-kv} \
+    ${FROZEN_PROMPT_KV:+--writeback-frozen-prompt-kv true} \
     ${adapter:+--lora-adapters "$adapter"} \
     --save-lora-adapters "$next_adapter" 2>&1 | tee "$rdir/train.log"
   # --save-lora-adapters writes <dir>/adapters_replay/{adapter_model.safetensors,..}

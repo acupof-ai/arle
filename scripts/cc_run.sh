@@ -30,7 +30,7 @@ curl -s --max-time 3 "$ANTHROPIC_BASE_URL/v1/models" >/dev/null && { echo "port 
 # Own the serve; kill only our PID on exit (never pkill).
 CUDA_VISIBLE_DEVICES=$GPU nohup "$ARLE" serve --model-path "$MODEL_PATH" \
   --bind 0.0.0.0 --port "$PORT" --max-running-requests 4 --dump-messages-dir "$DUMP" \
-  ${DECODE_GRAPH:+--qwen35-decode-graph} \
+  ${DECODE_GRAPH:+--qwen35-decode-graph true} \
   ${LORA:+--lora-adapters "$LORA" --lora-alpha 32} > "$OUT_DIR/serve.log" 2>&1 &
 SERVE_PID=$!; trap 'kill "$SERVE_PID" 2>/dev/null' EXIT
 
