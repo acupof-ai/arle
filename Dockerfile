@@ -68,7 +68,17 @@ CMD ["bash"]
 
 FROM dev AS builder
 
+# `.cargo/config.toml` pins rustc-wrapper=sccache, but sccache isn't installed
+# in the image — cargo would fail on the missing wrapper. Disable it: a one-shot
+# container build gets nothing from sccache. Empty value overrides config.toml.
+ENV RUSTC_WRAPPER=""
+
 COPY . .
+
+# build.rs runs TileLang AOT, which imports tilelang — vanilla apache-tvm-ffi
+# 0.1.12 (from requirements-build.txt) hard-aborts the import (tilelang#2367).
+# Rebuild tvm-ffi with the repo's first-wins patch, same as the CI lanes.
+RUN scripts/ci-patch-tvm-ffi.sh
 
 # Cache mounts persist the cargo registry and target dir across rebuilds;
 # the binary is copied out because cache mounts are not part of the image.
