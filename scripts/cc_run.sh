@@ -11,6 +11,7 @@ MODEL_PATH=${MODEL_PATH:-/host/Qwen3.6-27B-FP8}
 DATASET=${DATASET:-/host/swe_run2/train.jsonl}
 STAGED=${STAGED:-/host/swe_run2/staged}
 PYTHONPATH_TASK=${PYTHONPATH_TASK:-lib}                 # scoring PYTHONPATH (ansible=lib)
+SAMPLES=${SAMPLES:-1}                                   # attempts/task (SAO needs >=2)
 LORA=${LORA:-}                                          # optional adapter
 OUT_DIR=${OUT_DIR:-/host/cc_run/$(date -u +%Y%m%d_%H%M%S)}
 ARLE=${ARLE:-/host/arle-build/target/release/arle}
@@ -43,7 +44,7 @@ echo "[cc-run] serve up, model=$ANTHROPIC_MODEL"
 
 python3 "$ROOT/scripts/cc_swe_baseline.py" \
   --dataset "$DATASET" --staged-root "$STAGED" --model "$MODEL_ID" \
-  --pythonpath "$PYTHONPATH_TASK" --work-root "$OUT_DIR/work" \
+  --pythonpath "$PYTHONPATH_TASK" --work-root "$OUT_DIR/work" --samples "$SAMPLES" \
   --windows-out "$OUT_DIR/windows.jsonl" --out "$OUT_DIR/results.jsonl"
 
 if [ -s "$OUT_DIR/windows.jsonl" ]; then
@@ -51,6 +52,6 @@ if [ -s "$OUT_DIR/windows.jsonl" ]; then
     --windows "$OUT_DIR/windows.jsonl" --out "$OUT_DIR/records.jsonl"
   echo "[cc-run] records -> $OUT_DIR/records.jsonl"
 else
-  echo "[cc-run] no passing windows — no records written"
+  echo "[cc-run] no attempt windows — no records written"
 fi
 echo "[cc-run] done. results=$OUT_DIR/results.jsonl serve.log=$OUT_DIR/serve.log"

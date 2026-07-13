@@ -18,6 +18,9 @@ EVAL_DATASET=${EVAL_DATASET:-/host/opd-sweetspot3/split/tasks_eval.jsonl}
 EVAL_N=${EVAL_N:-33}
 EVAL_EVERY=${EVAL_EVERY:-2}
 PYTHONPATH_TASK=${PYTHONPATH_TASK:-lib:test}
+SAMPLES=${SAMPLES:-2}                    # attempts/task for collection; SAO needs >=2
+UPDATE_STRATEGY=${UPDATE_STRATEGY:-rejection-ce}   # rejection-ce | sao-dis | sao-value
+SAO_GAMMA=${SAO_GAMMA:-1.0}; SAO_LAMBDA=${SAO_LAMBDA:-0.95}; VALUE_LR=${VALUE_LR:-0.0003}
 LR=${LR:-0.00001}
 LORA_RANK=${LORA_RANK:-16}; LORA_ALPHA=${LORA_ALPHA:-32}
 LORA_TARGET_SET=${LORA_TARGET_SET:-attention-qv}
@@ -37,21 +40,28 @@ for round in $(seq 0 $((ROUNDS - 1))); do
 
   # 1. Collect cc-harness rollouts with the current adapter (fresh serve each round).
   GPU="$GPU" PORT="$PORT" MODEL_PATH="$MODEL_PATH" DATASET="$DATASET" STAGED="$STAGED" \
-    PYTHONPATH_TASK="$PYTHONPATH_TASK" LORA="$adapter" OUT_DIR="$rdir/collect" ARLE="$ARLE" \
+    PYTHONPATH_TASK="$PYTHONPATH_TASK" SAMPLES="$SAMPLES" LORA="$adapter" \
+    OUT_DIR="$rdir/collect" ARLE="$ARLE" \
     bash "$ROOT/scripts/cc_run.sh"
 
   records="$rdir/collect/records.jsonl"
   if [ ! -s "$records" ]; then
-    echo "[cc-opd] round $round: no records (no passing cc rollouts) — stopping."
+    echo "[cc-opd] round $round: no records (no cc rollouts) — stopping."
     break
   fi
 
-  # 2. Train ONE round on the cc records, chaining the adapter forward.
+  # 2. Train ONE round on the cc records, chaining the adapter forward. sao-value
+  # also passes the critic GAE/lr knobs; rejection-ce/sao-dis ignore them.
+  sao_args=()
+  if [ "$UPDATE_STRATEGY" = "sao-value" ]; then
+    sao_args=(--sao-gamma "$SAO_GAMMA" --sao-lambda "$SAO_LAMBDA" --value-lr "$VALUE_LR")
+  fi
   next_adapter="$rdir/adapter"
   CUDA_VISIBLE_DEVICES="$GPU" "$ARLE" train agent-opd \
     --student-model "$MODEL_PATH" --replay-records "$records" \
     --lora-rank "$LORA_RANK" --lora-alpha "$LORA_ALPHA" --lora-target-set "$LORA_TARGET_SET" \
-    --lr "$LR" ${adapter:+--lora-adapters "$adapter"} \
+    --lr "$LR" --update-strategy "$UPDATE_STRATEGY" ${sao_args[@]+"${sao_args[@]}"} \
+    ${adapter:+--lora-adapters "$adapter"} \
     --save-lora-adapters "$next_adapter" 2>&1 | tee "$rdir/train.log"
   # --save-lora-adapters writes <dir>/adapters_replay/{adapter_model.safetensors,..}
   # + a <dir>/latest symlink; the serve + resume loaders read the adapter dir
