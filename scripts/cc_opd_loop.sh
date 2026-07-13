@@ -18,8 +18,9 @@ EVAL_DATASET=${EVAL_DATASET:-/host/opd-sweetspot3/split/tasks_eval.jsonl}
 EVAL_N=${EVAL_N:-33}
 EVAL_EVERY=${EVAL_EVERY:-2}
 PYTHONPATH_TASK=${PYTHONPATH_TASK:-lib:test}
-SAMPLES=${SAMPLES:-2}                    # attempts/task for collection; SAO needs >=2
 UPDATE_STRATEGY=${UPDATE_STRATEGY:-rejection-ce}   # rejection-ce | sao-dis | sao-value
+# rejection-CE keeps the 1-attempt default (byte-identical); SAO needs >=2 for within-task reward variance.
+SAMPLES=${SAMPLES:-$([ "$UPDATE_STRATEGY" = rejection-ce ] && echo 1 || echo 2)}
 SAO_GAMMA=${SAO_GAMMA:-1.0}; SAO_LAMBDA=${SAO_LAMBDA:-0.95}; VALUE_LR=${VALUE_LR:-0.0003}
 LR=${LR:-0.00001}
 LORA_RANK=${LORA_RANK:-16}; LORA_ALPHA=${LORA_ALPHA:-32}
