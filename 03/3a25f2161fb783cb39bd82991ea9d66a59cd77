@@ -1,0 +1,21 @@
+docs/plans/2026-07-13-cc-as-harness-online-opd.md
+  s_3d949abe53b900::t_03aec63ec6872d 62-71,74-83
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "033a25f2161fb783cb39bd82991ea9d66a59cd77",
+  "prompts": {},
+  "sessions": {
+    "s_3d949abe53b900": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "92f2c43c-22c8-4f1d-8b27-d06d6f3c59ad",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
