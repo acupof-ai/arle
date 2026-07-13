@@ -57,6 +57,19 @@ Cost: substantial (slot state + per-token tap accumulation + context append +
 absolute RoPE + executor wiring). Multi-cycle. Geometry 95% specced; the HC-mapping
 is the one empirical unknown.
 
+**UPDATE 2026-07-13 — GEOMETRY SOLVED (`b350b0f90`, accept 0 → 0.143).** The
+absolute-RoPE-decoupled-from-cache-offset fix landed and validated on pod TP=4:
+draft `[11111,84941]` vs target `[11111,1,978]` → accepted=1; `accept_rate 0.143`
+(was 0.0). HC-mapping choice (all `hc_mult` at the token's single abs position)
+confirmed by nonzero accept. The relative context→block offset was the bug (buffer
+stride, not the true 1) — see
+[wins](../experience/wins/2026-07-13-dspark-dsv4-geometry-solved-absolute-rope.md).
+**Remaining lever = per-committed-token context WINDOW** (prompt-prefix seed +
+within-step accepted-draft taps) to lift accept 0.143 → reference 60-85%. That's a
+trunk forward-path change (multi-row tap capture at prefill + verify, mirror the
+qwen35 track's `dspark_append_ctx`), NOT geometry. HC-mapping empirical unknown
+resolved.
+
 ## Verdict first
 
 Adopt **DeepSeek's official `deepseek-ai/DeepSeek-V4-Flash-DSpark`** draft module
