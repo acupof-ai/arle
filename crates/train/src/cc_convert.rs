@@ -30,6 +30,14 @@ pub struct CcWindow {
     pub label: String,
     pub t_start_ms: u64,
     pub t_end_ms: u64,
+    /// Attempt reward (1.0 pass / 0.0 fail). Old windows.jsonl (passing-only)
+    /// lack the field → default 1.0 preserves today's passing = reward-1.0 flow.
+    #[serde(default = "default_reward")]
+    pub reward: f32,
+}
+
+fn default_reward() -> f32 {
+    1.0
 }
 
 /// One converted attempt: a verl-style token record plus mask accounting.
@@ -39,6 +47,10 @@ pub struct CcRecord {
     pub prompt_ids: Vec<u32>,
     pub response_ids: Vec<u32>,
     pub response_mask: Vec<u8>,
+    /// Attempt reward carried from the window (SAO advantage input). Default
+    /// 1.0 keeps replay records from pre-reward windows on the passing-only path.
+    #[serde(default = "default_reward")]
+    pub reward: f32,
     pub masked_tokens: usize,
     pub total_tokens: usize,
 }
@@ -65,6 +77,7 @@ pub fn run_cc_convert(
         label: "all".to_owned(),
         t_start_ms: 0,
         t_end_ms: u64::MAX,
+        reward: default_reward(),
     }];
     let windows = if windows.is_empty() {
         &whole_dir[..]
@@ -82,7 +95,7 @@ pub fn run_cc_convert(
             continue;
         };
         records.push(
-            convert_body(&window.label, body, &tokenizer)
+            convert_body(&window.label, window.reward, body, &tokenizer)
                 .with_context(|| format!("convert window {}", window.label))?,
         );
     }
@@ -155,6 +168,7 @@ fn fullest_dump_in_window(
 /// render with spans, tokenize with byte offsets, assistant-span mask.
 fn convert_body(
     label: &str,
+    reward: f32,
     body: serde_json::Value,
     tokenizer: &tokenizers::Tokenizer,
 ) -> Result<CcRecord> {
@@ -207,6 +221,7 @@ fn convert_body(
         prompt_ids: ids[..first_masked].to_vec(),
         response_ids: ids[first_masked..].to_vec(),
         response_mask: mask[first_masked..].to_vec(),
+        reward,
         masked_tokens,
         total_tokens: ids.len(),
     })
