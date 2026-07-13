@@ -39,6 +39,20 @@ use qwen35::Qwen35CudaExecutor;
 
 pub(crate) const SUPPORTED_PAGE_SIZE: usize = 16;
 
+/// Periodic recurrent-sidecar snapshot stride, in KV pages (`= 2048` tokens at
+/// `SUPPORTED_PAGE_SIZE = 16`). During a long hybrid prefill the Qwen3.5/3.6
+/// executor snapshots the recurrent state at every multiple of this stride, so a
+/// LATER request that shares only a leading prefix (a different conversation
+/// reusing the same system prompt, or a serve-restart) can restore at the
+/// largest stride boundary `≤` its radix match and re-prefill only the tail.
+///
+/// Cost/coverage tradeoff: snapshotting every stride (not every page) caps
+/// cross-conversation re-prefill at `≤ stride` tokens while keeping the snapshot
+/// count — and the deferred KV-copy / tier-insert work at publish — at `1/128`
+/// of a per-page scheme. 128 pages balances the two; a smaller stride tightens
+/// re-prefill but multiplies snapshot D2H + disk-tier writes.
+pub(crate) const SIDECAR_SNAPSHOT_STRIDE_PAGES: usize = 128;
+
 /// Flatten a `(session, block)` [`infer_seam::TierBlockKey`] into the
 /// `KvTierStore`'s opaque `u64` key namespace. The prefix tier already keys
 /// the same store by sequentially-assigned `u64`s (`next_tier_key`), so the
@@ -510,11 +524,15 @@ impl RealCudaExecutor {
         prefix_pages: &[u32],
     ) -> Result<usize> {
         match self {
-            Self::Qwen35(q) => q
-                .restore_recurrent_sidecar(slot, tokens, matched_len, prefix_pages)
-                .map(|()| 0),
-            Self::Dsv4(d) => d.restore_prefix_state(slot, tokens, matched_len, prefix_pages),
-            Self::Qwen(_) => Ok(0),
+            // Qwen3.5/3.6 returns the ABSOLUTE restored length (a periodic
+            // boundary `B ≤ matched_len` on a cross-conversation hit, else
+            // `matched_len`).
+            Self::Qwen35(q) => q.restore_recurrent_sidecar(slot, tokens, matched_len, prefix_pages),
+            // DSv4 returns EXTRA tokens beyond `matched_len`; lift to absolute.
+            Self::Dsv4(d) => d
+                .restore_prefix_state(slot, tokens, matched_len, prefix_pages)
+                .map(|extra| matched_len + extra),
+            Self::Qwen(_) => Ok(matched_len),
         }
     }
 

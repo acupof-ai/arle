@@ -132,13 +132,13 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         // full-attention-only backends. On miss, release the attached pages and fall
         // back to full recompute — a zeroed linear-attn state with non-zero full-attn
         // KV causes a cross-type mismatch that corrupts model output.
-        let extra = match self.executor.restore_prefix_sidecar(
+        let restored = match self.executor.restore_prefix_sidecar(
             slot,
             &request.prompt_tokens,
             prefix_match.matched_len,
             &prefix_match.block_ids,
         ) {
-            Ok(extra) => extra,
+            Ok(restored) => restored,
             Err(err) => {
                 log::warn!(
                     "recurrent sidecar restore failed for slot {slot}: {err:#}; \
@@ -156,17 +156,25 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             }
         };
 
-        // DSv4 finish-write-through restores PAST the 64-block-aligned radix
-        // `matched_len` by `extra` tokens (< page) up to the finished turn's exact
-        // length (its sub-page tail block from the pool entry's pending). Grow the
-        // slot into its OWN partial page (never radix-published, so no
-        // retain/release) so the cursor reaches that length and only the leftover
-        // suffix prefills. Clamp to the prompt: a match cannot extend past this
-        // request's own prompt. extra==0 is today's page-aligned path, unchanged.
-        let restored_len = (prefix_match.matched_len + extra).min(request.prompt_len());
+        // `restored` is the ABSOLUTE length the backend materialized. Three cases:
+        // - `== matched_len`: today's page-aligned restore (all backends' common path).
+        // - `> matched_len`: DSv4 finish-write-through restored PAST the 64-block
+        //   radix `matched_len` into the finished turn's sub-page tail (< page).
+        //   Grow the slot into its OWN partial page (never radix-published, so no
+        //   retain/release) so only the leftover suffix prefills.
+        // - `< matched_len`: Qwen3.5/3.6 hybrid restored a PERIODIC snapshot
+        //   boundary `B` because no sidecar existed exactly at `matched_len` (a
+        //   cross-conversation prefix hit). The device pool is at `B`; truncate the
+        //   over-attached host pages [B..matched_len] back to `B` (radix-retained
+        //   pages survive the reclaim; they stay in `reused_prefix_pages` and are
+        //   released on finish), so the tail prefill covers [B..prompt].
+        // Clamp to the prompt: a match cannot extend past this request's own prompt.
+        let restored_len = restored.min(request.prompt_len());
         if restored_len > prefix_match.matched_len {
             self.kv
                 .alloc(slot, restored_len - prefix_match.matched_len)?;
+        } else if restored_len < prefix_match.matched_len {
+            self.kv.truncate_slot(slot, restored_len)?;
         }
 
         self.prefix_cache_stats.hits = self.prefix_cache_stats.hits.saturating_add(1);

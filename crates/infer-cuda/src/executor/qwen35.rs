@@ -217,6 +217,15 @@ pub(crate) struct Qwen35CudaExecutor {
     /// `save_recurrent_sidecar`; cleared on the next request (`start_pos == 0`)
     /// so no cross-request state leaks.
     prefill_boundary_snapshot: Vec<Option<(usize, crate::qwen35::Qwen35RecurrentSnapshot)>>,
+    /// Per-slot recurrent snapshots captured DURING prefill at every periodic
+    /// stride boundary `S = k * SIDECAR_SNAPSHOT_STRIDE_PAGES * 16` crossed in
+    /// `[start_pos..prompt)` (excluding `L*`, which `prefill_boundary_snapshot`
+    /// owns). Each carries the state at EXACTLY `S` (snapshot-position ==
+    /// key-position), so `save_recurrent_sidecar` can store a sidecar keyed at
+    /// `hash(tokens[..S])` for a future cross-conversation restore at `S`. Drained
+    /// at save; cleared on a fresh request (`start_pos == 0`) and on prefix-reuse
+    /// attach so no prior occupant's snapshots leak into this request's saves.
+    periodic_boundary_snapshots: Vec<Vec<(usize, crate::qwen35::Qwen35RecurrentSnapshot)>>,
     /// DSpark block-draft runtime (`--spec-type dspark`): draft head + per-slot
     /// ctx caches + tap/scratch buffers. `None` (the default) keeps the
     /// baseline executor byte-identical — nothing is allocated or captured.
@@ -271,6 +280,10 @@ impl Qwen35CudaExecutor {
         if !self.slots[slot].has_recurrent() {
             return Ok(()); // pure full-attn path — nothing to capture
         }
+        // Drain the periodic snapshots up front so EVERY exit path (incl. the
+        // mat_len==0 / D2H-fail early returns) leaves the slot clean for its next
+        // occupant — a leaked entry would double-save under a later publish.
+        let periodic = std::mem::take(&mut self.periodic_boundary_snapshots[slot]);
         let boundary = tokens.len().saturating_sub(1) / SUPPORTED_PAGE_SIZE * SUPPORTED_PAGE_SIZE;
         let pending = self.prefill_boundary_snapshot[slot].take();
         let (mat_len, mut snap) = match pending {
@@ -300,44 +313,81 @@ impl Qwen35CudaExecutor {
                 tokens.len(),
             );
         }
-        // snapshot_recurrent synchronizes the stream so pages are flushed before D2H.
-        if let Some(pool) = self.full_attn_kv.as_ref() {
-            // full-attn KV is position-indexed and append-only, so pages [0..mat_len)
-            // are byte-identical whether copied at `mat_len` or at the current end.
-            let n_pages = mat_len / SUPPORTED_PAGE_SIZE;
-            let all_pages = pool.page_indices(slot);
-            let pages = all_pages[..n_pages.min(all_pages.len())].to_vec();
-            if !pages.is_empty() {
-                match pool.copy_pages_to_host(&self.model.ctx, &pages) {
-                    Ok(data) => snap.full_attn_kv = Some(data),
-                    Err(e) => {
-                        log::warn!(
-                            "slot {slot}: full-attn KV D2H failed: {e}; skipping sidecar entry"
-                        );
-                        return Ok(()); // don't store an incomplete (KV-less) blob
+        // Copy KV[0..mat_len] to host ONCE (snapshot_recurrent synchronized the
+        // stream). full-attn KV is position-indexed and append-only, so pages
+        // [0..mat_len) are byte-identical whether copied at `mat_len` or the
+        // current end, AND every periodic boundary `pos ≤ mat_len` is a page-major
+        // PREFIX of this buffer — slice it instead of re-copying (avoids O(N²) D2H
+        // across the periodic boundaries).
+        let host_kv = match self.full_attn_kv.as_ref() {
+            Some(pool) => {
+                let n_pages = mat_len / SUPPORTED_PAGE_SIZE;
+                let all_pages = pool.page_indices(slot);
+                let pages = all_pages[..n_pages.min(all_pages.len())].to_vec();
+                if pages.is_empty() {
+                    None
+                } else {
+                    match pool.copy_pages_to_host(&self.model.ctx, &pages) {
+                        Ok(data) => Some(data),
+                        Err(e) => {
+                            log::warn!(
+                                "slot {slot}: full-attn KV D2H failed: {e}; skipping sidecar entry"
+                            );
+                            return Ok(()); // don't store an incomplete (KV-less) blob
+                        }
                     }
                 }
             }
+            None => None,
+        };
+        // Bytes per KV page (page-major layout): slice `[..pages * page_bytes]`
+        // gives KV[0..pages*16] for any periodic boundary.
+        let n_pages = (mat_len / SUPPORTED_PAGE_SIZE).max(1);
+        let page_bytes = host_kv.as_ref().map(|d| d.len() / n_pages);
+
+        // PERIODIC sidecars at each stride boundary `0 < pos ≤ mat_len` snapshotted
+        // during this prefill — for a FUTURE cross-conversation restore that shares
+        // only a leading prefix. Each blob = the recurrent state captured at EXACTLY
+        // `pos` + KV[0..pos] sliced from `host_kv` (snapshot-position == key-position).
+        // Saved BEFORE the primary so the primary can MOVE `host_kv` (no clone).
+        for (pos, mut psnap) in periodic {
+            if pos == 0 || pos > mat_len {
+                continue; // beyond the copied/published prefix — nothing to key
+            }
+            psnap.full_attn_kv = match (host_kv.as_ref(), page_bytes) {
+                (Some(kv), Some(pb)) => Some(kv[..(pos / SUPPORTED_PAGE_SIZE) * pb].to_vec()),
+                _ => None,
+            };
+            let pkey = crate::qwen35::hash_prefix_tokens(&tokens[..pos]);
+            self.store_sidecar_blob(pos, pkey, psnap.to_bytes(), prefix_pages);
         }
-        // Atomic: recurrent + full-attn KV as ONE blob under ONE key.
-        let bytes = snap.to_bytes();
-        if self
+
+        // PRIMARY sidecar at `mat_len` (the exact-resend restore target) — the
+        // within-conversation reuse path, unchanged.
+        snap.full_attn_kv = host_kv;
+        self.store_sidecar_blob(mat_len, key, snap.to_bytes(), prefix_pages);
+        Ok(())
+    }
+
+    /// Insert a sidecar blob under `key` and coordinate its eviction off the last
+    /// radix page it COVERS (`prefix_pages[pos/16 - 1]`): leaves evict
+    /// deepest-first, so the blob drops the moment its own prefix erodes. Shared
+    /// by the primary (`mat_len`) and periodic (`pos ≤ mat_len`) saves.
+    fn store_sidecar_blob(&mut self, pos: usize, key: u64, bytes: Vec<u8>, prefix_pages: &[u32]) {
+        if !self
             .slot_tier
             .insert_chunked(NS_SIDECAR, NS_SIDECAR_CHUNK, key, &bytes)
         {
-            // Coordinate eviction off the last page the sidecar COVERS (leaves
-            // evict deepest-first, so this drops the blob the moment its own
-            // prefix erodes) — `mat_len` may be one page short of the sealed run.
-            let cover_idx = (mat_len / SUPPORTED_PAGE_SIZE).saturating_sub(1);
-            if let Some(&tail) = prefix_pages.get(cover_idx).or_else(|| prefix_pages.last())
-                && let Some(old) = self.sidecar_page_key.insert(tail, key)
-                && old != key
-            {
-                self.slot_tier
-                    .remove_chunked(NS_SIDECAR, NS_SIDECAR_CHUNK, old);
-            }
+            return;
         }
-        Ok(())
+        let cover_idx = (pos / SUPPORTED_PAGE_SIZE).saturating_sub(1);
+        if let Some(&tail) = prefix_pages.get(cover_idx).or_else(|| prefix_pages.last())
+            && let Some(old) = self.sidecar_page_key.insert(tail, key)
+            && old != key
+        {
+            self.slot_tier
+                .remove_chunked(NS_SIDECAR, NS_SIDECAR_CHUNK, old);
+        }
     }
 
     /// Radix evicted these host-pool prefix pages: drop the sidecar blob keyed to
@@ -351,16 +401,32 @@ impl Qwen35CudaExecutor {
         }
     }
 
-    /// Acquires recurrent buffers before restore so the tail-prefill sees populated state.
-    /// Also resets device KV pool seq_len to matched_len for the prefill_row_paged_default invariant.
-    /// Cache miss → zeroed recurrent (graceful degradation, not a hard error).
+    /// Restore the recurrent sidecar for a page-radix prefix hit, returning the
+    /// ABSOLUTE token length restored — `matched_len` on an exact hit, or the
+    /// largest periodic stride boundary `B ≤ matched_len` whose sidecar is present
+    /// (a cross-conversation hit where no sidecar was saved exactly at
+    /// `matched_len`). Acquires recurrent buffers, restores state + full-attn
+    /// KV[0..B], and sets the device pool seq_len to `B` for the
+    /// `prefill_row_paged_default` invariant; the engine truncates the host pool
+    /// to `B` and re-prefills `[B..prompt]`. A MISS at every boundary returns
+    /// `Err` so the caller full-recomputes.
+    ///
+    /// Correctness of the `[B..matched_len]` re-prefill: the blob keyed at
+    /// `hash(tokens[..B])` holds the recurrent state and KV captured at EXACTLY
+    /// `B` (snapshot-position == key-position). The tail prefill re-runs
+    /// `[B..prompt]`, advancing the recurrent state and recomputing full-attn KV
+    /// from `B` — identical to a fresh prefill, since both are deterministic
+    /// functions of the token prefix. The radix KV pages `[B..matched_len]` are
+    /// NOT laid over the `B`-boundary state (device pool is rebuilt to `B` here,
+    /// re-prefill allocates fresh tail pages) — avoiding the "one block too many"
+    /// corruption.
     pub(crate) fn restore_recurrent_sidecar(
         &mut self,
         slot: usize,
         tokens: &[u32],
         matched_len: usize,
         _prefix_pages: &[u32],
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<usize> {
         let matched_len = matched_len.min(tokens.len());
         if std::env::var_os("ARLE_KVDRIFT_DEBUG").is_some() {
             let pool_len = self
@@ -377,7 +443,6 @@ impl Qwen35CudaExecutor {
                 pool_len,
             );
         }
-        let key = crate::qwen35::hash_prefix_tokens(&tokens[..matched_len]);
         let (num_linear, gdr_len, conv_len) = self.model.recurrent_dims();
         // Reused slot: start_pos != 0 skips the normal release+acquire in submit_prefill_row.
         self.slots[slot].release_recurrent(&mut self.recurrent_pool);
@@ -395,41 +460,65 @@ impl Qwen35CudaExecutor {
         if let Some(df) = self.dspark.as_mut().and_then(|ds| ds.slots[slot].as_mut()) {
             df.reset();
         }
-        // Read the atomic blob from the tier (transparently spans L1/L2 host →
-        // L3 disk); a MISS or corrupt/foreign payload deserializes to None and
-        // falls through to the clean-recompute reset below — never a partial restore.
-        let snap = self
-            .slot_tier
-            .read_chunked(NS_SIDECAR, NS_SIDECAR_CHUNK, key)
-            .ok()
-            .and_then(|bytes| crate::qwen35::Qwen35RecurrentSnapshot::from_bytes(&bytes).ok());
 
-        // restore_recurrent_from_snapshot doesn't advance seq_len; set it for submit_decode_row invariant.
-        match snap.as_ref() {
-            Some(s) => self.slots[slot].restore_recurrent_from_snapshot(&self.model.ctx, s)?,
-            None => {
-                // ponytail: MISS → reset slot state, then return Err so the caller
-                // falls back to full recompute. Must clean up full_attn_kv and seq_len
-                // here before returning — the caller's Err handler won't do it.
-                if let Some(pool) = self.full_attn_kv.as_mut() {
-                    pool.free_slot(slot);
-                }
-                self.slots[slot].set_seq_len(0);
-                return Err(anyhow::anyhow!(
-                    "no recurrent sidecar for prefix matched_len={matched_len} \
-                     (key={key:#018x}); falling back to full recompute"
-                ));
-            }
+        // Probe boundaries largest-first: the exact `matched_len` (today's
+        // within-conversation fast path), then descending stride multiples
+        // `≤ matched_len`. The first present blob wins — a miss on a higher
+        // boundary reads nothing heavy (key-absent short-circuits), and we never
+        // read-then-discard a hit. Each boundary is page-aligned (matched_len is
+        // a radix page match, stride is a page multiple), so `hash(tokens[..B])`
+        // rendezvous with the save keys.
+        let stride = SIDECAR_SNAPSHOT_STRIDE_PAGES * SUPPORTED_PAGE_SIZE; // const, > 0
+        let mut candidates: Vec<usize> = Vec::new();
+        if matched_len > 0 {
+            candidates.push(matched_len);
         }
-        self.slots[slot].set_seq_len(matched_len);
+        let mut b = matched_len / stride * stride;
+        while b >= stride {
+            if b != matched_len {
+                candidates.push(b);
+            }
+            b -= stride;
+        }
+        // Read the atomic blob from the tier (transparently spans L1/L2 host →
+        // L3 disk); a corrupt/foreign payload deserializes to None and is skipped.
+        let restored = candidates.into_iter().find_map(|b| {
+            let key = crate::qwen35::hash_prefix_tokens(&tokens[..b]);
+            self.slot_tier
+                .read_chunked(NS_SIDECAR, NS_SIDECAR_CHUNK, key)
+                .ok()
+                .and_then(|bytes| crate::qwen35::Qwen35RecurrentSnapshot::from_bytes(&bytes).ok())
+                .map(|snap| (b, snap))
+        });
 
-        // Must run regardless of sidecar hit/miss: free prior occupant, alloc fresh pages.
+        let Some((boundary, snap)) = restored else {
+            // MISS at every boundary → reset slot state, then Err so the caller
+            // full-recomputes. Must clean up full_attn_kv and seq_len here — the
+            // caller's Err handler won't do it.
+            if let Some(pool) = self.full_attn_kv.as_mut() {
+                pool.free_slot(slot);
+            }
+            self.slots[slot].set_seq_len(0);
+            return Err(anyhow::anyhow!(
+                "no recurrent sidecar for prefix matched_len={matched_len} \
+                 (probed stride={stride}); falling back to full recompute"
+            ));
+        };
+
+        // restore_recurrent_from_snapshot doesn't advance seq_len; set it to the
+        // restored boundary for the submit_decode_row / prefill readiness invariant.
+        self.slots[slot].restore_recurrent_from_snapshot(&self.model.ctx, &snap)?;
+        self.slots[slot].set_seq_len(boundary);
+
+        // Rebuild the device KV pool to EXACTLY `boundary` pages, restoring
+        // KV[0..boundary] from the blob; the re-prefill of [boundary..prompt]
+        // allocates fresh tail pages (never reuses the radix [B..matched_len] KV).
         if let Some(pool) = self.full_attn_kv.as_mut() {
             pool.free_slot(slot);
-            let new_pages = pool.alloc_tokens(slot, matched_len).map_err(|e| {
+            let new_pages = pool.alloc_tokens(slot, boundary).map_err(|e| {
                 anyhow::anyhow!("device pool prefix alloc failed for slot {slot}: {e}")
             })?;
-            if let Some(kv_data) = snap.as_ref().and_then(|s| s.full_attn_kv.as_deref()) {
+            if let Some(kv_data) = snap.full_attn_kv.as_deref() {
                 pool.copy_pages_from_host(&self.model.ctx, &new_pages, kv_data)
                     .map_err(|e| {
                         anyhow::anyhow!("device pool KV H2D restore failed for slot {slot}: {e}")
@@ -437,7 +526,10 @@ impl Qwen35CudaExecutor {
             }
             // Stream-order: H2D above is ordered before subsequent kernels; no explicit sync needed.
         }
-        Ok(())
+        // Fresh prefill sequence for [boundary..prompt]: drop any prior occupant's
+        // periodic snapshots so this request's saves never inherit stale entries.
+        self.periodic_boundary_snapshots[slot].clear();
+        Ok(boundary)
     }
 
     /// Whole-slot swap is rank-local bytes plus TP-wide scalar consensus
@@ -753,6 +845,7 @@ impl Qwen35CudaExecutor {
             kv_pool_requested_pages: total_pages.max(1),
             sidecar_page_key: std::collections::HashMap::new(),
             prefill_boundary_snapshot: (0..num_slots).map(|_| None).collect(),
+            periodic_boundary_snapshots: (0..num_slots).map(|_| Vec::new()).collect(),
             dspark: dspark_head.map(|h| crate::qwen35::dspark::Qwen35DsparkExec::new(h, num_slots)),
         };
         cuda_startup_log(
@@ -2058,9 +2151,10 @@ impl Qwen35CudaExecutor {
             // zero it for the new occupant. This replaces the old in-place
             // `reset()` zeroing; the block MUST be resident before the forward.
             self.slots[row.slot].release_recurrent(&mut self.recurrent_pool);
-            // Drop any prior occupant's pending boundary snapshot: this slot is a
+            // Drop any prior occupant's pending boundary snapshots: this slot is a
             // new request, so a stale snapshot must never key a future sidecar.
             self.prefill_boundary_snapshot[row.slot] = None;
+            self.periodic_boundary_snapshots[row.slot].clear();
             // New occupant: the prior request's draft ctx cache is dead.
             if let Some(df) = self
                 .dspark
@@ -2129,45 +2223,108 @@ impl Qwen35CudaExecutor {
         }
         // Default paged prefill: full attention over all resident pages, no
         // eviction (the dense model applied to Qwen3.6 — Phase 2).
-        //
-        // Recurrent-sidecar boundary capture: on the FINAL prefill chunk, split
-        // the forward at the last-page boundary `L* = align_down16(total - 1)`
-        // and snapshot the recurrent state there, so the sidecar keyed at `L*`
-        // matches a resend's restore target (popped for aligned, un-popped for
-        // non-aligned) with snapshot-position == key-position. Without the split
-        // the state is only observable at `P` (prompt end), and keying it at
-        // `L* < P` bakes the residue `[L*..P]` — double-advanced on restore. For
-        // a non-aligned prompt the planner already ends a chunk at `L*` (residue
-        // split), so `head_len == 0` and we only snapshot; for an aligned prompt
-        // the final chunk spans `L*`, so we forward `[start..L*]`, snapshot, then
-        // forward the last page.
-        let is_final = row.start_pos + row.tokens.len() == row.total_tokens;
+        if self.slots[row.slot].has_recurrent() {
+            return self.prefill_row_snapshotted(row, position);
+        }
+        self.prefill_row_paged_default(row, position)
+    }
+
+    /// Prefill a hybrid row, splitting the forward at recurrent-snapshot
+    /// boundaries so a later prefix hit can restore the linear-attn state.
+    ///
+    /// Recurrent state is only observable at a forward's END, so a snapshot keyed
+    /// at position `S` requires a forward that ends at `S` (else keying a
+    /// later-position state at `S` bakes the residue `[S..end]` and double-advances
+    /// it on restore). Two families of boundary:
+    /// - **`L*` = align_down16(total - 1)** (final chunk only) — the exact-resend
+    ///   restore target (popped for aligned, un-popped for non-aligned; see
+    ///   `prefix.rs:72`). Owns `prefill_boundary_snapshot` (the within-conversation
+    ///   fast path), unchanged.
+    /// - **Periodic stride multiples `S = k * SIDECAR_SNAPSHOT_STRIDE_PAGES * 16`**
+    ///   crossed in `(start, end)` — for a future CROSS-conversation restore. Each
+    ///   feeds `periodic_boundary_snapshots`, saved at publish.
+    ///
+    /// Every cut is `< end`, so a real tail always remains to forward with the
+    /// real `position` and return the sampled token. All cuts are page-aligned
+    /// (stride is a page multiple, `L*` is `align16`), so `hash(tokens[..S])`
+    /// rendezvous with the restore probe's page-aligned boundaries.
+    fn prefill_row_snapshotted(
+        &mut self,
+        row: &infer_plan::PrefillRow,
+        position: u64,
+    ) -> Result<u32> {
+        let start = row.start_pos;
+        let end = start + row.tokens.len();
+        let is_final = end == row.total_tokens;
         let lstar = row.total_tokens.saturating_sub(1) / SUPPORTED_PAGE_SIZE * SUPPORTED_PAGE_SIZE;
-        if is_final && lstar > 0 && lstar >= row.start_pos && self.slots[row.slot].has_recurrent() {
-            let head_len = lstar - row.start_pos;
-            if head_len > 0 {
-                let head = infer_plan::PrefillRow {
+        let stride = SIDECAR_SNAPSHOT_STRIDE_PAGES * SUPPORTED_PAGE_SIZE; // const, > 0
+
+        // Ordered snapshot cuts in `[start, end)`. `bool` = is-`L*` (routes to the
+        // exact-resend `prefill_boundary_snapshot`; a boundary coinciding with `L*`
+        // is marked here so the L* insert below dedups it).
+        let mut cuts: Vec<(usize, bool)> = Vec::new();
+        // Boundary at `start`: a prior chunk ended exactly on a stride multiple, so
+        // that boundary is never `< end` of any chunk — snapshot the already-
+        // materialized state here (no forward). Without this, chunking aligned to
+        // the stride (e.g. chunked_prefill_size == stride) would snapshot nothing.
+        if start > 0 && start.is_multiple_of(stride) {
+            cuts.push((start, is_final && start == lstar));
+        }
+        // Interior stride multiples (strictly `> start`, `< end`).
+        let mut s = (start / stride + 1) * stride;
+        while s < end {
+            cuts.push((s, is_final && s == lstar));
+            s += stride;
+        }
+        // `L*` on the final chunk (non-aligned residue can land on `start`).
+        if is_final
+            && lstar > 0
+            && lstar >= start
+            && lstar < end
+            && !cuts.iter().any(|&(p, _)| p == lstar)
+        {
+            cuts.push((lstar, true));
+        }
+        cuts.sort_unstable_by_key(|&(p, _)| p);
+
+        // Forward each `[cursor..cut]` segment (state materialized at `cut`),
+        // snapshot there, then the final `[cursor..end]` tail returns the token.
+        let mut cursor = start;
+        let mut did_cut = false;
+        for (cut, is_lstar) in cuts {
+            if cut > cursor {
+                let seg = infer_plan::PrefillRow {
                     slot: row.slot,
-                    tokens: row.tokens[..head_len].to_vec(),
-                    start_pos: row.start_pos,
+                    tokens: row.tokens[cursor - start..cut - start].to_vec(),
+                    start_pos: cursor,
                     total_tokens: row.total_tokens,
                     params: row.params.clone(),
                 };
-                self.prefill_row_paged_default(&head, lstar as u64)?; // token discarded
+                self.prefill_row_paged_default(&seg, cut as u64)?; // token discarded
+                cursor = cut;
             }
-            // State is now materialized at exactly `L*`; snapshot before the tail.
+            // State is now materialized at exactly `cut` (either forwarded to it,
+            // or `cut == start` already reached by a prior chunk).
             let snap = self.slots[row.slot].snapshot_recurrent(&self.model.ctx)?;
-            self.prefill_boundary_snapshot[row.slot] = Some((lstar, snap));
-            let tail = infer_plan::PrefillRow {
-                slot: row.slot,
-                tokens: row.tokens[head_len..].to_vec(),
-                start_pos: lstar,
-                total_tokens: row.total_tokens,
-                params: row.params.clone(),
-            };
-            return self.prefill_row_paged_default(&tail, position);
+            if is_lstar {
+                self.prefill_boundary_snapshot[row.slot] = Some((cut, snap));
+            } else {
+                self.periodic_boundary_snapshots[row.slot].push((cut, snap));
+            }
+            did_cut = true;
         }
-        self.prefill_row_paged_default(row, position)
+        if !did_cut {
+            return self.prefill_row_paged_default(row, position); // no boundary crossed
+        }
+        // Final tail `[cursor..end]` (cuts are all `< end`, so this is non-empty).
+        let tail = infer_plan::PrefillRow {
+            slot: row.slot,
+            tokens: row.tokens[cursor - start..].to_vec(),
+            start_pos: cursor,
+            total_tokens: row.total_tokens,
+            params: row.params.clone(),
+        };
+        self.prefill_row_paged_default(&tail, position)
     }
 
     /// One decode row as a single-row forward (the pre-batching single-row

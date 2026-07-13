@@ -420,19 +420,25 @@ pub trait BackendExecutor {
         anyhow::bail!("backend has no position-0 prefix store")
     }
 
-    /// Restore the sidecar recurrent state for `slot` when reusing a page-radix
-    /// prefix of length `matched_len`, returning the number of EXTRA tokens
-    /// restored BEYOND `matched_len` (`0` = restored exactly the matched prefix,
-    /// nothing extra). Called by `attach_prefix_to_request` after
-    /// `kv.attach_pages()` succeeds. Default returns `0` (byte-identical to a
-    /// page-aligned restore — the engine prefills from `matched_len`) for
-    /// full-attention-only backends (CUDA Qwen dense, Metal) and Qwen3.5/3.6
-    /// hybrid; a backend that forgets to override falls back to the conservative
-    /// correct `0`. DSv4 finish-write-through may restore PAST the 64-block-aligned
-    /// `matched_len` to the finished turn's exact length (its sub-page tail block
-    /// lives in the pool entry's pending section); it returns that tail length
-    /// (< 64) and the engine grows the slot's own partial page and prefills only
-    /// from the extended length.
+    /// Restore the sidecar side state for `slot` when reusing a page-radix prefix
+    /// of length `matched_len`, returning the ABSOLUTE token length actually
+    /// restored — the position the engine sets `prefill_start_pos` to. Called by
+    /// `attach_prefix_to_request` after `kv.attach_pages()` succeeds. Default
+    /// returns `matched_len` (byte-identical to a page-aligned restore — the
+    /// engine prefills from `matched_len`) for full-attention-only backends (CUDA
+    /// Qwen dense, Metal); a backend that forgets to override falls back to the
+    /// conservative correct `matched_len`.
+    ///
+    /// Two backends restore a length OTHER than `matched_len`:
+    /// - **DSv4 finish-write-through** restores PAST the 64-block-aligned
+    ///   `matched_len` to the finished turn's exact length (its sub-page tail
+    ///   block lives in the pool entry's pending section) — returns
+    ///   `matched_len + tail` (`tail < 64`); the engine grows the slot's own
+    ///   partial page and prefills only from the extended length.
+    /// - **Qwen3.5/3.6 hybrid** may restore a periodic snapshot boundary `B ≤
+    ///   matched_len` when no sidecar exists exactly at `matched_len` (a
+    ///   cross-conversation prefix hit) — returns `B`; the engine truncates the
+    ///   attached pages back to `B` and re-prefills `[B..prompt]`.
     ///
     /// `prefix_pages` are the physical host-pool page ids already attached to the
     /// slot — the hybrid override uses them to sync the device KV pool seq_len.
@@ -440,10 +446,10 @@ pub trait BackendExecutor {
         &mut self,
         _slot: usize,
         _tokens: &[u32],
-        _matched_len: usize,
+        matched_len: usize,
         _prefix_pages: &[u32],
     ) -> anyhow::Result<usize> {
-        Ok(0)
+        Ok(matched_len)
     }
 
     /// Write the finishing slot's full frontier state THROUGH to the backend's
