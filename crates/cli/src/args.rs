@@ -2080,6 +2080,13 @@ pub(crate) struct TrainAgentOpdArgs {
     #[arg(long, value_name = "DIR")]
     pub(crate) save_lora_adapters: Option<PathBuf>,
 
+    /// Resume from a previously-saved PEFT LoRA adapter dir (a
+    /// `--save-lora-adapters` round output, containing `adapter_model.safetensors`):
+    /// overlays its A/B weights onto the fresh student before training/eval so an
+    /// online loop can chain adapters round-to-round. Fresh zero-B LoRA if unset.
+    #[arg(long, value_name = "DIR")]
+    pub(crate) lora_adapters: Option<PathBuf>,
+
     /// Compute backend for autograd (auto picks CUDA when built with cuda).
     #[arg(long, value_enum, default_value_t = OpdBackendArg::Auto)]
     pub(crate) backend: OpdBackendArg,
