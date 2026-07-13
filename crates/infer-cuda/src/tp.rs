@@ -621,6 +621,36 @@ impl TpRuntime {
             TpComm::Nccl(backend) => backend.all_gather_bytes(ctx, input, per_rank_bytes),
         }
     }
+
+    /// Broadcast rank-0's `values` to every rank (rank-0 authoritative).
+    ///
+    /// Single-rank / non-NCCL builds are identity. DSpark spec-decode uses this
+    /// to keep the rank-local proposal (sampling + confidence truncation) and
+    /// accept decision consistent: a divergent draft length feeds the
+    /// variable-length verify a different token count per rank, mismatching the
+    /// per-forward collective count and deadlocking the lockstep coordinator.
+    #[cfg_attr(not(all(feature = "cuda", feature = "nccl")), allow(unused_variables))]
+    pub fn broadcast_rank0_i32(
+        &self,
+        ctx: &cuda_kernels::prelude::DeviceContext,
+        values: &[i32],
+    ) -> anyhow::Result<Vec<i32>> {
+        if self.config.world_size <= 1 {
+            return Ok(values.to_vec());
+        }
+        #[cfg(all(feature = "cuda", feature = "nccl"))]
+        {
+            let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_ne_bytes()).collect();
+            let gathered = self.all_gather_bytes(ctx, &bytes, bytes.len())?;
+            // Rank-major layout: rank 0's payload is the leading `bytes.len()`.
+            Ok(gathered[..bytes.len()]
+                .chunks_exact(4)
+                .map(|c| i32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
+                .collect())
+        }
+        #[cfg(not(all(feature = "cuda", feature = "nccl")))]
+        Ok(values.to_vec())
+    }
 }
 
 #[cfg(test)]
