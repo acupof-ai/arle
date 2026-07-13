@@ -2116,6 +2116,7 @@ fn replay_sao(
     optimizer: &mut autograd::optim::AdamW,
     vocab: usize,
     epochs: usize,
+    per_epoch_cap: usize,
     store: &mut autograd::TensorStore,
 ) -> Result<()> {
     use train::update_strategy::ScoredTrajectory;
@@ -2137,9 +2138,10 @@ fn replay_sao(
         })
         .transpose()?;
 
-    // First-seen-ordered task groups (small n → linear find is the lowest-entropy form).
+    // First-seen-ordered task groups (small n → linear find is the lowest-entropy
+    // form). `--writeback-cap` bounds the records considered, as in the CE path.
     let mut groups: Vec<(&str, Vec<usize>)> = Vec::new();
-    for (idx, record) in records.iter().enumerate() {
+    for (idx, record) in records.iter().take(per_epoch_cap).enumerate() {
         let key = task_key(record.label.as_deref());
         match groups.iter_mut().find(|(k, _)| *k == key) {
             Some((_, idxs)) => idxs.push(idx),
@@ -2285,6 +2287,15 @@ fn run_agent_opd_replay(
     // `ema` EMA-updates each step; `self` stays frozen at the student's initial
     // adapter+base snapshot (never updated). Both reuse the EmaSelfTeacher
     // machinery — the only difference is whether `update()` runs.
+    // GKD distils a teacher distribution; SAO trains on reward advantage — the
+    // replay dispatch runs one OR the other, so reject the silent-no-op combo
+    // (would build + hold the teacher's VRAM, then ignore it).
+    if args.gkd && args.update_strategy != crate::args::UpdateStrategyArg::RejectionCe {
+        bail!(
+            "--gkd is incompatible with --update-strategy {:?}: pick GKD (teacher distill) or SAO (reward advantage)",
+            args.update_strategy
+        );
+    }
     let mut gkd_teacher = if args.gkd {
         Some(
             EmaSelfTeacher::from_student(&student, lora, target_set, &mut store)
@@ -2385,6 +2396,7 @@ fn run_agent_opd_replay(
             &mut optimizer,
             vocab,
             epochs,
+            per_epoch_cap,
             &mut store,
         )?;
     }
