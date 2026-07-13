@@ -1,5 +1,12 @@
 # DSpark-for-DSv4 draft geometry SOLVED — absolute-position RoPE (accept 0 → 0.14)
 
+> **SUPERSEDED — OVERTURNED 2026-07-13** by
+> [errors/2026-07-13-dspark-dsv4-draft-context-blind-at-gating-pos](../errors/2026-07-13-dspark-dsv4-draft-context-blind-at-gating-pos.md).
+> The `0.143` was noise from ONE France case (token 11111). Full-block
+> multi-prompt attribution shows 0/300 accept: the draft is context-blind at the
+> gating position. Geometry is NOT solved; the "context window" here is NOT the
+> lever. Read the errors entry, not the conclusion below.
+
 ## Context
 
 DSpark speculative decode for DeepSeek-V4-Flash ran correct + lockstep under TP=4
