@@ -310,6 +310,28 @@ fn build_peft_adapter_registry(
     Ok(registry)
 }
 
+/// Resume-load a previously-saved PEFT LoRA adapter dir into `student`'s live
+/// store — the exact inverse of the AdapterOnly save. Overwrites each LoRA A/B
+/// tensor in place (frozen base untouched, since only A/B are in the PEFT
+/// registry); hard-errors on shape mismatch or any registered adapter tensor
+/// missing from the file (no silent hybridize with the fresh zero-B init).
+pub fn load_qwen35_lora_adapters(
+    student: &Qwen35Model,
+    store: &mut TensorStore,
+    dir: &Path,
+) -> Result<(), Qwen35CheckpointError> {
+    let mut registry = build_peft_adapter_registry(student)?;
+    if registry.is_empty() {
+        return Err(Qwen35CheckpointError::Custom(
+            "load_qwen35_lora_adapters: student has no LoRA adapter tensors to resume into"
+                .to_owned(),
+        ));
+    }
+    let weights_path = dir.join(ADAPTER_WEIGHTS_FILENAME);
+    registry.load_into_strict(store, &weights_path)?;
+    Ok(())
+}
+
 fn peft_adapter_name(internal_name: &str) -> Result<String, Qwen35CheckpointError> {
     let (base_name, peft_suffix) = if let Some(base_name) = internal_name.strip_suffix(".lora_a") {
         (base_name, "lora_A")
