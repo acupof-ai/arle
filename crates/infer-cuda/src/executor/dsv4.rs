@@ -1433,7 +1433,8 @@ impl Dsv4CudaExecutor {
             // geometry garbage (unrelated drafts).
             if std::env::var_os("INFER_DSPARK_DEBUG").is_some() {
                 eprintln!(
-                    "[dspark-dbg] anchor={anchor} drafts={:?} target_argmax={:?} accepted={accepted}",
+                    "[dspark-dbg] anchor={anchor} base_argmax={:?} drafts={:?} target_argmax={:?} accepted={accepted}",
+                    &proposal.base_argmax,
                     &proposal.chain[1..],
                     &verify.argmax,
                 );

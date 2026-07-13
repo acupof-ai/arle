@@ -313,7 +313,10 @@ impl Dsv4Model {
             let (lat_ptr, _gl) = df.latent_kv[stage_idx].data.device_ptr(&ctx.stream);
             let (o_ptr, _go) = attn_heads.data.device_ptr_mut(&ctx.stream);
             // SAFETY: q [block,local_heads,head_dim]; latent_kv holds kv_len rows
-            // from ctx_base; out [block,local_heads,head_dim] (Flag #1).
+            // from ctx_base; out [block,local_heads,head_dim] (Flag #1). RoPE
+            // params mirror the forward q/latent prep above (block_abs frame,
+            // cr==0 → original_seq_len 0, no YaRN) so the value-tail inverse-RoPE
+            // exactly un-rotates the forward-rotated latent tail.
             unsafe {
                 ffi::dsv4_dspark_draft_attention_cuda(
                     q_ptr as *const ffi::Half,
@@ -325,7 +328,13 @@ impl Dsv4Model {
                     head_dim as i32,
                     nope_dim as i32,
                     rope_dim as i32,
+                    block_abs as i32,
                     sm_scale,
+                    config.rope_theta,
+                    0,
+                    rope.factor,
+                    rope.beta_fast,
+                    rope.beta_slow,
                     ctx.stream.cu_stream(),
                 )
                 .result()?;
@@ -712,6 +721,11 @@ pub(crate) struct Dsv4DsparkProposal {
     /// Corrected per-step logits `[vocab, draft_len]` for the accepted prefix.
     /// `None` when the block truncated to zero drafts.
     pub draft_logits: Option<HiddenStates>,
+    /// DIAG: base-only (pre-Markov) greedy argmax per block row `[block]`. Splits
+    /// "Markov masks a working forward" from "forward is context-blind" — if
+    /// `base_argmax[0]` is constant per anchor while target varies, the forward is
+    /// the bug, not the Markov bias. Remove with the INFER_DSPARK_DEBUG dump.
+    pub base_argmax: Vec<u32>,
 }
 
 impl Dsv4Model {
@@ -749,6 +763,10 @@ impl Dsv4Model {
         // SAFETY: uninit scratch; `lm_head_project_batch` writes every row.
         let mut base_logits = unsafe { HiddenStates::uninit(ctx, vocab, block)? };
         self.lm_head_project_batch(block_hidden, &mut base_logits)?;
+        // DIAG (INFER_DSPARK_DEBUG): base-only greedy per row, before the Markov
+        // bias — reveals whether the forward's gating-position prediction is
+        // context-sensitive independent of the Markov prior.
+        let base_argmax = self.mtp_argmax_batch(&base_logits)?;
 
         // Markov semi-AR L→R: step bias = markov_w2 · markov_w1[prev], added to the
         // base row; sample via the shared DSv4 sampler; feed the sampled token as
@@ -839,6 +857,7 @@ impl Dsv4Model {
             chain,
             draft_len,
             draft_logits,
+            base_argmax,
         })
     }
 
