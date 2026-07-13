@@ -19,18 +19,21 @@ if python -c "import tilelang" 2>/dev/null; then
 fi
 
 work="$(mktemp -d)"
-pip download --no-cache-dir --no-deps --no-binary :all: -d "$work" "apache-tvm-ffi==$PIN"
+# --no-binary ONLY for apache-tvm-ffi (we need its sdist to patch). `:all:` would
+# force pip to source-build every build backend dep too — incl. cmake, which
+# times out on CI when the env's pip cmake (4.x) falls outside scikit-build-core's
+# accepted range and gets requested as a from-source backend dep.
+pip download --no-cache-dir --no-deps --no-binary apache-tvm-ffi -d "$work" "apache-tvm-ffi==$PIN"
 tar -xzf "$work"/apache*tvm*ffi-*.tar.gz -C "$work"
 src="$(ls -d "$work"/apache*tvm*ffi-*/)"
 patch -p1 -d "$src" < "$PATCH"
-# Build the wheel in THIS env with --no-build-isolation, so we control the
-# build deps directly instead of pip's nested isolated builds (which recurse
-# into the same old-packaging trap). The tvm-ffi sdist needs scikit-build-core
-# + setuptools_scm + cython to configure, and a modern setuptools/packaging to
-# parse its PEP 639 license expression (else "Cannot import packaging.licenses",
-# setuptools>=77 / packaging>=24.2). Install the full set up front.
+# Build the wheel with --no-build-isolation so THIS env's deps are authoritative
+# (no nested isolated builds). tvm-ffi's scikit-build-core backend needs
+# setuptools_scm + cython to configure and a cmake in its accepted range — the
+# sm70 lane's `pip install cmake` pulls 4.x, which scikit-build-core rejects, so
+# pin cmake<4. modern setuptools/packaging keeps license parsing quiet.
 pip install --no-cache-dir -U \
-  'setuptools>=77' 'packaging>=24.2' wheel scikit-build-core setuptools_scm cython ninja
+  'setuptools>=77' 'packaging>=24.2' wheel scikit-build-core setuptools_scm cython ninja 'cmake<4'
 pip wheel --no-cache-dir --no-deps --no-build-isolation -w "$work" "$src"
 pip install --force-reinstall --no-deps "$work"/apache*tvm*ffi-*.whl
 python -c "import tilelang; print('tilelang', tilelang.__version__, 'tvm-ffi patched-ok')"
