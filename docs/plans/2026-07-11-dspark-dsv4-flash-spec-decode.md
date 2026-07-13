@@ -203,16 +203,23 @@ T4.4's draft-KV window management: either T4.4 keeps the draft context bounded
 dynamic-shared-mem / tiled softmax. Decide once T4.4 lands + shows its cache model.
 Handle in the pod kernel-iteration session (where nvcc can compile-test).
 
-**#1 POD-VERIFY CORRECTNESS ITEM — post-attention inverse-RoPE (deferred, ~85%).**
-The base DSv4 MLA attention kernels (`dsv4_swa.cu:86-102`, `dsv4_hybrid.cu`) apply
-a post-attention **inverse-RoPE** (sign −1) to the output's `rope_dim` slice before
-`mla_oproj`. The DSpark draft kernel (`07f454f17`) OMITS it (implemented the frozen
-contract verbatim). Reasoning it's likely NEEDED: the draft feeds the SAME
-`mla_oproj`, and its `wo_a/wo_b` were trained by DeepSpec against the base DSv4
-attention (which de-RoPEs) → the draft expects de-RoPE'd values. Not at 95% (can't
-read the DeepSpec DSv4 attention source locally) → **the pod needle gate arbitrates**
-(decode actual output: incoherent ⇒ add the de-RoPE). Staged fix: copy the `swa`
-post-RoPE block into `dsv4_dspark_draft_attention.cu`, gated on `rope_dim>0`.
+**#1 post-attention inverse-RoPE — IMPLEMENTED (f36675d85) then DISPROVEN as the
+dominant bug (A/B, 2026-07-13).** The base DSv4 MLA attention (`dsv4_swa.cu:86-101`)
+de-RoPEs the output's `rope_dim` slice at the query position before `mla_oproj`; the
+draft kernel omitted it, so the hypothesis was the draft's DeepSpec-trained
+`wo_a/wo_b` expect de-RoPE'd values. Added it (mirror of swa, `abs_pos =
+block_start + token`). **Pod TP=4 A/B verdict: the draft ids are byte-identical
+pre/post fix** (`[dspark-dbg]` dump: `anchor=603 drafts=[68745]` unchanged;
+`8760→[9515,85158]` unchanged) and accept stayed 0%. The output de-RoPE is a no-op
+on these drafts → the dominant garbage is UPSTREAM of the attention output. Kept the
+fix (correct per swa, harmless) but it is NOT sufficient. **Remaining suspects
+(ranked):** ① context-fusion tap layout (POD-VERIFY, `dspark.rs` tap concat
+`513-522` reads the wide HC stream as `[row r @ r*hidden]` — unverified); ② draft
+attention Q/K RoPE positions / context-K RoPE consistency; ③ MoE routing. Eliminated
+so far: tied-head tensor (draft reuses `self.lm_head`, proven by correct MAIN output)
+and tap-capture width (`capture_mtp_stream_hidden`, proven MTP path, `stream_dim =
+hidden*hc_mult` matches). Next: DeepSpec DSv4 reference (recon) or a runtime norm
+sweep (tap/context/block_hidden L2) to localize the broken stage.
 
 **Flag #1 (V-output width) RESOLVED** (pod build + `dsv4_oproj_group_shape`
 `attention.rs:6648`): the draft attention V-output = **`local_heads × head_dim`
