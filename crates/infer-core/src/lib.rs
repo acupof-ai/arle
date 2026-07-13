@@ -2751,7 +2751,7 @@ mod tests {
     /// pages (the ~4.5K-token shape that crashed on the pre-`1b0f0459` tree).
     #[test]
     fn agentic_reprefill_keeps_seq_len_in_lockstep() {
-        let (probe, result) = run_agentic_reprefill(true, 6, 40, 5, 24);
+        let (probe, result) = run_agentic_reprefill(true, 6, 128, 5, 24);
         result.expect("agentic re-prefill must not drift seq_len with the rewind fix");
         let log = probe.decode_log();
         assert!(!log.is_empty(), "expected decode rows across the turns");
@@ -2780,6 +2780,33 @@ mod tests {
             msg.contains("start_pos") || msg.contains("kv_seq_len") || msg.contains("materialized"),
             "expected the seq_len drift guard, got: {msg}"
         );
+    }
+
+    /// cc-as-harness shape: an 8-page CONSTANT system prompt (cc's large prompt,
+    /// scaled to the mock's regime) re-matched every turn plus multi-turn growth
+    /// — 3.2× the base of `agentic_reprefill_keeps_seq_len_in_lockstep`. Drift is
+    /// scale-independent (device-counter rewind), proven identical at base
+    /// 40/64/96/128; this pins the multi-page-prefix re-match shape cc drives.
+    /// Confirms `materialized == kv_seq_len` so cc rollouts feed the OPD writeback
+    /// a non-drifting KV. Per-round serve RESTART separately keeps the cross-round
+    /// adapter epoch fresh (token-keyed RadixCache has no epoch — issue #92).
+    #[test]
+    fn agentic_reprefill_cc_large_prompt_shape() {
+        let (probe, result) = run_agentic_reprefill(true, 6, 128, 5, 24);
+        result.expect("cc-shape big-prefix multi-turn must not drift seq_len");
+        let log = probe.decode_log();
+        assert!(
+            !log.is_empty(),
+            "expected decode rows across the cc-shape turns"
+        );
+        for (k, &(slot, materialized, kv_seq_len)) in log.iter().enumerate() {
+            assert_eq!(slot, 0);
+            assert_eq!(
+                materialized, kv_seq_len,
+                "decode {k}: materialized {materialized} != kv_seq_len {kv_seq_len} \
+                 (cc large-prefix re-prefill drift)"
+            );
+        }
     }
 
     fn submit_with_sampling(
