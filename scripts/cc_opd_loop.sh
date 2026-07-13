@@ -22,6 +22,8 @@ UPDATE_STRATEGY=${UPDATE_STRATEGY:-rejection-ce}   # rejection-ce | sao-dis | sa
 # rejection-CE keeps the 1-attempt default (byte-identical); SAO needs >=2 for within-task reward variance.
 SAMPLES=${SAMPLES:-$([ "$UPDATE_STRATEGY" = rejection-ce ] && echo 1 || echo 2)}
 SAO_GAMMA=${SAO_GAMMA:-1.0}; SAO_LAMBDA=${SAO_LAMBDA:-0.95}; VALUE_LR=${VALUE_LR:-0.0003}
+CC_TIMEOUT=${CC_TIMEOUT:-600}; DECODE_GRAPH=${DECODE_GRAPH:-1}   # rollout speed: per-task cap + decode graph
+FROZEN_PROMPT_KV=${FROZEN_PROMPT_KV:-1}   # SAO writeback skips the shared 17K-prompt forward (needs the port)
 LR=${LR:-0.00001}
 LORA_RANK=${LORA_RANK:-16}; LORA_ALPHA=${LORA_ALPHA:-32}
 LORA_TARGET_SET=${LORA_TARGET_SET:-attention-qv}
@@ -42,6 +44,7 @@ for round in $(seq 0 $((ROUNDS - 1))); do
   # 1. Collect cc-harness rollouts with the current adapter (fresh serve each round).
   GPU="$GPU" PORT="$PORT" MODEL_PATH="$MODEL_PATH" DATASET="$DATASET" STAGED="$STAGED" \
     PYTHONPATH_TASK="$PYTHONPATH_TASK" SAMPLES="$SAMPLES" LORA="$adapter" \
+    CC_TIMEOUT="$CC_TIMEOUT" DECODE_GRAPH="$DECODE_GRAPH" \
     OUT_DIR="$rdir/collect" ARLE="$ARLE" \
     bash "$ROOT/scripts/cc_run.sh"
 
@@ -62,6 +65,7 @@ for round in $(seq 0 $((ROUNDS - 1))); do
     --student-model "$MODEL_PATH" --replay-records "$records" \
     --lora-rank "$LORA_RANK" --lora-alpha "$LORA_ALPHA" --lora-target-set "$LORA_TARGET_SET" \
     --lr "$LR" --update-strategy "$UPDATE_STRATEGY" ${sao_args[@]+"${sao_args[@]}"} \
+    ${FROZEN_PROMPT_KV:+--writeback-frozen-prompt-kv} \
     ${adapter:+--lora-adapters "$adapter"} \
     --save-lora-adapters "$next_adapter" 2>&1 | tee "$rdir/train.log"
   # --save-lora-adapters writes <dir>/adapters_replay/{adapter_model.safetensors,..}
@@ -76,6 +80,7 @@ for round in $(seq 0 $((ROUNDS - 1))); do
   if [ $(((round + 1) % EVAL_EVERY)) -eq 0 ]; then
     GPU="$GPU" PORT="$PORT" MODEL_PATH="$MODEL_PATH" DATASET="$EVAL_DATASET" STAGED="$STAGED" \
       PYTHONPATH_TASK="$PYTHONPATH_TASK" LORA="$adapter" OUT_DIR="$rdir/eval" ARLE="$ARLE" \
+      CC_TIMEOUT="$CC_TIMEOUT" DECODE_GRAPH="$DECODE_GRAPH" SAMPLES=1 \
       bash "$ROOT/scripts/cc_run.sh" || true
     echo "[cc-opd] round $round held-out eval -> $rdir/eval/results.jsonl"
   fi
