@@ -1,6 +1,6 @@
 # cc-as-harness online OPD
 
-> Status: Active — 2026-07-13. Supersedes the weak in-process agent loop as the
+> Status: Active — 2026-07-13. Loop + prefix-reuse VALIDATED (pod, GPU H20). Supersedes the weak in-process agent loop as the
 > default agent-OPD rollout harness.
 
 ## Verdict
@@ -74,18 +74,24 @@ round's adapter → the bash loop can't chain. Serve *does* load adapters
 1. **KV correctness gate** ✓ — cc-shape multi-page prefix re-match test
    (`agentic_reprefill_cc_large_prompt_shape`, `70e3f5137`); per-round restart =
    fresh cache for #92. *(user priority: "kv cache 也得测试好")*
-2. **Adapter resume-load** — add `load_lora_adapters` (import twin of
-   `save_lora_adapters`, keyed by `adapter_name_map`) + wire `--lora-adapters`
-   into the agent-opd train + eval load paths. Unblocks chaining.
-3. **Online loop orchestrator** — `scripts/cc_opd_loop.sh` (drafted): per-round
+2. **Adapter resume-load** ✓ — `load_qwen35_lora_adapters` (PEFT registry twin,
+   `591a864e8`) + `--lora-adapters` wired into agent-opd train/eval; serve loader
+   accepts a PEFT dir (`3b9d0bb7`). **Validated (pod): round-1 `resumed adapter
+   from …/adapters_replay`, CC_OPD_EXIT=0.**
+3. **Online loop orchestrator** ✓ — `scripts/cc_opd_loop.sh`: per-round
    serve-restart → cc → convert → train-one-round (`--replay-records`) → chain
-   adapter → periodic held-out eval. Viable once (2) lands. **CE-only** (replay
-   ignores `--update-strategy`).
-3. **SAO-on-cc (follow-up)** — collect *failing* windows + carry reward through
+   adapter → periodic cc held-out eval. **Validated end-to-end (pod, 2 rounds).**
+   **CE-only** (replay ignores `--update-strategy`).
+4. **Prefix reuse (shared 17K prompt)** ✓ — periodic recurrent-sidecar snapshots
+   + partial restore (`312d22c8c`, STRIDE=2048, L3-disk). **Validated (pod):
+   needle gate 3/3 exact 115→8000; cross-task 18320 restore `restore_failed 1→0`;
+   cc tasks pass at baseline rate.** Kills the per-conversation/per-restart 18K
+   re-prefill.
+5. **SAO-on-cc (follow-up)** — collect *failing* windows + carry reward through
    `cc-convert`; make `run_agent_opd_replay` honor `--update-strategy`. (cc-harness
    + SAO Phase 1/2 together.)
-4. **Perf follow-up** — hot-reload adapter + #92 epoch-invalidation to kill the
-   per-round model-reload; recurrent-sidecar prefix restore for the 17K prompt.
+6. **Perf follow-up** — hot-reload adapter + #92 epoch-invalidation to kill the
+   per-round model-reload; guidellm A/B for the sidecar prefill savings.
 
 ## Non-goals (now)
 
