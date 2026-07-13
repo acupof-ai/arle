@@ -2336,21 +2336,35 @@ mod testing {
         decode_log: std::rc::Rc<std::cell::RefCell<Vec<(usize, usize, usize)>>>,
         /// The fix: rewind the device counter to `matched_len` on prefix attach.
         rewind_on_attach: bool,
+        /// Periodic-snapshot PARTIAL restore: when `> 0`, `restore_prefix_sidecar`
+        /// restores at a boundary `B = matched_len - partial_gap < matched_len`
+        /// instead of `matched_len`, modelling a cross-conversation hit where no
+        /// sidecar existed exactly at the radix match.
+        partial_gap: usize,
+        /// `(matched_len, B)` of the most recent partial restore — the test asserts
+        /// the engine set `prefill_start_pos` to `B`.
+        last_restore: std::rc::Rc<std::cell::RefCell<Option<(usize, usize)>>>,
     }
 
     impl HybridReprefillMirror {
-        pub(super) fn new(rewind_on_attach: bool) -> Self {
+        pub(super) fn with_partial_gap(rewind_on_attach: bool, partial_gap: usize) -> Self {
             Self {
                 materialized: std::rc::Rc::new(std::cell::RefCell::new(
                     std::collections::HashMap::new(),
                 )),
                 decode_log: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
                 rewind_on_attach,
+                partial_gap,
+                last_restore: std::rc::Rc::new(std::cell::RefCell::new(None)),
             }
         }
 
         pub(super) fn decode_log(&self) -> Vec<(usize, usize, usize)> {
             self.decode_log.borrow().clone()
+        }
+
+        pub(super) fn last_restore(&self) -> Option<(usize, usize)> {
+            *self.last_restore.borrow()
         }
     }
 
@@ -2377,10 +2391,21 @@ mod testing {
             matched_len: usize,
             _prefix_pages: &[u32],
         ) -> Result<usize> {
+            // Periodic-snapshot partial restore: land on a lower boundary `B =
+            // matched_len - partial_gap` (the caller keeps `partial_gap` a page
+            // multiple), so the engine truncates the over-attached pages and
+            // re-prefills [B..prompt].
+            let restored = if self.partial_gap > 0 && matched_len > self.partial_gap {
+                let b = matched_len - self.partial_gap;
+                *self.last_restore.borrow_mut() = Some((matched_len, b));
+                b
+            } else {
+                matched_len
+            };
             if self.rewind_on_attach {
-                self.materialized.borrow_mut().insert(slot, matched_len);
+                self.materialized.borrow_mut().insert(slot, restored);
             }
-            Ok(0)
+            Ok(restored)
         }
 
         fn submit(&mut self, plan: &ForwardPlan, _kv: &mut dyn KvPool) -> Result<Self::Inflight> {
@@ -2717,7 +2742,25 @@ mod tests {
         gen_per_turn: usize,
         tool_tokens: usize,
     ) -> (HybridReprefillMirror, Result<()>) {
-        let executor = HybridReprefillMirror::new(rewind_on_attach);
+        run_agentic_reprefill_gap(
+            rewind_on_attach,
+            turns,
+            base_prompt,
+            gen_per_turn,
+            tool_tokens,
+            0,
+        )
+    }
+
+    fn run_agentic_reprefill_gap(
+        rewind_on_attach: bool,
+        turns: usize,
+        base_prompt: usize,
+        gen_per_turn: usize,
+        tool_tokens: usize,
+        partial_gap: usize,
+    ) -> (HybridReprefillMirror, Result<()>) {
+        let executor = HybridReprefillMirror::with_partial_gap(rewind_on_attach, partial_gap);
         let probe = executor.clone();
         let mut config = test_config(1);
         config.chunked_prefill_size = 64;
@@ -2780,6 +2823,56 @@ mod tests {
             msg.contains("start_pos") || msg.contains("kv_seq_len") || msg.contains("materialized"),
             "expected the seq_len drift guard, got: {msg}"
         );
+    }
+
+    /// Periodic-snapshot PARTIAL restore: when the backend restores at a boundary
+    /// `B < matched_len` (no sidecar existed exactly at the radix match — a
+    /// cross-conversation hit), the engine must set `prefill_start_pos = B` and
+    /// truncate the over-attached pages so the tail prefills `[B..prompt]`.
+    #[test]
+    fn partial_restore_reprefills_from_returned_boundary() -> Result<()> {
+        // page_size 4. First prompt publishes an 8-token (2-page) prefix; the
+        // second shares it. The hybrid mock restores PARTIALLY at
+        // `B = matched_len - partial_gap = 8 - 4 = 4` (one page below the radix
+        // match), modelling a cross-conversation hit with no sidecar exactly at
+        // `matched_len`. The engine must truncate the over-attached second page
+        // and set `prefill_start_pos = B`, re-prefilling `[B..prompt]`.
+        let executor = HybridReprefillMirror::with_partial_gap(true, 4);
+        let probe = executor.clone();
+        let mut engine = Engine::with_config(
+            executor,
+            MockKvPool::with_capacity(2, 4, 16),
+            test_config(2),
+        );
+
+        let first = engine.submit_request(vec![1, 2, 3, 4, 5, 6, 7, 8, 99], 1);
+        engine.run_to_idle()?;
+        assert_finished(engine.completed(first).expect("first completed"));
+        let hit = engine
+            .radix
+            .peek_longest_prefix_match(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(hit.matched_len, 8, "2-page prefix published");
+
+        let second = engine.submit_request(vec![1, 2, 3, 4, 5, 6, 7, 8, 100, 101], 1);
+        engine.step()?;
+
+        let (_, request) = engine
+            .active
+            .iter()
+            .find(|(_, request)| request.handle == second)
+            .expect("second admitted");
+        // Partial restore fired (B = 8 - 4 = 4) and the engine re-enters prefill at B.
+        let (matched_len, b) = probe.last_restore().expect("a partial restore occurred");
+        assert_eq!(matched_len, 8);
+        assert_eq!(b, 4);
+        assert_eq!(
+            request.prefill_start_pos, 4,
+            "prefill_start_pos must be the restored boundary B, not matched_len"
+        );
+
+        engine.run_to_idle()?;
+        assert_finished(engine.completed(second).expect("second completed"));
+        Ok(())
     }
 
     /// cc-as-harness shape: an 8-page CONSTANT system prompt (cc's large prompt,
