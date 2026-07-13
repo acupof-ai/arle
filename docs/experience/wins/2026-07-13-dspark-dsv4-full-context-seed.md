@@ -1,10 +1,10 @@
-# DSpark-for-DSv4 full-committed-sequence context seed — `pending-remote` (built, UNMEASURED)
+# DSpark-for-DSv4 full-committed-sequence context seed — landed, but accept still ~0 (second fuse bug)
 
-> Status: **UNVERIFIED** — built clean (BUILD_EXIT=0) but accept_rate NOT measured;
-> the pod serve never reached engine-ready (274GB cold load exceeded the 57-min
-> barrier under co-tenant disk-IO contention, 2026-07-13). Re-measure when the box
-> is idle before trusting any accept number. Opt-in path (`--spec-type dspark`),
-> production defaults untouched.
+> Status: **MEASURED 2026-07-14** — the seed WORKS (context accumulates the whole
+> prompt) but accept is still ~0: `1/145 = 0.0069` on stable `/v1/completions`
+> targets (was 0/170). A correct, necessary structural step — NOT a regression
+> (opt-in `--spec-type dspark`; DSpark-DSv4 was already 0). A SECOND bug remains:
+> the context fusion produces near-uniform per-position context. See "Measured" below.
 
 ## Context
 
@@ -42,15 +42,31 @@ invariant that regressed a prior attempt — held here, verified line-by-line).
 - VRAM: `latent_cap = max_seq_len*hc_mult + block` (each token caches `hc_mult`
   lanes); transient prompt-tap buffer excluded from the ledger.
 
-## Verification status
+## Measured (2026-07-14, TP=4 GPUs 3-6, conf-threshold 0, raw /v1/completions)
 
-- Local typecheck clean (`cargo check -p infer-api … cuda,no-cuda`).
-- Geometry reviewed end-to-end: stream-copy layout ↔ fuse index `c=j*hc_mult+r`
-  ↔ per-row RoPE positions — consistent; decode reduces to the validated baseline.
-- **Accept_rate: NOT measured** (pod infra block above). Decisive probe when
-  unblocked: raw `/v1/completions` (stable targets), watch `[dspark-dbg]`
-  `base_argmax` start varying + tracking `target_argmax`, `[dspark-stat]` `context
-  rows=` grow to prompt-len×hc_mult, and spec_decode delta accept > 0.
+- The seed FIRES and accumulates: `[dspark-stat] context rows=20/24/40` (prompt_len ×
+  hc_mult=4) confirmed in the log — the whole committed sequence is now the context.
+- **But accept ≈ 0 still: `1/145 = 0.0069`** (was 0/170). `base_argmax` still
+  attractor-collapses ({24132, 112434, …}); outputs still degenerate.
+- **Root cause of the residual failure — near-uniform context.** Every context row
+  has `row_l2 ≈ 5.64` (the `main_norm` output magnitude) and `row_spread ≈ 0.25`
+  across 40 rows — only ~2.5× the within-token spread (0.10). The context barely
+  distinguishes positions, so the (now-present) full context is INEFFECTIVE.
+
+## Open — SECOND fuse bug (the wide-HC-tap reduction)
+
+Our fuse LANE-SPLITS the wide HC tap: per committed token it makes `hc_mult` context
+vectors, each from ONE HC lane (`fuse_in` column `c=j*hc_mult+r`, main_proj over one
+lane's tap-concat) → each context vector sees only 1/hc_mult of the pre-collapse HC
+residual → weak, near-uniform. The DeepSpec/HyperDFlash reference REDUCES the wide
+pre-collapse HC residual to ONE vector per position via the target's `hc_head` gate
+(Eq 1: `α=σ(W_f·RMSNorm(vec(H))+b)`, `y=Σ αⱼ Hⱼ`) BEFORE the drafter — encoding the
+FULL stream, one context vector per token (main_proj `[hidden, n_taps*hidden]` then
+takes the n_taps reduced vectors). Next: replace the lane-split with an
+`hc_head`-gate reduce (reuse `head_hidden_from_stream`) per tap per position →
+`n_taps` reduced vectors → main_proj → ONE context latent per committed token (not
+`hc_mult`). This also shrinks the latent cache back to `max_seq_len + block`
+(the `×hc_mult` sizing was a consequence of the lane-split).
 
 ## Rule
 
