@@ -31,24 +31,33 @@ prep used (`rope_theta`, `original_seq_len=0`, YaRN `factor`/`beta_*`; cr==0, no
 YaRN). Threaded `block_abs` + rope params through the FFI signature
 (`ffi/attention.rs`) and the call site (`dspark.rs`).
 
-### Result (GPUs 3-6, TP=4, `--dspark-conf-threshold 0`, Roman-Empire prompt)
+### Result (GPUs 3-6, TP=4, `--dspark-conf-threshold 0`)
 
-`spec_decode`: **accepted 16, drafted 260, accept_rate 0.0615** (was 0/300/0.0).
-Drafts now vary per anchor and sometimes match the target's leading tokens.
+- On the Roman-Empire prompt: accepted 16 / drafted 260 (0.0615) vs 0/300 pre-fix.
+  **But that prompt's greedy generation LOOPED** (target repeats 19738/26964/10395)
+  — §0.1: a looping decode is not a valid test case. The "gain" was the Markov
+  head coincidentally hitting the repeated target tokens.
+- **On STABLE targets (raw `/v1/completions`: "The capital of France is"→" Paris.",
+  "Water is made of hydrogen and"→" oxygen atoms."): accepted 0 / drafted 170 —
+  accept ≈ 0.** The inverse-RoPE fix is correct (a real MLA geometry bug, mirrors
+  the validated main path) but its benefit is MASKED by a dominant second bug.
 
-## Open — root cause #2: the forward still copy-degenerates
+## Open — root cause #2 (dominant): block_hidden is a CONSTANT
 
-`base_argmax` (pure forward, pre-Markov) still does NOT track the target — it
-collapses to the ANCHOR token (`19738 → [19738×5]`) or a residual attractor
-(112434). block_hidden decodes back to the INPUT token, not the next token: the
-input-embedding HC residual dominates and the attention/context contribution is
-too weak. The 6.15% accepts ride on the Markov head, not the forward. Next: audit
-the context-fusion (`main_proj` hc_mult tap mapping, audit suspect #2) and the
-attention→HC-residual weighting; confirm vs the DeepSeek reference whether
-base_logits are meant to come from block_hidden at all. NOTE: this probe's
-generation LOOPED (target repeats 19738/26964/10395) — re-measure on a
-non-degenerate decode before trusting the 6.15% magnitude (§0.1: a looping decode
-is not a valid test case).
+`base_argmax` (pure forward, pre-Markov) on stable targets is pegged at token
+**24132 for nearly every anchor AND every block position** (`[24132×5]`),
+independent of the input — even at position 0, whose input is the varying anchor
+embedding. So the draft forward outputs a **constant block_hidden** carrying zero
+information; the tied head always emits 24132. All apparent accepts ride on the
+Markov bigram, never the forward.
+
+The exit head STRUCTURE is verified correct (mirrors the main model's
+`head_normed_rows` @ `dsv4.rs:2944`: `mtp.2.norm(mtp.2.hc_head(stream))` vs
+`self.norm(self.head_hc(stream))`), so the constant enters EARLIER. Next step is a
+numerical bisect — dump the stream L2/variance after embed → stage0 → stage1 →
+stage2 → exit-head — to find where it collapses to constant, then fix that stage's
+DSv4-only substitution (`main_proj` context fuse / stage attn-MoE-HC / a mis-loaded
+`mtp.*` weight). NOT the window, NOT geometry.
 
 ## Rule
 
