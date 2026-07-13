@@ -1282,7 +1282,9 @@ impl Dsv4CudaExecutor {
         )?;
         let verify_pos = start_pos + 1;
 
-        // Draft the block, then build the proposal (tied-head logits → Markov
+        // Append the anchor-forward token's context to the window (its taps were
+        // captured at `start_pos` by the forward above), then draft the block over
+        // the accumulated window and build the proposal (tied-head logits → Markov
         // semi-AR sampling → confidence truncation). Split-borrow: model, slot
         // taps, and the draft + this slot's caches are disjoint fields.
         let mut proposal = {
@@ -1301,12 +1303,18 @@ impl Dsv4CudaExecutor {
                 .as_mut()
                 .expect("dspark_decode_tokens without dspark");
             let rt = &mut ds_slots[slot_idx];
+            model.dspark_append_window(
+                draft,
+                &mut rt.df,
+                slots[slot_idx].dspark_taps(),
+                1,
+                start_pos,
+            )?;
             let block_hidden = model.dspark_forward_block(
                 draft,
                 &mut rt.df,
                 &mut rt.scratch,
                 &mut rt.attn_states,
-                slots[slot_idx].dspark_taps(),
                 anchor,
                 verify_pos,
             )?;
@@ -1414,6 +1422,30 @@ impl Dsv4CudaExecutor {
             accepted,
             draft_len,
         )?;
+
+        // Extend the draft window with the accepted committed rows (anchor +
+        // `accepted` drafts, at absolute `verify_pos..`) — their taps were captured
+        // multi-row by the verify forward. The bonus (row `accepted+1`) is NOT
+        // appended here; it becomes the next step's anchor-forward token and is
+        // appended by that step's leading `dspark_append_window(.., 1, ..)`.
+        {
+            let Self {
+                model,
+                slots,
+                dspark,
+                ..
+            } = self;
+            let ds = dspark
+                .as_mut()
+                .expect("dspark_decode_tokens without dspark");
+            model.dspark_append_window(
+                &ds.draft,
+                &mut ds.slots[slot_idx].df,
+                slots[slot_idx].dspark_taps(),
+                accepted + 1,
+                verify_pos,
+            )?;
+        }
 
         self.mtp_accepts += accepted;
         self.mtp_rejects += draft_len - accepted;
@@ -1788,14 +1820,27 @@ impl Dsv4CudaExecutor {
             position,
             final_prefill,
         )?;
-        // Rebase the DSpark draft cache to the prompt frontier once prefill
-        // completes: prefill never appends prompt rows to `df`, so without this
-        // the first `dspark_forward_block` would RoPE from position 0 (the
-        // `start_pos == 0` reset) instead of the prompt length. Mirrors the
-        // restored-prefix path rebasing to `finish_len`; the final chunk of a
-        // tail prefill after restore lands here too, so the two paths converge.
-        if final_prefill {
-            self.reset_dspark_slot(row.slot, row.start_pos + row.tokens.len());
+        // Seed the DSpark draft window with THIS prefill chunk's committed tokens
+        // (one context entry per prompt token, RoPE'd at its absolute position) —
+        // their taps were captured multi-row by the forward. Gap-free across chunks
+        // via the window's abs-position contiguity; a restored prefix / reused slot
+        // (`start_pos > 0`, no reset above) rebases inside `dspark_append_window`.
+        // Greedy-only (dspark decode is greedy); no-op off the DSpark path.
+        if self.dspark.is_some() && row.params.is_greedy() {
+            let Self {
+                model,
+                slots,
+                dspark,
+                ..
+            } = self;
+            let ds = dspark.as_mut().expect("checked is_some");
+            model.dspark_append_window(
+                &ds.draft,
+                &mut ds.slots[row.slot].df,
+                slots[row.slot].dspark_taps(),
+                row.tokens.len(),
+                row.start_pos,
+            )?;
         }
         let slot = row.slot;
         // Prefix-state publish hook: this chunk completed pages

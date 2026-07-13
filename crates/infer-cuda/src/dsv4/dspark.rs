@@ -20,19 +20,29 @@ use super::*;
 use deepseek_spec::DeepSeekV4RopeParameters;
 
 /// Per-slot draft context cache. Per stage, ONE `latent_kv` buffer (K==V) laid
-/// out `[position][head_dim]`, LINEAR from `ctx_base` (`row = abs − ctx_base`).
-/// Sized `context_capacity + block_size` (accepted context + one speculative
-/// noise block). Noise rows self-heal: rejected rows are overwritten by the next
-/// block's context/noise writes before any read.
+/// out `[row][head_dim]`, LINEAR from `ctx_base` (`row = ctx_end − ctx_base`).
+/// The BUFFER OFFSET (`ctx_end`, a row cursor) and the RoPE POSITION (`abs_end`,
+/// an absolute trunk position) are DECOUPLED: each committed token contributes
+/// `hc_mult` rows (the HC-mapping) written contiguously at `ctx_end`, but all
+/// `hc_mult` rows are RoPE'd at that token's single absolute position. So the
+/// buffer packs `committed_tokens * hc_mult` rows in commit order (non-causal
+/// softmax is order-independent — only the RoPE positions matter), sized
+/// `context_capacity * hc_mult + block_size` (full committed window + one
+/// speculative noise block). Noise rows self-heal: rejected rows are overwritten
+/// by the next append before any read.
 #[allow(dead_code)]
 pub(crate) struct Dsv4DsparkSlotState {
     /// One compressed KV latent buffer per stage (`[cap * head_dim]` bf16).
     latent_kv: Vec<DeviceVec>,
-    /// Absolute trunk position of `latent_kv` row 0.
+    /// Row-cursor base of `latent_kv` (always 0 after `rebase`; kept for the
+    /// `row − ctx_base` idiom the append/draft kernels share).
     ctx_base: usize,
-    /// Absolute end (exclusive) of materialized context rows; the buffer holds
-    /// `ctx_end - ctx_base` context rows before the noise block is appended.
+    /// Row-cursor end (exclusive) of materialized context rows; the buffer holds
+    /// `ctx_end − ctx_base` context rows before the noise block is appended.
     ctx_end: usize,
+    /// Absolute trunk position of the NEXT committed token to append — the
+    /// contiguity anchor for the per-committed-token window (gap ⇒ rebase).
+    abs_end: usize,
     /// Last emitted token (the next block's anchor), staged by prefill/verify.
     pending: Option<u32>,
 }
@@ -40,7 +50,7 @@ pub(crate) struct Dsv4DsparkSlotState {
 #[allow(dead_code)]
 impl Dsv4DsparkSlotState {
     /// Allocate one latent cache per stage. `context_capacity` = per-request
-    /// context ceiling (accepted tokens the draft ever caches); `block_size` =
+    /// context ceiling in TOKENS (each caches `hc_mult` rows); `block_size` =
     /// speculative noise block. Call only under `config.is_dspark()`.
     pub(crate) fn new(
         ctx: &DeviceContext,
@@ -49,7 +59,10 @@ impl Dsv4DsparkSlotState {
         context_capacity: usize,
         block_size: usize,
     ) -> Result<Self> {
-        let cap = context_capacity + block_size;
+        // Each committed token maps to `hc_mult` latent rows (HC-mapping), so the
+        // full committed window needs `context_capacity * hc_mult` rows plus the
+        // block noise. Must track `dspark_latent_reserve_rows` in the VRAM ledger.
+        let cap = context_capacity * config.hc_mult + block_size;
         let latent_kv = (0..num_stages)
             .map(|_| DeviceVec::zeros(ctx, cap * config.head_dim))
             .collect::<Result<Vec<_>>>()?;
@@ -57,6 +70,7 @@ impl Dsv4DsparkSlotState {
             latent_kv,
             ctx_base: 0,
             ctx_end: 0,
+            abs_end: 0,
             pending: None,
         })
     }
@@ -65,11 +79,13 @@ impl Dsv4DsparkSlotState {
         self.rebase(0);
     }
 
-    /// Re-key the (empty) latent buffer so row 0 is absolute position `pos`. No
-    /// zeroing: stale rows are overwritten by post-rebase appends before any read.
+    /// Re-key the (empty) latent buffer: reset the row cursor to 0 and set the
+    /// window's next absolute position to `pos`. No zeroing — stale rows are
+    /// overwritten by post-rebase appends before any read.
     pub(crate) fn rebase(&mut self, pos: usize) {
-        self.ctx_base = pos;
-        self.ctx_end = pos;
+        self.ctx_base = 0;
+        self.ctx_end = 0;
+        self.abs_end = pos;
         self.pending = None;
     }
 }
@@ -116,16 +132,14 @@ impl HsSlot {
 }
 
 impl Dsv4Model {
-    /// One DSpark stage's dual-stream forward. Appends the fused `context` rows
-    /// and the noise `block` to the stage's `latent_kv`, runs dense non-causal
-    /// MLA-latent attention over the whole `[context ++ block]` range, and returns
-    /// the stage's HC output stream `[stream_dim, block]` (after MoE + HC), ready
-    /// to feed the next stage.
+    /// One DSpark stage's dual-stream forward. The committed-token context is
+    /// ALREADY resident in the stage's `latent_kv` (seeded per committed token by
+    /// [`Dsv4Model::dspark_append_window`]); this only appends the speculative
+    /// noise `block`, runs dense non-causal MLA-latent attention over the whole
+    /// `[window ++ block]` range, and returns the stage's HC output stream
+    /// `[stream_dim, block]` (after MoE + HC), ready to feed the next stage.
     ///
-    /// `stream_in` = the noise block's HC stream `[stream_dim, block]`. `context`
-    /// = fused feature rows `[hidden, ctx_rows]` written to the draft-local buffer
-    /// at `df.ctx_end..` but RoPE'd at the committed token's ABSOLUTE position
-    /// `block_abs - 1` (all `hc_mult` rows share it — the HC-mapping choice).
+    /// `stream_in` = the noise block's HC stream `[stream_dim, block]`.
     /// `block_tokens` = anchor+draft ids (MoE hash routing; unused for the draft's
     /// `LearnedBias` layers). `block_abs` = the block's absolute trunk position
     /// (noise block Q/K RoPE at `block_abs + [0..block)`). Attention math lives in
@@ -140,7 +154,6 @@ impl Dsv4Model {
         scratch: &mut Dsv4DsparkScratch,
         attn_state: &mut crate::attention::Dsv4LayerAttentionState,
         stream_in: &HiddenStates,
-        context: &HiddenStates,
         block_tokens: &[u32],
         block_abs: usize,
     ) -> Result<HiddenStates> {
@@ -161,16 +174,10 @@ impl Dsv4Model {
         let layer = &stage.layer;
         let attention = &layer.attention;
         let block = stream_in.seq_len;
-        let ctx_rows = context.seq_len;
         ensure!(
             stream_in.hidden_dim == stream_dim,
             "DSpark stage stream dim {} != {stream_dim}",
             stream_in.hidden_dim
-        );
-        ensure!(
-            context.hidden_dim == hidden_size,
-            "DSpark context dim {} != hidden {hidden_size}",
-            context.hidden_dim
         );
         ensure!(
             block_tokens.len() == block,
@@ -187,8 +194,10 @@ impl Dsv4Model {
         // Draft layer is compress_ratio == 0 (pure attention, no CSA/HCA), so RoPE
         // is plain rope_theta with no YaRN (matches mla_attention's cr==0 branch).
         let rope = &config.rope_parameters;
-        let ctx_start = df.ctx_end;
-        let block_start = ctx_start + ctx_rows;
+        // The committed-token window already occupies rows `[ctx_base, ctx_end)`
+        // (seeded by `dspark_append_window`); the noise block writes speculatively
+        // right after it and self-heals (overwritten by the next window append).
+        let block_start = df.ctx_end;
         let cap = df.latent_kv[stage_idx].len / head_dim;
         ensure!(
             (block_start + block) - df.ctx_base <= cap,
@@ -197,34 +206,6 @@ impl Dsv4Model {
         );
 
         let mut keepalive = Dsv4ForwardKeepalive::new(false);
-
-        // Append fused context latent: draft-local buffer offset `ctx_start`, but
-        // RoPE all rows at the committed token's ABSOLUTE position `block_abs - 1`
-        // (the anchor-forward token sits one position before the block). block_abs
-        // = verify_pos >= 1, so the subtraction never underflows.
-        let ctx_abs = block_abs.saturating_sub(1);
-        if ctx_rows > 0 {
-            self.dspark_append_latent(
-                df,
-                stage_idx,
-                attention,
-                context,
-                ctx_start,
-                ctx_abs,
-                local_width,
-                local_heads,
-                head_dim,
-                rope_dim,
-                rope,
-                eps,
-                &mut keepalive,
-            )?;
-        }
-        // codex P1 ×2: do NOT advance the SHARED `df.ctx_end` here. `latent_kv` is
-        // per-stage, so a per-stage advance would push stage>0's ctx_start past its
-        // own still-unwritten rows (stale reads); advancing before the attention
-        // below also commits state on the error path. Caller advances to
-        // `block_start` ONCE, after all stages succeed.
 
         // ── Noise block. HC pre-norm the stream to the attention input.
         let attn_mhc = crate::hc::gen_mhc_params(ctx, config, &layer.hc_attn, stream_in)?;
@@ -426,30 +407,22 @@ impl Dsv4Model {
     }
 
     /// The 3-stage DSpark backbone (`mtp.0 → mtp.1 → mtp.2`). Builds the noise
-    /// block's HC stream + the fused `context` ONCE, chains every stage's
-    /// dual-stream forward ([`Dsv4Model::dspark_stage_forward`]), then advances the
-    /// shared `df.ctx_end` ONE time and folds the exit head. Returns `block_hidden`
-    /// `[hidden, block]` (base-embed logits are the next tranche).
+    /// block's HC stream ONCE, chains every stage's dual-stream forward
+    /// ([`Dsv4Model::dspark_stage_forward`]) over the ALREADY-resident committed
+    /// window, then folds the exit head. Returns `block_hidden` `[hidden, block]`
+    /// (base-embed logits are the next tranche).
+    ///
+    /// PURE-DRAFT: the committed-token context window (prompt prefix + every
+    /// accepted trunk token) is seeded into every stage's `latent_kv` by
+    /// [`Dsv4Model::dspark_append_window`] BEFORE this call, so the block attends
+    /// the full gap-free window — this method never touches `df.ctx_end` (the noise
+    /// block writes speculatively past it and self-heals on the next append).
     ///
     /// `attn_states` = one caller-provisioned [`Dsv4LayerAttentionState`] per stage
-    /// (no per-block alloc — spec steps are serial). `taps` = the 3 wide HC-stream
-    /// taps from `Dsv4SlotState::dspark_taps()` (trunk layers `[40,41,42]`);
-    /// `anchor` = the last accepted token (noise block position 0).
-    ///
-    /// `block_abs` = the block's ABSOLUTE trunk position (executor `verify_pos =
-    /// start_pos + 1`). RoPE runs in the absolute frame (decoupled from the
-    /// draft-local `latent_kv` write offset): the noise block Q/K at
-    /// `block_abs + [0..block)`, and this block's committed context token (`taps`
-    /// = the anchor-forward token, at absolute position `block_abs - 1`) at that
-    /// single absolute position — so the context→block relative offset the draft
-    /// attends is the true `1`, not the draft-local buffer stride.
-    ///
-    /// NOTE (partial window — see module blocker): only ONE committed token per
-    /// block (the anchor-forward `taps`) is appended here. Verify-accepted drafts
-    /// and the prompt prefix are absent — their trunk taps at `[40,41,42]` are not
-    /// captured (single-row `slot.dspark_taps`, `seq_len-1` only). The accumulated
-    /// window is therefore sparse until a multi-row tapped-verify/prefill path
-    /// lands (qwen35 `dspark_verify_logits`/`dspark_append_ctx` analog).
+    /// (no per-block alloc — spec steps are serial); `anchor` = the last accepted
+    /// token (noise block position 0). `block_abs` = the block's ABSOLUTE trunk
+    /// position (executor `verify_pos = start_pos + 1`): the noise block Q/K RoPE
+    /// at `block_abs + [0..block)`, decoupled from the draft-local write offset.
     #[allow(dead_code)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn dspark_forward_block(
@@ -458,7 +431,6 @@ impl Dsv4Model {
         df: &mut Dsv4DsparkSlotState,
         scratch: &mut Dsv4DsparkScratch,
         attn_states: &mut [crate::attention::Dsv4LayerAttentionState],
-        taps: &[DeviceVec],
         anchor: u32,
         block_abs: usize,
     ) -> Result<HiddenStates> {
@@ -494,67 +466,13 @@ impl Dsv4Model {
         let mut hidden_stream = unsafe { HiddenStates::uninit(ctx, stream_dim, block)? };
         crate::hc::initial_stream_from_embeddings(ctx, &emb, hidden, hc_mult, &mut hidden_stream)?;
 
-        // ── Context fuse (main_proj @ stage 0). POD-VERIFY tap layout: each tap is
-        // the WIDE HC stream `[hc_mult, hidden]` for ONE trunk position (row r at
-        // `r*hidden`). main_proj `[hidden, n_taps*hidden]` takes `n_taps*hidden` PER
-        // hc_mult row (NOT `n_taps*stream_dim`): per row concat the taps'
-        // hidden-slices → `[n_taps*hidden, hc_mult]`; main_proj → `[hidden,
-        // hc_mult]`; main_norm → context.
-        let stage0 = &draft.stages[0];
-        let main_proj = stage0
-            .main_proj
-            .as_ref()
-            .ok_or_else(|| anyhow!("DSpark stage 0 missing main_proj"))?;
-        let main_norm = stage0
-            .main_norm
-            .as_ref()
-            .ok_or_else(|| anyhow!("DSpark stage 0 missing main_norm"))?;
-        let n_taps = taps.len();
-        // POD-VERIFY preconditions — the tap stride/interleave and main_proj
-        // input width are not locally verifiable (attention kernel is stubbed).
-        ensure!(
-            main_proj.cols == n_taps * hidden,
-            "DSpark main_proj cols {} != n_taps {n_taps} * hidden {hidden}",
-            main_proj.cols
-        );
-        ensure!(
-            main_proj.rows == hidden,
-            "DSpark main_proj rows {} != hidden {hidden}",
-            main_proj.rows
-        );
-        for (t, tap) in taps.iter().enumerate() {
-            ensure!(
-                tap.len == hidden * hc_mult,
-                "DSpark tap {t} len {} != hidden {hidden} * hc_mult {hc_mult}",
-                tap.len
-            );
-        }
-        // SAFETY: uninit device scratch; every [row r, tap t] slice written below.
-        let mut fuse_in = unsafe { HiddenStates::uninit(ctx, n_taps * hidden, hc_mult)? };
-        for r in 0..hc_mult {
-            for (t, tap) in taps.iter().enumerate() {
-                let src = tap.data.slice(r * hidden..(r + 1) * hidden);
-                let base = r * n_taps * hidden + t * hidden;
-                let mut dst = fuse_in.data.slice_mut(base..base + hidden);
-                ctx.stream
-                    .memcpy_dtod(&src, &mut dst)
-                    .map_err(|e| anyhow!("DSpark tap concat D2D failed: {e}"))?;
-            }
-        }
-        // SAFETY: dsv4_linear writes the full [hidden, hc_mult] buffer.
-        let mut context_raw = unsafe { HiddenStates::uninit(ctx, hidden, hc_mult)? };
-        crate::attention::dsv4_linear(ctx, main_proj, &fuse_in, &mut context_raw)?;
-        let context = crate::attention::mla_rms_norm(ctx, &context_raw, main_norm, eps)?;
-
         // Draft MoE routing is LearnedBias, so these hash ids are unused — but the
         // stage forward's shape gate requires `block_tokens.len() == block`.
         let block_tokens: Vec<u32> = ids.iter().map(|&i| i as u32).collect();
 
-        // ── Chain the stages. `df.ctx_end` is the SHARED cursor; every stage
-        // appends `context` to its OWN `latent_kv` at the same `ctx_start` and must
-        // NOT advance it — the single advance happens AFTER all stages succeed.
-        let ctx_start = df.ctx_end;
-        let block_start = ctx_start + context.seq_len;
+        // ── Chain the stages over the already-resident committed window (seeded by
+        // `dspark_append_window`). No context append and no `df.ctx_end` advance
+        // here — pure draft; the noise block self-heals past the window.
         for (stage_idx, attn_state) in attn_states.iter_mut().enumerate() {
             hidden_stream = self.dspark_stage_forward(
                 draft,
@@ -563,7 +481,6 @@ impl Dsv4Model {
                 scratch,
                 attn_state,
                 &hidden_stream,
-                &context,
                 &block_tokens,
                 block_abs,
             )?;
@@ -602,20 +519,165 @@ impl Dsv4Model {
                 .memcpy_dtod(&row_normed.data, &mut dst)
                 .map_err(|e| anyhow!("DSpark exit head row copy failed: {e}"))?;
         }
-        // Advance the shared context cursor ONCE, only after the whole block (all
-        // stages AND the exit head) succeeds — a mid-forward advance would commit
-        // persistent state on an error path (codex T4.2 P2).
-        df.ctx_end = block_start;
         Ok(block_hidden)
+    }
+
+    /// Seed the committed-token context WINDOW: append `n_rows` committed tokens'
+    /// context to EVERY stage's `latent_kv`, mirroring the shipped Qwen3.6 track's
+    /// `dspark_append_ctx`. `taps` = the per-stage-invariant wide HC-stream taps
+    /// (one `DeviceVec` per `dspark_target_layer_ids` layer, each holding the
+    /// forward's ALL rows: token `i` at `[i*stream_dim ..]`, sub-row `r` at
+    /// `+ r*hidden`), captured multi-row by the trunk forward. `start_abs` = the
+    /// absolute trunk position of token 0.
+    ///
+    /// Per committed token: concat its 3 taps → `main_proj` (@stage 0) + `main_norm`
+    /// → `hc_mult` context rows; per stage, `wkv → kv_norm → K-RoPE` those rows at
+    /// the token's SINGLE absolute position and append to that stage's `latent_kv`.
+    /// The buffer packs `n_rows * hc_mult` rows in commit order (RoPE positions
+    /// carry the true geometry); the draft block then attends the whole window
+    /// non-causally. Called after prefill (seed the prompt prefix), after the
+    /// anchor forward (the anchor-forward token), and after verify (every accepted
+    /// draft) — together a gap-free window of all committed tokens.
+    ///
+    /// POD-VERIFY: the tap stride/interleave + `main_proj` input width match the
+    /// single-token fuse the geometry-solved block used (`b350b0f90`); the batched
+    /// multi-row fold is not locally verifiable (attention kernel is stubbed).
+    #[allow(dead_code)]
+    pub(crate) fn dspark_append_window(
+        &self,
+        draft: &Dsv4DsparkDraft,
+        df: &mut Dsv4DsparkSlotState,
+        taps: &[DeviceVec],
+        n_rows: usize,
+        start_abs: usize,
+    ) -> Result<()> {
+        if n_rows == 0 {
+            return Ok(());
+        }
+        let ctx = &self.ctx;
+        let config = &self.config;
+        let eps = config.rms_norm_eps;
+        let hidden = config.hidden_size;
+        let hc_mult = config.hc_mult;
+        let stream_dim = hidden * hc_mult;
+        let head_dim = config.head_dim;
+        let rope_dim = config.qk_rope_head_dim;
+        let rope = &config.rope_parameters;
+
+        // Contiguity: the window is gap-free in ABSOLUTE positions. A mismatch is a
+        // restored-prefix / whole-slot-promote boundary — rebase and rebuild the
+        // suffix-only window from here (mirrors qwen35's prefill/warm rebase).
+        if df.abs_end != start_abs {
+            df.rebase(start_abs);
+        }
+
+        let stage0 = &draft.stages[0];
+        let main_proj = stage0
+            .main_proj
+            .as_ref()
+            .ok_or_else(|| anyhow!("DSpark stage 0 missing main_proj"))?;
+        let main_norm = stage0
+            .main_norm
+            .as_ref()
+            .ok_or_else(|| anyhow!("DSpark stage 0 missing main_norm"))?;
+        let n_taps = taps.len();
+        ensure!(
+            main_proj.cols == n_taps * hidden,
+            "DSpark main_proj cols {} != n_taps {n_taps} * hidden {hidden}",
+            main_proj.cols
+        );
+        ensure!(
+            main_proj.rows == hidden,
+            "DSpark main_proj rows {} != hidden {hidden}",
+            main_proj.rows
+        );
+        for (t, tap) in taps.iter().enumerate() {
+            ensure!(
+                tap.len >= n_rows * stream_dim,
+                "DSpark tap {t} len {} < n_rows {n_rows} * stream_dim {stream_dim}",
+                tap.len
+            );
+        }
+
+        // Fuse all `n_rows` tokens' taps → `[n_taps*hidden, n_rows*hc_mult]`: token
+        // `i`'s `hc_mult` sub-rows land at fold rows `[i*hc_mult ..]`, each a
+        // `n_taps*hidden` concat of the taps' hidden-slices for that (token, sub-row).
+        let cols = n_rows * hc_mult;
+        // SAFETY: uninit device scratch; every [row, tap] slice is written below.
+        let mut fuse_in = unsafe { HiddenStates::uninit(ctx, n_taps * hidden, cols)? };
+        for i in 0..n_rows {
+            for r in 0..hc_mult {
+                let fold_row = i * hc_mult + r;
+                for (t, tap) in taps.iter().enumerate() {
+                    let so = i * stream_dim + r * hidden;
+                    let src = tap.data.slice(so..so + hidden);
+                    let base = fold_row * n_taps * hidden + t * hidden;
+                    let mut dst = fuse_in.data.slice_mut(base..base + hidden);
+                    ctx.stream
+                        .memcpy_dtod(&src, &mut dst)
+                        .map_err(|e| anyhow!("DSpark window tap concat D2D failed: {e}"))?;
+                }
+            }
+        }
+        // SAFETY: dsv4_linear writes the full [hidden, cols] buffer.
+        let mut context_raw = unsafe { HiddenStates::uninit(ctx, hidden, cols)? };
+        crate::attention::dsv4_linear(ctx, main_proj, &fuse_in, &mut context_raw)?;
+        let context = crate::attention::mla_rms_norm(ctx, &context_raw, main_norm, eps)?;
+
+        // Each committed token's `hc_mult` context rows share its absolute position.
+        let positions: Vec<i32> = (0..n_rows)
+            .flat_map(|i| std::iter::repeat_n((start_abs + i) as i32, hc_mult))
+            .collect();
+
+        // Every stage appends the SAME context rows to its OWN `latent_kv` at the
+        // shared row cursor `ctx_start`; advance the cursor ONCE after all stages.
+        let ctx_start = df.ctx_end;
+        let cap = df.latent_kv[0].len / head_dim;
+        ensure!(
+            (ctx_start - df.ctx_base) + cols + config.dspark_block_size <= cap,
+            "DSpark window overflow: {} rows + block > cap {cap}",
+            (ctx_start - df.ctx_base) + cols
+        );
+        let mut keepalive = Dsv4ForwardKeepalive::new(false);
+        for (stage_idx, stage) in draft.stages.iter().enumerate() {
+            let attention = &stage.layer.attention;
+            let local_width = attention.wq_b.rows;
+            ensure!(
+                local_width.is_multiple_of(head_dim),
+                "DSpark local width {local_width} not a multiple of head_dim {head_dim}"
+            );
+            let local_heads = local_width / head_dim;
+            self.dspark_append_latent(
+                df,
+                stage_idx,
+                attention,
+                &context,
+                ctx_start,
+                &positions,
+                local_width,
+                local_heads,
+                head_dim,
+                rope_dim,
+                rope,
+                eps,
+                &mut keepalive,
+            )?;
+        }
+        df.ctx_end = ctx_start + cols;
+        df.abs_end = start_abs + n_rows;
+        std::hint::black_box(keepalive.len());
+        Ok(())
     }
 
     /// Compute the compressed latent for hidden-wide `feats` via
     /// `wkv → kv_norm → partial-RoPE`, writing it into the draft-local buffer
-    /// `latent_kv[start..start+rows]` (offset `(start - ctx_base) * head_dim`) but
-    /// RoPE'd at the SINGLE ABSOLUTE position `abs_pos` for every row (the
-    /// HC-mapping choice: one committed token's `hc_mult` entries all share its
-    /// absolute position). Context rows carry no query, so a discarded dummy q is
-    /// driven through the fused prep kernel (which requires q heads).
+    /// `latent_kv[start..start+rows]` (offset `(start - ctx_base) * head_dim`),
+    /// RoPE'd at the per-row ABSOLUTE `positions` (len == `feats.seq_len`). One
+    /// committed token's `hc_mult` entries all carry that token's single absolute
+    /// position (the HC-mapping choice), so a batched multi-token append passes
+    /// each token's position repeated `hc_mult` times. Context rows carry no
+    /// query, so a discarded dummy q is driven through the fused prep kernel
+    /// (which requires q heads).
     #[allow(clippy::too_many_arguments)]
     fn dspark_append_latent(
         &self,
@@ -624,7 +686,7 @@ impl Dsv4Model {
         attention: &Dsv4Attention,
         feats: &HiddenStates,
         start: usize,
-        abs_pos: usize,
+        positions: &[i32],
         local_width: usize,
         local_heads: usize,
         head_dim: usize,
@@ -635,6 +697,11 @@ impl Dsv4Model {
     ) -> Result<()> {
         let ctx = &self.ctx;
         let rows = feats.seq_len;
+        ensure!(
+            positions.len() == rows,
+            "DSpark append positions {} != feats rows {rows}",
+            positions.len()
+        );
         // SAFETY: dsv4_linear writes the full buffer.
         let mut kv_raw = unsafe { HiddenStates::uninit(ctx, head_dim, rows)? };
         crate::attention::dsv4_linear(ctx, &attention.wkv, feats, &mut kv_raw)?;
@@ -647,11 +714,9 @@ impl Dsv4Model {
         // zeros; the result is discarded anyway.
         let mut q_dummy = HiddenStates::zeros(ctx, local_width, rows)?;
         keepalive.keep_hidden(&q_dummy);
-        // All `hc_mult` context entries for this committed token share `abs_pos`.
-        let positions = vec![abs_pos as i32; rows];
         let pos_dev = ctx
             .stream
-            .clone_htod(&positions)
+            .clone_htod(positions)
             .map_err(|e| anyhow!("DSpark ctx positions H2D failed: {e}"))?;
         let latent_off = ((start - df.ctx_base) * head_dim) as u64 * 2;
         let (k_ptr, _gk) = kv_normed.data.device_ptr(&ctx.stream);
