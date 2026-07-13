@@ -191,8 +191,11 @@ unsafe extern "C" {
     /// Layout: `q` [block_size, local_heads, head_dim] token-major; `latent_kv`
     /// [kv_len, head_dim] kv-major (one head-shared latent, broadcast over
     /// `local_heads`); `out` [block_size, local_heads, head_dim] token-major.
-    /// `sm_scale` is the caller's `1/sqrt(head_dim)`. bf16 in/out. `nope_dim` /
-    /// `rope_dim` are unused by the kernel (Flag #1: full head_dim value).
+    /// `sm_scale` is the caller's `1/sqrt(head_dim)`. bf16 in/out. `nope_dim` is
+    /// unused (Flag #1: full head_dim value); the value's trailing `rope_dim`
+    /// dims are inverse-RoPE'd at `abs_pos = base_start_pos + token` (query
+    /// position) with `rope_base`/`original_seq_len`/YaRN `factor`/`beta_*` —
+    /// the same params the caller's forward q/latent RoPE used (cr==0, no YaRN).
     pub fn dsv4_dspark_draft_attention_cuda(
         q: *const Half,
         latent_kv: *const Half,
@@ -203,7 +206,13 @@ unsafe extern "C" {
         head_dim: i32,
         nope_dim: i32,
         rope_dim: i32,
+        base_start_pos: i32,
         sm_scale: f32,
+        rope_base: f32,
+        original_seq_len: i32,
+        factor: f32,
+        beta_fast: f32,
+        beta_slow: f32,
         stream: CUstream,
     ) -> CUresult;
 
