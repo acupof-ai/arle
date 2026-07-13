@@ -1269,10 +1269,9 @@ impl Dsv4CudaExecutor {
             )?;
             return Ok(vec![token]);
         }
-        // (a)/(b) Anchor forward: a normal decode step commits `last_token` and
-        // emits the block anchor (a real target greedy token). `is_dspark()` ⇒
-        // this runs eager and populates `slot.dspark_taps()` at the target layers
-        // — no separate arming flag (unlike Qwen3.6 DSpark's `armed`).
+        // Anchor forward: a normal eager decode step commits `last_token`, emits
+        // the block anchor (a real target greedy token), and — under `is_dspark()`
+        // — populates `slot.dspark_taps()` at the target layers (no arming flag).
         let anchor = self.model.forward_tokens(
             &mut self.slots[slot_idx],
             &mut self.kv_adapter,
@@ -1283,12 +1282,10 @@ impl Dsv4CudaExecutor {
         )?;
         let verify_pos = start_pos + 1;
 
-        // (c)/(d) Draft the block from the taps + anchor, then build the proposal
-        // (tied-head base logits → Markov semi-AR sampling → confidence
-        // truncation). Split-borrow: model (&), the slot taps (&), and the draft +
-        // this slot's draft caches (&mut, disjoint fields) are all disjoint.
-        let temperature = params.temperature;
-        let proposal = {
+        // Draft the block, then build the proposal (tied-head logits → Markov
+        // semi-AR sampling → confidence truncation). Split-borrow: model, slot
+        // taps, and the draft + this slot's caches are disjoint fields.
+        let mut proposal = {
             let Self {
                 model,
                 slots,
@@ -1304,24 +1301,22 @@ impl Dsv4CudaExecutor {
                 .as_mut()
                 .expect("dspark_decode_tokens without dspark");
             let rt = &mut ds_slots[slot_idx];
-            let taps = slots[slot_idx].dspark_taps();
             let block_hidden = model.dspark_forward_block(
                 draft,
                 &mut rt.df,
                 &mut rt.scratch,
                 &mut rt.attn_states,
-                taps,
+                slots[slot_idx].dspark_taps(),
                 anchor,
             )?;
             model.dspark_build_proposal(
                 draft,
                 &block_hidden,
                 anchor,
-                temperature,
+                params.temperature,
                 *conf_threshold,
             )?
         };
-        let mut proposal = proposal;
         ensure!(
             proposal.chain.len() == proposal.draft_len + 1 && proposal.chain[0] == anchor,
             "DSpark proposal chain {} != draft_len {} + 1 (anchor {anchor})",
@@ -1329,30 +1324,29 @@ impl Dsv4CudaExecutor {
             proposal.draft_len,
         );
 
-        // TP lockstep: the proposal (sampling + confidence truncation over the
-        // draft backbone's block_hidden) is rank-local and drifts across ranks by
-        // FP — a divergent draft_len feeds `forward_tokens_verify` a different
-        // token count per rank, mismatching the per-forward collective count and
-        // deadlocking the coordinator. Adopt rank 0's block so every rank verifies
-        // the same shape+tokens. (Greedy gate: the argmax accept ignores
-        // draft_logits; sampled-mode q reconciliation is a separate lever.)
+        // TP lockstep: the rank-local proposal (confidence-truncated draft_len)
+        // drifts by FP across ranks; a divergent length feeds verify a different
+        // token count per rank → per-forward collective-count mismatch → deadlock.
+        // Adopt rank 0's `[draft_len, chain..]` so every rank verifies one shape.
+        // (Greedy: argmax accept ignores draft_logits; sampled q is a later lever.)
         if self.model.tp.config().world_size > 1 {
             let block = self.model.config.dspark_block_size;
-            let mut payload = vec![0i32; 2 + block];
-            payload[0] = proposal.draft_len as i32;
-            for (i, &t) in proposal.chain.iter().enumerate() {
-                payload[1 + i] = t as i32;
-            }
+            let mut payload = Vec::with_capacity(2 + block);
+            payload.push(proposal.draft_len as i32);
+            payload.extend(proposal.chain.iter().map(|&t| t as i32));
+            payload.resize(2 + block, 0);
             let r0 = self
                 .model
                 .tp
                 .broadcast_rank0_i32(&self.model.ctx, &payload)?;
-            let r0_len = r0[0] as usize;
-            let r0_chain: Vec<u32> = r0[1..2 + r0_len].iter().map(|&v| v as u32).collect();
+            let r0_chain: Vec<u32> = r0[1..2 + r0[0] as usize]
+                .iter()
+                .map(|&v| v as u32)
+                .collect();
             if r0_chain != proposal.chain {
+                proposal.draft_len = r0[0] as usize;
                 proposal.chain = r0_chain;
-                proposal.draft_len = r0_len;
-                proposal.draft_logits = None; // for rank 0's (discarded) tokens
+                proposal.draft_logits = None; // rank 0's (discarded) tokens
             }
         }
         let draft_len = proposal.draft_len;
@@ -1367,9 +1361,8 @@ impl Dsv4CudaExecutor {
             draft_len,
         )?;
 
-        // (e) Verify the chain [anchor, d0..] as ONE contiguous commit forward at
-        // `verify_pos` (writes every row's KV; the rejected tail is truncated).
-        // Reuses the MTP verify substrate — no new verify path invented.
+        // Verify [anchor, d0..] as ONE contiguous commit forward at `verify_pos`
+        // (writes every row's KV; the rejected tail is truncated). MTP substrate.
         let verify = self.model.forward_tokens_verify(
             &mut self.slots[slot_idx],
             &mut self.kv_adapter,
@@ -1384,18 +1377,17 @@ impl Dsv4CudaExecutor {
             proposal.chain.len()
         );
 
-        // (f) Accept scan: `argmax[i]` is the target greedy token AFTER chain[i];
-        // accept draft chain[i+1] while it matches. Longest matching prefix.
+        // Accept scan: `argmax[i]` is the target greedy token AFTER chain[i];
+        // accept chain[i+1] while it matches. Longest matching prefix.
         let mut accepted = 0usize;
         while accepted < draft_len && verify.argmax[accepted] == proposal.chain[accepted + 1] {
             accepted += 1;
         }
         let mut bonus = verify.argmax[accepted];
 
-        // TP lockstep: accepted/bonus derive from `verify.argmax` (rank-local FP);
-        // adopt rank 0's so every rank truncates+commits an identical KV tail —
-        // the next tick's combined attention reads all ranks' KV shards, so an
-        // inconsistent commit corrupts it.
+        // TP lockstep: accepted/bonus are rank-local FP; adopt rank 0's so every
+        // rank commits an identical KV tail (next tick's combined attention reads
+        // all ranks' shards — an inconsistent commit corrupts it).
         if self.model.tp.config().world_size > 1 {
             let r0 = self
                 .model
