@@ -1,0 +1,21 @@
+crates/infer-cuda/src/dsv4/dspark.rs
+  s_5626676c8d1363::t_a49737a3cd3196 3-8,10-11,13-16,22-26,42-43,77-80,92-94,120-123,125-129,183-184,197,214-218,257,298-299,359,422-424,426-429,473-476,531,580-581,588-591,616-619,668-669,672-676,689,691-692,718-719,724-726,816-821
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "f2b26657f6dfbc1b5d3f92895b6305d8a113c20a",
+  "prompts": {},
+  "sessions": {
+    "s_5626676c8d1363": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a9857d3d8e54b4b73",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
