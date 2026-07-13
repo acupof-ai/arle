@@ -1,0 +1,23 @@
+crates/train/src/opd.rs
+  s_93bfcacd9c139a::t_d3b73db7452594 3041-3069,3076-3081,3135-3140,3154,3169-3170,3173-3175,3178-3196,3328-3335,3348-3366,3383,3388,3517-3522,3526-3544,3551-3553
+crates/train/tests/test_frozen_prompt_kv_writeback.rs
+  s_93bfcacd9c139a::t_f0129ce835abfc 18,20-23,438-490
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "4a178ff40025c695c88a2a420456e80d535ef19a",
+  "prompts": {},
+  "sessions": {
+    "s_93bfcacd9c139a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aee95475dc34090be",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
