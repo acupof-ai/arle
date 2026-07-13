@@ -1,0 +1,21 @@
+Dockerfile
+  s_c5b532ba176b27::t_36276073b8f724 32
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "d1ddd57f61ebe41b8a738d93a91239a2f28fd7ff",
+  "prompts": {},
+  "sessions": {
+    "s_c5b532ba176b27": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4db221a6-91f5-4cb0-aa41-0e30311ecba8",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
