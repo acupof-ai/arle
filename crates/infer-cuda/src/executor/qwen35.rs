@@ -293,6 +293,13 @@ impl Qwen35CudaExecutor {
             }
         };
         let key = crate::qwen35::hash_prefix_tokens(&tokens[..mat_len]);
+        if std::env::var_os("ARLE_KVDRIFT_DEBUG").is_some() {
+            eprintln!(
+                "[kvdrift] SAVE-SIDECAR slot={slot} mat_len={mat_len} key={key:#018x} \
+                 tokens_len={} boundary={boundary} matched_len_in={matched_len}",
+                tokens.len(),
+            );
+        }
         // snapshot_recurrent synchronizes the stream so pages are flushed before D2H.
         if let Some(pool) = self.full_attn_kv.as_ref() {
             // full-attn KV is position-indexed and append-only, so pages [0..mat_len)
