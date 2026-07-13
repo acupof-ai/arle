@@ -156,7 +156,7 @@ def main():
                     help="attempts per task; workdir re-booted per attempt")
     ap.add_argument("--windows-out", type=Path, default=None,
                     help="JSONL of `arle train cc-convert --windows` rows for "
-                         "PASSING attempts")
+                         "ALL attempts (each carries a binary reward)")
     ap.add_argument("--out", type=Path, default=Path("cc_baseline_results.jsonl"))
     args = ap.parse_args()
 
@@ -198,10 +198,13 @@ def main():
                 "cc_output_tokens": (cc.get("usage") or {}).get("output_tokens"),
             }
             results.append(row)
-            if passed:
-                windows.append({"label": f"{iid}#{sample}",
-                                "t_start_ms": t_start_ms,
-                                "t_end_ms": t_end_ms})
+            # Every attempt is a window (SAO needs failing trajectories too).
+            # reward is binary pass/fail; TODO graded reward (fraction of
+            # fail_to_pass passing) for a denser signal.
+            windows.append({"label": f"{iid}#{sample}",
+                            "t_start_ms": t_start_ms,
+                            "t_end_ms": t_end_ms,
+                            "reward": 1.0 if passed else 0.0})
             print(f"[cc-baseline] {iid}#{sample}: passed={passed} "
                   f"edited={edited} turns={row['cc_turns']} "
                   f"wall={row['wall_s']}s :: {note}", flush=True)
@@ -231,7 +234,7 @@ def main():
         with open(args.windows_out, "w") as f:
             for w in windows:
                 f.write(json.dumps(w) + "\n")
-        print(f"[cc-baseline] {len(windows)} passing window(s) -> "
+        print(f"[cc-baseline] {len(windows)} attempt window(s) -> "
               f"{args.windows_out}", flush=True)
     print(f"[cc-baseline] pass@1={p1}/{n} pass@any={p_any}/{n} "
           f"per-sample={per_sample} -> {args.out}", flush=True)

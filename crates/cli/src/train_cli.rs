@@ -134,6 +134,8 @@ fn run_cc_convert_impl(args: TrainCcConvertArgs) -> Result<()> {
             label: parts
                 .next()
                 .map_or_else(|| format!("w{idx}"), str::to_owned),
+            // Manual --window has no attempt reward → passing default (CE flow).
+            reward: 1.0,
         });
     }
 
@@ -2081,6 +2083,15 @@ struct ReplayRecord {
     prompt_ids: Vec<u32>,
     response_ids: Vec<u32>,
     response_mask: Vec<u8>,
+    /// Attempt reward for SAO advantage; pre-reward records (CE-only flow)
+    /// default to 1.0 = a passing trajectory, keeping rejection-CE unchanged.
+    #[serde(default = "replay_default_reward")]
+    reward: f32,
+}
+
+#[cfg(feature = "cuda")]
+fn replay_default_reward() -> f32 {
+    1.0
 }
 
 /// Agent-OPD replay mode: run the SAME masked-CE writeback the round loop
@@ -2099,6 +2110,7 @@ fn run_agent_opd_replay(
         opd::{gkd_writeback_step, masked_writeback_ce_step_dispatch},
         qwen35_checkpoint::load_qwen35_lora_adapters,
         qwen35_loader::load_qwen35_lora_from_hf_dir_with_shared_base,
+        update_strategy::{ScoredTrajectory, UpdateStrategy},
     };
 
     use crate::args::GkdTeacherArg;
@@ -2190,20 +2202,48 @@ fn run_agent_opd_replay(
     }
     log_opd_vram("replay: after student load", &train_backend);
 
+    // Default rejection-CE (incl. GKD) is byte-identical to before; sao-dis /
+    // sao-value dispatch to the same `UpdateStrategy::update` the online path uses.
+    let update_strategy = args
+        .update_strategy
+        .to_strategy(args.sao_eps_low, args.sao_eps_high);
     let epochs = args.replay_epochs.max(1);
     let per_epoch_cap = args.writeback_cap.unwrap_or(usize::MAX);
-    for epoch in 0..epochs {
-        let mut losses = Vec::new();
-        for record in records.iter().take(per_epoch_cap) {
-            let loss = if let Some(ema) = gkd_teacher.as_mut() {
-                // GKD: distil the teacher's per-position distribution on the same
-                // masked trajectory tokens (forward-KL), then (ema only) nudge the
-                // EMA teacher toward the just-updated student.
-                let step_loss = {
-                    let teacher = ema.as_teacher();
-                    gkd_writeback_step(
+    if matches!(update_strategy, UpdateStrategy::RejectionCe) {
+        for epoch in 0..epochs {
+            let mut losses = Vec::new();
+            for record in records.iter().take(per_epoch_cap) {
+                let loss = if let Some(ema) = gkd_teacher.as_mut() {
+                    // GKD: distil the teacher's per-position distribution on the same
+                    // masked trajectory tokens (forward-KL), then (ema only) nudge the
+                    // EMA teacher toward the just-updated student.
+                    let step_loss = {
+                        let teacher = ema.as_teacher();
+                        gkd_writeback_step(
+                            &student,
+                            &teacher,
+                            all_params.as_slice(),
+                            trainable.as_slice(),
+                            &mut optimizer,
+                            &record.prompt_ids,
+                            &record.response_ids,
+                            &record.response_mask,
+                            vocab,
+                            args.writeback_window,
+                            args.gkd_temperature,
+                            args.gkd_entropy_weight,
+                            &mut store,
+                        )
+                        .with_context(|| format!("replay GKD writeback ({:?})", record.label))?
+                    };
+                    if matches!(args.gkd_teacher, GkdTeacherArg::Ema) {
+                        ema.update(&student, &mut store, args.gkd_ema_alpha)
+                            .context("GKD EMA teacher update")?;
+                    }
+                    step_loss
+                } else {
+                    masked_writeback_ce_step_dispatch(
                         &student,
-                        &teacher,
                         all_params.as_slice(),
                         trainable.as_slice(),
                         &mut optimizer,
@@ -2212,39 +2252,108 @@ fn run_agent_opd_replay(
                         &record.response_mask,
                         vocab,
                         args.writeback_window,
-                        args.gkd_temperature,
-                        args.gkd_entropy_weight,
                         &mut store,
                     )
-                    .with_context(|| format!("replay GKD writeback ({:?})", record.label))?
+                    .with_context(|| format!("replay writeback ({:?})", record.label))?
                 };
-                if matches!(args.gkd_teacher, GkdTeacherArg::Ema) {
-                    ema.update(&student, &mut store, args.gkd_ema_alpha)
-                        .context("GKD EMA teacher update")?;
-                }
-                step_loss
-            } else {
-                masked_writeback_ce_step_dispatch(
-                    &student,
-                    all_params.as_slice(),
-                    trainable.as_slice(),
-                    &mut optimizer,
-                    &record.prompt_ids,
-                    &record.response_ids,
-                    &record.response_mask,
-                    vocab,
-                    args.writeback_window,
+                losses.push(loss);
+            }
+            let mean_loss = losses.iter().sum::<f32>() / losses.len() as f32;
+            eprintln!(
+                "[agent-opd] replay epoch={epoch} trained_pairs={} mean_loss={mean_loss:.4}",
+                losses.len()
+            );
+        }
+    } else {
+        // SAO: build the value critic (Phase 2 only) AFTER the `trainable` filter,
+        // so it rides `all_params` (kept, not stepped) but is never a LoRA target.
+        let mut value_critic = if args.update_strategy.needs_value_critic() {
+            Some(
+                train::opd::ValueCritic::new(
+                    student.config().hidden_size,
+                    args.value_lr,
+                    args.sao_gamma,
+                    args.sao_lambda,
                     &mut store,
                 )
-                .with_context(|| format!("replay writeback ({:?})", record.label))?
-            };
-            losses.push(loss);
+                .map_err(anyhow::Error::from)?,
+            )
+        } else {
+            None
+        };
+        // Group by task = the label prefix before '#' (`iid`). SAO advantage is
+        // group-scoped (reward − group-mean); a singleton group centers to 0 → no
+        // update, which is correct. First-seen order preserved.
+        let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
+        for (idx, record) in records.iter().enumerate() {
+            let key = record
+                .label
+                .as_deref()
+                .unwrap_or("")
+                .split('#')
+                .next()
+                .unwrap_or("")
+                .to_owned();
+            match groups.iter_mut().find(|(k, _)| *k == key) {
+                Some((_, idxs)) => idxs.push(idx),
+                None => groups.push((key, vec![idx])),
+            }
         }
-        let mean_loss = losses.iter().sum::<f32>() / losses.len() as f32;
         eprintln!(
-            "[agent-opd] replay epoch={epoch} trained_pairs={} mean_loss={mean_loss:.4}",
-            losses.len()
+            "[agent-opd] replay SAO mode: strategy={update_strategy:?} groups={} record(s)={}",
+            groups.len(),
+            records.len()
         );
+        for epoch in 0..epochs {
+            let mut losses = Vec::new();
+            for (_key, idxs) in &groups {
+                // One SAO batch per task group. The autograd student holds the
+                // current adapter = the rollout policy, so capturing π_rollout here
+                // (θ unchanged until `update`) matches the online path.
+                let mut batch: Vec<ScoredTrajectory> = Vec::with_capacity(idxs.len());
+                for &idx in idxs {
+                    let record = &records[idx];
+                    let rollout_logprobs = train::opd::capture_rollout_logprobs(
+                        &student,
+                        &record.prompt_ids,
+                        &record.response_ids,
+                        &record.response_mask,
+                        &mut store,
+                    )
+                    .map_err(anyhow::Error::from)?;
+                    batch.push(ScoredTrajectory {
+                        prompt_ids: record.prompt_ids.clone(),
+                        response_ids: record.response_ids.clone(),
+                        response_mask: record.response_mask.clone(),
+                        reward: record.reward,
+                        rollout_logprobs: Some(rollout_logprobs),
+                    });
+                }
+                let loss = update_strategy
+                    .update(
+                        &batch,
+                        &student,
+                        all_params.as_slice(),
+                        trainable.as_slice(),
+                        &mut optimizer,
+                        value_critic.as_mut(),
+                        vocab,
+                        args.writeback_window,
+                        &mut store,
+                    )
+                    .map_err(anyhow::Error::from)?;
+                losses.push(loss);
+            }
+            let mean_loss = if losses.is_empty() {
+                0.0
+            } else {
+                losses.iter().sum::<f32>() / losses.len() as f32
+            };
+            eprintln!(
+                "[agent-opd] replay SAO epoch={epoch} groups={} mean_loss={mean_loss:.4}",
+                losses.len()
+            );
+        }
     }
     log_opd_vram("replay: after writeback", &train_backend);
 
