@@ -1,0 +1,23 @@
+docs/experience/wins/2026-07-13-cc-harness-loop-and-prefix-reuse-validated.md
+  s_9c91b86ec3fb55::t_11b2dfbda22682 1-63
+docs/plans/2026-07-13-cc-as-harness-online-opd.md
+  s_9c91b86ec3fb55::t_e248b2669cc31d 3,77-81,83-90,93-94
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "cd13dc2ae6a93c4a44f0350e224d58b27cb41a63",
+  "prompts": {},
+  "sessions": {
+    "s_9c91b86ec3fb55": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4779911a-69b7-49db-bc83-daf5a48d6ca3",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
