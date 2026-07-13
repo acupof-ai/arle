@@ -317,14 +317,6 @@ impl Dsv4Model {
                     head_dim as i32,
                     nope_dim as i32,
                     rope_dim as i32,
-                    // abs_pos = block_start + token; same RoPE params as the q/latent
-                    // prepare above → post-attention inverse-RoPE de-rotates the output.
-                    block_start as i32,
-                    config.rope_theta,
-                    0,
-                    rope.factor,
-                    rope.beta_fast,
-                    rope.beta_slow,
                     sm_scale,
                     ctx.stream.cu_stream(),
                 )
