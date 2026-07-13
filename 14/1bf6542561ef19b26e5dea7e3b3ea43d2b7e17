@@ -1,0 +1,21 @@
+scripts/cc_opd_loop.sh
+  s_9c91b86ec3fb55::t_09cdb25984535c 1-69
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "141bf6542561ef19b26e5dea7e3b3ea43d2b7e17",
+  "prompts": {},
+  "sessions": {
+    "s_9c91b86ec3fb55": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4779911a-69b7-49db-bc83-daf5a48d6ca3",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
