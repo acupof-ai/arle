@@ -59,13 +59,28 @@ renderer matches the checkpoint's Jinja `chat_template` (Qwen: yes today; tool-c
 re-rendered assistant tokens round-trip against the serve-emitted tokens on a
 sample before trusting the mask at scale.
 
+## Chaining gap (verified, not assumed)
+
+`--lora-adapters` is **defined but never read** in the agent-opd path (`grep
+'\.lora_adapters' train_cli.rs` = ∅); the loader inits fresh zero-B LoRA
+(`LoadMode::LoraStudent`), and there is **no adapter-load function** (only
+`save_lora_adapters`, no import twin). So a round cannot resume from the prior
+round's adapter → the bash loop can't chain. Serve *does* load adapters
+(`serve --lora-adapters`, proven by `cc_run.sh`); replay *does* save them
+(`save_agent_opd_adapters`). Only the **resume-load** is missing.
+
 ## Tranches
 
-1. **KV correctness gate** — cc-pattern multi-turn prefix test (growing history +
-   tool-result + big system prompt) in `infer-core`; confirm per-round-restart =
-   fresh cache. *(user priority: "kv cache 也得测试好")*
-2. **Online loop orchestrator** — `scripts/cc_opd_loop.sh`: per-round serve-restart
-   → cc → convert → train-one-round → chain adapter → periodic held-out eval.
+1. **KV correctness gate** ✓ — cc-shape multi-page prefix re-match test
+   (`agentic_reprefill_cc_large_prompt_shape`, `70e3f5137`); per-round restart =
+   fresh cache for #92. *(user priority: "kv cache 也得测试好")*
+2. **Adapter resume-load** — add `load_lora_adapters` (import twin of
+   `save_lora_adapters`, keyed by `adapter_name_map`) + wire `--lora-adapters`
+   into the agent-opd train + eval load paths. Unblocks chaining.
+3. **Online loop orchestrator** — `scripts/cc_opd_loop.sh` (drafted): per-round
+   serve-restart → cc → convert → train-one-round (`--replay-records`) → chain
+   adapter → periodic held-out eval. Viable once (2) lands. **CE-only** (replay
+   ignores `--update-strategy`).
 3. **SAO-on-cc (follow-up)** — collect *failing* windows + carry reward through
    `cc-convert`; make `run_agent_opd_replay` honor `--update-strategy`. (cc-harness
    + SAO Phase 1/2 together.)
