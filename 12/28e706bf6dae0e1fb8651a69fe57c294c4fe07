@@ -1,0 +1,21 @@
+docs/experience/wins/2026-07-13-dspark-dsv4-geometry-solved-absolute-rope.md
+  s_3d949abe53b900::t_b2e2793ef33518 1-72
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "1228e706bf6dae0e1fb8651a69fe57c294c4fe07",
+  "prompts": {},
+  "sessions": {
+    "s_3d949abe53b900": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "92f2c43c-22c8-4f1d-8b27-d06d6f3c59ad",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
