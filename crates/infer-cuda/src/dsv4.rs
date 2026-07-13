@@ -2268,18 +2268,31 @@ impl Dsv4Model {
         //    under-counts these per-slot caches (→ OOM at large slots / max_seq_len).
         if self.config.is_dspark() {
             let head_dim = self.config.head_dim;
+            let hc_mult = self.config.hc_mult;
+            let block_size = self.config.dspark_block_size;
             let num_stages = self.config.dspark_num_stages();
-            let draft_span = max_seq_len + self.config.dspark_block_size;
+            // Attention state span = accepted tokens + noise block (the stage's
+            // bookkeeping pool handle). latent_kv holds the per-committed-token
+            // WINDOW: `hc_mult` rows per token (HC-mapping) + one noise block.
+            let draft_span = max_seq_len + block_size;
+            let latent_span = max_seq_len
+                .saturating_mul(hc_mult)
+                .saturating_add(block_size);
+            // T3 taps: one wide-stream buffer per target layer, grown to the
+            // per-forward row count. Steady-state decode peaks at the verify chain
+            // (`block_size + 1` rows); prefill chunks transiently exceed this before
+            // decode occupies the slot (POD-VERIFY the chunk cap vs this reserve).
             total = total.saturating_add(
                 self.config
                     .dspark_target_layer_ids
                     .len()
                     .saturating_mul(stream_dim)
+                    .saturating_mul(block_size + 1)
                     .saturating_mul(bf16),
             );
             total = total.saturating_add(
                 num_stages
-                    .saturating_mul(draft_span)
+                    .saturating_mul(latent_span)
                     .saturating_mul(head_dim)
                     .saturating_mul(bf16),
             );
@@ -5350,6 +5363,38 @@ impl Dsv4Model {
         Ok(())
     }
 
+    /// DSpark window tap: D2D-copy the WHOLE `[stream_dim, seq_len]` wide stream
+    /// into `out` (token `i` at `[i*stream_dim ..]`), growing `out` on a longer
+    /// forward. Feeds the multi-row `dspark_append_window` (prompt-prefix seed +
+    /// per-accepted-token window). Graph-safe (no host readback); gated by the
+    /// caller's `dspark` flag so the default path is byte-identical.
+    fn capture_dspark_taps_all(
+        &self,
+        stream: &HiddenStates,
+        seq_len: usize,
+        out: &mut DeviceVec,
+        keepalive: &mut Dsv4ForwardKeepalive,
+    ) -> Result<()> {
+        let stream_dim = self.config.hidden_size * self.config.hc_mult;
+        ensure!(
+            stream.hidden_dim == stream_dim && stream.seq_len >= seq_len,
+            "DSpark tap source stream [{}, {}] vs [{stream_dim}, {seq_len}]",
+            stream.hidden_dim,
+            stream.seq_len
+        );
+        let need = stream_dim * seq_len;
+        if out.len < need {
+            *out = DeviceVec::zeros(&self.ctx, need)?;
+        }
+        let src = stream.data.slice(0..need);
+        self.ctx
+            .stream
+            .memcpy_dtod(&src, &mut out.data.slice_mut(0..need))
+            .map_err(|e| anyhow!("DSpark tap capture failed: {e}"))?;
+        keepalive.keep_vec(out);
+        Ok(())
+    }
+
     fn forward_stream_last_token(
         &self,
         stream: &HiddenStates,
@@ -6344,8 +6389,10 @@ impl Dsv4Model {
             keepalive.keep_hidden(&ffn_stream);
             stream = ffn_stream;
             // DSpark T3: capture the wide HC stream at this layer's OUTPUT
-            // (hidden_states[layer_idx+1]) for the row being predicted, when this
-            // layer is a DSpark target. D2D copy only (graph-safe, no readback);
+            // (hidden_states[layer_idx+1]) for ALL rows, when this layer is a
+            // DSpark target — one context entry per committed token (prompt-prefix
+            // seed at prefill, every accepted token at verify), consumed by
+            // `dspark_append_window`. D2D copy only (graph-safe, no readback);
             // gated by `dspark` so the default path is byte-identical.
             if dspark
                 && let Some(tap_idx) = self
@@ -6354,9 +6401,9 @@ impl Dsv4Model {
                     .iter()
                     .position(|&l| l == layer_idx)
             {
-                self.capture_mtp_stream_hidden(
+                self.capture_dspark_taps_all(
                     &stream,
-                    seq_len - 1,
+                    seq_len,
                     &mut slot.dspark_taps[tap_idx],
                     &mut keepalive,
                 )?;
