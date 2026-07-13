@@ -1,0 +1,29 @@
+crates/cli/src/train_cli.rs
+  s_6431c6e022cd74::t_06e8aefd17d3de 137-138,2086-2094,2113,2205-2209,2212-2245,2257,2259-2276,2279-2300,2303-2305,2307-2356
+crates/train/src/cc_convert.rs
+  s_6431c6e022cd74::t_5cfad088262a03 33-40,50-53,80,98,171,224
+scripts/cc_opd_loop.sh
+  s_6431c6e022cd74::t_aced756d0c4d94 21-23,43-44,49,53-58,63-64
+scripts/cc_run.sh
+  s_6431c6e022cd74::t_3ae4f8d26a03be 14,47,55
+scripts/cc_swe_baseline.py
+  s_6431c6e022cd74::t_7b36241305f538 159,201-207,237
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "d146f2fb63b9ef26f275295442e321b6e2e90dc0",
+  "prompts": {},
+  "sessions": {
+    "s_6431c6e022cd74": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a70158d6dad9facb5",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
