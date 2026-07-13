@@ -1,0 +1,25 @@
+crates/infer-cuda/src/executor.rs
+  s_9a4cd4dfbe58e5::t_78e1ba231386c5 42-55,527-535
+crates/infer-cuda/src/lib.rs
+  s_9a4cd4dfbe58e5::t_69eff4db8faf06 795-796
+crates/infer-seam/src/lib.rs
+  s_9a4cd4dfbe58e5::t_bec77910b09308 423-441,449,452
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "312d22c8ccb952571536d535947e57733df80d3e",
+  "prompts": {},
+  "sessions": {
+    "s_9a4cd4dfbe58e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a53bd516bcb32d5cf",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
