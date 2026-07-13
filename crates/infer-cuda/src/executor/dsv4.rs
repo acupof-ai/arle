@@ -607,11 +607,16 @@ impl Dsv4CudaExecutor {
         let draft_span = max_seq_len + block_size;
         let slots = (0..num_slots)
             .map(|slot_idx| -> Result<_> {
+                // Each committed context token caches `hc_mult` latent rows (the
+                // fused-tap HC lanes), so the full-prompt draft context needs
+                // `max_seq_len * hc_mult` rows — NOT `max_seq_len` (would overflow
+                // the latent cap once the prompt prefix is seeded).
+                let context_capacity = max_seq_len * model.config.hc_mult;
                 let df = crate::dsv4::dspark::Dsv4DsparkSlotState::new(
                     &model.ctx,
                     &model.config,
                     num_stages,
-                    max_seq_len,
+                    context_capacity,
                     block_size,
                 )?;
                 let attn_states = draft
@@ -1225,6 +1230,33 @@ impl Dsv4CudaExecutor {
         }
     }
 
+    /// Seed a freshly-prefilled prompt chunk into the DSpark draft context: pull
+    /// the transient multi-row taps the prefill forward stashed on the slot and
+    /// append them at absolute trunk positions `start_abs..` (the canonical
+    /// `dspark_append_context` path). No-op off the DSpark path or when the
+    /// forward captured no multi-row taps (single-token prompt / chunk).
+    fn seed_dspark_prompt(&mut self, slot: usize, start_abs: usize) -> Result<()> {
+        let Self {
+            model,
+            slots,
+            dspark,
+            ..
+        } = self;
+        let Some(ds) = dspark.as_mut() else {
+            return Ok(());
+        };
+        let Some(taps) = slots[slot].take_dspark_prompt_taps() else {
+            return Ok(());
+        };
+        model.dspark_append_context(
+            &ds.draft,
+            &mut ds.slots[slot].df,
+            &taps.bufs,
+            taps.rows,
+            start_abs,
+        )
+    }
+
     /// One DSpark block decode step (`--spec-type dspark`, greedy). Forward the
     /// last token to emit the block anchor + capture the T3 trunk taps, draft a
     /// whole block from those taps in ONE non-causal pass, verify the chain in one
@@ -1301,12 +1333,22 @@ impl Dsv4CudaExecutor {
                 .as_mut()
                 .expect("dspark_decode_tokens without dspark");
             let rt = &mut ds_slots[slot_idx];
+            // Append the anchor-forward token to the accumulated draft context
+            // (committed at absolute position `start_pos`, i.e. `verify_pos - 1`)
+            // BEFORE the block forward — the canonical context path (prompt prefix
+            // seeded at prefill, per-step anchor here).
+            model.dspark_append_context(
+                draft,
+                &mut rt.df,
+                slots[slot_idx].dspark_taps(),
+                1,
+                start_pos,
+            )?;
             let block_hidden = model.dspark_forward_block(
                 draft,
                 &mut rt.df,
                 &mut rt.scratch,
                 &mut rt.attn_states,
-                slots[slot_idx].dspark_taps(),
                 anchor,
                 verify_pos,
             )?;
@@ -1789,15 +1831,16 @@ impl Dsv4CudaExecutor {
             position,
             final_prefill,
         )?;
-        // Rebase the DSpark draft cache to the prompt frontier once prefill
-        // completes: prefill never appends prompt rows to `df`, so without this
-        // the first `dspark_forward_block` would RoPE from position 0 (the
-        // `start_pos == 0` reset) instead of the prompt length. Mirrors the
-        // restored-prefix path rebasing to `finish_len`; the final chunk of a
-        // tail prefill after restore lands here too, so the two paths converge.
-        if final_prefill {
-            self.reset_dspark_slot(row.slot, row.start_pos + row.tokens.len());
-        }
+        // Seed THIS prompt chunk into the DSpark draft context (the canonical
+        // context path). The forward captured the chunk's full multi-row taps;
+        // append them at their absolute trunk positions `row.start_pos..`. Chunks
+        // accumulate in `df.ctx_end`, so a chunked prefill seeds the whole prompt
+        // across chunks; the frontier the first decode block reads is thus the
+        // prompt context, not an empty rebase. No-op off the DSpark path or when
+        // the chunk was single-row. A restored (cache-hit) prefix's context is
+        // genuinely absent — its taps were never captured (partial-window, still
+        // strictly better than the prior empty seed).
+        self.seed_dspark_prompt(row.slot, row.start_pos)?;
         let slot = row.slot;
         // Prefix-state publish hook: this chunk completed pages
         // [start_pos/page, (start_pos+len)/page).
