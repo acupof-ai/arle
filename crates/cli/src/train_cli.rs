@@ -2094,6 +2094,116 @@ fn replay_default_reward() -> f32 {
     1.0
 }
 
+/// Task key for SAO grouping: the label prefix before `#` (`iid#sample` → `iid`).
+#[cfg(feature = "cuda")]
+fn task_key(label: Option<&str>) -> &str {
+    label.unwrap_or("").split('#').next().unwrap_or("")
+}
+
+/// SAO replay: group cc records by task, then per group capture π_rollout (θ is
+/// the current adapter = the rollout policy) and apply the same
+/// [`UpdateStrategy::update`] the online path uses. Advantage is group-scoped
+/// (reward − group-mean; a singleton group → advantage 0 → no update).
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn replay_sao(
+    strategy: train::update_strategy::UpdateStrategy,
+    args: &TrainAgentOpdArgs,
+    records: &[ReplayRecord],
+    student: &train::qwen35::Qwen35Model,
+    all_params: &[autograd::TensorId],
+    trainable: &[autograd::TensorId],
+    optimizer: &mut autograd::optim::AdamW,
+    vocab: usize,
+    epochs: usize,
+    store: &mut autograd::TensorStore,
+) -> Result<()> {
+    use train::update_strategy::ScoredTrajectory;
+
+    // Value critic (Phase 2 only), built after the `trainable` filter so it rides
+    // `all_params` (kept, never stepped) — mirrors the online path.
+    let mut value_critic = args
+        .update_strategy
+        .needs_value_critic()
+        .then(|| {
+            train::opd::ValueCritic::new(
+                student.config().hidden_size,
+                args.value_lr,
+                args.sao_gamma,
+                args.sao_lambda,
+                store,
+            )
+            .map_err(anyhow::Error::from)
+        })
+        .transpose()?;
+
+    // First-seen-ordered task groups (small n → linear find is the lowest-entropy form).
+    let mut groups: Vec<(&str, Vec<usize>)> = Vec::new();
+    for (idx, record) in records.iter().enumerate() {
+        let key = task_key(record.label.as_deref());
+        match groups.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, idxs)) => idxs.push(idx),
+            None => groups.push((key, vec![idx])),
+        }
+    }
+    eprintln!(
+        "[agent-opd] replay SAO: strategy={strategy:?} groups={} records={}",
+        groups.len(),
+        records.len()
+    );
+
+    for epoch in 0..epochs {
+        let mut losses = Vec::new();
+        for (_key, idxs) in &groups {
+            let batch: Vec<ScoredTrajectory> = idxs
+                .iter()
+                .map(|&idx| {
+                    let r = &records[idx];
+                    let rollout_logprobs = train::opd::capture_rollout_logprobs(
+                        student,
+                        &r.prompt_ids,
+                        &r.response_ids,
+                        &r.response_mask,
+                        store,
+                    )
+                    .map_err(anyhow::Error::from)?;
+                    Ok(ScoredTrajectory {
+                        prompt_ids: r.prompt_ids.clone(),
+                        response_ids: r.response_ids.clone(),
+                        response_mask: r.response_mask.clone(),
+                        reward: r.reward,
+                        rollout_logprobs: Some(rollout_logprobs),
+                    })
+                })
+                .collect::<Result<_>>()?;
+            let loss = strategy
+                .update(
+                    &batch,
+                    student,
+                    all_params,
+                    trainable,
+                    optimizer,
+                    value_critic.as_mut(),
+                    vocab,
+                    args.writeback_window,
+                    store,
+                )
+                .map_err(anyhow::Error::from)?;
+            losses.push(loss);
+        }
+        let mean_loss = if losses.is_empty() {
+            0.0
+        } else {
+            losses.iter().sum::<f32>() / losses.len() as f32
+        };
+        eprintln!(
+            "[agent-opd] replay SAO epoch={epoch} groups={} mean_loss={mean_loss:.4}",
+            losses.len()
+        );
+    }
+    Ok(())
+}
+
 /// Agent-OPD replay mode: run the SAME masked-CE writeback the round loop
 /// passes as `train_on_accepted` over pre-converted token records — no rollout
 /// engine, sandboxes, or datasets (no engine VRAM, no staged trees).
@@ -2110,7 +2220,7 @@ fn run_agent_opd_replay(
         opd::{gkd_writeback_step, masked_writeback_ce_step_dispatch},
         qwen35_checkpoint::load_qwen35_lora_adapters,
         qwen35_loader::load_qwen35_lora_from_hf_dir_with_shared_base,
-        update_strategy::{ScoredTrajectory, UpdateStrategy},
+        update_strategy::UpdateStrategy,
     };
 
     use crate::args::GkdTeacherArg;
@@ -2265,95 +2375,18 @@ fn run_agent_opd_replay(
             );
         }
     } else {
-        // SAO: build the value critic (Phase 2 only) AFTER the `trainable` filter,
-        // so it rides `all_params` (kept, not stepped) but is never a LoRA target.
-        let mut value_critic = if args.update_strategy.needs_value_critic() {
-            Some(
-                train::opd::ValueCritic::new(
-                    student.config().hidden_size,
-                    args.value_lr,
-                    args.sao_gamma,
-                    args.sao_lambda,
-                    &mut store,
-                )
-                .map_err(anyhow::Error::from)?,
-            )
-        } else {
-            None
-        };
-        // Group by task = the label prefix before '#' (`iid`). SAO advantage is
-        // group-scoped (reward − group-mean); a singleton group centers to 0 → no
-        // update, which is correct. First-seen order preserved.
-        let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
-        for (idx, record) in records.iter().enumerate() {
-            let key = record
-                .label
-                .as_deref()
-                .unwrap_or("")
-                .split('#')
-                .next()
-                .unwrap_or("")
-                .to_owned();
-            match groups.iter_mut().find(|(k, _)| *k == key) {
-                Some((_, idxs)) => idxs.push(idx),
-                None => groups.push((key, vec![idx])),
-            }
-        }
-        eprintln!(
-            "[agent-opd] replay SAO mode: strategy={update_strategy:?} groups={} record(s)={}",
-            groups.len(),
-            records.len()
-        );
-        for epoch in 0..epochs {
-            let mut losses = Vec::new();
-            for (_key, idxs) in &groups {
-                // One SAO batch per task group. The autograd student holds the
-                // current adapter = the rollout policy, so capturing π_rollout here
-                // (θ unchanged until `update`) matches the online path.
-                let mut batch: Vec<ScoredTrajectory> = Vec::with_capacity(idxs.len());
-                for &idx in idxs {
-                    let record = &records[idx];
-                    let rollout_logprobs = train::opd::capture_rollout_logprobs(
-                        &student,
-                        &record.prompt_ids,
-                        &record.response_ids,
-                        &record.response_mask,
-                        &mut store,
-                    )
-                    .map_err(anyhow::Error::from)?;
-                    batch.push(ScoredTrajectory {
-                        prompt_ids: record.prompt_ids.clone(),
-                        response_ids: record.response_ids.clone(),
-                        response_mask: record.response_mask.clone(),
-                        reward: record.reward,
-                        rollout_logprobs: Some(rollout_logprobs),
-                    });
-                }
-                let loss = update_strategy
-                    .update(
-                        &batch,
-                        &student,
-                        all_params.as_slice(),
-                        trainable.as_slice(),
-                        &mut optimizer,
-                        value_critic.as_mut(),
-                        vocab,
-                        args.writeback_window,
-                        &mut store,
-                    )
-                    .map_err(anyhow::Error::from)?;
-                losses.push(loss);
-            }
-            let mean_loss = if losses.is_empty() {
-                0.0
-            } else {
-                losses.iter().sum::<f32>() / losses.len() as f32
-            };
-            eprintln!(
-                "[agent-opd] replay SAO epoch={epoch} groups={} mean_loss={mean_loss:.4}",
-                losses.len()
-            );
-        }
+        replay_sao(
+            update_strategy,
+            args,
+            &records,
+            &student,
+            all_params.as_slice(),
+            trainable.as_slice(),
+            &mut optimizer,
+            vocab,
+            epochs,
+            &mut store,
+        )?;
     }
     log_opd_vram("replay: after writeback", &train_backend);
 
