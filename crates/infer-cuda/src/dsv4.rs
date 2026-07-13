@@ -653,8 +653,25 @@ pub(crate) struct Dsv4SlotState {
     /// one `DeviceVec` of `hidden_size * hc_mult`, index-aligned with the id
     /// list. The T4 draft fuses these; empty (zero cost) unless `is_dspark()`.
     dspark_taps: Vec<DeviceVec>,
+    /// Transient multi-row prompt taps captured during a PREFILL forward
+    /// (`seq_len > 1` under `is_dspark()`): the full wide HC stream
+    /// `[stream_dim, seq_len]` per target layer, consumed once by the DSpark
+    /// prefix seed ([`crate::dsv4::dspark`]) and then dropped. Prefill-scoped and
+    /// bounded by the chunked-prefill chunk size — deliberately EXCLUDED from the
+    /// per-slot VRAM ledger (like `decode_graph`, it is not resident at build).
+    dspark_prompt_taps: Option<Dsv4DsparkPromptTaps>,
     seq_len: usize,
     max_seq_len: usize,
+}
+
+/// Full-prompt-chunk tap capture for the DSpark prefix seed. Each buffer holds
+/// one target layer's wide HC stream `[stream_dim * rows]` token-major (column
+/// `j*hc_mult + r` at `(j*hc_mult + r) * hidden`), index-aligned with
+/// `dspark_target_layer_ids`. Transient: allocated per prefill forward, taken by
+/// the seed.
+pub(crate) struct Dsv4DsparkPromptTaps {
+    pub(crate) bufs: Vec<DeviceVec>,
+    pub(crate) rows: usize,
 }
 
 struct Dsv4SpecVerifyScratch {
@@ -1151,6 +1168,7 @@ impl Dsv4SlotState {
             #[cfg(feature = "deepep")]
             deepep_ll_scratch,
             dspark_taps,
+            dspark_prompt_taps: None,
             seq_len: 0,
             max_seq_len,
         })
@@ -1212,6 +1230,14 @@ impl Dsv4SlotState {
     #[allow(dead_code)]
     pub(crate) fn dspark_taps(&self) -> &[DeviceVec] {
         &self.dspark_taps
+    }
+
+    /// Take the transient prompt-chunk taps captured by the last prefill forward
+    /// (`None` off the DSpark path or when the forward was single-row). Consumed
+    /// once by the DSpark prefix seed.
+    #[allow(dead_code)]
+    pub(crate) fn take_dspark_prompt_taps(&mut self) -> Option<Dsv4DsparkPromptTaps> {
+        self.dspark_prompt_taps.take()
     }
 
     /// Sub-struct byte totals summed across ALL attention layers (sw_window /
@@ -1292,6 +1318,7 @@ impl Dsv4SlotState {
         kv_adapter: &mut crate::attention::Dsv4KvAdapter,
     ) -> Result<()> {
         self.seq_len = 0;
+        self.dspark_prompt_taps = None;
         ctx.stream
             .memset_zeros(&mut self.start_pos_device)
             .map_err(|e| anyhow!("DSv4 slot start_pos reset failed: {e}"))?;
@@ -2262,14 +2289,21 @@ impl Dsv4Model {
         // spec_decode_on — MUST track the constructors):
         //  - T3 taps: one wide-stream (bf16) buffer per target layer (`Dsv4SlotState`).
         //  - draft caches (`Dsv4DsparkExec`, one runtime per slot, `load_dspark_exec`):
-        //    per stage a `latent_kv` [draft_span, head_dim] bf16 + a ratio-0 MLA
+        //    per stage a `latent_kv` [latent_cap, head_dim] bf16 + a ratio-0 MLA
         //    attention state over draft_span. Counted here so the KV budget's
         //    per-slot divisor reserves them — the fixed draft-WEIGHT reserve alone
         //    under-counts these per-slot caches (→ OOM at large slots / max_seq_len).
+        //    `latent_cap = max_seq_len * hc_mult + block`: EACH committed context
+        //    token contributes `hc_mult` latent rows (the fused-tap HC lanes), so
+        //    the full-prompt draft context is `hc_mult ×` the token count.
         if self.config.is_dspark() {
             let head_dim = self.config.head_dim;
             let num_stages = self.config.dspark_num_stages();
-            let draft_span = max_seq_len + self.config.dspark_block_size;
+            let block = self.config.dspark_block_size;
+            let draft_span = max_seq_len + block;
+            let latent_cap = max_seq_len
+                .saturating_mul(self.config.hc_mult)
+                .saturating_add(block);
             total = total.saturating_add(
                 self.config
                     .dspark_target_layer_ids
@@ -2279,7 +2313,7 @@ impl Dsv4Model {
             );
             total = total.saturating_add(
                 num_stages
-                    .saturating_mul(draft_span)
+                    .saturating_mul(latent_cap)
                     .saturating_mul(head_dim)
                     .saturating_mul(bf16),
             );
@@ -5790,6 +5824,21 @@ impl Dsv4Model {
         let dspark = self.config.is_dspark();
         let mut keepalive = Dsv4ForwardKeepalive::new(false);
         let ctx = &self.ctx;
+        // DSpark prefix seed: a PREFILL forward (`seq_len > 1`) additionally
+        // captures ALL rows per target layer into transient `[stream_dim, seq_len]`
+        // buffers (token-major), so the executor can seed the full committed
+        // context (the per-slot single-row `dspark_taps` only holds `seq_len-1`).
+        // Prefill-scoped; bounded by the chunk size. Stashed on the slot post-loop.
+        let mut dspark_prompt_bufs: Option<Vec<DeviceVec>> = if dspark && seq_len > 1 {
+            let n_taps = self.config.dspark_target_layer_ids.len();
+            Some(
+                (0..n_taps)
+                    .map(|_| DeviceVec::zeros(ctx, stream_dim * seq_len))
+                    .collect::<Result<Vec<_>>>()?,
+            )
+        } else {
+            None
+        };
         // DEBUG: catch any deferred CUDA error from init/boot before first forward op.
         if use_deepep_transport {
             self.ctx.stream.synchronize().map_err(|e| {
@@ -6360,6 +6409,13 @@ impl Dsv4Model {
                     &mut slot.dspark_taps[tap_idx],
                     &mut keepalive,
                 )?;
+                // Prefill: also capture the FULL stream (all rows) for the seed.
+                if let Some(bufs) = dspark_prompt_bufs.as_mut() {
+                    ctx.stream
+                        .memcpy_dtod(&stream.data, &mut bufs[tap_idx].data)
+                        .map_err(|e| anyhow!("DSpark prompt tap capture D2D failed: {e}"))?;
+                    keepalive.keep_vec(&bufs[tap_idx]);
+                }
             }
             // Lens capture: head-project the layer's final stream (row 0, the
             // decode token) and stash the DEVICE logits (no sync/D2H until
@@ -6368,6 +6424,13 @@ impl Dsv4Model {
                 let logits = self.verify_logits_from_stream(&stream, seq_len, &mut keepalive)?;
                 crate::probe::lens_push(layer_idx, logits);
             }
+        }
+
+        if let Some(bufs) = dspark_prompt_bufs.take() {
+            slot.dspark_prompt_taps = Some(Dsv4DsparkPromptTaps {
+                bufs,
+                rows: seq_len,
+            });
         }
 
         slot.seq_len += seq_len;
