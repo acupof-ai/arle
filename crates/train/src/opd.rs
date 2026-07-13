@@ -3038,12 +3038,47 @@ pub fn masked_writeback_ce_step<O: Optimizer>(
     )
 }
 
+/// Frozen-prompt-KV gen-segment split shared by the SAO writeback/capture/critic
+/// forwards. `gen_start = prompt_len - 1`: the boundary token predicts the first
+/// response token, so every masked target position `p >= gen_start` and rebasing
+/// into the gen tensor with `p - gen_start` is always `>= 0`. The prefix covers
+/// absolute positions `0..gen_start` (captured off-tape, seeds attention); the
+/// gen segment covers `gen_start..seq_len`. Only the forward's context differs
+/// from the full path — the masked-position loss/logprobs/values are identical.
+struct GenSegment {
+    prompt_prefix: Vec<u32>,
+    gen_ids: Vec<u32>,
+    prompt_positions: Vec<u32>,
+    gen_positions: Vec<u32>,
+}
+
+impl GenSegment {
+    /// Caller must ensure `prompt_len > 1` (a non-empty prompt prefix requires
+    /// `gen_start = prompt_len - 1 >= 1`, enforced by the `prompt_len > 1` gate).
+    fn split(full: &[u32], prompt_len: usize) -> Self {
+        let gen_start = prompt_len - 1;
+        let seq_len = full.len();
+        Self {
+            prompt_prefix: full[0..gen_start].to_vec(),
+            gen_ids: full[gen_start..].to_vec(),
+            prompt_positions: (0..gen_start as u32).collect(),
+            gen_positions: (gen_start as u32..seq_len as u32).collect(),
+        }
+    }
+}
+
 /// Shared masked single-trajectory writeback skeleton: ONE checkpointed forward
 /// over `prompt ++ response` → hidden states, then a CHUNKED fused loss on the
 /// masked (LLM-generated) positions that never materializes `[seq, vocab]`. Only
 /// the fused-loss call branches on `loss_kind` (CE vs DIS); everything else —
 /// forward, backward, optimizer step, seq-adaptive offload, VRAM logging — is
 /// shared. See [`masked_writeback_ce_step`] for the CE-path rationale.
+///
+/// When `--writeback-frozen-prompt-kv` is set (and `prompt_len > 1`) the forward
+/// runs ONLY the generated segment, seeding attention from an off-tape
+/// prompt-prefix capture — cutting the shared-prompt cost ~5-8×. The dropped
+/// LoRA-grad-on-prompt-KV term is ~0 at lora_b=0, so loss + response-position
+/// grads match the full path; the flag-off path is byte-identical.
 #[allow(clippy::too_many_arguments)]
 pub fn masked_writeback_step<O: Optimizer>(
     loss_kind: WritebackLoss,
@@ -3097,6 +3132,12 @@ pub fn masked_writeback_step<O: Optimizer>(
     let total_targets = loss_targets.len();
     let chunk_rows = window_size; // reused: positions per fused-CE chunk.
 
+    // Frozen-prompt-KV: forward only the gen segment, rebasing masked positions
+    // into it. gen_start=0 keeps positions absolute for the byte-identical full
+    // path. Every masked target p >= prompt_len-1 = gen_start, so p-gen_start>=0.
+    let frozen = crate::runtime_flags::writeback_frozen_prompt_kv() && prompt_len > 1;
+    let gen_start = if frozen { prompt_len - 1 } else { 0 };
+
     // Split the (predicting-position p, target token) pairs into the parallel
     // i32 index/target arrays the fused chunked CE consumes. `p` indexes the
     // hidden tensor's sequence rows; the targets are the hard next tokens.
@@ -3110,7 +3151,7 @@ pub fn masked_writeback_step<O: Optimizer>(
                 "masked writeback target token {target} at position {p} exceeds vocab={vocab}"
             )));
         }
-        position_indices.push(p as i32);
+        position_indices.push((p - gen_start) as i32);
         target_tokens.push(target as i32);
     }
 
@@ -3125,16 +3166,34 @@ pub fn masked_writeback_step<O: Optimizer>(
     eprintln!("[masked-writeback] offload_checkpoints={offload_checkpoints} seq_len={seq_len}");
     let keep_extra: HashSet<TensorId> = HashSet::new();
     eprintln!(
-        "[masked-writeback] seq_len={seq_len} total_targets={total_targets} chunk_rows={chunk_rows}"
+        "[masked-writeback] seq_len={seq_len} total_targets={total_targets} \
+         chunk_rows={chunk_rows} frozen={frozen} gen_start={gen_start}"
     );
 
-    // ONE checkpointed forward over prompt++response → [1, seq, hidden]. No
-    // per-window re-forward of the growing prefix (was O(N²)).
+    // ONE checkpointed forward → [1, rows, hidden] (rows = seq or gen_len). No
+    // per-window re-forward of the growing prefix (was O(N²)). Frozen: only the
+    // gen segment is forwarded/backwarded, seeded from the off-tape prompt KV.
     let vram_base = log_writeback_vram(store, "masked-writeback", "pre forward_hidden_states");
     let t_fwd = Instant::now();
-    let hidden = student
-        .forward_hidden_states(store, &mut tape, &full, &positions)
-        .map_err(|err| map_qwen35_forward_error("masked writeback student hidden", err))?;
+    let hidden = if frozen {
+        let seg = GenSegment::split(&full, prompt_len);
+        student
+            .forward_hidden_states_gen_segment(
+                store,
+                &mut tape,
+                &seg.prompt_prefix,
+                &seg.gen_ids,
+                &seg.prompt_positions,
+                &seg.gen_positions,
+            )
+            .map_err(|err| {
+                map_qwen35_forward_error("masked writeback frozen-prompt-KV student hidden", err)
+            })?
+    } else {
+        student
+            .forward_hidden_states(store, &mut tape, &full, &positions)
+            .map_err(|err| map_qwen35_forward_error("masked writeback student hidden", err))?
+    };
     let fwd_secs = t_fwd.elapsed().as_secs_f64();
     let vram_post_forward =
         log_writeback_vram(store, "masked-writeback", "post forward_hidden_states");
@@ -3266,6 +3325,14 @@ pub fn capture_rollout_logprobs(
     }
     let positions: Vec<u32> = (0..seq_len as u32).collect();
 
+    // Frozen-prompt-KV: forward only the gen segment. gen_start=0 keeps the full
+    // path byte-identical. Masked rows p >= prompt_len-1 = gen_start, so the
+    // gathered `rows` rebase to p-gen_start (>= 0) into the [gen_len, hidden]
+    // tensor; output logprobs stay in the same target order.
+    let frozen = crate::runtime_flags::writeback_frozen_prompt_kv() && prompt_len > 1;
+    let gen_start = if frozen { prompt_len - 1 } else { 0 };
+    let hidden_rows = seq_len - gen_start;
+
     // Snapshot live tensors so the forward + per-chunk projection intermediates
     // (hidden, logits, logp, gathered) + the tape's checkpoints are reclaimed at
     // the end — `to_host` copies but does not free them, so trajectories leak.
@@ -3278,9 +3345,25 @@ pub fn capture_rollout_logprobs(
     // numerically exact, so π_rollout is unchanged. Needs `--gradient-checkpointing`.
     let mut tape = Tape::new();
     tape.set_enabled(true);
-    let hidden = student
-        .forward_hidden_states(store, &mut tape, &full, &positions)
-        .map_err(|err| map_qwen35_forward_error("rollout-logprob student hidden", err))?;
+    let hidden = if frozen {
+        let seg = GenSegment::split(&full, prompt_len);
+        student
+            .forward_hidden_states_gen_segment(
+                store,
+                &mut tape,
+                &seg.prompt_prefix,
+                &seg.gen_ids,
+                &seg.prompt_positions,
+                &seg.gen_positions,
+            )
+            .map_err(|err| {
+                map_qwen35_forward_error("rollout-logprob frozen-prompt-KV student hidden", err)
+            })?
+    } else {
+        student
+            .forward_hidden_states(store, &mut tape, &full, &positions)
+            .map_err(|err| map_qwen35_forward_error("rollout-logprob student hidden", err))?
+    };
     let hidden_dim = *store
         .get(hidden)
         .ok_or(AutogradError::InvalidTensorId(hidden))?
@@ -3297,12 +3380,12 @@ pub fn capture_rollout_logprobs(
         );
     }
     let hidden_2d =
-        reshape(hidden, &[seq_len, hidden_dim], store, &mut tape).map_err(OpdError::from)?;
+        reshape(hidden, &[hidden_rows, hidden_dim], store, &mut tape).map_err(OpdError::from)?;
     let lm_head = student.lm_head_weight_id();
 
     let mut logprobs = Vec::with_capacity(loss_targets.len());
     for chunk in loss_targets.chunks(CAPTURE_LOGPROB_CHUNK_ROWS) {
-        let rows: Vec<usize> = chunk.iter().map(|&(p, _)| p).collect();
+        let rows: Vec<usize> = chunk.iter().map(|&(p, _)| p - gen_start).collect();
         let targets: Vec<usize> = chunk.iter().map(|&(_, t)| t).collect();
         // Gather this chunk's hidden rows, project through lm_head, log-softmax,
         // then pick each row's target logprob. Never materializes [seq, vocab].
@@ -3431,21 +3514,43 @@ impl ValueCritic {
             return Ok((Vec::new(), 0));
         }
         let positions: Vec<u32> = (0..seq_len as u32).collect();
+        // Frozen-prompt-KV: gen-segment forward, gather masked rows rebased by
+        // -gen_start. gen_start=0 keeps the full path byte-identical. Returned
+        // (rows_flat, n) semantics are unchanged.
+        let frozen = crate::runtime_flags::writeback_frozen_prompt_kv() && prompt_len > 1;
+        let gen_start = if frozen { prompt_len - 1 } else { 0 };
+        let hidden_rows = seq_len - gen_start;
         let keep_ids: HashSet<TensorId> = store.live_ids().into_iter().collect();
         let mut tape = Tape::new();
         tape.set_enabled(true);
-        let hidden = student
-            .forward_hidden_states(store, &mut tape, &full, &positions)
-            .map_err(|err| map_qwen35_forward_error("value-critic student hidden", err))?;
+        let hidden = if frozen {
+            let seg = GenSegment::split(&full, prompt_len);
+            student
+                .forward_hidden_states_gen_segment(
+                    store,
+                    &mut tape,
+                    &seg.prompt_prefix,
+                    &seg.gen_ids,
+                    &seg.prompt_positions,
+                    &seg.gen_positions,
+                )
+                .map_err(|err| {
+                    map_qwen35_forward_error("value-critic frozen-prompt-KV student hidden", err)
+                })?
+        } else {
+            student
+                .forward_hidden_states(store, &mut tape, &full, &positions)
+                .map_err(|err| map_qwen35_forward_error("value-critic student hidden", err))?
+        };
         let hidden_dim = *store
             .get(hidden)
             .ok_or(AutogradError::InvalidTensorId(hidden))?
             .shape
             .last()
             .ok_or_else(|| OpdError::InvalidInput("value-critic: empty hidden shape".to_owned()))?;
-        let hidden_2d =
-            reshape(hidden, &[seq_len, hidden_dim], store, &mut tape).map_err(OpdError::from)?;
-        let rows: Vec<usize> = loss_targets.iter().map(|&(p, _)| p).collect();
+        let hidden_2d = reshape(hidden, &[hidden_rows, hidden_dim], store, &mut tape)
+            .map_err(OpdError::from)?;
+        let rows: Vec<usize> = loss_targets.iter().map(|&(p, _)| p - gen_start).collect();
         let n = rows.len();
         let rows_hidden_3d =
             embedding(hidden_2d, &rows, store, &mut tape).map_err(OpdError::from)?;
