@@ -23,12 +23,14 @@ pip download --no-cache-dir --no-deps --no-binary :all: -d "$work" "apache-tvm-f
 tar -xzf "$work"/apache*tvm*ffi-*.tar.gz -C "$work"
 src="$(ls -d "$work"/apache*tvm*ffi-*/)"
 patch -p1 -d "$src" < "$PATCH"
-# The tvm-ffi sdist's build backend parses PEP 639 license expressions via
-# packaging.licenses (setuptools>=77 / packaging>=24.2); the runner's stock
-# setuptools is too old ("Cannot import packaging.licenses"). Upgrade before
-# building. --no-build-isolation then reuses this env + the runner's cmake/ninja.
-pip install --no-cache-dir -U 'setuptools>=77' 'packaging>=24.2' wheel scikit-build-core
-pip wheel --no-cache-dir --no-deps --no-build-isolation -w "$work" "$src" \
-  || pip wheel --no-cache-dir --no-deps -w "$work" "$src"
+# Build the wheel in THIS env with --no-build-isolation, so we control the
+# build deps directly instead of pip's nested isolated builds (which recurse
+# into the same old-packaging trap). The tvm-ffi sdist needs scikit-build-core
+# + setuptools_scm + cython to configure, and a modern setuptools/packaging to
+# parse its PEP 639 license expression (else "Cannot import packaging.licenses",
+# setuptools>=77 / packaging>=24.2). Install the full set up front.
+pip install --no-cache-dir -U \
+  'setuptools>=77' 'packaging>=24.2' wheel scikit-build-core setuptools_scm cython ninja
+pip wheel --no-cache-dir --no-deps --no-build-isolation -w "$work" "$src"
 pip install --force-reinstall --no-deps "$work"/apache*tvm*ffi-*.whl
 python -c "import tilelang; print('tilelang', tilelang.__version__, 'tvm-ffi patched-ok')"
