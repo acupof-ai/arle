@@ -792,8 +792,8 @@ impl BackendExecutor for CudaExecutor {
     ) -> anyhow::Result<usize> {
         match &mut self.inner {
             CudaExecutorInner::Placeholder => {
-                let _ = (slot, tokens, matched_len, prefix_pages);
-                Ok(0)
+                let _ = (slot, tokens, prefix_pages);
+                Ok(matched_len)
             }
             #[cfg(feature = "cuda")]
             CudaExecutorInner::Real(real) => {
