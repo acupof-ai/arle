@@ -15,8 +15,12 @@
 
 use autograd::{Tape, TensorId, TensorStore, optim::AdamW};
 use train::{
+    TrainRuntimeFlags, apply_runtime_flags,
     lora::{LoraConfig, LoraTargetSet},
-    opd::{masked_writeback_ce_step, masked_writeback_ce_step_frozen_prompt_kv},
+    opd::{
+        capture_rollout_logprobs, masked_writeback_ce_step,
+        masked_writeback_ce_step_frozen_prompt_kv,
+    },
     qwen35::{LayerType, Qwen35Config, Qwen35Model},
 };
 
@@ -428,6 +432,59 @@ fn frozen_prompt_kv_public_step_runs_and_matches_baseline_loss() {
     assert!(
         diff <= 1.0e-5,
         "public-step frozen vs baseline loss diff {diff:.3e} exceeds 1e-5"
+    );
+}
+
+#[test]
+fn frozen_prompt_kv_capture_rollout_logprobs_matches_full() {
+    // The forward-only SAO capture path goes through the global
+    // `--writeback-frozen-prompt-kv` flag. Toggle it and assert the gen-segment
+    // gather (rows rebased by -gen_start) reproduces the full-forward logprobs at
+    // every masked target — same order, same values (≤ 1e-5).
+    let mut store = TensorStore::default();
+    let student = build_student(&mut store);
+
+    let prompt_ids: Vec<u32> = vec![1, 3, 8, 2, 7, 4, 9, 5];
+    let response_ids: Vec<u32> = vec![6, 10, 11, 12, 13, 14];
+    let response_mask: Vec<u8> = vec![1; response_ids.len()];
+
+    let set_frozen = |on: bool| {
+        apply_runtime_flags(&TrainRuntimeFlags {
+            writeback_frozen_prompt_kv: on,
+            ..TrainRuntimeFlags::default()
+        });
+    };
+
+    set_frozen(false);
+    let full = capture_rollout_logprobs(
+        &student,
+        &prompt_ids,
+        &response_ids,
+        &response_mask,
+        &mut store,
+    )
+    .expect("full capture");
+    set_frozen(true);
+    let frozen = capture_rollout_logprobs(
+        &student,
+        &prompt_ids,
+        &response_ids,
+        &response_mask,
+        &mut store,
+    )
+    .expect("frozen capture");
+    set_frozen(false); // restore default for any later test reading the flag
+
+    assert_eq!(full.len(), frozen.len(), "capture logprob count mismatch");
+    assert!(!full.is_empty(), "expected masked targets");
+    let max_diff = max_abs_diff(&full, &frozen);
+    println!(
+        "[gate-a-capture] n={} logprob_max_diff={max_diff:.3e}",
+        full.len()
+    );
+    assert!(
+        max_diff <= 1.0e-5,
+        "frozen vs full capture logprob diff {max_diff:.3e} exceeds 1e-5"
     );
 }
 
