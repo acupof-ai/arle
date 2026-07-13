@@ -2097,6 +2097,7 @@ fn run_agent_opd_replay(
     use train::{
         ema_self_teacher::EmaSelfTeacher,
         opd::{gkd_writeback_step, masked_writeback_ce_step_dispatch},
+        qwen35_checkpoint::load_qwen35_lora_adapters,
         qwen35_loader::load_qwen35_lora_from_hf_dir_with_shared_base,
     };
 
@@ -2149,6 +2150,13 @@ fn run_agent_opd_replay(
     .with_context(|| format!("load LoRA student from {}", student_dir.display()))?;
     if args.grad_checkpointing {
         student.set_gradient_checkpointing(true);
+    }
+    // Resume: overlay a saved adapter BEFORE the GKD self-teacher snapshots the
+    // student, so the frozen `self` teacher captures the resumed adapter, not zeros.
+    if let Some(dir) = args.lora_adapters.as_deref() {
+        load_qwen35_lora_adapters(&student, &mut store, dir)
+            .with_context(|| format!("resume LoRA adapter from {}", dir.display()))?;
+        eprintln!("[agent-opd] resumed adapter from {}", dir.display());
     }
     // GKD teacher (built here — immediately after the student and BEFORE any
     // other store scratch, per EmaSelfTeacher::from_student's retain_ids contract).
@@ -2270,6 +2278,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
         infer_student::InferStudent,
         lora::LoraConfig,
         opd::masked_writeback_ce_step_dispatch,
+        qwen35_checkpoint::load_qwen35_lora_adapters,
         qwen35_loader::{SharedFrozenBaseEntry, load_qwen35_lora_from_hf_dir_with_shared_base},
         swe_dataset::SweTask,
     };
@@ -2522,6 +2531,14 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
             .with_context(|| format!("load LoRA student from {}", student_dir.display()))?
         }
     };
+
+    // Resume: overlay a saved adapter onto the fresh student (both load branches
+    // merge here) BEFORE the handoff fence, so its A/B uploads drain with the base.
+    if let Some(dir) = args.lora_adapters.as_deref() {
+        load_qwen35_lora_adapters(&student, &mut store, dir)
+            .with_context(|| format!("resume LoRA adapter from {}", dir.display()))?;
+        eprintln!("[agent-opd] resumed adapter from {}", dir.display());
+    }
 
     // Shared-base bytes alias the engine's resident FP8 — drain the autograd
     // backend's OWN in-flight uploads before the first autograd forward
