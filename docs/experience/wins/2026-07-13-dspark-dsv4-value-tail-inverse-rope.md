@@ -68,12 +68,19 @@ attractor-collapse, not a frozen constant.
   the fuse slices `tap[r*hidden..(r+1)*hidden]` — matches. Correct.
 - **inverse-RoPE value tail** — fixed here.
 
-**Remaining (systematic, next):** a subtle weight-mapping swap/transpose in the
-draft `mtp.0/1/2` tensors (attention `wq_b`/`wkv`/`wo`, MoE, `main_proj`, `hc_head`,
-`norm`, `markov_*`) vs the `deepseek-spec` contract, OR a numerical bug needing
-layer-by-layer comparison against the DeepSeek reference. Attractor-collapse to
-specific tokens smells like a weight swap/transpose. NOT the window, NOT geometry,
-NOT the exit/fuse.
+- **Output head** — the draft correctly decodes via the base model's separate
+  `head.weight` (`model.lm_head`, `tie_word_embeddings=false`, verified in the
+  checkpoint index; `dsv4.rs:392-396`). "Tie to embed" is a known false positive.
+
+**Remaining locus (next):** `dspark_stage_forward` (`dsv4/dspark.rs:135-426`)
+REIMPLEMENTS the DSv4 block inline (HC pre-norm → wq_a/q_norm/wq_b, wkv/kv_norm,
+prepare_qk, draft attention, oproj, hc_post, MoE + shared expert, hc_post) rather
+than reusing the validated `mtp_forward_level` / main layer forward. The bug is
+almost certainly a subtle divergence here — an fp8 weight+scale pairing, an HC
+combine/residual detail, or a MoE routing detail — since every OTHER piece is now
+verified. Next: line-by-line diff of `dspark_stage_forward` against the validated
+`mtp_forward_level` + the main DSv4 layer forward, one divergence at a time.
+Estimated multi-cycle. NOT the window, NOT geometry, NOT exit/fuse/head.
 
 ## Rule
 
