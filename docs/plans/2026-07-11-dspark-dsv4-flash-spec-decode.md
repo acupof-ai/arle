@@ -70,6 +70,20 @@ trunk forward-path change (multi-row tap capture at prefill + verify, mirror the
 qwen35 track's `dspark_append_ctx`), NOT geometry. HC-mapping empirical unknown
 resolved.
 
+**UPDATE 2026-07-13 — window attempt (`7cf7d9dfd`) REGRESSED to 0.0, REVERTED
+(`4c9b3a3e1`).** The big-bang window (multi-row `capture_dspark_taps_all` +
+`dspark_append_window` + stripped inline append + `abs_end`/rebase/cap-4× slot-state
+change, all at once) re-broke the geometry: same `anchor=6102` that gave `accepted=1`
+under `b350b0f90` reverted to the exact pre-geometry-fix garbage (`68745/9515/84941`),
+`accept_rate 0.0` on both prompts. Changed too many variables to attribute — the
+per-token append re-coupled the context position / cache-offset that `b350b0f90`
+decoupled. Reverted to the confirmed 0.143 baseline. **Re-derive INCREMENTALLY**
+(§0 isolate confounders): add ONE thing at a time on the clean baseline, each
+pod-verified — (1) prompt-prefix seed ONLY, holding the exact `b350b0f90`
+block/context RoPE math; verify ≥0.143; (2) then per-token accepted-draft entries.
+The window slot-state/cap change must NOT alter where the block attention reads
+`latent_kv` vs where the append writes.
+
 ## Verdict first
 
 Adopt **DeepSeek's official `deepseek-ai/DeepSeek-V4-Flash-DSpark`** draft module
