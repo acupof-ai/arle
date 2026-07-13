@@ -1,0 +1,23 @@
+scripts/cc_opd_loop.sh
+  s_9c91b86ec3fb55::t_5fa5be9ddd9468 25-26,47,68,83
+scripts/cc_run.sh
+  s_9c91b86ec3fb55::t_7ec22647b01132 15-16,33,51
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "4996d515c89b0d9e0f2bb0b0ad1fd63d05feab87",
+  "prompts": {},
+  "sessions": {
+    "s_9c91b86ec3fb55": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4779911a-69b7-49db-bc83-daf5a48d6ca3",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
