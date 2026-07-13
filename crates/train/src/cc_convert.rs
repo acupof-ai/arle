@@ -94,10 +94,13 @@ pub fn run_cc_convert(
             );
             continue;
         };
-        records.push(
-            convert_body(&window.label, window.reward, body, &tokenizer)
-                .with_context(|| format!("convert window {}", window.label))?,
-        );
+        // A single un-convertible window (e.g. a failed rollout with no assistant
+        // turn — now collected because SAO keeps failing attempts) must not abort
+        // the whole round's records; skip it and keep the rest.
+        match convert_body(&window.label, window.reward, body, &tokenizer) {
+            Ok(record) => records.push(record),
+            Err(err) => eprintln!("[cc-convert] window {}: {err:#}; skipped", window.label),
+        }
     }
     ensure!(
         !records.is_empty(),
