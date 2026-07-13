@@ -135,6 +135,11 @@ jobs:
     name: Build Linux x86_64 (CUDA sm_70 / V100, best-effort)
     runs-on: ubuntu-22.04
     continue-on-error: true
+    # Off by default: a no-GPU cross-compile runner can't validate sm_70, and the
+    # in-CI patched-tvm-ffi wheel rebuild is fragile. sm_70 is verified on the real
+    # V100 box instead (ssh v100; see wins/2026-07-13-sm70-gated-delta-rule-fp16-gate).
+    # Set repo var ENABLE_EXOTIC_SM_LANES=true to run it.
+    if: ${{ vars.ENABLE_EXOTIC_SM_LANES == 'true' }}
 
     steps:
       - uses: actions/checkout@v7
@@ -236,6 +241,10 @@ jobs:
     name: Build Linux x86_64 (CUDA Blackwell sm_100+sm_120, best-effort)
     runs-on: ubuntu-22.04
     continue-on-error: true
+    # Off by default: no Blackwell hardware exists in CI to validate sm_100/sm_120
+    # codegen, and the in-CI patched-tvm-ffi wheel rebuild is fragile. Set repo var
+    # ENABLE_EXOTIC_SM_LANES=true to run it once Blackwell hardware is available.
+    if: ${{ vars.ENABLE_EXOTIC_SM_LANES == 'true' }}
 
     steps:
       - uses: actions/checkout@v7
