@@ -227,6 +227,7 @@ struct DiskTier {
     durable: bool,
     /// Model/weights-version tag written into the manifest.
     epoch: String,
+    _lock: Option<nix::fcntl::Flock<std::fs::File>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -246,6 +247,17 @@ impl Drop for DiskTier {
 }
 
 impl DiskTier {
+    fn lock_namespace(namespace: &Path) -> Result<nix::fcntl::Flock<std::fs::File>> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(namespace.join("owner.lock"))?;
+        nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock)
+            .map_err(|(_, err)| anyhow!("namespace already owned: {err}"))
+    }
+
     fn manifest_path(&self) -> PathBuf {
         self.root_dir.join(MANIFEST_FILE)
     }
@@ -348,8 +360,12 @@ impl KvTierStore {
         budget_bytes: usize,
         bytes_per_page: usize,
         epoch: String,
+        format_tag: u8,
+        world_size: usize,
+        rank: usize,
     ) -> bool {
-        let namespace = Self::durable_namespace(root);
+        let namespace =
+            Self::durable_namespace(root, &epoch, format_tag, world_size, rank, bytes_per_page);
         self.attach_disk(namespace, budget_bytes, bytes_per_page, true, epoch)
     }
 
@@ -376,6 +392,20 @@ impl KvTierStore {
             );
             return false;
         }
+        let namespace_lock = if durable {
+            match DiskTier::lock_namespace(&namespace) {
+                Ok(lock) => Some(lock),
+                Err(err) => {
+                    log::warn!(
+                        "KV durable namespace lock failed under {}: {err}",
+                        namespace.display()
+                    );
+                    return false;
+                }
+            }
+        } else {
+            None
+        };
         match crate::KvMmapStore::create(&mmap_path, capacity_pages, bytes_per_page) {
             Ok(store) => {
                 self.disk = Some(DiskTier {
@@ -384,6 +414,7 @@ impl KvTierStore {
                     keys: BTreeMap::new(),
                     durable,
                     epoch,
+                    _lock: namespace_lock,
                 });
                 true
             }
@@ -403,8 +434,18 @@ impl KvTierStore {
         budget_bytes: usize,
         bytes_per_page: usize,
         epoch: String,
+        format_tag: u8,
+        world_size: usize,
+        rank: usize,
     ) -> bool {
-        let namespace = Self::durable_namespace(root.clone());
+        let namespace = Self::durable_namespace(
+            root.clone(),
+            &epoch,
+            format_tag,
+            world_size,
+            rank,
+            bytes_per_page,
+        );
         let manifest_path = namespace.join(MANIFEST_FILE);
         let mmap_path = namespace.join("kv.mmap");
         let capacity_pages = budget_bytes.checked_div(bytes_per_page).unwrap_or(0);
@@ -417,24 +458,41 @@ impl KvTierStore {
             log::warn!("KV durable namespace creation failed: {err}");
             return false;
         }
-
-        // Try to open existing mmap store.
-        let mut store = match crate::KvMmapStore::open(&mmap_path, capacity_pages, bytes_per_page) {
-            Ok(s) => s,
-            Err(_) => {
-                // No existing store — create fresh.
-                match crate::KvMmapStore::create(&mmap_path, capacity_pages, bytes_per_page) {
-                    Ok(s) => s,
-                    Err(err) => {
-                        log::warn!("KV mmap store create failed: {err}");
-                        return false;
-                    }
-                }
+        let namespace_lock = match DiskTier::lock_namespace(&namespace) {
+            Ok(lock) => lock,
+            Err(err) => {
+                log::warn!(
+                    "KV durable namespace lock failed under {}: {err}",
+                    namespace.display()
+                );
+                return false;
             }
         };
 
-        let parsed = std::fs::read(&manifest_path)
-            .ok()
+        let (mut store, replay_manifest) =
+            match crate::KvMmapStore::open(&mmap_path, capacity_pages, bytes_per_page) {
+                Ok(s) => (s, true),
+                Err(_) => {
+                    match crate::KvMmapStore::create(&mmap_path, capacity_pages, bytes_per_page) {
+                        Ok(s) => (s, false),
+                        Err(err) => {
+                            log::warn!("KV mmap store create failed: {err}");
+                            return false;
+                        }
+                    }
+                }
+            };
+        if !replay_manifest
+            && let Err(err) = std::fs::remove_file(&manifest_path)
+            && err.kind() != std::io::ErrorKind::NotFound
+        {
+            log::warn!("KV stale manifest removal failed: {err}");
+            return false;
+        }
+
+        let parsed = replay_manifest
+            .then(|| std::fs::read(&manifest_path).ok())
+            .flatten()
             .and_then(|bytes| DiskTier::parse_manifest(&bytes));
 
         let mut keys = BTreeMap::new();
@@ -466,6 +524,11 @@ impl KvTierStore {
                 store.reserve_indices(&indices);
             }
         }
+        log::info!(
+            "KV recall restored {} pages from {}",
+            keys.len(),
+            namespace.display()
+        );
 
         self.disk = Some(DiskTier {
             root_dir: namespace,
@@ -473,6 +536,7 @@ impl KvTierStore {
             keys,
             durable: true,
             epoch,
+            _lock: Some(namespace_lock),
         });
         true
     }
@@ -498,8 +562,17 @@ impl KvTierStore {
         ))
     }
 
-    fn durable_namespace(root: PathBuf) -> PathBuf {
-        root.join(format!("arle-kv-recall-{}", std::process::id()))
+    fn durable_namespace(
+        root: PathBuf,
+        epoch: &str,
+        format_tag: u8,
+        world_size: usize,
+        rank: usize,
+        bytes_per_page: usize,
+    ) -> PathBuf {
+        root.join(format!(
+            "arle-kv-recall-{epoch}-format-{format_tag}-world-{world_size}-rank-{rank}-page-{bytes_per_page}"
+        ))
     }
 
     pub fn capacity_pages(&self) -> usize {
@@ -1210,47 +1283,67 @@ mod tests {
     }
 
     #[test]
-    fn durable_manifest_round_trips_disk_index_across_restart() {
-        let root = temp_root("durable_mmap");
+    fn durable_manifest_round_trips_disk_index_across_processes() {
+        const MODE: &str = "ARLE_KV_TIER_CROSS_PROCESS_MODE";
+        const ROOT: &str = "ARLE_KV_TIER_CROSS_PROCESS_ROOT";
         let epoch = "epoch-A".to_string();
-
-        // session 1: write three blocks, then drop.
-        let namespace;
-        {
+        if let Some((mode, root)) = std::env::var_os(MODE).zip(std::env::var_os(ROOT)) {
+            let root = PathBuf::from(root);
+            let mode = mode.to_string_lossy();
+            std::fs::write(
+                root.join(format!("{mode}.pid")),
+                std::process::id().to_string(),
+            )
+            .expect("write child pid");
             let mut store = KvTierStore::with_budget(0, 8);
-            assert!(store.set_disk_durable(root.clone(), 32, 8, epoch.clone()));
-            namespace = root.join(format!("arle-kv-recall-{}", std::process::id()));
-            assert!(namespace.exists());
-            assert!(namespace.join("kv.mmap").exists());
-
-            assert!(store.insert(1, vec![1; 8]));
-            assert!(store.insert(2, vec![2; 8]));
-            assert!(store.insert(3, vec![3; 8]));
-            assert!(namespace.join(MANIFEST_FILE).exists());
-            assert_eq!(store.disk_pages(), 3);
-        }
-        // Durable namespace survives drop.
-        assert!(namespace.exists());
-
-        // session 2: load() rebuilds index from manifest.
-        {
-            let mut store = KvTierStore::with_budget(0, 8);
-            let reloaded = store.load(root.clone(), 32, 8, epoch.clone());
-            assert!(reloaded, "load reports prior blocks reloaded");
-            assert_eq!(store.disk_pages(), 3, "all three keys re-indexed");
-            assert_eq!(store.read(1).expect("reload read 1").as_ref(), &[1u8; 8]);
-            assert_eq!(store.read(3).expect("reload read 3").as_ref(), &[3u8; 8]);
-        }
-
-        // session 3: mismatched epoch discards stale memory.
-        {
-            let mut store = KvTierStore::with_budget(0, 8);
-            let reloaded = store.load(root.clone(), 32, 8, "epoch-B".to_string());
-            assert!(reloaded, "durable disk tier still attaches");
-            assert_eq!(store.disk_pages(), 0, "stale-epoch index starts cold");
-            assert!(store.read(1).is_err(), "stale-epoch key must not resolve");
+            match mode.as_ref() {
+                "write" => {
+                    assert!(store.set_disk_durable(root, 32, 8, epoch, 1, 4, 3));
+                    assert!(store.insert(1, vec![1; 8]));
+                    assert!(store.insert(2, vec![2; 8]));
+                    assert!(store.insert(3, vec![3; 8]));
+                }
+                "read" => {
+                    assert!(store.load(root, 32, 8, epoch, 1, 4, 3));
+                    assert_eq!(store.disk_pages(), 3);
+                    assert_eq!(store.read(1).expect("reload read 1").as_ref(), &[1u8; 8]);
+                    assert_eq!(store.read(3).expect("reload read 3").as_ref(), &[3u8; 8]);
+                    assert!(store.insert(4, vec![4; 8]));
+                    assert_eq!(store.read(4).expect("new read 4").as_ref(), &[4u8; 8]);
+                }
+                "contend" => assert!(!store.set_disk_durable(root, 32, 8, epoch, 1, 4, 3)),
+                mode => panic!("unknown cross-process mode {mode}"),
+            }
+            return;
         }
 
+        let root = temp_root("durable_mmap");
+        let test = "kv_tier::tests::durable_manifest_round_trips_disk_index_across_processes";
+        let run = |mode| {
+            std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args(["--exact", test])
+                .env(MODE, mode)
+                .env(ROOT, &root)
+                .status()
+                .expect("spawn test child")
+        };
+        let mut owner = KvTierStore::with_budget(0, 8);
+        assert!(owner.set_disk_durable(root.clone(), 32, 8, epoch, 1, 4, 3));
+        assert!(run("contend").success(), "lock contender child failed");
+        drop(owner);
+        for mode in ["write", "read"] {
+            assert!(run(mode).success(), "{mode} child failed");
+        }
+        assert!(
+            root.join("arle-kv-recall-epoch-A-format-1-world-4-rank-3-page-8")
+                .exists()
+        );
+        let writer = std::fs::read_to_string(root.join("write.pid")).expect("writer pid");
+        let reader = std::fs::read_to_string(root.join("read.pid")).expect("reader pid");
+        assert_ne!(
+            writer, reader,
+            "write and reload must run in different PIDs"
+        );
         std::fs::remove_dir_all(&root).expect("cleanup");
     }
 
@@ -1261,7 +1354,7 @@ mod tests {
 
         {
             let mut store = KvTierStore::with_budget(0, 16);
-            assert!(store.set_disk_durable(root.clone(), 32, 16, epoch.clone()));
+            assert!(store.set_disk_durable(root.clone(), 32, 16, epoch.clone(), 1, 1, 0));
             assert!(store.insert(11, b"tiny".to_vec()));
             assert!(store.insert(12, b"payload-123".to_vec()));
             let disk = store.disk.as_ref().expect("disk tier");
@@ -1275,7 +1368,7 @@ mod tests {
 
         {
             let mut store = KvTierStore::with_budget(0, 16);
-            let reloaded = store.load(root.clone(), 32, 16, epoch.clone());
+            let reloaded = store.load(root.clone(), 32, 16, epoch.clone(), 1, 1, 0);
             assert!(reloaded, "load reports prior blocks reloaded");
             assert_eq!(store.read(11).expect("reload read 11").as_ref(), b"tiny");
             assert_eq!(
@@ -1287,6 +1380,24 @@ mod tests {
             assert_eq!(disk.keys.get(&12), Some(&DiskRecord { slot: 0, len: 11 }),);
         }
 
+        std::fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn durable_load_with_changed_capacity_starts_cold() {
+        let root = temp_root("durable_geometry");
+        let epoch = "epoch-A".to_string();
+        {
+            let mut store = KvTierStore::with_budget(0, 8);
+            assert!(store.set_disk_durable(root.clone(), 32, 8, epoch.clone(), 1, 1, 0));
+            assert!(store.insert(1, vec![1; 8]));
+        }
+        let mut store = KvTierStore::with_budget(0, 8);
+        assert!(store.load(root.clone(), 64, 8, epoch, 1, 1, 0));
+        assert_eq!(store.disk_pages(), 0);
+        assert!(store.read(1).is_err());
+        assert!(store.insert(2, vec![2; 8]));
+        drop(store);
         std::fs::remove_dir_all(&root).expect("cleanup");
     }
 }

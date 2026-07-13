@@ -1120,11 +1120,16 @@ impl Qwen35CudaExecutor {
         let recall_attached = match self.recall_tier.as_mut() {
             Some(tier) => {
                 let page_bytes = tier.page_bytes();
-                tier.set_disk_durable(
+                tier.load(
                     root.clone(),
                     budget_bytes,
                     page_bytes,
                     self.weights_epoch.clone(),
+                    self.kv_format
+                        .stable_tag()
+                        .expect("persisted KV format must have a stable tag"),
+                    self.model.tp.config().world_size,
+                    self.model.tp.config().rank,
                 )
             }
             None => false,
@@ -1166,14 +1171,30 @@ impl Qwen35CudaExecutor {
             // Try loading prior session durable NVMe spill if disk is configured.
             // Falls through to set_disk_durable on first run or epoch mismatch.
             if let (Some(root), Some(budget)) = (self.disk_root.as_ref(), self.disk_budget) {
-                let loaded =
-                    tier.load(root.clone(), budget, page_bytes, self.weights_epoch.clone());
+                let format_tag = self
+                    .kv_format
+                    .stable_tag()
+                    .expect("persisted KV format must have a stable tag");
+                let rank = self.model.tp.config().rank;
+                let world_size = self.model.tp.config().world_size;
+                let loaded = tier.load(
+                    root.clone(),
+                    budget,
+                    page_bytes,
+                    self.weights_epoch.clone(),
+                    format_tag,
+                    world_size,
+                    rank,
+                );
                 if !loaded {
                     tier.set_disk_durable(
                         root.clone(),
                         budget,
                         page_bytes,
                         self.weights_epoch.clone(),
+                        format_tag,
+                        world_size,
+                        rank,
                     );
                 }
             }
