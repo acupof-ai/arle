@@ -166,14 +166,14 @@ impl KvMmapStore {
 
         let file = OpenOptions::new().read(true).write(true).open(path)?;
         let actual = file.metadata()?.len() as usize;
-        if actual < total_bytes {
+        if actual != total_bytes {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("mmap store file {actual}B < expected {total_bytes}B"),
+                format!("mmap store file {actual}B != expected {total_bytes}B"),
             ));
         }
 
-        // SAFETY: the file length was verified >= `total_bytes` above and
+        // SAFETY: the file length was verified == `total_bytes` above and
         // `_file` keeps it open for the mapping's lifetime. Sound as long as no
         // external process truncates the backing file while mapped (mmap's
         // inherent contract).
@@ -188,7 +188,7 @@ impl KvMmapStore {
             mapping,
             slot_bytes,
             num_slots,
-            free_list: Vec::with_capacity(num_slots as usize),
+            free_list: (0..num_slots).collect(),
         })
     }
 
