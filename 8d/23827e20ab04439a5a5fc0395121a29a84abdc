@@ -1,0 +1,21 @@
+docs/experience/errors/2026-07-13-dspark-dsv4-draft-context-blind-at-gating-pos.md
+  s_3d949abe53b900::t_fe0f2121b7ddb9 52-71,74-81
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "8d23827e20ab04439a5a5fc0395121a29a84abdc",
+  "prompts": {},
+  "sessions": {
+    "s_3d949abe53b900": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "92f2c43c-22c8-4f1d-8b27-d06d6f3c59ad",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
