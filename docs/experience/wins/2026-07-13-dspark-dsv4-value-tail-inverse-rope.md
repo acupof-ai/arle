@@ -51,13 +51,29 @@ embedding. So the draft forward outputs a **constant block_hidden** carrying zer
 information; the tied head always emits 24132. All apparent accepts ride on the
 Markov bigram, never the forward.
 
-The exit head STRUCTURE is verified correct (mirrors the main model's
-`head_normed_rows` @ `dsv4.rs:2944`: `mtp.2.norm(mtp.2.hc_head(stream))` vs
-`self.norm(self.head_hc(stream))`), so the constant enters EARLIER. Next step is a
-numerical bisect — dump the stream L2/variance after embed → stage0 → stage1 →
-stage2 → exit-head — to find where it collapses to constant, then fix that stage's
-DSv4-only substitution (`main_proj` context fuse / stage attn-MoE-HC / a mis-loaded
-`mtp.*` weight). NOT the window, NOT geometry.
+### Bisect results + eliminated suspects (2026-07-13)
+
+`[dspark-stat]` L2/spread bisect (embed → context → stage0/1/2 → exit) shows the
+stages DO vary with input (stage0-2 L2 in the 100s–1000s, cross-row spread 4–8);
+the RMSNorms confound a clean "spread→0" localization (each resets magnitude).
+`base_argmax` is directionally degenerate — attractor-collapse to a SET
+({9722, 112434, 24132, 35119, 18942, …}) with some input variation, not a single
+constant. My earlier "pegged at 24132" was one state; the general failure is
+attractor-collapse, not a frozen constant.
+
+**Eliminated (verified correct, do NOT re-check):**
+- **Exit head** — structurally mirrors `head_normed_rows` (`mtp.2.norm(mtp.2.hc_head(·))`).
+- **`main_proj` tap-fuse interleave** — the HC stream is LANE-MAJOR
+  (`dsv4_mhc.cu:140` `col = idx % hidden_size`, lane `l` at `[l*hidden..(l+1)*hidden]`);
+  the fuse slices `tap[r*hidden..(r+1)*hidden]` — matches. Correct.
+- **inverse-RoPE value tail** — fixed here.
+
+**Remaining (systematic, next):** a subtle weight-mapping swap/transpose in the
+draft `mtp.0/1/2` tensors (attention `wq_b`/`wkv`/`wo`, MoE, `main_proj`, `hc_head`,
+`norm`, `markov_*`) vs the `deepseek-spec` contract, OR a numerical bug needing
+layer-by-layer comparison against the DeepSeek reference. Attractor-collapse to
+specific tokens smells like a weight swap/transpose. NOT the window, NOT geometry,
+NOT the exit/fuse.
 
 ## Rule
 
