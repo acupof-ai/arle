@@ -53,7 +53,10 @@ for round in $(seq 0 $((ROUNDS - 1))); do
     --lora-rank "$LORA_RANK" --lora-alpha "$LORA_ALPHA" --lora-target-set "$LORA_TARGET_SET" \
     --lr "$LR" ${adapter:+--lora-adapters "$adapter"} \
     --save-lora-adapters "$next_adapter" 2>&1 | tee "$rdir/train.log"
-  adapter="$next_adapter"
+  # --save-lora-adapters writes <dir>/adapters_replay/{adapter_model.safetensors,..}
+  # + a <dir>/latest symlink; the serve + resume loaders read the adapter dir
+  # directly (no symlink-follow / descend), so chain the real subdir.
+  adapter="$next_adapter/adapters_replay"
 
   # 3. Periodic held-out eval — ALSO cc-harness (train==eval==serve under cc).
   # NOT `agent-opd --rounds 0`: that eval uses the inference engine, which loads
