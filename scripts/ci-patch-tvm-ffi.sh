@@ -12,8 +12,9 @@ PATCH="$ROOT/crates/cuda-kernels/tools/tilelang/patches/tvm-ffi-legacy-tvm-compa
 PIN="$(grep -oE 'apache-tvm-ffi==[0-9.]+' "$ROOT/requirements-build.txt" | cut -d= -f3)"
 
 # Vanilla 0.1.12 aborts the process (SIGABRT) on import, so a clean import here
-# means the patch already landed — nothing to do.
-if python -c "import tilelang" 2>/dev/null; then
+# means the patch already landed — nothing to do. Use python3: the slim CUDA
+# image has no bare `python` (only python3), which exit-127'd the final check.
+if python3 -c "import tilelang" 2>/dev/null; then
   echo "tilelang imports cleanly; tvm-ffi patch not needed"
   exit 0
 fi
@@ -36,4 +37,4 @@ pip install --no-cache-dir -U \
   'setuptools>=77' 'packaging>=24.2' wheel scikit-build-core setuptools_scm cython ninja 'cmake<4'
 pip wheel --no-cache-dir --no-deps --no-build-isolation -w "$work" "$src"
 pip install --force-reinstall --no-deps "$work"/apache*tvm*ffi-*.whl
-python -c "import tilelang; print('tilelang', tilelang.__version__, 'tvm-ffi patched-ok')"
+python3 -c "import tilelang; print('tilelang', tilelang.__version__, 'tvm-ffi patched-ok')"
