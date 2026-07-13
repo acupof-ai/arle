@@ -49,10 +49,33 @@ draft's **gating-position** prediction tracks the context-dependent target — i
 `draft[0]` is constant per anchor while `target[0]` varies, the draft is
 context-blind regardless of accept magnitude on a lucky case.
 
+## Refinement (measured — `base_argmax` probe)
+
+Added a diagnostic field: `base_argmax` = the draft's pure-forward greedy pick per
+block row BEFORE the Markov bias. One full-block run (Roman-Empire prompt, 60
+chains / 300 drafted / **0 accepted**) splits the hypotheses:
+
+- **"Markov masks a working forward" — REJECTED.** With the Markov bias removed,
+  `base_argmax[0]` STILL never matches `target[0]` (anchor 7726 → base 53316 vs
+  target 4608; anchor 223 → base 4649 vs target 29658). The forward itself is
+  wrong, not merely biased.
+- **"Fully context-blind" — REJECTED.** `base_argmax[0]` DOES vary with context
+  for a fixed anchor (7726 → 53316 then 38946; 223 → 4649/97267/70610/117626).
+  Attention is doing something.
+
+The real failure: **the 3-stage draft forward is numerically degenerate** —
+context-sensitive but producing a wrong distribution that collapses toward ~7
+attractor tokens (53316, 125095, 113530, 117626, 127279, 70610, 36613) across all
+anchors/positions, often the same token repeated across a whole block
+(`base_argmax=[53316,53316,53316,53316,53316]`). Never target-aligned.
+
 ## Open (next, unstarted)
 
-Isolate why the gating-position attention signal is dominated: (a) Markov bias
-magnitude vs base-logit magnitude at pos0 (zero the bias, re-measure `draft[0]`
-tracking); (b) context-fusion (`main_proj` of the 3 taps) correctness; (c) block
-self-attention diluting context (noise keys dominating softmax). NOT the window,
-NOT the RoPE base offset.
+This is a correctness bug in the draft forward, NOT geometry/window/Markov.
+Attractor-collapse across all contexts smells like a systematic
+weight-mapping/layout or norm-scale error. Cheapest first: (a) audit the draft
+weight loading / tensor-name mapping for the DSv4-specific pieces the shipped
+Qwen3.6 DSpark doesn't have (MLA `wq_b`/`wkv`/`wo`, `main_proj` HC-fuse, DSv4 MoE,
+exit `hc_head`→tied `lm_head`); (b) if source-clean, dump `block_hidden` norm/stats
+to locate where the attractor-collapse enters (embed→HC→attn→MoE→exit). The Qwen
+B track works with the same skeleton, so the bug is in a DSv4-only substitution.
