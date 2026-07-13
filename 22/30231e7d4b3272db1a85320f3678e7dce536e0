@@ -1,0 +1,21 @@
+scripts/ci-patch-tvm-ffi.sh
+  s_c5b532ba176b27::t_7dcf83b8ee9fc9 15-17,40
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "2230231e7d4b3272db1a85320f3678e7dce536e0",
+  "prompts": {},
+  "sessions": {
+    "s_c5b532ba176b27": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4db221a6-91f5-4cb0-aa41-0e30311ecba8",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
