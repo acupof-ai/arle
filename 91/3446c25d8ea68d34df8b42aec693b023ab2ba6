@@ -1,0 +1,21 @@
+docs/plans/2026-07-11-dspark-dsv4-flash-spec-decode.md
+  s_67f30536ea8bd0::t_9cff4c2d1ba36a 73-86
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "913446c25d8ea68d34df8b42aec693b023ab2ba6",
+  "prompts": {},
+  "sessions": {
+    "s_67f30536ea8bd0": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f5a4e-8eeb-78c0-9eae-63b67e06ffcb",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
