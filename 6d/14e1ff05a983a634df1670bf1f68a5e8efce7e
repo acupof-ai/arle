@@ -1,0 +1,21 @@
+crates/cuda-kernels/tools/tilelang/gated_delta_rule.py
+  s_c5b532ba176b27::t_3645eced5ce77e 63-64,90-110,251,266,276-277,600,617-619,629-630,647-648,664,666,695,719-722,725,747,750,767-768,770-771,807,812,815,850,874-877,887,891,894,898-899,928,930
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.5",
+  "base_commit_sha": "6d14e1ff05a983a634df1670bf1f68a5e8efce7e",
+  "prompts": {},
+  "sessions": {
+    "s_c5b532ba176b27": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4db221a6-91f5-4cb0-aa41-0e30311ecba8",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
