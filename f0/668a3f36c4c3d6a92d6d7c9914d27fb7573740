@@ -1,0 +1,29 @@
+crates/cuda-kernels/csrc/attention/dsv4_dspark_draft_attention.cu
+  s_3d949abe53b900::t_6d5909b286991b 16-17,19-25,39-46,52,57,91,98-119,133,135-139,141-142,146,151-153
+crates/cuda-kernels/src/ffi/attention.rs
+  s_3d949abe53b900::t_0c086053cae736 194-198,209,211-215
+crates/infer-cuda/src/dsv4/dspark.rs
+  s_3d949abe53b900::t_9465d84c10bbbd 316-319,331,333-337,724-728,766-769,860
+crates/infer-cuda/src/executor/dsv4.rs
+  s_3d949abe53b900::t_c031ff476e1eee 1436-1437
+docs/experience/wins/2026-07-13-dspark-dsv4-value-tail-inverse-rope.md
+  s_3d949abe53b900::t_c915ca45570475 1-61
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "f0668a3f36c4c3d6a92d6d7c9914d27fb7573740",
+  "prompts": {},
+  "sessions": {
+    "s_3d949abe53b900": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "92f2c43c-22c8-4f1d-8b27-d06d6f3c59ad",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
