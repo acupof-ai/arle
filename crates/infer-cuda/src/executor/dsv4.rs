@@ -1321,12 +1321,41 @@ impl Dsv4CudaExecutor {
                 *conf_threshold,
             )?
         };
-        let draft_len = proposal.draft_len;
+        let mut proposal = proposal;
         ensure!(
-            proposal.chain.len() == draft_len + 1 && proposal.chain[0] == anchor,
-            "DSpark proposal chain {} != draft_len {draft_len} + 1 (anchor {anchor})",
-            proposal.chain.len()
+            proposal.chain.len() == proposal.draft_len + 1 && proposal.chain[0] == anchor,
+            "DSpark proposal chain {} != draft_len {} + 1 (anchor {anchor})",
+            proposal.chain.len(),
+            proposal.draft_len,
         );
+
+        // TP lockstep: the proposal (sampling + confidence truncation over the
+        // draft backbone's block_hidden) is rank-local and drifts across ranks by
+        // FP — a divergent draft_len feeds `forward_tokens_verify` a different
+        // token count per rank, mismatching the per-forward collective count and
+        // deadlocking the coordinator. Adopt rank 0's block so every rank verifies
+        // the same shape+tokens. (Greedy gate: the argmax accept ignores
+        // draft_logits; sampled-mode q reconciliation is a separate lever.)
+        if self.model.tp.config().world_size > 1 {
+            let block = self.model.config.dspark_block_size;
+            let mut payload = vec![0i32; 2 + block];
+            payload[0] = proposal.draft_len as i32;
+            for (i, &t) in proposal.chain.iter().enumerate() {
+                payload[1 + i] = t as i32;
+            }
+            let r0 = self
+                .model
+                .tp
+                .broadcast_rank0_i32(&self.model.ctx, &payload)?;
+            let r0_len = r0[0] as usize;
+            let r0_chain: Vec<u32> = r0[1..2 + r0_len].iter().map(|&v| v as u32).collect();
+            if r0_chain != proposal.chain {
+                proposal.chain = r0_chain;
+                proposal.draft_len = r0_len;
+                proposal.draft_logits = None; // for rank 0's (discarded) tokens
+            }
+        }
+        let draft_len = proposal.draft_len;
 
         // Snapshot the boundary rings the verify will overwrite so a rejected
         // draft tail rolls back (MTP-shared substrate). Nothing has touched the
@@ -1361,7 +1390,20 @@ impl Dsv4CudaExecutor {
         while accepted < draft_len && verify.argmax[accepted] == proposal.chain[accepted + 1] {
             accepted += 1;
         }
-        let bonus = verify.argmax[accepted];
+        let mut bonus = verify.argmax[accepted];
+
+        // TP lockstep: accepted/bonus derive from `verify.argmax` (rank-local FP);
+        // adopt rank 0's so every rank truncates+commits an identical KV tail —
+        // the next tick's combined attention reads all ranks' KV shards, so an
+        // inconsistent commit corrupts it.
+        if self.model.tp.config().world_size > 1 {
+            let r0 = self
+                .model
+                .tp
+                .broadcast_rank0_i32(&self.model.ctx, &[accepted as i32, bonus as i32])?;
+            accepted = r0[0] as usize;
+            bonus = r0[1] as u32;
+        }
 
         // Commit: keep anchor + accepted drafts (`accepted + 1` rows), truncate
         // the rejected tail, restore the rejected ring slots (order: truncate →
