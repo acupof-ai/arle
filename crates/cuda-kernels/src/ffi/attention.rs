@@ -203,12 +203,6 @@ unsafe extern "C" {
         head_dim: i32,
         nope_dim: i32,
         rope_dim: i32,
-        block_start: i32,
-        rope_base: f32,
-        original_seq_len: i32,
-        factor: f32,
-        beta_fast: f32,
-        beta_slow: f32,
         sm_scale: f32,
         stream: CUstream,
     ) -> CUresult;
