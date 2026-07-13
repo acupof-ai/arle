@@ -1,0 +1,23 @@
+crates/cli/src/train_cli.rs
+  s_9c91b86ec3fb55::t_ee610f9a2d0fdb 2119,2141-2142,2144,2290-2298,2399
+scripts/cc_opd_loop.sh
+  s_9c91b86ec3fb55::t_68c02849172eb6 22-23
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "65268048a027e75439c3af37f162905c73bc5712",
+  "prompts": {},
+  "sessions": {
+    "s_9c91b86ec3fb55": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4779911a-69b7-49db-bc83-daf5a48d6ca3",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
