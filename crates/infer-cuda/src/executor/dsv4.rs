@@ -1308,6 +1308,7 @@ impl Dsv4CudaExecutor {
                 &mut rt.attn_states,
                 slots[slot_idx].dspark_taps(),
                 anchor,
+                verify_pos,
             )?;
             model.dspark_build_proposal(
                 draft,
