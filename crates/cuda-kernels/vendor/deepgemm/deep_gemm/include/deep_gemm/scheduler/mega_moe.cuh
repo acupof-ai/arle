@@ -26,13 +26,14 @@ template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t kNumL1BlockNs = L1_SHAPE_N / BLOCK_N,
           uint32_t kNumL2BlockNs = L2_SHAPE_N / BLOCK_N,
           uint32_t kNumL1BlockKs = L1_SHAPE_K / BLOCK_K,
-          uint32_t kNumL2BlockKs = L2_SHAPE_K / BLOCK_K>
+          uint32_t kNumL2BlockKs = L2_SHAPE_K / BLOCK_K,
+          typename WorkspaceT = layout::Workspace>
 struct MegaMoEScheduler {
     DG_STATIC_ASSERT(L1_SHAPE_N % BLOCK_N == 0, "Invalid shape");
     DG_STATIC_ASSERT(L2_SHAPE_N % BLOCK_N == 0, "Invalid shape");
     DG_STATIC_ASSERT(L1_SHAPE_K % BLOCK_K == 0, "Invalid shape");
     DG_STATIC_ASSERT(L2_SHAPE_K % BLOCK_K == 0, "Invalid shape");
-    DG_STATIC_ASSERT(kNumExpertsPerRank % kNumExpertsPerWave == 0, "Invalid wave config");
+    DG_STATIC_ASSERT(kNumExpertsPerWave > 0 and kNumExpertsPerWave <= kNumExpertsPerRank, "Invalid wave config");
 
     // NOTES: N block counts must be even so that 2 adjacent CTAs in a cluster
     // always land on the same m_block_idx with n_block_idx differing by 1
@@ -41,7 +42,7 @@ struct MegaMoEScheduler {
     DG_STATIC_ASSERT(kNumL2BlockNs % 2 == 0, "L2 N block count must be even for 2-CTA cluster");
 
     // Arrival counts
-    const layout::Workspace& workspace;
+    const WorkspaceT& workspace;
 
     // Scheduler state
     BlockPhase next_phase = BlockPhase::Linear1;
@@ -58,12 +59,14 @@ struct MegaMoEScheduler {
     // Layout: `stored_num_tokens_per_expert[i]` holds expert (i * 32 + lane_idx)'s count
     uint32_t stored_num_tokens_per_expert[kNumExpertsPerLane] = {};
 
-    CUTLASS_DEVICE explicit MegaMoEScheduler(const layout::Workspace& workspace): workspace(workspace) {
+    CUTLASS_DEVICE explicit MegaMoEScheduler(const WorkspaceT& workspace): workspace(workspace) {
         block_idx = blockIdx.x;
     }
 
     CUTLASS_DEVICE uint32_t get_wave_expert_end_idx() const {
-        return math::align(current_local_expert_idx + 1, kNumExpertsPerWave);
+        // Align up to wave boundary, clamped for the last partial wave
+        const auto aligned = math::align(current_local_expert_idx + 1, kNumExpertsPerWave);
+        return cute::min(aligned, kNumExpertsPerRank);
     }
 
     CUTLASS_DEVICE uint32_t get_num_tokens(const uint32_t& expert_idx) const {
