@@ -34,6 +34,9 @@
 #include <utility>
 #include <vector>
 
+#include <csrc/jit_kernels/heuristics/sm90_mega_moe_core.hpp>
+#include <deep_gemm/layout/sym_buffer.cuh>
+
 #ifndef ARLE_DEEPGEMM_DEFAULT_LIBRARY_ROOT
 #define ARLE_DEEPGEMM_DEFAULT_LIBRARY_ROOT "vendor/deepgemm/deep_gemm"
 #endif
@@ -111,6 +114,23 @@ struct GemmDesc {
   int max_block_m = 128;
 };
 
+struct Sm90MegaMoeWorkspaceLayout {
+  uint64_t num_bytes;
+  uint64_t x;
+  uint64_t x_sf;
+  uint64_t topk_idx;
+  uint64_t topk_weights;
+  uint64_t l1_acts;
+  uint64_t l1_acts_sf;
+  uint64_t l1_topk_weights;
+  uint64_t l2_acts;
+  uint64_t l2_acts_sf;
+  uint64_t combine;
+  int num_max_pool_tokens;
+  int num_padded_sf_pool_tokens;
+  int num_max_tokens_per_rank;
+};
+
 struct LayoutInfo {
   int64_t num_cycles;
   Layout layout;
@@ -151,9 +171,17 @@ ARLE_DECL_LAZY_CUDA_DRIVER_FUNCTION(cuTensorMapEncodeTiled);
 ARLE_DECL_LAZY_CUDA_DRIVER_FUNCTION(cuModuleLoad);
 ARLE_DECL_LAZY_CUDA_DRIVER_FUNCTION(cuModuleUnload);
 ARLE_DECL_LAZY_CUDA_DRIVER_FUNCTION(cuModuleGetFunction);
+#if CUDART_VERSION >= 12080 && defined(DG_JIT_USE_RUNTIME_API)
+using LibraryHandle = cudaLibrary_t;
+using KernelHandle = cudaKernel_t;
+using LaunchConfigHandle = cudaLaunchConfig_t;
+using LaunchAttrHandle = cudaLaunchAttribute;
+#else
 using LibraryHandle = CUmodule;
-
 using KernelHandle = CUfunction;
+using LaunchConfigHandle = CUlaunchConfig;
+using LaunchAttrHandle = CUlaunchAttribute;
+#endif
 
 void unload_library(const LibraryHandle& library);
 
@@ -468,21 +496,37 @@ KernelHandle load_kernel(
     LibraryHandle* library_out) {
   LibraryHandle library{};
   KernelHandle kernel{};
+#if CUDART_VERSION >= 12080 && defined(DG_JIT_USE_RUNTIME_API)
+  const auto load_error = cudaLibraryLoadFromFile(
+      &library, cubin_path.c_str(), nullptr, nullptr, 0, nullptr, nullptr, 0);
+  if (load_error != cudaSuccess)
+    throw std::runtime_error(cudaGetErrorString(load_error));
+  const auto kernel_error = cudaLibraryGetKernel(&kernel, library, func_name.c_str());
+  if (kernel_error != cudaSuccess)
+    throw std::runtime_error(cudaGetErrorString(kernel_error));
+#else
   check_driver(lazy_cuModuleLoad(&library, cubin_path.c_str()), "cuModuleLoad");
   check_driver(lazy_cuModuleGetFunction(&kernel, library, func_name.c_str()),
                "cuModuleGetFunction");
+#endif
   if (library_out != nullptr) *library_out = library;
   return kernel;
 }
 
 void unload_library(const LibraryHandle& library) {
+#if CUDART_VERSION >= 12080 && defined(DG_JIT_USE_RUNTIME_API)
+  const auto err = cudaLibraryUnload(library);
+  if (err != cudaSuccess && err != cudaErrorCudartUnloading)
+    throw std::runtime_error(cudaGetErrorString(err));
+#else
   const auto err = lazy_cuModuleUnload(library);
   if (err != CUDA_SUCCESS && err != CUDA_ERROR_DEINITIALIZED) {
     check_driver(err, "CUDA library unload");
   }
+#endif
 }
 
-CUlaunchConfig construct_launch_config(
+LaunchConfigHandle construct_launch_config(
     KernelHandle kernel,
     cudaStream_t stream,
     int smem_size,
@@ -490,6 +534,31 @@ CUlaunchConfig construct_launch_config(
     dim3 block_dim,
     int cluster_dim,
     bool enable_pdl) {
+#if CUDART_VERSION >= 12080 && defined(DG_JIT_USE_RUNTIME_API)
+  if (smem_size > 0) {
+    const auto err = cudaFuncSetAttribute(
+        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+    if (err != cudaSuccess) throw std::runtime_error(cudaGetErrorString(err));
+  }
+  LaunchConfigHandle config{};
+  config.gridDim = grid_dim;
+  config.blockDim = block_dim;
+  config.dynamicSmemBytes = smem_size;
+  config.stream = stream;
+  static thread_local LaunchAttrHandle attrs[2];
+  config.numAttrs = 0;
+  config.attrs = attrs;
+  if (cluster_dim > 1) {
+    auto& attr = attrs[config.numAttrs++];
+    attr.id = cudaLaunchAttributeClusterDimension;
+    attr.val.clusterDim = {static_cast<unsigned>(cluster_dim), 1, 1};
+  }
+  if (enable_pdl) {
+    auto& attr = attrs[config.numAttrs++];
+    attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attr.val.programmaticStreamSerializationAllowed = 1;
+  }
+#else
   if (smem_size > 0) {
     check_driver(
         lazy_cuFuncSetAttribute(
@@ -497,7 +566,7 @@ CUlaunchConfig construct_launch_config(
         "cuFuncSetAttribute");
   }
 
-  CUlaunchConfig config{};
+  LaunchConfigHandle config{};
   config.gridDimX = grid_dim.x;
   config.gridDimY = grid_dim.y;
   config.gridDimZ = grid_dim.z;
@@ -507,7 +576,7 @@ CUlaunchConfig construct_launch_config(
   config.sharedMemBytes = smem_size;
   config.hStream = stream;
 
-  static thread_local CUlaunchAttribute attrs[2];
+  static thread_local LaunchAttrHandle attrs[2];
   config.numAttrs = 0;
   config.attrs = attrs;
 
@@ -524,17 +593,22 @@ CUlaunchConfig construct_launch_config(
     attr.id = CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION;
     attr.value.programmaticStreamSerializationAllowed = 1;
   }
+#endif
 
   return config;
 }
 
 template <typename... Args>
-CUresult launch_kernel(KernelHandle kernel, const CUlaunchConfig& config, Args&&... args) {
+CUresult launch_kernel(KernelHandle kernel, const LaunchConfigHandle& config, Args&&... args) {
   void* ptr_args[] = {
       const_cast<void*>(reinterpret_cast<const void*>(&args))...,
   };
+#if CUDART_VERSION >= 12080 && defined(DG_JIT_USE_RUNTIME_API)
+  return static_cast<CUresult>(cudaLaunchKernelExC(&config, kernel, ptr_args));
+#else
   return lazy_cuLaunchKernelEx(
-      const_cast<CUlaunchConfig*>(&config), kernel, ptr_args, nullptr);
+      const_cast<LaunchConfigHandle*>(&config), kernel, ptr_args, nullptr);
+#endif
 }
 
 int get_tma_aligned_size(int x, int elem_size) {
@@ -739,6 +813,18 @@ CUtensorMap make_tma_2d_desc_raw(
           CU_TENSOR_MAP_L2_PROMOTION_L2_256B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE),
       "cuTensorMapEncodeTiled");
   return tensor_map;
+}
+
+CUtensorMap make_tma_sf_desc_raw(
+    const void* ptr,
+    int shape_mn,
+    int shape_k,
+    int block_mn,
+    int gran_k) {
+  shape_mn = get_tma_aligned_size(shape_mn, sizeof(float));
+  return make_tma_2d_desc_raw(
+      ptr, CU_TENSOR_MAP_DATA_TYPE_FLOAT32, sizeof(float), shape_mn,
+      ceil_div(shape_k, gran_k), block_mn, 1, shape_mn, 0);
 }
 
 CUtensorMap make_tma_3d_desc_raw(
@@ -1761,6 +1847,166 @@ extern "C" CUresult dsv4_deepgemm_native_preflight_cuda(
     return report.ok ? CUDA_SUCCESS : CUDA_ERROR_NOT_SUPPORTED;
   } catch (const std::exception& err) {
     write_c_string(out, out_len, std::string("status=failed error=") + err.what());
+    return CUDA_ERROR_UNKNOWN;
+  }
+}
+
+extern "C" CUresult dsv4_sm90_mega_moe_workspace_layout_cuda(
+    int num_ranks,
+    int num_experts,
+    int requested_max_tokens_per_rank,
+    int num_topk,
+    int hidden,
+    int intermediate_hidden,
+    Sm90MegaMoeWorkspaceLayout* out) {
+  if (out == nullptr || num_ranks <= 0 || num_experts <= 0 ||
+      requested_max_tokens_per_rank <= 0 || num_topk <= 0 || hidden <= 0 ||
+      intermediate_hidden <= 0 ||
+      requested_max_tokens_per_rank >
+          std::numeric_limits<int>::max() - deep_gemm::layout::kLCMCandidateBlockM + 1) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  try {
+    constexpr int kTokenAlignment = deep_gemm::layout::kLCMCandidateBlockM;
+    const int max_tokens = align_to(requested_max_tokens_per_rank, kTokenAlignment);
+    const auto layout = deep_gemm::get_sm90_mega_moe_workspace_layout(
+        num_ranks, num_experts, max_tokens, num_topk, hidden, intermediate_hidden);
+    *out = {
+        layout.num_bytes,
+        layout.x,
+        layout.x_sf,
+        layout.topk_idx,
+        layout.topk_weights,
+        layout.l1_acts,
+        layout.l1_acts_sf,
+        layout.l1_topk_weights,
+        layout.l2_acts,
+        layout.l2_acts_sf,
+        layout.combine,
+        layout.num_max_pool_tokens,
+        layout.num_padded_sf_pool_tokens,
+        max_tokens,
+    };
+    return CUDA_SUCCESS;
+  } catch (const std::exception& err) {
+    std::fprintf(stderr, "DeepGEMM SM90 MegaMoE workspace failed: %s\n", err.what());
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+}
+
+extern "C" CUresult dsv4_sm90_mega_moe_launch_cuda(
+    void* y,
+    int* cumulative_local_expert_recv_stats,
+    const uint64_t* peer_buffer_ptrs,
+    void* local_workspace,
+    int num_ranks,
+    int rank_idx,
+    int num_max_tokens_per_rank,
+    int num_tokens,
+    int num_experts,
+    int num_topk,
+    int hidden,
+    int intermediate_hidden,
+    float activation_clamp,
+    int fast_math,
+    int enable_pdl,
+    const unsigned char* l1_weights,
+    int l1_weight_stride,
+    const float* l1_weights_sf,
+    const unsigned char* l2_weights,
+    int l2_weight_stride,
+    const float* l2_weights_sf,
+    CUstream stream) {
+  if (y == nullptr || peer_buffer_ptrs == nullptr || local_workspace == nullptr ||
+      l1_weights == nullptr || l1_weights_sf == nullptr || l2_weights == nullptr ||
+      l2_weights_sf == nullptr || stream == nullptr ||
+      num_ranks <= 0 || num_ranks > static_cast<int>(deep_gemm::layout::kNumMaxRanks) ||
+      rank_idx < 0 || rank_idx >= num_ranks || num_max_tokens_per_rank <= 0 ||
+      num_max_tokens_per_rank % deep_gemm::layout::kLCMCandidateBlockM != 0 ||
+      num_tokens <= 0 || num_tokens > num_max_tokens_per_rank || num_experts <= 0 ||
+      num_experts % num_ranks != 0 || num_topk <= 0 || hidden <= 0 ||
+      intermediate_hidden <= 0 || l1_weight_stride < hidden ||
+      l2_weight_stride < intermediate_hidden || fast_math < 0 || fast_math > 1 ||
+      enable_pdl < 0 || enable_pdl > 1 || std::isnan(activation_clamp) ||
+      activation_clamp < 0.0f) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  for (int rank = 0; rank < num_ranks; ++rank) {
+    if (peer_buffer_ptrs[rank] == 0) return CUDA_ERROR_INVALID_VALUE;
+  }
+  if (peer_buffer_ptrs[rank_idx] != reinterpret_cast<uint64_t>(local_workspace)) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+
+  try {
+    cudaDeviceProp prop{};
+    const CUresult prop_err = current_device_prop(&prop);
+    if (prop_err != CUDA_SUCCESS) return prop_err;
+    if (prop.major != 9) return CUDA_ERROR_NOT_SUPPORTED;
+    const int num_sms = env_int("DG_NUM_SMS", prop.multiProcessorCount);
+    if (num_sms <= 0 || num_sms > prop.multiProcessorCount) {
+      return CUDA_ERROR_INVALID_VALUE;
+    }
+    const auto workspace = deep_gemm::get_sm90_mega_moe_workspace_layout(
+        num_ranks, num_experts, num_max_tokens_per_rank, num_topk, hidden,
+        intermediate_hidden);
+    const auto spec = deep_gemm::get_sm90_fp8_mega_moe_kernel_spec(
+        num_ranks, num_experts, num_max_tokens_per_rank, num_tokens, num_topk, hidden,
+        intermediate_hidden, workspace.num_padded_sf_pool_tokens, activation_clamp,
+        fast_math != 0, num_sms, kSm90SmemCapacity,
+        env_int("DG_SM90_FP8_SWAP_AB", 1) != 0);
+    const auto runtime = get_or_build_runtime(
+        "sm90_fp8_mega_moe_native",
+        deep_gemm::generate_sm90_fp8_mega_moe_source(spec), prop.major, prop.minor);
+    std::vector<int64_t> peers(peer_buffer_ptrs, peer_buffer_ptrs + num_ranks);
+    const deep_gemm::layout::SymBuffer<> sym_buffer(peers, rank_idx);
+    const auto& config = spec.config;
+    const auto at = [local_workspace](uint64_t offset) {
+      return static_cast<unsigned char*>(local_workspace) + offset;
+    };
+    const auto tensor_map_l1_acts = make_tma_2d_desc_raw(
+        at(workspace.l1_acts), CU_TENSOR_MAP_DATA_TYPE_UINT8, 1, hidden,
+        config.num_max_pool_tokens, config.block_k, config.block_m, hidden,
+        config.swizzle_acts_mode);
+    const auto tensor_map_l1_acts_sf = make_tma_sf_desc_raw(
+        at(workspace.l1_acts_sf), config.num_padded_sf_pool_tokens, hidden,
+        config.block_m, 128);
+    const auto tma = deep_gemm::get_sm90_mega_moe_tma_config(config);
+    const auto tensor_map_l1_weights = make_tma_2d_desc_raw(
+        l1_weights, CU_TENSOR_MAP_DATA_TYPE_UINT8, 1, hidden,
+        (num_experts / num_ranks) * intermediate_hidden * 2, config.block_k,
+        tma.weight_block_n, l1_weight_stride, config.swizzle_weights_mode);
+    const auto tensor_map_l1_output = make_tma_2d_desc_raw(
+        at(workspace.l2_acts), CU_TENSOR_MAP_DATA_TYPE_UINT8, 1,
+        intermediate_hidden, config.num_max_pool_tokens, tma.l1_output_box_n,
+        tma.l1_output_box_m, intermediate_hidden, 0);
+    const auto tensor_map_l2_acts = make_tma_2d_desc_raw(
+        at(workspace.l2_acts), CU_TENSOR_MAP_DATA_TYPE_UINT8, 1,
+        intermediate_hidden, config.num_max_pool_tokens, config.block_k,
+        config.block_m, intermediate_hidden, config.swizzle_acts_mode);
+    const auto tensor_map_l2_acts_sf = make_tma_sf_desc_raw(
+        at(workspace.l2_acts_sf), config.num_padded_sf_pool_tokens,
+        intermediate_hidden, config.block_m, 64);
+    const auto tensor_map_l2_weights = make_tma_2d_desc_raw(
+        l2_weights, CU_TENSOR_MAP_DATA_TYPE_UINT8, 1, intermediate_hidden,
+        (num_experts / num_ranks) * hidden, config.block_k, tma.weight_block_n,
+        l2_weight_stride, config.swizzle_weights_mode);
+    const auto launch_config = construct_launch_config(
+        runtime->kernel, reinterpret_cast<cudaStream_t>(stream), config.smem_size,
+        dim3(static_cast<unsigned>(num_sms), 1, 1),
+        dim3(static_cast<unsigned>(config.num_dispatch_threads +
+                                   config.num_non_epilogue_threads +
+                                   config.num_epilogue_threads),
+             1, 1),
+        config.cluster_size, enable_pdl != 0);
+    return launch_kernel(
+        runtime->kernel, launch_config, y, cumulative_local_expert_recv_stats, num_tokens,
+        sym_buffer, tensor_map_l1_acts, tensor_map_l1_acts_sf,
+        tensor_map_l1_weights, l1_weights_sf, tensor_map_l1_output,
+        tensor_map_l2_acts, tensor_map_l2_acts_sf, tensor_map_l2_weights,
+        l2_weights_sf);
+  } catch (const std::exception& err) {
+    std::fprintf(stderr, "DeepGEMM SM90 MegaMoE launch failed: %s\n", err.what());
     return CUDA_ERROR_UNKNOWN;
   }
 }
