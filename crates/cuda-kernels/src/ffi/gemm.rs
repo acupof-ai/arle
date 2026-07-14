@@ -349,6 +349,41 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn moe_w4a16_grouped_gemv_batch_cuda(
+        weight_ptrs: *const u64,
+        scale_ptrs: *const u64,
+        input: *const Half,
+        output: *mut Half,
+        offsets: *const i32,
+        counts: *const i32,
+        expert_indices: *const i32,
+        num_experts: i32,
+        max_count: i32,
+        n: i32,
+        k: i32,
+        group_size: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn moe_w4a16_grouped_gemv_pair_batch_cuda(
+        weight_a_ptrs: *const u64,
+        scale_a_ptrs: *const u64,
+        weight_b_ptrs: *const u64,
+        scale_b_ptrs: *const u64,
+        input: *const Half,
+        output_a: *mut Half,
+        output_b: *mut Half,
+        offsets: *const i32,
+        counts: *const i32,
+        expert_indices: *const i32,
+        num_experts: i32,
+        max_count: i32,
+        n: i32,
+        k: i32,
+        group_size: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn dsv4_fp8_grouped_swiglu_decode_cuda(
         weight_gate_ptrs: *const u64,
         scale_gate_ptrs: *const u64,

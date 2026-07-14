@@ -1828,6 +1828,34 @@ mod gpu {
                     )
                 }
             }
+            WeightFormat::W4A16 => {
+                let first = weights
+                    .gate
+                    .first()
+                    .ok_or_else(|| anyhow::anyhow!("W4A16 MoE pair batch has no gate experts"))?;
+                // SAFETY: ptrs from live device allocations sized to the dims passed.
+                unsafe {
+                    moe::moe_w4a16_grouped_gemv_pair_batch(
+                        &weights.gate_ptrs,
+                        opt_ptrs(&weights.gate_scale_ptrs, "gate W4A16 scale")?,
+                        &weights.up_ptrs,
+                        opt_ptrs(&weights.up_scale_ptrs, "up W4A16 scale")?,
+                        cache_ptr(&packed_hidden.data, ctx),
+                        cache_ptr(&gate_out.data, ctx),
+                        cache_ptr(&up_out.data, ctx),
+                        cache_ptr(offsets, ctx),
+                        counts,
+                        cache_ptr(expert_indices, ctx),
+                        local_experts,
+                        max_count,
+                        n,
+                        k,
+                        first.group_size,
+                        ctx,
+                        ctx.stream.cu_stream(),
+                    )
+                }
+            }
             other => anyhow::bail!("unsupported Qwen3.6 MoE pair format {other}"),
         }
     }
@@ -1916,6 +1944,31 @@ mod gpu {
                         k,
                         first.group_size,
                         first.quant_scale_cols,
+                        ctx,
+                        ctx.stream.cu_stream(),
+                    )
+                }
+            }
+            WeightFormat::W4A16 => {
+                let first = weights
+                    .down
+                    .first()
+                    .ok_or_else(|| anyhow::anyhow!("W4A16 MoE down batch has no down experts"))?;
+                // SAFETY: ptrs from live device allocations sized to the dims passed.
+                unsafe {
+                    moe::moe_w4a16_grouped_gemv_batch(
+                        &weights.down_ptrs,
+                        opt_ptrs(&weights.down_scale_ptrs, "down W4A16 scale")?,
+                        cache_ptr(&act.data, ctx),
+                        cache_ptr(&expert_out.data, ctx),
+                        cache_ptr(offsets, ctx),
+                        counts,
+                        cache_ptr(expert_indices, ctx),
+                        local_experts,
+                        max_count,
+                        n,
+                        k,
+                        first.group_size,
                         ctx,
                         ctx.stream.cu_stream(),
                     )

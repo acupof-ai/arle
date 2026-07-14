@@ -2181,6 +2181,9 @@ impl SafetensorLoader {
                 group_size,
                 global_scale_apply,
             } => self.load_fp4_group_view(ctx, view, &shard, group_size, global_scale_apply),
+            QuantFormat::W4A16 { group_size } => {
+                self.load_w4a16_view(ctx, view, &shard, group_size)
+            }
         }
     }
 
@@ -2500,6 +2503,112 @@ impl SafetensorLoader {
             group_size,
         )
         .with_context(|| format!("upload FP4 E2M1 tensor {}", view.name))
+    }
+
+    fn load_w4a16_view(
+        &self,
+        ctx: &DeviceContext,
+        view: &QuantTensorView,
+        shard: &QuantMatrixShard,
+        group_size: usize,
+    ) -> Result<DeviceMatrix> {
+        let weight = self.borrow_raw_tensor(&view.name)?;
+        let rows = view.logical_shape[0];
+        let cols = view.logical_shape[1];
+        ensure!(
+            weight.dtype == Dtype::U8 && weight.shape == [rows, cols / 2],
+            "{}: expected packed U8 [{rows}, {}], got {:?} {:?}",
+            view.name,
+            cols / 2,
+            weight.dtype,
+            weight.shape
+        );
+        let weight_shard =
+            self.shard_fp4_packed_weight_cow(weight.bytes(), rows, cols, group_size, shard)?;
+        let scale = self.borrow_raw_tensor(&view.scale_names[0])?;
+        ensure!(
+            scale.dtype == Dtype::BF16 && scale.shape == [rows, cols / group_size],
+            "{}: expected BF16 group scale [{rows}, {}], got {:?} {:?}",
+            view.scale_names[0],
+            cols / group_size,
+            scale.dtype,
+            scale.shape
+        );
+        let scale_shard =
+            self.shard_w4a16_scales_cow(scale.bytes(), rows, cols, group_size, shard)?;
+        let scale_bf16 = Self::tensor_bytes_to_bf16(
+            &view.scale_names[0],
+            scale.dtype,
+            scale_shard.bytes.as_ref(),
+        )?;
+        // SAFETY: BF16 bytes (2 bytes/elem) are a valid `&[half::bf16]` slice
+        // (align 2, every bit pattern valid).
+        let scales_data: &[half::bf16] = unsafe {
+            std::slice::from_raw_parts(
+                scale_bf16.as_ptr().cast::<half::bf16>(),
+                scale_bf16.len() / 2,
+            )
+        };
+        DeviceMatrix::from_quantized_int4(
+            ctx,
+            weight_shard.bytes.as_ref(),
+            scales_data,
+            weight_shard.rows,
+            weight_shard.cols * 2,
+            group_size,
+        )
+        .with_context(|| format!("upload W4A16 tensor {}", view.name))
+    }
+
+    fn shard_w4a16_scales_cow<'a>(
+        &self,
+        bytes: &'a [u8],
+        rows: usize,
+        logical_cols: usize,
+        group_size: usize,
+        shard: &QuantMatrixShard,
+    ) -> Result<ShardedBytesCow<'a>> {
+        let scale_cols = logical_cols / group_size;
+        match shard {
+            QuantMatrixShard::Full => Ok(ShardedBytesCow {
+                bytes: Cow::Borrowed(bytes),
+                rows,
+                cols: scale_cols,
+            }),
+            QuantMatrixShard::Rows(spec) => {
+                let sharded =
+                    crate::shard_slice::shard_column_parallel(bytes, rows, scale_cols, 2, spec)?;
+                Ok(ShardedBytesCow {
+                    bytes: Cow::Owned(sharded.bytes),
+                    rows: sharded.rows,
+                    cols: sharded.cols,
+                })
+            }
+            QuantMatrixShard::Cols(spec) => {
+                ensure!(
+                    spec.offset.is_multiple_of(group_size) && spec.size.is_multiple_of(group_size),
+                    "W4A16 scale col shard {:?} must align to group_size={group_size}",
+                    spec.range()
+                );
+                let scale_spec = ShardingSpec {
+                    offset: spec.offset / group_size,
+                    size: spec.size / group_size,
+                    total: scale_cols,
+                };
+                let sharded = crate::shard_slice::shard_row_parallel(
+                    bytes,
+                    rows,
+                    scale_cols,
+                    2,
+                    &scale_spec,
+                )?;
+                Ok(ShardedBytesCow {
+                    bytes: Cow::Owned(sharded.bytes),
+                    rows: sharded.rows,
+                    cols: sharded.cols,
+                })
+            }
+        }
     }
 
     fn shard_fp4_packed_weight_cow<'a>(
@@ -4619,6 +4728,7 @@ fn routed_expert_weight_format(
                 | WeightFormat::Fp8BlockScaled
                 | WeightFormat::Fp8PerShard
                 | WeightFormat::Fp4E2M1Group
+                | WeightFormat::W4A16
         ),
         "Qwen3.6 MoE routed expert format {first} is not supported"
     );
@@ -4899,11 +5009,20 @@ fn build_moe_layer_pointer_tables(
     } else {
         let refs = moe_expert_refs(gate, up, down)?;
         if routed_quant {
-            (
-                cuda_kernels::moe::build_expert_qweight_u8_ptr_table(ctx, &refs.gate)?,
-                cuda_kernels::moe::build_expert_qweight_u8_ptr_table(ctx, &refs.up)?,
-                cuda_kernels::moe::build_expert_qweight_u8_ptr_table(ctx, &refs.down)?,
-            )
+            // W4A16 packs INT4 nibbles into `i8` qweight; FP8/FP4 use `u8`.
+            if expert_weight_format == WeightFormat::W4A16 {
+                (
+                    cuda_kernels::moe::build_expert_qweight_i8_ptr_table(ctx, &refs.gate)?,
+                    cuda_kernels::moe::build_expert_qweight_i8_ptr_table(ctx, &refs.up)?,
+                    cuda_kernels::moe::build_expert_qweight_i8_ptr_table(ctx, &refs.down)?,
+                )
+            } else {
+                (
+                    cuda_kernels::moe::build_expert_qweight_u8_ptr_table(ctx, &refs.gate)?,
+                    cuda_kernels::moe::build_expert_qweight_u8_ptr_table(ctx, &refs.up)?,
+                    cuda_kernels::moe::build_expert_qweight_u8_ptr_table(ctx, &refs.down)?,
+                )
+            }
         } else {
             (
                 cuda_kernels::moe::build_expert_weight_ptr_table(ctx, &refs.gate)?,
@@ -4949,6 +5068,19 @@ fn build_moe_layer_pointer_tables(
                 ctx, &refs.up,
             )?),
             Some(cuda_kernels::moe::build_expert_qscale_fp8_ptr_table(
+                ctx, &refs.down,
+            )?),
+        )
+    } else if routed_quant && expert_weight_format == WeightFormat::W4A16 {
+        let refs = moe_expert_refs(gate, up, down)?;
+        (
+            Some(cuda_kernels::moe::build_expert_qscale_bf16_ptr_table(
+                ctx, &refs.gate,
+            )?),
+            Some(cuda_kernels::moe::build_expert_qscale_bf16_ptr_table(
+                ctx, &refs.up,
+            )?),
+            Some(cuda_kernels::moe::build_expert_qscale_bf16_ptr_table(
                 ctx, &refs.down,
             )?),
         )
