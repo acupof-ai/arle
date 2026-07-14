@@ -20,6 +20,7 @@ docs/plans/2026-07-03-agentic-opd-27b-capability-curve.md (phase 2, cc-as-harnes
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -73,7 +74,7 @@ def boot_workdir(staged, workdir, setup_cmd=None):
 def score(workdir, task, test_timeout, pythonpath=None, python="python3"):
     diff = run(["git", "diff"], workdir).stdout
     if not diff.strip():
-        return False, False, "no edits"
+        return False, False, "no edits", 0.0
     patch = task.get("test_patch", "")
     if patch.strip():
         # Reset test files the agent may have dirtied (mirrors score_workdir).
@@ -87,7 +88,7 @@ def score(workdir, task, test_timeout, pythonpath=None, python="python3"):
         (workdir / ".t.diff").write_text(patch)
         r = run(["git", "apply", ".t.diff"], workdir)
         if r.returncode != 0:
-            return False, True, f"test_patch apply failed: {r.stderr.strip()[:200]}"
+            return False, True, f"test_patch apply failed: {r.stderr.strip()[:200]}", 0.0
     f2p = task.get("fail_to_pass", [])
     if isinstance(f2p, str):
         f2p = json.loads(f2p) if f2p.strip().startswith("[") else [f2p]
@@ -96,9 +97,15 @@ def score(workdir, task, test_timeout, pythonpath=None, python="python3"):
         r = run([python, "-m", "pytest", "-q", "-p", "no:cacheprovider", *f2p],
                 workdir, timeout=test_timeout, env=env)
     except subprocess.TimeoutExpired:
-        return False, True, "pytest timeout"
-    tail = (r.stdout + r.stderr).strip().splitlines()[-1:] or [""]
-    return r.returncode == 0, True, tail[0][:200]
+        return False, True, "pytest timeout", 0.0
+    out = r.stdout + r.stderr
+    tail = out.strip().splitlines()[-1:] or [""]
+    # Dense reward = fraction of run fail_to_pass tests that pass. Near-misses
+    # (e.g. 65/74) give SAO real gradient; binary would collapse them to 0.
+    n_pass = int(re.findall(r"(\d+) passed", out)[-1]) if "passed" in out else 0
+    n_fail = int(re.findall(r"(\d+) failed", out)[-1]) if "failed" in out else 0
+    reward = n_pass / (n_pass + n_fail) if (n_pass + n_fail) else 0.0
+    return r.returncode == 0, True, tail[0][:200], reward
 
 
 def cc_attempt(workdir, task, args):
@@ -186,11 +193,11 @@ def main():
             t_start_ms = int(time.time() * 1000)
             cc = cc_attempt(workdir, task, args)
             t_end_ms = int(time.time() * 1000)
-            passed, edited, note = score(workdir, task, args.test_timeout,
-                                         args.pythonpath, args.python)
+            passed, edited, note, reward = score(workdir, task, args.test_timeout,
+                                                  args.pythonpath, args.python)
             row = {
                 "instance_id": iid, "sample": sample, "passed": passed,
-                "edited": edited, "note": note,
+                "edited": edited, "note": note, "reward": round(reward, 4),
                 "t_start_ms": t_start_ms, "t_end_ms": t_end_ms,
                 "wall_s": round((t_end_ms - t_start_ms) / 1000, 1),
                 "cc_error": cc.get("error") or (cc.get("is_error") and cc.get("result")) or None,
@@ -199,13 +206,13 @@ def main():
             }
             results.append(row)
             # Every attempt is a window (SAO needs failing trajectories too).
-            # reward is binary pass/fail; TODO graded reward (fraction of
-            # fail_to_pass passing) for a denser signal.
+            # Dense reward = fraction of fail_to_pass tests passing — near-misses
+            # give SAO within-task advantage variance that binary collapses to 0.
             windows.append({"label": f"{iid}#{sample}",
                             "t_start_ms": t_start_ms,
                             "t_end_ms": t_end_ms,
-                            "reward": 1.0 if passed else 0.0})
-            print(f"[cc-baseline] {iid}#{sample}: passed={passed} "
+                            "reward": reward})
+            print(f"[cc-baseline] {iid}#{sample}: passed={passed} reward={reward:.3f} "
                   f"edited={edited} turns={row['cc_turns']} "
                   f"wall={row['wall_s']}s :: {note}", flush=True)
 
