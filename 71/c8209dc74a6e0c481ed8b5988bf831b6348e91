@@ -1,0 +1,23 @@
+crates/cli/src/train_cli.rs
+  s_9c91b86ec3fb55::t_524c4380b2f660 2334-2337,2340-2344
+scripts/cc_swe_baseline.py
+  s_9c91b86ec3fb55::t_d341fa0ffc8a3e 23,77,91,100-108,196-197,200,209-210,214-215
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "71c8209dc74a6e0c481ed8b5988bf831b6348e91",
+  "prompts": {},
+  "sessions": {
+    "s_9c91b86ec3fb55": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4779911a-69b7-49db-bc83-daf5a48d6ca3",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
