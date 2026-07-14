@@ -250,10 +250,31 @@ static int device_compute_major();
 // at all — only FP16/FP32. A BF16 cublasGemmEx faults at runtime with
 // cudaErrorNotSupported, and the fault is asynchronous (the API returns
 // SUCCESS, surfacing only at the next stream sync), so a post-hoc retry cannot
-// catch it without a per-call cudaStreamSynchronize. Instead, cast the BF16
-// operands to FP16, run an FP16 GEMM (V100 has FP16 tensor cores), and cast the
-// FP16 result back to BF16. Allocates per-call scratch; this is the legacy
-// Volta-only path, never the sm_80+ hot path.
+// catch it without a per-call cudaStreamSynchronize. Instead, value-convert the
+// BF16 operands to FP16, run an FP16 GEMM (V100 has FP16 tensor cores), and
+// value-convert the FP16 result back to BF16. Allocates per-call scratch; this
+// is the legacy Volta-only path, never the sm_80+ hot path.
+//
+// BF16 and FP16 differ in exponent/mantissa width (BF16: 8 exp + 7 mantissa,
+// same exponent range as FP32; FP16: 5 exp + 10 mantissa, narrower range), so a
+// raw byte copy reinterprets the bits and corrupts every value (e.g. BF16 1.0
+// == 0x3F80 reads as FP16 1.875). Promote through FP32 with round-to-nearest.
+__global__ void convert_bf16_to_fp16_kernel(const __nv_bfloat16 *__restrict__ in,
+                                            __half *__restrict__ out, size_t n) {
+  size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i < n) {
+    out[i] = __float2half_rn(__bfloat162float(in[i]));
+  }
+}
+
+__global__ void convert_fp16_to_bf16_kernel(const __half *__restrict__ in,
+                                            __nv_bfloat16 *__restrict__ out, size_t n) {
+  size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i < n) {
+    out[i] = __float2bfloat16_rn(__half2float(in[i]));
+  }
+}
+
 static cudaError_t gemm_fp16_cast_cuda(const __nv_bfloat16 *W, const __nv_bfloat16 *X,
                                        __nv_bfloat16 *Y, int M, int N, int K,
                                        cudaStream_t stream, cublasHandle_t handle) {
@@ -261,12 +282,12 @@ static cudaError_t gemm_fp16_cast_cuda(const __nv_bfloat16 *W, const __nv_bfloat
     return cudaErrorUnknown;
   }
   __half *W_f16 = nullptr, *X_f16 = nullptr, *Y_f16 = nullptr;
-  size_t w_bytes = static_cast<size_t>(K) * M * sizeof(__half);
-  size_t x_bytes = static_cast<size_t>(K) * N * sizeof(__half);
-  size_t y_bytes = static_cast<size_t>(M) * N * sizeof(__half);
-  if (cudaMalloc(&W_f16, w_bytes) != cudaSuccess ||
-      cudaMalloc(&X_f16, x_bytes) != cudaSuccess ||
-      cudaMalloc(&Y_f16, y_bytes) != cudaSuccess) {
+  size_t w_elems = static_cast<size_t>(K) * M;
+  size_t x_elems = static_cast<size_t>(K) * N;
+  size_t y_elems = static_cast<size_t>(M) * N;
+  if (cudaMalloc(&W_f16, w_elems * sizeof(__half)) != cudaSuccess ||
+      cudaMalloc(&X_f16, x_elems * sizeof(__half)) != cudaSuccess ||
+      cudaMalloc(&Y_f16, y_elems * sizeof(__half)) != cudaSuccess) {
     if (Y_f16 != nullptr) cudaFree(Y_f16);
     if (X_f16 != nullptr) cudaFree(X_f16);
     if (W_f16 != nullptr) cudaFree(W_f16);
@@ -274,12 +295,16 @@ static cudaError_t gemm_fp16_cast_cuda(const __nv_bfloat16 *W, const __nv_bfloat
   }
   cudaError_t cerr = cudaSuccess;
   do {
-    if ((cerr = cudaMemcpyAsync(W_f16, W, w_bytes, cudaMemcpyDeviceToDevice, stream)) !=
-            cudaSuccess ||
-        (cerr = cudaMemcpyAsync(X_f16, X, x_bytes, cudaMemcpyDeviceToDevice, stream)) !=
-            cudaSuccess) {
-      break;
-    }
+    constexpr int CONV_BLOCK = 256;
+    // Value-convert BF16 operands to FP16 (not a raw byte copy — see the
+    // kernel comments above). Launch errors are sticky, so cudaGetLastError
+    // after each rather than relying on the trailing sync alone.
+    convert_bf16_to_fp16_kernel<<<(w_elems + CONV_BLOCK - 1) / CONV_BLOCK, CONV_BLOCK, 0,
+                                  stream>>>(W, W_f16, w_elems);
+    if ((cerr = cudaGetLastError()) != cudaSuccess) break;
+    convert_bf16_to_fp16_kernel<<<(x_elems + CONV_BLOCK - 1) / CONV_BLOCK, CONV_BLOCK, 0,
+                                  stream>>>(X, X_f16, x_elems);
+    if ((cerr = cudaGetLastError()) != cudaSuccess) break;
     const float h_alpha = 1.0f, h_beta = 0.0f;
     // FP16 GEMM with FP32 accumulate + tensor cores: native on V100.
     cublasStatus_t stat = cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, M, N, K,
@@ -291,7 +316,9 @@ static cudaError_t gemm_fp16_cast_cuda(const __nv_bfloat16 *W, const __nv_bfloat
       cerr = cudaErrorUnknown;
       break;
     }
-    cerr = cudaMemcpyAsync(Y, Y_f16, y_bytes, cudaMemcpyDeviceToDevice, stream);
+    convert_fp16_to_bf16_kernel<<<(y_elems + CONV_BLOCK - 1) / CONV_BLOCK, CONV_BLOCK, 0,
+                                  stream>>>(Y_f16, Y, y_elems);
+    cerr = cudaGetLastError();
   } while (false);
   {
     cudaError_t sync_err = cudaStreamSynchronize(stream);
