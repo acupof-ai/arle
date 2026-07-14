@@ -2,9 +2,10 @@
 
 **Date:** 2026-07-14. **Backend:** CUDA, legacy Volta (sm_70, V100).
 **Scope:** `crates/cuda-kernels/build.rs` — FlashMLA enablement gate.
-**Status: pending-remote** — fix compiles clean (build.rs edition-2024 parse
-verified on Mac); full `cargo build --features cuda` + `arle --doctor` / serve
-verify to run on the V100 box (sm_70 test lane).
+**Status: verified 2026-07-14** — full `cargo build --features cuda` with
+`TORCH_CUDA_ARCH_LIST=7.0` succeeded on the V100 box (sm_70 test lane):
+18 sm_70 cubins compiled, 31M binary produced. End-to-end serve + chat with
+`Qwen3.5-0.8B` → HTTP 200, no errors.
 
 ## Context
 
@@ -43,5 +44,5 @@ BF16-only on sm_70 remains the rule: FP8 KV and DSv4 HD64 wrappers return
   `sm_targets.len() != 1` already panics (build.rs:97); the FlashMLA gate
   relies on the same single-sm legacy set.
 
-Verify (V100 box, pending):
-`RUSTC_WRAPPER= CUDA_HOME=/usr/local/cuda-12.4 TORCH_CUDA_ARCH_LIST=7.0 cargo build --release --features cuda --bin arle`.
+Verified 2026-07-14 (V100 box):
+`RUSTC_WRAPPER= CUDA_HOME=/usr/local/cuda-12.4 TORCH_CUDA_ARCH_LIST=7.0 cargo build --release --features cuda --bin arle` → success (18 sm_70 cubins, 31M binary). Serve + chat verified end-to-end.

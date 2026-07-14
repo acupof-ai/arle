@@ -3,8 +3,10 @@
 **Date:** 2026-07-14. **Backend:** CUDA, legacy Volta (sm_70, V100-SXM2-32GB).
 **Scope:** `crates/cuda-kernels/kernels.toml` — TileLang AOT paged-attention
 kernel eligibility gate.
-**Status: pending-remote** — fix compiles clean; end-to-end serve + chat
-verify on the 0.8B model to run on the V100 box (sm_70 test lane).
+**Status: verified 2026-07-14** — end-to-end serve + chat on the V100 box
+(sm_70 test lane) with `Qwen3.5-0.8B` (HD256 q8_kv2): HTTP 200, 50
+completion tokens, no `cudaErrorNotSupported`, no errors/panics in serve log.
+The layer-3 full attention prefill step that previously faulted now passes.
 
 ## Context
 
@@ -41,6 +43,6 @@ the `allow_sm70` header comment to list HD256 q8_kv2 as supported.
   builds.** q16_kv4's row licensed flipping q8_kv2 without a fresh TileLang
   port.
 
-Verify (V100 box, pending): same build + serve + chat as the BF16-GEMM entry
-(`2026-07-14-v100-sm70-bf16-gemm-fp16cast.md`) — both fixes land together
-and clear the same layer-3 prefill step.
+Verified 2026-07-14 (V100 box): same build + serve + chat as the BF16-GEMM
+entry (`2026-07-14-v100-sm70-bf16-gemm-fp16cast.md`) — both fixes land together
+and clear the same layer-3 prefill step. HTTP 200, 50 tokens, no errors.
