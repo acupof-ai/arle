@@ -35,6 +35,25 @@ use crate::quant_format::{
 
 const DEFAULT_ROPE_CACHE_LEN: usize = 32_768;
 const DEFAULT_SHARD_CACHE_BYTES: usize = 8 * 1024 * 1024 * 1024;
+const PREFETCH_CACHE_HEADROOM: usize = 64 * 1024 * 1024 * 1024;
+
+fn available_ram_bytes() -> Option<usize> {
+    fs::read_to_string("/proc/meminfo")
+        .ok()?
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("MemAvailable:")?
+                .split_whitespace()
+                .next()?
+                .parse::<usize>()
+                .ok()
+                .map(|kb| kb.saturating_mul(1024))
+        })
+}
+
+fn should_prefetch_shards(rank: usize, available: usize, checkpoint: usize) -> bool {
+    rank == 0 && checkpoint > 0 && available >= checkpoint.saturating_add(PREFETCH_CACHE_HEADROOM)
+}
 
 impl CudaModel {
     pub(crate) fn from_safetensors(model_path: &Path) -> Result<Self> {
@@ -737,14 +756,36 @@ fn shard_cache_bytes_limit() -> usize {
 }
 
 impl SafetensorLoader {
-    /// Parallel-read every shard into the OS page cache before the per-tensor
-    /// mmap loads below fault them in one page at a time. mmap page faults are
-    /// synchronous and single-stream (~150 MB/s cold here); a parallel readahead
-    /// hits the disk's multi-queue ceiling instead and leaves the checkpoint
-    /// warm (page-cached reads are ~55 GB/s). Best-effort: read errors are
-    /// ignored (a failed prefetch just falls back to cold faults). The GB/s log
-    /// line is also the measurement of the disk's real parallel ceiling.
-    pub(crate) fn prefetch_shards(&self) {
+    /// Rank zero warms the shared page cache when it can retain the checkpoint;
+    /// the collective holds other TP ranks until that read completes.
+    pub(crate) fn prefetch_shards_rank0(
+        &self,
+        ctx: &DeviceContext,
+        tp: &crate::tp::TpRuntime,
+    ) -> Result<()> {
+        let checkpoint = self
+            .shards
+            .iter()
+            .filter_map(|path| fs::metadata(path).ok().map(|m| m.len() as usize))
+            .sum();
+        let available = available_ram_bytes().unwrap_or(0);
+        let rank = tp.config().rank;
+        let prefetch = should_prefetch_shards(rank, available, checkpoint);
+        if prefetch {
+            self.prefetch_all_shards();
+        }
+        let rank0_prefetched = tp.broadcast_rank0_i32(ctx, &[i32::from(prefetch)])?[0] != 0;
+        if rank == 0 && !rank0_prefetched {
+            log::info!(
+                "loader prefetch skipped: MemAvailable {:.1} GB < checkpoint {:.1} GB + 64.0 GB headroom",
+                available as f64 / 1e9,
+                checkpoint as f64 / 1e9,
+            );
+        }
+        Ok(())
+    }
+
+    fn prefetch_all_shards(&self) {
         use std::io::Read;
         use std::sync::atomic::{AtomicUsize, Ordering};
         let t0 = Instant::now();
@@ -5489,6 +5530,22 @@ mod tests {
             shard_cache: std::cell::RefCell::new(ShardByteCache::new(DEFAULT_SHARD_CACHE_BYTES)),
             shard_meta_cache: std::cell::RefCell::new(HashMap::new()),
         }
+    }
+
+    #[test]
+    fn prefetch_needs_rank_zero_and_cache_capacity() {
+        let checkpoint = 294 * 1024 * 1024 * 1024;
+        assert!(should_prefetch_shards(
+            0,
+            checkpoint + PREFETCH_CACHE_HEADROOM,
+            checkpoint
+        ));
+        assert!(!should_prefetch_shards(
+            1,
+            checkpoint + PREFETCH_CACHE_HEADROOM,
+            checkpoint
+        ));
+        assert!(!should_prefetch_shards(0, checkpoint, checkpoint));
     }
 
     #[test]

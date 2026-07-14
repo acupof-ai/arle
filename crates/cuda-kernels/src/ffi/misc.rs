@@ -131,6 +131,17 @@ unsafe extern "C" {
         stream: super::CUstream,
     ) -> super::CUresult;
 
+    pub fn dsv4_mhc_lane_mean_cuda(
+        stream: *const super::Half,
+        out: *mut super::Half,
+        num_tokens: i32,
+        hidden_size: i32,
+        hc_mult: i32,
+        out_stride: i32,
+        tap_offset: i32,
+        cuda_stream: super::CUstream,
+    ) -> super::CUresult;
+
     pub fn dsv4_mtp_add_eproj_hproj_cuda(
         e_proj: *const super::Half,
         h_proj: *const super::Half,

@@ -418,9 +418,8 @@ pub(crate) struct Dsv4DsparkDraft {
 /// Load the 3-stage DSpark draft from a DSpark checkpoint. Each stage's common
 /// block reuses the native MTP loaders (MLA attn + FP8 MoE + hyper-connections);
 /// the position-dependent extras load conditionally: `main_proj` via the
-/// fp8-block loader the attn `wq_a`/`wkv` projections use (`load_dsv4_block_scaled`,
-/// NOT `load_dsv4_global_matrix`), the norms via `load_dsv4_vec`, and the
-/// bf16/plain Markov + confidence heads via `load_dsv4_global_matrix`.
+/// fp8-block loader the attn `wq_a`/`wkv` projections use, the Markov head in
+/// checkpoint BF16, and the remaining small tensors through their native loaders.
 // wired by the DSpark forward tranche (T4)
 #[allow(dead_code)]
 pub(crate) fn load_dspark_draft(
@@ -483,12 +482,12 @@ pub(crate) fn load_dspark_draft(
                 markov_w1: names
                     .markov_w1
                     .as_deref()
-                    .map(|n| loader.load_dsv4_global_matrix(ctx, n))
+                    .map(|n| loader.load_dsv4_bf16_matrix(ctx, n))
                     .transpose()?,
                 markov_w2: names
                     .markov_w2
                     .as_deref()
-                    .map(|n| loader.load_dsv4_global_matrix(ctx, n))
+                    .map(|n| loader.load_dsv4_bf16_matrix(ctx, n))
                     .transpose()?,
                 confidence_proj: names
                     .confidence_proj
@@ -650,8 +649,8 @@ pub(crate) struct Dsv4SlotState {
     deepep_ll_scratch: Option<crate::deepep::DeepEpLlScratch>,
     /// DSpark T3 tap buffers: the wide HC residual stream captured at each
     /// `config.dspark_target_layer_ids` layer OUTPUT (`hidden_states[layer+1]`),
-    /// one `DeviceVec` of `hidden_size * hc_mult`, index-aligned with the id
-    /// list. The T4 draft fuses these; empty (zero cost) unless `is_dspark()`.
+    /// one `DeviceVec` sized for a verify block, index-aligned with the id list.
+    /// Decode writes row 0; verify writes its full batch. Empty unless DSpark.
     dspark_taps: Vec<DeviceVec>,
     /// Transient multi-row prompt taps captured during a PREFILL forward
     /// (`seq_len > 1` under `is_dspark()`): the full wide HC stream
@@ -1145,15 +1144,16 @@ impl Dsv4SlotState {
             }
             _ => None,
         };
-        // DSpark tap buffers: one wide-stream capture slot per target layer.
+        // DSpark tap buffers: one verify-block capture per target layer.
         // Empty (no alloc) unless this is a DSpark checkpoint.
         let dspark_taps = if model.config.is_dspark() {
             let stream_dim = model.config.hidden_size * model.config.hc_mult;
+            let rows = model.config.dspark_block_size + 1;
             model
                 .config
                 .dspark_target_layer_ids
                 .iter()
-                .map(|_| DeviceVec::zeros(&model.ctx, stream_dim))
+                .map(|_| DeviceVec::zeros(&model.ctx, stream_dim * rows))
                 .collect::<Result<Vec<_>>>()?
         } else {
             Vec::new()
@@ -1990,7 +1990,7 @@ impl Dsv4Model {
             config.n_routed_experts,
         )?;
         let loader = SafetensorLoader::new(model_path)?;
-        loader.prefetch_shards(); // warm page cache in parallel before mmap faults
+        loader.prefetch_shards_rank0(&ctx, &tp)?;
         let names = config.tensor_names();
 
         let embed_tokens = loader.load_dsv4_bf16_matrix(&ctx, names.embed_tokens())?;
@@ -2293,17 +2293,14 @@ impl Dsv4Model {
         //    attention state over draft_span. Counted here so the KV budget's
         //    per-slot divisor reserves them — the fixed draft-WEIGHT reserve alone
         //    under-counts these per-slot caches (→ OOM at large slots / max_seq_len).
-        //    `latent_cap = max_seq_len * hc_mult + block`: EACH committed context
-        //    token contributes `hc_mult` latent rows (the fused-tap HC lanes), so
-        //    the full-prompt draft context is `hc_mult ×` the token count.
+        //    `latent_cap = max_seq_len + block`: one reduced context row per
+        //    committed token plus one speculative noise block.
         if self.config.is_dspark() {
             let head_dim = self.config.head_dim;
             let num_stages = self.config.dspark_num_stages();
             let block = self.config.dspark_block_size;
             let draft_span = max_seq_len + block;
-            let latent_cap = max_seq_len
-                .saturating_mul(self.config.hc_mult)
-                .saturating_add(block);
+            let latent_cap = max_seq_len.saturating_add(block);
             total = total.saturating_add(
                 self.config
                     .dspark_target_layer_ids
@@ -2760,13 +2757,16 @@ impl Dsv4Model {
     /// schedule order, root first) from the persisted verify rows — per layer:
     /// compressor/indexer re-ingestion + ring K re-derivation — then advance the
     /// slot length. Caller order: truncate → rejected-tail restore → THIS.
-    pub(crate) fn commit_accepted_fold(
+    pub(crate) fn commit_accepted_fold<I>(
         &self,
         slot: &mut Dsv4SlotState,
         kv_adapter: &mut crate::attention::Dsv4KvAdapter,
-        accepted_rows: &[usize],
+        accepted_rows: I,
         start_pos: usize,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        I: Clone + ExactSizeIterator<Item = usize>,
+    {
         let m = accepted_rows.len();
         ensure!(m > 0, "DSv4 commit fold needs at least the pending row");
         let hidden_size = self.config.hidden_size;
@@ -2781,7 +2781,7 @@ impl Dsv4Model {
                     .spec_normed
                     .as_ref()
                     .ok_or_else(|| anyhow!("DSv4 commit fold without persisted verify rows"))?;
-                for (i, &row) in accepted_rows.iter().enumerate() {
+                for (i, row) in accepted_rows.clone().enumerate() {
                     let src = cache[layer_idx]
                         .data
                         .slice(row * hidden_size..(row + 1) * hidden_size);
@@ -2910,7 +2910,7 @@ impl Dsv4Model {
         }
 
         let (stream, mut keepalive) =
-            self.forward_tokens_stream_impl(slot, kv_adapter, tokens, start_pos, None)?;
+            self.forward_tokens_stream_impl(slot, kv_adapter, tokens, start_pos, false, None)?;
         if seq_len > 1 && crate::probe::token_entropy() {
             self.probe_prefill_entropy(&stream, tokens, start_pos)?;
         }
@@ -2954,7 +2954,7 @@ impl Dsv4Model {
         let n = tokens.len();
         let stream_dim = self.config.hidden_size * self.config.hc_mult;
         let (stream, mut keepalive) =
-            self.forward_tokens_stream_impl(slot, kv_adapter, tokens, start_pos, None)?;
+            self.forward_tokens_stream_impl(slot, kv_adapter, tokens, start_pos, true, None)?;
         let hiddens = (0..n)
             .map(|i| -> Result<_> {
                 let mut h = DeviceVec::zeros(&self.ctx, stream_dim)?;
@@ -3127,8 +3127,14 @@ impl Dsv4Model {
             crate::attention::set_dsv4_verify_frozen(true);
         }
         let result = (|| -> Result<SpecVerifyResult> {
-            let (stream, mut keepalive) =
-                self.forward_tokens_stream_impl(slot, kv_adapter, tokens, start_pos, Some(sched))?;
+            let (stream, mut keepalive) = self.forward_tokens_stream_impl(
+                slot,
+                kv_adapter,
+                tokens,
+                start_pos,
+                true,
+                Some(sched),
+            )?;
             let n = tokens.len();
             let mut hiddens = Vec::with_capacity(n);
             for i in 0..n {
@@ -5375,11 +5381,16 @@ impl Dsv4Model {
             self.config.hc_mult
         );
         ensure!(
-            out.len == stream_dim,
-            "DSv4 MTP hidden capture len {} != stream_dim {stream_dim}",
+            out.len >= stream_dim,
+            "DSv4 MTP hidden capture len {} < stream_dim {stream_dim}",
             out.len
         );
-        crate::ops::copy_row_to_vec(&self.ctx, stream, row, out)?;
+        let src = stream.data.slice(row * stream_dim..(row + 1) * stream_dim);
+        let mut dst = out.data.slice_mut(0..stream_dim);
+        self.ctx
+            .stream
+            .memcpy_dtod(&src, &mut dst)
+            .map_err(|e| anyhow!("DSv4 MTP hidden capture D2D failed: {e}"))?;
         keepalive.keep_vec(out);
         Ok(())
     }
@@ -5759,6 +5770,21 @@ impl Dsv4Model {
                         )
                     })?;
                 }
+
+                if self.config.is_dspark()
+                    && let Some(tap_idx) = self
+                        .config
+                        .dspark_target_layer_ids
+                        .iter()
+                        .position(|&l| l == layer_idx)
+                {
+                    let elems = stream_dim * seq_len;
+                    let src = current.ffn_stream.data.slice(0..elems);
+                    let mut dst = slot.dspark_taps[tap_idx].data.slice_mut(0..elems);
+                    ctx.stream
+                        .memcpy_dtod(&src, &mut dst)
+                        .map_err(|e| anyhow!("DSpark verify tap capture D2D failed: {e}"))?;
+                }
             }
         }
 
@@ -5783,6 +5809,7 @@ impl Dsv4Model {
         kv_adapter: &mut crate::attention::Dsv4KvAdapter,
         tokens: &[u32],
         start_pos: usize,
+        persist_spec_normed: bool,
         // `Some`: verify a scheduled row chunk. Ancestor metadata routes
         // attention through one FlashMLA sparse verify call per layer; point-wise
         // and MoE stay batched for weight-read amortization. Current top-k only
@@ -5953,6 +5980,19 @@ impl Dsv4Model {
                 Some(mhc)
             };
             keepalive.keep_hidden(&normed);
+            if persist_spec_normed {
+                let cache = slot
+                    .spec_normed
+                    .as_mut()
+                    .ok_or_else(|| anyhow!("DSv4 verify without spec_normed cache"))?;
+                let rows = seq_len * hidden_size;
+                let src = normed.data.slice(0..rows);
+                let mut dst = cache[layer_idx].data.slice_mut(0..rows);
+                self.ctx
+                    .stream
+                    .memcpy_dtod(&src, &mut dst)
+                    .map_err(|e| anyhow!("DSv4 commit-fold normed persist failed: {e}"))?;
+            }
             // SAFETY: mla_attention writes the full [seq_len, hidden_size] buffer.
             let mut attn_out = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
             if let Some(meta) = sparse_verify_meta.as_ref() {
@@ -5961,15 +6001,6 @@ impl Dsv4Model {
                 // so no row replay or slot-ring mutation is needed; commit
                 // writes accepted rows later.
                 let _nvtx = crate::nvtx::range("dsv4/mla_attn_sparse_verify");
-                if let Some(cache) = slot.spec_normed.as_mut() {
-                    let rows = seq_len * hidden_size;
-                    let src = normed.data.slice(0..rows);
-                    let mut dst = cache[layer_idx].data.slice_mut(0..rows);
-                    self.ctx
-                        .stream
-                        .memcpy_dtod(&src, &mut dst)
-                        .map_err(|e| anyhow!("DSv4 commit-fold normed persist failed: {e}"))?;
-                }
                 let (layer_pool, dsa_shared, flashmla_scratch, prefill_shared) =
                     kv_adapter.layer_and_dsa_shared_mut(layer_idx)?;
                 crate::attention::mla_attention(
@@ -6403,12 +6434,18 @@ impl Dsv4Model {
                     .iter()
                     .position(|&l| l == layer_idx)
             {
-                self.capture_mtp_stream_hidden(
-                    &stream,
-                    seq_len - 1,
-                    &mut slot.dspark_taps[tap_idx],
-                    &mut keepalive,
-                )?;
+                let tap = &mut slot.dspark_taps[tap_idx];
+                let elems = stream_dim * seq_len;
+                if tap.len >= elems {
+                    let src = stream.data.slice(0..elems);
+                    let mut dst = tap.data.slice_mut(0..elems);
+                    ctx.stream
+                        .memcpy_dtod(&src, &mut dst)
+                        .map_err(|e| anyhow!("DSpark tap capture D2D failed: {e}"))?;
+                    keepalive.keep_vec(tap);
+                } else {
+                    self.capture_mtp_stream_hidden(&stream, seq_len - 1, tap, &mut keepalive)?;
+                }
                 // Prefill: also capture the FULL stream (all rows) for the seed.
                 if let Some(bufs) = dspark_prompt_bufs.as_mut() {
                     ctx.stream
