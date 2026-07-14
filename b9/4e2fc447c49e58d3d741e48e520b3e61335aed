@@ -1,0 +1,21 @@
+crates/cuda-kernels/csrc/gemm/gemv.cu
+  s_67038b17df7668::t_147f05daf599f2 253-277,285-290,298-307,319-321
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "b94e2fc447c49e58d3d741e48e520b3e61335aed",
+  "prompts": {},
+  "sessions": {
+    "s_67038b17df7668": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c4b3468e-feff-42b1-aa89-1f360f19b20b",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
