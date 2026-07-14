@@ -244,14 +244,86 @@ static CublasDeviceState *current_device_state() {
   return t_cached_state;
 }
 
+static int device_compute_major();
+
+// Volta (sm_70, e.g. V100) has no BF16 tensor cores and no BF16 cuBLAS compute
+// at all — only FP16/FP32. A BF16 cublasGemmEx faults at runtime with
+// cudaErrorNotSupported, and the fault is asynchronous (the API returns
+// SUCCESS, surfacing only at the next stream sync), so a post-hoc retry cannot
+// catch it without a per-call cudaStreamSynchronize. Instead, cast the BF16
+// operands to FP16, run an FP16 GEMM (V100 has FP16 tensor cores), and cast the
+// FP16 result back to BF16. Allocates per-call scratch; this is the legacy
+// Volta-only path, never the sm_80+ hot path.
+static cudaError_t gemm_fp16_cast_cuda(const __nv_bfloat16 *W, const __nv_bfloat16 *X,
+                                       __nv_bfloat16 *Y, int M, int N, int K,
+                                       cudaStream_t stream, cublasHandle_t handle) {
+  if (cublasSetStream(handle, stream) != CUBLAS_STATUS_SUCCESS) {
+    return cudaErrorUnknown;
+  }
+  __half *W_f16 = nullptr, *X_f16 = nullptr, *Y_f16 = nullptr;
+  size_t w_bytes = static_cast<size_t>(K) * M * sizeof(__half);
+  size_t x_bytes = static_cast<size_t>(K) * N * sizeof(__half);
+  size_t y_bytes = static_cast<size_t>(M) * N * sizeof(__half);
+  if (cudaMalloc(&W_f16, w_bytes) != cudaSuccess ||
+      cudaMalloc(&X_f16, x_bytes) != cudaSuccess ||
+      cudaMalloc(&Y_f16, y_bytes) != cudaSuccess) {
+    if (Y_f16 != nullptr) cudaFree(Y_f16);
+    if (X_f16 != nullptr) cudaFree(X_f16);
+    if (W_f16 != nullptr) cudaFree(W_f16);
+    return cudaErrorMemoryAllocation;
+  }
+  cudaError_t cerr = cudaSuccess;
+  do {
+    if ((cerr = cudaMemcpyAsync(W_f16, W, w_bytes, cudaMemcpyDeviceToDevice, stream)) !=
+            cudaSuccess ||
+        (cerr = cudaMemcpyAsync(X_f16, X, x_bytes, cudaMemcpyDeviceToDevice, stream)) !=
+            cudaSuccess) {
+      break;
+    }
+    const float h_alpha = 1.0f, h_beta = 0.0f;
+    // FP16 GEMM with FP32 accumulate + tensor cores: native on V100.
+    cublasStatus_t stat = cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, M, N, K,
+                                       &h_alpha, W_f16, CUDA_R_16F, K, X_f16,
+                                       CUDA_R_16F, K, &h_beta, Y_f16, CUDA_R_16F,
+                                       M, CUBLAS_COMPUTE_32F,
+                                       CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    if (stat != CUBLAS_STATUS_SUCCESS) {
+      cerr = cudaErrorUnknown;
+      break;
+    }
+    cerr = cudaMemcpyAsync(Y, Y_f16, y_bytes, cudaMemcpyDeviceToDevice, stream);
+  } while (false);
+  {
+    cudaError_t sync_err = cudaStreamSynchronize(stream);
+    if (cerr == cudaSuccess) cerr = sync_err;
+  }
+  cudaFree(Y_f16);
+  cudaFree(X_f16);
+  cudaFree(W_f16);
+  return cerr;
+}
+
 static cudaError_t gemm_cublas_fallback(const __nv_bfloat16 *W, const __nv_bfloat16 *X,
                                         __nv_bfloat16 *Y, int M, int N, int K,
                                         cudaStream_t stream, cublasHandle_t handle) {
+  // Volta (sm_70, e.g. V100) has no BF16 compute at all — only FP16/FP32. A
+  // BF16 cublasGemmEx faults asynchronously at runtime, so take the FP16-cast
+  // path directly: BF16 operands → FP16 GEMM → BF16 result. Compute major is
+  // cached per device (single cudaGetDeviceProperties at first use).
+  if (device_compute_major() <= 7) {
+    return gemm_fp16_cast_cuda(W, X, Y, M, N, K, stream, handle);
+  }
   const float h_alpha = 1.0f;
   const float h_beta = 0.0f;
   if (cublasSetStream(handle, stream) != CUBLAS_STATUS_SUCCESS) {
     return cudaErrorUnknown;
   }
+  // CUBLAS_GEMM_DEFAULT_TENSOR_OP lets cuBLAS pick a tensor-core kernel. On
+  // hardware without BF16 tensor cores (Volta/sm_70 V100, only FP16/FP32),
+  // cuBLAS still launches a BF16 tensor-core kernel that faults at runtime
+  // with cudaErrorNotSupported (sticky). CUBLAS_GEMM_DEFAULT falls back to
+  // CUDA-core math, which is correct on every device — slower but the only
+  // correct path for BF16 on Volta. Retry once, only on NOT_SUPPORTED.
   if (cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
                    M, N, K,
                    &h_alpha,
@@ -262,7 +334,25 @@ static cudaError_t gemm_cublas_fallback(const __nv_bfloat16 *W, const __nv_bfloa
                    CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP) != CUBLAS_STATUS_SUCCESS) {
     return cudaErrorUnknown;
   }
-  return cudaGetLastError();
+  cudaError_t err = cudaGetLastError();
+  if (err == cudaErrorNotSupported) {
+    // CUBLAS_GEMM_DEFAULT_TENSOR_OP let cuBLAS pick a BF16 tensor-core
+    // kernel that faults at runtime on hardware without BF16 tensor cores
+    // (Volta/sm_70 V100, only FP16/FP32). Retry once with CUBLAS_GEMM_DEFAULT
+    // (CUDA-core math), which is correct on every device.
+    if (cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                     M, N, K,
+                     &h_alpha,
+                     W, CUDA_R_16BF, K,
+                     X, CUDA_R_16BF, K,
+                     &h_beta,
+                     Y, CUDA_R_16BF, M,
+                     CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT) != CUBLAS_STATUS_SUCCESS) {
+      return cudaErrorUnknown;
+    }
+    err = cudaGetLastError();
+  }
+  return err;
 }
 
 static bool gemm_small_n_uses_gemv(int N, int K) {
@@ -331,6 +421,31 @@ static bool deterministic_gemm_enabled() {
   return enabled;
 }
 
+// Compute capability major of the currently-active CUDA device, cached per
+// device ordinal. A single cudaGetDeviceProperties runs at first use per
+// device; subsequent calls read the cache. Returns 999 on a lookup failure so
+// the caller conservatively takes the fast (cublasLt) path.
+static int device_compute_major() {
+  static constexpr int kUnknownMajor = 999;
+  static std::atomic<int> cached_ordinal{-1};
+  static std::atomic<int> cached_major{kUnknownMajor};
+  int ordinal = 0;
+  if (cudaGetDevice(&ordinal) != cudaSuccess) {
+    return kUnknownMajor;
+  }
+  if (cached_ordinal.load(std::memory_order_acquire) == ordinal) {
+    return cached_major.load(std::memory_order_acquire);
+  }
+  cudaDeviceProp prop{};
+  int major = kUnknownMajor;
+  if (cudaGetDeviceProperties(&prop, ordinal) == cudaSuccess) {
+    major = prop.major;
+  }
+  cached_ordinal.store(ordinal, std::memory_order_release);
+  cached_major.store(major, std::memory_order_release);
+  return major;
+}
+
 static cudaError_t gemm_cublaslt_impl(const __nv_bfloat16 *W, const __nv_bfloat16 *X,
                                       __nv_bfloat16 *Y, int M, int N, int K,
                                       cudaStream_t stream, bool graphsafe) {
@@ -341,6 +456,20 @@ static cudaError_t gemm_cublaslt_impl(const __nv_bfloat16 *W, const __nv_bfloat1
   CublasDeviceState *state = current_device_state();
   if (state == nullptr) {
     return cudaErrorNotReady;
+  }
+
+  // Volta (sm_70, e.g. V100) has no BF16 tensor cores — only FP16/FP32.
+  // cublasLt's heuristic still selects a BF16 tensor-core algo that faults at
+  // runtime with cudaErrorNotSupported, and the fault is asynchronous (the API
+  // returns SUCCESS, surfacing only at the next stream sync). Route BF16 GEMMs
+  // directly to the CUDA-core cublasGemmEx fallback on these devices: it skips
+  // the heuristic entirely (never caching a bad algo) and needs no per-call
+  // sync, so the sm_80+ hot path is untouched. Compute major is cached per
+  // device (a single cudaGetDeviceProperties at first use) — the uncached
+  // per-step lookup caused a -77% decode regression (2026-06-12).
+  if (device_compute_major() <= 7) {
+    return gemm_cublas_fallback(W, X, Y, M, N, K, stream,
+                                graphsafe ? state->handle : state->prefill_handle);
   }
 
   if (deterministic_gemm_enabled()) {
@@ -496,6 +625,7 @@ static cudaError_t gemm_cublaslt_impl(const __nv_bfloat16 *W, const __nv_bfloat1
     }
   }
 
+  cudaError_t err = cudaSuccess;
   if (cublasLtMatmul(state->lt_handle, operation_desc,
                      &h_alpha,
                      W, w_desc,
@@ -507,18 +637,26 @@ static cudaError_t gemm_cublaslt_impl(const __nv_bfloat16 *W, const __nv_bfloat1
                      state->cublaslt_workspace,
                      kWorkspaceBytes,
                      stream) != CUBLAS_STATUS_SUCCESS) {
+    err = cudaErrorUnknown;
+  } else {
+    err = cudaGetLastError();
+  }
+  if (err != cudaSuccess) {
     cublasLtMatrixLayoutDestroy(y_desc);
     cublasLtMatrixLayoutDestroy(x_desc);
     cublasLtMatrixLayoutDestroy(w_desc);
     cublasLtMatmulDescDestroy(operation_desc);
-    return cudaErrorUnknown;
+    // A failed launch (or an opaque cudaErrorUnknown from cublasLt) falls back
+    // to cublasGemmEx, which retries with CUBLAS_GEMM_DEFAULT (CUDA-core math)
+    // on hardware without BF16 tensor cores (Volta/sm_70 V100).
+    return gemm_cublas_fallback(W, X, Y, M, N, K, stream, state->prefill_handle);
   }
 
   cublasLtMatrixLayoutDestroy(y_desc);
   cublasLtMatrixLayoutDestroy(x_desc);
   cublasLtMatrixLayoutDestroy(w_desc);
   cublasLtMatmulDescDestroy(operation_desc);
-  return cudaGetLastError();
+  return cudaSuccess;
 }
 
 extern "C" {
