@@ -101,6 +101,22 @@ See the [README Quick Start](../README.md#quick-start) for the canonical
 `cargo build` invocations per backend, and [environment.md](environment.md)
 for the env-var knobs that affect the build.
 
+**CUDA source builds need TileLang.** TileLang is the one build-time Python
+dependency (attention / GDR kernel AOT codegen), pinned in
+[`requirements-build.txt`](../requirements-build.txt). The quickest way to
+set it up — it also installs the native build deps (clang/cmake/bindgen)
+and downloads a default model — is:
+
+```bash
+./setup.sh                     # native deps + TileLang venv + model
+cargo build --release --features cuda --bin arle
+```
+
+If you prefer to set it up manually, see
+[troubleshooting.md](troubleshooting.md#tilelang-aot-build-dep-fails-to-install)
+and the `INFER_TILELANG_PYTHON` entry in
+[environment.md](environment.md). Docker (§3) needs no compile step.
+
 ## Verifying an install
 
 ```bash
