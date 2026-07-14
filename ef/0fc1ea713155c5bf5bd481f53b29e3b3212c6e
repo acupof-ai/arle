@@ -1,0 +1,25 @@
+CHANGELOG.md
+  s_67038b17df7668::t_e4c8ce39f72c89 26-36
+docs/experience/wins/2026-07-14-v100-sm70-bf16-gemm-fp16cast.md
+  s_67038b17df7668::t_504c1778d81896 1-49
+docs/experience/wins/2026-07-14-v100-sm70-paged-attention-allow-sm70.md
+  s_67038b17df7668::t_4a5ae3021a4f6e 1-46
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "ef0fc1ea713155c5bf5bd481f53b29e3b3212c6e",
+  "prompts": {},
+  "sessions": {
+    "s_67038b17df7668": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c4b3468e-feff-42b1-aa89-1f360f19b20b",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
