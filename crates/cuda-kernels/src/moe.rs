@@ -13,6 +13,114 @@ use crate::tensor::{DeviceContext, DeviceMatrix, DeviceVec, RawDevicePtr};
 // (from `cache_ptr`) carries buffers; bf16 (Rust) and Half (u16, kernel ABI)
 // share a 16-bit layout, so pointers cast directly.
 
+#[derive(Clone, Copy, Debug)]
+pub struct Sm90MegaMoeShape {
+    pub num_ranks: usize,
+    pub num_experts: usize,
+    pub requested_max_tokens_per_rank: usize,
+    pub num_topk: usize,
+    pub hidden: usize,
+    pub intermediate_hidden: usize,
+}
+
+pub type Sm90MegaMoeWorkspaceLayout = ffi::Sm90MegaMoeWorkspaceLayoutRaw;
+
+/// Returns byte offsets in each rank's symmetric workspace.
+pub fn sm90_mega_moe_workspace_layout(
+    shape: Sm90MegaMoeShape,
+) -> Result<Sm90MegaMoeWorkspaceLayout> {
+    let mut layout = Sm90MegaMoeWorkspaceLayout::default();
+    // SAFETY: `layout` is a live host output and the FFI reads only scalar inputs.
+    unsafe {
+        ffi::dsv4_sm90_mega_moe_workspace_layout_cuda(
+            i32::try_from(shape.num_ranks)?,
+            i32::try_from(shape.num_experts)?,
+            i32::try_from(shape.requested_max_tokens_per_rank)?,
+            i32::try_from(shape.num_topk)?,
+            i32::try_from(shape.hidden)?,
+            i32::try_from(shape.intermediate_hidden)?,
+            &mut layout,
+        )
+        .result()?;
+    }
+    Ok(layout)
+}
+
+pub struct Sm90MegaMoeLaunch<'a> {
+    pub shape: Sm90MegaMoeShape,
+    pub workspace: &'a Sm90MegaMoeWorkspaceLayout,
+    pub num_tokens: usize,
+    pub rank_idx: usize,
+    pub y: RawDevicePtr<bf16>,
+    pub cumulative_local_expert_recv_stats: Option<RawDevicePtr<i32>>,
+    pub peer_buffer_ptrs: &'a [u64],
+    pub local_workspace: u64,
+    pub activation_clamp: f32,
+    pub fast_math: bool,
+    pub enable_pdl: bool,
+    pub l1_weights: RawDevicePtr<u8>,
+    pub l1_weight_stride: usize,
+    pub l1_weights_sf: RawDevicePtr<f32>,
+    pub l2_weights: RawDevicePtr<u8>,
+    pub l2_weight_stride: usize,
+    pub l2_weights_sf: RawDevicePtr<f32>,
+    pub stream: CUstream,
+}
+
+/// Launches the vendored SM90 fused dispatch, L1 SwiGLU, L2, and combine kernel.
+///
+/// # Safety
+/// `peer_buffer_ptrs` must be CUDA symmetric virtual addresses, one per rank, each
+/// spanning `workspace.num_bytes`; the kernel mutates its barrier/count metadata,
+/// `l1_acts`, `l1_acts_sf`, `l1_topk_weights`, `l2_acts`, `l2_acts_sf`, and
+/// `combine` regions. Its `x`, `x_sf`, `topk_idx`, and `topk_weights` regions must
+/// contain this step's inputs. `y`, both weight/scale buffers, the local workspace,
+/// and optional stats must cover the shape and remain live through `stream`.
+/// L1 weights are FP8 K-major `[experts/rank, 2*intermediate, hidden]`; L2 weights
+/// are `[experts/rank, hidden, intermediate]`; strides are in FP8 elements.
+pub unsafe fn sm90_mega_moe_launch(args: &Sm90MegaMoeLaunch<'_>) -> Result<()> {
+    ensure!(
+        args.peer_buffer_ptrs.len() == args.shape.num_ranks,
+        "SM90 MegaMoE needs one symmetric workspace pointer per rank"
+    );
+    ensure!(
+        args.peer_buffer_ptrs.get(args.rank_idx) == Some(&args.local_workspace),
+        "SM90 MegaMoE local workspace must match the rank pointer"
+    );
+    let stats = args
+        .cumulative_local_expert_recv_stats
+        .map_or(std::ptr::null_mut(), RawDevicePtr::as_mut_ptr);
+    // SAFETY: forwarded from this function's device-buffer and TMA contract.
+    unsafe {
+        ffi::dsv4_sm90_mega_moe_launch_cuda(
+            args.y.as_mut_ptr().cast(),
+            stats,
+            args.peer_buffer_ptrs.as_ptr(),
+            args.local_workspace as *mut u8,
+            i32::try_from(args.shape.num_ranks)?,
+            i32::try_from(args.rank_idx)?,
+            args.workspace.num_max_tokens_per_rank,
+            i32::try_from(args.num_tokens)?,
+            i32::try_from(args.shape.num_experts)?,
+            i32::try_from(args.shape.num_topk)?,
+            i32::try_from(args.shape.hidden)?,
+            i32::try_from(args.shape.intermediate_hidden)?,
+            args.activation_clamp,
+            i32::from(args.fast_math),
+            i32::from(args.enable_pdl),
+            args.l1_weights.as_ptr(),
+            i32::try_from(args.l1_weight_stride)?,
+            args.l1_weights_sf.as_ptr(),
+            args.l2_weights.as_ptr(),
+            i32::try_from(args.l2_weight_stride)?,
+            args.l2_weights_sf.as_ptr(),
+            args.stream,
+        )
+        .result()?;
+    }
+    Ok(())
+}
+
 /// Build the device-resident per-expert weight-pointer table the grouped-GEMM
 /// kernels consume (`*const u64`, one dense `data` pointer per expert).
 ///

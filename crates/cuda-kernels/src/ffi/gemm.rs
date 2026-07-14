@@ -1,7 +1,61 @@
 use super::{CUresult, CUstream, Half};
 
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(C)]
+pub struct Sm90MegaMoeWorkspaceLayoutRaw {
+    pub num_bytes: u64,
+    pub x: u64,
+    pub x_sf: u64,
+    pub topk_idx: u64,
+    pub topk_weights: u64,
+    pub l1_acts: u64,
+    pub l1_acts_sf: u64,
+    pub l1_topk_weights: u64,
+    pub l2_acts: u64,
+    pub l2_acts_sf: u64,
+    pub combine: u64,
+    pub num_max_pool_tokens: i32,
+    pub num_padded_sf_pool_tokens: i32,
+    pub num_max_tokens_per_rank: i32,
+}
+
 #[allow(dead_code)]
 unsafe extern "C" {
+    pub fn dsv4_sm90_mega_moe_workspace_layout_cuda(
+        num_ranks: i32,
+        num_experts: i32,
+        requested_max_tokens_per_rank: i32,
+        num_topk: i32,
+        hidden: i32,
+        intermediate_hidden: i32,
+        out: *mut Sm90MegaMoeWorkspaceLayoutRaw,
+    ) -> CUresult;
+
+    pub fn dsv4_sm90_mega_moe_launch_cuda(
+        y: *mut Half,
+        cumulative_local_expert_recv_stats: *mut i32,
+        peer_buffer_ptrs: *const u64,
+        local_workspace: *mut u8,
+        num_ranks: i32,
+        rank_idx: i32,
+        num_max_tokens_per_rank: i32,
+        num_tokens: i32,
+        num_experts: i32,
+        num_topk: i32,
+        hidden: i32,
+        intermediate_hidden: i32,
+        activation_clamp: f32,
+        fast_math: i32,
+        enable_pdl: i32,
+        l1_weights: *const u8,
+        l1_weight_stride: i32,
+        l1_weights_sf: *const f32,
+        l2_weights: *const u8,
+        l2_weight_stride: i32,
+        l2_weights_sf: *const f32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn gemv_cuda(
         A: *const Half,
         x: *const Half,

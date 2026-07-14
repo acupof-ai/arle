@@ -1,6 +1,24 @@
 #include <cuda.h>
 
 #include <cstddef>
+#include <cstdint>
+
+struct Sm90MegaMoeWorkspaceLayout {
+  uint64_t num_bytes;
+  uint64_t x;
+  uint64_t x_sf;
+  uint64_t topk_idx;
+  uint64_t topk_weights;
+  uint64_t l1_acts;
+  uint64_t l1_acts_sf;
+  uint64_t l1_topk_weights;
+  uint64_t l2_acts;
+  uint64_t l2_acts_sf;
+  uint64_t combine;
+  int num_max_pool_tokens;
+  int num_padded_sf_pool_tokens;
+  int num_max_tokens_per_rank;
+};
 
 #ifndef ARLE_ENABLE_DEEPGEMM_NATIVE
 extern "C" CUresult dsv4_deepgemm_native_preflight_cuda(char* out, size_t out_len) {
@@ -16,6 +34,43 @@ extern "C" CUresult dsv4_deepgemm_native_preflight_cuda(char* out, size_t out_le
     }
     out[n] = '\0';
   }
+  return CUDA_ERROR_NOT_SUPPORTED;
+}
+
+extern "C" CUresult dsv4_sm90_mega_moe_workspace_layout_cuda(
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
+    Sm90MegaMoeWorkspaceLayout*) {
+  return CUDA_ERROR_NOT_SUPPORTED;
+}
+
+extern "C" CUresult dsv4_sm90_mega_moe_launch_cuda(
+    void*,
+    int*,
+    const uint64_t*,
+    void*,
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
+    float,
+    int,
+    int,
+    const unsigned char*,
+    int,
+    const float*,
+    const unsigned char*,
+    int,
+    const float*,
+    CUstream) {
   return CUDA_ERROR_NOT_SUPPORTED;
 }
 

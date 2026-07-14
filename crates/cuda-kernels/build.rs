@@ -1809,6 +1809,8 @@ fn emit_prebuilt_deepep_sidecar(path: &Path) {
 
 const PREBUILT_REQUIRED_DSV4_SYMBOLS: &[&str] = &[
     "dsv4_deepgemm_native_preflight_cuda",
+    "dsv4_sm90_mega_moe_workspace_layout_cuda",
+    "dsv4_sm90_mega_moe_launch_cuda",
     "arle_dsv4_fp8_kv_fill_one_sw_slot_from_start_pos_cuda",
     "arle_dsv4_flashmla_decode_build_indices_start_pos_ptr_cuda",
     "arle_dsv4_flashmla_decode_build_indices_batched_cuda",
@@ -2344,6 +2346,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=ARLE_CUDA_DISABLE_DEEPGEMM_NATIVE");
     println!("cargo:rerun-if-env-changed=ARLE_DEEPGEMM_ROOT");
     println!("cargo:rerun-if-env-changed=ARLE_DEEPGEMM_CUTLASS_INCLUDE");
+    println!("cargo:rerun-if-env-changed=DG_JIT_USE_RUNTIME_API");
     // `enable_deepgemm_native` is computed below (after the vendored paths +
     // sm_targets resolve) so it can DEFAULT-ON via auto-detection.
     // DeepGEMM availability is also a RUNTIME preflight probe (`cuda_kernels::
@@ -2477,6 +2480,7 @@ fn main() {
                 "--expt-relaxed-constexpr".to_string(),
                 "-Wno-deprecated-declarations".to_string(),
                 format!("-I{}/include", cuda_path),
+                format!("-I{}", deepgemm_root.display()),
                 format!("-I{}", deepgemm_root.join("csrc").display()),
                 format!("-I{}", deepgemm_library_root.join("include").display()),
                 format!("-I{}", deepgemm_cutlass_include.display()),
@@ -2494,6 +2498,9 @@ fn main() {
                     deepgemm_cutlass_include.display()
                 ),
             ]);
+            if env_flag("DG_JIT_USE_RUNTIME_API") {
+                nvcc_args.push("-DDG_JIT_USE_RUNTIME_API=1".to_string());
+            }
         }
 
         // Marlin kernel needs C++17 + relaxed constexpr
