@@ -67,6 +67,8 @@ Local raw-ABI gates passed:
 - `git diff --check`
 - H20/CUDA 12.9 direct NVCC compile of `deepgemm_native.cu` with
   `DG_JIT_USE_RUNTIME_API=1` (`deepgemm_native.o`, 244 KiB).
+- H20 raw workspace ABI returned success for `TP4/E256/H4096/I2048/topk6`:
+  requested 128 tokens aligned to 384, 165,608,480 bytes/rank.
 
 ## Problems
 
