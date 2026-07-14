@@ -1,0 +1,21 @@
+docs/experience/wins/2026-07-14-bench-dsv4-sm90-mega-moe-raw-abi.md
+  s_cbac1d54da53ea::t_05c392d6034830 43
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "83aded74bda872a5eef083abfb81ae5b09f9ebb1",
+  "prompts": {},
+  "sessions": {
+    "s_cbac1d54da53ea": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f5e9b-c754-7170-ba19-53745faa66e6",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
