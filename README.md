@@ -146,23 +146,33 @@ Agent and RL workloads re-process the same prompt + history + tool output every 
 
 ```mermaid
 flowchart TB
-  subgraph One binary
-    Serve["arle serve — OpenAI v1 HTTP"]
-    Agent["arle — local agent / REPL"]
-    Train["arle train opd — teacher = server"]
+  classDef entry fill:#1a1a2e,stroke:#e94560,color:#eee,rx:8,ry:8
+  classDef serve fill:#16213e,stroke:#4ecca3,color:#eee,rx:8,ry:8
+  classDef core fill:#0f3460,stroke:#e94560,color:#eee,rx:8,ry:8
+  classDef seam fill:#533483,stroke:#e94560,color:#eee,rx:8,ry:8
+  classDef exec fill:#190e36,stroke:#4ecca3,color:#eee,rx:8,ry:8
+
+  subgraph S1[" "]
+    direction LR
+    Serve["arle serve<br/><sub>OpenAI v1 HTTP</sub>"]
+    Agent["arle<br/><sub>local agent / REPL</sub>"]
+    Train["arle train opd<br/><sub>teacher = server</sub>"]
   end
 
-  subgraph Serving
-    Server["infer-server — HTTP, streaming"]
-    API["infer-api — LoadedInferenceEngine"]
+  subgraph S2[" "]
+    direction LR
+    API["infer-api<br/><sub>LoadedInferenceEngine</sub>"]
+    Server["infer-server<br/><sub>HTTP, streaming</sub>"]
   end
 
-  Core["infer-core — device-neutral Engine<br/>scheduler, RadixCache, paged-KV"]
-  Seam["infer-plan + infer-seam<br/>two host-only traits: BackendExecutor, KvPool"]
+  Core["infer-core<br/><sub>device-neutral Engine · scheduler · RadixCache · paged-KV</sub>"]
 
-  subgraph Executors
-    CUDA["infer-cuda<br/>FlashMLA, DeepGEMM, DeepEP, TileLang AOT<br/>TP=8 / EP=8"]
-    Metal["infer-metal<br/>MLX bridge, packed varlen decode"]
+  Seam["infer-plan + infer-seam<br/><sub>two host-only traits: BackendExecutor · KvPool</sub>"]
+
+  subgraph S3[" "]
+    direction LR
+    CUDA["infer-cuda<br/><sub>FlashMLA · DeepGEMM · DeepEP · TileLang AOT · TP=8/EP=8</sub>"]
+    Metal["infer-metal<br/><sub>MLX bridge · packed varlen decode</sub>"]
   end
 
   Serve --> Server
@@ -173,9 +183,16 @@ flowchart TB
   Core --> Seam
   Seam --> CUDA
   Seam --> Metal
+
+  class Serve,Agent,Train entry
+  class API,Server serve
+  class Core core
+  class Seam seam
+  class CUDA,Metal exec
 ```
 
-A new backend = implementing the two seam traits. No changes to scheduler, cache, or server.
+A new backend plugs in by implementing the two seam traits — no changes to
+the scheduler, cache, or server.
 
 Deep dive: [docs/onboarding.md](docs/onboarding.md) (30 min) · [docs/architecture.md](docs/architecture.md) · [docs/codebase-map.md](docs/codebase-map.md).
 
