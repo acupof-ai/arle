@@ -1,11 +1,11 @@
 # W4A16 (INT4) MoE grouped GEMV — CUDA
 
-> Status: build PASS + kernel-correctness PASS (H20 sm_90, 2026-07-14);
-> end-to-end 4-bit MoE smoke DEFERRED — no W4A16/INT4 MoE model on the box
-> and the HF proxy tunnel is down (127.0.0.1:1080 refused + direct HF
-> timeout), so no model could be fetched. V100 (sm_70) is the target
+> Status: build PASS + kernel-correctness PASS (H20 sm_90, 2026-07-14)
+> + V100 (sm_70) kernel-correctness PASS + BF16 end-to-end PASS +
+> concurrent-throughput measured (2026-07-14). V100 is the target
 > workload: a 4-bit MoE fits 32 GB VRAM where the FP8 variant (32.43 GB)
-> does not.
+> does not. W4A16 end-to-end 4-bit MoE smoke DEFERRED — no W4A16/INT4
+> MoE model on the box and the HF proxy tunnel is down.
 
 ## Goal
 
@@ -44,11 +44,31 @@ closes the MoE grouped-GEMV lane.
   reference (N=64, K=256, GROUP_SIZE=128, 2 experts, 4 tokens):
   max_err < 0.05 && mean_err < 0.01. 1 passed, 0 failed. No HF model
   dependency — directly exercises the written kernels.
-- **Smoke: DEFERRED** — no W4A16/INT4 MoE model on the box; HF proxy
-  tunnel down + direct HF timeout blocked fetch. V100 end-to-end
-  (serve + chat on a 4-bit MoE) to follow once a model is available.
+- **Kernel correctness: PASS** (V100 sm_70, GPU 0,
+  `TORCH_CUDA_ARCH_LIST=7.0 cargo test -p cuda-kernels --release
+  --features cuda`, 0.42s). Same test, same bounds — confirms the W4A16
+  grouped GEMV kernel is numerically correct on the target sm_70
+  platform (BF16 storage + FP32 accumulate, no BF16 compute needed).
+  1 passed, 0 failed.
+- **BF16 end-to-end: PASS** (V100 sm_70, Qwen3.5-0.8B BF16, greedy).
+  The sm_70 build path also surfaced and fixed a BF16 GEMM bug (see
+  `errors/2026-07-14-v100-bf16-gemm-raw-byte-copy-corruption.md`):
+  `gemm_fp16_cast_cuda` used raw `cudaMemcpyAsync` for BF16↔FP16
+  "conversion", corrupting every operand. Post-fix output is correct
+  ("2+2?"→"Four", "capital of France"→"Paris").
+- **Concurrent throughput: measured** (V100 sm_70, Qwen3.5-0.8B BF16,
+  greedy, 20 prompts × 200 tok). Peak ~76 tok/s at c=4; c=8 ~69 tok/s;
+  c=16 ~60 tok/s. guidellm `benchmark run` subcommand is absent in the
+  box's installed version, so a Python concurrent-request load generator
+  was used instead.
+- **Smoke (4-bit MoE): DEFERRED** — no W4A16/INT4 MoE model on the box;
+  HF proxy tunnel down + direct HF timeout blocked fetch. V100
+  end-to-end (serve + chat on a 4-bit MoE) to follow once a model is
+  available.
 - One pre-existing unrelated warning: `unused variable: i` at
   `crates/infer-cuda/src/qwen35.rs:6207` (not in scope).
+- Pre-existing FP8 dequant test fails on sm_70 (no FP8 hardware) —
+  unrelated to W4A16; not a regression.
 
 ## Rule
 
