@@ -1713,6 +1713,7 @@ mod tests {
             None,
             None,
             0.5,
+            None,
         )
         .map_err(|e| anyhow::anyhow!("from_dsv4_fp8_safetensors failed: {e:#}"))?;
 

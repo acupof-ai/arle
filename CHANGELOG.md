@@ -23,6 +23,12 @@ Progress spine. Entry classes recorded here the day they land: phase exits,
 default flips, license-or-kill verdicts (AGENTS.md §Docs lifecycle & progress
 spine).
 
+- **2026-07-14 — DSv4 DSpark prompt router licensed for H20 TP=4.** DSpark
+  output throughput moved from +6.3% at 32 prompt tokens to -12.4% at 128 and
+  -18.6% at 8K. The opt-in `--dspark-max-prompt-tokens 64` router preserves the
+  short-prompt path and restores 128/8K to within 1% of no-spec; defaults remain
+  unchanged. [bench](docs/experience/wins/2026-07-14-dspark-prompt-router-tp4.md).
+
 - **2026-07-14 — V100 (sm_70) prefill `cudaErrorNotSupported` fixed.** Two
   fixes, both gated exclusively on compute-major ≤ 7 so the sm_80+ hot path is
   byte-identical: (1) BF16 GEMM on Volta (no BF16 tensor cores — only FP16/FP32)
