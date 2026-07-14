@@ -1,0 +1,47 @@
+crates/cuda-kernels/build.rs
+  s_483311ae2757bc::t_c1684a11572a7e 1812-1813,2349,2483,2501-2503
+crates/cuda-kernels/csrc/gemm/deepgemm_bridge_stub.cu
+  s_483311ae2757bc::t_1fb61ea2e69b8d 4-21,40-76
+crates/cuda-kernels/csrc/gemm/deepgemm_native.cu
+  s_483311ae2757bc::t_ad60f58385521d 37-39,117-133,174-179,182-184,499-507,511,517-521,526,529,537-561,569,579,596,602,606-608,610-611,818-829,1854-2013
+crates/cuda-kernels/src/ffi/gemm.rs
+  s_483311ae2757bc::t_0c1132d8b357bf 3-21,24-58
+crates/cuda-kernels/src/moe.rs
+  s_483311ae2757bc::t_ab50f5ace2fdb8 16-123
+crates/cuda-kernels/vendor/deepgemm/csrc/jit_kernels/heuristics/mega_moe.hpp
+  s_31b774c682ea1f::t_c51cf982645b82 14
+crates/cuda-kernels/vendor/deepgemm/csrc/jit_kernels/heuristics/mega_moe_common.hpp
+  s_31b774c682ea1f::t_d1852e9d3091b0 1-74
+crates/cuda-kernels/vendor/deepgemm/csrc/jit_kernels/heuristics/sm90_mega_moe.hpp
+  s_483311ae2757bc::t_756e02c401cd3f 4,23-25,264-269,271-273,276-277,279
+crates/cuda-kernels/vendor/deepgemm/csrc/jit_kernels/heuristics/sm90_mega_moe_core.hpp
+  s_483311ae2757bc::t_7d14ba175f990a 1-276
+crates/cuda-kernels/vendor/deepgemm/csrc/jit_kernels/impls/sm90_fp8_mega_moe.hpp
+  s_483311ae2757bc::t_df3ce0f449ae74 74-80,121-128,145,148,153,155,167,184-189
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "7b9b6e01ea19ed2055614a2eeff0ea8d638ff3dc",
+  "prompts": {},
+  "sessions": {
+    "s_31b774c682ea1f": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f60f4-efa8-72c1-9fc7-d1ad84754a88",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_483311ae2757bc": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f605c-5195-7383-880b-feb3cf5bb44e",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
