@@ -1,0 +1,67 @@
+crates/cuda-kernels/vendor/README.md
+  s_aa970b1e4a3552::t_0d210bca2641fe 4-11
+crates/cuda-kernels/vendor/deepgemm/csrc/jit_kernels/heuristics/config.hpp
+  s_aa970b1e4a3552::t_4b94c9e5481b5c 25-27,66
+crates/cuda-kernels/vendor/deepgemm/csrc/jit_kernels/heuristics/mega_moe.hpp
+  s_cbac1d54da53ea::t_4c0ace6fe94d12 4-5,9,27-29,43-45,52-53,59-60,65-95,98-101,104-107,110,113,116,119,122,125-132,141,146-147,149-154,160-163,166-194,200-205,209,218,222,224,226,231-233,239-250,255-256,259,266-271,273-274,278-279,283-287,289-290,294-295,301-310,315-318,324,328-329
+crates/cuda-kernels/vendor/deepgemm/csrc/jit_kernels/heuristics/runtime.hpp
+  s_aa970b1e4a3552::t_49cf178fa71a72 51
+crates/cuda-kernels/vendor/deepgemm/csrc/jit_kernels/heuristics/sm90_mega_moe.hpp
+  s_aa970b1e4a3552::t_5ce6a86be01b16 1-454
+crates/cuda-kernels/vendor/deepgemm/csrc/jit_kernels/impls/runtime_utils.hpp
+  s_aa970b1e4a3552::t_e8d33d457804ab 4,48,57,84,255-256,265
+crates/cuda-kernels/vendor/deepgemm/csrc/jit_kernels/impls/sm90_fp8_mega_moe.hpp
+  s_aa970b1e4a3552::t_d4bcdca4ba3d67 1-312
+crates/cuda-kernels/vendor/deepgemm/csrc/utils/compatibility.hpp
+  s_aa970b1e4a3552::t_6d28dc36a7c3e9 5
+crates/cuda-kernels/vendor/deepgemm/csrc/utils/layout.hpp
+  s_aa970b1e4a3552::t_6713ab2aca0b9d 4
+crates/cuda-kernels/vendor/deepgemm/csrc/utils/math.hpp
+  s_aa970b1e4a3552::t_455e7c2092ee25 4
+crates/cuda-kernels/vendor/deepgemm/deep_gemm/include/deep_gemm/comm/barrier.cuh
+  s_aa970b1e4a3552::t_787326396b11a3 11-13,21-22,29,33-34,38-48,53-54,78,85-89,92
+crates/cuda-kernels/vendor/deepgemm/deep_gemm/include/deep_gemm/common/math.cuh
+  s_aa970b1e4a3552::t_b3e709b2a992fe 101-148
+crates/cuda-kernels/vendor/deepgemm/deep_gemm/include/deep_gemm/common/types.cuh
+  s_aa970b1e4a3552::t_70d8e38315046a 27,38-45
+crates/cuda-kernels/vendor/deepgemm/deep_gemm/include/deep_gemm/common/utils.cuh
+  s_aa970b1e4a3552::t_ff6ac4c731a7e3 3-4,23-47
+crates/cuda-kernels/vendor/deepgemm/deep_gemm/include/deep_gemm/impls/sm90_fp8_mega_moe.cuh
+  s_aa970b1e4a3552::t_69595b36b80a17 1-2287
+crates/cuda-kernels/vendor/deepgemm/deep_gemm/include/deep_gemm/layout/mega_moe.cuh
+  s_aa970b1e4a3552::t_0f22b815a0fb12 29-30,47-51,62-63,66-67,71,87-88,90-97,102,155-291,359,362
+crates/cuda-kernels/vendor/deepgemm/deep_gemm/include/deep_gemm/layout/sym_buffer.cuh
+  s_aa970b1e4a3552::t_010fe375d37bdc 35-37
+crates/cuda-kernels/vendor/deepgemm/deep_gemm/include/deep_gemm/ptx/ld_st.cuh
+  s_aa970b1e4a3552::t_115967749783a1 6-7,53-64,157
+crates/cuda-kernels/vendor/deepgemm/deep_gemm/include/deep_gemm/ptx/utils.cuh
+  s_aa970b1e4a3552::t_b0395fe5a492d4 42-51
+crates/cuda-kernels/vendor/deepgemm/deep_gemm/include/deep_gemm/scheduler/mega_moe.cuh
+  s_aa970b1e4a3552::t_c13001affc2616 29-30,36,45,62,67-69
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "8aa372ad1ea57d984550c06903528267a55c98ae",
+  "prompts": {},
+  "sessions": {
+    "s_aa970b1e4a3552": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f5ebb-f1a4-7651-898f-0be36fe6b396",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_cbac1d54da53ea": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f5e9b-c754-7170-ba19-53745faa66e6",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
