@@ -209,6 +209,7 @@ mod real {
             None,
             None,
             0.5,
+            None,
         )
         .context("from_dsv4_fp8_safetensors failed")?;
         let load_ms = load_t0.elapsed().as_secs_f64() * 1000.0;

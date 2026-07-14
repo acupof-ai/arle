@@ -125,6 +125,9 @@ pub struct EngineLoadConfig {
     /// ignore it).
     #[serde(default = "default_dspark_conf_threshold")]
     pub dspark_conf_threshold: f32,
+    /// Inclusive original-prompt limit for DSpark. `None` preserves DSpark for all prompts.
+    #[serde(default)]
+    pub dspark_max_prompt_tokens: Option<usize>,
     /// CUDA runtime toggles (CLI flags → `infer_cuda::apply_runtime_flags`
     /// before executor construction; multiproc workers included).
     #[serde(default)]
@@ -196,6 +199,7 @@ impl Default for EngineLoadConfig {
             student_lora_alpha: default_student_lora_alpha(),
             dspark_draft_model: None,
             dspark_conf_threshold: default_dspark_conf_threshold(),
+            dspark_max_prompt_tokens: None,
             cuda: infer_seam::CudaRuntimeFlags::default(),
             metal: infer_seam::MetalRuntimeFlags::default(),
             diffusion_max_denoising_steps: None,
@@ -1911,6 +1915,7 @@ mod backend {
                 config.mtp_draft_topk,
                 config.dspark_draft_model.as_deref(),
                 config.dspark_conf_threshold,
+                config.dspark_max_prompt_tokens,
             )?,
             CudaModelKind::DiffusionGemma | CudaModelKind::Qwen3MoeUnsupported => {
                 unreachable!("checked before CUDA executor build")

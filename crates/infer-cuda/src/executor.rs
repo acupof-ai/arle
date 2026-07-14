@@ -251,6 +251,7 @@ impl RealCudaExecutor {
         mtp_draft_topk: Option<usize>,
         dspark_draft_model: Option<&Path>,
         dspark_conf_threshold: f32,
+        dspark_max_prompt_tokens: Option<usize>,
     ) -> Result<Self> {
         Ok(Self::Dsv4(Box::new(
             Dsv4CudaExecutor::from_dsv4_fp8_safetensors(
@@ -261,6 +262,7 @@ impl RealCudaExecutor {
                 mtp_draft_topk,
                 dspark_draft_model,
                 dspark_conf_threshold,
+                dspark_max_prompt_tokens,
             )?,
         )))
     }

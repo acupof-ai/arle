@@ -313,6 +313,7 @@ fn resolve_config(args: &Args, serve_args: &ServeArgs) -> Result<ServeConfig, St
         engine_config.dspark_draft_model =
             spec.mtp_draft_model.clone().map(std::path::PathBuf::from);
         engine_config.dspark_conf_threshold = spec.dspark_conf_threshold;
+        engine_config.dspark_max_prompt_tokens = spec.dspark_max_prompt_tokens;
     }
 
     let options = ServeHttpOptions {
@@ -350,6 +351,7 @@ fn resolve_spec_options(backend: ServeBackend, serve_args: &ServeArgs) -> ServeS
         spec_type,
         mtp_draft_model: serve_args.mtp_draft_model.clone(),
         dspark_conf_threshold: serve_args.dspark_conf_threshold,
+        dspark_max_prompt_tokens: serve_args.dspark_max_prompt_tokens,
         mtp_draft_tokens: serve_args.mtp_draft_tokens,
         mtp_draft_topk: serve_args.mtp_draft_topk,
     }
