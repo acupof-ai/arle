@@ -3817,6 +3817,15 @@ pub fn cache_ptr<T>(slice: &CudaSlice<T>, ctx: &DeviceContext) -> RawDevicePtr<T
     }
 }
 
+/// A null [`RawDevicePtr`] — for optional kernel tables the kernel treats as
+/// absent (e.g. `expert_indices` when the compact index is the expert index).
+pub fn null_raw_ptr<T>() -> RawDevicePtr<T> {
+    RawDevicePtr {
+        ptr: 0,
+        _marker: PhantomData,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
