@@ -1,0 +1,25 @@
+docs/experience/wins/2026-07-14-dsv4-c1-host-gpu-timestamp-model.md
+  s_cbac1d54da53ea::t_f1b9cdf629a84c 1-115
+docs/experience/wins/2026-07-14-dsv4-high-concurrency-timestamp-nsys.md
+  s_cbac1d54da53ea::t_9474bbe585d53a 1-138
+scripts/analyze_nsys_overlap.py
+  s_cbac1d54da53ea::t_1a091e4e29eba2 1-185
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "296ea21737bc0133aa30b5024d2668afeb17fe88",
+  "prompts": {},
+  "sessions": {
+    "s_cbac1d54da53ea": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f5e9b-c754-7170-ba19-53745faa66e6",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
