@@ -6204,7 +6204,7 @@ impl Qwen35Model {
 
         let mut full_idx = 0usize;
         let mut linear_idx = 0usize;
-        for layer in &self.layers {
+        for (i, layer) in self.layers.iter().enumerate() {
             rms_norm_offset(&self.ctx, hidden, &layer.input_layernorm, eps, normed)?;
 
             match &layer.attn {

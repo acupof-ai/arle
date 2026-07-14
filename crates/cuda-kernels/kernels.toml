@@ -248,7 +248,7 @@ rust = []
 
 # ===========================================================================
 # BF16 prefill (paged_attn_v1) — kernel_family "attention".
-# allow_sm70: HD128 q32/q40 + HD256 q16_kv4 (Qwen3.5 dense subset).
+# allow_sm70: HD128 q32/q40 + HD256 q8_kv2/q16_kv4 (Qwen3.5 dense subset incl. 0.8B).
 # ===========================================================================
 
 [[kernel]]
@@ -332,7 +332,7 @@ py_module = "tools/tilelang/batch_prefill_paged_hd256.py"
 artifact_dir = "batch_prefill_paged_hd256_q8_kv2"
 kernel_name = "tilelang_batch_prefill_paged_hd256_q8_kv2_run"
 out_name = "tilelang_batch_prefill_paged_hd256_q8_kv2"
-allow_sm70 = false
+allow_sm70 = true
 ffi = true
 
 [[kernel]]
@@ -423,7 +423,7 @@ py_module = "tools/tilelang/batch_decode_paged_hd256.py"
 artifact_dir = "batch_decode_paged_hd256_q8_kv2"
 kernel_name = "tilelang_batch_decode_paged_hd256_q8_kv2_run"
 out_name = "tilelang_batch_decode_paged_hd256_q8_kv2"
-allow_sm70 = false
+allow_sm70 = true
 ffi = true
 
 [[kernel]]
