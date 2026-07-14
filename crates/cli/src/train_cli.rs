@@ -2331,9 +2331,17 @@ fn run_agent_opd_replay(
     let epochs = args.replay_epochs.max(1);
     let per_epoch_cap = args.writeback_cap.unwrap_or(usize::MAX);
     if matches!(update_strategy, UpdateStrategy::RejectionCe) {
+        // Rejection sampling: imitate only SOLVED trajectories. Now that cc
+        // collects failing attempts too (for SAO's 0-reward arm), CE must reject
+        // them — imitating a failed fix is actively harmful. reward == 1.0 iff all
+        // fail_to_pass tests pass; pre-reward records default to 1.0 (unchanged).
         for epoch in 0..epochs {
             let mut losses = Vec::new();
-            for record in records.iter().take(per_epoch_cap) {
+            for record in records
+                .iter()
+                .filter(|r| r.reward >= 1.0)
+                .take(per_epoch_cap)
+            {
                 let loss = if let Some(ema) = gkd_teacher.as_mut() {
                     // GKD: distil the teacher's per-position distribution on the same
                     // masked trajectory tokens (forward-KL), then (ema only) nudge the
