@@ -1,10 +1,11 @@
-# W4A16 (INT4) MoE grouped GEMV — CUDA, pending-remote
+# W4A16 (INT4) MoE grouped GEMV — CUDA
 
-> Status: build PASS (H20 sm_90, 2026-07-14); end-to-end 4-bit
-> MoE smoke DEFERRED — no W4A16/INT4 MoE model on the box and the HF proxy
-> tunnel is down (127.0.0.1:1080 refused + direct HF timeout), so no model
-> could be fetched. V100 (sm_70) is the target workload: a 4-bit MoE fits
-> 32 GB VRAM where the FP8 variant (32.43 GB) does not.
+> Status: build PASS + kernel-correctness PASS (H20 sm_90, 2026-07-14);
+> end-to-end 4-bit MoE smoke DEFERRED — no W4A16/INT4 MoE model on the box
+> and the HF proxy tunnel is down (127.0.0.1:1080 refused + direct HF
+> timeout), so no model could be fetched. V100 (sm_70) is the target
+> workload: a 4-bit MoE fits 32 GB VRAM where the FP8 variant (32.43 GB)
+> does not.
 
 ## Goal
 
@@ -36,6 +37,13 @@ closes the MoE grouped-GEMV lane.
 - **Build: PASS** (H20 sm_90, `cargo build --release --features cuda`,
   8 crates, 2m 54s). Both `w4a16_grouped_gemv_batch_kernel` and
   `w4a16_grouped_gemv_pair_batch_kernel` confirmed in the binary `.text`.
+- **Kernel correctness: PASS** (H20 sm_90, GPU 1,
+  `cargo test -p cuda-kernels --release --features cuda`, 0.24s).
+  `moe::w4a16_tests::w4a16_grouped_gemv_matches_dequantized_bf16`
+  validates the W4A16 grouped GEMV kernel against a host-dequantized BF16
+  reference (N=64, K=256, GROUP_SIZE=128, 2 experts, 4 tokens):
+  max_err < 0.05 && mean_err < 0.01. 1 passed, 0 failed. No HF model
+  dependency — directly exercises the written kernels.
 - **Smoke: DEFERRED** — no W4A16/INT4 MoE model on the box; HF proxy
   tunnel down + direct HF timeout blocked fetch. V100 end-to-end
   (serve + chat on a 4-bit MoE) to follow once a model is available.

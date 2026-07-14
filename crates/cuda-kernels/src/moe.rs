@@ -1894,3 +1894,175 @@ pub unsafe fn dsv4_fp8_grouped_down_decode(
 pub fn device_vec_ptr(vec: &DeviceVec, ctx: &DeviceContext) -> RawDevicePtr<bf16> {
     crate::tensor::cache_ptr(&vec.data, ctx)
 }
+
+// W4A16 (INT4) MoE grouped GEMV — numerical correctness vs a dequantized
+// BF16 reference. GPU-gated: builds the pointer tables, runs
+// `moe_w4a16_grouped_gemv_batch`, dequantizes the same weights to BF16 and
+// runs `moe_bf16_grouped_gemm_batch` as the reference, then compares the
+// outputs. No HF dependency — synthetic weights only.
+#[cfg(all(test, feature = "cuda"))]
+mod w4a16_tests {
+    use super::*;
+    use crate::tensor::{cache_ptr, null_raw_ptr};
+    use half::bf16;
+
+    // Tiny but shape-valid: 2 experts, N=64 output rows, K=256 input cols,
+    // group_size=128 (2 groups per row). K must be even and K % group_size == 0.
+    const N: usize = 64;
+    const K: usize = 256;
+    const GROUP_SIZE: usize = 128;
+    const NUM_EXPERTS: usize = 2;
+    const NUM_TOKENS: usize = 4; // 2 routed to each expert.
+
+    // Deterministic INT4 nibble pattern (values 0..=15) covering the range.
+    const NIBBLES: [u8; 8] = [0, 8, 15, 13, 4, 2, 7, 11];
+
+    fn packed_int4_and_scales() -> (Vec<u8>, Vec<bf16>) {
+        let num_groups = K / GROUP_SIZE;
+        let mut packed = vec![0u8; N * K / 2];
+        let mut scales = vec![bf16::from_f32(0.0); N * num_groups];
+        for row in 0..N {
+            for k in 0..K {
+                let nibble = NIBBLES[(row + k) % NIBBLES.len()];
+                let byte = &mut packed[row * (K / 2) + k / 2];
+                if k % 2 == 0 {
+                    *byte = nibble; // lo nibble
+                } else {
+                    *byte |= nibble << 4; // hi nibble
+                }
+            }
+            for g in 0..num_groups {
+                // Small, non-trivial per-group scale (different per row/group).
+                let v = 0.01 + (row as f32) * 0.001 + (g as f32) * 0.005;
+                scales[row * num_groups + g] = bf16::from_f32(v);
+            }
+        }
+        (packed, scales)
+    }
+
+    // Dequantize W4A16 -> BF16 on host: (nibble - zero_point 8) * per-group scale.
+    fn dequantize(packed: &[u8], scales: &[bf16]) -> Vec<bf16> {
+        let num_groups = K / GROUP_SIZE;
+        let mut out = vec![bf16::from_f32(0.0); N * K];
+        for row in 0..N {
+            for k in 0..K {
+                let byte = packed[row * (K / 2) + k / 2];
+                let nibble = if k % 2 == 0 { byte & 0x0F } else { byte >> 4 };
+                let scale = scales[row * num_groups + k / GROUP_SIZE].to_f32();
+                let v = (nibble as f32 - 8.0) * scale;
+                out[row * K + k] = bf16::from_f32(v);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn w4a16_grouped_gemv_matches_dequantized_bf16() {
+        let ctx = DeviceContext::new().expect("cuda context");
+        let (packed, scales) = packed_int4_and_scales();
+
+        // Build the per-expert W4A16 matrices (same weights both experts).
+        let w4a16 = (0..NUM_EXPERTS)
+            .map(|_| DeviceMatrix::from_quantized_int4(&ctx, &packed, &scales, N, K, GROUP_SIZE))
+            .collect::<Result<Vec<_>>>()
+            .expect("build w4a16 matrices");
+        let w4a16_refs: Vec<&DeviceMatrix> = w4a16.iter().collect();
+        let weight_ptrs =
+            build_expert_qweight_i8_ptr_table(&ctx, &w4a16_refs).expect("qweight ptrs");
+        let scale_ptrs =
+            build_expert_qscale_bf16_ptr_table(&ctx, &w4a16_refs).expect("qscale ptrs");
+
+        // Reference: dequantize -> BF16 matrices -> dense grouped GEMM.
+        let dequant = dequantize(&packed, &scales);
+        let bf16_mats = (0..NUM_EXPERTS)
+            .map(|_| DeviceMatrix::from_host(&ctx, &dequant, N, K))
+            .collect::<Result<Vec<_>>>()
+            .expect("build bf16 matrices");
+        let bf16_refs: Vec<&DeviceMatrix> = bf16_mats.iter().collect();
+        let bf16_weight_ptrs =
+            build_expert_weight_ptr_table(&ctx, &bf16_refs).expect("bf16 weight ptrs");
+
+        // Input activations (deterministic, signed).
+        let input_host: Vec<bf16> = (0..NUM_TOKENS * K)
+            .map(|i| bf16::from_f32(((i as f32 % 13.0) - 6.0) * 0.01))
+            .collect();
+        let input_dev = ctx.stream.clone_htod(&input_host).expect("input h2d");
+
+        // Route tables: tokens [0,1] -> expert 0, tokens [2,3] -> expert 1.
+        // compact index == expert index (expert_indices = null below).
+        let offsets = ctx.stream.clone_htod(&[0i32, 2i32]).expect("offsets h2d");
+        let counts = ctx.stream.clone_htod(&[2i32, 2i32]).expect("counts h2d");
+        let max_count = 2;
+
+        let w4a16_out = ctx
+            .stream
+            .alloc_zeros::<bf16>(NUM_TOKENS * N)
+            .expect("w4a16 out");
+        let bf16_out = ctx
+            .stream
+            .alloc_zeros::<bf16>(NUM_TOKENS * N)
+            .expect("bf16 out");
+
+        let input_p = cache_ptr(&input_dev, &ctx);
+        let offsets_p = cache_ptr(&offsets, &ctx).cast::<i32>();
+        let counts_p = cache_ptr(&counts, &ctx).cast::<i32>();
+        let w4a16_out_p = cache_ptr(&w4a16_out, &ctx);
+        let bf16_out_p = cache_ptr(&bf16_out, &ctx);
+        let stream = ctx.stream.cu_stream();
+
+        // SAFETY: all buffers live for the duration, shapes match, route tables
+        // address only valid tokens/experts (test-only, single stream).
+        unsafe {
+            moe_w4a16_grouped_gemv_batch(
+                &weight_ptrs,
+                &scale_ptrs,
+                input_p,
+                w4a16_out_p,
+                offsets_p,
+                counts_p,
+                null_raw_ptr(),
+                NUM_EXPERTS,
+                max_count,
+                N,
+                K,
+                GROUP_SIZE,
+                &ctx,
+                stream,
+            )
+            .expect("w4a16 grouped gemv");
+
+            moe_bf16_grouped_gemm_batch(
+                &bf16_weight_ptrs,
+                input_p,
+                bf16_out_p,
+                offsets_p,
+                counts_p,
+                null_raw_ptr(),
+                NUM_EXPERTS,
+                max_count,
+                N,
+                K,
+                &ctx,
+                stream,
+            )
+            .expect("bf16 grouped gemm");
+        }
+        ctx.sync().expect("sync");
+
+        let w4a16_host = ctx.stream.clone_dtoh(&w4a16_out).expect("w4a16 d2h");
+        let bf16_host = ctx.stream.clone_dtoh(&bf16_out).expect("bf16 d2h");
+
+        let mut max_err = 0.0f32;
+        let mut sum_err = 0.0f32;
+        for (a, b) in w4a16_host.iter().zip(bf16_host.iter()) {
+            let e = (a.to_f32() - b.to_f32()).abs();
+            max_err = max_err.max(e);
+            sum_err += e;
+        }
+        let mean_err = sum_err / (w4a16_host.len() as f32);
+        assert!(
+            max_err < 0.05 && mean_err < 0.01,
+            "W4A16 vs dequantized-BF16 mismatch: max_err={max_err} mean_err={mean_err}"
+        );
+    }
+}
