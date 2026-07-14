@@ -417,7 +417,31 @@ impl Dsv4CudaExecutor {
                 Err(_) => None,
             }
         };
-        let weights_used_at_model_load = mem_dbg("after model load (weights+experts)");
+        let base_weights_used = mem_dbg("after base model load (weights+experts)");
+        let dspark_draft = dspark_draft_model
+            .map(|draft_dir| -> Result<_> {
+                let loader = crate::loader::SafetensorLoader::new(draft_dir)?;
+                loader.prefetch_shards_rank0(&model.ctx, &model.tp)?;
+                let draft = crate::dsv4::load_dspark_draft(
+                    &loader,
+                    &model.ctx,
+                    &model.config,
+                    &model.split,
+                    model.tp.config(),
+                )?;
+                model.ctx.sync()?;
+                let after = mem_dbg("after DSpark draft weights load");
+                if let (Some(before), Some(after)) = (base_weights_used, after) {
+                    log::info!(
+                        "[vram-ledger] DSpark weights: +{}MB ({}MB -> {}MB)",
+                        (after as i64 - before as i64) >> 20,
+                        before >> 20,
+                        after >> 20,
+                    );
+                }
+                Ok(draft)
+            })
+            .transpose()?;
         // Reclaim the cuMemAllocAsync pool BEFORE measuring free VRAM: weight
         // loading allocs+frees large device scratch (FP8 dequant, DeepGEMM cache
         // build, staging), and the retain-threshold=MAX pool holds it — so
@@ -427,6 +451,7 @@ impl Dsv4CudaExecutor {
         if let Err(e) = model.ctx.trim_memory_pool() {
             log::warn!("pre-KV-budget trim_memory_pool failed (non-fatal): {e}");
         }
+        let weights_used_at_model_load = mem_dbg("after weight-load pool trim");
         // Dynamic KV mem budget: clamp num_slots to what GPU free mem affords (was: fixed
         // num_slots → c=32 OOM crash at long max_seq_len). Deterministic ⇒ TP-consistent.
         let budget = model.kv_budget_plan(num_slots, max_seq_len)?;
@@ -531,16 +556,14 @@ impl Dsv4CudaExecutor {
             &layer_specs,
             model.kv_arena.page_block_size,
         );
-        // DSpark drafter (opt-in, `--spec-type dspark`): load the external block
-        // drafter from its own checkpoint dir + provision one per-slot draft
-        // cache. `is_dspark()` (checkpoint config) gates the T3 taps; the draft
-        // WEIGHTS live in a separate dir. Off the DSpark path: `None`, zero cost.
-        let dspark = dspark_draft_model
-            .map(|dir| {
+        // DSpark weights were loaded before KV budgeting; only per-slot runtime
+        // state is allocated here.
+        let dspark = dspark_draft
+            .map(|draft| {
                 Self::load_dspark_exec(
                     &model,
                     &kv_adapter,
-                    dir,
+                    draft,
                     dspark_conf_threshold,
                     max_seq_len,
                     dspark_max_prompt_tokens,
@@ -569,16 +592,15 @@ impl Dsv4CudaExecutor {
         })
     }
 
-    /// Load the DSpark drafter weights + provision per-slot draft caches. The
+    /// Provision per-slot caches for the preloaded DSpark drafter. The
     /// main checkpoint's config MUST be DSpark-capable (`is_dspark()`, i.e. it
     /// carries `dspark_block_size` + target-layer ids so the T3 taps exist); the
-    /// draft weights come from `draft_dir` (`--mtp-draft-model`). Each stage's
-    /// isolated MLA attention (`compress_ratio == 0`) gets its own attention
-    /// state; the draft latent cache is sized to the request token ceiling.
+    /// isolated MLA attention (`compress_ratio == 0`) gets its own attention state;
+    /// the draft latent cache is sized to the request token ceiling.
     fn load_dspark_exec(
         model: &crate::dsv4::Dsv4Model,
         kv_adapter: &crate::attention::Dsv4KvAdapter,
-        draft_dir: &Path,
+        draft: crate::dsv4::Dsv4DsparkDraft,
         conf_threshold: f32,
         max_seq_len: usize,
         max_prompt_tokens: Option<usize>,
@@ -589,15 +611,6 @@ impl Dsv4CudaExecutor {
             "--spec-type dspark needs a DSpark-capable DSv4 checkpoint (config carries \
              dspark_block_size + dspark_target_layer_ids); this checkpoint is not one"
         );
-        let loader = crate::loader::SafetensorLoader::new(draft_dir)?;
-        loader.prefetch_shards_rank0(&model.ctx, &model.tp)?;
-        let draft = crate::dsv4::load_dspark_draft(
-            &loader,
-            &model.ctx,
-            &model.config,
-            &model.split,
-            model.tp.config(),
-        )?;
         let num_stages = model.config.dspark_num_stages();
         let block_size = model.config.dspark_block_size;
         // Draft-stage attention is pure MLA (`compress_ratio == 0`, no CSA/HCA):
@@ -645,10 +658,9 @@ impl Dsv4CudaExecutor {
             })
             .collect::<Result<Vec<_>>>()?;
         log::info!(
-            "CUDA DSv4 DSpark drafter loaded from {}: stages={num_stages} block={block_size} \
+            "CUDA DSv4 DSpark runtime initialized: stages={num_stages} block={block_size} \
              conf_threshold={conf_threshold} max_prompt_tokens={max_prompt_tokens:?} \
              target_layers={:?}",
-            draft_dir.display(),
             model.config.dspark_target_layer_ids,
         );
         Ok(Dsv4DsparkExec {
@@ -1633,32 +1645,18 @@ impl Dsv4CudaExecutor {
         // of the per-row `spec_step` loop.
         let spec_on = self.spec_requested();
         let all_greedy = batch.rows.iter().all(|row| row.params.is_greedy());
-        // DSpark has no batched verify lane yet (B=1 bring-up). Run each greedy
-        // row's block step sequentially; non-greedy rows fall to plain batched
-        // decode below (DSpark uses no `spec_slots`, so nothing to clear).
+        // DSpark has no TP-safe batched verify lane. Once a request joins a batch,
+        // keep it on the target path so a later batch shrink cannot reuse stale draft state.
         let any_dspark = self.dspark.is_some()
             && batch
                 .rows
                 .iter()
                 .any(|row| self.dspark_slot_eligible(row.slot));
-        if any_dspark && all_greedy {
-            let mut tokens = Vec::with_capacity(batch.rows.len());
+        if any_dspark {
+            let dspark = self.dspark.as_mut().expect("checked above");
             for row in &batch.rows {
-                let out = self.forward_decode_tokens(
-                    row.slot,
-                    row.last_token,
-                    row.start_pos,
-                    &row.params,
-                    row.position,
-                )?;
-                tokens.extend(out.into_iter().map(|token| SlotToken {
-                    slot: row.slot,
-                    token,
-                    logprob: None,
-                    finish: None,
-                }));
+                dspark.slots[row.slot].eligible = false;
             }
-            return Ok(tokens);
         }
         if spec_on && all_greedy && self.dspark.is_none() {
             // Self-heal an un-seeded / desynced MTP stream (#140), the batched
