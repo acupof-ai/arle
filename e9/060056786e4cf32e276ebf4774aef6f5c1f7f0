@@ -1,0 +1,35 @@
+crates/cuda-kernels/csrc/attention/dsv4_mhc.cu
+  s_cbac1d54da53ea::t_f42aa024678aff 655-700
+crates/cuda-kernels/src/ffi/misc.rs
+  s_aa970b1e4a3552::t_37732899b897ba 134-144
+crates/infer-cuda/src/dsv4/dspark.rs
+  s_cbac1d54da53ea::t_a51ae1b0e82445 572-575,577-578,607-608,631-632,636,645-646,648-649,651-666,675-676
+scripts/dsv4_fast_build.sh
+  s_cbac1d54da53ea::t_c58d5089ce4b4d 30
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "e9060056786e4cf32e276ebf4774aef6f5c1f7f0",
+  "prompts": {},
+  "sessions": {
+    "s_aa970b1e4a3552": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f5ebb-f1a4-7651-898f-0be36fe6b396",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_cbac1d54da53ea": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f5e9b-c754-7170-ba19-53745faa66e6",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
