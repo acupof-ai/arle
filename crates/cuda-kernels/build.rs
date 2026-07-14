@@ -2179,6 +2179,7 @@ fn main() {
     let nvcc = format!("{}/bin/nvcc", cuda_path);
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let sm_targets = detect_sm_targets();
+    let legacy_volta_build = has_legacy_volta(&sm_targets);
     validate_sm_set(&sm_targets);
     let arch_args = nvcc_arch_args(&sm_targets);
     println!(
@@ -2224,7 +2225,11 @@ fn main() {
     println!("cargo:rerun-if-env-changed=ARLE_CUDA_DISABLE_FLASHMLA_DECODE");
     let flashmla_root = Path::new("vendor/flashmla");
     let flashmla_stub = Path::new("csrc/attention/arle_flashmla_decode_stubs.cu");
-    let enable_flashmla = flashmla_root.is_dir() && !env_flag("ARLE_CUDA_DISABLE_FLASHMLA");
+    // FlashMLA is SM90-only sparse-FP8 (prefill + decode). Legacy Volta (sm_70)
+    // has no FP8, so the SM90 instantiations fail to compile there — fall back
+    // to the cudaErrorNotSupported stub path, same as an explicit opt-out.
+    let enable_flashmla =
+        flashmla_root.is_dir() && !env_flag("ARLE_CUDA_DISABLE_FLASHMLA") && !legacy_volta_build;
     if enable_flashmla {
         // Runtime FlashMLA gates read `cuda_kernels::HAS_FLASHMLA` (this cfg); a
         // build without the FlashMLA kernels falls back to scalar — no env var.
@@ -2397,7 +2402,6 @@ fn main() {
     }
     let ccbin = std::env::var("NVCC_CCBIN").ok();
     println!("cargo:rerun-if-env-changed=ARLE_CUDA_DISABLE_MARLIN_W4_FP8");
-    let legacy_volta_build = has_legacy_volta(&sm_targets);
     let disable_marlin_w4_fp8 = legacy_volta_build
         || matches!(
             std::env::var("ARLE_CUDA_DISABLE_MARLIN_W4_FP8").as_deref(),
