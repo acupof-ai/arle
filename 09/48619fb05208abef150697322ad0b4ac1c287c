@@ -1,0 +1,37 @@
+crates/agent-bench/src/lib.rs
+  s_aa970b1e4a3552::t_069ed099d47dfe 1716
+crates/cli/src/args.rs
+  s_aa970b1e4a3552::t_5835ff9488d517 742-745
+crates/cli/src/serve.rs
+  s_aa970b1e4a3552::t_e64850546d1732 316,354
+crates/infer-api/src/loaded.rs
+  s_aa970b1e4a3552::t_6442ece301f8a2 128-130,202,1918
+crates/infer-api/src/serve.rs
+  s_aa970b1e4a3552::t_edacbf011d95f4 172,248
+crates/infer-cuda/examples/dsv4_parity.rs
+  s_aa970b1e4a3552::t_69947d6e403651 236
+crates/infer-cuda/examples/dsv4_resident_ab.rs
+  s_aa970b1e4a3552::t_c973bde3eab8db 212
+crates/infer-cuda/src/executor.rs
+  s_aa970b1e4a3552::t_854ee507edcc6d 254,265
+crates/infer-cuda/src/lib.rs
+  s_aa970b1e4a3552::t_7f22794c7e655b 368,380
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "0948619fb05208abef150697322ad0b4ac1c287c",
+  "prompts": {},
+  "sessions": {
+    "s_aa970b1e4a3552": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f5ebb-f1a4-7651-898f-0be36fe6b396",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
