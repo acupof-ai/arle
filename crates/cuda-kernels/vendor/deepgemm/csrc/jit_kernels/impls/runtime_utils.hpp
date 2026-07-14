@@ -1,7 +1,7 @@
 #pragma once
 
 #include <cuda.h>
-#include <torch/python.h>
+#include <torch/torch.h>
 
 #include "../heuristics/sm90.hpp"
 #include "../../jit/handle.hpp"
@@ -45,6 +45,7 @@ static std::string to_string(const GemmType& type) {
         case GemmType::MGroupedMasked:                      return "GemmType::MGroupedMasked";
         case GemmType::MGroupedContiguousWithPsumLayout:    return "GemmType::MGroupedContiguousWithPsumLayout";
         case GemmType::KGroupedContiguous:                  return "GemmType::KGroupedContiguous";
+        case GemmType::KGroupedContiguousWithPsumLayout:    return "GemmType::KGroupedContiguousWithPsumLayout";
         case GemmType::Batched:                             return "GemmType::Batched";
     }
     DG_HOST_UNREACHABLE("Unknown GEMM type");
@@ -53,6 +54,7 @@ static std::string to_string(const GemmType& type) {
 static std::string to_string(const at::ScalarType& dtype) {
     switch (dtype) {
         case torch::kInt:           return "int";
+        case torch::kByte:          return "uint8_t";
         case torch::kFloat:         return "float";
         case torch::kBFloat16:      return "cutlass::bfloat16_t";
         case torch::kFloat8_e4m3fn: return "cutlass::float_e4m3_t";
@@ -79,6 +81,7 @@ static CUtensorMapDataType aten_dtype_to_tensor_map_dtype(const at::ScalarType& 
 
     switch (dtype) {
         case torch::kInt:           return CU_TENSOR_MAP_DATA_TYPE_INT32;
+        case torch::kByte:          return CU_TENSOR_MAP_DATA_TYPE_UINT8;
         case torch::kFloat:         return CU_TENSOR_MAP_DATA_TYPE_FLOAT32;
         case torch::kBFloat16:      return CU_TENSOR_MAP_DATA_TYPE_BFLOAT16;
         case torch::kFloat8_e4m3fn: return CU_TENSOR_MAP_DATA_TYPE_UINT8;
@@ -249,7 +252,8 @@ static CUtensorMap make_tma_sf_desc(const cute::UMMA::Major& major,
                                     const int& block_mn, const int& gran_k,
                                     const int& num_groups,
                                     const int& swizzle_mode, const int& swizzle_base = 0,
-                                    const bool& allow_tf32 = false) {
+                                    const bool& allow_tf32 = false,
+                                    const int& smem_outer_dim = 1) {
     DG_HOST_ASSERT(major == cute::UMMA::Major::MN);
 
     // TODO: maybe swizzle SF as well
@@ -258,7 +262,7 @@ static CUtensorMap make_tma_sf_desc(const cute::UMMA::Major& major,
     shape_mn = get_tma_aligned_size(shape_mn, static_cast<int>(t.element_size()));
     return make_tma_2d_desc(t,
                             shape_mn, ceil_div(shape_k, gran_k * (t.scalar_type() == torch::kFloat ? 1 : 4)) * num_groups,
-                            block_mn, 1,
+                            block_mn, smem_outer_dim,
                             shape_mn,
                             swizzle_mode, swizzle_base,
                             allow_tf32);
