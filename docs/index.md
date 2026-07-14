@@ -128,11 +128,8 @@ marked as the current source of truth, treat it as historical context.
 | [release-checklist.md](release-checklist.md) | Release prep and artifact verification |
 | [perf-and-correctness-gates.md](perf-and-correctness-gates.md) | Lightweight validation expectations by change type |
 | [resources/profiling-guide.md](resources/profiling-guide.md) | GPU profiling playbook |
-| [resources/metal-dflash.md](resources/metal-dflash.md) | DFlash usage runbook |
-| [resources/metal-dflash-params.md](resources/metal-dflash-params.md) | DFlash CLI parameter reference |
 | [resources/kv-cache-quantization.md](resources/kv-cache-quantization.md) | KV-cache quantization formats and operator-side guidance |
 | [resources/infer-cuda-profiling-wrappers.md](resources/infer-cuda-profiling-wrappers.md) | `nsys` / `ncu` wrapper scripts |
-| [resources/eli-integration.md](resources/eli-integration.md) | Eli sibling-repo integration runbook; layer-2 nexil session-id forwarding shipped 2026-05-07. |
 
 ## Archived / Historical (kept for evidence + cross-refs)
 
@@ -170,6 +167,14 @@ brings them back.
 | [projects/2026-04-30-arle-vs-sglang-admission.md](projects/2026-04-30-arle-vs-sglang-admission.md) | Admission policy gap matrix; sibling to active SGLang admission research note. |
 | [projects/2026-05-02-tilekernels-integration-decision.md](projects/2026-05-02-tilekernels-integration-decision.md) | Decision record (don't-submodule, port-selectively) for `cklxx/TileKernels`; referenced from the multi-backend plan. |
 | [projects/2026-05-07-eli-arle-native-provider-design.md](projects/2026-05-07-eli-arle-native-provider-design.md) | Layer-2 nexil ↔ arle native-provider design; shipped 2026-05-07 (`session_id` forwarding, now in `infer-api` + `infer-server`). Kept as post-implementation reference. |
+
+### Resources (archived)
+
+| Path | Why kept |
+| --- | --- |
+| [resources/metal-dflash.md](resources/metal-dflash.md) | **Historical** — written against deleted `metal_request`/`metal_bench`/`metal_serve` binaries. DFlash survives only as the `mlx-sys` draft-model FFI substrate; rewrite Metal serve uses MTP. |
+| [resources/metal-dflash-params.md](resources/metal-dflash-params.md) | **Historical** — DFlash CLI param reference for the deleted binaries; pairs with `metal-dflash.md`. |
+| [resources/eli-integration.md](resources/eli-integration.md) | **Historical** — eli drove the deleted `metal_serve`; rewrite entry point is `arle serve --backend metal`. |
 
 ## Historical Material
 

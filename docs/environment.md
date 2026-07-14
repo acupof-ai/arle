@@ -473,7 +473,13 @@ export CMAKE_CUDA_ARCHITECTURES="80;86;89;90"          # CMake alias
 - T1 (default): `sm_80 / 86 / 89 / 90` — A100 / A10·3090 / L4·4090 / H100.
 - T2 (opt-in):  `sm_100 / 120` — B100·B200 / RTX 5090. Must be requested
   explicitly via `TORCH_CUDA_ARCH_LIST`; not auto-included.
-- T3 (rejected): `sm < 80` — V100 / T4 / older. Build panics.
+- Legacy Volta (opt-in): `sm_70` — V100. Supported as a **separate
+  SM-pinned build**: set `TORCH_CUDA_ARCH_LIST="7.0"` (or `"70"`) alone —
+  it cannot be mixed with T1/T2 targets, otherwise build errors with
+  "sm_70 legacy Volta builds must be SM-pinned". Only BF16 Qwen3.5
+  dense-attention + GDR cubins are functional; FP8 KV and DSv4 HD64
+  wrappers return `CUDA_ERROR_NOT_SUPPORTED` (build emits a warning).
+- T4 (`sm_75`) and older (`sm < 70`) are **rejected** — build panics.
 
 **Difference from PyTorch.** PyTorch is best-effort (warns + skips when
 a kernel can't compile for a target SM). ARLE is hard-fail: every target

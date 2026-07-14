@@ -118,24 +118,33 @@ agent 与 RL 工作负载每轮都在重复处理同样的 prompt + 历史 + 工
 
 ```mermaid
 flowchart TB
-  subgraph Surfaces["One arle binary"]
-    Serve["arle serve<br/>OpenAI v1 HTTP"]
-    Agent["arle<br/>local agent / REPL"]
-    Train["arle train opd<br/>OPD — teacher <i>is</i> the production server"]
+  classDef entry fill:#1a1a2e,stroke:#e94560,color:#eee,rx:8,ry:8
+  classDef serve fill:#16213e,stroke:#4ecca3,color:#eee,rx:8,ry:8
+  classDef core fill:#0f3460,stroke:#e94560,color:#eee,rx:8,ry:8
+  classDef seam fill:#533483,stroke:#e94560,color:#eee,rx:8,ry:8
+  classDef exec fill:#190e36,stroke:#4ecca3,color:#eee,rx:8,ry:8
+
+  subgraph Surfaces[" "]
+    direction LR
+    Serve["arle serve<br/><sub>OpenAI v1 HTTP</sub>"]
+    Agent["arle<br/><sub>local agent / REPL</sub>"]
+    Train["arle train opd<br/><sub>OPD — teacher 就是生产 server</sub>"]
   end
 
-  subgraph Serving["Serving layer"]
-    Server["infer-server<br/>HTTP · streaming · ServeHandle"]
-    API["infer-api<br/>LoadedInferenceEngine — programmatic front door"]
+  subgraph Serving[" "]
+    direction LR
+    Server["infer-server<br/><sub>HTTP · streaming · ServeHandle</sub>"]
+    API["infer-api<br/><sub>LoadedInferenceEngine — 唯一编程入口</sub>"]
   end
 
-  Core["<b>infer-core — device-neutral Engine&lt;E,K&gt;</b><br/>continuous scheduler · RadixCache prefix reuse<br/>chunked prefill · paged-KV admission · sampling"]
+  Core["<b>infer-core — device-neutral Engine&lt;E,K&gt;</b><br/><sub>continuous scheduler · RadixCache prefix reuse · chunked prefill · paged-KV admission · sampling</sub>"]
 
-  Seam["<b>infer-plan IR · infer-seam</b><br/>the narrow waist: two host-only traits — BackendExecutor · KvPool"]
+  Seam["<b>infer-plan IR · infer-seam</b><br/><sub>细腰：两个 host-only trait — BackendExecutor · KvPool</sub>"]
 
-  subgraph Exec["Executors — a new backend = implement the two traits"]
-    CUDA["infer-cuda<br/>official FlashMLA · DeepGEMM · DeepEP + TileLang AOT<br/>TP=8 / EP=8 · Qwen3-dense · Qwen3.5/3.6 hybrid·MoE<br/>DeepSeek-V4-Flash · GLM-5.2 (verify pending)"]
-    Metal["infer-metal<br/>MLX bridge · packed varlen decode · wired weights<br/>Qwen3.5/3.6 hybrid·MoE · Gemma4 / DeepSeek-OCR VLM (bring-up)<br/>DiffusionGemma (quality pending)"]
+  subgraph Exec[" "]
+    direction LR
+    CUDA["infer-cuda<br/><sub>官方 FlashMLA · DeepGEMM · DeepEP + TileLang AOT · TP=8/EP=8</sub>"]
+    Metal["infer-metal<br/><sub>MLX bridge · packed varlen decode · wired weights</sub>"]
   end
 
   Serve --> Server
@@ -146,7 +155,15 @@ flowchart TB
   Core --> Seam
   Seam --> CUDA
   Seam --> Metal
+
+  class Serve,Agent,Train entry
+  class Server,API serve
+  class Core core
+  class Seam seam
+  class CUDA,Metal exec
 ```
+
+新后端只需实现 seam 的两个 trait，无需改动 scheduler、cache 或 server。
 
 架构详解:[docs/onboarding.md](docs/onboarding.md)(新人 30 分钟)· [docs/architecture.md](docs/architecture.md) · [docs/codebase-map.md](docs/codebase-map.md)。
 

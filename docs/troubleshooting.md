@@ -30,6 +30,17 @@ cargo build --release --no-default-features --features cpu,no-cuda,cli --bin arl
 will report `bare` and `arle serve --backend auto` will refuse to start with an
 actionable message.
 
+### `error: could not execute process 'sccache .../rustc -vV' (never executed)`
+
+`RUSTC_WRAPPER` (or `~/.cargo/config.toml` `[build] rustc-wrapper`) points to
+`sccache`, but it is not installed on this host — the wrapper binary itself
+can't be found, so no compile ever starts. Either install it
+(`cargo install sccache` or the system package) or clear it for this build:
+
+```bash
+RUSTC_WRAPPER= cargo build --release --features cuda --bin arle
+```
+
 ### `error: linker 'cc' not found` on Linux
 
 Install build essentials: `apt install -y build-essential pkg-config` (Debian /
@@ -129,13 +140,6 @@ E2E tests now require explicit `--features cuda`:
 ```bash
 cargo test --release --features cuda --test e2e
 ```
-
-### Hygiene check fails: missing marker `## 📰 Latest Updates`
-
-`scripts/check_repo_hygiene.py` enforces that README.md keeps the
-"Latest Updates" emoji marker (and zh-CN keeps `## 📰 最新动态`). If you slim
-the README, keep the marker even if the section is short — the hygiene script
-parses on it.
 
 ### `pytest tests/` finds nothing
 
