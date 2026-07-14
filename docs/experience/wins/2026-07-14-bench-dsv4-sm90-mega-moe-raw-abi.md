@@ -65,11 +65,13 @@ Local raw-ABI gates passed:
 
 - `CUDARC_CUDA_VERSION=12080 cargo check -p cuda-kernels --release --no-default-features --features cuda,no-cuda --lib`
 - `git diff --check`
+- H20/CUDA 12.9 direct NVCC compile of `deepgemm_native.cu` with
+  `DG_JIT_USE_RUNTIME_API=1` (`deepgemm_native.o`, 244 KiB).
 
 ## Problems
 
-- H20 NVCC/JIT compile, tensor-map construction, symmetric-buffer dispatch, and
-  numerical output are unverified.
+- H20 JIT load/launch, tensor-map runtime encoding, symmetric-buffer dispatch,
+  and raw-ABI numerical output are unverified.
 - Serving has no call site, so guidellm cannot attribute a delta yet.
 
 ## Learnings
@@ -84,4 +86,5 @@ Deferred. Use the latest DSv4 TP=4 fixed-concurrency baseline when wiring lands.
 ## Artefacts
 
 Pod logs: `/host/deepgemm-pr323-probe/t0-exact-shape-max128.log`,
-`t0-n16-baseline.log`, and `t0-accuracy-flash-exact.log`.
+`t0-n16-baseline.log`, `t0-accuracy-flash-exact.log`, and
+`/host/arle-megamoe-t1/h20-native-nvcc.log`.
