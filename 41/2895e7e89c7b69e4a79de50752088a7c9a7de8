@@ -1,0 +1,25 @@
+crates/cuda-kernels/csrc/gemm/gemv.cu
+  s_67038b17df7668::t_b93c5003af9095 247-305,309-315,321-326,337-355,424-448,461-474,628,640-644,649-652,659
+crates/cuda-kernels/kernels.toml
+  s_67038b17df7668::t_37c150f38fc603 251,335,426
+crates/infer-cuda/src/qwen35.rs
+  s_67038b17df7668::t_0589aa6f088f16 6207
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "412895e7e89c7b69e4a79de50752088a7c9a7de8",
+  "prompts": {},
+  "sessions": {
+    "s_67038b17df7668": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c4b3468e-feff-42b1-aa89-1f360f19b20b",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
