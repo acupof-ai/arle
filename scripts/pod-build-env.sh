@@ -18,11 +18,17 @@ export CMAKE_CUDA_ARCHITECTURES=90
 # via requirements-build.txt). If neither, leave unset — a from-source CUDA build
 # then fails loudly; install via `scripts/pod.sh setup-tilelang`. (Single-crate
 # builds like -p autograd don't touch this.)
-_tl_venv="${TREE:-/host/arle-build}/crates/cuda-kernels/tools/tilelang/.venv/bin/python"
-if [ -x "$_tl_venv" ]; then
-  export INFER_TILELANG_PYTHON="${INFER_TILELANG_PYTHON:-$_tl_venv}"
-elif command -v python3 >/dev/null 2>&1 && python3 -c "import tilelang" >/dev/null 2>&1; then
-  export INFER_TILELANG_PYTHON="${INFER_TILELANG_PYTHON:-$(command -v python3)}"
+if [ -z "${INFER_TILELANG_PYTHON:-}" ]; then
+  for python in \
+    "${TREE:-/host/arle-build}/crates/cuda-kernels/tools/tilelang/.venv/bin/python" \
+    /host/arle-build/crates/cuda-kernels/tools/tilelang/.venv/bin/python \
+    "$(command -v python3 2>/dev/null)"; do
+    [ -x "$python" ] || continue
+    if "$python" -c 'import tilelang; assert tuple(map(int, tilelang.__version__.split(".")[:3])) >= (0, 1, 11)' >/dev/null 2>&1; then
+      export INFER_TILELANG_PYTHON="$python"
+      break
+    fi
+  done
 fi
 # Persistent kernel-artifact cache (keyed on kernel source × SM × nvcc). build.rs
 # regenerates kernels on demand (generated/ gitignored); this cache restores a prior
