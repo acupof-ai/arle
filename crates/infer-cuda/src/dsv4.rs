@@ -2287,7 +2287,7 @@ impl Dsv4Model {
         }
         // DSpark per-slot device memory (gated on is_dspark(), independent of
         // spec_decode_on — MUST track the constructors):
-        //  - T3 taps: one wide-stream (bf16) buffer per target layer (`Dsv4SlotState`).
+        //  - T3 taps: one verify-block wide-stream buffer per target layer.
         //  - draft caches (`Dsv4DsparkExec`, one runtime per slot, `load_dspark_exec`):
         //    per stage a `latent_kv` [latent_cap, head_dim] bf16 + a ratio-0 MLA
         //    attention state over draft_span. Counted here so the KV budget's
@@ -2306,6 +2306,7 @@ impl Dsv4Model {
                     .dspark_target_layer_ids
                     .len()
                     .saturating_mul(stream_dim)
+                    .saturating_mul(block.saturating_add(1))
                     .saturating_mul(bf16),
             );
             total = total.saturating_add(
@@ -2953,8 +2954,15 @@ impl Dsv4Model {
         );
         let n = tokens.len();
         let stream_dim = self.config.hidden_size * self.config.hc_mult;
-        let (stream, mut keepalive) =
-            self.forward_tokens_stream_impl(slot, kv_adapter, tokens, start_pos, true, None)?;
+        let persist_spec_normed = slot.spec_normed.is_some();
+        let (stream, mut keepalive) = self.forward_tokens_stream_impl(
+            slot,
+            kv_adapter,
+            tokens,
+            start_pos,
+            persist_spec_normed,
+            None,
+        )?;
         let hiddens = (0..n)
             .map(|i| -> Result<_> {
                 let mut h = DeviceVec::zeros(&self.ctx, stream_dim)?;
