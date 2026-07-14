@@ -1,0 +1,23 @@
+README.md
+  s_cbac1d54da53ea::t_f227ce4afa5fcf 154-167,178-179
+README.zh-CN.md
+  s_cbac1d54da53ea::t_81f3f04f4e8c77 126-139,150-151
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "e4c87fb88d6765509100faf9e0dfa75cae2e6024",
+  "prompts": {},
+  "sessions": {
+    "s_cbac1d54da53ea": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f5e9b-c754-7170-ba19-53745faa66e6",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
