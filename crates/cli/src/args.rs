@@ -739,6 +739,10 @@ pub(crate) struct ServeArgs {
     #[arg(long, default_value_t = 0.5, value_name = "T")]
     pub(crate) dspark_conf_threshold: f32,
 
+    /// Use DSpark only when the original prompt has at most this many tokens.
+    #[arg(long, value_name = "N")]
+    pub(crate) dspark_max_prompt_tokens: Option<usize>,
+
     /// Number of MTP draft tokens to propose per verify block on CUDA.
     #[arg(long, value_name = "N")]
     pub(crate) mtp_draft_tokens: Option<usize>,
