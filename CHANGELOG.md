@@ -23,6 +23,14 @@ Progress spine. Entry classes recorded here the day they land: phase exits,
 default flips, license-or-kill verdicts (AGENTS.md §Docs lifecycle & progress
 spine).
 
+- **2026-07-14 — DSv4 DSpark TP=4 concurrency licensed.** Loading the already
+  EP4/TP4-sharded draft before KV planning replaced a false 19.9 GB/rank reserve
+  with the measured 4,960 MB resident footprint, raising slots **1→33**. The
+  TP-unsafe sequential B>1 draft path was deleted; batches use the target decoder
+  until a TP-safe batched verify lane exists. GuideLLM c=1/4/8/16 throughput is
+  **45.04/80.06/120.66/141.46 tok/s**: -1.0%/+71.6%/+159.1%/+203.9%, zero errors.
+  [bench](docs/experience/wins/2026-07-14-dspark-resident-budget-tp4.md).
+
 - **2026-07-14 — DSv4 DSpark prompt router licensed for H20 TP=4.** DSpark
   output throughput moved from +6.3% at 32 prompt tokens to -12.4% at 128 and
   -18.6% at 8K. The opt-in `--dspark-max-prompt-tokens 64` router preserves the
