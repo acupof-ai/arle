@@ -1,0 +1,31 @@
+crates/cuda-kernels/csrc/gemm/quantized_gemv.cu
+  s_67038b17df7668::t_34b453d06a90dc 1250-1424,2453-2510
+crates/cuda-kernels/src/ffi/gemm.rs
+  s_67038b17df7668::t_91c5335c2b3622 352-386
+crates/cuda-kernels/src/moe.rs
+  s_67038b17df7668::t_f44eccaa8d212c 105-161,603-710
+crates/infer-cuda/src/moe.rs
+  s_67038b17df7668::t_d96daaf6005e12 1831-1858,1952-1976
+crates/infer-cuda/src/ops/quant_linear.rs
+  s_67038b17df7668::t_fd0163dc4f821b 698-728,870-899
+crates/infer-cuda/src/quant_format.rs
+  s_67038b17df7668::t_3771dd13269461 29-31,187-215,316-344
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "8ec848cf7785788142b87ecc3271f766e3c8e718",
+  "prompts": {},
+  "sessions": {
+    "s_67038b17df7668": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c4b3468e-feff-42b1-aa89-1f360f19b20b",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
