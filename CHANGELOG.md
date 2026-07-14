@@ -23,6 +23,17 @@ Progress spine. Entry classes recorded here the day they land: phase exits,
 default flips, license-or-kill verdicts (AGENTS.md §Docs lifecycle & progress
 spine).
 
+- **2026-07-14 — V100 (sm_70) prefill `cudaErrorNotSupported` fixed.** Two
+  fixes, both gated exclusively on compute-major ≤ 7 so the sm_80+ hot path is
+  byte-identical: (1) BF16 GEMM on Volta (no BF16 tensor cores — only FP16/FP32)
+  now casts BF16→FP16, runs an FP16 tensor-core GEMM, casts back, skipping
+  cublasLt's bad-algo heuristic; compute-major cached per device to avoid the
+  uncached-per-step −77% decode regression. (2) `allow_sm70 = true` for the
+  HD256 q8_kv2 paged-attention prefill/decode kernels (the 0.8B dense config),
+  so the sm_70 cubin is compiled instead of the runtime `cudaErrorNotSupported`
+  stub. [gemm](docs/experience/wins/2026-07-14-v100-sm70-bf16-gemm-fp16cast.md),
+  [paged-attn](docs/experience/wins/2026-07-14-v100-sm70-paged-attention-allow-sm70.md).
+
 - **2026-07-14 — DSv4 DSpark correctness PASS, opt-in unchanged.** Restored the
   official HC-lane mean, native BF16 Markov weights, and accepted-prefix recurrent
   fold: coherent 128-token output with **61/170 accepted (35.9%)** on H20 TP=4.
