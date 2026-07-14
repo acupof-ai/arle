@@ -23,6 +23,13 @@ Progress spine. Entry classes recorded here the day they land: phase exits,
 default flips, license-or-kill verdicts (AGENTS.md §Docs lifecycle & progress
 spine).
 
+- **2026-07-14 — DSv4 DSpark correctness PASS, opt-in unchanged.** Restored the
+  official HC-lane mean, native BF16 Markov weights, and accepted-prefix recurrent
+  fold: coherent 128-token output with **61/170 accepted (35.9%)** on H20 TP=4.
+  Also bounded checkpoint prefetch to rank zero plus page-cache capacity, removing
+  the observed 4-rank full-checkpoint read amplification. [correctness](docs/experience/wins/2026-07-14-dspark-dsv4-accept-and-correctness.md),
+  [load](docs/experience/wins/2026-07-14-loader-tp-rank0-prefetch.md).
+
 ## [0.3.0] - 2026-07-12
 
 Headline: **DSpark speculative decoding** for DSv4/Qwen3.6, a **CUDA kernel
