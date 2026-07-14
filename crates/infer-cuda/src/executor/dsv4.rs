@@ -42,9 +42,6 @@ pub(crate) struct Dsv4CudaExecutor {
     /// loaded and greedy B=1 decode routes through the DSpark
     /// draft→verify→accept loop instead of MTP; `None` = MTP or no spec. The
     /// per-slot draft caches ride here (serial spec state, like `spec_slots`).
-    /// NOTE: the underlying block-attention kernel is a pod stub
-    /// (`cudaErrorNotYetImplemented`), so a `dspark` serve is WIRED but not yet
-    /// runnable — the loop errors at the first draft forward until the kernel lands.
     pub(crate) dspark: Option<Dsv4DsparkExec>,
 }
 
@@ -588,7 +585,7 @@ impl Dsv4CudaExecutor {
              dspark_block_size + dspark_target_layer_ids); this checkpoint is not one"
         );
         let loader = crate::loader::SafetensorLoader::new(draft_dir)?;
-        loader.prefetch_shards();
+        loader.prefetch_shards_rank0(&model.ctx, &model.tp)?;
         let draft = crate::dsv4::load_dspark_draft(
             &loader,
             &model.ctx,
@@ -607,11 +604,7 @@ impl Dsv4CudaExecutor {
         let draft_span = max_seq_len + block_size;
         let slots = (0..num_slots)
             .map(|slot_idx| -> Result<_> {
-                // Each committed context token caches `hc_mult` latent rows (the
-                // fused-tap HC lanes), so the full-prompt draft context needs
-                // `max_seq_len * hc_mult` rows — NOT `max_seq_len` (would overflow
-                // the latent cap once the prompt prefix is seeded).
-                let context_capacity = max_seq_len * model.config.hc_mult;
+                let context_capacity = max_seq_len;
                 let df = crate::dsv4::dspark::Dsv4DsparkSlotState::new(
                     &model.ctx,
                     &model.config,
@@ -1266,11 +1259,8 @@ impl Dsv4CudaExecutor {
     /// swapping the autoregressive MTP draft for the single-pass block drafter and
     /// the sparse frozen verify for the contiguous commit verify + truncate.
     ///
-    /// WIRED-NOT-RUNNABLE: `dspark_forward_block`'s block-attention kernel is a
-    /// pod stub (`cudaErrorNotYetImplemented`), so this errors at the draft
-    /// forward until the kernel lands. Every committed token is a target greedy
-    /// argmax (anchor + verified accepted drafts + bonus), so the loop is
-    /// token-exact to no-spec greedy decode once the kernel is real.
+    /// Every committed token is a target greedy argmax (anchor + verified
+    /// accepted drafts + bonus).
     fn dspark_decode_tokens(
         &mut self,
         slot_idx: usize,
@@ -1394,18 +1384,12 @@ impl Dsv4CudaExecutor {
         }
         let draft_len = proposal.draft_len;
 
-        // Snapshot the boundary rings the verify will overwrite so a rejected
-        // draft tail rolls back (MTP-shared substrate). Nothing has touched the
-        // rings at `verify_pos..` yet — the draft wrote only its own latent cache.
         self.model.capture_spec_rings(
             &mut self.slots[slot_idx],
             &mut self.kv_adapter,
             verify_pos,
             draft_len,
         )?;
-
-        // Verify [anchor, d0..] as ONE contiguous commit forward at `verify_pos`
-        // (writes every row's KV; the rejected tail is truncated). MTP substrate.
         let verify = self.model.forward_tokens_verify(
             &mut self.slots[slot_idx],
             &mut self.kv_adapter,
@@ -1440,15 +1424,10 @@ impl Dsv4CudaExecutor {
             bonus = r0[1] as u32;
         }
 
-        // Commit: keep anchor + accepted drafts (`accepted + 1` rows), truncate
-        // the rejected tail, restore the rejected ring slots (order: truncate →
-        // ring restore, mirroring MTP).
-        let committed_len = verify_pos + accepted + 1;
-        self.model.truncate_slot(
-            &mut self.slots[slot_idx],
-            &mut self.kv_adapter,
-            committed_len,
-        )?;
+        // Return to the real frontier, restore the aliased ring boundary, then
+        // fold anchor + accepted drafts exactly once from persisted verify rows.
+        self.model
+            .truncate_slot(&mut self.slots[slot_idx], &mut self.kv_adapter, verify_pos)?;
         self.model.restore_spec_ring_tail(
             &mut self.slots[slot_idx],
             &mut self.kv_adapter,
@@ -1456,6 +1435,37 @@ impl Dsv4CudaExecutor {
             accepted,
             draft_len,
         )?;
+        self.model.commit_accepted_fold(
+            &mut self.slots[slot_idx],
+            &mut self.kv_adapter,
+            0..accepted + 1,
+            verify_pos,
+        )?;
+
+        // The verify taps cover [anchor, drafts..]. Only its committed prefix
+        // belongs in the next block's context; the rejected tail must not leak.
+        {
+            let Self {
+                model,
+                slots,
+                dspark,
+                ..
+            } = self;
+            let Dsv4DsparkExec {
+                draft,
+                slots: ds_slots,
+                ..
+            } = dspark
+                .as_mut()
+                .expect("dspark_decode_tokens without dspark");
+            model.dspark_append_context(
+                draft,
+                &mut ds_slots[slot_idx].df,
+                slots[slot_idx].dspark_taps(),
+                accepted + 1,
+                verify_pos,
+            )?;
+        }
 
         self.mtp_accepts += accepted;
         self.mtp_rejects += draft_len - accepted;

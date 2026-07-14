@@ -652,6 +652,52 @@ extern "C" CUresult dsv4_mhc_head_pre_cuda(
   return (CUresult)cudaGetLastError();
 }
 
+__global__ void dsv4_mhc_lane_mean_kernel(
+    const uint16_t *__restrict__ stream,
+    uint16_t *__restrict__ out,
+    int num_tokens,
+    int hidden_size,
+    int hc_mult,
+    int out_stride,
+    int tap_offset) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int total = num_tokens * hidden_size;
+  if (idx >= total) return;
+  int token = idx / hidden_size;
+  int col = idx % hidden_size;
+  int64_t stream_base =
+      (int64_t)token * hc_mult * hidden_size + col;
+  float sum = 0.0f;
+  for (int lane = 0; lane < hc_mult; ++lane) {
+    sum += bf16_to_f32(stream[stream_base + lane * hidden_size]);
+  }
+  int64_t out_idx = (int64_t)token * out_stride + tap_offset + col;
+  out[out_idx] =
+      f32_to_bf16_bits(sum / (float)hc_mult);
+}
+
+extern "C" CUresult dsv4_mhc_lane_mean_cuda(
+    const uint16_t *stream,
+    uint16_t *out,
+    int num_tokens,
+    int hidden_size,
+    int hc_mult,
+    int out_stride,
+    int tap_offset,
+    CUstream cuda_stream) {
+  if (num_tokens < 0 || hidden_size <= 0 || hc_mult <= 0 ||
+      tap_offset < 0 || out_stride < tap_offset + hidden_size) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  if (num_tokens == 0) return CUDA_SUCCESS;
+  int total = num_tokens * hidden_size;
+  int grid = (total + DSV4_MHC_BLOCK - 1) / DSV4_MHC_BLOCK;
+  dsv4_mhc_lane_mean_kernel<<<grid, DSV4_MHC_BLOCK, 0,
+                               (cudaStream_t)cuda_stream>>>(
+      stream, out, num_tokens, hidden_size, hc_mult, out_stride, tap_offset);
+  return (CUresult)cudaGetLastError();
+}
+
 __global__ void dsv4_mtp_add_eproj_hproj_kernel(
     const uint16_t *__restrict__ e_proj,
     const uint16_t *__restrict__ h_proj,

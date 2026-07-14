@@ -325,7 +325,7 @@ impl Dsv4CudaExecutor {
         self.model.commit_accepted_fold(
             &mut self.slots[slot_idx],
             &mut self.kv_adapter,
-            &path,
+            path.iter().copied(),
             start_pos,
         )?;
         {
@@ -496,7 +496,7 @@ impl Dsv4CudaExecutor {
             self.model.commit_accepted_fold(
                 &mut self.slots[slot_idx],
                 &mut self.kv_adapter,
-                &path,
+                path.iter().copied(),
                 start_pos,
             )?;
             let spec = &mut self.spec_slots[slot_idx];

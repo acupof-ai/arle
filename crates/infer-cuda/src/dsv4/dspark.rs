@@ -569,16 +569,13 @@ impl Dsv4Model {
     /// THE canonical context-append path. Fuses `rows` committed tokens' trunk
     /// taps into per-token context features and appends their compressed latent to
     /// EVERY stage's `latent_kv`, RoPE'ing each token at its OWN absolute trunk
-    /// position `start_abs + j` (the geometry invariant — a committed token's
-    /// `hc_mult` latent entries all share that token's position, but distinct
-    /// tokens carry distinct positions). `taps` = `n_taps` wide-HC-stream captures,
-    /// each `[stream_dim * rows]` token-major (column `c = j*hc_mult + r` at
-    /// `c*hidden`); `rows` = number of committed tokens; `start_abs` = the absolute
-    /// trunk position of tap row 0. Advances `df.ctx_end` by `rows * hc_mult`.
+    /// position `start_abs + j` (the geometry invariant). `taps` = `n_taps`
+    /// wide-HC-stream captures, each `[stream_dim * rows]` token-major; `rows` =
+    /// number of committed tokens; `start_abs` = the absolute trunk position of
+    /// tap row 0. Advances `df.ctx_end` by `rows`.
     ///
-    /// Both callers route here: prefill seeds the whole prompt prefix
-    /// (`start_abs = 0`, `rows = prompt_len`), decode appends the per-step anchor
-    /// (`rows = 1`, `start_abs = start_pos`).
+    /// Prefill seeds the prompt; decode appends the anchor-forward row before
+    /// drafting, then the verified anchor plus accepted draft rows after verify.
     #[allow(dead_code)]
     pub(crate) fn dspark_append_context(
         &self,
@@ -607,9 +604,8 @@ impl Dsv4Model {
             draft.stages.len()
         );
 
-        // Fuse ALL committed tokens at once. Column `c = j*hc_mult + r` (token j,
-        // HC lane r) → context row `c`; main_proj `[hidden, n_taps*hidden]` takes
-        // `n_taps*hidden` per column (concat the taps' hidden-slices).
+        // Fuse all committed tokens at once. Each tap's HC lanes are mean-reduced
+        // before the taps are concatenated for main_proj.
         let stage0 = &draft.stages[0];
         let main_proj = stage0
             .main_proj
@@ -620,8 +616,6 @@ impl Dsv4Model {
             .as_ref()
             .ok_or_else(|| anyhow!("DSpark stage 0 missing main_norm"))?;
         let n_taps = taps.len();
-        // POD-VERIFY: the tap stride/interleave + main_proj input width are not
-        // locally verifiable (the attention kernel is stubbed).
         ensure!(
             main_proj.cols == n_taps * hidden,
             "DSpark main_proj cols {} != n_taps {n_taps} * hidden {hidden}",
@@ -634,12 +628,12 @@ impl Dsv4Model {
         );
         for (t, tap) in taps.iter().enumerate() {
             ensure!(
-                tap.len == stream_dim * rows,
-                "DSpark tap {t} len {} != stream_dim {stream_dim} * rows {rows}",
+                tap.len >= stream_dim * rows,
+                "DSpark tap {t} len {} < stream_dim {stream_dim} * rows {rows}",
                 tap.len
             );
         }
-        let cols = hc_mult * rows;
+        let cols = rows;
         // Capacity: the appended context rows must fit before the noise block.
         let cap = df.latent_kv[0].len / head_dim;
         ensure!(
@@ -648,16 +642,28 @@ impl Dsv4Model {
             (df.ctx_end - df.ctx_base) + cols
         );
 
-        // SAFETY: uninit device scratch; every [column c, tap t] slice written below.
+        // SAFETY: each launch fully writes one non-overlapping [rows, hidden]
+        // tap slice; all n_taps slices cover the buffer before it is read.
         let mut fuse_in = unsafe { HiddenStates::uninit(ctx, n_taps * hidden, cols)? };
-        for c in 0..cols {
+        {
+            let (fuse_ptr, _gf) = fuse_in.data.device_ptr_mut(&ctx.stream);
             for (t, tap) in taps.iter().enumerate() {
-                let src = tap.data.slice(c * hidden..(c + 1) * hidden);
-                let base = c * n_taps * hidden + t * hidden;
-                let mut dst = fuse_in.data.slice_mut(base..base + hidden);
-                ctx.stream
-                    .memcpy_dtod(&src, &mut dst)
-                    .map_err(|e| anyhow!("DSpark tap concat D2D failed: {e}"))?;
+                let (tap_ptr, _gt) = tap.data.device_ptr(&ctx.stream);
+                // SAFETY: tap is [rows, hc_mult, hidden]; output shape and complete,
+                // non-overlapping tap-slice coverage are established above.
+                unsafe {
+                    ffi::dsv4_mhc_lane_mean_cuda(
+                        tap_ptr as *const ffi::Half,
+                        fuse_ptr as *mut ffi::Half,
+                        rows as i32,
+                        hidden as i32,
+                        hc_mult as i32,
+                        (n_taps * hidden) as i32,
+                        (t * hidden) as i32,
+                        ctx.stream.cu_stream(),
+                    )
+                    .result()?;
+                }
             }
         }
         // SAFETY: dsv4_linear writes the full [hidden, cols] buffer.
@@ -666,10 +672,8 @@ impl Dsv4Model {
         let context = crate::attention::mla_rms_norm(ctx, &context_raw, main_norm, eps)?;
         self.dspark_dbg_stats("context", &context);
 
-        // Per-column absolute positions: token j's `hc_mult` columns share
-        // `start_abs + j`; distinct tokens carry distinct positions (the invariant).
-        let positions: Vec<i32> = (0..rows)
-            .flat_map(|j| std::iter::repeat((start_abs + j) as i32).take(hc_mult))
+        let positions: Vec<i32> = (start_abs..start_abs + rows)
+            .map(|pos| pos as i32)
             .collect();
 
         // Append to every stage's latent_kv at the SAME frontier offset, then
