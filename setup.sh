@@ -566,6 +566,16 @@ do_build() {
     # shellcheck disable=SC1091
     [ -f "$HOME/.cargo/env" ] && source "$HOME/.cargo/env"
 
+    # A stale RUSTC_WRAPPER (e.g. sccache) from the host env breaks cargo build
+    # the instant the wrapper binary isn't installed — "could not execute process
+    # 'sccache .../rustc -vV' (never executed)". Detect, warn, and clear it for
+    # this build so a fresh checkout compiles without editing shell config.
+    if [ -n "${RUSTC_WRAPPER:-}" ] && ! command -v "$RUSTC_WRAPPER" &>/dev/null; then
+        warn "RUSTC_WRAPPER='$RUSTC_WRAPPER' is set but not on PATH — clearing for this build."
+        warn "  Install it or add 'unset RUSTC_WRAPPER' to your shell rc to use plain rustc."
+        unset RUSTC_WRAPPER
+    fi
+
     if [ "$PLATFORM" = "linux" ] && [ "$HAS_CUDA" = "1" ]; then
         export CUDA_HOME
         export PATH="$CUDA_HOME/bin:$PATH"
