@@ -40,7 +40,7 @@ scripts/bench_guidellm.sh dsv4-sm90-mega-moe \
 - Model: DeepSeek-V4-Flash
 - Hardware: 4x H20, driver 535.161.08, CUDA 12.9
 - Upstream: DeepGEMM PR #323 head `9e3afe91cb145ddfa0b18ae874a11dbb449e16a9`
-- Source commit: `8aa372ad1` plus the raw-ABI tranche
+- Source commit: `b94e2fc44` plus the raw-ABI tranche
 - Non-default path: SM90 MegaMoE raw ABI, not yet reachable from serving
 
 ## Results
