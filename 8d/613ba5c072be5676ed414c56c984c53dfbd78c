@@ -1,0 +1,25 @@
+docs/experience/wins/2026-07-14-v100-legacy-volta-flashmla-gate.md
+  s_67038b17df7668::t_fcd58b9763fa23 5-8,47-48
+docs/experience/wins/2026-07-14-v100-sm70-bf16-gemm-fp16cast.md
+  s_67038b17df7668::t_924a36eb673ebf 5-8,50-52
+docs/experience/wins/2026-07-14-v100-sm70-paged-attention-allow-sm70.md
+  s_67038b17df7668::t_b9b97db6501c48 6-9,46-48
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "8d613ba5c072be5676ed414c56c984c53dfbd78c",
+  "prompts": {},
+  "sessions": {
+    "s_67038b17df7668": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c4b3468e-feff-42b1-aa89-1f360f19b20b",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
