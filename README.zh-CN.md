@@ -119,51 +119,36 @@ agent 与 RL 工作负载每轮都在重复处理同样的 prompt + 历史 + 工
 ```mermaid
 flowchart TB
   classDef entry fill:#1a1a2e,stroke:#e94560,color:#eee,rx:8,ry:8
-  classDef serve fill:#16213e,stroke:#4ecca3,color:#eee,rx:8,ry:8
   classDef core fill:#0f3460,stroke:#e94560,color:#eee,rx:8,ry:8
   classDef seam fill:#533483,stroke:#e94560,color:#eee,rx:8,ry:8
   classDef exec fill:#190e36,stroke:#4ecca3,color:#eee,rx:8,ry:8
 
-  subgraph Surfaces[" "]
-    direction LR
-    Serve["arle serve<br/><sub>OpenAI v1 HTTP</sub>"]
-    Agent["arle<br/><sub>local agent / REPL</sub>"]
-    Train["arle train opd<br/><sub>OPD — teacher 就是生产 server</sub>"]
-  end
+  Serve["arle serve<br/><sub>OpenAI v1</sub>"]
+  Agent["arle<br/><sub>本地 agent</sub>"]
+  Train["arle train opd<br/><sub>OPD</sub>"]
 
-  subgraph Serving[" "]
-    direction LR
-    Server["infer-server<br/><sub>HTTP · streaming · ServeHandle</sub>"]
-    API["infer-api<br/><sub>LoadedInferenceEngine — 唯一编程入口</sub>"]
-  end
+  Core["infer-core<br/><sub>device-neutral Engine · 调度器 · KV cache</sub>"]
 
-  Core["<b>infer-core — device-neutral Engine&lt;E,K&gt;</b><br/><sub>continuous scheduler · RadixCache prefix reuse · chunked prefill · paged-KV admission · sampling</sub>"]
+  Seam["infer-seam<br/><sub>两个 trait：BackendExecutor · KvPool</sub>"]
 
-  Seam["<b>infer-plan IR · infer-seam</b><br/><sub>细腰：两个 host-only trait — BackendExecutor · KvPool</sub>"]
+  CUDA["infer-cuda<br/><sub>FlashMLA · DeepGEMM · DeepEP</sub>"]
+  Metal["infer-metal<br/><sub>MLX bridge</sub>"]
 
-  subgraph Exec[" "]
-    direction LR
-    CUDA["infer-cuda<br/><sub>官方 FlashMLA · DeepGEMM · DeepEP + TileLang AOT · TP=8/EP=8</sub>"]
-    Metal["infer-metal<br/><sub>MLX bridge · packed varlen decode · wired weights</sub>"]
-  end
-
-  Serve --> Server
-  Agent --> API
-  Train --> API
-  Server --> Core
-  API --> Core
+  Serve --> Core
+  Agent --> Core
+  Train --> Core
   Core --> Seam
   Seam --> CUDA
   Seam --> Metal
 
   class Serve,Agent,Train entry
-  class Server,API serve
   class Core core
   class Seam seam
   class CUDA,Metal exec
 ```
 
-新后端只需实现 seam 的两个 trait，无需改动 scheduler、cache 或 server。
+一套运行时、三个表面、两个可插拔后端。新后端只需实现 seam 的两个
+trait，无需改动 scheduler、cache 或 server。
 
 架构详解:[docs/onboarding.md](docs/onboarding.md)(新人 30 分钟)· [docs/architecture.md](docs/architecture.md) · [docs/codebase-map.md](docs/codebase-map.md)。
 
