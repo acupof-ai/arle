@@ -1,0 +1,23 @@
+crates/infer-cuda/src/dsv4.rs
+  s_cbac1d54da53ea::t_fe43f21a056a4a 2185-2186,2388,2407,2449
+crates/infer-cuda/src/executor/dsv4.rs
+  s_cbac1d54da53ea::t_126601a2dc5bba 420-444,454,559-562,566,595,598-599,603,661,1648-1649,1655-1656,1658
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "3ef88a0db6f2be3061131007ce1b0b972b489b35",
+  "prompts": {},
+  "sessions": {
+    "s_cbac1d54da53ea": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f5e9b-c754-7170-ba19-53745faa66e6",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
