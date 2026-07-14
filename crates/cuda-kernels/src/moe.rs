@@ -102,6 +102,63 @@ pub fn build_expert_qscale_fp8_ptr_table(
     build_optional_u8_ptr_table(ctx, experts, "qscale_fp8", |m| m.qscale_fp8.as_ref())
 }
 
+fn build_optional_bf16_ptr_table(
+    ctx: &DeviceContext,
+    experts: &[&DeviceMatrix],
+    label: &str,
+    get: impl Fn(&DeviceMatrix) -> Option<&CudaSlice<bf16>>,
+) -> Result<CudaSlice<u64>> {
+    let host = experts
+        .iter()
+        .enumerate()
+        .map(|(idx, expert)| {
+            let slice = get(expert).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "expert {idx} missing {label} for {} quant table",
+                    expert.weight_format
+                )
+            })?;
+            let (ptr, _guard) = slice.device_ptr(&ctx.stream);
+            Ok(ptr)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    ctx.stream
+        .clone_htod(&host)
+        .map_err(|e| anyhow::anyhow!("expert {label} ptr table H2D failed: {e}"))
+}
+
+/// Build a per-expert pointer table for W4A16 INT4 packed weights (`i8`).
+pub fn build_expert_qweight_i8_ptr_table(
+    ctx: &DeviceContext,
+    experts: &[&DeviceMatrix],
+) -> Result<CudaSlice<u64>> {
+    let host = experts
+        .iter()
+        .enumerate()
+        .map(|(idx, expert)| {
+            let slice = expert.qweight.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "expert {idx} missing qweight_i8 for {} quant table",
+                    expert.weight_format
+                )
+            })?;
+            let (ptr, _guard) = slice.device_ptr(&ctx.stream);
+            Ok(ptr)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    ctx.stream
+        .clone_htod(&host)
+        .map_err(|e| anyhow::anyhow!("expert qweight_i8 ptr table H2D failed: {e}"))
+}
+
+/// Build a per-expert pointer table for W4A16 BF16 per-group scales.
+pub fn build_expert_qscale_bf16_ptr_table(
+    ctx: &DeviceContext,
+    experts: &[&DeviceMatrix],
+) -> Result<CudaSlice<u64>> {
+    build_optional_bf16_ptr_table(ctx, experts, "qscale_bf16", |m| m.qscales.as_ref())
+}
+
 /// Single grouped expert GEMM: `output[token] = input[token] @ W_expert^T`,
 /// M-grouped by expert. `weight_ptrs` is the [`build_expert_weight_ptr_table`]
 /// table; `n`/`k` are one expert's `[n, k]` weight dims.
@@ -536,6 +593,114 @@ pub unsafe fn moe_fp4_e2m1_grouped_gemv_pair_batch(
             i32::try_from(k)?,
             i32::try_from(group_size)?,
             i32::try_from(scale_cols)?,
+            stream,
+        )
+        .result()?;
+    }
+    Ok(())
+}
+
+/// ABI-generic W4A16 grouped expert GEMV (INT4 weights, BF16 per-group scales,
+/// zero-point 8). `N` = expert output rows, `K` = input cols, `group_size` = the
+/// BF16 scale group size along K.
+///
+/// # Safety
+/// `weight_ptrs` and `scale_ptrs` must contain valid device pointers for every
+/// routed expert. `input`, `output`, `offsets`, `counts`, and `expert_indices`
+/// must be live on `stream`; each route row selected by the tables must address
+/// `[K]` input elements and `[N]` output elements.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn moe_w4a16_grouped_gemv_batch(
+    weight_ptrs: &CudaSlice<u64>,
+    scale_ptrs: &CudaSlice<u64>,
+    input: RawDevicePtr<bf16>,
+    output: RawDevicePtr<bf16>,
+    offsets: RawDevicePtr<i32>,
+    counts: RawDevicePtr<i32>,
+    expert_indices: RawDevicePtr<i32>,
+    num_experts: usize,
+    max_count: usize,
+    n: usize,
+    k: usize,
+    group_size: usize,
+    ctx: &DeviceContext,
+    stream: CUstream,
+) -> Result<()> {
+    let (wp, _gw) = weight_ptrs.device_ptr(&ctx.stream);
+    let (sp, _gs) = scale_ptrs.device_ptr(&ctx.stream);
+    // SAFETY: forwarded — the caller upholds this fn's `# Safety` contract;
+    // the expert-pointer tables are live CudaSlices pinned by the `_g*` guards.
+    unsafe {
+        ffi::moe_w4a16_grouped_gemv_batch_cuda(
+            wp as *const u64,
+            sp as *const u64,
+            input.as_ptr() as *const Half,
+            output.as_mut_ptr() as *mut Half,
+            offsets.as_ptr(),
+            counts.as_ptr(),
+            expert_indices.as_ptr(),
+            i32::try_from(num_experts)?,
+            i32::try_from(max_count)?,
+            i32::try_from(n)?,
+            i32::try_from(k)?,
+            i32::try_from(group_size)?,
+            stream,
+        )
+        .result()?;
+    }
+    Ok(())
+}
+
+/// ABI-generic W4A16 paired grouped expert GEMV (gate + up in one launch).
+///
+/// # Safety
+/// `weight_*_ptrs` and `scale_*_ptrs` must contain valid device pointers for
+/// every routed expert. `input`, both outputs, and the route tables must be live
+/// on `stream`; each selected route row must address `[K]` input elements and
+/// `[N]` elements in both outputs.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn moe_w4a16_grouped_gemv_pair_batch(
+    weight_a_ptrs: &CudaSlice<u64>,
+    scale_a_ptrs: &CudaSlice<u64>,
+    weight_b_ptrs: &CudaSlice<u64>,
+    scale_b_ptrs: &CudaSlice<u64>,
+    input: RawDevicePtr<bf16>,
+    output_a: RawDevicePtr<bf16>,
+    output_b: RawDevicePtr<bf16>,
+    offsets: RawDevicePtr<i32>,
+    counts: RawDevicePtr<i32>,
+    expert_indices: RawDevicePtr<i32>,
+    num_experts: usize,
+    max_count: usize,
+    n: usize,
+    k: usize,
+    group_size: usize,
+    ctx: &DeviceContext,
+    stream: CUstream,
+) -> Result<()> {
+    let (wa, _gwa) = weight_a_ptrs.device_ptr(&ctx.stream);
+    let (sa, _gsa) = scale_a_ptrs.device_ptr(&ctx.stream);
+    let (wb, _gwb) = weight_b_ptrs.device_ptr(&ctx.stream);
+    let (sb, _gsb) = scale_b_ptrs.device_ptr(&ctx.stream);
+    // SAFETY: forwarded — the caller upholds this fn's `# Safety` contract;
+    // the expert-pointer tables are live CudaSlices pinned by the `_g*` guards.
+    unsafe {
+        ffi::moe_w4a16_grouped_gemv_pair_batch_cuda(
+            wa as *const u64,
+            sa as *const u64,
+            wb as *const u64,
+            sb as *const u64,
+            input.as_ptr() as *const Half,
+            output_a.as_mut_ptr() as *mut Half,
+            output_b.as_mut_ptr() as *mut Half,
+            offsets.as_ptr(),
+            counts.as_ptr(),
+            expert_indices.as_ptr(),
+            i32::try_from(num_experts)?,
+            i32::try_from(max_count)?,
+            i32::try_from(n)?,
+            i32::try_from(k)?,
+            i32::try_from(group_size)?,
             stream,
         )
         .result()?;

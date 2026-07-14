@@ -26,6 +26,9 @@ pub(crate) enum QuantFormat {
         group_size: usize,
         global_scale_apply: ScaleApply,
     },
+    W4A16 {
+        group_size: usize,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -181,6 +184,35 @@ pub(crate) fn detect_quant_format(
                 ],
             }
         }
+        Dtype::U8
+            if tensors
+                .get(&format!("{base}.weight_scale"))
+                .is_some_and(|s| s.dtype == Dtype::BF16)
+                && !tensors.contains_key(&format!("{base}.weight_global_scale"))
+                && !tensors.contains_key(&format!("{base}.input_global_scale"))
+                && !tensors.contains_key(&format!("{base}.weight_scale_2")) =>
+        {
+            let logical_shape = fp4_logical_shape(name, &tensor.shape)?;
+            let scale = tensor_by_name(tensors, &format!("{base}.weight_scale"))?;
+            ensure!(
+                scale.shape.len() == 2,
+                "{name}: W4A16 weight_scale must be rank-2, got {:?}",
+                scale.shape
+            );
+            let group_size = logical_shape[1] / scale.shape[1];
+            ensure!(
+                group_size > 0 && logical_shape[1] % group_size == 0,
+                "{name}: W4A16 logical K {} not group-aligned to {group_size}",
+                logical_shape[1]
+            );
+            QuantTensorView {
+                name: name.to_owned(),
+                logical_shape,
+                storage_dtype: tensor.dtype,
+                format: QuantFormat::W4A16 { group_size },
+                scale_names: vec![format!("{base}.weight_scale")],
+            }
+        }
         _ => return Ok(None),
     };
     validate_scale_shapes(&view, tensors)?;
@@ -279,6 +311,35 @@ pub(crate) fn validate_scale_shapes(
                     tensor.shape
                 );
             }
+            Ok(())
+        }
+        QuantFormat::W4A16 { group_size } => {
+            ensure!(
+                view.logical_shape.len() == 2,
+                "{}: W4A16 weights must be rank-2",
+                view.name
+            );
+            ensure!(
+                view.logical_shape[1].is_multiple_of(group_size),
+                "{}: W4A16 logical K {} must be group-aligned to {group_size}",
+                view.name,
+                view.logical_shape[1]
+            );
+            let scale = tensor_by_name(tensors, &view.scale_names[0])?;
+            ensure!(
+                scale.dtype == Dtype::BF16,
+                "{}: W4A16 weight_scale must be BF16, got {:?}",
+                view.scale_names[0],
+                scale.dtype
+            );
+            let expected = [view.logical_shape[0], view.logical_shape[1] / group_size];
+            ensure!(
+                scale.shape == expected,
+                "{}: W4A16 weight_scale shape {:?} != {:?}",
+                view.scale_names[0],
+                scale.shape,
+                expected
+            );
             Ok(())
         }
     }
