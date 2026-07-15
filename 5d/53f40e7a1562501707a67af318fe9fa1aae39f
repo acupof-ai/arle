@@ -1,0 +1,71 @@
+crates/infer-core/src/lib.rs
+  s_433fcaf9b7564b::t_f7bcebd64d5aa3 791-795
+crates/infer-cuda/examples/dsv4_parity.rs
+  s_cbac1d54da53ea::t_461647c0f48c8a 241,278-279,310,320,347
+crates/infer-cuda/examples/dsv4_resident_ab.rs
+  s_cbac1d54da53ea::t_5033ddb66e222b 13,15,17
+crates/infer-cuda/examples/fp8_decode_probe.rs
+  s_cbac1d54da53ea::t_7c9ceb8ec26af8 126,150,321,346,370,399,431,453,482,511,538,562
+crates/infer-cuda/examples/fp8_grouped_prefill_probe.rs
+  s_cbac1d54da53ea::t_59ce8c2cc7da1f 254,280,308,334
+crates/infer-cuda/examples/fp8_smallm_gemm_probe.rs
+  s_cbac1d54da53ea::t_6aed8f5a7e2cd8 195,455
+crates/infer-cuda/src/attention/prefix_state.rs
+  s_433fcaf9b7564b::t_b2eaaf9d0e0573 316-317,329-330,393-399,554-558
+crates/infer-cuda/src/attention/tests.rs
+  s_cbac1d54da53ea::t_88395e3da1d673 211,213,219,221,225,227
+crates/infer-cuda/src/dsv4.rs
+  s_cbac1d54da53ea::t_0a6296752a43c5 3282-3304
+crates/infer-cuda/src/executor.rs
+  s_433fcaf9b7564b::t_3506d4b364d50f 395-401
+crates/infer-cuda/src/executor/dsv4.rs
+  s_433fcaf9b7564b::t_d9b7a2d8751ba6 905-908
+crates/infer-cuda/src/lib.rs
+  s_433fcaf9b7564b::t_fc8de49362dfe9 621-628
+crates/infer-cuda/src/loader.rs
+  s_cbac1d54da53ea::t_66c6ab7c00f94c 773-774,780-788
+crates/infer-cuda/src/moe.rs
+  s_cbac1d54da53ea::t_e47283f37c2999 5356,5439,5470,5519
+crates/infer-cuda/src/ops/quant_linear.rs
+  s_cbac1d54da53ea::t_27c087d7dc9364 708,880
+crates/infer-cuda/src/paged_kv_table.rs
+  s_cbac1d54da53ea::t_f9dbdce1f5b50a 515
+crates/infer-seam/src/lib.rs
+  s_433fcaf9b7564b::t_2d338d1a9edebc 77-82,318-321
+docs/bench-and-trace-spec.md
+  s_cbac1d54da53ea::t_41cbc54809e9f6 155,157,167-172
+docs/experience/wins/2026-07-15-dsv4-batched-lm-head.md
+  s_cbac1d54da53ea::t_a24f93ff4baa78 1-57
+docs/experience/wins/2026-07-15-dsv4-kv-l2-l3-hit-throughput.md
+  s_cbac1d54da53ea::t_715aae562dcec5 1-60
+docs/experience/wins/2026-07-15-dsv4-nvme-cold-load.md
+  s_cbac1d54da53ea::t_463d3f2eec4aa5 1-51
+docs/experience/wins/README.md
+  s_cbac1d54da53ea::t_fe208c28cbdf73 5
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "5d53f40e7a1562501707a67af318fe9fa1aae39f",
+  "prompts": {},
+  "sessions": {
+    "s_433fcaf9b7564b": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f64cd-4976-7451-a737-ec8264027855",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_cbac1d54da53ea": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f5e9b-c754-7170-ba19-53745faa66e6",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
