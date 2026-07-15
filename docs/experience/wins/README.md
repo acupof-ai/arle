@@ -2,7 +2,7 @@
 
 This directory is the canonical log of dated benchmark and runtime snapshots
 that ARLE keeps as evidence for performance and correctness claims. Each file
-follows the [`TEMPLATE-bench-guidellm.md`](TEMPLATE-bench-guidellm.md) skeleton
+follows the [`TEMPLATE-bench.md`](TEMPLATE-bench.md) skeleton
 or a slim ad-hoc variant; nothing here is overwritten — after-snapshots cite
 before-snapshots with deltas instead.
 

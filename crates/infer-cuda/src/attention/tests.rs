@@ -208,23 +208,23 @@ mod indexer_query_batch_tests {
         let normed_host: Vec<bf16> = (0..hidden)
             .map(|i| bf16::from_f32(prng(i + 717_171)))
             .collect();
-        let mut c_q = unsafe { HiddenStates::uninit(&ctx, q_lora_rank, 1).unwrap() };
+        let mut c_q = HiddenStates::zeros(&ctx, q_lora_rank, 1).unwrap();
         c_q.data = ctx.stream.clone_htod(&c_q_host).unwrap();
-        let mut normed = unsafe { HiddenStates::uninit(&ctx, hidden, 1).unwrap() };
+        let mut normed = HiddenStates::zeros(&ctx, hidden, 1).unwrap();
         normed.data = ctx.stream.clone_htod(&normed_host).unwrap();
 
         // Batched pre-pass path (the GEMMs `indexer_query_batch_prepass` runs:
         // it reads only `wq_b` + `weights_proj`, so the two `dsv4_linear` calls
         // reproduce its output exactly without a full `Dsv4Indexer`).
-        let mut q_i_batch = unsafe { HiddenStates::uninit(&ctx, wq_b_rows, 1).unwrap() };
+        let mut q_i_batch = HiddenStates::zeros(&ctx, wq_b_rows, 1).unwrap();
         dsv4_linear(&ctx, &wq_b, &c_q, &mut q_i_batch).unwrap();
-        let mut weights_batch = unsafe { HiddenStates::uninit(&ctx, weights_rows, 1).unwrap() };
+        let mut weights_batch = HiddenStates::zeros(&ctx, weights_rows, 1).unwrap();
         dsv4_linear(&ctx, &weights_proj, &normed, &mut weights_batch).unwrap();
 
         // Per-row reference (the path the precomputed slice replaces).
-        let mut q_i_ref = unsafe { HiddenStates::uninit(&ctx, wq_b_rows, 1).unwrap() };
+        let mut q_i_ref = HiddenStates::zeros(&ctx, wq_b_rows, 1).unwrap();
         dsv4_linear(&ctx, &wq_b, &c_q, &mut q_i_ref).unwrap();
-        let mut weights_ref = unsafe { HiddenStates::uninit(&ctx, weights_rows, 1).unwrap() };
+        let mut weights_ref = HiddenStates::zeros(&ctx, weights_rows, 1).unwrap();
         dsv4_linear(&ctx, &weights_proj, &normed, &mut weights_ref).unwrap();
         ctx.sync().unwrap();
 

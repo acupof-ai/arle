@@ -74,6 +74,12 @@ pub enum KvTierLocation {
     Disk,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KvTierReadHits {
+    pub host_demoted: u64,
+    pub disk: u64,
+}
+
 /// Count the largest leading prefix that is complete for a pages-only KV
 /// restore contract.
 ///
@@ -307,6 +313,10 @@ pub trait BackendExecutor {
 
     fn kv_tier_disk_pages(&self) -> usize {
         0
+    }
+
+    fn kv_tier_read_hits(&self) -> KvTierReadHits {
+        KvTierReadHits::default()
     }
 
     fn kv_tier_transfer_is_zero_copy(&self) -> bool {
