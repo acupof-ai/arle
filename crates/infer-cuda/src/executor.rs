@@ -214,6 +214,8 @@ impl RealCudaExecutor {
 
     /// `dspark_draft_model`: `Some(dir)` loads the DSpark/DFlash block drafter
     /// from that checkpoint dir and enables `--spec-type dspark` decode.
+    /// `mtp_draft_tokens`: `Some(n)` loads the checkpoint-native NextN-MTP head
+    /// for `--spec-type mtp` speculative decode (draft depth `n`).
     pub(crate) fn from_qwen35_safetensors(
         model_path: impl AsRef<Path>,
         num_slots: usize,
@@ -223,6 +225,7 @@ impl RealCudaExecutor {
         mem_fraction_static: f64,
         dspark_draft_model: Option<&Path>,
         dspark_conf_threshold: f32,
+        mtp_draft_tokens: Option<usize>,
     ) -> Result<Self> {
         Ok(Self::Qwen35(Box::new(
             Qwen35CudaExecutor::from_qwen35_safetensors(
@@ -234,6 +237,7 @@ impl RealCudaExecutor {
                 mem_fraction_static,
                 dspark_draft_model,
                 dspark_conf_threshold,
+                mtp_draft_tokens,
             )?,
         )))
     }
