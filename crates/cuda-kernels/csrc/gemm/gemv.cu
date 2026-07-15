@@ -816,6 +816,53 @@ cudaError_t gemm_cuda(const __nv_bfloat16 *W, const __nv_bfloat16 *X, __nv_bfloa
   return gemm_cublaslt_impl(W, X, Y, M, N, K, stream, /*graphsafe=*/false);
 }
 
+cudaError_t gemm_bf16_f32_cuda(const __nv_bfloat16 *W, const __nv_bfloat16 *X, float *Y,
+                               int M, int N, int K, cudaStream_t stream) {
+  CublasDeviceState *state = current_device_state();
+  if (state == nullptr || state->lt_handle == nullptr) return cudaErrorNotReady;
+
+  cublasLtMatmulDesc_t op = nullptr;
+  cublasLtMatrixLayout_t wl = nullptr, xl = nullptr, yl = nullptr;
+  cublasLtMatmulPreference_t pref = nullptr;
+  const float alpha = 1.0f, beta = 0.0f;
+  cublasOperation_t transa = CUBLAS_OP_T, transb = CUBLAS_OP_N;
+  cublasLtMatmulHeuristicResult_t heuristic{};
+  int returned = 0;
+  cublasStatus_t status = cublasLtMatmulDescCreate(&op, CUBLAS_COMPUTE_32F, CUDA_R_32F);
+  if (status == CUBLAS_STATUS_SUCCESS)
+    status = cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSA,
+                                            &transa, sizeof(transa));
+  if (status == CUBLAS_STATUS_SUCCESS)
+    status = cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSB,
+                                            &transb, sizeof(transb));
+  if (status == CUBLAS_STATUS_SUCCESS)
+    status = cublasLtMatrixLayoutCreate(&wl, CUDA_R_16BF, K, M, K);
+  if (status == CUBLAS_STATUS_SUCCESS)
+    status = cublasLtMatrixLayoutCreate(&xl, CUDA_R_16BF, K, N, K);
+  if (status == CUBLAS_STATUS_SUCCESS)
+    status = cublasLtMatrixLayoutCreate(&yl, CUDA_R_32F, M, N, M);
+  if (status == CUBLAS_STATUS_SUCCESS)
+    status = cublasLtMatmulPreferenceCreate(&pref);
+  if (status == CUBLAS_STATUS_SUCCESS)
+    status = cublasLtMatmulPreferenceSetAttribute(
+        pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+        &kWorkspaceBytes, sizeof(kWorkspaceBytes));
+  if (status == CUBLAS_STATUS_SUCCESS)
+    status = cublasLtMatmulAlgoGetHeuristic(state->lt_handle, op, wl, xl, yl, yl,
+                                            pref, 1, &heuristic, &returned);
+  if (status == CUBLAS_STATUS_SUCCESS && returned > 0)
+    status = cublasLtMatmul(state->lt_handle, op, &alpha, W, wl, X, xl, &beta,
+                            Y, yl, Y, yl, &heuristic.algo,
+                            state->cublaslt_workspace, kWorkspaceBytes, stream);
+  if (pref != nullptr) cublasLtMatmulPreferenceDestroy(pref);
+  if (yl != nullptr) cublasLtMatrixLayoutDestroy(yl);
+  if (xl != nullptr) cublasLtMatrixLayoutDestroy(xl);
+  if (wl != nullptr) cublasLtMatrixLayoutDestroy(wl);
+  if (op != nullptr) cublasLtMatmulDescDestroy(op);
+  return status == CUBLAS_STATUS_SUCCESS && returned > 0 ? cudaGetLastError()
+                                                         : cudaErrorUnknown;
+}
+
 // Graph-safe GEMM: same math as gemm_cuda but uses the workspace-free handle.
 // Safe for CUDA Graph capture and decode path.
 cudaError_t gemm_graphsafe_cuda(const __nv_bfloat16 *W, const __nv_bfloat16 *X, __nv_bfloat16 *Y,

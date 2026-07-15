@@ -4159,7 +4159,7 @@ impl SafetensorLoader {
             compressor: names
                 .compressor
                 .as_ref()
-                .map(|c| self.load_dsv4_compressor(ctx, c, glm))
+                .map(|c| self.load_dsv4_compressor(ctx, c, glm, true))
                 .transpose()?,
             indexer: names
                 .indexer
@@ -4534,6 +4534,7 @@ impl SafetensorLoader {
         ctx: &DeviceContext,
         names: &deepseek_spec::DeepSeekV4CompressorTensorNames,
         glm: bool,
+        retain_fp32_probe: bool,
     ) -> Result<crate::dsv4::Dsv4Compressor> {
         let load_matrix = |name: &str| {
             if glm {
@@ -4544,6 +4545,40 @@ impl SafetensorLoader {
         };
         let wkv = load_matrix(&names.wkv)?;
         let wgate = load_matrix(&names.wgate)?;
+        let fp32_probe =
+            if retain_fp32_probe && crate::attention::dsv4_compressor_fp32_preload_enabled()? {
+                let tensor = self.borrow_raw_tensor(&names.ape)?;
+                ensure!(
+                    tensor.shape.len() == 2,
+                    "{}: expected 2D compressor APE, got {:?}",
+                    names.ape,
+                    tensor.shape
+                );
+                let values = match tensor.dtype {
+                    Dtype::F32 | Dtype::BF16 => tensor_bytes_to_f32(
+                        &names.ape,
+                        tensor.dtype,
+                        tensor.bytes(),
+                        ScaleApply::Multiply,
+                    )?,
+                    Dtype::F8_E4M3 => self.dequantize_dsv4_block_scaled_to_f32_host(
+                        &names.ape,
+                        tensor.shape[0],
+                        tensor.shape[1],
+                    )?,
+                    other => bail!("{}: unsupported compressor APE dtype {other:?}", names.ape),
+                };
+                Some(crate::dsv4::Dsv4CompressorFp32Probe {
+                    wkv: self.load_dsv4_bf16_matrix(ctx, &names.wkv)?,
+                    wgate: self.load_dsv4_bf16_matrix(ctx, &names.wgate)?,
+                    ape: ctx
+                        .stream
+                        .clone_htod(&values)
+                        .map_err(|e| anyhow!("upload f32 compressor APE {}: {e}", names.ape))?,
+                })
+            } else {
+                None
+            };
         Ok(crate::dsv4::Dsv4Compressor {
             wkv_deepgemm: self.decode_proj_cache(ctx, &wkv)?,
             wgate_deepgemm: self.decode_proj_cache(ctx, &wgate)?,
@@ -4551,6 +4586,7 @@ impl SafetensorLoader {
             // quant-aware `dsv4_linear` like wkv/wgate), so it must be dense
             // bf16 — the dialect dequants FP8 in both GLM and DSv4 (#138).
             ape: self.load_dsv4_block_scaled_dialect(ctx, &names.ape)?,
+            fp32_probe,
             norm: self.load_dsv4_vec(ctx, &names.norm)?,
             wkv,
             wgate,
@@ -4599,6 +4635,7 @@ impl SafetensorLoader {
                     .compressor
                     .as_ref()
                     .expect("DSv4 indexer always has a compressor"),
+                false,
                 false,
             )?;
             (Some(compressor), None, None, None)
