@@ -1138,6 +1138,12 @@ impl Qwen35SpecSlotState {
     ) -> Result<()> {
         slot.restore_linear_from(ctx, &self.gdr_snap, &self.conv_snap)
     }
+
+    /// Mutable access to the persistent 1-element argmax scratch (the warm step
+    /// seeds the spec state with the greedy pending token).
+    pub(crate) fn argmax_scratch_mut(&mut self) -> &mut CudaSlice<i32> {
+        &mut self.argmax_scratch
+    }
 }
 
 /// Persistent device workspace for the Qwen3.5/3.6 hybrid forward.
@@ -3428,6 +3434,12 @@ impl Qwen35Model {
         self.max_seq_len
     }
 
+    /// MTP spec-decode draft depth this model was built for (`0` = spec off).
+    /// The executor's `mtp_decode_row` uses this to size `spec_step`'s depth.
+    pub(crate) fn spec_draft_tokens(&self) -> usize {
+        self.spec_draft_tokens
+    }
+
     /// This rank's local full-attention KV head count (= global config on a
     /// single GPU). Used by the opt-in KV-recall pool sizing + paged kernels.
     pub(crate) fn local_kv_heads(&self) -> usize {
@@ -3590,8 +3602,9 @@ impl Qwen35Model {
         ws: &mut Qwen35Workspace,
         tokens: &[u32],
         start_pos: usize,
+        recall: Option<&mut Qwen35RecallForward>,
     ) -> Result<(DeviceVec, [usize; 2], DeviceVec)> {
-        self.forward_hidden(slot, ws, tokens, start_pos)?;
+        self.forward_hidden_capture(slot, ws, tokens, start_pos, None, recall, None)?;
         let seq_len = tokens.len();
         let eps = self.config.rms_norm_eps;
         let hidden_size = self.config.hidden_size;
@@ -3633,8 +3646,9 @@ impl Qwen35Model {
         tokens: &[u32],
         start_pos: usize,
         capture: Option<&mut Qwen35LinearCapture>,
+        recall: Option<&mut Qwen35RecallForward>,
     ) -> Result<(DeviceVec, [usize; 2], DeviceVec)> {
-        self.forward_hidden_capture(slot, ws, tokens, start_pos, capture, None, None)?;
+        self.forward_hidden_capture(slot, ws, tokens, start_pos, capture, recall, None)?;
         let seq_len = tokens.len();
         let eps = self.config.rms_norm_eps;
         let hidden_size = self.config.hidden_size;
@@ -3850,6 +3864,7 @@ impl Qwen35Model {
         hidden: &DeviceVec,
         start_pos: usize,
         depth: usize,
+        recall: Option<&mut Qwen35RecallForward>,
     ) -> Result<(Vec<u32>, u32, DeviceVec)> {
         ensure!(depth >= 1, "spec_step requires depth >= 1, got {depth}");
         // The MTP head KV (spec.head_k/head_v) was sized (spec_draft_tokens+1)
@@ -3894,8 +3909,14 @@ impl Qwen35Model {
         //    Advances the full-attn KV + 48 linear states by depth+1 tokens, and
         //    captures each linear layer's gated-delta inputs for ALL depth+1 rows
         //    (the cheap partial-accept replay reads them; see step 5).
-        let (logits, dims, hiddens) =
-            self.forward_tokens_verify(slot, ws, &chain, start_pos, Some(&mut spec.capture))?;
+        let (logits, dims, hiddens) = self.forward_tokens_verify(
+            slot,
+            ws,
+            &chain,
+            start_pos,
+            Some(&mut spec.capture),
+            recall,
+        )?;
         ensure!(
             dims == [depth + 1, vocab],
             "spec verify dims {dims:?} != [{}, {vocab}]",
@@ -7716,7 +7737,7 @@ mod tests {
             let mut ws = Qwen35Workspace::new();
             // Prefill returns the next token's logits + the producing hidden.
             let (logits, dims, mut hidden) = model
-                .forward_tokens_with_hidden(&mut slot, &mut ws, &prompt, 0)
+                .forward_tokens_with_hidden(&mut slot, &mut ws, &prompt, 0, None)
                 .unwrap();
             let vocab = dims[1];
             // The prefill's last-row argmax IS the first decoded token = the seed
@@ -7738,7 +7759,9 @@ mod tests {
             while out.len() < n_decode {
                 let sp = slot.seq_len();
                 let (emitted, next_pending, next_hidden) = model
-                    .spec_step(&mut slot, &mut spec, &mut ws, pending, &hidden, sp, depth)
+                    .spec_step(
+                        &mut slot, &mut spec, &mut ws, pending, &hidden, sp, depth, None,
+                    )
                     .unwrap();
                 // Accepted drafts this step = emitted.len() - 1 (the bonus is the
                 // trunk's own token, not a draft). accept_rate = accepts/(steps*depth).

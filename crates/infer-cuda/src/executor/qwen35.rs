@@ -230,6 +230,23 @@ pub(crate) struct Qwen35CudaExecutor {
     /// ctx caches + tap/scratch buffers. `None` (the default) keeps the
     /// baseline executor byte-identical — nothing is allocated or captured.
     pub(crate) dspark: Option<crate::qwen35::dspark::Qwen35DsparkExec>,
+    /// MTP spec-decode per-slot state (`--spec-type mtp`): the spec draft/verify
+    /// state + the seed (pending token + hidden) for the next spec step.
+    /// `None` (the default) keeps the baseline executor byte-identical.
+    mtp: Option<MtpExec>,
+}
+
+/// Per-slot MTP spec-decode runtime state. The spec state is created lazily on
+/// the first decode step that needs it (a warm forward captures the seed
+/// hidden + pending token); subsequent steps run `spec_step` directly.
+struct MtpExec {
+    slots: Vec<Option<MtpSlotState>>,
+}
+
+struct MtpSlotState {
+    spec: crate::qwen35::Qwen35SpecSlotState,
+    pending: u32,
+    hidden: DeviceVec,
 }
 
 impl std::fmt::Debug for Qwen35CudaExecutor {
@@ -694,6 +711,7 @@ impl Qwen35CudaExecutor {
         mem_fraction_static: f64,
         dspark_draft_model: Option<&Path>,
         dspark_conf_threshold: f32,
+        mtp_draft_tokens: Option<usize>,
     ) -> Result<Self> {
         let total_t0 = Instant::now();
         ensure!(
@@ -713,8 +731,11 @@ impl Qwen35CudaExecutor {
         // `None`: the checkpoint-native NextN-MTP head stays unwired here; the
         // baseline load is byte-identical (no draft head loaded). DSpark is the
         // external block drafter, loaded below from its own checkpoint dir.
-        let mut model =
-            crate::qwen35::Qwen35Model::from_safetensors(model_path.as_ref(), max_seq_len, None)?;
+        let mut model = crate::qwen35::Qwen35Model::from_safetensors(
+            model_path.as_ref(),
+            max_seq_len,
+            mtp_draft_tokens,
+        )?;
         cuda_startup_log(
             "qwen35_model_load",
             model_t0,
@@ -847,6 +868,9 @@ impl Qwen35CudaExecutor {
             prefill_boundary_snapshot: (0..num_slots).map(|_| None).collect(),
             periodic_boundary_snapshots: (0..num_slots).map(|_| Vec::new()).collect(),
             dspark: dspark_head.map(|h| crate::qwen35::dspark::Qwen35DsparkExec::new(h, num_slots)),
+            mtp: mtp_draft_tokens.map(|_| MtpExec {
+                slots: (0..num_slots).map(|_| None).collect(),
+            }),
         };
         cuda_startup_log(
             "qwen35_executor_total",
@@ -1448,7 +1472,219 @@ impl Qwen35CudaExecutor {
         self.dspark_spec_row(row)
     }
 
-    /// One no-spec decode step that keeps the DSpark draft warm: paged decode
+    /// One MTP spec-decode row (`--spec-type mtp`): the spec draft/verify step
+    /// when the slot is seeded (pending token + hidden captured by the warm
+    /// step), else a warm forward that captures the seed. Emits 1..=depth+1
+    /// tokens for this slot. Greedy-only (sampling rows fall back to no-spec).
+    fn mtp_decode_row(&mut self, row: &DecodeRow) -> Result<Vec<SlotToken>> {
+        ensure!(
+            row.slot < self.num_slots,
+            "decode slot {} outside Qwen3.5 executor slots {}",
+            row.slot,
+            self.num_slots
+        );
+        // MTP spec-decode is greedy-only; sampling rows fall back to no-spec.
+        if row.params.temperature != 0.0 {
+            let token = self.submit_decode_row(row, /* allow_graph = */ true)?;
+            return Ok(vec![SlotToken {
+                slot: row.slot,
+                token,
+                logprob: None,
+                finish: None,
+            }]);
+        }
+        let depth = self.model.spec_draft_tokens().max(1);
+        // Seeded iff we have a stored pending+hidden AND the pending matches the
+        // token the scheduler will feed (a gap = re-seed at the warm step).
+        let seeded = matches!(
+            self.mtp.as_ref().and_then(|m| m.slots[row.slot].as_ref()),
+            Some(s) if s.pending == row.last_token
+        );
+        if !seeded {
+            let token = self.mtp_warm_decode_row(row)?;
+            return Ok(vec![SlotToken {
+                slot: row.slot,
+                token,
+                logprob: None,
+                finish: None,
+            }]);
+        }
+        self.mtp_spec_row(row, depth)
+    }
+
+    /// Warm step: a single forward that ALSO captures the seed hidden + pending
+    /// (greedy argmax) for the next spec step. Returns the pending token as the
+    /// decode output (the prefill already returned the first token; this is the
+    /// second). The spec step starts from the stored (pending, hidden).
+    fn mtp_warm_decode_row(&mut self, row: &DecodeRow) -> Result<u32> {
+        let slot = row.slot;
+        let start = row.kv_seq_len;
+        if self.full_attn_paged() {
+            {
+                let pool = self.full_attn_kv.as_mut().expect("paged (gated)");
+                ensure!(
+                    pool.seq_len(slot) == start,
+                    "MTP warm decode: pool seq_len {} != start {start} for slot {slot}",
+                    pool.seq_len(slot),
+                );
+                pool.alloc_tokens(slot, 1)?;
+            }
+            let meta = {
+                let pool = self.full_attn_kv.as_ref().expect("paged (gated)");
+                crate::loader::PageMeta::for_slot(&self.model.ctx, pool, slot, start, 1)?
+            };
+            let Self {
+                model,
+                slots,
+                workspace,
+                full_attn_kv,
+                mtp,
+                ..
+            } = self;
+            let pool = full_attn_kv.as_mut().expect("paged (gated)");
+            let mut rc = crate::qwen35::Qwen35RecallForward {
+                pool,
+                meta: &meta,
+                layer0_query: Vec::new(),
+            };
+            let (logits, dims, hidden) = model.forward_tokens_with_hidden(
+                &mut slots[slot],
+                workspace,
+                &[row.last_token],
+                start,
+                Some(&mut rc),
+            )?;
+            let vocab = dims[1];
+            let mut spec = model.new_spec_slot_state()?;
+            let pending = crate::ops::argmax_row_into(
+                &model.ctx,
+                &logits,
+                dims[0] - 1,
+                vocab,
+                spec.argmax_scratch_mut(),
+            )?;
+            mtp.as_mut().expect("mtp (gated)").slots[slot] = Some(MtpSlotState {
+                spec,
+                pending,
+                hidden,
+            });
+            Ok(pending)
+        } else {
+            let Self {
+                model,
+                slots,
+                workspace,
+                mtp,
+                ..
+            } = self;
+            let (logits, dims, hidden) = model.forward_tokens_with_hidden(
+                &mut slots[slot],
+                workspace,
+                &[row.last_token],
+                start,
+                None,
+            )?;
+            let vocab = dims[1];
+            let mut spec = model.new_spec_slot_state()?;
+            let pending = crate::ops::argmax_row_into(
+                &model.ctx,
+                &logits,
+                dims[0] - 1,
+                vocab,
+                spec.argmax_scratch_mut(),
+            )?;
+            mtp.as_mut().expect("mtp (gated)").slots[slot] = Some(MtpSlotState {
+                spec,
+                pending,
+                hidden,
+            });
+            Ok(pending)
+        }
+    }
+
+    /// Spec step: draft a depth-token chain, verify in ONE trunk forward, accept
+    /// the longest matching prefix. On partial accept the trunk linear state is
+    /// rolled back + the paged pool truncated to the accepted prefix. Returns the
+    /// emitted tokens (accepted drafts + bonus); updates the seed state for the
+    /// next step.
+    fn mtp_spec_row(&mut self, row: &DecodeRow, depth: usize) -> Result<Vec<SlotToken>> {
+        let slot = row.slot;
+        let start = row.kv_seq_len;
+        // The verify forward appends depth+1 tokens; allocate the paged pool
+        // upfront (paged path only). On partial accept we truncate the excess.
+        if self.full_attn_paged() {
+            let pool = self.full_attn_kv.as_mut().expect("paged (gated)");
+            ensure!(
+                pool.seq_len(slot) == start,
+                "MTP spec decode: pool seq_len {} != start {start} for slot {slot}",
+                pool.seq_len(slot),
+            );
+            pool.alloc_tokens(slot, depth + 1)?;
+        }
+        let meta = if self.full_attn_paged() {
+            let pool = self.full_attn_kv.as_ref().expect("paged (gated)");
+            Some(crate::loader::PageMeta::for_slot(
+                &self.model.ctx,
+                pool,
+                slot,
+                start,
+                depth + 1,
+            )?)
+        } else {
+            None
+        };
+        let Self {
+            model,
+            slots,
+            workspace,
+            full_attn_kv,
+            mtp,
+            ..
+        } = self;
+        let (emitted, next_pending, next_hidden) = {
+            let mtp_exec = mtp.as_mut().expect("mtp (gated)");
+            let st = mtp_exec.slots[slot].as_mut().expect("seeded (gated)");
+            let mut rc = full_attn_kv
+                .as_mut()
+                .map(|pool| crate::qwen35::Qwen35RecallForward {
+                    pool,
+                    meta: meta.as_ref().expect("paged (gated)"),
+                    layer0_query: Vec::new(),
+                });
+            model.spec_step(
+                &mut slots[slot],
+                &mut st.spec,
+                workspace,
+                st.pending,
+                &st.hidden,
+                start,
+                depth,
+                rc.as_mut(),
+            )?
+        };
+        // Partial accept: truncate the paged pool to the accepted prefix.
+        if full_attn_kv.is_some() && emitted.len() < depth + 1 {
+            full_attn_kv
+                .as_mut()
+                .expect("paged (gated)")
+                .truncate_slot(slot, start + emitted.len())?;
+        }
+        // Update the seed for the next spec step.
+        if let Some(st) = mtp.as_mut().expect("mtp (gated)").slots[slot].as_mut() {
+            st.pending = next_pending;
+            st.hidden = next_hidden;
+        }
+        Ok(emitted
+            .into_iter()
+            .map(|token| SlotToken {
+                slot,
+                token,
+                logprob: None,
+                finish: None,
+            })
+            .collect())
+    }
+
     /// with tap capture, extending the ctx cache + pending anchor when the
     /// cache is contiguous. Non-paged rows run plain and clear the draft state
     /// (speculation re-seeds at the next paged step).
@@ -2076,6 +2312,11 @@ impl Qwen35CudaExecutor {
                         tokens: self.dspark_decode_row(row)?,
                     });
                 }
+                if self.mtp.is_some() {
+                    return Ok(StepOutput {
+                        tokens: self.mtp_decode_row(row)?,
+                    });
+                }
                 (
                     row.slot,
                     self.submit_decode_row(row, /* allow_graph = */ true)?,
@@ -2183,6 +2424,11 @@ impl Qwen35CudaExecutor {
                 .and_then(|ds| ds.slots[row.slot].as_mut())
             {
                 df.reset();
+            }
+            // New occupant: drop the prior request's MTP seed (pending+hidden);
+            // the warm step re-seeds from the prefill's last token.
+            if let Some(mtp) = self.mtp.as_mut() {
+                mtp.slots[row.slot] = None;
             }
             let (num_linear, gdr_len, conv_len) = self.model.recurrent_dims();
             self.slots[row.slot].acquire_recurrent(

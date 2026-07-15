@@ -1852,9 +1852,9 @@ mod backend {
         let num_slots = config.hot_workspace_slots();
         let page_size = config.page_size;
         let mtp_requested = config.mtp_enabled();
-        if mtp_requested && !matches!(kind, CudaModelKind::Dsv4) {
+        if mtp_requested && !matches!(kind, CudaModelKind::Dsv4 | CudaModelKind::Qwen35) {
             anyhow::bail!(
-                "--spec-type mtp / --mtp-draft-* is only wired for CUDA DSv4 checkpoints; \
+                "--spec-type mtp / --mtp-draft-* is only wired for CUDA DSv4 and Qwen3.5/3.6 checkpoints; \
                  model kind {kind:?} would otherwise ignore the request"
             );
         }
@@ -1890,6 +1890,7 @@ mod backend {
                 config.mem_fraction_static,
                 config.dspark_draft_model.as_deref(),
                 config.dspark_conf_threshold,
+                config.mtp_draft_tokens,
             )?,
             // DSv4 multi-rank serve. The DSv4 executor resolves its TP
             // rank/world-size + EP expert split + NCCL communicator from the

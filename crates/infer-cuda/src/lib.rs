@@ -321,6 +321,7 @@ impl CudaExecutor {
         mem_fraction_static: f64,
         dspark_draft_model: Option<&std::path::Path>,
         dspark_conf_threshold: f32,
+        mtp_draft_tokens: Option<usize>,
     ) -> anyhow::Result<Self> {
         Ok(Self {
             inner: CudaExecutorInner::Real(Box::new(
@@ -333,6 +334,7 @@ impl CudaExecutor {
                     mem_fraction_static,
                     dspark_draft_model,
                     dspark_conf_threshold,
+                    mtp_draft_tokens,
                 )?,
             )),
         })
