@@ -54,7 +54,7 @@ Pick exactly one primary lane before reading upstream material:
 
 | Lane | Use when | ARLE anchor |
 | --- | --- | --- |
-| Fair serving benchmark | ckl asks "ARLE vs SGLang/vLLM" or wants a best external baseline | `docs/bench-and-trace-spec.md`, `scripts/bench_guidellm.sh` |
+| Fair serving benchmark | ckl asks "ARLE vs SGLang/vLLM" or wants a best external baseline | `docs/bench-and-trace-spec.md`, `scripts/bench_throughput.py` |
 | Capacity / OOM / KV budget | memory pool, max tokens, KV dtype, mem fraction, request capacity | `docs/support-matrix.md`, server logs, `/v1/stats`, `nvidia-smi` |
 | Model PR history | Qwen3.5, DeepSeek V4, Qwen3-Next, MoE, loader, sampler, cache path | `infer/src/model/`, `crates/*-spec/`, active project docs |
 | Trace triage | external torch profiler or ARLE nsys/ncu points at a stage | `docs/resources/*profiling*`, `scripts/profile_*` |
@@ -136,7 +136,7 @@ Do not crown a framework winner until each requested framework has had its main
 serving knobs tuned or explicitly fixed by the experiment design. Do not search
 memory fractions by default unless capacity is the lane.
 
-For ARLE, use `scripts/bench_guidellm.sh` and the report skeleton under
+For ARLE, use `scripts/bench_throughput.py` and the report skeleton under
 `docs/experience/wins/`. External framework tools are references, not the ARLE
 truth surface.
 

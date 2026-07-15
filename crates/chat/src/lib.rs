@@ -55,7 +55,7 @@ pub struct OpenAiChatMessage {
 
 /// Message content as sent by OAI-compatible clients.
 ///
-/// Modern tools (OpenAI SDK, vllm-project/guidellm, LiteLLM, LangChain's
+/// Modern tools (OpenAI SDK, LiteLLM, LangChain's
 /// openai adapter) always send `content` as a **part array**
 /// (`[{"type":"text","text":"..."}, ...]`) to leave room for multimodal
 /// inputs, while older tools still send a plain string. Our server is

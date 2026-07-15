@@ -51,8 +51,8 @@ Pick one (no "make it faster all-around" — that's vibes):
 
 | Target | Metric | Where measured |
 |---|---|---|
-| **Latency** | TTFT p50/p99, ITL p50/p99, TPOT | Client (guidellm) + server (`/v1/stats`) |
-| **Throughput** | tok/s, req/s, total token/s | guidellm sweep |
+| **Latency** | TTFT p50/p99, ITL p50/p99, TPOT | Native client + server (`/v1/stats`) |
+| **Throughput** | tok/s, req/s, total token/s | Native fixed-concurrency benchmark |
 | **Memory** | KV cache size, weight size, peak VRAM | nvidia-smi + `/v1/stats` |
 | **Occupancy** | warps/SM, active blocks/SM | ncu (proxy, never the final goal) |
 | **Compute utilization** | TFLOPS achieved / TFLOPS peak | ncu tensor pipe pct |
@@ -109,12 +109,12 @@ The single most common kernel-optimization bug in this repo: sweeping tile param
 ```bash
 # nsys — system-level launch density + dispatch overhead
 PATH=/home/ckl/projects/arle/.venv/bin:$PATH \
-  scripts/profile_nsys_guidellm.sh <label> --concurrencies 4 --max-seconds 60 \
-  --data 'prompt_tokens=4096,...,output_tokens=256,...'
+  scripts/profile_nsys_bench.sh <label> --concurrency-grid 4 \
+  --seconds-per-concurrency 60 --prompts-jsonl <workload.jsonl>
 
 # ncu — kernel-internal occupancy / smem / reg / mem-bound vs compute-bound
 PATH=/home/ckl/projects/arle/.venv/bin:$PATH \
-  scripts/profile_ncu_guidellm.sh <label> --bench <existing-bench-dir> \
+  scripts/profile_ncu_bench.sh <label> --bench <existing-bench-dir> \
   --family attention --set full --launch-skip 5 --launch-count 5
 
 # Internal counters (see bench-and-trace-spec §3) — every wins entry must cite these
@@ -169,13 +169,15 @@ ONE thing changes. All else stays.
 ```bash
 # Baseline (commit hash recorded)
 git rev-parse --short HEAD > /tmp/baseline-sha
-scripts/bench_guidellm.sh <name>-baseline --concurrencies 4 --max-seconds 120 \
-  --warmup 10 --data '<exact-spec>'
+python3 scripts/bench_throughput.py --model <model> \
+  --prompts-jsonl <workload.jsonl> --concurrency-grid 4 \
+  --seconds-per-concurrency 120 --output bench-output/<name>-baseline/bench
 
 # Treatment (single variable change)
 # Edit ONE thing (kernel constant, env var, dispatch path), build incremental
-scripts/bench_guidellm.sh <name>-<treatment> --concurrencies 4 --max-seconds 120 \
-  --warmup 10 --data '<exact-spec>'
+python3 scripts/bench_throughput.py --model <model> \
+  --prompts-jsonl <workload.jsonl> --concurrency-grid 4 \
+  --seconds-per-concurrency 120 --output bench-output/<name>-<treatment>/bench
 ```
 
 **Matched-control checklist** (every miss = uncontrolled comparison):
@@ -382,7 +384,7 @@ Apply these by **identifying the binding constraint first** (Phase 3), THEN sele
 
 - **NVIDIA Nsight Compute** (ncu) — kernel-internal metrics.
   - Reference: <https://docs.nvidia.com/nsight-compute/>
-  - Trap (this repo, 2026-05-08): ncu 2026.1.1.0 dropped `--attach-pid`; project's `scripts/profile_ncu_guidellm.sh` wrapper needs migration to `--mode=attach --hostname` semantics.
+  - Trap (this repo, 2026-05-08): ncu 2026.1.1.0 dropped `--attach-pid`; the former ncu wrapper needed `--mode=attach --hostname` semantics.
   - Pattern: `--set full` for one-time deep dive; `--set basic` for sweep iterations; `--launch-skip N` to past warmup.
 
 - **NVIDIA Nsight Systems** (nsys) — system-level launch timeline.
@@ -1030,7 +1032,7 @@ Each anti-pattern has a project commit/entry where it was paid for.
     - **Sub-rule (#34b)**: when bench reports "0 successful requests"
       OR "all-zero latency table", CHECK SERVER LOG FIRST before
       debugging bench tool. v3-v10 PF8.5 attempts wasted 30+ min
-      on guidellm CLI quirks (PATH, --backend-kwargs, --outputs html,
+      on benchmark-client CLI quirks (PATH, backend args, output formats,
       absolute path, pre-mkdir) when the actual issue was 100%
       kernel failure surfaced via server log line 627 (`prefill
       batch failed: gemm_w4_fp8_marlin_cuda failed with code 2`).
@@ -1267,16 +1269,18 @@ ARLE-specific quick paths:
 
 # Wall-clock baseline
 PATH=/home/ckl/projects/arle/.venv/bin:$PATH \
-  scripts/bench_guidellm.sh <label> --concurrencies 4 --max-seconds 120 \
-  --warmup 10 --data 'prompt_tokens=4096,...,output_tokens=256,...'
+  python3 scripts/bench_throughput.py --model <model> \
+  --prompts-jsonl <workload.jsonl> --concurrency-grid 4 \
+  --seconds-per-concurrency 120 --output bench-output/<label>/bench
 
 # Kernel-internal
-PATH=.venv/bin:$PATH scripts/profile_ncu_guidellm.sh <label> \
+PATH=.venv/bin:$PATH scripts/profile_ncu_bench.sh <label> \
   --bench bench-output/<dir> --family attention --set full
 
 # System-level dispatch
-PATH=.venv/bin:$PATH scripts/profile_nsys_guidellm.sh <label> \
-  --concurrencies 4 --max-seconds 60 --data '...'
+PATH=.venv/bin:$PATH scripts/profile_nsys_bench.sh <label> \
+  --concurrency-grid 4 --seconds-per-concurrency 60 \
+  --prompts-jsonl <workload.jsonl>
 
 # TileLang JIT smoke (no GPU, kernel-codegen sanity)
 .venv/bin/python scripts/tilelang_jit_smoke.py
@@ -1327,7 +1331,7 @@ cargo test --release --features cuda --test greedy_consistency
 | **v1.9.0** | **2026-05-10** | **27** | **(this commit) added #26-27 from #37 Path B v1 KILL → #40 Path B.2 wins chain. Theme: "cache-hit-rate claims need cardinality evidence, and bucketing fixes need second-order scalar-capture sync". Sources: `a7a8b94` #26 (Path B v1 388-key churn at 4k production despite shape-(4,3,8) smoke success) / `a56b7a9`+`c44788f` #27 (Codex's second-order bucketing insight beyond Claude brief: bucketed key + captured scalars baked at first-capture dim = semantic miss; bucketed key + captured scalars baked at bucket capacity = 98.5% reuse, engine TTFT -92.5%). Compound learning: the same Phase B family of optimization required two distinct anti-pattern lessons, one per KILL→WIN cycle.** |
 | **v1.10.0** | **2026-05-10** | **28** | **(this commit) added #28 from `ee2c5b0` SOLID-critical hallucination chain. Theme: "agent fabrication overrides peer's correct conclusion when memory of prior tool output is trusted over fresh verification". Source: Claude challenged codex's correct claim that `--max-waiting-requests` CLI flag does not exist, cited fabricated grep evidence, codex (rightly) trusted the "correction" and used `--cold-headroom 253` workaround. Two ticks later audit-of-audit re-ran verification → direct evidence proved codex correct from start (`git log -S` shows string never existed in main.rs). Lesson distinct from #25 ("audit-chain shared blindspot"): #28 is "agent fabricates evidence", and empirical bench doesn't catch it because the bench command itself is built on the fabrication. Fix: when correcting peer agent file-content claim, MUST re-run verification in SAME response and quote raw output literally, NOT summarize memory.** |
 | **v1.11.0** | **2026-05-10** | **32** | **(this commit) batch-added #29-32 from same-day cooperative discipline session. Theme: "verify substrate of EVERY claim, not just contested ones". Evidence chain: 4 hallucinations sedimented in single session (`0f4d0ae` CLI flag, `43bda9c` reduce buffer, `4b30c15` /health endpoint, `5bf0e20` baseline mismatch) + cooperative race in `0d63a52`/`994a294` recovery + 33min wedged poll in `4b30c15`. Sources: `eb2b4b6` #29 (default test fixture broken since #25, codex correctly overrode via env var) / `0d63a52`+`994a294`+`ca09db0` #30 (commit-time worktree race; status BEFORE commit not just before add) / `c3bb82b`+`d387b03` #31 (ARLE surface claims need raw evidence even when not contesting peer; 4 hallucination pattern caught by self-audit) / `4b30c15` #32 (peer "Waiting >5min" warrants direct ps/log/curl verify; recovered ~33min of codex bandwidth). Cumulative compound learning: `de36538` retrospective + `940f49e` self-implementation by Claude (PF8.1+2) demonstrated discipline working — cooperative pipeline recovers from individual mis-claims when each agent applies raw-evidence-required rule.** |
-| **v1.12.0** | **2026-05-10** | **34** | **(this commit) added #33+#34 from PF8.3 substrate session evidence. Theme: "code-correct ≠ runtime-correct under load". Evidence chain: codex review caught 3 real bugs that all formal gates passed (`ace3cbe` parallel-M loop + max_par/lock workspace + graph capture interaction); PF8.3 RUNTIME KILL with 101380/101380 failures despite greedy_consistency PASS at conc=1 (`0cde63d` + `57c37b5` H8 verify). Sources: `ace3cbe` #33 (codex review IS load-bearing for non-trivial substrate, NOT formality; 3 bugs/27min review = high amortized value; required when build+clippy+tests pass on FFI/cross-feature/parallel logic diffs) / `0cde63d`+`57c37b5` #34 (greedy single-request PASS NECESSARY but NOT SUFFICIENT; pair with sustained-load bench at conc 1+2+4; sub-rule #34b: bench 0-success → CHECK SERVER LOG FIRST, wasted 30+min on guidellm CLI quirks when real cause was kernel 100% failure visible in /tmp/<server>.log). Cumulative compound learning: 7 hallucinations across this session + 3 codex-review bug catches + 1 RUNTIME KILL exposed by sustained load = code-correctness gates and runtime-correctness gates are SEPARATE concerns; both required for license-grade substrate.** |
+| **v1.12.0** | **2026-05-10** | **34** | **(this commit) added #33+#34 from PF8.3 substrate session evidence. Theme: "code-correct ≠ runtime-correct under load". Evidence chain: codex review caught 3 real bugs that all formal gates passed (`ace3cbe` parallel-M loop + max_par/lock workspace + graph capture interaction); PF8.3 RUNTIME KILL with 101380/101380 failures despite greedy_consistency PASS at conc=1 (`0cde63d` + `57c37b5` H8 verify). Sources: `ace3cbe` #33 (codex review IS load-bearing for non-trivial substrate, NOT formality; 3 bugs/27min review = high amortized value; required when build+clippy+tests pass on FFI/cross-feature/parallel logic diffs) / `0cde63d`+`57c37b5` #34 (greedy single-request PASS NECESSARY but NOT SUFFICIENT; pair with sustained-load bench at conc 1+2+4; sub-rule #34b: bench 0-success → CHECK SERVER LOG FIRST, wasted 30+min on benchmark-client CLI quirks when real cause was kernel 100% failure visible in /tmp/<server>.log). Cumulative compound learning: 7 hallucinations across this session + 3 codex-review bug catches + 1 RUNTIME KILL exposed by sustained load = code-correctness gates and runtime-correctness gates are SEPARATE concerns; both required for license-grade substrate.** |
 | **v1.16.0** | **2026-05-10** | **38** | **(this commit) graduated #43 "always source-survey existing files BEFORE listing items as pending pickup" from candidate to canonical after n=4 evidence threshold reached across same-day brief-vs-reality discoveries. Sources: `e021026` (Alpaca data ALREADY downloaded, saved 12-24 hr critical path) / `86b28c7` (M''' W4-FP8 preprocess ALREADY DONE as PF8.2 substep) / `2f19a3c` (ARLE marlin_kernel.cu at-par with vLLM) / `b6b8adc` (ARLE marlin_pf8/ subdir = COMPLETE vLLM marlin/ fork; P2 dropped from queue, wall-clock down 7d → 5-6d). Cumulative: 5-min source-survey discipline saved ~3-4 days of false-pending pickup work, 100×+ ROI. Companion to #25 (audit-chain shared blindspot) + #36 (grep alone needs A/B): #43 is bare-minimum first step before either #25 or #36.** |
 | **v1.13.0** | **2026-05-10** | **35** | **(this commit) graduated #38 from candidate to canonical anti-pattern after n=2 evidence threshold reached in same Task #35 cap=8 prefill warmup implementation cycle (per `b4a3c38` §6.8 + `182d67b` §6.13 + codex commit `a2ad788`). Theme: "warmup target shape budget must clamp to (effective workload shape × hardware headroom)". Evidence chain: same Task #35 implementation independently discovered both failure modes — n=1 max_seq_len=512 vs chunked_prefill_size=4096 mismatch (Pass 3 warming unreachable shapes; codex applied cap fix); n=2 B=8 × 2048 tokens/row exceeds 16GB VRAM → Marlin scratch OOM (substrate gracefully falls back to 1024 tokens/row). Both n=1 and n=2 are within ONE substrate development cycle but with INDEPENDENT failure mechanisms (config-vs-config alignment vs hardware-vs-shape alignment) — this satisfies n=2 distinct-mechanism evidence threshold. Generalization: warmup-based optimizations target shape sets; the set must be (a) reachable by actual workload AND (b) within hardware budget. Detection rule + (a) clamp / (b) graceful fallback patterns documented. Companion to #34 (single-bench-shape) + #37 (multi-shape bench discipline) — all three are "single-X is necessary but not sufficient" patterns at different abstraction levels.** |
 | **v1.14.0** | **2026-05-10** | **36** | **(this commit) graduated #36 from candidate to canonical after n=2 evidence reached including INVERSE-direction case. Theme: "static code audit is hypothesis-grade evidence; behavioral A/B is ground truth — both required". Evidence chain: n=1 `2cc608a` H1' design REVISION (MarlinScratch already existed in linear.rs, grep for variants saved 40 LOC); n=2 INVERSE `e8b6b31` Task #43 hypothesis OVERTURNED by behavioral A/B (Claude's `1ba06f0` dispatch-audit predicted scratch path safer; reality showed scratch path KILLS with 36 OOM failures, eager fallback HEALTHY — opposite causal direction). The INVERSE n=2 case is especially load-bearing: static audit was directionally wrong, not just incomplete. Cure: cheap behavioral A/B FIRST before designing/planning around audit-derived hypotheses. Companion to §0 SOLID rule 1 (inference ≠ SOLID) — #36 is the practical implementation: grep gives the hypothesis, A/B gives the evidence; either alone leads to either over-engineered designs (audit ignoring existing patterns) or directionally wrong fixes (audit ignoring memory/timing behavior).** |

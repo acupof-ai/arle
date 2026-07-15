@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Direct HTTP benchmark for #36 PrefixAware warm-mix workload.
 
-Replaces GuideLLM JSONL path which is broken for this finite workload
-(per docs/experience/errors/2026-05-10-36-warmmix-guidellm-jsonl-invalid.md
+Uses a direct finite-workload path; the old generic JSONL path was invalid
+(see the dated 2026-05-10 error entry
 8150bfe — drains 256 rows in 1.3s, reports TTFT p50=0.0, B-arm reports
 0 successful requests despite /v1/stats showing 257 served).
 
@@ -129,7 +129,7 @@ async def run_bench(args: argparse.Namespace) -> int:
 
         # Snapshot stats before
         stats_before = await capture_stats(session, target)
-        print(f"--- /v1/stats BEFORE ---")
+        print("--- /v1/stats BEFORE ---")
         print(json.dumps(stats_before.get("agent_cache", stats_before),
                          indent=2)[:600])
         print()
@@ -155,7 +155,7 @@ async def run_bench(args: argparse.Namespace) -> int:
 
         # Snapshot stats after
         stats_after = await capture_stats(session, target)
-        print(f"--- /v1/stats AFTER ---")
+        print("--- /v1/stats AFTER ---")
         print(json.dumps(stats_after.get("agent_cache", stats_after),
                          indent=2)[:1200])
         print()
@@ -228,7 +228,7 @@ async def run_bench(args: argparse.Namespace) -> int:
         print(f"  Warm p50 TTFT:       {warm_p50:.0f} ms")
         print(f"  Cold p95 / Warm p95: {starv_ratio:.2f}x  (≤3x = no starvation)")
         if starv_ratio > 3:
-            print(f"  ⚠️  STARVATION FLAG: cold p95 > 3× warm p95")
+            print("  ⚠️  STARVATION FLAG: cold p95 > 3× warm p95")
 
     return 0 if failed == 0 else 1
 

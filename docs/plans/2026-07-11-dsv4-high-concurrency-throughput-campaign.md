@@ -4,12 +4,12 @@
 
 **Goal (ckl 2026-07-11)**: maximize **TTFT · TPOT · throughput** for the
 high-concurrency agent workload on DSv4-Flash-FP8. Each optimization is
-LICENSED only by a `scripts/bench_guidellm.sh` sweep at production concurrency
+LICENSED only by a `scripts/bench_throughput.py` run at production concurrency
 (agent-shape prompts, c-sweep incl. c≥4) showing a TTFT/TPOT/throughput win —
 per-metric, vs the current-best baseline. Order: **1 → 2 → 3 → 5 → 6**.
 
 ## Measurement (the license gate)
-- Harness: `scripts/bench_guidellm.sh` (canonical), agent-shape prompt mix,
+- Harness: `scripts/bench_throughput.py` (canonical), agent-shape prompt mix,
   c-sweep {1,4,8,16}. Report TTFT p50/p99, ITL/TPOT p50/p99, output tok/s.
 - Each optimization: matched-baseline A/B (flag/knob OFF vs ON, same binary,
   same boot config), Δ% per metric. A flip/default needs ≥2 binding shapes.

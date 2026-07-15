@@ -73,28 +73,6 @@ profile_resolve_server_pid() {
     printf '%s\n' "$pid"
 }
 
-profile_extract_output_dir_from_log() {
-    python3 - "$1" <<'PY'
-import pathlib
-import re
-import sys
-
-text = pathlib.Path(sys.argv[1]).read_text()
-patterns = [
-    r"raw artefacts:\s*(\S+)",
-    r"output\s*:\s*(\S+)",
-]
-matches = []
-for pattern in patterns:
-    matches = re.findall(pattern, text)
-    if matches:
-        break
-if not matches:
-    raise SystemExit("failed to locate bench output dir in log")
-print(matches[-1])
-PY
-}
-
 profile_sha256() {
     local file="$1"
     if command -v sha256sum >/dev/null 2>&1; then
@@ -106,18 +84,18 @@ profile_sha256() {
     fi
 }
 
-profile_build_guidellm_replay_script() {
+profile_build_bench_replay_script() {
     local command_txt="$1"
-    local replay_output_dir="$2"
+    local replay_output="$2"
     local replay_script="$3"
 
-    python3 - "$command_txt" "$replay_output_dir" "$replay_script" <<'PY'
+    python3 - "$command_txt" "$replay_output" "$replay_script" <<'PY'
 import pathlib
 import shlex
 import sys
 
 command_path = pathlib.Path(sys.argv[1])
-output_dir = sys.argv[2]
+output = sys.argv[2]
 script_path = pathlib.Path(sys.argv[3])
 
 lines = [line.strip() for line in command_path.read_text().splitlines() if line.strip()]
@@ -131,30 +109,36 @@ for line in lines:
         key, value = line.split("=", 1)
         env_pairs[key] = value
         continue
-    if line.startswith("guidellm benchmark run "):
+    if "bench_throughput.py" in line:
         command_line = line
         break
 
 if command_line is None:
-    raise SystemExit(f"missing `guidellm benchmark run ...` line in {command_path}")
+    raise SystemExit(f"missing bench_throughput.py command in {command_path}")
 
 tokens = shlex.split(command_line)
+script_index = next(index for index, token in enumerate(tokens) if token.endswith("bench_throughput.py"))
+tokens = tokens[max(0, script_index - 1):] if script_index and "python" in pathlib.Path(tokens[script_index - 1]).name else tokens[script_index:]
 rewritten = []
 skip_next = False
-for idx, token in enumerate(tokens):
+has_output = False
+for token in tokens:
     if skip_next:
         skip_next = False
         continue
-    if token == "--output-dir":
-        rewritten.extend(["--output-dir", output_dir])
+    if token == "--output":
+        rewritten.extend(["--output", output])
+        has_output = True
         skip_next = True
         continue
     rewritten.append(token)
+if not has_output:
+    rewritten.extend(["--output", output])
 
 script_lines = [
     "#!/usr/bin/env bash",
     "set -euo pipefail",
-    f"mkdir -p {shlex.quote(output_dir)}",
+    f"mkdir -p {shlex.quote(str(pathlib.Path(output).parent))}",
 ]
 for key, value in env_pairs.items():
     script_lines.append(f"export {key}={shlex.quote(value)}")

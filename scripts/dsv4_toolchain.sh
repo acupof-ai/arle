@@ -464,8 +464,8 @@ nsys_profile() {
     need_cmd nsys
     need_cmd curl
     [[ -x "$SERVER_BIN" ]] || die "arle binary missing or not executable: $SERVER_BIN; run build first"
-    [[ -x "$ROOT/scripts/profile_nsys_guidellm.sh" ]] ||
-        die "missing nsys wrapper: $ROOT/scripts/profile_nsys_guidellm.sh"
+    [[ -x "$ROOT/scripts/profile_nsys_bench.sh" ]] ||
+        die "missing nsys wrapper: $ROOT/scripts/profile_nsys_bench.sh"
 
     mkdir -p "$ARTIFACT_ROOT"
     if curl -sS -f "$TARGET/v1/models" >/dev/null 2>&1; then
@@ -494,12 +494,13 @@ nsys_profile() {
     ARLE_DSV4_MOE_BACKEND="$ARLE_DSV4_MOE_BACKEND" \
     ARLE_DSV4_EXPERT_BACKEND="$ARLE_DSV4_EXPERT_BACKEND" \
     ARLE_DEEPGEMM_LIBRARY_ROOT="$ARLE_DEEPGEMM_LIBRARY_ROOT" \
-        "$ROOT/scripts/profile_nsys_guidellm.sh" \
+        "$ROOT/scripts/profile_nsys_bench.sh" \
         dsv4-toolchain \
-        --target "$TARGET" \
+        --url "$TARGET" \
         --model "$MODEL_NAME" \
         --server-pid "$server_pid" \
-        --fast \
+        --concurrency-grid 1 \
+        --seconds-per-concurrency "$NSYS_DURATION_SECONDS" \
         --delay-seconds "$NSYS_DELAY_SECONDS" \
         --duration-seconds "$NSYS_DURATION_SECONDS"
 }

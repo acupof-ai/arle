@@ -25,7 +25,6 @@ set -euo pipefail
 SGLANG_COMMIT="214c35b03184c354acf1f86f99746799e1c9b3a9"
 MODEL="${MODEL:-Qwen/Qwen3-4B}"
 MODEL_PATH="${MODEL_PATH:-infer/models/Qwen3-4B}"
-PROCESSOR="${PROCESSOR:-$MODEL_PATH}"
 SGLANG_DIR="${SGLANG_DIR:-/tmp/sglang-arle-${SGLANG_COMMIT}}"
 SGLANG_REPO="${SGLANG_REPO:-https://github.com/sgl-project/sglang.git}"
 PORT="${PORT:-30000}"
@@ -38,14 +37,11 @@ MAX_SECONDS="${MAX_SECONDS:-300}"
 C1_SECONDS="${C1_SECONDS:-360}"
 RUN_SECONDARY_C1="${RUN_SECONDARY_C1:-1}"
 RANDOM_SEED="${RANDOM_SEED:-20260416}"
-BACKEND="${BACKEND:-openai_http}"
-BACKEND_KWARGS="${BACKEND_KWARGS:-{\"validate_backend\":\"/v1/models\",\"request_format\":\"/v1/completions\"}}"
 MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.85}"
 MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-16}"
 MAX_TOTAL_TOKENS="${MAX_TOTAL_TOKENS:-140000}"  # 4 * (32768 + 256) + margin
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8_e4m3}"
 WAIT_SECONDS="${WAIT_SECONDS:-600}"
-OUTPUTS=(json csv html)
 LABEL=""
 SGLANG_COMMIT_FOR_ARTIFACTS="$SGLANG_COMMIT"
 
@@ -83,7 +79,7 @@ usage() {
     cat <<EOF
 usage: $(basename "$0") <label>
 
-Runs SGLang at commit $SGLANG_COMMIT with the longctx-32k GuideLLM shape.
+Runs SGLang at commit $SGLANG_COMMIT with the longctx-32k native bench shape.
 
 Environment:
   TARGET=$TARGET
@@ -134,7 +130,7 @@ if [[ -z "$LABEL" ]]; then
     exit 2
 fi
 
-for tool in git guidellm curl python3; do
+for tool in git curl python3; do
     if ! command -v "$tool" >/dev/null 2>&1; then
         echo "error: required tool not on PATH: $tool" >&2
         exit 2
@@ -153,8 +149,8 @@ done
 mkdir -p "$OUTPUT_DIR"
 
 SERVER_LOG="$OUTPUT_DIR/sglang_server.log"
-PRIMARY_DIR="$OUTPUT_DIR/guidellm-primary"
-SECONDARY_DIR="$OUTPUT_DIR/guidellm-c1-secondary"
+PRIMARY_DIR="$OUTPUT_DIR/primary"
+SECONDARY_DIR="$OUTPUT_DIR/c1-secondary"
 HEADLINE_JSON="$OUTPUT_DIR/sglang_headline.json"
 HEADLINE_TABLE="$OUTPUT_DIR/headline_table.md"
 mkdir -p "$PRIMARY_DIR"
@@ -162,10 +158,6 @@ mkdir -p "$PRIMARY_DIR"
 if [[ "$MODEL_PATH" != /* ]]; then
     MODEL_PATH="$REPO_ROOT/$MODEL_PATH"
 fi
-if [[ "$PROCESSOR" != /* && -d "$REPO_ROOT/$PROCESSOR" ]]; then
-    PROCESSOR="$REPO_ROOT/$PROCESSOR"
-fi
-
 ensure_sglang_checkout() {
     if [[ ! -d "$SGLANG_DIR/.git" ]]; then
         git clone "$SGLANG_REPO" "$SGLANG_DIR"
@@ -198,35 +190,28 @@ wait_for_server() {
     done
 }
 
-run_guidellm() {
+run_bench() {
     local out_dir="$1"
     local conc="$2"
     local seconds="$3"
-    local log_file="$out_dir/guidellm.log"
+    local log_file="$out_dir/bench.log"
     local cmd_file="$out_dir/command.txt"
     mkdir -p "$out_dir"
-
-    local data
-    data="prompt_tokens=${PROMPT_TOKENS},prompt_tokens_stdev=1,prompt_tokens_min=${PROMPT_TOKENS},prompt_tokens_max=${PROMPT_TOKENS},output_tokens=${OUTPUT_TOKENS},output_tokens_stdev=1,output_tokens_min=${OUTPUT_TOKENS},output_tokens_max=${OUTPUT_TOKENS}"
-
+    local prompts="$out_dir/prompts.jsonl"
+    python3 - "$prompts" "$PROMPT_TOKENS" <<'PY'
+import json, pathlib, sys
+pathlib.Path(sys.argv[1]).write_text(json.dumps({"prompt": "token " * int(sys.argv[2])}) + "\n")
+PY
     local args=(
-        --target "$TARGET"
+        --url "$TARGET"
         --model "$MODEL"
-        --processor "$PROCESSOR"
-        --profile concurrent
-        --data "$data"
-        --max-seconds "$seconds"
-        --random-seed "$RANDOM_SEED"
-        --output-dir "$out_dir"
-        --backend "$BACKEND"
-        --backend-kwargs "$BACKEND_KWARGS"
-        --disable-console-interactive
-        --rate "$conc"
+        --prompts-jsonl "$prompts"
+        --concurrency-grid "$conc"
+        --seconds-per-concurrency "$seconds"
+        --max-tokens "$OUTPUT_TOKENS"
+        --seed "$RANDOM_SEED"
+        --output "$out_dir/bench_throughput"
     )
-    local output
-    for output in "${OUTPUTS[@]}"; do
-        args+=(--outputs "$output")
-    done
 
     {
         echo "SGLANG_COMMIT=$SGLANG_COMMIT_FOR_ARTIFACTS"
@@ -235,7 +220,7 @@ run_guidellm() {
             echo "SGLANG_NO_LAUNCH=1"
         fi
         echo "SGLANG_LAUNCH_PARAMS=--model-path $MODEL_PATH --kv-cache-dtype $KV_CACHE_DTYPE --max-running-requests $MAX_RUNNING_REQUESTS --mem-fraction-static $MEM_FRACTION_STATIC --disable-radix-cache --max-total-tokens $MAX_TOTAL_TOKENS"
-        printf 'guidellm benchmark run'
+        printf 'python3 scripts/bench_throughput.py'
         local arg
         for arg in "${args[@]}"; do
             printf ' %q' "$arg"
@@ -243,10 +228,10 @@ run_guidellm() {
         printf '\n'
     } > "$cmd_file"
 
-    guidellm benchmark run "${args[@]}" 2>&1 | tee "$log_file"
+    python3 "$REPO_ROOT/scripts/bench_throughput.py" "${args[@]}" 2>&1 | tee "$log_file"
 }
 
-validate_guidellm_results() {
+validate_results() {
     python3 - "$1" <<'PY'
 import json
 import pathlib
@@ -254,41 +239,18 @@ import sys
 
 json_path = pathlib.Path(sys.argv[1])
 obj = json.loads(json_path.read_text())
-benchmarks = obj.get("benchmarks") or []
-if not benchmarks:
-    print(f"guidellm validation failed: no benchmarks in {json_path}", file=sys.stderr)
+if obj.get("schema") != "arle.bench_throughput.v1" or not obj.get("points"):
+    print(f"invalid native benchmark report: {json_path}", file=sys.stderr)
     sys.exit(1)
-
-errors = []
-for bm in benchmarks:
-    strategy = bm.get("config", {}).get("strategy", {})
-    rate = strategy.get("type_", "unknown")
-    if rate == "concurrent":
-        rate = f"conc{strategy.get('max_concurrency', '?')}"
-    metrics = bm.get("metrics", {})
-    request_totals = metrics.get("request_totals", {})
-    successful = int(request_totals.get("successful") or 0)
-    output_mean = (metrics.get("output_token_count", {}).get("successful", {}) or {}).get("mean") or 0.0
-    outputs = bm.get("requests", {}).get("successful", []) or []
-    nonempty_outputs = sum(1 for req in outputs if (req.get("output") or "") != "")
-
-    if successful <= 0:
-        errors.append(f"{rate}: no successful requests recorded")
-    elif output_mean > 0.0 and nonempty_outputs == 0:
-        errors.append(
-            f"{rate}: successful requests reported {output_mean:.1f} output tokens on average but every sampled output was empty"
-        )
-
-if errors:
-    print(f"guidellm validation failed for {json_path}:", file=sys.stderr)
-    for line in errors:
-        print(f"  - {line}", file=sys.stderr)
-    sys.exit(4)
+for point in obj["points"]:
+    summary = point.get("summary", {})
+    if not summary.get("complete") or summary.get("correctness_failed"):
+        raise SystemExit(f"unhealthy benchmark point: {summary}")
 PY
 }
 
 write_headline() {
-    python3 - "$HEADLINE_JSON" "$HEADLINE_TABLE" "$SGLANG_COMMIT_FOR_ARTIFACTS" "$PRIMARY_DIR/benchmarks.json" "$SECONDARY_DIR/benchmarks.json" <<'PY'
+    python3 - "$HEADLINE_JSON" "$HEADLINE_TABLE" "$SGLANG_COMMIT_FOR_ARTIFACTS" "$PRIMARY_DIR/bench_throughput.json" "$SECONDARY_DIR/bench_throughput.json" <<'PY'
 import json
 import pathlib
 import sys
@@ -296,30 +258,25 @@ import sys
 out_json, out_table, commit, *inputs = sys.argv[1:]
 rows = []
 
-def rate_name(strategy):
-    if strategy.get("type_") == "concurrent":
-        return f"conc{strategy.get('max_concurrency', '?')}"
-    return strategy.get("type_", "unknown")
-
 for input_path in inputs:
     path = pathlib.Path(input_path)
     if not path.exists():
         continue
     obj = json.loads(path.read_text())
-    for bm in obj.get("benchmarks") or []:
-        metrics = bm.get("metrics", {})
-        ttft = metrics.get("time_to_first_token_ms", {}).get("successful", {})
-        itl = metrics.get("inter_token_latency_ms", {}).get("successful", {})
+    for point in obj.get("points") or []:
+        metrics = point.get("summary", {})
+        ttft = metrics.get("ttft", {})
+        itl = metrics.get("itl", {})
         rows.append({
             "source": str(path),
-            "rate": rate_name(bm.get("config", {}).get("strategy", {})),
-            "output_tokens_per_second": metrics.get("output_tokens_per_second", {}).get("successful", {}).get("mean"),
-            "tokens_per_second": metrics.get("tokens_per_second", {}).get("successful", {}).get("mean"),
-            "requests_per_second": metrics.get("requests_per_second", {}).get("successful", {}).get("mean"),
-            "ttft_p50_ms": (ttft.get("percentiles") or {}).get("p50"),
-            "ttft_p99_ms": (ttft.get("percentiles") or {}).get("p99"),
-            "itl_p50_ms": (itl.get("percentiles") or {}).get("p50"),
-            "itl_p99_ms": (itl.get("percentiles") or {}).get("p99"),
+            "rate": f"conc{metrics.get('concurrency', '?')}",
+            "output_tokens_per_second": metrics.get("output_tokens_per_s"),
+            "tokens_per_second": metrics.get("total_tokens_per_s"),
+            "requests_per_second": metrics.get("requests_per_s"),
+            "ttft_p50_ms": ttft.get("p50_ms"),
+            "ttft_p99_ms": ttft.get("p99_ms"),
+            "itl_p50_ms": itl.get("p50_ms"),
+            "itl_p99_ms": itl.get("p99_ms"),
         })
 
 payload = {"sglang_commit": commit, "benchmarks": rows}
@@ -401,10 +358,7 @@ import sys
 ) = sys.argv[1:]
 table = pathlib.Path(table_file).read_text().rstrip()
 data_spec = (
-    f"prompt_tokens={prompt_tokens},prompt_tokens_stdev=1,"
-    f"prompt_tokens_min={prompt_tokens},prompt_tokens_max={prompt_tokens},"
-    f"output_tokens={output_tokens},output_tokens_stdev=1,"
-    f"output_tokens_min={output_tokens},output_tokens_max={output_tokens}"
+        f"prompt_tokens={prompt_tokens},output_tokens={output_tokens}"
 )
 launch = (
     f"python3 -m sglang.launch_server --model-path {model_path} "
@@ -443,11 +397,10 @@ scripts/bench_sglang_longctx.sh {label}
 
 ## Canonical params
 
-- `--profile concurrent`
-- `--data {data_spec}`
-- `--rate {concurrencies}`
-- `--max-seconds {max_seconds}`
-- `--random-seed {random_seed}`
+- `--prompts-jsonl` generated for `{data_spec}`
+- `--concurrency-grid {concurrencies}`
+- `--seconds-per-concurrency {max_seconds}`
+- `--seed {random_seed}`
 - Secondary c=1 run: `{run_secondary_c1}` (`{c1_seconds}s`)
 
 ## Results
@@ -457,7 +410,7 @@ scripts/bench_sglang_longctx.sh {label}
 ## Problems
 
 - Pending reviewer fill-in after the remote run if startup, CUDA memory, or
-  GuideLLM validation deviated from the watch-list.
+  native benchmark validation deviated from the watch-list.
 
 ## Learnings
 
@@ -470,8 +423,8 @@ scripts/bench_sglang_longctx.sh {label}
 ## Artefacts
 
 - Raw: `{output_dir}/`
-- Primary: `{output_dir}/guidellm-primary/benchmarks.json`
-- Secondary c=1: `{output_dir}/guidellm-c1-secondary/benchmarks.json`
+- Primary: `{output_dir}/primary/bench_throughput.json`
+- Secondary c=1: `{output_dir}/c1-secondary/bench_throughput.json`
 - Headline: `{output_dir}/headline_table.md`
 - Server log: `{output_dir}/sglang_server.log`
 """
@@ -529,13 +482,13 @@ else
 fi
 
 wait_for_server
-run_guidellm "$PRIMARY_DIR" "$CONCURRENCIES" "$MAX_SECONDS"
-validate_guidellm_results "$PRIMARY_DIR/benchmarks.json"
+run_bench "$PRIMARY_DIR" "$CONCURRENCIES" "$MAX_SECONDS"
+validate_results "$PRIMARY_DIR/bench_throughput.json"
 
 if [[ "$RUN_SECONDARY_C1" == "1" && "$CONCURRENCIES" == *"1"* && "${SMOKE:-0}" != "1" ]]; then
     mkdir -p "$SECONDARY_DIR"
-    run_guidellm "$SECONDARY_DIR" "1" "$C1_SECONDS"
-    validate_guidellm_results "$SECONDARY_DIR/benchmarks.json"
+    run_bench "$SECONDARY_DIR" "1" "$C1_SECONDS"
+    validate_results "$SECONDARY_DIR/bench_throughput.json"
 fi
 
 write_headline
@@ -547,7 +500,7 @@ cat "$HEADLINE_TABLE"
 echo
 echo ">>> artefacts"
 echo "    raw     : $OUTPUT_DIR"
-echo "    primary : $PRIMARY_DIR/benchmarks.json"
-echo "    c1 sec  : $SECONDARY_DIR/benchmarks.json"
+echo "    primary : $PRIMARY_DIR/bench_throughput.json"
+echo "    c1 sec  : $SECONDARY_DIR/bench_throughput.json"
 echo "    headline: $HEADLINE_JSON"
 echo "    server  : $SERVER_LOG"
