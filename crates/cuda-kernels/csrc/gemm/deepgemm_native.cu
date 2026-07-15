@@ -1861,7 +1861,8 @@ extern "C" CUresult dsv4_sm90_mega_moe_workspace_layout_cuda(
     Sm90MegaMoeWorkspaceLayout* out) {
   if (out == nullptr || num_ranks <= 0 || num_experts <= 0 ||
       requested_max_tokens_per_rank <= 0 || num_topk <= 0 || hidden <= 0 ||
-      intermediate_hidden <= 0 ||
+      intermediate_hidden <= 0 || intermediate_hidden > 4096 ||
+      hidden % 128 != 0 || intermediate_hidden % 128 != 0 ||
       requested_max_tokens_per_rank >
           std::numeric_limits<int>::max() - deep_gemm::layout::kLCMCandidateBlockM + 1) {
     return CUDA_ERROR_INVALID_VALUE;
@@ -1891,6 +1892,71 @@ extern "C" CUresult dsv4_sm90_mega_moe_workspace_layout_cuda(
   } catch (const std::exception& err) {
     std::fprintf(stderr, "DeepGEMM SM90 MegaMoE workspace failed: %s\n", err.what());
     return CUDA_ERROR_INVALID_VALUE;
+  }
+}
+
+extern "C" CUresult dsv4_sm90_mega_moe_pre_dispatch_cuda(
+    const unsigned short* hidden_states,
+    const int* route_indices,
+    const float* route_weights,
+    unsigned char* workspace_x,
+    float* workspace_x_sf,
+    int64_t* workspace_topk_idx,
+    float* workspace_topk_weights,
+    int num_tokens,
+    int padded_max_tokens,
+    int hidden,
+    int num_topk,
+    int enable_pdl,
+    CUstream stream) {
+  if (hidden_states == nullptr || route_indices == nullptr || route_weights == nullptr ||
+      workspace_x == nullptr || workspace_x_sf == nullptr ||
+      workspace_topk_idx == nullptr || workspace_topk_weights == nullptr ||
+      stream == nullptr || num_tokens < 0 || padded_max_tokens <= 0 ||
+      num_tokens > padded_max_tokens || hidden <= 0 || hidden % 128 != 0 ||
+      hidden / 8 > 1024 || num_topk <= 0 || num_topk > hidden / 8 ||
+      enable_pdl < 0 || enable_pdl > 1) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+
+  try {
+    cudaDeviceProp prop{};
+    const CUresult prop_err = current_device_prop(&prop);
+    if (prop_err != CUDA_SUCCESS) return prop_err;
+    if (prop.major != 9) return CUDA_ERROR_NOT_SUPPORTED;
+
+    std::ostringstream source;
+    source << "#include <deep_gemm/impls/sm90_mega_moe_pre_dispatch.cuh>\n"
+              "using namespace deep_gemm;\n"
+              "static void __instantiate_kernel() { auto ptr = reinterpret_cast<void*>("
+              "&sm90_mega_moe_pre_dispatch_kernel<128,"
+           << (enable_pdl != 0 ? "true" : "false") << ">); }\n";
+    const auto runtime = get_or_build_runtime(
+        "sm90_mega_moe_pre_dispatch_native", source.str(), prop.major, prop.minor);
+
+    const uint64_t num_threads = static_cast<uint64_t>(hidden / 8);
+    const uint64_t pad_slots =
+        static_cast<uint64_t>(padded_max_tokens - num_tokens) * num_topk;
+    const uint64_t pad_blocks = pad_slots == 0 ? 0 : ceil_div(pad_slots, num_threads);
+    const uint64_t total_blocks = static_cast<uint64_t>(num_tokens) + pad_blocks;
+    if (total_blocks == 0 || total_blocks > std::numeric_limits<unsigned>::max()) {
+      return total_blocks == 0 ? CUDA_SUCCESS : CUDA_ERROR_INVALID_VALUE;
+    }
+
+    const auto launch_config = construct_launch_config(
+        runtime->kernel, reinterpret_cast<cudaStream_t>(stream), 0,
+        dim3(static_cast<unsigned>(total_blocks), 1, 1),
+        dim3(static_cast<unsigned>(num_threads), 1, 1), 1, enable_pdl != 0);
+    constexpr float kAlreadyScaledRouteWeights = 1.0f;
+    return launch_kernel(
+        runtime->kernel, launch_config, hidden_states, route_indices, route_weights,
+        workspace_x, workspace_x_sf, workspace_topk_idx, workspace_topk_weights,
+        static_cast<uint32_t>(num_tokens), static_cast<uint32_t>(padded_max_tokens),
+        static_cast<uint32_t>(hidden), static_cast<uint32_t>(hidden / 128),
+        static_cast<uint32_t>(num_topk), kAlreadyScaledRouteWeights);
+  } catch (const std::exception& err) {
+    std::fprintf(stderr, "DeepGEMM SM90 MegaMoE pre-dispatch failed: %s\n", err.what());
+    return CUDA_ERROR_UNKNOWN;
   }
 }
 
@@ -1925,7 +1991,9 @@ extern "C" CUresult dsv4_sm90_mega_moe_launch_cuda(
       num_max_tokens_per_rank % deep_gemm::layout::kLCMCandidateBlockM != 0 ||
       num_tokens <= 0 || num_tokens > num_max_tokens_per_rank || num_experts <= 0 ||
       num_experts % num_ranks != 0 || num_topk <= 0 || hidden <= 0 ||
-      intermediate_hidden <= 0 || l1_weight_stride < hidden ||
+      intermediate_hidden <= 0 || intermediate_hidden > 4096 ||
+      hidden % 128 != 0 || intermediate_hidden % 128 != 0 ||
+      l1_weight_stride < hidden ||
       l2_weight_stride < intermediate_hidden || fast_math < 0 || fast_math > 1 ||
       enable_pdl < 0 || enable_pdl > 1 || std::isnan(activation_clamp) ||
       activation_clamp < 0.0f) {

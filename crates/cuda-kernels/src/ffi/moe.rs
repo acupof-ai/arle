@@ -97,6 +97,15 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn dsv4_interleave_gate_up_fp8_rows_cuda(
+        gate: *const u8,
+        up: *const u8,
+        output: *mut u8,
+        rows: i32,
+        cols: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn dsv4_count_expert_ranks_cuda(
         indices: *const i32,
         counts: *mut i32,

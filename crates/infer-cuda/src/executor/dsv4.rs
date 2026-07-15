@@ -395,7 +395,7 @@ impl Dsv4CudaExecutor {
         // Pass the draft dir through: the builder reads its config for DSpark
         // metadata and derives `spec_decode_on` (which allocates the per-slot
         // spec-ring snapshots MTP and DSpark share).
-        let model = crate::dsv4::Dsv4Model::from_dsv4_fp8_safetensors(
+        let mut model = crate::dsv4::Dsv4Model::from_dsv4_fp8_safetensors(
             model_path.as_ref(),
             mtp_draft_tokens_for_load,
             dspark_draft_model,
@@ -571,6 +571,7 @@ impl Dsv4CudaExecutor {
                 )
             })
             .transpose()?;
+        model.boot_mega_moe(num_slots.max(256))?;
         Ok(Self {
             model,
             slots,

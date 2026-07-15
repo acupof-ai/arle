@@ -103,6 +103,43 @@ pub struct TpRuntime {
     oneshot: Option<oneshot::OneShotComm>,
 }
 
+#[cfg(all(feature = "cuda", feature = "nccl"))]
+pub(crate) struct SymmetricIpcBuffer {
+    peer_mappings: Vec<cuda_ipc::PeerMapping>,
+    local: Option<cuda_ipc::SharedRegion>,
+    peer_ptrs: Vec<u64>,
+    bytes: usize,
+    context: Option<std::sync::Arc<cudarc::driver::CudaContext>>,
+}
+
+#[cfg(all(feature = "cuda", feature = "nccl"))]
+impl SymmetricIpcBuffer {
+    pub(crate) fn local_base(&self) -> u64 {
+        self.local.as_ref().map_or(0, cuda_ipc::SharedRegion::ptr)
+    }
+
+    pub(crate) fn peer_ptrs(&self) -> &[u64] {
+        &self.peer_ptrs
+    }
+
+    pub(crate) fn bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
+#[cfg(all(feature = "cuda", feature = "nccl"))]
+impl Drop for SymmetricIpcBuffer {
+    fn drop(&mut self) {
+        std::mem::forget(std::mem::take(&mut self.peer_mappings));
+        if let Some(local) = self.local.take() {
+            std::mem::forget(local);
+        }
+        if let Some(context) = self.context.take() {
+            std::mem::forget(context);
+        }
+    }
+}
+
 impl TpRuntime {
     /// Single-GPU runtime (no parallelism, no-op communicator).
     #[must_use]
@@ -622,6 +659,140 @@ impl TpRuntime {
         }
     }
 
+    #[cfg(all(feature = "cuda", feature = "nccl"))]
+    fn symmetric_vote(
+        &self,
+        ctx: &cuda_kernels::prelude::DeviceContext,
+        ok: bool,
+    ) -> anyhow::Result<bool> {
+        let payload = [u8::from(ok), 0, 0, 0];
+        Ok(self
+            .all_gather_bytes(ctx, &payload, 4)?
+            .chunks_exact(4)
+            .all(|chunk| chunk[0] == 1))
+    }
+
+    /// Allocate one zeroed CUDA-IPC region per rank and map every peer in
+    /// rank order. Collective: every rank must call with the same `bytes`.
+    #[cfg(all(feature = "cuda", feature = "nccl"))]
+    #[allow(dead_code)]
+    pub(crate) fn alloc_symmetric_ipc(
+        &self,
+        ctx: &cuda_kernels::prelude::DeviceContext,
+        bytes: usize,
+    ) -> anyhow::Result<SymmetricIpcBuffer> {
+        use anyhow::{anyhow, ensure};
+        use cuda_kernels::collective::CollectiveBackend;
+
+        const IPC_HANDLE_BYTES: usize = 64;
+
+        let backend = match &self.comm {
+            TpComm::Nccl(backend) => backend,
+            TpComm::Single => anyhow::bail!("symmetric IPC requires an NCCL communicator"),
+        };
+        let world = backend.world_size();
+        let rank = backend.rank();
+        ensure!(world >= 2, "symmetric IPC requires world_size >= 2");
+        ensure!(
+            (self.config.world_size, self.config.rank) == (world, rank),
+            "TpConfig rank {}/{} does not match NCCL rank {rank}/{world}",
+            self.config.rank,
+            self.config.world_size
+        );
+        cuda_ipc::bind(ctx)?;
+
+        let bytes_u64 = u64::try_from(bytes)?;
+        let gathered_bytes = self.all_gather_bytes(ctx, &bytes_u64.to_ne_bytes(), 8)?;
+        ensure!(
+            gathered_bytes.len() == world * 8,
+            "symmetric IPC byte-size exchange returned {} bytes, expected {}",
+            gathered_bytes.len(),
+            world * 8
+        );
+        let rank_bytes = gathered_bytes
+            .chunks_exact(8)
+            .map(|chunk| u64::from_ne_bytes(chunk.try_into().expect("8-byte chunk")))
+            .collect::<Vec<_>>();
+        ensure!(
+            rank_bytes.iter().all(|&value| value == bytes_u64),
+            "symmetric IPC byte-size mismatch across ranks: {rank_bytes:?}"
+        );
+        ensure!(bytes > 0, "symmetric IPC bytes must be positive");
+
+        let allocated = (|| -> anyhow::Result<(cuda_ipc::SharedRegion, [u8; IPC_HANDLE_BYTES])> {
+            let mut handle = [0u8; IPC_HANDLE_BYTES];
+            let local = cuda_ipc::SharedRegion::alloc(
+                ctx,
+                bytes,
+                &mut handle,
+                "MegaMoE symmetric region alloc",
+            )?;
+            Ok((local, handle))
+        })();
+        let all_allocated = match self.symmetric_vote(ctx, allocated.is_ok()) {
+            Ok(all_allocated) => all_allocated,
+            Err(err) => {
+                if let Ok((local, _)) = allocated {
+                    std::mem::forget(local);
+                    std::mem::forget(ctx.ctx.clone());
+                }
+                return Err(err);
+            }
+        };
+        if !all_allocated {
+            return match allocated {
+                Err(err) => Err(err),
+                Ok((local, _)) => {
+                    std::mem::forget(local);
+                    std::mem::forget(ctx.ctx.clone());
+                    Err(anyhow!("symmetric IPC allocation failed on a peer rank"))
+                }
+            };
+        }
+        let (local, handle) = allocated?;
+        let mut buffer = SymmetricIpcBuffer {
+            peer_mappings: Vec::with_capacity(world - 1),
+            local: Some(local),
+            peer_ptrs: Vec::with_capacity(world),
+            bytes,
+            context: Some(ctx.ctx.clone()),
+        };
+
+        let gathered_handles = self.all_gather_bytes(ctx, &handle, IPC_HANDLE_BYTES)?;
+        ensure!(
+            gathered_handles.len() == world * IPC_HANDLE_BYTES,
+            "symmetric IPC handle exchange returned {} bytes, expected {}",
+            gathered_handles.len(),
+            world * IPC_HANDLE_BYTES
+        );
+
+        cuda_ipc::bind(ctx)?;
+        let mut open_error = None;
+        for (peer_rank, peer_handle) in gathered_handles.chunks_exact(IPC_HANDLE_BYTES).enumerate()
+        {
+            if peer_rank == rank {
+                buffer.peer_ptrs.push(buffer.local_base());
+                continue;
+            }
+            match cuda_ipc::PeerMapping::open(ctx, peer_handle, "MegaMoE symmetric peer open") {
+                Ok(mapping) => {
+                    buffer.peer_ptrs.push(mapping.ptr());
+                    buffer.peer_mappings.push(mapping);
+                }
+                Err(err) => {
+                    buffer.peer_ptrs.push(0);
+                    open_error.get_or_insert(err);
+                }
+            }
+        }
+        let all_opened = self.symmetric_vote(ctx, open_error.is_none())?;
+        if !all_opened {
+            return Err(open_error
+                .unwrap_or_else(|| anyhow!("symmetric IPC peer mapping failed on a peer rank")));
+        }
+        Ok(buffer)
+    }
+
     /// Broadcast rank-0's `values` to every rank (rank-0 authoritative).
     ///
     /// Single-rank / non-NCCL builds are identity. DSpark spec-decode uses this
@@ -859,6 +1030,119 @@ mod tests {
     }
 }
 
+#[cfg(all(feature = "cuda", feature = "nccl"))]
+mod cuda_ipc {
+    use anyhow::{Result, anyhow, ensure};
+    use cuda_kernels::ffi::comm as car;
+
+    pub(super) fn bind(ctx: &cuda_kernels::prelude::DeviceContext) -> Result<()> {
+        ctx.ctx
+            .bind_to_thread()
+            .map_err(|err| anyhow!("bind symmetric IPC CUDA context failed: {err}"))
+    }
+
+    pub(super) fn check(res: cudarc::driver::sys::CUresult, what: &str) -> Result<()> {
+        ensure!(
+            res == cudarc::driver::sys::CUresult::CUDA_SUCCESS,
+            "{what} failed: {res:?}"
+        );
+        Ok(())
+    }
+
+    pub(super) struct SharedRegion {
+        ptr: u64,
+        label: &'static str,
+    }
+
+    impl SharedRegion {
+        pub(super) fn alloc(
+            ctx: &cuda_kernels::prelude::DeviceContext,
+            bytes: usize,
+            handle: &mut [u8; 64],
+            label: &'static str,
+        ) -> Result<Self> {
+            bind(ctx)?;
+            let mut ptr = 0u64;
+            // SAFETY: outputs point to live locals and `ctx` is current.
+            check(
+                unsafe { car::arle_car_alloc_shared(bytes, &mut ptr, handle.as_mut_ptr()) },
+                label,
+            )?;
+            Ok(Self { ptr, label })
+        }
+
+        pub(super) fn ptr(&self) -> u64 {
+            self.ptr
+        }
+
+        pub(super) fn disarm(&mut self) {
+            self.ptr = 0;
+        }
+    }
+
+    impl Drop for SharedRegion {
+        fn drop(&mut self) {
+            if self.ptr == 0 {
+                return;
+            }
+            let res = unsafe { car::arle_car_free_shared(self.ptr) };
+            if res != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                log::warn!(
+                    "[cuda-ipc] cleanup {} ptr=0x{:x} failed: {res:?}",
+                    self.label,
+                    self.ptr
+                );
+            }
+        }
+    }
+
+    pub(super) struct PeerMapping {
+        ptr: u64,
+        label: &'static str,
+    }
+
+    impl PeerMapping {
+        pub(super) fn open(
+            ctx: &cuda_kernels::prelude::DeviceContext,
+            handle: &[u8],
+            label: &'static str,
+        ) -> Result<Self> {
+            bind(ctx)?;
+            let mut ptr = 0u64;
+            // SAFETY: `handle` is a gathered 64-byte IPC handle and `ctx` is current.
+            check(
+                unsafe { car::arle_car_open_peer(handle.as_ptr(), &mut ptr) },
+                label,
+            )?;
+            Ok(Self { ptr, label })
+        }
+
+        pub(super) fn ptr(&self) -> u64 {
+            self.ptr
+        }
+
+        pub(super) fn disarm(&mut self) {
+            self.ptr = 0;
+        }
+    }
+
+    impl Drop for PeerMapping {
+        fn drop(&mut self) {
+            if self.ptr == 0 {
+                return;
+            }
+            let res = unsafe { car::arle_car_close_peer(self.ptr) };
+            if res != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                log::warn!(
+                    "[cuda-ipc] cleanup {} ptr=0x{:x} failed: {res:?}",
+                    self.label,
+                    self.ptr
+                );
+            }
+        }
+    }
+}
+
 /// One-shot small-message collective path: vendored sgl-kernel/vLLM custom
 /// allreduce + ARLE one-shot all-gather over IPC-shared buffers
 /// (`csrc/comm/custom_all_reduce.cu`), staged through one persistent registered
@@ -871,6 +1155,7 @@ mod tests {
 /// degrades EVERY rank to NCCL instead of desyncing the boot collectives.
 #[cfg(all(feature = "cuda", feature = "nccl"))]
 mod oneshot {
+    use super::cuda_ipc::{PeerMapping, SharedRegion, check};
     use anyhow::{Result, anyhow, ensure};
     use cuda_kernels::collective::NcclBackend;
     use cuda_kernels::ffi::comm as car;
@@ -900,94 +1185,6 @@ mod oneshot {
         fn drop(&mut self) {
             // Frees own regions + rank data, IPC-closes peer mappings.
             unsafe { car::arle_car_destroy_prod(self.handle) };
-        }
-    }
-
-    fn check(res: cudarc::driver::sys::CUresult, what: &str) -> Result<()> {
-        ensure!(
-            res == cudarc::driver::sys::CUresult::CUDA_SUCCESS,
-            "{what} failed: {res:?}"
-        );
-        Ok(())
-    }
-
-    struct SharedRegion {
-        ptr: u64,
-        label: &'static str,
-    }
-
-    impl SharedRegion {
-        fn alloc(bytes: usize, handle: &mut [u8; 64], label: &'static str) -> Result<Self> {
-            let mut ptr = 0u64;
-            check(
-                unsafe { car::arle_car_alloc_shared(bytes, &mut ptr, handle.as_mut_ptr()) },
-                label,
-            )?;
-            Ok(Self { ptr, label })
-        }
-
-        fn ptr(&self) -> u64 {
-            self.ptr
-        }
-
-        fn disarm(&mut self) {
-            self.ptr = 0;
-        }
-    }
-
-    impl Drop for SharedRegion {
-        fn drop(&mut self) {
-            if self.ptr == 0 {
-                return;
-            }
-            let res = unsafe { car::arle_car_free_shared(self.ptr) };
-            if res != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-                log::warn!(
-                    "[comm-oneshot] cleanup {} ptr=0x{:x} failed: {res:?}",
-                    self.label,
-                    self.ptr
-                );
-            }
-        }
-    }
-
-    struct PeerMapping {
-        ptr: u64,
-        label: &'static str,
-    }
-
-    impl PeerMapping {
-        fn open(handle: &[u8], label: &'static str) -> Result<Self> {
-            let mut ptr = 0u64;
-            check(
-                unsafe { car::arle_car_open_peer(handle.as_ptr(), &mut ptr) },
-                label,
-            )?;
-            Ok(Self { ptr, label })
-        }
-
-        fn ptr(&self) -> u64 {
-            self.ptr
-        }
-
-        fn disarm(&mut self) {
-            self.ptr = 0;
-        }
-    }
-
-    impl Drop for PeerMapping {
-        fn drop(&mut self) {
-            if self.ptr == 0 {
-                return;
-            }
-            let res = unsafe { car::arle_car_close_peer(self.ptr) };
-            if res != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-                log::warn!(
-                    "[comm-oneshot] cleanup {} ptr=0x{:x} failed: {res:?}",
-                    self.label,
-                    self.ptr
-                );
-            }
         }
     }
 
@@ -1049,12 +1246,17 @@ mod oneshot {
                 let mut sig_handle = [0u8; 64];
                 let mut in_handle = [0u8; 64];
                 let sig_region = SharedRegion::alloc(
+                    ctx,
                     SIGNAL_BYTES,
                     &mut sig_handle,
                     "one-shot signal-region alloc",
                 )?;
-                let in_region =
-                    SharedRegion::alloc(SCRATCH_BYTES, &mut in_handle, "one-shot scratch alloc")?;
+                let in_region = SharedRegion::alloc(
+                    ctx,
+                    SCRATCH_BYTES,
+                    &mut in_handle,
+                    "one-shot scratch alloc",
+                )?;
                 Ok((sig_region, in_region, sig_handle, in_handle))
             })();
             if let Err(err) = &alloc_ok {
@@ -1088,11 +1290,14 @@ mod oneshot {
                         continue;
                     }
                     let rec = &all[r * 128..(r + 1) * 128];
-                    let sig =
-                        PeerMapping::open(&rec[..64], "one-shot peer signal open (no-P2P probe)")?;
+                    let sig = PeerMapping::open(
+                        ctx,
+                        &rec[..64],
+                        "one-shot peer signal open (no-P2P probe)",
+                    )?;
                     sigs[r] = sig.ptr();
                     peer_sigs.push(sig);
-                    let input = PeerMapping::open(&rec[64..], "one-shot peer scratch open")?;
+                    let input = PeerMapping::open(ctx, &rec[64..], "one-shot peer scratch open")?;
                     ins[r] = input.ptr();
                     peer_ins.push(input);
                 }

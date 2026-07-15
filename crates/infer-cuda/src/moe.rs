@@ -2918,7 +2918,8 @@ mod dsv4_gpu {
         out: &mut HiddenStates,
         keepalive: &mut Dsv4ForwardKeepalive,
         tail: Option<&mut Dsv4MoeTailScratch>,
-    ) -> Result<()> {
+        mega_epoch: Option<u64>,
+    ) -> Result<bool> {
         let ctx = &model.ctx;
         let cfg = &model.moe_config;
         let num_tokens = hidden.seq_len;
@@ -2970,6 +2971,80 @@ mod dsv4_gpu {
                 Ok((routing.indices, routing.weights))
             })?;
 
+        #[cfg(all(feature = "cuda", feature = "nccl"))]
+        if let Some(mega_moe) = &model.mega_moe {
+            mega_moe.assert_forward_epoch(
+                mega_epoch.ok_or_else(|| anyhow::anyhow!("DSv4 MegaMoE forward epoch missing"))?,
+                num_tokens,
+            )?;
+            let world = model.tp.config().world_size;
+            let per_rank = num_tokens.div_ceil(world);
+            let start = (model.tp.config().rank * per_rank).min(num_tokens);
+            let owned_n = (((model.tp.config().rank + 1) * per_rank).min(num_tokens)) - start;
+            let launch_n = owned_n.max(1);
+            let local_workspace = mega_moe.workspace.local_base();
+            crate::stage_profile::profile(ctx, "dsv4/stage/mega_moe_input", || {
+                // SAFETY: sources are live contiguous step buffers; the model-owned
+                // symmetric workspace spans `layout.num_bytes` through this launch.
+                unsafe {
+                    moe::sm90_mega_moe_stage_inputs(
+                        cache_ptr(&hidden.data, ctx).offset_elems(start * hidden_dim),
+                        cache_ptr(&route_indices, ctx).offset_elems(start * cfg.top_k),
+                        cache_ptr(&route_weights, ctx).offset_elems(start * cfg.top_k),
+                        local_workspace,
+                        &mega_moe.layout,
+                        owned_n,
+                        cfg.top_k,
+                        hidden_dim,
+                        ctx.stream.cu_stream(),
+                    )
+                }
+            })?;
+            crate::stage_profile::profile(ctx, "dsv4/stage/mega_moe", || {
+                // SAFETY: boot validates shape/workspace ownership; staging above
+                // fully writes this step's four input regions on the same stream.
+                unsafe {
+                    moe::sm90_mega_moe_launch(&moe::Sm90MegaMoeLaunch {
+                        shape: mega_moe.shape,
+                        workspace: &mega_moe.layout,
+                        num_tokens: launch_n,
+                        rank_idx: model.tp.config().rank,
+                        y: cache_ptr(&mega_moe.owned_out, ctx),
+                        cumulative_local_expert_recv_stats: None,
+                        peer_buffer_ptrs: mega_moe.workspace.peer_ptrs(),
+                        local_workspace,
+                        activation_clamp: model.config.swiglu_limit,
+                        fast_math: mega_moe.fast_math,
+                        enable_pdl: mega_moe.enable_pdl,
+                        l1_weights: cache_ptr(&layer.w13_grouped.weight, ctx),
+                        l1_weight_stride: hidden_dim,
+                        l1_weights_sf: cache_ptr(&layer.w13_grouped.scales, ctx),
+                        l2_weights: cache_ptr(&layer.w2_grouped.weight, ctx),
+                        l2_weight_stride: layer.intermediate,
+                        l2_weights_sf: cache_ptr(&layer.w2_grouped.scales, ctx),
+                        stream: ctx.stream.cu_stream(),
+                    })
+                }
+            })?;
+            ctx.stream
+                .memset_zeros(&mut out.data)
+                .map_err(|error| anyhow::anyhow!("MegaMoE output zero failed: {error}"))?;
+            if owned_n > 0 {
+                ctx.stream
+                    .memcpy_dtod(
+                        &mega_moe.owned_out.slice(0..owned_n * hidden_dim),
+                        &mut out
+                            .data
+                            .slice_mut(start * hidden_dim..(start + owned_n) * hidden_dim),
+                    )
+                    .map_err(|error| {
+                        anyhow::anyhow!("MegaMoE owned output copy failed: {error}")
+                    })?;
+            }
+            model.tp.all_reduce_sum(ctx, out)?;
+            return Ok(false);
+        }
+
         dsv4_moe_forward_masked_tail(
             model,
             layer,
@@ -2979,7 +3054,8 @@ mod dsv4_gpu {
             out,
             keepalive,
             tail,
-        )
+        )?;
+        Ok(true)
     }
 
     /// Routed-row ceiling for the compact FP8 decode lane.
@@ -4688,6 +4764,12 @@ mod dsv4_gpu {
         pub(crate) cols: usize,
     }
 
+    #[derive(Clone, Copy)]
+    pub(crate) enum GroupedWeightLayout {
+        Normal,
+        InterleavedL1,
+    }
+
     /// Concatenate the per-expert FP8 caches into one contiguous group-major
     /// buffer (D2D), validating uniform `[rows, cols]` shape + 128-row alignment.
     ///
@@ -4699,6 +4781,7 @@ mod dsv4_gpu {
         caches: &[Dsv4Fp8DeepGemmWeightCache],
         rows: usize,
         cols: usize,
+        layout: GroupedWeightLayout,
     ) -> Result<GroupedCache> {
         let first = caches
             .first()
@@ -4734,11 +4817,29 @@ mod dsv4_gpu {
                 cache.rows,
                 cache.cols
             );
-            {
-                let mut dst = weight.slice_mut(g * weight_stride..(g + 1) * weight_stride);
-                ctx.stream
+            let mut dst = weight.slice_mut(g * weight_stride..(g + 1) * weight_stride);
+            match layout {
+                GroupedWeightLayout::Normal => ctx
+                    .stream
                     .memcpy_dtod(&cache.weight, &mut dst)
-                    .map_err(|e| anyhow::anyhow!("DSv4 grouped weight D2D failed: {e}"))?;
+                    .map_err(|e| anyhow::anyhow!("DSv4 grouped weight D2D failed: {e}"))?,
+                GroupedWeightLayout::InterleavedL1 => {
+                    ensure!(
+                        rows.is_multiple_of(16),
+                        "MegaMoE L1 fused rows must be divisible by 16, got {rows}"
+                    );
+                    let half_len = weight_stride / 2;
+                    let gate = cache.weight.slice(0..half_len);
+                    let up = cache.weight.slice(half_len..weight_stride);
+                    cuda_kernels::moe::interleave_gate_up_fp8_rows(
+                        ctx,
+                        &gate,
+                        &up,
+                        &mut dst,
+                        rows / 2,
+                        cols,
+                    )?;
+                }
             }
             let mut dst = scales.slice_mut(g * scale_stride..(g + 1) * scale_stride);
             ctx.stream
@@ -5002,9 +5103,9 @@ mod dsv4_gpu {
 #[allow(unused_imports)] // consumed by the Piece 2 model.rs DSv4 branch
 pub(crate) use dsv4_gpu::{
     Dsv4GemvTables, Dsv4MoeDecodeScratch, Dsv4MoeTailScratch, Dsv4SharedDecodeScratch,
-    GroupedCache, build_grouped_cache, dsv4_moe_forward, dsv4_moe_forward_decode_graph,
-    dsv4_shared_expert_forward, dsv4_shared_expert_forward_decode_graph,
-    dsv4_shared_expert_forward_decode_scratch,
+    GroupedCache, GroupedWeightLayout, build_grouped_cache, dsv4_moe_forward,
+    dsv4_moe_forward_decode_graph, dsv4_shared_expert_forward,
+    dsv4_shared_expert_forward_decode_graph, dsv4_shared_expert_forward_decode_scratch,
 };
 #[cfg(feature = "deepep")]
 pub(crate) use dsv4_gpu::{dsv4_moe_forward_deepep, dsv4_moe_forward_deepep_ll};
