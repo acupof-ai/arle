@@ -1865,10 +1865,10 @@ fn read_safetensors_tensor_names(path: &Path) -> Result<Vec<String>> {
 }
 
 impl Dsv4Model {
-    pub(crate) fn begin_mega_moe_forward(&self, num_tokens: usize) -> Result<Option<u64>> {
+    pub(crate) fn begin_mega_moe_forward(&self, _num_tokens: usize) -> Result<Option<u64>> {
         #[cfg(all(feature = "cuda", feature = "nccl"))]
         if let Some(mega_moe) = &self.mega_moe {
-            return mega_moe.begin_forward(self, num_tokens).map(Some);
+            return mega_moe.begin_forward(self, _num_tokens).map(Some);
         }
         Ok(None)
     }
@@ -1897,7 +1897,7 @@ impl Dsv4Model {
         }
     }
 
-    pub(crate) fn boot_mega_moe(&mut self, requested_max_tokens_per_rank: usize) -> Result<()> {
+    pub(crate) fn boot_mega_moe(&mut self, _requested_max_tokens_per_rank: usize) -> Result<()> {
         if !matches!(
             crate::runtime_flags::dsv4_moe_transport()?,
             crate::runtime_flags::Dsv4MoeTransport::MegaMoe
@@ -1948,7 +1948,7 @@ impl Dsv4Model {
             let shape = cuda_kernels::moe::Sm90MegaMoeShape {
                 num_ranks: self.tp.config().world_size,
                 num_experts: self.moe_config.num_experts,
-                requested_max_tokens_per_rank,
+                requested_max_tokens_per_rank: _requested_max_tokens_per_rank,
                 num_topk: self.moe_config.top_k,
                 hidden: first.hidden_dim,
                 intermediate_hidden: first.intermediate,
@@ -1967,7 +1967,7 @@ impl Dsv4Model {
                     .ctx
                     .stream
                     .alloc_zeros::<half::bf16>(
-                        requested_max_tokens_per_rank
+                        _requested_max_tokens_per_rank
                             .checked_mul(first.hidden_dim)
                             .ok_or_else(|| anyhow!("DSv4 MegaMoE output scratch overflow"))?,
                     )

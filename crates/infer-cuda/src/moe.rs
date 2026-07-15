@@ -2918,7 +2918,7 @@ mod dsv4_gpu {
         out: &mut HiddenStates,
         keepalive: &mut Dsv4ForwardKeepalive,
         tail: Option<&mut Dsv4MoeTailScratch>,
-        mega_epoch: Option<u64>,
+        _mega_epoch: Option<u64>,
     ) -> Result<bool> {
         let ctx = &model.ctx;
         let cfg = &model.moe_config;
@@ -2974,7 +2974,7 @@ mod dsv4_gpu {
         #[cfg(all(feature = "cuda", feature = "nccl"))]
         if let Some(mega_moe) = &model.mega_moe {
             mega_moe.assert_forward_epoch(
-                mega_epoch.ok_or_else(|| anyhow::anyhow!("DSv4 MegaMoE forward epoch missing"))?,
+                _mega_epoch.ok_or_else(|| anyhow::anyhow!("DSv4 MegaMoE forward epoch missing"))?,
                 num_tokens,
             )?;
             let world = model.tp.config().world_size;
