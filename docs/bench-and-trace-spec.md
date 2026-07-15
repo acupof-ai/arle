@@ -152,9 +152,9 @@ or SQLite rows used for the calculation.
 Nsight Compute is a kernel microbenchmark. Pair it with the fixed-concurrency
 native benchmark before claiming serving impact.
 
-## 8. Licensing
+## 8. Acceptance
 
-A performance change is licensed only when:
+A performance change is built in when:
 
 1. correctness passes;
 2. the matched A/B scheduling envelope aligns;
@@ -163,6 +163,12 @@ A performance change is licensed only when:
    stated SLO;
 5. raw JSON/CSV, logs, and any profiler artifacts are preserved;
 6. a dated `wins/` or `errors/` entry links the baseline and treatment.
+
+There is no minimum gain threshold. Any positive target wall-clock median over
+at least three matched trials is enough. If the sign is within observed
+run-to-run noise, keep measuring until it resolves. A correctness failure stays
+non-default regardless of speed; retain measured work for repair instead of
+deleting it.
 
 Use the conservative framing when component and wall-clock percentages disagree.
 The per-request result wins.

@@ -5353,7 +5353,7 @@ mod tests {
         let (offsets, total) = aligned_scan_ref(&counts, A64 as i32);
         assert_eq!(total as usize, 8 * A64);
         let cap = super::deepgemm_contig_rows_cap(8, 32, A64);
-        assert!(total as usize <= cap && cap % A64 == 0);
+        assert!(total as usize <= cap && cap.is_multiple_of(A64));
         let m = fill_m_indices_ref(&counts, &offsets, cap);
         assert!(
             tile_contract_holds(&m, A64),
@@ -5436,11 +5436,7 @@ mod tests {
     #[test]
     fn decode_band_sits_below_deepgemm_floor_and_covers_batched_decode() {
         const MAX: usize = super::QWEN35_MOE_DECODE_MAX_ROUTES;
-        assert!(
-            MAX < super::QWEN35_DEEPGEMM_MIN_ROUTES,
-            "decode band {MAX} must stay below the DeepGEMM floor {}",
-            super::QWEN35_DEEPGEMM_MIN_ROUTES
-        );
+        const { assert!(MAX < super::QWEN35_DEEPGEMM_MIN_ROUTES) };
         // Batched decode R = 8B; the band covers B up to 32 slots.
         assert_eq!(MAX, 8 * 32, "decode band is the batched-decode envelope");
         // grid.y chunking is ACT_TILE=8-row; the band is whole chunks.
@@ -5471,10 +5467,7 @@ mod tests {
             128 * TOPK,
             "DeepGEMM floor is the first 128-token prefill chunk"
         );
-        assert!(
-            super::QWEN35_MOE_DECODE_MAX_ROUTES < super::QWEN35_DEEPGEMM_MIN_ROUTES,
-            "decode must remain below the DeepGEMM prefill floor"
-        );
+        const { assert!(super::QWEN35_MOE_DECODE_MAX_ROUTES < super::QWEN35_DEEPGEMM_MIN_ROUTES) };
     }
 
     /// Host mirror of the `moe_bf16_grouped_gemm_{swiglu_,}decode` launch
@@ -5523,7 +5516,7 @@ mod tests {
     fn masked_band_threshold_bounds_per_group_counts() {
         const BAND: i32 = 128;
         // Worst skew at the threshold: all R = 128 routes on one expert.
-        let counts = vec![128i32, 0, 0];
+        let counts = [128i32, 0, 0];
         let total: i32 = counts.iter().sum();
         assert!(total <= BAND);
         for (g, &c) in counts.iter().enumerate() {

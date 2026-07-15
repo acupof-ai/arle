@@ -705,7 +705,7 @@ pub(super) fn gemm_batch(
                     .as_ref()
                     .ok_or_else(|| anyhow!("W4A16 missing qscales"))?;
                 ensure!(
-                    weight.group_size > 0 && weight.cols % weight.group_size == 0,
+                    weight.group_size > 0 && weight.cols.is_multiple_of(weight.group_size),
                     "W4A16 cols {} not group-aligned to {}",
                     weight.cols,
                     weight.group_size
@@ -877,7 +877,7 @@ pub(super) fn gemv(
                     .as_ref()
                     .ok_or_else(|| anyhow!("W4A16 missing qscales"))?;
                 ensure!(
-                    weight.group_size > 0 && weight.cols % weight.group_size == 0,
+                    weight.group_size > 0 && weight.cols.is_multiple_of(weight.group_size),
                     "W4A16 cols {} not group-aligned to {}",
                     weight.cols,
                     weight.group_size

@@ -3279,20 +3279,29 @@ impl Dsv4Model {
             start_positions,
         )?;
         let _nvtx = crate::nvtx::range("dsv4/lm_head_sample_batched");
-        // `forward_stream_last_token` folds stream row `seq_len - 1`; passing
-        // `seq_len = r + 1` samples row r of the batched stream.
-        let out_tokens = (0..n)
-            .map(|r| {
-                self.forward_stream_last_token(
-                    &stream,
-                    r + 1,
-                    &params[r],
-                    positions[r],
-                    None,
-                    &mut keepalive,
-                )
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let fast_head = self.lm_head_shard.is_none()
+            && params.iter().all(SamplingParams::is_greedy)
+            && !crate::probe::token_entropy()
+            && crate::probe::lens_layers() == 0
+            && std::env::var_os("INFER_DSV4_DUMP_TOPK_POSITIONS").is_none();
+        let out_tokens = if fast_head {
+            let logits = self.verify_logits_from_stream(&stream, n, &mut keepalive)?;
+            self.mtp_argmax_batch(&logits)?
+        } else {
+            // `forward_stream_last_token` folds row `seq_len - 1`.
+            (0..n)
+                .map(|r| {
+                    self.forward_stream_last_token(
+                        &stream,
+                        r + 1,
+                        &params[r],
+                        positions[r],
+                        None,
+                        &mut keepalive,
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
         // Post-sampling sync point: all rows' emitted tokens are known.
         crate::probe::lens_flush(&self.ctx, positions, &out_tokens);
         dsv4_decode_trace(

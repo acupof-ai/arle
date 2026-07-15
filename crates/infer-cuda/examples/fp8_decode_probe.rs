@@ -123,6 +123,7 @@ mod real {
             shape.iters,
             n,
             k,
+            // SAFETY: the buffers and dimensions above match this FFI contract.
             || unsafe {
                 let (w, _gw) = w_bf16.device_ptr(&ctx.stream);
                 let (x_ptr, _gx) = x.device_ptr(&ctx.stream);
@@ -146,6 +147,7 @@ mod real {
             shape.iters,
             n,
             k,
+            // SAFETY: the buffers and dimensions above match this FFI contract.
             || unsafe {
                 let (w, _gw) = w_fp8.device_ptr(&ctx.stream);
                 let (s, _gs) = scales.device_ptr(&ctx.stream);
@@ -316,6 +318,7 @@ mod real {
             shape.iters,
             shape.intermediate,
             shape.hidden,
+            // SAFETY: the buffers and dimensions above match this FFI contract.
             || unsafe {
                 moe::moe_bf16_grouped_gemm_swiglu_decode(
                     &gate_bf16_ptrs,
@@ -340,6 +343,7 @@ mod real {
             shape.iters,
             shape.hidden,
             shape.intermediate,
+            // SAFETY: the buffers and dimensions above match this FFI contract.
             || unsafe {
                 moe::moe_bf16_grouped_gemm_decode(
                     &down_bf16_ptrs,
@@ -363,6 +367,7 @@ mod real {
             shape.iters,
             shape.hidden,
             routes,
+            // SAFETY: the buffers and dimensions above match this FFI contract.
             || unsafe {
                 moe::dsv4_scatter_all_route_slots(
                     cache_ptr(&expert_out, ctx),
@@ -391,6 +396,7 @@ mod real {
             shape.iters,
             shape.intermediate,
             shape.hidden,
+            // SAFETY: the buffers and dimensions above match this FFI contract.
             || unsafe {
                 moe::moe_fp8_block_scaled_grouped_gemv_pair_batch(
                     &gate_fp8_ptrs,
@@ -422,6 +428,7 @@ mod real {
             shape.iters,
             shape.intermediate,
             routes,
+            // SAFETY: the buffers and dimensions above match this FFI contract.
             || unsafe {
                 let (gate, _gg) = gate_out.device_ptr(&ctx.stream);
                 let (up, _gu) = up_out.device_ptr(&ctx.stream);
@@ -443,6 +450,7 @@ mod real {
             shape.iters,
             shape.hidden,
             shape.intermediate,
+            // SAFETY: the buffers and dimensions above match this FFI contract.
             || unsafe {
                 moe::moe_fp8_block_scaled_grouped_gemv_batch(
                     &down_fp8_ptrs,
@@ -471,6 +479,7 @@ mod real {
             shape.iters,
             shape.hidden,
             routes,
+            // SAFETY: the buffers and dimensions above match this FFI contract.
             || unsafe {
                 moe::dsv4_scatter_all_route_slots(
                     cache_ptr(&expert_out, ctx),
@@ -499,6 +508,7 @@ mod real {
             shape.iters,
             shape.intermediate,
             shape.hidden,
+            // SAFETY: the buffers and dimensions above match this FFI contract.
             || unsafe {
                 moe::dsv4_fp8_grouped_swiglu_decode(
                     cache_ptr(&gate_fp8_ptrs, ctx),
@@ -525,6 +535,7 @@ mod real {
             shape.iters,
             shape.hidden,
             shape.intermediate,
+            // SAFETY: the buffers and dimensions above match this FFI contract.
             || unsafe {
                 moe::dsv4_fp8_grouped_down_decode(
                     cache_ptr(&down_fp8_ptrs, ctx),
@@ -548,6 +559,7 @@ mod real {
             shape.iters,
             shape.hidden,
             routes,
+            // SAFETY: the buffers and dimensions above match this FFI contract.
             || unsafe {
                 moe::dsv4_scatter_all_route_slots(
                     cache_ptr(&expert_out, ctx),

@@ -392,6 +392,13 @@ impl RealCudaExecutor {
         }
     }
 
+    pub(crate) fn kv_tier_read_hits(&self) -> infer_seam::KvTierReadHits {
+        match self {
+            Self::Dsv4(d) => d.kv_tier_read_hits(),
+            Self::Qwen(_) | Self::Qwen35(_) => infer_seam::KvTierReadHits::default(),
+        }
+    }
+
     pub(crate) fn kv_tier_location(&self, key: u64) -> Option<infer_seam::KvTierLocation> {
         match self {
             Self::Qwen(q) => q.kv_tier_location(key),

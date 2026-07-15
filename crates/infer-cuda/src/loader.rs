@@ -770,17 +770,22 @@ impl SafetensorLoader {
             .sum();
         let available = available_ram_bytes().unwrap_or(0);
         let rank = tp.config().rank;
-        let prefetch = should_prefetch_shards(rank, available, checkpoint);
+        let enabled = std::env::var_os("ARLE_LOADER_PREFETCH").is_none_or(|value| value != "0");
+        let prefetch = enabled && should_prefetch_shards(rank, available, checkpoint);
         if prefetch {
             self.prefetch_all_shards();
         }
         let rank0_prefetched = tp.broadcast_rank0_i32(ctx, &[i32::from(prefetch)])?[0] != 0;
         if rank == 0 && !rank0_prefetched {
-            log::info!(
-                "loader prefetch skipped: MemAvailable {:.1} GB < checkpoint {:.1} GB + 64.0 GB headroom",
-                available as f64 / 1e9,
-                checkpoint as f64 / 1e9,
-            );
+            if enabled {
+                log::info!(
+                    "loader prefetch skipped: MemAvailable {:.1} GB < checkpoint {:.1} GB + 64.0 GB headroom",
+                    available as f64 / 1e9,
+                    checkpoint as f64 / 1e9,
+                );
+            } else {
+                log::info!("loader prefetch skipped: ARLE_LOADER_PREFETCH=0");
+            }
         }
         Ok(())
     }

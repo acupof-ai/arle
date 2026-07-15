@@ -902,6 +902,10 @@ impl Dsv4CudaExecutor {
         self.prefix_state.disk_pages()
     }
 
+    pub(crate) fn kv_tier_read_hits(&self) -> infer_seam::KvTierReadHits {
+        self.prefix_state.read_hits()
+    }
+
     /// Content-keyed reuse license (#154 Phase 2): a leading page is
     /// attachable only while every page before and including it has a pool
     /// entry; the COMMIT point additionally requires the page to carry the

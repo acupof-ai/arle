@@ -512,7 +512,7 @@ mod tests {
         const ROW_WIDTH: usize = DEC_PAGES; // per-slot total_blocks
         // Flat [max_batch, row_width] buffer; row r is the identity table for a
         // slot whose first physical page is r * ROW_WIDTH.
-        let mut buf = vec![0u32; MAX_BATCH * ROW_WIDTH];
+        let mut buf = [0u32; MAX_BATCH * ROW_WIDTH];
         for r in 0..MAX_BATCH {
             for lp in 0..ROW_WIDTH {
                 buf[r * ROW_WIDTH + lp] = (r * ROW_WIDTH + lp) as u32;

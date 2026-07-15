@@ -238,7 +238,7 @@ mod real {
         .context("from_dsv4_fp8_safetensors failed (build/config?)")?;
         let load_ms = load_t0.elapsed().as_secs_f64() * 1000.0;
         if env_flag("INFER_DSV4_MTP_STEP_A_SELFTEST") {
-            exec.dsv4_verify_forward_selftest(&prompt)
+            exec.dsv4_verify_forward_selftest(prompt)
                 .context("DSv4 MTP Step A verify-forward selftest failed")?;
         }
 
@@ -275,8 +275,8 @@ mod real {
 
     #[allow(clippy::too_many_arguments)]
     fn run_prompt_case(
-        mut exec: &mut CudaExecutor,
-        mut kv: &mut CudaKvPool,
+        exec: &mut CudaExecutor,
+        kv: &mut CudaKvPool,
         prompt: &[u32],
         max_new: usize,
         load_ms: f64,
@@ -307,7 +307,7 @@ mod real {
         let first = if chunk1_prompt {
             let mut first = None;
             for (idx, &tok) in prompt.iter().enumerate() {
-                let tokens = forward_once(&mut exec, &mut kv, prefill_plan(&[tok], idx))?;
+                let tokens = forward_once(exec, kv, prefill_plan(&[tok], idx))?;
                 first = Some(
                     tokens
                         .first()
@@ -317,7 +317,7 @@ mod real {
             }
             first.expect("prompt is non-empty")
         } else {
-            forward_once(&mut exec, &mut kv, prefill_plan(&prompt, 0))?
+            forward_once(exec, kv, prefill_plan(prompt, 0))?
                 .first()
                 .copied()
                 .context("DSv4 prefill produced no token")?
@@ -344,7 +344,7 @@ mod real {
             // KV length already materialized = prompt + tokens emitted so far.
             let kv_seq_len = prompt.len() + clean_tokens.len() - 1;
             let last = *clean_tokens.last().expect("clean_tokens is non-empty");
-            match forward_once(&mut exec, &mut kv, decode_plan(last, kv_seq_len)) {
+            match forward_once(exec, kv, decode_plan(last, kv_seq_len)) {
                 Ok(tokens) => {
                     for tok in tokens {
                         if clean_tokens.len() >= max_new {

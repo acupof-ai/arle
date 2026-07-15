@@ -313,6 +313,8 @@ pub(crate) struct Dsv4PrefixStatePool {
     frontier_tails: BTreeMap<u32, Vec<u32>>,
     clock: u64,
     entry_bytes: usize,
+    host_read_hits: u64,
+    disk_read_hits: u64,
 }
 
 impl Dsv4PrefixStatePool {
@@ -324,6 +326,8 @@ impl Dsv4PrefixStatePool {
             frontier_tails: BTreeMap::new(),
             clock: 0,
             entry_bytes: entry_bytes.max(1),
+            host_read_hits: 0,
+            disk_read_hits: 0,
         }
     }
 
@@ -384,6 +388,13 @@ impl Dsv4PrefixStatePool {
 
     pub(crate) fn disk_pages(&self) -> usize {
         self.store.disk_pages()
+    }
+
+    pub(crate) fn read_hits(&self) -> infer_seam::KvTierReadHits {
+        infer_seam::KvTierReadHits {
+            host_demoted: self.host_read_hits,
+            disk: self.disk_read_hits,
+        }
     }
 
     /// Insert (LAST producer wins). Host page ids recycle when freed, so a
@@ -540,6 +551,11 @@ impl Dsv4PrefixStatePool {
         );
         let bytes = self.store.read(key)?.into_owned();
         let entry = Dsv4PrefixPageEntry::from_bytes(&bytes)?;
+        if promote {
+            self.disk_read_hits = self.disk_read_hits.saturating_add(1);
+        } else {
+            self.host_read_hits = self.host_read_hits.saturating_add(1);
+        }
         // Read-on-miss promote: a disk-resident entry that restores is hot —
         // re-insert to the host level (its LRU spills something colder), then
         // drop the now-superseded disk record (else the key is double-resident
