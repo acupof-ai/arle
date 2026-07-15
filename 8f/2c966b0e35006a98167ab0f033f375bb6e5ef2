@@ -1,0 +1,23 @@
+CHANGELOG.md
+  s_cbac1d54da53ea::t_e5c3e69baa709b 26-31
+docs/experience/errors/2026-07-15-dsv4-long-context-needle-failure.md
+  s_cbac1d54da53ea::t_cf82a31f48818e 1-64
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "8f2c966b0e35006a98167ab0f033f375bb6e5ef2",
+  "prompts": {},
+  "sessions": {
+    "s_cbac1d54da53ea": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f5e9b-c754-7170-ba19-53745faa66e6",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
