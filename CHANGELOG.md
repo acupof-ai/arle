@@ -23,6 +23,13 @@ Progress spine. Entry classes recorded here the day they land: phase exits,
 default flips, and accept-or-reject verdicts (AGENTS.md §Docs lifecycle &
 progress spine).
 
+- **2026-07-16 — DSv4 FP32 compressor promoted to default.** The FP32
+  main-value compressor (fixes #146 VIOLET-6529→4929, #150 738291→738292) is
+  now always-on, replacing the BF16 compressor for single-prefill. The
+  `ARLE_DSV4_COMPRESSOR_FP32` env flags were removed. Throughput impact:
+  ±0.7% at c=1/4, −1.1% at c=8, −3.6% at c=16 — acceptable for the
+  correctness fix. [bench](docs/experience/wins/2026-07-16-dsv4-fp32-compressor-promotion.md).
+
 - **2026-07-15 — DSv4 long-context correctness blocked.** Full-prefill TP=4
   retrieval became nondeterministic at 5,424 actual prompt tokens and failed
   3/3 at 7,222 tokens for a 50%-depth needle, while the same 7,222-token prompt
