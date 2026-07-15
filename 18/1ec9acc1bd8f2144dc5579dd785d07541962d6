@@ -1,0 +1,25 @@
+CHANGELOG.md
+  s_cbac1d54da53ea::t_b492ebc205b890 26-30
+docs/experience/errors/2026-07-15-dsv4-megamoe-decoded-case-failure.md
+  s_cbac1d54da53ea::t_40a39a0fcdbb65 1-61
+docs/experience/wins/2026-07-14-bench-dsv4-sm90-mega-moe-raw-abi.md
+  s_cbac1d54da53ea::t_61a3409e27d2b1 3,134-136
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "181ec9acc1bd8f2144dc5579dd785d07541962d6",
+  "prompts": {},
+  "sessions": {
+    "s_cbac1d54da53ea": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f5e9b-c754-7170-ba19-53745faa66e6",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
