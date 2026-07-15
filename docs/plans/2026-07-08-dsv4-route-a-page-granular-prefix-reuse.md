@@ -801,7 +801,7 @@ per this directive, not an oversight.
      covering both the compressor and ring/`dsa_official` paths, GLM-5.2
      included.
    - *Performance*: a direct high-concurrency benchmark measuring **TTFT,
-     TPOT (ITL), and throughput** — `scripts/bench_guidellm.sh` (the
+     TPOT (ITL), and throughput** — `scripts/bench_throughput.py` (the
      canonical tool, `AGENTS.md` §Benchmarks), swept across concurrency
      levels (c=1/4/8/16) and at least one long-context production shape, not
      a single smoke shape (distilled lesson: SLO verdict needs the SLO

@@ -7,7 +7,7 @@
 set +e
 
 ROOT=/host/arle-build; ARLE=$ROOT/target/release/arle; MODEL=/host/Qwen3.6-27B-FP8
-PY=/host/guidellm-venv/bin/python
+PY=${PY:-python3}
 WORK=${WORK:-/host/tbench_opd}
 DATASET_PATH=${DATASET_PATH:?set DATASET_PATH to a calibrated task pool}
 ROUNDS=${ROUNDS:-3}; N_ATTEMPTS=${N_ATTEMPTS:-3}; EPOCHS=${EPOCHS:-2}

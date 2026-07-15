@@ -5,7 +5,7 @@
 set +e
 
 ROOT=/host/arle-build; ARLE=$ROOT/target/release/arle; MODEL=/host/Qwen3.6-27B-FP8
-PY=/host/guidellm-venv/bin/python
+PY=${PY:-python3}
 WORK=${WORK:-/host/tb_calib}; PORT=${PORT:-18200}; GPU=${GPU:-0}
 LORA=${LORA:-/host/tb_lora/adapters_replay/adapter_model.safetensors}  # +5pp format fix
 N=${N:-36}; MINC=${MINC:-1}; MAXC=${MAXC:-3}   # full spread by default; band sits at c3

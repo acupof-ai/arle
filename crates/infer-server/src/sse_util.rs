@@ -42,7 +42,7 @@ pub(crate) fn chat_stream_chunk(
 /// OpenAI `stream_options.include_usage` trailer: sent once, after the
 /// finish-reason chunk and before `[DONE]`, with EMPTY `choices` and the
 /// populated `usage` — mirrors vLLM/SGLang so clients that only look for
-/// usage on the empty-choices chunk (guidellm included) find it. `object` is
+/// usage on the empty-choices chunk find it. `object` is
 /// `"text_completion"` (completions) or `"chat.completion.chunk"` (chat).
 pub(crate) fn stream_usage_chunk(
     id: &str,

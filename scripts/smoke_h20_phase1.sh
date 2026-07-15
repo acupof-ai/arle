@@ -3,7 +3,7 @@
 #
 # Expected bundle layout:
 #   ./bin/infer
-#   ./scripts/bench_guidellm.sh
+#   ./scripts/bench_throughput.py
 #   ./infer/models/Qwen3-4B/
 #
 # The default shape matches the Phase 1 W1/H1 longctx c=4 envelope:
@@ -41,8 +41,7 @@ require_tool() {
 require_tool nvidia-smi
 require_tool curl
 require_tool awk
-require_tool jq
-require_tool guidellm
+require_tool python3
 
 if [[ ! -x "$BIN" ]]; then
     echo "error: infer binary is missing or not executable: $BIN" >&2
@@ -112,14 +111,26 @@ until curl -sS -f "$TARGET/v1/models" >/dev/null 2>&1; do
     sleep 2
 done
 
-WORKLOAD=longctx-32k \
-LONGCTX_CONCURRENCIES=4 \
-LONGCTX_MAX_SECONDS=300 \
-LONGCTX_SECONDARY_C1_ONLY=0 \
-"$ROOT/scripts/bench_guidellm.sh" \
-    "$LABEL" \
-    --target "$TARGET" \
-    --model Qwen/Qwen3-4B \
-    --processor "$MODEL_PATH"
+OUTPUT_DIR="$ROOT/bench-output/$(date +%Y-%m-%d)-${LABEL}"
+mkdir -p "$OUTPUT_DIR"
+PROMPTS_JSONL="$OUTPUT_DIR/prompts.jsonl"
+python3 - "$PROMPTS_JSONL" <<'PY'
+import json
+import pathlib
+import sys
 
-echo "H20 Phase 1 smoke complete. Inspect bench-output/ and generated wins entry for success(W1,H2) candidate data."
+pathlib.Path(sys.argv[1]).write_text(
+    json.dumps({"prompt": "token " * 32768}) + "\n",
+    encoding="utf-8",
+)
+PY
+python3 "$ROOT/scripts/bench_throughput.py" \
+    --url "$TARGET" \
+    --model Qwen/Qwen3-4B \
+    --prompts-jsonl "$PROMPTS_JSONL" \
+    --concurrency-grid 4 \
+    --seconds-per-concurrency 300 \
+    --max-tokens 256 \
+    --output "$OUTPUT_DIR/bench_throughput"
+
+echo "H20 Phase 1 smoke complete. Inspect $OUTPUT_DIR for success(W1,H2) candidate data."

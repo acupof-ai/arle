@@ -1,6 +1,6 @@
 # Operator evidence vertical slice — Qwen FP8 dense, 2026-07-10
 
-> Status: Active — H20 probe evidence and GuideLLM engagement gate pending.
+> Status: Active — H20 probe evidence and native benchmark engagement gate pending.
 > P1 update (2026-07-11): backend dispatch counters wired in `quant_linear.rs` — all 4 FP8 dense
 > paths (DeepGEMM, dequant GEMM, GEMV in gemm_batch, GEMV in gemv) increment global atomics.
 > `/v1/stats` now returns real `implementation_hits` + `fallback_count`.
@@ -50,7 +50,7 @@ override it without affecting unknown hardware or shapes.
 | Gate | Result |
 |---|---|
 | seam/core/server tests | 201 run; 200 passed, 1 ignored |
-| GuideLLM stats regression | 1 passed |
+| Native benchmark stats regression | 1 passed |
 | invalid stats JSON | rejected and recorded as `ok:false` |
 | multiprocess stats relay | policy/identity/hit/fallback preserved |
 | generated selector | no exact cells; fallback unchanged |
@@ -78,7 +78,7 @@ override it without affecting unknown hardware or shapes.
 
 - numeric candidate/reference probe with the committed mixed tolerance;
 - same-binary, same-bundle actual-model E2E artifact and independent launch engagement;
-- canonical GuideLLM SLO run and wall-clock delta;
+- canonical native SLO run and wall-clock delta;
 - exact policy/product/bundle identity in `/v1/stats`.
 
 ## Artefacts

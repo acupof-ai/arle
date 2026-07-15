@@ -1,428 +1,178 @@
-# Bench & Trace Specification
+# Benchmark and trace specification
 
-> Process rule for running, recording, and **iterating** on benchmarks and
-> traces. Linked from [`AGENTS.md`](../AGENTS.md) and [`CLAUDE.md`](../CLAUDE.md)
-> §Benchmarks. The fill-in skeleton is
-> [`TEMPLATE-bench-guidellm.md`](experience/wins/TEMPLATE-bench-guidellm.md);
-> this doc governs the process, not the skeleton.
+> Status: Active
 
-**The four things that matter** (28 原则 — these carry 80% of the value):
+This is the reporting and evidence contract for benchmarks, profilers, and
+performance claims. The canonical runner is `scripts/bench_throughput.py`; the
+report skeleton is [`TEMPLATE-bench.md`](experience/wins/TEMPLATE-bench.md).
 
-1. **Every run has a written hypothesis** — the only defence against measurement-bug wins.
-2. **Auto-iterate on information, not schedule** — stop when numbers converge, loop when they don't (§6).
-3. **Profile pairs with bench** — a profile without a bench anchor is rejected (§8).
-4. **Wins log is immutable history** — never overwrite; deltas cite prior (§9).
+## 1. Required report
 
-Everything else is support. If a rule below doesn't serve one of those four, it's optional.
+Every run records these sections:
 
-Scope: canonical guidellm sweeps, supporting component-level helper benches,
-and every trace (nsys, ncu, Metal capture, MLX instruments, `tracing` spans).
-Helpers may inform diagnosis but never replace `scripts/bench_guidellm.sh` as
-the throughput / latency truth source.
+1. **Goal** — one user-visible wall-clock metric and workload.
+2. **Hypothesis** — one mechanism, one treatment, one predicted delta.
+3. **Parameters** — exact command, workload, seed, concurrency, duration or
+   request count, prompt/output token distribution, and server flags.
+4. **Environment** — commit and binary hash, host, GPU, driver, CUDA/Metal,
+   model, dtype, TP/EP, slots, and KV configuration.
+5. **Results** — raw fixed-concurrency rows, completed/incomplete/error counts,
+   output tok/s, req/s, TTFT p50/p99, ITL p50/p99, and A/B delta.
+6. **Problems** — correctness failures, OOM, retries, cache contamination,
+   profiler gaps, and other confounders.
+7. **Learnings** — PASS, KILL, or pending-remote; measured number; next wall.
 
----
+Missing one section means the run does not count.
 
-## 1. Required report sections
+## 2. Goals
 
-Every run produces `docs/experience/wins/YYYY-MM-DD-<kind>-<label>.md` with
-all sections filled. Missing one → the run doesn't count. The `guidellm`
-template mirrors this order so report and template stay aligned.
+Use exactly one primary goal per run:
 
-| # | Section | Content |
-|---|---------|---------|
-| 1 | **Goal** (+ type) | One sentence. Type ∈ {baseline, regression, optimization, diagnosis, ceiling}. |
-| 2 | **Hypothesis** | Expected outcome *before* the run. Enables §6 to judge "was this surprising?". |
-| 3 | **Command** | Exact CLI + env vars + seed. Copy-pasteable. |
-| 4 | **Environment** | GPU/SoC + VRAM, CUDA/Metal version, commit sha (never dirty), feature set, model + weights path. |
-| 5 | **Results** | Raw client-side table first (TTFT p50/p99, ITL p50/p99, tok/s, req/s actual). Then the §3 internal-sources headline counters that the workload exercised. No summaries replacing numbers. Link raw artefacts including service-stats snapshots. |
-| 6 | **Problems** | Anything that degraded, crashed, or deviated from §5 watch-list. Smallest reproducer. |
-| 7 | **Learnings** | Generalizable rules, not run-specific facts. Each actionable: "X bound by Y → tune Z first". |
-| 8 | **Δ vs baseline** | Link prior entry + Δ% row. "First run" if none exists. |
+- **Latency:** TTFT or ITL at a fixed concurrency and request shape.
+- **Throughput:** output tok/s at fixed concurrency, or saturation throughput
+  under an explicit SLO.
+- **Memory:** peak device/host bytes for a fixed workload.
+- **Correctness:** decoded outputs and request status for the failing slice.
+- **Diagnosis:** wall-clock attribution of a named stage.
 
-Acid test: a reviewer should be able to answer "would I get the same numbers
-if I reran this?" from §3 + §4 alone.
+A component kernel speedup is diagnosis, not an end-to-end serving win.
 
----
+## 3. Canonical benchmark
 
-## 2. Tools
-
-Grouped by purpose; prefer the wrapper over the raw CLI so captures land in
-the canonical layout automatically.
-
-**Throughput / latency (canonical):**
-- **`scripts/bench_guidellm.sh <label>`** — params locked in [`plans/guidellm-integration.md`](plans/guidellm-integration.md) §3. Enforces serial runs via `bench-output/.bench_guidellm.lock`; captures `/v1/stats` before/during/after; emits K6 silent-OOM warnings. Variant: `--concurrencies 1,4,16,64 --max-seconds 120` for fixed-c reference comparisons.
-
-**Profile (preferred wrappers, attach-mode):**
-- **`scripts/profile_nsys_guidellm.sh <label>`** — Nsight Systems → `.nsys-rep` + `.sqlite` + stats + summary.
-- **`scripts/profile_ncu_guidellm.sh <label> --family <name>`** — Nsight Compute → `.ncu-rep` + summary.
-
-**Component / fallback:**
-- **`scripts/bench_dsv4_trace_http.py`** — DSv4 HTTP smoke helper for
-  streaming trace bring-up. It emits client-side TTFT / token throughput and,
-  when `--trace-log` points at the service log, collects matching
-  `request_trace` JSON summaries with KV, prefix, scheduler phase, and
-  preprocess snapshots. Keep `--fanout 0` for trace smoke; use explicit fanout
-  only when testing scheduler concurrency.
-- **`scripts/bench_throughput.py`** — legacy synthetic helper; historical reproducibility only.
-- **`scripts/bench_kv_cache*.py`** — internal component checks.
-- **`nsys profile` / `ncu --set full`** — raw CUDA CLIs; wrappers preferred.
-- **Xcode Metal capture / MLX instruments** — Metal → `.gputrace`.
-
----
-
-## 3. Internal information sources
-
-External tools (guidellm, nsys, ncu) report **client-side** views: latency,
-throughput, kernel timeline. They miss the **server-side** state that
-explains *why* those numbers came out. Every wins entry whose workload
-touched a layer below MUST cite the matching counters — that's what makes a
-delta attributable.
-
-### 3.1 `/v1/stats` service trace
-
-> **Rewrite status (2026-06-11):** `infer-server` exposes a minimal JSON
-> `/v1/stats` surface: scheduler counters plus prefix-cache hit counters. SSD
-> KV recall is reported as unavailable because the rewrite serve path has no
-> active SSD recall tier.
-
-Captured automatically by `bench_guidellm.sh` as
-`service_stats_before.txt`, `service_stats_trace.jsonl`,
-`service_stats_after.txt`, plus a summary. Headline counters:
-
-| Layer | Counters | Reads as |
-|-------|----------|----------|
-| Scheduler | `peak active`, `peak waiting`, `peak prefill_queue` | Slot pressure + queueing |
-| KV memory | `peak kv_util` | Did we run hot on KV? |
-| Prefix cache | `prefix_hit_rate`, `prefix_skip_rate` | Was the run cold or warm? |
-| KV transport | `kv_fetch_q`, `kv_fetch_waiters`, `kv_store_q`, `kv_store`, `kv_bp` | Tier I/O backpressure |
-| Tier recall | `tier_recall`, `tier_src`, `tier_promoted`, `tier_fallback` | Multi-tier hit path |
-
-Cite only the counters the workload actually exercised — listing
-zero-valued counters dilutes the report. If `kv_util ≈ 1.0` or
-`prefill_queue` is non-trivial throughout, that fact belongs in §1 row 5,
-not §6.
-
-### 3.2 Scheduling envelope log
-
-> **Rewrite gap (2026-06-10):** the envelope log lived in the deleted
-> monolith's `bootstrap.rs` and has not been re-ported to the rewrite stack.
-> Until it lands, record the resolved scheduling params by hand (flags + env)
-> in the wins entry.
-
-The monolith emitted a
-`Scheduling envelope (resolved | SGLang-equiv)` line at server boot. **Paste
-it verbatim** into the wins entry whenever the run is compared against an
-external reference (SGLang, vLLM, prior commit). Silent param drift
-(e.g. `max_prefill_tokens=2048` vs reference `16384`) is the single most
-common 5× regression — the envelope log is the contract that makes drift
-visible.
-
-### 3.3 Token accounting
-
-GuideLLM reports completed vs incomplete input/output tokens; both go in §1
-row 5 when available. Mismatch between requested and accepted tokens is a
-silent indicator of stream truncation or tokenizer mismatch.
-
-### 3.4 K6 silent-OOM detector
-
-`bench_guidellm.sh:emit_oom_warnings` flags HTTP-200 responses with empty
-output (the K6 failure mode). Useful but **insufficient on its own** — see
-§7.1: the e2e correctness gate also catches HTTP-200 + degenerate-text
-failures (`!!!!!` regression, `47bad713`).
-
----
-
-## 4. Goal types → iteration policy
-
-| Type | Success = | Stop when |
-|------|-----------|-----------|
-| baseline | Data captured | One clean run |
-| regression | Δ within noise band | Within band → done; else diagnosis loop |
-| optimization | Beats noise band AND hypothesis held | §6 stopping rules |
-| diagnosis | Root cause named + reproducer | Root cause in §6 |
-| ceiling | Saturation + bottleneck named | Saturation reached |
-
----
-
-## 5. Watch-list during a run (top-5 — the 80%)
-
-Confirm each before trusting §1 row 5. Deviation → §6 entry.
-
-1. **Warmup.** Discard first 3–5s; cold caches skew TTFT p50.
-2. **Launches per token.** If launches ≈ generated tokens, dispatch is the bottleneck — don't claim a compute ceiling from that shape.
-3. **Determinism.** Same seed twice → TTFT p50 within ±2%. Higher = investigate before publishing.
-4. **Thermal + background noise.** `nvidia-smi dmon` / `powermetrics` for throttling; no other GPU processes.
-5. **Prefix-cache state + tokenizer.** Declare cold/warm in §3 of the entry; verify `prompt_tokens` matches the model tokenizer.
-
-Long tail (memory pressure, client-side saturation, slot misconfig) → §6 if
-encountered, not a pre-run gate.
-
----
-
-## 6. Auto-iteration
-
-**Iterate when** any holds:
-
-| Signal | Action |
-|--------|--------|
-| Variance >5% across repeats | Longer `--max-seconds`, pin clocks; don't trust until <2%. |
-| Result beats hypothesis by >20% | Rerun once — too-good wins are usually measurement bugs. |
-| Result misses hypothesis by >20% | Switch to **diagnosis** goal (profile) before further tuning. |
-| Saturation not reached (req/s still climbing) | Raise `--rate` ceiling. |
-| §5 watch-item deviated | Fix, rerun. Never publish compromised numbers. |
-
-**Stop when all hold:** variance <2% across last 2 runs; hypothesis confirmed
-or falsified with a named reason; §5 clean; Δ% vs prior baseline recorded. A
-clean falsification is a successful run — don't grind for false precision.
-
-**Triggers outside a single task:**
-
-- Optimization commit touching `crates/infer-*/src/`, `crates/cuda-kernels/csrc/`, `crates/mlx-sys/src/` → regression run vs latest baseline. No exceptions.
-- Diagnosis entry without a follow-up fix entry within 14 days = debt → open in `docs/plans/`.
-
----
-
-## 7. Hard-won protocol rules
-
-Codified from 2026-04-28→29 lessons. Each rule fixes a specific, observed
-failure mode of "the bench technically ran but the number was a lie".
-
-### 7.1 Correctness gate before perf reporting
-
-Tok/s is meaningless if the model emits garbage. The TileLang `clear=False`
-regression (`47bad713`) shipped headline numbers while 4-token prompts
-returned `"!!!!!"`. **Gate** every wins entry with one of:
-
-- a passing rewrite-stack integration test on the target backend (e.g.
-  `cargo test -p infer-api --release --features cuda` on the pod), or
-- a curl smoke: 4-token prompt → non-empty, first 5 chars not all identical.
-
-K6 (§3.4) catches "200 + empty"; the e2e test catches "200 + degenerate
-text". Both failure modes have shipped before — don't trust K6 alone.
-
-### 7.2 Sweep ≠ fixed-concurrency
-
-`guidellm --profile sweep` auto-picks 10 strategies linspaced between sync
-and measured throughput. On a 24 GB L4 at 4096-in/256-out, the realised
-sweep is `sync (0.10 r/s) → throughput (0.27 r/s)` — concurrency in flight
-≈ 1×–3× sync. **It does not cover `c=16`,** which is what SGLang/vLLM
-headline numbers usually report. Comparing our sweep "throughput" tok/s to
-their "c=16" tok/s is apples-to-oranges (throughput-mode = unbounded
-saturation, TTFT 13 s; c=16 = bounded in-flight, TTFT 1–2 s).
-
-**Rule:** match the reference's concurrency model.
-- `bench_guidellm.sh <label> --concurrencies 1,4,16,64 --max-seconds 120` — fixed-c vs reference.
-- `bench_guidellm.sh <label>` (canonical sweep) — load-curve characterization.
-
-Both valid; they answer different questions. The wins entry must state
-which.
-
-### 7.3 Duration adequacy
-
-Single-run tok/s variance scales with √(samples). At c=16 a 30 s run admits
-~10–15 requests; 60 s → ~30; 120 s → ~60. At `--fast` (30 s) we measured
-σ ≈ 50 tok/s on the headline metric — too noisy for delta attribution.
-
-| Purpose | Min duration |
-|---------|--------------|
-| Iteration / smoke | `--fast` (30 s c=16) |
-| Wins-entry headline | 60 s (sweep default) |
-| Fixed-c vs reference | 120 s + n=3 if variance |
-| Long-context (prompt ≥ 8k) | 180 s |
-| Decode-bound (small prompt, long output) | 60 s + n=3 |
-
-Variance >10% across n=3 → double the duration before publishing.
-
-### 7.4 Param alignment with reference
-
-Every run compared against an external reference must paste the §3.2
-scheduling envelope log verbatim. Drift like `max_prefill_tokens=2048` vs
-reference `16384` is silent and costs ~5× TTFT — the F4 fix (`8f6965c3`)
-was driven by exactly this.
-
-### 7.5 Server lifecycle hygiene
-
-- Stale lock after a killed run: `rm -f bench-output/.bench_guidellm.lock`.
-- Slot leak when client disconnects mid-stream (K7 — see [`projects/2026-04-29-perf-bug-roundup.md`](projects/2026-04-29-perf-bug-roundup.md)). Restart server between sessions when status is uncertain; verify `/v1/stats` shows `active=0 waiting=0` before re-running.
-
-### 7.6 Roofline gate — measured tok/s < 5% of theoretical peak → default KILL
-
-Codified from 2026-05-27 DSv4 GEMV-at-prefill incident
-(`docs/experience/errors/2026-05-27-dsv4-tp-allreduce-slo-prefill-kill.md`).
-The 2026-05-25 `dsv4-longseq-prefill-decode-split` wins entry shipped
-196 tok/s/rank prefill = **0.42% of H20 BF16 peak** (FLOPS-roofline
-46,250 tok/s/rank for DSv4-Flash per-token compute). It was called
-PASS because the entry goal was only "don't OOM and don't decode
-regress" — no roofline check. Two days later the same kernel shape
-re-surfaced as a 67× SLO miss.
-
-**Rule:** every wins/errors entry that reports throughput MUST compute
-achieved-vs-peak ratio:
-
-- **Compute-bound op** (prefill GEMM, attention QK): achieved TFLOPS
-  vs theoretical peak (BF16/FP8 SM peak × num_GPUs × utilization
-  budget 70%).
-- **Memory-bound op** (decode GEMV, KV streaming): achieved
-  GB/s vs HBM peak (e.g. H20 ~1.6 TB/s, MI300 ~5.3 TB/s).
-
-If achieved < **5% of peak**, the entry defaults to **KILL**
-regardless of relative-vs-baseline framing. The only way to PASS
-under 5% is an explicit "deferred — accept uncertainty" annotation
-that names the root-cause hypothesis and the next investigation step.
-
-Why 5%: the GEMV-at-prefill bug ran at 0.42% (>10× below threshold);
-modest baselines on suboptimal kernels run 30–60%; well-tuned kernels
-run 60–85%. 5% is the floor below which something is structurally
-wrong with the kernel shape, dispatch, or path, not a tuning gap.
-
-Cross-check with `framing trap rule` (CLAUDE.md §0): nsys "X% of NVTX
-window" tells you what fraction of wall-clock the kernel consumed,
-not whether the kernel itself runs at acceptable efficiency. Both
-checks must pass.
-
-### 7.7 SLO-shape probe before declaring win
-
-A bench at c=1 / short prompt validates the dispatch path. It does
-NOT validate scaling behavior. The 2026-05-27 incident:
-`a98c3dde` win entry (c=1 short decode 2.21× TP/allreduce vs EP)
-projected to SLO 32K prefill = **67× off** because the kernel that's
-fast at M=1 is bandwidth-bound at M=large.
-
-**Rule:** any wins entry claiming a default-flag-flip or backend
-switch must include at least one probe at:
-
-- M ≥ 4096 (prefill scaling — surface weight-reuse / M-tile bugs)
-- batch ≥ 4 concurrent requests (NCCL / scheduler contention surface)
-- prompt ≥ 8K tokens (KV pool sizing — surface OOM-near-SLO bugs)
-
-Single-row entry header `SLO-shape probed?` (Y/N + workload) is
-mandatory. N → defaults to deferred, never PASS, never default-flip.
-
-### 7.8 DSv4 throughput baselines must be profiling-OFF
-
-Codified from the 2026-06-16 DSv4 c1-8 baseline correction: launching a
-throughput run with `ARLE_DSV4_DECODE_PHASE_TIME=1` and/or
-`ARLE_DSV4_LINEAR_PROFILE=1` inserts per-step `cudaStreamSynchronize`
-work and understated tok/s by about 25-35%. Those knobs are valid for
-diagnosis, not for baseline throughput claims.
-
-**Rule:** every DSv4 throughput/latency baseline must state profiling
-state in the command/environment block. Baselines and default-flip
-evidence require profiling OFF: no `ARLE_DSV4_DECODE_PHASE_TIME`, no
-`ARLE_DSV4_LINEAR_PROFILE`, and no equivalent sync-profile guard. The
-canonical `scripts/bench_guidellm.sh` wrapper fail-fast checks those two
-env vars; override with `ARLE_ALLOW_PROFILED_BENCH=1` only for an
-explicitly labeled profiling-contaminated diagnostic run.
-
-### 7.9 Bench reports 0 successful → CHECK SERVER LOG FIRST
-
-Codified from the 2026-05-10 PF8.5 v3-v10 cascade (skill
-`kernel-optimization` v1.12.0 #34b): when guidellm or any other
-client-side bench tool reports "0 successful requests" or "all-zero
-latency table", the temptation is to debug the bench tool's CLI quirks
-(missing flag, wrong path, save crash). v3-v10 wasted 30+ min on this
-path before the actual cause — kernel 100% failure under sustained load
-visible in `/tmp/<server>.log` line 627 — was discovered.
-
-**Rule:** when bench reports 0 success, **check server log FIRST**
-before chasing tool issues. Run:
+Published results use a checked JSONL workload:
 
 ```bash
-scripts/pf83_bench_health.sh <bench-output-dir> [<server-log-path>]
+python3 scripts/bench_throughput.py \
+  --url http://127.0.0.1:8000 \
+  --model <model> \
+  --prompts-jsonl <workload.jsonl> \
+  --concurrency-grid 1,4,8,16 \
+  --seconds-per-concurrency 120 \
+  --max-tokens <n> \
+  --seed 20260416 \
+  --output bench-output/<label>/bench
 ```
 
-The script outputs a 3-line verdict + exit code that branches you to
-`debug-kernel` (substrate KILL signal) vs `debug-tool` (bench-tool
-quirk) vs `proceed-license`. Cheap (single-shot diagnostic), saves the
-30+min trap.
+`--requests-per-concurrency` may replace the duration for short deterministic
+runs. Synthetic prompts are smoke-only. They may repeat prefixes and therefore
+cannot license cache-sensitive changes.
 
----
+The JSON artifact is the source of truth. CSV is a view. Preserve both.
 
-## 8. Profile document format
+### 3.1 Matched A/B
 
-Profile = trace-driven investigation (nsys/ncu/Xcode/MLX). Bench asks "how
-fast?", profile asks "why?". Lives in `wins/` (or `errors/` on bug
-discovery).
+Keep fixed:
 
-Filename: `YYYY-MM-DD-profile-<backend>-<model>-<what>.md`
+- checkout, binary, machine, GPU clocks, and server lifecycle;
+- model, dtype, TP/EP, slots, KV settings, and all unrelated flags;
+- JSONL workload, request order, concurrency, duration, output cap, and seed.
 
-Required sections (§1 plus these):
+Change one treatment variable. Run baseline and treatment from the same shell,
+side by side. If the observed delta is below 5% or overlaps run variance, use
+at least three trials per arm and report median plus range.
 
-- **Capture params** — tool + command + window (e.g. "200 ms steady-state, slot 4")
-- **Bench anchor** — link to the bench entry this profile explains, same commit + workload. Orphan profile = rejected.
-- **Top-N kernels** — table: kernel | calls | total µs | avg µs | % of frame
-- **Launches per token** — mandatory for decode profiles
-- **Roofline** — achieved TFLOPs or mem-GB/s vs theoretical peak
-- **Findings** — each = bottleneck + evidence line + proposed fix
+### 3.2 Scheduling envelope
 
-Rules: one profile, one question; scope capture to ≤1 s of steady state;
-never commit raw `.nsys-rep`/`.ncu-rep`/`.gputrace` (hundreds of MB — keep
-under `bench-output/`, cite sha256); small annotated timeline PNGs (<500 KB)
-under `experience/wins/assets/<date>-<slug>/` are encouraged.
+For every point record:
 
----
+- offered concurrency and completed request count;
+- prompt and completion token min/p50/max;
+- active, queued, retry, prefix-hit, and KV residency counters from `/v1/stats`;
+- incomplete, errored, timed-out, or empty responses.
 
-## 9. Folder layout
+If these differ materially across A/B, the comparison is invalid until
+explained.
 
+## 4. Correctness gate
+
+Before timing:
+
+1. run one non-degenerate prompt through the same endpoint and flags;
+2. require non-empty, completed, non-repeating output;
+3. inspect decoded outputs on every failing slice;
+4. confirm request errors and timeouts are not counted as valid samples.
+
+For a new kernel, quantization path, rollback path, or speculative decoder, also
+run the model-specific correctness gate. Token identity against another kernel
+is not required when MoE non-determinism applies; coherent autoregressive output
+and the model-specific gate are required.
+
+## 5. Server and cache hygiene
+
+- Run one benchmark process at a time.
+- Start each arm from the declared cache state. For cache-independent claims,
+  use unique prompts or restart and prove zero prefix hits.
+- Do not reuse a server after OOM, assertion, NCCL failure, or allocator
+  corruption.
+- Capture server logs and `/v1/stats` before and after every point.
+- A 200 response with empty output, missing usage, incomplete stream, or retry
+  exhaustion is a failure, not throughput.
+- ITL is valid only when each non-empty SSE event carries one completion token;
+  the runner rejects event/token count mismatches instead of reporting chunk latency.
+- Cold-load time is separate from request TTFT. Report it independently.
+
+## 6. Duration and stop rules
+
+Use 120 seconds per concurrency by default. A shorter run counts only when it
+completes enough work for stable medians and the report states why. Extend or
+repeat when:
+
+- the first and second halves differ by more than 5%;
+- queue depth, prefix-hit rate, or memory residency is still moving;
+- the treatment delta is within normal variance;
+- fewer than 20 completed requests contribute to a reported point.
+
+Stop and fix the harness or server when any request is incomplete, errored, or
+empty. Do not average through failures. Stop exploring a treatment after a
+controlled wall-clock KILL unless a new measurement changes the mechanism.
+
+## 7. Tracing
+
+Use traces to attribute an end-to-end result:
+
+```bash
+scripts/profile_nsys_bench.sh <label> --model <model> \
+  --prompts-jsonl <workload.jsonl> --concurrency-grid 4 \
+  --seconds-per-concurrency 60
+scripts/profile_ncu_bench.sh <label> --family <kernel-family> --model <model> \
+  --prompts-jsonl <workload.jsonl> --concurrency-grid 4 \
+  --seconds-per-concurrency 60
 ```
-ARLE/
-├── AGENTS.md / CLAUDE.md            ← link this spec
-├── docs/
-│   ├── bench-and-trace-spec.md      ← THIS FILE (process)
-│   ├── perf-and-correctness-gates.md← pass/fail thresholds (what)
-│   ├── plans/guidellm-integration.md← canonical params
-│   └── experience/
-│       ├── wins/                    ← bench + profile entries; immutable
-│       │   ├── TEMPLATE-bench-guidellm.md
-│       │   ├── YYYY-MM-DD-bench-<label>.md
-│       │   ├── YYYY-MM-DD-profile-<backend>-<model>-<what>.md
-│       │   └── assets/<date>-<slug>/← small PNGs only
-│       └── errors/                  ← bench that surfaced a bug
-├── bench-output/                    ← gitignored; raw + service_stats_*
-├── benchmarks/                      ← committed baseline JSONs (small)
-└── scripts/
-    ├── bench_guidellm.sh            ← canonical throughput / latency
-    ├── profile_nsys_guidellm.sh     ← Nsight Systems wrapper
-    ├── profile_ncu_guidellm.sh      ← Nsight Compute wrapper
-    └── bench_throughput.py          ← legacy helper
-```
 
-**Three locations, three rules:**
+Every trace reports both:
 
-1. `docs/experience/wins/` — **immutable**, one file per run. Superseded findings = new dated entry citing the old.
-2. `bench-output/` — **raw, ephemeral, gitignored**. Large artefacts → shared storage; cite URL + sha256.
-3. `benchmarks/*.json` — **committed baselines** (small). Update = deliberate commit.
+- time inside the selected NVTX or kernel window;
+- that time divided by per-request or whole-run wall clock.
 
----
+Host/GPU overlap claims require timestamps on the same timeline: request start,
+host enqueue begin/end, CUDA event or kernel begin/end, synchronization, and
+response completion. A visual overlap alone is not proof. Export the timeline
+or SQLite rows used for the calculation.
 
-## 10. Handshake with the rest of docs/
+Nsight Compute is a kernel microbenchmark. Pair it with the fixed-concurrency
+native benchmark before claiming serving impact.
 
-| Kind | Role | Handshake |
-|------|------|-----------|
-| **Intent** — `projects/`, `plans/`, `research/`, `reviews/` | Describe *what we want* | **Cite** wins entries as evidence; never duplicate numbers. Plan acceptance gates name a specific wins entry. |
-| **Reality** — `experience/wins/`, `experience/errors/` | Record *what happened* | Implement §1 + §8. Errors/ for regressions; wins/ otherwise. |
-| **Thresholds** — `perf-and-correctness-gates.md` | Define pass/fail | This spec defines **how** to measure them. |
-| **Params** — `plans/guidellm-integration.md` §3 | Lock canonical flags | This spec forbids per-run override. |
-| **Numbers** — `bench-output/`, `benchmarks/*.json` | Hold data | Wins entries link into them. |
+## 8. Licensing
 
-One-line: **intent describes, experience records, artefacts hold, this spec
-governs how reality becomes a trustworthy record.**
+A performance change is licensed only when:
 
----
+1. correctness passes;
+2. the matched A/B scheduling envelope aligns;
+3. the named wall-clock metric improves on the target workload;
+4. no TTFT, ITL, throughput, memory, or failure-rate regression violates the
+   stated SLO;
+5. raw JSON/CSV, logs, and any profiler artifacts are preserved;
+6. a dated `wins/` or `errors/` entry links the baseline and treatment.
 
-## 11. PR checklist
+Use the conservative framing when component and wall-clock percentages disagree.
+The per-request result wins.
 
-```
-- [ ] Goal stated (type: baseline/regression/opt/diagnosis/ceiling)
-- [ ] Hypothesis recorded before the run
-- [ ] §1 wins entry committed (profile? also §8 skeleton + bench anchor)
-- [ ] Env pinned: GPU, driver, commit sha, features, weights
-- [ ] §3 internal sources cited (service trace, envelope log if vs reference)
-- [ ] DSv4 throughput state pinned: profiling OFF, or explicitly labeled contaminated
-- [ ] Raw artefacts in bench-output/<date>-<label>/; sha256 cited
-- [ ] §5 watch-list reviewed
-- [ ] §6 stopping rules satisfied (or iteration rationale stated)
-- [ ] §7 protocol respected (correctness gate, sweep-vs-c, duration, envelope, lifecycle)
-- [ ] Δ% vs prior baseline
-- [ ] Cross-link: project/plan/review that commissioned the run
-```
+## 9. Repository lifecycle
+
+Runtime and benchmark-parameter changes require a dated report under
+`docs/experience/wins/` or `docs/experience/errors/`. If hardware is unavailable,
+commit a `pending-remote` report naming the exact remote gate. Documentation and
+dev-only tooling are exempt; state the exemption in the commit body.
+
+Never overwrite a report. An after report links its baseline and reports the
+delta. Update CHANGELOG on a phase exit, default flip, or license-or-kill verdict.

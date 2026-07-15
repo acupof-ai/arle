@@ -970,7 +970,7 @@ mod tests {
     }
 
     #[test]
-    fn text_completions_allow_streaming_for_guidellm() {
+    fn text_completions_allow_streaming_clients() {
         let request: CompletionRequest = serde_json::from_value(json!({
             "prompt": "hello",
             "stream": true,

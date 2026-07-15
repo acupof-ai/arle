@@ -7,7 +7,7 @@
 #   make build-metal              # macOS / Apple Silicon → target/release/arle
 #   make check-metal              # CI-mirrored Metal checks (infer-api lib + CLI surface)
 #   make test-metal               # CI-mirrored Metal tests (cli crate + smoke)
-#   make bench-metal              # canonical guidellm bench (Qwen3.6 default)
+#   make bench-metal              # native throughput bench (Qwen3.6 default)
 #   make build-cuda               # Linux / NVIDIA GPU → target/release/arle
 #   make check-cuda               # Mac-safe CUDA-Rust typecheck (no nvcc needed)
 #   make test                     # any platform (CPU-only, CI-mirrored)
@@ -38,7 +38,7 @@ test-metal:
 	cargo test -p arle --release --no-default-features --features metal,no-cuda,cli --test cli_smoke
 
 bench-metal:
-	./scripts/bench_guidellm.sh make-bench-metal --model $(METAL_MODEL)
+	python3 scripts/bench_local_metal.py http://localhost:8000 $(METAL_MODEL)
 
 # ── CUDA (Linux / NVIDIA GPU) ─────────────────────────────────────────────────
 # sccache (when installed) wraps both rustc and nvcc — including the TileLang

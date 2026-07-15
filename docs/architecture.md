@@ -231,7 +231,7 @@ require a dated entry under `docs/experience/wins/` or `errors/` per
 
 | Layer touched | Minimum verify | Notes |
 | --- | --- | --- |
-| `crates/cuda-kernels/csrc/` or `crates/cuda-kernels/src/` | `cargo test --release -p cuda-kernels --features cuda` + the affected `infer-cuda` path | Bench: `scripts/bench_guidellm.sh` for perf claims; kernel heat map in [`crates/cuda-kernels/AGENTS.md`](../crates/cuda-kernels/AGENTS.md) |
+| `crates/cuda-kernels/csrc/` or `crates/cuda-kernels/src/` | `cargo test --release -p cuda-kernels --features cuda` + the affected `infer-cuda` path | Bench: `scripts/bench_throughput.py` for perf claims; kernel heat map in [`crates/cuda-kernels/AGENTS.md`](../crates/cuda-kernels/AGENTS.md) |
 | `crates/infer-core/` (scheduler / RadixCache / chunked prefill) | `cargo test --release -p infer-core` | One `Engine<E,K>` drives both backends — a scheduler change touches all of them |
 | `crates/infer-cuda/` (CUDA executor, model, TP/EP, DSv4) | `cargo test --release -p infer-cuda --features cuda` (GPU) | Golden parity validated on the multi-GPU pod, not locally on a Mac |
 | KV quant / paged KV gating (`crates/infer-cuda/`) | `cargo test --release -p infer-cuda --features cuda` (GPU) | See AGENTS.md §Build & run |

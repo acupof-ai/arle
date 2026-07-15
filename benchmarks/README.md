@@ -1,7 +1,7 @@
 # Benchmark snapshots
 
 Committed, distilled bench results — the single source of truth for the headline
-numbers shown on the [README front door](../README.md#performance). Raw guidellm
+numbers shown on the [README front door](../README.md#performance). Raw native
 artefacts (json / csv / html per run) stay in the gitignored `bench-output/`;
 this folder keeps only the distilled headline metrics, version-controlled, each
 row traceable to a dated [`docs/experience/wins/`](../docs/experience/wins/) entry.
@@ -59,6 +59,7 @@ not re-measured here — provenance is the linked wins):
   locally-cached MLX model in turn, c=1, strictly serial), then distil the
   `RESULT:` lines into a dated `snapshots/<date>-<label>.json` and update the
   tables above.
-- **Canonical guidellm sweep** (CUDA/Metal, produces a wins entry):
-  `scripts/bench_guidellm.sh <label>` — raw artefacts land in `bench-output/`;
+- **Canonical serving benchmark** (CUDA/Metal, produces a wins entry):
+  `python3 scripts/bench_throughput.py ... --output bench-output/<label>/bench`
+  — raw JSON and CSV land in `bench-output/`;
   copy the headline table into a snapshot here and link the wins entry.
