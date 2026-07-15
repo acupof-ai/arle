@@ -1,6 +1,6 @@
 # DSv4 SM90 MegaMoE TP4
 
-> Status: Shipped — opt-in licensed on 4x H20; default unchanged.
+> Status: Superseded by [the decoded-case correctness failure](../errors/2026-07-15-dsv4-megamoe-decoded-case-failure.md); default remains allreduce.
 
 ## Goal
 
@@ -131,5 +131,6 @@ the token-sharded, fixed-concurrency serving A/B licensed the path.
 
 ## Delta vs baseline
 
-Opt-in MegaMoE is licensed for H20 TP4. Defaults stay on allreduce until a
-second production shape and repeated-run variance gate pass.
+The performance result stands, but the opt-in license is revoked: a broader
+native A/B found a deterministic decoded-case failure. Default remains
+allreduce until MegaMoE matches the baseline on that case and a repeated suite.

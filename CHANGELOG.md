@@ -23,12 +23,11 @@ Progress spine. Entry classes recorded here the day they land: phase exits,
 default flips, license-or-kill verdicts (AGENTS.md §Docs lifecycle & progress
 spine).
 
-- **2026-07-15 — DSv4 MegaMoE licensed opt-in on H20 TP=4.** DeepGEMM PR #323
-  now owns fused dispatch/L1/L2/combine. Token sharding removed 4x duplicate TP
-  expert work; 1K/256 output throughput improved **+15.7%/+21.6%/+39.4%/+7.4%**
-  at c=1/4/8/16 with zero request errors. A fresh fixed-c16 run measured
-  **79.97→148.74 tok/s**, while cache-independent ITL improved 2.8%. Default
-  remains allreduce. [bench](docs/experience/wins/2026-07-14-bench-dsv4-sm90-mega-moe-raw-abi.md).
+- **2026-07-15 — DSv4 MegaMoE opt-in license revoked.** A no-prefix native A/B
+  measured c16 **177.20→256.56 tok/s (+44.8%)**, but one decoded case entered a
+  deterministic attractor on MegaMoE and passed on allreduce; direct replay
+  reproduced it 5/5 times. Performance passes, correctness blocks use. Default
+  remains allreduce. [error](docs/experience/errors/2026-07-15-dsv4-megamoe-decoded-case-failure.md).
 
 - **2026-07-14 — DSv4 DSpark TP=4 concurrency licensed.** Loading the already
   EP4/TP4-sharded draft before KV planning replaced a false 19.9 GB/rank reserve
