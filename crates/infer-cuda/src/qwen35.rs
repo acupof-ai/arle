@@ -2707,7 +2707,7 @@ impl Qwen35Model {
                 "Qwen3.5 MTP spec-decode is single-GPU only for now \
                  (TP-sharded MTP draft head not yet wired)"
             );
-            let head = load_qwen35_mtp_head(&loader, &ctx, &m)?;
+            let head = load_qwen35_mtp_head(&loader, &ctx, &m, &split, &tp_cfg)?;
             qwen35_startup_log(
                 "mtp_head",
                 mtp_t0,
@@ -3741,10 +3741,6 @@ impl Qwen35Model {
         let Qwen35Attn::Full(full_attn) = &layer.attn else {
             unreachable!("MTP head layer is always full attention");
         };
-        let mlp = layer
-            .mlp
-            .as_ref()
-            .ok_or_else(|| anyhow!("MTP head layer missing dense MLP"))?;
 
         let mut normed = HiddenStates::zeros(&self.ctx, hidden, 1)?;
         rms_norm_offset(&self.ctx, &h_fc, &layer.input_layernorm, eps, &mut normed)?;
@@ -3774,7 +3770,27 @@ impl Qwen35Model {
             &mut normed,
         )?;
         let mut mlp_out = HiddenStates::zeros(&self.ctx, hidden, 1)?;
-        self.dense_mlp(mlp, &normed, &mut ws.dense, &mut mlp_out)?;
+        if let Some(moe) = &layer.moe {
+            let moe_cfg = self
+                .moe_config
+                .as_ref()
+                .ok_or_else(|| anyhow!("MTP MoE layer but no moe_config"))?;
+            crate::moe::moe_forward_into(
+                &self.ctx,
+                moe,
+                &normed,
+                moe_cfg,
+                &self.expert_split,
+                &mut ws.moe,
+                &mut mlp_out,
+            )?;
+        } else {
+            let mlp = layer
+                .mlp
+                .as_ref()
+                .ok_or_else(|| anyhow!("MTP head layer missing MLP"))?;
+            self.dense_mlp(mlp, &normed, &mut ws.dense, &mut mlp_out)?;
+        }
         let mut h_layer = HiddenStates::zeros(&self.ctx, hidden, 1)?;
         add_batch(&self.ctx, &hidden_mid, &mlp_out, &mut h_layer)?;
 
@@ -7351,16 +7367,18 @@ fn load_v_head_f32_sharded(
         .map_err(|e| anyhow!("upload sharded per-v-head f32 {name}: {e}"))
 }
 
-/// Load the NextN-MTP draft head (single-GPU): one Full-attention + dense-MLP
-/// transformer block, the `fc` concat-projection, two pre-`fc` RMSNorms, and the
-/// final pre-lm_head RMSNorm. Mirrors the single-GPU Full-attn + dense-MLP
-/// branches in the main loader (`load_matrix_quant_aware` auto-detects FP8 vs
-/// BF16 per tensor). `lm_head`/`embed_tokens` are SHARED with the base model and
-/// are not reloaded here.
+/// Load the NextN-MTP draft head (single-GPU): one Full-attention transformer
+/// block, the `fc` concat-projection, two pre-`fc` RMSNorms, and the final
+/// pre-lm_head RMSNorm. The block's FFN is MoE when the base model is MoE
+/// (`m.is_moe()`), mirroring the trunk layer's `load_moe_layer_experts`;
+/// otherwise a dense MLP. `lm_head`/`embed_tokens` are SHARED with the base
+/// model and are not reloaded here.
 fn load_qwen35_mtp_head(
     loader: &SafetensorLoader,
     ctx: &DeviceContext,
     m: &Qwen35Config,
+    split: &ExpertSplit,
+    tp: &TpConfig,
 ) -> Result<Qwen35MtpHead> {
     let names = m.mtp_tensor_names();
     let Qwen35AttentionTensorNames::Full(full) = &names.layer.attention else {
@@ -7374,18 +7392,31 @@ fn load_qwen35_mtp_head(
         q_norm: loader.load_vec(ctx, &full.q_norm)?,
         k_norm: loader.load_vec(ctx, &full.k_norm)?,
     }));
-    let mlp = DenseMlp {
-        gate_proj: loader.load_matrix_quant_aware(ctx, &names.layer.common.mlp_gate_proj)?,
-        up_proj: loader.load_matrix_quant_aware(ctx, &names.layer.common.mlp_up_proj)?,
-        down_proj: loader.load_matrix_quant_aware(ctx, &names.layer.common.mlp_down_proj)?,
+    let (mlp, moe) = if m.is_moe() {
+        let moe = loader.load_moe_layer_experts(
+            ctx,
+            &names.layer.common.moe_tensor_names(),
+            split,
+            tp,
+            m.moe_intermediate_size,
+            m.hidden_size,
+        )?;
+        (None, Some(moe))
+    } else {
+        let mlp = DenseMlp {
+            gate_proj: loader.load_matrix_quant_aware(ctx, &names.layer.common.mlp_gate_proj)?,
+            up_proj: loader.load_matrix_quant_aware(ctx, &names.layer.common.mlp_up_proj)?,
+            down_proj: loader.load_matrix_quant_aware(ctx, &names.layer.common.mlp_down_proj)?,
+        };
+        (Some(mlp), None)
     };
     let layer = Qwen35Layer {
         input_layernorm: loader.load_vec(ctx, &names.layer.common.input_layernorm)?,
         attn,
         post_attention_layernorm: loader
             .load_vec(ctx, &names.layer.common.post_attention_layernorm)?,
-        mlp: Some(mlp),
-        moe: None,
+        mlp,
+        moe,
     };
     Ok(Qwen35MtpHead {
         pre_fc_norm_embedding: loader.load_vec(ctx, &names.pre_fc_norm_embedding)?,

@@ -91,6 +91,16 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn gemm_bf16_f32_cuda(
+        W: *const Half,
+        X: *const Half,
+        Y: *mut f32,
+        M: i32,
+        N: i32,
+        K: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn gemm_graphsafe_cuda(
         W: *const Half,
         X: *const Half,

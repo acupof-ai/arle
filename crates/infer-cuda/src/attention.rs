@@ -19,7 +19,8 @@ use infer_seam::{KvBatchDescriptor, KvBatchRowKind};
 use std::sync::atomic::{AtomicI8, Ordering};
 
 use crate::dsv4::{
-    Dsv4Attention, Dsv4Compressor, Dsv4ForwardKeepalive, Dsv4Indexer, Dsv4MlaKvArena,
+    Dsv4Attention, Dsv4Compressor, Dsv4CompressorFp32Probe, Dsv4ForwardKeepalive, Dsv4Indexer,
+    Dsv4MlaKvArena,
 };
 use crate::loader::PageMeta;
 use crate::moe_config::ExpertSplit;
@@ -81,6 +82,8 @@ pub(crate) fn set_dsv4_fused_wqkv_decode_override(enabled: Option<bool>) {
 }
 
 static DSV4_VERIFY_FROZEN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static DSV4_COMPRESSOR_FP32_LOGGED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 /// Frozen-KV MTP verify: while set, `mla_attention` SKIPS `dsv4_compressor_update`
@@ -1698,6 +1701,18 @@ fn dsv4_proj_batched_bf16_forced() -> Result<bool> {
 /// gates on `Dsv4Attention::mla_proj_bf16` presence.
 pub(crate) fn dsv4_mla_proj_bf16_enabled() -> Result<bool> {
     env_flag("ARLE_DSV4_MLA_PROJ_BF16")
+}
+
+/// Diagnostic only: enable the preloaded single-prefill main-value discriminator.
+/// The shared-file switch permits same-process A/B without reloading the model.
+pub(crate) fn dsv4_compressor_fp32_enabled() -> Result<bool> {
+    Ok(env_flag("ARLE_DSV4_COMPRESSOR_FP32")?
+        || std::path::Path::new("/tmp/arle-dsv4-compressor-fp32").exists())
+}
+
+/// Diagnostic-only load gate. PRELOAD retains probe weights without enabling it.
+pub(crate) fn dsv4_compressor_fp32_preload_enabled() -> Result<bool> {
+    Ok(env_flag("ARLE_DSV4_COMPRESSOR_FP32_PRELOAD")? || env_flag("ARLE_DSV4_COMPRESSOR_FP32")?)
 }
 
 /// Batched-decode CSA select-metadata DEVICE build (default OFF). When ON, the
@@ -7581,6 +7596,172 @@ fn sparse_indexed_index_key_forward(
     Ok(())
 }
 
+/// FP32 main-value discriminator (diagnostic). Re-runs the compressor forward in
+/// FP32 — BF16 input projections via cuBLASLt FP32-accumulate GEMM, FP32 APE, FP32
+/// state carry — to isolate whether the BF16/FP8 fast path is the source of a
+/// value mismatch. Writes the BF16 overlap carry + compressed output back into
+/// `state` so the downstream attention reads the FP32-discriminated values.
+///
+/// Gated to a single prefill (`start_pos == 0`, no prior compressed state, no
+/// precomputed/deferred paths); the decode fast path is unchanged.
+#[allow(clippy::too_many_arguments)]
+fn compressor_fp32_probe(
+    ctx: &DeviceContext,
+    config: &DeepSeekV4Config,
+    compressor: &Dsv4Compressor,
+    probe: &Dsv4CompressorFp32Probe,
+    hidden: &HiddenStates,
+    state: &mut Dsv4CompressorState,
+    head_dim: usize,
+    ratio: usize,
+    width: usize,
+    overlap: bool,
+    token_count: usize,
+    compressed_rows: usize,
+    apply_rope: bool,
+    rope_original_seq_len: i32,
+    keepalive: &mut Dsv4ForwardKeepalive,
+) -> Result<()> {
+    let _nvtx = crate::nvtx::range("dsv4/compressor_fp32_probe");
+    ensure!(
+        probe.wkv.cols == hidden.hidden_dim && probe.wgate.cols == hidden.hidden_dim,
+        "DSv4 compressor FP32 projection K mismatch"
+    );
+    ensure!(
+        probe.ape.len() == ratio * width,
+        "DSv4 compressor FP32 APE len {} != ratio*width {}",
+        probe.ape.len(),
+        ratio * width
+    );
+    if DSV4_COMPRESSOR_FP32_LOGGED
+        .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
+    {
+        let rank = std::env::var("INFER_TP_RANK")
+            .or_else(|_| std::env::var("ARLE_TP_RANK"))
+            .unwrap_or_else(|_| "0".into());
+        eprintln!(
+            "[rank {rank}] ARLE_DSV4_COMPRESSOR_FP32 engaged: single-prefill main-value discriminator; negative does not reject persistent FP32 state"
+        );
+    }
+    let elems = width * token_count;
+    let mut kv_raw = ctx
+        .stream
+        .alloc_zeros::<f32>(elems)
+        .map_err(|e| anyhow!("DSv4 compressor FP32 kv alloc failed: {e}"))?;
+    let mut score_raw = ctx
+        .stream
+        .alloc_zeros::<f32>(elems)
+        .map_err(|e| anyhow!("DSv4 compressor FP32 score alloc failed: {e}"))?;
+    let mut pending_kv = ctx
+        .stream
+        .alloc_zeros::<f32>(ratio * width)
+        .map_err(|e| anyhow!("DSv4 compressor FP32 pending kv alloc failed: {e}"))?;
+    let mut pending_score = ctx
+        .stream
+        .alloc_zeros::<f32>(ratio * width)
+        .map_err(|e| anyhow!("DSv4 compressor FP32 pending score alloc failed: {e}"))?;
+    let mut prev_kv = ctx
+        .stream
+        .alloc_zeros::<f32>(ratio * head_dim)
+        .map_err(|e| anyhow!("DSv4 compressor FP32 overlap kv alloc failed: {e}"))?;
+    let mut prev_score = ctx
+        .stream
+        .alloc_zeros::<f32>(ratio * head_dim)
+        .map_err(|e| anyhow!("DSv4 compressor FP32 overlap score alloc failed: {e}"))?;
+    {
+        let (wkv, _wg0) = probe.wkv.data.device_ptr(&ctx.stream);
+        let (wgate, _wg1) = probe.wgate.data.device_ptr(&ctx.stream);
+        let (x, _xg) = hidden.data.device_ptr(&ctx.stream);
+        let (kv, _kg) = kv_raw.device_ptr_mut(&ctx.stream);
+        let (score, _sg) = score_raw.device_ptr_mut(&ctx.stream);
+        // SAFETY: dense BF16 matrices and outputs match the checked M/N/K shapes.
+        unsafe {
+            ffi::gemm_bf16_f32_cuda(
+                wkv as *const ffi::Half,
+                x as *const ffi::Half,
+                kv as *mut f32,
+                width as i32,
+                token_count as i32,
+                hidden.hidden_dim as i32,
+                ctx.stream.cu_stream(),
+            )
+            .result()?;
+            ffi::gemm_bf16_f32_cuda(
+                wgate as *const ffi::Half,
+                x as *const ffi::Half,
+                score as *mut f32,
+                width as i32,
+                token_count as i32,
+                hidden.hidden_dim as i32,
+                ctx.stream.cu_stream(),
+            )
+            .result()?;
+        }
+    }
+    let rope = &config.rope_parameters;
+    let (rope_dim, rope_base) = if apply_rope {
+        (config.qk_rope_head_dim, config.compress_rope_theta)
+    } else {
+        (0, config.compress_rope_theta)
+    };
+    {
+        let (kv, _kg) = kv_raw.device_ptr(&ctx.stream);
+        let (score, _sg) = score_raw.device_ptr(&ctx.stream);
+        let (ape, _ag) = probe.ape.device_ptr(&ctx.stream);
+        let (norm, _ng) = compressor.norm.data.device_ptr(&ctx.stream);
+        let (pkv, _p0) = pending_kv.device_ptr_mut(&ctx.stream);
+        let (psc, _p1) = pending_score.device_ptr_mut(&ctx.stream);
+        let (prkv, _p2) = prev_kv.device_ptr_mut(&ctx.stream);
+        let (prsc, _p3) = prev_score.device_ptr_mut(&ctx.stream);
+        let (prkv_bf16, _p4) = state.prev_overlap_kv.device_ptr_mut(&ctx.stream);
+        let (prsc_bf16, _p5) = state.prev_overlap_score.device_ptr_mut(&ctx.stream);
+        let (compressed, _cg) = state.compressed.data.device_ptr_mut(&ctx.stream);
+        // SAFETY: all buffers match the checked ratio, width, and token count.
+        unsafe {
+            ffi::dsv4_compressor_fp32_prefill_probe_cuda(
+                kv as *const f32,
+                score as *const f32,
+                ape as *const f32,
+                norm as *const ffi::Half,
+                pkv as *mut f32,
+                psc as *mut f32,
+                prkv as *mut f32,
+                prsc as *mut f32,
+                prkv_bf16 as *mut ffi::Half,
+                prsc_bf16 as *mut ffi::Half,
+                compressed as *mut ffi::Half,
+                token_count as i32,
+                head_dim as i32,
+                ratio as i32,
+                width as i32,
+                i32::from(overlap),
+                config.rms_norm_eps,
+                rope_dim as i32,
+                rope_base,
+                rope_original_seq_len,
+                rope.factor,
+                rope.beta_fast,
+                rope.beta_slow,
+                ctx.stream.cu_stream(),
+            )
+            .result()?;
+        }
+    }
+    for value in [
+        &kv_raw,
+        &score_raw,
+        &pending_kv,
+        &pending_score,
+        &prev_kv,
+        &prev_score,
+    ] {
+        keepalive.keep_f32(value);
+    }
+    state.compressed.seq_len = compressed_rows;
+    Ok(())
+}
+
 /// Run one compressor sub-block over `hidden`, updating the per-slot bf16
 /// compressed-key pool for the absolute `[0, start_pos + token_count)` range.
 ///
@@ -7652,6 +7833,36 @@ fn compressor_forward(
         compressed_rows <= compressed_capacity,
         "DSv4 compressor compressed rows {compressed_rows} exceed state capacity {compressed_capacity}"
     );
+
+    if let Some(probe) = compressor.fp32_probe.as_ref()
+        && dsv4_compressor_fp32_enabled()?
+        && !dsv4_verify_frozen()
+        && start_pos == 0
+        && token_count > 0
+        && token_count.is_multiple_of(ratio)
+        && state.compressed.seq_len == 0
+        && precomputed.is_none()
+        && defer_update.is_none()
+    {
+        compressor_fp32_probe(
+            ctx,
+            config,
+            compressor,
+            probe,
+            hidden,
+            state,
+            head_dim,
+            ratio,
+            width,
+            overlap,
+            token_count,
+            compressed_rows,
+            apply_rope,
+            rope_original_seq_len,
+            keepalive,
+        )?;
+        return Ok(());
+    }
 
     // Full-flatten decode (defer_update Some): skip BOTH the per-row projection
     // GEMVs (already batched in the prepass; the batched update reads that output
