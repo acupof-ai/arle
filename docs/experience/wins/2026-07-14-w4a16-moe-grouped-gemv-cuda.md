@@ -2,10 +2,12 @@
 
 > Status: build PASS + kernel-correctness PASS (H20 sm_90, 2026-07-14)
 > + V100 (sm_70) kernel-correctness PASS + BF16 end-to-end PASS +
-> concurrent-throughput measured (2026-07-14). V100 is the target
-> workload: a 4-bit MoE fits 32 GB VRAM where the FP8 variant (32.43 GB)
-> does not. W4A16 end-to-end 4-bit MoE smoke DEFERRED — no W4A16/INT4
-> MoE model on the box and the HF proxy tunnel is down.
+> concurrent-throughput measured (2026-07-14). BF16 GEMM sm_70 fallback
+> perf fix (pre-allocated scratch, no per-call malloc/free/sync) verified
+> 2026-07-15: c=8 186 tok/s vs pre-fix 69 tok/s (+170%). V100 is the
+> target workload: a 4-bit MoE fits 32 GB VRAM where the FP8 variant
+> (32.43 GB) does not. W4A16 end-to-end 4-bit MoE smoke DEFERRED — no
+> W4A16/INT4 MoE model on the box and the HF proxy tunnel is down.
 
 ## Goal
 
@@ -57,8 +59,13 @@ closes the MoE grouped-GEMV lane.
   "conversion", corrupting every operand. Post-fix output is correct
   ("2+2?"→"Four", "capital of France"→"Paris").
 - **Concurrent throughput: measured** (V100 sm_70, Qwen3.5-0.8B BF16,
-  greedy, 20 prompts × 200 tok). Peak ~76 tok/s at c=4; c=8 ~69 tok/s;
-  c=16 ~60 tok/s. guidellm `benchmark run` subcommand is absent in the
+  20 prompts × 200 tok, token-counted via `usage.completion_tokens`).
+  Pre-fix (per-call malloc/free/sync in BF16 GEMM sm_70 fallback):
+  c=4 ~76 tok/s, c=8 ~69 tok/s, c=16 ~60 tok/s — concurrency *decreased*
+  throughput because every GEMM synchronized. Post-fix (pre-allocated
+  scratch, no per-call alloc/sync, 2026-07-15): c=1 98 tok/s, c=4 125
+  tok/s, c=8 186 tok/s — concurrency now scales correctly (+64% at c=4,
+  +170% at c=8). guidellm `benchmark run` subcommand is absent in the
   box's installed version, so a Python concurrent-request load generator
   was used instead.
 - **Smoke (4-bit MoE): DEFERRED** — no W4A16/INT4 MoE model on the box;
