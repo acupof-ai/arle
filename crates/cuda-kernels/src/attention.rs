@@ -650,3 +650,139 @@ pub fn dsv4_flashmla_decode_build_indices_batched_raw(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod fa2_sm70_tests {
+    use crate::ffi::attention::arle_fa2_sm70_attention_cuda;
+    use crate::tensor::{DeviceContext, cache_ptr};
+    use cudarc::driver::sys::CUstream;
+    use half::bf16;
+
+    // Host reference: causal multi-head attention, BF16 I/O, FP32 math.
+    // Q layout [seq, q_heads, d]; K/V cache layout [kv_heads, max_seq, d].
+    fn reference_attention(
+        q: &[bf16],
+        k: &[bf16],
+        v: &[bf16],
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        seq_len: usize,
+        max_seq_len: usize,
+        sm_scale: f32,
+    ) -> Vec<bf16> {
+        let gqa = num_q_heads / num_kv_heads;
+        let mut out = vec![bf16::from_f32(0.0); seq_len * num_q_heads * head_dim];
+        for qh in 0..num_q_heads {
+            let kh = qh / gqa;
+            for q_pos in 0..seq_len {
+                let q_base = q_pos * num_q_heads * head_dim + qh * head_dim;
+                let k_base = kh * max_seq_len * head_dim;
+
+                // Causal logits over KV 0..=q_pos.
+                let mut logits = vec![0.0f32; q_pos + 1];
+                for k_pos in 0..=q_pos {
+                    let mut dot = 0.0f32;
+                    for d in 0..head_dim {
+                        dot += q[q_base + d].to_f32() * k[k_base + k_pos * head_dim + d].to_f32();
+                    }
+                    logits[k_pos] = dot * sm_scale;
+                }
+                let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let exp_sum: f32 = logits.iter().map(|l| (l - max).exp()).sum();
+
+                for d in 0..head_dim {
+                    let mut acc = 0.0f32;
+                    for k_pos in 0..=q_pos {
+                        acc +=
+                            (logits[k_pos] - max).exp() * v[k_base + k_pos * head_dim + d].to_f32();
+                    }
+                    out[q_base + d] = bf16::from_f32(acc / exp_sum);
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn fa2_sm70_matches_host_reference() {
+        let ctx = DeviceContext::new().expect("cuda context");
+
+        const SEQ_LEN: i32 = 4;
+        const NUM_Q_HEADS: i32 = 2;
+        const NUM_KV_HEADS: i32 = 1;
+        const HEAD_DIM: i32 = 256;
+        let sm_scale = 1.0f32 / (HEAD_DIM as f32).sqrt();
+
+        let q_len = (SEQ_LEN * NUM_Q_HEADS * HEAD_DIM) as usize;
+        let kv_len = (NUM_KV_HEADS * SEQ_LEN * HEAD_DIM) as usize;
+
+        // Deterministic, signed, non-trivial input pattern.
+        let mk = |len, mod_, off, scale| {
+            (0..len)
+                .map(|i| bf16::from_f32(((i as f32 % mod_) - off) * scale))
+                .collect::<Vec<_>>()
+        };
+        let q_host = mk(q_len, 11.0, 5.0, 0.01);
+        let k_host = mk(kv_len, 7.0, 3.0, 0.012);
+        let v_host = mk(kv_len, 13.0, 6.0, 0.008);
+
+        let q_dev = ctx.stream.clone_htod(&q_host).expect("q h2d");
+        let k_dev = ctx.stream.clone_htod(&k_host).expect("k h2d");
+        let v_dev = ctx.stream.clone_htod(&v_host).expect("v h2d");
+        let o_dev = ctx.stream.alloc_zeros::<bf16>(q_len).expect("o alloc");
+
+        let q_p = cache_ptr(&q_dev, &ctx).as_ptr() as *const u16;
+        let k_p = cache_ptr(&k_dev, &ctx).as_ptr() as *const u16;
+        let v_p = cache_ptr(&v_dev, &ctx).as_ptr() as *const u16;
+        let o_p = cache_ptr(&o_dev, &ctx).as_mut_ptr() as *mut u16;
+        let stream = ctx.stream.cu_stream() as CUstream;
+
+        // SAFETY: buffers live for the call; shapes match the kernel contract.
+        unsafe {
+            arle_fa2_sm70_attention_cuda(
+                q_p,
+                k_p,
+                v_p,
+                o_p,
+                NUM_Q_HEADS,
+                NUM_KV_HEADS,
+                HEAD_DIM,
+                SEQ_LEN,
+                SEQ_LEN,
+                SEQ_LEN,
+                sm_scale,
+                stream,
+            )
+            .result()
+            .expect("fa2 sm70 kernel");
+        }
+        ctx.sync().expect("sync");
+
+        let o_host = ctx.stream.clone_dtoh(&o_dev).expect("o d2h");
+        let reference = reference_attention(
+            &q_host,
+            &k_host,
+            &v_host,
+            NUM_Q_HEADS as usize,
+            NUM_KV_HEADS as usize,
+            HEAD_DIM as usize,
+            SEQ_LEN as usize,
+            SEQ_LEN as usize,
+            sm_scale,
+        );
+
+        let mut max_err = 0.0f32;
+        let mut sum_err = 0.0f32;
+        for (a, b) in o_host.iter().zip(reference.iter()) {
+            let e = (a.to_f32() - b.to_f32()).abs();
+            max_err = max_err.max(e);
+            sum_err += e;
+        }
+        let mean_err = sum_err / (o_host.len() as f32);
+        assert!(
+            max_err < 0.05 && mean_err < 0.01,
+            "FA2 sm_70 vs host reference mismatch: max_err={max_err} mean_err={mean_err}"
+        );
+    }
+}
