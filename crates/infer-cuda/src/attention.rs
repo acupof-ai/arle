@@ -83,8 +83,6 @@ pub(crate) fn set_dsv4_fused_wqkv_decode_override(enabled: Option<bool>) {
 
 static DSV4_VERIFY_FROZEN: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
-static DSV4_COMPRESSOR_FP32_LOGGED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
 
 /// Frozen-KV MTP verify: while set, `mla_attention` SKIPS `dsv4_compressor_update`
 /// so the speculative K-token verify forms no new compressed blocks / DSA packs and
@@ -1701,18 +1699,6 @@ fn dsv4_proj_batched_bf16_forced() -> Result<bool> {
 /// gates on `Dsv4Attention::mla_proj_bf16` presence.
 pub(crate) fn dsv4_mla_proj_bf16_enabled() -> Result<bool> {
     env_flag("ARLE_DSV4_MLA_PROJ_BF16")
-}
-
-/// Diagnostic only: enable the preloaded single-prefill main-value discriminator.
-/// The shared-file switch permits same-process A/B without reloading the model.
-pub(crate) fn dsv4_compressor_fp32_enabled() -> Result<bool> {
-    Ok(env_flag("ARLE_DSV4_COMPRESSOR_FP32")?
-        || std::path::Path::new("/tmp/arle-dsv4-compressor-fp32").exists())
-}
-
-/// Diagnostic-only load gate. PRELOAD retains probe weights without enabling it.
-pub(crate) fn dsv4_compressor_fp32_preload_enabled() -> Result<bool> {
-    Ok(env_flag("ARLE_DSV4_COMPRESSOR_FP32_PRELOAD")? || env_flag("ARLE_DSV4_COMPRESSOR_FP32")?)
 }
 
 /// Batched-decode CSA select-metadata DEVICE build (default OFF). When ON, the
@@ -7620,7 +7606,6 @@ fn compressor_fp32_probe(
     compressed_rows: usize,
     apply_rope: bool,
     rope_original_seq_len: i32,
-    keepalive: &mut Dsv4ForwardKeepalive,
 ) -> Result<()> {
     let _nvtx = crate::nvtx::range("dsv4/compressor_fp32_probe");
     ensure!(
@@ -7633,42 +7618,14 @@ fn compressor_fp32_probe(
         probe.ape.len(),
         ratio * width
     );
-    if DSV4_COMPRESSOR_FP32_LOGGED
-        .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
-        .is_ok()
-    {
-        let rank = std::env::var("INFER_TP_RANK")
-            .or_else(|_| std::env::var("ARLE_TP_RANK"))
-            .unwrap_or_else(|_| "0".into());
-        eprintln!(
-            "[rank {rank}] ARLE_DSV4_COMPRESSOR_FP32 engaged: single-prefill main-value discriminator; negative does not reject persistent FP32 state"
-        );
-    }
-    let elems = width * token_count;
-    let mut kv_raw = ctx
-        .stream
-        .alloc_zeros::<f32>(elems)
-        .map_err(|e| anyhow!("DSv4 compressor FP32 kv alloc failed: {e}"))?;
-    let mut score_raw = ctx
-        .stream
-        .alloc_zeros::<f32>(elems)
-        .map_err(|e| anyhow!("DSv4 compressor FP32 score alloc failed: {e}"))?;
-    let mut pending_kv = ctx
-        .stream
-        .alloc_zeros::<f32>(ratio * width)
-        .map_err(|e| anyhow!("DSv4 compressor FP32 pending kv alloc failed: {e}"))?;
-    let mut pending_score = ctx
-        .stream
-        .alloc_zeros::<f32>(ratio * width)
-        .map_err(|e| anyhow!("DSv4 compressor FP32 pending score alloc failed: {e}"))?;
-    let mut prev_kv = ctx
-        .stream
-        .alloc_zeros::<f32>(ratio * head_dim)
-        .map_err(|e| anyhow!("DSv4 compressor FP32 overlap kv alloc failed: {e}"))?;
-    let mut prev_score = ctx
-        .stream
-        .alloc_zeros::<f32>(ratio * head_dim)
-        .map_err(|e| anyhow!("DSv4 compressor FP32 overlap score alloc failed: {e}"))?;
+    // Pre-allocated FP32 buffers in `state` (sized for max_seq_len); reuse
+    // across layers/requests to avoid per-prefill OOM (174 allocs/prefill).
+    let kv_raw = &mut state.fp32_kv_raw;
+    let score_raw = &mut state.fp32_score_raw;
+    let pending_kv = &mut state.fp32_pending_kv;
+    let pending_score = &mut state.fp32_pending_score;
+    let prev_kv = &mut state.fp32_prev_kv;
+    let prev_score = &mut state.fp32_prev_score;
     {
         let (wkv, _wg0) = probe.wkv.data.device_ptr(&ctx.stream);
         let (wgate, _wg1) = probe.wgate.data.device_ptr(&ctx.stream);
@@ -7748,16 +7705,6 @@ fn compressor_fp32_probe(
             .result()?;
         }
     }
-    for value in [
-        &kv_raw,
-        &score_raw,
-        &pending_kv,
-        &pending_score,
-        &prev_kv,
-        &prev_score,
-    ] {
-        keepalive.keep_f32(value);
-    }
     state.compressed.seq_len = compressed_rows;
     Ok(())
 }
@@ -7835,7 +7782,6 @@ fn compressor_forward(
     );
 
     if let Some(probe) = compressor.fp32_probe.as_ref()
-        && dsv4_compressor_fp32_enabled()?
         && !dsv4_verify_frozen()
         && start_pos == 0
         && token_count > 0
@@ -7859,7 +7805,6 @@ fn compressor_forward(
             compressed_rows,
             apply_rope,
             rope_original_seq_len,
-            keepalive,
         )?;
         return Ok(());
     }
