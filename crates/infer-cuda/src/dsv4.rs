@@ -115,19 +115,25 @@ impl Dsv4MlaKvArena {
 /// Compressor sub-block for CSA/HCA layers (`compress_ratio > 0`): projects the
 /// wide hidden into the compressed-key latent stream the sparse attention reads.
 /// `wkv`/`wgate` may be FP8/FP4 block-scaled or bf16 (`dsv4_linear` dispatches on
-/// `weight_format`); `ape` is ALWAYS dense bf16 — the update kernel raw-reads its
-/// `.data`, which on a quantized matrix is a 1-element dummy (#138 OOB); the
-/// loader dequants it. `norm` is bf16.
+/// `weight_format`); the main-value probe optionally retains checkpoint BF16
+/// projections and F32 APE. The indexer and default path stay unchanged.
 pub(crate) struct Dsv4Compressor {
     pub wkv: DeviceMatrix,
     pub wgate: DeviceMatrix,
     pub ape: DeviceMatrix,
+    pub fp32_probe: Option<Dsv4CompressorFp32Probe>,
     pub norm: DeviceVec,
     /// DeepGEMM repacks of the FP8 `wkv`/`wgate` projections for the batched (m=N)
     /// decode pre-pass — tensor-core `sm90_fp8_gemm_1d2d` instead of the scalar
     /// `dsv4_fp8_gemv_batch`. `None` ⇒ scalar (bf16 GLM dialect, or gate off).
     pub wkv_deepgemm: Option<Dsv4Fp8DeepGemmWeightCache>,
     pub wgate_deepgemm: Option<Dsv4Fp8DeepGemmWeightCache>,
+}
+
+pub(crate) struct Dsv4CompressorFp32Probe {
+    pub wkv: DeviceMatrix,
+    pub wgate: DeviceMatrix,
+    pub ape: CudaSlice<f32>,
 }
 
 /// Sparse indexer sub-block. DSv4 CompressedSparse: a key compressor over
