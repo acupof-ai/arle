@@ -23,7 +23,10 @@ UPDATE_STRATEGY=${UPDATE_STRATEGY:-rejection-ce}   # rejection-ce | sao-dis | sa
 SAMPLES=${SAMPLES:-$([ "$UPDATE_STRATEGY" = rejection-ce ] && echo 1 || echo 2)}
 SAO_GAMMA=${SAO_GAMMA:-1.0}; SAO_LAMBDA=${SAO_LAMBDA:-0.95}; VALUE_LR=${VALUE_LR:-0.0003}
 CC_TIMEOUT=${CC_TIMEOUT:-600}; DECODE_GRAPH=${DECODE_GRAPH:-1}   # rollout speed: per-task cap + decode graph
-FROZEN_PROMPT_KV=${FROZEN_PROMPT_KV:-1}   # SAO writeback skips the shared 17K-prompt forward (needs the port)
+# Frozen-prompt-KV skips the PROMPT forward — but cc trajectories are mostly
+# RESPONSE (multi-turn, gen_len~15K vs prompt~3.7K), so it saves ~19% AND OOMs on
+# the long gen-segment forward. Off by default for cc; the bulk is the response.
+FROZEN_PROMPT_KV=${FROZEN_PROMPT_KV:-}
 LR=${LR:-0.00001}
 LORA_RANK=${LORA_RANK:-16}; LORA_ALPHA=${LORA_ALPHA:-32}
 LORA_TARGET_SET=${LORA_TARGET_SET:-attention-qv}
