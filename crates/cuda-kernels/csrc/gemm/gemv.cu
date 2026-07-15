@@ -202,6 +202,12 @@ struct CublasDeviceState {
   void *cublas_workspace = nullptr;
   void *cublaslt_workspace = nullptr;
   std::unordered_map<GemmKey, cublasLtMatmulAlgo_t, GemmKeyHash> algo_cache;
+  // Volta (sm_70) BF16↔FP16 cast scratch. Pre-allocated once, grown on
+  // demand, freed at cublas_destroy. Avoids per-GEMM cudaMalloc/cudaFree
+  // + the trailing cudaStreamSynchronize that guarded the cudaFree — both
+  // serialized the entire decode pipeline on V100.
+  void *cast_scratch = nullptr;
+  size_t cast_scratch_bytes = 0;
 };
 
 static const size_t CUBLAS_WORKSPACE_SIZE = 32 * 1024 * 1024; // 32MB
@@ -252,8 +258,9 @@ static int device_compute_major();
 // SUCCESS, surfacing only at the next stream sync), so a post-hoc retry cannot
 // catch it without a per-call cudaStreamSynchronize. Instead, value-convert the
 // BF16 operands to FP16, run an FP16 GEMM (V100 has FP16 tensor cores), and
-// value-convert the FP16 result back to BF16. Allocates per-call scratch; this
-// is the legacy Volta-only path, never the sm_80+ hot path.
+// value-convert the FP16 result back to BF16. Uses a pre-allocated per-device
+// scratch (grown on demand, freed at cublas_destroy) — no per-call alloc or
+// sync. This is the Volta-only path, never the sm_80+ hot path.
 //
 // BF16 and FP16 differ in exponent/mantissa width (BF16: 8 exp + 7 mantissa,
 // same exponent range as FP32; FP16: 5 exp + 10 mantissa, narrower range), so a
@@ -275,62 +282,82 @@ __global__ void convert_fp16_to_bf16_kernel(const __half *__restrict__ in,
   }
 }
 
-static cudaError_t gemm_fp16_cast_cuda(const __nv_bfloat16 *W, const __nv_bfloat16 *X,
+// Grow the per-device BF16↔FP16 cast scratch to at least `needed` bytes.
+// Common case (already large enough) is lock-free; the grow path takes
+// `g_state_mutex` with double-checked locking so concurrent GEMM calls on
+// the same device don't race. Scratch is freed at cublas_destroy.
+static cudaError_t ensure_cast_scratch(CublasDeviceState *state, size_t needed) {
+  if (state->cast_scratch_bytes >= needed) {
+    return cudaSuccess;
+  }
+  std::lock_guard<std::mutex> lock(g_state_mutex);
+  if (state->cast_scratch_bytes >= needed) {
+    return cudaSuccess;
+  }
+  if (state->cast_scratch != nullptr) {
+    cudaFree(state->cast_scratch);
+    state->cast_scratch = nullptr;
+    state->cast_scratch_bytes = 0;
+  }
+  // Round up to the next 1 MB boundary to avoid repeated tiny grows.
+  size_t alloc_bytes = ((needed + (1 << 20) - 1) / (1 << 20)) * (1 << 20);
+  if (cudaMalloc(&state->cast_scratch, alloc_bytes) != cudaSuccess) {
+    return cudaErrorMemoryAllocation;
+  }
+  state->cast_scratch_bytes = alloc_bytes;
+  return cudaSuccess;
+}
+
+static cudaError_t gemm_fp16_cast_cuda(CublasDeviceState *state,
+                                       const __nv_bfloat16 *W, const __nv_bfloat16 *X,
                                        __nv_bfloat16 *Y, int M, int N, int K,
                                        cudaStream_t stream, cublasHandle_t handle) {
   if (cublasSetStream(handle, stream) != CUBLAS_STATUS_SUCCESS) {
     return cudaErrorUnknown;
   }
-  __half *W_f16 = nullptr, *X_f16 = nullptr, *Y_f16 = nullptr;
   size_t w_elems = static_cast<size_t>(K) * M;
   size_t x_elems = static_cast<size_t>(K) * N;
   size_t y_elems = static_cast<size_t>(M) * N;
-  if (cudaMalloc(&W_f16, w_elems * sizeof(__half)) != cudaSuccess ||
-      cudaMalloc(&X_f16, x_elems * sizeof(__half)) != cudaSuccess ||
-      cudaMalloc(&Y_f16, y_elems * sizeof(__half)) != cudaSuccess) {
-    if (Y_f16 != nullptr) cudaFree(Y_f16);
-    if (X_f16 != nullptr) cudaFree(X_f16);
-    if (W_f16 != nullptr) cudaFree(W_f16);
+  size_t needed = (w_elems + x_elems + y_elems) * sizeof(__half);
+  if (ensure_cast_scratch(state, needed) != cudaSuccess) {
     return cudaErrorMemoryAllocation;
   }
-  cudaError_t cerr = cudaSuccess;
-  do {
-    constexpr int CONV_BLOCK = 256;
-    // Value-convert BF16 operands to FP16 (not a raw byte copy — see the
-    // kernel comments above). Launch errors are sticky, so cudaGetLastError
-    // after each rather than relying on the trailing sync alone.
-    convert_bf16_to_fp16_kernel<<<(w_elems + CONV_BLOCK - 1) / CONV_BLOCK, CONV_BLOCK, 0,
-                                  stream>>>(W, W_f16, w_elems);
-    if ((cerr = cudaGetLastError()) != cudaSuccess) break;
-    convert_bf16_to_fp16_kernel<<<(x_elems + CONV_BLOCK - 1) / CONV_BLOCK, CONV_BLOCK, 0,
-                                  stream>>>(X, X_f16, x_elems);
-    if ((cerr = cudaGetLastError()) != cudaSuccess) break;
-    const float h_alpha = 1.0f, h_beta = 0.0f;
-    // FP16 GEMM with FP32 accumulate + tensor cores: native on V100.
-    cublasStatus_t stat = cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, M, N, K,
-                                       &h_alpha, W_f16, CUDA_R_16F, K, X_f16,
-                                       CUDA_R_16F, K, &h_beta, Y_f16, CUDA_R_16F,
-                                       M, CUBLAS_COMPUTE_32F,
-                                       CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-    if (stat != CUBLAS_STATUS_SUCCESS) {
-      cerr = cudaErrorUnknown;
-      break;
-    }
-    convert_fp16_to_bf16_kernel<<<(y_elems + CONV_BLOCK - 1) / CONV_BLOCK, CONV_BLOCK, 0,
-                                  stream>>>(Y_f16, Y, y_elems);
-    cerr = cudaGetLastError();
-  } while (false);
-  {
-    cudaError_t sync_err = cudaStreamSynchronize(stream);
-    if (cerr == cudaSuccess) cerr = sync_err;
+  // Slice the pre-allocated scratch into W/X/Y regions (no per-call alloc).
+  __half *W_f16 = static_cast<__half *>(state->cast_scratch);
+  __half *X_f16 = W_f16 + w_elems;
+  __half *Y_f16 = X_f16 + x_elems;
+  constexpr int CONV_BLOCK = 256;
+  // Value-convert BF16 operands to FP16 (not a raw byte copy — see the
+  // kernel comments above). Launch errors are sticky, so cudaGetLastError
+  // after each.
+  convert_bf16_to_fp16_kernel<<<(w_elems + CONV_BLOCK - 1) / CONV_BLOCK, CONV_BLOCK, 0,
+                                stream>>>(W, W_f16, w_elems);
+  cudaError_t cerr = cudaGetLastError();
+  if (cerr != cudaSuccess) return cerr;
+  convert_bf16_to_fp16_kernel<<<(x_elems + CONV_BLOCK - 1) / CONV_BLOCK, CONV_BLOCK, 0,
+                                stream>>>(X, X_f16, x_elems);
+  cerr = cudaGetLastError();
+  if (cerr != cudaSuccess) return cerr;
+  const float h_alpha = 1.0f, h_beta = 0.0f;
+  // FP16 GEMM with FP32 accumulate + tensor cores: native on V100.
+  cublasStatus_t stat = cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, M, N, K,
+                                     &h_alpha, W_f16, CUDA_R_16F, K, X_f16,
+                                     CUDA_R_16F, K, &h_beta, Y_f16, CUDA_R_16F,
+                                     M, CUBLAS_COMPUTE_32F,
+                                     CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+  if (stat != CUBLAS_STATUS_SUCCESS) {
+    return cudaErrorUnknown;
   }
-  cudaFree(Y_f16);
-  cudaFree(X_f16);
-  cudaFree(W_f16);
-  return cerr;
+  convert_fp16_to_bf16_kernel<<<(y_elems + CONV_BLOCK - 1) / CONV_BLOCK, CONV_BLOCK, 0,
+                                stream>>>(Y_f16, Y, y_elems);
+  // No trailing cudaStreamSynchronize + cudaFree: the scratch is persistent
+  // (freed at cublas_destroy), so the conversion kernels + GEMM stay queued
+  // on `stream` and overlap with subsequent work. Matches the sm_80+ hot path.
+  return cudaGetLastError();
 }
 
-static cudaError_t gemm_cublas_fallback(const __nv_bfloat16 *W, const __nv_bfloat16 *X,
+static cudaError_t gemm_cublas_fallback(CublasDeviceState *state,
+                                        const __nv_bfloat16 *W, const __nv_bfloat16 *X,
                                         __nv_bfloat16 *Y, int M, int N, int K,
                                         cudaStream_t stream, cublasHandle_t handle) {
   // Volta (sm_70, e.g. V100) has no BF16 compute at all — only FP16/FP32. A
@@ -338,7 +365,7 @@ static cudaError_t gemm_cublas_fallback(const __nv_bfloat16 *W, const __nv_bfloa
   // path directly: BF16 operands → FP16 GEMM → BF16 result. Compute major is
   // cached per device (single cudaGetDeviceProperties at first use).
   if (device_compute_major() <= 7) {
-    return gemm_fp16_cast_cuda(W, X, Y, M, N, K, stream, handle);
+    return gemm_fp16_cast_cuda(state, W, X, Y, M, N, K, stream, handle);
   }
   const float h_alpha = 1.0f;
   const float h_beta = 0.0f;
@@ -495,7 +522,7 @@ static cudaError_t gemm_cublaslt_impl(const __nv_bfloat16 *W, const __nv_bfloat1
   // device (a single cudaGetDeviceProperties at first use) — the uncached
   // per-step lookup caused a -77% decode regression (2026-06-12).
   if (device_compute_major() <= 7) {
-    return gemm_cublas_fallback(W, X, Y, M, N, K, stream,
+    return gemm_cublas_fallback(state, W, X, Y, M, N, K, stream,
                                 graphsafe ? state->handle : state->prefill_handle);
   }
 
@@ -505,7 +532,7 @@ static cudaError_t gemm_cublaslt_impl(const __nv_bfloat16 *W, const __nv_bfloat1
     // workspace-backed prefill handle. In deterministic decode, Rust splits
     // BF16 batched GEMM into per-row graph-safe N=1 calls, so every row hits
     // this same cublasGemmEx path.
-    return gemm_cublas_fallback(W, X, Y, M, N, K, stream,
+    return gemm_cublas_fallback(state, W, X, Y, M, N, K, stream,
                                 graphsafe ? state->handle : state->prefill_handle);
   }
 
@@ -551,7 +578,7 @@ static cudaError_t gemm_cublaslt_impl(const __nv_bfloat16 *W, const __nv_bfloat1
       cublasLtMatrixLayoutDestroy(x_desc);
       cublasLtMatrixLayoutDestroy(w_desc);
       cublasLtMatmulDescDestroy(operation_desc);
-      return gemm_cublas_fallback(W, X, Y, M, N, K, stream, state->handle);
+      return gemm_cublas_fallback(state, W, X, Y, M, N, K, stream, state->handle);
     }
 
     if (cublasLtMatmulPreferenceCreate(&preference) != CUBLAS_STATUS_SUCCESS) {
@@ -648,7 +675,7 @@ static cudaError_t gemm_cublaslt_impl(const __nv_bfloat16 *W, const __nv_bfloat1
       cublasLtMatrixLayoutDestroy(x_desc);
       cublasLtMatrixLayoutDestroy(w_desc);
       cublasLtMatmulDescDestroy(operation_desc);
-      return gemm_cublas_fallback(W, X, Y, M, N, K, stream, state->prefill_handle);
+      return gemm_cublas_fallback(state, W, X, Y, M, N, K, stream, state->prefill_handle);
     }
   }
 
@@ -676,7 +703,7 @@ static cudaError_t gemm_cublaslt_impl(const __nv_bfloat16 *W, const __nv_bfloat1
     // A failed launch (or an opaque cudaErrorUnknown from cublasLt) falls back
     // to cublasGemmEx, which retries with CUBLAS_GEMM_DEFAULT (CUDA-core math)
     // on hardware without BF16 tensor cores (Volta/sm_70 V100).
-    return gemm_cublas_fallback(W, X, Y, M, N, K, stream, state->prefill_handle);
+    return gemm_cublas_fallback(state, W, X, Y, M, N, K, stream, state->prefill_handle);
   }
 
   cublasLtMatrixLayoutDestroy(y_desc);
@@ -760,6 +787,9 @@ void cublas_destroy() {
     }
     if (state->cublaslt_workspace != nullptr) {
       cudaFree(state->cublaslt_workspace);
+    }
+    if (state->cast_scratch != nullptr) {
+      cudaFree(state->cast_scratch);
     }
   }
   g_per_device_state.clear();
