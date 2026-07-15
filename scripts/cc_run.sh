@@ -32,7 +32,10 @@ CUDA_VISIBLE_DEVICES=$GPU nohup "$ARLE" serve --model-path "$MODEL_PATH" \
   --bind 0.0.0.0 --port "$PORT" --max-running-requests 4 --dump-messages-dir "$DUMP" \
   ${DECODE_GRAPH:+--qwen35-decode-graph true} \
   ${LORA:+--lora-adapters "$LORA" --lora-alpha 32} > "$OUT_DIR/serve.log" 2>&1 &
-SERVE_PID=$!; trap 'kill "$SERVE_PID" 2>/dev/null' EXIT
+# kill + WAIT for the serve to fully exit (frees its ~50GB) before returning, so
+# the caller's train step can load the 27B student on the same GPU without an
+# htod-copy OOM; sleep covers the CUDA-context teardown lag after process exit.
+SERVE_PID=$!; trap 'kill "$SERVE_PID" 2>/dev/null; wait "$SERVE_PID" 2>/dev/null; sleep 5' EXIT
 
 echo "[cc-run] serve pid=$SERVE_PID gpu=$GPU port=$PORT — waiting for load…"
 for _ in $(seq 1 90); do
