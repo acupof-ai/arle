@@ -654,6 +654,7 @@ pub fn cuda_qwen35_engine_from_model_path(
         0.9,
         None,
         0.0,
+        None,
     )?;
     let engine = Engine::with_config(
         executor,
