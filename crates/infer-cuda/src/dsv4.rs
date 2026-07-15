@@ -544,8 +544,86 @@ pub(crate) struct Dsv4Model {
     /// MTP-head load and the per-slot rollback snapshots agree on one decision.
     pub spec_decode_on: bool,
     pub tp: crate::tp::TpRuntime,
+    #[cfg(all(feature = "cuda", feature = "nccl"))]
+    pub(crate) mega_moe: Option<Dsv4MegaMoeTransport>,
     #[cfg(feature = "deepep")]
     pub deepep: Option<crate::deepep::DeepEpTransport>,
+}
+
+#[cfg(all(feature = "cuda", feature = "nccl"))]
+pub(crate) struct Dsv4MegaMoeTransport {
+    pub(crate) workspace: crate::tp::SymmetricIpcBuffer,
+    pub(crate) owned_out: CudaSlice<half::bf16>,
+    pub(crate) layout: cuda_kernels::moe::Sm90MegaMoeWorkspaceLayout,
+    pub(crate) shape: cuda_kernels::moe::Sm90MegaMoeShape,
+    pub(crate) fast_math: bool,
+    pub(crate) enable_pdl: bool,
+    epoch: std::sync::Mutex<(u64, Option<(u64, usize)>)>,
+}
+
+#[cfg(all(feature = "cuda", feature = "nccl"))]
+impl Dsv4MegaMoeTransport {
+    fn assert_collective_values(&self, model: &Dsv4Model, values: &[u64]) -> Result<()> {
+        let bytes = values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        let gathered = model.tp.all_gather_bytes(&model.ctx, &bytes, bytes.len())?;
+        ensure!(
+            gathered.chunks_exact(bytes.len()).all(|peer| peer == bytes),
+            "DSv4 MegaMoE specialization differs across TP ranks"
+        );
+        Ok(())
+    }
+
+    fn assert_static_spec(&self, model: &Dsv4Model, activation_clamp: f32) -> Result<()> {
+        fn env_i32(name: &str, fallback: i32) -> i32 {
+            std::env::var(name)
+                .ok()
+                .filter(|value| !value.is_empty())
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(fallback)
+        }
+
+        let values = [
+            u64::try_from(self.shape.num_ranks)?,
+            u64::try_from(self.shape.num_experts)?,
+            u64::try_from(self.shape.requested_max_tokens_per_rank)?,
+            u64::try_from(self.shape.num_topk)?,
+            u64::try_from(self.shape.hidden)?,
+            u64::try_from(self.shape.intermediate_hidden)?,
+            u64::from(activation_clamp.to_bits()),
+            u64::from(self.fast_math),
+            u64::from(self.enable_pdl),
+            env_i32("DG_NUM_SMS", i32::try_from(model.ctx.sm_count())?) as u32 as u64,
+            u64::from(env_i32("DG_SM90_FP8_SWAP_AB", 1) != 0),
+        ];
+        self.assert_collective_values(model, &values)
+    }
+
+    fn begin_forward(&self, model: &Dsv4Model, num_tokens: usize) -> Result<u64> {
+        self.assert_collective_values(model, &[u64::try_from(num_tokens)?])?;
+        let mut epoch = self
+            .epoch
+            .lock()
+            .map_err(|_| anyhow!("DSv4 MegaMoE forward epoch lock poisoned"))?;
+        epoch.0 = epoch.0.wrapping_add(1);
+        let id = epoch.0;
+        epoch.1 = Some((id, num_tokens));
+        Ok(id)
+    }
+
+    pub(crate) fn assert_forward_epoch(&self, epoch_id: u64, num_tokens: usize) -> Result<()> {
+        let epoch = self
+            .epoch
+            .lock()
+            .map_err(|_| anyhow!("DSv4 MegaMoE forward epoch lock poisoned"))?;
+        ensure!(
+            epoch.1 == Some((epoch_id, num_tokens)),
+            "DSv4 MegaMoE layer has no matching top-level forward epoch"
+        );
+        Ok(())
+    }
 }
 
 /// Max depth for the per-slot spec-ring snapshot. `topk` widens candidate
@@ -1787,11 +1865,26 @@ fn read_safetensors_tensor_names(path: &Path) -> Result<Vec<String>> {
 }
 
 impl Dsv4Model {
+    pub(crate) fn begin_mega_moe_forward(&self, num_tokens: usize) -> Result<Option<u64>> {
+        #[cfg(all(feature = "cuda", feature = "nccl"))]
+        if let Some(mega_moe) = &self.mega_moe {
+            return mega_moe.begin_forward(self, num_tokens).map(Some);
+        }
+        Ok(None)
+    }
+
     /// Per-forward owned-token cap when the deepep_ll MoE transport is booted
     /// (`None` for allreduce / intranode / non-deepep builds → unbounded). Core
     /// caps decode_rows + prefill chunk tokens to this so the LL dispatch buffer
     /// is never overrun.
     pub(crate) fn max_tokens_per_step(&self) -> Option<usize> {
+        #[cfg(all(feature = "cuda", feature = "nccl"))]
+        if let Some(mega_moe) = &self.mega_moe {
+            return mega_moe
+                .shape
+                .requested_max_tokens_per_rank
+                .checked_mul(mega_moe.shape.num_ranks);
+        }
         #[cfg(feature = "deepep")]
         {
             self.deepep
@@ -1801,6 +1894,95 @@ impl Dsv4Model {
         #[cfg(not(feature = "deepep"))]
         {
             None
+        }
+    }
+
+    pub(crate) fn boot_mega_moe(&mut self, requested_max_tokens_per_rank: usize) -> Result<()> {
+        if !matches!(
+            crate::runtime_flags::dsv4_moe_transport()?,
+            crate::runtime_flags::Dsv4MoeTransport::MegaMoe
+        ) {
+            return Ok(());
+        }
+        #[cfg(not(all(feature = "cuda", feature = "nccl")))]
+        bail!("ARLE_DSV4_MOE_TRANSPORT=mega_moe requires infer-cuda features cuda,nccl");
+        #[cfg(all(feature = "cuda", feature = "nccl"))]
+        {
+            ensure!(
+                self.mega_moe.is_none(),
+                "DSv4 MegaMoE transport already booted"
+            );
+            ensure!(
+                self.tp.config().world_size > 1,
+                "ARLE_DSV4_MOE_TRANSPORT=mega_moe requires TP world_size > 1"
+            );
+            let first = self
+                .layers
+                .iter()
+                .find_map(|layer| layer.moe.as_ref())
+                .ok_or_else(|| anyhow!("DSv4 MegaMoE requires at least one routed MoE layer"))?;
+            ensure!(
+                self.layers
+                    .iter()
+                    .filter_map(|layer| layer.moe.as_ref())
+                    .all(|moe| {
+                        moe.hidden_dim == first.hidden_dim
+                            && moe.intermediate == first.intermediate
+                            && moe.num_groups == first.num_groups
+                    }),
+                "DSv4 MegaMoE requires one routed-expert shape across all layers"
+            );
+            if let Some(mtp) = &self.mtp {
+                let moe = mtp
+                    .layer
+                    .moe
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("DSv4 MegaMoE MTP layer has no routed experts"))?;
+                ensure!(
+                    moe.hidden_dim == first.hidden_dim
+                        && moe.intermediate == first.intermediate
+                        && moe.num_groups == first.num_groups,
+                    "DSv4 MegaMoE MTP routed-expert shape differs from base layers"
+                );
+            }
+            let shape = cuda_kernels::moe::Sm90MegaMoeShape {
+                num_ranks: self.tp.config().world_size,
+                num_experts: self.moe_config.num_experts,
+                requested_max_tokens_per_rank,
+                num_topk: self.moe_config.top_k,
+                hidden: first.hidden_dim,
+                intermediate_hidden: first.intermediate,
+            };
+            let layout = cuda_kernels::moe::sm90_mega_moe_workspace_layout(shape)?;
+            let bytes = usize::try_from(layout.num_bytes)?;
+            let workspace = self.tp.alloc_symmetric_ipc(&self.ctx, bytes)?;
+            ensure!(
+                workspace.bytes() == bytes,
+                "DSv4 MegaMoE workspace bytes {} != layout {bytes}",
+                workspace.bytes()
+            );
+            let mega_moe = Dsv4MegaMoeTransport {
+                workspace,
+                owned_out: self
+                    .ctx
+                    .stream
+                    .alloc_zeros::<half::bf16>(
+                        requested_max_tokens_per_rank
+                            .checked_mul(first.hidden_dim)
+                            .ok_or_else(|| anyhow!("DSv4 MegaMoE output scratch overflow"))?,
+                    )
+                    .map_err(|error| {
+                        anyhow!("DSv4 MegaMoE output scratch alloc failed: {error}")
+                    })?,
+                layout,
+                shape,
+                fast_math: true,
+                enable_pdl: false,
+                epoch: std::sync::Mutex::new((0, None)),
+            };
+            mega_moe.assert_static_spec(self, self.config.swiglu_limit)?;
+            self.mega_moe = Some(mega_moe);
+            Ok(())
         }
     }
 
@@ -2053,6 +2235,8 @@ impl Dsv4Model {
             mtp,
             spec_decode_on,
             tp,
+            #[cfg(all(feature = "cuda", feature = "nccl"))]
+            mega_moe: None,
             #[cfg(feature = "deepep")]
             deepep,
         })
@@ -2770,7 +2954,7 @@ impl Dsv4Model {
         last_hidden_out: Option<&mut DeviceVec>,
     ) -> Result<u32> {
         let seq_len = tokens.len();
-        let use_deepep_transport = dsv4_use_deepep_transport()?;
+        let moe_transport = crate::runtime_flags::dsv4_moe_transport()?;
         // FlashMLA-decode captures cleanly (capture-safety fixes e95e11b6).
         // The graph routes on-device into fixed scratch and runs the masked
         // MoE tail — no gpu_router/pooled dependency. GLM rides the same FP8 MoE
@@ -2788,7 +2972,10 @@ impl Dsv4Model {
             && last_hidden_out.is_none()
             && !self.config.is_dspark()
             && seq_len == 1
-            && !use_deepep_transport
+            && matches!(
+                moe_transport,
+                crate::runtime_flags::Dsv4MoeTransport::AllReduce
+            )
             && crate::probe::lens_layers() == 0
         {
             return self.forward_tokens_decode_graph(
@@ -3128,6 +3315,7 @@ impl Dsv4Model {
         start_positions: &[usize],
     ) -> Result<(HiddenStates, Dsv4ForwardKeepalive)> {
         let n = slot_ids.len();
+        let mega_epoch = self.begin_mega_moe_forward(n)?;
         // Opt-in decode-phase timing probe (env-gated). When unset: zero behavior
         // change, zero extra syncs. Pure instrumentation — see ARLE_DSV4_DECODE_PHASE_TIME.
         let phase_time = matches!(
@@ -3168,7 +3356,7 @@ impl Dsv4Model {
         let stream_dim = hidden_size * hc_mult;
         let seq_len = n; // batch dimension: N independent decode rows
         let eps = self.config.rms_norm_eps;
-        let use_deepep_transport = dsv4_use_deepep_transport()?;
+        let use_deepep_transport = crate::runtime_flags::dsv4_moe_transport()?.is_deepep();
         // N>1: mirror the prefill keepalive discipline (the per-token decode
         // scratch / comm-overlap fast paths are seq_len==1 only).
         let mut keepalive = Dsv4ForwardKeepalive::new(false);
@@ -4696,7 +4884,7 @@ impl Dsv4Model {
                     bail!("ARLE_DSV4_MOE_TRANSPORT=deepep requires infer-cuda feature deepep");
                 } else {
                     let tail = kv_adapter.moe_tail_scratch_mut();
-                    crate::moe::dsv4_moe_forward(
+                    let needs_moe_allreduce = crate::moe::dsv4_moe_forward(
                         self,
                         layer.moe.as_ref().expect("DSv4 layer.moe"),
                         tokens,
@@ -4704,12 +4892,15 @@ impl Dsv4Model {
                         &mut moe_out,
                         &mut keepalive,
                         tail,
+                        mega_epoch,
                     )?;
                     keepalive.keep_hidden(&moe_out);
                     // Routed experts are EP-sharded → sum, then add the replicated
                     // shared expert once per rank. One all-reduce over [N, hidden].
-                    let _nvtx = crate::nvtx::range("dsv4/moe_allreduce");
-                    self.tp.all_reduce_sum(&self.ctx, &mut moe_out)?;
+                    if needs_moe_allreduce {
+                        let _nvtx = crate::nvtx::range("dsv4/moe_allreduce");
+                        self.tp.all_reduce_sum(&self.ctx, &mut moe_out)?;
+                    }
                 }
                 keepalive.keep_hidden(&moe_out);
                 // Phase 6a: grouped shared expert over [N] (dense FFN, prefill path)
@@ -4869,7 +5060,7 @@ impl Dsv4Model {
             scheds.len()
         );
         ensure!(
-            !dsv4_use_deepep_transport()?,
+            !crate::runtime_flags::dsv4_moe_transport()?.is_deepep(),
             "DSv4 batched MTP verify supports the allreduce transport only \
              (the deepep_ll owned-shard partition is keyed on the whole-batch \
               seq_len, not per-slot verify chunks)"
@@ -4913,6 +5104,7 @@ impl Dsv4Model {
         let hc_mult = self.config.hc_mult;
         let stream_dim = hidden_size * hc_mult;
         let seq_len = m; // batch dimension: M verify rows
+        let mega_epoch = self.begin_mega_moe_forward(seq_len)?;
         let eps = self.config.rms_norm_eps;
         let mut keepalive = Dsv4ForwardKeepalive::new(false);
 
@@ -5165,7 +5357,7 @@ impl Dsv4Model {
                     // SAFETY: the MoE forward writes the full routed output buffer.
                     let mut moe_out =
                         unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
-                    crate::moe::dsv4_moe_forward(
+                    let needs_moe_allreduce = crate::moe::dsv4_moe_forward(
                         self,
                         layer.moe.as_ref().expect("DSv4 layer.moe"),
                         &tokens,
@@ -5173,9 +5365,10 @@ impl Dsv4Model {
                         &mut moe_out,
                         &mut keepalive,
                         None,
+                        mega_epoch,
                     )?;
                     keepalive.keep_hidden(&moe_out);
-                    {
+                    if needs_moe_allreduce {
                         let _nvtx = crate::nvtx::range("dsv4/moe_allreduce");
                         self.tp.all_reduce_sum(&self.ctx, &mut moe_out)?;
                     }
@@ -5396,6 +5589,7 @@ impl Dsv4Model {
             slot.max_seq_len
         );
         let seq_len = tokens.len();
+        let mega_epoch = self.begin_mega_moe_forward(seq_len)?;
         ensure!(
             seq_len <= MAX_SPEC_VERIFY_ROWS,
             "DSv4 persistent verify rows {seq_len} exceed capacity {MAX_SPEC_VERIFY_ROWS}"
@@ -5408,7 +5602,7 @@ impl Dsv4Model {
         );
         sched.validate_sparse_at(start_pos)?;
         ensure!(
-            !dsv4_use_deepep_transport()?,
+            !crate::runtime_flags::dsv4_moe_transport()?.is_deepep(),
             "DSv4 persistent MTP verify scratch currently supports allreduce transport"
         );
 
@@ -5591,7 +5785,7 @@ impl Dsv4Model {
                         &mut keepalive,
                     )?;
                 } else {
-                    crate::moe::dsv4_moe_forward(
+                    let needs_moe_allreduce = crate::moe::dsv4_moe_forward(
                         self,
                         layer.moe.as_ref().expect("DSv4 layer.moe"),
                         tokens,
@@ -5599,12 +5793,15 @@ impl Dsv4Model {
                         &mut current.moe_out,
                         &mut keepalive,
                         None,
+                        mega_epoch,
                     )?;
 
-                    let _nvtx = crate::nvtx::range("dsv4/moe_allreduce");
-                    crate::stage_profile::profile(ctx, "dsv4/stage/moe_allreduce", || {
-                        self.tp.all_reduce_sum(ctx, &mut current.moe_out)
-                    })?;
+                    if needs_moe_allreduce {
+                        let _nvtx = crate::nvtx::range("dsv4/moe_allreduce");
+                        crate::stage_profile::profile(ctx, "dsv4/stage/moe_allreduce", || {
+                            self.tp.all_reduce_sum(ctx, &mut current.moe_out)
+                        })?;
+                    }
 
                     let _nvtx_shared_hc = crate::nvtx::range("dsv4/shared_hc");
                     let (shared_out, shared_scratch) = kv_adapter.shared_expert_decode_mut();
@@ -5727,7 +5924,7 @@ impl Dsv4Model {
         );
         if let Some(sched) = verify
             && tokens.len() <= MAX_SPEC_VERIFY_ROWS
-            && !dsv4_use_deepep_transport()?
+            && !crate::runtime_flags::dsv4_moe_transport()?.is_deepep()
         {
             return self.forward_tokens_verify_stream_persistent(
                 slot, kv_adapter, tokens, start_pos, sched,
@@ -5738,8 +5935,9 @@ impl Dsv4Model {
         let hc_mult = self.config.hc_mult;
         let stream_dim = hidden_size * hc_mult;
         let seq_len = tokens.len();
+        let mega_epoch = self.begin_mega_moe_forward(seq_len)?;
         let eps = self.config.rms_norm_eps;
-        let use_deepep_transport = dsv4_use_deepep_transport()?;
+        let use_deepep_transport = crate::runtime_flags::dsv4_moe_transport()?.is_deepep();
         // DSpark T3: capture the wide stream at each target layer output. One bool
         // check per layer when off; the position scan only runs when on.
         let dspark = self.config.is_dspark();
@@ -6074,9 +6272,8 @@ impl Dsv4Model {
                 let mut moe_out = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
                 // DeepEP combine already reduces the EP-sharded routed output; the
                 // non-deepep path needs the explicit TP all-reduce below.
-                let needs_moe_allreduce = !use_deepep_transport;
                 let (mut shared_out, mut shared_scratch) = kv_adapter.shared_expert_decode_mut();
-                if use_deepep_transport {
+                let needs_moe_allreduce = if use_deepep_transport {
                     #[cfg(feature = "deepep")]
                     {
                         let transport = self.deepep.as_ref().ok_or_else(|| {
@@ -6131,6 +6328,7 @@ impl Dsv4Model {
                                 &mut keepalive,
                             )?;
                         }
+                        false
                     }
                     #[cfg(not(feature = "deepep"))]
                     {
@@ -6145,8 +6343,9 @@ impl Dsv4Model {
                         &mut moe_out,
                         &mut keepalive,
                         None,
-                    )?;
-                }
+                        mega_epoch,
+                    )?
+                };
                 keepalive.keep_hidden(&moe_out);
                 let _nvtx_shared_hc = crate::nvtx::range("dsv4/shared_hc");
                 let mut shared_owned = None;
@@ -6391,7 +6590,7 @@ impl Dsv4Model {
              --mtp-draft-tokens)"
         );
         ensure!(
-            !dsv4_use_deepep_transport()?,
+            !crate::runtime_flags::dsv4_moe_transport()?.is_deepep(),
             "DSv4 MTP Phase 1 supports allreduce transport only"
         );
         let mtp = self
@@ -6400,6 +6599,7 @@ impl Dsv4Model {
             .ok_or_else(|| anyhow!("DSv4 MTP requested but the draft head is not loaded"))?;
         let m = rows.len();
         ensure!(m > 0 && h_prevs.len() == m, "DSv4 MTP level shape mismatch");
+        let mega_epoch = self.begin_mega_moe_forward(m)?;
         let hidden_size = self.config.hidden_size;
         let hc_mult = self.config.hc_mult;
         let stream_dim = hidden_size * hc_mult;
@@ -6587,7 +6787,7 @@ impl Dsv4Model {
         let level_tokens: Vec<u32> = rows.iter().map(|r| r.token).collect();
         // SAFETY: uninit device scratch; fully written before first read.
         let mut moe_out = unsafe { HiddenStates::uninit(ctx, hidden_size, m)? };
-        crate::moe::dsv4_moe_forward(
+        let needs_moe_allreduce = crate::moe::dsv4_moe_forward(
             self,
             layer.moe.as_ref().expect("DSv4 layer.moe"),
             &level_tokens,
@@ -6595,8 +6795,11 @@ impl Dsv4Model {
             &mut moe_out,
             &mut keepalive,
             None,
+            mega_epoch,
         )?;
-        self.tp.all_reduce_sum(ctx, &mut moe_out)?;
+        if needs_moe_allreduce {
+            self.tp.all_reduce_sum(ctx, &mut moe_out)?;
+        }
         // SAFETY: uninit device scratch; fully written before first read.
         let mut shared = unsafe { HiddenStates::uninit(ctx, hidden_size, m)? };
         crate::moe::dsv4_shared_expert_forward(
@@ -6868,7 +7071,10 @@ impl Dsv4Model {
             slot.max_seq_len
         );
         ensure!(
-            !dsv4_use_deepep_transport()?,
+            matches!(
+                crate::runtime_flags::dsv4_moe_transport()?,
+                crate::runtime_flags::Dsv4MoeTransport::AllReduce
+            ),
             "DSv4 decode graph v1 supports the allreduce transport only"
         );
 
@@ -7355,21 +7561,6 @@ fn dsv4_dense_mlp_forward(
     // out = down_w · act  → [hidden, tok]
     crate::attention::dsv4_linear(ctx, &dense.down, &act, out)?;
     Ok(())
-}
-
-fn dsv4_use_deepep_transport() -> Result<bool> {
-    let value = std::env::var("ARLE_DSV4_MOE_TRANSPORT")
-        .or_else(|_| std::env::var("ARLE_DSV4_MOE_BACKEND"))
-        .unwrap_or_else(|_| "allreduce".to_string());
-    match value.as_str() {
-        "allreduce" | "all_reduce" | "native" | "scalar" | "static" | "deepgemm" | "" => Ok(false),
-        "deepep" | "native-deepep" | "native_deepep" | "deepep_ll" | "deepep-ll"
-        | "deepep_low_latency" | "native_deepep_ll" => Ok(true),
-        other => bail!(
-            "unsupported ARLE_DSV4_MOE_TRANSPORT/ARLE_DSV4_MOE_BACKEND `{other}` \
-             (expected allreduce, deepep, or deepep_ll)"
-        ),
-    }
 }
 
 fn dsv4_decode_graph_enabled() -> bool {

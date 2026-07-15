@@ -31,6 +31,22 @@ unsafe extern "C" {
         out: *mut Sm90MegaMoeWorkspaceLayoutRaw,
     ) -> CUresult;
 
+    pub fn dsv4_sm90_mega_moe_pre_dispatch_cuda(
+        hidden_states: *const Half,
+        route_indices: *const i32,
+        route_weights: *const f32,
+        workspace_x: *mut u8,
+        workspace_x_sf: *mut f32,
+        workspace_topk_idx: *mut i64,
+        workspace_topk_weights: *mut f32,
+        num_tokens: i32,
+        padded_max_tokens: i32,
+        hidden: i32,
+        num_topk: i32,
+        enable_pdl: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn dsv4_sm90_mega_moe_launch_cuda(
         y: *mut Half,
         cumulative_local_expert_recv_stats: *mut i32,

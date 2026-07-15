@@ -14,6 +14,7 @@ use cuda_kernels::prelude::{DeviceContext, HiddenStates};
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 use half::bf16;
 
+use crate::runtime_flags::Dsv4MoeTransport;
 use crate::tp::TpRuntime;
 
 pub(crate) struct DeepEpTransport {
@@ -87,30 +88,6 @@ enum DeepEpMode {
 }
 
 impl DeepEpTransport {
-    /// Which DSv4 MoE transport the env selects: normal intranode DeepEP
-    /// (`deepep`) vs the NVSHMEM low-latency token-owned path (`deepep_ll`).
-    fn selected_mode() -> Option<DeepEpMode> {
-        let pick = |v: &str| -> Option<DeepEpMode> {
-            match v {
-                "deepep" | "native-deepep" | "native_deepep" => Some(DeepEpMode::Intranode),
-                "deepep_ll" | "deepep-ll" | "deepep_low_latency" | "native_deepep_ll" => {
-                    Some(DeepEpMode::LowLatency)
-                }
-                _ => None,
-            }
-        };
-        std::env::var("ARLE_DSV4_MOE_TRANSPORT")
-            .ok()
-            .as_deref()
-            .and_then(pick)
-            .or_else(|| {
-                std::env::var("ARLE_DSV4_MOE_BACKEND")
-                    .ok()
-                    .as_deref()
-                    .and_then(pick)
-            })
-    }
-
     /// `true` when the LL token-owned path is selected.
     pub(crate) fn is_low_latency(&self) -> bool {
         self.ll.is_some()
@@ -207,9 +184,10 @@ impl DeepEpTransport {
         hidden: usize,
         num_experts: usize,
     ) -> Result<Option<Self>> {
-        let mode = match Self::selected_mode() {
-            Some(mode) => mode,
-            None => return Ok(None),
+        let mode = match crate::runtime_flags::dsv4_moe_transport()? {
+            Dsv4MoeTransport::DeepEp => DeepEpMode::Intranode,
+            Dsv4MoeTransport::DeepEpLowLatency => DeepEpMode::LowLatency,
+            Dsv4MoeTransport::AllReduce | Dsv4MoeTransport::MegaMoe => return Ok(None),
         };
         ensure!(deepep_sys::is_native(), "deepep-sys was built as a stub");
         let cfg = tp.config();

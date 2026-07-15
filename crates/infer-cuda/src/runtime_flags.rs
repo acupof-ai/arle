@@ -5,7 +5,42 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering::Relaxed};
 
+use anyhow::{Result, bail};
 use infer_seam::{CommBackend, CudaRuntimeFlags};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Dsv4MoeTransport {
+    AllReduce,
+    DeepEp,
+    DeepEpLowLatency,
+    MegaMoe,
+}
+
+impl Dsv4MoeTransport {
+    pub(crate) fn is_deepep(self) -> bool {
+        matches!(self, Self::DeepEp | Self::DeepEpLowLatency)
+    }
+}
+
+pub(crate) fn dsv4_moe_transport() -> Result<Dsv4MoeTransport> {
+    let value = std::env::var("ARLE_DSV4_MOE_TRANSPORT")
+        .or_else(|_| std::env::var("ARLE_DSV4_MOE_BACKEND"))
+        .unwrap_or_else(|_| "allreduce".to_string());
+    match value.as_str() {
+        "allreduce" | "all_reduce" | "native" | "scalar" | "static" | "deepgemm" | "" => {
+            Ok(Dsv4MoeTransport::AllReduce)
+        }
+        "deepep" | "native-deepep" | "native_deepep" => Ok(Dsv4MoeTransport::DeepEp),
+        "deepep_ll" | "deepep-ll" | "deepep_low_latency" | "native_deepep_ll" => {
+            Ok(Dsv4MoeTransport::DeepEpLowLatency)
+        }
+        "mega_moe" => Ok(Dsv4MoeTransport::MegaMoe),
+        other => bail!(
+            "unsupported ARLE_DSV4_MOE_TRANSPORT/ARLE_DSV4_MOE_BACKEND `{other}` \
+             (expected allreduce, deepep, deepep_ll, or mega_moe)"
+        ),
+    }
+}
 
 /// `usize::MAX` / `0` sentinels mean "unset → built-in default".
 static SHARD_CACHE_BYTES: AtomicUsize = AtomicUsize::new(usize::MAX);

@@ -48,6 +48,23 @@ extern "C" CUresult dsv4_sm90_mega_moe_workspace_layout_cuda(
   return CUDA_ERROR_NOT_SUPPORTED;
 }
 
+extern "C" CUresult dsv4_sm90_mega_moe_pre_dispatch_cuda(
+    const unsigned short*,
+    const int*,
+    const float*,
+    unsigned char*,
+    float*,
+    int64_t*,
+    float*,
+    int,
+    int,
+    int,
+    int,
+    int,
+    CUstream) {
+  return CUDA_ERROR_NOT_SUPPORTED;
+}
+
 extern "C" CUresult dsv4_sm90_mega_moe_launch_cuda(
     void*,
     int*,
