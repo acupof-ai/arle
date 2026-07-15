@@ -1,0 +1,27 @@
+crates/cuda-kernels/csrc/attention/arle_fa2_sm70.cu
+  s_67038b17df7668::t_f8ca36f4069a65 1-199
+crates/cuda-kernels/src/attention.rs
+  s_67038b17df7668::t_01847bee14d34d 653-788
+crates/cuda-kernels/src/ffi/attention.rs
+  s_67038b17df7668::t_2eb7d25a6a26ac 173-192
+crates/infer-cuda/src/qwen35.rs
+  s_67038b17df7668::t_fdaa26a57dd975 199-214,5038-5059,5118-5135
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "8b0cda318890f3b0a91c123abaceb064be428331",
+  "prompts": {},
+  "sessions": {
+    "s_67038b17df7668": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c4b3468e-feff-42b1-aa89-1f360f19b20b",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
