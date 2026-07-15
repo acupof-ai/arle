@@ -1,0 +1,75 @@
+crates/cuda-kernels/build.rs
+  s_95998eccb703a2::t_18f1faf53da3d6 1813
+crates/cuda-kernels/csrc/gemm/deepgemm_bridge_stub.cu
+  s_95998eccb703a2::t_212c23193b2b5a 51-67
+crates/cuda-kernels/csrc/gemm/deepgemm_native.cu
+  s_95998eccb703a2::t_6474b985991955 1864-1865,1898-1962,1994-1996
+crates/cuda-kernels/csrc/moe/dsv4_route.cu
+  s_aa970b1e4a3552::t_352d7e0f6ee48d 1518-1555
+crates/cuda-kernels/src/ffi/gemm.rs
+  s_95998eccb703a2::t_5797db875ccfcf 34-49
+crates/cuda-kernels/src/ffi/moe.rs
+  s_aa970b1e4a3552::t_bf6b538121dbef 100-108
+crates/cuda-kernels/src/moe.rs
+  s_cbac1d54da53ea::t_0fc541c3df750d 5,28-72,94-199
+crates/cuda-kernels/vendor/deepgemm/deep_gemm/include/deep_gemm/impls/sm90_mega_moe_pre_dispatch.cuh
+  s_483311ae2757bc::t_0c77dda3c6bc08 1-105
+crates/infer-cuda/src/deepep.rs
+  s_483311ae2757bc::t_7376a6c42dd3ea 17,187-190
+crates/infer-cuda/src/dsv4.rs
+  s_cbac1d54da53ea::t_f8fad95640a11e 547-548,553-628,1868-1875,1881-1887,1900-1988,2238-2239,2957,2975-2978,3318,3359,4887,4895,4900-4903,5063,5107,5360,5368,5371,5592,5605,5788,5796,5799-5804,5927,5938,5940,6276,6331,6346-6348,6593,6602,6790,6798,6800-6802,7074-7077
+crates/infer-cuda/src/dsv4/dspark.rs
+  s_483311ae2757bc::t_2fc4262e223adc 212,401,409,411-413
+crates/infer-cuda/src/executor/dsv4.rs
+  s_cbac1d54da53ea::t_d70357a6aaa575 398,574
+crates/infer-cuda/src/loader.rs
+  s_aa970b1e4a3552::t_77f2f833db642b 3524-3528,3591-3609
+crates/infer-cuda/src/moe.rs
+  s_cbac1d54da53ea::t_97fcf29d01b4cd 2921-2922,2974-3047,3057-3058,4767-4772,4784,4820-4823,4825-4842,5106-5108
+crates/infer-cuda/src/runtime_flags.rs
+  s_483311ae2757bc::t_33add5c486642f 8,11-44
+crates/infer-cuda/src/tp.rs
+  s_cbac1d54da53ea::t_cf0319b5fca137 106-142,662-795,1034,1038-1041,1044,1052,1058-1064,1066,1074,1078,1091,1099,1105-1110,1112,1120,1124,1137,1144-1189,1249,1254-1259,1293-1297,1300
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "91d105f3f6189be96aedb1b5f6e68d976e75ddac",
+  "prompts": {},
+  "sessions": {
+    "s_483311ae2757bc": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f605c-5195-7383-880b-feb3cf5bb44e",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_95998eccb703a2": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f5e9c-17a0-7c63-bb76-cfb2f797e0e9",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_aa970b1e4a3552": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f5ebb-f1a4-7651-898f-0be36fe6b396",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_cbac1d54da53ea": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f5e9b-c754-7170-ba19-53745faa66e6",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
