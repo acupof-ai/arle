@@ -1,0 +1,43 @@
+crates/cuda-kernels/csrc/attention/dsv4_compressor.cu
+  s_67038b17df7668::t_d5735729e39198 3-29,31-32,40,42,45,47-49,58,60-61,83,85-87,89-92,126-130,151,172-173,244-245,263-264,313-351,695-734
+crates/cuda-kernels/csrc/gemm/gemv.cu
+  s_804b466310e58e::t_a4491a4e56aaaa 819-865
+crates/cuda-kernels/src/ffi/gemm.rs
+  s_804b466310e58e::t_ac2e76fb0df65b 94-103
+crates/cuda-kernels/src/ffi/misc.rs
+  s_67038b17df7668::t_915fef8590ffd9 360-386
+crates/infer-cuda/src/attention.rs
+  s_67038b17df7668::t_9b50a9d4bcafcb 22-23,86-87,1706-1717,7599-7764,7837-7866
+crates/infer-cuda/src/dsv4.rs
+  s_804b466310e58e::t_18e5b171c7f33e 118-119,124,133-138
+crates/infer-cuda/src/loader.rs
+  s_67038b17df7668::t_d3e2cc720c7cc4 4162,4537,4548-4581,4589,4639
+scripts/convert_gptq_to_w4a16.py
+  s_67038b17df7668::t_0e45d0e41eae60 1-257
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "8f79163bda56d54de0302889ff23f82fff8c00e6",
+  "prompts": {},
+  "sessions": {
+    "s_67038b17df7668": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c4b3468e-feff-42b1-aa89-1f360f19b20b",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_804b466310e58e": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f64f8-0cb8-7b31-8128-2318478c5ed7",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
