@@ -196,6 +196,22 @@ fn qwen35_gdr_chunked_enabled() -> bool {
     crate::runtime_flags::qwen35_gdr_chunked()
 }
 
+/// sm_70 (V100) has no FA3 (sm_80+ CUTLASS-3.x) and no BF16 compute — the
+/// hand-written `arle_fa2_sm70_attention_cuda` (FA2, FP16 half2 math, BF16 I/O)
+/// is the SOTA option. `major < 8` covers sm_70 and sm_75. Latched once.
+/// `ARLE_QWEN35_FA2_SM70=0` forces the naive FP32 SIMT fallback (A/B use).
+fn qwen35_fa2_sm70_enabled(ctx: &DeviceContext) -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let (major, _minor) = ctx.compute_capability();
+        major < 8
+            && !matches!(
+                std::env::var("ARLE_QWEN35_FA2_SM70").as_deref(),
+                Ok("0") | Ok("false") | Ok("off")
+            )
+    })
+}
+
 /// Raw (un-scaled) LoRA A/B matrices for one student projection, pushed from
 /// the train crate's OPD student loop for the per-step re-merge.
 ///
@@ -5019,6 +5035,28 @@ impl Qwen35Model {
                             };
                             ffi::arle_fa3_fwd_hd256_bf16_cuda(&args, self.ctx.stream.cu_stream())
                                 .result()?;
+                        } else if seq_len == 1
+                            && qwen35_fa2_sm70_enabled(&self.ctx)
+                            && !crate::runtime_flags::qwen35_decode_graph()
+                        {
+                            // FA2 sm_70 decode (eager). The host kv_len arg is
+                            // not graph-replay safe, so captured decode falls
+                            // through to the devpos kernel below.
+                            ffi::arle_fa2_sm70_attention_cuda(
+                                q_ptr as *const ffi::Half,
+                                kc_ptr as *const ffi::Half,
+                                vc_ptr as *const ffi::Half,
+                                o_ptr as *mut ffi::Half,
+                                self.local_q_heads as i32,
+                                self.local_kv_heads as i32,
+                                c.head_dim as i32,
+                                seq_len as i32,
+                                kv_len as i32,
+                                max_seq_len as i32,
+                                sm_scale,
+                                self.ctx.stream.cu_stream(),
+                            )
+                            .result()?;
                         } else if seq_len == 1 {
                             let (sp_ptr, _g4) = start_pos_dev.device_ptr(&self.ctx.stream);
                             ffi::nonpaged_prefill_attention_devpos_cuda(
@@ -5077,6 +5115,24 @@ impl Qwen35Model {
                             };
                             ffi::arle_fa3_fwd_hd256_bf16_cuda(&args, self.ctx.stream.cu_stream())
                                 .result()?;
+                        } else if qwen35_fa2_sm70_enabled(&self.ctx) {
+                            // FA2 sm_70 prefill (SOTA on V100; FA3 is sm_80+).
+                            // Causal chunked-prefill; same buffers as naive.
+                            ffi::arle_fa2_sm70_attention_cuda(
+                                q_ptr as *const ffi::Half,
+                                kc_ptr as *const ffi::Half,
+                                vc_ptr as *const ffi::Half,
+                                o_ptr as *mut ffi::Half,
+                                self.local_q_heads as i32,
+                                self.local_kv_heads as i32,
+                                c.head_dim as i32,
+                                seq_len as i32,
+                                kv_len as i32,
+                                max_seq_len as i32,
+                                sm_scale,
+                                self.ctx.stream.cu_stream(),
+                            )
+                            .result()?;
                         } else {
                             ffi::nonpaged_prefill_attention_cuda(
                                 q_ptr as *const ffi::Half,

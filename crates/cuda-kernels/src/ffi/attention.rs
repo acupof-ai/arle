@@ -172,6 +172,26 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    /// Hand-written FA2-style forward attention for sm_70 (V100). BF16 I/O,
+    /// FP16 (half2) internal math, FP32 accumulation. Tiled online softmax
+    /// (Br=8 Q tokens, Bc=16 KV tiles), causal chunked-prefill semantics.
+    /// Drop-in replacement for [`nonpaged_prefill_attention_cuda`] on sm_70
+    /// where FA3 (sm_80+) is unavailable. Same strides and layout.
+    pub fn arle_fa2_sm70_attention_cuda(
+        q: *const Half,
+        k_cache: *const Half,
+        v_cache: *const Half,
+        out: *mut Half,
+        num_q_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        seq_len: i32,
+        kv_len: i32,
+        max_seq_len: i32,
+        sm_scale: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
     /// DSpark draft dense MLA-latent attention (T4.1). Non-causal: every one of
     /// `block_size` query rows attends the whole `[kv_len]` latent range (draft
     /// context ++ noise block). MLA has NO separate V — K and V are the SAME
