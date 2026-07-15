@@ -2,7 +2,7 @@
 """Generate a JSONL workload with controlled warm/cold prefix mix.
 
 Purpose: provide a deterministic dataset that exercises ARLE's
-PrefixAwareAdmission gate. Synthetic guidellm random data has no prefix
+PrefixAwareAdmission gate. Independent synthetic requests have no prefix
 overlap → all requests look "cold" → PrefixAware gate fires but win
 mechanism (warm session reuse) is not measurable.
 
@@ -10,7 +10,7 @@ This generator emits N requests where:
   - W% share one of K shared prefixes ("warm sessions")
   - (100-W)% have unique random suffixes (cold)
 
-Output is JSONL compatible with `guidellm benchmark run --data <path>`.
+Output is JSONL compatible with `bench_throughput.py --prompts-jsonl <path>`.
 
 Usage:
   ./scripts/gen_36_warm_prefix_mix.py \\

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Non-streaming single-user latency/throughput probe for the Metal serve path.
 
-The rewrite Metal backend defers `stream=true` (R5 tranche 2), so guidellm's
+The rewrite Metal backend defers `stream=true` (R5 tranche 2), so the native
 streaming TTFT/ITL collection can't run against it. This derives the same
 single-stream numbers from two non-streaming latency points:
 

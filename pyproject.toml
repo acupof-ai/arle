@@ -35,7 +35,6 @@ dev = [
 ]
 bench = [
     "httpx==0.28.1",
-    "guidellm[recommended]>=0.3",
 ]
 observe = [
     "wandb>=0.19",

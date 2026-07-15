@@ -1,6 +1,6 @@
 # GPU Profiling Guide
 
-> **TL;DR:** For benchmarking, use `scripts/bench_guidellm.sh --help`. For profiling, start `arle serve` and capture with `scripts/profile_nsys_guidellm.sh`. This document covers pitfalls and diagnostic paths, not CLI reference.
+> **TL;DR:** Benchmark with `scripts/bench_throughput.py`; profile with `scripts/profile_nsys_bench.sh`. This document covers pitfalls, not CLI reference.
 >
 > **Status:** Current for the rewrite stack (`arle serve`). Historical examples that used the deleted legacy benchmark binary were removed.
 
@@ -18,10 +18,12 @@ Start the server, then attach a profiling load:
 ./target/release/arle serve --backend cuda --model-path /path/to/model --port 8000
 
 # Terminal 2
-scripts/profile_nsys_guidellm.sh cuda-local \
-  --target http://127.0.0.1:8000 \
+scripts/profile_nsys_bench.sh cuda-local \
+  --url http://127.0.0.1:8000 \
   --model Qwen/Qwen3-4B \
-  --fast \
+  --prompts-jsonl data/prompts.jsonl \
+  --concurrency-grid 16 \
+  --seconds-per-concurrency 20 \
   --delay-seconds 8 \
   --duration-seconds 12
 ```
@@ -88,32 +90,35 @@ Normal pattern: `cuMemcpyHtoDAsync` is dominated by model loading (one-time). Du
 Two profiles isolate prefill and decode paths for per-model optimization.
 
 ```bash
-# Canonical latency / throughput sweep against a running arle server
-scripts/bench_guidellm.sh cuda-local --target http://127.0.0.1:8000
-
-# Fast profiling anchor: 4096 input tokens + 256 output tokens at c=16
-scripts/bench_guidellm.sh cuda-local --target http://127.0.0.1:8000 --fast
-
-# Quick concurrency curve: c=1,2,4,8 with 512 input + 128 output tokens
-scripts/bench_guidellm.sh cuda-local --target http://127.0.0.1:8000 --quick
+# Canonical fixed-concurrency curve against a running server.
+python3 scripts/bench_throughput.py \
+  --url http://127.0.0.1:8000 \
+  --model Qwen/Qwen3-4B \
+  --prompts-jsonl data/prompts.jsonl \
+  --concurrency-grid 1,4,8,16 \
+  --seconds-per-concurrency 120 \
+  --output bench-output/cuda-local/bench
 ```
 
 ## Diagnosing Decode Degradation With Sequence Length
 
-If GuideLLM or service stats show TPOT degrading significantly as context grows, use comparative traces to pinpoint the offending kernel:
+If the native benchmark or service stats show ITL degrading as context grows,
+use comparative traces to pinpoint the offending kernel:
 
 ```bash
 # Short-context trace
-scripts/profile_nsys_guidellm.sh cuda-ctx-short \
-  --target http://127.0.0.1:8000 \
+scripts/profile_nsys_bench.sh cuda-ctx-short \
+  --url http://127.0.0.1:8000 \
   --model Qwen/Qwen3-4B \
-  --quick \
+  --prompts-jsonl data/short-context.jsonl \
+  --concurrency-grid 16 \
+  --seconds-per-concurrency 20 \
   --delay-seconds 8 \
   --duration-seconds 12
 
 # Long-context trace
-scripts/profile_nsys_guidellm.sh cuda-ctx-long \
-  --target http://127.0.0.1:8000 \
+scripts/profile_nsys_bench.sh cuda-ctx-long \
+  --url http://127.0.0.1:8000 \
   --model Qwen/Qwen3-4B \
   --bench bench-output/<existing-longctx-bench>
 ```

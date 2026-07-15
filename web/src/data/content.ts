@@ -338,8 +338,8 @@ const BENCH_ROWS_EN: BenchRow[] = [
       { key: "vs legacy", value: "+64", unit: "%" },
       { key: "kv util", value: "69", unit: "%" },
     ],
-    cmd: "scripts/bench_guidellm.sh cuda-l4-hbm-tier-fp8-auto",
-    href: "https://github.com/cklxx/arle/blob/main/docs/experience/wins/2026-04-28-bench-guidellm-cuda-l4-kv-fp8-auto.md",
+    cmd: "python3 scripts/bench_throughput.py --concurrency-grid 16 --max-tokens 256",
+    href: "https://github.com/cklxx/arle/blob/main/docs/support-matrix.md",
   },
   {
     date: "2026-04-27",
@@ -412,8 +412,8 @@ const BENCH_ROWS_ZH: BenchRow[] = [
       { key: "对比 legacy", value: "+64", unit: "%" },
       { key: "KV 利用率", value: "69", unit: "%" },
     ],
-    cmd: "scripts/bench_guidellm.sh cuda-l4-hbm-tier-fp8-auto",
-    href: "https://github.com/cklxx/arle/blob/main/docs/experience/wins/2026-04-28-bench-guidellm-cuda-l4-kv-fp8-auto.md",
+    cmd: "python3 scripts/bench_throughput.py --concurrency-grid 16 --max-tokens 256",
+    href: "https://github.com/cklxx/arle/blob/main/docs/support-matrix.md",
   },
   {
     date: "2026-04-27",
@@ -755,7 +755,7 @@ export const EN: Locale = {
     bench: {
       title: "Bench",
       caption:
-        'Dated, reproducible snapshots straight from <a href="https://github.com/cklxx/arle/tree/main/docs/experience/wins"><code>docs/experience/wins/</code></a>. Numbers come out of <code>scripts/bench_guidellm.sh</code> and the canonical step-driver smokes — nothing is curated.',
+        'Dated, reproducible snapshots straight from <a href="https://github.com/cklxx/arle/tree/main/docs/experience/wins"><code>docs/experience/wins/</code></a>. Numbers come out of <code>scripts/bench_throughput.py</code> and the canonical step-driver smokes — nothing is curated.',
       rows: BENCH_ROWS_EN,
     },
     matrix: {
@@ -855,7 +855,7 @@ export const ZH: Locale = {
     bench: {
       title: "基准",
       caption:
-        '直接来自 <a href="https://github.com/cklxx/arle/tree/main/docs/experience/wins"><code>docs/experience/wins/</code></a> 的带日期快照。数字出自 <code>scripts/bench_guidellm.sh</code> 与标准 step-driver 冒烟，未做挑选。',
+        '直接来自 <a href="https://github.com/cklxx/arle/tree/main/docs/experience/wins"><code>docs/experience/wins/</code></a> 的带日期快照。数字出自 <code>scripts/bench_throughput.py</code> 与标准 step-driver 冒烟，未做挑选。',
       rows: BENCH_ROWS_ZH,
     },
     matrix: {

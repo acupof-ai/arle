@@ -351,13 +351,9 @@ mechanical changes.
 
 - **Spec — always read first:**
   [`docs/bench-and-trace-spec.md`](docs/bench-and-trace-spec.md) — mandatory
-  report sections (Goal · Hypothesis · Params · Env · Results · Problems ·
-  Learnings), goal taxonomy, watch-list, **auto-iteration rules** (§6: when to
-  loop/stop, information-volume triggers), and **§7 hard-won protocol rules**
-  (correctness gate, sweep≠fixed-c, duration adequacy, param-alignment via §3.2
-  envelope log, server lifecycle hygiene). Internal info sources (§3: `/v1/stats`
-  service trace, scheduling envelope, K6 OOM detector) are first-class report
-  content. Applies to benchmarks and traces.
+  report sections, fixed-concurrency A/B contract, correctness gate, server and
+  cache hygiene, duration rules, tracing timestamps, and licensing gate. Applies
+  to benchmarks and traces.
 - **MANDATORY — every runtime change produces a bench entry.** A diff isn't
   "done" until a dated entry lands under `docs/experience/wins/` (or `errors/` on
   regression). Verify-phase exit condition. No entry → not shipped.
@@ -366,25 +362,23 @@ mechanical changes.
     feature-flag default flips, hot-path dep bumps.
   - **Exempt:** docs / `AGENTS.md` / `CLAUDE.md` / memory / dev-only tooling /
     gitignored output. State so in the commit body.
-  - **Minimum:** one `scripts/bench_guidellm.sh` run vs latest baseline for the
-    affected backend+model, with Δ% row. Full sweep only for optimization /
-    architectural changes.
+  - **Minimum:** one `python3 scripts/bench_throughput.py ...` run vs latest
+    baseline for the affected backend+model, with Δ% row. Use the full
+    `1,4,8,16` grid for optimization / architectural changes.
   - **Can't run locally** (e.g. CUDA on a Mac): commit body cites the remote
     ticket; stub the `wins/` entry with `pending-remote`. No silent skips.
-  - **Auto-iterate** per spec §7; cross-link wins back to the commissioning
+  - **Auto-iterate** per spec §6; cross-link wins back to the commissioning
     project/plan.
-- Snapshot to `docs/experience/wins/YYYY-MM-DD-bench-guidellm-<label>.md` using
-  the [`TEMPLATE-bench-guidellm.md`](docs/experience/wins/TEMPLATE-bench-guidellm.md)
+- Snapshot to `docs/experience/wins/YYYY-MM-DD-bench-<label>.md` using
+  the [`TEMPLATE-bench.md`](docs/experience/wins/TEMPLATE-bench.md)
   skeleton. **Never overwrite**; after-snapshots cite before-snapshots with deltas.
-- **Canonical tool: `scripts/bench_guidellm.sh <label>`** — thin wrapper around
-  [`vllm-project/guidellm`](https://github.com/vllm-project/guidellm) (vLLM
-  official, LLM-native TTFT/ITL/tok-s, sweep profile, HTML report). Canonical
-  params locked in
-  [`docs/plans/guidellm-integration.md`](docs/plans/guidellm-integration.md) §3 —
-  changing them is a deliberate commit, not a flag flip.
+- **Canonical tool: `scripts/bench_throughput.py`** — the repo-native
+  OpenAI-compatible streaming runner. Canonical params are locked in
+  [`docs/plans/native-bench.md`](docs/plans/native-bench.md); changing them is a
+  deliberate commit, not a flag flip.
 - Include: GPU model, CUDA/Metal version, model, num_slots, non-default flags,
-  feature set. Raw output table, not summaries. Install once:
-  `pip install -e .[bench]` (guidellm ships in the `bench` extra).
+  feature set. Preserve the raw JSON and CSV, not only summaries. Install once:
+  `pip install -e .[bench]`.
 
 ### Docs lifecycle & progress spine
 

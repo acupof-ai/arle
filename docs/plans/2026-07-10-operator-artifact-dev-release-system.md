@@ -263,7 +263,7 @@ fallback count
 
 Do not use exact shape as a metrics label.
 
-Fix `scripts/bench_guidellm.sh` to parse the current JSON stats schema. A
+Keep `scripts/bench_throughput.py` aligned with the current JSON stats schema. A
 self-test requires raw stats, trace JSONL, rendered summary, and an independent
 launch counter to agree.
 
@@ -350,7 +350,7 @@ Files:
 - `crates/infer-server/src/execution.rs`
 - `crates/infer-server/src/multiproc_relay.rs`
 - `crates/infer-server/src/schema.rs`
-- `scripts/bench_guidellm.sh`
+- `scripts/bench_throughput.py`
 
 Work:
 

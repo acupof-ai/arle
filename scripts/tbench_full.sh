@@ -4,7 +4,7 @@
 # (qemu/kernel/swe-bench) fail on pod infra not capability — read per-task.
 set +e
 ROOT=/host/arle-build; ARLE=$ROOT/target/release/arle; MODEL=/host/Qwen3.6-27B-FP8
-PY=/host/guidellm-venv/bin/python
+PY=${PY:-python3}
 W=/host/tb_full; rm -rf $W; mkdir -p $W
 PORT=${PORT:-18300}; GPU=${GPU:-5}   # 5-7 free; 1-4 held by another pod job
 LORA=/host/tb_lora/adapters_replay/adapter_model.safetensors

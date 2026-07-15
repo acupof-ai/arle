@@ -100,6 +100,6 @@ shows. Read each project's own docs before committing.
   the canonical answer.
 
 If after reading this you are still on the fence, the lowest-cost test is to
-pull `ghcr.io/cklxx/arle:latest` and run [`scripts/bench_guidellm.sh`](../scripts/bench_guidellm.sh)
+pull `ghcr.io/cklxx/arle:latest` and run [`scripts/bench_throughput.py`](../scripts/bench_throughput.py)
 against your own traffic profile, then compare to the same workload on the
 runtime you would have picked otherwise.

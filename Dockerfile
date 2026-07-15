@@ -48,16 +48,14 @@ COPY requirements-build.txt /tmp/requirements-build.txt
 # requirements-build.txt pins the cu12 stack (torch 2.9.1+cu129 + tilelang
 # 0.1.11 + apache-tvm-ffi 0.1.11); it is the only build-critical Python set —
 # build.rs imports tilelang for AOT codegen, setup.sh uses huggingface_hub.
-# guidellm is the dev-image bench client. flashinfer-python is intentionally
-# NOT installed here: 0.6.9 pulls nvidia-cutlass-dsl → cuda-python 13.x, whose
+# flashinfer-python is intentionally NOT installed here: 0.6.9 pulls
+# nvidia-cutlass-dsl → cuda-python 13.x, whose
 # ffi double-registers against tilelang's apache-tvm-ffi (`__ffi_repr__ already
 # registered`, build.rs:1037) and breaks the cargo build. ARLE's runtime is
 # Rust-native (no Python on the hot path) and the published `runtime` stage
 # ships only the arle binary, so flashinfer is unused — keep the build green.
 RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel \
-    && python3 -m pip install --no-cache-dir -r /tmp/requirements-build.txt \
-    && python3 -m pip install --no-cache-dir \
-      "guidellm[recommended]==0.6.0"
+    && python3 -m pip install --no-cache-dir -r /tmp/requirements-build.txt
 
 FROM python-deps AS dev
 

@@ -91,7 +91,7 @@ round's adapter → the bash loop can't chain. Serve *does* load adapters
    `cc-convert`; make `run_agent_opd_replay` honor `--update-strategy`. (cc-harness
    + SAO Phase 1/2 together.)
 6. **Perf follow-up** — hot-reload adapter + #92 epoch-invalidation to kill the
-   per-round model-reload; guidellm A/B for the sidecar prefill savings.
+   per-round model reload; native fixed-concurrency A/B for sidecar prefill savings.
 
 ## Non-goals (now)
 

@@ -2,7 +2,7 @@
 # pf83_bench_health.sh — operationalizes SKILL kernel-optimization v1.12.0 #34b:
 # when bench reports 0 successful → CHECK SERVER LOG FIRST before debugging tool.
 #
-# Single-shot diagnostic for any guidellm bench-output dir + paired server log.
+# Single-shot diagnostic for a native bench output + paired server log.
 # Outputs 3-line verdict so you know whether to debug bench-tool quirks vs
 # debug kernel failure vs proceed to license decision.
 #
@@ -16,7 +16,7 @@
 # Exit codes:
 #   0 = healthy bench (succeeded, ready for license decision)
 #   1 = bench produced 0 successful requests AND server log shows kernel failure (substrate KILL signal)
-#   2 = bench produced 0 successful requests but server log clean (likely tool quirk — check guidellm CLI)
+#   2 = bench produced 0 successful requests but server log clean
 #   3 = bench produced no output at all (didn't run / save crash)
 #   4 = usage error
 
@@ -35,23 +35,21 @@ if [[ ! -d "$BENCH_DIR" ]]; then
   exit 4
 fi
 
-# 1. Did guidellm produce a results file?
-RESULTS_JSON="$(find "$BENCH_DIR" -maxdepth 2 -name 'results.json' -o -name 'benchmarks.json' 2>/dev/null | head -1)"
-RESULTS_HTML="$(find "$BENCH_DIR" -maxdepth 2 -name '*.html' 2>/dev/null | head -1)"
+# 1. Did the native runner produce a result?
+RESULTS_JSON="$(find "$BENCH_DIR" -maxdepth 2 -name 'bench_throughput.json' 2>/dev/null | head -1)"
 
-if [[ -z "$RESULTS_JSON" && -z "$RESULTS_HTML" ]]; then
+if [[ -z "$RESULTS_JSON" ]]; then
   echo "VERDICT: BENCH-NO-OUTPUT"
-  echo "DETAIL:  no results.json/benchmarks.json/*.html in $BENCH_DIR — guidellm crashed before save (per 7f7a58e v7-v9 cascade pattern)"
-  echo "NEXT:    re-run bench with --outputs html + absolute --output-dir + pre-mkdir (lessons from v3-v10)"
+  echo "DETAIL:  no bench_throughput.json in $BENCH_DIR"
+  echo "NEXT:    re-run scripts/bench_throughput.py with --output under this directory"
   exit 3
 fi
 
-# 2. Count successful vs failed requests from results.json (preferred) or html (fallback)
+# 2. Count complete vs failed requests from the native report.
 SUCCESS_COUNT=0
 FAIL_COUNT=0
 
 if [[ -n "$RESULTS_JSON" ]]; then
-  # guidellm 0.6.0 results.json structure: benchmarks[].metrics.requests_successful_total / requests_errored_total
   SUCCESS_COUNT="$(python3 -c "
 import json, sys
 try:
@@ -59,24 +57,14 @@ try:
         data = json.load(f)
     total_succ = 0
     total_fail = 0
-    benchmarks = data.get('benchmarks', [])
-    for b in benchmarks:
-        m = b.get('metrics', {}) or b.get('run_stats', {}) or {}
-        request_totals = m.get('request_totals', {}) or {}
-        total_succ += int(
-            request_totals.get(
-                'successful',
-                m.get('requests_successful_total', m.get('successful_requests', 0)),
-            )
-            or 0
-        )
-        total_fail += int(
-            request_totals.get(
-                'errored',
-                m.get('requests_errored_total', m.get('errored_requests', 0)),
-            )
-            or 0
-        )
+    if data.get('schema') != 'arle.bench_throughput.v1':
+        raise ValueError('unsupported benchmark schema')
+    for point in data.get('points', []):
+        summary = point.get('summary', {})
+        total_succ += int(summary.get('complete') or 0)
+        total_fail += int(summary.get('incomplete') or 0)
+        total_fail += int(summary.get('error') or 0)
+        total_fail += int(summary.get('correctness_failed') or 0)
     print(f'{total_succ}|{total_fail}')
 except Exception as e:
     print('ERR|' + str(e))
@@ -142,5 +130,5 @@ if [[ -z "$SERVER_LOG" ]]; then
 fi
 
 echo "VERDICT: TOOL-QUIRK ($SUCCESS_COUNT successful but server log clean — bench-tool issue not substrate)"
-echo "NEXT:    debug guidellm CLI (--backend-kwargs validate_backend, --outputs html, absolute --output-dir, pre-mkdir per v3-v10 cascade)"
+echo "NEXT:    inspect the native runner stderr and request records"
 exit 2

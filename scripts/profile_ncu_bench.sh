@@ -1,28 +1,24 @@
 #!/usr/bin/env bash
-# Bench-anchored Nsight Compute wrapper for hotspot infer kernels.
+# Native-bench-anchored Nsight Compute wrapper for hotspot infer kernels.
 #
 # Default flow:
-#   1. Attach `ncu` to an already-running infer server (PID resolved from --target).
-#   2. Drive a short `bench_guidellm.sh --fast` load to hit the selected kernel family.
+#   1. Attach `ncu` to an already-running infer server (PID resolved from --url).
+#   2. Drive `bench_throughput.py` to hit the selected kernel family.
 #   3. Export `.ncu-rep` + profiler log + a short markdown summary.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=./profile_guidellm_common.sh
-source "${SCRIPT_DIR}/profile_guidellm_common.sh"
+# shellcheck source=./profile_bench_common.sh
+source "${SCRIPT_DIR}/profile_bench_common.sh"
 
 TARGET="http://localhost:8000"
 MODEL="Qwen/Qwen3-4B"
-PROCESSOR=""
-TRACE_INTERVAL_MS=1000
+PROMPTS_JSONL="${BENCH_PROMPTS_JSONL:-}"
 SERVER_PID=""
 BENCH_DIR=""
-BENCH_PRESET="fast"
-CONCURRENCIES=""
-BENCH_PROFILE=""
-MAX_SECONDS=""
-WARMUP=""
+CONCURRENCY_GRID="16"
+BENCH_DURATION=10
 LABEL=""
 KERNEL_FAMILY=""
 KERNEL_REGEX=""
@@ -59,7 +55,7 @@ kernel_family_regex() {
 
 usage() {
     cat <<EOF
-Bench-anchored Nsight Compute wrapper for infer hotspot kernels.
+Native-bench-anchored Nsight Compute wrapper for infer hotspot kernels.
 
 Usage:
   $(basename "$0") <label> (--family NAME | --kernel REGEX) [options]
@@ -75,26 +71,21 @@ Kernel focus:
 Bench anchor:
   --bench DIR             reuse an existing bench-output dir as the anchor
                           and replay DIR/command.txt for the profiling load
-  --fast                  short load anchor via bench_guidellm.sh --fast
-                          (default when --bench is not provided)
-  --quick                 1,2,4,8 concurrency quick sweep anchor
-  --target URL            default: ${TARGET}
+  --url URL               default: ${TARGET}
   --model NAME            default: ${MODEL}
-  --processor PATH        forwarded to bench_guidellm.sh
-  --trace-interval-ms N   forwarded to bench_guidellm.sh (default: ${TRACE_INTERVAL_MS})
-  --concurrencies LIST    forwarded to bench_guidellm.sh
-  --profile TYPE          forwarded to bench_guidellm.sh
-  --max-seconds N         forwarded to bench_guidellm.sh
-  --warmup N              forwarded to bench_guidellm.sh
+  --prompts-jsonl PATH    optional JSONL prompt dataset
+  --concurrency-grid LIST fixed concurrency list (default: ${CONCURRENCY_GRID})
+  --seconds-per-concurrency N
+                          measurement duration (default: ${BENCH_DURATION})
 
 Profiler:
-  --server-pid PID        explicit infer server PID (else resolve from --target via lsof)
+  --server-pid PID        explicit infer server PID (else resolve from --url via lsof)
   --dry-run               print resolved commands without executing them
 
 Examples:
-  scripts/profile_ncu_guidellm.sh cuda-qwen3 --family attention --target http://127.0.0.1:8000
-  scripts/profile_ncu_guidellm.sh cuda-qwen3 --family paged-kv --launch-skip 8 --launch-count 2
-  scripts/profile_ncu_guidellm.sh cuda-qwen3 --kernel 'regex:decode_attention_int8_.*_kernel'
+  scripts/profile_ncu_bench.sh cuda-qwen3 --family attention --prompts-jsonl data/prompts.jsonl
+  scripts/profile_ncu_bench.sh cuda-qwen3 --family paged-kv --launch-skip 8 --launch-count 2
+  scripts/profile_ncu_bench.sh cuda-qwen3 --kernel 'regex:decode_attention_int8_.*_kernel'
 EOF
 }
 
@@ -121,34 +112,21 @@ while [[ $# -gt 0 ]]; do
         --bench)
             [[ $# -ge 2 ]] || { echo "error: --bench requires a value" >&2; exit 2; }
             BENCH_DIR="$2"; shift 2 ;;
-        --fast)
-            BENCH_PRESET="fast"; shift ;;
-        --quick)
-            BENCH_PRESET="quick"; shift ;;
-        --target)
-            [[ $# -ge 2 ]] || { echo "error: --target requires a value" >&2; exit 2; }
+        --url)
+            [[ $# -ge 2 ]] || { echo "error: --url requires a value" >&2; exit 2; }
             TARGET="$2"; shift 2 ;;
         --model)
             [[ $# -ge 2 ]] || { echo "error: --model requires a value" >&2; exit 2; }
             MODEL="$2"; shift 2 ;;
-        --processor)
-            [[ $# -ge 2 ]] || { echo "error: --processor requires a value" >&2; exit 2; }
-            PROCESSOR="$2"; shift 2 ;;
-        --trace-interval-ms)
-            [[ $# -ge 2 ]] || { echo "error: --trace-interval-ms requires a value" >&2; exit 2; }
-            TRACE_INTERVAL_MS="$2"; shift 2 ;;
-        --concurrencies)
-            [[ $# -ge 2 ]] || { echo "error: --concurrencies requires a value" >&2; exit 2; }
-            CONCURRENCIES="$2"; shift 2 ;;
-        --profile)
-            [[ $# -ge 2 ]] || { echo "error: --profile requires a value" >&2; exit 2; }
-            BENCH_PROFILE="$2"; shift 2 ;;
-        --max-seconds)
-            [[ $# -ge 2 ]] || { echo "error: --max-seconds requires a value" >&2; exit 2; }
-            MAX_SECONDS="$2"; shift 2 ;;
-        --warmup)
-            [[ $# -ge 2 ]] || { echo "error: --warmup requires a value" >&2; exit 2; }
-            WARMUP="$2"; shift 2 ;;
+        --prompts-jsonl)
+            [[ $# -ge 2 ]] || { echo "error: --prompts-jsonl requires a value" >&2; exit 2; }
+            PROMPTS_JSONL="$2"; shift 2 ;;
+        --concurrency-grid)
+            [[ $# -ge 2 ]] || { echo "error: --concurrency-grid requires a value" >&2; exit 2; }
+            CONCURRENCY_GRID="$2"; shift 2 ;;
+        --seconds-per-concurrency)
+            [[ $# -ge 2 ]] || { echo "error: --seconds-per-concurrency requires a value" >&2; exit 2; }
+            BENCH_DURATION="$2"; shift 2 ;;
         --server-pid)
             [[ $# -ge 2 ]] || { echo "error: --server-pid requires a value" >&2; exit 2; }
             SERVER_PID="$2"; shift 2 ;;
@@ -199,12 +177,12 @@ SUMMARY_FILE="${OUTPUT_DIR}/summary.md"
 ENV_FILE="${OUTPUT_DIR}/env.txt"
 COMMAND_FILE="${OUTPUT_DIR}/command.txt"
 SHA_FILE="${OUTPUT_DIR}/sha256.txt"
-REPLAY_SCRIPT="${OUTPUT_DIR}/replay-guidellm.sh"
+REPLAY_SCRIPT="${OUTPUT_DIR}/replay-bench.sh"
 REPLAY_OUTPUT_DIR="${OUTPUT_DIR}/replay-bench"
+REPLAY_OUTPUT="${REPLAY_OUTPUT_DIR}/bench_throughput"
 mkdir -p "$OUTPUT_DIR"
 
 profile_require_command curl
-profile_require_command jq
 profile_require_command python3
 if [[ "$DRY_RUN" != true ]]; then
     profile_require_command ncu
@@ -216,8 +194,8 @@ if [[ -n "$BENCH_DIR" ]]; then
         exit 2
     fi
 else
-    if [[ ! -x "${REPO_ROOT}/scripts/bench_guidellm.sh" ]]; then
-        echo "error: missing executable bench wrapper: ${REPO_ROOT}/scripts/bench_guidellm.sh" >&2
+    if [[ ! -f "${REPO_ROOT}/scripts/bench_throughput.py" ]]; then
+        echo "error: missing native bench runner: ${REPO_ROOT}/scripts/bench_throughput.py" >&2
         exit 2
     fi
 fi
@@ -242,36 +220,23 @@ NCU_CMD=(
 )
 
 if [[ -n "$BENCH_DIR" ]]; then
-    profile_build_guidellm_replay_script "${BENCH_DIR}/command.txt" "$REPLAY_OUTPUT_DIR" "$REPLAY_SCRIPT"
+    profile_build_bench_replay_script "${BENCH_DIR}/command.txt" "$REPLAY_OUTPUT" "$REPLAY_SCRIPT"
     LOAD_CMD=("$REPLAY_SCRIPT")
 else
     LOAD_CMD=(
-        "${REPO_ROOT}/scripts/bench_guidellm.sh"
-        "$LABEL"
-        --target "$TARGET"
+        python3 "${REPO_ROOT}/scripts/bench_throughput.py"
+        --url "$TARGET"
         --model "$MODEL"
-        --trace-interval-ms "$TRACE_INTERVAL_MS"
+        --concurrency-grid "$CONCURRENCY_GRID"
+        --seconds-per-concurrency "$BENCH_DURATION"
+        --output "$REPLAY_OUTPUT"
     )
-    if [[ -n "$PROCESSOR" ]]; then
-        LOAD_CMD+=(--processor "$PROCESSOR")
+    if [[ -n "$PROMPTS_JSONL" ]]; then
+        LOAD_CMD+=(--prompts-jsonl "$PROMPTS_JSONL")
     fi
-    case "$BENCH_PRESET" in
-        fast) LOAD_CMD+=(--fast) ;;
-        quick) LOAD_CMD+=(--quick) ;;
-        *) echo "error: unsupported bench preset: $BENCH_PRESET" >&2; exit 2 ;;
-    esac
-    if [[ -n "$CONCURRENCIES" ]]; then
-        LOAD_CMD+=(--concurrencies "$CONCURRENCIES")
-    fi
-    if [[ -n "$BENCH_PROFILE" ]]; then
-        LOAD_CMD+=(--profile "$BENCH_PROFILE")
-    fi
-    if [[ -n "$MAX_SECONDS" ]]; then
-        LOAD_CMD+=(--max-seconds "$MAX_SECONDS")
-    fi
-    if [[ -n "$WARMUP" ]]; then
-        LOAD_CMD+=(--warmup "$WARMUP")
-    fi
+    mkdir -p "$REPLAY_OUTPUT_DIR"
+    printf '%q ' "${LOAD_CMD[@]}" > "${REPLAY_OUTPUT_DIR}/command.txt"
+    printf '\n' >> "${REPLAY_OUTPUT_DIR}/command.txt"
 fi
 
 {
@@ -346,7 +311,7 @@ fi
 
 ANCHOR_DIR="${BENCH_DIR}"
 if [[ -z "$ANCHOR_DIR" ]]; then
-    ANCHOR_DIR="$(profile_extract_output_dir_from_log "$BENCH_LOG")"
+    ANCHOR_DIR="$REPLAY_OUTPUT_DIR"
 fi
 
 {

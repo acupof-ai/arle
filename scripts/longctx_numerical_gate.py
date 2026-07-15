@@ -43,7 +43,7 @@ DEFAULT_PROMPTS = [
     "Write a short plan for validating StepPlan::Mixed on Qwen3-4B at 32k context.",
     "Explain how synthetic prompt token clamps avoid benchmark distribution drift.",
     "Create a risk register for a mission to lead open-source long-context throughput.",
-    "Summarize how service-side traces complement client-side GuideLLM metrics.",
+    "Summarize how service-side traces complement client-side benchmark metrics.",
     "Explain why a benchmark that emits empty outputs should not create a wins entry.",
     "Describe how to compare two greedy model outputs when exact text differs.",
     "Write an incident rule for avoiding misleading reused-server baseline artifacts.",

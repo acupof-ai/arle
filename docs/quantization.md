@@ -257,7 +257,7 @@ Source: the `--kv-cache-dtype` CLI parser in `crates/cli`, carried through
 |---|---|---|---|
 | `cargo test --test kv_precision_parity` | Boots scheduler per precision, sends string prompts via the IncomingRequest path, greedy decode, compares token trajectories vs the BF16 result. | The audit dispatch path produces the same/different token-IDs across precisions. Includes a **degenerate-baseline guard** (added 2026-05-27) that warns when the BF16 reference is a single-token repetition — that condition makes `mean_match` a noise-fidelity metric, not a quality metric. | Anything about generation *quality*. Greedy + base/chat LM + long prompts collapse to `!`-loops and INT8 reads as "perfect" because it faithfully reproduces the junk. |
 | `cargo test --test kv_fp8_prefill_logit_parity` | BF16 vs FP8 raw logit deltas via the scheduler's `forward_raw_logits` (token-by-token decode loop, **not** batched paged prefill). | Single-token decode kernels produce sensible per-vocab logits. Last A100 run: `max_abs=0.000000, argmax_bf16=16, argmax_fp8=16, argmax_match=true, top1_val=17.625`. | Batched paged prefill correctness — the path the production scheduler uses for real prompts is *not* exercised here. |
-| `scripts/bench_guidellm.sh <label>` | guidellm 0.6.0 + synthetic random-token prompts + sampled decode (temperature 0.6, top_p 0.95). Measures throughput / TTFT / ITL. | Throughput and latency under load. Kernels run. | Output quality — guidellm doesn't inspect generated text; synthetic random-token prompts produce semi-random outputs by design. |
+| `scripts/bench_throughput.py` | OpenAI-compatible streaming requests over a checked JSONL workload. Measures throughput, TTFT, and ITL. | Throughput and latency under load. Kernels run. | Independent output quality; use decoded cases and the model-specific correctness gate. |
 | HuggingFace transformers reference | `AutoModelForCausalLM.from_pretrained(..., torch_dtype=bfloat16) + greedy generate` on the same prompt + chat template. | Independent ground truth for what greedy *should* generate. On Qwen3-4B chat + Eiffel Tower ChatML prompt: first 8 tokens `[151667, 198, 32313, 11, 279, 1196, 3855, 448]` = `"<think>\nOkay, the user started with"`. | Anything about ARLE's runtime kernels — it's a different stack entirely. |
 
 **Reading the matrix**: a precision passing
@@ -304,9 +304,8 @@ RETRACTED):
 
 Bench numbers from `2026-05-26-bench-int8-vs-bf16-kv-a100.md`
 (throughput +57–113% INT8 vs BF16 on synthetic random-token prompts)
-are independent of this — guidellm doesn't inspect output text and
-sampled decode with random prompts produces semi-random output by
-construction.
+are independent of this because sampled decode with random prompts produces
+semi-random output by construction.
 
 **Next step (not yet executed — needs go-ahead before touching shared
 kernel code)**: read `launch_prefill_paged_batch` →

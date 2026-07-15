@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Matched A/B bench harness on top of bench_guidellm.sh.
+# Matched A/B harness on top of bench_throughput.py.
 #
 # Why: any A/B comparison on one GPU must run A and B back-to-back on the
 # same machine with the same workload. Manual start-server, bench, kill,
@@ -7,8 +7,8 @@
 # between runs. This script bundles it.
 #
 # Usage:
-#   scripts/bench_ab.sh <label-a> <label-b> [--quick] [--concurrencies L] \
-#       [--model NAME] [--processor PATH] \
+#   scripts/bench_ab.sh <label-a> <label-b> --seconds-per-concurrency N \
+#       [--concurrency-grid L] [--model NAME] [--prompts-jsonl PATH] \
 #       --cmd-a "<shell cmd that starts server-A, backgrounds itself>" \
 #       --cmd-b "<shell cmd that starts server-B, backgrounds itself>"
 #
@@ -18,19 +18,18 @@
 #       from $! inside eval
 #     * be idempotent across kill (we pkill -f <cmd snippet> at cleanup)
 #
-# Exploration-mode flags (--quick, --concurrencies, --max-seconds, --warmup,
-# --profile) are forwarded to bench_guidellm.sh. Artefacts land in
+# Native runner flags are forwarded to bench_throughput.py. Artefacts land in
 # bench-output/<date>-<label-a>/ and bench-output/<date>-<label-b>/. No
 # wins entries are seeded (exploration mode).
 #
-# Example — MTP vs no-MTP on Qwen3.6 Metal, 2-minute /quick run:
+# Example — MTP vs no-MTP on Qwen3.6 Metal, two-minute cells:
 #
 #   MODEL=mlx-community/Qwen3.6-35B-A3B-4bit
 #   BIN="target/release/arle serve --backend metal"
 #   scripts/bench_ab.sh \
 #       qwen36-baseline \
 #       qwen36-mtp \
-#       --quick \
+#       --seconds-per-concurrency 120 \
 #       --model "$MODEL" \
 #       --cmd-a "$BIN --model-path $MODEL --port 8000 \
 #                > /tmp/ab-a.log 2>&1 &" \
@@ -40,7 +39,7 @@
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-cd "$REPO_ROOT"
+cd "$REPO_ROOT" || exit
 
 PORT="${PORT:-8000}"
 TARGET="http://127.0.0.1:${PORT}"
@@ -49,7 +48,7 @@ LABEL_A=""
 LABEL_B=""
 CMD_A=""
 CMD_B=""
-# Flags forwarded to bench_guidellm.sh.
+# Flags forwarded to bench_throughput.py.
 PASSTHROUGH=()
 
 usage() {
@@ -60,14 +59,14 @@ usage: $(basename "$0") <label-a> <label-b> --cmd-a "<launch>" --cmd-b "<launch>
   --cmd-a "..."           shell command that starts server A (trailing & required)
   --cmd-b "..."           shell command that starts server B (trailing & required)
 
-Forwarded to bench_guidellm.sh (one exploration-mode flag required):
-  --quick                 ~2-min preset
-  --concurrencies LIST    e.g. "1,2,4,8"
-  --max-seconds N         override per-benchmark duration
-  --warmup N              warmup seconds/fraction
-  --profile TYPE          override profile
+Forwarded to bench_throughput.py (one measurement bound required):
+  --concurrency-grid LIST e.g. "1,2,4,8"
+  --requests-per-concurrency N
+  --seconds-per-concurrency N
+  --max-tokens N
+  --temperature F
   --model NAME            model identifier
-  --processor PATH        tokenizer path / HF id
+  --prompts-jsonl PATH    prompt dataset
 
 Env:
   PORT=8000               the port both servers bind (default)
@@ -82,10 +81,9 @@ while [[ $# -gt 0 ]]; do
         --cmd-b)
             [[ $# -ge 2 ]] || { echo "error: --cmd-b requires a value" >&2; exit 2; }
             CMD_B="$2"; shift 2 ;;
-        --quick|-h|--help)
-            if [[ "$1" == "-h" || "$1" == "--help" ]]; then usage; exit 0; fi
-            PASSTHROUGH+=("$1"); shift ;;
-        --concurrencies|--max-seconds|--warmup|--profile|--model|--processor)
+        -h|--help)
+            usage; exit 0 ;;
+        --concurrency-grid|--requests-per-concurrency|--seconds-per-concurrency|--max-tokens|--temperature|--model|--prompts-jsonl|--synthetic-prompts|--timeout-seconds|--seed)
             [[ $# -ge 2 ]] || { echo "error: $1 requires a value" >&2; exit 2; }
             PASSTHROUGH+=("$1" "$2"); shift 2 ;;
         --*)
@@ -104,18 +102,16 @@ if [[ -z "$LABEL_A" || -z "$LABEL_B" || -z "$CMD_A" || -z "$CMD_B" ]]; then
     exit 2
 fi
 
-# Refuse to run without at least one exploration flag: sweep is ~10 min per
-# side, too slow for rapid A/B. Force the user to opt in to canonical.
+# Refuse unbounded A/B runs.
 has_exploration=false
 for f in "${PASSTHROUGH[@]}"; do
     case "$f" in
-        --quick|--concurrencies|--max-seconds|--warmup|--profile)
+        --requests-per-concurrency|--seconds-per-concurrency)
             has_exploration=true; break ;;
     esac
 done
 if [[ "$has_exploration" == false ]]; then
-    echo "error: bench_ab.sh requires exploration mode (--quick recommended)." >&2
-    echo "       Canonical sweep A/B takes 15+ min and should be driven manually." >&2
+    echo "error: bench_ab.sh requires --requests-per-concurrency or --seconds-per-concurrency." >&2
     exit 2
 fi
 
@@ -144,7 +140,7 @@ wait_for_server() {
 }
 
 run_side() {
-    local label="$1" cmd="$2"
+    local label="$1" cmd="$2" out_dir="$3"
     CURRENT_CMD="$cmd"
     echo
     echo "=== $label ==="
@@ -155,7 +151,9 @@ run_side() {
     eval "$cmd" || die "failed to launch: $cmd"
     wait_for_server || die "server for $label never became ready"
 
-    "$REPO_ROOT/scripts/bench_guidellm.sh" "$label" --target "$TARGET" "${PASSTHROUGH[@]}" \
+    mkdir -p "$out_dir"
+    python3 "$REPO_ROOT/scripts/bench_throughput.py" --url "$TARGET" \
+        --output "$out_dir/bench_throughput" "${PASSTHROUGH[@]}" \
         || die "bench run failed for $label"
 
     pkill -f "target/release/arle" 2>/dev/null || true
@@ -163,17 +161,17 @@ run_side() {
     CURRENT_CMD=""
 }
 
-run_side "$LABEL_A" "$CMD_A"
-run_side "$LABEL_B" "$CMD_B"
-
-# ---- cross-label diff ---------------------------------------------------------
 DATE="$(date +%Y-%m-%d)"
 OUT_A="$REPO_ROOT/bench-output/${DATE}-${LABEL_A}"
 OUT_B="$REPO_ROOT/bench-output/${DATE}-${LABEL_B}"
-# If a run-N suffix was appended, take the latest matching dir.
-pick_latest() { ls -d "${1}"* 2>/dev/null | sort | tail -1; }
-OUT_A="$(pick_latest "$OUT_A")"
-OUT_B="$(pick_latest "$OUT_B")"
+unique_dir() { local base="$1" out="$1" n=1; while [[ -e "$out" ]]; do n=$((n + 1)); out="${base}-run${n}"; done; printf '%s\n' "$out"; }
+OUT_A="$(unique_dir "$OUT_A")"
+OUT_B="$(unique_dir "$OUT_B")"
+
+run_side "$LABEL_A" "$CMD_A" "$OUT_A"
+run_side "$LABEL_B" "$CMD_B" "$OUT_B"
+
+# ---- cross-label diff ---------------------------------------------------------
 
 DIFF_FILE="$REPO_ROOT/bench-output/${DATE}-${LABEL_A}-vs-${LABEL_B}-diff.md"
 python3 - "$OUT_A" "$OUT_B" "$LABEL_A" "$LABEL_B" "$DIFF_FILE" <<'PY'
@@ -182,34 +180,18 @@ import sys, json, pathlib
 a_dir, b_dir, label_a, label_b, out_path = sys.argv[1:]
 
 def load(d):
-    p = pathlib.Path(d) / "benchmarks.json"
+    p = pathlib.Path(d) / "bench_throughput.json"
     if not p.exists():
         return None
     j = json.loads(p.read_text())
     rows = {}
-    for bench in j.get("benchmarks", []):
-        strat = bench.get("config", {}).get("strategy", {})
-        t = strat.get("type_", "?")
-        if t == "synchronous":
-            key = "sync"
-        elif t == "concurrent":
-            key = f"conc{strat.get('max_concurrency', '?')}"
-        elif t == "throughput":
-            key = "throughput"
-        else:
-            key = t
-        m = bench.get("metrics", {})
-        def _get(path):
-            cur = m
-            for part in path.split("."):
-                if cur is None:
-                    return None
-                cur = cur.get(part)
-            return cur
+    for point in j.get("points", []):
+        m = point.get("summary", {})
+        key = f"conc{m.get('concurrency', '?')}"
         rows[key] = {
-            "ttft_p50": _get("time_to_first_token_ms.successful.percentiles.p50"),
-            "itl_p50":  _get("inter_token_latency_ms.successful.percentiles.p50"),
-            "tok_s":    _get("output_tokens_per_second.successful.mean"),
+            "ttft_p50": (m.get("ttft") or {}).get("p50_ms"),
+            "itl_p50":  (m.get("itl") or {}).get("p50_ms"),
+            "tok_s":    m.get("output_tokens_per_s"),
         }
     return rows
 

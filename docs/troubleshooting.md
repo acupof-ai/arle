@@ -159,5 +159,5 @@ When opening an issue, please include:
 - OS + GPU + driver version (Linux) or chip + macOS version (Apple Silicon)
 
 For runtime crashes that look like a kernel / scheduler bug, attach a
-[`scripts/bench_guidellm.sh`](../scripts/bench_guidellm.sh) repro at the
+[`scripts/bench_throughput.py`](../scripts/bench_throughput.py) repro at the
 smallest concurrency that reproduces the failure.

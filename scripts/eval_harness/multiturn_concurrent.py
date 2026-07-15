@@ -1,7 +1,7 @@
 """Multi-turn concurrent agent-workload harness — TTFT/TPOT/throughput with
 decode-region KV reuse actually firing.
 
-guidellm's synthetic prompts are independent (no shared growing prefix), so it
+Independent synthetic prompts have no shared growing prefix, so they
 cannot exercise the DSv4 decode-region reuse. Here C conversations run T turns
 each; turn k replays the EXACT prior-turn token ids (prompt_ids ++ generated_ids)
 as a token-id prompt, so the radix matches the full history and reuse fires INTO

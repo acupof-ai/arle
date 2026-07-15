@@ -743,7 +743,7 @@ do_full() {
     fi
     echo ""
     echo "  # 5. Run benchmarks"
-    echo "  ./scripts/bench_guidellm.sh cuda-local --target http://localhost:8000"
+    echo "  python3 scripts/bench_throughput.py --url http://localhost:8000"
     echo ""
     echo "  # 6. Run tests"
     echo "  cargo test --release"

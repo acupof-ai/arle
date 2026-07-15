@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """DSv4 8-slot concurrent throughput + correctness probe (pod-local, aiohttp).
 
-Not a replacement for the canonical guidellm sweep — this is the pod-runnable
-stand-in when guidellm is absent (offline pod). It does two things the serial
+This focused probe predates the canonical native runner. It does two things the
+serial
 needle gate cannot:
 
   1. THROUGHPUT under real N-way concurrency (aggregate tok/s, per-request p50/p99).
