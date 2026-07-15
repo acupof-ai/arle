@@ -9,6 +9,16 @@ pub(crate) struct Dsv4CompressorState {
     pub(super) compressed: HiddenStates,
     pub(super) compressed_capacity: usize,
     pub(super) ring_rows: usize,
+    // FP32 main-value probe scratch: pre-allocated once and reused across
+    // layers/requests instead of per-call alloc_zeros (which caused OOM
+    // under concurrency). Sized for max_seq_len (the largest single-prefill
+    // token_count the probe can see).
+    pub(super) fp32_kv_raw: CudaSlice<f32>,
+    pub(super) fp32_score_raw: CudaSlice<f32>,
+    pub(super) fp32_pending_kv: CudaSlice<f32>,
+    pub(super) fp32_pending_score: CudaSlice<f32>,
+    pub(super) fp32_prev_kv: CudaSlice<f32>,
+    pub(super) fp32_prev_score: CudaSlice<f32>,
 }
 
 /// Indexer key-staging ring depth (rows): 2 × the max per-forward query chunk.
@@ -31,6 +41,30 @@ impl Dsv4CompressorState {
             compressed_capacity
         };
         let compressed_rows = ring_rows;
+        let fp32_kv_raw = ctx
+            .stream
+            .alloc_zeros::<f32>(width * max_seq_len)
+            .map_err(|e| anyhow::anyhow!("DSv4 compressor FP32 kv_raw alloc failed: {e}"))?;
+        let fp32_score_raw = ctx
+            .stream
+            .alloc_zeros::<f32>(width * max_seq_len)
+            .map_err(|e| anyhow::anyhow!("DSv4 compressor FP32 score_raw alloc failed: {e}"))?;
+        let fp32_pending_kv = ctx
+            .stream
+            .alloc_zeros::<f32>(ratio * width)
+            .map_err(|e| anyhow::anyhow!("DSv4 compressor FP32 pending_kv alloc failed: {e}"))?;
+        let fp32_pending_score = ctx
+            .stream
+            .alloc_zeros::<f32>(ratio * width)
+            .map_err(|e| anyhow::anyhow!("DSv4 compressor FP32 pending_score alloc failed: {e}"))?;
+        let fp32_prev_kv = ctx
+            .stream
+            .alloc_zeros::<f32>(ratio * head_dim)
+            .map_err(|e| anyhow::anyhow!("DSv4 compressor FP32 prev_kv alloc failed: {e}"))?;
+        let fp32_prev_score = ctx
+            .stream
+            .alloc_zeros::<f32>(ratio * head_dim)
+            .map_err(|e| anyhow::anyhow!("DSv4 compressor FP32 prev_score alloc failed: {e}"))?;
         Ok(Self {
             pending_kv: ctx
                 .stream
@@ -51,6 +85,12 @@ impl Dsv4CompressorState {
             compressed: HiddenStates::zeros(ctx, head_dim, compressed_rows)?,
             compressed_capacity,
             ring_rows,
+            fp32_kv_raw,
+            fp32_score_raw,
+            fp32_pending_kv,
+            fp32_pending_score,
+            fp32_prev_kv,
+            fp32_prev_score,
         })
     }
 
@@ -103,15 +143,23 @@ impl Dsv4CompressorState {
     }
 
     /// Exact requested device bytes owned by this compressor/indexer state:
-    /// Σ over the four bf16 partial-row buffers + the `compressed` HiddenStates.
+    /// Σ over the four bf16 partial-row buffers + the `compressed` HiddenStates
+    /// + the six fp32 probe scratch buffers.
     #[allow(dead_code)]
     pub(crate) fn device_bytes(&self) -> usize {
         let bf16 = std::mem::size_of::<half::bf16>();
+        let f32 = std::mem::size_of::<f32>();
         self.pending_kv.len() * bf16
             + self.pending_score.len() * bf16
             + self.prev_overlap_kv.len() * bf16
             + self.prev_overlap_score.len() * bf16
             + self.compressed.device_bytes()
+            + self.fp32_kv_raw.len() * f32
+            + self.fp32_score_raw.len() * f32
+            + self.fp32_pending_kv.len() * f32
+            + self.fp32_pending_score.len() * f32
+            + self.fp32_prev_kv.len() * f32
+            + self.fp32_prev_score.len() * f32
     }
 
     /// STATIC predictor of `device_bytes` from `new`'s dims — MUST mirror `new`
@@ -134,7 +182,13 @@ impl Dsv4CompressorState {
         };
         // pending_kv + pending_score (ratio*width each) + prev_overlap_kv +
         // prev_overlap_score (ratio*head_dim each) + compressed[head_dim, ring_rows].
-        (2 * ratio * width + 2 * ratio * head_dim + head_dim * ring_rows) * bf16
+        let bf16_bytes = (2 * ratio * width + 2 * ratio * head_dim + head_dim * ring_rows) * bf16;
+        // FP32 probe scratch: kv_raw + score_raw (width*max_seq_len each) +
+        // pending_kv + pending_score (ratio*width each) + prev_kv + prev_score
+        // (ratio*head_dim each).
+        let f32 = std::mem::size_of::<f32>();
+        let fp32_bytes = (2 * width * max_seq_len + 2 * ratio * width + 2 * ratio * head_dim) * f32;
+        bf16_bytes + fp32_bytes
     }
 }
 
