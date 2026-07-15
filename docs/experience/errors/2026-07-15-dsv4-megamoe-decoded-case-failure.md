@@ -44,18 +44,25 @@ replays reproduced the MegaMoE failure five times.
 ## Problems
 
 The earlier single `Paris` smoke proved reachability, not output preservation.
-This run has one trial and 16 requests per point, so it licenses neither a
+This run has one trial and 16 requests per point, so it supports neither a
 default flip nor a variance claim. The deterministic failing case is sufficient
 to block use.
 
+Controlled follow-ups killed three suspected causes: expert A/B swapping,
+zero-token padded ranks, and `fast_math=false`. On the exact failing prompt, a
+temporary same-input dual run diverged in the first MoE layer before sampling:
+`max_abs=1.24316406`, `RMSE=0.26650614`; the request then reproduced the
+`2.2.2...` attractor. The probe was removed after collection.
+
 ## Learnings
 
-KILL the current opt-in license, not the optimization. MegaMoE has a material
-wall-clock win, but distributed FP8 routing or reduction must match allreduce on
-the failing token sequence before more throughput tuning.
+RETAIN the optimization, but block default use. MegaMoE has a material
+wall-clock win, while PR #323's FP8 MoE result already differs at layer zero.
+Fix operator parity before tuning downstream sampling.
 
 ## Artifacts
 
 - `/host/arle-megamoe-t1/bench-output/2026-07-15-native-allreduce-c1-16-r1/benchmarks.{json,csv}`
 - `/host/arle-megamoe-t1/bench-output/2026-07-15-native-megamoe-c1-16-r1/benchmarks.{json,csv}`
 - `/host/arle-megamoe-t1/logs/mega-native-ab.log`
+- `/host/arle-megamoe-t1/logs/mega-compare-failing-l0.log`

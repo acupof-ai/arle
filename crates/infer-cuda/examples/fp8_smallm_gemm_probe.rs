@@ -192,7 +192,7 @@ mod real {
         seed ^= m as u64 * 0x9e37_79b9_7f4a_7c15;
         seed ^= n as u64 * 0x7f4a_7c15_517c_c1cc;
         seed ^= k as u64 * 0x517c_c1cc_9e37_79b9;
-        let mut rng = Rng::new(seed as u64);
+        let mut rng = Rng::new(seed);
         let x_host: Vec<bf16> = (0..m * k).map(|_| bf16::from_f32(rng.normal())).collect();
         let w_host: Vec<u8> = (0..n * k).map(|_| f32_to_fp8_e4m3(rng.normal())).collect();
         let w_scales_host: Vec<f32> = (0..scale_rows * scale_cols)
@@ -452,7 +452,7 @@ mod real {
             }
             if mant >= 8 {
                 // Rounds up to smallest normal (exp=1, mant=0)
-                let byte = (1u8 << 3) | 0;
+                let byte = 1u8 << 3;
                 return if sign != 0 { byte | 0x80 } else { byte };
             }
             return if sign != 0 { mant | 0x80 } else { mant };

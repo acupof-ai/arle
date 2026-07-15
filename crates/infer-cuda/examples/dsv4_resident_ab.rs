@@ -10,11 +10,11 @@
 //!   * `INFER_DSV4_AB_VARIANTS`      `scalar,flashmla` by default.
 //!   * `INFER_DSV4_AB_MAX_NEW`       generated-token count, default 128.
 //!   * `INFER_DSV4_AB_WARMUP_NEW`    decode steps excluded from steady timing,
-//!                                  default 16.
+//!     default 16.
 //!   * `INFER_DSV4_AB_REPEAT`        repeat the variant list after one load,
-//!                                  default 1.
+//!     default 1.
 //!   * `INFER_DSV4_AB_PROFILE_VARIANT` optional variant name; starts CUDA
-//!                                  profiler after warmup for ncu/nsys attach.
+//!     profiler after warmup for ncu/nsys attach.
 
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 

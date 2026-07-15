@@ -17,7 +17,7 @@ not a suggestion.
 - **Isolate confounders.** One experiment changing N variables at once (buffer
   pool + scheduler clamp + KV format + graph capture) is **unattributable** —
   change one variable at a time, or run an explicit control.
-- **Root-cause hypotheses get license-or-kill too** — not just fixes. The
+- **Root-cause hypotheses get verify-or-reject too** — not just fixes. The
   inference itself needs a cheap verify (nsys fraction / log counter / second
   source read / A/B). Wrong root cause → every sub-experiment wasted.
 - **80% SOLID is not enough.** Dig to 95%+, or explicitly declare "deferred,
@@ -27,7 +27,7 @@ not a suggestion.
 - **Wall-clock / per-request framing is ground truth.** When framings disagree
   (per-NVTX-window vs wall-clock, per-launch vs per-token, per-layer vs
   per-request), a narrow-window X% share ≠ the actual wall-clock impact.
-  License-or-kill uses the wall-clock framing — never the narrow-window one.
+  Acceptance uses the wall-clock framing — never the narrow-window one.
 - **Case-as-fact — attribute decoded cases before overturning a hypothesis (做算法
   以 case 为事实).** A negative/bug result (a regression, a failed metric, a
   subagent's "it's structural") is a **case to debug at the token level**, NOT a
@@ -49,9 +49,9 @@ Empirical anchors:
   still void — launch-overhead share not nsys-verified / graph-trigger count not
   measured against a control / 4 variables changed at once.
 - **M_pf-graph v2 framing trap** (2026-05-08): nsys "55.7% of prefill window"
-  looked like a PASS, but 191ms / 60s trace = 6.4ms per prefill / 1995ms TTFT =
-  **0.32% wall-clock**, far below the 10% kill threshold. nsys "X% of NVTX
-  window" must cross-check "Y ms / per-request total"; take the conservative one.
+  looked large, but 191ms / 60s trace = 6.4ms per prefill / 1995ms TTFT =
+  **0.32% wall-clock**. The old 10% gate rejected it; the current rule keeps any
+  stable positive wall-clock gain. Always cross-check the per-request total.
 
 ---
 
@@ -390,7 +390,7 @@ mechanical changes.
   legacy docs on touch, not in bulk.
 - **CHANGELOG is the progress spine.** Three event classes land a CHANGELOG
   line the same day, linking the wins/errors entry: **phase exit · default
-  flip · license-or-kill verdict**. Phase exits also cut a release tag; a tag
+  flip · accept-or-reject verdict**. Phase exits also cut a release tag; a tag
   without its CHANGELOG section is a regression (v0.1.5→v0.2.1 backfilled
   2026-07-02).
 - **Weekly resync (~30 min):** ① ROADMAP phase table ↔ GitHub issues (issues
@@ -461,7 +461,7 @@ Measure with `ncu` (CUDA) or Xcode Metal capture / MLX instruments (Metal).
 - **SLO verdict from the SLO workload, not a smoke shape** — a c=1 short-prompt
   nsys "2× win" routinely flips on production prompt length (path scaling is
   shape-specific) (`errors/2026-05-27-dsv4-tp-allreduce-slo-prefill-kill.md`).
-- **`plan_label=mixed` / "executes new path" is reachability, not a license** —
+- **`plan_label=mixed` / "executes new path" is reachability, not acceptance** —
   c-sweep must clear TTFT *and* ITL *and* output throughput before a default flip
   (`errors/2026-05-25-axis2-mixed-default-kill.md`,
   `errors/2026-05-26-qwen35-hybrid-mixed-kill.md`,
@@ -477,7 +477,7 @@ Measure with `ncu` (CUDA) or Xcode Metal capture / MLX instruments (Metal).
   on the *same* config before staring at new code; if prod also breaks, the
   serving config is the bug (`wins/2026-05-27-dsv4-native-deepep-pod-e2e.md`).
 - **Launch-count source-survey is hypothesis** — a fused-kernel rewrite for tiny
-  CUDA ops is licensed only by a paired component A/B (or nsys/CUDA-event) under
+  CUDA ops is accepted only by a paired component A/B (or nsys/CUDA-event) under
   the runtime's sync framing
   (`errors/2026-05-12-fp8-kv-pair-quantize-fusion-no-license.md`,
   `errors/2026-05-21-arle-cuda-opd-swiglu-fused-kill.md`).

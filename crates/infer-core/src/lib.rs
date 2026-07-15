@@ -788,6 +788,11 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         metrics.host_demoted_pages = self.executor.kv_tier_host_demoted_pages();
         metrics.host_demoted_pending_inflight = 0;
         metrics.disk_pages = self.executor.kv_tier_disk_pages();
+        let tier_hits = self.executor.kv_tier_read_hits();
+        metrics.reuse_hit_host_demoted = metrics
+            .reuse_hit_host_demoted
+            .saturating_add(tier_hits.host_demoted);
+        metrics.reuse_hit_disk = metrics.reuse_hit_disk.saturating_add(tier_hits.disk);
         metrics
     }
 

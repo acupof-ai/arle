@@ -618,6 +618,14 @@ impl BackendExecutor for CudaExecutor {
         }
     }
 
+    fn kv_tier_read_hits(&self) -> infer_seam::KvTierReadHits {
+        match &self.inner {
+            CudaExecutorInner::Placeholder => infer_seam::KvTierReadHits::default(),
+            #[cfg(feature = "cuda")]
+            CudaExecutorInner::Real(real) => real.kv_tier_read_hits(),
+        }
+    }
+
     fn kv_tier_location(&self, key: u64) -> Option<KvTierLocation> {
         match &self.inner {
             CudaExecutorInner::Placeholder => {

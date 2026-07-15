@@ -20,14 +20,31 @@ Related governance docs:
 ## [Unreleased]
 
 Progress spine. Entry classes recorded here the day they land: phase exits,
-default flips, license-or-kill verdicts (AGENTS.md §Docs lifecycle & progress
-spine).
+default flips, and accept-or-reject verdicts (AGENTS.md §Docs lifecycle &
+progress spine).
 
-- **2026-07-15 — DSv4 MegaMoE opt-in license revoked.** A no-prefix native A/B
+- **2026-07-15 — DSv4 local-NVMe cold load shipped.** A zero-residency 294 GB
+  checkpoint reached HTTP ready in **80.95 s**; the virtual system-disk run had
+  spent **1,675 s** in prefetch alone. Local lazy loading is now explicitly
+  selectable with `ARLE_LOADER_PREFETCH=0`.
+  [bench](docs/experience/wins/2026-07-15-dsv4-nvme-cold-load.md).
+
+- **2026-07-15 — DSv4 batched greedy lm_head shipped.** Three-trial median
+  output throughput improved **+1.53%/+2.25%/+2.52%** at c=4/8/16 with no
+  errors or correctness failures. The eligible path is built in with no flag.
+  [bench](docs/experience/wins/2026-07-15-dsv4-batched-lm-head.md).
+
+- **2026-07-15 — DSv4 L2/L3 real-hit path measured.** A 1,649-token repeated
+  prompt exercised 4 L2 plus 47 L3 state pages and 51 disk reads on the first
+  reuse. At c16, L3 cost **4.19%** output throughput and **11.9%** TTFT while
+  extending the retained working set.
+  [bench](docs/experience/wins/2026-07-15-dsv4-kv-l2-l3-hit-throughput.md).
+
+- **2026-07-15 — DSv4 MegaMoE retained but correctness-blocked.** A no-prefix native A/B
   measured c16 **177.20→256.56 tok/s (+44.8%)**, but one decoded case entered a
   deterministic attractor on MegaMoE and passed on allreduce; direct replay
-  reproduced it 5/5 times. Performance passes, correctness blocks use. Default
-  remains allreduce. [error](docs/experience/errors/2026-07-15-dsv4-megamoe-decoded-case-failure.md).
+  reproduced it 5/5 times. The implementation stays for repair, but correctness
+  blocks default use. [error](docs/experience/errors/2026-07-15-dsv4-megamoe-decoded-case-failure.md).
 
 - **2026-07-14 — DSv4 DSpark TP=4 concurrency licensed.** Loading the already
   EP4/TP4-sharded draft before KV planning replaced a false 19.9 GB/rank reserve

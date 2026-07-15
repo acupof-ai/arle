@@ -251,6 +251,7 @@ mod real {
             shape.hidden,
             0,
             total,
+            // SAFETY: the buffers and dimensions above match this FFI contract.
             || unsafe {
                 moe::dsv4_deepgemm_pack_quantize_bf16_to_fp8(
                     cache_ptr(packed_hidden, ctx),
@@ -276,6 +277,7 @@ mod real {
             2 * shape.intermediate,
             shape.hidden,
             total,
+            // SAFETY: the buffers and dimensions above match this FFI contract.
             || unsafe {
                 moe::dsv4_deepgemm_m_grouped_fp8_gemm_nt_contiguous(
                     cache_ptr(input_fp8, ctx),
@@ -303,6 +305,7 @@ mod real {
             shape.intermediate,
             0,
             total,
+            // SAFETY: the buffers and dimensions above match this FFI contract.
             || unsafe {
                 moe::dsv4_deepgemm_swiglu_quantize_w13(
                     cache_ptr(w13_out, ctx),
@@ -328,6 +331,7 @@ mod real {
             shape.hidden,
             shape.intermediate,
             total,
+            // SAFETY: the buffers and dimensions above match this FFI contract.
             || unsafe {
                 moe::dsv4_deepgemm_m_grouped_fp8_gemm_nt_contiguous(
                     cache_ptr(act_fp8, ctx),
