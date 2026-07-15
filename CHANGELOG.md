@@ -23,6 +23,12 @@ Progress spine. Entry classes recorded here the day they land: phase exits,
 default flips, and accept-or-reject verdicts (AGENTS.md §Docs lifecycle &
 progress spine).
 
+- **2026-07-15 — DSv4 long-context correctness blocked.** Full-prefill TP=4
+  retrieval became nondeterministic at 5,424 actual prompt tokens and failed
+  3/3 at 7,222 tokens for a 50%-depth needle, while the same 7,222-token prompt
+  passed at 90% depth. Throughput measurement stops at the correctness gate.
+  [error](docs/experience/errors/2026-07-15-dsv4-long-context-needle-failure.md).
+
 - **2026-07-15 — DSv4 local-NVMe cold load shipped.** A zero-residency 294 GB
   checkpoint reached HTTP ready in **80.95 s**; the virtual system-disk run had
   spent **1,675 s** in prefetch alone. Local lazy loading is now explicitly
