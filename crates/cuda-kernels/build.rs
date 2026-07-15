@@ -1810,6 +1810,7 @@ fn emit_prebuilt_deepep_sidecar(path: &Path) {
 const PREBUILT_REQUIRED_DSV4_SYMBOLS: &[&str] = &[
     "dsv4_deepgemm_native_preflight_cuda",
     "dsv4_sm90_mega_moe_workspace_layout_cuda",
+    "dsv4_sm90_mega_moe_pre_dispatch_cuda",
     "dsv4_sm90_mega_moe_launch_cuda",
     "arle_dsv4_fp8_kv_fill_one_sw_slot_from_start_pos_cuda",
     "arle_dsv4_flashmla_decode_build_indices_start_pos_ptr_cuda",

@@ -3521,6 +3521,11 @@ impl SafetensorLoader {
         use cuda_kernels::tensor::Dsv4Fp8DeepGemmWeightCache;
         use deepseek_spec::DeepSeekV4MoeRoutingKind;
 
+        let mega_moe = matches!(
+            crate::runtime_flags::dsv4_moe_transport()?,
+            crate::runtime_flags::Dsv4MoeTransport::MegaMoe
+        );
+
         // Both DSv4 and GLM run FP8 MoE. DSv4 ships FP8 E4M3 + E8M0 (`<prefix>.scale`),
         // consumed by `from_dsv4_weight*`. GLM ships FP8 E4M3 + F32 `weight_scale_inv`
         // (general 128×128 block scales), consumed losslessly by
@@ -3583,10 +3588,25 @@ impl SafetensorLoader {
             "DSv4 grouped w2 rows {} != hidden_dim {hidden_dim}",
             first_w2.rows
         );
-        let w13_grouped =
-            crate::moe::build_grouped_cache(ctx, w13.as_slice(), 2 * intermediate, hidden_dim)?;
-        let w2_grouped =
-            crate::moe::build_grouped_cache(ctx, w2.as_slice(), hidden_dim, intermediate)?;
+        let w13_layout = if mega_moe {
+            crate::moe::GroupedWeightLayout::InterleavedL1
+        } else {
+            crate::moe::GroupedWeightLayout::Normal
+        };
+        let w13_grouped = crate::moe::build_grouped_cache(
+            ctx,
+            w13.as_slice(),
+            2 * intermediate,
+            hidden_dim,
+            w13_layout,
+        )?;
+        let w2_grouped = crate::moe::build_grouped_cache(
+            ctx,
+            w2.as_slice(),
+            hidden_dim,
+            intermediate,
+            crate::moe::GroupedWeightLayout::Normal,
+        )?;
         let num_groups = w13_grouped.groups;
         ensure!(
             num_groups == split.experts_per_rank && w2_grouped.groups == num_groups,

@@ -2,7 +2,7 @@
 
 use anyhow::{Result, ensure};
 use cudarc::driver::sys::CUstream;
-use cudarc::driver::{CudaSlice, DevicePtr};
+use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 use half::bf16;
 
 use crate::ffi::{self, Half};
@@ -25,6 +25,51 @@ pub struct Sm90MegaMoeShape {
 
 pub type Sm90MegaMoeWorkspaceLayout = ffi::Sm90MegaMoeWorkspaceLayoutRaw;
 
+/// Copy FP8 gate/up rows into MegaMoE's 8-row interleaved L1 layout.
+pub fn interleave_gate_up_fp8_rows(
+    ctx: &DeviceContext,
+    gate: &impl DevicePtr<u8>,
+    up: &impl DevicePtr<u8>,
+    output: &mut impl DevicePtrMut<u8>,
+    rows: usize,
+    cols: usize,
+) -> Result<()> {
+    let half_len = rows
+        .checked_mul(cols)
+        .ok_or_else(|| anyhow::anyhow!("MegaMoE L1 shape overflow: {rows}x{cols}"))?;
+    let total_len = half_len
+        .checked_mul(2)
+        .ok_or_else(|| anyhow::anyhow!("MegaMoE fused L1 shape overflow: {rows}x{cols}"))?;
+    ensure!(
+        rows.is_multiple_of(8) && cols.is_multiple_of(16),
+        "MegaMoE L1 needs rows divisible by 8 and cols divisible by 16, got {rows}x{cols}"
+    );
+    ensure!(
+        gate.len() == half_len && up.len() == half_len && output.len() == total_len,
+        "MegaMoE L1 buffers mismatch: gate={} up={} output={} expected={half_len}/{half_len}/{}",
+        gate.len(),
+        up.len(),
+        output.len(),
+        total_len
+    );
+    let (gate_ptr, _gate_guard) = gate.device_ptr(&ctx.stream);
+    let (up_ptr, _up_guard) = up.device_ptr(&ctx.stream);
+    let (output_ptr, _output_guard) = output.device_ptr_mut(&ctx.stream);
+    // SAFETY: lengths and alignment are validated above; all slices belong to `ctx.stream`.
+    unsafe {
+        ffi::dsv4_interleave_gate_up_fp8_rows_cuda(
+            gate_ptr as *const u8,
+            up_ptr as *const u8,
+            output_ptr as *mut u8,
+            i32::try_from(rows)?,
+            i32::try_from(cols)?,
+            ctx.stream.cu_stream(),
+        )
+        .result()?;
+    }
+    Ok(())
+}
+
 /// Returns byte offsets in each rank's symmetric workspace.
 pub fn sm90_mega_moe_workspace_layout(
     shape: Sm90MegaMoeShape,
@@ -44,6 +89,112 @@ pub fn sm90_mega_moe_workspace_layout(
         .result()?;
     }
     Ok(layout)
+}
+
+/// Stages one rank's BF16 tokens and routes into the MegaMoE symmetric input area.
+///
+/// # Safety
+/// The three source pointers must cover contiguous token-major buffers of shapes
+/// `[num_tokens, hidden]`, `[num_tokens, topk]`, and `[num_tokens, topk]` on
+/// `stream`. `local_workspace` must cover `layout.num_bytes` and remain live
+/// until the launch completes. Route weights are copied unchanged.
+pub unsafe fn sm90_mega_moe_stage_inputs(
+    hidden_states: RawDevicePtr<bf16>,
+    route_indices: RawDevicePtr<i32>,
+    route_weights: RawDevicePtr<f32>,
+    local_workspace: u64,
+    layout: &Sm90MegaMoeWorkspaceLayout,
+    num_tokens: usize,
+    topk: usize,
+    hidden: usize,
+    stream: CUstream,
+) -> Result<()> {
+    ensure!(
+        local_workspace != 0 && !stream.is_null(),
+        "MegaMoE staging needs a workspace and CUDA stream"
+    );
+    ensure!(
+        hidden.is_multiple_of(128) && hidden <= 8192,
+        "MegaMoE staging hidden must be a multiple of 128 and <=8192, got {hidden}"
+    );
+    ensure!(
+        topk > 0 && topk <= hidden / 8,
+        "MegaMoE staging topk must be in 1..={}, got {topk}",
+        hidden / 8
+    );
+    let padded = usize::try_from(layout.num_max_tokens_per_rank)?;
+    ensure!(
+        num_tokens <= padded,
+        "MegaMoE staging tokens {num_tokens} exceed workspace capacity {padded}"
+    );
+
+    let end = |offset: u64, bytes: usize| -> Result<u64> {
+        offset
+            .checked_add(u64::try_from(bytes)?)
+            .ok_or_else(|| anyhow::anyhow!("MegaMoE workspace range overflow"))
+    };
+    let x_end = end(
+        layout.x,
+        padded
+            .checked_mul(hidden)
+            .ok_or_else(|| anyhow::anyhow!("MegaMoE x size overflow"))?,
+    )?;
+    let x_sf_end = end(
+        layout.x_sf,
+        padded
+            .checked_mul(hidden / 128)
+            .and_then(|value| value.checked_mul(std::mem::size_of::<f32>()))
+            .ok_or_else(|| anyhow::anyhow!("MegaMoE x_sf size overflow"))?,
+    )?;
+    let topk_slots = padded
+        .checked_mul(topk)
+        .ok_or_else(|| anyhow::anyhow!("MegaMoE route size overflow"))?;
+    let topk_idx_end = end(
+        layout.topk_idx,
+        topk_slots
+            .checked_mul(std::mem::size_of::<i64>())
+            .ok_or_else(|| anyhow::anyhow!("MegaMoE route-index size overflow"))?,
+    )?;
+    let topk_weights_end = end(
+        layout.topk_weights,
+        topk_slots
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| anyhow::anyhow!("MegaMoE route-weight size overflow"))?,
+    )?;
+    ensure!(
+        x_end <= layout.x_sf
+            && x_sf_end <= layout.topk_idx
+            && topk_idx_end <= layout.topk_weights
+            && topk_weights_end <= layout.l1_acts
+            && layout.l1_acts <= layout.num_bytes,
+        "MegaMoE workspace layout does not cover staged inputs"
+    );
+
+    let at = |offset: u64| -> Result<u64> {
+        local_workspace
+            .checked_add(offset)
+            .ok_or_else(|| anyhow::anyhow!("MegaMoE workspace pointer overflow"))
+    };
+    // SAFETY: source and workspace lifetimes are the caller's contract; ranges are checked above.
+    unsafe {
+        ffi::dsv4_sm90_mega_moe_pre_dispatch_cuda(
+            hidden_states.as_ptr().cast(),
+            route_indices.as_ptr(),
+            route_weights.as_ptr(),
+            at(layout.x)? as *mut u8,
+            at(layout.x_sf)? as *mut f32,
+            at(layout.topk_idx)? as *mut i64,
+            at(layout.topk_weights)? as *mut f32,
+            i32::try_from(num_tokens)?,
+            layout.num_max_tokens_per_rank,
+            i32::try_from(hidden)?,
+            i32::try_from(topk)?,
+            0,
+            stream,
+        )
+        .result()?;
+    }
+    Ok(())
 }
 
 pub struct Sm90MegaMoeLaunch<'a> {

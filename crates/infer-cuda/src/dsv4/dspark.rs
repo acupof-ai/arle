@@ -209,6 +209,7 @@ impl Dsv4Model {
             "DSpark block_tokens {} != block {block}",
             block_tokens.len()
         );
+        let mega_epoch = self.begin_mega_moe_forward(block)?;
         let local_width = attention.wq_b.rows;
         ensure!(
             local_width.is_multiple_of(head_dim),
@@ -397,7 +398,7 @@ impl Dsv4Model {
         let moe = layer.moe.as_ref().expect("DSpark draft layer.moe");
         // SAFETY: uninit device scratch; fully written before first read.
         let mut moe_out = unsafe { HiddenStates::uninit(ctx, hidden_size, block)? };
-        crate::moe::dsv4_moe_forward(
+        let needs_moe_allreduce = crate::moe::dsv4_moe_forward(
             self,
             moe,
             block_tokens,
@@ -405,8 +406,11 @@ impl Dsv4Model {
             &mut moe_out,
             &mut keepalive,
             None,
+            mega_epoch,
         )?;
-        self.tp.all_reduce_sum(ctx, &mut moe_out)?;
+        if needs_moe_allreduce {
+            self.tp.all_reduce_sum(ctx, &mut moe_out)?;
+        }
         // SAFETY: uninit device scratch; fully written before first read.
         let mut shared = unsafe { HiddenStates::uninit(ctx, hidden_size, block)? };
         crate::moe::dsv4_shared_expert_forward(

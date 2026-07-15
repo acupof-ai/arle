@@ -1,92 +1,135 @@
-# DSv4 SM90 MegaMoE raw ABI — pending remote
+# DSv4 SM90 MegaMoE TP4
 
-> Status: pending-remote — the raw ABI is not wired into serving yet.
-
-## SLO-shape probed? N
-
-No H20 run in this local tranche; no performance verdict or default flip.
-
-## Roofline check
-
-Deferred until the H20 component A/B. Required counters: fused-kernel TFLOPS,
-HBM GB/s, launch count, and wall-clock MoE ms/request.
+> Status: Shipped — opt-in licensed on 4x H20; default unchanged.
 
 ## Goal
 
-Optimization substrate: expose the vendored SM90 MegaMoE workspace and launch
-without Torch, while leaving the serving path unchanged.
+Use DeepGEMM PR #323 directly for DSv4 routed experts without PyTorch or a
+second kernel implementation.
 
 ## Hypothesis
 
-Replacing per-rank MoE staging with the upstream fused dispatch/L1/L2/combine
-kernel will improve TP=4 aggregate throughput; no percentage is licensed yet.
+The fused dispatch, L1, L2, and combine path improves TP4 wall-clock throughput
+once each replicated TP batch is token-sharded before dispatch.
 
-## Command
+## Parameters
 
-```bash
-# Upstream PR #323 component probe; ARLE raw ABI remains pending.
-python3 test_mega_moe_hopper.py --fused-only-sweep --num-processes 4 \
-  --num-max-tokens-per-rank 128 --batches 1 4 8 16 \
-  --hidden 4096 --intermediate-hidden 2048 --num-experts 256 --num-topk 6
+- Model: `/host/DeepSeek-V4-Flash-FP8`, TP=4 on GPUs 3-6
+- Input/output: 1,024/256 tokens, seed `20260416`
+- Concurrency: 1, 4, 8, 16; 120 seconds each
+- Baseline: `ARLE_DSV4_MOE_TRANSPORT=allreduce`
+- Candidate: `ARLE_DSV4_MOE_TRANSPORT=mega_moe`
+- L1 KV: `mem_fraction_static=0.9`; L2: 50% host DRAM; L3: off
+- Binary SHA256: `16a2dd6a30d64e333a082991e938c18e5c6558573239ed7eb963e0e38e5f98e1`
+- Upstream PR head: `9e3afe91cb145ddfa0b18ae874a11dbb449e16a9`
 
-# Pending after serving wiring.
-scripts/bench_guidellm.sh dsv4-sm90-mega-moe \
-  --concurrencies 1,4,16,64 --max-seconds 120
-```
+GuideLLM needed a tokenizer-only processor view because installed Transformers
+does not recognize `deepseek_v4`; tokenization still used the checkpoint's
+unchanged `tokenizer.json` and `tokenizer_config.json`.
 
 ## Environment
 
-- Backend: CUDA, SM90 only
-- Model: DeepSeek-V4-Flash
-- Hardware: 4x H20, driver 535.161.08, CUDA 12.9
-- Upstream: DeepGEMM PR #323 head `9e3afe91cb145ddfa0b18ae874a11dbb449e16a9`
-- Source commit: `b94e2fc44` plus the raw-ABI tranche
-- Non-default path: SM90 MegaMoE raw ABI, not yet reachable from serving
+- 4x H20, SM90, 96 GB each
+- Driver 535.161.08, CUDA 12.9, NCCL 2.27.3
+- 1.9 TiB host RAM
+- Final incremental release build: 2m12s
+- Final serving binary: 73,735 MB weights/rank, 186 slots
+
+## Correctness
+
+The allreduce and final token-sharded MegaMoE paths both decoded `Paris` for the
+same greedy request. The independent PR reference passed at the exact Flash
+shape with `calc_diff=0.0006 < 0.07`; upstream accuracy passed 28/28 cases.
 
 ## Results
 
-The upstream component probe passed on 4x H20; this validates the pinned kernel,
-not the ARLE raw ABI or serving path.
+Final same-binary sweep:
+
+| c | Path | TTFT ms | ITL ms | Output tok/s | Total tok/s | Req/s | Errors |
+|---:|---|---:|---:|---:|---:|---:|---:|
+| 1 | allreduce | 1,432.8 | 21.90 | 36.93 | 184.77 | 0.142 | 0 |
+| 1 | MegaMoE | 951.5 | 19.95 | 42.72 | 213.79 | 0.158 | 0 |
+| 4 | allreduce | 3,995.9 | 52.32 | 59.98 | 289.73 | 0.200 | 0 |
+| 4 | MegaMoE | 2,267.3 | 45.52 | 72.92 | 337.43 | 0.250 | 0 |
+| 8 | allreduce | 6,365.6 | 69.44 | 86.95 | 405.37 | 0.283 | 0 |
+| 8 | MegaMoE | 3,571.8 | 52.81 | 121.20 | 563.34 | 0.408 | 0 |
+| 16 | allreduce | 20,674.5 | 76.16 | 117.51 | 588.02 | 0.275 | 0 |
+| 16 | MegaMoE | 9,220.2 | 74.06 | 126.15 | 575.77 | 0.433 | 0 |
+
+| c | Output tok/s delta | TTFT delta | ITL delta |
+|---:|---:|---:|---:|
+| 1 | +15.7% | -33.6% | -8.9% |
+| 4 | +21.6% | -43.3% | -13.0% |
+| 8 | +39.4% | -43.9% | -24.0% |
+| 16 | +7.4% | -55.4% | -2.8% |
+
+Fresh-server fixed-c16 control:
+
+| Path | TTFT ms | ITL ms | Output tok/s | Total tok/s | Req/s | Prefix hit peak |
+|---|---:|---:|---:|---:|---:|---:|
+| allreduce | 21,330.1 | 76.60 | 79.97 | 400.18 | 0.267 | 0.0% |
+| MegaMoE | 9,393.0 | 74.44 | 148.74 | 697.44 | 0.467 | 46.0% |
+
+Fixed-c16 output throughput improved 86.0%, but faster completion created more
+prefix-reuse opportunities. The cache-independent decode claim is therefore the
+2.8% ITL improvement; 86.0% is the measured whole-service result with L2/prefix
+enabled, not a pure kernel claim.
+
+## Nsight Systems timeline
+
+The pre-sharding c16 trace captured 6,836 MegaMoE launches. CUDA runtime and GPU
+timestamps joined by process plus correlation id show host/GPU overlap, not a
+host serialization bottleneck:
+
+- Host CUDA launch time overlapped GPU work by 87.1-89.3% across four ranks.
+- MegaMoE launch API p50: 4.1 us; kernel p50/p99: 372/639 us.
+- API-end to kernel-start queue p50/p99: 10.78/28.51 ms.
+- Three MegaMoE launches, nine BF16 all-reduces, and eight all-gathers exceeded
+  10 ms; maxima were 107.6/143.0/96.8 ms.
+
+The trace killed the original implementation: TP replicated the same tokens on
+all ranks, while PR #323 assumes rank-owned tokens. Sharding contiguous token
+rows before dispatch and reducing owned outputs removed 4x duplicate expert
+work. The output scratch is allocated once; the hot loop allocates nothing.
+
+## Component evidence
 
 | Tokens/rank | MegaMoE us | TFLOPS | HBM GB/s |
 |---:|---:|---:|---:|
-| 1 | 103.0 | 3.4 | 1467 |
-| 4 | 262.5 | 4.8 | 2015 |
-| 8 | 322.1 | 6.7 | 2190 |
-| 16 | 455.4 | 9.8 | 2821 |
+| 1 | 103.0 | 3.4 | 1,467 |
+| 4 | 262.5 | 4.8 | 2,015 |
+| 8 | 322.1 | 6.7 | 2,190 |
+| 16 | 455.4 | 9.8 | 2,821 |
 
-The exact Flash shape matched the independent Torch reference at
-`calc_diff=0.0006 < 0.07`. At 16 tokens, the optional DeepEP + grouped-FP8
-pipeline took 1.54-1.58 ms versus 0.46-0.52 ms fused (3.06-3.36x), but its
-per-128 L2 activation scale differs from MegaMoE's per-64 contract, so it is a
-timing control, not the numerical reference.
+At 16 tokens/rank, the optional DeepEP plus grouped-FP8 control took
+1.54-1.58 ms versus 0.46-0.52 ms fused. This is component evidence only; the
+wall-clock tables above license serving.
 
-Local raw-ABI gates passed:
+## Cold-load result
 
-- `CUDARC_CUDA_VERSION=12080 cargo check -p cuda-kernels --release --no-default-features --features cuda,no-cuda --lib`
-- `git diff --check`
-- H20/CUDA 12.9 direct NVCC compile of `deepgemm_native.cu` with
-  `DG_JIT_USE_RUNTIME_API=1` (`deepgemm_native.o`, 244 KiB).
-- H20 raw workspace ABI returned success for `TP4/E256/H4096/I2048/topk6`:
-  requested 128 tokens aligned to 384, 165,608,480 bytes/rank.
+Only rank 0 physically prefetched the base checkpoint. The measured load was
+294.0 GB across 46 shards in 1,445.4 seconds on the cold disk; ranks 1-3 reported
+zero physical read bytes and reused page cache. This removes the old TP4
+1.65-TB read amplification. A warm page-cache prefetch took 7.5-15.4 seconds.
 
 ## Problems
 
-- H20 JIT load/launch, tensor-map runtime encoding, symmetric-buffer dispatch,
-  and raw-ABI numerical output are unverified.
-- Serving has no call site, so guidellm cannot attribute a delta yet.
+- The canonical 4,096/256 sweep is invalid above c=4 on this KV envelope. At
+  c=8 the minimum-rank 47,936-token pool exhausted and the worker exited after
+  repeated preemption. c=16 needs about 69,632 active tokens before retained
+  prefix pages, so no code path can satisfy that shape with this pool.
+- L3 was intentionally off. Synthetic unique prompts do not license SSD recall;
+  enable it only for a repeated-prefix workload with measured disk hits.
+- The nsys report is pod-local and intentionally not committed:
+  `/host/arle-megamoe-t1/bench-output/2026-07-15-megamoe-c16-nsys/fused.nsys-rep`.
 
 ## Learnings
 
-An unreachable raw kernel ABI is implementation progress, not a throughput win;
-license only after same-binary serving A/B and decoded-output correctness.
+PR #323 is directly usable, but its distributed-token contract is DP-like, not
+TP-replicated. Kernel microbench wins were real and still insufficient: only
+the token-sharded, fixed-concurrency serving A/B licensed the path.
 
 ## Delta vs baseline
 
-Deferred. Use the latest DSv4 TP=4 fixed-concurrency baseline when wiring lands.
-
-## Artefacts
-
-Pod logs: `/host/deepgemm-pr323-probe/t0-exact-shape-max128.log`,
-`t0-n16-baseline.log`, `t0-accuracy-flash-exact.log`, and
-`/host/arle-megamoe-t1/h20-native-nvcc.log`.
+Opt-in MegaMoE is licensed for H20 TP4. Defaults stay on allreduce until a
+second production shape and repeated-run variance gate pass.

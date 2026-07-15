@@ -1515,3 +1515,41 @@ extern "C" CUresult dsv4_cast_i32_to_i64_cuda(
   return (CUresult)cudaGetLastError();
 }
 
+__global__ void dsv4_interleave_gate_up_fp8_rows_kernel(
+    const uint4 *__restrict__ gate,
+    const uint4 *__restrict__ up,
+    uint4 *__restrict__ output,
+    int rows,
+    int vectors_per_row) {
+  int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  int64_t total = static_cast<int64_t>(rows) * 2 * vectors_per_row;
+  if (idx >= total) return;
+  int dst_row = idx / vectors_per_row;
+  int col = idx % vectors_per_row;
+  int lane = dst_row & 15;
+  int src_row = (dst_row >> 4) * 8 + (lane & 7);
+  const uint4 *src = lane < 8 ? gate : up;
+  output[idx] = src[static_cast<int64_t>(src_row) * vectors_per_row + col];
+}
+
+extern "C" CUresult dsv4_interleave_gate_up_fp8_rows_cuda(
+    const uint8_t *gate,
+    const uint8_t *up,
+    uint8_t *output,
+    int rows,
+    int cols,
+    CUstream stream) {
+  if (gate == nullptr || up == nullptr || output == nullptr || rows <= 0 ||
+      (rows & 7) != 0 || cols <= 0 || (cols & 15) != 0) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  int vectors_per_row = cols / 16;
+  int64_t total = static_cast<int64_t>(rows) * 2 * vectors_per_row;
+  int grid = static_cast<int>((total + DSV4_ROUTE_BLOCK - 1) / DSV4_ROUTE_BLOCK);
+  dsv4_interleave_gate_up_fp8_rows_kernel<<<grid, DSV4_ROUTE_BLOCK, 0,
+                                            (cudaStream_t)stream>>>(
+      reinterpret_cast<const uint4 *>(gate),
+      reinterpret_cast<const uint4 *>(up),
+      reinterpret_cast<uint4 *>(output), rows, vectors_per_row);
+  return (CUresult)cudaGetLastError();
+}
