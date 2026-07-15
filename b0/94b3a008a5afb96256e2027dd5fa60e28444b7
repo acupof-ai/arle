@@ -1,0 +1,23 @@
+CHANGELOG.md
+  s_84df39eb543901::t_4ef710faa4d772 26-32
+docs/experience/wins/2026-07-16-dsv4-fp32-compressor-promotion.md
+  s_84df39eb543901::t_096e6ac9cb61b2 1-79
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "b094b3a008a5afb96256e2027dd5fa60e28444b7",
+  "prompts": {},
+  "sessions": {
+    "s_84df39eb543901": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "09b70280-1d0b-477b-9aa8-54f8da20ed0f",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
