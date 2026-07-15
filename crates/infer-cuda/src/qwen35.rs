@@ -495,6 +495,10 @@ pub(crate) struct Qwen35SlotState {
     gdr_states: Vec<CudaSlice<f32>>,
     /// `[num_linear_layers]` conv1d rings (`qkv_dim*(kernel-1)` bf16).
     conv_states: Vec<DeviceVec>,
+    /// True once `acquire_recurrent` has run for the current occupant (even
+    /// when `num_linear == 0` and the state vecs are empty). Guards the
+    /// forward's `has_recurrent()` chokepoint against a missed acquire.
+    recurrent_acquired: bool,
     /// Tokens materialized into the caches so far (full-attn kv_len).
     seq_len: usize,
 }
@@ -660,6 +664,7 @@ impl Qwen35SlotState {
             v_caches: Vec::new(),
             gdr_states: Vec::new(),
             conv_states: Vec::new(),
+            recurrent_acquired: false,
             seq_len: 0,
         }
     }
@@ -680,6 +685,7 @@ impl Qwen35SlotState {
         pool: &mut Vec<RecurrentBlock>,
     ) -> Result<()> {
         if !self.gdr_states.is_empty() {
+            self.recurrent_acquired = true;
             return Ok(()); // already active (a chunked-prefill continuation)
         }
         let (gdr, conv) = match pool.pop() {
@@ -698,6 +704,7 @@ impl Qwen35SlotState {
         };
         self.gdr_states = gdr;
         self.conv_states = conv;
+        self.recurrent_acquired = true;
         self.seq_len = 0;
         // Zero on acquisition (a pooled block carries the prior occupant's
         // state; a fresh alloc is already zero but re-zeroing is cheap/uniform).
@@ -709,6 +716,7 @@ impl Qwen35SlotState {
     /// fully done — no in-flight forward references it), so the block is safe to
     /// hand to the next request.
     pub(crate) fn release_recurrent(&mut self, pool: &mut Vec<RecurrentBlock>) {
+        self.recurrent_acquired = false;
         if self.gdr_states.is_empty() {
             return;
         }
@@ -742,17 +750,24 @@ impl Qwen35SlotState {
     /// that reads `gdr_states` MUST see this true — a false here means an
     /// `acquire_recurrent` hook was missed at the request's `start_pos == 0`.
     pub(crate) fn has_recurrent(&self) -> bool {
-        !self.gdr_states.is_empty()
+        self.recurrent_acquired
     }
 
-    /// D2H snapshot of the current recurrent state. Returns an error if
-    /// the slot has no recurrent state (unacquired).
+    /// D2H snapshot of the current recurrent state. A full-attn-only model
+    /// (`num_linear == 0`) has empty `gdr_states`/`conv_states` but still reaches
+    /// the prefix-cache sidecar snapshot path — return an empty snapshot (no
+    /// device work) so `restore_recurrent_from_snapshot` (0==0 dims, no-op zips)
+    /// stays consistent.
     pub(crate) fn snapshot_recurrent(
         &self,
         ctx: &DeviceContext,
     ) -> Result<Qwen35RecurrentSnapshot> {
         if self.gdr_states.is_empty() {
-            anyhow::bail!("snapshot_recurrent: slot recurrent state not acquired");
+            return Ok(Qwen35RecurrentSnapshot {
+                gdr: Vec::new(),
+                conv: Vec::new(),
+                full_attn_kv: None,
+            });
         }
         let gdr = self
             .gdr_states
