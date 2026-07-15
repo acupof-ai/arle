@@ -30,7 +30,7 @@ kernel_bundle_identity() {
         done | cuda_prebuilt_hash_stream
     )
     cat <<EOF
-schema=3
+schema=4
 lane=$LANE
 arches=$ARCHS
 tilelang_inputs=$tilelang_inputs
@@ -44,12 +44,11 @@ kernel_bundle_manifest() {
     [[ -x "$nvcc" ]] || nvcc="$(command -v nvcc 2>/dev/null || true)"
     cat <<EOF
 {
-  "schema": 2,
+  "schema": 3,
   "bundle_id": "$id",
   "lane": "$LANE",
   "arches": "$ARCHS",
   "cuda_contract": "$CUDA_CONTRACT",
-  "source_commit": "$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || printf unknown)",
   "tilelang_inputs_sha256": "$(cd "$ROOT" && cuda_prebuilt_files_hash crates/cuda-kernels/build.rs crates/cuda-kernels/kernels.toml crates/cuda-kernels/tools/tilelang requirements-build.txt)",
   "nvcc_sha256": "$(if [[ -n "$nvcc" ]]; then cuda_prebuilt_command_id "$nvcc" --version; else printf missing; fi)",
   "host_compiler_sha256": "$(cuda_prebuilt_command_id "${NVCC_CCBIN:-g++}" --version)",
