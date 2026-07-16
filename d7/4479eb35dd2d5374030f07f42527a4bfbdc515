@@ -1,0 +1,23 @@
+crates/cli/src/args.rs
+  s_1134586d21dd15::t_8bbb6efc2787c5 1869-1876
+crates/cli/src/train_cli.rs
+  s_1134586d21dd15::t_231584e3ee5cbe 540-619,3101-3110,3127,3313-3360,3502,4963,4968-5016
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "d74479eb35dd2d5374030f07f42527a4bfbdc515",
+  "prompts": {},
+  "sessions": {
+    "s_1134586d21dd15": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ac90fc91e48e6a2a0",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
