@@ -470,6 +470,71 @@ impl PromptSampler {
             .wrapping_add(1442695040888963407);
         ((self.state >> 32) as usize) % len
     }
+
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    fn next_unit(&mut self) -> f64 {
+        self.next_index(1 << 24) as f64 / (1 << 24) as f64
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct TaskStats {
+    zv_streak: u32,
+    ema_pass: Option<f32>,
+    hot_rounds: u32,
+    retired: bool,
+}
+
+/// P5 pass-rate task selection: GRESO-style zero-variance skip + EMA-pass
+/// retirement. No comfort-band reweighting yet — needs a corpus-level
+/// difficulty spread to be meaningful.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+struct TaskSelection {
+    rng: PromptSampler,
+    stats: Vec<TaskStats>,
+}
+
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+impl TaskSelection {
+    fn new(n_tasks: usize) -> Self {
+        Self {
+            // Fixed seed → runs are reproducible.
+            rng: PromptSampler::new(0x5EED),
+            stats: vec![TaskStats::default(); n_tasks],
+        }
+    }
+
+    /// P(skip) = 1 − 1/(1+streak), capped so P(explore) ≥ 0.1.
+    fn skip_prob(zv_streak: u32) -> f64 {
+        (1.0 - 1.0 / (1.0 + f64::from(zv_streak))).min(0.9)
+    }
+
+    /// Update from a completed group; skipped rounds freeze both streaks.
+    fn record(&mut self, task: usize, zero_variance: bool, pass_rate: f32) {
+        let s = &mut self.stats[task];
+        s.zv_streak = if zero_variance { s.zv_streak + 1 } else { 0 };
+        let ema = s.ema_pass.map_or(pass_rate, |e| 0.3 * pass_rate + 0.7 * e);
+        s.ema_pass = Some(ema);
+        s.hot_rounds = if ema >= 0.9 { s.hot_rounds + 1 } else { 0 };
+        s.retired = s.retired || s.hot_rounds >= 3;
+    }
+
+    /// Task indices to run this round + (skipped, retired) counts.
+    /// Round 0 runs ALL tasks: no history yet, and the baseline needs it.
+    fn select(&mut self, round: usize) -> (Vec<usize>, usize, usize) {
+        let (mut run, mut skipped, mut retired) = (Vec::new(), 0, 0);
+        for i in 0..self.stats.len() {
+            let s = self.stats[i];
+            if s.retired {
+                retired += 1;
+            } else if round > 0 && self.rng.next_unit() < Self::skip_prob(s.zv_streak) {
+                skipped += 1;
+            } else {
+                run.push(i);
+            }
+        }
+        (run, skipped, retired)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2586,6 +2651,8 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
         tasks.len(),
         dataset.display()
     );
+    // P5 selection state: in-memory, this run only (metrics.jsonl has the history).
+    let mut selection = args.task_selection.then(|| TaskSelection::new(tasks.len()));
 
     // HELD-OUT eval tasks (separate from --dataset). Staged under
     // --eval-staged-root (falls back to --staged-root). Loaded once up front so
@@ -2971,16 +3038,28 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
         // pre-cc loop, where the cap bounded accepted pairs per round).
         let mut cap_left = args.writeback_cap.unwrap_or(usize::MAX);
 
-        let mut next_boot = tasks
-            .first()
-            .map(|(task, staged)| harness.boot_group(task, staged, width));
-        for group_idx in 0..tasks.len() {
+        let (round_tasks, tasks_skipped, tasks_retired) = match selection.as_mut() {
+            Some(sel) => sel.select(round),
+            None => ((0..tasks.len()).collect(), 0, 0),
+        };
+        if tasks_skipped + tasks_retired > 0 {
+            eprintln!(
+                "[arle train agent-opd] round {round}: task-selection ran={}/{} skipped={tasks_skipped} retired={tasks_retired}",
+                round_tasks.len(),
+                tasks.len()
+            );
+        }
+
+        let boot = |&i: &usize| {
+            let (task, staged) = &tasks[i];
+            harness.boot_group(task, staged, width)
+        };
+        let mut next_boot = round_tasks.first().map(boot);
+        for (pos, &group_idx) in round_tasks.iter().enumerate() {
             let this_boot = next_boot.take().expect("booted ahead");
             // Boot-ahead: the next group's sandboxes build during this group's
             // rollout + train (CPU only — staleness-free).
-            next_boot = tasks
-                .get(group_idx + 1)
-                .map(|(next, staged)| harness.boot_group(next, staged, width));
+            next_boot = round_tasks.get(pos + 1).map(boot);
             let group =
                 train::aopd_profile::time_try("cc_rollout", train::aopd_profile::WALL, || {
                     harness.run_group(this_boot)
@@ -2991,6 +3070,13 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
             passed += group_passed;
             tasks_passed += usize::from(group_passed > 0);
             zero_variance_groups += usize::from(train::cc_harness::zero_variance(&group.samples));
+            if let Some(sel) = selection.as_mut() {
+                sel.record(
+                    group_idx,
+                    train::cc_harness::zero_variance(&group.samples),
+                    group_passed as f32 / group.samples.len().max(1) as f32,
+                );
+            }
             let rewards: Vec<f32> = group.samples.iter().map(|s| s.reward).collect();
             let reward_mean = rewards.iter().sum::<f32>() / rewards.len().max(1) as f32;
             let reward_std = (rewards
@@ -3134,7 +3220,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
             // prefix-cache drop in one engine-thread closure); every-round
             // syncs once, at the last group. Then re-acquire the KV pool for
             // the next rollout.
-            if sync_every_group || group_idx + 1 == tasks.len() {
+            if sync_every_group || pos + 1 == round_tasks.len() {
                 let sync_started = Instant::now();
                 infer_student
                     .sync_lora_from_store(&mut store, &student.adapter_name_map(), lora)
@@ -3157,7 +3243,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
         };
         eprintln!(
             "[arle train agent-opd] round {round}: tasks={} rollouts={rollouts} passed={passed} tasks_passed={tasks_passed} zero_variance_groups={zero_variance_groups} mean_loss={mean_loss:.4}",
-            tasks.len(),
+            round_tasks.len(),
         );
         log_opd_vram(&format!("after round {round} writeback"), &train_backend);
 
@@ -3227,11 +3313,13 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
         eprintln!("[agent-opd] phase=round_tail_save seconds={save_secs:.3}");
 
         // Per-round metrics row; the update/group rows land per group above.
-        let groups = tasks.len().max(1);
+        let groups = round_tasks.len().max(1);
         metrics.append(&serde_json::json!({
             "kind": "round",
             "round": round,
-            "tasks": tasks.len(),
+            "tasks": round_tasks.len(),
+            "tasks_skipped": tasks_skipped,
+            "tasks_retired": tasks_retired,
             "rollouts": rollouts,
             "passed": passed,
             "pass_at_k": tasks_passed as f32 / groups as f32,
@@ -4697,9 +4785,39 @@ mod tests {
 
     use super::{
         OpdLrSchedule, OpdStepMetric, PretrainPresetArg, PromptSampler, ScratchShape,
-        current_grad_norm, default_cosine_warmup_steps, embedded_tiny_qwen35_config, kl_mask_arg,
-        maybe_save_full_student_checkpoint, opd_summary, validate_prompt_collection,
+        TaskSelection, current_grad_norm, default_cosine_warmup_steps, embedded_tiny_qwen35_config,
+        kl_mask_arg, maybe_save_full_student_checkpoint, opd_summary, validate_prompt_collection,
     };
+
+    #[test]
+    fn task_selection_skip_retire_math() {
+        // Monotone skip probability with the 0.9 cap (P(explore) >= 0.1).
+        assert_eq!(TaskSelection::skip_prob(0), 0.0);
+        assert!(TaskSelection::skip_prob(1) < TaskSelection::skip_prob(3));
+        assert_eq!(TaskSelection::skip_prob(100), 0.9);
+
+        // Round 0 runs ALL tasks even with a zero-variance history.
+        let mut sel = TaskSelection::new(2);
+        sel.record(0, true, 0.0);
+        let (run, skipped, retired) = sel.select(0);
+        assert_eq!((run.len(), skipped, retired), (2, 0, 0));
+
+        // Retirement needs 3 CONSECUTIVE hot rounds.
+        sel.record(1, false, 1.0);
+        sel.record(1, false, 1.0);
+        assert_eq!(sel.select(1).2, 0, "not yet 3 consecutive");
+        sel.record(1, false, 1.0);
+        let (run, _, retired) = sel.select(1);
+        assert_eq!(retired, 1);
+        assert!(!run.contains(&1), "retired task never runs again");
+
+        // A sub-0.9 EMA round resets the hot streak.
+        let mut sel = TaskSelection::new(1);
+        sel.record(0, false, 1.0);
+        sel.record(0, false, 1.0);
+        sel.record(0, false, 0.0);
+        assert_eq!(sel.stats[0].hot_rounds, 0);
+    }
     use crate::args::{LrScheduleArg, OpdKlMaskArg};
 
     #[test]
