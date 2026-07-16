@@ -1876,6 +1876,12 @@ pub(crate) struct TrainAgentOpdArgs {
     #[arg(long, value_name = "N")]
     pub(crate) task_limit: Option<usize>,
 
+    /// Pass-rate task selection: zero-variance skip (GRESO-style, P(explore) >=
+    /// 0.1, fixed-seed RNG) + retirement at EMA pass >= 0.9 for 3 consecutive
+    /// rounds. Round 0 always runs all tasks. `false` = every task every round.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set, value_name = "BOOL")]
+    pub(crate) task_selection: bool,
+
     /// HELD-OUT eval task set (SWE-bench-Pro JSONL, SAME schema as --dataset but
     /// SEPARATE tasks — no overlap, so the pass-rate measures generalization).
     /// When set, an eval-only rollout+score pass runs at round boundaries (a
