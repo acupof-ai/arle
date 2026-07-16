@@ -1,0 +1,25 @@
+scripts/gen_bench_prompts.py
+  s_81c5a850d93f85::t_b5fbf794ad0376 1-43
+scripts/pod.sh
+  s_81c5a850d93f85::t_3d806bfd46b761 31,124-128,146-167,194
+scripts/run_dsv4_bench.sh
+  s_81c5a850d93f85::t_b3de4369f1d823 2-4,7,10-12,16,27,35-38
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "49bf705e9cd68e076cb1ce30408a325d93356147",
+  "prompts": {},
+  "sessions": {
+    "s_81c5a850d93f85": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c1899929-05e0-4ef7-9ac7-0acb8fe9ec71",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
