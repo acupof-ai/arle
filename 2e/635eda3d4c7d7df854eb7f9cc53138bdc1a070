@@ -1,0 +1,21 @@
+crates/cuda-kernels/csrc/attention/dsv4_compressor.cu
+  s_81c5a850d93f85::t_2539d13f2152c8 380-382,384-386,388-391,431,458-459,530-532,534-542,574-579,590-594,608-609,663-664,704-716,718-719
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "2e635eda3d4c7d7df854eb7f9cc53138bdc1a070",
+  "prompts": {},
+  "sessions": {
+    "s_81c5a850d93f85": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c1899929-05e0-4ef7-9ac7-0acb8fe9ec71",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
