@@ -212,6 +212,10 @@ impl KvMmapStore {
         self.free_list.pop()
     }
 
+    pub fn available_slots(&self) -> usize {
+        self.free_list.len()
+    }
+
     /// Memcpy `data` into `slot` (`data.len() <= slot_bytes`).
     /// Trailing bytes are left untouched; callers must track the valid length.
     pub fn write_slot(&mut self, slot: u32, data: &[u8]) -> io::Result<()> {
