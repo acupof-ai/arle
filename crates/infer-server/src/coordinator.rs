@@ -8,6 +8,7 @@
 //! per-request sinks the async handlers await. TP=1 never reaches here.
 //! See `docs/plans/2026-06-24-multiproc-control-data-plane-redesign.md`.
 
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver as SyncReceiver, RecvTimeoutError, Sender as SyncSender};
 use std::sync::{Arc, Mutex};
@@ -52,11 +53,10 @@ pub fn set_messages_dump_dir(dir: impl Into<std::path::PathBuf>) -> std::io::Res
     Ok(())
 }
 
-/// Fire-and-forget dump of one `/v1/messages` body (log-and-continue on error).
-fn dump_messages_body(body: &serde_json::Value) {
-    let Some((dir, seq)) = MESSAGES_DUMP.get() else {
-        return;
-    };
+/// Fire-and-forget dump of one `/v1/messages` body (log-and-continue on
+/// error). Returns the dump path so the handler can write its token sidecar.
+fn dump_messages_body(body: &serde_json::Value) -> Option<PathBuf> {
+    let (dir, seq) = MESSAGES_DUMP.get()?;
     let epoch_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis());
@@ -67,8 +67,45 @@ fn dump_messages_body(body: &serde_json::Value) {
     let result = serde_json::to_vec(body)
         .map_err(std::io::Error::other)
         .and_then(|bytes| std::fs::write(&path, bytes));
+    match result {
+        Ok(()) => Some(path),
+        Err(err) => {
+            log::warn!("dump /v1/messages body to {} failed: {err}", path.display());
+            None
+        }
+    }
+}
+
+/// Request-keyed token truth written beside a `/v1/messages` dump: the exact
+/// prompt tokens the serve rendered + the tokens the engine generated for THAT
+/// request — no re-render drift. Assistant-span byte offsets are not captured:
+/// the serve renders via the checkpoint's Jinja template, which exposes no
+/// spans. gen_logprobs joins here when the CUDA-side generation-time logprob
+/// capture lands (P6b).
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct TokensSidecar {
+    pub prompt_token_ids: Vec<u32>,
+    pub gen_token_ids: Vec<u32>,
+}
+
+/// Sidecar path for a dump: `<epoch_ms>_<seq>.tokens.json`.
+#[must_use]
+pub fn tokens_sidecar_path(dump_path: &Path) -> PathBuf {
+    dump_path.with_extension("tokens.json")
+}
+
+/// Fire-and-forget sidecar write (log-and-continue on error).
+fn write_tokens_sidecar(dump_path: &Path, prompt: Vec<u32>, generated: Vec<u32>) {
+    let path = tokens_sidecar_path(dump_path);
+    let sidecar = TokensSidecar {
+        prompt_token_ids: prompt,
+        gen_token_ids: generated,
+    };
+    let result = serde_json::to_vec(&sidecar)
+        .map_err(std::io::Error::other)
+        .and_then(|bytes| std::fs::write(&path, bytes));
     if let Err(err) = result {
-        log::warn!("dump /v1/messages body to {} failed: {err}", path.display());
+        log::warn!("write tokens sidecar {} failed: {err}", path.display());
     }
 }
 
@@ -1038,7 +1075,7 @@ async fn anthropic_messages(
     State(state): State<Arc<CoordinatorHandle>>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Response, MessagesError> {
-    dump_messages_body(&body);
+    let dump_path = dump_messages_body(&body);
     let request: MessagesRequest = serde_json::from_value(body)
         .map_err(|err| MessagesError::invalid_request(err.to_string()))?;
     request.validate()?;
@@ -1054,6 +1091,8 @@ async fn anthropic_messages(
     let prompt_token_count = prompt_tokens.len();
 
     if request.stream.unwrap_or(false) {
+        // Token sidecar rides the dump: carry the rendered prompt into the task.
+        let mut sidecar = dump_path.map(|path| (path, prompt_tokens.clone()));
         let (mut rx, guard) = streaming_submit(&state, prompt_tokens, max_tokens, sampling)?;
         let state_clone = Arc::clone(&state);
         // Bounded channel: backpressure keeps the task from racing too far ahead.
@@ -1074,6 +1113,7 @@ async fn anthropic_messages(
             let mut pipeline = StreamPipeline::new(thinking, tools_active);
             let mut saw_tool_use = false;
             let mut output_tokens = 0usize;
+            let mut gen_ids: Vec<u32> = Vec::new();
             // Keep-alive pings while generation runs (long prefills).
             let mut ping = tokio::time::interval(Duration::from_secs(5));
             ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1095,6 +1135,9 @@ async fn anthropic_messages(
                         let mut events = String::new();
                         if !delta.token_ids.is_empty() {
                             output_tokens += delta.token_ids.len();
+                            if sidecar.is_some() {
+                                gen_ids.extend_from_slice(&delta.token_ids);
+                            }
                             let text = {
                                 let tok = state_clone
                                     .tokenizer
@@ -1107,6 +1150,9 @@ async fn anthropic_messages(
                                 push_anthropic_events(&mut events, &mut encoder, pieces, &calls);
                         }
                         if delta.finish {
+                            if let Some((path, prompt)) = sidecar.take() {
+                                write_tokens_sidecar(&path, prompt, std::mem::take(&mut gen_ids));
+                            }
                             // Flush the pipeline: truncated thinking + buffered tool tail.
                             let (pieces, calls) = pipeline.finish();
                             saw_tool_use |=
@@ -1145,7 +1191,11 @@ async fn anthropic_messages(
             .into_response());
     }
 
+    let sidecar_prompt = dump_path.as_ref().map(|_| prompt_tokens.clone());
     let outcome = submit_and_collect(&state, prompt_tokens, max_tokens, sampling).await?;
+    if let (Some(path), Some(prompt)) = (dump_path, sidecar_prompt) {
+        write_tokens_sidecar(&path, prompt, outcome.generated_tokens.clone());
+    }
     let decoded = decode(&state, &outcome.generated_tokens)?;
     let (content, tool_calls, split_thinking) =
         finalize_chat_content(decoded, tools_active, thinking);

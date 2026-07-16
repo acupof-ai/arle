@@ -117,7 +117,7 @@ pub fn convert_cc_dumps(
 
     let mut records = Vec::with_capacity(windows.len());
     for window in windows {
-        let Some(body) = fullest_dump_in_window(&dumps, window)? else {
+        let Some((body, path)) = fullest_dump_in_window(&dumps, window)? else {
             eprintln!(
                 "[cc-convert] window {} [{}, {}) matched no dump; skipped",
                 window.label, window.t_start_ms, window.t_end_ms
@@ -127,7 +127,12 @@ pub fn convert_cc_dumps(
         // A single un-convertible window (e.g. a failed rollout with no assistant
         // turn — now collected because SAO keeps failing attempts) must not abort
         // the whole round's records; skip it and keep the rest.
-        match convert_body(&window.label, window.reward, body, tokenizer) {
+        let converted = match read_tokens_sidecar(&path) {
+            // Serve-written engine tokens: token-exact, no re-render drift.
+            Some(sidecar) => Ok(record_from_sidecar(&window.label, window.reward, sidecar)),
+            None => convert_body(&window.label, window.reward, body, tokenizer),
+        };
+        match converted {
             Ok(record) => records.push(record),
             Err(err) => eprintln!("[cc-convert] window {}: {err:#}; skipped", window.label),
         }
@@ -183,9 +188,12 @@ fn list_dumps(dir: &Path) -> Result<Vec<(u64, PathBuf)>> {
         if path.extension().is_none_or(|ext| ext != "json") {
             continue;
         }
-        let epoch_ms = path
-            .file_stem()
-            .and_then(|stem| stem.to_str())
+        let stem = path.file_stem().and_then(|stem| stem.to_str());
+        // `<stem>.tokens.json` sidecars ride beside dumps, not as dumps.
+        if stem.is_some_and(|stem| stem.ends_with(".tokens")) {
+            continue;
+        }
+        let epoch_ms = stem
             .and_then(|stem| stem.split('_').next())
             .and_then(|prefix| prefix.parse::<u64>().ok());
         match epoch_ms {
@@ -205,8 +213,8 @@ fn list_dumps(dir: &Path) -> Result<Vec<(u64, PathBuf)>> {
 fn fullest_dump_in_window(
     dumps: &[(u64, PathBuf)],
     window: &CcWindow,
-) -> Result<Option<serde_json::Value>> {
-    let mut best: Option<(usize, serde_json::Value)> = None;
+) -> Result<Option<(serde_json::Value, PathBuf)>> {
+    let mut best: Option<(usize, serde_json::Value, PathBuf)> = None;
     for (_, path) in dumps
         .iter()
         .filter(|(ms, _)| (window.t_start_ms..window.t_end_ms).contains(ms))
@@ -221,11 +229,45 @@ fn fullest_dump_in_window(
             .get("messages")
             .and_then(serde_json::Value::as_array)
             .map_or(0, Vec::len);
-        if best.as_ref().is_none_or(|(best_len, _)| len > *best_len) {
-            best = Some((len, body));
+        if best.as_ref().is_none_or(|(best_len, _, _)| len > *best_len) {
+            best = Some((len, body, path.clone()));
         }
     }
-    Ok(best.map(|(_, body)| body))
+    Ok(best.map(|(_, body, path)| (body, path)))
+}
+
+/// Parse `<dump>.tokens.json` when present and usable (non-empty prompt+gen);
+/// anything else falls back to the re-render path.
+fn read_tokens_sidecar(dump_path: &Path) -> Option<infer_server::TokensSidecar> {
+    let path = infer_server::tokens_sidecar_path(dump_path);
+    let raw = fs::read_to_string(&path).ok()?;
+    match serde_json::from_str::<infer_server::TokensSidecar>(&raw) {
+        Ok(s) if !s.prompt_token_ids.is_empty() && !s.gen_token_ids.is_empty() => Some(s),
+        Ok(_) => None,
+        Err(err) => {
+            eprintln!(
+                "[cc-convert] {}: {err}; falling back to re-render",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
+/// Engine-token record: the final request's prompt IS the token-exact
+/// multi-turn history (masked); every generated token is supervised.
+fn record_from_sidecar(label: &str, reward: f32, sidecar: infer_server::TokensSidecar) -> CcRecord {
+    let masked_tokens = sidecar.gen_token_ids.len();
+    let total_tokens = sidecar.prompt_token_ids.len() + masked_tokens;
+    CcRecord {
+        label: label.to_owned(),
+        prompt_ids: sidecar.prompt_token_ids,
+        response_ids: sidecar.gen_token_ids,
+        response_mask: vec![1; masked_tokens],
+        reward,
+        masked_tokens,
+        total_tokens,
+    }
 }
 
 /// One dump body → one token record: serve-identical request mapping, ChatML
@@ -377,5 +419,34 @@ mod tests {
     fn straddling_token_is_supervised() {
         let mask = mask_from_offsets(&[(0, 4), (4, 8), (8, 12)], &[6..10]);
         assert_eq!(mask, vec![0, 1, 1]);
+    }
+
+    /// A dump + engine-token sidecar round-trips to a record whose ids equal
+    /// the sidecar's and whose mask supervises exactly the gen segment (the
+    /// dump body alone has no assistant turn, so only the sidecar path can
+    /// produce this record — proving it took precedence over the re-render).
+    #[test]
+    fn sidecar_round_trips_engine_tokens() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("1000_0.json"),
+            r#"{"model":"m","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}"#,
+        )
+        .expect("write dump");
+        std::fs::write(
+            dir.path().join("1000_0.tokens.json"),
+            r#"{"prompt_token_ids":[5,6,7],"gen_token_ids":[8,9]}"#,
+        )
+        .expect("write sidecar");
+        // Never reached: the sidecar path skips tokenization entirely.
+        let tokenizer =
+            tokenizers::Tokenizer::new(tokenizers::models::wordlevel::WordLevel::default());
+        let records = super::convert_cc_dumps(dir.path(), &tokenizer, &[]).expect("convert");
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(record.prompt_ids, vec![5, 6, 7]);
+        assert_eq!(record.response_ids, vec![8, 9]);
+        assert_eq!(record.response_mask, vec![1, 1]);
+        assert_eq!((record.masked_tokens, record.total_tokens), (2, 5));
     }
 }
