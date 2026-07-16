@@ -665,7 +665,10 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             return Ok(());
         }
 
-        self.allocate_for_plan(&plan)?;
+        self.allocate_for_plan(&mut plan);
+        if plan.is_idle() {
+            return Ok(());
+        }
         log::trace!("infer-core submit plan: mode={:?}", plan.mode);
         if diag {
             eprintln!("[STEP-DIAG] SUBMIT plan mode={:?}", plan.mode);
@@ -1380,14 +1383,41 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             .count()
     }
 
-    fn allocate_for_plan(&mut self, plan: &ForwardPlan) -> Result<()> {
-        for row in &plan.prefill_rows {
-            self.alloc_with_prefix_reclaim(row.slot, row.tokens.len())?;
-        }
-        for row in &plan.decode_rows {
-            self.alloc_with_prefix_reclaim(row.slot, 1)?;
-        }
-        Ok(())
+    /// Allocate KV for every plan row. `fit_plan_to_kv_pages` sizes the plan
+    /// so this succeeds; if an alloc still fails (capacity drift), degrade
+    /// the row — shed a prefill chunk (it retries next tick) or park the
+    /// decode victim (#162 path) — never propagate: a step-loop alloc error
+    /// unwinds the whole TP worker group (#164). Lockstep-safe: pool state
+    /// is identical across ranks (same admissions + plans every tick), so
+    /// every rank degrades the same rows.
+    fn allocate_for_plan(&mut self, plan: &mut ForwardPlan) {
+        plan.prefill_rows.retain(|row| {
+            match self.alloc_with_prefix_reclaim(row.slot, row.tokens.len()) {
+                Ok(()) => true,
+                Err(err) => {
+                    log::warn!(
+                        "KV alloc failed for prefill chunk (slot {}): {err:#}; \
+                         shedding the chunk (#164 backstop)",
+                        row.slot
+                    );
+                    false
+                }
+            }
+        });
+        plan.decode_rows
+            .retain(|row| match self.alloc_with_prefix_reclaim(row.slot, 1) {
+                Ok(()) => true,
+                Err(err) => {
+                    log::warn!(
+                        "KV alloc failed for decode row (slot {}): {err:#}; \
+                         parking the request (#164 backstop)",
+                        row.slot
+                    );
+                    self.requeue_preempted_decode(row.slot);
+                    false
+                }
+            });
+        plan.mode = planner::plan_mode(plan.prefill_rows.is_empty(), plan.decode_rows.is_empty());
     }
 
     fn evict_prefix_cache_if_below_low_water(&mut self) -> usize {
@@ -1637,12 +1667,14 @@ mod testing {
 
         fn resident_evictable_pages(&self) -> usize {
             self.page_ref_counts
-                .iter()
-                .filter(|entry| {
-                    let (page, count) = *entry;
-                    *count > 0 && self.page_attach_counts.get(page).copied().unwrap_or(0) == 0
-                })
+                .keys()
+                .filter(|&&page| self.page_is_evictable(page))
                 .count()
+        }
+
+        fn page_is_evictable(&self, page: u32) -> bool {
+            self.page_ref_counts.get(&page).copied().unwrap_or(0) > 0
+                && self.page_attach_counts.get(&page).copied().unwrap_or(0) == 0
         }
 
         fn seq_len(&self, slot: usize) -> usize {
@@ -4285,6 +4317,86 @@ mod tests {
             plan.prefill_rows.len(),
             1,
             "evictable capacity covers demand: nothing shed"
+        );
+        Ok(())
+    }
+
+    /// #164 residual, hole 1: the LRU HEAD is a live slot's mid-flight
+    /// published page (retained once, still attached). Eviction must skip it
+    /// — severing it frees nothing — and continue into the deeper LRU to a
+    /// genuinely freeable page. Uses the production `HostPagedKvPool`.
+    #[test]
+    fn evict_skips_live_attached_lru_head_and_frees_deeper_page() -> Result<()> {
+        let mut engine = Engine::with_config(
+            MockExecutor::ready(),
+            HostPagedKvPool::new(2, 2, 4),
+            test_config(2),
+        );
+        // Slot 0 LIVE with its page published (prompt-seal): LRU-oldest.
+        engine.kv.alloc(0, 4)?;
+        engine.publish_prefix_blocks(0, &[1, 2, 3, 4]);
+        // Slot 1 finished: published then freed — evictable, newer access.
+        engine.kv.alloc(1, 4)?;
+        engine.publish_prefix_blocks(1, &[5, 6, 7, 8]);
+        engine.free_slot_pages(1);
+        assert_eq!(engine.kv_free_pages(), 0);
+        assert_eq!(engine.kv.resident_evictable_pages(), 1);
+
+        let freed = engine.evict_prefix_cache_for_pages(2);
+        assert_eq!(freed, 1, "skipped the live-attached head, freed deeper");
+        assert_eq!(engine.kv_free_pages(), 1);
+        // The live slot kept its page AND its cached prefix.
+        assert_eq!(engine.kv.page_indices(0).len(), 1);
+        assert!(
+            !engine
+                .radix
+                .peek_longest_prefix_match(&[1, 2, 3, 4])
+                .is_empty(),
+            "live-attached prefix must not be severed for zero gain"
+        );
+        Ok(())
+    }
+
+    /// #164 residual, hole 2 (tick #8340 mirror): free=0 and every cached
+    /// page is still attached to a live slot. The capacity model must not
+    /// count them (`page_is_evictable` — the evictor's own predicate), so the
+    /// repair parks the decode victim instead of reaching a fatal
+    /// `allocate_for_plan` failure. Uses the production `HostPagedKvPool`.
+    #[test]
+    fn plan_repair_sees_shortfall_when_cached_pages_are_live_attached() -> Result<()> {
+        let mut engine = Engine::with_config(
+            MockExecutor::ready(),
+            HostPagedKvPool::new(2, 2, 4),
+            test_config(2),
+        );
+        let handle = engine.next_handle();
+        let mut decode_req = RequestState::new(
+            handle,
+            vec![1, 2, 3, 4, 5, 6, 7, 8],
+            RequestPriority::Normal,
+            8,
+            SamplingParams::default(),
+        );
+        decode_req.generated_tokens = vec![9];
+        decode_req.phase = RequestPhase::Decoding;
+        engine.kv.alloc(0, 8)?; // both pool pages, full
+        engine.publish_prefix_blocks(0, &[1, 2, 3, 4, 5, 6, 7, 8]);
+        engine.active.insert(0, decode_req);
+        assert_eq!(engine.kv_free_pages(), 0);
+        assert_eq!(
+            engine.kv.resident_evictable_pages(),
+            0,
+            "live-attached cached pages are not repair capacity"
+        );
+
+        engine.step()?; // pre-fix: phantom capacity -> fatal alloc at tick time
+
+        let parked = engine.waiting.front().expect("decode victim parked");
+        assert_eq!(parked.handle, handle);
+        assert_eq!(
+            engine.kv.resident_evictable_pages(),
+            2,
+            "the park made the pages genuinely evictable"
         );
         Ok(())
     }

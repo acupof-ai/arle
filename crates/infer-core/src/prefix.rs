@@ -119,13 +119,21 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             }
         }
 
+        // An admission-time alloc failure must never propagate — the caller
+        // sits on the step path and the error is fatal to the whole TP group
+        // (#164). Fixed-band top-up exhaustion degrades to full recompute;
+        // the prefill then allocates through the shed-able plan path.
         if let Err(err) =
             self.kv
                 .attach_pages(slot, &prefix_match.block_ids, prefix_match.matched_len)
         {
+            log::warn!("prefix attach failed for slot {slot}: {err:#}; full recompute fallback");
             self.radix.release_blocks(&prefix_match.block_ids);
             self.kv.release_pages(&prefix_match.block_ids);
-            return Err(err);
+            request.phase = RequestPhase::Prefilling { progress: 0 };
+            request.waiting_hint.immediate_reuse_tokens = 0;
+            request.waiting_hint.total_reuse_tokens = 0;
+            return Ok(());
         }
 
         // Restore the recurrent sidecar for hybrid models (Qwen3.5/3.6). No-op for
@@ -171,8 +179,22 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         // Clamp to the prompt: a match cannot extend past this request's own prompt.
         let restored_len = restored.min(request.prompt_len());
         if restored_len > prefix_match.matched_len {
-            self.kv
-                .alloc(slot, restored_len - prefix_match.matched_len)?;
+            // Same degrade contract as the sidecar-miss arm above: an
+            // admission alloc failure must not propagate into the fatal step
+            // path (#164) — undo the attach and full-recompute instead.
+            if let Err(err) = self.kv.alloc(slot, restored_len - prefix_match.matched_len) {
+                log::warn!(
+                    "prefix-restore grow alloc failed for slot {slot}: {err:#}; \
+                     full recompute fallback"
+                );
+                self.free_slot_pages(slot);
+                self.radix.release_blocks(&prefix_match.block_ids);
+                self.kv.release_pages(&prefix_match.block_ids);
+                request.phase = RequestPhase::Prefilling { progress: 0 };
+                request.waiting_hint.immediate_reuse_tokens = 0;
+                request.waiting_hint.total_reuse_tokens = 0;
+                return Ok(());
+            }
         } else if restored_len < prefix_match.matched_len {
             self.kv.truncate_slot(slot, restored_len)?;
         }
@@ -213,13 +235,13 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             Ok(()) => Ok(()),
             Err(first_err) => {
                 let needed = self.kv.append_pages_needed(slot, tokens);
-                let reclaimed = self.evict_prefix_cache_for_pages(needed);
-                if reclaimed == 0 {
+                let freed = self.evict_prefix_cache_for_pages(needed);
+                if freed == 0 {
                     return Err(first_err);
                 }
                 self.kv.alloc(slot, tokens).map_err(|retry_err| {
                     anyhow!(
-                        "KV alloc retry failed after reclaiming {reclaimed} pages: first error: {first_err}; retry error: {retry_err}"
+                        "KV alloc retry failed after freeing {freed} pages: first error: {first_err}; retry error: {retry_err}"
                     )
                 })
             }
@@ -373,58 +395,68 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         self.kv.release_pages(pages);
     }
 
+    /// Evict LRU prefix-cache pages until `pages_needed` pages have actually
+    /// been RETURNED to the free pool, or no further progress is possible.
+    /// Victims are filtered by `KvQuery::page_is_evictable` — the exact
+    /// predicate `resident_evictable_pages` counts, one source — so a cached
+    /// page still attached to a live slot (or a ref-drifted orphan) is
+    /// skipped and the loop continues past it into the deeper LRU (#164
+    /// residual: the old count-of-severed-nodes "reclaimed 2 pages" while
+    /// freeing 0, then gave up with freeable pages still resident).
+    /// Returns the number of pages actually freed.
     pub(crate) fn evict_prefix_cache_for_pages(&mut self, pages_needed: usize) -> usize {
         if pages_needed == 0 {
             return 0;
         }
-        if self.kv_tier_capacity() == 0 {
-            let pages = self.radix.evict_lru(pages_needed);
-            let reclaimed = pages.len();
-            if reclaimed > 0 {
-                self.kv.release_pages(&pages);
-                self.executor.release_prefix_pages(&pages);
-            }
-            self.drain_dropped_tier_keys();
-            return reclaimed;
-        }
-
-        // Tier path: demote each LRU page into the backend host store instead
-        // of dropping it; fall back to plain eviction when the store refuses.
-        let mut reclaimed = 0usize;
-        while reclaimed < pages_needed {
-            let pages = self.radix.lru_evictable_pages(pages_needed - reclaimed);
-            if pages.is_empty() {
+        let free_before = self.kv.free_pages();
+        let tiered = self.kv_tier_capacity() > 0;
+        loop {
+            let freed = self.kv.free_pages().saturating_sub(free_before);
+            if freed >= pages_needed {
                 break;
+            }
+            // Snapshot the whole evictable frontier in LRU order (severing a
+            // leaf exposes its parent, so re-query each round) and keep only
+            // victims whose release genuinely frees a page.
+            let victims: Vec<BlockId> = self
+                .radix
+                .lru_evictable_pages(usize::MAX)
+                .into_iter()
+                .filter(|&page| self.kv.page_is_evictable(page))
+                .take(pages_needed - freed)
+                .collect();
+            if victims.is_empty() {
+                break;
+            }
+            // Tier path: demote into the backend host store (contents stay
+            // promotable); sever only when the store refuses everything.
+            let demoted = if tiered {
+                self.try_demote_pages(&victims)
+            } else {
+                0
             };
-            let demoted = self.try_demote_pages(&pages);
-            for &page in &pages[..demoted] {
+            for &page in &victims[..demoted] {
                 self.kv.release_pages(&[page]);
                 self.executor.release_prefix_pages(&[page]);
-                reclaimed += 1;
             }
             if demoted > 0 {
                 continue;
             }
-            let mut blocked = false;
-            for &page in &pages[demoted..] {
+            let mut severed = 0usize;
+            for &page in &victims {
                 if !self.radix.evict_page(page) {
-                    // Neither demotable nor severable — stop instead of spinning.
-                    blocked = true;
                     break;
                 }
                 self.kv.release_pages(&[page]);
                 self.executor.release_prefix_pages(&[page]);
-                reclaimed += 1;
-                if reclaimed >= pages_needed {
-                    break;
-                }
+                severed += 1;
             }
-            if blocked {
+            if severed == 0 {
                 break;
             }
         }
         self.drain_dropped_tier_keys();
-        reclaimed
+        self.kv.free_pages().saturating_sub(free_before)
     }
 
     /// Invalidate the whole prefix cache after a resident-weight change (OPD

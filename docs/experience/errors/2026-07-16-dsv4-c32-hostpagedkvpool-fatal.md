@@ -89,6 +89,82 @@ error under exhaustion — only reachable with MTP on.
 prompts) must run past the ~101 s exhaustion point with preemptions logged
 and zero teardowns.
 
+## Residual (2026-07-17)
+
+The 459ed5000 repair (`fit_plan_to_kv_pages` budgets `tp_sync_min(free +
+resident_evictable_pages)`, sheds/preempts on shortfall) did NOT survive the
+pod acceptance run: 4×H20 TP=4 eager c=32, prefix hit_rate 0.925, tick #8340,
+all ranks identical — `KV alloc retry failed after reclaiming 2 pages ...
+needs 2, free 0 ... retry ... free 0`, with ZERO park/preempt/requeue in the
+log (the repair never computed a shortfall). Attributed (code-level, verified
+against `serve-accept-crash-last80.log`: L2 host tier ON, 59 slots):
+
+1. **Capacity model ≠ allocator — the pool refcount is blind to live-slot
+   attachment.** `HostPagedKvPool::resident_evictable_pages`
+   (`host_paged_kv_pool.rs:130` pre-fix) counted `page_refs == 1`. But
+   `apply_output`'s prompt-seal publish (`lib.rs:930-936`) puts a LIVE
+   decoding slot's freshly-prefilled pages into the radix at exactly
+   `page_refs == 1` (radix `ref_count == 0`, no `retain_blocks`, not in
+   `reused_prefix_pages`) while they still sit in the slot's `slot_pages`.
+   With c=32 decodes × 256-token outputs, ~32 requests' non-reused prompt
+   tail pages sat in that state at any tick — phantom capacity. The repair
+   (`planner.rs:139`) therefore saw `plan_new_pages_needed ≤ capacity` and
+   shed nothing (zero park/preempt ✓).
+
+2. **The evictor freed live pages, seeding refcount drift.**
+   `evict_prefix_cache_for_pages` (`prefix.rs:376` pre-fix) victims came from
+   radix LRU only (`is_evictable_leaf`: radix ref 0), never consulting slot
+   attachment. Evicting/demoting a live-attached page ran `release_pages` →
+   refs 1→0 → the page RETURNED TO FREE while the slot still wrote it
+   (`host_paged_kv_pool.rs:283-292` pre-fix). Consequences cascade: the page
+   is re-allocated to a second slot (aliasing); the first slot's `free_slot`
+   pushes it AGAIN (`reclaim_page`: refs 0) — duplicate free entries; a
+   duplicate later gets published under a second token path and
+   `RadixCache::insert`'s `page_to_node.insert` overwrite (`radix.rs:392/406`)
+   orphans the older node WITHOUT releasing its ref. Evicting the mapped node
+   frees the single ref; the orphan remains an `is_evictable_leaf` whose later
+   eviction calls `release_pages` on a page absent from `page_refs` — a
+   no-op.
+
+3. **Why "reclaimed 2, free 0" twice:** `alloc_with_prefix_reclaim`
+   (`prefix.rs:216` pre-fix) counted `reclaimed` = radix-severed NODES, not
+   pages actually freed, and stopped after one bounded batch. At tick #8340
+   the LRU frontier's coldest entries were drift orphans (mechanism 2): both
+   eviction attempts severed 2 nodes, freed 0 pages, and gave up while
+   genuinely freeable pages sat deeper in the LRU. Deterministic lockstep →
+   identical on all 4 ranks. The failing call site is
+   `allocate_for_plan` (`lib.rs:1379`, prefill chunk crossing 2 page
+   boundaries); the other step-path allocs (spec extras `lib.rs:950`,
+   `restore_swapped_slot` `planner.rs:359`) already degraded.
+
+Fix (single source, degrade-never-propagate):
+
+- `KvQuery::page_is_evictable(page)` — new predicate: retained exactly once
+  AND attached to no live slot. `HostPagedKvPool` now tracks per-page
+  `slot_attach` counts (alloc/attach_pages/free_slot/truncate/evict_slot_page)
+  and both `resident_evictable_pages` (capacity) and the evictor filter are
+  this one predicate.
+- `release_pages` frees a page only when retains AND attachments are zero —
+  the radix evicting a live-attached page can no longer recycle it (the
+  corruption seed of mechanism 2 is closed at the pool level).
+- `evict_prefix_cache_for_pages` is evict-until-freed: filters victims by the
+  predicate, skips non-freeing pages, re-queries the frontier each round, and
+  returns pages ACTUALLY freed.
+- `allocate_for_plan` degrades instead of propagating: a failing prefill row
+  is shed, a failing decode row parks via `requeue_preempted_decode`;
+  `attach_prefix_to_request`'s attach/grow allocs degrade to full recompute.
+  Invariant: no step-path alloc failure can unwind the TP group.
+
+GPU-free regressions (production `HostPagedKvPool`):
+`evict_skips_live_attached_lru_head_and_frees_deeper_page`,
+`plan_repair_sees_shortfall_when_cached_pages_are_live_attached`
+(`crates/infer-core/src/lib.rs`),
+`release_of_attached_page_defers_free_until_slot_detach`
+(`crates/infer-seam/src/host_paged_kv_pool.rs`).
+
+**Pending gate:** pod c=32 acceptance rerun past the ~700 s crash point with
+zero teardowns.
+
 ## Rule
 
 A capacity fix that raises concurrency is not accepted until the NEW regime's
