@@ -9,12 +9,9 @@ pub(crate) struct Dsv4CompressorState {
     pub(super) compressed: HiddenStates,
     pub(super) compressed_capacity: usize,
     pub(super) ring_rows: usize,
-    // FP32 main-value probe scratch: pre-allocated once and reused across
-    // layers/requests instead of per-call alloc_zeros (which caused OOM
-    // under concurrency). Sized for max_seq_len (the largest single-prefill
-    // token_count the probe can see).
-    pub(super) fp32_kv_raw: CudaSlice<f32>,
-    pub(super) fp32_score_raw: CudaSlice<f32>,
+    // FP32 probe carry (pending partial-group + prev-overlap rows) — genuine
+    // persistent per-state carry; the big per-call kv/score GEMM scratch is
+    // the model-wide [`Dsv4CompressorFp32Scratch`].
     pub(super) fp32_pending_kv: CudaSlice<f32>,
     pub(super) fp32_pending_score: CudaSlice<f32>,
     pub(super) fp32_prev_kv: CudaSlice<f32>,
@@ -41,14 +38,6 @@ impl Dsv4CompressorState {
             compressed_capacity
         };
         let compressed_rows = ring_rows;
-        let fp32_kv_raw = ctx
-            .stream
-            .alloc_zeros::<f32>(width * max_seq_len)
-            .map_err(|e| anyhow::anyhow!("DSv4 compressor FP32 kv_raw alloc failed: {e}"))?;
-        let fp32_score_raw = ctx
-            .stream
-            .alloc_zeros::<f32>(width * max_seq_len)
-            .map_err(|e| anyhow::anyhow!("DSv4 compressor FP32 score_raw alloc failed: {e}"))?;
         let fp32_pending_kv = ctx
             .stream
             .alloc_zeros::<f32>(ratio * width)
@@ -85,8 +74,6 @@ impl Dsv4CompressorState {
             compressed: HiddenStates::zeros(ctx, head_dim, compressed_rows)?,
             compressed_capacity,
             ring_rows,
-            fp32_kv_raw,
-            fp32_score_raw,
             fp32_pending_kv,
             fp32_pending_score,
             fp32_prev_kv,
@@ -144,7 +131,7 @@ impl Dsv4CompressorState {
 
     /// Exact requested device bytes owned by this compressor/indexer state:
     /// Σ over the four bf16 partial-row buffers + the `compressed` HiddenStates
-    /// + the six fp32 probe scratch buffers.
+    /// + the four fp32 probe carry buffers.
     #[allow(dead_code)]
     pub(crate) fn device_bytes(&self) -> usize {
         let bf16 = std::mem::size_of::<half::bf16>();
@@ -154,8 +141,6 @@ impl Dsv4CompressorState {
             + self.prev_overlap_kv.len() * bf16
             + self.prev_overlap_score.len() * bf16
             + self.compressed.device_bytes()
-            + self.fp32_kv_raw.len() * f32
-            + self.fp32_score_raw.len() * f32
             + self.fp32_pending_kv.len() * f32
             + self.fp32_pending_score.len() * f32
             + self.fp32_prev_kv.len() * f32
@@ -183,13 +168,84 @@ impl Dsv4CompressorState {
         // pending_kv + pending_score (ratio*width each) + prev_overlap_kv +
         // prev_overlap_score (ratio*head_dim each) + compressed[head_dim, ring_rows].
         let bf16_bytes = (2 * ratio * width + 2 * ratio * head_dim + head_dim * ring_rows) * bf16;
-        // FP32 probe scratch: kv_raw + score_raw (width*max_seq_len each) +
-        // pending_kv + pending_score (ratio*width each) + prev_kv + prev_score
-        // (ratio*head_dim each).
+        // FP32 probe carry: pending_kv + pending_score (ratio*width each) +
+        // prev_kv + prev_score (ratio*head_dim each).
         let f32 = std::mem::size_of::<f32>();
-        let fp32_bytes = (2 * width * max_seq_len + 2 * ratio * width + 2 * ratio * head_dim) * f32;
+        let fp32_bytes = (2 * ratio * width + 2 * ratio * head_dim) * f32;
         bf16_bytes + fp32_bytes
     }
+}
+
+/// Model-wide (one instance, NOT per-slot/per-layer) FP32 compressor-probe GEMM
+/// scratch, hoisted off the per-(slot,layer) [`Dsv4CompressorState`] (#85 P3
+/// pattern, like [`Dsv4FlashMlaDecodeScratch`]): `kv_raw`/`score_raw` are written
+/// by the probe's two GEMMs and consumed inside the SAME `compressor_fp32_probe`
+/// call — layers run sequentially and the engine runs one forward at a time, so
+/// one instance sized `max_width × max_seq_len` serves every (slot, layer). The
+/// per-slot copies inflated the ledger by 2×width×max_seq_len×4 B per compressor
+/// state ("per_slot 9922MB" clamped 256 slots to 1).
+pub(crate) struct Dsv4CompressorFp32Scratch {
+    pub(super) kv_raw: CudaSlice<f32>,
+    pub(super) score_raw: CudaSlice<f32>,
+}
+
+impl Dsv4CompressorFp32Scratch {
+    pub(super) fn new(ctx: &DeviceContext, max_width: usize, max_seq_len: usize) -> Result<Self> {
+        let kv_raw = ctx
+            .stream
+            .alloc_zeros::<f32>(max_width * max_seq_len)
+            .map_err(|e| anyhow::anyhow!("DSv4 shared compressor FP32 kv_raw alloc failed: {e}"))?;
+        let score_raw = ctx
+            .stream
+            .alloc_zeros::<f32>(max_width * max_seq_len)
+            .map_err(|e| {
+                anyhow::anyhow!("DSv4 shared compressor FP32 score_raw alloc failed: {e}")
+            })?;
+        Ok(Self { kv_raw, score_raw })
+    }
+
+    /// STATIC predictor of `device_bytes` — MUST mirror `new` (feeds
+    /// `Dsv4Model::kv_budget_plan`'s fixed subtraction before the adapter exists).
+    pub(crate) fn device_bytes_for(max_width: usize, max_seq_len: usize) -> usize {
+        2 * max_width * max_seq_len * std::mem::size_of::<f32>()
+    }
+
+    /// Exact requested device bytes owned by this ONE model-wide scratch.
+    #[allow(dead_code)]
+    pub(crate) fn device_bytes(&self) -> usize {
+        (self.kv_raw.len() + self.score_raw.len()) * std::mem::size_of::<f32>()
+    }
+}
+
+/// Max FP32-probe row width over every compressor `compressor_fp32_probe` can
+/// run: the main compressor (`2*head_dim` when overlap, i.e. cr<16, else
+/// `head_dim`) and the CSA indexer compressor (always overlap →
+/// `2*index_head_dim`). 0 ⇔ the model has no compressor layer (no scratch).
+pub(crate) fn dsv4_compressor_fp32_max_width(
+    config: &DeepSeekV4Config,
+    layers: impl IntoIterator<Item = (DeepSeekV4AttentionMode, usize)>,
+) -> usize {
+    layers
+        .into_iter()
+        .map(|(mode, compress_ratio)| {
+            let main = if mode.has_compressor() {
+                if compress_ratio < 16 {
+                    2 * config.head_dim
+                } else {
+                    config.head_dim
+                }
+            } else {
+                0
+            };
+            let indexer = if mode == DeepSeekV4AttentionMode::CompressedSparse {
+                2 * config.index_head_dim
+            } else {
+                0
+            };
+            main.max(indexer)
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 pub(crate) struct Dsv4KvAdapter {
@@ -254,6 +310,11 @@ pub(crate) struct Dsv4KvAdapter {
     /// never aliased concurrently (exactly like `dsa_shared`/`flashmla_batch`/
     /// decode-graph scratch). `None` when native DeepGEMM is unavailable.
     pub(super) prefill_linear: Option<Dsv4PrefillDeepGemmLinearScratch>,
+    /// One shared FP32 compressor-probe GEMM scratch for ALL compressor layers
+    /// and slots, hoisted off the per-(slot,layer) `Dsv4CompressorState` (its
+    /// two `width×max_seq_len` f32 buffers collapsed the slot budget). `None`
+    /// only when the model has no compressor layer.
+    pub(super) compressor_fp32: Option<Dsv4CompressorFp32Scratch>,
     /// Per-slot "host FlashMLA band changed since last device-table sync" bit
     /// (#154 Phase 0). Set by the mirror/attach sites; consumed once per
     /// forward via [`Self::take_device_table_dirty`] to drive the
@@ -702,6 +763,15 @@ impl Dsv4KvAdapter {
         } else {
             None
         };
+        // ONE model-wide FP32 compressor-probe scratch (hoisted off the
+        // per-(slot,layer) compressor state). max_width 0 ⇔ no compressor layer.
+        let fp32_width = dsv4_compressor_fp32_max_width(
+            config,
+            layer_specs.iter().map(|&(mode, cr, _)| (mode, cr)),
+        );
+        let compressor_fp32 = (fp32_width > 0)
+            .then(|| Dsv4CompressorFp32Scratch::new(ctx, fp32_width, max_seq_len))
+            .transpose()?;
         Ok(Self {
             layers,
             num_slots,
@@ -717,6 +787,7 @@ impl Dsv4KvAdapter {
             flashmla_batch,
             flashmla_scratch,
             prefill_linear,
+            compressor_fp32,
             device_table_dirty: vec![false; num_slots],
         })
     }
@@ -782,16 +853,23 @@ impl Dsv4KvAdapter {
                 "prefill_linear",
                 self.prefill_linear.as_ref().map_or(0, |s| s.device_bytes()),
             ),
+            (
+                "compressor_fp32",
+                self.compressor_fp32
+                    .as_ref()
+                    .map_or(0, |s| s.device_bytes()),
+            ),
         ]
     }
 
     /// Split-borrow accessor: one layer's KV layout, the model-wide shared DSA
-    /// scratch, the model-wide single-row FlashMLA decode scratch, AND the
-    /// model-wide shared FP8 prefill DeepGEMM linear scratch (all disjoint
-    /// fields, so all can be `&mut` at once). The FlashMLA scratch is `None`
-    /// when FlashMLA decode is disabled at the build/override level (same gate
-    /// as the per-slot state); the prefill scratch is `None` when native DeepGEMM
-    /// is unavailable.
+    /// scratch, the model-wide single-row FlashMLA decode scratch, the
+    /// model-wide shared FP8 prefill DeepGEMM linear scratch, AND the model-wide
+    /// FP32 compressor-probe scratch (all disjoint fields, so all can be `&mut`
+    /// at once). The FlashMLA scratch is `None` when FlashMLA decode is disabled
+    /// at the build/override level (same gate as the per-slot state); the
+    /// prefill scratch is `None` when native DeepGEMM is unavailable; the FP32
+    /// scratch is `None` when the model has no compressor layer.
     #[allow(clippy::type_complexity)]
     pub(crate) fn layer_and_dsa_shared_mut(
         &mut self,
@@ -801,6 +879,7 @@ impl Dsv4KvAdapter {
         Option<&mut Dsv4DsaSharedScratch>,
         Option<&mut Dsv4FlashMlaDecodeScratch>,
         Option<&mut Dsv4PrefillDeepGemmLinearScratch>,
+        Option<&mut Dsv4CompressorFp32Scratch>,
     )> {
         let len = self.layers.len();
         let layer = self
@@ -812,26 +891,36 @@ impl Dsv4KvAdapter {
             self.dsa_shared.as_mut(),
             self.flashmla_scratch.as_mut(),
             self.prefill_linear.as_mut(),
+            self.compressor_fp32.as_mut(),
         ))
     }
 
     /// Split-borrow accessor for the commit-fold path: one layer's KV layout +
-    /// the model-wide single-row FlashMLA decode scratch (both disjoint fields).
-    /// The fold's FP8 SW ring pack reuses the shared scratch's `sw_bulk_*`
-    /// buffers. `None` for the scratch when FlashMLA decode is disabled.
+    /// the model-wide single-row FlashMLA decode scratch + the model-wide FP32
+    /// compressor-probe scratch (all disjoint fields). The fold's FP8 SW ring
+    /// pack reuses the shared scratch's `sw_bulk_*` buffers; its compressor
+    /// re-ingestion runs the FP32 probe. `None` for the FlashMLA scratch when
+    /// FlashMLA decode is disabled; `None` for the FP32 scratch when the model
+    /// has no compressor layer.
+    #[allow(clippy::type_complexity)]
     pub(crate) fn layer_and_flashmla_scratch_mut(
         &mut self,
         layer_idx: usize,
     ) -> Result<(
         &mut Dsv4LayerKvLayout,
         Option<&mut Dsv4FlashMlaDecodeScratch>,
+        Option<&mut Dsv4CompressorFp32Scratch>,
     )> {
         let len = self.layers.len();
         let layer = self
             .layers
             .get_mut(layer_idx)
             .ok_or_else(|| anyhow!("DSv4 attention pool layer {layer_idx} outside len {len}"))?;
-        Ok((layer, self.flashmla_scratch.as_mut()))
+        Ok((
+            layer,
+            self.flashmla_scratch.as_mut(),
+            self.compressor_fp32.as_mut(),
+        ))
     }
 
     /// Split-borrow accessor for eager B=1 MODEL1 MLA decode: one layer's KV

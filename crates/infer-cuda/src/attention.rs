@@ -125,6 +125,9 @@ pub(crate) fn commit_layer_fold(
     // FlashMLA arena (same gate); the fold only touches it inside the FlashMLA
     // `if let Some(flash)` branch below.
     flashmla_scratch: Option<&mut Dsv4FlashMlaDecodeScratch>,
+    // Model-wide shared FP32 compressor-probe scratch: the fold's compressor
+    // re-ingestion runs prefill-lane (start_pos_device None), so it consumes it.
+    mut fp32_scratch: Option<&mut Dsv4CompressorFp32Scratch>,
     pool: &mut Dsv4LayerKvLayout,
     gathered: &HiddenStates,
     start_pos: usize,
@@ -177,6 +180,7 @@ pub(crate) fn commit_layer_fold(
             None,
             true,
             original_seq_len,
+            fp32_scratch.as_deref_mut(),
             None,
             None,
             keepalive,
@@ -213,6 +217,7 @@ pub(crate) fn commit_layer_fold(
                 None,
                 use_official_dsa,
                 indexer_rope_original_seq_len,
+                fp32_scratch,
                 None,
                 None,
                 keepalive,
@@ -4022,6 +4027,11 @@ pub(crate) fn mla_attention(
     // per-slot state). `Some` only when native DeepGEMM is available and the caller
     // threads it. `None` on the decode (token_count==1) graph lane.
     mut prefill_shared: Option<&mut Dsv4PrefillDeepGemmLinearScratch>,
+    // Model-wide shared FP32 compressor-probe scratch (hoisted off the
+    // per-(slot,layer) compressor state). Required (`Some`) on prefill lanes
+    // (`start_pos_device` None); decode lanes never reach the probe and pass
+    // `None`.
+    fp32_scratch: Option<&mut Dsv4CompressorFp32Scratch>,
     start_pos: usize,
     start_pos_device: Option<&CudaSlice<i32>>,
     chain_verify: Option<&Dsv4ChainVerifyAttnMeta>,
@@ -4045,6 +4055,7 @@ pub(crate) fn mla_attention(
         pool,
         dsa_shared,
         prefill_shared.as_deref_mut(),
+        fp32_scratch,
         start_pos,
         start_pos_device,
         chain_verify,
@@ -4125,6 +4136,8 @@ fn compressor_forward_decode_graph(
         start_pos_device,
         apply_rope,
         rope_original_seq_len,
+        // Decode graph lane (start_pos_device Some): the FP32 probe never runs.
+        None,
         Some((&*kv_scratch, &*score_scratch)),
         None,
         keepalive,
@@ -4977,6 +4990,10 @@ pub(crate) fn mla_attention_prepare(
     // threads it (the prefill projection lanes). `None` on the decode
     // (token_count==1) graph/batched lanes, which never take a prefill branch.
     mut prefill_shared: Option<&mut Dsv4PrefillDeepGemmLinearScratch>,
+    // Model-wide shared FP32 compressor-probe scratch. Required (`Some`) on
+    // prefill lanes (`start_pos_device` None — the compressor FP32 probe
+    // consumes it); decode lanes pass `None`.
+    mut fp32_scratch: Option<&mut Dsv4CompressorFp32Scratch>,
     start_pos: usize,
     start_pos_device: Option<&CudaSlice<i32>>,
     chain_verify: Option<&Dsv4ChainVerifyAttnMeta>,
@@ -5342,6 +5359,7 @@ pub(crate) fn mla_attention_prepare(
                     // YaRN on for compressed layers (matches Q/SW-K + SGLang
                     // compressor freqs_cis); original_seq_len = orig_max_pos here.
                     original_seq_len,
+                    fp32_scratch.as_deref_mut(),
                     None,
                     None,
                     keepalive,
@@ -5400,6 +5418,7 @@ pub(crate) fn mla_attention_prepare(
                         start_pos_device,
                         use_official_dsa,
                         indexer_rope_original_seq_len,
+                        fp32_scratch,
                         None,
                         None,
                         keepalive,
@@ -5845,6 +5864,8 @@ pub(crate) fn mla_attention_compressor_defer_row(
             start_pos_device,
             true,
             original_seq_len,
+            // Decode lane (start_pos_device Some): the FP32 probe never runs.
+            None,
             // Defer mode ignores `precomputed` (the batched update reads the batched
             // prepass output directly); pass None.
             None,
@@ -5889,6 +5910,7 @@ pub(crate) fn mla_attention_compressor_defer_row(
             start_pos_device,
             use_official_dsa,
             indexer_rope_original_seq_len,
+            None,
             None,
             Some(indexer_sink),
             keepalive,
@@ -6039,6 +6061,9 @@ pub(crate) fn mla_attention_prepare_compressed_only(
                     start_pos_device,
                     true,
                     original_seq_len,
+                    // Batched-decode lane (start_pos_device Some from the one
+                    // caller): the FP32 probe never runs.
+                    None,
                     precomputed_main,
                     None,
                     keepalive,
@@ -6103,6 +6128,7 @@ pub(crate) fn mla_attention_prepare_compressed_only(
                         start_pos_device,
                         use_official_dsa,
                         indexer_rope_original_seq_len,
+                        None,
                         precomputed_indexer,
                         None,
                         keepalive,
@@ -7596,6 +7622,7 @@ fn compressor_fp32_probe(
     compressor: &Dsv4Compressor,
     hidden: &HiddenStates,
     state: &mut Dsv4CompressorState,
+    scratch: &mut Dsv4CompressorFp32Scratch,
     head_dim: usize,
     ratio: usize,
     width: usize,
@@ -7618,10 +7645,16 @@ fn compressor_fp32_probe(
         probe.ape.len(),
         ratio * width
     );
-    // Pre-allocated FP32 buffers in `state` (sized for max_seq_len); reuse
-    // across layers/requests to avoid per-prefill OOM (174 allocs/prefill).
-    let kv_raw = &mut state.fp32_kv_raw;
-    let score_raw = &mut state.fp32_score_raw;
+    // Model-wide shared FP32 GEMM scratch (hoisted off the per-slot state);
+    // written and consumed within this call, no cross-call state.
+    ensure!(
+        token_count * width <= scratch.kv_raw.len(),
+        "DSv4 compressor FP32 scratch too small: token_count {token_count} × width {width} \
+         exceeds {}",
+        scratch.kv_raw.len()
+    );
+    let kv_raw = &mut scratch.kv_raw;
+    let score_raw = &mut scratch.score_raw;
     let pending_kv = &mut state.fp32_pending_kv;
     let pending_score = &mut state.fp32_pending_score;
     let prev_kv = &mut state.fp32_prev_kv;
@@ -7748,6 +7781,10 @@ fn compressor_forward(
     start_pos_device: Option<&CudaSlice<i32>>,
     apply_rope: bool,
     rope_original_seq_len: i32,
+    // Model-wide shared FP32 probe scratch: required (`Some`) on every prefill
+    // lane (`start_pos_device` None — the probe branch consumes it, fail loud);
+    // decode lanes never reach the probe and pass `None`.
+    fp32_scratch: Option<&mut Dsv4CompressorFp32Scratch>,
     // Batched decode pre-pass: when `Some`, the two m=1
     // `dsv4_linear` projection GEMVs are SKIPPED and the passed
     // `(kv_raw, score_raw)` — this row's `[width, 1]` slices of the batched
@@ -7801,12 +7838,16 @@ fn compressor_forward(
     // FP32 probe: prefill only (start_pos_device None). The #146/#150 corruption
     // was a multi-token prefill boundary issue; decode uses the BF16 path.
     if !dsv4_verify_frozen() && token_count > 0 && start_pos_device.is_none() {
+        let scratch = fp32_scratch.ok_or_else(|| {
+            anyhow!("DSv4 FP32 compressor probe needs the model-wide scratch on prefill lanes")
+        })?;
         compressor_fp32_probe(
             ctx,
             config,
             compressor,
             hidden,
             state,
+            scratch,
             head_dim,
             ratio,
             width,

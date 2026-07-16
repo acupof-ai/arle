@@ -2459,6 +2459,16 @@ impl Dsv4Model {
             }
             _ => 0,
         };
+        // ONE model-wide FP32 compressor-probe scratch (hoisted off the per-slot
+        // compressor state) — a fixed subtraction, mirroring `dsa_shared_bytes`.
+        // 0 when the model has no compressor layer (matches the adapter's gate).
+        let compressor_fp32_bytes = crate::attention::Dsv4CompressorFp32Scratch::device_bytes_for(
+            crate::attention::dsv4_compressor_fp32_max_width(
+                &self.config,
+                self.layers.iter().map(|l| (l.mode, l.compress_ratio)),
+            ),
+            max_seq_len,
+        );
         // Mirror new_kv_adapter's allocation gate: routed-MoE scratch is
         // decode-graph-only. Eager B=1 uses the FP8 decode-band MoE lane.
         let needs_moe_decode_shared = dsv4_decode_graph_enabled();
@@ -2573,6 +2583,7 @@ impl Dsv4Model {
             match cudarc::driver::result::mem_get_info() {
                 Ok((free, _total)) => {
                     let fixed_without_pool = dsa_shared_bytes
+                        .saturating_add(compressor_fp32_bytes)
                         .saturating_add(moe_decode_shared_bytes)
                         .saturating_add(shared_expert_scratch_bytes)
                         .saturating_add(moe_tail_scratch_bytes)
@@ -2594,14 +2605,15 @@ impl Dsv4Model {
                         .saturating_sub(reserved_for_slots);
                     log::info!(
                         "DSv4 KV budget: free {}MB, per_slot {}MB (slot-state {}MB + DSA key-cache {}MB + DSA batched {}MB; \
-                         FP8 arena in shared pool), shared DSA {}MB, shared MoE decode {}MB, shared expert scratch {}MB, \
-                         shared MLA decode {}MB, pool_total {}MB, affordable {}",
+                         FP8 arena in shared pool), shared DSA {}MB, shared compressor FP32 {}MB, shared MoE decode {}MB, \
+                         shared expert scratch {}MB, shared MLA decode {}MB, pool_total {}MB, affordable {}",
                         free >> 20,
                         per_slot >> 20,
                         slot_state_bytes >> 20,
                         dsa_key_cache_per_slot >> 20,
                         dsa_batched_per_slot >> 20,
                         dsa_shared_bytes >> 20,
+                        compressor_fp32_bytes >> 20,
                         moe_decode_shared_bytes >> 20,
                         shared_expert_scratch_bytes >> 20,
                         mla_decode_bytes >> 20,
@@ -2872,7 +2884,7 @@ impl Dsv4Model {
                         .map_err(|e| anyhow!("DSv4 commit fold gather failed: {e}"))?;
                 }
             }
-            let (layer_pool, flashmla_scratch) =
+            let (layer_pool, flashmla_scratch, fp32_scratch) =
                 kv_adapter.layer_and_flashmla_scratch_mut(layer_idx)?;
             crate::attention::commit_layer_fold(
                 &self.ctx,
@@ -2882,6 +2894,7 @@ impl Dsv4Model {
                 layer.compress_ratio,
                 &mut slot.attention[layer_idx],
                 flashmla_scratch,
+                fp32_scratch,
                 layer_pool,
                 &gathered,
                 start_pos,
@@ -4707,7 +4720,7 @@ impl Dsv4Model {
                     ctx.stream
                         .memcpy_dtod(&src, &mut normed_row.data)
                         .map_err(|e| anyhow!("DSv4 batched attn copy-in failed: {e}"))?;
-                    let (layer_pool, dsa_shared, flashmla_scratch, prefill_shared) =
+                    let (layer_pool, dsa_shared, flashmla_scratch, prefill_shared, _fp32) =
                         kv_adapter.layer_and_dsa_shared_mut(layer_idx)?;
                     let slot = &mut slots[slot_ids[r]];
                     crate::attention::mla_attention(
@@ -4723,6 +4736,8 @@ impl Dsv4Model {
                         dsa_shared,
                         flashmla_scratch,
                         prefill_shared,
+                        // Decode lane (start_pos_device Some): probe unreachable.
+                        None,
                         start_positions[r],
                         Some(&slot.start_pos_device),
                         None,
@@ -5257,7 +5272,7 @@ impl Dsv4Model {
                             .map_err(|e| {
                                 anyhow!("DSv4 batched verify spec_normed persist failed: {e}")
                             })?;
-                        let (layer_pool, dsa_shared, flashmla_scratch, prefill_shared) =
+                        let (layer_pool, dsa_shared, flashmla_scratch, prefill_shared, fp32) =
                             kv_adapter.layer_and_dsa_shared_mut(layer_idx)?;
                         let slot = &mut slots[slot_ids[s]];
                         crate::attention::mla_attention(
@@ -5273,6 +5288,7 @@ impl Dsv4Model {
                             dsa_shared,
                             flashmla_scratch,
                             prefill_shared,
+                            fp32,
                             start_positions[s],
                             None,
                             Some(&sparse_metas[s]),
@@ -5710,7 +5726,7 @@ impl Dsv4Model {
                 }
 
                 let _nvtx = crate::nvtx::range("dsv4/mla_attn_sparse_verify");
-                let (layer_pool, dsa_shared, flashmla_scratch, prefill_shared) =
+                let (layer_pool, dsa_shared, flashmla_scratch, prefill_shared, fp32) =
                     kv_adapter.layer_and_dsa_shared_mut(layer_idx)?;
                 crate::attention::mla_attention(
                     ctx,
@@ -5725,6 +5741,7 @@ impl Dsv4Model {
                     dsa_shared,
                     flashmla_scratch,
                     prefill_shared,
+                    fp32,
                     start_pos,
                     None,
                     Some(&sparse_verify_meta),
@@ -6109,7 +6126,7 @@ impl Dsv4Model {
                 // so no row replay or slot-ring mutation is needed; commit
                 // writes accepted rows later.
                 let _nvtx = crate::nvtx::range("dsv4/mla_attn_sparse_verify");
-                let (layer_pool, dsa_shared, flashmla_scratch, prefill_shared) =
+                let (layer_pool, dsa_shared, flashmla_scratch, prefill_shared, fp32) =
                     kv_adapter.layer_and_dsa_shared_mut(layer_idx)?;
                 crate::attention::mla_attention(
                     &self.ctx,
@@ -6124,6 +6141,7 @@ impl Dsv4Model {
                     dsa_shared,
                     flashmla_scratch,
                     prefill_shared,
+                    fp32,
                     start_pos,
                     None,
                     Some(meta),
@@ -6165,7 +6183,7 @@ impl Dsv4Model {
                             &mut keepalive,
                         )
                     } else {
-                        let (layer_pool, dsa_shared, flashmla_scratch, prefill_shared) =
+                        let (layer_pool, dsa_shared, flashmla_scratch, prefill_shared, fp32) =
                             kv_adapter.layer_and_dsa_shared_mut(layer_idx)?;
                         crate::attention::mla_attention(
                             &self.ctx,
@@ -6180,6 +6198,7 @@ impl Dsv4Model {
                             dsa_shared,
                             flashmla_scratch,
                             prefill_shared,
+                            fp32,
                             start_pos,
                             start_pos_device,
                             None,
@@ -6733,7 +6752,7 @@ impl Dsv4Model {
             let mut attn_row = unsafe { HiddenStates::uninit(ctx, hidden_size, 1)? };
             keepalive.keep_hidden(&normed_row);
             keepalive.keep_hidden(&attn_row);
-            let (layer_pool, mut dsa_shared, mut flashmla_scratch, mut prefill_shared) =
+            let (layer_pool, mut dsa_shared, mut flashmla_scratch, mut prefill_shared, _fp32) =
                 kv_adapter.layer_and_dsa_shared_mut(target_layer_idx)?;
             for r in 0..rows.len() {
                 let src = attn_normed
@@ -6755,6 +6774,8 @@ impl Dsv4Model {
                     dsa_shared.as_deref_mut(),
                     flashmla_scratch.as_deref_mut(),
                     prefill_shared.as_deref_mut(),
+                    // Decode lane (start_pos_device Some): probe unreachable.
+                    None,
                     position as usize,
                     Some(&pos_dev),
                     None,
@@ -7164,7 +7185,7 @@ impl Dsv4Model {
                         ..
                     } = current;
                     let attn_state = &mut slot.attention[layer_idx];
-                    let (attn_pool, dsa_shared_raw, flashmla_scratch, _prefill) =
+                    let (attn_pool, dsa_shared_raw, flashmla_scratch, _prefill, _fp32) =
                         kv_adapter.layer_and_dsa_shared_mut(layer_idx)?;
                     // Default decode stays byte-identical (None) unless the CSA read-lane is
                     // on; the unconditional dsa_shared swap hung eager c=1 decode.
@@ -7228,7 +7249,7 @@ impl Dsv4Model {
                         ..
                     } = current;
                     let attn_state = &mut slot.attention[layer_idx];
-                    let (attn_pool, dsa_shared_raw, flashmla_scratch, _prefill) =
+                    let (attn_pool, dsa_shared_raw, flashmla_scratch, _prefill, _fp32) =
                         kv_adapter.layer_and_dsa_shared_mut(layer_idx)?;
                     // Default decode stays byte-identical (None) unless the CSA read-lane is
                     // on; the unconditional dsa_shared swap hung eager c=1 decode.
