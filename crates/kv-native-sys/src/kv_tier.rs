@@ -35,6 +35,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::thread::JoinHandle;
 
@@ -337,6 +338,7 @@ struct DiskTier {
     /// Model/weights-version tag written into the manifest.
     epoch: String,
     stats: TierIoStats,
+    worker_stats: Arc<WorkerIoStats>,
     pending: BTreeMap<u64, PendingRecord>,
     next_generation: u64,
     accepting_writes: bool,
@@ -384,18 +386,23 @@ enum DiskWork {
 enum DiskCompletion {
     Write {
         items: Vec<WriteItem>,
-        result: std::io::Result<WriteIo>,
-    },
-    Manifest {
-        bytes: usize,
         result: std::io::Result<()>,
     },
+    Manifest(std::io::Result<()>),
 }
 
 #[derive(Clone, Copy)]
 struct WriteIo {
     submitted_bytes: u64,
     wait_ns: u64,
+}
+
+#[derive(Default)]
+struct WorkerIoStats {
+    submitted_write_bytes: AtomicU64,
+    write_wait_ns: AtomicU64,
+    metadata_write_bytes: AtomicU64,
+    failures: AtomicU64,
 }
 
 impl Drop for DiskTier {
@@ -605,13 +612,7 @@ impl DiskTier {
         while let Ok(completion) = self.completion_rx.try_recv() {
             match completion {
                 DiskCompletion::Write { items, result } => match result {
-                    Ok(io) => {
-                        self.stats.submitted_write_bytes = self
-                            .stats
-                            .submitted_write_bytes
-                            .saturating_add(io.submitted_bytes);
-                        self.stats.completion_wait_ns =
-                            self.stats.completion_wait_ns.saturating_add(io.wait_ns);
+                    Ok(()) => {
                         for item in items {
                             let pending = self.pending.get(&item.key);
                             if pending.is_some_and(|entry| {
@@ -635,7 +636,6 @@ impl DiskTier {
                     }
                     Err(err) => {
                         log::warn!("KV async disk writer failed: {err}");
-                        self.stats.failures = self.stats.failures.saturating_add(1);
                         self.accepting_writes = false;
                         for item in items {
                             if !self.pending.get(&item.key).is_some_and(|entry| {
@@ -646,15 +646,11 @@ impl DiskTier {
                         }
                     }
                 },
-                DiskCompletion::Manifest { bytes, result } => {
+                DiskCompletion::Manifest(result) => {
                     if let Err(err) = result {
                         log::warn!("KV async manifest writer failed: {err}");
-                        self.stats.failures = self.stats.failures.saturating_add(1);
                         self.accepting_writes = false;
                         self.manifest_dirty = true;
-                    } else {
-                        self.stats.metadata_write_bytes =
-                            self.stats.metadata_write_bytes.saturating_add(bytes as u64);
                     }
                 }
             }
@@ -874,6 +870,7 @@ fn spawn_disk_worker(
     SyncSender<DiskWork>,
     Receiver<DiskCompletion>,
     JoinHandle<()>,
+    Arc<WorkerIoStats>,
 ) {
     let depth = std::env::var("ARLE_KV_ASYNC_QUEUE_DEPTH")
         .ok()
@@ -882,6 +879,8 @@ fn spawn_disk_worker(
         .unwrap_or(8);
     let (work_tx, work_rx) = sync_channel(depth);
     let (completion_tx, completion_rx) = std::sync::mpsc::channel();
+    let worker_stats = Arc::new(WorkerIoStats::default());
+    let counters = Arc::clone(&worker_stats);
     let worker = std::thread::Builder::new()
         .name("arle-kv-disk".to_string())
         .spawn(move || {
@@ -900,6 +899,21 @@ fn spawn_disk_worker(
                                 .collect::<Vec<_>>();
                             store.write_payloads(&writes)
                         };
+                        let result = match result {
+                            Ok(io) => {
+                                counters
+                                    .submitted_write_bytes
+                                    .fetch_add(io.submitted_bytes, Ordering::Relaxed);
+                                counters
+                                    .write_wait_ns
+                                    .fetch_add(io.wait_ns, Ordering::Relaxed);
+                                Ok(())
+                            }
+                            Err(err) => {
+                                counters.failures.fetch_add(1, Ordering::Relaxed);
+                                Err(err)
+                            }
+                        };
                         failed |= result.is_err();
                         let _ = completion_tx.send(DiskCompletion::Write { items, result });
                     }
@@ -912,14 +926,21 @@ fn spawn_disk_worker(
                         } else {
                             crate::write_file_atomic_cache(&manifest_path, &bytes)
                         };
+                        if result.is_ok() {
+                            counters
+                                .metadata_write_bytes
+                                .fetch_add(len as u64, Ordering::Relaxed);
+                        } else {
+                            counters.failures.fetch_add(1, Ordering::Relaxed);
+                        }
                         failed |= result.is_err();
-                        let _ = completion_tx.send(DiskCompletion::Manifest { bytes: len, result });
+                        let _ = completion_tx.send(DiskCompletion::Manifest(result));
                     }
                 }
             }
         })
         .expect("spawn KV disk writer");
-    (work_tx, completion_rx, worker)
+    (work_tx, completion_rx, worker, worker_stats)
 }
 
 // ---- KvTierStore impl ----
@@ -1018,7 +1039,7 @@ impl KvTierStore {
                             return false;
                         }
                     };
-                let (worker_tx, completion_rx, worker) =
+                let (worker_tx, completion_rx, worker, worker_stats) =
                     spawn_disk_worker(writer, namespace.join(MANIFEST_FILE));
                 self.disk = Some(DiskTier {
                     root_dir: namespace,
@@ -1027,6 +1048,7 @@ impl KvTierStore {
                     durable,
                     epoch,
                     stats,
+                    worker_stats,
                     pending: BTreeMap::new(),
                     next_generation: 0,
                     accepting_writes: true,
@@ -1157,7 +1179,7 @@ impl KvTierStore {
                 return false;
             }
         };
-        let (worker_tx, completion_rx, worker) =
+        let (worker_tx, completion_rx, worker, worker_stats) =
             spawn_disk_worker(writer, namespace.join(MANIFEST_FILE));
 
         self.disk = Some(DiskTier {
@@ -1167,6 +1189,7 @@ impl KvTierStore {
             durable: true,
             epoch,
             stats,
+            worker_stats,
             pending: BTreeMap::new(),
             next_generation: 0,
             accepting_writes: true,
@@ -1248,7 +1271,26 @@ impl KvTierStore {
     pub fn io_stats(&self) -> TierIoStats {
         self.disk
             .as_ref()
-            .map_or_else(TierIoStats::default, |disk| disk.stats.clone())
+            .map_or_else(TierIoStats::default, |disk| {
+                let mut stats = disk.stats.clone();
+                stats.submitted_write_bytes = stats.submitted_write_bytes.saturating_add(
+                    disk.worker_stats
+                        .submitted_write_bytes
+                        .load(Ordering::Relaxed),
+                );
+                stats.metadata_write_bytes = stats.metadata_write_bytes.saturating_add(
+                    disk.worker_stats
+                        .metadata_write_bytes
+                        .load(Ordering::Relaxed),
+                );
+                stats.completion_wait_ns = stats
+                    .completion_wait_ns
+                    .saturating_add(disk.worker_stats.write_wait_ns.load(Ordering::Relaxed));
+                stats.failures = stats
+                    .failures
+                    .saturating_add(disk.worker_stats.failures.load(Ordering::Relaxed));
+                stats
+            })
     }
 
     pub fn location(&self, key: u64) -> Option<infer_seam::KvTierLocation> {
@@ -1995,6 +2037,16 @@ mod tests {
         let mut store = KvTierStore::with_budget(0, 8);
         assert!(store.set_disk(root.clone(), 32, 8));
         assert!(store.insert(1, vec![1; 8]));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while store.io_stats().submitted_write_bytes == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker stats tail invisible"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(store.io_stats().submitted_write_bytes, 8);
 
         {
             let first = store.read(1).expect("first disk read");
