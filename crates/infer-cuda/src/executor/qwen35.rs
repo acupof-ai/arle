@@ -453,6 +453,26 @@ impl Qwen35CudaExecutor {
         }
     }
 
+    /// Engine freed `slot`'s host pages (finish/park/requeue): return its device
+    /// pages NOW. The old lazy free at the next occupant's prefill left the host
+    /// admission pool over-reporting free pages by the whole dead slot, so the
+    /// planner licensed prefill chunks the device pool could not hold — an
+    /// engine-fatal alloc error at submit. Safe here: sidecar/tier capture runs
+    /// before the engine frees host pages, and no forward is in flight for a
+    /// slot being released. Idempotent with the prefill-start `free_slot`.
+    pub(crate) fn release_kv_slot(&mut self, slot: usize) {
+        if slot >= self.num_slots {
+            return;
+        }
+        let parked = std::mem::take(&mut self.recall_keepalive[slot]);
+        if let Some(pool) = self.full_attn_kv.as_mut() {
+            for (_logical, physical) in parked {
+                pool.release_evicted_page(physical);
+            }
+            pool.free_slot(slot);
+        }
+    }
+
     /// Restore the recurrent sidecar for a page-radix prefix hit, returning the
     /// ABSOLUTE token length restored — `matched_len` on an exact hit, or the
     /// largest periodic stride boundary `B ≤ matched_len` whose sidecar is present
