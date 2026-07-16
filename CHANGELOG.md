@@ -23,6 +23,15 @@ Progress spine. Entry classes recorded here the day they land: phase exits,
 default flips, and accept-or-reject verdicts (AGENTS.md §Docs lifecycle &
 progress spine).
 
+- **2026-07-16 — DSv4 FP32 probe scratch hoisted off per-slot state (accept):
+  per_slot 9618→338 MB, slot clamp 2→59.** Same-config rolling comparison:
+  output tok/s +9% (rate 1) to +48% (rate 16), c32 +72% req/s with TTFT p50
+  halved; var-c1 wash (clean null control); needle zero-miss both depths.
+  Exposed a previously unreachable fatal path — `HostPagedKvPool out of
+  pages` crashes the serve at c32 instead of preempting
+  ([errors](docs/experience/errors/2026-07-16-dsv4-c32-hostpagedkvpool-fatal.md));
+  now the top high-concurrency blocker. Entry:
+  [wins](docs/experience/wins/2026-07-16-dsv4-fp32-scratch-hoist-slots.md).
 - **2026-07-16 — DSv4 FP32 prefill compressor grid-parallelized; serial probe
   kernel deleted (accept).** The `<<<1,256>>>` FP32 probe serially swept every
   compressed block per prefill call; now launches the templated grid-parallel
