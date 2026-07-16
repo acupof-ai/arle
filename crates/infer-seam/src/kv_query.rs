@@ -30,8 +30,22 @@ pub trait KvQuery {
 
     /// Return resident pages retained only by the prefix cache and therefore
     /// reclaimable by cache eviction. Default 0 for non-standard pools.
+    ///
+    /// Must count exactly the pages for which [`KvQuery::page_is_evictable`]
+    /// returns true — the scheduler's capacity repair budgets against this
+    /// count and the evictor filters victims with the predicate, so a
+    /// divergent pair silently masks a shortfall (#164 residual).
     fn resident_evictable_pages(&self) -> usize {
         0
+    }
+
+    /// Whether evicting `page` from the prefix cache would actually return it
+    /// to the free pool: retained exactly once (the cache's own ref) and not
+    /// attached to any live slot. Releasing a page a live slot still writes
+    /// must never recycle it — that aliases two slots onto one physical page.
+    /// Default `true` for pools without per-page tracking.
+    fn page_is_evictable(&self, _page: u32) -> bool {
+        true
     }
 
     /// Return the logical sequence length for `slot`.

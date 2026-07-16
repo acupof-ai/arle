@@ -41,6 +41,13 @@ pub struct HostPagedKvPool {
     slot_epoch: Vec<u64>,
     /// Ref counts for pages retained by an external owner such as prefix cache.
     page_refs: HashMap<u32, u32>,
+    /// Per-page live-slot attachment counts (a shared prefix page can be
+    /// attached to several slots at once). A page returns to `free` only when
+    /// BOTH its retain count and attach count are zero: recycling a page a
+    /// live slot still writes aliases two slots onto one physical page, then
+    /// double-frees on slot free and drifts `page_refs` until eviction frees
+    /// nothing while the evictable count stays positive (#164 residual).
+    slot_attach: HashMap<u32, u32>,
     fixed_pages_per_slot: Option<usize>,
 }
 
@@ -58,6 +65,7 @@ impl HostPagedKvPool {
             slot_len: vec![0; num_slots],
             slot_epoch: vec![0; num_slots],
             page_refs: HashMap::new(),
+            slot_attach: HashMap::new(),
             fixed_pages_per_slot: None,
         }
     }
@@ -72,15 +80,35 @@ impl HostPagedKvPool {
         tokens.div_ceil(self.page_size)
     }
 
-    fn reclaim_page(&mut self, page: u32) {
-        // An evict-dropped logical slot holds the sentinel, not a live page: its
-        // physical page was already returned to `free` at evict time, so freeing a
-        // slot/range that still carries the sentinel must skip it (never push it
-        // back — that would corrupt the free stack).
+    fn attach_count(&self, page: u32) -> u32 {
+        self.slot_attach.get(&page).copied().unwrap_or(0)
+    }
+
+    fn attach(&mut self, page: u32) {
+        *self.slot_attach.entry(page).or_insert(0) += 1;
+    }
+
+    /// Drop one slot attachment for `page`, recycling it once neither a slot
+    /// nor the prefix cache holds it. Skips the evict-drop sentinel (its
+    /// physical page was already returned to `free` at evict time — pushing
+    /// it back would corrupt the free stack).
+    fn detach(&mut self, page: u32) {
         if page == EVICTED_PAGE {
             return;
         }
-        if self.page_refs.get(&page).copied().unwrap_or(0) == 0 {
+        if let Some(count) = self.slot_attach.get_mut(&page) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.slot_attach.remove(&page);
+                self.maybe_free(page);
+            }
+        }
+    }
+
+    /// Push `page` to the free stack iff no retain AND no attachment holds it.
+    /// Called exactly at ref-decrement transitions, so a page frees once.
+    fn maybe_free(&mut self, page: u32) {
+        if self.page_refs.get(&page).copied().unwrap_or(0) == 0 && self.attach_count(page) == 0 {
             self.free.push(page);
         }
     }
@@ -98,6 +126,7 @@ impl HostPagedKvPool {
             }
             for _ in 0..pages {
                 let page = self.free.pop().expect("checked free >= fixed pages");
+                self.attach(page);
                 self.slot_pages[slot].push(page);
             }
         }
@@ -128,7 +157,14 @@ impl KvQuery for HostPagedKvPool {
     }
 
     fn resident_evictable_pages(&self) -> usize {
-        self.page_refs.values().filter(|&&count| count == 1).count()
+        self.page_refs
+            .keys()
+            .filter(|&&page| self.page_is_evictable(page))
+            .count()
+    }
+
+    fn page_is_evictable(&self, page: u32) -> bool {
+        self.page_refs.get(&page).copied().unwrap_or(0) == 1 && self.attach_count(page) == 0
     }
 
     fn seq_len(&self, slot: usize) -> usize {
@@ -190,6 +226,7 @@ impl KvAllocator for HostPagedKvPool {
         }
         for _ in 0..need {
             let page = self.free.pop().expect("checked free >= need");
+            self.attach(page);
             self.slot_pages[slot].push(page);
         }
         self.slot_len[slot] += tokens;
@@ -214,6 +251,10 @@ impl KvAllocator for HostPagedKvPool {
                 self.page_refs.get(&page).copied().unwrap_or(0) == 0,
                 "free_detached_pages: page {page} is retained"
             );
+            debug_assert!(
+                self.attach_count(page) == 0,
+                "free_detached_pages: page {page} is slot-attached"
+            );
             self.free.push(page);
         }
     }
@@ -224,8 +265,8 @@ impl KvAllocator for HostPagedKvPool {
         };
         let taken = std::mem::take(pages);
         for page in taken {
-            // `reclaim_page` skips the evict sentinel (already freed at evict time).
-            self.reclaim_page(page);
+            // `detach` skips the evict sentinel (already freed at evict time).
+            self.detach(page);
         }
         self.slot_len[slot] = 0;
         self.slot_epoch[slot] = self.slot_epoch[slot].wrapping_add(1);
@@ -242,7 +283,7 @@ impl KvAllocator for HostPagedKvPool {
         // Keep the logical length intact so token→logical-page mapping stays
         // valid for the surviving pages; the physical page goes back to the pool.
         pages[logical_page] = EVICTED_PAGE;
-        self.free.push(page);
+        self.detach(page);
         Some(page)
     }
 
@@ -262,7 +303,7 @@ impl KvAllocator for HostPagedKvPool {
         let cut = keep_pages.min(pages.len());
         let removed: Vec<u32> = pages.split_off(cut);
         for page in removed {
-            self.reclaim_page(page);
+            self.detach(page);
         }
         self.slot_len[slot] = new_len;
         Ok(())
@@ -286,7 +327,7 @@ impl KvPrefixStore for HostPagedKvPool {
                 *c = c.saturating_sub(1);
                 if *c == 0 {
                     self.page_refs.remove(&page);
-                    self.free.push(page);
+                    self.maybe_free(page);
                 }
             }
         }
@@ -313,12 +354,21 @@ impl KvPrefixStore for HostPagedKvPool {
                     self.free.len()
                 );
             }
-            let dst = &mut self.slot_pages[slot];
-            dst.clear();
-            dst.extend_from_slice(pages);
-            dst.extend((0..top_up).map(|_| self.free.pop().unwrap()));
+            let stale = std::mem::take(&mut self.slot_pages[slot]);
+            for page in stale {
+                self.detach(page);
+            }
+            self.slot_pages[slot].extend_from_slice(pages);
+            for _ in 0..top_up {
+                let page = self.free.pop().expect("checked free >= top_up");
+                self.attach(page);
+                self.slot_pages[slot].push(page);
+            }
         } else {
             self.slot_pages[slot].extend_from_slice(pages);
+        }
+        for &page in pages {
+            self.attach(page);
         }
         self.slot_len[slot] = self.slot_len[slot].max(token_count);
         self.slot_epoch[slot] = self.slot_epoch[slot].wrapping_add(1);
@@ -360,10 +410,19 @@ mod tests {
         pool.retain_pages(&prefix);
         assert_eq!(pool.retained_count(), 2);
         assert_eq!(pool.resident_pages(), 2);
-        assert_eq!(pool.resident_evictable_pages(), 2);
+        assert_eq!(
+            pool.resident_evictable_pages(),
+            0,
+            "live-attached pages are not evictable capacity"
+        );
         let free_before = pool.free_pages();
         pool.free_slot(0);
         assert_eq!(pool.free_pages(), free_before);
+        assert_eq!(
+            pool.resident_evictable_pages(),
+            2,
+            "evictable once detached"
+        );
         pool.attach_pages(1, &prefix, 32).unwrap();
         pool.retain_pages(&prefix);
         assert_eq!(pool.resident_evictable_pages(), 0);
@@ -376,6 +435,23 @@ mod tests {
         assert_eq!(pool.retained_count(), 0);
         assert_eq!(pool.resident_pages(), 0);
         assert_eq!(pool.free_pages(), 8);
+    }
+
+    /// #164 residual: the prefix cache releasing a page a live slot still
+    /// writes must NOT recycle it — recycling aliases two slots onto one
+    /// physical page and double-frees on slot free. The free is deferred to
+    /// the slot's own detach.
+    #[test]
+    fn release_of_attached_page_defers_free_until_slot_detach() {
+        let mut pool = HostPagedKvPool::new(1, 4, 16);
+        pool.alloc(0, 16).unwrap();
+        let pages = pool.page_indices(0).to_vec();
+        pool.retain_pages(&pages); // mid-flight prompt-seal publish
+        assert!(!pool.page_is_evictable(pages[0]));
+        pool.release_pages(&pages); // radix evicts while the slot still lives
+        assert_eq!(pool.free_pages(), 3, "attached page must not recycle");
+        pool.free_slot(0);
+        assert_eq!(pool.free_pages(), 4, "freed exactly once, at slot free");
     }
 
     #[test]

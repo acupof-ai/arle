@@ -212,6 +212,12 @@ impl KvQuery for HipKvPool {
         self.page_refs.values().filter(|&&count| count == 1).count()
     }
 
+    fn page_is_evictable(&self, page: u32) -> bool {
+        // No slot-attach tracking in the HIP lane yet: same predicate as the
+        // count above so capacity and evictor stay one source.
+        self.page_refs.get(&page).copied().unwrap_or(0) == 1
+    }
+
     fn seq_len(&self, slot: usize) -> usize {
         self.slot_len.get(slot).copied().unwrap_or(0)
     }
