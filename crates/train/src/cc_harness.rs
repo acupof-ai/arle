@@ -20,11 +20,16 @@ use crate::cc_convert::{CcRecord, CcWindow, convert_cc_dumps};
 use crate::sandbox::{boot_workdir, diff_workdir, run_captured, score_workdir};
 use crate::swe_dataset::SweTask;
 
-/// Measured cc SWE-session token ceiling: sizes the serve KV budget per
-/// concurrent cc stream and is the rollout generation budget (Dr.GRPO's fixed
-/// normalizer). cc owns sampling/turns, so this — not a turn×token flag pair —
-/// bounds a session.
+/// TYPICAL cc SWE-session tokens: sizes the per-stream KV budget and is the
+/// rollout generation budget (Dr.GRPO's fixed normalizer). NOT a session cap —
+/// long sessions run to [`CC_MAX_SESSION_TOKENS`]; the engine preempts under
+/// KV pressure (#162).
 pub const CC_SESSION_TOKENS: usize = 22_000;
+
+/// A cc session must be schedulable to at least this many tokens (long-horizon
+/// requirement, ckl 2026-07-17): the KV pool is sized to fit ≥1 such session
+/// and the serve request caps derive from the pool, never from the typical size.
+pub const CC_MAX_SESSION_TOKENS: usize = 200_000;
 
 /// Run-wide knobs; construct literally. Stateless — boot-ahead state lives in
 /// the [`BootedGroup`] values the caller threads between calls.
