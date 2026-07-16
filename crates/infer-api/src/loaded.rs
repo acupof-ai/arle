@@ -424,6 +424,8 @@ mod classify_tests {
     feature = "cpu"
 ))]
 mod backend {
+    use std::sync::Arc;
+
     use anyhow::Result;
     use infer_core::SchedulerConfig;
     use infer_server::ServeHandle;
@@ -1026,6 +1028,51 @@ mod backend {
             }
         }
 
+        /// OpenAI-compat HTTP router over this ALREADY-loaded engine's
+        /// `ServeHandle` (same engine thread, same KV pool) — unlike
+        /// `router_for_backend`, which spawns a second engine. Serve it with
+        /// [`crate::serve_router_on_thread`].
+        #[cfg(feature = "cuda")]
+        pub fn local_router(&self, max_thinking_tokens: usize) -> Result<axum::Router> {
+            match self {
+                Self::Cuda(engine) => Ok(infer_server::coordinator_local_router(
+                    engine.serve_arc(),
+                    engine.tokenizer().clone(),
+                    engine.model_id().to_string(),
+                    max_thinking_tokens,
+                    None,
+                )),
+                #[cfg(feature = "metal")]
+                Self::Metal(_) => {
+                    anyhow::bail!("local router is CUDA-only; active backend is Metal")
+                }
+                #[cfg(feature = "metal")]
+                Self::MetalDiffusionGemma(_) => anyhow::bail!(
+                    "local router is CUDA-only; active backend is Metal DiffusionGemma"
+                ),
+                #[cfg(feature = "metal")]
+                Self::MetalGemma4(_) => {
+                    anyhow::bail!("local router is CUDA-only; active backend is Metal Gemma4")
+                }
+                #[cfg(feature = "metal")]
+                Self::MetalDeepseekOcr(_) => {
+                    anyhow::bail!("local router is CUDA-only; active backend is Metal DeepSeek-OCR")
+                }
+                #[cfg(feature = "hip")]
+                Self::Hip(_) => {
+                    anyhow::bail!("local router is CUDA-only; active backend is HIP")
+                }
+                #[cfg(feature = "vulkan")]
+                Self::Vulkan(_) => {
+                    anyhow::bail!("local router is CUDA-only; active backend is Vulkan")
+                }
+                #[cfg(all(feature = "cpu", not(feature = "metal")))]
+                Self::Cpu(_) => {
+                    anyhow::bail!("local router is CUDA-only; active backend is CPU")
+                }
+            }
+        }
+
         #[cfg(feature = "metal")]
         fn load_metal(model_path: &str, config: &EngineLoadConfig) -> Result<Self> {
             let resolved = infer_metal::resolve_model_path(model_path)?;
@@ -1337,7 +1384,7 @@ mod backend {
             let (serve, tokenizer, model_id) =
                 metal_diffusion_gemma_serve_handle(model_path, &resolved, config, shutdown)?;
             return Ok(infer_server::coordinator_local_router(
-                serve,
+                Arc::new(serve),
                 tokenizer,
                 model_id,
                 config.max_thinking_tokens,
@@ -1348,7 +1395,7 @@ mod backend {
             let (serve, tokenizer, model_id) =
                 metal_gemma4_serve_handle(model_path, &resolved, config, shutdown)?;
             return Ok(infer_server::coordinator_local_router(
-                serve,
+                Arc::new(serve),
                 tokenizer,
                 model_id,
                 config.max_thinking_tokens,
@@ -1359,7 +1406,7 @@ mod backend {
             let (serve, tokenizer, model_id) =
                 metal_deepseek_ocr_serve_handle(model_path, &resolved, config, shutdown)?;
             return Ok(infer_server::coordinator_local_router(
-                serve,
+                Arc::new(serve),
                 tokenizer,
                 model_id,
                 config.max_thinking_tokens,
@@ -1368,7 +1415,7 @@ mod backend {
         }
         let (serve, tokenizer, model_id) = metal_serve_handle(model_path, config, shutdown)?;
         Ok(infer_server::coordinator_local_router(
-            serve,
+            Arc::new(serve),
             tokenizer,
             model_id,
             config.max_thinking_tokens,
@@ -2285,7 +2332,7 @@ mod backend {
         let (serve, tokenizer, model_id) =
             cuda_serve_handle(model_path, enable_cuda_graph, config, shutdown)?;
         Ok(infer_server::coordinator_local_router(
-            serve,
+            Arc::new(serve),
             tokenizer,
             model_id,
             config.max_thinking_tokens,
@@ -2449,7 +2496,7 @@ mod backend {
     ) -> Result<axum::Router> {
         let (serve, tokenizer, model_id) = hip_serve_handle(model_path, config, shutdown)?;
         Ok(infer_server::coordinator_local_router(
-            serve,
+            Arc::new(serve),
             tokenizer,
             model_id,
             config.max_thinking_tokens,
@@ -2468,7 +2515,7 @@ mod backend {
     ) -> Result<axum::Router> {
         let (serve, tokenizer, model_id) = vulkan_serve_handle(model_path, config, shutdown)?;
         Ok(infer_server::coordinator_local_router(
-            serve,
+            Arc::new(serve),
             tokenizer,
             model_id,
             config.max_thinking_tokens,
@@ -2508,7 +2555,7 @@ mod backend {
         let serve =
             ServeHandle::spawn_with_shutdown(executor, kv, config.scheduler_config(), shutdown);
         Ok(infer_server::coordinator_local_router(
-            serve,
+            Arc::new(serve),
             tokenizer,
             model_id,
             config.max_thinking_tokens,

@@ -2,6 +2,8 @@
 //! [`InferenceEngine`]: `tokenize -> submit -> collect -> detokenize`, projecting
 //! the rewrite `CompletedRequest` back into [`CompletionOutput`].
 
+use std::sync::Arc;
+
 use anyhow::{Result, anyhow};
 use infer_core::CompletedRequest;
 use infer_seam::{BackendExecutor, KvPool};
@@ -19,7 +21,7 @@ use crate::types::{
 pub struct ServeInferenceEngine<E: BackendExecutor, K: KvPool> {
     model_id: String,
     tokenizer: OpenAiTokenizer,
-    serve: ServeHandle<E, K>,
+    serve: Arc<ServeHandle<E, K>>,
 }
 
 impl<E, K> ServeInferenceEngine<E, K>
@@ -33,8 +35,20 @@ where
         Self {
             model_id,
             tokenizer,
-            serve,
+            serve: Arc::new(serve),
         }
+    }
+
+    /// Shared handle to the running engine, for wiring an HTTP router over an
+    /// already-loaded engine ([`crate::LoadedInferenceEngine::local_router`]).
+    #[cfg(feature = "cuda")]
+    pub(crate) fn serve_arc(&self) -> Arc<ServeHandle<E, K>> {
+        Arc::clone(&self.serve)
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(crate) fn tokenizer(&self) -> &OpenAiTokenizer {
+        &self.tokenizer
     }
 
     /// Offload the engine's device weights to host RAM (OPD teacher weight

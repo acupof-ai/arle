@@ -60,6 +60,14 @@ pub use serve::{
     DEFAULT_MTP_DRAFT_TOKENS, DEFAULT_MTP_DRAFT_TOPK, ServeHttpOptions, ServeSpecOptions,
     ServeSpecType, default_kv_ssd_root, serve_http, validate_kv_ssd_config,
 };
+#[cfg(any(
+    feature = "metal",
+    feature = "cuda",
+    feature = "hip",
+    feature = "vulkan",
+    feature = "cpu"
+))]
+pub use serve::{ServeThread, serve_router_on_thread};
 pub use serve_engine::ServeInferenceEngine;
 // DSv4 multiproc-serve control-plane relay, re-exported from `infer-server` so
 // the `cli` coordinator/worker scaffold (`cli::serve_multiproc`) reaches it at
