@@ -660,7 +660,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             return Ok(());
         }
 
-        self.fit_plan_to_kv_pages(&mut plan);
+        self.fit_plan_to_kv_pages(&mut plan)?;
         if plan.is_idle() {
             return Ok(());
         }
@@ -943,8 +943,13 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             };
             let mut token_idx = 0usize;
             while let Some(token) = tokens.pop_front() {
-                if token_idx > 0 {
-                    self.alloc_with_prefix_reclaim(row.slot, 1)?;
+                // Speculative extras run BEFORE any plan repair; the engine
+                // has no spec-depth to pre-budget, so on true exhaustion
+                // degrade like the repair does — park the request (#162 path)
+                // and drop the unappended tail — instead of a fatal unwind.
+                if token_idx > 0 && self.alloc_with_prefix_reclaim(row.slot, 1).is_err() {
+                    self.requeue_preempted_decode(row.slot);
+                    break;
                 }
                 let Some(request) = self.active.get_mut(&row.slot) else {
                     break;
@@ -2302,6 +2307,12 @@ mod testing {
 
         pub(super) fn decode_log(&self) -> Vec<(usize, usize, usize)> {
             self.decode_log.borrow().clone()
+        }
+
+        /// Pre-seed the device-side materialized length for a directly
+        /// injected (already-prefilled) request.
+        pub(super) fn seed_materialized(&self, slot: usize, len: usize) {
+            self.materialized.borrow_mut().insert(slot, len);
         }
     }
 
@@ -4232,6 +4243,170 @@ mod tests {
         }
         let done = engine.completed(handle).expect("request must not stall");
         assert!(!done.generated_tokens.is_empty());
+        Ok(())
+    }
+
+    /// Evictable-but-not-free pages are repair capacity: with the whole pool
+    /// radix-cached (free=0), a plan the cache can satisfy survives untouched
+    /// — `alloc_with_prefix_reclaim` evicts on demand at alloc time.
+    #[test]
+    fn plan_repair_keeps_rows_when_evictable_pages_cover_demand() -> Result<()> {
+        let mut engine = Engine::with_config(
+            MockExecutor::ready(),
+            MockKvPool::with_capacity(2, 4, 2),
+            test_config(2),
+        );
+        // Seal both pages into the radix, then drop the slot: cache-retained
+        // pages with no live reference — evictable, not free.
+        engine.kv.alloc(0, 8)?;
+        engine.publish_prefix_blocks(0, &[1, 2, 3, 4, 5, 6, 7, 8]);
+        engine.free_slot_pages(0);
+        assert_eq!(engine.kv_free_pages(), 0);
+        assert_eq!(engine.kv.resident_evictable_pages(), 2);
+
+        let mut plan = ForwardPlan::idle();
+        plan.prefill_rows.push(infer_plan::PrefillRow {
+            slot: 1,
+            tokens: vec![7; 8],
+            start_pos: 0,
+            total_tokens: 8,
+            params: SamplingParams::default(),
+        });
+        plan.mode = infer_plan::ForwardMode::Prefill;
+
+        engine.fit_plan_to_kv_pages(&mut plan)?;
+        assert_eq!(
+            plan.prefill_rows.len(),
+            1,
+            "evictable capacity covers demand: nothing shed"
+        );
+        Ok(())
+    }
+
+    /// Shedding must skip zero-demand rows: a fully prefix-reused (or
+    /// tail-room) chunk frees no pages, so deferring it gains nothing.
+    #[test]
+    fn plan_repair_sheds_only_demand_reducing_prefill_rows() -> Result<()> {
+        let mut engine = Engine::with_config(
+            MockExecutor::ready(),
+            MockKvPool::with_capacity(2, 4, 1),
+            test_config(2),
+        );
+        // Slot 0 holds the only page with tail room: appending 2 tokens
+        // demands zero new pages. Nothing free, nothing cached.
+        engine.kv.alloc(0, 2)?;
+        assert_eq!(engine.kv_free_pages(), 0);
+
+        let mut plan = ForwardPlan::idle();
+        plan.prefill_rows.push(infer_plan::PrefillRow {
+            slot: 1,
+            tokens: vec![7; 4],
+            start_pos: 0,
+            total_tokens: 4,
+            params: SamplingParams::default(),
+        });
+        // Zero-demand row LAST: the pre-fix blind end-pop shed it first.
+        plan.prefill_rows.push(infer_plan::PrefillRow {
+            slot: 0,
+            tokens: vec![5, 6],
+            start_pos: 2,
+            total_tokens: 4,
+            params: SamplingParams::default(),
+        });
+        plan.mode = infer_plan::ForwardMode::Prefill;
+
+        engine.fit_plan_to_kv_pages(&mut plan)?;
+        assert_eq!(plan.prefill_rows.len(), 1);
+        assert_eq!(plan.prefill_rows[0].slot, 0, "zero-demand row survives");
+        assert!(matches!(plan.mode, infer_plan::ForwardMode::Prefill));
+        Ok(())
+    }
+
+    /// True exhaustion — nothing free AND nothing evictable — still empties
+    /// the plan without error: prefill shed, decode victim parked (#164).
+    #[test]
+    fn plan_repair_true_exhaustion_empties_plan_without_error() -> Result<()> {
+        let mut engine = Engine::with_config(
+            MockExecutor::ready(),
+            MockKvPool::with_capacity(2, 4, 1),
+            test_config(2),
+        );
+        let handle = engine.next_handle();
+        let mut decode_req = RequestState::new(
+            handle,
+            vec![1, 1, 1],
+            RequestPriority::Normal,
+            8,
+            SamplingParams::default(),
+        );
+        decode_req.generated_tokens = vec![9];
+        decode_req.phase = RequestPhase::Decoding;
+        engine.kv.alloc(0, 4)?; // page full: the next decode token needs a new page
+        engine.active.insert(0, decode_req);
+
+        let mut plan = ForwardPlan::idle();
+        plan.decode_rows.push(infer_plan::DecodeRow {
+            slot: 0,
+            last_token: 9,
+            kv_seq_len: 4,
+            params: SamplingParams::default(),
+        });
+        plan.prefill_rows.push(infer_plan::PrefillRow {
+            slot: 1,
+            tokens: vec![7; 4],
+            start_pos: 0,
+            total_tokens: 4,
+            params: SamplingParams::default(),
+        });
+        plan.mode = infer_plan::ForwardMode::Mixed;
+
+        engine.fit_plan_to_kv_pages(&mut plan)?;
+        assert!(
+            plan.is_idle(),
+            "nothing reclaimable: plan empties instead of erroring"
+        );
+        let parked = engine.waiting.front().expect("decode victim parked");
+        assert_eq!(parked.handle, handle);
+        Ok(())
+    }
+
+    /// #164 adjacent hole: a speculative backend's EXTRA decode token is
+    /// appended in `apply_output` before any repair can run. On true
+    /// exhaustion the append must park the request, not unwind the group.
+    #[test]
+    fn spec_extra_token_exhaustion_parks_request_instead_of_fatal() -> Result<()> {
+        let executor = SpecMirrorExecutor::default();
+        executor.seed_materialized(0, 3);
+        // HoldGovernor keeps the parked victim in `waiting` (no same-tick
+        // re-admission), so the degrade outcome stays observable.
+        let mut engine = Engine::with_config_and_governor(
+            executor,
+            MockKvPool::with_capacity(1, 2, 2),
+            test_config(1),
+            Box::new(HoldGovernor),
+        );
+        let handle = engine.next_handle();
+        let mut request = RequestState::new(
+            handle,
+            vec![1, 1, 1],
+            RequestPriority::Normal,
+            8,
+            SamplingParams::default(),
+        );
+        request.generated_tokens = vec![9];
+        request.phase = RequestPhase::Decoding;
+        engine.kv.alloc(0, 3)?; // both pages used; the first decode token fits the tail
+        engine.active.insert(0, request);
+        assert_eq!(engine.kv_free_pages(), 0);
+
+        engine.step()?; // submit the decode forward (two-token spec output)
+        engine.step()?; // apply: the extra's append finds nothing reclaimable — park, not fatal
+
+        assert_eq!(
+            engine.waiting.front().expect("request parked").handle,
+            handle
+        );
+        assert!(engine.active.is_empty());
         Ok(())
     }
 
