@@ -135,6 +135,46 @@ pub fn convert_cc_dumps(
     Ok(records)
 }
 
+/// Newest dump's prompt-portion tokens (everything before the first assistant
+/// supervised byte; the whole render when no assistant turn yet). Feeds the
+/// post-merge prefix warm-up: one max_tokens=1 prefill re-populates the shared
+/// cc prefix the LoRA re-merge's cache flush dropped. `None` = no dump yet.
+pub fn newest_dump_prompt_ids(
+    dump_dir: &Path,
+    tokenizer: &tokenizers::Tokenizer,
+) -> Result<Option<Vec<u32>>> {
+    let Some((_, path)) = list_dumps(dump_dir)?.into_iter().next_back() else {
+        return Ok(None);
+    };
+    let raw = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    let body: serde_json::Value =
+        serde_json::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
+    let chat_request = infer_server::messages_body_to_chat_request(body)
+        .context("map /v1/messages body onto the chat request")?;
+    let messages: Vec<chat::ChatMessage> =
+        chat_request.messages.iter().map(to_chat_message).collect();
+    ensure!(!messages.is_empty(), "dump has no messages");
+    let rendered = chat::render_structured_chatml_with_spans(&messages, false);
+    let cutoff = rendered
+        .spans
+        .iter()
+        .map(|span| span.supervised.clone())
+        .filter(|range| !range.is_empty())
+        .map(|range| range.start)
+        .min()
+        .unwrap_or(rendered.prompt.len());
+    let encoding = tokenizer
+        .encode(rendered.prompt.as_str(), false)
+        .map_err(|err| anyhow!("tokenize rendered prompt: {err}"))?;
+    let ids = encoding.get_ids();
+    let prompt_len = encoding
+        .get_offsets()
+        .iter()
+        .position(|&(_, end)| end > cutoff)
+        .unwrap_or(ids.len());
+    Ok((prompt_len > 0).then(|| ids[..prompt_len].to_vec()))
+}
+
 /// `<epoch_ms>_<seq>.json` files under `dir`, keyed by their epoch prefix.
 fn list_dumps(dir: &Path) -> Result<Vec<(u64, PathBuf)>> {
     let mut dumps = Vec::new();

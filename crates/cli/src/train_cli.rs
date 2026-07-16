@@ -2991,6 +2991,9 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
         tokenizer: train::cc_harness::load_tokenizer(&student_dir.join("tokenizer.json"))?,
     };
 
+    // One deep tokenizer clone for the post-merge warm-up threads.
+    let warmup_tokenizer = Arc::new(harness.tokenizer.clone());
+
     // PEFT adapter config for `--save-lora-adapters` (mainstream HF PEFT dir:
     // adapter_config.json + adapter_model.safetensors). Built once; borrowed by
     // every per-round adapter save.
@@ -3220,7 +3223,8 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
             // prefix-cache drop in one engine-thread closure); every-round
             // syncs once, at the last group. Then re-acquire the KV pool for
             // the next rollout.
-            if sync_every_group || pos + 1 == round_tasks.len() {
+            let synced = sync_every_group || pos + 1 == round_tasks.len();
+            if synced {
                 let sync_started = Instant::now();
                 infer_student
                     .sync_lora_from_store(&mut store, &student.adapter_name_map(), lora)
@@ -3232,8 +3236,40 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
             if let Err(err) = infer_student.ensure_kv_pool() {
                 eprintln!("[agent-opd] ensure KV pool (group {group_idx}) failed: {err}");
             }
-            // P2 follow-up: prefix warm-up rides the merge (needs a registered
-            // shared-prefix prefill).
+            // Post-merge prefix warm-up: the re-merge flushed the radix cache,
+            // so re-prefill the shared cc prompt (newest dump's prompt portion,
+            // max_tokens=1) on a background thread — overlapped with the next
+            // group's boot; a queued real request just lands behind it in the
+            // same engine FIFO. Log-and-continue: never kills training.
+            if synced {
+                let engine = Arc::clone(infer_student.engine());
+                let tokenizer = Arc::clone(&warmup_tokenizer);
+                let dump_dir = harness.dump_dir.clone();
+                std::thread::spawn(move || {
+                    let t0 = Instant::now();
+                    let outcome = train::cc_convert::newest_dump_prompt_ids(&dump_dir, &tokenizer)
+                        .and_then(|prompt| match prompt {
+                            // No dump yet (round 0 group 0): skip silently.
+                            None => Ok(false),
+                            Some(ids) => engine
+                                .lock()
+                                .map_err(|err| anyhow!("engine lock poisoned: {err}"))?
+                                .generate_token_ids(&ids, 1, SamplingParams::default())
+                                .map(|_| true),
+                        });
+                    match outcome {
+                        Ok(true) => train::aopd_profile::record(
+                            "prefix_warmup",
+                            train::aopd_profile::GPU,
+                            t0.elapsed().as_secs_f64(),
+                        ),
+                        Ok(false) => {}
+                        Err(err) => {
+                            eprintln!("[agent-opd] prefix warm-up failed (continuing): {err:#}");
+                        }
+                    }
+                });
+            }
         }
 
         let mean_loss = if losses.is_empty() {
