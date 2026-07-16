@@ -24,6 +24,7 @@ for RATE in $RATES; do
     --processor "$MODEL" \
     --profile concurrent \
     --data "$DATA" \
+    --data-args '{"output_tokens_count_column":"output_tokens"}' \
     --max-seconds "$SECONDS_PER_RATE" \
     --random-seed 20260416 \
     --output-dir "$OUTDIR" \

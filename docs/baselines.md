@@ -42,6 +42,16 @@ Datasets: rates = `bench-prompts.jsonl` (20×~3352 tok, 60 s); c1/c32 =
 ([errors](experience/errors/2026-07-16-dsv4-c32-hostpagedkvpool-fatal.md)) —
 c32 rows are pre-crash; fix pending before this regime is production-safe.
 
+**WORKLOAD CORRECTION (2026-07-16)**: every 2026-07-16 run actually generated
+**16 output tokens per request**, not 256 — guidellm never sent `max_tokens`
+(the server's /v1/completions default is 16) because the dataset column wasn't
+mapped. All same-day Δ% comparisons remain valid (identical workload both
+arms), and per-request decode speed is 1/ITL ≈ 46.5 tok/s, but `out tok/s`
+aggregates are prefill-diluted and entries saying "256 output" describe
+3352-in/16-out. Fixed in `run_dsv4_bench.sh` via
+`--data-args '{"output_tokens_count_column":"output_tokens"}'` — the NEXT
+anchored run (256-out) is a **fingerprint change: re-anchor the champion**.
+
 Pure-prefill anchor (c1, no queueing): ~3352-tok prompt / 446 ms TTFT ≈
 **7516 tok/s prefill**.
 
