@@ -34,16 +34,20 @@ passes (prefix-restore lane) zero-miss. Raw:
 | 4 | 20 | 73.3 | 1032 | 1532 / 7863 | 43.4 / 88.4 |
 | 8 | 40 | 137.3 | 1935 | 2726 / 2923 | 46.8 / 92.7 |
 | 16 | 48 | 169.6 | 2392 | 5294 / 5637 | 71.6 / 124.4 |
-| 32 (bench-prompts-64, 180 s) | 32/64 | 43.0 | 507 | 90800 | 134.7 | 
+| 32 (bench-prompts-64, 300 s, `--max-running-requests 32`) | 121 | 91.9 | 1090 | 83500 / 91900 | 134.6 / 308 |
 
-c32 row is pre-crash (see below). Grid-time prefix hit_rate 0.925.
+c32 champion requires `--max-running-requests 32` (slot line: `num_slots 32,
+comp capacity 1048576 tokens`) — the recommended DSv4 serve flag per
+[the slot-budget entry](experience/wins/2026-07-17-max-running-requests-caps-slot-budget.md).
+Crash-era and default-slots rows retired. Grid-time prefix hit_rate 0.925.
 
 Retired 16-out-era rows (guidellm, 2026-07-16, kept for the same-era A/B
 deltas only): rate 1/4/8/16 total 4514/6663/7985/8130; var-c1 850.
 
-**KNOWN CRASH at c32**: `HostPagedKvPool out of pages` is fatal at ~101 s
-([errors](experience/errors/2026-07-16-dsv4-c32-hostpagedkvpool-fatal.md)) —
-c32 rows are pre-crash; fix pending before this regime is production-safe.
+c32 crash RESOLVED 2026-07-17 (#164/#162 closed): oversubscription now
+degrades to preemption
+([errors](experience/errors/2026-07-16-dsv4-c32-hostpagedkvpool-fatal.md)),
+and `--max-running-requests 32` removes the pressure entirely.
 
 **WORKLOAD CORRECTION (2026-07-16)**: every 2026-07-16 run actually generated
 **16 output tokens per request**, not 256 — guidellm never sent `max_tokens`
