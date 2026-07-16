@@ -1,0 +1,33 @@
+crates/infer-core/src/lib.rs
+  s_4b2e45ef7da6cf::t_fe0028aff1ca88 4109-4161
+crates/infer-core/src/planner.rs
+  s_0837ed412322fe::t_45c9a3fd260aba 111-119,121-125,127-129,137
+docs/experience/errors/2026-07-16-dsv4-c32-hostpagedkvpool-fatal.md
+  s_4b2e45ef7da6cf::t_39a1d72357d1ed 21-63,67-90
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "74b6aafd3a9509d2c000b76121f72496e718ef37",
+  "prompts": {},
+  "sessions": {
+    "s_0837ed412322fe": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f6a12-61c8-7bc3-a029-b359f1f4a3ed",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_4b2e45ef7da6cf": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a16ee15cd15f63cdf",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
