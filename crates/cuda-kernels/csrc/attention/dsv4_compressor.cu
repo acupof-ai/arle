@@ -323,10 +323,15 @@ __global__ void dsv4_compressor_fp32_prefill_probe_kernel(
     uint16_t *__restrict__ prev_overlap_score_bf16,
     uint16_t *__restrict__ compressed,
     int num_tokens,
+    int start_pos,
+    int pending_len,
+    int compressed_base,
     int head_dim,
     int ratio,
     int width,
     int overlap,
+    int has_prev_overlap,
+    int overlap_page_stride,
     float eps,
     int rope_dim,
     float rope_base,
@@ -336,8 +341,9 @@ __global__ void dsv4_compressor_fp32_prefill_probe_kernel(
     float beta_slow) {
   dsv4_compressor_update_body(
       kv_raw, score_raw, ape, norm, pending_kv, pending_score, prev_overlap_kv,
-      prev_overlap_score, compressed, num_tokens, 0, 0, 0, head_dim, ratio,
-      width, overlap, 0, 0, eps, rope_dim, rope_base, original_seq_len, factor,
+      prev_overlap_score, compressed, num_tokens, start_pos, pending_len,
+      compressed_base, head_dim, ratio, width, overlap, has_prev_overlap,
+      overlap_page_stride, eps, rope_dim, rope_base, original_seq_len, factor,
       beta_fast, beta_slow);
   __syncthreads();
   if (overlap) {
@@ -705,10 +711,15 @@ extern "C" CUresult dsv4_compressor_fp32_prefill_probe_cuda(
     uint16_t *prev_overlap_score_bf16,
     uint16_t *compressed,
     int num_tokens,
+    int start_pos,
+    int pending_len,
+    int compressed_base,
     int head_dim,
     int ratio,
     int width,
     int overlap,
+    int has_prev_overlap,
+    int overlap_page_stride,
     float eps,
     int rope_dim,
     float rope_base,
@@ -717,9 +728,9 @@ extern "C" CUresult dsv4_compressor_fp32_prefill_probe_cuda(
     float beta_fast,
     float beta_slow,
     CUstream stream) {
-  if (num_tokens <= 0 || head_dim <= 0 ||
+  if (num_tokens <= 0 || start_pos < 0 || pending_len < 0 ||
+      compressed_base < 0 || head_dim <= 0 ||
       head_dim > DSV4_ATTN_MAX_HEAD_DIM || ratio <= 0 || ratio > 256 ||
-      num_tokens % ratio != 0 ||
       width < head_dim || rope_dim < 0 || rope_dim > head_dim) {
     return CUDA_ERROR_INVALID_VALUE;
   }
@@ -727,8 +738,9 @@ extern "C" CUresult dsv4_compressor_fp32_prefill_probe_cuda(
                                                (cudaStream_t)stream>>>(
       kv_raw, score_raw, ape, norm, pending_kv, pending_score, prev_overlap_kv,
       prev_overlap_score, prev_overlap_kv_bf16, prev_overlap_score_bf16,
-      compressed, num_tokens, head_dim, ratio, width, overlap, eps, rope_dim,
-      rope_base, original_seq_len, factor, beta_fast, beta_slow);
+      compressed, num_tokens, start_pos, pending_len, compressed_base,
+      head_dim, ratio, width, overlap, has_prev_overlap, overlap_page_stride,
+      eps, rope_dim, rope_base, original_seq_len, factor, beta_fast, beta_slow);
   return (CUresult)cudaGetLastError();
 }
 
