@@ -29,6 +29,7 @@ any of them with `git log -- docs/index.md`.
 | Architecture ownership and boundaries | [architecture.md](architecture.md) | The `infer-*` rewrite crates (`infer-core`/`-seam`/`-cuda`/`-metal`/`-server`/`-api`) own runtime truth. |
 | DSv4/GLM prefill+decode paths & kernels | [architecture-dsv4.md](architecture-dsv4.md) | Mechanism-level map: FlashMLA prefill/decode, DeepGEMM grouped MoE, DSA indexer, MTP spec-decode + rollback; DSpark survey. |
 | Benchmark and trace process | [bench-and-trace-spec.md](bench-and-trace-spec.md) | Native runner is the canonical e2e benchmark path. |
+| Rolling performance baselines (champion rows per config) | [baselines.md](baselines.md) | Default single-arm iteration per spec §3.0; matched A/B only to resolve in-band deltas. |
 | Canonical e2e bench tool + parameter set | [plans/native-bench.md](plans/native-bench.md) | `scripts/bench_throughput.py` uses this contract. |
 | Capability and agent-code evals | [eval.md](eval.md) | MMLU and SWE-bench Pro workflows; ARLE engine owns the candidate answer/patch, deterministic graders own only scoring. |
 | OPD/QAT capability curve + serving blocker | [opd-capability-curve.md](opd-capability-curve.md) | Δ-vs-baseline curve driver (`scripts/opd_capability_curve.py`) over the eval lanes; the exact adapter-serving blocker (file:line) + smallest fix for the non-baseline curve points. |
