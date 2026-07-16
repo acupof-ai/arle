@@ -52,7 +52,9 @@ use execution::{ControlMessage, Submission, engine_loop};
 pub use execution::{CounterSnapshot, StreamItem};
 
 pub use anthropic::messages_body_to_chat_request;
-pub use coordinator::{coordinator_router, set_messages_dump_dir};
+pub use coordinator::{
+    TokensSidecar, coordinator_router, set_messages_dump_dir, tokens_sidecar_path,
+};
 
 /// In-process channel for multimodal requests from coordinator → relay driver.
 pub struct LocalMultimodalRequest {
