@@ -108,19 +108,33 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         }
     }
 
+    /// Repair a plan whose page demand exceeds `free_pages` so
+    /// `allocate_for_plan` cannot fail — a step-loop alloc error is FATAL (it
+    /// unwinds the whole TP worker group, #164). Cheapest loss first: shed
+    /// prefill chunks (a dropped chunk retries next tick with no state change,
+    /// the same deferral `apply_step_budget` performs), then preempt-requeue
+    /// decode victims down to an empty plan — each retraction FREES the
+    /// victim's pages (park or recompute, the #162 path), so the loop
+    /// terminates and later ticks fit. Inputs (lockstep host pool + plan) are
+    /// identical on every rank, so the repair stays SPMD-deterministic.
     pub(crate) fn retract_decode_to_fit(&mut self, plan: &mut ForwardPlan) {
-        while self.kv.is_active()
-            && self.plan_new_pages_needed(plan) > self.kv.free_pages()
-            && plan.decode_rows.len() > 1
+        if !self.kv.is_active() {
+            return;
+        }
+        while self.plan_new_pages_needed(plan) > self.kv.free_pages()
+            && !plan.prefill_rows.is_empty()
         {
+            plan.prefill_rows.pop();
+        }
+        while self.plan_new_pages_needed(plan) > self.kv.free_pages() {
             let Some(victim_pos) = self.retract_victim_pos(&plan.decode_rows) else {
                 break;
             };
             let victim_slot = plan.decode_rows[victim_pos].slot;
             self.requeue_preempted_decode(victim_slot);
             plan.decode_rows.remove(victim_pos);
-            plan.mode = plan_mode(plan.prefill_rows.is_empty(), plan.decode_rows.is_empty());
         }
+        plan.mode = plan_mode(plan.prefill_rows.is_empty(), plan.decode_rows.is_empty());
     }
 
     fn retract_victim_pos(&self, decode_rows: &[DecodeRow]) -> Option<usize> {

@@ -4106,6 +4106,59 @@ mod tests {
         Ok(())
     }
 
+    /// #164: pool exhausted (free 0) with a mixed plan must never reach a
+    /// failing `allocate_for_plan` — that error is fatal (TP group unwind).
+    /// The prefill chunk is shed and the LAST decode row parks (requeues).
+    #[test]
+    fn kv_exhaustion_sheds_prefill_and_parks_last_decode_instead_of_fatal() -> Result<()> {
+        let mut engine = Engine::with_config(
+            MockExecutor::ready(),
+            MockKvPool::with_capacity(2, 4, 1),
+            test_config(2),
+        );
+        let decoding = engine.next_handle();
+        let prefilling = engine.next_handle();
+
+        let mut decode_req = RequestState::new(
+            decoding,
+            vec![1, 1, 1],
+            RequestPriority::Normal,
+            8,
+            SamplingParams::default(),
+        );
+        decode_req.generated_tokens = vec![9];
+        decode_req.phase = RequestPhase::Decoding;
+        let mut prefill_req = RequestState::new(
+            prefilling,
+            vec![2; 8],
+            RequestPriority::Normal,
+            8,
+            SamplingParams::default(),
+        );
+        prefill_req.phase = RequestPhase::Prefilling { progress: 0 };
+
+        engine.kv.alloc(0, 4)?; // the only page: next decode token needs a new one
+        engine.active.insert(0, decode_req);
+        engine.active.insert(1, prefill_req);
+        assert_eq!(engine.kv_free_pages(), 0);
+
+        engine.step()?; // pre-#164 this returned the fatal alloc error
+
+        let requeued = engine.waiting.front().expect("decode victim requeued");
+        assert_eq!(requeued.handle, decoding);
+        assert!(
+            engine.active.contains_key(&1),
+            "shed prefill stays active for the next tick"
+        );
+        // The victim's page is reclaimable: freed outright or parked in the
+        // prefix cache, where `alloc_with_prefix_reclaim` evicts it on demand.
+        assert!(
+            engine.kv_free_pages() + engine.kv.resident_evictable_pages() > 0,
+            "retraction made the victim's pages reclaimable"
+        );
+        Ok(())
+    }
+
     #[test]
     fn finish_frees_slot_and_pages() -> Result<()> {
         let mut engine = Engine::with_config(
