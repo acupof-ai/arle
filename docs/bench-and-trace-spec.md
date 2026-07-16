@@ -39,6 +39,10 @@ A component kernel speedup is diagnosis, not an end-to-end serving win.
 
 ## 3. Canonical benchmark
 
+`bench_throughput.py` is the ONLY sanctioned runner. guidellm was removed
+2026-07-16 (silently dropped `max_tokens` → 16-token outputs; synthetic-data
+failures on the DSv4 config; c32 accounting drift) — do not reintroduce it.
+
 Published results use a checked JSONL workload:
 
 ```bash
