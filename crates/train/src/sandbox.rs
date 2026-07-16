@@ -124,8 +124,9 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// killing the whole group on exit/timeout reaps any lingering grandchildren so
 /// they can't linger or hold the parent.
 ///
-/// Returns `(combined_output, exit_code, killed_by_timeout)`.
-fn run_captured(
+/// Returns `(combined_output, exit_code, killed_by_timeout)`. Also the cc
+/// harness's `claude -p` spawn path (`crate::cc_harness`).
+pub(crate) fn run_captured(
     command: Command,
     timeout: Duration,
 ) -> std::io::Result<(Vec<u8>, Option<i32>, bool)> {
