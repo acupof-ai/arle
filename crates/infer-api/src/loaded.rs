@@ -169,10 +169,12 @@ impl Default for EngineLoadConfig {
             // Auto-budget ceiling, NOT a concurrency cap: the executor clamps
             // this to what post-weights VRAM affords (`kv_budget_plan` /
             // `kv_budget_num_slots`), and `max_running_requests` is the
-            // user-facing concurrency knob. `--num-slots` was removed; the old
-            // default of 4 lingered as a hard 4-slot cap that starved
-            // concurrency regardless of VRAM. 256 is beyond any single-box need,
-            // so the VRAM budget always binds first.
+            // user-facing concurrency knob — when set it replaces this ceiling
+            // as the executor slot budget (`hot_workspace_slots`; post-#154-3b
+            // slots trade against comp-pool tokens, so "VRAM budget always
+            // binds first" no longer holds). `--num-slots` was removed; the
+            // old default of 4 lingered as a hard 4-slot cap that starved
+            // concurrency regardless of VRAM.
             num_slots: 256,
             max_running_requests: None,
             total_pages: 8192,
@@ -211,11 +213,14 @@ impl Default for EngineLoadConfig {
 impl EngineLoadConfig {
     // All callsites are under cfg(feature = "cuda"/"metal"/"hip"/"vulkan");
     // the cpu-only CI surface compiles none of them.
+    // A set `--max-running-requests` IS the executor slot budget: the scheduler
+    // runs at most `cap` requests, and post-#154-3b DSv4 slots TRADE against
+    // shared comp-pool tokens (each ~338MB), so provisioning `num_slots` slots
+    // for a capped scheduler reserves VRAM no request can ever use. Unset, the
+    // `num_slots` auto-ceiling applies and the VRAM budget binds.
     #[allow(dead_code)]
     fn hot_workspace_slots(&self) -> usize {
-        self.num_slots
-            .max(self.max_running_requests.unwrap_or(0))
-            .max(1)
+        self.max_running_requests.unwrap_or(self.num_slots).max(1)
     }
 
     pub fn mtp_enabled(&self) -> bool {
@@ -336,6 +341,25 @@ pub(crate) fn classify_cuda_model(v: &serde_json::Value) -> CudaModelKind {
         CudaModelKind::Qwen35
     } else {
         CudaModelKind::Qwen3Dense
+    }
+}
+
+#[cfg(test)]
+mod hot_workspace_tests {
+    use super::EngineLoadConfig;
+
+    #[test]
+    fn max_running_requests_caps_executor_slot_budget() {
+        let mut config = EngineLoadConfig::default();
+        assert_eq!(config.hot_workspace_slots(), config.num_slots);
+        config.max_running_requests = Some(32);
+        assert_eq!(config.hot_workspace_slots(), 32);
+        // Cap above the auto-ceiling still grows the workspace: the knob is
+        // the intended concurrency, not a clamp.
+        config.max_running_requests = Some(config.num_slots + 1);
+        assert_eq!(config.hot_workspace_slots(), config.num_slots + 1);
+        config.max_running_requests = Some(0);
+        assert_eq!(config.hot_workspace_slots(), 1);
     }
 }
 
