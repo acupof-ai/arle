@@ -7,7 +7,12 @@
 > (`a0c7ed9ae`+`99a72ed19`) · **P2** orchestrator+metrics (`1a74d192d`..`acbe36461`)
 > · **P3** deletions net −1775 LOC (`ea060434a`+`0581cfdf1`+`9c3e11201`; Dr.GRPO
 > norm const 61440→22000 = CC_SESSION_TOKENS — old value was the deleted in-house
-> arm's turn×token budget). Next: **P4** pod E2E smoke + two-arm baseline (running).
+> arm's turn×token budget) · **P5** task selection (`29185a443`, default on) ·
+> **P2-debt** prefix warm-up (`624932baf`) · **P6a** token-sidecar capture +
+> prefix-merged multi-turn mask (`e788185fb`+`be5de8467`; logprob half blocked on
+> another lane's qwen35.rs WIP) · **P8-machinery** replay buffer (`d74479eb3`,
+> default off, license gate pending). Holding: **P4** baseline (GPU held by ckl),
+> P6b/P7/spec-port (file blocked).
 
 ## Verdict
 
