@@ -23,6 +23,17 @@ Progress spine. Entry classes recorded here the day they land: phase exits,
 default flips, and accept-or-reject verdicts (AGENTS.md §Docs lifecycle &
 progress spine).
 
+- **2026-07-16 — polish round: high-effort adversarial review of the day's
+  commits fixed 8 confirmed defects pre-deployment.** The first #164 repair
+  livelocked warm caches (evictable ≠ free) and could hang TP via rank-local
+  `free_pages` — fixed in `459ed5000` (rank-synced free+evictable capacity,
+  demand-aware shedding, spec-alloc degrade-to-park;
+  [errors](docs/experience/errors/2026-07-16-plan-repair-evictable-not-free.md)).
+  `f59dd79af` closes the FP32 carry coherence family: reseed-on-stale at
+  restore/reset/decode-advance (cross-request contamination), a mainline
+  pending→bf16 mirror gap, and reverts the GLM never-read scratch gate.
+  Residual: CSA indexer pending not in the finish write-through (#165).
+  Pod needle + c32 repro remain the pending acceptance gates.
 - **2026-07-16 — DSv4 FP32 probe scratch hoisted off per-slot state (accept):
   per_slot 9618→338 MB, slot clamp 2→59.** Same-config rolling comparison:
   output tok/s +9% (rate 1) to +48% (rate 16), c32 +72% req/s with TTFT p50
