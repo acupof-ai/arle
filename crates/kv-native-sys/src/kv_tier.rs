@@ -34,6 +34,9 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
+use std::thread::JoinHandle;
 
 use anyhow::{Context, Result, anyhow};
 use infer_seam::{DramTierPolicy, NvmeTierPolicy, dram_l2_budget, nvme_l3_budget};
@@ -278,6 +281,14 @@ impl DiskStore {
         }
     }
 
+    fn available_slots(&self) -> usize {
+        match self {
+            Self::Mmap(store) => store.available_slots(),
+            #[cfg(target_os = "linux")]
+            Self::Direct(store) => store.available_slots(),
+        }
+    }
+
     fn free_slot(&mut self, slot: u32) {
         match self {
             Self::Mmap(store) => store.free_slot(slot),
@@ -291,6 +302,25 @@ impl DiskStore {
             Self::Mmap(store) => store.reserve_indices(indices),
             #[cfg(target_os = "linux")]
             Self::Direct(store) => store.reserve_indices(indices),
+        }
+    }
+
+    fn write_payloads(&mut self, writes: &[(u32, &[u8])]) -> std::io::Result<WriteIo> {
+        match self {
+            Self::Mmap(store) => {
+                for (slot, bytes) in writes {
+                    store.write_slot(*slot, bytes)?;
+                }
+                Ok(WriteIo {
+                    submitted_bytes: writes.iter().map(|(_, bytes)| bytes.len() as u64).sum(),
+                    wait_ns: 0,
+                })
+            }
+            #[cfg(target_os = "linux")]
+            Self::Direct(store) => store.write_slots(writes).map(|batch| WriteIo {
+                submitted_bytes: batch.submitted_bytes,
+                wait_ns: batch.wait_ns,
+            }),
         }
     }
 }
@@ -307,6 +337,13 @@ struct DiskTier {
     /// Model/weights-version tag written into the manifest.
     epoch: String,
     stats: TierIoStats,
+    pending: BTreeMap<u64, PendingRecord>,
+    next_generation: u64,
+    accepting_writes: bool,
+    manifest_dirty: bool,
+    worker_tx: Option<SyncSender<DiskWork>>,
+    completion_rx: Receiver<DiskCompletion>,
+    worker: Option<JoinHandle<()>>,
     _lock: Option<nix::fcntl::Flock<std::fs::File>>,
 }
 
@@ -316,8 +353,61 @@ struct DiskRecord {
     len: usize,
 }
 
+struct PendingRecord {
+    generation: u64,
+    slot: u32,
+    #[allow(
+        clippy::rc_buffer,
+        reason = "moves Vec payload without copying its allocation"
+    )]
+    payload: Arc<Vec<u8>>,
+    useful: bool,
+}
+
+struct WriteItem {
+    key: u64,
+    generation: u64,
+    slot: u32,
+    #[allow(
+        clippy::rc_buffer,
+        reason = "moves Vec payload without copying its allocation"
+    )]
+    payload: Arc<Vec<u8>>,
+    useful: bool,
+}
+
+enum DiskWork {
+    Write(Vec<WriteItem>),
+    Manifest(Vec<u8>),
+}
+
+enum DiskCompletion {
+    Write {
+        items: Vec<WriteItem>,
+        result: std::io::Result<WriteIo>,
+    },
+    Manifest {
+        bytes: usize,
+        result: std::io::Result<()>,
+    },
+}
+
+#[derive(Clone, Copy)]
+struct WriteIo {
+    submitted_bytes: u64,
+    wait_ns: u64,
+}
+
 impl Drop for DiskTier {
     fn drop(&mut self) {
+        let active = self.worker.is_some();
+        self.finish_worker();
+        if active
+            && self.durable
+            && let Err(err) = self.write_manifest()
+        {
+            log::warn!("KV final manifest persist failed: {err}");
+        }
         if !self.durable {
             // KvMmapStore drops first (field order), unmapping the file.
             // Linux tolerates unlinking a still-open file, so best-effort.
@@ -327,6 +417,14 @@ impl Drop for DiskTier {
 }
 
 impl DiskTier {
+    fn finish_worker(&mut self) {
+        self.worker_tx.take();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+        self.drain_completions();
+    }
+
     fn lock_namespace(namespace: &Path) -> Result<nix::fcntl::Flock<std::fs::File>> {
         let file = std::fs::OpenOptions::new()
             .read(true)
@@ -343,22 +441,9 @@ impl DiskTier {
     }
 
     fn write_manifest(&mut self) -> Result<()> {
-        let mut buf = String::with_capacity(64 + self.keys.len() * 32);
-        buf.push_str(MANIFEST_MAGIC);
-        buf.push('\n');
-        buf.push_str(&self.epoch);
-        buf.push('\n');
-        let slot_bytes = self.store.slot_bytes();
-        for (key, record) in &self.keys {
-            writeln!(
-                &mut buf,
-                "{key} {} {} {slot_bytes}",
-                record.slot, record.len
-            )
-            .expect("write to String never fails");
-        }
+        let buf = self.manifest_bytes();
         let bytes = buf.len() as u64;
-        let result = crate::write_file_atomic_cache(&self.manifest_path(), buf.as_bytes())
+        let result = crate::write_file_atomic_cache(&self.manifest_path(), &buf)
             .with_context(|| format!("KV recall manifest write under {}", self.root_dir.display()));
         if result.is_ok() {
             self.stats.metadata_write_bytes = self.stats.metadata_write_bytes.saturating_add(bytes);
@@ -408,37 +493,199 @@ impl DiskTier {
         Some((epoch, records))
     }
 
-    fn write_payloads(&mut self, writes: &[(u32, &[u8])]) -> std::io::Result<()> {
-        let useful = writes
+    fn manifest_bytes(&self) -> Vec<u8> {
+        let mut buf = String::with_capacity(64 + self.keys.len() * 32);
+        buf.push_str(MANIFEST_MAGIC);
+        buf.push('\n');
+        buf.push_str(&self.epoch);
+        buf.push('\n');
+        let slot_bytes = self.store.slot_bytes();
+        for (key, record) in &self.keys {
+            writeln!(
+                &mut buf,
+                "{key} {} {} {slot_bytes}",
+                record.slot, record.len
+            )
+            .expect("write to String never fails");
+        }
+        buf.into_bytes()
+    }
+
+    fn enqueue(
+        &mut self,
+        entries: Vec<(u64, Vec<u8>, bool)>,
+    ) -> Result<(), Vec<(u64, Vec<u8>, bool)>> {
+        self.drain_completions();
+        if entries.is_empty() {
+            return Ok(());
+        }
+        if !self.accepting_writes {
+            return Err(entries);
+        }
+        let mut items: Vec<WriteItem> = Vec::with_capacity(entries.len());
+        let mut entries = entries.into_iter();
+        while let Some((key, payload, useful)) = entries.next() {
+            let Some(slot) = self.store.alloc_slot() else {
+                let mut rejected = Vec::with_capacity(items.len() + entries.len() + 1);
+                rejected.extend(self.reject(items));
+                rejected.push((key, payload, useful));
+                rejected.extend(entries);
+                return Err(rejected);
+            };
+            self.next_generation = self.next_generation.saturating_add(1);
+            items.push(WriteItem {
+                key,
+                generation: self.next_generation,
+                slot,
+                payload: Arc::new(payload),
+                useful,
+            });
+        }
+        let Some(tx) = self.worker_tx.as_ref() else {
+            return Err(self.reject(items));
+        };
+        let pending = items
             .iter()
-            .map(|(_, bytes)| bytes.len() as u64)
-            .sum::<u64>();
-        let result = match &mut self.store {
-            DiskStore::Mmap(store) => {
-                for (slot, bytes) in writes {
-                    store.write_slot(*slot, bytes)?;
+            .map(|item| {
+                (
+                    item.key,
+                    PendingRecord {
+                        generation: item.generation,
+                        slot: item.slot,
+                        payload: Arc::clone(&item.payload),
+                        useful: item.useful,
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        match tx.try_send(DiskWork::Write(items)) {
+            Ok(()) => {
+                self.stats.write_ops = self.stats.write_ops.saturating_add(pending.len() as u64);
+                self.stats.useful_write_bytes = self.stats.useful_write_bytes.saturating_add(
+                    pending
+                        .iter()
+                        .filter(|(_, record)| record.useful)
+                        .map(|(_, record)| record.payload.len() as u64)
+                        .sum::<u64>(),
+                );
+                for (key, record) in pending {
+                    self.pending.insert(key, record);
                 }
-                self.stats.submitted_write_bytes =
-                    self.stats.submitted_write_bytes.saturating_add(useful);
                 Ok(())
             }
-            #[cfg(target_os = "linux")]
-            DiskStore::Direct(store) => store.write_slots(writes).map(|batch| {
-                self.stats.submitted_write_bytes = self
-                    .stats
-                    .submitted_write_bytes
-                    .saturating_add(batch.submitted_bytes);
-                self.stats.completion_wait_ns =
-                    self.stats.completion_wait_ns.saturating_add(batch.wait_ns);
-            }),
-        };
-        self.stats.write_ops = self.stats.write_ops.saturating_add(writes.len() as u64);
-        if result.is_ok() {
-            self.stats.useful_write_bytes = self.stats.useful_write_bytes.saturating_add(useful);
-        } else {
-            self.stats.failures = self.stats.failures.saturating_add(1);
+            Err(TrySendError::Full(DiskWork::Write(items))) => {
+                drop(pending);
+                Err(self.reject(items))
+            }
+            Err(TrySendError::Disconnected(DiskWork::Write(items))) => {
+                drop(pending);
+                self.accepting_writes = false;
+                Err(self.reject(items))
+            }
+            Err(_) => unreachable!("enqueue only submits disk writes"),
         }
-        result
+    }
+
+    fn recover_item(item: WriteItem) -> (u64, Vec<u8>, bool) {
+        let payload = Arc::try_unwrap(item.payload).expect("pending references dropped");
+        (item.key, payload, item.useful)
+    }
+
+    fn reject(&mut self, items: Vec<WriteItem>) -> Vec<(u64, Vec<u8>, bool)> {
+        items
+            .into_iter()
+            .map(|item| {
+                self.store.free_slot(item.slot);
+                Self::recover_item(item)
+            })
+            .collect()
+    }
+
+    fn drain_completions(&mut self) {
+        while let Ok(completion) = self.completion_rx.try_recv() {
+            match completion {
+                DiskCompletion::Write { items, result } => match result {
+                    Ok(io) => {
+                        self.stats.submitted_write_bytes = self
+                            .stats
+                            .submitted_write_bytes
+                            .saturating_add(io.submitted_bytes);
+                        self.stats.completion_wait_ns =
+                            self.stats.completion_wait_ns.saturating_add(io.wait_ns);
+                        for item in items {
+                            let pending = self.pending.get(&item.key);
+                            if pending.is_some_and(|entry| {
+                                entry.generation == item.generation && entry.slot == item.slot
+                            }) {
+                                self.pending.remove(&item.key);
+                                if let Some(old) = self.keys.insert(
+                                    item.key,
+                                    DiskRecord {
+                                        slot: item.slot,
+                                        len: item.payload.len(),
+                                    },
+                                ) {
+                                    self.store.free_slot(old.slot);
+                                }
+                                self.manifest_dirty |= self.durable;
+                            } else {
+                                self.store.free_slot(item.slot);
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        log::warn!("KV async disk writer failed: {err}");
+                        self.stats.failures = self.stats.failures.saturating_add(1);
+                        self.accepting_writes = false;
+                        for item in items {
+                            if !self.pending.get(&item.key).is_some_and(|entry| {
+                                entry.generation == item.generation && entry.slot == item.slot
+                            }) {
+                                self.store.free_slot(item.slot);
+                            }
+                        }
+                    }
+                },
+                DiskCompletion::Manifest { bytes, result } => {
+                    if let Err(err) = result {
+                        log::warn!("KV async manifest writer failed: {err}");
+                        self.stats.failures = self.stats.failures.saturating_add(1);
+                        self.accepting_writes = false;
+                        self.manifest_dirty = true;
+                    } else {
+                        self.stats.metadata_write_bytes =
+                            self.stats.metadata_write_bytes.saturating_add(bytes as u64);
+                    }
+                }
+            }
+        }
+        self.try_enqueue_manifest();
+    }
+
+    fn try_enqueue_manifest(&mut self) {
+        if !self.durable || !self.manifest_dirty || !self.accepting_writes {
+            return;
+        }
+        let bytes = self.manifest_bytes();
+        let Some(tx) = self.worker_tx.as_ref() else {
+            return;
+        };
+        match tx.try_send(DiskWork::Manifest(bytes)) {
+            Ok(()) => self.manifest_dirty = false,
+            Err(TrySendError::Full(_)) => {}
+            Err(TrySendError::Disconnected(_)) => {
+                self.accepting_writes = false;
+            }
+        }
+    }
+
+    fn logical_pages(&self) -> usize {
+        self.keys
+            .keys()
+            .chain(self.pending.keys())
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .len()
     }
 
     fn read_payloads(&mut self, reads: &[(u32, usize)]) -> std::io::Result<Vec<Vec<u8>>> {
@@ -604,6 +851,77 @@ fn open_disk_store(
         .map(|store| (DiskStore::Mmap(store), mmap_stats(None)))
 }
 
+fn open_writer_store(
+    path: &Path,
+    num_slots: usize,
+    slot_bytes: usize,
+    mode: DiskIoMode,
+) -> std::io::Result<DiskStore> {
+    #[cfg(not(target_os = "linux"))]
+    let _ = mode;
+    #[cfg(target_os = "linux")]
+    if mode == DiskIoMode::Direct {
+        return crate::direct_store::DirectStore::open(path, num_slots, slot_bytes)
+            .map(|store| DiskStore::Direct(Box::new(store)));
+    }
+    crate::KvMmapStore::open(path, num_slots, slot_bytes).map(DiskStore::Mmap)
+}
+
+fn spawn_disk_worker(
+    mut store: DiskStore,
+    manifest_path: PathBuf,
+) -> (
+    SyncSender<DiskWork>,
+    Receiver<DiskCompletion>,
+    JoinHandle<()>,
+) {
+    let depth = std::env::var("ARLE_KV_ASYNC_QUEUE_DEPTH")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|depth| *depth > 0)
+        .unwrap_or(8);
+    let (work_tx, work_rx) = sync_channel(depth);
+    let (completion_tx, completion_rx) = std::sync::mpsc::channel();
+    let worker = std::thread::Builder::new()
+        .name("arle-kv-disk".to_string())
+        .spawn(move || {
+            let mut failed = false;
+            while let Ok(work) = work_rx.recv() {
+                match work {
+                    DiskWork::Write(items) => {
+                        let result = if failed {
+                            Err(std::io::Error::other(
+                                "disk writer stopped after prior failure",
+                            ))
+                        } else {
+                            let writes = items
+                                .iter()
+                                .map(|item| (item.slot, item.payload.as_slice()))
+                                .collect::<Vec<_>>();
+                            store.write_payloads(&writes)
+                        };
+                        failed |= result.is_err();
+                        let _ = completion_tx.send(DiskCompletion::Write { items, result });
+                    }
+                    DiskWork::Manifest(bytes) => {
+                        let len = bytes.len();
+                        let result = if failed {
+                            Err(std::io::Error::other(
+                                "disk writer stopped after prior failure",
+                            ))
+                        } else {
+                            crate::write_file_atomic_cache(&manifest_path, &bytes)
+                        };
+                        failed |= result.is_err();
+                        let _ = completion_tx.send(DiskCompletion::Manifest { bytes: len, result });
+                    }
+                }
+            }
+        })
+        .expect("spawn KV disk writer");
+    (work_tx, completion_rx, worker)
+}
+
 // ---- KvTierStore impl ----
 
 impl Drop for KvTierStore {
@@ -691,6 +1009,17 @@ impl KvTierStore {
         match create_disk_store(&mmap_path, capacity_pages, bytes_per_page) {
             Ok((store, stats)) => {
                 crate::gds::log_gate(&namespace, stats.mode);
+                let writer =
+                    match open_writer_store(&mmap_path, capacity_pages, bytes_per_page, stats.mode)
+                    {
+                        Ok(writer) => writer,
+                        Err(err) => {
+                            log::warn!("KV async writer open failed: {err}");
+                            return false;
+                        }
+                    };
+                let (worker_tx, completion_rx, worker) =
+                    spawn_disk_worker(writer, namespace.join(MANIFEST_FILE));
                 self.disk = Some(DiskTier {
                     root_dir: namespace,
                     store,
@@ -698,6 +1027,13 @@ impl KvTierStore {
                     durable,
                     epoch,
                     stats,
+                    pending: BTreeMap::new(),
+                    next_generation: 0,
+                    accepting_writes: true,
+                    manifest_dirty: false,
+                    worker_tx: Some(worker_tx),
+                    completion_rx,
+                    worker: Some(worker),
                     _lock: namespace_lock,
                 });
                 true
@@ -813,6 +1149,17 @@ impl KvTierStore {
             namespace.display()
         );
 
+        let writer = match open_writer_store(&mmap_path, capacity_pages, bytes_per_page, stats.mode)
+        {
+            Ok(writer) => writer,
+            Err(err) => {
+                log::warn!("KV async writer open failed: {err}");
+                return false;
+            }
+        };
+        let (worker_tx, completion_rx, worker) =
+            spawn_disk_worker(writer, namespace.join(MANIFEST_FILE));
+
         self.disk = Some(DiskTier {
             root_dir: namespace,
             store,
@@ -820,17 +1167,26 @@ impl KvTierStore {
             durable: true,
             epoch,
             stats,
+            pending: BTreeMap::new(),
+            next_generation: 0,
+            accepting_writes: true,
+            manifest_dirty: false,
+            worker_tx: Some(worker_tx),
+            completion_rx,
+            worker: Some(worker),
             _lock: Some(namespace_lock),
         });
         true
     }
 
     pub fn persist(&mut self) {
-        if let Some(disk) = self.disk.as_mut()
-            && disk.durable
-            && let Err(err) = disk.write_manifest()
-        {
-            log::warn!("KV recall manifest persist failed: {err}");
+        if let Some(disk) = self.disk.as_mut() {
+            disk.finish_worker();
+            if disk.durable
+                && let Err(err) = disk.write_manifest()
+            {
+                log::warn!("KV recall manifest persist failed: {err}");
+            }
         }
     }
 
@@ -868,8 +1224,13 @@ impl KvTierStore {
     }
 
     pub fn available_pages(&self) -> usize {
-        self.capacity_pages()
-            .saturating_sub(self.host.len().saturating_add(self.disk_pages()))
+        let disk_available = self
+            .disk
+            .as_ref()
+            .map_or(0, |disk| disk.store.available_slots());
+        self.host_capacity_pages
+            .saturating_sub(self.host.len())
+            .saturating_add(disk_available)
     }
 
     pub fn page_bytes(&self) -> usize {
@@ -881,7 +1242,7 @@ impl KvTierStore {
     }
 
     pub fn disk_pages(&self) -> usize {
-        self.disk.as_ref().map_or(0, |d| d.keys.len())
+        self.disk.as_ref().map_or(0, DiskTier::logical_pages)
     }
 
     pub fn io_stats(&self) -> TierIoStats {
@@ -895,8 +1256,7 @@ impl KvTierStore {
             return Some(infer_seam::KvTierLocation::HostDemoted);
         }
         self.disk.as_ref().and_then(|disk| {
-            disk.keys
-                .contains_key(&key)
+            (disk.keys.contains_key(&key) || disk.pending.contains_key(&key))
                 .then_some(infer_seam::KvTierLocation::Disk)
         })
     }
@@ -906,7 +1266,7 @@ impl KvTierStore {
         let disk_full = self
             .disk
             .as_ref()
-            .is_none_or(|d| d.keys.len() >= d.store.num_slots() as usize);
+            .is_none_or(|d| d.store.available_slots() == 0 || !d.accepting_writes);
         host_full && disk_full
     }
 
@@ -915,7 +1275,7 @@ impl KvTierStore {
             || self
                 .disk
                 .as_ref()
-                .is_some_and(|disk| disk.keys.contains_key(&key))
+                .is_some_and(|disk| disk.keys.contains_key(&key) || disk.pending.contains_key(&key))
     }
 
     pub fn insert(&mut self, key: u64, payload: Vec<u8>) -> bool {
@@ -931,19 +1291,19 @@ impl KvTierStore {
             );
             return false;
         }
-        self.insert_inner(key, payload, true)
+        self.insert_inner(key, payload)
     }
 
-    fn insert_inner(&mut self, key: u64, payload: Vec<u8>, commit_manifest: bool) -> bool {
+    fn insert_inner(&mut self, key: u64, payload: Vec<u8>) -> bool {
         if self.host.len() < self.host_capacity_pages {
             self.insert_host(key, payload);
             return true;
         }
-        if self.host_capacity_pages > 0 && self.spill_coldest_to_disk(commit_manifest) {
+        if self.host_capacity_pages > 0 && self.spill_coldest_to_disk() {
             self.insert_host(key, payload);
             return true;
         }
-        self.write_to_disk(key, &payload, commit_manifest)
+        self.write_to_disk(key, payload).is_ok()
     }
 
     pub fn insert_many(&mut self, mut entries: Vec<(u64, Vec<u8>)>) -> bool {
@@ -956,21 +1316,20 @@ impl KvTierStore {
         {
             return false;
         }
-        if self.host_capacity_pages == 0 && self.write_many_to_disk(&entries) {
-            return true;
+        if self.host_capacity_pages == 0 {
+            return self.write_many_to_disk(entries);
         }
         if self.insert_many_overflow(&mut entries) {
             return true;
         }
         let mut inserted = Vec::with_capacity(entries.len());
         for (key, payload) in entries {
-            if !self.insert_inner(key, payload, false) {
+            if !self.insert_inner(key, payload) {
                 self.remove(&inserted);
                 return false;
             }
             inserted.push(key);
         }
-        self.commit_manifest();
         true
     }
 
@@ -1007,45 +1366,18 @@ impl KvTierStore {
         let Some(disk) = self.disk.as_mut() else {
             return false;
         };
-        let mut slots = Vec::with_capacity(overflow);
-        for _ in 0..overflow {
-            let Some(slot) = disk.store.alloc_slot() else {
-                for slot in slots {
-                    disk.store.free_slot(slot);
-                }
-                return false;
-            };
-            slots.push(slot);
-        }
-        let mut writes = Vec::with_capacity(overflow);
-        let mut records = Vec::with_capacity(overflow);
-        for (key, slot) in old_spills.iter().copied().zip(slots.iter().copied()) {
-            let payload = &self.host[&key].payload;
-            writes.push((slot, payload.as_slice()));
-            records.push((key, slot, payload.len()));
-        }
-        for ((key, payload), slot) in entries
+        let mut spills = old_spills
             .iter()
-            .take(incoming_spills)
-            .zip(slots.iter().copied().skip(old_spills.len()))
-        {
-            writes.push((slot, payload.as_slice()));
-            records.push((*key, slot, payload.len()));
-        }
-        if let Err(err) = disk.write_payloads(&writes) {
-            log::warn!("KV overflow batch disk write failed: {err}");
-            for slot in slots {
-                disk.store.free_slot(slot);
-            }
+            .map(|key| (*key, self.host[key].payload.clone(), true))
+            .collect::<Vec<_>>();
+        spills.extend(
+            entries
+                .iter()
+                .take(incoming_spills)
+                .map(|(key, payload)| (*key, payload.clone(), true)),
+        );
+        if disk.enqueue(spills).is_err() {
             return false;
-        }
-        for (key, slot, len) in records {
-            disk.keys.insert(key, DiskRecord { slot, len });
-        }
-        if disk.durable
-            && let Err(err) = disk.write_manifest()
-        {
-            log::warn!("KV recall batch manifest update failed: {err}");
         }
         for key in old_spills {
             if let Some(entry) = self.host.remove(&key) {
@@ -1061,21 +1393,27 @@ impl KvTierStore {
     fn contains_disk(&self, key: u64) -> bool {
         self.disk
             .as_ref()
-            .is_some_and(|disk| disk.keys.contains_key(&key))
+            .is_some_and(|disk| disk.keys.contains_key(&key) || disk.pending.contains_key(&key))
     }
 
     fn discount_disk_useful_write(&mut self, key: u64, bytes: usize) {
-        if let Some(disk) = self.disk.as_mut()
-            && disk.keys.contains_key(&key)
-        {
-            disk.stats.useful_write_bytes =
-                disk.stats.useful_write_bytes.saturating_sub(bytes as u64);
+        if let Some(disk) = self.disk.as_mut() {
+            if let Some(pending) = disk.pending.get_mut(&key) {
+                if pending.useful {
+                    disk.stats.useful_write_bytes =
+                        disk.stats.useful_write_bytes.saturating_sub(bytes as u64);
+                }
+                pending.useful = false;
+            } else if disk.keys.contains_key(&key) {
+                disk.stats.useful_write_bytes =
+                    disk.stats.useful_write_bytes.saturating_sub(bytes as u64);
+            }
         }
     }
 
     fn discount_disk_useful_read(&mut self, key: u64, bytes: usize) {
         if let Some(disk) = self.disk.as_mut()
-            && disk.keys.contains_key(&key)
+            && (disk.keys.contains_key(&key) || disk.pending.contains_key(&key))
         {
             disk.stats.useful_read_bytes =
                 disk.stats.useful_read_bytes.saturating_sub(bytes as u64);
@@ -1095,106 +1433,45 @@ impl KvTierStore {
         self.host_lru.insert((stamp, key));
     }
 
-    fn write_to_disk(&mut self, key: u64, payload: &[u8], commit_manifest: bool) -> bool {
+    fn write_to_disk(&mut self, key: u64, payload: Vec<u8>) -> Result<(), Vec<u8>> {
         let Some(disk) = &mut self.disk else {
-            return false;
+            return Err(payload);
         };
-        let old = disk.keys.get(&key).copied();
-        let slot = match disk.store.alloc_slot() {
-            Some(slot) => slot,
-            None => return false,
-        };
-        if let Err(err) = disk.write_payloads(&[(slot, payload)]) {
-            log::warn!("KV disk write failed for key {key} slot {slot}: {err}");
-            disk.store.free_slot(slot);
-            return false;
-        }
-        disk.keys.insert(
-            key,
-            DiskRecord {
-                slot,
-                len: payload.len(),
-            },
-        );
-        if let Some(old) = old {
-            disk.store.free_slot(old.slot);
-        }
-        if commit_manifest
-            && disk.durable
-            && let Err(err) = disk.write_manifest()
-        {
-            log::warn!("KV recall manifest update failed for key {key}: {err}");
-        }
-        true
+        disk.enqueue(vec![(key, payload, true)])
+            .map_err(|mut entries| entries.pop().expect("single rejected disk write").1)
     }
 
-    fn write_many_to_disk(&mut self, entries: &[(u64, Vec<u8>)]) -> bool {
+    fn write_many_to_disk(&mut self, entries: Vec<(u64, Vec<u8>)>) -> bool {
         let Some(disk) = &mut self.disk else {
             return entries.is_empty();
         };
-        let unique = entries.iter().map(|(key, _)| *key).collect::<BTreeSet<_>>();
-        if unique.len() != entries.len() {
-            return false;
-        }
-        let mut allocated = Vec::with_capacity(entries.len());
-        let mut records = Vec::with_capacity(entries.len());
-        for (key, payload) in entries {
-            let Some(slot) = disk.store.alloc_slot() else {
-                for slot in allocated {
-                    disk.store.free_slot(slot);
-                }
-                return false;
-            };
-            allocated.push(slot);
-            records.push((*key, slot, payload.len()));
-        }
-        let writes = records
-            .iter()
-            .zip(entries)
-            .map(|((_, slot, _), (_, payload))| (*slot, payload.as_slice()))
-            .collect::<Vec<_>>();
-        if let Err(err) = disk.write_payloads(&writes) {
-            log::warn!("KV batch disk write failed: {err}");
-            for slot in allocated {
-                disk.store.free_slot(slot);
-            }
-            return false;
-        }
-        for (key, slot, len) in records {
-            disk.keys.insert(key, DiskRecord { slot, len });
-        }
-        if disk.durable
-            && let Err(err) = disk.write_manifest()
-        {
-            log::warn!("KV recall batch manifest update failed: {err}");
-        }
-        true
+        disk.enqueue(
+            entries
+                .into_iter()
+                .map(|(key, payload)| (key, payload, true))
+                .collect(),
+        )
+        .is_ok()
     }
 
-    fn commit_manifest(&mut self) {
-        if let Some(disk) = self.disk.as_mut()
-            && disk.durable
-            && let Err(err) = disk.write_manifest()
-        {
-            log::warn!("KV recall batch manifest update failed: {err}");
-        }
-    }
-
-    fn spill_coldest_to_disk(&mut self, commit_manifest: bool) -> bool {
+    fn spill_coldest_to_disk(&mut self) -> bool {
         let Some((stamp, key)) = self.host_lru.iter().next().copied() else {
             return false;
         };
         self.host_lru.remove(&(stamp, key));
-        let Some(entry) = self.host.remove(&key) else {
+        let Some(mut entry) = self.host.remove(&key) else {
             return false;
         };
         debug_assert_eq!(entry.stamp, stamp);
-        if self.write_to_disk(key, &entry.payload, commit_manifest) {
-            true
-        } else {
-            self.host.insert(key, entry);
-            self.host_lru.insert((stamp, key));
-            false
+        let payload = entry.payload;
+        match self.write_to_disk(key, payload) {
+            Ok(()) => true,
+            Err(payload) => {
+                entry.payload = payload;
+                self.host.insert(key, entry);
+                self.host_lru.insert((stamp, key));
+                false
+            }
         }
     }
 
@@ -1210,9 +1487,17 @@ impl KvTierStore {
             entry.stamp = stamp;
             return Ok(Cow::Borrowed(entry.payload.as_slice()));
         }
-        if let Some(disk) = self.disk.as_mut()
-            && let Some(record) = disk.keys.get(&key).copied()
-        {
+        if let Some(disk) = self.disk.as_mut() {
+            disk.drain_completions();
+            if disk.pending.contains_key(&key) {
+                let len = disk.pending[&key].payload.len();
+                disk.stats.read_ops += 1;
+                disk.stats.useful_read_bytes += len as u64;
+                return Ok(Cow::Borrowed(disk.pending[&key].payload.as_slice()));
+            }
+            let Some(record) = disk.keys.get(&key).copied() else {
+                return Err(anyhow!("KV tier store has no entry for key {key}"));
+            };
             let len = if record.len == 0 {
                 self.bytes_per_page
             } else {
@@ -1224,6 +1509,9 @@ impl KvTierStore {
     }
 
     pub fn read_many(&mut self, keys: &[u64]) -> Result<Vec<Vec<u8>>> {
+        if let Some(disk) = self.disk.as_mut() {
+            disk.drain_completions();
+        }
         let mut values = vec![None; keys.len()];
         let mut disk_reads = Vec::new();
         for (index, key) in keys.iter().copied().enumerate() {
@@ -1234,6 +1522,21 @@ impl KvTierStore {
                 let entry = self.host.get_mut(&key).expect("key observed above");
                 entry.stamp = stamp;
                 values[index] = Some(entry.payload.clone());
+                continue;
+            }
+            if let Some(payload) = self
+                .disk
+                .as_ref()
+                .and_then(|disk| disk.pending.get(&key))
+                .map(|pending| pending.payload.as_ref().clone())
+            {
+                let disk = self
+                    .disk
+                    .as_mut()
+                    .expect("pending disk payload observed above");
+                disk.stats.read_ops += 1;
+                disk.stats.useful_read_bytes += payload.len() as u64;
+                values[index] = Some(payload);
                 continue;
             }
             let record = self
@@ -1361,15 +1664,13 @@ impl KvTierStore {
         let Some(disk) = &mut self.disk else {
             return;
         };
-        let Some(record) = disk.keys.remove(&key) else {
-            return;
-        };
-        disk.store.free_slot(record.slot);
-        if disk.durable
-            && let Err(err) = disk.write_manifest()
-        {
-            log::warn!("KV recall manifest update failed dropping key {key}: {err}");
+        disk.drain_completions();
+        disk.pending.remove(&key);
+        if let Some(record) = disk.keys.remove(&key) {
+            disk.store.free_slot(record.slot);
+            disk.manifest_dirty |= disk.durable;
         }
+        disk.try_enqueue_manifest();
     }
 
     /// Drop entries from both levels. In the mmap store, freed slots return to
@@ -1377,23 +1678,24 @@ impl KvTierStore {
     /// overwritten on next allocation).
     pub fn remove(&mut self, keys: &[u64]) {
         let mut disk_index_changed = false;
+        if let Some(disk) = self.disk.as_mut() {
+            disk.drain_completions();
+        }
         for key in keys {
             if let Some(entry) = self.host.remove(key) {
                 self.host_lru.remove(&(entry.stamp, *key));
             }
-            if let Some(disk) = &mut self.disk
-                && let Some(record) = disk.keys.remove(key)
-            {
-                disk.store.free_slot(record.slot);
-                disk_index_changed = true;
+            if let Some(disk) = &mut self.disk {
+                disk.pending.remove(key);
+                if let Some(record) = disk.keys.remove(key) {
+                    disk.store.free_slot(record.slot);
+                    disk_index_changed = true;
+                }
             }
         }
-        if disk_index_changed
-            && let Some(disk) = self.disk.as_mut()
-            && disk.durable
-            && let Err(err) = disk.write_manifest()
-        {
-            log::warn!("KV recall manifest update after remove failed: {err}");
+        if let Some(disk) = self.disk.as_mut() {
+            disk.manifest_dirty |= disk_index_changed && disk.durable;
+            disk.try_enqueue_manifest();
         }
     }
 }
@@ -1447,7 +1749,6 @@ pub fn weights_epoch_tag(model_path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::borrow::Cow;
 
     fn temp_root(tag: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
@@ -1530,6 +1831,7 @@ mod tests {
         assert!(store.insert_chunked(3, 4, 2, &blob));
         store.remove_chunked(3, 4, 1);
         assert_eq!(store.disk_pages(), 4, "superseded disk blob reclaimed");
+        store.persist();
         assert_eq!(store.available_pages(), baseline - 4);
         assert_eq!(store.read_chunked(3, 4, 2).expect("v2 via mmap"), blob);
         let _ = std::fs::remove_dir_all(root);
@@ -1688,7 +1990,7 @@ mod tests {
     }
 
     #[test]
-    fn disk_read_is_zero_copy_mmap_slice() {
+    fn pending_disk_payload_is_immediately_readable() {
         let root = temp_root("mmap_read");
         let mut store = KvTierStore::with_budget(0, 8);
         assert!(store.set_disk(root.clone(), 32, 8));
@@ -1696,10 +1998,6 @@ mod tests {
 
         {
             let first = store.read(1).expect("first disk read");
-            assert!(
-                matches!(&first, Cow::Borrowed(_)),
-                "disk read borrows mmap slice"
-            );
             assert_eq!(first.as_ref(), &[1u8; 8]);
         }
         // Second read still works (mmap unchanged).
@@ -1736,6 +2034,21 @@ mod tests {
             store.read(1).expect("original disk read").as_ref(),
             &[1u8; 8]
         );
+
+        std::fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn pending_overwrite_keeps_latest_generation() {
+        let root = temp_root("overwrite");
+        let mut store = KvTierStore::with_budget(0, 8);
+        assert!(store.set_disk(root.clone(), 16, 8));
+
+        assert!(store.insert(1, vec![1; 8]));
+        assert!(store.insert(1, vec![9; 8]));
+        assert_eq!(store.read(1).expect("pending latest").as_ref(), &[9u8; 8]);
+        store.persist();
+        assert_eq!(store.read(1).expect("committed latest").as_ref(), &[9u8; 8]);
 
         std::fs::remove_dir_all(&root).expect("cleanup");
     }
@@ -1804,9 +2117,15 @@ mod tests {
         assert_eq!(store.disk_pages(), 1);
         store.remove(&[1]);
         assert_eq!(store.disk_pages(), 0);
-        // Same slot should be re-allocated.
-        assert!(store.insert(2, vec![2; 8]));
+        // An in-flight tombstoned slot is reclaimed only by its completion.
+        while !store.insert(2, vec![2; 8]) {
+            std::thread::yield_now();
+        }
         assert_eq!(store.disk_pages(), 1);
+        assert!(
+            store.read(1).is_err(),
+            "tombstoned completion cannot resurrect key"
+        );
 
         std::fs::remove_dir_all(&root).expect("cleanup");
     }
@@ -1944,6 +2263,7 @@ mod tests {
             assert!(store.set_disk_durable(root.clone(), 32, 16, epoch.clone(), 1, 1, 0));
             assert!(store.insert(11, b"tiny".to_vec()));
             assert!(store.insert(12, b"payload-123".to_vec()));
+            store.persist();
             let disk = store.disk.as_ref().expect("disk tier");
             assert_eq!(
                 disk.keys.get(&11),

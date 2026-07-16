@@ -147,6 +147,10 @@ impl DirectStore {
         self.free_list.pop()
     }
 
+    pub(crate) fn available_slots(&self) -> usize {
+        self.free_list.len()
+    }
+
     pub(crate) fn free_slot(&mut self, slot: u32) {
         if !self.free_list.contains(&slot) {
             self.free_list.push(slot);
