@@ -16,7 +16,7 @@
 #   DSPARK=1                      spec decode on (default; agent-OPD is serial
 #                                 B=1 so dspark ~1.9x applies at any SAMPLES). 0=off.
 #   DSPARK_DRAFT_HF_ID=z-lab/Qwen3.6-27B-DFlash   DSPARK_CONF_THRESHOLD=0.0
-#   ROUNDS=16 SAMPLES=2 MAX_TURNS=8 MAX_TOKENS=768 EVAL_EVERY=2 EVAL_N=24
+#   ROUNDS=16 SAMPLES=2 EVAL_EVERY=2 EVAL_N=24
 #   TASK_LIMIT=12 WRITEBACK_CAP=8 BASE_REPEATS=2 DIFFICULTY=easy SEED=0
 set -euo pipefail
 
@@ -51,13 +51,9 @@ else
     ROUNDS=${ROUNDS:-16} SAMPLES=${SAMPLES:-2} EVAL_EVERY=${EVAL_EVERY:-2}
     EVAL_N=${EVAL_N:-24} TASK_LIMIT=${TASK_LIMIT:-12} BASE_REPEATS=${BASE_REPEATS:-2}
 fi
-MAX_TURNS=${MAX_TURNS:-8} MAX_TOKENS=${MAX_TOKENS:-768}
 WRITEBACK_CAP=${WRITEBACK_CAP:-8} DIFFICULTY=${DIFFICULTY:-easy} SEED=${SEED:-0}
-# DSpark ON by default — agent-OPD rollout is SERIAL B=1 regardless of SAMPLES
-# (agent_opd.rs:473 runs samples in a sequential per-sample engine-lock loop, NOT
-# concurrently — the concurrent best-of-N path is rubric-OPD's generate_batch,
-# infer_student.rs:212, a different variant). So dspark's licensed ~1.9x serial
-# win applies at every SAMPLES here. DSPARK=0 disables. conf=0 is licensed.
+# DSpark ON by default. cc owns sampling/turns (--cc-timeout is the bound).
+# DSPARK=0 disables. conf=0 is licensed.
 DSPARK_CONF_THRESHOLD=${DSPARK_CONF_THRESHOLD:-0.0}
 if [[ ${DSPARK:-1} == 1 ]]; then
     DSPARK_DRAFT_MODEL=${DSPARK_DRAFT_MODEL:-$(ensure_hf_model "$DSPARK_DRAFT_HF_ID")}
@@ -86,13 +82,8 @@ train_args=(
     --eval-dataset "$OUT/corpus/tasks_eval.jsonl"
     --eval-n "$EVAL_N"
     --samples-per-prompt "$SAMPLES"
-    --max-turns "$MAX_TURNS"
-    --max-tokens "$MAX_TOKENS"
-    --bash-timeout-secs 30
     --test-timeout-secs 60
     --writeback-cap "$WRITEBACK_CAP"
-    --rollout-temperature 1.0
-    --rollout-seed "$SEED"
     --lora-rank 16
     --lora-alpha 32
     --lora-target-set attention-qv

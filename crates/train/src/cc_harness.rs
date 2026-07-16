@@ -20,6 +20,12 @@ use crate::cc_convert::{CcRecord, CcWindow, convert_cc_dumps};
 use crate::sandbox::{boot_workdir, diff_workdir, run_captured, score_workdir};
 use crate::swe_dataset::SweTask;
 
+/// Measured cc SWE-session token ceiling: sizes the serve KV budget per
+/// concurrent cc stream and is the rollout generation budget (Dr.GRPO's fixed
+/// normalizer). cc owns sampling/turns, so this — not a turn×token flag pair —
+/// bounds a session.
+pub const CC_SESSION_TOKENS: usize = 22_000;
+
 /// Run-wide knobs; construct literally. Stateless — boot-ahead state lives in
 /// the [`BootedGroup`] values the caller threads between calls.
 pub struct CcHarness {

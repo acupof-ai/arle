@@ -10,8 +10,6 @@
 //! not a claim every subcommand is KL distillation.
 //! See `docs/projects/2026-05-18-opd-only-pivot.md`.
 
-#[path = "agent_opd.rs"]
-pub mod agent_opd;
 #[path = "aopd_profile.rs"]
 pub mod aopd_profile;
 #[path = "causal_lm.rs"]

@@ -3752,7 +3752,6 @@ dependencies = [
 name = "train"
 version = "0.3.0"
 dependencies = [
- "agent",
  "anyhow",
  "autograd",
  "base64 0.22.1",
@@ -3777,7 +3776,6 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokenizers",
- "tools",
  "ureq 2.12.1",
 ]
 
