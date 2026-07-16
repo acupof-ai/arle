@@ -56,7 +56,9 @@ use crate::{
 use crate::{infer_student::InferStudent, lora::LoraConfig};
 use autograd::ops::{
     add, embedding,
-    fused_linear_distill::{fused_linear_ce_loss_indexed, fused_linear_pg_loss_indexed},
+    fused_linear_distill::{
+        PgStats, WeightForm, fused_linear_ce_loss_indexed, fused_linear_pg_loss_indexed,
+    },
     gather_last_dim, log_softmax, matmul_bt, mean, mul, mul_scalar, reshape, slice,
 };
 
@@ -2992,20 +2994,25 @@ fn trim_memory_pool_for_writeback(store: &TensorStore, scope: &str) -> Result<Op
 }
 
 /// Per-token loss the shared masked-writeback skeleton applies. `Ce` is the
-/// byte-identical rejection-sampling default; `Dis` is SAO Phase 1 (per-token PG
-/// with a clipped importance-ratio gate). Only the single fused-loss call
-/// branches on this — forward / backward / optimizer / offload are shared.
+/// byte-identical rejection-sampling default — PG at uniform weight `1/N`, kept
+/// as its own arm because the fused CE op needs no per-chunk logprob readback.
+/// `Pg` is the weighted policy-gradient path (SAO/GRPO-family presets). Only the
+/// single fused-loss call branches on this — forward / backward / optimizer /
+/// offload are shared.
 pub enum WritebackLoss<'a> {
     Ce,
-    Dis {
-        /// π_rollout per masked target position, same order as the fused ops.
+    Pg {
+        /// π_behavior per masked target position (the policy the trajectory was
+        /// SAMPLED from — the IS-ratio denominator), same order as the fused ops.
         rollout_logprobs: &'a [f32],
-        /// Per-token advantage, same order/len as `rollout_logprobs`. SaoDis
-        /// passes a constant vec (batch-centered scalar); SaoValue passes
-        /// Skip-Obs GAE advantages.
-        advantage: &'a [f32],
-        eps_low: f32,
-        eps_high: f32,
+        /// FINAL per-token detached base weight: advantage already scaled by the
+        /// preset's aggregation norm; the ratio/gate factor is applied inside
+        /// the op per `form`.
+        weight: &'a [f32],
+        form: WeightForm,
+        /// k3 KL(π_b‖πθ) coefficient folded into the weight (0 = off), already
+        /// aggregation-scaled like `weight`.
+        kl_coef: f32,
     },
 }
 
@@ -3029,6 +3036,7 @@ pub fn masked_writeback_ce_step<O: Optimizer>(
         all_model_params,
         trainable_params,
         optimizer,
+        true,
         prompt_ids,
         response_ids,
         response_mask,
@@ -3036,6 +3044,7 @@ pub fn masked_writeback_ce_step<O: Optimizer>(
         window_size,
         store,
     )
+    .map(|(loss, _)| loss)
 }
 
 /// Frozen-prompt-KV gen-segment split shared by the SAO writeback/capture/critic
@@ -3086,13 +3095,17 @@ pub fn masked_writeback_step<O: Optimizer>(
     all_model_params: &[TensorId],
     trainable_params: &[TensorId],
     optimizer: &mut O,
+    // `false` = grad-accumulate only (GlobalTokenMean batches trajectories into
+    // ONE step): grads survive `cleanup_after_backward`'s keep-set; the caller
+    // steps + zeroes once at batch end.
+    step_optimizer: bool,
     prompt_ids: &[u32],
     response_ids: &[u32],
     response_mask: &[u8],
     vocab: usize,
     window_size: usize,
     store: &mut TensorStore,
-) -> Result<f32> {
+) -> Result<(f32, PgStats)> {
     if prompt_ids.is_empty() {
         return Err(OpdError::InvalidInput(
             "masked writeback requires a non-empty prompt".to_owned(),
@@ -3127,7 +3140,7 @@ pub fn masked_writeback_step<O: Optimizer>(
             response_ids.len(),
             response_mask.iter().filter(|&&m| m == 1).count(),
         );
-        return Ok(0.0);
+        return Ok((0.0, PgStats::default()));
     }
     let total_targets = loss_targets.len();
     let chunk_rows = window_size; // reused: positions per fused-CE chunk.
@@ -3205,52 +3218,49 @@ pub fn masked_writeback_step<O: Optimizer>(
     // is already the mean CE per masked token and the gradient is scaled by 1/N,
     // so backward (seed 1.0) applies the per-token-mean update directly.
     let t_ce = Instant::now();
-    let loss = match loss_kind {
-        WritebackLoss::Ce => fused_linear_ce_loss_indexed(
-            hidden,
-            student.lm_head_weight_id(),
-            &position_indices,
-            &target_tokens,
-            chunk_rows,
-            store,
-            &mut tape,
+    let (loss, pg_stats) = match loss_kind {
+        WritebackLoss::Ce => (
+            fused_linear_ce_loss_indexed(
+                hidden,
+                student.lm_head_weight_id(),
+                &position_indices,
+                &target_tokens,
+                chunk_rows,
+                store,
+                &mut tape,
+            )
+            .map_err(OpdError::from)?,
+            PgStats::default(),
         ),
-        WritebackLoss::Dis {
+        WritebackLoss::Pg {
             rollout_logprobs,
-            advantage,
-            eps_low,
-            eps_high,
+            weight,
+            form,
+            kl_coef,
         } => {
-            if rollout_logprobs.len() != total_targets || advantage.len() != total_targets {
+            if rollout_logprobs.len() != total_targets || weight.len() != total_targets {
                 return Err(OpdError::InvalidInput(format!(
-                    "masked writeback DIS rollout_logprobs/advantage len {}/{} != masked targets {total_targets}",
+                    "masked writeback PG rollout_logprobs/weight len {}/{} != masked targets {total_targets}",
                     rollout_logprobs.len(),
-                    advantage.len(),
+                    weight.len(),
                 )));
             }
-            // Token-mean the PG objective (÷ masked-token count), mirroring CE's
-            // 1/N. Without it the summed −w·logp scales with trajectory length →
-            // DIS grad-norm ~490× CE's, over-large steps at the shared LR (the
-            // round-8 regression). The fused op scales loss+grad by this weight,
-            // so dividing here is exact. Self-check calls the op directly, unaffected.
-            let advantage_per_token: Vec<f32> =
-                advantage.iter().map(|a| a / total_targets as f32).collect();
             fused_linear_pg_loss_indexed(
                 hidden,
                 student.lm_head_weight_id(),
                 &position_indices,
                 &target_tokens,
                 rollout_logprobs,
-                &advantage_per_token,
-                eps_low,
-                eps_high,
+                weight,
+                form,
+                kl_coef,
                 chunk_rows,
                 store,
                 &mut tape,
             )
+            .map_err(OpdError::from)?
         }
-    }
-    .map_err(OpdError::from)?;
+    };
 
     let loss_value = store.to_host(loss).map_err(OpdError::from)?[0];
     let ce_secs = t_ce.elapsed().as_secs_f64();
@@ -3268,8 +3278,10 @@ pub fn masked_writeback_step<O: Optimizer>(
         eprintln!("[writeback-grad] grad_norm={gn:.6e}");
     }
     let t_opt = Instant::now();
-    optimizer.step(store, trainable_params)?;
-    optimizer.zero_grad(store, trainable_params);
+    if step_optimizer {
+        optimizer.step(store, trainable_params)?;
+        optimizer.zero_grad(store, trainable_params);
+    }
     cleanup_after_backward(store, &mut tape, all_model_params, &keep_extra);
     let opt_secs = t_opt.elapsed().as_secs_f64();
     let vram_post_cleanup = log_writeback_vram(store, "masked-writeback", "post cleanup");
@@ -3287,7 +3299,7 @@ pub fn masked_writeback_step<O: Optimizer>(
 
     eprintln!("[masked-writeback] DONE loss={loss_value:.6} total_targets={total_targets}");
     // Mean CE per masked token (the fused loss already applied the 1/N mean).
-    Ok(loss_value)
+    Ok((loss_value, pg_stats))
 }
 
 /// Positions per `[rows, vocab]` logits tile in [`capture_rollout_logprobs`];
