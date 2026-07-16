@@ -4027,10 +4027,7 @@ pub(crate) fn mla_attention(
     // per-slot state). `Some` only when native DeepGEMM is available and the caller
     // threads it. `None` on the decode (token_count==1) graph lane.
     mut prefill_shared: Option<&mut Dsv4PrefillDeepGemmLinearScratch>,
-    // Model-wide shared FP32 compressor-probe scratch (hoisted off the
-    // per-(slot,layer) compressor state). Required (`Some`) on prefill lanes
-    // (`start_pos_device` None); decode lanes never reach the probe and pass
-    // `None`.
+    // Shared FP32 probe scratch — contract on `compressor_forward`'s param.
     fp32_scratch: Option<&mut Dsv4CompressorFp32Scratch>,
     start_pos: usize,
     start_pos_device: Option<&CudaSlice<i32>>,
@@ -4136,7 +4133,6 @@ fn compressor_forward_decode_graph(
         start_pos_device,
         apply_rope,
         rope_original_seq_len,
-        // Decode graph lane (start_pos_device Some): the FP32 probe never runs.
         None,
         Some((&*kv_scratch, &*score_scratch)),
         None,
@@ -4990,9 +4986,7 @@ pub(crate) fn mla_attention_prepare(
     // threads it (the prefill projection lanes). `None` on the decode
     // (token_count==1) graph/batched lanes, which never take a prefill branch.
     mut prefill_shared: Option<&mut Dsv4PrefillDeepGemmLinearScratch>,
-    // Model-wide shared FP32 compressor-probe scratch. Required (`Some`) on
-    // prefill lanes (`start_pos_device` None — the compressor FP32 probe
-    // consumes it); decode lanes pass `None`.
+    // Shared FP32 probe scratch — contract on `compressor_forward`'s param.
     mut fp32_scratch: Option<&mut Dsv4CompressorFp32Scratch>,
     start_pos: usize,
     start_pos_device: Option<&CudaSlice<i32>>,
@@ -5864,7 +5858,6 @@ pub(crate) fn mla_attention_compressor_defer_row(
             start_pos_device,
             true,
             original_seq_len,
-            // Decode lane (start_pos_device Some): the FP32 probe never runs.
             None,
             // Defer mode ignores `precomputed` (the batched update reads the batched
             // prepass output directly); pass None.
@@ -6061,8 +6054,6 @@ pub(crate) fn mla_attention_prepare_compressed_only(
                     start_pos_device,
                     true,
                     original_seq_len,
-                    // Batched-decode lane (start_pos_device Some from the one
-                    // caller): the FP32 probe never runs.
                     None,
                     precomputed_main,
                     None,
