@@ -1,0 +1,29 @@
+crates/train/src/cc_convert.rs
+  s_8f872b9640eadf::t_9f864975f06fd7 69,71-72,76-99,124
+crates/train/src/cc_harness.rs
+  s_8f872b9640eadf::t_023749cec3dfb7 1-526
+crates/train/src/lib.rs
+  s_8f872b9640eadf::t_b545a2faf8e572 21-22
+crates/train/src/sandbox.rs
+  s_8f872b9640eadf::t_c1e7d2892e3b92 127-129
+crates/train/src/spawner.rs
+  s_8f872b9640eadf::t_9ef152f907e10e 133-138
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "1a74d192dae91dce91824e0d454876769b429c65",
+  "prompts": {},
+  "sessions": {
+    "s_8f872b9640eadf": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a7be0e1d9e53cc820",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
