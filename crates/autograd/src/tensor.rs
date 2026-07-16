@@ -1193,6 +1193,15 @@ mod tests {
             assert!(store.checkpoint_offload_pool.free.is_empty());
         }
 
+        let root = tempfile::tempdir().expect("checkpoint L3 root");
+        let mut store = TensorStore {
+            checkpoint_l3: CheckpointL3::try_new(
+                root.path().to_path_buf(),
+                1,
+                2 * kv_native_sys::BLOB_CHUNK_BYTES,
+            ),
+            ..TensorStore::default()
+        };
         let x =
             store.alloc(Tensor::new(values.clone(), vec![len], true).expect("checkpoint input"));
         store.ensure_device(x).expect("upload checkpoint input");
