@@ -14,6 +14,12 @@ path) of the agent-RL unified-infra plan. Behavior contract: the three shipped
 strategies (rejection-ce / sao-dis / sao-value) byte-identical through their
 presets; default CLI unchanged.
 
+P2 orchestrator tranches (`1a74d192d` cc-harness driver, `16d9fdb05` simplify
+pass, `a46ab3388` serve + per-group round loop + always-on metrics) ride this
+entry: their wall-clock license is the F.3 A/B vs the bash loop; correctness is
+F.1 (needle across re-merge) + F.2 (reward parity, py→Rust denominator change
+expected and documented there).
+
 ## What must be measured (pod, H20)
 
 1. Preset behavior parity: one replay round each for rejection-ce / sao-dis /
