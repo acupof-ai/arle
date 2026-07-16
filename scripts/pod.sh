@@ -143,9 +143,12 @@ case "$cmd" in
     echo "run '$label' launched on GPU $gpu. poll: scripts/pod.sh status $label"
     ;;
   gpus)
-    # Per-GPU usage + per-holder attribution: a holder PID visible in our
-    # /proc is ours (cmdline shown, killable); an invisible one is another
-    # container's (host PID ns) — not killable from here, don't try.
+    # Per-GPU usage + per-holder attribution. A holder PID visible in our
+    # /proc is ours (cmdline shown, killable here). An invisible one is NOT
+    # proof it's foreign — nvidia-smi prints host PIDs, so it may be another
+    # container's process OR our own from a pre-restart container instance
+    # (observed 2026-07-16: our arm-A serve read as "foreign"). Attribute and
+    # kill from the host: `tn exec 'tr "\0" " " </proc/<pid>/cmdline'`.
     "$POD" "nvidia-smi --query-gpu=index,memory.used,memory.total,utilization.gpu --format=csv,noheader; \
       map=\$(nvidia-smi --query-gpu=index,uuid --format=csv,noheader); \
       apps=\$(nvidia-smi --query-compute-apps=gpu_uuid,pid,used_memory --format=csv,noheader 2>/dev/null); \
@@ -154,7 +157,7 @@ case "$cmd" in
         [ -n \"\$pid\" ] || continue; pid=\$(echo \"\$pid\" | tr -d ' '); uuid=\$(echo \"\$uuid\" | tr -d ' '); \
         idx=\$(echo \"\$map\" | grep \"\$uuid\" | cut -d',' -f1 | tr -d ' '); \
         if [ -d \"/proc/\$pid\" ]; then who=\"ours: \$(tr '\0' ' ' </proc/\$pid/cmdline | cut -c1-90)\"; \
-        else who='FOREIGN (host-ns pid — not visible/killable from this container)'; fi; \
+        else who='NOT VISIBLE from this container (other container OR pre-restart leftover of ours) — attribute/kill from host via tn exec'; fi; \
         echo \"gpu \${idx:-?} pid \$pid\$mem — \$who\"; done"
     ;;
   ready)
