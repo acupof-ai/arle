@@ -3082,10 +3082,9 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
 
     // Round-0 BASELINE held-out eval BEFORE any training: the un-tuned student's
     // pass-rate every per-round eval is read against.
-    let mut baseline_pass_rate: Option<f32> = None;
-    if !eval_tasks.is_empty() {
-        baseline_pass_rate = Some(run_cc_eval(&harness, &eval_tasks, &eval_out_dir, "base")?);
-    }
+    let baseline_pass_rate: Option<f32> = (!eval_tasks.is_empty())
+        .then(|| run_cc_eval(&harness, &eval_tasks, &eval_out_dir, "base"))
+        .transpose()?;
 
     let needs = update_preset.needs();
     let sync_every_group = matches!(args.sync, crate::args::SyncArg::EveryGroup);
@@ -3160,14 +3159,15 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
                 })?;
 
             let group_passed = group.samples.iter().filter(|s| s.passed()).count();
+            let group_zero_variance = train::cc_harness::zero_variance(&group.samples);
             rollouts += group.samples.len();
             passed += group_passed;
             tasks_passed += usize::from(group_passed > 0);
-            zero_variance_groups += usize::from(train::cc_harness::zero_variance(&group.samples));
+            zero_variance_groups += usize::from(group_zero_variance);
             if let Some(sel) = selection.as_mut() {
                 sel.record(
                     group_idx,
-                    train::cc_harness::zero_variance(&group.samples),
+                    group_zero_variance,
                     group_passed as f32 / group.samples.len().max(1) as f32,
                 );
             }
@@ -3211,7 +3211,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
                 "rewards": rewards,
                 "reward_mean": reward_mean,
                 "reward_std": reward_std,
-                "zero_variance": train::cc_harness::zero_variance(&group.samples),
+                "zero_variance": group_zero_variance,
                 "passed": group_passed,
                 "edited": group.samples.iter().filter(|s| s.edited).count(),
                 "prompt_tokens": g_prompt,
@@ -3276,39 +3276,53 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
                     traj.rollout_logprobs = Some(lp);
                 }
             }
-            let update_started = Instant::now();
-            let report = train::aopd_profile::time_try("update", train::aopd_profile::GPU, || {
-                update_preset.update(
-                    &batch,
-                    &student,
-                    all_params.as_slice(),
-                    trainable.as_slice(),
-                    &mut optimizer,
-                    value_critic.as_mut(),
-                    vocab,
-                    args.writeback_window,
-                    &mut store,
-                )
-            })
-            .map_err(anyhow::Error::from)?;
-            losses.push(report.loss);
-            metrics.append(&serde_json::json!({
-                "kind": "update",
-                "round": round,
-                "group": group_idx,
-                "preset": preset_name,
-                "trajectories": report.trained,
-                "tokens_trained": report.tokens,
-                "policy_loss": report.loss,
-                "critic_mse": report.critic_mse,
-                "kl_rollout": report.stats.kl_mean(),
-                "is_ratio_mean": report.stats.ratio_mean(),
-                "is_ratio_max": report.stats.ratio_max,
-                "clip_frac": report.stats.clip_frac(),
-                "adv_mean": report.adv_mean,
-                "adv_std": report.adv_std,
-                "update_secs": update_started.elapsed().as_secs_f64(),
-            }));
+            // One update + its metrics row; `extra` carries the arm-specific
+            // fields (fresh: group; replay: group/task_id/replayed/age).
+            let mut run_update = |batch: &[train::update_strategy::ScoredTrajectory],
+                                  extra: serde_json::Value|
+             -> Result<()> {
+                let update_started = Instant::now();
+                let report =
+                    train::aopd_profile::time_try("update", train::aopd_profile::GPU, || {
+                        update_preset.update(
+                            batch,
+                            &student,
+                            all_params.as_slice(),
+                            trainable.as_slice(),
+                            &mut optimizer,
+                            value_critic.as_mut(),
+                            vocab,
+                            args.writeback_window,
+                            &mut store,
+                        )
+                    })
+                    .map_err(anyhow::Error::from)?;
+                losses.push(report.loss);
+                let mut row = serde_json::json!({
+                    "kind": "update",
+                    "round": round,
+                    "preset": preset_name,
+                    "trajectories": report.trained,
+                    "tokens_trained": report.tokens,
+                    "policy_loss": report.loss,
+                    "critic_mse": report.critic_mse,
+                    "kl_rollout": report.stats.kl_mean(),
+                    "is_ratio_mean": report.stats.ratio_mean(),
+                    "is_ratio_max": report.stats.ratio_max,
+                    "clip_frac": report.stats.clip_frac(),
+                    "adv_mean": report.adv_mean,
+                    "adv_std": report.adv_std,
+                    "update_secs": update_started.elapsed().as_secs_f64(),
+                });
+                if let serde_json::Value::Object(extra) = extra {
+                    row.as_object_mut()
+                        .expect("update row is an object")
+                        .extend(extra);
+                }
+                metrics.append(&row);
+                Ok(())
+            };
+            run_update(&batch, serde_json::json!({ "group": group_idx }))?;
 
             // Experience replay (fresh-anchored: only after the fresh group
             // trained). Stored batches carry the behavior logprobs captured at
@@ -3316,44 +3330,16 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
             // fresh batch is pushed AFTER drawing (first drawable next group).
             if let Some((buffer, rng)) = replay.as_mut() {
                 for entry in buffer.draw(round, args.replay_reuse, rng) {
-                    let update_started = Instant::now();
-                    let report =
-                        train::aopd_profile::time_try("update", train::aopd_profile::GPU, || {
-                            update_preset.update(
-                                &entry.batch,
-                                &student,
-                                all_params.as_slice(),
-                                trainable.as_slice(),
-                                &mut optimizer,
-                                value_critic.as_mut(),
-                                vocab,
-                                args.writeback_window,
-                                &mut store,
-                            )
-                        })
-                        .map_err(anyhow::Error::from)?;
-                    losses.push(report.loss);
+                    run_update(
+                        &entry.batch,
+                        serde_json::json!({
+                            "group": entry.batch[0].group_id,
+                            "task_id": entry.task_id,
+                            "replayed": true,
+                            "age": round - entry.round,
+                        }),
+                    )?;
                     replayed_groups += 1;
-                    metrics.append(&serde_json::json!({
-                        "kind": "update",
-                        "round": round,
-                        "group": entry.batch[0].group_id,
-                        "task_id": entry.task_id,
-                        "preset": preset_name,
-                        "replayed": true,
-                        "age": round - entry.round,
-                        "trajectories": report.trained,
-                        "tokens_trained": report.tokens,
-                        "policy_loss": report.loss,
-                        "critic_mse": report.critic_mse,
-                        "kl_rollout": report.stats.kl_mean(),
-                        "is_ratio_mean": report.stats.ratio_mean(),
-                        "is_ratio_max": report.stats.ratio_max,
-                        "clip_frac": report.stats.clip_frac(),
-                        "adv_mean": report.adv_mean,
-                        "adv_std": report.adv_std,
-                        "update_secs": update_started.elapsed().as_secs_f64(),
-                    }));
                 }
                 buffer.push(round, group.task_id.clone(), batch);
             }
