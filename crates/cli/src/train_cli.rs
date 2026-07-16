@@ -537,6 +537,86 @@ impl TaskSelection {
     }
 }
 
+/// P8 experience replay: age-bounded, |A|-prioritized buffer of trained
+/// groups. Entries keep the batch as trained — including the behavior
+/// logprobs captured at FIRST use, so a replayed update's IS ratio is taken
+/// against the true π_behavior instead of a recomputed ratio ≈ 1.
+/// Fresh-anchored by call order: the round loop draws AFTER the fresh
+/// group's update and pushes after drawing, so an entry is first drawable
+/// at the next draw.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+#[derive(Clone)]
+struct ReplayEntry {
+    batch: Vec<train::update_strategy::ScoredTrajectory>,
+    task_id: String,
+    round: usize,
+    priority: f32,
+}
+
+/// Survey-grounded staleness bound: evict entries older than 10 rounds.
+const REPLAY_MAX_AGE: usize = 10;
+
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+#[derive(Default)]
+struct ReplayBuffer {
+    entries: Vec<ReplayEntry>,
+}
+
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+impl ReplayBuffer {
+    /// Priority = mean |reward − group mean|; 0 ⇔ zero-variance (nothing to learn).
+    fn priority(rewards: &[f32]) -> f32 {
+        if rewards.is_empty() {
+            return 0.0;
+        }
+        let mean = rewards.iter().sum::<f32>() / rewards.len() as f32;
+        rewards.iter().map(|r| (r - mean).abs()).sum::<f32>() / rewards.len() as f32
+    }
+
+    /// Zero-variance groups never enter the buffer.
+    fn push(
+        &mut self,
+        round: usize,
+        task_id: String,
+        batch: Vec<train::update_strategy::ScoredTrajectory>,
+    ) {
+        let rewards: Vec<f32> = batch.iter().map(|t| t.reward).collect();
+        let priority = Self::priority(&rewards);
+        if priority > 0.0 {
+            self.entries.push(ReplayEntry {
+                batch,
+                task_id,
+                round,
+                priority,
+            });
+        }
+    }
+
+    /// Evict age > [`REPLAY_MAX_AGE`], then draw up to `n` entries without
+    /// replacement, P(entry) ∝ priority — deterministic given the fixed-seed rng.
+    fn draw(&mut self, round: usize, n: usize, rng: &mut PromptSampler) -> Vec<ReplayEntry> {
+        self.entries.retain(|e| round - e.round <= REPLAY_MAX_AGE);
+        let mut pool: Vec<usize> = (0..self.entries.len()).collect();
+        let mut out = Vec::new();
+        while out.len() < n && !pool.is_empty() {
+            let total: f64 = pool
+                .iter()
+                .map(|&i| f64::from(self.entries[i].priority))
+                .sum();
+            let mut x = rng.next_unit() * total;
+            let pick = pool
+                .iter()
+                .position(|&i| {
+                    x -= f64::from(self.entries[i].priority);
+                    x <= 0.0
+                })
+                .unwrap_or(pool.len() - 1);
+            out.push(self.entries[pool.remove(pick)].clone());
+        }
+        out
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct OpdLrSchedule {
     mode: LrScheduleArg,
@@ -3018,6 +3098,16 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
     }
     let preset_name = clap::ValueEnum::to_possible_value(&args.update_strategy)
         .map_or_else(String::new, |v| v.get_name().to_owned());
+    if args.replay_reuse > 0 && !needs.rollout_logprobs {
+        bail!(
+            "--replay-reuse {} with --update-strategy {preset_name}: the preset has no IS ratio \
+             (ratio == None), so replayed groups would be uncorrected off-policy. Use a \
+             ratio-weighted preset (grpo | dapo | dr-grpo | gspo | cispo | sao-*).",
+            args.replay_reuse
+        );
+    }
+    let mut replay =
+        (args.replay_reuse > 0).then(|| (ReplayBuffer::default(), PromptSampler::new(0x5EED_1A7)));
     for round in 0..args.rounds {
         // Anchor the per-stage profiler (human table opt-in via ARLE_AOPD_PROFILE).
         train::aopd_profile::begin_round();
@@ -3034,6 +3124,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
         let mut losses: Vec<f32> = Vec::new();
         let (mut rollouts, mut passed, mut tasks_passed, mut zero_variance_groups) =
             (0usize, 0usize, 0usize, 0usize);
+        let mut replayed_groups = 0usize;
         let mut reward_sum = 0.0f64;
         let (mut prompt_tokens, mut completion_tokens) = (0u64, 0u64);
         let mut sync_lora_secs = 0.0f64;
@@ -3219,6 +3310,54 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
                 "update_secs": update_started.elapsed().as_secs_f64(),
             }));
 
+            // Experience replay (fresh-anchored: only after the fresh group
+            // trained). Stored batches carry the behavior logprobs captured at
+            // first use, so the preset's IS ratio corrects staleness; the
+            // fresh batch is pushed AFTER drawing (first drawable next group).
+            if let Some((buffer, rng)) = replay.as_mut() {
+                for entry in buffer.draw(round, args.replay_reuse, rng) {
+                    let update_started = Instant::now();
+                    let report =
+                        train::aopd_profile::time_try("update", train::aopd_profile::GPU, || {
+                            update_preset.update(
+                                &entry.batch,
+                                &student,
+                                all_params.as_slice(),
+                                trainable.as_slice(),
+                                &mut optimizer,
+                                value_critic.as_mut(),
+                                vocab,
+                                args.writeback_window,
+                                &mut store,
+                            )
+                        })
+                        .map_err(anyhow::Error::from)?;
+                    losses.push(report.loss);
+                    replayed_groups += 1;
+                    metrics.append(&serde_json::json!({
+                        "kind": "update",
+                        "round": round,
+                        "group": entry.batch[0].group_id,
+                        "task_id": entry.task_id,
+                        "preset": preset_name,
+                        "replayed": true,
+                        "age": round - entry.round,
+                        "trajectories": report.trained,
+                        "tokens_trained": report.tokens,
+                        "policy_loss": report.loss,
+                        "critic_mse": report.critic_mse,
+                        "kl_rollout": report.stats.kl_mean(),
+                        "is_ratio_mean": report.stats.ratio_mean(),
+                        "is_ratio_max": report.stats.ratio_max,
+                        "clip_frac": report.stats.clip_frac(),
+                        "adv_mean": report.adv_mean,
+                        "adv_std": report.adv_std,
+                        "update_secs": update_started.elapsed().as_secs_f64(),
+                    }));
+                }
+                buffer.push(round, group.task_id.clone(), batch);
+            }
+
             // Sync the trained LoRA into the serve engine (atomic re-merge +
             // prefix-cache drop in one engine-thread closure); every-round
             // syncs once, at the last group. Then re-acquire the KV pool for
@@ -3360,6 +3499,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
             "passed": passed,
             "pass_at_k": tasks_passed as f32 / groups as f32,
             "zero_variance_group_frac": zero_variance_groups as f32 / groups as f32,
+            "replayed_groups": replayed_groups,
             "reward_mean": reward_sum / rollouts.max(1) as f64,
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
@@ -4820,10 +4960,59 @@ mod tests {
     use train::{qwen35::Qwen35Model, qwen35_loader::load_qwen35_from_hf_dir};
 
     use super::{
-        OpdLrSchedule, OpdStepMetric, PretrainPresetArg, PromptSampler, ScratchShape,
+        OpdLrSchedule, OpdStepMetric, PretrainPresetArg, PromptSampler, ReplayBuffer, ScratchShape,
         TaskSelection, current_grad_norm, default_cosine_warmup_steps, embedded_tiny_qwen35_config,
         kl_mask_arg, maybe_save_full_student_checkpoint, opd_summary, validate_prompt_collection,
     };
+
+    #[test]
+    fn replay_buffer_retention_math() {
+        let batch = |rewards: &[f32]| -> Vec<train::update_strategy::ScoredTrajectory> {
+            rewards
+                .iter()
+                .map(|&reward| train::update_strategy::ScoredTrajectory {
+                    prompt_ids: vec![1],
+                    response_ids: vec![2],
+                    response_mask: vec![1],
+                    reward,
+                    rollout_logprobs: Some(vec![-0.5]),
+                    group_id: 0,
+                    truncated: false,
+                })
+                .collect()
+        };
+        // Priority = mean |reward − group mean|; zero-variance ⇒ 0.
+        assert_eq!(ReplayBuffer::priority(&[1.0, 1.0]), 0.0);
+        assert_eq!(ReplayBuffer::priority(&[0.0, 1.0]), 0.5);
+        assert_eq!(ReplayBuffer::priority(&[]), 0.0);
+
+        let mut rng = PromptSampler::new(7);
+        let mut buf = ReplayBuffer::default();
+        // Zero-variance groups never enter.
+        buf.push(0, "zv".into(), batch(&[1.0, 1.0, 1.0]));
+        assert!(buf.entries.is_empty());
+        // Fresh-anchoring order: a draw made before the push cannot see it …
+        assert!(buf.draw(0, 4, &mut rng).is_empty());
+        buf.push(0, "a".into(), batch(&[0.0, 1.0]));
+        // … and the next draw can.
+        assert_eq!(buf.draw(0, 4, &mut rng).len(), 1);
+
+        // Priority ordering: P(draw) ∝ priority — an overwhelming-priority
+        // entry is drawn first, without replacement within one call.
+        buf.push(1, "b".into(), batch(&[0.0, 1000.0]));
+        let drawn = buf.draw(1, 2, &mut rng);
+        assert_eq!(drawn.len(), 2);
+        assert_eq!(drawn[0].task_id, "b");
+        assert_eq!(drawn[1].task_id, "a");
+        // Drawing clones; entries stay for reuse.
+        assert_eq!(buf.entries.len(), 2);
+
+        // Age eviction: "a" (round 0) survives a draw at round 10, not 11.
+        assert_eq!(buf.draw(10, 4, &mut rng).len(), 2);
+        let survivors = buf.draw(11, 4, &mut rng);
+        assert_eq!(survivors.len(), 1);
+        assert_eq!(survivors[0].task_id, "b");
+    }
 
     #[test]
     fn task_selection_skip_retire_math() {
