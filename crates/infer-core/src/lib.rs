@@ -624,6 +624,8 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             }
         }
 
+        self.executor.poll_background()?;
+
         let budget = self.governor.step_budget();
         if self.governor.should_yield() || budget.max_tokens == 0 || budget.max_micros == 0 {
             if diag {
@@ -1827,6 +1829,39 @@ mod testing {
         }
     }
 
+    pub(super) struct BackgroundPublishExecutor {
+        pub(super) inner: MockExecutor,
+        pub(super) ready: std::rc::Rc<std::cell::Cell<bool>>,
+        pub(super) pending: std::rc::Rc<std::cell::Cell<bool>>,
+    }
+
+    impl BackendExecutor for BackgroundPublishExecutor {
+        type Inflight = MockInflight;
+
+        fn submit(&mut self, plan: &ForwardPlan, kv: &mut dyn KvPool) -> Result<Self::Inflight> {
+            self.inner.submit(plan, kv)
+        }
+
+        fn poll(&mut self, inflight: Self::Inflight) -> Result<PollResult<Self::Inflight>> {
+            self.inner.poll(inflight)
+        }
+
+        fn poll_background(&mut self) -> Result<()> {
+            if self.pending.replace(false) {
+                self.ready.set(true);
+            }
+            Ok(())
+        }
+
+        fn reusable_prefix_blocks(&self, blocks: &[PrefixBlock]) -> usize {
+            if self.ready.get() {
+                pages_only_reusable_prefix_blocks(blocks, |_| false)
+            } else {
+                0
+            }
+        }
+    }
+
     #[derive(Debug, Clone)]
     pub(super) struct SingleRowExecutor {
         inner: MockExecutor,
@@ -2726,11 +2761,11 @@ mod tests {
     use infer_seam::{BufferedDiffusionExecutor, HostPagedKvPool, KvAllocator, KvQuery};
 
     use super::testing::{
-        AlignedPrefixExecutor, DeviceMirrorExecutor, HoldGovernor, HybridReprefillMirror,
-        LimitedPrefixExecutor, MockExecutor, MockKvPool, RestoreAlignmentExecutor,
-        SamplingExecutor, SidecarMissExecutor, SingleRowExecutor, SlotTierMockExecutor,
-        SpecMirrorExecutor, StopTokenExecutor, TierMockExecutor, TokenBudgetGovernor,
-        WarmupCountingExecutor,
+        AlignedPrefixExecutor, BackgroundPublishExecutor, DeviceMirrorExecutor, HoldGovernor,
+        HybridReprefillMirror, LimitedPrefixExecutor, MockExecutor, MockKvPool,
+        RestoreAlignmentExecutor, SamplingExecutor, SidecarMissExecutor, SingleRowExecutor,
+        SlotTierMockExecutor, SpecMirrorExecutor, StopTokenExecutor, TierMockExecutor,
+        TokenBudgetGovernor, WarmupCountingExecutor,
     };
     use super::*;
 
@@ -4531,6 +4566,38 @@ mod tests {
             "trim-then-clamp must land on the 2-block-aligned boundary"
         );
         assert_eq!(request.reused_prefix_pages.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn background_completion_is_published_before_admission_lookup() -> Result<()> {
+        let ready = std::rc::Rc::new(std::cell::Cell::new(true));
+        let pending = std::rc::Rc::new(std::cell::Cell::new(false));
+        let mut engine = Engine::with_config(
+            BackgroundPublishExecutor {
+                inner: MockExecutor::ready(),
+                ready: ready.clone(),
+                pending: pending.clone(),
+            },
+            MockKvPool::with_capacity(1, 4, 8),
+            test_config(1),
+        );
+        let prompt: Vec<u32> = (1..=8).collect();
+        let first = engine.submit_request(prompt.clone(), 1);
+        engine.run_to_idle()?;
+        assert_finished(engine.completed(first).expect("first completed"));
+
+        ready.set(false);
+        pending.set(true);
+        let second = engine.submit_request(prompt, 1);
+        engine.step()?;
+        let (_, request) = engine
+            .active
+            .iter()
+            .find(|(_, request)| request.handle == second)
+            .expect("second admitted");
+        assert_eq!(request.reused_prefix_pages.len(), 1);
+        assert!(!pending.get());
         Ok(())
     }
 

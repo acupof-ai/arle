@@ -600,6 +600,10 @@ pub(crate) type LayerFlashMlaAndMlaDecode<'a> = (
 );
 
 impl Dsv4KvAdapter {
+    pub(crate) fn slot_epoch(&self, slot: usize) -> Option<u64> {
+        self.slot_epochs.get(slot).copied().flatten()
+    }
+
     pub(crate) fn new(
         ctx: &DeviceContext,
         config: &DeepSeekV4Config,

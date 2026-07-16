@@ -1486,7 +1486,7 @@ impl Dsv4SlotState {
     /// page's own content + carry (boundary) PLUS the sub-page tail the radix
     /// match can't cover (`[matched_len, finish_len)`). `page_index =
     /// matched_len/page_tokens − 1`; the whole carry reflects `finish_len`
-    /// because capture runs at the finish sync point.
+    /// because capture runs after the finish forward.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn capture_frontier_page(
         &self,
