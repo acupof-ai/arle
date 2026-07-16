@@ -115,13 +115,14 @@ impl Dsv4MlaKvArena {
 /// Compressor sub-block for CSA/HCA layers (`compress_ratio > 0`): projects the
 /// wide hidden into the compressed-key latent stream the sparse attention reads.
 /// `wkv`/`wgate` may be FP8/FP4 block-scaled or bf16 (`dsv4_linear` dispatches on
-/// `weight_format`); the main-value probe optionally retains checkpoint BF16
-/// projections and F32 APE. The indexer and default path stay unchanged.
+/// `weight_format`); the main-value probe retains BF16 input projections and F32
+/// APE for the FP32 compressor forward. The indexer and default path stay
+/// unchanged.
 pub(crate) struct Dsv4Compressor {
     pub wkv: DeviceMatrix,
     pub wgate: DeviceMatrix,
     pub ape: DeviceMatrix,
-    pub fp32_probe: Option<Dsv4CompressorFp32Probe>,
+    pub fp32_probe: Dsv4CompressorFp32Probe,
     pub norm: DeviceVec,
     /// DeepGEMM repacks of the FP8 `wkv`/`wgate` projections for the batched (m=N)
     /// decode pre-pass — tensor-core `sm90_fp8_gemm_1d2d` instead of the scalar

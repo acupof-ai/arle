@@ -4544,7 +4544,7 @@ impl SafetensorLoader {
         };
         let wkv = load_matrix(&names.wkv)?;
         let wgate = load_matrix(&names.wgate)?;
-        let fp32_probe = Some({
+        let fp32_probe = {
             let tensor = self.borrow_raw_tensor(&names.ape)?;
             ensure!(
                 tensor.shape.len() == 2,
@@ -4574,7 +4574,7 @@ impl SafetensorLoader {
                     .clone_htod(&values)
                     .map_err(|e| anyhow!("upload f32 compressor APE {}: {e}", names.ape))?,
             }
-        });
+        };
         Ok(crate::dsv4::Dsv4Compressor {
             wkv_deepgemm: self.decode_proj_cache(ctx, &wkv)?,
             wgate_deepgemm: self.decode_proj_cache(ctx, &wgate)?,
