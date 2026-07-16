@@ -2147,28 +2147,40 @@ fn run_cc_eval(
     Ok(pass_rate)
 }
 
-/// Block until the serve engine has no in-flight requests. The group's cc
-/// children have exited by the time this runs, so this only drains stragglers
-/// (e.g. an aborted stream the engine is still finishing) — a live request
-/// during the weight re-merge / KV-pool drop would read stale or freed state.
+/// Drain the serve engine before the weight re-merge / KV-pool drop. The
+/// group's cc children have exited by the time this runs, so any request still
+/// in flight is an orphan by definition (its client is dead) — cancel them all,
+/// then REQUIRE active_requests == 0: a live request past this point reads
+/// stale or freed engine state (the P4 baseline's engine-thread panic).
 #[cfg(feature = "cuda")]
 fn quiesce_serve(
     engine: &std::sync::Arc<std::sync::Mutex<infer_api::LoadedInferenceEngine>>,
 ) -> Result<()> {
     use infer_api::InferenceEngine as _;
 
+    let lock = || {
+        engine
+            .lock()
+            .map_err(|err| anyhow!("LoadedInferenceEngine lock poisoned: {err}"))
+    };
+    let cancelled = lock()?.cancel_all_requests()?;
+    if cancelled > 0 {
+        eprintln!("[agent-opd] quiesce: cancelled {cancelled} orphaned request(s)");
+    }
     let started = Instant::now();
     let mut next_warn = 10u64;
     loop {
-        let active = engine
-            .lock()
-            .map_err(|err| anyhow!("LoadedInferenceEngine lock poisoned: {err}"))?
-            .telemetry()
-            .active_requests;
+        let active = lock()?.telemetry().active_requests;
         if active == 0 {
             return Ok(());
         }
         let elapsed = started.elapsed().as_secs();
+        anyhow::ensure!(
+            elapsed < 60,
+            "quiesce: {active} request(s) still active {elapsed}s after cancellation — \
+             refusing to proceed (a live request during weight re-merge / KV drop \
+             corrupts the engine)"
+        );
         if elapsed >= next_warn {
             eprintln!("[agent-opd] quiesce: {active} request(s) still active after {elapsed}s");
             next_warn += 10;
