@@ -1,0 +1,37 @@
+crates/autograd/src/ops/fused_linear_distill.rs
+  s_67038b17df7668::t_473c43ab332318 703-704,710-711,719-720,728-739,883,1016
+crates/cli/src/args.rs
+  s_8f872b9640eadf::t_d99ca80f3d7e82 215-223,1926-1938
+crates/cli/src/train_cli.rs
+  s_8f872b9640eadf::t_df1e5f92dfa57d 1942-1943,1945,2003-2134,2325,2338,2639,2643,2658,2682,2686,2714-2720,2747,2757,2760,2762-2765,2782-2799,2979-2981,2983-2986,2988-2989,2996,2999,3002,3005-3008,3010,3012-3013,3021-3205,3208-3209,3213-3215,3223-3224,3233,3237,3278-3302,3308
+crates/train/src/aopd_profile.rs
+  s_8f872b9640eadf::t_41fe2301d4c188 3-5,62-75,93
+crates/train/src/update_strategy.rs
+  s_8f872b9640eadf::t_81684e932b50dc 128-143,288-289,302,305,332,379-383,412-416,489-493,497,510-523,599,601,617,619-624
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "a46ab3388cedb5ea23343e4d1e85ff5bbd9512c0",
+  "prompts": {},
+  "sessions": {
+    "s_67038b17df7668": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c4b3468e-feff-42b1-aa89-1f360f19b20b",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_8f872b9640eadf": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a7be0e1d9e53cc820",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
