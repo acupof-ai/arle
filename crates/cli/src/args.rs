@@ -212,6 +212,15 @@ pub(crate) enum GkdTeacherArg {
     SelfFrozen,
 }
 
+/// `agent-opd --sync`: when the trained LoRA re-merges into the serve engine.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+pub(crate) enum SyncArg {
+    /// After every task group (strict on-policy; default).
+    EveryGroup,
+    /// Once at round end (fewer merges; intra-round rollouts go stale).
+    EveryRound,
+}
+
 /// Policy-update preset for `agent-opd` (`--update-strategy`). Each value maps
 /// to a `train::update_strategy::UpdatePreset` constructor — the algorithm is
 /// data, not a code path; see `TrainAgentOpdArgs::update_preset`.
@@ -1913,6 +1922,19 @@ pub(crate) struct TrainAgentOpdArgs {
     /// Agent rollouts generated per task each round (best-of-N).
     #[arg(long, default_value_t = 4)]
     pub(crate) samples_per_prompt: usize,
+
+    /// Port the in-process serve binds on 127.0.0.1 for the cc rollout harness.
+    #[arg(long, default_value_t = 8000)]
+    pub(crate) serve_port: u16,
+
+    /// Per-sample `claude -p` wall-clock cap (seconds); the child process
+    /// group is killed on expiry.
+    #[arg(long, default_value_t = 600)]
+    pub(crate) cc_timeout: u64,
+
+    /// Weight-sync cadence into the rollout serve.
+    #[arg(long, value_enum, default_value_t = SyncArg::EveryGroup)]
+    pub(crate) sync: SyncArg,
 
     /// Max agent turns (tool sub-turns) per rollout.
     #[arg(long, default_value_t = 30)]

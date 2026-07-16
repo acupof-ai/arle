@@ -700,12 +700,15 @@ pub enum WeightForm {
 }
 
 /// Off-policy diagnostics accumulated by [`fused_linear_pg_loss_indexed`]:
-/// Schulman k3 KL(π_b‖πθ) `Σ(r−1−ln r)` plus the gate/clamp reject count.
+/// Schulman k3 KL(π_b‖πθ) `Σ(r−1−ln r)`, the gate/clamp reject count, and the
+/// raw importance-ratio sum/max (off-policy blow-up telemetry).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct PgStats {
     pub kl_sum: f64,
     pub clipped: usize,
     pub tokens: usize,
+    pub ratio_sum: f64,
+    pub ratio_max: f64,
 }
 
 impl PgStats {
@@ -713,12 +716,26 @@ impl PgStats {
         self.kl_sum += other.kl_sum;
         self.clipped += other.clipped;
         self.tokens += other.tokens;
+        self.ratio_sum += other.ratio_sum;
+        self.ratio_max = self.ratio_max.max(other.ratio_max);
     }
     pub fn kl_mean(&self) -> f64 {
         self.kl_sum / self.tokens.max(1) as f64
     }
     pub fn clip_frac(&self) -> f64 {
         self.clipped as f64 / self.tokens.max(1) as f64
+    }
+    pub fn ratio_mean(&self) -> f64 {
+        self.ratio_sum / self.tokens.max(1) as f64
+    }
+    fn observe(&mut self, logp: f32, rollout_logp: f32, clipped: bool) {
+        let d = f64::from(logp - rollout_logp);
+        let r = d.exp();
+        self.kl_sum += r - 1.0 - d;
+        self.clipped += usize::from(clipped);
+        self.tokens += 1;
+        self.ratio_sum += r;
+        self.ratio_max = self.ratio_max.max(r);
     }
 }
 
@@ -863,10 +880,7 @@ pub fn fused_linear_pg_loss_indexed(
             // Detached weight: ratio/gate/base are constants, no grad path.
             let r = (logp - rollout_logprobs[local]).exp();
             let (w, clipped) = pg_token_weight(form, token_weight[local], r, kl_coef);
-            let d = f64::from(logp - rollout_logprobs[local]);
-            stats.kl_sum += d.exp() - 1.0 - d;
-            stats.clipped += usize::from(clipped);
-            stats.tokens += 1;
+            stats.observe(logp, rollout_logprobs[local], clipped);
             loss_sum -= w * logp;
 
             // d_logits = w · (softmax − onehot), the CE gradient scaled by w.
@@ -999,10 +1013,7 @@ fn fused_linear_pg_loss_indexed_device(
             let idx = chunk_start + offset;
             let r = (logp - rollout_logprobs[idx]).exp();
             let (w, clipped) = pg_token_weight(form, token_weight[idx], r, kl_coef);
-            let d = f64::from(logp - rollout_logprobs[idx]);
-            stats.kl_sum += d.exp() - 1.0 - d;
-            stats.clipped += usize::from(clipped);
-            stats.tokens += 1;
+            stats.observe(logp, rollout_logprobs[idx], clipped);
             neg_w.push(-w);
         }
         let neg_w_id = store.from_slice(&neg_w, &[chunk_len])?;
