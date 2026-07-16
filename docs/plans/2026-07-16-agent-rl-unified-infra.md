@@ -219,6 +219,63 @@ between both sources at staleness 0 = the numerics-noise floor.
 Added gate: **F.5** — co-residency VRAM ledger (KV pool + activations) before
 enabling `--staleness 1`; **F.6** — logprob-source ratio-floor measurement.
 
+## H. Async & extreme-acceleration roadmap (deep-survey verdict, 2026-07-16)
+
+Ground truth for this scale: **rollout is 96% of a LoRA-RL run** (Unsloth FP8+LoRA
+measurement; Arnal: >80% fleet-wide). Train-step levers (packing, recompute) are
+~nil end-to-end here. The published lever stack, ranked for one H20:
+
+1. **Concurrency to the KV ceiling + 3-stage CPU pipeline** (init / agent-run /
+   score as bounded-queue pools). Sync batching runs 20-40% GPU util; SkyRL-Agent
+   holds ~90% once init/reward leave the critical path; Polar 20.4%→87.7%.
+   ROLL-Flash env-level async: 2.72× agentic at equal GPU. Our 4-way is far below
+   the ceiling; VRAM multiplexing (shared FP8 base — we have it; reclaim trainer
+   state during generation — our KV-release dance, inverted) is what RAISES the
+   ceiling.
+2. **Sample-efficiency beats systems work**: zero-variance groups are 51-66% of
+   GRPO groups (worse at K=4: p⁴+(1-p)⁴ = 66% at p=0.9) — full rollout cost, zero
+   gradient. GRESO predictive skip 2.0×; AERO staged probe 1.8-1.9×; SPEED-RL
+   difficulty targeting 2-6×; task retirement >0.9 pass. Lives in the harness
+   scheduler + `UpdatePreset.filter`, not in kernels.
+3. **Staleness 1-2 + token-TIS is the published safe envelope** (AReaL η≤8 within
+   1%; PRIME-RL IcePop [0.5,5] masking; M2PO stale-256). Doubly mandatory for us:
+   FP8-serve vs bf16-train numerics mismatch (token KL ~1e-2 measured elsewhere)
+   is the SAME correction — one mechanism covers quantization mismatch + async
+   staleness. Our DIS hard gate is already this family.
+4. **Experience replay 2-5× reuse** (age-bound ~10 steps, fresh-anchored,
+   |advantage|-prioritized): ~40% compute saved; our inference/train cost ratio is
+   the extreme-replay regime.
+5. **Spec decode in rollout is distribution-lossless** (rejection sampling):
+   training-free suffix-tree drafter (DAS) 25-50%; SPEC-RL reuses prev-epoch
+   rollouts as drafts 2-3×; drafter staleness a non-issue at LoRA drift.
+6. **OPD/privileged self-distillation is the only ~10× class move**: HDPO/OPSD
+   distill from the model-itself-with-privileged-context (failing pytest output /
+   reference patch) on all-fail tasks — no external teacher; rescues exactly the
+   zero-gradient tail. Our GKD machinery + `KlReg{reference: Teacher}` slot is
+   the landing zone.
+
+**Blueprint corrections from the survey critic:**
+- **Re-merge is a requant loop, not a free sync.** Folding bf16 LoRA into the FP8
+  base each sync = dequant→add→requant; per-sync quantization ε (bounded if the
+  pristine base is kept; still ε vs exact). Structural alternative: **adapter-
+  separate serving** (LoRA GEMM at inference atop the frozen base — rank-16 cost
+  is tiny), which makes sync a true sub-ms adapter swap. Gate **F.7**: measure
+  merged-vs-separate logit drift + decide; do not assert either way.
+- **Prefix flush-vs-keep, one policy**: PipelineRL measures stale-KV ≈ recompute
+  (only slightly higher divergence) — with generation-time behavior logprobs +
+  token-TIS, keeping KV across adapter swaps is IS-covered; flush stays the
+  conservative default until F.7/F.1 evidence.
+- **Polar (arXiv 2605.24220) independently validates the whole shape**: RL through
+  unmodified Claude Code via an API proxy recording token IDs + logprobs
+  (= our §G.3 engine-native capture), prefix-merged traces (1185→218, 5.39×
+  step time), +4.8 SWE-Bench-Verified through CC on a 4B. Also: KAT-Coder-V2.5,
+  Agent Lightning, verifiers-v1 — harness-in-the-loop is published practice.
+
+Sequencing: T3 lands levers 1+3 structurally (concurrent driver, sample-level
+pipeline, staleness dial); lever 2 is a T4-adjacent scheduler feature
+(pass-rate-driven task selection reading metrics.jsonl); levers 4-6 are
+post-T6 roadmap items, each behind its own gate.
+
 ## Field grounding (mid-2026 survey)
 
 verl/NeMo-RL converged on **two pure functions over masked token tensors**
