@@ -420,6 +420,65 @@ pub fn serve_http(opts: ServeHttpOptions) -> Result<()> {
     )
 }
 
+#[cfg(any(
+    feature = "metal",
+    feature = "cuda",
+    feature = "hip",
+    feature = "vulkan",
+    feature = "cpu"
+))]
+async fn shutdown_signal(shutdown: infer_server::ServeShutdown, process_signals: bool) {
+    // SIGINT or SIGTERM (kill/pod_serve.sh/orchestrators send SIGTERM): without
+    // handling SIGTERM the coordinator dies un-gracefully (drop(guard) skipped) → TP
+    // workers reaped mid-NCCL-collective → wedged/leaked GPU contexts.
+    // `process_signals: false` (background server inside a training process):
+    // installing a handler would swallow the default-kill SIGTERM while only the
+    // HTTP loop exits — wait exclusively on the programmatic token instead.
+    #[cfg(unix)]
+    let terminate = async {
+        if !process_signals {
+            std::future::pending::<()>().await;
+        }
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                term.recv().await;
+            }
+            Err(e) => {
+                log::warn!(
+                    "SIGTERM handler install failed ({e}); SIGTERM won't shut down gracefully"
+                );
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    let ctrl_c = async {
+        if !process_signals {
+            std::future::pending::<()>().await;
+        }
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    // Programmatic teardown (#135): `ServeShutdown::request()` from the
+    // coordinator's fatal lockstep path must also unwind this loop — signals
+    // alone would leave the HTTP server (and thus the worker guard) alive.
+    let requested = async {
+        while !shutdown.is_requested() {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+    };
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+        _ = requested => {}
+    }
+    shutdown.request();
+    log::info!("shutdown signal received");
+}
+
 #[cfg(test)]
 mod tests {
     use super::{EngineLoadConfig, validate_kv_ssd_config};
@@ -486,63 +545,4 @@ mod tests {
         assert_eq!(parsed.kv_ssd_root, None);
         assert_eq!(parsed.kv_disk_limit, None);
     }
-}
-
-#[cfg(any(
-    feature = "metal",
-    feature = "cuda",
-    feature = "hip",
-    feature = "vulkan",
-    feature = "cpu"
-))]
-async fn shutdown_signal(shutdown: infer_server::ServeShutdown, process_signals: bool) {
-    // SIGINT or SIGTERM (kill/pod_serve.sh/orchestrators send SIGTERM): without
-    // handling SIGTERM the coordinator dies un-gracefully (drop(guard) skipped) → TP
-    // workers reaped mid-NCCL-collective → wedged/leaked GPU contexts.
-    // `process_signals: false` (background server inside a training process):
-    // installing a handler would swallow the default-kill SIGTERM while only the
-    // HTTP loop exits — wait exclusively on the programmatic token instead.
-    #[cfg(unix)]
-    let terminate = async {
-        if !process_signals {
-            std::future::pending::<()>().await;
-        }
-        use tokio::signal::unix::{SignalKind, signal};
-        match signal(SignalKind::terminate()) {
-            Ok(mut term) => {
-                term.recv().await;
-            }
-            Err(e) => {
-                log::warn!(
-                    "SIGTERM handler install failed ({e}); SIGTERM won't shut down gracefully"
-                );
-                std::future::pending::<()>().await;
-            }
-        }
-    };
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-    let ctrl_c = async {
-        if !process_signals {
-            std::future::pending::<()>().await;
-        }
-        let _ = tokio::signal::ctrl_c().await;
-    };
-
-    // Programmatic teardown (#135): `ServeShutdown::request()` from the
-    // coordinator's fatal lockstep path must also unwind this loop — signals
-    // alone would leave the HTTP server (and thus the worker guard) alive.
-    let requested = async {
-        while !shutdown.is_requested() {
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        }
-    };
-
-    tokio::select! {
-        _ = ctrl_c => {}
-        _ = terminate => {}
-        _ = requested => {}
-    }
-    shutdown.request();
-    log::info!("shutdown signal received");
 }
