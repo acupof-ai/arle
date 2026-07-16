@@ -228,8 +228,9 @@ async def send_streaming(
         missing.append("missing output event")
     if finish_reason is None:
         missing.append("missing finish_reason")
-    if usage_received and output_events != completion_tokens:
-        missing.append(f"{output_events} output events for {completion_tokens} tokens")
+    # MTP/speculative decode sends multiple accepted tokens per SSE event, so
+    # output_events may be < completion_tokens. The usage-based token count is
+    # the ground truth for tok/s; ITL uses inter-event intervals (approximate).
     output = "".join(output_parts)
     return RequestResult(
         request_id=request_id,
