@@ -1,0 +1,25 @@
+crates/cuda-kernels/csrc/attention/dsv4_compressor.cu
+  s_84df39eb543901::t_0f12bbe2744d6b 326-328,333-334,344-346,714-716,721-722,731-732,741-743
+crates/cuda-kernels/src/ffi/misc.rs
+  s_84df39eb543901::t_24de6a87a1d536 377-379,384-385
+crates/infer-cuda/src/attention.rs
+  s_84df39eb543901::t_0235bc615eb644 7590-7591,7603,7665-7676,7704-7706,7711-7712,7801,7812
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "8766d20e9695ccde73617d650214b246eb8ead50",
+  "prompts": {},
+  "sessions": {
+    "s_84df39eb543901": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "09b70280-1d0b-477b-9aa8-54f8da20ed0f",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
