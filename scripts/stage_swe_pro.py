@@ -9,7 +9,7 @@ receives the resulting staged-root tarball + JSONL — never clones itself.
            gold_patch for the scoring gate).
   stage  — clone each candidate at base_commit, run the self-check gate
            (test_patch alone FAILS, gold_patch on top PASSES — mirrors
-           scripts/cc_swe_baseline.py score()), land accepted trees at
+           sandbox.rs::score_workdir), land accepted trees at
            <staged-root>/<instance_id>/ + train/eval JSONL. Then ship to the
            pod (pod builds offline, local-fed):
              tar czf staged.tgz <staged-root> train.jsonl eval.jsonl
@@ -232,7 +232,7 @@ def run_pytest(workdir, f2p, python, pythonpath=None, timeout=None):
 
 
 def self_check(repo_dir, task, scratch, python, pythonpath=None):
-    """Mirror cc_swe_baseline.py score() semantics in a scratch copy:
+    """Mirror sandbox.rs::score_workdir semantics in a scratch copy:
     test_patch alone must FAIL with real test failures (pytest rc 1, no
     collection errors), gold_patch on top must PASS (rc 0)."""
     if scratch.exists():
@@ -332,7 +332,7 @@ def cmd_stage(args):
                 continue
 
             # Land the clean base tree without .git — the runner
-            # (cc_swe_baseline.py boot_workdir / sandbox.rs) git-inits it.
+            # (sandbox.rs::boot_workdir) git-inits it.
             shutil.rmtree(repo_dir / ".git")
             repo_dir.rename(staged)
 

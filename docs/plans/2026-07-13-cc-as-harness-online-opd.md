@@ -1,7 +1,8 @@
 # cc-as-harness online OPD
 
-> Status: Active — 2026-07-13. Loop + prefix-reuse VALIDATED (pod, GPU H20). Supersedes the weak in-process agent loop as the
-> default agent-OPD rollout harness.
+> Status: Superseded by [2026-07-16-agent-rl-unified-infra.md](2026-07-16-agent-rl-unified-infra.md)
+> — the bash/python loop it validated (`cc_opd_loop.sh`/`cc_run.sh`/`cc_swe_baseline.py`)
+> is folded into one `arle train agent-opd` process (P2) and deleted (P3).
 
 ## Verdict
 
