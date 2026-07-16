@@ -1,0 +1,33 @@
+docs/baselines.md
+  s_81c5a850d93f85::t_6d2fda08ff303a 51-55
+scripts/gen_bench_prompts.py
+  s_81c5a850d93f85::t_805ea223c87e66 2
+scripts/run_dsv4_bench.sh
+  s_7a0ab3bd2ba9ac::t_354d65ba97a1cb 2-6,12-13,15,17,19-20,22-31,33-37
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "455da583ddddcc3c33d545e57ff81235fc62fb8a",
+  "prompts": {},
+  "sessions": {
+    "s_7a0ab3bd2ba9ac": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f6a12-9293-7d13-bfca-8f94115246df",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_81c5a850d93f85": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c1899929-05e0-4ef7-9ac7-0acb8fe9ec71",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
