@@ -1785,7 +1785,7 @@ pub(crate) struct TrainRubricOpdArgs {
 
     /// Gradient checkpointing for the CE backward (recompute activations). On by
     /// default; `--grad-checkpointing false` to disable.
-    #[arg(long, default_value_t = true)]
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set, value_name = "BOOL")]
     pub(crate) grad_checkpointing: bool,
 
     /// Directory where servable full-materialized checkpoints are written.
@@ -2026,7 +2026,7 @@ pub(crate) struct TrainAgentOpdArgs {
 
     /// Gradient checkpointing for the CE backward (recompute activations). On by
     /// default; `--grad-checkpointing false` to disable.
-    #[arg(long, default_value_t = true)]
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set, value_name = "BOOL")]
     pub(crate) grad_checkpointing: bool,
 
     /// Directory where servable full-materialized checkpoints are written.
