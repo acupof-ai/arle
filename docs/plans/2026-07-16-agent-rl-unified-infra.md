@@ -1,292 +1,302 @@
-# Agent-RL unified infra — one process, one algorithm seam, one metrics stream
+# Agent-RL unified infra — implementation plan (v2, re-ranked)
 
-> Status: Active — 2026-07-16. Supersedes the orchestration half of
-> [2026-07-13-cc-as-harness-online-opd.md](2026-07-13-cc-as-harness-online-opd.md)
-> (its tranches 1-4 remain shipped; its bash loop dies here).
+> Status: Active — 2026-07-16 (v2 full rewrite; v1 sections A-H consolidated).
+> Supersedes the orchestration half of
+> [2026-07-13-cc-as-harness-online-opd.md](2026-07-13-cc-as-harness-online-opd.md).
+> Landed so far: **P0** in-process serve plumbing (`b5f0f406`). **P1** UpdatePreset
+> in flight.
 
 ## Verdict
 
-Fold serve + cc rollout + scoring + convert + train + weight-sync into the ONE
-`arle train agent-opd` process. Every mechanism already exists in-tree; the bash
-loop bypasses all of them:
+One `arle train agent-opd` process = serve + cc rollout + scoring + convert +
+train + weight-sync. User surface: `--update-strategy <preset> --rounds N`;
+everything else is a measured best-practice default. Deletes ≈406 LOC
+bash/python + ≈1.4k LOC Rust, adds ≈600.
 
-- The train rollout engine **is** the production serve engine
-  (`LoadedInferenceEngine::Cuda` = `ServeInferenceEngine<CudaExecutor, CudaKvPool>`,
-  same `cuda_serve_handle` builder as `arle serve`, loaded.rs:1083/:2286).
-- Hot weight-sync needs **zero new code**: `sync_lora_from_store →
-  remerge_student_lora` re-merges LoRA + flushes the prefix cache in one
-  engine-thread closure (serve_engine.rs:342-348) — kills #92 structurally, and
-  with it the per-round serve restart and the two per-round ~50 GB reloads.
-- Python `score()`/`boot_workdir` duplicate `sandbox.rs` line-for-line and the
-  reward denominator has silently diverged (py `n_pass/(n_pass+n_fail)`, ignores
-  pytest errors; Rust `passed/len(fail_to_pass)`, counts errors as failures).
-- The serial python harness wastes the serve's own `--max-running-requests 4`
-  (one request in flight, ever).
+Ranking driver (survey-grounded): **rollout is ~96% of a LoRA-RL run** (Unsloth
+FP8+LoRA measurement; Arnal >80% fleet-wide); sync batching idles at 20-40% GPU
+util vs ~90% achievable; **51-66% of GRPO groups are zero-variance** (full
+rollout cost, zero gradient). So priorities are: orchestrator concurrency +
+CPU pipeline first, sample-efficiency second, staleness overlap third,
+train-step micro-opts ~never.
 
-Net: delete ≈406 LOC bash/python + ≈1.4k LOC Rust; add ≈450 LOC. User surface
-becomes `arle train agent-opd --algo <preset> --rounds N`; everything else
-(concurrency, decode config, dense reward, sync cadence, eval cadence, metrics)
-is a best-practice default, not a flag to remember.
+Wall-clock estimate vs today's serial bash loop (estimates, each gated before
+credit is claimed): concurrency+pipeline ~2-2.5×, task-selection 2-6×
+*effective* compute, staleness-1 ~1.3×, spec-decode 1.3-2×. Compounding
+plausibly ≥5× to a given capability level.
 
-Adversarially verified (threading / CUDA context / generics / VRAM co-residency
-all CONFIRMED): the engine always lives on its own `infer-engine` thread behind
-`&self` channel methods; engine+autograd co-residency in one process/context is
-existing production (`mem_fraction_static: 0.2`, `--share-frozen-base`,
-train_cli.rs:2628-2670). Scope: single-GPU student path (`load_cuda`); DSv4 TP=8
-multiproc serve is out of scope.
+## Architecture (final form)
 
-## A. In-process serve (~150 LOC, 4 files)
+```
+arle train agent-opd --update-strategy dapo --rounds 8
+┌──────────────────────────────────────────────────────────────────┐
+│ driver (round loop, fixed)                                       │
+│  boot pool ─▶ cc-run pool ─▶ score pool ─▶ group asm ─▶ trainer  │
+│  (bounded std::mpsc queues; sample-level flow, no group barrier) │
+│                 │ claude -p ×K ──HTTP──▶ serve thread            │
+│                 ▼                                                │
+│  UpdatePreset.update ─▶ remerge/adapter-swap ─▶ ControlMessage   │
+│                                                                  │
+│ serve thread: axum OpenAI+Anthropic router over Arc<ServeHandle> │
+│ engine thread: Engine<CudaExecutor,KvPool> (sched+Radix+batching)│
+│ autograd student: LoRA rank16, shares frozen FP8 base pointers   │
+└──────────────────────────────────────────────────────────────────┘
+   metrics.jsonl (update / group / round)  ← every stage feeds it
+```
 
-1. `coordinator_local_router(serve: ServeHandle<E,K>, …)` →
-   `Arc<ServeHandle<E,K>>` (it already `Arc::new`s internally, lib.rs:673);
-   wrap the 8 call sites in infer-api/loaded.rs.
-2. `ServeInferenceEngine.serve: ServeHandle` → `Arc<ServeHandle>` + a
-   `serve_arc()` accessor (serve_engine.rs:22; all uses are `&self`).
-3. `LoadedInferenceEngine::local_router(&self, …) -> Result<axum::Router>` —
-   CUDA arm clones `Arc<ServeHandle>` + `OpenAiTokenizer` (Clone) into
-   `coordinator_local_router`; other arms bail like `remerge_student_lora`.
-4. `serve_router_on_thread(router, bind, port, shutdown) -> JoinHandle` — public
-   non-blocking twin of the private `bind_and_serve` (infer-api/serve.rs:304-330),
-   own tokio runtime on a spawned thread (precedent: train/src/server.rs:48-74).
-5. agent-opd wiring: `--serve-port/--serve-bind`, `set_messages_dump_dir`
-   (already re-exported, infer-api/lib.rs:71), `shutdown.request()` at loop end.
-6. **Quiesce gate**: writeback releases the engine KV pool
-   (infer_student.rs:67-119) — a live HTTP request during writeback hits a
-   dropped pool, not just stale KV. The driver owns all `claude` subprocesses,
-   so quiesce = all children exited + `counters().active_requests == 0`
-   belt-and-braces poll.
-7. Serve-shaped engine config (slots/pages/max-running-requests for 17K-prompt
-   4-way cc traffic vs student scratch) is the one **measured on-pod** trade;
-   decode-graph on/off under co-residency decided by that measurement, not
-   assumption.
+Three async invariants (published convergence, single-GPU form):
+1. token stream never stalls for weight sync (sub-second adapter sync via
+   engine-thread control closure);
+2. training never waits on CPU/env time (boot/score/convert pipelined
+   off-path);
+3. a group never waits on its slowest member for scoring (sample-level flow;
+   the *update* waits for group rewards — information-theoretic, not infra).
 
-## B. Rust cc harness + unified round loop (~150 LOC new)
+Two pluggable seams, everything else fixed:
+- **Algorithm** = `UpdatePreset` (data). New algorithm = new preset value.
+- **Rollout harness** = subprocess driver (`CcHarness`). New harness = new
+  driver; serve/train/sync untouched.
 
-Port `cc_attempt` + pass@k aggregation to `crates/train/src/cc_harness.rs`:
-spawn `claude -p` via the **spawner** path (mandatory: CUDA-resident
-multi-threaded parent, sandbox.rs:148-162), N samples concurrent up to
-`max_running_requests`. Boot/score via existing `sandbox.rs::{boot_workdir,
-score_workdir}` (single reward definition; the py denominator drift dies).
-Convert via `cc_convert` lib in-memory (`Vec<CcRecord>`, no records.jsonl
-handoff); keep `--dump-messages-dir` time-window attribution as the first fold,
-per-attempt request tagging later.
+Scope: single-GPU student path (`load_cuda`); DSv4 TP=8 out of scope.
 
-Round loop = the existing `run_agent_opd_impl` skeleton (eval cadence, round-0
-baseline, checkpoint saves, metrics sink — train_cli.rs:2870-3101) with the
-rollout arm swapped to the cc harness.
+## Concurrency × on-policy coupling (design fact, decided upfront)
 
-**Sync cadence knob** (the on-policy dial): `--sync every-group | every-round`,
-default `every-group` — after each prompt's K-sample group trains, re-merge +
-flush, next group rolls under the updated policy. Cost = one shared-prefix
-re-prefill per group (cache flushed by design); field norm (2026): bounded
-staleness + IS correction, LoRA-only sync per batch is standard.
+- `--staleness 0` (default): task groups are **sequential**; in-flight
+  concurrency = K samples of the current group. Raise K (default 4 → 8 gated
+  on F.5 KV budget) — bigger K is the staleness-0-compatible concurrency
+  lever, and cuts zero-variance probability (p⁴+(1-p)⁴ → p⁸+(1-p)⁸: 0.66 →
+  0.43 at p=0.9; dense reward cuts it further).
+- `--staleness 1`: M groups in flight; merge after each group trains;
+  other in-flight groups continue under their behavior adapter (whole
+  trajectory version-tagged; token-TIS corrects). This is where the 2.4-2.7×
+  published agentic gains live. Requires P6 (generation-time behavior
+  logprobs) — **not before**.
+- Boot + prefix warm-up of group i+1 overlap group i's train/merge in BOTH
+  modes (CPU + cache-warm only — staleness-free).
 
-## C. `UpdatePreset` algorithm seam (replaces the closed `UpdateStrategy` enum)
+## Phases (re-ranked)
 
-Six orthogonal fields; an algorithm is a **const value**, not a new enum arm:
+### P0 — in-process serve plumbing ✅ (`b5f0f406`)
+
+`coordinator_local_router(Arc<ServeHandle>)`, `ServeInferenceEngine.serve:
+Arc<_>` + `serve_arc()`, `LoadedInferenceEngine::local_router()`,
+`serve_router_on_thread() -> ServeThread` (owns `ServeShutdown`), re-exports.
+132+/13−, all lanes green.
+
+### P1 — `UpdatePreset` algorithm seam (in flight)
+
+Six orthogonal fields, presets as values:
 
 ```rust
 pub struct UpdatePreset {
-    pub filter: SampleFilter,      // PassOnly | KeepAll | DropZeroAdvGroup | drop-truncated
-    pub advantage: Advantage,      // None | Mean{scope: Batch|Group, std_norm} | ValueGae{gamma, lam}
-    pub ratio: RatioGrain,         // None | PerToken | PerSequence
-    pub clip: ClipForm,            // HardGate{lo,hi} | SoftClamp{lo,hi}   (weights stay detached)
-    pub agg: Aggregation,          // PerSeqTokenMean | GlobalTokenMean{norm_const}
-    pub kl: Option<KlReg>,         // {coef, reference: RolloutPolicy /* Teacher later */}
+    pub filter: SampleFilter,   // PassOnly | KeepAll | DropZeroAdvGroup | DropTruncated
+    pub advantage: Advantage,   // None | Mean{scope: Batch|Group, std_norm} | ValueGae{gamma, lam}
+    pub ratio: RatioGrain,      // None | PerToken | PerSequence
+    pub clip: ClipForm,         // HardGate{lo,hi} | SoftClamp{lo,hi}   (weights detached)
+    pub agg: Aggregation,       // PerSeqTokenMean | GlobalTokenMean{norm_const}
+    pub kl: Option<KlReg>,      // {coef}; reference = rollout policy; Teacher slot later
 }
 ```
 
-Presets: `REJECTION_CE`, `SAO_DIS`, `SAO_VALUE`, `GRPO`, `DAPO`, `DR_GRPO`,
-`GSPO`, `CISPO`. `RolloutNeeds` derives mechanically (`rollout_logprobs = ratio
-!= None`, `keep_failing = filter != PassOnly`). `--update-strategy` stays as a
-preset alias.
+Presets: `rejection_ce, sao_dis, sao_value, grpo, dapo, dr_grpo, gspo, cispo`.
+`RolloutNeeds` derives (`rollout_logprobs = ratio != None`, `keep_failing =
+filter != PassOnly`); `needs_value_critic = advantage == ValueGae`.
+Three plumbing pieces: `ScoredTrajectory.group_id`; gate/weight builder hoisted
+out of `fused_linear_pg_loss_indexed` (`WeightForm{HardGate,SoftClamp,
+Precomputed}`; KL folds in as `coef×(r−1)` added to the detached weight;
+GSPO = capture pass → seq-ratio → `Precomputed`); grad-accumulate/step split in
+`masked_writeback_step` for `GlobalTokenMean`. Behavior contract: the three
+shipped strategies byte-identical through their presets; default stays
+`rejection-ce`. Note: our HardGate double-sided detached gate is the same
+family as IcePop's [0.5,5] mask — the correction that covers BOTH async
+staleness and FP8-serve/bf16-train numerics mismatch (measured token KL ~1e-2
+elsewhere; uncorrected quantized rollout collapses training).
 
-Three genuine plumbing pieces (everything else is data):
-1. **Group identity through the update** — `ScoredTrajectory.group_id`; the
-   online path flattens groups at agent_opd.rs:453 while replay already groups
-   per task (train_cli.rs:2143-2150). Unlocks per-prompt-group baselines +
-   DAPO dynamic-sampling filters.
-2. **Hoist the gate/weight builder out of the fused op** — ratio/gate is
-   computed inside `fused_linear_pg_loss_indexed` (fused_linear_distill.rs:
-   799-803, 931-943); move to a caller-side per-token weight builder keyed on
-   `ratio × clip`. Unlocks GSPO's seq-scalar broadcast and CISPO's clamped
-   weight; the op keeps its detached-weight contract (PPO grad-through-ratio
-   stays structurally excluded — CISPO-family is the native fit, and GSPO beats
-   GRPO +13.3% on agentic benchmarks in 2026 head-to-heads).
-3. **Split grad-accumulate from optimizer.step** — `masked_writeback_step`
-   steps per trajectory (opd.rs:3271); `GlobalTokenMean` (DAPO token-level
-   loss) needs batch-level accumulation before one step.
+### P2 — unified orchestrator, async-native internals (~350 LOC new)
 
-Collapses on landing: `WritebackLoss::{Ce,Dis}` → one per-token-weight op (CE =
-weight `1/N`); the replay CE/GKD fork (train_cli.rs:2333-2395) and the GKD⊕SAO
-mutual-exclusion bail die — k3 KL already computed (fused_linear_distill.rs:
-944-966), `KlReg{reference: RolloutPolicy}` just adds it to the loss with a
-coefficient; `Teacher` reference (= on-policy distillation as a regularizer
-swap) is the designed-for follow-up.
+`crates/train/src/cc_harness.rs` + round-loop rewiring in `train_cli.rs`
+(reusing the existing skeleton at train_cli.rs:2870-3101: eval cadence, round-0
+baseline, checkpoint saves, metrics sink).
 
-## D. Always-on metrics.jsonl (extend the existing `--metrics-out` sink)
+**Driver = 3-stage bounded pipeline, house-style threads + std::mpsc** (no
+tokio in train; matches engine/control-plane precedent):
+- *boot pool* (2 workers): `sandbox.rs::boot_workdir` (staged copytree + git
+  init) — pre-boots next group's K workdirs during current group's
+  train/merge.
+- *cc-run pool* (width = serve `max_running_requests`): spawn `claude -p
+  --model … --allowedTools "Bash Read Write Edit Grep Glob" --output-format
+  json --dangerously-skip-permissions` via **spawner** (mandatory:
+  CUDA-resident multithreaded parent, sandbox.rs:148-162; IS_SANDBOX=1 env);
+  per-sample `(t_start_ms, t_end_ms)` recorded for dump attribution;
+  `--cc-timeout` 600s.
+- *score pool* (2-4 workers, CPU-bounded): `sandbox.rs::score_workdir` the
+  moment a sample's cc exits — pytest (≤300s) hides inside siblings' rollout
+  window. Single reward definition (Rust semantics: errors count as failures,
+  denominator = len(fail_to_pass); the py drift dies — documented Δ in the
+  first bench entry). Tiered scoring: fail_to_pass first, early-exit on
+  first F2P failure, pass_to_pass only on F2P success, ~120s soft cap.
+- *group assembler*: `HashMap<task_id, Vec<Scored>>`; a group completes at K
+  scored samples → cc-convert (lib call, in-memory `Vec<CcRecord>`, time-window
+  attribution kept for this fold) → trainer.
+- *trainer*: capture logprobs at V0 → `UpdatePreset.update` → sync.
 
-Three `kind`s, one append-only stream, env-gating retired
-(`ARLE_OPD_LOG_DIS_STATS` / `ARLE_AOPD_PROFILE` fold in; profile table stays as
-the human view):
+**Weight sync**: `sync_lora_from_store → remerge_student_lora` (atomic
+re-merge + `invalidate_prefix_cache` in one engine-thread closure). Quiesce =
+all cc children exited + `counters().active_requests == 0` poll (needed beyond
+staleness: writeback drops the engine KV pool — a live request would hit a
+dropped pool). Post-merge: **prefix warm-up** — enqueue one prefill of the
+shared system prompt, overlapped with next-group boot (kills the per-group
+re-prefill tax).
 
-- `update`: strategy, trajectories, tokens_trained, policy_loss, critic_mse,
+**metrics.jsonl** (moved into this phase — it is the sensor layer P4 gates and
+P5 scheduling read). Extend the existing `--metrics-out` JsonlSink
+(train_cli.rs:3057) with `kind` rows, always-on, env-gates retired
+(`ARLE_OPD_LOG_DIS_STATS`, `ARLE_AOPD_PROFILE` fold in; human table stays):
+- `update`: preset, trajectories, tokens_trained, policy_loss, critic_mse,
   kl_rollout, is_ratio_mean/max, clip_frac, adv_mean/std, update_secs.
 - `group`: task_id, rewards[], reward_mean/std, zero_variance, passed, edited,
   prompt/completion tokens, rollout_secs, rollout_tok_per_sec.
-- `round`: pass@k, reward stats, zero_variance_group_frac, phase_secs breakdown,
+- `round`: pass@k, reward stats, zero_variance_group_frac, phase_secs,
   rollout_tok_per_sec, held_out_pass_rate/delta.
+Run judgment without logs: learning (round.held_out_delta), off-policy blow-up
+(update.kl_rollout + clip_frac + is_ratio_max), signal starvation
+(zero_variance_group_frac + adv_std), throughput (phase_secs, tok/s).
 
-A run is judged from three trends without reading logs: learning
-(round.held_out_delta), off-policy blow-up (update.kl_rollout + clip_frac +
-is_ratio_max), signal starvation (group zero-variance fraction + adv_std).
+**CLI surface (full)**: `--rounds`, `--update-strategy <preset>`, `--dataset
+--staged-root --eval-dataset`, `--samples-per-prompt` (default 4; 8 after
+F.5), `--sync every-group|every-round` (default every-group), `--serve-port
+--serve-bind`, `--cc-timeout 600`, `--eval-every 2`, existing LoRA/lr flags.
+Serve-shaped engine config derived: `num_slots = samples_per_prompt`,
+`total_pages = slots × 22K/16 + headroom` (formula, not magic constant);
+decode-graph on/off decided by F.5 measurement under co-residency.
 
-## E. Deletions
+### P3 — deletions (land in the same tranche as each replacement)
 
 | Item | ~LOC | Replacement |
 |---|---|---|
-| scripts/cc_opd_loop.sh + cc_run.sh + cc_swe_baseline.py | 406 | unified command (A+B) |
-| in-house AgentSession arm: `agent_opd.rs::cuda_rollout`, `SandboxToolExecutor`, 4-tool prompts, `run_agent_opd_eval_pass`, in-house-only plumbing | ≈1160 | cc harness is canonical (user decision 2026-07) |
-| `tokens_record_to_pairs` + tests (zero non-test callers) | 88 | none — dead |
-| replay CE/GKD fork + GKD⊕SAO bail + dup critic/logprob builds | ≈125 | one grouped loop over `UpdatePreset` |
-| `--lora-adapters` as chaining vehicle; `adapters_replay` handoff + symlink dance | 27 | TensorStore persists across rounds in-process; flag re-docs as crash-resume; per-round checkpoints stay |
+| scripts/cc_opd_loop.sh + cc_run.sh + cc_swe_baseline.py | 406 | P2 |
+| in-house AgentSession arm (`agent_opd.rs::cuda_rollout` ~590, `SandboxToolExecutor` ~220, 4-tool prompts ~66, `run_agent_opd_eval_pass` ~56, in-house-only plumbing ~230) | ≈1160 | cc harness canonical |
+| `tokens_record_to_pairs` + tests (zero non-test callers) | 88 | dead |
+| replay CE/GKD fork + GKD⊕SAO bail + dup critic/logprob builds | ≈125 | P1 collapsed them |
+| `--lora-adapters` as chaining vehicle; `adapters_replay` handoff | 27 | TensorStore persists in-process; flag re-docs as crash-resume |
 
-Keep: `update_strategy.rs` (becomes the preset seam), `cc_convert.rs` lib +
-offline CLI, `sandbox.rs` boot/score/spawner, `SweTask` loading,
-round-loop skeleton.
+Keep: `update_strategy.rs` (the seam), `cc_convert.rs` lib + offline CLI,
+`sandbox.rs` boot/score/spawner, `SweTask` loading, round-loop skeleton,
+`--replay-records` as offline entry.
 
-## F. Gates (pod, H20)
+### P4 — pod validation gates (H20, GPU 0/1/7, pinned dir)
 
-1. Correct inference across re-merge: needle gate ×3 after a mid-run re-merge
-   (covers recurrent-sidecar tier invalidation under the new flush path).
-2. Reward parity audit: Rust vs old py scoring on one collected round —
-   denominator change is **expected and documented**, per-case diffs reviewed.
-3. Wall-clock A/B vs the bash loop, same tasks/samples: reload tax (2× ~50 GB
-   loads/round) and serial-rollout tax both eliminated; bench entry with Δ%.
-4. `every-group` vs `every-round` A/B: pass-rate + wall cost of the per-group
-   prefix re-prefill, before flipping any default beyond `every-group`.
+- **F.1** correct inference across sync: needle gate ×3 after a mid-run
+  re-merge (also covers recurrent-sidecar tier invalidation).
+- **F.2** reward parity audit: Rust vs old py scoring on one collected round;
+  denominator change expected + documented, per-case diffs reviewed.
+- **F.3** wall-clock A/B vs the bash loop, same tasks/K: reload tax + serial
+  rollout eliminated; wins/ entry with Δ%.
+- **F.4** `every-group` vs `every-round` A/B: pass-rate + wall cost.
+- **F.5** co-residency VRAM ledger: KV pool (K=4 vs 8 × 22K) + autograd
+  activations + decode-graph on/off; sets K default and page formula headroom.
+- **F.6** logprob-source ratio floor: V0-recompute vs generation-capture ratio
+  distribution at staleness 0 = numerics-noise baseline (FP8 serve vs bf16
+  train); informs P6/P7.
+- **F.7** re-merge requant drift: folding bf16 LoRA into FP8 base each sync is
+  dequant→add→requant — measure merged-vs-adapter-separate logit gap over N
+  syncs. If material → **adapter-separate serving** (rank-16 LoRA GEMM at
+  inference; sync = true sub-ms adapter swap; also enables KV-keep across
+  syncs per PipelineRL's stale-KV≈recompute measurement + TIS).
 
-## Tranches
+### P5 — task-selection scheduler (2-6× effective compute; cheap; after P2+P4)
 
-| # | What | Depends |
+Reads per-task history from metrics.jsonl `group` rows; lives in the driver's
+task iterator, ~80 LOC:
+- **zero-variance skip** (GRESO-style): P(skip) grows with consecutive
+  zero-variance rounds for that task; floor ε=0.1 re-explore.
+- **comfort band**: sample tasks ∝ proximity to ~50% EMA pass-rate
+  (SPEED-RL/DOTS: intermediate difficulty maximizes gradient SNR).
+- **retirement**: EMA pass ≥0.9 over 3 rounds → retire (Polaris practice).
+- All three are *scheduler* policy — `UpdatePreset.filter` stays the loss-side
+  guard. Emit skipped/retired counts in `round` rows (no silent truncation).
+
+### P6 — engine-native trajectory capture (correctness + staleness enabler)
+
+Engine records per-request `(request_id, prompt_token_ids, gen_token_ids,
+gen_logprobs)`: sampler-site gather of the chosen token's logprob into a
+device ring, D2H at request finish (graph-compatible — no per-step sync).
+Dump sink keyed by request_id replaces time-window attribution; masks come
+from the engine's own span renderer (`render_structured_chatml_with_spans`)
+instead of client-side re-render. Kills: window fragility, re-render drift,
+and the V0-recompute "θ unchanged" assumption (the published missing-old-logits
+failure). Polar (arXiv 2605.24220) validates the exact shape: RL through
+unmodified Claude Code via proxy-recorded token ids + logprobs, +4.8
+SWE-Bench-Verified on a 4B. Decision input: F.6 ratio floor.
+
+### P7 — staleness dial (needs P6)
+
+`--staleness 0|1`. At 1: driver admits group i+1 before group i's merge;
+trajectories carry `behavior_version`; ratio uses generation-time logprobs;
+existing HardGate/TIS corrects (published envelope: 1-2 steps safe everywhere;
+AReaL η≤8 within 1%). KV-keep across adapter swaps becomes an option per F.7.
+Loss is *measured*, not assumed: clip_frac + kl_rollout ≈ 0 ⇒ empirically
+lossless.
+
+### P8 — gated roadmap (post-P7, each behind its own gate)
+
+- **Experience replay**: age ≤10 steps, fresh-anchored, |A|-prioritized, reuse
+  2-5× (~40% compute); our inference/train cost ratio is the extreme-replay
+  regime. Gate: held-out parity at reuse 2-3×.
+- **Spec decode in rollout**: training-free suffix-tree drafter over recent
+  rollouts (DAS pattern) — distribution-lossless via rejection sampling;
+  1.3-2× decode. Engine feature, useful beyond RL. Gate: needle + acceptance
+  rate + identical training curves on one round.
+- **Privileged self-distillation for all-fail tasks** (HDPO/OPSD): teacher =
+  same model + privileged context (failing pytest output / reference patch);
+  distill per-token on student rollouts; rescues the zero-gradient tail; the
+  ~10×-class move. Lands as `KlReg{reference: Teacher}` + a privileged-prompt
+  harness lane. Gate: all-fail-task pass-rate delta on the real corpus.
+
+## Priority rationale (value × effort × dependency)
+
+| Rank | Phase | Expected effect | Effort | Depends |
+|---|---|---|---|---|
+| 1 | P1 preset seam | algorithm iteration cost → ~0; TIS machinery | in flight | — |
+| 2 | P2 orchestrator+pipeline+metrics | 2-2.5× wall vs bash loop; observability | ~350 LOC | P0 ✓ |
+| 3 | P3 deletions | −1.8k LOC, no half-states | mechanical | P2 |
+| 4 | P4 gates | licenses defaults; measures F.5/F.6/F.7 unknowns | pod runs | P2-P3 |
+| 5 | P5 task selection | 2-6× effective compute; biggest single multiplier | ~80 LOC | P2 metrics |
+| 6 | P6 engine capture | correctness hardening; unlocks P7 | engine plumbing | F.6 |
+| 7 | P7 staleness 1 | ~1.3-1.7×, ε-measured | small | P6 |
+| 8 | P8 replay / spec-decode / priv-distill | 1.4× / 1.3-2× / ~10×-class | each gated | P7 |
+
+Re-ranking vs v1: metrics moved INTO the orchestrator phase (sensor layer,
+not an afterthought); task selection promoted above staleness (bigger
+multiplier, smaller effort, zero risk); engine capture promoted from
+"later" to the P7 gatekeeper (Polar-validated); train-step micro-opts
+(packing, recompute tuning) explicitly DROPPED (<4% share).
+
+## Defaults contract (run it and it's best practice)
+
+| Knob | Default | Why |
 |---|---|---|
-| T1 | In-process serve plumbing (A) | — |
-| T2 | UpdatePreset seam + 3 plumbing pieces (C) | — |
-| T3 | Rust cc harness + unified round loop + sync knob (B) | T1 |
-| T4 | metrics.jsonl kinds (D) | T2 |
-| T5 | Deletions (E) — same tranche as replacement lands, no half-states | T3 |
-| T6 | Pod gates + bench entry + doc statuses (F) | T3-T5 |
+| preset | rejection-ce (flip after P4 A/B) | current validated baseline |
+| samples_per_prompt K | 4 → 8 after F.5 | staleness-0 concurrency + zero-variance cut |
+| sync | every-group | user's on-policy requirement; F.4 prices it |
+| staleness | 0 (dial exists after P7) | strict on-policy until ε is instrumented |
+| scoring | tiered F2P-first, 120s soft cap, Rust semantics | reward wall −; single definition |
+| prefix warm-up after merge | on | hides re-prefill tax |
+| metrics.jsonl | always-on | no env-gate; agents parse runs |
+| task selection | on after P5 (skip/band/retire, ε=0.1) | 2-6× effective |
+| decode-graph / KV pages | F.5 measurement | co-residency budget, not assumption |
 
-## G. Lossless-performance ceiling (refinement, 2026-07-16)
+## Field grounding (kept from v1, abridged)
 
-Under strict on-policy, `rollout_i → train_i → merge_i → rollout_{i+1}` is an
-information-theoretic dependency, not an infra defect. Squeezing wall-clock
-without losing anything therefore has exactly three moves:
-
-1. **Sample-level pipeline — no group barriers (strictly lossless).**
-   Score/convert each sample the moment ITS rollout finishes, not when the
-   group does: pytest (≤300 s CPU) hides inside the window where sibling
-   samples are still rolling. After each merge, proactively re-prefill the
-   shared prefix (cache warm-up rides the merge control message) overlapped
-   with next-group workdir boot — the per-group re-prefill tax disappears.
-   Eval runs off checkpoints, off the critical path. The critical path
-   collapses to `max(sample rollouts) → train → merge`.
-2. **Staleness is an instrumented dial, not an architecture fork (ε-measured).**
-   `--staleness 0` = strict serial. `--staleness 1` = rollout_{i+1} under π_i
-   overlaps train_i; the IS ratio exists precisely to correct this, and with a
-   rank-16 LoRA at lr 1e-5 the per-group update is tiny → ratio≈1,
-   clip_frac≈0, the truncated-IS bias is directly read off the always-on
-   metrics (update.clip_frac + kl_rollout ≈ 0 ⇒ empirically lossless). Same
-   code path; the only difference is whether the driver awaits the merge.
-   Single-GPU degenerate form of AReaL's decoupled PPO. Precondition: engine
-   KV pool + autograd activations co-resident (measured on-pod, gate F.5).
-3. **Engine-native trajectory capture (kills three reconstruction errors at
-   once).** Record `(request_id, prompt_token_ids, gen_token_ids,
-   gen_logprobs)` at generation time, D2H at request finish
-   (graph-compatible). Replaces: time-window dump attribution (fragile),
-   chat-template re-render for masks (drift risk — span offsets come from the
-   engine's own renderer instead), and train-side V0 logprob recomputation
-   (whose "θ unchanged since generation" assumption is exactly what breaks at
-   staleness>0 — the 2026 "missing old logits" failure). Cost ≈ one f32
-   gather/token.
-
-Honest trade in (3): generation-time logprobs carry FP8-serve numerics while
-π_θ is computed under bf16 train numerics — ratio ≠ 1 even at θ = θ_b; V0
-recomputation is the mirror image (ratio exactly 1, but only valid at
-staleness 0). Decide at T3 with one measurement: the ratio distribution gap
-between both sources at staleness 0 = the numerics-noise floor.
-
-Added gate: **F.5** — co-residency VRAM ledger (KV pool + activations) before
-enabling `--staleness 1`; **F.6** — logprob-source ratio-floor measurement.
-
-## H. Async & extreme-acceleration roadmap (deep-survey verdict, 2026-07-16)
-
-Ground truth for this scale: **rollout is 96% of a LoRA-RL run** (Unsloth FP8+LoRA
-measurement; Arnal: >80% fleet-wide). Train-step levers (packing, recompute) are
-~nil end-to-end here. The published lever stack, ranked for one H20:
-
-1. **Concurrency to the KV ceiling + 3-stage CPU pipeline** (init / agent-run /
-   score as bounded-queue pools). Sync batching runs 20-40% GPU util; SkyRL-Agent
-   holds ~90% once init/reward leave the critical path; Polar 20.4%→87.7%.
-   ROLL-Flash env-level async: 2.72× agentic at equal GPU. Our 4-way is far below
-   the ceiling; VRAM multiplexing (shared FP8 base — we have it; reclaim trainer
-   state during generation — our KV-release dance, inverted) is what RAISES the
-   ceiling.
-2. **Sample-efficiency beats systems work**: zero-variance groups are 51-66% of
-   GRPO groups (worse at K=4: p⁴+(1-p)⁴ = 66% at p=0.9) — full rollout cost, zero
-   gradient. GRESO predictive skip 2.0×; AERO staged probe 1.8-1.9×; SPEED-RL
-   difficulty targeting 2-6×; task retirement >0.9 pass. Lives in the harness
-   scheduler + `UpdatePreset.filter`, not in kernels.
-3. **Staleness 1-2 + token-TIS is the published safe envelope** (AReaL η≤8 within
-   1%; PRIME-RL IcePop [0.5,5] masking; M2PO stale-256). Doubly mandatory for us:
-   FP8-serve vs bf16-train numerics mismatch (token KL ~1e-2 measured elsewhere)
-   is the SAME correction — one mechanism covers quantization mismatch + async
-   staleness. Our DIS hard gate is already this family.
-4. **Experience replay 2-5× reuse** (age-bound ~10 steps, fresh-anchored,
-   |advantage|-prioritized): ~40% compute saved; our inference/train cost ratio is
-   the extreme-replay regime.
-5. **Spec decode in rollout is distribution-lossless** (rejection sampling):
-   training-free suffix-tree drafter (DAS) 25-50%; SPEC-RL reuses prev-epoch
-   rollouts as drafts 2-3×; drafter staleness a non-issue at LoRA drift.
-6. **OPD/privileged self-distillation is the only ~10× class move**: HDPO/OPSD
-   distill from the model-itself-with-privileged-context (failing pytest output /
-   reference patch) on all-fail tasks — no external teacher; rescues exactly the
-   zero-gradient tail. Our GKD machinery + `KlReg{reference: Teacher}` slot is
-   the landing zone.
-
-**Blueprint corrections from the survey critic:**
-- **Re-merge is a requant loop, not a free sync.** Folding bf16 LoRA into the FP8
-  base each sync = dequant→add→requant; per-sync quantization ε (bounded if the
-  pristine base is kept; still ε vs exact). Structural alternative: **adapter-
-  separate serving** (LoRA GEMM at inference atop the frozen base — rank-16 cost
-  is tiny), which makes sync a true sub-ms adapter swap. Gate **F.7**: measure
-  merged-vs-separate logit drift + decide; do not assert either way.
-- **Prefix flush-vs-keep, one policy**: PipelineRL measures stale-KV ≈ recompute
-  (only slightly higher divergence) — with generation-time behavior logprobs +
-  token-TIS, keeping KV across adapter swaps is IS-covered; flush stays the
-  conservative default until F.7/F.1 evidence.
-- **Polar (arXiv 2605.24220) independently validates the whole shape**: RL through
-  unmodified Claude Code via an API proxy recording token IDs + logprobs
-  (= our §G.3 engine-native capture), prefix-merged traces (1185→218, 5.39×
-  step time), +4.8 SWE-Bench-Verified through CC on a 4B. Also: KAT-Coder-V2.5,
-  Agent Lightning, verifiers-v1 — harness-in-the-loop is published practice.
-
-Sequencing: T3 lands levers 1+3 structurally (concurrent driver, sample-level
-pipeline, staleness dial); lever 2 is a T4-adjacent scheduler feature
-(pass-rate-driven task selection reading metrics.jsonl); levers 4-6 are
-post-T6 roadmap items, each behind its own gate.
-
-## Field grounding (mid-2026 survey)
-
-verl/NeMo-RL converged on **two pure functions over masked token tensors**
-(advantage estimator + policy loss, config-dispatched) as THE pluggable surface
-— `UpdatePreset` is that shape. GSPO (seq-level ratio) is the winning agentic
-variant; DAPO's knobs (clip-higher / dynamic sampling / token-level loss) are
-the production recipe; detached-IS-weight designs (CISPO) match our op contract.
-Async staleness practice = bounded versions + truncated-IS (our DIS gate) +
-background weight publish; LoRA-only sync per batch is standard. OPD enters the
-same seam as a KL-reference swap (Thinking Machines / AReaL). Trajectory-level
-group advantage broadcast over tokens + tool-output masking remains the
-production norm for SWE agents (DeepSWE, Nebius) — turn-level credit is the
-research frontier the seam leaves room for (per-token advantage vector already
-flows end-to-end).
+verl/NeMo-RL: algorithm surface = advantage-estimator + policy-loss as
+config-dispatched data — `UpdatePreset` is that shape. GSPO wins agentic
+head-to-heads (+13.3% vs GRPO, ARLArena). Async convergence: bounded staleness
+1-2 + truncated token-IS; in-flight weight swap with kept KV ≈ recompute
+(PipelineRL Fig.7); LoRA adapter-only sync is sub-ms in 8/16 libraries.
+Harness-in-the-loop is published practice (Polar, KAT-Coder-V2.5, Agent
+Lightning, verifiers-v1, Cursor Composer). Rollout waste: zero-variance 51-66%
+of groups; GRESO 2.0×, AERO 1.8-1.9×, SPEED-RL 2-6×. OPD 9-30× vs RL
+(Thinking Machines; Qwen3 ~10×); HDPO/OPSD = privileged self-distill without an
+external teacher. Trajectory-level group advantage + tool-output masking remains
+the SWE production norm (DeepSWE, Nebius); turn-level credit is the research
+frontier the per-token advantage vector leaves room for.
