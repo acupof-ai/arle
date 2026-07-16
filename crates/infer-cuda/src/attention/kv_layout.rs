@@ -24,6 +24,11 @@ pub(crate) struct Dsv4CompressorState {
     pub(super) fp32_pending_score: CudaSlice<f32>,
     pub(super) fp32_prev_kv: CudaSlice<f32>,
     pub(super) fp32_prev_score: CudaSlice<f32>,
+    /// The bf16 carry advanced past the FP32 carry (decode-lane update, prefix
+    /// restore, reset) — the next `compressor_fp32_probe` must reseed FP32
+    /// from bf16 before reading pending/prev. Every bf16-carry writer sets it;
+    /// only the probe clears it.
+    pub(super) fp32_carry_stale: bool,
 }
 
 /// Indexer key-staging ring depth (rows): 2 × the max per-forward query chunk.
@@ -86,6 +91,7 @@ impl Dsv4CompressorState {
             fp32_pending_score,
             fp32_prev_kv,
             fp32_prev_score,
+            fp32_carry_stale: false,
         })
     }
 
@@ -111,6 +117,9 @@ impl Dsv4CompressorState {
             .memset_zeros(&mut self.compressed.data)
             .map_err(|e| anyhow::anyhow!("DSv4 compressor compressed reset failed: {e}"))?;
         self.compressed.seq_len = 0;
+        // The FP32 carry still holds the previous occupant; the next probe
+        // reseeds it from the zeroed bf16 carry.
+        self.fp32_carry_stale = true;
         Ok(())
     }
 
@@ -225,9 +234,8 @@ impl Dsv4CompressorFp32Scratch {
 }
 
 /// Max FP32-probe row width over every compressor `compressor_fp32_probe` can
-/// run — MUST mirror the `Dsv4LayerAttentionState::new` gates: main compressor
-/// on `has_compressor()` (overlap ⇔ cr<16), indexer compressor on
-/// `has_indexer()` (always overlap). 0 ⇔ no compressor layer (no scratch).
+/// run — main compressor on `has_compressor()` (overlap ⇔ cr<16), indexer
+/// compressor on CSA only. 0 ⇔ no probing layer (no scratch).
 pub(crate) fn dsv4_compressor_fp32_max_width(
     config: &DeepSeekV4Config,
     layers: impl IntoIterator<Item = (DeepSeekV4AttentionMode, usize)>,
@@ -240,7 +248,9 @@ pub(crate) fn dsv4_compressor_fp32_max_width(
             } else {
                 0
             };
-            let indexer = if mode.has_indexer() {
+            // Narrower than has_indexer() on purpose: SparseIndexed (GLM) index
+            // keys go through sparse_indexed_index_key_forward and never probe.
+            let indexer = if mode == DeepSeekV4AttentionMode::CompressedSparse {
                 dsv4_compressor_width(config.index_head_dim, true)
             } else {
                 0

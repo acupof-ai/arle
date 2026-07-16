@@ -1036,11 +1036,17 @@ impl Dsv4LayerAttentionState {
         } else {
             0
         };
+        // The restore rewrote the bf16 carry (overlap registers + pending tail)
+        // while the FP32 probe carry still holds the previous occupant — the
+        // next probe reseeds FP32 from the restored bf16 (cross-request
+        // contamination otherwise).
         if let Some(c) = &mut self.compressor {
             c.compressed.seq_len = comp_rows;
+            c.fp32_carry_stale = true;
         }
         if let Some(ix) = &mut self.indexer {
             ix.compressed.seq_len = index_rows;
+            ix.fp32_carry_stale = true;
         }
         if let Some(dsa) = &mut self.dsa_official {
             dsa.packed_rows = index_rows;

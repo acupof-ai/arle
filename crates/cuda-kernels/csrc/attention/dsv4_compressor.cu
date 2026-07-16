@@ -527,8 +527,8 @@ __global__ void dsv4_compressor_block_kernel(
 // produced block's first-half tokens) and the trailing `pending` partial block.
 // Single block (both writes are O(ratio·head_dim), tiny). The __syncthreads
 // separates the prev_overlap reads of the OLD pending from the pending writes.
-// The FP32 path (T = float) also mirrors the prev_overlap page to bf16 for the
-// decode-lane readers; bf16 callers pass nullptr mirrors.
+// The FP32 path (T = float) also mirrors the prev_overlap AND pending writes to
+// bf16 for the decode-lane readers; bf16 callers pass nullptr mirrors.
 template <typename T>
 __global__ void dsv4_compressor_finalize_kernel(
     const T *__restrict__ kv_raw,
@@ -540,6 +540,8 @@ __global__ void dsv4_compressor_finalize_kernel(
     T *__restrict__ prev_overlap_score,
     uint16_t *__restrict__ prev_overlap_kv_mirror,
     uint16_t *__restrict__ prev_overlap_score_mirror,
+    uint16_t *__restrict__ pending_kv_mirror,
+    uint16_t *__restrict__ pending_score_mirror,
     int num_tokens,
     int start_pos,
     int pending_len,
@@ -554,6 +556,10 @@ __global__ void dsv4_compressor_finalize_kernel(
   int block_start0 = start_pos - pending_len;
   int total = pending_len + num_tokens;
 
+  // completed == 0 leaves prev_overlap (FP32 and bf16 mirror alike) untouched:
+  // the two carries are coherent at every probe entry (probe-exit mirror or the
+  // host-side stale reseed), and a pending-only call changes neither — so the
+  // deleted serial probe's unconditional re-mirror was redundant, not load-bearing.
   if (overlap && completed > 0) {
     int last_block_start = block_start0 + (completed - 1) * ratio;
     // Absolute block index of the LAST block this call completed — always
@@ -592,6 +598,10 @@ __global__ void dsv4_compressor_finalize_kernel(
                     dsv4_compressor_load(ape[(abs_pos % ratio) * width + col]);
       pending_kv[dst] = dsv4_compressor_store<T>(kv);
       pending_score[dst] = dsv4_compressor_store<T>(score);
+      if (pending_kv_mirror != nullptr) {
+        pending_kv_mirror[dst] = dsv4_attn_f32_to_bf16_bits(kv);
+        pending_score_mirror[dst] = dsv4_attn_f32_to_bf16_bits(score);
+      }
     }
   } else {
     int new_pending = total - completed * ratio;
@@ -607,8 +617,66 @@ __global__ void dsv4_compressor_finalize_kernel(
           ratio, width, col);
       pending_kv[idx] = dsv4_compressor_store<T>(kv);
       pending_score[idx] = dsv4_compressor_store<T>(score);
+      if (pending_kv_mirror != nullptr) {
+        pending_kv_mirror[idx] = dsv4_attn_f32_to_bf16_bits(kv);
+        pending_score_mirror[idx] = dsv4_attn_f32_to_bf16_bits(score);
+      }
     }
   }
+}
+
+// FP32-carry reseed: bf16 → f32 upcast of the four per-state carry buffers
+// (pending kv/score = `pending_elems` each, prev_overlap kv/score =
+// `prev_elems` each). Launched when the bf16 decode lane / prefix restore /
+// reset advanced the bf16 carry since the last FP32 probe — the bf16 carry is
+// then the authority and the probe must not read the stale FP32 copy.
+__global__ void dsv4_compressor_fp32_carry_reseed_kernel(
+    const uint16_t *__restrict__ pending_kv_bf16,
+    const uint16_t *__restrict__ pending_score_bf16,
+    const uint16_t *__restrict__ prev_kv_bf16,
+    const uint16_t *__restrict__ prev_score_bf16,
+    float *__restrict__ pending_kv,
+    float *__restrict__ pending_score,
+    float *__restrict__ prev_kv,
+    float *__restrict__ prev_score,
+    int pending_elems,
+    int prev_elems) {
+  int total = pending_elems + prev_elems;
+  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < total;
+       i += gridDim.x * blockDim.x) {
+    if (i < pending_elems) {
+      pending_kv[i] = dsv4_attn_bf16_to_f32(pending_kv_bf16[i]);
+      pending_score[i] = dsv4_attn_bf16_to_f32(pending_score_bf16[i]);
+    } else {
+      int j = i - pending_elems;
+      prev_kv[j] = dsv4_attn_bf16_to_f32(prev_kv_bf16[j]);
+      prev_score[j] = dsv4_attn_bf16_to_f32(prev_score_bf16[j]);
+    }
+  }
+}
+
+extern "C" CUresult dsv4_compressor_fp32_carry_reseed_cuda(
+    const uint16_t *pending_kv_bf16,
+    const uint16_t *pending_score_bf16,
+    const uint16_t *prev_kv_bf16,
+    const uint16_t *prev_score_bf16,
+    float *pending_kv,
+    float *pending_score,
+    float *prev_kv,
+    float *prev_score,
+    int pending_elems,
+    int prev_elems,
+    CUstream stream) {
+  if (pending_elems < 0 || prev_elems < 0) {
+    return CUDA_ERROR_INVALID_VALUE;
+  }
+  int total = pending_elems + prev_elems;
+  if (total == 0) return CUDA_SUCCESS;
+  int blocks = (total + DSV4_ATTN_BLOCK - 1) / DSV4_ATTN_BLOCK;
+  dsv4_compressor_fp32_carry_reseed_kernel<<<blocks, DSV4_ATTN_BLOCK, 0, (cudaStream_t)stream>>>(
+      pending_kv_bf16, pending_score_bf16, prev_kv_bf16, prev_score_bf16,
+      pending_kv, pending_score, prev_kv, prev_score, pending_elems, prev_elems);
+  return (CUresult)cudaGetLastError();
 }
 
 extern "C" CUresult dsv4_compressor_update_cuda(
@@ -660,8 +728,9 @@ extern "C" CUresult dsv4_compressor_update_cuda(
   }
   dsv4_compressor_finalize_kernel<<<1, DSV4_ATTN_BLOCK, 0, (cudaStream_t)stream>>>(
       kv_raw, score_raw, ape, pending_kv, pending_score, prev_overlap_kv,
-      prev_overlap_score, nullptr, nullptr, num_tokens, start_pos, pending_len,
-      completed, head_dim, ratio, width, overlap, overlap_page_stride);
+      prev_overlap_score, nullptr, nullptr, nullptr, nullptr, num_tokens,
+      start_pos, pending_len, completed, head_dim, ratio, width, overlap,
+      overlap_page_stride);
   return (CUresult)cudaGetLastError();
 }
 
@@ -676,6 +745,8 @@ extern "C" CUresult dsv4_compressor_fp32_prefill_probe_cuda(
     float *prev_overlap_score,
     uint16_t *prev_overlap_kv_bf16,
     uint16_t *prev_overlap_score_bf16,
+    uint16_t *pending_kv_bf16,
+    uint16_t *pending_score_bf16,
     uint16_t *compressed,
     int num_tokens,
     int start_pos,
@@ -715,8 +786,8 @@ extern "C" CUresult dsv4_compressor_fp32_prefill_probe_cuda(
   dsv4_compressor_finalize_kernel<<<1, DSV4_ATTN_BLOCK, 0, (cudaStream_t)stream>>>(
       kv_raw, score_raw, ape, pending_kv, pending_score, prev_overlap_kv,
       prev_overlap_score, prev_overlap_kv_bf16, prev_overlap_score_bf16,
-      num_tokens, start_pos, pending_len, completed, head_dim, ratio, width,
-      overlap, overlap_page_stride);
+      pending_kv_bf16, pending_score_bf16, num_tokens, start_pos, pending_len,
+      completed, head_dim, ratio, width, overlap, overlap_page_stride);
   return (CUresult)cudaGetLastError();
 }
 
