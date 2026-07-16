@@ -1,0 +1,23 @@
+docs/experience/wins/2026-07-16-l3-direct-storage-engine.md
+  s_6773c539a98594::t_e0c007c116ef2c 1-88
+docs/plans/2026-07-16-l3-direct-storage-engine.md
+  s_6773c539a98594::t_9d46e1bfd80817 1-153
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "3fcd3b72189028402cc5c7dab6a1bde54ea299da",
+  "prompts": {},
+  "sessions": {
+    "s_6773c539a98594": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f69e3-547c-7460-94f3-f1366a2a8a05",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
