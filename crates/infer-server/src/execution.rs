@@ -156,17 +156,27 @@ fn engine_loop_with_tick_broadcaster<E, K>(
     let mut submit_open = true;
     let trace_submit = crate::submit_trace_enabled();
 
+    // Streaming requests whose receiver hung up (client gone): recorded by the
+    // observer inside `engine.step()`, cancelled by the loop body after the step
+    // (the observer can't touch the engine reentrantly).
+    let dropped_streams: Rc<RefCell<Vec<RequestHandle>>> = Rc::default();
+
     // Forward each committed token to its request's live stream (if any). Runs on
     // the engine thread inside `engine.step()`, so it shares `streamers` via the
     // single-threaded `Rc<RefCell<_>>`. The blocking `pending` path is untouched.
     {
         let streamers = Rc::clone(&streamers);
+        let dropped_streams = Rc::clone(&dropped_streams);
         engine.set_token_observer(Box::new(move |handle, token| {
-            if let Some(tx) = streamers.borrow().get(&handle) {
-                let _ = tx.send(StreamItem::Token {
-                    token: token.token,
-                    logprob: token.logprob,
-                });
+            if let Some(tx) = streamers.borrow().get(&handle)
+                && tx
+                    .send(StreamItem::Token {
+                        token: token.token,
+                        logprob: token.logprob,
+                    })
+                    .is_err()
+            {
+                dropped_streams.borrow_mut().push(handle);
             }
         }));
     }
@@ -194,7 +204,12 @@ fn engine_loop_with_tick_broadcaster<E, K>(
         //    (OPD raw-logits forward, weight offload/reload, LoRA re-merge). These
         //    run between steps with no request in flight, so `&mut E` access is
         //    exclusive. A disconnected control channel is benign (frontend gone).
-        drain_control(&mut engine, &control_rx);
+        //    A closure may have cancelled requests (client disconnect / quiesce
+        //    orphan sweep); deliver those completions even if the engine is now
+        //    idle and never reaches the post-step delivery below.
+        if drain_control(&mut engine, &control_rx) > 0 {
+            deliver_completions(&engine, &mut pending, &streamers);
+        }
 
         // 1. Drain every queued submission without blocking (plus any idle-park
         //    carry). Admission happens AFTER the lockstep broadcast below.
@@ -273,6 +288,23 @@ fn engine_loop_with_tick_broadcaster<E, K>(
                 pending.clear();
                 return;
             }
+            // Cancel requests whose stream receiver hung up mid-decode so the
+            // row frees its KV slot instead of decoding to max_tokens. Local
+            // lane only: in lockstep mode a cancellation must arrive on every
+            // rank via the rank-synchronized `CancelRequest` broadcast, or the
+            // scheduler states desync.
+            let dropped = std::mem::take(&mut *dropped_streams.borrow_mut());
+            if !lockstep {
+                for handle in dropped {
+                    streamers.borrow_mut().remove(&handle);
+                    if engine.cancel_request(handle) {
+                        log::info!(
+                            "[serve-engine] cancelled request {} (stream receiver dropped)",
+                            handle.id()
+                        );
+                    }
+                }
+            }
             deliver_completions(&engine, &mut pending, &streamers);
             if let Some(start) = step_start {
                 let step_ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -306,17 +338,23 @@ fn engine_loop_with_tick_broadcaster<E, K>(
 }
 
 /// Run every queued control closure against the engine's executor without
-/// blocking. Each closure carries its own response channel, so the loop only
-/// invokes it. A disconnected channel is benign (the frontend dropped its
-/// `ServeHandle`); the loop's normal shutdown path still runs.
-fn drain_control<E, K>(engine: &mut Engine<E, K>, control_rx: &Receiver<ControlMessage<E, K>>)
+/// blocking, returning how many ran. Each closure carries its own response
+/// channel, so the loop only invokes it. A disconnected channel is benign (the
+/// frontend dropped its `ServeHandle`); the loop's normal shutdown path still runs.
+fn drain_control<E, K>(
+    engine: &mut Engine<E, K>,
+    control_rx: &Receiver<ControlMessage<E, K>>,
+) -> usize
 where
     E: BackendExecutor,
     K: KvPool,
 {
+    let mut ran = 0;
     while let Ok(closure) = control_rx.try_recv() {
         closure(engine);
+        ran += 1;
     }
+    ran
 }
 
 fn abort_pending(pending: &mut PendingCompletions, streamers: &Streamers) {
