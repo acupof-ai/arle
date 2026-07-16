@@ -2796,9 +2796,13 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
     // Rollout engine (student) doubles as the cc serve. KV budget for cc
     // traffic: K concurrent cc streams × the measured session ceiling, +25%
     // headroom, page_size 16.
-    use train::cc_harness::CC_SESSION_TOKENS;
+    use train::cc_harness::{CC_MAX_SESSION_TOKENS, CC_SESSION_TOKENS};
     let width = args.samples_per_prompt.max(1);
-    let cc_pages = width * CC_SESSION_TOKENS.div_ceil(16);
+    // Pool = K typical streams, but never smaller than one full long-horizon
+    // session (+25% headroom each) so a 200K session stays schedulable.
+    let cc_pages = (width * CC_SESSION_TOKENS)
+        .max(CC_MAX_SESSION_TOKENS)
+        .div_ceil(16);
     let cc_total_pages = cc_pages + cc_pages / 4;
 
     // Load order: default loads the autograd student FIRST (engine then sees
