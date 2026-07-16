@@ -1,0 +1,21 @@
+crates/kv-native-sys/src/kv_tier.rs
+  s_0837ed412322fe::t_ee924c25cfcde4 38,341,391,400-407,615,649,873,882-883,902-916,929-935,937,943,1042,1051,1182,1192,1274-1293,2041-2050
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "f72ab2e91f7fb6f7915ec827643c937f46f22c71",
+  "prompts": {},
+  "sessions": {
+    "s_0837ed412322fe": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f6a12-61c8-7bc3-a029-b359f1f4a3ed",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
