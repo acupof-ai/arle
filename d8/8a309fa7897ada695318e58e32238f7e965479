@@ -1,0 +1,23 @@
+crates/cli/src/train_cli.rs
+  s_9c91b86ec3fb55::t_f985316e4e36fc 2845-2850,3080-3082,3380,3403,3516-3518
+crates/infer-core/src/lib.rs
+  s_9c91b86ec3fb55::t_bb119a84c863ec 842-847
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "d88a309fa7897ada695318e58e32238f7e965479",
+  "prompts": {},
+  "sessions": {
+    "s_9c91b86ec3fb55": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4779911a-69b7-49db-bc83-daf5a48d6ca3",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
