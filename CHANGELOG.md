@@ -23,6 +23,15 @@ Progress spine. Entry classes recorded here the day they land: phase exits,
 default flips, and accept-or-reject verdicts (AGENTS.md §Docs lifecycle &
 progress spine).
 
+- **2026-07-16 — DSv4 FP32 prefill compressor grid-parallelized; serial probe
+  kernel deleted (accept).** The `<<<1,256>>>` FP32 probe serially swept every
+  compressed block per prefill call; now launches the templated grid-parallel
+  block/finalize kernels (bit-identical FP32 numerics). Same-shell A/B (4×H20
+  TP=4, eager): total tok/s +3.7%..+6.3% at rates 1–16, +18.9% at c=32; needle
+  zero-miss at depths 0.0/0.5. Both arms log `256 slots clamped to 2`
+  (per-slot FP32 scratch, hoisted in `672b8ac08`, A/B pending) — slots, not
+  kernels, are the remaining high-concurrency wall. Entry:
+  [wins](docs/experience/wins/2026-07-16-dsv4-fp32-compressor-grid-parallel.md).
 - **2026-07-16 — DSv4 FP32 probe limited to prefill; unblocks DSpark (MTP)
   decode.** The all-boundaries FP32 compressor was running the FP32 probe on
   every decode token, including the DSpark draft phase (each draft token
