@@ -1,0 +1,27 @@
+crates/infer-core/src/lib.rs
+  s_28825b290b9e51::t_19a150fd933ecd 4324-4364
+crates/infer-cuda/src/executor.rs
+  s_28825b290b9e51::t_dcfcbd0d9b9188 647-652,654-661
+crates/infer-cuda/src/executor/qwen35.rs
+  s_28825b290b9e51::t_ad8e9e8bd017c6 456-475
+docs/experience/wins/2026-07-17-qwen35-release-kv-slot-lockstep.md
+  s_28825b290b9e51::t_d57108663a17a8 1-44
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "655198493756482fa450be4a3c012886f82e110d",
+  "prompts": {},
+  "sessions": {
+    "s_28825b290b9e51": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a37f9ed5dbf9a3db9",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
