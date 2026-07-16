@@ -1087,6 +1087,23 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         false
     }
 
+    /// Cancel every waiting + active request ([`Self::cancel_request`] per
+    /// handle, same release path). Orphan sweep for a caller that knows all
+    /// clients are gone (e.g. the OPD round-loop quiesce after its cc
+    /// children exited). Same multiproc invariant as `cancel_request`.
+    pub fn cancel_all_requests(&mut self) -> Vec<RequestHandle> {
+        let handles: Vec<RequestHandle> = self
+            .waiting
+            .iter()
+            .map(|r| r.handle)
+            .chain(self.active.values().map(|r| r.handle))
+            .collect();
+        for &handle in &handles {
+            self.cancel_request(handle);
+        }
+        handles
+    }
+
     fn record_attached_prefix_metrics(&mut self, attached_pages: usize) {
         if !self.config.enable_prefix_cache {
             return;
