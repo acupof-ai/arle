@@ -198,6 +198,7 @@ impl CcHarness {
                 t_start_ms: s.t_start_ms,
                 t_end_ms: s.t_end_ms,
                 reward: s.reward,
+                model: Some(sample_model(&self.model_id, s.sample)),
             })
             .collect();
         let records = convert_cc_dumps(&self.dump_dir, &self.tokenizer, &windows)?;
@@ -213,9 +214,12 @@ impl CcHarness {
     /// then the single Rust reward definition (`git diff` gate →
     /// `score_workdir`; errors fold into reward 0).
     fn run_sample(&self, task: &SweTask, sample: usize, workdir: &Path) -> ScoredSample {
+        // Per-sample model tag: the serve echoes `model` back without
+        // interpreting it, so concurrent samples' dumps stay attributable.
+        let model = sample_model(&self.model_id, sample);
         let mut cmd = Command::new("claude");
         cmd.arg("-p")
-            .args(["--model", &self.model_id])
+            .args(["--model", &model])
             // Allowlist keeps CC off WebFetch/WebSearch/Task — the sandbox is
             // offline and one web call stalls on CC's ~38s retry-backoff.
             .args(["--allowedTools", "Bash Read Write Edit Grep Glob"])
@@ -227,8 +231,8 @@ impl CcHarness {
             // Mandatory on a root container: --dangerously-skip-permissions
             // refuses under uid 0 without it.
             .env("IS_SANDBOX", "1")
-            .env("ANTHROPIC_MODEL", &self.model_id)
-            .env("ANTHROPIC_SMALL_FAST_MODEL", &self.model_id)
+            .env("ANTHROPIC_MODEL", &model)
+            .env("ANTHROPIC_SMALL_FAST_MODEL", &model)
             .env("DISABLE_TELEMETRY", "1")
             .env("DISABLE_AUTOUPDATER", "1")
             .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1");
@@ -319,6 +323,12 @@ fn cc_prompt(problem_statement: &str) -> String {
          failure. Do not write or run the hidden tests (they are applied at scoring time). Do \
          not commit."
     )
+}
+
+/// The model id a sample requests with: `<model>#s<k>`. Distinct per sample so
+/// dump attribution never relies on wall-clock alone under concurrency.
+fn sample_model(model_id: &str, sample: usize) -> String {
+    format!("{model_id}#s{sample}")
 }
 
 fn epoch_ms() -> u64 {
