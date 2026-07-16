@@ -1,0 +1,21 @@
+crates/cli/src/args.rs
+  s_6773c539a98594::t_58fe97d388489d 1788,2029
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "5fa4ded48b89d8bc4dc8b25e00840f743730854b",
+  "prompts": {},
+  "sessions": {
+    "s_6773c539a98594": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f69e3-547c-7460-94f3-f1366a2a8a05",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
