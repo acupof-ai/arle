@@ -23,6 +23,15 @@ Progress spine. Entry classes recorded here the day they land: phase exits,
 default flips, and accept-or-reject verdicts (AGENTS.md §Docs lifecycle &
 progress spine).
 
+- **2026-07-16 — DSv4 FP32 probe limited to prefill; DSpark (MTP) decode
+  throughput recovered.** The all-boundaries FP32 compressor was running the
+  FP32 probe on every decode token, including the DSpark draft phase. Guarded
+  to prefill only (`start_pos_device.is_none()`); simplified the guard from 5
+  conditions to 3. Needle gate: depth 0.0 all-pass, depth 0.5 no-misses
+  (prefill correctness preserved). DSpark MTP bench: ~2× output tok/s (19–25
+  → 48–49), ITL p50 flat at 40.8ms (compute-bound, not probe-bound).
+  [bench](docs/experience/wins/2026-07-16-dsv4-fp32-probe-prefill-only-dspark-recovery.md).
+
 - **2026-07-16 — DSv4 FP32 compressor extended to all compression boundaries.**
   The FP32 main-value compressor now runs on every prefill compression boundary
   (any `start_pos`, with prior compressed state), not just the first boundary.
