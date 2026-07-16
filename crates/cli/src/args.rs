@@ -2028,10 +2028,11 @@ pub(crate) struct TrainAgentOpdArgs {
     #[arg(long, value_name = "DIR")]
     pub(crate) save_lora_adapters: Option<PathBuf>,
 
-    /// Resume from a previously-saved PEFT LoRA adapter dir (a
+    /// Crash-resume from a previously-saved PEFT LoRA adapter dir (a
     /// `--save-lora-adapters` round output, containing `adapter_model.safetensors`):
-    /// overlays its A/B weights onto the fresh student before training/eval so an
-    /// online loop can chain adapters round-to-round. Fresh zero-B LoRA if unset.
+    /// overlays its A/B weights onto the fresh student before training/eval.
+    /// Fresh zero-B LoRA if unset. Round-to-round chaining is in-process (the
+    /// adapter stays in the TensorStore), not a use of this flag.
     #[arg(long, value_name = "DIR")]
     pub(crate) lora_adapters: Option<PathBuf>,
 
