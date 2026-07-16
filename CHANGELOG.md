@@ -23,6 +23,14 @@ Progress spine. Entry classes recorded here the day they land: phase exits,
 default flips, and accept-or-reject verdicts (AGENTS.md §Docs lifecycle &
 progress spine).
 
+- **2026-07-16 — DSv4 FP32 compressor extended to all compression boundaries.**
+  The FP32 main-value compressor now runs on every prefill compression boundary
+  (any `start_pos`, with prior compressed state), not just the first boundary.
+  This fixes the depth=0.5 needle retrieval corruption at len=600 (#146, #150).
+  Needle gate: depth 0.0 all-pass (9 lengths), depth 0.5 no-misses. Performance
+  cost: −17% to −36% total tok/s vs first-boundary-only (redundant FP32 GEMM per
+  boundary). [bench](docs/experience/wins/2026-07-16-dsv4-fp32-compressor-all-boundaries.md).
+
 - **2026-07-16 — DSv4 FP32 compressor promoted to default.** The FP32
   main-value compressor (fixes #146 VIOLET-6529→4929, #150 738291→738292) is
   now always-on, replacing the BF16 compressor for single-prefill. The
