@@ -2100,14 +2100,15 @@ fn task_key(label: Option<&str>) -> &str {
     label.unwrap_or("").split('#').next().unwrap_or("")
 }
 
-/// SAO replay: group cc records by task, then per group capture π_rollout (θ is
-/// the current adapter = the rollout policy) and apply the same
-/// [`UpdateStrategy::update`] the online path uses. Advantage is group-scoped
-/// (reward − group-mean; a singleton group → advantage 0 → no update).
+/// PG-preset replay: group cc records by task, then per group capture
+/// π_behavior (θ is the current adapter = the rollout policy) and apply the same
+/// [`train::update_strategy::UpdatePreset::update`] the online path uses. One
+/// update call per group, so batch-scoped advantages center over the group —
+/// the replay grain IS the group.
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
-fn replay_sao(
-    strategy: train::update_strategy::UpdateStrategy,
+fn replay_pg(
+    preset: train::update_strategy::UpdatePreset,
     args: &TrainAgentOpdArgs,
     records: &[ReplayRecord],
     student: &train::qwen35::Qwen35Model,
@@ -2119,24 +2120,23 @@ fn replay_sao(
     per_epoch_cap: usize,
     store: &mut autograd::TensorStore,
 ) -> Result<()> {
-    use train::update_strategy::ScoredTrajectory;
+    use train::update_strategy::{Advantage, ScoredTrajectory};
 
-    // Value critic (Phase 2 only), built after the `trainable` filter so it rides
-    // `all_params` (kept, never stepped) — mirrors the online path.
-    let mut value_critic = args
-        .update_strategy
-        .needs_value_critic()
-        .then(|| {
+    // Value critic (ValueGae only), built after the `trainable` filter so it
+    // rides `all_params` (kept, never stepped) — mirrors the online path.
+    let mut value_critic = match preset.advantage {
+        Advantage::ValueGae { gamma, lam } => Some(
             train::opd::ValueCritic::new(
                 student.config().hidden_size,
                 args.value_lr,
-                args.sao_gamma,
-                args.sao_lambda,
+                gamma,
+                lam,
                 store,
             )
-            .map_err(anyhow::Error::from)
-        })
-        .transpose()?;
+            .map_err(anyhow::Error::from)?,
+        ),
+        _ => None,
+    };
 
     // First-seen-ordered task groups (small n → linear find is the lowest-entropy
     // form). `--writeback-cap` bounds the records considered, as in the CE path.
@@ -2149,36 +2149,45 @@ fn replay_sao(
         }
     }
     eprintln!(
-        "[agent-opd] replay SAO: strategy={strategy:?} groups={} records={}",
+        "[agent-opd] replay PG: preset={preset:?} groups={} records={}",
         groups.len(),
         records.len()
     );
 
+    let needs = preset.needs();
     for epoch in 0..epochs {
         let mut losses = Vec::new();
-        for (_key, idxs) in &groups {
+        for (group_id, (_key, idxs)) in groups.iter().enumerate() {
             let batch: Vec<ScoredTrajectory> = idxs
                 .iter()
                 .map(|&idx| {
                     let r = &records[idx];
-                    let rollout_logprobs = train::opd::capture_rollout_logprobs(
-                        student,
-                        &r.prompt_ids,
-                        &r.response_ids,
-                        &r.response_mask,
-                        store,
-                    )
-                    .map_err(anyhow::Error::from)?;
+                    let rollout_logprobs = needs
+                        .rollout_logprobs
+                        .then(|| {
+                            train::opd::capture_rollout_logprobs(
+                                student,
+                                &r.prompt_ids,
+                                &r.response_ids,
+                                &r.response_mask,
+                                store,
+                            )
+                            .map_err(anyhow::Error::from)
+                        })
+                        .transpose()?;
                     Ok(ScoredTrajectory {
                         prompt_ids: r.prompt_ids.clone(),
                         response_ids: r.response_ids.clone(),
                         response_mask: r.response_mask.clone(),
                         reward: r.reward,
-                        rollout_logprobs: Some(rollout_logprobs),
+                        rollout_logprobs,
+                        group_id,
+                        // Replay records don't carry the terminal state.
+                        truncated: false,
                     })
                 })
                 .collect::<Result<_>>()?;
-            let loss = strategy
+            let loss = preset
                 .update(
                     &batch,
                     student,
@@ -2199,7 +2208,7 @@ fn replay_sao(
             losses.iter().sum::<f32>() / losses.len() as f32
         };
         eprintln!(
-            "[agent-opd] replay SAO epoch={epoch} groups={} mean_loss={mean_loss:.4}",
+            "[agent-opd] replay PG epoch={epoch} groups={} mean_loss={mean_loss:.4}",
             losses.len()
         );
     }
@@ -2222,7 +2231,7 @@ fn run_agent_opd_replay(
         opd::{gkd_writeback_step, masked_writeback_ce_step_dispatch},
         qwen35_checkpoint::load_qwen35_lora_adapters,
         qwen35_loader::load_qwen35_lora_from_hf_dir_with_shared_base,
-        update_strategy::UpdateStrategy,
+        update_strategy::RatioGrain,
     };
 
     use crate::args::GkdTeacherArg;
@@ -2323,14 +2332,16 @@ fn run_agent_opd_replay(
     }
     log_opd_vram("replay: after student load", &train_backend);
 
-    // Default rejection-CE (incl. GKD) is byte-identical to before; sao-dis /
-    // sao-value dispatch to the same `UpdateStrategy::update` the online path uses.
-    let update_strategy = args
-        .update_strategy
-        .to_strategy(args.sao_eps_low, args.sao_eps_high);
+    // Default rejection-CE (incl. GKD) is byte-identical to before; ratio-
+    // weighted presets dispatch to the same `UpdatePreset::update` the online
+    // path uses.
+    let preset = args.update_preset();
     let epochs = args.replay_epochs.max(1);
     let per_epoch_cap = args.writeback_cap.unwrap_or(usize::MAX);
-    if matches!(update_strategy, UpdateStrategy::RejectionCe) {
+    // The flat CE arm keeps the pre-preset record-order + filter-then-cap
+    // semantics byte-identical and hosts the GKD teacher fork (a distribution-
+    // level KL, not a per-token weight — it dies in T5 with the cc harness).
+    if preset.ratio == RatioGrain::None {
         // Rejection sampling: imitate only SOLVED trajectories. Now that cc
         // collects failing attempts too (for SAO's 0-reward arm), CE must reject
         // them — imitating a failed fix is actively harmful. reward == 1.0 iff all
@@ -2394,8 +2405,8 @@ fn run_agent_opd_replay(
             );
         }
     } else {
-        replay_sao(
-            update_strategy,
+        replay_pg(
+            preset,
             args,
             &records,
             &student,
@@ -2752,22 +2763,23 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
     );
 
     let mut optimizer = AdamW::new(args.lr, (0.9, 0.999), 1.0e-8, 0.0);
-    // SAO Phase 2 critic: its weight is created AFTER the `trainable` filter and
-    // is not a student param, so the policy optimizer / LoRA sync / adapter save
-    // never touch it — a fully isolated critic with its own AdamW.
-    let mut value_critic = if args.update_strategy.needs_value_critic() {
-        Some(
+    // Pluggable policy-update preset (default rejection-CE = byte-identical).
+    let update_preset = args.update_preset();
+    // Value critic (ValueGae presets): its weight is created AFTER the
+    // `trainable` filter and is not a student param, so the policy optimizer /
+    // LoRA sync / adapter save never touch it — fully isolated, own AdamW.
+    let mut value_critic = match update_preset.advantage {
+        train::update_strategy::Advantage::ValueGae { gamma, lam } => Some(
             train::opd::ValueCritic::new(
                 student.config().hidden_size,
                 args.value_lr,
-                args.sao_gamma,
-                args.sao_lambda,
+                gamma,
+                lam,
                 &mut store,
             )
             .map_err(anyhow::Error::from)?,
-        )
-    } else {
-        None
+        ),
+        _ => None,
     };
 
     // Diagnostic: skip the (slow, stochastic) agent rollout and drive ONE masked-CE
@@ -2819,11 +2831,6 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
         return Ok(());
     }
 
-    // Pluggable policy update (default rejection-CE = byte-identical to before).
-    let update_strategy = args
-        .update_strategy
-        .to_strategy(args.sao_eps_low, args.sao_eps_high);
-
     // rounds:1 — the round loop is external (mirroring rubric-OPD); each call runs
     // one round, then the caller syncs the trained LoRA into the rollout engine.
     let cfg = train::agent_opd::AgentOpdConfig {
@@ -2842,7 +2849,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
         pythonpath: args.pythonpath.clone(),
         bash_timeout_secs: args.bash_timeout_secs,
         test_timeout_secs: args.test_timeout_secs,
-        update_strategy,
+        update_strategy: update_preset,
     };
 
     // PEFT adapter config for `--save-lora-adapters` (mainstream HF PEFT dir:
@@ -2890,7 +2897,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
             let opt_ref = &mut optimizer;
             let critic_slot = &mut value_critic;
             let writeback_window = args.writeback_window;
-            let needs = update_strategy.needs();
+            let needs = update_preset.needs();
             train::agent_opd::run_agentic_opd_round(
                 &infer_student,
                 &tasks,
@@ -2939,7 +2946,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
                             traj.rollout_logprobs = Some(lp);
                         }
                     }
-                    update_strategy
+                    update_preset
                         .update(
                             &scored,
                             student_ref,
