@@ -80,6 +80,27 @@ pub struct KvTierReadHits {
     pub disk: u64,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KvTierIoMode {
+    #[default]
+    Disabled,
+    Mmap,
+    Direct,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KvTierIoStats {
+    pub mode: KvTierIoMode,
+    pub useful_read_bytes: u64,
+    pub useful_write_bytes: u64,
+    pub submitted_read_bytes: u64,
+    pub submitted_write_bytes: u64,
+    pub metadata_write_bytes: u64,
+    pub failures: u64,
+    pub completion_wait_ns: u64,
+}
+
 /// Count the largest leading prefix that is complete for a pages-only KV
 /// restore contract.
 ///
@@ -317,6 +338,10 @@ pub trait BackendExecutor {
 
     fn kv_tier_read_hits(&self) -> KvTierReadHits {
         KvTierReadHits::default()
+    }
+
+    fn kv_tier_io_stats(&self) -> KvTierIoStats {
+        KvTierIoStats::default()
     }
 
     fn kv_tier_transfer_is_zero_copy(&self) -> bool {

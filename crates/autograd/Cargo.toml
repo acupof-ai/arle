@@ -19,6 +19,7 @@ safetensors = ["dep:safetensors", "dep:memmap2", "dep:half"]
 
 [dependencies]
 anyhow = "1.0"
+bytemuck = "1"
 cuda-kernels = { path = "../cuda-kernels", optional = true, default-features = false }
 cudarc = { version = "0.19", features = [
     "cuda-version-from-build-system",
@@ -27,6 +28,8 @@ cudarc = { version = "0.19", features = [
 ], optional = true }
 half = { version = "2", optional = true }
 libm.workspace = true
+kv-native-sys = { path = "../kv-native-sys" }
+log = "0.4"
 # Hand-tuned AVX2/SSE2 single-threaded f32 sgemm. cpu_matmul_forward and
 # cpu_matmul_backward route every rank-2 / rank-3 tile through
 # matrixmultiply::sgemm so the CPU training substrate gets packed-tile cache

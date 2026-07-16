@@ -23,6 +23,41 @@ fn qwen35_batched_decode_enabled() -> bool {
     crate::runtime_flags::qwen35_batched_decode()
 }
 
+fn merge_tier_io_stats(
+    slot: &kv_native_sys::TierIoStats,
+    recall: &kv_native_sys::TierIoStats,
+) -> infer_seam::KvTierIoStats {
+    let mode = if [slot.mode, recall.mode].contains(&kv_native_sys::DiskIoMode::Direct) {
+        infer_seam::KvTierIoMode::Direct
+    } else if [slot.mode, recall.mode].contains(&kv_native_sys::DiskIoMode::Mmap) {
+        infer_seam::KvTierIoMode::Mmap
+    } else {
+        infer_seam::KvTierIoMode::Disabled
+    };
+    infer_seam::KvTierIoStats {
+        mode,
+        useful_read_bytes: slot
+            .useful_read_bytes
+            .saturating_add(recall.useful_read_bytes),
+        useful_write_bytes: slot
+            .useful_write_bytes
+            .saturating_add(recall.useful_write_bytes),
+        submitted_read_bytes: slot
+            .submitted_read_bytes
+            .saturating_add(recall.submitted_read_bytes),
+        submitted_write_bytes: slot
+            .submitted_write_bytes
+            .saturating_add(recall.submitted_write_bytes),
+        metadata_write_bytes: slot
+            .metadata_write_bytes
+            .saturating_add(recall.metadata_write_bytes),
+        failures: slot.failures.saturating_add(recall.failures),
+        completion_wait_ns: slot
+            .completion_wait_ns
+            .saturating_add(recall.completion_wait_ns),
+    }
+}
+
 /// Decode-graph replay/capture probes — static so the pod bench can PROVE
 /// replay reuse from server logs (license requires reuse evidence, not
 /// capture-exists). Expected steady state: captures == live slots (≤
@@ -561,6 +596,15 @@ impl Qwen35CudaExecutor {
 
     pub(crate) fn kv_tier_disk_pages(&self) -> usize {
         self.slot_tier.disk_pages()
+    }
+
+    pub(crate) fn kv_tier_io_stats(&self) -> infer_seam::KvTierIoStats {
+        let slot = self.slot_tier.io_stats();
+        let recall = self
+            .recall_tier
+            .as_ref()
+            .map_or_else(kv_native_sys::TierIoStats::default, KvTierStore::io_stats);
+        merge_tier_io_stats(&slot, &recall)
     }
 
     fn tp_min_usize(&self, value: usize, what: &str) -> Result<usize> {
@@ -2987,5 +3031,30 @@ impl Qwen35CudaExecutor {
     ) -> Result<Vec<crate::qwen35::SharedFp8BaseProjection>> {
         self.ensure_not_collective("frozen_base_fp8_pointers")?;
         self.model.frozen_base_fp8_pointers()
+    }
+}
+
+#[cfg(test)]
+mod tier_io_tests {
+    use super::*;
+
+    #[test]
+    fn merge_prefers_direct_and_saturates_counters() {
+        let slot = kv_native_sys::TierIoStats {
+            mode: kv_native_sys::DiskIoMode::Mmap,
+            useful_read_bytes: u64::MAX,
+            failures: 2,
+            ..Default::default()
+        };
+        let recall = kv_native_sys::TierIoStats {
+            mode: kv_native_sys::DiskIoMode::Direct,
+            useful_read_bytes: 1,
+            failures: 3,
+            ..Default::default()
+        };
+        let merged = merge_tier_io_stats(&slot, &recall);
+        assert_eq!(merged.mode, infer_seam::KvTierIoMode::Direct);
+        assert_eq!(merged.useful_read_bytes, u64::MAX);
+        assert_eq!(merged.failures, 5);
     }
 }

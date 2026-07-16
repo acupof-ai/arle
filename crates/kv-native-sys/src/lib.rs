@@ -1,16 +1,18 @@
 //! Pure-Rust persistence substrate for the KV tier.
 //!
-//! POSIX-only (Linux + macOS); uses `nix`, `memmap2`, and `libc` directly
-//! with no FFI of its own. Surface: atomic file writes, the page-slot file mmap, and the
-//! backend-neutral two-level [`KvTierStore`] (host RAM + mmap disk spill)
-//! shared by the CUDA and Metal executors.
+//! POSIX-only (Linux and macOS). mmap is the default; Linux can opt into
+//! O_DIRECT with io_uring and mmap fallback. [`KvTierStore`] is the backend-neutral
+//! two-level store shared by the CUDA and Metal executors.
 
+#[cfg(target_os = "linux")]
+mod direct_store;
+mod gds;
 mod kv_tier;
 
 pub use kv_tier::{
-    BLOB_CHUNK_BYTES, CHUNK_IDX_BITS, KvTierStore, TIER_NS_SHIFT, chunk_sub,
-    default_t1_budget_bytes, default_t2_budget_bytes, resolve_dram_budget_bytes, tier_key,
-    weights_epoch_tag,
+    BLOB_CHUNK_BYTES, CHUNK_IDX_BITS, DiskIoMode, KvTierStore, TIER_NS_SHIFT, TierIoStats,
+    chunk_sub, default_t1_budget_bytes, default_t2_budget_bytes, resolve_dram_budget_bytes,
+    tier_key, weights_epoch_tag,
 };
 
 use std::fs::OpenOptions;

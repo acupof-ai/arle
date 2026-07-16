@@ -13,6 +13,9 @@ log = "0.4"
 memmap2 = { workspace = true }
 nix = { version = "0.31", features = ["fs", "mman"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = "0.7"
+
 [dev-dependencies]
 tempfile = "3"
 

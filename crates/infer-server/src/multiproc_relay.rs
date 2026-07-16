@@ -293,6 +293,22 @@ pub struct WireStats {
     pub kv_system_prefix_match_full_blocks: u64,
     pub kv_system_prefix_match_clamped_blocks: u64,
     #[serde(default)]
+    pub kv_system_tier_io_mode: infer_seam::KvTierIoMode,
+    #[serde(default)]
+    pub kv_system_tier_io_useful_read_bytes: u64,
+    #[serde(default)]
+    pub kv_system_tier_io_useful_write_bytes: u64,
+    #[serde(default)]
+    pub kv_system_tier_io_submitted_read_bytes: u64,
+    #[serde(default)]
+    pub kv_system_tier_io_submitted_write_bytes: u64,
+    #[serde(default)]
+    pub kv_system_tier_io_metadata_write_bytes: u64,
+    #[serde(default)]
+    pub kv_system_tier_io_failures: u64,
+    #[serde(default)]
+    pub kv_system_tier_io_completion_wait_ns: u64,
+    #[serde(default)]
     pub spec_chains: u64,
     #[serde(default)]
     pub spec_drafted: u64,
@@ -357,6 +373,14 @@ impl WireStats {
                 fallback_recompute: self.kv_system_fallback_recompute,
                 prefix_match_full_blocks: self.kv_system_prefix_match_full_blocks,
                 prefix_match_clamped_blocks: self.kv_system_prefix_match_clamped_blocks,
+                tier_io_mode: self.kv_system_tier_io_mode,
+                tier_io_useful_read_bytes: self.kv_system_tier_io_useful_read_bytes,
+                tier_io_useful_write_bytes: self.kv_system_tier_io_useful_write_bytes,
+                tier_io_submitted_read_bytes: self.kv_system_tier_io_submitted_read_bytes,
+                tier_io_submitted_write_bytes: self.kv_system_tier_io_submitted_write_bytes,
+                tier_io_metadata_write_bytes: self.kv_system_tier_io_metadata_write_bytes,
+                tier_io_failures: self.kv_system_tier_io_failures,
+                tier_io_completion_wait_ns: self.kv_system_tier_io_completion_wait_ns,
             },
             spec_decode: infer_seam::SpecDecodeStats {
                 chains: self.spec_chains,
@@ -415,6 +439,14 @@ impl WireStats {
             kv_system_fallback_recompute: c.kv_system.fallback_recompute,
             kv_system_prefix_match_full_blocks: c.kv_system.prefix_match_full_blocks,
             kv_system_prefix_match_clamped_blocks: c.kv_system.prefix_match_clamped_blocks,
+            kv_system_tier_io_mode: c.kv_system.tier_io_mode,
+            kv_system_tier_io_useful_read_bytes: c.kv_system.tier_io_useful_read_bytes,
+            kv_system_tier_io_useful_write_bytes: c.kv_system.tier_io_useful_write_bytes,
+            kv_system_tier_io_submitted_read_bytes: c.kv_system.tier_io_submitted_read_bytes,
+            kv_system_tier_io_submitted_write_bytes: c.kv_system.tier_io_submitted_write_bytes,
+            kv_system_tier_io_metadata_write_bytes: c.kv_system.tier_io_metadata_write_bytes,
+            kv_system_tier_io_failures: c.kv_system.tier_io_failures,
+            kv_system_tier_io_completion_wait_ns: c.kv_system.tier_io_completion_wait_ns,
             spec_chains: c.spec_decode.chains,
             spec_drafted: c.spec_decode.drafted,
             spec_accepted: c.spec_decode.accepted,

@@ -2,7 +2,10 @@ use crate::{
     AutogradError, Result,
     backend::{Backend, CpuBackend, DeviceHandle},
 };
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashSet, fmt, path::PathBuf, sync::Arc};
+
+const CHECKPOINT_L3_NS: u64 = 0x43;
+const CHECKPOINT_L3_CHUNK_NS: u64 = 0x44;
 
 pub type TensorId = usize;
 
@@ -16,6 +19,13 @@ pub enum Dirty {
     Both,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CheckpointResidency {
+    None,
+    Host,
+    L3,
+}
+
 #[derive(Debug)]
 pub struct Tensor {
     pub data: Vec<f32>,
@@ -26,11 +36,16 @@ pub struct Tensor {
     pub grad: Option<TensorId>,
     pub device_handle: Option<DeviceHandle>,
     pub dirty: Dirty,
-    checkpoint_offloaded: bool,
+    checkpoint_residency: CheckpointResidency,
 }
 
 impl Clone for Tensor {
     fn clone(&self) -> Self {
+        assert_ne!(
+            self.checkpoint_residency,
+            CheckpointResidency::L3,
+            "restore L3 checkpoint before cloning"
+        );
         // P3.1 (post-Wave-1): mirror the `TensorStore::clone_tensor`
         // discipline at the `Tensor` level — when the source is
         // `Dirty::Device` (host data is empty/stale, the truth lives on
@@ -67,7 +82,7 @@ impl Clone for Tensor {
                 self.device_handle.clone()
             },
             dirty: self.dirty.clone(),
-            checkpoint_offloaded: false,
+            checkpoint_residency: CheckpointResidency::None,
         }
     }
 }
@@ -93,7 +108,7 @@ impl Tensor {
             grad: None,
             device_handle: None,
             dirty: Dirty::Host,
-            checkpoint_offloaded: false,
+            checkpoint_residency: CheckpointResidency::None,
         })
     }
 
@@ -116,7 +131,7 @@ impl Tensor {
             grad: None,
             device_handle: None,
             dirty: Dirty::Device,
-            checkpoint_offloaded: false,
+            checkpoint_residency: CheckpointResidency::None,
         })
     }
 }
@@ -124,6 +139,99 @@ impl Tensor {
 #[derive(Debug, Default)]
 struct CheckpointOffloadPool {
     free: Vec<Vec<f32>>,
+}
+
+struct CheckpointL3 {
+    store: kv_native_sys::KvTierStore,
+    host_cap_bytes: usize,
+    host_bytes: usize,
+}
+
+impl fmt::Debug for CheckpointL3 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CheckpointL3")
+            .field("host_cap_bytes", &self.host_cap_bytes)
+            .field("host_bytes", &self.host_bytes)
+            .finish_non_exhaustive()
+    }
+}
+
+impl CheckpointL3 {
+    fn from_env() -> Option<Self> {
+        let root = std::env::var_os("ARLE_CHECKPOINT_L3_ROOT").map(PathBuf::from)?;
+        let host_cap_bytes = parse_env_bytes("ARLE_CHECKPOINT_HOST_CAP_BYTES")?;
+        let disk_cap_bytes = parse_env_bytes("ARLE_CHECKPOINT_L3_CAP_BYTES")?;
+        Self::try_new(root, host_cap_bytes, disk_cap_bytes)
+    }
+
+    fn try_new(root: PathBuf, host_cap_bytes: usize, disk_cap_bytes: usize) -> Option<Self> {
+        if host_cap_bytes == 0 || disk_cap_bytes == 0 {
+            return None;
+        }
+        let mut store = kv_native_sys::KvTierStore::with_budget(0, kv_native_sys::BLOB_CHUNK_BYTES);
+        if !store.set_disk(root, disk_cap_bytes, kv_native_sys::BLOB_CHUNK_BYTES) {
+            return None;
+        }
+        Some(Self {
+            store,
+            host_cap_bytes,
+            host_bytes: 0,
+        })
+    }
+
+    fn should_spill(&self, bytes: usize) -> bool {
+        self.host_bytes.saturating_add(bytes) > self.host_cap_bytes
+    }
+
+    fn insert(&mut self, id: TensorId, host: &[f32]) -> bool {
+        let Ok(key) = u64::try_from(id) else {
+            return false;
+        };
+        if key >> (kv_native_sys::TIER_NS_SHIFT - kv_native_sys::CHUNK_IDX_BITS) != 0 {
+            return false;
+        }
+        self.store.insert_chunked(
+            CHECKPOINT_L3_NS,
+            CHECKPOINT_L3_CHUNK_NS,
+            key,
+            bytemuck::cast_slice(host),
+        )
+    }
+
+    fn restore(&mut self, id: TensorId, expected_len: usize) -> Result<Vec<f32>> {
+        let bytes = self
+            .store
+            .read_chunked(CHECKPOINT_L3_NS, CHECKPOINT_L3_CHUNK_NS, id as u64)
+            .map_err(|_| AutogradError::TapeInvariant("checkpoint L3 restore failed"))?;
+        if bytes.len() != expected_len.saturating_mul(std::mem::size_of::<f32>()) {
+            return Err(AutogradError::TapeInvariant(
+                "checkpoint L3 payload length mismatch",
+            ));
+        }
+        let host = bytes
+            .chunks_exact(std::mem::size_of::<f32>())
+            .map(|chunk| f32::from_ne_bytes(chunk.try_into().expect("four-byte chunk")))
+            .collect();
+        self.store
+            .remove_chunked(CHECKPOINT_L3_NS, CHECKPOINT_L3_CHUNK_NS, id as u64);
+        Ok(host)
+    }
+
+    fn remove(&mut self, id: TensorId) {
+        self.store
+            .remove_chunked(CHECKPOINT_L3_NS, CHECKPOINT_L3_CHUNK_NS, id as u64);
+    }
+}
+
+fn parse_env_bytes(name: &str) -> Option<usize> {
+    let raw = std::env::var(name).ok()?;
+    match raw.parse::<usize>() {
+        Ok(value) if value > 0 => Some(value),
+        _ => {
+            log::warn!("ignoring invalid {name}={raw:?}");
+            None
+        }
+    }
 }
 
 impl CheckpointOffloadPool {
@@ -152,6 +260,7 @@ pub struct TensorStore {
     pub free_ids: Vec<TensorId>,
     backend: Arc<dyn Backend>,
     checkpoint_offload_pool: CheckpointOffloadPool,
+    checkpoint_l3: Option<CheckpointL3>,
 }
 
 impl Default for TensorStore {
@@ -167,6 +276,7 @@ impl TensorStore {
             free_ids: Vec::new(),
             backend,
             checkpoint_offload_pool: CheckpointOffloadPool::default(),
+            checkpoint_l3: CheckpointL3::from_env(),
         }
     }
 
@@ -176,6 +286,27 @@ impl TensorStore {
 
     pub fn set_backend(&mut self, backend: Arc<dyn Backend>) {
         self.backend = backend;
+    }
+
+    fn discard_checkpoint_copy(&mut self, id: TensorId) -> Result<()> {
+        let (residency, bytes) = {
+            let tensor = self.tensor(id)?;
+            (
+                tensor.checkpoint_residency,
+                tensor.data.len() * std::mem::size_of::<f32>(),
+            )
+        };
+        if let Some(l3) = &mut self.checkpoint_l3 {
+            match residency {
+                CheckpointResidency::Host => {
+                    l3.host_bytes = l3.host_bytes.saturating_sub(bytes);
+                }
+                CheckpointResidency::L3 => l3.remove(id),
+                CheckpointResidency::None => {}
+            }
+        }
+        self.raw_tensor_mut(id)?.checkpoint_residency = CheckpointResidency::None;
+        Ok(())
     }
 
     pub fn alloc(&mut self, tensor: Tensor) -> TensorId {
@@ -197,8 +328,21 @@ impl TensorStore {
                 .ok_or(AutogradError::InvalidTensorId(id))?;
             slot.take().ok_or(AutogradError::InvalidTensorId(id))?
         };
-        if tensor.checkpoint_offloaded {
-            self.checkpoint_offload_pool.recycle(tensor.data);
+        match tensor.checkpoint_residency {
+            CheckpointResidency::Host => {
+                if let Some(l3) = &mut self.checkpoint_l3 {
+                    l3.host_bytes = l3
+                        .host_bytes
+                        .saturating_sub(tensor.data.len() * std::mem::size_of::<f32>());
+                }
+                self.checkpoint_offload_pool.recycle(tensor.data);
+            }
+            CheckpointResidency::L3 => {
+                if let Some(l3) = &mut self.checkpoint_l3 {
+                    l3.remove(id);
+                }
+            }
+            CheckpointResidency::None => {}
         }
         self.free_ids.push(id);
         Ok(())
@@ -246,10 +390,23 @@ impl TensorStore {
             if keep.contains(&id) || slot.is_none() {
                 continue;
             }
-            if let Some(tensor) = slot.take()
-                && tensor.checkpoint_offloaded
-            {
-                self.checkpoint_offload_pool.recycle(tensor.data);
+            if let Some(tensor) = slot.take() {
+                match tensor.checkpoint_residency {
+                    CheckpointResidency::Host => {
+                        if let Some(l3) = &mut self.checkpoint_l3 {
+                            l3.host_bytes = l3
+                                .host_bytes
+                                .saturating_sub(tensor.data.len() * std::mem::size_of::<f32>());
+                        }
+                        self.checkpoint_offload_pool.recycle(tensor.data);
+                    }
+                    CheckpointResidency::L3 => {
+                        if let Some(l3) = &mut self.checkpoint_l3 {
+                            l3.remove(id);
+                        }
+                    }
+                    CheckpointResidency::None => {}
+                }
             }
             self.free_ids.push(id);
         }
@@ -260,21 +417,32 @@ impl TensorStore {
     }
 
     pub fn get_mut(&mut self, id: TensorId) -> Option<&mut Tensor> {
-        if matches!(
-            self.tensors
-                .get(id)
-                .and_then(Option::as_ref)
-                .map(|tensor| &tensor.dirty),
-            Some(Dirty::Device)
-        ) {
+        if self
+            .tensors
+            .get(id)
+            .and_then(Option::as_ref)
+            .is_some_and(|tensor| {
+                tensor.dirty == Dirty::Device
+                    || tensor.checkpoint_residency == CheckpointResidency::L3
+            })
+        {
             self.ensure_host(id)
                 .expect("ensure_host before mutable tensor access");
         }
 
+        let checkpoint_host_bytes = self
+            .tensors
+            .get(id)
+            .and_then(Option::as_ref)
+            .filter(|tensor| tensor.checkpoint_residency == CheckpointResidency::Host)
+            .map_or(0, |tensor| tensor.data.len() * std::mem::size_of::<f32>());
+        if let Some(l3) = &mut self.checkpoint_l3 {
+            l3.host_bytes = l3.host_bytes.saturating_sub(checkpoint_host_bytes);
+        }
         let tensor = self.tensors.get_mut(id).and_then(Option::as_mut)?;
         tensor.device_handle = None;
         tensor.dirty = Dirty::Host;
-        tensor.checkpoint_offloaded = false;
+        tensor.checkpoint_residency = CheckpointResidency::None;
         Some(tensor)
     }
 
@@ -284,6 +452,26 @@ impl TensorStore {
     }
 
     pub fn ensure_host(&mut self, id: TensorId) -> Result<()> {
+        if self.tensor(id)?.checkpoint_residency == CheckpointResidency::L3 {
+            let expected_len = self.tensor(id)?.size;
+            let host = self
+                .checkpoint_l3
+                .as_mut()
+                .ok_or(AutogradError::TapeInvariant(
+                    "L3 checkpoint missing storage backend",
+                ))?
+                .restore(id, expected_len)?;
+            let bytes = host.len() * std::mem::size_of::<f32>();
+            let tensor = self.raw_tensor_mut(id)?;
+            tensor.data = host;
+            tensor.dirty = Dirty::Host;
+            tensor.checkpoint_residency = CheckpointResidency::Host;
+            self.checkpoint_l3
+                .as_mut()
+                .expect("storage backend checked above")
+                .host_bytes += bytes;
+            return Ok(());
+        }
         if self.tensor(id)?.dirty != Dirty::Device {
             return Ok(());
         }
@@ -301,7 +489,7 @@ impl TensorStore {
         let tensor = self.raw_tensor_mut(id)?;
         tensor.data = host;
         tensor.dirty = Dirty::Both;
-        tensor.checkpoint_offloaded = false;
+        tensor.checkpoint_residency = CheckpointResidency::None;
         Ok(())
     }
 
@@ -338,12 +526,16 @@ impl TensorStore {
             let tensor = self.raw_tensor_mut(id)?;
             tensor.data = host;
             tensor.dirty = Dirty::Both;
-            tensor.checkpoint_offloaded = false;
+            tensor.checkpoint_residency = CheckpointResidency::None;
         }
         Ok(())
     }
 
     pub fn ensure_device(&mut self, id: TensorId) -> Result<()> {
+        let was_l3 = self.tensor(id)?.checkpoint_residency == CheckpointResidency::L3;
+        if was_l3 {
+            self.ensure_host(id)?;
+        }
         let (dirty, has_handle) = {
             let tensor = self.tensor(id)?;
             (tensor.dirty.clone(), tensor.device_handle.is_some())
@@ -359,31 +551,45 @@ impl TensorStore {
             return Ok(());
         }
 
-        let (shape, checkpoint_offloaded) = {
+        let (shape, checkpoint_residency) = {
             let tensor = self.tensor(id)?;
-            (tensor.shape.clone(), tensor.checkpoint_offloaded)
+            (tensor.shape.clone(), tensor.checkpoint_residency)
         };
         let handle = {
             let tensor = self.tensor(id)?;
             self.backend().upload(&tensor.data, &shape)?
         };
-        let recycled = if checkpoint_offloaded {
+        let recycled = if checkpoint_residency == CheckpointResidency::Host {
             let tensor = self.raw_tensor_mut(id)?;
             std::mem::take(&mut tensor.data)
         } else {
             Vec::new()
         };
-        if checkpoint_offloaded {
-            self.checkpoint_offload_pool.recycle(recycled);
+        if checkpoint_residency == CheckpointResidency::Host {
+            if let Some(l3) = &mut self.checkpoint_l3 {
+                l3.host_bytes = l3
+                    .host_bytes
+                    .saturating_sub(recycled.len() * std::mem::size_of::<f32>());
+            }
+            if !was_l3 {
+                self.checkpoint_offload_pool.recycle(recycled);
+            }
         }
         let tensor = self.raw_tensor_mut(id)?;
         tensor.device_handle = Some(handle);
-        tensor.dirty = if checkpoint_offloaded {
+        tensor.dirty = if checkpoint_residency == CheckpointResidency::Host {
             Dirty::Device
         } else {
             Dirty::Both
         };
-        tensor.checkpoint_offloaded = false;
+        tensor.checkpoint_residency = CheckpointResidency::None;
+        Ok(())
+    }
+
+    pub(crate) fn ensure_checkpoint_device(&mut self, id: TensorId) -> Result<()> {
+        if self.tensor(id)?.checkpoint_residency == CheckpointResidency::L3 {
+            self.ensure_device(id)?;
+        }
         Ok(())
     }
 
@@ -406,7 +612,7 @@ impl TensorStore {
             grad: None,
             device_handle: Some(handle),
             dirty: Dirty::Device,
-            checkpoint_offloaded: false,
+            checkpoint_residency: CheckpointResidency::None,
         };
         Ok(self.alloc(tensor))
     }
@@ -422,11 +628,12 @@ impl TensorStore {
     /// then mark the tensor `Dirty::Host`, forcing a full re-upload on the
     /// next forward pass. That is the exact churn this path exists to kill.
     pub fn replace_device_handle(&mut self, id: TensorId, handle: DeviceHandle) -> Result<()> {
+        self.discard_checkpoint_copy(id)?;
         let tensor = self.raw_tensor_mut(id)?;
         tensor.device_handle = Some(handle);
         tensor.dirty = Dirty::Device;
         tensor.data.clear();
-        tensor.checkpoint_offloaded = false;
+        tensor.checkpoint_residency = CheckpointResidency::None;
         Ok(())
     }
 
@@ -434,6 +641,10 @@ impl TensorStore {
     /// exists. This keeps model weights device-authoritative on memory-tight
     /// CUDA hosts; callers that later need host data can still use `to_host`.
     pub fn evict_host_mirror(&mut self, id: TensorId) -> Result<usize> {
+        if self.tensor(id)?.checkpoint_residency == CheckpointResidency::L3 {
+            self.ensure_host(id)?;
+        }
+        self.discard_checkpoint_copy(id)?;
         let (dirty, has_handle) = {
             let tensor = self.tensor(id)?;
             (tensor.dirty.clone(), tensor.device_handle.is_some())
@@ -456,7 +667,7 @@ impl TensorStore {
         let evicted_bytes = tensor.data.capacity() * std::mem::size_of::<f32>();
         tensor.data = Vec::new();
         tensor.dirty = Dirty::Device;
-        tensor.checkpoint_offloaded = false;
+        tensor.checkpoint_residency = CheckpointResidency::None;
         Ok(evicted_bytes)
     }
 
@@ -467,6 +678,7 @@ impl TensorStore {
     /// training forward so they don't pin ~30 GB of VRAM. Returns bytes freed.
     pub fn offload_to_host(&mut self, id: TensorId) -> Result<usize> {
         self.ensure_host(id)?;
+        self.discard_checkpoint_copy(id)?;
         let tensor = self.raw_tensor_mut(id)?;
         let freed = if tensor.device_handle.is_some() {
             tensor.size * std::mem::size_of::<f32>()
@@ -475,7 +687,7 @@ impl TensorStore {
         };
         tensor.device_handle = None;
         tensor.dirty = Dirty::Host;
-        tensor.checkpoint_offloaded = false;
+        tensor.checkpoint_residency = CheckpointResidency::None;
         Ok(freed)
     }
 
@@ -486,7 +698,11 @@ impl TensorStore {
         let (size, bytes, handle) = {
             let tensor = self.tensor(id)?;
             let bytes = tensor.size.saturating_mul(std::mem::size_of::<f32>());
-            if bytes < min_bytes || tensor.dirty == Dirty::Host || tensor.device_handle.is_none() {
+            if bytes < min_bytes
+                || tensor.checkpoint_residency != CheckpointResidency::None
+                || tensor.dirty == Dirty::Host
+                || tensor.device_handle.is_none()
+            {
                 return Ok(0);
             }
             (
@@ -503,13 +719,28 @@ impl TensorStore {
         let mut host = self.checkpoint_offload_pool.take(size);
         self.backend().eval(&[&handle])?;
         self.backend().readback_into(&handle, &mut host)?;
+        let spilled = self
+            .checkpoint_l3
+            .as_mut()
+            .is_some_and(|l3| l3.should_spill(bytes) && l3.insert(id, &host));
+        if spilled {
+            let tensor = self.raw_tensor_mut(id)?;
+            tensor.device_handle = None;
+            tensor.data = Vec::new();
+            tensor.dirty = Dirty::Host;
+            tensor.checkpoint_residency = CheckpointResidency::L3;
+            return Ok(bytes);
+        }
         let old_host = {
             let tensor = self.raw_tensor_mut(id)?;
             tensor.device_handle = None;
             tensor.dirty = Dirty::Host;
-            tensor.checkpoint_offloaded = true;
+            tensor.checkpoint_residency = CheckpointResidency::Host;
             std::mem::replace(&mut tensor.data, host)
         };
+        if let Some(l3) = &mut self.checkpoint_l3 {
+            l3.host_bytes = l3.host_bytes.saturating_add(bytes);
+        }
         self.checkpoint_offload_pool.recycle(old_host);
         Ok(bytes)
     }
@@ -523,6 +754,7 @@ impl TensorStore {
     /// access fails loud through the missing-data guards rather than reading
     /// stale memory. Returns bytes freed. No-op if already host-resident.
     pub fn drop_device_residency(&mut self, id: TensorId) -> Result<usize> {
+        self.discard_checkpoint_copy(id)?;
         let tensor = self.raw_tensor_mut(id)?;
         let freed = if tensor.device_handle.is_some() {
             tensor.size * std::mem::size_of::<f32>()
@@ -531,7 +763,7 @@ impl TensorStore {
         };
         tensor.device_handle = None;
         tensor.dirty = Dirty::Host;
-        tensor.checkpoint_offloaded = false;
+        tensor.checkpoint_residency = CheckpointResidency::None;
         Ok(freed)
     }
 
@@ -699,7 +931,7 @@ impl TensorStore {
                 grad: source.grad,
                 device_handle,
                 dirty: Dirty::Device,
-                checkpoint_offloaded: false,
+                checkpoint_residency: CheckpointResidency::None,
             };
             return Ok(self.alloc(cloned));
         }
@@ -893,6 +1125,97 @@ mod tests {
         assert_eq!(
             store.to_host(id).expect("read back installed handle"),
             vec![1.0, 2.0, 3.0, 4.0]
+        );
+    }
+
+    #[test]
+    fn checkpoint_l3_spills_restores_and_falls_back_to_host_when_full() {
+        let root = tempfile::tempdir().expect("temp L3 root");
+        let mut store = TensorStore {
+            checkpoint_l3: CheckpointL3::try_new(
+                root.path().to_path_buf(),
+                1,
+                2 * kv_native_sys::BLOB_CHUNK_BYTES,
+            ),
+            ..TensorStore::default()
+        };
+        let len = crate::runtime_flags::checkpoint_offload_min_bytes()
+            .div_ceil(std::mem::size_of::<f32>());
+        let values = vec![3.25; len];
+
+        let first = store.from_slice(&values, &[len]).expect("first checkpoint");
+        store.ensure_device(first).expect("upload first");
+        store
+            .offload_checkpoint_to_host(first)
+            .expect("spill first");
+        let tensor = store.tensor(first).expect("first tensor");
+        assert_eq!(tensor.checkpoint_residency, CheckpointResidency::L3);
+        assert!(tensor.data.is_empty());
+        assert!(tensor.device_handle.is_none());
+
+        let second = store
+            .from_slice(&values, &[len])
+            .expect("second checkpoint");
+        store.ensure_device(second).expect("upload second");
+        store
+            .offload_checkpoint_to_host(second)
+            .expect("host fallback");
+        let tensor = store.tensor(second).expect("second tensor");
+        assert_eq!(tensor.checkpoint_residency, CheckpointResidency::Host);
+        assert_eq!(tensor.data, values);
+        assert!(tensor.device_handle.is_none());
+        store
+            .ensure_checkpoint_device(second)
+            .expect("host checkpoint stays host");
+        assert_eq!(
+            store
+                .tensor(second)
+                .expect("second tensor")
+                .checkpoint_residency,
+            CheckpointResidency::Host
+        );
+
+        store
+            .ensure_checkpoint_device(first)
+            .expect("restore first");
+        let tensor = store.tensor(first).expect("restored tensor");
+        assert_eq!(tensor.checkpoint_residency, CheckpointResidency::None);
+        assert_eq!(tensor.dirty, Dirty::Device);
+        assert!(tensor.data.is_empty());
+        assert_eq!(store.to_host(first).expect("restored values"), values);
+        for _ in 0..8 {
+            store
+                .offload_checkpoint_to_host(first)
+                .expect("repeat spill");
+            store
+                .ensure_checkpoint_device(first)
+                .expect("repeat restore");
+            assert!(store.checkpoint_offload_pool.free.is_empty());
+        }
+
+        let x =
+            store.alloc(Tensor::new(values.clone(), vec![len], true).expect("checkpoint input"));
+        store.ensure_device(x).expect("upload checkpoint input");
+        let mut tape = crate::Tape::new();
+        tape.set_offload_checkpoints(true);
+        let y = crate::ops::checkpoint(vec![x], &mut store, &mut tape, |store, tape, inputs| {
+            crate::ops::mul_scalar(inputs[0], 2.0, store, tape)
+        })
+        .expect("checkpoint forward");
+        assert_eq!(
+            store.tensor(x).expect("spilled input").checkpoint_residency,
+            CheckpointResidency::L3
+        );
+        let loss = crate::ops::sum(y, &mut store, &mut tape).expect("checkpoint loss");
+        let grads = tape
+            .backward(loss, &mut store)
+            .expect("checkpoint backward");
+        assert!(
+            store
+                .to_host(*grads.get(&x).expect("checkpoint gradient"))
+                .expect("host gradient")
+                .iter()
+                .all(|&value| value == 2.0)
         );
     }
 }

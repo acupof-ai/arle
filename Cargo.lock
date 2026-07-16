@@ -177,10 +177,13 @@ name = "autograd"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "bytemuck",
  "cuda-kernels",
  "cudarc",
  "half",
+ "kv-native-sys",
  "libm",
+ "log",
  "matrixmultiply",
  "memmap2",
  "mlx-sys",
@@ -1764,6 +1767,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "io-uring"
+version = "0.7.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9080b15e63775b9a2ac7dca720f7050a8b955e092ea0f6020a4a80f69998cdc0"
+dependencies = [
+ "bitflags",
+ "cfg-if",
+ "libc",
+]
+
+[[package]]
 name = "ipnet"
 version = "2.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1848,6 +1862,7 @@ version = "0.3.0"
 dependencies = [
  "anyhow",
  "infer-seam",
+ "io-uring",
  "libc",
  "log",
  "memmap2",

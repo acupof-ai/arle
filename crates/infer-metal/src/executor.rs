@@ -538,6 +538,14 @@ impl BackendExecutor for MetalExecutor {
         0
     }
 
+    fn kv_tier_io_stats(&self) -> infer_seam::KvTierIoStats {
+        #[cfg(feature = "metal")]
+        if let Some(real) = self.real.as_ref() {
+            return real.page_store.kv_tier_io_stats();
+        }
+        infer_seam::KvTierIoStats::default()
+    }
+
     fn kv_tier_location(&self, key: u64) -> Option<infer_seam::KvTierLocation> {
         #[cfg(feature = "metal")]
         if let Some(real) = self.real.as_ref() {

@@ -38,6 +38,30 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow};
 use infer_seam::{DramTierPolicy, NvmeTierPolicy, dram_l2_budget, nvme_l3_budget};
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DiskIoMode {
+    #[default]
+    Disabled,
+    Mmap,
+    Direct,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TierIoStats {
+    pub mode: DiskIoMode,
+    pub useful_read_bytes: u64,
+    pub useful_write_bytes: u64,
+    pub submitted_read_bytes: u64,
+    pub submitted_write_bytes: u64,
+    pub metadata_write_bytes: u64,
+    pub read_ops: u64,
+    pub write_ops: u64,
+    pub failures: u64,
+    pub completion_wait_ns: u64,
+    pub fallback_count: u64,
+    pub fallback_reason: Option<String>,
+}
+
 /// Manifest filename under a durable disk namespace. Records the epoch tag plus
 /// one `key slot_idx len slot_bytes` line per disk-resident block so a restart
 /// can rebuild the in-memory disk index and replay slot allocations.
@@ -214,19 +238,68 @@ struct HostDemotedEntry {
     payload: Vec<u8>,
 }
 
-// ---- DiskTier (mmap-backed) ----
+// ---- DiskTier ----
+
+enum DiskStore {
+    Mmap(crate::KvMmapStore),
+    #[cfg(target_os = "linux")]
+    Direct(Box<crate::direct_store::DirectStore>),
+}
+
+impl DiskStore {
+    fn num_slots(&self) -> u32 {
+        match self {
+            Self::Mmap(store) => store.num_slots(),
+            #[cfg(target_os = "linux")]
+            Self::Direct(store) => store.num_slots(),
+        }
+    }
+
+    fn slot_bytes(&self) -> usize {
+        match self {
+            Self::Mmap(store) => store.slot_bytes(),
+            #[cfg(target_os = "linux")]
+            Self::Direct(store) => store.slot_bytes(),
+        }
+    }
+
+    fn alloc_slot(&mut self) -> Option<u32> {
+        match self {
+            Self::Mmap(store) => store.alloc_slot(),
+            #[cfg(target_os = "linux")]
+            Self::Direct(store) => store.alloc_slot(),
+        }
+    }
+
+    fn free_slot(&mut self, slot: u32) {
+        match self {
+            Self::Mmap(store) => store.free_slot(slot),
+            #[cfg(target_os = "linux")]
+            Self::Direct(store) => store.free_slot(slot),
+        }
+    }
+
+    fn reserve_indices(&mut self, indices: &[u32]) {
+        match self {
+            Self::Mmap(store) => store.reserve_indices(indices),
+            #[cfg(target_os = "linux")]
+            Self::Direct(store) => store.reserve_indices(indices),
+        }
+    }
+}
 
 struct DiskTier {
     /// Namespace directory (contains `kv.mmap` + `manifest.kvm`).
     root_dir: PathBuf,
-    /// Fixed-size page-slot mmap store.
-    store: crate::KvMmapStore,
+    /// Fixed-size page-slot store selected once at attach.
+    store: DiskStore,
     /// Key -> slot index plus valid payload length in the mmap store.
     keys: BTreeMap<u64, DiskRecord>,
     /// Durable tier: suppress drop-time wipe, persist manifest on mutation.
     durable: bool,
     /// Model/weights-version tag written into the manifest.
     epoch: String,
+    stats: TierIoStats,
     _lock: Option<nix::fcntl::Flock<std::fs::File>>,
 }
 
@@ -262,7 +335,7 @@ impl DiskTier {
         self.root_dir.join(MANIFEST_FILE)
     }
 
-    fn write_manifest(&self) -> Result<()> {
+    fn write_manifest(&mut self) -> Result<()> {
         let mut buf = String::with_capacity(64 + self.keys.len() * 32);
         buf.push_str(MANIFEST_MAGIC);
         buf.push('\n');
@@ -277,8 +350,15 @@ impl DiskTier {
             )
             .expect("write to String never fails");
         }
-        crate::write_file_atomic_cache(&self.manifest_path(), buf.as_bytes())
-            .with_context(|| format!("KV recall manifest write under {}", self.root_dir.display()))
+        let bytes = buf.len() as u64;
+        let result = crate::write_file_atomic_cache(&self.manifest_path(), buf.as_bytes())
+            .with_context(|| format!("KV recall manifest write under {}", self.root_dir.display()));
+        if result.is_ok() {
+            self.stats.metadata_write_bytes = self.stats.metadata_write_bytes.saturating_add(bytes);
+        } else {
+            self.stats.failures = self.stats.failures.saturating_add(1);
+        }
+        result
     }
 
     fn parse_manifest(bytes: &[u8]) -> Option<(String, Vec<(u64, DiskRecord)>)> {
@@ -320,6 +400,201 @@ impl DiskTier {
             .collect();
         Some((epoch, records))
     }
+
+    fn write_payloads(&mut self, writes: &[(u32, &[u8])]) -> std::io::Result<()> {
+        let useful = writes
+            .iter()
+            .map(|(_, bytes)| bytes.len() as u64)
+            .sum::<u64>();
+        let result = match &mut self.store {
+            DiskStore::Mmap(store) => {
+                for (slot, bytes) in writes {
+                    store.write_slot(*slot, bytes)?;
+                }
+                self.stats.submitted_write_bytes =
+                    self.stats.submitted_write_bytes.saturating_add(useful);
+                Ok(())
+            }
+            #[cfg(target_os = "linux")]
+            DiskStore::Direct(store) => store.write_slots(writes).map(|batch| {
+                self.stats.submitted_write_bytes = self
+                    .stats
+                    .submitted_write_bytes
+                    .saturating_add(batch.submitted_bytes);
+                self.stats.completion_wait_ns =
+                    self.stats.completion_wait_ns.saturating_add(batch.wait_ns);
+            }),
+        };
+        self.stats.write_ops = self.stats.write_ops.saturating_add(writes.len() as u64);
+        if result.is_ok() {
+            self.stats.useful_write_bytes = self.stats.useful_write_bytes.saturating_add(useful);
+        } else {
+            self.stats.failures = self.stats.failures.saturating_add(1);
+        }
+        result
+    }
+
+    fn read_payloads(&mut self, reads: &[(u32, usize)]) -> std::io::Result<Vec<Vec<u8>>> {
+        let useful = reads.iter().map(|(_, len)| *len as u64).sum::<u64>();
+        let result = match &mut self.store {
+            DiskStore::Mmap(store) => {
+                self.stats.submitted_read_bytes =
+                    self.stats.submitted_read_bytes.saturating_add(useful);
+                Ok(reads
+                    .iter()
+                    .map(|(slot, len)| store.read_slot(*slot)[..*len].to_vec())
+                    .collect())
+            }
+            #[cfg(target_os = "linux")]
+            DiskStore::Direct(store) => store.read_slots(reads).map(|(values, batch)| {
+                self.stats.submitted_read_bytes = self
+                    .stats
+                    .submitted_read_bytes
+                    .saturating_add(batch.submitted_bytes);
+                self.stats.completion_wait_ns =
+                    self.stats.completion_wait_ns.saturating_add(batch.wait_ns);
+                values
+            }),
+        };
+        self.stats.read_ops = self.stats.read_ops.saturating_add(reads.len() as u64);
+        if result.is_ok() {
+            self.stats.useful_read_bytes = self.stats.useful_read_bytes.saturating_add(useful);
+        } else {
+            self.stats.failures = self.stats.failures.saturating_add(1);
+        }
+        result
+    }
+
+    fn read_payload(&mut self, slot: u32, len: usize) -> std::io::Result<Cow<'_, [u8]>> {
+        match &mut self.store {
+            DiskStore::Mmap(store) => {
+                self.stats.read_ops = self.stats.read_ops.saturating_add(1);
+                self.stats.useful_read_bytes =
+                    self.stats.useful_read_bytes.saturating_add(len as u64);
+                self.stats.submitted_read_bytes =
+                    self.stats.submitted_read_bytes.saturating_add(len as u64);
+                Ok(Cow::Borrowed(&store.read_slot(slot)[..len]))
+            }
+            #[cfg(target_os = "linux")]
+            DiskStore::Direct(store) => {
+                self.stats.read_ops = self.stats.read_ops.saturating_add(1);
+                match store.read_slots(&[(slot, len)]) {
+                    Ok((mut values, batch)) => {
+                        self.stats.useful_read_bytes =
+                            self.stats.useful_read_bytes.saturating_add(len as u64);
+                        self.stats.submitted_read_bytes = self
+                            .stats
+                            .submitted_read_bytes
+                            .saturating_add(batch.submitted_bytes);
+                        self.stats.completion_wait_ns =
+                            self.stats.completion_wait_ns.saturating_add(batch.wait_ns);
+                        Ok(Cow::Owned(values.pop().expect("one disk read")))
+                    }
+                    Err(err) => {
+                        self.stats.failures = self.stats.failures.saturating_add(1);
+                        Err(err)
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn requested_disk_mode() -> Option<DiskIoMode> {
+    parse_disk_mode(std::env::var("ARLE_KV_DISK_IO").ok().as_deref())
+}
+
+fn parse_disk_mode(value: Option<&str>) -> Option<DiskIoMode> {
+    match value {
+        Some("mmap") => Some(DiskIoMode::Mmap),
+        Some("direct") => Some(DiskIoMode::Direct),
+        _ => None,
+    }
+}
+
+fn mmap_stats(reason: Option<String>) -> TierIoStats {
+    TierIoStats {
+        mode: DiskIoMode::Mmap,
+        fallback_count: u64::from(reason.is_some()),
+        fallback_reason: reason,
+        ..TierIoStats::default()
+    }
+}
+
+fn create_disk_store(
+    path: &Path,
+    num_slots: usize,
+    slot_bytes: usize,
+) -> std::io::Result<(DiskStore, TierIoStats)> {
+    if requested_disk_mode() == Some(DiskIoMode::Direct) {
+        #[cfg(target_os = "linux")]
+        match crate::direct_store::DirectStore::create(path, num_slots, slot_bytes) {
+            Ok(store) => {
+                return Ok((
+                    DiskStore::Direct(Box::new(store)),
+                    TierIoStats {
+                        mode: DiskIoMode::Direct,
+                        ..TierIoStats::default()
+                    },
+                ));
+            }
+            Err(err) => {
+                let reason = err.to_string();
+                log::warn!(
+                    "KV O_DIRECT/io_uring unavailable at {}: {reason}; using mmap",
+                    path.display()
+                );
+                return crate::KvMmapStore::create(path, num_slots, slot_bytes)
+                    .map(|store| (DiskStore::Mmap(store), mmap_stats(Some(reason))));
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        if requested_disk_mode() == Some(DiskIoMode::Direct) {
+            let reason = "O_DIRECT/io_uring requires Linux".to_string();
+            return crate::KvMmapStore::create(path, num_slots, slot_bytes)
+                .map(|store| (DiskStore::Mmap(store), mmap_stats(Some(reason))));
+        }
+    }
+    crate::KvMmapStore::create(path, num_slots, slot_bytes)
+        .map(|store| (DiskStore::Mmap(store), mmap_stats(None)))
+}
+
+fn open_disk_store(
+    path: &Path,
+    num_slots: usize,
+    slot_bytes: usize,
+) -> std::io::Result<(DiskStore, TierIoStats)> {
+    if requested_disk_mode() == Some(DiskIoMode::Direct) {
+        #[cfg(target_os = "linux")]
+        match crate::direct_store::DirectStore::open(path, num_slots, slot_bytes) {
+            Ok(store) => {
+                return Ok((
+                    DiskStore::Direct(Box::new(store)),
+                    TierIoStats {
+                        mode: DiskIoMode::Direct,
+                        ..TierIoStats::default()
+                    },
+                ));
+            }
+            Err(err) => {
+                let reason = err.to_string();
+                log::warn!(
+                    "KV O_DIRECT/io_uring unavailable at {}: {reason}; using mmap",
+                    path.display()
+                );
+                return crate::KvMmapStore::open(path, num_slots, slot_bytes)
+                    .map(|store| (DiskStore::Mmap(store), mmap_stats(Some(reason))));
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        if requested_disk_mode() == Some(DiskIoMode::Direct) {
+            let reason = "O_DIRECT/io_uring requires Linux".to_string();
+            return crate::KvMmapStore::open(path, num_slots, slot_bytes)
+                .map(|store| (DiskStore::Mmap(store), mmap_stats(Some(reason))));
+        }
+    }
+    crate::KvMmapStore::open(path, num_slots, slot_bytes)
+        .map(|store| (DiskStore::Mmap(store), mmap_stats(None)))
 }
 
 // ---- KvTierStore impl ----
@@ -406,14 +681,16 @@ impl KvTierStore {
         } else {
             None
         };
-        match crate::KvMmapStore::create(&mmap_path, capacity_pages, bytes_per_page) {
-            Ok(store) => {
+        match create_disk_store(&mmap_path, capacity_pages, bytes_per_page) {
+            Ok((store, stats)) => {
+                crate::gds::log_gate(&namespace, stats.mode);
                 self.disk = Some(DiskTier {
                     root_dir: namespace,
                     store,
                     keys: BTreeMap::new(),
                     durable,
                     epoch,
+                    stats,
                     _lock: namespace_lock,
                 });
                 true
@@ -469,19 +746,18 @@ impl KvTierStore {
             }
         };
 
-        let (mut store, replay_manifest) =
-            match crate::KvMmapStore::open(&mmap_path, capacity_pages, bytes_per_page) {
-                Ok(s) => (s, true),
-                Err(_) => {
-                    match crate::KvMmapStore::create(&mmap_path, capacity_pages, bytes_per_page) {
-                        Ok(s) => (s, false),
-                        Err(err) => {
-                            log::warn!("KV mmap store create failed: {err}");
-                            return false;
-                        }
+        let (mut store, stats, replay_manifest) =
+            match open_disk_store(&mmap_path, capacity_pages, bytes_per_page) {
+                Ok((store, stats)) => (store, stats, true),
+                Err(_) => match create_disk_store(&mmap_path, capacity_pages, bytes_per_page) {
+                    Ok((store, stats)) => (store, stats, false),
+                    Err(err) => {
+                        log::warn!("KV mmap store create failed: {err}");
+                        return false;
                     }
-                }
+                },
             };
+        crate::gds::log_gate(&namespace, stats.mode);
         if !replay_manifest
             && let Err(err) = std::fs::remove_file(&manifest_path)
             && err.kind() != std::io::ErrorKind::NotFound
@@ -536,13 +812,14 @@ impl KvTierStore {
             keys,
             durable: true,
             epoch,
+            stats,
             _lock: Some(namespace_lock),
         });
         true
     }
 
-    pub fn persist(&self) {
-        if let Some(disk) = self.disk.as_ref()
+    pub fn persist(&mut self) {
+        if let Some(disk) = self.disk.as_mut()
             && disk.durable
             && let Err(err) = disk.write_manifest()
         {
@@ -600,6 +877,12 @@ impl KvTierStore {
         self.disk.as_ref().map_or(0, |d| d.keys.len())
     }
 
+    pub fn io_stats(&self) -> TierIoStats {
+        self.disk
+            .as_ref()
+            .map_or_else(TierIoStats::default, |disk| disk.stats.clone())
+    }
+
     pub fn location(&self, key: u64) -> Option<infer_seam::KvTierLocation> {
         if self.host.contains_key(&key) {
             return Some(infer_seam::KvTierLocation::HostDemoted);
@@ -641,15 +924,152 @@ impl KvTierStore {
             );
             return false;
         }
+        self.insert_inner(key, payload, true)
+    }
+
+    fn insert_inner(&mut self, key: u64, payload: Vec<u8>, commit_manifest: bool) -> bool {
         if self.host.len() < self.host_capacity_pages {
             self.insert_host(key, payload);
             return true;
         }
-        if self.host_capacity_pages > 0 && self.spill_coldest_to_disk() {
+        if self.host_capacity_pages > 0 && self.spill_coldest_to_disk(commit_manifest) {
             self.insert_host(key, payload);
             return true;
         }
-        self.write_to_disk(key, &payload)
+        self.write_to_disk(key, &payload, commit_manifest)
+    }
+
+    pub fn insert_many(&mut self, mut entries: Vec<(u64, Vec<u8>)>) -> bool {
+        if entries
+            .iter()
+            .any(|(_, payload)| payload.len() > self.bytes_per_page)
+        {
+            return false;
+        }
+        if self.host_capacity_pages == 0 && self.write_many_to_disk(&entries) {
+            return true;
+        }
+        if self.insert_many_overflow(&mut entries) {
+            return true;
+        }
+        let mut inserted = Vec::with_capacity(entries.len());
+        for (key, payload) in entries {
+            if !self.insert_inner(key, payload, false) {
+                self.remove(&inserted);
+                return false;
+            }
+            inserted.push(key);
+        }
+        self.commit_manifest();
+        true
+    }
+
+    fn insert_many_overflow(&mut self, entries: &mut [(u64, Vec<u8>)]) -> bool {
+        if entries.is_empty() || self.host_capacity_pages == 0 || self.disk.is_none() {
+            return false;
+        }
+        let keys = entries.iter().map(|(key, _)| *key).collect::<BTreeSet<_>>();
+        if keys.len() != entries.len()
+            || keys
+                .iter()
+                .any(|key| self.host.contains_key(key) || self.contains_disk(*key))
+        {
+            return false;
+        }
+        let overflow = self
+            .host
+            .len()
+            .saturating_add(entries.len())
+            .saturating_sub(self.host_capacity_pages);
+        if overflow == 0 {
+            for (key, payload) in entries {
+                self.insert_host(*key, std::mem::take(payload));
+            }
+            return true;
+        }
+        let old_spills = self
+            .host_lru
+            .iter()
+            .take(overflow.min(self.host.len()))
+            .map(|(_, key)| *key)
+            .collect::<Vec<_>>();
+        let incoming_spills = overflow.saturating_sub(old_spills.len());
+        let Some(disk) = self.disk.as_mut() else {
+            return false;
+        };
+        let mut slots = Vec::with_capacity(overflow);
+        for _ in 0..overflow {
+            let Some(slot) = disk.store.alloc_slot() else {
+                for slot in slots {
+                    disk.store.free_slot(slot);
+                }
+                return false;
+            };
+            slots.push(slot);
+        }
+        let mut writes = Vec::with_capacity(overflow);
+        let mut records = Vec::with_capacity(overflow);
+        for (key, slot) in old_spills.iter().copied().zip(slots.iter().copied()) {
+            let payload = &self.host[&key].payload;
+            writes.push((slot, payload.as_slice()));
+            records.push((key, slot, payload.len()));
+        }
+        for ((key, payload), slot) in entries
+            .iter()
+            .take(incoming_spills)
+            .zip(slots.iter().copied().skip(old_spills.len()))
+        {
+            writes.push((slot, payload.as_slice()));
+            records.push((*key, slot, payload.len()));
+        }
+        if let Err(err) = disk.write_payloads(&writes) {
+            log::warn!("KV overflow batch disk write failed: {err}");
+            for slot in slots {
+                disk.store.free_slot(slot);
+            }
+            return false;
+        }
+        for (key, slot, len) in records {
+            disk.keys.insert(key, DiskRecord { slot, len });
+        }
+        if disk.durable
+            && let Err(err) = disk.write_manifest()
+        {
+            log::warn!("KV recall batch manifest update failed: {err}");
+        }
+        for key in old_spills {
+            if let Some(entry) = self.host.remove(&key) {
+                self.host_lru.remove(&(entry.stamp, key));
+            }
+        }
+        for (key, payload) in entries.iter_mut().skip(incoming_spills) {
+            self.insert_host(*key, std::mem::take(payload));
+        }
+        true
+    }
+
+    fn contains_disk(&self, key: u64) -> bool {
+        self.disk
+            .as_ref()
+            .is_some_and(|disk| disk.keys.contains_key(&key))
+    }
+
+    fn discount_disk_useful_write(&mut self, key: u64, bytes: usize) {
+        if let Some(disk) = self.disk.as_mut()
+            && disk.keys.contains_key(&key)
+        {
+            disk.stats.useful_write_bytes =
+                disk.stats.useful_write_bytes.saturating_sub(bytes as u64);
+        }
+    }
+
+    fn discount_disk_useful_read(&mut self, key: u64, bytes: usize) {
+        if let Some(disk) = self.disk.as_mut()
+            && disk.keys.contains_key(&key)
+        {
+            disk.stats.useful_read_bytes =
+                disk.stats.useful_read_bytes.saturating_sub(bytes as u64);
+        }
     }
 
     fn next_stamp(&mut self) -> u64 {
@@ -665,7 +1085,7 @@ impl KvTierStore {
         self.host_lru.insert((stamp, key));
     }
 
-    fn write_to_disk(&mut self, key: u64, payload: &[u8]) -> bool {
+    fn write_to_disk(&mut self, key: u64, payload: &[u8], commit_manifest: bool) -> bool {
         let Some(disk) = &mut self.disk else {
             return false;
         };
@@ -678,8 +1098,8 @@ impl KvTierStore {
                 None => return false,
             }
         };
-        if let Err(err) = disk.store.write_slot(slot, payload) {
-            log::warn!("KV mmap write failed for key {key} slot {slot}: {err}");
+        if let Err(err) = disk.write_payloads(&[(slot, payload)]) {
+            log::warn!("KV disk write failed for key {key} slot {slot}: {err}");
             if !already_present {
                 disk.store.free_slot(slot);
             }
@@ -692,7 +1112,8 @@ impl KvTierStore {
                 len: payload.len(),
             },
         );
-        if disk.durable
+        if commit_manifest
+            && disk.durable
             && let Err(err) = disk.write_manifest()
         {
             log::warn!("KV recall manifest update failed for key {key}: {err}");
@@ -700,7 +1121,68 @@ impl KvTierStore {
         true
     }
 
-    fn spill_coldest_to_disk(&mut self) -> bool {
+    fn write_many_to_disk(&mut self, entries: &[(u64, Vec<u8>)]) -> bool {
+        let Some(disk) = &mut self.disk else {
+            return entries.is_empty();
+        };
+        let unique = entries.iter().map(|(key, _)| *key).collect::<BTreeSet<_>>();
+        if unique.len() != entries.len() {
+            return false;
+        }
+        let mut allocated = Vec::new();
+        let mut records = Vec::with_capacity(entries.len());
+        for (key, payload) in entries {
+            let already_present = disk.keys.get(key).copied();
+            let slot = match already_present {
+                Some(record) => record.slot,
+                None => match disk.store.alloc_slot() {
+                    Some(slot) => {
+                        allocated.push(slot);
+                        slot
+                    }
+                    None => {
+                        for slot in allocated {
+                            disk.store.free_slot(slot);
+                        }
+                        return false;
+                    }
+                },
+            };
+            records.push((*key, slot, payload.len()));
+        }
+        let writes = records
+            .iter()
+            .zip(entries)
+            .map(|((_, slot, _), (_, payload))| (*slot, payload.as_slice()))
+            .collect::<Vec<_>>();
+        if let Err(err) = disk.write_payloads(&writes) {
+            log::warn!("KV batch disk write failed: {err}");
+            for slot in allocated {
+                disk.store.free_slot(slot);
+            }
+            return false;
+        }
+        for (key, slot, len) in records {
+            disk.keys.insert(key, DiskRecord { slot, len });
+        }
+        if disk.durable
+            && let Err(err) = disk.write_manifest()
+        {
+            log::warn!("KV recall batch manifest update failed: {err}");
+        }
+        true
+    }
+
+    fn commit_manifest(&mut self) {
+        if let Some(disk) = self.disk.as_mut()
+            && disk.durable
+            && let Err(err) = disk.write_manifest()
+        {
+            log::warn!("KV recall batch manifest update failed: {err}");
+        }
+    }
+
+    fn spill_coldest_to_disk(&mut self, commit_manifest: bool) -> bool {
         let Some((stamp, key)) = self.host_lru.iter().next().copied() else {
             return false;
         };
@@ -709,7 +1191,7 @@ impl KvTierStore {
             return false;
         };
         debug_assert_eq!(entry.stamp, stamp);
-        if self.write_to_disk(key, &entry.payload) {
+        if self.write_to_disk(key, &entry.payload, commit_manifest) {
             true
         } else {
             self.host.insert(key, entry);
@@ -718,10 +1200,8 @@ impl KvTierStore {
         }
     }
 
-    /// Fetch a payload for promotion. Host hit bumps recency and returns the
-    /// owned payload. Disk hit returns a **zero-copy** mmap slice — no allocation,
-    /// no copy. The caller (promote) copies the slice into a device buffer, so
-    /// the borrowed lifetime is sufficient.
+    /// Fetch a payload for promotion. Host and mmap hits borrow their payload;
+    /// direct-I/O hits own the aligned read result.
     pub fn read(&mut self, key: u64) -> Result<Cow<'_, [u8]>> {
         // Host hit: bump LRU, return owned payload.
         if let Some(old_stamp) = self.host.get(&key).map(|entry| entry.stamp) {
@@ -732,18 +1212,63 @@ impl KvTierStore {
             entry.stamp = stamp;
             return Ok(Cow::Borrowed(entry.payload.as_slice()));
         }
-        // Disk hit: zero-copy mmap slice.
-        if let Some(disk) = self.disk.as_ref()
-            && let Some(record) = disk.keys.get(&key)
+        if let Some(disk) = self.disk.as_mut()
+            && let Some(record) = disk.keys.get(&key).copied()
         {
             let len = if record.len == 0 {
                 self.bytes_per_page
             } else {
                 record.len.min(self.bytes_per_page)
             };
-            return Ok(Cow::Borrowed(&disk.store.read_slot(record.slot)[..len]));
+            return Ok(disk.read_payload(record.slot, len)?);
         }
         Err(anyhow!("KV tier store has no entry for key {key}"))
+    }
+
+    pub fn read_many(&mut self, keys: &[u64]) -> Result<Vec<Vec<u8>>> {
+        let mut values = vec![None; keys.len()];
+        let mut disk_reads = Vec::new();
+        for (index, key) in keys.iter().copied().enumerate() {
+            if let Some(old_stamp) = self.host.get(&key).map(|entry| entry.stamp) {
+                let stamp = self.next_stamp();
+                self.host_lru.remove(&(old_stamp, key));
+                self.host_lru.insert((stamp, key));
+                let entry = self.host.get_mut(&key).expect("key observed above");
+                entry.stamp = stamp;
+                values[index] = Some(entry.payload.clone());
+                continue;
+            }
+            let record = self
+                .disk
+                .as_ref()
+                .and_then(|disk| disk.keys.get(&key))
+                .copied()
+                .ok_or_else(|| anyhow!("KV tier store has no entry for key {key}"))?;
+            let len = if record.len == 0 {
+                self.bytes_per_page
+            } else {
+                record.len.min(self.bytes_per_page)
+            };
+            disk_reads.push((index, record.slot, len));
+        }
+        if !disk_reads.is_empty() {
+            let reads = disk_reads
+                .iter()
+                .map(|(_, slot, len)| (*slot, *len))
+                .collect::<Vec<_>>();
+            let disk_values = self
+                .disk
+                .as_mut()
+                .expect("disk records observed above")
+                .read_payloads(&reads)?;
+            for ((index, _, _), value) in disk_reads.into_iter().zip(disk_values) {
+                values[index] = Some(value);
+            }
+        }
+        Ok(values
+            .into_iter()
+            .map(|value| value.expect("every requested key resolved"))
+            .collect())
     }
 
     /// Rank-LOCAL chunked-blob insert: one manifest page under
@@ -761,30 +1286,36 @@ impl KvTierStore {
             return false;
         }
         let manifest_key = tier_key(ns, key);
-        if !self.insert(manifest_key, chunk_manifest(chunks, bytes.len())) {
-            return false;
+        let manifest = chunk_manifest(chunks, bytes.len());
+        let manifest_bytes = manifest.len();
+        let mut entries = Vec::with_capacity(chunks + 1);
+        entries.push((manifest_key, manifest));
+        entries.extend(
+            bytes
+                .chunks(self.bytes_per_page)
+                .enumerate()
+                .map(|(idx, chunk)| (tier_key(ns_chunk, chunk_sub(key, idx)), chunk.to_vec())),
+        );
+        let inserted = self.insert_many(entries);
+        if inserted {
+            self.discount_disk_useful_write(manifest_key, manifest_bytes);
         }
-        let mut added = Vec::with_capacity(chunks + 1);
-        added.push(manifest_key);
-        for (idx, chunk) in bytes.chunks(self.bytes_per_page).enumerate() {
-            let chunk_key = tier_key(ns_chunk, chunk_sub(key, idx));
-            if !self.insert(chunk_key, chunk.to_vec()) {
-                self.remove(&added);
-                return false;
-            }
-            added.push(chunk_key);
-        }
-        true
+        inserted
     }
 
-    /// Rank-LOCAL chunked-blob read-back (host hit or zero-copy mmap slices,
-    /// assembled owned). Err on any missing piece.
+    /// Rank-LOCAL chunked-blob read-back, assembled owned. Err on any missing
+    /// piece.
     pub fn read_chunked(&mut self, ns: u64, ns_chunk: u64, key: u64) -> Result<Vec<u8>> {
-        let manifest = self.read(tier_key(ns, key))?.into_owned();
+        let manifest_key = tier_key(ns, key);
+        let manifest = self.read(manifest_key)?.into_owned();
+        self.discount_disk_useful_read(manifest_key, manifest.len());
         let (chunks, total) = parse_chunk_manifest(&manifest)?;
+        let keys = (0..chunks)
+            .map(|idx| tier_key(ns_chunk, chunk_sub(key, idx)))
+            .collect::<Vec<_>>();
         let mut bytes = Vec::with_capacity(total);
-        for idx in 0..chunks {
-            bytes.extend_from_slice(&self.read(tier_key(ns_chunk, chunk_sub(key, idx)))?);
+        for chunk in self.read_many(&keys)? {
+            bytes.extend_from_slice(&chunk);
         }
         bytes.truncate(total);
         anyhow::ensure!(
@@ -845,7 +1376,7 @@ impl KvTierStore {
             }
         }
         if disk_index_changed
-            && let Some(disk) = self.disk.as_ref()
+            && let Some(disk) = self.disk.as_mut()
             && disk.durable
             && let Err(err) = disk.write_manifest()
         {
@@ -980,6 +1511,9 @@ mod tests {
         let blob: Vec<u8> = (0..80u8).collect();
         assert!(store.insert_chunked(3, 4, 1, &blob));
         assert_eq!(store.disk_pages(), 4, "manifest + 3 chunks on disk");
+        assert_eq!(store.io_stats().useful_write_bytes, blob.len() as u64);
+        assert_eq!(store.read_chunked(3, 4, 1).expect("batch read"), blob);
+        assert_eq!(store.io_stats().useful_read_bytes, blob.len() as u64);
         assert!(store.insert_chunked(3, 4, 2, &blob));
         store.remove_chunked(3, 4, 1);
         assert_eq!(store.disk_pages(), 4, "superseded disk blob reclaimed");
@@ -1035,11 +1569,29 @@ mod tests {
         assert_eq!(total, NUM as usize * BLOB);
 
         let gib = (NUM as f64 * BLOB as f64) / (1u64 << 30) as f64;
+        let stats = store.io_stats();
+        let write_wa = stats
+            .submitted_write_bytes
+            .saturating_add(stats.metadata_write_bytes) as f64
+            / stats.useful_write_bytes.max(1) as f64;
+        let read_amplification =
+            stats.submitted_read_bytes as f64 / stats.useful_read_bytes.max(1) as f64;
         println!(
             "chunked-blob disk bandwidth over {gib:.1} GiB: \
-             write {:.2} GiB/s ({write:?}), read(warm) {:.2} GiB/s ({read:?})",
+             write {:.2} GiB/s ({write:?}), read(warm) {:.2} GiB/s ({read:?}); \
+             mode={:?} useful_read={} useful_write={} submitted_read={} submitted_write={} \
+             metadata_write={} write_wa={write_wa:.4} read_amplification={read_amplification:.4} \
+             completion_wait_ns={} fallback={:?}",
             gib / write.as_secs_f64(),
             gib / read.as_secs_f64(),
+            stats.mode,
+            stats.useful_read_bytes,
+            stats.useful_write_bytes,
+            stats.submitted_read_bytes,
+            stats.submitted_write_bytes,
+            stats.metadata_write_bytes,
+            stats.completion_wait_ns,
+            stats.fallback_reason,
         );
         let _ = std::fs::remove_dir_all(root);
     }
@@ -1072,6 +1624,13 @@ mod tests {
     }
 
     #[test]
+    fn disk_mode_defaults_to_mmap() {
+        assert_eq!(parse_disk_mode(None), None);
+        assert_eq!(parse_disk_mode(Some("mmap")), Some(DiskIoMode::Mmap));
+        assert_eq!(parse_disk_mode(Some("direct")), Some(DiskIoMode::Direct));
+    }
+
+    #[test]
     fn host_overflow_spills_coldest_to_disk_and_reads_back() {
         let root = temp_root("spill");
         let mut store = KvTierStore::with_budget(16, 8);
@@ -1095,6 +1654,24 @@ mod tests {
         assert!(store.read(2).is_err());
 
         std::fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn batch_overflow_submits_disk_pages_together() {
+        let root = temp_root("batch_overflow");
+        let mut store = KvTierStore::with_budget(16, 8);
+        assert!(store.set_disk(root.clone(), 32, 8));
+        assert!(store.insert(1, vec![1; 8]));
+        assert!(store.insert_many(vec![(2, vec![2; 8]), (3, vec![3; 8]), (4, vec![4; 8])]));
+        assert_eq!(store.disk_pages(), 2);
+        assert_eq!(
+            store.read_many(&[1, 2, 3, 4]).expect("batch read")[0],
+            vec![1; 8]
+        );
+        let stats = store.io_stats();
+        assert_eq!(stats.write_ops, 2);
+        assert_eq!(stats.useful_write_bytes, 16);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
