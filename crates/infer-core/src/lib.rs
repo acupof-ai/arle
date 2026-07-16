@@ -4194,6 +4194,47 @@ mod tests {
         Ok(())
     }
 
+    /// free=0 but the radix cache holds reclaimable pages: `fit_plan_to_kv_pages`
+    /// must evict the shortfall instead of shedding every prefill row — an
+    /// all-trimmed plan is idle, re-enters the same state next tick, and the
+    /// request stalls forever (`alloc_with_prefix_reclaim` never reached).
+    #[test]
+    fn plan_repair_reclaims_cached_pages_before_trimming_prefill() -> Result<()> {
+        let mut engine = Engine::with_config(
+            MockExecutor::ready(),
+            MockKvPool::with_capacity(2, 4, 2),
+            test_config(2),
+        );
+        // Cache one of the two pages: 3 prompt + 2 generated tokens materialize
+        // 4 KV positions (the newest token's KV is unwritten), sealing one full
+        // block at finish → that page stays cache-retained, one page free.
+        let warm = engine.submit_request(vec![1, 2, 3], 2);
+        engine.run_to_idle()?;
+        assert_finished(engine.completed(warm).expect("warm-up completed"));
+        assert_eq!(engine.kv_free_pages(), 1, "one page free, one cached");
+        assert_eq!(engine.kv.resident_evictable_pages(), 1);
+
+        // 8-token prompt needs 2 pages > 1 free; the cached page must be
+        // reclaimed instead of shedding the row into a permanently idle plan.
+        let handle = engine.next_handle();
+        let mut request = RequestState::new(
+            handle,
+            vec![9; 8],
+            RequestPriority::Normal,
+            1,
+            SamplingParams::default(),
+        );
+        request.phase = RequestPhase::Prefilling { progress: 0 };
+        engine.active.insert(0, request);
+
+        for _ in 0..8 {
+            engine.step()?;
+        }
+        let done = engine.completed(handle).expect("request must not stall");
+        assert!(!done.generated_tokens.is_empty());
+        Ok(())
+    }
+
     #[test]
     fn finish_frees_slot_and_pages() -> Result<()> {
         let mut engine = Engine::with_config(
