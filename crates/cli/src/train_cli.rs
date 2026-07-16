@@ -1939,7 +1939,10 @@ fn log_opd_vram(label: &str, backend: &std::sync::Arc<dyn autograd::Backend>) {
 /// (per-task pass/fail + the aggregate pass-rate), and return the pass-rate so
 /// the caller can log it next to `mean_train_loss`. `label` is `"base"` for the
 /// round-0 baseline or the round index otherwise.
+// In-house AgentSession eval arm — superseded by `run_cc_eval`; P3 deletes it
+// with the in-house rollout arm.
 #[cfg(feature = "cuda")]
+#[allow(dead_code)]
 fn run_agent_opd_eval_pass(
     infer_student: &train::infer_student::InferStudent,
     eval_tasks: &[(train::swe_dataset::SweTask, PathBuf)],
@@ -1995,6 +1998,138 @@ fn run_agent_opd_eval_pass(
         out_path.display(),
     );
     Ok(pass_rate)
+}
+
+/// Held-out eval via the cc harness: ONE sample per task (K=1 — best-of-N would
+/// inflate the pass-rate vs the single-shot production setting), no training.
+/// Writes the same `eval_round_{label}.jsonl` shape as the in-house eval pass
+/// and returns the pass-rate. Sampling params are CC's own (the harness has no
+/// temperature knob — cc drives the API request).
+#[cfg(feature = "cuda")]
+fn run_cc_eval(
+    harness: &train::cc_harness::CcHarness,
+    eval_tasks: &[(std::sync::Arc<train::swe_dataset::SweTask>, PathBuf)],
+    out_dir: &Path,
+    label: &str,
+) -> Result<f32> {
+    use std::io::Write;
+
+    if eval_tasks.is_empty() {
+        return Ok(0.0);
+    }
+    fs::create_dir_all(out_dir)
+        .with_context(|| format!("create eval out dir {}", out_dir.display()))?;
+    let out_path = out_dir.join(format!("eval_round_{label}.jsonl"));
+    let mut file = fs::File::create(&out_path)
+        .with_context(|| format!("create eval out {}", out_path.display()))?;
+
+    let (first_task, first_staged) = &eval_tasks[0];
+    let mut booted = Some(harness.boot_group(first_task, first_staged, 1));
+    let (mut passed, mut edited, mut dense_sum) = (0usize, 0usize, 0.0f32);
+    for i in 0..eval_tasks.len() {
+        let this = booted.take().expect("booted ahead");
+        // Boot-ahead: the next task's sandbox builds during this rollout.
+        booted = eval_tasks
+            .get(i + 1)
+            .map(|(next, staged)| harness.boot_group(next, staged, 1));
+        let group = harness.run_group(this)?;
+        let s = &group.samples[0];
+        passed += usize::from(s.passed());
+        edited += usize::from(s.edited);
+        dense_sum += s.reward;
+        let line = serde_json::json!({
+            "instance_id": s.task_id,
+            "passed": s.passed(),
+            "edited": s.edited,
+            "note": s.note,
+            "reward": s.reward,
+        });
+        writeln!(file, "{line}")?;
+    }
+    let pass_rate = passed as f32 / eval_tasks.len() as f32;
+    let mean_dense = dense_sum / eval_tasks.len() as f32;
+    let agg = serde_json::json!({
+        "aggregate": true,
+        "label": label,
+        "pass_rate": pass_rate,
+        "mean_dense": mean_dense,
+        "passed": passed,
+        "edited": edited,
+        "tasks": eval_tasks.len(),
+    });
+    writeln!(file, "{agg}")?;
+    file.flush()?;
+    eprintln!(
+        "[arle train agent-opd] eval[{label}]: held-out pass_rate={pass_rate:.4} mean_dense={mean_dense:.4} ({passed}/{} tasks) -> {}",
+        eval_tasks.len(),
+        out_path.display(),
+    );
+    Ok(pass_rate)
+}
+
+/// Block until the serve engine has no in-flight requests. The group's cc
+/// children have exited by the time this runs, so this only drains stragglers
+/// (e.g. an aborted stream the engine is still finishing) — a live request
+/// during the weight re-merge / KV-pool drop would read stale or freed state.
+#[cfg(feature = "cuda")]
+fn quiesce_serve(
+    engine: &std::sync::Arc<std::sync::Mutex<infer_api::LoadedInferenceEngine>>,
+) -> Result<()> {
+    use infer_api::InferenceEngine as _;
+
+    let started = Instant::now();
+    let mut next_warn = 10u64;
+    loop {
+        let active = engine
+            .lock()
+            .map_err(|err| anyhow!("LoadedInferenceEngine lock poisoned: {err}"))?
+            .telemetry()
+            .active_requests;
+        if active == 0 {
+            return Ok(());
+        }
+        let elapsed = started.elapsed().as_secs();
+        if elapsed >= next_warn {
+            eprintln!("[agent-opd] quiesce: {active} request(s) still active after {elapsed}s");
+            next_warn += 10;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// Append-only JSONL metrics sink (`--metrics-out`); write failures log and
+/// never abort training.
+#[cfg(feature = "cuda")]
+struct JsonlSink {
+    path: PathBuf,
+}
+
+#[cfg(feature = "cuda")]
+impl JsonlSink {
+    fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    fn append(&self, row: &serde_json::Value) {
+        let write = || -> Result<()> {
+            use std::io::Write;
+            if let Some(parent) = self.path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let mut file = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.path)?;
+            writeln!(file, "{row}")?;
+            Ok(())
+        };
+        if let Err(err) = write() {
+            eprintln!(
+                "[agent-opd] metrics write to {} failed: {err}",
+                self.path.display()
+            );
+        }
+    }
 }
 
 /// PEFT adapter config for `--save-lora-adapters` (mainstream HF PEFT dir:
@@ -2187,7 +2322,7 @@ fn replay_pg(
                     })
                 })
                 .collect::<Result<_>>()?;
-            let loss = preset
+            let report = preset
                 .update(
                     &batch,
                     student,
@@ -2200,7 +2335,7 @@ fn replay_pg(
                     store,
                 )
                 .map_err(anyhow::Error::from)?;
-            losses.push(loss);
+            losses.push(report.loss);
         }
         let mean_loss = if losses.is_empty() {
             0.0
@@ -2501,11 +2636,11 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
     if let Some(n) = args.task_limit {
         tasks_raw.truncate(n);
     }
-    let tasks: Vec<(SweTask, PathBuf)> = tasks_raw
+    let tasks: Vec<(Arc<SweTask>, PathBuf)> = tasks_raw
         .into_iter()
         .map(|t| {
             let tree = staged_root.join(&t.instance_id);
-            (t, tree)
+            (Arc::new(t), tree)
         })
         .collect();
     if tasks.is_empty() {
@@ -2520,7 +2655,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
     // HELD-OUT eval tasks (separate from --dataset). Staged under
     // --eval-staged-root (falls back to --staged-root). Loaded once up front so
     // the round-0 baseline + per-round eval reuse the same set.
-    let eval_tasks: Vec<(SweTask, PathBuf)> = match args.eval_dataset.as_deref() {
+    let eval_tasks: Vec<(Arc<SweTask>, PathBuf)> = match args.eval_dataset.as_deref() {
         Some(eval_path) => {
             let eval_staged_root = args.eval_staged_root.as_deref().unwrap_or(staged_root);
             let mut eval_raw = train::swe_dataset::load_swe_tasks(eval_path)?;
@@ -2544,11 +2679,11 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
                     overlap.first().copied().unwrap_or("")
                 );
             }
-            let eval_tasks: Vec<(SweTask, PathBuf)> = eval_raw
+            let eval_tasks: Vec<(Arc<SweTask>, PathBuf)> = eval_raw
                 .into_iter()
                 .map(|t| {
                     let tree = eval_staged_root.join(&t.instance_id);
-                    (t, tree)
+                    (Arc::new(t), tree)
                 })
                 .collect();
             eprintln!(
@@ -2576,20 +2711,13 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
         .clone()
         .unwrap_or_else(|| eval_out_dir.join("metrics.jsonl"));
 
-    // Rollout engine (student) — own KV/scheduler path for the multi-turn agent
-    // tool loop. Size for the full accumulated agent conversation: up to
-    // `max_turns` sub-turns, each generating up to `max_tokens`, plus tool
-    // outputs / context. Generous budget, floored, bounds total KV pages.
-    // KV must cover the longest rollout — rescue runs at the bigger of its own
-    // turn/token budget and the normal one.
-    let rescue_turns = if args.rescue_max_turns == 0 {
-        args.max_turns
-    } else {
-        args.rescue_max_turns
-    };
-    let student_seq =
-        (rescue_turns.max(args.max_turns) * args.rescue_max_tokens.max(args.max_tokens) + 8192)
-            .max(16384);
+    // Rollout engine (student) doubles as the cc serve. KV budget for cc
+    // traffic: K concurrent cc streams × ~22K-token session ceiling (measured
+    // cc SWE sessions), +25% headroom, page_size 16.
+    const CC_SESSION_TOKENS: usize = 22_000;
+    let width = args.samples_per_prompt.max(1);
+    let cc_pages = width * CC_SESSION_TOKENS.div_ceil(16);
+    let cc_total_pages = cc_pages + cc_pages / 4;
 
     // Load order: default loads the autograd student FIRST (engine then sees
     // post-student free VRAM — byte-identical). --share-frozen-base loads the
@@ -2616,7 +2744,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
     };
 
     eprintln!(
-        "[arle train agent-opd] loading rollout engine from {} (max_seq_len={student_seq})",
+        "[arle train agent-opd] loading rollout engine from {} (slots={width} pages={cc_total_pages})",
         student_dir.display()
     );
     let student_engine = LoadedInferenceEngine::load_with_config(
@@ -2626,16 +2754,15 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
         // agent-OPD: NO decode CUDA-graph. Its captured workspace (~30 GB on the
         // 27B MoE, captured during the rollout's decode) would co-reside with the
         // masked-CE writeback and OOM it (post-rollout engine ~87 GB vs ~55 GB
-        // no-graph). Eager rollout is slower but the writeback is the binding
-        // constraint — reclaiming that room lets the loop close end-to-end.
+        // no-graph). F.5 measures whether the co-residency budget affords it.
         false,
         EngineLoadConfig {
-            num_slots: args.rollout_num_slots,
+            num_slots: width,
             page_size: 16,
-            total_pages: args.rollout_num_slots.max(1) * student_seq.div_ceil(16),
-            max_prompt_tokens: student_seq,
-            max_total_tokens: student_seq,
-            chunked_prefill_size: student_seq,
+            total_pages: cc_total_pages,
+            max_prompt_tokens: CC_SESSION_TOKENS,
+            max_total_tokens: CC_SESSION_TOKENS,
+            chunked_prefill_size: CC_SESSION_TOKENS,
             // The autograd student co-resides with this engine, so the engine
             // must NOT greedily reserve 0.9 of free VRAM (the SGLang default) —
             // its KV pool is num_slots-based (small). Cap the static reservation
@@ -2650,6 +2777,24 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
     log_opd_vram(
         "after rollout engine load (KV pool alloc'd)",
         &train_backend,
+    );
+
+    // cc serve over THIS engine (same engine thread, same KV pool): install the
+    // dump sink BEFORE any traffic, then serve the router on a background
+    // thread. Token-only shutdown (`serve_thread.shutdown()` at run end).
+    let dump_dir = eval_out_dir.join("dumps");
+    infer_api::set_messages_dump_dir(&dump_dir)
+        .with_context(|| format!("create cc dump dir {}", dump_dir.display()))?;
+    let cc_model_id = infer_api::InferenceEngine::model_id(&student_engine).to_owned();
+    let serve_thread = infer_api::serve_router_on_thread(
+        student_engine.local_router(0)?, // thinking unbounded — the serve default
+        "127.0.0.1",
+        args.serve_port,
+    )?;
+    eprintln!(
+        "[arle train agent-opd] cc serve on http://127.0.0.1:{} (model={cc_model_id}, dumps={})",
+        args.serve_port,
+        dump_dir.display()
     );
 
     // Train-infer FP8 weight sharing (`--share-frozen-base`): borrow the rollout
@@ -2831,55 +2976,41 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
         return Ok(());
     }
 
-    // rounds:1 — the round loop is external (mirroring rubric-OPD); each call runs
-    // one round, then the caller syncs the trained LoRA into the rollout engine.
-    let cfg = train::agent_opd::AgentOpdConfig {
-        rounds: 1,
-        samples_per_prompt: args.samples_per_prompt,
-        max_turns: args.max_turns,
-        max_tokens: args.max_tokens,
-        temperature: args.rollout_temperature,
-        think: args.think_rollouts,
-        rescue_samples: args.rescue_samples,
-        rescue_max_tokens: args.rescue_max_tokens,
-        rescue_max_turns: rescue_turns,
-        writeback_batch: args.writeback_batch,
-        writeback_cap: args.writeback_cap,
+    // cc rollout harness over the serve; task groups run sequentially
+    // (staleness 0) — in-flight concurrency = the K samples of one group.
+    let harness = train::cc_harness::CcHarness {
         work_root: args.work_root.clone(),
-        pythonpath: args.pythonpath.clone(),
-        bash_timeout_secs: args.bash_timeout_secs,
+        dump_dir,
+        base_url: format!("http://127.0.0.1:{}", args.serve_port),
+        model_id: cc_model_id,
+        cc_timeout_secs: args.cc_timeout,
         test_timeout_secs: args.test_timeout_secs,
-        update_strategy: update_preset,
+        pythonpath: args.pythonpath.clone(),
+        tokenizer: train::cc_harness::load_tokenizer(&student_dir.join("tokenizer.json"))?,
     };
 
     // PEFT adapter config for `--save-lora-adapters` (mainstream HF PEFT dir:
     // adapter_config.json + adapter_model.safetensors). Built once; borrowed by
     // every per-round adapter save.
     let lora_adapter_config = agent_opd_adapter_config(student_dir, target_set, lora);
+    let metrics = JsonlSink::new(metrics_path);
 
     // Round-0 BASELINE held-out eval BEFORE any training: the un-tuned student's
-    // pass-rate. Every per-round eval is read against this, so the operator sees
-    // baseline → round-N improvement (the whole point — train loss alone cannot
-    // tell you the model got better at coding). The KV pool is resident here
-    // (just loaded); the round loop re-acquires it via `ensure_kv_pool`.
+    // pass-rate every per-round eval is read against.
     let mut baseline_pass_rate: Option<f32> = None;
     if !eval_tasks.is_empty() {
-        baseline_pass_rate = Some(run_agent_opd_eval_pass(
-            &infer_student,
-            &eval_tasks,
-            &cfg,
-            args.eval_temperature,
-            &eval_out_dir,
-            "base",
-        )?);
+        baseline_pass_rate = Some(run_cc_eval(&harness, &eval_tasks, &eval_out_dir, "base")?);
     }
 
+    let needs = update_preset.needs();
+    let sync_every_group = matches!(args.sync, crate::args::SyncArg::EveryGroup);
+    let preset_name = clap::ValueEnum::to_possible_value(&args.update_strategy)
+        .map_or_else(String::new, |v| v.get_name().to_owned());
     for round in 0..args.rounds {
-        // Anchor the per-stage profiler (opt-in via ARLE_AOPD_PROFILE; no-op off).
+        // Anchor the per-stage profiler (human table opt-in via ARLE_AOPD_PROFILE).
         train::aopd_profile::begin_round();
-        // Re-acquire the rollout KV pool the PREVIOUS round's writeback closure
-        // dropped (no-op on round 0 / when the pool is resident). The rollout
-        // below needs it; the writeback frees it again at the end of the round.
+        // Re-acquire the rollout KV pool the previous writeback dropped
+        // (no-op when resident).
         if let Err(err) =
             train::aopd_profile::time_try("kv_pool_ensure", train::aopd_profile::GPU, || {
                 infer_student.ensure_kv_pool()
@@ -2887,126 +3018,211 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
         {
             eprintln!("[agent-opd] ensure KV pool (round {round}) failed: {err}");
         }
-        // Fresh closures each round so the &mut store / &mut optimizer borrows
-        // are released before the per-round checkpoint reuses the store.
-        let report = {
-            let student_ref = &student;
-            let all_ref = all_params.as_slice();
-            let trainable_ref = trainable.as_slice();
-            let store_ref = &mut store;
-            let opt_ref = &mut optimizer;
-            let critic_slot = &mut value_critic;
-            let writeback_window = args.writeback_window;
-            let needs = update_preset.needs();
-            train::agent_opd::run_agentic_opd_round(
-                &infer_student,
-                &tasks,
-                &cfg,
-                round,
-                |batch: &[train::update_strategy::ScoredTrajectory]| {
-                    // Release the rollout engine's inference forward scratch (24K-shaped
-                    // workspace) BEFORE the writeback: the agent-OPD path runs
-                    // EngineOffloadMode::Off so the scratch otherwise stays resident and
-                    // OOMs the writeback's logits alloc. The rollout has synced before the
-                    // closure runs, so the release precondition holds; the freed blocks
-                    // return to the shared caching pool the writeback autograd reuses.
-                    if let Err(err) = infer_student.release_inference_scratch() {
-                        eprintln!("[agent-opd] release inference scratch failed: {err}");
-                    } else {
-                        eprintln!("[agent-opd] released inference scratch");
-                    }
-                    // Free the DEAD rollout KV pool: the writeback's
-                    // `forward_hidden_states` is a fresh autograd forward that does
-                    // NOT read this engine's KV cache, so the rollout pool is idle
-                    // during the writeback. Dropping it (~KV-pool GB) is the
-                    // headroom that lets the ~16-24K writeback forward fit. The
-                    // round's rollout has synced before the closure runs, so the
-                    // pool holds no resident pages; `ensure_kv_pool` re-acquires it
-                    // at the top of the next round.
-                    if let Err(err) = infer_student.release_kv_pool() {
-                        eprintln!("[agent-opd] release KV pool failed: {err}");
-                    } else {
-                        eprintln!("[agent-opd] released rollout KV pool");
-                    }
-                    log_opd_vram("agent-opd pre-writeback", &train_backend);
-                    // Capture π_rollout at V0 (before any optimizer step) when the
-                    // strategy needs it — a tape-off forward per trajectory. θ is
-                    // unchanged until `update` below, so these ARE the rollout logprobs.
-                    let mut scored = batch.to_vec();
-                    if needs.rollout_logprobs {
-                        for traj in &mut scored {
-                            let lp = train::opd::capture_rollout_logprobs(
-                                student_ref,
-                                &traj.prompt_ids,
-                                &traj.response_ids,
-                                &traj.response_mask,
-                                store_ref,
-                            )
-                            .map_err(anyhow::Error::from)?;
-                            traj.rollout_logprobs = Some(lp);
-                        }
-                    }
-                    update_preset
-                        .update(
-                            &scored,
-                            student_ref,
-                            all_ref,
-                            trainable_ref,
-                            opt_ref,
-                            critic_slot.as_mut(),
-                            vocab,
-                            writeback_window,
-                            store_ref,
-                        )
-                        .map_err(anyhow::Error::from)
-                },
-            )?
+
+        let mut losses: Vec<f32> = Vec::new();
+        let (mut rollouts, mut passed, mut tasks_passed, mut zero_variance_groups) =
+            (0usize, 0usize, 0usize, 0usize);
+        let mut reward_sum = 0.0f64;
+        let (mut prompt_tokens, mut completion_tokens) = (0u64, 0u64);
+        let mut sync_lora_secs = 0.0f64;
+
+        let mut next_boot = tasks
+            .first()
+            .map(|(task, staged)| harness.boot_group(task, staged, width));
+        for group_idx in 0..tasks.len() {
+            let this_boot = next_boot.take().expect("booted ahead");
+            // Boot-ahead: the next group's sandboxes build during this group's
+            // rollout + train (CPU only — staleness-free).
+            next_boot = tasks
+                .get(group_idx + 1)
+                .map(|(next, staged)| harness.boot_group(next, staged, width));
+            let group =
+                train::aopd_profile::time_try("cc_rollout", train::aopd_profile::WALL, || {
+                    harness.run_group(this_boot)
+                })?;
+
+            let group_passed = group.samples.iter().filter(|s| s.passed()).count();
+            rollouts += group.samples.len();
+            passed += group_passed;
+            tasks_passed += usize::from(group_passed > 0);
+            zero_variance_groups += usize::from(train::cc_harness::zero_variance(&group.samples));
+            let rewards: Vec<f32> = group.samples.iter().map(|s| s.reward).collect();
+            let reward_mean = rewards.iter().sum::<f32>() / rewards.len().max(1) as f32;
+            let reward_std = (rewards
+                .iter()
+                .map(|r| (r - reward_mean).powi(2))
+                .sum::<f32>()
+                / rewards.len().max(1) as f32)
+                .sqrt();
+            reward_sum += f64::from(rewards.iter().sum::<f32>());
+            let g_prompt: u64 = group.samples.iter().filter_map(|s| s.cc_input_tokens).sum();
+            let g_completion: u64 = group
+                .samples
+                .iter()
+                .filter_map(|s| s.cc_output_tokens)
+                .sum();
+            prompt_tokens += g_prompt;
+            completion_tokens += g_completion;
+            // Group rollout wall = first cc start → last cc end.
+            let rollout_secs = group
+                .samples
+                .iter()
+                .map(|s| s.t_end_ms)
+                .max()
+                .unwrap_or(0)
+                .saturating_sub(
+                    group
+                        .samples
+                        .iter()
+                        .map(|s| s.t_start_ms)
+                        .min()
+                        .unwrap_or(0),
+                ) as f64
+                / 1000.0;
+            metrics.append(&serde_json::json!({
+                "kind": "group",
+                "round": round,
+                "task_id": group.task_id,
+                "rewards": rewards,
+                "reward_mean": reward_mean,
+                "reward_std": reward_std,
+                "zero_variance": train::cc_harness::zero_variance(&group.samples),
+                "passed": group_passed,
+                "edited": group.samples.iter().filter(|s| s.edited).count(),
+                "prompt_tokens": g_prompt,
+                "completion_tokens": g_completion,
+                "rollout_secs": rollout_secs,
+                "rollout_tok_per_sec": g_completion as f64 / rollout_secs.max(1e-9),
+            }));
+
+            // Quiesce before touching weights / dropping the KV pool: the
+            // group's cc children exited with run_group, so this only drains a
+            // straggler engine request — a live one would hit the dropped pool.
+            train::aopd_profile::time_try("quiesce", train::aopd_profile::WALL, || {
+                quiesce_serve(infer_student.engine())
+            })?;
+            // Release the inference forward scratch + the DEAD rollout KV pool
+            // BEFORE the writeback — the same two headroom levers as before
+            // (scratch otherwise OOMs the logits alloc; the writeback's fresh
+            // autograd forward never reads the engine KV, see release_kv_pool).
+            if let Err(err) = infer_student.release_inference_scratch() {
+                eprintln!("[agent-opd] release inference scratch failed: {err}");
+            }
+            if let Err(err) = infer_student.release_kv_pool() {
+                eprintln!("[agent-opd] release KV pool failed: {err}");
+            }
+            log_opd_vram("agent-opd pre-writeback", &train_backend);
+
+            let mut batch: Vec<train::update_strategy::ScoredTrajectory> = group
+                .records
+                .into_iter()
+                .map(|r| train::update_strategy::ScoredTrajectory {
+                    prompt_ids: r.prompt_ids,
+                    response_ids: r.response_ids,
+                    response_mask: r.response_mask,
+                    reward: r.reward,
+                    rollout_logprobs: None,
+                    group_id: group_idx,
+                    truncated: false,
+                })
+                .collect();
+            if let Some(cap) = args.writeback_cap {
+                batch.truncate(cap);
+            }
+            // Capture π_rollout when the preset needs it. Under every-group
+            // sync θ still equals the rollout policy; under every-round the
+            // ratio gate absorbs the intra-round drift (F.6 measures the floor).
+            if needs.rollout_logprobs {
+                for traj in &mut batch {
+                    let lp = train::opd::capture_rollout_logprobs(
+                        &student,
+                        &traj.prompt_ids,
+                        &traj.response_ids,
+                        &traj.response_mask,
+                        &mut store,
+                    )
+                    .map_err(anyhow::Error::from)?;
+                    traj.rollout_logprobs = Some(lp);
+                }
+            }
+            let update_started = Instant::now();
+            let report = train::aopd_profile::time_try("update", train::aopd_profile::GPU, || {
+                update_preset.update(
+                    &batch,
+                    &student,
+                    all_params.as_slice(),
+                    trainable.as_slice(),
+                    &mut optimizer,
+                    value_critic.as_mut(),
+                    vocab,
+                    args.writeback_window,
+                    &mut store,
+                )
+            })
+            .map_err(anyhow::Error::from)?;
+            losses.push(report.loss);
+            metrics.append(&serde_json::json!({
+                "kind": "update",
+                "round": round,
+                "group": group_idx,
+                "preset": preset_name,
+                "trajectories": report.trained,
+                "tokens_trained": report.tokens,
+                "policy_loss": report.loss,
+                "critic_mse": report.critic_mse,
+                "kl_rollout": report.stats.kl_mean(),
+                "is_ratio_mean": report.stats.ratio_mean(),
+                "is_ratio_max": report.stats.ratio_max,
+                "clip_frac": report.stats.clip_frac(),
+                "adv_mean": report.adv_mean,
+                "adv_std": report.adv_std,
+                "update_secs": update_started.elapsed().as_secs_f64(),
+            }));
+
+            // Sync the trained LoRA into the serve engine (atomic re-merge +
+            // prefix-cache drop in one engine-thread closure); every-round
+            // syncs once, at the last group. Then re-acquire the KV pool for
+            // the next rollout.
+            if sync_every_group || group_idx + 1 == tasks.len() {
+                let sync_started = Instant::now();
+                infer_student
+                    .sync_lora_from_store(&mut store, &student.adapter_name_map(), lora)
+                    .context("sync trained LoRA into rollout engine")?;
+                let secs = sync_started.elapsed().as_secs_f64();
+                train::aopd_profile::record("sync_lora", train::aopd_profile::GPU, secs);
+                sync_lora_secs += secs;
+            }
+            if let Err(err) = infer_student.ensure_kv_pool() {
+                eprintln!("[agent-opd] ensure KV pool (group {group_idx}) failed: {err}");
+            }
+            // P2 follow-up: prefix warm-up rides the merge (needs a registered
+            // shared-prefix prefill).
+        }
+
+        let mean_loss = if losses.is_empty() {
+            0.0
+        } else {
+            losses.iter().sum::<f32>() / losses.len() as f32
         };
         eprintln!(
-            "[arle train agent-opd] round {round}: tasks={} rollouts={} passed={} distinct={} no_token_record={} trained_pairs={} mean_loss={:.4} rescue_rollouts={} rescue_passed={}",
-            report.tasks,
-            report.rollouts,
-            report.passed,
-            report.distinct_passed,
-            report.no_token_record,
-            report.trained_pairs,
-            report.mean_train_loss,
-            report.rescue_rollouts,
-            report.rescue_passed
+            "[arle train agent-opd] round {round}: tasks={} rollouts={rollouts} passed={passed} tasks_passed={tasks_passed} zero_variance_groups={zero_variance_groups} mean_loss={mean_loss:.4}",
+            tasks.len(),
         );
         log_opd_vram(&format!("after round {round} writeback"), &train_backend);
 
-        // Sync the trained LoRA into the rollout engine (always): the next round
-        // needs this round's improved student. Round 0 sampled from base.
-        let sync_started = Instant::now();
-        infer_student
-            .sync_lora_from_store(&mut store, &student.adapter_name_map(), lora)
-            .context("sync trained LoRA into rollout engine")?;
-        let sync_lora_secs = sync_started.elapsed().as_secs_f64();
-        train::aopd_profile::record("sync_lora", train::aopd_profile::GPU, sync_lora_secs);
-        eprintln!("[agent-opd] phase=sync_lora seconds={sync_lora_secs:.3}");
-
-        // HELD-OUT eval of THIS round's student (rollout engine now holds the
-        // round-N LoRA). Eval-only: drives the same rollout+score harness with no
-        // writeback / optimizer step, logs the held-out pass-rate vs the round-0
-        // baseline. Runs every --eval-every rounds (0 = off) and always on the
-        // final round so the operator sees the final pass-rate. The round's
-        // writeback closure freed the KV pool, so re-acquire it for the eval.
+        // HELD-OUT eval of THIS round's student (serve engine now holds the
+        // round-N LoRA under every-group AND every-round sync). Runs every
+        // --eval-every rounds (0 = off) and always on the final round.
         let is_final_round = round + 1 == args.rounds;
         let do_eval = !eval_tasks.is_empty()
             && (is_final_round || (args.eval_every > 0 && (round + 1) % args.eval_every == 0));
         let mut held_out_pass_rate: Option<f32> = None;
         if do_eval {
-            if let Err(err) = infer_student.ensure_kv_pool() {
-                eprintln!("[agent-opd] ensure KV pool before eval (round {round}) failed: {err}");
-            }
             let pass_rate =
                 train::aopd_profile::time_try("eval", train::aopd_profile::GPU, || {
-                    run_agent_opd_eval_pass(
-                        &infer_student,
+                    run_cc_eval(
+                        &harness,
                         &eval_tasks,
-                        &cfg,
-                        args.eval_temperature,
                         &eval_out_dir,
                         &(round + 1).to_string(),
                     )
@@ -3014,13 +3230,11 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
             held_out_pass_rate = Some(pass_rate);
             match baseline_pass_rate {
                 Some(base) => eprintln!(
-                    "[arle train agent-opd] round {round}: held-out pass_rate={pass_rate:.4} (baseline={base:.4}, Δ={:+.4}) train_mean_loss={:.4}",
+                    "[arle train agent-opd] round {round}: held-out pass_rate={pass_rate:.4} (baseline={base:.4}, Δ={:+.4}) train_mean_loss={mean_loss:.4}",
                     pass_rate - base,
-                    report.mean_train_loss
                 ),
                 None => eprintln!(
-                    "[arle train agent-opd] round {round}: held-out pass_rate={pass_rate:.4} train_mean_loss={:.4}",
-                    report.mean_train_loss
+                    "[arle train agent-opd] round {round}: held-out pass_rate={pass_rate:.4} train_mean_loss={mean_loss:.4}",
                 ),
             }
         }
@@ -3061,52 +3275,37 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
         train::aopd_profile::record("save_checkpoint", train::aopd_profile::DISK, save_secs);
         eprintln!("[agent-opd] phase=round_tail_save seconds={save_secs:.3}");
 
-        // Structured per-round metrics: one JSON line appended to metrics.jsonl.
-        // `report` flattens to its own fields (incl. the T2 rollout aggregates);
-        // held_out_* is present only on eval rounds. Machine-readable sink that
-        // replaces the stderr regex-scraping in plot_agent_opd_curve.py.
-        if let Err(err) = (|| -> Result<()> {
-            use std::io::Write;
-            let mut row = serde_json::to_value(&report)?;
-            let obj = row
-                .as_object_mut()
-                .expect("AgentRoundReport serializes to object");
-            obj.insert("round".into(), serde_json::json!(round));
-            obj.insert("sync_lora_secs".into(), serde_json::json!(sync_lora_secs));
-            obj.insert("save_secs".into(), serde_json::json!(save_secs));
-            obj.insert(
-                "held_out_pass_rate".into(),
-                serde_json::json!(held_out_pass_rate),
-            );
-            obj.insert(
-                "baseline_pass_rate".into(),
-                serde_json::json!(baseline_pass_rate),
-            );
-            obj.insert(
-                "delta".into(),
-                serde_json::json!(
-                    held_out_pass_rate
-                        .zip(baseline_pass_rate)
-                        .map(|(p, b)| p - b)
-                ),
-            );
-            if let Some(parent) = metrics_path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            let mut file = fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&metrics_path)?;
-            writeln!(file, "{row}")?;
-            Ok(())
-        })() {
-            eprintln!("[agent-opd] metrics.jsonl write (round {round}) failed: {err}");
-        }
+        // Per-round metrics row; the update/group rows land per group above.
+        let groups = tasks.len().max(1);
+        metrics.append(&serde_json::json!({
+            "kind": "round",
+            "round": round,
+            "tasks": tasks.len(),
+            "rollouts": rollouts,
+            "passed": passed,
+            "pass_at_k": tasks_passed as f32 / groups as f32,
+            "zero_variance_group_frac": zero_variance_groups as f32 / groups as f32,
+            "reward_mean": reward_sum / rollouts.max(1) as f64,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "mean_train_loss": mean_loss,
+            "sync_lora_secs": sync_lora_secs,
+            "save_secs": save_secs,
+            "phase_secs": serde_json::Map::from_iter(
+                train::aopd_profile::phase_secs()
+                    .into_iter()
+                    .map(|(stage, secs)| (stage.to_owned(), secs.into())),
+            ),
+            "held_out_pass_rate": held_out_pass_rate,
+            "baseline_pass_rate": baseline_pass_rate,
+            "delta": held_out_pass_rate.zip(baseline_pass_rate).map(|(p, b)| p - b),
+        }));
 
         // Per-stage ms + %-of-round breakdown (opt-in ARLE_AOPD_PROFILE; no-op off).
         train::aopd_profile::print_round(round);
     }
 
+    serve_thread.shutdown()?;
     eprintln!("[arle train agent-opd] done ({} rounds)", args.rounds);
     Ok(())
 }
