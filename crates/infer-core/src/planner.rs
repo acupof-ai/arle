@@ -118,9 +118,20 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
     /// terminates and later ticks fit. Inputs (lockstep host pool + plan) are
     /// identical on every rank, so the repair stays SPMD-deterministic.
     pub(crate) fn fit_plan_to_kv_pages(&mut self, plan: &mut ForwardPlan) {
-        if !self.kv.is_active() || self.plan_new_pages_needed(plan) <= self.kv.free_pages() {
+        if !self.kv.is_active() {
             return;
         }
+        let shortfall = self
+            .plan_new_pages_needed(plan)
+            .saturating_sub(self.kv.free_pages());
+        if shortfall == 0 {
+            return;
+        }
+        // Radix-cached pages are reclaimable capacity: evict the shortfall
+        // BEFORE shedding, else free=0 with a warm cache trims every prefill
+        // row → idle plan → identical state next tick (permanent stall;
+        // `alloc_with_prefix_reclaim` is only reached by surviving rows).
+        self.evict_prefix_cache_for_pages(shortfall);
         while self.plan_new_pages_needed(plan) > self.kv.free_pages()
             && !plan.prefill_rows.is_empty()
         {
