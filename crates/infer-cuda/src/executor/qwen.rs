@@ -354,17 +354,16 @@ impl QwenCudaExecutor {
         }
         let page_bytes = self.kv.storage_bytes_per_page();
         let keys = entries.iter().map(|&(key, _)| key).collect::<Vec<_>>();
-        let payloads = self
+        let buf = self
             .tier
-            .read_many(&keys)
+            .read_many_concat(&keys)
             .map_err(|err| anyhow::anyhow!("KV tier promote: {err}"))?;
         ensure!(
-            payloads.len() == entries.len()
-                && payloads.iter().all(|payload| payload.len() == page_bytes),
-            "batched KV promote returned invalid page count or size"
+            buf.len() == entries.len() * page_bytes,
+            "batched KV promote returned {} bytes, expected {}",
+            buf.len(),
+            entries.len() * page_bytes
         );
-        let mut buf = Vec::with_capacity(entries.len() * page_bytes);
-        buf.extend(payloads.into_iter().flatten());
         let pages = entries.iter().map(|&(_, page)| page).collect::<Vec<_>>();
         self.kv
             .copy_pages_from_host_on_copy_stream(&self.model.ctx, &pages, &buf)?;

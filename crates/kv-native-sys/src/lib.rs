@@ -92,6 +92,7 @@ pub struct KvMmapStore {
     mapping: memmap2::MmapMut,
     /// Size of one slot in bytes.
     slot_bytes: usize,
+    stride_bytes: usize,
     /// Total number of slots.
     num_slots: u32,
     /// Indices of freed slots, available for re-use.
@@ -104,12 +105,13 @@ impl KvMmapStore {
     /// NOT pre-allocated — the filesystem lazily allocates blocks for
     /// slots that are actually written.
     pub fn create(path: &Path, num_slots: usize, slot_bytes: usize) -> io::Result<Self> {
+        let stride_bytes = aligned_slot_bytes(slot_bytes)?;
         let num_slots = u32::try_from(num_slots).map_err(|_| invalid("num_slots exceeds u32"))?;
         if num_slots == 0 {
             return Err(invalid("num_slots must be > 0"));
         }
         let total_bytes = (num_slots as u64)
-            .checked_mul(slot_bytes as u64)
+            .checked_mul(stride_bytes as u64)
             .and_then(|t| usize::try_from(t).ok())
             .ok_or_else(|| invalid("total bytes overflow"))?;
 
@@ -152,6 +154,7 @@ impl KvMmapStore {
             _file: file,
             mapping,
             slot_bytes,
+            stride_bytes,
             num_slots,
             free_list,
         })
@@ -160,9 +163,10 @@ impl KvMmapStore {
     /// Open an existing page-slot mmap file. Caller must replay the manifest to
     /// mark allocated slots via [`reserve`] — all slots are free on return.
     pub fn open(path: &Path, num_slots: usize, slot_bytes: usize) -> io::Result<Self> {
+        let stride_bytes = aligned_slot_bytes(slot_bytes)?;
         let num_slots = u32::try_from(num_slots).map_err(|_| invalid("num_slots exceeds u32"))?;
         let total_bytes = (num_slots as u64)
-            .checked_mul(slot_bytes as u64)
+            .checked_mul(stride_bytes as u64)
             .and_then(|t| usize::try_from(t).ok())
             .ok_or_else(|| invalid("total bytes overflow"))?;
 
@@ -189,6 +193,7 @@ impl KvMmapStore {
             _file: file,
             mapping,
             slot_bytes,
+            stride_bytes,
             num_slots,
             free_list: (0..num_slots).collect(),
         })
@@ -216,7 +221,7 @@ impl KvMmapStore {
             data.len(),
             self.slot_bytes,
         );
-        let offset = (slot as usize) * self.slot_bytes;
+        let offset = (slot as usize) * self.stride_bytes;
         self.mapping[offset..offset + data.len()].copy_from_slice(data);
         Ok(())
     }
@@ -228,7 +233,7 @@ impl KvMmapStore {
             "read_slot: slot {slot} >= num_slots {}",
             self.num_slots,
         );
-        let offset = (slot as usize) * self.slot_bytes;
+        let offset = (slot as usize) * self.stride_bytes;
         &self.mapping[offset..offset + self.slot_bytes]
     }
 
@@ -247,6 +252,14 @@ impl KvMmapStore {
 
 fn invalid(msg: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, msg)
+}
+
+fn aligned_slot_bytes(bytes: usize) -> io::Result<usize> {
+    bytes
+        .checked_add(4095)
+        .map(|value| value / 4096 * 4096)
+        .filter(|value| *value > 0)
+        .ok_or_else(|| invalid("slot bytes must be > 0 and fit usize"))
 }
 
 #[cfg(test)]
