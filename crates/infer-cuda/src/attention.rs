@@ -7587,8 +7587,8 @@ fn sparse_indexed_index_key_forward(
 /// overlap carry + compressed output back into `state` so the downstream
 /// attention reads the FP32 values.
 ///
-/// Gated to a single prefill (`start_pos == 0`, no prior compressed state, no
-/// precomputed/deferred paths); the decode fast path is unchanged.
+/// Runs on every prefill compression boundary (any `start_pos`, with prior
+/// compressed state); the decode fast path is unchanged.
 #[allow(clippy::too_many_arguments)]
 fn compressor_fp32_probe(
     ctx: &DeviceContext,
@@ -7600,6 +7600,7 @@ fn compressor_fp32_probe(
     ratio: usize,
     width: usize,
     overlap: bool,
+    start_pos: usize,
     token_count: usize,
     compressed_rows: usize,
     apply_rope: bool,
@@ -7661,6 +7662,18 @@ fn compressor_fp32_probe(
     } else {
         (0, config.compress_rope_theta)
     };
+    let start_pos_i32 = i32::try_from(start_pos)
+        .map_err(|_| anyhow::anyhow!("DSv4 FP32 compressor start_pos {start_pos} exceeds i32"))?;
+    let pending_len = start_pos % ratio;
+    let pending_len_i32 = i32::try_from(pending_len).map_err(|_| {
+        anyhow::anyhow!("DSv4 FP32 compressor pending_len {pending_len} exceeds i32")
+    })?;
+    let compressed_base = start_pos / ratio;
+    let compressed_base_i32 = i32::try_from(compressed_base).map_err(|_| {
+        anyhow::anyhow!("DSv4 FP32 compressor compressed_base {compressed_base} exceeds i32")
+    })?;
+    let has_prev_overlap = i32::from(compressed_base > 0);
+    let overlap_page_stride = 0i32;
     {
         let (kv, _kg) = kv_raw.device_ptr(&ctx.stream);
         let (score, _sg) = score_raw.device_ptr(&ctx.stream);
@@ -7688,10 +7701,15 @@ fn compressor_fp32_probe(
                 prsc_bf16 as *mut ffi::Half,
                 compressed as *mut ffi::Half,
                 token_count as i32,
+                start_pos_i32,
+                pending_len_i32,
+                compressed_base_i32,
                 head_dim as i32,
                 ratio as i32,
                 width as i32,
                 i32::from(overlap),
+                has_prev_overlap,
+                overlap_page_stride,
                 config.rms_norm_eps,
                 rope_dim as i32,
                 rope_base,
@@ -7780,14 +7798,7 @@ fn compressor_forward(
         "DSv4 compressor compressed rows {compressed_rows} exceed state capacity {compressed_capacity}"
     );
 
-    if !dsv4_verify_frozen()
-        && start_pos == 0
-        && token_count > 0
-        && token_count.is_multiple_of(ratio)
-        && state.compressed.seq_len == 0
-        && precomputed.is_none()
-        && defer_update.is_none()
-    {
+    if !dsv4_verify_frozen() && token_count > 0 && precomputed.is_none() && defer_update.is_none() {
         compressor_fp32_probe(
             ctx,
             config,
@@ -7798,6 +7809,7 @@ fn compressor_forward(
             ratio,
             width,
             overlap,
+            start_pos,
             token_count,
             compressed_rows,
             apply_rope,
