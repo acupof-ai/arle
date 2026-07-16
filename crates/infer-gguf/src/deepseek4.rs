@@ -182,6 +182,12 @@ pub fn dsv4_config_from_gguf(g: &GgufFile) -> Result<DeepSeekV4Config> {
         per_layer_dense_mlp: None,
         per_layer_full_indexer: None,
         tensor_dialect: deepseek_spec::TensorDialect::Dsv4,
+        // GGUF DSv4 path is native MTP / non-spec: DSpark disabled (0 = off).
+        dspark_block_size: 0,
+        dspark_target_layer_ids: Vec::new(),
+        dspark_markov_rank: 0,
+        dspark_noise_token_id: 0,
+        dspark_num_stages: 0,
     };
     config
         .validate()
