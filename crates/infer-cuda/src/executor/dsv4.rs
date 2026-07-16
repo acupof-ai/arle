@@ -45,7 +45,7 @@ struct PendingPrefixCapture {
     slot: usize,
     slot_epoch: u64,
     slot_pages: Vec<u32>,
-    fence: Option<CudaPipelineFence>,
+    fence: CudaPipelineFence,
     pages: Vec<PendingPrefixPage>,
 }
 
@@ -776,58 +776,43 @@ impl Dsv4CudaExecutor {
             return Ok(());
         }
         let slot_epoch = self.kv_adapter.slot_epoch(slot).unwrap_or(u64::MAX);
-        match self
+        // A fence-record failure DROPS the capture (its pages are host-only
+        // clones, released by plain drop — same as poll's cancelled path): a
+        // fence-less entry at the front would never poll Ready, pinning
+        // `prefix_capture_queue_full` true forever.
+        let fence = self
             .model
             .ctx
-            .record_pipeline_fence(CudaPipelineStreamKind::Compute)
-        {
-            Ok(fence) => {
-                self.pending_prefix_captures
-                    .push_back(PendingPrefixCapture {
-                        slot,
-                        slot_epoch,
-                        slot_pages: slot_pages.to_vec(),
-                        fence: Some(fence),
-                        pages,
-                    });
-                Ok(())
-            }
-            Err(err) => {
-                self.pending_prefix_captures
-                    .push_back(PendingPrefixCapture {
-                        slot,
-                        slot_epoch,
-                        slot_pages: slot_pages.to_vec(),
-                        fence: None,
-                        pages,
-                    });
-                Err(err)
-            }
-        }
+            .record_pipeline_fence(CudaPipelineStreamKind::Compute)?;
+        self.pending_prefix_captures
+            .push_back(PendingPrefixCapture {
+                slot,
+                slot_epoch,
+                slot_pages: slot_pages.to_vec(),
+                fence,
+                pages,
+            });
+        Ok(())
     }
 
     fn prefix_capture_queue_full(&self) -> bool {
         self.pending_prefix_captures.len() >= MAX_PENDING_PREFIX_CAPTURES
-            || self
-                .pending_prefix_captures
-                .front()
-                .is_some_and(|capture| capture.fence.is_none())
     }
 
     pub(crate) fn poll_prefix_captures(&mut self) {
         loop {
             let status = match self.pending_prefix_captures.front() {
-                Some(capture) => match &capture.fence {
-                    Some(fence) => fence.query(),
-                    None => return,
-                },
+                Some(capture) => capture.fence.query(),
                 None => return,
             };
             match status {
                 Ok(CudaPipelineFenceStatus::NotReady) => return,
                 Err(err) => {
-                    warn!("DSv4 prefix capture fence failed: {err:#}");
-                    return;
+                    // Sticky query error: drop the capture so the queue drains
+                    // instead of re-warning every tick behind a stuck front.
+                    warn!("DSv4 prefix capture fence failed; dropping capture: {err:#}");
+                    self.pending_prefix_captures.pop_front();
+                    continue;
                 }
                 Ok(CudaPipelineFenceStatus::Ready) => {}
             }
