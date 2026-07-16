@@ -1,0 +1,21 @@
+docs/index.md
+  s_81c5a850d93f85::t_c0d44f31f90766 32
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "3f580e42d0bf979f886589a33a74d93ccf07cb66",
+  "prompts": {},
+  "sessions": {
+    "s_81c5a850d93f85": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c1899929-05e0-4ef7-9ac7-0acb8fe9ec71",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
