@@ -19,8 +19,7 @@ use infer_seam::{KvBatchDescriptor, KvBatchRowKind};
 use std::sync::atomic::{AtomicI8, Ordering};
 
 use crate::dsv4::{
-    Dsv4Attention, Dsv4Compressor, Dsv4CompressorFp32Probe, Dsv4ForwardKeepalive, Dsv4Indexer,
-    Dsv4MlaKvArena,
+    Dsv4Attention, Dsv4Compressor, Dsv4ForwardKeepalive, Dsv4Indexer, Dsv4MlaKvArena,
 };
 use crate::loader::PageMeta;
 use crate::moe_config::ExpertSplit;
@@ -7582,11 +7581,11 @@ fn sparse_indexed_index_key_forward(
     Ok(())
 }
 
-/// FP32 main-value discriminator (diagnostic). Re-runs the compressor forward in
+/// FP32 main-value compressor. Re-runs the compressor forward in
 /// FP32 — BF16 input projections via cuBLASLt FP32-accumulate GEMM, FP32 APE, FP32
-/// state carry — to isolate whether the BF16/FP8 fast path is the source of a
-/// value mismatch. Writes the BF16 overlap carry + compressed output back into
-/// `state` so the downstream attention reads the FP32-discriminated values.
+/// state carry — to avoid BF16/FP8 value mismatches (#146, #150). Writes the BF16
+/// overlap carry + compressed output back into `state` so the downstream
+/// attention reads the FP32 values.
 ///
 /// Gated to a single prefill (`start_pos == 0`, no prior compressed state, no
 /// precomputed/deferred paths); the decode fast path is unchanged.
@@ -7595,7 +7594,6 @@ fn compressor_fp32_probe(
     ctx: &DeviceContext,
     config: &DeepSeekV4Config,
     compressor: &Dsv4Compressor,
-    probe: &Dsv4CompressorFp32Probe,
     hidden: &HiddenStates,
     state: &mut Dsv4CompressorState,
     head_dim: usize,
@@ -7608,6 +7606,7 @@ fn compressor_fp32_probe(
     rope_original_seq_len: i32,
 ) -> Result<()> {
     let _nvtx = crate::nvtx::range("dsv4/compressor_fp32_probe");
+    let probe = &compressor.fp32_probe;
     ensure!(
         probe.wkv.cols == hidden.hidden_dim && probe.wgate.cols == hidden.hidden_dim,
         "DSv4 compressor FP32 projection K mismatch"
@@ -7781,8 +7780,7 @@ fn compressor_forward(
         "DSv4 compressor compressed rows {compressed_rows} exceed state capacity {compressed_capacity}"
     );
 
-    if let Some(probe) = compressor.fp32_probe.as_ref()
-        && !dsv4_verify_frozen()
+    if !dsv4_verify_frozen()
         && start_pos == 0
         && token_count > 0
         && token_count.is_multiple_of(ratio)
@@ -7794,7 +7792,6 @@ fn compressor_forward(
             ctx,
             config,
             compressor,
-            probe,
             hidden,
             state,
             head_dim,
