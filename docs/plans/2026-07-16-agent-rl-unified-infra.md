@@ -241,16 +241,21 @@ lossless.
 ### P8 — gated roadmap (RE-COSTED 2026-07-16: substrate exists in-tree, these
 are wire-and-license, not build)
 
-- **Spec decode in rollout** — substrate: the Qwen3.6 NextN-MTP draft lane is
-  fully built (`Qwen35SpecState` draft-head K/V + spec snapshot/restore/rewind,
-  qwen35.rs:843-1088; `--spec-type dspark`, `--speculative-tokens`; engine
-  `spec_decode_stats`). Gap: **RL licensing only** — the verify rows are argmax
-  (greedy acceptance), which does NOT preserve the sampling distribution at
-  temp=1; RL rollouts need the rejection-sampling acceptance rule (survey:
-  greedy/typical variants are lossy, true rejection sampling is exact). Work =
-  acceptance-rule audit + (if greedy) the rejection variant + gate: needle ×3,
-  acceptance rate, identical reward curve on one round. Promoted: 1.3-2× on the
-  dominant cost for audit-sized effort.
+- **Spec decode in rollout** — AUDITED 2026-07-16, two license paths:
+  - **(a) zero-code, license-ready**: the DSpark lane already implements EXACT
+    rejection sampling (`u < p/q` + residual `max(0,p−q)` draw,
+    sampling.cu:844-857) and already routes SAMPLED decoding through spec
+    (`dspark_accept_commit_sampled`, executor/qwen35.rs:1857-1871). At temp=1
+    top_p=1 acceptance is exact vs the policy; with top_p<1 exact vs the
+    nucleus-filtered policy (the standard RL sampler). Needs only a Qwen3.6
+    drafter checkpoint (`--spec-type dspark --mtp-draft-model <dir>`).
+  - **(b) ~200-250 LOC port** if the checkpoint-native NextN-MTP head must be
+    used instead: that lane is greedy-only AND sampling-unreachable today
+    (temp≠0 falls back to no-spec, executor/qwen35.rs:1486-1495; argmax verify
+    qwen35.rs:3932); port the shipped DSpark rejection twin onto it — zero new
+    CUDA, buffer-rollback coverage carries over unchanged.
+  Gate either way: needle ×3, acceptance rate, identical reward curve on one
+  round. 1.3-2× on the dominant cost.
 - **Experience replay** — substrate: `--replay-records` + `--replay-epochs`
   already exist. Gap: driver-side retention policy (age ≤10 steps,
   fresh-anchored, |A|-prioritized) + IS-corrected reuse (the preset's ratio
