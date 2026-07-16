@@ -895,11 +895,16 @@ impl Dsv4LayerAttentionState {
             return;
         }
         let compressed_rows = total_len / ratio;
+        // Graph-replay ticks advance the bf16 carry with no compressor_forward
+        // host call — mark the FP32 probe carry stale here (host bookkeeping
+        // that runs every step); a redundant set on eager ticks is free.
         if let Some(compressor) = &mut self.compressor {
             compressor.compressed.seq_len = compressed_rows;
+            compressor.fp32_carry_stale = true;
         }
         if let Some(indexer) = &mut self.indexer {
             indexer.compressed.seq_len = compressed_rows;
+            indexer.fp32_carry_stale = true;
         }
     }
 

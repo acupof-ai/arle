@@ -372,6 +372,8 @@ unsafe extern "C" {
         prev_overlap_score: *mut f32,
         prev_overlap_kv_bf16: *mut super::Half,
         prev_overlap_score_bf16: *mut super::Half,
+        pending_kv_bf16: *mut super::Half,
+        pending_score_bf16: *mut super::Half,
         compressed: *mut super::Half,
         num_tokens: i32,
         start_pos: i32,
@@ -390,6 +392,24 @@ unsafe extern "C" {
         factor: f32,
         beta_fast: f32,
         beta_slow: f32,
+        stream: super::CUstream,
+    ) -> super::CUresult;
+
+    /// FP32-carry reseed: bf16 → f32 upcast of a compressor state's four carry
+    /// buffers (pending kv/score = `pending_elems` each, prev_overlap kv/score
+    /// = `prev_elems` each). Run before an FP32 probe whose bf16 carry advanced
+    /// since the last probe (decode lane / prefix restore / reset).
+    pub fn dsv4_compressor_fp32_carry_reseed_cuda(
+        pending_kv_bf16: *const super::Half,
+        pending_score_bf16: *const super::Half,
+        prev_kv_bf16: *const super::Half,
+        prev_score_bf16: *const super::Half,
+        pending_kv: *mut f32,
+        pending_score: *mut f32,
+        prev_kv: *mut f32,
+        prev_score: *mut f32,
+        pending_elems: i32,
+        prev_elems: i32,
         stream: super::CUstream,
     ) -> super::CUresult;
 
