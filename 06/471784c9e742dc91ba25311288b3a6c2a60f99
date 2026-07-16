@@ -1,0 +1,23 @@
+crates/kv-native-sys/src/direct_store.rs
+  s_0837ed412322fe::t_8ec87b1a1849ab 150-153
+crates/kv-native-sys/src/lib.rs
+  s_0837ed412322fe::t_4393c24e3a0410 215-218
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "06471784c9e742dc91ba25311288b3a6c2a60f99",
+  "prompts": {},
+  "sessions": {
+    "s_0837ed412322fe": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f6a12-61c8-7bc3-a029-b359f1f4a3ed",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
