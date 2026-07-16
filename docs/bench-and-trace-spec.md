@@ -59,7 +59,27 @@ cannot license cache-sensitive changes.
 
 The JSON artifact is the source of truth. CSV is a view. Preserve both.
 
-### 3.1 Matched A/B
+### 3.0 Rolling baseline — the default iteration path
+
+[`docs/baselines.md`](baselines.md) holds the champion row per config
+fingerprint (model, TP/EP, GPU set, serve flags, slot line, dataset, build
+sha). The default iteration is ONE arm: bench the candidate, compare against
+the champion row. No second arm, no revert-rebuild, no env-flip arms —
+every accepted binary is archived on the pod, so any later two-arm run
+reuses archives.
+
+- Candidate Δ clears the fingerprint's drift band (measured ±3%,
+  2026-07-16; use >2× band): accept on the rolling comparison, update the
+  champion row, archive the binary.
+- Δ within the band: **do not kill — every stable positive gain is kept.**
+  Escalate to §3.1 matched A/B against the archived champion binary
+  (≥3 trials per arm, median + range) to resolve sign.
+- Fingerprint changed (flags, GPU set, slots, dataset, driver): re-anchor
+  the champion first; the stored row is invalid for comparison.
+- Every ~5 accepted updates and before any default flip: one anchor A/B
+  vs the oldest archived binary to bound accumulated drift.
+
+### 3.1 Matched A/B — the disambiguation tool
 
 Keep fixed:
 

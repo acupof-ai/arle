@@ -362,9 +362,14 @@ mechanical changes.
     feature-flag default flips, hot-path dep bumps.
   - **Exempt:** docs / `AGENTS.md` / `CLAUDE.md` / memory / dev-only tooling /
     gitignored output. State so in the commit body.
-  - **Minimum:** one `python3 scripts/bench_throughput.py ...` run vs latest
-    baseline for the affected backend+model, with Δ% row. Use the full
-    `1,4,8,16` grid for optimization / architectural changes.
+  - **Minimum:** one `python3 scripts/bench_throughput.py ...` run vs the
+    rolling champion row in [`docs/baselines.md`](docs/baselines.md), with Δ%
+    row (spec §3.0 — single-arm by default; archived champion binaries replace
+    env-flip/revert-rebuild arms). Use the full `1,4,8,16` grid for
+    optimization / architectural changes.
+  - **Any stable positive gain is kept.** A Δ inside the fingerprint's drift
+    band is never killed on ambiguity — escalate to a matched A/B against the
+    archived champion binary (spec §3.1) to resolve sign, then keep or revert.
   - **Can't run locally** (e.g. CUDA on a Mac): commit body cites the remote
     ticket; stub the `wins/` entry with `pending-remote`. No silent skips.
   - **Auto-iterate** per spec §6; cross-link wins back to the commissioning
