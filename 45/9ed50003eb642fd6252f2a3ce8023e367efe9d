@@ -1,0 +1,23 @@
+crates/infer-core/src/planner.rs
+  s_802ef0cebc270e::t_db88f6a58e6d9c 111-124,126,128-141,143-153,155,162-168,171
+crates/infer-core/src/lib.rs
+  s_802ef0cebc270e::t_7568b20d0f26ae 663,946-952,2311-2316,4249-4412
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "459ed50003eb642fd6252f2a3ce8023e367efe9d",
+  "prompts": {},
+  "sessions": {
+    "s_802ef0cebc270e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ad98439930ac39ef7",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
