@@ -1,0 +1,25 @@
+crates/infer-cuda/src/executor/qwen.rs
+  s_6773c539a98594::t_856e5c16629af4 357,359,362-365
+crates/kv-native-sys/src/kv_tier.rs
+  s_6773c539a98594::t_a110334e93b3ca 250-256,950,954-955,1102-1105,1109,1119-1121,1139,1142-1146,1148,1272-1286,1726,1733,1736-1737
+crates/kv-native-sys/src/lib.rs
+  s_6773c539a98594::t_fe5830da1d2031 95,108,114,157,166,169,196,224,236,257-264
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "333c2d9f5927e6532480a3225a0f02f2258e54c1",
+  "prompts": {},
+  "sessions": {
+    "s_6773c539a98594": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f69e3-547c-7460-94f3-f1366a2a8a05",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
