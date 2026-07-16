@@ -4321,6 +4321,47 @@ mod tests {
         Ok(())
     }
 
+    /// P4 pod smoke: with the pool nearly exhausted by long sessions, a queued
+    /// chunked-prefill CONTINUATION chunk (start_pos > 0) reached the executor
+    /// needing 128 pages with 6 free — engine-fatal at submit. Pins the host
+    /// contract: `fit_plan_to_kv_pages` defers the chunk (it retries next tick)
+    /// instead of over-committing; the un-repaired plan provably over-commits.
+    #[test]
+    fn plan_repair_defers_prefill_continuation_when_pool_nearly_exhausted() -> Result<()> {
+        let mut engine = Engine::with_config(
+            MockExecutor::ready(),
+            MockKvPool::with_capacity(2, 2, 4),
+            test_config(2),
+        );
+        engine.kv.alloc(0, 6)?; // long-lived occupant: 3 of 4 pages
+        engine.kv.alloc(1, 2)?; // mid-prefill occupant: first chunk done
+        assert_eq!(engine.kv_free_pages(), 0);
+
+        let mut plan = ForwardPlan::idle();
+        plan.prefill_rows.push(infer_plan::PrefillRow {
+            slot: 1,
+            tokens: vec![7; 4], // continuation chunk: 2 new pages, none available
+            start_pos: 2,
+            total_tokens: 6,
+            params: SamplingParams::default(),
+        });
+        plan.mode = infer_plan::ForwardMode::Prefill;
+
+        let capacity = engine.kv_free_pages() + engine.kv.resident_evictable_pages();
+        assert!(
+            engine.plan_new_pages_needed(&plan) > capacity,
+            "un-repaired plan over-commits the pool"
+        );
+
+        engine.fit_plan_to_kv_pages(&mut plan)?;
+        assert!(
+            plan.prefill_rows.is_empty(),
+            "continuation chunk must be deferred, not over-committed"
+        );
+        assert!(plan.is_idle());
+        Ok(())
+    }
+
     /// #164 residual, hole 1: the LRU HEAD is a live slot's mid-flight
     /// published page (retained once, still attached). Eviction must skip it
     /// — severing it frees nothing — and continue into the deeper LRU to a

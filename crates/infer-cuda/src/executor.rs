@@ -644,14 +644,21 @@ impl RealCudaExecutor {
         }
     }
 
-    /// Engine freed `slot`'s host pages: DSv4 returns the slot's demand-paged
-    /// FlashMLA band pages to the layer pools (#154 Phase 3b — waiting for
-    /// the next occupant would starve the free lists); no-op elsewhere.
+    /// Engine freed `slot`'s host pages: the backend must return the slot's
+    /// device pages in the same tick, or the host admission pool over-reports
+    /// free capacity and the planner licenses chunks the device pool can't
+    /// hold (engine-fatal at submit). DSv4 returns demand-paged FlashMLA band
+    /// pages (#154 Phase 3b); Qwen3.5/3.6 frees its self-allocated
+    /// `full_attn_kv` slot; dense Qwen mirrors the host pool (nothing to free).
     pub(crate) fn release_kv_slot(&mut self, slot: usize) {
-        if let Self::Dsv4(d) = self
-            && let Err(err) = d.kv_adapter.flashmla_free_slot(slot)
-        {
-            warn!("DSv4 release_kv_slot({slot}) failed: {err:#}");
+        match self {
+            Self::Qwen35(q) => q.release_kv_slot(slot),
+            Self::Dsv4(d) => {
+                if let Err(err) = d.kv_adapter.flashmla_free_slot(slot) {
+                    warn!("DSv4 release_kv_slot({slot}) failed: {err:#}");
+                }
+            }
+            Self::Qwen(_) => {}
         }
     }
 
