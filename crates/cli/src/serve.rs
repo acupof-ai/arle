@@ -712,7 +712,7 @@ mod tests {
         let config = resolve_config(&args, &serve).expect("resolve");
         assert_eq!(
             config.options.engine_config.num_slots, defaults.num_slots,
-            "low-impact must not shrink executor hot workspace"
+            "low-impact caps via max_running_requests, not num_slots"
         );
         assert_eq!(config.options.engine_config.max_running_requests, Some(1));
         assert_eq!(
@@ -970,8 +970,11 @@ mod tests {
         assert!(config.options.engine_config.allow_swap);
     }
 
+    // The CLI leaves `num_slots` at its auto-ceiling default and carries the
+    // cap in `max_running_requests`; infer-api's `hot_workspace_slots` then
+    // makes a set cap the executor slot budget at load.
     #[test]
-    fn max_running_requests_is_scheduler_only() {
+    fn max_running_requests_is_the_concurrency_knob() {
         if skip_if_no_backend() {
             return;
         }
