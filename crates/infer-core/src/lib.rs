@@ -839,6 +839,12 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         }
 
         if prompt_tokens.is_empty() || prompt_tokens.len() > self.config.max_prompt_tokens {
+            // A silent Abort reads as an empty completion to the client — say why.
+            log::warn!(
+                "aborting request: prompt {} tokens outside (0, max_prompt_tokens={}]",
+                prompt_tokens.len(),
+                self.config.max_prompt_tokens
+            );
             return NormalizedRequest::Completed(
                 RequestState::new(handle, prompt_tokens, options.priority, 0, options.sampling)
                     .complete_immediately(FinishReason::Abort),

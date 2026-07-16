@@ -2842,8 +2842,12 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
             num_slots: width,
             page_size: 16,
             total_pages: cc_total_pages,
-            max_prompt_tokens: CC_SESSION_TOKENS,
-            max_total_tokens: CC_SESSION_TOKENS,
+            // Request caps are POOL-derived, not per-session: capping at
+            // CC_SESSION_TOKENS silently aborted cc mid-conversation (P4
+            // tripwire — sidecars showed prompt>22K → gen 0). The pool bounds
+            // memory and the engine preempts under KV pressure (#162).
+            max_prompt_tokens: cc_total_pages * 16 - 256,
+            max_total_tokens: cc_total_pages * 16,
             chunked_prefill_size: CC_SESSION_TOKENS,
             // The autograd student co-resides with this engine, so the engine
             // must NOT greedily reserve 0.9 of free VRAM (the SGLang default) —
@@ -3073,6 +3077,9 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
 
     // One deep tokenizer clone for the post-merge warm-up threads.
     let warmup_tokenizer = Arc::new(harness.tokenizer.clone());
+    // Last warm-up's handle: joined before serve teardown so it never races
+    // engine shutdown (earlier ones finish inside the next group's rollout).
+    let mut warmup_join: Option<std::thread::JoinHandle<()>> = None;
 
     // PEFT adapter config for `--save-lora-adapters` (mainstream HF PEFT dir:
     // adapter_config.json + adapter_model.safetensors). Built once; borrowed by
@@ -3370,7 +3377,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
                 let engine = Arc::clone(infer_student.engine());
                 let tokenizer = Arc::clone(&warmup_tokenizer);
                 let dump_dir = harness.dump_dir.clone();
-                std::thread::spawn(move || {
+                warmup_join = Some(std::thread::spawn(move || {
                     let t0 = Instant::now();
                     let outcome = train::cc_convert::newest_dump_prompt_ids(&dump_dir, &tokenizer)
                         .and_then(|prompt| match prompt {
@@ -3393,7 +3400,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
                             eprintln!("[agent-opd] prefix warm-up failed (continuing): {err:#}");
                         }
                     }
-                });
+                }));
             }
         }
 
@@ -3506,6 +3513,9 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
         train::aopd_profile::print_round(round);
     }
 
+    if let Some(join) = warmup_join.take() {
+        let _ = join.join();
+    }
     serve_thread.shutdown()?;
     eprintln!("[arle train agent-opd] done ({} rounds)", args.rounds);
     Ok(())
