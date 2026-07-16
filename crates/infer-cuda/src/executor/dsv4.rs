@@ -1,5 +1,86 @@
 use super::*;
 
+const MAX_PENDING_PREFIX_CAPTURES: usize = 2;
+
+struct PendingPrefixPage {
+    source_page: u32,
+    target_page: u32,
+    confirmed: bool,
+    cancelled: bool,
+    entry: crate::attention::Dsv4PrefixPageEntry,
+    frontier_tail: Option<Vec<u32>>,
+}
+
+impl PendingPrefixPage {
+    fn confirm(&mut self, pages: &[u32]) {
+        self.confirmed |= pages.contains(&self.target_page);
+    }
+
+    fn cancel_provisional(&mut self, pages: &[u32]) {
+        self.cancelled |= !self.confirmed && pages.contains(&self.source_page);
+    }
+
+    fn repair(&mut self, canonical: u32, own: u32, canonical_exists: bool) {
+        if self.source_page != own || self.cancelled {
+            return;
+        }
+        if canonical_exists {
+            self.cancelled = true;
+        } else {
+            self.target_page = canonical;
+            self.confirmed = true;
+        }
+    }
+}
+
+fn capture_epoch_matches(captured: u64, current: Option<u64>) -> bool {
+    current == Some(captured)
+}
+
+struct PendingPrefixCapture {
+    slot: usize,
+    slot_epoch: u64,
+    slot_pages: Vec<u32>,
+    fence: Option<CudaPipelineFence>,
+    pages: Vec<PendingPrefixPage>,
+}
+
+#[cfg(test)]
+mod pending_prefix_tests {
+    use super::*;
+
+    fn page(source_page: u32) -> PendingPrefixPage {
+        PendingPrefixPage {
+            source_page,
+            target_page: source_page,
+            confirmed: false,
+            cancelled: false,
+            entry: crate::attention::Dsv4PrefixPageEntry {
+                page_index: 0,
+                boundary: false,
+                layers: Vec::new(),
+            },
+            frontier_tail: None,
+        }
+    }
+
+    #[test]
+    fn pending_capture_rekeys_or_cancels_before_page_recycle() {
+        let mut rekeyed = page(7);
+        rekeyed.repair(9, 7, false);
+        assert_eq!(rekeyed.target_page, 9);
+        assert!(rekeyed.confirmed);
+        rekeyed.cancel_provisional(&[7]);
+        assert!(!rekeyed.cancelled);
+
+        let mut recycled = page(11);
+        recycled.cancel_provisional(&[11]);
+        assert!(recycled.cancelled);
+        assert!(capture_epoch_matches(3, Some(3)));
+        assert!(!capture_epoch_matches(3, Some(4)));
+    }
+}
+
 /// DSv4-Flash executor: drives [`crate::dsv4::Dsv4Model::forward_tokens`].
 /// Prefill/mixed still run one scheduled row. Pure decode uses B=1 as the
 /// single-row reference and B>1 as the canonical layer-major batched lane for
@@ -38,6 +119,7 @@ pub(crate) struct Dsv4CudaExecutor {
     /// the preemption store (Phase 2b): published pages are already captured
     /// here, so preempt = free pages + requeue, resume = prefix-attach.
     prefix_state: crate::attention::Dsv4PrefixStatePool,
+    pending_prefix_captures: VecDeque<PendingPrefixCapture>,
     /// DSpark block-drafter state (`--spec-type dspark`). `Some` = the draft is
     /// loaded and greedy B=1 decode routes through the DSpark
     /// draft→verify→accept loop instead of MTP; `None` = MTP or no spec. The
@@ -589,6 +671,7 @@ impl Dsv4CudaExecutor {
                 default_t1_budget_bytes(DEFAULT_DRAM_FRACTION),
                 prefix_entry_bytes,
             ),
+            pending_prefix_captures: VecDeque::new(),
             dspark,
         })
     }
@@ -676,6 +759,108 @@ impl Dsv4CudaExecutor {
     /// Publish every host page this forward completed for `slot` into the
     /// content-keyed prefix-state pool (#154 Phase 2 write hook). Best-effort:
     /// a publish failure only forfeits a future reuse, never the forward.
+    fn enqueue_prefix_capture(
+        &mut self,
+        slot: usize,
+        slot_pages: &[u32],
+        pages: Vec<PendingPrefixPage>,
+    ) -> Result<()> {
+        if pages.is_empty() {
+            return Ok(());
+        }
+        let slot_epoch = self.kv_adapter.slot_epoch(slot).unwrap_or(u64::MAX);
+        match self
+            .model
+            .ctx
+            .record_pipeline_fence(CudaPipelineStreamKind::Compute)
+        {
+            Ok(fence) => {
+                self.pending_prefix_captures
+                    .push_back(PendingPrefixCapture {
+                        slot,
+                        slot_epoch,
+                        slot_pages: slot_pages.to_vec(),
+                        fence: Some(fence),
+                        pages,
+                    });
+                Ok(())
+            }
+            Err(err) => {
+                self.pending_prefix_captures
+                    .push_back(PendingPrefixCapture {
+                        slot,
+                        slot_epoch,
+                        slot_pages: slot_pages.to_vec(),
+                        fence: None,
+                        pages,
+                    });
+                Err(err)
+            }
+        }
+    }
+
+    fn prefix_capture_queue_full(&self) -> bool {
+        self.pending_prefix_captures.len() >= MAX_PENDING_PREFIX_CAPTURES
+            || self
+                .pending_prefix_captures
+                .front()
+                .is_some_and(|capture| capture.fence.is_none())
+    }
+
+    pub(crate) fn poll_prefix_captures(&mut self) {
+        loop {
+            let status = match self.pending_prefix_captures.front() {
+                Some(capture) => match &capture.fence {
+                    Some(fence) => fence.query(),
+                    None => return,
+                },
+                None => return,
+            };
+            match status {
+                Ok(CudaPipelineFenceStatus::NotReady) => return,
+                Err(err) => {
+                    warn!("DSv4 prefix capture fence failed: {err:#}");
+                    return;
+                }
+                Ok(CudaPipelineFenceStatus::Ready) => {}
+            }
+            let capture = self
+                .pending_prefix_captures
+                .pop_front()
+                .expect("front observed");
+            let epoch_matches =
+                capture_epoch_matches(capture.slot_epoch, self.kv_adapter.slot_epoch(capture.slot));
+            let protected_pages = if epoch_matches {
+                capture.slot_pages
+            } else {
+                capture
+                    .pages
+                    .iter()
+                    .filter(|page| page.confirmed && !page.cancelled)
+                    .map(|page| page.target_page)
+                    .collect()
+            };
+            for page in capture.pages {
+                if page.cancelled || (!page.confirmed && !epoch_matches) {
+                    continue;
+                }
+                if !self
+                    .prefix_state
+                    .publish(page.target_page, &page.entry, &protected_pages)
+                {
+                    continue;
+                }
+                if page.confirmed {
+                    self.prefix_state.confirm_pages(&[page.target_page]);
+                }
+                if let Some(tokens) = page.frontier_tail {
+                    self.prefix_state
+                        .set_frontier_tail(page.target_page, tokens);
+                }
+            }
+        }
+    }
+
     fn publish_completed_prefix_pages(
         &mut self,
         slot: usize,
@@ -686,13 +871,18 @@ impl Dsv4CudaExecutor {
         if self.prefix_state.is_inactive() {
             return;
         }
+        self.poll_prefix_captures();
+        if self.prefix_capture_queue_full() {
+            return;
+        }
         let page_tokens = self.model.kv_arena.page_block_size;
         if page_tokens == 0 || end_pos <= start_pos {
             return;
         }
         let align = self.model.config.sliding_window.max(1);
         // Phase 1: enqueue every page's D2H clones (stream-ordered, no sync).
-        let mut captured: Vec<(u32, usize, crate::attention::Dsv4PrefixPageEntry)> = Vec::new();
+        let mut captured = Vec::new();
+        let mut capture_failed = false;
         for page_index in (start_pos / page_tokens)..(end_pos / page_tokens) {
             let page_end = (page_index + 1) * page_tokens;
             let Some(&page_id) = slot_pages.get(page_index) else {
@@ -700,7 +890,8 @@ impl Dsv4CudaExecutor {
                     "DSv4 prefix publish: slot {slot} page {page_index} outside host table ({} pages)",
                     slot_pages.len()
                 );
-                return;
+                capture_failed = true;
+                break;
             };
             // Boundary sections exist only when the forward ended exactly here;
             // restore commits only at `align` multiples, so skip odd page ends.
@@ -720,35 +911,37 @@ impl Dsv4CudaExecutor {
                 page_index,
                 boundary,
             ) {
-                Ok(entry) => captured.push((page_id, page_index, entry)),
+                Ok(entry) => captured.push(PendingPrefixPage {
+                    source_page: page_id,
+                    target_page: page_id,
+                    confirmed: false,
+                    cancelled: false,
+                    entry,
+                    frontier_tail: None,
+                }),
                 Err(err) => {
-                    warn!("DSv4 prefix publish failed for slot {slot} page {page_index}: {err:#}")
+                    warn!("DSv4 prefix publish failed for slot {slot} page {page_index}: {err:#}");
+                    capture_failed = true;
+                    break;
                 }
             }
         }
         if captured.is_empty() {
             return;
         }
-        // Phase 2: ONE sync for the whole tick's clones, then publish.
-        if let Err(err) = self.model.ctx.sync() {
-            warn!("DSv4 prefix publish sync failed for slot {slot}: {err:#}");
-            return;
+        if capture_failed {
+            captured.iter_mut().for_each(|page| page.cancelled = true);
         }
-        for (page_id, page_index, entry) in captured {
-            if !self.prefix_state.publish(page_id, &entry, slot_pages) {
-                warn!(
-                    "DSv4 prefix publish: pool refused host page {page_id} \
-                     (slot {slot} idx {page_index})"
-                );
-            }
+        if let Err(err) = self.enqueue_prefix_capture(slot, slot_pages, captured) {
+            warn!("DSv4 prefix publish fence failed for slot {slot}: {err:#}");
         }
     }
 
     /// Finish write-through (`--dsv4-decode-reuse`): publish content-keyed pool
     /// entries for the finished slot's whole sealed region + the frontier tail,
     /// so a later turn restores to the EXACT finish position instead of flooring
-    /// at a page boundary. Runs at the finish sync point (graph-safe — the
-    /// decode-lane per-tick publish is a no-op under this flag). Publishes
+    /// at a page boundary. Publication waits on the capture's compute-stream
+    /// fence; decode-lane per-tick publish is a no-op under this flag. Publishes
     /// PROVISIONAL onto the slot's own page ids exactly like the prefill publish;
     /// the finish's `save_prefix_sidecar` confirm/repair (running right after)
     /// reconciles them to the radix's canonical ids. Best-effort: a failure only
@@ -760,6 +953,10 @@ impl Dsv4CudaExecutor {
         slot_pages: &[u32],
     ) -> Result<()> {
         if !crate::runtime_flags::dsv4_decode_reuse_enabled() || self.prefix_state.is_inactive() {
+            return Ok(());
+        }
+        self.poll_prefix_captures();
+        if self.prefix_capture_queue_full() {
             return Ok(());
         }
         let page_tokens = self.model.kv_arena.page_block_size;
@@ -777,14 +974,16 @@ impl Dsv4CudaExecutor {
         // Phase 1: enqueue D2H clones (stream-ordered, no sync). A content page
         // the prefill publish already stored is skipped; the frontier is always
         // (re)captured to attach its tail + carry at finish_len.
-        let mut captured: Vec<(u32, crate::attention::Dsv4PrefixPageEntry)> = Vec::new();
+        let mut captured = Vec::new();
+        let mut capture_failed = false;
         for page_index in 0..sealed_pages {
             let Some(&page_id) = slot_pages.get(page_index) else {
                 warn!(
                     "DSv4 finish frontier: slot {slot} page {page_index} outside host table ({} pages)",
                     slot_pages.len()
                 );
-                return Ok(());
+                capture_failed = true;
+                break;
             };
             let is_frontier = page_index == frontier;
             if !is_frontier && self.prefix_state.page_meta(page_id).is_some() {
@@ -813,54 +1012,64 @@ impl Dsv4CudaExecutor {
                 )
             };
             match entry {
-                Ok(e) => captured.push((page_id, e)),
+                Ok(entry) => captured.push(PendingPrefixPage {
+                    source_page: page_id,
+                    target_page: page_id,
+                    confirmed: false,
+                    cancelled: false,
+                    entry,
+                    frontier_tail: (is_frontier && finish_len > matched_len)
+                        .then(|| tokens[matched_len..finish_len].to_vec()),
+                }),
                 Err(err) => {
                     warn!(
                         "DSv4 finish frontier capture failed for slot {slot} page {page_index}: {err:#}"
                     );
-                    return Ok(());
+                    capture_failed = true;
+                    break;
                 }
             }
         }
         if captured.is_empty() {
             return Ok(());
         }
-        if let Err(err) = self.model.ctx.sync() {
-            warn!("DSv4 finish frontier sync failed for slot {slot}: {err:#}");
-            return Ok(());
+        if capture_failed {
+            captured.iter_mut().for_each(|page| page.cancelled = true);
         }
-        for (page_id, entry) in captured {
-            if !self.prefix_state.publish(page_id, &entry, slot_pages) {
-                warn!("DSv4 finish frontier: pool refused host page {page_id} (slot {slot})");
-            }
-        }
-        // Record the frontier's sub-page tail token ids so a later restore that
-        // extends into [matched_len, finish_len) verifies content identity — the
-        // radix only proves it to matched_len. `publish` cleared any stale one.
-        if finish_len > matched_len {
-            self.prefix_state.set_frontier_tail(
-                slot_pages[frontier],
-                tokens[matched_len..finish_len].to_vec(),
-            );
-        }
+        self.enqueue_prefix_capture(slot, slot_pages, captured)?;
         Ok(())
     }
 
     /// Radix evicted these host pages: drop their pool entries (the pool's
     /// lifetime rides the radix, no independent lifetime above the DRAM budget).
     pub(crate) fn release_prefix_pages(&mut self, pages: &[u32]) {
+        for capture in &mut self.pending_prefix_captures {
+            for page in &mut capture.pages {
+                page.cancelled |= pages.contains(&page.target_page);
+            }
+        }
         self.prefix_state.remove_pages(pages);
     }
 
     /// Slot free/abort returned these pages to the pool: drop provisional
     /// entries only (see `Dsv4PrefixStatePool::remove_provisional_pages`).
     pub(crate) fn release_provisional_prefix_pages(&mut self, pages: &[u32]) {
+        for capture in &mut self.pending_prefix_captures {
+            for page in &mut capture.pages {
+                page.cancel_provisional(pages);
+            }
+        }
         self.prefix_state.remove_provisional_pages(pages);
     }
 
     /// Radix publish confirmed these pages (engine `save_prefix_sidecar` arm):
     /// flip their pool entries from provisional to readable.
     pub(crate) fn confirm_prefix_pages(&mut self, pages: &[u32]) {
+        for capture in &mut self.pending_prefix_captures {
+            for page in &mut capture.pages {
+                page.confirm(pages);
+            }
+        }
         self.prefix_state.confirm_pages(pages);
     }
 
@@ -871,9 +1080,16 @@ impl Dsv4CudaExecutor {
     pub(crate) fn repair_prefix_pool_chain(&mut self, canonical: &[u32], slot_pages: &[u32]) {
         for (&canon, &own) in canonical.iter().zip(slot_pages) {
             if canon != own {
+                let canonical_exists = self.prefix_state.page_meta(canon).is_some();
+                for capture in &mut self.pending_prefix_captures {
+                    for page in &mut capture.pages {
+                        page.repair(canon, own, canonical_exists);
+                    }
+                }
                 self.prefix_state.adopt_canonical(canon, own);
             }
         }
+        self.poll_prefix_captures();
     }
 
     /// Attach the opt-in NVMe disk spill level (pre-serve only). The whole
@@ -1031,6 +1247,7 @@ impl Dsv4CudaExecutor {
         matched_len: usize,
         prefix_pages: &[u32],
     ) -> Result<usize> {
+        self.poll_prefix_captures();
         ensure!(
             slot < self.num_slots,
             "DSv4 prefix restore slot {slot} outside executor slots {}",
@@ -1609,9 +1826,9 @@ impl Dsv4CudaExecutor {
         kv_batch: &KvBatchDescriptor,
     ) -> Result<Vec<SlotToken>> {
         let out = self.forward_decode_batch_inner(rows, kv_batch)?;
-        // Finish write-through owns the decode region: the per-tick publish is a
-        // D2H+sync (graph-incompatible), so under --dsv4-decode-reuse it's a
-        // no-op and the whole generated region is captured once at finish.
+        // Finish write-through owns the decode region: per-tick D2H capture is
+        // graph-incompatible, so under --dsv4-decode-reuse it's a no-op and the
+        // whole generated region is captured once at finish.
         if !crate::runtime_flags::dsv4_decode_reuse_enabled() {
             for (row, kv_row) in rows.iter().zip(&kv_batch.rows) {
                 let slot_pages = &kv_batch.flat_slot_page_ids[kv_row.slot_page_range.clone()];
@@ -1788,6 +2005,7 @@ impl Dsv4CudaExecutor {
         plan: &ForwardPlan,
         kv_batch: &KvBatchDescriptor,
     ) -> Result<StepOutput> {
+        self.poll_prefix_captures();
         let rows = plan.decode_rows.len() + plan.prefill_rows.len();
         // Cross-rank lockstep debug surface: every rank logs a per-forward plan
         // fingerprint. Divergence at tick K (different rows on different ranks)

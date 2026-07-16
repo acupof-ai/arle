@@ -4,12 +4,14 @@
 //! single-row plan, mirrors host→device page allocation, runs the forward, and
 //! samples the next token (`sample_cuda_token`: greedy argmax / host sampling).
 
+use std::collections::VecDeque;
 use std::path::Path;
 use std::time::Instant;
 
 use anyhow::{Result, ensure};
 use cuda_kernels::KVFormat;
 use cuda_kernels::prelude::{DeviceContext, DeviceVec, PagedKVPool};
+use cuda_kernels::tensor::{CudaPipelineFence, CudaPipelineFenceStatus, CudaPipelineStreamKind};
 use infer_plan::{DecodeRow, ForwardPlan, SamplingParams, SlotToken, StepOutput};
 use infer_seam::{
     KvBatchDescriptor, KvBatchRowKind, KvPool, PrefixBlock, pages_only_reusable_prefix_blocks,
@@ -303,6 +305,12 @@ impl RealCudaExecutor {
             // DSv4 drives its own per-portion/whole-step graph gates inside
             // the model (ARLE_DSV4_* envs).
             Self::Dsv4(_) => Ok(()),
+        }
+    }
+
+    pub(crate) fn poll_background(&mut self) {
+        if let Self::Dsv4(d) = self {
+            d.poll_prefix_captures();
         }
     }
 

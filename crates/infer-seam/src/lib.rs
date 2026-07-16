@@ -180,6 +180,12 @@ pub trait BackendExecutor {
     /// Poll an in-flight forward step for completion.
     fn poll(&mut self, inflight: Self::Inflight) -> anyhow::Result<PollResult<Self::Inflight>>;
 
+    /// Advance completed backend work that is independent of the active
+    /// forward. Engine-core calls this before request admission.
+    fn poll_background(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Perform optional backend warmup before serving.
     fn warmup(&mut self) -> anyhow::Result<()> {
         Ok(())

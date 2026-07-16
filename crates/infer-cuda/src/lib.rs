@@ -558,6 +558,15 @@ impl BackendExecutor for CudaExecutor {
         Ok(PollResult::Ready(inflight.output))
     }
 
+    fn poll_background(&mut self) -> anyhow::Result<()> {
+        match &mut self.inner {
+            CudaExecutorInner::Placeholder => {}
+            #[cfg(feature = "cuda")]
+            CudaExecutorInner::Real(real) => real.poll_background(),
+        }
+        Ok(())
+    }
+
     fn warmup(&mut self) -> anyhow::Result<()> {
         match &mut self.inner {
             CudaExecutorInner::Placeholder => Ok(()),
