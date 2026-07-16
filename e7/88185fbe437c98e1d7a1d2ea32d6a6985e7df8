@@ -1,0 +1,25 @@
+crates/infer-server/src/coordinator.rs
+  s_91397647017cd2::t_08a9a4f7f79405 11,56-59,70-106,108,1078,1094-1095,1116,1138-1140,1153-1155,1194,1196-1198
+crates/infer-server/src/lib.rs
+  s_91397647017cd2::t_b67dbf81cd64e6 55-57
+crates/train/src/cc_convert.rs
+  s_91397647017cd2::t_7898bb13704f48 120,130-135,191-196,216-217,232-252,255-270,423-451
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "e788185fbe437c98e1d7a1d2ea32d6a6985e7df8",
+  "prompts": {},
+  "sessions": {
+    "s_91397647017cd2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-abf9104c4faf60f77",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
