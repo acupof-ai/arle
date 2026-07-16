@@ -4793,8 +4793,7 @@ mod tests {
     fn validate_prompt_collection_rejects_out_of_vocab_corpus_rows() {
         let prompts = vec![vec![1, 2], vec![3, 99]];
         let err = validate_prompt_collection("corpus", &prompts, 10)
-            .err()
-            .expect("out-of-vocab row should fail");
+            .expect_err("out-of-vocab row should fail");
         assert!(err.to_string().contains("corpus[1] token ids must be < 10"));
     }
 
