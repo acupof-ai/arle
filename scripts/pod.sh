@@ -28,6 +28,7 @@
 #   scripts/pod.sh run -- train opd ...    # AUTO-pick a free GPU, label "g<gpu>", detached
 #   scripts/pod.sh status                  # label defaults to "arle" (or pass g3 / your label)
 #   scripts/pod.sh gpus                    # per-GPU memory/util
+#   scripts/pod.sh ready 8000 900        # block until engine-ready (/v1/models 200)
 #   Explicit when needed: build <label> <cargo-args> | run <label> <gpu> -- <args>
 #                         | status/log/kill <label> | setup (warm/repair toolchain)
 #   Compile cache: setup-sccache (install binary; cache on /host persists) | sccache-stats
@@ -120,9 +121,11 @@ case "$cmd" in
     done < <(cd "$ROOT" && git status --porcelain | awk '{print $2}')
     ;;
   build)
-    # No args => standard arle build (label "arle"). Else: first arg = label.
-    if [ $# -eq 0 ]; then label="arle"; set -- --release --features cuda --bin arle
-    else label="$1"; shift; fi
+    # First arg (if any) = label; remaining args = cargo args. Missing cargo
+    # args ALWAYS fall back to the standard arle build — `build <label>` used
+    # to silently launch a plain debug `cargo build` (unusable on GPU).
+    if [ $# -eq 0 ]; then label="arle"; else label="$1"; shift; fi
+    [ $# -eq 0 ] && set -- --release --features cuda --bin arle
     "$POD" "POD_TREE=$TREE setsid bash $TREE/scripts/pod-remote-build.sh $label $* </dev/null >/dev/null 2>&1 &"
     echo "build '$label' launched (detached). poll: scripts/pod.sh status $label"
     ;;
@@ -140,7 +143,28 @@ case "$cmd" in
     echo "run '$label' launched on GPU $gpu. poll: scripts/pod.sh status $label"
     ;;
   gpus)
-    "$POD" "nvidia-smi --query-gpu=index,memory.used,memory.total,utilization.gpu --format=csv,noheader"
+    # Per-GPU usage + per-holder attribution: a holder PID visible in our
+    # /proc is ours (cmdline shown, killable); an invisible one is another
+    # container's (host PID ns) — not killable from here, don't try.
+    "$POD" "nvidia-smi --query-gpu=index,memory.used,memory.total,utilization.gpu --format=csv,noheader; \
+      map=\$(nvidia-smi --query-gpu=index,uuid --format=csv,noheader); \
+      apps=\$(nvidia-smi --query-compute-apps=gpu_uuid,pid,used_memory --format=csv,noheader 2>/dev/null); \
+      [ -n \"\$apps\" ] && echo '--- holders ---'; \
+      echo \"\$apps\" | while IFS=',' read -r uuid pid mem; do \
+        [ -n \"\$pid\" ] || continue; pid=\$(echo \"\$pid\" | tr -d ' '); uuid=\$(echo \"\$uuid\" | tr -d ' '); \
+        idx=\$(echo \"\$map\" | grep \"\$uuid\" | cut -d',' -f1 | tr -d ' '); \
+        if [ -d \"/proc/\$pid\" ]; then who=\"ours: \$(tr '\0' ' ' </proc/\$pid/cmdline | cut -c1-90)\"; \
+        else who='FOREIGN (host-ns pid — not visible/killable from this container)'; fi; \
+        echo \"gpu \${idx:-?} pid \$pid\$mem — \$who\"; done"
+    ;;
+  ready)
+    # Poll engine-ready (HTTP 200 on /v1/models). Usage: ready [port] [timeout_s].
+    port="${1:-8000}"; timeout_s="${2:-1200}"
+    case "$port$timeout_s" in *[!0-9]*) echo "usage: pod.sh ready [port] [timeout_s]"; exit 2;; esac
+    "$POD" "code=; for i in \$(seq 1 $(( timeout_s / 10 ))); do \
+      code=\$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:$port/v1/models 2>/dev/null); \
+      [ \"\$code\" = 200 ] && { echo \"ENGINE_READY port=$port after ~\$((i*10))s\"; exit 0; }; sleep 10; done; \
+      echo \"NOT_READY after ${timeout_s}s (last http \${code:-none})\"; exit 1"
     ;;
   status)
     label="${1:-arle}"
@@ -167,6 +191,6 @@ case "$cmd" in
       [ -n \"\$p\" ] && { kill -- -\$p 2>/dev/null; kill \$p 2>/dev/null; echo \"killed \$k pgid \$p\"; }; done"
     ;;
   *)
-    sed -n '2,38p' "$0" | sed 's/^# \?//'
+    sed -n '2,39p' "$0" | sed 's/^# \?//'
     ;;
 esac
