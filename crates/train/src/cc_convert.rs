@@ -52,9 +52,7 @@ pub struct CcRecord {
     pub prompt_ids: Vec<u32>,
     pub response_ids: Vec<u32>,
     pub response_mask: Vec<u8>,
-    /// Attempt reward carried from the window (SAO advantage input). Default
-    /// 1.0 keeps replay records from pre-reward windows on the passing-only path.
-    #[serde(default = "default_reward")]
+    /// Attempt reward carried from the window (SAO advantage input).
     pub reward: f32,
     pub masked_tokens: usize,
     pub total_tokens: usize,
@@ -164,20 +162,9 @@ pub fn newest_dump_prompt_ids(
     if let Some(sidecar) = read_tokens_sidecar(&path) {
         return Ok(Some(sidecar.prompt_token_ids));
     }
-    let raw = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-    let body: serde_json::Value =
-        serde_json::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
-    let chat_request = infer_server::messages_body_to_chat_request(body)
-        .context("map /v1/messages body onto the chat request")?;
-    let messages: Vec<chat::ChatMessage> =
-        chat_request.messages.iter().map(to_chat_message).collect();
-    ensure!(!messages.is_empty(), "dump has no messages");
-    let rendered = chat::render_structured_chatml_with_spans(&messages, false);
-    let cutoff = rendered
-        .spans
+    let rendered = render_dump(read_json(&path)?)?;
+    let cutoff = supervised_spans(&rendered)
         .iter()
-        .map(|span| span.supervised.clone())
-        .filter(|range| !range.is_empty())
         .map(|range| range.start)
         .min()
         .unwrap_or(rendered.prompt.len());
@@ -231,15 +218,40 @@ fn dumps_in_window(
         .iter()
         .filter(|(ms, _)| (window.t_start_ms..window.t_end_ms).contains(ms))
     {
-        let raw = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-        let body: serde_json::Value =
-            serde_json::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
+        let body = read_json(path)?;
         if window.model.as_deref().is_some_and(|m| body["model"] != m) {
             continue;
         }
         matched.push((body, path.clone()));
     }
     Ok(matched)
+}
+
+fn read_json(path: &Path) -> Result<serde_json::Value> {
+    let raw = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    serde_json::from_str(&raw).with_context(|| format!("parse {}", path.display()))
+}
+
+/// Dump body → serve-identical chat request → span-carrying ChatML render.
+/// No generation prompt: this is a supervision record, not an inference
+/// prompt, and the last turn of the fullest request is user/tool anyway.
+fn render_dump(body: serde_json::Value) -> Result<chat::RenderedChatMl> {
+    let chat_request = infer_server::messages_body_to_chat_request(body)
+        .context("map /v1/messages body onto the chat request")?;
+    let messages: Vec<chat::ChatMessage> =
+        chat_request.messages.iter().map(to_chat_message).collect();
+    ensure!(!messages.is_empty(), "dump has no messages");
+    Ok(chat::render_structured_chatml_with_spans(&messages, false))
+}
+
+/// Non-empty supervised byte ranges (the assistant turns) of a render.
+fn supervised_spans(rendered: &chat::RenderedChatMl) -> Vec<Range<usize>> {
+    rendered
+        .spans
+        .iter()
+        .map(|span| span.supervised.clone())
+        .filter(|range| !range.is_empty())
+        .collect()
 }
 
 fn messages_len(body: &serde_json::Value) -> usize {
@@ -319,16 +331,27 @@ fn merged_sidecar_record(
         .copied()
         .collect();
     mask.resize(ids.len(), 1);
-    let masked_tokens = mask.iter().filter(|&&m| m == 1).count();
-    Some(CcRecord {
+    Some(split_record(label, reward, &ids, &mask, first_masked))
+}
+
+/// Split at the first supervised token: everything before is prompt, the rest
+/// is the (masked) response.
+fn split_record(
+    label: &str,
+    reward: f32,
+    ids: &[u32],
+    mask: &[u8],
+    first_masked: usize,
+) -> CcRecord {
+    CcRecord {
         label: label.to_owned(),
         prompt_ids: ids[..first_masked].to_vec(),
         response_ids: ids[first_masked..].to_vec(),
         response_mask: mask[first_masked..].to_vec(),
         reward,
-        masked_tokens,
+        masked_tokens: mask.iter().filter(|&&m| m == 1).count(),
         total_tokens: ids.len(),
-    })
+    }
 }
 
 /// First occurrence of `needle` in `haystack` (naive scan: ~20K-token prompt ×
@@ -346,20 +369,8 @@ fn convert_body(
     body: serde_json::Value,
     tokenizer: &tokenizers::Tokenizer,
 ) -> Result<CcRecord> {
-    let chat_request = infer_server::messages_body_to_chat_request(body)
-        .context("map /v1/messages body onto the chat request")?;
-    let messages: Vec<chat::ChatMessage> =
-        chat_request.messages.iter().map(to_chat_message).collect();
-    ensure!(!messages.is_empty(), "dump has no messages");
-    // No generation prompt: this is a supervision record, not an inference
-    // prompt, and the last turn of the fullest request is user/tool anyway.
-    let rendered = chat::render_structured_chatml_with_spans(&messages, false);
-    let supervised: Vec<Range<usize>> = rendered
-        .spans
-        .iter()
-        .map(|span| span.supervised.clone())
-        .filter(|range| !range.is_empty())
-        .collect();
+    let rendered = render_dump(body)?;
+    let supervised = supervised_spans(&rendered);
     ensure!(
         !supervised.is_empty(),
         "no assistant turns to supervise in the rendered conversation"
@@ -389,16 +400,7 @@ fn convert_body(
         "first token is supervised — the record would have an empty prompt"
     );
 
-    let masked_tokens = mask.iter().filter(|&&m| m == 1).count();
-    Ok(CcRecord {
-        label: label.to_owned(),
-        prompt_ids: ids[..first_masked].to_vec(),
-        response_ids: ids[first_masked..].to_vec(),
-        response_mask: mask[first_masked..].to_vec(),
-        reward,
-        masked_tokens,
-        total_tokens: ids.len(),
-    })
+    Ok(split_record(label, reward, ids, &mask, first_masked))
 }
 
 /// Map the serve's OpenAI-shaped message onto the `chat` crate's structured
