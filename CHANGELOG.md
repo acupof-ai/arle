@@ -23,6 +23,17 @@ Progress spine. Entry classes recorded here the day they land: phase exits,
 default flips, and accept-or-reject verdicts (AGENTS.md §Docs lifecycle &
 progress spine).
 
+- **2026-07-17 — #164/#162 CLOSED (accept): c32 × 300 s oversubscription
+  survival with real preemption (192 events, zero teardowns).** Final fix
+  chain `f03a54f4a`: the evictor freed live-attached pages (cross-slot KV
+  corruption seed) and counted radix-severed orphans as "reclaimed" —
+  `page_is_evictable` (retained-once ∧ slot-unattached) now single-sources
+  repair capacity and evictor filtering; evict-until-freed; every step-path
+  alloc failure degrades to shed/park. Same run accepted `77e0d1d5d`:
+  `--max-running-requests 32` frees per-slot VRAM into the comp pool —
+  **84k → 1,048,576 tokens (12.5×)**, c32 +42% out tok/s / ITL p99 −84%,
+  grid c1–16 unchanged. Entry:
+  [wins](docs/experience/wins/2026-07-17-max-running-requests-caps-slot-budget.md).
 - **2026-07-16 — polish round: high-effort adversarial review of the day's
   commits fixed 8 confirmed defects pre-deployment.** The first #164 repair
   livelocked warm caches (evictable ≠ free) and could hang TP via rank-local
