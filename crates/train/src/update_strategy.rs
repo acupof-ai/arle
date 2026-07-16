@@ -125,6 +125,22 @@ pub struct KlReg {
     pub coef: f32,
 }
 
+/// One `update` call's roll-up: the mean per-trajectory loss plus the
+/// off-policy / critic / advantage diagnostics the metrics sink records.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct UpdateReport {
+    pub loss: f32,
+    /// Trajectories that contributed a gradient.
+    pub trained: usize,
+    /// Masked tokens trained across them (0 on the CE path's own count below).
+    pub tokens: usize,
+    pub stats: PgStats,
+    /// Mean critic MSE (0.0 without a critic).
+    pub critic_mse: f32,
+    pub adv_mean: f32,
+    pub adv_std: f32,
+}
+
 /// One policy-update algorithm as data. Extend = a new constructor value.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct UpdatePreset {
@@ -269,7 +285,8 @@ impl UpdatePreset {
     }
 
     /// Apply one round's update over `batch`, returning the mean per-trajectory
-    /// loss (same reduction as the pre-preset per-trajectory writeback loop).
+    /// loss (same reduction as the pre-preset per-trajectory writeback loop)
+    /// plus the diagnostics the metrics sink records.
     #[allow(clippy::too_many_arguments)]
     pub fn update<O: Optimizer>(
         &self,
@@ -282,10 +299,10 @@ impl UpdatePreset {
         vocab: usize,
         window: usize,
         store: &mut TensorStore,
-    ) -> Result<f32> {
+    ) -> Result<UpdateReport> {
         let survivors = self.filter_batch(batch);
         if survivors.is_empty() {
-            return Ok(0.0);
+            return Ok(UpdateReport::default());
         }
         if self.ratio == RatioGrain::None {
             return update_ce(
@@ -312,7 +329,7 @@ impl UpdatePreset {
         vocab: usize,
         window: usize,
         store: &mut TensorStore,
-    ) -> Result<f32> {
+    ) -> Result<UpdateReport> {
         let scalar_advs: Vec<f32> = match self.advantage {
             Advantage::Mean { scope, std_norm } => centered_advantages(survivors, scope, std_norm),
             // GAE supplies per-token credit below; None = uniform PG weight.
@@ -359,6 +376,11 @@ impl UpdatePreset {
         let mut mse_sum = 0.0f32;
         let mut adv_abs_sum = 0.0f32;
         let mut adv_tokens = 0usize;
+        // Advantage distribution over the values actually applied (per-token
+        // under GAE, per-trajectory scalars otherwise).
+        let mut adv_sum = 0.0f64;
+        let mut adv_sq = 0.0f64;
+        let mut adv_n = 0usize;
 
         for (i, traj) in survivors.iter().enumerate() {
             let rollout_logprobs = traj.rollout_logprobs.as_deref().ok_or_else(|| {
@@ -387,6 +409,11 @@ impl UpdatePreset {
             if critic.is_none() && scalar_advs[i] == 0.0 {
                 continue;
             }
+            for &a in &advantages {
+                adv_sum += f64::from(a);
+                adv_sq += f64::from(a) * f64::from(a);
+            }
+            adv_n += advantages.len();
 
             // Token-mean the PG objective, mirroring CE's 1/N: per-trajectory
             // masked count, or the batch/fixed constant for GlobalTokenMean.
@@ -459,11 +486,15 @@ impl UpdatePreset {
             opt.step(store, trainable)?;
             opt.zero_grad(store, trainable);
         }
+        let critic_mse = if critic.is_some() && steps > 0 {
+            mse_sum / steps as f32
+        } else {
+            0.0
+        };
         if steps > 0 {
             let critic_suffix = if critic.is_some() {
                 format!(
-                    " mean_critic_mse={:.4e} mean_adv_abs={:.4e}",
-                    mse_sum / steps as f32,
+                    " mean_critic_mse={critic_mse:.4e} mean_adv_abs={:.4e}",
                     adv_abs_sum / adv_tokens.max(1) as f32,
                 )
             } else {
@@ -476,10 +507,20 @@ impl UpdatePreset {
                 stats.clip_frac(),
             );
         }
-        Ok(if steps > 0 {
-            loss_sum / steps as f32
-        } else {
-            0.0
+        let adv_mean = adv_sum / adv_n.max(1) as f64;
+        let adv_std = (adv_sq / adv_n.max(1) as f64 - adv_mean * adv_mean).max(0.0);
+        Ok(UpdateReport {
+            loss: if steps > 0 {
+                loss_sum / steps as f32
+            } else {
+                0.0
+            },
+            trained: steps,
+            tokens: stats.tokens,
+            stats,
+            critic_mse,
+            adv_mean: adv_mean as f32,
+            adv_std: adv_std.sqrt() as f32,
         })
     }
 }
@@ -555,8 +596,9 @@ fn update_ce<O: Optimizer>(
     vocab: usize,
     window: usize,
     store: &mut TensorStore,
-) -> Result<f32> {
+) -> Result<UpdateReport> {
     let mut loss_sum = 0.0f32;
+    let mut tokens = 0usize;
     for traj in survivors {
         // Dispatch (not `masked_writeback_step(Ce)` directly) so the default
         // path stays byte-identical, honoring `--writeback-frozen-prompt-kv`.
@@ -572,8 +614,14 @@ fn update_ce<O: Optimizer>(
             window,
             store,
         )?;
+        tokens += traj.response_mask.iter().filter(|&&m| m == 1).count();
     }
-    Ok(loss_sum / survivors.len() as f32)
+    Ok(UpdateReport {
+        loss: loss_sum / survivors.len() as f32,
+        trained: survivors.len(),
+        tokens,
+        ..UpdateReport::default()
+    })
 }
 
 #[cfg(test)]

@@ -1,8 +1,8 @@
 //! Per-round stage wall-clock profiler for the agent-OPD loop.
 //!
-//! Opt-in via the `ARLE_AOPD_PROFILE` env var (any value enables it). Zero-cost
-//! when unset: every entry point early-returns on the `OnceLock<bool>` gate
-//! before touching the mutex, and [`time`] calls the closure directly.
+//! Recording is always-on (a mutex touch per stage — round-grain call sites)
+//! and feeds the metrics.jsonl `round.phase_secs` field via [`phase_secs`];
+//! only the human table stays opt-in via the `ARLE_AOPD_PROFILE` env var.
 //!
 //! All timings are HOST wall-clock. The GPU stages (rollout decode, masked-CE
 //! writeback, LoRA sync, eval) block on the device — each materializes a host
@@ -53,13 +53,24 @@ fn table() -> &'static Mutex<Table> {
 
 /// Anchor a fresh round: reset the stage table and start the round wall clock.
 pub fn begin_round() {
-    if !enabled() {
-        return;
-    }
     if let Ok(mut t) = table().lock() {
         t.rows.clear();
         t.round_start = Some(Instant::now());
     }
+}
+
+/// Snapshot the round's accumulated `(stage, secs)` pairs for the metrics sink.
+#[must_use]
+pub fn phase_secs() -> Vec<(&'static str, f64)> {
+    table().lock().map_or_else(
+        |_| Vec::new(),
+        |t| {
+            t.rows
+                .iter()
+                .map(|(label, _, s)| (*label, s.secs))
+                .collect()
+        },
+    )
 }
 
 /// Accumulate one stage observation. `kind` is one of [`GPU`] / [`WALL`] /
@@ -67,9 +78,6 @@ pub fn begin_round() {
 /// this directly when the elapsed time is derived (e.g. decode wall split out of
 /// a returned record).
 pub fn record(label: &'static str, kind: &'static str, secs: f64) {
-    if !enabled() {
-        return;
-    }
     if let Ok(mut t) = table().lock() {
         match t.rows.iter_mut().find(|(l, _, _)| *l == label) {
             Some((_, _, stat)) => {
@@ -82,11 +90,8 @@ pub fn record(label: &'static str, kind: &'static str, secs: f64) {
 }
 
 /// Time a closure and accumulate its wall under `label`. Returns the closure's
-/// value unchanged. When profiling is off, calls `f` directly (zero overhead).
+/// value unchanged.
 pub fn time<T>(label: &'static str, kind: &'static str, f: impl FnOnce() -> T) -> T {
-    if !enabled() {
-        return f();
-    }
     let t0 = Instant::now();
     let out = f();
     record(label, kind, t0.elapsed().as_secs_f64());
