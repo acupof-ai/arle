@@ -1,0 +1,31 @@
+crates/infer-cuda/src/tp.rs
+  s_1197b13cfdde87::t_82205e20faf8d0 803
+crates/infer-gguf/src/deepseek4.rs
+  s_3b4cf05945733b::t_dcd8d4d50f1383 185-190
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "8acf371d71562093d5c42619f36833de19637888",
+  "prompts": {},
+  "sessions": {
+    "s_1197b13cfdde87": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f699d-1035-7703-bf68-5b21f46252de",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_3b4cf05945733b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a9b02347b884af6dd",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
