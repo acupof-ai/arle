@@ -1,27 +1,19 @@
 //! Per-task filesystem sandbox for agent-based OPD training.
 //!
-//! Backs an agentic OPD loop where a student LLM edits a real repo checked out
-//! at a base commit and we run hidden tests as the reward signal. The
-//! [`SandboxToolExecutor`] runs the coding agent's read/write/replace/bash tools
-//! against a per-task workdir on the local filesystem (no container — the
-//! caller is responsible for isolation if it wants any). The free functions
-//! [`boot_workdir`] / [`diff_workdir`] / [`score_workdir`] / [`reset_workdir`]
-//! manage the workdir lifecycle: stage a tree, diff the agent's candidate patch,
-//! apply the hidden `test_patch` + run `fail_to_pass` tests, and reset between
-//! samples.
-//!
-//! Path resolution is rooted at the per-task `workdir` and rejects `..` escapes
-//! so a misbehaving agent can't read or clobber files outside its sandbox.
+//! Backs the cc-harness agentic OPD loop ([`crate::cc_harness`]): the agent
+//! edits a real repo checked out at a base commit and hidden tests are the
+//! reward signal. [`boot_workdir`] / [`diff_workdir`] / [`score_workdir`]
+//! manage the workdir lifecycle (no container — the caller is responsible for
+//! isolation if it wants any): stage a tree, diff the agent's candidate patch,
+//! apply the hidden `test_patch` + run `fail_to_pass` tests. [`run_captured`]
+//! is the fork-safe subprocess primitive both scoring and the cc spawn use.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use agent::ToolExecutor;
 use anyhow::{Context, Result, anyhow, bail};
-use chat::ToolCall;
-use tools::{apply_replace, format_read};
 
 use crate::spawner::{SpawnClient, SpawnRequest, SpawnResponse};
 
@@ -232,226 +224,6 @@ fn kill_group(pgid: i32) {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
-}
-
-/// Runs the coding agent's read/write/replace/bash tools against a per-task
-/// repo directory on the local filesystem.
-///
-/// `workdir` is both the cwd for bash and the base for path resolution. Tool
-/// `path` arguments are joined onto it and validated to stay inside it.
-pub struct SandboxToolExecutor {
-    /// Per-task repo root (cwd for bash; base for path resolution).
-    workdir: PathBuf,
-    /// Wall-clock budget for a single `bash` tool invocation. Enforced in Rust
-    /// (not the coreutil `timeout`, which is absent on macOS).
-    bash_timeout_secs: u64,
-    /// Prepended to `PYTHONPATH` for bash (e.g. `"lib:test"`). Any inherited
-    /// `PYTHONPATH` is preserved by appending it after this prefix.
-    pythonpath: Option<String>,
-}
-
-impl SandboxToolExecutor {
-    pub fn new(workdir: PathBuf, bash_timeout_secs: u64, pythonpath: Option<String>) -> Self {
-        Self {
-            workdir,
-            bash_timeout_secs,
-            pythonpath,
-        }
-    }
-
-    /// Join `workdir` + `path`, rejecting any `..` escape so the agent cannot
-    /// read or write outside its sandbox. Returns `Err(message)` with a
-    /// tool-surfaced error string on rejection.
-    fn resolve(&self, path: &str) -> Result<PathBuf, String> {
-        let candidate = Path::new(path);
-        if candidate.is_absolute() {
-            return Err(format!("ERROR: absolute paths are not allowed: {path}"));
-        }
-        for component in candidate.components() {
-            if matches!(component, std::path::Component::ParentDir) {
-                return Err(format!("ERROR: path escapes the sandbox ('..'): {path}"));
-            }
-        }
-        Ok(self.workdir.join(candidate))
-    }
-
-    /// Spawn `bash -lc <cmd>` in the workdir with a Rust-enforced timeout and
-    /// collect stdout+stderr into a single tool result string.
-    fn run_bash(&self, cmd: &str) -> String {
-        // Confine the bash tool to the workdir: reject an absolute `cd` that
-        // escapes the sandbox. Without this, a `cd /abs/other-task-repo` reaches
-        // a SIBLING task's workdir (all per-task workdirs are flat-siblings under
-        // one --work-root, and the eval pass leaves its dirs there), so a single
-        // hallucinated absolute path makes the whole rollout edit the wrong repo
-        // and leave its own diff empty. Mirrors the `resolve()` jail the
-        // read/write/replace tools already enforce; the system prompt already
-        // tells the agent to use relative paths only.
-        if let Some(msg) = cd_escape_message(cmd, &self.workdir) {
-            return msg;
-        }
-
-        let mut command = Command::new("bash");
-        command.arg("-lc").arg(cmd).current_dir(&self.workdir);
-        // Never write bytecode in the sandbox: a stale in-tree __pycache__
-        // (same mtime-second + same size after an edit) makes a later pytest
-        // run pre-edit bytecode — byte-length-preserving fixes score as fails.
-        command.env("PYTHONDONTWRITEBYTECODE", "1");
-
-        if let Some(prefix) = &self.pythonpath {
-            let combined = match std::env::var("PYTHONPATH") {
-                Ok(existing) if !existing.is_empty() => format!("{prefix}:{existing}"),
-                _ => prefix.clone(),
-            };
-            command.env("PYTHONPATH", combined);
-        }
-
-        match run_captured(command, Duration::from_secs(self.bash_timeout_secs)) {
-            Ok((output, code, killed)) => format_bash_output(&output, &[], code, killed),
-            Err(e) => format!("ERROR: failed to run bash: {e}"),
-        }
-    }
-}
-
-/// Non-empty string argument. Missing args get a schema-naming error (see
-/// TOOL_SCHEMAS): the decoded 0-accept wall (errors/2026-06-29) included `read`
-/// called with `command` instead of `path`, and the old fallback-to-"" error
-/// never taught the student the real schema.
-fn arg<'a>(call: &'a ToolCall, key: &str) -> Option<&'a str> {
-    call.arguments
-        .get(key)
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-}
-
-const TOOL_SCHEMAS: &str =
-    "read(path, start?, end?), write(path, content), replace(path, old, new), bash(command)";
-
-fn schema_err(name: &str, key: &str) -> String {
-    format!("ERROR: {name} requires `{key}` — available tools: {TOOL_SCHEMAS}")
-}
-
-impl ToolExecutor for SandboxToolExecutor {
-    fn execute(&self, call: &ToolCall) -> String {
-        match call.name.as_str() {
-            "read" => {
-                let Some(path) = arg(call, "path") else {
-                    return schema_err("read", "path");
-                };
-                let start = call.arguments.get("start").and_then(|v| v.as_i64());
-                let end = call.arguments.get("end").and_then(|v| v.as_i64());
-                let resolved = match self.resolve(path) {
-                    Ok(p) => p,
-                    Err(msg) => return msg,
-                };
-                if resolved.is_dir() {
-                    return format!("ERROR: {path} is a directory (use bash `ls` to list it)");
-                }
-                let contents = match fs::read_to_string(&resolved) {
-                    Ok(c) => c,
-                    Err(_) => return format!("ERROR: no such file: {path}"),
-                };
-                format_read(&contents, path, start, end)
-            }
-            "write" => {
-                let Some(path) = arg(call, "path") else {
-                    return schema_err("write", "path");
-                };
-                let content = call
-                    .arguments
-                    .get("content")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let resolved = match self.resolve(path) {
-                    Ok(p) => p,
-                    Err(msg) => return msg,
-                };
-                if let Some(parent) = resolved.parent()
-                    && let Err(e) = fs::create_dir_all(parent)
-                {
-                    return format!("ERROR: failed to create parent dirs for {path}: {e}");
-                }
-                match fs::write(&resolved, content) {
-                    Ok(()) => format!("wrote {} bytes to {path}", content.len()),
-                    Err(e) => format!("ERROR: failed to write {path}: {e}"),
-                }
-            }
-            "replace" => {
-                let Some(path) = arg(call, "path") else {
-                    return schema_err("replace", "path");
-                };
-                let Some(old) = arg(call, "old") else {
-                    return schema_err("replace", "old");
-                };
-                let new = call
-                    .arguments
-                    .get("new")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let resolved = match self.resolve(path) {
-                    Ok(p) => p,
-                    Err(msg) => return msg,
-                };
-                let contents = match fs::read_to_string(&resolved) {
-                    Ok(c) => c,
-                    Err(_) => return format!("ERROR: no such file: {path}"),
-                };
-                match apply_replace(&contents, path, old, new) {
-                    Err(msg) => msg,
-                    Ok(replaced) => match fs::write(&resolved, replaced) {
-                        Ok(()) => format!("OK: replaced 1 occurrence in {path}"),
-                        Err(e) => format!("ERROR: failed to write {path}: {e}"),
-                    },
-                }
-            }
-            "bash" => match arg(call, "cmd").or_else(|| arg(call, "command")) {
-                Some(cmd) => self.run_bash(cmd),
-                None => schema_err("bash", "command"),
-            },
-            other => format!("ERROR: unknown tool '{other}' — available tools: {TOOL_SCHEMAS}"),
-        }
-    }
-}
-
-/// Reject a bash command that `cd`s to an absolute path escaping `workdir`.
-///
-/// Returns `Some(error)` (a tool-surfaced rejection string) when the command
-/// contains a `cd <absolute>` whose target is not inside `workdir`; `None`
-/// otherwise. Only ABSOLUTE `cd` targets are checked — relative `cd subdir` and
-/// `cd ..` stay allowed (cwd stays inside the workdir at spawn time; the
-/// read/write/replace tools independently reject `..` path args). This is a
-/// pragmatic guard for the decoded escape vector (`cd /abs/sibling-task-repo`),
-/// not a full shell sandbox: a determined adversary can still escape via e.g.
-/// `pushd`/symlinks, but the agent-OPD student only ever emits a leading `cd`.
-fn cd_escape_message(cmd: &str, workdir: &Path) -> Option<String> {
-    // Canonicalize the workdir once so symlinked roots (e.g. /host -> ...) compare
-    // correctly; fall back to the raw path if canonicalization fails.
-    let root = workdir
-        .canonicalize()
-        .unwrap_or_else(|_| workdir.to_owned());
-    // Split on shell statement separators so chained `... && cd /abs && ...` is
-    // caught, then look at each segment's leading word.
-    for segment in cmd.split(['&', '|', ';', '\n']) {
-        let mut words = segment.split_whitespace();
-        if words.next() != Some("cd") {
-            continue;
-        }
-        let Some(target) = words.next() else { continue };
-        // Strip surrounding quotes the model sometimes emits.
-        let target = target.trim_matches(|c| c == '"' || c == '\'');
-        let path = Path::new(target);
-        if !path.is_absolute() {
-            continue;
-        }
-        let canon = path.canonicalize().unwrap_or_else(|_| path.to_owned());
-        if !canon.starts_with(&root) {
-            return Some(format!(
-                "ERROR: absolute `cd {target}` escapes the sandbox. Your working \
-directory is the repo root; use RELATIVE paths only (e.g. `cd lib/ansible`, or \
-just reference files relative to the repo root). Do not `cd` to an absolute path."
-            ));
-        }
-    }
-    None
 }
 
 /// Clip a string to `max_chars` keeping HEAD + TAIL. Tests / tracebacks live at
@@ -732,27 +504,6 @@ fn parse_pytest_counts(text: &str) -> Option<(usize, usize)> {
     None
 }
 
-/// Discard the agent's edits + any applied `test_patch`, restoring the
-/// committed base for the next sample: `git checkout -- .` then
-/// `git clean -fdq`.
-pub fn reset_workdir(workdir: &Path) -> Result<()> {
-    run_checked(
-        Command::new("git")
-            .arg("-C")
-            .arg(workdir)
-            .args(["checkout", "--", "."]),
-        "git checkout",
-    )?;
-    run_checked(
-        Command::new("git")
-            .arg("-C")
-            .arg(workdir)
-            .args(["clean", "-fdq"]),
-        "git clean",
-    )?;
-    Ok(())
-}
-
 /// Run a `Command` and return an error including stderr if it does not exit 0.
 /// Routes through the sandbox-spawner when its env is set (agent-OPD rollout).
 fn run_checked(command: &mut Command, label: &str) -> Result<()> {
@@ -770,12 +521,7 @@ fn run_checked(command: &mut Command, label: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
     use std::process::Command;
-
-    fn call(name: &str, args: serde_json::Value) -> ToolCall {
-        ToolCall::new(name, args)
-    }
 
     /// `plain_output`/`run_captured` both gate on the process-global
     /// `ARLE_SPAWNER_SOCKET` (`SpawnClient::from_env`) — any test that spawns a
@@ -805,92 +551,35 @@ mod tests {
     }
 
     #[test]
-    fn bash_does_not_hang_on_backgrounded_child() {
+    fn run_captured_does_not_hang_on_backgrounded_child() {
         let _guard = env_guard();
-        // Regression: a tool command that backgrounds a process inheriting the
-        // stdout pipe used to block `wait_with_output()` until that grandchild
-        // exited (forever for a daemon), stranding the parent in `wait4()`.
+        // Regression: a command that backgrounds a process inheriting the stdout
+        // pipe used to block `wait_with_output()` until that grandchild exited
+        // (forever for a daemon), stranding the parent in `wait4()`.
         // `run_captured` writes to a temp file (no pipe to hold) and kills the
-        // whole process group, so `execute` must return promptly.
+        // whole process group, so it must return promptly.
         let tmp = tempfile::tempdir().unwrap();
-        let exec = SandboxToolExecutor::new(tmp.path().to_path_buf(), 30, None);
+        let mut cmd = Command::new("bash");
+        cmd.args(["-lc", "echo ready; sleep 30 &"])
+            .current_dir(tmp.path());
         let start = std::time::Instant::now();
-        let out = exec.execute(&call("bash", json!({"command": "echo ready; sleep 30 &"})));
+        let (out, code, killed) = run_captured(cmd, Duration::from_secs(30)).unwrap();
         let elapsed = start.elapsed();
-        assert!(out.contains("ready"), "bash output: {out}");
         assert!(
-            elapsed < std::time::Duration::from_secs(5),
-            "run_bash blocked {}s on a backgrounded child — the pipe-hang regressed",
+            String::from_utf8_lossy(&out).contains("ready"),
+            "output: {out:?}"
+        );
+        assert_eq!(code, Some(0));
+        assert!(!killed);
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "run_captured blocked {}s on a backgrounded child — the pipe-hang regressed",
             elapsed.as_secs()
         );
     }
 
     #[test]
-    fn missing_args_name_the_schema() {
-        let _guard = env_guard();
-        // The decoded 0-accept vector: `read` called with `command` instead of
-        // `path` must come back naming the schema, not "is a directory".
-        let tmp = tempfile::tempdir().unwrap();
-        let exec = SandboxToolExecutor::new(tmp.path().to_path_buf(), 30, None);
-        for (name, args, key) in [
-            ("read", json!({"command": "ls"}), "path"),
-            ("write", json!({"content": "x"}), "path"),
-            ("replace", json!({"path": "a.py"}), "old"),
-            ("bash", json!({}), "command"),
-        ] {
-            let out = exec.execute(&call(name, args));
-            assert!(
-                out.contains(&format!("{name} requires `{key}`")) && out.contains("read(path"),
-                "{name} error must name `{key}` + the schemas: {out}"
-            );
-        }
-        let out = exec.execute(&call("grep", json!({"pattern": "x"})));
-        assert!(
-            out.contains("unknown tool 'grep'") && out.contains("bash(command)"),
-            "unknown tool must list the real tools: {out}"
-        );
-    }
-
-    #[test]
-    fn executor_read_write_replace_bash() {
-        let _guard = env_guard();
-        let tmp = tempfile::tempdir().unwrap();
-        let exec = SandboxToolExecutor::new(tmp.path().to_path_buf(), 30, None);
-
-        let wrote = exec.execute(&call(
-            "write",
-            json!({"path": "hello.txt", "content": "alpha UNIQUE_TOKEN omega\n"}),
-        ));
-        assert!(wrote.contains("wrote"), "write result: {wrote}");
-
-        let read = exec.execute(&call("read", json!({"path": "hello.txt"})));
-        assert!(
-            read.contains("UNIQUE_TOKEN") && read.contains("1\t"),
-            "read result: {read}"
-        );
-
-        let replaced = exec.execute(&call(
-            "replace",
-            json!({"path": "hello.txt", "old": "UNIQUE_TOKEN", "new": "REPLACED"}),
-        ));
-        assert!(
-            replaced.contains("OK: replaced"),
-            "replace result: {replaced}"
-        );
-
-        let bashed = exec.execute(&call("bash", json!({"cmd": "echo hi"})));
-        assert!(
-            bashed.contains("hi") && bashed.contains("[exit 0]"),
-            "bash result: {bashed}"
-        );
-
-        // `..` escape is rejected.
-        let escaped = exec.execute(&call("read", json!({"path": "../secret"})));
-        assert!(escaped.contains("escapes the sandbox"), "escape: {escaped}");
-    }
-
-    #[test]
-    fn boot_diff_reset_roundtrip() {
+    fn boot_diff_roundtrip() {
         let _guard = env_guard();
         let work_root = tempfile::tempdir().unwrap();
         let staged = tempfile::tempdir().unwrap();
@@ -899,65 +588,9 @@ mod tests {
         let workdir = boot_workdir(work_root.path(), "inst1", staged.path(), None).unwrap();
         assert!(workdir.join("a.txt").exists());
 
-        let exec = SandboxToolExecutor::new(workdir.clone(), 30, None);
-        let wrote = exec.execute(&call("write", json!({"path": "a.txt", "content": "y\n"})));
-        assert!(wrote.contains("wrote"), "write: {wrote}");
-
+        fs::write(workdir.join("a.txt"), "y\n").unwrap();
         let diff = diff_workdir(&workdir).unwrap();
         assert!(diff.contains("a.txt"), "diff should mention a.txt: {diff}");
-
-        reset_workdir(&workdir).unwrap();
-        let diff_after = diff_workdir(&workdir).unwrap();
-        assert!(
-            diff_after.trim().is_empty(),
-            "diff after reset should be empty: {diff_after}"
-        );
-    }
-
-    #[test]
-    fn bash_rejects_absolute_cd_into_sibling_task() {
-        let _guard = env_guard();
-        // Mirror the decoded accept-wall: two task workdirs are flat-siblings
-        // under one work_root; the agent's bash must not `cd` into the other.
-        let work_root = tempfile::tempdir().unwrap();
-        let mine = work_root.path().join("ansible__ansible-f327e65");
-        let sibling = work_root.path().join("ansible__ansible-0ea40e0");
-        fs::create_dir_all(&mine).unwrap();
-        fs::create_dir_all(&sibling).unwrap();
-
-        let exec = SandboxToolExecutor::new(mine.clone(), 30, None);
-
-        // The exact escape vector decoded from the failing rollout.
-        let escape = format!("cd {} && find . -name '*.py'", sibling.display());
-        let out = exec.execute(&call("bash", json!({ "command": escape })));
-        assert!(
-            out.contains("escapes the sandbox"),
-            "absolute cd into sibling must be rejected: {out}"
-        );
-
-        // Chained mid-command escape is also caught.
-        let chained = format!("ls && cd {} && cat x", sibling.display());
-        let out2 = exec.execute(&call("bash", json!({ "command": chained })));
-        assert!(
-            out2.contains("escapes the sandbox"),
-            "chained absolute cd must be rejected: {out2}"
-        );
-
-        // Relative navigation inside the workdir stays allowed (no rejection).
-        fs::create_dir_all(mine.join("lib")).unwrap();
-        let ok = exec.execute(&call("bash", json!({ "command": "cd lib && pwd" })));
-        assert!(
-            !ok.contains("escapes the sandbox"),
-            "relative cd must be allowed: {ok}"
-        );
-
-        // An absolute cd that stays INSIDE the workdir is allowed.
-        let inside = format!("cd {} && pwd", mine.join("lib").display());
-        let ok2 = exec.execute(&call("bash", json!({ "command": inside })));
-        assert!(
-            !ok2.contains("escapes the sandbox"),
-            "absolute cd inside workdir must be allowed: {ok2}"
-        );
     }
 
     #[test]
@@ -1099,10 +732,12 @@ mod tests {
             let workdir =
                 boot_workdir(work_root.path(), "inst_route", staged.path(), None).unwrap();
             // bash via run_captured (combined_timeout path).
-            let exec = SandboxToolExecutor::new(workdir.clone(), 30, None);
-            let bashed = exec.execute(&call("bash", json!({"cmd": "echo ROUTE_MARKER"})));
+            let mut cmd = Command::new("bash");
+            cmd.args(["-lc", "echo ROUTE_MARKER"]).current_dir(&workdir);
+            let (out, code, killed) = run_captured(cmd, Duration::from_secs(30)).unwrap();
+            let bashed = format!("{}|{code:?}|{killed}", String::from_utf8_lossy(&out));
             // edit + git diff via diff_workdir (plain_output path).
-            exec.execute(&call("write", json!({"path": "a.txt", "content": "y\n"})));
+            fs::write(workdir.join("a.txt"), "y\n").unwrap();
             let diff = diff_workdir(&workdir).unwrap();
             // Normalize the workdir-specific temp path out of outputs.
             (
@@ -1115,7 +750,7 @@ mod tests {
         let (bash_routed, diff_routed) = run_once(true);
 
         assert!(
-            bash_routed.contains("ROUTE_MARKER") && bash_routed.contains("[exit 0]"),
+            bash_routed.contains("ROUTE_MARKER") && bash_routed.contains("Some(0)|false"),
             "routed bash: {bash_routed}"
         );
         assert_eq!(bash_direct, bash_routed, "bash output must match direct");

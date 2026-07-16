@@ -1913,12 +1913,6 @@ pub(crate) struct TrainAgentOpdArgs {
     #[arg(long, value_name = "PATH")]
     pub(crate) metrics_out: Option<PathBuf>,
 
-    /// Sampling temperature for the held-out eval rollout (0.0 = greedy). Kept
-    /// separate from --rollout-temperature so eval is deterministic-ish while
-    /// training samples diversely.
-    #[arg(long, default_value_t = 0.0, value_parser = parse_temperature, allow_hyphen_values = true)]
-    pub(crate) eval_temperature: f32,
-
     /// Agent rollouts generated per task each round (best-of-N).
     #[arg(long, default_value_t = 4)]
     pub(crate) samples_per_prompt: usize,
@@ -1936,22 +1930,10 @@ pub(crate) struct TrainAgentOpdArgs {
     #[arg(long, value_enum, default_value_t = SyncArg::EveryGroup)]
     pub(crate) sync: SyncArg,
 
-    /// Max agent turns (tool sub-turns) per rollout.
-    #[arg(long, default_value_t = 30)]
-    pub(crate) max_turns: usize,
-
-    /// Max tokens the engine generates per agent sub-turn.
-    #[arg(long, default_value_t = 2048)]
-    pub(crate) max_tokens: usize,
-
     /// `PYTHONPATH` (sandbox-relative) for the bash tool + test runs, e.g.
     /// `lib:test`. Optional.
     #[arg(long, value_name = "PATH")]
     pub(crate) pythonpath: Option<String>,
-
-    /// Bash tool timeout (seconds).
-    #[arg(long, default_value_t = 150)]
-    pub(crate) bash_timeout_secs: u64,
 
     /// Test-run (scoring) timeout (seconds).
     #[arg(long, default_value_t = 300)]
@@ -1964,10 +1946,6 @@ pub(crate) struct TrainAgentOpdArgs {
     /// Cap on CE writeback pairs trained per round (unset = all accepted).
     #[arg(long, value_name = "N")]
     pub(crate) writeback_cap: Option<usize>,
-
-    /// CE writeback micro-batch size (amortizes host op-dispatch; bounds logit VRAM).
-    #[arg(long, default_value_t = 4)]
-    pub(crate) writeback_batch: usize,
 
     /// Sequence-window size for the masked single-trajectory CE writeback. Each
     /// window re-forwards the prefix up to its end and materializes only a
@@ -2003,57 +1981,12 @@ pub(crate) struct TrainAgentOpdArgs {
     #[arg(long, default_value_t = 1.0e-3)]
     pub(crate) value_lr: f32,
 
-    /// KV slots for the rollout engine (>1 batches sampling/eval; VRAM-gated).
-    #[arg(long, default_value_t = 2)]
-    pub(crate) rollout_num_slots: usize,
-
     /// Disable train-infer FP8 weight sharing (训推一体). Sharing is ON by default
     /// (the autograd student's frozen FP8 base points zero-copy at the rollout
     /// engine's resident base; graceful no-op for non-FP8 single-GPU). Pass
     /// --no-share-frozen-base to force the byte-identical two-copy load.
     #[arg(long, default_value_t = false)]
     pub(crate) no_share_frozen_base: bool,
-
-    /// Rollout sampling temperature (>0 for rejection-sampling diversity).
-    #[arg(long, default_value_t = 1.0, value_parser = parse_temperature, allow_hyphen_values = true)]
-    pub(crate) rollout_temperature: f32,
-
-    /// Enable Qwen3.x thinking for ALL rollouts (train + rescue + eval) —
-    /// think-on everywhere, never mixed (2026-06-20 precedent). Default off
-    /// (`/no_think` soft-switch appended: tool calls, no deliberation).
-    #[arg(long, default_value_t = false)]
-    pub(crate) think_rollouts: bool,
-
-    /// Budget-asymmetric self-rescue: a task with ZERO accepted samples gets
-    /// up to N extra rollouts at --rescue-max-tokens (stops at the first
-    /// accept). Bootstraps regimes where plain rejection sampling starves
-    /// (the real-repo 0-accept wall). 0 = off.
-    #[arg(long, default_value_t = 0, value_name = "N")]
-    pub(crate) rescue_samples: usize,
-
-    /// Per-sub-turn token budget for rescue rollouts (thinking needs room).
-    #[arg(long, default_value_t = 8192)]
-    pub(crate) rescue_max_tokens: usize,
-
-    /// Turn budget for rescue rollouts (0 = inherit --max-turns). Hard real-repo
-    /// tasks are turns-to-first-edit bound: they burn `max_turns` on on-target
-    /// investigation and never edit (empty diff → 0-accept), yet the same
-    /// teacher edits and passes at 20 turns (measured A/B 2026-07-08). Raising
-    /// tokens alone (the old rescue) tunes the wrong axis.
-    #[arg(long, default_value_t = 0, value_name = "N")]
-    pub(crate) rescue_max_turns: usize,
-
-    /// Rollout nucleus sampling threshold (1.0 disables top-p).
-    #[arg(long, default_value_t = 1.0)]
-    pub(crate) rollout_top_p: f32,
-
-    /// Rollout top-k filter (0 disables top-k).
-    #[arg(long, default_value_t = 0)]
-    pub(crate) rollout_top_k: i32,
-
-    /// Optional deterministic base rollout seed (per-sample = base + i).
-    #[arg(long)]
-    pub(crate) rollout_seed: Option<u64>,
 
     /// AdamW learning rate.
     #[arg(long, default_value_t = 1.0e-5)]
@@ -2164,8 +2097,11 @@ impl TrainAgentOpdArgs {
             ),
             UpdateStrategyArg::Grpo => UpdatePreset::grpo(),
             UpdateStrategyArg::Dapo => UpdatePreset::dapo(),
-            // Dr.GRPO's fixed normalizer = the rollout generation budget.
-            UpdateStrategyArg::DrGrpo => UpdatePreset::dr_grpo(self.max_turns * self.max_tokens),
+            // Dr.GRPO's fixed normalizer = the rollout generation budget
+            // (cc owns sampling/turns; the session token ceiling is the budget).
+            UpdateStrategyArg::DrGrpo => {
+                UpdatePreset::dr_grpo(train::cc_harness::CC_SESSION_TOKENS)
+            }
             UpdateStrategyArg::Gspo => UpdatePreset::gspo(),
             UpdateStrategyArg::Cispo => UpdatePreset::cispo(),
         }
