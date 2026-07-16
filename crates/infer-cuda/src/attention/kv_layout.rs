@@ -1,6 +1,14 @@
 use super::*;
 
 pub(super) const DSV4_PREFILL_QUERY_CHUNK: usize = 4096;
+
+/// Probe/pending row width of a compressor state: both halves when `overlap`.
+/// Single source for `Dsv4CompressorState::{new, device_bytes_for}` and
+/// `dsv4_compressor_fp32_max_width` — these MUST agree or the shared FP32
+/// scratch mis-sizes against its consumers.
+pub(crate) fn dsv4_compressor_width(head_dim: usize, overlap: bool) -> usize {
+    if overlap { 2 * head_dim } else { head_dim }
+}
 pub(crate) struct Dsv4CompressorState {
     pub(super) pending_kv: CudaSlice<half::bf16>,
     pub(super) pending_score: CudaSlice<half::bf16>,
@@ -30,7 +38,7 @@ impl Dsv4CompressorState {
         max_seq_len: usize,
         staging_ring: bool,
     ) -> Result<Self> {
-        let width = if overlap { 2 * head_dim } else { head_dim };
+        let width = dsv4_compressor_width(head_dim, overlap);
         let compressed_capacity = max_seq_len.div_ceil(ratio).max(1);
         let ring_rows = if staging_ring {
             DSV4_INDEXER_STAGING_RING_ROWS.min(compressed_capacity)
@@ -158,7 +166,7 @@ impl Dsv4CompressorState {
         staging_ring: bool,
     ) -> usize {
         let bf16 = std::mem::size_of::<half::bf16>();
-        let width = if overlap { 2 * head_dim } else { head_dim };
+        let width = dsv4_compressor_width(head_dim, overlap);
         let compressed_capacity = max_seq_len.div_ceil(ratio.max(1)).max(1);
         let ring_rows = if staging_ring {
             DSV4_INDEXER_STAGING_RING_ROWS.min(compressed_capacity)
@@ -211,16 +219,15 @@ impl Dsv4CompressorFp32Scratch {
     }
 
     /// Exact requested device bytes owned by this ONE model-wide scratch.
-    #[allow(dead_code)]
     pub(crate) fn device_bytes(&self) -> usize {
         (self.kv_raw.len() + self.score_raw.len()) * std::mem::size_of::<f32>()
     }
 }
 
 /// Max FP32-probe row width over every compressor `compressor_fp32_probe` can
-/// run: the main compressor (`2*head_dim` when overlap, i.e. cr<16, else
-/// `head_dim`) and the CSA indexer compressor (always overlap →
-/// `2*index_head_dim`). 0 ⇔ the model has no compressor layer (no scratch).
+/// run — MUST mirror the `Dsv4LayerAttentionState::new` gates: main compressor
+/// on `has_compressor()` (overlap ⇔ cr<16), indexer compressor on
+/// `has_indexer()` (always overlap). 0 ⇔ no compressor layer (no scratch).
 pub(crate) fn dsv4_compressor_fp32_max_width(
     config: &DeepSeekV4Config,
     layers: impl IntoIterator<Item = (DeepSeekV4AttentionMode, usize)>,
@@ -229,16 +236,12 @@ pub(crate) fn dsv4_compressor_fp32_max_width(
         .into_iter()
         .map(|(mode, compress_ratio)| {
             let main = if mode.has_compressor() {
-                if compress_ratio < 16 {
-                    2 * config.head_dim
-                } else {
-                    config.head_dim
-                }
+                dsv4_compressor_width(config.head_dim, compress_ratio < 16)
             } else {
                 0
             };
-            let indexer = if mode == DeepSeekV4AttentionMode::CompressedSparse {
-                2 * config.index_head_dim
+            let indexer = if mode.has_indexer() {
+                dsv4_compressor_width(config.index_head_dim, true)
             } else {
                 0
             };
