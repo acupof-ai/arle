@@ -1,0 +1,21 @@
+docs/plans/2026-07-16-agent-rl-unified-infra.md
+  s_66e11f4120e959::t_da2308c815378a 241-268,281
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "8186326fe710a159a64e9e3f9f1ca3be99dd5238",
+  "prompts": {},
+  "sessions": {
+    "s_66e11f4120e959": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f69ae-2f2a-7273-9bf3-b3201418c0d3",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
