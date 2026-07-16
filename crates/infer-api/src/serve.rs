@@ -329,6 +329,58 @@ fn bind_and_serve(
     })
 }
 
+/// HTTP server running on a background thread ([`serve_router_on_thread`]).
+#[cfg(any(
+    feature = "metal",
+    feature = "cuda",
+    feature = "hip",
+    feature = "vulkan",
+    feature = "cpu"
+))]
+pub struct ServeThread {
+    join: std::thread::JoinHandle<Result<()>>,
+    shutdown: infer_server::ServeShutdown,
+}
+
+#[cfg(any(
+    feature = "metal",
+    feature = "cuda",
+    feature = "hip",
+    feature = "vulkan",
+    feature = "cpu"
+))]
+impl ServeThread {
+    /// Request graceful shutdown and join, returning the serve loop's result
+    /// (e.g. a bind failure surfaces here).
+    pub fn shutdown(self) -> Result<()> {
+        self.shutdown.request();
+        self.join
+            .join()
+            .map_err(|_| anyhow::anyhow!("serve thread panicked"))?
+    }
+}
+
+/// Serve an already-built router (e.g. [`crate::LoadedInferenceEngine::local_router`])
+/// on a background thread, leaving the caller free to keep driving the engine.
+/// Same serve loop as [`serve_http`] via [`bind_and_serve`].
+#[cfg(any(
+    feature = "metal",
+    feature = "cuda",
+    feature = "hip",
+    feature = "vulkan",
+    feature = "cpu"
+))]
+pub fn serve_router_on_thread(router: axum::Router, bind: &str, port: u16) -> Result<ServeThread> {
+    let shutdown = infer_server::ServeShutdown::new();
+    let thread_shutdown = shutdown.clone();
+    let bind = bind.to_owned();
+    let join = std::thread::Builder::new()
+        .name("arle-http-serve".to_string())
+        .spawn(move || bind_and_serve(&bind, port, router, "local router", thread_shutdown))
+        .context("spawn arle-http-serve thread")?;
+    Ok(ServeThread { join, shutdown })
+}
+
 /// Backend-absent build: report the same way `--doctor` does and return an error.
 #[cfg(not(any(
     feature = "metal",

@@ -656,7 +656,7 @@ impl BackendExecutor for EchoExecutor {
 /// rather than TCP. Pass `multimodal_kind` for VLM backends (Gemma4, DeepseekOcr,
 /// DiffusionGemma); text-only backends pass `None`.
 pub fn coordinator_local_router<E, K>(
-    serve: ServeHandle<E, K>,
+    serve: Arc<ServeHandle<E, K>>,
     tokenizer: tokenizer::OpenAiTokenizer,
     model: impl Into<String>,
     max_thinking_tokens: usize,
@@ -667,10 +667,8 @@ where
     K: infer_seam::KvPool + 'static,
 {
     use multiproc_relay::RelayCoordinator;
-    use std::sync::Arc;
 
     let (relay, engine_recv, engine_tx) = RelayCoordinator::new_local();
-    let serve = Arc::new(serve);
 
     let (multimodal_rx, coord_multimodal) = match multimodal_kind {
         Some(kind) => {
