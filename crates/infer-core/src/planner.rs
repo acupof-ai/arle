@@ -108,44 +108,67 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         }
     }
 
-    /// Repair a plan whose page demand exceeds `free_pages` so
-    /// `allocate_for_plan` cannot fail — a step-loop alloc error is FATAL (it
-    /// unwinds the whole TP worker group, #164). Cheapest loss first: shed
-    /// prefill chunks (a dropped chunk retries next tick with no state change,
-    /// the same deferral `apply_step_budget` performs), then preempt-requeue
-    /// decode victims down to an empty plan — each retraction FREES the
-    /// victim's pages (park or recompute, the #162 path), so the loop
-    /// terminates and later ticks fit. Inputs (lockstep host pool + plan) are
-    /// identical on every rank, so the repair stays SPMD-deterministic.
-    pub(crate) fn fit_plan_to_kv_pages(&mut self, plan: &mut ForwardPlan) {
+    /// Repair a plan whose page demand exceeds the pool's reclaimable
+    /// capacity so `allocate_for_plan` cannot fail — a step-loop alloc error
+    /// is FATAL (it unwinds the whole TP worker group, #164). Capacity counts
+    /// free PLUS cache-evictable pages: `alloc_with_prefix_reclaim` evicts the
+    /// radix LRU on demand, so radix-retained pages are evictable-but-not-free
+    /// and only demand beyond both would genuinely fail. Budgeting against
+    /// `free_pages` alone livelocked a warm cache (free=0 shed every prefill
+    /// chunk each tick forever) and cascaded preemptions whose freed pages
+    /// merely re-entered the cache. Cheapest loss first: shed demand-reducing
+    /// prefill chunks (a dropped chunk retries next tick with no state
+    /// change), then preempt-requeue decode victims down to an empty plan —
+    /// each retraction makes the victim's pages free or evictable (park or
+    /// recompute, the #162 path), so the loop terminates and later ticks fit.
+    pub(crate) fn fit_plan_to_kv_pages(&mut self, plan: &mut ForwardPlan) -> Result<()> {
         if !self.kv.is_active() {
-            return;
+            return Ok(());
         }
-        let shortfall = self
-            .plan_new_pages_needed(plan)
-            .saturating_sub(self.kv.free_pages());
-        if shortfall == 0 {
-            return;
+        // Rank-synced capacity: per-rank KV-tier residuals make the raw
+        // locals diverge, and a rank-local read here would diverge the
+        // shed/preempt decisions → divergent ForwardPlans → collective shape
+        // mismatch → TP hang. Induction: identical synced starting capacity +
+        // identical plan → identical decisions → pool mutations stay
+        // lockstep. Unconditional at this fixed call point (every rank with a
+        // non-idle plan reaches it): one small host collective per tick, the
+        // same price admission already pays; single-rank backends return
+        // `local` unchanged.
+        let mut capacity = self
+            .executor
+            .tp_sync_min(self.kv.free_pages() + self.kv.resident_evictable_pages())?;
+        if self.plan_new_pages_needed(plan) <= capacity {
+            return Ok(());
         }
-        // Radix-cached pages are reclaimable capacity: evict the shortfall
-        // BEFORE shedding, else free=0 with a warm cache trims every prefill
-        // row → idle plan → identical state next tick (permanent stall;
-        // `alloc_with_prefix_reclaim` is only reached by surviving rows).
-        self.evict_prefix_cache_for_pages(shortfall);
-        while self.plan_new_pages_needed(plan) > self.kv.free_pages()
-            && !plan.prefill_rows.is_empty()
-        {
-            plan.prefill_rows.pop();
+        // Shed only rows that reduce demand — a zero-demand row (fully
+        // prefix-reused) frees nothing and would be deferred for nothing.
+        while self.plan_new_pages_needed(plan) > capacity {
+            let Some(pos) = plan
+                .prefill_rows
+                .iter()
+                .rposition(|row| self.kv.append_pages_needed(row.slot, row.tokens.len()) > 0)
+            else {
+                break;
+            };
+            plan.prefill_rows.remove(pos);
         }
-        while self.plan_new_pages_needed(plan) > self.kv.free_pages() {
+        while self.plan_new_pages_needed(plan) > capacity {
             let Some(victim_pos) = self.retract_victim_pos(&plan.decode_rows) else {
                 break;
             };
             let victim_slot = plan.decode_rows[victim_pos].slot;
             self.requeue_preempted_decode(victim_slot);
             plan.decode_rows.remove(victim_pos);
+            // Re-sync: the victim's pages went free or cache-evictable, but
+            // tier demote acceptance is rank-local. Loop iterations are
+            // themselves lockstep (condition inputs identical on all ranks),
+            // so every rank issues the same number of collectives.
+            capacity = self
+                .executor
+                .tp_sync_min(self.kv.free_pages() + self.kv.resident_evictable_pages())?;
         }
         plan.mode = plan_mode(plan.prefill_rows.is_empty(), plan.decode_rows.is_empty());
+        Ok(())
     }
 
     fn retract_victim_pos(&self, decode_rows: &[DecodeRow]) -> Option<usize> {
