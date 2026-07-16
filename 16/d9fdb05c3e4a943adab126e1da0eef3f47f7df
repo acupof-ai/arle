@@ -1,0 +1,21 @@
+crates/train/src/cc_harness.rs
+  s_67038b17df7668::t_89955c55c62bf4 1-7,12-14,23-25,38-43,54,64-72,101,114-116,118-119,123-139,141-149,151-152,154-157,161-171,173-190,192,203,205,210-281,284-303,306-307,324-327
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "16d9fdb05c3e4a943adab126e1da0eef3f47f7df",
+  "prompts": {},
+  "sessions": {
+    "s_67038b17df7668": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c4b3468e-feff-42b1-aa89-1f360f19b20b",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
