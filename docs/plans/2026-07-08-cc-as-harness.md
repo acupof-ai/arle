@@ -92,9 +92,11 @@ for debugging/scoring; training records come from the **server-side**
 `--dump-messages-dir` (§1), not this file.
 
 ### 4. One agent, two scorers (task set differs, agent identical)
-- **SWE-Pro** (OPD substrate): `scripts/cc_swe_baseline.py` already IS this —
-  boot the staged tree → `claude` headless → `sandbox.rs::score_workdir`
-  (non-empty `git diff` ∧ `test_patch` + `pytest <fail_to_pass>` exit 0).
+- **SWE-Pro** (OPD substrate): the cc harness inside `arle train agent-opd`
+  (`crates/train/src/cc_harness.rs`; formerly `scripts/cc_swe_baseline.py`,
+  deleted 2026-07-16 P3) IS this — boot the staged tree → `claude` headless →
+  `sandbox.rs::score_workdir` (non-empty `git diff` ∧ `test_patch` +
+  `pytest <fail_to_pass>` exit 0).
 - **terminal-bench-core** (68 benign tasks, general eval): the built-in
   `claude-code` agent does **not** work as-is — its `_env` forwards only
   `ANTHROPIC_API_KEY` + `ANTHROPIC_MODEL` (no `ANTHROPIC_BASE_URL`, no
@@ -108,21 +110,21 @@ for debugging/scoring; training records come from the **server-side**
 
 ### 5. OPD loop — the smooth finish
 ```
-serve(LoRA, --dump-messages-dir D) → cc_swe_baseline over the train set
-   → filter D to passing tasks → arle train cc-convert --dump-dir D → masked-CE
+serve(LoRA, --dump-messages-dir D) → cc rollout over the train set
+   → filter D to passing tasks → cc-convert (in-memory) → masked-CE
    → new LoRA → repeat
 ```
-`cc-convert` (`train_cli.rs:87` → `train::cc_convert::run_cc_convert`) reads the
-server-side message dump and replaces `terminus_to_records.py`. The whole
-agentic-OPD loop moves from research-code
-terminus to the production CC loop — the harness stops being a confound in the
-capability-lift measurement.
+Now one command: `arle train agent-opd` runs this loop in-process
+(2026-07-16 plan P2). `cc-convert` reads the server-side message dump and
+replaces `terminus_to_records.py`. The whole agentic-OPD loop moves from
+research-code terminus to the production CC loop — the harness stops being a
+confound in the capability-lift measurement.
 
 ## Retire (deletion-style)
 `terminus` agent invocations, `scripts/terminus_to_records.py`, the litellm
 `-a terminus -m openai/…` path in `terminal_bench_eval.sh`, and the terminus
-calls in `tbench_*.sh` — all replaced by `--agent claude-code` or
-`cc_swe_baseline.py`.
+calls in `tbench_*.sh` — all replaced by `--agent claude-code` or the
+`arle train agent-opd` cc harness.
 
 ## End-to-end refinements (found in the chain audit)
 
@@ -186,8 +188,8 @@ permission block) and dropping `--max-turns` (no such flag). `cc-convert
 
 **Residual:** installing full `terminal-bench` on the pod is painful (PyPI egress
 ~58 kB/s, litellm timed out mid-pull) — pre-stage wheels or `tn push`. Only
-needed for the tb-core lane; the SWE-Pro OPD lane (`cc_swe_baseline.py`) needs no
-tb install.
+needed for the tb-core lane; the SWE-Pro OPD lane (`arle train agent-opd`) needs
+no tb install.
 
 Pod artifacts: `/host/npm-global/bin/claude` (2.1.204),
 `/host/cc_smoke/{serve.log,dumps/,records.jsonl}`.
@@ -197,6 +199,7 @@ Pod artifacts: `/host/npm-global/bin/claude` (2.1.204),
 - `crates/infer-server/src/coordinator.rs:220-225` — routes `/v1/messages`,
   `/v1/messages/count_tokens`, `/v1/models`; `--dump-messages-dir` at :41-56.
 - `crates/cli/src/train_cli.rs:87` — `arle train cc-convert` (dump → records).
-- `scripts/cc_swe_baseline.py` — CC-as-harness SWE driver + scorer.
+- `crates/train/src/cc_harness.rs` — CC-as-harness SWE driver + scorer
+  (ported from `scripts/cc_swe_baseline.py`, deleted 2026-07-16 P3).
 - `docs/plans/2026-07-03-agentic-opd-27b-capability-curve.md` — phase-2 OPD context.
 - Memory: `reference_cc_as_harness_pod_recipe`.
