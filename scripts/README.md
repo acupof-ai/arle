@@ -107,9 +107,6 @@ directory unless noted.
 | `opd_capability_curve.py` | OPD capability curve generator. |
 | `opd_security_filter.py` | OPD rollout security content filter. |
 | `h20_teacher_student_opd_curve.sh` | H20 teacher-student OPD curve. |
-| `cc_opd_loop.sh` | CC-harness OPD training loop. |
-| `cc_run.sh` | CC-harness runner. |
-| `cc_swe_baseline.py` | CC-harness SWE baseline. |
 | `clean_opd_corpora.py` | Clean and deduplicate OPD training corpora. |
 | `fetch_opd_corpora.py` | Fetch OPD training corpora. |
 | `filter_inband.py` | Filter in-band calibrated task pool. |
