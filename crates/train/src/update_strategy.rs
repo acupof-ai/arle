@@ -1,21 +1,21 @@
-//! Pluggable OPD policy-update strategy (SAO Phase 1). The rollout/scoring
-//! harness is strategy-agnostic; each algorithm is one closed-set enum variant
-//! with a static-dispatch `update<O: Optimizer>` (a `dyn` trait would force the
-//! generic `Optimizer` behind `dyn`). Extend = one new variant.
+//! Data-driven OPD policy-update seam. An algorithm is a [`UpdatePreset`] —
+//! six orthogonal fields over ONE update path — not a new enum arm; the named
+//! constructors below are the algorithm table. The rollout/scoring harness is
+//! preset-agnostic: it only reads [`UpdatePreset::needs`].
 //!
-//! See `docs/plans/2026-07-11-opd-pluggable-update-strategy.md`.
+//! See docs/plans/2026-07-16-agent-rl-unified-infra.md §C.
 
-use autograd::ops::fused_linear_distill::WeightForm;
+use autograd::ops::fused_linear_distill::{PgStats, WeightForm, pg_token_weight};
 use autograd::{TensorId, TensorStore, optim::Optimizer};
 
 use crate::opd::{
-    OpdError, Result, ValueCritic, WritebackLoss, masked_writeback_ce_step_dispatch,
-    masked_writeback_step,
+    OpdError, Result, ValueCritic, WritebackLoss, capture_rollout_logprobs,
+    masked_writeback_ce_step_dispatch, masked_writeback_step,
 };
 use crate::qwen35::Qwen35Model;
 
-/// What the harness must collect for a strategy: whether to keep failing
-/// trajectories, and whether to capture π_rollout logprobs before the update.
+/// What the harness must collect for a preset: whether to keep failing
+/// trajectories, and whether to capture π_behavior logprobs before the update.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RolloutNeeds {
     pub keep_failing: bool,
@@ -23,50 +23,253 @@ pub struct RolloutNeeds {
 }
 
 /// One scored rollout: the verl-style `(prompt, response, mask)` record plus its
-/// scalar reward and (for advantage-weighted strategies) the captured π_rollout
-/// logprobs — one per masked target position, `Some` iff `needs.rollout_logprobs`.
+/// scalar reward, group key, and (for ratio-weighted presets) the captured
+/// behavior-policy logprobs.
 #[derive(Clone, Debug)]
 pub struct ScoredTrajectory {
     pub prompt_ids: Vec<u32>,
     pub response_ids: Vec<u32>,
     /// Skip-Observation mask: `1` = LLM token, `0` = tool/environment token.
     pub response_mask: Vec<u8>,
-    /// pytest reward: `1.0` pass / `0.0` fail.
+    /// Graded pytest reward in [0,1]; pass ⇔ `reward >= 1.0`.
     pub reward: f32,
+    /// π_behavior logprob per masked target position — the IS-ratio denominator
+    /// (the policy the trajectory was SAMPLED from; equals πθ at V0 today,
+    /// stale-θ under future async staleness). `Some` iff `needs.rollout_logprobs`.
     pub rollout_logprobs: Option<Vec<f32>>,
+    /// Per-prompt group key (task index) for [`Scope::Group`] baselines.
+    pub group_id: usize,
+    /// Hit the turn/token budget (input to the DAPO overlong filter).
+    pub truncated: bool,
 }
 
-/// Closed set of policy-update algorithms, selected once by a CLI flag.
+/// Which scored trajectories enter the update.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SampleFilter {
+    /// Full passes only (`reward >= 1.0` — all fail_to_pass green).
+    PassOnly,
+    KeepAll,
+    /// DAPO dynamic sampling: drop zero-reward-variance groups AND truncated
+    /// trajectories (the paper's overlong filter travels with it).
+    DropZeroAdvGroup,
+    /// Drop budget-truncated trajectories only.
+    DropTruncated,
+}
+
+/// Advantage baseline scope for [`Advantage::Mean`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scope {
+    Batch,
+    /// Per-prompt group ([`ScoredTrajectory::group_id`]).
+    Group,
+}
+
+/// Advantage estimator (per-trajectory scalar unless GAE).
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum UpdateStrategy {
-    /// Current default: reject (reward ≤ 0), masked CE on the survivors.
-    RejectionCe,
-    /// SAO Phase 1: DIS (per-token PG, clipped importance-ratio gate) with a
-    /// batch-centered binary advantage.
-    SaoDis { eps_low: f32, eps_high: f32 },
-    /// SAO Phase 2: DIS with per-token Skip-Obs GAE advantages from a learned
-    /// value critic (γ/λ live on the [`ValueCritic`]). The critic supplies the
-    /// baseline (no batch-mean centering) and per-token credit; the caller passes
-    /// `Some(critic)` to [`UpdateStrategy::update`].
-    SaoValue { eps_low: f32, eps_high: f32 },
+pub enum Advantage {
+    None,
+    /// `A_i = reward_i − mean(scope rewards)`, `/ (std + 1e-6)` if `std_norm`.
+    Mean {
+        scope: Scope,
+        std_norm: bool,
+    },
+    /// Learned value critic + Skip-Obs GAE (per-token credit).
+    ValueGae {
+        gamma: f32,
+        lam: f32,
+    },
 }
 
-impl UpdateStrategy {
-    pub fn needs(&self) -> RolloutNeeds {
+/// Importance-ratio granularity vs the behavior policy π_b.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RatioGrain {
+    None,
+    PerToken,
+    /// Length-normalized sequence ratio (GSPO): `exp(mean_t(logπθ − logπ_b))`,
+    /// clipped at the sequence level and broadcast over tokens.
+    PerSequence,
+}
+
+/// Clip applied to the (detached) ratio before it weights the loss.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ClipForm {
+    /// Binary keep/drop gate: `1` iff `(1−lo) < r < (1+hi)` (SAO DIS).
+    HardGate { lo: f32, hi: f32 },
+    /// `clamp(r, 1−lo, 1+hi)` as the weight factor (CISPO family).
+    SoftClamp { lo: f32, hi: f32 },
+}
+
+impl ClipForm {
+    fn weight_form(self) -> WeightForm {
         match self {
-            Self::RejectionCe => RolloutNeeds {
-                keep_failing: false,
-                rollout_logprobs: false,
+            Self::HardGate { lo, hi } => WeightForm::HardGate { lo, hi },
+            Self::SoftClamp { lo, hi } => WeightForm::SoftClamp { lo, hi },
+        }
+    }
+}
+
+/// Loss normalization + optimizer-step grain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Aggregation {
+    /// Token-mean per trajectory, one optimizer step per trajectory.
+    PerSeqTokenMean,
+    /// Token-mean over the whole batch (÷ `norm_const` if set, else the batch's
+    /// masked-token count); grads accumulate, ONE step per batch.
+    GlobalTokenMean { norm_const: Option<usize> },
+}
+
+/// k3 KL(π_b‖πθ) regularizer folded into the per-token weight; the reference is
+/// the rollout/behavior policy (a teacher reference is the designed follow-up).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct KlReg {
+    pub coef: f32,
+}
+
+/// One policy-update algorithm as data. Extend = a new constructor value.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct UpdatePreset {
+    pub filter: SampleFilter,
+    pub advantage: Advantage,
+    pub ratio: RatioGrain,
+    pub clip: ClipForm,
+    pub agg: Aggregation,
+    pub kl: Option<KlReg>,
+}
+
+impl UpdatePreset {
+    /// Shipped default: reject failures, masked CE on full passes.
+    pub fn rejection_ce() -> Self {
+        Self {
+            filter: SampleFilter::PassOnly,
+            advantage: Advantage::None,
+            ratio: RatioGrain::None,
+            // Unused: ratio None routes to the fused CE op.
+            clip: ClipForm::HardGate { lo: 0.0, hi: 0.0 },
+            agg: Aggregation::PerSeqTokenMean,
+            kl: None,
+        }
+    }
+
+    /// SAO Phase 1: batch-centered advantage, hard-gated per-token IS ratio.
+    pub fn sao_dis(lo: f32, hi: f32) -> Self {
+        Self {
+            filter: SampleFilter::KeepAll,
+            advantage: Advantage::Mean {
+                scope: Scope::Batch,
+                std_norm: false,
             },
-            Self::SaoDis { .. } | Self::SaoValue { .. } => RolloutNeeds {
-                keep_failing: true,
-                rollout_logprobs: true,
+            ratio: RatioGrain::PerToken,
+            clip: ClipForm::HardGate { lo, hi },
+            agg: Aggregation::PerSeqTokenMean,
+            kl: None,
+        }
+    }
+
+    /// SAO Phase 2: Skip-Obs GAE advantages from a learned value critic.
+    pub fn sao_value(lo: f32, hi: f32, gamma: f32, lam: f32) -> Self {
+        Self {
+            advantage: Advantage::ValueGae { gamma, lam },
+            ..Self::sao_dis(lo, hi)
+        }
+    }
+
+    /// GRPO (Shao et al. 2024): group-normalized advantage, clamped token ratio.
+    pub fn grpo() -> Self {
+        Self {
+            filter: SampleFilter::KeepAll,
+            advantage: Advantage::Mean {
+                scope: Scope::Group,
+                std_norm: true,
             },
+            ratio: RatioGrain::PerToken,
+            clip: ClipForm::SoftClamp { lo: 0.2, hi: 0.2 },
+            agg: Aggregation::PerSeqTokenMean,
+            kl: None,
+        }
+    }
+
+    /// DAPO (Yu et al. 2025): clip-higher 0.2/0.28, dynamic sampling + overlong
+    /// filter, no std norm, token-level (batch token-mean) loss, no KL.
+    pub fn dapo() -> Self {
+        Self {
+            filter: SampleFilter::DropZeroAdvGroup,
+            advantage: Advantage::Mean {
+                scope: Scope::Group,
+                std_norm: false,
+            },
+            clip: ClipForm::SoftClamp { lo: 0.2, hi: 0.28 },
+            agg: Aggregation::GlobalTokenMean { norm_const: None },
+            ..Self::grpo()
+        }
+    }
+
+    /// Dr.GRPO (Liu et al. 2025): GRPO minus its length/std biases — no std
+    /// norm, fixed-constant normalizer (the generation budget).
+    pub fn dr_grpo(norm_const: usize) -> Self {
+        Self {
+            advantage: Advantage::Mean {
+                scope: Scope::Group,
+                std_norm: false,
+            },
+            agg: Aggregation::GlobalTokenMean {
+                norm_const: Some(norm_const),
+            },
+            ..Self::grpo()
+        }
+    }
+
+    /// GSPO (Zheng et al. 2025): sequence-level ratio; paper clip 3e-4/4e-4.
+    pub fn gspo() -> Self {
+        Self {
+            ratio: RatioGrain::PerSequence,
+            clip: ClipForm::SoftClamp { lo: 3e-4, hi: 4e-4 },
+            ..Self::grpo()
+        }
+    }
+
+    /// CISPO (MiniMax-M1 2025): detached clamped-IS weight, one-sided (lo=1 →
+    /// floor 0, no lower clip); the upper bound mirrors the licensed SAO-DIS
+    /// bound (the paper leaves ε_high^IS workload-tuned). Batch token-mean.
+    pub fn cispo() -> Self {
+        Self {
+            clip: ClipForm::SoftClamp { lo: 1.0, hi: 3.0 },
+            agg: Aggregation::GlobalTokenMean { norm_const: None },
+            ..Self::grpo()
+        }
+    }
+
+    /// Derived mechanically from the preset fields.
+    pub fn needs(&self) -> RolloutNeeds {
+        RolloutNeeds {
+            keep_failing: self.filter != SampleFilter::PassOnly,
+            rollout_logprobs: self.ratio != RatioGrain::None,
+        }
+    }
+
+    /// True when the caller must build (and pass) a [`ValueCritic`].
+    pub fn needs_value_critic(&self) -> bool {
+        matches!(self.advantage, Advantage::ValueGae { .. })
+    }
+
+    fn filter_batch<'a>(&self, batch: &'a [ScoredTrajectory]) -> Vec<&'a ScoredTrajectory> {
+        match self.filter {
+            SampleFilter::PassOnly => batch.iter().filter(|t| t.reward >= 1.0).collect(),
+            SampleFilter::KeepAll => batch.iter().collect(),
+            SampleFilter::DropTruncated => batch.iter().filter(|t| !t.truncated).collect(),
+            SampleFilter::DropZeroAdvGroup => {
+                // Variance judged on the group as scored (before truncation drop).
+                let live = |t: &ScoredTrajectory| {
+                    batch
+                        .iter()
+                        .any(|o| o.group_id == t.group_id && o.reward != t.reward)
+                };
+                batch.iter().filter(|t| !t.truncated && live(t)).collect()
+            }
         }
     }
 
     /// Apply one round's update over `batch`, returning the mean per-trajectory
-    /// loss (same reduction as the pre-strategy per-trajectory writeback loop).
+    /// loss (same reduction as the pre-preset per-trajectory writeback loop).
     #[allow(clippy::too_many_arguments)]
     pub fn update<O: Optimizer>(
         &self,
@@ -80,213 +283,153 @@ impl UpdateStrategy {
         window: usize,
         store: &mut TensorStore,
     ) -> Result<f32> {
-        match self {
-            Self::RejectionCe => self.update_rejection_ce(
-                batch, student, all_params, trainable, opt, vocab, window, store,
-            ),
-            Self::SaoDis { eps_low, eps_high } => self.update_sao_dis(
-                batch, *eps_low, *eps_high, student, all_params, trainable, opt, vocab, window,
-                store,
-            ),
-            Self::SaoValue { eps_low, eps_high } => {
-                let critic = critic.ok_or_else(|| {
-                    OpdError::InvalidInput(
-                        "SaoValue update requires a ValueCritic (caller must pass Some)".to_owned(),
-                    )
-                })?;
-                self.update_sao_value(
-                    batch, *eps_low, *eps_high, student, all_params, trainable, opt, critic, vocab,
-                    window, store,
-                )
-            }
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn update_rejection_ce<O: Optimizer>(
-        &self,
-        batch: &[ScoredTrajectory],
-        student: &Qwen35Model,
-        all_params: &[TensorId],
-        trainable: &[TensorId],
-        opt: &mut O,
-        vocab: usize,
-        window: usize,
-        store: &mut TensorStore,
-    ) -> Result<f32> {
-        let mut loss_sum = 0.0f32;
-        let mut steps = 0usize;
-        for traj in batch.iter().filter(|t| t.reward > 0.0) {
-            // Dispatch (not `masked_writeback_step(Ce)` directly) so the default
-            // path stays byte-identical to the prior closure, honoring the
-            // `--writeback-frozen-prompt-kv` opt-in as before.
-            let loss = masked_writeback_ce_step_dispatch(
-                student,
-                all_params,
-                trainable,
-                opt,
-                &traj.prompt_ids,
-                &traj.response_ids,
-                &traj.response_mask,
-                vocab,
-                window,
-                store,
-            )?;
-            loss_sum += loss;
-            steps += 1;
-        }
-        Ok(if steps > 0 {
-            loss_sum / steps as f32
-        } else {
-            0.0
-        })
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn update_sao_dis<O: Optimizer>(
-        &self,
-        batch: &[ScoredTrajectory],
-        eps_low: f32,
-        eps_high: f32,
-        student: &Qwen35Model,
-        all_params: &[TensorId],
-        trainable: &[TensorId],
-        opt: &mut O,
-        vocab: usize,
-        window: usize,
-        store: &mut TensorStore,
-    ) -> Result<f32> {
-        if batch.is_empty() {
+        let survivors = self.filter_batch(batch);
+        if survivors.is_empty() {
             return Ok(0.0);
         }
-        // Batch-centered binary advantage: A_i = reward_i − mean(reward).
-        let mean_reward = batch.iter().map(|t| t.reward).sum::<f32>() / batch.len() as f32;
-
-        let mut loss_sum = 0.0f32;
-        let mut steps = 0usize;
-        for traj in batch {
-            let advantage = traj.reward - mean_reward;
-            // No signal → no update. Binary rewards center to exactly 0 when the
-            // batch is all-pass or all-fail; stepping anyway lets AdamW weight
-            // decay / momentum drift the weights on zero gradient.
-            if advantage == 0.0 {
-                continue;
-            }
-            let rollout_logprobs = traj.rollout_logprobs.as_deref().ok_or_else(|| {
-                OpdError::InvalidInput(
-                    "SaoDis update requires rollout_logprobs (harness must capture π_rollout \
-                     when needs.rollout_logprobs)"
-                        .to_owned(),
-                )
-            })?;
-            // Constant per-token weight (batch-centered scalar broadcast to
-            // every masked position), token-meaned (÷ masked count) to mirror
-            // CE's 1/N; SaoValue supplies Skip-Obs GAE instead.
-            let n = rollout_logprobs.len().max(1) as f32;
-            let weights = vec![advantage / n; rollout_logprobs.len()];
-            let (loss, _stats) = masked_writeback_step(
-                WritebackLoss::Pg {
-                    rollout_logprobs,
-                    weight: &weights,
-                    form: WeightForm::HardGate {
-                        lo: eps_low,
-                        hi: eps_high,
-                    },
-                    kl_coef: 0.0,
-                },
-                student,
-                all_params,
-                trainable,
-                opt,
-                true,
-                &traj.prompt_ids,
-                &traj.response_ids,
-                &traj.response_mask,
-                vocab,
-                window,
-                store,
-            )?;
-            loss_sum += loss;
-            steps += 1;
+        if self.ratio == RatioGrain::None {
+            return update_ce(
+                &survivors, student, all_params, trainable, opt, vocab, window, store,
+            );
         }
-        Ok(if steps > 0 {
-            loss_sum / steps as f32
-        } else {
-            0.0
-        })
+        self.update_pg(
+            &survivors, student, all_params, trainable, opt, critic, vocab, window, store,
+        )
     }
 
-    /// SAO Phase 2: per-trajectory Skip-Obs GAE from the critic → per-token DIS
-    /// PG on the policy, then one MSE step on the critic. No batch-mean centering
-    /// (the critic IS the baseline). At cold start V≈0 so failing trajectories
-    /// (reward 0) get ~0 advantage — degrading gracefully to rejection-CE — and
-    /// gain a negative signal only as the critic learns to predict >0 on them.
+    /// Weighted policy-gradient path: per-trajectory detached weights =
+    /// advantage × aggregation norm × (seq-ratio factor for GSPO), the token
+    /// ratio gate applied inside the fused op per `clip`.
     #[allow(clippy::too_many_arguments)]
-    fn update_sao_value<O: Optimizer>(
+    fn update_pg<O: Optimizer>(
         &self,
-        batch: &[ScoredTrajectory],
-        eps_low: f32,
-        eps_high: f32,
+        survivors: &[&ScoredTrajectory],
         student: &Qwen35Model,
         all_params: &[TensorId],
         trainable: &[TensorId],
         opt: &mut O,
-        critic: &mut ValueCritic,
+        mut critic: Option<&mut ValueCritic>,
         vocab: usize,
         window: usize,
         store: &mut TensorStore,
     ) -> Result<f32> {
-        let mut loss_sum = 0.0f32;
-        let mut steps = 0usize;
-        // Critic health telemetry — the load-bearing question for Phase 2: is
-        // V(s) learning (MSE ↓) and producing non-trivial credit (|adv| > 0)? A
-        // null result is unattributable without it.
-        let mut mse_sum = 0.0f32;
-        let mut adv_abs_sum = 0.0f32;
-        let mut adv_tokens = 0usize;
+        let scalar_advs: Vec<f32> = match self.advantage {
+            Advantage::Mean { scope, std_norm } => centered_advantages(survivors, scope, std_norm),
+            // GAE supplies per-token credit below; None = uniform PG weight.
+            Advantage::ValueGae { .. } => Vec::new(),
+            Advantage::None => vec![1.0; survivors.len()],
+        };
+        if self.needs_value_critic() && critic.is_none() {
+            return Err(OpdError::InvalidInput(
+                "ValueGae update requires a ValueCritic (caller must pass Some)".to_owned(),
+            ));
+        }
         // The policy writeback's `cleanup_after_backward` frees every live tensor
         // not in `all_model_params`; the critic weight isn't a student param, so
         // it must ride in this keep-set (kept, NOT stepped — `trainable` is still
         // LoRA-only) or `critic.update` below hits a freed weight.
-        let mut all_with_critic = all_params.to_vec();
-        all_with_critic.extend_from_slice(critic.param_ids());
-        for traj in batch {
+        let all_with_critic: Vec<TensorId> = match &critic {
+            Some(c) => all_params
+                .iter()
+                .copied()
+                .chain(c.param_ids().iter().copied())
+                .collect(),
+            None => Vec::new(),
+        };
+        let params = if critic.is_some() {
+            all_with_critic.as_slice()
+        } else {
+            all_params
+        };
+
+        // GlobalTokenMean denominator: the surviving batch's masked-token count
+        // (zero-advantage trajectories contribute 0 grad either way).
+        let batch_tokens: usize = survivors
+            .iter()
+            .map(|t| t.rollout_logprobs.as_ref().map_or(0, Vec::len))
+            .sum();
+        let step_each = matches!(self.agg, Aggregation::PerSeqTokenMean);
+        let kl_coef = self.kl.map_or(0.0, |k| k.coef);
+
+        let mut loss_sum = 0.0f32;
+        let mut steps = 0usize;
+        let mut stats = PgStats::default();
+        // Critic health telemetry: is V(s) learning (MSE ↓) and producing
+        // non-trivial credit (|adv| > 0)? A null result is unattributable without it.
+        let mut mse_sum = 0.0f32;
+        let mut adv_abs_sum = 0.0f32;
+        let mut adv_tokens = 0usize;
+
+        for (i, traj) in survivors.iter().enumerate() {
             let rollout_logprobs = traj.rollout_logprobs.as_deref().ok_or_else(|| {
                 OpdError::InvalidInput(
-                    "SaoValue update requires rollout_logprobs (harness must capture π_rollout \
-                     when needs.rollout_logprobs)"
+                    "ratio-weighted update requires rollout_logprobs (harness must capture \
+                     π_behavior when needs.rollout_logprobs)"
                         .to_owned(),
                 )
             })?;
-            let (advantages, returns) = critic.advantages(
-                student,
-                &traj.prompt_ids,
-                &traj.response_ids,
-                &traj.response_mask,
-                traj.reward,
-                store,
-            )?;
+            let (advantages, returns) = match critic.as_deref_mut() {
+                Some(c) => c.advantages(
+                    student,
+                    &traj.prompt_ids,
+                    &traj.response_ids,
+                    &traj.response_mask,
+                    traj.reward,
+                    store,
+                )?,
+                None => (vec![scalar_advs[i]; rollout_logprobs.len()], Vec::new()),
+            };
             if advantages.is_empty() {
                 continue; // no LLM tokens to train
             }
-            // Token-mean the per-token GAE weights (÷ masked count), as CE's 1/N.
-            let n = advantages.len() as f32;
-            let weights: Vec<f32> = advantages.iter().map(|a| a / n).collect();
-            let (loss, _stats) = masked_writeback_step(
+            // No signal → no update: stepping on zero advantage lets AdamW weight
+            // decay / momentum drift the weights on zero gradient.
+            if critic.is_none() && scalar_advs[i] == 0.0 {
+                continue;
+            }
+
+            // Token-mean the PG objective, mirroring CE's 1/N: per-trajectory
+            // masked count, or the batch/fixed constant for GlobalTokenMean.
+            let norm = match self.agg {
+                Aggregation::PerSeqTokenMean => advantages.len(),
+                Aggregation::GlobalTokenMean { norm_const } => norm_const.unwrap_or(batch_tokens),
+            }
+            .max(1) as f32;
+            let mut weights: Vec<f32> = advantages.iter().map(|a| a / norm).collect();
+
+            let form = match self.ratio {
+                RatioGrain::PerToken => self.clip.weight_form(),
+                RatioGrain::PerSequence => {
+                    // GSPO: seq ratio at CURRENT θ (one tape-off capture pass),
+                    // clipped at the sequence level, broadcast into the weights.
+                    let current_lp = capture_rollout_logprobs(
+                        student,
+                        &traj.prompt_ids,
+                        &traj.response_ids,
+                        &traj.response_mask,
+                        store,
+                    )?;
+                    let s = seq_ratio_weight(&current_lp, rollout_logprobs, self.clip)?;
+                    for w in &mut weights {
+                        *w *= s;
+                    }
+                    WeightForm::Precomputed
+                }
+                RatioGrain::None => unreachable!("CE path handled in update()"),
+            };
+
+            let (loss, traj_stats) = masked_writeback_step(
                 WritebackLoss::Pg {
                     rollout_logprobs,
                     weight: &weights,
-                    form: WeightForm::HardGate {
-                        lo: eps_low,
-                        hi: eps_high,
-                    },
-                    kl_coef: 0.0,
+                    form,
+                    kl_coef: kl_coef / norm,
                 },
                 student,
-                &all_with_critic,
+                params,
                 trainable,
                 opt,
-                true,
+                step_each,
                 &traj.prompt_ids,
                 &traj.response_ids,
                 &traj.response_mask,
@@ -294,27 +437,43 @@ impl UpdateStrategy {
                 window,
                 store,
             )?;
-            // Fit the critic toward the observed returns (frozen-attention MSE).
-            let mse = critic.update(
-                student,
-                &traj.prompt_ids,
-                &traj.response_ids,
-                &traj.response_mask,
-                &returns,
-                store,
-            )?;
-            mse_sum += mse;
-            adv_abs_sum += advantages.iter().map(|a| a.abs()).sum::<f32>();
-            adv_tokens += advantages.len();
+            stats.merge(traj_stats);
+            if let Some(c) = critic.as_deref_mut() {
+                // Fit the critic toward the observed returns (frozen-attention MSE).
+                mse_sum += c.update(
+                    student,
+                    &traj.prompt_ids,
+                    &traj.response_ids,
+                    &traj.response_mask,
+                    &returns,
+                    store,
+                )?;
+                adv_abs_sum += advantages.iter().map(|a| a.abs()).sum::<f32>();
+                adv_tokens += advantages.len();
+            }
             loss_sum += loss;
             steps += 1;
         }
+
+        if !step_each && steps > 0 {
+            opt.step(store, trainable)?;
+            opt.zero_grad(store, trainable);
+        }
         if steps > 0 {
+            let critic_suffix = if critic.is_some() {
+                format!(
+                    " mean_critic_mse={:.4e} mean_adv_abs={:.4e}",
+                    mse_sum / steps as f32,
+                    adv_abs_sum / adv_tokens.max(1) as f32,
+                )
+            } else {
+                String::new()
+            };
             eprintln!(
-                "[sao-value] trained={steps} mean_policy_loss={:.4} mean_critic_mse={:.4e} mean_adv_abs={:.4e}",
+                "[update] trained={steps} mean_policy_loss={:.4} kl={:.4e} clip_frac={:.3}{critic_suffix}",
                 loss_sum / steps as f32,
-                mse_sum / steps as f32,
-                adv_abs_sum / adv_tokens.max(1) as f32,
+                stats.kl_mean(),
+                stats.clip_frac(),
             );
         }
         Ok(if steps > 0 {
@@ -325,47 +484,195 @@ impl UpdateStrategy {
     }
 }
 
+/// Reward-centered advantage per trajectory: `A_i = r_i − mean(scope)`,
+/// `/ (std + 1e-6)` when `std_norm` (the GRPO convention).
+fn centered_advantages(survivors: &[&ScoredTrajectory], scope: Scope, std_norm: bool) -> Vec<f32> {
+    let group_of = |t: &ScoredTrajectory| match scope {
+        Scope::Batch => 0usize,
+        Scope::Group => t.group_id,
+    };
+    // (key, sum, sumsq, n) — small n, first-seen order, linear find.
+    let mut stats: Vec<(usize, f32, f32, usize)> = Vec::new();
+    for t in survivors {
+        let key = group_of(t);
+        match stats.iter_mut().find(|(k, ..)| *k == key) {
+            Some((_, sum, sumsq, n)) => {
+                *sum += t.reward;
+                *sumsq += t.reward * t.reward;
+                *n += 1;
+            }
+            None => stats.push((key, t.reward, t.reward * t.reward, 1)),
+        }
+    }
+    survivors
+        .iter()
+        .map(|t| {
+            let &(_, sum, sumsq, n) = stats
+                .iter()
+                .find(|(k, ..)| *k == group_of(t))
+                .expect("group key inserted above");
+            let mean = sum / n as f32;
+            let adv = t.reward - mean;
+            if std_norm {
+                let var = (sumsq / n as f32 - mean * mean).max(0.0);
+                adv / (var.sqrt() + 1e-6)
+            } else {
+                adv
+            }
+        })
+        .collect()
+}
+
+/// GSPO sequence weight: `s = exp(mean_t(logπθ − logπ_b))` gated/clamped at the
+/// sequence level via the same [`pg_token_weight`] the op uses per token.
+fn seq_ratio_weight(current_lp: &[f32], behavior_lp: &[f32], clip: ClipForm) -> Result<f32> {
+    if current_lp.len() != behavior_lp.len() {
+        return Err(OpdError::InvalidInput(format!(
+            "seq-ratio capture len {} != behavior logprobs len {}",
+            current_lp.len(),
+            behavior_lp.len()
+        )));
+    }
+    let n = current_lp.len().max(1) as f32;
+    let s = (current_lp
+        .iter()
+        .zip(behavior_lp)
+        .map(|(c, b)| c - b)
+        .sum::<f32>()
+        / n)
+        .exp();
+    Ok(pg_token_weight(clip.weight_form(), 1.0, s, 0.0).0)
+}
+
+/// Masked-CE loop over the surviving trajectories (`ratio == None`), mean loss.
+#[allow(clippy::too_many_arguments)]
+fn update_ce<O: Optimizer>(
+    survivors: &[&ScoredTrajectory],
+    student: &Qwen35Model,
+    all_params: &[TensorId],
+    trainable: &[TensorId],
+    opt: &mut O,
+    vocab: usize,
+    window: usize,
+    store: &mut TensorStore,
+) -> Result<f32> {
+    let mut loss_sum = 0.0f32;
+    for traj in survivors {
+        // Dispatch (not `masked_writeback_step(Ce)` directly) so the default
+        // path stays byte-identical, honoring `--writeback-frozen-prompt-kv`.
+        loss_sum += masked_writeback_ce_step_dispatch(
+            student,
+            all_params,
+            trainable,
+            opt,
+            &traj.prompt_ids,
+            &traj.response_ids,
+            &traj.response_mask,
+            vocab,
+            window,
+            store,
+        )?;
+    }
+    Ok(loss_sum / survivors.len() as f32)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn traj(reward: f32) -> ScoredTrajectory {
+    fn traj(reward: f32, group_id: usize) -> ScoredTrajectory {
         ScoredTrajectory {
             prompt_ids: vec![1],
             response_ids: vec![2],
             response_mask: vec![1],
             reward,
             rollout_logprobs: None,
+            group_id,
+            truncated: false,
         }
     }
 
     #[test]
-    fn needs_are_closed_set() {
-        assert_eq!(
-            UpdateStrategy::RejectionCe.needs(),
-            RolloutNeeds {
-                keep_failing: false,
-                rollout_logprobs: false
-            }
-        );
-        assert_eq!(
-            UpdateStrategy::SaoDis {
-                eps_low: 0.8,
-                eps_high: 3.0
-            }
-            .needs(),
-            RolloutNeeds {
-                keep_failing: true,
-                rollout_logprobs: true
-            }
-        );
+    fn preset_needs_derive_mechanically() {
+        let cases = [
+            (UpdatePreset::rejection_ce(), false, false),
+            (UpdatePreset::sao_dis(0.8, 3.0), true, true),
+            (UpdatePreset::sao_value(0.8, 3.0, 1.0, 0.95), true, true),
+            (UpdatePreset::grpo(), true, true),
+            (UpdatePreset::dapo(), true, true),
+            (UpdatePreset::dr_grpo(4096), true, true),
+            (UpdatePreset::gspo(), true, true),
+            (UpdatePreset::cispo(), true, true),
+        ];
+        for (preset, keep_failing, rollout_logprobs) in cases {
+            assert_eq!(
+                preset.needs(),
+                RolloutNeeds {
+                    keep_failing,
+                    rollout_logprobs
+                },
+                "{preset:?}"
+            );
+        }
+        assert!(UpdatePreset::sao_value(0.8, 3.0, 1.0, 0.95).needs_value_critic());
+        assert!(!UpdatePreset::grpo().needs_value_critic());
     }
 
     #[test]
-    fn sao_advantages_center_to_zero() {
-        let batch = [traj(1.0), traj(0.0), traj(1.0), traj(0.0)];
-        let mean = batch.iter().map(|t| t.reward).sum::<f32>() / batch.len() as f32;
-        let sum: f32 = batch.iter().map(|t| t.reward - mean).sum();
-        assert!(sum.abs() < 1e-6, "advantages must sum to ~0, got {sum}");
+    fn group_vs_batch_advantage_scope() {
+        // Group 0 rewards (1, 0); group 1 zero-variance (1, 1).
+        let batch = [traj(1.0, 0), traj(0.0, 0), traj(1.0, 1), traj(1.0, 1)];
+        let refs: Vec<&ScoredTrajectory> = batch.iter().collect();
+        // Batch scope: mean 0.75.
+        assert_eq!(
+            centered_advantages(&refs, Scope::Batch, false),
+            vec![0.25, -0.75, 0.25, 0.25]
+        );
+        // Group scope: group 0 mean 0.5 → ±0.5; group 1 zero-variance → 0.
+        assert_eq!(
+            centered_advantages(&refs, Scope::Group, false),
+            vec![0.5, -0.5, 0.0, 0.0]
+        );
+        // std_norm (GRPO): group 0 std 0.5 → ±(0.5 / (0.5 + 1e-6)).
+        let gn = centered_advantages(&refs, Scope::Group, true);
+        assert!((gn[0] - 0.5 / (0.5 + 1e-6)).abs() < 1e-6, "{gn:?}");
+        assert_eq!(gn[2], 0.0);
+    }
+
+    #[test]
+    fn weight_builder_hard_soft_precomputed() {
+        let hard = WeightForm::HardGate { lo: 0.2, hi: 0.5 };
+        let soft = WeightForm::SoftClamp { lo: 0.2, hi: 0.5 };
+        // HardGate: base passes untouched inside (1−lo, 1+hi), else 0.
+        assert_eq!(pg_token_weight(hard, 2.0, 1.0, 0.0), (2.0, false));
+        assert_eq!(pg_token_weight(hard, 2.0, 1.6, 0.0), (0.0, true));
+        // SoftClamp: w = base · clamp(r, 1−lo, 1+hi), detached.
+        assert_eq!(pg_token_weight(soft, 2.0, 1.2, 0.0), (2.4, false));
+        assert_eq!(pg_token_weight(soft, 2.0, 3.0, 0.0), (3.0, true));
+        assert_eq!(pg_token_weight(soft, 2.0, 0.5, 0.0), (1.6, true));
+        // KL folds into the weight: w −= coef·(r−1).
+        let (w, clipped) = pg_token_weight(WeightForm::Precomputed, 1.0, 2.0, 0.1);
+        assert!((w - 0.9).abs() < 1e-6);
+        assert!(!clipped);
+        // Precomputed-seq (GSPO): s = exp(mean Δlogp), clamped at seq level.
+        let clip = ClipForm::SoftClamp { lo: 3e-4, hi: 4e-4 };
+        let s = seq_ratio_weight(&[0.0, 0.0], &[-0.2, 0.2], clip).unwrap();
+        assert!((s - 1.0).abs() < 1e-6, "mean Δ=0 → s=1, got {s}");
+        let s = seq_ratio_weight(&[0.5, 0.5], &[0.0, 0.0], clip).unwrap();
+        assert!((s - 1.0004).abs() < 1e-6, "clamped to 1+hi, got {s}");
+    }
+
+    #[test]
+    fn dapo_filter_drops_zero_variance_groups_and_truncated() {
+        let mut batch = vec![traj(1.0, 0), traj(0.0, 0), traj(1.0, 1), traj(1.0, 1)];
+        batch[0].truncated = true;
+        let kept: Vec<f32> = UpdatePreset::dapo()
+            .filter_batch(&batch)
+            .iter()
+            .map(|t| t.reward)
+            .collect();
+        // Group 1 zero-variance dropped; the truncated pass dropped; group 0's
+        // failing arm survives (variance judged on the group as scored).
+        assert_eq!(kept, vec![0.0]);
     }
 }

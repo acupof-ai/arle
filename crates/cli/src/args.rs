@@ -212,38 +212,27 @@ pub(crate) enum GkdTeacherArg {
     SelfFrozen,
 }
 
-/// Policy-update algorithm for `agent-opd` (`--update-strategy`).
+/// Policy-update preset for `agent-opd` (`--update-strategy`). Each value maps
+/// to a `train::update_strategy::UpdatePreset` constructor — the algorithm is
+/// data, not a code path; see `TrainAgentOpdArgs::update_preset`.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
 pub(crate) enum UpdateStrategyArg {
-    /// Reject (reward ≤ 0), masked CE on the survivors (default, unchanged).
+    /// Reject failures, masked CE on full passes (default, unchanged).
     RejectionCe,
-    /// SAO Phase 1: DIS (clipped per-token PG) with a batch-centered advantage.
+    /// SAO Phase 1: hard-gated per-token PG with a batch-centered advantage.
     SaoDis,
-    /// SAO Phase 2: DIS with per-token Skip-Obs GAE from a learned value critic.
+    /// SAO Phase 2: per-token Skip-Obs GAE from a learned value critic.
     SaoValue,
-}
-
-impl UpdateStrategyArg {
-    // Consumed only by the cuda-gated agent-opd driver (`run_agent_opd_impl`).
-    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-    pub(crate) fn to_strategy(
-        self,
-        eps_low: f32,
-        eps_high: f32,
-    ) -> train::update_strategy::UpdateStrategy {
-        use train::update_strategy::UpdateStrategy;
-        match self {
-            Self::RejectionCe => UpdateStrategy::RejectionCe,
-            Self::SaoDis => UpdateStrategy::SaoDis { eps_low, eps_high },
-            Self::SaoValue => UpdateStrategy::SaoValue { eps_low, eps_high },
-        }
-    }
-
-    /// True for the value-critic strategy — the driver must build a `ValueCritic`.
-    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-    pub(crate) fn needs_value_critic(self) -> bool {
-        matches!(self, Self::SaoValue)
-    }
+    /// GRPO: group-normalized advantage, clamped per-token ratio.
+    Grpo,
+    /// DAPO: clip-higher + dynamic sampling + token-level (batch-mean) loss.
+    Dapo,
+    /// Dr.GRPO: GRPO minus its length/std biases (fixed-constant normalizer).
+    DrGrpo,
+    /// GSPO: sequence-level clipped importance ratio.
+    Gspo,
+    /// CISPO: detached one-sided clamped-IS weight, batch-mean loss.
+    Cispo,
 }
 
 impl SaveDtypeArg {
@@ -1964,9 +1953,9 @@ pub(crate) struct TrainAgentOpdArgs {
     #[arg(long, default_value_t = 2048)]
     pub(crate) writeback_window: usize,
 
-    /// Policy-update algorithm. `rejection-ce` (default) = today's reject +
-    /// masked CE. `sao-dis` = SAO Phase 1 (trains failing trajectories too, with
-    /// a batch-centered advantage + clipped per-token PG).
+    /// Policy-update preset. `rejection-ce` (default) = reject failures +
+    /// masked CE. The rest select an `UpdatePreset` value: sao-dis | sao-value |
+    /// grpo | dapo | dr-grpo | gspo | cispo.
     #[arg(long, value_enum, default_value_t = UpdateStrategyArg::RejectionCe)]
     pub(crate) update_strategy: UpdateStrategyArg,
 
@@ -2134,6 +2123,31 @@ pub(crate) struct TrainAgentOpdArgs {
     /// EMA decay for `--gkd-teacher ema` (θ_ema ← α·θ_ema + (1−α)·θ_student).
     #[arg(long, default_value_t = 0.999)]
     pub(crate) gkd_ema_alpha: f32,
+}
+
+impl TrainAgentOpdArgs {
+    /// The `--update-strategy` preset; the sao-* flags override the SAO presets'
+    /// clip/GAE fields (their clap defaults ARE the preset defaults).
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    pub(crate) fn update_preset(&self) -> train::update_strategy::UpdatePreset {
+        use train::update_strategy::UpdatePreset;
+        match self.update_strategy {
+            UpdateStrategyArg::RejectionCe => UpdatePreset::rejection_ce(),
+            UpdateStrategyArg::SaoDis => UpdatePreset::sao_dis(self.sao_eps_low, self.sao_eps_high),
+            UpdateStrategyArg::SaoValue => UpdatePreset::sao_value(
+                self.sao_eps_low,
+                self.sao_eps_high,
+                self.sao_gamma,
+                self.sao_lambda,
+            ),
+            UpdateStrategyArg::Grpo => UpdatePreset::grpo(),
+            UpdateStrategyArg::Dapo => UpdatePreset::dapo(),
+            // Dr.GRPO's fixed normalizer = the rollout generation budget.
+            UpdateStrategyArg::DrGrpo => UpdatePreset::dr_grpo(self.max_turns * self.max_tokens),
+            UpdateStrategyArg::Gspo => UpdatePreset::gspo(),
+            UpdateStrategyArg::Cispo => UpdatePreset::cispo(),
+        }
+    }
 }
 
 #[cfg(test)]

@@ -128,7 +128,7 @@ mod tests {
 mod cuda_rollout {
     use std::path::PathBuf;
 
-    use agent::{AgentSession, AgentSettings, ToolExecutor, ToolPolicy};
+    use agent::{AgentSession, AgentSettings, TerminalState, ToolExecutor, ToolPolicy};
     use anyhow::{Context, Result};
     use chat::{ToolCall, ToolDefinition};
     use serde_json::json;
@@ -139,7 +139,7 @@ mod cuda_rollout {
         SandboxToolExecutor, boot_workdir, diff_workdir, reset_workdir, score_workdir,
     };
     use crate::swe_dataset::{SweTask, agent_system_prompt, agent_user_prompt};
-    use crate::update_strategy::{ScoredTrajectory, UpdateStrategy};
+    use crate::update_strategy::{ScoredTrajectory, UpdatePreset};
 
     /// A no-op [`ToolPolicy`]: the trained student emits proper tool calls, so
     /// the deterministic recovery / repair hooks stay off (all trait defaults).
@@ -201,9 +201,9 @@ mod cuda_rollout {
         pub bash_timeout_secs: u64,
         /// Test-run timeout (seconds).
         pub test_timeout_secs: u64,
-        /// Pluggable policy-update algorithm (`--update-strategy`). Drives
+        /// Pluggable policy-update preset (`--update-strategy`). Drives
         /// trajectory collection (keep-failing?) and the writeback call.
-        pub update_strategy: UpdateStrategy,
+        pub update_strategy: UpdatePreset,
     }
 
     /// One round's roll-up.
@@ -411,9 +411,9 @@ mod cuda_rollout {
     /// holding its repo already checked out at `base_commit` (the staged tree).
     /// `update_batch` applies the round's policy update over the whole scored
     /// batch and returns the mean per-trajectory loss — the caller wires
-    /// [`crate::update_strategy::UpdateStrategy::update`] (which for
-    /// [`crate::update_strategy::UpdateStrategy::SaoDis`] first captures
-    /// π_rollout via [`crate::opd::capture_rollout_logprobs`], θ still at V0).
+    /// [`crate::update_strategy::UpdatePreset::update`] (which for
+    /// ratio-weighted presets first captures π_behavior via
+    /// [`crate::opd::capture_rollout_logprobs`], θ still at V0).
     /// Batch-level (not per-trajectory) because advantage centering + the
     /// pre-update logprob capture are batch-scoped.
     ///
@@ -452,7 +452,7 @@ mod cuda_rollout {
             // into O(N²) per-turn `(prefix, completion)` pairs.
             let mut accepted_trajectories: Vec<ScoredTrajectory> = Vec::new();
 
-            for (task, staged_tree) in tasks {
+            for (group_id, (task, staged_tree)) in tasks.iter().enumerate() {
                 report.tasks += 1;
                 let workdir = aopd_profile::time_try("sandbox_boot", aopd_profile::WALL, || {
                     boot_workdir(
@@ -657,6 +657,9 @@ mod cuda_rollout {
                                 // still gates on reward == 1.0 (accept only full pass).
                                 reward,
                                 rollout_logprobs: None,
+                                // Per-prompt group identity (Scope::Group baselines).
+                                group_id,
+                                truncated: result.terminal_state == TerminalState::MaxTurns,
                             });
                         }
                         None => {
