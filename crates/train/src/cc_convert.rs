@@ -66,12 +66,36 @@ pub fn run_cc_convert(
 ) -> Result<Vec<CcRecord>> {
     let tokenizer = tokenizers::Tokenizer::from_file(tokenizer_path)
         .map_err(|err| anyhow!("load tokenizer {}: {err}", tokenizer_path.display()))?;
-    let dumps = list_dumps(dump_dir)?;
+    let records = convert_cc_dumps(dump_dir, &tokenizer, windows)?;
     ensure!(
-        !dumps.is_empty(),
-        "no *.json dumps in {}",
+        !records.is_empty(),
+        "no window matched any dump in {}",
         dump_dir.display()
     );
+
+    let mut out = String::new();
+    for record in &records {
+        out.push_str(&serde_json::to_string(record)?);
+        out.push('\n');
+    }
+    fs::write(out_path, out).with_context(|| format!("write {}", out_path.display()))?;
+    Ok(records)
+}
+
+/// In-memory core: dumps under `dump_dir` → one token record per matched
+/// window. Unmatched or un-convertible windows are skipped with a note, so the
+/// result may be empty (the cc harness treats an all-failed group as
+/// trainable-empty, not fatal — the CLI wrapper above enforces non-empty).
+pub fn convert_cc_dumps(
+    dump_dir: &Path,
+    tokenizer: &tokenizers::Tokenizer,
+    windows: &[CcWindow],
+) -> Result<Vec<CcRecord>> {
+    let dumps = list_dumps(dump_dir)?;
+    if dumps.is_empty() {
+        eprintln!("[cc-convert] no *.json dumps in {}", dump_dir.display());
+        return Ok(Vec::new());
+    }
 
     let whole_dir = [CcWindow {
         label: "all".to_owned(),
@@ -97,23 +121,11 @@ pub fn run_cc_convert(
         // A single un-convertible window (e.g. a failed rollout with no assistant
         // turn — now collected because SAO keeps failing attempts) must not abort
         // the whole round's records; skip it and keep the rest.
-        match convert_body(&window.label, window.reward, body, &tokenizer) {
+        match convert_body(&window.label, window.reward, body, tokenizer) {
             Ok(record) => records.push(record),
             Err(err) => eprintln!("[cc-convert] window {}: {err:#}; skipped", window.label),
         }
     }
-    ensure!(
-        !records.is_empty(),
-        "no window matched any dump in {}",
-        dump_dir.display()
-    );
-
-    let mut out = String::new();
-    for record in &records {
-        out.push_str(&serde_json::to_string(record)?);
-        out.push('\n');
-    }
-    fs::write(out_path, out).with_context(|| format!("write {}", out_path.display()))?;
     Ok(records)
 }
 

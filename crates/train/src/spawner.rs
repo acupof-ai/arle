@@ -130,7 +130,12 @@ pub fn serve_loop() -> i32 {
     eprintln!("[arle sandbox-spawner] listening on {sock}");
     for conn in listener.incoming() {
         match conn {
-            Ok(stream) => handle_conn(stream),
+            // Thread per connection: the cc harness runs K cc children + boot +
+            // score spawns concurrently; a serial accept loop would serialize
+            // every rollout behind one 600s `claude` run.
+            Ok(stream) => {
+                std::thread::spawn(move || handle_conn(stream));
+            }
             Err(e) => {
                 eprintln!("[arle sandbox-spawner] accept failed: {e}");
                 break;
