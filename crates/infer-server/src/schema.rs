@@ -557,6 +557,14 @@ impl StatsResponse {
                 fallback_recompute: system.fallback_recompute,
                 prefix_match_full_blocks: system.prefix_match_full_blocks,
                 prefix_match_clamped_blocks: system.prefix_match_clamped_blocks,
+                tier_io_mode: system.tier_io_mode,
+                tier_io_useful_read_bytes: system.tier_io_useful_read_bytes,
+                tier_io_useful_write_bytes: system.tier_io_useful_write_bytes,
+                tier_io_submitted_read_bytes: system.tier_io_submitted_read_bytes,
+                tier_io_submitted_write_bytes: system.tier_io_submitted_write_bytes,
+                tier_io_metadata_write_bytes: system.tier_io_metadata_write_bytes,
+                tier_io_failures: system.tier_io_failures,
+                tier_io_completion_wait_ns: system.tier_io_completion_wait_ns,
             },
             ssd_recall: SsdRecallStats {
                 available: ssd_available,
@@ -633,6 +641,14 @@ pub struct KvSystemMetricsResponse {
     pub fallback_recompute: u64,
     pub prefix_match_full_blocks: u64,
     pub prefix_match_clamped_blocks: u64,
+    pub tier_io_mode: infer_seam::KvTierIoMode,
+    pub tier_io_useful_read_bytes: u64,
+    pub tier_io_useful_write_bytes: u64,
+    pub tier_io_submitted_read_bytes: u64,
+    pub tier_io_submitted_write_bytes: u64,
+    pub tier_io_metadata_write_bytes: u64,
+    pub tier_io_failures: u64,
+    pub tier_io_completion_wait_ns: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -137,6 +137,27 @@ impl MetalPageStore {
         self.tier_to_logical.len()
     }
 
+    pub(super) fn kv_tier_io_stats(&self) -> infer_seam::KvTierIoStats {
+        let stats = self
+            .tier
+            .as_ref()
+            .map_or_else(kv_native_sys::TierIoStats::default, KvTierStore::io_stats);
+        infer_seam::KvTierIoStats {
+            mode: match stats.mode {
+                kv_native_sys::DiskIoMode::Disabled => infer_seam::KvTierIoMode::Disabled,
+                kv_native_sys::DiskIoMode::Mmap => infer_seam::KvTierIoMode::Mmap,
+                kv_native_sys::DiskIoMode::Direct => infer_seam::KvTierIoMode::Direct,
+            },
+            useful_read_bytes: stats.useful_read_bytes,
+            useful_write_bytes: stats.useful_write_bytes,
+            submitted_read_bytes: stats.submitted_read_bytes,
+            submitted_write_bytes: stats.submitted_write_bytes,
+            metadata_write_bytes: stats.metadata_write_bytes,
+            failures: stats.failures,
+            completion_wait_ns: stats.completion_wait_ns,
+        }
+    }
+
     pub(super) fn kv_tier_location(&self, key: u64) -> Option<infer_seam::KvTierLocation> {
         let logical_id = self.tier_to_logical.get(&key)?;
         self.tier.as_ref()?.location(tier_key(NS_PAGE, *logical_id))

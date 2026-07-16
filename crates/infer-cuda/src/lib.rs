@@ -628,6 +628,14 @@ impl BackendExecutor for CudaExecutor {
         }
     }
 
+    fn kv_tier_io_stats(&self) -> infer_seam::KvTierIoStats {
+        match &self.inner {
+            CudaExecutorInner::Placeholder => infer_seam::KvTierIoStats::default(),
+            #[cfg(feature = "cuda")]
+            CudaExecutorInner::Real(real) => real.kv_tier_io_stats(),
+        }
+    }
+
     fn kv_tier_location(&self, key: u64) -> Option<KvTierLocation> {
         match &self.inner {
             CudaExecutorInner::Placeholder => {

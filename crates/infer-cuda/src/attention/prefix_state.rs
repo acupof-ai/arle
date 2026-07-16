@@ -397,6 +397,10 @@ impl Dsv4PrefixStatePool {
         }
     }
 
+    pub(crate) fn io_stats(&self) -> kv_native_sys::TierIoStats {
+        self.store.io_stats()
+    }
+
     /// Insert (LAST producer wins). Host page ids recycle when freed, so a
     /// republish under a recycled id MUST overwrite — a page a slot completes
     /// is either radix-shared (content-identical) or slot-exclusive, so the
