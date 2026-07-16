@@ -794,6 +794,9 @@ impl Tape {
         let live_before = store.live_ids().into_iter().collect::<HashSet<_>>();
         let mut inner_profile = profile.as_ref().map(|_| BackwardProfile::default());
         let result = (|| {
+            for &input_id in &entry.input_ids {
+                store.ensure_checkpoint_device(input_id)?;
+            }
             let mut inner_tape = Tape::new();
             let replay_output = checkpoint_fn(store, &mut inner_tape, &entry.input_ids)?;
             trim_after_checkpoint_replay(store)?;

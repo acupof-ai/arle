@@ -180,6 +180,14 @@ pub struct KvSystemMetrics {
     pub fallback_recompute: u64,
     pub prefix_match_full_blocks: u64,
     pub prefix_match_clamped_blocks: u64,
+    pub tier_io_mode: infer_seam::KvTierIoMode,
+    pub tier_io_useful_read_bytes: u64,
+    pub tier_io_useful_write_bytes: u64,
+    pub tier_io_submitted_read_bytes: u64,
+    pub tier_io_submitted_write_bytes: u64,
+    pub tier_io_metadata_write_bytes: u64,
+    pub tier_io_failures: u64,
+    pub tier_io_completion_wait_ns: u64,
 }
 
 /// Prefix-cache counters.
@@ -793,6 +801,15 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             .reuse_hit_host_demoted
             .saturating_add(tier_hits.host_demoted);
         metrics.reuse_hit_disk = metrics.reuse_hit_disk.saturating_add(tier_hits.disk);
+        let io = self.executor.kv_tier_io_stats();
+        metrics.tier_io_mode = io.mode;
+        metrics.tier_io_useful_read_bytes = io.useful_read_bytes;
+        metrics.tier_io_useful_write_bytes = io.useful_write_bytes;
+        metrics.tier_io_submitted_read_bytes = io.submitted_read_bytes;
+        metrics.tier_io_submitted_write_bytes = io.submitted_write_bytes;
+        metrics.tier_io_metadata_write_bytes = io.metadata_write_bytes;
+        metrics.tier_io_failures = io.failures;
+        metrics.tier_io_completion_wait_ns = io.completion_wait_ns;
         metrics
     }
 

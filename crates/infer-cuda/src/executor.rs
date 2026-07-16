@@ -403,6 +403,14 @@ impl RealCudaExecutor {
         }
     }
 
+    pub(crate) fn kv_tier_io_stats(&self) -> infer_seam::KvTierIoStats {
+        match self {
+            Self::Qwen(q) => q.kv_tier_io_stats(),
+            Self::Dsv4(d) => d.kv_tier_io_stats(),
+            Self::Qwen35(q) => q.kv_tier_io_stats(),
+        }
+    }
+
     pub(crate) fn kv_tier_location(&self, key: u64) -> Option<infer_seam::KvTierLocation> {
         match self {
             Self::Qwen(q) => q.kv_tier_location(key),

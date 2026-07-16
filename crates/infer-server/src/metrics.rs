@@ -270,6 +270,60 @@ pub(crate) fn render_prometheus(counters: &CounterSnapshot, model: &str) -> Stri
         "Prefix blocks left after restore-boundary clamp.",
         kv_system.prefix_match_clamped_blocks,
     );
+    push(
+        "kv_tier_io_useful_read_bytes_total",
+        "counter",
+        "Payload bytes read from the KV disk tier.",
+        kv_system.tier_io_useful_read_bytes,
+    );
+    push(
+        "kv_tier_io_useful_write_bytes_total",
+        "counter",
+        "Payload bytes written to the KV disk tier.",
+        kv_system.tier_io_useful_write_bytes,
+    );
+    push(
+        "kv_tier_io_submitted_read_bytes_total",
+        "counter",
+        "Aligned bytes submitted for KV disk reads.",
+        kv_system.tier_io_submitted_read_bytes,
+    );
+    push(
+        "kv_tier_io_submitted_write_bytes_total",
+        "counter",
+        "Aligned bytes submitted for KV disk writes.",
+        kv_system.tier_io_submitted_write_bytes,
+    );
+    push(
+        "kv_tier_io_metadata_write_bytes_total",
+        "counter",
+        "Metadata bytes written by the KV disk tier.",
+        kv_system.tier_io_metadata_write_bytes,
+    );
+    push(
+        "kv_tier_io_failures_total",
+        "counter",
+        "Failed KV disk I/O operations.",
+        kv_system.tier_io_failures,
+    );
+    push(
+        "kv_tier_io_completion_wait_ns_total",
+        "counter",
+        "Nanoseconds waiting for KV disk I/O completions.",
+        kv_system.tier_io_completion_wait_ns,
+    );
+    let mode = match kv_system.tier_io_mode {
+        infer_seam::KvTierIoMode::Disabled => "disabled",
+        infer_seam::KvTierIoMode::Mmap => "mmap",
+        infer_seam::KvTierIoMode::Direct => "direct",
+    };
+    out.push_str("# HELP arle_kv_tier_io_mode_info Active KV disk I/O mode.\n");
+    out.push_str("# TYPE arle_kv_tier_io_mode_info gauge\n");
+    out.push_str("arle_kv_tier_io_mode_info{model_name=\"");
+    out.push_str(&escape_label_value(model));
+    out.push_str("\",io_mode=\"");
+    out.push_str(mode);
+    out.push_str("\"} 1\n");
     out
 }
 
@@ -293,7 +347,7 @@ mod tests {
 
     use super::*;
 
-    const METRIC_COUNT: usize = 39;
+    const METRIC_COUNT: usize = 47;
 
     #[test]
     fn renders_help_type_and_labelled_samples() {
@@ -344,6 +398,7 @@ mod tests {
                 fallback_recompute: 1,
                 prefix_match_full_blocks: 12,
                 prefix_match_clamped_blocks: 10,
+                ..KvSystemMetrics::default()
             },
             spec_decode: infer_seam::SpecDecodeStats::default(),
         };
@@ -387,6 +442,9 @@ mod tests {
         ));
         assert!(body.contains(
             "arle_kv_system_prefix_match_clamped_blocks_total{model_name=\"qwen3-dense\"} 10\n"
+        ));
+        assert!(body.contains(
+            "arle_kv_tier_io_mode_info{model_name=\"qwen3-dense\",io_mode=\"disabled\"} 1\n"
         ));
 
         // Every sample line carries the HELP/TYPE pair exactly once.

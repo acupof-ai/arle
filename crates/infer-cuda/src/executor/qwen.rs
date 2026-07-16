@@ -233,6 +233,24 @@ impl QwenCudaExecutor {
         self.tier.location(key)
     }
 
+    pub(crate) fn kv_tier_io_stats(&self) -> infer_seam::KvTierIoStats {
+        let stats = self.tier.io_stats();
+        infer_seam::KvTierIoStats {
+            mode: match stats.mode {
+                kv_native_sys::DiskIoMode::Disabled => infer_seam::KvTierIoMode::Disabled,
+                kv_native_sys::DiskIoMode::Mmap => infer_seam::KvTierIoMode::Mmap,
+                kv_native_sys::DiskIoMode::Direct => infer_seam::KvTierIoMode::Direct,
+            },
+            useful_read_bytes: stats.useful_read_bytes,
+            useful_write_bytes: stats.useful_write_bytes,
+            submitted_read_bytes: stats.submitted_read_bytes,
+            submitted_write_bytes: stats.submitted_write_bytes,
+            metadata_write_bytes: stats.metadata_write_bytes,
+            failures: stats.failures,
+            completion_wait_ns: stats.completion_wait_ns,
+        }
+    }
+
     pub(crate) fn reusable_prefix_blocks(&self, blocks: &[PrefixBlock]) -> usize {
         pages_only_reusable_prefix_blocks(blocks, |key| self.tier.contains(key))
     }
@@ -303,18 +321,29 @@ impl QwenCudaExecutor {
     /// complete when this returns, so the engine may free the pages). Stops at
     /// capacity and reports the accepted prefix length.
     pub(crate) fn demote_prefix_pages(&mut self, entries: &[(u32, u64)]) -> Result<usize> {
-        let mut accepted = 0usize;
-        for &(page, key) in entries {
-            if self.tier.is_full() {
-                break;
-            }
-            let payload = self.kv.copy_pages_to_host(&self.model.ctx, &[page])?;
-            if !self.tier.insert(key, payload) {
-                break;
-            }
-            accepted += 1;
+        if entries.is_empty() || self.tier.is_full() {
+            return Ok(0);
         }
-        Ok(accepted)
+        let accepted = entries.len().min(self.tier.available_pages());
+        let entries = &entries[..accepted];
+        let pages = entries.iter().map(|&(page, _)| page).collect::<Vec<_>>();
+        let payload = self.kv.copy_pages_to_host(&self.model.ctx, &pages)?;
+        let page_bytes = self.kv.storage_bytes_per_page();
+        ensure!(
+            payload.len() == accepted * page_bytes,
+            "batched KV demote returned {} bytes for {accepted} pages of {page_bytes} bytes",
+            payload.len()
+        );
+        let batch = entries
+            .iter()
+            .zip(payload.chunks_exact(page_bytes))
+            .map(|(&(_, key), bytes)| (key, bytes.to_vec()))
+            .collect::<Vec<_>>();
+        Ok(if self.tier.insert_many(batch) {
+            accepted
+        } else {
+            0
+        })
     }
 
     /// Copy host tier entries back into freshly allocated device pages. The
@@ -324,16 +353,19 @@ impl QwenCudaExecutor {
             return Ok(());
         }
         let page_bytes = self.kv.storage_bytes_per_page();
+        let keys = entries.iter().map(|&(key, _)| key).collect::<Vec<_>>();
+        let payloads = self
+            .tier
+            .read_many(&keys)
+            .map_err(|err| anyhow::anyhow!("KV tier promote: {err}"))?;
+        ensure!(
+            payloads.len() == entries.len()
+                && payloads.iter().all(|payload| payload.len() == page_bytes),
+            "batched KV promote returned invalid page count or size"
+        );
         let mut buf = Vec::with_capacity(entries.len() * page_bytes);
-        let mut pages: Vec<u32> = Vec::with_capacity(entries.len());
-        for &(key, page) in entries {
-            let payload = self
-                .tier
-                .read(key)
-                .map_err(|err| anyhow::anyhow!("KV tier promote: {err}"))?;
-            pages.push(page);
-            buf.extend_from_slice(&payload);
-        }
+        buf.extend(payloads.into_iter().flatten());
+        let pages = entries.iter().map(|&(_, page)| page).collect::<Vec<_>>();
         self.kv
             .copy_pages_from_host_on_copy_stream(&self.model.ctx, &pages, &buf)?;
         self.model.ctx.sync_copy()?;
