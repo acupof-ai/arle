@@ -844,6 +844,30 @@ mod backend {
             }
         }
 
+        /// Cancel every in-flight engine request, returning how many were
+        /// cancelled. Orphan sweep for a caller that knows all clients are
+        /// gone (the OPD round-loop quiesce after its cc children exited).
+        pub fn cancel_all_requests(&self) -> Result<usize> {
+            match self {
+                #[cfg(feature = "metal")]
+                Self::Metal(engine) => engine.cancel_all_requests(),
+                #[cfg(feature = "metal")]
+                Self::MetalDiffusionGemma(engine) => engine.cancel_all_requests(),
+                #[cfg(feature = "metal")]
+                Self::MetalGemma4(engine) => engine.cancel_all_requests(),
+                #[cfg(feature = "metal")]
+                Self::MetalDeepseekOcr(engine) => engine.cancel_all_requests(),
+                #[cfg(feature = "cuda")]
+                Self::Cuda(engine) => engine.cancel_all_requests(),
+                #[cfg(feature = "hip")]
+                Self::Hip(engine) => engine.cancel_all_requests(),
+                #[cfg(feature = "vulkan")]
+                Self::Vulkan(engine) => engine.cancel_all_requests(),
+                #[cfg(all(feature = "cpu", not(feature = "metal")))]
+                Self::Cpu(engine) => engine.cancel_all_requests(),
+            }
+        }
+
         /// Reload the engine's device weights from the host snapshot (OPD teacher
         /// weight time-share). CUDA-only; Metal/CPU bail.
         pub fn reload_engine_weights(&self) -> Result<()> {

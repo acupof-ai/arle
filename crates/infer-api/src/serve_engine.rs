@@ -85,6 +85,13 @@ where
         self.serve.ensure_kv_pool()
     }
 
+    /// Cancel every in-flight engine request, returning how many were
+    /// cancelled. Orphan sweep for a caller that knows all clients are gone
+    /// (the OPD round-loop quiesce after its cc children exited).
+    pub fn cancel_all_requests(&self) -> Result<usize> {
+        self.serve.cancel_all_requests()
+    }
+
     /// Generate token ids from an already-tokenized prompt through the serving
     /// scheduler. This is the programmatic OPD rollout surface: unlike
     /// `forward_token_logits`, it keeps one request alive in infer-core, so the
