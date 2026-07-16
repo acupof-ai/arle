@@ -247,6 +247,13 @@ enum DiskStore {
 }
 
 impl DiskStore {
+    fn is_direct(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        return matches!(self, Self::Direct(_));
+        #[cfg(not(target_os = "linux"))]
+        false
+    }
+
     fn num_slots(&self) -> u32 {
         match self {
             Self::Mmap(store) => store.num_slots(),
@@ -940,9 +947,12 @@ impl KvTierStore {
     }
 
     pub fn insert_many(&mut self, mut entries: Vec<(u64, Vec<u8>)>) -> bool {
+        let keys = entries.iter().map(|(key, _)| *key).collect::<BTreeSet<_>>();
         if entries
             .iter()
             .any(|(_, payload)| payload.len() > self.bytes_per_page)
+            || keys.len() != entries.len()
+            || keys.iter().any(|key| self.contains(*key))
         {
             return false;
         }
@@ -1089,20 +1099,14 @@ impl KvTierStore {
         let Some(disk) = &mut self.disk else {
             return false;
         };
-        let already_present = disk.keys.contains_key(&key);
-        let slot = if already_present {
-            disk.keys[&key].slot
-        } else {
-            match disk.store.alloc_slot() {
-                Some(s) => s,
-                None => return false,
-            }
+        let old = disk.keys.get(&key).copied();
+        let slot = match disk.store.alloc_slot() {
+            Some(slot) => slot,
+            None => return false,
         };
         if let Err(err) = disk.write_payloads(&[(slot, payload)]) {
             log::warn!("KV disk write failed for key {key} slot {slot}: {err}");
-            if !already_present {
-                disk.store.free_slot(slot);
-            }
+            disk.store.free_slot(slot);
             return false;
         }
         disk.keys.insert(
@@ -1112,6 +1116,9 @@ impl KvTierStore {
                 len: payload.len(),
             },
         );
+        if let Some(old) = old {
+            disk.store.free_slot(old.slot);
+        }
         if commit_manifest
             && disk.durable
             && let Err(err) = disk.write_manifest()
@@ -1129,25 +1136,16 @@ impl KvTierStore {
         if unique.len() != entries.len() {
             return false;
         }
-        let mut allocated = Vec::new();
+        let mut allocated = Vec::with_capacity(entries.len());
         let mut records = Vec::with_capacity(entries.len());
         for (key, payload) in entries {
-            let already_present = disk.keys.get(key).copied();
-            let slot = match already_present {
-                Some(record) => record.slot,
-                None => match disk.store.alloc_slot() {
-                    Some(slot) => {
-                        allocated.push(slot);
-                        slot
-                    }
-                    None => {
-                        for slot in allocated {
-                            disk.store.free_slot(slot);
-                        }
-                        return false;
-                    }
-                },
+            let Some(slot) = disk.store.alloc_slot() else {
+                for slot in allocated {
+                    disk.store.free_slot(slot);
+                }
+                return false;
             };
+            allocated.push(slot);
             records.push((*key, slot, payload.len()));
         }
         let writes = records
@@ -1269,6 +1267,21 @@ impl KvTierStore {
             .into_iter()
             .map(|value| value.expect("every requested key resolved"))
             .collect())
+    }
+
+    pub fn read_many_concat(&mut self, keys: &[u64]) -> Result<Vec<u8>> {
+        if self
+            .disk
+            .as_ref()
+            .is_some_and(|disk| disk.store.is_direct())
+        {
+            return Ok(self.read_many(keys)?.into_iter().flatten().collect());
+        }
+        let mut values = Vec::with_capacity(keys.len().saturating_mul(self.bytes_per_page));
+        for key in keys {
+            values.extend_from_slice(&self.read(*key)?);
+        }
+        Ok(values)
     }
 
     /// Rank-LOCAL chunked-blob insert: one manifest page under
@@ -1710,21 +1723,18 @@ mod tests {
     }
 
     #[test]
-    fn disk_full_allows_replacing_existing_key() {
+    fn disk_full_replacement_preserves_existing_key() {
         let root = temp_root("replace");
         let mut store = KvTierStore::with_budget(0, 8);
         assert!(store.set_disk(root.clone(), 8, 8));
 
         assert!(store.insert(1, vec![1; 8]));
         assert!(store.is_full());
-        assert!(
-            store.insert(1, vec![9; 8]),
-            "replace does not consume capacity"
-        );
+        assert!(!store.insert(1, vec![9; 8]));
         assert_eq!(store.disk_pages(), 1);
         assert_eq!(
-            store.read(1).expect("replaced disk read").as_ref(),
-            &[9u8; 8]
+            store.read(1).expect("original disk read").as_ref(),
+            &[1u8; 8]
         );
 
         std::fs::remove_dir_all(&root).expect("cleanup");
