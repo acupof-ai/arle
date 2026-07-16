@@ -1866,6 +1866,14 @@ pub(crate) struct TrainAgentOpdArgs {
     #[arg(long, default_value_t = 1)]
     pub(crate) replay_epochs: usize,
 
+    /// Experience replay: after each fresh group's update, additionally train
+    /// on up to N groups drawn from an age-bounded (≤10 rounds),
+    /// |A|-prioritized buffer. IS-corrected by the preset's ratio vs the
+    /// behavior logprobs stored at first use — requires a ratio-weighted
+    /// --update-strategy. 0 = off.
+    #[arg(long, default_value_t = 0, value_name = "N")]
+    pub(crate) replay_reuse: usize,
+
     /// Root dir under which each task's per-rollout sandbox is built (copied from
     /// the staged tree, reset between samples).
     #[arg(long, value_name = "DIR", default_value = "/tmp/agent-opd")]
