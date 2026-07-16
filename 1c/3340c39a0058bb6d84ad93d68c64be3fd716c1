@@ -1,0 +1,23 @@
+docs/baselines.md
+  s_81c5a850d93f85::t_acac5df98f1c8d 45-54
+scripts/run_dsv4_bench.sh
+  s_81c5a850d93f85::t_ea6cb9b25e5777 27
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "1c3340c39a0058bb6d84ad93d68c64be3fd716c1",
+  "prompts": {},
+  "sessions": {
+    "s_81c5a850d93f85": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c1899929-05e0-4ef7-9ac7-0acb8fe9ec71",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
