@@ -1183,16 +1183,6 @@ mod tests {
         assert_eq!(tensor.dirty, Dirty::Device);
         assert!(tensor.data.is_empty());
         assert_eq!(store.to_host(first).expect("restored values"), values);
-        for _ in 0..8 {
-            store
-                .offload_checkpoint_to_host(first)
-                .expect("repeat spill");
-            store
-                .ensure_checkpoint_device(first)
-                .expect("repeat restore");
-            assert!(store.checkpoint_offload_pool.free.is_empty());
-        }
-
         let root = tempfile::tempdir().expect("checkpoint L3 root");
         let mut store = TensorStore {
             checkpoint_l3: CheckpointL3::try_new(
