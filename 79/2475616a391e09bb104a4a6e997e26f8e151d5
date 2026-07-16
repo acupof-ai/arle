@@ -1,0 +1,21 @@
+docs/experience/wins/2026-07-17-orphan-request-disconnect-cancel.md
+  s_8da11402b39562::t_41d62e65bb0455 1-37
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "792475616a391e09bb104a4a6e997e26f8e151d5",
+  "prompts": {},
+  "sessions": {
+    "s_8da11402b39562": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a0d852fdf4cb1d719",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
