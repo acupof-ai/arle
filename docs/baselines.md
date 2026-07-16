@@ -48,9 +48,11 @@ c32 rows are pre-crash; fix pending before this regime is production-safe.
 mapped. All same-day Δ% comparisons remain valid (identical workload both
 arms), and per-request decode speed is 1/ITL ≈ 46.5 tok/s, but `out tok/s`
 aggregates are prefill-diluted and entries saying "256 output" describe
-3352-in/16-out. Fixed in `run_dsv4_bench.sh` via
-`--data-args '{"output_tokens_count_column":"output_tokens"}'` — the NEXT
-anchored run (256-out) is a **fingerprint change: re-anchor the champion**.
+3352-in/16-out. guidellm is REMOVED entirely (2026-07-16, user call — this silent default plus
+its synthetic-data and accounting quirks); `run_dsv4_bench.sh` now drives the
+canonical native runner `bench_throughput.py` with explicit `--max-tokens`.
+The NEXT anchored run (native runner, 256-out) is a **fingerprint change:
+re-anchor the champion**.
 
 Pure-prefill anchor (c1, no queueing): ~3352-tok prompt / 446 ms TTFT ≈
 **7516 tok/s prefill**.

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate a varied-prompt bench dataset (guidellm --data jsonl).
+"""Generate a varied-prompt bench dataset (bench_throughput.py --prompts-jsonl).
 
 Usage: gen_bench_prompts.py [out.jsonl] [count] [chars_per_doc] [output_tokens]
 
