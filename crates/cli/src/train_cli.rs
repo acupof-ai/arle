@@ -1935,72 +1935,6 @@ fn log_opd_vram(label: &str, backend: &std::sync::Arc<dyn autograd::Backend>) {
     }
 }
 
-/// Run ONE held-out eval pass (eval-only: no writeback, no optimizer step) over
-/// `eval_tasks` with the CURRENT student, write `eval_round{label}.jsonl`
-/// (per-task pass/fail + the aggregate pass-rate), and return the pass-rate so
-/// the caller can log it next to `mean_train_loss`. `label` is `"base"` for the
-/// round-0 baseline or the round index otherwise.
-// In-house AgentSession eval arm — superseded by `run_cc_eval`; P3 deletes it
-// with the in-house rollout arm.
-#[cfg(feature = "cuda")]
-#[allow(dead_code)]
-fn run_agent_opd_eval_pass(
-    infer_student: &train::infer_student::InferStudent,
-    eval_tasks: &[(train::swe_dataset::SweTask, PathBuf)],
-    cfg: &train::agent_opd::AgentOpdConfig,
-    eval_temperature: f32,
-    out_dir: &Path,
-    label: &str,
-) -> Result<f32> {
-    use std::io::Write;
-
-    let report = train::agent_opd::run_agentic_opd_eval(
-        infer_student,
-        eval_tasks,
-        cfg,
-        eval_temperature,
-        label,
-    )?;
-    let pass_rate = report.pass_rate();
-
-    fs::create_dir_all(out_dir)
-        .with_context(|| format!("create eval out dir {}", out_dir.display()))?;
-    let out_path = out_dir.join(format!("eval_round_{label}.jsonl"));
-    let mut file = fs::File::create(&out_path)
-        .with_context(|| format!("create eval out {}", out_path.display()))?;
-    // Per-task pass/fail lines, then one aggregate line so a downstream reader
-    // gets both the breakdown and the held-out pass-rate from the same file.
-    for t in &report.tasks {
-        let line = serde_json::json!({
-            "instance_id": t.instance_id,
-            "passed": t.passed,
-            "edited": t.edited,
-            "note": t.note,
-            "reward": t.reward,
-        });
-        writeln!(file, "{line}")?;
-    }
-    let mean_dense = report.mean_dense();
-    let agg = serde_json::json!({
-        "aggregate": true,
-        "label": label,
-        "pass_rate": pass_rate,
-        "mean_dense": mean_dense,
-        "passed": report.passed(),
-        "edited": report.edited(),
-        "tasks": report.tasks.len(),
-    });
-    writeln!(file, "{agg}")?;
-    file.flush()?;
-    eprintln!(
-        "[arle train agent-opd] eval[{label}]: held-out pass_rate={pass_rate:.4} mean_dense={mean_dense:.4} ({}/{} tasks) -> {}",
-        report.passed(),
-        report.tasks.len(),
-        out_path.display(),
-    );
-    Ok(pass_rate)
-}
-
 /// Held-out eval via the cc harness: ONE sample per task (K=1 — best-of-N would
 /// inflate the pass-rate vs the single-shot production setting), no training.
 /// Writes the same `eval_round_{label}.jsonl` shape as the in-house eval pass
@@ -2713,9 +2647,9 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
         .unwrap_or_else(|| eval_out_dir.join("metrics.jsonl"));
 
     // Rollout engine (student) doubles as the cc serve. KV budget for cc
-    // traffic: K concurrent cc streams × ~22K-token session ceiling (measured
-    // cc SWE sessions), +25% headroom, page_size 16.
-    const CC_SESSION_TOKENS: usize = 22_000;
+    // traffic: K concurrent cc streams × the measured session ceiling, +25%
+    // headroom, page_size 16.
+    use train::cc_harness::CC_SESSION_TOKENS;
     let width = args.samples_per_prompt.max(1);
     let cc_pages = width * CC_SESSION_TOKENS.div_ceil(16);
     let cc_total_pages = cc_pages + cc_pages / 4;
