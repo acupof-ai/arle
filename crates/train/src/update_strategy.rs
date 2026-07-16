@@ -5,6 +5,7 @@
 //!
 //! See `docs/plans/2026-07-11-opd-pluggable-update-strategy.md`.
 
+use autograd::ops::fused_linear_distill::WeightForm;
 use autograd::{TensorId, TensorStore, optim::Optimizer};
 
 use crate::opd::{
@@ -178,20 +179,26 @@ impl UpdateStrategy {
                         .to_owned(),
                 )
             })?;
-            // Constant per-token advantage (batch-centered scalar broadcast to
-            // every masked position); SaoValue supplies Skip-Obs GAE instead.
-            let advantages = vec![advantage; rollout_logprobs.len()];
-            let loss = masked_writeback_step(
-                WritebackLoss::Dis {
+            // Constant per-token weight (batch-centered scalar broadcast to
+            // every masked position), token-meaned (÷ masked count) to mirror
+            // CE's 1/N; SaoValue supplies Skip-Obs GAE instead.
+            let n = rollout_logprobs.len().max(1) as f32;
+            let weights = vec![advantage / n; rollout_logprobs.len()];
+            let (loss, _stats) = masked_writeback_step(
+                WritebackLoss::Pg {
                     rollout_logprobs,
-                    advantage: &advantages,
-                    eps_low,
-                    eps_high,
+                    weight: &weights,
+                    form: WeightForm::HardGate {
+                        lo: eps_low,
+                        hi: eps_high,
+                    },
+                    kl_coef: 0.0,
                 },
                 student,
                 all_params,
                 trainable,
                 opt,
+                true,
                 &traj.prompt_ids,
                 &traj.response_ids,
                 &traj.response_mask,
@@ -262,17 +269,24 @@ impl UpdateStrategy {
             if advantages.is_empty() {
                 continue; // no LLM tokens to train
             }
-            let loss = masked_writeback_step(
-                WritebackLoss::Dis {
+            // Token-mean the per-token GAE weights (÷ masked count), as CE's 1/N.
+            let n = advantages.len() as f32;
+            let weights: Vec<f32> = advantages.iter().map(|a| a / n).collect();
+            let (loss, _stats) = masked_writeback_step(
+                WritebackLoss::Pg {
                     rollout_logprobs,
-                    advantage: &advantages,
-                    eps_low,
-                    eps_high,
+                    weight: &weights,
+                    form: WeightForm::HardGate {
+                        lo: eps_low,
+                        hi: eps_high,
+                    },
+                    kl_coef: 0.0,
                 },
                 student,
                 &all_with_critic,
                 trainable,
                 opt,
+                true,
                 &traj.prompt_ids,
                 &traj.response_ids,
                 &traj.response_mask,

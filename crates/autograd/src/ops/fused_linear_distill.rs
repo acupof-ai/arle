@@ -686,22 +686,80 @@ fn fused_linear_ce_loss_indexed_device(
     Ok(loss_id)
 }
 
+/// How the (detached) importance ratio `r` gates the base weight inside
+/// [`fused_linear_pg_loss_indexed`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum WeightForm {
+    /// Binary DIS gate: keep iff `(1−lo) < r < (1+hi)`, else drop the token.
+    HardGate { lo: f32, hi: f32 },
+    /// CISPO-family: the clamped ratio IS the gate factor, `clamp(r, 1−lo, 1+hi)`.
+    SoftClamp { lo: f32, hi: f32 },
+    /// Caller already folded any ratio factor into the weight (e.g. GSPO's
+    /// sequence-level clamp); the op applies the weight as-is.
+    Precomputed,
+}
+
+/// Off-policy diagnostics accumulated by [`fused_linear_pg_loss_indexed`]:
+/// Schulman k3 KL(π_b‖πθ) `Σ(r−1−ln r)` plus the gate/clamp reject count.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PgStats {
+    pub kl_sum: f64,
+    pub clipped: usize,
+    pub tokens: usize,
+}
+
+impl PgStats {
+    pub fn merge(&mut self, other: PgStats) {
+        self.kl_sum += other.kl_sum;
+        self.clipped += other.clipped;
+        self.tokens += other.tokens;
+    }
+    pub fn kl_mean(&self) -> f64 {
+        self.kl_sum / self.tokens.max(1) as f64
+    }
+    pub fn clip_frac(&self) -> f64 {
+        self.clipped as f64 / self.tokens.max(1) as f64
+    }
+}
+
+/// `w = base·gate(r) − kl_coef·(r−1)`, all DETACHED (k3 KL gradient w.r.t. logp
+/// is `r−1`; the sign makes descending the loss decrease KL(π_b‖πθ)). Single
+/// source of truth for the host and device paths. Returns `(w, ratio_clipped)`.
+pub fn pg_token_weight(form: WeightForm, base: f32, r: f32, kl_coef: f32) -> (f32, bool) {
+    let (gate, clipped) = match form {
+        WeightForm::HardGate { lo, hi } => {
+            if (1.0 - lo) < r && r < (1.0 + hi) {
+                (1.0, false)
+            } else {
+                (0.0, true)
+            }
+        }
+        WeightForm::SoftClamp { lo, hi } => {
+            let clamped = r.clamp(1.0 - lo, 1.0 + hi);
+            (clamped, clamped != r)
+        }
+        WeightForm::Precomputed => (1.0, false),
+    };
+    let mut w = base * gate;
+    // Guarded so kl_coef=0 stays byte-identical even at r=inf (0.0·inf = NaN).
+    if kl_coef != 0.0 {
+        w -= kl_coef * (r - 1.0);
+    }
+    (w, clipped)
+}
+
 /// Per-token-weighted policy-gradient twin of [`fused_linear_ce_loss_indexed`]
 /// — a REINFORCE surrogate `Σ_p (-w_p · logπθ(t_p))` at a sparse set of hidden
 /// positions, chunked so it never materializes `[seq, vocab]`. Structure,
 /// dispatch, and grad-writeback mirror the CE op exactly; the ONLY difference is
 /// the per-position scale: the CE op uses a uniform `1/N`, this op uses
-/// `w_p = advantage · gate_p`.
-///
-/// Per position `p` with target token `t`:
-/// `logp = log_softmax(logits_p)[t]`; `r = exp(logp − rollout_logprobs[p])`
-/// (importance ratio vs the rollout policy); `gate = 1` iff
-/// `(1−eps_low) < r < (1+eps_high)` (double-sided HARD DIS clip mask, else `0`);
-/// `w = advantage · gate` — a DETACHED scalar weight. `loss += −w · logp`;
-/// `d_logits_p = w · (softmax(logits_p) − onehot(t))`. `r`/`gate`/`advantage`
-/// are weights only — the gradient flows solely through `logp` (no backprop
-/// through the ratio). `d_hidden` flows always (if `hidden.requires_grad`);
-/// `d_weight` only when the lm_head is trainable. f32 numerics throughout.
+/// `w_p = pg_token_weight(form, token_weight[p], r_p, kl_coef)` with
+/// `r = exp(logp − rollout_logprobs[p])` (importance ratio vs the behavior
+/// policy). `w` is a DETACHED weight: `loss += −w · logp`;
+/// `d_logits_p = w · (softmax(logits_p) − onehot(t))` — the gradient flows
+/// solely through `logp`, never through the ratio. `d_hidden` flows always (if
+/// `hidden.requires_grad`); `d_weight` only when the lm_head is trainable. f32
+/// numerics throughout. Also returns the k3 KL / clip diagnostics.
 #[allow(clippy::too_many_arguments)]
 pub fn fused_linear_pg_loss_indexed(
     hidden: TensorId,
@@ -709,13 +767,13 @@ pub fn fused_linear_pg_loss_indexed(
     position_indices: &[i32],
     target_tokens: &[i32],
     rollout_logprobs: &[f32],
-    advantage: &[f32],
-    eps_low: f32,
-    eps_high: f32,
+    token_weight: &[f32],
+    form: WeightForm,
+    kl_coef: f32,
     chunk_rows: usize,
     store: &mut TensorStore,
     tape: &mut Tape,
-) -> Result<TensorId> {
+) -> Result<(TensorId, PgStats)> {
     let shape = validate_ce_indexed_inputs(hidden, weight, position_indices, target_tokens, store)?;
     if chunk_rows == 0 {
         return Err(AutogradError::TapeInvariant(
@@ -728,16 +786,23 @@ pub fn fused_linear_pg_loss_indexed(
             got: rollout_logprobs.len(),
         });
     }
-    // Per-token advantage (Skip-Obs GAE, SAO Phase 2); SaoDis passes a constant.
-    if advantage.len() != position_indices.len() {
+    if token_weight.len() != position_indices.len() {
         return Err(AutogradError::InvalidIndicesLen {
             expected: position_indices.len(),
-            got: advantage.len(),
+            got: token_weight.len(),
         });
     }
-    if !(advantage.iter().all(|a| a.is_finite()) && eps_low.is_finite() && eps_high.is_finite()) {
+    let (lo, hi) = match form {
+        WeightForm::HardGate { lo, hi } | WeightForm::SoftClamp { lo, hi } => (lo, hi),
+        WeightForm::Precomputed => (0.0, 0.0),
+    };
+    if !(token_weight.iter().all(|a| a.is_finite())
+        && lo.is_finite()
+        && hi.is_finite()
+        && kl_coef.is_finite())
+    {
         return Err(AutogradError::TapeInvariant(
-            "fused_linear_pg_loss_indexed: advantage/eps_low/eps_high must be finite",
+            "fused_linear_pg_loss_indexed: token_weight/clip bounds/kl_coef must be finite",
         ));
     }
     if rollout_logprobs.iter().any(|value| !value.is_finite()) {
@@ -753,9 +818,9 @@ pub fn fused_linear_pg_loss_indexed(
             position_indices,
             target_tokens,
             rollout_logprobs,
-            advantage,
-            eps_low,
-            eps_high,
+            token_weight,
+            form,
+            kl_coef,
             chunk_rows,
             &shape,
             store,
@@ -773,6 +838,7 @@ pub fn fused_linear_pg_loss_indexed(
     let mut grad_weight = need_weight_grad.then(|| vec![0.0_f32; weight_data.len()]);
     let num_targets = position_indices.len();
     let mut loss_sum = 0.0_f32;
+    let mut stats = PgStats::default();
 
     for chunk_start in (0..num_targets).step_by(chunk_rows) {
         let chunk_end = chunk_start.saturating_add(chunk_rows).min(num_targets);
@@ -794,14 +860,13 @@ pub fn fused_linear_pg_loss_indexed(
 
             let log_probs = log_softmax_row(&logits);
             let logp = log_probs[target];
-            // Detached DIS weight: ratio/gate/advantage are constants, no grad path.
+            // Detached weight: ratio/gate/base are constants, no grad path.
             let r = (logp - rollout_logprobs[local]).exp();
-            let gate = if (1.0 - eps_low) < r && r < (1.0 + eps_high) {
-                1.0
-            } else {
-                0.0
-            };
-            let w = advantage[local] * gate;
+            let (w, clipped) = pg_token_weight(form, token_weight[local], r, kl_coef);
+            let d = f64::from(logp - rollout_logprobs[local]);
+            stats.kl_sum += d.exp() - 1.0 - d;
+            stats.clipped += usize::from(clipped);
+            stats.tokens += 1;
             loss_sum -= w * logp;
 
             // d_logits = w · (softmax − onehot), the CE gradient scaled by w.
@@ -851,14 +916,14 @@ pub fn fused_linear_pg_loss_indexed(
         });
     }
 
-    Ok(loss_id)
+    Ok((loss_id, stats))
 }
 
 /// GPU path for [`fused_linear_pg_loss_indexed`] — mirrors
 /// [`fused_linear_ce_loss_indexed_device`], but replaces the uniform
 /// `mul_scalar(summed, -1/N)` with a per-position detached weight vector
-/// `neg_w_p = -(advantage · gate_p)` applied elementwise to the gathered
-/// target log-probs before the sum. `gate_p` is computed on host from a
+/// `neg_w_p = -pg_token_weight(...)` applied elementwise to the gathered
+/// target log-probs before the sum. The ratio is evaluated on host from a
 /// per-chunk readback of the gathered log-probs (the only extra readback vs
 /// the CE path); the multiply feeds `d_logits_p = w_p·(softmax − onehot)` back
 /// through log_softmax, matching the host path.
@@ -869,14 +934,14 @@ fn fused_linear_pg_loss_indexed_device(
     position_indices: &[i32],
     target_tokens: &[i32],
     rollout_logprobs: &[f32],
-    advantage: &[f32],
-    eps_low: f32,
-    eps_high: f32,
+    token_weight: &[f32],
+    form: WeightForm,
+    kl_coef: f32,
     chunk_rows: usize,
     shape: &FusedLinearDistillShape,
     store: &mut TensorStore,
     tape: &mut Tape,
-) -> Result<TensorId> {
+) -> Result<(TensorId, PgStats)> {
     let need_hidden_grad = store.tensor(hidden)?.requires_grad;
     let need_weight_grad = store.tensor(weight)?.requires_grad;
     let requires_grad = need_hidden_grad || need_weight_grad;
@@ -893,6 +958,7 @@ fn fused_linear_pg_loss_indexed_device(
     )?;
 
     let mut loss_sum = 0.0_f32;
+    let mut stats = PgStats::default();
     let mut grad_hidden_2d_accum: Option<TensorId> = None;
     let mut grad_weight_accum: Option<TensorId> = None;
 
@@ -925,44 +991,19 @@ fn fused_linear_pg_loss_indexed_device(
         let gathered =
             crate::ops::gather_last_dim(log_probs, &chunk_targets, store, &mut chunk_tape)?;
 
-        // Detached per-position DIS weight negated for the -w·logp loss; read
-        // the gathered log-probs back to evaluate the hard ratio gate on host.
+        // Detached per-position weight negated for the -w·logp loss; read the
+        // gathered log-probs back to evaluate the ratio gate/clamp on host.
         let gathered_logp = store.to_host(gathered)?;
-        let neg_w: Vec<f32> = gathered_logp
-            .iter()
-            .enumerate()
-            .map(|(offset, &logp)| {
-                let r = (logp - rollout_logprobs[chunk_start + offset]).exp();
-                let gate = if (1.0 - eps_low) < r && r < (1.0 + eps_high) {
-                    1.0
-                } else {
-                    0.0
-                };
-                -(advantage[chunk_start + offset] * gate)
-            })
-            .collect();
-        // DIS off-policy diagnostics (env-gated → zero prod cost). KL(πθ‖π_rollout)
-        // via Schulman k3 E[r−1−ln r] (≥0, low-variance); clip = hard-mask reject rate.
-        if std::env::var("ARLE_OPD_LOG_DIS_STATS").is_ok() {
-            let (mut kl, mut clipped) = (0.0_f64, 0_usize);
-            for (offset, &logp) in gathered_logp.iter().enumerate() {
-                let d = f64::from(logp - rollout_logprobs[chunk_start + offset]);
-                let r = d.exp();
-                kl += r - 1.0 - d;
-                if !((1.0 - f64::from(eps_low)) < r && r < (1.0 + f64::from(eps_high))) {
-                    clipped += 1;
-                }
-            }
-            let n = gathered_logp.len().max(1);
-            let adv_mean = advantage[chunk_start..chunk_start + gathered_logp.len()]
-                .iter()
-                .sum::<f32>()
-                / n as f32;
-            eprintln!(
-                "[dis-stats] adv={adv_mean:.4} kl={:.4e} clip_frac={:.3} tokens={n}",
-                kl / n as f64,
-                clipped as f64 / n as f64,
-            );
+        let mut neg_w = Vec::with_capacity(gathered_logp.len());
+        for (offset, &logp) in gathered_logp.iter().enumerate() {
+            let idx = chunk_start + offset;
+            let r = (logp - rollout_logprobs[idx]).exp();
+            let (w, clipped) = pg_token_weight(form, token_weight[idx], r, kl_coef);
+            let d = f64::from(logp - rollout_logprobs[idx]);
+            stats.kl_sum += d.exp() - 1.0 - d;
+            stats.clipped += usize::from(clipped);
+            stats.tokens += 1;
+            neg_w.push(-w);
         }
         let neg_w_id = store.from_slice(&neg_w, &[chunk_len])?;
         // gather_last_dim can return [chunk_len, 1]; flatten to rank-1 so the
@@ -1032,7 +1073,7 @@ fn fused_linear_pg_loss_indexed_device(
         });
     }
 
-    Ok(loss_id)
+    Ok((loss_id, stats))
 }
 
 pub(crate) fn fused_linear_distill_backward(
@@ -1584,9 +1625,8 @@ mod tests {
         positions: &[i32],
         targets: &[i32],
         rollout_logprobs: &[f32],
-        advantage: &[f32],
-        eps_low: f32,
-        eps_high: f32,
+        token_weight: &[f32],
+        form: WeightForm,
         chunk_rows: usize,
     ) -> Result<(f32, Vec<f32>, Vec<f32>)> {
         let mut store = TensorStore::default();
@@ -1595,15 +1635,15 @@ mod tests {
         store.get_mut(hidden).expect("hidden").requires_grad = true;
         let weight = store.from_slice(weight_data, &[vocab, hidden_dim])?;
         store.get_mut(weight).expect("weight").requires_grad = true;
-        let loss = fused_linear_pg_loss_indexed(
+        let (loss, _stats) = fused_linear_pg_loss_indexed(
             hidden,
             weight,
             positions,
             targets,
             rollout_logprobs,
-            advantage,
-            eps_low,
-            eps_high,
+            token_weight,
+            form,
+            0.0,
             chunk_rows,
             &mut store,
             &mut tape,
@@ -1667,8 +1707,7 @@ mod tests {
             &targets,
             &rollout,
             &vec![1.0 / n as f32; n],
-            0.2,
-            0.2,
+            WeightForm::HardGate { lo: 0.2, hi: 0.2 },
             3,
         )?;
 
