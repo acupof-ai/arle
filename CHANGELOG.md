@@ -23,13 +23,17 @@ Progress spine. Entry classes recorded here the day they land: phase exits,
 default flips, and accept-or-reject verdicts (AGENTS.md §Docs lifecycle &
 progress spine).
 
-- **2026-07-16 — DSv4 FP32 probe limited to prefill; DSpark (MTP) decode
-  throughput recovered.** The all-boundaries FP32 compressor was running the
-  FP32 probe on every decode token, including the DSpark draft phase. Guarded
-  to prefill only (`start_pos_device.is_none()`); simplified the guard from 5
-  conditions to 3. Needle gate: depth 0.0 all-pass, depth 0.5 no-misses
-  (prefill correctness preserved). DSpark MTP bench: ~2× output tok/s (19–25
-  → 48–49), ITL p50 flat at 40.8ms (compute-bound, not probe-bound).
+- **2026-07-16 — DSv4 FP32 probe limited to prefill; unblocks DSpark (MTP)
+  decode.** The all-boundaries FP32 compressor was running the FP32 probe on
+  every decode token, including the DSpark draft phase (each draft token
+  re-ran the FP32 GEMM+probe). Guarded to prefill only
+  (`start_pos_device.is_none()`); simplified the guard from 5 conditions to 3.
+  Needle gate: depth 0.0 all-pass, depth 0.5 no-misses (prefill correctness
+  preserved). DSpark MTP bench: 48–49 output tok/s, ITL p50 flat at 40.8ms
+  (compute-bound). The 48–49 tok/s is MTP speculative decoding now unblocked
+  by the probe removal, NOT the isolated probe effect (the no-MTP baseline
+  confounds). The all-boundaries bench's −17% to −36% eager total-tok/s is the
+  best isolated estimate of the probe-on-decode overhead.
   [bench](docs/experience/wins/2026-07-16-dsv4-fp32-probe-prefill-only-dspark-recovery.md).
 
 - **2026-07-16 — DSv4 FP32 compressor extended to all compression boundaries.**
