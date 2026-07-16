@@ -238,20 +238,34 @@ AReaL η≤8 within 1%). KV-keep across adapter swaps becomes an option per F.7.
 Loss is *measured*, not assumed: clip_frac + kl_rollout ≈ 0 ⇒ empirically
 lossless.
 
-### P8 — gated roadmap (post-P7, each behind its own gate)
+### P8 — gated roadmap (RE-COSTED 2026-07-16: substrate exists in-tree, these
+are wire-and-license, not build)
 
-- **Experience replay**: age ≤10 steps, fresh-anchored, |A|-prioritized, reuse
-  2-5× (~40% compute); our inference/train cost ratio is the extreme-replay
-  regime. Gate: held-out parity at reuse 2-3×.
-- **Spec decode in rollout**: training-free suffix-tree drafter over recent
-  rollouts (DAS pattern) — distribution-lossless via rejection sampling;
-  1.3-2× decode. Engine feature, useful beyond RL. Gate: needle + acceptance
-  rate + identical training curves on one round.
-- **Privileged self-distillation for all-fail tasks** (HDPO/OPSD): teacher =
-  same model + privileged context (failing pytest output / reference patch);
-  distill per-token on student rollouts; rescues the zero-gradient tail; the
-  ~10×-class move. Lands as `KlReg{reference: Teacher}` + a privileged-prompt
-  harness lane. Gate: all-fail-task pass-rate delta on the real corpus.
+- **Spec decode in rollout** — substrate: the Qwen3.6 NextN-MTP draft lane is
+  fully built (`Qwen35SpecState` draft-head K/V + spec snapshot/restore/rewind,
+  qwen35.rs:843-1088; `--spec-type dspark`, `--speculative-tokens`; engine
+  `spec_decode_stats`). Gap: **RL licensing only** — the verify rows are argmax
+  (greedy acceptance), which does NOT preserve the sampling distribution at
+  temp=1; RL rollouts need the rejection-sampling acceptance rule (survey:
+  greedy/typical variants are lossy, true rejection sampling is exact). Work =
+  acceptance-rule audit + (if greedy) the rejection variant + gate: needle ×3,
+  acceptance rate, identical reward curve on one round. Promoted: 1.3-2× on the
+  dominant cost for audit-sized effort.
+- **Experience replay** — substrate: `--replay-records` + `--replay-epochs`
+  already exist. Gap: driver-side retention policy (age ≤10 steps,
+  fresh-anchored, |A|-prioritized) + IS-corrected reuse (the preset's ratio
+  machinery already covers it — behavior logprobs are carried). Gate: held-out
+  parity at reuse 2-3×.
+- **Privileged self-distillation for all-fail tasks** (HDPO/OPSD) — substrate:
+  GKD machinery complete (`KlDirection` fwd/rev, temperature, λ-mix, teacher
+  source flag, teacher surface on infer-api). Gap: a privileged-prompt teacher
+  lane (same model + failing pytest output / reference patch in context) +
+  `KlReg{reference: Teacher}` wiring. The ~10×-class move; rescues the
+  zero-gradient tail. Gate: all-fail-task pass-rate delta on the real corpus.
+
+Standing rule this re-cost enforces: **audit in-tree substrate before costing
+any lever** (先用最好的再自己写) — the v1 costing of all three was wrong in the
+expensive direction.
 
 ## Priority rationale (value × effort × dependency)
 
@@ -264,7 +278,7 @@ lossless.
 | 5 | P5 task selection | 2-6× effective compute; biggest single multiplier | ~80 LOC | P2 metrics |
 | 6 | P6 engine capture | correctness hardening; unlocks P7 | engine plumbing | F.6 |
 | 7 | P7 staleness 1 | ~1.3-1.7×, ε-measured | small | P6 |
-| 8 | P8 replay / spec-decode / priv-distill | 1.4× / 1.3-2× / ~10×-class | each gated | P7 |
+| 8 | P8 spec-decode license / replay policy / priv-distill lane | 1.3-2× / 1.4× / ~10×-class | wire-and-license (substrate in-tree; see P8 re-cost) | spec+replay: P4; distill: P7 |
 
 Re-ranking vs v1: metrics moved INTO the orchestrator phase (sensor layer,
 not an afterthought); task selection promoted above staleness (bigger
