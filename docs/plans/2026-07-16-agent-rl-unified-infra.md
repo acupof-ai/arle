@@ -177,6 +177,48 @@ round-loop skeleton.
 | T5 | Deletions (E) — same tranche as replacement lands, no half-states | T3 |
 | T6 | Pod gates + bench entry + doc statuses (F) | T3-T5 |
 
+## G. Lossless-performance ceiling (refinement, 2026-07-16)
+
+Under strict on-policy, `rollout_i → train_i → merge_i → rollout_{i+1}` is an
+information-theoretic dependency, not an infra defect. Squeezing wall-clock
+without losing anything therefore has exactly three moves:
+
+1. **Sample-level pipeline — no group barriers (strictly lossless).**
+   Score/convert each sample the moment ITS rollout finishes, not when the
+   group does: pytest (≤300 s CPU) hides inside the window where sibling
+   samples are still rolling. After each merge, proactively re-prefill the
+   shared prefix (cache warm-up rides the merge control message) overlapped
+   with next-group workdir boot — the per-group re-prefill tax disappears.
+   Eval runs off checkpoints, off the critical path. The critical path
+   collapses to `max(sample rollouts) → train → merge`.
+2. **Staleness is an instrumented dial, not an architecture fork (ε-measured).**
+   `--staleness 0` = strict serial. `--staleness 1` = rollout_{i+1} under π_i
+   overlaps train_i; the IS ratio exists precisely to correct this, and with a
+   rank-16 LoRA at lr 1e-5 the per-group update is tiny → ratio≈1,
+   clip_frac≈0, the truncated-IS bias is directly read off the always-on
+   metrics (update.clip_frac + kl_rollout ≈ 0 ⇒ empirically lossless). Same
+   code path; the only difference is whether the driver awaits the merge.
+   Single-GPU degenerate form of AReaL's decoupled PPO. Precondition: engine
+   KV pool + autograd activations co-resident (measured on-pod, gate F.5).
+3. **Engine-native trajectory capture (kills three reconstruction errors at
+   once).** Record `(request_id, prompt_token_ids, gen_token_ids,
+   gen_logprobs)` at generation time, D2H at request finish
+   (graph-compatible). Replaces: time-window dump attribution (fragile),
+   chat-template re-render for masks (drift risk — span offsets come from the
+   engine's own renderer instead), and train-side V0 logprob recomputation
+   (whose "θ unchanged since generation" assumption is exactly what breaks at
+   staleness>0 — the 2026 "missing old logits" failure). Cost ≈ one f32
+   gather/token.
+
+Honest trade in (3): generation-time logprobs carry FP8-serve numerics while
+π_θ is computed under bf16 train numerics — ratio ≠ 1 even at θ = θ_b; V0
+recomputation is the mirror image (ratio exactly 1, but only valid at
+staleness 0). Decide at T3 with one measurement: the ratio distribution gap
+between both sources at staleness 0 = the numerics-noise floor.
+
+Added gate: **F.5** — co-residency VRAM ledger (KV pool + activations) before
+enabling `--staleness 1`; **F.6** — logprob-source ratio-floor measurement.
+
 ## Field grounding (mid-2026 survey)
 
 verl/NeMo-RL converged on **two pure functions over masked token tensors**
