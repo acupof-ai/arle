@@ -19,24 +19,27 @@ champion row — no second arm. Rules:
 
 ## DSv4-Flash-FP8 · 4×H20 GPUs 0–3 · TP=4/EP=4 · eager · port 8000
 
-Champion: `672b8ac08` (grid-parallel FP32 compressor + slot hoist), build
-`--features cuda,nccl`, pod `target/release/arle` (2026-07-16 08:11 build).
-Serve fingerprint: `arle serve --backend cuda --model-path
-/host/DeepSeek-V4-Flash-FP8 --port 8000`, slot line `256 clamped to 59,
-per_slot 338MB, budget 20584MB, shared comp capacity 84736 tokens`.
-Datasets: rates = `bench-prompts.jsonl` (20×~3352 tok, 60 s); c1/c32 =
-`bench-prompts-64.jsonl` (64 varied, 120 s). guidellm concurrent, seed
-20260416. Measured 2026-07-16
-([entry](experience/wins/2026-07-16-dsv4-fp32-scratch-hoist-slots.md)).
+Champion: `00b301643` (grid-parallel FP32 + slot hoist + carry coherence +
+plan repair), build `--features cuda,nccl`. **RE-ANCHORED fingerprint
+2026-07-17**: runner = `bench_throughput.py`, **max_tokens 256** (the earlier
+16-out era below is retired), dataset `bench-prompts.jsonl` (20×~3352 tok),
+60 s/point, seed 20260416, GPUs 0–3 TP=4/EP=4 eager, slot line `256 clamped
+to 59, per_slot 338MB, budget 20582MB, comp capacity 83968 tok`. Needle ×2
+passes (prefix-restore lane) zero-miss. Raw:
+`bench-output/2026-07-16-accept/`.
 
-| point | ok | total tok/s | out tok/s | TTFT p50 ms | ITL p50 ms |
-|---|---:|---:|---:|---:|---:|
-| rate 1 | 20 | 4514 | 21.4 | 446 | 21.5 |
-| rate 4 | 20 | 6663 | 31.7 | 1270 | 56.8 |
-| rate 8 | 20 | 7985 | 37.9 | 2612 | 48.6 |
-| rate 16 | 20 | 8130 | 38.6 | 5397 | 75.2 |
-| var-c1 | 35 | 850 | 4.9 | 3031 | 21.9 |
-| var-c32 | 59/101.5 s | — (accounting caveat) | — | 32630 | 2079 |
+| c | complete | out tok/s | total tok/s | TTFT p50/p99 ms | ITL p50/p99 ms |
+|---|---:|---:|---:|---|---|
+| 1 | 11 | 42.3 | 605 | 442 / 457 | 21.8 / 41.9 |
+| 4 | 20 | 73.3 | 1032 | 1532 / 7863 | 43.4 / 88.4 |
+| 8 | 40 | 137.3 | 1935 | 2726 / 2923 | 46.8 / 92.7 |
+| 16 | 48 | 169.6 | 2392 | 5294 / 5637 | 71.6 / 124.4 |
+| 32 (bench-prompts-64, 180 s) | 32/64 | 43.0 | 507 | 90800 | 134.7 | 
+
+c32 row is pre-crash (see below). Grid-time prefix hit_rate 0.925.
+
+Retired 16-out-era rows (guidellm, 2026-07-16, kept for the same-era A/B
+deltas only): rate 1/4/8/16 total 4514/6663/7985/8130; var-c1 850.
 
 **KNOWN CRASH at c32**: `HostPagedKvPool out of pages` is fatal at ~101 s
 ([errors](experience/errors/2026-07-16-dsv4-c32-hostpagedkvpool-fatal.md)) —
