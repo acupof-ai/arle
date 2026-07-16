@@ -37,6 +37,10 @@ fn capture_epoch_matches(captured: u64, current: Option<u64>) -> bool {
     current == Some(captured)
 }
 
+fn rekey_target_conflicts(source_page: u32, target_page: u32, target_exists: bool) -> bool {
+    source_page != target_page && target_exists
+}
+
 struct PendingPrefixCapture {
     slot: usize,
     slot_epoch: u64,
@@ -72,6 +76,9 @@ mod pending_prefix_tests {
         assert!(rekeyed.confirmed);
         rekeyed.cancel_provisional(&[7]);
         assert!(!rekeyed.cancelled);
+        assert!(rekey_target_conflicts(7, 9, true));
+        assert!(!rekey_target_conflicts(7, 9, false));
+        assert!(!rekey_target_conflicts(9, 9, true));
 
         let mut recycled = page(11);
         recycled.cancel_provisional(&[11]);
@@ -841,7 +848,11 @@ impl Dsv4CudaExecutor {
                     .collect()
             };
             for page in capture.pages {
-                if page.cancelled || (!page.confirmed && !epoch_matches) {
+                let target_exists = self.prefix_state.page_meta(page.target_page).is_some();
+                if page.cancelled
+                    || (!page.confirmed && !epoch_matches)
+                    || rekey_target_conflicts(page.source_page, page.target_page, target_exists)
+                {
                     continue;
                 }
                 if !self
