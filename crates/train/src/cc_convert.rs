@@ -34,6 +34,11 @@ pub struct CcWindow {
     /// lack the field → default 1.0 preserves today's passing = reward-1.0 flow.
     #[serde(default = "default_reward")]
     pub reward: f32,
+    /// Require the dump body's `model` to equal this (the cc harness tags each
+    /// sample's model id) — concurrent samples overlap in time, so wall-clock
+    /// alone would cross-attribute conversations. `None` = time-only (serial).
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 fn default_reward() -> f32 {
@@ -102,6 +107,7 @@ pub fn convert_cc_dumps(
         t_start_ms: 0,
         t_end_ms: u64::MAX,
         reward: default_reward(),
+        model: None,
     }];
     let windows = if windows.is_empty() {
         &whole_dir[..]
@@ -168,6 +174,9 @@ fn fullest_dump_in_window(
         let raw = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
         let body: serde_json::Value =
             serde_json::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
+        if window.model.as_deref().is_some_and(|m| body["model"] != m) {
+            continue;
+        }
         let len = body
             .get("messages")
             .and_then(serde_json::Value::as_array)

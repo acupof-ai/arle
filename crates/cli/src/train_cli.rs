@@ -136,6 +136,7 @@ fn run_cc_convert_impl(args: TrainCcConvertArgs) -> Result<()> {
                 .map_or_else(|| format!("w{idx}"), str::to_owned),
             // Manual --window has no attempt reward → passing default (CE flow).
             reward: 1.0,
+            model: None,
         });
     }
 
@@ -3004,6 +3005,13 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
 
     let needs = update_preset.needs();
     let sync_every_group = matches!(args.sync, crate::args::SyncArg::EveryGroup);
+    if !sync_every_group && needs.rollout_logprobs {
+        eprintln!(
+            "[agent-opd] WARNING: --sync every-round with a ratio-weighted preset — π_behavior is \
+             captured at update time, so intra-round drift is NOT corrected (ratios ≈ 1). \
+             Generation-time logprobs land in P6; every-group is the faithful cadence."
+        );
+    }
     let preset_name = clap::ValueEnum::to_possible_value(&args.update_strategy)
         .map_or_else(String::new, |v| v.get_name().to_owned());
     for round in 0..args.rounds {
@@ -3025,6 +3033,9 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
         let mut reward_sum = 0.0f64;
         let (mut prompt_tokens, mut completion_tokens) = (0u64, 0u64);
         let mut sync_lora_secs = 0.0f64;
+        // Round-scoped budget of TRAINABLE trajectories (parity with the
+        // pre-cc loop, where the cap bounded accepted pairs per round).
+        let mut cap_left = args.writeback_cap.unwrap_or(usize::MAX);
 
         let mut next_boot = tasks
             .first()
@@ -3126,12 +3137,18 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
                     truncated: false,
                 })
                 .collect();
-            if let Some(cap) = args.writeback_cap {
-                batch.truncate(cap);
+            if args.writeback_cap.is_some() {
+                if !needs.keep_failing {
+                    // Don't let failures (rejected inside `update`) burn budget.
+                    batch.retain(|t| t.reward >= 1.0);
+                }
+                batch.truncate(cap_left);
+                cap_left -= batch.len();
             }
-            // Capture π_rollout when the preset needs it. Under every-group
-            // sync θ still equals the rollout policy; under every-round the
-            // ratio gate absorbs the intra-round drift (F.6 measures the floor).
+            // Capture π_behavior when the preset needs it. Faithful under
+            // every-group sync (θ == rollout policy); under every-round this
+            // approximates π_behavior with the already-updated θ (startup
+            // warning above; P6 generation-time logprobs replace it).
             if needs.rollout_logprobs {
                 for traj in &mut batch {
                     let lp = train::opd::capture_rollout_logprobs(
