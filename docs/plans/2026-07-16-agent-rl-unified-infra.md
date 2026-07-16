@@ -3,8 +3,11 @@
 > Status: Active — 2026-07-16 (v2 full rewrite; v1 sections A-H consolidated).
 > Supersedes the orchestration half of
 > [2026-07-13-cc-as-harness-online-opd.md](2026-07-13-cc-as-harness-online-opd.md).
-> Landed so far: **P0** in-process serve plumbing (`b5f0f406`). **P1** UpdatePreset
-> in flight.
+> Landed: **P0** serve plumbing (`b5f0f406`+`46d4ebd5e`) · **P1** UpdatePreset
+> (`a0c7ed9ae`+`99a72ed19`) · **P2** orchestrator+metrics (`1a74d192d`..`acbe36461`)
+> · **P3** deletions net −1775 LOC (`ea060434a`+`0581cfdf1`+`9c3e11201`; Dr.GRPO
+> norm const 61440→22000 = CC_SESSION_TOKENS — old value was the deleted in-house
+> arm's turn×token budget). Next: **P4** pod E2E smoke + two-arm baseline (running).
 
 ## Verdict
 
