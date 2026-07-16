@@ -1,0 +1,173 @@
+# Scripts Index
+
+ARLE utility scripts, categorized by function. All paths relative to this
+directory unless noted.
+
+## Benchmarking
+
+| Script | Purpose |
+|---|---|
+| `bench_throughput.py` | Canonical OpenAI-compatible streaming throughput runner. |
+| `bench_ab.sh` | Matched A/B benchmark driver wrapping `bench_throughput.py`. |
+| `bench_compare.py` | Compare two benchmark JSON snapshots with Δ% and threshold. |
+| `bench_direct_http.py` | Direct HTTP streaming decode benchmark (no OpenAI client). |
+| `bench_dsv4_trace_http.py` | DSv4 trace-driven HTTP benchmark. |
+| `bench_kv_cache.py` | KV cache hit-rate and sharing benchmark. |
+| `bench_local_metal.py` | Local Metal backend benchmark. |
+| `bench_local_metal_all.sh` | Run full Metal benchmark grid. |
+| `bench_local_metal_supplement.sh` | Supplemental Metal benchmark shapes. |
+| `bench_mlx_http_decode.py` | MLX HTTP decode benchmark. |
+| `bench_multi_request.py` | Multi-request concurrent decode benchmark. |
+| `bench_multitenant_burst.py` | Multi-tenant burst throughput benchmark. |
+| `bench_agent.py` | Local agent end-to-end benchmark. |
+| `bench_agent_trace.py` | Agent trace-driven benchmark. |
+| `bench_long_agent.py` | Long-horizon agent benchmark. |
+| `bench_sglang_longctx.sh` | SGLang long-context baseline runner. |
+| `run_dsv4_bench.sh` | DSv4 benchmark orchestration. |
+| `run_fp8_probe.sh` | FP8 inference probe runner. |
+
+## Model Conversion
+
+| Script | Purpose |
+|---|---|
+| `convert_gptq_to_w4a16.py` | Convert GPTQ safetensors to ARLE W4A16 format (4-bit). |
+| `convert_gptq_w4a16_to_w4a8_marlin.py` | Convert W4A16 to hybrid W4A8 Marlin format. |
+| `convert_gptq.py` | Generic GPTQ format conversion. |
+| `convert_dspark_speculators.py` | Convert DSpark speculator checkpoints. |
+| `gguf_to_safetensors.py` | Convert GGUF to safetensors format. |
+| `merge_w4_hybrid_checkpoint.py` | Merge hybrid W4A16/W4A8 checkpoint shards. |
+| `setup_qwen3_yarn_config.py` | Set up YaRN RoPE config for Qwen models. |
+
+## Quantization
+
+| Script | Purpose |
+|---|---|
+| `quantize_weights.py` | General weight quantization utility. |
+| `quantize_qwen3_w4a8.py` | Quantize Qwen to W4A8 (pack_w4a8 + Marlin). |
+| `turboquant_weights.py` | TurboQuant 4-bit quantization. |
+| `qwen35_tq4_dense_parity.py` | Verify Qwen3.5 TQ4 dense parity. |
+| `qwen36_dense_to_nvfp4.py` | Convert Qwen3.6 dense to NVFP4 format. |
+| `requant_dspark_mxfp4_to_fp8.py` | Re-quantize DSpark MXFP4 to FP8. |
+| `marlin_repack.py` | GPTQ int32 → Marlin tile layout repack. |
+| `verify_gptq_w4a8_repack_quality.py` | Verify W4A8 repack quality vs baseline. |
+| `diag_w4a8_pack_roundtrip.py` | W4A8 pack round-trip diagnostic. |
+| `diag_w4a8_pack_roundtrip_multishape.py` | Multi-shape W4A8 pack round-trip diagnostic. |
+
+## Correctness Gates
+
+| Script | Purpose |
+|---|---|
+| `needle_gate.py` | Needle-in-haystack retrieval correctness gate. |
+| `lever_gate.sh` | Lever multi-step reasoning correctness gate. |
+| `prefix_reuse_gate.py` | Prefix-cache reuse correctness gate. |
+| `longctx_numerical_gate.py` | Long-context numerical quality gate. |
+| `verify_kv_cache.py` | KV cache correctness verification. |
+| `kv_recall_quality_eval.py` | KV-recall quality evaluation (Metal). |
+| `cuda_recall_needle.py` | CUDA recall needle test. |
+| `cuda_kv_capacity_probe.py` | CUDA KV cache capacity probe. |
+| `dsv4_batched_decode_validate.py` | DSv4 batched decode correctness. |
+| `dsv4_variable_shape_dsa_gate.py` | DSv4 variable-shape DSA correctness gate. |
+| `dsv4_multigpu_parity.sh` | DSv4 multi-GPU parity test. |
+| `assert_kernel_fired.sh` | Assert a specific CUDA kernel was launched. |
+
+## DSv4
+
+| Script | Purpose |
+|---|---|
+| `dsv4_c_sweep.py` | DSv4 concurrency sweep benchmark. |
+| `dsv4_concurrent_probe.py` | DSv4 concurrent inference probe. |
+| `dsv4_hot_cache_probe.py` | DSv4 hot-cache reuse probe. |
+| `dsv4_resident_ab.sh` | DSv4 resident-set A/B test. |
+| `dsv4_sparse_adversarial_probe.py` | DSv4 sparse attention adversarial probe. |
+| `dsv4_ttft_probe.py` | DSv4 TTFT measurement probe. |
+| `dsv4_plan_diff.py` | DSv4 plan diff visualization. |
+| `dsv4_beat_sglang_bench.sh` | DSv4 vs SGLang comparison benchmark. |
+| `dsv4_fast_build.sh` | Fast DSv4 CUDA build. |
+| `dsv4_toolchain.sh` | DSv4 native DeepEP/DeepGEMM toolchain validator. |
+
+## Evaluation
+
+| Script | Purpose |
+|---|---|
+| `arle_capability_eval.py` | ARLE capability evaluation (MMLU, GSM8K, etc.). |
+| `arle_capability_compare.py` | Compare capability eval results across backends. |
+| `arle_swe_pro_eval.py` | SWE-Pro evaluation harness. |
+| `llmbench.py` | Generic LLM benchmark runner. |
+| `score_rubric_eval.py` | Rubric-based evaluation scoring. |
+| `analyze_multi_seed.py` | Multi-seed eval analysis with mean±σ and Wilson CI. |
+| `hf_greedy_ref.py` | HuggingFace greedy-decode reference runner. |
+| `probe_report.py` | Probe logit-lens report generator. |
+| `reduce_operator_evidence.py` | FP8 operator evidence reduction analysis. |
+
+## OPD Training
+
+| Script | Purpose |
+|---|---|
+| `agent_opd_curve.sh` | Agentic OPD capability curve runner. |
+| `opd_capability_curve.py` | OPD capability curve generator. |
+| `opd_security_filter.py` | OPD rollout security content filter. |
+| `h20_teacher_student_opd_curve.sh` | H20 teacher-student OPD curve. |
+| `cc_opd_loop.sh` | CC-harness OPD training loop. |
+| `cc_run.sh` | CC-harness runner. |
+| `cc_swe_baseline.py` | CC-harness SWE baseline. |
+| `clean_opd_corpora.py` | Clean and deduplicate OPD training corpora. |
+| `fetch_opd_corpora.py` | Fetch OPD training corpora. |
+| `filter_inband.py` | Filter in-band calibrated task pool. |
+| `gen_36_warm_prefix_mix.py` | Generate warm prefix mix for eval. |
+| `gen_agent_opd_tasks.py` | Generate agent OPD training tasks. |
+| `gen_arle_longctx_eval.py` | Generate long-context eval tasks. |
+| `gen_terminal_tasks.py` | Generate Terminal-Bench tasks. |
+| `stage_opd_run_corpus.py` | Stage OPD run corpus. |
+| `stage_swe_pro.py` | Stage SWE-Pro eval. |
+| `tbench_calibrate.sh` | Terminal-Bench calibration. |
+| `tbench_full.sh` | Terminal-Bench full run. |
+| `tbench_opd_loop.sh` | Terminal-Bench OPD loop. |
+| `tb_exclude_security.sh` | Terminal-Bench security exclusion. |
+| `terminal_bench_eval.sh` | Terminal-Bench evaluation. |
+| `terminal_bench_serve.sh` | Terminal-Bench serve setup. |
+| `terminus_to_records.py` | Convert Terminus output to records. |
+| `train_and_chat.sh` | Quick train+chat smoke test. |
+
+## Build & Deploy
+
+| Script | Purpose |
+|---|---|
+| `install.sh` | One-line installer (Linux x86_64 / Apple Silicon). |
+| `docker_build_dev.sh` | Build dev Docker image. |
+| `docker_push.sh` | Push Docker image to registry. |
+| `pod.sh` | Remote pod build/run orchestration. |
+| `pod-build-env.sh` | Pod build environment setup. |
+| `pod-remote-build.sh` | Remote pod build wrapper. |
+| `pod-remote-run.sh` | Remote pod run wrapper. |
+| `pod-tilelang-env.sh` | Pod TileLang Python environment setup. |
+| `pod_pipeline.sh` | Pod CI pipeline. |
+| `pod_serve.sh` | Pod serving setup. |
+| `cuda_prebuilt_manifest.sh` | Generate prebuilt CUDA kernel manifest. |
+| `export_prebuilt_cuda_kernels.sh` | Export prebuilt CUDA kernels. |
+| `package_macos_metal_artifact.sh` | Package macOS Metal artifact. |
+| `kernel_artifacts.sh` | Kernel artifact packaging helper. |
+| `ci-fmt-check-changed.sh` | CI rustfmt check on changed files. |
+| `ci-patch-tvm-ffi.sh` | CI TVM FFI patch. |
+| `pre_push_checks.sh` | Pre-push validation checks. |
+| `check_repo_hygiene.py` | Repo hygiene checker (wins cap, etc.). |
+| `pick-gpu.sh` | GPU selection helper. |
+| `start_agent.sh` | Start local agent. |
+| `v100_qwen35_9b_load_smoke.sh` | V100 Qwen3.5-9B load smoke test. |
+| `reap_run.py` | Pod subreaper process wrapper. |
+| `vllm_serve_control.sh` | vLLM serve control for nsys benchmarks. |
+
+## Profiling
+
+| Script | Purpose |
+|---|---|
+| `profile_bench_common.sh` | Shared profiling benchmark functions. |
+| `profile_ncu_bench.sh` | Nsight Compute (ncu) profiling benchmark. |
+| `profile_nsys_bench.sh` | Nsight Systems (nsys) profiling benchmark. |
+| `analyze_nsys_overlap.py` | Analyze nsys trace overlap. |
+
+## Kernel Dev
+
+| Script | Purpose |
+|---|---|
+| `tilelang_jit_smoke.py` | TileLang JIT smoke test. |
+| `tilelang_metal_dev_backend.py` | TileLang Metal dev backend. |
