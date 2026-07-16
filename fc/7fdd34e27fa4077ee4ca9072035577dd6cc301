@@ -1,0 +1,21 @@
+scripts/bench_throughput.py
+  s_e9c031531705e1::t_7fb669d79f934b 231-233
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "fc7fdd34e27fa4077ee4ca9072035577dd6cc301",
+  "prompts": {},
+  "sessions": {
+    "s_e9c031531705e1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a68ffbb968caad0f5",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
