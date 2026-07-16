@@ -800,6 +800,7 @@ impl TpRuntime {
     /// accept decision consistent: a divergent draft length feeds the
     /// variable-length verify a different token count per rank, mismatching the
     /// per-forward collective count and deadlocking the lockstep coordinator.
+    #[cfg(feature = "cuda")]
     #[cfg_attr(not(all(feature = "cuda", feature = "nccl")), allow(unused_variables))]
     pub fn broadcast_rank0_i32(
         &self,
