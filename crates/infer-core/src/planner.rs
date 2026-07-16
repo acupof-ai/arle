@@ -117,8 +117,8 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
     /// victim's pages (park or recompute, the #162 path), so the loop
     /// terminates and later ticks fit. Inputs (lockstep host pool + plan) are
     /// identical on every rank, so the repair stays SPMD-deterministic.
-    pub(crate) fn retract_decode_to_fit(&mut self, plan: &mut ForwardPlan) {
-        if !self.kv.is_active() {
+    pub(crate) fn fit_plan_to_kv_pages(&mut self, plan: &mut ForwardPlan) {
+        if !self.kv.is_active() || self.plan_new_pages_needed(plan) <= self.kv.free_pages() {
             return;
         }
         while self.plan_new_pages_needed(plan) > self.kv.free_pages()

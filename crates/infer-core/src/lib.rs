@@ -658,7 +658,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             return Ok(());
         }
 
-        self.retract_decode_to_fit(&mut plan);
+        self.fit_plan_to_kv_pages(&mut plan);
         if plan.is_idle() {
             return Ok(());
         }
