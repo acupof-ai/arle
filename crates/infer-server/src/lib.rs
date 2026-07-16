@@ -578,6 +578,20 @@ where
         self.run_on_executor(|executor| executor.ensure_kv_pool())?
     }
 
+    /// Cancel every in-flight (waiting + active) engine request, returning how
+    /// many were cancelled. Orphan sweep for a caller that knows all clients
+    /// are gone (OPD round-loop quiesce). Runs on the engine thread between
+    /// steps; each cancelled row frees its KV slot via the normal finish path.
+    pub fn cancel_all_requests(&self) -> Result<usize> {
+        self.run_on_engine(|engine| {
+            let handles = engine.cancel_all_requests();
+            for handle in &handles {
+                log::warn!("[serve-engine] cancelled orphaned request {}", handle.id());
+            }
+            handles.len()
+        })
+    }
+
     /// Close the submit channel and join the engine thread.
     ///
     /// The engine drains its in-flight and waiting work to completion before the
@@ -791,15 +805,21 @@ fn serve_handle_relay_driver<E, K>(
     );
     let (work_tx, work_rx) = std::sync::mpsc::channel::<WorkItem>();
     let work_rx = std::sync::Arc::new(std::sync::Mutex::new(work_rx));
+    // request_id -> engine handle for `CancelRequest` lookups (client
+    // disconnect); inserted at submit, removed by the worker at stream end.
+    let handles: std::sync::Arc<Mutex<std::collections::HashMap<u64, RequestHandle>>> =
+        std::sync::Arc::default();
     let n_workers = serve.max_live_requests.clamp(1, 1024);
     for _ in 0..n_workers {
         let work_rx = std::sync::Arc::clone(&work_rx);
+        let handles = std::sync::Arc::clone(&handles);
         let tx = engine_tx.clone();
         std::thread::Builder::new()
             .name("arle-relay-worker".into())
             .spawn(move || {
                 while let Ok((request_id, _ticket, rx)) = work_rx.lock().unwrap().recv() {
                     relay_stream(request_id, rx, &tx);
+                    handles.lock().unwrap().remove(&request_id);
                     // _ticket drops here — live_requests decremented after relay completes
                 }
             })
@@ -814,6 +834,9 @@ fn serve_handle_relay_driver<E, K>(
                     let (prompt_tokens, max_tokens, sampling) = wire.submit_args();
                     match serve.submit_streaming(prompt_tokens, max_tokens, sampling) {
                         Ok((ticket, rx)) => {
+                            // Insert BEFORE handing to a worker so the worker's
+                            // remove-at-stream-end can never race the insert.
+                            handles.lock().unwrap().insert(request_id, ticket.handle());
                             let _ = work_tx.send((request_id, ticket, rx));
                         }
                         Err(e) => {
@@ -832,6 +855,19 @@ fn serve_handle_relay_driver<E, K>(
                 // the lockstep loop's ack window stalls at TICK_WINDOW. A send
                 // failure means the coordinator is gone — recv EOFs us out next.
                 let _ = engine_tx.send(RelayEnvelope::TickAck { rank: 0, seq });
+            }
+            // Client disconnected (`InFlightGuard::drop` -> coordinator
+            // broadcast): stop decoding the orphan so it frees its KV slot.
+            // A missing/finished handle is a benign race with natural finish.
+            Ok(Some(RelayEnvelope::CancelRequest { request_id })) => {
+                let handle = handles.lock().unwrap().get(&request_id).copied();
+                if let Some(handle) = handle
+                    && serve
+                        .run_on_engine(move |engine| engine.cancel_request(handle))
+                        .unwrap_or(false)
+                {
+                    log::info!("[local-relay-driver] cancelled req#{request_id} (client gone)");
+                }
             }
             Ok(Some(RelayEnvelope::StatsQuery { request_id })) => {
                 let counters = serve.counters();
@@ -1039,6 +1075,44 @@ mod tests {
         let done = done.expect("terminal Done item");
         assert_eq!(done.generated_tokens, streamed);
         assert_eq!(ticket.collect()?.generated_tokens, streamed);
+
+        serve.shutdown().expect("engine thread joins cleanly");
+        Ok(())
+    }
+
+    /// Dropping the streaming receiver (client disconnect) must cancel the
+    /// request — the engine frees the row instead of decoding to max_tokens.
+    #[test]
+    fn dropped_stream_receiver_cancels_the_request() -> Result<()> {
+        let config = SchedulerConfig {
+            num_slots: 1,
+            max_prompt_tokens: 4096,
+            max_total_tokens: 8192,
+            ..SchedulerConfig::default()
+        };
+        let kv = HostPagedKvPool::new(1, 256, 16);
+        let serve = ServeHandle::spawn(EchoExecutor, kv, config);
+
+        let (ticket, stream_rx) =
+            serve.submit_streaming(vec![10, 11, 12], 4000, SamplingParams::default())?;
+        // Wait for decode to start, then hang up like a killed client.
+        match stream_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(StreamItem::Token { .. }) => {}
+            other => panic!("expected a first streamed token, got {:?}", other.is_ok()),
+        }
+        drop(stream_rx);
+
+        let completed = ticket.collect()?;
+        assert_eq!(
+            completed.finish,
+            Some(infer_plan::FinishReason::Abort),
+            "orphaned stream must finish as Abort, not run to max_tokens"
+        );
+        assert!(
+            completed.generated_tokens.len() < 4000,
+            "cancelled request decoded {} tokens",
+            completed.generated_tokens.len()
+        );
 
         serve.shutdown().expect("engine thread joins cleanly");
         Ok(())
