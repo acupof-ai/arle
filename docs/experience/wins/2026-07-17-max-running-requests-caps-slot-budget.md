@@ -1,6 +1,6 @@
 # --max-running-requests caps the executor slot budget
 
-> Status: pending-remote — pod A/B queued (DSv4 8xH20, c32 comp-pool sizing).
+> Status: Shipped — pod A/B accepted 2026-07-17.
 
 ## Context
 
@@ -23,3 +23,29 @@ tokens (~15x). Bench numbers pending the pod A/B.
 
 Post-#154-3b DSv4 slots TRADE against comp-pool tokens — "the VRAM budget
 always binds first" no longer licenses over-provisioning the slot request.
+
+## Results (pod A/B, 4xH20 TP=4/EP=4 eager, ce5d0b833 build, native runner 256-out)
+
+Slot lines: default = `num_slots 59, shared comp capacity 83968 tokens`;
+`--max-running-requests 32` = `num_slots 32, shared comp capacity 1048576
+tokens (16384 engine pages)` — **12.5x comp capacity at the same 20582 MB
+budget** (hits the 32 x max_seq cap).
+
+c=32, 300 s, bench-prompts-64.jsonl:
+
+| arm | complete | out tok/s | total tok/s | TTFT p50/p99 | ITL p50/p99 |
+|---|---|---|---|---|---|
+| default (59 slots, oversubscribed) | 74 | 64.5 | 662.5 | 67.2 / 122.0 s | 85.6 / 1955 ms |
+| cap 32 | **121** | **91.9 (+42%)** | **1089.6 (+64%)** | 83.5 / 91.9 s | 134.6 / **308 ms (-84% p99)** |
+
+Grid c1/4/8/16 with the cap: within +-8% of the accept baseline (noise), TTFT
+p50 better at c4 (1194 vs 1532 ms) and c8 (2397 vs 2726 ms). The cap costs
+nothing at low concurrency and removes preempt-recompute storms at c32
+(default arm logged 192 KV-overflow preemptions; cap arm zero).
+
+## Rule
+
+Post-#154-3b, slots and comp-pool tokens trade against each other in one
+budget: slots beyond the offered concurrency are pure token-capacity waste.
+Set `--max-running-requests` to the real concurrency target on DSv4 serves.
+Raw: pod `bench-output/2026-07-16-ab-*`.
