@@ -4098,7 +4098,7 @@ fn compressor_forward_decode_graph(
     score_scratch: &mut HiddenStates,
     keepalive: &mut Dsv4ForwardKeepalive,
 ) -> Result<()> {
-    let width = if overlap { 2 * head_dim } else { head_dim };
+    let width = dsv4_compressor_width(head_dim, overlap);
     ensure!(
         kv_scratch.hidden_dim == width
             && kv_scratch.seq_len == 1
@@ -7601,11 +7601,14 @@ fn sparse_indexed_index_key_forward(
 /// FP32 main-value compressor. Re-runs the compressor forward in
 /// FP32 — BF16 input projections via cuBLASLt FP32-accumulate GEMM, FP32 APE, FP32
 /// state carry — to avoid BF16/FP8 value mismatches (#146, #150). Writes the BF16
-/// overlap carry + compressed output back into `state` so the downstream
-/// attention reads the FP32 values.
+/// overlap + pending carry mirrors and the compressed output back into `state`
+/// so the downstream attention AND the bf16 decode lane read the FP32 values.
 ///
 /// Runs on every prefill compression boundary (any `start_pos`, with prior
-/// compressed state); the decode fast path is unchanged.
+/// compressed state); the decode fast path is unchanged. Carry coherence: when
+/// `fp32_carry_stale` (a bf16-lane update / prefix restore / reset advanced the
+/// bf16 carry since the last probe), the bf16 carry is the authority — reseed
+/// FP32 from it before the probe reads pending/prev.
 #[allow(clippy::too_many_arguments)]
 fn compressor_fp32_probe(
     ctx: &DeviceContext,
@@ -7644,6 +7647,39 @@ fn compressor_fp32_probe(
          exceeds {}",
         scratch.kv_raw.len()
     );
+    if state.fp32_carry_stale {
+        let pending_elems = i32::try_from(state.fp32_pending_kv.len())
+            .map_err(|_| anyhow!("DSv4 FP32 carry pending elems exceed i32"))?;
+        let prev_elems = i32::try_from(state.fp32_prev_kv.len())
+            .map_err(|_| anyhow!("DSv4 FP32 carry prev elems exceed i32"))?;
+        let (pkv_b, _b0) = state.pending_kv.device_ptr(&ctx.stream);
+        let (psc_b, _b1) = state.pending_score.device_ptr(&ctx.stream);
+        let (prkv_b, _b2) = state.prev_overlap_kv.device_ptr(&ctx.stream);
+        let (prsc_b, _b3) = state.prev_overlap_score.device_ptr(&ctx.stream);
+        let (pkv, _f0) = state.fp32_pending_kv.device_ptr_mut(&ctx.stream);
+        let (psc, _f1) = state.fp32_pending_score.device_ptr_mut(&ctx.stream);
+        let (prkv, _f2) = state.fp32_prev_kv.device_ptr_mut(&ctx.stream);
+        let (prsc, _f3) = state.fp32_prev_score.device_ptr_mut(&ctx.stream);
+        // SAFETY: bf16/f32 carry buffers are allocated with identical element
+        // counts (`Dsv4CompressorState::new`).
+        unsafe {
+            ffi::dsv4_compressor_fp32_carry_reseed_cuda(
+                pkv_b as *const ffi::Half,
+                psc_b as *const ffi::Half,
+                prkv_b as *const ffi::Half,
+                prsc_b as *const ffi::Half,
+                pkv as *mut f32,
+                psc as *mut f32,
+                prkv as *mut f32,
+                prsc as *mut f32,
+                pending_elems,
+                prev_elems,
+                ctx.stream.cu_stream(),
+            )
+            .result()?;
+        }
+        state.fp32_carry_stale = false;
+    }
     let kv_raw = &mut scratch.kv_raw;
     let score_raw = &mut scratch.score_raw;
     let pending_kv = &mut state.fp32_pending_kv;
@@ -7709,6 +7745,8 @@ fn compressor_fp32_probe(
         let (prsc, _p3) = prev_score.device_ptr_mut(&ctx.stream);
         let (prkv_bf16, _p4) = state.prev_overlap_kv.device_ptr_mut(&ctx.stream);
         let (prsc_bf16, _p5) = state.prev_overlap_score.device_ptr_mut(&ctx.stream);
+        let (pkv_bf16, _p6) = state.pending_kv.device_ptr_mut(&ctx.stream);
+        let (psc_bf16, _p7) = state.pending_score.device_ptr_mut(&ctx.stream);
         let (compressed, _cg) = state.compressed.data.device_ptr_mut(&ctx.stream);
         // SAFETY: all buffers match the checked ratio, width, and token count.
         unsafe {
@@ -7723,6 +7761,8 @@ fn compressor_fp32_probe(
                 prsc as *mut f32,
                 prkv_bf16 as *mut ffi::Half,
                 prsc_bf16 as *mut ffi::Half,
+                pkv_bf16 as *mut ffi::Half,
+                psc_bf16 as *mut ffi::Half,
                 compressed as *mut ffi::Half,
                 token_count as i32,
                 start_pos_i32,
@@ -7796,7 +7836,7 @@ fn compressor_forward(
     keepalive: &mut Dsv4ForwardKeepalive,
 ) -> Result<()> {
     ensure!(ratio > 0, "DSv4 compressor ratio must be non-zero");
-    let width = if overlap { 2 * head_dim } else { head_dim };
+    let width = dsv4_compressor_width(head_dim, overlap);
     ensure!(
         compressor.wkv.rows == width && compressor.wgate.rows == width,
         "DSv4 compressor rows mismatch: wkv={} wgate={} expected width={width}",
@@ -7874,6 +7914,7 @@ fn compressor_forward(
         if !dsv4_verify_frozen() {
             sink.push(state.batched_update_ptrs(ctx));
             state.compressed.seq_len = compressed_rows;
+            state.fp32_carry_stale = true;
         }
         return Ok(());
     }
@@ -8035,6 +8076,8 @@ fn compressor_forward(
     // accepted-prefix commit re-forward (non-frozen) advances it for real.
     if !dsv4_verify_frozen() {
         state.compressed.seq_len = compressed_rows;
+        // bf16 lane advanced the carry; the next FP32 probe must reseed.
+        state.fp32_carry_stale = true;
     }
     Ok(())
 }
@@ -8592,7 +8635,7 @@ pub(crate) fn dsv4_compressor_update_batched(
     ptr_keepalive: &mut Vec<CudaSlice<u64>>,
 ) -> Result<()> {
     ensure!(ratio > 0, "DSv4 batched compressor ratio must be non-zero");
-    let width = if overlap { 2 * head_dim } else { head_dim };
+    let width = dsv4_compressor_width(head_dim, overlap);
     ensure!(
         kv_raw_batch.hidden_dim == width
             && kv_raw_batch.seq_len == n
