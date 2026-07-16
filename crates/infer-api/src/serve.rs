@@ -308,22 +308,42 @@ fn bind_and_serve(
     label: &str,
     shutdown: infer_server::ServeShutdown,
 ) -> Result<()> {
-    let bind = bind.to_owned();
+    let listener = std::net::TcpListener::bind((bind, port))
+        .with_context(|| format!("failed to bind {bind}:{port}"))?;
+    serve_listener(listener, router, label, shutdown, true)
+}
+
+#[cfg(any(
+    feature = "metal",
+    feature = "cuda",
+    feature = "hip",
+    feature = "vulkan",
+    feature = "cpu"
+))]
+fn serve_listener(
+    listener: std::net::TcpListener,
+    router: axum::Router,
+    label: &str,
+    shutdown: infer_server::ServeShutdown,
+    process_signals: bool,
+) -> Result<()> {
     let label = label.to_owned();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("failed to build serve tokio runtime")?;
     runtime.block_on(async move {
-        let listener = tokio::net::TcpListener::bind((bind.as_str(), port))
-            .await
-            .with_context(|| format!("failed to bind {bind}:{port}"))?;
+        listener
+            .set_nonblocking(true)
+            .context("failed to set listener non-blocking")?;
+        let listener = tokio::net::TcpListener::from_std(listener)
+            .context("failed to adopt listener into tokio")?;
         let addr = listener
             .local_addr()
             .context("failed to read listener local address")?;
         log::info!("serving OpenAI v1 on http://{addr} ({label})");
         axum::serve(listener, router)
-            .with_graceful_shutdown(shutdown_signal(shutdown))
+            .with_graceful_shutdown(shutdown_signal(shutdown, process_signals))
             .await
             .context("serve loop error")
     })
@@ -362,7 +382,10 @@ impl ServeThread {
 
 /// Serve an already-built router (e.g. [`crate::LoadedInferenceEngine::local_router`])
 /// on a background thread, leaving the caller free to keep driving the engine.
-/// Same serve loop as [`serve_http`] via [`bind_and_serve`].
+/// Binds in the caller so a port-in-use error surfaces here, not at `shutdown()`.
+/// Never touches process signals — the caller owns process lifecycle; the ONLY
+/// stop path is the [`ServeThread`] token (so a background server can't swallow
+/// the SIGTERM that should kill the whole training process).
 #[cfg(any(
     feature = "metal",
     feature = "cuda",
@@ -372,11 +395,12 @@ impl ServeThread {
 ))]
 pub fn serve_router_on_thread(router: axum::Router, bind: &str, port: u16) -> Result<ServeThread> {
     let shutdown = infer_server::ServeShutdown::new();
+    let listener = std::net::TcpListener::bind((bind, port))
+        .with_context(|| format!("failed to bind {bind}:{port}"))?;
     let thread_shutdown = shutdown.clone();
-    let bind = bind.to_owned();
     let join = std::thread::Builder::new()
         .name("arle-http-serve".to_string())
-        .spawn(move || bind_and_serve(&bind, port, router, "local router", thread_shutdown))
+        .spawn(move || serve_listener(listener, router, "local router", thread_shutdown, false))
         .context("spawn arle-http-serve thread")?;
     Ok(ServeThread { join, shutdown })
 }
@@ -471,12 +495,18 @@ mod tests {
     feature = "vulkan",
     feature = "cpu"
 ))]
-async fn shutdown_signal(shutdown: infer_server::ServeShutdown) {
+async fn shutdown_signal(shutdown: infer_server::ServeShutdown, process_signals: bool) {
     // SIGINT or SIGTERM (kill/pod_serve.sh/orchestrators send SIGTERM): without
     // handling SIGTERM the coordinator dies un-gracefully (drop(guard) skipped) → TP
     // workers reaped mid-NCCL-collective → wedged/leaked GPU contexts.
+    // `process_signals: false` (background server inside a training process):
+    // installing a handler would swallow the default-kill SIGTERM while only the
+    // HTTP loop exits — wait exclusively on the programmatic token instead.
     #[cfg(unix)]
     let terminate = async {
+        if !process_signals {
+            std::future::pending::<()>().await;
+        }
         use tokio::signal::unix::{SignalKind, signal};
         match signal(SignalKind::terminate()) {
             Ok(mut term) => {
@@ -492,6 +522,12 @@ async fn shutdown_signal(shutdown: infer_server::ServeShutdown) {
     };
     #[cfg(not(unix))]
     let terminate = std::future::pending::<()>();
+    let ctrl_c = async {
+        if !process_signals {
+            std::future::pending::<()>().await;
+        }
+        let _ = tokio::signal::ctrl_c().await;
+    };
 
     // Programmatic teardown (#135): `ServeShutdown::request()` from the
     // coordinator's fatal lockstep path must also unwind this loop — signals
@@ -503,7 +539,7 @@ async fn shutdown_signal(shutdown: infer_server::ServeShutdown) {
     };
 
     tokio::select! {
-        _ = tokio::signal::ctrl_c() => {}
+        _ = ctrl_c => {}
         _ = terminate => {}
         _ = requested => {}
     }
