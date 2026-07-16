@@ -82,7 +82,7 @@ pub(crate) struct Dsv4LayerPageState {
     /// the sub-page `tail` the radix match can't cover (`[matched_len,
     /// finish_len)`, < page_tokens). Present ONLY on the frontier entry when a
     /// finish landed off a page boundary; empty otherwise (aligned finishes and
-    /// every non-frontier page). Captured at the finish sync point, so the whole
+    /// every non-frontier page). Captured after the finish forward, so the whole
     /// frontier carry (overlap/idx_overlap/ring/pending) reflects `finish_len`.
     ///
     /// `pending_kv/score`: the incomplete compress block's raw rows (`finish_len
@@ -616,7 +616,7 @@ impl Dsv4LayerAttentionState {
     /// D2H one host page's share of this layer's state. `boundary` additionally
     /// captures the page-end registers + ring — valid only when the forward
     /// ended exactly at `page_tokens·(page_index+1)` (the caller's contract).
-    /// Host vectors are stream-ordered; the caller syncs once after all layers.
+    /// Host vectors are stream-ordered; the caller fences after all layers.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn capture_prefix_page(
         &self,
@@ -821,8 +821,8 @@ impl Dsv4LayerAttentionState {
     /// page's own content+carry): the sub-page tail the radix match can't cover,
     /// `[matched_len, finish_len)`. `pending_kv/score` = the incomplete compress
     /// block (`finish_len % ratio` tokens); `tail_staging`/`tail_dsa_*` = the
-    /// tail page's completed compress / DSA rows. All live at the finish sync
-    /// point; the caller syncs once after all layers.
+    /// tail page's completed compress / DSA rows. The caller fences after all
+    /// layers before reading them.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn capture_frontier_tail(
         &self,
