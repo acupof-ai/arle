@@ -1,0 +1,21 @@
+crates/autograd/src/tensor.rs
+  s_6773c539a98594::t_887821cd34c770 1196-1204
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "54afd888d4b1a288d74551b4c9b9967532d8e13e",
+  "prompts": {},
+  "sessions": {
+    "s_6773c539a98594": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f69e3-547c-7460-94f3-f1366a2a8a05",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
