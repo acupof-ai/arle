@@ -1,0 +1,23 @@
+CHANGELOG.md
+  s_84df39eb543901::t_d3f0d3c55ea8e1 26-34
+docs/experience/wins/2026-07-16-dsv4-fp32-probe-prefill-only-dspark-recovery.md
+  s_84df39eb543901::t_daec6dbac1cf1c 1-84
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "629628b70ba335155887949cb47f14e23961af36",
+  "prompts": {},
+  "sessions": {
+    "s_84df39eb543901": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "09b70280-1d0b-477b-9aa8-54f8da20ed0f",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
