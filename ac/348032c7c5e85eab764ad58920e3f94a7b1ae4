@@ -1,0 +1,91 @@
+Cargo.lock
+  s_0837ed412322fe::t_5651cb9b2700eb 180,184,186,1769-1779,1865
+crates/autograd/Cargo.toml
+  s_7a0ab3bd2ba9ac::t_ac442572fc5a57 22,31-32
+crates/autograd/src/tape.rs
+  s_035349bc1c9b41::t_0a5a2ca7bf60e1 797-799
+crates/cli/src/serve_multiproc.rs
+  s_67038b17df7668::t_ae57be41042717 438-445
+crates/infer-core/src/lib.rs
+  s_035349bc1c9b41::t_0fbfd758da0275 183-190,804-812
+crates/infer-cuda/src/attention/prefix_state.rs
+  s_035349bc1c9b41::t_85ca7a8aea0793 400-403
+crates/infer-cuda/src/executor.rs
+  s_035349bc1c9b41::t_95b77131a7bab3 406-413
+crates/infer-cuda/src/executor/dsv4.rs
+  s_035349bc1c9b41::t_a51d7a79b7cfbf 909-926
+crates/infer-cuda/src/executor/qwen.rs
+  s_035349bc1c9b41::t_4a7b36dc9175f5 236-253,324-325,327-346,356-365,367-368
+crates/infer-cuda/src/executor/qwen35.rs
+  s_035349bc1c9b41::t_445cf0fc37b451 26-60,601-609,3036-3060
+crates/infer-cuda/src/lib.rs
+  s_035349bc1c9b41::t_cf25788bc728b6 631-638
+crates/infer-metal/src/executor.rs
+  s_035349bc1c9b41::t_38c36b4bcf2353 541-548
+crates/infer-metal/src/kv_ssd.rs
+  s_035349bc1c9b41::t_d15a03133f02c8 140-160
+crates/infer-seam/src/lib.rs
+  s_7a0ab3bd2ba9ac::t_69b488d21cb9d7 83-103,343-346
+crates/infer-server/src/metrics.rs
+  s_035349bc1c9b41::t_87bdbe8162490f 273-326,350,401,446-448
+crates/infer-server/src/multiproc_relay.rs
+  s_035349bc1c9b41::t_22d7cf8952dacc 296-311,376-383,442-449
+crates/infer-server/src/schema.rs
+  s_035349bc1c9b41::t_898d0a5a453fbf 560-567,644-651
+crates/kv-native-sys/Cargo.toml
+  s_0837ed412322fe::t_471a314da4a72f 16-18
+crates/kv-native-sys/src/gds.rs
+  s_6773c539a98594::t_074efbc279b848 1-158
+crates/kv-native-sys/src/kv_tier.rs
+  s_0837ed412322fe::t_0ccfbd6d98c200 41-64,241-289,294-295,302,338,353-361,403-597,684-686,693,749-756,758,760,815,821-822,880-885,927-930,935,939-1072,1088,1101-1102,1115-1116,1124-1185,1194,1203-1204,1215-1216,1223,1228-1273,1289-1301,1303,1306-1307,1309-1311,1313-1315,1317-1318,1379,1514-1516,1572-1578,1581-1584,1587-1594,1626-1632,1659-1676
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "ac348032c7c5e85eab764ad58920e3f94a7b1ae4",
+  "prompts": {},
+  "sessions": {
+    "s_035349bc1c9b41": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f6a13-86ea-7bd0-9c38-0c65a3e5e157",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_0837ed412322fe": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f6a12-61c8-7bc3-a029-b359f1f4a3ed",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_67038b17df7668": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c4b3468e-feff-42b1-aa89-1f360f19b20b",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_6773c539a98594": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f69e3-547c-7460-94f3-f1366a2a8a05",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_7a0ab3bd2ba9ac": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f6a12-9293-7d13-bfca-8f94115246df",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
