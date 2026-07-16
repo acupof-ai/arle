@@ -1,0 +1,25 @@
+CHANGELOG.md
+  s_67038b17df7668::t_a96a61f4e3801d 26-36
+docs/baselines.md
+  s_67038b17df7668::t_73392777d5b7dc 37,39-42,47-50
+docs/experience/wins/2026-07-17-max-running-requests-caps-slot-budget.md
+  s_67038b17df7668::t_39a20db6c3b899 3,26-51
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "2d38b05da90e99a3cc64d90f1d9dfa8e44e55522",
+  "prompts": {},
+  "sessions": {
+    "s_67038b17df7668": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c4b3468e-feff-42b1-aa89-1f360f19b20b",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
