@@ -1,0 +1,21 @@
+docs/experience/wins/2026-07-16-l3-async-write.md
+  s_6773c539a98594::t_39af8d09fd2b6c 1-67
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "23b5031f3b52569238ca5adf4b8b84eef26814eb",
+  "prompts": {},
+  "sessions": {
+    "s_6773c539a98594": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f69e3-547c-7460-94f3-f1366a2a8a05",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
