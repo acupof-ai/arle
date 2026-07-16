@@ -1,0 +1,33 @@
+crates/autograd/src/ops/fused_linear_distill.rs
+  s_67038b17df7668::t_34caa4b0fb56b2 689-750,756-762,770-772,776,789,792,795-803,805,821-823,841,863,865-869,919,925-926,937-939,944,961,994-995,997-1006,1076,1628-1629,1638,1644-1646,1710
+crates/train/src/opd.rs
+  s_c60f1520c4fe09::t_4f0a5aaf697677 59-61,2997-3001,3004-3006,3008-3015,3039,3047,3098-3101,3108,3143,3221-3233,3235,3237-3239,3241,3243,3245,3254-3256,3261,3263,3281-3284,3302
+crates/train/src/update_strategy.rs
+  s_67038b17df7668::t_638d8ed5fba30e 8,182-188,190-195,201,272-276,278-283,289
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "a0c7ed9ae6df7566aaaab13cb0eb99309605e232",
+  "prompts": {},
+  "sessions": {
+    "s_67038b17df7668": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c4b3468e-feff-42b1-aa89-1f360f19b20b",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_c60f1520c4fe09": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a7f96e4b978c1cc36",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
