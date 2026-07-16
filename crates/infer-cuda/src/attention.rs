@@ -7798,7 +7798,15 @@ fn compressor_forward(
         "DSv4 compressor compressed rows {compressed_rows} exceed state capacity {compressed_capacity}"
     );
 
-    if !dsv4_verify_frozen() && token_count > 0 && precomputed.is_none() && defer_update.is_none() {
+    // FP32 probe: prefill-only (start_pos_device None). Decode (start_pos_device
+    // Some, token_count==1) uses the BF16 path — the #146/#150 corruption was a
+    // multi-token prefill boundary issue, so decode needs no FP32 re-projection.
+    if !dsv4_verify_frozen()
+        && token_count > 0
+        && start_pos_device.is_none()
+        && precomputed.is_none()
+        && defer_update.is_none()
+    {
         compressor_fp32_probe(
             ctx,
             config,
