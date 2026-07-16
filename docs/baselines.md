@@ -19,27 +19,32 @@ champion row — no second arm. Rules:
 
 ## DSv4-Flash-FP8 · 4×H20 GPUs 0–3 · TP=4/EP=4 · eager · port 8000
 
-Champion: `2e635eda3` (grid-parallel FP32 compressor), build sha256
-`fd568375fc06…`, pod archive `/host/arle-build/arle-armB-gridpar`.
+Champion: `672b8ac08` (grid-parallel FP32 compressor + slot hoist), build
+`--features cuda,nccl`, pod `target/release/arle` (2026-07-16 08:11 build).
 Serve fingerprint: `arle serve --backend cuda --model-path
-/host/DeepSeek-V4-Flash-FP8 --port 8000`, slot line `256 clamped to 2,
-per_slot 9618MB, budget 20840MB`. Datasets: rates = `bench-prompts.jsonl`
-(20×~3352 tok, 60 s); c1/c32 = `bench-prompts-64.jsonl` (64 varied, 120 s).
-guidellm concurrent, seed 20260416. Measured 2026-07-16
-([entry](experience/wins/2026-07-16-dsv4-fp32-compressor-grid-parallel.md)).
+/host/DeepSeek-V4-Flash-FP8 --port 8000`, slot line `256 clamped to 59,
+per_slot 338MB, budget 20584MB, shared comp capacity 84736 tokens`.
+Datasets: rates = `bench-prompts.jsonl` (20×~3352 tok, 60 s); c1/c32 =
+`bench-prompts-64.jsonl` (64 varied, 120 s). guidellm concurrent, seed
+20260416. Measured 2026-07-16
+([entry](experience/wins/2026-07-16-dsv4-fp32-scratch-hoist-slots.md)).
 
-| point | ok | total tok/s | TTFT p50/p99 ms | ITL p50/p99 ms |
-|---|---:|---:|---|---|
-| rate 1 | 20 | 4116.8 | 521 / 3541 | 21.47 / 21.99 |
-| rate 4 | 20 | 5339.4 | 1467 / 2295 | 75.80 / 81.24 |
-| rate 8 | 20 | 5604.5 | 3921 / 4584 | 69.73 / 74.75 |
-| rate 16 | 20 | 5481.2 | 6698 / 9686 | 72.61 / 77.71 |
-| var-c1 | 35 | 853.6 | 3019 / 3082 | 21.83 / 22.35 |
-| var-c32 | 41 | 1007.5 | 51842 / 87832 | 160.38 / 166.73 |
+| point | ok | total tok/s | out tok/s | TTFT p50 ms | ITL p50 ms |
+|---|---:|---:|---:|---:|---:|
+| rate 1 | 20 | 4514 | 21.4 | 446 | 21.5 |
+| rate 4 | 20 | 6663 | 31.7 | 1270 | 56.8 |
+| rate 8 | 20 | 7985 | 37.9 | 2612 | 48.6 |
+| rate 16 | 20 | 8130 | 38.6 | 5397 | 75.2 |
+| var-c1 | 35 | 850 | 4.9 | 3031 | 21.9 |
+| var-c32 | 59/101.5 s | — (accounting caveat) | — | 32630 | 2079 |
 
-Pure-prefill anchor (c1, no queueing): ~3352-tok prompt / 521 ms TTFT ≈
-**6434 tok/s prefill**.
+**KNOWN CRASH at c32**: `HostPagedKvPool out of pages` is fatal at ~101 s
+([errors](experience/errors/2026-07-16-dsv4-c32-hostpagedkvpool-fatal.md)) —
+c32 rows are pre-crash; fix pending before this regime is production-safe.
 
-Archived arms (pod): `arle-armA-serialprobe` (60be54d9a-equivalent, serial
-probe), `arle-armB-gridpar` (2e635eda3). Raw:
-`/host/arle-build/bench-output/2026-07-16-{fp32par,fp32serialA}-*`.
+Pure-prefill anchor (c1, no queueing): ~3352-tok prompt / 446 ms TTFT ≈
+**7516 tok/s prefill**.
+
+Archived arms (pod): `arle-armA-serialprobe` (serial probe),
+`arle-armB-gridpar` (2e635eda3, per_slot 9618MB/2 slots). Raw:
+`/host/arle-build/bench-output/2026-07-16-{fp32par,fp32serialA,fp32slots}-*`.
