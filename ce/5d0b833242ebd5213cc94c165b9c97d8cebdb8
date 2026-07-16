@@ -1,0 +1,21 @@
+docs/experience/wins/2026-07-17-max-running-requests-caps-slot-budget.md
+  s_28825b290b9e51::t_6e823399817872 1-25
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "ce5d0b833242ebd5213cc94c165b9c97d8cebdb8",
+  "prompts": {},
+  "sessions": {
+    "s_28825b290b9e51": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a37f9ed5dbf9a3db9",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
