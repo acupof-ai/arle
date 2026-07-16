@@ -1,0 +1,33 @@
+docs/plans/2026-07-08-cc-as-harness.md
+  s_7e271081a269f9::t_a6a9c68ef646ac 95-99,113-114,117-121,126-127,191-192,202-203
+docs/plans/2026-07-13-cc-as-harness-online-opd.md
+  s_2d6f2874d4a09c::t_219b2b2a0744f1 3-5
+scripts/stage_swe_pro.py
+  s_7e271081a269f9::t_c9ba0c9d26d979 12,235,335
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "ea060434a9d313d3d255c21cc8a2e9bf92d0afc3",
+  "prompts": {},
+  "sessions": {
+    "s_2d6f2874d4a09c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aaa85bc696c96c52e",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_7e271081a269f9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a18d1c202066cf128",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
