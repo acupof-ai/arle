@@ -1,0 +1,39 @@
+crates/infer-core/src/lib.rs
+  s_e7907486d8a42b::t_da20c2f52c9faf 668-671,1386-1420,1670-1671,1675-1679,4324-4403
+crates/infer-core/src/prefix.rs
+  s_e7907486d8a42b::t_04ed7037e287b9 122-125,130,133-136,182-197,238-239,244,398-406,411-416,418-428,430-436,438,445-446,452,454,459
+crates/infer-hip/src/kv_pool.rs
+  s_e7907486d8a42b::t_d4630ffd238852 215-220
+crates/infer-seam/src/host_paged_kv_pool.rs
+  s_e7907486d8a42b::t_b28e9b4d49f18b 44-50,68,83-95,99-111,129,160-167,229,254-257,268-269,286,306,330,357-366,370-372,413-417,421-425,440-456
+crates/infer-seam/src/kv_query.rs
+  s_946e75f124c4ca::t_f78bef7c1d73e5 33-37,42-50
+docs/experience/errors/2026-07-16-dsv4-c32-hostpagedkvpool-fatal.md
+  s_e7907486d8a42b::t_5d7965034b197f 92-167
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "f03a54f4ae9fb382ee8f7b7ac32fc95f4d379bdd",
+  "prompts": {},
+  "sessions": {
+    "s_946e75f124c4ca": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a3488b266d71afb5f",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_e7907486d8a42b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a49dd81af2127d047",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
