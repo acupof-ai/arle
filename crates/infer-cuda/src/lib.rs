@@ -686,6 +686,14 @@ impl BackendExecutor for CudaExecutor {
         }
     }
 
+    fn max_prefill_chunk(&self) -> usize {
+        match &self.inner {
+            CudaExecutorInner::Placeholder => usize::MAX,
+            #[cfg(feature = "cuda")]
+            CudaExecutorInner::Real(real) => real.max_prefill_chunk(),
+        }
+    }
+
     fn model_stop_token_ids(&self) -> Vec<u32> {
         match &self.inner {
             CudaExecutorInner::Placeholder => Vec::new(),

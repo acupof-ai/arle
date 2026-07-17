@@ -292,12 +292,21 @@ pub trait BackendExecutor {
         self.reusable_prefix_blocks(blocks)
     }
 
-    /// Extra chunk-end alignment beyond KV pages, in tokens — a backend whose
-    /// side state snapshots only at its own forward-call end (e.g. DSv4's
-    /// ring) needs every intermediate boundary forced, not just the deepest.
-    /// Default `1`: no additional constraint.
+    /// Extra chunk-END alignment beyond KV pages, in tokens: the planner
+    /// aligns each prefill chunk's end position to `lcm(page_size, this)`, so
+    /// backend side state that snapshots at forward-call ends (e.g. DSv4's
+    /// ring) lands on restorable boundaries. End alignment only — chunk SIZE
+    /// is bounded by [`Self::max_prefill_chunk`]. Default `1`: no constraint.
     fn prefill_restore_boundary_alignment(&self) -> usize {
         1
+    }
+
+    /// Largest single prefill forward this executor accepts, in tokens; also
+    /// the restore-snapshot grain when > restore alignment (a forward
+    /// snapshots boundary state only at its own end, so a bigger chunk
+    /// coarsens the boundary grid). Default: unbounded.
+    fn max_prefill_chunk(&self) -> usize {
+        usize::MAX
     }
 
     /// Notify the backend that host prefix-cache pages were evicted from the

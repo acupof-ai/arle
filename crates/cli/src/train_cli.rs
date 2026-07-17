@@ -1763,7 +1763,7 @@ fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
             total_pages: args.rollout_num_slots.max(1) * student_seq.div_ceil(16),
             max_prompt_tokens: student_seq,
             max_total_tokens: student_seq,
-            chunked_prefill_size: student_seq,
+            chunked_prefill_size: Some(student_seq),
             dspark_draft_model: args.runtime.dspark_draft_model.clone(),
             dspark_conf_threshold: args.runtime.dspark_conf_threshold,
             ..EngineLoadConfig::default()
@@ -1893,7 +1893,7 @@ fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
                 total_pages: args.judge_num_slots.max(1) * judge_total.div_ceil(16),
                 max_prompt_tokens: judge_prompt_cap,
                 max_total_tokens: judge_total,
-                chunked_prefill_size: judge_prompt_cap,
+                chunked_prefill_size: Some(judge_prompt_cap),
                 ..EngineLoadConfig::default()
             },
         )
@@ -2864,7 +2864,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
             // memory and the engine preempts under KV pressure (#162).
             max_prompt_tokens: cc_total_pages * 16 - 256,
             max_total_tokens: cc_total_pages * 16,
-            chunked_prefill_size: CC_SESSION_TOKENS,
+            chunked_prefill_size: Some(CC_SESSION_TOKENS),
             // The autograd student co-resides with this engine, so the engine
             // must NOT greedily reserve 0.9 of free VRAM (the SGLang default) —
             // its KV pool is num_slots-based (small). Cap the static reservation
@@ -4072,7 +4072,7 @@ fn load_opd_infer_teacher(
             total_pages: max_seq_len.div_ceil(page_size),
             max_prompt_tokens: max_seq_len,
             max_total_tokens: max_seq_len,
-            chunked_prefill_size: max_seq_len,
+            chunked_prefill_size: Some(max_seq_len),
             ..EngineLoadConfig::default()
         },
     )
@@ -4130,7 +4130,7 @@ fn load_opd_infer_student(
             total_pages: max_seq_len.div_ceil(page_size),
             max_prompt_tokens: max_seq_len,
             max_total_tokens: max_seq_len,
-            chunked_prefill_size: max_seq_len,
+            chunked_prefill_size: Some(max_seq_len),
             dspark_draft_model: runtime.dspark_draft_model.clone(),
             dspark_conf_threshold: runtime.dspark_conf_threshold,
             ..EngineLoadConfig::default()
