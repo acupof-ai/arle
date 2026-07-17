@@ -23,6 +23,16 @@ Progress spine. Entry classes recorded here the day they land: phase exits,
 default flips, and accept-or-reject verdicts (AGENTS.md §Docs lifecycle &
 progress spine).
 
+- **2026-07-17 — DSv4 extension-prompt prefix reuse fixed (accept, wash).**
+  The finish write-through's frontier recapture clobbered the prefill
+  chunk-end's tail-less boundary entry, so every diverging-suffix prompt (the
+  multi-turn shape) licensed 0 reuse blocks and later finishes retroactively
+  destroyed hitting shapes. Fix keeps the aligned boundary entry; prefix_reuse
+  gates 2000+2003 PASS (reuse_hit 1792t ×3), needle 27/27, bench wash
+  (−0.3…−1.2% inside drift band, c32 TTFT −18.6%). Also closed #165 (CSA
+  indexer bf16 pending now in the write-through image, pod-verified).
+  [wins](docs/experience/wins/2026-07-17-dsv4-extension-prefix-reuse-fix.md) ·
+  #165 #166.
 - **2026-07-17 — DSv4 prefill chunk default 128→2048 (default flip, accept).**
   The planner's one-unit alignment cap pinned every DSv4 prefill tick at 128
   tokens and made `--chunked-prefill-size` cosmetic. Three-phase unification
