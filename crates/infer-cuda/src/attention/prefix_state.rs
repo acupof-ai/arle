@@ -450,6 +450,16 @@ impl Dsv4PrefixStatePool {
         // content-identical sharer's republish.
         let confirmed = self.meta.get(&page_id).is_some_and(|m| m.confirmed);
         if let Some(old) = self.meta.get(&page_id) {
+            let clears_tail = self.frontier_tails.contains_key(&page_id);
+            if (old.boundary && !entry.boundary) || clears_tail {
+                log::info!(
+                    "prefix-pool republish page {page_id}: boundary {}->{} tail_cleared={clears_tail}",
+                    old.boundary,
+                    entry.boundary
+                );
+            }
+        }
+        if let Some(old) = self.meta.get(&page_id) {
             self.lru.remove(&(old.confirmed, old.stamp, page_id));
         }
         let stamp = self.next_stamp();
