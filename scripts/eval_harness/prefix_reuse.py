@@ -113,6 +113,9 @@ class PrefixReuseGate(Gate):
         reuse_rate = reuse_ok / n_a
         ctrl_rate = ctrl_ok / n_t
         fail = reuse_ok < ctrl_ok and ctrl_rate > 0 and reuse_rate + 0.34 < ctrl_rate
+        # ctrl (full recompute) never retrieving the needle means the corruption
+        # check is running blind — the verdict rests on arm parity alone.
+        needle_sensitive = ctrl_ok > 0
 
         avg_hit_tok = sum(r["reuse_hit_tokens"] for r in actual_runs) / n_a
         avg_reuse_dt = sum(r["reuse_dt"] for r in actual_runs) / n_a
@@ -126,6 +129,7 @@ class PrefixReuseGate(Gate):
                 "target_tokens": self.target,
                 "runs": n_t,
                 "reuse_runs_actual": n_a,
+                "needle_sensitive": needle_sensitive,
                 "reuse_needle": f"{reuse_ok}/{n_a}",
                 "ctrl_needle": f"{ctrl_ok}/{n_t}",
                 "avg_reuse_hit_tokens": round(avg_hit_tok, 1),
@@ -137,4 +141,6 @@ class PrefixReuseGate(Gate):
         )
         if fail:
             v.reason = f"reuse {reuse_ok}/{n_a} < ctrl {ctrl_ok}/{n_t} — KV corruption"
+        elif not needle_sensitive:
+            v.reason = "needle-insensitive doc (ctrl 0 retrievals) — passed on arm parity only"
         return v
