@@ -2111,6 +2111,18 @@ fn flashmla_pack_compressed_delta(
     Ok(())
 }
 
+/// Host-side tail slice for the SW ring update. Only the last `window` rows of
+/// a `seq_len`-row batch can survive in the ring; writing the earlier rows too
+/// makes up to `ceil(seq_len/window)` unordered same-slot writers race in
+/// `dsv4_update_window_cache_kernel` (`slot = (start_pos+token) % window`,
+/// dsv4_swa.cu) — nondeterministic SWA keys for the next chunk once prefill
+/// chunks exceed the window. Returns `(rows_skipped, adjusted_start_pos,
+/// rows_to_write)`; a no-op `(0, start_pos, seq_len)` at `seq_len <= window`.
+fn sw_ring_tail_slice(seq_len: usize, window: usize, start_pos: usize) -> (usize, usize, usize) {
+    let skip = seq_len.saturating_sub(window);
+    (skip, start_pos + skip, seq_len - skip)
+}
+
 fn update_bf16_sw_window(
     ctx: &DeviceContext,
     sw_window_cache: &mut CudaSlice<half::bf16>,
@@ -2131,6 +2143,15 @@ fn update_bf16_sw_window(
     // SAFETY: ptrs from live device allocations sized to the dims passed.
     unsafe {
         if let Some(start_pos_device) = start_pos_device {
+            // start_pos lives on device — the host can't tail-slice. Decode/MTP
+            // rows are far below the window; oversize here is a bug, not a path.
+            ensure!(
+                k_prepared.seq_len <= config.sliding_window,
+                "DSv4 SW ring device-start_pos update rows {} > window {} (host tail-slice \
+                 unavailable; the update kernel would race same-slot writers)",
+                k_prepared.seq_len,
+                config.sliding_window
+            );
             let (start_ptr, _sg) = start_pos_device.device_ptr(&ctx.stream);
             ffi::dsv4_update_window_cache_start_pos_ptr_cuda(
                 k_ptr as *const ffi::Half,
@@ -2143,10 +2164,13 @@ fn update_bf16_sw_window(
             )
             .result()?;
         } else {
+            let (skip, start_pos, rows) =
+                sw_ring_tail_slice(k_prepared.seq_len, config.sliding_window, start_pos);
+            let k_ptr = k_ptr + (skip * config.head_dim * 2) as u64;
             ffi::dsv4_update_window_cache_cuda(
                 k_ptr as *const ffi::Half,
                 window_ptr as *mut ffi::Half,
-                k_prepared.seq_len as i32,
+                rows as i32,
                 start_pos as i32,
                 config.sliding_window as i32,
                 config.head_dim as i32,
