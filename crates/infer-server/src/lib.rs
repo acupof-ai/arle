@@ -717,10 +717,13 @@ fn relay_stream(
     use multiproc_relay::RelayEnvelope;
     for item in rx {
         let delta = match item {
-            execution::StreamItem::Token { token, .. } => multiproc_relay::RelayCompletionDelta {
-                token_ids: vec![token],
-                ..Default::default()
-            },
+            execution::StreamItem::Token { token, logprob } => {
+                multiproc_relay::RelayCompletionDelta {
+                    token_ids: vec![token],
+                    logprobs: logprob.into_iter().collect(),
+                    ..Default::default()
+                }
+            }
             execution::StreamItem::Done(completed) => multiproc_relay::RelayCompletionDelta {
                 finish: true,
                 finish_reason: completed.finish.clone(),
@@ -765,25 +768,20 @@ fn serve_handle_relay_driver<E, K>(
                         });
                         let delta = match result {
                             Ok(Ok(Some(out))) => multiproc_relay::RelayCompletionDelta {
-                                text_delta: String::new(),
                                 token_ids: out.generated_tokens,
                                 finish: true,
                                 finish_reason: Some(out.finish),
-                                error: None,
+                                ..Default::default()
                             },
                             Ok(Ok(None)) => multiproc_relay::RelayCompletionDelta {
-                                text_delta: String::new(),
-                                token_ids: Vec::new(),
                                 finish: true,
-                                finish_reason: None,
                                 error: Some("generate_multimodal returned None".to_string()),
+                                ..Default::default()
                             },
                             Ok(Err(e)) | Err(e) => multiproc_relay::RelayCompletionDelta {
-                                text_delta: String::new(),
-                                token_ids: Vec::new(),
                                 finish: true,
-                                finish_reason: None,
                                 error: Some(e.to_string()),
+                                ..Default::default()
                             },
                         };
                         let _ = req.response_tx.send(delta);

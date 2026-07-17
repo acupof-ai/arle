@@ -54,8 +54,21 @@ fn splitmix64(mut x: u64) -> u64 {
 /// sub-millisecond, so no new GPU sampling kernel is required.
 #[must_use]
 pub fn sample_token(logits: &[f32], params: &SamplingParams, position: u64) -> u32 {
+    sample_token_logprob(logits, params, position).0
+}
+
+/// [`sample_token`] plus the behavior log-probability of the drawn token under
+/// the SAME filtered, renormalized distribution the draw came from — the IS
+/// ratio denominator for on-policy RL. `None` for greedy (a delta policy) and
+/// for the degenerate-distribution argmax fallback.
+#[must_use]
+pub fn sample_token_logprob(
+    logits: &[f32],
+    params: &SamplingParams,
+    position: u64,
+) -> (u32, Option<f32>) {
     if params.is_greedy() || logits.is_empty() {
-        return argmax_logit(logits);
+        return (argmax_logit(logits), None);
     }
 
     // Temperature-scaled, numerically stable softmax over all candidates.
@@ -105,7 +118,7 @@ pub fn sample_token(logits: &[f32], params: &SamplingParams, position: u64) -> u
     // fall back to greedy rather than silently returning token 0.
     let total: f32 = cand.iter().map(|(_, p)| *p).sum();
     if cand.is_empty() || !total.is_finite() || total <= 0.0 {
-        return argmax_logit(logits);
+        return (argmax_logit(logits), None);
     }
 
     // Multinomial draw over the surviving candidates.
@@ -122,10 +135,11 @@ pub fn sample_token(logits: &[f32], params: &SamplingParams, position: u64) -> u
     for (idx, p) in &cand {
         acc += *p;
         if target < acc {
-            return *idx;
+            return (*idx, Some((*p / total).ln()));
         }
     }
-    cand.last().map_or(0, |(idx, _)| *idx)
+    cand.last()
+        .map_or((0, None), |(idx, p)| (*idx, Some((*p / total).ln())))
 }
 
 fn sample_unfiltered_temperature(
@@ -134,13 +148,13 @@ fn sample_unfiltered_temperature(
     max: f32,
     params: &SamplingParams,
     position: u64,
-) -> u32 {
+) -> (u32, Option<f32>) {
     let mut total = 0.0f32;
     for &logit in logits {
         total += ((logit - max) * inv_t).exp();
     }
     if !total.is_finite() || total <= 0.0 {
-        return argmax_logit(logits);
+        return (argmax_logit(logits), None);
     }
 
     let bits = splitmix64(
@@ -153,13 +167,15 @@ fn sample_unfiltered_temperature(
     let unit = (bits >> 40) as f32 / (1u32 << 24) as f32; // [0, 1)
     let target = unit * total;
     let mut acc = 0.0;
+    let logprob = |logit: f32| Some((logit - max) * inv_t - total.ln());
     for (idx, &logit) in logits.iter().enumerate() {
         acc += ((logit - max) * inv_t).exp();
         if target < acc {
-            return idx as u32;
+            return (idx as u32, logprob(logit));
         }
     }
-    logits.len().saturating_sub(1) as u32
+    let last = logits.len().saturating_sub(1);
+    (last as u32, logprob(logits[last]))
 }
 
 #[cfg(test)]

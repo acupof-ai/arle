@@ -2162,10 +2162,12 @@ mod backend {
         Ok(infer_core::Engine::with_config(executor, kv, scheduler))
     }
 
-    /// New tokens since the last drain, per handle.
+    /// New tokens (+ optional behavior logprob) since the last drain, per handle.
     #[cfg(feature = "cuda")]
     type PendingTokens = std::rc::Rc<
-        std::cell::RefCell<std::collections::HashMap<infer_core::RequestHandle, Vec<u32>>>,
+        std::cell::RefCell<
+            std::collections::HashMap<infer_core::RequestHandle, Vec<(u32, Option<f32>)>>,
+        >,
     >;
 
     /// One multiproc worker rank's engine. Steps SYNCHRONOUSLY per relayed
@@ -2203,7 +2205,7 @@ mod backend {
                         .borrow_mut()
                         .entry(handle)
                         .or_default()
-                        .push(token.token);
+                        .push((token.token, token.logprob));
                 }));
             }
             Ok(Self {
@@ -2355,11 +2357,19 @@ mod backend {
                 if new_tokens.is_empty() && !finish {
                     continue; // nothing new to report this tick
                 }
+                // logprobs is all-or-nothing per delta (a partial vector would
+                // misalign the sidecar's token↔logprob pairing downstream).
+                let logprobs = new_tokens
+                    .iter()
+                    .map(|&(_, lp)| lp)
+                    .collect::<Option<Vec<f32>>>()
+                    .unwrap_or_default();
                 out.push((
                     request_id,
                     infer_server::RelayCompletionDelta {
                         text_delta: String::new(),
-                        token_ids: new_tokens,
+                        token_ids: new_tokens.into_iter().map(|(t, _)| t).collect(),
+                        logprobs,
                         finish,
                         finish_reason,
                         error,

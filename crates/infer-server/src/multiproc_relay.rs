@@ -470,6 +470,11 @@ pub struct RelayCompletionDelta {
     pub text_delta: String,
     /// Token ids newly emitted in this delta.
     pub token_ids: Vec<u32>,
+    /// Generation-time behavior logprobs, one per `token_ids` entry — or empty
+    /// when the executor did not capture them (greedy, non-CUDA arms). Serde
+    /// default so pre-P6 workers interoperate.
+    #[serde(default)]
+    pub logprobs: Vec<f32>,
     /// Whether this is the terminal delta for the request.
     pub finish: bool,
     /// Finish reason on the terminal delta, so the coordinator reports the real

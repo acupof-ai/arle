@@ -1324,7 +1324,7 @@ impl Qwen35CudaExecutor {
         &mut self,
         row: &infer_plan::PrefillRow,
         position: u64,
-    ) -> Result<u32> {
+    ) -> Result<(u32, Option<f32>)> {
         let slot = row.slot;
         if std::env::var_os("ARLE_KVDRIFT_DEBUG").is_some() {
             let pool_len = self
@@ -1403,7 +1403,7 @@ impl Qwen35CudaExecutor {
             model.config.hidden_size,
             row.tokens.len(),
         );
-        let token = model.forward_tokens_recall_tapped(
+        let (token, logprob) = model.forward_tokens_recall_tapped(
             &mut slots[slot],
             workspace,
             &row.tokens,
@@ -1436,14 +1436,18 @@ impl Qwen35CudaExecutor {
         )?;
         let is_final = row.start_pos + row.tokens.len() == row.total_tokens;
         df.pending = (is_final && df.ctx_end == row.total_tokens).then_some(token);
-        Ok(token)
+        Ok((token, logprob))
     }
 
     /// One DEFAULT paged decode row (no recall cycle): append this step's token
     /// to the shared `full_attn_kv` pool and attend the FULL resident page set
     /// (`PageMeta::for_slot`). Mirrors [`Self::decode_row_recall`] but without
     /// the working-set restriction and without any tier I/O.
-    fn decode_row_paged_default(&mut self, row: &DecodeRow, position: u64) -> Result<u32> {
+    fn decode_row_paged_default(
+        &mut self,
+        row: &DecodeRow,
+        position: u64,
+    ) -> Result<(u32, Option<f32>)> {
         let slot = row.slot;
         {
             let pool = self
@@ -1525,11 +1529,11 @@ impl Qwen35CudaExecutor {
                 Some(s) if s.pending == Some(row.last_token) && s.ctx_end == start
             );
         if !seeded {
-            let token = self.dspark_warm_decode_row(row, position)?;
+            let (token, logprob) = self.dspark_warm_decode_row(row, position)?;
             return Ok(vec![SlotToken {
                 slot: row.slot,
                 token,
-                logprob: None,
+                logprob,
                 finish: None,
             }]);
         }
@@ -1557,11 +1561,11 @@ impl Qwen35CudaExecutor {
             Some(s) if s.pending == row.last_token
         );
         if !seeded {
-            let token = self.mtp_warm_decode_row(row)?;
+            let (token, logprob) = self.mtp_warm_decode_row(row)?;
             return Ok(vec![SlotToken {
                 slot: row.slot,
                 token,
-                logprob: None,
+                logprob,
                 finish: None,
             }]);
         }
@@ -1573,7 +1577,7 @@ impl Qwen35CudaExecutor {
     /// step. Returns the pending token as the
     /// decode output (the prefill already returned the first token; this is the
     /// second). The spec step starts from the stored (pending, hidden).
-    fn mtp_warm_decode_row(&mut self, row: &DecodeRow) -> Result<u32> {
+    fn mtp_warm_decode_row(&mut self, row: &DecodeRow) -> Result<(u32, Option<f32>)> {
         let slot = row.slot;
         let start = row.kv_seq_len;
         if self.full_attn_paged() {
@@ -1613,14 +1617,15 @@ impl Qwen35CudaExecutor {
             )?;
             let vocab = dims[1];
             let mut spec = model.new_spec_slot_state()?;
-            let pending = if row.params.is_greedy() {
-                crate::ops::argmax_row_into(
+            let (pending, logprob) = if row.params.is_greedy() {
+                let tok = crate::ops::argmax_row_into(
                     &model.ctx,
                     &logits,
                     dims[0] - 1,
                     vocab,
                     spec.argmax_scratch_mut(),
-                )?
+                )?;
+                (tok, None)
             } else {
                 // Sampled seed so the pending token is policy-distributed (the
                 // warm forward is seq=1, so `logits` is exactly one vocab row).
@@ -1637,7 +1642,7 @@ impl Qwen35CudaExecutor {
                 pending,
                 hidden,
             });
-            Ok(pending)
+            Ok((pending, logprob))
         } else {
             let Self {
                 model,
@@ -1655,14 +1660,15 @@ impl Qwen35CudaExecutor {
             )?;
             let vocab = dims[1];
             let mut spec = model.new_spec_slot_state()?;
-            let pending = if row.params.is_greedy() {
-                crate::ops::argmax_row_into(
+            let (pending, logprob) = if row.params.is_greedy() {
+                let tok = crate::ops::argmax_row_into(
                     &model.ctx,
                     &logits,
                     dims[0] - 1,
                     vocab,
                     spec.argmax_scratch_mut(),
-                )?
+                )?;
+                (tok, None)
             } else {
                 // Sampled seed so the pending token is policy-distributed (the
                 // warm forward is seq=1, so `logits` is exactly one vocab row).
@@ -1679,7 +1685,7 @@ impl Qwen35CudaExecutor {
                 pending,
                 hidden,
             });
-            Ok(pending)
+            Ok((pending, logprob))
         }
     }
 
@@ -1758,10 +1764,10 @@ impl Qwen35CudaExecutor {
         }
         Ok(emitted
             .into_iter()
-            .map(|token| SlotToken {
+            .map(|(token, logprob)| SlotToken {
                 slot,
                 token,
-                logprob: None,
+                logprob,
                 finish: None,
             })
             .collect())
@@ -1770,7 +1776,11 @@ impl Qwen35CudaExecutor {
     /// with tap capture, extending the ctx cache + pending anchor when the
     /// cache is contiguous. Non-paged rows run plain and clear the draft state
     /// (speculation re-seeds at the next paged step).
-    fn dspark_warm_decode_row(&mut self, row: &DecodeRow, position: u64) -> Result<u32> {
+    fn dspark_warm_decode_row(
+        &mut self,
+        row: &DecodeRow,
+        position: u64,
+    ) -> Result<(u32, Option<f32>)> {
         let slot = row.slot;
         if !self.full_attn_paged() {
             if let Some(df) = self.dspark.as_mut().and_then(|ds| ds.slots[slot].as_mut()) {
@@ -1822,7 +1832,7 @@ impl Qwen35CudaExecutor {
         } else {
             None
         };
-        let token = model.forward_tokens_recall_tapped(
+        let (token, logprob) = model.forward_tokens_recall_tapped(
             &mut slots[slot],
             workspace,
             &[row.last_token],
@@ -1843,7 +1853,7 @@ impl Qwen35CudaExecutor {
             )?;
             df.pending = Some(token);
         }
-        Ok(token)
+        Ok((token, logprob))
     }
 
     /// One DSpark block spec step: draft a block from the draft head's ctx
@@ -1882,11 +1892,11 @@ impl Qwen35CudaExecutor {
         if chain.len() < 2 {
             // Confidence head rejected the whole block — warm step instead.
             let position = start.saturating_add(1) as u64;
-            let token = self.dspark_warm_decode_row(row, position)?;
+            let (token, logprob) = self.dspark_warm_decode_row(row, position)?;
             return Ok(vec![SlotToken {
                 slot,
                 token,
-                logprob: None,
+                logprob,
                 finish: None,
             }]);
         }
@@ -1937,7 +1947,16 @@ impl Qwen35CudaExecutor {
         // 4. Accept scan + trunk rollback (linear replay; full-attn KV
         //    self-heals under the pool crop below).
         let (emitted, bonus, k) = if row.params.is_greedy() {
-            model.dspark_accept_commit(&mut slots[slot], spec, workspace, &chain, &logits, start)?
+            // Greedy: delta policy, no behavior logprob (P6 sidecar skips greedy).
+            let (tokens, bonus, k) = model.dspark_accept_commit(
+                &mut slots[slot],
+                spec,
+                workspace,
+                &chain,
+                &logits,
+                start,
+            )?;
+            (tokens.into_iter().map(|t| (t, None)).collect(), bonus, k)
         } else {
             model.dspark_accept_commit_sampled(
                 &mut slots[slot],
@@ -1978,10 +1997,10 @@ impl Qwen35CudaExecutor {
         ds.partial_ctx_chains += usize::from(partial_ctx);
         Ok(emitted
             .into_iter()
-            .map(|token| SlotToken {
+            .map(|(token, logprob)| SlotToken {
                 slot,
                 token,
-                logprob: None,
+                logprob,
                 finish: None,
             })
             .collect())
@@ -1996,7 +2015,11 @@ impl Qwen35CudaExecutor {
     /// 4. Write-back-evict cold middle to tier, free physical pages immediately (no in-flight attn race).
     ///
     /// After return, `recall[slot].recall_pages()` is the immutable working set for decode.
-    fn prefill_row_recall(&mut self, row: &infer_plan::PrefillRow, position: u64) -> Result<u32> {
+    fn prefill_row_recall(
+        &mut self,
+        row: &infer_plan::PrefillRow,
+        position: u64,
+    ) -> Result<(u32, Option<f32>)> {
         let slot = row.slot;
         let cfg = self.recall_cfg;
         {
@@ -2145,7 +2168,7 @@ impl Qwen35CudaExecutor {
 
     /// One decode row over the recall pool (`--kv-recall`): append + attend, ZERO tier I/O.
     /// Working set fixed at prefill. Alloc token, read fixed `recall_pages`, forward + sample.
-    fn decode_row_recall(&mut self, row: &DecodeRow, position: u64) -> Result<u32> {
+    fn decode_row_recall(&mut self, row: &DecodeRow, position: u64) -> Result<(u32, Option<f32>)> {
         let slot = row.slot;
         {
             let pool = self
@@ -2203,7 +2226,11 @@ impl Qwen35CudaExecutor {
     ///
     /// See [`crate::qwen35::Qwen35Model::forward_decode_step_captured`] for
     /// capture-safety table and perf formula.
-    fn try_graph_decode(&mut self, row: &DecodeRow, position: u64) -> Result<Option<u32>> {
+    fn try_graph_decode(
+        &mut self,
+        row: &DecodeRow,
+        position: u64,
+    ) -> Result<Option<(u32, Option<f32>)>> {
         if !self.decode_graph_armed {
             return Ok(None);
         }
@@ -2385,7 +2412,7 @@ impl Qwen35CudaExecutor {
         // (including the whole-step B=1 decode-graph lane, which is gated to
         // rows==1 PLANS — batched/mixed steps never capture or replay).
         if rows == 1 {
-            let (slot, token) = if let Some(row) = plan.prefill_rows.first() {
+            let (slot, (token, logprob)) = if let Some(row) = plan.prefill_rows.first() {
                 (row.slot, self.submit_prefill_row(row)?)
             } else {
                 let row = &plan.decode_rows[0];
@@ -2408,7 +2435,7 @@ impl Qwen35CudaExecutor {
                 tokens: vec![SlotToken {
                     slot,
                     token,
-                    logprob: None,
+                    logprob,
                     finish: None,
                 }],
             });
@@ -2434,11 +2461,11 @@ impl Qwen35CudaExecutor {
 
         let mut tokens = Vec::with_capacity(rows);
         for row in &plan.prefill_rows {
-            let token = self.submit_prefill_row(row)?;
+            let (token, logprob) = self.submit_prefill_row(row)?;
             tokens.push(SlotToken {
                 slot: row.slot,
                 token,
-                logprob: None,
+                logprob,
                 finish: None,
             });
         }
@@ -2456,11 +2483,12 @@ impl Qwen35CudaExecutor {
                 // Mixed tick with a single decode row: eager (the B=1 graph
                 // lane stays gated to rows==1 plans in stage 1).
                 let row = &plan.decode_rows[0];
-                let token = self.submit_decode_row(row, /* allow_graph = */ false)?;
+                let (token, logprob) =
+                    self.submit_decode_row(row, /* allow_graph = */ false)?;
                 tokens.push(SlotToken {
                     slot: row.slot,
                     token,
-                    logprob: None,
+                    logprob,
                     finish: None,
                 });
             }
@@ -2471,7 +2499,7 @@ impl Qwen35CudaExecutor {
 
     /// One prefill row as its own single-row sub-step (the pre-batching
     /// single-row prefill arm, factored).
-    fn submit_prefill_row(&mut self, row: &infer_plan::PrefillRow) -> Result<u32> {
+    fn submit_prefill_row(&mut self, row: &infer_plan::PrefillRow) -> Result<(u32, Option<f32>)> {
         ensure!(
             row.slot < self.num_slots,
             "prefill slot {} outside Qwen3.5 executor slots {}",
@@ -2601,7 +2629,7 @@ impl Qwen35CudaExecutor {
         &mut self,
         row: &infer_plan::PrefillRow,
         position: u64,
-    ) -> Result<u32> {
+    ) -> Result<(u32, Option<f32>)> {
         let start = row.start_pos;
         let end = start + row.tokens.len();
         let is_final = end == row.total_tokens;
@@ -2679,7 +2707,11 @@ impl Qwen35CudaExecutor {
     /// One decode row as a single-row forward (the pre-batching single-row
     /// decode arm, factored). `allow_graph` admits the whole-step B=1
     /// decode-graph lane — true only for rows==1 plans.
-    fn submit_decode_row(&mut self, row: &DecodeRow, allow_graph: bool) -> Result<u32> {
+    fn submit_decode_row(
+        &mut self,
+        row: &DecodeRow,
+        allow_graph: bool,
+    ) -> Result<(u32, Option<f32>)> {
         ensure!(
             row.slot < self.num_slots,
             "decode slot {} outside Qwen3.5 executor slots {}",
@@ -2807,11 +2839,12 @@ impl Qwen35CudaExecutor {
             // Correctness floor: recall / quant-KV / TP → serial per-row paged.
             let mut tokens = Vec::with_capacity(rows.len());
             for row in rows {
-                let token = self.submit_decode_row(row, /* allow_graph = */ false)?;
+                let (token, logprob) =
+                    self.submit_decode_row(row, /* allow_graph = */ false)?;
                 tokens.push(SlotToken {
                     slot: row.slot,
                     token,
-                    logprob: None,
+                    logprob,
                     finish: None,
                 });
             }
@@ -2823,11 +2856,12 @@ impl Qwen35CudaExecutor {
         if !qwen35_batched_decode_enabled() || self.recall_active() {
             let mut tokens = Vec::with_capacity(rows.len());
             for row in rows {
-                let token = self.submit_decode_row(row, /* allow_graph = */ false)?;
+                let (token, logprob) =
+                    self.submit_decode_row(row, /* allow_graph = */ false)?;
                 tokens.push(SlotToken {
                     slot: row.slot,
                     token,
-                    logprob: None,
+                    logprob,
                     finish: None,
                 });
             }
@@ -2875,10 +2909,10 @@ impl Qwen35CudaExecutor {
         Ok(slot_indices
             .into_iter()
             .zip(sampled)
-            .map(|(slot, token)| SlotToken {
+            .map(|(slot, (token, logprob))| SlotToken {
                 slot,
                 token,
-                logprob: None,
+                logprob,
                 finish: None,
             })
             .collect())
@@ -2971,10 +3005,10 @@ impl Qwen35CudaExecutor {
         Ok(slot_indices
             .into_iter()
             .zip(sampled)
-            .map(|(slot, token)| SlotToken {
+            .map(|(slot, (token, logprob))| SlotToken {
                 slot,
                 token,
-                logprob: None,
+                logprob,
                 finish: None,
             })
             .collect())

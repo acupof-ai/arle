@@ -140,10 +140,10 @@ fn qwen35_profile<T>(
 /// keeps the in-tree kernel, so the default is safe across build flavors.
 /// Read once — prefill is never graph-captured, so a process-lifetime latch
 /// is safe.
-fn qwen35_fa3_enabled() -> bool {
+fn qwen35_fa3_enabled(ctx: &DeviceContext) -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
-        if !crate::runtime_flags::qwen35_fa3() {
+        if !crate::runtime_flags::qwen35_fa3() || ctx.compute_capability() != (9, 0) {
             return false;
         }
         // SAFETY: pure host query exported by both the real shim and the stub.
@@ -162,7 +162,7 @@ fn qwen35_fa3_enabled() -> bool {
 /// the vendored FA3 split-KV + PackGQA path. Default OFF until the 4K/c=1
 /// needle + ITL gate licenses it. This path uses a host `seqlen_k` launch
 /// parameter, so keep it out of the whole-step decode graph for now.
-fn qwen35_fa3_decode_enabled() -> bool {
+fn qwen35_fa3_decode_enabled(ctx: &DeviceContext) -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
         if !crate::runtime_flags::qwen35_fa3_decode() {
@@ -175,7 +175,7 @@ fn qwen35_fa3_decode_enabled() -> bool {
             );
             return false;
         }
-        qwen35_fa3_enabled()
+        qwen35_fa3_enabled(ctx)
     })
 }
 
@@ -507,6 +507,10 @@ pub(crate) struct Qwen35SlotState {
 /// the executor's free-list. Released back by a finished request and popped by
 /// the next one — same dims for every slot, so any block fits any slot.
 pub(crate) type RecurrentBlock = (Vec<CudaSlice<f32>>, Vec<DeviceVec>);
+
+/// One committed token + its behavior logprob under the filtered sampling
+/// dist (`None` = uncaptured: greedy / delta policy).
+pub(crate) type CommittedToken = (u32, Option<f32>);
 
 /// D2H snapshot of the recurrent state at a prefix boundary.
 /// Used by the sidecar prefix-cache to restore the recurrent layers
@@ -3329,8 +3333,8 @@ impl Qwen35Model {
     /// Run prefill or decode for one row. `start_pos` is the absolute position of
     /// the first token; `tokens` are the new tokens (whole prompt on prefill, one
     /// token on decode). Advances `slot.seq_len` and the recurrent state. Returns
-    /// the next sampled token. `ws` is the executor's persistent forward
-    /// workspace (serial forwards share one).
+    /// the next sampled token + its behavior logprob (`None` for greedy). `ws` is
+    /// the executor's persistent forward workspace (serial forwards share one).
     pub(crate) fn forward_tokens(
         &self,
         slot: &mut Qwen35SlotState,
@@ -3339,7 +3343,7 @@ impl Qwen35Model {
         start_pos: usize,
         params: &SamplingParams,
         position: u64,
-    ) -> Result<u32> {
+    ) -> Result<(u32, Option<f32>)> {
         qwen35_profile(&self.ctx, "qwen/forward_hidden", None, tokens.len(), || {
             self.forward_hidden(slot, ws, tokens, start_pos)
         })?;
@@ -3365,7 +3369,7 @@ impl Qwen35Model {
         params: &SamplingParams,
         position: u64,
         recall: &mut Qwen35RecallForward,
-    ) -> Result<u32> {
+    ) -> Result<(u32, Option<f32>)> {
         self.forward_tokens_recall_tapped(
             slot, ws, tokens, start_pos, params, position, recall, None,
         )
@@ -3385,7 +3389,7 @@ impl Qwen35Model {
         position: u64,
         recall: &mut Qwen35RecallForward,
         taps: Option<&mut dspark::Qwen35DsparkTaps>,
-    ) -> Result<u32> {
+    ) -> Result<(u32, Option<f32>)> {
         ensure!(
             !tokens.is_empty(),
             "Qwen3.5 recall forward requires at least one token"
@@ -3436,7 +3440,7 @@ impl Qwen35Model {
         ws: &mut Qwen35Workspace,
         params: &SamplingParams,
         position: u64,
-    ) -> Result<u32> {
+    ) -> Result<(u32, Option<f32>)> {
         let Qwen35Workspace {
             logits, argmax_out, ..
         } = ws;
@@ -3936,7 +3940,7 @@ impl Qwen35Model {
         depth: usize,
         params: &SamplingParams,
         recall: Option<&mut Qwen35RecallForward>,
-    ) -> Result<(Vec<u32>, u32, DeviceVec)> {
+    ) -> Result<(Vec<CommittedToken>, u32, DeviceVec)> {
         ensure!(depth >= 1, "spec_step requires depth >= 1, got {depth}");
         // The MTP head KV (spec.head_k/head_v) was sized (spec_draft_tokens+1)
         // rows by new_spec_slot_state; a depth beyond that would overflow the
@@ -4012,8 +4016,10 @@ impl Qwen35Model {
                     break;
                 }
             }
-            let mut emitted: Vec<u32> = chain[1..=k].to_vec();
-            emitted.push(bonus);
+            // Greedy: delta policy, no behavior logprob (P6 sidecar skips greedy).
+            let mut emitted: Vec<CommittedToken> =
+                chain[1..=k].iter().map(|&t| (t, None)).collect();
+            emitted.push((bonus, None));
             if k < depth {
                 spec.restore_trunk(&self.ctx, slot)?;
                 // LINEAR-ONLY replay: restore_trunk just rewound the 48 gated-delta
@@ -4061,7 +4067,7 @@ impl Qwen35Model {
     /// distributed exactly as filtered target sampling. Identical rollback set
     /// to the greedy path: `restore_trunk` + `replay_linear_only` +
     /// `set_seq_len` (the full-attn KV self-heals under the caller's seq
-    /// rewind / pool truncate). Returns `(emitted, bonus, k)`.
+    /// rewind / pool truncate). Returns `(emitted-with-logprobs, bonus, k)`.
     fn mtp_accept_commit_sampled(
         &self,
         slot: &mut Qwen35SlotState,
@@ -4071,7 +4077,7 @@ impl Qwen35Model {
         logits: &DeviceVec,
         start_pos: usize,
         params: &SamplingParams,
-    ) -> Result<(Vec<u32>, u32, usize)> {
+    ) -> Result<(Vec<CommittedToken>, u32, usize)> {
         let ctx = &self.ctx;
         let depth = chain.len() - 1;
         let cap = self.spec_draft_tokens.max(1);
@@ -4157,8 +4163,17 @@ impl Qwen35Model {
             k <= depth,
             "mtp chain kernel returned k {k} > depth {depth}"
         );
-        let mut emitted: Vec<u32> = chain[1..=k].to_vec();
-        emitted.push(bonus);
+        let mut tokens: Vec<u32> = chain[1..=k].to_vec();
+        tokens.push(bonus);
+        // Behavior logprobs: committed token j is marginally distributed as the
+        // filtered target dist p_j (chain rejection-sampling exactness), and the
+        // p rows are still materialized + final (verdict D2H synced above).
+        let logprobs = chain_commit_logprobs(ctx, p_all, vocab, &tokens)?;
+        let emitted = tokens
+            .into_iter()
+            .zip(logprobs)
+            .map(|(t, lp)| (t, Some(lp)))
+            .collect();
         if k < depth {
             spec.restore_trunk(ctx, slot)?;
             self.replay_linear_only(slot, ws, &spec.capture, k)?;
@@ -5229,7 +5244,8 @@ impl Qwen35Model {
                 || {
                     // SAFETY: ptrs from live device allocations sized to the dims passed.
                     unsafe {
-                        if seq_len == 1 && c.head_dim == 256 && qwen35_fa3_decode_enabled() {
+                        if seq_len == 1 && c.head_dim == 256 && qwen35_fa3_decode_enabled(&self.ctx)
+                        {
                             // FA3 split-KV decode mirrors SGLang/FlashInfer's
                             // flash-decoding shape: split the 4K KV sweep into
                             // multiple KV ranges, then combine partial softmax
@@ -5317,7 +5333,7 @@ impl Qwen35Model {
                                 self.ctx.stream.cu_stream(),
                             )
                             .result()?;
-                        } else if c.head_dim == 256 && qwen35_fa3_enabled() {
+                        } else if c.head_dim == 256 && qwen35_fa3_enabled(&self.ctx) {
                             // FA3 fwd over the SAME buffers the in-tree kernel uses:
                             // q/out token-major [S, h, 256] (HD256 prep layout),
                             // cache head-major [h_k, max_seq, 256]. Passing the
@@ -6405,7 +6421,7 @@ impl Qwen35Model {
         kv_seq_lens: &[usize],
         params: &[SamplingParams],
         sample_positions: &[u64],
-    ) -> Result<Vec<u32>> {
+    ) -> Result<Vec<(u32, Option<f32>)>> {
         let b = tokens.len();
         ensure!(b >= 1, "Qwen3.5 batched decode requires at least one row");
         ensure!(
@@ -6623,14 +6639,18 @@ impl Qwen35Model {
         let out = params
             .iter()
             .enumerate()
-            .map(|(r, p)| -> anyhow::Result<u32> {
+            .map(|(r, p)| -> anyhow::Result<(u32, Option<f32>)> {
                 if p.is_greedy() {
-                    return Ok(greedy_ids[r] as u32);
+                    return Ok((greedy_ids[r] as u32, None));
                 }
                 let row_vec = row_logits.get(&self.ctx, vocab)?;
                 copy_row_to_vec(&self.ctx, logits_buf, r, row_vec)?;
                 let host = row_vec.to_host(&self.ctx)?;
-                Ok(infer_plan::sample_token(&host, p, sample_positions[r]))
+                Ok(infer_plan::sample_token_logprob(
+                    &host,
+                    p,
+                    sample_positions[r],
+                ))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
         Ok(out)
@@ -6664,7 +6684,7 @@ impl Qwen35Model {
         kv_seq_lens: &[usize],
         params: &[SamplingParams],
         sample_positions: &[u64],
-    ) -> Result<Vec<u32>> {
+    ) -> Result<Vec<(u32, Option<f32>)>> {
         let b = tokens.len();
         ensure!(
             b >= 1,
@@ -6856,14 +6876,18 @@ impl Qwen35Model {
         let out = params
             .iter()
             .enumerate()
-            .map(|(r, p)| -> anyhow::Result<u32> {
+            .map(|(r, p)| -> anyhow::Result<(u32, Option<f32>)> {
                 if p.is_greedy() {
-                    return Ok(greedy_ids[r] as u32);
+                    return Ok((greedy_ids[r] as u32, None));
                 }
                 let row_vec = row_logits.get(&self.ctx, vocab)?;
                 copy_row_to_vec(&self.ctx, logits_buf, r, row_vec)?;
                 let host = row_vec.to_host(&self.ctx)?;
-                Ok(infer_plan::sample_token(&host, p, sample_positions[r]))
+                Ok(infer_plan::sample_token_logprob(
+                    &host,
+                    p,
+                    sample_positions[r],
+                ))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
         Ok(out)
@@ -7711,6 +7735,32 @@ pub(crate) fn mtp_phase_lap(ctx: &DeviceContext, t: &mut Option<std::time::Insta
     }
 }
 
+/// log p_filtered of each committed chain token, read from the materialized
+/// filtered `p` rows (`dspark_filter_probs_cuda` output; row j produced
+/// `tokens[j]`). Caller contract: the accept verdict's D2H + sync already ran,
+/// so the rows are final and these 4-byte reads add no new sync. Committed
+/// tokens always carry filtered mass > 0; the floor clamp only guards f32
+/// underflow at `ln`.
+fn chain_commit_logprobs(
+    ctx: &DeviceContext,
+    p_all: &CudaSlice<f32>,
+    vocab: usize,
+    tokens: &[u32],
+) -> Result<Vec<f32>> {
+    tokens
+        .iter()
+        .enumerate()
+        .map(|(j, &tok)| {
+            let off = j * vocab + tok as usize;
+            let p = ctx
+                .stream
+                .clone_dtoh(&p_all.slice(off..off + 1))
+                .map_err(|e| anyhow!("D2H chain commit prob failed: {e}"))?[0];
+            Ok(p.max(f32::MIN_POSITIVE).ln())
+        })
+        .collect()
+}
+
 fn rms_norm_offset(
     ctx: &DeviceContext,
     x: &HiddenStates,
@@ -7928,7 +7978,8 @@ mod tests {
             let mut out = Vec::with_capacity(n_decode);
             let mut tok = model
                 .forward_tokens(&mut slot, &mut ws, &prompt, 0, &greedy, 0)
-                .unwrap();
+                .unwrap()
+                .0;
             out.push(tok);
             model.ctx.sync().unwrap();
             let t0 = Instant::now();
@@ -7936,7 +7987,8 @@ mod tests {
                 let sp = slot.seq_len();
                 tok = model
                     .forward_tokens(&mut slot, &mut ws, &[tok], sp, &greedy, step as u64)
-                    .unwrap();
+                    .unwrap()
+                    .0;
                 out.push(tok);
             }
             model.ctx.sync().unwrap();
@@ -7983,7 +8035,7 @@ mod tests {
                 // trunk's own token, not a draft). accept_rate = accepts/(steps*depth).
                 accepts += emitted.len().saturating_sub(1);
                 steps += 1;
-                out.extend_from_slice(&emitted);
+                out.extend(emitted.iter().map(|&(t, _)| t));
                 pending = next_pending;
                 hidden = next_hidden;
             }
