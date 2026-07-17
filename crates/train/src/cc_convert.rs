@@ -3,10 +3,18 @@
 //! (`prompt_ids`/`response_ids`/`response_mask`) for the agent-OPD masked-CE
 //! replay (`agent-opd --replay-records`). Backend-independent, no CUDA.
 //!
-//! Pipeline per attempt window: pick the dump with the LARGEST `messages`
-//! array (the session-final request = full conversation) → map it through the
-//! serve's own [`infer_server::messages_body_to_chat_request`] → render as
-//! ChatML with per-turn supervised byte spans
+//! Pipeline per attempt window — one record PER REQUEST: every dump with a
+//! token sidecar (serve-written engine tokens) yields a record whose prompt =
+//! the sidecar's prompt tokens (mask 0) and response = its gen tokens (mask 1).
+//! Token-exact by construction: both halves come from the engine, no re-render,
+//! no prefix matching. Real cc traffic compacts/rewrites history between
+//! requests, so the prefix-merge relation genuinely doesn't hold (pod: 100% of
+//! windows fell back to re-render); cf. Polar per-request traces.
+//!
+//! Fallback (window with NO sidecars): pick the dump with the LARGEST
+//! `messages` array (the session-final request = full conversation) → map it
+//! through the serve's own [`infer_server::messages_body_to_chat_request`] →
+//! render as ChatML with per-turn supervised byte spans
 //! ([`chat::render_structured_chatml_with_spans`]) → tokenize with byte
 //! offsets → mask = tokens overlapping an assistant turn's supervised span.
 //!
@@ -45,17 +53,21 @@ fn default_reward() -> f32 {
     1.0
 }
 
-/// One converted attempt: a verl-style token record plus mask accounting.
+/// One converted request (or, on the re-render fallback, one attempt): a
+/// verl-style token record plus mask accounting.
 #[derive(Debug, Serialize)]
 pub struct CcRecord {
+    /// `<window label>#r<request seq>` on the per-request path; the window
+    /// label on the fallback. SAO's task key is the prefix before the first
+    /// `#`, so grouping stays at the task level.
     pub label: String,
     pub prompt_ids: Vec<u32>,
     pub response_ids: Vec<u32>,
     pub response_mask: Vec<u8>,
     /// Generation-time behavior logprobs, one per MASKED response token in
     /// mask order (= `capture_rollout_logprobs` target order) — from the
-    /// serve sidecars' `gen_logprobs`. Empty when any contributing request
-    /// lacked capture (greedy, Metal, pre-P6 serve, re-render fallback).
+    /// serve sidecar's `gen_logprobs`. Empty when the request lacked capture
+    /// (greedy, Metal, pre-P6 serve, re-render fallback).
     pub gen_logprobs: Vec<f32>,
     /// Attempt reward carried from the window (SAO advantage input).
     pub reward: f32,
@@ -63,9 +75,9 @@ pub struct CcRecord {
     pub total_tokens: usize,
 }
 
-/// Convert the dumps under `dump_dir` into one JSONL record per window at
-/// `out_path` (no windows = one record over the whole dir). Returns per-window
-/// summaries for the caller to log.
+/// Convert the dumps under `dump_dir` into JSONL records at `out_path` — one
+/// per sidecar-covered request, grouped by window (no windows = the whole
+/// dir). Returns the records for the caller to log.
 pub fn run_cc_convert(
     dump_dir: &Path,
     tokenizer_path: &Path,
@@ -90,9 +102,10 @@ pub fn run_cc_convert(
     Ok(records)
 }
 
-/// In-memory core: dumps under `dump_dir` → one token record per matched
-/// window. Unmatched or un-convertible windows are skipped with a note, so the
-/// result may be empty (the cc harness treats an all-failed group as
+/// In-memory core: dumps under `dump_dir` → one token record per
+/// sidecar-covered request of each matched window (re-render fallback: one per
+/// window). Unmatched or un-convertible windows are skipped with a note, so
+/// the result may be empty (the cc harness treats an all-failed group as
 /// trainable-empty, not fatal — the CLI wrapper above enforces non-empty).
 pub fn convert_cc_dumps(
     dump_dir: &Path,
@@ -121,34 +134,76 @@ pub fn convert_cc_dumps(
     let mut records = Vec::with_capacity(windows.len());
     for window in windows {
         let mut matched = dumps_in_window(&dumps, window)?;
-        // Session-final request = the dump with the LARGEST `messages` array
-        // (each CC turn resends the whole conversation).
-        let Some(final_idx) = (0..matched.len()).max_by_key(|&i| messages_len(&matched[i].0))
-        else {
+        if matched.is_empty() {
             eprintln!(
                 "[cc-convert] window {} [{}, {}) matched no dump; skipped",
                 window.label, window.t_start_ms, window.t_end_ms
             );
             continue;
-        };
-        // A single un-convertible window (e.g. a failed rollout with no assistant
-        // turn — now collected because SAO keeps failing attempts) must not abort
-        // the whole round's records; skip it and keep the rest.
-        let converted =
-            match merged_sidecar_record(&window.label, window.reward, &matched, final_idx) {
-                // Serve-written engine tokens: token-exact, no re-render drift.
-                Some(record) => Ok(record),
-                None => {
-                    let (body, _) = matched.swap_remove(final_idx);
-                    convert_body(&window.label, window.reward, body, tokenizer)
-                }
-            };
-        match converted {
+        }
+        // Primary path — one token-exact record per sidecar-covered request.
+        // Earlier turns' gen tokens also recur inside later requests' prompts
+        // (masked 0 there), so each turn is supervised exactly once — its own
+        // record. The shared conversation prefix IS forwarded once per record
+        // at train time (accepted compute cost for correctness; provable
+        // prefix merging is the future optimization, cf. Polar).
+        let before = records.len();
+        for (seq, (_, path)) in matched.iter().enumerate() {
+            if let Some(sidecar) = read_tokens_sidecar(path) {
+                records.push(request_record(
+                    &format!("{}#r{seq}", window.label),
+                    window.reward,
+                    sidecar,
+                ));
+            }
+        }
+        let covered = records.len() - before;
+        if covered > 0 {
+            if covered < matched.len() {
+                eprintln!(
+                    "[cc-convert] window {}: {}/{} requests lack a token sidecar; skipped",
+                    window.label,
+                    matched.len() - covered,
+                    matched.len()
+                );
+            }
+            continue;
+        }
+        // Fallback (NO sidecars): re-render the session-final request = the
+        // dump with the LARGEST `messages` array (each CC turn resends the
+        // whole conversation). A single un-convertible window (e.g. a failed
+        // rollout with no assistant turn — SAO keeps failing attempts) must
+        // not abort the whole round's records; skip it and keep the rest.
+        let final_idx = (0..matched.len())
+            .max_by_key(|&i| messages_len(&matched[i].0))
+            .expect("matched is non-empty");
+        let (body, _) = matched.swap_remove(final_idx);
+        match convert_body(&window.label, window.reward, body, tokenizer) {
             Ok(record) => records.push(record),
             Err(err) => eprintln!("[cc-convert] window {}: {err:#}; skipped", window.label),
         }
     }
     Ok(records)
+}
+
+/// One request's sidecar → one record: prompt = engine prompt tokens (mask 0),
+/// response = engine gen tokens (mask 1) — token-exact by construction.
+fn request_record(label: &str, reward: f32, sidecar: infer_server::TokensSidecar) -> CcRecord {
+    let n_gen = sidecar.gen_token_ids.len();
+    CcRecord {
+        label: label.to_owned(),
+        total_tokens: sidecar.prompt_token_ids.len() + n_gen,
+        prompt_ids: sidecar.prompt_token_ids,
+        response_ids: sidecar.gen_token_ids,
+        response_mask: vec![1; n_gen],
+        gen_logprobs: if sidecar.gen_logprobs.len() == n_gen {
+            sidecar.gen_logprobs
+        } else {
+            Vec::new()
+        },
+        reward,
+        masked_tokens: n_gen,
+    }
 }
 
 /// Newest dump's prompt-portion tokens (everything before the first assistant
@@ -283,79 +338,6 @@ fn read_tokens_sidecar(dump_path: &Path) -> Option<infer_server::TokensSidecar> 
     }
 }
 
-/// Engine-token record with prefix-merged supervision: the final request's
-/// tokens ARE the token-exact multi-turn history, and each earlier request's
-/// gen segment recurs verbatim inside the final prompt (request i's prompt+gen
-/// is a prefix of request i+1's prompt modulo template glue). Mask = union of
-/// every located earlier gen segment (monotonic forward scan — turn order) ∪
-/// the final gen. Earlier dumps without a sidecar are skipped: an incomplete
-/// request's gen never entered the history. `None` (no usable final sidecar,
-/// an unlocatable earlier segment — compaction/branching/template drift — or a
-/// mask starting at token 0) → the caller re-renders; never a silently
-/// narrower mask.
-fn merged_sidecar_record(
-    label: &str,
-    reward: f32,
-    matched: &[(serde_json::Value, PathBuf)],
-    final_idx: usize,
-) -> Option<CcRecord> {
-    let final_sidecar = read_tokens_sidecar(&matched[final_idx].1)?;
-    let prompt_len = final_sidecar.prompt_token_ids.len();
-    let mut mask = vec![0u8; prompt_len];
-    let mut cursor = 0usize;
-    // Behavior logprobs in mask order (segments located at monotonic cursor
-    // positions); all-or-nothing — any uncaptured contributing request drops
-    // the whole vector so it can never misalign with the mask.
-    let mut logprobs = Some(Vec::new());
-    let mut push_logprobs = |lps: &[f32], n_gen: usize| {
-        match &mut logprobs {
-            Some(all) if lps.len() == n_gen => all.extend_from_slice(lps),
-            slot => *slot = None,
-        };
-    };
-    for (i, (_, path)) in matched.iter().enumerate() {
-        if i == final_idx {
-            continue;
-        }
-        let Some(earlier) = read_tokens_sidecar(path) else {
-            continue;
-        };
-        let gen_ids = &earlier.gen_token_ids;
-        let Some(pos) = find_subsequence(&final_sidecar.prompt_token_ids[cursor..], gen_ids) else {
-            eprintln!(
-                "[cc-convert] window {label}: earlier gen segment ({} tokens, {}) not in the \
-                 final prompt; re-render fallback",
-                gen_ids.len(),
-                path.display()
-            );
-            return None;
-        };
-        let start = cursor + pos;
-        mask[start..start + gen_ids.len()].fill(1);
-        cursor = start + gen_ids.len();
-        push_logprobs(&earlier.gen_logprobs, gen_ids.len());
-    }
-    push_logprobs(
-        &final_sidecar.gen_logprobs,
-        final_sidecar.gen_token_ids.len(),
-    );
-    let first_masked = mask.iter().position(|&m| m == 1).unwrap_or(prompt_len);
-    if first_masked == 0 {
-        eprintln!("[cc-convert] window {label}: supervised segment at token 0; re-render fallback");
-        return None;
-    }
-    let ids: Vec<u32> = final_sidecar
-        .prompt_token_ids
-        .iter()
-        .chain(&final_sidecar.gen_token_ids)
-        .copied()
-        .collect();
-    mask.resize(ids.len(), 1);
-    let mut record = split_record(label, reward, &ids, &mask, first_masked);
-    record.gen_logprobs = logprobs.unwrap_or_default();
-    Some(record)
-}
-
 /// Split at the first supervised token: everything before is prompt, the rest
 /// is the (masked) response.
 fn split_record(
@@ -375,13 +357,6 @@ fn split_record(
         masked_tokens: mask.iter().filter(|&&m| m == 1).count(),
         total_tokens: ids.len(),
     }
-}
-
-/// First occurrence of `needle` in `haystack` (naive scan: ~20K-token prompt ×
-/// few-hundred-token needles × a handful of turns). Callers guarantee a
-/// non-empty needle (`read_tokens_sidecar` requires non-empty gen).
-fn find_subsequence(haystack: &[u32], needle: &[u32]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 /// One dump body → one token record: serve-identical request mapping, ChatML
@@ -514,56 +489,100 @@ mod tests {
         assert_eq!(mask, vec![0, 1, 1]);
     }
 
-    /// A 3-request window (two earlier turns + final) with engine-token
-    /// sidecars round-trips to ONE record built from the final sidecar's
-    /// tokens whose mask supervises exactly the three gen segments — earlier
-    /// gens located by exact subsequence match in the final prompt, template
-    /// glue tokens (3, 4) and the leading prompt left unsupervised. The dump
-    /// bodies alone have no assistant turn, so only the sidecar path can
-    /// produce this record — proving it took precedence over the re-render.
+    /// Fake tokenizer for the sidecar paths (never reached — the per-request
+    /// path skips tokenization entirely).
+    fn stub_tokenizer() -> tokenizers::Tokenizer {
+        tokenizers::Tokenizer::new(tokenizers::models::wordlevel::WordLevel::default())
+    }
+
+    fn write(dir: &std::path::Path, name: &str, contents: &str) {
+        std::fs::write(dir.join(name), contents).expect("write");
+    }
+
+    /// Dump body with `n` user messages (no assistant turn — only the sidecar
+    /// path can produce records, proving it took precedence over re-render).
+    fn dump(n: usize) -> String {
+        let messages: Vec<String> = (0..n)
+            .map(|i| format!(r#"{{"role":"user","content":"m{i}"}}"#))
+            .collect();
+        format!(
+            r#"{{"model":"m","max_tokens":8,"messages":[{}]}}"#,
+            messages.join(",")
+        )
+    }
+
+    /// A 3-request window with engine-token sidecars → THREE per-request
+    /// records, each token-exact vs its own sidecar: prompt = the sidecar's
+    /// prompt tokens (unsupervised — earlier gens recurring there stay
+    /// mask 0), response = its gen tokens (all mask 1), gen_logprobs aligned
+    /// to the gen segment. No prefix matching anywhere: request 2's prompt
+    /// rewrites history (compaction — [99] replaces [1,2,10,11]) and still
+    /// converts.
     #[test]
-    fn sidecar_round_trips_engine_tokens() {
+    fn sidecars_yield_one_record_per_request() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let dump = |n: usize| {
-            let messages: Vec<String> = (0..n)
-                .map(|i| format!(r#"{{"role":"user","content":"m{i}"}}"#))
-                .collect();
-            format!(
-                r#"{{"model":"m","max_tokens":8,"messages":[{}]}}"#,
-                messages.join(",")
-            )
-        };
-        let write = |name: &str, contents: &str| {
-            std::fs::write(dir.path().join(name), contents).expect("write");
-        };
-        write("1000_0.json", &dump(1));
+        write(dir.path(), "1000_0.json", &dump(1));
         write(
+            dir.path(),
             "1000_0.tokens.json",
             r#"{"prompt_token_ids":[1,2],"gen_token_ids":[10,11],"gen_logprobs":[-0.1,-0.2]}"#,
         );
-        write("1001_0.json", &dump(3));
+        write(dir.path(), "1001_0.json", &dump(3));
         write(
+            dir.path(),
             "1001_0.tokens.json",
             r#"{"prompt_token_ids":[1,2,10,11,3],"gen_token_ids":[20,21],"gen_logprobs":[-0.3,-0.4]}"#,
         );
-        write("1002_0.json", &dump(5));
+        write(dir.path(), "1002_0.json", &dump(5));
         write(
+            dir.path(),
             "1002_0.tokens.json",
-            r#"{"prompt_token_ids":[1,2,10,11,3,20,21,4],"gen_token_ids":[30],"gen_logprobs":[-0.5]}"#,
+            r#"{"prompt_token_ids":[99,20,21,4],"gen_token_ids":[30],"gen_logprobs":[-0.5]}"#,
         );
-        // Never reached: the sidecar path skips tokenization entirely.
-        let tokenizer =
-            tokenizers::Tokenizer::new(tokenizers::models::wordlevel::WordLevel::default());
-        let records = super::convert_cc_dumps(dir.path(), &tokenizer, &[]).expect("convert");
+        let records = super::convert_cc_dumps(dir.path(), &stub_tokenizer(), &[]).expect("convert");
+        assert_eq!(records.len(), 3);
+        let expect = [
+            ("all#r0", vec![1, 2], vec![10, 11], vec![-0.1, -0.2]),
+            (
+                "all#r1",
+                vec![1, 2, 10, 11, 3],
+                vec![20, 21],
+                vec![-0.3, -0.4],
+            ),
+            ("all#r2", vec![99, 20, 21, 4], vec![30], vec![-0.5]),
+        ];
+        for (record, (label, prompt, gen_ids, logprobs)) in records.iter().zip(expect) {
+            assert_eq!(record.label, label);
+            assert_eq!(record.prompt_ids, prompt);
+            assert_eq!(record.response_ids, gen_ids);
+            assert_eq!(record.response_mask, vec![1; gen_ids.len()]);
+            assert_eq!(record.gen_logprobs, logprobs);
+            assert_eq!(record.masked_tokens, gen_ids.len());
+            assert_eq!(record.total_tokens, prompt.len() + gen_ids.len());
+        }
+    }
+
+    /// Partial sidecar coverage: the covered request converts, the uncovered
+    /// one is skipped (logged) — no re-render fallback once ≥1 sidecar exists.
+    /// A sidecar with uncaptured (empty) gen_logprobs still converts, with an
+    /// empty logprob vector.
+    #[test]
+    fn partial_coverage_uses_covered_requests() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write(dir.path(), "1000_0.json", &dump(1));
+        write(
+            dir.path(),
+            "1000_0.tokens.json",
+            r#"{"prompt_token_ids":[1,2],"gen_token_ids":[10,11]}"#,
+        );
+        write(dir.path(), "1001_0.json", &dump(3)); // no sidecar
+        let records = super::convert_cc_dumps(dir.path(), &stub_tokenizer(), &[]).expect("convert");
         assert_eq!(records.len(), 1);
         let record = &records[0];
-        // Full sequence [1,2,10,11,3,20,21,4,30] splits at the first
-        // supervised token; mask = the three gen segments exactly.
+        assert_eq!(record.label, "all#r0");
         assert_eq!(record.prompt_ids, vec![1, 2]);
-        assert_eq!(record.response_ids, vec![10, 11, 3, 20, 21, 4, 30]);
-        assert_eq!(record.response_mask, vec![1, 1, 0, 1, 1, 0, 1]);
-        assert_eq!((record.masked_tokens, record.total_tokens), (5, 9));
-        // Behavior logprobs: one per masked token, in mask order.
-        assert_eq!(record.gen_logprobs, vec![-0.1, -0.2, -0.3, -0.4, -0.5]);
+        assert_eq!(record.response_ids, vec![10, 11]);
+        assert_eq!(record.response_mask, vec![1, 1]);
+        assert!(record.gen_logprobs.is_empty(), "uncaptured logprobs");
     }
 }
