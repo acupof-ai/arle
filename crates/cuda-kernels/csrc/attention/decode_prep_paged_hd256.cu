@@ -218,6 +218,19 @@ cudaError_t decode_prep_paged_hd256_cuda(
     float rms_eps,
     cudaStream_t stream
 ) {
+    if (q_full_batch == nullptr || q_out_batch == nullptr || k_batch == nullptr ||
+        v_batch == nullptr || q_norm_weight == nullptr || k_norm_weight == nullptr ||
+        cos_cache == nullptr || sin_cache == nullptr || positions == nullptr ||
+        k_pool == nullptr || v_pool == nullptr || page_table == nullptr ||
+        page_indptr == nullptr || last_page_len == nullptr || num_qo_heads <= 0 ||
+        num_kv_heads <= 0 || num_qo_heads % num_kv_heads != 0 || page_size <= 0 ||
+        stride_page <= 0 ||
+        static_cast<long long>(stride_page) <
+            static_cast<long long>(num_kv_heads) * page_size * HD256 ||
+        batch_size <= 0 || rotary_dim <= 0 || rotary_dim > HD256 ||
+        rotary_dim % 2 != 0) {
+        return cudaErrorInvalidValue;
+    }
     dim3 grid(num_kv_heads, batch_size);
     int threads = HD256;
 
@@ -242,6 +255,9 @@ cudaError_t attention_gate_paged_hd256_cuda(
     int batch_size,
     cudaStream_t stream
 ) {
+    if (q_full_batch == nullptr || attn_out == nullptr || num_q_heads <= 0 || batch_size <= 0) {
+        return cudaErrorInvalidValue;
+    }
     int q_dim = num_q_heads * HD256;
     int total = q_dim * batch_size;
     int threads = 256;

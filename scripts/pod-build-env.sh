@@ -11,6 +11,7 @@ fi
 export CUDA_HOME=/usr/local/cuda
 export TORCH_CUDA_ARCH_LIST=9.0          # H20 == sm_90
 export CMAKE_CUDA_ARCHITECTURES=90
+export ARLE_CUDA_ENABLE_FA3=1
 # TileLang AOT regen — REQUIRED for full arle / cuda-kernels builds now that the
 # generated/ artifacts are gitignored (kernels regenerate on demand; nvcc 12.8+
 # cross-compiles every SM incl. Blackwell). Resolve a python that imports tilelang:

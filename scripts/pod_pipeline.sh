@@ -41,7 +41,7 @@ done < /tmp/pipe_changed.txt
 # 2) BUILD — incremental, the proven CUDA env, gate on the REAL exit code (not a wrapper echo).
 log "build (incremental, exit-gated)…"
 ~/bin/pod "cd $POD && \
-  CUDA_HOME=/usr/local/cuda TORCH_CUDA_ARCH_LIST=9.0 \
+  CUDA_HOME=/usr/local/cuda TORCH_CUDA_ARCH_LIST=9.0 ARLE_CUDA_ENABLE_FA3=1 \
   ARLE_DEEPGEMM_ROOT=$POD/crates/cuda-kernels/vendor/deepgemm \
   ARLE_DEEPGEMM_LIBRARY_ROOT=$POD/crates/cuda-kernels/vendor/deepgemm/deep_gemm \
   INFER_TILELANG_PYTHON=/usr/bin/python3 \

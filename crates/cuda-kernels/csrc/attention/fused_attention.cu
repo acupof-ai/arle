@@ -655,7 +655,15 @@ cudaError_t fused_gqa_attention_decode_batched(
     float rms_eps,
     cudaStream_t stream
 ) {
-    if (head_dim != BATCHED_DECODE_HEAD_DIM) {
+    if (q_batch == nullptr || k_batch == nullptr || v_batch == nullptr ||
+        q_norm_weight == nullptr || k_norm_weight == nullptr || cos_cache == nullptr ||
+        sin_cache == nullptr || positions == nullptr || seq_lens == nullptr ||
+        k_cache_ptrs == nullptr || v_cache_ptrs == nullptr || partial_out == nullptr ||
+        partial_m == nullptr || partial_l == nullptr || num_qheads <= 0 ||
+        num_kvheads <= 0 || gqa_ratio <= 0 ||
+        num_qheads != num_kvheads * gqa_ratio || head_dim != BATCHED_DECODE_HEAD_DIM ||
+        rotary_dim <= 0 || rotary_dim > head_dim || rotary_dim % 2 != 0 ||
+        max_seq_len <= 0 || batch_size <= 0) {
         return cudaErrorInvalidValue;
     }
     dim3 grid(num_qheads, NUM_KV_SPLITS, batch_size);
@@ -684,6 +692,11 @@ cudaError_t attention_decode_reduce_batched(
     int batch_size,
     cudaStream_t stream
 ) {
+    if (partial_out == nullptr || partial_m == nullptr || partial_l == nullptr ||
+        output == nullptr || num_qheads <= 0 || head_dim != BATCHED_DECODE_HEAD_DIM ||
+        batch_size <= 0) {
+        return cudaErrorInvalidValue;
+    }
     dim3 grid(num_qheads, batch_size);
     int threads = head_dim;
 
