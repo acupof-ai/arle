@@ -2449,6 +2449,12 @@ fn replay_pg(
                 )
                 .map_err(anyhow::Error::from)?;
             losses.push(report.loss);
+            // #45: freed writeback blocks hoarded in the device pool starve
+            // the next group's capture forward (38–87 GB oscillation, dies
+            // entering group 3); return them per group.
+            if let Err(err) = store.backend().trim_memory_pool() {
+                eprintln!("[agent-opd] replay device-pool trim failed: {err}");
+            }
         }
         let mean_loss = if losses.is_empty() {
             0.0
@@ -3322,16 +3328,18 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
                 "rollout_tok_per_sec": g_completion as f64 / rollout_secs.max(1e-9),
             }));
 
-            // Staleness 1 skips quiesce AND the releases: the NEXT group's
-            // requests are legitimately in flight — cancel_all would kill them,
-            // and a dropped KV pool / scratch would be read by live decodes, so
-            // both stay resident (F.5: 70 GB peak at K=8 WITH the pool
-            // resident — it fits). The re-merge below is atomic engine-side;
-            // in-flight requests keep their pinned pages and finish on mixed
-            // KV (#92 caveat) — exactly the drift the version tag + sidecar IS
-            // ratio correct. A current-group straggler (its cc child exited)
-            // is harmless without the pool drop and drains on its own.
-            if args.staleness == 0 {
+            // Staleness 1 skips quiesce AND the releases ONLY while a next
+            // group is actually Rolling: its requests are legitimately in
+            // flight — cancel_all would kill them, and a dropped KV pool /
+            // scratch would be read by live decodes. The re-merge below is
+            // atomic engine-side; in-flight requests keep their pinned pages
+            // and finish on mixed KV (#92 caveat) — exactly the drift the
+            // version tag + sidecar IS ratio correct. A current-group
+            // straggler (its cc child exited) is harmless without the pool
+            // drop and drains on its own. With NOTHING in flight
+            // (`next.is_none()`), release exactly as at staleness 0 — a
+            // resident pool+scratch atop the capture forward OOMed at 97.4 GB.
+            if args.staleness == 0 || next.is_none() {
                 // Quiesce before touching weights / dropping the KV pool: the
                 // group's cc children exited with run_group, so this only drains
                 // a straggler engine request — a live one would hit the dropped
@@ -3489,6 +3497,12 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
                 buffer.push(round, group.task_id.clone(), batch);
             }
 
+            // Writeback transients leave freed blocks hoarded in the autograd
+            // device pool; return them to the driver here or the engine-thread
+            // LoRA re-merge below OOMs even with the KV pool released.
+            if let Err(err) = store.backend().trim_memory_pool() {
+                eprintln!("[agent-opd] device-pool trim after writeback failed: {err}");
+            }
             // Sync the trained LoRA into the serve engine (atomic re-merge +
             // prefix-cache drop in one engine-thread closure); every-round
             // syncs once, at the last group. Then re-acquire the KV pool for
