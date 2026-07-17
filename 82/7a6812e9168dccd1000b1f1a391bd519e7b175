@@ -1,0 +1,21 @@
+crates/qwen35-spec/src/lib.rs
+  s_b4f8d64910d456::t_5454291b771c79 1650-1652,1681
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "827a6812e9168dccd1000b1f1a391bd519e7b175",
+  "prompts": {},
+  "sessions": {
+    "s_b4f8d64910d456": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a1aa1da89c1b33cf4",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
