@@ -961,24 +961,26 @@ pub(crate) fn sample_cuda_token(
 /// device i32): the Qwen3.5/3.6 steady-state decode sampler — greedy decode
 /// performs ZERO device allocations per token (the last per-token
 /// `alloc_zeros(1)` moved into the workspace `argmax_out` slot). Always runs
-/// OUTSIDE any CUDA-graph capture (argmax syncs + reads D2H).
+/// OUTSIDE any CUDA-graph capture (argmax syncs + reads D2H). Also returns the
+/// behavior logprob of the drawn token under the filtered sampling dist
+/// (`None` for greedy — the P6 sidecar skips greedy requests).
 pub(crate) fn sample_cuda_token_scratched(
     ctx: &DeviceContext,
     logits: &DeviceVec,
     params: &SamplingParams,
     position: u64,
     argmax_out: &mut cudarc::driver::CudaSlice<i32>,
-) -> Result<u32> {
+) -> Result<(u32, Option<f32>)> {
     maybe_dump_sample_topk(ctx, logits, position)?;
     if params.is_greedy() {
         let token = crate::ops::argmax_into(ctx, logits, argmax_out)?;
         probe_decode_entropy(ctx, logits, None, token, position)?;
-        return Ok(token);
+        return Ok((token, None));
     }
     let logits_host = logits.to_host(ctx)?;
-    let token = infer_plan::sample_token(&logits_host, params, position);
+    let (token, logprob) = infer_plan::sample_token_logprob(&logits_host, params, position);
     probe_decode_entropy(ctx, logits, Some(&logits_host), token, position)?;
-    Ok(token)
+    Ok((token, logprob))
 }
 
 /// [`sample_cuda_token`] for the vocab-sharded lm_head
