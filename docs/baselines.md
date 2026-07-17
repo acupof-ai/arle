@@ -19,7 +19,13 @@ champion row — no second arm. Rules:
 
 ## DSv4-Flash-FP8 · 4×H20 GPUs 0–3 · TP=4/EP=4 · eager · port 8000
 
-Champion: `00b301643` (grid-parallel FP32 + slot hoist + carry coherence +
+**RE-ANCHOR 2026-07-17 (chunk-2048 default, `0904a50cc`)** — dataset
+`bench-prompts-64.jsonl` (~2.8k unique docs), cap32 serve, 90 s/point:
+c1 38.9 out / TTFT 1093 ms · c4 75.0 · c16 142.9 · c32 **209.9 out / 2474
+total tok/s**. Cold prefill ~2560 tok/s. Raw: pod
+`bench-output/2026-07-17-p3-sweep/`. Rows below are the chunk-128 era.
+
+Champion (chunk-128 era): `00b301643` (grid-parallel FP32 + slot hoist + carry coherence +
 plan repair), build `--features cuda,nccl`. **RE-ANCHORED fingerprint
 2026-07-17**: runner = `bench_throughput.py`, **max_tokens 256** (the earlier
 16-out era below is retired), dataset `bench-prompts.jsonl` (20×~3352 tok),
