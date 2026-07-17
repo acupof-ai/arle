@@ -1,0 +1,85 @@
+Dockerfile
+  s_0a5e0efcaeacd8::t_d631ae255cc31a 16
+crates/cuda-kernels/csrc/attention/decode_prep_paged_hd256.cu
+  s_0a5e0efcaeacd8::t_c4333bc528867e 221-233,258-260
+crates/cuda-kernels/csrc/attention/fused_attention.cu
+  s_0a5e0efcaeacd8::t_96ddba691b4a2b 658-666,695-699
+crates/cuda-kernels/csrc/attention/prefill_attention_paged_prep.cu
+  s_0a5e0efcaeacd8::t_aa90784f2629e9 315-326
+crates/infer-api/src/loaded.rs
+  s_6e2d7d24c2d824::t_e00a5408e67b7b 1960-1964
+crates/infer-cuda/src/executor/qwen35.rs
+  s_6abb0d645a30e1::t_99439cd42daa3d 26-31,800-803,1577-1581,2504-2509,3143-3149
+crates/infer-cuda/src/qwen35.rs
+  s_3571686f97aefc::t_01e95295d2378f 141-142,144-151,156-159,167-172,177-180
+crates/qwen35-spec/src/lib.rs
+  s_131420ccbbb11e::t_3cac5041aa9577 286-289,311-356,828,1713-1751
+docs/experience/wins/2026-07-17-qwen36-rotary-fa3-gates.md
+  s_a3496271e6c066::t_79d5185c3350e7 1-33
+scripts/lever_gate.sh
+  s_6abb0d645a30e1::t_8b3d401cf52803 42-99,129-134
+scripts/pod-build-env.sh
+  s_0a5e0efcaeacd8::t_cf1f1d864ff434 14
+scripts/pod_pipeline.sh
+  s_0a5e0efcaeacd8::t_0b8c046fd4f2d0 44
+scripts/tests/test_lever_gate.sh
+  s_6abb0d645a30e1::t_2ad1a6edea0154 1-47
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "ceb1745d95fdc7a2762fbb40bafa40ade0beafad",
+  "prompts": {},
+  "sessions": {
+    "s_0a5e0efcaeacd8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b50094bb-bf29-4f19-bc6d-f29cfad0de56",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_131420ccbbb11e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a607659657be220a9",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_3571686f97aefc": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f6f83-0944-7f21-8c6e-1d3c26558c28",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_6abb0d645a30e1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aac912ecffa894638",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_6e2d7d24c2d824": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-add9f6e4b54f7192b",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_a3496271e6c066": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a567ec791eef97389",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
