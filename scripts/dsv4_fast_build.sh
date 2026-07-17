@@ -2,35 +2,12 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-source "$ROOT/scripts/cuda_prebuilt_manifest.sh"
+source "$ROOT/scripts/export_prebuilt_cuda_kernels.sh"
 PROFILE="${PROFILE:-release-fast}"
 FEATURES="${FEATURES:-cuda,nccl}"
 BIN="${BIN:-arle}"
 PREBUILT_DIR="${ARLE_CUDA_KERNELS_PREBUILT_DIR:-$ROOT/target/dsv4-cuda-kernels-prebuilt}"
-TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
-MANIFEST_NAME="arle-cuda-kernels.manifest"
 USED_PREBUILT=0
-
-required_dsv4_symbols() {
-    cat <<'EOF'
-dsv4_deepgemm_native_preflight_cuda
-arle_dsv4_fp8_kv_fill_one_sw_slot_from_start_pos_cuda
-arle_dsv4_flashmla_decode_build_indices_start_pos_ptr_cuda
-arle_dsv4_flashmla_decode_build_indices_batched_cuda
-arle_flashmla_sm90_sparse_decode_real_kernel_marker_cuda
-dsv4_prepare_qk_start_pos_ptr_cuda
-dsv4_prepare_qk_fused_start_pos_ptr_cuda
-dsv4_swa_attention_start_pos_ptr_cuda
-dsv4_hybrid_attention_start_pos_ptr_cuda
-arle_dsv4_output_inverse_rope_cuda
-arle_dsv4_output_inverse_rope_start_pos_ptr_cuda
-dsv4_update_window_cache_start_pos_ptr_cuda
-dsv4_compressor_update_start_pos_ptr_cuda
-arle_dsv4_fp8_kv_pack_completed_compressor_row_start_pos_cuda
-dsv4_mhc_lane_mean_cuda
-dsv4_mtp_add_eproj_hproj_cuda
-EOF
-}
 
 detect_cuda() {
     local nvcc=""
@@ -54,7 +31,8 @@ detect_cuda() {
     fi
 
     if [[ -n "$nvcc" ]]; then
-        export CUDA_HOME="$(cd "$(dirname "$nvcc")/.." && pwd)"
+        CUDA_HOME="$(cd "$(dirname "$nvcc")/.." && pwd)"
+        export CUDA_HOME
         export PATH="$CUDA_HOME/bin:$PATH"
         if [[ -z "${CUDARC_CUDA_VERSION:-}" ]]; then
             local major_minor major minor
@@ -104,7 +82,8 @@ resolve_deepgemm_env() {
             export ARLE_DEEPGEMM_CUTLASS_INCLUDE="$flashmla"
         fi
     else
-        export ARLE_DEEPGEMM_CUTLASS_INCLUDE="$(abs_path "$ARLE_DEEPGEMM_CUTLASS_INCLUDE")"
+        ARLE_DEEPGEMM_CUTLASS_INCLUDE="$(abs_path "$ARLE_DEEPGEMM_CUTLASS_INCLUDE")"
+        export ARLE_DEEPGEMM_CUTLASS_INCLUDE
     fi
 }
 
@@ -116,7 +95,8 @@ deepep_dir_valid() {
 
 resolve_deepep_env() {
     if [[ -n "${ARLE_DEEPEP_DIR:-}" ]]; then
-        export ARLE_DEEPEP_DIR="$(abs_path "$ARLE_DEEPEP_DIR")"
+        ARLE_DEEPEP_DIR="$(abs_path "$ARLE_DEEPEP_DIR")"
+        export ARLE_DEEPEP_DIR
         deepep_dir_valid "$ARLE_DEEPEP_DIR" || {
             echo "ARLE_DEEPEP_DIR=$ARLE_DEEPEP_DIR is not a supported DeepEP source tree; expected csrc/kernels/api.cuh or csrc/kernels/legacy/api.cuh" >&2
             return 1
@@ -149,88 +129,19 @@ resolve_deepep_env() {
     echo "DeepEP source tree not found; building without arle_deepep_sidecar"
 }
 
-prebuilt_sidecar_ready() {
-    if [[ -n "${ARLE_DEEPEP_DIR:-}" ]]; then
-        [[ -f "$PREBUILT_DIR/arle_deepep_sidecar" ]] || {
-            echo "prebuilt artifacts missing arle_deepep_sidecar while ARLE_DEEPEP_DIR=$ARLE_DEEPEP_DIR"
-            return 1
-        }
-    fi
-}
-
 prebuilt_ready() {
-    [[ -f "$PREBUILT_DIR/libkernels_cuda.a" ]] &&
-        [[ -f "$PREBUILT_DIR/libtilelang_kernels_aot.a" ]] &&
-        manifest_matches &&
-        validate_cuda_archive_symbols "$PREBUILT_DIR/libkernels_cuda.a" &&
-        prebuilt_sidecar_ready
-}
-
-artifact_manifest() {
-    cuda_prebuilt_manifest
-}
-
-manifest_matches() {
-    local manifest="$PREBUILT_DIR/$MANIFEST_NAME"
-    if [[ ! -f "$manifest" ]]; then
-        echo "prebuilt artifacts missing $MANIFEST_NAME; ignoring stale/manual cache"
-        return 1
-    fi
-    if ! diff -u "$manifest" <(artifact_manifest) >/tmp/arle-cuda-kernels-manifest.diff 2>/dev/null; then
-        echo "prebuilt artifact manifest mismatch; ignoring $PREBUILT_DIR"
-        cat /tmp/arle-cuda-kernels-manifest.diff || true
-        return 1
-    fi
-}
-
-validate_cuda_archive_symbols() {
-    local archive="$1"
-    local symbols
-    symbols="$(nm -g "$archive" 2>/dev/null || true)"
-    local missing=0
-    while IFS= read -r symbol; do
-        [[ -n "$symbol" ]] || continue
-        if ! grep -Fq "$symbol" <<<"$symbols"; then
-            echo "prebuilt CUDA archive $archive is missing required DSv4 symbol: $symbol"
-            missing=1
-        fi
-    done < <(required_dsv4_symbols)
-    [[ "$missing" == 0 ]]
-}
-
-find_latest_cuda_out() {
-    find "$TARGET_DIR/$PROFILE/build" "$TARGET_DIR/release/build" \
-        -maxdepth 3 -path '*/cuda-kernels-*/out/libkernels_cuda.a' \
-        -print 2>/dev/null |
-        while IFS= read -r lib; do
-            local mtime
-            mtime="$(stat -c %Y "$lib" 2>/dev/null || stat -f %m "$lib")"
-            printf '%s %s\n' "$mtime" "$(dirname "$lib")"
-        done |
-        sort -nr |
-        awk 'NR == 1 {print $2}'
+    cuda_prebuilt_validate_bundle "$PREBUILT_DIR" || return 1
+    ARLE_CUDA_KERNELS_PREBUILT_DIR="$PREBUILT_DIR" \
+        cargo check -q -p cuda-kernels --profile "$PROFILE" --features "$FEATURES" 2>/dev/null
 }
 
 harvest_prebuilt() {
-    local out_dir
-    out_dir="$(find_latest_cuda_out || true)"
-    [[ -n "$out_dir" ]] || return 0
-    [[ -f "$out_dir/libkernels_cuda.a" ]] || return 0
-    [[ -f "$out_dir/libtilelang_kernels_aot.a" ]] || return 0
-    validate_cuda_archive_symbols "$out_dir/libkernels_cuda.a" || {
-        echo "refusing to harvest incomplete CUDA prebuilt artifacts from $out_dir"
+    local out_dir="$1"
+    [[ -n "$out_dir" ]] || {
+        echo "cargo did not report cuda-kernels OUT_DIR" >&2
         return 1
     }
-
-    mkdir -p "$PREBUILT_DIR"
-    cp -f "$out_dir/libkernels_cuda.a" "$PREBUILT_DIR/"
-    cp -f "$out_dir/libtilelang_kernels_aot.a" "$PREBUILT_DIR/"
-    if [[ -f "$out_dir/arle_deepep_sidecar" ]]; then
-        cp -f "$out_dir/arle_deepep_sidecar" "$PREBUILT_DIR/"
-        chmod +x "$PREBUILT_DIR/arle_deepep_sidecar" || true
-    fi
-    artifact_manifest >"$PREBUILT_DIR/$MANIFEST_NAME"
-    echo "harvested CUDA prebuilt artifacts from $out_dir -> $PREBUILT_DIR"
+    cuda_prebuilt_export "$PREBUILT_DIR" "$out_dir"
 }
 
 cd "$ROOT"
@@ -268,9 +179,24 @@ echo "ARLE_DEEPGEMM_LIBRARY_ROOT=${ARLE_DEEPGEMM_LIBRARY_ROOT:-}"
 echo "ARLE_DEEPGEMM_CUTLASS_INCLUDE=${ARLE_DEEPGEMM_CUTLASS_INCLUDE:-}"
 echo "ARLE_DEEPEP_DIR=${ARLE_DEEPEP_DIR:-}"
 
-time cargo build --profile "$PROFILE" --features "$FEATURES" --bin "$BIN"
+BUILD_JSON="$(mktemp)"
+trap 'rm -f "$BUILD_JSON"' EXIT
+time cargo build --profile "$PROFILE" --features "$FEATURES" --bin "$BIN" \
+    --message-format=json-render-diagnostics | tee "$BUILD_JSON"
 if [[ "$USED_PREBUILT" == "1" ]]; then
-    echo "prebuilt fast path used; not harvesting older OUT_DIR artifacts"
+    echo "prebuilt fast path used; not harvesting source artifacts"
 else
-    harvest_prebuilt
+    mapfile -t CUDA_OUT_DIRS < <(jq -r '
+        select(.reason == "build-script-executed") |
+        select(.package_id | test("/crates/cuda-kernels#[^/]+$")) |
+        .out_dir
+    ' "$BUILD_JSON" | LC_ALL=C sort -u)
+    [[ ${#CUDA_OUT_DIRS[@]} == 1 ]] || {
+        printf 'expected exactly one cuda-kernels OUT_DIR, found %s:
+' "${#CUDA_OUT_DIRS[@]}" >&2
+        printf '  %s
+' "${CUDA_OUT_DIRS[@]}" >&2
+        exit 1
+    }
+    harvest_prebuilt "${CUDA_OUT_DIRS[0]}"
 fi

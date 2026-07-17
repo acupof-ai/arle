@@ -1,88 +1,66 @@
 #!/usr/bin/env bash
-#
-# Harvest prebuilt CUDA kernel archives from a built target tree into a
-# directory consumable by ARLE_CUDA_KERNELS_PREBUILT_DIR (the build.rs fast
-# path that skips ALL nvcc + TileLang AOT work — link-only, ~5s).
-#
-# This is the missing producer for the existing consumer in
-# crates/cuda-kernels/build.rs::link_prebuilt_cuda_artifacts. Typical uses:
-#   - freeze kernels for .rs-only iteration loops (pod or local)
-#   - tn-push a kernel pack to a pod so its first build skips nvcc entirely
-#
-# Usage:
-#   scripts/export_prebuilt_cuda_kernels.sh <dest-dir> [target-dir] [profile]
-#     target-dir defaults to ./target, profile to release.
-#
-# Consume with:
-#   export ARLE_CUDA_KERNELS_PREBUILT_DIR=<dest-dir>
-#
-# build.rs rejects a pack unless arle-cuda-kernels.manifest byte-matches the
-# current canonical source/toolchain manifest and required symbols are present.
-# manifest.json records human-readable provenance. See
-# errors/2026-05-28-dsv4-flashmla-decode-parity-precond-fail.md for why.
-
 set -euo pipefail
 
-DEST="${1:?usage: export_prebuilt_cuda_kernels.sh <dest-dir> [target-dir] [profile]}"
-TARGET_DIR="${2:-target}"
-PROFILE="${3:-release}"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$ROOT/scripts/cuda_prebuilt_manifest.sh"
+CUDA_PREBUILT_MANIFEST="arle-cuda-kernels.manifest"
+CUDA_PREBUILT_ARTIFACTS=(libkernels_cuda.a libtilelang_kernels_aot.a arle_deepep_sidecar)
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "${REPO_ROOT}"
-source "${REPO_ROOT}/scripts/cuda_prebuilt_manifest.sh"
-
-# Newest cuda-kernels OUT_DIR that actually contains both archives (several
-# fingerprint hashes can coexist after feature/env flips).
-SRC_OUT=""
-for candidate in $(ls -td "${TARGET_DIR}/${PROFILE}"/build/cuda-kernels-*/out 2>/dev/null); do
-    if [[ -f "${candidate}/libkernels_cuda.a" && -f "${candidate}/libtilelang_kernels_aot.a" ]]; then
-        SRC_OUT="${candidate}"
-        break
-    fi
-done
-
-if [[ -z "${SRC_OUT}" ]]; then
-    echo "error: no cuda-kernels OUT_DIR with libkernels_cuda.a + libtilelang_kernels_aot.a under ${TARGET_DIR}/${PROFILE}/build/" >&2
-    echo "       run a CUDA build first: CUDA_HOME=... cargo build --release --features cuda" >&2
-    exit 1
-fi
-
-mkdir -p "${DEST}"
-cp "${SRC_OUT}/libkernels_cuda.a" "${DEST}/"
-cp "${SRC_OUT}/libtilelang_kernels_aot.a" "${DEST}/"
-
-SIDECAR=""
-if [[ -f "${SRC_OUT}/arle_deepep_sidecar" ]]; then
-    cp "${SRC_OUT}/arle_deepep_sidecar" "${DEST}/"
-    SIDECAR="arle_deepep_sidecar"
-fi
-
-# Provenance manifest — the cache key docs/environment.md tells consumers to
-# respect: source tree object + toolkit + SM list + flags.
-KERNELS_TREE="$(git rev-parse "HEAD:crates/cuda-kernels" 2>/dev/null || echo unknown)"
-HEAD_SHA="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
-DIRTY="clean"
-if [[ -n "$(git status --porcelain -- crates/cuda-kernels 2>/dev/null)" ]]; then
-    DIRTY="dirty"
-fi
-NVCC_VERSION="$("${CUDA_HOME:-/usr/local/cuda}/bin/nvcc" --version 2>/dev/null | sed -n 's/.*release \([0-9.]*\).*/\1/p' | head -1 || true)"
-
-cat > "${DEST}/manifest.json" <<EOF
-{
-  "exported_at": "$(date -u +%FT%TZ)",
-  "head": "${HEAD_SHA}",
-  "cuda_kernels_tree": "${KERNELS_TREE}",
-  "cuda_kernels_worktree": "${DIRTY}",
-  "nvcc_version": "${NVCC_VERSION:-unknown}",
-  "torch_cuda_arch_list": "${TORCH_CUDA_ARCH_LIST:-unset (nvidia-smi autodetect)}",
-  "source_out_dir": "${SRC_OUT}",
-  "sidecar": "${SIDECAR:-none}"
+cuda_prebuilt_validate_bundle() {
+    local dir="$1" manifest name size hash
+    manifest="$dir/$CUDA_PREBUILT_MANIFEST"
+    [[ -f "$manifest" ]] || { echo "CUDA prebuilt manifest missing: $manifest" >&2; return 1; }
+    cuda_prebuilt_manifest_validate "$manifest" || return 1
+    [[ "$(cuda_prebuilt_manifest_value "$manifest" schema)" == "3" ]] || {
+        echo "unsupported CUDA prebuilt manifest schema" >&2
+        return 1
+    }
+    for name in "${CUDA_PREBUILT_ARTIFACTS[@]}"; do
+        size="$(cuda_prebuilt_manifest_value "$manifest" "artifact.$name.size" 2>/dev/null || true)"
+        hash="$(cuda_prebuilt_manifest_value "$manifest" "artifact.$name.sha256" 2>/dev/null || true)"
+        if [[ -z "$size" ]]; then
+            if [[ "$name" == arle_deepep_sidecar ]]; then
+                [[ -z "$hash" && ! -e "$dir/$name" ]] || {
+                    echo "CUDA prebuilt sidecar manifest/file half-state" >&2
+                    return 1
+                }
+                continue
+            fi
+            echo "CUDA prebuilt manifest lacks artifact.$name.size" >&2
+            return 1
+        fi
+        [[ -f "$dir/$name" ]] || { echo "CUDA prebuilt artifact missing: $dir/$name" >&2; return 1; }
+        [[ "$(wc -c <"$dir/$name" | tr -d ' ')" == "$size" ]] || {
+            echo "CUDA prebuilt artifact size mismatch: $name" >&2
+            return 1
+        }
+        [[ "$(cuda_prebuilt_hash_file "$dir/$name")" == "$hash" ]] || {
+            echo "CUDA prebuilt artifact hash mismatch: $name" >&2
+            return 1
+        }
+    done
 }
-EOF
 
-cuda_prebuilt_manifest > "${DEST}/arle-cuda-kernels.manifest"
+cuda_prebuilt_export() {
+    local dest="$1" out_dir="$2" name
+    cuda_prebuilt_validate_bundle "$out_dir"
+    mkdir -p "$dest"
+    rm -f "$dest/$CUDA_PREBUILT_MANIFEST"
+    for name in "${CUDA_PREBUILT_ARTIFACTS[@]}"; do
+        rm -f "$dest/$name"
+    done
+    for name in "$CUDA_PREBUILT_MANIFEST" "${CUDA_PREBUILT_ARTIFACTS[@]}"; do
+        [[ -f "$out_dir/$name" ]] && cp -p "$out_dir/$name" "$dest/$name"
+    done
+    cuda_prebuilt_validate_bundle "$dest"
+    printf '[export] %s -> %s\n' "$out_dir" "$dest"
+}
 
-echo "[export] ${SRC_OUT} -> ${DEST}"
-echo "[export] archives: libkernels_cuda.a libtilelang_kernels_aot.a ${SIDECAR}"
-echo "[export] manifest: arle-cuda-kernels.manifest (consumer key), manifest.json (provenance)"
-echo "[export] consume with: export ARLE_CUDA_KERNELS_PREBUILT_DIR=$(cd "${DEST}" && pwd)"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    [[ $# == 2 ]] || {
+        echo "usage: export_prebuilt_cuda_kernels.sh <dest-dir> <cuda-kernels-out-dir>" >&2
+        exit 2
+    }
+    cuda_prebuilt_export "$1" "$2"
+    echo "[export] consume with: export ARLE_CUDA_KERNELS_PREBUILT_DIR=$(cd "$1" && pwd)"
+fi

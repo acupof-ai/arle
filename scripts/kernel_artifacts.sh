@@ -12,25 +12,73 @@ LANE="${ARLE_KERNEL_BUNDLE_LANE:-t1}"
 ARCHS="${TORCH_CUDA_ARCH_LIST:-8.0;8.6;8.9;9.0}"
 CUDA_HOME="${CUDA_HOME:-${CUDA_PATH:-/usr/local/cuda}}"
 CUDA_CONTRACT="${ARLE_KERNEL_BUNDLE_CUDA_CONTRACT:-12.8.0}"
-CORRECTNESS_STATUS="${ARLE_KERNEL_CORRECTNESS_STATUS:-unverified-local}"
+CORRECTNESS_STATUS="${ARLE_KERNEL_CORRECTNESS_STATUS:-not-run}"
+CORRECTNESS_EVIDENCE="${ARLE_KERNEL_CORRECTNESS_EVIDENCE:-}"
+TESTED_ARTIFACT_SHA256="${ARLE_KERNEL_TESTED_ARTIFACT_SHA256:-}"
 source "$ROOT/scripts/cuda_prebuilt_manifest.sh"
 
+validate_correctness_status() {
+    case "$CORRECTNESS_STATUS" in
+        not-run|passed|failed) ;;
+        *)
+            echo "invalid ARLE_KERNEL_CORRECTNESS_STATUS: $CORRECTNESS_STATUS (expected not-run|passed|failed)" >&2
+            return 1
+            ;;
+    esac
+}
+
+source_commit() {
+    git -C "$ROOT" rev-parse HEAD
+}
+
+validate_correctness_evidence() {
+    local id="$1" commit
+    commit="$(source_commit)"
+    [[ -n "$CORRECTNESS_EVIDENCE" && -f "$CORRECTNESS_EVIDENCE" ]] || {
+        echo "$CORRECTNESS_STATUS requires ARLE_KERNEL_CORRECTNESS_EVIDENCE" >&2
+        return 1
+    }
+    jq -e --arg status "$CORRECTNESS_STATUS" --arg id "$id" --arg commit "$commit" \
+        --arg artifact_sha "$TESTED_ARTIFACT_SHA256" \
+        --arg tested_sms "$ARCHS" --arg capabilities "fa3" '
+        .schema == 2 and .status == $status and .bundle_id == $id and
+        .source_commit == $commit and .artifact_sha256 == $artifact_sha and
+        ($artifact_sha | test("^[0-9a-f]{64}$")) and
+        .tested_sms == ($tested_sms | split(";")) and
+        .capabilities == ($capabilities | split(",")) and
+        (keys | sort == ["artifact_sha256", "bundle_id", "capabilities", "schema", "source_commit", "status", "tested_sms"])
+    ' "$CORRECTNESS_EVIDENCE" >/dev/null || {
+        echo "correctness evidence is not bound to status=$CORRECTNESS_STATUS bundle_id=$id source_commit=$commit" >&2
+        return 1
+    }
+}
+
+stage_correctness_evidence() {
+    local stage="$1" id="$2" commit
+    commit="$(source_commit)"
+    if [[ "$CORRECTNESS_STATUS" == not-run ]]; then
+        printf '{"schema":2,"status":"not-run","bundle_id":"%s","source_commit":"%s","artifact_sha256":null,"tested_sms":[],"capabilities":[]}\n' \
+            "$id" "$commit" >"$stage/correctness-evidence.json"
+        return
+    fi
+    validate_correctness_evidence "$id"
+    jq -cS . "$CORRECTNESS_EVIDENCE" >"$stage/correctness-evidence.json"
+}
+
 kernel_bundle_identity() {
-    # Hash git-TRACKED content (blob/tree object per path), not the working tree:
-    # `find -type f` pulls in gitignored __pycache__/*.pyc that any codegen run
-    # drops into tools/tilelang, so the id differed between the publish job (post
-    # codegen, has .pyc) and a pristine consumer (no .pyc) — the bundle was
-    # unfetchable. `git rev-parse HEAD:<path>` is deterministic and pyc-immune
-    # (same helper the prebuilt manifest already uses).
+    # Hash tracked working-tree content; generated and untracked files cannot
+    # change the identity, while dirty inputs cannot masquerade as HEAD.
     local tilelang_inputs
     tilelang_inputs=$(
         for path in crates/cuda-kernels/build.rs crates/cuda-kernels/kernels.toml \
-            crates/cuda-kernels/tools/tilelang requirements-build.txt; do
-            printf 'input\t%s\t%s\n' "$path" "$(cuda_prebuilt_tree_hash "$path")"
+            crates/cuda-kernels/tools/tilelang crates/cuda-kernels/csrc \
+            crates/cuda-kernels/ffi crates/cuda-kernels/src crates/infer-cuda/src \
+            vendor/flash-attention vendor/flashmla requirements-build.txt; do
+            printf 'input\t%s\t%s\n' "$path" "$(cuda_prebuilt_tracked_hash "$path")"
         done | cuda_prebuilt_hash_stream
     )
     cat <<EOF
-schema=4
+schema=5
 lane=$LANE
 arches=$ARCHS
 tilelang_inputs=$tilelang_inputs
@@ -40,7 +88,7 @@ EOF
 }
 
 kernel_bundle_manifest() {
-    local id="$1" abi_hash="$2" symbols_hash="$3" nvcc="$CUDA_HOME/bin/nvcc"
+    local id="$1" abi_hash="$2" symbols_hash="$3" evidence_hash="$4" nvcc="$CUDA_HOME/bin/nvcc"
     [[ -x "$nvcc" ]] || nvcc="$(command -v nvcc 2>/dev/null || true)"
     cat <<EOF
 {
@@ -49,7 +97,7 @@ kernel_bundle_manifest() {
   "lane": "$LANE",
   "arches": "$ARCHS",
   "cuda_contract": "$CUDA_CONTRACT",
-  "tilelang_inputs_sha256": "$(cd "$ROOT" && cuda_prebuilt_files_hash crates/cuda-kernels/build.rs crates/cuda-kernels/kernels.toml crates/cuda-kernels/tools/tilelang requirements-build.txt)",
+  "tilelang_inputs_sha256": "$(cd "$ROOT" && cuda_prebuilt_files_hash crates/cuda-kernels/build.rs crates/cuda-kernels/kernels.toml crates/cuda-kernels/tools/tilelang crates/cuda-kernels/csrc crates/cuda-kernels/ffi crates/cuda-kernels/src crates/infer-cuda/src vendor/flash-attention vendor/flashmla requirements-build.txt)",
   "nvcc_sha256": "$(if [[ -n "$nvcc" ]]; then cuda_prebuilt_command_id "$nvcc" --version; else printf missing; fi)",
   "host_compiler_sha256": "$(cuda_prebuilt_command_id "${NVCC_CCBIN:-g++}" --version)",
   "python_sha256": "$(cuda_prebuilt_command_id python3 --version)",
@@ -58,6 +106,9 @@ kernel_bundle_manifest() {
   "symbol_allowlist": "symbols.txt",
   "symbol_allowlist_sha256": "$symbols_hash",
   "correctness_status": "$CORRECTNESS_STATUS",
+  "correctness_evidence": "correctness-evidence.json",
+  "correctness_evidence_sha256": "$evidence_hash",
+  "source_commit": "$(source_commit)",
   "files": "SHA256SUMS"
 }
 EOF
@@ -120,8 +171,9 @@ verify_archive_checksum() {
 }
 
 verify_archive() {
-    local archive="$1" checksum="$2" expected_id="$3"
+    local archive="$1" checksum="$2" expected_id="$3" require_passed="${4:-0}"
     local tmp entry recorded_id recorded_abi recorded_symbols actual_symbols
+    local recorded_status recorded_commit recorded_evidence_hash actual_evidence_hash
     verify_archive_checksum "$archive" "$checksum"
     while IFS= read -r entry; do
         [[ "$entry" != /* && "/$entry/" != *'/../'* ]] || {
@@ -150,12 +202,41 @@ verify_archive() {
         rm -rf "$tmp"
         return 1
     }
+    recorded_status="$(sed -n 's/^  "correctness_status": "\([^"]*\)",$/\1/p' "$tmp/manifest.json")"
+    recorded_commit="$(sed -n 's/^  "source_commit": "\([^"]*\)",$/\1/p' "$tmp/manifest.json")"
+    recorded_evidence_hash="$(sed -n 's/^  "correctness_evidence_sha256": "\([^"]*\)",$/\1/p' "$tmp/manifest.json")"
+    actual_evidence_hash="$(cuda_prebuilt_hash_file "$tmp/correctness-evidence.json")"
+    [[ "$recorded_evidence_hash" == "$actual_evidence_hash" ]] || {
+        echo "bundle correctness evidence checksum mismatch" >&2
+        rm -rf "$tmp"
+        return 1
+    }
+    jq -e --arg status "$recorded_status" --arg id "$expected_id" --arg commit "$recorded_commit" \
+        --arg arches "$ARCHS" '
+        .schema == 2 and .status == $status and .bundle_id == $id and
+        .source_commit == $commit and
+        (if $status == "not-run" then
+           .artifact_sha256 == null and .tested_sms == [] and .capabilities == []
+         else (.artifact_sha256 | test("^[0-9a-f]{64}$")) and
+           .tested_sms == ($arches | split(";")) and .capabilities == ["fa3"] end) and
+        (keys | sort == ["artifact_sha256", "bundle_id", "capabilities", "schema", "source_commit", "status", "tested_sms"])
+    ' "$tmp/correctness-evidence.json" >/dev/null || {
+        echo "bundle correctness evidence binding mismatch" >&2
+        rm -rf "$tmp"
+        return 1
+    }
+    if [[ "$require_passed" == 1 && "$recorded_status" != passed ]]; then
+        echo "formal kernel bundle requires passed correctness evidence, got $recorded_status" >&2
+        rm -rf "$tmp"
+        return 1
+    fi
     verify_tree_checksums "$tmp"
     rm -rf "$tmp"
 }
 
 pack_bundle() {
-    local id file stage epoch abi_hash symbols_hash
+    local id file stage epoch abi_hash symbols_hash evidence_hash
+    validate_correctness_status
     [[ -d "$GEN" ]] || {
         echo "no $GEN - build with ARLE_KERNEL_VENDOR=1 first" >&2
         return 1
@@ -168,7 +249,8 @@ pack_bundle() {
     file="arle-kernels-$LANE-$id.tar.gz"
     stage="$(mktemp -d)"
     cp -R "$GEN/." "$stage/"
-    rm -f "$stage/manifest.json" "$stage/SHA256SUMS" "$stage/symbols.txt"
+    rm -f "$stage/manifest.json" "$stage/SHA256SUMS" "$stage/symbols.txt" \
+        "$stage/correctness-evidence.json"
     find "$stage" -name meta.txt -type f -exec sed -n 's/^FUNC_NAME=//p' {} + |
         LC_ALL=C sort -u >"$stage/symbols.txt"
     [[ -s "$stage/symbols.txt" ]] || {
@@ -178,7 +260,9 @@ pack_bundle() {
     }
     abi_hash="$(cuda_prebuilt_hash_file "$ROOT/crates/cuda-kernels/kernels.toml")"
     symbols_hash="$(cuda_prebuilt_hash_file "$stage/symbols.txt")"
-    kernel_bundle_manifest "$id" "$abi_hash" "$symbols_hash" >"$stage/manifest.json"
+    stage_correctness_evidence "$stage" "$id"
+    evidence_hash="$(cuda_prebuilt_hash_file "$stage/correctness-evidence.json")"
+    kernel_bundle_manifest "$id" "$abi_hash" "$symbols_hash" "$evidence_hash" >"$stage/manifest.json"
     write_tree_checksums "$stage"
     epoch="${SOURCE_DATE_EPOCH:-$(git -C "$ROOT" log -1 --format=%ct 2>/dev/null || printf '0')}"
     if tar --version 2>/dev/null | grep -q 'GNU tar'; then
@@ -207,12 +291,12 @@ case "${1:-help}" in
         ;;
     publish)
         cd "$ROOT"
-        case "$CORRECTNESS_STATUS" in
-            ""|unverified-local|failed)
-                echo "publish requires explicit non-failing ARLE_KERNEL_CORRECTNESS_STATUS" >&2
-                exit 1
-                ;;
-        esac
+        [[ "$CORRECTNESS_STATUS" == passed ]] || {
+            echo "publish requires ARLE_KERNEL_CORRECTNESS_STATUS=passed" >&2
+            exit 1
+        }
+        id="$(kernel_bundle_id)"
+        validate_correctness_evidence "$id"
         tar --version 2>/dev/null | grep -q 'GNU tar' || {
             echo "publishing requires GNU tar for canonical metadata" >&2
             exit 1
@@ -236,7 +320,7 @@ case "${1:-help}" in
             }
             tmp="$(mktemp -d)"
             gh release download "$REL" -R "$REPO" -p "$file" -p "$checksum" -D "$tmp"
-            verify_archive "$tmp/$file" "$tmp/$checksum" "$id"
+            verify_archive "$tmp/$file" "$tmp/$checksum" "$id" 1
             cmp "$checksum" "$tmp/$checksum" >/dev/null || {
                 echo "immutable bundle identity collision: $file" >&2
                 rm -rf "$tmp"
@@ -249,8 +333,10 @@ case "${1:-help}" in
         gh release upload "$REL" -R "$REPO" "$file" "$checksum"
         echo "published immutable $file -> release $REL"
         ;;
-    fetch)
+    fetch|fetch-qualified)
         cd "$ROOT"
+        require_passed=0
+        [[ "$1" == fetch-qualified ]] && require_passed=1
         id="$(kernel_bundle_id)"
         file="arle-kernels-$LANE-$id.tar.gz"
         checksum="$file.sha256"
@@ -261,7 +347,7 @@ case "${1:-help}" in
         else
             gh release download "$source_ref" -R "$REPO" -p "$file" -p "$checksum" -D "$tmp"
         fi
-        verify_archive "$tmp/$file" "$tmp/$checksum" "$id"
+        verify_archive "$tmp/$file" "$tmp/$checksum" "$id" "$require_passed"
         stage="$ROOT/crates/cuda-kernels/generated.fetch.$$"
         rm -rf "$stage"
         mkdir -p "$stage"
