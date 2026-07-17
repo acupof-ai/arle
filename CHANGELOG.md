@@ -23,6 +23,16 @@ Progress spine. Entry classes recorded here the day they land: phase exits,
 default flips, and accept-or-reject verdicts (AGENTS.md §Docs lifecycle &
 progress spine).
 
+- **2026-07-17 — DSv4 prefill chunk default 128→2048 (default flip, accept).**
+  The planner's one-unit alignment cap pinned every DSv4 prefill tick at 128
+  tokens and made `--chunked-prefill-size` cosmetic. Three-phase unification
+  (config honesty + `max_prefill_chunk` capability; SW-ring tail-slice race
+  fix + opt-in flag; flip): c1 cold TTFT 3031→1088 ms, c16 out tok/s +126%,
+  c32 +128% (209.9 tok/s), ITL p99 better outright; needle zero-miss ×2
+  passes. `ARLE_DSV4_PREFILL_CHUNK` overrides. Entry:
+  [wins](docs/experience/wins/2026-07-17-dsv4-prefill-chunk-2048-default.md);
+  plan Shipped:
+  [plan](docs/plans/2026-07-17-dsv4-chunked-prefill-unification.md).
 - **2026-07-17 — #164/#162 CLOSED (accept): c32 × 300 s oversubscription
   survival with real preemption (192 events, zero teardowns).** Final fix
   chain `f03a54f4a`: the evictor freed live-attached pages (cross-slot KV
