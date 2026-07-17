@@ -275,6 +275,9 @@ are wire-and-license, not build)
   lane (same model + failing pytest output / reference patch in context) +
   `KlReg{reference: Teacher}` wiring. The ~10×-class move; rescues the
   zero-gradient tail. Gate: all-fail-task pass-rate delta on the real corpus.
+  Teacher hygiene when this lands: EMA smoothing (default-on) + iso-loss
+  projection A/B —
+  [Requential Coding notes](../resources/2026-07-17-requential-coding-opd-notes.md).
 
 Standing rule this re-cost enforces: **audit in-tree substrate before costing
 any lever** (先用最好的再自己写) — the v1 costing of all three was wrong in the
