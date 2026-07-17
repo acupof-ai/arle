@@ -1,0 +1,21 @@
+scripts/eval_harness/__init__.py
+  s_eb144558c03e4b::t_4d4be74e18f61c 112-117,119-123
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "7f24937cadb78f73b39f803cec99073a1d27ebec",
+  "prompts": {},
+  "sessions": {
+    "s_eb144558c03e4b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a3c2582389c582f61",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
