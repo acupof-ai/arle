@@ -3357,6 +3357,12 @@ pub fn capture_rollout_logprobs(
     // numerically exact, so π_rollout is unchanged. Needs `--gradient-checkpointing`.
     let mut tape = Tape::new();
     tape.set_enabled(true);
+    // Same seq-adaptive host-offload gate as the writeback forward. Capture is
+    // never backwarded, so offloaded checkpoint inputs are never re-uploaded —
+    // the forward retains no device activations across layers (resident
+    // checkpoints spiked 50.7→97.4 GB and OOMed at seq≈15K; offload is
+    // numerically transparent, see `checkpoint_offload_is_transparent`).
+    tape.set_offload_checkpoints(crate::runtime_flags::writeback_offload_for_seq(seq_len));
     let hidden = if frozen {
         let seg = GenSegment::split(&full, prompt_len);
         student
