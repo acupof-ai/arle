@@ -370,15 +370,25 @@ impl RealCudaExecutor {
         match self {
             Self::Qwen(_) => infer_seam::SpecDecodeStats::default(),
             Self::Qwen35(q) => {
-                q.dspark
-                    .as_ref()
-                    .map_or_else(Default::default, |ds| infer_seam::SpecDecodeStats {
+                if let Some(ds) = q.dspark.as_ref() {
+                    infer_seam::SpecDecodeStats {
                         chains: ds.chains as u64,
                         drafted: (ds.accepts + ds.rejects) as u64,
                         accepted: ds.accepts as u64,
                         rejected: ds.rejects as u64,
                         partial_ctx_chains: ds.partial_ctx_chains as u64,
-                    })
+                    }
+                } else if let Some(m) = q.mtp.as_ref() {
+                    infer_seam::SpecDecodeStats {
+                        chains: m.chains as u64,
+                        drafted: (m.accepts + m.rejects) as u64,
+                        accepted: m.accepts as u64,
+                        rejected: m.rejects as u64,
+                        partial_ctx_chains: 0,
+                    }
+                } else {
+                    infer_seam::SpecDecodeStats::default()
+                }
             }
             Self::Dsv4(d) => infer_seam::SpecDecodeStats {
                 chains: d.mtp_chains as u64,

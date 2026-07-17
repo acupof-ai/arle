@@ -268,14 +268,19 @@ pub(crate) struct Qwen35CudaExecutor {
     /// MTP spec-decode per-slot state (`--spec-type mtp`): the spec draft/verify
     /// state + the seed (pending token + hidden) for the next spec step.
     /// `None` (the default) keeps the baseline executor byte-identical.
-    mtp: Option<MtpExec>,
+    pub(crate) mtp: Option<MtpExec>,
 }
 
 /// Per-slot MTP spec-decode runtime state. The spec state is created lazily on
 /// the first decode step that needs it (a warm forward captures the seed
 /// hidden + pending token); subsequent steps run `spec_step` directly.
-struct MtpExec {
+pub(crate) struct MtpExec {
     slots: Vec<Option<MtpSlotState>>,
+    /// Cumulative accept-commit counters (host-side, no device sync) — the
+    /// /v1/stats spec-decode source, same shape as DSv4's mtp_* counters.
+    pub(crate) accepts: usize,
+    pub(crate) rejects: usize,
+    pub(crate) chains: usize,
 }
 
 struct MtpSlotState {
@@ -934,6 +939,9 @@ impl Qwen35CudaExecutor {
             dspark: dspark_head.map(|h| crate::qwen35::dspark::Qwen35DsparkExec::new(h, num_slots)),
             mtp: mtp_draft_tokens.map(|_| MtpExec {
                 slots: (0..num_slots).map(|_| None).collect(),
+                accepts: 0,
+                rejects: 0,
+                chains: 0,
             }),
         };
         cuda_startup_log(
@@ -1757,8 +1765,13 @@ impl Qwen35CudaExecutor {
                 .expect("paged (gated)")
                 .truncate_slot(slot, start + emitted.len())?;
         }
-        // Update the seed for the next spec step.
-        if let Some(st) = mtp.as_mut().expect("mtp (gated)").slots[slot].as_mut() {
+        // Commit: accumulate the spec-decode counters + update the next seed.
+        let mtp_exec = mtp.as_mut().expect("mtp (gated)");
+        let accepted = emitted.len() - 1;
+        mtp_exec.accepts += accepted;
+        mtp_exec.rejects += depth - accepted;
+        mtp_exec.chains += 1;
+        if let Some(st) = mtp_exec.slots[slot].as_mut() {
             st.pending = next_pending;
             st.hidden = next_hidden;
         }
