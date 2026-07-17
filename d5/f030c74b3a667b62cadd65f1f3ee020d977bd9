@@ -1,0 +1,21 @@
+CHANGELOG.md
+  s_b881c0010283cd::t_1aac662c7583ca 26-33
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "d5f030c74b3a667b62cadd65f1f3ee020d977bd9",
+  "prompts": {},
+  "sessions": {
+    "s_b881c0010283cd": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f6fa8-ad76-7ce2-82eb-2fad677f0d4f",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
