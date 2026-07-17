@@ -42,14 +42,18 @@ class PrefixReuseGate(Gate):
         query(doc, max_tokens=1)
         time.sleep(0.3)
         s1 = get_stats()
-        return stat_delta(s0, s1, "prefix_hit_tokens")
+        return stat_delta(s0, s1, "prefix_cache_hit_tokens")
 
     def _reuse(self, doc: str) -> tuple[dict, int, int]:
         s0 = get_stats()
         r = query(doc + QUESTION, max_tokens=48)
         time.sleep(0.3)
         s1 = get_stats()
-        return r, stat_delta(s0, s1, "prefix_hit_tokens"), stat_delta(s0, s1, "prefix_hit_pages")
+        return (
+            r,
+            stat_delta(s0, s1, "prefix_cache_hit_tokens"),
+            stat_delta(s0, s1, "prefix_cache_hit_pages"),
+        )
 
     def _control(self, doc: str) -> dict:
         return query(mutate_prefix(doc) + QUESTION, max_tokens=48)
@@ -96,7 +100,7 @@ class PrefixReuseGate(Gate):
                 self.name,
                 False,
                 {"results": results},
-                "prefix_hit_tokens never increased — cache not seeded",
+                "prefix_cache_hit_tokens never increased — cache not seeded",
             )
 
         reuse_ok = sum(1 for r in actual_runs if r["reuse_needle"])
