@@ -2310,6 +2310,9 @@ struct ReplayRecord {
     prompt_ids: Vec<u32>,
     response_ids: Vec<u32>,
     response_mask: Vec<u8>,
+    /// Generation-time behavior logprobs (one per masked token; F.6 input).
+    #[serde(default)]
+    gen_logprobs: Vec<f32>,
     /// Attempt reward for SAO advantage; pre-reward records (CE-only flow)
     /// default to 1.0 = a passing trajectory, keeping rejection-CE unchanged.
     #[serde(default = "replay_default_reward")]
@@ -2408,6 +2411,10 @@ fn replay_pg(
                         response_mask: r.response_mask.clone(),
                         reward: r.reward,
                         rollout_logprobs,
+                        // Sidecar behavior logprobs: F.6 diagnostic only — the
+                        // IS ratio stays on the V0 recompute above until F.6
+                        // licenses the source flip.
+                        gen_logprobs: (!r.gen_logprobs.is_empty()).then(|| r.gen_logprobs.clone()),
                         group_id,
                         // Replay records don't carry the terminal state.
                         truncated: false,
@@ -3270,6 +3277,9 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
                     response_mask: r.response_mask,
                     reward: r.reward,
                     rollout_logprobs: None,
+                    // Sidecar behavior logprobs (F.6 diagnostic; the IS ratio
+                    // stays on the V0 recompute until F.6 licenses the flip).
+                    gen_logprobs: (!r.gen_logprobs.is_empty()).then_some(r.gen_logprobs),
                     group_id: group_idx,
                     truncated: false,
                 })
@@ -3332,6 +3342,10 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
                     "kl_rollout": report.stats.kl_mean(),
                     "is_ratio_mean": report.stats.ratio_mean(),
                     "is_ratio_max": report.stats.ratio_max,
+                    // F.6: sidecar-vs-recompute logprob gap (0/absent tokens = no sidecar coverage).
+                    "ratio_floor_mean": report.ratio_floor_mean,
+                    "ratio_floor_max": report.ratio_floor_max,
+                    "ratio_floor_tokens": report.ratio_floor_tokens,
                     "clip_frac": report.stats.clip_frac(),
                     "adv_mean": report.adv_mean,
                     "adv_std": report.adv_std,
@@ -4988,6 +5002,7 @@ mod tests {
                     response_mask: vec![1],
                     reward,
                     rollout_logprobs: Some(vec![-0.5]),
+                    gen_logprobs: None,
                     group_id: 0,
                     truncated: false,
                 })
