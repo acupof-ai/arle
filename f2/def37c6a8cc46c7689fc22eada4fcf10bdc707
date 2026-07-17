@@ -1,0 +1,23 @@
+crates/infer-core/src/prefix.rs
+  s_a900073d9c66b4::t_d9f143614ddfed 202-206,618-632,637-641
+scripts/eval_harness/__init__.py
+  s_a900073d9c66b4::t_ccdeafe4a23a91 140-144
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "f2def37c6a8cc46c7689fc22eada4fcf10bdc707",
+  "prompts": {},
+  "sessions": {
+    "s_a900073d9c66b4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a04bb5f9f1a3cf318",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
