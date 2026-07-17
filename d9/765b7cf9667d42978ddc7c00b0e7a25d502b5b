@@ -1,0 +1,21 @@
+scripts/eval_harness/prefix_reuse.py
+  s_a900073d9c66b4::t_90b95bc10c53a3 116-118,132,144-145
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "d9765b7cf9667d42978ddc7c00b0e7a25d502b5b",
+  "prompts": {},
+  "sessions": {
+    "s_a900073d9c66b4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a04bb5f9f1a3cf318",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
