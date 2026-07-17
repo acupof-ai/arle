@@ -199,6 +199,11 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             self.kv.truncate_slot(slot, restored_len)?;
         }
 
+        log::info!(
+            "prefix-attach: slot={slot} matched={} restored={restored_len} prompt={}",
+            prefix_match.matched_len,
+            request.prompt_len()
+        );
         self.prefix_cache_stats.hits = self.prefix_cache_stats.hits.saturating_add(1);
         self.prefix_cache_stats.hit_tokens = self
             .prefix_cache_stats
@@ -610,13 +615,30 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
     pub(crate) fn lookup_prefix_for_attach(&mut self, tokens: &[u32]) -> PrefixMatch {
         if self.kv_tier_capacity() == 0 {
             let matched = self.radix.longest_prefix_match(tokens);
-            return self.clamp_prefix_to_backend(matched, tokens);
+            let raw = matched.block_ids.len();
+            let clamped = self.clamp_prefix_to_backend(matched, tokens);
+            log::info!(
+                "prefix-lookup: prompt={} raw_blocks={raw} licensed_blocks={}",
+                tokens.len(),
+                clamped.block_ids.len()
+            );
+            return clamped;
         }
-        let mut blocks = self.radix.tiered_longest_prefix_match(tokens).blocks;
+        let blocks_all = self.radix.tiered_longest_prefix_match(tokens).blocks;
+        let resident = blocks_all
+            .iter()
+            .take_while(|b| matches!(b, PrefixBlock::ResidentPage(_)))
+            .count();
+        let mut blocks = blocks_all;
         let reusable = self
             .executor
             .reusable_prefix_blocks_for_prompt(&blocks, tokens)
             .min(blocks.len());
+        log::info!(
+            "prefix-lookup(tier): prompt={} raw_blocks={} resident_run={resident} licensed_blocks={reusable}",
+            tokens.len(),
+            blocks.len()
+        );
         blocks.truncate(reusable);
         let block_ids = self.materialize_prefix_blocks(&blocks);
         // record_prefix_tier_hits now lives inside materialize_prefix_blocks
