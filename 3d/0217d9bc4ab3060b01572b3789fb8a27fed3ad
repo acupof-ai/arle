@@ -1,0 +1,21 @@
+docs/experience/wins/2026-07-17-qwen35-mtp-rejection-sampling.md
+  s_ce5861ea120d27::t_9dface23735ad3 3-6,28-45
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "3d0217d9bc4ab3060b01572b3789fb8a27fed3ad",
+  "prompts": {},
+  "sessions": {
+    "s_ce5861ea120d27": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-af4ecfb1843dd598e",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
