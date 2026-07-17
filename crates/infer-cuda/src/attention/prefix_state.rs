@@ -90,6 +90,11 @@ pub(crate) struct Dsv4LayerPageState {
     /// finish_len % ratio` and reads exactly these.
     pub(super) pending_kv: Vec<half::bf16>,
     pub(super) pending_score: Vec<half::bf16>,
+    /// Indexer pending of the same tail (`finish_len % index_ratio` tokens ×
+    /// indexer width) — #165: without it an off-ratio restore left the prior
+    /// occupant's rows in the indexer's bf16 pending.
+    pub(super) idx_pending_kv: Vec<half::bf16>,
+    pub(super) idx_pending_score: Vec<half::bf16>,
     /// Completed compress rows of the tail page (`[matched_len/ratio,
     /// finish_len/ratio)`), restored past the frontier page's own rows.
     pub(super) tail_staging: Vec<half::bf16>,
@@ -111,7 +116,9 @@ pub(crate) struct Dsv4PrefixPageEntry {
     pub(crate) layers: Vec<Dsv4LayerPageState>,
 }
 
-const ENTRY_MAGIC: &[u8; 4] = b"DSPP";
+// Magic doubles as format version: bumped on layout change so stale entries
+// fail-close at the header instead of misparsing positional sections.
+const ENTRY_MAGIC: &[u8; 4] = b"DSP2";
 
 fn push_bytes(buf: &mut Vec<u8>, v: &[u8]) {
     buf.extend_from_slice(&(v.len() as u32).to_le_bytes());
@@ -173,6 +180,8 @@ impl Dsv4PrefixPageEntry {
             push_bf16(&mut buf, &layer.ring);
             push_bf16(&mut buf, &layer.pending_kv);
             push_bf16(&mut buf, &layer.pending_score);
+            push_bf16(&mut buf, &layer.idx_pending_kv);
+            push_bf16(&mut buf, &layer.idx_pending_score);
             push_bf16(&mut buf, &layer.tail_staging);
             push_bytes(&mut buf, &layer.tail_dsa_data);
             push_bytes(&mut buf, &layer.tail_dsa_scale);
@@ -202,6 +211,8 @@ impl Dsv4PrefixPageEntry {
                     ring: read_bf16(&mut pos, bytes)?,
                     pending_kv: read_bf16(&mut pos, bytes)?,
                     pending_score: read_bf16(&mut pos, bytes)?,
+                    idx_pending_kv: read_bf16(&mut pos, bytes)?,
+                    idx_pending_score: read_bf16(&mut pos, bytes)?,
                     tail_staging: read_bf16(&mut pos, bytes)?,
                     tail_dsa_data: read_bytes(&mut pos, bytes)?,
                     tail_dsa_scale: read_bytes(&mut pos, bytes)?,
@@ -232,6 +243,8 @@ impl Dsv4PrefixPageEntry {
                         + l.ring.len()
                         + l.pending_kv.len()
                         + l.pending_score.len()
+                        + l.idx_pending_kv.len()
+                        + l.idx_pending_score.len()
                         + l.tail_staging.len())
                         * 2
             })
@@ -250,7 +263,7 @@ pub(crate) fn dsv4_prefix_entry_max_bytes(
     let bf16 = 2usize;
     let mut total = 13usize; // entry header (magic + page_index + boundary + n_layers)
     for &(mode, ratio) in layer_specs {
-        total += 13 * 4; // section length prefixes
+        total += 15 * 4; // section length prefixes
         // ring — every layer has an SW window cache.
         total += config.sliding_window * config.head_dim * bf16;
         // ceil, not floor: for ratio > page_tokens a page can still complete
@@ -273,6 +286,9 @@ pub(crate) fn dsv4_prefix_entry_max_bytes(
             // dsa data+scale + tail dsa data+scale (both ≤ one page of rows).
             total += 2 * rpp * (config.index_head_dim + 4);
             total += 2 * index_ratio * config.index_head_dim * bf16; // idx overlap
+            // idx pending kv+score: indexer is built with overlap=true, width
+            // = 2·index_head_dim.
+            total += 2 * index_ratio * (2 * config.index_head_dim) * bf16;
         }
     }
     total
@@ -866,6 +882,31 @@ impl Dsv4LayerAttentionState {
                     .map_err(|e| anyhow!("DSv4 frontier tail staging D2H failed: {e}"))?;
             }
         }
+        if let Some(ix) = &self.indexer {
+            let ratio = dsa_index_ratio(mode, compress_ratio);
+            let pending_len = finish_len % ratio;
+            if pending_len > 0 {
+                ensure!(
+                    ix.pending_kv.len().is_multiple_of(ratio),
+                    "DSv4 frontier tail: idx pending buffer {} not ratio-{ratio} divisible",
+                    ix.pending_kv.len()
+                );
+                let n = pending_len * (ix.pending_kv.len() / ratio);
+                ensure!(
+                    n <= ix.pending_kv.len() && n <= ix.pending_score.len(),
+                    "DSv4 frontier tail: idx pending rows {n} outside buffer {}",
+                    ix.pending_kv.len()
+                );
+                out.idx_pending_kv = ctx
+                    .stream
+                    .clone_dtoh(&ix.pending_kv.slice(0..n))
+                    .map_err(|e| anyhow!("DSv4 frontier tail idx pending kv D2H failed: {e}"))?;
+                out.idx_pending_score = ctx
+                    .stream
+                    .clone_dtoh(&ix.pending_score.slice(0..n))
+                    .map_err(|e| anyhow!("DSv4 frontier tail idx pending score D2H failed: {e}"))?;
+            }
+        }
         if let Some(dsa) = &self.dsa_official
             && let Some((data_range, scale_range)) = dsa_tail_ranges(
                 pool,
@@ -955,6 +996,36 @@ impl Dsv4LayerAttentionState {
                     "DSv4 frontier tail restore: entry has staging for a tail the live shape completes none"
                 ),
             }
+        }
+        if let Some(ix) = &mut self.indexer {
+            let ratio = dsa_index_ratio(mode, compress_ratio);
+            let pending_len = finish_len % ratio;
+            let n = if pending_len > 0 {
+                pending_len * (ix.pending_kv.len() / ratio)
+            } else {
+                0
+            };
+            ensure!(
+                state.idx_pending_kv.len() == n && state.idx_pending_score.len() == n,
+                "DSv4 frontier tail restore idx pending {}+{} != live {n}",
+                state.idx_pending_kv.len(),
+                state.idx_pending_score.len()
+            );
+            if n > 0 {
+                let mut kv = ix.pending_kv.slice_mut(0..n);
+                ctx.stream
+                    .memcpy_htod(&state.idx_pending_kv, &mut kv)
+                    .map_err(|e| anyhow!("DSv4 frontier tail idx pending kv H2D failed: {e}"))?;
+                let mut score = ix.pending_score.slice_mut(0..n);
+                ctx.stream
+                    .memcpy_htod(&state.idx_pending_score, &mut score)
+                    .map_err(|e| anyhow!("DSv4 frontier tail idx pending score H2D failed: {e}"))?;
+            }
+        } else {
+            ensure!(
+                state.idx_pending_kv.is_empty() && state.idx_pending_score.is_empty(),
+                "DSv4 frontier tail restore: entry has idx pending for a layer without an indexer"
+            );
         }
         if let Some(dsa) = &self.dsa_official {
             match dsa_tail_ranges(
@@ -1251,6 +1322,8 @@ mod tests {
                     ring: bf(&[1.0, 2.0, 3.0]),
                     pending_kv: bf(&[0.75, -0.5]),
                     pending_score: bf(&[1.5]),
+                    idx_pending_kv: bf(&[0.25]),
+                    idx_pending_score: bf(&[-4.5]),
                     tail_staging: bf(&[-2.25]),
                     tail_dsa_data: vec![9, 10, 11],
                     tail_dsa_scale: vec![64, 0],
