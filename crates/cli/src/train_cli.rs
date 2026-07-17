@@ -2870,11 +2870,12 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
         student_dir
             .to_str()
             .ok_or_else(|| anyhow!("student path is not valid UTF-8"))?,
-        // agent-OPD: NO decode CUDA-graph. Its captured workspace (~30 GB on the
-        // 27B MoE, captured during the rollout's decode) would co-reside with the
-        // masked-CE writeback and OOM it (post-rollout engine ~87 GB vs ~55 GB
-        // no-graph). F.5 measures whether the co-residency budget affords it.
-        false,
+        // agent-OPD: decode CUDA-graph default-OFF. Its captured workspace (~30 GB
+        // on the 27B MoE, captured during the rollout's decode) would co-reside
+        // with the masked-CE writeback and OOM it (post-rollout engine ~87 GB vs
+        // ~55 GB no-graph). F.5's ~26 GB headroom made it worth exposing as
+        // --qwen35-decode-graph; the default flip waits for the F.5 license.
+        args.runtime.qwen35_decode_graph,
         EngineLoadConfig {
             num_slots: width,
             page_size: 16,
@@ -2893,6 +2894,10 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
             mem_fraction_static: 0.2,
             dspark_draft_model: args.runtime.dspark_draft_model.clone(),
             dspark_conf_threshold: args.runtime.dspark_conf_threshold,
+            cuda: infer_api::CudaRuntimeFlags {
+                qwen35_decode_graph: args.runtime.qwen35_decode_graph,
+                ..Default::default()
+            },
             ..EngineLoadConfig::default()
         },
     )
