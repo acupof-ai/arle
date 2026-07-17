@@ -1,6 +1,6 @@
 # DSv4 Chunked-Prefill Unification: sizing, restore-alignment, and compressor-boundary snapshots
 
-> Status: Active — Phase 1 landed (2026-07-17); Phase 2 code landed (2026-07-17, `ARLE_DSV4_PREFILL_CHUNK`, default OFF) — pod gates pending (needle ladder, prefix-restore A/B, t(chunk) curve)
+> Status: Shipped — all 3 phases landed + pod-accepted 2026-07-17 (wins: ../experience/wins/2026-07-17-dsv4-prefill-chunk-2048-default.md)
 
 
 **File:** `docs/plans/2026-07-17-dsv4-chunked-prefill-unification.md`
