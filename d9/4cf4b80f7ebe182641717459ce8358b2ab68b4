@@ -1,0 +1,27 @@
+crates/infer-cuda/src/qwen35/dspark.rs
+  s_3e28b5e8b2fa2b::t_635554cdcee41d 329-332,346
+crates/infer-cuda/src/executor/qwen35.rs
+  s_3e28b5e8b2fa2b::t_a61246f0de7b7c 1542-1544,1572-1573,1616-1634,1658-1676,1743
+crates/infer-cuda/src/qwen35.rs
+  s_3e28b5e8b2fa2b::t_0086c452617daa 1086-1102,2016-2022,3715-3717,3734-3735,3839,3849-3887,3896,3900-3909,3937,3969-3970,3999-4013,4015-4034,4046-4159,4163,4167,7979
+docs/experience/wins/2026-07-17-qwen35-mtp-rejection-sampling.md
+  s_3e28b5e8b2fa2b::t_990b7bd1a72487 1-36
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "d94cf4b80f7ebe182641717459ce8358b2ab68b4",
+  "prompts": {},
+  "sessions": {
+    "s_3e28b5e8b2fa2b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ad6a9ec63380d81a6",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
