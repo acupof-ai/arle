@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const DSV4_PREFILL_QUERY_CHUNK: usize = 4096;
+pub(crate) const DSV4_PREFILL_QUERY_CHUNK: usize = 4096;
 
 /// Probe/pending row width of a compressor state: both halves when `overlap`.
 /// Single source for `Dsv4CompressorState::{new, device_bytes_for}` and
