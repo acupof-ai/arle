@@ -37,6 +37,10 @@ pub struct ScoredTrajectory {
     /// (the policy the trajectory was SAMPLED from; equals πθ at V0 today,
     /// stale-θ under future async staleness). `Some` iff `needs.rollout_logprobs`.
     pub rollout_logprobs: Option<Vec<f32>>,
+    /// Generation-time behavior logprobs from the serve sidecar (same order as
+    /// `rollout_logprobs`). F.6 diagnostic input only for now: the IS ratio
+    /// keeps the V0 recompute until F.6 licenses flipping the source.
+    pub gen_logprobs: Option<Vec<f32>>,
     /// Per-prompt group key (task index) for [`Scope::Group`] baselines.
     pub group_id: usize,
     /// Hit the turn/token budget (input to the DAPO overlong filter).
@@ -139,6 +143,13 @@ pub struct UpdateReport {
     pub critic_mse: f32,
     pub adv_mean: f32,
     pub adv_std: f32,
+    /// F.6 precision diagnostic over trajectories carrying BOTH the sidecar's
+    /// generation-time logprobs and the V0 recompute: per-token
+    /// `exp(logp_recompute − logp_sidecar)` mean / max, and the tokens covered
+    /// (0 = no sidecar coverage this update).
+    pub ratio_floor_mean: f32,
+    pub ratio_floor_max: f32,
+    pub ratio_floor_tokens: usize,
 }
 
 /// One policy-update algorithm as data. Extend = a new constructor value.
@@ -381,6 +392,12 @@ impl UpdatePreset {
         let mut adv_sum = 0.0f64;
         let mut adv_sq = 0.0f64;
         let mut adv_n = 0usize;
+        // F.6: per-token exp(logp_recompute − logp_sidecar) over trajectories
+        // where both sources exist — measures the serve↔train numerics gap
+        // (FP8 serve vs bf16 train) plus any θ staleness.
+        let mut rf_sum = 0.0f64;
+        let mut rf_max = 0.0f32;
+        let mut rf_tokens = 0usize;
 
         for (i, traj) in survivors.iter().enumerate() {
             let rollout_logprobs = traj.rollout_logprobs.as_deref().ok_or_else(|| {
@@ -390,6 +407,16 @@ impl UpdatePreset {
                         .to_owned(),
                 )
             })?;
+            if let Some(gen_lp) = traj.gen_logprobs.as_deref()
+                && gen_lp.len() == rollout_logprobs.len()
+            {
+                for (&recompute, &sidecar) in rollout_logprobs.iter().zip(gen_lp) {
+                    let ratio = (recompute - sidecar).exp();
+                    rf_sum += f64::from(ratio);
+                    rf_max = rf_max.max(ratio);
+                }
+                rf_tokens += gen_lp.len();
+            }
             let (advantages, returns) = match critic.as_deref_mut() {
                 Some(c) => c.advantages(
                     student,
@@ -500,8 +527,16 @@ impl UpdatePreset {
             } else {
                 String::new()
             };
+            let rf_suffix = if rf_tokens > 0 {
+                format!(
+                    " ratio_floor_mean={:.4} ratio_floor_max={rf_max:.4} (F.6, {rf_tokens} tokens)",
+                    rf_sum / rf_tokens as f64,
+                )
+            } else {
+                String::new()
+            };
             eprintln!(
-                "[update] trained={steps} mean_policy_loss={:.4} kl={:.4e} clip_frac={:.3}{critic_suffix}",
+                "[update] trained={steps} mean_policy_loss={:.4} kl={:.4e} clip_frac={:.3}{critic_suffix}{rf_suffix}",
                 loss_sum / steps as f32,
                 stats.kl_mean(),
                 stats.clip_frac(),
@@ -521,6 +556,9 @@ impl UpdatePreset {
             critic_mse,
             adv_mean: adv_mean as f32,
             adv_std: adv_std.sqrt() as f32,
+            ratio_floor_mean: (rf_sum / rf_tokens.max(1) as f64) as f32,
+            ratio_floor_max: rf_max,
+            ratio_floor_tokens: rf_tokens,
         })
     }
 }
@@ -635,6 +673,7 @@ mod tests {
             response_mask: vec![1],
             reward,
             rollout_logprobs: None,
+            gen_logprobs: None,
             group_id,
             truncated: false,
         }

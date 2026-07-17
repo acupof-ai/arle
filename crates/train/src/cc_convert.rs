@@ -52,6 +52,11 @@ pub struct CcRecord {
     pub prompt_ids: Vec<u32>,
     pub response_ids: Vec<u32>,
     pub response_mask: Vec<u8>,
+    /// Generation-time behavior logprobs, one per MASKED response token in
+    /// mask order (= `capture_rollout_logprobs` target order) — from the
+    /// serve sidecars' `gen_logprobs`. Empty when any contributing request
+    /// lacked capture (greedy, Metal, pre-P6 serve, re-render fallback).
+    pub gen_logprobs: Vec<f32>,
     /// Attempt reward carried from the window (SAO advantage input).
     pub reward: f32,
     pub masked_tokens: usize,
@@ -298,6 +303,16 @@ fn merged_sidecar_record(
     let prompt_len = final_sidecar.prompt_token_ids.len();
     let mut mask = vec![0u8; prompt_len];
     let mut cursor = 0usize;
+    // Behavior logprobs in mask order (segments located at monotonic cursor
+    // positions); all-or-nothing — any uncaptured contributing request drops
+    // the whole vector so it can never misalign with the mask.
+    let mut logprobs = Some(Vec::new());
+    let mut push_logprobs = |lps: &[f32], n_gen: usize| {
+        match &mut logprobs {
+            Some(all) if lps.len() == n_gen => all.extend_from_slice(lps),
+            slot => *slot = None,
+        };
+    };
     for (i, (_, path)) in matched.iter().enumerate() {
         if i == final_idx {
             continue;
@@ -318,7 +333,12 @@ fn merged_sidecar_record(
         let start = cursor + pos;
         mask[start..start + gen_ids.len()].fill(1);
         cursor = start + gen_ids.len();
+        push_logprobs(&earlier.gen_logprobs, gen_ids.len());
     }
+    push_logprobs(
+        &final_sidecar.gen_logprobs,
+        final_sidecar.gen_token_ids.len(),
+    );
     let first_masked = mask.iter().position(|&m| m == 1).unwrap_or(prompt_len);
     if first_masked == 0 {
         eprintln!("[cc-convert] window {label}: supervised segment at token 0; re-render fallback");
@@ -331,7 +351,9 @@ fn merged_sidecar_record(
         .copied()
         .collect();
     mask.resize(ids.len(), 1);
-    Some(split_record(label, reward, &ids, &mask, first_masked))
+    let mut record = split_record(label, reward, &ids, &mask, first_masked);
+    record.gen_logprobs = logprobs.unwrap_or_default();
+    Some(record)
 }
 
 /// Split at the first supervised token: everything before is prompt, the rest
@@ -348,6 +370,7 @@ fn split_record(
         prompt_ids: ids[..first_masked].to_vec(),
         response_ids: ids[first_masked..].to_vec(),
         response_mask: mask[first_masked..].to_vec(),
+        gen_logprobs: Vec::new(),
         reward,
         masked_tokens: mask.iter().filter(|&&m| m == 1).count(),
         total_tokens: ids.len(),
@@ -516,17 +539,17 @@ mod tests {
         write("1000_0.json", &dump(1));
         write(
             "1000_0.tokens.json",
-            r#"{"prompt_token_ids":[1,2],"gen_token_ids":[10,11]}"#,
+            r#"{"prompt_token_ids":[1,2],"gen_token_ids":[10,11],"gen_logprobs":[-0.1,-0.2]}"#,
         );
         write("1001_0.json", &dump(3));
         write(
             "1001_0.tokens.json",
-            r#"{"prompt_token_ids":[1,2,10,11,3],"gen_token_ids":[20,21]}"#,
+            r#"{"prompt_token_ids":[1,2,10,11,3],"gen_token_ids":[20,21],"gen_logprobs":[-0.3,-0.4]}"#,
         );
         write("1002_0.json", &dump(5));
         write(
             "1002_0.tokens.json",
-            r#"{"prompt_token_ids":[1,2,10,11,3,20,21,4],"gen_token_ids":[30]}"#,
+            r#"{"prompt_token_ids":[1,2,10,11,3,20,21,4],"gen_token_ids":[30],"gen_logprobs":[-0.5]}"#,
         );
         // Never reached: the sidecar path skips tokenization entirely.
         let tokenizer =
@@ -540,5 +563,7 @@ mod tests {
         assert_eq!(record.response_ids, vec![10, 11, 3, 20, 21, 4, 30]);
         assert_eq!(record.response_mask, vec![1, 1, 0, 1, 1, 0, 1]);
         assert_eq!((record.masked_tokens, record.total_tokens), (5, 9));
+        // Behavior logprobs: one per masked token, in mask order.
+        assert_eq!(record.gen_logprobs, vec![-0.1, -0.2, -0.3, -0.4, -0.5]);
     }
 }
