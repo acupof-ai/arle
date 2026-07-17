@@ -80,12 +80,16 @@ fn dump_messages_body(body: &serde_json::Value) -> Option<PathBuf> {
 /// prompt tokens the serve rendered + the tokens the engine generated for THAT
 /// request — no re-render drift. Assistant-span byte offsets are not captured:
 /// the serve renders via the checkpoint's Jinja template, which exposes no
-/// spans. gen_logprobs joins here when the CUDA-side generation-time logprob
-/// capture lands (P6b).
+/// spans.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct TokensSidecar {
     pub prompt_token_ids: Vec<u32>,
     pub gen_token_ids: Vec<u32>,
+    /// Generation-time behavior logprobs (P6b), one per `gen_token_ids` entry:
+    /// log p under the SAME filtered dist the sampler drew from, captured at
+    /// commit time. Empty when uncaptured (greedy, Metal, pre-P6 serves).
+    #[serde(default)]
+    pub gen_logprobs: Vec<f32>,
 }
 
 /// Sidecar path for a dump: `<epoch_ms>_<seq>.tokens.json`.
@@ -94,12 +98,25 @@ pub fn tokens_sidecar_path(dump_path: &Path) -> PathBuf {
     dump_path.with_extension("tokens.json")
 }
 
-/// Fire-and-forget sidecar write (log-and-continue on error).
-fn write_tokens_sidecar(dump_path: &Path, prompt: Vec<u32>, generated: Vec<u32>) {
+/// Fire-and-forget sidecar write (log-and-continue on error). `logprobs` is
+/// all-or-nothing: kept only when it covers every generated token (a partial
+/// vector would silently misalign the F.6 ratio diagnostic).
+fn write_tokens_sidecar(
+    dump_path: &Path,
+    prompt: Vec<u32>,
+    generated: Vec<u32>,
+    logprobs: Vec<f32>,
+) {
     let path = tokens_sidecar_path(dump_path);
+    let gen_logprobs = if logprobs.len() == generated.len() {
+        logprobs
+    } else {
+        Vec::new()
+    };
     let sidecar = TokensSidecar {
         prompt_token_ids: prompt,
         gen_token_ids: generated,
+        gen_logprobs,
     };
     let result = serde_json::to_vec(&sidecar)
         .map_err(std::io::Error::other)
@@ -434,6 +451,8 @@ fn lockstep_loop(
 struct CollectedGeneration {
     prompt_tokens: usize,
     generated_tokens: Vec<u32>,
+    /// Behavior logprobs accumulated from the deltas (empty when uncaptured).
+    gen_logprobs: Vec<f32>,
     finish: Option<FinishReason>,
 }
 
@@ -534,10 +553,12 @@ async fn submit_and_collect(
     let prompt_len = prompt_tokens.len();
     let (mut rx, _guard) = streaming_submit(state, prompt_tokens, max_tokens, sampling)?;
     let mut generated_tokens: Vec<u32> = Vec::new();
+    let mut gen_logprobs: Vec<f32> = Vec::new();
     let mut finish: Option<FinishReason> = None;
     let mut error: Option<String> = None;
     while let Some(delta) = rx.recv().await {
         generated_tokens.extend_from_slice(&delta.token_ids);
+        gen_logprobs.extend_from_slice(&delta.logprobs);
         let done = delta.is_done();
         error = error.or(delta.error);
         if done {
@@ -551,6 +572,7 @@ async fn submit_and_collect(
     Ok(CollectedGeneration {
         prompt_tokens: prompt_len,
         generated_tokens,
+        gen_logprobs,
         finish,
     })
 }
@@ -1114,6 +1136,7 @@ async fn anthropic_messages(
             let mut saw_tool_use = false;
             let mut output_tokens = 0usize;
             let mut gen_ids: Vec<u32> = Vec::new();
+            let mut gen_lps: Vec<f32> = Vec::new();
             // Keep-alive pings while generation runs (long prefills).
             let mut ping = tokio::time::interval(Duration::from_secs(5));
             ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1137,6 +1160,7 @@ async fn anthropic_messages(
                             output_tokens += delta.token_ids.len();
                             if sidecar.is_some() {
                                 gen_ids.extend_from_slice(&delta.token_ids);
+                                gen_lps.extend_from_slice(&delta.logprobs);
                             }
                             let text = {
                                 let tok = state_clone
@@ -1151,7 +1175,12 @@ async fn anthropic_messages(
                         }
                         if delta.finish {
                             if let Some((path, prompt)) = sidecar.take() {
-                                write_tokens_sidecar(&path, prompt, std::mem::take(&mut gen_ids));
+                                write_tokens_sidecar(
+                                    &path,
+                                    prompt,
+                                    std::mem::take(&mut gen_ids),
+                                    std::mem::take(&mut gen_lps),
+                                );
                             }
                             // Flush the pipeline: truncated thinking + buffered tool tail.
                             let (pieces, calls) = pipeline.finish();
@@ -1194,7 +1223,12 @@ async fn anthropic_messages(
     let sidecar_prompt = dump_path.as_ref().map(|_| prompt_tokens.clone());
     let outcome = submit_and_collect(&state, prompt_tokens, max_tokens, sampling).await?;
     if let (Some(path), Some(prompt)) = (dump_path, sidecar_prompt) {
-        write_tokens_sidecar(&path, prompt, outcome.generated_tokens.clone());
+        write_tokens_sidecar(
+            &path,
+            prompt,
+            outcome.generated_tokens.clone(),
+            outcome.gen_logprobs.clone(),
+        );
     }
     let decoded = decode(&state, &outcome.generated_tokens)?;
     let (content, tool_calls, split_thinking) =

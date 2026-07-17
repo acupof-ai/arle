@@ -1230,8 +1230,10 @@ impl Qwen35Model {
     /// last row — committed tokens are distributed exactly as filtered target
     /// sampling. Fully on device: one batched filter launch over the verify
     /// logits + one chain kernel; the host receives only `[accepted_len,
-    /// token]` (8 bytes). All uniforms come from host salted `(seed, position)`
-    /// streams, so same-config-twice reproduces.
+    /// token]` (8 bytes) plus one 4-byte filtered prob per committed token
+    /// (the P6 behavior logprob, read after the verdict sync). All uniforms
+    /// come from host salted `(seed, position)` streams, so same-config-twice
+    /// reproduces.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn dspark_accept_commit_sampled(
         &self,
@@ -1244,7 +1246,7 @@ impl Qwen35Model {
         logits: &DeviceVec,
         start_pos: usize,
         params: &SamplingParams,
-    ) -> Result<(Vec<u32>, u32, usize)> {
+    ) -> Result<(Vec<super::CommittedToken>, u32, usize)> {
         let ctx = &self.ctx;
         let depth = chain.len() - 1;
         let block = head.cfg.block_size;
@@ -1330,8 +1332,16 @@ impl Qwen35Model {
             k <= depth,
             "dspark chain kernel returned k {k} > depth {depth}"
         );
-        let mut emitted: Vec<u32> = chain[1..=k].to_vec();
-        emitted.push(bonus);
+        let mut tokens: Vec<u32> = chain[1..=k].to_vec();
+        tokens.push(bonus);
+        // Behavior logprobs from the still-materialized filtered p rows
+        // (verdict D2H synced above) — see `chain_commit_logprobs`.
+        let logprobs = super::chain_commit_logprobs(ctx, p_all, vocab, &tokens)?;
+        let emitted = tokens
+            .into_iter()
+            .zip(logprobs)
+            .map(|(t, lp)| (t, Some(lp)))
+            .collect();
         if k < depth {
             spec.restore_trunk(ctx, slot)?;
             self.replay_linear_only(slot, ws, &spec.capture, k)?;
