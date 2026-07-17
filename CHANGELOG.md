@@ -23,6 +23,14 @@ Progress spine. Entry classes recorded here the day they land: phase exits,
 default flips, and accept-or-reject verdicts (AGENTS.md §Docs lifecycle &
 progress spine).
 
+- **2026-07-17 — DSv4 cold-boot #69 closed (verdict: fixed in code, disk-bound residual).**
+  Re-measured on current main: warm boot 33 s, all ranks build concurrent —
+  the filed rank-0 serialization and 8× read amplification were fixed by the
+  loader rewrite (mmap zero-copy + single-pass rank-0 prefetch). True cold
+  boot 26.5 min is 98% one saturated sequential read: 294 GB @ 0.19 GB/s
+  virtio device cap (dd-verified at 1/4/16 streams). Remaining lever is
+  storage infra, not runtime code.
+  [wins](docs/experience/wins/2026-07-17-dsv4-cold-boot-69-attribution.md) · #69.
 - **2026-07-17 — DSv4 extension-prompt prefix reuse fixed (accept, wash).**
   The finish write-through's frontier recapture clobbered the prefill
   chunk-end's tail-less boundary entry, so every diverging-suffix prompt (the
