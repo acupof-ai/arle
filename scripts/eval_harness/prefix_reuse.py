@@ -16,6 +16,8 @@ from __future__ import annotations
 import time
 
 from . import (
+    PREFIX_HIT_PAGES,
+    PREFIX_HIT_TOKENS,
     Gate,
     Verdict,
     build_doc,
@@ -42,7 +44,7 @@ class PrefixReuseGate(Gate):
         query(doc, max_tokens=1)
         time.sleep(0.3)
         s1 = get_stats()
-        return stat_delta(s0, s1, "prefix_cache_hit_tokens")
+        return stat_delta(s0, s1, PREFIX_HIT_TOKENS)
 
     def _reuse(self, doc: str) -> tuple[dict, int, int]:
         s0 = get_stats()
@@ -51,8 +53,8 @@ class PrefixReuseGate(Gate):
         s1 = get_stats()
         return (
             r,
-            stat_delta(s0, s1, "prefix_cache_hit_tokens"),
-            stat_delta(s0, s1, "prefix_cache_hit_pages"),
+            stat_delta(s0, s1, PREFIX_HIT_TOKENS),
+            stat_delta(s0, s1, PREFIX_HIT_PAGES),
         )
 
     def _control(self, doc: str) -> dict:
