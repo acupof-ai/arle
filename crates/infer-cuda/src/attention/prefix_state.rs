@@ -448,8 +448,9 @@ impl Dsv4PrefixStatePool {
         // Carry `confirmed` forward: a confirmed id still present is still
         // radix-held (evict would have dropped it), so any overwrite is a
         // content-identical sharer's republish.
-        let confirmed = self.meta.get(&page_id).is_some_and(|m| m.confirmed);
-        if let Some(old) = self.meta.get(&page_id) {
+        let old = self.meta.get(&page_id).copied();
+        let confirmed = old.is_some_and(|m| m.confirmed);
+        if let Some(old) = old {
             let clears_tail = self.frontier_tails.contains_key(&page_id);
             if (old.boundary && !entry.boundary) || clears_tail {
                 log::info!(
@@ -458,8 +459,6 @@ impl Dsv4PrefixStatePool {
                     entry.boundary
                 );
             }
-        }
-        if let Some(old) = self.meta.get(&page_id) {
             self.lru.remove(&(old.confirmed, old.stamp, page_id));
         }
         let stamp = self.next_stamp();

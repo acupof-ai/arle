@@ -993,11 +993,9 @@ impl Dsv4CudaExecutor {
             if !is_frontier && self.prefix_state.page_meta(page_id).is_some() {
                 continue;
             }
-            // A chunk-end boundary entry (tail-less, carry at the page end)
-            // licenses ANY continuation; replacing it with a finish-frontier
-            // entry (carry at finish_len, tail-gated) vetoed every diverging
-            // suffix — the #166 extension miss. Keep it: the finish forfeits
-            // only the < page_tokens sub-page tail.
+            // A tail-less chunk-end boundary entry licenses ANY continuation; a
+            // finish-frontier recapture (tail-gated at finish_len) would veto every
+            // diverging suffix (#166). Keep it — the finish forfeits only the sub-page tail.
             if is_frontier
                 && self
                     .prefix_state
