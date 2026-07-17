@@ -458,7 +458,7 @@ fn resolve_engine_config(
     if serve_args.low_impact {
         config.low_impact = true;
         config.max_running_requests = Some(1);
-        config.chunked_prefill_size = config.chunked_prefill_size.min(32);
+        config.chunked_prefill_size = Some(config.chunked_prefill_size.map_or(32, |v| v.min(32)));
     }
 
     config.kv_recall = serve_args.kv_recall;
@@ -476,7 +476,7 @@ fn resolve_engine_config(
     config.mem_fraction_static = serve_args.mem_fraction_static;
     config.kv_dram = serve_args.kv_dram;
     if let Some(value) = serve_args.chunked_prefill_size {
-        config.chunked_prefill_size = value;
+        config.chunked_prefill_size = Some(value);
     }
     config.slot_oversubscription = serve_args.kv_oversubscription;
     config.memory_budget_bytes = serve_args.memory_budget_bytes;
@@ -730,7 +730,7 @@ mod tests {
             config.options.engine_config.max_total_tokens,
             defaults.max_total_tokens
         );
-        assert_eq!(config.options.engine_config.chunked_prefill_size, 32);
+        assert_eq!(config.options.engine_config.chunked_prefill_size, Some(32));
         assert!(config.options.engine_config.low_impact);
     }
 

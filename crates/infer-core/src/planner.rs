@@ -57,7 +57,11 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             .config
             .prefill_step_budget()
             .min(cap.saturating_sub(decode_rows.len()));
-        let chunk_cap = self.config.prefill_chunk_size().min(cap);
+        let chunk_cap = self
+            .config
+            .prefill_chunk_size()
+            .min(cap)
+            .min(self.executor.max_prefill_chunk());
         let max_prefills = self.config.max_concurrent_prefill();
         for (&slot, request) in &self.active {
             if prefill_rows.len() >= max_prefills || budget == 0 {
@@ -75,15 +79,11 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             // Align chunk ends to lcm(page_size, restore_alignment) (LCM, not
             // max — neither is guaranteed to divide the other): some backends
             // restore side state (ring/compressor snapshots) only at their own
-            // coarser boundary. When restore_alignment > 1, also cap the chunk
-            // to one alignment unit — a call snapshots only at its own end, so
-            // an oversized chunk would skip every earlier unit inside it.
+            // coarser boundary. Chunk SIZE is bounded by max_prefill_chunk()
+            // in chunk_cap above; this only aligns where the chunk ends.
             let page_size = self.kv.page_size().max(1);
             let restore_alignment = self.executor.prefill_restore_boundary_alignment().max(1);
             let alignment_unit = lcm(page_size, restore_alignment);
-            if restore_alignment > 1 {
-                chunk = chunk.min(alignment_unit);
-            }
             let chunk_end = start_pos + chunk;
             let aligned_end = chunk_end - (chunk_end % alignment_unit);
             if aligned_end > start_pos {

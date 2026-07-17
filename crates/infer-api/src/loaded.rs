@@ -37,8 +37,9 @@ pub struct EngineLoadConfig {
     pub max_prompt_tokens: usize,
     /// Max prompt+generated tokens for one request.
     pub max_total_tokens: usize,
-    /// Per-request prefill chunk size.
-    pub chunked_prefill_size: usize,
+    /// Per-request prefill chunk size; `None` = backend/model-kind default.
+    #[serde(default)]
+    pub chunked_prefill_size: Option<usize>,
     /// `Some(n)` = MTP spec decode on with draft depth `n`; `None` = off.
     pub mtp_draft_tokens: Option<usize>,
     /// `Some(k)` = D2 MTP root-branch top-k width; verifier rows are root + candidates.
@@ -182,7 +183,7 @@ impl Default for EngineLoadConfig {
             // Sentinel: unset → bound by KV capacity in `scheduler_config` (#145).
             max_prompt_tokens: usize::MAX,
             max_total_tokens: 65_536,
-            chunked_prefill_size: 64,
+            chunked_prefill_size: None,
             mtp_draft_tokens: None,
             mtp_draft_topk: None,
             kv_cache_dtype: KvCacheDtype::Auto,
@@ -499,7 +500,10 @@ mod backend {
                 .max_prompt_tokens
                 .min(per_req_cap.saturating_sub(gen_reserve));
             config.max_total_tokens = self.max_total_tokens;
-            config.chunked_prefill_size = self.chunked_prefill_size;
+            // Unset → 64: the Metal-interactivity default (small ticks keep the
+            // single-threaded MLX encode loop responsive between decode steps).
+            // The CUDA load path re-resolves per model kind before use.
+            config.chunked_prefill_size = self.chunked_prefill_size.unwrap_or(64);
             config.max_running_requests = self.max_running_requests;
             config.slot_oversubscription = self.slot_oversubscription;
             // Diagnostic-only escape hatch (not a shipped feature) for the
@@ -1923,27 +1927,33 @@ mod backend {
             );
         }
         let mut scheduler = config.scheduler_config();
-        // The 64-token `chunked_prefill_size` default is a Metal-interactivity
-        // tune (small ticks keep the single-threaded MLX encode loop responsive
-        // between decode steps); on CUDA the per-chunk cost is an entire engine
-        // tick plus a full launch round (GDR/conv/MoE kernels per layer), so a
-        // 2048-token prompt at 64-token ticks pays ~32x the tick/launch overhead
-        // for the same KV-read volume (KV bytes read are chunk-invariant).
-        // Floor the CUDA Qwen kinds at 2048, mirroring the DSv4 override below;
-        // an explicitly larger configured chunk is preserved. (audit QW-KV-07)
-        if matches!(kind, CudaModelKind::Qwen3Dense | CudaModelKind::Qwen35) {
-            scheduler.chunked_prefill_size = scheduler.chunked_prefill_size.max(2048);
-        }
-        // DSv4 prefill activation scratch is bounded by the query-chunk size
-        // (`DSV4_PREFILL_QUERY_CHUNK` = 4096): the chunked-prefill forward asserts
-        // each call passes <= that many query tokens, so long prompts MUST chunk
-        // (single-chunk max_seq_len both trips that assert at >4096 and OOMs the
-        // M×K scratch at 900K). Cap at 4096; cross-request prefix reuse is
-        // backend-gated by `reusable_prefix_blocks`, so non-page-addressable
-        // CUDA arms fail closed without an API-layer model branch.
-        if matches!(kind, CudaModelKind::Dsv4) {
-            scheduler.chunked_prefill_size = 4096;
-        }
+        // Default-not-override chunk resolution. Unset → per-kind default: on
+        // CUDA a chunk is an entire engine tick plus a full launch round, so
+        // the 64-token Metal-interactivity base default would pay ~32x the
+        // tick/launch overhead on a 2048-token prompt (KV bytes read are
+        // chunk-invariant) — Qwen kinds default 2048 (audit QW-KV-07); DSv4
+        // defaults to its prefill scratch bound (`DSV4_PREFILL_QUERY_CHUNK` =
+        // 4096; the forward asserts each call passes <= that many query
+        // tokens, so long prompts MUST chunk — single-chunk max_seq_len both
+        // trips that assert at >4096 and OOMs the M×K scratch at 900K), while
+        // the planner still caps each chunk to the executor's
+        // `max_prefill_chunk()` capability. An explicit value is honored,
+        // clamped into the executor-safe [128, 4096] and rounded down to a
+        // 128 multiple (KV page × restore-alignment grain).
+        scheduler.chunked_prefill_size = match config.chunked_prefill_size {
+            None if matches!(kind, CudaModelKind::Dsv4) => 4096,
+            None => 2048,
+            Some(v) => {
+                let clamped = (v.clamp(128, 4096) / 128) * 128;
+                if clamped != v {
+                    log::warn!(
+                        "--chunked-prefill-size {v} clamped to {clamped} \
+                         ([128, 4096], rounded down to a 128 multiple)"
+                    );
+                }
+                clamped
+            }
+        };
         let num_slots = config.hot_workspace_slots();
         let page_size = config.page_size;
         let mtp_requested = config.mtp_enabled();

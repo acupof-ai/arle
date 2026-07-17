@@ -595,6 +595,15 @@ impl RealCudaExecutor {
         }
     }
 
+    /// Largest single prefill forward (seam contract): DSv4 bounds it by its
+    /// snapshot grain; the Qwen arms accept any chunk the config allows.
+    pub(crate) fn max_prefill_chunk(&self) -> usize {
+        match self {
+            Self::Dsv4(d) => d.max_prefill_chunk(),
+            Self::Qwen(_) | Self::Qwen35(_) => usize::MAX,
+        }
+    }
+
     /// Capture the page-radix sidecar for `slot` at the just-published prefix
     /// `tokens[..matched_len]`. Qwen3.5/3.6 hybrid stores recurrent + full-attn
     /// KV atomically into the tier; DSv4 confirms ONLY the newly-cached pages'

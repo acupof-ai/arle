@@ -2129,20 +2129,23 @@ mod testing {
         }
     }
 
-    /// Mock executor reporting a coarser-than-page restore alignment,
-    /// mirroring DSv4's ring-snapshot `sliding_window` unit — proves the
-    /// planner combines it with KV page size via LCM, not `.max()`.
+    /// Mock executor reporting a coarser-than-page restore alignment plus a
+    /// per-forward chunk capability, mirroring DSv4's ring-snapshot
+    /// `sliding_window` unit — proves the planner combines the alignment with
+    /// KV page size via LCM, not `.max()`, and caps chunks to the capability.
     #[derive(Debug, Clone)]
     pub(super) struct RestoreAlignmentExecutor {
         inner: MockExecutor,
         alignment: usize,
+        max_chunk: usize,
     }
 
     impl RestoreAlignmentExecutor {
-        pub(super) fn with_alignment(alignment: usize) -> Self {
+        pub(super) fn with_alignment_and_chunk(alignment: usize, max_chunk: usize) -> Self {
             Self {
                 inner: MockExecutor::ready(),
                 alignment,
+                max_chunk,
             }
         }
     }
@@ -2160,6 +2163,10 @@ mod testing {
 
         fn prefill_restore_boundary_alignment(&self) -> usize {
             self.alignment
+        }
+
+        fn max_prefill_chunk(&self) -> usize {
+            self.max_chunk
         }
     }
 
@@ -5351,12 +5358,12 @@ mod tests {
     fn prefill_chunk_stops_on_lcm_of_page_size_and_restore_alignment() -> Result<()> {
         // page_size=4, restore_alignment=6: neither divides the other, so
         // lcm(4,6)=12 is required (max(4,6)=6 would land on 30, NOT a
-        // multiple of page_size 4). restore_alignment>1 also caps each chunk
-        // to one alignment unit (12), so a 32-token prompt hits EVERY
-        // boundary — 12, then 24 — not just the deepest one a single
-        // oversized chunk could reach (28, page-only) or (30, max-only).
+        // multiple of page_size 4). max_prefill_chunk=12 (one alignment
+        // unit) caps each chunk, so a 32-token prompt hits EVERY boundary —
+        // 12, then 24 — not just the deepest one a single oversized chunk
+        // could reach (28, page-only) or (30, max-only).
         let mut engine = Engine::with_config(
-            RestoreAlignmentExecutor::with_alignment(6),
+            RestoreAlignmentExecutor::with_alignment_and_chunk(6, 12),
             MockKvPool::with_capacity(1, 4, 16),
             test_config(1),
         );
@@ -5379,6 +5386,41 @@ mod tests {
             !prefilling_positions.contains(&28) && !prefilling_positions.contains(&30),
             "chunk must not skip ahead to page-size-only (28) or max-only (30) boundaries, \
              got {prefilling_positions:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn dsv4_shaped_prefill_chunking_is_unchanged_by_capability() -> Result<()> {
+        // DSv4 Phase-1 shape: page 16, restore_alignment 128, max_prefill_chunk
+        // 128, config chunk 4096. Plans must be byte-identical to the removed
+        // one-alignment-unit cap: a 300-token prompt chunks [128, 128, 44] —
+        // start positions 0 -> 128 -> 256, tail unaligned, nothing else.
+        let mut config = test_config(1);
+        config.max_prompt_tokens = 512;
+        config.chunked_prefill_size = 4096;
+        let mut engine = Engine::with_config(
+            RestoreAlignmentExecutor::with_alignment_and_chunk(128, 128),
+            MockKvPool::with_capacity(1, 16, 32),
+            config,
+        );
+        engine.submit_request((0u32..300).collect(), 1);
+
+        let mut prefilling_positions = Vec::new();
+        for _ in 0..6 {
+            engine.step()?;
+            if let Some(request) = engine.active.values().next()
+                && matches!(request.phase, RequestPhase::Prefilling { .. })
+            {
+                prefilling_positions.push(request.prefill_start_pos);
+            }
+        }
+        // First step admits (position still 0), then chunks advance 0 -> 128
+        // -> 256 -> decode: exactly the 128/128/44 split the one-unit cap gave.
+        assert_eq!(
+            prefilling_positions,
+            vec![0, 128, 256],
+            "DSv4-shaped chunking must stay 128/128/44 (old one-unit-cap behavior)"
         );
         Ok(())
     }

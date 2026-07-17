@@ -1,6 +1,6 @@
 # DSv4 Chunked-Prefill Unification: sizing, restore-alignment, and compressor-boundary snapshots
 
-> Status: Active — Phase 1 in progress (2026-07-17)
+> Status: Active — Phase 1 landed (2026-07-17); Phase 2 next
 
 
 **File:** `docs/plans/2026-07-17-dsv4-chunked-prefill-unification.md`
