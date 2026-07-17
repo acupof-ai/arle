@@ -1235,18 +1235,18 @@ impl Dsv4CudaExecutor {
     }
 
     /// Largest single prefill forward; also the restore-snapshot grain when it
-    /// exceeds the boundary alignment. Default: one sliding_window (=128) —
-    /// plans unchanged. `ARLE_DSV4_PREFILL_CHUNK` raises it (chunked-prefill
-    /// plan Phase 2, opt-in): clamped to `[128, DSV4_PREFILL_QUERY_CHUNK]`
-    /// (the shared prefill scratch M bound), min'd with the deepep_ll
-    /// per-forward token cap, and rounded down to a 128 multiple so chunk ends
-    /// stay on the ring/snapshot alignment.
+    /// exceeds the boundary alignment. Default 2048 (plan Phase 3 flip,
+    /// 2026-07-17 gates: c1 TTFT 3031→1088 ms, c16 out +138%, ITL p99 −293 ms,
+    /// needle zero-miss ×2 passes). `ARLE_DSV4_PREFILL_CHUNK` overrides:
+    /// clamped to `[128, DSV4_PREFILL_QUERY_CHUNK]` (the shared prefill
+    /// scratch M bound), min'd with the deepep_ll per-forward token cap, and
+    /// rounded down to a 128 multiple so chunk ends stay on the ring/snapshot
+    /// alignment.
     pub(crate) fn max_prefill_chunk(&self) -> usize {
+        const DEFAULT_PREFILL_CHUNK: usize = 2048;
         let grain = self.model.config.sliding_window.max(1);
-        let Some(flag) = crate::runtime_flags::dsv4_prefill_chunk() else {
-            return grain;
-        };
-        let cap = flag
+        let requested = crate::runtime_flags::dsv4_prefill_chunk().unwrap_or(DEFAULT_PREFILL_CHUNK);
+        let cap = requested
             .clamp(128, crate::attention::DSV4_PREFILL_QUERY_CHUNK)
             .min(self.model.max_tokens_per_step().unwrap_or(usize::MAX));
         (cap / 128 * 128).max(grain)
