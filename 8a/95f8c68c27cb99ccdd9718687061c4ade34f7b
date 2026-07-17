@@ -1,0 +1,75 @@
+crates/cuda-kernels/build.rs
+  s_3faeb0ec6b9263::t_cf7208e198eb33 3,762-770,772,785,792,844-846,849,965-966,969,971-972,978-1006,1009-1010,1012-1020,1059,1116,1130,1140-1143,1145-1155,1157,1160-1210,1213,1216-1236,1263-1274,1285,1291,1316,1346,1365-1366,1383,1385,1387-1394,1660,1674,1825-1828,1830,1927-1977,1979,1985,1990-1999,2002,2004-2040,2044-2055,2057-2090,2092,2095-2180,2182-2211,2213,2216-2239,2241,2245-2264,2266,2268-2289,2291-2301,2304-2315,2317-2326,2328-2329,2332-2335,2338,2340-2347,2349,2363,2366-2373,2472-2481,2512-2514,2516-2523,2666-2668,2956,2964,2992-3009
+crates/cuda-kernels/kernels.toml
+  s_67038b17df7668::t_c329c78c5a7c0a 251-253,267,309,323,351,382,414,442,473,487,529,564,609,624,669
+crates/cuda-kernels/tools/tilelang/README.md
+  s_3faeb0ec6b9263::t_9280cbc0e43929 13-16,32,35,39-45,67,70,73-75,77-78,107-108
+crates/cuda-kernels/tools/tilelang/gen_tilelang_aot.py
+  s_3faeb0ec6b9263::t_cc3b725f9a0376 627-629,636,639-640,658-681,760-766,768-769,781-783,785-797,799-805,809-815,818,822-823,835,875-878,954-955,964
+crates/infer-cuda/examples/fp8_smallm_gemm_probe.rs
+  s_083443baf30dec::t_a8c302e9a262a1 15-18
+scripts/README.md
+  s_6abb0d645a30e1::t_e591f9ef1d435e 27,61,142-143,145-146
+scripts/cuda_prebuilt_manifest.sh
+  s_6abb0d645a30e1::t_cfc53bee873570 57-58,60-62,64-71,76-107,109-110
+scripts/dsv4_fast_build.sh
+  s_973374ed222ecb::t_8f8e082b569080 5,34-35,85-86,98-99,133-135,139-141,144,182-185,187,189-201
+scripts/export_prebuilt_cuda_kernels.sh
+  s_6abb0d645a30e1::t_659171612668c9 4-7,9-41,44-57,59-66
+scripts/kernel_artifacts.sh
+  s_6abb0d645a30e1::t_93159548025847 15-17,20-67,69-70,74-77,81,91,100,109-111,174,176,205-232,238-239,252-253,263-265,294-299,323,336,338-339,350
+scripts/run_fp8_probe.sh
+  s_6abb0d645a30e1::t_e7728297f8162d 16,43-48
+scripts/tests/test_cuda_prebuilt_export.sh
+  s_6abb0d645a30e1::t_181ffe52d56f2e 1-132
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "8a95f8c68c27cb99ccdd9718687061c4ade34f7b",
+  "prompts": {},
+  "sessions": {
+    "s_083443baf30dec": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a29b614e196f25287",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_3faeb0ec6b9263": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "eb2672f9-3c2f-4e5a-8e92-393e34ed3536",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_67038b17df7668": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c4b3468e-feff-42b1-aa89-1f360f19b20b",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_6abb0d645a30e1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aac912ecffa894638",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_973374ed222ecb": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f6f8d-5b6a-7611-b4a5-aef56f5d1cbb",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
