@@ -1,0 +1,47 @@
+crates/infer-api/src/loaded.rs
+  s_3c14c5088393c0::t_f50522a9f81c9a 2165,2168-2170,2208,2360-2366,2371-2372
+crates/infer-cuda/src/executor.rs
+  s_3c14c5088393c0::t_60e0c663201e5f 964-966,973,978,981,983
+crates/infer-cuda/src/executor/qwen35.rs
+  s_3c14c5088393c0::t_69623fb83abbff 1327,1406,1439,1446-1450,1532,1536,1564,1568,1580,1620-1621,1627-1628,1645,1663-1664,1670-1671,1688,1767,1770,1779-1783,1835,1856,1895,1899,1950-1959,2000,2003,2018-2022,2171,2229-2233,2415,2438,2464,2468,2486-2487,2491,2502,2632,2710-2714,2842-2843,2847,2859-2860,2864,2912,2915,3008,3011
+crates/infer-plan/src/lib.rs
+  s_3c14c5088393c0::t_84f8b261d9a4ad 17
+crates/infer-plan/src/sample.rs
+  s_3c14c5088393c0::t_306abe6d376889 57-69,71,121,138,141-142,151,157,170,174,177-178
+crates/infer-server/src/coordinator.rs
+  s_047271293e1eb9::t_d07d759097eca6 83,88-92,101-109,111-115,119,454-455,556,561,575,1139,1163,1178-1183,1226-1231
+crates/infer-server/src/lib.rs
+  s_3c14c5088393c0::t_b9e1b8ca2be2ad 720-726,774,779,784
+crates/infer-server/src/multiproc_relay.rs
+  s_3c14c5088393c0::t_badaef56822692 473-477
+crates/infer-cuda/src/qwen35.rs
+  s_3c14c5088393c0::t_cd027d61ebb637 143,146,165,178,511-514,3336-3337,3346,3372,3392,3443,3943,4019-4022,4070,4080,4166-4176,5247-5248,5336,6424,6642,6644,6649-6653,6687,6879,6881,6886-6890,7738-7763,7981-7982,7990-7991,8038
+crates/infer-cuda/src/qwen35/dspark.rs
+  s_3c14c5088393c0::t_706ee25ab82a2e 1233-1236,1249,1335-1344
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "a41827b75983f8083329b0759726f81601321e4d",
+  "prompts": {},
+  "sessions": {
+    "s_047271293e1eb9": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f6f2d-331c-7200-af4a-006b3ca82515",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_3c14c5088393c0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a2cab6efa20fa6445",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
