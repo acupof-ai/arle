@@ -1,0 +1,21 @@
+docs/experience/wins/2026-07-17-dsv4-cold-boot-69-attribution.md
+  s_e8a482618fb63e::t_bb4d1e685f92e6 1-43
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "c30ef95dbab4f4629bf58f3fc2f64765380f1127",
+  "prompts": {},
+  "sessions": {
+    "s_e8a482618fb63e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ac2eac3d1a738e694",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
