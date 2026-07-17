@@ -1109,6 +1109,11 @@ pub(crate) struct OpdRuntimeArgs {
     /// on waits for the F.5 co-residency license.
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set, value_name = "BOOL")]
     pub(crate) qwen35_decode_graph: bool,
+
+    /// MTP spec-decode draft depth for the in-process rollout engine (mirrors
+    /// serve's `--spec-type mtp --mtp-draft-tokens`). None (default) = off.
+    #[arg(long, value_name = "N")]
+    pub(crate) mtp_draft_tokens: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

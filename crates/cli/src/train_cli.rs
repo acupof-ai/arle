@@ -2894,6 +2894,9 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
             mem_fraction_static: 0.2,
             dspark_draft_model: args.runtime.dspark_draft_model.clone(),
             dspark_conf_threshold: args.runtime.dspark_conf_threshold,
+            // MTP GPU gate passed 2026-07-17 (1.21×); default-on waits for the
+            // depth sweep + an in-loop A/B.
+            mtp_draft_tokens: args.runtime.mtp_draft_tokens,
             cuda: infer_api::CudaRuntimeFlags {
                 qwen35_decode_graph: args.runtime.qwen35_decode_graph,
                 ..Default::default()
