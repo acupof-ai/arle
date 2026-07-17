@@ -1,0 +1,23 @@
+CHANGELOG.md
+  s_c4617f86685d21::t_c47fc784013bda 26-35
+docs/experience/wins/2026-07-17-dsv4-extension-prefix-reuse-fix.md
+  s_c4617f86685d21::t_eab934fc3ce6ad 1-52
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "f79d793839ce107f18eee42b876fe978cad1f51b",
+  "prompts": {},
+  "sessions": {
+    "s_c4617f86685d21": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a2a6d567461b960a9",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
