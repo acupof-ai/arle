@@ -1647,7 +1647,9 @@ mod tests {
             "linear_value_head_dim": 128,
             "rope_parameters": {
                 "rope_theta": 10000000.0,
-                "partial_rotary_factor": 0.25
+                "partial_rotary_factor": 0.25,
+                "mrope_section": [11, 11, 10],
+                "mrope_interleaved": true
             },
             "eos_token_id": 248044,
             "tie_word_embeddings": false,
@@ -1676,6 +1678,7 @@ mod tests {
         assert_eq!(config.num_hidden_layers, 40);
         assert_eq!(config.num_attention_heads, 16);
         assert_eq!(config.num_key_value_heads, 2);
+        assert_eq!(config.rotary_dim, 64);
         // With decoder_sparse_step=1 and empty mlp_only_layers, every layer is MoE.
         for idx in 0..config.num_hidden_layers {
             assert!(config.is_moe_layer(idx), "layer {idx} should be MoE");
