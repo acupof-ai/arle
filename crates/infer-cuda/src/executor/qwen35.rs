@@ -1539,7 +1539,9 @@ impl Qwen35CudaExecutor {
     /// One MTP spec-decode row (`--spec-type mtp`): the spec draft/verify step
     /// when the slot is seeded (pending token + hidden captured by the warm
     /// step), else a warm forward that captures the seed. Emits 1..=depth+1
-    /// tokens for this slot. Greedy-only (sampling rows fall back to no-spec).
+    /// tokens for this slot. Greedy rows verify by argmax match (token-exact
+    /// to no-spec greedy); sampling rows by rejection sampling (exact w.r.t.
+    /// the filtered target policy).
     fn mtp_decode_row(&mut self, row: &DecodeRow) -> Result<Vec<SlotToken>> {
         ensure!(
             row.slot < self.num_slots,
@@ -1547,16 +1549,6 @@ impl Qwen35CudaExecutor {
             row.slot,
             self.num_slots
         );
-        // MTP spec-decode is greedy-only; sampling rows fall back to no-spec.
-        if row.params.temperature != 0.0 {
-            let token = self.submit_decode_row(row, /* allow_graph = */ true)?;
-            return Ok(vec![SlotToken {
-                slot: row.slot,
-                token,
-                logprob: None,
-                finish: None,
-            }]);
-        }
         let depth = self.model.spec_draft_tokens().max(1);
         // Seeded iff we have a stored pending+hidden AND the pending matches the
         // token the scheduler will feed (a gap = re-seed at the warm step).
@@ -1577,7 +1569,8 @@ impl Qwen35CudaExecutor {
     }
 
     /// Warm step: a single forward that ALSO captures the seed hidden + pending
-    /// (greedy argmax) for the next spec step. Returns the pending token as the
+    /// (argmax, or a policy-distributed sample under temp>0) for the next spec
+    /// step. Returns the pending token as the
     /// decode output (the prefill already returned the first token; this is the
     /// second). The spec step starts from the stored (pending, hidden).
     fn mtp_warm_decode_row(&mut self, row: &DecodeRow) -> Result<u32> {
@@ -1620,13 +1613,25 @@ impl Qwen35CudaExecutor {
             )?;
             let vocab = dims[1];
             let mut spec = model.new_spec_slot_state()?;
-            let pending = crate::ops::argmax_row_into(
-                &model.ctx,
-                &logits,
-                dims[0] - 1,
-                vocab,
-                spec.argmax_scratch_mut(),
-            )?;
+            let pending = if row.params.is_greedy() {
+                crate::ops::argmax_row_into(
+                    &model.ctx,
+                    &logits,
+                    dims[0] - 1,
+                    vocab,
+                    spec.argmax_scratch_mut(),
+                )?
+            } else {
+                // Sampled seed so the pending token is policy-distributed (the
+                // warm forward is seq=1, so `logits` is exactly one vocab row).
+                sample_cuda_token_scratched(
+                    &model.ctx,
+                    &logits,
+                    &row.params,
+                    start.saturating_add(1) as u64,
+                    spec.argmax_scratch_mut(),
+                )?
+            };
             mtp.as_mut().expect("mtp (gated)").slots[slot] = Some(MtpSlotState {
                 spec,
                 pending,
@@ -1650,13 +1655,25 @@ impl Qwen35CudaExecutor {
             )?;
             let vocab = dims[1];
             let mut spec = model.new_spec_slot_state()?;
-            let pending = crate::ops::argmax_row_into(
-                &model.ctx,
-                &logits,
-                dims[0] - 1,
-                vocab,
-                spec.argmax_scratch_mut(),
-            )?;
+            let pending = if row.params.is_greedy() {
+                crate::ops::argmax_row_into(
+                    &model.ctx,
+                    &logits,
+                    dims[0] - 1,
+                    vocab,
+                    spec.argmax_scratch_mut(),
+                )?
+            } else {
+                // Sampled seed so the pending token is policy-distributed (the
+                // warm forward is seq=1, so `logits` is exactly one vocab row).
+                sample_cuda_token_scratched(
+                    &model.ctx,
+                    &logits,
+                    &row.params,
+                    start.saturating_add(1) as u64,
+                    spec.argmax_scratch_mut(),
+                )?
+            };
             mtp.as_mut().expect("mtp (gated)").slots[slot] = Some(MtpSlotState {
                 spec,
                 pending,
@@ -1723,6 +1740,7 @@ impl Qwen35CudaExecutor {
                 &st.hidden,
                 start,
                 depth,
+                &row.params,
                 rc.as_mut(),
             )?
         };

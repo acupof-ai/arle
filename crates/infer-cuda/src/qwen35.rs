@@ -1083,6 +1083,23 @@ pub(crate) struct Qwen35SpecSlotState {
     /// rows, so a spec step performs ZERO per-token argmax allocations and the
     /// verify argmax stays on-device (no full `[seq, vocab]` D2H).
     argmax_scratch: CudaSlice<i32>,
+    /// Sampled-mode device buffers (allocated on the first temp>0 spec step
+    /// only; greedy never touches them). Mirrors `DsparkScratch`'s sampled
+    /// block, sized by the head cap `spec_draft_tokens.max(1)`:
+    /// `q_probs [cap, vocab] f32` draft filtered dists (row `level` fully
+    /// written by `dspark_draft_sample_cuda` before the chain kernel reads it);
+    /// `p_probs [cap+1, vocab] f32` verify filtered dists (leading `depth+1`
+    /// rows fully written per accept; the stale tail is never read);
+    /// `sample_tok [1]` / `accept_out [2]` fully written before D2H;
+    /// `chain_draft [cap]` / `u_accept [cap]` / `u_residual [cap+1]`
+    /// host-uploaded prefixes — the kernel reads only the uploaded prefix.
+    q_probs: SliceSlot<f32>,
+    p_probs: SliceSlot<f32>,
+    sample_tok: SliceSlot<i32>,
+    accept_out: SliceSlot<i32>,
+    chain_draft: SliceSlot<i32>,
+    u_accept: SliceSlot<f32>,
+    u_residual: SliceSlot<f32>,
 }
 
 /// Per-linear-layer capture of the gated-delta-rule inputs from the spec verify
@@ -1996,6 +2013,13 @@ impl Qwen35Model {
                 .stream
                 .alloc_zeros::<i32>(1)
                 .map_err(|e| anyhow!("alloc spec argmax scratch failed: {e}"))?,
+            q_probs: SliceSlot::default(),
+            p_probs: SliceSlot::default(),
+            sample_tok: SliceSlot::default(),
+            accept_out: SliceSlot::default(),
+            chain_draft: SliceSlot::default(),
+            u_accept: SliceSlot::default(),
+            u_residual: SliceSlot::default(),
         })
     }
 
@@ -3688,7 +3712,9 @@ impl Qwen35Model {
     /// starts at 0), with the trunk context injected via
     /// `fc(concat[norm(embed(token)), norm(h_prev)])` — NOT re-attended. `level`
     /// is the 0-based position within the draft block (RoPE position + head-KV
-    /// row). Greedy (argmax) draft; top-k is a later increment.
+    /// row). Greedy rows argmax; sampled rows draw on device from the
+    /// engine-sampler-filtered head dist, retaining the filtered row in
+    /// `spec.q_probs[level]` for the rejection accept.
     ///
     /// The head's KV is `spec.head_k`/`head_v`; processing levels `0,1,2,…` in
     /// order overwrites rows `0,1,2,…`, so each block self-seeds without an
@@ -3705,6 +3731,8 @@ impl Qwen35Model {
         token: u32,
         h_prev: &DeviceVec,
         level: usize,
+        params: &SamplingParams,
+        start_pos: usize,
     ) -> Result<(u32, DeviceVec)> {
         let mtp = self
             .mtp
@@ -3808,7 +3836,7 @@ impl Qwen35Model {
         let mut h_layer = HiddenStates::zeros(&self.ctx, hidden, 1)?;
         add_batch(&self.ctx, &hidden_mid, &mlp_out, &mut h_layer)?;
 
-        // ── 4. Final head RMSNorm + SHARED lm_head + greedy argmax. ──
+        // ── 4. Final head RMSNorm + SHARED lm_head + token selection. ──
         rms_norm_offset(&self.ctx, &h_layer, &mtp.norm, eps, &mut normed)?;
         let vocab = self.output_projection().rows;
         let mut logits = HiddenStates::zeros(&self.ctx, vocab, 1)?;
@@ -3818,7 +3846,45 @@ impl Qwen35Model {
             len: vocab,
             label: "qwen35_mtp_draft_logits",
         };
-        let next = argmax_into(&self.ctx, &logits_vec, &mut spec.argmax_scratch)?;
+        let next = if params.is_greedy() {
+            argmax_into(&self.ctx, &logits_vec, &mut spec.argmax_scratch)?
+        } else {
+            // Filter + q-row retain + multinomial draw in one device call; the
+            // uniform is the salted (seed, position) stream plain decode would
+            // consume at this position (mirrors the DSpark draft draw).
+            let u =
+                dspark::unit_uniform(params.seed, dspark::SALT_DRAW, (start_pos + level) as u64);
+            let cap = self.spec_draft_tokens.max(1);
+            let q_all = spec.q_probs.get(&self.ctx, cap * vocab)?;
+            let tok_out = spec.sample_tok.get(&self.ctx, 1)?;
+            {
+                let (l_ptr, _gl) = logits_vec.data.device_ptr(&self.ctx.stream);
+                let (q_ptr, _gq) = q_all.device_ptr_mut(&self.ctx.stream);
+                let (t_ptr, _gt) = tok_out.device_ptr_mut(&self.ctx.stream);
+                // SAFETY: logits_vec holds `vocab` bf16; q row `level` < cap
+                // (spec_step's depth guard bounds every level).
+                unsafe {
+                    ffi::dspark_draft_sample_cuda(
+                        l_ptr as *const ffi::Half,
+                        (q_ptr + (level * vocab * 4) as u64) as *mut f32,
+                        t_ptr as *mut i32,
+                        vocab as i32,
+                        1.0 / params.temperature,
+                        params.top_k,
+                        params.top_p,
+                        params.min_p,
+                        u,
+                        self.ctx.stream.cu_stream(),
+                    )
+                    .result()?;
+                }
+            }
+            self.ctx.sync()?;
+            self.ctx
+                .stream
+                .clone_dtoh(tok_out)
+                .map_err(|e| anyhow!("D2H mtp draft token failed: {e}"))?[0] as u32
+        };
 
         // The head's own output hidden seeds the next level (autoregressive chain,
         // per `dflash.rs` `step_hidden = flat`).
@@ -3827,16 +3893,20 @@ impl Qwen35Model {
         Ok((next, h_out))
     }
 
-    /// One depth-`depth` NextN-MTP speculative decode step (greedy, single CHAIN).
+    /// One depth-`depth` NextN-MTP speculative decode step (single CHAIN).
     ///
     /// Drafts a `depth`-token chain with the MTP head (each level autoregressive
     /// on the previous level's head hidden), verifies `[pending, d1..dD]` in a
-    /// SINGLE trunk forward, accepts the longest prefix whose draft token equals
-    /// the trunk's argmax at that row (STRICT, k=1 top-1 match), and commits the
-    /// accepted drafts + the trunk's bonus. The output is therefore **token-exact
-    /// to greedy no-spec decode** (every committed token is a trunk argmax) — the
-    /// correctness gate is spec greedy ≡ no-spec greedy (MoE non-determinism
-    /// caveat applies to the 35B/27B MoE shapes). A single chain (no sibling
+    /// SINGLE trunk forward, accepts, and commits the accepted drafts + the
+    /// trunk's bonus. Greedy rows (`params.is_greedy()`) accept the longest
+    /// prefix whose draft token equals the trunk's argmax at that row (STRICT,
+    /// k=1 top-1 match) — **token-exact to greedy no-spec decode** (every
+    /// committed token is a trunk argmax); the correctness gate is spec greedy
+    /// ≡ no-spec greedy (MoE non-determinism caveat applies to the 35B/27B MoE
+    /// shapes). Sampled rows draft by device multinomial from the filtered head
+    /// dist (q retained per level) and accept by chain rejection sampling
+    /// ([`Self::mtp_accept_commit_sampled`]) — committed tokens are distributed
+    /// exactly as filtered target sampling. A single chain (no sibling
     /// branching) keeps the 48 gated-delta linear layers' sequential recurrence
     /// correct; tree/top-k acceptance is a later, lossy increment.
     ///
@@ -3864,6 +3934,7 @@ impl Qwen35Model {
         hidden: &DeviceVec,
         start_pos: usize,
         depth: usize,
+        params: &SamplingParams,
         recall: Option<&mut Qwen35RecallForward>,
     ) -> Result<(Vec<u32>, u32, DeviceVec)> {
         ensure!(depth >= 1, "spec_step requires depth >= 1, got {depth}");
@@ -3895,7 +3966,8 @@ impl Qwen35Model {
         chain.push(pending);
         for level in 0..depth {
             let last_tok = *chain.last().unwrap();
-            let (tok, h_out) = self.mtp_forward_level(spec, ws, last_tok, &h_prev, level)?;
+            let (tok, h_out) =
+                self.mtp_forward_level(spec, ws, last_tok, &h_prev, level, params, start_pos)?;
             chain.push(tok);
             h_prev = h_out;
         }
@@ -3924,20 +3996,42 @@ impl Qwen35Model {
         );
         let verify_ms = mtp_phase_lap(&self.ctx, &mut pt);
 
-        // 4. Accept the longest prefix where the draft == the trunk's argmax at
-        //    that row (on-device per-row argmax; stops at the first mismatch).
-        let mut k = 0usize;
-        let bonus;
-        loop {
-            let am = argmax_row_into(&self.ctx, &logits, k, vocab, &mut spec.argmax_scratch)?;
-            if k < depth && am == chain[k + 1] {
-                k += 1;
-            } else {
-                bonus = am;
-                break;
+        // 4+5. Accept + commit, rolling the trunk back on partial accept (the
+        //    verify over-advanced by depth+1 > k+1). Greedy: longest prefix
+        //    where the draft == the trunk's argmax at that row. Sampled: chain
+        //    rejection sampling over the shared-filter p/q dists.
+        let (emitted, bonus, k) = if params.is_greedy() {
+            let mut k = 0usize;
+            let bonus;
+            loop {
+                let am = argmax_row_into(&self.ctx, &logits, k, vocab, &mut spec.argmax_scratch)?;
+                if k < depth && am == chain[k + 1] {
+                    k += 1;
+                } else {
+                    bonus = am;
+                    break;
+                }
             }
-        }
-        let argmax_ms = mtp_phase_lap(&self.ctx, &mut pt);
+            let mut emitted: Vec<u32> = chain[1..=k].to_vec();
+            emitted.push(bonus);
+            if k < depth {
+                spec.restore_trunk(&self.ctx, slot)?;
+                // LINEAR-ONLY replay: restore_trunk just rewound the 48 gated-delta
+                // recurrent + conv rings to S_{start_pos}; re-advance ONLY them over
+                // the accepted prefix `[pending, d1..dk]` (k+1 rows) from the verify
+                // capture, skipping the full-attn blocks, MLP/MoE, final norm, and
+                // lm_head — the dominant avoidable cost of the old full replay. The
+                // 16 full-attn KV caches self-heal via position-indexing under the
+                // explicit seq_len rewind below; MLP/MoE/lm_head leave no state.
+                self.replay_linear_only(slot, ws, &spec.capture, k)?;
+                slot.set_seq_len(start_pos + k + 1);
+            }
+            // else k==depth: verify already left seq_len=start_pos+depth+1, state correct.
+            (emitted, bonus, k)
+        } else {
+            self.mtp_accept_commit_sampled(slot, spec, ws, &chain, &logits, start_pos, params)?
+        };
+        let accept_ms = mtp_phase_lap(&self.ctx, &mut pt);
 
         // next_hidden = the verify hidden of accepted row k (produced `bonus`).
         let mut next_hidden = DeviceVec::zeros(&self.ctx, hidden_size)?;
@@ -3949,31 +4043,128 @@ impl Qwen35Model {
                 .map_err(|e| anyhow!("spec next-hidden copy failed: {e}"))?;
         }
 
-        // 5. Commit: emitted = accepted drafts + bonus. Roll back the trunk state
-        //    on partial accept (the verify over-advanced by depth+1 > k+1).
-        let mut emitted: Vec<u32> = chain[1..=k].to_vec();
-        emitted.push(bonus);
-        if k < depth {
-            spec.restore_trunk(&self.ctx, slot)?;
-            // LINEAR-ONLY replay: restore_trunk just rewound the 48 gated-delta
-            // recurrent + conv rings to S_{start_pos}; re-advance ONLY them over
-            // the accepted prefix `[pending, d1..dk]` (k+1 rows) from the verify
-            // capture, skipping the full-attn blocks, MLP/MoE, final norm, and
-            // lm_head — the dominant avoidable cost of the old full replay. The
-            // 16 full-attn KV caches self-heal via position-indexing under the
-            // explicit seq_len rewind below; MLP/MoE/lm_head leave no state.
-            self.replay_linear_only(slot, ws, &spec.capture, k)?;
-            slot.set_seq_len(start_pos + k + 1);
-        }
-        // else k==depth: verify already left seq_len=start_pos+depth+1, state correct.
-        let replay_ms = mtp_phase_lap(&self.ctx, &mut pt);
-
         if pt.is_some() {
             eprintln!(
-                "[mtp-phase] depth={depth} accept={k} draft={draft_ms:.2} snap={snap_ms:.2} verify={verify_ms:.2} argmax={argmax_ms:.2} replay={replay_ms:.2} ms"
+                "[mtp-phase] depth={depth} accept={k} draft={draft_ms:.2} snap={snap_ms:.2} verify={verify_ms:.2} accept_commit={accept_ms:.2} ms"
             );
         }
         Ok((emitted, bonus, next_hidden))
+    }
+
+    /// Rejection-sampling twin of the greedy accept scan in [`Self::spec_step`]
+    /// — the port of [`Self::dspark_accept_commit_sampled`] onto the NextN-MTP
+    /// lane (mirrors flashinfer/SGLang `chain_speculative_sampling`): accept
+    /// `chain[j+1]` with prob min(1, p_j(tok)/q_j(tok)); the first reject
+    /// commits a residual `max(0, p−q)` renormalized draw, full accept a bonus
+    /// draw from the last row. Exactness invariant: p and q pass the SAME
+    /// engine-sampler filter (temp/top_k/top_p/min_p), so committed tokens are
+    /// distributed exactly as filtered target sampling. Identical rollback set
+    /// to the greedy path: `restore_trunk` + `replay_linear_only` +
+    /// `set_seq_len` (the full-attn KV self-heals under the caller's seq
+    /// rewind / pool truncate). Returns `(emitted, bonus, k)`.
+    fn mtp_accept_commit_sampled(
+        &self,
+        slot: &mut Qwen35SlotState,
+        spec: &mut Qwen35SpecSlotState,
+        ws: &mut Qwen35Workspace,
+        chain: &[u32],
+        logits: &DeviceVec,
+        start_pos: usize,
+        params: &SamplingParams,
+    ) -> Result<(Vec<u32>, u32, usize)> {
+        let ctx = &self.ctx;
+        let depth = chain.len() - 1;
+        let cap = self.spec_draft_tokens.max(1);
+        ensure!(
+            depth <= cap,
+            "mtp sampled verify: depth {depth} > head cap {cap}"
+        );
+        let vocab = self.output_projection().rows;
+        // Uniform streams at pos = start_pos + j + 1 (identical to the host
+        // path's per-step draws — position-salted, so batching changes nothing).
+        let pos = |j: usize| (start_pos + j + 1) as u64;
+        let u_acc: Vec<f32> = (0..depth)
+            .map(|j| dspark::unit_uniform(params.seed, dspark::SALT_ACCEPT, pos(j)))
+            .collect();
+        let u_res: Vec<f32> = (0..=depth)
+            .map(|j| dspark::unit_uniform(params.seed, dspark::SALT_RESIDUAL, pos(j)))
+            .collect();
+        let draft: Vec<i32> = chain[1..].iter().map(|&t| t as i32).collect();
+
+        let p_all = spec.p_probs.get(ctx, (cap + 1) * vocab)?;
+        let q_all = spec.q_probs.get(ctx, cap * vocab)?;
+        let draft_dev = spec.chain_draft.get(ctx, cap)?;
+        let ua_dev = spec.u_accept.get(ctx, cap)?;
+        let ur_dev = spec.u_residual.get(ctx, cap + 1)?;
+        let out_dev = spec.accept_out.get(ctx, 2)?;
+        ctx.stream
+            .memcpy_htod(&draft, &mut draft_dev.slice_mut(0..depth))
+            .and_then(|()| {
+                ctx.stream
+                    .memcpy_htod(&u_acc, &mut ua_dev.slice_mut(0..depth))
+            })
+            .and_then(|()| {
+                ctx.stream
+                    .memcpy_htod(&u_res, &mut ur_dev.slice_mut(0..=depth))
+            })
+            .map_err(|e| anyhow!("H2D mtp chain inputs failed: {e}"))?;
+        {
+            let (l_ptr, _gl) = logits.data.device_ptr(&ctx.stream);
+            let (p_ptr, _gp) = p_all.device_ptr_mut(&ctx.stream);
+            let (q_ptr, _gq) = q_all.device_ptr(&ctx.stream);
+            let (d_ptr, _gd) = draft_dev.device_ptr(&ctx.stream);
+            let (ua_ptr, _gua) = ua_dev.device_ptr(&ctx.stream);
+            let (ur_ptr, _gur) = ur_dev.device_ptr(&ctx.stream);
+            let (o_ptr, _go) = out_dev.device_ptr_mut(&ctx.stream);
+            // SAFETY: logits holds chain.len()*vocab bf16; p/q scratches hold
+            // (cap+1)/cap vocab-rows and depth <= cap (ensured above); the q
+            // rows were written by this step's draft; draft/u prefixes uploaded
+            // just above.
+            unsafe {
+                ffi::dspark_filter_probs_cuda(
+                    l_ptr as *const ffi::Half,
+                    p_ptr as *mut f32,
+                    chain.len() as i32,
+                    vocab as i32,
+                    1.0 / params.temperature,
+                    params.top_k,
+                    params.top_p,
+                    params.min_p,
+                    ctx.stream.cu_stream(),
+                )
+                .result()?;
+                ffi::dspark_chain_accept_cuda(
+                    q_ptr as *const f32,
+                    p_ptr as *const f32,
+                    d_ptr as *const i32,
+                    ua_ptr as *const f32,
+                    ur_ptr as *const f32,
+                    o_ptr as *mut i32,
+                    depth as i32,
+                    vocab as i32,
+                    ctx.stream.cu_stream(),
+                )
+                .result()?;
+            }
+        }
+        ctx.sync()?;
+        let out = ctx
+            .stream
+            .clone_dtoh(out_dev)
+            .map_err(|e| anyhow!("D2H mtp chain verdict failed: {e}"))?;
+        let (k, bonus) = (out[0] as usize, out[1] as u32);
+        ensure!(
+            k <= depth,
+            "mtp chain kernel returned k {k} > depth {depth}"
+        );
+        let mut emitted: Vec<u32> = chain[1..=k].to_vec();
+        emitted.push(bonus);
+        if k < depth {
+            spec.restore_trunk(ctx, slot)?;
+            self.replay_linear_only(slot, ws, &spec.capture, k)?;
+            slot.set_seq_len(start_pos + k + 1);
+        }
+        Ok((emitted, bonus, k))
     }
 
     /// Per-step student LoRA re-merge (OPD P2).
@@ -7785,7 +7976,7 @@ mod tests {
                 let sp = slot.seq_len();
                 let (emitted, next_pending, next_hidden) = model
                     .spec_step(
-                        &mut slot, &mut spec, &mut ws, pending, &hidden, sp, depth, None,
+                        &mut slot, &mut spec, &mut ws, pending, &hidden, sp, depth, &greedy, None,
                     )
                     .unwrap();
                 // Accepted drafts this step = emitted.len() - 1 (the bonus is the
