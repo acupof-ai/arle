@@ -1,0 +1,23 @@
+crates/train/src/cc_harness.rs
+  s_809e66863fd8b9::t_842f39cf791694 82-84
+crates/train/src/cc_convert.rs
+  s_809e66863fd8b9::t_17da75d472695d 6-17,56-57,60-62,69-70,78-80,105-108,137,143-181,189-208,492-520,522,524,526,530,532,536,538,540-576,578-579,582,584-586
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "925fd69b7512492cef305817f1880b0e747ffa42",
+  "prompts": {},
+  "sessions": {
+    "s_809e66863fd8b9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ac6b93c7db6db1eff",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
