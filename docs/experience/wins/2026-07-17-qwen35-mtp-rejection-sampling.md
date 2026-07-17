@@ -1,7 +1,9 @@
 # Qwen3.5/3.6 MTP spec decode: rejection-sampling acceptance (RL-lossless sampled rollouts)
 
-> Status: pending-remote — GPU gate per plan §P8
-> ([2026-07-16-agent-rl-unified-infra](../../plans/2026-07-16-agent-rl-unified-infra.md))
+> Status: GPU gate RUN 2026-07-17 (H20, Qwen3.6-27B-FP8, depth=2, c=1) —
+> correctness PASS, speedup 1.21× (below the 1.3-2× expectation; depth sweep +
+> counters follow-up filed). Plan §P8
+> ([2026-07-16-agent-rl-unified-infra](../../plans/2026-07-16-agent-rl-unified-infra.md)).
 
 ## Context
 
@@ -23,11 +25,24 @@ port onto the MTP lane — zero new CUDA.
   `replay_linear_only` + `set_seq_len` (+ caller pool truncate); no new mutated
   buffer — sampled-mode scratch is read-only w.r.t. model/slot state.
 
-## Gate (pending-remote)
+## Gate results (2026-07-17, H20; MTP serve vs no-spec control, same binary)
 
-Needle ×3 + acceptance-rate + identical reward-curve-on-one-round per plan §P8,
-plus same-config-twice sampling-distribution check. Expected 1.3-2× decode
-speedup on temp=1 rollouts.
+- Needle ×3 at temp=1 (qwen3_nonthink RAW, lengths 115/446/1000/2000):
+  **12/12 exact** on both arms.
+- Same-config-twice (t=1, seed fixed, 200 tok): **bit-identical** on the spec
+  serve (salted uniform streams); spec-on vs off same seed differ (expected,
+  different sampler path), both coherent.
+- Acceptance (via `ARLE_MTP_PHASE`; /v1/stats counters are a filed hole —
+  executor.rs:369 maps only DSpark): sampled t=1 **50.9%** (394 chains,
+  ≈2.02 committed tokens/spec step incl. bonus); greedy 61.5%.
+- Decode tok/s A/B (t=1, 4 prompts × 512 tok, TTFT excluded): **52.56 vs 43.62
+  = 1.21×**. Below expectation at depth=2/c=1; depth 3-4 sweep + decode-graph
+  train-lane plumb filed as follow-up.
+- Confound excluded first: tip garbled ALL temp>0 output on the no-spec control
+  — single-variable attributed to b4b293f0c (hd256 q/k RMSNorm OFFSET→STANDARD,
+  its wins entry was pending-remote/never GPU-run); the gate ran on tip+revert.
+  That regression is owned by the hd256 lane and blocks any temp>0 use of
+  Qwen3.6-27B-FP8 on tip until resolved.
 
 ## Rule
 
