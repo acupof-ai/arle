@@ -1944,6 +1944,16 @@ pub(crate) struct TrainAgentOpdArgs {
     #[arg(long, value_enum, default_value_t = SyncArg::EveryGroup)]
     pub(crate) sync: SyncArg,
 
+    /// Rollout/train overlap: 0 = task groups strictly sequential (on-policy);
+    /// 1 = admit the next group's rollouts before this group's train+merge —
+    /// cc rolls while the GPU trains. Trajectories are tagged with the policy
+    /// version they launched under and the preset's IS ratio (denominator =
+    /// generation-time sidecar logprobs) corrects the one-step drift, so a
+    /// ratio-weighted --update-strategy is required. Max 1 (the published
+    /// safe envelope).
+    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u8).range(0..=1))]
+    pub(crate) staleness: u8,
+
     /// `PYTHONPATH` (sandbox-relative) for the bash tool + test runs, e.g.
     /// `lib:test`. Optional.
     #[arg(long, value_name = "PATH")]

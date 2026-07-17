@@ -563,6 +563,27 @@ impl UpdatePreset {
     }
 }
 
+/// P7 staleness: pin the IS-ratio denominator for a version-tagged group.
+/// Staleness 0 leaves the batch alone (caller captures the V0 recompute —
+/// θ == π_behavior). A STALE group must use the generation-time sidecar: the
+/// V0 recompute reflects the post-merge policy (the missing-old-logits
+/// failure), so a stale trajectory without sidecar coverage is dropped —
+/// never trained with a fake ratio ≈ 1. Returns the number dropped.
+pub fn apply_staleness_denominator(batch: &mut Vec<ScoredTrajectory>, staleness: u64) -> usize {
+    if staleness == 0 {
+        return 0;
+    }
+    let before = batch.len();
+    batch.retain_mut(|t| {
+        let Some(lp) = t.gen_logprobs.clone() else {
+            return false;
+        };
+        t.rollout_logprobs = Some(lp);
+        true
+    });
+    before - batch.len()
+}
+
 /// Reward-centered advantage per trajectory: `A_i = r_i − mean(scope)`,
 /// `/ (std + 1e-6)` when `std_norm` (the GRPO convention).
 fn centered_advantages(survivors: &[&ScoredTrajectory], scope: Scope, std_norm: bool) -> Vec<f32> {
@@ -747,6 +768,28 @@ mod tests {
         assert!((s - 1.0).abs() < 1e-6, "mean Δ=0 → s=1, got {s}");
         let s = seq_ratio_weight(&[0.5, 0.5], &[0.0, 0.0], clip).unwrap();
         assert!((s - 1.0004).abs() < 1e-6, "clamped to 1+hi, got {s}");
+    }
+
+    #[test]
+    fn staleness_version_tag_and_sidecar_denominator() {
+        // Group launched at policy version v, trained at v+1 → staleness 1.
+        let (behavior_version, policy_version) = (3u64, 4u64);
+        let staleness = policy_version - behavior_version;
+        assert_eq!(staleness, 1);
+
+        // Stale: the sidecar becomes the ratio denominator; the trajectory
+        // without sidecar coverage is dropped (never trained at ratio ≈ 1).
+        let mut batch = vec![traj(1.0, 0), traj(0.0, 0)];
+        batch[0].gen_logprobs = Some(vec![-0.25]);
+        assert_eq!(apply_staleness_denominator(&mut batch, staleness), 1);
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].rollout_logprobs.as_deref(), Some(&[-0.25f32][..]));
+
+        // On-policy (staleness 0): untouched — the V0 recompute stays the
+        // denominator even when a sidecar is absent.
+        let mut batch = vec![traj(1.0, 0)];
+        assert_eq!(apply_staleness_denominator(&mut batch, 0), 0);
+        assert!(batch[0].rollout_logprobs.is_none());
     }
 
     #[test]
