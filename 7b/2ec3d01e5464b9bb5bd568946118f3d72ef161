@@ -1,0 +1,49 @@
+.github/workflows/cuda-ci.yml
+  s_3faeb0ec6b9263::t_d5b0d21097f68f 9-17,20,73-133
+.github/workflows/kernels-publish.yml
+  s_6abb0d645a30e1::t_fc1043fe841a08 12-17,25-34,45,51-52,86,91,94,96-97,99-100,109-110,125-132,137,142-194
+.github/workflows/release.yml
+  s_6abb0d645a30e1::t_00005d38b51e3c 21-35,39,85,105,125,154,235,262,302
+docs/plans/2026-07-10-operator-artifact-dev-release-system.md
+  s_6abb0d645a30e1::t_2ca89d88d0248f 318-323
+docs/release-checklist.md
+  s_6abb0d645a30e1::t_14e08ca3f66c1b 3,61-75,201-203
+release-blockers.json
+  s_0a5e0efcaeacd8::t_ebbf1b60cd34b7 1
+scripts/validate_release.sh
+  s_3faeb0ec6b9263::t_d62e9b977bdd23 1-41
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "7b2ec3d01e5464b9bb5bd568946118f3d72ef161",
+  "prompts": {},
+  "sessions": {
+    "s_0a5e0efcaeacd8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b50094bb-bf29-4f19-bc6d-f29cfad0de56",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_3faeb0ec6b9263": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "eb2672f9-3c2f-4e5a-8e92-393e34ed3536",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_6abb0d645a30e1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aac912ecffa894638",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
