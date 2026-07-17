@@ -1,0 +1,33 @@
+crates/cli/src/args.rs
+  s_9666981ffdc626::t_3f3e401906eeca 1947-1956
+crates/cli/src/train_cli.rs
+  s_88e917ebbb8c8f::t_c5fa8eecf21c21 2192-2205,3102-3106,3115,3154-3161,3164-3167,3204,3206-3214,3216,3218-3251,3307-3308,3317-3344,3357-3359,3373-3379,3381-3402,3455-3462,3497
+crates/train/src/update_strategy.rs
+  s_9666981ffdc626::t_cbeaa6fd31592b 566-586,773-794
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "d3d6fa87ceb1abff535fc1c9eefbc4c877b06999",
+  "prompts": {},
+  "sessions": {
+    "s_88e917ebbb8c8f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-abee677ce0ea53b34",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_9666981ffdc626": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a980f4317e6437e05",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
