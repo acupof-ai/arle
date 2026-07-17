@@ -1,0 +1,29 @@
+crates/cuda-kernels/csrc/attention/decode_prep_paged_hd256.cu
+  s_67038b17df7668::t_38509b15f6abb7 5,19-20,45,121,138
+crates/cuda-kernels/csrc/attention/fused_attention.cu
+  s_67038b17df7668::t_509313b3339834 413,448
+crates/cuda-kernels/csrc/attention/prefill_attention_hd256.cu
+  s_67038b17df7668::t_2ab06af0de3a87 7,9,83
+crates/cuda-kernels/csrc/attention/prefill_attention_paged_prep.cu
+  s_67038b17df7668::t_bd69d7680b7d7f 112,136,200,217
+crates/infer-cuda/src/qwen35.rs
+  s_67038b17df7668::t_e4fa7315ea0ee8 2674,7447,7451-7475
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "b4b293f0c431d335ed4b520621f54b7440a31e99",
+  "prompts": {},
+  "sessions": {
+    "s_67038b17df7668": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c4b3468e-feff-42b1-aa89-1f360f19b20b",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
