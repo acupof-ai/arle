@@ -326,9 +326,10 @@ fn argmax_hs_row(
 
 /// Uniform-stream salts: draft draw / accept test / residual+bonus draw at the
 /// same position must be independent or the rejection identity breaks.
-const SALT_DRAW: u64 = 0;
-const SALT_ACCEPT: u64 = 0x9E37_79B9_7F4A_7C15;
-const SALT_RESIDUAL: u64 = 0xC2B2_AE3D_27D4_EB4F;
+/// `pub(super)`: the MTP lane's rejection twin shares the same streams.
+pub(super) const SALT_DRAW: u64 = 0;
+pub(super) const SALT_ACCEPT: u64 = 0x9E37_79B9_7F4A_7C15;
+pub(super) const SALT_RESIDUAL: u64 = 0xC2B2_AE3D_27D4_EB4F;
 
 /// SplitMix64 — mirrors `infer_plan::sample`'s private mixer bit-for-bit.
 fn splitmix64(x: u64) -> u64 {
@@ -342,7 +343,7 @@ fn splitmix64(x: u64) -> u64 {
 /// sampler's `(seed, position)` stream (`infer_plan::sample_token`), so
 /// same-config-twice reproduces. `SALT_DRAW = 0` makes the draft draw consume
 /// exactly the uniform plain decode would at that position.
-fn unit_uniform(seed: Option<u64>, salt: u64, position: u64) -> f32 {
+pub(super) fn unit_uniform(seed: Option<u64>, salt: u64, position: u64) -> f32 {
     let bits = splitmix64(
         seed.unwrap_or(0)
             .wrapping_add(salt)
