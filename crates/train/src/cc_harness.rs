@@ -79,8 +79,9 @@ impl ScoredSample {
     }
 }
 
-/// One completed group: K scored samples + their converted token records
-/// (fewer than K when an attempt produced no serve request).
+/// One completed group: K scored samples + their converted token records —
+/// one per sidecar-covered request, so usually MORE than K (re-render
+/// fallback: one per sample; zero when an attempt produced no serve request).
 pub struct CcGroup {
     pub task_id: String,
     pub samples: Vec<ScoredSample>,
