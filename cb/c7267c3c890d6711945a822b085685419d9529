@@ -1,0 +1,35 @@
+crates/cli/src/train_cli.rs
+  s_3c14c5088393c0::t_ad2fe4c0cd2580 2313-2315,2414-2417,3280-3282,3345-3348,5005
+crates/train/src/cc_convert.rs
+  s_3c14c5088393c0::t_5a0868a0b69968 55-59,306-315,336,338-341,354-356,373,542,547,552,566-567
+crates/train/src/update_strategy.rs
+  s_3c14c5088393c0::t_d698a13ed4eadf 40-43,146-152,395-400,410-419,530-537,539,559-561,676
+docs/experience/wins/2026-07-17-qwen35-gen-logprob-capture.md
+  s_21df2bb8ca4d26::t_25a0c3ed8111ac 1-49
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "cbc7267c3c890d6711945a822b085685419d9529",
+  "prompts": {},
+  "sessions": {
+    "s_21df2bb8ca4d26": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a750b30fd3e660802",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_3c14c5088393c0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a2cab6efa20fa6445",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
