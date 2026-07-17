@@ -1226,6 +1226,14 @@ impl Dsv4CudaExecutor {
         self.model.config.sliding_window.max(1)
     }
 
+    /// Phase 1 of the chunked-prefill unification keeps the chunk pinned to
+    /// one snapshot grain (= sliding_window = 128), so plans are unchanged;
+    /// Phase 2 raises this behind a flag (min with DSV4_PREFILL_QUERY_CHUNK
+    /// and the deepep per-forward cap).
+    pub(crate) fn max_prefill_chunk(&self) -> usize {
+        self.model.config.sliding_window.max(1)
+    }
+
     /// Restore a radix-matched prefix into `slot` from the content-keyed pool
     /// (#154 Phase 2 read hook; engine calls via the restore_prefix_sidecar
     /// seam AFTER attaching the host pages). Every entry decodes to owned

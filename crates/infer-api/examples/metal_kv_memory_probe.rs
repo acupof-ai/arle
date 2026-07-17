@@ -110,7 +110,7 @@ fn main() -> anyhow::Result<()> {
     let mut config = EngineLoadConfig {
         num_slots: 1,
         total_pages,
-        chunked_prefill_size,
+        chunked_prefill_size: Some(chunked_prefill_size),
         max_prompt_tokens: target_prompt_tokens.saturating_add(1024),
         max_total_tokens: target_prompt_tokens
             .saturating_add(max_tokens)

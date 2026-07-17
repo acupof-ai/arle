@@ -621,7 +621,7 @@ pub mod app {
                 total_pages: max_seq_len.div_ceil(page_size),
                 max_prompt_tokens: max_seq_len,
                 max_total_tokens: max_seq_len,
-                chunked_prefill_size: max_seq_len,
+                chunked_prefill_size: Some(max_seq_len),
                 ..EngineLoadConfig::default()
             },
         )
