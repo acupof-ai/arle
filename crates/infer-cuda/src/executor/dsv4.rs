@@ -661,7 +661,7 @@ impl Dsv4CudaExecutor {
             })
             .transpose()?;
         model.boot_mega_moe(num_slots.max(256))?;
-        Ok(Self {
+        let exec = Self {
             model,
             slots,
             kv_adapter,
@@ -680,7 +680,15 @@ impl Dsv4CudaExecutor {
             ),
             pending_prefix_captures: VecDeque::new(),
             dspark,
-        })
+        };
+        log::info!(
+            "DSv4 prefill chunk capability: {} tokens (ARLE_DSV4_PREFILL_CHUNK {:?}, deepep \
+             per-forward cap {:?})",
+            exec.max_prefill_chunk(),
+            crate::runtime_flags::dsv4_prefill_chunk(),
+            exec.model.max_tokens_per_step(),
+        );
+        Ok(exec)
     }
 
     /// Provision per-slot caches for the preloaded DSpark drafter. The
@@ -1226,12 +1234,22 @@ impl Dsv4CudaExecutor {
         self.model.config.sliding_window.max(1)
     }
 
-    /// Phase 1 of the chunked-prefill unification keeps the chunk pinned to
-    /// one snapshot grain (= sliding_window = 128), so plans are unchanged;
-    /// Phase 2 raises this behind a flag (min with DSV4_PREFILL_QUERY_CHUNK
-    /// and the deepep per-forward cap).
+    /// Largest single prefill forward; also the restore-snapshot grain when it
+    /// exceeds the boundary alignment. Default: one sliding_window (=128) —
+    /// plans unchanged. `ARLE_DSV4_PREFILL_CHUNK` raises it (chunked-prefill
+    /// plan Phase 2, opt-in): clamped to `[128, DSV4_PREFILL_QUERY_CHUNK]`
+    /// (the shared prefill scratch M bound), min'd with the deepep_ll
+    /// per-forward token cap, and rounded down to a 128 multiple so chunk ends
+    /// stay on the ring/snapshot alignment.
     pub(crate) fn max_prefill_chunk(&self) -> usize {
-        self.model.config.sliding_window.max(1)
+        let grain = self.model.config.sliding_window.max(1);
+        let Some(flag) = crate::runtime_flags::dsv4_prefill_chunk() else {
+            return grain;
+        };
+        let cap = flag
+            .clamp(128, crate::attention::DSV4_PREFILL_QUERY_CHUNK)
+            .min(self.model.max_tokens_per_step().unwrap_or(usize::MAX));
+        (cap / 128 * 128).max(grain)
     }
 
     /// Restore a radix-matched prefix into `slot` from the content-keyed pool

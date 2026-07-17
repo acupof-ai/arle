@@ -253,3 +253,24 @@ mod indexer_query_batch_tests {
         );
     }
 }
+
+mod sw_ring_tail_slice_tests {
+    use super::super::sw_ring_tail_slice;
+
+    #[test]
+    fn noop_at_or_below_window() {
+        // Today's paths (chunk <= window): byte-identical launch args.
+        assert_eq!(sw_ring_tail_slice(128, 128, 512), (0, 512, 128));
+        assert_eq!(sw_ring_tail_slice(1, 128, 7), (0, 7, 1));
+        assert_eq!(sw_ring_tail_slice(0, 128, 0), (0, 0, 0));
+    }
+
+    #[test]
+    fn slices_tail_above_window() {
+        // window+1: drop exactly the first row (its slot is rewritten by row 128).
+        assert_eq!(sw_ring_tail_slice(129, 128, 256), (1, 257, 128));
+        // 2048-token chunk at start_pos 4096: keep only the surviving last 128
+        // rows; pointer advances 1920 rows, ring positions unchanged.
+        assert_eq!(sw_ring_tail_slice(2048, 128, 4096), (1920, 6016, 128));
+    }
+}
