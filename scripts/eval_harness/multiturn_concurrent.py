@@ -39,7 +39,7 @@ import random
 import time
 import urllib.request
 
-from . import BASE, MODEL, Gate, Verdict, build_doc, get_stats, stat_delta
+from . import BASE, MODEL, PREFIX_HIT_TOKENS, Gate, Verdict, build_doc, get_stats, stat_delta
 
 NEEDLE = "738291"
 NEW_TURN_TEXT = "\n\nUser: Continue and elaborate further.\n\nAssistant:"
@@ -139,7 +139,7 @@ class MultiTurnConcurrentGate(Gate):
                 probes = list(pool.map(lambda p: post(p, max_tokens=1), prompts))
                 if turn == 2:
                     time.sleep(0.3)
-                    reuse_turn2 = stat_delta(s0, get_stats(), "prefix_cache_hit_tokens")
+                    reuse_turn2 = stat_delta(s0, get_stats(), PREFIX_HIT_TOKENS)
                 ttft.extend(r["dt"] for r in probes)
 
                 # Full phase replays the probe's EXACT prompt ids (reuses probe).
