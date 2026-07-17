@@ -1,0 +1,33 @@
+docs/baselines.md
+  s_67038b17df7668::t_3f01ef3b20c8df 22-28
+docs/experience/wins/2026-07-17-dsv4-prefill-chunk-2048-default.md
+  s_81c5a850d93f85::t_21b31d0b7da22a 1-42
+docs/plans/2026-07-17-dsv4-chunked-prefill-unification.md
+  s_67038b17df7668::t_cd6b49de0ab481 3
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "67e15b0a66e313c635971a7dc561f6b5dca7e3dd",
+  "prompts": {},
+  "sessions": {
+    "s_67038b17df7668": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c4b3468e-feff-42b1-aa89-1f360f19b20b",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_81c5a850d93f85": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c1899929-05e0-4ef7-9ac7-0acb8fe9ec71",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
