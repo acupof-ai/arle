@@ -1,0 +1,31 @@
+crates/infer-cuda/src/attention.rs
+  s_8ca58d52ed7ed5::t_5dc2df07ca653f 2114-2125,2146-2154,2167-2169,2173
+crates/infer-cuda/src/attention/kv_layout.rs
+  s_8ca58d52ed7ed5::t_3a2e48af7a4bb2 3
+crates/infer-cuda/src/attention/tests.rs
+  s_8ca58d52ed7ed5::t_2720def39666c9 256-276
+crates/infer-cuda/src/executor/dsv4.rs
+  s_8ca58d52ed7ed5::t_bd16367495972d 664,683-691,1237-1243,1245-1252
+crates/infer-cuda/src/runtime_flags.rs
+  s_8ca58d52ed7ed5::t_2107e37c9dfd59 162-177
+docs/plans/2026-07-17-dsv4-chunked-prefill-unification.md
+  s_8ca58d52ed7ed5::t_27fb334d13a98f 3
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "0e9f687f8e8fe8987513ba95c7dafb1e82351333",
+  "prompts": {},
+  "sessions": {
+    "s_8ca58d52ed7ed5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a29fa6447550eddb8",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
