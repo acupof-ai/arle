@@ -2,7 +2,7 @@
 //
 // Differences from decode_prep_paged.cu (HD128):
 //   1. HEAD_DIM = 256 (256 threads per block)
-//   2. RMSNorm uses (1+weight) offset variant
+//   2. RMSNorm applies weight directly (standard convention, matches hd128)
 //   3. Partial RoPE: only first `rotary_dim` dims (typically 64) get rotation
 //   4. Q has gate: q_full layout is [B, num_q_heads * head_dim * 2]
 //      where each head has [head_dim Q values, head_dim gate values]
@@ -16,9 +16,8 @@
 #define HD256 256
 #define NUM_WARPS_HD256 (HD256 / WARP_SIZE)  // 8
 
-// Per-head RMSNorm with (1+weight) offset variant:
-//   output = x * (1/sqrt(mean(x^2) + eps)) * (1 + weight)
-__device__ __forceinline__ float rms_norm_head_offset_hd256(
+// Per-head RMSNorm: output = x * (1/sqrt(mean(x^2) + eps)) * weight
+__device__ __forceinline__ float rms_norm_head_hd256(
     float val,
     float weight,
     float eps,
@@ -43,7 +42,7 @@ __device__ __forceinline__ float rms_norm_head_offset_hd256(
     }
     __syncthreads();
 
-    return val * scratch[0] * (1.0f + weight);
+    return val * scratch[0] * weight;
 }
 
 // Partial RoPE: pair-wise rotation on first rotary_dim elements.
@@ -119,7 +118,7 @@ __global__ void decode_prep_paged_hd256_kernel(
         int q_src = batch_idx * q_full_dim + q_head * 2 * HD256 + tid;
 
         float q_val = __bfloat162float(q_full_batch[q_src]);
-        float q_normed = rms_norm_head_offset_hd256(q_val, q_norm_w, rms_eps, tid);
+        float q_normed = rms_norm_head_hd256(q_val, q_norm_w, rms_eps, tid);
 
         smem_rope[tid] = q_normed;
         __syncthreads();
@@ -136,7 +135,7 @@ __global__ void decode_prep_paged_hd256_kernel(
     int kv_dim = num_kv_heads * HD256;
     int kv_offset = batch_idx * kv_dim + kv_head_idx * HD256 + tid;
     float k_val = __bfloat162float(k_batch[kv_offset]);
-    float k_normed = rms_norm_head_offset_hd256(k_val, k_norm_w, rms_eps, tid);
+    float k_normed = rms_norm_head_hd256(k_val, k_norm_w, rms_eps, tid);
 
     smem_rope[tid] = k_normed;
     __syncthreads();
