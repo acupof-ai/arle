@@ -1103,6 +1103,12 @@ pub(crate) struct OpdRuntimeArgs {
     /// (matches serve's default).
     #[arg(long, default_value_t = 0.5, value_name = "T")]
     pub(crate) dspark_conf_threshold: f32,
+
+    /// Whole-step Qwen3.5/3.6 decode graph for the in-process rollout engine
+    /// (mirrors serve's flag). Default off = unchanged behavior; flipping it
+    /// on waits for the F.5 co-residency license.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set, value_name = "BOOL")]
+    pub(crate) qwen35_decode_graph: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
