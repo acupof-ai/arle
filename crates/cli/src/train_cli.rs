@@ -2189,6 +2189,20 @@ fn quiesce_serve(
     }
 }
 
+/// One task group's pending rollout (P7 `--staleness` dial). Staleness 0 keeps
+/// today's boot-ahead: sandboxes build in the background, the rollout itself
+/// runs inline at collect (strictly on-policy). Staleness 1 runs the WHOLE
+/// rollout on a background thread launched before the previous group's
+/// train+merge, tagged with the policy version it launched under.
+#[cfg(feature = "cuda")]
+enum PendingGroup {
+    Booted(train::cc_harness::BootedGroup),
+    Rolling {
+        behavior_version: u64,
+        handle: std::thread::JoinHandle<Result<train::cc_harness::CcGroup>>,
+    },
+}
+
 /// Append-only JSONL metrics sink (`--metrics-out`); write failures log and
 /// never abort training.
 #[cfg(feature = "cuda")]
@@ -3085,9 +3099,11 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
         return Ok(());
     }
 
-    // cc rollout harness over the serve; task groups run sequentially
-    // (staleness 0) — in-flight concurrency = the K samples of one group.
-    let harness = train::cc_harness::CcHarness {
+    // cc rollout harness over the serve. --staleness 0 (default): task groups
+    // run sequentially — in-flight concurrency = the K samples of one group.
+    // --staleness 1: the next group rolls on a background thread while this
+    // group trains+merges (Arc'd for that thread's 'static bound).
+    let harness = Arc::new(train::cc_harness::CcHarness {
         work_root: args.work_root.clone(),
         dump_dir,
         base_url: format!("http://127.0.0.1:{}", args.serve_port),
@@ -3096,7 +3112,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
         test_timeout_secs: args.test_timeout_secs,
         pythonpath: args.pythonpath.clone(),
         tokenizer: train::cc_harness::load_tokenizer(&student_dir.join("tokenizer.json"))?,
-    };
+    });
 
     // One deep tokenizer clone for the post-merge warm-up threads.
     let warmup_tokenizer = Arc::new(harness.tokenizer.clone());
@@ -3135,8 +3151,20 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
             args.replay_reuse
         );
     }
+    if args.staleness > 0 && !needs.rollout_logprobs {
+        bail!(
+            "--staleness {} with --update-strategy {preset_name}: the preset has no IS ratio \
+             (ratio == None), so stale groups would be uncorrected off-policy. Use a \
+             ratio-weighted preset (grpo | dapo | dr-grpo | gspo | cispo | sao-*).",
+            args.staleness
+        );
+    }
     let mut replay =
         (args.replay_reuse > 0).then(|| (ReplayBuffer::default(), PromptSampler::new(0x5EED_1A7)));
+    // P7: LoRA-merge counter. A group is tagged with the version its rollouts
+    // LAUNCHED under (behavior_version) and trains at the current version;
+    // staleness = current − behavior (0 today; 1 for overlapped groups).
+    let mut policy_version = 0u64;
     for round in 0..args.rounds {
         // Anchor the per-stage profiler (human table opt-in via ARLE_AOPD_PROFILE).
         train::aopd_profile::begin_round();
@@ -3173,20 +3201,54 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
             );
         }
 
-        let boot = |&i: &usize| {
+        let launch = |&i: &usize, version: u64| -> PendingGroup {
             let (task, staged) = &tasks[i];
-            harness.boot_group(task, staged, width)
+            let booted = harness.boot_group(task, staged, width);
+            if args.staleness == 0 {
+                return PendingGroup::Booted(booted);
+            }
+            let harness = Arc::clone(&harness);
+            PendingGroup::Rolling {
+                behavior_version: version,
+                handle: std::thread::spawn(move || harness.run_group(booted)),
+            }
         };
-        let mut next_boot = round_tasks.first().map(boot);
+        let mut next = round_tasks.first().map(|i| launch(i, policy_version));
         for (pos, &group_idx) in round_tasks.iter().enumerate() {
-            let this_boot = next_boot.take().expect("booted ahead");
-            // Boot-ahead: the next group's sandboxes build during this group's
-            // rollout + train (CPU only — staleness-free).
-            next_boot = round_tasks.get(pos + 1).map(boot);
-            let group =
-                train::aopd_profile::time_try("cc_rollout", train::aopd_profile::WALL, || {
-                    harness.run_group(this_boot)
-                })?;
+            let pending = next.take().expect("launched ahead");
+            // Boot-ahead (staleness 0): the next group's sandboxes build during
+            // this group's rollout + train (CPU only — staleness-free).
+            if args.staleness == 0 {
+                next = round_tasks.get(pos + 1).map(|i| launch(i, policy_version));
+            }
+            let (group, behavior_version) = train::aopd_profile::time_try(
+                "cc_rollout",
+                train::aopd_profile::WALL,
+                || -> Result<(train::cc_harness::CcGroup, u64)> {
+                    match pending {
+                        // Rollout runs inline — π_behavior is the CURRENT policy.
+                        PendingGroup::Booted(booted) => {
+                            Ok((harness.run_group(booted)?, policy_version))
+                        }
+                        PendingGroup::Rolling {
+                            behavior_version,
+                            handle,
+                        } => Ok((
+                            handle
+                                .join()
+                                .map_err(|_| anyhow!("stale rollout thread panicked"))??,
+                            behavior_version,
+                        )),
+                    }
+                },
+            )?;
+            // Staleness 1: admit the NEXT group's rollout now, BEFORE this
+            // group's train + merge — cc rolls while the GPU trains; the
+            // version tag + sidecar IS ratio below correct the one-step drift.
+            if args.staleness > 0 {
+                next = round_tasks.get(pos + 1).map(|i| launch(i, policy_version));
+            }
+            let group_staleness = policy_version - behavior_version;
 
             let group_passed = group.samples.iter().filter(|s| s.passed()).count();
             let group_zero_variance = train::cc_harness::zero_variance(&group.samples);
@@ -3242,6 +3304,8 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
                 "reward_mean": reward_mean,
                 "reward_std": reward_std,
                 "zero_variance": group_zero_variance,
+                "behavior_version": behavior_version,
+                "staleness": group_staleness,
                 "passed": group_passed,
                 "edited": group.samples.iter().filter(|s| s.edited).count(),
                 "prompt_tokens": g_prompt,
@@ -3250,21 +3314,34 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
                 "rollout_tok_per_sec": g_completion as f64 / rollout_secs.max(1e-9),
             }));
 
-            // Quiesce before touching weights / dropping the KV pool: the
-            // group's cc children exited with run_group, so this only drains a
-            // straggler engine request — a live one would hit the dropped pool.
-            train::aopd_profile::time_try("quiesce", train::aopd_profile::WALL, || {
-                quiesce_serve(infer_student.engine())
-            })?;
-            // Release the inference forward scratch + the DEAD rollout KV pool
-            // BEFORE the writeback — the same two headroom levers as before
-            // (scratch otherwise OOMs the logits alloc; the writeback's fresh
-            // autograd forward never reads the engine KV, see release_kv_pool).
-            if let Err(err) = infer_student.release_inference_scratch() {
-                eprintln!("[agent-opd] release inference scratch failed: {err}");
-            }
-            if let Err(err) = infer_student.release_kv_pool() {
-                eprintln!("[agent-opd] release KV pool failed: {err}");
+            // Staleness 1 skips quiesce AND the releases: the NEXT group's
+            // requests are legitimately in flight — cancel_all would kill them,
+            // and a dropped KV pool / scratch would be read by live decodes, so
+            // both stay resident (F.5: 70 GB peak at K=8 WITH the pool
+            // resident — it fits). The re-merge below is atomic engine-side;
+            // in-flight requests keep their pinned pages and finish on mixed
+            // KV (#92 caveat) — exactly the drift the version tag + sidecar IS
+            // ratio correct. A current-group straggler (its cc child exited)
+            // is harmless without the pool drop and drains on its own.
+            if args.staleness == 0 {
+                // Quiesce before touching weights / dropping the KV pool: the
+                // group's cc children exited with run_group, so this only drains
+                // a straggler engine request — a live one would hit the dropped
+                // pool.
+                train::aopd_profile::time_try("quiesce", train::aopd_profile::WALL, || {
+                    quiesce_serve(infer_student.engine())
+                })?;
+                // Release the inference forward scratch + the DEAD rollout KV
+                // pool BEFORE the writeback — the same two headroom levers as
+                // before (scratch otherwise OOMs the logits alloc; the
+                // writeback's fresh autograd forward never reads the engine KV,
+                // see release_kv_pool).
+                if let Err(err) = infer_student.release_inference_scratch() {
+                    eprintln!("[agent-opd] release inference scratch failed: {err}");
+                }
+                if let Err(err) = infer_student.release_kv_pool() {
+                    eprintln!("[agent-opd] release KV pool failed: {err}");
+                }
             }
             log_opd_vram("agent-opd pre-writeback", &train_backend);
 
@@ -3277,8 +3354,9 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
                     response_mask: r.response_mask,
                     reward: r.reward,
                     rollout_logprobs: None,
-                    // Sidecar behavior logprobs (F.6 diagnostic; the IS ratio
-                    // stays on the V0 recompute until F.6 licenses the flip).
+                    // Sidecar behavior logprobs: F.6 diagnostic at staleness 0
+                    // (the IS ratio stays on the V0 recompute until F.6
+                    // licenses the flip); the ratio denominator for stale groups.
                     gen_logprobs: (!r.gen_logprobs.is_empty()).then_some(r.gen_logprobs),
                     group_id: group_idx,
                     truncated: false,
@@ -3292,21 +3370,36 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
                 batch.truncate(cap_left);
                 cap_left -= batch.len();
             }
-            // Capture π_behavior when the preset needs it. Faithful under
-            // every-group sync (θ == rollout policy); under every-round this
-            // approximates π_behavior with the already-updated θ (startup
-            // warning above; P6 generation-time logprobs replace it).
+            // Capture π_behavior when the preset needs it. STALE groups pin
+            // the denominator to the generation-time sidecar (the V0 recompute
+            // reflects the post-merge policy — the missing-old-logits failure)
+            // and drop uncaptured trajectories. On-policy groups recompute at
+            // V0: faithful under every-group sync (θ == rollout policy); under
+            // every-round this approximates π_behavior with the already-updated
+            // θ (startup warning above).
             if needs.rollout_logprobs {
-                for traj in &mut batch {
-                    let lp = train::opd::capture_rollout_logprobs(
-                        &student,
-                        &traj.prompt_ids,
-                        &traj.response_ids,
-                        &traj.response_mask,
-                        &mut store,
-                    )
-                    .map_err(anyhow::Error::from)?;
-                    traj.rollout_logprobs = Some(lp);
+                let dropped = train::update_strategy::apply_staleness_denominator(
+                    &mut batch,
+                    group_staleness,
+                );
+                if dropped > 0 {
+                    eprintln!(
+                        "[agent-opd] staleness {group_staleness}: dropped {dropped} trajectory(ies) \
+                         without sidecar gen_logprobs (fallback/greedy capture path)"
+                    );
+                }
+                if group_staleness == 0 {
+                    for traj in &mut batch {
+                        let lp = train::opd::capture_rollout_logprobs(
+                            &student,
+                            &traj.prompt_ids,
+                            &traj.response_ids,
+                            &traj.response_mask,
+                            &mut store,
+                        )
+                        .map_err(anyhow::Error::from)?;
+                        traj.rollout_logprobs = Some(lp);
+                    }
                 }
             }
             // One update + its metrics row; `extra` carries the arm-specific
@@ -3359,7 +3452,14 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
                 metrics.append(&row);
                 Ok(())
             };
-            run_update(&batch, serde_json::json!({ "group": group_idx }))?;
+            run_update(
+                &batch,
+                serde_json::json!({
+                    "group": group_idx,
+                    "behavior_version": behavior_version,
+                    "staleness": group_staleness,
+                }),
+            )?;
 
             // Experience replay (fresh-anchored: only after the fresh group
             // trained). Stored batches carry the behavior logprobs captured at
@@ -3394,6 +3494,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
                 let secs = sync_started.elapsed().as_secs_f64();
                 train::aopd_profile::record("sync_lora", train::aopd_profile::GPU, secs);
                 sync_lora_secs += secs;
+                policy_version += 1;
             }
             if let Err(err) = infer_student.ensure_kv_pool() {
                 eprintln!("[agent-opd] ensure KV pool (group {group_idx}) failed: {err}");
