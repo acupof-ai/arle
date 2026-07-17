@@ -9,6 +9,12 @@ on:
     branches: [main]
     paths:
       - crates/cuda-kernels/tools/tilelang/**
+      - crates/cuda-kernels/csrc/**
+      - crates/cuda-kernels/ffi/**
+      - crates/cuda-kernels/src/**
+      - crates/infer-cuda/src/**
+      - vendor/flash-attention/**
+      - vendor/flashmla/**
       - crates/cuda-kernels/kernels.toml
       - crates/cuda-kernels/build.rs
       - requirements-build.txt
@@ -16,7 +22,16 @@ on:
       - scripts/kernel_artifacts.sh
       - scripts/cuda_prebuilt_manifest.sh
       - .github/workflows/kernels-publish.yml
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      correctness_evidence_run_id:
+        description: CUDA CI run ID containing kernel-correctness evidence
+        required: false
+        type: string
+      kernel_candidate_run_id:
+        description: Kernels Publish run ID containing the tested kernel-bundle-candidate
+        required: false
+        type: string
 
 concurrency:
   group: kernels-publish
@@ -27,13 +42,14 @@ env:
   RUSTC_WRAPPER: ""
 
 permissions:
+  actions: read
   contents: write
   attestations: write
   id-token: write
 
 jobs:
-  publish:
-    name: Regen T1 kernel bundle + publish
+  build:
+    name: Build T1 kernel bundle
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
@@ -67,22 +83,21 @@ jobs:
       - name: Regenerate T1 kernel set (sm_80/86/89/90)
         env:
           TORCH_CUDA_ARCH_LIST: '8.0;8.6;8.9;9.0'
+          ARLE_CUDA_ENABLE_FA3: '1'
           ARLE_KERNEL_VENDOR: '1'
           ARLE_CUDA_KERNEL_CACHE: '0'
         run: cargo build --release --features cuda -p cuda-kernels
 
-      - name: Publish exact immutable bundle
+      - name: Pack unqualified bundle
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # This workflow has no GPU correctness lane; record that fact rather
-          # than promoting a successful build to a correctness claim.
           ARLE_KERNEL_CORRECTNESS_STATUS: not-run
-        run: scripts/kernel_artifacts.sh publish
+        run: scripts/kernel_artifacts.sh pack
 
-      - name: Attest immutable bundle
-        uses: actions/attest-build-provenance@v4
+      - name: Upload bundle candidate
+        uses: actions/upload-artifact@v7
         with:
-          subject-path: |
+          name: kernel-bundle-candidate
+          path: |
             arle-kernels-t1-*.tar.gz
             arle-kernels-t1-*.tar.gz.sha256
 
@@ -91,8 +106,8 @@ jobs:
   # any regen attempt (bundle stale/incomplete) panics with the tilelang
   # probe error and fails this job.
   consume-check:
-    name: Zero-Python consume check
-    needs: publish
+    name: Zero-Python candidate consume check
+    needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -107,15 +122,73 @@ jobs:
           cuda: '12.8.0'
           method: network
 
-      - name: Fetch the exact just-published bundle
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: scripts/kernel_artifacts.sh fetch
+      - name: Download bundle candidate
+        uses: actions/download-artifact@v8
+        with:
+          name: kernel-bundle-candidate
+          path: /tmp/kernel-bundle-candidate
+
+      - name: Fetch the exact candidate bundle
+        run: scripts/kernel_artifacts.sh fetch /tmp/kernel-bundle-candidate
 
       - name: Build the T1 kernel set with zero Python
         env:
           TORCH_CUDA_ARCH_LIST: '8.0;8.6;8.9;9.0'
+          ARLE_CUDA_ENABLE_FA3: '1'
           ARLE_CUDA_KERNEL_CACHE: '0'
           # Poison the tilelang probe: consume must never need it.
           INFER_TILELANG_PYTHON: /usr/bin/false
         run: cargo build --release --features cuda -p cuda-kernels
+
+  publish-qualified:
+    name: Publish correctness-qualified bundle
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.correctness_evidence_run_id != '' && inputs.kernel_candidate_run_id != '' }}
+    needs: [build, consume-check]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download correctness evidence
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh run download "${{ inputs.correctness_evidence_run_id }}" -n kernel-correctness -D /tmp/kernel-correctness
+
+      - name: Download tested kernel candidate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh run download "${{ inputs.kernel_candidate_run_id }}" -n kernel-bundle-candidate -D /tmp/kernel-bundle-candidate
+
+      - name: Verify tested candidate identity
+        id: tested
+        run: |
+          CANDIDATE="$(compgen -G '/tmp/kernel-bundle-candidate/arle-kernels-t1-*.tar.gz')"
+          CANDIDATE_SHA="$(sha256sum "$CANDIDATE" | cut -d' ' -f1)"
+          mkdir /tmp/kernel-candidate-manifest
+          tar -xzf "$CANDIDATE" -C /tmp/kernel-candidate-manifest ./manifest.json
+          BUNDLE_ID="$(jq -er '.bundle_id' /tmp/kernel-candidate-manifest/manifest.json)"
+          test "$BUNDLE_ID" = "$(scripts/kernel_artifacts.sh id)"
+          jq -e --arg bundle "$BUNDLE_ID" --arg commit "$GITHUB_SHA" --arg sha "$CANDIDATE_SHA" '
+            .schema == 2 and .status == "passed" and .bundle_id == $bundle and
+            .source_commit == $commit and .artifact_sha256 == $sha and
+            .tested_sms == ["8.0","8.6","8.9","9.0"] and .capabilities == ["fa3"] and
+            (keys | sort == ["artifact_sha256","bundle_id","capabilities","schema","source_commit","status","tested_sms"])
+          ' /tmp/kernel-correctness/correctness-evidence.json >/dev/null
+          echo "sha256=$CANDIDATE_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Restore tested generated kernel tree
+        run: scripts/kernel_artifacts.sh fetch /tmp/kernel-bundle-candidate
+
+      - name: Publish exact immutable qualified bundle
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ARLE_KERNEL_CORRECTNESS_STATUS: passed
+          ARLE_KERNEL_CORRECTNESS_EVIDENCE: /tmp/kernel-correctness/correctness-evidence.json
+          ARLE_KERNEL_TESTED_ARTIFACT_SHA256: ${{ steps.tested.outputs.sha256 }}
+        run: scripts/kernel_artifacts.sh publish
+
+      - name: Attest immutable bundle
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: |
+            arle-kernels-t1-*.tar.gz
+            arle-kernels-t1-*.tar.gz.sha256

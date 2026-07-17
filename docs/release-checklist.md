@@ -1,9 +1,6 @@
 # Release Checklist
 
-This checklist defines the minimum steps for cutting a release of
-`ARLE`.
-
-It is meant to keep releases repeatable, readable, and safe.
+Release automation fails closed unless the tag commit, workspace version, explicit blocker registry, and passed kernel evidence agree.
 
 ---
 
@@ -60,6 +57,21 @@ bump lives in this checklist.
 ---
 
 ## 3. Run Validation
+
+Before tagging, `release-blockers.json` must contain exactly the current explicit blockers. Release automation never scans historical docs. An empty release-ready registry is:
+
+```json
+{"schema":1,"blockers":[]}
+```
+
+Validate the candidate tag against a local qualified kernel bundle directory or the `kernel-artifacts` release:
+
+```bash
+scripts/validate_release.sh vX.Y.Z /path/to/bundle-assets
+scripts/validate_release.sh vX.Y.Z
+```
+
+The validator requires tag commit = checkout commit, tag base version = workspace product version, zero blockers, and passed kernel evidence bound to the exact bundle ID, GPU-tested commit, and tested candidate archive SHA-256. The tested commit may be an ancestor of the tag when intervening commits do not change the bundle identity.
 
 Typical baseline:
 
@@ -186,6 +198,9 @@ After release:
 - [ ] Changelog updated
 - [ ] Compatibility reviewed
 - [ ] Support matrix updated
+- [ ] `release-blockers.json` has zero blockers
+- [ ] Qualified kernel evidence matches tag commit and bundle ID
+- [ ] Product identity matches tag/workspace version
 - [ ] Validation run
 - [ ] Artifacts verified
 - [ ] Tag created and workflow passed
