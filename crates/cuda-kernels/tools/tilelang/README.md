@@ -10,10 +10,10 @@ chunk-wise GDR. See `docs/plans/tilelang-integration.md` and
 - TileLang attention kernels: `batch_prefill_paged_hd128.py`,
   `batch_prefill_paged_hd256.py`, and
   `batch_decode_paged_hd256.py`.
-- AOT-specialized per Qwen head config. Build emits one cubin + C wrapper per
-  config; Rust dispatches by `(num_q_heads, num_kv_heads)`. Add a new size by
-  extending the lockstep lists in the kernel module, `build.rs`,
-  `ffi/attention.rs`, and `infer/src/ops/attention.rs`.
+- AOT-specialized per Qwen head config and target SM. Build emits one cubin + C
+  wrapper per `(config, SM)` and runtime dispatches by model shape plus the active
+  device SM. Add a size by updating `kernels.toml`, `build.rs`, and the matching
+  FFI/runtime call sites.
 - TileLang GDR scaffold: `gated_delta_rule.py` mirrors the Qwen3.5 chunk-wise
   stages that TileLang 0.1.9 can lower on sm_89; the strict-lower triangular
   solve symbol is native CUDA C in `csrc/misc/gdr_prefill_solve.cu`.
@@ -29,20 +29,19 @@ export CUDA_HOME=/usr/local/cuda
 export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
 ```
 
-Bootstrap a repo-local TileLang Python:
+Bootstrap the pinned, patched repo-local toolchain from the repo root:
 
 ```bash
-uv venv crates/cuda-kernels/tools/tilelang/.venv
-uv pip install -p crates/cuda-kernels/tools/tilelang/.venv/bin/python tilelang
-```
-
-Or, from the repo root: `pip install -e ".[tilelang]"`.
-
-Point the build at that interpreter explicitly:
-
-```bash
+scripts/pod-tilelang-env.sh
 export INFER_TILELANG_PYTHON=$PWD/crates/cuda-kernels/tools/tilelang/.venv/bin/python
 ```
+
+The build uses the exact `INFER_TILELANG_PYTHON` path; it does not resolve venv
+symlinks to a system interpreter. It requires `import tilelang`, the package's
+bundled `lib/`, `src/`, and CUTLASS trees, plus the installed `tvm_ffi` package.
+A separate top-level `tvm` package is not required: TileLang loads its bundled
+TVM during import. These runtime/codegen trees are hashed into the persistent
+kernel-cache identity.
 
 The build also probes `crates/cuda-kernels/tools/tilelang/.venv/bin/python`
 and `.venv/bin/python` before falling back to `python3` / `python`.
@@ -65,15 +64,18 @@ Build through the workspace root when you want the `arle`/`cli` binaries:
 cargo build --release --features cuda
 ```
 
-Build the runtime crate directly when you only need `infer`:
+Build only the kernel producer crate:
 
 ```bash
-cargo build --release -p infer --features cuda
+cargo build --release -p cuda-kernels --features cuda
 ```
 
-For scripted server launches, set `INFER_FEATURES=cuda` before calling
-`scripts/start_infer.sh`.
+A qualified T1 fat bundle is built with `ARLE_CUDA_ENABLE_FA3=1`, then tested on
+SM 8.0, 8.6, 8.9, and 9.0. Evidence from one GPU qualifies only that GPU's SM;
+publish fails closed until all four SMs have exact-pass evidence.
 
+The generated per-SM C++ wrapper exports its CUDA entry point with C linkage;
+the C dispatch wrapper preserves the same ABI for Rust `extern "C"` callers.
 Artifacts land under `target/release/build/cuda-kernels-*/out/tilelang_aot/`.
 The generated C wrapper embeds the cubin bytes via `cuModuleLoadData`, so
 the produced binary is self-contained and survives `cargo clean` /
@@ -102,16 +104,8 @@ ARLE_TILELANG_PYTHON=/tmp/arle-tilelang-mac-venv/bin/python \
 
 The smoke imports TileLang from that checkout, lowers ARLE's in-tree
 `batch_prefill_paged_hd128.py` attention kernel to Metal, and executes a
-TileLang Metal `T.gemm` kernel on MPS. For a full local server/bench loop:
-
-```bash
-scripts/tilelang_metal_dev_backend.sh bench models/Qwen3.5-0.8B 8765
-```
-
-This is a Metal dev gate for the local TileLang checkout. The production
-ARLE Metal inference path still runs through `metal_serve` +
-`crates/mlx-sys`; replacing inference ops with TileLang-generated Metal
-kernels requires a separate runtime integration.
+TileLang Metal `T.gemm` kernel on MPS. This is a development-only compiler gate;
+the production Metal executor remains `crates/mlx-sys`.
 
 ## Risk gates
 

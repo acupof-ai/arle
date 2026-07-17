@@ -1,11 +1,10 @@
 #[allow(unused_imports)]
 use fs4::FileExt;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::OnceLock;
 
 /// Tier-1 SMs: default-compiled fat-binary set. A100 / A10·3090 / L4·4090 / H100.
 const T1_SMS: &[&str] = &["80", "86", "89", "90"];
@@ -760,8 +759,17 @@ fn find_tilelang_python() -> Result<String, String> {
 /// from-source build regenerates and DOES need `tilelang` installed — `get()` is
 /// only skipped when every per-(kernel, SM) artifact is restored from the
 /// persistent kernel cache or an externally-provided `generated/`/prebuilt dir.
+struct TilelangToolchain {
+    python: PathBuf,
+    package: PathBuf,
+    tvm_runtime: PathBuf,
+    tvm_ffi: PathBuf,
+    src: PathBuf,
+    cutlass_include: PathBuf,
+}
+
 struct LazyTilelang {
-    cell: std::cell::OnceCell<(String, std::path::PathBuf, std::path::PathBuf)>, // (python, tilelang_src, cutlass_include)
+    cell: std::cell::OnceCell<TilelangToolchain>,
 }
 
 impl LazyTilelang {
@@ -774,15 +782,14 @@ impl LazyTilelang {
     /// Resolve python + include dirs lazily — called ONLY when a kernel must be
     /// regenerated. A fully-vendored build never calls this, so it never needs
     /// tilelang.
-    fn get(&self) -> &(String, std::path::PathBuf, std::path::PathBuf) {
+    fn get(&self) -> &TilelangToolchain {
         self.cell.get_or_init(|| {
             let python = find_tilelang_python().unwrap_or_else(|m| {
                 panic!(
                     "TileLang is required to (re)generate a missing or source-changed AOT kernel, but it is unavailable: {m}"
                 )
             });
-            let (src, cutlass) = tilelang_include_dirs(&python);
-            (python, src, cutlass)
+            tilelang_toolchain(&python)
         })
     }
 }
@@ -834,9 +841,12 @@ fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
         .unwrap_or_else(|err| panic!("read identity directory {}: {err}", dir.display()))
     {
         let path = entry.expect("read identity directory entry").path();
+        if path.file_name().is_some_and(|name| name == "__pycache__") {
+            continue;
+        }
         if path.is_dir() {
             collect_files(&path, out);
-        } else if path.is_file() {
+        } else if path.is_file() && path.extension().is_none_or(|extension| extension != "pyc") {
             out.push(path);
         }
     }
@@ -952,40 +962,62 @@ fn resolve_executable(program: &str) -> PathBuf {
         .unwrap_or_else(|| panic!("compiler executable not found: {program}"))
 }
 
-fn compiler_identity(program: &str) -> Vec<u8> {
-    let executable = resolve_executable(program);
-    let output = Command::new(&executable)
+fn executable_identity(program: &Path) -> Vec<u8> {
+    let output = Command::new(program)
         .arg("--version")
         .output()
-        .unwrap_or_else(|err| panic!("run compiler {}: {err}", executable.display()));
-    assert!(
-        output.status.success(),
-        "compiler identity probe failed: {}",
-        executable.display()
-    );
+        .unwrap_or_else(|err| panic!("run executable {}: {err}", program.display()));
     let mut identity = Vec::new();
-    add_identity_part(&mut identity, "binary", &identity_file(executable));
+    add_identity_part(&mut identity, "path", program.to_string_lossy().as_bytes());
+    add_identity_part(&mut identity, "binary", &identity_file(program));
     add_identity_part(&mut identity, "stdout", &output.stdout);
     add_identity_part(&mut identity, "stderr", &output.stderr);
     identity
 }
 
-fn tilelang_toolchain_id(cuda_path: &str) -> &'static str {
-    static ID: OnceLock<String> = OnceLock::new();
-    ID.get_or_init(|| {
-        let mut identity = Vec::new();
+fn compiler_identity(program: &str) -> Vec<u8> {
+    executable_identity(&resolve_executable(program))
+}
+
+fn tilelang_toolchain_id(
+    toolchain: &TilelangToolchain,
+    nvcc: &Path,
+    wrapper: &[String],
+    cuda_include: &Path,
+) -> String {
+    let mut identity = Vec::new();
+    add_identity_part(
+        &mut identity,
+        "python",
+        &executable_identity(&toolchain.python),
+    );
+    add_identity_tree(&mut identity, &toolchain.package);
+    add_identity_tree(&mut identity, &toolchain.tvm_runtime);
+    add_identity_tree(&mut identity, &toolchain.tvm_ffi);
+    add_identity_tree(&mut identity, &toolchain.src);
+    add_identity_tree(&mut identity, &toolchain.cutlass_include);
+    add_identity_tree(&mut identity, cuda_include);
+    add_identity_part(&mut identity, "nvcc", &executable_identity(nvcc));
+    add_identity_part(
+        &mut identity,
+        "host_compiler",
+        &compiler_identity(&std::env::var("NVCC_CCBIN").unwrap_or_else(|_| "g++".to_string())),
+    );
+    for (index, arg) in wrapper.iter().enumerate() {
         add_identity_part(
             &mut identity,
-            "nvcc",
-            &compiler_identity(&format!("{cuda_path}/bin/nvcc")),
+            &format!("wrapper_argv_{index}"),
+            arg.as_bytes(),
         );
-        add_identity_part(
-            &mut identity,
-            "host_compiler",
-            &compiler_identity(&std::env::var("NVCC_CCBIN").unwrap_or_else(|_| "g++".to_string())),
-        );
-        sha256_bytes(&identity)
-    })
+        if index == 0 {
+            add_identity_part(
+                &mut identity,
+                "wrapper_executable",
+                &executable_identity(&resolve_executable(arg)),
+            );
+        }
+    }
+    sha256_bytes(&identity)
 }
 
 fn tilelang_cache_id(src_hash: &str, sm_token: &str, toolchain_id: &str) -> String {
@@ -1024,7 +1056,7 @@ fn validate_tilelang_artifact(
     if cache_id.is_some_and(|expected| recorded_cache_id != expected) {
         return Err("cache ID mismatch".to_string());
     }
-    let c_path = dir.join(format!("{out_name}.c"));
+    let c_path = dir.join(format!("{out_name}.cc"));
     let output_hash = sha256_bytes(
         &std::fs::read(&c_path).map_err(|err| format!("read {}: {err}", c_path.display()))?,
     );
@@ -1081,7 +1113,7 @@ fn run_tilelang_cache_identity_self_test(registry: &Registry, out_dir: &Path) {
     let out_name = "probe";
     let output = b"int probe(void) { return 0; }\n";
     let output_hash = sha256_bytes(output);
-    std::fs::write(dir.join("probe.c"), output).expect("write self-test output");
+    std::fs::write(dir.join("probe.cc"), output).expect("write self-test output");
     std::fs::write(
         dir.join("meta.txt"),
         format!(
@@ -1095,7 +1127,7 @@ fn run_tilelang_cache_identity_self_test(registry: &Registry, out_dir: &Path) {
     )
     .expect("write self-test marker");
     validate_tilelang_artifact(&dir, out_name, &base, Some("cache")).expect("valid cache fixture");
-    std::fs::write(dir.join("probe.c"), b"corrupt").expect("corrupt self-test output");
+    std::fs::write(dir.join("probe.cc"), b"corrupt").expect("corrupt self-test output");
     assert!(validate_tilelang_artifact(&dir, out_name, &base, Some("cache")).is_err());
     std::fs::remove_dir_all(&dir).expect("remove cache identity self-test dir");
 }
@@ -1105,57 +1137,104 @@ fn run_tilelang_cache_identity_self_test(registry: &Registry, out_dir: &Path) {
 // `[abi.*]` blocks of kernels.toml and reach build code via the parsed
 // `TileLangKernelSpec.public_decl/extern_decl/call_args` fields.
 
-/// Locate the directories the TileLang AOT generator needs for nvcc to
-/// compile `device_kernel.cu`: TileLang's `src/` (for `tl_templates/`),
-/// the cutlass headers it bundles, and the active CUDA toolkit include.
-fn tilelang_include_dirs(python: &str) -> (PathBuf, PathBuf) {
-    let probe = r#"
-import importlib.util, json, sys
-spec = importlib.util.find_spec("tilelang")
-if spec is None or not spec.submodule_search_locations:
-    print("ERR_NOT_INSTALLED")
-    sys.exit(0)
+fn tilelang_toolchain_probe() -> &'static str {
+    r#"
+import importlib.util
+import sys
 from pathlib import Path
-pkg = Path(spec.submodule_search_locations[0]).resolve()
+
+def package(name):
+    spec = importlib.util.find_spec(name)
+    if spec is None:
+        raise SystemExit("ERR_NOT_INSTALLED:" + name)
+    if spec.submodule_search_locations:
+        return Path(next(iter(spec.submodule_search_locations))).resolve()
+    return Path(spec.origin).resolve()
+
+pkg = package("tilelang")
+tvm_ffi = package("tvm_ffi")
 roots = [pkg, pkg.parent]
+tvm_runtime = next((root / "lib" for root in roots if (root / "lib").is_dir()), None)
 src = next((root / "src" for root in roots if (root / "src" / "tl_templates").exists()), None)
 cutlass = next((root / "3rdparty" / "cutlass" / "include" for root in roots if (root / "3rdparty" / "cutlass" / "include").exists()), None)
-if src is None or cutlass is None:
-    print("ERR_LAYOUT:" + str(pkg))
-    sys.exit(0)
-print(json.dumps({
-    "src": str(src),
-    "cutlass_include": str(cutlass),
-}))
-"#;
+if tvm_runtime is None or src is None or cutlass is None:
+    raise SystemExit("ERR_LAYOUT:" + str(pkg))
+print(sys.executable)
+print(pkg)
+print(tvm_runtime)
+print(tvm_ffi)
+print(src)
+print(cutlass)
+"#
+}
+
+fn run_tilelang_toolchain_probe_self_test(out_dir: &Path) {
+    let root = out_dir.join("tilelang_toolchain_probe_self_test");
+    let _ = std::fs::remove_dir_all(&root);
+    for path in [
+        "tilelang/lib",
+        "tilelang/src/tl_templates",
+        "tilelang/3rdparty/cutlass/include",
+        "tvm_ffi",
+    ] {
+        std::fs::create_dir_all(root.join(path)).expect("create TileLang probe fixture");
+    }
+    std::fs::write(root.join("tilelang/__init__.py"), "").expect("write tilelang fixture");
+    std::fs::write(root.join("tvm_ffi/__init__.py"), "").expect("write tvm-ffi fixture");
+    let output = Command::new("python3")
+        .arg("-c")
+        .arg(tilelang_toolchain_probe())
+        .env("PYTHONPATH", &root)
+        .output()
+        .expect("run TileLang toolchain probe self-test");
+    assert!(
+        output.status.success(),
+        "TileLang toolchain probe self-test failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    let paths = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    assert_eq!(paths.len(), 6);
+    assert_eq!(paths[1], root.join("tilelang"));
+    assert_eq!(paths[2], root.join("tilelang/lib"));
+    assert_eq!(paths[3], root.join("tvm_ffi"));
+    assert_eq!(paths[4], root.join("tilelang/src"));
+    assert_eq!(paths[5], root.join("tilelang/3rdparty/cutlass/include"));
+    assert!(!root.join("tvm").exists());
+    std::fs::remove_dir_all(&root).expect("remove TileLang probe fixture");
+}
+
+/// Locate the installed codegen and runtime trees that affect TileLang output.
+fn tilelang_toolchain(python: &str) -> TilelangToolchain {
     let output = Command::new(python)
         .arg("-c")
-        .arg(probe)
+        .arg(tilelang_toolchain_probe())
         .output()
         .expect("failed to probe tilelang install path");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stdout = stdout.trim();
-    if stdout == "ERR_NOT_INSTALLED" {
-        panic!("tilelang Python package not installed for the chosen interpreter");
+    assert!(
+        output.status.success(),
+        "tilelang toolchain probe failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    let paths = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        paths.len(),
+        6,
+        "tilelang toolchain probe returned invalid output"
+    );
+    TilelangToolchain {
+        python: PathBuf::from(python),
+        package: paths[1].clone(),
+        tvm_runtime: paths[2].clone(),
+        tvm_ffi: paths[3].clone(),
+        src: paths[4].clone(),
+        cutlass_include: paths[5].clone(),
     }
-    if let Some(pkg) = stdout.strip_prefix("ERR_LAYOUT:") {
-        panic!(
-            "tilelang Python package at {pkg} does not expose src/tl_templates or 3rdparty/cutlass/include; \
-             install TileLang from a source checkout or set INFER_TILELANG_PYTHON to the patched checkout interpreter"
-        );
-    }
-    // Tiny hand-rolled parse — JSON has only two known keys, no need to add a dep.
-    let src = stdout
-        .split("\"src\":")
-        .nth(1)
-        .and_then(|s| s.split('"').nth(1))
-        .expect("tilelang probe: src field missing");
-    let cutlass_include = stdout
-        .split("\"cutlass_include\":")
-        .nth(1)
-        .and_then(|s| s.split('"').nth(1))
-        .expect("tilelang probe: cutlass_include field missing");
-    (PathBuf::from(src), PathBuf::from(cutlass_include))
 }
 
 /// Run gen_tilelang_aot.py once per SM target. Each per-SM invocation:
@@ -1181,7 +1260,18 @@ fn generate_tilelang_artifacts_per_sm(
     );
     let force_regen = env_truthy("ARLE_TILELANG_REGEN");
     let cache_root = kernel_cache_root();
-    let toolchain_id = tilelang_toolchain_id(cuda_path);
+    let toolchain = tl.get();
+    let nvcc = resolve_executable(&format!("{cuda_path}/bin/nvcc"));
+    let cuda_include = PathBuf::from(cuda_path).join("include");
+    let wrapper: Vec<String> = env_nonempty("ARLE_NVCC_WRAPPER")
+        .map(|value| {
+            value
+                .split_whitespace()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let toolchain_id = tilelang_toolchain_id(toolchain, &nvcc, &wrapper, &cuda_include);
     let mut results = Vec::new();
 
     for sm in sm_targets {
@@ -1192,13 +1282,13 @@ fn generate_tilelang_artifacts_per_sm(
         let target = format!("cuda -arch=sm_{sm_token}");
 
         let src_hash = tilelang_kernel_src_hash(base_spec, sm_token);
-        let cache_id = tilelang_cache_id(&src_hash, sm_token, toolchain_id);
+        let cache_id = tilelang_cache_id(&src_hash, sm_token, &toolchain_id);
         let per_sm_artifact_dir = format!("{}_sm{sm_token}", base_spec.artifact_dir);
         let per_sm_out_name = format!("{}_sm{sm_token}", base_spec.out_name);
         let per_sm_kernel_name = format!("{}_sm{sm_token}", base_spec.kernel_name);
         let vendored_dir = manifest_dir.join("generated").join(&per_sm_artifact_dir);
         let out_artifact_dir = out_dir.join("tilelang_aot").join(&per_sm_artifact_dir);
-        let vendored_c = vendored_dir.join(format!("{per_sm_out_name}.c"));
+        let vendored_c = vendored_dir.join(format!("{per_sm_out_name}.cc"));
 
         let vendored_func = if !force_regen && vendored_dir.exists() {
             match validate_tilelang_artifact(&vendored_dir, &per_sm_out_name, &src_hash, None) {
@@ -1223,7 +1313,7 @@ fn generate_tilelang_artifacts_per_sm(
                     out_artifact_dir.display()
                 )
             });
-            let consumed_c = out_artifact_dir.join(format!("{per_sm_out_name}.c"));
+            let consumed_c = out_artifact_dir.join(format!("{per_sm_out_name}.cc"));
             println!("cargo:rerun-if-changed={}", vendored_c.display());
             println!("cargo:rerun-if-changed={}", base_spec.kernel_path);
             results.push((sm_token.clone(), func, consumed_c));
@@ -1253,7 +1343,7 @@ fn generate_tilelang_artifacts_per_sm(
                     results.push((
                         sm_token.clone(),
                         func,
-                        out_artifact_dir.join(format!("{per_sm_out_name}.c")),
+                        out_artifact_dir.join(format!("{per_sm_out_name}.cc")),
                     ));
                     continue;
                 }
@@ -1270,12 +1360,10 @@ fn generate_tilelang_artifacts_per_sm(
             }
         }
 
-        // Regen: resolve tilelang lazily (panics if unavailable) and run the
-        // generator exactly as before.
-        let (python, tilelang_src, cutlass_include) = tl.get();
         let _ = std::fs::remove_dir_all(&out_artifact_dir);
 
-        let output = Command::new(python)
+        let mut command = Command::new(&toolchain.python);
+        let output = command
             .arg(&generator_path)
             .arg("--kernel-path")
             .arg(&base_spec.kernel_path)
@@ -1292,11 +1380,18 @@ fn generate_tilelang_artifacts_per_sm(
             .arg("--cuda-arch")
             .arg(cuda_arch.to_string())
             .arg("--tilelang-src")
-            .arg(tilelang_src)
+            .arg(&toolchain.src)
             .arg("--cutlass-include")
-            .arg(cutlass_include)
+            .arg(&toolchain.cutlass_include)
             .arg("--cuda-include")
-            .arg(format!("{cuda_path}/include"))
+            .arg(&cuda_include)
+            .arg("--nvcc")
+            .arg(&nvcc)
+            .args(
+                wrapper
+                    .iter()
+                    .flat_map(|arg| ["--nvcc-wrapper".to_string(), arg.clone()]),
+            )
             .args(
                 base_spec
                     .kernel_key
@@ -1562,7 +1657,7 @@ fn compile_tilelang_aot_kernels(
     build
         .cuda(false)
         .include(format!("{}/include", cuda_path))
-        .flag("-std=c11")
+        .flag("-std=c++17")
         .warnings(false);
     for source in &generated_sources {
         build.file(source);
@@ -1576,7 +1671,7 @@ fn compile_tilelang_aot_kernels(
     );
     if has_legacy_volta(sm_targets) {
         println!(
-            "cargo:warning=sm_70 legacy Volta build: TileLang AOT emits BF16 Qwen3.5 dense-attention and GDR cubins; FP8 KV and DSv4 HD64 wrappers return CUDA_ERROR_NOT_SUPPORTED."
+            "cargo:warning=sm_70 legacy Volta build: TileLang AOT emits BF16 Qwen3.5/3.6 dense-attention (all HD128/HD256 BF16 configs) and GDR cubins; FP8 KV (sm_80+), DSv4 HD64, and HD64 wrappers return CUDA_ERROR_NOT_SUPPORTED."
         );
     }
     for entry in std::fs::read_dir("tools/tilelang")
@@ -1727,12 +1822,12 @@ fn vendor_tilelang_generated(out_dir: &Path, sm_targets: &[SmSpec]) {
         }
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
-        // Only vendor artifacts for the SM targets just built (or the dispatch
-        // wrappers, which are SM-independent C glue). This keeps a Blackwell
-        // regen from clobbering vendored Hopper/Ampere dirs that weren't rebuilt.
-        let is_dispatch = name_str.ends_with("_dispatch");
+        // Dispatch wrappers are ephemeral C++ glue, never cache artifacts.
+        if name_str.ends_with("_dispatch") {
+            continue;
+        }
         let is_target_sm = sm_tokens.iter().any(|tok| name_str.ends_with(tok));
-        if !is_dispatch && !is_target_sm {
+        if !is_target_sm {
             continue;
         }
         let to = generated_root.join(name);
@@ -1829,38 +1924,59 @@ const PREBUILT_REQUIRED_DSV4_SYMBOLS: &[&str] = &[
     "dsv4_mtp_add_eproj_hproj_cuda",
 ];
 
-fn validate_prebuilt_cuda_archive_symbols(archive: &Path) {
-    let output = Command::new("nm")
-        .arg("-g")
-        .arg(archive)
-        .output()
-        .unwrap_or_else(|err| panic!("Failed to run nm for {}: {err}", archive.display()));
-    if !output.status.success() {
-        panic!(
-            "Failed to inspect prebuilt CUDA archive {} with nm: {}",
-            archive.display(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+const PREBUILT_MANIFEST: &str = "arle-cuda-kernels.manifest";
+const PREBUILT_SCHEMA: &str = "3";
+const PREBUILT_ARTIFACTS: &[&str] = &[
+    "libkernels_cuda.a",
+    "libtilelang_kernels_aot.a",
+    "arle_deepep_sidecar",
+];
+
+fn command_id(program: &str, args: &[&str]) -> String {
+    let mut identity = program.as_bytes().to_vec();
+    if let Ok(output) = Command::new(program).args(args).output() {
+        identity.extend(output.stdout);
+        identity.extend(output.stderr);
+    } else {
+        identity.extend(b"missing");
     }
-    let symbols = String::from_utf8_lossy(&output.stdout);
-    let missing = PREBUILT_REQUIRED_DSV4_SYMBOLS
-        .iter()
-        .copied()
-        .filter(|symbol| !symbols.contains(symbol))
-        .collect::<Vec<_>>();
-    if !missing.is_empty() {
-        panic!(
-            "ARLE_CUDA_KERNELS_PREBUILT_DIR archive {} is missing required DSv4 symbols: {}. \
-             Rebuild the CUDA prebuilt artifacts instead of linking a stale archive.",
-            archive.display(),
-            missing.join(", ")
-        );
-    }
+    sha256_bytes(&identity)
 }
 
-fn validate_cuda_archive_has_symbol(archive: &Path, symbol: &str, context: &str) {
+fn cargo_features() -> String {
+    std::env::vars_os()
+        .filter_map(|(key, _)| {
+            key.to_str()?
+                .strip_prefix("CARGO_FEATURE_")
+                .map(str::to_owned)
+        })
+        .map(|feature| feature.to_ascii_lowercase().replace('_', "-"))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn resolved_sms(sm_targets: &[SmSpec]) -> String {
+    sm_targets
+        .iter()
+        .map(|spec| format!("sm_{}{}", spec.sm, if spec.ptx { "+ptx" } else { "" }))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn required_symbols(capabilities: &BTreeSet<String>) -> Vec<&'static str> {
+    let mut symbols = PREBUILT_REQUIRED_DSV4_SYMBOLS.to_vec();
+    if capabilities.contains("fa3") {
+        symbols.push("arle_fa3_real_kernel_marker_cuda");
+    }
+    symbols.sort_unstable();
+    symbols
+}
+
+fn archive_symbols(archive: &Path) -> BTreeSet<String> {
     let output = Command::new("nm")
-        .arg("-g")
+        .args(["-g", "--defined-only"])
         .arg(archive)
         .output()
         .unwrap_or_else(|err| panic!("Failed to run nm for {}: {err}", archive.display()));
@@ -1871,112 +1987,366 @@ fn validate_cuda_archive_has_symbol(archive: &Path, symbol: &str, context: &str)
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    let symbols = String::from_utf8_lossy(&output.stdout);
-    if !symbols.contains(symbol) {
-        panic!(
-            "CUDA archive {} is missing required symbol {symbol} ({context}). \
-             This usually means a stale FlashMLA stub object was linked instead of the real shim.",
-            archive.display()
-        );
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.split_whitespace().last())
+        .map(str::to_string)
+        .collect()
+}
+
+fn validate_archive_symbols(archive: &Path, required: &[&str]) {
+    let symbols = archive_symbols(archive);
+    let missing = required
+        .iter()
+        .copied()
+        .filter(|symbol| !symbols.contains(*symbol))
+        .collect::<Vec<_>>();
+    assert!(
+        missing.is_empty(),
+        "CUDA archive {} is missing required symbols: {}",
+        archive.display(),
+        missing.join(", ")
+    );
+}
+
+fn validate_archive_symbol(archive: &Path, symbol: &str, context: &str) {
+    assert!(
+        archive_symbols(archive).contains(symbol),
+        "CUDA archive {} is missing required symbol {symbol} ({context})",
+        archive.display()
+    );
+}
+
+fn collect_input_files(path: &Path, files: &mut Vec<PathBuf>) {
+    if path.is_file() {
+        files.push(path.to_path_buf());
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let entry_path = entry.path();
+        if entry_path
+            .file_name()
+            .is_some_and(|name| name == "generated")
+        {
+            continue;
+        }
+        if entry_path.is_dir() {
+            collect_input_files(&entry_path, files);
+        } else if entry_path.is_file() {
+            files.push(entry_path);
+        }
     }
 }
 
-fn link_prebuilt_cuda_artifacts(prebuilt_dir: &Path, cuda_path: &str) {
-    println!("cargo:rerun-if-changed=build.rs");
-    let required = ["libkernels_cuda.a", "libtilelang_kernels_aot.a"];
-    for lib in required {
-        let path = prebuilt_dir.join(lib);
-        if !path.is_file() {
-            panic!(
-                "ARLE_CUDA_KERNELS_PREBUILT_DIR={} is missing required artifact {lib}",
-                prebuilt_dir.display()
-            );
-        }
-        println!("cargo:rerun-if-changed={}", path.display());
+fn hash_input_root(digest: &mut ring::digest::Context, label: &str, root: &Path) {
+    let mut files = Vec::new();
+    collect_input_files(root, &mut files);
+    files.sort();
+    for file in files {
+        let relative = file.strip_prefix(root).unwrap_or(&file);
+        digest.update(label.as_bytes());
+        digest.update(b"/");
+        digest.update(relative.to_string_lossy().as_bytes());
+        digest.update(b"\0");
+        digest.update(sha256_file(&file).as_bytes());
+        digest.update(b"\n");
     }
-    let manifest = prebuilt_dir.join("arle-cuda-kernels.manifest");
-    if !manifest.is_file() {
+}
+
+fn producer_inputs_sha256() -> String {
+    let crate_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+    let repo_root = crate_dir.parent().and_then(Path::parent).unwrap();
+    let mut roots = vec![
+        ("workspace-cargo", repo_root.join("Cargo.toml")),
+        ("workspace-lock", repo_root.join("Cargo.lock")),
+        (
+            "requirements-build",
+            repo_root.join("requirements-build.txt"),
+        ),
+        ("cuda-cargo", crate_dir.join("Cargo.toml")),
+        ("cuda-build", crate_dir.join("build.rs")),
+        ("cuda-registry", crate_dir.join("kernels.toml")),
+        ("cuda-csrc", crate_dir.join("csrc")),
+        ("cuda-rust", crate_dir.join("src")),
+        ("cuda-tools", crate_dir.join("tools")),
+        ("cuda-vendor", crate_dir.join("vendor")),
+    ];
+    for (env, label) in [
+        ("ARLE_DEEPGEMM_ROOT", "deepgemm"),
+        ("ARLE_DEEPGEMM_LIBRARY_ROOT", "deepgemm-library"),
+        ("ARLE_DEEPGEMM_CUTLASS_INCLUDE", "deepgemm-cutlass"),
+        ("ARLE_DEEPEP_DIR", "deepep"),
+        ("ARLE_DEEPEP_NVSHMEM_DIR", "nvshmem"),
+    ] {
+        if let Some(path) = env_nonempty(env) {
+            roots.push((label, PathBuf::from(path)));
+        }
+    }
+    let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
+    for (label, root) in roots {
+        hash_input_root(&mut digest, label, &root);
+    }
+    hex_digest(digest.finish().as_ref())
+}
+
+fn configured_capabilities(sm_targets: &[SmSpec]) -> BTreeSet<String> {
+    let legacy_volta = has_legacy_volta(sm_targets);
+    let mut capabilities = BTreeSet::new();
+    if Path::new("vendor/flashmla").is_dir()
+        && !env_flag("ARLE_CUDA_DISABLE_FLASHMLA")
+        && !legacy_volta
+    {
+        capabilities.insert("flashmla".into());
+    }
+    if env_flag("ARLE_CUDA_ENABLE_FA3") && Path::new("vendor/flash-attention/hopper").is_dir() {
+        capabilities.insert("fa3".into());
+    }
+    let deepgemm_root = env_nonempty("ARLE_DEEPGEMM_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("vendor/deepgemm"));
+    let deepgemm_library = env_nonempty("ARLE_DEEPGEMM_LIBRARY_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| deepgemm_root.join("deep_gemm"));
+    let deepgemm_cutlass = env_nonempty("ARLE_DEEPGEMM_CUTLASS_INCLUDE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| deepgemm_root.join("third-party/cutlass/include"));
+    if !env_flag("ARLE_CUDA_DISABLE_DEEPGEMM_NATIVE")
+        && sm_targets.iter().any(|spec| spec.sm == "90")
+        && deepgemm_library.is_dir()
+        && deepgemm_cutlass.join("cutlass/arch/barrier.h").is_file()
+    {
+        capabilities.insert("deepgemm-native".into());
+    }
+    if std::env::var_os("CARGO_FEATURE_NCCL").is_some() {
+        capabilities.insert("nccl".into());
+    }
+    if env_nonempty("ARLE_DEEPEP_DIR").is_some() {
+        capabilities.insert("deepep-sidecar".into());
+    }
+    capabilities
+}
+
+fn producer_contract(
+    cuda_path: &str,
+    sm_targets: &[SmSpec],
+    capabilities: &BTreeSet<String>,
+) -> BTreeMap<String, String> {
+    let nvcc = format!("{cuda_path}/bin/nvcc");
+    BTreeMap::from([
+        ("schema".into(), PREBUILT_SCHEMA.into()),
+        ("package".into(), "cuda-kernels".into()),
+        ("cargo_features".into(), cargo_features()),
+        (
+            "profile".into(),
+            std::env::var("PROFILE").unwrap_or_default(),
+        ),
+        ("target".into(), std::env::var("TARGET").unwrap_or_default()),
+        ("host".into(), std::env::var("HOST").unwrap_or_default()),
+        ("resolved_sm".into(), resolved_sms(sm_targets)),
+        (
+            "build.ARLE_CUDA_ENABLE_FLASHQLA_GDR".into(),
+            env_flag("ARLE_CUDA_ENABLE_FLASHQLA_GDR").to_string(),
+        ),
+        (
+            "capabilities".into(),
+            capabilities.iter().cloned().collect::<Vec<_>>().join(","),
+        ),
+        ("inputs_sha256".into(), producer_inputs_sha256()),
+        ("toolchain.nvcc".into(), command_id(&nvcc, &["--version"])),
+        (
+            "toolchain.host_compiler".into(),
+            command_id(
+                &std::env::var("NVCC_CCBIN").unwrap_or_else(|_| "g++".into()),
+                &["--version"],
+            ),
+        ),
+        ("toolchain.ar".into(), command_id("ar", &["--version"])),
+        ("toolchain.rustc".into(), command_id("rustc", &["-vV"])),
+        (
+            "required_symbols".into(),
+            required_symbols(capabilities).join(","),
+        ),
+    ])
+}
+
+fn parse_manifest(path: &Path) -> BTreeMap<String, String> {
+    let text = std::fs::read_to_string(path)
+        .unwrap_or_else(|err| panic!("Failed to read {}: {err}", path.display()));
+    let mut fields = BTreeMap::new();
+    for (index, line) in text.lines().enumerate() {
+        let (key, value) = line.split_once('=').unwrap_or_else(|| {
+            panic!(
+                "Malformed CUDA prebuilt manifest line {}:{}: {line}",
+                path.display(),
+                index + 1
+            )
+        });
+        assert!(
+            !key.is_empty() && fields.insert(key.to_string(), value.to_string()).is_none(),
+            "Duplicate or empty CUDA prebuilt manifest key {}:{}: {key}",
+            path.display(),
+            index + 1
+        );
+    }
+    fields
+}
+
+fn write_producer_manifest(
+    out_dir: &Path,
+    cuda_path: &str,
+    sm_targets: &[SmSpec],
+    capabilities: &BTreeSet<String>,
+) {
+    let required = required_symbols(capabilities);
+    validate_archive_symbols(&out_dir.join("libkernels_cuda.a"), &required);
+    let mut manifest = producer_contract(cuda_path, sm_targets, capabilities);
+    for name in PREBUILT_ARTIFACTS {
+        let path = out_dir.join(name);
+        if path.is_file() {
+            manifest.insert(
+                format!("artifact.{name}.size"),
+                path.metadata().unwrap().len().to_string(),
+            );
+            manifest.insert(format!("artifact.{name}.sha256"), sha256_file(&path));
+        }
+    }
+    let identity = manifest
+        .iter()
+        .map(|(key, value)| format!("{key}={value}\n"))
+        .collect::<String>();
+    manifest.insert(
+        "kernel_build_id".into(),
+        format!("bundle:{}", sha256_bytes(identity.as_bytes())),
+    );
+    let text = manifest
+        .iter()
+        .map(|(key, value)| format!("{key}={value}\n"))
+        .collect::<String>();
+    std::fs::write(out_dir.join(PREBUILT_MANIFEST), text).expect("write CUDA producer manifest");
+    emit_kernel_build_identity(out_dir, &manifest);
+}
+
+fn verify_prebuilt_manifest(
+    prebuilt_dir: &Path,
+    cuda_path: &str,
+    sm_targets: &[SmSpec],
+    capabilities: &BTreeSet<String>,
+) -> BTreeMap<String, String> {
+    let path = prebuilt_dir.join(PREBUILT_MANIFEST);
+    if !path.is_file() {
         panic!(
-            "ARLE_CUDA_KERNELS_PREBUILT_DIR={} is missing arle-cuda-kernels.manifest",
+            "ARLE_CUDA_KERNELS_PREBUILT_DIR={} is missing {PREBUILT_MANIFEST}",
             prebuilt_dir.display()
         );
     }
-    println!("cargo:rerun-if-changed={}", manifest.display());
-    validate_prebuilt_manifest(&manifest);
-    emit_kernel_build_identity(
-        &PathBuf::from(std::env::var("OUT_DIR").unwrap()),
-        Some(prebuilt_dir),
-    );
-    validate_prebuilt_cuda_archive_symbols(&prebuilt_dir.join("libkernels_cuda.a"));
-    // The prebuilt fast-build path returns before the normal-build cfg emission,
-    // so set `arle_flashmla` here too — otherwise `cuda_kernels::HAS_FLASHMLA` is
-    // false for a valid prebuilt and DSv4 loses FlashMLA (codex P1). `validate_*`
-    // above mandates the real FlashMLA marker, which is real-only (the stub omits
-    // it), so a linked prebuilt has real FlashMLA. (DeepGEMM uses a runtime
-    // preflight probe, not a cfg — nothing to set here, and a stub can't be
-    // misreported.)
-    println!("cargo:rustc-cfg=arle_flashmla");
+    println!("cargo:rerun-if-changed={}", path.display());
+    let manifest = parse_manifest(&path);
+    let expected = producer_contract(cuda_path, sm_targets, capabilities);
+    for (key, value) in expected {
+        assert_eq!(
+            manifest.get(&key),
+            Some(&value),
+            "CUDA prebuilt producer contract mismatch for {key}; rebuild the bundle"
+        );
+    }
+    for name in PREBUILT_ARTIFACTS {
+        let size_key = format!("artifact.{name}.size");
+        let hash_key = format!("artifact.{name}.sha256");
+        let expected_size = manifest.get(&size_key);
+        let expected_hash = manifest.get(&hash_key);
+        let path = prebuilt_dir.join(name);
+        if *name == "arle_deepep_sidecar" && expected_size.is_none() && expected_hash.is_none() {
+            assert!(
+                !path.exists(),
+                "CUDA prebuilt sidecar exists but is absent from the manifest"
+            );
+            continue;
+        }
+        let expected_size =
+            expected_size.unwrap_or_else(|| panic!("CUDA prebuilt manifest lacks {size_key}"));
+        assert!(
+            expected_hash.is_some(),
+            "CUDA prebuilt manifest lacks {hash_key}"
+        );
+        assert!(
+            path.is_file(),
+            "CUDA prebuilt artifact missing: {}",
+            path.display()
+        );
+        assert_eq!(
+            path.metadata().unwrap().len().to_string(),
+            *expected_size,
+            "CUDA prebuilt artifact size mismatch: {name}"
+        );
+        assert_eq!(
+            manifest.get(&hash_key),
+            Some(&sha256_file(&path)),
+            "CUDA prebuilt artifact hash mismatch: {name}"
+        );
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
+    let symbols = manifest
+        .get("required_symbols")
+        .map(|value| {
+            value
+                .split(',')
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    validate_archive_symbols(&prebuilt_dir.join("libkernels_cuda.a"), &symbols);
+    manifest
+}
+
+fn link_prebuilt_cuda_artifacts(
+    prebuilt_dir: &Path,
+    cuda_path: &str,
+    sm_targets: &[SmSpec],
+    capabilities: &BTreeSet<String>,
+    out_dir: &Path,
+) {
+    println!("cargo:rerun-if-changed=build.rs");
+    let manifest = verify_prebuilt_manifest(prebuilt_dir, cuda_path, sm_targets, capabilities);
+    emit_kernel_build_identity(out_dir, &manifest);
+    if capabilities.contains("flashmla") {
+        println!("cargo:rustc-cfg=arle_flashmla");
+    }
     println!("cargo:rustc-link-search=native={}", prebuilt_dir.display());
     println!("cargo:rustc-link-lib=static=kernels_cuda");
     println!("cargo:rustc-link-lib=static=tilelang_kernels_aot");
     emit_cuda_system_link_libs(cuda_path);
-    if let Some(sidecar) = env_nonempty("ARLE_DEEPEP_SIDECAR_PREBUILT") {
-        emit_prebuilt_deepep_sidecar(Path::new(&sidecar));
-    } else {
-        let sidecar = prebuilt_dir.join("arle_deepep_sidecar");
-        if sidecar.is_file() {
-            emit_prebuilt_deepep_sidecar(&sidecar);
-        } else if env_nonempty("ARLE_DEEPEP_DIR").is_some() {
-            panic!(
-                "ARLE_CUDA_KERNELS_PREBUILT_DIR={} is missing arle_deepep_sidecar while ARLE_DEEPEP_DIR is set. \
-                 Rebuild the DSv4 prebuilt artifacts with DeepEP enabled.",
-                prebuilt_dir.display()
-            );
-        }
+    let sidecar = env_nonempty("ARLE_DEEPEP_SIDECAR_PREBUILT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| prebuilt_dir.join("arle_deepep_sidecar"));
+    if sidecar.is_file() {
+        emit_prebuilt_deepep_sidecar(&sidecar);
+    } else if env_nonempty("ARLE_DEEPEP_DIR").is_some() {
+        panic!(
+            "ARLE_CUDA_KERNELS_PREBUILT_DIR={} is missing arle_deepep_sidecar while ARLE_DEEPEP_DIR is set",
+            prebuilt_dir.display()
+        );
     }
     println!(
-        "cargo:warning=Using prebuilt CUDA kernel artifacts from {}; skipping nvcc and TileLang AOT.",
+        "cargo:warning=Using verified prebuilt CUDA kernel artifacts from {}; skipping nvcc and TileLang AOT.",
         prebuilt_dir.display()
     );
 }
 
-fn validate_prebuilt_manifest(manifest: &Path) {
-    let crate_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
-    let repo_root = crate_dir
-        .parent()
-        .and_then(Path::parent)
-        .expect("cuda-kernels is under <repo>/crates");
-    let producer = repo_root.join("scripts/cuda_prebuilt_manifest.sh");
-    println!("cargo:rerun-if-changed={}", producer.display());
-    let output = Command::new("bash")
-        .args([
-            "-c",
-            "source \"$1\"; cuda_prebuilt_manifest",
-            "cuda-prebuilt-manifest",
-        ])
-        .arg(&producer)
-        .current_dir(repo_root)
-        .output()
-        .unwrap_or_else(|err| panic!("Failed to run {}: {err}", producer.display()));
-    if !output.status.success() {
-        panic!(
-            "Failed to produce canonical CUDA prebuilt manifest: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    let actual = std::fs::read(manifest)
-        .unwrap_or_else(|err| panic!("Failed to read {}: {err}", manifest.display()));
-    if actual != output.stdout {
-        panic!(
-            "ARLE_CUDA_KERNELS_PREBUILT_DIR manifest does not match current source/toolchain inputs. \
-             Rebuild the prebuilt CUDA artifacts."
-        );
-    }
+fn hex_digest(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    bytes.iter().fold(
+        String::with_capacity(bytes.len() * 2),
+        |mut output, byte| {
+            write!(output, "{byte:02x}").expect("writing to String is infallible");
+            output
+        },
+    )
 }
 
 fn sha256_file(path: &Path) -> String {
-    use std::fmt::Write as _;
-
     let mut file = File::open(path)
         .unwrap_or_else(|err| panic!("Failed to open {} for hashing: {err}", path.display()));
     let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
@@ -1990,56 +2360,17 @@ fn sha256_file(path: &Path) -> String {
         }
         digest.update(&buffer[..read]);
     }
-    digest
-        .finish()
-        .as_ref()
-        .iter()
-        .fold(String::with_capacity(64), |mut output, byte| {
-            write!(output, "{byte:02x}").expect("writing to String is infallible");
-            output
-        })
+    hex_digest(digest.finish().as_ref())
 }
 
-fn emit_kernel_build_identity(out_dir: &Path, prebuilt_dir: Option<&Path>) {
-    use std::fmt::Write as _;
-
-    let id = prebuilt_dir.map_or_else(
-        || "unreported".to_string(),
-        |dir| {
-            let manifest = dir.join("arle-cuda-kernels.manifest");
-            let mut identity = format!("manifest\t{}\n", sha256_file(&manifest));
-            let external_sidecar = env_nonempty("ARLE_DEEPEP_SIDECAR_PREBUILT");
-            for (name, path) in [
-                ("libkernels_cuda.a", dir.join("libkernels_cuda.a")),
-                (
-                    "libtilelang_kernels_aot.a",
-                    dir.join("libtilelang_kernels_aot.a"),
-                ),
-                (
-                    "arle_deepep_sidecar",
-                    external_sidecar
-                        .map(PathBuf::from)
-                        .unwrap_or_else(|| dir.join("arle_deepep_sidecar")),
-                ),
-            ] {
-                if path.is_file() {
-                    writeln!(identity, "{name}\t{}", sha256_file(&path))
-                        .expect("writing to String is infallible");
-                    println!("cargo:rerun-if-changed={}", path.display());
-                }
-            }
-            let digest = ring::digest::digest(&ring::digest::SHA256, identity.as_bytes());
-            let hash =
-                digest
-                    .as_ref()
-                    .iter()
-                    .fold(String::with_capacity(64), |mut output, byte| {
-                        write!(output, "{byte:02x}").expect("writing to String is infallible");
-                        output
-                    });
-            format!("bundle:{hash}")
-        },
-    );
+fn emit_kernel_build_identity(out_dir: &Path, manifest: &BTreeMap<String, String>) {
+    let id = manifest.get("kernel_build_id").cloned().unwrap_or_else(|| {
+        let identity = manifest
+            .iter()
+            .map(|(key, value)| format!("{key}={value}\n"))
+            .collect::<String>();
+        format!("bundle:{}", sha256_bytes(identity.as_bytes()))
+    });
     std::fs::write(
         out_dir.join("kernel_build_identity.rs"),
         format!("pub const KERNEL_BUILD_ID: &str = {id:?};\n"),
@@ -2138,7 +2469,16 @@ fn main() {
     let registry = load_registry();
     let early_out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     emit_ffi_generated(&registry, &early_out_dir);
-    emit_kernel_build_identity(&early_out_dir, None);
+    std::fs::write(
+        early_out_dir.join("kernel_build_identity.rs"),
+        "pub const KERNEL_BUILD_ID: &str = \"not-built\";\n",
+    )
+    .expect("write initial kernel build identity");
+    println!("cargo:rerun-if-env-changed=ARLE_TILELANG_TOOLCHAIN_PROBE_SELF_TEST");
+    if env_truthy("ARLE_TILELANG_TOOLCHAIN_PROBE_SELF_TEST") {
+        run_tilelang_toolchain_probe_self_test(&early_out_dir);
+        println!("cargo:warning=TileLang toolchain probe self-test passed");
+    }
     println!("cargo:rerun-if-env-changed=ARLE_TILELANG_CACHE_ID_SELF_TEST");
     if env_truthy("ARLE_TILELANG_CACHE_ID_SELF_TEST") {
         run_tilelang_cache_identity_self_test(&registry, &early_out_dir);
@@ -2169,8 +2509,18 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
     println!("cargo:rerun-if-env-changed=ARLE_CUDA_KERNELS_PREBUILT_DIR");
     println!("cargo:rerun-if-env-changed=ARLE_DEEPEP_SIDECAR_PREBUILT");
+    let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    let sm_targets = detect_sm_targets();
+    validate_sm_set(&sm_targets);
     if let Some(prebuilt_dir) = env_nonempty("ARLE_CUDA_KERNELS_PREBUILT_DIR") {
-        link_prebuilt_cuda_artifacts(Path::new(&prebuilt_dir), &cuda_path);
+        let capabilities = configured_capabilities(&sm_targets);
+        link_prebuilt_cuda_artifacts(
+            Path::new(&prebuilt_dir),
+            &cuda_path,
+            &sm_targets,
+            &capabilities,
+            &out_dir,
+        );
         return;
     }
 
@@ -2180,10 +2530,7 @@ fn main() {
     let nvcc_split_compile = env_nonempty("ARLE_NVCC_SPLIT_COMPILE");
 
     let nvcc = format!("{}/bin/nvcc", cuda_path);
-    let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
-    let sm_targets = detect_sm_targets();
     let legacy_volta_build = has_legacy_volta(&sm_targets);
-    validate_sm_set(&sm_targets);
     let arch_args = nvcc_arch_args(&sm_targets);
     println!(
         "cargo:warning=Compiling CUDA kernels for targets: {}",
@@ -2316,7 +2663,9 @@ fn main() {
     let fa3_root = Path::new("vendor/flash-attention");
     let fa3_stub = Path::new("csrc/attention/arle_fa3_stubs.cu");
     let fa3_shim = Path::new("csrc/attention/arle_fa3_shim.cu");
-    let enable_fa3 = env_flag("ARLE_CUDA_ENABLE_FA3") && fa3_root.join("hopper").is_dir();
+    let enable_fa3 = env_flag("ARLE_CUDA_ENABLE_FA3")
+        && fa3_root.join("hopper").is_dir()
+        && sm_targets.iter().any(|target| target.sm == "90");
     // Exactly one implementation of the FA3 FFI symbols may reach the archive
     // (same single-definition rule as the FlashMLA stub handling above).
     cu_files.retain(|p| p != fa3_stub);
@@ -2604,7 +2953,7 @@ fn main() {
     assert!(status.success(), "ar failed");
 
     if enable_flashmla {
-        validate_cuda_archive_has_symbol(
+        validate_archive_symbol(
             &cuda_lib,
             "arle_flashmla_sm90_sparse_decode_real_kernel_marker_cuda",
             "real FlashMLA sparse decode shim",
@@ -2612,7 +2961,7 @@ fn main() {
     }
 
     if enable_fa3 {
-        validate_cuda_archive_has_symbol(
+        validate_archive_symbol(
             &cuda_lib,
             "arle_fa3_real_kernel_marker_cuda",
             "real FA3 hd256 fwd shim (ARLE_CUDA_ENABLE_FA3 build)",
@@ -2639,6 +2988,24 @@ fn main() {
         nvcc_wrapper.as_deref(),
         nvcc_split_compile.as_deref(),
     );
+
+    let mut capabilities = BTreeSet::new();
+    if enable_flashmla {
+        capabilities.insert("flashmla".into());
+    }
+    if enable_fa3 {
+        capabilities.insert("fa3".into());
+    }
+    if enable_deepgemm_native {
+        capabilities.insert("deepgemm-native".into());
+    }
+    if std::env::var_os("CARGO_FEATURE_NCCL").is_some() {
+        capabilities.insert("nccl".into());
+    }
+    if out_dir.join("arle_deepep_sidecar").is_file() {
+        capabilities.insert("deepep-sidecar".into());
+    }
+    write_producer_manifest(&out_dir, &cuda_path, &sm_targets, &capabilities);
 
     // Recursive watch — `rerun-if-changed=csrc/` alone only watches the
     // immediate dir entries; subdirectory `.cu`/`.cuh`/`.h` edits would be

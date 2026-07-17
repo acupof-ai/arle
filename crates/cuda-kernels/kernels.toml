@@ -248,7 +248,9 @@ rust = []
 
 # ===========================================================================
 # BF16 prefill (paged_attn_v1) — kernel_family "attention".
-# allow_sm70: HD128 q32/q40 + HD256 q8_kv2/q16_kv4 (Qwen3.5 dense subset incl. 0.8B).
+# allow_sm70: all HD128 + HD256 BF16 configs (Qwen3.5/3.6 dense + MoE,
+#   incl. 0.8B/1.7B/27B/35B-A3B). FP8 kernels stay sm_80+ (Volta has no FP8
+#   compute). HD64 stays sm_80+ (no Qwen3 model uses it).
 # ===========================================================================
 
 [[kernel]]
@@ -262,7 +264,7 @@ py_module = "tools/tilelang/batch_prefill_paged_hd128.py"
 artifact_dir = "batch_prefill_paged_hd128_q16_kv8"
 kernel_name = "tilelang_batch_prefill_paged_hd128_q16_kv8_run"
 out_name = "tilelang_batch_prefill_paged_hd128_q16_kv8"
-allow_sm70 = false
+allow_sm70 = true
 ffi = true
 
 [[kernel]]
@@ -304,7 +306,7 @@ py_module = "tools/tilelang/batch_prefill_paged_hd128.py"
 artifact_dir = "batch_prefill_paged_hd128_q64_kv8"
 kernel_name = "tilelang_batch_prefill_paged_hd128_q64_kv8_run"
 out_name = "tilelang_batch_prefill_paged_hd128_q64_kv8"
-allow_sm70 = false
+allow_sm70 = true
 ffi = true
 
 [[kernel]]
@@ -318,7 +320,7 @@ py_module = "tools/tilelang/batch_prefill_paged_hd256.py"
 artifact_dir = "batch_prefill_paged_hd256_q8_kv1"
 kernel_name = "tilelang_batch_prefill_paged_hd256_q8_kv1_run"
 out_name = "tilelang_batch_prefill_paged_hd256_q8_kv1"
-allow_sm70 = false
+allow_sm70 = true
 ffi = true
 
 [[kernel]]
@@ -346,7 +348,7 @@ py_module = "tools/tilelang/batch_prefill_paged_hd256.py"
 artifact_dir = "batch_prefill_paged_hd256_q16_kv2"
 kernel_name = "tilelang_batch_prefill_paged_hd256_q16_kv2_run"
 out_name = "tilelang_batch_prefill_paged_hd256_q16_kv2"
-allow_sm70 = false
+allow_sm70 = true
 ffi = true
 
 [[kernel]]
@@ -377,7 +379,7 @@ py_module = "tools/tilelang/batch_prefill_paged_hd256.py"
 artifact_dir = "batch_prefill_paged_hd256_q24_kv4"
 kernel_name = "tilelang_batch_prefill_paged_hd256_q24_kv4_run"
 out_name = "tilelang_batch_prefill_paged_hd256_q24_kv4"
-allow_sm70 = false
+allow_sm70 = true
 ffi = true
 
 [[kernel]]
@@ -409,7 +411,7 @@ py_module = "tools/tilelang/batch_decode_paged_hd256.py"
 artifact_dir = "batch_decode_paged_hd256_q8_kv1"
 kernel_name = "tilelang_batch_decode_paged_hd256_q8_kv1_run"
 out_name = "tilelang_batch_decode_paged_hd256_q8_kv1"
-allow_sm70 = false
+allow_sm70 = true
 ffi = true
 
 [[kernel]]
@@ -437,7 +439,7 @@ py_module = "tools/tilelang/batch_decode_paged_hd256.py"
 artifact_dir = "batch_decode_paged_hd256_q16_kv2"
 kernel_name = "tilelang_batch_decode_paged_hd256_q16_kv2_run"
 out_name = "tilelang_batch_decode_paged_hd256_q16_kv2"
-allow_sm70 = false
+allow_sm70 = true
 ffi = true
 
 [[kernel]]
@@ -468,7 +470,7 @@ py_module = "tools/tilelang/batch_decode_paged_hd256.py"
 artifact_dir = "batch_decode_paged_hd256_q24_kv4"
 kernel_name = "tilelang_batch_decode_paged_hd256_q24_kv4_run"
 out_name = "tilelang_batch_decode_paged_hd256_q24_kv4"
-allow_sm70 = false
+allow_sm70 = true
 ffi = true
 
 [[kernel]]
@@ -482,7 +484,7 @@ py_module = "tools/tilelang/batch_decode_paged_hd128.py"
 artifact_dir = "batch_decode_paged_hd128_q16_kv8"
 kernel_name = "tilelang_batch_decode_paged_hd128_q16_kv8_run"
 out_name = "tilelang_batch_decode_paged_hd128_q16_kv8"
-allow_sm70 = false
+allow_sm70 = true
 ffi = true
 
 [[kernel]]
@@ -524,7 +526,7 @@ py_module = "tools/tilelang/batch_decode_paged_hd128.py"
 artifact_dir = "batch_decode_paged_hd128_q64_kv8"
 kernel_name = "tilelang_batch_decode_paged_hd128_q64_kv8_run"
 out_name = "tilelang_batch_decode_paged_hd128_q64_kv8"
-allow_sm70 = false
+allow_sm70 = true
 ffi = true
 
 [[kernel]]
@@ -559,7 +561,7 @@ py_module = "tools/tilelang/batch_decode_paged_hd128.py"
 artifact_dir = "batch_decode_paged_hd128_split_partial_q16_kv8"
 kernel_name = "tilelang_batch_decode_paged_hd128_split_partial_q16_kv8_run"
 out_name = "tilelang_batch_decode_paged_hd128_split_partial_q16_kv8"
-allow_sm70 = false
+allow_sm70 = true
 ffi = true
 
 [[kernel]]
@@ -604,7 +606,7 @@ py_module = "tools/tilelang/batch_decode_paged_hd128.py"
 artifact_dir = "batch_decode_paged_hd128_split_partial_q64_kv8"
 kernel_name = "tilelang_batch_decode_paged_hd128_split_partial_q64_kv8_run"
 out_name = "tilelang_batch_decode_paged_hd128_split_partial_q64_kv8"
-allow_sm70 = false
+allow_sm70 = true
 ffi = true
 
 [[kernel]]
@@ -619,7 +621,7 @@ py_module = "tools/tilelang/batch_decode_paged_hd128.py"
 artifact_dir = "batch_decode_paged_hd128_split_merge_q16_kv8"
 kernel_name = "tilelang_batch_decode_paged_hd128_split_merge_q16_kv8_run"
 out_name = "tilelang_batch_decode_paged_hd128_split_merge_q16_kv8"
-allow_sm70 = false
+allow_sm70 = true
 ffi = true
 
 [[kernel]]
@@ -664,7 +666,7 @@ py_module = "tools/tilelang/batch_decode_paged_hd128.py"
 artifact_dir = "batch_decode_paged_hd128_split_merge_q64_kv8"
 kernel_name = "tilelang_batch_decode_paged_hd128_split_merge_q64_kv8_run"
 out_name = "tilelang_batch_decode_paged_hd128_split_merge_q64_kv8"
-allow_sm70 = false
+allow_sm70 = true
 ffi = true
 
 # ===========================================================================
