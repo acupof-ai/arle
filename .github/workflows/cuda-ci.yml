@@ -6,8 +6,18 @@ on:
   # would queue forever and get cancel-in-progress'd by the next push. Re-enable
   # the `push` / `pull_request` blocks (see git history) once a runner is back.
   workflow_dispatch:
+    inputs:
+      kernel_candidate_run_id:
+        description: Kernels Publish run containing kernel-bundle-candidate; blank runs checks only
+        required: false
+        type: string
+      model_path:
+        description: Qwen3.6 model path for the kernel correctness gate
+        required: false
+        type: string
 
 permissions:
+  actions: read
   contents: read
 
 env:
@@ -59,4 +69,65 @@ jobs:
           cargo test -p arle --release
           --no-default-features --features cuda,no-cuda,cli
           --test cli_smoke
+
+      - name: Download kernel candidate
+        if: ${{ inputs.kernel_candidate_run_id != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh run download "${{ inputs.kernel_candidate_run_id }}" -n kernel-bundle-candidate -D /tmp/kernel-candidate
+
+      - name: Run kernel correctness gate
+        if: ${{ inputs.kernel_candidate_run_id != '' }}
+        env:
+          MODEL: ${{ inputs.model_path }}
+          GATE_PROFILE: generic
+          LENGTHS: '115,300,446,2000,8000'
+          RUNS: '3'
+          TORCH_CUDA_ARCH_LIST: '8.0;8.6;8.9;9.0'
+          ARLE_CUDA_KERNEL_CACHE: '0'
+          ARLE_CUDA_ENABLE_FA3: '1'
+          INFER_TILELANG_PYTHON: /usr/bin/false
+          CARGO_TARGET_DIR: /tmp/kernel-candidate-target
+        run: |
+          test -n "$MODEL"
+          rm -rf "$CARGO_TARGET_DIR"
+          scripts/kernel_artifacts.sh fetch /tmp/kernel-candidate
+          CANDIDATE="$(compgen -G '/tmp/kernel-candidate/arle-kernels-t1-*.tar.gz')"
+          CANDIDATE_SHA="$(sha256sum "$CANDIDATE" | cut -d' ' -f1)"
+          BUNDLE_ID="$(jq -er '.bundle_id' crates/cuda-kernels/generated/manifest.json)"
+          test "$BUNDLE_ID" = "$(scripts/kernel_artifacts.sh id)"
+          cargo build --release --features cuda -p arle --bin arle
+          TESTED_SM="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -n1)"
+          case "$TESTED_SM" in 8.0|8.6|8.9|9.0) ;; *) echo "unsupported tested SM: $TESTED_SM" >&2; exit 1;; esac
+          BIN="$CARGO_TARGET_DIR/release/arle" scripts/lever_gate.sh kernel-correctness
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          text = Path("needle_gate_kernel-correctness.log").read_text()
+          if "ERROR" in text:
+              raise SystemExit("needle gate reported request errors")
+          expected = {int(value) for value in os.environ["LENGTHS"].split(",")}
+          runs = int(os.environ["RUNS"])
+          rows = re.findall(r"^SUMMARY len=(\d+).* exact=(\d+) partial=(\d+) miss=(\d+) ", text, re.M)
+          if {int(row[0]) for row in rows} != expected or len(rows) != len(expected):
+              raise SystemExit("needle gate summaries do not match requested lengths")
+          for length, exact, partial, miss in rows:
+              if int(exact) != runs or int(partial) or int(miss):
+                  raise SystemExit(f"needle gate failed at length {length}")
+          PY
+          jq -n --arg bundle "$BUNDLE_ID" --arg source_commit "$GITHUB_SHA" \
+            --arg artifact_sha256 "$CANDIDATE_SHA" --arg tested_sm "$TESTED_SM" \
+            '{schema:2,status:"passed",bundle_id:$bundle,source_commit:$source_commit,artifact_sha256:$artifact_sha256,tested_sms:[$tested_sm],capabilities:["fa3"]}' \
+            > correctness-evidence.json
+
+      - name: Upload kernel correctness evidence
+        if: ${{ inputs.kernel_candidate_run_id != '' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: kernel-correctness
+          path: |
+            correctness-evidence.json
+            needle_gate_kernel-correctness.log
 

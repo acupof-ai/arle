@@ -315,6 +315,12 @@ and correctness status.
 
 Rules:
 
+- correctness status is the closed enum `not-run | passed | failed`;
+- local packing may record `not-run`; publish and formal fetch require `passed`;
+- passed evidence is immutable JSON bound to bundle ID, GPU-tested commit, and tested candidate archive SHA-256, with its own SHA-256 in the manifest;
+- kernel build/pack success never publishes by itself; only the qualified workflow path publishes;
+- a qualified bundle may serve a later descendant commit only when the exact bundle ID is unchanged;
+- formal release checks only `release-blockers.json`, never historical docs;
 - hash-named assets are immutable;
 - CI and product release fetch only the exact expected ID;
 - mutable `latest` is removed after one compatibility release;

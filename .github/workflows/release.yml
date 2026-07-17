@@ -18,9 +18,25 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  qualify-release:
+    name: Validate release identity and evidence
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Validate tag, blockers, product, and kernel evidence
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: scripts/validate_release.sh "${{ github.ref_name }}"
+
   # ── macOS arm64: Metal/MLX backend ──────────────────────────────────────────
   build-macos:
     name: Build macOS arm64 (Metal)
+    needs: qualify-release
     runs-on: macos-14
 
     steps:
@@ -66,6 +82,7 @@ jobs:
   # ── Linux x86_64: CUDA backend ───────────────────────────────────────────────
   build-linux:
     name: Build Linux x86_64 (CUDA)
+    needs: qualify-release
     runs-on: ubuntu-22.04
 
     steps:
@@ -85,7 +102,7 @@ jobs:
         # asset. Missing content fails; release builds never consume `latest`.
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: scripts/kernel_artifacts.sh fetch
+        run: scripts/kernel_artifacts.sh fetch-qualified
 
       - name: Cache cargo registry
         uses: actions/cache@v6
@@ -105,6 +122,7 @@ jobs:
           # T1 set: sm_80 (A100) + sm_86 (A10/3090) + sm_89 (L4/4090) + sm_90 (H100).
           # See docs/plans/sm-coverage.md for tier policy.
           TORCH_CUDA_ARCH_LIST: '8.0;8.6;8.9;9.0'
+          ARLE_CUDA_ENABLE_FA3: '1'
           # FlashMLA stays ENABLED here: build.rs compiles its sm90 sparse_fp8
           # TUs sm_90a-ONLY (cluster launch_bounds need the arch variant),
           # decoupled from TORCH_CUDA_ARCH_LIST above, so the T1 binary carries
@@ -133,6 +151,7 @@ jobs:
   # a failure is non-blocking and signals fix-forward, never nuking the release.
   build-linux-v100:
     name: Build Linux x86_64 (CUDA sm_70 / V100, best-effort)
+    needs: qualify-release
     runs-on: ubuntu-22.04
     continue-on-error: true
     # Off by default: a no-GPU cross-compile runner can't validate sm_70, and the
@@ -213,6 +232,7 @@ jobs:
         env:
           # Volta V100 only — SM-pinned, no T1 SMs (sm-coverage.md §"Why sm_70 is separate").
           TORCH_CUDA_ARCH_LIST: '7.0'
+          ARLE_CUDA_ENABLE_FA3: '0'
           # FlashMLA is a Hopper-only (sm_90a) kernel — dormant on Volta, so keep
           # it out of the sm_70 binary to stay lean (the runtime gate never fires
           # here). build.rs swaps in a clean stub; no FlashMLA half-state.
@@ -239,6 +259,7 @@ jobs:
   # contract as the V100 job: continue-on-error, attaches only if it compiles.
   build-linux-blackwell:
     name: Build Linux x86_64 (CUDA Blackwell sm_100+sm_120, best-effort)
+    needs: qualify-release
     runs-on: ubuntu-22.04
     continue-on-error: true
     # Off by default: no Blackwell hardware exists in CI to validate sm_100/sm_120
@@ -278,6 +299,7 @@ jobs:
         env:
           # B100/B200 (sm_100) + RTX 5090 (sm_120). Datacenter + consumer Blackwell.
           TORCH_CUDA_ARCH_LIST: '10.0;12.0'
+          ARLE_CUDA_ENABLE_FA3: '0'
           # FlashMLA is a Hopper-only (sm_90a) kernel — dormant on Blackwell, so
           # keep it out of the sm_100/sm_120 binary to stay lean (the runtime gate
           # never fires here). build.rs swaps in a clean stub; no FlashMLA half-state.
