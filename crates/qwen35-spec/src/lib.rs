@@ -283,6 +283,10 @@ impl Qwen35LayerTensorNames {
 struct RopeParameters {
     rope_theta: f32,
     partial_rotary_factor: f32,
+    #[serde(default)]
+    mrope_section: Option<Vec<usize>>,
+    #[serde(default)]
+    mrope_interleaved: Option<bool>,
     /// HF `rope_parameters.rope_type` (newer exports; older ones omit it).
     /// `None` / `"default"` ⇒ vanilla RoPE. Scaled types populate
     /// [`Qwen35Config::rope_scaling`] so downstream guards
@@ -304,6 +308,52 @@ struct RopeParameters {
 }
 
 impl RopeParameters {
+    fn rotary_dim(&self, head_dim: usize) -> Result<usize> {
+        if !self.partial_rotary_factor.is_finite()
+            || self.partial_rotary_factor <= 0.0
+            || self.partial_rotary_factor > 1.0
+        {
+            return Err(Qwen35ConfigError::InvalidConfig(
+                "partial_rotary_factor must be finite and in (0, 1]",
+            ));
+        }
+        let scaled = head_dim as f64 * self.partial_rotary_factor as f64;
+        let rounded = scaled.round();
+        let tolerance = 4.0 * f32::EPSILON as f64 * head_dim as f64;
+        if (scaled - rounded).abs() > tolerance || rounded > usize::MAX as f64 {
+            return Err(Qwen35ConfigError::InvalidConfig(
+                "head_dim * partial_rotary_factor must be an integer",
+            ));
+        }
+        let rotary_dim = rounded as usize;
+        if rotary_dim == 0 || !rotary_dim.is_multiple_of(2) {
+            return Err(Qwen35ConfigError::InvalidConfig(
+                "rotary_dim must be even and non-zero",
+            ));
+        }
+        match (&self.mrope_section, self.mrope_interleaved) {
+            (None, None) => {}
+            (Some(section), Some(true)) => {
+                let sum = section.iter().try_fold(0usize, |sum, &width| {
+                    (width > 0)
+                        .then_some(width)
+                        .and_then(|width| sum.checked_add(width))
+                });
+                if section.is_empty() || sum != Some(rotary_dim / 2) {
+                    return Err(Qwen35ConfigError::InvalidConfig(
+                        "mrope_section must contain positive widths summing to rotary_dim / 2",
+                    ));
+                }
+            }
+            _ => {
+                return Err(Qwen35ConfigError::InvalidConfig(
+                    "mrope_section requires mrope_interleaved=true",
+                ));
+            }
+        }
+        Ok(rotary_dim)
+    }
+
     /// Resolve the long-context scaling config from the flat HF
     /// `rope_parameters` fields. `rope_type` absent or `"default"` ⇒ `None`
     /// (behavior unchanged for vanilla checkpoints); unsupported types are a
@@ -775,8 +825,7 @@ impl Qwen35Config {
     }
 
     fn from_text_config(text: TextConfig, stop_token_ids: Vec<u32>) -> Result<Self> {
-        let rotary_dim =
-            (text.head_dim as f32 * text.rope_parameters.partial_rotary_factor) as usize;
+        let rotary_dim = text.rope_parameters.rotary_dim(text.head_dim)?;
         let rope_scaling = text.rope_parameters.rope_scaling()?;
 
         // Merge nested `moe_config` sub-block (if present) on top of the flat
@@ -1660,6 +1709,45 @@ mod tests {
             "shared_expert_intermediate_size": 512
         }
     }"#;
+
+    #[test]
+    fn rejects_fractional_rotary_dim() {
+        let json = NESTED_CONFIG_JSON.replace(
+            "\"partial_rotary_factor\": 0.5",
+            "\"partial_rotary_factor\": 0.251",
+        );
+        assert!(matches!(
+            Qwen35Config::from_json_str(&json),
+            Err(Qwen35ConfigError::InvalidConfig(
+                "head_dim * partial_rotary_factor must be an integer"
+            ))
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_mrope_section() {
+        let json = QWEN36_MOE_FLAT_JSON.replace("[11, 11, 10]", "[11, 11, 9]");
+        assert!(matches!(
+            Qwen35Config::from_json_str(&json),
+            Err(Qwen35ConfigError::InvalidConfig(
+                "mrope_section must contain positive widths summing to rotary_dim / 2"
+            ))
+        ));
+    }
+
+    #[test]
+    fn rejects_mrope_without_interleaving() {
+        let json = QWEN36_MOE_FLAT_JSON.replace(
+            "\"mrope_interleaved\": true",
+            "\"mrope_interleaved\": false",
+        );
+        assert!(matches!(
+            Qwen35Config::from_json_str(&json),
+            Err(Qwen35ConfigError::InvalidConfig(
+                "mrope_section requires mrope_interleaved=true"
+            ))
+        ));
+    }
 
     #[test]
     fn parses_qwen36_moe_flat_config() {

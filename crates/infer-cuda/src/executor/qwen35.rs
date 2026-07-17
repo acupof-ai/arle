@@ -23,6 +23,12 @@ fn qwen35_batched_decode_enabled() -> bool {
     crate::runtime_flags::qwen35_batched_decode()
 }
 
+fn mtp_spec_fits(start: usize, depth: usize, max_seq_len: usize) -> bool {
+    start
+        .checked_add(depth)
+        .is_some_and(|last_position| last_position < max_seq_len)
+}
+
 fn merge_tier_io_stats(
     slot: &kv_native_sys::TierIoStats,
     recall: &kv_native_sys::TierIoStats,
@@ -790,6 +796,10 @@ impl Qwen35CudaExecutor {
         ensure!(
             total_pages > 0,
             "Qwen35CudaExecutor requires at least one KV page"
+        );
+        ensure!(
+            dspark_draft_model.is_none() || mtp_draft_tokens.is_none(),
+            "Qwen3.5/3.6 DSpark and MTP speculative decode are mutually exclusive"
         );
         // `max_seq_len` is the per-request token ceiling (the model's positional
         // budget + the host CudaKvPool admission span). The full-attn KV is now a
@@ -1564,10 +1574,11 @@ impl Qwen35CudaExecutor {
         let depth = self.model.spec_draft_tokens().max(1);
         // Seeded iff we have a stored pending+hidden AND the pending matches the
         // token the scheduler will feed (a gap = re-seed at the warm step).
-        let seeded = matches!(
-            self.mtp.as_ref().and_then(|m| m.slots[row.slot].as_ref()),
-            Some(s) if s.pending == row.last_token
-        );
+        let seeded = mtp_spec_fits(row.kv_seq_len, depth, self.model.max_seq_len())
+            && matches!(
+                self.mtp.as_ref().and_then(|m| m.slots[row.slot].as_ref()),
+                Some(s) if s.pending == row.last_token
+            );
         if !seeded {
             let (token, logprob) = self.mtp_warm_decode_row(row)?;
             return Ok(vec![SlotToken {
@@ -2490,6 +2501,12 @@ impl Qwen35CudaExecutor {
             }
             return Ok(StepOutput { tokens });
         }
+        if self.mtp.is_some() {
+            for row in &plan.decode_rows {
+                tokens.extend(self.mtp_decode_row(row)?);
+            }
+            return Ok(StepOutput { tokens });
+        }
         match plan.decode_rows.len() {
             0 => {}
             1 => {
@@ -3122,6 +3139,13 @@ impl Qwen35CudaExecutor {
 #[cfg(test)]
 mod tier_io_tests {
     use super::*;
+
+    #[test]
+    fn mtp_spec_boundary_falls_back_before_verify_exceeds_max_seq_len() {
+        assert!(mtp_spec_fits(12, 3, 16));
+        assert!(!mtp_spec_fits(13, 3, 16));
+        assert!(!mtp_spec_fits(usize::MAX, 1, usize::MAX));
+    }
 
     #[test]
     fn merge_prefers_direct_and_saturates_counters() {

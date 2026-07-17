@@ -138,24 +138,25 @@ fn qwen35_profile<T>(
 /// `--qwen35-fa3 false` is the same-binary fallback arm. On stub builds
 /// (no `ARLE_CUDA_ENABLE_FA3`) the link marker is 0 and the gate silently
 /// keeps the in-tree kernel, so the default is safe across build flavors.
-/// Read once — prefill is never graph-captured, so a process-lifetime latch
-/// is safe.
+/// The marker is process-wide, but capability is checked on the bound context
+/// so mixed-device workers cannot inherit another device's decision.
 fn qwen35_fa3_enabled(ctx: &DeviceContext) -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        if !crate::runtime_flags::qwen35_fa3() || ctx.compute_capability() != (9, 0) {
-            return false;
-        }
-        // SAFETY: pure host query exported by both the real shim and the stub.
-        let real = unsafe { ffi::arle_fa3_real_kernel_marker_cuda() } == 1;
-        if !real {
+    if !crate::runtime_flags::qwen35_fa3() {
+        return false;
+    }
+    // SAFETY: pure host query exported by both the real shim and the stub.
+    let real = unsafe { ffi::arle_fa3_real_kernel_marker_cuda() } == 1;
+    if !real {
+        static LOGGED: OnceLock<()> = OnceLock::new();
+        LOGGED.get_or_init(|| {
             log::info!(
                 "FA3 stub build (no ARLE_CUDA_ENABLE_FA3) — full-attention \
                  prefill stays on the in-tree kernel"
             );
-        }
-        real
-    })
+        });
+        return false;
+    }
+    ctx.compute_capability() == (9, 0)
 }
 
 /// `--qwen35-fa3-decode true`: route single-token full-attention decode through
@@ -163,20 +164,20 @@ fn qwen35_fa3_enabled(ctx: &DeviceContext) -> bool {
 /// needle + ITL gate licenses it. This path uses a host `seqlen_k` launch
 /// parameter, so keep it out of the whole-step decode graph for now.
 fn qwen35_fa3_decode_enabled(ctx: &DeviceContext) -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        if !crate::runtime_flags::qwen35_fa3_decode() {
-            return false;
-        }
-        if crate::runtime_flags::qwen35_decode_graph() {
+    if !crate::runtime_flags::qwen35_fa3_decode() {
+        return false;
+    }
+    if crate::runtime_flags::qwen35_decode_graph() {
+        static LOGGED: OnceLock<()> = OnceLock::new();
+        LOGGED.get_or_init(|| {
             log::info!(
                 "--qwen35-fa3-decode ignored while --qwen35-decode-graph is on; \
                  FA3 split decode uses host seqlen_k and is not graph-replay safe"
             );
-            return false;
-        }
-        qwen35_fa3_enabled(ctx)
-    })
+        });
+        return false;
+    }
+    qwen35_fa3_enabled(ctx)
 }
 
 fn qwen35_fa3_decode_splits() -> usize {
