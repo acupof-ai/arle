@@ -1,0 +1,45 @@
+crates/cli/src/serve.rs
+  s_6e410738f9d8cd::t_22fafb5838c4fb 461,479,733
+crates/cli/src/train_cli.rs
+  s_6e410738f9d8cd::t_26e93fb746a4ad 1766,1896,2867,4075,4133
+crates/infer-api/examples/metal_kv_memory_probe.rs
+  s_6e410738f9d8cd::t_355805928e3bfd 113
+crates/infer-api/src/loaded.rs
+  s_6e410738f9d8cd::t_a48eead8abb674 40-42,186,503-506,1930-1956
+crates/infer-core/src/lib.rs
+  s_6e410738f9d8cd::t_c4447e647a391d 2132-2135,2140,2144,2148,2167-2170,5361-5364,5366,5393-5427
+crates/infer-core/src/planner.rs
+  s_6e410738f9d8cd::t_87198f3b153659 60-64,82-83
+crates/infer-cuda/src/executor.rs
+  s_6e410738f9d8cd::t_72d84f9f399bd7 598-606
+crates/infer-cuda/src/executor/dsv4.rs
+  s_6e410738f9d8cd::t_34b88c748235c7 1229-1236
+crates/infer-cuda/src/lib.rs
+  s_6e410738f9d8cd::t_0ae5c236bea054 689-696
+crates/infer-seam/src/lib.rs
+  s_6e410738f9d8cd::t_76db89d7a93d89 295-299,304-311
+crates/train/examples/opd_step_cuda_realckpt_train.rs
+  s_6e410738f9d8cd::t_be83fcdec18b36 624
+crates/train/examples/qwen36_fp8_lora_load_gate.rs
+  s_6e410738f9d8cd::t_ae8b5fc4362e70 303
+docs/plans/2026-07-17-dsv4-chunked-prefill-unification.md
+  s_6e410738f9d8cd::t_fe9099c642d79f 3
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "cf974bcd70e6e20a653228127111b6ffc9342f12",
+  "prompts": {},
+  "sessions": {
+    "s_6e410738f9d8cd": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a02aa9398f2b0529e",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
