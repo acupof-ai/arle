@@ -13,6 +13,7 @@ ENV RUSTUP_HOME=/usr/local/rustup
 ENV PATH=/usr/local/cargo/bin:/usr/local/cuda/bin:${PATH}
 ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH}
 ENV TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0"
+ENV ARLE_CUDA_ENABLE_FA3=1
 # FlashMLA's sm90 sparse_fp8 kernels use thread-block clusters that require the
 # sm_90a arch variant. build.rs compiles the FlashMLA TUs sm_90a-ONLY, decoupled
 # from TORCH_CUDA_ARCH_LIST above, so they build cleanly inside the T1 image and

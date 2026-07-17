@@ -1957,6 +1957,11 @@ mod backend {
         let num_slots = config.hot_workspace_slots();
         let page_size = config.page_size;
         let mtp_requested = config.mtp_enabled();
+        if mtp_requested && config.dspark_draft_model.is_some() {
+            anyhow::bail!(
+                "--spec-type mtp and --spec-type dspark are mutually exclusive; select one drafter"
+            );
+        }
         if mtp_requested && !matches!(kind, CudaModelKind::Dsv4 | CudaModelKind::Qwen35) {
             anyhow::bail!(
                 "--spec-type mtp / --mtp-draft-* is only wired for CUDA DSv4 and Qwen3.5/3.6 checkpoints; \

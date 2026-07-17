@@ -312,6 +312,18 @@ cudaError_t prefill_attention_paged_prep_hd256_cuda(
     int rotary_dim,
     float rms_eps,
     cudaStream_t stream) {
+  if (q_full_batch == nullptr || q_out_batch == nullptr || k_batch == nullptr ||
+      v_batch == nullptr || q_norm_weight == nullptr || k_norm_weight == nullptr ||
+      cos_cache == nullptr || sin_cache == nullptr || page_table == nullptr ||
+      k_pool == nullptr || v_pool == nullptr || start_pos_ptr == nullptr ||
+      num_q_heads <= 0 || num_kv_heads <= 0 || num_q_heads % num_kv_heads != 0 ||
+      page_size <= 0 || seq_len < 0 || rotary_dim <= 0 ||
+      rotary_dim > PREFILL_PAGED_HD256 || rotary_dim % 2 != 0) {
+    return cudaErrorInvalidValue;
+  }
+  if (seq_len == 0) {
+    return cudaSuccess;
+  }
   dim3 grid(num_kv_heads, seq_len);
   prefill_attention_paged_hd256_kernel<<<grid, PREFILL_PAGED_HD256, 0, stream>>>(
       q_full_batch,

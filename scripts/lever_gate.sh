@@ -39,6 +39,64 @@ OUT="${OUT:-needle_gate_${LABEL}.log}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 export RUST_LOG="${RUST_LOG:-info}"
 
+validate_summary() {
+    local log=$1
+    local baseline=${2:-}
+    python3 - "$log" "$RUNS" "$LENGTHS" "$baseline" <<'PY'
+import re, sys
+
+path, runs, lengths, baseline = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
+expected_lengths = [int(x) for x in lengths.split(",") if x]
+summary = re.compile(
+    r"^SUMMARY len=(\d+) .* exact=(\d+) partial=(\d+) miss=(\d+) (?:DET|NONDET)$"
+)
+
+def load(path):
+    counts = {}
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            if " ERROR " in line:
+                raise SystemExit(f"[gate] request error: {line.strip()}")
+            if not line.startswith("SUMMARY "):
+                continue
+            match = summary.match(line.strip())
+            if match is None:
+                raise SystemExit(f"[gate] malformed summary: {line.strip()}")
+            length, exact, partial, miss = map(int, match.groups())
+            if exact + partial + miss != runs:
+                raise SystemExit(
+                    f"[gate] incomplete summary: {exact}+{partial}+{miss} != runs={runs}"
+                )
+            if length in counts:
+                raise SystemExit(f"[gate] duplicate summary length {length}")
+            counts[length] = (exact, partial, miss)
+    if sorted(counts) != sorted(expected_lengths):
+        raise SystemExit(
+            f"[gate] summary lengths {sorted(counts)} != expected {sorted(expected_lengths)}"
+        )
+    return counts
+
+counts = load(path)
+if baseline:
+    baseline_counts = load(baseline)
+    for length in expected_lengths:
+        exact, partial, miss = counts[length]
+        base_exact, base_partial, base_miss = baseline_counts[length]
+        if miss > base_miss or abs(exact - base_exact) > 1 or abs(partial - base_partial) > 1:
+            raise SystemExit(
+                f"[gate] len={length} outside baseline envelope: "
+                f"exact={exact} baseline={base_exact}, partial={partial} baseline={base_partial}, "
+                f"miss={miss} baseline={base_miss}"
+            )
+print(f"[gate] correctness PASS: summaries={len(counts)}")
+PY
+}
+
+if [ -n "${LEVER_GATE_VALIDATE_LOG:-}" ]; then
+    validate_summary "$LEVER_GATE_VALIDATE_LOG" "${BASELINE_LOG:-}"
+    exit
+fi
+
 # DSv4 multi-GPU profile: the TP=8 + DSv4 kernel env. Defaults to dsv4 so the
 # existing DSv4 gate is byte-identical; any other GATE_PROFILE (generic, qwen)
 # skips it for a single-GPU model that brings its own config via SERVE_FLAGS.
@@ -68,4 +126,10 @@ done
 curl -sf "http://127.0.0.1:${PORT}/v1/models" >/dev/null || { echo "[gate] serve never ready"; exit 3; }
 
 PORT="$PORT" python3 "$ROOT/scripts/needle_gate.py" "$LENGTHS" "$RUNS" 0.0 2>&1 | tee "$OUT"
+status=${PIPESTATUS[0]}
+if [ "$status" -ne 0 ]; then
+    echo "[gate] needle gate failed with status $status"
+    exit "$status"
+fi
+validate_summary "$OUT" "${BASELINE_LOG:-}"
 echo "[gate] $LABEL done -> $OUT"
