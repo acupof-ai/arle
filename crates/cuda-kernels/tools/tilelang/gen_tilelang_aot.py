@@ -23,7 +23,6 @@ import importlib.util
 import os
 import re
 import shlex
-import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -625,24 +624,20 @@ def compile_kernel(prim_func, target, pass_configs=None):
     return device_source, match.group(1), parsed, dyn_shmem_bytes
 
 
-def nvcc_compile_cubin(
+def nvcc_command(
+    nvcc: str,
+    nvcc_wrapper: list[str],
     device_cu: Path,
     cubin_path: Path,
     cuda_arch: int,
     tilelang_src: Path,
     cutlass_include: Path,
     cuda_include: Path,
-) -> None:
-    nvcc_bin = shutil.which("nvcc") or "/usr/local/cuda/bin/nvcc"
-    # Hopper (sm_90) TileLang kernels emit CUTLASS WGMMA (`wgmma.fence`), which
-    # nvcc only enables under the architecture-accelerated `sm_90a` target — that
-    # is what defines `CUTE_ARCH_MMA_SM90A_ENABLED`. Plain `sm_90` compiles the
-    # WGMMA path but device-asserts at the first `wgmma.fence` at runtime
-    # (`cute::warpgroup_arrive(): Attempting to use wgmma.fence without
-    # CUTE_ARCH_MMA_SM90A_ENABLED`). Use the `a` variant for the SASS/PTX target.
+) -> list[str]:
     arch_sm = f"{cuda_arch}a" if cuda_arch == 90 else str(cuda_arch)
     cmd = [
-        nvcc_bin,
+        *nvcc_wrapper,
+        nvcc,
         "-cubin",
         "-O3",
         f"-gencode=arch=compute_{arch_sm},code=sm_{arch_sm}",
@@ -658,19 +653,32 @@ def nvcc_compile_cubin(
         "-o",
         str(cubin_path),
     ]
-    import os
-
     nvcc_ccbin = os.environ.get("NVCC_CCBIN")
     if nvcc_ccbin:
-        cmd.insert(1, f"--compiler-bindir={nvcc_ccbin}")
-    # Honor ARLE_NVCC_WRAPPER (e.g. sccache / ccache) so the TileLang AOT cubins
-    # share the same compile cache as the native .cu (build.rs threads the same
-    # env into its nvcc tool_command). Without this, sccache caches the 62 native
-    # .cu but misses the 124 TileLang cubins — the bigger half of a CUDA rebuild.
-    # No-op when the env is unset, so the default build path is unchanged.
-    nvcc_wrapper = os.environ.get("ARLE_NVCC_WRAPPER", "").strip()
-    if nvcc_wrapper:
-        cmd = nvcc_wrapper.split() + cmd
+        cmd.insert(len(nvcc_wrapper) + 1, f"--compiler-bindir={nvcc_ccbin}")
+    return cmd
+
+
+def nvcc_compile_cubin(
+    nvcc: str,
+    nvcc_wrapper: list[str],
+    device_cu: Path,
+    cubin_path: Path,
+    cuda_arch: int,
+    tilelang_src: Path,
+    cutlass_include: Path,
+    cuda_include: Path,
+) -> None:
+    cmd = nvcc_command(
+        nvcc,
+        nvcc_wrapper,
+        device_cu,
+        cubin_path,
+        cuda_arch,
+        tilelang_src,
+        cutlass_include,
+        cuda_include,
+    )
     result = subprocess.run(cmd, capture_output=True, text=True, check=False)
     if result.returncode != 0:
         raise RuntimeError(
@@ -749,9 +757,16 @@ def write_c_wrapper(
     scalar_locals = _build_scalar_locals(parsed_args, spec)
     src = f"""#include <cuda.h>
 #include <stdint.h>
+#include <mutex>
+#include <unordered_map>
 
-static CUmodule g_module = NULL;
-static CUfunction g_function = NULL;
+struct LoadedKernel {{
+    CUmodule module;
+    CUfunction function;
+}};
+
+static std::mutex g_load_mutex;
+static std::unordered_map<CUcontext, LoadedKernel> g_loaded;
 static const char *kFuncSymbol = "{kernel_symbol}";
 
 static const unsigned char kCubinData[] = {{
@@ -763,25 +778,49 @@ static int32_t ceildiv_i32(int32_t n, int32_t d) {{
     return (n + d - 1) / d;
 }}
 
-static CUresult ensure_loaded(void) {{
-    if (g_function != NULL) return CUDA_SUCCESS;
+static CUresult load_function(CUfunction *function) {{
+    CUcontext context = NULL;
+    CUresult r = cuCtxGetCurrent(&context);
+    if (r != CUDA_SUCCESS) return r;
+    if (context == NULL) return CUDA_ERROR_INVALID_CONTEXT;
+
+    std::lock_guard<std::mutex> lock(g_load_mutex);
+    auto loaded = g_loaded.find(context);
+    if (loaded != g_loaded.end()) {{
+        *function = loaded->second.function;
+        return CUDA_SUCCESS;
+    }}
+
     (void)kCubinSize;
-    CUresult r = cuModuleLoadData(&g_module, kCubinData);
+    CUmodule module = NULL;
+    CUfunction local_function = NULL;
+    r = cuModuleLoadData(&module, kCubinData);
     if (r != CUDA_SUCCESS) return r;
-    r = cuModuleGetFunction(&g_function, g_module, kFuncSymbol);
-    if (r != CUDA_SUCCESS) return r;
-    return cuFuncSetAttribute(
-        g_function,
+    r = cuModuleGetFunction(&local_function, module, kFuncSymbol);
+    if (r != CUDA_SUCCESS) {{
+        cuModuleUnload(module);
+        return r;
+    }}
+    r = cuFuncSetAttribute(
+        local_function,
         CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
         {dyn_shmem_bytes}
     );
+    if (r != CUDA_SUCCESS) {{
+        cuModuleUnload(module);
+        return r;
+    }}
+    g_loaded.emplace(context, LoadedKernel{{module, local_function}});
+    *function = local_function;
+    return CUDA_SUCCESS;
 }}
 
-CUresult {kernel_name}_cuda(
+extern "C" CUresult {kernel_name}_cuda(
 {spec.public_params}
 ) {{
 {spec.prelude}
-    CUresult r = ensure_loaded();
+    CUfunction function = NULL;
+    CUresult r = load_function(&function);
     if (r != CUDA_SUCCESS) return r;
 
 {scalar_locals}
@@ -793,7 +832,7 @@ CUresult {kernel_name}_cuda(
 {spec.grid}
 
     return cuLaunchKernel(
-        g_function,
+        function,
         grid_x, grid_y, grid_z,
         {spec.block},
         {dyn_shmem_bytes}, stream, args, NULL
@@ -833,6 +872,10 @@ def main() -> int:
                         help="cutlass/include dir bundled inside the tilelang package.")
     parser.add_argument("--cuda-include", required=True,
                         help="CUDA toolkit include dir (e.g. /usr/local/cuda/include).")
+    parser.add_argument("--nvcc", required=True,
+                        help="Exact nvcc executable selected by build.rs.")
+    parser.add_argument("--nvcc-wrapper", action="append", default=[],
+                        help="One wrapper argv element; repeated in execution order.")
     args = parser.parse_args()
 
     os.environ["ARLE_TILELANG_CUDA_ARCH"] = str(args.cuda_arch)
@@ -908,6 +951,8 @@ def main() -> int:
     device_cu_staged.write_text(device_source)
     cubin_path = out_dir / f"{args.out_name}.cubin"
     nvcc_compile_cubin(
+        args.nvcc,
+        args.nvcc_wrapper,
         device_cu_staged,
         cubin_path,
         args.cuda_arch,
@@ -916,7 +961,7 @@ def main() -> int:
         Path(args.cuda_include),
     )
 
-    c_path = (out_dir / f"{args.out_name}.c").resolve()
+    c_path = (out_dir / f"{args.out_name}.cc").resolve()
     write_c_wrapper(
         c_path,
         args.kernel_name,

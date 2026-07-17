@@ -12,6 +12,10 @@
 //! Run on a pod: `INFER_CUDA_DEVICE=2 target/release/examples/fp8_smallm_gemm_probe`
 
 fn main() -> anyhow::Result<()> {
+    if std::env::args().nth(1).as_deref() == Some("--kernel-build-id") {
+        println!("{}", cuda_kernels::KERNEL_BUILD_ID);
+        return Ok(());
+    }
     real::run()
 }
 

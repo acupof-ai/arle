@@ -24,7 +24,7 @@ directory unless noted.
 | `bench_long_agent.py` | Long-horizon agent benchmark. |
 | `bench_sglang_longctx.sh` | SGLang long-context baseline runner. |
 | `run_dsv4_bench.sh` | DSv4 benchmark orchestration. |
-| `run_fp8_probe.sh` | FP8 inference probe runner. |
+| `run_fp8_probe.sh` | Run the FP8 component probe; when a producer manifest is supplied, require its build ID to match the binary-embedded `KERNEL_BUILD_ID`. |
 
 ## Model Conversion
 
@@ -58,7 +58,7 @@ directory unless noted.
 | Script | Purpose |
 |---|---|
 | `needle_gate.py` | Needle-in-haystack retrieval correctness gate. |
-| `lever_gate.sh` | Lever multi-step reasoning correctness gate. |
+| `lever_gate.sh` | Multi-step reasoning gate; validates complete summaries and caps candidate misses at the baseline miss count. |
 | `prefix_reuse_gate.py` | Prefix-cache reuse correctness gate. |
 | `longctx_numerical_gate.py` | Long-context numerical quality gate. |
 | `verify_kv_cache.py` | KV cache correctness verification. |
@@ -139,10 +139,11 @@ directory unless noted.
 | `pod-tilelang-env.sh` | Pod TileLang Python environment setup. |
 | `pod_pipeline.sh` | Pod CI pipeline. |
 | `pod_serve.sh` | Pod serving setup. |
-| `cuda_prebuilt_manifest.sh` | Generate prebuilt CUDA kernel manifest. |
-| `export_prebuilt_cuda_kernels.sh` | Export prebuilt CUDA kernels. |
+| `cuda_prebuilt_manifest.sh` | Shared hashing and strict producer-manifest validation helpers. |
+| `export_prebuilt_cuda_kernels.sh` | Validate and export a producer manifest plus its exact artifacts. |
 | `package_macos_metal_artifact.sh` | Package macOS Metal artifact. |
-| `kernel_artifacts.sh` | Kernel artifact packaging helper. |
+| `kernel_artifacts.sh` | Build, fetch, and qualify immutable CUDA bundles; qualification requires exact commit, artifact SHA, FA3 capability, and complete tested-SM evidence. |
+| `validate_release.sh` | Fail-closed tag/product/blocker/kernel-evidence release validator. |
 | `ci-fmt-check-changed.sh` | CI rustfmt check on changed files. |
 | `ci-patch-tvm-ffi.sh` | CI TVM FFI patch. |
 | `pre_push_checks.sh` | Pre-push validation checks. |

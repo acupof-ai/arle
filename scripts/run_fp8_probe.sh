@@ -13,7 +13,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUTPUT="${1:-/dev/stdout}"
 cd "$ROOT"
-source "$ROOT/scripts/cuda_prebuilt_manifest.sh"
+source "$ROOT/scripts/export_prebuilt_cuda_kernels.sh"
 
 die() {
     echo "[run_fp8_probe] ERROR: $*" >&2
@@ -40,23 +40,12 @@ fi
 if [[ -n "$MANIFEST" ]]; then
     [[ -f "$MANIFEST" ]] || die "kernel manifest missing: $MANIFEST"
     MANIFEST_DIR="$(cd "$(dirname "$MANIFEST")" && pwd)"
-    EXPECTED_MANIFEST="$(mktemp)"
-    trap 'rm -f "$EXPECTED_MANIFEST"' EXIT
-    cuda_prebuilt_manifest >"$EXPECTED_MANIFEST"
-    cmp "$MANIFEST" "$EXPECTED_MANIFEST" >/dev/null ||
-        die "kernel manifest does not match current source/toolchain inputs"
-    for file in libkernels_cuda.a libtilelang_kernels_aot.a; do
-        [[ -f "$MANIFEST_DIR/$file" ]] || die "verified kernel bundle missing $file"
-    done
-    BUNDLE_HASH="$({
-        printf 'manifest\t%s\n' "$(cuda_prebuilt_hash_file "$MANIFEST")"
-        for file in libkernels_cuda.a libtilelang_kernels_aot.a arle_deepep_sidecar; do
-            [[ -f "$MANIFEST_DIR/$file" ]] &&
-                printf '%s\t%s\n' "$file" "$(cuda_prebuilt_hash_file "$MANIFEST_DIR/$file")"
-        done
-    } | cuda_prebuilt_hash_stream)"
-    BUNDLE_ID="bundle:$BUNDLE_HASH"
-    BUNDLE_ID_SOURCE="verified_manifest"
+    cuda_prebuilt_validate_bundle "$MANIFEST_DIR" || die "invalid kernel producer manifest or artifact hashes"
+    BUNDLE_ID="$(cuda_prebuilt_manifest_value "$MANIFEST" kernel_build_id)"
+    [[ "$BUNDLE_ID" =~ ^bundle:[0-9a-f]{64}$ ]] || die "kernel manifest has invalid kernel_build_id"
+    EMBEDDED_BUNDLE_ID="$("$PROBE_BIN" --kernel-build-id)" || die "probe binary cannot report its kernel build ID"
+    [[ "$EMBEDDED_BUNDLE_ID" == "$BUNDLE_ID" ]] || die "kernel manifest ID does not match the probe binary"
+    BUNDLE_ID_SOURCE="verified_binary"
     BUNDLE_MANIFEST_SHA256="$(cuda_prebuilt_hash_file "$MANIFEST")"
 else
     BUNDLE_ID=""
