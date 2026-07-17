@@ -2671,7 +2671,7 @@ impl Qwen35Model {
             );
         }
         let tail_t0 = Instant::now();
-        let norm = loader.load_vec(&ctx, m.norm_tensor_name())?;
+        let norm = load_final_norm_offset(&loader, &ctx, m.norm_tensor_name())?;
 
         let rope_len = m
             .rope_cache_len_hint()
@@ -7444,8 +7444,33 @@ fn load_qwen35_mtp_head(
         pre_fc_norm_hidden: loader.load_vec(ctx, &names.pre_fc_norm_hidden)?,
         fc: loader.load_matrix_quant_aware(ctx, &names.fc)?,
         layer,
-        norm: loader.load_vec(ctx, &names.norm)?,
+        norm: load_final_norm_offset(loader, ctx, &names.norm)?,
     })
+}
+
+/// Load the final RMSNorm weight and convert it to the trunk's offset
+/// convention `w - 1`. Qwen3.5 ships norms in standard format (centered at 1),
+/// but the trunk's RMSNorm kernels apply `(1 + weight)`; loading the raw weight
+/// would double the effective magnitude. The recurrent/full-attention layer
+/// norms are already stored in offset format; only the final norm needs this.
+fn load_final_norm_offset(
+    loader: &SafetensorLoader,
+    ctx: &DeviceContext,
+    name: &str,
+) -> Result<DeviceVec> {
+    let tensor = loader.load_raw_tensor(name)?;
+    ensure!(
+        tensor.shape.len() == 1,
+        "{name}: expected 1D norm tensor, got shape {:?}",
+        tensor.shape
+    );
+    let bytes = SafetensorLoader::tensor_bytes_to_bf16(name, tensor.dtype, &tensor.bytes)?;
+    let host: Vec<bf16> = bytes
+        .chunks_exact(2)
+        .map(|c| bf16::from_le_bytes([c[0], c[1]]))
+        .map(|w| bf16::from_f32(w.to_f32() - 1.0))
+        .collect();
+    DeviceVec::from_host(ctx, &host)
 }
 
 /// This rank's contiguous v-head range `(start, len)` within `[0, total_v_heads)`.

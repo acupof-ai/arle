@@ -4,10 +4,9 @@
 #define THREADS_HEAD_DIM 256
 #define NUM_WARPS_HEAD_DIM (THREADS_HEAD_DIM / WARP_SIZE)
 
-__device__ __forceinline__ __nv_bfloat16 rms_norm_elem_offset(
+__device__ __forceinline__ __nv_bfloat16 rms_norm_elem(
     __nv_bfloat16 x, float rms_inv, __nv_bfloat16 weight) {
-    float w = 1.0f + __bfloat162float(weight);
-    return __float2bfloat16(__bfloat162float(x) * rms_inv * w);
+    return __float2bfloat16(__bfloat162float(x) * rms_inv * __bfloat162float(weight));
 }
 
 __device__ __forceinline__ void apply_rope_pair(
@@ -81,7 +80,7 @@ __global__ void prefill_qk_norm_rope_kernel(
     __syncthreads();
 
     if (active) {
-        smem[d] = rms_norm_elem_offset(x, inv_rms, norm_w[d]);
+        smem[d] = rms_norm_elem(x, inv_rms, norm_w[d]);
     }
     __syncthreads();
 

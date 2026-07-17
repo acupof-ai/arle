@@ -410,7 +410,7 @@ __global__ void fused_gqa_attention_decode_batched_kernel(
     }
     __syncthreads();
     float q_rms = smem_scratch[0];
-    float q_normed = q_val * q_rms * (1.0f + __bfloat162float(q_norm_weight[tid]));
+    float q_normed = q_val * q_rms * __bfloat162float(q_norm_weight[tid]);
 
     // RoPE for Q — partial half-split: lo = 0..rotary_dim/2-1,
     // hi = rotary_dim/2..rotary_dim-1; dims >= rotary_dim pass through.
@@ -445,7 +445,7 @@ __global__ void fused_gqa_attention_decode_batched_kernel(
     }
     __syncthreads();
     float k_rms = smem_scratch[0];
-    float k_normed = k_val * k_rms * (1.0f + __bfloat162float(k_norm_weight[tid]));
+    float k_normed = k_val * k_rms * __bfloat162float(k_norm_weight[tid]);
 
     __shared__ float smem_k_rope[BATCHED_DECODE_HEAD_DIM];
     smem_k_rope[tid] = k_normed;
