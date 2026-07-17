@@ -1,0 +1,21 @@
+crates/train/src/opd.rs
+  s_a3496271e6c066::t_b0e27169f5aa76 3360-3365
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "4dbfd922ed1fde87b08530f22c63f1bd27aa08f2",
+  "prompts": {},
+  "sessions": {
+    "s_a3496271e6c066": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a567ec791eef97389",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
