@@ -10,10 +10,10 @@ so a match can only truncate where the cache truly diverges.
 Protocol (one live serve, temp=0):
   turn 1 — POST prompt=P (string, salted doc, needle mid-prompt),
            return_token_ids → capture PT (prompt ids) + GT (generated ids).
-  ON     — POST prompt = PT + GT + suffix (TOKEN-ID array) → prefix_hit_tokens
+  ON     — POST prompt = PT + GT + suffix (TOKEN-ID array) → prefix_cache_hit_tokens
            delta should reach floor((|PT|+|GT|)/page)·page (reuse into GT).
   CONTROL— POST prompt = PT + suffix + GT (shares only PT: diverges right after
-           the prompt) → prefix_hit_tokens delta hits floor(|PT|/page)·page.
+           the prompt) → prefix_cache_hit_tokens delta hits floor(|PT|/page)·page.
            A flag-OFF serve collapses ON onto this same prompt-boundary floor,
            so delta≈0 proves the ON delta is the feature.
 
@@ -26,7 +26,7 @@ import json
 import time
 import urllib.request
 
-from . import BASE, MODEL, Gate, Verdict, build_doc, get_stats, stat_delta
+from . import BASE, MODEL, PREFIX_HIT_TOKENS, Gate, Verdict, build_doc, get_stats, stat_delta
 
 NEEDLE = "738291"
 SUFFIX_TEXT = "\nQ:"
@@ -69,7 +69,7 @@ def _hit_delta(prompt: list[int], max_tokens: int = 8) -> tuple[int, dict]:
     r = post_completion(prompt, max_tokens=max_tokens, return_token_ids=True)
     time.sleep(0.3)
     s1 = get_stats()
-    return stat_delta(s0, s1, "prefix_cache_hit_tokens"), r
+    return stat_delta(s0, s1, PREFIX_HIT_TOKENS), r
 
 
 class TokenReuseGate(Gate):

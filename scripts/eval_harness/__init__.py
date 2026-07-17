@@ -109,8 +109,18 @@ def get_stats() -> dict:
     return flat
 
 
+# /v1/stats keys shared by the reuse gates (flattened "{group}_{key}" form) —
+# one place to update on a server-side rename (#166).
+PREFIX_HIT_TOKENS = "prefix_cache_hit_tokens"
+PREFIX_HIT_PAGES = "prefix_cache_hit_pages"
+
+
 def stat_delta(before: dict, after: dict, key: str) -> int:
-    return int(after.get(key, 0)) - int(before.get(key, 0))
+    # Fail loud on a missing key: a silent 0 turned the #166 key rename into
+    # a bogus "cache not seeded" verdict instead of an error.
+    if key not in before or key not in after:
+        raise KeyError(f"/v1/stats has no key {key!r} — renamed server-side?")
+    return int(after[key]) - int(before[key])
 
 
 def build_doc(target_tokens: int, needle: str, needle_pos: float = 0.88) -> tuple[str, int]:

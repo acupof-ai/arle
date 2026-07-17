@@ -853,28 +853,14 @@ impl Dsv4LayerAttentionState {
     ) -> Result<()> {
         if let Some(c) = &self.compressor {
             let ratio = compress_ratio.max(1);
-            let pending_len = finish_len % ratio;
-            if pending_len > 0 {
-                ensure!(
-                    c.pending_kv.len().is_multiple_of(ratio),
-                    "DSv4 frontier tail: pending buffer {} not ratio-{ratio} divisible",
-                    c.pending_kv.len()
-                );
-                let n = pending_len * (c.pending_kv.len() / ratio);
-                ensure!(
-                    n <= c.pending_kv.len() && n <= c.pending_score.len(),
-                    "DSv4 frontier tail: pending rows {n} outside buffer {}",
-                    c.pending_kv.len()
-                );
-                out.pending_kv = ctx
-                    .stream
-                    .clone_dtoh(&c.pending_kv.slice(0..n))
-                    .map_err(|e| anyhow!("DSv4 frontier tail pending kv D2H failed: {e}"))?;
-                out.pending_score = ctx
-                    .stream
-                    .clone_dtoh(&c.pending_score.slice(0..n))
-                    .map_err(|e| anyhow!("DSv4 frontier tail pending score D2H failed: {e}"))?;
-            }
+            (out.pending_kv, out.pending_score) = capture_pending_tail(
+                ctx,
+                &c.pending_kv,
+                &c.pending_score,
+                ratio,
+                finish_len,
+                "pending",
+            )?;
             if let Some(range) = staging_tail_range(c, ratio, matched_len, finish_len)? {
                 out.tail_staging = ctx
                     .stream
@@ -883,29 +869,14 @@ impl Dsv4LayerAttentionState {
             }
         }
         if let Some(ix) = &self.indexer {
-            let ratio = dsa_index_ratio(mode, compress_ratio);
-            let pending_len = finish_len % ratio;
-            if pending_len > 0 {
-                ensure!(
-                    ix.pending_kv.len().is_multiple_of(ratio),
-                    "DSv4 frontier tail: idx pending buffer {} not ratio-{ratio} divisible",
-                    ix.pending_kv.len()
-                );
-                let n = pending_len * (ix.pending_kv.len() / ratio);
-                ensure!(
-                    n <= ix.pending_kv.len() && n <= ix.pending_score.len(),
-                    "DSv4 frontier tail: idx pending rows {n} outside buffer {}",
-                    ix.pending_kv.len()
-                );
-                out.idx_pending_kv = ctx
-                    .stream
-                    .clone_dtoh(&ix.pending_kv.slice(0..n))
-                    .map_err(|e| anyhow!("DSv4 frontier tail idx pending kv D2H failed: {e}"))?;
-                out.idx_pending_score = ctx
-                    .stream
-                    .clone_dtoh(&ix.pending_score.slice(0..n))
-                    .map_err(|e| anyhow!("DSv4 frontier tail idx pending score D2H failed: {e}"))?;
-            }
+            (out.idx_pending_kv, out.idx_pending_score) = capture_pending_tail(
+                ctx,
+                &ix.pending_kv,
+                &ix.pending_score,
+                dsa_index_ratio(mode, compress_ratio),
+                finish_len,
+                "idx pending",
+            )?;
         }
         if let Some(dsa) = &self.dsa_official
             && let Some((data_range, scale_range)) = dsa_tail_ranges(
@@ -956,28 +927,16 @@ impl Dsv4LayerAttentionState {
     ) -> Result<()> {
         if let Some(c) = &mut self.compressor {
             let ratio = compress_ratio.max(1);
-            let pending_len = finish_len % ratio;
-            let n = if pending_len > 0 {
-                pending_len * (c.pending_kv.len() / ratio)
-            } else {
-                0
-            };
-            ensure!(
-                state.pending_kv.len() == n && state.pending_score.len() == n,
-                "DSv4 frontier tail restore pending {}+{} != live {n}",
-                state.pending_kv.len(),
-                state.pending_score.len()
-            );
-            if n > 0 {
-                let mut kv = c.pending_kv.slice_mut(0..n);
-                ctx.stream
-                    .memcpy_htod(&state.pending_kv, &mut kv)
-                    .map_err(|e| anyhow!("DSv4 frontier tail pending kv H2D failed: {e}"))?;
-                let mut score = c.pending_score.slice_mut(0..n);
-                ctx.stream
-                    .memcpy_htod(&state.pending_score, &mut score)
-                    .map_err(|e| anyhow!("DSv4 frontier tail pending score H2D failed: {e}"))?;
-            }
+            restore_pending_tail(
+                ctx,
+                &mut c.pending_kv,
+                &mut c.pending_score,
+                ratio,
+                finish_len,
+                &state.pending_kv,
+                &state.pending_score,
+                "pending",
+            )?;
             match staging_tail_range(c, ratio, matched_len, finish_len)? {
                 Some(range) => {
                     ensure!(
@@ -998,29 +957,16 @@ impl Dsv4LayerAttentionState {
             }
         }
         if let Some(ix) = &mut self.indexer {
-            let ratio = dsa_index_ratio(mode, compress_ratio);
-            let pending_len = finish_len % ratio;
-            let n = if pending_len > 0 {
-                pending_len * (ix.pending_kv.len() / ratio)
-            } else {
-                0
-            };
-            ensure!(
-                state.idx_pending_kv.len() == n && state.idx_pending_score.len() == n,
-                "DSv4 frontier tail restore idx pending {}+{} != live {n}",
-                state.idx_pending_kv.len(),
-                state.idx_pending_score.len()
-            );
-            if n > 0 {
-                let mut kv = ix.pending_kv.slice_mut(0..n);
-                ctx.stream
-                    .memcpy_htod(&state.idx_pending_kv, &mut kv)
-                    .map_err(|e| anyhow!("DSv4 frontier tail idx pending kv H2D failed: {e}"))?;
-                let mut score = ix.pending_score.slice_mut(0..n);
-                ctx.stream
-                    .memcpy_htod(&state.idx_pending_score, &mut score)
-                    .map_err(|e| anyhow!("DSv4 frontier tail idx pending score H2D failed: {e}"))?;
-            }
+            restore_pending_tail(
+                ctx,
+                &mut ix.pending_kv,
+                &mut ix.pending_score,
+                dsa_index_ratio(mode, compress_ratio),
+                finish_len,
+                &state.idx_pending_kv,
+                &state.idx_pending_score,
+                "idx pending",
+            )?;
         } else {
             ensure!(
                 state.idx_pending_kv.is_empty() && state.idx_pending_score.is_empty(),
@@ -1233,6 +1179,80 @@ fn dsa_byte_ranges(
         data_start..data_start + count * index_head_dim,
         scale_start..scale_start + count * std::mem::size_of::<f32>(),
     ))
+}
+
+/// D2H the `finish_len % ratio` valid tail rows of a ratio-grouped pending
+/// kv+score pair; `(empty, empty)` when the finish is on-ratio.
+fn capture_pending_tail(
+    ctx: &DeviceContext,
+    kv: &CudaSlice<half::bf16>,
+    score: &CudaSlice<half::bf16>,
+    ratio: usize,
+    finish_len: usize,
+    label: &str,
+) -> Result<(Vec<half::bf16>, Vec<half::bf16>)> {
+    let pending_len = finish_len % ratio;
+    if pending_len == 0 {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    ensure!(
+        kv.len().is_multiple_of(ratio),
+        "DSv4 frontier tail: {label} buffer {} not ratio-{ratio} divisible",
+        kv.len()
+    );
+    let n = pending_len * (kv.len() / ratio);
+    ensure!(
+        n <= kv.len() && n <= score.len(),
+        "DSv4 frontier tail: {label} rows {n} outside buffer {}",
+        kv.len()
+    );
+    Ok((
+        ctx.stream
+            .clone_dtoh(&kv.slice(0..n))
+            .map_err(|e| anyhow!("DSv4 frontier tail {label} kv D2H failed: {e}"))?,
+        ctx.stream
+            .clone_dtoh(&score.slice(0..n))
+            .map_err(|e| anyhow!("DSv4 frontier tail {label} score D2H failed: {e}"))?,
+    ))
+}
+
+/// H2D the inverse of [`capture_pending_tail`]; section lengths must equal the
+/// live tail row count (0 for an on-ratio finish).
+#[allow(clippy::too_many_arguments)]
+fn restore_pending_tail(
+    ctx: &DeviceContext,
+    kv: &mut CudaSlice<half::bf16>,
+    score: &mut CudaSlice<half::bf16>,
+    ratio: usize,
+    finish_len: usize,
+    src_kv: &[half::bf16],
+    src_score: &[half::bf16],
+    label: &str,
+) -> Result<()> {
+    let pending_len = finish_len % ratio;
+    let n = if pending_len > 0 {
+        pending_len * (kv.len() / ratio)
+    } else {
+        0
+    };
+    ensure!(
+        src_kv.len() == n && src_score.len() == n,
+        "DSv4 frontier tail restore {label} {}+{} != live {n}",
+        src_kv.len(),
+        src_score.len()
+    );
+    if n == 0 {
+        return Ok(());
+    }
+    let mut kv_view = kv.slice_mut(0..n);
+    ctx.stream
+        .memcpy_htod(src_kv, &mut kv_view)
+        .map_err(|e| anyhow!("DSv4 frontier tail {label} kv H2D failed: {e}"))?;
+    let mut score_view = score.slice_mut(0..n);
+    ctx.stream
+        .memcpy_htod(src_score, &mut score_view)
+        .map_err(|e| anyhow!("DSv4 frontier tail {label} score H2D failed: {e}"))?;
+    Ok(())
 }
 
 fn dsa_index_ratio(mode: DeepSeekV4AttentionMode, compress_ratio: usize) -> usize {
