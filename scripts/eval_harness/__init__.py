@@ -137,7 +137,11 @@ def build_doc(target_tokens: int, needle: str, needle_pos: float = 0.88) -> tupl
     post = " ".join(
         f"Note {i+1}: {FILLER_SENTS[(i + k) % len(FILLER_SENTS)]}" for i in range(n - k)
     )
-    doc = pre + block + post
+    # Word-level tail pad: whole sentences quantize to ~16 tokens, so nearby
+    # targets (2000 vs 2003) built identical docs and off-ratio lengths were
+    # unreachable from the CLI (#166).
+    pad = " ".join("filler" for _ in range(target_tokens % toks_per_sent))
+    doc = pre + block + post + (" " + pad if pad else "")
     approx = len(doc.split()) * 4 // 3
     return doc, approx
 
