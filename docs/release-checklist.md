@@ -71,7 +71,7 @@ scripts/validate_release.sh vX.Y.Z /path/to/bundle-assets
 scripts/validate_release.sh vX.Y.Z
 ```
 
-The validator requires tag commit = checkout commit, tag base version = workspace product version, zero blockers, and passed kernel evidence bound to the exact bundle ID, GPU-tested commit, and tested candidate archive SHA-256. The tested commit may be an ancestor of the tag when intervening commits do not change the bundle identity.
+The validator requires tag commit = checkout commit, tag base version = workspace product version, zero blockers, and a fetched qualified archive whose aggregate qualification sidecar binds its SHA-256 and current bundle ID. The tested commit must exist locally and be an ancestor of the tag; fetch or unshallow history when Git cannot prove ancestry. Descendant commits remain qualified only while `scripts/kernel_artifacts.sh id` is unchanged.
 
 Typical baseline:
 
