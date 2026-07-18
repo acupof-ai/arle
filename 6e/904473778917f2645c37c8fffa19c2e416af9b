@@ -1,0 +1,27 @@
+scripts/kernel_artifacts.sh
+  s_66620580bd7062::t_0169bb05a6fba2 597-598,602,607,609-611,613-614
+scripts/lever_gate.sh
+  s_66620580bd7062::t_6ef852e9975be8 39-41,108-114,131-139,150-170
+scripts/tests/test_kernel_artifact_qualification.sh
+  s_66620580bd7062::t_e866167b328395 7-10,14,38-39,149-180
+scripts/tests/test_lever_gate.sh
+  s_66620580bd7062::t_0c028f86667a5f 65-128
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "6e904473778917f2645c37c8fffa19c2e416af9b",
+  "prompts": {},
+  "sessions": {
+    "s_66620580bd7062": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a4c5ecad1ad82342a",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
