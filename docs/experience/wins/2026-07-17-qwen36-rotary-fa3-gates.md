@@ -25,17 +25,19 @@ aggregates the required profiles, and adds qualification as a sidecar without
 changing payload bytes. Pod sync/build/run are source- and receipt-bound; kill
 refuses stale or foreign process identities.
 
-H20 clean build passed on source `925fd69b7512` plus the local diff
-(`LOCAL_STATE_SHA256=2965976e9c2e95c0b6e2ba52222e71487c6784e334eafacec1da65e98e0f8051`):
-`BUILD_EXIT=0`, 345 crates, 8m41s. TileLang AOT generated all SM90 kernels from
-`/host/tilelang-preserve/.venv`; the dispatch objects export unmangled GDR and
-HD256 attention C symbols. Embedded kernel ID:
-`bundle:0f6510c6c3b9e343d2afcc320608a7eb965152d61f80dddbfeefa2bbfaa59acf`.
+H20 exact receipt build passed on source `4f34f471ece0`:
+`BUILD_EXIT=0` in 3m48s. Source digest
+`74c0e7530d8b1d3840f1a0a3a5947d1732da702a61d9eae1e4f160e94c6c6fe5`;
+product SHA `79f83ab3fd01d4f7c506d812d22d839a8b00a1d2980bb8b90a1d1c93e2c2f087`;
+producer and embedded kernel ID both
+`bundle:639529e383719a407eb7c2be4090036d263eded4f2601bc33469f9b05e639d38`.
+Receipt: `/root/arle-ops/builds/h20-4f34f471/receipt`.
 
-Correctness and throughput are not measured. GPU 1 remained at 87,757 MiB for
-the full 60-minute wait, owned by foreign PID 1269240 (`Qwen3-0.6B` serve); it
-was not killed. The earlier needle log is invalid because the server rejected a
-stale `--num-slots` flag and never became ready.
+Correctness and throughput remain unmeasured. GPU 1 still held 87,757 MiB under
+foreign PID 1269240; it was not signalled. DSv4 was also blocked because the
+full eight-GPU topology was not free. No matching Qwen3.6 CUDA champion exists
+in `docs/baselines.md`, so the eventual throughput run must re-anchor before a
+delta is claimed.
 
 ## Rule
 
