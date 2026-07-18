@@ -1,0 +1,35 @@
+.github/workflows/cuda-ci.yml
+  s_3faeb0ec6b9263::t_fd94464e63c406 4,12,15-34,83-92,96,104,108-151,154,156-159
+.github/workflows/kernels-publish.yml
+  s_688a49c5f5277c::t_f6a1d737f5129c 3-4,24-25,28-29,47-64,66-68,92,99,103,112-114,126,131,133,139-142,144-147,151,154-155,157-171,174-178,182-184
+scripts/kernel_artifacts.sh
+  s_688a49c5f5277c::t_3d66b919658d71 430-533,554-557
+scripts/tests/test_kernel_artifact_qualification.sh
+  s_688a49c5f5277c::t_77c7782d1b36fa 107-137
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "957386c14b6e149ada50cbd4a6934c4d96cde6a9",
+  "prompts": {},
+  "sessions": {
+    "s_3faeb0ec6b9263": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "eb2672f9-3c2f-4e5a-8e92-393e34ed3536",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_688a49c5f5277c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-afc01ff6de58ea4ca",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
