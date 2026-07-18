@@ -59,7 +59,7 @@ case "$cmd" in
     : > "$stage/files"
     while IFS= read -r -d '' path; do [ -f "$ROOT/$path" ] && printf '%s\0' "$path" >> "$stage/files"; done < <(git -C "$ROOT" ls-files -co --exclude-standard -z)
     git -C "$ROOT" ls-files -d -z > "$stage/deletes"
-    tar -C "$ROOT" --null -T "$stage/files" -czf "$stage/tree.tgz"
+    COPYFILE_DISABLE=1 tar -C "$ROOT" --null -T "$stage/files" -czf "$stage/tree.tgz"
     archive_sha="$(shasum -a 256 "$stage/tree.tgz" | cut -d' ' -f1)"
     git -C "$ROOT" bundle create "$stage/source.bundle" HEAD
     bundle_sha="$(shasum -a 256 "$stage/source.bundle" | cut -d' ' -f1)"
