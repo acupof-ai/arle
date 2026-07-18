@@ -427,6 +427,104 @@ with open(output, 'w') as f: json.dump(result, f, sort_keys=True, separators=(',
 PY
 }
 
+qualification_policy_validate() (
+    local candidate="$1" aggregate="$2" tmp
+    [[ -f "$aggregate" ]] || { echo "aggregate qualification JSON not found: $aggregate" >&2; return 1; }
+    tmp="$(mktemp -d)"
+    trap 'rm -rf "$tmp"' EXIT
+    python3 - "$aggregate" "$tmp" <<'PY'
+import json, os, sys
+path, output = sys.argv[1:]
+with open(path) as f: result = json.load(f)
+keys = {'schema','status','candidate_archive_sha256','bundle_id','source_commit','kernel_build_id','bundle_capabilities','observations'}
+if not isinstance(result, dict) or set(result) != keys or result['schema'] != 1 or result['status'] != 'passed':
+    raise SystemExit('invalid aggregate schema or status')
+if not isinstance(result['observations'], list): raise SystemExit('aggregate observations must be an array')
+identity = {key: result[key] for key in ('candidate_archive_sha256','bundle_id','source_commit','kernel_build_id','bundle_capabilities')}
+for index, observation in enumerate(result['observations']):
+    if not isinstance(observation, dict): raise SystemExit('aggregate observation must be an object')
+    row = {'schema': 1, **identity, **observation}
+    with open(os.path.join(output, f'{index}.json'), 'w') as f:
+        json.dump(row, f, sort_keys=True, separators=(',', ':')); f.write('\n')
+PY
+    qualification_aggregate "$candidate" "$tmp/rebuilt.json" "$tmp"/[0-9]*.json
+    cmp "$aggregate" "$tmp/rebuilt.json" >/dev/null || {
+        echo "aggregate qualification is not canonical or policy-valid" >&2
+        return 1
+    }
+)
+
+promotion_archive() {
+    local candidate="$1" found
+    if [[ -f "$candidate" ]]; then
+        printf '%s\n' "$candidate"
+        return
+    fi
+    [[ -d "$candidate" ]] || { echo "promotion candidate not found: $candidate" >&2; return 1; }
+    found="$(find "$candidate" -maxdepth 1 -type f -name '*.tar.gz' -print)"
+    [[ "$(wc -l <<<"$found" | tr -d ' ')" == 1 && -n "$found" ]] || {
+        echo "promotion directory must contain exactly one .tar.gz candidate" >&2
+        return 1
+    }
+    printf '%s\n' "$found"
+}
+
+qualification_publish() (
+    local candidate="$1" aggregate="$2" archive file checksum sidecar assets present tmp target source_checksum
+    archive="$(promotion_archive "$candidate")"
+    source_checksum="$archive.sha256"
+    [[ -f "$source_checksum" ]] || { echo "candidate checksum not found: $source_checksum" >&2; return 1; }
+    verify_archive_checksum "$archive" "$source_checksum"
+    qualification_policy_validate "$archive" "$aggregate"
+    file="$(basename "$archive")"
+    checksum="$file.sha256"
+    sidecar="$file.qualification.json"
+    tmp="$(mktemp -d)"
+    trap 'rm -rf "$tmp"' EXIT
+    cp "$source_checksum" "$tmp/$checksum"
+    cp "$aggregate" "$tmp/$sidecar"
+
+    if [[ -n "${ARLE_KERNEL_PROMOTE_DIR:-}" ]]; then
+        mkdir -p "$ARLE_KERNEL_PROMOTE_DIR"
+        present=0
+        for target in "$file" "$checksum" "$sidecar"; do
+            [[ -e "$ARLE_KERNEL_PROMOTE_DIR/$target" ]] && ((present += 1))
+        done
+        [[ "$present" == 0 || "$present" == 3 ]] || { echo "partial immutable qualification already promoted: $file" >&2; return 1; }
+        if [[ "$present" == 0 ]]; then
+            cp "$archive" "$ARLE_KERNEL_PROMOTE_DIR/$file"
+            cp "$tmp/$checksum" "$tmp/$sidecar" "$ARLE_KERNEL_PROMOTE_DIR/"
+        fi
+        cmp "$archive" "$ARLE_KERNEL_PROMOTE_DIR/$file"
+        cmp "$tmp/$checksum" "$ARLE_KERNEL_PROMOTE_DIR/$checksum"
+        cmp "$tmp/$sidecar" "$ARLE_KERNEL_PROMOTE_DIR/$sidecar"
+        verify_archive_checksum "$ARLE_KERNEL_PROMOTE_DIR/$file" "$ARLE_KERNEL_PROMOTE_DIR/$checksum"
+        qualification_policy_validate "$ARLE_KERNEL_PROMOTE_DIR/$file" "$ARLE_KERNEL_PROMOTE_DIR/$sidecar"
+        echo "promoted qualified candidate $file -> $ARLE_KERNEL_PROMOTE_DIR"
+        return
+    fi
+
+    assets="$(remote_assets)"
+    present=0
+    for target in "$file" "$checksum" "$sidecar"; do
+        grep -Fxq "$target" <<<"$assets" && ((present += 1))
+    done
+    [[ "$present" == 0 || "$present" == 3 ]] || { echo "partial immutable qualification already published: $file" >&2; return 1; }
+    if [[ "$present" == 0 ]]; then
+        gh release upload "$REL" -R "$REPO" "$archive" "$tmp/$checksum" "$tmp/$sidecar"
+        echo "published qualified candidate $file -> release $REL"
+        return
+    fi
+    mkdir "$tmp/remote"
+    gh release download "$REL" -R "$REPO" -p "$file" -p "$checksum" -p "$sidecar" -D "$tmp/remote"
+    cmp "$archive" "$tmp/remote/$file"
+    cmp "$tmp/$checksum" "$tmp/remote/$checksum"
+    cmp "$tmp/$sidecar" "$tmp/remote/$sidecar"
+    verify_archive_checksum "$tmp/remote/$file" "$tmp/remote/$checksum"
+    qualification_policy_validate "$tmp/remote/$file" "$tmp/remote/$sidecar"
+    echo "verified existing qualified candidate $file"
+)
+
 remote_assets() {
     gh release view "$REL" -R "$REPO" --json assets --jq '.assets[].name'
 }
@@ -446,6 +544,10 @@ case "${1:-help}" in
     aggregate-qualification)
         (( $# >= 4 )) || { echo "usage: $0 aggregate-qualification CANDIDATE OUTPUT_JSON FRAGMENT..." >&2; exit 1; }
         qualification_aggregate "$2" "$3" "${@:4}"
+        ;;
+    qualify-publish)
+        [[ $# == 3 ]] || { echo "usage: $0 qualify-publish CANDIDATE_ARCHIVE_OR_DIR AGGREGATE_JSON" >&2; exit 1; }
+        qualification_publish "$2" "$3"
         ;;
     publish)
         cd "$ROOT"
