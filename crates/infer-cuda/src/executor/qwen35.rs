@@ -23,7 +23,7 @@ fn qwen35_batched_decode_enabled() -> bool {
     crate::runtime_flags::qwen35_batched_decode()
 }
 
-fn mtp_spec_fits(start: usize, depth: usize, max_seq_len: usize) -> bool {
+fn speculative_chain_fits(start: usize, depth: usize, max_seq_len: usize) -> bool {
     start
         .checked_add(depth)
         .is_some_and(|last_position| last_position < max_seq_len)
@@ -1541,7 +1541,7 @@ impl Qwen35CudaExecutor {
         // trunk cap; near the cap, degrade to single-token steps. Greedy rows
         // verify by argmax match; sampling rows by rejection sampling.
         let seeded = self.full_attn_paged()
-            && start + ds.head.block_size() < self.model.max_seq_len()
+            && speculative_chain_fits(start, ds.head.block_size(), self.model.max_seq_len())
             && matches!(
                 ds.slots[row.slot].as_ref(),
                 Some(s) if s.pending == Some(row.last_token) && s.ctx_end == start
@@ -1574,7 +1574,7 @@ impl Qwen35CudaExecutor {
         let depth = self.model.spec_draft_tokens().max(1);
         // Seeded iff we have a stored pending+hidden AND the pending matches the
         // token the scheduler will feed (a gap = re-seed at the warm step).
-        let seeded = mtp_spec_fits(row.kv_seq_len, depth, self.model.max_seq_len())
+        let seeded = speculative_chain_fits(row.kv_seq_len, depth, self.model.max_seq_len())
             && matches!(
                 self.mtp.as_ref().and_then(|m| m.slots[row.slot].as_ref()),
                 Some(s) if s.pending == row.last_token
@@ -3141,10 +3141,10 @@ mod tier_io_tests {
     use super::*;
 
     #[test]
-    fn mtp_spec_boundary_falls_back_before_verify_exceeds_max_seq_len() {
-        assert!(mtp_spec_fits(12, 3, 16));
-        assert!(!mtp_spec_fits(13, 3, 16));
-        assert!(!mtp_spec_fits(usize::MAX, 1, usize::MAX));
+    fn speculative_chain_boundary_falls_back_before_verify_exceeds_max_seq_len() {
+        assert!(speculative_chain_fits(12, 3, 16));
+        assert!(!speculative_chain_fits(13, 3, 16));
+        assert!(!speculative_chain_fits(usize::MAX, 1, usize::MAX));
     }
 
     #[test]

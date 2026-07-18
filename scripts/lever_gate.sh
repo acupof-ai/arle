@@ -42,10 +42,10 @@ export RUST_LOG="${RUST_LOG:-info}"
 validate_summary() {
     local log=$1
     local baseline=${2:-}
-    python3 - "$log" "$RUNS" "$LENGTHS" "$baseline" <<'PY'
+    python3 - "$log" "$RUNS" "$LENGTHS" "$baseline" "${LEVER_GATE_REQUIRE_EXACT:-0}" <<'PY'
 import re, sys
 
-path, runs, lengths, baseline = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
+path, runs, lengths, baseline, require_exact = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5] == "1"
 expected_lengths = [int(x) for x in lengths.split(",") if x]
 summary = re.compile(
     r"^SUMMARY len=(\d+) .* exact=(\d+) partial=(\d+) miss=(\d+) (?:DET|NONDET)$"
@@ -77,6 +77,12 @@ def load(path):
     return counts
 
 counts = load(path)
+if require_exact:
+    for length, (exact, partial, miss) in counts.items():
+        if exact != runs or partial or miss:
+            raise SystemExit(
+                f"[gate] len={length} requires exact={runs}, got exact={exact} partial={partial} miss={miss}"
+            )
 if baseline:
     baseline_counts = load(baseline)
     for length in expected_lengths:

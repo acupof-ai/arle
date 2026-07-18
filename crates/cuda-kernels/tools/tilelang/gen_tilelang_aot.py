@@ -772,7 +772,6 @@ static const char *kFuncSymbol = "{kernel_symbol}";
 static const unsigned char kCubinData[] = {{
 {cubin_array}
 }};
-static const unsigned int kCubinSize = (unsigned int)sizeof(kCubinData);
 
 static int32_t ceildiv_i32(int32_t n, int32_t d) {{
     return (n + d - 1) / d;
@@ -791,7 +790,6 @@ static CUresult load_function(CUfunction *function) {{
         return CUDA_SUCCESS;
     }}
 
-    (void)kCubinSize;
     CUmodule module = NULL;
     CUfunction local_function = NULL;
     r = cuModuleLoadData(&module, kCubinData);
