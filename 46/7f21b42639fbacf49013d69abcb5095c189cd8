@@ -1,0 +1,23 @@
+scripts/pod-remote-run.sh
+  s_4c19d90f36810f::t_6370c7f21b018d 179,196
+scripts/tests/test_pod_flow.sh
+  s_4c19d90f36810f::t_b6aee285629301 253-309
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "467f21b42639fbacf49013d69abcb5095c189cd8",
+  "prompts": {},
+  "sessions": {
+    "s_4c19d90f36810f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aacf25a363b785cd3",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
