@@ -2923,6 +2923,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
     infer_api::set_messages_dump_dir(&dump_dir)
         .with_context(|| format!("create cc dump dir {}", dump_dir.display()))?;
     let cc_model_id = infer_api::InferenceEngine::model_id(&student_engine).to_owned();
+    infer_api::set_default_temperature(args.rollout_temperature);
     let serve_thread = infer_api::serve_router_on_thread(
         student_engine.local_router(0)?, // thinking unbounded — the serve default
         "127.0.0.1",
