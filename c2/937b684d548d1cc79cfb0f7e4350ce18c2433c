@@ -1,0 +1,35 @@
+.github/workflows/cuda-ci.yml
+  s_b249be85b8b5e3::t_f97c63ae4b7558 102
+.github/workflows/kernels-publish.yml
+  s_b249be85b8b5e3::t_c4a7ce50e553e6 170-172
+crates/cuda-kernels/build.rs
+  s_b249be85b8b5e3::t_3e47e12a9b3d9f 1198-1203,1226,1231-1235,2358-2360,2942,2944,2947
+crates/infer-cuda/src/executor/qwen35.rs
+  s_b249be85b8b5e3::t_57dc45f67fe60a 26,1544,1577,3144-3147
+scripts/kernel_artifacts.sh
+  s_b249be85b8b5e3::t_532b96dacd9c48 238,290,304
+scripts/lever_gate.sh
+  s_b249be85b8b5e3::t_423068d8010c39 45,48,80-85
+scripts/tests/test_lever_gate.sh
+  s_b249be85b8b5e3::t_d490710d4584b7 19-35
+scripts/validate_release.sh
+  s_b249be85b8b5e3::t_6f5c82cadafafd 28
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "c2937b684d548d1cc79cfb0f7e4350ce18c2433c",
+  "prompts": {},
+  "sessions": {
+    "s_b249be85b8b5e3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "38f0a33d-cf6f-47ec-9617-4ca19706bf4b",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
