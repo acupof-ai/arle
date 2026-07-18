@@ -56,6 +56,14 @@ export CUDARC_CUDA_VERSION="${CUDARC_CUDA_VERSION:-12080}"
 
 run python3 scripts/check_repo_hygiene.py
 run cargo fmt --all -- --check
+for test in \
+    test_cuda_prebuilt_export.sh \
+    test_lever_gate.sh \
+    test_kernel_artifact_qualification.sh \
+    test_validate_release.sh \
+    test_pod_flow.sh; do
+    run bash "scripts/tests/${test}"
+done
 run cargo check -p arle --no-default-features --features cpu,no-cuda,cli --bin arle
 run cargo check -p infer-api --release --no-default-features --features cuda,no-cuda --lib
 run cargo test -p chat -p tools -p qwen3-spec -p qwen35-spec -p kv-native-sys --release
