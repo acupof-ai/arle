@@ -1,0 +1,23 @@
+scripts/kernel_artifacts.sh
+  s_d4cddf8a712690::t_955e2993274023 280-429,442-449
+scripts/tests/test_kernel_artifact_qualification.sh
+  s_d4cddf8a712690::t_9f1cb40c98b02e 1-107
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "0ff6762667a93697acaebe357297b9d8adeac820",
+  "prompts": {},
+  "sessions": {
+    "s_d4cddf8a712690": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a1a01896f1320c862",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
