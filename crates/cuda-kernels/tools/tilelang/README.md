@@ -70,9 +70,14 @@ Build only the kernel producer crate:
 cargo build --release -p cuda-kernels --features cuda
 ```
 
-A qualified T1 fat bundle is built with `ARLE_CUDA_ENABLE_FA3=1`, then tested on
-SM 8.0, 8.6, 8.9, and 9.0. Evidence from one GPU qualifies only that GPU's SM;
-publish fails closed until all four SMs have exact-pass evidence.
+A T1 candidate is generated and packed once with `ARLE_CUDA_ENABLE_FA3=1`.
+Cold consumers fetch those exact bytes and build with
+`INFER_TILELANG_PYTHON=/usr/bin/false`; they cannot regenerate the candidate.
+GPU qualification emits fragments bound to the candidate archive SHA-256,
+bundle ID, kernel build ID, product binary SHA-256, tested SM, workload profile,
+and exercised capabilities. Aggregation requires the complete policy set.
+Qualification publishes the original archive and checksum unchanged, adding only
+a `.qualification.json` sidecar.
 
 The generated per-SM C++ wrapper exports its CUDA entry point with C linkage;
 the C dispatch wrapper preserves the same ABI for Rust `extern "C"` callers.

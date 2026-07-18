@@ -127,22 +127,41 @@ directory unless noted.
 
 ## Build & Deploy
 
-Canonical pod sequence is receipt-bound: `sync` atomically installs an exact
-source tree and receipt; `build` consumes it; `run` names the successful build
-receipt as its first argument.
+Canonical pod flow is receipt-bound: `sync` atomically installs the complete
+working tree and source receipt; `build` records that source identity and the
+binary hash; `run` requires the successful build label. `kill` signals only the
+recorded process group after PID, start-time, PGID, and operation checks.
 
 ```bash
 scripts/pod.sh push-scripts
 scripts/pod.sh sync
-scripts/pod.sh build <build-label>
+scripts/pod.sh build <build-label> [cargo args...]
 scripts/pod.sh status <build-label>
-scripts/pod.sh run <build-label> [run-label] [auto|GPU] -- <args>
+scripts/pod.sh run <build-label> [run-label] [auto|GPU] -- [arle args...]
+scripts/pod.sh status <run-label>
+scripts/pod.sh kill <run-label>
 ```
 
-Labels use `[A-Za-z0-9_.-]+`. Omit build/run labels for unique timestamped
-labels. Existing labels are immutable. Logs and receipts live under
-`$POD_STATE/{builds,runs}/<label>/`; status and kill refuse stale or mismatched
-PID/start-time/PGID/operation identities.
+Labels use `[A-Za-z0-9_.-]+`; omitted build/run labels are unique timestamps.
+Labels are immutable. Receipts and logs live under
+`$POD_STATE/{builds,runs}/<label>/`.
+
+Kernel artifacts use two workflows. **Kernels Publish** candidate mode generates
+and packs the bundle once. **CUDA CI** consumes that exact candidate on each GPU,
+runs the strict gate, and emits one qualification fragment. **Kernels Publish**
+qualification mode aggregates those fragments and publishes the unchanged
+candidate plus its qualification sidecar.
+
+```bash
+scripts/kernel_artifacts.sh qualify-fragment CANDIDATE STATS_JSON FRAGMENT_JSON
+scripts/kernel_artifacts.sh aggregate-qualification CANDIDATE AGGREGATE_JSON FRAGMENT_JSON...
+scripts/kernel_artifacts.sh qualify-publish CANDIDATE AGGREGATE_JSON
+```
+
+Dispatch `kernels-publish.yml` without inputs to create the candidate. Dispatch
+`cuda-ci.yml` with `kernel_candidate_run_id`, `model_path`, and the exact
+qualification profile for each required GPU. Then dispatch `kernels-publish.yml`
+with that candidate run ID and the comma-separated CUDA CI evidence run IDs.
 
 | Script | Purpose |
 |---|---|
@@ -158,7 +177,7 @@ PID/start-time/PGID/operation identities.
 | `cuda_prebuilt_manifest.sh` | Shared hashing and strict producer-manifest validation helpers. |
 | `export_prebuilt_cuda_kernels.sh` | Validate and export a producer manifest plus its exact artifacts. |
 | `package_macos_metal_artifact.sh` | Package macOS Metal artifact. |
-| `kernel_artifacts.sh` | Build, fetch, and qualify immutable CUDA bundles; qualification requires exact commit, artifact SHA, FA3 capability, and complete tested-SM evidence. |
+| `kernel_artifacts.sh` | Pack immutable CUDA candidates, create qualification fragments, aggregate exact-candidate evidence, and publish the unchanged payload with a qualification sidecar. |
 | `validate_release.sh` | Fail-closed tag/product/blocker/kernel-evidence release validator. |
 | `ci-fmt-check-changed.sh` | CI rustfmt check on changed files. |
 | `ci-patch-tvm-ffi.sh` | CI TVM FFI patch. |

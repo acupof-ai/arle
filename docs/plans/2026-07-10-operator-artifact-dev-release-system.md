@@ -313,17 +313,30 @@ GitHub build attestation
 source commit, target lane, toolchain/provider versions, ABI/symbol allowlist,
 and correctness status.
 
+Implemented artifact flow:
+
+1. `kernels-publish.yml` candidate mode generates and packs one immutable
+   candidate, then proves a cold consumer builds with TileLang disabled.
+2. Each `cuda-ci.yml` qualification run downloads that candidate, runs the
+   profile-specific correctness gate, and emits a fragment bound to the exact
+   candidate archive, kernel identity, product binary, SM, and capabilities.
+3. `kernels-publish.yml` qualification mode downloads the named candidate and
+   fragments, runs `aggregate-qualification`, then `qualify-publish` publishes
+   the original archive and checksum plus a qualification sidecar.
+4. Release fetches only the qualified same-ID bundle. Evidence from an ancestor
+   commit is valid for a descendant release only when the recomputed bundle ID
+   is unchanged.
+
 Rules:
 
 - correctness status is the closed enum `not-run | passed | failed`;
-- local packing may record `not-run`; publish and formal fetch require `passed`;
-- passed evidence is immutable JSON bound to bundle ID, GPU-tested commit, and tested candidate archive SHA-256, with its own SHA-256 in the manifest;
-- kernel build/pack success never publishes by itself; only the qualified workflow path publishes;
-- a qualified bundle may serve a later descendant commit only when the exact bundle ID is unchanged;
+- candidate packing records `not-run`; formal fetch requires the qualification sidecar;
+- fragments and aggregate evidence bind exact product and kernel identities;
+- kernel build/pack success never publishes by itself;
+- qualification leaves candidate payload bytes unchanged;
 - formal release checks only `release-blockers.json`, never historical docs;
 - hash-named assets are immutable;
 - CI and product release fetch only the exact expected ID;
-- mutable `latest` is removed after one compatibility release;
 - PR artifacts remain 14-day Actions Artifacts and are never promoted;
 - official products embed or reference their exact kernel bundle ID.
 
@@ -436,16 +449,17 @@ Files:
 
 Work:
 
-- complete cache/build identity and atomic writes;
-- remove mtime-based artifact harvesting;
-- publish and fetch exact immutable GitHub Release assets;
-- stop release/CI consumption of `latest`;
-- run one two-checkout reproducibility diagnosis to normalize timestamps and
-  paths, without making it an every-release gate.
+- implemented immutable candidate generation and a cold zero-TileLang consumer;
+- implemented per-GPU qualification fragments bound to candidate, kernel, product, SM, profile, and capabilities;
+- implemented canonical fragment aggregation and unchanged-byte qualification publishing;
+- implemented exact qualified fetch plus ancestor-commit/same-bundle-ID release validation;
+- retained one reproducibility diagnosis as a trigger, not an every-release gate.
 
 Exit:
 
-- historical checkout fetches its exact bundle;
+- candidate bytes are generated once and preserved through qualification;
+- mixed, incomplete, duplicate, or overclaimed evidence fails closed;
+- a descendant release may reuse ancestor evidence only for the same bundle ID;
 - stale/partial/legacy cache entries fail clearly;
 - product reports exact source, bundle, and policy IDs;
 - current 0.408-second no-op does not regress beyond noise.
