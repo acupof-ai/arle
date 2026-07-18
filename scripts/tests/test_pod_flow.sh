@@ -128,6 +128,7 @@ set +e
 POD_TREE="$TREE" POD_STATE="$STATE" setsid bash "$TREE/scripts/pod-remote-run.sh" run good changed auto op-change "$TMP/empty-argv" >/dev/null 2>&1
 rc=$?; set -e
 [ "$rc" -ne 0 ] && grep -q 'source changed since build' "$STATE/runs/changed/log"
+grep -Fq "pod-remote-run.sh' run '\$build'" "$LOCAL/scripts/pod.sh"
 printf rename > "$TREE/new name"
 digest_now="$(POD_TREE="$TREE" bash "$TREE/scripts/pod-remote-build.sh" source-digest "$TREE")"
 python3 - "$TREE/.arle-source-receipt" "$digest_now" <<'PY'
