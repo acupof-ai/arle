@@ -49,11 +49,6 @@ cuda_prebuilt_command_id() {
     } | cuda_prebuilt_hash_stream
 }
 
-cuda_prebuilt_tree_hash() {
-    local path="$1"
-    git rev-parse "HEAD:$path" 2>/dev/null || printf 'missing'
-}
-
 cuda_prebuilt_tracked_hash() {
     local path="$1" root relative file
     root="$(git rev-parse --show-toplevel 2>/dev/null || true)"

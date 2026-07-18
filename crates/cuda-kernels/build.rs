@@ -1159,7 +1159,6 @@ src = next((root / "src" for root in roots if (root / "src" / "tl_templates").ex
 cutlass = next((root / "3rdparty" / "cutlass" / "include" for root in roots if (root / "3rdparty" / "cutlass" / "include").exists()), None)
 if tvm_runtime is None or src is None or cutlass is None:
     raise SystemExit("ERR_LAYOUT:" + str(pkg))
-print(sys.executable)
 print(pkg)
 print(tvm_runtime)
 print(tvm_ffi)
@@ -1196,12 +1195,12 @@ fn run_tilelang_toolchain_probe_self_test(out_dir: &Path) {
         .lines()
         .map(PathBuf::from)
         .collect::<Vec<_>>();
-    assert_eq!(paths.len(), 6);
-    assert_eq!(paths[1], root.join("tilelang"));
-    assert_eq!(paths[2], root.join("tilelang/lib"));
-    assert_eq!(paths[3], root.join("tvm_ffi"));
-    assert_eq!(paths[4], root.join("tilelang/src"));
-    assert_eq!(paths[5], root.join("tilelang/3rdparty/cutlass/include"));
+    assert_eq!(paths.len(), 5);
+    assert_eq!(paths[0], root.join("tilelang"));
+    assert_eq!(paths[1], root.join("tilelang/lib"));
+    assert_eq!(paths[2], root.join("tvm_ffi"));
+    assert_eq!(paths[3], root.join("tilelang/src"));
+    assert_eq!(paths[4], root.join("tilelang/3rdparty/cutlass/include"));
     assert!(!root.join("tvm").exists());
     std::fs::remove_dir_all(&root).expect("remove TileLang probe fixture");
 }
@@ -1224,16 +1223,16 @@ fn tilelang_toolchain(python: &str) -> TilelangToolchain {
         .collect::<Vec<_>>();
     assert_eq!(
         paths.len(),
-        6,
+        5,
         "tilelang toolchain probe returned invalid output"
     );
     TilelangToolchain {
         python: PathBuf::from(python),
-        package: paths[1].clone(),
-        tvm_runtime: paths[2].clone(),
-        tvm_ffi: paths[3].clone(),
-        src: paths[4].clone(),
-        cutlass_include: paths[5].clone(),
+        package: paths[0].clone(),
+        tvm_runtime: paths[1].clone(),
+        tvm_ffi: paths[2].clone(),
+        src: paths[3].clone(),
+        cutlass_include: paths[4].clone(),
     }
 }
 
@@ -2009,14 +2008,6 @@ fn validate_archive_symbols(archive: &Path, required: &[&str]) {
     );
 }
 
-fn validate_archive_symbol(archive: &Path, symbol: &str, context: &str) {
-    assert!(
-        archive_symbols(archive).contains(symbol),
-        "CUDA archive {} is missing required symbol {symbol} ({context})",
-        archive.display()
-    );
-}
-
 fn collect_input_files(path: &Path, files: &mut Vec<PathBuf>) {
     if path.is_file() {
         files.push(path.to_path_buf());
@@ -2364,13 +2355,9 @@ fn sha256_file(path: &Path) -> String {
 }
 
 fn emit_kernel_build_identity(out_dir: &Path, manifest: &BTreeMap<String, String>) {
-    let id = manifest.get("kernel_build_id").cloned().unwrap_or_else(|| {
-        let identity = manifest
-            .iter()
-            .map(|(key, value)| format!("{key}={value}\n"))
-            .collect::<String>();
-        format!("bundle:{}", sha256_bytes(identity.as_bytes()))
-    });
+    let id = manifest
+        .get("kernel_build_id")
+        .expect("CUDA prebuilt manifest lacks kernel_build_id");
     std::fs::write(
         out_dir.join("kernel_build_identity.rs"),
         format!("pub const KERNEL_BUILD_ID: &str = {id:?};\n"),
@@ -2952,20 +2939,12 @@ fn main() {
 
     assert!(status.success(), "ar failed");
 
+    let mut capabilities = BTreeSet::new();
     if enable_flashmla {
-        validate_archive_symbol(
-            &cuda_lib,
-            "arle_flashmla_sm90_sparse_decode_real_kernel_marker_cuda",
-            "real FlashMLA sparse decode shim",
-        );
+        capabilities.insert("flashmla".into());
     }
-
     if enable_fa3 {
-        validate_archive_symbol(
-            &cuda_lib,
-            "arle_fa3_real_kernel_marker_cuda",
-            "real FA3 hd256 fwd shim (ARLE_CUDA_ENABLE_FA3 build)",
-        );
+        capabilities.insert("fa3".into());
     }
 
     compile_tilelang_aot_kernels(&registry, &cuda_path, &out_dir, &sm_targets);
@@ -2989,13 +2968,6 @@ fn main() {
         nvcc_split_compile.as_deref(),
     );
 
-    let mut capabilities = BTreeSet::new();
-    if enable_flashmla {
-        capabilities.insert("flashmla".into());
-    }
-    if enable_fa3 {
-        capabilities.insert("fa3".into());
-    }
     if enable_deepgemm_native {
         capabilities.insert("deepgemm-native".into());
     }

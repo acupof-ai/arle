@@ -99,24 +99,7 @@ jobs:
           cargo build --release --features cuda -p arle --bin arle
           TESTED_SM="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -n1)"
           case "$TESTED_SM" in 8.0|8.6|8.9|9.0) ;; *) echo "unsupported tested SM: $TESTED_SM" >&2; exit 1;; esac
-          BIN="$CARGO_TARGET_DIR/release/arle" scripts/lever_gate.sh kernel-correctness
-          python3 - <<'PY'
-          import os
-          import re
-          from pathlib import Path
-
-          text = Path("needle_gate_kernel-correctness.log").read_text()
-          if "ERROR" in text:
-              raise SystemExit("needle gate reported request errors")
-          expected = {int(value) for value in os.environ["LENGTHS"].split(",")}
-          runs = int(os.environ["RUNS"])
-          rows = re.findall(r"^SUMMARY len=(\d+).* exact=(\d+) partial=(\d+) miss=(\d+) ", text, re.M)
-          if {int(row[0]) for row in rows} != expected or len(rows) != len(expected):
-              raise SystemExit("needle gate summaries do not match requested lengths")
-          for length, exact, partial, miss in rows:
-              if int(exact) != runs or int(partial) or int(miss):
-                  raise SystemExit(f"needle gate failed at length {length}")
-          PY
+          LEVER_GATE_REQUIRE_EXACT=1 BIN="$CARGO_TARGET_DIR/release/arle" scripts/lever_gate.sh kernel-correctness
           jq -n --arg bundle "$BUNDLE_ID" --arg source_commit "$GITHUB_SHA" \
             --arg artifact_sha256 "$CANDIDATE_SHA" --arg tested_sm "$TESTED_SM" \
             '{schema:2,status:"passed",bundle_id:$bundle,source_commit:$source_commit,artifact_sha256:$artifact_sha256,tested_sms:[$tested_sm],capabilities:["fa3"]}' \

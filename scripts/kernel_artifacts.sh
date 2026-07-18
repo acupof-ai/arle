@@ -235,7 +235,7 @@ verify_archive() {
 }
 
 pack_bundle() {
-    local id file stage epoch abi_hash symbols_hash evidence_hash
+    local id="$1" file stage epoch abi_hash symbols_hash evidence_hash
     validate_correctness_status
     [[ -d "$GEN" ]] || {
         echo "no $GEN - build with ARLE_KERNEL_VENDOR=1 first" >&2
@@ -287,7 +287,7 @@ case "${1:-help}" in
         ;;
     pack)
         cd "$ROOT"
-        pack_bundle
+        pack_bundle "$(kernel_bundle_id)"
         ;;
     publish)
         cd "$ROOT"
@@ -301,9 +301,8 @@ case "${1:-help}" in
             echo "publishing requires GNU tar for canonical metadata" >&2
             exit 1
         }
-        file="$(pack_bundle)"
+        file="$(pack_bundle "$id")"
         checksum="$file.sha256"
-        id="$(kernel_bundle_id)"
         gh release view "$REL" -R "$REPO" >/dev/null 2>&1 ||
             gh release create "$REL" -R "$REPO" --prerelease \
                 --title "Immutable TileLang kernel artifacts" \
