@@ -114,9 +114,10 @@ case "$cmd" in
     "$POD" "nvidia-smi --query-gpu=index,memory.used,memory.total,utilization.gpu --format=csv,noheader"
     ;;
   ready)
-    port="${1:-8000}"; timeout_s="${2:-1200}"
-    case "$port$timeout_s" in *[!0-9]*) echo "usage: pod.sh ready [port] [timeout_s]"; exit 2;; esac
-    "$POD" "code=; for i in \$(seq 1 $((timeout_s / 10))); do code=\$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:$port/v1/models 2>/dev/null); [ \"\$code\" = 200 ] && { echo ENGINE_READY port=$port after ~\$((i*10))s; exit 0; }; sleep 10; done; echo NOT_READY after ${timeout_s}s; exit 1"
+    label="${1:-}"; timeout_s="${2:-1200}"
+    valid_label "$label"
+    case "$timeout_s" in ''|*[!0-9]*) echo "usage: pod.sh ready <run-label> [timeout_s]" >&2; exit 2;; esac
+    "$POD" "POD_TREE='$TREE' POD_STATE='$STATE' bash '$TREE/scripts/pod-remote-run.sh' ready '$label' '$timeout_s'"
     ;;
   status|log|kill)
     label="${1:-}"
@@ -128,7 +129,7 @@ case "$cmd" in
       'pod.sh sync' \
       'pod.sh build [label] [cargo argv...]' \
       'pod.sh run <build-label> [run-label] [auto|GPU] -- [arle argv...]' \
-      'pod.sh status|log|kill <label>' \
-      'pod.sh gpus | ready [port] [timeout] | setup | setup-sccache | sccache-stats'
+      'pod.sh status|ready|log|kill <run-label> [timeout]' \
+      'pod.sh gpus | setup | setup-sccache | sccache-stats'
     ;;
 esac

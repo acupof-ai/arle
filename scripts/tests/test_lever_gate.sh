@@ -95,6 +95,7 @@ print('SUMMARY len=115 depth=0.00 exact=1 partial=0 miss=0 DET')
 EOF
 mkdir -p "$tmp/root/scripts"
 cp "$ROOT/scripts/lever_gate.sh" "$tmp/root/scripts/lever_gate.sh"
+cp "$ROOT/scripts/pick-gpu.sh" "$tmp/root/scripts/pick-gpu.sh"
 cp "$tmp/needle.py" "$tmp/root/scripts/needle_gate.py"
 
 run_gate() {
@@ -126,3 +127,22 @@ expect_fail env EXPECTED_PRODUCT_SHA256="$SHA" STATS_OUT="$tmp/one.json" \
     "$ROOT/scripts/lever_gate.sh" one-sided
 expect_fail env EXPECTED_KERNEL_BUNDLE_ID="$KERNEL_ID" STATS_OUT="$tmp/one.json" \
     "$ROOT/scripts/lever_gate.sh" one-sided
+
+mkdir -p "$tmp/mock-bin" "$tmp/claims"
+cat > "$tmp/mock-bin/nvidia-smi" <<'EOF'
+#!/usr/bin/env bash
+case "$*" in
+  *--query-compute-apps=gpu_uuid*) printf '%b' "${SMI_COMPUTE:-}" ;;
+  *) printf '%b\n' "${SMI:-0, GPU-0, 0, 9.0}" ;;
+esac
+EOF
+chmod +x "$tmp/mock-bin/nvidia-smi"
+evidence="$tmp/dsv4-evidence.json"
+printf sentinel > "$evidence"
+expect_fail env PATH="$tmp/mock-bin:$PATH" ARLE_GPU_CLAIMS="$tmp/claims" \
+    GATE_PROFILE=dsv4 INFER_CUDA_DEVICES=0 INFER_TP_SIZE=8 STATS_OUT="$evidence" \
+    "$tmp/root/scripts/lever_gate.sh" dsv4-preflight
+[[ "$(<"$evidence")" == sentinel ]]
+expect_fail env PATH="$tmp/mock-bin:$PATH" ARLE_GPU_CLAIMS="$tmp/claims" \
+    GATE_PROFILE=dsv4 INFER_CUDA_DEVICES=0,1,2,3,4,5,6,7 INFER_TP_SIZE=4 \
+    "$tmp/root/scripts/lever_gate.sh" dsv4-preflight

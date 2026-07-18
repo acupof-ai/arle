@@ -166,7 +166,7 @@ case "${1:-}" in
     mv "$ARGV_FILE" "$DIR/argv.nul" || exit 1
     LOG="$DIR/log"; RECEIPT="$DIR/receipt"
     echo $$ > "$DIR/pid"
-    printf '%s\n' "op=$OP" "pid=$$" "pgid=$(ps -o pgid= -p $$ | tr -d ' ')" "start=$(proc_start $$)" > "$DIR/process"
+    printf '%s\n' "schema=arle-process-v1" "kind=build" "expected_helper=$TREE/scripts/pod-remote-build.sh" "operation=$OP" "pid=$$" "pgid=$(ps -o pgid= -p $$ | tr -d ' ')" "start=$(proc_start $$)" "expected_binary=" > "$DIR/process"
     exec >"$LOG" 2>&1
     # shellcheck disable=SC1091
     source "$TREE/scripts/pod-build-env.sh"

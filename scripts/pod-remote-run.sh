@@ -7,24 +7,88 @@ PROC_ROOT="${PROC_ROOT:-/proc}"
 mkdir -p "$STATE/runs"
 sha256() { sha256sum "$1" | cut -d' ' -f1; }
 source_digest() { bash "$TREE/scripts/pod-remote-build.sh" source-digest "$TREE"; }
-field() { awk -F= -v key="$2" '$1==key {sub(/^[^=]*=/, ""); print; exit}' "$1"; }
+field() { awk -F= -v key="$2" '$1==key {sub(/^[^=]*=/, ""); print; exit}' "$1" 2>/dev/null; }
 proc_start() { awk '{print $22}' "$PROC_ROOT/$1/stat" 2>/dev/null; }
 write_receipt() { local dst="$1" tmp="$1.tmp.$$"; shift; printf '%s\n' "$@" > "$tmp" && mv "$tmp" "$dst"; }
+update_receipt() {
+  python3 - "$@" <<'PY'
+import os, sys, tempfile
+path, *updates = sys.argv[1:]
+values = {}
+order = []
+for line in open(path, encoding="utf-8"):
+    key, sep, value = line.rstrip("\n").partition("=")
+    if sep:
+        if key not in values: order.append(key)
+        values[key] = value
+for update in updates:
+    key, sep, value = update.partition("=")
+    if not sep: raise SystemExit(f"invalid receipt update: {update}")
+    if key not in values: order.append(key)
+    values[key] = value
+fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path) + ".tmp.", dir=os.path.dirname(path), text=True)
+with os.fdopen(fd, "w", encoding="utf-8") as stream:
+    for key in order: stream.write(f"{key}={values[key]}\n")
+os.replace(tmp, path)
+PY
+}
+process_cmd_matches() {
+  python3 - "$PROC_ROOT/$1/cmdline" "$2" "$3" <<'PY'
+import os, sys
+path, helper, operation = sys.argv[1:]
+try: args = [os.fsdecode(x) for x in open(path, "rb").read().split(b"\0") if x]
+except OSError: raise SystemExit(1)
+raise SystemExit(0 if helper in args and operation in args else 1)
+PY
+}
 valid_process() {
-  local file="$1" pid pgid start op cmd actual_pgid
+  local dir="$1" file="$1/process" kind helper operation pid pgid start expected_binary actual_pgid receipt_binary
   [ -f "$file" ] || return 1
-  pid="$(field "$file" pid)"; pgid="$(field "$file" pgid)"; start="$(field "$file" start)"; op="$(field "$file" op)"
-  [ -n "$pid" ] && [ -r "$PROC_ROOT/$pid/stat" ] || return 1
-  [ "$(proc_start "$pid")" = "$start" ] || return 1
+  kind="$(field "$file" kind)"; helper="$(field "$file" expected_helper)"; operation="$(field "$file" operation)"
+  pid="$(field "$file" pid)"; pgid="$(field "$file" pgid)"; start="$(field "$file" start)"
+  expected_binary="$(field "$file" expected_binary)"
+  case "$kind:$helper" in
+    build:"$TREE/scripts/pod-remote-build.sh"|run:"$TREE/scripts/pod-remote-run.sh") ;;
+    *) return 1 ;;
+  esac
+  [ -n "$operation" ] && [ -n "$pid" ] && [ -n "$pgid" ] && [ -n "$start" ] || return 1
+  [ -r "$PROC_ROOT/$pid/stat" ] && [ "$(proc_start "$pid")" = "$start" ] || return 1
   actual_pgid="$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')"
   [ "$actual_pgid" = "$pgid" ] || return 1
-  cmd="$(tr '\0' ' ' < "$PROC_ROOT/$pid/cmdline" 2>/dev/null)"
-  case "$cmd" in *pod-remote-build.sh*"$op"*|*pod-remote-run.sh*"$op"*) return 0;; esac
-  return 1
+  process_cmd_matches "$pid" "$helper" "$operation" || return 1
+  if [ "$kind" = run ]; then
+    [ -n "$expected_binary" ] || return 1
+    receipt_binary="$(field "$dir/receipt" binary)"
+    [ -z "$receipt_binary" ] || [ "$receipt_binary" = "$expected_binary" ] || return 1
+  fi
 }
 find_op() {
   local label="$1" d
   for d in "$STATE/builds/$label" "$STATE/runs/$label"; do [ -d "$d" ] && printf '%s\n' "$d"; done
+}
+terminal_receipt() {
+  local receipt="$1"
+  [ -f "$receipt" ] && [ -n "$(field "$receipt" exit)" ]
+}
+serve_port() {
+  python3 - "$1" <<'PY'
+import os, sys
+args = [os.fsdecode(x) for x in open(sys.argv[1], "rb").read().split(b"\0") if x]
+if not args or args[0] != "serve": raise SystemExit("recorded argv is not an arle serve command")
+ports = []
+i = 0
+while i < len(args):
+    arg = args[i]
+    if arg == "--port":
+        if i + 1 == len(args): raise SystemExit("recorded --port has no value")
+        ports.append(args[i + 1]); i += 2; continue
+    if arg.startswith("--port="): ports.append(arg.split("=", 1)[1])
+    i += 1
+if len(ports) > 1: raise SystemExit("recorded argv has duplicate --port")
+port = ports[0] if ports else "8000"
+if not port.isdigit() or not 1 <= int(port) <= 65535: raise SystemExit(f"invalid recorded port: {port}")
+print(port)
+PY
 }
 
 case "${1:-}" in
@@ -33,21 +97,59 @@ case "${1:-}" in
     while IFS= read -r dir; do
       [ -n "$dir" ] || continue; found=1
       if [ "$action" = log ]; then cat "$dir/log" 2>/dev/null; continue; fi
-      if valid_process "$dir/process"; then
-        if [ "$action" = kill ]; then pgid="$(field "$dir/process" pgid)"; "${KILL_CMD:-kill}" -- "-$pgid" && echo "killed $(basename "$dir") pgid=$pgid"
-        else echo "$(basename "$dir"): RUNNING pid=$(field "$dir/process" pid)"; fi
-      elif [ "$action" = kill ] && [ -f "$dir/receipt" ]; then
+      if valid_process "$dir"; then
+        if [ "$action" = kill ]; then
+          pgid="$(field "$dir/process" pgid)"
+          "${KILL_CMD:-kill}" -- "-$pgid" && echo "killed $(basename "$dir") pgid=$pgid" || failed=1
+        else
+          echo "$(basename "$dir"): RUNNING pid=$(field "$dir/process" pid) state=$(field "$dir/receipt" state)"
+        fi
+      elif terminal_receipt "$dir/receipt"; then
         echo "$(basename "$dir"): DONE exit=$(field "$dir/receipt" exit)"
-      elif [ "$action" = kill ]; then
-        echo "refuse stale or mismatched process: $(basename "$dir")" >&2
-        failed=1
       else
-        exit_code="$(field "$dir/receipt" exit 2>/dev/null)"; echo "$(basename "$dir"): DONE exit=${exit_code:-unknown}"
+        echo "$(basename "$dir"): REFUSED process ownership mismatch" >&2
+        failed=1
       fi
       [ "$action" = status ] && tail -20 "$dir/log" 2>/dev/null || true
     done < <(find_op "$label")
     [ "$found" -eq 1 ] || { echo "no operation: $label" >&2; exit 1; }
     exit "$failed"
+    ;;
+  ready)
+    LABEL="${2:?missing run label}"; TIMEOUT="${3:-1200}"
+    case "$TIMEOUT" in ''|*[!0-9]*) echo "invalid timeout: $TIMEOUT" >&2; exit 2;; esac
+    DIR="$STATE/runs/$LABEL"; RECEIPT="$DIR/receipt"
+    [ -d "$DIR" ] && [ "$(field "$RECEIPT" schema)" = arle-run-v1 ] || { echo "no run: $LABEL" >&2; exit 1; }
+    valid_process "$DIR" || { echo "run process ownership mismatch: $LABEL" >&2; exit 1; }
+    port="$(serve_port "$DIR/argv.nul")" || exit 2
+    deadline=$((SECONDS + TIMEOUT)); models_ok=0
+    while [ "$SECONDS" -le "$deadline" ]; do
+      valid_process "$DIR" || { echo "run process ownership changed: $LABEL" >&2; exit 1; }
+      if curl -sf "http://127.0.0.1:$port/v1/models" >/dev/null; then models_ok=1; break; fi
+      sleep 1
+    done
+    [ "$models_ok" -eq 1 ] || { echo "NOT_READY run=$LABEL port=$port" >&2; exit 1; }
+    stats_tmp="$DIR/stats.json.tmp.$$"
+    curl -sf "http://127.0.0.1:$port/v1/stats" -o "$stats_tmp" || { echo "stats unavailable: run=$LABEL" >&2; rm -f "$stats_tmp"; exit 1; }
+    mv "$stats_tmp" "$DIR/stats.json"
+    stats_sha="$(sha256 "$DIR/stats.json")"
+    expected_sha="$(field "$RECEIPT" binary_sha)"; expected_kernel="$(field "$RECEIPT" kernel_id)"
+    if ! python3 - "$DIR/stats.json" "$expected_sha" "$expected_kernel" <<'PY'
+import json, sys
+path, expected_sha, expected_kernel = sys.argv[1:]
+try: identity = json.load(open(path))["build_identity"]
+except (OSError, ValueError, KeyError, TypeError): raise SystemExit(1)
+actual_sha = identity.get("product_binary_sha256", "").removeprefix("sha256:")
+raise SystemExit(0 if actual_sha == expected_sha and identity.get("kernel_bundle_id") == expected_kernel else 1)
+PY
+    then
+      update_receipt "$RECEIPT" "state=identity-mismatch" "stats_file=$DIR/stats.json" "stats_sha=$stats_sha" "identity_error=runtime-build-identity-mismatch"
+      echo "runtime build identity mismatch: run=$LABEL" >&2
+      exit 1
+    fi
+    valid_process "$DIR" || { echo "run process ownership changed: $LABEL" >&2; exit 1; }
+    update_receipt "$RECEIPT" "state=running-verified" "stats_file=$DIR/stats.json" "stats_sha=$stats_sha" "verified_at=$(date -u +%FT%TZ)"
+    echo "ENGINE_READY run=$LABEL port=$port state=running-verified"
     ;;
   run)
     BUILD="${2:?missing build label}"; LABEL="${3:?missing run label}"; GPU="${4:?missing GPU}"; OP="${5:?missing operation}"; ARGV_FILE="${6:?missing argv file}"
@@ -56,34 +158,40 @@ case "${1:-}" in
     mkdir "$DIR" || exit 1
     mv "$ARGV_FILE" "$DIR/argv.nul" || exit 1
     LOG="$DIR/log"; RECEIPT="$DIR/receipt"; MARKER="$DIR/terminal"
-    echo $$ > "$DIR/pid"
-    printf '%s\n' "op=$OP" "pid=$$" "pgid=$(ps -o pgid= -p $$ | tr -d ' ')" "start=$(proc_start $$)" > "$DIR/process"
+    binary="$(field "$BUILD_RECEIPT" binary)"
+    process_pgid="$(ps -o pgid= -p $$ | tr -d ' ')"; process_start="$(proc_start $$)"
+    printf '%s\n' "schema=arle-process-v1" "kind=run" "expected_helper=$TREE/scripts/pod-remote-run.sh" "operation=$OP" "pid=$$" "pgid=$process_pgid" "start=$process_start" "expected_binary=$binary" > "$DIR/process"
     exec >"$LOG" 2>&1
-    rc=1; claim=""; binary=""; binary_sha=""; source_head=""; source_digest=""
+    rc=1; claim=""; binary_sha=""; source_head=""; source_digest_value=""; kernel_id=""; producer_id=""; embedded_id=""; selected_gpu="$GPU"
     if [ ! -f "$BUILD_RECEIPT" ] || [ "$(field "$BUILD_RECEIPT" schema)" != arle-build-v1 ] || [ "$(field "$BUILD_RECEIPT" exit)" != 0 ]; then
       echo "successful build receipt required: build:$BUILD"
     else
-      binary="$(field "$BUILD_RECEIPT" binary)"; binary_sha="$(field "$BUILD_RECEIPT" binary_sha)"
-      source_head="$(field "$BUILD_RECEIPT" source_head)"; source_digest="$(field "$BUILD_RECEIPT" source_digest)"
+      binary_sha="$(field "$BUILD_RECEIPT" binary_sha)"; source_head="$(field "$BUILD_RECEIPT" source_head)"; source_digest_value="$(field "$BUILD_RECEIPT" source_digest)"
+      kernel_id="$(field "$BUILD_RECEIPT" kernel_id)"; producer_id="$(field "$BUILD_RECEIPT" producer_id)"; embedded_id="$(field "$BUILD_RECEIPT" embedded_id)"
       if [ "$(sha256 "$binary" 2>/dev/null)" != "$binary_sha" ]; then echo "binary SHA mismatch"
-      elif [ ! -f "$TREE/.arle-source-receipt" ] || [ "$(field "$TREE/.arle-source-receipt" head)" != "$source_head" ] || [ "$(field "$TREE/.arle-source-receipt" digest)" != "$source_digest" ] || [ "$(git -C "$TREE" rev-parse HEAD)" != "$source_head" ] || [ "$(source_digest)" != "$source_digest" ]; then echo "source changed since build"
+      elif [ ! -f "$TREE/.arle-source-receipt" ] || [ "$(field "$TREE/.arle-source-receipt" head)" != "$source_head" ] || [ "$(field "$TREE/.arle-source-receipt" digest)" != "$source_digest_value" ] || [ "$(git -C "$TREE" rev-parse HEAD)" != "$source_head" ] || [ "$(source_digest)" != "$source_digest_value" ]; then echo "source changed since build"
       else
-        claim_env=(ARLE_OP_ID="$OP" ARLE_OWNER="$(id -u):$(id -un)" ARLE_CLAIM_PID="$$" ARLE_CLAIM_START="$(proc_start $$)")
-        if [ "$GPU" = auto ]; then GPU="$(env "${claim_env[@]}" bash "$TREE/scripts/pick-gpu.sh")" || GPU=""; else ARLE_GPU="$GPU" env "${claim_env[@]}" bash "$TREE/scripts/pick-gpu.sh" >/dev/null || GPU=""; fi
-        if [ -z "$GPU" ]; then echo "no free GPU"
+        claim_env=(ARLE_OP_ID="$OP" ARLE_OWNER="$(id -u):$(id -un)" ARLE_CLAIM_PID="$$" ARLE_CLAIM_START="$process_start")
+        if [ "$GPU" = auto ]; then selected_gpu="$(env "${claim_env[@]}" bash "$TREE/scripts/pick-gpu.sh")" || selected_gpu=""; else ARLE_GPU="$GPU" env "${claim_env[@]}" bash "$TREE/scripts/pick-gpu.sh" >/dev/null || selected_gpu=""; fi
+        if [ -z "$selected_gpu" ]; then echo "no free GPU"
         else
-          claim="/tmp/arle-gpu-claims/$GPU"
+          claim="${ARLE_GPU_CLAIMS:-/tmp/arle-gpu-claims}/$selected_gpu"
+          write_receipt "$RECEIPT" "schema=arle-run-v1" "state=running-unobserved" "operation=$OP" "label=$LABEL" "build_label=$BUILD" "tree=$TREE" "source_head=$source_head" "source_digest=$source_digest_value" "binary=$binary" "binary_sha=$binary_sha" "kernel_id=$kernel_id" "producer_id=$producer_id" "embedded_id=$embedded_id" "argv_file=$DIR/argv.nul" "argv_sha=$(sha256 "$DIR/argv.nul")" "gpu=$selected_gpu" "owner=$(id -u):$(id -un)" "claim_pid=$$" "claim_start=$process_start" "pid=$$" "pgid=$process_pgid" "start=$process_start" "launched_at=$(date -u +%FT%TZ)"
           # shellcheck disable=SC1091
           source "$TREE/scripts/pod-build-env.sh"
-          CUDA_VISIBLE_DEVICES="$GPU" INFER_CUDA_DEVICE=0 python3 "$TREE/scripts/reap_run.py" "$OP" --argv-file "$DIR/argv.nul" "$binary"; rc=$?
+          CUDA_VISIBLE_DEVICES="$selected_gpu" INFER_CUDA_DEVICE=0 python3 "$TREE/scripts/reap_run.py" "$OP" --argv-file "$DIR/argv.nul" "$binary"; rc=$?
         fi
       fi
     fi
-    [ -n "$claim" ] && [ "$(field "$claim" op 2>/dev/null)" = "$OP" ] && rm -f "$claim"
-    write_receipt "$RECEIPT" "schema=arle-run-v1" "operation=$OP" "label=$LABEL" "build_label=$BUILD" "tree=$TREE" "source_head=$source_head" "source_digest=$source_digest" "binary=$binary" "binary_sha=$binary_sha" "argv_file=$DIR/argv.nul" "gpu=$GPU" "exit=$rc" "pid=$$" "pgid=$(ps -o pgid= -p $$ | tr -d ' ')" "start=$(proc_start $$)" "finished_at=$(date -u +%FT%TZ)"
+    [ -n "$claim" ] && [ "$(field "$claim" op)" = "$OP" ] && rm -f "$claim"
+    if [ -f "$RECEIPT" ]; then
+      update_receipt "$RECEIPT" "state=exited" "exit=$rc" "finished_at=$(date -u +%FT%TZ)"
+    else
+      write_receipt "$RECEIPT" "schema=arle-run-v1" "state=exited" "operation=$OP" "label=$LABEL" "build_label=$BUILD" "tree=$TREE" "source_head=$source_head" "source_digest=$source_digest_value" "binary=$binary" "binary_sha=$binary_sha" "kernel_id=$kernel_id" "producer_id=$producer_id" "embedded_id=$embedded_id" "argv_file=$DIR/argv.nul" "argv_sha=$(sha256 "$DIR/argv.nul")" "gpu=$selected_gpu" "owner=$(id -u):$(id -un)" "pid=$$" "pgid=$process_pgid" "start=$process_start" "exit=$rc" "finished_at=$(date -u +%FT%TZ)"
+    fi
     write_receipt "$MARKER" "RUN_EXIT=$rc" "operation=$OP"
     printf 'RUN_EXIT=%s\n' "$rc"
     exit "$rc"
     ;;
-  *) echo "usage: pod-remote-run.sh run|status|log|kill ..." >&2; exit 2;;
+  *) echo "usage: pod-remote-run.sh run|ready|status|log|kill ..." >&2; exit 2;;
 esac
