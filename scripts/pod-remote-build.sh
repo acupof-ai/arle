@@ -8,19 +8,90 @@ mkdir -p "$STATE/builds" "$STATE/runs"
 
 proc_start() { awk '{print $22}' "/proc/$1/stat" 2>/dev/null; }
 sha256() { sha256sum "$1" | cut -d' ' -f1; }
-dirty_digest() {
-  local tmp
-  tmp="$(mktemp)" || return 1
-  git -C "$TREE" status --porcelain=v1 -z -- . ':(exclude).arle-source-receipt' > "$tmp" && sha256 "$tmp"
-  rm -f "$tmp"
+source_digest() {
+  python3 - "${1:-$TREE}" <<'PY'
+import hashlib, os, stat, subprocess, sys
+
+root = os.fsencode(os.path.abspath(sys.argv[1]))
+def git(*args):
+    return subprocess.check_output([b"git", b"-C", root, *args])
+
+paths = set(git(b"ls-tree", b"-rz", b"--name-only", b"HEAD").split(b"\0"))
+paths.update(git(b"ls-files", b"-co", b"--exclude-standard", b"-z").split(b"\0"))
+paths.discard(b"")
+paths.discard(b".arle-source-receipt")
+digest = hashlib.sha256()
+for path in sorted(paths):
+    full = os.path.join(root, path)
+    digest.update(len(path).to_bytes(8, "big")); digest.update(path)
+    try:
+        mode = os.lstat(full).st_mode
+    except FileNotFoundError:
+        digest.update(b"D")
+        continue
+    if stat.S_ISLNK(mode):
+        data = os.fsencode(os.readlink(full)); kind = b"L"
+    elif stat.S_ISREG(mode):
+        with open(full, "rb") as f: data = f.read()
+        kind = b"X" if mode & 0o111 else b"F"
+    else:
+        continue
+    digest.update(kind); digest.update(len(data).to_bytes(8, "big")); digest.update(data)
+print(digest.hexdigest())
+PY
+}
+validate_build_args() {
+  python3 - "$1" <<'PY'
+import os, sys
+args = [os.fsdecode(x) for x in open(sys.argv[1], "rb").read().split(b"\0") if x]
+release = False
+binary = None
+i = 0
+while i < len(args):
+    arg = args[i]
+    if arg == "--release": release = True; i += 1
+    elif arg == "--no-default-features": i += 1
+    elif arg in ("--features", "--bin"):
+        if i + 1 == len(args) or args[i + 1].startswith("-"):
+            raise SystemExit(f"missing value for {arg}")
+        if arg == "--bin":
+            if binary is not None: raise SystemExit("--bin must occur exactly once")
+            binary = args[i + 1]
+        i += 2
+    elif arg.startswith("--features="):
+        if not arg.removeprefix("--features="): raise SystemExit("missing value for --features")
+        i += 1
+    elif arg.startswith(("--profile", "--target-dir", "--target")):
+        raise SystemExit(f"unsupported cargo build argument: {arg}")
+    else:
+        raise SystemExit(f"unsupported cargo build argument: {arg}")
+if not release: raise SystemExit("cargo build arguments require --release")
+if binary is None: raise SystemExit("cargo build arguments require --bin")
+if "/" in binary or binary in ("", ".", ".."): raise SystemExit("invalid --bin value")
+print(binary)
+PY
 }
 write_receipt() {
   local dst="$1" tmp="$1.tmp.$$"
   shift
   printf '%s\n' "$@" > "$tmp" && mv "$tmp" "$dst"
 }
+restore_persistent() {
+  local from="$1" to="$2" path
+  for path in target crates/cuda-kernels/tools/tilelang/.venv bench-output; do
+    [ -e "$from/$path" ] || continue
+    mkdir -p "$(dirname "$to/$path")" || return 1
+    mv "$from/$path" "$to/$path" || return 1
+  done
+}
 
 case "${1:-}" in
+  source-digest)
+    source_digest "${2:-$TREE}"
+    ;;
+  validate-build-args)
+    validate_build_args "${2:?missing argv file}"
+    ;;
   apply-sync)
     stage="${2:?missing sync stage}"
     exec 9>"$TREE_LOCK"
@@ -43,12 +114,17 @@ case "${1:-}" in
       [ -d "$backup" ] && mv "$backup" "$TREE"
       exit 1
     fi
+    if ! restore_persistent "$backup" "$TREE"; then
+      restore_persistent "$TREE" "$backup" || true
+      rm -rf "$TREE"; mv "$backup" "$TREE"; exit 1
+    fi
     head="$(awk -F= '$1=="head" {print $2}' "$meta")"
     actual_head="$(git -C "$TREE" rev-parse HEAD)"
     expected_digest="$(awk -F= '$1=="dirty_digest" {print $2}' "$meta")"
-    actual_digest="$(dirty_digest)"
+    actual_digest="$(source_digest)"
     if [ "$actual_head" != "$head" ] || [ "$actual_digest" != "$expected_digest" ]; then
-      rm -rf "$TREE"; mv "$backup" "$TREE"; echo "sync source mismatch" >&2; exit 1
+      restore_persistent "$TREE" "$backup" || true
+      rm -rf "$TREE"; mv "$backup" "$TREE"; echo "sync source mismatch: head=$actual_head expected_head=$head digest=$actual_digest expected_digest=$expected_digest" >&2; exit 1
     fi
     receipt="$TREE/.arle-source-receipt"
     write_receipt "$receipt" "schema=arle-source-v1" "head=$actual_head" "digest=$actual_digest" "archive_sha=$archive_sha" "bundle_sha=$bundle_sha" "applied_at=$(date -u +%FT%TZ)"
@@ -57,6 +133,7 @@ case "${1:-}" in
     ;;
   build)
     LABEL="${2:?missing label}"; OP="${3:?missing operation}"; ARGV_FILE="${4:?missing argv file}"
+    binary_name="$(validate_build_args "$ARGV_FILE")" || exit 2
     DIR="$STATE/builds/$LABEL"
     [ ! -e "$DIR" ] || { echo "build label exists: $LABEL" >&2; exit 1; }
     mkdir "$DIR" || exit 1
@@ -65,7 +142,10 @@ case "${1:-}" in
     echo $$ > "$DIR/pid"
     printf '%s\n' "op=$OP" "pid=$$" "pgid=$(ps -o pgid= -p $$ | tr -d ' ')" "start=$(proc_start $$)" > "$DIR/process"
     exec >"$LOG" 2>&1
+    # shellcheck disable=SC1091
     source "$TREE/scripts/pod-build-env.sh"
+    # shellcheck disable=SC1091
+    source "$TREE/scripts/cuda_prebuilt_manifest.sh"
     cd "$TREE" || exit 1
     source_receipt="$TREE/.arle-source-receipt"
     rc=1; binary=""
@@ -73,17 +153,10 @@ case "${1:-}" in
       echo "source receipt required"
     else
       source_head="$(awk -F= '$1=="head" {print $2}' "$source_receipt")"
-      source_digest="$(awk -F= '$1=="digest" {print $2}' "$source_receipt")"
-      argv_dump="$(python3 - "$DIR/argv.nul" <<'PY'
-import shlex, sys
-raw = open(sys.argv[1], "rb").read().split(b"\0")
-if raw and not raw[-1]: raw.pop()
-print(" ".join(shlex.quote(x.decode()) for x in raw))
-PY
-)"
+      source_digest_value="$(awk -F= '$1=="digest" {print $2}' "$source_receipt")"
       exec 9>"$TREE_LOCK"
       flock 9
-      if [ "$(git rev-parse HEAD)" != "$source_head" ] || [ "$(dirty_digest)" != "$source_digest" ]; then
+      if [ "$(git rev-parse HEAD)" != "$source_head" ] || [ "$(source_digest)" != "$source_digest_value" ]; then
         echo "source changed since receipt"
       else
         # shellcheck disable=SC2016
@@ -95,22 +168,19 @@ if raw and not raw[-1]: raw.pop()
 os.execvp("cargo", ["cargo", "build", *(os.fsdecode(x) for x in raw)])
 PY
         rc=$?
-        binary="$TREE/target/release/arle"
-        case " $argv_dump " in *' --bin '*) binary="$TREE/target/release/$(python3 - "$DIR/argv.nul" <<'PY'
-import os, sys
-args = [os.fsdecode(x) for x in open(sys.argv[1], 'rb').read().split(b'\0') if x]
-print(args[args.index('--bin') + 1] if '--bin' in args else 'arle')
-PY
-)";; esac
+        binary="$TREE/target/release/$binary_name"
       fi
     fi
     binary_sha=""; [ "$rc" -eq 0 ] && [ -f "$binary" ] && binary_sha="$(sha256 "$binary")" || rc=1
     manifest="$(find "$TREE/target" -name arle-cuda-kernels.manifest -type f -print 2>/dev/null | sort | tail -1)"
     manifest_sha=""; kernel_id=""
-    if [ -n "$manifest" ]; then manifest_sha="$(sha256 "$manifest")"; kernel_id="$(awk -F= '$1=="build_id" {print $2}' "$manifest" | tail -1)"; fi
-    write_receipt "$RECEIPT" "schema=arle-build-v1" "operation=$OP" "label=$LABEL" "tree=$TREE" "source_head=${source_head:-}" "source_digest=${source_digest:-}" "argv_file=$DIR/argv.nul" "binary=$binary" "binary_sha=$binary_sha" "producer_manifest=$manifest" "producer_manifest_sha=$manifest_sha" "kernel_id=$kernel_id" "exit=$rc" "pid=$$" "pgid=$(ps -o pgid= -p $$ | tr -d ' ')" "start=$(proc_start $$)" "finished_at=$(date -u +%FT%TZ)"
+    if [ -n "$manifest" ]; then
+      manifest_sha="$(sha256 "$manifest")"
+      cuda_prebuilt_manifest_validate "$manifest" && kernel_id="$(cuda_prebuilt_manifest_value "$manifest" kernel_build_id)" || rc=1
+    fi
+    write_receipt "$RECEIPT" "schema=arle-build-v1" "operation=$OP" "label=$LABEL" "tree=$TREE" "source_head=${source_head:-}" "source_digest=${source_digest_value:-}" "argv_file=$DIR/argv.nul" "binary=$binary" "binary_sha=$binary_sha" "producer_manifest=$manifest" "producer_manifest_sha=$manifest_sha" "kernel_id=$kernel_id" "exit=$rc" "pid=$$" "pgid=$(ps -o pgid= -p $$ | tr -d ' ')" "start=$(proc_start $$)" "finished_at=$(date -u +%FT%TZ)"
     printf 'BUILD_EXIT=%s\n' "$rc"
     exit "$rc"
     ;;
-  *) echo "usage: pod-remote-build.sh apply-sync|build ..." >&2; exit 2;;
+  *) echo "usage: pod-remote-build.sh source-digest|validate-build-args|apply-sync|build ..." >&2; exit 2;;
 esac
