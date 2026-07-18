@@ -33,7 +33,7 @@ pod_path() {
 
 case "$cmd" in
   push-scripts)
-    for s in pod-build-env.sh pod-remote-build.sh pod-remote-run.sh pod-tilelang-env.sh pick-gpu.sh reap_run.py; do
+    for s in pod-build-env.sh pod-remote-build.sh pod-remote-run.sh pod-tilelang-env.sh pick-gpu.sh reap_run.py cuda_prebuilt_manifest.sh; do
       push_or_die "$ROOT/scripts/$s" "$NODE_TREE/scripts/$s"
     done
     echo "pushed pod helpers -> $NODE_TREE/scripts/"
@@ -55,8 +55,7 @@ case "$cmd" in
     stage="$(mktemp -d -t arle-sync-XXXXXX)"
     trap 'rm -rf "$stage"' EXIT
     head="$(git -C "$ROOT" rev-parse HEAD)"
-    git -C "$ROOT" status --porcelain=v1 -z > "$stage/status"
-    dirty_digest="$(shasum -a 256 "$stage/status" | cut -d' ' -f1)"
+    dirty_digest="$(POD_TREE="$ROOT" bash "$ROOT/scripts/pod-remote-build.sh" source-digest "$ROOT")"
     : > "$stage/files"
     while IFS= read -r -d '' path; do [ -f "$ROOT/$path" ] && printf '%s\0' "$path" >> "$stage/files"; done < <(git -C "$ROOT" ls-files -co --exclude-standard -z)
     git -C "$ROOT" ls-files -d -z > "$stage/deletes"
@@ -78,10 +77,11 @@ case "$cmd" in
     if [ -n "$label" ]; then shift; else label="$(new_label build)"; fi
     valid_label "$label"
     [ $# -gt 0 ] || set -- --release --features cuda --bin arle
-    op="build-$label-$(date +%s)-$$-$RANDOM"
     tmp="$(mktemp -t arle-build-argv-XXXXXX)"
     trap 'rm -f "$tmp"' EXIT
     args_file "$tmp" "$@"
+    bash "$ROOT/scripts/pod-remote-build.sh" validate-build-args "$tmp" >/dev/null
+    op="build-$label-$(date +%s)-$$-$RANDOM"
     remote="$NODE_TREE.build-$op.argv"
     push_or_die "$tmp" "$remote"
     pod_remote="$(pod_path "$remote")"
