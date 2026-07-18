@@ -1,9 +1,7 @@
 name: Kernels Publish
 
-# Regenerate the TileLang AOT kernel bundle whenever a kernel-relevant source
-# changes and publish an immutable, source-addressed asset to the
-# `kernel-artifacts` release. Consumers compute the same exact identity; there
-# is no mutable latest asset. This job is the one place that needs TileLang.
+# Candidate mode builds once, then proves the exact Action artifact is consumable
+# without TileLang. Qualification mode only promotes that tested candidate.
 on:
   push:
     branches: [main]
@@ -18,18 +16,17 @@ on:
       - crates/cuda-kernels/kernels.toml
       - crates/cuda-kernels/build.rs
       - requirements-build.txt
-      # The bundle id + pack/fetch contract — a change here re-addresses the bundle.
       - scripts/kernel_artifacts.sh
       - scripts/cuda_prebuilt_manifest.sh
       - .github/workflows/kernels-publish.yml
   workflow_dispatch:
     inputs:
-      correctness_evidence_run_id:
-        description: CUDA CI run ID containing kernel-correctness evidence
+      kernel_candidate_run_id:
+        description: Candidate-mode Kernels Publish run ID; enables qualification mode
         required: false
         type: string
-      kernel_candidate_run_id:
-        description: Kernels Publish run ID containing the tested kernel-bundle-candidate
+      evidence_run_ids:
+        description: Comma/newline-separated CUDA CI run IDs containing qualification fragments
         required: false
         type: string
 
@@ -38,7 +35,6 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # .cargo/config.toml pins rustc-wrapper=sccache for local dev; not installed here.
   RUSTC_WRAPPER: ""
 
 permissions:
@@ -48,8 +44,28 @@ permissions:
   id-token: write
 
 jobs:
+  validate-mode:
+    name: Validate mode
+    runs-on: ubuntu-latest
+    outputs:
+      qualify: ${{ steps.mode.outputs.qualify }}
+    steps:
+      - id: mode
+        env:
+          CANDIDATE_RUN_ID: ${{ inputs.kernel_candidate_run_id }}
+          EVIDENCE_RUN_IDS: ${{ inputs.evidence_run_ids }}
+        run: |
+          if [[ -n "$CANDIDATE_RUN_ID" || -n "$EVIDENCE_RUN_IDS" ]]; then
+            test -n "$CANDIDATE_RUN_ID" && test -n "$EVIDENCE_RUN_IDS"
+            echo 'qualify=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'qualify=false' >> "$GITHUB_OUTPUT"
+          fi
+
   build:
-    name: Build T1 kernel bundle
+    name: Build T1 kernel candidate
+    needs: validate-mode
+    if: ${{ needs.validate-mode.outputs.qualify == 'false' }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
@@ -65,9 +81,6 @@ jobs:
           method: network
 
       - name: Install TileLang stack (pinned set + carried tvm-ffi patch)
-        # Vanilla tvm-ffi at the pin aborts `import tilelang` under tilelang's
-        # bundled TVM (tile-ai/tilelang#2367); rebuild it from sdist with the
-        # carried patch — same flow as scripts/pod-tilelang-env.sh.
         run: |
           pip install --no-cache-dir -r requirements-build.txt
           pin="$(grep -oE 'apache-tvm-ffi==[0-9.]+' requirements-build.txt | cut -d= -f3)"
@@ -88,12 +101,12 @@ jobs:
           ARLE_CUDA_KERNEL_CACHE: '0'
         run: cargo build --release --features cuda -p cuda-kernels
 
-      - name: Pack unqualified bundle
+      - name: Pack unqualified candidate
         env:
           ARLE_KERNEL_CORRECTNESS_STATUS: not-run
         run: scripts/kernel_artifacts.sh pack
 
-      - name: Upload bundle candidate
+      - name: Upload exact candidate
         uses: actions/upload-artifact@v7
         with:
           name: kernel-bundle-candidate
@@ -101,13 +114,10 @@ jobs:
             arle-kernels-t1-*.tar.gz
             arle-kernels-t1-*.tar.gz.sha256
 
-  # The consumer contract, proven cold on every refresh: a fresh runner with
-  # NO Python kernel stack fetches the bundle and builds the full T1 set —
-  # any regen attempt (bundle stale/incomplete) panics with the tilelang
-  # probe error and fails this job.
   consume-check:
-    name: Zero-Python candidate consume check
-    needs: build
+    name: Zero-Python exact candidate consume
+    needs: [validate-mode, build]
+    if: ${{ needs.validate-mode.outputs.qualify == 'false' }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -122,70 +132,71 @@ jobs:
           cuda: '12.8.0'
           method: network
 
-      - name: Download bundle candidate
+      - name: Download exact candidate artifact
         uses: actions/download-artifact@v8
         with:
           name: kernel-bundle-candidate
           path: /tmp/kernel-bundle-candidate
 
-      - name: Fetch the exact candidate bundle
+      - name: Fetch exact candidate
         run: scripts/kernel_artifacts.sh fetch /tmp/kernel-bundle-candidate
 
-      - name: Build the T1 kernel set with zero Python
+      - name: Build product cold with TileLang poisoned
         env:
           TORCH_CUDA_ARCH_LIST: '8.0;8.6;8.9;9.0'
           ARLE_CUDA_ENABLE_FA3: '1'
           ARLE_CUDA_KERNEL_CACHE: '0'
-          # Poison the tilelang probe: consume must never need it.
           INFER_TILELANG_PYTHON: /usr/bin/false
-        run: cargo build --release --features cuda -p cuda-kernels
+          CARGO_TARGET_DIR: product/cuda-kernels
+        run: |
+          rm -rf "$CARGO_TARGET_DIR"
+          cargo build --release --features cuda -p arle --bin arle
 
-  publish-qualified:
-    name: Publish correctness-qualified bundle
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.correctness_evidence_run_id != '' && inputs.kernel_candidate_run_id != '' }}
-    needs: [build, consume-check]
+  qualify:
+    name: Aggregate and promote tested candidate
+    needs: validate-mode
+    if: ${{ needs.validate-mode.outputs.qualify == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download correctness evidence
+      - name: Download named candidate and evidence fragments
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh run download "${{ inputs.correctness_evidence_run_id }}" -n kernel-correctness -D /tmp/kernel-correctness
-
-      - name: Download tested kernel candidate
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh run download "${{ inputs.kernel_candidate_run_id }}" -n kernel-bundle-candidate -D /tmp/kernel-bundle-candidate
-
-      - name: Verify tested candidate identity
-        id: tested
+          CANDIDATE_RUN_ID: ${{ inputs.kernel_candidate_run_id }}
+          EVIDENCE_RUN_IDS: ${{ inputs.evidence_run_ids }}
         run: |
-          CANDIDATE="$(compgen -G '/tmp/kernel-bundle-candidate/arle-kernels-t1-*.tar.gz')"
-          CANDIDATE_SHA="$(sha256sum "$CANDIDATE" | cut -d' ' -f1)"
-          mkdir /tmp/kernel-candidate-manifest
-          tar -xzf "$CANDIDATE" -C /tmp/kernel-candidate-manifest ./manifest.json
-          BUNDLE_ID="$(jq -er '.bundle_id' /tmp/kernel-candidate-manifest/manifest.json)"
-          test "$BUNDLE_ID" = "$(scripts/kernel_artifacts.sh id)"
-          test "$(jq -er '.bundle_id' /tmp/kernel-correctness/correctness-evidence.json)" = "$BUNDLE_ID"
-          test "$(jq -er '.source_commit' /tmp/kernel-correctness/correctness-evidence.json)" = "$GITHUB_SHA"
-          test "$(jq -er '.artifact_sha256' /tmp/kernel-correctness/correctness-evidence.json)" = "$CANDIDATE_SHA"
-          echo "sha256=$CANDIDATE_SHA" >> "$GITHUB_OUTPUT"
+          mkdir -p /tmp/kernel-candidate /tmp/kernel-fragments
+          gh run download "$CANDIDATE_RUN_ID" -n kernel-bundle-candidate -D /tmp/kernel-candidate
+          printf '%s\n' "$EVIDENCE_RUN_IDS" | tr ',' '\n' | sed '/^[[:space:]]*$/d' | while read -r run_id; do
+            [[ "$run_id" =~ ^[0-9]+$ ]]
+            dir="/tmp/kernel-fragments/$run_id"
+            mkdir "$dir"
+            gh run download "$run_id" -n kernel-qualification-fragment -D "$dir"
+          done
 
-      - name: Restore tested generated kernel tree
-        run: scripts/kernel_artifacts.sh fetch /tmp/kernel-bundle-candidate
+      - name: Aggregate exact candidate evidence
+        run: |
+          mapfile -t candidates < <(find /tmp/kernel-candidate -maxdepth 1 -name 'arle-kernels-t1-*.tar.gz' -type f)
+          ((${#candidates[@]} == 1))
+          mapfile -t checksums < <(find /tmp/kernel-candidate -maxdepth 1 -name 'arle-kernels-t1-*.tar.gz.sha256' -type f)
+          ((${#checksums[@]} == 1))
+          mapfile -t fragments < <(find /tmp/kernel-fragments -name qualification-fragment.json -type f | sort)
+          ((${#fragments[@]} > 0))
+          scripts/kernel_artifacts.sh aggregate-qualification "${candidates[0]}" /tmp/aggregate-qualification.json "${fragments[@]}"
 
-      - name: Publish exact immutable qualified bundle
+      - name: Qualify and publish exact candidate bytes
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          ARLE_KERNEL_CORRECTNESS_STATUS: passed
-          ARLE_KERNEL_CORRECTNESS_EVIDENCE: /tmp/kernel-correctness/correctness-evidence.json
-          ARLE_KERNEL_TESTED_ARTIFACT_SHA256: ${{ steps.tested.outputs.sha256 }}
-        run: scripts/kernel_artifacts.sh publish
+        run: |
+          mapfile -t candidates < <(find /tmp/kernel-candidate -maxdepth 1 -name 'arle-kernels-t1-*.tar.gz' -type f)
+          ((${#candidates[@]} == 1))
+          scripts/kernel_artifacts.sh qualify-publish "${candidates[0]}" /tmp/aggregate-qualification.json
 
-      - name: Attest immutable bundle
+      - name: Attest immutable candidate and qualification
         uses: actions/attest-build-provenance@v4
         with:
           subject-path: |
-            arle-kernels-t1-*.tar.gz
-            arle-kernels-t1-*.tar.gz.sha256
+            /tmp/kernel-candidate/arle-kernels-t1-*.tar.gz
+            /tmp/kernel-candidate/arle-kernels-t1-*.tar.gz.sha256
+            /tmp/aggregate-qualification.json
