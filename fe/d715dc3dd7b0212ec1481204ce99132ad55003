@@ -1,0 +1,29 @@
+crates/cli/src/args.rs
+  s_9c91b86ec3fb55::t_7f3801ae43e60b 1955-1960
+crates/cli/src/train_cli.rs
+  s_9c91b86ec3fb55::t_0672d5f20aa0d5 2926
+crates/infer-api/src/lib.rs
+  s_9c91b86ec3fb55::t_97d9a3b30103b4 79
+crates/infer-server/src/lib.rs
+  s_9c91b86ec3fb55::t_f5a7ae2f7813bf 77
+crates/infer-server/src/schema.rs
+  s_9c91b86ec3fb55::t_ec3d8b0047cabc 9,21-34,398
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "fed715dc3dd7b0212ec1481204ce99132ad55003",
+  "prompts": {},
+  "sessions": {
+    "s_9c91b86ec3fb55": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4779911a-69b7-49db-bc83-daf5a48d6ca3",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
