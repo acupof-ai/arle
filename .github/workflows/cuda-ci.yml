@@ -151,20 +151,17 @@ jobs:
             qwen|qwen-fa3) export GATE_PROFILE=generic ;;
             dsv4) export GATE_PROFILE=dsv4 ;;
           esac
-          scripts/lever_gate.sh kernel-candidate &
-          gate_pid=$!
-          stats=''
-          while kill -0 "$gate_pid" 2>/dev/null; do
-            if curl -sf "http://127.0.0.1:${PORT}/v1/stats" -o stats.json; then
-              stats=1
-              break
-            fi
-            sleep 1
-          done
-          wait "$gate_pid"
-          test -n "$stats"
           mapfile -t candidates < <(find /tmp/kernel-candidate -maxdepth 1 -name 'arle-kernels-t1-*.tar.gz' -type f)
           ((${#candidates[@]} == 1))
+          producer="$(tar -tzf "${candidates[0]}" | grep 'arle-cuda-kernels.manifest$')"
+          test "$(wc -l <<<"$producer")" -eq 1
+          export STATS_OUT=stats.json
+          product_sha="$(sha256sum "$BIN" | cut -d' ' -f1)"
+          kernel_id="$(tar -xOzf "${candidates[0]}" "$producer" | sed -n 's/^kernel_build_id=//p')"
+          export EXPECTED_PRODUCT_SHA256="$product_sha"
+          export EXPECTED_KERNEL_BUNDLE_ID="$kernel_id"
+          test -n "$EXPECTED_KERNEL_BUNDLE_ID"
+          scripts/lever_gate.sh kernel-candidate
           ARLE_KERNEL_TEST_BINARY="$BIN" \
             ARLE_KERNEL_TESTED_SM="$(<tested-sm.txt)" \
             ARLE_KERNEL_QUALIFICATION_PROFILE="$QUALIFICATION_PROFILE" \

@@ -36,6 +36,9 @@ LENGTHS="${LENGTHS:-115,300,446,2000,8000}"
 RUNS="${RUNS:-3}"
 SERVE_FLAGS="${SERVE_FLAGS:-}"
 OUT="${OUT:-needle_gate_${LABEL}.log}"
+STATS_OUT="${STATS_OUT:-}"
+EXPECTED_PRODUCT_SHA256="${EXPECTED_PRODUCT_SHA256:-}"
+EXPECTED_KERNEL_BUNDLE_ID="${EXPECTED_KERNEL_BUNDLE_ID:-}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 export RUST_LOG="${RUST_LOG:-info}"
 
@@ -102,6 +105,13 @@ if [ -n "${LEVER_GATE_VALIDATE_LOG:-}" ]; then
     validate_summary "$LEVER_GATE_VALIDATE_LOG" "${BASELINE_LOG:-}"
     exit
 fi
+if [ -n "$EXPECTED_PRODUCT_SHA256" ] || [ -n "$EXPECTED_KERNEL_BUNDLE_ID" ]; then
+    [ -n "$EXPECTED_PRODUCT_SHA256" ] && [ -n "$EXPECTED_KERNEL_BUNDLE_ID" ] || {
+        echo "[gate] expected product SHA and kernel bundle ID must be provided together" >&2
+        exit 2
+    }
+    [ -n "$STATS_OUT" ] || { echo "[gate] STATS_OUT is required with expected identities" >&2; exit 2; }
+fi
 
 # DSv4 multi-GPU profile: the TP=8 + DSv4 kernel env. Defaults to dsv4 so the
 # existing DSv4 gate is byte-identical; any other GATE_PROFILE (generic, qwen)
@@ -118,9 +128,15 @@ fi
 # Lever env flips ride the CLI: lever_gate.sh <label> KEY=VAL ...
 for kv in "$@"; do export "${kv?}"; done
 
-# shellcheck disable=SC2086  # SERVE_FLAGS is an intentional word-split passthrough
-"$BIN" serve --backend cuda --model-path "$MODEL" --port "$PORT" "${DSV4_FLAGS[@]}" $SERVE_FLAGS \
-    > "serve_${LABEL}.log" 2>&1 &
+if [ "${GATE_PROFILE:-dsv4}" = "dsv4" ]; then
+    # shellcheck disable=SC2086  # SERVE_FLAGS is an intentional word-split passthrough
+    "$BIN" serve --backend cuda --model-path "$MODEL" --port "$PORT" "${DSV4_FLAGS[@]}" $SERVE_FLAGS \
+        > "serve_${LABEL}.log" 2>&1 &
+else
+    # shellcheck disable=SC2086  # SERVE_FLAGS is an intentional word-split passthrough
+    "$BIN" serve --backend cuda --model-path "$MODEL" --port "$PORT" $SERVE_FLAGS \
+        > "serve_${LABEL}.log" 2>&1 &
+fi
 SERVE_PID=$!
 trap 'kill $SERVE_PID 2>/dev/null; wait $SERVE_PID 2>/dev/null' EXIT
 
@@ -130,6 +146,27 @@ for _ in $(seq 1 120); do
     sleep 5
 done
 curl -sf "http://127.0.0.1:${PORT}/v1/models" >/dev/null || { echo "[gate] serve never ready"; exit 3; }
+
+if [ -n "$EXPECTED_PRODUCT_SHA256" ]; then
+    stats_tmp="$(mktemp "${STATS_OUT}.tmp.XXXXXX")" || exit 2
+    curl -sf "http://127.0.0.1:${PORT}/v1/stats" -o "$stats_tmp" || {
+        rm -f "$stats_tmp"
+        echo "[gate] failed to capture /v1/stats" >&2
+        exit 3
+    }
+    expected_sha="${EXPECTED_PRODUCT_SHA256#sha256:}"
+    jq -e --arg sha "$expected_sha" --arg kernel "$EXPECTED_KERNEL_BUNDLE_ID" '
+        ($sha | test("^[0-9a-f]{64}$")) and
+        (.build_identity.product_binary_sha256 | type == "string") and
+        ((.build_identity.product_binary_sha256 | sub("^sha256:"; "")) == $sha) and
+        .build_identity.kernel_bundle_id == $kernel
+    ' "$stats_tmp" >/dev/null || {
+        rm -f "$stats_tmp"
+        echo "[gate] runtime build identity mismatch" >&2
+        exit 3
+    }
+    mv "$stats_tmp" "$STATS_OUT"
+fi
 
 PORT="$PORT" python3 "$ROOT/scripts/needle_gate.py" "$LENGTHS" "$RUNS" 0.0 2>&1 | tee "$OUT"
 status=${PIPESTATUS[0]}

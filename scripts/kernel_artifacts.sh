@@ -594,19 +594,24 @@ case "${1:-help}" in
         ;;
     fetch|fetch-qualified)
         cd "$ROOT"
-        require_passed=0
-        [[ "$1" == fetch-qualified ]] && require_passed=1
+        qualified=0
+        [[ "$1" == fetch-qualified ]] && qualified=1
         id="$(kernel_bundle_id)"
         file="arle-kernels-$LANE-$id.tar.gz"
         checksum="$file.sha256"
+        sidecar="$file.qualification.json"
         tmp="$(mktemp -d)"
         source_ref="${2:-$REL}"
         if [[ -d "$source_ref" ]]; then
             cp "$source_ref/$file" "$source_ref/$checksum" "$tmp/"
+            [[ "$qualified" == 0 ]] || cp "$source_ref/$sidecar" "$tmp/"
         else
-            gh release download "$source_ref" -R "$REPO" -p "$file" -p "$checksum" -D "$tmp"
+            patterns=(-p "$file" -p "$checksum")
+            [[ "$qualified" == 0 ]] || patterns+=(-p "$sidecar")
+            gh release download "$source_ref" -R "$REPO" "${patterns[@]}" -D "$tmp"
         fi
-        verify_archive "$tmp/$file" "$tmp/$checksum" "$id" "$require_passed"
+        verify_archive "$tmp/$file" "$tmp/$checksum" "$id"
+        [[ "$qualified" == 0 ]] || qualification_policy_validate "$tmp/$file" "$tmp/$sidecar"
         stage="$ROOT/crates/cuda-kernels/generated.fetch.$$"
         rm -rf "$stage"
         mkdir -p "$stage"

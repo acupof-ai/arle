@@ -62,3 +62,67 @@ if LEVER_GATE_VALIDATE_LOG="$tmp/incomplete.log" LENGTHS=115,300 RUNS=3 \
     echo "lever gate accepted an incomplete summary" >&2
     exit 1
 fi
+
+expect_fail() {
+    if "$@" >/dev/null 2>&1; then
+        echo "unexpected success: $*" >&2
+        exit 1
+    fi
+}
+
+SHA="$(printf product | shasum -a 256 | cut -d' ' -f1)"
+KERNEL_ID="bundle:$(printf kernel | shasum -a 256 | cut -d' ' -f1)"
+cat >"$tmp/server.py" <<'PY'
+import json, os
+from http.server import BaseHTTPRequestHandler, HTTPServer
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == '/v1/models': body = b'{}'
+        elif self.path == '/v1/stats': body = os.environ['STATS'].encode()
+        else: self.send_error(404); return
+        self.send_response(200); self.send_header('Content-Length', str(len(body))); self.end_headers(); self.wfile.write(body)
+    def log_message(self, *_): pass
+HTTPServer(('127.0.0.1', int(os.environ['PORT'])), Handler).serve_forever()
+PY
+cat >"$tmp/bin" <<'EOF'
+#!/usr/bin/env bash
+exec python3 "$SERVER"
+EOF
+chmod +x "$tmp/bin"
+cat >"$tmp/needle.py" <<'EOF'
+#!/usr/bin/env python3
+print('SUMMARY len=115 depth=0.00 exact=1 partial=0 miss=0 DET')
+EOF
+mkdir -p "$tmp/root/scripts"
+cp "$ROOT/scripts/lever_gate.sh" "$tmp/root/scripts/lever_gate.sh"
+cp "$tmp/needle.py" "$tmp/root/scripts/needle_gate.py"
+
+run_gate() {
+    local stats="$1" out="$2" sha="${3:-$SHA}" kernel="${4:-$KERNEL_ID}" port="$5"
+    STATS="$stats" SERVER="$tmp/server.py" BIN="$tmp/bin" MODEL=model GATE_PROFILE=generic \
+        PORT="$port" LENGTHS=115 RUNS=1 STATS_OUT="$out" EXPECTED_PRODUCT_SHA256="$sha" \
+        EXPECTED_KERNEL_BUNDLE_ID="$kernel" "$tmp/root/scripts/lever_gate.sh" identity >/dev/null
+}
+
+STATS="{\"build_identity\":{\"product_binary_sha256\":\"sha256:$SHA\",\"kernel_bundle_id\":\"$KERNEL_ID\"}}"
+run_gate "$STATS" "$tmp/stats.json" "sha256:$SHA" "$KERNEL_ID" 29189
+cmp <(printf '%s' "$STATS") "$tmp/stats.json"
+
+for case in wrong-sha wrong-kernel malformed missing; do
+    out="$tmp/$case.json"
+    printf sentinel >"$out"
+    stats="$STATS"; sha="$SHA"; kernel="$KERNEL_ID"
+    case "$case" in
+        wrong-sha) sha="$(printf wrong | shasum -a 256 | cut -d' ' -f1)" ;;
+        wrong-kernel) kernel="bundle:$(printf wrong | shasum -a 256 | cut -d' ' -f1)" ;;
+        malformed) stats='{' ;;
+        missing) stats='{}' ;;
+    esac
+    expect_fail run_gate "$stats" "$out" "$sha" "$kernel" $((29189 + RANDOM % 1000))
+    [[ "$(<"$out")" == sentinel ]]
+done
+
+expect_fail env EXPECTED_PRODUCT_SHA256="$SHA" STATS_OUT="$tmp/one.json" \
+    "$ROOT/scripts/lever_gate.sh" one-sided
+expect_fail env EXPECTED_KERNEL_BUNDLE_ID="$KERNEL_ID" STATS_OUT="$tmp/one.json" \
+    "$ROOT/scripts/lever_gate.sh" one-sided
