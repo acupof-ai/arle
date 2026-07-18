@@ -125,12 +125,17 @@ case "${1:-}" in
     deadline=$((SECONDS + TIMEOUT)); models_ok=0
     while [ "$SECONDS" -le "$deadline" ]; do
       valid_process "$DIR" || { echo "run process ownership changed: $LABEL" >&2; exit 1; }
-      if curl -sf "http://127.0.0.1:$port/v1/models" >/dev/null; then models_ok=1; break; fi
+      remaining=$((deadline - SECONDS + 1))
+      [ "$remaining" -gt 5 ] && request_timeout=5 || request_timeout="$remaining"
+      if curl --max-time "$request_timeout" -sf "http://127.0.0.1:$port/v1/models" >/dev/null; then models_ok=1; break; fi
       sleep 1
     done
     [ "$models_ok" -eq 1 ] || { echo "NOT_READY run=$LABEL port=$port" >&2; exit 1; }
     stats_tmp="$DIR/stats.json.tmp.$$"
-    curl -sf "http://127.0.0.1:$port/v1/stats" -o "$stats_tmp" || { echo "stats unavailable: run=$LABEL" >&2; rm -f "$stats_tmp"; exit 1; }
+    remaining=$((deadline - SECONDS + 1))
+    [ "$remaining" -gt 0 ] || { echo "stats deadline expired: run=$LABEL" >&2; exit 1; }
+    [ "$remaining" -gt 5 ] && request_timeout=5 || request_timeout="$remaining"
+    curl --max-time "$request_timeout" -sf "http://127.0.0.1:$port/v1/stats" -o "$stats_tmp" || { echo "stats unavailable: run=$LABEL" >&2; rm -f "$stats_tmp"; exit 1; }
     mv "$stats_tmp" "$DIR/stats.json"
     stats_sha="$(sha256 "$DIR/stats.json")"
     expected_sha="$(field "$RECEIPT" binary_sha)"; expected_kernel="$(field "$RECEIPT" kernel_id)"
@@ -143,12 +148,18 @@ actual_sha = identity.get("product_binary_sha256", "").removeprefix("sha256:")
 raise SystemExit(0 if actual_sha == expected_sha and identity.get("kernel_bundle_id") == expected_kernel else 1)
 PY
     then
-      update_receipt "$RECEIPT" "state=identity-mismatch" "stats_file=$DIR/stats.json" "stats_sha=$stats_sha" "identity_error=runtime-build-identity-mismatch"
+      update_receipt "$RECEIPT" "state=identity-mismatch" "stats_file=$DIR/stats.json" "stats_sha=$stats_sha" "identity_error=runtime-build-identity-mismatch" || {
+        echo "failed to persist identity mismatch: run=$LABEL" >&2
+        exit 1
+      }
       echo "runtime build identity mismatch: run=$LABEL" >&2
       exit 1
     fi
     valid_process "$DIR" || { echo "run process ownership changed: $LABEL" >&2; exit 1; }
-    update_receipt "$RECEIPT" "state=running-verified" "stats_file=$DIR/stats.json" "stats_sha=$stats_sha" "verified_at=$(date -u +%FT%TZ)"
+    update_receipt "$RECEIPT" "state=running-verified" "stats_file=$DIR/stats.json" "stats_sha=$stats_sha" "verified_at=$(date -u +%FT%TZ)" || {
+      echo "failed to persist verified identity: run=$LABEL" >&2
+      exit 1
+    }
     echo "ENGINE_READY run=$LABEL port=$port state=running-verified"
     ;;
   run)
@@ -176,10 +187,14 @@ PY
         if [ -z "$selected_gpu" ]; then echo "no free GPU"
         else
           claim="${ARLE_GPU_CLAIMS:-/tmp/arle-gpu-claims}/$selected_gpu"
-          write_receipt "$RECEIPT" "schema=arle-run-v1" "state=running-unobserved" "operation=$OP" "label=$LABEL" "build_label=$BUILD" "tree=$TREE" "source_head=$source_head" "source_digest=$source_digest_value" "binary=$binary" "binary_sha=$binary_sha" "kernel_id=$kernel_id" "producer_id=$producer_id" "embedded_id=$embedded_id" "argv_file=$DIR/argv.nul" "argv_sha=$(sha256 "$DIR/argv.nul")" "gpu=$selected_gpu" "owner=$(id -u):$(id -un)" "claim_pid=$$" "claim_start=$process_start" "pid=$$" "pgid=$process_pgid" "start=$process_start" "launched_at=$(date -u +%FT%TZ)"
-          # shellcheck disable=SC1091
-          source "$TREE/scripts/pod-build-env.sh"
-          CUDA_VISIBLE_DEVICES="$selected_gpu" INFER_CUDA_DEVICE=0 python3 "$TREE/scripts/reap_run.py" "$OP" --argv-file "$DIR/argv.nul" "$binary"; rc=$?
+          if ! write_receipt "$RECEIPT" "schema=arle-run-v1" "state=running-unobserved" "operation=$OP" "label=$LABEL" "build_label=$BUILD" "tree=$TREE" "source_head=$source_head" "source_digest=$source_digest_value" "binary=$binary" "binary_sha=$binary_sha" "kernel_id=$kernel_id" "producer_id=$producer_id" "embedded_id=$embedded_id" "argv_file=$DIR/argv.nul" "argv_sha=$(sha256 "$DIR/argv.nul")" "gpu=$selected_gpu" "owner=$(id -u):$(id -un)" "claim_pid=$$" "claim_start=$process_start" "pid=$$" "pgid=$process_pgid" "start=$process_start" "launched_at=$(date -u +%FT%TZ)"; then
+            echo "failed to persist launch receipt"
+            rc=1
+          else
+            # shellcheck disable=SC1091
+            source "$TREE/scripts/pod-build-env.sh"
+            CUDA_VISIBLE_DEVICES="$selected_gpu" INFER_CUDA_DEVICE=0 python3 "$TREE/scripts/reap_run.py" "$OP" --argv-file "$DIR/argv.nul" "$binary"; rc=$?
+          fi
         fi
       fi
     fi

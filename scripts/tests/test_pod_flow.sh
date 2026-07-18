@@ -253,6 +253,11 @@ gpu="$(ARLE_GPU_CLAIMS="$TMP/claims" ARLE_OP_ID=ours ARLE_OWNER=test SMI='0, GPU
 
 SM90_SET='0, GPU-0, 0, 9.0\n1, GPU-1, 0, 9.0\n2, GPU-2, 0, 9.0\n3, GPU-3, 0, 9.0\n4, GPU-4, 0, 9.0\n5, GPU-5, 0, 9.0\n6, GPU-6, 0, 9.0\n7, GPU-7, 0, 9.0'
 SMI="$SM90_SET" ARLE_GPU_CLAIMS="$TMP/free-set" bash "$TREE/scripts/pick-gpu.sh" check-free-set 0,1,2,3,4,5,6,7 >/dev/null
+reserve_op=reserve-test
+SMI="$SM90_SET" ARLE_GPU_CLAIMS="$TMP/reserved-set" ARLE_OP_ID="$reserve_op" ARLE_OWNER=test \
+  ARLE_CLAIM_PID="$$" ARLE_CLAIM_START="$(awk '{print $22}' /proc/$$/stat)" \
+  bash "$TREE/scripts/pick-gpu.sh" reserve-set 0,1,2,3,4,5,6,7 >/dev/null
+for gpu in $(seq 0 7); do [ "$(awk -F= '$1=="op" {print $2}' "$TMP/reserved-set/$gpu")" = "$reserve_op" ]; done
 set +e
 SMI="$SM90_SET" SMI_COMPUTE='GPU-3\n' ARLE_GPU_CLAIMS="$TMP/free-set" bash "$TREE/scripts/pick-gpu.sh" check-free-set 0,1,2,3,4,5,6,7 >/dev/null 2>&1
 rc=$?; set -e
