@@ -6,6 +6,7 @@
 //! [`crate::http`] own request ingress; this file owns only the wire shapes and
 //! their validation/conversion.
 
+use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::Json;
@@ -16,6 +17,20 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::multiproc_relay::WireStats;
+
+/// Serve-wide temperature for requests that omit the field (f32 bits; default
+/// 0.0 = greedy, the shipped behavior). The cc rollout lane sets this to 1.0 —
+/// Claude Code sends no `temperature`, and greedy rollouts have zero sampling
+/// diversity AND no behavior logprobs (greedy emits `logprob: None`).
+static DEFAULT_TEMPERATURE: AtomicU32 = AtomicU32::new(0);
+
+pub fn set_default_temperature(t: f32) {
+    DEFAULT_TEMPERATURE.store(t.to_bits(), Relaxed);
+}
+
+fn default_temperature() -> f32 {
+    f32::from_bits(DEFAULT_TEMPERATURE.load(Relaxed))
+}
 
 /// OpenAI `stream_options`: `{"include_usage": true}` asks the streaming
 /// response for a trailing usage-only chunk (empty `choices`, populated
@@ -380,7 +395,7 @@ fn sampling_params(
 ) -> SamplingParams {
     let default = SamplingParams::default();
     SamplingParams {
-        temperature: temperature.unwrap_or(default.temperature),
+        temperature: temperature.unwrap_or_else(default_temperature),
         top_k: top_k.unwrap_or(default.top_k),
         top_p: top_p.unwrap_or(default.top_p),
         min_p: min_p.unwrap_or(default.min_p),

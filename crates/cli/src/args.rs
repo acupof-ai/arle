@@ -1952,6 +1952,12 @@ pub(crate) struct TrainAgentOpdArgs {
     #[arg(long, default_value_t = 8000)]
     pub(crate) serve_port: u16,
 
+    /// Serve-side temperature for requests that omit the field. Claude Code
+    /// sends none, and the serve default is 0.0 (greedy) — which silences
+    /// behavior-logprob capture and kills sampling diversity across the group.
+    #[arg(long, default_value_t = 1.0, value_name = "T")]
+    pub(crate) rollout_temperature: f32,
+
     /// Per-sample `claude -p` wall-clock cap (seconds); the child process
     /// group is killed on expiry.
     #[arg(long, default_value_t = 600)]
