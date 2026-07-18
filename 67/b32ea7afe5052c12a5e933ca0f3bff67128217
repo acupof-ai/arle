@@ -1,0 +1,29 @@
+crates/cli/src/args.rs
+  s_0f0a4f0f1fe37c::t_6a65cb96bbd4fb 327-329
+crates/cli/src/lib.rs
+  s_0f0a4f0f1fe37c::t_2d8f9b1e9edb54 102-105
+crates/infer-api/src/lib.rs
+  s_0f0a4f0f1fe37c::t_fcab1f22da03b7 40-51
+scripts/pod-remote-build.sh
+  s_0f0a4f0f1fe37c::t_145e2de27ef076 64,79-104,190-193,196-204,207-213,216-219,221-227,229
+scripts/tests/test_pod_flow.sh
+  s_0f0a4f0f1fe37c::t_4a16b4425336e5 53-74,181-190,198-223
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "67b32ea7afe5052c12a5e933ca0f3bff67128217",
+  "prompts": {},
+  "sessions": {
+    "s_0f0a4f0f1fe37c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a309c9e5e23ebe250",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
