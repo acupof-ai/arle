@@ -24,6 +24,12 @@ args_file() {
 push_or_die() {
   "$TN" push "$1" "$2" || { echo "push failed; remote tree unchanged" >&2; exit 1; }
 }
+pod_path() {
+  case "$1" in
+    "$NODE_TREE"*) printf '%s%s\n' "$TREE" "${1#"$NODE_TREE"}" ;;
+    *) echo "node path is outside NODE_TREE: $1" >&2; exit 2 ;;
+  esac
+}
 
 case "$cmd" in
   push-scripts)
@@ -64,7 +70,8 @@ case "$cmd" in
     push_or_die "$stage/deletes" "$remote_stage.deletes"
     push_or_die "$stage/source.bundle" "$remote_stage.source.bundle"
     push_or_die "$stage/source.meta" "$remote_stage.source.meta"
-    "$POD" "POD_TREE='$TREE' POD_STATE='$STATE' bash '$TREE/scripts/pod-remote-build.sh' apply-sync '$remote_stage'" || { echo "remote sync apply failed" >&2; exit 1; }
+    pod_stage="$(pod_path "$remote_stage")"
+    "$POD" "POD_TREE='$TREE' POD_STATE='$STATE' bash '$TREE/scripts/pod-remote-build.sh' apply-sync '$pod_stage'" || { echo "remote sync apply failed" >&2; exit 1; }
     ;;
   build)
     label="${1:-}"
@@ -77,7 +84,8 @@ case "$cmd" in
     args_file "$tmp" "$@"
     remote="$NODE_TREE.build-$op.argv"
     push_or_die "$tmp" "$remote"
-    "$POD" "POD_TREE='$TREE' POD_STATE='$STATE' setsid bash '$TREE/scripts/pod-remote-build.sh' build '$label' '$op' '$remote' </dev/null >/dev/null 2>&1 &"
+    pod_remote="$(pod_path "$remote")"
+    "$POD" "POD_TREE='$TREE' POD_STATE='$STATE' setsid bash '$TREE/scripts/pod-remote-build.sh' build '$label' '$op' '$pod_remote' </dev/null >/dev/null 2>&1 &"
     echo "build '$label' launched; receipt: build:$label"
     ;;
   run)
@@ -98,7 +106,8 @@ case "$cmd" in
     args_file "$tmp" "$@"
     remote="$NODE_TREE.run-$op.argv"
     push_or_die "$tmp" "$remote"
-    "$POD" "POD_TREE='$TREE' POD_STATE='$STATE' setsid bash '$TREE/scripts/pod-remote-run.sh' '$build' '$label' '$gpu' '$op' '$remote' </dev/null >/dev/null 2>&1 &"
+    pod_remote="$(pod_path "$remote")"
+    "$POD" "POD_TREE='$TREE' POD_STATE='$STATE' setsid bash '$TREE/scripts/pod-remote-run.sh' '$build' '$label' '$gpu' '$op' '$pod_remote' </dev/null >/dev/null 2>&1 &"
     echo "run '$label' launched from build:$build; GPU=$gpu"
     ;;
   gpus)
