@@ -37,6 +37,18 @@ mod student_lora;
 mod types;
 
 pub use infer_seam::{CommBackend, CudaRuntimeFlags, MetalRuntimeFlags};
+
+#[must_use]
+pub const fn kernel_build_id() -> &'static str {
+    #[cfg(feature = "cuda")]
+    {
+        cuda_kernels::KERNEL_BUILD_ID
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        "unreported"
+    }
+}
 #[cfg(feature = "cuda")]
 pub use loaded::CudaWorkerEngine;
 #[cfg(any(

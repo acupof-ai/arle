@@ -324,6 +324,9 @@ pub(crate) struct RenderArgs {
     group(ArgGroup::new("inspection_mode").args(["doctor", "list_models"]))
 )]
 pub(crate) struct Args {
+    #[arg(long, hide = true, default_value_t = false)]
+    pub(crate) kernel_build_id: bool,
+
     /// Path to model directory or HuggingFace model ID.
     /// If omitted, the CLI auto-detects a local model from common directories and HF cache.
     #[arg(long)]

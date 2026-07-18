@@ -61,7 +61,7 @@ while i < len(args):
     elif arg.startswith("--features="):
         if not arg.removeprefix("--features="): raise SystemExit("missing value for --features")
         i += 1
-    elif arg.startswith(("--profile", "--target-dir", "--target")):
+    elif arg.startswith(("--profile", "--target-dir", "--target", "--message-format")):
         raise SystemExit(f"unsupported cargo build argument: {arg}")
     else:
         raise SystemExit(f"unsupported cargo build argument: {arg}")
@@ -75,6 +75,32 @@ write_receipt() {
   local dst="$1" tmp="$1.tmp.$$"
   shift
   printf '%s\n' "$@" > "$tmp" && mv "$tmp" "$dst"
+}
+argv_sha256() { sha256 "$1"; }
+parse_cargo_events() {
+  python3 - "$1" "$2" "$TREE/crates/cuda-kernels" <<'PY'
+import json, pathlib, sys
+
+path, binary, kernel_dir = sys.argv[1:]
+kernel_package = "path+" + pathlib.Path(kernel_dir).resolve().as_uri() + "#"
+executables = []
+out_dirs = []
+with open(path) as stream:
+    for line in stream:
+        try: event = json.loads(line)
+        except json.JSONDecodeError: continue
+        reason = event.get("reason")
+        target = event.get("target", {})
+        if reason == "compiler-artifact" and target.get("name") == binary and "bin" in target.get("kind", []):
+            executable = event.get("executable")
+            if executable: executables.append(executable)
+        elif reason == "build-script-executed" and event.get("package_id", "").startswith(kernel_package):
+            out_dir = event.get("out_dir")
+            if out_dir: out_dirs.append(out_dir)
+if len(executables) != 1: raise SystemExit(f"expected exactly one executable event for {binary}, found {len(executables)}")
+if len(out_dirs) != 1: raise SystemExit(f"expected exactly one cuda-kernels build-script event, found {len(out_dirs)}")
+print(executables[0]); print(out_dirs[0])
+PY
 }
 restore_persistent() {
   local from="$1" to="$2" path
@@ -161,24 +187,46 @@ case "${1:-}" in
       else
         # shellcheck disable=SC2016
         flock /tmp/arle-toolchain.lock bash -c 'toolchain_dir="${ARLE_RUST_TOOLCHAIN_DIR:-/root/.rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu}"; [ -x "$toolchain_dir/bin/rustc" ] && ls "$toolchain_dir"/lib/rustlib/*/lib/libstd-*.rlib >/dev/null 2>&1 || rustup toolchain install 1.95.0 --profile minimal -c rustfmt -c clippy'
-        python3 - "$DIR/argv.nul" <<'PY'
-import os, sys
+        events="$DIR/cargo.jsonl"
+        export ARLE_CARGO_WORKSPACE_ROOT="$TREE"
+        python3 - "$DIR/argv.nul" "$events" <<'PY'
+import json, os, subprocess, sys
 raw = open(sys.argv[1], "rb").read().split(b"\0")
 if raw and not raw[-1]: raw.pop()
-os.execvp("cargo", ["cargo", "build", *(os.fsdecode(x) for x in raw)])
+command = ["cargo", "build", "--message-format=json-render-diagnostics", *(os.fsdecode(x) for x in raw)]
+with open(sys.argv[2], "w") as events:
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, text=True)
+    for line in process.stdout:
+        events.write(line)
+        try: rendered = json.loads(line).get("message", {}).get("rendered")
+        except json.JSONDecodeError: rendered = None
+        if rendered: print(rendered, end="", file=sys.stderr)
+raise SystemExit(process.wait())
 PY
         rc=$?
-        binary="$TREE/target/release/$binary_name"
+        if [ "$rc" -eq 0 ]; then
+          cargo_outputs="$(parse_cargo_events "$events" "$binary_name")" || rc=1
+          if [ "$rc" -eq 0 ]; then
+            binary="${cargo_outputs%%$'\n'*}"
+            cargo_out_dir="${cargo_outputs#*$'\n'}"
+          fi
+        fi
       fi
     fi
-    binary_sha=""; [ "$rc" -eq 0 ] && [ -f "$binary" ] && binary_sha="$(sha256 "$binary")" || rc=1
-    manifest="$(find "$TREE/target" -name arle-cuda-kernels.manifest -type f -print 2>/dev/null | sort | tail -1)"
-    manifest_sha=""; kernel_id=""
-    if [ -n "$manifest" ]; then
+    binary_sha=""; manifest=""; manifest_sha=""; producer_id=""; embedded_id=""
+    [ "$rc" -eq 0 ] && [ -f "$binary" ] && binary_sha="$(sha256 "$binary")" || rc=1
+    manifest="${cargo_out_dir:-}/arle-cuda-kernels.manifest"
+    if [ "$rc" -eq 0 ] && [ -f "$manifest" ]; then
       manifest_sha="$(sha256 "$manifest")"
-      cuda_prebuilt_manifest_validate "$manifest" && kernel_id="$(cuda_prebuilt_manifest_value "$manifest" kernel_build_id)" || rc=1
+      cuda_prebuilt_manifest_validate "$manifest" && producer_id="$(cuda_prebuilt_manifest_value "$manifest" kernel_build_id)" || rc=1
+    else
+      rc=1
     fi
-    write_receipt "$RECEIPT" "schema=arle-build-v1" "operation=$OP" "label=$LABEL" "tree=$TREE" "source_head=${source_head:-}" "source_digest=${source_digest_value:-}" "argv_file=$DIR/argv.nul" "binary=$binary" "binary_sha=$binary_sha" "producer_manifest=$manifest" "producer_manifest_sha=$manifest_sha" "kernel_id=$kernel_id" "exit=$rc" "pid=$$" "pgid=$(ps -o pgid= -p $$ | tr -d ' ')" "start=$(proc_start $$)" "finished_at=$(date -u +%FT%TZ)"
+    if [ "$rc" -eq 0 ]; then
+      embedded_id="$($binary --kernel-build-id)" || rc=1
+      [ "$embedded_id" != unreported ] && [ "$embedded_id" = "$producer_id" ] || rc=1
+    fi
+    write_receipt "$RECEIPT" "schema=arle-build-v1" "operation=$OP" "label=$LABEL" "tree=$TREE" "source_head=${source_head:-}" "source_digest=${source_digest_value:-}" "argv_file=$DIR/argv.nul" "argv_sha=$(argv_sha256 "$DIR/argv.nul")" "binary=$binary" "binary_sha=$binary_sha" "cargo_out_dir=${cargo_out_dir:-}" "producer_manifest=$manifest" "producer_manifest_sha=$manifest_sha" "producer_id=$producer_id" "embedded_id=$embedded_id" "kernel_id=$producer_id" "exit=$rc" "pid=$$" "pgid=$(ps -o pgid= -p $$ | tr -d ' ')" "start=$(proc_start $$)" "finished_at=$(date -u +%FT%TZ)"
     printf 'BUILD_EXIT=%s\n' "$rc"
     exit "$rc"
     ;;

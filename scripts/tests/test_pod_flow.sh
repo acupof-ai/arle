@@ -50,10 +50,28 @@ exec /usr/bin/python3 "$@"
 SH
 cat > "$BIN/cargo" <<'SH'
 #!/usr/bin/env bash
-mkdir -p "$POD_TREE/target/release" "$POD_TREE/target/test-manifest"
-printf '#!/usr/bin/env bash\nexit 0\n' > "$POD_TREE/target/release/arle"
-chmod +x "$POD_TREE/target/release/arle"
-printf 'schema=1\nkernel_build_id=kernel-123\n' > "$POD_TREE/target/test-manifest/arle-cuda-kernels.manifest"
+[ "${CARGO_CASE:-success}" != fail ] || exit 7
+out="$POD_TREE/target/test-manifest"
+exe="$POD_TREE/target/release/arle"
+mkdir -p "$(dirname "$exe")" "$out" "$POD_TREE/target/stale"
+id=kernel-123; [ "${CARGO_CASE:-}" != embedded-mismatch ] || id=kernel-wrong
+printf '#!/usr/bin/env bash\nif [ "$1" = --kernel-build-id ]; then echo %s; exit; fi\nexit 0\n' "$id" > "$exe"
+chmod +x "$exe"
+printf 'schema=1\nkernel_build_id=kernel-123\n' > "$out/arle-cuda-kernels.manifest"
+printf 'schema=1\nkernel_build_id=stale\n' > "$POD_TREE/target/stale/arle-cuda-kernels.manifest"
+python3 - "$exe" "$out" "${CARGO_CASE:-success}" <<'PY'
+import json, os, pathlib, sys
+exe, out, case = sys.argv[1:]
+root = pathlib.Path(os.environ["ARLE_CARGO_WORKSPACE_ROOT"])
+package = (root / "crates/cuda-kernels").resolve().as_uri()
+artifact = {"reason":"compiler-artifact","target":{"name":"arle","kind":["bin"]},"executable":exe}
+script = {"reason":"build-script-executed","package_id":f"path+{package}#0.1.0","out_dir":out}
+events = [] if case == "missing-exe" else [artifact]
+if case == "duplicate-exe": events.append(artifact)
+if case != "missing-out": events.append(script)
+if case == "duplicate-out": events.append(script)
+for event in events: print(json.dumps(event))
+PY
 SH
 cat > "$BIN/rustup" <<'SH'
 #!/usr/bin/env bash
@@ -160,6 +178,16 @@ set +e
 "$LOCAL/scripts/pod.sh" build bad --release --profile release-fast --bin arle >/dev/null 2>&1
 rc=$?; set -e
 [ "$rc" -ne 0 ] && [ ! -e "$STATE/builds/bad" ]
+printf '%s\0' --release --message-format json --bin arle > "$TMP/reserved-format"
+set +e
+POD_TREE="$TREE" bash "$TREE/scripts/pod-remote-build.sh" validate-build-args "$TMP/reserved-format" >/dev/null 2>&1
+rc=$?; set -e
+[ "$rc" -ne 0 ]
+printf '%s\0' --release --message-format=json --bin arle > "$TMP/reserved-format-equals"
+set +e
+POD_TREE="$TREE" bash "$TREE/scripts/pod-remote-build.sh" validate-build-args "$TMP/reserved-format-equals" >/dev/null 2>&1
+rc=$?; set -e
+[ "$rc" -ne 0 ]
 
 out1="$("$LOCAL/scripts/pod.sh" build 2>/dev/null)"; out2="$("$LOCAL/scripts/pod.sh" build 2>/dev/null)"
 label1="$(printf '%s' "$out1" | awk -F"'" '{print $2}')"; label2="$(printf '%s' "$out2" | awk -F"'" '{print $2}')"
@@ -167,7 +195,32 @@ label1="$(printf '%s' "$out1" | awk -F"'" '{print $2}')"; label2="$(printf '%s' 
 
 printf '%s\0' --release --features cuda --bin arle > "$TMP/build-argv"
 POD_TREE="$TREE" POD_STATE="$STATE" bash "$TREE/scripts/pod-remote-build.sh" build manifest op-manifest "$TMP/build-argv" >/dev/null
-[ "$(awk -F= '$1=="kernel_id" {print $2}' "$STATE/builds/manifest/receipt")" = kernel-123 ]
+receipt="$STATE/builds/manifest/receipt"
+[ "$(awk -F= '$1=="kernel_id" {print $2}' "$receipt")" = kernel-123 ]
+[ "$(awk -F= '$1=="embedded_id" {print $2}' "$receipt")" = kernel-123 ]
+[ "$(awk -F= '$1=="cargo_out_dir" {print $2}' "$receipt")" = "$TREE/target/test-manifest" ]
+grep -Fq "producer_manifest=$TREE/target/test-manifest/arle-cuda-kernels.manifest" "$receipt"
+[ "$(awk -F= '$1=="argv_sha" {print $2}' "$receipt")" = "$(sha256sum "$STATE/builds/manifest/argv.nul" | cut -d' ' -f1)" ]
+
+for case in missing-exe duplicate-exe missing-out duplicate-out embedded-mismatch fail; do
+  label="build-$case"; printf '%s\0' --release --features cuda --bin arle > "$TMP/$label"
+  set +e
+  CARGO_CASE="$case" POD_TREE="$TREE" POD_STATE="$STATE" bash "$TREE/scripts/pod-remote-build.sh" build "$label" "op-$case" "$TMP/$label" >/dev/null
+  rc=$?; set -e
+  [ "$rc" -ne 0 ] && [ "$(awk -F= '$1=="exit" {print $2}' "$STATE/builds/$label/receipt")" -ne 0 ]
+done
+
+printf stale >> "$TREE/target/release/arle"
+printf '\0' > "$TMP/stale-run-argv"
+set +e
+POD_TREE="$TREE" POD_STATE="$STATE" bash "$TREE/scripts/pod-remote-run.sh" run manifest stale-binary auto op-stale "$TMP/stale-run-argv" >/dev/null 2>&1
+rc=$?; set -e
+[ "$rc" -ne 0 ] && grep -q 'binary SHA mismatch' "$STATE/runs/stale-binary/log"
+printf '%s\0' --release --features cuda --bin arle > "$TMP/failed-run-argv"
+set +e
+POD_TREE="$TREE" POD_STATE="$STATE" bash "$TREE/scripts/pod-remote-run.sh" run build-fail failed-build auto op-failed "$TMP/failed-run-argv" >/dev/null 2>&1
+rc=$?; set -e
+[ "$rc" -ne 0 ] && grep -q 'successful build receipt required' "$STATE/runs/failed-build/log"
 
 mkdir -p "$STATE/builds/shared" "$STATE/runs/shared" "$TMP/proc/4242"
 printf 'exit=0\n' > "$STATE/builds/shared/receipt"
