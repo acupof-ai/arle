@@ -1,0 +1,23 @@
+.github/workflows/ci.yml
+  s_6410ed1fa67be2::t_261b4f714f4892 58-71
+scripts/pre_push_checks.sh
+  s_6410ed1fa67be2::t_e2ff003824e861 59-66
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "c414ab04580d973df5c722b770874c958bfa5629",
+  "prompts": {},
+  "sessions": {
+    "s_6410ed1fa67be2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a8aef1359e4bba858",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}

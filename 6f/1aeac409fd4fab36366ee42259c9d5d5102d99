@@ -1,0 +1,27 @@
+crates/cuda-kernels/tools/tilelang/README.md
+  s_6410ed1fa67be2::t_ddc2d20a73a60c 73-80
+docs/experience/wins/2026-07-17-qwen36-rotary-fa3-gates.md
+  s_6410ed1fa67be2::t_3604f908f41051 17-26
+docs/plans/2026-07-10-operator-artifact-dev-release-system.md
+  s_6410ed1fa67be2::t_4e9b0f4cf76ccc 316-329,333-336,452-456,460-462
+scripts/README.md
+  s_6410ed1fa67be2::t_fb19bff8071ec6 130-133,138,140-142,145-164,180
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "6f1aeac409fd4fab36366ee42259c9d5d5102d99",
+  "prompts": {},
+  "sessions": {
+    "s_6410ed1fa67be2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a8aef1359e4bba858",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
