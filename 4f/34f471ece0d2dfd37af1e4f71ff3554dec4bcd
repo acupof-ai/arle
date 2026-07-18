@@ -1,0 +1,35 @@
+scripts/lever_gate.sh
+  s_d6adcec6a0a6d3::t_c5b66723cf4b5d 120,125-127,131,150-160
+scripts/pick-gpu.sh
+  s_d6adcec6a0a6d3::t_79ba0f72763fae 35-36,69-86,106
+scripts/pod-remote-run.sh
+  s_d6adcec6a0a6d3::t_32e8a15ba64e24 128-130,135-138,151-154,159-162,190-197
+scripts/tests/test_pod_flow.sh
+  s_687b40467089d8::t_9c2d560c45bc37 256-260
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "4f34f471ece0d2dfd37af1e4f71ff3554dec4bcd",
+  "prompts": {},
+  "sessions": {
+    "s_687b40467089d8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a2dbcf8bfdc361eec",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_d6adcec6a0a6d3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dc64a0b5-493b-4e08-a5cf-392205926291",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
