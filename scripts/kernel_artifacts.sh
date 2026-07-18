@@ -277,6 +277,156 @@ pack_bundle() {
     printf '%s\n' "$file"
 }
 
+qualification_candidate() {
+    local candidate="$1" tmp archive_sha
+    if [[ -d "$candidate" ]]; then
+        : "${ARLE_KERNEL_CANDIDATE_ARCHIVE_SHA256:?directory candidates require ARLE_KERNEL_CANDIDATE_ARCHIVE_SHA256}"
+        [[ "$ARLE_KERNEL_CANDIDATE_ARCHIVE_SHA256" =~ ^[0-9a-f]{64}$ ]] || {
+            echo "invalid ARLE_KERNEL_CANDIDATE_ARCHIVE_SHA256" >&2
+            return 1
+        }
+        QUALIFICATION_TREE="$candidate"
+        printf -v "$2" '%s' "$ARLE_KERNEL_CANDIDATE_ARCHIVE_SHA256"
+        return
+    fi
+    [[ -f "$candidate" ]] || { echo "qualification candidate not found: $candidate" >&2; return 1; }
+    archive_sha="$(cuda_prebuilt_hash_file "$candidate")"
+    tmp="$(mktemp -d)"
+    while IFS= read -r entry; do
+        [[ "$entry" != /* && "/$entry/" != *'/../'* ]] || {
+            echo "unsafe bundle path: $entry" >&2
+            rm -rf "$tmp"
+            return 1
+        }
+    done < <(tar -tzf "$candidate")
+    tar -xzf "$candidate" -C "$tmp"
+    QUALIFICATION_TREE="$tmp"
+    printf -v "$2" '%s' "$archive_sha"
+}
+
+qualification_manifest_value() {
+    local manifest="$1" key="$2"
+    jq -er --arg key "$key" '.[$key] | select(type == "string" and length > 0)' "$manifest"
+}
+
+qualification_fragment() {
+    local candidate="$1" stats="$2" output="$3" archive_sha tree producer binary_sha stats_sha
+    local bundle_id source_commit kernel_id capabilities cleanup=""
+    : "${ARLE_KERNEL_TEST_BINARY:?ARLE_KERNEL_TEST_BINARY is required}"
+    : "${ARLE_KERNEL_TESTED_SM:?ARLE_KERNEL_TESTED_SM is required}"
+    : "${ARLE_KERNEL_QUALIFICATION_PROFILE:?ARLE_KERNEL_QUALIFICATION_PROFILE is required}"
+    [[ ${ARLE_KERNEL_TESTED_CAPABILITIES+x} ]] || {
+        echo "ARLE_KERNEL_TESTED_CAPABILITIES is required (empty is valid)" >&2
+        return 1
+    }
+    [[ -x "$ARLE_KERNEL_TEST_BINARY" ]] || { echo "test binary is not executable: $ARLE_KERNEL_TEST_BINARY" >&2; return 1; }
+    [[ -f "$stats" ]] || { echo "stats JSON not found: $stats" >&2; return 1; }
+    qualification_candidate "$candidate" archive_sha
+    tree="$QUALIFICATION_TREE"
+    [[ "$tree" == "$candidate" ]] || cleanup="$tree"
+    trap '[[ -z "${cleanup:-}" ]] || rm -rf "$cleanup"' RETURN
+    [[ -f "$tree/manifest.json" && -f "$tree/correctness-evidence.json" && -f "$tree/SHA256SUMS" ]] || {
+        echo "candidate lacks pack metadata" >&2; return 1;
+    }
+    verify_tree_checksums "$tree"
+    jq -e '.schema == 2 and .status == "not-run" and .artifact_sha256 == null and
+        .tested_sms == [] and .capabilities == []' "$tree/correctness-evidence.json" >/dev/null || {
+        echo "candidate is not an unqualified pack archive" >&2; return 1;
+    }
+    bundle_id="$(qualification_manifest_value "$tree/manifest.json" bundle_id)"
+    source_commit="$(qualification_manifest_value "$tree/manifest.json" source_commit)"
+    producer="$(find "$tree" -name arle-cuda-kernels.manifest -type f -print)"
+    [[ "$(wc -l <<<"$producer" | tr -d ' ')" == 1 ]] || {
+        echo "candidate must contain exactly one arle-cuda-kernels.manifest" >&2; return 1;
+    }
+    cuda_prebuilt_manifest_validate "$producer"
+    kernel_id="$(cuda_prebuilt_manifest_value "$producer" kernel_build_id)"
+    capabilities="$(cuda_prebuilt_manifest_value "$producer" capabilities)"
+    binary_sha="$(cuda_prebuilt_hash_file "$ARLE_KERNEL_TEST_BINARY")"
+    stats_sha="$(jq -er '.build_identity.product_binary_sha256 | select(test("^sha256:[0-9a-f]{64}$")) | sub("^sha256:"; "")' "$stats")"
+    [[ "$binary_sha" == "$stats_sha" ]] || { echo "test binary SHA does not match /v1/stats product SHA" >&2; return 1; }
+    [[ "$(jq -er '.build_identity.kernel_bundle_id' "$stats")" == "$kernel_id" ]] || {
+        echo "runtime kernel bundle ID does not match candidate producer manifest" >&2; return 1;
+    }
+    python3 - "$archive_sha" "$bundle_id" "$source_commit" "$kernel_id" "$capabilities" \
+        "$binary_sha" "$ARLE_KERNEL_TESTED_SM" "$ARLE_KERNEL_QUALIFICATION_PROFILE" \
+        "$ARLE_KERNEL_TESTED_CAPABILITIES" "$output" <<'PY'
+import json, re, sys
+archive_sha, bundle_id, commit, kernel_id, bundle_csv, binary_sha, sm, profile, tested_csv, output = sys.argv[1:]
+def csv(value): return [] if not value else value.split(',')
+def valid(items): return len(items) == len(set(items)) and all(re.fullmatch(r'[a-z0-9-]+', x) for x in items)
+bundle_caps, tested_caps = csv(bundle_csv), csv(tested_csv)
+if not valid(bundle_caps) or not valid(tested_caps): raise SystemExit('invalid or duplicate capability list')
+if profile not in {'qwen', 'qwen-fa3', 'dsv4'}: raise SystemExit('invalid qualification profile')
+if sm not in {'8.0', '8.6', '8.9', '9.0'}: raise SystemExit('invalid tested SM')
+allowed = {'qwen': set(), 'qwen-fa3': {'fa3'}, 'dsv4': {'flashmla', 'deepgemm-native'}}[profile]
+if not set(tested_caps) <= allowed: raise SystemExit('false capability/profile claim')
+if not set(tested_caps) <= set(bundle_caps): raise SystemExit('tested capability absent from bundle')
+if profile == 'qwen' and sm not in {'8.0', '8.6', '8.9'}: raise SystemExit('generic qwen profile is Ampere/Ada only')
+if profile == 'qwen-fa3' and (sm != '9.0' or tested_caps != ['fa3']): raise SystemExit('qwen-fa3 requires sm_90 and exactly fa3')
+if profile == 'dsv4' and sm != '9.0': raise SystemExit('dsv4 qualification requires sm_90')
+fragment = {'schema': 1, 'candidate_archive_sha256': archive_sha, 'bundle_id': bundle_id,
+    'source_commit': commit, 'kernel_build_id': kernel_id, 'bundle_capabilities': sorted(bundle_caps),
+    'product_binary_sha256': binary_sha, 'tested_sm': sm, 'profile': profile,
+    'tested_capabilities': sorted(tested_caps)}
+with open(output, 'w') as f: json.dump(fragment, f, sort_keys=True, separators=(',', ':')); f.write('\n')
+PY
+}
+
+qualification_aggregate() {
+    local candidate="$1" output="$2" archive_sha tree producer bundle_id source_commit kernel_id capabilities cleanup=""
+    shift 2
+    (( $# > 0 )) || { echo "aggregate requires evidence fragments" >&2; return 1; }
+    qualification_candidate "$candidate" archive_sha
+    tree="$QUALIFICATION_TREE"
+    [[ "$tree" == "$candidate" ]] || cleanup="$tree"
+    trap '[[ -z "${cleanup:-}" ]] || rm -rf "$cleanup"' RETURN
+    verify_tree_checksums "$tree"
+    bundle_id="$(qualification_manifest_value "$tree/manifest.json" bundle_id)"
+    source_commit="$(qualification_manifest_value "$tree/manifest.json" source_commit)"
+    producer="$(find "$tree" -name arle-cuda-kernels.manifest -type f -print)"
+    [[ "$(wc -l <<<"$producer" | tr -d ' ')" == 1 ]] || { echo "candidate must contain exactly one producer manifest" >&2; return 1; }
+    cuda_prebuilt_manifest_validate "$producer"
+    kernel_id="$(cuda_prebuilt_manifest_value "$producer" kernel_build_id)"
+    capabilities="$(cuda_prebuilt_manifest_value "$producer" capabilities)"
+    python3 - "$archive_sha" "$bundle_id" "$source_commit" "$kernel_id" "$capabilities" "$output" "$@" <<'PY'
+import json, re, sys
+archive_sha, bundle_id, commit, kernel_id, caps_csv, output, *paths = sys.argv[1:]
+keys = {'schema','candidate_archive_sha256','bundle_id','source_commit','kernel_build_id','bundle_capabilities','product_binary_sha256','tested_sm','profile','tested_capabilities'}
+bundle_caps = sorted([] if not caps_csv else caps_csv.split(','))
+rows, seen = [], set()
+for path in paths:
+    with open(path) as f: row = json.load(f)
+    if set(row) != keys or row['schema'] != 1: raise SystemExit(f'invalid fragment schema: {path}')
+    identity = (row['candidate_archive_sha256'], row['bundle_id'], row['source_commit'], row['kernel_build_id'], row['bundle_capabilities'])
+    if identity != (archive_sha, bundle_id, commit, kernel_id, bundle_caps): raise SystemExit(f'mixed candidate evidence: {path}')
+    if not re.fullmatch(r'[0-9a-f]{64}', row['product_binary_sha256']): raise SystemExit(f'invalid product SHA: {path}')
+    key = (row['tested_sm'], row['profile'])
+    if key in seen: raise SystemExit(f'duplicate tested_sm/profile: {key}')
+    seen.add(key); rows.append(row)
+required = {('8.0','qwen'), ('8.6','qwen'), ('8.9','qwen'), ('9.0','qwen-fa3')}
+if not required <= seen: raise SystemExit('incomplete T1 hardware coverage')
+for row in rows:
+    allowed = {'qwen': set(), 'qwen-fa3': {'fa3'}, 'dsv4': {'flashmla','deepgemm-native'}}.get(row['profile'])
+    if allowed is None or not set(row['tested_capabilities']) <= allowed: raise SystemExit('false capability/profile claim')
+    if not set(row['tested_capabilities']) <= set(bundle_caps): raise SystemExit('capability overclaim')
+    if row['profile'] == 'qwen' and (row['tested_sm'] not in {'8.0','8.6','8.9'} or row['tested_capabilities']): raise SystemExit('invalid generic qwen evidence')
+    if row['profile'] == 'qwen-fa3' and (row['tested_sm'] != '9.0' or row['tested_capabilities'] != ['fa3']): raise SystemExit('invalid qwen-fa3 evidence')
+    if row['profile'] == 'dsv4' and row['tested_sm'] != '9.0': raise SystemExit('invalid dsv4 evidence')
+for cap in {'flashmla','deepgemm-native'} & set(bundle_caps):
+    if not any(r['profile'] == 'dsv4' and cap in r['tested_capabilities'] for r in rows):
+        raise SystemExit(f'missing dsv4 evidence for {cap}')
+result = {'schema': 1, 'status': 'passed', 'candidate_archive_sha256': archive_sha,
+    'bundle_id': bundle_id, 'source_commit': commit, 'kernel_build_id': kernel_id,
+    'bundle_capabilities': bundle_caps,
+    'observations': sorted(rows, key=lambda r: (r['tested_sm'], r['profile'], r['product_binary_sha256']))}
+for row in result['observations']:
+    for key in ('schema','candidate_archive_sha256','bundle_id','source_commit','kernel_build_id','bundle_capabilities'):
+        del row[key]
+with open(output, 'w') as f: json.dump(result, f, sort_keys=True, separators=(',', ':')); f.write('\n')
+PY
+}
+
 remote_assets() {
     gh release view "$REL" -R "$REPO" --json assets --jq '.assets[].name'
 }
@@ -288,6 +438,14 @@ case "${1:-help}" in
     pack)
         cd "$ROOT"
         pack_bundle "$(kernel_bundle_id)"
+        ;;
+    qualify-fragment)
+        [[ $# == 4 ]] || { echo "usage: $0 qualify-fragment CANDIDATE STATS_JSON OUTPUT_JSON" >&2; exit 1; }
+        qualification_fragment "$2" "$3" "$4"
+        ;;
+    aggregate-qualification)
+        (( $# >= 4 )) || { echo "usage: $0 aggregate-qualification CANDIDATE OUTPUT_JSON FRAGMENT..." >&2; exit 1; }
+        qualification_aggregate "$2" "$3" "${@:4}"
         ;;
     publish)
         cd "$ROOT"
