@@ -91,7 +91,11 @@ trap 'rmdir "$lock.d"' EXIT
 SH
 cat > "$BIN/nvidia-smi" <<'SH'
 #!/usr/bin/env bash
-printf '%s\n' "${SMI:-0, 0 MiB\n1, 0 MiB}"
+case "$*" in
+  *--query-compute-apps=gpu_uuid*) printf '%b' "${SMI_COMPUTE:-}" ;;
+  *--query-gpu=index,uuid,memory.used,compute_cap*) printf '%b\n' "${SMI:-0, GPU-0, 0, 9.0\n1, GPU-1, 0, 9.0}" ;;
+  *) printf '%b\n' "${SMI:-0, GPU-0, 0, 9.0\n1, GPU-1, 0, 9.0}" ;;
+esac
 SH
 chmod +x "$BIN/"*
 export PATH="$BIN:$PATH" POD="$BIN/pod" TN="$BIN/tn" NODE_TREE="$NODE" POD_TREE="$TREE" POD_STATE="$STATE"
@@ -160,7 +164,7 @@ printf 'schema=arle-build-v1\nexit=0\nbinary=%s\nbinary_sha=%s\nsource_head=%s\n
 printf '%s\0' '' 'a b' 'q"uote' '*' > "$TMP/argv"
 export ARGV_OUT="$TMP/seen"
 set +e
-POD_TREE="$TREE" POD_STATE="$STATE" SMI='0, 0 MiB' setsid bash "$TREE/scripts/pod-remote-run.sh" run good exact auto op-exact "$TMP/argv" >/dev/null
+POD_TREE="$TREE" POD_STATE="$STATE" SMI='0, GPU-0, 0, 9.0' setsid bash "$TREE/scripts/pod-remote-run.sh" run good exact auto op-exact "$TMP/argv" >/dev/null
 rc=$?; set -e
 [ "$rc" -eq 0 ] || { command cat "$STATE/runs/exact/log" >&2; exit 1; }
 [ -f "$TMP/seen" ] || { command cat "$STATE/runs/exact/log" >&2; exit 1; }
@@ -226,8 +230,9 @@ mkdir -p "$STATE/builds/shared" "$STATE/runs/shared" "$TMP/proc/4242"
 printf 'exit=0\n' > "$STATE/builds/shared/receipt"
 printf '%s' 'done' > "$STATE/builds/shared/log"
 printf '0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 12345\n' > "$TMP/proc/4242/stat"
-printf 'pod-remote-run.sh active-run\0' > "$TMP/proc/4242/cmdline"
-printf 'op=active-run\npid=4242\npgid=4242\nstart=12345\n' > "$STATE/runs/shared/process"
+printf '%s\0' bash "$TREE/scripts/pod-remote-run.sh" run shared active-run > "$TMP/proc/4242/cmdline"
+printf 'schema=arle-run-v1\nbinary=/tmp/arle\nstate=running-unobserved\n' > "$STATE/runs/shared/receipt"
+printf 'schema=arle-process-v1\nkind=run\nexpected_helper=%s\noperation=active-run\npid=4242\npgid=4242\nstart=12345\nexpected_binary=/tmp/arle\n' "$TREE/scripts/pod-remote-run.sh" > "$STATE/runs/shared/process"
 cat > "$BIN/ps" <<'SH'
 #!/usr/bin/env bash
 printf '4242\n'
@@ -243,7 +248,45 @@ PROC_ROOT="$TMP/proc" KILL_CMD="$BIN/mock-kill" POD_TREE="$TREE" POD_STATE="$STA
 
 mkdir -p "$TMP/claims"
 printf 'schema=arle-gpu-claim-v1\nop=foreign\nowner=other\npid=%s\nstart=%s\n' "$$" "$(awk '{print $22}' /proc/$$/stat)" > "$TMP/claims/0"
-gpu="$(ARLE_GPU_CLAIMS="$TMP/claims" ARLE_OP_ID=ours ARLE_OWNER=test SMI='0, 0 MiB\n1, 0 MiB' bash "$TREE/scripts/pick-gpu.sh")"
+gpu="$(ARLE_GPU_CLAIMS="$TMP/claims" ARLE_OP_ID=ours ARLE_OWNER=test SMI='0, GPU-0, 0, 9.0\n1, GPU-1, 0, 9.0' bash "$TREE/scripts/pick-gpu.sh")"
 [ "$gpu" = 1 ] && kill -0 $$
+
+SM90_SET='0, GPU-0, 0, 9.0\n1, GPU-1, 0, 9.0\n2, GPU-2, 0, 9.0\n3, GPU-3, 0, 9.0\n4, GPU-4, 0, 9.0\n5, GPU-5, 0, 9.0\n6, GPU-6, 0, 9.0\n7, GPU-7, 0, 9.0'
+SMI="$SM90_SET" ARLE_GPU_CLAIMS="$TMP/free-set" bash "$TREE/scripts/pick-gpu.sh" check-free-set 0,1,2,3,4,5,6,7 >/dev/null
+set +e
+SMI="$SM90_SET" SMI_COMPUTE='GPU-3\n' ARLE_GPU_CLAIMS="$TMP/free-set" bash "$TREE/scripts/pick-gpu.sh" check-free-set 0,1,2,3,4,5,6,7 >/dev/null 2>&1
+rc=$?; set -e
+[ "$rc" -ne 0 ]
+set +e
+SMI="$SM90_SET" ARLE_GPU_CLAIMS="$TMP/free-set" bash "$TREE/scripts/pick-gpu.sh" check-free-set 0,1,2,3,4,5,6 >/dev/null 2>&1
+rc=$?; set -e
+[ "$rc" -ne 0 ]
+low_compute="$(ARLE_GPU_CLAIMS="$TMP/low-compute" ARLE_OP_ID=ours ARLE_OWNER=test SMI='0, GPU-0, 1, 9.0\n1, GPU-1, 0, 9.0' SMI_COMPUTE='GPU-0\n' bash "$TREE/scripts/pick-gpu.sh")"
+[ "$low_compute" = 1 ]
+
+for mismatch in kind expected_helper operation start pgid; do
+  cp "$STATE/runs/shared/process" "$TMP/process.good"
+  case "$mismatch" in
+    kind) key=kind; value=build ;;
+    expected_helper) key=expected_helper; value=/wrong/helper ;;
+    operation) key=operation; value=wrong-op ;;
+    start) key=start; value=0 ;;
+    pgid) key=pgid; value=0 ;;
+  esac
+  python3 - "$STATE/runs/shared/process" "$key" "$value" <<'PY'
+import sys
+path, key, value = sys.argv[1:]
+lines = open(path).read().splitlines()
+open(path, "w").write("\n".join(f"{key}={value}" if line.startswith(key + "=") else line for line in lines) + "\n")
+PY
+  rm -f "$KILL_MARKER"
+  set +e
+  PROC_ROOT="$TMP/proc" KILL_CMD="$BIN/mock-kill" POD_TREE="$TREE" POD_STATE="$STATE" bash "$TREE/scripts/pod-remote-run.sh" status shared >/dev/null 2>&1
+  status_rc=$?
+  PROC_ROOT="$TMP/proc" KILL_CMD="$BIN/mock-kill" POD_TREE="$TREE" POD_STATE="$STATE" bash "$TREE/scripts/pod-remote-run.sh" kill shared >/dev/null 2>&1
+  kill_rc=$?; set -e
+  [ "$status_rc" -ne 0 ] && [ "$kill_rc" -ne 0 ] && [ ! -e "$KILL_MARKER" ]
+  mv "$TMP/process.good" "$STATE/runs/shared/process"
+done
 
 echo "pod flow tests: PASS"
