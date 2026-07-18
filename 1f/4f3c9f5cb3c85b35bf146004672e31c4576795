@@ -1,0 +1,29 @@
+.github/workflows/cuda-ci.yml
+  s_0b905170d9f450::t_df0769681ba17b 9-25,28,53,65,69,76,80,86-119
+.github/workflows/kernels-publish.yml
+  s_0b905170d9f450::t_119c6547f1adc3 19-28,39,46-47,85,88,90-91,93-94,103-104,120-127,136-170
+scripts/kernel_artifacts.sh
+  s_0b905170d9f450::t_a36f6089f5d8e7 47,49,52,202-323,376-384
+scripts/lever_gate.sh
+  s_0b905170d9f450::t_49fe0f82081f90 71-77
+scripts/tests/test_kernel_artifact_qualification.sh
+  s_0b905170d9f450::t_ce5763a3cfa798 1-89
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "1f4f3c9f5cb3c85b35bf146004672e31c4576795",
+  "prompts": {},
+  "sessions": {
+    "s_0b905170d9f450": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ae34154ea96da1d77",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
