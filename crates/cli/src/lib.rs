@@ -99,6 +99,10 @@ pub fn run() -> ExitCode {
     infer_util::logging::init_stderr(level);
 
     let mut args = Args::parse();
+    if args.kernel_build_id {
+        println!("{}", infer_api::kernel_build_id());
+        return ExitCode::SUCCESS;
+    }
     let command = args.command.take();
     #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
     let _exit_report = if should_print_exit_report(&args, command.as_ref()) {
