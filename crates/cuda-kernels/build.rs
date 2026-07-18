@@ -1909,7 +1909,6 @@ const PREBUILT_REQUIRED_DSV4_SYMBOLS: &[&str] = &[
     "arle_dsv4_fp8_kv_fill_one_sw_slot_from_start_pos_cuda",
     "arle_dsv4_flashmla_decode_build_indices_start_pos_ptr_cuda",
     "arle_dsv4_flashmla_decode_build_indices_batched_cuda",
-    "arle_flashmla_sm90_sparse_decode_real_kernel_marker_cuda",
     "dsv4_prepare_qk_start_pos_ptr_cuda",
     "dsv4_prepare_qk_fused_start_pos_ptr_cuda",
     "dsv4_swa_attention_start_pos_ptr_cuda",
@@ -1966,6 +1965,9 @@ fn resolved_sms(sm_targets: &[SmSpec]) -> String {
 
 fn required_symbols(capabilities: &BTreeSet<String>) -> Vec<&'static str> {
     let mut symbols = PREBUILT_REQUIRED_DSV4_SYMBOLS.to_vec();
+    if capabilities.contains("flashmla") {
+        symbols.push("arle_flashmla_sm90_sparse_decode_real_kernel_marker_cuda");
+    }
     if capabilities.contains("fa3") {
         symbols.push("arle_fa3_real_kernel_marker_cuda");
     }
