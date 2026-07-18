@@ -1,0 +1,21 @@
+crates/cuda-kernels/build.rs
+  s_b249be85b8b5e3::t_bc93b771dd49ed 1968-1970
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "ab1888db439e32416e97e259a015f24007c59223",
+  "prompts": {},
+  "sessions": {
+    "s_b249be85b8b5e3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "38f0a33d-cf6f-47ec-9617-4ca19706bf4b",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
