@@ -32,8 +32,8 @@ physical_free() {
 }
 
 case "${1:-}" in
-  check-free-set)
-    requested="${2:?usage: pick-gpu.sh check-free-set <csv>}"
+  check-free-set|reserve-set)
+    action="$1"; requested="${2:?usage: pick-gpu.sh $1 <csv>}"
     exec 9>"$CLAIMS/.lock"; flock 9
     compute="$(load_compute_uuids)" || { echo "cannot query compute applications" >&2; exit 1; }
     rows="$(load_gpus)" || exit 1
@@ -66,6 +66,24 @@ for idx in indices:
     if uuid in busy: raise SystemExit(f"GPU {idx} has a compute application")
 print(requested)
 PY
+    status=$?
+    [ "$status" -eq 0 ] || exit "$status"
+    if [ "$action" = reserve-set ]; then
+      OP="${ARLE_OP_ID:?ARLE_OP_ID required}"; OWNER="${ARLE_OWNER:?ARLE_OWNER required}"
+      CLAIM_PID="${ARLE_CLAIM_PID:-$$}"; CLAIM_START="${ARLE_CLAIM_START:-$(awk '{print $22}' "$PROC_ROOT/$CLAIM_PID/stat" 2>/dev/null)}"
+      now="$(date +%s)"
+      IFS=',' read -r -a indices <<< "$requested"
+      reserved=()
+      for idx in "${indices[@]}"; do
+        c="$CLAIMS/$idx"; tmp="$c.tmp.$$"
+        if ! printf 'schema=arle-gpu-claim-v1\nop=%s\nowner=%s\npid=%s\nstart=%s\ncreated=%s\n' "$OP" "$OWNER" "$CLAIM_PID" "$CLAIM_START" "$now" > "$tmp" || ! mv "$tmp" "$c"; then
+          rm -f "$tmp"
+          for gpu in "${reserved[@]}"; do rm -f "$CLAIMS/$gpu"; done
+          exit 1
+        fi
+        reserved+=("$idx")
+      done
+    fi
     ;;
   "")
     OP="${ARLE_OP_ID:?ARLE_OP_ID required}"; OWNER="${ARLE_OWNER:?ARLE_OWNER required}"
@@ -85,5 +103,5 @@ PY
     done < <(load_gpus)
     echo NONE; exit 1
     ;;
-  *) echo "usage: pick-gpu.sh [check-free-set <csv>]" >&2; exit 2;;
+  *) echo "usage: pick-gpu.sh [check-free-set|reserve-set <csv>]" >&2; exit 2;;
 esac

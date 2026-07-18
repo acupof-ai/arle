@@ -117,14 +117,18 @@ fi
 # existing DSv4 gate is byte-identical; any other GATE_PROFILE (generic, qwen)
 # skips it for a single-GPU model that brings its own config via SERVE_FLAGS.
 DSV4_FLAGS=()
+DSV4_CLAIMS=""
 if [ "${GATE_PROFILE:-dsv4}" = "dsv4" ]; then
     export INFER_CUDA_DEVICES="${INFER_CUDA_DEVICES:-0,1,2,3,4,5,6,7}"
     [ "${INFER_TP_SIZE:-8}" = 8 ] || { echo "[gate] DSv4 requires INFER_TP_SIZE=8" >&2; exit 2; }
     export INFER_TP_SIZE=8
-    bash "$ROOT/scripts/pick-gpu.sh" check-free-set "$INFER_CUDA_DEVICES" >/dev/null || {
+    gate_op="lever-$LABEL-$$-$RANDOM"
+    ARLE_OP_ID="$gate_op" ARLE_OWNER="$(id -u):$(id -un)" ARLE_CLAIM_PID="$$" \
+        bash "$ROOT/scripts/pick-gpu.sh" reserve-set "$INFER_CUDA_DEVICES" >/dev/null || {
         echo "[gate] DSv4 requires eight free unique SM90 GPUs" >&2
         exit 2
     }
+    DSV4_CLAIMS="$INFER_CUDA_DEVICES"
     export ARLE_DSV4_MOE_BACKEND="${ARLE_DSV4_MOE_BACKEND:-allreduce}"
     export ARLE_DSV4_INCREMENTAL_KV=1
     export ARLE_DSV4_EXPERT_BACKEND="${ARLE_DSV4_EXPERT_BACKEND:-deepgemm}"
@@ -143,7 +147,17 @@ else
         > "serve_${LABEL}.log" 2>&1 &
 fi
 SERVE_PID=$!
-trap 'kill $SERVE_PID 2>/dev/null; wait $SERVE_PID 2>/dev/null' EXIT
+cleanup() {
+    kill "$SERVE_PID" 2>/dev/null
+    wait "$SERVE_PID" 2>/dev/null
+    old_ifs="$IFS"; IFS=','
+    for gpu in $DSV4_CLAIMS; do
+        claim="${ARLE_GPU_CLAIMS:-/tmp/arle-gpu-claims}/$gpu"
+        [ "$(awk -F= '$1=="op" {print $2}' "$claim" 2>/dev/null)" = "${gate_op:-}" ] && rm -f "$claim"
+    done
+    IFS="$old_ifs"
+}
+trap cleanup EXIT
 
 for _ in $(seq 1 120); do
     curl -sf "http://127.0.0.1:${PORT}/v1/models" >/dev/null 2>&1 && break
