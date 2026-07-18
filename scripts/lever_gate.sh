@@ -119,7 +119,12 @@ fi
 DSV4_FLAGS=()
 if [ "${GATE_PROFILE:-dsv4}" = "dsv4" ]; then
     export INFER_CUDA_DEVICES="${INFER_CUDA_DEVICES:-0,1,2,3,4,5,6,7}"
-    export INFER_TP_SIZE="${INFER_TP_SIZE:-8}"
+    [ "${INFER_TP_SIZE:-8}" = 8 ] || { echo "[gate] DSv4 requires INFER_TP_SIZE=8" >&2; exit 2; }
+    export INFER_TP_SIZE=8
+    bash "$ROOT/scripts/pick-gpu.sh" check-free-set "$INFER_CUDA_DEVICES" >/dev/null || {
+        echo "[gate] DSv4 requires eight free unique SM90 GPUs" >&2
+        exit 2
+    }
     export ARLE_DSV4_MOE_BACKEND="${ARLE_DSV4_MOE_BACKEND:-allreduce}"
     export ARLE_DSV4_INCREMENTAL_KV=1
     export ARLE_DSV4_EXPERT_BACKEND="${ARLE_DSV4_EXPERT_BACKEND:-deepgemm}"

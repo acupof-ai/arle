@@ -128,16 +128,19 @@ directory unless noted.
 ## Build & Deploy
 
 Canonical pod flow is receipt-bound: `sync` atomically installs the complete
-working tree and source receipt; `build` records that source identity and the
-binary hash; `run` requires the successful build label. `kill` signals only the
-recorded process group after PID, start-time, PGID, and operation checks.
+working tree and source receipt; `build` records that source identity and exact
+artifact; `run` atomically records argv, GPU, build identity, and process
+ownership before launch; `ready` verifies that owned serve against `/v1/stats`.
+`status` and `kill` fail closed unless the exact helper, operation, PID,
+start-time, PGID, and binary still match.
 
 ```bash
 scripts/pod.sh push-scripts
 scripts/pod.sh sync
 scripts/pod.sh build <build-label> [cargo args...]
 scripts/pod.sh status <build-label>
-scripts/pod.sh run <build-label> [run-label] [auto|GPU] -- [arle args...]
+scripts/pod.sh run <build-label> [run-label] [auto|GPU] -- serve [args...]
+scripts/pod.sh ready <run-label> [timeout]
 scripts/pod.sh status <run-label>
 scripts/pod.sh kill <run-label>
 ```
