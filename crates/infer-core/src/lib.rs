@@ -346,6 +346,18 @@ impl From<RequestState> for CompletedRequest {
     }
 }
 
+/// Engine admission mode. `Quiesced` gates `admit_waiting` so no waiter is
+/// promoted to active — the OPD writeback bracket sets it before cancelling
+/// in-flight work and releasing the KV pool, so a submit-backlog request cannot
+/// be admitted+prefilled onto a released pool (qwen35 full_attn_kv=None panic,
+/// f6d 2026-07-18). Cleared by `resume_serving` after the pool is re-acquired.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum EngineMode {
+    #[default]
+    Serving,
+    Quiesced,
+}
+
 /// Backend-agnostic engine loop.
 ///
 /// Prefix reuse is host-indexed: the engine carries token blocks and page ids,
@@ -384,6 +396,8 @@ pub struct Engine<E: BackendExecutor, K: KvPool> {
     /// request, so a serving layer can stream tokens live. `None` by default —
     /// when unset, token commit behavior is byte-identical to before.
     on_token: Option<TokenObserver>,
+    /// Admission mode; `Quiesced` during the OPD writeback bracket. See [`EngineMode`].
+    mode: EngineMode,
 }
 
 /// Per-token observer: invoked with `(handle, &token)` as each token is committed
@@ -455,6 +469,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             next_tier_key: 0,
             next_admit_seq: 0,
             on_token: None,
+            mode: EngineMode::Serving,
         }
     }
 
@@ -1104,6 +1119,22 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         handles
     }
 
+    /// OPD writeback bracket: switch to `Quiesced` (no new admission) and cancel
+    /// all in-flight work, atomically on the engine thread. Setting the mode
+    /// BEFORE the cancel closes the race where a submit-backlog request is
+    /// admitted between cancel and the caller's KV-pool release. Pairs with
+    /// [`Self::resume_serving`]. Returns the cancelled handles (as `cancel_all_requests`).
+    pub fn quiesce(&mut self) -> Vec<RequestHandle> {
+        self.mode = EngineMode::Quiesced;
+        self.cancel_all_requests()
+    }
+
+    /// Re-arm admission after the OPD writeback bracket (once the KV pool is
+    /// re-acquired). Idempotent.
+    pub fn resume_serving(&mut self) {
+        self.mode = EngineMode::Serving;
+    }
+
     fn record_attached_prefix_metrics(&mut self, attached_pages: usize) {
         if !self.config.enable_prefix_cache {
             return;
@@ -1130,6 +1161,9 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
     }
 
     fn admit_waiting(&mut self) -> Result<()> {
+        if self.mode == EngineMode::Quiesced {
+            return Ok(());
+        }
         match self.governor.admission_gate() {
             AdmissionVerdict::Admit | AdmissionVerdict::ShedTo(_) => {}
             AdmissionVerdict::Hold => return Ok(()),
