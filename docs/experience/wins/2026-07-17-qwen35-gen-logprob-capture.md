@@ -1,9 +1,38 @@
 # Qwen3.5/3.6 generation-time behavior-logprob capture → sidecar → F.6 ratio-floor
 
-> Status: pending-remote — GPU gate: F.6 ratio-floor numbers on one collected
-> group + needle unaffected, per plan §P6
+> Status: Shipped — F.6 ratio-floor measured on real cc rollout groups
+> (H20 f6d, 2026-07-18), per plan §P6
 > ([2026-07-16-agent-rl-unified-infra](../../plans/2026-07-16-agent-rl-unified-infra.md)).
 > Sibling of [2026-07-17-qwen35-mtp-rejection-sampling](2026-07-17-qwen35-mtp-rejection-sampling.md).
+
+## F.6 verdict (H20 f6d, 2026-07-18)
+
+First real sampled ratio-floor — `exp(logp_recompute − logp_sidecar)` over 1406
+tokens where both the V0 bf16 recompute and the generation-time sidecar logp
+exist:
+
+```
+ratio_floor_mean=1.0011  ratio_floor_max=5.2769  (1406 tokens)
+kl_rollout=1.46e-2  clip_frac=0.025  trained=10
+```
+
+**FP8-serve vs bf16-train per-token numerics gap is ~0.1% in the mean, heavy
+tail to 5.28× (exp 1.66).** The sidecar behavior-logp is safe to use as-is: the
+importance ratio needs no numerics correction, only the existing clip
+(clip_frac=0.025 already absorbs the tail). This LICENSES the IS-ratio flip from
+V0 recompute onto the sidecar logp (kills the recompute forward — see the
+release/ensure round-boundary crash below that the recompute path exposed).
+
+**Precondition that made this non-zero:** the serve default temperature must be
+> 0 for the cc lane (`--rollout-temperature`, default 1.0 →
+`set_default_temperature`). Claude Code omits `temperature`; the old serve
+default 0.0 made every rollout greedy → `logprob:None` → empty sidecar →
+`ratio_floor_tokens=0`. See is_greedy root-cause (fed715dc3).
+
+**VRAM guard held:** 34 SKIP (seq>23K `--max-update-seq` wall, 9ed5143e1), 10
+trained, no OOM; backward survived seq 22256 (461s). But 34 skip / 10 train =
+77% of the cc corpus discarded by the 23K cap — data efficiency, not safety, is
+now the binding constraint (raise-cap lane / #50).
 
 ## Context
 
