@@ -1,0 +1,35 @@
+scripts/lever_gate.sh
+  s_687b40467089d8::t_0504d33b41aef1 30-31
+scripts/pod-remote-run.sh
+  s_687b40467089d8::t_153fbd4560b8f9 93-132,161-165,169,172,177,179
+scripts/tests/test_lever_gate.sh
+  s_4c19d90f36810f::t_a4568bf90e26a4 110-112
+scripts/tests/test_pod_flow.sh
+  s_687b40467089d8::t_41a2171d513c35 6,232-236,253-309
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "81836c74fad86c73275af460a65b8607a0b0ab8a",
+  "prompts": {},
+  "sessions": {
+    "s_4c19d90f36810f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aacf25a363b785cd3",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_687b40467089d8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a2dbcf8bfdc361eec",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
