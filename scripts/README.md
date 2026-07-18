@@ -127,6 +127,16 @@ directory unless noted.
 
 ## Build & Deploy
 
+Canonical pod sequence:
+
+```bash
+scripts/pod.sh push-scripts
+scripts/pod.sh sync
+scripts/pod.sh build <label>
+scripts/pod.sh status <label>
+scripts/pod.sh run <label> auto -- <args>
+```
+
 | Script | Purpose |
 |---|---|
 | `install.sh` | One-line installer (Linux x86_64 / Apple Silicon). |
@@ -137,7 +147,6 @@ directory unless noted.
 | `pod-remote-build.sh` | Remote pod build wrapper. |
 | `pod-remote-run.sh` | Remote pod run wrapper. |
 | `pod-tilelang-env.sh` | Pod TileLang Python environment setup. |
-| `pod_pipeline.sh` | Pod CI pipeline. |
 | `pod_serve.sh` | Pod serving setup. |
 | `cuda_prebuilt_manifest.sh` | Shared hashing and strict producer-manifest validation helpers. |
 | `export_prebuilt_cuda_kernels.sh` | Validate and export a producer manifest plus its exact artifacts. |

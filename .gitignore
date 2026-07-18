@@ -45,6 +45,5 @@ traces/
 _gap_a_micro_workdir/
 scripts/_pod_*
 .kami-lark/*
-.pod_pipeline_ref
 logs/
 data/opd-corpora/

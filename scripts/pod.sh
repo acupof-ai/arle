@@ -6,10 +6,16 @@
 #                     sglang-test container's host-root hostPath mount. Persistent
 #                     (survives a static-pod restart) AND exactly where `tn push`
 #                     lands, so one push updates the build tree with no copy-in hop.
-#   Builds/runs are DETACHED (survive disconnect), logged with a BUILD_EXIT/RUN_EXIT
-#   marker (the done-signal, not process liveness), and polled — never a foreground
-#   `tn exec` a timeout can strand. Kills are by exact recorded PGID — never
-#   `pkill -f <our own cmd>` (self-matches; once corrupted the toolchain mid-install).
+# Canonical sequence:
+#   scripts/pod.sh push-scripts
+#   scripts/pod.sh sync
+#   scripts/pod.sh build <label>
+#   scripts/pod.sh status <label>
+#   scripts/pod.sh run <label> auto -- <args>
+#
+# Builds/runs are DETACHED (survive disconnect), logged with BUILD_EXIT/RUN_EXIT
+# as the completion signal, and polled — never a foreground `tn exec` a timeout
+# can strand. Kills are by exact recorded PGID — never `pkill -f <our own cmd>`.
 #
 # MULTI-AGENT (lock the racy steps, isolate the rest):
 #   * Racy, LOCKED: the toolchain (~/.rustup, global) is installed under a global
@@ -21,16 +27,16 @@
 #   Typical fan-out: build the shared binary ONCE (`build`), then N agents each
 #   `run <label-i> <gpu-i> -- <args>` on a free GPU (`gpus` to pick).
 #
-# Usage (the common path is zero-param — defaults fill in label/GPU/cargo-args):
-#   scripts/pod.sh push-scripts            # push the pod-side helpers (once)
-#   scripts/pod.sh sync                    # push all git-changed files local->pod
-#   scripts/pod.sh build                   # = build arle --release --features cuda --bin arle
-#   scripts/pod.sh run -- train opd ...    # AUTO-pick a free GPU, label "g<gpu>", detached
-#   scripts/pod.sh status                  # label defaults to "arle" (or pass g3 / your label)
+# Usage:
+#   scripts/pod.sh push-scripts
+#   scripts/pod.sh sync
+#   scripts/pod.sh build <label>
+#   scripts/pod.sh status <label>
+#   scripts/pod.sh run <label> auto -- <args>
 #   scripts/pod.sh gpus                    # per-GPU memory/util
-#   scripts/pod.sh ready 8000 900        # block until engine-ready (/v1/models 200)
-#   Explicit when needed: build <label> <cargo-args> | run <label> <gpu> -- <args>
-#                         | status/log/kill <label> | setup (warm/repair toolchain)
+#   scripts/pod.sh ready 8000 900          # block until engine-ready
+#   Other forms: build <label> <cargo-args> | run <label> <gpu> -- <args>
+#                | status/log/kill <label> | setup (warm/repair toolchain)
 #   Compile cache: setup-sccache (install binary; cache on /host persists) | sccache-stats
 #   (RUSTC_WRAPPER=sccache auto-engages once installed — gives fresh-tree/cross-restart reuse)
 #
