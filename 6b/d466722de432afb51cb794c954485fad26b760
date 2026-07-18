@@ -1,0 +1,35 @@
+scripts/README.md
+  s_072939943ff4f2::t_14b23c740fea65 130-133,141
+scripts/lever_gate.sh
+  s_072939943ff4f2::t_a6a60ea7593035 123-127
+scripts/pick-gpu.sh
+  s_072939943ff4f2::t_4eb84a80cdc555 5-6,15,18-61,65-67,70-71,74
+scripts/pod-remote-build.sh
+  s_072939943ff4f2::t_a678c01e4ea6d8 6,10,169-170,230
+scripts/pod-remote-run.sh
+  s_072939943ff4f2::t_b89fa101546b4e 10,13-43,45,47-55,58-63,69-92,100-107,110-111,118-153,161-163,165,169-170,172,174-176,178-179,182,186-191,196
+scripts/pod.sh
+  s_072939943ff4f2::t_d9f6faad97ae22 117-120,132-133
+scripts/tests/test_lever_gate.sh
+  s_072939943ff4f2::t_ad058bf29fc2de 103
+scripts/tests/test_pod_flow.sh
+  s_072939943ff4f2::t_2f28f48cfe49e4 94-97,166,232-234,250,253-267
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "6bd466722de432afb51cb794c954485fad26b760",
+  "prompts": {},
+  "sessions": {
+    "s_072939943ff4f2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a84c5db5d8e23480d",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
