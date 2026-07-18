@@ -1,0 +1,23 @@
+scripts/pod.sh
+  s_3faeb0ec6b9263::t_28e2eb3eaed202 62
+scripts/tests/test_pod_flow.sh
+  s_3faeb0ec6b9263::t_b3999642fa1f37 89
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "77defac45f015012358dbc93d08c0010e3b340cf",
+  "prompts": {},
+  "sessions": {
+    "s_3faeb0ec6b9263": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "eb2672f9-3c2f-4e5a-8e92-393e34ed3536",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
