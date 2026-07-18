@@ -1,0 +1,23 @@
+scripts/README.md
+  s_986fe0403ad2fd::t_7a97304052d164 130-139
+scripts/pod.sh
+  s_986fe0403ad2fd::t_c7c29ac883700a 9-18,30-35,37-39
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "9d767f6565730fda395ed63097bf1c9a5c6a2c9f",
+  "prompts": {},
+  "sessions": {
+    "s_986fe0403ad2fd": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a1b0a7e049b13f4f2",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
