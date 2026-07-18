@@ -85,11 +85,16 @@ where
         self.serve.ensure_kv_pool()
     }
 
-    /// Cancel every in-flight engine request, returning how many were
-    /// cancelled. Orphan sweep for a caller that knows all clients are gone
-    /// (the OPD round-loop quiesce after its cc children exited).
-    pub fn cancel_all_requests(&self) -> Result<usize> {
-        self.serve.cancel_all_requests()
+    /// Quiesce engine admission (no new admission) and cancel every in-flight
+    /// (waiting + active) request, returning how many were cancelled. The OPD
+    /// round-loop writeback bracket; pairs with [`Self::resume_admissions`].
+    pub fn quiesce_admissions(&self) -> Result<usize> {
+        self.serve.quiesce_admissions()
+    }
+
+    /// Re-arm admission after the OPD writeback bracket (KV pool re-acquired).
+    pub fn resume_admissions(&self) -> Result<()> {
+        self.serve.resume_admissions()
     }
 
     /// Generate token ids from an already-tokenized prompt through the serving
