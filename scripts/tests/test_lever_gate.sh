@@ -16,6 +16,23 @@ EOF
 LEVER_GATE_VALIDATE_LOG="$tmp/pass.log" BASELINE_LOG="$tmp/baseline.log" \
     LENGTHS=115,300 RUNS=3 "$ROOT/scripts/lever_gate.sh" test >/dev/null
 
+if LEVER_GATE_REQUIRE_EXACT=1 LEVER_GATE_VALIDATE_LOG="$tmp/pass.log" \
+    LENGTHS=115,300 RUNS=3 "$ROOT/scripts/lever_gate.sh" test >/dev/null 2>&1; then
+    echo "lever gate exact mode accepted partial or missed outputs" >&2
+    exit 1
+fi
+if LEVER_GATE_REQUIRE_EXACT=1 LEVER_GATE_VALIDATE_LOG="$tmp/baseline.log" \
+    LENGTHS=115,300 RUNS=3 "$ROOT/scripts/lever_gate.sh" test >/dev/null 2>&1; then
+    echo "lever gate exact mode accepted a non-exact length" >&2
+    exit 1
+fi
+cat >"$tmp/exact.log" <<'EOF'
+SUMMARY len=115 depth=0.00 exact=3 partial=0 miss=0 DET
+SUMMARY len=300 depth=0.00 exact=3 partial=0 miss=0 DET
+EOF
+LEVER_GATE_REQUIRE_EXACT=1 LEVER_GATE_VALIDATE_LOG="$tmp/exact.log" \
+    LENGTHS=115,300 RUNS=3 "$ROOT/scripts/lever_gate.sh" test >/dev/null
+
 cat >"$tmp/fail.log" <<'EOF'
 SUMMARY len=115 depth=0.00 exact=1 partial=0 miss=2 NONDET
 SUMMARY len=300 depth=0.00 exact=0 partial=0 miss=3 DET
