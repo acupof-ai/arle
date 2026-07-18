@@ -1,0 +1,31 @@
+crates/cli/src/train_cli.rs
+  s_3cd02a6d2ec6a9::t_93ab3edfed7406 2166,3196-3202
+crates/infer-api/src/loaded.rs
+  s_3cd02a6d2ec6a9::t_6c170ec489e1f5 851-855,858,860,862,864,866,868,870,872-894
+crates/infer-api/src/serve_engine.rs
+  s_3cd02a6d2ec6a9::t_ec0637ec5d4aca 88-97
+crates/infer-core/src/lib.rs
+  s_3cd02a6d2ec6a9::t_9c29f2c449a301 349-360,399-400,472,1122-1137,1164-1166
+crates/infer-server/src/lib.rs
+  s_3cd02a6d2ec6a9::t_8f80767b3db180 581-585,587,595-600
+crates/train/src/infer_student.rs
+  s_3cd02a6d2ec6a9::t_e65c819f90ceb3 121-129
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "0392af660d6305d0c9e72d68e09d36a5e144f23f",
+  "prompts": {},
+  "sessions": {
+    "s_3cd02a6d2ec6a9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a292f551439f77619",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
