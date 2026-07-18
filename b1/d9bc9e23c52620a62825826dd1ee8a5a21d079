@@ -1,0 +1,21 @@
+scripts/tests/test_validate_release.sh
+  s_3faeb0ec6b9263::t_865790a72a27a9 6
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "b1d9bc9e23c52620a62825826dd1ee8a5a21d079",
+  "prompts": {},
+  "sessions": {
+    "s_3faeb0ec6b9263": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "eb2672f9-3c2f-4e5a-8e92-393e34ed3536",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
