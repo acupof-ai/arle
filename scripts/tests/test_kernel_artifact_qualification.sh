@@ -43,6 +43,7 @@ EOF
         done
 ) >"$TREE/SHA256SUMS"
 tar -C "$TREE" -czf "$TMP/candidate.tar.gz" .
+printf '%s  %s\n' "$(cuda_prebuilt_hash_file "$TMP/candidate.tar.gz")" candidate.tar.gz >"$TMP/candidate.tar.gz.sha256"
 
 printf product >"$TMP/arle"
 chmod +x "$TMP/arle"
@@ -103,5 +104,42 @@ expect_fail "${AGG[@]}" "$TMP/overclaim-out.json" "$TMP/overclaim.json" "$TMP/86
 cmp "$TMP/a.json" "$TMP/b.json"
 jq -e '.schema == 1 and .status == "passed" and (.observations | length == 5) and
     [.observations[].tested_sm] == ["8.0","8.6","8.9","9.0","9.0"]' "$TMP/a.json" >/dev/null
+
+PROMOTE="$TMP/promote"
+mkdir "$PROMOTE" "$TMP/poison"
+for command in cargo rustc cc gcc g++ clang clang++ nvcc cmake make ninja; do
+    printf '#!/usr/bin/env bash\nexit 97\n' >"$TMP/poison/$command"
+    chmod +x "$TMP/poison/$command"
+done
+PATH="$TMP/poison:$PATH" ARLE_KERNEL_PROMOTE_DIR="$PROMOTE" \
+    "$ROOT/scripts/kernel_artifacts.sh" qualify-publish "$TMP/candidate.tar.gz" "$TMP/a.json"
+cmp "$TMP/candidate.tar.gz" "$PROMOTE/candidate.tar.gz"
+cmp "$TMP/candidate.tar.gz.sha256" "$PROMOTE/candidate.tar.gz.sha256"
+cmp "$TMP/a.json" "$PROMOTE/candidate.tar.gz.qualification.json"
+[[ "$(cuda_prebuilt_hash_file "$PROMOTE/candidate.tar.gz")" == "$(cuda_prebuilt_hash_file "$TMP/candidate.tar.gz")" ]]
+mkdir "$TMP/unpacked"
+tar -xzf "$PROMOTE/candidate.tar.gz" -C "$TMP/unpacked"
+cmp "$TREE/generated/kernel.bin" "$TMP/unpacked/generated/kernel.bin"
+PATH="$TMP/poison:$PATH" ARLE_KERNEL_PROMOTE_DIR="$PROMOTE" \
+    "$ROOT/scripts/kernel_artifacts.sh" qualify-publish "$TMP/candidate.tar.gz" "$TMP/a.json"
+
+jq 'del(.observations[0])' "$TMP/a.json" >"$TMP/incomplete-aggregate.json"
+expect_fail env PATH="$TMP/poison:$PATH" ARLE_KERNEL_PROMOTE_DIR="$TMP/rejected" \
+    "$ROOT/scripts/kernel_artifacts.sh" qualify-publish "$TMP/candidate.tar.gz" "$TMP/incomplete-aggregate.json"
+jq '.observations[0].tested_capabilities=["fa3"]' "$TMP/a.json" >"$TMP/invalid-aggregate.json"
+expect_fail env PATH="$TMP/poison:$PATH" ARLE_KERNEL_PROMOTE_DIR="$TMP/rejected" \
+    "$ROOT/scripts/kernel_artifacts.sh" qualify-publish "$TMP/candidate.tar.gz" "$TMP/invalid-aggregate.json"
+
+mkdir "$TMP/partial"
+cp "$TMP/candidate.tar.gz" "$TMP/partial/"
+expect_fail env PATH="$TMP/poison:$PATH" ARLE_KERNEL_PROMOTE_DIR="$TMP/partial" \
+    "$ROOT/scripts/kernel_artifacts.sh" qualify-publish "$TMP/candidate.tar.gz" "$TMP/a.json"
+
+mkdir "$TMP/candidate-dir"
+cp "$TMP/candidate.tar.gz" "$TMP/candidate.tar.gz.sha256" "$TMP/candidate-dir/"
+mkdir "$TMP/promote-dir"
+PATH="$TMP/poison:$PATH" ARLE_KERNEL_PROMOTE_DIR="$TMP/promote-dir" \
+    "$ROOT/scripts/kernel_artifacts.sh" qualify-publish "$TMP/candidate-dir" "$TMP/a.json"
+cmp "$TMP/candidate.tar.gz" "$TMP/promote-dir/candidate.tar.gz"
 
 echo "kernel artifact qualification self-test passed"
