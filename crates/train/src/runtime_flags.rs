@@ -26,6 +26,8 @@ pub struct TrainRuntimeFlags {
     pub rollout_retain_interval: usize,
     /// Rollout progress log interval (`--rollout-progress-interval`).
     pub rollout_progress_interval: usize,
+    /// Skip update records longer than this (`--max-update-seq`; 0 = unlimited).
+    pub max_update_seq: usize,
     /// Autograd-crate knobs, forwarded to `autograd::apply_runtime_flags`.
     pub autograd: autograd::AutogradRuntimeFlags,
 }
@@ -41,6 +43,7 @@ impl Default for TrainRuntimeFlags {
             writeback_frozen_prompt_kv: false,
             rollout_retain_interval: 2,
             rollout_progress_interval: 16,
+            max_update_seq: 23_000,
             autograd: autograd::AutogradRuntimeFlags::default(),
         }
     }
@@ -54,6 +57,7 @@ static TRIM_AFTER_WRITEBACK: AtomicBool = AtomicBool::new(false);
 static WRITEBACK_FROZEN_PROMPT_KV: AtomicBool = AtomicBool::new(false);
 static ROLLOUT_RETAIN_INTERVAL: AtomicUsize = AtomicUsize::new(2);
 static ROLLOUT_PROGRESS_INTERVAL: AtomicUsize = AtomicUsize::new(16);
+static MAX_UPDATE_SEQ: AtomicUsize = AtomicUsize::new(23_000);
 
 pub fn apply_runtime_flags(f: &TrainRuntimeFlags) {
     WRITEBACK_OFFLOAD.store(f.writeback_offload, Relaxed);
@@ -64,7 +68,15 @@ pub fn apply_runtime_flags(f: &TrainRuntimeFlags) {
     WRITEBACK_FROZEN_PROMPT_KV.store(f.writeback_frozen_prompt_kv, Relaxed);
     ROLLOUT_RETAIN_INTERVAL.store(f.rollout_retain_interval.max(1), Relaxed);
     ROLLOUT_PROGRESS_INTERVAL.store(f.rollout_progress_interval.max(1), Relaxed);
+    MAX_UPDATE_SEQ.store(f.max_update_seq, Relaxed);
     autograd::apply_runtime_flags(&f.autograd);
+}
+
+/// VRAM wall: H20-96GB OOMs the writeback backward at seq≈30K even with
+/// offload + trims (alloc_zeros mul_backward, 2026-07-18); 22K peaked 90.7GB.
+/// 0 = unlimited.
+pub(crate) fn max_update_seq() -> usize {
+    MAX_UPDATE_SEQ.load(Relaxed)
 }
 
 pub(crate) fn writeback_offload() -> bool {

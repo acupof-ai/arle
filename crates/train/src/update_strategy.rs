@@ -400,6 +400,9 @@ impl UpdatePreset {
         let mut rf_tokens = 0usize;
 
         for (i, traj) in survivors.iter().enumerate() {
+            if skip_over_max_seq(traj) {
+                continue;
+            }
             let rollout_logprobs = traj.rollout_logprobs.as_deref().ok_or_else(|| {
                 OpdError::InvalidInput(
                     "ratio-weighted update requires rollout_logprobs (harness must capture \
@@ -644,6 +647,19 @@ fn seq_ratio_weight(current_lp: &[f32], behavior_lp: &[f32], clip: ClipForm) -> 
     Ok(pg_token_weight(clip.weight_form(), 1.0, s, 0.0).0)
 }
 
+/// H20-96GB VRAM wall: writeback backward OOMs at seq≈30K even with offload +
+/// trims (see `runtime_flags::max_update_seq`). Skip-with-warn keeps the round
+/// alive instead of killing the whole run mid-group.
+fn skip_over_max_seq(traj: &ScoredTrajectory) -> bool {
+    let cap = crate::runtime_flags::max_update_seq();
+    let seq = traj.prompt_ids.len() + traj.response_ids.len();
+    let skip = cap != 0 && seq > cap;
+    if skip {
+        eprintln!("[update] SKIP trajectory: seq {seq} > max_update_seq {cap} (VRAM wall)");
+    }
+    skip
+}
+
 /// Masked-CE loop over the surviving trajectories (`ratio == None`), mean loss.
 #[allow(clippy::too_many_arguments)]
 fn update_ce<O: Optimizer>(
@@ -659,6 +675,9 @@ fn update_ce<O: Optimizer>(
     let mut loss_sum = 0.0f32;
     let mut tokens = 0usize;
     for traj in survivors {
+        if skip_over_max_seq(traj) {
+            continue;
+        }
         // Dispatch (not `masked_writeback_step(Ce)` directly) so the default
         // path stays byte-identical, honoring `--writeback-frozen-prompt-kv`.
         loss_sum += masked_writeback_ce_step_dispatch(
