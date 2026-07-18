@@ -1,256 +1,450 @@
 #!/usr/bin/env python3
-"""Convert GPTQ safetensors to ARLE W4A16 format.
+"""Convert GPTQ v1 safetensors to ARLE W4A16."""
 
-GPTQ format:
-  *.qweight  -> int32, 4-bit packed (8 weights per int32, low-nibble-first)
-  *.scales   -> float16, per-group scales [K//group_size, N]
-  *.qzeros   -> int32, zero points (symmetric = all 8s)
-
-ARLE W4A16 format:
-  *.weight         -> uint8, 4-bit packed (2 weights per byte, same bytes)
-  *.weight_scale   -> BF16, per-group scales [K//group_size, N]
-  (no zero-point tensor; hardcoded to 8)
-
-Usage:
-  python3 convert_gptq_to_w4a16.py <hf_repo> <output_dir> [--proxy <proxy>]
-
-Example:
-  python3 convert_gptq_to_w4a16.py Qwen/Qwen3.5-27B-GPTQ-Int4 /data/models/qwen35-27b-w4a16
-"""
 import argparse
+import ctypes
+import errno
 import json
 import os
-import struct
+import shutil
 import sys
-import time
+import tempfile
+from collections import Counter
 from pathlib import Path
 
-import numpy as np
-import safetensors
-from safetensors.torch import load_file, save_file
 import torch
+from safetensors import safe_open
+from safetensors.torch import save_file
+
+GPTQ_VALUES_PER_WORD = 8
+W4_VALUES_PER_BYTE = 2
+INDEX_NAME = "model.safetensors.index.json"
+SIDECAR_SUFFIXES = (".qweight", ".qzeros", ".scales", ".g_idx")
 
 
-def download_file(url, dest_path, proxy=None, chunk_size=8 * 1024 * 1024):
-    """Download a file with progress."""
-    import urllib.request
+def convert_gptq_tensors(
+    qweight,
+    qzeros,
+    scales,
+    g_idx=None,
+    *,
+    group_size,
+    tensor_name="qweight",
+    channel_chunk_size=256,
+):
+    """Convert one symmetric GPTQ v1 tensor to row-major W4A16."""
+    if qweight.dtype != torch.int32 or qweight.ndim != 2:
+        raise ValueError(
+            f"{tensor_name}: qweight must be rank-2 int32, got "
+            f"{qweight.dtype} {tuple(qweight.shape)}"
+        )
+    if qzeros.dtype != torch.int32 or qzeros.ndim != 2:
+        raise ValueError(
+            f"{tensor_name}: qzeros must be rank-2 int32, got "
+            f"{qzeros.dtype} {tuple(qzeros.shape)}"
+        )
+    if scales.ndim != 2:
+        raise ValueError(
+            f"{tensor_name}: scales must be rank 2, got {tuple(scales.shape)}"
+        )
+    if group_size <= 0:
+        raise ValueError(
+            f"{tensor_name}: group_size must be positive, got {group_size}"
+        )
+    if channel_chunk_size <= 0:
+        raise ValueError(f"{tensor_name}: channel_chunk_size must be positive")
 
-    if proxy:
-        os.environ["HTTPS_PROXY"] = proxy
-        os.environ["HTTP_PROXY"] = proxy
+    packed_k, output_channels = qweight.shape
+    k = packed_k * GPTQ_VALUES_PER_WORD
+    if k % group_size != 0 or k % W4_VALUES_PER_BYTE != 0:
+        raise ValueError(
+            f"{tensor_name}: K={k} must be divisible by group_size={group_size} and 2"
+        )
 
-    dest_path = Path(dest_path)
-    if dest_path.exists():
-        print(f"  [skip] {dest_path.name} already exists")
-        return
+    num_groups = k // group_size
+    expected_scales = (num_groups, output_channels)
+    if output_channels % GPTQ_VALUES_PER_WORD != 0:
+        raise ValueError(
+            f"{tensor_name}: output channels {output_channels} must be divisible by 8"
+        )
+    expected_qzeros = (num_groups, output_channels // GPTQ_VALUES_PER_WORD)
+    if tuple(scales.shape) != expected_scales:
+        raise ValueError(
+            f"{tensor_name}: scales shape {tuple(scales.shape)} != {expected_scales}"
+        )
+    if tuple(qzeros.shape) != expected_qzeros:
+        raise ValueError(
+            f"{tensor_name}: qzeros shape {tuple(qzeros.shape)} != {expected_qzeros}"
+        )
 
-    tmp_path = dest_path.with_suffix(dest_path.suffix + ".tmp")
-    req = urllib.request.Request(url)
-    t0 = time.time()
-    try:
-        resp = urllib.request.urlopen(req, timeout=300)
-        total = int(resp.headers.get("content-length", 0))
-        downloaded = 0
-        with open(tmp_path, "wb") as f:
-            while True:
-                chunk = resp.read(chunk_size)
-                if not chunk:
-                    break
-                f.write(chunk)
-                downloaded += len(chunk)
-                if total:
-                    pct = downloaded * 100 // total
-                    mb = downloaded / (1024 * 1024)
-                    print(f"\r  downloading {dest_path.name}: {pct}% ({mb:.1f} MB)", end="", flush=True)
-        tmp_path.rename(dest_path)
-        dt = time.time() - t0
-        mb = downloaded / (1024 * 1024)
-        print(f"\r  downloaded {dest_path.name}: {mb:.1f} MB in {dt:.1f}s ({mb/dt:.1f} MB/s)")
-    except Exception as e:
-        if tmp_path.exists():
-            tmp_path.unlink()
-        raise RuntimeError(f"Failed to download {url}: {e}") from e
+    expected_g_idx = (
+        torch.arange(k, device=qweight.device, dtype=torch.long) // group_size
+    )
+    if g_idx is not None:
+        if (
+            g_idx.ndim != 1
+            or g_idx.numel() != k
+            or g_idx.dtype not in (torch.int32, torch.int64)
+        ):
+            raise ValueError(f"{tensor_name}: g_idx must be int32/int64 [{k}]")
+        if not torch.equal(
+            g_idx.to(device=qweight.device, dtype=torch.long), expected_g_idx
+        ):
+            raise ValueError(
+                f"{tensor_name}: non-canonical g_idx requires desc_act support"
+            )
+
+    packed = torch.empty(
+        (output_channels, k // W4_VALUES_PER_BYTE),
+        dtype=torch.uint8,
+        device=qweight.device,
+    )
+    for start in range(0, output_channels, channel_chunk_size):
+        end = min(start + channel_chunk_size, output_channels)
+        channels = torch.arange(start, end, device=qweight.device, dtype=torch.long)
+        zero_words = qzeros[:, channels // GPTQ_VALUES_PER_WORD]
+        zero_shifts = (channels % GPTQ_VALUES_PER_WORD) * 4
+        zeros = (((zero_words >> zero_shifts.unsqueeze(0)) & 0xF) + 1).to(torch.int8).T
+        if not torch.all(zeros == 8):
+            values = torch.unique(zeros).tolist()
+            raise ValueError(
+                f"{tensor_name}: symmetric GPTQ requires zero point 8, got {values[:8]}"
+            )
+
+        signed = torch.empty((end - start, k), dtype=torch.int8, device=qweight.device)
+        qweight_chunk = qweight[:, start:end]
+        for nibble in range(GPTQ_VALUES_PER_WORD):
+            unsigned = ((qweight_chunk >> (nibble * 4)) & 0xF).to(torch.int8).T
+            groups = expected_g_idx[nibble::GPTQ_VALUES_PER_WORD]
+            signed[:, nibble::GPTQ_VALUES_PER_WORD] = unsigned - zeros[:, groups]
+
+        minimum = int(signed.min().item())
+        maximum = int(signed.max().item())
+        if minimum < -8 or maximum > 7:
+            raise ValueError(
+                f"{tensor_name}: signed codes out of range [-8, 7]: "
+                f"min={minimum}, max={maximum}"
+            )
+
+        unsigned = (signed + 8).to(torch.uint8)
+        packed[start:end] = unsigned[:, 0::2] | (unsigned[:, 1::2] << 4)
+
+    return packed, scales.T.contiguous().to(torch.bfloat16)
 
 
-def convert_shard(input_path, output_path):
-    """Convert one GPTQ safetensors shard to W4A16 format."""
-    print(f"  converting {Path(input_path).name}...")
-    t0 = time.time()
+def _read_json(path):
+    with path.open() as handle:
+        return json.load(handle)
 
-    tensors = load_file(input_path)
-    new_tensors = {}
-    dropped = 0
 
-    for key, tensor in tensors.items():
-        if key.endswith(".qweight"):
-            new_key = key[: -len(".qweight")] + ".weight"
-            # int32 [K//8, N] -> uint8 [K//2, N] (reinterpret bytes)
-            t = tensor.contiguous()
-            raw = t.view(torch.uint8)  # [K//8, N*4]
-            raw = raw.reshape(t.shape[0] * 4, t.shape[1])  # [K//2, N]
-            new_tensors[new_key] = raw
+def _root_file(root, name):
+    path = (root / name).resolve()
+    if path.parent != root:
+        raise ValueError(f"path escapes model directory: {name!r}")
+    return path
 
-        elif key.endswith(".scales"):
-            new_key = key[: -len(".scales")] + ".weight_scale"
-            # float16 -> BF16 (via float32)
-            bf16 = tensor.to(torch.float32).to(torch.bfloat16)
-            new_tensors[new_key] = bf16
 
-        elif key.endswith(".qzeros"):
-            # Verify symmetric (all 8s), then drop
-            if not torch.all(tensor == 8):
-                # Print warning but still drop — ARLE hardcodes zp=8
-                unique = tensor.unique()
-                print(f"    WARNING: {key} has non-8 qzeros: {unique[:5]}")
-            dropped += 1
+def _rename_noreplace(src, dst):
+    src = os.fsencode(src)
+    dst = os.fsencode(dst)
+    libc = ctypes.CDLL(None, use_errno=True)
+    if sys.platform.startswith("linux"):
+        rename = libc.renameat2
+        rename.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        result = rename(-100, src, -100, dst, 1)
+    elif sys.platform == "darwin":
+        rename = libc.renamex_np
+        rename.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+        result = rename(src, dst, 4)
+    else:
+        raise OSError(
+            errno.ENOTSUP, f"atomic no-replace rename is unsupported on {sys.platform}"
+        )
+    if result:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), os.fsdecode(dst))
+
+
+def _source_quantization_config(input_dir, config):
+    inline = config.get("quantization_config")
+    if inline:
+        return inline
+    path = _root_file(input_dir, "quantize_config.json")
+    if path.exists():
+        return _read_json(path)
+    raise ValueError("GPTQ quantization_config is missing")
+
+
+def _validate_gptq_v1(config):
+    supported = (
+        config.get("quant_method", "gptq").lower() == "gptq"
+        and config.get("bits") == 4
+        and isinstance(config.get("group_size"), int)
+        and config["group_size"] > 0
+        and config.get("sym") is True
+        and config.get("desc_act") is False
+    )
+    version = config.get("gptq_version", config.get("version"))
+    checkpoint_format = str(
+        config.get("checkpoint_format", config.get("format", ""))
+    ).lower()
+    explicit_v2 = version in (2, "2", "v2") or checkpoint_format in ("gptq_v2", "v2")
+    if not supported or explicit_v2:
+        raise ValueError(
+            "Only GPTQ v1 4-bit symmetric quantization without act-order is supported; "
+            f"got {config}"
+        )
+
+
+def _validate_shard_name(name):
+    if (
+        not isinstance(name, str)
+        or not name
+        or "/" in name
+        or "\\" in name
+        or Path(name).name != name
+        or Path(name).suffix != ".safetensors"
+    ):
+        raise ValueError(f"invalid safetensors shard name: {name!r}")
+
+
+def _inspect_index(input_dir, index):
+    weight_map = index.get("weight_map")
+    if not isinstance(weight_map, dict) or not weight_map:
+        raise ValueError("index weight_map must be a non-empty object")
+    for key, shard in weight_map.items():
+        if not isinstance(key, str) or not key:
+            raise ValueError(f"invalid tensor name in index: {key!r}")
+        _validate_shard_name(shard)
+
+    source_shards = sorted(
+        source
+        for source in input_dir.iterdir()
+        if source.is_file() and source.suffix == ".safetensors"
+    )
+    for source in source_shards:
+        _validate_shard_name(source.name)
+        if source.resolve() != _root_file(input_dir, source.name):
+            raise ValueError(f"shard escapes model directory: {source.name!r}")
+
+    declared_shards = set(weight_map.values())
+    actual_shards = {source.name for source in source_shards}
+    if declared_shards != actual_shards:
+        raise ValueError(
+            "index shard set mismatch: "
+            f"missing={sorted(declared_shards - actual_shards)}, "
+            f"unindexed={sorted(actual_shards - declared_shards)}"
+        )
+
+    actual_map = {}
+    for source in source_shards:
+        with safe_open(source, framework="pt", device="cpu") as handle:
+            for key in handle.keys():
+                if key in actual_map:
+                    raise ValueError(
+                        f"tensor {key} appears in both {actual_map[key]} and {source.name}"
+                    )
+                actual_map[key] = source.name
+
+    declared_keys = set(weight_map)
+    actual_keys = set(actual_map)
+    wrong_shards = sorted(
+        key for key in declared_keys & actual_keys if weight_map[key] != actual_map[key]
+    )
+    if declared_keys != actual_keys or wrong_shards:
+        raise ValueError(
+            "index tensor map mismatch: "
+            f"missing={sorted(declared_keys - actual_keys)}, "
+            f"unindexed={sorted(actual_keys - declared_keys)}, "
+            f"wrong_shard={wrong_shards}"
+        )
+    return weight_map
+
+
+def _gptq_groups(weight_map):
+    prefixes = sorted(
+        key[: -len(".qweight")] for key in weight_map if key.endswith(".qweight")
+    )
+    if not prefixes:
+        raise ValueError("no GPTQ .qweight tensors found")
+
+    groups = {}
+    consumed = set()
+    for prefix in prefixes:
+        keys = {suffix: prefix + suffix for suffix in SIDECAR_SUFFIXES}
+        for suffix in (".qweight", ".qzeros", ".scales"):
+            if keys[suffix] not in weight_map:
+                raise ValueError(f"{prefix}.qweight: missing {keys[suffix]}")
+        groups[prefix] = keys
+        consumed.update(
+            keys[suffix] for suffix in SIDECAR_SUFFIXES if keys[suffix] in weight_map
+        )
+
+    generated = [
+        name
+        for prefix in prefixes
+        for name in (prefix + ".weight", prefix + ".weight_scale")
+    ]
+    duplicates = sorted(name for name, count in Counter(generated).items() if count > 1)
+    conflicts = sorted(set(generated) & (set(weight_map) - consumed))
+    if duplicates or conflicts:
+        raise ValueError(
+            f"generated tensor name collision: duplicates={duplicates}, existing={conflicts}"
+        )
+    return groups, consumed
+
+
+def _load_tensor(input_dir, weight_map, key):
+    shard = weight_map[key]
+    with safe_open(
+        _root_file(input_dir, shard), framework="pt", device="cpu"
+    ) as handle:
+        return handle.get_tensor(key)
+
+
+def _copy_sources(input_dir):
+    excluded = {INDEX_NAME, "config.json", "quantize_config.json"}
+    sources = []
+    for source in input_dir.iterdir():
+        if (
+            not source.is_file()
+            or source.suffix == ".safetensors"
+            or source.name in excluded
+        ):
             continue
+        if source.resolve().parent != input_dir:
+            raise ValueError(f"model file escapes input directory: {source.name!r}")
+        sources.append(source)
+    return sources
 
-        else:
-            # Keep as-is (BF16 attention, norms, embed, lm_head, etc.)
-            new_tensors[key] = tensor
 
-    # Save to temp then rename (input may be mmap'd by load_file)
-    tmp_out = Path(output_path).with_suffix(".converted.tmp")
-    save_file(new_tensors, str(tmp_out))
-    tmp_out.rename(output_path)
-    dt = time.time() - t0
-    print(f"    saved {Path(output_path).name}: {len(new_tensors)} tensors, dropped {dropped} qzeros ({dt:.1f}s)")
+def convert_model_dir(input_dir, output_dir):
+    """Convert one indexed local model directory without modifying its source."""
+    input_dir = Path(input_dir).resolve()
+    output_path = Path(output_dir)
+    output_dir = output_path.parent.resolve() / output_path.name
+    if not input_dir.is_dir():
+        raise ValueError(f"input directory does not exist: {input_dir}")
+    if os.path.lexists(output_dir):
+        raise ValueError(f"output directory already exists: {output_dir}")
+    if not output_dir.parent.is_dir():
+        raise ValueError(f"output parent directory does not exist: {output_dir.parent}")
+    if output_dir == input_dir or output_dir.is_relative_to(input_dir):
+        raise ValueError("output directory must not equal or be inside input directory")
+    if input_dir.is_relative_to(output_dir):
+        raise ValueError("input directory must not be inside output directory")
+
+    config_path = _root_file(input_dir, "config.json")
+    index_path = _root_file(input_dir, INDEX_NAME)
+    if not config_path.is_file() or not index_path.is_file():
+        raise ValueError(f"input must contain config.json and {INDEX_NAME}")
+
+    config = _read_json(config_path)
+    quantization_config = _source_quantization_config(input_dir, config)
+    _validate_gptq_v1(quantization_config)
+    group_size = quantization_config["group_size"]
+    index = _read_json(index_path)
+    weight_map = _inspect_index(input_dir, index)
+    groups, consumed = _gptq_groups(weight_map)
+    copy_sources = _copy_sources(input_dir)
+
+    output_weight_map = {}
+    total_size = 0
+    shards = sorted(set(weight_map.values()))
+    by_target_shard = {}
+    for prefix, keys in groups.items():
+        by_target_shard.setdefault(weight_map[keys[".qweight"]], []).append(
+            (prefix, keys)
+        )
+
+    prefix = f".{output_dir.name}.staging-"
+    with tempfile.TemporaryDirectory(prefix=prefix, dir=output_dir.parent) as temporary:
+        staging_dir = Path(temporary)
+        for source in copy_sources:
+            shutil.copy2(source, staging_dir / source.name)
+
+        for shard in shards:
+            output_tensors = {}
+            with safe_open(
+                _root_file(input_dir, shard), framework="pt", device="cpu"
+            ) as handle:
+                for key in handle.keys():
+                    if key not in consumed:
+                        output_tensors[key] = handle.get_tensor(key)
+
+            for tensor_prefix, keys in by_target_shard.get(shard, []):
+                packed, scales = convert_gptq_tensors(
+                    _load_tensor(input_dir, weight_map, keys[".qweight"]),
+                    _load_tensor(input_dir, weight_map, keys[".qzeros"]),
+                    _load_tensor(input_dir, weight_map, keys[".scales"]),
+                    _load_tensor(input_dir, weight_map, keys[".g_idx"])
+                    if keys[".g_idx"] in weight_map
+                    else None,
+                    group_size=group_size,
+                    tensor_name=keys[".qweight"],
+                )
+                output_tensors[tensor_prefix + ".weight"] = packed
+                output_tensors[tensor_prefix + ".weight_scale"] = scales
+
+            if not output_tensors:
+                continue
+            target = _root_file(staging_dir.resolve(), shard)
+            save_file(output_tensors, target)
+            for key, tensor in output_tensors.items():
+                output_weight_map[key] = shard
+                total_size += tensor.numel() * tensor.element_size()
+
+        output_config = dict(config)
+        output_config["quantization_config"] = {
+            "quant_method": "w4a16",
+            "bits": 4,
+            "group_size": group_size,
+            "sym": True,
+            "desc_act": False,
+        }
+        (staging_dir / "config.json").write_text(
+            json.dumps(output_config, indent=2) + "\n"
+        )
+        metadata = dict(index.get("metadata", {}))
+        metadata["total_size"] = total_size
+        output_index = {"metadata": metadata, "weight_map": output_weight_map}
+        (staging_dir / INDEX_NAME).write_text(json.dumps(output_index, indent=2) + "\n")
+
+        actual_map = {}
+        for shard_path in sorted(staging_dir.glob("*.safetensors")):
+            with safe_open(shard_path, framework="pt", device="cpu") as handle:
+                for key in handle.keys():
+                    if key in actual_map:
+                        raise ValueError(
+                            f"output tensor {key} appears in both "
+                            f"{actual_map[key]} and {shard_path.name}"
+                        )
+                    actual_map[key] = shard_path.name
+        if actual_map != output_weight_map:
+            raise ValueError("staging tensor map does not match output index")
+
+        try:
+            _rename_noreplace(staging_dir, output_dir)
+        except FileExistsError as error:
+            raise ValueError(
+                f"output directory already exists: {output_dir}"
+            ) from error
+
+    return output_index
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Convert GPTQ safetensors to ARLE W4A16 format")
-    parser.add_argument("repo", help="HF repo ID, e.g. Qwen/Qwen3.5-27B-GPTQ-Int4")
-    parser.add_argument("output_dir", help="Output directory for converted model")
-    parser.add_argument("--proxy", default=os.environ.get("HTTPS_PROXY", ""), help="HTTP proxy")
-    parser.add_argument("--keep-original", action="store_true", help="Keep original GPTQ shards after conversion")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("input_dir", type=Path)
+    parser.add_argument("output_dir", type=Path)
     args = parser.parse_args()
-
-    out_dir = Path(args.output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    base_url = f"https://huggingface.co/{args.repo}/resolve/main"
-
-    # 1. Download + parse config.json
-    print(f"Fetching config.json for {args.repo}...")
-    config_path = out_dir / "config.json.orig"
-    download_file(f"{base_url}/config.json", config_path, args.proxy)
-    with open(config_path) as f:
-        config = json.load(f)
-
-    qc = config.get("quantization_config", {})
-    assert qc.get("quant_method") == "gptq", f"Not GPTQ: {qc.get('quant_method')}"
-    assert qc.get("bits") == 4, f"Not 4-bit: {qc.get('bits')}"
-    assert qc.get("sym") is True, f"Not symmetric: {qc.get('sym')}"
-    assert qc.get("desc_act") is False, f"Has act-order (not supported): {qc.get('desc_act')}"
-    group_size = qc.get("group_size", 128)
-    print(f"  GPTQ 4-bit, group_size={group_size}, sym=True, desc_act=False")
-
-    # 2. Download + parse index.json
-    print("Fetching model.safetensors.index.json...")
-    index_path = out_dir / "model.safetensors.index.json.orig"
-    download_file(f"{base_url}/model.safetensors.index.json", index_path, args.proxy)
-    with open(index_path) as f:
-        index = json.load(f)
-
-    weight_map = index["weight_map"]
-    shards = sorted(set(weight_map.values()))
-    print(f"  {len(weight_map)} tensors in {len(shards)} shards")
-
-    # 3. Build new weight map (rename .qweight -> .weight, .scales -> .weight_scale, drop .qzeros)
-    new_weight_map = {}
-    for key, shard in weight_map.items():
-        if key.endswith(".qzeros"):
-            continue
-        if key.endswith(".qweight"):
-            new_key = key[: -len(".qweight")] + ".weight"
-        elif key.endswith(".scales"):
-            new_key = key[: -len(".scales")] + ".weight_scale"
-        else:
-            new_key = key
-        new_shard = shard  # keep same shard name
-        new_weight_map[new_key] = new_shard
-
-    # 4. Convert each shard
-    for shard in shards:
-        # Download original shard
-        shard_url = f"{base_url}/{shard}"
-        shard_path = out_dir / shard
-        download_file(shard_url, shard_path, args.proxy)
-
-        # Convert
-        out_shard = out_dir / shard  # overwrite in place
-        convert_shard(str(shard_path), str(out_shard))
-
-        # Remove original if not keeping
-        if not args.keep_original:
-            # The converted shard overwrites the original, so nothing to remove
-            pass
-
-    # 5. Write new index.json
-    new_index = {
-        "metadata": index.get("metadata", {}),
-        "weight_map": new_weight_map,
-    }
-    new_index_path = out_dir / "model.safetensors.index.json"
-    with open(new_index_path, "w") as f:
-        json.dump(new_index, f, indent=2)
-    print(f"Wrote {new_index_path.name}: {len(new_weight_map)} tensors")
-
-    # 6. Write new config.json with W4A16 quantization_config
-    # Determine modules_to_not_convert from GPTQ dynamic field
-    dynamic = qc.get("dynamic", {})
-    not_convert = []
-    for key in dynamic:
-        if key.startswith("-:"):
-            # Regex pattern — convert to module name hint
-            pattern = key[2:]
-            not_convert.append(pattern)
-        else:
-            not_convert.append(key)
-
-    # Also add standard non-quantized modules
-    for m in ["lm_head", "model.embed_tokens", "model.norm", "mtp"]:
-        if m not in not_convert:
-            not_convert.append(m)
-
-    new_config = dict(config)
-    new_config["quantization_config"] = {
-        "quant_method": "w4a16",
-        "bits": 4,
-        "group_size": group_size,
-        "sym": True,
-        "desc_act": False,
-        "modules_to_not_convert": not_convert,
-    }
-    with open(out_dir / "config.json", "w") as f:
-        json.dump(new_config, f, indent=2)
-    print(f"Wrote config.json with W4A16 quantization_config")
-
-    # 7. Download tokenizer files
-    print("Downloading tokenizer files...")
-    tokenizer_files = [
-        "tokenizer.json",
-        "tokenizer_config.json",
-        "special_tokens_map.json",
-        "vocab.json",
-        "merges.txt",
-        "tokenizer.model",
-        "chat_template.jinja",
-        "generation_config.json",
-    ]
-    for tf in tokenizer_files:
-        try:
-            download_file(f"{base_url}/{tf}", out_dir / tf, args.proxy)
-        except Exception:
-            pass  # optional files
-
-    # Cleanup original index
-    if not args.keep_original:
-        for p in [config_path, index_path]:
-            if p.exists():
-                p.unlink()
-
-    print(f"\nDone! Converted model saved to {out_dir}")
-    print(f"  Run with: arle serve --model-path {out_dir} --backend cuda --port 8000")
+    convert_model_dir(args.input_dir, args.output_dir)
 
 
 if __name__ == "__main__":
