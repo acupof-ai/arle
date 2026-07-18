@@ -7,7 +7,6 @@ trap 'rm -rf "$TMP"' EXIT
 LOCAL="$TMP/local"; NODE="$TMP/node/tree"; TREE="$TMP/pod/tree"; STATE="$TMP/state"; BIN="$TMP/bin"
 mkdir -p "$LOCAL/scripts" "$TMP/node" "$TMP/pod" "$STATE" "$BIN"
 cp "$ROOT/scripts/"{pod.sh,pod-remote-build.sh,pod-remote-run.sh,pick-gpu.sh,reap_run.py,pod-build-env.sh,pod-tilelang-env.sh} "$LOCAL/scripts/"
-ln -s "$NODE" "$TREE"
 
 git -C "$LOCAL" init -q
 git -C "$LOCAL" config user.email test@example.com
@@ -21,14 +20,18 @@ printf untracked > "$LOCAL/untracked space"
 
 cat > "$BIN/pod" <<'SH'
 #!/usr/bin/env bash
-bash -c "$1"
+NODE_TREE="${NODE_TREE:?}" POD_TREE="${POD_TREE:?}" bash -c '
+command=${1//"$NODE_TREE"/"$POD_TREE"}
+bash -c "$command"
+' _ "$1"
 SH
 cat > "$BIN/tn" <<'SH'
 #!/usr/bin/env bash
 [ "${TN_FAIL_AT:-}" != "${TN_COUNT:-0}" ] || exit 1
 src=$2; dst=$3
-mkdir -p "$(dirname "$dst")"
-cp "$src" "$dst"
+pod_dst="${POD_TREE}${dst#"$NODE_TREE"}"
+mkdir -p "$(dirname "$pod_dst")"
+cp "$src" "$pod_dst"
 SH
 cat > "$BIN/python3" <<'SH'
 #!/usr/bin/env bash
@@ -63,10 +66,10 @@ SH
 chmod +x "$BIN/"*
 export PATH="$BIN:$PATH" POD="$BIN/pod" TN="$BIN/tn" NODE_TREE="$NODE" POD_TREE="$TREE" POD_STATE="$STATE"
 
-mkdir -p "$NODE/scripts"; printf sentinel > "$NODE/sentinel"
-cp "$LOCAL/scripts/pod-remote-build.sh" "$NODE/scripts/"
+mkdir -p "$TREE/scripts"; printf sentinel > "$TREE/sentinel"
+cp "$LOCAL/scripts/pod-remote-build.sh" "$TREE/scripts/"
 TN_FAIL_AT=0 "$LOCAL/scripts/pod.sh" sync >/dev/null 2>&1 && exit 1 || true
-[ "$(cat "$NODE/sentinel")" = sentinel ]
+[ "$(cat "$TREE/sentinel")" = sentinel ]
 
 "$LOCAL/scripts/pod.sh" sync >/dev/null
 [ -f "$TREE/new name" ] && [ -f "$TREE/untracked space" ] && [ ! -e "$TREE/delete me" ] && [ ! -e "$TREE/old name" ]
