@@ -127,15 +127,22 @@ directory unless noted.
 
 ## Build & Deploy
 
-Canonical pod sequence:
+Canonical pod sequence is receipt-bound: `sync` atomically installs an exact
+source tree and receipt; `build` consumes it; `run` names the successful build
+receipt as its first argument.
 
 ```bash
 scripts/pod.sh push-scripts
 scripts/pod.sh sync
-scripts/pod.sh build <label>
-scripts/pod.sh status <label>
-scripts/pod.sh run <label> auto -- <args>
+scripts/pod.sh build <build-label>
+scripts/pod.sh status <build-label>
+scripts/pod.sh run <build-label> [run-label] [auto|GPU] -- <args>
 ```
+
+Labels use `[A-Za-z0-9_.-]+`. Omit build/run labels for unique timestamped
+labels. Existing labels are immutable. Logs and receipts live under
+`$POD_STATE/{builds,runs}/<label>/`; status and kill refuse stale or mismatched
+PID/start-time/PGID/operation identities.
 
 | Script | Purpose |
 |---|---|
