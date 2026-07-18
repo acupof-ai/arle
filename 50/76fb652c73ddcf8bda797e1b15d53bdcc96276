@@ -1,0 +1,33 @@
+scripts/README.md
+  s_0696eb63e0109a::t_bf67f3771e42f0 130-132,137-139,142-146
+scripts/pick-gpu.sh
+  s_0696eb63e0109a::t_1807948319a617 3-11,13-37,39-40
+scripts/pod-remote-build.sh
+  s_0696eb63e0109a::t_023afc6b2bf533 3,5-116
+scripts/pod-remote-run.sh
+  s_0696eb63e0109a::t_f9a67ffc81c546 3,5-83
+scripts/pod.sh
+  s_0696eb63e0109a::t_56e2ec47b854d5 4-8,10-26,30-31,33,36,39,45,48-50,52-67,70-81,84-89,91-102,105,110,112-115,118-123
+scripts/reap_run.py
+  s_0696eb63e0109a::t_4dcbae3ccdaf7f 23-35,45,47
+scripts/tests/test_pod_flow.sh
+  s_0696eb63e0109a::t_5d12c9b0f95e84 1-135
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "5076fb652c73ddcf8bda797e1b15d53bdcc96276",
+  "prompts": {},
+  "sessions": {
+    "s_0696eb63e0109a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a470b7db8ccd7053b",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
