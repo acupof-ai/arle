@@ -31,6 +31,12 @@ assert 'env_flag("ARLE_CUDA_ENABLE_FLASHQLA_GDR")' in contract
 capabilities = function_body("configured_capabilities")
 assert 'env_nonempty("ARLE_DEEPEP_DIR")' in capabilities
 assert "ARLE_DEEPEP_SIDECAR_PREBUILT" not in capabilities
+required = function_body("required_symbols")
+assert 'capabilities.contains("flashmla")' in required
+assert 'capabilities.contains("fa3")' in required
+assert '"arle_flashmla_sm90_sparse_decode_real_kernel_marker_cuda"' not in source[
+    source.index("const PREBUILT_REQUIRED_DSV4_SYMBOLS"):source.index("const PREBUILT_MANIFEST")
+]
 PY
 printf kernels >"$SRC/libkernels_cuda.a"
 printf tilelang >"$SRC/libtilelang_kernels_aot.a"
