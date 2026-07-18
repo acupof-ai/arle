@@ -107,7 +107,7 @@ case "$cmd" in
     remote="$NODE_TREE.run-$op.argv"
     push_or_die "$tmp" "$remote"
     pod_remote="$(pod_path "$remote")"
-    "$POD" "POD_TREE='$TREE' POD_STATE='$STATE' setsid bash '$TREE/scripts/pod-remote-run.sh' '$build' '$label' '$gpu' '$op' '$pod_remote' </dev/null >/dev/null 2>&1 &"
+    "$POD" "POD_TREE='$TREE' POD_STATE='$STATE' setsid bash '$TREE/scripts/pod-remote-run.sh' run '$build' '$label' '$gpu' '$op' '$pod_remote' </dev/null >/dev/null 2>&1 &"
     echo "run '$label' launched from build:$build; GPU=$gpu"
     ;;
   gpus)
