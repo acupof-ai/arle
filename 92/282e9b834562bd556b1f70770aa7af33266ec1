@@ -1,0 +1,43 @@
+scripts/README.md
+  s_b1bf0369e8b550::t_dc0cec6ac8ca97 131-135,143
+scripts/lever_gate.sh
+  s_b1bf0369e8b550::t_a0c733e372c062 122-128
+scripts/pick-gpu.sh
+  s_b1bf0369e8b550::t_02b81aebfd43f4 5-43,47,54-55,58-60,63,67
+scripts/pod-remote-build.sh
+  s_b1bf0369e8b550::t_81532aa3111a7d 168-169,229
+scripts/pod-remote-run.sh
+  s_b1bf0369e8b550::t_973f08cac1b042 13-40,42-43,45-50,54-56,63,70-79,82-83,90-140,150,155-156,158,165-167,175-181,186
+scripts/pod.sh
+  s_b1bf0369e8b550::t_359f03ea55ca6f 117-121,134
+scripts/tests/test_lever_gate.sh
+  s_b1bf0369e8b550::t_60fd2dcc0eca06 129-145
+scripts/tests/test_pod_flow.sh
+  s_4c19d90f36810f::t_27d3a0be56ab1e 94-97,166,174,229,233,236,242-256,261-279,282,285-294
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "92282e9b834562bd556b1f70770aa7af33266ec1",
+  "prompts": {},
+  "sessions": {
+    "s_4c19d90f36810f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aacf25a363b785cd3",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_b1bf0369e8b550": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ab623ba15e1180550",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
