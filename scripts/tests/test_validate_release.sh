@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
+trap 'chmod -R u+w "$TMP" 2>/dev/null || true; rm -rf "$TMP"' EXIT
 REPO="$TMP/repo"
 mkdir -p "$REPO/scripts" "$REPO/assets"
 cp "$ROOT/scripts/validate_release.sh" "$REPO/scripts/"
