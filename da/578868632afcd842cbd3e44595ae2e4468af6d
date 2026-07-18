@@ -1,0 +1,25 @@
+scripts/pod-remote-build.sh
+  s_a7d28e33a9937c::t_1b98eb40e9712a 11-72,79-86,89-94,117-120,124,126-127,136,145,147-148,156,159,171,177-181,185
+scripts/pod-remote-run.sh
+  s_a7d28e33a9937c::t_3b7cf8392017c0 6,9,11,15,17,21,32,37,39-40,42-43,50,69,76
+scripts/pod.sh
+  s_a7d28e33a9937c::t_4831981849925b 36,58,83-84
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "da578868632afcd842cbd3e44595ae2e4468af6d",
+  "prompts": {},
+  "sessions": {
+    "s_a7d28e33a9937c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a2db1872daf1d248b",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
