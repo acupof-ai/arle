@@ -86,6 +86,7 @@ printf bench > "$TREE/bench-output/keep"
 cp "$LOCAL/scripts/pod-remote-build.sh" "$TREE/scripts/"
 TN_FAIL_AT=0 "$LOCAL/scripts/pod.sh" sync >/dev/null 2>&1 && exit 1 || true
 [ "$(cat "$TREE/sentinel")" = sentinel ]
+grep -Fq 'COPYFILE_DISABLE=1 tar ' "$LOCAL/scripts/pod.sh"
 
 "$LOCAL/scripts/pod.sh" sync >/dev/null
 [ -f "$TREE/new name" ] && [ -f "$TREE/untracked space" ] && [ ! -e "$TREE/delete me" ] && [ ! -e "$TREE/old name" ]
