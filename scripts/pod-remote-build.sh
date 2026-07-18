@@ -215,7 +215,11 @@ PY
     fi
     binary_sha=""; manifest=""; manifest_sha=""; producer_id=""; embedded_id=""
     [ "$rc" -eq 0 ] && [ -f "$binary" ] && binary_sha="$(sha256 "$binary")" || rc=1
-    manifest="${cargo_out_dir:-}/arle-cuda-kernels.manifest"
+    if [ -n "${ARLE_CUDA_KERNELS_PREBUILT_DIR:-}" ]; then
+      manifest="$ARLE_CUDA_KERNELS_PREBUILT_DIR/arle-cuda-kernels.manifest"
+    else
+      manifest="${cargo_out_dir:-}/arle-cuda-kernels.manifest"
+    fi
     if [ "$rc" -eq 0 ] && [ -f "$manifest" ]; then
       manifest_sha="$(sha256 "$manifest")"
       cuda_prebuilt_manifest_validate "$manifest" && producer_id="$(cuda_prebuilt_manifest_value "$manifest" kernel_build_id)" || rc=1
