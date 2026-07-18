@@ -55,6 +55,20 @@ jobs:
       - name: Run repo hygiene checks
         run: python3 scripts/check_repo_hygiene.py
 
+  shell-contracts:
+    name: Shell Contracts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Run artifact, release, and pod contract tests
+        run: |
+          bash scripts/tests/test_cuda_prebuilt_export.sh
+          bash scripts/tests/test_lever_gate.sh
+          bash scripts/tests/test_kernel_artifact_qualification.sh
+          bash scripts/tests/test_validate_release.sh
+          bash scripts/tests/test_pod_flow.sh
+
   # macOS Metal coverage lives in metal-ci.yml (superset: checks + tests +
   # artifact packaging on macos-14). A second macOS job here was a duplicate.
 
