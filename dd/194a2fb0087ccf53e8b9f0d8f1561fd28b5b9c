@@ -1,0 +1,25 @@
+docs/release-checklist.md
+  s_3a976bcaa3a784::t_f89a0db667ae27 74
+scripts/tests/test_validate_release.sh
+  s_3a976bcaa3a784::t_bf86d37003acfe 1-88
+scripts/validate_release.sh
+  s_3a976bcaa3a784::t_4de4df953303a2 7,26-52,54-55,58-65
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "dd194a2fb0087ccf53e8b9f0d8f1561fd28b5b9c",
+  "prompts": {},
+  "sessions": {
+    "s_3a976bcaa3a784": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ab2c3405055abfce5",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
