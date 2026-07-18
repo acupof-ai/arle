@@ -30,9 +30,9 @@ directory unless noted.
 
 | Script | Purpose |
 |---|---|
-| `convert_gptq_to_w4a16.py` | Convert GPTQ safetensors to ARLE W4A16 format (4-bit). |
+| `convert_gptq_to_w4a16.py` | Convert a local GPTQ v1 directory to ARLE W4A16; download first with `hf download REPO --local-dir DIR`. |
+| `convert_gptq.py` | Compatibility wrapper for the legacy `INPUT_DIR --output OUTPUT_DIR` CLI. |
 | `convert_gptq_w4a16_to_w4a8_marlin.py` | Convert W4A16 to hybrid W4A8 Marlin format. |
-| `convert_gptq.py` | Generic GPTQ format conversion. |
 | `convert_dspark_speculators.py` | Convert DSpark speculator checkpoints. |
 | `gguf_to_safetensors.py` | Convert GGUF to safetensors format. |
 | `merge_w4_hybrid_checkpoint.py` | Merge hybrid W4A16/W4A8 checkpoint shards. |

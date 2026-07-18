@@ -201,7 +201,9 @@ jobs:
             ${{ runner.os }}-pip-
 
       - name: Install Python dependencies
-        run: pip install -e ".[dev]"
+        run: pip install -e ".[dev]" safetensors torch
 
       - name: Run pytest
-        run: python -m pytest tests/python/ -v
+        run: |
+          python -m pytest tests/python/ -v
+          python -m pytest scripts/tests/test_convert_gptq_to_w4a16.py -v
