@@ -4,11 +4,14 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "$ROOT/scripts/cuda_prebuilt_manifest.sh"
 TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
+GENERATED="$ROOT/crates/cuda-kernels/generated"
+GENERATED_BACKUP="$TMP/generated-backup"
+[[ ! -e "$GENERATED" ]] || cp -R "$GENERATED" "$GENERATED_BACKUP"
+trap 'rm -rf "$GENERATED"; [[ ! -e "$GENERATED_BACKUP" ]] || cp -R "$GENERATED_BACKUP" "$GENERATED"; rm -rf "$TMP"' EXIT
 TREE="$TMP/tree"
 mkdir -p "$TREE/generated"
 printf kernel >"$TREE/generated/kernel.bin"
-BUNDLE_ID="bundle:$(printf bundle | cuda_prebuilt_hash_stream)"
+BUNDLE_ID="$(ARLE_KERNEL_BUNDLE_LANE=t1 "$ROOT/scripts/kernel_artifacts.sh" id)"
 KERNEL_ID="bundle:$(printf kernels | cuda_prebuilt_hash_stream)"
 COMMIT="$(printf commit | cuda_prebuilt_hash_stream)"
 cat >"$TREE/generated/arle-cuda-kernels.manifest" <<EOF
@@ -32,7 +35,8 @@ cat >"$TREE/manifest.json" <<EOF
   "abi_sha256": "$(cuda_prebuilt_hash_file "$ROOT/crates/cuda-kernels/kernels.toml")",
   "symbol_allowlist_sha256": "$SYMBOL_SHA",
   "correctness_status": "not-run",
-  "correctness_evidence_sha256": "$EVIDENCE_SHA"
+  "correctness_evidence_sha256": "$EVIDENCE_SHA",
+  "files": "SHA256SUMS"
 }
 EOF
 (
@@ -141,5 +145,37 @@ mkdir "$TMP/promote-dir"
 PATH="$TMP/poison:$PATH" ARLE_KERNEL_PROMOTE_DIR="$TMP/promote-dir" \
     "$ROOT/scripts/kernel_artifacts.sh" qualify-publish "$TMP/candidate-dir" "$TMP/a.json"
 cmp "$TMP/candidate.tar.gz" "$TMP/promote-dir/candidate.tar.gz"
+
+FETCH_ID="$(ARLE_KERNEL_BUNDLE_LANE=t1 "$ROOT/scripts/kernel_artifacts.sh" id)"
+FETCH_NAME="arle-kernels-t1-$FETCH_ID.tar.gz"
+FETCH_DIR="$TMP/fetch"
+mkdir "$FETCH_DIR"
+cp "$TMP/candidate.tar.gz" "$FETCH_DIR/$FETCH_NAME"
+cp "$TMP/candidate.tar.gz.sha256" "$FETCH_DIR/$FETCH_NAME.sha256"
+sed -i.bak "s/candidate.tar.gz/$FETCH_NAME/" "$FETCH_DIR/$FETCH_NAME.sha256"
+rm "$FETCH_DIR/$FETCH_NAME.sha256.bak"
+cp "$TMP/a.json" "$FETCH_DIR/$FETCH_NAME.qualification.json"
+rm -rf "$GENERATED"
+mkdir -p "$GENERATED"
+printf old >"$GENERATED/old"
+ARLE_KERNEL_BUNDLE_LANE=t1 "$ROOT/scripts/kernel_artifacts.sh" fetch-qualified "$FETCH_DIR" >/dev/null
+cmp "$TREE/generated/kernel.bin" "$GENERATED/generated/kernel.bin"
+
+for bad in missing malformed incomplete mixed noncanonical; do
+    BAD="$TMP/fetch-$bad"
+    cp -R "$FETCH_DIR" "$BAD"
+    case "$bad" in
+        missing) rm "$BAD/$FETCH_NAME.qualification.json" ;;
+        malformed) printf '{\n' >"$BAD/$FETCH_NAME.qualification.json" ;;
+        incomplete) jq 'del(.observations[0])' "$TMP/a.json" >"$BAD/$FETCH_NAME.qualification.json" ;;
+        mixed) jq '.candidate_archive_sha256="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' "$TMP/a.json" >"$BAD/$FETCH_NAME.qualification.json" ;;
+        noncanonical) jq . "$TMP/a.json" >"$BAD/$FETCH_NAME.qualification.json" ;;
+    esac
+    rm -rf "$GENERATED"
+    mkdir -p "$GENERATED"
+    printf sentinel >"$GENERATED/sentinel"
+    expect_fail env ARLE_KERNEL_BUNDLE_LANE=t1 "$ROOT/scripts/kernel_artifacts.sh" fetch-qualified "$BAD"
+    [[ "$(<"$GENERATED/sentinel")" == sentinel && "$(find "$GENERATED" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')" == 1 ]]
+done
 
 echo "kernel artifact qualification self-test passed"
