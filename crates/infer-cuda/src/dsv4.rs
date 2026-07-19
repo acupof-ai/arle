@@ -6605,18 +6605,20 @@ impl Dsv4Model {
     /// Draft one MTP matrix level. `rows` is the draft batch for this level
     /// (single-slot path uses `m == 1`; cross-slot batched draft uses one row per
     /// slot). The point-wise pipeline batches over `m`, target-layer attention
-    /// runs per row at `position`, and candidates come from k rounds of device
-    /// argmax + mask — no full-vocab D2H.
+    /// runs per row at each row's `position`, and candidates come from k rounds
+    /// of device argmax + mask — no full-vocab D2H.
     ///
-    /// Returns per row: top-k candidate tokens (highest first) + the wide
-    /// MTP stream the next draft row branches from.
+    /// `slot_ids[r]` selects the KV cache slot for row `r`; `positions[r]` is
+    /// that row's draft position. Returns per row: top-k candidate tokens
+    /// (highest first) + the wide MTP stream the next draft row branches from.
     pub(crate) fn mtp_forward_level(
         &self,
-        slot: &mut Dsv4SlotState,
+        slots: &mut [Dsv4SlotState],
         kv_adapter: &mut crate::attention::Dsv4KvAdapter,
+        slot_ids: &[usize],
         rows: &[MtpDraftRow],
         h_prevs: &[&DeviceVec],
-        position: u64,
+        positions: &[u64],
         top_k: usize,
     ) -> Result<Vec<(Vec<u32>, DeviceVec)>> {
         ensure!(
@@ -6633,7 +6635,13 @@ impl Dsv4Model {
             .as_ref()
             .ok_or_else(|| anyhow!("DSv4 MTP requested but the draft head is not loaded"))?;
         let m = rows.len();
-        ensure!(m > 0 && h_prevs.len() == m, "DSv4 MTP level shape mismatch");
+        ensure!(
+            m > 0 && h_prevs.len() == m && slot_ids.len() == m && positions.len() == m,
+            "DSv4 MTP level shape mismatch (rows {m}, h_prevs {}, slot_ids {}, positions {})",
+            h_prevs.len(),
+            slot_ids.len(),
+            positions.len()
+        );
         let mega_epoch = self.begin_mega_moe_forward(m)?;
         let hidden_size = self.config.hidden_size;
         let hc_mult = self.config.hc_mult;
@@ -6713,24 +6721,22 @@ impl Dsv4Model {
         // which candidate rows are scheduled for target verify.
         let layer = &mtp.layer;
         let target_layer_idx = self.mtp_frozen_target_layer_idx(mtp)?;
-        ensure!(
-            target_layer_idx < slot.attention.len(),
-            "DSv4 MTP frozen-KV target layer {target_layer_idx} outside slot attention len {}",
-            slot.attention.len()
-        );
+        for &sid in slot_ids {
+            ensure!(
+                target_layer_idx < slots[sid].attention.len(),
+                "DSv4 MTP frozen-KV target layer {target_layer_idx} outside slot {sid} attention len {}",
+                slots[sid].attention.len()
+            );
+        }
         let local_width = layer.attention.wq_b.rows;
         ensure!(
             local_width.is_multiple_of(self.config.head_dim),
             "DSv4 MTP attention local width {local_width} is not a multiple of head_dim {}",
             self.config.head_dim
         );
-        let pos_dev = ctx
-            .stream
-            .clone_htod(&[position as i32])
-            .map_err(|e| anyhow!("DSv4 MTP start_pos H2D failed: {e}"))?;
 
         let attn_mhc = crate::hc::gen_mhc_params(ctx, &self.config, &layer.hc_attn, &stream)?;
-        // SAFETY: uninit device scratch; fully written before first read.
+        // SAFETY: scratch fully written before read.
         let mut attn_normed = unsafe { HiddenStates::uninit(ctx, hidden_size, m)? };
         crate::hc::mhc_pre_rms_norm(
             ctx,
@@ -6743,12 +6749,12 @@ impl Dsv4Model {
             &mut attn_normed,
         )?;
         keepalive.keep_hidden(&attn_normed);
-        // SAFETY: uninit device scratch; fully written before first read.
+        // SAFETY: scratch fully written before read.
         let mut attn_out = unsafe { HiddenStates::uninit(ctx, hidden_size, m)? };
         {
-            // SAFETY: uninit device scratch; fully written before first read.
+            // SAFETY: scratch fully written before read.
             let mut normed_row = unsafe { HiddenStates::uninit(ctx, hidden_size, 1)? };
-            // SAFETY: uninit device scratch; fully written before first read.
+            // SAFETY: scratch fully written before read.
             let mut attn_row = unsafe { HiddenStates::uninit(ctx, hidden_size, 1)? };
             keepalive.keep_hidden(&normed_row);
             keepalive.keep_hidden(&attn_row);
@@ -6761,6 +6767,10 @@ impl Dsv4Model {
                 ctx.stream
                     .memcpy_dtod(&src, &mut normed_row.data)
                     .map_err(|e| anyhow!("DSv4 MTP attn copy-in failed: {e}"))?;
+                let pos_dev = ctx
+                    .stream
+                    .clone_htod(&[positions[r] as i32])
+                    .map_err(|e| anyhow!("DSv4 MTP start_pos H2D failed: {e}"))?;
                 crate::attention::mla_attention(
                     ctx,
                     &self.config,
@@ -6769,14 +6779,13 @@ impl Dsv4Model {
                     layer.compress_ratio,
                     target_layer_idx,
                     &normed_row,
-                    &mut slot.attention[target_layer_idx],
+                    &mut slots[slot_ids[r]].attention[target_layer_idx],
                     layer_pool,
                     dsa_shared.as_deref_mut(),
                     flashmla_scratch.as_deref_mut(),
                     prefill_shared.as_deref_mut(),
-                    // Decode lane (start_pos_device Some): probe unreachable.
                     None,
-                    position as usize,
+                    positions[r] as usize,
                     Some(&pos_dev),
                     None,
                     &self.tp,
