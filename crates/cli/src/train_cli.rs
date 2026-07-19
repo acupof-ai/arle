@@ -2163,7 +2163,7 @@ fn quiesce_serve(
             .lock()
             .map_err(|err| anyhow!("LoadedInferenceEngine lock poisoned: {err}"))
     };
-    let cancelled = lock()?.cancel_all_requests()?;
+    let cancelled = lock()?.quiesce_admissions()?;
     if cancelled > 0 {
         eprintln!("[agent-opd] quiesce: cancelled {cancelled} orphaned request(s)");
     }
@@ -3379,6 +3379,25 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
                     truncated: false,
                 })
                 .collect();
+            // VRAM-wall length guard, applied HERE — before `capture_rollout_logprobs`
+            // runs an unguarded recompute forward and before the writeback. A
+            // trajectory over `max_update_seq` OOM-hangs the capture forward in an
+            // H2D staging copy (37K-token sqlparse hung `cuMemcpyHtoDAsync`, f6g
+            // 2026-07-19); update()'s own `skip_over_max_seq` is downstream, too late
+            // to protect capture. Skipped here == skipped by update() anyway.
+            if args.runtime.max_update_seq != 0 {
+                batch.retain(|t| {
+                    let seq = t.prompt_ids.len() + t.response_ids.len();
+                    let keep = seq <= args.runtime.max_update_seq;
+                    if !keep {
+                        eprintln!(
+                            "[agent-opd] SKIP trajectory pre-capture: seq {seq} > max_update_seq {} (VRAM wall)",
+                            args.runtime.max_update_seq
+                        );
+                    }
+                    keep
+                });
+            }
             if args.writeback_cap.is_some() {
                 if !needs.keep_failing {
                     // Don't let failures (rejected inside `update`) burn budget.
@@ -3521,6 +3540,12 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
             }
             if let Err(err) = infer_student.ensure_kv_pool() {
                 eprintln!("[agent-opd] ensure KV pool (group {group_idx}) failed: {err}");
+            }
+            // Re-arm admission after this group's writeback bracket quiesced it
+            // (paired with quiesce_admissions in quiesce_serve). Idempotent; the
+            // pool is re-acquired just above, so admission reopens onto a live pool.
+            if let Err(err) = infer_student.resume_admissions() {
+                eprintln!("[agent-opd] resume admissions (group {group_idx}) failed: {err}");
             }
             // Post-merge prefix warm-up: the re-merge flushed the radix cache,
             // so re-prefill the shared cc prompt (newest dump's prompt portion,
