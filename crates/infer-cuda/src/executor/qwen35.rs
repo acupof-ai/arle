@@ -3139,6 +3139,221 @@ impl Qwen35CudaExecutor {
 #[cfg(test)]
 mod tier_io_tests {
     use super::*;
+    use half::bf16;
+    use infer_plan::{ForwardMode, PrefillRow};
+
+    const FACTUAL_S33: [u32; 33] = [
+        248045, 846, 198, 3710, 369, 279, 6511, 314, 8071, 30, 30299, 391, 30982, 66463, 494,
+        20620, 13, 21134, 303, 799, 466, 1330, 22157, 13, 248046, 198, 248045, 74455, 198, 248068,
+        271, 248069, 271,
+    ];
+    const NEEDLE_S75: [u32; 75] = [
+        248045, 846, 198, 4274, 411, 2716, 2193, 321, 4087, 1132, 279, 10897, 3177, 13, 9321, 25,
+        561, 6105, 8265, 369, 383, 26748, 220, 18, 13, 561, 2528, 1970, 369, 220, 19, 23, 16, 17,
+        13, 561, 2313, 6725, 66351, 682, 1141, 1534, 3286, 303, 11751, 13, 561, 2438, 8265, 369,
+        383, 26748, 220, 22, 13, 15380, 25, 733, 864, 3177, 369, 5606, 66351, 1534, 3286, 30,
+        248046, 198, 248045, 74455, 198, 248068, 271, 248069, 271,
+    ];
+
+    fn format_w4_sampled_projection_case(
+        name: &str,
+        seq_len: usize,
+        captures: &[crate::qwen35::w4_probe::Capture],
+    ) -> (String, bool) {
+        use crate::qwen35::w4_probe::Projection;
+        use std::fmt::Write;
+
+        const MAX_ABS_TOL: f32 = 0.05;
+        const MEAN_ABS_TOL: f64 = 0.01;
+
+        assert_eq!(
+            captures
+                .iter()
+                .map(|capture| capture.projection)
+                .collect::<Vec<_>>(),
+            [
+                Projection::LinearQkv,
+                Projection::FullQ,
+                Projection::FullK,
+                Projection::FullV,
+            ],
+            "{name}: unexpected W4 projection capture order"
+        );
+        let mut report = format!("case={name} seq_len={seq_len}\n");
+        let mut passed = true;
+        for capture in captures {
+            assert_eq!(capture.seq_len, seq_len);
+            assert_eq!(capture.packed_weight.len(), capture.rows * capture.cols / 2);
+            assert_eq!(capture.input.len(), seq_len * capture.cols);
+            assert_eq!(capture.output.len(), seq_len * capture.rows);
+            assert!(capture.rows >= 64);
+            assert!(capture.group_size > 0);
+            assert_eq!(capture.cols % capture.group_size, 0);
+            let groups = capture.cols / capture.group_size;
+            assert_eq!(capture.scales.len(), capture.rows * groups);
+
+            let rows = (0..64)
+                .map(|i| i * (capture.rows - 1) / 63)
+                .collect::<Vec<_>>();
+            let mut max_abs = 0.0f64;
+            let mut sum_abs = 0.0f64;
+            let mut dot = 0.0f64;
+            let mut ref_norm = 0.0f64;
+            let mut got_norm = 0.0f64;
+            let mut first_violation = None;
+            let mut non_finite = 0usize;
+            let mut count = 0usize;
+            for token in 0..seq_len {
+                let input = &capture.input[token * capture.cols..(token + 1) * capture.cols];
+                for &row in &rows {
+                    let reference = bf16::from_f32(input.iter().enumerate().fold(
+                        0.0f32,
+                        |sum, (col, activation)| {
+                            let packed = capture.packed_weight[row * capture.cols / 2 + col / 2];
+                            let q = if col.is_multiple_of(2) {
+                                packed & 0x0f
+                            } else {
+                                packed >> 4
+                            };
+                            let scale =
+                                capture.scales[row * groups + col / capture.group_size].to_f32();
+                            sum + (f32::from(q) - 8.0) * scale * activation.to_f32()
+                        },
+                    ))
+                    .to_f32();
+                    let actual = capture.output[token * capture.rows + row].to_f32();
+                    if !reference.is_finite() || !actual.is_finite() {
+                        non_finite += 1;
+                    }
+                    let abs = (reference - actual).abs();
+                    if first_violation.is_none() && (!abs.is_finite() || abs >= MAX_ABS_TOL) {
+                        first_violation = Some((token, row, reference, actual, abs));
+                    }
+                    max_abs = max_abs.max(f64::from(abs));
+                    sum_abs += f64::from(abs);
+                    dot += f64::from(reference) * f64::from(actual);
+                    ref_norm += f64::from(reference).powi(2);
+                    got_norm += f64::from(actual).powi(2);
+                    count += 1;
+                }
+            }
+            let mean_abs = sum_abs / count as f64;
+            let cosine = if ref_norm > 0.0 && got_norm > 0.0 {
+                dot / (ref_norm.sqrt() * got_norm.sqrt())
+            } else {
+                1.0
+            };
+            let projection_passed =
+                non_finite == 0 && max_abs < f64::from(MAX_ABS_TOL) && mean_abs < MEAN_ABS_TOL;
+            passed &= projection_passed;
+            writeln!(
+                report,
+                "projection={:?} rows={} cols={} group_size={} sampled_rows=64 max_abs={:.8} mean_abs={:.8} cosine={:.10} non_finite={} first_violation={:?} passed={}",
+                capture.projection,
+                capture.rows,
+                capture.cols,
+                capture.group_size,
+                max_abs,
+                mean_abs,
+                cosine,
+                non_finite,
+                first_violation,
+                projection_passed,
+            )
+            .unwrap();
+        }
+        (report, passed)
+    }
+
+    #[test]
+    #[ignore = "GPU + Qwen3.6-27B-W4A16 checkpoint; set INFER_QWEN35_W4_PROBE_OUT"]
+    fn qwen35_w4_sampled_projection_parity() {
+        let Ok(out_path) = std::env::var("INFER_QWEN35_W4_PROBE_OUT") else {
+            return;
+        };
+        let model_path = std::env::var("INFER_QWEN35_W4_PROBE_MODEL")
+            .unwrap_or_else(|_| "/tmp/Qwen3.6-27B-W4A16-fixed-d68879e".to_string());
+        let total_pages = 16;
+        let mut executor = Qwen35CudaExecutor::from_qwen35_safetensors(
+            &model_path,
+            1,
+            total_pages,
+            total_pages * SUPPORTED_PAGE_SIZE,
+            CudaKvCacheDtype::Bf16,
+            0.9,
+            None,
+            0.0,
+            None,
+        )
+        .expect("load Qwen3.6 W4A16 executor");
+        executor.decode_graph_armed = false;
+        assert!(!executor.kv_recall);
+        assert!(executor.dspark.is_none());
+        assert!(executor.mtp.is_none());
+        assert_eq!(executor.kv_format, KVFormat::BF16);
+        let mut report = format!(
+            "model={model_path}\nscope=sampled_first_projection_occurrence\nmax_abs_tolerance=0.05\nmean_abs_tolerance=0.01\n"
+        );
+        let mut all_passed = true;
+
+        for (name, tokens) in [
+            ("factual_s33", FACTUAL_S33.as_slice()),
+            ("needle_s75", NEEDLE_S75.as_slice()),
+        ] {
+            let (prior_len, prior_epoch) = {
+                let pool = executor.full_attn_kv.as_ref().expect("paged KV pool");
+                (pool.seq_len(0), pool.slot_epoch(0))
+            };
+            crate::qwen35::w4_probe::arm();
+            let submit = executor.submit(&ForwardPlan {
+                mode: ForwardMode::Prefill,
+                decode_rows: Vec::new(),
+                prefill_rows: vec![PrefillRow {
+                    slot: 0,
+                    tokens: tokens.to_vec(),
+                    start_pos: 0,
+                    total_tokens: tokens.len() + 1,
+                    params: SamplingParams {
+                        temperature: 0.0,
+                        top_k: -1,
+                        ..Default::default()
+                    },
+                }],
+                microbatch: None,
+                spec: None,
+            });
+            submit.expect("actual paged prefill");
+            let captures = crate::qwen35::w4_probe::drain();
+            let pool = executor.full_attn_kv.as_ref().expect("paged KV pool");
+            assert_eq!(pool.seq_len(0), tokens.len());
+            assert_eq!(
+                pool.page_indices(0).len(),
+                tokens.len().div_ceil(SUPPORTED_PAGE_SIZE)
+            );
+            assert_eq!(
+                pool.slot_epoch(0),
+                prior_epoch + usize::from(prior_len > 0) as u64
+            );
+            assert_eq!(executor.slots[0].seq_len(), tokens.len());
+            assert!(executor.slots[0].has_recurrent());
+            assert_eq!(
+                captures.len(),
+                4,
+                "{name}: expected linear qkv + full q/k/v captures"
+            );
+            let (case_report, passed) =
+                format_w4_sampled_projection_case(name, tokens.len(), &captures);
+            report.push_str(&case_report);
+            all_passed &= passed;
+        }
+
+        std::fs::write(&out_path, &report).expect("write W4 probe report");
+        eprint!("{report}");
+        assert!(
+            all_passed,
+            "W4 actual-activation parity failed; report: {out_path}"
+        );
+    }
 
     #[test]
     fn speculative_chain_boundary_falls_back_before_verify_exceeds_max_seq_len() {

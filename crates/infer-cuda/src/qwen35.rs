@@ -67,6 +67,115 @@ pub(crate) mod dspark;
 const DEFAULT_ROPE_CACHE_LEN: usize = 32_768;
 const QWEN35_BATCHED_DECODE_KV_SPLITS: usize = 4;
 
+#[cfg(test)]
+pub(crate) mod w4_probe {
+    use super::*;
+    use std::cell::RefCell;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum Projection {
+        LinearQkv,
+        FullQ,
+        FullK,
+        FullV,
+    }
+
+    pub(crate) struct Capture {
+        pub(crate) projection: Projection,
+        pub(crate) seq_len: usize,
+        pub(crate) rows: usize,
+        pub(crate) cols: usize,
+        pub(crate) group_size: usize,
+        pub(crate) input: Vec<bf16>,
+        pub(crate) output: Vec<bf16>,
+        pub(crate) packed_weight: Vec<u8>,
+        pub(crate) scales: Vec<bf16>,
+    }
+
+    thread_local! {
+        static CAPTURES: RefCell<Option<Vec<Capture>>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn arm() {
+        CAPTURES.with(|captures| {
+            assert!(
+                captures.replace(Some(Vec::new())).is_none(),
+                "W4 probe already armed"
+            );
+        });
+    }
+
+    pub(crate) fn drain() -> Vec<Capture> {
+        CAPTURES.with(|captures| captures.borrow_mut().take().expect("W4 probe not armed"))
+    }
+
+    pub(super) fn capture(
+        ctx: &DeviceContext,
+        projection: Projection,
+        weight: &DeviceMatrix,
+        input: &HiddenStates,
+        output: &HiddenStates,
+    ) -> Result<()> {
+        let needed = CAPTURES.with(|captures| {
+            captures.borrow().as_ref().is_some_and(|captures| {
+                captures
+                    .iter()
+                    .all(|capture| capture.projection != projection)
+            })
+        });
+        if !needed {
+            return Ok(());
+        }
+        ensure!(
+            weight.weight_format == WeightFormat::W4A16,
+            "{projection:?} is not W4A16"
+        );
+        let packed = weight
+            .qweight
+            .as_ref()
+            .ok_or_else(|| anyhow!("{projection:?} missing qweight"))?;
+        let scales = weight
+            .qscales
+            .as_ref()
+            .ok_or_else(|| anyhow!("{projection:?} missing qscales"))?;
+        let packed_weight = ctx
+            .stream
+            .clone_dtoh(packed)
+            .map_err(|e| anyhow!("{projection:?} weight D2H failed: {e}"))?;
+        let input = ctx
+            .stream
+            .clone_dtoh(&input.data)
+            .map_err(|e| anyhow!("{projection:?} input D2H failed: {e}"))?;
+        let output = ctx
+            .stream
+            .clone_dtoh(&output.data)
+            .map_err(|e| anyhow!("{projection:?} output D2H failed: {e}"))?;
+        let scales = ctx
+            .stream
+            .clone_dtoh(scales)
+            .map_err(|e| anyhow!("{projection:?} scales D2H failed: {e}"))?;
+        ctx.sync()?;
+        CAPTURES.with(|captures| {
+            captures
+                .borrow_mut()
+                .as_mut()
+                .expect("W4 probe disarmed during capture")
+                .push(Capture {
+                    projection,
+                    seq_len: input.len() / weight.cols,
+                    rows: weight.rows,
+                    cols: weight.cols,
+                    group_size: weight.group_size,
+                    input,
+                    output,
+                    packed_weight: packed_weight.into_iter().map(|byte| byte as u8).collect(),
+                    scales,
+                });
+        });
+        Ok(())
+    }
+}
+
 fn qwen35_profile_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -5508,6 +5617,30 @@ impl Qwen35Model {
                 gemm_batch(&self.ctx, &attn.q_proj, normed, q_full)?;
                 gemm_batch(&self.ctx, &attn.k_proj, normed, k_batch)?;
                 gemm_batch(&self.ctx, &attn.v_proj, normed, v_batch)?;
+                #[cfg(test)]
+                {
+                    w4_probe::capture(
+                        &self.ctx,
+                        w4_probe::Projection::FullQ,
+                        &attn.q_proj,
+                        normed,
+                        q_full,
+                    )?;
+                    w4_probe::capture(
+                        &self.ctx,
+                        w4_probe::Projection::FullK,
+                        &attn.k_proj,
+                        normed,
+                        k_batch,
+                    )?;
+                    w4_probe::capture(
+                        &self.ctx,
+                        w4_probe::Projection::FullV,
+                        &attn.v_proj,
+                        normed,
+                        v_batch,
+                    )?;
+                }
                 Ok(())
             },
         )?;
@@ -5895,6 +6028,14 @@ impl Qwen35Model {
             seq_len,
             || {
                 gemm_batch(&self.ctx, &attn.in_proj_qkv, normed, qkv)?;
+                #[cfg(test)]
+                w4_probe::capture(
+                    &self.ctx,
+                    w4_probe::Projection::LinearQkv,
+                    &attn.in_proj_qkv,
+                    normed,
+                    qkv,
+                )?;
                 gemm_batch(&self.ctx, &attn.in_proj_z, normed, z)?;
                 gemm_batch(&self.ctx, &attn.in_proj_b, normed, b_proj)?;
                 gemm_batch(&self.ctx, &attn.in_proj_a, normed, a_proj)?;
