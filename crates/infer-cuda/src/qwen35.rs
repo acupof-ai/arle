@@ -358,6 +358,7 @@ pub(crate) mod prep_probe {
     use super::*;
     use std::cell::RefCell;
 
+    #[allow(dead_code)]
     pub(crate) struct Capture {
         pub(crate) seq_len: usize,
         pub(crate) num_q_heads: usize,

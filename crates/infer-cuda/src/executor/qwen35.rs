@@ -3498,9 +3498,7 @@ mod tier_io_tests {
                     }
                 }
 
-                for val_idx in 0..capture.val_dim {
-                    output.push(bf16::from_f32(out[val_idx]));
-                }
+                output.extend(out.iter().map(|&v| bf16::from_f32(v)));
             }
         }
         (output, state)
@@ -3673,7 +3671,6 @@ mod tier_io_tests {
             let pos = capture.start_pos as usize + token;
             for q_head in 0..capture.num_q_heads {
                 let q_src = token * q_full_dim + q_head * head_dim * 2;
-                let q_dst = token * q_dim + q_head * head_dim;
 
                 // RMSNorm: scale = 1/sqrt(mean(x^2) + eps)
                 let sq_sum: f32 = (0..head_dim)
@@ -3899,12 +3896,13 @@ mod tier_io_tests {
                     .map(|d| capture.q_prepped[q_base + d].to_f32())
                     .collect();
 
-                let mut scores = vec![0.0f32; token + 1];
-                for j in 0..=token {
-                    let k_base = j * kv_dim + kv_head * head_dim;
-                    let dot: f32 = (0..head_dim).map(|d| q[d] * k_roped[k_base + d]).sum();
-                    scores[j] = dot * sm_scale;
-                }
+                let scores: Vec<f32> = (0..=token)
+                    .map(|j| {
+                        let k_base = j * kv_dim + kv_head * head_dim;
+                        let dot: f32 = (0..head_dim).map(|d| q[d] * k_roped[k_base + d]).sum();
+                        dot * sm_scale
+                    })
+                    .collect();
                 // softmax
                 let max_score = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                 let exp_sum: f32 = scores.iter().map(|s| (s - max_score).exp()).sum();
@@ -3914,14 +3912,14 @@ mod tier_io_tests {
                     .collect();
 
                 let mut out = vec![0.0f32; head_dim];
-                for j in 0..=token {
+                for (j, &w) in weights.iter().enumerate() {
                     let v_base = j * kv_dim + kv_head * head_dim;
-                    for d in 0..head_dim {
-                        out[d] += weights[j] * capture.v_raw[v_base + d].to_f32();
+                    for (d, o) in out.iter_mut().enumerate() {
+                        *o += w * capture.v_raw[v_base + d].to_f32();
                     }
                 }
-                for d in 0..head_dim {
-                    output.push(bf16::from_f32(out[d]));
+                for &o in out.iter() {
+                    output.push(bf16::from_f32(o));
                 }
             }
         }
