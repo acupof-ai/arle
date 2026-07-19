@@ -3309,10 +3309,17 @@ impl Qwen35Model {
             );
 
             layers.push(Qwen35Layer {
-                input_layernorm: loader.load_vec(&ctx, &names.common.input_layernorm)?,
+                input_layernorm: load_final_norm_offset(
+                    &loader,
+                    &ctx,
+                    &names.common.input_layernorm,
+                )?,
                 attn,
-                post_attention_layernorm: loader
-                    .load_vec(&ctx, &names.common.post_attention_layernorm)?,
+                post_attention_layernorm: load_final_norm_offset(
+                    &loader,
+                    &ctx,
+                    &names.common.post_attention_layernorm,
+                )?,
                 mlp,
                 moe,
             });
@@ -8358,10 +8365,13 @@ fn load_qwen35_mtp_head(
         (Some(mlp), None)
     };
     let layer = Qwen35Layer {
-        input_layernorm: loader.load_vec(ctx, &names.layer.common.input_layernorm)?,
+        input_layernorm: load_final_norm_offset(loader, ctx, &names.layer.common.input_layernorm)?,
         attn,
-        post_attention_layernorm: loader
-            .load_vec(ctx, &names.layer.common.post_attention_layernorm)?,
+        post_attention_layernorm: load_final_norm_offset(
+            loader,
+            ctx,
+            &names.layer.common.post_attention_layernorm,
+        )?,
         mlp,
         moe,
     };
