@@ -3790,7 +3790,8 @@ mod tier_io_tests {
         let mut all_passed = true;
 
         for (slot, name, tokens, expected_segments) in [
-            (0, "factual_s33", FACTUAL_S33.as_slice(), &[32, 1][..]),
+            // prep probe 只在 prefill (seq_len>1) 捕获；S33 的 1-token 尾段走 decode
+            (0, "factual_s33", FACTUAL_S33.as_slice(), &[32][..]),
             (1, "needle_s75", NEEDLE_S75.as_slice(), &[64, 11][..]),
         ] {
             crate::qwen35::prep_probe::arm();
