@@ -233,6 +233,16 @@ fn engine_loop_with_tick_broadcaster<E, K>(
         // the submit channel so `drain_control` (step 0) still observes resume.
         if engine.is_quiesced() {
             carry = drained;
+            // Keep telemetry live: `quiesce_serve` polls `active_requests == 0`
+            // after `quiesce()` cancelled everything — without this publish the
+            // counter stays stale and that poll never clears (60s timeout).
+            publish_counters(&engine, &counters);
+            // Frontend gone (submit channel closed) → exit like the idle path,
+            // so engine teardown never deadlocks on a quiesced engine.
+            if !submit_open {
+                deliver_completions(&engine, &mut pending, &streamers);
+                return;
+            }
             match submit_rx.recv_timeout(IDLE_PARK) {
                 Ok(submission) => carry.push(submission),
                 Err(RecvTimeoutError::Timeout) => {}
