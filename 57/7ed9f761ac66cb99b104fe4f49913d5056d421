@@ -1,0 +1,21 @@
+crates/train/src/dspark_rl.rs
+  s_2d5ae796fd7468::t_0a67c7b116d8c1 1-299
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "577ed9f761ac66cb99b104fe4f49913d5056d421",
+  "prompts": {},
+  "sessions": {
+    "s_2d5ae796fd7468": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aa755872fdd9b470f",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
