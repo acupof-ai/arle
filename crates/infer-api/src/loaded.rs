@@ -848,50 +848,27 @@ mod backend {
             }
         }
 
-        /// Quiesce engine admission (switch to Quiesced, no new admission) and
-        /// cancel every in-flight (waiting + active) request, returning how many
-        /// were cancelled. The OPD round-loop writeback bracket; pairs with
-        /// [`Self::resume_admissions`] after the KV pool is re-acquired.
-        pub fn quiesce_admissions(&self) -> Result<usize> {
+        /// Cancel every in-flight engine request, returning how many were
+        /// cancelled. Orphan sweep for a caller that knows all clients are
+        /// gone (the OPD round-loop quiesce after its cc children exited).
+        pub fn cancel_all_requests(&self) -> Result<usize> {
             match self {
                 #[cfg(feature = "metal")]
-                Self::Metal(engine) => engine.quiesce_admissions(),
+                Self::Metal(engine) => engine.cancel_all_requests(),
                 #[cfg(feature = "metal")]
-                Self::MetalDiffusionGemma(engine) => engine.quiesce_admissions(),
+                Self::MetalDiffusionGemma(engine) => engine.cancel_all_requests(),
                 #[cfg(feature = "metal")]
-                Self::MetalGemma4(engine) => engine.quiesce_admissions(),
+                Self::MetalGemma4(engine) => engine.cancel_all_requests(),
                 #[cfg(feature = "metal")]
-                Self::MetalDeepseekOcr(engine) => engine.quiesce_admissions(),
+                Self::MetalDeepseekOcr(engine) => engine.cancel_all_requests(),
                 #[cfg(feature = "cuda")]
-                Self::Cuda(engine) => engine.quiesce_admissions(),
+                Self::Cuda(engine) => engine.cancel_all_requests(),
                 #[cfg(feature = "hip")]
-                Self::Hip(engine) => engine.quiesce_admissions(),
+                Self::Hip(engine) => engine.cancel_all_requests(),
                 #[cfg(feature = "vulkan")]
-                Self::Vulkan(engine) => engine.quiesce_admissions(),
+                Self::Vulkan(engine) => engine.cancel_all_requests(),
                 #[cfg(all(feature = "cpu", not(feature = "metal")))]
-                Self::Cpu(engine) => engine.quiesce_admissions(),
-            }
-        }
-
-        /// Re-arm admission after the OPD writeback bracket (KV pool re-acquired).
-        pub fn resume_admissions(&self) -> Result<()> {
-            match self {
-                #[cfg(feature = "metal")]
-                Self::Metal(engine) => engine.resume_admissions(),
-                #[cfg(feature = "metal")]
-                Self::MetalDiffusionGemma(engine) => engine.resume_admissions(),
-                #[cfg(feature = "metal")]
-                Self::MetalGemma4(engine) => engine.resume_admissions(),
-                #[cfg(feature = "metal")]
-                Self::MetalDeepseekOcr(engine) => engine.resume_admissions(),
-                #[cfg(feature = "cuda")]
-                Self::Cuda(engine) => engine.resume_admissions(),
-                #[cfg(feature = "hip")]
-                Self::Hip(engine) => engine.resume_admissions(),
-                #[cfg(feature = "vulkan")]
-                Self::Vulkan(engine) => engine.resume_admissions(),
-                #[cfg(all(feature = "cpu", not(feature = "metal")))]
-                Self::Cpu(engine) => engine.resume_admissions(),
+                Self::Cpu(engine) => engine.cancel_all_requests(),
             }
         }
 
