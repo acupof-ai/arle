@@ -17,6 +17,29 @@ champion row — no second arm. Rules:
 4. **Anchor audit**: every ~5 accepted updates (and before any default flip),
    one A/B against the oldest archived binary bounds accumulated drift.
 
+## DSv4-Flash-FP8 · 4×H20 GPUs 3,5,6,7 · TP=4/EP=4 · eager · port 8000
+
+**RE-ANCHOR 2026-07-19 (`45dd64bd2`, production-all-on)** — dataset
+`bench-prompts-64.jsonl` (~2.8k unique docs), 120 s/point, max_tokens 256,
+seed 20260416. Binary `c7730414…`, kernel `bundle:7eef1a90…`.
+Needle ×3 passes (15/15 strict). Raw: pod
+`/host/arle-evidence/prod-allon-45dd64bd-dsv4-{base,mtp,dspark}-20260719T*/`.
+
+| c | Base out tok/s | MTP out tok/s | MTP Δ | DSpark out tok/s | DSpark Δ |
+|---|---:|---:|---:|---:|---:|
+| 1 | 38.0 | **46.2** | **+21.6%** | 38.1 | +0.3% |
+| 4 | 74.6 | 70.2 | -5.9% | 74.3 | -0.4% |
+| 8 | **123.7** | 72.0 | -41.8% | 121.9 | -1.5% |
+| 16 | **195.7** | 69.7 | -64.4% | 117.6 | -39.9% |
+
+- **Base = production champion.** c16 195.7 vs old chunk-2048 anchor 142.9
+  (different GPU set + 120s vs 90s → re-anchor, not a strict Δ).
+- **MTP: c1-only win.** accept_rate 0.704; draft verification serializes under
+  concurrency, c4+ regresses. Not a default-flip candidate.
+- **DSpark: not triggered.** `--dspark-max-prompt-tokens 64` routes all >64-tok
+  prompts to no-spec; bench prompts ~2.8k tok → 100% target decode. Needs
+  short-prompt workload to measure gain.
+
 ## DSv4-Flash-FP8 · 4×H20 GPUs 0–3 · TP=4/EP=4 · eager · port 8000
 
 **RE-ANCHOR 2026-07-17 (chunk-2048 default, `0904a50cc`)** — dataset
