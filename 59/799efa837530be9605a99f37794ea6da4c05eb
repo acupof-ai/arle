@@ -1,0 +1,21 @@
+crates/xgrammar-sys/src/lib.rs
+  s_6e2dde2c3a0901::t_eeb60587f78aa7 199-201,332-333,335-336,370-372
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "59799efa837530be9605a99f37794ea6da4c05eb",
+  "prompts": {},
+  "sessions": {
+    "s_6e2dde2c3a0901": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-af38af97ea51ae962",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
