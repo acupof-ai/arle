@@ -1,0 +1,35 @@
+scripts/pick-gpu.sh
+  s_3be5776208307f::t_fff3ab90216d80 44
+scripts/pod-remote-run.sh
+  s_3be5776208307f::t_91aecb49067c50 176,186-192,195-196,203-208,213
+scripts/pod.sh
+  s_093790400845c6::t_8d4601caf79e50 93,102-114,143
+scripts/tests/test_pod_flow.sh
+  s_3be5776208307f::t_d2f6f738e89fd7 140-141,176-195,277,281-288,290,294
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "b486297c19cf3864c55a0a27a25767e114864d79",
+  "prompts": {},
+  "sessions": {
+    "s_093790400845c6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aa8eb5b27599bcb8a",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_3be5776208307f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a5c052e2430c05243",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
