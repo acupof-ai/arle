@@ -74,7 +74,7 @@ pub use multiproc_relay::{
 };
 pub use schema::{
     ChatCompletionRequest, ChatCompletionResponse, ChatContent, ChatContentPart, ChatMessage,
-    CompletionRequest, CompletionResponse, set_default_temperature,
+    CompletionRequest, CompletionResponse, SamplingDefaults, set_sampling_defaults,
 };
 pub use tokenizer::OpenAiTokenizer;
 

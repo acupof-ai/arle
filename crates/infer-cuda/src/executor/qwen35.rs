@@ -3374,6 +3374,254 @@ mod tier_io_tests {
         assert!(all_passed, "conv parity failed; report: {out_path}");
     }
 
+    struct GdrProbeGuard(bool);
+
+    impl Drop for GdrProbeGuard {
+        fn drop(&mut self) {
+            if self.0 {
+                crate::qwen35::gdr_probe::disarm();
+            }
+        }
+    }
+
+    // 复刻 gated_delta_rule_prefill_recurrent_kernel 的 CPU 参考。
+    // 超越函数 (exp/ln/rsqrt) CPU 与 GPU libdevice 可能差最后一位，
+    // 故 output 用 BF16 ULP 容差、state 用相对误差容差，而非 bit-exact。
+    fn replay_gdr(capture: &crate::qwen35::gdr_probe::Capture) -> (Vec<bf16>, Vec<f32>) {
+        let q_dim_total = capture.key_dim * capture.num_k_heads;
+        let k_dim_total = q_dim_total;
+        let qkv_stride = q_dim_total + k_dim_total + capture.val_dim * capture.num_v_heads;
+        let out_stride = capture.num_v_heads * capture.val_dim;
+        assert_eq!(capture.qkv.len(), capture.seq_len * qkv_stride);
+        assert_eq!(capture.b_proj.len(), capture.seq_len * capture.num_v_heads);
+        assert_eq!(capture.a_proj.len(), capture.seq_len * capture.num_v_heads);
+        assert_eq!(capture.dt_bias.len(), capture.num_v_heads);
+        assert_eq!(capture.a_log.len(), capture.num_v_heads);
+        assert_eq!(
+            capture.pre_state.len(),
+            capture.num_v_heads * capture.key_dim * capture.val_dim
+        );
+
+        let mut state = capture.pre_state.clone();
+        let mut output = Vec::with_capacity(capture.seq_len * out_stride);
+
+        for token in 0..capture.seq_len {
+            let token_qkv = &capture.qkv[token * qkv_stride..];
+            for v_head in 0..capture.num_v_heads {
+                let k_head = v_head * capture.num_k_heads / capture.num_v_heads;
+                let q_base = k_head * capture.key_dim;
+                let k_base = q_dim_total + k_head * capture.key_dim;
+                let v_base = q_dim_total + k_dim_total + v_head * capture.val_dim;
+
+                let q: Vec<f32> = (0..capture.key_dim)
+                    .map(|j| token_qkv[q_base + j].to_f32())
+                    .collect();
+                let k: Vec<f32> = (0..capture.key_dim)
+                    .map(|j| token_qkv[k_base + j].to_f32())
+                    .collect();
+                let v: Vec<f32> = (0..capture.val_dim)
+                    .map(|j| token_qkv[v_base + j].to_f32())
+                    .collect();
+
+                // q RMSNorm + 1/sqrt(key_dim)
+                let q_sq: f32 = q.iter().map(|x| x * x).sum();
+                let q_scale = 1.0 / (q_sq + 1e-12).sqrt() / (capture.key_dim as f32).sqrt();
+                let q: Vec<f32> = q.iter().map(|x| x * q_scale).collect();
+
+                // k RMSNorm
+                let k_sq: f32 = k.iter().map(|x| x * x).sum();
+                let k_norm = 1.0 / (k_sq + 1e-12).sqrt();
+                let k: Vec<f32> = k.iter().map(|x| x * k_norm).collect();
+
+                // gate: g = -exp(a_log) * softplus(a+bias); beta = sigmoid(b)
+                let a_val = capture.a_proj[token * capture.num_v_heads + v_head].to_f32();
+                let b_val = capture.b_proj[token * capture.num_v_heads + v_head].to_f32();
+                let bias = capture.dt_bias[v_head].to_f32();
+                let a_log = capture.a_log[v_head];
+                let x = a_val + bias;
+                let softplus = if x > 20.0 { x } else { (1.0 + x.exp()).ln() };
+                let exp_g = (-a_log.exp() * softplus).exp();
+                let beta = 1.0 / (1.0 + (-b_val).exp());
+
+                // state 衰减: s *= exp_g; kv_mem = sum(s * k)
+                let state_base = v_head * capture.key_dim * capture.val_dim;
+                let mut kv_mem = vec![0.0f32; capture.val_dim];
+                for j in 0..capture.key_dim {
+                    for val_idx in 0..capture.val_dim {
+                        let s = &mut state[state_base + j * capture.val_dim + val_idx];
+                        *s *= exp_g;
+                        kv_mem[val_idx] += *s * k[j];
+                    }
+                }
+
+                // delta = (v - kv_mem) * beta
+                let delta: Vec<f32> = (0..capture.val_dim)
+                    .map(|i| (v[i] - kv_mem[i]) * beta)
+                    .collect();
+
+                // state 更新: s += delta * k; out = sum(s * q)
+                let mut out = vec![0.0f32; capture.val_dim];
+                for j in 0..capture.key_dim {
+                    for val_idx in 0..capture.val_dim {
+                        let s = &mut state[state_base + j * capture.val_dim + val_idx];
+                        *s += delta[val_idx] * k[j];
+                        out[val_idx] += *s * q[j];
+                    }
+                }
+
+                for val_idx in 0..capture.val_dim {
+                    output.push(bf16::from_f32(out[val_idx]));
+                }
+            }
+        }
+        (output, state)
+    }
+
+    fn format_gdr_case(
+        name: &str,
+        captures: &[crate::qwen35::gdr_probe::Capture],
+    ) -> (String, bool) {
+        use std::fmt::Write;
+
+        let mut report = String::new();
+        let mut cursor = 0;
+        let mut passed = true;
+        for (segment, capture) in captures.iter().enumerate() {
+            let (reference_output, reference_state) = replay_gdr(capture);
+            assert_eq!(capture.output.len(), reference_output.len());
+            assert_eq!(capture.post_state.len(), reference_state.len());
+
+            let output_mismatch = reference_output
+                .iter()
+                .zip(&capture.output)
+                .enumerate()
+                .find(|(_, (r, a))| bf16_ulp_distance(**r, **a) > 2)
+                .map(|(index, (r, a))| {
+                    format!(
+                        "output idx={index} token={} vhead={} val={} reference={:04x} actual={:04x} ulp={}",
+                        index / (capture.num_v_heads * capture.val_dim),
+                        (index % (capture.num_v_heads * capture.val_dim)) / capture.val_dim,
+                        index % capture.val_dim,
+                        r.to_bits(),
+                        a.to_bits(),
+                        bf16_ulp_distance(*r, *a),
+                    )
+                });
+
+            // state 用相对误差：|ref - actual| / max(|ref|, 1e-6)
+            let state_mismatch = reference_state
+                .iter()
+                .zip(&capture.post_state)
+                .enumerate()
+                .find(|(_, (r, a))| {
+                    let denom = r.abs().max(1e-6);
+                    (*r - *a).abs() / denom > 1e-4
+                })
+                .map(|(index, (r, a))| {
+                    format!(
+                        "state idx={index} vhead={} j={} val={} reference={r} actual={a} rel_err={}",
+                        index / (capture.key_dim * capture.val_dim),
+                        (index % (capture.key_dim * capture.val_dim)) / capture.val_dim,
+                        index % capture.val_dim,
+                        (*r - *a).abs() / r.abs().max(1e-6),
+                    )
+                });
+
+            let segment_passed = output_mismatch.is_none() && state_mismatch.is_none();
+            passed &= segment_passed;
+            writeln!(
+                report,
+                "case={name} segment={segment} cursor={}..{} rows={} vheads={} kd={} vd={} output_ulp<=2={} state_rel<1e-4={} first_mismatch={}",
+                cursor,
+                cursor + capture.seq_len,
+                capture.seq_len,
+                capture.num_v_heads,
+                capture.key_dim,
+                capture.val_dim,
+                output_mismatch.is_none(),
+                state_mismatch.is_none(),
+                output_mismatch.or(state_mismatch).unwrap_or_else(|| "none".to_string()),
+            )
+            .unwrap();
+            cursor += capture.seq_len;
+        }
+        (report, passed)
+    }
+
+    #[test]
+    #[ignore = "GPU + Qwen3.6-27B-W4A16 checkpoint; set INFER_QWEN35_GDR_PROBE_OUT"]
+    fn qwen35_paged_prefill_gdr_parity() {
+        let out_path = std::env::var("INFER_QWEN35_GDR_PROBE_OUT")
+            .expect("INFER_QWEN35_GDR_PROBE_OUT must name the report path");
+        let model_path = "/tmp/Qwen3.6-27B-W4A16-fixed-d68879e";
+        let total_pages = 16;
+        let mut executor = Qwen35CudaExecutor::from_qwen35_safetensors(
+            model_path,
+            2,
+            total_pages,
+            total_pages * SUPPORTED_PAGE_SIZE,
+            CudaKvCacheDtype::Bf16,
+            0.9,
+            None,
+            0.0,
+            None,
+        )
+        .expect("load Qwen3.6 W4A16 executor");
+        executor.decode_graph_armed = false;
+        assert!(!executor.kv_recall);
+        assert!(executor.dspark.is_none());
+        assert!(executor.mtp.is_none());
+        assert_eq!(executor.kv_format, KVFormat::BF16);
+        let mut report = format!(
+            "model={model_path}\nscope=first_linear_gdr_per_paged_prefill_segment\noutput_gate=bf16_ulp<=2\nstate_gate=rel_err<1e-4\n"
+        );
+        let mut all_passed = true;
+
+        for (slot, name, tokens, expected_segments) in [
+            (0, "factual_s33", FACTUAL_S33.as_slice(), &[32, 1][..]),
+            (1, "needle_s75", NEEDLE_S75.as_slice(), &[64, 11][..]),
+        ] {
+            crate::qwen35::gdr_probe::arm();
+            let mut guard = GdrProbeGuard(true);
+            executor
+                .submit(&ForwardPlan {
+                    mode: ForwardMode::Prefill,
+                    decode_rows: Vec::new(),
+                    prefill_rows: vec![PrefillRow {
+                        slot,
+                        tokens: tokens.to_vec(),
+                        start_pos: 0,
+                        total_tokens: tokens.len(),
+                        params: SamplingParams {
+                            temperature: 0.0,
+                            top_k: -1,
+                            ..Default::default()
+                        },
+                    }],
+                    microbatch: None,
+                    spec: None,
+                })
+                .expect("production paged prefill");
+            let captures = crate::qwen35::gdr_probe::drain();
+            guard.0 = false;
+            assert_eq!(
+                captures.iter().map(|c| c.seq_len).collect::<Vec<_>>(),
+                expected_segments,
+                "{name}: paged prefill segment shape"
+            );
+            let (case_report, passed) = format_gdr_case(name, &captures);
+            report.push_str(&case_report);
+            all_passed &= passed;
+        }
+
+        if let Some(parent) = std::path::Path::new(&out_path).parent() {
+            std::fs::create_dir_all(parent).expect("create gdr probe report dir");
+        }
+        std::fs::write(&out_path, &report).expect("write gdr probe report");
+        eprint!("{report}");
+        assert!(all_passed, "gdr parity failed; report: {out_path}");
+    }
+
     #[test]
     fn speculative_chain_boundary_falls_back_before_verify_exceeds_max_seq_len() {
         assert!(speculative_chain_fits(12, 3, 16));
