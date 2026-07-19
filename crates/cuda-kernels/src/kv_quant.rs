@@ -1650,6 +1650,7 @@ mod tests {
     /// audit's token-1 catastrophic divergence (where FP8 = ~0.4% match
     /// while the scatter kernel proves clean).
     #[test]
+    #[allow(clippy::needless_range_loop)]
     fn fp8_paged_quantize_qwen3_production_layout_diagnostic() {
         let ctx = DeviceContext::new().expect("failed to create CUDA context");
         let num_kv_heads = 8usize;

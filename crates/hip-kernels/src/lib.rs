@@ -668,6 +668,7 @@ mod tests {
     #[cfg(not(feature = "hip"))]
     #[test]
     fn stubs_report_not_compiled() {
+        // SAFETY: stubs return `NOT_COMPILED` without dereferencing pointers.
         let err = unsafe {
             quantize_row_q8_1(
                 std::ptr::null(),
@@ -679,6 +680,7 @@ mod tests {
         }
         .unwrap_err();
         assert_eq!(err, NOT_COMPILED);
+        // SAFETY: stubs return `NOT_COMPILED` without dereferencing pointers.
         let err = unsafe {
             mmvq_iq2_xxs(
                 std::ptr::null(),
@@ -691,6 +693,7 @@ mod tests {
         }
         .unwrap_err();
         assert_eq!(err, NOT_COMPILED);
+        // SAFETY: stubs return `NOT_COMPILED` without dereferencing pointers.
         let err = unsafe {
             mmvq_q2_k(
                 std::ptr::null(),
@@ -709,6 +712,7 @@ mod tests {
     #[cfg(not(feature = "hip"))]
     #[test]
     fn basic_op_ffi_stubs_report_not_compiled() {
+        // SAFETY: stubs return `NOT_COMPILED` without dereferencing pointers.
         let code = unsafe {
             ffi::rms_norm_cuda(
                 std::ptr::null(),
@@ -720,6 +724,7 @@ mod tests {
             )
         };
         assert_eq!(code, NOT_COMPILED.0);
+        // SAFETY: stubs return `NOT_COMPILED` without dereferencing pointers.
         let code = unsafe {
             ffi::q4k_gemv_cuda(
                 std::ptr::null(),

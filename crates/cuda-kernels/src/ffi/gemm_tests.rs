@@ -1,3 +1,8 @@
+// All unsafe blocks in these tests invoke CUDA FFI with device pointers
+// obtained from the CudaSlice/CudaVec allocator, whose validity is guarded
+// by the SyncOnDrop handles held in the same scope.
+#![allow(clippy::undocumented_unsafe_blocks)]
+
 use super::*;
 use crate::tensor::DeviceContext;
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};

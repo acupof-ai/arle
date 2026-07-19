@@ -196,9 +196,9 @@ pub struct GrammarCompiler {
     _not_sync: PhantomData<*mut ()>,
 }
 
-// The upstream compiler owns heap state and is safe to move between scheduler
-// setup threads, but it is not exposed as Sync because cache mutation is
-// internal to compile calls.
+// SAFETY: The upstream compiler owns heap state and is safe to move between
+// scheduler setup threads; it is not Sync because cache mutation is internal
+// to compile calls.
 unsafe impl Send for GrammarCompiler {}
 
 impl GrammarCompiler {
@@ -329,7 +329,11 @@ pub struct CompiledGrammar {
     vocab_size: usize,
 }
 
+// SAFETY: `CompiledGrammar` owns a non-null FFI handle that is freed on Drop;
+// the underlying C object is not aliased across threads by this wrapper.
 unsafe impl Send for CompiledGrammar {}
+// SAFETY: `CompiledGrammar` is read-only after construction; no interior
+// mutability, so shared references across threads are sound.
 unsafe impl Sync for CompiledGrammar {}
 
 impl CompiledGrammar {
@@ -363,6 +367,9 @@ pub struct GrammarMatcher {
     _not_sync: PhantomData<*mut ()>,
 }
 
+// SAFETY: `GrammarMatcher` owns a non-null FFI handle; the `_not_sync`
+// PhantomData already prevents Sync, and Send is sound because the matcher
+// is not shared across threads by construction.
 unsafe impl Send for GrammarMatcher {}
 
 impl GrammarMatcher {

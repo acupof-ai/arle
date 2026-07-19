@@ -2850,10 +2850,8 @@ mod tests {
                 let pu = p as usize;
                 let cur = self.page_ref_count[pu];
                 self.page_ref_count[pu] = cur.saturating_sub(1);
-                if self.page_ref_count[pu] == 0 {
-                    if self.recycle_page_if_unreferenced(p) {
-                        freed.push(p);
-                    }
+                if self.page_ref_count[pu] == 0 && self.recycle_page_if_unreferenced(p) {
+                    freed.push(p);
                 }
             }
             freed
