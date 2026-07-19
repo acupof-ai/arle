@@ -107,6 +107,14 @@ pub use qwen35::{
 /// CUDA support matrix, failing loud on unwired paged quant modes.
 #[cfg(feature = "cuda")]
 pub use executor::CudaKvCacheDtype;
+/// DSpark RL sidecar: experience buffer for test-time training of the draft
+/// model. The inference hot path pushes (draft_tokens, draft_logits,
+/// target_logits, accepted_count) tuples; a separate trainer drains them and
+/// runs REINFORCE against the acceptance reward.
+#[cfg(feature = "cuda")]
+pub use executor::dspark_rl::{
+    DsparkExperience, DsparkExperienceBuffer, buffer as dspark_experience_buffer,
+};
 #[cfg(feature = "cuda")]
 pub use executor::set_decode_graph_default;
 /// Tier budget resolution: machine-derived disk budget when `--kv-disk` has no
@@ -501,6 +509,19 @@ impl CudaExecutor {
                  the no-GPU placeholder has no resident weights"
             ),
             CudaExecutorInner::Real(real) => real.frozen_base_fp8_pointers(),
+        }
+    }
+
+    /// Hot-swap the DSpark Markov head weights from a host f32 snapshot.
+    /// Called by the RL sidecar trainer after each REINFORCE step.
+    #[cfg(feature = "cuda")]
+    pub fn update_dspark_markov_weights(&mut self, w1: &[f32], w2: &[f32]) -> anyhow::Result<()> {
+        match &mut self.inner {
+            CudaExecutorInner::Placeholder => anyhow::bail!(
+                "DSpark Markov weight update requires the real CUDA executor; \
+                 the no-GPU placeholder has no resident weights"
+            ),
+            CudaExecutorInner::Real(real) => real.update_dspark_markov_weights(w1, w2),
         }
     }
 
