@@ -1765,16 +1765,18 @@ pub(crate) struct TrainRubricOpdArgs {
     #[arg(long, default_value_t = false)]
     pub(crate) distill_shortest: bool,
 
-    /// Rollout sampling temperature (>0 for rejection-sampling diversity).
-    #[arg(long, default_value_t = 1.0, value_parser = parse_temperature, allow_hyphen_values = true)]
+    /// Rollout sampling temperature. 0.3 (not 1.0): hd256/FP8 sampling corrupts at
+    /// temp>0 above ~0.3 (#48; b4b293f0c fixed greedy only). 0.3 stays coherent and
+    /// >0. Restore 1.0 once the hd256/FP8 temp>0 fix lands.
+    #[arg(long, default_value_t = 0.3, value_parser = parse_temperature, allow_hyphen_values = true)]
     pub(crate) rollout_temperature: f32,
 
     /// Rollout nucleus sampling threshold (1.0 disables top-p).
-    #[arg(long, default_value_t = 1.0)]
+    #[arg(long, default_value_t = 0.95)]
     pub(crate) rollout_top_p: f32,
 
     /// Rollout top-k filter (0 disables top-k).
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, default_value_t = 20)]
     pub(crate) rollout_top_k: i32,
 
     /// Optional deterministic base rollout seed (per-sample = base + i).
@@ -1955,10 +1957,12 @@ pub(crate) struct TrainAgentOpdArgs {
     #[arg(long, default_value_t = 8000)]
     pub(crate) serve_port: u16,
 
-    /// Serve-side temperature for requests that omit the field. Claude Code
-    /// sends none, and the serve default is 0.0 (greedy) — which silences
-    /// behavior-logprob capture and kills sampling diversity across the group.
-    #[arg(long, default_value_t = 1.0, value_name = "T")]
+    /// Serve-side temperature for requests that omit it (CC sends none). 0.3, not
+    /// 1.0: hd256/FP8 (Qwen3.6-27B) sampling corrupts at temp>0 above ~0.3 (#48;
+    /// b4b293f0c fixed greedy/argmax only, the temp>0 distribution still degrades)
+    /// — 0.3 stays coherent AND keeps behavior logprobs non-empty (F.6). Restore
+    /// 1.0 once the hd256/FP8 temp>0 fix lands.
+    #[arg(long, default_value_t = 0.3, value_name = "T")]
     pub(crate) rollout_temperature: f32,
 
     /// Per-sample `claude -p` wall-clock cap (seconds); the child process
