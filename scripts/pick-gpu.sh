@@ -41,7 +41,7 @@ case "${1:-}" in
 import os, sys
 requested, rows, compute, claims, limit, proc = sys.argv[1:]
 indices = requested.split(",") if requested else []
-if len(indices) != 8 or len(indices) != len(set(indices)) or any(not x.isdigit() for x in indices): raise SystemExit("GPU set must contain eight unique indices")
+if not indices or len(indices) != len(set(indices)) or any(not x.isdecimal() for x in indices): raise SystemExit("GPU set must contain unique decimal indices")
 gpus = {}
 for row in rows.splitlines():
     parts = [x.strip() for x in row.split(",")]
