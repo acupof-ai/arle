@@ -541,9 +541,29 @@ impl Dsv4CudaExecutor {
             log::warn!("pre-KV-budget trim_memory_pool failed (non-fatal): {e}");
         }
         let weights_used_at_model_load = mem_dbg("after weight-load pool trim");
-        // Dynamic KV mem budget: clamp num_slots to what GPU free mem affords (was: fixed
-        // num_slots → c=32 OOM crash at long max_seq_len). Deterministic ⇒ TP-consistent.
-        let budget = model.kv_budget_plan(num_slots, max_seq_len)?;
+        // DSpark per-slot runtime (latent KV + draft attention states) is allocated
+        // after kv_budget_plan; count it here so num_slots doesn't over-commit.
+        let dspark_per_slot_bytes = if dspark_draft.is_some() {
+            let num_stages = model.config.dspark_num_stages();
+            let block_size = model.config.dspark_block_size;
+            let head_dim = model.config.head_dim;
+            let draft_span = max_seq_len + block_size;
+            // latent_kv: num_stages buffers, each [draft_span * head_dim] bf16.
+            let latent_kv = num_stages
+                .saturating_mul(draft_span)
+                .saturating_mul(head_dim)
+                .saturating_mul(std::mem::size_of::<half::bf16>());
+            // Draft attention states: num_stages KV caches at draft_span. Rough
+            // estimate; the adapter's per_slot already covers the trunk layers.
+            let attn = num_stages
+                .saturating_mul(draft_span)
+                .saturating_mul(head_dim)
+                .saturating_mul(2);
+            latent_kv.saturating_add(attn)
+        } else {
+            0
+        };
+        let budget = model.kv_budget_plan(num_slots, max_seq_len, dspark_per_slot_bytes)?;
         let num_slots = budget.num_slots;
         let kv_adapter = model.new_kv_adapter(max_seq_len, budget)?;
         mem_dbg("after new_kv_adapter (KV pools)");
