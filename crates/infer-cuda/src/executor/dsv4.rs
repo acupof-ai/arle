@@ -1913,25 +1913,23 @@ impl Dsv4CudaExecutor {
             return Ok(out);
         }
 
-        // Cross-slot batched MTP decode (batched-MTP Stage 1). B=1 already took
-        // the single-row path above; B>1 drives all N chains through one batched
-        // verify (MoE grouped over the verify rows, attention per-slot) instead
-        // of the per-row `spec_step` loop.
-        let spec_on = self.spec_requested();
-        let all_greedy = batch.rows.iter().all(|row| row.params.is_greedy());
-        // DSpark has no TP-safe batched verify lane. Once a request joins a batch,
-        // keep it on the target path so a later batch shrink cannot reuse stale draft state.
-        let any_dspark = self.dspark.is_some()
+        // B>1 path. DSpark has no batched verify lane: if any row is eligible,
+        // dispatch every row individually (`forward_decode_row` handles DSpark /
+        // MTP / plain decode per-row). Otherwise run the batched lanes below.
+        if self.dspark.is_some()
             && batch
                 .rows
                 .iter()
-                .any(|row| self.dspark_slot_eligible(row.slot));
-        if any_dspark {
-            let dspark = self.dspark.as_mut().expect("checked above");
+                .any(|row| self.dspark_slot_eligible(row.slot))
+        {
+            let mut out = Vec::with_capacity(batch.rows.len());
             for row in &batch.rows {
-                dspark.slots[row.slot].eligible = false;
+                out.extend(self.forward_decode_row(row)?);
             }
+            return Ok(out);
         }
+        let spec_on = self.spec_requested();
+        let all_greedy = batch.rows.iter().all(|row| row.params.is_greedy());
         if spec_on && all_greedy && self.dspark.is_none() {
             // Self-heal an un-seeded / desynced MTP stream (#140), the batched
             // twin of the B=1 path: a slot entering Decoding without a tail
