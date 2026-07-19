@@ -13,6 +13,8 @@ use infer_api::{
     DEFAULT_MTP_DRAFT_TOKENS, DEFAULT_MTP_DRAFT_TOPK, EngineLoadConfig, KvCacheDtype,
     ServeHttpOptions, ServeSpecOptions, ServeSpecType, serve_http,
 };
+#[cfg(feature = "cuda")]
+use infer_api::{LoadedInferenceEngine, ServeShutdown, bind_and_serve};
 
 use crate::{
     args::{Args, ServeArgs, ServeBackendArg, ServeKvCacheDtypeArg, ServeSpecTypeArg},
@@ -171,7 +173,79 @@ fn run_config(config: ServeConfig) -> ExitCode {
         config.options.bind,
         config.options.port,
     );
+
+    // DSpark RL sidecar: load the engine once, spawn the REINFORCE trainer
+    // thread, then serve over the same engine's local router. The trainer
+    // drains the experience buffer the hot path populates and pushes updated
+    // Markov-head weights back into the running engine after each step.
+    #[cfg(feature = "cuda")]
+    if config.options.spec.spec_type == ServeSpecType::Dspark {
+        return run_dspark_serve(config);
+    }
+
     match serve_http(config.options) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("[ARLE serve] error: {err:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// DSpark serve path: load the engine, spawn the RL sidecar trainer, and serve
+/// over the engine's local router so the trainer can push weight updates back
+/// into the same running engine.
+#[cfg(feature = "cuda")]
+fn run_dspark_serve(config: ServeConfig) -> ExitCode {
+    use std::sync::Arc;
+
+    let opts = config.options;
+    let max_thinking_tokens = opts.engine_config.max_thinking_tokens;
+    let engine = match LoadedInferenceEngine::load_with_config(
+        &opts.model_path,
+        opts.enable_cuda_graph,
+        opts.engine_config,
+    ) {
+        Ok(e) => Arc::new(e),
+        Err(err) => {
+            eprintln!("[ARLE serve] failed to load engine for DSpark RL: {err:#}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let _guard = match train::dspark_rl::spawn_dspark_rl_sidecar(
+        Arc::clone(&engine),
+        train::dspark_rl::DsparkRlConfig::default(),
+    ) {
+        Ok(Some(guard)) => {
+            eprintln!("[ARLE serve] DSpark RL sidecar trainer started");
+            guard
+        }
+        Ok(None) => {
+            eprintln!("[ARLE serve] warning: DSpark RL sidecar not started (no experience buffer)");
+            return ExitCode::FAILURE;
+        }
+        Err(err) => {
+            eprintln!("[ARLE serve] failed to start DSpark RL sidecar: {err:#}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let router = match engine.local_router(max_thinking_tokens) {
+        Ok(r) => r,
+        Err(err) => {
+            eprintln!("[ARLE serve] failed to build local router: {err:#}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    match bind_and_serve(
+        &opts.bind,
+        opts.port,
+        router,
+        &opts.model_path,
+        ServeShutdown::new(),
+    ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("[ARLE serve] error: {err:#}");
