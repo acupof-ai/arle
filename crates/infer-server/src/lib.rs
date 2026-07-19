@@ -302,6 +302,15 @@ where
     }
 }
 
+fn quiesce_engine<E: BackendExecutor, K: KvPool>(engine: &mut Engine<E, K>) -> Result<usize> {
+    let handles = engine.quiesce();
+    engine.run_to_idle()?;
+    for handle in &handles {
+        log::warn!("[serve-engine] cancelled orphaned request {}", handle.id());
+    }
+    Ok(handles.len())
+}
+
 impl<E, K> ServeHandle<E, K>
 where
     E: BackendExecutor + 'static,
@@ -572,10 +581,19 @@ where
         self.run_on_executor(|executor| executor.release_kv_pool())?
     }
 
-    /// Re-acquire the engine's KV pool before the next rollout (after
-    /// [`Self::release_kv_pool`]). Runs on the engine thread; blocks until done.
+    /// Re-acquire the engine's KV pool before the next rollout.
     pub fn ensure_kv_pool(&self) -> Result<()> {
         self.run_on_executor(|executor| executor.ensure_kv_pool())?
+    }
+
+    /// Re-acquire the engine's KV pool, then resume admission atomically on the
+    /// engine thread. A failed ensure leaves the engine quiesced.
+    pub fn ensure_kv_pool_and_resume_admissions(&self) -> Result<()> {
+        self.run_on_engine(|engine| {
+            engine.executor_mut().ensure_kv_pool()?;
+            engine.resume_serving();
+            Ok(())
+        })?
     }
 
     /// OPD round-loop quiesce: switch the engine to Quiesced (the serve loop
@@ -584,13 +602,7 @@ where
     /// cancelled. Pairs with [`Self::resume_admissions`], called after the KV
     /// pool is re-acquired.
     pub fn quiesce_admissions(&self) -> Result<usize> {
-        self.run_on_engine(|engine| {
-            let handles = engine.quiesce();
-            for handle in &handles {
-                log::warn!("[serve-engine] cancelled orphaned request {}", handle.id());
-            }
-            handles.len()
-        })
+        self.run_on_engine(quiesce_engine)?
     }
 
     /// Re-arm engine serving after the OPD writeback bracket (KV pool
@@ -942,6 +954,50 @@ mod tests {
     }
 
     #[derive(Clone)]
+    struct PendingOnceEchoExecutor {
+        polls: Arc<AtomicUsize>,
+    }
+
+    impl BackendExecutor for PendingOnceEchoExecutor {
+        type Inflight = (StepOutput, bool);
+
+        fn submit(&mut self, plan: &ForwardPlan, kv: &mut dyn KvPool) -> Result<Self::Inflight> {
+            Ok((EchoExecutor.submit(plan, kv)?, false))
+        }
+
+        fn poll(
+            &mut self,
+            (output, pending): Self::Inflight,
+        ) -> Result<PollResult<Self::Inflight>> {
+            self.polls.fetch_add(1, Ordering::SeqCst);
+            if pending {
+                Ok(PollResult::Ready(output))
+            } else {
+                Ok(PollResult::NotReady((output, true)))
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, Default)]
+    struct EnsureFailEchoExecutor;
+
+    impl BackendExecutor for EnsureFailEchoExecutor {
+        type Inflight = StepOutput;
+
+        fn submit(&mut self, plan: &ForwardPlan, kv: &mut dyn KvPool) -> Result<Self::Inflight> {
+            EchoExecutor.submit(plan, kv)
+        }
+
+        fn poll(&mut self, inflight: Self::Inflight) -> Result<PollResult<Self::Inflight>> {
+            EchoExecutor.poll(inflight)
+        }
+
+        fn ensure_kv_pool(&mut self) -> Result<()> {
+            anyhow::bail!("injected ensure failure")
+        }
+    }
+
+    #[derive(Clone)]
     struct StatsCountingEchoExecutor {
         materializations: Arc<AtomicUsize>,
     }
@@ -968,6 +1024,45 @@ mod tests {
                 fallback_count: 1,
             }
         }
+    }
+
+    #[test]
+    fn quiesce_waits_for_executor_inflight() -> Result<()> {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let executor = PendingOnceEchoExecutor {
+            polls: Arc::clone(&polls),
+        };
+        let mut engine = Engine::with_config(
+            executor,
+            HostPagedKvPool::new(1, 64, 16),
+            SchedulerConfig::default(),
+        );
+        let handle = engine.submit_request(vec![10, 11], 4);
+        engine.step()?;
+        assert!(engine.has_inflight());
+
+        quiesce_engine(&mut engine)?;
+        assert!(
+            polls.load(Ordering::SeqCst) >= 2,
+            "quiesce must poll a pending executor operation to completion"
+        );
+        assert!(!engine.has_inflight());
+        assert_eq!(
+            engine.completed(handle).expect("cancelled").finish,
+            Some(infer_plan::FinishReason::Abort)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn failed_kv_ensure_keeps_admissions_quiesced() -> Result<()> {
+        let kv = HostPagedKvPool::new(1, 64, 16);
+        let serve = ServeHandle::spawn(EnsureFailEchoExecutor, kv, SchedulerConfig::default());
+        serve.quiesce_admissions()?;
+        assert!(serve.ensure_kv_pool_and_resume_admissions().is_err());
+        assert!(serve.run_on_engine(|engine| engine.is_quiesced())?);
+        serve.shutdown().expect("engine thread joins cleanly");
+        Ok(())
     }
 
     /// End-to-end frontend-||-engine smoke test with no GPU/MLX dependency.

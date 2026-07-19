@@ -895,6 +895,28 @@ mod backend {
             }
         }
 
+        /// Re-acquire the KV pool, then resume admission only after success.
+        pub fn ensure_kv_pool_and_resume_admissions(&self) -> Result<()> {
+            match self {
+                #[cfg(feature = "metal")]
+                Self::Metal(engine) => engine.ensure_kv_pool_and_resume_admissions(),
+                #[cfg(feature = "metal")]
+                Self::MetalDiffusionGemma(engine) => engine.ensure_kv_pool_and_resume_admissions(),
+                #[cfg(feature = "metal")]
+                Self::MetalGemma4(engine) => engine.ensure_kv_pool_and_resume_admissions(),
+                #[cfg(feature = "metal")]
+                Self::MetalDeepseekOcr(engine) => engine.ensure_kv_pool_and_resume_admissions(),
+                #[cfg(feature = "cuda")]
+                Self::Cuda(engine) => engine.ensure_kv_pool_and_resume_admissions(),
+                #[cfg(feature = "hip")]
+                Self::Hip(engine) => engine.ensure_kv_pool_and_resume_admissions(),
+                #[cfg(feature = "vulkan")]
+                Self::Vulkan(engine) => engine.ensure_kv_pool_and_resume_admissions(),
+                #[cfg(all(feature = "cpu", not(feature = "metal")))]
+                Self::Cpu(engine) => engine.ensure_kv_pool_and_resume_admissions(),
+            }
+        }
+
         /// Reload the engine's device weights from the host snapshot (OPD teacher
         /// weight time-share). CUDA-only; Metal/CPU bail.
         pub fn reload_engine_weights(&self) -> Result<()> {
