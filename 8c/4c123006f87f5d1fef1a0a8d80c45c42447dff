@@ -1,0 +1,21 @@
+docs/experience/wins/2026-07-17-qwen36-rotary-fa3-gates.md
+  s_d6adcec6a0a6d3::t_4adffe4d9256ac 3,28-55,59
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "8c4c123006f87f5d1fef1a0a8d80c45c42447dff",
+  "prompts": {},
+  "sessions": {
+    "s_d6adcec6a0a6d3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dc64a0b5-493b-4e08-a5cf-392205926291",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
