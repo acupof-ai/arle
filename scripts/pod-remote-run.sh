@@ -173,7 +173,7 @@ PY
     process_pgid="$(ps -o pgid= -p $$ | tr -d ' ')"; process_start="$(proc_start $$)"
     printf '%s\n' "schema=arle-process-v1" "kind=run" "expected_helper=$TREE/scripts/pod-remote-run.sh" "operation=$OP" "pid=$$" "pgid=$process_pgid" "start=$process_start" "expected_binary=$binary" > "$DIR/process"
     exec >"$LOG" 2>&1
-    rc=1; claim=""; binary_sha=""; source_head=""; source_digest_value=""; kernel_id=""; producer_id=""; embedded_id=""; selected_gpu="$GPU"
+    rc=1; claims=(); binary_sha=""; source_head=""; source_digest_value=""; kernel_id=""; producer_id=""; embedded_id=""; selected_gpu="$GPU"
     if [ ! -f "$BUILD_RECEIPT" ] || [ "$(field "$BUILD_RECEIPT" schema)" != arle-build-v1 ] || [ "$(field "$BUILD_RECEIPT" exit)" != 0 ]; then
       echo "successful build receipt required: build:$BUILD"
     else
@@ -183,22 +183,36 @@ PY
       elif [ ! -f "$TREE/.arle-source-receipt" ] || [ "$(field "$TREE/.arle-source-receipt" head)" != "$source_head" ] || [ "$(field "$TREE/.arle-source-receipt" digest)" != "$source_digest_value" ] || [ "$(git -C "$TREE" rev-parse HEAD)" != "$source_head" ] || [ "$(source_digest)" != "$source_digest_value" ]; then echo "source changed since build"
       else
         claim_env=(ARLE_OP_ID="$OP" ARLE_OWNER="$(id -u):$(id -un)" ARLE_CLAIM_PID="$$" ARLE_CLAIM_START="$process_start")
-        if [ "$GPU" = auto ]; then selected_gpu="$(env "${claim_env[@]}" bash "$TREE/scripts/pick-gpu.sh")" || selected_gpu=""; else ARLE_GPU="$GPU" env "${claim_env[@]}" bash "$TREE/scripts/pick-gpu.sh" >/dev/null || selected_gpu=""; fi
+        if [ "$GPU" = auto ]; then
+          selected_gpu="$(env "${claim_env[@]}" bash "$TREE/scripts/pick-gpu.sh")" || selected_gpu=""
+        elif [[ "$GPU" = *,* ]]; then
+          env "${claim_env[@]}" bash "$TREE/scripts/pick-gpu.sh" reserve-set "$GPU" >/dev/null || selected_gpu=""
+        else
+          ARLE_GPU="$GPU" env "${claim_env[@]}" bash "$TREE/scripts/pick-gpu.sh" >/dev/null || selected_gpu=""
+        fi
         if [ -z "$selected_gpu" ]; then echo "no free GPU"
         else
-          claim="${ARLE_GPU_CLAIMS:-/tmp/arle-gpu-claims}/$selected_gpu"
+          IFS=',' read -r -a selected_gpus <<< "$selected_gpu"
+          for gpu in "${selected_gpus[@]}"; do claims+=("${ARLE_GPU_CLAIMS:-/tmp/arle-gpu-claims}/$gpu"); done
           if ! write_receipt "$RECEIPT" "schema=arle-run-v1" "state=running-unobserved" "operation=$OP" "label=$LABEL" "build_label=$BUILD" "tree=$TREE" "source_head=$source_head" "source_digest=$source_digest_value" "binary=$binary" "binary_sha=$binary_sha" "kernel_id=$kernel_id" "producer_id=$producer_id" "embedded_id=$embedded_id" "argv_file=$DIR/argv.nul" "argv_sha=$(sha256 "$DIR/argv.nul")" "gpu=$selected_gpu" "owner=$(id -u):$(id -un)" "claim_pid=$$" "claim_start=$process_start" "pid=$$" "pgid=$process_pgid" "start=$process_start" "launched_at=$(date -u +%FT%TZ)"; then
             echo "failed to persist launch receipt"
             rc=1
           else
             # shellcheck disable=SC1091
             source "$TREE/scripts/pod-build-env.sh"
-            CUDA_VISIBLE_DEVICES="$selected_gpu" INFER_CUDA_DEVICE=0 python3 "$TREE/scripts/reap_run.py" "$OP" --argv-file "$DIR/argv.nul" "$binary"; rc=$?
+            if [ "${#selected_gpus[@]}" -eq 1 ]; then
+              CUDA_VISIBLE_DEVICES="$selected_gpu" INFER_CUDA_DEVICE=0 python3 "$TREE/scripts/reap_run.py" "$OP" --argv-file "$DIR/argv.nul" "$binary"; rc=$?
+            else
+              logical_gpus="$(printf '%s,' "${!selected_gpus[@]}")"
+              logical_gpus="${logical_gpus%,}"
+              logical_gpus="${logical_gpus// /,}"
+              CUDA_VISIBLE_DEVICES="$selected_gpu" INFER_CUDA_DEVICES="$logical_gpus" INFER_TP_SIZE="${#selected_gpus[@]}" python3 "$TREE/scripts/reap_run.py" "$OP" --argv-file "$DIR/argv.nul" "$binary"; rc=$?
+            fi
           fi
         fi
       fi
     fi
-    [ -n "$claim" ] && [ "$(field "$claim" op)" = "$OP" ] && rm -f "$claim"
+    for claim in "${claims[@]}"; do [ "$(field "$claim" op)" = "$OP" ] && rm -f "$claim"; done
     if [ -f "$RECEIPT" ]; then
       update_receipt "$RECEIPT" "state=exited" "exit=$rc" "finished_at=$(date -u +%FT%TZ)"
     else
