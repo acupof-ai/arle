@@ -13,6 +13,17 @@ shift || true
 valid_label() {
   case "$1" in ""|*[!A-Za-z0-9_.-]*) echo "invalid label: $1" >&2; exit 2;; esac
 }
+valid_gpu() {
+  local gpu="$1" seen="," device
+  [ "$gpu" = auto ] && return
+  IFS=',' read -r -a devices <<< "$gpu"
+  [ "${#devices[@]}" -gt 0 ] || { echo "invalid GPU: $gpu" >&2; exit 2; }
+  for device in "${devices[@]}"; do
+    case "$device" in ""|*[!0-9]*) echo "invalid GPU: $gpu" >&2; exit 2;; esac
+    case "$seen" in *",$device,"*) echo "invalid GPU: $gpu" >&2; exit 2;; esac
+    seen="$seen$device,"
+  done
+}
 new_label() {
   printf '%s-%s-%s\n' "$1" "$(date -u +%Y%m%dT%H%M%SZ)" "$$-$RANDOM"
 }
@@ -90,7 +101,7 @@ case "$cmd" in
     ;;
   run)
     build="${1:-}"
-    [ -n "$build" ] || { echo "usage: pod.sh run <build-label> [run-label] [auto|GPU] -- <args>" >&2; exit 2; }
+    [ -n "$build" ] || { echo "usage: pod.sh run <build-label> [run-label] [auto|GPU|GPU,...] -- <args>" >&2; exit 2; }
     shift
     valid_label "$build"
     pre=()
@@ -99,7 +110,7 @@ case "$cmd" in
     label="${pre[0]:-$(new_label run)}"
     gpu="${pre[1]:-auto}"
     valid_label "$label"
-    case "$gpu" in auto|[0-9]*) ;; *) echo "invalid GPU: $gpu" >&2; exit 2;; esac
+    valid_gpu "$gpu"
     op="run-$label-$(date +%s)-$$-$RANDOM"
     tmp="$(mktemp -t arle-run-argv-XXXXXX)"
     trap 'rm -f "$tmp"' EXIT
@@ -128,7 +139,7 @@ case "$cmd" in
     printf '%s\n' \
       'pod.sh sync' \
       'pod.sh build [label] [cargo argv...]' \
-      'pod.sh run <build-label> [run-label] [auto|GPU] -- [arle argv...]' \
+      'pod.sh run <build-label> [run-label] [auto|GPU|GPU,...] -- [arle argv...]' \
       'pod.sh status|ready|log|kill <run-label> [timeout]' \
       'pod.sh gpus | setup | setup-sccache | sccache-stats'
     ;;

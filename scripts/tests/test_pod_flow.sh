@@ -137,6 +137,8 @@ mkdir -p "$STATE/builds/good" "$TREE/target/release"
 cat > "$TREE/target/release/arle" <<'SH'
 #!/usr/bin/env bash
 printf '%s\0' "$@" > "$ARGV_OUT"
+[ -z "${ENV_OUT:-}" ] || env | grep -E '^(CUDA_VISIBLE_DEVICES|INFER_CUDA_DEVICE|INFER_CUDA_DEVICES|INFER_TP_SIZE)=' | sort > "$ENV_OUT"
+[ -z "${CLAIM_SWAP:-}" ] || printf 'schema=arle-gpu-claim-v1\nop=foreign\n' > "$CLAIM_SWAP"
 SH
 chmod +x "$TREE/target/release/arle"
 bsha="$(sha256sum "$TREE/target/release/arle" | cut -d' ' -f1)"
@@ -170,6 +172,26 @@ rc=$?; set -e
 [ -f "$TMP/seen" ] || { command cat "$STATE/runs/exact/log" >&2; exit 1; }
 cmp "$STATE/runs/exact/argv.nul" "$TMP/seen"
 [ "$(sha256sum "$TREE/target/release/arle" | cut -d' ' -f1)" = "$bsha" ]
+
+TP4_SET='0, GPU-0, 0, 9.0\n1, GPU-1, 0, 9.0\n2, GPU-2, 0, 9.0\n3, GPU-3, 0, 9.0'
+printf '%s\0' serve > "$TMP/tp4-argv"
+export ENV_OUT="$TMP/tp4-env" ARGV_OUT="$TMP/tp4-seen"
+TP4_CLAIMS="$TMP/tp4-claims"
+POD_TREE="$TREE" POD_STATE="$STATE" ARLE_GPU_CLAIMS="$TP4_CLAIMS" SMI="$TP4_SET" setsid bash "$TREE/scripts/pod-remote-run.sh" run good tp4 0,1,2,3 op-tp4 "$TMP/tp4-argv" >/dev/null
+receipt="$STATE/runs/tp4/receipt"
+grep -Fxq 'gpu=0,1,2,3' "$receipt"
+grep -Fxq 'CUDA_VISIBLE_DEVICES=0,1,2,3' "$ENV_OUT"
+grep -Fxq 'INFER_CUDA_DEVICES=0,1,2,3' "$ENV_OUT"
+grep -Fxq 'INFER_TP_SIZE=4' "$ENV_OUT"
+grep -q '^INFER_CUDA_DEVICE=' "$ENV_OUT" && exit 1 || true
+for gpu in 0 1 2 3; do [ ! -e "$TP4_CLAIMS/$gpu" ]; done
+
+printf '%s\0' serve > "$TMP/tp4-foreign-argv"
+export ENV_OUT="$TMP/tp4-foreign-env" CLAIM_SWAP="$TP4_CLAIMS/2"
+POD_TREE="$TREE" POD_STATE="$STATE" ARLE_GPU_CLAIMS="$TP4_CLAIMS" SMI="$TP4_SET" setsid bash "$TREE/scripts/pod-remote-run.sh" run good tp4-foreign 0,1,2,3 op-tp4-foreign "$TMP/tp4-foreign-argv" >/dev/null
+[ "$(awk -F= '$1=="op" {print $2}' "$TP4_CLAIMS/2")" = foreign ]
+for gpu in 0 1 3; do [ ! -e "$TP4_CLAIMS/$gpu" ]; done
+unset CLAIM_SWAP ENV_OUT
 
 mkdir -p "$STATE/runs/stale"
 printf 'op=foreign\npid=%s\npgid=%s\nstart=0\n' "$$" "$$" > "$STATE/runs/stale/process"
@@ -263,9 +285,19 @@ SMI="$SM90_SET" SMI_COMPUTE='GPU-3\n' ARLE_GPU_CLAIMS="$TMP/free-set" bash "$TRE
 rc=$?; set -e
 [ "$rc" -ne 0 ]
 set +e
-SMI="$SM90_SET" ARLE_GPU_CLAIMS="$TMP/free-set" bash "$TREE/scripts/pick-gpu.sh" check-free-set 0,1,2,3,4,5,6 >/dev/null 2>&1
+SMI="$SM90_SET" ARLE_GPU_CLAIMS="$TMP/free-set" bash "$TREE/scripts/pick-gpu.sh" check-free-set 0,1,1,2 >/dev/null 2>&1
 rc=$?; set -e
 [ "$rc" -ne 0 ]
+mkdir -p "$TMP/tp4-busy"
+printf 'schema=arle-gpu-claim-v1\nop=foreign\npid=%s\nstart=%s\n' "$$" "$(awk '{print $22}' /proc/$$/stat)" > "$TMP/tp4-busy/2"
+set +e
+SMI="$TP4_SET" ARLE_GPU_CLAIMS="$TMP/tp4-busy" bash "$TREE/scripts/pick-gpu.sh" check-free-set 0,1,2,3 >/dev/null 2>&1
+rc=$?; set -e
+[ "$rc" -ne 0 ] && [ ! -e "$TMP/tp4-busy/0" ] && [ ! -e "$TMP/tp4-busy/1" ] && [ ! -e "$TMP/tp4-busy/3" ]
+set +e
+SMI="$TP4_SET" SMI_COMPUTE='GPU-2\n' ARLE_GPU_CLAIMS="$TMP/tp4-free" bash "$TREE/scripts/pick-gpu.sh" reserve-set 0,1,2,3 >/dev/null 2>&1
+rc=$?; set -e
+[ "$rc" -ne 0 ] && [ ! -e "$TMP/tp4-free/0" ] && [ ! -e "$TMP/tp4-free/1" ] && [ ! -e "$TMP/tp4-free/2" ] && [ ! -e "$TMP/tp4-free/3" ]
 low_compute="$(ARLE_GPU_CLAIMS="$TMP/low-compute" ARLE_OP_ID=ours ARLE_OWNER=test SMI='0, GPU-0, 1, 9.0\n1, GPU-1, 0, 9.0' SMI_COMPUTE='GPU-0\n' bash "$TREE/scripts/pick-gpu.sh")"
 [ "$low_compute" = 1 ]
 
