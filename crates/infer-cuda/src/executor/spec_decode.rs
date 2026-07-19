@@ -217,6 +217,29 @@ impl DraftChain {
         });
         Ok(row)
     }
+
+    fn new(root_token: u32, depth: usize) -> Self {
+        Self {
+            nodes: vec![DraftNode {
+                token: root_token,
+                parent: None,
+                depth: 0,
+            }],
+            candidates: Vec::with_capacity(depth),
+            depth,
+        }
+    }
+
+    fn add_level(&mut self, candidates: Vec<u32>) -> Result<u32> {
+        ensure!(
+            !candidates.is_empty(),
+            "DSv4 MTP draft level produced no candidates"
+        );
+        let next = candidates[0];
+        self.candidates.push(candidates);
+        self.add_chain_child(next)?;
+        Ok(next)
+    }
 }
 
 impl Dsv4CudaExecutor {
@@ -386,10 +409,8 @@ impl Dsv4CudaExecutor {
         let mut phase_last = mtp_phase_start(&self.model.ctx, phase_time);
 
         // ── 1. Per-slot pre-draft ring capture, then draft the N chains.
-        // The ring capture is ALWAYS per-slot (cheap host-side snapshot, the
-        // proven per-row call — never batched). Draft is per-slot top-1 chain;
-        // `topk` only widens candidate sampling from those same draft logits.
-        let mut chains: Vec<DraftChain> = Vec::with_capacity(n);
+        // Ring capture is per-slot (cheap host snapshot, never batched). Draft
+        // runs `depth` batched `mtp_forward_level` calls, one per level.
         let mut scheds: Vec<SpecVerifySchedule> = Vec::with_capacity(n);
 
         // Gather per-slot pending tokens + previous hidden (h_prev) BEFORE the
@@ -418,18 +439,41 @@ impl Dsv4CudaExecutor {
             h_prevs.push(hidden);
         }
         let capture_ms = mtp_phase_mark(&self.model.ctx, &mut phase_last, phase_time);
-        for s in 0..n {
-            let chain = self.draft_chain(
-                slot_ids[s],
-                pendings[s],
-                &h_prevs[s],
-                depth,
+        // Batched draft: `depth` levels, each level runs ONE `mtp_forward_level`
+        // over all N slots (one row per slot) instead of N×depth serial m=1 calls.
+        let mut chains: Vec<DraftChain> = (0..n)
+            .map(|s| DraftChain::new(pendings[s], depth))
+            .collect();
+        let mut cur_tokens: Vec<u32> = pendings.clone();
+        let mut cur_hiddens: Vec<DeviceVec> = h_prevs.clone();
+        for level in 0..depth {
+            let rows: Vec<crate::dsv4::MtpDraftRow> = cur_tokens
+                .iter()
+                .map(|&t| crate::dsv4::MtpDraftRow { token: t })
+                .collect();
+            let h_refs: Vec<&DeviceVec> = cur_hiddens.iter().collect();
+            let positions: Vec<u64> = (0..n)
+                .map(|s| (start_positions[s] + level) as u64)
+                .collect();
+            let expanded = self.model.mtp_forward_level(
+                &mut self.slots,
+                &mut self.kv_adapter,
+                slot_ids,
+                &rows,
+                &h_refs,
+                &positions,
                 topk,
-                start_positions[s],
             )?;
-            chain.validate()?;
-            scheds.push(chain.verify_schedule(start_positions[s]));
-            chains.push(chain);
+            for s in 0..n {
+                let (candidates, stream) = expanded[s].clone();
+                let next = chains[s].add_level(candidates)?;
+                cur_tokens[s] = next;
+                cur_hiddens[s] = stream;
+            }
+        }
+        for s in 0..n {
+            chains[s].validate()?;
+            scheds.push(chains[s].verify_schedule(start_positions[s]));
         }
         let draft_ms = mtp_phase_mark(&self.model.ctx, &mut phase_last, phase_time);
 
@@ -597,11 +641,12 @@ impl Dsv4CudaExecutor {
                 })?
             };
             let mut expanded = self.model.mtp_forward_level(
-                &mut self.slots[slot_idx],
+                &mut self.slots,
                 &mut self.kv_adapter,
+                &[slot_idx],
                 std::slice::from_ref(&row),
                 &[h_prev],
-                (start_pos + level) as u64,
+                &[(start_pos + level) as u64],
                 topk,
             )?;
             let (candidates, stream) = expanded
