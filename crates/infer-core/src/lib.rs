@@ -346,6 +346,17 @@ impl From<RequestState> for CompletedRequest {
     }
 }
 
+/// Engine admission mode. `Quiesced` marks the OPD writeback bracket (KV pool
+/// released); the serve loop defers submission admission while it is set so no
+/// request is prefilled onto the dropped pool (qwen35 full_attn_kv=None panic,
+/// f6d 2026-07-18). Cleared by `resume_serving` after the pool is re-acquired.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum EngineMode {
+    #[default]
+    Serving,
+    Quiesced,
+}
+
 /// Backend-agnostic engine loop.
 ///
 /// Prefix reuse is host-indexed: the engine carries token blocks and page ids,
@@ -384,6 +395,8 @@ pub struct Engine<E: BackendExecutor, K: KvPool> {
     /// request, so a serving layer can stream tokens live. `None` by default —
     /// when unset, token commit behavior is byte-identical to before.
     on_token: Option<TokenObserver>,
+    /// Admission mode; `Quiesced` during the OPD writeback bracket. See [`EngineMode`].
+    mode: EngineMode,
 }
 
 /// Per-token observer: invoked with `(handle, &token)` as each token is committed
@@ -455,6 +468,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             next_tier_key: 0,
             next_admit_seq: 0,
             on_token: None,
+            mode: EngineMode::Serving,
         }
     }
 
@@ -1102,6 +1116,28 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             self.cancel_request(handle);
         }
         handles
+    }
+
+    /// OPD writeback bracket: switch to `Quiesced` and cancel all in-flight
+    /// work, atomically on the engine thread. The serve loop reads the mode to
+    /// defer draining submissions until [`Self::resume_serving`]. Returns the
+    /// cancelled handles (as `cancel_all_requests`).
+    pub fn quiesce(&mut self) -> Vec<RequestHandle> {
+        self.mode = EngineMode::Quiesced;
+        self.cancel_all_requests()
+    }
+
+    /// Re-arm serving after the OPD writeback bracket (once the KV pool is
+    /// re-acquired). Idempotent.
+    pub fn resume_serving(&mut self) {
+        self.mode = EngineMode::Serving;
+    }
+
+    /// True while in the OPD writeback bracket (KV pool released). The serve
+    /// loop defers submission admission until [`Self::resume_serving`].
+    #[must_use]
+    pub fn is_quiesced(&self) -> bool {
+        self.mode == EngineMode::Quiesced
     }
 
     fn record_attached_prefix_metrics(&mut self, attached_pages: usize) {
