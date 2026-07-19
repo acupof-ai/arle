@@ -1,0 +1,69 @@
+crates/cli/src/serve.rs
+  s_701dead3b9c2f3::t_2b0265c3f1c265 16-17,176-185,195-256
+crates/infer-api/src/lib.rs
+  s_701dead3b9c2f3::t_78298524eb146c 82,90-92,102-103
+crates/infer-api/src/loaded.rs
+  s_701dead3b9c2f3::t_2e7b2edc85e4e2 691-716
+crates/infer-api/src/serve.rs
+  s_2d5ae796fd7468::t_69fb81e71db922 304
+crates/infer-api/src/serve_engine.rs
+  s_6e2dde2c3a0901::t_87b21679d8f91d 390-403
+crates/infer-cuda/src/executor.rs
+  s_701dead3b9c2f3::t_daaa32ce83552f 29-31,910-925
+crates/infer-cuda/src/executor/dspark_rl.rs
+  s_701dead3b9c2f3::t_21aed0a58c90b7 1-144
+crates/infer-cuda/src/lib.rs
+  s_701dead3b9c2f3::t_e957fc3a56dbfb 110-117,515-527
+crates/infer-cuda/src/qwen35/dspark.rs
+  s_d6adcec6a0a6d3::t_4879228b9412cf 17,64,67-71,94,112-154,159-165,170,182,184-185,511,599-602,616,689,710-740,787,817-842,867-893
+crates/train/src/dspark_rl.rs
+  s_701dead3b9c2f3::t_a1fdce797d6f38 300-356
+crates/train/src/lib.rs
+  s_701dead3b9c2f3::t_e2a40a56a67027 59-60
+crates/train/tests/test_dspark_rl.rs
+  s_701dead3b9c2f3::t_0a4a9b4226ead2 1-121
+docs/plans/2026-07-19-dspark-rl-sidecar.md
+  s_701dead3b9c2f3::t_77046680bde103 1-161
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "d3875f021d157dfee058cf7566549644bae258a6",
+  "prompts": {},
+  "sessions": {
+    "s_2d5ae796fd7468": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aa755872fdd9b470f",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_6e2dde2c3a0901": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-af38af97ea51ae962",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_701dead3b9c2f3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4876ea73-5d7b-4a4e-a891-98c71325cbc0",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_d6adcec6a0a6d3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dc64a0b5-493b-4e08-a5cf-392205926291",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
