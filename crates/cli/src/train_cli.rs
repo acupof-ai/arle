@@ -2163,7 +2163,7 @@ fn quiesce_serve(
             .lock()
             .map_err(|err| anyhow!("LoadedInferenceEngine lock poisoned: {err}"))
     };
-    let cancelled = lock()?.quiesce_admissions()?;
+    let cancelled = lock()?.cancel_all_requests()?;
     if cancelled > 0 {
         eprintln!("[agent-opd] quiesce: cancelled {cancelled} orphaned request(s)");
     }
@@ -3191,13 +3191,6 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
             })
         {
             eprintln!("[agent-opd] ensure KV pool (round {round}) failed: {err}");
-        }
-
-        // Re-arm admission after the previous round's writeback bracket quiesced
-        // it (paired with quiesce_admissions in quiesce_serve). Idempotent; a
-        // no-op on round 0 and on the staleness-1 overlap path that never quiesced.
-        if let Err(err) = infer_student.resume_admissions() {
-            eprintln!("[agent-opd] resume admissions (round {round}) failed: {err}");
         }
 
         let mut losses: Vec<f32> = Vec::new();
