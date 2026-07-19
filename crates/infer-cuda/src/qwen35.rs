@@ -68,28 +68,19 @@ const DEFAULT_ROPE_CACHE_LEN: usize = 32_768;
 const QWEN35_BATCHED_DECODE_KV_SPLITS: usize = 4;
 
 #[cfg(test)]
-pub(crate) mod w4_probe {
+pub(crate) mod conv_probe {
     use super::*;
     use std::cell::RefCell;
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub(crate) enum Projection {
-        LinearQkv,
-        FullQ,
-        FullK,
-        FullV,
-    }
-
     pub(crate) struct Capture {
-        pub(crate) projection: Projection,
         pub(crate) seq_len: usize,
-        pub(crate) rows: usize,
-        pub(crate) cols: usize,
-        pub(crate) group_size: usize,
+        pub(crate) channels: usize,
+        pub(crate) kernel_size: usize,
         pub(crate) input: Vec<bf16>,
+        pub(crate) weight: Vec<bf16>,
         pub(crate) output: Vec<bf16>,
-        pub(crate) packed_weight: Vec<u8>,
-        pub(crate) scales: Vec<bf16>,
+        pub(crate) pre_state: Vec<bf16>,
+        pub(crate) post_state: Vec<bf16>,
     }
 
     thread_local! {
@@ -100,76 +91,101 @@ pub(crate) mod w4_probe {
         CAPTURES.with(|captures| {
             assert!(
                 captures.replace(Some(Vec::new())).is_none(),
-                "W4 probe already armed"
+                "conv probe already armed"
             );
         });
     }
 
     pub(crate) fn drain() -> Vec<Capture> {
-        CAPTURES.with(|captures| captures.borrow_mut().take().expect("W4 probe not armed"))
+        CAPTURES.with(|captures| captures.borrow_mut().take().expect("conv probe not armed"))
     }
 
-    pub(super) fn capture(
-        ctx: &DeviceContext,
-        projection: Projection,
-        weight: &DeviceMatrix,
-        input: &HiddenStates,
-        output: &HiddenStates,
-    ) -> Result<()> {
-        let needed = CAPTURES.with(|captures| {
-            captures.borrow().as_ref().is_some_and(|captures| {
-                captures
-                    .iter()
-                    .all(|capture| capture.projection != projection)
-            })
+    pub(crate) fn disarm() {
+        CAPTURES.with(|captures| {
+            captures.borrow_mut().take();
         });
+    }
+
+    pub(super) struct Pending {
+        seq_len: usize,
+        channels: usize,
+        kernel_size: usize,
+        input: Vec<bf16>,
+        weight: Vec<bf16>,
+        pre_state: Vec<bf16>,
+    }
+
+    pub(super) fn begin(
+        ctx: &DeviceContext,
+        linear_idx: usize,
+        seq_len: usize,
+        channels: usize,
+        kernel_size: usize,
+        input: &CudaSlice<bf16>,
+        weight: &DeviceVec,
+        state: &DeviceVec,
+    ) -> Result<Option<Pending>> {
+        // 只捕获第一个 linear-attention 层的 conv：同一层的 conv 算术在所有层相同，
+        // 一层足以验证正确性，避免下载每一层的 state。
+        let needed = linear_idx == 0 && CAPTURES.with(|captures| captures.borrow().is_some());
         if !needed {
-            return Ok(());
+            return Ok(None);
         }
-        ensure!(
-            weight.weight_format == WeightFormat::W4A16,
-            "{projection:?} is not W4A16"
-        );
-        let packed = weight
-            .qweight
-            .as_ref()
-            .ok_or_else(|| anyhow!("{projection:?} missing qweight"))?;
-        let scales = weight
-            .qscales
-            .as_ref()
-            .ok_or_else(|| anyhow!("{projection:?} missing qscales"))?;
-        let packed_weight = ctx
-            .stream
-            .clone_dtoh(packed)
-            .map_err(|e| anyhow!("{projection:?} weight D2H failed: {e}"))?;
         let input = ctx
             .stream
-            .clone_dtoh(&input.data)
-            .map_err(|e| anyhow!("{projection:?} input D2H failed: {e}"))?;
+            .clone_dtoh(input)
+            .map_err(|e| anyhow!("conv input D2H failed: {e}"))?;
+        let weight = ctx
+            .stream
+            .clone_dtoh(&weight.data)
+            .map_err(|e| anyhow!("conv weight D2H failed: {e}"))?;
+        let pre_state = ctx
+            .stream
+            .clone_dtoh(&state.data)
+            .map_err(|e| anyhow!("conv pre-state D2H failed: {e}"))?;
+        ctx.sync()?;
+        Ok(Some(Pending {
+            seq_len,
+            channels,
+            kernel_size,
+            input,
+            weight,
+            pre_state,
+        }))
+    }
+
+    pub(super) fn finish(
+        ctx: &DeviceContext,
+        pending: Option<Pending>,
+        output: &HiddenStates,
+        state: &DeviceVec,
+    ) -> Result<()> {
+        let Some(pending) = pending else {
+            return Ok(());
+        };
         let output = ctx
             .stream
             .clone_dtoh(&output.data)
-            .map_err(|e| anyhow!("{projection:?} output D2H failed: {e}"))?;
-        let scales = ctx
+            .map_err(|e| anyhow!("conv output D2H failed: {e}"))?;
+        let post_state = ctx
             .stream
-            .clone_dtoh(scales)
-            .map_err(|e| anyhow!("{projection:?} scales D2H failed: {e}"))?;
+            .clone_dtoh(&state.data)
+            .map_err(|e| anyhow!("conv post-state D2H failed: {e}"))?;
         ctx.sync()?;
         CAPTURES.with(|captures| {
             captures
                 .borrow_mut()
                 .as_mut()
-                .expect("W4 probe disarmed during capture")
+                .expect("conv probe disarmed during capture")
                 .push(Capture {
-                    projection,
-                    seq_len: input.len() / weight.cols,
-                    rows: weight.rows,
-                    cols: weight.cols,
-                    group_size: weight.group_size,
-                    input,
+                    seq_len: pending.seq_len,
+                    channels: pending.channels,
+                    kernel_size: pending.kernel_size,
+                    input: pending.input,
+                    weight: pending.weight,
                     output,
-                    packed_weight: packed_weight.into_iter().map(|byte| byte as u8).collect(),
-                    scales,
+                    pre_state: pending.pre_state,
+                    post_state,
                 });
         });
         Ok(())
@@ -5617,30 +5633,6 @@ impl Qwen35Model {
                 gemm_batch(&self.ctx, &attn.q_proj, normed, q_full)?;
                 gemm_batch(&self.ctx, &attn.k_proj, normed, k_batch)?;
                 gemm_batch(&self.ctx, &attn.v_proj, normed, v_batch)?;
-                #[cfg(test)]
-                {
-                    w4_probe::capture(
-                        &self.ctx,
-                        w4_probe::Projection::FullQ,
-                        &attn.q_proj,
-                        normed,
-                        q_full,
-                    )?;
-                    w4_probe::capture(
-                        &self.ctx,
-                        w4_probe::Projection::FullK,
-                        &attn.k_proj,
-                        normed,
-                        k_batch,
-                    )?;
-                    w4_probe::capture(
-                        &self.ctx,
-                        w4_probe::Projection::FullV,
-                        &attn.v_proj,
-                        normed,
-                        v_batch,
-                    )?;
-                }
                 Ok(())
             },
         )?;
@@ -6028,14 +6020,6 @@ impl Qwen35Model {
             seq_len,
             || {
                 gemm_batch(&self.ctx, &attn.in_proj_qkv, normed, qkv)?;
-                #[cfg(test)]
-                w4_probe::capture(
-                    &self.ctx,
-                    w4_probe::Projection::LinearQkv,
-                    &attn.in_proj_qkv,
-                    normed,
-                    qkv,
-                )?;
                 gemm_batch(&self.ctx, &attn.in_proj_z, normed, z)?;
                 gemm_batch(&self.ctx, &attn.in_proj_b, normed, b_proj)?;
                 gemm_batch(&self.ctx, &attn.in_proj_a, normed, a_proj)?;
@@ -6216,35 +6200,50 @@ impl Qwen35Model {
             qkv_dim * (c.linear_conv_kernel_dim - 1)
         );
         {
-            let (x_ptr, _g0) = qkv_in.device_ptr(&self.ctx.stream);
-            let (w_ptr, _g1) = attn.conv1d_weight.data.device_ptr(&self.ctx.stream);
-            let (s_ptr, _g2) = conv_state.data.device_ptr_mut(&self.ctx.stream);
-            let (o_ptr, _g3) = qkv_conv.data.device_ptr_mut(&self.ctx.stream);
-            // SAFETY: qkv/weight/state/out valid on ctx.stream; weight len checked
-            // by the kernel against num_channels*kernel.
-            qwen35_profile(
+            #[cfg(test)]
+            let conv_capture = conv_probe::begin(
                 &self.ctx,
-                "qwen/linear/conv1d",
-                Some(linear_idx),
+                linear_idx,
                 seq_len,
-                || {
-                    // SAFETY: ptrs from live device allocations sized to the dims passed.
-                    unsafe {
-                        ffi::conv1d_prefill_cuda(
-                            x_ptr as *const ffi::Half,
-                            w_ptr as *const ffi::Half,
-                            s_ptr as *mut ffi::Half,
-                            o_ptr as *mut ffi::Half,
-                            qkv_dim as i32,
-                            seq_len as i32,
-                            c.linear_conv_kernel_dim as i32,
-                            self.ctx.stream.cu_stream(),
-                        )
-                        .result()?;
-                    }
-                    Ok(())
-                },
+                qkv_dim,
+                c.linear_conv_kernel_dim,
+                qkv_in,
+                &attn.conv1d_weight,
+                conv_state,
             )?;
+            {
+                let (x_ptr, _g0) = qkv_in.device_ptr(&self.ctx.stream);
+                let (w_ptr, _g1) = attn.conv1d_weight.data.device_ptr(&self.ctx.stream);
+                let (s_ptr, _g2) = conv_state.data.device_ptr_mut(&self.ctx.stream);
+                let (o_ptr, _g3) = qkv_conv.data.device_ptr_mut(&self.ctx.stream);
+                // SAFETY: qkv/weight/state/out valid on ctx.stream; weight len checked
+                // by the kernel against num_channels*kernel.
+                qwen35_profile(
+                    &self.ctx,
+                    "qwen/linear/conv1d",
+                    Some(linear_idx),
+                    seq_len,
+                    || {
+                        // SAFETY: ptrs from live device allocations sized to the dims passed.
+                        unsafe {
+                            ffi::conv1d_prefill_cuda(
+                                x_ptr as *const ffi::Half,
+                                w_ptr as *const ffi::Half,
+                                s_ptr as *mut ffi::Half,
+                                o_ptr as *mut ffi::Half,
+                                qkv_dim as i32,
+                                seq_len as i32,
+                                c.linear_conv_kernel_dim as i32,
+                                self.ctx.stream.cu_stream(),
+                            )
+                            .result()?;
+                        }
+                        Ok(())
+                    },
+                )?;
+            }
+            #[cfg(test)]
+            conv_probe::finish(&self.ctx, conv_capture, qkv_conv, conv_state)?;
         }
 
         // ── gated-delta rule. Decode (seq_len==1) is always the recurrent
