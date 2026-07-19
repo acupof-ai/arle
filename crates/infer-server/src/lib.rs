@@ -578,24 +578,18 @@ where
         self.run_on_executor(|executor| executor.ensure_kv_pool())?
     }
 
-    /// OPD round-loop quiesce: switch the engine to Quiesced (no new admission)
-    /// and cancel every in-flight (waiting + active) request, atomically on the
-    /// engine thread. Returns how many were cancelled. Pairs with
-    /// [`Self::resume_admissions`], called after the KV pool is re-acquired.
-    pub fn quiesce_admissions(&self) -> Result<usize> {
+    /// Cancel every in-flight (waiting + active) engine request, returning how
+    /// many were cancelled. Orphan sweep for a caller that knows all clients
+    /// are gone (OPD round-loop quiesce). Runs on the engine thread between
+    /// steps; each cancelled row frees its KV slot via the normal finish path.
+    pub fn cancel_all_requests(&self) -> Result<usize> {
         self.run_on_engine(|engine| {
-            let handles = engine.quiesce();
+            let handles = engine.cancel_all_requests();
             for handle in &handles {
                 log::warn!("[serve-engine] cancelled orphaned request {}", handle.id());
             }
             handles.len()
         })
-    }
-
-    /// Re-arm engine admission after the OPD writeback bracket (KV pool
-    /// re-acquired). Idempotent.
-    pub fn resume_admissions(&self) -> Result<()> {
-        self.run_on_engine(|engine| engine.resume_serving())
     }
 
     /// Close the submit channel and join the engine thread.
