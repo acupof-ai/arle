@@ -6,7 +6,8 @@
 //! [`crate::http`] own request ingress; this file owns only the wire shapes and
 //! their validation/conversion.
 
-use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+use std::path::Path;
+use std::sync::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::Json;
@@ -18,18 +19,77 @@ use serde_json::json;
 
 use crate::multiproc_relay::WireStats;
 
-/// Serve-wide temperature for requests that omit the field (f32 bits; default
-/// 0.0 = greedy, the shipped behavior). The cc rollout lane sets this to 1.0 —
-/// Claude Code sends no `temperature`, and greedy rollouts have zero sampling
-/// diversity AND no behavior logprobs (greedy emits `logprob: None`).
-static DEFAULT_TEMPERATURE: AtomicU32 = AtomicU32::new(0);
-
-pub fn set_default_temperature(t: f32) {
-    DEFAULT_TEMPERATURE.store(t.to_bits(), Relaxed);
+/// Serve-wide sampling defaults for request fields left unset. Both halves of
+/// the default matter: temperature drives greedy-vs-sample, and the nucleus
+/// (`top_k`/`top_p`/`min_p`) truncates the tail — omitting the nucleus while
+/// forcing temperature>0 draws over the full vocab tail (token salad).
+/// Initialized to the shipped greedy/no-filter default, byte-identical to
+/// [`SamplingParams::default`] until serve init overrides it from the model's
+/// `generation_config.json`.
+#[derive(Debug, Clone, Copy)]
+pub struct SamplingDefaults {
+    /// Non-zero keeps rollout logprobs non-empty (greedy emits `logprob: None`)
+    /// — the cc rollout F.6 invariant; the model nucleus then truncates the tail.
+    pub temperature: f32,
+    pub top_k: i32,
+    pub top_p: f32,
+    pub min_p: f32,
 }
 
-fn default_temperature() -> f32 {
-    f32::from_bits(DEFAULT_TEMPERATURE.load(Relaxed))
+impl Default for SamplingDefaults {
+    fn default() -> Self {
+        Self {
+            temperature: 0.0,
+            top_k: -1,
+            top_p: 1.0,
+            min_p: 0.0,
+        }
+    }
+}
+
+impl SamplingDefaults {
+    /// Read `temperature`/`top_k`/`top_p` from the model's
+    /// `generation_config.json`; a missing file, unreadable file, or missing key
+    /// keeps the greedy/no-filter default for that field (tolerant parse, mirrors
+    /// `Qwen35Config::load_stop_token_ids`). `min_p` has no wire key — stays default.
+    #[must_use]
+    pub fn from_generation_config(model_dir: impl AsRef<Path>) -> Self {
+        let mut defaults = Self::default();
+        let path = model_dir.as_ref().join("generation_config.json");
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            return defaults;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) else {
+            return defaults;
+        };
+        if let Some(t) = value.get("temperature").and_then(serde_json::Value::as_f64) {
+            defaults.temperature = t as f32;
+        }
+        if let Some(k) = value.get("top_k").and_then(serde_json::Value::as_i64) {
+            defaults.top_k = k as i32;
+        }
+        if let Some(p) = value.get("top_p").and_then(serde_json::Value::as_f64) {
+            defaults.top_p = p as f32;
+        }
+        defaults
+    }
+}
+
+// Set-once-at-serve-init, read-per-request. Const initializer = the shipped
+// greedy/no-filter default (matches `SamplingParams::default()`).
+static SAMPLING_DEFAULTS: RwLock<SamplingDefaults> = RwLock::new(SamplingDefaults {
+    temperature: 0.0,
+    top_k: -1,
+    top_p: 1.0,
+    min_p: 0.0,
+});
+
+pub fn set_sampling_defaults(defaults: SamplingDefaults) {
+    *SAMPLING_DEFAULTS.write().unwrap() = defaults;
+}
+
+fn sampling_defaults() -> SamplingDefaults {
+    *SAMPLING_DEFAULTS.read().unwrap()
 }
 
 /// OpenAI `stream_options`: `{"include_usage": true}` asks the streaming
@@ -394,11 +454,12 @@ fn sampling_params(
     seed: Option<u64>,
 ) -> SamplingParams {
     let default = SamplingParams::default();
+    let serve = sampling_defaults();
     SamplingParams {
-        temperature: temperature.unwrap_or_else(default_temperature),
-        top_k: top_k.unwrap_or(default.top_k),
-        top_p: top_p.unwrap_or(default.top_p),
-        min_p: min_p.unwrap_or(default.min_p),
+        temperature: temperature.unwrap_or(serve.temperature),
+        top_k: top_k.unwrap_or(serve.top_k),
+        top_p: top_p.unwrap_or(serve.top_p),
+        min_p: min_p.unwrap_or(serve.min_p),
         repetition_penalty: repetition_penalty.unwrap_or(default.repetition_penalty),
         frequency_penalty: frequency_penalty.unwrap_or(default.frequency_penalty),
         presence_penalty: presence_penalty.unwrap_or(default.presence_penalty),
@@ -968,6 +1029,49 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Global serve-default state — combined into one fn (no parallel interference)
+    // and restored to the shipped default at the end.
+    #[test]
+    fn serve_sampling_defaults_fill_omitted_nucleus_and_temperature() {
+        let dir = std::env::temp_dir().join(format!(
+            "arle-schema-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("generation_config.json"),
+            r#"{"temperature": 1.0, "top_k": 20, "top_p": 0.95}"#,
+        )
+        .unwrap();
+
+        let defaults = SamplingDefaults::from_generation_config(&dir);
+        assert_eq!(defaults.temperature, 1.0);
+        assert_eq!(defaults.top_k, 20);
+        assert_eq!(defaults.top_p, 0.95);
+        assert_eq!(defaults.min_p, 0.0);
+        set_sampling_defaults(defaults);
+
+        // Omitted temperature + nucleus inherit the model defaults — NOT the
+        // unfiltered top_k -1 / top_p 1.0 that drew over the vocab tail (salad).
+        let omitted: CompletionRequest = serde_json::from_value(json!({ "prompt": "hi" })).unwrap();
+        let sp = omitted.sampling_params();
+        assert_eq!(sp.temperature, 1.0);
+        assert_eq!(sp.top_k, 20);
+        assert_eq!(sp.top_p, 0.95);
+
+        // An explicitly-provided field still wins over the serve default.
+        let explicit: CompletionRequest =
+            serde_json::from_value(json!({ "prompt": "hi", "top_p": 0.5 })).unwrap();
+        assert_eq!(explicit.sampling_params().top_p, 0.5);
+
+        set_sampling_defaults(SamplingDefaults::default());
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn models_response_is_openai_single_model_list() {

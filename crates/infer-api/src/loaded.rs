@@ -577,6 +577,12 @@ mod backend {
             enable_cuda_graph: bool,
             config: EngineLoadConfig,
         ) -> Result<Self> {
+            // Model-driven serve defaults for omitted sampling fields (nucleus +
+            // temperature). The cc rollout lane overrides `.temperature` after this.
+            infer_server::set_sampling_defaults(
+                infer_server::SamplingDefaults::from_generation_config(model_path),
+            );
+
             #[cfg(feature = "metal")]
             {
                 let _ = enable_cuda_graph;
@@ -1310,6 +1316,12 @@ mod backend {
         config: EngineLoadConfig,
         shutdown: infer_server::ServeShutdown,
     ) -> Result<axum::Router> {
+        // Model-driven serve defaults for omitted sampling fields (nucleus +
+        // temperature) — the `arle serve` router lane.
+        infer_server::set_sampling_defaults(
+            infer_server::SamplingDefaults::from_generation_config(model_path),
+        );
+
         // The L3 disk tier is consumed by CUDA and Metal; every other
         // backend fails closed on an explicit request instead of silently
         // serving without it.
