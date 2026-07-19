@@ -278,7 +278,7 @@ pack_bundle() {
 }
 
 qualification_candidate() {
-    local candidate="$1" tmp archive_sha
+    local candidate="$1" tmp computed_sha
     if [[ -d "$candidate" ]]; then
         : "${ARLE_KERNEL_CANDIDATE_ARCHIVE_SHA256:?directory candidates require ARLE_KERNEL_CANDIDATE_ARCHIVE_SHA256}"
         [[ "$ARLE_KERNEL_CANDIDATE_ARCHIVE_SHA256" =~ ^[0-9a-f]{64}$ ]] || {
@@ -290,7 +290,7 @@ qualification_candidate() {
         return
     fi
     [[ -f "$candidate" ]] || { echo "qualification candidate not found: $candidate" >&2; return 1; }
-    archive_sha="$(cuda_prebuilt_hash_file "$candidate")"
+    computed_sha="$(cuda_prebuilt_hash_file "$candidate")"
     tmp="$(mktemp -d)"
     while IFS= read -r entry; do
         [[ "$entry" != /* && "/$entry/" != *'/../'* ]] || {
@@ -301,7 +301,7 @@ qualification_candidate() {
     done < <(tar -tzf "$candidate")
     tar -xzf "$candidate" -C "$tmp"
     QUALIFICATION_TREE="$tmp"
-    printf -v "$2" '%s' "$archive_sha"
+    printf -v "$2" '%s' "$computed_sha"
 }
 
 qualification_manifest_value() {

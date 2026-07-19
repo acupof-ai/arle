@@ -32,6 +32,7 @@ serve = [
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
+    "safetensors[torch]",
 ]
 bench = [
     "httpx==0.28.1",

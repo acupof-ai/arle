@@ -87,6 +87,7 @@ expect_fail env ARLE_KERNEL_TEST_BINARY="$TMP/arle" ARLE_KERNEL_TESTED_SM=8.9 \
     "$TMP/stats.json" "$TMP/wrong.json"
 
 fragment 8.0 qwen '' "$TMP/80.json"
+[[ "$(jq -r '.candidate_archive_sha256' "$TMP/80.json")" == "$(sha256sum "$TMP/candidate.tar.gz" | cut -d' ' -f1)" ]]
 fragment 8.6 qwen '' "$TMP/86.json"
 fragment 8.9 qwen '' "$TMP/89.json"
 fragment 9.0 qwen-fa3 fa3 "$TMP/90.json"
