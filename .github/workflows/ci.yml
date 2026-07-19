@@ -215,7 +215,7 @@ jobs:
             ${{ runner.os }}-pip-
 
       - name: Install Python dependencies
-        run: pip install -e ".[dev]" safetensors torch
+        run: pip install -e ".[dev]"
 
       - name: Run pytest
         run: |
