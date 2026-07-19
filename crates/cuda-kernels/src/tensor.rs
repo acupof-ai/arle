@@ -659,6 +659,8 @@ mod pipeline_fence_tests {
         let ctx = DeviceContext::new()?;
 
         let initial = [11_i32, 22, 33, 44];
+        // SAFETY: `alloc_pinned` returns a valid pinned buffer of `initial.len()`
+        // elements; the buffer is freed when `pinned` is dropped at scope end.
         let mut pinned = unsafe {
             ctx.ctx
                 .alloc_pinned::<i32>(initial.len())
@@ -3844,7 +3846,7 @@ mod tests {
         assert_eq!(scoped_device_ordinal_override(), None);
         let outer = with_device_ordinal_override(2, || {
             assert_eq!(scoped_device_ordinal_override(), Some(2));
-            let inner = with_device_ordinal_override(7, || scoped_device_ordinal_override());
+            let inner = with_device_ordinal_override(7, scoped_device_ordinal_override);
             assert_eq!(inner, Some(7));
             scoped_device_ordinal_override()
         });

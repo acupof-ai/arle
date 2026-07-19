@@ -100,6 +100,8 @@ fn current_transpose_then_matmul(shape: Shape, a: &[f32], weight: &[f32]) -> Vec
 
 fn direct_bt_matrixmultiply(shape: Shape, a: &[f32], weight: &[f32]) -> Vec<f32> {
     let mut out = vec![0.0f32; shape.m * shape.n];
+    // SAFETY: `a`, `weight`, and `out` are sized to match `shape`; strides
+    // encode the transposed B layout (lda=k, ldb=1, ldc=n).
     unsafe {
         matrixmultiply::sgemm(
             shape.m,

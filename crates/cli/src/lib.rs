@@ -1,3 +1,8 @@
+// CLI crate: unsafe blocks are FFI calls (signal handlers, process spawning,
+// ioctl) with invariants documented at the call site; crate-level allow avoids
+// repetitive SAFETY comments on well-understood libc invocations.
+#![allow(clippy::undocumented_unsafe_blocks)]
+
 mod args;
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 mod banner;

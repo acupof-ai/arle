@@ -63,6 +63,8 @@ fn saxpy_row_major(m: usize, k: usize, n: usize, a: &[f32], b: &[f32]) -> Vec<f3
 
 fn matrixmultiply_row_major(m: usize, k: usize, n: usize, a: &[f32], b: &[f32]) -> Vec<f32> {
     let mut out = vec![0.0f32; m * n];
+    // SAFETY: `a` has at least m*k elements, `b` has at least k*n elements,
+    // and `out` has exactly m*n elements; strides match the row-major layout.
     unsafe {
         matrixmultiply::sgemm(
             m,
