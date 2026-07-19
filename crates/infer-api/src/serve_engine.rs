@@ -387,6 +387,20 @@ impl ServeInferenceEngine<infer_cuda::CudaExecutor, infer_cuda::CudaKvPool> {
         self.serve
             .run_on_executor(|executor| executor.frozen_base_fp8_pointers())?
     }
+
+    /// Hot-swap the DSpark Markov head weights from a host f32 snapshot, then
+    /// drop the now-stale prefix cache. Runs on the engine thread via the
+    /// control seam so the resident weight mutation never races an in-flight
+    /// forward step.
+    pub fn update_dspark_markov_weights(&self, w1: Vec<f32>, w2: Vec<f32>) -> Result<()> {
+        self.serve.run_on_engine(move |engine| {
+            engine
+                .executor_mut()
+                .update_dspark_markov_weights(&w1, &w2)?;
+            engine.invalidate_prefix_cache();
+            Ok(())
+        })?
+    }
 }
 
 // `Send` holds via the auto-trait: `ServeInferenceEngine` stores only a

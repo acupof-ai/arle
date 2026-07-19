@@ -301,7 +301,7 @@ pub fn serve_coordinator_http(
     feature = "vulkan",
     feature = "cpu"
 ))]
-fn bind_and_serve(
+pub fn bind_and_serve(
     bind: &str,
     port: u16,
     router: axum::Router,

@@ -297,3 +297,60 @@ impl<'a> ExperienceSource for InferCudaExperienceSource<'a> {
         self.buf.len()
     }
 }
+
+/// RAII guard for a spawned DSpark RL sidecar training thread.
+///
+/// Dropping the guard signals the training loop to stop and waits for it to
+/// exit. The guard is `Send` so it can live across the serve thread boundary.
+#[cfg(feature = "cuda")]
+pub struct DsparkRlSidecarGuard {
+    running: Arc<AtomicBool>,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(feature = "cuda")]
+impl Drop for DsparkRlSidecarGuard {
+    fn drop(&mut self) {
+        self.running.store(false, Ordering::SeqCst);
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+/// Spawn the DSpark RL sidecar training thread.
+///
+/// Drains the global experience buffer populated by the CUDA inference hot
+/// path, runs REINFORCE updates on the Markov head, and pushes updated weights
+/// back into the running engine via [`LoadedInferenceEngine::update_dspark_markov_weights`].
+///
+/// Returns a guard that stops the thread on drop. No-ops (returns `None`) on
+/// non-CUDA backends or when the experience buffer is unavailable.
+#[cfg(feature = "cuda")]
+pub fn spawn_dspark_rl_sidecar(
+    engine: Arc<infer_api::LoadedInferenceEngine>,
+    config: DsparkRlConfig,
+) -> Result<Option<DsparkRlSidecarGuard>> {
+    let Some(buf) = engine.dspark_experience_buffer() else {
+        return Ok(None);
+    };
+    let source = InferCudaExperienceSource::new(buf);
+    let mut trainer = DsparkRlTrainer::new(config)?;
+    let running = trainer.running_handle();
+
+    let engine_for_thread = Arc::clone(&engine);
+    let join = std::thread::Builder::new()
+        .name("dspark-rl-sidecar".to_string())
+        .spawn(move || {
+            trainer.run_loop(&source, move |w1, w2| {
+                if let Err(e) = engine_for_thread.update_dspark_markov_weights(w1, w2) {
+                    eprintln!("dspark_rl: weight update failed: {e}");
+                }
+            });
+        })?;
+
+    Ok(Some(DsparkRlSidecarGuard {
+        running,
+        join: Some(join),
+    }))
+}

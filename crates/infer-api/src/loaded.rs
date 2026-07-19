@@ -690,6 +690,32 @@ mod backend {
             }
         }
 
+        /// Access the DSpark RL sidecar experience buffer.
+        ///
+        /// Returns `Some` on CUDA backends where the DSpark drafter is active;
+        /// `None` on other backends. The buffer is populated by the inference
+        /// hot path with (draft_tokens, draft_logits, target_logits,
+        /// accepted_count) tuples for test-time training of the draft model.
+        #[cfg(feature = "cuda")]
+        pub fn dspark_experience_buffer(
+            &self,
+        ) -> Option<&'static infer_cuda::DsparkExperienceBuffer> {
+            match self {
+                Self::Cuda(_) => Some(infer_cuda::dspark_experience_buffer()),
+                _ => None,
+            }
+        }
+
+        /// Hot-swap the DSpark Markov head weights from a host f32 snapshot.
+        /// Called by the RL sidecar trainer after each REINFORCE step.
+        #[cfg(feature = "cuda")]
+        pub fn update_dspark_markov_weights(&self, w1: &[f32], w2: &[f32]) -> Result<()> {
+            match self {
+                Self::Cuda(engine) => engine.update_dspark_markov_weights(w1.to_vec(), w2.to_vec()),
+                _ => anyhow::bail!("update_dspark_markov_weights is CUDA-only"),
+            }
+        }
+
         /// Programmatic token-id generation over the serving scheduler/KV path.
         /// OPD uses this for student rollout: one submitted request owns one KV
         /// slot and decodes incrementally until `max_tokens` is reached.

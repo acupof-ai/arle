@@ -56,6 +56,8 @@ pub mod qwen35_loader;
 #[path = "runtime_flags.rs"]
 mod runtime_flags;
 pub use runtime_flags::{TrainRuntimeFlags, apply_runtime_flags};
+#[path = "dspark_rl.rs"]
+pub mod dspark_rl;
 #[path = "rubric.rs"]
 pub mod rubric;
 #[path = "rubric_opd.rs"]

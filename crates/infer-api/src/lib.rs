@@ -79,7 +79,7 @@ pub use serve::{
     feature = "vulkan",
     feature = "cpu"
 ))]
-pub use serve::{ServeThread, serve_router_on_thread};
+pub use serve::{ServeThread, bind_and_serve, serve_router_on_thread};
 pub use serve_engine::ServeInferenceEngine;
 // DSv4 multiproc-serve control-plane relay, re-exported from `infer-server` so
 // the `cli` coordinator/worker scaffold (`cli::serve_multiproc`) reaches it at
@@ -87,9 +87,9 @@ pub use serve_engine::ServeInferenceEngine;
 // the `infer-cuda` re-export pattern above).
 pub use infer_server::{
     BuildIdentity, PendingRelayCoordinator, RelayChannel, RelayCompletionDelta, RelayCoordinator,
-    RelayEnvelope, RelayWorker, SamplingDefaults, TcpChannel, WireRequest, WireStats,
-    build_identity, coordinator_local_router, set_messages_dump_dir, set_sampling_defaults,
-    set_tick_broadcaster,
+    RelayEnvelope, RelayWorker, SamplingDefaults, ServeShutdown, TcpChannel, WireRequest,
+    WireStats, build_identity, coordinator_local_router, set_messages_dump_dir,
+    set_sampling_defaults, set_tick_broadcaster,
 };
 // Per-step student LoRA re-merge contract (OPD P2), re-exported from `infer-cuda`
 // so consumers see them at the `infer-api` surface (mirrors the legacy
@@ -99,8 +99,8 @@ pub use infer_server::{
 pub use infer_cuda::mint_nccl_unique_id_hex;
 #[cfg(feature = "cuda")]
 pub use infer_cuda::{
-    SharedFp8BaseProjection, StudentLoraLayer, StudentLoraMatrices, StudentLoraProjection,
-    StudentLoraProjectionUpdate, StudentLoraUpdate,
+    DsparkExperience, DsparkExperienceBuffer, SharedFp8BaseProjection, StudentLoraLayer,
+    StudentLoraMatrices, StudentLoraProjection, StudentLoraProjectionUpdate, StudentLoraUpdate,
 };
 #[cfg(feature = "metal")]
 pub use infer_metal::recommended_max_working_set_size_bytes as metal_recommended_max_working_set_size_bytes;
