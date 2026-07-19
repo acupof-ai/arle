@@ -343,7 +343,7 @@ pub fn spawn_dspark_rl_sidecar(
         .name("dspark-rl-sidecar".to_string())
         .spawn(move || {
             trainer.run_loop(&source, move |w1, w2| {
-                if let Err(e) = engine_for_thread.update_dspark_markov_weights(w1, w2) {
+                if let Err(e) = engine_for_thread.update_dspark_markov_weights(&w1, &w2) {
                     eprintln!("dspark_rl: weight update failed: {e}");
                 }
             });
