@@ -54,7 +54,7 @@ Raw artifacts: `/host/arle-evidence/dsv4-allon-0c0d148d-20260719T0633Z/`; `SHA25
 
 ## Problems
 
-This fingerprint differs from the stored champion: GPU set `3,5,6,7` instead of `0–3`, 120 instead of 90 seconds, a new source/binary, and no historical dataset SHA. It is not a valid delta. The receipt helper also attempted to create its remote default state directory during a local-only `source-digest`; that side effect is removed in the accompanying fix.
+This fingerprint differs from the stored champion: GPU set `3,5,6,7` instead of `0–3`, 120 instead of 90 seconds, a new source/binary, and no historical dataset SHA. It is not a valid delta. The receipt helper also attempted to create its remote default state directory during a local-only `source-digest`; the warning did not change the digest or sync result. The environment-specific helper change was intentionally not shipped.
 
 ## Learnings
 
