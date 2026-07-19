@@ -1,0 +1,31 @@
+crates/cli/src/train_cli.rs
+  s_466ac8679b39e0::t_5ef8149f920037 3541-3543
+crates/infer-api/src/loaded.rs
+  s_466ac8679b39e0::t_2f90921aed4414 898-919
+crates/infer-api/src/serve_engine.rs
+  s_466ac8679b39e0::t_5dc4d54e786223 82,87-91
+crates/infer-server/src/execution.rs
+  s_466ac8679b39e0::t_fd0f24c6c80784 203-204,217-226,503-544
+crates/train/src/infer_student.rs
+  s_466ac8679b39e0::t_715823c2b7df63 121-122,127
+docs/experience/wins/2026-07-19-bench-opd-quiesce-bracket-safety.md
+  s_466ac8679b39e0::t_feb4665b7ad591 1-41
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "dfdb575a0128333230aab97e8bb56d4df0861cf0",
+  "prompts": {},
+  "sessions": {
+    "s_466ac8679b39e0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a9e033164f8f2d191",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
