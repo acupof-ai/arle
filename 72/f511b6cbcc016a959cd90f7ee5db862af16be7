@@ -1,0 +1,25 @@
+scripts/pick-gpu.sh
+  s_4508cd9a0200fa::t_cda5e5c15d1d19 44
+scripts/pod-remote-run.sh
+  s_4508cd9a0200fa::t_3bf7071288897e 176,186-192,195-196,203-210,215
+scripts/pod.sh
+  s_4508cd9a0200fa::t_28bd09ead8dab7 16-26,104,113,142
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "72f511b6cbcc016a959cd90f7ee5db862af16be7",
+  "prompts": {},
+  "sessions": {
+    "s_4508cd9a0200fa": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ae7eee8667c5f1fd7",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
