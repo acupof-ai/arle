@@ -3835,6 +3835,223 @@ mod tier_io_tests {
         assert!(all_passed, "prep parity failed; report: {out_path}");
     }
 
+    struct AttnProbeGuard(bool);
+
+    impl Drop for AttnProbeGuard {
+        fn drop(&mut self) {
+            if self.0 {
+                crate::qwen35::attn_probe::disarm();
+            }
+        }
+    }
+
+    // CPU reference: RMSNorm+RoPE on K, then causal attention.
+    fn replay_attn(capture: &crate::qwen35::attn_probe::Capture) -> Vec<bf16> {
+        let head_dim = capture.head_dim;
+        let q_dim = capture.num_q_heads * head_dim;
+        let kv_dim = capture.num_kv_heads * head_dim;
+        let gqa = capture.num_q_heads / capture.num_kv_heads;
+        let sm_scale = 1.0 / (head_dim as f32).sqrt();
+        assert_eq!(capture.q_prepped.len(), capture.seq_len * q_dim);
+        assert_eq!(capture.k_raw.len(), capture.seq_len * kv_dim);
+        assert_eq!(capture.v_raw.len(), capture.seq_len * kv_dim);
+        assert_eq!(capture.k_norm.len(), head_dim);
+
+        // RMSNorm + RoPE on K (same as prep kernel)
+        let mut k_roped = vec![0.0f32; capture.seq_len * kv_dim];
+        for token in 0..capture.seq_len {
+            let pos = capture.start_pos as usize + token;
+            for kv_head in 0..capture.num_kv_heads {
+                let src = token * kv_dim + kv_head * head_dim;
+                let sq_sum: f32 = (0..head_dim)
+                    .map(|d| capture.k_raw[src + d].to_f32().powi(2))
+                    .sum();
+                let scale = 1.0 / (sq_sum / head_dim as f32 + capture.rms_eps).sqrt();
+                let normed: Vec<f32> = (0..head_dim)
+                    .map(|d| capture.k_raw[src + d].to_f32() * scale * capture.k_norm[d].to_f32())
+                    .collect();
+                let half_rot = capture.rotary_dim / 2;
+                let dst = token * kv_dim + kv_head * head_dim;
+                for d in 0..head_dim {
+                    k_roped[dst + d] = if d < half_rot {
+                        let cos = capture.cos[pos * capture.rotary_dim + d].to_f32();
+                        let sin = capture.sin[pos * capture.rotary_dim + d].to_f32();
+                        normed[d] * cos - normed[d + half_rot] * sin
+                    } else if d < capture.rotary_dim {
+                        let pair = d - half_rot;
+                        let cos = capture.cos[pos * capture.rotary_dim + pair].to_f32();
+                        let sin = capture.sin[pos * capture.rotary_dim + pair].to_f32();
+                        normed[pair] * sin + normed[d] * cos
+                    } else {
+                        normed[d]
+                    };
+                }
+            }
+        }
+
+        // Causal attention: out[i,h] = sum_{j<=i} softmax(q_i . k_j * sm_scale) * v_j
+        let mut output = Vec::with_capacity(capture.seq_len * q_dim);
+        for token in 0..capture.seq_len {
+            for q_head in 0..capture.num_q_heads {
+                let kv_head = q_head / gqa;
+                let q_base = token * q_dim + q_head * head_dim;
+                let q: Vec<f32> = (0..head_dim)
+                    .map(|d| capture.q_prepped[q_base + d].to_f32())
+                    .collect();
+
+                let mut scores = vec![0.0f32; token + 1];
+                for j in 0..=token {
+                    let k_base = j * kv_dim + kv_head * head_dim;
+                    let dot: f32 = (0..head_dim).map(|d| q[d] * k_roped[k_base + d]).sum();
+                    scores[j] = dot * sm_scale;
+                }
+                // softmax
+                let max_score = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let exp_sum: f32 = scores.iter().map(|s| (s - max_score).exp()).sum();
+                let weights: Vec<f32> = scores
+                    .iter()
+                    .map(|s| (s - max_score).exp() / exp_sum)
+                    .collect();
+
+                let mut out = vec![0.0f32; head_dim];
+                for j in 0..=token {
+                    let v_base = j * kv_dim + kv_head * head_dim;
+                    for d in 0..head_dim {
+                        out[d] += weights[j] * capture.v_raw[v_base + d].to_f32();
+                    }
+                }
+                for d in 0..head_dim {
+                    output.push(bf16::from_f32(out[d]));
+                }
+            }
+        }
+        output
+    }
+
+    fn format_attn_case(
+        name: &str,
+        captures: &[crate::qwen35::attn_probe::Capture],
+    ) -> (String, bool) {
+        use std::fmt::Write;
+
+        let mut report = String::new();
+        let mut cursor = 0;
+        let mut passed = true;
+        for (segment, capture) in captures.iter().enumerate() {
+            let reference = replay_attn(capture);
+            assert_eq!(capture.attn_out.len(), reference.len());
+
+            let mismatch = reference
+                .iter()
+                .zip(&capture.attn_out)
+                .enumerate()
+                .find(|(_, (r, a))| bf16_ulp_distance(**r, **a) > 4)
+                .map(|(index, (r, a))| {
+                    format!(
+                        "attn idx={index} token={} qhead={} d={} reference={:04x} actual={:04x} ulp={}",
+                        index / (capture.num_q_heads * capture.head_dim),
+                        (index % (capture.num_q_heads * capture.head_dim)) / capture.head_dim,
+                        index % capture.head_dim,
+                        r.to_bits(),
+                        a.to_bits(),
+                        bf16_ulp_distance(*r, *a),
+                    )
+                });
+
+            let segment_passed = mismatch.is_none();
+            passed &= segment_passed;
+            writeln!(
+                report,
+                "case={name} segment={segment} cursor={}..{} rows={} qheads={} kheads={} hd={} attn_ulp<=4={} first_mismatch={}",
+                cursor,
+                cursor + capture.seq_len,
+                capture.seq_len,
+                capture.num_q_heads,
+                capture.num_kv_heads,
+                capture.head_dim,
+                mismatch.is_none(),
+                mismatch.unwrap_or_else(|| "none".to_string()),
+            )
+            .unwrap();
+            cursor += capture.seq_len;
+        }
+        (report, passed)
+    }
+
+    #[test]
+    #[ignore = "GPU + Qwen3.6-27B-W4A16 checkpoint; set INFER_QWEN35_ATTN_PROBE_OUT"]
+    fn qwen35_paged_prefill_attn_parity() {
+        let out_path = std::env::var("INFER_QWEN35_ATTN_PROBE_OUT")
+            .expect("INFER_QWEN35_ATTN_PROBE_OUT must name the report path");
+        let model_path = "/tmp/Qwen3.6-27B-W4A16-fixed-d68879e";
+        let total_pages = 16;
+        let mut executor = Qwen35CudaExecutor::from_qwen35_safetensors(
+            model_path,
+            2,
+            total_pages,
+            total_pages * SUPPORTED_PAGE_SIZE,
+            CudaKvCacheDtype::Bf16,
+            0.9,
+            None,
+            0.0,
+            None,
+        )
+        .expect("load Qwen3.6 W4A16 executor");
+        executor.decode_graph_armed = false;
+        assert!(!executor.kv_recall);
+        assert!(executor.dspark.is_none());
+        assert!(executor.mtp.is_none());
+        assert_eq!(executor.kv_format, KVFormat::BF16);
+        let mut report = format!(
+            "model={model_path}\nscope=first_full_attn_per_paged_prefill_segment\nattn_gate=bf16_ulp<=4_after_rmsnorm+rope+causal_attn\n"
+        );
+        let mut all_passed = true;
+
+        for (slot, name, tokens, expected_segments) in [
+            (0, "factual_s33", FACTUAL_S33.as_slice(), &[32][..]),
+            (1, "needle_s75", NEEDLE_S75.as_slice(), &[64, 11][..]),
+        ] {
+            crate::qwen35::attn_probe::arm();
+            let mut guard = AttnProbeGuard(true);
+            executor
+                .submit(&ForwardPlan {
+                    mode: ForwardMode::Prefill,
+                    decode_rows: Vec::new(),
+                    prefill_rows: vec![PrefillRow {
+                        slot,
+                        tokens: tokens.to_vec(),
+                        start_pos: 0,
+                        total_tokens: tokens.len(),
+                        params: SamplingParams {
+                            temperature: 0.0,
+                            top_k: -1,
+                            ..Default::default()
+                        },
+                    }],
+                    microbatch: None,
+                    spec: None,
+                })
+                .expect("production paged prefill");
+            let captures = crate::qwen35::attn_probe::drain();
+            guard.0 = false;
+            assert_eq!(
+                captures.iter().map(|c| c.seq_len).collect::<Vec<_>>(),
+                expected_segments,
+                "{name}: paged prefill segment shape"
+            );
+            let (case_report, passed) = format_attn_case(name, &captures);
+            report.push_str(&case_report);
+            all_passed &= passed;
+        }
+
+        if let Some(parent) = std::path::Path::new(&out_path).parent() {
+            std::fs::create_dir_all(parent).expect("create attn probe report dir");
+        }
+        std::fs::write(&out_path, &report).expect("write attn probe report");
+        eprint!("{report}");
+        assert!(all_passed, "attn parity failed; report: {out_path}");
+    }
+
     #[test]
     fn speculative_chain_boundary_falls_back_before_verify_exceeds_max_seq_len() {
         assert!(speculative_chain_fits(12, 3, 16));
