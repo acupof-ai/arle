@@ -1683,10 +1683,7 @@ mod tests {
         let hidden_data = deterministic_vec(seq * hidden_dim, 7);
         let weight_data = deterministic_vec(vocab * hidden_dim, 11);
         let positions: Vec<i32> = vec![0, 2, 3, 5, 6];
-        let targets: Vec<i32> = positions
-            .iter()
-            .map(|&p| ((p * 5 + 3) % 32) as i32)
-            .collect();
+        let targets: Vec<i32> = positions.iter().map(|&p| (p * 5 + 3) % 32).collect();
         let n = positions.len();
 
         let rollout = model_target_logprobs(
