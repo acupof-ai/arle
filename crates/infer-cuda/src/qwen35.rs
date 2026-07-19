@@ -192,6 +192,167 @@ pub(crate) mod conv_probe {
     }
 }
 
+#[cfg(test)]
+pub(crate) mod gdr_probe {
+    use super::*;
+    use std::cell::RefCell;
+
+    pub(crate) struct Capture {
+        pub(crate) seq_len: usize,
+        pub(crate) num_k_heads: usize,
+        pub(crate) num_v_heads: usize,
+        pub(crate) key_dim: usize,
+        pub(crate) val_dim: usize,
+        pub(crate) qkv: Vec<bf16>,
+        pub(crate) b_proj: Vec<bf16>,
+        pub(crate) a_proj: Vec<bf16>,
+        pub(crate) dt_bias: Vec<bf16>,
+        pub(crate) a_log: Vec<f32>,
+        pub(crate) pre_state: Vec<f32>,
+        pub(crate) output: Vec<bf16>,
+        pub(crate) post_state: Vec<f32>,
+    }
+
+    thread_local! {
+        static CAPTURES: RefCell<Option<Vec<Capture>>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn arm() {
+        CAPTURES.with(|captures| {
+            assert!(
+                captures.replace(Some(Vec::new())).is_none(),
+                "gdr probe already armed"
+            );
+        });
+    }
+
+    pub(crate) fn drain() -> Vec<Capture> {
+        CAPTURES.with(|captures| captures.borrow_mut().take().expect("gdr probe not armed"))
+    }
+
+    pub(crate) fn disarm() {
+        CAPTURES.with(|captures| {
+            captures.borrow_mut().take();
+        });
+    }
+
+    pub(super) struct Pending {
+        seq_len: usize,
+        num_k_heads: usize,
+        num_v_heads: usize,
+        key_dim: usize,
+        val_dim: usize,
+        qkv: Vec<bf16>,
+        b_proj: Vec<bf16>,
+        a_proj: Vec<bf16>,
+        dt_bias: Vec<bf16>,
+        a_log: Vec<f32>,
+        pre_state: Vec<f32>,
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn begin(
+        ctx: &DeviceContext,
+        linear_idx: usize,
+        seq_len: usize,
+        num_k_heads: usize,
+        num_v_heads: usize,
+        key_dim: usize,
+        val_dim: usize,
+        qkv: &CudaSlice<bf16>,
+        b_proj: &CudaSlice<bf16>,
+        a_proj: &CudaSlice<bf16>,
+        dt_bias: &DeviceVec,
+        a_log: &CudaSlice<f32>,
+        state: &CudaSlice<f32>,
+    ) -> Result<Option<Pending>> {
+        let needed = linear_idx == 0 && CAPTURES.with(|captures| captures.borrow().is_some());
+        if !needed {
+            return Ok(None);
+        }
+        let qkv = ctx
+            .stream
+            .clone_dtoh(qkv)
+            .map_err(|e| anyhow!("gdr qkv D2H failed: {e}"))?;
+        let b_proj = ctx
+            .stream
+            .clone_dtoh(b_proj)
+            .map_err(|e| anyhow!("gdr b_proj D2H failed: {e}"))?;
+        let a_proj = ctx
+            .stream
+            .clone_dtoh(a_proj)
+            .map_err(|e| anyhow!("gdr a_proj D2H failed: {e}"))?;
+        let dt_bias = ctx
+            .stream
+            .clone_dtoh(&dt_bias.data)
+            .map_err(|e| anyhow!("gdr dt_bias D2H failed: {e}"))?;
+        let a_log = ctx
+            .stream
+            .clone_dtoh(a_log)
+            .map_err(|e| anyhow!("gdr a_log D2H failed: {e}"))?;
+        let pre_state = ctx
+            .stream
+            .clone_dtoh(state)
+            .map_err(|e| anyhow!("gdr pre-state D2H failed: {e}"))?;
+        ctx.sync()?;
+        Ok(Some(Pending {
+            seq_len,
+            num_k_heads,
+            num_v_heads,
+            key_dim,
+            val_dim,
+            qkv,
+            b_proj,
+            a_proj,
+            dt_bias,
+            a_log,
+            pre_state,
+        }))
+    }
+
+    pub(super) fn finish(
+        ctx: &DeviceContext,
+        pending: Option<Pending>,
+        output: &HiddenStates,
+        state: &CudaSlice<f32>,
+    ) -> Result<()> {
+        let Some(pending) = pending else {
+            return Ok(());
+        };
+        let output = ctx
+            .stream
+            .clone_dtoh(&output.data)
+            .map_err(|e| anyhow!("gdr output D2H failed: {e}"))?;
+        let post_state = ctx
+            .stream
+            .clone_dtoh(state)
+            .map_err(|e| anyhow!("gdr post-state D2H failed: {e}"))?;
+        ctx.sync()?;
+        CAPTURES.with(|captures| {
+            captures
+                .borrow_mut()
+                .as_mut()
+                .expect("gdr probe disarmed during capture")
+                .push(Capture {
+                    seq_len: pending.seq_len,
+                    num_k_heads: pending.num_k_heads,
+                    num_v_heads: pending.num_v_heads,
+                    key_dim: pending.key_dim,
+                    val_dim: pending.val_dim,
+                    qkv: pending.qkv,
+                    b_proj: pending.b_proj,
+                    a_proj: pending.a_proj,
+                    dt_bias: pending.dt_bias,
+                    a_log: pending.a_log,
+                    pre_state: pending.pre_state,
+                    output,
+                    post_state,
+                });
+        });
+        Ok(())
+    }
+}
+
 fn qwen35_profile_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -6351,59 +6512,79 @@ impl Qwen35Model {
         }
         if !use_fq_chunked {
             let gdr_state = &mut slot.gdr_states[linear_idx];
-            let (qkv_ptr, _g0) = qkv_conv.data.device_ptr(&self.ctx.stream);
-            let (b_ptr, _g1) = b_in.device_ptr(&self.ctx.stream);
-            let (a_ptr, _g2) = a_in.device_ptr(&self.ctx.stream);
-            let (dt_ptr, _g3) = attn.dt_bias.data.device_ptr(&self.ctx.stream);
-            let (alog_ptr, _g4) = attn.a_log.device_ptr(&self.ctx.stream);
-            let (s_ptr, _g5) = gdr_state.device_ptr_mut(&self.ctx.stream);
-            let (o_ptr, _g6) = gdr_out.data.device_ptr_mut(&self.ctx.stream);
-            qwen35_profile(
+            #[cfg(test)]
+            let gdr_capture = gdr_probe::begin(
                 &self.ctx,
-                "qwen/linear/gdr_recurrent",
-                Some(linear_idx),
+                linear_idx,
                 seq_len,
-                || {
-                    // SAFETY: all buffers valid on ctx.stream; head dims from config.
-                    unsafe {
-                        if seq_len == 1 {
-                            ffi::gated_delta_rule_decode_cuda(
-                                qkv_ptr as *const ffi::Half,
-                                b_ptr as *const ffi::Half,
-                                a_ptr as *const ffi::Half,
-                                dt_ptr as *const ffi::Half,
-                                alog_ptr as *const f32,
-                                s_ptr as *mut f32,
-                                o_ptr as *mut ffi::Half,
-                                self.local_linear_k_heads as i32,
-                                self.local_linear_v_heads as i32,
-                                c.linear_key_head_dim as i32,
-                                c.linear_value_head_dim as i32,
-                                self.ctx.stream.cu_stream(),
-                            )
-                            .result()?;
-                        } else {
-                            ffi::gated_delta_rule_prefill_recurrent_cuda(
-                                qkv_ptr as *const ffi::Half,
-                                b_ptr as *const ffi::Half,
-                                a_ptr as *const ffi::Half,
-                                dt_ptr as *const ffi::Half,
-                                alog_ptr as *const f32,
-                                s_ptr as *mut f32,
-                                o_ptr as *mut ffi::Half,
-                                self.local_linear_k_heads as i32,
-                                self.local_linear_v_heads as i32,
-                                c.linear_key_head_dim as i32,
-                                c.linear_value_head_dim as i32,
-                                seq_len as i32,
-                                self.ctx.stream.cu_stream(),
-                            )
-                            .result()?;
-                        }
-                    }
-                    Ok(())
-                },
+                self.local_linear_k_heads,
+                self.local_linear_v_heads,
+                c.linear_key_head_dim,
+                c.linear_value_head_dim,
+                &qkv_conv.data,
+                b_in,
+                a_in,
+                &attn.dt_bias,
+                &attn.a_log,
+                gdr_state,
             )?;
+            {
+                let (qkv_ptr, _g0) = qkv_conv.data.device_ptr(&self.ctx.stream);
+                let (b_ptr, _g1) = b_in.device_ptr(&self.ctx.stream);
+                let (a_ptr, _g2) = a_in.device_ptr(&self.ctx.stream);
+                let (dt_ptr, _g3) = attn.dt_bias.data.device_ptr(&self.ctx.stream);
+                let (alog_ptr, _g4) = attn.a_log.device_ptr(&self.ctx.stream);
+                let (s_ptr, _g5) = gdr_state.device_ptr_mut(&self.ctx.stream);
+                let (o_ptr, _g6) = gdr_out.data.device_ptr_mut(&self.ctx.stream);
+                qwen35_profile(
+                    &self.ctx,
+                    "qwen/linear/gdr_recurrent",
+                    Some(linear_idx),
+                    seq_len,
+                    || {
+                        // SAFETY: all buffers valid on ctx.stream; head dims from config.
+                        unsafe {
+                            if seq_len == 1 {
+                                ffi::gated_delta_rule_decode_cuda(
+                                    qkv_ptr as *const ffi::Half,
+                                    b_ptr as *const ffi::Half,
+                                    a_ptr as *const ffi::Half,
+                                    dt_ptr as *const ffi::Half,
+                                    alog_ptr as *const f32,
+                                    s_ptr as *mut f32,
+                                    o_ptr as *mut ffi::Half,
+                                    self.local_linear_k_heads as i32,
+                                    self.local_linear_v_heads as i32,
+                                    c.linear_key_head_dim as i32,
+                                    c.linear_value_head_dim as i32,
+                                    self.ctx.stream.cu_stream(),
+                                )
+                                .result()?;
+                            } else {
+                                ffi::gated_delta_rule_prefill_recurrent_cuda(
+                                    qkv_ptr as *const ffi::Half,
+                                    b_ptr as *const ffi::Half,
+                                    a_ptr as *const ffi::Half,
+                                    dt_ptr as *const ffi::Half,
+                                    alog_ptr as *const f32,
+                                    s_ptr as *mut f32,
+                                    o_ptr as *mut ffi::Half,
+                                    self.local_linear_k_heads as i32,
+                                    self.local_linear_v_heads as i32,
+                                    c.linear_key_head_dim as i32,
+                                    c.linear_value_head_dim as i32,
+                                    seq_len as i32,
+                                    self.ctx.stream.cu_stream(),
+                                )
+                                .result()?;
+                            }
+                        }
+                        Ok(())
+                    },
+                )?;
+            }
+            #[cfg(test)]
+            gdr_probe::finish(&self.ctx, gdr_capture, gdr_out, gdr_state)?;
         }
         Ok(())
     }
