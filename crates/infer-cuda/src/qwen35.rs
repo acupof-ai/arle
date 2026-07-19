@@ -8384,11 +8384,13 @@ fn load_qwen35_mtp_head(
     })
 }
 
-/// Load the final RMSNorm weight and convert it to the trunk's offset
-/// convention `w - 1`. Qwen3.5 ships norms in standard format (centered at 1),
-/// but the trunk's RMSNorm kernels apply `(1 + weight)`; loading the raw weight
-/// would double the effective magnitude. The recurrent/full-attention layer
-/// norms are already stored in offset format; only the final norm needs this.
+/// Load an RMSNorm weight and convert it to the trunk's offset convention
+/// `w - 1`. Qwen3.5 ships ALL norms (input_layernorm, post_attention_layernorm,
+/// final norm, q/k_norm) in standard format (centered at ~1), but the trunk's
+/// `rms_norm_offset` kernels apply `(1 + weight)`; loading the raw weight would
+/// double the effective magnitude (~2x per layer, compounding to garbage).
+/// q/k_norm are the exception: the hd256 prep kernels apply `weight` directly
+/// (STANDARD), so those stay raw.
 fn load_final_norm_offset(
     loader: &SafetensorLoader,
     ctx: &DeviceContext,
