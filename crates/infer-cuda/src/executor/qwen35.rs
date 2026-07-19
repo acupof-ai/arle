@@ -3155,128 +3155,154 @@ mod tier_io_tests {
         248046, 198, 248045, 74455, 198, 248068, 271, 248069, 271,
     ];
 
-    fn format_w4_sampled_projection_case(
+    struct ConvProbeGuard(bool);
+
+    impl Drop for ConvProbeGuard {
+        fn drop(&mut self) {
+            if self.0 {
+                crate::qwen35::conv_probe::disarm();
+            }
+        }
+    }
+
+    fn bf16_ulp_distance(lhs: bf16, rhs: bf16) -> u16 {
+        lhs.to_bits().abs_diff(rhs.to_bits())
+    }
+
+    // conv1d 在 source 位置的输入值：source<0 取 ring buffer (pre_state)，否则取 input。
+    fn conv_input_at(
+        capture: &crate::qwen35::conv_probe::Capture,
+        source: isize,
+        channel: usize,
+        state_width: usize,
+    ) -> bf16 {
+        if source < 0 {
+            capture.pre_state[channel * state_width + (state_width as isize + source) as usize]
+        } else {
+            capture.input[source as usize * capture.channels + channel]
+        }
+    }
+
+    fn replay_conv(capture: &crate::qwen35::conv_probe::Capture) -> (Vec<bf16>, Vec<bf16>) {
+        let state_width = capture.kernel_size - 1;
+        assert_eq!(capture.input.len(), capture.seq_len * capture.channels);
+        assert_eq!(capture.weight.len(), capture.channels * capture.kernel_size);
+        assert_eq!(capture.pre_state.len(), capture.channels * state_width);
+        let mut output = Vec::with_capacity(capture.input.len());
+        for token in 0..capture.seq_len {
+            for channel in 0..capture.channels {
+                let sum = (0..capture.kernel_size).fold(0.0f32, |sum, tap| {
+                    let source = token as isize - state_width as isize + tap as isize;
+                    conv_input_at(capture, source, channel, state_width)
+                        .to_f32()
+                        .mul_add(
+                            capture.weight[channel * capture.kernel_size + tap].to_f32(),
+                            sum,
+                        )
+                });
+                // GPU 在 FMA 累加后、SiLU 前做一次 BF16 舍入，CPU 参考必须复刻。
+                let rounded = bf16::from_f32(sum).to_f32();
+                output.push(bf16::from_f32(rounded / (1.0 + (-rounded).exp())));
+            }
+        }
+        let mut post_state = vec![bf16::ZERO; capture.pre_state.len()];
+        for channel in 0..capture.channels {
+            for ring_slot in 0..state_width {
+                let source = capture.seq_len as isize - state_width as isize + ring_slot as isize;
+                post_state[channel * state_width + ring_slot] =
+                    conv_input_at(capture, source, channel, state_width);
+            }
+        }
+        (output, post_state)
+    }
+
+    fn format_conv_case(
         name: &str,
-        seq_len: usize,
-        captures: &[crate::qwen35::w4_probe::Capture],
+        captures: &[crate::qwen35::conv_probe::Capture],
     ) -> (String, bool) {
-        use crate::qwen35::w4_probe::Projection;
         use std::fmt::Write;
 
-        const MAX_ABS_TOL: f32 = 0.05;
-        const MEAN_ABS_TOL: f64 = 0.01;
-
-        assert_eq!(
-            captures
-                .iter()
-                .map(|capture| capture.projection)
-                .collect::<Vec<_>>(),
-            [
-                Projection::LinearQkv,
-                Projection::FullQ,
-                Projection::FullK,
-                Projection::FullV,
-            ],
-            "{name}: unexpected W4 projection capture order"
-        );
-        let mut report = format!("case={name} seq_len={seq_len}\n");
+        let mut report = String::new();
+        let mut cursor = 0;
         let mut passed = true;
-        for capture in captures {
-            assert_eq!(capture.seq_len, seq_len);
-            assert_eq!(capture.packed_weight.len(), capture.rows * capture.cols / 2);
-            assert_eq!(capture.input.len(), seq_len * capture.cols);
-            assert_eq!(capture.output.len(), seq_len * capture.rows);
-            assert!(capture.rows >= 64);
-            assert!(capture.group_size > 0);
-            assert_eq!(capture.cols % capture.group_size, 0);
-            let groups = capture.cols / capture.group_size;
-            assert_eq!(capture.scales.len(), capture.rows * groups);
-
-            let rows = (0..64)
-                .map(|i| i * (capture.rows - 1) / 63)
-                .collect::<Vec<_>>();
-            let mut max_abs = 0.0f64;
-            let mut sum_abs = 0.0f64;
-            let mut dot = 0.0f64;
-            let mut ref_norm = 0.0f64;
-            let mut got_norm = 0.0f64;
-            let mut first_violation = None;
-            let mut non_finite = 0usize;
-            let mut count = 0usize;
-            for token in 0..seq_len {
-                let input = &capture.input[token * capture.cols..(token + 1) * capture.cols];
-                for &row in &rows {
-                    let reference = bf16::from_f32(input.iter().enumerate().fold(
-                        0.0f32,
-                        |sum, (col, activation)| {
-                            let packed = capture.packed_weight[row * capture.cols / 2 + col / 2];
-                            let q = if col.is_multiple_of(2) {
-                                packed & 0x0f
-                            } else {
-                                packed >> 4
-                            };
-                            let scale =
-                                capture.scales[row * groups + col / capture.group_size].to_f32();
-                            sum + (f32::from(q) - 8.0) * scale * activation.to_f32()
-                        },
-                    ))
-                    .to_f32();
-                    let actual = capture.output[token * capture.rows + row].to_f32();
-                    if !reference.is_finite() || !actual.is_finite() {
-                        non_finite += 1;
-                    }
-                    let abs = (reference - actual).abs();
-                    if first_violation.is_none() && (!abs.is_finite() || abs >= MAX_ABS_TOL) {
-                        first_violation = Some((token, row, reference, actual, abs));
-                    }
-                    max_abs = max_abs.max(f64::from(abs));
-                    sum_abs += f64::from(abs);
-                    dot += f64::from(reference) * f64::from(actual);
-                    ref_norm += f64::from(reference).powi(2);
-                    got_norm += f64::from(actual).powi(2);
-                    count += 1;
-                }
-            }
-            let mean_abs = sum_abs / count as f64;
-            let cosine = if ref_norm > 0.0 && got_norm > 0.0 {
-                dot / (ref_norm.sqrt() * got_norm.sqrt())
-            } else {
-                1.0
-            };
-            let projection_passed =
-                non_finite == 0 && max_abs < f64::from(MAX_ABS_TOL) && mean_abs < MEAN_ABS_TOL;
-            passed &= projection_passed;
+        for (segment, capture) in captures.iter().enumerate() {
+            let (reference_output, reference_state) = replay_conv(capture);
+            assert_eq!(capture.output.len(), reference_output.len());
+            assert_eq!(capture.post_state.len(), reference_state.len());
+            let state_width = capture.kernel_size - 1;
+            let output_mismatch = reference_output
+                .iter()
+                .zip(&capture.output)
+                .enumerate()
+                .find(|(_, (reference, actual))| bf16_ulp_distance(**reference, **actual) > 1)
+                .map(|(index, (reference, actual))| {
+                    let token = index / capture.channels;
+                    let channel = index % capture.channels;
+                    let taps = (0..capture.kernel_size)
+                        .map(|tap| {
+                            let source = token as isize - state_width as isize + tap as isize;
+                            let input = conv_input_at(capture, source, channel, state_width);
+                            format!(
+                                "{tap}:{source}:{:04x}:{:04x}",
+                                input.to_bits(),
+                                capture.weight[channel * capture.kernel_size + tap].to_bits(),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    format!(
+                        "output token={token} channel={channel} taps=tap:source:input:weight[{taps}] reference={:04x} actual={:04x} ulp={}",
+                        reference.to_bits(),
+                        actual.to_bits(),
+                        bf16_ulp_distance(*reference, *actual),
+                    )
+                });
+            let state_mismatch = reference_state
+                .iter()
+                .zip(&capture.post_state)
+                .enumerate()
+                .find(|(_, (reference, actual))| reference.to_bits() != actual.to_bits())
+                .map(|(index, (reference, actual))| {
+                    format!(
+                        "state token=- channel={} ring_slot={} reference={:04x} actual={:04x}",
+                        index / state_width,
+                        index % state_width,
+                        reference.to_bits(),
+                        actual.to_bits(),
+                    )
+                });
+            let segment_passed = output_mismatch.is_none() && state_mismatch.is_none();
+            passed &= segment_passed;
             writeln!(
                 report,
-                "projection={:?} rows={} cols={} group_size={} sampled_rows=64 max_abs={:.8} mean_abs={:.8} cosine={:.10} non_finite={} first_violation={:?} passed={}",
-                capture.projection,
-                capture.rows,
-                capture.cols,
-                capture.group_size,
-                max_abs,
-                mean_abs,
-                cosine,
-                non_finite,
-                first_violation,
-                projection_passed,
+                "case={name} segment={segment} cursor={}..{} rows={} channels={} kernel={} output_ulp<=1={} state_exact={} first_mismatch={}",
+                cursor,
+                cursor + capture.seq_len,
+                capture.seq_len,
+                capture.channels,
+                capture.kernel_size,
+                output_mismatch.is_none(),
+                state_mismatch.is_none(),
+                output_mismatch
+                    .or(state_mismatch)
+                    .unwrap_or_else(|| "none".to_string()),
             )
             .unwrap();
+            cursor += capture.seq_len;
         }
         (report, passed)
     }
 
     #[test]
-    #[ignore = "GPU + Qwen3.6-27B-W4A16 checkpoint; set INFER_QWEN35_W4_PROBE_OUT"]
-    fn qwen35_w4_sampled_projection_parity() {
-        let Ok(out_path) = std::env::var("INFER_QWEN35_W4_PROBE_OUT") else {
-            return;
-        };
-        let model_path = std::env::var("INFER_QWEN35_W4_PROBE_MODEL")
-            .unwrap_or_else(|_| "/tmp/Qwen3.6-27B-W4A16-fixed-d68879e".to_string());
+    #[ignore = "GPU + Qwen3.6-27B-W4A16 checkpoint; set INFER_QWEN35_CONV_PROBE_OUT"]
+    fn qwen35_paged_prefill_conv_parity() {
+        let out_path = std::env::var("INFER_QWEN35_CONV_PROBE_OUT")
+            .expect("INFER_QWEN35_CONV_PROBE_OUT must name the report path");
+        let model_path = "/tmp/Qwen3.6-27B-W4A16-fixed-d68879e";
         let total_pages = 16;
         let mut executor = Qwen35CudaExecutor::from_qwen35_safetensors(
-            &model_path,
-            1,
+            model_path,
+            2,
             total_pages,
             total_pages * SUPPORTED_PAGE_SIZE,
             CudaKvCacheDtype::Bf16,
@@ -3292,67 +3318,60 @@ mod tier_io_tests {
         assert!(executor.mtp.is_none());
         assert_eq!(executor.kv_format, KVFormat::BF16);
         let mut report = format!(
-            "model={model_path}\nscope=sampled_first_projection_occurrence\nmax_abs_tolerance=0.05\nmean_abs_tolerance=0.01\n"
+            "model={model_path}\nscope=first_linear_conv_per_paged_prefill_segment\noutput_gate=bf16_ulp<=1_after_fp32_fma,bf16_round,silu\nstate_gate=bit_exact\n"
         );
         let mut all_passed = true;
 
-        for (name, tokens) in [
-            ("factual_s33", FACTUAL_S33.as_slice()),
-            ("needle_s75", NEEDLE_S75.as_slice()),
+        for (slot, name, tokens, expected_segments) in [
+            (0, "factual_s33", FACTUAL_S33.as_slice(), &[32, 1][..]),
+            (1, "needle_s75", NEEDLE_S75.as_slice(), &[64, 11][..]),
         ] {
-            let (prior_len, prior_epoch) = {
-                let pool = executor.full_attn_kv.as_ref().expect("paged KV pool");
-                (pool.seq_len(0), pool.slot_epoch(0))
-            };
-            crate::qwen35::w4_probe::arm();
-            let submit = executor.submit(&ForwardPlan {
-                mode: ForwardMode::Prefill,
-                decode_rows: Vec::new(),
-                prefill_rows: vec![PrefillRow {
-                    slot: 0,
-                    tokens: tokens.to_vec(),
-                    start_pos: 0,
-                    total_tokens: tokens.len(),
-                    params: SamplingParams {
-                        temperature: 0.0,
-                        top_k: -1,
-                        ..Default::default()
-                    },
-                }],
-                microbatch: None,
-                spec: None,
-            });
-            submit.expect("actual paged prefill");
-            let captures = crate::qwen35::w4_probe::drain();
+            crate::qwen35::conv_probe::arm();
+            let mut guard = ConvProbeGuard(true);
+            executor
+                .submit(&ForwardPlan {
+                    mode: ForwardMode::Prefill,
+                    decode_rows: Vec::new(),
+                    prefill_rows: vec![PrefillRow {
+                        slot,
+                        tokens: tokens.to_vec(),
+                        start_pos: 0,
+                        total_tokens: tokens.len(),
+                        params: SamplingParams {
+                            temperature: 0.0,
+                            top_k: -1,
+                            ..Default::default()
+                        },
+                    }],
+                    microbatch: None,
+                    spec: None,
+                })
+                .expect("production paged prefill");
+            let captures = crate::qwen35::conv_probe::drain();
+            guard.0 = false;
+            assert_eq!(
+                captures
+                    .iter()
+                    .map(|capture| capture.seq_len)
+                    .collect::<Vec<_>>(),
+                expected_segments,
+                "{name}: paged prefill segment shape"
+            );
             let pool = executor.full_attn_kv.as_ref().expect("paged KV pool");
-            assert_eq!(pool.seq_len(0), tokens.len());
-            assert_eq!(
-                pool.page_indices(0).len(),
-                tokens.len().div_ceil(SUPPORTED_PAGE_SIZE)
-            );
-            assert_eq!(
-                pool.slot_epoch(0),
-                prior_epoch + usize::from(prior_len > 0) as u64
-            );
-            assert_eq!(executor.slots[0].seq_len(), tokens.len());
-            assert!(executor.slots[0].has_recurrent());
-            assert_eq!(
-                captures.len(),
-                4,
-                "{name}: expected linear qkv + full q/k/v captures"
-            );
-            let (case_report, passed) =
-                format_w4_sampled_projection_case(name, tokens.len(), &captures);
+            assert_eq!(pool.seq_len(slot), tokens.len());
+            assert_eq!(executor.slots[slot].seq_len(), tokens.len());
+            assert!(executor.slots[slot].has_recurrent());
+            let (case_report, passed) = format_conv_case(name, &captures);
             report.push_str(&case_report);
             all_passed &= passed;
         }
 
-        std::fs::write(&out_path, &report).expect("write W4 probe report");
+        if let Some(parent) = std::path::Path::new(&out_path).parent() {
+            std::fs::create_dir_all(parent).expect("create conv probe report dir");
+        }
+        std::fs::write(&out_path, &report).expect("write conv probe report");
         eprint!("{report}");
-        assert!(
-            all_passed,
-            "W4 actual-activation parity failed; report: {out_path}"
-        );
+        assert!(all_passed, "conv parity failed; report: {out_path}");
     }
 
     #[test]
