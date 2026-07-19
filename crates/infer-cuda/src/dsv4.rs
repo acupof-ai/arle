@@ -2430,6 +2430,7 @@ impl Dsv4Model {
         &self,
         requested: usize,
         max_seq_len: usize,
+        extra_per_slot_bytes: usize,
     ) -> Result<Dsv4KvBudgetPlan> {
         // NO term here for the prefix-state pool (#154 Phase 2): it is
         // host-DRAM-resident by design (`attention/prefix_state.rs`), funded
@@ -2578,7 +2579,8 @@ impl Dsv4Model {
         };
         let per_slot = slot_state_bytes
             .saturating_add(dsa_key_cache_per_slot)
-            .saturating_add(dsa_batched_per_slot);
+            .saturating_add(dsa_batched_per_slot)
+            .saturating_add(extra_per_slot_bytes);
         let (affordable_local, budget_bytes_local): (i32, usize) =
             match cudarc::driver::result::mem_get_info() {
                 Ok((free, _total)) => {

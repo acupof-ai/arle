@@ -254,7 +254,7 @@ pub(crate) struct DsparkScratch {
     attn_heads: HiddenSlot,
     dense: DenseMlpScratch,
     final_normed: HiddenSlot,
-    logits: HiddenSlot,
+    pub(crate) logits: HiddenSlot,
     feat_a: HiddenSlot,
     feat_b: HiddenSlot,
     feat_rows: HiddenSlot,
