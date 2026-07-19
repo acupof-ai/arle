@@ -125,8 +125,8 @@ The **128-assuming** code paths (the real Phase-2 work):
 - **Config honesty**: `--chunked-prefill-size` becomes real for DSv4 (clamped, warned), planner cap derived from an honest executor capability instead of two disagreeing hard-codes.
 
 ### Critical Files for Implementation
-- /Users/bytedance/code/agent-infer/crates/infer-core/src/planner.rs
-- /Users/bytedance/code/agent-infer/crates/infer-api/src/loaded.rs
-- /Users/bytedance/code/agent-infer/crates/infer-cuda/src/executor/dsv4.rs
-- /Users/bytedance/code/agent-infer/crates/infer-seam/src/lib.rs
-- /Users/bytedance/code/agent-infer/crates/infer-cuda/src/attention.rs (plus `crates/cuda-kernels/csrc/attention/dsv4_swa.cu` for the ring-race fix)
+- `crates/infer-core/src/planner.rs`
+- `crates/infer-api/src/loaded.rs`
+- `crates/infer-cuda/src/executor/dsv4.rs`
+- `crates/infer-seam/src/lib.rs`
+- `crates/infer-cuda/src/attention.rs` (plus `crates/cuda-kernels/csrc/attention/dsv4_swa.cu` for the ring-race fix)
