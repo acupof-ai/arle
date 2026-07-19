@@ -1,0 +1,31 @@
+docs/experience/wins/2026-07-17-qwen36-rotary-fa3-gates.md
+  s_cf85c4aa2b402d::t_d5e3f15c968bac 54-57
+docs/experience/wins/2026-07-19-dsv4-production-all-on-tp4-anchor.md
+  s_d6adcec6a0a6d3::t_8e97f00e9de84b 57
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "511512ac6b5bc9ef7ea32c68a00369fc7d83c277",
+  "prompts": {},
+  "sessions": {
+    "s_cf85c4aa2b402d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aaf7b5ebcc813a682",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_d6adcec6a0a6d3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dc64a0b5-493b-4e08-a5cf-392205926291",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
