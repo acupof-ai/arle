@@ -1,0 +1,23 @@
+crates/infer-cuda/src/executor/dsv4.rs
+  s_d6adcec6a0a6d3::t_afe7226dd34cfd 1916-1919,1923-1925,1927,1929,1931-1932
+crates/infer-cuda/src/executor/spec_decode.rs
+  s_d6adcec6a0a6d3::t_29736f710391cf 220-242,412-413,442-464,467-476,644,646,649
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "13426a8de7c1436b037f89c3dff1fedbe0029d27",
+  "prompts": {},
+  "sessions": {
+    "s_d6adcec6a0a6d3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dc64a0b5-493b-4e08-a5cf-392205926291",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
