@@ -1994,6 +1994,20 @@ impl Qwen35CudaExecutor {
                 &row.params,
             )?
         };
+        // 4b. RL sidecar: capture (draft_tokens, draft_logits, target_logits,
+        //     accepted) for the asynchronous REINFORCE trainer. The draft
+        //     logits live in `scratch.logits` from the draft step; greedy path
+        //     leaves them intact. Sampling path may overwrite — capture is
+        //     best-effort and skips when unavailable.
+        if let Some(draft_logits) = ds.scratch.logits.as_ref() {
+            super::dspark_rl::capture_dspark_experience(
+                &model.ctx,
+                &chain,
+                draft_logits,
+                &logits,
+                k,
+            );
+        }
         drop(rc);
         if k + 1 < chain.len() {
             full_attn_kv
@@ -3134,6 +3148,21 @@ impl Qwen35CudaExecutor {
         self.ensure_not_collective("frozen_base_fp8_pointers")?;
         self.model.frozen_base_fp8_pointers()
     }
+
+    /// Hot-swap the DSpark Markov head weights from a host f32 snapshot.
+    ///
+    /// Called by the RL sidecar trainer after each REINFORCE step. Invalidates
+    /// the decode graph (which bakes the old weight pointers) and updates the
+    /// resident `markov_w1` / `markov_w2` device buffers in place.
+    pub(crate) fn update_dspark_markov_weights(&mut self, w1: &[f32], w2: &[f32]) -> Result<()> {
+        self.ensure_not_collective("update_dspark_markov_weights")?;
+        self.decode_graph = None;
+        let dspark = self
+            .dspark
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("DSpark head not loaded"))?;
+        dspark.head.update_markov_weights(&self.model.ctx, w1, w2)
+    }
 }
 
 #[cfg(test)]
@@ -3618,6 +3647,191 @@ mod tier_io_tests {
         std::fs::write(&out_path, &report).expect("write gdr probe report");
         eprint!("{report}");
         assert!(all_passed, "gdr parity failed; report: {out_path}");
+    }
+
+    struct PrepProbeGuard(bool);
+
+    impl Drop for PrepProbeGuard {
+        fn drop(&mut self) {
+            if self.0 {
+                crate::qwen35::prep_probe::disarm();
+            }
+        }
+    }
+
+    // 复刻 prefill_attention_paged_hd256_kernel 的 Q path: RMSNorm + partial RoPE。
+    fn replay_prep_q(capture: &crate::qwen35::prep_probe::Capture) -> Vec<bf16> {
+        let head_dim = capture.head_dim;
+        let q_dim = capture.num_q_heads * head_dim;
+        let q_full_dim = q_dim * 2; // q_full 含 [query; gate]
+        assert_eq!(capture.q_full.len(), capture.seq_len * q_full_dim);
+        assert_eq!(capture.q_norm.len(), head_dim);
+        assert_eq!(capture.q_prepped.len(), capture.seq_len * q_dim);
+
+        let mut output = Vec::with_capacity(capture.seq_len * q_dim);
+        for token in 0..capture.seq_len {
+            let pos = capture.start_pos as usize + token;
+            for q_head in 0..capture.num_q_heads {
+                let q_src = token * q_full_dim + q_head * head_dim * 2;
+                let q_dst = token * q_dim + q_head * head_dim;
+
+                // RMSNorm: scale = 1/sqrt(mean(x^2) + eps)
+                let sq_sum: f32 = (0..head_dim)
+                    .map(|d| capture.q_full[q_src + d].to_f32().powi(2))
+                    .sum();
+                let scale = 1.0 / (sq_sum / head_dim as f32 + capture.rms_eps).sqrt();
+
+                let normed: Vec<f32> = (0..head_dim)
+                    .map(|d| {
+                        capture.q_full[q_src + d].to_f32() * scale * capture.q_norm[d].to_f32()
+                    })
+                    .collect();
+
+                // Partial RoPE: 只对前 rotary_dim 维旋转
+                let half_rot = capture.rotary_dim / 2;
+                for d in 0..head_dim {
+                    let val = if d < half_rot {
+                        let cos = capture.cos[pos * capture.rotary_dim + d].to_f32();
+                        let sin = capture.sin[pos * capture.rotary_dim + d].to_f32();
+                        normed[d] * cos - normed[d + half_rot] * sin
+                    } else if d < capture.rotary_dim {
+                        let pair = d - half_rot;
+                        let cos = capture.cos[pos * capture.rotary_dim + pair].to_f32();
+                        let sin = capture.sin[pos * capture.rotary_dim + pair].to_f32();
+                        normed[pair] * sin + normed[d] * cos
+                    } else {
+                        normed[d]
+                    };
+                    output.push(bf16::from_f32(val));
+                }
+            }
+        }
+        output
+    }
+
+    fn format_prep_case(
+        name: &str,
+        captures: &[crate::qwen35::prep_probe::Capture],
+    ) -> (String, bool) {
+        use std::fmt::Write;
+
+        let mut report = String::new();
+        let mut cursor = 0;
+        let mut passed = true;
+        for (segment, capture) in captures.iter().enumerate() {
+            let reference = replay_prep_q(capture);
+            assert_eq!(capture.q_prepped.len(), reference.len());
+
+            let mismatch = reference
+                .iter()
+                .zip(&capture.q_prepped)
+                .enumerate()
+                .find(|(_, (r, a))| bf16_ulp_distance(**r, **a) > 2)
+                .map(|(index, (r, a))| {
+                    format!(
+                        "q idx={index} token={} qhead={} d={} reference={:04x} actual={:04x} ulp={}",
+                        index / (capture.num_q_heads * capture.head_dim),
+                        (index % (capture.num_q_heads * capture.head_dim)) / capture.head_dim,
+                        index % capture.head_dim,
+                        r.to_bits(),
+                        a.to_bits(),
+                        bf16_ulp_distance(*r, *a),
+                    )
+                });
+
+            let segment_passed = mismatch.is_none();
+            passed &= segment_passed;
+            writeln!(
+                report,
+                "case={name} segment={segment} cursor={}..{} rows={} qheads={} kheads={} hd={} rot={} q_ulp<=2={} first_mismatch={}",
+                cursor,
+                cursor + capture.seq_len,
+                capture.seq_len,
+                capture.num_q_heads,
+                capture.num_kv_heads,
+                capture.head_dim,
+                capture.rotary_dim,
+                mismatch.is_none(),
+                mismatch.unwrap_or_else(|| "none".to_string()),
+            )
+            .unwrap();
+            cursor += capture.seq_len;
+        }
+        (report, passed)
+    }
+
+    #[test]
+    #[ignore = "GPU + Qwen3.6-27B-W4A16 checkpoint; set INFER_QWEN35_PREP_PROBE_OUT"]
+    fn qwen35_paged_prefill_prep_parity() {
+        let out_path = std::env::var("INFER_QWEN35_PREP_PROBE_OUT")
+            .expect("INFER_QWEN35_PREP_PROBE_OUT must name the report path");
+        let model_path = "/tmp/Qwen3.6-27B-W4A16-fixed-d68879e";
+        let total_pages = 16;
+        let mut executor = Qwen35CudaExecutor::from_qwen35_safetensors(
+            model_path,
+            2,
+            total_pages,
+            total_pages * SUPPORTED_PAGE_SIZE,
+            CudaKvCacheDtype::Bf16,
+            0.9,
+            None,
+            0.0,
+            None,
+        )
+        .expect("load Qwen3.6 W4A16 executor");
+        executor.decode_graph_armed = false;
+        assert!(!executor.kv_recall);
+        assert!(executor.dspark.is_none());
+        assert!(executor.mtp.is_none());
+        assert_eq!(executor.kv_format, KVFormat::BF16);
+        let mut report = format!(
+            "model={model_path}\nscope=first_full_attn_prep_per_paged_prefill_segment\nq_gate=bf16_ulp<=2_after_rmsnorm+partial_rope\n"
+        );
+        let mut all_passed = true;
+
+        for (slot, name, tokens, expected_segments) in [
+            (0, "factual_s33", FACTUAL_S33.as_slice(), &[32, 1][..]),
+            (1, "needle_s75", NEEDLE_S75.as_slice(), &[64, 11][..]),
+        ] {
+            crate::qwen35::prep_probe::arm();
+            let mut guard = PrepProbeGuard(true);
+            executor
+                .submit(&ForwardPlan {
+                    mode: ForwardMode::Prefill,
+                    decode_rows: Vec::new(),
+                    prefill_rows: vec![PrefillRow {
+                        slot,
+                        tokens: tokens.to_vec(),
+                        start_pos: 0,
+                        total_tokens: tokens.len(),
+                        params: SamplingParams {
+                            temperature: 0.0,
+                            top_k: -1,
+                            ..Default::default()
+                        },
+                    }],
+                    microbatch: None,
+                    spec: None,
+                })
+                .expect("production paged prefill");
+            let captures = crate::qwen35::prep_probe::drain();
+            guard.0 = false;
+            assert_eq!(
+                captures.iter().map(|c| c.seq_len).collect::<Vec<_>>(),
+                expected_segments,
+                "{name}: paged prefill segment shape"
+            );
+            let (case_report, passed) = format_prep_case(name, &captures);
+            report.push_str(&case_report);
+            all_passed &= passed;
+        }
+
+        if let Some(parent) = std::path::Path::new(&out_path).parent() {
+            std::fs::create_dir_all(parent).expect("create prep probe report dir");
+        }
+        std::fs::write(&out_path, &report).expect("write prep probe report");
+        eprint!("{report}");
+        assert!(all_passed, "prep parity failed; report: {out_path}");
     }
 
     #[test]

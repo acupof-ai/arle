@@ -353,6 +353,174 @@ pub(crate) mod gdr_probe {
     }
 }
 
+#[cfg(test)]
+pub(crate) mod prep_probe {
+    use super::*;
+    use std::cell::RefCell;
+
+    pub(crate) struct Capture {
+        pub(crate) seq_len: usize,
+        pub(crate) num_q_heads: usize,
+        pub(crate) num_kv_heads: usize,
+        pub(crate) head_dim: usize,
+        pub(crate) rotary_dim: usize,
+        pub(crate) rms_eps: f32,
+        pub(crate) start_pos: i32,
+        pub(crate) q_full: Vec<bf16>,
+        pub(crate) k_batch: Vec<bf16>,
+        pub(crate) q_norm: Vec<bf16>,
+        pub(crate) k_norm: Vec<bf16>,
+        pub(crate) cos: Vec<bf16>,
+        pub(crate) sin: Vec<bf16>,
+        pub(crate) q_prepped: Vec<bf16>,
+    }
+
+    thread_local! {
+        static CAPTURES: RefCell<Option<Vec<Capture>>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn arm() {
+        CAPTURES.with(|captures| {
+            assert!(
+                captures.replace(Some(Vec::new())).is_none(),
+                "prep probe already armed"
+            );
+        });
+    }
+
+    pub(crate) fn drain() -> Vec<Capture> {
+        CAPTURES.with(|captures| captures.borrow_mut().take().expect("prep probe not armed"))
+    }
+
+    pub(crate) fn disarm() {
+        CAPTURES.with(|captures| {
+            captures.borrow_mut().take();
+        });
+    }
+
+    pub(super) struct Pending {
+        seq_len: usize,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        rotary_dim: usize,
+        rms_eps: f32,
+        start_pos: i32,
+        q_full: Vec<bf16>,
+        k_batch: Vec<bf16>,
+        q_norm: Vec<bf16>,
+        k_norm: Vec<bf16>,
+        cos: Vec<bf16>,
+        sin: Vec<bf16>,
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn begin(
+        ctx: &DeviceContext,
+        full_idx: usize,
+        seq_len: usize,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        rotary_dim: usize,
+        rms_eps: f32,
+        q_full: &CudaSlice<bf16>,
+        k_batch: &CudaSlice<bf16>,
+        q_norm: &DeviceVec,
+        k_norm: &DeviceVec,
+        cos: &DeviceVec,
+        sin: &DeviceVec,
+        start_pos: &CudaSlice<i32>,
+    ) -> Result<Option<Pending>> {
+        let needed = full_idx == 0 && CAPTURES.with(|captures| captures.borrow().is_some());
+        if !needed {
+            return Ok(None);
+        }
+        let q_full = ctx
+            .stream
+            .clone_dtoh(q_full)
+            .map_err(|e| anyhow!("prep q_full D2H failed: {e}"))?;
+        let k_batch = ctx
+            .stream
+            .clone_dtoh(k_batch)
+            .map_err(|e| anyhow!("prep k_batch D2H failed: {e}"))?;
+        let q_norm = ctx
+            .stream
+            .clone_dtoh(&q_norm.data)
+            .map_err(|e| anyhow!("prep q_norm D2H failed: {e}"))?;
+        let k_norm = ctx
+            .stream
+            .clone_dtoh(&k_norm.data)
+            .map_err(|e| anyhow!("prep k_norm D2H failed: {e}"))?;
+        let cos = ctx
+            .stream
+            .clone_dtoh(&cos.data)
+            .map_err(|e| anyhow!("prep cos D2H failed: {e}"))?;
+        let sin = ctx
+            .stream
+            .clone_dtoh(&sin.data)
+            .map_err(|e| anyhow!("prep sin D2H failed: {e}"))?;
+        let start_pos = ctx
+            .stream
+            .clone_dtoh(start_pos)
+            .map_err(|e| anyhow!("prep start_pos D2H failed: {e}"))?;
+        ctx.sync()?;
+        Ok(Some(Pending {
+            seq_len,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            rotary_dim,
+            rms_eps,
+            start_pos: start_pos[0],
+            q_full,
+            k_batch,
+            q_norm,
+            k_norm,
+            cos,
+            sin,
+        }))
+    }
+
+    pub(super) fn finish(
+        ctx: &DeviceContext,
+        pending: Option<Pending>,
+        q_prepped: &HiddenStates,
+    ) -> Result<()> {
+        let Some(pending) = pending else {
+            return Ok(());
+        };
+        let q_prepped = ctx
+            .stream
+            .clone_dtoh(&q_prepped.data)
+            .map_err(|e| anyhow!("prep q_prepped D2H failed: {e}"))?;
+        ctx.sync()?;
+        CAPTURES.with(|captures| {
+            captures
+                .borrow_mut()
+                .as_mut()
+                .expect("prep probe disarmed during capture")
+                .push(Capture {
+                    seq_len: pending.seq_len,
+                    num_q_heads: pending.num_q_heads,
+                    num_kv_heads: pending.num_kv_heads,
+                    head_dim: pending.head_dim,
+                    rotary_dim: pending.rotary_dim,
+                    rms_eps: pending.rms_eps,
+                    start_pos: pending.start_pos,
+                    q_full: pending.q_full,
+                    k_batch: pending.k_batch,
+                    q_norm: pending.q_norm,
+                    k_norm: pending.k_norm,
+                    cos: pending.cos,
+                    sin: pending.sin,
+                    q_prepped,
+                });
+        });
+        Ok(())
+    }
+}
+
 fn qwen35_profile_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -5806,6 +5974,28 @@ impl Qwen35Model {
 
         // ── 1. Prep: q/k RMSNorm + RoPE; write K/V into the pool's tail page. ──
         {
+            #[cfg(test)]
+            let prep_capture = if !decode {
+                prep_probe::begin(
+                    &self.ctx,
+                    full_idx,
+                    seq_len,
+                    self.local_q_heads,
+                    self.local_kv_heads,
+                    c.head_dim,
+                    c.rotary_dim,
+                    c.rms_norm_eps,
+                    &q_full.data,
+                    &k_batch.data,
+                    &attn.q_norm,
+                    &attn.k_norm,
+                    &self.cos_cache,
+                    &self.sin_cache,
+                    &rc.meta.start_positions,
+                )?
+            } else {
+                None
+            };
             let (qf_ptr, _g0) = q_full.data.device_ptr(&self.ctx.stream);
             let (k_ptr, _g1) = k_batch.data.device_ptr(&self.ctx.stream);
             let (v_ptr, _g2) = v_batch.data.device_ptr(&self.ctx.stream);
@@ -5813,74 +6003,78 @@ impl Qwen35Model {
             let (kn_ptr, _g4) = attn.k_norm.data.device_ptr(&self.ctx.stream);
             let (cos_ptr, _g5) = self.cos_cache.data.device_ptr(&self.ctx.stream);
             let (sin_ptr, _g6) = self.sin_cache.data.device_ptr(&self.ctx.stream);
-            let (qp_ptr, _g7) = q_prepped.data.device_ptr_mut(&self.ctx.stream);
             let (positions_ptr, _gp) = rc.meta.positions.device_ptr(&self.ctx.stream);
             let (kv_indices_ptr, _gi) = rc.meta.kv_indices.device_ptr(&self.ctx.stream);
             let (kv_indptr_ptr, _gpi) = rc.meta.kv_indptr.device_ptr(&self.ctx.stream);
             let (last_page_len_ptr, _gl) = rc.meta.kv_last_page_len.device_ptr(&self.ctx.stream);
             let (start_pos_ptr, _gs) = rc.meta.start_positions.device_ptr(&self.ctx.stream);
-            qwen35_profile(
-                &self.ctx,
-                "qwen/full_paged/prep",
-                Some(full_idx),
-                seq_len,
-                || {
-                    // SAFETY: all buffers valid on ctx.stream; pool tail page allocated.
-                    unsafe {
-                        if decode {
-                            ffi::decode_prep_paged_hd256_cuda(
-                                qf_ptr as *const ffi::Half,
-                                qp_ptr as *mut ffi::Half,
-                                k_ptr as *const ffi::Half,
-                                v_ptr as *const ffi::Half,
-                                qn_ptr as *const ffi::Half,
-                                kn_ptr as *const ffi::Half,
-                                cos_ptr as *const ffi::Half,
-                                sin_ptr as *const ffi::Half,
-                                positions_ptr as *const i32,
-                                k_pool_ptr as *mut ffi::Half,
-                                v_pool_ptr as *mut ffi::Half,
-                                kv_indices_ptr as *const i32,
-                                kv_indptr_ptr as *const i32,
-                                last_page_len_ptr as *const i32,
-                                self.local_q_heads as i32,
-                                self.local_kv_heads as i32,
-                                rc.pool.page_size as i32,
-                                stride_page as i32,
-                                1,
-                                c.rotary_dim as i32,
-                                c.rms_norm_eps,
-                                self.ctx.stream.cu_stream(),
-                            )
-                            .result()?;
-                        } else {
-                            ffi::prefill_attention_paged_prep_hd256_cuda(
-                                qf_ptr as *const ffi::Half,
-                                qp_ptr as *mut ffi::Half,
-                                k_ptr as *const ffi::Half,
-                                v_ptr as *const ffi::Half,
-                                qn_ptr as *const ffi::Half,
-                                kn_ptr as *const ffi::Half,
-                                cos_ptr as *const ffi::Half,
-                                sin_ptr as *const ffi::Half,
-                                kv_indices_ptr as *const i32,
-                                rc.pool.page_size as i32,
-                                k_pool_ptr as *mut ffi::Half,
-                                v_pool_ptr as *mut ffi::Half,
-                                self.local_q_heads as i32,
-                                self.local_kv_heads as i32,
-                                seq_len as i32,
-                                start_pos_ptr as *const i32,
-                                c.rotary_dim as i32,
-                                c.rms_norm_eps,
-                                self.ctx.stream.cu_stream(),
-                            )
-                            .result()?;
+            {
+                let (qp_ptr, _g7) = q_prepped.data.device_ptr_mut(&self.ctx.stream);
+                qwen35_profile(
+                    &self.ctx,
+                    "qwen/full_paged/prep",
+                    Some(full_idx),
+                    seq_len,
+                    || {
+                        // SAFETY: all buffers valid on ctx.stream; pool tail page allocated.
+                        unsafe {
+                            if decode {
+                                ffi::decode_prep_paged_hd256_cuda(
+                                    qf_ptr as *const ffi::Half,
+                                    qp_ptr as *mut ffi::Half,
+                                    k_ptr as *const ffi::Half,
+                                    v_ptr as *const ffi::Half,
+                                    qn_ptr as *const ffi::Half,
+                                    kn_ptr as *const ffi::Half,
+                                    cos_ptr as *const ffi::Half,
+                                    sin_ptr as *const ffi::Half,
+                                    positions_ptr as *const i32,
+                                    k_pool_ptr as *mut ffi::Half,
+                                    v_pool_ptr as *mut ffi::Half,
+                                    kv_indices_ptr as *const i32,
+                                    kv_indptr_ptr as *const i32,
+                                    last_page_len_ptr as *const i32,
+                                    self.local_q_heads as i32,
+                                    self.local_kv_heads as i32,
+                                    rc.pool.page_size as i32,
+                                    stride_page as i32,
+                                    1,
+                                    c.rotary_dim as i32,
+                                    c.rms_norm_eps,
+                                    self.ctx.stream.cu_stream(),
+                                )
+                                .result()?;
+                            } else {
+                                ffi::prefill_attention_paged_prep_hd256_cuda(
+                                    qf_ptr as *const ffi::Half,
+                                    qp_ptr as *mut ffi::Half,
+                                    k_ptr as *const ffi::Half,
+                                    v_ptr as *const ffi::Half,
+                                    qn_ptr as *const ffi::Half,
+                                    kn_ptr as *const ffi::Half,
+                                    cos_ptr as *const ffi::Half,
+                                    sin_ptr as *const ffi::Half,
+                                    kv_indices_ptr as *const i32,
+                                    rc.pool.page_size as i32,
+                                    k_pool_ptr as *mut ffi::Half,
+                                    v_pool_ptr as *mut ffi::Half,
+                                    self.local_q_heads as i32,
+                                    self.local_kv_heads as i32,
+                                    seq_len as i32,
+                                    start_pos_ptr as *const i32,
+                                    c.rotary_dim as i32,
+                                    c.rms_norm_eps,
+                                    self.ctx.stream.cu_stream(),
+                                )
+                                .result()?;
+                            }
                         }
-                    }
-                    Ok(())
-                },
-            )?;
+                        Ok(())
+                    },
+                )?;
+            }
+            #[cfg(test)]
+            prep_probe::finish(&self.ctx, prep_capture, q_prepped)?;
         }
 
         // ── 1.5. For quantized pools: BF16 work buffer → quantized data buffer. ──
