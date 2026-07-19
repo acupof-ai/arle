@@ -1,0 +1,47 @@
+crates/cli/src/train_cli.rs
+  s_bba680afab0a60::t_e748f5d15fe08f 2926-2930
+crates/infer-api/src/lib.rs
+  s_d6adcec6a0a6d3::t_c70967794c3029 90-92
+crates/infer-api/src/loaded.rs
+  s_9f58936c71e4e4::t_c18920c976ebfd 580-585,1319-1324
+crates/infer-cuda/src/qwen35.rs
+  s_9f58936c71e4e4::t_69a056f4c9dfc8 195-355,6515-6516,6518,6520-6529,6531-6587
+crates/infer-server/src/lib.rs
+  s_9f58936c71e4e4::t_54a287237ec37f 77
+crates/infer-server/src/schema.rs
+  s_bba680afab0a60::t_0c005eb128ad72 9-10,22-76,78-88,91-92,457,459-462,1033-1075
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "b9207defa210d20bc3483bc65531eeb64cc59d96",
+  "prompts": {},
+  "sessions": {
+    "s_9f58936c71e4e4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7b56b8c4-c864-4372-9743-f6f12c7f4dd0",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_bba680afab0a60": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-afb295325c32fba4b",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_d6adcec6a0a6d3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dc64a0b5-493b-4e08-a5cf-392205926291",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
