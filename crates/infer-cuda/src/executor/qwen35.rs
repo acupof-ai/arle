@@ -3312,7 +3312,7 @@ mod tier_io_tests {
                     slot: 0,
                     tokens: tokens.to_vec(),
                     start_pos: 0,
-                    total_tokens: tokens.len() + 1,
+                    total_tokens: tokens.len(),
                     params: SamplingParams {
                         temperature: 0.0,
                         top_k: -1,
