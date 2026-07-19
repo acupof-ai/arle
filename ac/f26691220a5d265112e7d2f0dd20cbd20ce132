@@ -1,0 +1,39 @@
+crates/infer-api/src/loaded.rs
+  s_6f16a6299045de::t_485d7b292baada 851-855,858,860,862,864,866,868,870,872-894
+crates/infer-api/src/serve_engine.rs
+  s_6f16a6299045de::t_c38d8573964ac3 88-98
+crates/infer-core/src/lib.rs
+  s_6f16a6299045de::t_59cbf2b0231046 349-359,398-399,471,1121-1142
+crates/infer-server/src/execution.rs
+  s_6f16a6299045de::t_7ae62b1cec0189 228-243
+crates/infer-server/src/lib.rs
+  s_20b61a17a6ee68::t_cbab640c3625d1 581-586,588,596-601
+crates/train/src/infer_student.rs
+  s_6f16a6299045de::t_f2bae1b2da0d64 121-129
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "acf26691220a5d265112e7d2f0dd20cbd20ce132",
+  "prompts": {},
+  "sessions": {
+    "s_20b61a17a6ee68": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ad6b77ecf4a4114b2",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_6f16a6299045de": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a81ac8624b9092753",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
