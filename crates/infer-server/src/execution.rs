@@ -225,6 +225,22 @@ fn engine_loop_with_tick_broadcaster<E, K>(
             }
         }
 
+        // OPD writeback bracket: the KV pool is released while quiesced, so no
+        // submission may be admitted (it would prefill onto the dropped pool) and
+        // none may become a waiter (a non-idle engine busy-spins the loop and
+        // explodes the lockstep tick). Defer every drained submission into `carry`
+        // — admitted verbatim once `resume_serving` clears the flag — and park on
+        // the submit channel so `drain_control` (step 0) still observes resume.
+        if engine.is_quiesced() {
+            carry = drained;
+            match submit_rx.recv_timeout(IDLE_PARK) {
+                Ok(submission) => carry.push(submission),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => submit_open = false,
+            }
+            continue;
+        }
+
         // 2. Lockstep tick barrier: exactly one `TickAdmissions` precedes every
         //    engine step (and every admission batch). Empty-request envelopes on
         //    pure-decode ticks cost one localhost TCP write per worker (~µs)

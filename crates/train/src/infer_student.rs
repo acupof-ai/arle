@@ -118,6 +118,15 @@ impl InferStudent {
         engine.ensure_kv_pool()
     }
 
+    /// Re-arm engine admission after the OPD writeback bracket. Idempotent.
+    pub fn resume_admissions(&self) -> Result<()> {
+        let engine = self
+            .engine
+            .lock()
+            .map_err(|err| anyhow!("LoadedInferenceEngine lock poisoned: {err}"))?;
+        engine.resume_admissions()
+    }
+
     /// Generate `rollout_len` tokens from `prompt_ids` through the infer
     /// scheduler/KV path and return the full prompt+generated rollout.
     ///
