@@ -1,0 +1,23 @@
+docs/plans/2026-07-17-dsv4-chunked-prefill-unification.md
+  s_130adfb7e856b2::t_ec5afc3c657f33 128-132
+scripts/kernel_artifacts.sh
+  s_130adfb7e856b2::t_d21964d5c95f47 281,293,304
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "ec059aa065c6b4ccd10b78ce2c271fbaa4fa0bb7",
+  "prompts": {},
+  "sessions": {
+    "s_130adfb7e856b2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aa7d6f23fdb552558",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
