@@ -79,10 +79,14 @@ where
         self.serve.release_kv_pool()
     }
 
-    /// Re-acquire the KV pool dropped by [`Self::release_kv_pool`] before the next
-    /// rollout. Threads to the backend executor on the engine thread.
+    /// Re-acquire the KV pool dropped by [`Self::release_kv_pool`].
     pub fn ensure_kv_pool(&self) -> Result<()> {
         self.serve.ensure_kv_pool()
+    }
+
+    /// Re-acquire the KV pool, then resume admission only after success.
+    pub fn ensure_kv_pool_and_resume_admissions(&self) -> Result<()> {
+        self.serve.ensure_kv_pool_and_resume_admissions()
     }
 
     /// Quiesce engine admission (the serve loop defers new admission) and cancel

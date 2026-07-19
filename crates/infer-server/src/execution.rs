@@ -200,19 +200,8 @@ fn engine_loop_with_tick_broadcaster<E, K>(
             return;
         }
 
-        // 0. Run any queued out-of-band control closures against the executor
-        //    (OPD raw-logits forward, weight offload/reload, LoRA re-merge). These
-        //    run between steps with no request in flight, so `&mut E` access is
-        //    exclusive. A disconnected control channel is benign (frontend gone).
-        //    A closure may have cancelled requests (client disconnect / quiesce
-        //    orphan sweep); deliver those completions even if the engine is now
-        //    idle and never reaches the post-step delivery below.
-        if drain_control(&mut engine, &control_rx) > 0 {
-            deliver_completions(&engine, &mut pending, &streamers);
-        }
-
-        // 1. Drain every queued submission without blocking (plus any idle-park
-        //    carry). Admission happens AFTER the lockstep broadcast below.
+        // 0. Snapshot queued submissions before controls run. A Serving→Quiesced
+        //    transition aborts this pre-existing batch; later submissions defer.
         let mut drained = std::mem::take(&mut carry);
         loop {
             match submit_rx.try_recv() {
@@ -223,6 +212,16 @@ fn engine_loop_with_tick_broadcaster<E, K>(
                     break;
                 }
             }
+        }
+
+        // 1. Run queued out-of-band controls between steps. A closure may cancel
+        //    requests; deliver those completions even if the engine stays idle.
+        let was_quiesced = engine.is_quiesced();
+        if drain_control(&mut engine, &control_rx) > 0 {
+            deliver_completions(&engine, &mut pending, &streamers);
+        }
+        if !was_quiesced && engine.is_quiesced() {
+            drained.clear();
         }
 
         // OPD writeback bracket: the KV pool is released while quiesced, so no
@@ -499,6 +498,48 @@ mod tests {
             let mut inner = crate::EchoExecutor;
             inner.poll(inflight)
         }
+    }
+
+    #[test]
+    fn quiesce_transition_aborts_preexisting_submissions() -> anyhow::Result<()> {
+        let config = SchedulerConfig {
+            num_slots: 1,
+            max_prompt_tokens: 128,
+            max_total_tokens: 256,
+            ..SchedulerConfig::default()
+        };
+        let engine =
+            Engine::with_config(crate::EchoExecutor, HostPagedKvPool::new(1, 16, 16), config);
+        let (submit_tx, submit_rx) = mpsc::channel();
+        let (control_tx, control_rx) =
+            mpsc::channel::<ControlMessage<crate::EchoExecutor, HostPagedKvPool>>();
+        let counters = Arc::new(Mutex::new(CounterSnapshot::default()));
+        let shutdown = ServeShutdown::new();
+        let (handle_tx, handle_rx) = mpsc::channel();
+        let (completion_tx, _completion_rx) = mpsc::channel();
+        submit_tx.send(Submission {
+            prompt: vec![10, 11],
+            max_tokens: 1,
+            sampling: SamplingParams::default(),
+            handle_tx,
+            completion_tx,
+            stream_tx: None,
+        })?;
+        control_tx
+            .send(Box::new(|engine| {
+                engine.quiesce();
+            }))
+            .map_err(|_| anyhow::anyhow!("control receiver closed"))?;
+        drop(submit_tx);
+        drop(control_tx);
+
+        engine_loop_with_tick_broadcaster(engine, submit_rx, control_rx, counters, shutdown, None);
+
+        assert!(
+            handle_rx.recv_timeout(Duration::from_secs(1)).is_err(),
+            "submission queued before quiesce must not survive cancel-all"
+        );
+        Ok(())
     }
 
     #[test]

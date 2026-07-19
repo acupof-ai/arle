@@ -3538,15 +3538,9 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
                 sync_lora_secs += secs;
                 policy_version += 1;
             }
-            if let Err(err) = infer_student.ensure_kv_pool() {
-                eprintln!("[agent-opd] ensure KV pool (group {group_idx}) failed: {err}");
-            }
-            // Re-arm admission after this group's writeback bracket quiesced it
-            // (paired with quiesce_admissions in quiesce_serve). Idempotent; the
-            // pool is re-acquired just above, so admission reopens onto a live pool.
-            if let Err(err) = infer_student.resume_admissions() {
-                eprintln!("[agent-opd] resume admissions (group {group_idx}) failed: {err}");
-            }
+            infer_student
+                .ensure_kv_pool_and_resume_admissions()
+                .with_context(|| format!("restore rollout engine after group {group_idx}"))?;
             // Post-merge prefix warm-up: the re-merge flushed the radix cache,
             // so re-prefill the shared cc prompt (newest dump's prompt portion,
             // max_tokens=1) on a background thread — overlapped with the next
