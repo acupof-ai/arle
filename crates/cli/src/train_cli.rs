@@ -24,7 +24,7 @@ use crate::{
         KlDirectionArg, LrScheduleArg, ModelFamilyArg, OpdBackendArg, OpdKlMaskArg,
         OpdSftAnchorArg, OpdTeacherRuntimeArg, PretrainPresetArg, SaveDtypeArg, TrainAgentOpdArgs,
         TrainArgs, TrainCcConvertArgs, TrainCommand, TrainEnvArgs, TrainEstimateMemoryArgs,
-        TrainOpdArgs, TrainRubricOpdArgs, TrainSelfOpdArgs,
+        TrainOpdArgs, TrainPplArgs, TrainRubricOpdArgs, TrainSelfOpdArgs,
     },
     hardware, hub_discovery,
 };
@@ -99,7 +99,127 @@ pub(crate) fn run_train(train: TrainArgs) -> ExitCode {
             exit_from_result(run_agent_opd_impl(*args))
         }
         TrainCommand::CcConvert(args) => exit_from_result(run_cc_convert_impl(args)),
+        TrainCommand::Ppl(args) => exit_from_result(run_ppl(args)),
     }
+}
+
+/// `arle train ppl` — perplexity over a text corpus via teacher-forced logits,
+/// to calibrate FP8 / quant checkpoint quality. CUDA-only (the forward path is
+/// `LoadedInferenceEngine::forward_token_logits`, which the OPD lane also uses).
+#[cfg(feature = "cuda")]
+fn run_ppl(args: TrainPplArgs) -> Result<()> {
+    use infer_api::{EngineLoadConfig, LoadedInferenceEngine};
+
+    let ctx = args.ctx;
+    let model_path = args
+        .model_path
+        .to_str()
+        .ok_or_else(|| anyhow!("model path is not valid UTF-8"))?;
+
+    // Tokenize the corpus into one stream with the model's own tokenizer.
+    let tokenizer_path = resolve_local_tokenizer_path(&args.model_path)?;
+    let tokenizer = ChatTokenizer::from_file(&tokenizer_path)
+        .with_context(|| format!("load tokenizer {}", tokenizer_path.display()))?;
+    let corpus = fs::read_to_string(&args.corpus)
+        .with_context(|| format!("read corpus {}", args.corpus.display()))?;
+    let tokens = tokenizer
+        .encode(&corpus, false)
+        .context("tokenize corpus")?;
+    if tokens.len() < 2 {
+        bail!(
+            "corpus tokenizes to {} tokens; need at least 2 for a next-token NLL",
+            tokens.len()
+        );
+    }
+
+    let page_size = 16usize;
+    let engine = LoadedInferenceEngine::load_with_config(
+        model_path,
+        /*cuda_graph=*/ true,
+        EngineLoadConfig {
+            num_slots: 1,
+            page_size,
+            total_pages: ctx.div_ceil(page_size),
+            max_prompt_tokens: ctx,
+            max_total_tokens: ctx,
+            chunked_prefill_size: Some(ctx),
+            ..EngineLoadConfig::default()
+        },
+    )
+    .with_context(|| format!("load engine from {model_path}"))?;
+
+    // Non-overlapping windows of `ctx`; each contributes len-1 next-token NLLs.
+    let mut sum_nll = 0.0f64;
+    let mut count = 0usize;
+    let mut windows = 0usize;
+    for chunk in tokens.chunks(ctx) {
+        if chunk.len() < 2 {
+            break; // a trailing 1-token window has no next-token target
+        }
+        if args.max_windows.is_some_and(|cap| windows >= cap) {
+            break;
+        }
+        let positions: Vec<u32> = (0..chunk.len() as u32).collect();
+        let raw = engine
+            .forward_token_logits(chunk, &positions)
+            .with_context(|| format!("forward window {windows}"))?;
+        if raw.seq_len() != chunk.len() {
+            bail!(
+                "ppl window seq_len mismatch: logits={}, tokens={}",
+                raw.seq_len(),
+                chunk.len()
+            );
+        }
+        let vocab = raw.vocab_size();
+        let host = raw.to_host_f32()?;
+        for i in 0..chunk.len() - 1 {
+            let row = &host[i * vocab..(i + 1) * vocab];
+            let target = chunk[i + 1] as usize;
+            sum_nll += row_nll(row, target)?;
+            count += 1;
+        }
+        windows += 1;
+    }
+
+    if count == 0 {
+        bail!("no scorable positions (corpus shorter than 2 tokens per window)");
+    }
+    let ppl = (sum_nll / count as f64).exp();
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ppl": ppl,
+                "tokens": count,
+                "windows": windows,
+                "ctx": ctx,
+                "model_path": model_path,
+            })
+        );
+    } else {
+        println!("ppl={ppl} tokens={count} windows={windows} ctx={ctx}");
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "cuda"))]
+fn run_ppl(_args: TrainPplArgs) -> Result<()> {
+    bail!("arle train ppl requires the CUDA backend (forward_token_logits is CUDA-only)")
+}
+
+/// Numerically stable next-token NLL: `-log_softmax(row)[target]`, subtracting
+/// the row max before exp.
+#[cfg(feature = "cuda")]
+fn row_nll(row: &[f32], target: usize) -> Result<f64> {
+    let target_logit = *row
+        .get(target)
+        .ok_or_else(|| anyhow!("target token {target} out of vocab {}", row.len()))?
+        as f64;
+    let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+    let sum_exp: f64 = row.iter().map(|&l| (l as f64 - max).exp()).sum();
+    // NLL = -(logit - max - ln(sum_exp)) = ln(sum_exp) + max - logit
+    Ok(sum_exp.ln() + max - target_logit)
 }
 
 /// `arle train cc-convert` — backend-independent (no CUDA): dumps → verl-style
