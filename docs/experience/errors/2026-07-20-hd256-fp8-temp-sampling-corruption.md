@@ -71,9 +71,16 @@ the CUDA `(1+w)` offset kernel was already correct.
   for a quant/weights bug. Keep it.
 - **Voided:** #55 router bf16 re-export (no routers → no-op); any FP8 requant (FP8
   is faithful); any bf16 swap (bf16 salads identically).
-- **Open (cheap):** logprob spot-check — is the occasional non-ASCII token at
-  temp=1.0 a top_p=0.95 nucleus leak (our CUDA sampler bug) or a genuine model
-  tail? Verdict pending; either way the operating fix (temp=0.3) stands.
+- **Sampler exonerated (closed).** The host sampler (`infer-plan/src/sample.rs:56-109`)
+  truncates to top_k *then* cuts top_p at the first cum≥0.95 — by construction the
+  drawn token is always within top-20 and its predecessors sum <0.95, so neither
+  nucleus-leak condition is possible; the device sampler
+  (`csrc/sampling/sampling.cu:327`) does the same. Control confirms the filter is
+  live: temp=1.0 top_k=1 COHERENT, top_k=20 garbage. So the occasional non-ASCII
+  token at temp=1.0 is genuinely inside the model's own top-20 tail — model
+  behavior, not a leak. Fix stays serving-config (temp=0.3). (arle's OpenAI
+  endpoint does not implement `logprobs`, so the per-step table couldn't be pulled
+  from the API — the source + control settle it.)
 
 ## Rule
 
