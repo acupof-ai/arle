@@ -16,7 +16,9 @@
 #define HD256 256
 #define NUM_WARPS_HD256 (HD256 / WARP_SIZE)  // 8
 
-// Per-head RMSNorm: output = x * (1/sqrt(mean(x^2) + eps)) * weight
+// Per-head RMSNorm, OFFSET convention: output = x * rms_inv * (1 + weight).
+// #58: hd256 q/k_norm ships OFFSET (mean|w| ~0.49 < 0.75); dropping the +1
+// (b4b293f0c) shrank q/k ~3x, collapsing attention scores at length.
 __device__ __forceinline__ float rms_norm_head_hd256(
     float val,
     float weight,
@@ -42,7 +44,7 @@ __device__ __forceinline__ float rms_norm_head_hd256(
     }
     __syncthreads();
 
-    return val * scratch[0] * weight;
+    return val * scratch[0] * (1.0f + weight);
 }
 
 // Partial RoPE: pair-wise rotation on first rotary_dim elements.

@@ -4,9 +4,10 @@
 #define THREADS_HEAD_DIM 256
 #define NUM_WARPS_HEAD_DIM (THREADS_HEAD_DIM / WARP_SIZE)
 
+// OFFSET convention (#58): hd256 q/k_norm ships mean|w| ~0.49 < 0.75 → (1 + weight).
 __device__ __forceinline__ __nv_bfloat16 rms_norm_elem(
     __nv_bfloat16 x, float rms_inv, __nv_bfloat16 weight) {
-    return __float2bfloat16(__bfloat162float(x) * rms_inv * __bfloat162float(weight));
+    return __float2bfloat16(__bfloat162float(x) * rms_inv * (1.0f + __bfloat162float(weight)));
 }
 
 __device__ __forceinline__ void apply_rope_pair(
