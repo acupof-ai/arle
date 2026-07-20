@@ -133,7 +133,7 @@ __device__ __forceinline__ float prefill_attention_paged_rms_norm_hd256(
   }
   __syncthreads();
 
-  return val * scratch[0] * weight;
+  return val * scratch[0] * (1.0f + weight);  // #58: hd256 q/k_norm OFFSET (mean|w|<0.75)
 }
 
 __device__ __forceinline__ float prefill_attention_paged_apply_rope_partial_hd256(
