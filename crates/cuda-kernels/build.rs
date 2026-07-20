@@ -963,13 +963,21 @@ fn resolve_executable(program: &str) -> PathBuf {
 }
 
 fn executable_identity(program: &Path) -> Vec<u8> {
-    let output = Command::new(program)
+    // Resolve bare names (e.g. "python3", "g++") to their full PATH so the
+    // identity hash reads the actual binary, not a cwd-relative file that
+    // doesn't exist (panics with "No such file or directory").
+    let resolved = if program.components().count() > 1 && program.is_file() {
+        program.to_path_buf()
+    } else {
+        resolve_executable(&program.to_string_lossy())
+    };
+    let output = Command::new(&resolved)
         .arg("--version")
         .output()
-        .unwrap_or_else(|err| panic!("run executable {}: {err}", program.display()));
+        .unwrap_or_else(|err| panic!("run executable {}: {err}", resolved.display()));
     let mut identity = Vec::new();
-    add_identity_part(&mut identity, "path", program.to_string_lossy().as_bytes());
-    add_identity_part(&mut identity, "binary", &identity_file(program));
+    add_identity_part(&mut identity, "path", resolved.to_string_lossy().as_bytes());
+    add_identity_part(&mut identity, "binary", &identity_file(&resolved));
     add_identity_part(&mut identity, "stdout", &output.stdout);
     add_identity_part(&mut identity, "stderr", &output.stderr);
     identity
