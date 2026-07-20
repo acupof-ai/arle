@@ -1204,6 +1204,35 @@ pub(crate) enum TrainCommand {
     /// into verl-style token records for the agent-OPD masked-CE replay
     /// (`agent-opd --replay-records`).
     CcConvert(TrainCcConvertArgs),
+    /// Perplexity (PPL) over a text corpus via teacher-forced logits — a quality
+    /// calibration for FP8 / quant checkpoints. CUDA-only (forward_token_logits).
+    Ppl(TrainPplArgs),
+}
+
+#[derive(Debug, Clone, ClapArgs)]
+#[command(
+    after_help = "Examples:\n  arle train ppl --model-path checkpoints/base --corpus wikitext.txt\n  arle train ppl --model-path ckpt-fp8 --corpus corpus.txt --ctx 2048 --max-windows 8 --json"
+)]
+pub(crate) struct TrainPplArgs {
+    /// Model directory (local path or HF id) to score.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) model_path: PathBuf,
+
+    /// UTF-8 text corpus to compute perplexity over.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) corpus: PathBuf,
+
+    /// Context window (non-overlapping) in tokens.
+    #[arg(long, default_value_t = 4096, value_parser = parse_positive_usize)]
+    pub(crate) ctx: usize,
+
+    /// Cap the number of windows scored (quick run); unset scores the whole corpus.
+    #[arg(long, value_parser = parse_positive_usize)]
+    pub(crate) max_windows: Option<usize>,
+
+    /// Render output as JSON for scripts and CI.
+    #[arg(long, default_value_t = false)]
+    pub(crate) json: bool,
 }
 
 #[derive(Debug, Clone, ClapArgs)]
