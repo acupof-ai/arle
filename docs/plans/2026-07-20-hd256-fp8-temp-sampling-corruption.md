@@ -1,27 +1,57 @@
 # hd256/FP8 temp>0 sampling corruption — root-cause + complete fix
 
-> Status: Active — root cause FOUND & FIXED in source (`9851ced6b` +
-> `bf66a3854`, 2026-07-20). Confounder resolved: **Branch B (hd256 compute
-> residual, FP8-independent)**. Remaining = Phase 3 empirical verify on a
-> rebuilt binary, then revert the temp=0.3 workaround. Phase 0 bf16 isolation is
-> now unnecessary (the mechanism is identified and patched).
+> Status: Active — `9851ced6b` CONFIRMED a regression and REVERTED
+> (`485eefe0d`, 2026-07-20). The norm handling was a DETOUR — the CUDA loader
+> was already correct. The ORIGINAL bug (temp>0 salad, greedy coherent, on
+> hd256/**FP8**) is still OPEN; temp=0.3 workaround stays. Next: bf16 E1
+> isolation (FP8-noise vs hd256-compute) for the real bug.
 
-## Root cause (RESOLVED)
+## The norm detour — RESOLVED (9851ced6b reverted)
 
-`b4b293f0c` fixed the hd256 q/k RMSNorm convention but left the **per-layer
-`input_layernorm` / `post_attention_layernorm`** loaded raw. All Qwen3.5/3.6
-norms ship in STANDARD format (~1-centered); the `rms_norm_offset` trunk kernel
-applies `(1 + weight)`, so raw-loaded norms carried a ~2× multiplier per layer,
-compounding across 64 layers. Fix (`9851ced6b`): load them via
-`load_final_norm_offset` → `(w − 1)`, so `(1 + (w−1)) = w`. q/k_norm stay raw
-(hd256 prep kernels apply `weight` directly — the STANDARD convention
-`b4b293f0c` set). This is FP8-independent — the bf16 path had the same 2× bug.
+`9851ced6b` loaded the per-layer `input_layernorm`/`post_attention_layernorm` as
+`w−1`, which REGRESSED greedy to salad on both 27B FP8 models (decoded, two clean
+builds). The CUDA code was already correct. Reverted.
 
-**Open tension to close in Phase 3:** a 2×-per-layer compounding error should
-have broken greedy too, yet greedy read as coherent pre-fix. Either greedy was
-never rigorously gated on the 27B at this binary, or the mechanism magnitude is
-overstated. Do not trust the commit message — MEASURE temp=1.0 on the rebuilt
-binary before declaring done.
+**Why the CUDA norm handling is correct — the Metal reference settles it.**
+`crates/infer-metal/src/qwen35.rs`: `qwen35_norm_needs_offset_correction` detects
+offset weights by `mean(|w|) < 0.75`, then `qwen35_normalize_direct_norm_weight`
+converts them with `w + 1`, then applies standard `x·inv_rms·(w+1)`. That is
+IDENTICAL to the CUDA `rms_norm_batched_offset_kernel`'s hand-written
+`x·inv_rms·(1 + weight)`. So the `(1+w)` kernel is not a bug — it is the offset
+convention these HF checkpoints ship, matched.
+
+Per-tensor convention (measured, local Qwen3.5-0.8B; matches Metal's threshold):
+
+| tensor | mean\|w\| | convention | correct CUDA load |
+|---|---|---|---|
+| input/post_layernorm | 0.24 / 0.085 (<0.75) | offset | **raw** → kernel `(1+w)` |
+| final norm | 3.3 (>0.75) | direct | `w−1` → kernel `(1+w)` = 3.3 |
+
+`9851ced6b` wrongly applied the final-norm `w−1` to the offset input/post norms
+→ `(1+(w−1)) = w ≈ 0.24` → 1/5 scale per layer, compounding to salad. The
+"latent final-norm bug" hypothesis is void: final `mean|w| 3.3 > 0.75` is direct,
+`w−1` is correct.
+
+**Robustness follow-up (optional):** the CUDA loader hard-codes the per-tensor
+convention (input/post raw, final `w−1`) instead of detecting it like Metal
+(`mean|w| < 0.75`). Data-driven detection would have prevented `9851ced6b`
+entirely. Small, mirror Metal — do it if another checkpoint breaks the hard-code.
+
+## The REAL bug (still open): temp>0 salad on hd256/FP8
+
+Independent of the norm detour. Pre-`9851ced6b` (`13426a8de`): greedy + temp=0.3
+coherent, temp=1.0 salad, on both FP8 models. Leading hypothesis: FP8 logit-tail
+noise (both affected models are FP8; greedy argmax survives, temp>0 samples the
+mis-scaled tail). Decisive isolation = bf16 E1 below (download is staged,
+62.8 GB).
+
+## Crux confirm + E1 (in flight / next)
+
+- **Crux (running):** reverted-HEAD vs `00224faa0`, 27B FP8, greedy → expect
+  coherent vs salad. Confirms the revert.
+- **E1 (next, for the REAL bug):** hd256 **bf16** @ temp=1.0. Coherent → FP8
+  noise → fix in FP8 quant/dequant or raise hot path to bf16. Salad → hd256
+  compute residual (a path b4b293f0c/norms didn't touch).
 
 ## Verdict up front
 
