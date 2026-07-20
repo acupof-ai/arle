@@ -43,17 +43,32 @@ identical to the CUDA kernel. `9851ced6b` double-offset input/post →
 2 clean builds). Reverted (`485eefe0d`). The final norm (`mean|w| 3.3 > 0.75`,
 direct) correctly stays `w−1`. **The norm handling was never the temp>0 bug.**
 
-**The real bug — isolated to FP8 (dtype), confirmed by A/B.** Same reverted
-binary, same prompt/sampling (temp=1.0 top_k20 top_p0.95), hd256 27B:
-- **bf16** → `The capital of France is Paris` coherent, **nonascii 0.000**
-- **FP8** → `Paris パリ Παρίσιμο Париж…` salad, **nonascii 0.409**
+**The real bug — MoE routing flip from a broken FP8 export (NOT our runtime,
+NOT generic FP8 noise).** Localized by config diff + same-binary A/B:
 
-bf16 clean ⇒ NOT a hd256 compute residual (that would corrupt bf16 too). The
-temp>0 salad is **FP8 logit-tail noise**: FP8 quantization perturbs the logit
-tail; greedy argmax survives, temp>0 samples it. Fix lives in the FP8
-quant/dequant or FP8 compute precision, not the hd256 kernels. Localization
-(per-layer bf16↔FP8 divergence + MoE routing agreement) in progress. temp=0.3
-workaround holds until fixed.
+| bf16-kept | base Qwen3.6-27B-FP8 | ThinkingCap-FP8 |
+|---|---|---|
+| `mlp.gate` (router) | 65/65 layers | **1/65** |
+| `shared_expert_gate` | 65/65 | **0/65** |
+
+Same reverted binary, temp=1.0: **base (bf16 router) coherent (nonascii 0);
+ThinkingCap (FP8 router) salad (nonascii 0.37)**. The only structural difference
+is router quantization — identical FP8 expert/attention GEMMs, identical bf16
+lm_head/norms. FP8-quantizing the MoE router perturbs its gate logits →
+per-token top-k expert selection flips → wrong experts corrupt the residual tail
+→ greedy top-1 survives, temp>0 samples the scrambled tail → salad.
+
+**Two corrections to earlier reads:** (1) it is NOT smooth FP8 accumulation — if
+it were, the base (same expert GEMMs) would salad too; it doesn't. (2) "The whole
+OPD lane silently degraded" was a phantom — the base FP8 student is fine at
+temp=1.0; the earlier "current student salad" was on the norm-regression binary /
+conflated with ThinkingCap.
+
+Router weights are stored lossy-FP8 in ThinkingCap's checkpoint → a loader
+force-bf16 can't recover the lost precision (dequant keeps the loss). **Fix
+(chosen): re-export ThinkingCap-FP8 with `modules_to_not_convert` covering all
+`mlp.gate` + `shared_expert_gate` (match the base), from the bf16 ThinkingCap we
+already have.** experts/attention stay FP8. Then restore rollout temp=1.0.
 
 Revert A/B (greedy, temp=0.0): reverted binary → both FP8 models coherent
 ("Paris"/"64", nonascii 0); `00224faa0` (9851ced6b) → salad. Revert confirmed.
@@ -68,6 +83,14 @@ Revert A/B (greedy, temp=0.0): reverted binary → both FP8 models coherent
   or a hd256 compute-convention residual. Then restore temp=1.0.
 
 ## Rule
+
+**Never FP8-quantize a MoE router.** The gate is tiny and routing is
+discrete — a ~1-2% weight perturbation flips top-k expert selection, and greedy
+hides it (top-1 survives) while temp>0 exposes it as salad. Correctly-exported
+FP8 checkpoints keep `mlp.gate`/`shared_expert_gate` bf16 (vLLM/SGLang standard);
+**verify a third-party quant export's `modules_to_not_convert` before trusting
+it** — a config diff against a known-good sibling checkpoint localizes a broken
+export in 2 minutes, no rebuild.
 
 **Gate a served/quantized model on the actual SAMPLED generation at the
 production temperature, never on greedy alone.** Greedy (argmax) survives a

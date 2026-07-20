@@ -1,10 +1,11 @@
 # hd256/FP8 temp>0 sampling corruption — root-cause + complete fix
 
-> Status: Active — `9851ced6b` CONFIRMED a regression and REVERTED
-> (`485eefe0d`, 2026-07-20). The norm handling was a DETOUR — the CUDA loader
-> was already correct. The ORIGINAL bug (temp>0 salad, greedy coherent, on
-> hd256/**FP8**) is still OPEN; temp=0.3 workaround stays. Next: bf16 E1
-> isolation (FP8-noise vs hd256-compute) for the real bug.
+> Status: Active — ROOT CAUSE FOUND. The temp>0 salad is a **MoE routing flip**
+> from ThinkingCap-FP8's broken export (router FP8-quantized; base keeps it bf16
+> → base is fine at temp=1.0). NOT our runtime, NOT generic FP8 noise, NOT the
+> norm handling (that detour reverted, `485eefe0d`). Fix (chosen): re-export
+> ThinkingCap-FP8 with `mlp.gate`+`shared_expert_gate` bf16, from the bf16 copy —
+> in flight. Then restore rollout temp=1.0. Full evidence in the errors entry.
 
 ## The norm detour — RESOLVED (9851ced6b reverted)
 
