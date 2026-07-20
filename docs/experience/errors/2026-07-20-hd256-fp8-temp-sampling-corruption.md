@@ -1,104 +1,97 @@
-# hd256/FP8 temp>0 sampling corruption silently degraded every OPD rollout
+# temp=1.0 long-gen degeneration on Qwen3.6-27B — a five-hypothesis false-root-cause chain
 
-> Status: root fix in progress (plan:
-> [2026-07-20-hd256-fp8-temp-sampling-corruption](../../plans/2026-07-20-hd256-fp8-temp-sampling-corruption.md));
-> temp=0.3 workaround shipped (2394a2ab0).
+> Status: RESOLVED. The temp>0 "salad" is **temperature=1.0 + long generation
+> degeneration**, uniform across ALL Qwen3.6-27B variants (base & ThinkingCap,
+> FP8 & bf16) on the clean binary `fea8e1fd0`. NOT FP8, NOT the MoE router (there
+> is none), NOT ThinkingCap's weights, NOT norm handling, NOT config. Five static
+> hypotheses + the driving premise were each killed by measurement. Fix already
+> shipped: rollout `--rollout-temperature 0.3` (`2394a2ab0`) is the correct
+> operating point. One cheap sampler spot-check open (garbage-token nucleus leak
+> vs model tail).
 
 ## Context
 
 Adopting a concise-reasoning student (ThinkingCap-Qwen3.6-27B-FP8) for the
-agent-OPD lane. Serve-side sampling looked broken: temp=1.0 requests returned
-multilingual token-salad. First read: my new `SamplingDefaults` fix wasn't
-threading nucleus to the CUDA sampler.
+agent-OPD lane. temp=1.0 rollouts looked like multilingual token-salad; a prior
+session decoded "base FP8 coherent / ThinkingCap FP8 salad, nonascii 0.37" and
+built a root cause on it. Every layer of that root cause turned out wrong.
 
-## Root Cause
+## Root Cause (measured, clean binary `fea8e1fd0`)
 
-Two layers, only the second is the real bug:
+Controlled A/B — 3 models × {greedy, temp=1.0 top_p0.95 top_k20} × length:
 
-1. **Not the sampler.** A control A/B on the same binary — hd128 Qwen3-4B
-   coherent at temp=1.0+nucleus, hd256 model salad — proved the nucleus DOES
-   reach the CUDA sampler. The `SamplingDefaults` fix is fine.
-2. **hd256/FP8 temp>0 distribution corruption.** The hd256 (Qwen3.6-27B) FP8
-   path produces a distribution whose **argmax is correct** (greedy coherent —
-   `b4b293f0c` fixed the q/k RMSNorm OFFSET→STANDARD convention) but whose
-   **tail is mis-scaled/noisy**. Temperature is the "trust the tail" knob: at
-   0.3 the sharpened distribution suppresses the residual error (coherent), at
-   1.0 the flat distribution samples it (salad). Temperature-graded (clean
-   ≤0.3, onset ~0.6, salad 1.0), NOT length-driven (0.3 holds over 24K chars).
-   Decoded on BOTH the production student and ThinkingCap → generic hd256/FP8,
-   not checkpoint-specific.
+| | 400 tok | 2000 tok greedy | 2000 tok temp=1.0 |
+|---|---|---|---|
+| ThinkingCap-FP8 | COHERENT | coherent (loops, no answer) | **SALAD** na0.004 |
+| **base**-FP8 | COHERENT | **COHERENT** (code, finish=stop) | **SALAD** ttr0.10 |
+| ThinkingCap-**bf16** | COHERENT | COHERENT | **SALAD** na0.018 |
 
-**The silent damage:** `--rollout-temperature` defaulted to 1.0 (F.6, for
-non-empty behavior logprobs). Every agent-OPD rollout on the hd256/FP8 student
-was therefore sampling the corrupted distribution — degradation we had been
-attributing to thinking-chain length / timeouts.
+Control: temp=1.0 with **top_k=1** → base & bf16 both COHERENT, finish=stop.
+**Temperature is the flipped variable, uniform across weights and quant.** These
+are thinking models with no `repetition_penalty`; long unconstrained temp=1.0
+sampling degenerates into loops + occasional garbage. Greedy/top_k=1 are always
+coherent. Short (≤400 tok) is always coherent — the failure only shows at length.
 
-**A wrong "fix" (`9851ced6b`) sent us on a norm detour — reverted.** It loaded
-the per-layer `input_layernorm`/`post_attention_layernorm` as `w−1`, assuming
-STANDARD format. But these norms ship OFFSET (HF convention, `mean|w| ≈ 0.24 <
-0.75`) and the CUDA `(1+w)` kernel already matches that raw — confirmed by the
-Metal reference, which detects offset (`mean|w| < 0.75`) and converts with `w+1`,
-identical to the CUDA kernel. `9851ced6b` double-offset input/post →
-`(1+(w−1)) = w ≈ 0.24` → 1/5 scale/layer → greedy SALAD (decoded regression,
-2 clean builds). Reverted (`485eefe0d`). The final norm (`mean|w| 3.3 > 0.75`,
-direct) correctly stays `w−1`. **The norm handling was never the temp>0 bug.**
+The prior "nonascii 0.37 multilingual salad, base coherent / ThinkingCap salad"
+**does not reproduce on the clean binary** — it was an artifact of a
+pre-norm-revert binary (`9851ced6b` era) and/or long unseeded generation.
 
-**The real bug — MoE routing flip from a broken FP8 export (NOT our runtime,
-NOT generic FP8 noise).** Localized by config diff + same-binary A/B:
+## The false chain — each killed by measurement (CPU forensics, then GPU A/B)
 
-| bf16-kept | base Qwen3.6-27B-FP8 | ThinkingCap-FP8 |
-|---|---|---|
-| `mlp.gate` (router) | 65/65 layers | **1/65** |
-| `shared_expert_gate` | 65/65 | **0/65** |
+1. **"MoE router was FP8-quantized" → DEAD.** The model has *no routers*: it is a
+   **hybrid linear-attention** (Mamba-style) arch — 48/64 layers are
+   `linear_attn.*`, 16 are softmax `self_attn`. The "router 65/65 vs 1/65" table
+   was a loose grep matching `.mlp.gate_proj` (dense FFN) as `.mlp.gate` (router).
+2. **"dense hd256" → WRONG.** Never checked against `layer_types`; it is hybrid
+   linear-attn, head_dim 256, `full_attention_interval` 4.
+3. **"FP8 scales broken" → DEAD.** base & ThinkingCap `weight_scale_inv` are
+   **bit-identical** (1.48M values, ratio 1.0000, zero 0/inf/nan). The export
+   reused base's scale grid — which is fine, see (4).
+4. **"FP8 value clipping against frozen scales" → DEAD.** Dequant(ThinkingCap-FP8)
+   vs ThinkingCap-bf16 = flat **2.65%** relative error (intrinsic e4m3 block-128
+   noise), saturation 0.01%, forced-clip 0.003%. A correct-requant control (scale
+   recomputed from bf16 truth) lands on the *same* 0.0265. FP8 is faithful.
+5. **"sampling/rope/template/eos config mismatch" → DEAD.** ThinkingCap's
+   `generation_config` (temp 1.0/top_p 0.95/top_k 20), rope, `chat_template.jinja`
+   (byte-identical sha256), and eos set are all identical to base.
+6. **The premise "base coherent / ThinkingCap salad at temp=1.0" → ARTIFACT.**
+   Does not reproduce on the clean binary; base & ThinkingCap are indistinguishable.
 
-Same reverted binary, temp=1.0: **base (bf16 router) coherent (nonascii 0);
-ThinkingCap (FP8 router) salad (nonascii 0.37)**. The only structural difference
-is router quantization — identical FP8 expert/attention GEMMs, identical bf16
-lm_head/norms. FP8-quantizing the MoE router perturbs its gate logits →
-per-token top-k expert selection flips → wrong experts corrupt the residual tail
-→ greedy top-1 survives, temp>0 samples the scrambled tail → salad.
-
-**Two corrections to earlier reads:** (1) it is NOT smooth FP8 accumulation — if
-it were, the base (same expert GEMMs) would salad too; it doesn't. (2) "The whole
-OPD lane silently degraded" was a phantom — the base FP8 student is fine at
-temp=1.0; the earlier "current student salad" was on the norm-regression binary /
-conflated with ThinkingCap.
-
-Router weights are stored lossy-FP8 in ThinkingCap's checkpoint → a loader
-force-bf16 can't recover the lost precision (dequant keeps the loss). **Fix
-(chosen): re-export ThinkingCap-FP8 with `modules_to_not_convert` covering all
-`mlp.gate` + `shared_expert_gate` (match the base), from the bf16 ThinkingCap we
-already have.** experts/attention stay FP8. Then restore rollout temp=1.0.
-
-Revert A/B (greedy, temp=0.0): reverted binary → both FP8 models coherent
-("Paris"/"64", nonascii 0); `00224faa0` (9851ced6b) → salad. Revert confirmed.
+Separately killed earlier: the norm mis-fix `9851ced6b` (loaded input/post
+layernorm as `w−1`, double-offsetting HF's offset norms → greedy salad), reverted
+`485eefe0d`/`d50e4782f`. The Metal reference (`mean|w|<0.75 → w+1`) settled that
+the CUDA `(1+w)` offset kernel was already correct.
 
 ## Fix
 
-- **Workaround (shipped, 2394a2ab0):** `--rollout-temperature` default 1.0→0.3
-  (still >0, F.6 logprobs intact) + rubric-lane nucleus hygiene (top_p 0.95 /
-  top_k 20). Verified by decoded-case coherence A/B + a long thinking-on
-  nonascii=0.0000 gate on the SLO shape.
-- **Root fix (pending, #55):** branch on Phase 0 — FP8 quant/dequant precision,
-  or a hd256 compute-convention residual. Then restore temp=1.0.
+- **Shipped (`2394a2ab0`), now re-attributed as correct, not a workaround:**
+  `--rollout-temperature` 1.0→0.3 (+ rubric nucleus hygiene top_p0.95/top_k20).
+  temp=0.3 (or top_k=1) is coherent across all variants; this is the right
+  operating point for these no-rep-penalty thinking models at length, NOT a patch
+  for a quant/weights bug. Keep it.
+- **Voided:** #55 router bf16 re-export (no routers → no-op); any FP8 requant (FP8
+  is faithful); any bf16 swap (bf16 salads identically).
+- **Open (cheap):** logprob spot-check — is the occasional non-ASCII token at
+  temp=1.0 a top_p=0.95 nucleus leak (our CUDA sampler bug) or a genuine model
+  tail? Verdict pending; either way the operating fix (temp=0.3) stands.
 
 ## Rule
 
-**Never FP8-quantize a MoE router.** The gate is tiny and routing is
-discrete — a ~1-2% weight perturbation flips top-k expert selection, and greedy
-hides it (top-1 survives) while temp>0 exposes it as salad. Correctly-exported
-FP8 checkpoints keep `mlp.gate`/`shared_expert_gate` bf16 (vLLM/SGLang standard);
-**verify a third-party quant export's `modules_to_not_convert` before trusting
-it** — a config diff against a known-good sibling checkpoint localizes a broken
-export in 2 minutes, no rebuild.
-
-**Gate a served/quantized model on the actual SAMPLED generation at the
-production temperature, never on greedy alone.** Greedy (argmax) survives a
-mis-scaled distribution tail that temp>0 sampling turns into garbage — a
-"greedy coherent" smoke test passes a model that is broken for every real
-rollout. When temp>0 output degrades, A/B the ONE variable (head_dim, quant,
-temperature) before blaming the nearest recent change: the salad here looked
-like a sampler-plumbing regression but was an orthogonal kernel-numerics bug two
-lanes away. See also [[feedback_validate_comparison_inputs_before_bug]] (decode
-the cases) and the greedy-decode-the-generation lesson
-(2026-05-26-fp8-kv-catastrophic-was-test-artifact).
+- **Reproduce the premise on the CURRENT clean binary BEFORE building a
+  root-cause chain.** The entire five-probe forensic tower stood on a decoded A/B
+  from a prior session whose *sibling* inferences (the router table, "dense") were
+  themselves artifacts. Once two claims from that session fell, the premise itself
+  owed re-verification first — not more probes built on top. One clean-binary
+  A/B at the end overturned everything the CPU forensics had "narrowed."
+- **Tensor-name / architecture ground truth, not loose grep.** `.mlp.gate` matched
+  `.mlp.gate_proj`; "dense" was never checked against `layer_types`. Read the
+  index keys and the arch config before naming a mechanism. See
+  [[feedback_validate_comparison_inputs_before_bug]],
+  [[feedback_dont_file_hypothesis_as_root_cause]].
+- **Temp-graded + length-dependent symptom ⇒ characterize the sampling path
+  first.** A/B the sampling variables (temperature, top_k, length) and a reference
+  weight/quant BEFORE blaming weights or quant. Here greedy/top_k=1 coherence +
+  temp=1.0 salad across base *and* ThinkingCap, FP8 *and* bf16, localized it to
+  temperature-at-length in one controlled run. Gate a served model on the actual
+  SAMPLED generation at production temperature *and length*, never greedy or short
+  alone (2026-05-26-fp8-kv-catastrophic-was-test-artifact).
