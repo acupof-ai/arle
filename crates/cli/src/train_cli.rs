@@ -132,19 +132,10 @@ fn run_ppl(args: TrainPplArgs) -> Result<()> {
         );
     }
 
-    let page_size = 16usize;
     let engine = LoadedInferenceEngine::load_with_config(
         model_path,
         /*cuda_graph=*/ true,
-        EngineLoadConfig {
-            num_slots: 1,
-            page_size,
-            total_pages: ctx.div_ceil(page_size),
-            max_prompt_tokens: ctx,
-            max_total_tokens: ctx,
-            chunked_prefill_size: Some(ctx),
-            ..EngineLoadConfig::default()
-        },
+        EngineLoadConfig::single_sequence(ctx),
     )
     .with_context(|| format!("load engine from {model_path}"))?;
 
@@ -4326,7 +4317,6 @@ fn load_opd_infer_teacher(
     use infer_api::{EngineLoadConfig, LoadedInferenceEngine};
 
     let max_seq_len = max_seq_len.max(128);
-    let page_size = 16usize;
     eprintln!(
         "[arle train opd] loading infer teacher from {} (max_seq_len={max_seq_len})",
         teacher_dir.display()
@@ -4336,15 +4326,7 @@ fn load_opd_infer_teacher(
             .to_str()
             .ok_or_else(|| anyhow!("teacher model path is not valid UTF-8"))?,
         true,
-        EngineLoadConfig {
-            num_slots: 1,
-            page_size,
-            total_pages: max_seq_len.div_ceil(page_size),
-            max_prompt_tokens: max_seq_len,
-            max_total_tokens: max_seq_len,
-            chunked_prefill_size: Some(max_seq_len),
-            ..EngineLoadConfig::default()
-        },
+        EngineLoadConfig::single_sequence(max_seq_len),
     )
     .with_context(|| format!("load infer teacher from {}", teacher_dir.display()))?;
 
@@ -4384,7 +4366,6 @@ fn load_opd_infer_student(
     use infer_api::{EngineLoadConfig, LoadedInferenceEngine};
 
     let max_seq_len = max_seq_len.max(128);
-    let page_size = 16usize;
     eprintln!(
         "[arle train opd] loading infer rollout student from {} (max_seq_len={max_seq_len})",
         student_dir.display()
@@ -4395,15 +4376,9 @@ fn load_opd_infer_student(
             .ok_or_else(|| anyhow!("student model path is not valid UTF-8"))?,
         true,
         EngineLoadConfig {
-            num_slots: 1,
-            page_size,
-            total_pages: max_seq_len.div_ceil(page_size),
-            max_prompt_tokens: max_seq_len,
-            max_total_tokens: max_seq_len,
-            chunked_prefill_size: Some(max_seq_len),
             dspark_draft_model: runtime.dspark_draft_model.clone(),
             dspark_conf_threshold: runtime.dspark_conf_threshold,
-            ..EngineLoadConfig::default()
+            ..EngineLoadConfig::single_sequence(max_seq_len)
         },
     )
     .with_context(|| format!("load infer rollout student from {}", student_dir.display()))?;

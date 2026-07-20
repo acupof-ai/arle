@@ -228,6 +228,22 @@ impl EngineLoadConfig {
         self.mtp_draft_tokens.is_some() || self.mtp_draft_topk.is_some()
     }
 
+    /// Single-slot, full-context teacher-forcing load: one sequence, no batching,
+    /// page_size 16, static KV reservation sized to `seq`. Shared by the OPD
+    /// teacher/student loaders and the PPL harness. Struct-update over this for
+    /// the few sites that also carry dspark draft fields.
+    pub fn single_sequence(seq: usize) -> Self {
+        Self {
+            num_slots: 1,
+            page_size: 16,
+            total_pages: seq.div_ceil(16),
+            max_prompt_tokens: seq,
+            max_total_tokens: seq,
+            chunked_prefill_size: Some(seq),
+            ..Self::default()
+        }
+    }
+
     /// Whether an L3 (NVMe) KV spill was requested at all.
     #[allow(dead_code)]
     fn kv_ssd_requested(&self) -> bool {
