@@ -1267,7 +1267,6 @@ fn generate_tilelang_artifacts_per_sm(
     );
     let force_regen = env_truthy("ARLE_TILELANG_REGEN");
     let cache_root = kernel_cache_root();
-    let toolchain = tl.get();
     let nvcc = resolve_executable(&format!("{cuda_path}/bin/nvcc"));
     let cuda_include = PathBuf::from(cuda_path).join("include");
     let wrapper: Vec<String> = env_nonempty("ARLE_NVCC_WRAPPER")
@@ -1278,7 +1277,10 @@ fn generate_tilelang_artifacts_per_sm(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let toolchain_id = tilelang_toolchain_id(toolchain, &nvcc, &wrapper, &cuda_include);
+    // Lazily resolved — only when a vendored/cached artifact is unavailable and
+    // a kernel must be (re)generated. A fully-vendored build never touches this,
+    // so it never needs TileLang installed.
+    let toolchain_id_cell: std::cell::OnceCell<String> = std::cell::OnceCell::new();
     let mut results = Vec::new();
 
     for sm in sm_targets {
@@ -1289,7 +1291,6 @@ fn generate_tilelang_artifacts_per_sm(
         let target = format!("cuda -arch=sm_{sm_token}");
 
         let src_hash = tilelang_kernel_src_hash(base_spec, sm_token);
-        let cache_id = tilelang_cache_id(&src_hash, sm_token, &toolchain_id);
         let per_sm_artifact_dir = format!("{}_sm{sm_token}", base_spec.artifact_dir);
         let per_sm_out_name = format!("{}_sm{sm_token}", base_spec.out_name);
         let per_sm_kernel_name = format!("{}_sm{sm_token}", base_spec.kernel_name);
@@ -1326,6 +1327,12 @@ fn generate_tilelang_artifacts_per_sm(
             results.push((sm_token.clone(), func, consumed_c));
             continue;
         }
+
+        // Reached only when the vendored artifact is missing/invalid — now we
+        // may need the toolchain (cache lookup or regeneration).
+        let toolchain_id = toolchain_id_cell
+            .get_or_init(|| tilelang_toolchain_id(tl.get(), &nvcc, &wrapper, &cuda_include));
+        let cache_id = tilelang_cache_id(&src_hash, sm_token, toolchain_id);
 
         let cache_entry = cache_root
             .as_ref()
@@ -1369,6 +1376,7 @@ fn generate_tilelang_artifacts_per_sm(
 
         let _ = std::fs::remove_dir_all(&out_artifact_dir);
 
+        let toolchain = tl.get();
         let mut command = Command::new(&toolchain.python);
         let output = command
             .arg(&generator_path)
