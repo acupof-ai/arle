@@ -43,10 +43,20 @@ identical to the CUDA kernel. `9851ced6b` double-offset input/post →
 2 clean builds). Reverted (`485eefe0d`). The final norm (`mean|w| 3.3 > 0.75`,
 direct) correctly stays `w−1`. **The norm handling was never the temp>0 bug.**
 
-**The real bug (still open):** on hd256/FP8, greedy + temp=0.3 are coherent but
-temp=1.0 is salad — a distribution-tail issue, most likely FP8 logit-tail noise
-(both affected models are FP8). Isolation pending (bf16 @ temp=1.0). The
-temp=0.3 workaround holds it.
+**The real bug — isolated to FP8 (dtype), confirmed by A/B.** Same reverted
+binary, same prompt/sampling (temp=1.0 top_k20 top_p0.95), hd256 27B:
+- **bf16** → `The capital of France is Paris` coherent, **nonascii 0.000**
+- **FP8** → `Paris パリ Παρίσιμο Париж…` salad, **nonascii 0.409**
+
+bf16 clean ⇒ NOT a hd256 compute residual (that would corrupt bf16 too). The
+temp>0 salad is **FP8 logit-tail noise**: FP8 quantization perturbs the logit
+tail; greedy argmax survives, temp>0 samples it. Fix lives in the FP8
+quant/dequant or FP8 compute precision, not the hd256 kernels. Localization
+(per-layer bf16↔FP8 divergence + MoE routing agreement) in progress. temp=0.3
+workaround holds until fixed.
+
+Revert A/B (greedy, temp=0.0): reverted binary → both FP8 models coherent
+("Paris"/"64", nonascii 0); `00224faa0` (9851ced6b) → salad. Revert confirmed.
 
 ## Fix
 
