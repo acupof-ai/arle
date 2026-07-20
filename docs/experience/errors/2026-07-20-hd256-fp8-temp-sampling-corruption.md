@@ -33,8 +33,15 @@ non-empty behavior logprobs). Every agent-OPD rollout on the hd256/FP8 student
 was therefore sampling the corrupted distribution — degradation we had been
 attributing to thinking-chain length / timeouts.
 
-FP8-noise vs hd256-compute-residual is still being isolated (Phase 0: hd256-bf16
-@ temp=1.0).
+**Confounder resolved — it is the hd256 COMPUTE residual, FP8-independent.**
+Root cause pinned & patched (`9851ced6b` + `bf66a3854`): the per-layer
+`input_layernorm` / `post_attention_layernorm` were loaded raw, but they ship in
+STANDARD format (~1-centered) and the `rms_norm_offset` trunk kernel applies
+`(1 + weight)` → a ~2× multiplier per layer, compounding across 64 layers.
+`b4b293f0c` had fixed only the q/k norms. Fix: load these norms as `(w − 1)` too
+(`load_final_norm_offset`). Still owes an empirical temp=1.0 gate on a rebuilt
+binary (the pod binary predates the fix) — a 2×/layer error "should" have broken
+greedy too, so the mechanism magnitude is measured, not assumed.
 
 ## Fix
 
