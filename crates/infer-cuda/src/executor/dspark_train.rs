@@ -2,7 +2,7 @@
 //!
 //! After each DSpark verify+accept step, the (draft_tokens, draft_logits,
 //! accepted_count) tuple is pushed into a bounded ring buffer. A separate
-//! training thread drains it and runs REINFORCE against the acceptance reward.
+//! training thread drains it and runs acceptance-weighted policy gradient against the acceptance reward.
 //!
 //! The capture runs AFTER the verify forward has completed, on already-computed
 //! data. It copies the logits to host (small: block_size × vocab bf16) and

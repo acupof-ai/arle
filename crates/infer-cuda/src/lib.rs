@@ -110,7 +110,7 @@ pub use executor::CudaKvCacheDtype;
 /// DSpark train sidecar: experience buffer for test-time training of the draft
 /// model. The inference hot path pushes (draft_tokens, draft_logits,
 /// target_logits, accepted_count) tuples; a separate trainer drains them and
-/// runs REINFORCE against the acceptance reward.
+/// runs acceptance-weighted policy gradient against the acceptance reward.
 #[cfg(feature = "cuda")]
 pub use executor::dspark_train::{
     DsparkExperience, DsparkExperienceBuffer, buffer as dspark_experience_buffer,
