@@ -112,7 +112,7 @@ impl Qwen35DsparkHead {
 
     /// Hot-swap the Markov head weights from a host f32 snapshot.
     ///
-    /// Called by the RL sidecar trainer after each REINFORCE step. The new
+    /// Called by the train sidecar after each acceptance-weighted step. The new
     /// weights are uploaded to a staging buffer, then the `data` pointer is
     /// flipped under the device stream's ordering guarantee (the hot path
     /// reads `markov.w1`/`markov.w2` only after a stream sync at step entry).

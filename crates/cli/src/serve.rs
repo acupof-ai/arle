@@ -174,7 +174,7 @@ fn run_config(config: ServeConfig) -> ExitCode {
         config.options.port,
     );
 
-    // DSpark RL sidecar: load the engine once, spawn the REINFORCE trainer
+    // DSpark train sidecar: load the engine once, spawn the acceptance-weighted trainer
     // thread, then serve over the same engine's local router. The trainer
     // drains the experience buffer the hot path populates and pushes updated
     // Markov-head weights back into the running engine after each step.
@@ -192,7 +192,7 @@ fn run_config(config: ServeConfig) -> ExitCode {
     }
 }
 
-/// DSpark serve path: load the engine, spawn the RL sidecar trainer, and serve
+/// DSpark serve path: load the engine, spawn the train sidecar, and serve
 /// over the engine's local router so the trainer can push weight updates back
 /// into the same running engine.
 #[cfg(feature = "cuda")]
@@ -208,25 +208,27 @@ fn run_dspark_serve(config: ServeConfig) -> ExitCode {
     ) {
         Ok(e) => Arc::new(e),
         Err(err) => {
-            eprintln!("[ARLE serve] failed to load engine for DSpark RL: {err:#}");
+            eprintln!("[ARLE serve] failed to load engine for DSpark train: {err:#}");
             return ExitCode::FAILURE;
         }
     };
 
-    let _guard = match train::dspark_rl::spawn_dspark_rl_sidecar(
+    let _guard = match train::dspark_train::spawn_dspark_train_sidecar(
         Arc::clone(&engine),
-        train::dspark_rl::DsparkRlConfig::default(),
+        train::dspark_train::DsparkTrainConfig::default(),
     ) {
         Ok(Some(guard)) => {
-            eprintln!("[ARLE serve] DSpark RL sidecar trainer started");
+            eprintln!("[ARLE serve] DSpark train sidecar started");
             guard
         }
         Ok(None) => {
-            eprintln!("[ARLE serve] warning: DSpark RL sidecar not started (no experience buffer)");
+            eprintln!(
+                "[ARLE serve] warning: DSpark train sidecar not started (no experience buffer)"
+            );
             return ExitCode::FAILURE;
         }
         Err(err) => {
-            eprintln!("[ARLE serve] failed to start DSpark RL sidecar: {err:#}");
+            eprintln!("[ARLE serve] failed to start DSpark train sidecar: {err:#}");
             return ExitCode::FAILURE;
         }
     };

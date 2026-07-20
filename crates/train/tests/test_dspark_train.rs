@@ -1,4 +1,4 @@
-//! DSpark RL sidecar trainer smoke test.
+//! DSpark trainer smoke test.
 //!
 //! Verifies:
 //! 1. Trainer constructs without error
@@ -7,7 +7,7 @@
 //! 4. Weights can be extracted and have the right shape
 //! 5. Multiple steps run cleanly (no resource leaks / tape issues)
 
-use train::dspark_rl::{DsparkExperience, DsparkRlConfig, DsparkRlTrainer};
+use train::dspark_train::{DsparkExperience, DsparkTrainConfig, DsparkTrainer};
 
 const VOCAB: usize = 100;
 const BLOCK: usize = 4;
@@ -33,15 +33,14 @@ fn make_experience(accepted: usize) -> DsparkExperience {
 }
 
 #[test]
-fn dspark_rl_trainer_smoke() {
-    let config = DsparkRlConfig {
-        vocab_size: VOCAB,
+fn dspark_trainer_smoke() {
+    let config = DsparkTrainConfig {
         markov_rank: RANK,
         learning_rate: 1e-3,
         batch_size: 4,
         baseline_ema_alpha: 0.1,
     };
-    let mut trainer = DsparkRlTrainer::new(config).expect("trainer should construct");
+    let mut trainer = DsparkTrainer::new(config).expect("trainer should construct");
 
     // Mix of high and low acceptance experiences.
     let experiences: Vec<DsparkExperience> = (0..8)
@@ -78,29 +77,27 @@ fn dspark_rl_trainer_smoke() {
 }
 
 #[test]
-fn dspark_rl_trainer_empty_batch() {
-    let config = DsparkRlConfig {
-        vocab_size: VOCAB,
+fn dspark_trainer_empty_batch() {
+    let config = DsparkTrainConfig {
         markov_rank: RANK,
         ..Default::default()
     };
-    let mut trainer = DsparkRlTrainer::new(config).unwrap();
+    let mut trainer = DsparkTrainer::new(config).unwrap();
     let loss = trainer.train_step(&[]).unwrap();
     assert_eq!(loss, 0.0, "empty batch should return 0 loss");
 }
 
 #[test]
-fn dspark_rl_trainer_converges() {
+fn dspark_trainer_converges() {
     // If we always give the same experience with full acceptance, the trainer
     // should increase the log-prob of those tokens (loss decreases).
-    let config = DsparkRlConfig {
-        vocab_size: VOCAB,
+    let config = DsparkTrainConfig {
         markov_rank: RANK,
         learning_rate: 0.1,
         batch_size: 4,
         baseline_ema_alpha: 0.5,
     };
-    let mut trainer = DsparkRlTrainer::new(config).unwrap();
+    let mut trainer = DsparkTrainer::new(config).unwrap();
 
     let exp = make_experience(BLOCK); // full acceptance
     let batch = vec![exp.clone(); 4];

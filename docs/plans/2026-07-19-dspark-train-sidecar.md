@@ -1,13 +1,13 @@
-# DSpark RL Sidecar — Test-Time Training for Draft Models
+# DSpark Train Sidecar — Acceptance-Weighted Training for Draft Models
 
-> Status: **Phase 1 shipped** (2026-07-20). Experience capture + REINFORCE
+> Status: **Phase 1 shipped** (2026-07-20). Experience capture + acceptance-weighted
 > trainer + Markov-head weight hot-swap verified end-to-end on H20
 > (Qwen3.6-27B-FP8 + dspark-aeon draft): 6 training steps, loss −4.04→−3.18,
 > zero errors. Phase 2 (PPO clip, util guard, checkpointing) pending.
 
 ## Decision
 
-Train the DSpark draft model **in-production** via a sidecar RL loop that
+Train the DSpark draft model **in-production** via a sidecar training loop that
 optimizes the actual acceptance rate, instead of the offline CE/L1 proxy loss
 used by DeepSpec/SpecForge. The draft model already runs in the inference
 engine (`crates/infer-cuda/src/qwen35/dspark.rs`); we add an asynchronous
@@ -15,9 +15,9 @@ training thread that consumes (context, draft_logits, accepted_count) tuples
 emitted by the verify step and updates the draft weights without blocking
 serving.
 
-## Why RL over offline training
+## Why in-production training over offline
 
-| | Offline (DeepSpec) | RL sidecar (this) |
+| | Offline (DeepSpec) | Train sidecar (this) |
 |---|---|---|
 | Data | ~38 TB precomputed target cache | live traffic, zero storage |
 | Objective | CE + L1 proxy for acceptance | **direct** acceptance reward |
@@ -49,7 +49,7 @@ The acceptance rate is already counted at `spec_decode.rs:297`
 │    batch = ring_buffer.drain(n=64)                   │
 │    if batch empty: sleep(100ms); continue            │
 │                                                      │
-│    # REINFORCE with advantage                        │
+│    # Acceptance-weighted policy gradient                        │
 │    log_prob = draft_logits.log_softmax().gather(tokens) │
 │    advantage = accepted - baseline_ema               │
 │    loss = -(log_prob * advantage).mean()             │
@@ -76,7 +76,7 @@ forward. `accepted_count` is the prefix length that matched. Normalizing by
 
 ## Components
 
-### 1. Experience capture hook (`crates/infer-cuda/src/executor/dspark_rl.rs`)
+### 1. Experience capture hook (`crates/infer-cuda/src/executor/dspark_train.rs`)
 
 After the DSpark verify+accept step in `qwen35.rs`, push a tuple to a global
 `DsparkExperienceBuffer`:
@@ -96,11 +96,11 @@ The hook runs **after** the verify, on already-computed data. It copies the
 logits to host (small: block_size × vocab bf16→f32) and returns immediately.
 No sync, no blocking of the hot path.
 
-### 2. Sidecar trainer (`crates/train/src/dspark_rl.rs`)
+### 2. Sidecar trainer (`crates/train/src/dspark_train.rs`)
 
 A standalone thread that:
 - drains the `DsparkExperienceBuffer` in batches (`batch_size=64`)
-- computes REINFORCE loss using the **train-crate autograd** (`CpuBackend`)
+- computes acceptance-weighted loss using the **train-crate autograd** (`CpuBackend`)
 - runs AdamW step on the **Markov head only** (`w1` embedding [vocab, rank] +
   `w2` linear [rank, vocab]); the parallel backbone stays frozen
 - calls back into the inference engine to swap Markov-head weights
@@ -120,13 +120,13 @@ weights after every step; the swap is atomic w.r.t. the hot path.
 ## Implementation phases
 
 ### Phase 0 — Instrumentation ✅ (shipped)
-- Add `ExperienceBuffer` + capture hook in `dspark_rl.rs` (called from `qwen35.rs`)
+- Add `ExperienceBuffer` + capture hook in `dspark_train.rs` (called from `qwen35.rs`)
 - Log acceptance distribution to confirm reward signal quality
 - **Exit**: see real acceptance rates per step
 
 ### Phase 1 — CPU trainer + weight swap ✅ (shipped 2026-07-20)
-- Implement `DsparkRlTrainer` in autograd (Markov head only: `w1` embedding + `w2` linear; backbone frozen)
-- Implement REINFORCE loss + AdamW + EMA baseline
+- Implement `DsparkTrainer` in autograd (Markov head only: `w1` embedding + `w2` linear; backbone frozen)
+- Implement acceptance-weighted loss + AdamW + EMA baseline
 - Wire weight hot-swap via `LoadedInferenceEngine::update_dspark_markov_weights`
 - **Exit**: end-to-end verified on H20 — 6 training steps, loss −4.04→−3.18, zero errors
 
@@ -141,10 +141,10 @@ weights after every step; the swap is atomic w.r.t. the hot path.
 
 | File | Change |
 |------|--------|
-| `crates/infer-cuda/src/executor/dspark_rl.rs` | `DsparkExperienceBuffer` + `capture_dspark_experience` hook (called from `qwen35.rs` hot path after verify) |
+| `crates/infer-cuda/src/executor/dspark_train.rs` | `DsparkExperienceBuffer` + `capture_dspark_experience` hook (called from `qwen35.rs` hot path after verify) |
 | `crates/infer-cuda/src/executor/qwen35.rs` | calls `capture_dspark_experience` after each DSpark accept step |
-| `crates/train/src/dspark_rl.rs` | sidecar trainer: `DsparkRlTrainer` (REINFORCE + AdamW + EMA baseline) + `spawn_dspark_rl_sidecar` (RAII guard) + `InferCudaExperienceSource` adapter |
-| `crates/cli/src/serve.rs` | `run_dspark_serve`: loads engine, spawns RL sidecar, serves over engine's local router so weight updates land in the same running engine |
+| `crates/train/src/dspark_train.rs` | sidecar trainer: `DsparkTrainer` (acceptance-weighted + AdamW + EMA baseline) + `spawn_dspark_train_sidecar` (RAII guard) + `InferCudaExperienceSource` adapter |
+| `crates/cli/src/serve.rs` | `run_dspark_serve`: loads engine, spawns train sidecar, serves over engine's local router so weight updates land in the same running engine |
 | `crates/infer-api/src/loaded.rs` | `update_dspark_markov_weights(&self, ...)` (hot-swap via `run_on_engine`) + `dspark_experience_buffer()` accessor |
 | `crates/infer-api/src/serve.rs` | `bind_and_serve` made `pub` so the CLI can serve an already-built router |
 | `crates/infer-api/src/lib.rs` | re-export `bind_and_serve` + `ServeShutdown` |

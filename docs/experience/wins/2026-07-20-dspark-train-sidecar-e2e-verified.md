@@ -1,9 +1,9 @@
-# DSpark RL sidecar — end-to-end verified (Phase 1 shipped)
+# DSpark train sidecar — end-to-end verified (Phase 1 shipped)
 
 ## Context
 
-The DSpark RL sidecar plan (`docs/plans/2026-07-19-dspark-rl-sidecar.md`)
-Phase 1 wired a REINFORCE trainer into the `arle serve --spec-type dspark`
+The DSpark train sidecar plan (`docs/plans/2026-07-19-dspark-train-sidecar.md`)
+Phase 1 wired an acceptance-weighted trainer into the `arle serve --spec-type dspark`
 path: the inference hot path captures (draft_tokens, draft_logits, accepted)
 tuples into a global buffer; a background thread drains it, runs a policy
 gradient step on the Markov head, and hot-swaps the updated weights back into
@@ -18,23 +18,23 @@ End-to-end verification on H20 (8×H20, CUDA), model pair:
 
 | Check | Result |
 |-------|--------|
-| "DSpark RL sidecar trainer started" | Yes |
-| `dspark_rl: loss=` training steps | 6 |
+| "DSpark train sidecar started" | Yes |
+| `dspark_train: loss=` training steps | 6 |
 | `train step failed` | 0 |
 | `weight update failed` | 0 |
 | Loss trend | −4.04 → −3.49 → −3.09 → −2.95 → −3.36 → −3.18 (decreasing) |
 | Baseline EMA | 0.495 → 0.471 (adapting) |
 | Batch sizes | n=1, then n=63–64 (buffer draining) |
 
-Pipeline: experience capture → buffer drain → REINFORCE step → weight
+Pipeline: experience capture → buffer drain → acceptance-weighted step → weight
 hot-swap — all functioning, zero errors.
 
 ## Bugs found & fixed
 
-1. **Hardcoded `vocab_size`** (`crates/train/src/dspark_rl.rs`):
-   `DsparkRlConfig::default()` had `vocab_size: 151936` but Qwen3.6-27B has
+1. **Hardcoded `vocab_size`** (`crates/train/src/dspark_train.rs`):
+   `DsparkTrainConfig::default()` had `vocab_size: 151936` but Qwen3.6-27B has
    `vocab_size: 248320`. Every training step failed with index-out-of-bounds /
-   shape mismatch. **Fix**: removed `vocab_size` from `DsparkRlConfig`; the
+   shape mismatch. **Fix**: removed `vocab_size` from `DsparkTrainConfig`; the
    trainer lazily initializes Markov params from the first experience's actual
    `vocab_size`, making it model-agnostic at construction.
 
