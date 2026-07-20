@@ -544,7 +544,7 @@ target-model verification on low-probability tail tokens under high concurrency.
 |--------------|-------------------|---------------------------|
 | Sequential MTP head, chain verify | **Have it** — `Dsv4MtpLayer` + chain-verify §6 (the EAGLE-style lane DSpark contrasts) | — |
 | Parallel backbone draft | Not present | New draft module producing all `block_size` positions in one pass; would reuse `forward_tokens_verify_scheduled` for verify |
-| Markov / RNN sequential head | Not present | Lightweight head on top of the parallel backbone; small autograd surface (`crates/autograd`) or a fused kernel |
+| Markov / RNN sequential head | **Implemented** — `dspark-sp+markov` draft checkpoints load the Markov head; the [DSpark RL sidecar](plans/2026-07-19-dspark-rl-sidecar.md) trains it in-production via REINFORCE on the acceptance reward (Phase 1 shipped 2026-07-20) | Lightweight head on top of the parallel backbone; small autograd surface (`crates/autograd`) or a fused kernel |
 | Confidence head + throughput-aware scheduler | Not present; we have a coarse `ARLE_DSV4_MTP_ADAPTIVE` accept-EMA skip | The scheduler is the **most runtime-differentiating** piece — it needs the live batch/SLO state that `infer-core`'s scheduler already owns. This is where ARLE's runtime authority could add value over a bolt-on draft. |
 | Verify length = dynamic | Fixed `depth` (`--mtp-draft-tokens`) | Make `depth` per-step adaptive from a confidence signal + batch occupancy |
 

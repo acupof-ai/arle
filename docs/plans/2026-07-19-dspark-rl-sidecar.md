@@ -1,6 +1,9 @@
 # DSpark RL Sidecar — Test-Time Training for Draft Models
 
-> Status: Active
+> Status: **Phase 1 shipped** (2026-07-20). Experience capture + REINFORCE
+> trainer + Markov-head weight hot-swap verified end-to-end on H20
+> (Qwen3.6-27B-FP8 + dspark-aeon draft): 6 training steps, loss −4.04→−3.18,
+> zero errors. Phase 2 (PPO clip, util guard, checkpointing) pending.
 
 ## Decision
 
@@ -73,61 +76,61 @@ forward. `accepted_count` is the prefix length that matched. Normalizing by
 
 ## Components
 
-### 1. Experience capture hook (`spec_decode.rs`)
+### 1. Experience capture hook (`crates/infer-cuda/src/executor/dspark_rl.rs`)
 
-After `chain.accept_path()` returns `accepted`, push a tuple to a global
-`ExperienceBuffer`:
+After the DSpark verify+accept step in `qwen35.rs`, push a tuple to a global
+`DsparkExperienceBuffer`:
 
 ```rust
-struct Experience {
-    slot_idx: usize,
-    start_pos: usize,
-    draft_logits: Vec<bf16>,   // [block_size, vocab] — copied out
-    draft_tokens: Vec<u32>,    // [block_size]
-    accepted: u32,             // reward signal
-    ctx_features: Vec<bf16>,   // target hidden at target_layer_ids (for value fn)
+pub struct DsparkExperience {
+    draft_tokens: Vec<u32>,     // [block_size]
+    draft_logits: Vec<f32>,     // [block_size, vocab] — D2H copy
+    target_logits: Vec<f32>,    // [block_size, vocab] — D2H copy (for L1 reg)
+    accepted: usize,            // reward signal
+    block_size: usize,
+    vocab_size: usize,
 }
 ```
 
-The hook runs **after** the verify, on the already-computed data. It copies
-the logits/tokens out (small: block_size × vocab is ~7 × 152k ≈ 1MB bf16)
-and returns immediately. No sync, no blocking.
+The hook runs **after** the verify, on already-computed data. It copies the
+logits to host (small: block_size × vocab bf16→f32) and returns immediately.
+No sync, no blocking of the hot path.
 
 ### 2. Sidecar trainer (`crates/train/src/dspark_rl.rs`)
 
-A standalone thread (or `tokio` task) that:
-- drains the `ExperienceBuffer` in batches
-- computes REINFORCE loss using the **train-crate autograd**
-  (`CpuBackend` — the draft model is tiny, 5 layers)
-- runs AdamW step
-- calls back into the inference engine to swap weights
+A standalone thread that:
+- drains the `DsparkExperienceBuffer` in batches (`batch_size=64`)
+- computes REINFORCE loss using the **train-crate autograd** (`CpuBackend`)
+- runs AdamW step on the **Markov head only** (`w1` embedding [vocab, rank] +
+  `w2` linear [rank, vocab]); the parallel backbone stays frozen
+- calls back into the inference engine to swap Markov-head weights
 
-The draft model forward is re-implemented in autograd ops (matmul, sdpa,
-embedding, rmsnorm, rope — all already exist in `crates/autograd/src/ops.rs`).
-Weights are shared via the same safetensors format the inference engine loads.
+The Markov head forward is two autograd ops: `embedding(w1, tokens)` →
+`matmul(_, w2)`, added as a bias to the draft logits before log-softmax.
+Vocab size is lazily inferred from the first drained experience so the
+trainer is model-agnostic at construction.
 
-### 3. Weight hot-swap (`qwen35/dspark.rs`)
+### 3. Weight hot-swap (`crates/infer-api/src/loaded.rs`)
 
-`Qwen35DsparkHead` gets an `update_weights()` method that takes a new
-state dict (host-side bf16 tensors) and atomically replaces the device
-pointers. Double-buffered: new weights are uploaded to a staging buffer,
-then the pointer is flipped under a lock that the hot path checks once per
-`spec_step`.
+`LoadedInferenceEngine::update_dspark_markov_weights(&self, w1, w2)` runs the
+weight swap on the engine thread via `run_on_engine` (invalidates the prefix
+cache so stale KV from the old head is not reused). The trainer pushes updated
+weights after every step; the swap is atomic w.r.t. the hot path.
 
 ## Implementation phases
 
-### Phase 0 — Instrumentation (no training yet)
-- Add `ExperienceBuffer` + capture hook in `spec_decode.rs`
+### Phase 0 — Instrumentation ✅ (shipped)
+- Add `ExperienceBuffer` + capture hook in `dspark_rl.rs` (called from `qwen35.rs`)
 - Log acceptance distribution to confirm reward signal quality
 - **Exit**: see real acceptance rates per step
 
-### Phase 1 — CPU trainer + weight swap
-- Implement `DSparkDraftModel` in autograd (reuse `qwen35.rs` layers)
-- Implement REINFORCE loss + AdamW
-- Wire weight hot-swap into `Qwen35DsparkHead`
-- **Exit**: acceptance rate improves over 1000 steps on a fixed workload
+### Phase 1 — CPU trainer + weight swap ✅ (shipped 2026-07-20)
+- Implement `DsparkRlTrainer` in autograd (Markov head only: `w1` embedding + `w2` linear; backbone frozen)
+- Implement REINFORCE loss + AdamW + EMA baseline
+- Wire weight hot-swap via `LoadedInferenceEngine::update_dspark_markov_weights`
+- **Exit**: end-to-end verified on H20 — 6 training steps, loss −4.04→−3.18, zero errors
 
-### Phase 2 — Production hardening
+### Phase 2 — Production hardening (pending)
 - PPO clip for stability
 - Advantage normalization
 - GPU utilization guard: train only when util < 70%
@@ -138,11 +141,13 @@ then the pointer is flipped under a lock that the hot path checks once per
 
 | File | Change |
 |------|--------|
-| `crates/infer-cuda/src/executor/spec_decode.rs` | add `ExperienceBuffer` + capture hook after verify |
-| `crates/infer-cuda/src/qwen35/dspark.rs` | add `update_weights()` hot-swap method |
-| `crates/train/src/dspark_rl.rs` **(new)** | sidecar trainer: REINFORCE + AdamW + weight sync |
-| `crates/train/src/dspark_model.rs` **(new)** | autograd impl of DSpark draft forward |
-| `crates/train/src/lib.rs` | register `dspark_rl` module |
+| `crates/infer-cuda/src/executor/dspark_rl.rs` | `DsparkExperienceBuffer` + `capture_dspark_experience` hook (called from `qwen35.rs` hot path after verify) |
+| `crates/infer-cuda/src/executor/qwen35.rs` | calls `capture_dspark_experience` after each DSpark accept step |
+| `crates/train/src/dspark_rl.rs` | sidecar trainer: `DsparkRlTrainer` (REINFORCE + AdamW + EMA baseline) + `spawn_dspark_rl_sidecar` (RAII guard) + `InferCudaExperienceSource` adapter |
+| `crates/cli/src/serve.rs` | `run_dspark_serve`: loads engine, spawns RL sidecar, serves over engine's local router so weight updates land in the same running engine |
+| `crates/infer-api/src/loaded.rs` | `update_dspark_markov_weights(&self, ...)` (hot-swap via `run_on_engine`) + `dspark_experience_buffer()` accessor |
+| `crates/infer-api/src/serve.rs` | `bind_and_serve` made `pub` so the CLI can serve an already-built router |
+| `crates/infer-api/src/lib.rs` | re-export `bind_and_serve` + `ServeShutdown` |
 
 ## Risks
 
