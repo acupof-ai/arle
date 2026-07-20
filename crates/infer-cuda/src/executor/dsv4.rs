@@ -145,7 +145,6 @@ pub(crate) struct Dsv4DsparkExec {
     /// Per-request token ceiling — the block spec step falls back to a single
     /// non-spec token when the worst-case chain would cross it.
     max_seq_len: usize,
-    max_prompt_tokens: Option<usize>,
     slots: Vec<Dsv4DsparkRuntime>,
 }
 
@@ -157,7 +156,6 @@ struct Dsv4DsparkRuntime {
     df: crate::dsv4::dspark::Dsv4DsparkSlotState,
     scratch: crate::dsv4::dspark::Dsv4DsparkScratch,
     attn_states: Vec<crate::attention::Dsv4LayerAttentionState>,
-    eligible: bool,
 }
 
 /// One demoted slot: the device-state image plus the executor-level MTP spec
@@ -475,7 +473,6 @@ impl Dsv4CudaExecutor {
         mtp_draft_topk: Option<usize>,
         dspark_draft_model: Option<&Path>,
         dspark_conf_threshold: f32,
-        dspark_max_prompt_tokens: Option<usize>,
     ) -> Result<Self> {
         ensure!(num_slots > 0, "Dsv4CudaExecutor requires at least one slot");
         ensure!(max_seq_len > 0, "Dsv4CudaExecutor requires max_seq_len > 0");
@@ -676,7 +673,6 @@ impl Dsv4CudaExecutor {
                     draft,
                     dspark_conf_threshold,
                     max_seq_len,
-                    dspark_max_prompt_tokens,
                     num_slots,
                 )
             })
@@ -723,7 +719,6 @@ impl Dsv4CudaExecutor {
         draft: crate::dsv4::Dsv4DsparkDraft,
         conf_threshold: f32,
         max_seq_len: usize,
-        max_prompt_tokens: Option<usize>,
         num_slots: usize,
     ) -> Result<Dsv4DsparkExec> {
         ensure!(
@@ -776,13 +771,12 @@ impl Dsv4CudaExecutor {
                     df,
                     scratch: crate::dsv4::dspark::Dsv4DsparkScratch::default(),
                     attn_states,
-                    eligible: max_prompt_tokens.is_none(),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
         log::info!(
             "CUDA DSv4 DSpark runtime initialized: stages={num_stages} block={block_size} \
-             conf_threshold={conf_threshold} max_prompt_tokens={max_prompt_tokens:?} \
+             conf_threshold={conf_threshold} \
              target_layers={:?}",
             model.config.dspark_target_layer_ids,
         );
@@ -790,7 +784,6 @@ impl Dsv4CudaExecutor {
             draft,
             conf_threshold,
             max_seq_len,
-            max_prompt_tokens,
             slots,
         })
     }
@@ -1363,7 +1356,6 @@ impl Dsv4CudaExecutor {
         // frontier so the first block drafts against fresh, in-request features.
         self.spec_slots[slot] = Dsv4SpecSlotState::default();
         self.reset_dspark_slot(slot, finish_len);
-        self.set_dspark_prompt_eligibility(slot, tokens.len());
         self.slots[slot].restore_prefix_state(
             &self.model.ctx,
             &self.model.layers,
@@ -1486,19 +1478,7 @@ impl Dsv4CudaExecutor {
         // replaces MTP for greedy decode. Off the DSpark path (`dspark` is
         // `None`), MTP runs below byte-identically.
         if self.dspark.is_some() {
-            if self.dspark_slot_eligible(slot_idx) {
-                return self
-                    .dspark_decode_tokens(slot_idx, last_token, start_pos, params, position);
-            }
-            let token = self.model.forward_tokens(
-                &mut self.slots[slot_idx],
-                &mut self.kv_adapter,
-                &[last_token],
-                start_pos,
-                params,
-                position,
-            )?;
-            return Ok(vec![token]);
+            return self.dspark_decode_tokens(slot_idx, last_token, start_pos, params, position);
         }
         // Self-heal an un-seeded / desynced MTP stream (#140). A request that
         // enters Decoding WITHOUT a tail prefill — a full position-0 prefix-cache
@@ -1550,24 +1530,8 @@ impl Dsv4CudaExecutor {
     /// prefix → the restored frontier). No-op off the DSpark path.
     fn reset_dspark_slot(&mut self, slot: usize, pos: usize) {
         if let Some(ds) = self.dspark.as_mut() {
-            let runtime = &mut ds.slots[slot];
-            runtime.df.rebase(pos);
-            runtime.eligible = ds.max_prompt_tokens.is_none();
+            ds.slots[slot].df.rebase(pos);
         }
-    }
-
-    fn set_dspark_prompt_eligibility(&mut self, slot: usize, prompt_tokens: usize) {
-        if let Some(ds) = self.dspark.as_mut() {
-            ds.slots[slot].eligible = ds
-                .max_prompt_tokens
-                .is_none_or(|max_tokens| prompt_tokens <= max_tokens);
-        }
-    }
-
-    fn dspark_slot_eligible(&self, slot: usize) -> bool {
-        self.dspark
-            .as_ref()
-            .is_some_and(|ds| ds.slots[slot].eligible)
     }
 
     /// Seed a freshly-prefilled prompt chunk into the DSpark draft context: pull
@@ -1588,9 +1552,6 @@ impl Dsv4CudaExecutor {
         let Some(taps) = slots[slot].take_dspark_prompt_taps() else {
             return Ok(());
         };
-        if !ds.slots[slot].eligible {
-            return Ok(());
-        }
         model.dspark_append_context(
             &ds.draft,
             &mut ds.slots[slot].df,
@@ -1937,15 +1898,10 @@ impl Dsv4CudaExecutor {
             return Ok(out);
         }
 
-        // B>1 path. DSpark has no batched verify lane: if any row is eligible,
+        // B>1 path. DSpark has no batched verify lane: if DSpark is on,
         // dispatch every row individually (`forward_decode_row` handles DSpark /
         // MTP / plain decode per-row). Otherwise run the batched lanes below.
-        if self.dspark.is_some()
-            && batch
-                .rows
-                .iter()
-                .any(|row| self.dspark_slot_eligible(row.slot))
-        {
+        if self.dspark.is_some() {
             let mut out = Vec::with_capacity(batch.rows.len());
             for row in &batch.rows {
                 out.extend(self.forward_decode_row(row)?);
@@ -2160,7 +2116,6 @@ impl Dsv4CudaExecutor {
             self.slots[row.slot].reset(&self.model.ctx, &mut self.kv_adapter)?;
             self.spec_slots[row.slot] = Dsv4SpecSlotState::default();
             self.reset_dspark_slot(row.slot, 0);
-            self.set_dspark_prompt_eligibility(row.slot, row.total_tokens);
         }
         let kv_view = self.kv_adapter.prepare_kv_batch(kv_batch)?;
         validate_dsv4_prefill_kv_view(row, &kv_view)?;
