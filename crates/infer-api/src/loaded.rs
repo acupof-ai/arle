@@ -690,7 +690,7 @@ mod backend {
             }
         }
 
-        /// Access the DSpark RL sidecar experience buffer.
+        /// Access the DSpark train sidecar experience buffer.
         ///
         /// Returns `Some` on CUDA backends where the DSpark drafter is active;
         /// `None` on other backends. The buffer is populated by the inference
@@ -707,7 +707,7 @@ mod backend {
         }
 
         /// Hot-swap the DSpark Markov head weights from a host f32 snapshot.
-        /// Called by the RL sidecar trainer after each REINFORCE step.
+        /// Called by the train sidecar after each acceptance-weighted step.
         #[cfg(feature = "cuda")]
         pub fn update_dspark_markov_weights(&self, w1: &[f32], w2: &[f32]) -> Result<()> {
             match self {

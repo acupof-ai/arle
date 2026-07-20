@@ -23,16 +23,16 @@ Progress spine. Entry classes recorded here the day they land: phase exits,
 default flips, and accept-or-reject verdicts (AGENTS.md §Docs lifecycle &
 progress spine).
 
-- **2026-07-20 — DSpark RL sidecar Phase 1 shipped (accept, end-to-end verified).**
-  `arle serve --spec-type dspark` now spawns a background REINFORCE trainer
+- **2026-07-20 — DSpark train sidecar Phase 1 shipped (accept, end-to-end verified).**
+  `arle serve --spec-type dspark` now spawns a background acceptance-weighted trainer
   that drains the experience buffer the hot path populates and hot-swaps
   updated Markov-head weights back into the running engine. Verified on H20
   (Qwen3.6-27B-FP8 + dspark-aeon draft): 6 training steps, loss −4.04→−3.18,
   zero errors. Fixed: hardcoded `vocab_size` (now lazily inferred from
   experience) and draft-model selection (requires `dspark-sp+markov`, not
   backbone-only DFlash).
-  [win](docs/experience/wins/2026-07-20-dspark-rl-sidecar-e2e-verified.md) ·
-  [plan](docs/plans/2026-07-19-dspark-rl-sidecar.md).
+  [win](docs/experience/wins/2026-07-20-dspark-train-sidecar-e2e-verified.md) ·
+  [plan](docs/plans/2026-07-19-dspark-train-sidecar.md).
 - **2026-07-17 — DSv4 cold-boot #69 closed (verdict: fixed in code, disk-bound residual).**
   Re-measured on current main: warm boot 33 s, all ranks build concurrent —
   the filed rank-0 serialization and 8× read amplification were fixed by the
