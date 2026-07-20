@@ -641,9 +641,10 @@ impl Dsv4Model {
         let max_ctx = cap - config.dspark_block_size;
         // Sliding-window: keep only the last `max_ctx` context rows. If the
         // incoming chunk exceeds that, drop the leading rows (they fall out of
-        // the window anyway) and process only the tail.
+        // the window anyway) and rebase the buffer to the tail start.
         let (cols, start_abs, skip) = if rows > max_ctx {
             let skip = rows - max_ctx;
+            df.rebase(start_abs + skip);
             (max_ctx, start_abs + skip, skip)
         } else {
             (rows, start_abs, 0)
