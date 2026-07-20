@@ -1,0 +1,21 @@
+crates/train/src/dspark_rl.rs
+  s_d70015f8a56f14::t_1866cff0faa9b8 77,84-86,89,91-102,104-109,115-117,119,125-127,129-130,148-154,171,182,208,210,241-245
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "1c500d74192d9c1d9c92b59bf520a6cd7a2737c8",
+  "prompts": {},
+  "sessions": {
+    "s_d70015f8a56f14": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-af56273d37a8ee894",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
