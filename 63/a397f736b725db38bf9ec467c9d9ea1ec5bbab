@@ -1,0 +1,23 @@
+crates/infer-cuda/src/executor/dspark_train.rs
+  s_099383ef79559d::t_81e6f6a5c2f5ba 5
+crates/infer-cuda/src/lib.rs
+  s_099383ef79559d::t_a04725902e8279 113
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "63a397f736b725db38bf9ec467c9d9ea1ec5bbab",
+  "prompts": {},
+  "sessions": {
+    "s_099383ef79559d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4489c951-ff19-410c-a076-13320f5753c1",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
