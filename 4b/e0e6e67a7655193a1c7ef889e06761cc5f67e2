@@ -1,0 +1,33 @@
+crates/cli/src/args.rs
+  s_d15542f92362e0::t_6def8302d46ad4 1207-1235
+crates/cli/src/train_cli.rs
+  s_d15542f92362e0::t_7c4aaabc05e46e 27,102,106-224
+scripts/fix_fp8_moe_router.py
+  s_d6adcec6a0a6d3::t_1394213902e824 1-237
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "4be0e6e67a7655193a1c7ef889e06761cc5f67e2",
+  "prompts": {},
+  "sessions": {
+    "s_d15542f92362e0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aa404241ea9fedcad",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_d6adcec6a0a6d3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dc64a0b5-493b-4e08-a5cf-392205926291",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
