@@ -19,7 +19,7 @@ never confused with `.mlp.gate_proj.weight` (a dense FFN projection) or
 
 The output's `quantization_config.modules_to_not_convert` is taken from a known-
 good reference config (`--ref-config`, e.g. the base FP8 model) so the runtime
-loader recognizes the bf16 routers as DenseBf16 (see quant_format.rs:100 — a
+loader recognizes the bf16 routers as DenseBf16 (see QuantManifest::ignored — a
 bf16 tensor in an FP8 manifest must be `ignored()` or it fails to resolve). The
 script then self-validates that every swapped router IS matched by that list.
 
@@ -61,9 +61,11 @@ def ignored_by(name: str, not_convert: list[str]) -> bool:
 def load_not_convert(ref_config: Path) -> list[str]:
     cfg = json.loads(ref_config.read_text())
     qc = cfg.get("quantization_config", {})
-    nc = list(qc.get("modules_to_not_convert", []))
+    # QuantManifest::ignored chains BOTH keys; mirror it or a ref that lists
+    # routers under `ignore` would look empty here.
+    nc = list(qc.get("modules_to_not_convert", [])) + list(qc.get("ignore", []))
     if not nc:
-        raise SystemExit(f"{ref_config}: quantization_config.modules_to_not_convert is empty")
+        raise SystemExit(f"{ref_config}: quantization_config has no modules_to_not_convert/ignore")
     return nc
 
 
@@ -76,7 +78,7 @@ def plan_swaps(weight_map: dict[str, str]) -> tuple[list[str], list[str]]:
 
 def validate_coverage(routers: list[str], not_convert: list[str]) -> None:
     """Every swapped-to-bf16 router MUST be ignored() by the output manifest,
-    else the loader can't resolve it (quant_format.rs:100)."""
+    else the loader can't resolve it (QuantManifest::ignored)."""
     missing = [n for n in routers if not ignored_by(n, not_convert)]
     if missing:
         raise SystemExit(
@@ -115,7 +117,7 @@ def run(args: argparse.Namespace) -> None:
         raise SystemExit(f"bf16 source lacks {len(missing_src)} routers, e.g. {missing_src[:3]}")
     validate_coverage(routers, not_convert)
 
-    already_bf16 = sum(1 for n in routers if not scale_name(n) in fp8_map)
+    already_bf16 = sum(1 for n in routers if scale_name(n) not in fp8_map)
     print(f"routers found : {len(routers)} ({len(routers) - already_bf16} FP8, {already_bf16} already bf16)")
     print(f"scales to drop: {len(scales)}")
     print(f"not_convert   : {len(not_convert)} prefixes from {args.ref_config}")
