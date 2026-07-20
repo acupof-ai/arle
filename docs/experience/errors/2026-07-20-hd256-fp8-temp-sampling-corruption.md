@@ -33,15 +33,20 @@ non-empty behavior logprobs). Every agent-OPD rollout on the hd256/FP8 student
 was therefore sampling the corrupted distribution — degradation we had been
 attributing to thinking-chain length / timeouts.
 
-**Confounder resolved — it is the hd256 COMPUTE residual, FP8-independent.**
-Root cause pinned & patched (`9851ced6b` + `bf66a3854`): the per-layer
-`input_layernorm` / `post_attention_layernorm` were loaded raw, but they ship in
-STANDARD format (~1-centered) and the `rms_norm_offset` trunk kernel applies
-`(1 + weight)` → a ~2× multiplier per layer, compounding across 64 layers.
-`b4b293f0c` had fixed only the q/k norms. Fix: load these norms as `(w − 1)` too
-(`load_final_norm_offset`). Still owes an empirical temp=1.0 gate on a rebuilt
-binary (the pod binary predates the fix) — a 2×/layer error "should" have broken
-greedy too, so the mechanism magnitude is measured, not assumed.
+**A wrong "fix" (`9851ced6b`) sent us on a norm detour — reverted.** It loaded
+the per-layer `input_layernorm`/`post_attention_layernorm` as `w−1`, assuming
+STANDARD format. But these norms ship OFFSET (HF convention, `mean|w| ≈ 0.24 <
+0.75`) and the CUDA `(1+w)` kernel already matches that raw — confirmed by the
+Metal reference, which detects offset (`mean|w| < 0.75`) and converts with `w+1`,
+identical to the CUDA kernel. `9851ced6b` double-offset input/post →
+`(1+(w−1)) = w ≈ 0.24` → 1/5 scale/layer → greedy SALAD (decoded regression,
+2 clean builds). Reverted (`485eefe0d`). The final norm (`mean|w| 3.3 > 0.75`,
+direct) correctly stays `w−1`. **The norm handling was never the temp>0 bug.**
+
+**The real bug (still open):** on hd256/FP8, greedy + temp=0.3 are coherent but
+temp=1.0 is salad — a distribution-tail issue, most likely FP8 logit-tail noise
+(both affected models are FP8). Isolation pending (bf16 @ temp=1.0). The
+temp=0.3 workaround holds it.
 
 ## Fix
 
