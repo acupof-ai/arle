@@ -152,12 +152,12 @@ fn run_ppl(args: TrainPplArgs) -> Result<()> {
     let mut sum_nll = 0.0f64;
     let mut count = 0usize;
     let mut windows = 0usize;
-    for chunk in tokens.chunks(ctx) {
+    for chunk in tokens
+        .chunks(ctx)
+        .take(args.max_windows.unwrap_or(usize::MAX))
+    {
         if chunk.len() < 2 {
             break; // a trailing 1-token window has no next-token target
-        }
-        if args.max_windows.is_some_and(|cap| windows >= cap) {
-            break;
         }
         let positions: Vec<u32> = (0..chunk.len() as u32).collect();
         let raw = engine
@@ -172,10 +172,10 @@ fn run_ppl(args: TrainPplArgs) -> Result<()> {
         }
         let vocab = raw.vocab_size();
         let host = raw.to_host_f32()?;
-        for i in 0..chunk.len() - 1 {
-            let row = &host[i * vocab..(i + 1) * vocab];
-            let target = chunk[i + 1] as usize;
-            sum_nll += row_nll(row, target)?;
+        // chunks_exact yields chunk.len() rows; windows(2) yields len-1 pairs →
+        // zip drops the final row (no next token), scoring each token once.
+        for (row, pair) in host.chunks_exact(vocab).zip(chunk.windows(2)) {
+            sum_nll += row_nll(row, pair[1] as usize)?;
             count += 1;
         }
         windows += 1;
@@ -210,7 +210,6 @@ fn run_ppl(_args: TrainPplArgs) -> Result<()> {
 
 /// Numerically stable next-token NLL: `-log_softmax(row)[target]`, subtracting
 /// the row max before exp.
-#[cfg(feature = "cuda")]
 fn row_nll(row: &[f32], target: usize) -> Result<f64> {
     let target_logit = *row
         .get(target)
@@ -3856,17 +3855,7 @@ fn heldout_nll(
     let mut nll_sum = 0.0_f64;
     for t in 0..seq_len {
         let row = &host[t * vocab..(t + 1) * vocab];
-        let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let mut denom = 0.0_f64;
-        for &v in row {
-            denom += f64::from(v - max).exp();
-        }
-        let target = eval_ids[t + 1] as usize;
-        if target >= vocab {
-            bail!("held-out NLL target token {target} >= vocab {vocab}");
-        }
-        let log_prob = f64::from(row[target] - max) - denom.ln();
-        nll_sum += -log_prob;
+        nll_sum += row_nll(row, eval_ids[t + 1] as usize)?;
     }
     Ok((nll_sum / seq_len as f64) as f32)
 }
