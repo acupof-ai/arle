@@ -42,8 +42,11 @@ pub trait ExperienceSource: Send + Sync {
 }
 
 /// Configuration for the DSpark RL trainer.
+///
+/// `vocab_size` is intentionally absent: the Markov head is lazily sized to the
+/// actual vocab from the first drained experience, so the trainer is
+/// model-agnostic at construction.
 pub struct DsparkRlConfig {
-    pub vocab_size: usize,
     pub markov_rank: usize,
     pub learning_rate: f32,
     pub batch_size: usize,
@@ -53,7 +56,6 @@ pub struct DsparkRlConfig {
 impl Default for DsparkRlConfig {
     fn default() -> Self {
         Self {
-            vocab_size: 151936,
             markov_rank: 256,
             learning_rate: 1e-4,
             batch_size: 64,
@@ -103,7 +105,6 @@ impl DsparkRlTrainer {
 
     /// Build the Markov head tensors with the given vocab size.
     fn init_params(&mut self, vocab_size: usize) -> Result<()> {
-        self.config.vocab_size = vocab_size;
         let rank = self.config.markov_rank;
 
         let w1_data: Vec<f32> = (0..vocab_size * rank)
