@@ -547,7 +547,8 @@ impl Dsv4CudaExecutor {
             let num_stages = model.config.dspark_num_stages();
             let block_size = model.config.dspark_block_size;
             let head_dim = model.config.head_dim;
-            let draft_span = max_seq_len + block_size;
+            // Sliding-window draft latent: fixed `window + block`, no prompt growth.
+            let draft_span = model.config.sliding_window + block_size;
             // latent_kv: num_stages buffers, each [draft_span * head_dim] bf16.
             let latent_kv = num_stages
                 .saturating_mul(draft_span)
@@ -738,10 +739,13 @@ impl Dsv4CudaExecutor {
         // handle only (layer 0's), and `max_seq_len` sizes the draft's own span.
         let stage_mode = model.config.attention_mode_for_compress_ratio(0);
         let stage_pool = kv_adapter.layer(0)?;
-        let draft_span = max_seq_len + block_size;
+        // Draft latent KV cache is sliding-window: fixed `sliding_window + block`
+        // ring, independent of prompt length. Full-context draft latent OOMs on
+        // long prompts (linear growth → router disabled DSpark on >64 tok).
+        let draft_span = model.config.sliding_window + block_size;
         let slots = (0..num_slots)
             .map(|slot_idx| -> Result<_> {
-                let context_capacity = max_seq_len;
+                let context_capacity = model.config.sliding_window;
                 let df = crate::dsv4::dspark::Dsv4DsparkSlotState::new(
                     &model.ctx,
                     &model.config,

@@ -638,8 +638,39 @@ impl Dsv4Model {
             );
         }
         let cols = rows;
-        // Capacity: the appended context rows must fit before the noise block.
+        // Sliding-window latent: if the live context would overflow the ring,
+        // shift ctx_base forward and memmove the surviving rows to the buffer
+        // head. `cap - block` is the max live context (the rest is the noise
+        // block's scratch space).
         let cap = df.latent_kv[0].len / head_dim;
+        let max_ctx = cap - config.dspark_block_size;
+        let live = df.ctx_end - df.ctx_base;
+        if live + cols > max_ctx {
+            let new_base = df.ctx_end.saturating_add(cols).saturating_sub(max_ctx);
+            let shift = new_base - df.ctx_base;
+            let keep = live.saturating_sub(shift);
+            if keep > 0 {
+                let elem_size = std::mem::size_of::<half::bf16>();
+                let n_bytes = keep * head_dim * elem_size;
+                let src_off = shift * head_dim * elem_size;
+                for stage_kv in &mut df.latent_kv {
+                    let (base, _g) = stage_kv.data.device_ptr_mut(&ctx.stream);
+                    // SAFETY: base is a live allocation of cap*head_dim bf16 on
+                    // this stream; keep+shift <= live < cap, so both ranges are
+                    // in-bounds. Overlapping shift uses the async memmove path.
+                    unsafe {
+                        cudarc::driver::result::memcpy_dtod_async(
+                            base,
+                            base + src_off as u64,
+                            n_bytes,
+                            ctx.stream.cu_stream(),
+                        )
+                        .map_err(|e| anyhow!("DSpark latent shift memcpy failed: {e}"))?;
+                    }
+                }
+            }
+            df.ctx_base = new_base;
+        }
         ensure!(
             (df.ctx_end - df.ctx_base) + cols <= cap,
             "DSpark context overflow: rows {} > cap {cap}",

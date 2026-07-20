@@ -2379,8 +2379,9 @@ impl Dsv4Model {
             let head_dim = self.config.head_dim;
             let num_stages = self.config.dspark_num_stages();
             let block = self.config.dspark_block_size;
-            let draft_span = max_seq_len + block;
-            let latent_cap = max_seq_len.saturating_add(block);
+            // Sliding-window draft latent: fixed `window + block`, no prompt growth.
+            let draft_span = self.config.sliding_window + block;
+            let latent_cap = draft_span;
             total = total.saturating_add(
                 self.config
                     .dspark_target_layer_ids
