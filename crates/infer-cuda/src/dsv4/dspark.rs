@@ -637,13 +637,17 @@ impl Dsv4Model {
                 tap.len
             );
         }
-        let cols = rows;
-        // Sliding-window latent: if the live context would overflow the ring,
-        // shift ctx_base forward and memmove the surviving rows to the buffer
-        // head. `cap - block` is the max live context (the rest is the noise
-        // block's scratch space).
         let cap = df.latent_kv[0].len / head_dim;
         let max_ctx = cap - config.dspark_block_size;
+        // Sliding-window: keep only the last `max_ctx` context rows. If the
+        // incoming chunk exceeds that, drop the leading rows (they fall out of
+        // the window anyway) and process only the tail.
+        let (cols, start_abs, skip) = if rows > max_ctx {
+            let skip = rows - max_ctx;
+            (max_ctx, start_abs + skip, skip)
+        } else {
+            (rows, start_abs, 0)
+        };
         let live = df.ctx_end - df.ctx_base;
         if live + cols > max_ctx {
             let new_base = df.ctx_end.saturating_add(cols).saturating_sub(max_ctx);
@@ -682,15 +686,16 @@ impl Dsv4Model {
         let mut fuse_in = unsafe { HiddenStates::uninit(ctx, n_taps * hidden, cols)? };
         {
             let (fuse_ptr, _gf) = fuse_in.data.device_ptr_mut(&ctx.stream);
+            let tap_off = (skip * stream_dim) as u64 * std::mem::size_of::<half::bf16>() as u64;
             for (t, tap) in taps.iter().enumerate() {
                 let (tap_ptr, _gt) = tap.data.device_ptr(&ctx.stream);
-                // SAFETY: tap is [rows, hc_mult, hidden]; output shape and complete,
-                // non-overlapping tap-slice coverage are established above.
+                // SAFETY: tap is [rows, hc_mult, hidden]; skip drops the leading
+                // rows that fall out of the sliding window; cols rows remain.
                 unsafe {
                     ffi::dsv4_mhc_lane_mean_cuda(
-                        tap_ptr as *const ffi::Half,
+                        (tap_ptr + tap_off) as *const ffi::Half,
                         fuse_ptr as *mut ffi::Half,
-                        rows as i32,
+                        cols as i32,
                         hidden as i32,
                         hc_mult as i32,
                         (n_taps * hidden) as i32,
@@ -707,7 +712,7 @@ impl Dsv4Model {
         let context = crate::attention::mla_rms_norm(ctx, &context_raw, main_norm, eps)?;
         self.dspark_dbg_stats("context", &context);
 
-        let positions: Vec<i32> = (start_abs..start_abs + rows)
+        let positions: Vec<i32> = (start_abs..start_abs + cols)
             .map(|pos| pos as i32)
             .collect();
 
