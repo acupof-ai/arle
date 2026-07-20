@@ -74,54 +74,60 @@ pub struct DsparkRlTrainer {
     config: DsparkRlConfig,
     store: TensorStore,
     tape: Tape,
-    params: MarkovParams,
+    params: Option<MarkovParams>,
     optim: AdamW,
     baseline_ema: f32,
     running: Arc<AtomicBool>,
 }
 
 impl DsparkRlTrainer {
-    /// Create a new trainer with randomly initialized Markov head.
+    /// Create a new trainer. Markov params are lazily initialized on the first
+    /// `train_step` using the actual vocab size from the experience buffer,
+    /// so the trainer is model-agnostic at construction time.
     pub fn new(config: DsparkRlConfig) -> Result<Self> {
         let backend: Arc<dyn autograd::Backend> = Arc::new(CpuBackend);
-        let mut store = TensorStore::with_backend(backend);
+        let store = TensorStore::with_backend(backend);
         let tape = Tape::new();
-
-        let w1_data: Vec<f32> = (0..config.vocab_size * config.markov_rank)
-            .map(|i| {
-                let s = (i % 1000) as f32;
-                0.02 * (s * 0.1).sin()
-            })
-            .collect();
-        let w1 = store.alloc(Tensor::new(
-            w1_data,
-            vec![config.vocab_size, config.markov_rank],
-            true,
-        )?);
-
-        let w2_data: Vec<f32> = (0..config.markov_rank * config.vocab_size)
-            .map(|i| {
-                let s = (i % 1000) as f32;
-                0.02 * (s * 0.1).cos()
-            })
-            .collect();
-        let w2 = store.alloc(Tensor::new(
-            w2_data,
-            vec![config.markov_rank, config.vocab_size],
-            true,
-        )?);
-
         let optim = AdamW::new(config.learning_rate, (0.9, 0.999), 1e-8, 0.0);
 
         Ok(Self {
             config,
             store,
             tape,
-            params: MarkovParams { w1, w2 },
+            params: None,
             optim,
             baseline_ema: 0.5,
             running: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    /// Build the Markov head tensors with the given vocab size.
+    fn init_params(&mut self, vocab_size: usize) -> Result<()> {
+        self.config.vocab_size = vocab_size;
+        let rank = self.config.markov_rank;
+
+        let w1_data: Vec<f32> = (0..vocab_size * rank)
+            .map(|i| {
+                let s = (i % 1000) as f32;
+                0.02 * (s * 0.1).sin()
+            })
+            .collect();
+        let w1 = self
+            .store
+            .alloc(Tensor::new(w1_data, vec![vocab_size, rank], true)?);
+
+        let w2_data: Vec<f32> = (0..rank * vocab_size)
+            .map(|i| {
+                let s = (i % 1000) as f32;
+                0.02 * (s * 0.1).cos()
+            })
+            .collect();
+        let w2 = self
+            .store
+            .alloc(Tensor::new(w2_data, vec![rank, vocab_size], true)?);
+
+        self.params = Some(MarkovParams { w1, w2 });
+        Ok(())
     }
 
     /// Get a handle to the running flag (for stopping the trainer).
@@ -139,6 +145,13 @@ impl DsparkRlTrainer {
         let block_size = experiences[0].block_size;
         let vocab_size = experiences[0].vocab_size;
 
+        // Lazily build Markov params with the actual vocab size from the
+        // first experience, so the trainer is model-agnostic at construction.
+        if self.params.is_none() {
+            self.init_params(vocab_size)?;
+        }
+        let params = self.params.as_ref().unwrap();
+
         let mut all_logits = Vec::with_capacity(batch * block_size * vocab_size);
         let mut all_tokens_usize = Vec::with_capacity(batch * block_size);
         let mut rewards = Vec::with_capacity(batch);
@@ -155,7 +168,7 @@ impl DsparkRlTrainer {
         // Markov bias: w2 @ w1[tokens]
         // embedding output: [1, batch*block, rank] (rank 3); reshape to [batch*block, rank]
         let emb_id = ops::embedding(
-            self.params.w1,
+            params.w1,
             &all_tokens_usize,
             &mut self.store,
             &mut self.tape,
@@ -166,7 +179,7 @@ impl DsparkRlTrainer {
             &mut self.store,
             &mut self.tape,
         )?;
-        let bias_id = ops::matmul(emb_flat_id, self.params.w2, &mut self.store, &mut self.tape)?;
+        let bias_id = ops::matmul(emb_flat_id, params.w2, &mut self.store, &mut self.tape)?;
         let corrected_id = ops::add(logits_id, bias_id, &mut self.store, &mut self.tape)?;
         let log_probs_id = ops::log_softmax(corrected_id, &mut self.store, &mut self.tape)?;
         let token_lp_id = ops::gather_last_dim(
@@ -192,10 +205,9 @@ impl DsparkRlTrainer {
         let loss_id = ops::mean(neg_id, &mut self.store, &mut self.tape)?;
 
         self.tape.backward(loss_id, &mut self.store)?;
+        self.optim.step(&[params.w1, params.w2], &mut self.store);
         self.optim
-            .step(&[self.params.w1, self.params.w2], &mut self.store);
-        self.optim
-            .zero_grad(&[self.params.w1, self.params.w2], &mut self.store);
+            .zero_grad(&[params.w1, params.w2], &mut self.store);
 
         let loss_val = self.store.to_host(loss_id).unwrap_or_default();
         let loss = if loss_val.is_empty() {
@@ -226,8 +238,11 @@ impl DsparkRlTrainer {
 
     /// Get current Markov head weights as (w1 [vocab*rank], w2 [rank*vocab]).
     pub fn get_weights(&mut self) -> Result<(Vec<f32>, Vec<f32>)> {
-        let w1 = self.store.to_host(self.params.w1)?;
-        let w2 = self.store.to_host(self.params.w2)?;
+        let Some(params) = self.params.as_ref() else {
+            anyhow::bail!("Markov params not yet initialized");
+        };
+        let w1 = self.store.to_host(params.w1)?;
+        let w2 = self.store.to_host(params.w2)?;
         Ok((w1, w2))
     }
 
