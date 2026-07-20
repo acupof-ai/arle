@@ -1,4 +1,4 @@
-//! DSpark RL sidecar trainer: REINFORCE on the acceptance reward.
+//! DSpark train sidecar: acceptance-weighted policy gradient.
 //!
 //! Drains the experience buffer populated by the inference hot path and runs
 //! policy-gradient updates against the Markov head (the DSpark-specific
@@ -41,19 +41,19 @@ pub trait ExperienceSource: Send + Sync {
     }
 }
 
-/// Configuration for the DSpark RL trainer.
+/// Configuration for the DSpark trainer.
 ///
 /// `vocab_size` is intentionally absent: the Markov head is lazily sized to the
 /// actual vocab from the first drained experience, so the trainer is
 /// model-agnostic at construction.
-pub struct DsparkRlConfig {
+pub struct DsparkTrainConfig {
     pub markov_rank: usize,
     pub learning_rate: f32,
     pub batch_size: usize,
     pub baseline_ema_alpha: f32,
 }
 
-impl Default for DsparkRlConfig {
+impl Default for DsparkTrainConfig {
     fn default() -> Self {
         Self {
             markov_rank: 256,
@@ -70,10 +70,10 @@ struct MarkovParams {
     w2: TensorId, // [rank, vocab]
 }
 
-/// DSpark RL trainer: runs in a background thread, drains the experience
-/// buffer, and runs REINFORCE updates on the Markov head.
-pub struct DsparkRlTrainer {
-    config: DsparkRlConfig,
+/// DSpark trainer: runs in a background thread, drains the experience
+/// buffer, and runs acceptance-weighted updates on the Markov head.
+pub struct DsparkTrainer {
+    config: DsparkTrainConfig,
     store: TensorStore,
     tape: Tape,
     params: Option<MarkovParams>,
@@ -82,11 +82,11 @@ pub struct DsparkRlTrainer {
     running: Arc<AtomicBool>,
 }
 
-impl DsparkRlTrainer {
+impl DsparkTrainer {
     /// Create a new trainer. Markov params are lazily initialized on the first
     /// `train_step` using the actual vocab size from the experience buffer,
     /// so the trainer is model-agnostic at construction time.
-    pub fn new(config: DsparkRlConfig) -> Result<Self> {
+    pub fn new(config: DsparkTrainConfig) -> Result<Self> {
         let backend: Arc<dyn autograd::Backend> = Arc::new(CpuBackend);
         let store = TensorStore::with_backend(backend);
         let tape = Tape::new();
@@ -263,7 +263,7 @@ impl DsparkRlTrainer {
             match self.train_step(&experiences) {
                 Ok(loss) => {
                     eprintln!(
-                        "dspark_rl: loss={loss:.4} baseline={:.4} n={}",
+                        "dspark_train: loss={loss:.4} baseline={:.4} n={}",
                         self.baseline_ema,
                         experiences.len()
                     );
@@ -271,7 +271,7 @@ impl DsparkRlTrainer {
                         on_weights(w1, w2);
                     }
                 }
-                Err(e) => eprintln!("dspark_rl: train step failed: {e}"),
+                Err(e) => eprintln!("dspark_train: train step failed: {e}"),
             }
         }
     }
@@ -314,18 +314,18 @@ impl<'a> ExperienceSource for InferCudaExperienceSource<'a> {
     }
 }
 
-/// RAII guard for a spawned DSpark RL sidecar training thread.
+/// RAII guard for a spawned DSpark train sidecar training thread.
 ///
 /// Dropping the guard signals the training loop to stop and waits for it to
 /// exit. The guard is `Send` so it can live across the serve thread boundary.
 #[cfg(feature = "cuda")]
-pub struct DsparkRlSidecarGuard {
+pub struct DsparkTrainSidecarGuard {
     running: Arc<AtomicBool>,
     join: Option<std::thread::JoinHandle<()>>,
 }
 
 #[cfg(feature = "cuda")]
-impl Drop for DsparkRlSidecarGuard {
+impl Drop for DsparkTrainSidecarGuard {
     fn drop(&mut self) {
         self.running.store(false, Ordering::SeqCst);
         if let Some(join) = self.join.take() {
@@ -334,38 +334,38 @@ impl Drop for DsparkRlSidecarGuard {
     }
 }
 
-/// Spawn the DSpark RL sidecar training thread.
+/// Spawn the DSpark train sidecar thread.
 ///
 /// Drains the global experience buffer populated by the CUDA inference hot
-/// path, runs REINFORCE updates on the Markov head, and pushes updated weights
+/// path, runs acceptance-weighted updates on the Markov head, and pushes updated weights
 /// back into the running engine via [`LoadedInferenceEngine::update_dspark_markov_weights`].
 ///
 /// Returns a guard that stops the thread on drop. No-ops (returns `None`) on
 /// non-CUDA backends or when the experience buffer is unavailable.
 #[cfg(feature = "cuda")]
-pub fn spawn_dspark_rl_sidecar(
+pub fn spawn_dspark_train_sidecar(
     engine: Arc<infer_api::LoadedInferenceEngine>,
-    config: DsparkRlConfig,
-) -> Result<Option<DsparkRlSidecarGuard>> {
+    config: DsparkTrainConfig,
+) -> Result<Option<DsparkTrainSidecarGuard>> {
     let Some(buf) = engine.dspark_experience_buffer() else {
         return Ok(None);
     };
     let source = InferCudaExperienceSource::new(buf);
-    let mut trainer = DsparkRlTrainer::new(config)?;
+    let mut trainer = DsparkTrainer::new(config)?;
     let running = trainer.running_handle();
 
     let engine_for_thread = Arc::clone(&engine);
     let join = std::thread::Builder::new()
-        .name("dspark-rl-sidecar".to_string())
+        .name("dspark-train-sidecar".to_string())
         .spawn(move || {
             trainer.run_loop(&source, move |w1, w2| {
                 if let Err(e) = engine_for_thread.update_dspark_markov_weights(&w1, &w2) {
-                    eprintln!("dspark_rl: weight update failed: {e}");
+                    eprintln!("dspark_train: weight update failed: {e}");
                 }
             });
         })?;
 
-    Ok(Some(DsparkRlSidecarGuard {
+    Ok(Some(DsparkTrainSidecarGuard {
         running,
         join: Some(join),
     }))

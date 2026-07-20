@@ -27,8 +27,8 @@ use crate::model::CudaModel;
 use crate::ops::argmax;
 
 #[cfg(feature = "cuda")]
-#[path = "executor/dspark_rl.rs"]
-pub mod dspark_rl;
+#[path = "executor/dspark_train.rs"]
+pub mod dspark_train;
 #[path = "executor/dsv4.rs"]
 mod dsv4;
 #[path = "executor/qwen.rs"]

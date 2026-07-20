@@ -1,4 +1,4 @@
-//! DSpark RL sidecar: experience capture from the inference hot path.
+//! DSpark train sidecar: experience capture from the inference hot path.
 //!
 //! After each DSpark verify+accept step, the (draft_tokens, draft_logits,
 //! accepted_count) tuple is pushed into a bounded ring buffer. A separate
@@ -96,7 +96,7 @@ fn hidden_states_to_host(ctx: &DeviceContext, hs: &HiddenStates) -> Vec<f32> {
             host_bf16.iter().map(|x| x.to_f32()).collect()
         }
         Err(e) => {
-            log::warn!("dspark_rl: D2H draft logits copy failed: {e}");
+            log::warn!("dspark_train: D2H draft logits copy failed: {e}");
             Vec::new()
         }
     }
@@ -125,7 +125,7 @@ pub fn capture_dspark_experience(
     let target_logits_host = match target_logits.to_host(ctx) {
         Ok(v) => v,
         Err(e) => {
-            log::warn!("dspark_rl: D2H target logits copy failed: {e}");
+            log::warn!("dspark_train: D2H target logits copy failed: {e}");
             return;
         }
     };

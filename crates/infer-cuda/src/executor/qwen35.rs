@@ -1994,13 +1994,13 @@ impl Qwen35CudaExecutor {
                 &row.params,
             )?
         };
-        // 4b. RL sidecar: capture (draft_tokens, draft_logits, target_logits,
-        //     accepted) for the asynchronous REINFORCE trainer. The draft
+        // 4b. Train sidecar: capture (draft_tokens, draft_logits, target_logits,
+        //     accepted) for the asynchronous acceptance-weighted trainer. The draft
         //     logits live in `scratch.logits` from the draft step; greedy path
         //     leaves them intact. Sampling path may overwrite — capture is
         //     best-effort and skips when unavailable.
         if let Some(draft_logits) = ds.scratch.logits.as_ref() {
-            super::dspark_rl::capture_dspark_experience(
+            super::dspark_train::capture_dspark_experience(
                 &model.ctx,
                 &chain,
                 draft_logits,
@@ -3151,7 +3151,7 @@ impl Qwen35CudaExecutor {
 
     /// Hot-swap the DSpark Markov head weights from a host f32 snapshot.
     ///
-    /// Called by the RL sidecar trainer after each REINFORCE step. Invalidates
+    /// Called by the train sidecar after each acceptance-weighted step. Invalidates
     /// the decode graph (which bakes the old weight pointers) and updates the
     /// resident `markov_w1` / `markov_w2` device buffers in place.
     pub(crate) fn update_dspark_markov_weights(&mut self, w1: &[f32], w2: &[f32]) -> Result<()> {
