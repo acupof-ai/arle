@@ -39,6 +39,7 @@ fn dspark_trainer_smoke() {
         learning_rate: 1e-3,
         batch_size: 4,
         baseline_ema_alpha: 0.1,
+        ..Default::default()
     };
     let mut trainer = DsparkTrainer::new(config).expect("trainer should construct");
 
@@ -96,6 +97,7 @@ fn dspark_trainer_converges() {
         learning_rate: 0.1,
         batch_size: 4,
         baseline_ema_alpha: 0.5,
+        ..Default::default()
     };
     let mut trainer = DsparkTrainer::new(config).unwrap();
 
