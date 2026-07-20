@@ -1,0 +1,31 @@
+crates/infer-cuda/src/dsv4/dspark.rs
+  s_9c91b86ec3fb55::t_06a7e52cad4394 642-650,689,692-693,696,698,715
+docs/experience/wins/2026-07-20-dspark-sliding-window-c1-win-c4-crash.md
+  s_099383ef79559d::t_03f3c310302046 1-51
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "3862d73bfa84622ac7658727198bee02a07d0316",
+  "prompts": {},
+  "sessions": {
+    "s_099383ef79559d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4489c951-ff19-410c-a076-13320f5753c1",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_9c91b86ec3fb55": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4779911a-69b7-49db-bc83-daf5a48d6ca3",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
