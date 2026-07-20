@@ -1,13 +1,19 @@
-//! DSpark train sidecar: acceptance-weighted policy gradient.
+//! DSpark train sidecar: hybrid policy-gradient + supervised logit matching.
 //!
 //! Drains the experience buffer populated by the inference hot path and runs
-//! policy-gradient updates against the Markov head (the DSpark-specific
-//! trainable component). The backbone transformer layers stay frozen; only
-//! `markov_w1` (embedding) and `markov_w2` (linear projection) are updated.
+//! updates against the Markov head (the DSpark-specific trainable component).
+//! The backbone transformer layers stay frozen; only `markov_w1` (embedding)
+//! and `markov_w2` (linear projection) are updated.
 //!
-//! Reward = accepted_count / block_size (normalized [0, 1]).
-//! Baseline = EMA of reward (stabilizes the gradient).
-//! Loss = -log π(draft_tokens) * (reward - baseline).
+//! Two complementary loss signals (cf. DeepSpec `deepspec/modeling/dspark/loss.py`):
+//! - **Policy gradient**: reward = accepted/block_size, baseline = EMA.
+//!   `pg_loss = -log π(draft_tokens) * (reward - baseline)`.
+//! - **Supervised L1 on probabilities**: dense signal from the captured
+//!   `target_logits`. `l1_loss = Σ|softmax(draft) - softmax(target)|`.
+//!   This directly optimises acceptance rate (`accept ≈ 1 - 0.5·TV`).
+//!
+//! Per-position exponential decay (`loss_decay_gamma`) up-weights earlier
+//! tokens in the block: a mistake at position 0 voids positions 1..k.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -51,6 +57,13 @@ pub struct DsparkTrainConfig {
     pub learning_rate: f32,
     pub batch_size: usize,
     pub baseline_ema_alpha: f32,
+    /// Weight on the supervised L1 probability-matching loss. The policy-gradient
+    /// loss receives weight `1.0 - l1_loss_alpha`. Default 0.9 (DeepSpec).
+    pub l1_loss_alpha: f32,
+    /// Exponential decay scale for per-position loss weighting. Position `k` in
+    /// the block is weighted `exp(-k/gamma)`. `None` disables decay (uniform).
+    /// Default 4.0 (DeepSpec).
+    pub loss_decay_gamma: Option<f32>,
 }
 
 impl Default for DsparkTrainConfig {
@@ -60,6 +73,8 @@ impl Default for DsparkTrainConfig {
             learning_rate: 1e-4,
             batch_size: 64,
             baseline_ema_alpha: 0.01,
+            l1_loss_alpha: 0.9,
+            loss_decay_gamma: Some(4.0),
         }
     }
 }
@@ -154,10 +169,12 @@ impl DsparkTrainer {
         let params = self.params.as_ref().unwrap();
 
         let mut all_logits = Vec::with_capacity(batch * block_size * vocab_size);
+        let mut all_target_logits = Vec::with_capacity(batch * block_size * vocab_size);
         let mut all_tokens_usize = Vec::with_capacity(batch * block_size);
         let mut rewards = Vec::with_capacity(batch);
         for exp in &experiences[..batch] {
             all_logits.extend_from_slice(&exp.draft_logits);
+            all_target_logits.extend_from_slice(&exp.target_logits);
             all_tokens_usize.extend(exp.draft_tokens.iter().map(|&t| t as usize));
             rewards.push(exp.accepted as f32 / exp.block_size as f32);
         }
@@ -165,9 +182,11 @@ impl DsparkTrainer {
         let logits_id = self
             .store
             .from_slice(&all_logits, &[batch * block_size, vocab_size])?;
+        let target_logits_id = self
+            .store
+            .from_slice(&all_target_logits, &[batch * block_size, vocab_size])?;
 
         // Markov bias: w2 @ w1[tokens]
-        // embedding output: [1, batch*block, rank] (rank 3); reshape to [batch*block, rank]
         let emb_id = ops::embedding(
             params.w1,
             &all_tokens_usize,
@@ -182,6 +201,23 @@ impl DsparkTrainer {
         )?;
         let bias_id = ops::matmul(emb_flat_id, params.w2, &mut self.store, &mut self.tape)?;
         let corrected_id = ops::add(logits_id, bias_id, &mut self.store, &mut self.tape)?;
+
+        // Per-position exponential decay: position k in the block is weighted
+        // exp(-k/gamma). Early tokens matter more — a mistake at position 0
+        // voids the rest of the block.
+        let pos_weights: Vec<f32> = match self.config.loss_decay_gamma {
+            Some(gamma) if gamma > 0.0 => (0..block_size)
+                .map(|k| (-(k as f32) / gamma).exp())
+                .collect(),
+            _ => vec![1.0; block_size],
+        };
+        // Expand to per-token weights [batch*block].
+        let token_weights: Vec<f32> = (0..batch)
+            .flat_map(|_| pos_weights.iter().copied())
+            .collect();
+        let weight_sum: f32 = token_weights.iter().sum();
+
+        // ---- Policy-gradient loss (acceptance-weighted) ----
         let log_probs_id = ops::log_softmax(corrected_id, &mut self.store, &mut self.tape)?;
         let token_lp_id = ops::gather_last_dim(
             log_probs_id,
@@ -193,17 +229,71 @@ impl DsparkTrainer {
         let mean_reward: f32 = rewards.iter().sum::<f32>() / batch as f32;
         self.baseline_ema = (1.0 - self.config.baseline_ema_alpha) * self.baseline_ema
             + self.config.baseline_ema_alpha * mean_reward;
-        // Expand per-experience advantage to per-token: each token in a block
-        // shares the same reward signal.
-        let advantages: Vec<f32> = rewards
+        let baseline = self.baseline_ema;
+        // Per-token advantage × position weight.
+        let weighted_adv: Vec<f32> = rewards
             .iter()
-            .flat_map(|&r| vec![r - self.baseline_ema; block_size])
+            .zip(token_weights.chunks(block_size))
+            .flat_map(|(&r, w)| w.iter().map(move |&wk| (r - baseline) * wk))
             .collect();
-        let adv_id = self.store.from_slice(&advantages, &[batch * block_size])?;
+        let adv_id = self
+            .store
+            .from_slice(&weighted_adv, &[batch * block_size])?;
 
-        let weighted_id = ops::mul(token_lp_id, adv_id, &mut self.store, &mut self.tape)?;
-        let neg_id = ops::mul_scalar(weighted_id, -1.0, &mut self.store, &mut self.tape)?;
-        let loss_id = ops::mean(neg_id, &mut self.store, &mut self.tape)?;
+        let pg_weighted_id = ops::mul(token_lp_id, adv_id, &mut self.store, &mut self.tape)?;
+        let pg_neg_id = ops::mul_scalar(pg_weighted_id, -1.0, &mut self.store, &mut self.tape)?;
+        // Weighted mean: divide by sum of position weights (not token count).
+        let pg_loss_id = ops::mul_scalar(
+            ops::sum(pg_neg_id, &mut self.store, &mut self.tape)?,
+            1.0 / weight_sum,
+            &mut self.store,
+            &mut self.tape,
+        )?;
+
+        // ---- Supervised L1 loss on probability distributions ----
+        // Directly optimises acceptance rate: accept ≈ 1 - 0.5·TV(draft, target).
+        // We use squared difference (Frobenius) as a differentiable surrogate
+        // for L1/TV — same gradient direction, no abs() op needed.
+        let draft_probs_id = ops::softmax(corrected_id, &mut self.store, &mut self.tape)?;
+        let target_probs_id = ops::softmax(target_logits_id, &mut self.store, &mut self.tape)?;
+        // diff = draft - target; negate target on host then add.
+        let neg_target_probs: Vec<f32> = all_target_logits.iter().map(|&x| -x).collect();
+        let neg_target_id = self
+            .store
+            .from_slice(&neg_target_probs, &[batch * block_size, vocab_size])?;
+        let diff_id = ops::add(
+            draft_probs_id,
+            neg_target_id,
+            &mut self.store,
+            &mut self.tape,
+        )?;
+        let sq_diff_id = ops::mul(diff_id, diff_id, &mut self.store, &mut self.tape)?;
+        // Expand per-token weights to [batch*block, vocab] for element-wise mul.
+        let expanded_weights: Vec<f32> = token_weights
+            .iter()
+            .flat_map(|&w| vec![w; vocab_size])
+            .collect();
+        let exp_weight_id = self
+            .store
+            .from_slice(&expanded_weights, &[batch * block_size, vocab_size])?;
+        let weighted_sq_id = ops::mul(sq_diff_id, exp_weight_id, &mut self.store, &mut self.tape)?;
+        let l1_loss_id = ops::mul_scalar(
+            ops::sum(weighted_sq_id, &mut self.store, &mut self.tape)?,
+            1.0 / (weight_sum * vocab_size as f32),
+            &mut self.store,
+            &mut self.tape,
+        )?;
+
+        // ---- Combined loss ----
+        let pg_alpha = 1.0 - self.config.l1_loss_alpha;
+        let pg_scaled_id = ops::mul_scalar(pg_loss_id, pg_alpha, &mut self.store, &mut self.tape)?;
+        let l1_scaled_id = ops::mul_scalar(
+            l1_loss_id,
+            self.config.l1_loss_alpha,
+            &mut self.store,
+            &mut self.tape,
+        )?;
+        let loss_id = ops::add(pg_scaled_id, l1_scaled_id, &mut self.store, &mut self.tape)?;
 
         self.tape.backward(loss_id, &mut self.store)?;
         self.optim.step(&[params.w1, params.w2], &mut self.store);
@@ -219,6 +309,7 @@ impl DsparkTrainer {
 
         for id in [
             logits_id,
+            target_logits_id,
             emb_id,
             emb_flat_id,
             bias_id,
@@ -226,8 +317,19 @@ impl DsparkTrainer {
             log_probs_id,
             token_lp_id,
             adv_id,
-            weighted_id,
-            neg_id,
+            pg_weighted_id,
+            pg_neg_id,
+            pg_loss_id,
+            draft_probs_id,
+            target_probs_id,
+            neg_target_id,
+            diff_id,
+            sq_diff_id,
+            exp_weight_id,
+            weighted_sq_id,
+            l1_loss_id,
+            pg_scaled_id,
+            l1_scaled_id,
             loss_id,
         ] {
             let _ = self.store.free(id);
