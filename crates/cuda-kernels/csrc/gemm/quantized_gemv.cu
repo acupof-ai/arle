@@ -1183,10 +1183,170 @@ __global__ void q8_embedding_decode_kernel(
     out[col] = __float2bfloat16(static_cast<float>(q) * scale);
 }
 
+// Batched W4A16 GEMM: B_TILE inputs share one weight read (vs B separate GEMVs
+// re-reading weight B times). Each thread holds B_TILE accumulators; weight is
+// loaded once per K-step and multiplied against B_TILE input vectors.
+#define W4A16_GEMM_BTILE 4
+__global__ void w4a16_gemm_batch_kernel(
+    const uint8_t* __restrict__ weight,
+    const __nv_bfloat16* __restrict__ scales,
+    const __nv_bfloat16* __restrict__ input,
+    __nv_bfloat16* __restrict__ output,
+    int B, int N, int K, int group_size)
+{
+    int row = blockIdx.x * GEMV_ROWS + threadIdx.x / (GEMV_THREADS / GEMV_ROWS);
+    int batch_base = blockIdx.y * W4A16_GEMM_BTILE;
+    int tid_in_row = threadIdx.x % (GEMV_THREADS / GEMV_ROWS);
+    int threads_per_row = GEMV_THREADS / GEMV_ROWS;
+    int lane_id = threadIdx.x % WARP_SIZE;
+    int row_in_block = threadIdx.x / threads_per_row;
+
+    if (row >= N) return;
+
+    float sum[W4A16_GEMM_BTILE];
+    #pragma unroll
+    for (int b = 0; b < W4A16_GEMM_BTILE; b++) sum[b] = 0.0f;
+
+    int num_groups = K / group_size;
+    int bytes_per_row = K / 2;
+    int valid_b = min(W4A16_GEMM_BTILE, B - batch_base);
+
+    for (int k = tid_in_row * 8; k < K; k += threads_per_row * 8) {
+        float scale_f = __bfloat162float(scales[row * num_groups + k / group_size]);
+        uint32_t packed = *reinterpret_cast<const uint32_t*>(&weight[row * bytes_per_row + k / 2]);
+
+        uint32_t lo4 = packed & 0x0F0F0F0Fu;
+        uint32_t hi4 = (packed >> 4) & 0x0F0F0F0Fu;
+
+        float w0 = (float)((int)(lo4 & 0xFF) - 8) * scale_f;
+        float w1 = (float)((int)(hi4 & 0xFF) - 8) * scale_f;
+        float w2 = (float)((int)((lo4 >> 8) & 0xFF) - 8) * scale_f;
+        float w3 = (float)((int)((hi4 >> 8) & 0xFF) - 8) * scale_f;
+        float w4 = (float)((int)((lo4 >> 16) & 0xFF) - 8) * scale_f;
+        float w5 = (float)((int)((hi4 >> 16) & 0xFF) - 8) * scale_f;
+        float w6 = (float)((int)((lo4 >> 24) & 0xFF) - 8) * scale_f;
+        float w7 = (float)((int)((hi4 >> 24) & 0xFF) - 8) * scale_f;
+
+        #pragma unroll
+        for (int b = 0; b < W4A16_GEMM_BTILE; b++) {
+            if (b >= valid_b) break;
+            const __nv_bfloat16* xb = input + (batch_base + b) * K;
+            sum[b] += w0 * __bfloat162float(xb[k]);
+            sum[b] += w1 * __bfloat162float(xb[k+1]);
+            sum[b] += w2 * __bfloat162float(xb[k+2]);
+            sum[b] += w3 * __bfloat162float(xb[k+3]);
+            sum[b] += w4 * __bfloat162float(xb[k+4]);
+            sum[b] += w5 * __bfloat162float(xb[k+5]);
+            sum[b] += w6 * __bfloat162float(xb[k+6]);
+            sum[b] += w7 * __bfloat162float(xb[k+7]);
+        }
+    }
+
+    int warps_per_row = threads_per_row / WARP_SIZE;
+    int warp_in_row = (threadIdx.x % threads_per_row) / WARP_SIZE;
+    #pragma unroll
+    for (int b = 0; b < W4A16_GEMM_BTILE; b++) {
+        if (b < valid_b) sum[b] = warp_reduce_sum(sum[b]);
+    }
+
+    __shared__ float smem_out[GEMV_ROWS * W4A16_GEMM_BTILE * 8];
+    if (lane_id == 0) {
+        #pragma unroll
+        for (int b = 0; b < W4A16_GEMM_BTILE; b++) {
+            if (b < valid_b)
+                smem_out[(row_in_block * W4A16_GEMM_BTILE + b) * warps_per_row + warp_in_row] = sum[b];
+        }
+    }
+    __syncthreads();
+    if (tid_in_row == 0) {
+        #pragma unroll
+        for (int b = 0; b < W4A16_GEMM_BTILE; b++) {
+            if (b >= valid_b) break;
+            float total = 0.0f;
+            for (int w = 0; w < warps_per_row; w++)
+                total += smem_out[(row_in_block * W4A16_GEMM_BTILE + b) * warps_per_row + w];
+            output[(batch_base + b) * N + row] = __float2bfloat16(total);
+        }
+    }
+}
+
 // ============================================================================
 // Batched W4A16 GEMV: [B, K] × [N, K/2]^T → [B, N]
 // Same nibble extraction as single W4A16, with batch dimension in grid.y.
+//
+// sm_70 (V100) variant: shared-mem caches the input vector so GEMV_ROWS rows
+// share one HBM read of input (~75% less input HBM traffic). Compute structure
+// (8 int4/iter, uint32 loads) is unchanged to keep register pressure identical.
 // ============================================================================
+#if __CUDA_ARCH__ == 700
+__global__ void w4a16_gemv_batch_kernel(
+    const uint8_t* __restrict__ weight,
+    const __nv_bfloat16* __restrict__ scales,
+    const __nv_bfloat16* __restrict__ input,
+    __nv_bfloat16* __restrict__ output,
+    int B, int N, int K, int group_size)
+{
+    extern __shared__ __nv_bfloat16 smem_input[];
+
+    int batch_idx = blockIdx.y;
+    int row = blockIdx.x * GEMV_ROWS + threadIdx.x / (GEMV_THREADS / GEMV_ROWS);
+    int tid_in_row = threadIdx.x % (GEMV_THREADS / GEMV_ROWS);
+    int threads_per_row = GEMV_THREADS / GEMV_ROWS;
+    int lane_id = threadIdx.x % WARP_SIZE;
+    int row_in_block = threadIdx.x / threads_per_row;
+
+    // Cooperatively load input into shared memory (all rows in block share it)
+    const __nv_bfloat16* x = input + batch_idx * K;
+    for (int i = threadIdx.x; i < K; i += GEMV_THREADS)
+        smem_input[i] = x[i];
+    __syncthreads();
+
+    if (row >= N) return;
+
+    float sum = 0.0f;
+    int num_groups = K / group_size;
+    int bytes_per_row = K / 2;
+
+    for (int k = tid_in_row * 8; k < K; k += threads_per_row * 8) {
+        float scale_f = __bfloat162float(scales[row * num_groups + k / group_size]);
+        uint32_t packed = *reinterpret_cast<const uint32_t*>(&weight[row * bytes_per_row + k / 2]);
+
+        uint32_t lo4 = packed & 0x0F0F0F0Fu;
+        uint32_t hi4 = (packed >> 4) & 0x0F0F0F0Fu;
+
+        int lo0 = static_cast<int>(lo4 & 0xFF) - 8;
+        int hi0 = static_cast<int>(hi4 & 0xFF) - 8;
+        int lo1 = static_cast<int>((lo4 >> 8) & 0xFF) - 8;
+        int hi1 = static_cast<int>((hi4 >> 8) & 0xFF) - 8;
+        int lo2 = static_cast<int>((lo4 >> 16) & 0xFF) - 8;
+        int hi2 = static_cast<int>((hi4 >> 16) & 0xFF) - 8;
+        int lo3 = static_cast<int>((lo4 >> 24) & 0xFF) - 8;
+        int hi3 = static_cast<int>((hi4 >> 24) & 0xFF) - 8;
+
+        sum += static_cast<float>(lo0) * scale_f * __bfloat162float(smem_input[k]);
+        sum += static_cast<float>(hi0) * scale_f * __bfloat162float(smem_input[k + 1]);
+        sum += static_cast<float>(lo1) * scale_f * __bfloat162float(smem_input[k + 2]);
+        sum += static_cast<float>(hi1) * scale_f * __bfloat162float(smem_input[k + 3]);
+        sum += static_cast<float>(lo2) * scale_f * __bfloat162float(smem_input[k + 4]);
+        sum += static_cast<float>(hi2) * scale_f * __bfloat162float(smem_input[k + 5]);
+        sum += static_cast<float>(lo3) * scale_f * __bfloat162float(smem_input[k + 6]);
+        sum += static_cast<float>(hi3) * scale_f * __bfloat162float(smem_input[k + 7]);
+    }
+
+    sum = warp_reduce_sum(sum);
+    __shared__ float smem[GEMV_ROWS * 8];
+    int warps_per_row = threads_per_row / WARP_SIZE;
+    int warp_in_row = (threadIdx.x % threads_per_row) / WARP_SIZE;
+    if (lane_id == 0) smem[row_in_block * warps_per_row + warp_in_row] = sum;
+    __syncthreads();
+    if (tid_in_row == 0) {
+        float total = 0.0f;
+        for (int w = 0; w < warps_per_row; w++)
+            total += smem[row_in_block * warps_per_row + w];
+        output[batch_idx * N + row] = __float2bfloat16(total);
+    }
+}
+#else
 __global__ void w4a16_gemv_batch_kernel(
     const uint8_t* __restrict__ weight,
     const __nv_bfloat16* __restrict__ scales,
@@ -1246,6 +1406,7 @@ __global__ void w4a16_gemv_batch_kernel(
         output[batch_idx * N + row] = __float2bfloat16(total);
     }
 }
+#endif
 
 // ============================================================================
 // Grouped W4A16 GEMV (MoE): one weight/scale ptr per expert, routed tokens.
@@ -2409,7 +2570,9 @@ cudaError_t w4a16_gemv_cuda(
 {
     dim3 grid((N + GEMV_ROWS - 1) / GEMV_ROWS, 1);
     dim3 block(GEMV_THREADS);
-    w4a16_gemv_batch_kernel<<<grid, block, 0, stream>>>(
+    // sm_70 path caches input in dynamic shared memory; other SMs ignore it.
+    size_t smem = (size_t)K * sizeof(__nv_bfloat16);
+    w4a16_gemv_batch_kernel<<<grid, block, smem, stream>>>(
         weight, scales, input, output, 1, N, K, group_size);
     return cudaGetLastError();
 }
@@ -2443,9 +2606,17 @@ cudaError_t w4a16_gemv_batch_cuda(
     const __nv_bfloat16* input, __nv_bfloat16* output,
     int B, int N, int K, int group_size, cudaStream_t stream)
 {
-    dim3 grid((N + GEMV_ROWS - 1) / GEMV_ROWS, B);
     dim3 block(GEMV_THREADS);
-    w4a16_gemv_batch_kernel<<<grid, block, 0, stream>>>(
+    // B>=2 uses the batched GEMM (4 inputs share one weight read).
+    if (B >= 2) {
+        dim3 grid((N + GEMV_ROWS - 1) / GEMV_ROWS, (B + W4A16_GEMM_BTILE - 1) / W4A16_GEMM_BTILE);
+        w4a16_gemm_batch_kernel<<<grid, block, 0, stream>>>(
+            weight, scales, input, output, B, N, K, group_size);
+        return cudaGetLastError();
+    }
+    dim3 grid((N + GEMV_ROWS - 1) / GEMV_ROWS, B);
+    size_t smem = (size_t)K * sizeof(__nv_bfloat16);
+    w4a16_gemv_batch_kernel<<<grid, block, smem, stream>>>(
         weight, scales, input, output, B, N, K, group_size);
     return cudaGetLastError();
 }
