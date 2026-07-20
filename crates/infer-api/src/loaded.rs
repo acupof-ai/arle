@@ -702,7 +702,17 @@ mod backend {
         ) -> Option<&'static infer_cuda::DsparkExperienceBuffer> {
             match self {
                 Self::Cuda(_) => Some(infer_cuda::dspark_experience_buffer()),
-                _ => None,
+                #[cfg(feature = "metal")]
+                Self::Metal(_)
+                | Self::MetalDiffusionGemma(_)
+                | Self::MetalGemma4(_)
+                | Self::MetalDeepseekOcr(_) => None,
+                #[cfg(feature = "hip")]
+                Self::Hip(_) => None,
+                #[cfg(feature = "vulkan")]
+                Self::Vulkan(_) => None,
+                #[cfg(all(feature = "cpu", not(feature = "metal")))]
+                Self::Cpu(_) => None,
             }
         }
 
@@ -712,7 +722,19 @@ mod backend {
         pub fn update_dspark_markov_weights(&self, w1: &[f32], w2: &[f32]) -> Result<()> {
             match self {
                 Self::Cuda(engine) => engine.update_dspark_markov_weights(w1.to_vec(), w2.to_vec()),
-                _ => anyhow::bail!("update_dspark_markov_weights is CUDA-only"),
+                #[cfg(feature = "metal")]
+                Self::Metal(_)
+                | Self::MetalDiffusionGemma(_)
+                | Self::MetalGemma4(_)
+                | Self::MetalDeepseekOcr(_) => {
+                    anyhow::bail!("update_dspark_markov_weights is CUDA-only")
+                }
+                #[cfg(feature = "hip")]
+                Self::Hip(_) => anyhow::bail!("update_dspark_markov_weights is CUDA-only"),
+                #[cfg(feature = "vulkan")]
+                Self::Vulkan(_) => anyhow::bail!("update_dspark_markov_weights is CUDA-only"),
+                #[cfg(all(feature = "cpu", not(feature = "metal")))]
+                Self::Cpu(_) => anyhow::bail!("update_dspark_markov_weights is CUDA-only"),
             }
         }
 
