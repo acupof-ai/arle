@@ -1,6 +1,27 @@
 # hd256/FP8 temp>0 sampling corruption — root-cause + complete fix
 
-> Status: Active — Phase 0 attribution in flight (2026-07-20)
+> Status: Active — root cause FOUND & FIXED in source (`9851ced6b` +
+> `bf66a3854`, 2026-07-20). Confounder resolved: **Branch B (hd256 compute
+> residual, FP8-independent)**. Remaining = Phase 3 empirical verify on a
+> rebuilt binary, then revert the temp=0.3 workaround. Phase 0 bf16 isolation is
+> now unnecessary (the mechanism is identified and patched).
+
+## Root cause (RESOLVED)
+
+`b4b293f0c` fixed the hd256 q/k RMSNorm convention but left the **per-layer
+`input_layernorm` / `post_attention_layernorm`** loaded raw. All Qwen3.5/3.6
+norms ship in STANDARD format (~1-centered); the `rms_norm_offset` trunk kernel
+applies `(1 + weight)`, so raw-loaded norms carried a ~2× multiplier per layer,
+compounding across 64 layers. Fix (`9851ced6b`): load them via
+`load_final_norm_offset` → `(w − 1)`, so `(1 + (w−1)) = w`. q/k_norm stay raw
+(hd256 prep kernels apply `weight` directly — the STANDARD convention
+`b4b293f0c` set). This is FP8-independent — the bf16 path had the same 2× bug.
+
+**Open tension to close in Phase 3:** a 2×-per-layer compounding error should
+have broken greedy too, yet greedy read as coherent pre-fix. Either greedy was
+never rigorously gated on the 27B at this binary, or the mechanism magnitude is
+overstated. Do not trust the commit message — MEASURE temp=1.0 on the rebuilt
+binary before declaring done.
 
 ## Verdict up front
 
@@ -36,6 +57,11 @@ quantization at once. Two live hypotheses, not yet separated:
   scale), independent of FP8.
 
 Inference points at (A), but inference is hypothesis — Phase 0 measures.
+
+## Phase 0/1/2 — DONE (root cause found + patched, see header)
+
+Superseded by `9851ced6b`. The bf16 isolation below is no longer needed; kept for
+the record.
 
 ## Phase 0 — decisive attribution (gates the fix branch; ~10 min, no rebuild)
 
