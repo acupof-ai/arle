@@ -375,7 +375,6 @@ impl CudaExecutor {
         mtp_draft_topk: Option<usize>,
         dspark_draft_model: Option<&std::path::Path>,
         dspark_conf_threshold: f32,
-        dspark_max_prompt_tokens: Option<usize>,
     ) -> anyhow::Result<Self> {
         Ok(Self {
             inner: CudaExecutorInner::Real(Box::new(
@@ -387,7 +386,6 @@ impl CudaExecutor {
                     mtp_draft_topk,
                     dspark_draft_model,
                     dspark_conf_threshold,
-                    dspark_max_prompt_tokens,
                 )?,
             )),
         })

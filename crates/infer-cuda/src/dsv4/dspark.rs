@@ -639,30 +639,27 @@ impl Dsv4Model {
         }
         let cap = df.latent_kv[0].len / head_dim;
         let max_ctx = cap - config.dspark_block_size;
-        // Sliding-window: keep only the last `max_ctx` context rows. If the
-        // incoming chunk exceeds that, drop the leading rows (they fall out of
-        // the window anyway) and rebase the buffer to the tail start.
-        let (cols, start_abs, skip) = if rows > max_ctx {
-            let skip = rows - max_ctx;
-            df.rebase(start_abs + skip);
-            (max_ctx, start_abs + skip, skip)
-        } else {
-            (rows, start_abs, 0)
-        };
+        // Sliding window: keep only the last `max_ctx` context rows. A chunk
+        // larger than the window drops its leading rows (they fall out anyway)
+        // and rebases the buffer to the tail start.
+        let skip = rows.saturating_sub(max_ctx);
+        let cols = rows - skip;
+        let start_abs = start_abs + skip;
+        if skip > 0 {
+            df.rebase(start_abs);
+        }
         let live = df.ctx_end - df.ctx_base;
         if live + cols > max_ctx {
-            let new_base = df.ctx_end.saturating_add(cols).saturating_sub(max_ctx);
-            let shift = new_base - df.ctx_base;
-            let keep = live.saturating_sub(shift);
+            let shift = df.ctx_end + cols - max_ctx - df.ctx_base;
+            let keep = live - shift;
             if keep > 0 {
                 let elem_size = std::mem::size_of::<half::bf16>();
                 let n_bytes = keep * head_dim * elem_size;
                 let src_off = shift * head_dim * elem_size;
                 for stage_kv in &mut df.latent_kv {
                     let (base, _g) = stage_kv.data.device_ptr_mut(&ctx.stream);
-                    // SAFETY: base is a live allocation of cap*head_dim bf16 on
-                    // this stream; keep+shift <= live < cap, so both ranges are
-                    // in-bounds. Overlapping shift uses the async memmove path.
+                    // SAFETY: keep+shift <= live < cap, both ranges in-bounds;
+                    // overlapping shift uses the async memmove path.
                     unsafe {
                         cudarc::driver::result::memcpy_dtod_async(
                             base,
@@ -674,13 +671,8 @@ impl Dsv4Model {
                     }
                 }
             }
-            df.ctx_base = new_base;
+            df.ctx_base += shift;
         }
-        ensure!(
-            (df.ctx_end - df.ctx_base) + cols <= cap,
-            "DSpark context overflow: rows {} > cap {cap}",
-            (df.ctx_end - df.ctx_base) + cols
-        );
 
         // SAFETY: each launch fully writes one non-overlapping [rows, hidden]
         // tap slice; all n_taps slices cover the buffer before it is read.
