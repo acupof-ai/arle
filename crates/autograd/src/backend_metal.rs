@@ -514,6 +514,8 @@ impl Backend for MetalBackend {
         };
 
         let _guard = mlx_guard();
+        // SAFETY: a_handle/b_handle are live MlxHandle pointers; mlx_guard()
+        // serializes MLX access; null return is checked below.
         unsafe {
             let out = mlx_multiply(a_handle.as_ptr(), b_handle.as_ptr());
             if out.is_null() {
@@ -803,6 +805,8 @@ impl Backend for MetalBackend {
         };
         let shape_i32: Vec<i32> = new_shape.iter().map(|&d| d as i32).collect();
         let _guard = mlx_guard();
+        // SAFETY: x_handle is a live MlxHandle pointer; shape_i32 is a valid
+        // Vec of the reported length; mlx_guard() serializes MLX access.
         unsafe {
             let reshaped = mlx_reshape(x_handle.as_ptr(), shape_i32.as_ptr(), shape_i32.len());
             if reshaped.is_null() {
@@ -847,6 +851,8 @@ impl Backend for MetalBackend {
             // permutation and keeps ownership semantics consistent.
             let shape_i32: Vec<i32> = new_shape.iter().map(|&d| d as i32).collect();
             let _guard = mlx_guard();
+            // SAFETY: x_handle is a live MlxHandle; shape_i32 matches new_shape
+            // length; mlx_guard() serializes MLX access.
             let view =
                 unsafe { mlx_reshape(x_handle.as_ptr(), shape_i32.as_ptr(), shape_i32.len()) };
             if view.is_null() {
@@ -860,6 +866,8 @@ impl Backend for MetalBackend {
         let mut perm: Vec<i32> = (0..rank as i32).collect();
         perm.swap(axis1, axis2);
         let _guard = mlx_guard();
+        // SAFETY: x_handle is a live MlxHandle; perm has `rank` valid entries;
+        // mlx_guard() serializes MLX access.
         unsafe {
             let view = mlx_transpose_axes(x_handle.as_ptr(), perm.as_ptr(), perm.len());
             if view.is_null() {
@@ -934,6 +942,8 @@ impl Backend for MetalBackend {
         let strides_i32: Vec<i32> = vec![1; rank];
 
         let _guard = mlx_guard();
+        // SAFETY: x_handle is a live MlxHandle; starts/ends/strides each have
+        // `rank` valid entries; mlx_guard() serializes MLX access.
         unsafe {
             let view = mlx_slice(
                 x_handle.as_ptr(),
@@ -1749,6 +1759,8 @@ fn mlx_unary_flat(a: &[f32], op: UnaryOp) -> Result<Vec<f32>> {
 // intermediate we allocate here is freed before returning.
 unsafe fn gelu_tanh(input: *mut mlx_sys::mlx_array) -> Result<*mut mlx_sys::mlx_array> {
     const K: f32 = 0.797_884_6_f32; // sqrt(2/pi)
+    // SAFETY: caller guarantees `input` is live and holds mlx_guard(); we free
+    // every intermediate before returning (see function-level safety doc).
     unsafe {
         // xsq = x * x ; xcube = xsq * x
         let xsq = mlx_multiply(input, input);
@@ -2995,6 +3007,9 @@ fn mlx_scatter_add_rows(
 // Safety: `arr` must be a non-null pointer to a live MLX array owned by
 // the caller for the duration of this call.
 unsafe fn eval_and_readback(arr: *mut mlx_sys::mlx_array) -> Result<Vec<f32>> {
+    // SAFETY: `arr` is a non-null live MLX array owned by the caller for the
+    // duration of this call (see function-level safety doc); mlx_guard() is
+    // held by the caller.
     unsafe {
         let mut eval_handles = [arr];
         mlx_eval(eval_handles.as_mut_ptr(), eval_handles.len());
