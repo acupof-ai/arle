@@ -46,7 +46,47 @@ pub struct CcHarness {
     pub test_timeout_secs: u64,
     /// Scoring `PYTHONPATH` prefix (e.g. `lib` for ansible).
     pub pythonpath: Option<String>,
+    /// Transform from raw pass-fraction to training reward. Default = as-is.
+    pub reward_shape: RewardShape,
     pub tokenizer: tokenizers::Tokenizer,
+}
+
+/// How the raw pytest pass-fraction becomes the training reward.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum RewardShape {
+    /// Reward = the pass-fraction as-is. Original behavior.
+    #[default]
+    Dense,
+    /// Reward = 1.0 only when every test passes, else 0.0.
+    Binary,
+    /// 1.0 on a full pass, 0.0 on a timeout/harness error, otherwise a small
+    /// fraction that only orders attempts inside an all-failing group.
+    Anchored,
+}
+
+/// A partial's reward tops out here, well below a full pass (1.0), so the
+/// pass/fail split always dominates and the fraction only breaks ties.
+const REWARD_DENSE_WEIGHT: f32 = 0.3;
+
+impl RewardShape {
+    /// Shape the raw pass-fraction `f`. `errored` marks a timeout or harness
+    /// failure — a budget artifact, not a signal to learn from.
+    #[must_use]
+    pub fn apply(self, f: f32, errored: bool) -> f32 {
+        match self {
+            RewardShape::Dense => f,
+            RewardShape::Binary => {
+                if f >= 1.0 {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
+            RewardShape::Anchored if errored => 0.0,
+            RewardShape::Anchored if f >= 1.0 => 1.0,
+            RewardShape::Anchored => REWARD_DENSE_WEIGHT * f,
+        }
+    }
 }
 
 pub fn load_tokenizer(path: &Path) -> Result<tokenizers::Tokenizer> {
@@ -59,9 +99,12 @@ pub fn load_tokenizer(path: &Path) -> Result<tokenizers::Tokenizer> {
 pub struct ScoredSample {
     pub task_id: String,
     pub sample: usize,
-    /// Dense pytest reward in [0,1]; pass ⇔ `reward >= 1.0`.
+    /// Shaped reward; pass ⇔ `reward >= 1.0` (all shapes agree on the pass point).
     pub reward: f32,
     pub edited: bool,
+    /// cc timed out or scoring failed — a budget/infra artifact, not a real
+    /// fail. Marks the trajectory truncated so the update drops it.
+    pub errored: bool,
     /// Score log tail, prefixed with the cc error when the attempt failed.
     pub note: String,
     /// cc attempt wall (epoch ms) — the dump-attribution window.
@@ -210,6 +253,7 @@ impl CcHarness {
                 t_start_ms: s.t_start_ms,
                 t_end_ms: s.t_end_ms,
                 reward: s.reward,
+                errored: s.errored,
                 model: Some(sample_model(&self.model_id, s.sample)),
             })
             .collect();
@@ -252,15 +296,20 @@ impl CcHarness {
         let t_start_ms = epoch_ms();
         let spawned = run_captured(cmd, Duration::from_secs(self.cc_timeout_secs));
         let t_end_ms = epoch_ms();
-        let (cc, cc_error) = match spawned {
-            Err(err) => (None, Some(format!("cc spawn failed: {err}"))),
-            Ok((_, _, true)) => (None, Some("cc timeout".to_owned())),
-            Ok((output, code, false)) => parse_cc_json(&output, code),
+        let (cc, cc_error, cc_timeout) = match spawned {
+            Err(err) => (None, Some(format!("cc spawn failed: {err}")), false),
+            Ok((_, _, true)) => (None, Some("cc timeout".to_owned()), true),
+            Ok((output, code, false)) => {
+                let (cc, err) = parse_cc_json(&output, code);
+                (cc, err, false)
+            }
         };
 
-        let (reward, edited, score_note) = match diff_workdir(workdir) {
-            Err(err) => (0.0, false, format!("diff error: {err}")),
-            Ok(diff) if diff.trim().is_empty() => (0.0, false, "no edits".to_owned()),
+        // `score_err` = the diff/score step itself failed (vs a clean fail with a
+        // real pass-fraction). Errored attempts don't carry a learnable reward.
+        let (raw_reward, edited, score_err, score_note) = match diff_workdir(workdir) {
+            Err(err) => (0.0, false, true, format!("diff error: {err}")),
+            Ok(diff) if diff.trim().is_empty() => (0.0, false, false, "no edits".to_owned()),
             Ok(_) => match score_workdir(
                 workdir,
                 &task.test_patch,
@@ -271,11 +320,14 @@ impl CcHarness {
                 Ok((reward, log)) => (
                     reward,
                     true,
+                    false,
                     log.lines().last().unwrap_or_default().to_owned(),
                 ),
-                Err(err) => (0.0, true, format!("score error: {err}")),
+                Err(err) => (0.0, true, true, format!("score error: {err}")),
             },
         };
+        let errored = cc_timeout || score_err;
+        let reward = self.reward_shape.apply(raw_reward, errored);
 
         let usage = cc.as_ref().and_then(|v| v.get("usage"));
         let get = |v: Option<&serde_json::Value>, key| v.and_then(|v| v.get(key)?.as_u64());
@@ -284,6 +336,7 @@ impl CcHarness {
             sample,
             reward,
             edited,
+            errored,
             note: match cc_error {
                 Some(err) => format!("{err}; {score_note}"),
                 None => score_note,
@@ -351,7 +404,7 @@ fn epoch_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{GroupAssembler, ScoredSample, zero_variance};
+    use super::{GroupAssembler, REWARD_DENSE_WEIGHT, RewardShape, ScoredSample, zero_variance};
 
     fn sample(task: &str, idx: usize, reward: f32) -> ScoredSample {
         ScoredSample {
@@ -359,6 +412,7 @@ mod tests {
             sample: idx,
             reward,
             edited: reward > 0.0,
+            errored: false,
             note: String::new(),
             t_start_ms: 0,
             t_end_ms: 0,
@@ -386,5 +440,26 @@ mod tests {
             .expect("b completes at K");
         assert_eq!(b.iter().map(|s| s.sample).collect::<Vec<_>>(), [0, 1]);
         assert!(!zero_variance(&b), "0.5 vs 1.0 carries advantage");
+    }
+
+    #[test]
+    fn reward_shapes_transform_fraction_and_error() {
+        // Dense: verbatim, byte-identical to the historical reward.
+        assert_eq!(RewardShape::Dense.apply(0.6, false), 0.6);
+        assert_eq!(RewardShape::Dense.apply(0.6, true), 0.6);
+        assert_eq!(RewardShape::Dense.apply(1.0, false), 1.0);
+
+        // Binary: 1.0 only at a full pass.
+        assert_eq!(RewardShape::Binary.apply(1.0, false), 1.0);
+        assert_eq!(RewardShape::Binary.apply(0.9, false), 0.0);
+
+        // Anchored: pass=1, error=0, partial=down-weighted (never reaches 1).
+        assert_eq!(RewardShape::Anchored.apply(1.0, false), 1.0);
+        assert_eq!(RewardShape::Anchored.apply(0.6, true), 0.0);
+        assert_eq!(
+            RewardShape::Anchored.apply(0.6, false),
+            REWARD_DENSE_WEIGHT * 0.6
+        );
+        assert!(RewardShape::Anchored.apply(0.99, false) < 1.0);
     }
 }
