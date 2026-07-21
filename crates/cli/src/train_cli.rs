@@ -3266,6 +3266,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
         cc_timeout_secs: args.cc_timeout,
         test_timeout_secs: args.test_timeout_secs,
         pythonpath: args.pythonpath.clone(),
+        reward_shape: args.reward_shape.into(),
         tokenizer: train::cc_harness::load_tokenizer(&student_dir.join("tokenizer.json"))?,
     });
 
@@ -3328,6 +3329,10 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
     // LAUNCHED under (behavior_version) and trains at the current version;
     // staleness = current − behavior (0 today; 1 for overlapped groups).
     let mut policy_version = 0u64;
+    // Previous eval round's gap between train reward and held-out pass rate. When
+    // train reward climbs but held-out doesn't, the two diverge — a sign the model
+    // is gaming the reward. We warn only when the gap is large AND still widening.
+    let mut prev_eval_gap: Option<f64> = None;
     for round in 0..args.rounds {
         // Anchor the per-stage profiler (human table opt-in via ARLE_AOPD_PROFILE).
         train::aopd_profile::begin_round();
@@ -3346,6 +3351,13 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
             (0usize, 0usize, 0usize, 0usize);
         let mut replayed_groups = 0usize;
         let mut reward_sum = 0.0f64;
+        // How far the generation-time token probabilities drift from the
+        // training-time ones for the same weights; near 0 means our rollout and
+        // training math agree. PgStats already sums this per masked token from the
+        // same Δ = train_logp − rollout_logp the IS ratio uses (no extra forward),
+        // so we just carry the sum/count across the round. Ratio-free presets
+        // (rejection-ce) contribute 0 tokens → the field is omitted below.
+        let (mut round_k3_sum, mut round_k3_tokens) = (0.0f64, 0usize);
         let (mut prompt_tokens, mut completion_tokens) = (0u64, 0u64);
         let mut sync_lora_secs = 0.0f64;
         // Round-scoped budget of TRAINABLE trajectories (parity with the
@@ -3524,7 +3536,9 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
                     // licenses the flip); the ratio denominator for stale groups.
                     gen_logprobs: (!r.gen_logprobs.is_empty()).then_some(r.gen_logprobs),
                     group_id: group_idx,
-                    truncated: false,
+                    // Timeout/harness-error attempts: drop them from the update
+                    // (a budget artifact, not a learnable fail) via DAPO's filter.
+                    truncated: r.truncated,
                 })
                 .collect();
             // VRAM-wall length guard, applied HERE — before `capture_rollout_logprobs`
@@ -3608,6 +3622,8 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
                     })
                     .map_err(anyhow::Error::from)?;
                 losses.push(report.loss);
+                round_k3_sum += report.stats.kl_sum;
+                round_k3_tokens += report.stats.tokens;
                 let mut row = serde_json::json!({
                     "kind": "update",
                     "round": round,
@@ -3804,6 +3820,25 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
 
         // Per-round metrics row; the update/group rows land per group above.
         let groups = round_tasks.len().max(1);
+        let reward_mean = reward_sum / rollouts.max(1) as f64;
+        // Mean drift over the round's masked tokens; None on ratio-free presets.
+        let rollout_train_k3_kl =
+            (round_k3_tokens > 0).then(|| round_k3_sum / round_k3_tokens as f64);
+        // Only meaningful on eval rounds (held_out is None otherwise). A large,
+        // still-widening gap is our reward-hacking alarm.
+        const REWARD_HELDOUT_GAP_WARN: f64 = 0.2;
+        let reward_heldout_gap = held_out_pass_rate.map(|pass| reward_mean - f64::from(pass));
+        if let Some(gap) = reward_heldout_gap {
+            if gap > REWARD_HELDOUT_GAP_WARN && prev_eval_gap.is_some_and(|prev| gap > prev) {
+                eprintln!(
+                    "[arle train agent-opd] WARNING round {round}: reward↔held-out gap \
+                     {gap:+.4} exceeds {REWARD_HELDOUT_GAP_WARN} and is rising (prev \
+                     {:+.4}) — possible reward hacking",
+                    prev_eval_gap.expect("prev gap present"),
+                );
+            }
+            prev_eval_gap = Some(gap);
+        }
         metrics.append(&serde_json::json!({
             "kind": "round",
             "round": round,
@@ -3815,7 +3850,8 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
             "pass_at_k": tasks_passed as f32 / groups as f32,
             "zero_variance_group_frac": zero_variance_groups as f32 / groups as f32,
             "replayed_groups": replayed_groups,
-            "reward_mean": reward_sum / rollouts.max(1) as f64,
+            "reward_mean": reward_mean,
+            "rollout_train_k3_kl": rollout_train_k3_kl,
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
             "mean_train_loss": mean_loss,
@@ -3829,6 +3865,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
             "held_out_pass_rate": held_out_pass_rate,
             "baseline_pass_rate": baseline_pass_rate,
             "delta": held_out_pass_rate.zip(baseline_pass_rate).map(|(p, b)| p - b),
+            "reward_heldout_gap": reward_heldout_gap,
         }));
 
         // Per-stage ms + %-of-round breakdown (opt-in ARLE_AOPD_PROFILE; no-op off).
