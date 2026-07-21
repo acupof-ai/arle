@@ -141,8 +141,33 @@ metric. c=1 ITL 40.4 ms ≈ 24.7 tok/s decode, matches the c=1 out tok/s.
 - **Decode-bound at all concurrencies.** out tok/s scales weakly (22.8 → 30.1,
   +32% from c=1 to c=16) — V100 sm_70 W4A16 decode is the bottleneck, not
   scheduler/KV. TTFT grows linearly with concurrency (queueing).
-- **DSpark not measured**: DFlash draft checkpoint on V100 has only
-  `config.json`, no weight files — needs a full DFlash model download before
-  the spec-decode arm can run.
+
+### DSpark arm — KILLED (−91% at c=1)
+
+Same serve + `--spec-type dspark --mtp-draft-model
+z-lab/Qwen3.6-27B-DFlash` (DFlash drafter, block=16, taps=[1,16,31,46,61]).
+39 slots (clamped by draft model VRAM +96MB/slot). Raw: V100
+`/tmp/v100_dspark_bench.{json,csv}`.
+
+| c | complete | errors | out tok/s | ITL p50/p99 ms | Δ vs no-spec |
+|---|---:|---:|---:|---|---:|
+| 1 | 2 | 0 | 2.0 | 499 / 507 | **−91.2%** |
+| 4 | 4 | 1 | 2.0 | 0.02* / 1990 | **−92.2%** |
+| 8 | 0 | 8 | 0.0 | n/a | n/a |
+| 16 | 0 | 131204 | 0.0 | n/a | n/a |
+
+\* ITL p50 artifact (see no-spec note); c=1 ITL 499 ms vs no-spec 40 ms =
+12.5× slower per decode step.
+
+- **KILL.** DSpark draft+verify path on V100 sm_70 adds ~460 ms/step overhead
+  (ITL 40 → 499 ms). c=8 all 8 requests error (1543 s wall); c=16 connection
+  storm (131204 errors in 60 s). Serve log: `[coordinator] lockstep stalled:
+  tick #2232128 awaiting acks (elapsed=10s)` — the TP lockstep mechanism
+  deadlocks under DSpark's multi-step proposal on single-GPU V100.
+- **Root cause hypothesis**: DSpark's `tp_lockstep_proposal/accept` was designed
+  for TP≥2 (H20); on TP=1 V100 the lockstep coordinator stalls waiting for
+  cross-rank acks that never arrive. Needs a TP=1 fast path or the lockstep
+  disabled when world_size=1.
+
 
 
