@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Start `arle serve` for Qwen3.6-27B-FP8 as the OpenAI-v1 endpoint that
+# Start `arle serve` for ThinkingCap-Qwen3.6-27B-FP8 as the OpenAI-v1 endpoint that
 # Terminal-Bench's terminus agent (via litellm) will hit.
 #
 # TOPOLOGY (evidence-grounded 2026-06-26):
@@ -23,7 +23,7 @@
 # Env overrides:
 #   ARLE_BIN     path to the prebuilt arle binary
 #                (default: /host/arle-build/target/release/arle)
-#   MODEL_PATH   model dir            (default: /host/Qwen3.6-27B-FP8)
+#   MODEL_PATH   model dir            (default: /host/ThinkingCap-Qwen3.6-27B-FP8)
 #   PORT         listen port          (default: 8000)
 #   BIND         bind address         (default: 0.0.0.0 — required for the
 #                                       node/Mac to reach it over host-net)
@@ -34,12 +34,12 @@
 #                       occupied by another workload.
 #   EXTRA_FLAGS  extra `arle serve` flags (e.g. "--max-total-tokens 32768")
 #
-# The served OpenAI model id is the model-dir basename: `Qwen3.6-27B-FP8`
-# (infer-api `model_id_from_path`). Point TB at it as `openai/Qwen3.6-27B-FP8`.
+# The served OpenAI model id is the model-dir basename: `ThinkingCap-Qwen3.6-27B-FP8`
+# (infer-api `model_id_from_path`). Point TB at it as `openai/ThinkingCap-Qwen3.6-27B-FP8`.
 set -euo pipefail
 
 ARLE_BIN="${ARLE_BIN:-/host/arle-build/target/release/arle}"
-MODEL_PATH="${MODEL_PATH:-/host/Qwen3.6-27B-FP8}"
+MODEL_PATH="${MODEL_PATH:-/host/ThinkingCap-Qwen3.6-27B-FP8}"
 PORT="${PORT:-8000}"
 BIND="${BIND:-0.0.0.0}"
 EXTRA_FLAGS="${EXTRA_FLAGS:-}"

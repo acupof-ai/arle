@@ -153,6 +153,19 @@ pub(crate) const CATALOG: &[CatalogEntry] = &[
         implemented: true,
         recommended: Some("fastest · MoE"),
     },
+    // ── CUDA agentic flagship — ThinkingCap 27B FP8 ──────────────────────
+    // 73% fewer tokens than base Qwen3.6-27B-FP8 at identical agentic reward
+    // (5/5 greedy); card claims "50% fewer thinking tokens, preserved quality".
+    CatalogEntry {
+        hf_id: "bottlecapai/ThinkingCap-Qwen3.6-27B-FP8",
+        display_name: "ThinkingCap 27B",
+        quantization: Some("FP8"),
+        size_gb: 29.0,
+        min_memory_gb: 32.0,
+        backends: &[Cuda],
+        implemented: true,
+        recommended: Some("best agentic · 73% fewer tokens"),
+    },
 ];
 
 /// Return catalog entries that can run on this system, best first: the
@@ -269,10 +282,11 @@ mod tests {
     #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
     #[test]
     fn flagship_picks_are_marked_recommended() {
-        // The two models ARLE leads with must carry a one-line reason.
+        // The models ARLE leads with must carry a one-line reason.
         for id in [
             "mlx-community/Qwen3.6-27B-OptiQ-4bit",
             "mlx-community/Qwen3.6-35B-A3B-4bit",
+            "bottlecapai/ThinkingCap-Qwen3.6-27B-FP8",
         ] {
             let entry = find_by_hf_id(id).expect("flagship in catalog");
             assert!(

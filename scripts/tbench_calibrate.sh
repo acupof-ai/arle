@@ -4,7 +4,7 @@
 # tbench_opd_loop.sh. The eval is the only signal for "hard *for the model*".
 set +e
 
-ROOT=/host/arle-build; ARLE=$ROOT/target/release/arle; MODEL=/host/Qwen3.6-27B-FP8
+ROOT=/host/arle-build; ARLE=$ROOT/target/release/arle; MODEL=/host/ThinkingCap-Qwen3.6-27B-FP8
 PY=${PY:-python3}
 WORK=${WORK:-/host/tb_calib}; PORT=${PORT:-18200}; GPU=${GPU:-0}
 LORA=${LORA:-/host/tb_lora/adapters_replay/adapter_model.safetensors}  # +5pp format fix
@@ -26,7 +26,7 @@ for i in $(seq 1 60); do curl -s --max-time 3 http://127.0.0.1:$PORT/v1/models >
 
 # 3. pass@3 difficulty label (600s agent cap bounds runaway-reasoning waste)
 OPENAI_API_BASE=http://127.0.0.1:$PORT/v1 OPENAI_API_KEY=dummy NO_PROXY=127.0.0.1,localhost,::1 \
-  tb run --dataset-path $POOL -a terminus -m openai/Qwen3.6-27B-FP8 \
+  tb run --dataset-path $POOL -a terminus -m openai/ThinkingCap-Qwen3.6-27B-FP8 \
   --n-attempts 3 --n-concurrent 4 --global-agent-timeout-sec 600 --global-test-timeout-sec 60 \
   --output-path $WORK/run > $WORK/eval.log 2>&1
 

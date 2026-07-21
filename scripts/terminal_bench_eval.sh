@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Run Terminal-Bench (laude-institute/terminal-bench, https://www.tbench.ai/)
-# against OUR model — Qwen3.6-27B-FP8 served by `arle serve` — using the
+# against OUR model — ThinkingCap-Qwen3.6-27B-FP8 served by `arle serve` — using the
 # built-in `terminus` agent driven through litellm at an OpenAI-compatible base
 # URL.
 #
@@ -37,7 +37,7 @@
 # Env overrides:
 #   PORT          local + pod serve port           (default: 8000)
 #   MODEL_ID      OpenAI model id (basename of pod model dir)
-#                                                   (default: Qwen3.6-27B-FP8)
+#                                          (default: ThinkingCap-Qwen3.6-27B-FP8)
 #   API_BASE      override the serve base URL       (default: http://localhost:$PORT/v1)
 #   OPENAI_API_KEY  litellm api key (dummy ok)      (default: arle-local)
 #   DATASET_NAME  TB dataset                        (default: terminal-bench-core)
@@ -50,7 +50,7 @@
 set -euo pipefail
 
 PORT="${PORT:-8000}"
-MODEL_ID="${MODEL_ID:-Qwen3.6-27B-FP8}"
+MODEL_ID="${MODEL_ID:-ThinkingCap-Qwen3.6-27B-FP8}"
 API_BASE="${API_BASE:-http://localhost:${PORT}/v1}"
 export OPENAI_API_KEY="${OPENAI_API_KEY:-arle-local}"
 DATASET_NAME="${DATASET_NAME:-terminal-bench-core}"
