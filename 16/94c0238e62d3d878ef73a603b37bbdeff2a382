@@ -1,0 +1,25 @@
+CHANGELOG.md
+  s_1f501b27e77cda::t_1f886791861c50 26-35
+docs/experience/wins/2026-07-22-bench-sm120-fp8-moe-cutlass-grouped.md
+  s_1f501b27e77cda::t_6b7603df20f7c6 1-92
+docs/plans/2026-07-21-sm120-tc-kernel-compat.md
+  s_1f501b27e77cda::t_51bafcf7cee55f 3-5
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "1694c0238e62d3d878ef73a603b37bbdeff2a382",
+  "prompts": {},
+  "sessions": {
+    "s_1f501b27e77cda": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a30e19813fe033b06",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
