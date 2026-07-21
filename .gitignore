@@ -47,5 +47,3 @@ scripts/_pod_*
 .kami-lark/*
 logs/
 data/opd-corpora/
-serve_baseline_tp4.sh
-serve_dspark_tp4.sh
