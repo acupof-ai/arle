@@ -1941,6 +1941,19 @@ impl DeviceMatrix {
         ))
     }
 
+    /// Copy the dense BF16 `data` buffer to host as f32 (for testing/training).
+    ///
+    /// Mirrors [`DeviceVec::to_host`]; only reads the dense `data` field, not
+    /// quantized side buffers.
+    pub fn to_host(&self, ctx: &DeviceContext) -> Result<Vec<f32>> {
+        let host_f16 = ctx
+            .stream
+            .clone_dtoh(&self.data)
+            .map_err(|e| anyhow!("D2H copy failed: {}", e))?;
+        ctx.sync()?;
+        Ok(host_f16.iter().map(|x| x.to_f32()).collect())
+    }
+
     /// Move every device weight buffer to host RAM and free the VRAM.
     ///
     /// Returns a [`HostMatrixSnapshot`] the caller holds until reload. The
