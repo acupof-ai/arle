@@ -1,0 +1,37 @@
+CHANGELOG.md
+  s_9c91b86ec3fb55::t_06a72b4b3aeb0d 26-35
+docs/experience/errors/2026-07-20-hd256-fp8-temp-sampling-corruption.md
+  s_099383ef79559d::t_b542636d4d4e8d 80,132-137
+docs/experience/wins/2026-07-20-hd256-qk-rmsnorm-offset-restore.md
+  s_099383ef79559d::t_38f32b167656a9 43-46
+docs/plans/2026-07-20-hd256-fp8-temp-sampling-corruption.md
+  s_099383ef79559d::t_a7a8d5a7ca84e5 8-9,25-29,39
+docs/plans/2026-07-21-rl-experiment-sop.md
+  s_9c91b86ec3fb55::t_668affb0e2e73c 248-265
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "1458ca434a309577caf33a1a0432e7aaa36ebde1",
+  "prompts": {},
+  "sessions": {
+    "s_099383ef79559d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4489c951-ff19-410c-a076-13320f5753c1",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_9c91b86ec3fb55": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4779911a-69b7-49db-bc83-daf5a48d6ca3",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
