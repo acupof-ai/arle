@@ -740,6 +740,13 @@ pub(crate) struct ServeArgs {
     #[arg(long, default_value_t = 0.5, value_name = "T")]
     pub(crate) dspark_conf_threshold: f32,
 
+    /// Spawn the DSpark train sidecar alongside `--spec-type dspark` serving.
+    /// Drains the experience buffer the hot path populates and hot-swaps updated
+    /// Markov-head weights back into the running engine. No-op without
+    /// `--spec-type dspark` or on non-CUDA backends.
+    #[arg(long, default_value_t = false)]
+    pub(crate) dspark_train: bool,
+
     /// Number of MTP draft tokens to propose per verify block on CUDA.
     #[arg(long, value_name = "N")]
     pub(crate) mtp_draft_tokens: Option<usize>,

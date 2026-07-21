@@ -1534,6 +1534,55 @@ impl Dsv4CudaExecutor {
         }
     }
 
+    /// Hot-swap the DSpark Markov head weights from a host f32 snapshot.
+    ///
+    /// Called by the train sidecar after each acceptance-weighted step. The new
+    /// weights are converted to bf16 and uploaded; the device `data` pointer is
+    /// flipped under the stream's ordering guarantee. `w1` is `[vocab * rank]`,
+    /// `w2` is `[rank * vocab]`.
+    pub(crate) fn update_dspark_markov_weights(&mut self, w1: &[f32], w2: &[f32]) -> Result<()> {
+        let dspark = self
+            .dspark
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("DSpark head not loaded"))?;
+        let stage = dspark
+            .draft
+            .stages
+            .last_mut()
+            .ok_or_else(|| anyhow::anyhow!("DSpark draft has no stages"))?;
+        let (Some(mw1), Some(mw2)) = (&mut stage.markov_w1, &mut stage.markov_w2) else {
+            anyhow::bail!("DSpark exit stage has no Markov head weights");
+        };
+        let w1_len = mw1.rows * mw1.cols;
+        let w2_len = mw2.rows * mw2.cols;
+        ensure!(
+            w1.len() == w1_len,
+            "DSpark markov w1 size mismatch: got {}, expected {w1_len}",
+            w1.len()
+        );
+        ensure!(
+            w2.len() == w2_len,
+            "DSpark markov w2 size mismatch: got {}, expected {w2_len}",
+            w2.len()
+        );
+        let w1_bf16: Vec<half::bf16> = w1.iter().map(|&x| half::bf16::from_f32(x)).collect();
+        let w2_bf16: Vec<half::bf16> = w2.iter().map(|&x| half::bf16::from_f32(x)).collect();
+        mw1.data = self
+            .model
+            .ctx
+            .stream
+            .clone_htod(&w1_bf16)
+            .map_err(|e| anyhow::anyhow!("DSpark markov w1 H2D upload failed: {e}"))?;
+        mw2.data = self
+            .model
+            .ctx
+            .stream
+            .clone_htod(&w2_bf16)
+            .map_err(|e| anyhow::anyhow!("DSpark markov w2 H2D upload failed: {e}"))?;
+        self.model.ctx.sync()?;
+        Ok(())
+    }
+
     /// Seed a freshly-prefilled prompt chunk into the DSpark draft context: pull
     /// the transient multi-row taps the prefill forward stashed on the slot and
     /// append them at absolute trunk positions `start_abs..` (the canonical
@@ -1746,6 +1795,21 @@ impl Dsv4CudaExecutor {
         // rank commits an identical KV tail (next tick's combined attention reads
         // all ranks' shards — an inconsistent commit corrupts it).
         (accepted, bonus) = Self::tp_lockstep_accept(&self.model, accepted, bonus)?;
+
+        // Train sidecar: capture (draft_tokens, draft_logits, target_logits,
+        // accepted) for the asynchronous acceptance-weighted trainer. Best-effort;
+        // skipped when draft_logits are unavailable (TP lockstep cleared them).
+        if let Some(draft_logits) = proposal.draft_logits.as_ref() {
+            super::dspark_train::capture_dspark_experience_hidden(
+                &self.model.ctx,
+                &proposal.chain,
+                draft_logits,
+                &verify.logits,
+                0,
+                proposal.chain.len(),
+                accepted,
+            );
+        }
 
         // Return to the real frontier, restore the aliased ring boundary, then
         // fold anchor + accepted drafts exactly once from persisted verify rows.
@@ -1987,7 +2051,7 @@ impl Dsv4CudaExecutor {
             )?;
         }
 
-        let verified = self.model.forward_decode_batch_verify(
+        let (verified, verify_logits) = self.model.forward_decode_batch_verify(
             &mut self.slots,
             &mut self.kv_adapter,
             &slot_ids,
@@ -1999,6 +2063,7 @@ impl Dsv4CudaExecutor {
         // ── Phase 4: per-slot accept + rollback + commit (proven fold path).
         let mut out: Vec<Vec<u32>> = vec![Vec::new(); n];
         let mut verified_iter = verified.into_iter();
+        let mut logits_offset = 0usize; // column offset into verify_logits (non-fallback only)
         for i in 0..n {
             if let Some(toks) = &fallback_tokens[i] {
                 out[i] = toks.clone();
@@ -2024,6 +2089,22 @@ impl Dsv4CudaExecutor {
             // TP lockstep on accepted/bonus (rank 0 wins — KV tail must be identical
             // across ranks, else next tick's combined attention corrupts).
             (accepted, bonus) = Self::tp_lockstep_accept(&self.model, accepted, bonus)?;
+
+            // Train sidecar: capture (draft_tokens, draft_logits, target_logits,
+            // accepted) for the asynchronous acceptance-weighted trainer. Best-effort;
+            // skipped when draft_logits are unavailable (e.g. sampling path overwrite).
+            if let Some(draft_logits) = proposal.draft_logits.as_ref() {
+                super::dspark_train::capture_dspark_experience_hidden(
+                    &self.model.ctx,
+                    &proposal.chain,
+                    draft_logits,
+                    &verify_logits,
+                    logits_offset,
+                    proposal.chain.len(),
+                    accepted,
+                );
+            }
+            logits_offset += proposal.chain.len();
 
             self.model.truncate_slot(
                 &mut self.slots[slot_idx],
