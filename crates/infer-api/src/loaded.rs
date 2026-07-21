@@ -1375,7 +1375,7 @@ mod backend {
         enable_cuda_graph: bool,
         config: EngineLoadConfig,
         shutdown: infer_server::ServeShutdown,
-    ) -> Result<axum::Router> {
+    ) -> Result<(axum::Router, Option<Arc<LoadedInferenceEngine>>)> {
         // Model-driven serve defaults for omitted sampling fields (nucleus +
         // temperature) — the `arle serve` router lane.
         infer_server::set_sampling_defaults(
@@ -1394,18 +1394,21 @@ mod backend {
         #[cfg(feature = "metal")]
         {
             let _ = enable_cuda_graph;
-            return router_metal(model_path, &config, shutdown);
+            let router = router_metal(model_path, &config, shutdown)?;
+            return Ok((router, None));
         }
 
         #[cfg(all(not(feature = "metal"), feature = "cuda"))]
         {
-            return router_cuda(model_path, enable_cuda_graph, &config, shutdown);
+            return router_cuda(model_path, enable_cuda_graph, &config, shutdown)
+                .map(|(r, e)| (r, Some(e)));
         }
 
         #[cfg(all(not(feature = "metal"), not(feature = "cuda"), feature = "hip"))]
         {
             let _ = enable_cuda_graph;
-            return router_hip(model_path, &config, shutdown);
+            let router = router_hip(model_path, &config, shutdown)?;
+            return Ok((router, None));
         }
 
         #[cfg(all(
@@ -1416,7 +1419,8 @@ mod backend {
         ))]
         {
             let _ = enable_cuda_graph;
-            return router_vulkan(model_path, &config, shutdown);
+            let router = router_vulkan(model_path, &config, shutdown)?;
+            return Ok((router, None));
         }
 
         #[cfg(all(
@@ -1428,7 +1432,8 @@ mod backend {
         ))]
         {
             let _ = enable_cuda_graph;
-            return router_cpu(model_path, &config, shutdown);
+            let router = router_cpu(model_path, &config, shutdown)?;
+            return Ok((router, None));
         }
     }
 
@@ -2517,16 +2522,20 @@ mod backend {
         enable_cuda_graph: bool,
         config: &EngineLoadConfig,
         shutdown: infer_server::ServeShutdown,
-    ) -> Result<axum::Router> {
+    ) -> Result<(axum::Router, Arc<LoadedInferenceEngine>)> {
         let (serve, tokenizer, model_id) =
             cuda_serve_handle(model_path, enable_cuda_graph, config, shutdown)?;
-        Ok(infer_server::coordinator_local_router(
-            Arc::new(serve),
+        let serve_engine = ServeInferenceEngine::new(model_id.clone(), tokenizer.clone(), serve);
+        let serve_arc = serve_engine.serve_arc();
+        let engine = Arc::new(LoadedInferenceEngine::Cuda(serve_engine));
+        let router = infer_server::coordinator_local_router(
+            serve_arc,
             tokenizer,
             model_id,
             config.max_thinking_tokens,
             None,
-        ))
+        );
+        Ok((router, engine))
     }
 
     /// Resolve `model_path` to a `.gguf` checkpoint: either the file itself or a

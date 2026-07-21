@@ -339,44 +339,44 @@ where
         // Mode B — Flash correction for rejected prompts (breaks the best-of-N
         // ceiling). Requires a judge; self-consistency (judge=None) does no
         // corrections.
-        if let Some(j) = judge {
-            if cfg.correction_cap > 0 {
-                let mut made = 0usize;
-                for (problem, prompt_ids) in &rejected {
-                    if made >= cfg.correction_cap {
-                        break;
-                    }
-                    match j.correct(rubric, problem, cfg.correction_max_tokens) {
-                        Ok(Some(solution)) => match encode(&solution) {
-                            Ok(tokens) if !tokens.is_empty() => {
-                                accepted_pairs.push((prompt_ids.clone(), tokens));
-                                rep.corrected += 1;
-                                made += 1;
-                            }
-                            Ok(_) => {}
-                            Err(err) => eprintln!("rubric_opd: correction encode failed: {err}"),
-                        },
-                        Ok(None) => {}
-                        Err(err) => eprintln!("rubric_opd: correction failed (skipped): {err}"),
-                    }
+        if let Some(j) = judge
+            && cfg.correction_cap > 0
+        {
+            let mut made = 0usize;
+            for (problem, prompt_ids) in &rejected {
+                if made >= cfg.correction_cap {
+                    break;
                 }
-                eprintln!(
-                    "[rubric] round {round} Mode-B: {made} corrections added (of {} rejected prompts)",
-                    rejected.len()
-                );
+                match j.correct(rubric, problem, cfg.correction_max_tokens) {
+                    Ok(Some(solution)) => match encode(&solution) {
+                        Ok(tokens) if !tokens.is_empty() => {
+                            accepted_pairs.push((prompt_ids.clone(), tokens));
+                            rep.corrected += 1;
+                            made += 1;
+                        }
+                        Ok(_) => {}
+                        Err(err) => eprintln!("rubric_opd: correction encode failed: {err}"),
+                    },
+                    Ok(None) => {}
+                    Err(err) => eprintln!("rubric_opd: correction failed (skipped): {err}"),
+                }
             }
+            eprintln!(
+                "[rubric] round {round} Mode-B: {made} corrections added (of {} rejected prompts)",
+                rejected.len()
+            );
         }
 
         // Cap the CE writeback set (the 27B-dense host-authoritative CE is
         // ~minutes/step; bound it to keep a round tractable). Keep the first N.
-        if let Some(cap) = cfg.writeback_cap {
-            if accepted_pairs.len() > cap {
-                eprintln!(
-                    "[rubric] round {round} writeback-cap: {} accepted -> training first {cap}",
-                    accepted_pairs.len()
-                );
-                accepted_pairs.truncate(cap);
-            }
+        if let Some(cap) = cfg.writeback_cap
+            && accepted_pairs.len() > cap
+        {
+            eprintln!(
+                "[rubric] round {round} writeback-cap: {} accepted -> training first {cap}",
+                accepted_pairs.len()
+            );
+            accepted_pairs.truncate(cap);
         }
 
         // Phase B — offload the inference engines to host RAM, freeing their VRAM

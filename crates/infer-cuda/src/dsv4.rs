@@ -5090,7 +5090,7 @@ impl Dsv4Model {
     ///   advances seq_len because it IS the commit.)
     /// - `slot.spec_normed`: the combined `[M,hidden]` normed is sliced by slot
     ///   and copied into the owning slot's cache for commit fold.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     pub(crate) fn forward_decode_batch_verify(
         &self,
         slots: &mut [Dsv4SlotState],
@@ -5099,7 +5099,7 @@ impl Dsv4Model {
         row_tokens: &[Vec<u32>],
         start_positions: &[usize],
         scheds: &[SpecVerifySchedule],
-    ) -> Result<Vec<(Vec<u32>, Vec<DeviceVec>)>> {
+    ) -> Result<(Vec<(Vec<u32>, Vec<DeviceVec>)>, HiddenStates)> {
         let n = slot_ids.len();
         ensure!(n > 0, "DSv4 batched verify requires at least one chain");
         ensure!(
@@ -5523,7 +5523,7 @@ impl Dsv4Model {
             }
             out.push((argmax, hiddens));
         }
-        Ok(out)
+        Ok((out, logits))
     }
 
     fn capture_mtp_stream_hidden(

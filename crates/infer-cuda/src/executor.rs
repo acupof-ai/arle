@@ -906,17 +906,13 @@ impl RealCudaExecutor {
     }
 
     /// Hot-swap the DSpark Markov head weights from a host f32 snapshot.
-    /// Only the Qwen3.5/3.6 executor carries a DSpark head.
     pub(crate) fn update_dspark_markov_weights(&mut self, w1: &[f32], w2: &[f32]) -> Result<()> {
         match self {
             Self::Qwen35(q) => q.update_dspark_markov_weights(w1, w2),
+            Self::Dsv4(d) => d.update_dspark_markov_weights(w1, w2),
             Self::Qwen(_) => anyhow::bail!(
-                "DSpark Markov weight update is only wired for the Qwen3.5/3.6 executor; \
+                "DSpark Markov weight update is only wired for the Qwen3.5/3.6 and DSv4-Flash executors; \
                  the dense Qwen3 executor has no DSpark head"
-            ),
-            Self::Dsv4(_) => anyhow::bail!(
-                "DSpark Markov weight update is only wired for the Qwen3.5/3.6 executor; \
-                 the DSv4-Flash executor has no DSpark head"
             ),
         }
     }
