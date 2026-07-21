@@ -124,7 +124,7 @@ pub(crate) mod conv_probe {
         input: &CudaSlice<bf16>,
         weight: &DeviceVec,
         state: &DeviceVec,
-    ) -> Result<Option<Pending>> {
+    ) -> Result<Option<Capture>> {
         // 只捕获第一个 linear-attention 层的 conv：同一层的 conv 算术在所有层相同，
         // 一层足以验证正确性，避免下载每一层的 state。
         let needed = linear_idx == 0 && CAPTURES.with(|captures| captures.borrow().is_some());
@@ -265,7 +265,7 @@ pub(crate) mod gdr_probe {
         dt_bias: &DeviceVec,
         a_log: &CudaSlice<f32>,
         state: &CudaSlice<f32>,
-    ) -> Result<Option<Pending>> {
+    ) -> Result<Option<Capture>> {
         let needed = linear_idx == 0 && CAPTURES.with(|captures| captures.borrow().is_some());
         if !needed {
             return Ok(None);
@@ -431,7 +431,7 @@ pub(crate) mod prep_probe {
         cos: &DeviceVec,
         sin: &DeviceVec,
         start_pos: &CudaSlice<i32>,
-    ) -> Result<Option<Pending>> {
+    ) -> Result<Option<Capture>> {
         let needed = full_idx == 0 && CAPTURES.with(|captures| captures.borrow().is_some());
         if !needed {
             return Ok(None);
@@ -516,6 +516,144 @@ pub(crate) mod prep_probe {
                     sin: pending.sin,
                     q_prepped,
                 });
+        });
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod attn_probe {
+    use super::*;
+    use std::cell::RefCell;
+
+    pub(crate) struct Capture {
+        pub(crate) seq_len: usize,
+        pub(crate) num_q_heads: usize,
+        pub(crate) num_kv_heads: usize,
+        pub(crate) head_dim: usize,
+        pub(crate) rotary_dim: usize,
+        pub(crate) q_prepped: Vec<bf16>,
+        pub(crate) k_raw: Vec<bf16>,
+        pub(crate) v_raw: Vec<bf16>,
+        pub(crate) k_norm: Vec<bf16>,
+        pub(crate) cos: Vec<bf16>,
+        pub(crate) sin: Vec<bf16>,
+        pub(crate) rms_eps: f32,
+        pub(crate) start_pos: i32,
+        pub(crate) attn_out: Vec<bf16>,
+    }
+
+    thread_local! {
+        static CAPTURES: RefCell<Option<Vec<Capture>>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn arm() {
+        CAPTURES.with(|captures| {
+            assert!(
+                captures.replace(Some(Vec::new())).is_none(),
+                "attn probe already armed"
+            );
+        });
+    }
+
+    pub(crate) fn drain() -> Vec<Capture> {
+        CAPTURES.with(|captures| captures.borrow_mut().take().expect("attn probe not armed"))
+    }
+
+    pub(crate) fn disarm() {
+        CAPTURES.with(|captures| {
+            captures.borrow_mut().take();
+        });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn begin(
+        ctx: &DeviceContext,
+        full_idx: usize,
+        seq_len: usize,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        rotary_dim: usize,
+        q_prepped: &CudaSlice<bf16>,
+        k_raw: &CudaSlice<bf16>,
+        v_raw: &CudaSlice<bf16>,
+        k_norm: &DeviceVec,
+        cos: &DeviceVec,
+        sin: &DeviceVec,
+        rms_eps: f32,
+        start_pos: &CudaSlice<i32>,
+    ) -> Result<Option<Capture>> {
+        let needed = full_idx == 0 && CAPTURES.with(|captures| captures.borrow().is_some());
+        if !needed {
+            return Ok(None);
+        }
+        let q_prepped = ctx
+            .stream
+            .clone_dtoh(q_prepped)
+            .map_err(|e| anyhow!("attn q_prepped D2H failed: {e}"))?;
+        let k_raw = ctx
+            .stream
+            .clone_dtoh(k_raw)
+            .map_err(|e| anyhow!("attn k_raw D2H failed: {e}"))?;
+        let v_raw = ctx
+            .stream
+            .clone_dtoh(v_raw)
+            .map_err(|e| anyhow!("attn v_raw D2H failed: {e}"))?;
+        let k_norm = ctx
+            .stream
+            .clone_dtoh(&k_norm.data)
+            .map_err(|e| anyhow!("attn k_norm D2H failed: {e}"))?;
+        let cos = ctx
+            .stream
+            .clone_dtoh(&cos.data)
+            .map_err(|e| anyhow!("attn cos D2H failed: {e}"))?;
+        let sin = ctx
+            .stream
+            .clone_dtoh(&sin.data)
+            .map_err(|e| anyhow!("attn sin D2H failed: {e}"))?;
+        let start_pos = ctx
+            .stream
+            .clone_dtoh(start_pos)
+            .map_err(|e| anyhow!("attn start_pos D2H failed: {e}"))?;
+        ctx.sync()?;
+        Ok(Some(Capture {
+            seq_len,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            rotary_dim,
+            q_prepped,
+            k_raw,
+            v_raw,
+            k_norm,
+            cos,
+            sin,
+            rms_eps,
+            start_pos: start_pos[0],
+            attn_out: Vec::new(),
+        }))
+    }
+
+    pub(super) fn finish(
+        ctx: &DeviceContext,
+        mut capture: Option<Capture>,
+        attn_out: &HiddenStates,
+    ) -> Result<()> {
+        let Some(capture) = capture.as_mut() else {
+            return Ok(());
+        };
+        capture.attn_out = ctx
+            .stream
+            .clone_dtoh(&attn_out.data)
+            .map_err(|e| anyhow!("attn attn_out D2H failed: {e}"))?;
+        ctx.sync()?;
+        CAPTURES.with(|captures| {
+            captures
+                .borrow_mut()
+                .as_mut()
+                .expect("attn probe disarmed during capture")
+                .push(capture.clone());
         });
         Ok(())
     }
@@ -3140,10 +3278,17 @@ impl Qwen35Model {
             );
 
             layers.push(Qwen35Layer {
-                input_layernorm: loader.load_vec(&ctx, &names.common.input_layernorm)?,
+                input_layernorm: load_final_norm_offset(
+                    &loader,
+                    &ctx,
+                    &names.common.input_layernorm,
+                )?,
                 attn,
-                post_attention_layernorm: loader
-                    .load_vec(&ctx, &names.common.post_attention_layernorm)?,
+                post_attention_layernorm: load_final_norm_offset(
+                    &loader,
+                    &ctx,
+                    &names.common.post_attention_layernorm,
+                )?,
                 mlp,
                 moe,
             });
@@ -6125,125 +6270,151 @@ impl Qwen35Model {
 
         // ── 2. Paged attention over the recall page table (RoPE pre-baked). ──
         {
+            #[cfg(test)]
+            let attn_capture = if !decode {
+                attn_probe::begin(
+                    &self.ctx,
+                    full_idx,
+                    seq_len,
+                    self.local_q_heads,
+                    self.local_kv_heads,
+                    c.head_dim,
+                    c.rotary_dim,
+                    &q_prepped.data,
+                    &k_batch.data,
+                    &v_batch.data,
+                    &attn.k_norm,
+                    &self.cos_cache,
+                    &self.sin_cache,
+                    c.rms_norm_eps,
+                    &rc.meta.start_positions,
+                )?
+            } else {
+                None
+            };
             let (bsz, total_q, max_q) = if decode {
                 (1, 1, 1)
             } else {
                 (1, seq_len as i32, seq_len as i32)
             };
-            let (qp_ptr, _g0) = q_prepped.data.device_ptr_mut(&self.ctx.stream);
             let (q_indptr_ptr, _g1) = rc.meta.q_indptr.device_ptr(&self.ctx.stream);
             let (kv_indptr_ptr, _g2) = rc.meta.kv_indptr.device_ptr(&self.ctx.stream);
             let (kv_indices_ptr, _g3) = rc.meta.kv_indices.device_ptr(&self.ctx.stream);
             let (last_page_len_ptr, _g4) = rc.meta.kv_last_page_len.device_ptr(&self.ctx.stream);
-            let (ao_ptr, _g5) = attn_out.data.device_ptr_mut(&self.ctx.stream);
             let phase = if decode {
                 ffi::AttnPhase::Decode
             } else {
                 ffi::AttnPhase::Prefill
             };
-            qwen35_profile(
-                &self.ctx,
-                "qwen/full_paged/attention",
-                Some(full_idx),
-                seq_len,
-                || {
-                    match rc.pool.format {
-                        KVFormat::BF16 => {
-                            // SAFETY: kernel signature from paged_attn_v1 ABI (18-arg BF16).
-                            let kernel = ffi::resolve_paged_attn_v1(
-                                c.head_dim as u32,
-                                self.local_q_heads as u32,
-                                self.local_kv_heads as u32,
-                                phase,
-                            )
-                            .ok_or_else(|| {
-                                anyhow!(
-                                    "no HD256 paged {} kernel for q{}_kv{}",
-                                    if decode { "decode" } else { "prefill" },
-                                    self.local_q_heads,
-                                    self.local_kv_heads
+            {
+                let (qp_ptr, _g0) = q_prepped.data.device_ptr_mut(&self.ctx.stream);
+                let (ao_ptr, _g5) = attn_out.data.device_ptr_mut(&self.ctx.stream);
+                qwen35_profile(
+                    &self.ctx,
+                    "qwen/full_paged/attention",
+                    Some(full_idx),
+                    seq_len,
+                    || {
+                        match rc.pool.format {
+                            KVFormat::BF16 => {
+                                // SAFETY: kernel signature from paged_attn_v1 ABI (18-arg BF16).
+                                let kernel = ffi::resolve_paged_attn_v1(
+                                    c.head_dim as u32,
+                                    self.local_q_heads as u32,
+                                    self.local_kv_heads as u32,
+                                    phase,
                                 )
-                            })?;
-                            // SAFETY: ptrs from live device allocations sized to the dims passed.
-                            unsafe {
-                                kernel(
-                                    qp_ptr as *mut ffi::Half,
-                                    q_indptr_ptr as *const i32,
-                                    k_pool_ptr as *mut ffi::Half,
-                                    v_pool_ptr as *mut ffi::Half,
-                                    kv_indptr_ptr as *const i32,
-                                    kv_indices_ptr as *const i32,
-                                    last_page_len_ptr as *const i32,
-                                    ao_ptr as *mut ffi::Half,
-                                    bsz,
-                                    total_q,
-                                    max_q,
-                                    rc.pool.max_total_pages as i32,
-                                    rc.meta.num_pages as i32,
-                                    self.local_q_heads as i32,
-                                    self.local_kv_heads as i32,
-                                    rc.pool.page_size as i32,
-                                    sm_scale,
-                                    self.ctx.stream.cu_stream(),
-                                )
-                                .result()?;
+                                .ok_or_else(|| {
+                                    anyhow!(
+                                        "no HD256 paged {} kernel for q{}_kv{}",
+                                        if decode { "decode" } else { "prefill" },
+                                        self.local_q_heads,
+                                        self.local_kv_heads
+                                    )
+                                })?;
+                                // SAFETY: ptrs from live device allocations sized to the dims passed.
+                                unsafe {
+                                    kernel(
+                                        qp_ptr as *mut ffi::Half,
+                                        q_indptr_ptr as *const i32,
+                                        k_pool_ptr as *mut ffi::Half,
+                                        v_pool_ptr as *mut ffi::Half,
+                                        kv_indptr_ptr as *const i32,
+                                        kv_indices_ptr as *const i32,
+                                        last_page_len_ptr as *const i32,
+                                        ao_ptr as *mut ffi::Half,
+                                        bsz,
+                                        total_q,
+                                        max_q,
+                                        rc.pool.max_total_pages as i32,
+                                        rc.meta.num_pages as i32,
+                                        self.local_q_heads as i32,
+                                        self.local_kv_heads as i32,
+                                        rc.pool.page_size as i32,
+                                        sm_scale,
+                                        self.ctx.stream.cu_stream(),
+                                    )
+                                    .result()?;
+                                }
                             }
-                        }
-                        KVFormat::FP8E4M3 => {
-                            // SAFETY: kernel signature from paged_attn_fp8_v1 ABI (20-arg).
-                            // k/v data buffers are FP8; scales are per-token per-kv-head f32.
-                            let kernel = ffi::resolve_paged_attn_fp8_v1(
-                                c.head_dim as u32,
-                                self.local_q_heads as u32,
-                                self.local_kv_heads as u32,
-                                phase,
-                            )
-                            .ok_or_else(|| {
-                                anyhow!(
-                                    "no HD256 FP8 paged {} kernel for q{}_kv{}",
-                                    if decode { "decode" } else { "prefill" },
-                                    self.local_q_heads,
-                                    self.local_kv_heads
+                            KVFormat::FP8E4M3 => {
+                                // SAFETY: kernel signature from paged_attn_fp8_v1 ABI (20-arg).
+                                // k/v data buffers are FP8; scales are per-token per-kv-head f32.
+                                let kernel = ffi::resolve_paged_attn_fp8_v1(
+                                    c.head_dim as u32,
+                                    self.local_q_heads as u32,
+                                    self.local_kv_heads as u32,
+                                    phase,
                                 )
-                            })?;
-                            let k_data = rc.pool.k_data_ptr(full_idx, &self.ctx.stream);
-                            let v_data = rc.pool.v_data_ptr(full_idx, &self.ctx.stream);
-                            let k_scales = rc.pool.k_scales_ptr(full_idx, &self.ctx.stream);
-                            let v_scales = rc.pool.v_scales_ptr(full_idx, &self.ctx.stream);
-                            // SAFETY: ptrs from live device allocations sized to the dims passed.
-                            unsafe {
-                                kernel(
-                                    qp_ptr as *mut ffi::Half,
-                                    q_indptr_ptr as *const i32,
-                                    k_data as *const u8,
-                                    v_data as *const u8,
-                                    k_scales as *const f32,
-                                    v_scales as *const f32,
-                                    kv_indptr_ptr as *const i32,
-                                    kv_indices_ptr as *const i32,
-                                    last_page_len_ptr as *const i32,
-                                    ao_ptr as *mut ffi::Half,
-                                    bsz,
-                                    total_q,
-                                    max_q,
-                                    rc.pool.max_total_pages as i32,
-                                    rc.meta.num_pages as i32,
-                                    self.local_q_heads as i32,
-                                    self.local_kv_heads as i32,
-                                    rc.pool.page_size as i32,
-                                    sm_scale,
-                                    self.ctx.stream.cu_stream(),
-                                )
-                                .result()?;
+                                .ok_or_else(|| {
+                                    anyhow!(
+                                        "no HD256 FP8 paged {} kernel for q{}_kv{}",
+                                        if decode { "decode" } else { "prefill" },
+                                        self.local_q_heads,
+                                        self.local_kv_heads
+                                    )
+                                })?;
+                                let k_data = rc.pool.k_data_ptr(full_idx, &self.ctx.stream);
+                                let v_data = rc.pool.v_data_ptr(full_idx, &self.ctx.stream);
+                                let k_scales = rc.pool.k_scales_ptr(full_idx, &self.ctx.stream);
+                                let v_scales = rc.pool.v_scales_ptr(full_idx, &self.ctx.stream);
+                                // SAFETY: ptrs from live device allocations sized to the dims passed.
+                                unsafe {
+                                    kernel(
+                                        qp_ptr as *mut ffi::Half,
+                                        q_indptr_ptr as *const i32,
+                                        k_data as *const u8,
+                                        v_data as *const u8,
+                                        k_scales as *const f32,
+                                        v_scales as *const f32,
+                                        kv_indptr_ptr as *const i32,
+                                        kv_indices_ptr as *const i32,
+                                        last_page_len_ptr as *const i32,
+                                        ao_ptr as *mut ffi::Half,
+                                        bsz,
+                                        total_q,
+                                        max_q,
+                                        rc.pool.max_total_pages as i32,
+                                        rc.meta.num_pages as i32,
+                                        self.local_q_heads as i32,
+                                        self.local_kv_heads as i32,
+                                        rc.pool.page_size as i32,
+                                        sm_scale,
+                                        self.ctx.stream.cu_stream(),
+                                    )
+                                    .result()?;
+                                }
                             }
+                            other => anyhow::bail!(
+                                "Qwen35 full-attn paged attention: unsupported pool format {other:?}"
+                            ),
                         }
-                        other => anyhow::bail!(
-                            "Qwen35 full-attn paged attention: unsupported pool format {other:?}"
-                        ),
-                    }
-                    Ok(())
-                },
-            )?;
+                        Ok(())
+                    },
+                )?;
+            }
+            #[cfg(test)]
+            attn_probe::finish(&self.ctx, attn_capture, attn_out)?;
         }
 
         // ── 3. Per-head sigmoid gate from q_full's gate half. ──
@@ -8163,10 +8334,17 @@ fn load_qwen35_mtp_head(
         (Some(mlp), None)
     };
     let layer = Qwen35Layer {
-        input_layernorm: loader.load_vec(ctx, &names.layer.common.input_layernorm)?,
+        input_layernorm: load_final_norm_offset(
+            loader,
+            ctx,
+            &names.layer.common.input_layernorm,
+        )?,
         attn,
-        post_attention_layernorm: loader
-            .load_vec(ctx, &names.layer.common.post_attention_layernorm)?,
+        post_attention_layernorm: load_final_norm_offset(
+            loader,
+            ctx,
+            &names.layer.common.post_attention_layernorm,
+        )?,
         mlp,
         moe,
     };

@@ -497,32 +497,50 @@ __global__ void fused_gqa_attention_decode_batched_kernel(
     const __nv_bfloat16* k_cache_head = k_cache_ptrs[batch_idx] + cache_head_offset;
     const __nv_bfloat16* v_cache_head = v_cache_ptrs[batch_idx] + cache_head_offset;
 
-    // Shared memory for scores within a tile
+    // Shared memory: K/V tiles (cooperatively loaded) + partial QK sums + scores
+    __shared__ __nv_bfloat16 smem_k_tile[BATCHED_BLOCK_N * BATCHED_DECODE_HEAD_DIM];
+    __shared__ __nv_bfloat16 smem_v_tile[BATCHED_BLOCK_N * BATCHED_DECODE_HEAD_DIM];
+    __shared__ float smem_partial[BATCHED_DECODE_NUM_WARPS * BATCHED_BLOCK_N];
     __shared__ float smem_qk[BATCHED_BLOCK_N];
 
     for (int tile_start = split_start; tile_start < split_end; tile_start += BATCHED_BLOCK_N) {
         int tile_len = min(BATCHED_BLOCK_N, split_end - tile_start);
 
-        // Compute QK dot products for all positions in this tile
-        // Each thread holds one dimension of Q; we iterate over K positions
-        for (int pos = 0; pos < tile_len; pos++) {
-            int abs_pos = tile_start + pos;
-            float k_elem = __bfloat162float(k_cache_head[abs_pos * head_dim + tid]);
+        // Cooperatively load K and V tiles into shared memory
+        for (int i = tid; i < tile_len * head_dim; i += BATCHED_DECODE_THREADS) {
+            int pos = i / head_dim;
+            int d = i % head_dim;
+            smem_k_tile[i] = k_cache_head[(tile_start + pos) * head_dim + d];
+            smem_v_tile[i] = v_cache_head[(tile_start + pos) * head_dim + d];
+        }
+        __syncthreads();
+
+        // Each warp computes partial dot products for positions assigned to it
+        // (round-robin: pos % NUM_WARPS == warp_id). Eliminates per-position
+        // cross-warp syncthreads: one sync after all partials are stored.
+        for (int pos = warp_id; pos < tile_len; pos += BATCHED_DECODE_NUM_WARPS) {
+            float k_elem = __bfloat162float(smem_k_tile[pos * head_dim + tid]);
             float dot = q_rot * k_elem;
             dot = warp_reduce_sum(dot);
             if (lane_id == 0) {
-                smem_scratch[warp_id] = dot;
+                smem_partial[warp_id * BATCHED_BLOCK_N + pos] = dot;
             }
-            __syncthreads();
-            if (tid == 0) {
+        }
+        __syncthreads();
+
+        // Each warp sums cross-warp partials for its assigned positions → full QK scores
+        for (int pos = warp_id; pos < tile_len; pos += BATCHED_DECODE_NUM_WARPS) {
+            if (lane_id == 0) {
                 float score = 0.0f;
-                for (int w = 0; w < BATCHED_DECODE_NUM_WARPS; w++) score += smem_scratch[w];
+                for (int w = 0; w < BATCHED_DECODE_NUM_WARPS; w++) {
+                    score += smem_partial[w * BATCHED_BLOCK_N + pos];
+                }
                 smem_qk[pos] = score * qk_scale;
             }
-            __syncthreads();
         }
+        __syncthreads();
 
-        // Find tile max
+        // Find tile max (each thread scans all scores — small, BATCHED_BLOCK_N=64)
         float tile_max = -INFINITY;
         for (int pos = 0; pos < tile_len; pos++) {
             tile_max = fmaxf(tile_max, smem_qk[pos]);
@@ -534,14 +552,15 @@ __global__ void fused_gqa_attention_decode_batched_kernel(
         acc *= alpha;
         l_i *= alpha;
 
-        // Accumulate weighted V
+        // Accumulate weighted V from shared memory
         for (int pos = 0; pos < tile_len; pos++) {
             float w = exp2f(smem_qk[pos] - m_new);
-            float v_elem = __bfloat162float(v_cache_head[(tile_start + pos) * head_dim + tid]);
+            float v_elem = __bfloat162float(smem_v_tile[pos * head_dim + tid]);
             acc += w * v_elem;
             l_i += w;
         }
         m_i = m_new;
+        __syncthreads();
     }
 
     // ---- Split 0: handle current token from registers ----

@@ -26,6 +26,9 @@ use crate::loader::PageMeta;
 use crate::model::CudaModel;
 use crate::ops::argmax;
 
+#[cfg(feature = "cuda")]
+#[path = "executor/dspark_rl.rs"]
+pub mod dspark_rl;
 #[path = "executor/dsv4.rs"]
 mod dsv4;
 #[path = "executor/qwen.rs"]
@@ -893,13 +896,19 @@ impl RealCudaExecutor {
     ) -> Result<()> {
         match self {
             Self::Qwen35(q) => q.remerge_student_lora(update),
-            Self::Qwen(_) => anyhow::bail!(
-                "student LoRA re-merge is only wired for the Qwen3.5/3.6 hybrid OPD student; \
-                 the dense Qwen3 executor is not a student target"
+            _ => anyhow::bail!(
+                "DSpark Markov weight update is only wired for the Qwen3.5/3.6 executor"
             ),
-            Self::Dsv4(_) => anyhow::bail!(
-                "student LoRA re-merge is only wired for the Qwen3.5/3.6 hybrid OPD student; \
-                 the DSv4-Flash executor is not a student target"
+        }
+    }
+
+    /// Hot-swap the DSpark Markov head weights from a host f32 snapshot.
+    /// Only the Qwen3.5/3.6 executor carries a DSpark head.
+    pub(crate) fn update_dspark_markov_weights(&mut self, w1: &[f32], w2: &[f32]) -> Result<()> {
+        match self {
+            Self::Qwen35(q) => q.update_dspark_markov_weights(w1, w2),
+            _ => anyhow::bail!(
+                "DSpark Markov weight update is only wired for the Qwen3.5/3.6 executor"
             ),
         }
     }
@@ -912,13 +921,8 @@ impl RealCudaExecutor {
     ) -> Result<Vec<crate::qwen35::SharedFp8BaseProjection>> {
         match self {
             Self::Qwen35(q) => q.frozen_base_fp8_pointers(),
-            Self::Qwen(_) => anyhow::bail!(
-                "frozen-base FP8 sharing is only wired for the Qwen3.5/3.6 hybrid OPD student; \
-                 the dense Qwen3 executor is not a student target"
-            ),
-            Self::Dsv4(_) => anyhow::bail!(
-                "frozen-base FP8 sharing is only wired for the Qwen3.5/3.6 hybrid OPD student; \
-                 the DSv4-Flash executor is not a student target"
+            _ => anyhow::bail!(
+                "DSpark Markov weight update is only wired for the Qwen3.5/3.6 executor"
             ),
         }
     }
