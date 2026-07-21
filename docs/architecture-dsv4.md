@@ -35,17 +35,17 @@ single-sequence entry. **Prefill and eager-decode share one function**
 and `start_pos_device` (filled only when `seq_len==1`).
 
 ```
-forward_tokens_impl  (dsv4.rs:1917)
-├─ decode-graph branch (dsv4.rs:1986)   seq_len==1 && !deepep && ARLE_DSV4_DECODE_GRAPH
-│                                        && last_hidden_out.is_none() && probe lens off; MODEL1 only (GLM bails)
-│     → forward_tokens_decode_graph (dsv4.rs:5736)
+forward_tokens_impl (dsv4.rs:1917)
+├─ decode-graph branch (dsv4.rs:1986) seq_len==1 && !deepep && ARLE_DSV4_DECODE_GRAPH
+│ && last_hidden_out.is_none() && probe lens off; MODEL1 only (GLM bails)
+│ → forward_tokens_decode_graph (dsv4.rs:5736)
 └─ eager branch (dsv4.rs:1947)
-      → forward_tokens_stream_impl (dsv4.rs:4661)   ← prefill (seq_len>1) AND eager decode (seq_len==1)
+ → forward_tokens_stream_impl (dsv4.rs:4661) ← prefill (seq_len>1) AND eager decode (seq_len==1)
 
-forward_decode_batch  (dsv4.rs:2125) → forward_decode_batch_stream_impl (dsv4.rs:2175)
-      → batched decode lane, MODEL1-only, concurrency lever #60 → decode_lane_fwd (dsv4.rs:3275)
+forward_decode_batch (dsv4.rs:2125) → forward_decode_batch_stream_impl (dsv4.rs:2175)
+ → batched decode lane, MODEL1-only, concurrency lever #60 → decode_lane_fwd (dsv4.rs:3275)
 
-forward_tokens_verify_scheduled (dsv4.rs:2054)        ← MTP spec-decode chain verify (frozen)
+forward_tokens_verify_scheduled (dsv4.rs:2054) ← MTP spec-decode chain verify (frozen)
 forward_tokens_verify_stream_persistent (dsv4.rs:4351)
 forward_decode_batch_verify (dsv4.rs:3858)
 ```
@@ -71,42 +71,42 @@ identity for GLM).
 RoPE / indexer) + `mla_attention_fwd` (the attention kernel).
 
 - **Projections (GEMM)** in `mla_attention_prepare` (`attention.rs:8935`): `wq_a`
-  → `q_norm` (RMSNorm) → `wq_b`; `wkv` → `kv_norm`. All via `dsv4_linear`
-  (`attention.rs:5740`: FP8 block-scaled GEMV / DeepGEMM / bf16 cuBLAS). Prefill
-  fusion: `run_fused_wqkv_prefill` (`attention.rs:5531`), `prefill_proj_deepgemm`
-  (`attention.rs:5376`).
+ → `q_norm` (RMSNorm) → `wq_b`; `wkv` → `kv_norm`. All via `dsv4_linear`
+ (`attention.rs:5740`: FP8 block-scaled GEMV / DeepGEMM / bf16 cuBLAS). Prefill
+ fusion: `run_fused_wqkv_prefill` (`attention.rs:5531`), `prefill_proj_deepgemm`
+ (`attention.rs:5376`).
 - **RoPE (partial dims + Hadamard)**: `dsv4_prepare_qk_cuda` (`attention.rs:9220`;
-  kernel `dsv4_prepare_qk_fused_kernel`, `csrc/misc/dsv4_attention.cu:274`,
-  hand-rolled).
+ kernel `dsv4_prepare_qk_fused_kernel`, `csrc/misc/dsv4_attention.cu:274`,
+ hand-rolled).
 - **DSA indexer** (sparse key selection, mode-gated): see §4.
 - **Write KV (bf16 pack)**: `arle_flashmla_csa_pack_kv` (`attention.rs:6358`;
-  hand-rolled `csrc/misc/arle_flashmla_csa_prep.cu`) packs one contiguous bf16
-  pool `[SW ring | current-chunk K | compressed pool]`.
+ hand-rolled `csrc/misc/arle_flashmla_csa_prep.cu`) packs one contiguous bf16
+ pool `[SW ring | current-chunk K | compressed pool]`.
 - **Build sparse indices** (per mode): `arle_flashmla_{chain_verify,csa,hca}_build_indices`
-  (`attention.rs:6406/6438/6478`, hand-rolled same file).
+ (`attention.rs:6406/6438/6478`, hand-rolled same file).
 - **Prefill attention kernel** = `arle_flashmla_sm90_sparse_prefill_fwd`
-  (`attention.rs:6620`; shim `csrc/misc/arle_flashmla_shim.cu:38`) →
-  **vendored FlashMLA `sm90::run_fwd_kernel`** (`vendor/flashmla/csrc/sm90/prefill/sparse/fwd.cu`,
-  sparse varlen prefill, B_H=64 / B_TOPK=64).
+ (`attention.rs:6620`; shim `csrc/misc/arle_flashmla_shim.cu:38`) →
+ **vendored FlashMLA `sm90::run_fwd_kernel`** (`vendor/flashmla/csrc/sm90/prefill/sparse/fwd.cu`,
+ sparse varlen prefill, B_H=64 / B_TOPK=64).
 - **Tail**: TP repack/out-slice (`dsv4_tp_q_repack_cuda` / `dsv4_tp_out_slice_cuda`),
-  output inverse-RoPE (`arle_dsv4_output_inverse_rope_batch_*`), SW ring update
-  (`dsv4_update_window_cache_cuda`, `csrc/misc/dsv4_attention.cu:863`).
+ output inverse-RoPE (`arle_dsv4_output_inverse_rope_batch_*`), SW ring update
+ (`dsv4_update_window_cache_cuda`, `csrc/misc/dsv4_attention.cu:863`).
 - **O-LoRA all-reduce**: `tp.all_reduce_sum` (`dsv4.rs:4909`, NCCL, single-GPU no-op).
 
 ### 1.3 MoE half
 - **GLM dense layer** (only `per_layer_dense_mlp[i]`): `dsv4_dense_mlp_forward`
-  (`dsv4.rs:6228`) — bf16 SwiGLU FFN, `dsv4_linear` gate/up → `ops::silu_mul`
-  (`csrc/misc/elementwise_basic.cu:86`) → `dsv4_linear` down. (DSv4 is MoE on
-  every layer; this is GLM-only.)
+ (`dsv4.rs:6228`) — bf16 SwiGLU FFN, `dsv4_linear` gate/up → `ops::silu_mul`
+ (`csrc/misc/elementwise_basic.cu:86`) → `dsv4_linear` down. (DSv4 is MoE on
+ every layer; this is GLM-only.)
 - **Routed MoE**: router GEMM (`gemm_batch(&layer.gate)`) → `dsv4_route`
-  (`moe.rs:2602`; kernel `dsv4_route_kernel`, `csrc/moe/dsv4_route.cu:329`,
-  hand-rolled). DSv4 uses **sqrtsoftplus scoring (kind=2) + NoAuxTc / LearnedBias**
-  (`e_score_correction_bias` steers selection; emitted weight uses the unbiased
-  score). `n_group/topk_group` group-limited routing exists only on the host
-  fallback (`infer-moe/src/route.rs:209`); DSv4-Flash sets neither, so the device
-  kernel always runs. Transport selection + grouped GEMM detail in §3.
+ (`moe.rs:2602`; kernel `dsv4_route_kernel`, `csrc/moe/dsv4_route.cu:329`,
+ hand-rolled). DSv4 uses **sqrtsoftplus scoring (kind=2) + NoAuxTc / LearnedBias**
+ (`e_score_correction_bias` steers selection; emitted weight uses the unbiased
+ score). `n_group/topk_group` group-limited routing exists only on the host
+ fallback (`infer-moe/src/route.rs:209`); DSv4-Flash sets neither, so the device
+ kernel always runs. Transport selection + grouped GEMM detail in §3.
 - **Shared experts (always-on)**: `dsv4_shared_expert_forward` (`moe.rs:3696`),
-  added at `dsv4.rs:3756`.
+ added at `dsv4.rs:3756`.
 
 ---
 
@@ -130,18 +130,18 @@ MODEL1 (`w_kc/w_vc/o_proj` all `None`) → `mla_attention_decode_graph`
 (`attention.rs:6746`):
 
 1. **Write KV (FP8 pack)**: `flashmla_pack_sw_ring` / `flashmla_pack_one_sw_token`
-   / `flashmla_pack_compressed_delta` (`attention.rs:6819/6824/6836`, hand-rolled
-   `csrc/attention/dsv4_fp8_kv_pack.cu`).
+ / `flashmla_pack_compressed_delta` (`attention.rs:6819/6824/6836`, hand-rolled
+ `csrc/attention/dsv4_fp8_kv_pack.cu`).
 2. **Read-side page table**: `pool.flashmla_device_page_table(slot)`
-   (`attention.rs:6870`). **Fixed**: eager decode now routes the device page
-   table (the historic `None` at ~`attention.rs:6496` is stale — 6496 is now in
-   the prefill function body).
+ (`attention.rs:6870`). **Fixed**: eager decode now routes the device page
+ table (the historic `None` at ~`attention.rs:6496` is stale — 6496 is now in
+ the prefill function body).
 3. **Build decode indices**: `dsv4_flashmla_decode_build_indices_start_pos_ptr`
-   (`attention.rs:6875`; kernel `csrc/attention/dsv4_flashmla_decode_build_indices.cu:186`).
+ (`attention.rs:6875`; kernel `csrc/attention/dsv4_flashmla_decode_build_indices.cu:186`).
 4. **Decode attention kernel** = `arle_flashmla_sm90_sparse_decode_fwd`
-   (`attention.rs:7016`; shim `csrc/misc/arle_flashmla_decode_shim.cu:209`) →
-   **vendored FlashMLA `sm90::decode::sparse_fp8::run_flash_splitkv_mla_fp8_sparse_kernel`
-   + `run_flash_mla_combine_kernel`** (SM90 sparse-FP8 split-KV decode).
+ (`attention.rs:7016`; shim `csrc/misc/arle_flashmla_decode_shim.cu:209`) →
+ **vendored FlashMLA `sm90::decode::sparse_fp8::run_flash_splitkv_mla_fp8_sparse_kernel`
+ + `run_flash_mla_combine_kernel`** (SM90 sparse-FP8 split-KV decode).
 
 Eager fallback (FlashMLA decode off): hand-rolled fused MLA cores
 `dsv4_swa_attention_start_pos_ptr_cuda` (SW, `csrc/misc/dsv4_attention.cu:751`) /
@@ -151,11 +151,11 @@ MoE half at decode — **default transport is `allreduce`** (`ARLE_DSV4_MOE_TRAN
 unset ⇒ local routed experts + per-layer TP all-reduce, `dsv4.rs:5308`); DeepEP-LL
 is opt-in:
 - LL transport (opt-in) = DeepEP `internode_ll` dispatch/combine (NVSHMEM
-  IBGDA, **FP8 e4m3 packed in-flight**).
+ IBGDA, **FP8 e4m3 packed in-flight**).
 - Small-batch bypass: `total_routes ≤ 8` → `dsv4_moe_forward_decode_fp8`
-  (`moe.rs:2918`), a hand-rolled warp-per-row w8a16 grouped GEMV (not DeepGEMM).
+ (`moe.rs:2918`), a hand-rolled warp-per-row w8a16 grouped GEMV (not DeepGEMM).
 - **Comm-overlap**: shared expert runs on `comm_stream` concurrent with the
-  routed all-reduce (`dsv4.rs:4989/5140`, pipeline fence).
+ routed all-reduce (`dsv4.rs:4989/5140`, pipeline fence).
 
 ### 2.2 CUDA-graph decode (`forward_tokens_decode_graph`, `dsv4.rs:5736`)
 Gate: `seq_len==1 && !deepep && ARLE_DSV4_DECODE_GRAPH && last_hidden_out.is_none()
@@ -163,8 +163,7 @@ Gate: `seq_len==1 && !deepep && ARLE_DSV4_DECODE_GRAPH && last_hidden_out.is_non
 derived on-device from `start_pos_device`). Same `try_flashmla_decode_attention`
 core; MoE via `deepgemm_grouped_experts_pooled` (masked, persistent scratch) +
 `dsv4_shared_expert_forward_decode_graph`.
-**B=1 decode-graph is a wash (~−1.5%) on H20 — off by default**
-(`errors/2026-06-10-dsv4-wholestep-graph-production-path-wash-rekill.md`):
+**B=1 decode-graph is a wash (~−1.5%) on H20 — off by default**:
 execution is GPU-bound, not host-pacer bound.
 
 ### 2.3 Batched decode lane (`forward_decode_batch_stream_impl`, MODEL1-only, lever #60)
@@ -198,22 +197,22 @@ DSv4 now connects to the same host page identity flow as other CUDA models, but
 with DSv4's fixed-band semantics:
 
 - `infer-seam::HostPagedKvPool::set_fixed_pages_per_slot(pages)` makes host
-  allocation draw the whole logical FlashMLA band once per slot. `truncate_slot`
-  only moves the logical cursor in this mode; it never frees tail band pages.
+ allocation draw the whole logical FlashMLA band once per slot. `truncate_slot`
+ only moves the logical cursor in this mode; it never frees tail band pages.
 - `KvBatchDescriptor` carries both `flat_page_ids` (live token prefix) and
-  `flat_slot_page_ids` (complete slot page table). Sequential models keep using
-  `page_range`; DSv4 lowers `slot_page_range`.
+ `flat_slot_page_ids` (complete slot page table). Sequential models keep using
+ `page_range`; DSv4 lowers `slot_page_range`.
 - `Dsv4KvAdapter::prepare_kv_batch` mirrors `flat_slot_page_ids` into every
-  layer's `TokenKVPool` via `mirror_band`, then advances the FlashMLA cursor.
-  FlashMLA prefill/decode pack and read paths therefore resolve through the
-  engine/radix/tier page identity rather than `slot * fixed_band` arithmetic.
+ layer's `TokenKVPool` via `mirror_band`, then advances the FlashMLA cursor.
+ FlashMLA prefill/decode pack and read paths therefore resolve through the
+ engine/radix/tier page identity rather than `slot * fixed_band` arithmetic.
 - Whole-slot restore and position-0 prefix restore receive the host slot page
-  table from `infer-core` and mirror it before copying `Dsv4SlotSnapshot` payloads
-  back to device memory.
+ table from `infer-core` and mirror it before copying `Dsv4SlotSnapshot` payloads
+ back to device memory.
 - TP support is rank-local bytes + TP scalar consensus: each rank stores its own
-  shard image under the same engine key; hit length, demote room, image-fit, insert,
-  read/parse/restore success are all reduced with `TpRuntime::all_reduce_min_scalar_i32`.
-  Any rank miss/failure makes every rank take the same recompute/error branch.
+ shard image under the same engine key; hit length, demote room, image-fit, insert,
+ read/parse/restore success are all reduced with `TpRuntime::all_reduce_min_scalar_i32`.
+ Any rank miss/failure makes every rank take the same recompute/error branch.
 
 The page-granular radix tier remains dense-Qwen-only until the DSA sidecar is
 itself page-addressable at arbitrary radix boundaries. DSv4's safe reuse route is
@@ -232,38 +231,38 @@ SM-partition (z-grid CTA), then combine partial softmaxes (flash-decoding).
 
 ### 3.2 How many splits (data-dependent)
 - `num_sm_parts` upper bound = `max(num_sms / s_q / (h_q/64), 1)` (vendored
-  `api/sparse_decode.h:59-66`; ATen-free shim replica `arle_flashmla_decode_shim.cu:120-132`).
-  H20 h_q=128 ≈ `num_sms/2`, h_q=64 ≈ `num_sms`.
+ `api/sparse_decode.h:59-66`; ATen-free shim replica `arle_flashmla_decode_shim.cu:120-132`).
+ H20 h_q=128 ≈ `num_sms/2`, h_q=64 ≈ `num_sms`.
 - Actual split by `get_mla_metadata_kernel` (`get_decoding_sched_meta.cu:30-126`,
-  single warp `<<<1,32>>>`): per-request blocks = `ceil(topk/64) + 5`
-  (`+5` = `fixed_overhead_num_blocks`, prevents over-splitting tiny requests),
-  greedily partitioned across `num_sm_parts`, `payload = ceil(total/parts)+5`.
-  **Long context (large topk) → more blocks → more splits → SMs saturated.**
-  `num_splits_ptr` is the per-request split prefix-sum; `num_splits[b]==1` → combine
-  early-exits.
+ single warp `<<<1,32>>>`): per-request blocks = `ceil(topk/64) + 5`
+ (`+5` = `fixed_overhead_num_blocks`, prevents over-splitting tiny requests),
+ greedily partitioned across `num_sm_parts`, `payload = ceil(total/parts)+5`.
+ **Long context (large topk) → more blocks → more splits → SMs saturated.**
+ `num_splits_ptr` is the per-request split prefix-sum; `num_splits[b]==1` → combine
+ early-exits.
 
 ### 3.3 The kernel (`splitkv_mla.cuh:86-678`, vendored)
 - **Grid** = `(NUM_M_BLOCKS, s_q, num_sm_parts)`, **block=384 = 3 warpgroups**.
-  h_q=128 → `NUM_M_BLOCKS=2` form a Hopper cluster sharing dequantized K via DSMEM.
+ h_q=128 → `NUM_M_BLOCKS=2` form a Hopper cluster sharing dequantized K via DSMEM.
 - **Warp specialization**: WG2 = producer (walks topk blocks, gathers selected
-  FP8 tokens, dequantizes bf16 into double-buffered smem); WG0/WG1 = consumers
-  (QK WGMMA → online softmax → P@V, V's 512-wide latent split across the two WGs).
+ FP8 tokens, dequantizes bf16 into double-buffered smem); WG0/WG1 = consumers
+ (QK WGMMA → online softmax → P@V, V's 512-wide latent split across the two WGs).
 - **Math**: QK `MMA_64x64x16_F32BF16BF16`; softmax `exp2f` (scale folded into
-  `sm_scale_div_log2 = sm_scale*1.4427`); PV `MMA_64x256x16`; `sV` aliases `sK`
-  smem (MLA K==V latent).
+ `sm_scale_div_log2 = sm_scale*1.4427`); PV `MMA_64x256x16`; `sV` aliases `sK`
+ smem (MLA K==V latent).
 - **Sparse**: producer reads `gIndices` (DSA-selected pool-absolute slot ids);
-  `token_index==-1` = mask sentinel; MODEL1 also enforces per-request
-  `topk_length`.
+ `token_index==-1` = mask sentinel; MODEL1 also enforces per-request
+ `topk_length`.
 
 ### 3.4 FP8 pool layout (dequant in-kernel, no separate scale arg)
 - **MODEL1 (584 B/tok)**: 64-token AoS body `[448 fp8 NoPE + 128B bf16 RoPE]=576B`
-  + trailing 8B e8m0 scale region/token; in-kernel `__nv_cvt_e8m0x2_to_bf162raw`
-  decodes 8 power-of-two scales (one per 64 dims).
+ + trailing 8B e8m0 scale region/token; in-kernel `__nv_cvt_e8m0x2_to_bf162raw`
+ decodes 8 power-of-two scales (one per 64 dims).
 - **V32/GLM (656 B/tok)**: inline `[512 fp8 NoPE][4×f32 scale][128B bf16 RoPE]`;
-  4 f32 scales (one per 128 dims). **V32 forbids dynamic `topk_length`/two-tier**
-  (in-kernel assert).
+ 4 f32 scales (one per 128 dims). **V32 forbids dynamic `topk_length`/two-tier**
+ (in-kernel assert).
 - Write-side pack (`dsv4_fp8_kv_pack.cu`): MODEL1 uses e8m0 `ceil(log2(amax/448))`;
-  V32 switched to inline f32 `amax/448` (e8m0 pow2 rounding costs up to ±40%/block).
+ V32 switched to inline f32 `amax/448` (e8m0 pow2 rounding costs up to ±40%/block).
 
 ### 3.5 Combine (`combine.cu:18-162`, vendored)
 Grid `(b*s_q, 1, ceil(h_q/8))`, one warp per head. `my_num_splits==1` returns
@@ -296,55 +295,55 @@ config-driven (GLM-DSA 32/128/2048, a DSv4 fixture 64/128/512).
 
 ### 4.2 Index-key cache WRITE (per new token)
 - **Hadamard rotation** (`hadamard128_bf16_kernel`, `dsv4_dsa_official.cu:196`,
-  vendored port): orthonormal transform spreads energy across 128 dims, preserving
-  `q·k`, so FP8 quant doesn't get crushed by one large coordinate. Impl: 2 intra-
-  thread radix-2 butterflies + 5-step `shfl_xor` warp Walsh–Hadamard + `rsqrt(128)`.
+ vendored port): orthonormal transform spreads energy across 128 dims, preserving
+ `q·k`, so FP8 quant doesn't get crushed by one large coordinate. Impl: 2 intra-
+ thread radix-2 butterflies + 5-step `shfl_xor` warp Walsh–Hadamard + `rsqrt(128)`.
 - **FP8 store** (`fused_store_indexer_cache_kernel`, `.cu:334`): page=8448B/64slot,
-  per-slot `[128B fp8 key][4B f32 scale]=132B`; `page=index>>6, offset=index&63`.
+ per-slot `[128B fp8 key][4B f32 scale]=132B`; `page=index>>6, offset=index&63`.
 - **Fixed-band sidecar — NOT in the FlashMLA page pool**:
-  `Dsv4LayerKvLayout.dsa_key_cache` (`attention.rs:262`, FP8, full history, what
-  the scoring kernel reads), summed as `state_caches_per_slot` in
-  `kv_budget_num_slots` (`dsv4.rs:1645`). The FP8 cache still grows linearly with
-  `max_seq` and is restored as part of `Dsv4SlotSnapshot`; it is not yet a
-  page-granular radix-tier object. The bf16 `rotated_keys` is **no longer** a
-  full-history mirror: as
-  of 2026-06-29 it is a transient drain-immediate staging ring
-  (`dsv4_dsa_rotated_ring_rows`, capped at `DSV4_INDEXER_STAGING_RING_ROWS`),
-  removing its O(max_seq) per-slot term (−254 MiB/slot/layer at 1M) — see
-  [`wins/2026-06-29-dsv4-dsa-rotated-key-transient-ring.md`](experience/wins/2026-06-29-dsv4-dsa-rotated-key-transient-ring.md)
-  (pending-remote needle-gate).
+ `Dsv4LayerKvLayout.dsa_key_cache` (`attention.rs:262`, FP8, full history, what
+ the scoring kernel reads), summed as `state_caches_per_slot` in
+ `kv_budget_num_slots` (`dsv4.rs:1645`). The FP8 cache still grows linearly with
+ `max_seq` and is restored as part of `Dsv4SlotSnapshot`; it is not yet a
+ page-granular radix-tier object. The bf16 `rotated_keys` is **no longer** a
+ full-history mirror: as
+ of 2026-06-29 it is a transient drain-immediate staging ring
+ (`dsv4_dsa_rotated_ring_rows`, capped at `DSV4_INDEXER_STAGING_RING_ROWS`),
+ removing its O(max_seq) per-slot term (−254 MiB/slot/layer at 1M) — see
+ [`wins/2026-06-29-dsv4-dsa-rotated-key-transient-ring.md`](experience/wins/2026-06-29-dsv4-dsa-rotated-key-transient-ring.md)
+ (pending-remote needle-gate).
 
 ### 4.3 Index query + score + top-k READ
 - **Build indexer Q** (`fused_q_indexer_rope_hadamard_quant`, `.cu:101`, vendored
-  port): one kernel fuses RoPE (rope lanes only) + Hadamard + FP8 quant; per-row
-  scale folded into `weights_out`.
+ port): one kernel fuses RoPE (rope lanes only) + Hadamard + FP8 quant; per-row
+ scale folded into `weights_out`.
 - **Paged FP8 MQA logits** (`dsv4_deepgemm_fp8_paged_mqa_logits_fused_cache_cuda`,
-  `deepgemm_native.cu:1990`, **vendored DeepGEMM template, JIT**): computes
-  `Σ_h weights[r,h]·(q_fp8[r,h]·k_fp8[j])` per (query, past-token) — **paged** via
-  `block_table` (block_kv=64). Metadata kernel (`smxx_paged_mqa_logits_metadata`,
-  split_kv=256) balances variable-length KV work across SMs.
+ `deepgemm_native.cu:1990`, **vendored DeepGEMM template, JIT**): computes
+ `Σ_h weights[r,h]·(q_fp8[r,h]·k_fp8[j])` per (query, past-token) — **paged** via
+ `block_table` (block_kv=64). Metadata kernel (`smxx_paged_mqa_logits_metadata`,
+ split_kv=256) balances variable-length KV work across SMs.
 - **Top-k** (`deepseek_v4_topk_transform_kernel`, `.cu:634`, vendored port):
-  `seq_len≤topk` → naive all-select; else `radix_topk` (MSB-first radix selection,
-  histogram+cumsum, 4 refine rounds, no full sort). Selected positions →
-  `page_to_slot` → `selected` (slot-relative page indices).
+ `seq_len≤topk` → naive all-select; else `radix_topk` (MSB-first radix selection,
+ histogram+cumsum, 4 refine rounds, no full sort). Selected positions →
+ `page_to_slot` → `selected` (slot-relative page indices).
 
 ### 4.4 How `selected` connects to FlashMLA
 `selected` does **not** go straight into the kernel; it passes through
 build-indices, which merges sparse selection with the sliding-window blocks and
 translates to pool-absolute:
 - Decode: `dsv4_flashmla_decode_build_indices_start_pos_ptr` (`attention.rs:6875`)
-  consumes `selected_ptr_u64` + SW + page table → `scratch.indices`.
+ consumes `selected_ptr_u64` + SW + page table → `scratch.indices`.
 - Prefill: `arle_flashmla_csa_build_indices` (CSA) / `hca` / `chain_verify`.
 - Batched: `selected_batched` → `build_indices_batched` → `self.indices[n, topk_unified]`.
 - `topk_unified = sliding_window + chain_pad + max_compressed_keys`,
-  `max_compressed_keys = index_topk` → FlashMLA attends `[SW blocks ∪ index_topk
-  selected keys]`.
+ `max_compressed_keys = index_topk` → FlashMLA attends `[SW blocks ∪ index_topk
+ selected keys]`.
 
 ### 4.5 Compressor vs indexer (mode-dependent)
 Two separate mechanisms, both per-token:
 - **Compressor** (`compressor_forward`, `attention.rs:11640`; `dsv4_compressor_*`
-  kernels in `dsv4_attention.cu`) **builds** the compressed latent KV (folds every
-  `compress_ratio` tokens into one row) that FlashMLA attends over.
+ kernels in `dsv4_attention.cu`) **builds** the compressed latent KV (folds every
+ `compress_ratio` tokens into one row) that FlashMLA attends over.
 - **Indexer (DSA)** **selects** which keys to attend.
 
 | Mode | Compressor | Indexer | Notes |
@@ -360,14 +359,14 @@ Two separate mechanisms, both per-token:
 
 ### 5.1 The two layouts
 - **Contiguous**: flat `[m,K]` FP8 activations, `m_indices[row]` names each row's
-  expert (`-1`=pad). Kernel resolves the B group **once per `BLOCK_M` tile** from
-  the tile-start row → each expert segment must be `BLOCK_M`-aligned
-  (`DEEPGEMM_CONTIG_ALIGN=128`, decode band 64); pad rows skipped via
-  `is_computation_valid >= 0` (`scheduler/gemm.cuh:285`).
+ expert (`-1`=pad). Kernel resolves the B group **once per `BLOCK_M` tile** from
+ the tile-start row → each expert segment must be `BLOCK_M`-aligned
+ (`DEEPGEMM_CONTIG_ALIGN=128`, decode band 64); pad rows skipped via
+ `is_computation_valid >= 0` (`scheduler/gemm.cuh:285`).
 - **Masked**: `[E, m_padded, K]` band, `masked_m[e]` = real rows/expert. Two skips:
-  scheduler enumerates only `ceil(masked_m[e]/BLOCK_M)` M-blocks (empty tail blocks
-  never scheduled), and the partial-block row skip `row < masked_m[e]`
-  (`gemm.cuh:287`).
+ scheduler enumerates only `ceil(masked_m[e]/BLOCK_M)` M-blocks (empty tail blocks
+ never scheduled), and the partial-block row skip `row < masked_m[e]`
+ (`gemm.cuh:287`).
 
 **Why two**: contiguous → prefill / large route counts (masked's unpad work
 `32*T*topk*H` overflows i32 at ~1.5K prompt tokens; contiguous packs only
@@ -397,12 +396,12 @@ reorder.
 
 ### 5.4 The FP8 quant dance (`dsv4_deepgemm_ops.cu`, hand-rolled)
 - `pack_quantize_bf16_to_fp8` (`:63`): per-128-block `scale=block_max/448`, f32
-  column-major (matches SFA TMA), e4m3 cast.
+ column-major (matches SFA TMA), e4m3 cast.
 - `swiglu_quantize_w13` (`:120`): fused **clamped SwiGLU** (`dg_swiglu`:55 —
-  `gate=min(gate,limit); up=clamp(up,±limit); silu(gate)*up`) on the w13 output +
-  per-128 requant for the w2 GEMM.
+ `gate=min(gate,limit); up=clamp(up,±limit); silu(gate)*up`) on the w13 output +
+ per-128 requant for the w2 GEMM.
 - `silu_mul_masked_quant` (`:191`, LL 3-D path): touches only `expected_m` rows;
-  out-of-bound `__trap()`s loudly rather than silently dropping rows.
+ out-of-bound `__trap()`s loudly rather than silently dropping rows.
 
 ### 5.5 Scale format
 **DSv4 MoE uses plain f32 block scales on SM90, NOT UE8M0** (UE8M0 is the SM100
@@ -504,21 +503,21 @@ CUDA-only. Adaptive skip via `ARLE_DSV4_MTP_ADAPTIVE` (B=1 only).
 ### 7.1 The problem DSpark targets
 Existing draft families trade off two ways:
 - **Autoregressive drafts (EAGLE-3)**: strong token-dependency modeling, high
-  accept rate, but draft cost grows linearly with block length → forced to short
-  blocks / shallow nets. (This is *our* current MTP family — a sequential nextn
-  head, chain-verified.)
+ accept rate, but draft cost grows linearly with block length → forced to short
+ blocks / shallow nets. (This is *our* current MTP family — a sequential nextn
+ head, chain-verified.)
 - **Parallel drafts (DFlash)**: all draft positions in one forward, cost
-  ~independent of block length, but (a) **suffix decay** — independent per-position
-  prediction can't model intra-block dependency, so accept rate collapses in the
-  block's tail; (b) the optimal verify length is hard to fix, and verifying all
-  tokens indiscriminately hurts system throughput under high concurrency.
+ ~independent of block length, but (a) **suffix decay** — independent per-position
+ prediction can't model intra-block dependency, so accept rate collapses in the
+ block's tail; (b) the optimal verify length is hard to fix, and verifying all
+ tokens indiscriminately hurts system throughput under high concurrency.
 
 ### 7.2 Mechanism 1 — semi-autoregressive draft
 Hybrid: a **parallel backbone** emits hidden states + base logits for all
 candidate positions in one pass, then a **lightweight sequential head** injects
 prefix dependency token-by-token (cheaply). Two head variants:
 - **Markov head**: low-rank projection depending only on the previous token
-  (`markov_rank` ~256).
+ (`markov_rank` ~256).
 - **RNN head**: a GRU-style cell accumulating the full prefix.
 
 Draft config sketch (from the reference impl): `draft_hidden_size~1024`,
@@ -536,7 +535,7 @@ target-model verification on low-probability tail tokens under high concurrency.
 ### 7.4 Claimed results
 - Accept-length **+16%–31% over EAGLE-3 and DFlash** on Qwen3 / Gemma4.
 - Single-user gen speed **+60%–85% (V4-Flash)**, **+57%–78% (V4-Pro)**;
-  high-concurrency throughput **up to +400%**.
+ high-concurrency throughput **up to +400%**.
 - Cross-model: Qwen3 (4B/8B/14B), Gemma4-12B, on top of V4-Flash/V4-Pro.
 
 ### 7.5 Mapping onto our runtime (gap analysis, license-or-kill before any code)

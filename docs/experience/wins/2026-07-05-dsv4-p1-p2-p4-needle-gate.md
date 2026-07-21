@@ -6,7 +6,7 @@ under test: `7b89fe32` (includes P1 `611d18cd`, P2+P4 `2dd9d07c`). Harness
 `scripts/needle_gate.py`, `RAW=1`, greedy, needle `738291`, 3 same-config
 repeats. `INFER_DSV4_MAX_SEQ_LEN=16384` (TP=4 halves rank count vs the
 TP=8 baseline this repo has previously validated at 32K — see
-[2026-06-10-dsv4-longctx-closeout-needle-matrix.md](2026-06-10-dsv4-longctx-closeout-needle-matrix.md)
+2026-06-10-dsv4-longctx-closeout-needle-matrix.md
 — so per-rank weight shard roughly doubles, leaving less headroom for KV).
 
 ## Goal

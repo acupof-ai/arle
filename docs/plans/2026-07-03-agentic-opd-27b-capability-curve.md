@@ -23,7 +23,7 @@ ONE H20 GPU, in one overnight run. Headline artifact = a baseline→round-N
 held-out pass-rate curve for the README OPD section, produced by one script.
 
 Supersedes the eval-surface portion of
-[2026-06-16-agentic-ropd-35b.md](2026-06-16-agentic-ropd-35b.md) (the E1–E3
+2026-06-16-agentic-ropd-35b.md (the E1–E3
 "net-new eval surface" is now built: `--eval-dataset` held-out pass in
 `crates/cli/src/train_cli.rs` `run_agent_opd_eval_pass`).
 

@@ -49,7 +49,7 @@
 | --- | --- | --- | --- |
 | Multi-GPU TP/EP | DSv4 路径已接线（TP=8/EP=8）；通用 Qwen TP/PP 仍 staged | `crates/infer-topo`（sharding）、`crates/infer-cuda/src/{tp,deepep,dsv4}.rs` | architecture §Multi-GPU；support-matrix §0 |
 | CUDA speculative decode | **Not shipped** — 未移植到 rewrite（原 legacy `infer/`-only） | 未移植到 rewrite stack | support-matrix §0、§4a |
-| Qwen3.5 Medusa | **Blocked** — 需 recurrent-state rollback | — | support-matrix §4a；[`plans/M_medusa-phase1b-qwen35-v2-snapshot-ring-redesign.md`](plans/M_medusa-phase1b-qwen35-v2-snapshot-ring-redesign.md) |
+| Qwen3.5 Medusa | **Blocked** — 需 recurrent-state rollback | — | support-matrix §4a；`plans/M_medusa-phase1b-qwen35-v2-snapshot-ring-redesign.md` |
 | 分层 KV T1–T3 / NIXL | 未移植到 rewrite stack（原 legacy `infer/`-only） | `crates/kv-native-sys`（持久化 substrate） | support-matrix §0、§4b |
 | xgrammar 结构化输出 | Scaffold Phase 1 | `crates/xgrammar-sys` | support-matrix §5 |
 

@@ -2,20 +2,20 @@
 
 > **This is the authoritative forward plan for the DSv4 perf campaign's throughput
 > axis.** Provenance: the campaign root-cause was a wall-clock @4096 trace
-> ([`2026-06-06-dsv4-pd-systematic-analysis.md`](2026-06-06-dsv4-pd-systematic-analysis.md)
+> (`2026-06-06-dsv4-pd-systematic-analysis.md`
 > §3.5 found the R6 executor is single-row-only → c>1 doesn't scale, 1.63× @c=8); the
 > single-request kernel bottlenecks were fixed by adopting official kernels (decode
 > [`../experience/wins/2026-06-07-dsv4-official-dsa-default-on.md`](../experience/wins/2026-06-07-dsv4-official-dsa-default-on.md),
 > prefill
 > [`../experience/wins/2026-06-07-dsv4-prefill-official-kernels-default-on.md`](../experience/wins/2026-06-07-dsv4-prefill-official-kernels-default-on.md))
 > per the retro
-> [`../experience/errors/2026-06-06-handrolled-kernels-vs-adopt-official-retro.md`](../experience/errors/2026-06-06-handrolled-kernels-vs-adopt-official-retro.md);
+> `../experience/errors/2026-06-06-handrolled-kernels-vs-adopt-official-retro.md`;
 > targets are anchored on the
-> [H20 reference baseline](2026-06-06-dsv4-h20-reference-baseline.md). The Phase 3
+> H20 reference baseline. The Phase 3
 > shared-KV-pool foundation landed (c=1 byte-identical, c=2/c=4 row-parity) — see the
 > wins entry `2026-06-07-dsv4-shared-kv-pool-foundation.md` once committed.
 > The session code cleanup that should ride alongside this work:
-> [`2026-06-07-dsv4-code-cleanup-audit.md`](2026-06-07-dsv4-code-cleanup-audit.md).
+> `2026-06-07-dsv4-code-cleanup-audit.md`.
 
 ## Context
 

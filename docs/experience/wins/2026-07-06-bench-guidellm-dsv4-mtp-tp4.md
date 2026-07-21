@@ -36,7 +36,7 @@ MTP draft-verify (`mtp_draft_tokens=2`, `mtp_draft_topk=1`, exact-greedy
 acceptance) lowers per-token decode latency whenever the draft head's greedy
 token matches the trunk's verify token. Directionally a win, per the same
 NextN design already measured correct on Qwen3.6
-([2026-06-06 EAGLE/MTP phase2 wins](2026-06-06-dsv4-eagle-mtp-phase2-verify-correct.md)).
+(2026-06-06 EAGLE/MTP phase2 wins).
 
 ## GPUs used
 
@@ -117,7 +117,7 @@ scripts/bench_guidellm.sh dsv4-mtp-tp4 \
 Server verified live and correct (decode-checked, not assumed) before this
 measurement. Ran `/host/bench_nonstream.py` (the same non-streaming
 concurrent-HTTP substitute tool used successfully post-rewrite in
-[2026-06-29-cuda-throughput-ceiling-three-models.md](2026-06-29-cuda-throughput-ceiling-three-models.md)),
+2026-06-29-cuda-throughput-ceiling-three-models.md),
 at the canonical prompt/output shape (4096 in / 256 out):
 
 | c | reqs | out tok/s (aggregate) | "TTFT" p50 (ms)¹ | "TTFT" p95 (ms)¹ | outcome |
@@ -152,7 +152,7 @@ Not collected — no guidellm run.
 1. **BLOCKER — streaming responses never populate `usage`, on any backend
    (rewrite regression).** `scripts/bench_guidellm.sh`'s preflight probe
    (`probe_streaming_completions`, added
-   [2026-04-21](../errors/2026-04-21-guidellm-streaming-metrics-invalid-zero.md)
+   2026-04-21
    against the old `infer/` monolith) requires at least one SSE chunk with a
    populated `usage` object. Verified directly:
    `curl -sN .../v1/completions -d '{"stream":true,"stream_options":{"include_usage":true,"continuous_usage_stats":true},...}'`

@@ -494,7 +494,7 @@ v0.2.1.
   (`LoadedInferenceEngine`) is the single programmatic front door. Any command
   referencing `-p infer` is stale. Consolidated verification + performance
   verdict:
-  [final report](docs/projects/2026-06-04-qwen35-dsv4-final-report.md).
+  final report.
 
 ### Training surface — OPD-only (2026-05-18)
 
@@ -530,7 +530,7 @@ v0.2.1.
   wireframe, SFT-anchor corpus attribution, and a CPU-only capability-eval
   preflight for the P5 pure-OPD 5k adapter. Live task ordering, deferred GPU
   gates, and artifact links are tracked in
-  [`docs/projects/2026-05-24-opd-mainline-task-backlog.md`](docs/projects/2026-05-24-opd-mainline-task-backlog.md).
+  `docs/projects/2026-05-24-opd-mainline-task-backlog.md`.
 - **End-to-end OPD CUDA training stack landed on Qwen3-0.6B.** Single-session
   32-commit arc through kill-or-license-gated wins brings the OPD step at the
   moderate Qwen3.5-like shape to **48.5 ms** on RTX 4070 Ti SUPER —
@@ -546,11 +546,11 @@ v0.2.1.
   backward, in-place AdamW, KV cache for OPD rollout, device-resident
   RoPE / argmax, fused causal-SDPA decode, fused attention-prepare
   layout, fused grad clip. Usage manual:
-  [`docs/projects/2026-05-21-arle-opd-cuda-usage-manual.md`](docs/projects/2026-05-21-arle-opd-cuda-usage-manual.md).
+  `docs/projects/2026-05-21-arle-opd-cuda-usage-manual.md`.
   Cycle wrap:
-  [`docs/projects/2026-05-21-opd-cuda-cycle-wrap.md`](docs/projects/2026-05-21-opd-cuda-cycle-wrap.md).
+  `docs/projects/2026-05-21-opd-cuda-cycle-wrap.md`.
   Industry positioning:
-  [`docs/projects/2026-05-21-opd-industry-positioning-best-framework.md`](docs/projects/2026-05-21-opd-industry-positioning-best-framework.md).
+  `docs/projects/2026-05-21-opd-industry-positioning-best-framework.md`.
 
 ### Observability
 
@@ -575,7 +575,7 @@ v0.2.1.
   communication-bound: default TP=8/EP=8 performs 86 all-reduces per generated
   token per rank, and nsys observed 22016 NCCL all-reduce kernels for a
   32-token decode window. Evidence and industry comparison are recorded in
-  [`docs/experience/errors/2026-05-14-dsv4-decode-nccl-bottleneck.md`](docs/experience/errors/2026-05-14-dsv4-decode-nccl-bottleneck.md).
+  `docs/experience/errors/2026-05-14-dsv4-decode-nccl-bottleneck.md`.
 - Added committed DSv4 trace artifacts under
   `docs/trace-artifacts/2026-05-14-dsv4-decode/`,
   including the compressed raw nsys report/database, `nsys stats`, client JSON,
@@ -960,7 +960,7 @@ v0.2.1.
   dim from first capture) was load-bearing for the win and added to
   skill v1.7.0 anti-pattern catalog. Followup: n=3 σ-tight re-bench +
   guidellm streaming fix. Evidence:
-  [`docs/experience/wins/2026-05-10-bench-40-pathB2-tier1-strong-proceed.md`](docs/experience/wins/2026-05-10-bench-40-pathB2-tier1-strong-proceed.md).
+  `docs/experience/wins/2026-05-10-bench-40-pathB2-tier1-strong-proceed.md`.
 - W4-hybrid Qwen3 paged-prefill **CUDA Graph capture** lands as opt-in
   via `INFER_PREFILL_GRAPH=1` + `INFER_HYBRID_W4A8_PREFILL=1` (`35fc3cf`).
   Phase 1 functional gate: prefill-lifetime `MarlinPrefillScratch`
@@ -971,8 +971,8 @@ v0.2.1.
   TTFT p50 1628.9 ms vs graph ON 1627.8 ms = Δ -0.07%) detected
   capture-key churn — Path A multi-key direction KILLED, Path B
   device-memory `start_pos` re-licensed P0 (`e462c53`). Evidence:
-  [`docs/experience/wins/2026-05-10-bench-p24-w4a8-prefill-graph-hoist.md`](docs/experience/wins/2026-05-10-bench-p24-w4a8-prefill-graph-hoist.md),
-  [`docs/experience/errors/2026-05-10-37-throughput-bench-killed-pathA-multikey-churn.md`](docs/experience/errors/2026-05-10-37-throughput-bench-killed-pathA-multikey-churn.md).
+  `docs/experience/wins/2026-05-10-bench-p24-w4a8-prefill-graph-hoist.md`,
+  `docs/experience/errors/2026-05-10-37-throughput-bench-killed-pathA-multikey-churn.md`.
 
 ### Long-context (cross-backend)
 
@@ -988,10 +988,10 @@ v0.2.1.
   `vanilla_inv_freq_matches_legacy_formula` test). Long-ctx bench
   validation (Qwen3-4B 64k YARN×2 / 128k YARN×4 + FP8 KV) deferred to
   Phase 3; CUDA-side viable on RTX 4070 Ti SUPER 16 GB per
-  [`docs/plans/2026-05-10-rope-yarn-phase3-cuda-bench-plan.md`](docs/plans/2026-05-10-rope-yarn-phase3-cuda-bench-plan.md).
+  `docs/plans/2026-05-10-rope-yarn-phase3-cuda-bench-plan.md`.
   Apply to a model dir via [`scripts/setup_qwen3_yarn_config.py`](scripts/setup_qwen3_yarn_config.py).
   Consolidation:
-  [`docs/experience/wins/2026-05-10-m-rope-yarn-scaling-phase1-phase2-landed.md`](docs/experience/wins/2026-05-10-m-rope-yarn-scaling-phase1-phase2-landed.md).
+  `docs/experience/wins/2026-05-10-m-rope-yarn-scaling-phase1-phase2-landed.md`.
 
 ### Structured-output (xgrammar)
 
@@ -1004,7 +1004,7 @@ v0.2.1.
   `bitmask_size` / per-step bitmask fill APIs. No HTTP, scheduler,
   sampler, or GPU sampling integration yet — that is follow-up
   tranche work. Plan:
-  [`docs/plans/M_xgrammar-ffi-scaffold.md`](docs/plans/M_xgrammar-ffi-scaffold.md).
+  `docs/plans/M_xgrammar-ffi-scaffold.md`.
 
 ### Metal
 

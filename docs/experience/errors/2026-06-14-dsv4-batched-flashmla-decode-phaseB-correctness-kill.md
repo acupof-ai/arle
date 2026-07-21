@@ -1,7 +1,7 @@
 # DSv4 batched FlashMLA decode Phase B — correctness KILL (garbled decode at c≥4, faster-nonsense)
 
 ## Context
-Phase B ([commit `fd4d240f`](../../plans/dsv4-batched-flashmla-decode.md)) replaced
+Phase B (commit `fd4d240f`) replaced
 the per-row FlashMLA attention kernel in the batched decode lane with ONE
 `sparse_decode_fwd(b=N)` (SW+HCA; CSA kept per-row). Gated
 `INFER_DSV4_BATCHED_DECODE=1` + `ARLE_DSV4_FLASHMLA_DECODE_BATCHED=1`, default OFF.
