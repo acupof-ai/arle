@@ -1996,6 +1996,8 @@ pub(crate) struct TrainAgentOpdArgs {
     /// continuous-batching serve engine but each blocks on host tool-exec, so a
     /// serial eval leaves the GPU idle; N concurrent tasks keep it fed (~N×
     /// faster). No policy update during eval → semantically identical to serial.
+    /// Keep ≥2: at 1 there is no sandbox boot-ahead, so the GPU idles during each
+    /// task's boot (the concurrent path relies on other workers to hide it).
     #[arg(long, default_value_t = 8)]
     pub(crate) eval_concurrency: usize,
 
