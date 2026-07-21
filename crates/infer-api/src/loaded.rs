@@ -750,6 +750,30 @@ mod backend {
             }
         }
 
+        /// Read the current DSpark Markov head weights back to host as f32.
+        ///
+        /// Used by the train sidecar to seed the trainer from the loaded checkpoint.
+        /// Returns `(w1 [vocab*rank], w2 [rank*vocab], rank)`.
+        #[cfg(feature = "cuda")]
+        pub fn get_dspark_markov_weights(&self) -> Result<(Vec<f32>, Vec<f32>, usize)> {
+            match self {
+                Self::Cuda(engine) => engine.get_dspark_markov_weights(),
+                #[cfg(feature = "metal")]
+                Self::Metal(_)
+                | Self::MetalDiffusionGemma(_)
+                | Self::MetalGemma4(_)
+                | Self::MetalDeepseekOcr(_) => {
+                    anyhow::bail!("get_dspark_markov_weights is CUDA-only")
+                }
+                #[cfg(feature = "hip")]
+                Self::Hip(_) => anyhow::bail!("get_dspark_markov_weights is CUDA-only"),
+                #[cfg(feature = "vulkan")]
+                Self::Vulkan(_) => anyhow::bail!("get_dspark_markov_weights is CUDA-only"),
+                #[cfg(all(feature = "cpu", not(feature = "metal")))]
+                Self::Cpu(_) => anyhow::bail!("get_dspark_markov_weights is CUDA-only"),
+            }
+        }
+
         /// Programmatic token-id generation over the serving scheduler/KV path.
         /// OPD uses this for student rollout: one submitted request owns one KV
         /// slot and decodes incrementally until `max_tokens` is reached.

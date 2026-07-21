@@ -523,6 +523,21 @@ impl CudaExecutor {
         }
     }
 
+    /// Read the current DSpark Markov head weights back to host as f32.
+    ///
+    /// Used by the train sidecar to seed the trainer from the loaded checkpoint.
+    /// Returns `(w1 [vocab*rank], w2 [rank*vocab], rank)`.
+    #[cfg(feature = "cuda")]
+    pub fn get_dspark_markov_weights(&self) -> anyhow::Result<(Vec<f32>, Vec<f32>, usize)> {
+        match &self.inner {
+            CudaExecutorInner::Placeholder => anyhow::bail!(
+                "DSpark Markov weight read requires the real CUDA executor; \
+                 the no-GPU placeholder has no resident weights"
+            ),
+            CudaExecutorInner::Real(real) => real.get_dspark_markov_weights(),
+        }
+    }
+
     #[cfg(feature = "cuda")]
     pub fn dsv4_verify_forward_selftest(&mut self, prompt: &[u32]) -> anyhow::Result<()> {
         match &mut self.inner {

@@ -3163,6 +3163,18 @@ impl Qwen35CudaExecutor {
             .ok_or_else(|| anyhow::anyhow!("DSpark head not loaded"))?;
         dspark.head.update_markov_weights(&self.model.ctx, w1, w2)
     }
+
+    /// Read the current DSpark Markov head weights back to host as f32.
+    ///
+    /// Used by the train sidecar to seed the trainer from the loaded checkpoint.
+    /// Returns `(w1 [vocab*rank], w2 [rank*vocab], rank)`.
+    pub(crate) fn get_dspark_markov_weights(&self) -> Result<(Vec<f32>, Vec<f32>, usize)> {
+        let dspark = self
+            .dspark
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("DSpark head not loaded"))?;
+        dspark.head.get_markov_weights(&self.model.ctx)
+    }
 }
 
 #[cfg(test)]

@@ -1583,6 +1583,28 @@ impl Dsv4CudaExecutor {
         Ok(())
     }
 
+    /// Read the current DSpark Markov head weights back to host as f32.
+    ///
+    /// Used by the train sidecar to seed the trainer from the loaded checkpoint
+    /// instead of random init. Returns `(w1 [vocab*rank], w2 [rank*vocab], rank)`.
+    pub(crate) fn get_dspark_markov_weights(&self) -> Result<(Vec<f32>, Vec<f32>, usize)> {
+        let dspark = self
+            .dspark
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("DSpark head not loaded"))?;
+        let stage = dspark
+            .draft
+            .stages
+            .last()
+            .ok_or_else(|| anyhow::anyhow!("DSpark draft has no stages"))?;
+        let (Some(mw1), Some(mw2)) = (stage.markov_w1.as_ref(), stage.markov_w2.as_ref()) else {
+            anyhow::bail!("DSpark exit stage has no Markov head weights");
+        };
+        let w1 = mw1.to_host(&self.model.ctx)?;
+        let w2 = mw2.to_host(&self.model.ctx)?;
+        Ok((w1, w2, mw1.cols))
+    }
+
     /// Seed a freshly-prefilled prompt chunk into the DSpark draft context: pull
     /// the transient multi-row taps the prefill forward stashed on the slot and
     /// append them at absolute trunk positions `start_abs..` (the canonical
