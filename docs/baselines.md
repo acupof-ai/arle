@@ -120,3 +120,29 @@ errors). DSpark ran clean (64/70 complete, 0 errors) — more stable under load.
 - **c=16 no-spec needs re-measurement** with a stable config (KV cache exhaustion
   at 32 slots under high concurrency).
 
+## Qwen3.6-27B-W4A16 · 1×V100 (sm_70) · eager · port 8080
+
+**2026-07-21 (`aec71ef16`, V100 kernel opts + KV pool floor fix)** — synthetic
+prompts 64, 60 s/point, max_tokens 256, seed 20260416. KV pool 16384 tok BF16
+(1.1 GB), 86 slots (clamped from 256 by VRAM budget). Serve:
+`--max-total-tokens 16384`. Raw: V100 `/tmp/v100_nospec_bench.{json,csv}`.
+
+| c | complete | out tok/s | total tok/s | TTFT p50/p99 ms | ITL p50/p99 ms |
+|---|---:|---:|---:|---|---|
+| 1 | 11 | 22.8 | 24.4 | 251 / 304 | 40.4 / 41.6 |
+| 4 | 12 | 25.5 | 27.4 | 17799 / 25769 | 0.02* / 270 |
+| 8 | 17 | 28.4 | 30.4 | 30818 / 54318 | 0.02* / 335 |
+| 16 | 16 | 30.1 | 32.1 | 72270 / 72933 | 0.02* / 452 |
+
+\* ITL p50 ≈ 0.02 ms is a bench-script artifact (streaming inter-token
+sampling undercounts at c≥4); the out tok/s column is the valid throughput
+metric. c=1 ITL 40.4 ms ≈ 24.7 tok/s decode, matches the c=1 out tok/s.
+
+- **Decode-bound at all concurrencies.** out tok/s scales weakly (22.8 → 30.1,
+  +32% from c=1 to c=16) — V100 sm_70 W4A16 decode is the bottleneck, not
+  scheduler/KV. TTFT grows linearly with concurrency (queueing).
+- **DSpark not measured**: DFlash draft checkpoint on V100 has only
+  `config.json`, no weight files — needs a full DFlash model download before
+  the spec-decode arm can run.
+
+
