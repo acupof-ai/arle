@@ -213,7 +213,7 @@ GroupedScratch& scratch_for_current_device() {
 
 }  // namespace
 
-extern "C" CUresult arle_fp8_moe_grouped_gemm_nt_sm120(
+extern "C" CUresult arle_fp8_moe_grouped_gemm_nt_sm120_cuda(
     const uint8_t* a,          // e4m3 activations, contiguous [total_M, K]
     const float* sfa,          // per-token f32 act scales (DeepGEMM packing)
     const uint8_t* b,          // e4m3 grouped weights [G, N, K] row-major
@@ -362,7 +362,7 @@ extern "C" CUresult arle_fp8_moe_grouped_gemm_nt_sm120(
 
 #else  // !ARLE_SM120_GROUPED_FP8
 
-extern "C" CUresult arle_fp8_moe_grouped_gemm_nt_sm120(
+extern "C" CUresult arle_fp8_moe_grouped_gemm_nt_sm120_cuda(
     const uint8_t*, const float*, const uint8_t*, const float*, void*,
     const int*, const int*, int, int, int, int, cudaStream_t) {
   return CUDA_ERROR_NOT_SUPPORTED;
