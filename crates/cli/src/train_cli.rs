@@ -2200,8 +2200,10 @@ fn run_cc_eval(
     eval_tasks: &[(std::sync::Arc<train::swe_dataset::SweTask>, PathBuf)],
     out_dir: &Path,
     label: &str,
+    concurrency: usize,
 ) -> Result<f32> {
     use std::io::Write;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     if eval_tasks.is_empty() {
         return Ok(0.0);
@@ -2212,27 +2214,52 @@ fn run_cc_eval(
     let mut file = fs::File::create(&out_path)
         .with_context(|| format!("create eval out {}", out_path.display()))?;
 
-    let (first_task, first_staged) = &eval_tasks[0];
-    let mut booted = Some(harness.boot_group(first_task, first_staged, 1));
+    // Bounded task-level concurrency: N workers steal task indices, each booting
+    // + rolling one task on the shared serve engine. Results land in per-slot
+    // cells so the output order matches the serial path exactly.
+    let concurrency = concurrency.clamp(1, eval_tasks.len());
+    let next = AtomicUsize::new(0);
+    type EvalSlot = Result<(serde_json::Value, bool, bool, f32)>;
+    let slots: Vec<std::sync::Mutex<Option<EvalSlot>>> = eval_tasks
+        .iter()
+        .map(|_| std::sync::Mutex::new(None))
+        .collect();
+    std::thread::scope(|scope| {
+        for _ in 0..concurrency {
+            scope.spawn(|| {
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let Some((task, staged)) = eval_tasks.get(i) else {
+                        break;
+                    };
+                    let out = harness
+                        .run_group(harness.boot_group(task, staged, 1))
+                        .map(|g| {
+                            let s = &g.samples[0];
+                            let line = serde_json::json!({
+                                "instance_id": s.task_id,
+                                "passed": s.passed(),
+                                "edited": s.edited,
+                                "note": s.note,
+                                "reward": s.reward,
+                            });
+                            (line, s.passed(), s.edited, s.reward)
+                        });
+                    *slots[i].lock().expect("eval slot poisoned") = Some(out);
+                }
+            });
+        }
+    });
     let (mut passed, mut edited, mut dense_sum) = (0usize, 0usize, 0.0f32);
-    for i in 0..eval_tasks.len() {
-        let this = booted.take().expect("booted ahead");
-        // Boot-ahead: the next task's sandbox builds during this rollout.
-        booted = eval_tasks
-            .get(i + 1)
-            .map(|(next, staged)| harness.boot_group(next, staged, 1));
-        let group = harness.run_group(this)?;
-        let s = &group.samples[0];
-        passed += usize::from(s.passed());
-        edited += usize::from(s.edited);
-        dense_sum += s.reward;
-        let line = serde_json::json!({
-            "instance_id": s.task_id,
-            "passed": s.passed(),
-            "edited": s.edited,
-            "note": s.note,
-            "reward": s.reward,
-        });
+    for slot in &slots {
+        let (line, p, e, r) = slot
+            .lock()
+            .expect("eval slot poisoned")
+            .take()
+            .expect("every eval slot filled")?;
+        passed += usize::from(p);
+        edited += usize::from(e);
+        dense_sum += r;
         writeln!(file, "{line}")?;
     }
     let pass_rate = passed as f32 / eval_tasks.len() as f32;
@@ -3257,7 +3284,15 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
     // Round-0 BASELINE held-out eval BEFORE any training: the un-tuned student's
     // pass-rate every per-round eval is read against.
     let baseline_pass_rate: Option<f32> = (!eval_tasks.is_empty())
-        .then(|| run_cc_eval(&harness, &eval_tasks, &eval_out_dir, "base"))
+        .then(|| {
+            run_cc_eval(
+                &harness,
+                &eval_tasks,
+                &eval_out_dir,
+                "base",
+                args.eval_concurrency,
+            )
+        })
         .transpose()?;
 
     let needs = update_preset.needs();
@@ -3716,6 +3751,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
                         &eval_tasks,
                         &eval_out_dir,
                         &(round + 1).to_string(),
+                        args.eval_concurrency,
                     )
                 })?;
             held_out_pass_rate = Some(pass_rate);
