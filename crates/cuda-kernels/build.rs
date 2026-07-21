@@ -2758,6 +2758,14 @@ fn main() {
             "cargo:warning=DeepGEMM native enabled (sm_90 + vendored source; set ARLE_CUDA_DISABLE_DEEPGEMM_NATIVE=1 to opt out)"
         );
     }
+    // sm_120 grouped blockwise-scaled FP8 MoE GEMM (CUTLASS 4.3.5 collective).
+    // Only instantiate the CUTLASS sm_120a collective when the build targets
+    // sm_120 — the TU carries `-DARLE_SM120_GROUPED_FP8` + forced
+    // compute_120a,sm_120a gencode only then; every other build compiles the
+    // cheap `#else` stub (symbol present, returns cudaErrorNotSupported). This
+    // is the sm_120 replacement for the Hopper-only DeepGEMM grouped GEMM.
+    let sm120_grouped_fp8_target = sm_targets.iter().any(|s| s.sm.starts_with("120"));
+
     let ccbin = std::env::var("NVCC_CCBIN").ok();
     println!("cargo:rerun-if-env-changed=ARLE_CUDA_DISABLE_MARLIN_W4_FP8");
     let disable_marlin_w4_fp8 = legacy_volta_build
@@ -2819,8 +2827,12 @@ fn main() {
                 stem,
                 "arle_flashmla_shim" | "arle_flashmla_decode_shim" | "arle_fa3_shim"
             );
+        let is_sm120_grouped_fp8 = stem == "fp8_moe_grouped_cutlass_sm120";
         if is_sm90a_only {
             nvcc_args.push("-gencode=arch=compute_90a,code=sm_90a".to_string());
+        } else if is_sm120_grouped_fp8 && sm120_grouped_fp8_target {
+            // CUTLASS sm_120 blockwise MMA needs the accelerated 'a' variant.
+            nvcc_args.push("-gencode=arch=compute_120a,code=sm_120a".to_string());
         } else {
             nvcc_args.extend(arch_args.clone());
         }
@@ -2856,6 +2868,27 @@ fn main() {
             if env_flag("DG_JIT_USE_RUNTIME_API") {
                 nvcc_args.push("-DDG_JIT_USE_RUNTIME_API=1".to_string());
             }
+        }
+
+        // sm_120 grouped FP8 MoE GEMM: CUTLASS 4.3.5 collective (FlashMLA's
+        // vendored cutlass tree). `--expt-relaxed-constexpr` for the collective's
+        // device `std::min`; `-lcuda` (device TMA `cuDriverGetVersion`) is already
+        // linked via emit_cuda_system_link_libs. Only the sm_120 build defines the
+        // macro that instantiates the collective.
+        if is_sm120_grouped_fp8 && sm120_grouped_fp8_target {
+            nvcc_args.extend([
+                "-std=c++17".to_string(),
+                "--expt-relaxed-constexpr".to_string(),
+                "-DARLE_SM120_GROUPED_FP8=1".to_string(),
+                format!("-I{}/include", cuda_path),
+                format!("-I{}", flashmla_root.join("csrc/cutlass/include").display()),
+                format!(
+                    "-I{}",
+                    flashmla_root
+                        .join("csrc/cutlass/tools/util/include")
+                        .display()
+                ),
+            ]);
         }
 
         // Marlin kernel needs C++17 + relaxed constexpr
