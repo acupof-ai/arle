@@ -75,13 +75,7 @@ impl RewardShape {
     pub fn apply(self, f: f32, errored: bool) -> f32 {
         match self {
             RewardShape::Dense => f,
-            RewardShape::Binary => {
-                if f >= 1.0 {
-                    1.0
-                } else {
-                    0.0
-                }
-            }
+            RewardShape::Binary => f32::from(f >= 1.0),
             RewardShape::Anchored if errored => 0.0,
             RewardShape::Anchored if f >= 1.0 => 1.0,
             RewardShape::Anchored => REWARD_DENSE_WEIGHT * f,
