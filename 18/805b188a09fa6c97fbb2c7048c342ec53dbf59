@@ -1,0 +1,47 @@
+README.zh-CN.md
+  s_5b5b45066e37d2::t_0f967c19ef194a 69
+docs/experience/errors/2026-07-03-agent-opd-toy-corpus-saturation-kill.md
+  s_5b5b45066e37d2::t_29d4d60e031779 10
+docs/experience/wins/2026-07-02-dsv4-kvssd-multiproc-attach.md
+  s_5b5b45066e37d2::t_cc8c278511ecae 43
+docs/experience/wins/2026-07-04-cc-as-harness-pod-e2e-baseline-probe.md
+  s_5b5b45066e37d2::t_e1d348b0170b8c 28
+docs/experience/wins/2026-07-05-dsv4-p1-p2-p4-needle-gate.md
+  s_5b5b45066e37d2::t_7d6c106ea6947b 9
+docs/experience/wins/2026-07-06-bench-guidellm-dsv4-mtp.md
+  s_5b5b45066e37d2::t_9733d86febbbdb 35
+docs/experience/wins/2026-07-06-dsv4-flashmla-budget-reconciliation-verified.md
+  s_5b5b45066e37d2::t_0f16d47784994e 7,12
+docs/experience/wins/2026-07-19-dsv4-production-all-on-reanchor.md
+  s_5b5b45066e37d2::t_571b1c1faf9780 29
+docs/experience/wins/README.md
+  s_5b5b45066e37d2::t_b4587c092b5039 34-36,57
+docs/plans/2026-07-03-agentic-opd-27b-capability-curve.md
+  s_5b5b45066e37d2::t_24d02f18c5a7f1 26,55
+docs/plans/2026-07-03-opd-remaining-work.md
+  s_5b5b45066e37d2::t_2f98871a35f151 44,71
+docs/plans/2026-07-09-dspark-dflash-spec-decode-qwen36.md
+  s_5b5b45066e37d2::t_9f899fa2a71bc0 55,168,192
+docs/plans/2026-07-21-kernel-opt-fusion-campaign.md
+  s_5b5b45066e37d2::t_5889f64d3687ee 1,3-5,7,9-10,12,14-17,19,21-27,29-30,32,34,36-39,41-42,44,46,48,50-54,56,58,60,62-66,68-77,79,81,83-92,94,96-103,105,107-111,113,115,117,119-120,122,124-128,130,132,134-135,137-163,166-175,177,179-215,217-221,223,225,227-232,234,236-298
+docs/resources/eli-integration.md
+  s_5b5b45066e37d2::t_fdf70f1c1522a9 58,104
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "18805b188a09fa6c97fbb2c7048c342ec53dbf59",
+  "prompts": {},
+  "sessions": {
+    "s_5b5b45066e37d2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d410989c-1154-48b6-8b1b-c6e51dca9e37",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
