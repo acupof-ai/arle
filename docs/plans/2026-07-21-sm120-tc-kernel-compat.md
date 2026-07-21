@@ -138,47 +138,67 @@ every (B) claim.
 - Open: confirm the FP8 safetensors `config.json` has `num_experts=0` (§0 pod caveat)
   on this box while it's up.
 
-## 6. (B) peak-perf plan — cuBLASLt FP8 route
+## 6. (B) peak-perf plan — CUTLASS sm_120 block-scaled GEMM
 
-Goal: recover the ~2× FP8 tensor-core throughput the (A) dequant→BF16 fallback drops.
-Not tcgen05 (absent on sm_120) — cuBLASLt FP8, wired as one dispatch route.
+Grounded by the 4-stream deep research ([2026-07-22-sm120-fp8-peak-landscape.md](../research/2026-07-22-sm120-fp8-peak-landscape.md)).
+Correction to the first draft: the peak path is **NOT cuBLASLt** — cuBLASLt on sm_120
+is per-tensor only and runs at the *throttled* legacy-MMA rate (2×). The framework
+consensus (vLLM PR #22131, CUTLASS example-79) is the **CUTLASS sm_120 block-scaled
+collective** (`mma.sync…block_scale`), the only route to un-throttled ~4× over BF16.
 
-### The one crux — scale format
-Weights are **128×128 f32 block-scaled** (DeepGEMM format). cuBLASLt on sm_120
-supports per-tensor scalar scaling or MXFP8 (32-element UE8M0 blocks) — neither is
-128×128. Resolve by measurement, not by betting:
-- **Cut 1 (prove the route)**: collapse 128×128 → one per-tensor f32 scale;
-  `cublasLtMatmul` FP8 per-tensor. Cheapest, reuses the scaffold end-to-end. **Risk:
-  precision may miss the needle gate.**
-- **Cut 2 (if needle fails)**: requantize weights to MXFP8 (32-element UE8M0) at load;
-  cuBLASLt MX matmul. Correct precision, costs a load-time requant pass + a scale-store
-  change.
-- Floor: (A) dequant→BF16 stays as the always-correct fallback for any shape/SM the
-  FP8 route rejects.
+### Two cuts, evidence-ordered
+- **Cut 1 (prove the route, mature, ~2×)**: cuBLASLt **per-tensor** scaled FP8
+  (`CUDA_R_8F_E4M3` + `SCALAR_32F`), reusing the `gemv.cu:539` cuBLASLt scaffold.
+  Validates FFI + `major==12` dispatch + sm_120 build end-to-end. Numerics change
+  (per-tensor vs 128-block) — a prove-route, not the endpoint. cuBLASLt sm_120 needs
+  the **TN layout** (no non-TN MXFP8 today).
+- **Cut 2 (true peak, ~4×)**: adopt the **CUTLASS sm_120 block-scaled collective**
+  (integrate CUTLASS example-79c MXFP8 / the vLLM PR #22131 kernel as a new `.cu`),
+  consuming 128-block E4M3 with **UE8M0** scales. This is the adopt-vendored-first
+  path — not hand-written.
+- Floor: (A) dequant→BF16 stays the always-correct fallback for any shape/SM the FP8
+  route rejects.
+
+### Scale-format action item (blocks Cut 2)
+Confirm the checkpoint's 128-block scales are **UE8M0** (power-of-2) — then CUTLASS
+sm_120 takes them directly (vLLM `block_shape=[128,128]`). If arbitrary f32, a
+load-time requant to UE8M0 is required (a checkpoint with `scale_fmt ≠ ue8m0` crashes
+the block-scaled loader — [vLLM #47436](https://github.com/vllm-project/vllm/issues/47436)).
+DeepGEMM's own SM100 path already repacks to UE8M0, so the format likely exists.
 
 ### file:line
-1. `crates/cuda-kernels/csrc/gemm/fp8_cublaslt_gemm.cu` (new): model on `gemv.cu:539-612`
-   (descriptor / preference / heuristic / `algo_cache` all reusable); inputs
-   `CUDA_R_8F_E4M3`, `CUBLAS_COMPUTE_32F`, scale via `CUBLASLT_MATMUL_DESC_A/B_SCALE_POINTER`
-   (Cut 1 per-tensor) or `..._SCALE_MODE` VEC32_UE8M0 (Cut 2).
-2. `crates/cuda-kernels/src/gemm.rs` (or the gemm FFI module): declare the extern + safe
-   wrapper.
+1. `crates/cuda-kernels/csrc/gemm/fp8_cutlass_sm120_gemm.cu` (new, Cut 2): adopt the
+   CUTLASS example-79c sm_120a block-scaled collective; inputs E4M3 + UE8M0 128-block
+   scales. Cut 1 interim: `fp8_cublaslt_gemm.cu` per-tensor on the `gemv.cu:539` scaffold.
+2. `crates/cuda-kernels/src/gemm.rs`: extern + safe wrapper.
 3. `crates/infer-cuda/src/ops/generated/qwen_fp8_dense_projection.rs`: add
-   `Route::CublasLtFp8`. This file is `@generated` by
-   `scripts/reduce_operator_evidence.py` — add the variant + a `major==12` selection via
-   the generator (or a small hand-written override layer over `select_exact`), NOT by
-   editing the generated file directly.
+   `Route::CutlassSm120Fp8` (and the Cut-1 cuBLASLt variant). `@generated` by
+   `scripts/reduce_operator_evidence.py` — add via the generator or a hand-written
+   override over `select_exact`, NOT by editing the generated file.
 4. `crates/infer-cuda/src/ops/quant_linear.rs:185 qwen_fp8_dense_route`: `major==12` →
-   `CublasLtFp8`; `major==9` stays `PackDeepGemm`; all other SMs unchanged. Plus the
-   dispatch site (`~:535`) launches the new route.
-5. `build.rs`: no change — new `.cu` is auto-collected; sm_120 gencode already emitted.
+   the sm_120 route; `major==9` stays `PackDeepGemm`; other SMs unchanged. Dispatch at
+   `~:535`.
+5. **MoE grouped (G2)**: the sm_120 MoE path is the CUTLASS block-scaled **grouped**
+   GEMM (CUTLASS ex79d / vLLM), NOT DeepGEMM grouped. `moe.rs:537` gates on cache
+   presence, not SM — confirm sm_120 routes away from `dsv4_deepgemm_m_grouped_*`
+   (empirically via Pass B, then wire the CUTLASS grouped route).
+6. `build.rs`: new `.cu` auto-collected; needs CUTLASS sm_120a includes for Cut 2.
 
 ### verify
-Colab sm_120: `needle_gate.py` (Cut 1 must pass, else escalate to Cut 2) THEN
-`bench_throughput.py` vs the (A) dequant-BF16 arm — the (B) route must show a stable
-positive Δ or it is reverted. wins/ entry cites the Colab bench.
+Colab sm_120: `needle_gate.py` per cut, THEN `bench_throughput.py` vs the (A)
+dequant-BF16 arm AND vs Cut 1 — Cut 2 must show a stable positive Δ (target ~2× over
+Cut 1, ~4× over BF16) or it is reverted. wins/ entry cites the Colab bench.
 
 ### Blackwell attention (deferred, second hotspot)
-GEMM dominates FLOPs; land the GEMM route first. Peak hd256 attention on sm_120 (FA3/
-CUTLASS or FlashInfer sm_120 build) is a follow-up once the GEMM route is benched — the
-portable `nonpaged_prefill_attention` (§1 #3/#4) is the correct-but-slow floor until then.
+GEMM dominates FLOPs; land the GEMM route first. Research verdict: **no Blackwell-native
+FMHA for hd256** — FA3 refuses Blackwell, FA4 is hd≤128, CUTLASS-ex77/trtllm-gen are
+sm_100. The peak is **FA2-class** (our TileLang `batch_prefill_paged_hd256`, GemmMMASm70
+MMA, forward-compiled to sm_120 via `ARLE_TILELANG_CUDA_ARCH=90`); `nonpaged_prefill_attention`
+(§1 #3/#4) is the SIMT floor. TileLang sm_120 has open bugs (#2328 hang / #2703 non-det)
+— gate on needle determinism.
+
+### Strategic (long-term) — NVFP4
+NVFP4 (E2M1 + 16-element UE4M3 scale) is the ecosystem-consensus **Blackwell-native**
+format, the only un-throttled ~4× path that also fits 96 GB comfortably. For a
+workstation-Blackwell *deployment* target, a 4-bit NVFP4 requant may beat FP8 —
+evaluate as a follow-up after the FP8 route is proven, not the first cut.
