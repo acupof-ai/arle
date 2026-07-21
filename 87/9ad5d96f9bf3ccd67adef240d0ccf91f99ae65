@@ -1,0 +1,21 @@
+crates/cli/src/train_cli.rs
+  s_401e742db357a3::t_f3b8dba22388f7 3269,3332-3335,3354-3360,3539-3541,3625-3626,3823-3841,3853-3854,3868
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "879ad5d96f9bf3ccd67adef240d0ccf91f99ae65",
+  "prompts": {},
+  "sessions": {
+    "s_401e742db357a3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a09187d808c7acaa2",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
