@@ -1,5 +1,0 @@
-{
-    "rust-analyzer.cargo.features": ["metal", "no-cuda"],
-    "rust-analyzer.cargo.noDefaultFeatures": false,
-    "rust-analyzer.procMacro.enable": true
-}
