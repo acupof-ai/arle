@@ -1,0 +1,23 @@
+README.md
+  s_701dead3b9c2f3::t_6e5743b8e753f0 155
+docs/experience/wins/2026-07-20-dspark-train-sidecar-e2e-verified.md
+  s_701dead3b9c2f3::t_925cecddf16232 53-79
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "a6e620f15a85bcdd9598a9c282b1aec80e357d33",
+  "prompts": {},
+  "sessions": {
+    "s_701dead3b9c2f3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4876ea73-5d7b-4a4e-a891-98c71325cbc0",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
