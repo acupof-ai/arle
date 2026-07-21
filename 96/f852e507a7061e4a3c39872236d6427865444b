@@ -1,0 +1,21 @@
+crates/cuda-kernels/csrc/gemm/fp8_moe_grouped_cutlass_sm120.cu
+  s_1f501b27e77cda::t_b23eba4863285a 120-139,286-289
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "96f852e507a7061e4a3c39872236d6427865444b",
+  "prompts": {},
+  "sessions": {
+    "s_1f501b27e77cda": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a30e19813fe033b06",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
