@@ -6,7 +6,7 @@
 # the filter is what keeps every round producing gradient (Tmax).
 set +e
 
-ROOT=/host/arle-build; ARLE=$ROOT/target/release/arle; MODEL=/host/Qwen3.6-27B-FP8
+ROOT=/host/arle-build; ARLE=$ROOT/target/release/arle; MODEL=/host/ThinkingCap-Qwen3.6-27B-FP8
 PY=${PY:-python3}
 WORK=${WORK:-/host/tbench_opd}
 DATASET_PATH=${DATASET_PATH:?set DATASET_PATH to a calibrated task pool}
@@ -32,7 +32,7 @@ for r in $(seq 0 $((ROUNDS-1))); do
 
   RUN_ROOT=$WORK/round$r
   OPENAI_API_BASE=http://127.0.0.1:$PORT/v1 OPENAI_API_KEY=dummy NO_PROXY=127.0.0.1,localhost,::1 \
-    tb run --dataset-path $DATASET_PATH -a terminus -m openai/Qwen3.6-27B-FP8 \
+    tb run --dataset-path $DATASET_PATH -a terminus -m openai/ThinkingCap-Qwen3.6-27B-FP8 \
     --n-attempts $N_ATTEMPTS --n-concurrent 4 --global-agent-timeout-sec 600 --global-test-timeout-sec 60 \
     --output-path $RUN_ROOT > $WORK/eval_r$r.log 2>&1
   RUN=$(ls -td $RUN_ROOT/*/ 2>/dev/null | head -1)
