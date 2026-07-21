@@ -1,0 +1,21 @@
+scripts/bench_dspark_accept.py
+  s_5b5b45066e37d2::t_31e324f2b9cb3d 4-7,10-11,21,23,44-48,51-52,56-64,71,73-74,79-116
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "a7362dafaac91fbc921e7c15a9529c7e0f5e4f00",
+  "prompts": {},
+  "sessions": {
+    "s_5b5b45066e37d2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d410989c-1154-48b6-8b1b-c6e51dca9e37",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
