@@ -41,7 +41,12 @@ fn dspark_trainer_smoke() {
         baseline_ema_alpha: 0.1,
         ..Default::default()
     };
-    let mut trainer = DsparkTrainer::new(config).expect("trainer should construct");
+    let mut trainer = DsparkTrainer::new(
+        config,
+        None,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .expect("trainer should construct");
 
     // Mix of high and low acceptance experiences.
     let experiences: Vec<DsparkExperience> = (0..8)
@@ -83,7 +88,12 @@ fn dspark_trainer_empty_batch() {
         markov_rank: RANK,
         ..Default::default()
     };
-    let mut trainer = DsparkTrainer::new(config).unwrap();
+    let mut trainer = DsparkTrainer::new(
+        config,
+        None,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .unwrap();
     let loss = trainer.train_step(&[]).unwrap();
     assert_eq!(loss, 0.0, "empty batch should return 0 loss");
 }
@@ -99,7 +109,12 @@ fn dspark_trainer_converges() {
         baseline_ema_alpha: 0.5,
         ..Default::default()
     };
-    let mut trainer = DsparkTrainer::new(config).unwrap();
+    let mut trainer = DsparkTrainer::new(
+        config,
+        None,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .unwrap();
 
     let exp = make_experience(BLOCK); // full acceptance
     let batch = vec![exp.clone(); 4];
