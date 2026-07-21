@@ -3,7 +3,7 @@
 > **pending-remote**: runtime forward change in `crates/infer-cuda/src/` +
 > `crates/cuda-kernels/csrc/` (CUDA-only). Cannot bench on a Mac (no nvcc/GPU).
 > GPU validation is the E-tranche on the pod; this entry is the bench-rule stub.
-> Cross-links: [`docs/plans/2026-06-18-glm52-dsv4-port.md`](../../plans/2026-06-18-glm52-dsv4-port.md).
+> Cross-links: `docs/plans/2026-06-18-glm52-dsv4-port.md`.
 
 ## SLO-shape probed?  N — GPU-only, no local bench
 

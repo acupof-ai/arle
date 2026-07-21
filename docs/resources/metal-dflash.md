@@ -54,7 +54,7 @@ Not supported:
 
 | Target | Draft | Provenance |
 |---|---|---|
-| `mlx-community/Qwen3.5-4B-MLX-4bit` | `z-lab/Qwen3.5-4B-DFlash` | [2026-04-19 default-on ship](../experience/wins/2026-04-19-metal-qwen35-concurrent-dflash-default-on.md), [2026-04-20 prefill fast-forward](../experience/wins/2026-04-20-dflash-prefill-fastforward.md), [2026-04-20 batched `async_eval`](../experience/wins/2026-04-20-dflash-batched-async-eval.md) |
+| `mlx-community/Qwen3.5-4B-MLX-4bit` | `z-lab/Qwen3.5-4B-DFlash` | 2026-04-19 default-on ship, 2026-04-20 prefill fast-forward, 2026-04-20 batched `async_eval` |
 | `mlx-community/Qwen3.6-35B-A3B-4bit` | `z-lab/Qwen3.6-35B-A3B-DFlash` | local smoke + single-request DFlash landing in `feat(metal): support qwen36 dflash draft` |
 | `mlx-community/Qwen3-4B-bf16` | `z-lab/Qwen3-4B-DFlash-b16` | 2026-04-14 Qwen3 5.9× decode bench (entry retired 2026-04-25 truth-surface cleanup) |
 
@@ -282,6 +282,6 @@ needs only config + weights.
 
 - [`metal-dflash-params.md`](metal-dflash-params.md) — full parameter table
 - [`profiling-guide.md`](profiling-guide.md) — GPU profiling playbook
-- [`../experience/wins/2026-04-19-metal-qwen35-final-state.md`](../experience/wins/2026-04-19-metal-qwen35-final-state.md) — terminal state of the Qwen3.5 DFlash arc
-- [`../experience/errors/2026-04-19-dflash-long-prompt-prefill-chunking-desync.md`](../experience/errors/2026-04-19-dflash-long-prompt-prefill-chunking-desync.md) — root cause for the prefill fast-forward fix
+- `../experience/wins/2026-04-19-metal-qwen35-final-state.md` — terminal state of the Qwen3.5 DFlash arc
+- `../experience/errors/2026-04-19-dflash-long-prompt-prefill-chunking-desync.md` — root cause for the prefill fast-forward fix
 - Code: `infer/src/backend/metal/dflash.rs`, `scheduler.rs::fast_forward_prefill`, `crates/mlx-sys/src/mlx_dflash_draft_model.cpp`

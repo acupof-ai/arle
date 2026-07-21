@@ -120,7 +120,7 @@ the win comes from exposing it, not from inventing new behavior.
 - **Quality eval** for top_k=6: small MMLU/HumanEval subset on
   Qwen3.6 35B-A3B-4bit. Defer flag-flip-to-default until quality
   delta confirmed <3%.
-- **M_e.7 MTP head wiring** ([`docs/plans/M_e7-mtp-head-wiring.md`](../../plans/M_e7-mtp-head-wiring.md))
+- **M_e.7 MTP head wiring** (`docs/plans/M_e7-mtp-head-wiring.md`)
   remains the highest-ROI next-tier lever (predicted ~40% c=1
   reduction, multiplicative with M_e.4 + this commit).
 - **DFlash with tiny dense draft** unblocked by today's M_e.6
@@ -134,4 +134,4 @@ the win comes from exposing it, not from inventing new behavior.
 - vllm-mlx README: `--moe-top-k` flag.
 - Predecessor (encode-bottleneck localization that explains why this
   works):
-  [`2026-05-07-bench-qwen36-encode-bottleneck.md`](2026-05-07-bench-qwen36-encode-bottleneck.md)
+  `2026-05-07-bench-qwen36-encode-bottleneck.md`

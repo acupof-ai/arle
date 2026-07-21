@@ -17,7 +17,7 @@
 >
 > Current state and full audit numbers (incl. 4×4 and 4×16 grids,
 > token traces, and the V100 substrate unblock) live in
-> [`2026-05-28-int4-kv-two-level-k.md`](2026-05-28-int4-kv-two-level-k.md).
+> `2026-05-28-int4-kv-two-level-k.md`.
 > Read that entry, not this one, for current INT4 KV behavior. This
 > PoC stays in the tree only as a historical "what symmetric +
 > per-channel-only looked like" reference.
@@ -31,7 +31,7 @@
 ## Context
 
 After INT8 + FP8 KIVI shipped bit-identical with BF16 on V100 (see
-[`2026-05-27-int8-kv-kivi-per-channel-k-fix.md`](2026-05-27-int8-kv-kivi-per-channel-k-fix.md)),
+`2026-05-27-int8-kv-kivi-per-channel-k-fix.md`),
 the obvious follow-up axis was 4-bit. ARLE already has TQ4 (4-bit
 packed + Hadamard rotation + FP16 group norms) but it doesn't run on
 V100's sm_70 wrapper. The empirical question for the 4-bit slot: does
@@ -154,9 +154,9 @@ where it crosses; this PoC's data is consistent.
 ## Related
 
 - Commit `d36c528f` — INT4 + KIVI PoC implementation.
-- [`docs/experience/wins/2026-05-27-int8-kv-kivi-per-channel-k-fix.md`](2026-05-27-int8-kv-kivi-per-channel-k-fix.md)
+- `docs/experience/wins/2026-05-27-int8-kv-kivi-per-channel-k-fix.md`
   — INT8 KIVI fix that the INT4 path direct-mirrors.
-- [`docs/experience/wins/2026-05-27-v100-kv-precision-parity-qwen35-4b.md`](2026-05-27-v100-kv-precision-parity-qwen35-4b.md)
+- `docs/experience/wins/2026-05-27-v100-kv-precision-parity-qwen35-4b.md`
   — V100 audit infrastructure this PoC reuses.
 - [`docs/quantization.md`](../../quantization.md) §1.4 — TQ family
   (TQ2/TQ3/TQ4) Hadamard description.

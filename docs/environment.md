@@ -79,9 +79,9 @@ Deferred (read site inside frozen DSv4 files this pass):
 
 - Prefer `ARLE_*` for newly documented user-facing CLI/runtime behavior.
 - Treat `AGENT_INFER_*` as legacy compatibility names unless this document
-  explicitly calls them out as the current canonical surface.
+ explicitly calls them out as the current canonical surface.
 - Treat `INFER_*` primarily as build, test, or compatibility variables unless
-  documented otherwise.
+ documented otherwise.
 - Treat undocumented variables as internal or experimental.
 
 ---
@@ -107,9 +107,9 @@ full dep rebuild every switch. Pin one dir per lane (disk ~3×, pruned by
 `cargo sweep`):
 
 ```bash
-CARGO_TARGET_DIR=target/lane-cuda  CUDARC_CUDA_VERSION=12080 cargo check -p infer-api --release --no-default-features --features cuda,no-cuda --lib
-CARGO_TARGET_DIR=target/lane-metal cargo test  -p cli       --release --no-default-features --features metal,no-cuda
-CARGO_TARGET_DIR=target/lane-cpu   cargo test  -p arle      --release --no-default-features --features cpu,no-cuda,cli
+CARGO_TARGET_DIR=target/lane-cuda CUDARC_CUDA_VERSION=12080 cargo check -p infer-api --release --no-default-features --features cuda,no-cuda --lib
+CARGO_TARGET_DIR=target/lane-metal cargo test -p cli --release --no-default-features --features metal,no-cuda
+CARGO_TARGET_DIR=target/lane-cpu cargo test -p arle --release --no-default-features --features cpu,no-cuda,cli
 ```
 
 Host-only unit tests (cli / infer-api) may drop `--release`: debug builds are
@@ -204,9 +204,9 @@ override.
 
 For `mlx-community/Qwen3.6-35B-A3B-4bit` (default top_k=8):
 - `INFER_MOE_TOP_K=6` cut c=4 ITL p50 by **−21.4%** (28880 → 22694
-  μs) and c=8 by **−9.9%** (41108 → 37044 μs). Quality cost ~3%
-  MMLU drop per upstream `vllm-mlx` reports on similar MoE models; not
-  validated for Qwen3.6 specifically.
+ μs) and c=8 by **−9.9%** (41108 → 37044 μs). Quality cost ~3%
+ MMLU drop per upstream `vllm-mlx` reports on similar MoE models; not
+ validated for Qwen3.6 specifically.
 
 Mirrors `vllm-mlx`'s `--moe-top-k` flag. Use for latency-critical
 chat / code workloads; keep the default for evaluation /
@@ -215,8 +215,8 @@ quality-sensitive paths. See
 
 ```bash
 INFER_MOE_TOP_K=6 ./target/release/arle serve --backend metal \
-  --model-path mlx-community/Qwen3.6-35B-A3B-4bit \
-  --port 8765 -- --max-running-requests 16
+ --model-path mlx-community/Qwen3.6-35B-A3B-4bit \
+ --port 8765 -- --max-running-requests 16
 ```
 
 ### `MLX_MAX_OPS_PER_BUFFER` / `MLX_MAX_MB_PER_BUFFER` (MLX upstream)
@@ -228,15 +228,15 @@ bench at c≥8**: export `MLX_MAX_OPS_PER_BUFFER=200
 MLX_MAX_MB_PER_BUFFER=200`. With Qwen3.6 MoE forward at c≥8, the MLX
 defaults force 4–5 implicit `commandBuffer.commit()` per decode step;
 boosting them collapses the cliff at c=8→c=10. Per
-[`docs/research/2026-05-07-mlx-ecosystem-survey-c4-itl-gap.md`](research/2026-05-07-mlx-ecosystem-survey-c4-itl-gap.md)
+`docs/research/2026-05-07-mlx-ecosystem-survey-c4-itl-gap.md`
 technique #2.
 
 ```bash
 MLX_MAX_OPS_PER_BUFFER=200 \
 MLX_MAX_MB_PER_BUFFER=200 \
 ./target/release/arle serve --backend metal \
-  --model-path mlx-community/Qwen3.6-35B-A3B-4bit \
-  --port 8765 -- --max-running-requests 16
+ --model-path mlx-community/Qwen3.6-35B-A3B-4bit \
+ --port 8765 -- --max-running-requests 16
 ```
 
 ### DiffusionGemma Metal diagnostics
@@ -254,12 +254,12 @@ output tok/s but are not a quality-preserving default unless separately gated.
 
 ```bash
 ARLE_DIFFUSION_CPP_PROFILE=0 ./target/release/arle \
-  --model-path mlx-community/diffusiongemma-26B-A4B-it-4bit \
-  --max-tokens 64 --non-interactive run --prompt "Say hi" --no-tools
+ --model-path mlx-community/diffusiongemma-26B-A4B-it-4bit \
+ --max-tokens 64 --non-interactive run --prompt "Say hi" --no-tools
 
 ./target/release/arle serve --diffusion-max-denoising-steps 4 \
-  --backend metal \
-  --model-path mlx-community/diffusiongemma-26B-A4B-it-4bit
+ --backend metal \
+ --model-path mlx-community/diffusiongemma-26B-A4B-it-4bit
 ```
 
 ### `AGENT_INFER_GDR_METAL_KERNEL`
@@ -295,12 +295,12 @@ Single-GPU runtime path (default): one `DeviceContext::new()` per process,
 honours this variable.
 
 Multi-GPU TP path (F1+, see
-[`docs/plans/2026-04-28-single-node-multi-gpu.md`](plans/2026-04-28-single-node-multi-gpu.md)):
+`docs/plans/2026-04-28-single-node-multi-gpu.md`):
 each rank thread bypasses this variable and calls
 `DeviceContext::on_device(ordinal)` directly with its assigned ordinal.
 
 ```bash
-export INFER_CUDA_DEVICE=1   # bind default context to GPU 1
+export INFER_CUDA_DEVICE=1 # bind default context to GPU 1
 ```
 
 ### Single-node multi-GPU topology variables (F0.11)
@@ -327,31 +327,31 @@ Current DSv4 parser acceptance rules:
 
 - `INFER_CUDA_DEVICES` length must be at least the local rank count.
 - For SGLang-style axes, `world_size = INFER_TP_SIZE * INFER_PP_SIZE`.
-  `INFER_ATTN_DP_SIZE * INFER_ATTN_CP_SIZE` must divide `INFER_TP_SIZE`, and
-  `INFER_EP_SIZE * INFER_MOE_DP_SIZE` must divide `INFER_TP_SIZE`.
+ `INFER_ATTN_DP_SIZE * INFER_ATTN_CP_SIZE` must divide `INFER_TP_SIZE`, and
+ `INFER_EP_SIZE * INFER_MOE_DP_SIZE` must divide `INFER_TP_SIZE`.
 - Current ARLE DSv4 execution also preserves legacy TP-only and EP-only
-  overrides where each of `INFER_TP_SIZE` and `INFER_EP_SIZE` is either `1` or
-  the CUDA worker count.
+ overrides where each of `INFER_TP_SIZE` and `INFER_EP_SIZE` is either `1` or
+ the CUDA worker count.
 - Today's executable DSv4 path accepts only global TP/EP-style layouts for
-  execution. Rich SGLang axes are parsed so that explicit path claims can fail
-  closed with a clear error instead of silently running the replicated-token
-  route.
+ execution. Rich SGLang axes are parsed so that explicit path claims can fail
+ closed with a clear error instead of silently running the replicated-token
+ route.
 - Multi-rank values are rejected if CUDA was not built in, NCCL was not enabled
-  for a path that needs collectives, or the machine exposes fewer devices than
-  requested.
+ for a path that needs collectives, or the machine exposes fewer devices than
+ requested.
 - `INFER_CUDA_DEVICE` and `INFER_CUDA_DEVICES` should not both be used for a
-  multi-rank run. `INFER_CUDA_DEVICE` is the single-rank compatibility knob;
-  `INFER_CUDA_DEVICES` is the ordered multi-rank map.
+ multi-rank run. `INFER_CUDA_DEVICE` is the single-rank compatibility knob;
+ `INFER_CUDA_DEVICES` is the ordered multi-rank map.
 
 Examples of combinations that F1+ bootstrap must reject:
 
 ```bash
-INFER_TP_SIZE=2 INFER_CUDA_DEVICES=0          # TP=2 but one local device
+INFER_TP_SIZE=2 INFER_CUDA_DEVICES=0 # TP=2 but one local device
 INFER_TP_SIZE=2 INFER_PP_SIZE=2 INFER_CUDA_DEVICES=0,1
 # product world size is 4, but only two local devices are listed
 
-INFER_TP_SIZE=2 INFER_CUDA_DEVICES=0,0        # duplicate device ordinal
-INFER_NCCL_PORT=0                             # invalid TCP port for rendezvous
+INFER_TP_SIZE=2 INFER_CUDA_DEVICES=0,0 # duplicate device ordinal
+INFER_NCCL_PORT=0 # invalid TCP port for rendezvous
 ```
 
 When the F1+ parser lands, startup logging must print the parsed topology before
@@ -359,19 +359,19 @@ model load so bad jobs fail with actionable context. Expected shape:
 
 ```text
 multi_gpu_config:
-  cuda_devices=[0,1]
-  tp_size=2 pp_size=1 ep_size=1 attn_dp=1 attn_cp=1 moe_dp=1
-  world_size=2 nccl_port=29500
-  status=accepted
+ cuda_devices=[0,1]
+ tp_size=2 pp_size=1 ep_size=1 attn_dp=1 attn_cp=1 moe_dp=1
+ world_size=2 nccl_port=29500
+ status=accepted
 ```
 
 For today's single-rank runtime, the equivalent effective topology is:
 
 ```text
 multi_gpu_config:
-  cuda_devices=[INFER_CUDA_DEVICE or 0]
-  tp_size=1 pp_size=1 ep_size=1 attn_dp=1 attn_cp=1
-  world_size=1 status=single-rank
+ cuda_devices=[INFER_CUDA_DEVICE or 0]
+ tp_size=1 pp_size=1 ep_size=1 attn_dp=1 attn_cp=1
+ world_size=1 status=single-rank
 ```
 
 ### DeepSeek V4 distributed CUDA debug variables
@@ -460,25 +460,25 @@ SGLang convention. Consumed by
 Accepted formats (any combination per token; separators `;` `,` whitespace):
 
 ```bash
-export TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0"          # PyTorch native
-export TORCH_CUDA_ARCH_LIST="8.0 9.0"                  # space-separated
-export TORCH_CUDA_ARCH_LIST="80;90"                    # packed integer
-export TORCH_CUDA_ARCH_LIST="sm_80;sm_90"              # nvcc style
-export TORCH_CUDA_ARCH_LIST="9.0+PTX"                  # PyTorch +PTX suffix
-export CMAKE_CUDA_ARCHITECTURES="80;86;89;90"          # CMake alias
+export TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0" # PyTorch native
+export TORCH_CUDA_ARCH_LIST="8.0 9.0" # space-separated
+export TORCH_CUDA_ARCH_LIST="80;90" # packed integer
+export TORCH_CUDA_ARCH_LIST="sm_80;sm_90" # nvcc style
+export TORCH_CUDA_ARCH_LIST="9.0+PTX" # PyTorch +PTX suffix
+export CMAKE_CUDA_ARCHITECTURES="80;86;89;90" # CMake alias
 ```
 
-**Tier policy** (see [`plans/sm-coverage.md`](plans/sm-coverage.md)):
+**Tier policy** (see [`plans/sm-coverage.md`](environment.md)):
 
 - T1 (default): `sm_80 / 86 / 89 / 90` — A100 / A10·3090 / L4·4090 / H100.
-- T2 (opt-in):  `sm_100 / 120` — B100·B200 / RTX 5090. Must be requested
-  explicitly via `TORCH_CUDA_ARCH_LIST`; not auto-included.
+- T2 (opt-in): `sm_100 / 120` — B100·B200 / RTX 5090. Must be requested
+ explicitly via `TORCH_CUDA_ARCH_LIST`; not auto-included.
 - Legacy Volta (opt-in): `sm_70` — V100. Supported as a **separate
-  SM-pinned build**: set `TORCH_CUDA_ARCH_LIST="7.0"` (or `"70"`) alone —
-  it cannot be mixed with T1/T2 targets, otherwise build errors with
-  "sm_70 legacy Volta builds must be SM-pinned". Only BF16 Qwen3.5
-  dense-attention + GDR cubins are functional; FP8 KV and DSv4 HD64
-  wrappers return `CUDA_ERROR_NOT_SUPPORTED` (build emits a warning).
+ SM-pinned build**: set `TORCH_CUDA_ARCH_LIST="7.0"` (or `"70"`) alone —
+ it cannot be mixed with T1/T2 targets, otherwise build errors with
+ "sm_70 legacy Volta builds must be SM-pinned". Only BF16 Qwen3.5
+ dense-attention + GDR cubins are functional; FP8 KV and DSv4 HD64
+ wrappers return `CUDA_ERROR_NOT_SUPPORTED` (build emits a warning).
 - T4 (`sm_75`) and older (`sm < 70`) are **rejected** — build panics.
 
 **Difference from PyTorch.** PyTorch is best-effort (warns + skips when
@@ -522,9 +522,9 @@ Override model path for infer-side GPU tests.
 
 **Backend defaults**:
 - **Metal**: `mlx-community/Qwen3.6-35B-A3B-4bit` (canonical, see
-  `AGENTS.md` §"Metal canonical model"). Use `INFER_TEST_MODEL_PATH`
-  to opt down to a smaller model for fast iteration on dense-only
-  paths.
+ `AGENTS.md` §"Metal canonical model"). Use `INFER_TEST_MODEL_PATH`
+ to opt down to a smaller model for fast iteration on dense-only
+ paths.
 - **CUDA**: `models/Qwen3.5-4B` (canonical for CUDA bench/test scripts).
 
 Example:
@@ -535,8 +535,8 @@ INFER_TEST_MODEL_PATH=models/Qwen3.5-4B cargo test --release --test e2e
 
 # Metal — bench the canonical Qwen3.6 35B-A3B MoE:
 ./target/release/arle serve --backend metal \
-  --model-path mlx-community/Qwen3.6-35B-A3B-4bit \
-  --port 8765 -- --max-running-requests 16
+ --model-path mlx-community/Qwen3.6-35B-A3B-4bit \
+ --port 8765 -- --max-running-requests 16
 ```
 
 ### `INFER_URL`
@@ -614,31 +614,31 @@ docs promote them more clearly:
 
 - `AGENT_INFER_GDR_METAL_KERNEL`
 - `AGENT_INFER_QWEN35_CPP_SEPARATE` — toggle the Rust→C++ separate-proj
-  path in `crates/infer-metal/src/qwen35.rs`. Default on; set to `0`
-  to force the fused route for A/B comparison
+ path in `crates/infer-metal/src/qwen35.rs`. Default on; set to `0`
+ to force the fused route for A/B comparison
 - `AGENT_INFER_QWEN35_CPP_KEEP_PREFILL_INTERMEDIATES` — keep prefill
-  intermediate tensors in the Qwen3.5 C++ step model (`mlx_qwen35_model.cpp`)
-  for debugging; default off
+ intermediate tensors in the Qwen3.5 C++ step model (`mlx_qwen35_model.cpp`)
+ for debugging; default off
 - `AGENT_INFER_QWEN35_CPP_CLEAR_CACHE` — force MLX cache clears between
-  Qwen3.5 C++ steps
+ Qwen3.5 C++ steps
 - `AGENT_INFER_QWEN35_CPP_PREFILL_LAST_LOGITS_ONLY` — only materialize
-  the last token's logits during prefill (default on for the C++ path)
+ the last token's logits during prefill (default on for the C++ path)
 - `AGENT_INFER_QWEN35_CPP_SEPARATE_MLP` — split the MLP evaluation into
-  separate up/gate/down passes instead of the fused path
+ separate up/gate/down passes instead of the fused path
 - `AGENT_INFER_QWEN35_CPP_PREFILL_GBETA_HELPER` — toggle the helper-kernel
-  g-beta variant during Qwen3.5 prefill
+ g-beta variant during Qwen3.5 prefill
 - `AGENT_INFER_QWEN35_CPP_QK_NORM_HELPER` — opt into the helper-kernel
-  Q/K norm variant during Qwen3.5 GDR execution; default off because the
-  native MLX `fast::rms_norm(...) * scale` lowering is faster on the
-  Qwen3.5-0.8B MLX 4bit single-request path
+ Q/K norm variant during Qwen3.5 GDR execution; default off because the
+ native MLX `fast::rms_norm(...) * scale` lowering is faster on the
+ Qwen3.5-0.8B MLX 4bit single-request path
 - `AGENT_INFER_METAL_GGUF_NATIVE_Q4` — controls Qwen3.5 Metal GGUF
-  load-time conversion for packed K-quant tensors. Default is `off`, keeping
-  exact GGUF affine/packed behavior for correctness. Set to `all` / `1` /
-  `true` for the lossy MLX native q4 group64 speed path
+ load-time conversion for packed K-quant tensors. Default is `off`, keeping
+ exact GGUF affine/packed behavior for correctness. Set to `all` / `1` /
+ `true` for the lossy MLX native q4 group64 speed path
 - `AGENT_INFER_QWEN35_CPP_GDR_TG_Y` /
-  `AGENT_INFER_QWEN35_CPP_PREFILL_GDR_TG_Y` /
-  `AGENT_INFER_QWEN35_CPP_DECODE_GDR_TG_Y` — Gated Delta Rule tile-Y
-  size tuning knobs for the Qwen3.5 C++ recurrent-state path
+ `AGENT_INFER_QWEN35_CPP_PREFILL_GDR_TG_Y` /
+ `AGENT_INFER_QWEN35_CPP_DECODE_GDR_TG_Y` — Gated Delta Rule tile-Y
+ size tuning knobs for the Qwen3.5 C++ recurrent-state path
 
 All `AGENT_INFER_QWEN35_CPP_*` knobs are internal C++ bridge debugging
 aids; they are not part of any stable contract and may be renamed or

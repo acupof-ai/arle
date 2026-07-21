@@ -1,36 +1,36 @@
 <p align="center">
-  <img src="docs/assets/caret-counter-lockup.svg" height="56" alt="arle">
+ <img src="docs/assets/caret-counter-lockup.svg" height="56" alt="arle">
 </p>
 
 <p align="center">
-  <b>Pure-Rust LLM engine: serving, agents, and on-policy distillation — on Apple Silicon and NVIDIA. No Python on the hot path.</b>
+ <b>Pure-Rust LLM engine: serving, agents, and on-policy distillation — on Apple Silicon and NVIDIA. No Python on the hot path.</b>
 </p>
 
 <p align="center">
-  <sub>35B MoE at <b>85 tok/s</b> on a MacBook · <b>bit-identical</b> speculative decode · OPD lifts 4B student <b>+27pp</b> on MATH-500</sub>
+ <sub>35B MoE at <b>85 tok/s</b> on a MacBook · <b>bit-identical</b> speculative decode · OPD lifts 4B student <b>+27pp</b> on MATH-500</sub>
 </p>
 
 <p align="center">
-  <a href="https://cklxx.github.io/arle/"><img src="https://img.shields.io/badge/website-cklxx.github.io%2Farle-D97757?style=flat-square" alt="Website"></a>
-  <a href="https://github.com/cklxx/arle/actions/workflows/ci.yml"><img src="https://github.com/cklxx/arle/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <a href="https://github.com/cklxx/arle/actions/workflows/metal-ci.yml"><img src="https://github.com/cklxx/arle/actions/workflows/metal-ci.yml/badge.svg" alt="Metal CI"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License"></a>
-  <a href="https://github.com/cklxx/arle/releases"><img src="https://img.shields.io/github/v/release/arle?include_prereleases" alt="Release"></a>
+ <a href="https://cklxx.github.io/arle/"><img src="https://img.shields.io/badge/website-cklxx.github.io%2Farle-D97757?style=flat-square" alt="Website"></a>
+ <a href="https://github.com/cklxx/arle/actions/workflows/ci.yml"><img src="https://github.com/cklxx/arle/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+ <a href="https://github.com/cklxx/arle/actions/workflows/metal-ci.yml"><img src="https://github.com/cklxx/arle/actions/workflows/metal-ci.yml/badge.svg" alt="Metal CI"></a>
+ <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License"></a>
+ <a href="https://github.com/cklxx/arle/releases"><img src="https://img.shields.io/github/v/release/arle?include_prereleases" alt="Release"></a>
 </p>
 
 <p align="center">
-  <a href="#quick-start">Quick Start</a> ·
-  <a href="#performance">Performance</a> ·
-  <a href="#why-arle">Why ARLE</a> ·
-  <a href="docs/http-api.md">HTTP API</a> ·
-  <a href="docs/support-matrix.md">Support Matrix</a> ·
-  <a href="docs/architecture.md">Architecture</a> ·
-  <a href="ROADMAP.md">Roadmap</a> ·
-  <a href="CHANGELOG.md">Changelog</a>
+ <a href="#quick-start">Quick Start</a> ·
+ <a href="#performance">Performance</a> ·
+ <a href="#why-arle">Why ARLE</a> ·
+ <a href="docs/http-api.md">HTTP API</a> ·
+ <a href="docs/support-matrix.md">Support Matrix</a> ·
+ <a href="docs/architecture.md">Architecture</a> ·
+ <a href="ROADMAP.md">Roadmap</a> ·
+ <a href="CHANGELOG.md">Changelog</a>
 </p>
 
 <p align="center">
-  <strong>English</strong> · <a href="README.zh-CN.md">简体中文</a>
+ <strong>English</strong> · <a href="README.zh-CN.md">简体中文</a>
 </p>
 
 ---
@@ -48,7 +48,7 @@ curl -fsSL https://github.com/cklxx/arle/releases/latest/download/install.sh | s
 
 # Linux + NVIDIA (Docker, no compile needed)
 docker run --rm --gpus all -p 8000:8000 -v $PWD/models:/models:ro \
-  ghcr.io/cklxx/arle:latest serve --backend cuda --model-path /models/Qwen3.5-4B
+ ghcr.io/cklxx/arle:latest serve --backend cuda --model-path /models/Qwen3.5-4B
 ```
 
 ### Serve
@@ -62,9 +62,9 @@ arle serve --backend metal --model-path mlx-community/Qwen3.6-35B-A3B-4bit --por
 
 # DSpark block-drafter decode + in-process Markov-head training (CUDA)
 arle serve --backend cuda \
-  --model-path /path/to/Qwen3.6-27B \
-  --spec-type dspark --mtp-draft-model /path/to/dspark-draft \
-  --dspark-train --port 8000
+ --model-path /path/to/Qwen3.6-27B \
+ --spec-type dspark --mtp-draft-model /path/to/dspark-draft \
+ --dspark-train --port 8000
 ```
 
 ### Use
@@ -74,8 +74,8 @@ from openai import OpenAI
 
 client = OpenAI(base_url="http://localhost:8000/v1", api_key="not-needed")
 print(client.chat.completions.create(
-    model="default",
-    messages=[{"role": "user", "content": "Hello from ARLE"}],
+ model="default",
+ messages=[{"role": "user", "content": "Hello from ARLE"}],
 ).choices[0].message.content)
 ```
 
@@ -160,33 +160,33 @@ Agent and RL workloads re-process the same prompt + history + tool output every 
 
 ```mermaid
 flowchart TB
-  classDef entry fill:#1a1a2e,stroke:#e94560,color:#eee,rx:8,ry:8
-  classDef core fill:#0f3460,stroke:#e94560,color:#eee,rx:8,ry:8
-  classDef seam fill:#533483,stroke:#e94560,color:#eee,rx:8,ry:8
-  classDef exec fill:#190e36,stroke:#4ecca3,color:#eee,rx:8,ry:8
+ classDef entry fill:#1a1a2e,stroke:#e94560,color:#eee,rx:8,ry:8
+ classDef core fill:#0f3460,stroke:#e94560,color:#eee,rx:8,ry:8
+ classDef seam fill:#533483,stroke:#e94560,color:#eee,rx:8,ry:8
+ classDef exec fill:#190e36,stroke:#4ecca3,color:#eee,rx:8,ry:8
 
-  Serve["arle serve<br/><sub>OpenAI v1</sub>"]
-  Agent["arle<br/><sub>local agent</sub>"]
-  Train["arle train opd<br/><sub>OPD</sub>"]
+ Serve["arle serve<br/><sub>OpenAI v1</sub>"]
+ Agent["arle<br/><sub>local agent</sub>"]
+ Train["arle train opd<br/><sub>OPD</sub>"]
 
-  Core["infer-core<br/><sub>device-neutral Engine · scheduler · KV cache</sub>"]
+ Core["infer-core<br/><sub>device-neutral Engine · scheduler · KV cache</sub>"]
 
-  Seam["infer-seam<br/><sub>two traits: BackendExecutor · KvPool</sub>"]
+ Seam["infer-seam<br/><sub>two traits: BackendExecutor · KvPool</sub>"]
 
-  CUDA["infer-cuda<br/><sub>FlashMLA · DeepGEMM · DeepEP</sub>"]
-  Metal["infer-metal<br/><sub>MLX bridge</sub>"]
+ CUDA["infer-cuda<br/><sub>FlashMLA · DeepGEMM · DeepEP</sub>"]
+ Metal["infer-metal<br/><sub>MLX bridge</sub>"]
 
-  Serve --> Core
-  Agent --> Core
-  Train --> Core
-  Core --> Seam
-  Seam --> CUDA
-  Seam --> Metal
+ Serve --> Core
+ Agent --> Core
+ Train --> Core
+ Core --> Seam
+ Seam --> CUDA
+ Seam --> Metal
 
-  class Serve,Agent,Train entry
-  class Core core
-  class Seam seam
-  class CUDA,Metal exec
+ class Serve,Agent,Train entry
+ class Core core
+ class Seam seam
+ class CUDA,Metal exec
 ```
 
 One runtime, three surfaces, two pluggable backends. A new backend implements
