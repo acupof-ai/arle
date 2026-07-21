@@ -5,8 +5,10 @@
 //! training thread drains it and runs acceptance-weighted policy gradient against the acceptance reward.
 //!
 //! The capture runs AFTER the verify forward has completed, on already-computed
-//! data. It copies the logits to host (small: block_size × vocab bf16) and
-//! returns immediately. No sync, no blocking of the hot path.
+//! data. It copies the logits to host (small: block_size × vocab bf16) via a
+//! stream sync — the sync is bounded (it waits for the just-issued verify
+//! forward + the small D2H copy) but does add per-step latency. A fully async
+//! capture (separate stream + event fence) is future work.
 
 use std::collections::VecDeque;
 use std::sync::{Mutex, OnceLock};
@@ -108,9 +110,10 @@ fn hidden_states_to_host(ctx: &DeviceContext, hs: &HiddenStates) -> Vec<f32> {
 /// Called after `dspark_accept_commit` returns the accepted count `k`.
 /// `draft_logits` are the draft head's outputs (`scratch.logits`); `target_logits`
 /// are the trunk's verify outputs. Both are device-resident; this function copies
-/// them to host and pushes the tuple to the global buffer.
+/// them to host (via a stream sync) and pushes the tuple to the global buffer.
 ///
-/// Returns immediately on any error (the hot path must never block on capture).
+/// Best-effort: returns immediately on any error so a capture failure never
+/// aborts the decode step. The D2H copy + sync does add per-step latency.
 pub fn capture_dspark_experience(
     ctx: &DeviceContext,
     draft_tokens: &[u32],
@@ -134,6 +137,16 @@ pub fn capture_dspark_experience(
         return;
     }
     let vocab_size = draft_logits_host.len() / block_size;
+    // Validate target logits shape matches draft (block_size * vocab). A
+    // mismatch here would silently feed garbage to the trainer's L1 loss.
+    if target_logits_host.len() != block_size * vocab_size {
+        log::warn!(
+            "dspark_train: draft/target shape mismatch: draft_len={} target_len={} block_size={block_size} vocab={vocab_size}",
+            draft_logits_host.len(),
+            target_logits_host.len()
+        );
+        return;
+    }
     buffer().push(DsparkExperience {
         draft_tokens: draft_tokens.to_vec(),
         draft_logits: draft_logits_host,
@@ -144,8 +157,9 @@ pub fn capture_dspark_experience(
     });
 }
 
-/// DSv4 variant: target logits are a `[vocab, total_m]` `HiddenStates`; only
-/// columns `[col_offset, col_offset + col_len)` belong to this slot.
+/// DSv4 variant: target logits are a `[total_m, vocab]` `HiddenStates`
+/// (`seq_len` = total tokens across all slots, `hidden_dim` = vocab); only
+/// rows `[col_offset, col_offset + col_len)` belong to this slot.
 pub fn capture_dspark_experience_hidden(
     ctx: &DeviceContext,
     draft_tokens: &[u32],
@@ -159,9 +173,17 @@ pub fn capture_dspark_experience_hidden(
     if block_size == 0 || col_len == 0 {
         return;
     }
-    let draft_logits_host = hidden_states_to_host(ctx, draft_logits);
-    // Slice the target logits to this slot's columns: [col_offset, col_offset+col_len).
     let vocab = target_logits.hidden_dim;
+    // Validate the slice is within bounds before touching device memory.
+    if col_offset + col_len > target_logits.seq_len {
+        log::warn!(
+            "dspark_train: target logits slice out of bounds: offset={col_offset} len={col_len} seq_len={}",
+            target_logits.seq_len
+        );
+        return;
+    }
+    let draft_logits_host = hidden_states_to_host(ctx, draft_logits);
+    // Slice the target logits to this slot's rows: [col_offset, col_offset+col_len).
     let byte_off = col_offset * vocab * std::mem::size_of::<bf16>();
     let byte_len = col_len * vocab * std::mem::size_of::<bf16>();
     let target_logits_host: Vec<f32> = match ctx
@@ -180,7 +202,16 @@ pub fn capture_dspark_experience_hidden(
     if draft_logits_host.is_empty() || target_logits_host.is_empty() {
         return;
     }
+    // Validate draft/target vocab agree before pushing (a mismatch here means
+    // the slice above grabbed the wrong rows and would silently corrupt training).
     let vocab_size = draft_logits_host.len() / block_size;
+    if target_logits_host.len() != col_len * vocab_size {
+        log::warn!(
+            "dspark_train: draft/target vocab mismatch: draft_vocab={vocab_size} target_len={} col_len={col_len}",
+            target_logits_host.len()
+        );
+        return;
+    }
     buffer().push(DsparkExperience {
         draft_tokens: draft_tokens.to_vec(),
         draft_logits: draft_logits_host,
