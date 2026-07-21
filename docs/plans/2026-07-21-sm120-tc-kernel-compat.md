@@ -194,79 +194,83 @@ every (B) claim.
 
 ## 6. (B) peak-perf plan — CUTLASS sm_120 block-scaled GEMM
 
-**Priority — MEASURED (baseline bench 2026-07-22,
-[wins](../experience/wins/2026-07-22-bench-sm120-fp8-moe-baseline.md)): the bottleneck is
-PREFILL, not decode.** `Qwen3.6-35B-A3B-FP8` on sm_120: cold prefill **~85 s / 3013 tok =
-~35 tok/s** on the scalar/dequant FP8 fallback (no tensor-core FP8 GEMM); decode ITL ~11 ms
-(~90 tok/s) is already healthy; c=16 collapses on prefill starvation. **This corrects the
-earlier "decode → G2 dominates" FLOP guess** — at PREFILL (M=3013) the dense projections
-are large-M on the *worst* fallback (dequant→BF16), so:
-- **Cut-2 (dense block-scaled) is BOTH the de-risk AND the first prefill win** — do it
-  first. It attacks the large-M dense-proj GEMM currently on dequant→BF16, and proves the
-  shared **CUTLASS sm_120 block-scaled collective** + FFI + dispatch + sm_120a build on the
-  simpler (dense) shape.
-- **G2 (MoE grouped block-scaled) follows** — reuses that collective wrapped for
-  grouped/segmented `m_grouped`, attacking the large-M MoE prefill (hand-grouped fallback).
-- Build order = win order = **Cut-2 → G2**.
-- **Cut-2 gate — CUTLASS version:** the sm_120a block-scaled collectives (example-79) need
-  CUTLASS ≥ 3.8. The build pulls CUTLASS from `vendor/flashmla/csrc/cutlass/` OR DeepGEMM's
-  `third-party/cutlass/` OR TileLang's `3rdparty/cutlass/` (build.rs:2576/2124/1167) —
-  **confirm the bundled tag has the sm_120a collectives on the VM before writing the
-  kernel**; a bump may be needed. An nsys prefill breakdown (dense-proj vs MoE-grouped vs
-  attention share at M=3013) refines the Cut-2/G2 effort split but does not block Cut-2.
+**Priority — MEASURED, three corrections converged (baseline bench + nsys, 2026-07-22,
+[wins](../experience/wins/2026-07-22-bench-sm120-fp8-moe-baseline.md)). The ONE target is
+G2 = the MoE grouped GEMM. Cut-2 (dense) is ~0.04% — skip it.**
+- The bottleneck is **PREFILL** (cold ~85 s / 3013 tok = ~35 tok/s; decode ITL ~11 ms is
+  already healthy; c=16 collapses on prefill starvation).
+- nsys prefill breakdown: **~99.5% is the MoE grouped GEMM** —
+  `fp8_f32_block_grouped_gemv_batch` + `_pair_batch` = 91.66 s of 92 s. **Dense projections
+  (Cut-2 target) = ~0.04%** (already bf16 CUTLASS GEMM). Linear-attn ~0.4%, attn <0.001%.
+- **Why so slow:** the sm_120 MoE path fell to the **hand-grouped fallback** because
+  DeepGEMM native won't compile for sm_120 (`loader.rs:1393`, Hopper-only). That fallback is
+  **GEMV-shaped** (per-token batched GEMV, no tensor cores, no M-batching across a group's
+  tokens) — pathological at prefill M=3013.
+- **G2 = replace the hand-grouped GEMV with the CUTLASS sm_120 grouped blockwise-scaling
+  collective** (real FP8 tensor-core grouped GEMM). Est. 10–50× on the MoE prefill (GEMV →
+  tensor-core grouped GEMM) → prefill ~35 tok/s could reach the 100s–1000s tok/s range.
+- **Cut-2 (dense) is dropped as a shippable kernel** — 0.04% headroom. Any collective
+  build/FFI/dispatch de-risk it would have provided is folded into G2's first compile.
 
-Grounded by the 4-stream deep research ([2026-07-22-sm120-fp8-peak-landscape.md](../research/2026-07-22-sm120-fp8-peak-landscape.md)).
-Correction to the first draft: the peak path is **NOT cuBLASLt** — cuBLASLt on sm_120
-is per-tensor only and runs at the *throttled* legacy-MMA rate (2×). The framework
-consensus (vLLM PR #22131, CUTLASS example-79) is the **CUTLASS sm_120 block-scaled
-collective** (`mma.sync…block_scale`), the only route to un-throttled ~4× over BF16.
+**Gates RESOLVED on the VM (no blockers to G2):**
+- **CUTLASS 4.3.5** ships in-repo at `crates/cuda-kernels/vendor/flashmla/csrc/cutlass`
+  (build.rs:2576) — **has the sm_120 grouped collectives**: `sm120_blockscaled_mma_array_tma.hpp`
+  + `sm120_mma_array_tma_blockwise_scaling.hpp` + `sm120_blockscaled_mma_builder.inl`.
+  **No CUTLASS bump.** Point the new `.cu`'s include at that tree.
+- **Scale format = 128×128 block, BF16 `weight_scale_inv`** (`weight_block_size=[128,128]`,
+  `fmt=e4m3`, `activation_scheme=dynamic`) — this is the DeepSeek-style **blockwise-scaling**
+  (float scale) collective family, NOT MXFP8/e8m0. Load-time work = **BF16→FP32 scale
+  widen only, no UE8M0 repack**.
 
-### Two cuts, evidence-ordered
-- **Cut 1 (prove the route, mature, ~2×)**: cuBLASLt **per-tensor** scaled FP8
-  (`CUDA_R_8F_E4M3` + `SCALAR_32F`), reusing the `gemv.cu:539` cuBLASLt scaffold.
-  Validates FFI + `major==12` dispatch + sm_120 build end-to-end. Numerics change
-  (per-tensor vs 128-block) — a prove-route, not the endpoint. cuBLASLt sm_120 needs
-  the **TN layout** (no non-TN MXFP8 today).
-- **Cut 2 (true peak, ~4×)**: adopt the **CUTLASS sm_120 block-scaled collective**
-  (integrate CUTLASS example-79c MXFP8 / the vLLM PR #22131 kernel as a new `.cu`),
-  consuming 128-block E4M3 with **UE8M0** scales. This is the adopt-vendored-first
-  path — not hand-written.
-- Floor: (A) dequant→BF16 stays the always-correct fallback for any shape/SM the FP8
-  route rejects.
+### G2 — CUTLASS sm_120 grouped blockwise-scaling MoE GEMM (the one deliverable)
 
-### Scale-format action item (blocks Cut 2)
-Confirm the checkpoint's 128-block scales are **UE8M0** (power-of-2) — then CUTLASS
-sm_120 takes them directly (vLLM `block_shape=[128,128]`). If arbitrary f32, a
-load-time requant to UE8M0 is required (a checkpoint with `scale_fmt ≠ ue8m0` crashes
-the block-scaled loader — [vLLM #47436](https://github.com/vllm-project/vllm/issues/47436)).
-DeepGEMM's own SM100 path already repacks to UE8M0, so the format likely exists.
+Replace the hand-grouped GEMV fallback (`quantized_gemv.cu:2865/2898`
+`fp8_f32_block_grouped_gemv_batch` / `_pair_batch`) with a real FP8 tensor-core grouped
+GEMM built on the vendored **CUTLASS 4.3.5** sm_120 array/grouped blockwise-scaling
+collective. This is the sm_120 replacement for the Hopper-only DeepGEMM
+`m_grouped_fp8_gemm_nt_contiguous` (which never compiles for sm_120).
 
-### file:line
-1. `crates/cuda-kernels/csrc/gemm/fp8_cutlass_sm120_gemm.cu` (new, Cut 2): adopt the
-   CUTLASS example-79c sm_120a block-scaled collective; inputs E4M3 + UE8M0 128-block
-   scales. Cut 1 interim: `fp8_cublaslt_gemm.cu` per-tensor on the `gemv.cu:539` scaffold.
-2. `crates/cuda-kernels/src/gemm.rs`: extern + safe wrapper.
-3. `crates/infer-cuda/src/ops/quant_linear.rs:538 gemm_batch`: insert a new
-   `try_fp8_<cublaslt|cutlass>_sm120_batch(ctx, weight, x, out)?` branch **between the
-   DeepGEMM arm (:551) and the dequant→BF16 arm (:556)**, gated `sm_major==12` &&
-   `Fp8BlockScaled`. Mirrors the existing `try_fp8_dequant_bf16_gemm_batch` shape
-   (returns `Ok(true)` when it handled the GEMM). **Dispatch-site branch, NOT a policy
-   enum edit** — the `Route`/`select_exact` path stays `Gemv`/`PackDeepGemm`; leaving the
-   `@generated qwen_fp8_dense_projection.rs` untouched is the lazier, lower-entropy form.
-5. **MoE grouped (G2)**: the sm_120 MoE path is the CUTLASS block-scaled **grouped**
-   GEMM (CUTLASS ex79d / vLLM), NOT DeepGEMM grouped. `moe.rs:537` gates on cache
-   presence, not SM — confirm sm_120 routes away from `dsv4_deepgemm_m_grouped_*`
-   (empirically via Pass B, then wire the CUTLASS grouped route).
-6. `build.rs`: new `.cu` auto-collected; needs CUTLASS sm_120a includes for Cut 2.
+Adopt-vendored-first: the collective already exists in-tree —
+`vendor/flashmla/csrc/cutlass/include/cutlass/gemm/collective/sm120_mma_array_tma_blockwise_scaling.hpp`
+(+ `sm120_blockscaled_mma_array_tma.hpp`, builder `sm120_blockscaled_mma_builder.inl`).
+Instantiate it; do not hand-write MMA.
+
+**file:line**
+1. `crates/cuda-kernels/csrc/gemm/fp8_moe_grouped_cutlass_sm120.cu` (new): instantiate the
+   sm_120a grouped blockwise-scaling collective. Signature mirrors
+   `cuda_moe::dsv4_deepgemm_m_grouped_fp8_gemm_nt_contiguous` (called at `moe.rs:1386/1434`;
+   reference impl `deepgemm_native.cu`) so it's a drop-in on the SAME grouped buffers:
+   E4M3 grouped weights (w13/down), E4M3 activations + **dynamic per-token** act scales
+   (`activation_scheme=dynamic` — reuse the existing FP8-activation quant the DeepGEMM path
+   already feeds), **128×128 weight scales widened BF16→FP32**, per-expert group offsets /
+   problem sizes (`m_grouped` contiguous layout).
+2. `crates/cuda-kernels/src/*.rs` (FFI) + `crates/infer-cuda/src/moe.rs` `mod cuda_moe`:
+   extern + safe wrapper, mirroring the `dsv4_deepgemm_m_grouped_*` binding.
+3. **Loader** (`loader.rs:~1391`): on sm_120, the DeepGEMM disable currently CLEARS the
+   grouped-B caches (`w13_fp8_grouped`/`down_fp8_grouped`) → `has_deepgemm_grouped=false`
+   (`moe.rs:537`) → hand-grouped GEMV. **Keep the grouped caches built on sm_120** (the
+   contiguous grouped memory layout is identical; only the GEMM callee changes) so the
+   grouped-contiguous route is taken.
+4. **Dispatch** (`moe.rs:539` `use_deepgemm`): add an sm_120 arm — when `major==12` &&
+   grouped caches present, route the expert GEMM to the CUTLASS grouped call instead of
+   `dsv4_deepgemm_m_grouped_*` (Hopper) and instead of the hand GEMV. Keep the existing
+   `QWEN35_DEEPGEMM_MIN_ROUTES` hybrid crossover (hand kernels still win tiny decode bands;
+   the CUTLASS grouped path is the prefill / large-R win).
+5. `build.rs`: collect the new `.cu` with **sm_120a** gencode (`compute_120a`), include path
+   = the flashmla cutlass tree (build.rs:2576). Guard so non-sm_120 builds skip it.
+
+**Scale format (resolved):** 128×128, BF16 `weight_scale_inv`, `fmt=e4m3` — the
+DeepSeek-style **blockwise-scaling** (float-scale) collective family, NOT MXFP8/e8m0. Only
+a BF16→FP32 widen at load; no UE8M0 repack.
 
 ### verify
-Colab sm_120. **Cut 1 is a route/perf smoke, NOT needle-gated** — per-tensor collapse of
-the 128-block scale shifts numerics by construction, so a needle miss is expected and is
-NOT grounds to revert; its only job is to prove the FFI + `major==12` dispatch + ~2× over
-BF16. **Cut 2 is the deployable path and MUST pass `needle_gate.py`** (block-scaled, numerics
-preserved), THEN `bench_throughput.py` vs the (A) dequant-BF16 arm AND vs Cut 1 — Cut 2 keeps
-a stable positive Δ (target ~2× over Cut 1, ~4× over BF16) or it is reverted. wins/ entry
-cites the Colab bench.
+Colab sm_120. **Correct-inference gate** (`needle_gate.py` + self-consistency: the CUTLASS
+grouped output's own autoregressive generation is the reference, vs the hand-grouped
+fallback envelope — MoE non-determinism forbids byte-identity). THEN `bench_throughput.py`
+1/4/8/16 vs the [baseline](../experience/wins/2026-07-22-bench-sm120-fp8-moe-baseline.md)
+(prefill ~35 tok/s → target multiples; the GEMV→tensor-core-grouped change is the win).
+A stable positive prefill Δ ships; wins/ entry cites the Colab bench. Floor: the hand
+grouped GEMV stays the always-correct fallback for shapes/SM the CUTLASS route rejects.
 
 ### Blackwell attention (deferred, second hotspot)
 GEMM dominates FLOPs; land the GEMM route first. Research verdict: **no Blackwell-native
