@@ -1969,6 +1969,13 @@ pub(crate) struct TrainAgentOpdArgs {
     #[arg(long, default_value_t = 1)]
     pub(crate) eval_every: usize,
 
+    /// Held-out eval task-level concurrency. Eval rollouts share the
+    /// continuous-batching serve engine but each blocks on host tool-exec, so a
+    /// serial eval leaves the GPU idle; N concurrent tasks keep it fed (~N×
+    /// faster). No policy update during eval → semantically identical to serial.
+    #[arg(long, default_value_t = 8)]
+    pub(crate) eval_concurrency: usize,
+
     /// Directory for the per-round eval dumps (eval_round{N}.jsonl with per-task
     /// pass/fail + the aggregate pass-rate). Defaults to --save-lora-adapters,
     /// then --save-checkpoint, then the current dir.
