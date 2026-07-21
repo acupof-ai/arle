@@ -1,0 +1,61 @@
+crates/cli/src/serve.rs
+  s_1b36017e58827d::t_29e1ce4a33864d 549-552
+crates/infer-cuda/src/dsv4.rs
+  s_099383ef79559d::t_bfcc7389db1379 5016
+crates/infer-cuda/src/executor/dsv4.rs
+  s_701dead3b9c2f3::t_4847bd2def1724 1960-1968,2008,2018,2090,2184-2202
+scripts/bench_throughput_chat.py
+  s_bb39aa6a03593e::t_1dd1cb43e885a1 1-506
+scripts/smoke_long_prompt.py
+  s_b4f29ff96e0a9f::t_6ba851e222d01c 1-43
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "36d5c38727cb32bb61741d9f1e00f8ada4dbe8d6",
+  "prompts": {},
+  "sessions": {
+    "s_099383ef79559d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4489c951-ff19-410c-a076-13320f5753c1",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_1b36017e58827d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a08abdc053b05388c",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_701dead3b9c2f3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4876ea73-5d7b-4a4e-a891-98c71325cbc0",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_b4f29ff96e0a9f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ad9e1bb3d6e5e4328",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_bb39aa6a03593e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a0a7877c3f1b7655e",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
