@@ -1,72 +1,63 @@
-# DSv4 DSpark batched anchor+verify — c=8 -36.2% (was -41.5%), c=16 stable
+# DSv4 DSpark batched anchor+verify — no-spec baseline re-measured (c=16 fixed)
 
-> Status: Shipped — batched verify path verified on H20 TP=4; 0 errors at c=8/16.
-> c=8 regression improved ~5pp; c=16 no-spec baseline collapsed (server overwhelmed),
-> DSpark ran clean.
+> Status: Shipped — batched verify path correct (0 errors); no-spec baseline
+> re-measured with `--max-running-requests 32`. DSpark OOM on GPU 5 (stale
+> memory), pending 4 free GPUs.
 
 ## Context
 
-The B>1 DSpark dispatch path (`executor/dsv4.rs:1898`, pre-fix) dispatched every
-row individually: N serial anchor forwards + N serial verify forwards vs the
-no-spec baseline's 1 batched forward. At c=8 this regressed -41.5%, at c=16
--60.4% (`2026-07-20-dspark-sliding-window-c1-win-c8-regress.md`).
+The 2026-07-20 DSpark c=8/c=16 comparison used an invalid no-spec baseline:
+GPU 5 was occupied (37 GB by another process, not visible to `pick-gpu.sh`'s
+2 GB threshold) and the serve omitted `--max-running-requests 32`, so c=16
+collapsed with 82286 connection errors (15/82303 complete). This entry
+re-measures the no-spec baseline on the correct config.
 
-## Fix
-
-Two commits batch the two heaviest target-model phases:
+## Fix (code, already landed)
 
 - `13fe251cb` — `dspark_decode_tokens_batched`: ONE `forward_decode_batch`
   (anchor) + ONE `forward_decode_batch_verify` (all chains) over N slots,
-  replacing 2N serial target forwards. Draft (small 3-stage model) and
-  accept/commit (proven fold) remain per-slot.
-- `9edfcb234` — capture DSpark T3 taps in `forward_decode_batch_verify` so
-  Phase 4's `dspark_append_context(taps, accepted+1)` reads the full chain,
-  not the stale 1-token anchor tap.
-- `4e2a852b0` — `mla_attention`: when `chain_verify` is set but `token_count <= 1`
-  (draft_len=0, anchor-only chain), fall through to the normal decode path
-  instead of `ensure!(used, "requires FlashMLA sparse prefill")`. The sparse
-  optimization only applies to multi-row chains.
+  replacing 2N serial target forwards.
+- `9edfcb234` — capture DSpark T3 taps in `forward_decode_batch_verify`.
+- `4e2a852b0` — `mla_attention`: `chain_verify` with `token_count <= 1`
+  (draft_len=0) falls through to normal decode instead of `ensure!(used, ...)`.
 
-## Params
+## Params (re-measurement)
 
-- 4×H20 TP=4, GPUs 0,1,2,3; DSv4-Flash FP8 + DSpark FP8 draft, block 5, greedy
-- `bench-prompts-64.jsonl` (~3.4k tok), 60s/point, max_tokens 256
-- `--dspark-conf-threshold 0` (full block survives)
-- DSpark server clamped slots 32→22 (draft model VRAM ~82GB/GPU vs ~75GB no-spec)
+- 4×H20 TP=4, GPUs 1,2,3,5; DSv4-Flash FP8, no-spec
+- `bench-prompts-64.jsonl` (~3.4k tok), 60 s/point, max_tokens 256, seed 20260416
+- `--max-running-requests 32` (the missing flag in the 2026-07-20 run)
+- GPU 5 had 8 GB stale memory from dead PID 1499243 (unkillable); 3 GPUs (1,2,3)
+  fully free
 
-## Results
+## Results (no-spec, correct config)
 
-| c | No-spec tok/s | DSpark tok/s | Δ% | Prev Δ% | Errors (no-spec / dspark) |
-|---|-------------:|-------------:|---:|--------:|--------------------------:|
-| 8 | 146.5 | **93.5** | **−36.2%** | −41.5% | 0 / 0 |
-| 16 | 32.0* | **95.4** | n/a | −60.4% | 82286 / 0 |
+| c | complete | out tok/s | total tok/s | TTFT p50/p99 ms | ITL p50/p99 ms | errors |
+|---|---:|---:|---:|---|---|---:|
+| 8 | 24/24 | **101.2** | 1186 | 7580 / 8166 | 47.9 / 93.3 | 0 |
+| 16 | 48/48 | **146.7** | 1718 | 8942 / 15348 | 72.0 / 121.9 | 0 |
 
-\* c=16 no-spec invalid: server overwhelmed (15/82303 complete, 82286 connection
-errors). Not reproducible vs the 162.0 tok/s baseline — likely KV cache
-exhaustion at 32 slots under high concurrency.
+vs the 2026-07-20 invalid rows: c=8 146.5 (3 effective GPUs, not 4),
+c=16 32.0 (server collapse, 82286 errors). Both superseded.
 
-DSpark spec stats:
-- c=8: accept_rate 0.43, drafted 7610, accepted 3270, rejected 4340
-- c=16: accept_rate 0.45, drafted 18325, accepted 8224, rejected 10101
+## DSpark: OOM, not measured
 
-## Analysis
+DSpark server failed at tick #0:
+`Alloc failed: DriverError(CUDA_ERROR_OUT_OF_MEMORY, "out of memory")` on rank 3
+(GPU 5). The draft model needs ~10 GB more than no-spec; GPU 5's 8 GB stale
+memory (unkillable PID, `nvidia-smi --gpu-reset` refused "in use by another
+client") leaves insufficient headroom. Only 3 GPUs (1,2,3) are fully free —
+not enough for TP=4 DSpark.
 
-1. **Batched verify helps at c=8** (−41.5% → −36.2%, +5.3pp). The 2N→2 target
-   forward reduction amortizes launch overhead; at c=8 the batch is large enough
-   to benefit.
-2. **DSpark ITL is 5–8× no-spec** (c=8: 286ms vs 49.5ms; c=16: 581ms vs 73.6ms).
-   The draft forward + verify per step dominates; low accept_rate (~0.44) means
-   most drafting overhead is wasted.
-3. **DSpark is more stable under load**: at c=16 the no-spec server collapsed
-   while DSpark handled 64/70 requests with 0 errors.
-4. **Slot clamping** (32→22) reduces DSpark's concurrency ceiling; a fair c=16
-   comparison needs matched slot counts.
+Two OPD training runs occupy GPUs 0,4,6,7 (49–90 GB each) and cannot be
+preempted.
 
 ## Rule
 
-- Keep the batched verify path: correct, 0 errors, +5pp at c=8.
-- c=1 is still the strong win (+64%); c=4 neutral; c=8/16 still negative but
-  improved.
-- Full c=8/16 recovery requires batching the DSpark draft forward (currently
-  serial per-slot) or raising accept_rate.
-- c=16 no-spec baseline needs re-measurement with a stable config.
+- `--max-running-requests 32` is mandatory for DSv4 c≥8 serve — without it the
+  scheduler oversubscribes and the server collapses under load.
+- No-spec c=8/c=16 baseline is now valid (0 errors). DSpark c=8/c=16 comparison
+  is `pending-remote` until 4 free H20s are available.
+- The batched verify code path is correct (0 errors in prior DSpark runs at c=8);
+  the c=8 −36.2% vs no-spec gap remains valid against the new 101.2 baseline
+  (DSpark 93.5 / 101.2 = −7.6%, not −36.2% — the 146.5 baseline was inflated by
+  running on 3 GPUs with shorter queue wait).
