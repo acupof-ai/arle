@@ -1,0 +1,11 @@
+{
+  "lsp": {
+    "rust-analyzer": {
+      "settings": {
+        "cargo": {
+          "features": ["metal", "no-cuda"]
+        }
+      }
+    }
+  }
+}
