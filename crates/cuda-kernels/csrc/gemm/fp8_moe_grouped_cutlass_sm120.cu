@@ -117,23 +117,22 @@ using StrideB = typename Gemm::GemmKernel::InternalStrideB;
 using StrideC = typename Gemm::GemmKernel::InternalStrideC;
 using StrideD = typename Gemm::GemmKernel::InternalStrideD;
 
-// Mirror cutlass::make_cute_packed_stride — the vendored cutlass tree is
-// include-only (no tools/util/packed_stride.hpp). Rank-3 (d0, d1, L); L=1 grouped
-// ⇒ batch stride 0. Two overloads keyed on the unit-stride (contiguous) mode:
-//   RowMajor [d0,d1]     -> Stride<int64_t, _1, int64_t>, leading = d1
-//   ColumnMajor [d0,d1]  -> Stride<_1, int64_t, int64_t>, second  = d0
-template <class IntT>
-CUTLASS_HOST_DEVICE cute::Stride<IntT, cute::Int<1>, IntT> arle_packed_stride(
-    cute::Stride<IntT, cute::Int<1>, IntT> s, int d0, int d1, int l) {
-  cute::get<0>(s) = static_cast<IntT>(d1);
-  cute::get<2>(s) = (l > 1) ? static_cast<IntT>(static_cast<int64_t>(d0) * d1) : IntT(0);
+// Compact rank-3 strides without the tools/util header (vendored cutlass is
+// include-only). Grouped ⇒ per-group ptr, L=1, batch mode = 0: only the leading
+// dynamic mode is set; the default-constructed stride zeroes the rest (or keeps a
+// static _0). Robust to whatever the collective's InternalStride batch mode is.
+//   RowMajor    -> unit stride at mode 1; set mode 0 (leading dim)
+//   ColumnMajor -> unit stride at mode 0; set mode 1 (leading dim)
+template <class M0, class M2>
+CUTLASS_HOST_DEVICE cute::Stride<M0, cute::Int<1>, M2> arle_row_stride(
+    cute::Stride<M0, cute::Int<1>, M2> s, int leading) {
+  cute::get<0>(s) = static_cast<M0>(leading);
   return s;
 }
-template <class IntT>
-CUTLASS_HOST_DEVICE cute::Stride<cute::Int<1>, IntT, IntT> arle_packed_stride(
-    cute::Stride<cute::Int<1>, IntT, IntT> s, int d0, int d1, int l) {
-  cute::get<1>(s) = static_cast<IntT>(d0);
-  cute::get<2>(s) = (l > 1) ? static_cast<IntT>(static_cast<int64_t>(d0) * d1) : IntT(0);
+template <class M1, class M2>
+CUTLASS_HOST_DEVICE cute::Stride<cute::Int<1>, M1, M2> arle_col_stride(
+    cute::Stride<cute::Int<1>, M1, M2> s, int leading) {
+  cute::get<1>(s) = static_cast<M1>(leading);
   return s;
 }
 
@@ -158,7 +157,7 @@ struct GroupedScratch {
   uint8_t* workspace = nullptr;
   int sm_count = 0;
 
-  cudaError_t ensure(int groups, size_t ws) {
+  cudaError_t ensure_arrays(int groups) {
     cudaError_t rc = cudaSuccess;
     if (groups > capacity) {
       free_arrays();
@@ -180,14 +179,19 @@ struct GroupedScratch {
 #undef ARLE_ALLOC
       capacity = groups;
     }
+    if (sm_count == 0) {
+      sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(0);
+    }
+    return cudaSuccess;
+  }
+
+  cudaError_t ensure_workspace(size_t ws) {
+    cudaError_t rc = cudaSuccess;
     if (ws > workspace_bytes) {
       if (workspace) cudaFree(workspace);
       workspace = nullptr;
       if ((rc = cudaMalloc(reinterpret_cast<void**>(&workspace), ws)) != cudaSuccess) return rc;
       workspace_bytes = ws;
-    }
-    if (sm_count == 0) {
-      sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(0);
     }
     return cudaSuccess;
   }
@@ -283,10 +287,10 @@ extern "C" CUresult arle_fp8_moe_grouped_gemm_nt_sm120(
     pSFA[g] = sfa + row;
     pSFB[g] = sfb + static_cast<int64_t>(g) * n_blocks * k_blocks;
 
-    sA[g] = arle_packed_stride(StrideA{}, Mg, k, 1);
-    sB[g] = arle_packed_stride(StrideB{}, n, k, 1);
-    sC[g] = arle_packed_stride(StrideC{}, Mg, n, 1);
-    sD[g] = arle_packed_stride(StrideD{}, Mg, n, 1);
+    sA[g] = arle_row_stride(StrideA{}, k);  // RowMajor [Mg,K], leading = K
+    sB[g] = arle_col_stride(StrideB{}, n);  // ColumnMajor [N,K], leading = N
+    sC[g] = arle_row_stride(StrideC{}, n);  // RowMajor [Mg,N], leading = N
+    sD[g] = arle_row_stride(StrideD{}, n);
 
     // LayoutSFA — DeepGEMM packing: K-block stride = scale_stride_m (NOT Mg),
     // per-token (1) stride = 1. Matches `k_block*scale_stride_m + m`.
@@ -301,43 +305,7 @@ extern "C" CUresult arle_fp8_moe_grouped_gemm_nt_sm120(
   if (max_m == 0) return CUDA_SUCCESS;  // nothing routed to any local expert.
 
   GroupedScratch& s = scratch_for_current_device();
-
-  typename Gemm::Arguments arguments;
-  {
-    cutlass::KernelHardwareInfo hw_info;
-    hw_info.device_id = 0;
-    cudaGetDevice(&hw_info.device_id);
-    hw_info.sm_count =
-        (s.sm_count != 0) ? s.sm_count
-                          : cutlass::KernelHardwareInfo::query_device_multiprocessor_count(
-                                hw_info.device_id);
-
-    typename Gemm::GemmKernel::TileSchedulerArguments scheduler;
-    scheduler.raster_order = cutlass::gemm::kernel::detail::RasterOrderOptions::AlongN;
-
-    decltype(arguments.epilogue.thread) fusion_args;
-    fusion_args.alpha = 1.0f;
-    fusion_args.beta = 0.0f;
-    fusion_args.alpha_ptr = nullptr;
-    fusion_args.beta_ptr = nullptr;
-    fusion_args.alpha_ptr_array = nullptr;
-    fusion_args.beta_ptr_array = nullptr;
-    fusion_args.dAlpha = {_0{}, _0{}, 0};
-    fusion_args.dBeta = {_0{}, _0{}, 0};
-
-    // Fill AFTER s.ensure so the device pointers exist; placeholders here get
-    // overwritten below once the arrays are uploaded.
-    arguments = {
-        cutlass::gemm::GemmUniversalMode::kGrouped,
-        {G, nullptr, ps_host.data()},
-        {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr},
-        {fusion_args, nullptr, nullptr, nullptr, nullptr},
-        hw_info,
-        scheduler};
-  }
-
-  size_t ws = Gemm::get_workspace_size(arguments);
-  if ((rc = s.ensure(G, ws)) != cudaSuccess) return CUDA_ERROR_OUT_OF_MEMORY;
+  if ((rc = s.ensure_arrays(G)) != cudaSuccess) return CUDA_ERROR_OUT_OF_MEMORY;
 
   // Upload the per-group arrays to the persistent scratch.
 #define ARLE_UP(dst, src, T)                                                     \
@@ -359,13 +327,36 @@ extern "C" CUresult arle_fp8_moe_grouped_gemm_nt_sm120(
   ARLE_UP(layout_SFB, lSFB, LayoutSFB);
 #undef ARLE_UP
 
-  arguments.problem_shape = {G, s.problem_sizes, ps_host.data()};
-  arguments.mainloop = {s.ptr_A, s.stride_A, s.ptr_B, s.stride_B,
-                        s.ptr_SFA, s.layout_SFA, s.ptr_SFB, s.layout_SFB};
-  arguments.epilogue.ptr_C = s.ptr_C;
-  arguments.epilogue.dC = s.stride_C;
-  arguments.epilogue.ptr_D = s.ptr_D;
-  arguments.epilogue.dD = s.stride_D;
+  cutlass::KernelHardwareInfo hw_info;
+  hw_info.device_id = 0;
+  cudaGetDevice(&hw_info.device_id);
+  hw_info.sm_count = s.sm_count;
+
+  typename Gemm::GemmKernel::TileSchedulerArguments scheduler;
+  scheduler.raster_order = cutlass::gemm::kernel::detail::RasterOrderOptions::AlongN;
+
+  typename Gemm::Arguments arguments;
+  decltype(arguments.epilogue.thread) fusion_args;
+  fusion_args.alpha = 1.0f;
+  fusion_args.beta = 0.0f;
+  fusion_args.alpha_ptr = nullptr;
+  fusion_args.beta_ptr = nullptr;
+  fusion_args.alpha_ptr_array = nullptr;
+  fusion_args.beta_ptr_array = nullptr;
+  fusion_args.dAlpha = {_0{}, _0{}, 0};
+  fusion_args.dBeta = {_0{}, _0{}, 0};
+
+  arguments = {
+      cutlass::gemm::GemmUniversalMode::kGrouped,
+      {G, s.problem_sizes, ps_host.data()},
+      {s.ptr_A, s.stride_A, s.ptr_B, s.stride_B, s.ptr_SFA, s.layout_SFA, s.ptr_SFB,
+       s.layout_SFB},
+      {fusion_args, s.ptr_C, s.stride_C, s.ptr_D, s.stride_D},
+      hw_info,
+      scheduler};
+
+  size_t ws = Gemm::get_workspace_size(arguments);
+  if ((rc = s.ensure_workspace(ws)) != cudaSuccess) return CUDA_ERROR_OUT_OF_MEMORY;
 
   Gemm gemm;
   if (gemm.can_implement(arguments) != cutlass::Status::kSuccess)
