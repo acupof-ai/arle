@@ -1,0 +1,21 @@
+docs/baselines.md
+  s_099383ef79559d::t_c3b208ebd4fa44 123-148
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "e42eda3a6f2846733dc9f5232c899d2315378f60",
+  "prompts": {},
+  "sessions": {
+    "s_099383ef79559d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4489c951-ff19-410c-a076-13320f5753c1",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
