@@ -1,0 +1,27 @@
+crates/cuda-kernels/build.rs
+  s_1f501b27e77cda::t_ae2f97f23a9eba 2761-2768,2830,2833-2835,2873-2893
+crates/cuda-kernels/csrc/gemm/fp8_moe_grouped_cutlass_sm120.cu
+  s_1f501b27e77cda::t_56286a4cda5adc 1-368
+crates/cuda-kernels/src/ffi/gemm.rs
+  s_1f501b27e77cda::t_1e6c0a1b7b3367 711-731
+crates/cuda-kernels/src/moe.rs
+  s_1f501b27e77cda::t_80d137be762d7f 1585-1637
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "8e61a3109ed64128e2d4f53e7b430c1a69d57c08",
+  "prompts": {},
+  "sessions": {
+    "s_1f501b27e77cda": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a30e19813fe033b06",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
