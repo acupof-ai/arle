@@ -84,7 +84,7 @@ impl Default for DsparkTrainConfig {
             batch_size: 64,
             baseline_ema_alpha: 0.01,
             baseline_init: 0.5,
-            prob_match_alpha: 0.9,
+            prob_match_alpha: 0.5,
             loss_decay_gamma: Some(4.0),
             max_grad_norm: Some(1.0),
         }
