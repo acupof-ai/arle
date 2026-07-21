@@ -708,6 +708,27 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    // sm_120 (Blackwell) grouped blockwise-scaled FP8 MoE GEMM — the sm_120
+    // replacement for the Hopper-only DeepGEMM contiguous grouped call. Group
+    // geometry arrives as device `group_offsets` (128-aligned row start) +
+    // `group_counts` (real Mg); `scale_stride_m` is the SFA K-block leading dim
+    // (= DeepGEMM's `sfa_aligned_m`). Non-sm120 builds link a stub returning
+    // `cudaErrorNotSupported`.
+    pub fn arle_fp8_moe_grouped_gemm_nt_sm120_cuda(
+        a: *const u8,
+        sfa: *const f32,
+        b: *const u8,
+        sfb: *const f32,
+        d: *mut Half,
+        group_offsets: *const i32,
+        group_counts: *const i32,
+        num_groups: i32,
+        n: i32,
+        k: i32,
+        scale_stride_m: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn deepgemm_m_grouped_bf16_gemm_nt_masked_cuda(
         a: *const Half,
         b: *const Half,
