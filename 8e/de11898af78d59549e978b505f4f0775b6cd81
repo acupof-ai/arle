@@ -1,0 +1,49 @@
+crates/cli/src/model_catalog.rs
+  s_22ede0183d53f7::t_e020af7da2a0c9 156-168,285,289
+scripts/agent_opd_curve.sh
+  s_22ede0183d53f7::t_7200f8ec9fbff0 15,31
+scripts/tbench_calibrate.sh
+  s_22ede0183d53f7::t_fd20642c5d1bd4 7,29
+scripts/tbench_full.sh
+  s_f2749fbb2c6546::t_79de7587abcbae 6,20
+scripts/tbench_opd_loop.sh
+  s_f2749fbb2c6546::t_f9272c77b07fcd 9,35
+scripts/terminal_bench_eval.sh
+  s_f2749fbb2c6546::t_79bb6601ac4014 3,40,53
+scripts/terminal_bench_serve.sh
+  s_d6adcec6a0a6d3::t_67a63d7c846ab1 2,26,37-38,42
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "8ede11898af78d59549e978b505f4f0775b6cd81",
+  "prompts": {},
+  "sessions": {
+    "s_22ede0183d53f7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a14b0ea78198e7fad",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_d6adcec6a0a6d3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dc64a0b5-493b-4e08-a5cf-392205926291",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_f2749fbb2c6546": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a2a623ef2bbb6851e",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
