@@ -194,23 +194,26 @@ every (B) claim.
 
 ## 6. (B) peak-perf plan — CUTLASS sm_120 block-scaled GEMM
 
-**Priority (FLOP-aimed HYPOTHESIS — verify with nsys before committing kernel effort):**
-the vehicle is `Qwen3.6-35B-A3B-FP8`, so at **decode** each token activates only ~3B MoE
-params (grouped GEMM) vs ~0.1–0.2B dense projections (q/k/v/o/shared). **MoE grouped GEMM
-should dominate decode FLOPs ~10–30× → G2 (MoE grouped block-scaled) is the real decode
-lever, NOT Cut-1/Cut-2 (dense).** The current MoE grouped path already runs on the
-*hand-grouped fallback* (DeepGEMM native unavailable on sm_120), so the headroom is real.
-**Verify with an nsys decode breakdown** (grouped-GEMM vs dense-proj vs attention share)
-before sinking effort — do not assume.
-
-**Build order = Cut-2 → G2** (not win-order): Cut-2 (dense block-scaled) is the *simpler
-shape* that de-risks the shared **CUTLASS sm_120 block-scaled collective** + FFI + dispatch
-+ sm_120a build; G2 reuses that collective wrapped for grouped/segmented `m_grouped` GEMM.
-Cut-2 is also the prefill win (large-M dense). **Cut-2 gate — CUTLASS version:** the
-sm_120a block-scaled collectives (example-79) need CUTLASS ≥ 3.8. The build pulls CUTLASS
-from `vendor/flashmla/csrc/cutlass/` OR DeepGEMM's `third-party/cutlass/` OR TileLang's
-`3rdparty/cutlass/` (build.rs:2576/2124/1167) — **confirm the bundled tag has the sm_120a
-collectives on the VM before writing the kernel**; a bump may be needed.
+**Priority — MEASURED (baseline bench 2026-07-22,
+[wins](../experience/wins/2026-07-22-bench-sm120-fp8-moe-baseline.md)): the bottleneck is
+PREFILL, not decode.** `Qwen3.6-35B-A3B-FP8` on sm_120: cold prefill **~85 s / 3013 tok =
+~35 tok/s** on the scalar/dequant FP8 fallback (no tensor-core FP8 GEMM); decode ITL ~11 ms
+(~90 tok/s) is already healthy; c=16 collapses on prefill starvation. **This corrects the
+earlier "decode → G2 dominates" FLOP guess** — at PREFILL (M=3013) the dense projections
+are large-M on the *worst* fallback (dequant→BF16), so:
+- **Cut-2 (dense block-scaled) is BOTH the de-risk AND the first prefill win** — do it
+  first. It attacks the large-M dense-proj GEMM currently on dequant→BF16, and proves the
+  shared **CUTLASS sm_120 block-scaled collective** + FFI + dispatch + sm_120a build on the
+  simpler (dense) shape.
+- **G2 (MoE grouped block-scaled) follows** — reuses that collective wrapped for
+  grouped/segmented `m_grouped`, attacking the large-M MoE prefill (hand-grouped fallback).
+- Build order = win order = **Cut-2 → G2**.
+- **Cut-2 gate — CUTLASS version:** the sm_120a block-scaled collectives (example-79) need
+  CUTLASS ≥ 3.8. The build pulls CUTLASS from `vendor/flashmla/csrc/cutlass/` OR DeepGEMM's
+  `third-party/cutlass/` OR TileLang's `3rdparty/cutlass/` (build.rs:2576/2124/1167) —
+  **confirm the bundled tag has the sm_120a collectives on the VM before writing the
+  kernel**; a bump may be needed. An nsys prefill breakdown (dense-proj vs MoE-grouped vs
+  attention share at M=3013) refines the Cut-2/G2 effort split but does not block Cut-2.
 
 Grounded by the 4-stream deep research ([2026-07-22-sm120-fp8-peak-landscape.md](../research/2026-07-22-sm120-fp8-peak-landscape.md)).
 Correction to the first draft: the peak path is **NOT cuBLASLt** — cuBLASLt on sm_120
