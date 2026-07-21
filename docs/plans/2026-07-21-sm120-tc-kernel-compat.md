@@ -202,13 +202,13 @@ DeepGEMM's own SM100 path already repacks to UE8M0, so the format likely exists.
    CUTLASS example-79c sm_120a block-scaled collective; inputs E4M3 + UE8M0 128-block
    scales. Cut 1 interim: `fp8_cublaslt_gemm.cu` per-tensor on the `gemv.cu:539` scaffold.
 2. `crates/cuda-kernels/src/gemm.rs`: extern + safe wrapper.
-3. `crates/infer-cuda/src/ops/generated/qwen_fp8_dense_projection.rs`: add
-   `Route::CutlassSm120Fp8` (and the Cut-1 cuBLASLt variant). `@generated` by
-   `scripts/reduce_operator_evidence.py` — add via the generator or a hand-written
-   override over `select_exact`, NOT by editing the generated file.
-4. `crates/infer-cuda/src/ops/quant_linear.rs:185 qwen_fp8_dense_route`: `major==12` →
-   the sm_120 route; `major==9` stays `PackDeepGemm`; other SMs unchanged. Dispatch at
-   `~:535`.
+3. `crates/infer-cuda/src/ops/quant_linear.rs:538 gemm_batch`: insert a new
+   `try_fp8_<cublaslt|cutlass>_sm120_batch(ctx, weight, x, out)?` branch **between the
+   DeepGEMM arm (:551) and the dequant→BF16 arm (:556)**, gated `sm_major==12` &&
+   `Fp8BlockScaled`. Mirrors the existing `try_fp8_dequant_bf16_gemm_batch` shape
+   (returns `Ok(true)` when it handled the GEMM). **Dispatch-site branch, NOT a policy
+   enum edit** — the `Route`/`select_exact` path stays `Gemv`/`PackDeepGemm`; leaving the
+   `@generated qwen_fp8_dense_projection.rs` untouched is the lazier, lower-entropy form.
 5. **MoE grouped (G2)**: the sm_120 MoE path is the CUTLASS block-scaled **grouped**
    GEMM (CUTLASS ex79d / vLLM), NOT DeepGEMM grouped. `moe.rs:537` gates on cache
    presence, not SM — confirm sm_120 routes away from `dsv4_deepgemm_m_grouped_*`
@@ -216,9 +216,13 @@ DeepGEMM's own SM100 path already repacks to UE8M0, so the format likely exists.
 6. `build.rs`: new `.cu` auto-collected; needs CUTLASS sm_120a includes for Cut 2.
 
 ### verify
-Colab sm_120: `needle_gate.py` per cut, THEN `bench_throughput.py` vs the (A)
-dequant-BF16 arm AND vs Cut 1 — Cut 2 must show a stable positive Δ (target ~2× over
-Cut 1, ~4× over BF16) or it is reverted. wins/ entry cites the Colab bench.
+Colab sm_120. **Cut 1 is a route/perf smoke, NOT needle-gated** — per-tensor collapse of
+the 128-block scale shifts numerics by construction, so a needle miss is expected and is
+NOT grounds to revert; its only job is to prove the FFI + `major==12` dispatch + ~2× over
+BF16. **Cut 2 is the deployable path and MUST pass `needle_gate.py`** (block-scaled, numerics
+preserved), THEN `bench_throughput.py` vs the (A) dequant-BF16 arm AND vs Cut 1 — Cut 2 keeps
+a stable positive Δ (target ~2× over Cut 1, ~4× over BF16) or it is reverted. wins/ entry
+cites the Colab bench.
 
 ### Blackwell attention (deferred, second hotspot)
 GEMM dominates FLOPs; land the GEMM route first. Research verdict: **no Blackwell-native
