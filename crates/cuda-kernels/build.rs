@@ -2882,12 +2882,6 @@ fn main() {
                 "-DARLE_SM120_GROUPED_FP8=1".to_string(),
                 format!("-I{}/include", cuda_path),
                 format!("-I{}", flashmla_root.join("csrc/cutlass/include").display()),
-                format!(
-                    "-I{}",
-                    flashmla_root
-                        .join("csrc/cutlass/tools/util/include")
-                        .display()
-                ),
             ]);
         }
 
