@@ -55,7 +55,7 @@ Add a new adapter in Eli alongside the existing
 The adapter URL routing is identical to OpenAI; the value-add is:
 
 - Pass-through of `session_id` so ARLE's session-affinity slot tracking
-  ([`infer/src/scheduler/AGENTS.md`](../../infer/src/scheduler/AGENTS.md)
+  (`infer/src/scheduler/AGENTS.md` (monolith deleted 2026-06-04)
   invariant 9) stays warm across an Eli session.
 - Optional `X-ARLE-Prefix-Hint` header for shared-prefix agentic loops
   (depends on the radix prefix cache landing on Metal — see
@@ -101,7 +101,7 @@ production.
 ## Cross-references
 
 - ARLE OpenAI v1 surface:
-  [`infer/src/http_server/AGENTS.md`](../../infer/src/http_server/AGENTS.md).
+  `infer/src/http_server/AGENTS.md` (monolith deleted 2026-06-04).
 - Eli provider crate: `cklxx/eli/crates/nexil/src/providers/`.
 - Eli runtime entry points: `eli/AGENTS.md`,
   `eli/docs/ARCHITECTURE_LANDSCAPE.md`.

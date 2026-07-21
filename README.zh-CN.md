@@ -1,31 +1,31 @@
 <p align="center">
-  <img src="docs/assets/caret-counter-lockup.svg" height="56" alt="arle">
+ <img src="docs/assets/caret-counter-lockup.svg" height="56" alt="arle">
 </p>
 
 <p align="center">
-  <em>Pure-Rust 运行时,统一服务、本地 agent、On-Policy Distillation 训练与评测。<code>arle serve</code> 是 OpenAI 兼容的服务入口;<code>arle</code> 是统一的用户入口。</em>
+ <em>Pure-Rust 运行时,统一服务、本地 agent、On-Policy Distillation 训练与评测。<code>arle serve</code> 是 OpenAI 兼容的服务入口;<code>arle</code> 是统一的用户入口。</em>
 </p>
 
 <p align="center">
-  <a href="https://cklxx.github.io/arle/"><img src="https://img.shields.io/badge/website-cklxx.github.io%2Farle-D97757?style=flat-square" alt="Website"></a>
-  <a href="https://github.com/cklxx/arle/actions/workflows/ci.yml"><img src="https://github.com/cklxx/arle/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <a href="https://github.com/cklxx/arle/actions/workflows/metal-ci.yml"><img src="https://github.com/cklxx/arle/actions/workflows/metal-ci.yml/badge.svg" alt="Metal CI"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License"></a>
-  <a href="https://github.com/cklxx/arle/releases"><img src="https://img.shields.io/github/v/release/cklxx/arle?include_prereleases" alt="Release"></a>
+ <a href="https://cklxx.github.io/arle/"><img src="https://img.shields.io/badge/website-cklxx.github.io%2Farle-D97757?style=flat-square" alt="Website"></a>
+ <a href="https://github.com/cklxx/arle/actions/workflows/ci.yml"><img src="https://github.com/cklxx/arle/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+ <a href="https://github.com/cklxx/arle/actions/workflows/metal-ci.yml"><img src="https://github.com/cklxx/arle/actions/workflows/metal-ci.yml/badge.svg" alt="Metal CI"></a>
+ <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License"></a>
+ <a href="https://github.com/cklxx/arle/releases"><img src="https://img.shields.io/github/v/release/cklxx/arle?include_prereleases" alt="Release"></a>
 </p>
 
 <p align="center">
-  <a href="#快速开始">快速开始</a> ·
-  <a href="docs/http-api.md">HTTP API</a> ·
-  <a href="docs/support-matrix.md">支持矩阵</a> ·
-  <a href="docs/onboarding.md">新人指南</a> ·
-  <a href="docs/architecture.md">架构</a> ·
-  <a href="ROADMAP.md">路线图</a> ·
-  <a href="CHANGELOG.md">变更日志</a>
+ <a href="#快速开始">快速开始</a> ·
+ <a href="docs/http-api.md">HTTP API</a> ·
+ <a href="docs/support-matrix.md">支持矩阵</a> ·
+ <a href="docs/onboarding.md">新人指南</a> ·
+ <a href="docs/architecture.md">架构</a> ·
+ <a href="ROADMAP.md">路线图</a> ·
+ <a href="CHANGELOG.md">变更日志</a>
 </p>
 
 <p align="center">
-  <a href="README.md">English</a> · <strong>简体中文</strong>
+ <a href="README.md">English</a> · <strong>简体中文</strong>
 </p>
 
 ---
@@ -41,10 +41,10 @@ curl -fsSL https://github.com/cklxx/arle/releases/latest/download/install.sh | s
 
 # Linux + NVIDIA — Docker,无需编译
 docker run --rm --gpus all -p 8000:8000 -v /path/to/Qwen3.5-4B:/model:ro \
-  ghcr.io/cklxx/arle:latest serve --backend cuda --model-path /model
+ ghcr.io/cklxx/arle:latest serve --backend cuda --model-path /model
 
 # 启动服务
-arle serve --backend cuda  --model-path /path/to/Qwen3.5-4B --port 8000
+arle serve --backend cuda --model-path /path/to/Qwen3.5-4B --port 8000
 arle serve --backend metal --model-path mlx-community/Qwen3.5-0.8B-MLX-4bit --port 8000
 ```
 
@@ -52,8 +52,8 @@ arle serve --backend metal --model-path mlx-community/Qwen3.5-0.8B-MLX-4bit --po
 from openai import OpenAI
 client = OpenAI(base_url="http://localhost:8000/v1", api_key="not-needed")
 print(client.chat.completions.create(
-    model="qwen3.5-4b",
-    messages=[{"role": "user", "content": "你好,ARLE"}],
+ model="qwen3.5-4b",
+ messages=[{"role": "user", "content": "你好,ARLE"}],
 ).choices[0].message.content)
 ```
 
@@ -66,7 +66,7 @@ print(client.chat.completions.create(
 | `arle`(无参) | 交互式 agent REPL,内置 `python` 与 `shell` 工具。 |
 | `arle run --prompt "…"` | 一次性 prompt。`--no-tools` 关闭工具。 |
 | `arle serve --backend …` | OpenAI 兼容 HTTP 服务。 |
-| `arle train opd` | **On-Policy Distillation** —— teacher 跑在服务运行时,student 跑 `train`。[使用手册](docs/projects/2026-05-21-arle-opd-cuda-usage-manual.md)。 |
+| `arle train opd` | **On-Policy Distillation** —— teacher 跑在服务运行时,student 跑 `train`。使用手册。 |
 | `arle --doctor [--json]` | 后端 / 硬件 / 模型解析自检。 |
 
 ---
@@ -93,14 +93,14 @@ print(client.chat.completions.create(
 **NVIDIA —— DeepSeek-V4-Flash,8×H20(TP=8 / EP=8,FP8 MoE)。** B=1 decode **53 tok/s**(prefill 23 ms);并发批量 decode lane 在 c=8 再 **+48%**。
 
 <p align="center">
-  <img src="docs/assets/dsv4-perf-journey.png" alt="DeepSeek-V4-Flash B=1 decode 33.5 → 53.3 tok/s,2026-06-13 → 06-14 campaign" width="720">
+ <img src="docs/assets/dsv4-perf-journey.png" alt="DeepSeek-V4-Flash B=1 decode 33.5 → 53.3 tok/s,2026-06-13 → 06-14 campaign" width="720">
 </p>
 <p align="center"><sub>DSv4 B=1 decode,<b>33.5 → 53.3 tok/s</b>,2026-06-13 → 06-14 campaign —— 每一步都对应一条 <code>docs/experience/wins/</code> 记录。</sub></p>
 
 **On-Policy Distillation 在 student 自己的 rollout 上真能提升它** —— teacher 就是生产服务本身。Qwen3.5-4B:MATH-500 **+27pp**(0.518 → 0.792,CI 完全分离)· BFCL-live abstention **0.60 → 1.00**。27B 在 **Terminal-Bench** 上:pass@1 **+5.1pp**(20.5 → 25.6%),蒸馏的梯度是输出格式规范性。
 
 <p align="center">
-  <img src="docs/assets/tbench-opd-loss-curve.png" alt="Terminal-Bench OPD 蒸馏 loss:逐步 masked-CE + EMA 趋势,3 epoch 均值 0.2165 → 0.1796 → 0.1453" width="720">
+ <img src="docs/assets/tbench-opd-loss-curve.png" alt="Terminal-Bench OPD 蒸馏 loss:逐步 masked-CE + EMA 趋势,3 epoch 均值 0.2165 → 0.1796 → 0.1453" width="720">
 </p>
 <p align="center"><sub>TB-OPD 蒸馏 loss,27B student · 41 records × 3 epochs · <b>0.2165 → 0.1796 → 0.1453</b>。<a href="docs/experience/wins/2026-06-20-opd-multiseed-math500-lock.md">MATH</a> · <a href="docs/experience/wins/2026-07-07-terminal-bench-opd-format-distill-lift.md">Terminal-Bench</a></sub></p>
 
@@ -118,33 +118,33 @@ agent 与 RL 工作负载每轮都在重复处理同样的 prompt + 历史 + 工
 
 ```mermaid
 flowchart TB
-  classDef entry fill:#1a1a2e,stroke:#e94560,color:#eee,rx:8,ry:8
-  classDef core fill:#0f3460,stroke:#e94560,color:#eee,rx:8,ry:8
-  classDef seam fill:#533483,stroke:#e94560,color:#eee,rx:8,ry:8
-  classDef exec fill:#190e36,stroke:#4ecca3,color:#eee,rx:8,ry:8
+ classDef entry fill:#1a1a2e,stroke:#e94560,color:#eee,rx:8,ry:8
+ classDef core fill:#0f3460,stroke:#e94560,color:#eee,rx:8,ry:8
+ classDef seam fill:#533483,stroke:#e94560,color:#eee,rx:8,ry:8
+ classDef exec fill:#190e36,stroke:#4ecca3,color:#eee,rx:8,ry:8
 
-  Serve["arle serve<br/><sub>OpenAI v1</sub>"]
-  Agent["arle<br/><sub>本地 agent</sub>"]
-  Train["arle train opd<br/><sub>OPD</sub>"]
+ Serve["arle serve<br/><sub>OpenAI v1</sub>"]
+ Agent["arle<br/><sub>本地 agent</sub>"]
+ Train["arle train opd<br/><sub>OPD</sub>"]
 
-  Core["infer-core<br/><sub>device-neutral Engine · 调度器 · KV cache</sub>"]
+ Core["infer-core<br/><sub>device-neutral Engine · 调度器 · KV cache</sub>"]
 
-  Seam["infer-seam<br/><sub>两个 trait：BackendExecutor · KvPool</sub>"]
+ Seam["infer-seam<br/><sub>两个 trait：BackendExecutor · KvPool</sub>"]
 
-  CUDA["infer-cuda<br/><sub>FlashMLA · DeepGEMM · DeepEP</sub>"]
-  Metal["infer-metal<br/><sub>MLX bridge</sub>"]
+ CUDA["infer-cuda<br/><sub>FlashMLA · DeepGEMM · DeepEP</sub>"]
+ Metal["infer-metal<br/><sub>MLX bridge</sub>"]
 
-  Serve --> Core
-  Agent --> Core
-  Train --> Core
-  Core --> Seam
-  Seam --> CUDA
-  Seam --> Metal
+ Serve --> Core
+ Agent --> Core
+ Train --> Core
+ Core --> Seam
+ Seam --> CUDA
+ Seam --> Metal
 
-  class Serve,Agent,Train entry
-  class Core core
-  class Seam seam
-  class CUDA,Metal exec
+ class Serve,Agent,Train entry
+ class Core core
+ class Seam seam
+ class CUDA,Metal exec
 ```
 
 一套运行时、三个表面、两个可插拔后端。新后端只需实现 seam 的两个

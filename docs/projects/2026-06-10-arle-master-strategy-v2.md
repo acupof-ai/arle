@@ -1,6 +1,6 @@
 # ARLE 战略主文档 v2 — 唯一真理(2026-06-10)
 
-> **本文 supersede [`2026-05-07-arle-master-strategy.md`](2026-05-07-arle-master-strategy.md)(v1)的全部战略结论。**
+> **本文 supersede `2026-05-07-arle-master-strategy.md`(v1)的全部战略结论。**
 > 任何与本文冲突的旧 doc 以本文为准。v1 保留作历史推理记录,header 已打 SUPERSEDED 横幅。
 > 进展跟踪:[umbrella #55](https://github.com/cklxx/arle/issues/55) ——
 > Phase 0 = #56–#59(✅ 全关 2026-06-10;残留 #68 model-generic KV-quant gate,不再 block
@@ -32,15 +32,15 @@
 
 | Moat | 状态 | Evidence |
 |---|---|---|
-| **设备中立 Engine seam**:同一 `Engine<E,K>` 驱动 CUDA 连续批处理 + Metal MLX 两个结构迥异后端;第三后端 = 实现两个 host-only trait | ✅ 已证明 | [final report §4](2026-06-04-qwen35-dsv4-final-report.md);`agent-bench` 双后端实例化。vLLM/SGLang 无 Metal 故事 |
+| **设备中立 Engine seam**:同一 `Engine<E,K>` 驱动 CUDA 连续批处理 + Metal MLX 两个结构迥异后端;第三后端 = 实现两个 host-only trait | ✅ 已证明 | final report §4;`agent-bench` 双后端实例化。vLLM/SGLang 无 Metal 故事 |
 | **Rust hot path**(全栈无 Python)| ✅ | 整个 workspace |
 | **DSv4-Flash 首发覆盖**(DSA/CSA/HCA/mHC/MTP 全架构)| ✅ 正确性已证,perf 在途 | needle@long-ctx + GSM8K=72;SGLang 加载不了 V4-Flash |
 | **OPD 训推一体**(teacher 即 serving 路径)| ⏳ substrate 已通,GPU 实验饿着 | [OPD pivot](2026-05-18-opd-only-pivot.md);`arle train opd` e2e wired |
 
 **v1 moat 列表中被撤销的项**:TileLang 自研 attention kernel 不再是 moat —— 6 月
 官方-kernel 采纳弧(FlashMLA / 官方 DSA indexer / DeepGEMM)实证 adopt-official 全面
-胜过 hand-rolled([retro](../experience/errors/2026-06-06-handrolled-kernels-vs-adopt-official-retro.md)),
-TileLang prefill 还有 [FlashInfer 迁移计划](../plans/2026-05-27-flashinfer-paged-prefill-migration.md)
+胜过 hand-rolled(retro),
+TileLang prefill 还有 FlashInfer 迁移计划
 在案。自研 kernel 是手段不是壁垒;**`先用最好的再自己写` 是纪律**。
 
 ---
@@ -51,11 +51,11 @@ TileLang prefill 还有 [FlashInfer 迁移计划](../plans/2026-05-27-flashinfer
 |---|---|---|
 | 训练侧 = DSV4 from-scratch repro(v1 §5/§8 全部)| **DEAD** | 2026-05-18 OPD pivot(322× 预训练 gap 实测)|
 | "❌ Distributed 大模型(72B+)是后期" | **被现实推翻**:DSv4-Flash TP8/EP8 是 6 月主战场,且锻造出了 engine-generic 抽象 | 6 月全部 commits/wins |
-| 单体 `infer/` crate 是 runtime 本体 | **DELETED**(~167k LOC,`e81b98fb`):serving truth = `infer-plan→seam→core→cuda/metal→server/api` | [final report](2026-06-04-qwen35-dsv4-final-report.md) §1 |
+| 单体 `infer/` crate 是 runtime 本体 | **DELETED**(~167k LOC,`e81b98fb`):serving truth = `infer-plan→seam→core→cuda/metal→server/api` | final report §1 |
 | Moat = Rust+TileLang+graph+spec+grammar 5 项组合 | **修订为 §0.1 四项**;TileLang 撤销 | 上文 |
 | W3/W4 跨引擎 baseline 是 P0.0 "必须先做" | **依然成立但从未执行**(2026-05-02 至今);移入 Phase 3,排在 batched lane 之后 | 无 W3/W4 跨引擎数据存在 |
-| Medusa 是 spec-decode 主路径 | **修订**:DSv4 走 frozen-KV MTP(checkpoint 自带 draft head,免训练);Qwen3.5 Medusa 继续卡 recurrent-rollback gate | [frozen-KV 设计](../plans/2026-06-06-dsv4-frozen-kv-mtp-redesign.md) |
-| 4k/8k prefill 落后 SGLang 50%(sm_89 单卡数据)| **过期数据**,不再指导决策;当前 perf 锚 = H20 同 pod A/B | [H20 reference baseline](../plans/2026-06-06-dsv4-h20-reference-baseline.md) |
+| Medusa 是 spec-decode 主路径 | **修订**:DSv4 走 frozen-KV MTP(checkpoint 自带 draft head,免训练);Qwen3.5 Medusa 继续卡 recurrent-rollback gate | frozen-KV 设计 |
+| 4k/8k prefill 落后 SGLang 50%(sm_89 单卡数据)| **过期数据**,不再指导决策;当前 perf 锚 = H20 同 pod A/B | H20 reference baseline |
 
 ---
 
@@ -71,12 +71,12 @@ TileLang prefill 还有 [FlashInfer 迁移计划](../plans/2026-05-27-flashinfer
    (`fa355315`);**残留**:seq≥241 尾数丢失(§6)、256K admission band-aid(`39be5f83`)。
 4. **B=1 per-kernel 优化已死**(8 次 wash 实证):只有 ①更少 GPU 计算 ②通信 overlap
    ③摊销(batching/MTP)能动 B=1 的墙。
-   [CONCLUSIVE](../experience/wins/2026-06-08-dsv4-decode-6ms-FINAL-consolidated.md)。
+   CONCLUSIVE。
 5. **c≥2 serving lane 刚刚存在**(`cd421794`,2026-06-10):executor 把 mixed/multi-prefill
    plan 拆成串行 single-row 子步 + decode 子批 —— 这是**正确性/可用性修复,不是吞吐**;
    c-sweep bench pending-remote。此前 c≥2 直接杀引擎线程,锁死 deepep_ll A/B、MTP
    acceptance workload、一切吞吐叙事
-   ([errors 2026-06-10](../experience/errors/2026-06-10-dsv4-deepep-ll-b1-regression-no-batch-lane.md))。
+   (errors 2026-06-10)。
 6. **正确性 gate 语义**:正确推理 ≠ 与基线 byte-identical(MoE run-to-run 非确定性);
    gate = needle + same-config-twice 地板 + 自洽。KV-precision-parity 审计**尚未移植**到
    `infer-cuda`,是一切 KV/quant default-flip 的前置。
@@ -114,7 +114,7 @@ Phase 0 还债(正确性 + 真相面)
 **为什么是钥匙石**:同时解锁所有停泊项 —— guidellm c-sweep(吞吐叙事)、deepep_ll
 翻案 A/B(它唯一能赢的 lane)、MTP acceptance workload、Metal 收敛(同为 single-row
 guard)、Qwen/Gemma 的 engine-generic 复用。wall-clock @4096 实测 c=8 仅 1.63× scaling
-([pd-systematic-analysis](../plans/2026-06-06-dsv4-pd-systematic-analysis.md))。
+(pd-systematic-analysis)。
 
 **出口条件**:c-sweep 不 crash 且 TTFT+ITL+tok/s 全指标过
 [bench-and-trace-spec](../bench-and-trace-spec.md)(distilled lesson:`plan_label=mixed`
@@ -122,7 +122,7 @@ guard)、Qwen/Gemma 的 engine-generic 复用。wall-clock @4096 实测 c=8 仅 
 
 ### Phase 2 — spec decode 默认有且默认好用(ckl directive)
 
-路径:[frozen-KV MTP](../plans/2026-06-06-dsv4-frozen-kv-mtp-redesign.md)(draft+verify
+路径:frozen-KV MTP(draft+verify
 读冻结 target KV,不重跑 compressor;checkpoint 自带 `mtp.0.*` draft head,免训练)。
 
 - **排序在 kernel base 收敛后**:×1.93 摊在 16ms 上 = 8ms,摊在 30ms 上只有 16ms。
@@ -158,7 +158,7 @@ guard)、Qwen/Gemma 的 engine-generic 复用。wall-clock @4096 实测 c=8 仅 
 | D2 | 吞吐轴唯一路径 = unified batched KvPool 计划;不再做绕过 seam 的 DSv4 专用旁路 | YES |
 | D3 | spec decode 必须默认有且默认好用;DSv4 走 frozen-KV MTP,排在 kernel base 后 | YES(ckl directive)|
 | D4 | 三线(DSv4 substrate / agent workload / OPD)严格串行,不并行争 GPU 与注意力 | YES |
-| D5 | 运行时 knob 一律 CLI `--flags`,env var 仅 build/toolchain | YES(ckl directive,清理单在 [code-cleanup-audit](../plans/2026-06-07-dsv4-code-cleanup-audit.md))|
+| D5 | 运行时 knob 一律 CLI `--flags`,env var 仅 build/toolchain | YES(ckl directive,清理单在 code-cleanup-audit)|
 
 ## §5 KILL / DEFER(不要重做)
 

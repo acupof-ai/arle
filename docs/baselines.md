@@ -6,16 +6,16 @@ One table per config fingerprint. Screening compares new runs against the
 champion row — no second arm. Rules:
 
 1. **Effect > ~10% (2× the measured cross-session drift band)**: rolling
-   baseline verdict is valid; update the champion row, archive the binary.
+ baseline verdict is valid; update the champion row, archive the binary.
 2. **Effect inside the drift band (±3% measured 2026-07-16: same binary
-   lineage, different session + GPU set): never kill on ambiguity — every
-   stable positive gain is kept.** Escalate to a same-shell A/B against the
-   archived champion binary (≥3 trials/arm, median + range) to resolve sign.
+ lineage, different session + GPU set): never kill on ambiguity — every
+ stable positive gain is kept.** Escalate to a same-shell A/B against the
+ archived champion binary (≥3 trials/arm, median + range) to resolve sign.
 3. **Fingerprint change re-anchors**: any change to model, TP/EP, GPU set,
-   serve flags, num_slots line, dataset, driver/CUDA invalidates the row —
-   re-measure the champion before comparing.
+ serve flags, num_slots line, dataset, driver/CUDA invalidates the row —
+ re-measure the champion before comparing.
 4. **Anchor audit**: every ~5 accepted updates (and before any default flip),
-   one A/B against the oldest archived binary bounds accumulated drift.
+ one A/B against the oldest archived binary bounds accumulated drift.
 
 ## DSv4-Flash-FP8 · 4×H20 GPUs 3,5,6,7 · TP=4/EP=4 · eager · port 8000
 
@@ -33,12 +33,12 @@ Needle ×3 passes (15/15 strict). Raw: pod
 | 16 | **195.7** | 69.7 | -64.4% | 117.6 | -39.9% |
 
 - **Base = production champion.** c16 195.7 vs old chunk-2048 anchor 142.9
-  (different GPU set + 120s vs 90s → re-anchor, not a strict Δ).
+ (different GPU set + 120s vs 90s → re-anchor, not a strict Δ).
 - **MTP: c1-only win.** accept_rate 0.704; draft verification serializes under
-  concurrency, c4+ regresses. Not a default-flip candidate.
+ concurrency, c4+ regresses. Not a default-flip candidate.
 - **DSpark: not triggered.** `--dspark-max-prompt-tokens 64` routes all >64-tok
-  prompts to no-spec; bench prompts ~2.8k tok → 100% target decode. Needs
-  short-prompt workload to measure gain.
+ prompts to no-spec; bench prompts ~2.8k tok → 100% target decode. Needs
+ short-prompt workload to measure gain.
 
 ## DSv4-Flash-FP8 · 4×H20 GPUs 0–3 · TP=4/EP=4 · eager · port 8000
 
@@ -111,14 +111,14 @@ greedy. Raw: pod `/tmp/nospec_c8c16.{json,csv}`.
 | 16 | **146.7** | n/a (OOM) | n/a | 0 / n/a |
 
 - **No-spec re-measured with correct config**: GPUs 1,2,3,5 (GPU 5 had 8 GB stale
-  memory from a dead process, not 37 GB as the 2026-07-20 run assumed) +
-  `--max-running-requests 32` (the 2026-07-20 c=16 run omitted this → 82286
-  connection errors, 15/82303 complete). c=16 now valid: 48/48 complete, 0 errors.
+ memory from a dead process, not 37 GB as the 2026-07-20 run assumed) +
+ `--max-running-requests 32` (the 2026-07-20 c=16 run omitted this → 82286
+ connection errors, 15/82303 complete). c=16 now valid: 48/48 complete, 0 errors.
 - **DSpark OOM on GPU 5**: draft model needs ~10 GB more than no-spec; GPU 5's 8 GB
-  stale memory (PID 1499243, unkillable, `nvidia-smi --gpu-reset` refused) leaves
-  insufficient headroom. 3 GPUs fully free (1,2,3) is not enough for TP=4 DSpark.
+ stale memory (PID 1499243, unkillable, `nvidia-smi --gpu-reset` refused) leaves
+ insufficient headroom. 3 GPUs fully free (1,2,3) is not enough for TP=4 DSpark.
 - **Prev (2026-07-20) no-spec rows invalid**: c=8 146.5 ran on 3 effective GPUs
-  (GPU 5 occupied); c=16 32.0 was server collapse. Both superseded.
+ (GPU 5 occupied); c=16 32.0 was server collapse. Both superseded.
 
 ## Qwen3.6-27B-W4A16 · 1×V100 (sm_70) · eager · port 8080
 
@@ -139,8 +139,8 @@ sampling undercounts at c≥4); the out tok/s column is the valid throughput
 metric. c=1 ITL 40.4 ms ≈ 24.7 tok/s decode, matches the c=1 out tok/s.
 
 - **Decode-bound at all concurrencies.** out tok/s scales weakly (22.8 → 30.1,
-  +32% from c=1 to c=16) — V100 sm_70 W4A16 decode is the bottleneck, not
-  scheduler/KV. TTFT grows linearly with concurrency (queueing).
+ +32% from c=1 to c=16) — V100 sm_70 W4A16 decode is the bottleneck, not
+ scheduler/KV. TTFT grows linearly with concurrency (queueing).
 
 ### DSpark arm — KILLED (−91% at c=1)
 
@@ -160,14 +160,12 @@ z-lab/Qwen3.6-27B-DFlash` (DFlash drafter, block=16, taps=[1,16,31,46,61]).
 12.5× slower per decode step.
 
 - **KILL.** DSpark draft+verify path on V100 sm_70 adds ~460 ms/step overhead
-  (ITL 40 → 499 ms). c=8 all 8 requests error (1543 s wall); c=16 connection
-  storm (131204 errors in 60 s). Serve log: `[coordinator] lockstep stalled:
-  tick #2232128 awaiting acks (elapsed=10s)` — the TP lockstep mechanism
-  deadlocks under DSpark's multi-step proposal on single-GPU V100.
+ (ITL 40 → 499 ms). c=8 all 8 requests error (1543 s wall); c=16 connection
+ storm (131204 errors in 60 s). Serve log: `[coordinator] lockstep stalled:
+ tick #2232128 awaiting acks (elapsed=10s)` — the TP lockstep mechanism
+ deadlocks under DSpark's multi-step proposal on single-GPU V100.
 - **Root cause hypothesis**: DSpark's `tp_lockstep_proposal/accept` was designed
-  for TP≥2 (H20); on TP=1 V100 the lockstep coordinator stalls waiting for
-  cross-rank acks that never arrive. Needs a TP=1 fast path or the lockstep
-  disabled when world_size=1.
-
-
+ for TP≥2 (H20); on TP=1 V100 the lockstep coordinator stalls waiting for
+ cross-rank acks that never arrive. Needs a TP=1 fast path or the lockstep
+ disabled when world_size=1.
 

@@ -9,12 +9,12 @@ with concrete evidence.
 > **Format conventions**
 > - **dtype** = how K/V or weight bits are laid out in memory.
 > - **scale** = per-tensor / per-channel / per-group / per-(token, head),
->   plus what numeric range it normalizes to (e.g. FP8 E4M3 absmax = 448,
->   INT8 = 127).
+> plus what numeric range it normalizes to (e.g. FP8 E4M3 absmax = 448,
+> INT8 = 127).
 > - **status** uses one of: `production` (default-safe), `opt-in`
->   (verified for known use cases, not auto-default), `experimental`
->   (works but quality not gated), `known-broken` (reproduces a logged
->   failure today), `not-shipped` (planned).
+> (verified for known use cases, not auto-default), `experimental`
+> (works but quality not gated), `known-broken` (reproduces a logged
+> failure today), `not-shipped` (planned).
 
 ---
 
@@ -59,39 +59,39 @@ describe the `crates/cuda-kernels` surface that survives the rewrite.
 - **Storage**: `__nv_bfloat16` rows in the paged pool, no scale.
 - **Quantize kernels**: none (direct write from the BF16 work buffer).
 - **Decode-attn kernel**: TileLang HD128 BF16 attention (paged) — same
-  kernel family as INT8/FP8, just without dequant.
+ kernel family as INT8/FP8, just without dequant.
 - **Status**: production. Reference for all audits.
 - **Memory cost**: 2 bytes / element (baseline).
 - **Limitation**: No KV compression; cache size scales as
-  `num_layers · 2 · num_kv_heads · head_dim · max_total_tokens · 2 B`.
+ `num_layers · 2 · num_kv_heads · head_dim · max_total_tokens · 2 B`.
 
 ### 1.2 INT8 (KIVI per-channel K)
 
 - **Storage**: `i8` rows (NHD `[max_tokens, kv_dim]`) + `f32` scales,
-  asymmetric per KIVI:
-  - **K**: per-(kv_head, head_dim) static table calibrated from the
-    first prefill batch (`absmax / 127`).
-  - **V**: per-(token, kv_head) (`absmax / 127`).
+ asymmetric per KIVI:
+ - **K**: per-(kv_head, head_dim) static table calibrated from the
+ first prefill batch (`absmax / 127`).
+ - **V**: per-(token, kv_head) (`absmax / 127`).
 - **Quantize kernels** (`csrc/kv/kv_quant.cu`):
-  - `quantize_paged_kv_int8_per_channel_kernel` — KIVI K quantize
-    using the static `[num_kv_heads, head_dim]` scale table.
-  - `quantize_paged_kv_single_kernel` — V per-(row, head) quantize
-    (also handles K in the BF16 contig→paged migration path).
-  - `compute_k_per_channel_absmax_kernel` +
-    `finalize_k_per_channel_scales_int8_kernel` (/127) — calibration.
+ - `quantize_paged_kv_int8_per_channel_kernel` — KIVI K quantize
+ using the static `[num_kv_heads, head_dim]` scale table.
+ - `quantize_paged_kv_single_kernel` — V per-(row, head) quantize
+ (also handles K in the BF16 contig→paged migration path).
+ - `compute_k_per_channel_absmax_kernel` +
+ `finalize_k_per_channel_scales_int8_kernel` (/127) — calibration.
 - **Decode-attn kernel**:
-  `decode_attention_int8_per_channel_k_partial_kernel`
-  (`csrc/attention/decode_attention_quantized.cu`) — cp.async smem
-  tiling, K scales pre-loaded into `k_scale_reg[EPT]` registers once
-  per warp at kernel entry, V scales loaded per-token from smem.
+ `decode_attention_int8_per_channel_k_partial_kernel`
+ (`csrc/attention/decode_attention_quantized.cu`) — cp.async smem
+ tiling, K scales pre-loaded into `k_scale_reg[EPT]` registers once
+ per warp at kernel entry, V scales loaded per-token from smem.
 - **Status**: production (CUDA). V100 Qwen3.5-4B audit
-  `mean_match=1.0000` bit-identical with BF16 across 32 generated
-  tokens / 2 prompts (2026-05-27 wins entry). Prior per-(token, head)
-  K path showed `mean_match=0.094` step-1 drift — retired in the same
-  commit that wired KIVI for INT8.
+ `mean_match=1.0000` bit-identical with BF16 across 32 generated
+ tokens / 2 prompts (2026-05-27 wins entry). Prior per-(token, head)
+ K path showed `mean_match=0.094` step-1 drift — retired in the same
+ commit that wired KIVI for INT8.
 - **Memory cost**: ~1.05 byte / element (i8 + V per-(token, head) f32
-  scale + K static `[num_kv_heads, head_dim]` f32 table — the K table
-  is layer-shared, amortizing to ~0 bytes / element).
+ scale + K static `[num_kv_heads, head_dim]` f32 table — the K table
+ is layer-shared, amortizing to ~0 bytes / element).
 
 ### 1.3 FP8 E4M3 (KIVI per-channel K)
 
@@ -101,21 +101,21 @@ same K calibration, same V per-(row, head) scheme.
 
 - **Storage**: `__nv_fp8_e4m3` rows + `f32` scales.
 - **Scale**:
-  - **K**: per-(kv_head, head_dim) static table, `absmax / 448`,
-    1e-30 floor (catches only truly-zero channels — the 2026-05-26
-    1e-6 floor incident at `8c6d92db` showed any larger floor causes
-    deep-layer K to saturate; the floor is intentionally minimal).
-  - **V**: per-(token, kv_head), `absmax / 448`.
+ - **K**: per-(kv_head, head_dim) static table, `absmax / 448`,
+ 1e-30 floor (catches only truly-zero channels — the 2026-05-26
+ 1e-6 floor incident at `8c6d92db` showed any larger floor causes
+ deep-layer K to saturate; the floor is intentionally minimal).
+ - **V**: per-(token, kv_head), `absmax / 448`.
 - **Quantize kernels** (`csrc/kv/kv_quant.cu`):
-  - `quantize_paged_kv_fp8_per_channel_kernel` — KIVI K quantize.
-  - `quantize_paged_kv_fp8_kernel` — V per-(row, head) quantize.
-  - `compute_k_per_channel_absmax_kernel` +
-    `finalize_k_per_channel_scales_kernel` (/448) — calibration pair.
+ - `quantize_paged_kv_fp8_per_channel_kernel` — KIVI K quantize.
+ - `quantize_paged_kv_fp8_kernel` — V per-(row, head) quantize.
+ - `compute_k_per_channel_absmax_kernel` +
+ `finalize_k_per_channel_scales_kernel` (/448) — calibration pair.
 - **Decode-attn kernel**:
-  `decode_attention_fp8_per_channel_k_partial_kernel` (HEAD_DIM
-  templated) — K scales pre-loaded into registers; HW-accelerated
-  4-wide FP8 dequant via `__nv_fp8x4_e4m3 → float4`. Phase-2 merge
-  shares `decode_attention_merge_kernel` with INT8.
+ `decode_attention_fp8_per_channel_k_partial_kernel` (HEAD_DIM
+ templated) — K scales pre-loaded into registers; HW-accelerated
+ 4-wide FP8 dequant via `__nv_fp8x4_e4m3 → float4`. Phase-2 merge
+ shares `decode_attention_merge_kernel` with INT8.
 - **Status**: production (CUDA). V100 audit `mean_match=1.0000`.
 
 ### 1.3.5 The retired per-token K kernels
@@ -125,41 +125,41 @@ Pre-2026-05-27 INT8 and FP8 both used per-(token, head) K scales via
 in commit `ba74dd49`:
 
 - 1052 lines deleted across `decode_attention_quantized.cu`, the
-  Rust wrappers, FFI, and a smoke test.
+ Rust wrappers, FFI, and a smoke test.
 - All KV dispatch sites in the legacy `infer/` qwen3 / qwen35
-  prefill + batch-decode paths route exclusively through the
-  per-channel K kernels.
+ prefill + batch-decode paths route exclusively through the
+ per-channel K kernels.
 - Kept: `quantize_paged_kv_single` and `quantize_paged_kv_fp8`,
-  because V still uses per-(row, head) scales (KIVI's asymmetric
-  design); `decode_attention_int8_workspace_bytes` because both
-  per-channel K kernels share its workspace layout;
-  `decode_attention_merge_kernel` (Phase 2, shared);
-  `decode_attention_varlen_fp8` (mixed prefill+decode varlen path —
-  separate KIVI migration tracked as follow-up).
+ because V still uses per-(row, head) scales (KIVI's asymmetric
+ design); `decode_attention_int8_workspace_bytes` because both
+ per-channel K kernels share its workspace layout;
+ `decode_attention_merge_kernel` (Phase 2, shared);
+ `decode_attention_varlen_fp8` (mixed prefill+decode varlen path —
+ separate KIVI migration tracked as follow-up).
 
 ### 1.4 TurboQuant TQ2 / TQ3 / TQ4
 
 - **Storage**: packed indices (2/3/4 bits per element) + FP16 per-group
-  norms + Hadamard sign bits.
+ norms + Hadamard sign bits.
 - **Scale**: FWHT-rotated absmax norm per group; bit-pair-combined
-  during dequant. Pool allocates `page_size = 1` (one token per page).
+ during dequant. Pool allocates `page_size = 1` (one token per page).
 - **Quantize kernels**:
-  `crates/cuda-kernels/csrc/quant/turboquant_*` — pack/unpack pair.
+ `crates/cuda-kernels/csrc/quant/turboquant_*` — pack/unpack pair.
 - **Decode-attn kernel**:
-  `decode_attention_turboquant_*` — fused dequant inline.
+ `decode_attention_turboquant_*` — fused dequant inline.
 - **Prefill path**: `page_size = 1` triggers the contiguous BF16
-  prefill path (legacy `infer/` qwen3 forward dispatch + the CUDA
-  scheduler `prefill::prepare` path) rather than the HD128 batched
-  paged kernel that BF16/INT8/FP8 use.
+ prefill path (legacy `infer/` qwen3 forward dispatch + the CUDA
+ scheduler `prefill::prepare` path) rather than the HD128 batched
+ paged kernel that BF16/INT8/FP8 use.
 - **Status**: experimental. **As of 2026-05-27, TQ4 is the only KV
-  format that produced the HF-reference first token (`151667 = <think>`)
-  in the audit on Qwen3-4B chat**; BF16/INT8/FP8 produced token 0
-  (`!`). This is the smoking gun that pointed the investigation at the
-  shared HD128 batched paged prefill kernel — see §5.
+ format that produced the HF-reference first token (`151667 = <think>`)
+ in the audit on Qwen3-4B chat**; BF16/INT8/FP8 produced token 0
+ (`!`). This is the smoking gun that pointed the investigation at the
+ shared HD128 batched paged prefill kernel — see §5.
 - **Quality gate**: greedy token-trajectory match against BF16 is *not*
-  a meaningful gate for TQ (tensor-local fixes license only their own
-  gate, not full-model logits parity —
-  `2026-05-21-arle-turboquant-9b-fwht-fixed-logits-kill`).
+ a meaningful gate for TQ (tensor-local fixes license only their own
+ gate, not full-model logits parity —
+ `2026-05-21-arle-turboquant-9b-fwht-fixed-logits-kill`).
 
 ---
 
@@ -212,32 +212,32 @@ kernel. Opt-in lossy conversion to MLX-native q4 group64 via
 ### 1.5 Metal INT8 (MLX affine groups)
 
 - **Storage**: one packed affine triple per full-attention K or V cache:
-  `uint32` packed 8-bit data with last dim `head_dim / 4`, plus BF16
-  `scale` and `bias` arrays with last dim `head_dim / group_size`.
+ `uint32` packed 8-bit data with last dim `head_dim / 4`, plus BF16
+ `scale` and `bias` arrays with last dim `head_dim / group_size`.
 - **Group size**: largest supported divisor among 128, 64, 32. Qwen3.6
-  (`head_dim=256`) uses group 128.
+ (`head_dim=256`) uses group 128.
 - **Write path**: C++ session quantizes only the newly written K/V chunk, then
-  `slice_update`s the packed data/scale/bias cache at `cache_pos`. It does not
-  re-quantize the whole cache every token.
+ `slice_update`s the packed data/scale/bias cache at `cache_pos`. It does not
+ re-quantize the whole cache every token.
 - **Read path**: the active prefix is dequantized to BF16 before MLX SDPA.
-  This keeps correctness close to the existing BF16 attention path while making
-  the persistent session KV about half-size.
+ This keeps correctness close to the existing BF16 attention path while making
+ the persistent session KV about half-size.
 - **Scope**: full-attention KV only. Qwen3.5/3.6 linear-attention recurrent and
-  convolution state keep their existing FP32/BF16 dtypes.
+ convolution state keep their existing FP32/BF16 dtypes.
 - **Evidence**: Qwen3.6 16K serial probe on local Apple Silicon:
-  BF16 after-clear active 24.203 GB vs INT8 23.691 GB, a 512 MB reduction;
-  8K probe reduced 244 MB. See
-  [`experience/wins/2026-06-11-metal-int8-kv-default.md`](experience/wins/2026-06-11-metal-int8-kv-default.md).
+ BF16 after-clear active 24.203 GB vs INT8 23.691 GB, a 512 MB reduction;
+ 8K probe reduced 244 MB. See
+ [`experience/wins/2026-06-11-metal-int8-kv-default.md`](experience/wins/2026-06-11-metal-int8-kv-default.md).
 
 ## 3. CLI quick reference
 
 ```bash
 # KV cache
 --kv-cache-dtype <auto|bf16|int8>
-  # Metal: auto → int8, bf16 → reference fallback, int8 → explicit default path.
-  # CUDA rewrite: dtype plumbing is backend-owned; unsupported flags fail closed.
-  # Legacy CUDA kernel formats fp8/tq{2,3,4} remain documented above but are not
-  # exposed by the rewrite CLI in this Metal tranche.
+ # Metal: auto → int8, bf16 → reference fallback, int8 → explicit default path.
+ # CUDA rewrite: dtype plumbing is backend-owned; unsupported flags fail closed.
+ # Legacy CUDA kernel formats fp8/tq{2,3,4} remain documented above but are not
+ # exposed by the rewrite CLI in this Metal tranche.
 
 # Weight quantization
 # Format is autodetected from safetensors metadata. No CLI flag needed.
@@ -290,17 +290,17 @@ Ruled out across the chain (`2026-05-26-fp8-kv-catastrophic-was-test-artifact.md
 + `2026-05-26-kivi-per-channel-k-insufficient-for-qwen3-4b-fp8.md`
 RETRACTED):
 - KV-side numerics (KIVI scale dump shows non-degenerate, decode
-  kernel math correct after `73a72615`).
+ kernel math correct after `73a72615`).
 - FP8 quant scale floor (fixed `25c7d409`).
 - Model load / tokenizer / RMSNorm / RoPE / LM head (HF reference uses
-  same weights and works; `forward_raw_logits` produces sensible
-  argmax).
+ same weights and works; `forward_raw_logits` produces sensible
+ argmax).
 - `INFER_DETERMINISTIC` autotune-bypass / cublasGemmEx fallback
-  (`228d6eb8` verified: turning it off doesn't change the
-  result).
+ (`228d6eb8` verified: turning it off doesn't change the
+ result).
 - ChatML special-token tokenization (HF tokenizer is shared via
-  `tokenizers` crate; the same ChatML wrap that works in HF reaches the
-  scheduler).
+ `tokenizers` crate; the same ChatML wrap that works in HF reaches the
+ scheduler).
 
 Bench numbers from `2026-05-26-bench-int8-vs-bf16-kv-a100.md`
 (throughput +57–113% INT8 vs BF16 on synthetic random-token prompts)
@@ -320,45 +320,45 @@ write layout against the decode-time read layout for an off-by-one.
 
 **Recent errors (chronological)**:
 - `errors/2026-05-26-fp8-kv-catastrophic-was-test-artifact.md` — the
-  retract chain; `mean_match` under a degenerate `!`-loop reference is
-  noise-fidelity, not quality.
+ retract chain; `mean_match` under a degenerate `!`-loop reference is
+ noise-fidelity, not quality.
 - `errors/2026-05-26-kivi-per-channel-k-insufficient-for-qwen3-4b-fp8.md`
-  — **RETRACTED**. Conclusion invalid because metric was bad.
+ — **RETRACTED**. Conclusion invalid because metric was bad.
 - `errors/2026-05-26-fp8-kv-step1-divergence-known-deferred.md` — the
-  "precision-floor compounding" hypothesis from f50dd674. Needs
-  re-evaluation under a non-degenerate reference once the paged-prefill
-  investigation closes.
+ "precision-floor compounding" hypothesis from f50dd674. Needs
+ re-evaluation under a non-degenerate reference once the paged-prefill
+ investigation closes.
 - `errors/2026-05-21-arle-turboquant-9b-fwht-fixed-logits-kill.md` —
-  TurboQuant tensor-local fixes don't gate full-model logits parity.
+ TurboQuant tensor-local fixes don't gate full-model logits parity.
 - `errors/2026-05-02-qwen3-fp8-kv-numerical-tier1-fail.md`,
-  `2026-05-05-fp8-kv-tier1-still-fail.md` — earlier FP8 KV failure
-  characterizations also relied on `mean_match`; the retract chain
-  applies.
+ `2026-05-05-fp8-kv-tier1-still-fail.md` — earlier FP8 KV failure
+ characterizations also relied on `mean_match`; the retract chain
+ applies.
 
 **Recent wins**:
 - `wins/2026-05-26-bench-int8-vs-bf16-kv-a100.md` — throughput numbers,
-  independent of the quality investigation.
+ independent of the quality investigation.
 
 **Commits central to this matrix**:
 - `25c7d409` fix(cuda): remove FP8 quant `s_scale` 1e-6 floor.
 - `73a72615` fix(cuda): KIVI partial kernel must write normalized `o_s`.
 - `e0c283d1` fix(cuda): recursive `rerun-if-changed` for csrc/ subdirs
-  (so .cu edits actually trigger rebuilds).
+ (so .cu edits actually trigger rebuilds).
 - `0ef57994` debug(kv-tier): KIVI `k_static_scales` post-finalize dump.
 - `8c6d92db` feat(kv-tier): KIVI per-channel K + per-token V FP8 KV
-  implementation (V1, gated).
+ implementation (V1, gated).
 - `228d6eb8` test(kv-tier): don't force `INFER_DETERMINISTIC` + document
-  scheduler-path bug.
+ scheduler-path bug.
 - `9259fe13` test(kv-tier): natural-continuation prompt 0 + document
-  repetition-penalty wiring gap.
+ repetition-penalty wiring gap.
 
 ---
 
 **Background reading (industry landscape, not project status)**:
 - [`resources/kv-cache-quantization.md`](resources/kv-cache-quantization.md)
-  — methods survey (uniform, heterogeneous K/V, KIVI, KVQuant,
-  TurboQuant), frameworks (LMDeploy, TensorRT-LLM, llm-compressor),
-  evaluation methodology.
+ — methods survey (uniform, heterogeneous K/V, KIVI, KVQuant,
+ TurboQuant), frameworks (LMDeploy, TensorRT-LLM, llm-compressor),
+ evaluation methodology.
 
 ---
 

@@ -294,7 +294,7 @@ and on GHCR (`ghcr.io/cklxx/arle:0.1.0`, `:0.1`, `:latest`).
 ### 2026-04-25 — Truth-surface cleanup
 
 Documentation-only refactor that collapses `docs/` to a single source of
-truth per [`docs/plans/2026-04-20-project-constitution-and-refactor-plan.md`](docs/plans/2026-04-20-project-constitution-and-refactor-plan.md)
+truth per the 2026-04-20 project constitution / refactor plan (purged)
 §2. No code or behavior change.
 
 Net effect: the documentation tree shrinks by ~330 markdown files. After
@@ -356,7 +356,7 @@ Coordinated refactor round finishing Route-A and pre-staging the internal seams 
 - `build.rs` Triton `cargo:rerun-if-changed` list is now auto-derived from a directory walk instead of a hand-maintained constant, so new Triton kernels don't silently skip rebuilds.
 
 #### Kernel crate extraction (option B landed same day)
-- Followed the hygiene round by executing the option B extraction locked in [`docs/plans/cuda-kernel-crate-extraction.md`](docs/plans/cuda-kernel-crate-extraction.md) — the `backend::cuda::prelude` seam was the staging point, and commits `a4e12f5` → `0ab2cd1` → `081cf32` landed the one-day mechanical refactor. `backend/cuda/` now contains only `bootstrap.rs`; all kernel sources, FFI, paged KV, FlashInfer wrappers, graph pool, tensor primitives, KV quant, and TurboQuant live under [`crates/cuda-kernels/`](crates/cuda-kernels/) with a one-way `infer → cuda-kernels` dependency. CUDA kernel C++ sources moved from `infer/csrc/cuda/` to `crates/cuda-kernels/csrc/{attention,gemm,kv,misc,quant}/`.
+- Followed the hygiene round by executing the option B kernel-crate extraction (plan purged; see [`docs/architecture.md`](docs/architecture.md) + [`docs/reviews/kernel-registry.md`](docs/reviews/kernel-registry.md)) — the `backend::cuda::prelude` seam was the staging point, and commits `a4e12f5` → `0ab2cd1` → `081cf32` landed the one-day mechanical refactor. `backend/cuda/` now contains only `bootstrap.rs`; all kernel sources, FFI, paged KV, FlashInfer wrappers, graph pool, tensor primitives, KV quant, and TurboQuant live under [`crates/cuda-kernels/`](crates/cuda-kernels/) with a one-way `infer → cuda-kernels` dependency. CUDA kernel C++ sources moved from `infer/csrc/cuda/` to `crates/cuda-kernels/csrc/{attention,gemm,kv,misc,quant}/`.
 - The `mlx-sys` bridge was promoted from `infer/mlx-sys/` to [`crates/mlx-sys/`](crates/mlx-sys/) as part of the same Route-A flattening so both native layers (CUDA, Metal) sit peer-level under `crates/`.
 
 ### Governance

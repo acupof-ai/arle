@@ -285,7 +285,7 @@ crates/
 
 ## 9. 相关文档
 
-- **执行计划**：[`docs/plans/rust-agent-rl-single-node.md`](../plans/rust-agent-rl-single-node.md)
+- **执行计划**：`docs/plans/rust-agent-rl-single-node.md`
 - **Roadmap 入口**：[`ROADMAP.md`](../../ROADMAP.md) → Phase 6
 - **现状（推理侧）**：[`docs/architecture.md`](../architecture.md)、[`docs/codebase-map.md`](../codebase-map.md)
 - **Metal 支线对齐**：[`docs/projects/mlx-backend-roadmap.md`](mlx-backend-roadmap.md)

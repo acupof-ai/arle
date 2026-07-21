@@ -26,6 +26,6 @@ WQKV, native DeepGEMM, paged/batched decode, decode reuse, chunked prefill
 
 - Base (no speculative) remains the production champion for all concurrency.
 - MTP/DSpark are c1-only or pending structural fixes
-  (see [errors](errors/2026-07-19-dsv4-mtp-dspark-high-concurrency-regression.md)).
+  (see [errors](../errors/2026-07-19-dsv4-mtp-dspark-high-concurrency-regression.md)).
 - Re-anchor vs old chunk-2048 row (different GPU set + 120s vs 90s) — not
   a strict Δ comparison.

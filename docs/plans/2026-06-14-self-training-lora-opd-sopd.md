@@ -1,7 +1,7 @@
 # Plan: Self-training LoRA OPD (SOPD) — on-device weight self-update
 
 > ✅ **APPROACH DECIDED (ckl 2026-06-14).** After the apples-to-apples
-> [survey](../research/2026-06-14-self-training-lora-options-survey.md) + three
+> survey + three
 > Codex-review passes (9 findings, all fixed), ckl locked the first cut:
 > - **Timing = G2** (整句后更新 / per-sequence inline) — the update fires after each
 >   rollout *sequence* on the rollout path; **not** per-token G3, **not** offline batch.
@@ -49,7 +49,7 @@ at once:
 2. **Teacher-free memory** — student and self-teacher *share the same frozen
    base*; the only per-role state is a ~10 MB adapter. The
    teacher+student co-residency OOM that
-   [blocked the 9B→0.8B plan](2026-05-21-arle-opd-qwen35-9b-to-08b-distillation-plan.md)
+   blocked the 9B→0.8B plan
    (15871/16384 MiB) disappears.
 3. **Trivial rollback** — base never mutates; a bad self-update is reverted by
    restoring the adapter + AdamW moments (§Mutated state).
@@ -320,7 +320,7 @@ wrapper around the rollout in `opd.rs`; verifier trait + GSM8K exact-match impl
 #93's exact-match verifier only reaches *checkable* skills (math/code/tool-schema).
 Real agent skills (Phase 4) are **not** exact-match-verifiable, so #93 alone can
 never feed Phase 4. **A5 swaps the exact-match verifier for an auto-induced
-rubric** ([ROPD](../research/2026-06-14-rubric-opd.md), arXiv 2605.07396): a
+rubric** (ROPD, arXiv 2605.07396): a
 **Rubricator** induces a prompt-specific rubric by contrasting EMA-teacher vs
 student rollouts; a **blind Verifier** scores each criterion; best-of-N selects
 the rubric-best τ*; distill via the same GKD `λ·CE(student‖τ*) + (1−λ)·KL(student‖EMA)`.
@@ -462,10 +462,10 @@ Phase 0 (CUDA, inline G2 A1-EMA loop)   ← MECHANISM KEYSTONE, blocks all
 ## Cross-links
 
 - Tracking issue: [#90](https://github.com/cklxx/arle/issues/90) (phase-3); roadmap Phase-3 row + off-path note; umbrella [#55](https://github.com/cklxx/arle/issues/55); related [#64](https://github.com/cklxx/arle/issues/64) (OPD resume), [#71](https://github.com/cklxx/arle/issues/71) (AIPC/Metal port)
-- Rubric-graded A5 (Phase 0.6, [#98](https://github.com/cklxx/arle/issues/98)): [`2026-06-14-rubric-opd.md`](../research/2026-06-14-rubric-opd.md) — ROPD machinery in distillation form (never GRPO), the open-ended bridge #93 → #97
+- Rubric-graded A5 (Phase 0.6, [#98](https://github.com/cklxx/arle/issues/98)): `2026-06-14-rubric-opd.md` — ROPD machinery in distillation form (never GRPO), the open-ended bridge #93 → #97
 - Strategy: [`2026-06-10-arle-master-strategy-v2.md`](../projects/2026-06-10-arle-master-strategy-v2.md) §3 Phase 3 #3/#5, D4, §5 ROCm/AIPC
 - OPD-only pivot (the distillation-not-RL line): [`2026-05-18-opd-only-pivot.md`](../projects/2026-05-18-opd-only-pivot.md)
 - Retired doctrine (data flow + verifier + reward-hack risk): [`agent-rl-self-evolving.md`](../projects/agent-rl-self-evolving.md)
-- Rollout-via-infer (LoRA-sync mechanism, AttentionQv lock): [`2026-05-29-opd-student-rollout-via-infer.md`](2026-05-29-opd-student-rollout-via-infer.md)
-- Teacher+student OOM (why teacher-free matters): [`2026-05-21-arle-opd-qwen35-9b-to-08b-distillation-plan.md`](2026-05-21-arle-opd-qwen35-9b-to-08b-distillation-plan.md)
+- Rollout-via-infer (LoRA-sync mechanism, AttentionQv lock): `2026-05-29-opd-student-rollout-via-infer.md`
+- Teacher+student OOM (why teacher-free matters): `2026-05-21-arle-opd-qwen35-9b-to-08b-distillation-plan.md`
 - Eval discipline: `errors/2026-05-28-mmlu-cross-base-was-noise.md`, `wins/2026-05-22-distill-trajectory-valley-then-recovery.md`, `wins/2026-05-22-opd-task-divergent-impact.md`

@@ -52,7 +52,7 @@ correct. What changes is ONLY the drafter: 1-layer NextN chain (depth 2) →
 | Piece | Where | Status |
 |---|---|---|
 | Verify forward + per-row logits, on-device argmax | `qwen35.rs` spec_step | shipped |
-| Recurrent rollback: `gdr_snap`/`conv_snap` + `Qwen35LinearCapture` linear-only replay | `qwen35.rs:1057-1110` | shipped, bit-equal ([06-23](../experience/wins/2026-06-23-mtp-replay-elimination-h20-net-win.md)) |
+| Recurrent rollback: `gdr_snap`/`conv_snap` + `Qwen35LinearCapture` linear-only replay | `qwen35.rs:1057-1110` | shipped, bit-equal (06-23) |
 | Full-attn cursor rewind on partial accept | `qwen35.rs:901` | shipped |
 | Adaptive gate (accept EMA, skip streak) | `executor.rs:1823-1831` | shipped (DSv4 lane) |
 | CLI: `--spec-type`, `--mtp-draft-model`, `--mtp-draft-tokens/topk` | `cli/src/args.rs:685-738` | shipped |
@@ -165,7 +165,7 @@ is extending that lane down the M axis, not a new kernel.
    `(kind, m, n, k)` → `{config, runtime}` in a host map; TMA descriptors
    stay per-call (they embed device pointers).
 2. Routing floor `QWEN_FP8_DEEPGEMM_DENSE_MIN_M = 16`
-   (`quant_linear.rs:25`): M∈[1,16) runs the scalar warp-per-row GEMV
+   (`quant_linear.rs:25`): M∈1,16) runs the scalar warp-per-row GEMV
    (`quantized_gemv.cu::fp8_f32_block_gemv_batch_kernel`), measured ~30% of
    HBM BW at B=1 e2e. After (1), A/B GEMV vs DeepGEMM per
    M∈{1,2,4,8,16,17,32} per shape (FFN 17408×5120 / 5120×17408, attn-sized
@@ -189,7 +189,7 @@ exact both lanes + same-config-twice self-consistency.
   latency-bound so draft cost eats acceptance gains — that is what the P1 A/B
   measures, no pre-estimate.
 - K=7 verify rows widen the verify GEMV past its depth-2 tile-matching
-  ([06-22](../experience/wins/2026-06-22-tile-matched-amortizing-verify-gemv.md));
+  ([06-22);
   re-measure, don't assume.
 - 45K-context draft conditioning: confirm in P0 how DFlash consumes target
   hidden at long ctx (it does not re-attend the trunk context).

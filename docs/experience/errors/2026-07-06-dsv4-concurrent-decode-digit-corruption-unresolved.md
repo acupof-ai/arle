@@ -806,7 +806,7 @@ identical numeric-vs-text needle A/B (`concurrent_needle_v3_qwen.py` /
 requests/arm, greedy) against **Qwen3.6-27B-FP8** (qwen35-hybrid MoE path,
 `sqrtsoftplus`/`noaux_tc` top-k routing — the same MoE routing family DSv4
 itself uses) at TP=1/GPU=1 (fits 1×H20 per
-[wins/2026-06-29-cuda-qwen36-paged-batched-decode.md](wins/2026-06-29-cuda-qwen36-paged-batched-decode.md)).
+[wins/2026-06-29-cuda-qwen36-paged-batched-decode.md](../wins/2026-06-29-cuda-qwen36-paged-batched-decode.md)).
 Solo (n=1) sanity 3/3 exact on both needles first.
 
 | Needle | Requests | Exact | Miss rate |

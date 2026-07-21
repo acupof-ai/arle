@@ -162,7 +162,7 @@ Do not delete or wire anything until the verdict lands.
 ### R0.4 — D5 env-knob cleanup — queued, not this wave
 
 Execute per the existing audit plan
-[`2026-06-07-dsv4-code-cleanup-audit.md`](2026-06-07-dsv4-code-cleanup-audit.md).
+`2026-06-07-dsv4-code-cleanup-audit.md`.
 Do a fresh `ARLE_/INFER_` env-var sweep first; do **not** trust the old
 63-call-site count. Classify bootstrap-legit (`INFER_TP_RANK`,
 `INFER_NCCL_UNIQUE_ID`, build/toolchain) vs runtime-knob→CLI-flag. Touches

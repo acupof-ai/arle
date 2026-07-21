@@ -4,12 +4,12 @@
 
 Round 3 of a verification chain on real CUDA hardware (8×H20):
 
-1. [round 1](2026-07-06-dsv4-max-total-tokens-pod-verify.md) — no-flags DSv4
+1. round 1 — no-flags DSv4
    serve auto-resolved `max_seq_len` to the checkpoint's native
    `max_position_embeddings` (1,048,576) and hard-failed at engine build
    (`kv_layout.rs`'s FlashMLA pool `ensure!`, pages=3344 need>=4098) on all 4
    worker ranks.
-2. [round 2](2026-07-06-dsv4-auto-context-ceiling-still-crashes-tp4.md) —
+2. round 2 —
    `29fdda704` capped the auto-resolve ceiling at 32768, but the same failure
    still reproduced at the smaller value (pages=74 need>=130) — proving the
    real defect is a reconciliation gap between two independent budget checks

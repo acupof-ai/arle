@@ -115,13 +115,13 @@ from the start.
 The remaining live gaps are: remote/shared staged readmission beyond the
 current local CUDA path, and the Metal MLX wired-memory bindings that
 were cut from the M4 batch. The detailed target design for that next tranche now lives in
-[`../plans/tiered-kv-hicache-readmission.md`](../plans/tiered-kv-hicache-readmission.md),
+`../plans/tiered-kv-hicache-readmission.md`,
 which records the `L0/L1/L2/L3` physical hierarchy, the
 `KVBlock / KVSpan / KVHandle` object model, the three-queue
 prefetch/store pipeline, and the `CacheIndex / CacheIO / CachePolicy /
 CacheOrchestrator` split. The runtime-facing ownership graph and the
 canonical scheduler branch order now live in
-[`tiered-kv-runtime-flow.md`](./tiered-kv-runtime-flow.md). One constraint is still explicit:
+`tiered-kv-runtime-flow.md`. One constraint is still explicit:
 **M2b does not do
 cross-slot page aliasing**. Reuse remains limited to the case where the
 radix hit maps to a currently free slot whose contiguous state still
@@ -1196,7 +1196,7 @@ when one of these triggers fires:
   reuse `cuda-kernels` + the transport, and needs a functional
   remote tier to do it
 
-See [`../plans/cuda-kernel-crate-extraction.md`](../plans/cuda-kernel-crate-extraction.md)
+See [`../plans/cuda-kernel-crate-extraction.md`](../architecture.md)
 §2 for the trip-wire discipline this follows. In the absence of any of
 these triggers, M5 real-RDMA is post-project work.
 
@@ -1379,7 +1379,7 @@ already shipped, and M1 can proceed on M0.1 alone.
 - [`mlx-backend-roadmap.md`](mlx-backend-roadmap.md) — Metal side. M4 is
   the first point of contact; the MLX roadmap should link back here once
   M4 enters execution.
-- [`cuda-kernel-crate-extraction.md`](../plans/cuda-kernel-crate-extraction.md) —
+- [`cuda-kernel-crate-extraction.md`](../architecture.md) —
   the `.cu` file moves landed 2026-04-15, so M0.3 kernel references now live at
   `crates/cuda-kernels/csrc/kv/*.cu` (and `crates/cuda-kernels/csrc/attention/decode_prep_paged*.cu`).
 - [`../architecture.md`](../architecture.md) § "Workspace governance rules" —

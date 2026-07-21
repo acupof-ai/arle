@@ -21,7 +21,7 @@ front door. Product mainline = coding-agent runtime (local Metal
 single-user + self-hosted CUDA multi-tenant). DSv4-Flash on 8×H20 is the
 technical wedge and engine forge, not a separate product line. Training
 is OPD-only (2026-05-18 pivot — see
-[`docs/projects/2026-05-18-opd-only-pivot.md`](docs/projects/2026-05-18-opd-only-pivot.md)).
+OPD-only product boundary).
 
 ## Active Priorities (strict serial — master strategy v2 §3)
 
@@ -75,23 +75,23 @@ bring-up) + DiffusionGemma. The model-coverage queue is ranked, not parallel:
 
 1. **DeepSeek V4 (DSv4-Flash)** — active substrate (Phase 0–2 above).
 2. **Qwen 3.6** — **CUDA serving landed** (no longer "next"): FP8 MoE via
-   DeepGEMM, batched paged decode scales c=1→8 (Qwen3.6-27B-FP8 1×H20 21→26
-   tok/s; wins `2026-06-29-cuda-qwen36-paged-batched-decode`). Metal canonical
-   model with NextN/MTP spec-decode shipped (wins
-   `2026-06-21-metal-qwen36-mtp-spec-decode`).
+ DeepGEMM, batched paged decode scales c=1→8 (Qwen3.6-27B-FP8 1×H20 21→26
+ tok/s; wins `2026-06-29-cuda-qwen36-paged-batched-decode`). Metal canonical
+ model with NextN/MTP spec-decode shipped (wins
+ `2026-06-21-metal-qwen36-mtp-spec-decode`).
 
 Active in-flight model items (no longer "Qwen3.6 next"):
 
 - **GLM-5.2** (`glm_moe_dsa`, DSv4-DSA family, 256 experts) — wired on the DSv4
-  CUDA path; forward tranches landed but **verification pending-remote** (wins
-  `2026-06-19` glm52-* all pending-remote). Not production-verified.
+ CUDA path; forward tranches landed but **verification pending-remote** (wins
+ `2026-06-19` glm52-* all pending-remote). Not production-verified.
 - **Gemma4 / DeepSeek-OCR Metal VLMs** — Metal forward + image smoke landed;
-  **quality/throughput validation pending** (Gemma4 wins `2026-06-15` gemma4-*;
-  DeepSeek-OCR wired/bring-up, vision numerics not yet faithful, wins
-  `2026-06-24/25` deepseek-ocr-*).
+ **quality/throughput validation pending** (Gemma4 wins `2026-06-15` gemma4-*;
+ DeepSeek-OCR wired/bring-up, vision numerics not yet faithful, wins
+ `2026-06-24/25` deepseek-ocr-*).
 - **Qwen3.5-122B-A10B at TP4** — serves at TP4 via GQA KV-head replication (all
-  4 worker engines ready); **numerical-completion gate pending** a clean re-run
-  (wins `2026-06-29-cuda-gqa-replication-122b-tp4`).
+ 4 worker engines ready); **numerical-completion gate pending** a clean re-run
+ (wins `2026-06-29-cuda-gqa-replication-122b-tp4`).
 
 Other families in the support matrix sit behind these and are not actively
 scheduled.

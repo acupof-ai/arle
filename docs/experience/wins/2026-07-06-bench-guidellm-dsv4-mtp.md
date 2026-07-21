@@ -32,7 +32,7 @@ decode latency (ITL) and raise output tok/s whenever the draft head's greedy
 token matches the trunk's verify token, at the cost of the extra draft-head
 forward pass on a miss. Directionally a win on DSv4 given the same NextN
 head/verify design already measured correct on Qwen3.6
-([2026-06-06 EAGLE/MTP phase2 wins](2026-06-06-dsv4-eagle-mtp-phase2-verify-correct.md)).
+(2026-06-06 EAGLE/MTP phase2 wins).
 
 ## Command (verified to construct correctly; not executed against a live server)
 

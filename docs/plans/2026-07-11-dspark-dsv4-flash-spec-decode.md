@@ -197,7 +197,7 @@ Procedure (`forward_dspark_draft_block` + `_forward_backbone`, verbatim):
 ```
 context = main_norm(main_proj(concat(out40, out41, out42)))   # extract_context_feature: hidden[layer_id+1], ids [40,41,42] → 3×4096=12288; fused ONCE at mtp.0 entry
 noise   = embed(noise_ids)                                     # create_noise_embed: per block pos0 = anchor (last accepted) token, pos1..4 = mask 128799; embed = base embed.weight (tied, no lm_head)
-block_hidden = stack[mtp.0, mtp.1, mtp.2](context, noise, is_causal=False, own draft KV cache cropped to `start` per block)
+block_hidden = stackmtp.0, mtp.1, mtp.2
 base_logits  = compute_logits(block_hidden)                   # base embed.weight^T (tied head), after mtp.2 norm(hc_head(·))
 sample_draft_tokens: semi-AR L→R over block_size=5, step logits += markov_w2(markov_w1[prev_token])   # VanillaMarkov: low-rank [vocab→256→vocab], HIDDEN-INDEPENDENT (mtp.2 has NO gate_proj)
 confidence   = sigmoid(confidence_head.proj(hidden, prev_tok)) ; truncate block at first pos < threshold   # dynamic draft length

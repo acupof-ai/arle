@@ -41,7 +41,7 @@ correct by construction, never perf-licensed on the agent-OPD lane.
 
 The transfer-operator rewrite hit its pre-declared kill threshold (29.7%);
 decoded floor = per-token `__syncthreads` chain
-([outcome](linear-attention-chunked-backward.md)). The remaining 3.19s (76% of
+(outcome). The remaining 3.19s (76% of
 backward) falls only to the fla-style formulation with NO intra-chunk token
 loop.
 
@@ -68,7 +68,7 @@ loop.
 
 ## P1.3 — bf16-native pipeline, T0 attribution gate (effort S; T1+ only if licensed)
 
-Full tranche plan: [bf16-native-autograd.md](bf16-native-autograd.md). The
+Full tranche plan: bf16-native-autograd.md. The
 plan's own arithmetic says conversions ≈ 4–10% of forward — the 10–30% upside
 is a launch/alloc-overhead HYPOTHESIS. Run T0 ONLY (conversion counters +
 nsys one round + long-seq probe), then the doc's three kill conditions decide

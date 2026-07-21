@@ -5,7 +5,7 @@ direction, and crate-admission governance. New contributors: start at
 [onboarding.md](onboarding.md) (30 min). For "what files exist and where
 to start reading", see [codebase-map.md](codebase-map.md). For the
 extraction story behind `crates/cuda-kernels`, see
-[plans/cuda-kernel-crate-extraction.md](plans/cuda-kernel-crate-extraction.md).
+`docs/reviews/kernel-registry.md`.
 
 Project framing (also in [index.md](index.md) §Current Positioning): the
 `infer-*` crate graph owns serving/runtime truth, `arle` is the local front
@@ -18,9 +18,6 @@ authority rather than defining a second equal architecture.
 > narrow host-only seam → thin per-device executors** — one scheduler serves
 > all backends; a backend is a seam impl, not a scheduler fork. Source of
 > truth for the rewrite's executed state:
-> [`projects/2026-06-03-ideal-inference-engine-architecture.md`](projects/2026-06-03-ideal-inference-engine-architecture.md)
-> §6 + the multi-GPU port roadmap
-> [`projects/2026-06-03-multigpu-port-roadmap.md`](projects/2026-06-03-multigpu-port-roadmap.md).
 
 ## Package Boundaries
 
@@ -56,7 +53,7 @@ authority rather than defining a second equal architecture.
 | `deepseek-spec` | DS0 readiness scaffold (2026-05-01): DeepSeek V3/V4 config, tensor-name contracts, MLA/MoE/MTP `Shard` annotations, `DeepSeekV4AttentionLayerPlan` operator summaries | Runtime model code beyond the spec |
 | `gemma-spec` | Gemma4 config spec (consumer today: `infer-vulkan` order pin; unranked in the model queue — ratification pending, roadmap §6) | Implementation code |
 | `autograd` | From-scratch autograd: `TensorStore` + `Tape` + `Backend` trait | Trainer loop, control plane |
-| `train` | Runtime-led post-training substrate (teacher via `infer-api`, student LoRA, rollout→score→LoRA-backward), train-side `/v1/train/*` control plane. Pretrain / SFT / GRPO / multi-turn retired 2026-05-18 — see `docs/projects/2026-05-18-opd-only-pivot.md`. Two families share it: **OPD** (`opd`/`self-opd`, teacher/EMA + KL) and **RFT** (`agent-opd`/`rubric-opd`, reward-selected + masked CE, no teacher/KL). "OPD-only" is the positioning, not that every subcommand is distillation. | GPU kernels, scheduler |
+| `train` | Runtime-led post-training substrate (teacher via `infer-api`, student LoRA, rollout→score→LoRA-backward), train-side `/v1/train/*` control plane. Pretrain / SFT / GRPO / multi-turn retired 2026-05-18 — see OPD-only product boundary. Two families share it: **OPD** (`opd`/`self-opd`, teacher/EMA + KL) and **RFT** (`agent-opd`/`rubric-opd`, reward-selected + masked CE, no teacher/KL). "OPD-only" is the positioning, not that every subcommand is distillation. | GPU kernels, scheduler |
 
 ## Dependency Direction
 
@@ -69,29 +66,29 @@ implement the seam against plan + seam only — they do **not** depend on
 executor into `Engine<E,K>`.
 
 ```text
-infer-plan        (no deps — the IR)
-  ▲
-infer-seam        -> infer-plan
-  ▲
-infer-core        -> infer-plan, infer-seam            (the one Engine<E,K>; no backend dep)
+infer-plan (no deps — the IR)
+ ▲
+infer-seam -> infer-plan
+ ▲
+infer-core -> infer-plan, infer-seam (the one Engine<E,K>; no backend dep)
 
-infer-cuda        -> infer-plan, infer-seam, infer-topo, infer-moe, cuda-kernels, [deepep-sys, deepseek-spec, qwen3-spec], qwen35-spec
-infer-metal       -> infer-plan, infer-seam, [mlx-sys]
-infer-gguf        -> deepseek-spec   (neutral GGUF host substrate leaf; spec crates never depend back)
-infer-hip         -> infer-plan, infer-seam, deepseek-spec, infer-gguf, [hip-sys, hip-kernels]
-infer-vulkan      -> infer-plan, infer-seam, deepseek-spec, gemma-spec, qwen3-spec, qwen35-spec,
-                     infer-gguf, [vulkan-sys, vulkan-kernels]
+infer-cuda -> infer-plan, infer-seam, infer-topo, infer-moe, cuda-kernels, [deepep-sys, deepseek-spec, qwen3-spec], qwen35-spec
+infer-metal -> infer-plan, infer-seam, [mlx-sys]
+infer-gguf -> deepseek-spec (neutral GGUF host substrate leaf; spec crates never depend back)
+infer-hip -> infer-plan, infer-seam, deepseek-spec, infer-gguf, [hip-sys, hip-kernels]
+infer-vulkan -> infer-plan, infer-seam, deepseek-spec, gemma-spec, qwen3-spec, qwen35-spec,
+ infer-gguf, [vulkan-sys, vulkan-kernels]
 
-infer-server      -> infer-core, infer-seam, infer-plan
-infer-api         -> infer-core, infer-seam, infer-plan, infer-server, [infer-metal, infer-cuda, infer-hip, infer-vulkan, cuda-kernels]
+infer-server -> infer-core, infer-seam, infer-plan
+infer-api -> infer-core, infer-seam, infer-plan, infer-server, [infer-metal, infer-cuda, infer-hip, infer-vulkan, cuda-kernels]
 
 workspace root package (arle)
-  -> cli
-     -> infer-api
-     -> agent (-> infer-api, chat, tools)
-     -> chat
-     -> tools
-     -> autograd, train, infer-util, deepseek-spec, qwen3-spec, qwen35-spec
+ -> cli
+ -> infer-api
+ -> agent (-> infer-api, chat, tools)
+ -> chat
+ -> tools
+ -> autograd, train, infer-util, deepseek-spec, qwen3-spec, qwen35-spec
 ```
 
 The backend-agnostic-scheduler win: one `Engine<E,K>` in `infer-core` drives
@@ -112,27 +109,27 @@ narrow host-only seam → thin per-device executors** — one scheduler serves a
 backends; a backend is a seam impl, not a scheduler fork.
 
 ```text
-infer-plan      data IR (ForwardPlan / ForwardMode / SamplingParams / StepOutput)
-   ▲
-infer-seam      host-only trait seam (no device types):
-   │              BackendExecutor (submit/poll core + opt-in capability
-   │              default-methods), KvPool = KvQuery+KvAllocator+KvPrefixStore,
-   │              KvBatchDescriptor, ResourceGovernor
-   ▲
-infer-core      device-neutral Engine<E,K> + scheduler + radix prefix + overlap (no backend dep)
+infer-plan data IR (ForwardPlan / ForwardMode / SamplingParams / StepOutput)
+ ▲
+infer-seam host-only trait seam (no device types):
+ │ BackendExecutor (submit/poll core + opt-in capability
+ │ default-methods), KvPool = KvQuery+KvAllocator+KvPrefixStore,
+ │ KvBatchDescriptor, ResourceGovernor
+ ▲
+infer-core device-neutral Engine<E,K> + scheduler + radix prefix + overlap (no backend dep)
 
-infer-metal              infer-cuda          thin executors, one seam impl each
- (real MLX Qwen          (CUDA paged KV,       (implement plan + seam only;
-  forward + packed         TileLang + native     zero scheduler)
-  varlen decode)           kernels, TP/EP,
-                           DeepGEMM, DeepEP,
-                           DSv4-Flash)
-   ▲                         ▲
-infer-server    OpenAI v1 HTTP frontend: coordinator.rs (single HTTP facade for all backends)
-                + ServeHandle<E,K> engine thread + relay (LocalChannel / TCP)
-   ▲
-infer-api       single front-door lib (LoadedInferenceEngine, EngineLoadConfig,
-                RawLogits, OPD teacher); backends plug in behind it
+infer-metal infer-cuda thin executors, one seam impl each
+ (real MLX Qwen (CUDA paged KV, (implement plan + seam only;
+ forward + packed TileLang + native zero scheduler)
+ varlen decode) kernels, TP/EP,
+ DeepGEMM, DeepEP,
+ DSv4-Flash)
+ ▲ ▲
+infer-server OpenAI v1 HTTP frontend: coordinator.rs (single HTTP facade for all backends)
+ + ServeHandle<E,K> engine thread + relay (LocalChannel / TCP)
+ ▲
+infer-api single front-door lib (LoadedInferenceEngine, EngineLoadConfig,
+ RawLogits, OPD teacher); backends plug in behind it
 ```
 
 **Seam growth pattern (deliberate).** Cross-cutting engine features (KV
@@ -172,20 +169,20 @@ do not pre-split speculatively.
 CUDA TP=8 / EP=8 (DeepGEMM FP8 MoE + DeepEP) is live in `infer-cuda` for
 DeepSeek-V4-Flash; PP is not yet wired into a forward path. Multi-GPU
 sequencing is tracked in
-[`projects/2026-06-03-multigpu-port-roadmap.md`](projects/2026-06-03-multigpu-port-roadmap.md).
+`projects/2026-06-03-multigpu-port-roadmap.md`.
 
 ## Backend Split
 
 - `cuda`: full scheduler path with chunked prefill, decode-priority batching,
-  paged KV, TileLang AOT, and native CUDA C kernels.
+ paged KV, TileLang AOT, and native CUDA C kernels.
 - `metal`: serial backend path for Apple Silicon via `mlx-sys`.
 - `cpu`: development-oriented serial backend for smoke tests, CLI wiring, and
-  end-to-end validation on non-GPU machines.
+ end-to-end validation on non-GPU machines.
 - `hip`: experimental AIPC lane (AMD ROCm) — DSv4 GGUF 2-bit shim-portable
-  forward; on-box validation pending-remote
-  ([runbook](plans/2026-06-11-hip-onbox-runbook.md)).
+ forward; on-box validation pending-remote
+ ([runbook](plans/2026-06-11-hip-onbox-runbook.md)).
 - `vulkan`: experimental AIPC skeleton (cross-vendor) — seam impls + host
-  order pins; device execution pending the shader ABI.
+ order pins; device execution pending the shader ABI.
 
 ## Backend Parity Matrix
 
@@ -249,16 +246,16 @@ model load, one `Engine` — unchanged; collectives only engage when a
 multi-GPU config is selected.
 
 - **TP (tensor parallel):** `crates/infer-cuda/src/tp.rs` — `TpRuntime` /
-  `TpConfig` / `resolve_tp_config_from_env`, `all_reduce_sum` post-attn /
-  post-MLP. TP=1 is no-op; TP>1 collectives are live (DSv4 prefill verified at
-  TP=8). Sharding helpers come from `infer-topo` (`head_shard`, column/row).
+ `TpConfig` / `resolve_tp_config_from_env`, `all_reduce_sum` post-attn /
+ post-MLP. TP=1 is no-op; TP>1 collectives are live (DSv4 prefill verified at
+ TP=8). Sharding helpers come from `infer-topo` (`head_shard`, column/row).
 - **EP (expert parallel):** `crates/infer-cuda/src/{moe,deepep}.rs` —
-  DeepEP `all_to_all` dispatch/combine, gated by the `deepep` feature; routing
-  is the backend-neutral `infer-moe`. Live at EP=8 for DSv4.
+ DeepEP `all_to_all` dispatch/combine, gated by the `deepep` feature; routing
+ is the backend-neutral `infer-moe`. Live at EP=8 for DSv4.
 - **PP (pipeline parallel):** not yet wired into a forward path — the one
-  known gap (microbatch ring in `infer-core` + a stage-aware executor).
+ known gap (microbatch ring in `infer-core` + a stage-aware executor).
 - **NCCL backend:** `--features cuda,nccl` gate forwards
-  `infer-cuda/nccl → cuda-kernels/nccl`; `deepep` implies `nccl`.
+ `infer-cuda/nccl → cuda-kernels/nccl`; `deepep` implies `nccl`.
 
 DeepSeek-V4-Flash is the binding multi-GPU consumer (TP=8 / EP=8, FP8
 DeepGEMM MoE + DeepEP). The DSv4 contract scaffold lives in
@@ -266,7 +263,7 @@ DeepGEMM MoE + DeepEP). The DSv4 contract scaffold lives in
 experts) is the in-flight DSv4-family addition riding the same CUDA path via
 an adapter — forward tranches landed, verification pending-remote (not
 production-verified). Multi-GPU sequencing is tracked in
-[`projects/2026-06-03-multigpu-port-roadmap.md`](projects/2026-06-03-multigpu-port-roadmap.md).
+`projects/2026-06-03-multigpu-port-roadmap.md`.
 
 DSv4 decode is under active kernel optimization on 8×H20 (adopt-best-first):
 gated, license-or-kill on a same-load resident A/B at the B=1 SLO shape, with
@@ -274,8 +271,8 @@ KV-precision parity (`agent-bench::dsv4_kv_precision_parity`) as the
 precondition for any default flip. Landed gated: FlashMLA fused sparse decode,
 FP8 fused `wqkv_a`, contiguous active-row MoE layout. Lever sequencing +
 SGLang-reference adopt plan:
-[`plans/2026-06-05-dsv4-endgame-architecture-adopt-best-first.md`](plans/2026-06-05-dsv4-endgame-architecture-adopt-best-first.md)
-and [`plans/2026-06-05-sglang-dsv4-decode-overlap-adopt-plan.md`](plans/2026-06-05-sglang-dsv4-decode-overlap-adopt-plan.md).
+`plans/2026-06-05-dsv4-endgame-architecture-adopt-best-first.md`
+and `plans/2026-06-05-sglang-dsv4-decode-overlap-adopt-plan.md`.
 Prefill at production shapes is in repair (a MoE padded-layout i32 work-size
 overflow at >~1560 tokens).
 
@@ -301,22 +298,22 @@ A concrete DSv4 port path now exists (adopt-best-first): the in-checkpoint
 **MTP draft head** (`mtp.0.*`, `num_nextn_predict_layers=1` — no training)
 consuming the wide hyper-connection stream, plus SGLang's MTP/EAGLE
 draft→tree→verify→extend loop reusing the Medusa substrate. Design:
-[`plans/2026-06-05-eagle-mtp-integration-design.md`](plans/2026-06-05-eagle-mtp-integration-design.md).
+`plans/2026-06-05-eagle-mtp-integration-design.md`.
 Banked behind the DSv4 kernel arc (kernels first; spec is the ×1.93 multiplier).
 
 The historical caveats still bound any port:
 
 - The first end-to-end real-spec bench regressed -62.8% because the
-  correctness-first verifier ran the target paged decode once per verifier
-  position; a packed K+1 verifier (or MagicDec sparse-KV self-spec) is the
-  prerequisite for a throughput lift. See
-  [`docs/projects/2026-04-30-longctx-32k-128k-leadership.md`](projects/2026-04-30-longctx-32k-128k-leadership.md)
-  §13 and
-  [`docs/experience/errors/2026-05-01-phase2-real-spec-regression.md`](experience/errors/2026-05-01-phase2-real-spec-regression.md).
+ correctness-first verifier ran the target paged decode once per verifier
+ position; a packed K+1 verifier (or MagicDec sparse-KV self-spec) is the
+ prerequisite for a throughput lift. See
+ `docs/projects/2026-04-30-longctx-32k-128k-leadership.md`
+ §13 and
+ `docs/experience/errors/2026-05-01-phase2-real-spec-regression.md`.
 - For Qwen3.5 / Medusa the gate is recurrent-state rollback: paged KV can be
-  truncated, but hybrid linear-attention recurrent state needs a model-owned
-  accepted-length commit/rollback. See
-  [`docs/plans/M_medusa-phase1b-qwen35-v2-snapshot-ring-redesign.md`](plans/M_medusa-phase1b-qwen35-v2-snapshot-ring-redesign.md).
+ truncated, but hybrid linear-attention recurrent state needs a model-owned
+ accepted-length commit/rollback. See
+ `docs/plans/M_medusa-phase1b-qwen35-v2-snapshot-ring-redesign.md`.
 
 ## Route-A Note (Historical)
 
@@ -344,17 +341,17 @@ and the agent CLI. Today that single front door is `infer-api`'s
 These rules govern when a new crate may be cut, and when one must not.
 
 1. New module → prefer placing it in an existing crate; cut a new crate only
-   when the existing one cannot contain it without leaking concerns.
+ when the existing one cannot contain it without leaking concerns.
 2. Cross-crate calls go through public traits; never import private
-   implementation modules across the boundary.
+ implementation modules across the boundary.
 3. Every new crate must name **at least two direct consumers** in its PR
-   description. If you cannot, the split is premature.
+ description. If you cannot, the split is premature.
 4. Every PR states its "affected layer" and "does this break a dependency
-   direction" up front; reverse dependencies from `runtime-*` into
-   `http/cli` are rejected on sight.
+ direction" up front; reverse dependencies from `runtime-*` into
+ `http/cli` are rejected on sight.
 5. Branches must arrive as single-topic commits; if a reviewer must hold
-   kernel + scheduler + workspace semantics in their head at once, the
-   split has already failed.
+ kernel + scheduler + workspace semantics in their head at once, the
+ split has already failed.
 
 ### Active anti-goals
 
@@ -363,20 +360,20 @@ The items below remain anti-goals **unless** a concrete second consumer
 forces them.
 
 - **No `infer-ops` crate.** Ops are tightly coupled to model data layouts and
-  live inside each executor (`infer-cuda` / `infer-metal`).
+ live inside each executor (`infer-cuda` / `infer-metal`).
 - **Scheduler extraction already done.** The PR #53 rewrite extracted the
-  scheduler into `infer-core` cleanly by pushing all device coupling
-  (`PagedKVPool`, TileLang metadata, model-specific bootstrap) below the
-  host-only seam into the executors. Do not re-couple the scheduler to a
-  backend — that is the regression this split exists to prevent.
+ scheduler into `infer-core` cleanly by pushing all device coupling
+ (`PagedKVPool`, TileLang metadata, model-specific bootstrap) below the
+ host-only seam into the executors. Do not re-couple the scheduler to a
+ backend — that is the regression this split exists to prevent.
 - **No `infer-runtime-api` trait crate beyond what exists.** The runtime
-  contract is already the `infer-seam` traits (`BackendExecutor` + `KvPool`)
-  plus the `infer-api` front door; a further trait crate would be redundant.
+ contract is already the `infer-seam` traits (`BackendExecutor` + `KvPool`)
+ plus the `infer-api` front door; a further trait crate would be redundant.
 - **No `*-sys` / Rust-types split for the kernel crate.** One crate holds
-  both layers; splitting them creates a `*-sys` boundary with one consumer.
+ both layers; splitting them creates a `*-sys` boundary with one consumer.
 - **No separate CPU backend crate.** The smoke executor still reuses the
-  feature-free placeholder `MetalExecutor`, but the host paged KV allocator is
-  now the shared `infer-seam::HostPagedKvPool`, not a Metal-owned pool.
+ feature-free placeholder `MetalExecutor`, but the host paged KV allocator is
+ now the shared `infer-seam::HostPagedKvPool`, not a Metal-owned pool.
 
 The original kernel-crate trip wires (T1 NCCL, T2 FA-3, T3 MLA/FP8 GEMM,
 T4 spec decoding, T5 second external consumer) are arguments for the

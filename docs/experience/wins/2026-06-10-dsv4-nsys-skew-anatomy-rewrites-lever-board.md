@@ -71,6 +71,6 @@ and was NOT used for GPU claims).
 
 ## Refs
 
-- Comm wash + per-op numbers: [`errors/2026-06-10-dsv4-oneshot-comm-wall-neutral-skew-bound.md`](../errors/2026-06-10-dsv4-oneshot-comm-wall-neutral-skew-bound.md)
+- Comm wash + per-op numbers: `errors/2026-06-10-dsv4-oneshot-comm-wall-neutral-skew-bound.md`
 - Graph works byte-identical: `wins/2026-06-08-dsv4-wholestep-graph-wall-neutral-gpu-bound-CONCLUSIVE.md` (its WALL verdict superseded by this entry)
 - Pod: `nsys_skew_*` reps/sqlites, `skew_analysis.py`
