@@ -1561,6 +1561,45 @@ impl Dsv4CudaExecutor {
         )
     }
 
+    fn tp_lockstep_proposal(
+        model: &crate::dsv4::Dsv4Model,
+        proposal: &mut crate::dsv4::dspark::Dsv4DsparkProposal,
+    ) -> Result<()> {
+        if model.tp.config().world_size <= 1 {
+            return Ok(());
+        }
+        let block = model.config.dspark_block_size;
+        let mut payload = Vec::with_capacity(2 + block);
+        payload.push(proposal.draft_len as i32);
+        payload.extend(proposal.chain.iter().map(|&t| t as i32));
+        payload.resize(2 + block, 0);
+        let r0 = model.tp.broadcast_rank0_i32(&model.ctx, &payload)?;
+        let r0_chain: Vec<u32> = r0[1..2 + r0[0] as usize]
+            .iter()
+            .map(|&v| v as u32)
+            .collect();
+        if r0_chain != proposal.chain {
+            proposal.draft_len = r0[0] as usize;
+            proposal.chain = r0_chain;
+            proposal.draft_logits = None;
+        }
+        Ok(())
+    }
+
+    fn tp_lockstep_accept(
+        model: &crate::dsv4::Dsv4Model,
+        accepted: usize,
+        bonus: u32,
+    ) -> Result<(usize, u32)> {
+        if model.tp.config().world_size <= 1 {
+            return Ok((accepted, bonus));
+        }
+        let r0 = model
+            .tp
+            .broadcast_rank0_i32(&model.ctx, &[accepted as i32, bonus as i32])?;
+        Ok((r0[0] as usize, r0[1] as u32))
+    }
+
     /// One DSpark block decode step (`--spec-type dspark`, greedy). Forward the
     /// last token to emit the block anchor + capture the T3 trunk taps, draft a
     /// whole block from those taps in ONE non-causal pass, verify the chain in one
@@ -1672,27 +1711,7 @@ impl Dsv4CudaExecutor {
         // drifts by FP across ranks; a divergent length feeds verify a different
         // token count per rank → per-forward collective-count mismatch → deadlock.
         // Adopt rank 0's `[draft_len, chain..]` so every rank verifies one shape.
-        // (Greedy: argmax accept ignores draft_logits; sampled q is a later lever.)
-        if self.model.tp.config().world_size > 1 {
-            let block = self.model.config.dspark_block_size;
-            let mut payload = Vec::with_capacity(2 + block);
-            payload.push(proposal.draft_len as i32);
-            payload.extend(proposal.chain.iter().map(|&t| t as i32));
-            payload.resize(2 + block, 0);
-            let r0 = self
-                .model
-                .tp
-                .broadcast_rank0_i32(&self.model.ctx, &payload)?;
-            let r0_chain: Vec<u32> = r0[1..2 + r0[0] as usize]
-                .iter()
-                .map(|&v| v as u32)
-                .collect();
-            if r0_chain != proposal.chain {
-                proposal.draft_len = r0[0] as usize;
-                proposal.chain = r0_chain;
-                proposal.draft_logits = None; // rank 0's (discarded) tokens
-            }
-        }
+        Self::tp_lockstep_proposal(&self.model, &mut proposal)?;
         let draft_len = proposal.draft_len;
 
         self.model.capture_spec_rings(
@@ -1726,14 +1745,7 @@ impl Dsv4CudaExecutor {
         // TP lockstep: accepted/bonus are rank-local FP; adopt rank 0's so every
         // rank commits an identical KV tail (next tick's combined attention reads
         // all ranks' shards — an inconsistent commit corrupts it).
-        if self.model.tp.config().world_size > 1 {
-            let r0 = self
-                .model
-                .tp
-                .broadcast_rank0_i32(&self.model.ctx, &[accepted as i32, bonus as i32])?;
-            accepted = r0[0] as usize;
-            bonus = r0[1] as u32;
-        }
+        (accepted, bonus) = Self::tp_lockstep_accept(&self.model, accepted, bonus)?;
 
         // Return to the real frontier, restore the aliased ring boundary, then
         // fold anchor + accepted drafts exactly once from persisted verify rows.
@@ -1930,28 +1942,9 @@ impl Dsv4CudaExecutor {
 
         // ── Phase 2: TP lockstep on proposals (rank 0's draft_len + chain wins,
         // same as the B=1 path — divergent lengths deadlock the verify collective).
-        let tp_world = self.model.tp.config().world_size;
-        if tp_world > 1 {
-            for prop in proposals.iter_mut() {
-                let Some(p) = prop else { continue };
-                let mut payload = Vec::with_capacity(2 + block);
-                payload.push(p.draft_len as i32);
-                payload.extend(p.chain.iter().map(|&t| t as i32));
-                payload.resize(2 + block, 0);
-                let r0 = self
-                    .model
-                    .tp
-                    .broadcast_rank0_i32(&self.model.ctx, &payload)?;
-                let r0_chain: Vec<u32> = r0[1..2 + r0[0] as usize]
-                    .iter()
-                    .map(|&v| v as u32)
-                    .collect();
-                if r0_chain != p.chain {
-                    p.draft_len = r0[0] as usize;
-                    p.chain = r0_chain;
-                    p.draft_logits = None;
-                }
-            }
+        for prop in proposals.iter_mut() {
+            let Some(p) = prop else { continue };
+            Self::tp_lockstep_proposal(&self.model, p)?;
         }
 
         // ── Phase 3: batched verify over all chains (the amortized phase).
@@ -2030,14 +2023,7 @@ impl Dsv4CudaExecutor {
 
             // TP lockstep on accepted/bonus (rank 0 wins — KV tail must be identical
             // across ranks, else next tick's combined attention corrupts).
-            if tp_world > 1 {
-                let r0 = self
-                    .model
-                    .tp
-                    .broadcast_rank0_i32(&self.model.ctx, &[accepted as i32, bonus as i32])?;
-                accepted = r0[0] as usize;
-                bonus = r0[1] as u32;
-            }
+            (accepted, bonus) = Self::tp_lockstep_accept(&self.model, accepted, bonus)?;
 
             self.model.truncate_slot(
                 &mut self.slots[slot_idx],
