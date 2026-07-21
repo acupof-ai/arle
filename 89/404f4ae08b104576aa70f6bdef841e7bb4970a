@@ -1,0 +1,23 @@
+scripts/agent_opd_curve.sh
+  s_9c91b86ec3fb55::t_9d2ab1245bf4df 11-19,24-31,41-42,61,64,67-70,72-84,86-87,89-90,98,113-115,117,126-138
+.gitignore
+  s_9c91b86ec3fb55::t_63b5b8148f4cfc 50-51
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "89404f4ae08b104576aa70f6bdef841e7bb4970a",
+  "prompts": {},
+  "sessions": {
+    "s_9c91b86ec3fb55": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4779911a-69b7-49db-bc83-daf5a48d6ca3",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
