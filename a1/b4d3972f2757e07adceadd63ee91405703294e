@@ -1,0 +1,23 @@
+docs/baselines.md
+  s_d6adcec6a0a6d3::t_05d5843bb13e84 100,102,104-105,108-121
+docs/experience/wins/2026-07-21-dspark-batched-verify-c8-c16.md
+  s_d6adcec6a0a6d3::t_3565e9d30917d5 1,3-5,9-13,15,19-22,24,26-30,32,34-37,39-40,42,44-49,51-52,56-63
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "a1b4d3972f2757e07adceadd63ee91405703294e",
+  "prompts": {},
+  "sessions": {
+    "s_d6adcec6a0a6d3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dc64a0b5-493b-4e08-a5cf-392205926291",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
