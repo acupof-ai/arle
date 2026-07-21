@@ -1,13 +1,16 @@
-# hd256 q/k RMSNorm convention flip (b4b293f0c) — one kernel bug, an eight-hypothesis false chase
+# RMSNorm convention flip (b4b293f0c) — TWO bugs in one commit, both fixed
 
-> Status: ROOT-CAUSED + FIXED (`e4d5580ca`). The agentic-rollout / long-context
-> degeneration is a **single kernel bug**: `b4b293f0c` flipped hd256 q/k RMSNorm
-> from OFFSET `x·rms·(1+w)` to STANDARD `x·rms·w`, shrinking 27B q/k ~3× and
-> collapsing attention at length. Binary bisect on the agentic greedy rollout is a
-> clean adjacent flip. Fix restores `(1+w)` at all 5 hd256-only sites; verified:
-> base greedy agentic rollout emits proper tool calls, 7 turns, fixes the real
-> bug, reward 1.0. **A separate temp>0 sampling defect survives the fix — see the
-> tail + [[project or #59]].**
+> Status: ROOT-CAUSED + FIXED. `b4b293f0c` carried **two independent** wrong
+> changes; the fix landed in two commits. **Type-A** (`e4d5580ca`): the kernel half
+> — flipped hd256 q/k RMSNorm from `(1+w)` to `w`, shrinking 27B q/k ~3× and
+> collapsing attention at length (greedy-at-length + temp>0). Fix restores `(1+w)`
+> at the 5 hd256 `.cu` sites. **Type-B** (this session): the load half — the same
+> commit added a `w-1` transform (`load_final_norm_offset`) on the final RMSNorm
+> weight in `qwen35.rs`; the `(1+w)` kernel is correct and untouched, but feeding it
+> `w-1` sign-corrupts the STANDARD final-norm's negative channels → flattened logits
+> → temp=1.0 sampled-tail garbage (greedy survives). `e4d5580ca` fixed only the
+> kernel half, so Type-B persisted to HEAD. Fix = revert both sites to `load_vec`.
+> Both verified on pod (temp=1.0 + greedy COHERENT). **temp=1.0 grpo unblocked.**
 
 ## Context
 
@@ -74,34 +77,46 @@ Qwen3.6-27B-FP8, greedy agentic rollout → proper `<tool_call>` Glob/Grep, 7 tu
 located + fixed the real `lexer.py is_keyword` bug, hidden tests pass, reward 1.0.
 Matches the GOOD bisect parent. **Agentic-OPD unblocked at greedy.**
 
-## Open — a SEPARATE temp>0 defect (#59): CONFIRMED, two independent causes
+## Type-B — a SEPARATE temp>0 defect (#59): ROOT-CAUSED + FIXED
 
-The fix restores the GREEDY/argmax path but temp>0 still degenerates AFTER it —
-confirmed by a **sha-verified** probe on HEAD `9edfcb234` (product binary sha ==
-on-disk build; source has OFFSET `(1+w)` at all 4 sites; temp=1.0 → SCRAMBLED).
-This **refutes** the tempting "temp>0 collapses into b4b293f0c / earlier report was
-a stale binary" hypothesis. There are **two independent causes**:
+`b4b293f0c` carried **two** wrong changes; `e4d5580ca` reverted only the kernel
+one. The Rust half survived at HEAD and is a distinct temp>0 corruption:
 
-1. **Type-A = `b4b293f0c`** (hd256 q/k RMSNorm OFFSET→STANDARD) — broke greedy-at-
-   length AND temp>0; **fixed at HEAD**. Garbage `funciton/Fibonaacci/
-   _selection_selection_`. Isolated cleanly (`67e15b0a6` OFFSET=COHERENT vs
-   `b4b293f0c` STANDARD=SCRAMBLED, byte-identical through `a41827b75`).
-2. **Type-B = a second, temp>0-specific tail bug that PERSISTS at HEAD** (different
-   garbage `fkk fkk`, early-stop ~117 tok). Proven by two controls that flip to the
-   SAME garbage-B: `a41827b75`+OFFSET-overlaid, and sha-verified HEAD. Localized by
-   a zero-rebuild param sweep: **top_k=1/greedy → COHERENT** (bug lives in the
-   sampled low-prob **tail**, not attention/argmax); **COHERENT at temp≤0.7,
-   SCRAMBLED at temp=1.0** (temp<1 sharpens away from the bad tail); top_p 1.0 vs
-   0.95 no diff → not a top_p renorm bug. Regression window `67e15b0a6..a41827b75`,
-   survives to HEAD; **not** the norm and **not** `a41827b75`'s `sample_token →
-   sample_token_logprob` rewrite alone (byte-identical under STANDARD). Suspects:
-   `qwen35.rs`/`prefix_state.rs` attention-prep, `d94cf4b80` (rejection-sampling).
-   Second bisect (OFFSET held fixed, one variable) in flight.
+1. **Type-A = `b4b293f0c`'s 4 `.cu` sites** (hd256 q/k RMSNorm OFFSET→STANDARD) —
+   broke greedy-at-length AND temp>0; **fixed by `e4d5580ca`**. Garbage
+   `funciton/Fibonaacci/_selection_selection_`.
+2. **Type-B = `b4b293f0c`'s one-line `qwen35.rs` change** — the **main-model +
+   MTP-head final RMSNorm** load switched from `loader.load_vec(...)` (raw) to
+   `load_final_norm_offset(...)` (`w → w-1`), on the premise "the trunk kernel
+   applies `(1+w)`, Qwen3.5 norms are STANDARD, raw would double." **Both premises
+   wrong for the final norm.** `e4d5580ca` never touched `qwen35.rs` → persists to
+   HEAD. Garbage `MemoizacionGMEMIZATION… fkk fkk`, early-stop ~117 tok.
 
-**Actionable:** on-policy grpo runs at **temp≤0.7 (coherent)** as the interim;
-temp=1.0 recovered after the Type-B fix. Key new fact: the tail was clean at
-temp=1.0 in `67e15b0a6` and got poisoned by one of the 10 following commits — a
-real **regression**, not an immutable FP8-logit-tail property.
+**Bisect (OFFSET held fixed, one variable, sha-verified each build):** every
+overlaid commit `67e15b0a6..HEAD` and genuine HEAD `9edfcb234` emit the *identical*
+`fkk`-117 output → the overlay faithfully reproduces HEAD. `67e15b0a6+OFFSET =
+COHERENT` vs `b4b293f0c+OFFSET = SCRAMBLED` is the adjacent flip — same commit as
+Type-A, but the Rust half.
+
+**Mechanism, proven by reading the kernel + measuring the weights (not the
+comment):** the final norm is applied by the **shared `rms_norm_offset` `(1+w)`
+kernel** (not head-dim-gated, one path for all models). Its weight
+`model.language_model.norm.weight` is **STANDARD (centered ~1)** everywhere — 27B
+`mean|w|=0.962` (min −0.27), 35B-A3B `1.628`, 122B `1.292`. Feeding the raw
+STANDARD weight through `(1+w)` is what the model expects (`load_vec` = COHERENT at
+temp=1.0 + greedy, sha 1b24b8e3). `load_final_norm_offset` subtracts 1, so the
+**negative channels flip sign** (min −0.27 → −1.27 → kernel `(1+(−1.27)) = −0.27`)
+and the hidden is sign-corrupted → logits flattened. **Argmax ordering survives**
+(greedy coherent); the flattened softmax poisons the sampled tail at temp=1.0.
+Param sweep confirms: `top_k=1` COHERENT, `temp≤0.7` COHERENT, `temp=1.0
+top_p={0.95,1.0}` SCRAMBLED.
+
+**Fix (HEAD):** revert both `load_final_norm_offset` sites to `loader.load_vec(...)`
+(= pre-`b4b293f0c` behavior) and delete the helper. STANDARD across all models →
+blanket revert is safe (no 4B/27B convention split; the hd256 kernels were
+27B-only, but the final-norm convention is uniform). Verified: 27B temp=1.0 +
+greedy both COHERENT, full 600 tok, matches `67e15b0a6`. **temp=1.0 on-policy grpo
+unblocked** — no more temp≤0.7 interim.
 
 ## Rule
 
