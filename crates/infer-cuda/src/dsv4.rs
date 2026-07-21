@@ -3012,7 +3012,7 @@ impl Dsv4Model {
             self.probe_prefill_entropy(&stream, tokens, start_pos)?;
         }
         if let Some(out) = last_hidden_out {
-            self.capture_mtp_stream_hidden(&stream, seq_len - 1, out, &mut keepalive)?;
+            self.capture_mtp_stream_hidden(&stream, seq_len - 1, 1, out, &mut keepalive)?;
         }
         let token = self.forward_stream_last_token(
             &stream,
@@ -3062,7 +3062,7 @@ impl Dsv4Model {
         let hiddens = (0..n)
             .map(|i| -> Result<_> {
                 let mut h = DeviceVec::zeros(&self.ctx, stream_dim)?;
-                self.capture_mtp_stream_hidden(&stream, i, &mut h, &mut keepalive)?;
+                self.capture_mtp_stream_hidden(&stream, i, 1, &mut h, &mut keepalive)?;
                 Ok(h)
             })
             .collect::<Result<Vec<_>>>()?;
@@ -3243,7 +3243,7 @@ impl Dsv4Model {
             let mut hiddens = Vec::with_capacity(n);
             for i in 0..n {
                 let mut h = DeviceVec::zeros(&self.ctx, stream_dim)?;
-                self.capture_mtp_stream_hidden(&stream, i, &mut h, &mut keepalive)?;
+                self.capture_mtp_stream_hidden(&stream, i, 1, &mut h, &mut keepalive)?;
                 hiddens.push(h);
             }
             let logits = self.verify_logits_from_stream(&stream, n, &mut keepalive)?;
@@ -5013,7 +5013,7 @@ impl Dsv4Model {
             {
                 for r in 0..n {
                     let tap = &mut slots[slot_ids[r]].dspark_taps[tap_idx];
-                    self.capture_mtp_stream_hidden(&stream, r, tap, &mut keepalive)?;
+                    self.capture_mtp_stream_hidden(&stream, r, 1, tap, &mut keepalive)?;
                 }
             }
             if let Some(t) = _moe_t {
@@ -5474,17 +5474,14 @@ impl Dsv4Model {
                         .position(|&l| l == layer_idx)
                 {
                     for s in 0..n {
-                        let off = offsets[s];
-                        let len = lens[s];
                         let tap = &mut slots[slot_ids[s]].dspark_taps[tap_idx];
-                        let src = stream
-                            .data
-                            .slice(off * stream_dim..(off + len) * stream_dim);
-                        let mut dst = tap.data.slice_mut(0..len * stream_dim);
-                        self.ctx.stream.memcpy_dtod(&src, &mut dst).map_err(|e| {
-                            anyhow!("DSpark batched verify tap capture D2D failed: {e}")
-                        })?;
-                        keepalive.keep_vec(tap);
+                        self.capture_mtp_stream_hidden(
+                            &stream,
+                            offsets[s],
+                            lens[s],
+                            tap,
+                            &mut keepalive,
+                        )?;
                     }
                 }
             }
@@ -5497,7 +5494,7 @@ impl Dsv4Model {
         let mut hiddens_all = Vec::with_capacity(m);
         for i in 0..m {
             let mut h = DeviceVec::zeros(&self.ctx, stream_dim)?;
-            self.capture_mtp_stream_hidden(&stream, i, &mut h, &mut keepalive)?;
+            self.capture_mtp_stream_hidden(&stream, i, 1, &mut h, &mut keepalive)?;
             hiddens_all.push(h);
         }
 
@@ -5532,7 +5529,8 @@ impl Dsv4Model {
     fn capture_mtp_stream_hidden(
         &self,
         stream: &HiddenStates,
-        row: usize,
+        offset: usize,
+        len: usize,
         out: &mut DeviceVec,
         keepalive: &mut Dsv4ForwardKeepalive,
     ) -> Result<()> {
@@ -5544,13 +5542,16 @@ impl Dsv4Model {
             self.config.hidden_size,
             self.config.hc_mult
         );
+        let elems = len * stream_dim;
         ensure!(
-            out.len >= stream_dim,
-            "DSv4 MTP hidden capture len {} < stream_dim {stream_dim}",
+            out.len >= elems,
+            "DSv4 MTP hidden capture len {} < elems {elems}",
             out.len
         );
-        let src = stream.data.slice(row * stream_dim..(row + 1) * stream_dim);
-        let mut dst = out.data.slice_mut(0..stream_dim);
+        let src = stream
+            .data
+            .slice(offset * stream_dim..offset * stream_dim + elems);
+        let mut dst = out.data.slice_mut(0..elems);
         self.ctx
             .stream
             .memcpy_dtod(&src, &mut dst)
@@ -6617,7 +6618,7 @@ impl Dsv4Model {
                         .map_err(|e| anyhow!("DSpark tap capture D2D failed: {e}"))?;
                     keepalive.keep_vec(tap);
                 } else {
-                    self.capture_mtp_stream_hidden(&stream, seq_len - 1, tap, &mut keepalive)?;
+                    self.capture_mtp_stream_hidden(&stream, seq_len - 1, 1, tap, &mut keepalive)?;
                 }
                 // Prefill: also capture the FULL stream (all rows) for the seed.
                 if let Some(bufs) = dspark_prompt_bufs.as_mut() {
