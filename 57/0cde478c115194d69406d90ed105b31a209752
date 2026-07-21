@@ -1,0 +1,21 @@
+docs/plans/2026-07-21-sm120-tc-kernel-compat.md
+  s_d6adcec6a0a6d3::t_c204192314b332 54,57,63-64,83-85,114-117,121
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "570cde478c115194d69406d90ed105b31a209752",
+  "prompts": {},
+  "sessions": {
+    "s_d6adcec6a0a6d3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dc64a0b5-493b-4e08-a5cf-392205926291",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
