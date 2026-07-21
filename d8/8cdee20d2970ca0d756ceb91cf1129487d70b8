@@ -1,0 +1,27 @@
+crates/autograd/src/backend_metal.rs
+  s_cf3a8e63211b00::t_52598290097950 517-518,808-809,854-855,869-870,945-946,1762-1763,3010-3012
+crates/autograd/tests/test_linear_attention.rs
+  s_cf3a8e63211b00::t_59fbd12c9d22df 72
+crates/infer-vulkan/src/model_dsv4.rs
+  s_cf3a8e63211b00::t_3318c10abbbd6a 305-307
+crates/infer-vulkan/src/model_gemma4.rs
+  s_cf3a8e63211b00::t_11ce2f3b30cc13 310-312,345-347
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "d88cdee20d2970ca0d756ceb91cf1129487d70b8",
+  "prompts": {},
+  "sessions": {
+    "s_cf3a8e63211b00": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a2941588e3ce9ba7c",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
