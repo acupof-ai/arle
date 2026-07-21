@@ -161,14 +161,17 @@ fn qwen_fp8_deepgemm_dense_enabled() -> bool {
 /// `prop.major == 9`). Cache the device compute-capability major ONCE here so
 /// the dense FP8 dispatch can SM-gate the DeepGEMM path without a per-step
 /// `cuDeviceGetAttribute` (the known per-step device-property query perf bug).
-/// On sm < 9 the caller routes the dense FP8 GEMM to the software-dequant →
-/// BF16 cuBLAS path (large M) or the portable scalar block-scaled GEMV (small
-/// M) — both run on sm_70+. The sm >= 9 path is byte-identical to before.
+/// On any non-Hopper SM the caller routes the dense FP8 GEMM to the
+/// software-dequant → BF16 cuBLAS path (large M) or the portable scalar
+/// block-scaled GEMV (small M) — both run on sm_70+. The Hopper path is
+/// byte-identical to before.
 fn qwen_fp8_dense_sm_supports_deepgemm(ctx: &DeviceContext) -> bool {
     static SUPPORTS: OnceLock<bool> = OnceLock::new();
     *SUPPORTS.get_or_init(|| {
         let (major, minor) = ctx.compute_capability();
-        let supports = major >= 9;
+        // DeepGEMM is Hopper-exclusive: deepgemm_native.cu refuses major != 9
+        // at every entry. Blackwell (major 10/12) must fall to the portable path.
+        let supports = major == 9;
         if !supports {
             log::info!(
                 "Qwen FP8 dense DeepGEMM SM-gated OFF on sm_{major}{minor} (Hopper sm_90 \
