@@ -48,7 +48,6 @@
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
 #include "cutlass/gemm/kernel/tile_scheduler_params.h"
-#include "cutlass/util/packed_stride.hpp"
 
 using namespace cute;
 
@@ -117,6 +116,26 @@ using StrideA = typename Gemm::GemmKernel::InternalStrideA;
 using StrideB = typename Gemm::GemmKernel::InternalStrideB;
 using StrideC = typename Gemm::GemmKernel::InternalStrideC;
 using StrideD = typename Gemm::GemmKernel::InternalStrideD;
+
+// Mirror cutlass::make_cute_packed_stride — the vendored cutlass tree is
+// include-only (no tools/util/packed_stride.hpp). Rank-3 (d0, d1, L); L=1 grouped
+// ⇒ batch stride 0. Two overloads keyed on the unit-stride (contiguous) mode:
+//   RowMajor [d0,d1]     -> Stride<int64_t, _1, int64_t>, leading = d1
+//   ColumnMajor [d0,d1]  -> Stride<_1, int64_t, int64_t>, second  = d0
+template <class IntT>
+CUTLASS_HOST_DEVICE cute::Stride<IntT, cute::Int<1>, IntT> arle_packed_stride(
+    cute::Stride<IntT, cute::Int<1>, IntT> s, int d0, int d1, int l) {
+  cute::get<0>(s) = static_cast<IntT>(d1);
+  cute::get<2>(s) = (l > 1) ? static_cast<IntT>(static_cast<int64_t>(d0) * d1) : IntT(0);
+  return s;
+}
+template <class IntT>
+CUTLASS_HOST_DEVICE cute::Stride<cute::Int<1>, IntT, IntT> arle_packed_stride(
+    cute::Stride<cute::Int<1>, IntT, IntT> s, int d0, int d1, int l) {
+  cute::get<1>(s) = static_cast<IntT>(d0);
+  cute::get<2>(s) = (l > 1) ? static_cast<IntT>(static_cast<int64_t>(d0) * d1) : IntT(0);
+  return s;
+}
 
 // Persistent device scratch — allocated once, grown on demand. Reused across the
 // per-layer / per-step GEMM calls (no per-call cudaMalloc in the hot loop).
@@ -264,10 +283,10 @@ extern "C" CUresult arle_fp8_moe_grouped_gemm_nt_sm120(
     pSFA[g] = sfa + row;
     pSFB[g] = sfb + static_cast<int64_t>(g) * n_blocks * k_blocks;
 
-    sA[g] = cutlass::make_cute_packed_stride(StrideA{}, {Mg, k, 1});
-    sB[g] = cutlass::make_cute_packed_stride(StrideB{}, {n, k, 1});
-    sC[g] = cutlass::make_cute_packed_stride(StrideC{}, {Mg, n, 1});
-    sD[g] = cutlass::make_cute_packed_stride(StrideD{}, {Mg, n, 1});
+    sA[g] = arle_packed_stride(StrideA{}, Mg, k, 1);
+    sB[g] = arle_packed_stride(StrideB{}, n, k, 1);
+    sC[g] = arle_packed_stride(StrideC{}, Mg, n, 1);
+    sD[g] = arle_packed_stride(StrideD{}, Mg, n, 1);
 
     // LayoutSFA — DeepGEMM packing: K-block stride = scale_stride_m (NOT Mg),
     // per-token (1) stride = 1. Matches `k_block*scale_stride_m + m`.
