@@ -50,3 +50,30 @@ hot-swap — all functioning, zero errors.
   hardcoded.
 - `--spec-type dspark` requires a draft checkpoint that actually contains the
   Markov head (`dspark-sp+markov`), not a backbone-only DFlash checkpoint.
+
+## Post-verification fixes (2026-07-21)
+
+A code review after the E2E run found two correctness bugs that silently
+degraded training quality; both fixed before any acceptance-rate benchmark:
+
+1. **L1 loss was dimensionally wrong** (`crates/train/src/dspark_train.rs`):
+   the supervised loss computed `softmax(draft) − raw_target_logits` — mixing
+   [0,1] probabilities with unbounded logits. The `target_probs_id` tensor
+   (the actual `softmax(target)`) was computed but never used. With L1 weight
+   0.9, 90% of the gradient signal was garbage. **Fix**: negate
+   `target_probs_id` in-graph (`ops::mul_scalar(target_probs_id, -1.0)`) so the
+   loss is `softmax(draft) − softmax(target)`. Also removed the dead
+   host-side `neg_target_probs` Vec allocation.
+
+2. **Trainer started from random init, discarding checkpoint weights**:
+   `init_params` used sin/cos pseudo-random init, overwriting the engine's
+   pre-trained Markov head on the first weight hot-swap. Acceptance would
+   regress before recovering. **Fix**: added `get_dspark_markov_weights()`
+   (mirrors `update_dspark_markov_weights` across the 6-file dispatch chain)
+   to read the loaded checkpoint weights; the sidecar seeds the trainer from
+   them as its first action (inside the spawned thread, so serve startup is
+   not blocked by the D2H copy + sync).
+
+Also added: gradient clipping (`max_grad_norm`, default 1.0, reuses
+`crate::grad_clip::clip_grad_norm`), configurable `baseline_init`, and
+replaced the 22-item manual tensor-free list with `free_new_except` snapshot.
