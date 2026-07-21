@@ -10,25 +10,30 @@
 # Models auto-download from HF if not local (set HF_ENDPOINT=https://hf-mirror.com
 # for the mirror).
 #
-# Default = ALL FEATURES ON (canonical config): grpo on-policy at
-# --rollout-temperature 1.0 (#167 fixed 2026-07-21 — the final-norm w-1 corruption
-# that scrambled temp>0 is gone), --samples-per-prompt 4 (grpo needs G>=4 for group
-# variance), --sync every-group (faithful pi_behavior), spec-decode via TC's own
-# MTP head (--mtp-draft-tokens, aligned to the student — see SPEC below), eval
-# --eval-concurrency 8. Fall back to the cheap SFT-on-wins baseline with
-# UPDATE_STRATEGY=rejection-ce ROLLOUT_TEMPERATURE=0.0 SAMPLES=2.
+# Default = the 2026-07-21 deep-research canonical config
+# (docs/research/2026-07-21-rl-algo-infra-deepresearch.md): DAPO + one-step-off
+# async (--staleness 1) + dynamic sampling (--task-selection) + G=8 at
+# --rollout-temperature 1.0 (#167 fixed 2026-07-21), spec-decode via TC's own MTP
+# head (SPEC below, aligned), eval --eval-concurrency 8. DAPO carries the DeepSWE
+# bundle (no-std / no-KL / clip-higher / overlong-filter); --staleness 1 recovers
+# the async throughput strict every-group sync forfeits and needs an IS-ratio
+# preset (dapo/dr-grpo/gspo — NOT rejection-ce). Fall back to the cheap
+# SFT-on-wins baseline with UPDATE_STRATEGY=rejection-ce ROLLOUT_TEMPERATURE=0.0
+# STALENESS=0 SAMPLES=2.
 # Optional env (full-run defaults; SMOKE=1 = 2-round sizing run):
 #   ARLE_BIN=target/release/arle  OUT_ROOT=runs  GPU=0  MODEL_CACHE=models
 #   STUDENT_MODEL=<dir>           override student (else fetch STUDENT_MODEL_HF_ID)
 #   STUDENT_MODEL_HF_ID=bottlecapai/ThinkingCap-Qwen3.6-27B-FP8
-#   UPDATE_STRATEGY=grpo          {grpo,rejection-ce,dapo,dr-grpo,gspo,cispo,...}
-#   ROLLOUT_TEMPERATURE=1.0       grpo needs >0; rejection-ce uses 0.0 (greedy)
+#   UPDATE_STRATEGY=dapo          {dapo,gspo,dr-grpo,grpo,rejection-ce,cispo,...}
+#   STALENESS=1                   one-step-off async (needs an IS-ratio preset)
+#   TASK_SELECTION=true           GRESO zero-variance skip + retirement
+#   ROLLOUT_TEMPERATURE=1.0       grpo/dapo need >0; rejection-ce uses 0.0 (greedy)
 #   SPEC=mtp                      spec-decode via TC's built-in MTP head (default,
 #                                 aligned, no download). dflash=external draft
 #                                 (needs C4 retrain vs TC). off=disable.
 #   MTP_DRAFT_TOKENS=3            MTP draft depth (SPEC=mtp)
 #   DSPARK_DRAFT_HF_ID=z-lab/Qwen3.6-27B-DFlash   DSPARK_CONF_THRESHOLD=0.0  (SPEC=dflash)
-#   ROUNDS=16 SAMPLES=4 EVAL_EVERY=2 EVAL_N=24 EVAL_CONCURRENCY=8
+#   ROUNDS=16 SAMPLES=8 EVAL_EVERY=2 EVAL_N=24 EVAL_CONCURRENCY=8
 #   TASK_LIMIT=12 WRITEBACK_CAP=8 BASE_REPEATS=2 DIFFICULTY=easy SEED=0
 set -euo pipefail
 
@@ -58,15 +63,24 @@ command -v huggingface-cli >/dev/null || { echo "huggingface-cli missing (pip in
 STUDENT_MODEL=${STUDENT_MODEL:-$(ensure_hf_model "$STUDENT_MODEL_HF_ID")}
 
 if [[ ${SMOKE:-0} == 1 ]]; then
-    ROUNDS=${ROUNDS:-2} SAMPLES=${SAMPLES:-4} EVAL_EVERY=${EVAL_EVERY:-1}
+    ROUNDS=${ROUNDS:-2} SAMPLES=${SAMPLES:-8} EVAL_EVERY=${EVAL_EVERY:-1}
     EVAL_N=${EVAL_N:-8} TASK_LIMIT=${TASK_LIMIT:-4} BASE_REPEATS=${BASE_REPEATS:-0}
 else
-    ROUNDS=${ROUNDS:-16} SAMPLES=${SAMPLES:-4} EVAL_EVERY=${EVAL_EVERY:-2}
+    ROUNDS=${ROUNDS:-16} SAMPLES=${SAMPLES:-8} EVAL_EVERY=${EVAL_EVERY:-2}
     EVAL_N=${EVAL_N:-24} TASK_LIMIT=${TASK_LIMIT:-12} BASE_REPEATS=${BASE_REPEATS:-2}
 fi
-# All-features-on canonical default: grpo on-policy at temp=1.0 (#167 fixed).
-UPDATE_STRATEGY=${UPDATE_STRATEGY:-grpo}
+# Canonical default = the 2026-07-21 deep-research config
+# (docs/research/2026-07-21-rl-algo-infra-deepresearch.md): DAPO (no-std/no-KL/
+# clip-higher/overlong-filter, the DeepSWE bundle) + one-step-off async
+# (--staleness 1, recovers the 2.2-2.8x that strict every-group sync forfeits;
+# needs an IS-ratio preset, which dapo is) + dynamic sampling (--task-selection)
+# + G=8 (sparse execution reward makes G=4 zero-variance groups common) at
+# temp=1.0. rejection-ce/greedy fallback: UPDATE_STRATEGY=rejection-ce
+# ROLLOUT_TEMPERATURE=0.0 STALENESS=0 SAMPLES=2.
+UPDATE_STRATEGY=${UPDATE_STRATEGY:-dapo}
 ROLLOUT_TEMPERATURE=${ROLLOUT_TEMPERATURE:-1.0}
+STALENESS=${STALENESS:-1}
+TASK_SELECTION=${TASK_SELECTION:-true}
 EVAL_CONCURRENCY=${EVAL_CONCURRENCY:-8}
 WRITEBACK_CAP=${WRITEBACK_CAP:-8} DIFFICULTY=${DIFFICULTY:-easy} SEED=${SEED:-0}
 # Spec-decode default = TC's OWN MTP head (--mtp-draft-tokens): the mtp.* tensors
@@ -95,7 +109,7 @@ python3 -m pytest --version >/dev/null 2>&1 || { echo "pytest missing (scoring n
 [[ -x $ARLE_BIN ]] || { echo "arle binary missing at $ARLE_BIN" >&2; exit 1; }
 
 mkdir -p "$OUT"
-echo "[curve] out=$OUT strategy=$UPDATE_STRATEGY temp=$ROLLOUT_TEMPERATURE spec=$SPEC rounds=$ROUNDS samples=$SAMPLES tasks=$TASK_LIMIT eval_n=$EVAL_N eval_conc=$EVAL_CONCURRENCY gpu=$GPU"
+echo "[curve] out=$OUT strategy=$UPDATE_STRATEGY staleness=$STALENESS temp=$ROLLOUT_TEMPERATURE spec=$SPEC rounds=$ROUNDS samples=$SAMPLES tasks=$TASK_LIMIT eval_n=$EVAL_N eval_conc=$EVAL_CONCURRENCY gpu=$GPU"
 
 # 1. Corpus (deterministic; self-check = base-FAILS / gold-PASSES gate).
 python3 scripts/gen_agent_opd_tasks.py \
@@ -114,6 +128,8 @@ train_args=(
     --update-strategy "$UPDATE_STRATEGY"
     --rollout-temperature "$ROLLOUT_TEMPERATURE"
     --samples-per-prompt "$SAMPLES"
+    --staleness "$STALENESS"
+    --task-selection "$TASK_SELECTION"
     --sync every-group
     --test-timeout-secs 60
     --writeback-cap "$WRITEBACK_CAP"
