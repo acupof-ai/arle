@@ -245,27 +245,24 @@ sweetspot3 29-train / 33-held-out):**
   config): this is *SFT-on-wins / rejection sampling*, **not** on-policy RL. A
   positive `delta` is a capability lift, not evidence GRPO works. Cheapest kill
   available; run it, one variable = student model.
-- **Phase 2 — `grpo` on-policy: runnable at temp≤0.7 now; temp=1.0 gated on #59
-  Type-B.** #59 has **two independent causes** (sha-verified probe on HEAD
-  `9edfcb234`, decoded generations — not inference):
-  - **Type-A = `b4b293f0c`** (hd256 q/k RMSNorm OFFSET→STANDARD): broke greedy-at-
-    length AND temp>0. **Fixed at HEAD** (OFFSET `(1+w)` restored at all 4 sites).
-    Garbage signature `funciton/Fibonaacci/_selection_selection_`.
-  - **Type-B = a second, temp>0-specific tail bug that PERSISTS at HEAD**
-    (different garbage `fkk fkk`, early-stop ~117 tok). Localized by a zero-rebuild
-    param sweep: **top_k=1/greedy → COHERENT** (bug is in the sampled low-prob
-    tail, not attention/argmax); **COHERENT at temp≤0.7, SCRAMBLED at temp=1.0**
-    (temp<1 sharpens away from the bad tail); not a top_p renorm bug. Regression
-    window `67e15b0a6..a41827b75`, survives to HEAD; **not** the norm and **not**
-    `a41827b75`'s sample.rs rewrite alone. Suspects: `qwen35.rs`/`prefix_state.rs`
-    attention-prep, `d94cf4b80` (rejection-sampling). Second bisect (OFFSET held
-    fixed) in flight.
-  - **Actionable:** GRPO needs temp>0 for group variance — run it at
-    `--rollout-temperature 0.7` (coherent, within the industry 0.6–1.0 band) as the
-    interim, `--update-strategy grpo --samples-per-prompt 4 --sync every-group`.
-    Recover temp=1.0 after the Type-B fix. Do **not** run at temp=1.0 before the
-    fix — a garbage `π_behavior` makes the IS ratio meaningless and the arm
-    unattributable (§1.5/§4 confounder).
+- **Phase 2 — `grpo` on-policy: temp=1.0 UNBLOCKED (#167 fixed).** `b4b293f0c`
+  carried **two independent** RMSNorm bugs, both now fixed (sha-verified pod probes,
+  decoded generations — not inference):
+  - **Type-A = the kernel half** (`e4d5580ca`): hd256 q/k RMSNorm `(1+w)`→`w`,
+    attention collapse at length (greedy-at-length AND temp>0). Garbage
+    `funciton/_selection_selection_`.
+  - **Type-B = the load half** (`d703b5240`): the same commit added
+    `load_final_norm_offset` (`w-1`) on the final RMSNorm weight before the shared
+    `(1+w)` kernel; the kernel is correct, but `w-1` sign-corrupts the STANDARD
+    final-norm's negative channels → flattened logits → temp=1.0 sampled-tail
+    garbage (`fkk`, ~117 tok). Greedy survived (argmax ordering preserved) so it hid
+    behind the greedy gate and persisted to HEAD after Type-A was fixed. Adjacent
+    bisect flip `67e15b0a6` COHERENT → `b4b293f0c` SCRAMBLED; fix = blanket revert to
+    `load_vec` (final-norm STANDARD across all models, kernel not head-dim-gated).
+  - **Actionable:** run grpo at **`--rollout-temperature 1.0`** (industry 0.6–1.0
+    band), `--update-strategy grpo --samples-per-prompt 4 --sync every-group`.
+    Pod-verified COHERENT at temp=1.0 + greedy. Gate on the correct-inference probe
+    (temp=1.0 coherent) before trusting `π_behavior`.
 - **Phase 3 — ablations/scale** on a Phase-1/2 survivor: LoRA surface, layers,
   rounds; then **≥5-seed mean±σ + Wilson CI** before any capability claim <5pp
   (matches both the ARLE rule and the sober-look finding), and multi-shape (≥2 task

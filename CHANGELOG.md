@@ -23,6 +23,16 @@ Progress spine. Entry classes recorded here the day they land: phase exits,
 default flips, and accept-or-reject verdicts (AGENTS.md §Docs lifecycle &
 progress spine).
 
+- **2026-07-21 — #167 closed: Qwen3.6 temp>0 sampled-tail garbage fixed (accept).**
+  `b4b293f0c` carried two independent RMSNorm bugs. Type-A (kernel, `e4d5580ca`):
+  hd256 q/k `(1+w)`→`w`. Type-B (load, `d703b5240`): a `w-1` transform on the final
+  RMSNorm weight before the correct `(1+w)` kernel, sign-corrupting the STANDARD
+  final-norm's negative channels → flattened logits → temp=1.0 garbage; greedy
+  survived so it hid behind the greedy gate and persisted to HEAD after the Type-A
+  revert. OFFSET-held bisect (sha-verified) → blanket revert to `load_vec`.
+  Pod-verified temp=1.0 + greedy COHERENT. **temp=1.0 on-policy grpo unblocked.**
+  [errors](docs/experience/errors/2026-07-20-hd256-fp8-temp-sampling-corruption.md) ·
+  [#167](https://github.com/cklxx/arle/issues/167).
 - **2026-07-20 — DSpark train sidecar Phase 1 shipped (accept, end-to-end verified).**
   `arle serve --spec-type dspark` now spawns a background acceptance-weighted trainer
   that drains the experience buffer the hot path populates and hot-swaps
