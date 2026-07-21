@@ -1,0 +1,21 @@
+.vscode/settings.json
+  s_1b36017e58827d::t_86a34122529997 1-5
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "fdd9a4ee97fdf35c659a12ef9decba11a4074b7b",
+  "prompts": {},
+  "sessions": {
+    "s_1b36017e58827d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a08abdc053b05388c",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
