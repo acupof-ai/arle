@@ -23,6 +23,65 @@ Progress spine. Entry classes recorded here the day they land: phase exits,
 default flips, and accept-or-reject verdicts (AGENTS.md §Docs lifecycle &
 progress spine).
 
+## [0.4.0] - 2026-07-22
+
+Headline: **DSv4 production hardening** (prefill chunk 2048 default, FP32
+compressor, c32 preemption survival, prefix reuse), **DSpark train sidecar +
+batched verify**, and **#167 temp>0 sampling correctness**. ~300 commits since
+v0.3.0.
+
+### Added
+
+- **DSpark train sidecar** (`--dspark-train` / serve background trainer) —
+  acceptance-weighted Markov-head updates from the live experience buffer with
+  hot-swap into the running engine. H20 e2e: 6 steps, loss −4.04→−3.18.
+  [win](docs/experience/wins/2026-07-20-dspark-train-sidecar-e2e-verified.md).
+- **DSpark batched verify (B>1)** — batch anchor forward + FlashMLA-gated
+  verify; TP lockstep proposal/accept extracted. c>1 crash closed; c8/c16 still
+  structural regress vs no-spec on some shapes.
+- **Qwen3.5/3.6 MTP speculative decode** — paged + contiguous, MoE draft head,
+  rejection-sampling acceptance for RL-lossless sampled rollouts (opt-in).
+- **Agent-OPD cc-harness path** — in-process serve, pass-rate task selection,
+  experience-replay (opt-in), `--staleness 1` IS correction, dense/binary/anchored
+  reward shapes, held-out eval concurrency.
+- **V100 (sm_70) serving substrate** — BF16→FP16 GEMM cast, paged-attention
+  `allow_sm70`, W4A16 MoE grouped GEMV, FA2 hand-written attention.
+- **ThinkingCap-27B-FP8** as the canonical CUDA agentic model default.
+- **Unified direct L3 storage** (`kv-tier`) + DSv4 L2/L3 hit path measured.
+- **DSv4 local-NVMe cold load** — `ARLE_LOADER_PREFETCH=0`; 294 GB → HTTP ready
+  in ~81 s on local NVMe (vs ~28 min virtio).
+- **Qualified kernel artifact flow** — candidate pack → per-SM fragments →
+  aggregate sidecar; release validates exact bundle ID + ancestry.
+
+### Changed
+
+- **DSv4 prefill chunk default 128→2048** (default flip). c1 cold TTFT
+  3031→1088 ms; c16/c32 out tok/s +126%/+128%. Override:
+  `ARLE_DSV4_PREFILL_CHUNK`.
+  [win](docs/experience/wins/2026-07-17-dsv4-prefill-chunk-2048-default.md).
+- **DSv4 FP32 main-value compressor default-on** (correctness for #146/#150);
+  all compression boundaries; prefill-only probe (unblocks DSpark decode);
+  grid-parallel probe; FP32 scratch hoisted off per-slot state (slots 2→59).
+- **`--max-running-requests`** frees per-slot VRAM into the compute pool —
+  **84k → 1,048,576 tokens (12.5×)**; c32 preemption survival (#164/#162).
+- **Agent-OPD curve defaults** — deep-research Phase-2 config (dapo +
+  staleness 1 + G=8); grpo temp=1.0 unblocked after #167.
+
+### Fixed
+
+- **#167 Qwen3.6 temp>0 sampled-tail garbage** — dual RMSNorm bugs (hd256 q/k
+  OFFSET convention + final-norm `w-1` load). temp=1.0 + greedy coherent;
+  on-policy grpo unblocked.
+  [errors](docs/experience/errors/2026-07-20-hd256-fp8-temp-sampling-corruption.md).
+- **DSv4 extension-prompt prefix reuse** — finish write-through no longer
+  clobbers aligned boundary entries; also #165 CSA indexer bf16 pending.
+- **DSv4 plan-repair / HostPagedKvPool fatal at c32** — evict-until-freed +
+  degrade-to-park on step-path alloc failure.
+- **SM-gate Qwen FP8 dense DeepGEMM to Hopper-only** (`major == 9`).
+- **DSpark draft latent sliding-window** + oversized prefill chunk rebase.
+
+### Verdicts (selected)
+
 - **2026-07-21 — #167 closed: Qwen3.6 temp>0 sampled-tail garbage fixed (accept).**
   `b4b293f0c` carried two independent RMSNorm bugs. Type-A (kernel, `e4d5580ca`):
   hd256 q/k `(1+w)`→`w`. Type-B (load, `d703b5240`): a `w-1` transform on the final
@@ -199,6 +258,7 @@ progress spine).
   Also bounded checkpoint prefetch to rank zero plus page-cache capacity, removing
   the observed 4-rank full-checkpoint read amplification. [correctness](docs/experience/wins/2026-07-14-dspark-dsv4-accept-and-correctness.md),
   [load](docs/experience/wins/2026-07-14-loader-tp-rank0-prefetch.md).
+
 
 ## [0.3.0] - 2026-07-12
 

@@ -113,7 +113,7 @@ on the AIPC backend queue (same pending ratification).
 
 Released tags + bench evidence live in:
 
-- [`CHANGELOG.md`](CHANGELOG.md) — per-version notes (latest: v0.1.5)
+- [`CHANGELOG.md`](CHANGELOG.md) — per-version notes (latest: v0.4.0)
 - [`docs/experience/wins/`](docs/experience/wins/), [`docs/experience/errors/`](docs/experience/errors/) — curated evidence log
 - [GitHub Releases](https://github.com/cklxx/arle/releases) — tagged binaries
 - `git log` — full history
