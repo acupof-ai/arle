@@ -23,6 +23,16 @@ Progress spine. Entry classes recorded here the day they land: phase exits,
 default flips, and accept-or-reject verdicts (AGENTS.md §Docs lifecycle &
 progress spine).
 
+- **ACCEPT — sm_120 FP8 MoE prefill: CUTLASS grouped GEMM (G2)** (2026-07-22).
+  The Blackwell (RTX PRO 6000, sm_120) FP8 MoE prefill now runs the CUTLASS 4.3.5
+  sm_120a grouped blockwise-scaling collective instead of the pathological
+  hand-grouped GEMV fallback (the Hopper-only DeepGEMM path never compiles for
+  sm_120). c=1 cold-prefill TTFT **84,634 → 760 ms (~111×)**, total throughput
+  c=8 **26.5×**, c=16 recovered from full collapse. needle exact/DET 115..8000;
+  correctness_failed=0. Scale layout matched by construction (SFA custom K-block
+  stride, SFB load-time transpose). Opt-in on sm_120 targets only; Hopper path
+  byte-unchanged. [wins](docs/experience/wins/2026-07-22-bench-sm120-fp8-moe-cutlass-grouped.md).
+
 ## [0.4.0] - 2026-07-22
 
 Headline: **DSv4 production hardening** (prefill chunk 2048 default, FP32

@@ -1,6 +1,8 @@
 # sm_120 (Blackwell RTX PRO 6000) — ThinkingCap-Qwen3.6-27B-FP8 kernel compatibility map
 
-> Status: Active
+> Status: Active — (A) correctness floor shipped; **(B) G2 SHIPPED 2026-07-22**
+> (CUTLASS sm_120a grouped FP8 MoE GEMM: c=1 prefill TTFT 84.6 s → 760 ms ~111×,
+> needle exact/DET; [wins](../experience/wins/2026-07-22-bench-sm120-fp8-moe-cutlass-grouped.md)).
 
 Two deliverables, both planned:
 - **(A) correctness floor** — route sm_120 to the portable fallback tier, pass the
