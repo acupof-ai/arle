@@ -1692,6 +1692,29 @@ pub(crate) enum RubricTaskArg {
     Agentic,
 }
 
+/// cc-harness reward transform (`--reward-shape`). Default `Dense` reproduces
+/// the historical reward exactly.
+#[derive(Debug, Clone, Copy, Default, ValueEnum)]
+pub(crate) enum RewardShapeArg {
+    /// Pytest pass-fraction as-is (unchanged default).
+    #[default]
+    Dense,
+    /// 1.0 only when every test passes, else 0.0.
+    Binary,
+    /// Pass/fail anchor with a small tie-break fraction for fails; errors → 0.
+    Anchored,
+}
+
+impl From<RewardShapeArg> for train::cc_harness::RewardShape {
+    fn from(arg: RewardShapeArg) -> Self {
+        match arg {
+            RewardShapeArg::Dense => Self::Dense,
+            RewardShapeArg::Binary => Self::Binary,
+            RewardShapeArg::Anchored => Self::Anchored,
+        }
+    }
+}
+
 /// What the accepted set writes back as CE targets.
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub(crate) enum RubricWritebackArg {
@@ -2031,6 +2054,12 @@ pub(crate) struct TrainAgentOpdArgs {
     /// Test-run (scoring) timeout (seconds).
     #[arg(long, default_value_t = 300)]
     pub(crate) test_timeout_secs: u64,
+
+    /// How the pytest pass-fraction becomes the reward. `dense` (default) is the
+    /// fraction as-is, byte-identical to prior runs; `binary` = 1 only on a full
+    /// pass; `anchored` = binary pass with a small tie-break fraction for fails.
+    #[arg(long, value_enum, default_value_t = RewardShapeArg::Dense)]
+    pub(crate) reward_shape: RewardShapeArg,
 
     /// RFT rounds (rollout → execute → score → writeback-CE).
     #[arg(long, default_value_t = 3)]

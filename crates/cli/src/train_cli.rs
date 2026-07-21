@@ -246,6 +246,7 @@ fn run_cc_convert_impl(args: TrainCcConvertArgs) -> Result<()> {
                 .map_or_else(|| format!("w{idx}"), str::to_owned),
             // Manual --window has no attempt reward → passing default (CE flow).
             reward: 1.0,
+            errored: false,
             model: None,
         });
     }
