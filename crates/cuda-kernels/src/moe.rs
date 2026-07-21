@@ -1582,6 +1582,59 @@ pub unsafe fn dsv4_deepgemm_m_grouped_fp8_gemm_nt_contiguous(
     Ok(())
 }
 
+/// sm_120 (Blackwell) grouped blockwise-scaled FP8 GEMM (NT): per group `g`,
+/// `d[rows(g), :] = a[rows(g), :] @ b[g]^T` with DeepSeek blockwise scaling
+/// (per-token A scale 1x128 + 128x128 B block scale). The sm_120 replacement
+/// for the Hopper-only [`dsv4_deepgemm_m_grouped_fp8_gemm_nt_contiguous`] on the
+/// SAME grouped FP8 buffers.
+///
+/// `a`/`b` are E4M3 bytes (`a` contiguous `[total_M, k]`, `b` grouped `[G, n, k]`
+/// row-major), `sfa` the per-token f32 scales in DeepGEMM packing (K-block
+/// leading dim `scale_stride_m`), `sfb` the f32 128-block weight scales already
+/// N-contiguous per group (`n_block + k_block*n_blocks` — the loader transposes
+/// the checkpoint layout at load on sm_120). `d` is BF16 out `[total_M, n]`.
+/// `group_offsets`/`group_counts` are device arrays of the 128-aligned per-group
+/// row start and the real per-group row count.
+///
+/// # Safety
+/// All pointers must be valid on `stream` for the shapes above; `n`/`k` are
+/// 128-aligned; `group_offsets[g] + group_counts[g] <= total_M`.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn arle_fp8_moe_grouped_gemm_nt_sm120(
+    a: RawDevicePtr<u8>,
+    sfa: RawDevicePtr<f32>,
+    b: RawDevicePtr<u8>,
+    sfb: RawDevicePtr<f32>,
+    d: RawDevicePtr<bf16>,
+    group_offsets: RawDevicePtr<i32>,
+    group_counts: RawDevicePtr<i32>,
+    num_groups: usize,
+    n: usize,
+    k: usize,
+    scale_stride_m: usize,
+    stream: CUstream,
+) -> Result<()> {
+    // SAFETY: forwarded — the caller upholds this fn's `# Safety` contract.
+    unsafe {
+        ffi::arle_fp8_moe_grouped_gemm_nt_sm120_cuda(
+            a.as_ptr(),
+            sfa.as_ptr(),
+            b.as_ptr(),
+            sfb.as_ptr(),
+            d.as_mut_ptr() as *mut Half,
+            group_offsets.as_ptr(),
+            group_counts.as_ptr(),
+            i32::try_from(num_groups)?,
+            i32::try_from(n)?,
+            i32::try_from(k)?,
+            i32::try_from(scale_stride_m)?,
+            stream,
+        )
+        .result()?;
+    }
+    Ok(())
+}
+
 /// SM90 BF16 m-grouped masked GEMM (NT): per group `g`,
 /// `d[g, 0..masked_m[g], :] = a[g, 0..masked_m[g], :] @ b[g]^T`. `a` is the
 /// per-group padded band `[num_groups, m, k]`, `b` the grouped weights
