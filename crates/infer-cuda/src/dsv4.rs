@@ -5013,12 +5013,7 @@ impl Dsv4Model {
             {
                 for r in 0..n {
                     let tap = &mut slots[slot_ids[r]].dspark_taps[tap_idx];
-                    let src = stream.data.slice(r * stream_dim..(r + 1) * stream_dim);
-                    let mut dst = tap.data.slice_mut(0..stream_dim);
-                    ctx.stream
-                        .memcpy_dtod(&src, &mut dst)
-                        .map_err(|e| anyhow!("DSpark batched tap capture D2D failed: {e}"))?;
-                    keepalive.keep_vec(tap);
+                    self.capture_mtp_stream_hidden(&stream, r, tap, &mut keepalive)?;
                 }
             }
             if let Some(t) = _moe_t {
