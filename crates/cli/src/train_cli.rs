@@ -2215,19 +2215,18 @@ fn run_cc_eval(
     let mut file = fs::File::create(&out_path)
         .with_context(|| format!("create eval out {}", out_path.display()))?;
 
-    // Bounded task-level concurrency: N workers steal task indices, each booting
-    // + rolling one task on the shared serve engine. Results land in per-slot
-    // cells so the output order matches the serial path exactly.
+    // Bounded task-level concurrency: N workers steal task indices and send each
+    // result back tagged with its index, so the output order matches the serial
+    // path exactly. thread::scope joins all workers before the channel is drained.
     let concurrency = concurrency.clamp(1, eval_tasks.len());
     let next = AtomicUsize::new(0);
-    type EvalSlot = Result<(serde_json::Value, bool, bool, f32)>;
-    let slots: Vec<std::sync::Mutex<Option<EvalSlot>>> = eval_tasks
-        .iter()
-        .map(|_| std::sync::Mutex::new(None))
-        .collect();
+    let next = &next; // shared by ref so each `move` worker copies the ref, not the counter
+    type EvalOut = Result<(serde_json::Value, bool, bool, f32)>;
+    let (tx, rx) = std::sync::mpsc::channel::<(usize, EvalOut)>();
     std::thread::scope(|scope| {
         for _ in 0..concurrency {
-            scope.spawn(|| {
+            let tx = tx.clone();
+            scope.spawn(move || {
                 loop {
                     let i = next.fetch_add(1, Ordering::Relaxed);
                     let Some((task, staged)) = eval_tasks.get(i) else {
@@ -2246,18 +2245,19 @@ fn run_cc_eval(
                             });
                             (line, s.passed(), s.edited, s.reward)
                         });
-                    *slots[i].lock().expect("eval slot poisoned") = Some(out);
+                    let _ = tx.send((i, out));
                 }
             });
         }
     });
+    drop(tx); // workers (and their clones) are joined; drop ours so rx ends
+    let mut results: Vec<Option<EvalOut>> = (0..eval_tasks.len()).map(|_| None).collect();
+    for (i, out) in rx {
+        results[i] = Some(out);
+    }
     let (mut passed, mut edited, mut dense_sum) = (0usize, 0usize, 0.0f32);
-    for slot in &slots {
-        let (line, p, e, r) = slot
-            .lock()
-            .expect("eval slot poisoned")
-            .take()
-            .expect("every eval slot filled")?;
+    for out in results {
+        let (line, p, e, r) = out.expect("every eval task produced a result")?;
         passed += usize::from(p);
         edited += usize::from(e);
         dense_sum += r;
@@ -2468,6 +2468,10 @@ struct ReplayRecord {
     /// default to 1.0 = a passing trajectory, keeping rejection-CE unchanged.
     #[serde(default = "replay_default_reward")]
     reward: f32,
+    /// Budget/timeout/error artifact — excluded by the DAPO `DropTruncated`
+    /// filter. Older dumps without the field default to false.
+    #[serde(default)]
+    truncated: bool,
 }
 
 #[cfg(feature = "cuda")]
@@ -2567,8 +2571,7 @@ fn replay_pg(
                         // licenses the source flip.
                         gen_logprobs: (!r.gen_logprobs.is_empty()).then(|| r.gen_logprobs.clone()),
                         group_id,
-                        // Replay records don't carry the terminal state.
-                        truncated: false,
+                        truncated: r.truncated,
                     })
                 })
                 .collect::<Result<_>>()?;
@@ -3830,12 +3833,14 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
         const REWARD_HELDOUT_GAP_WARN: f64 = 0.2;
         let reward_heldout_gap = held_out_pass_rate.map(|pass| reward_mean - f64::from(pass));
         if let Some(gap) = reward_heldout_gap {
-            if gap > REWARD_HELDOUT_GAP_WARN && prev_eval_gap.is_some_and(|prev| gap > prev) {
+            if let Some(prev) = prev_eval_gap
+                && gap > REWARD_HELDOUT_GAP_WARN
+                && gap > prev
+            {
                 eprintln!(
                     "[arle train agent-opd] WARNING round {round}: reward↔held-out gap \
                      {gap:+.4} exceeds {REWARD_HELDOUT_GAP_WARN} and is rising (prev \
-                     {:+.4}) — possible reward hacking",
-                    prev_eval_gap.expect("prev gap present"),
+                     {prev:+.4}) — possible reward hacking",
                 );
             }
             prev_eval_gap = Some(gap);
