@@ -120,6 +120,37 @@ FlashQLA `runtime_flags.rs:126` default false; FA2-sm70 `qwen35.rs:831` `major <
 
 **4 steps, 1 code edit (landed); the rest are build + verify-existing-gate.**
 
+## 4b. sm_120 first-light — VERIFIED 2026-07-22 (Colab RTX PRO 6000)
+
+Real-hardware results on NVIDIA RTX PRO 6000 Blackwell (sm_120, 96 GB, CUDA 12.8):
+- **Build ✅** — `TORCH_CUDA_ARCH_LIST=12.0 cargo build --release --features cuda`
+  succeeds (6m19s, Rust cached). **TileLang emitted sm_120 codegen with the DEFAULT
+  arch — no JIT hang (#2328 did NOT manifest at build), no error**, ~45 kernels. The
+  §5 load-bearing assumption is confirmed positive; `ARLE_TILELANG_CUDA_ARCH=90` not
+  needed for the build.
+- **G1 fix ✅ real-hardware** — serve.log: `Qwen FP8 dense DeepGEMM SM-gated OFF on
+  sm_120 … using dequant→BF16 GEMM / scalar GEMV fallback`. **No CUDA_ERROR_NOT_SUPPORTED
+  abort.** The `major == 9` gate routes sm_120 to the portable path correctly.
+- Model loads (49.9 GB, BF16 KV pool 21104 pages, L2 DRAM tier). `/v1/models` → 200.
+- Model is `Qwen/Qwen3.6-27B-FP8` = **MoE-VLM** (`Qwen3_5ForConditionalGeneration`,
+  64 layers, per-layer `shared_expert_gate`, MTP, `out_hidden_size`) — corrects §0's
+  dense inference.
+
+**BLOCKER — single-GPU MoE serve hang (NOT sm_120-specific).** Decode never produces
+tokens: GPU util 0%, engine process sleeping, 1077/1080 threads in `futex_wait`, ZERO
+in CUDA/driver wait. The serve came up on the **`coordinator_local_router` relay path**
+(MoE takes the multiproc-serve gate, `infer-api/lib.rs:62`
+`cuda_model_takes_multiproc_serve` → Qwen35/Dsv4), spawning **1024 `arle-relay-worker`
+threads** (`infer-server/lib.rs:829` `max_live_requests.clamp(1,1024)`). The request
+never reaches `engine.step()`. Static trace (HTTP → `submit_tx` → `lockstep_loop`
+`TickAdmissions` → relay driver → `submit_streaming` → `engine_loop`) is
+architecturally sound — the lockstep world=1 path (coordinator.rs:396 parks on
+`submit_rx.recv_timeout`, wakes on Submit) has no obvious bug. **Root cause needs a
+live backtrace of the parked engine thread; not yet determined — do not file a
+hypothesis.** Device-neutral (would repro on any GPU running single-GPU MoE serve);
+orthogonal to the Blackwell kernel work. Gates Cut-2 (MoE grouped GEMM bench); Cut-1
+(dense FP8 GEMM) can be developed on a dense model that takes the single-process path.
+
 ## 5. Colab RTX PRO 6000 build+bench loop (critical-path prerequisite)
 
 Peak-perf work is unverifiable without an sm_120 box. Stand this up FIRST; it gates
