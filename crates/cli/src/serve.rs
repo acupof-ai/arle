@@ -546,10 +546,6 @@ fn resolve_engine_config(
     if let Some(value) = serve_args.max_total_tokens {
         config.max_total_tokens = value;
     }
-    // KV pool floor tracks the requested context window: a 131K-token floor on a
-    // 32 GB GPU (e.g. V100 + DSpark) eats ~8.6 GB BF16 and OOMs the draft-model
-    // forward. `--max-total-tokens` now sizes the floor; default 64K → 4096 pages.
-    config.total_pages = config.max_total_tokens.div_ceil(config.page_size);
     config.max_thinking_tokens = serve_args.max_thinking_tokens;
     config.mem_fraction_static = serve_args.mem_fraction_static;
     config.kv_dram = serve_args.kv_dram;
