@@ -263,6 +263,32 @@ Instantiate it; do not hand-write MMA.
 DeepSeek-style **blockwise-scaling** (float-scale) collective family, NOT MXFP8/e8m0. Only
 a BF16→FP32 widen at load; no UE8M0 repack.
 
+### G2 de-risk — collective VERIFIED 2026-07-22 (RTX PRO 6000, standalone)
+The sm_120a grouped blockwise-scaling FP8 GEMM **compiles and is bit-exact** vs an FP32
+reference (`max_rel_err=0`, ragged M∈[100,500] + heavy M=3000 groups). Source =
+`scratchpad/fp8_moe_grouped_cutlass_sm120.cu`, copied from CUTLASS 4.3.5 example
+**`87c_blackwell_geforce_fp8_bf16_grouped_gemm_groupwise.cu`** (the only in-tree sm_120a
+grouped blockwise instantiation). **The hard part (does the collective instantiate on
+sm_120a) is done.** Load-bearing facts for the production wiring:
+- **Type stack:** `arch::Sm120` `OpClassTensorOp`; `MmaTileShape=Shape<_128,_128,_128>`,
+  `ClusterShape=Shape<_1,_1,_1>` (RTX Blackwell = no multicast); `Sm120BlockwiseScaleConfig<
+  M=1,N=128,K=128>` (= DeepSeek per-token-A / 128×128-B); `KernelScheduleSm120Blockwise` +
+  `EpilogueScheduleAuto`; `GroupProblemShape` + `GemmUniversalMode::kGrouped`, TileScheduler
+  `void`. A RowMajor `[M,K]`, **B ColumnMajor `[N,K]` (NT)**, C/D RowMajor bf16. SF element
+  = f32. **N%128==0 && K%128==0** required (Qwen3.6 N=768,K=2048 comply).
+- **Build flags (add for this `.cu`):** `--expt-relaxed-constexpr` (collective's device
+  `std::min`) + **link `-lcuda`** (device TMA setup calls `cuDriverGetVersion`). Both are
+  build-flag, not template constraints.
+- **API is array-of-pointers, not DeepGEMM single-contiguous.** Map `ptr_A[g]=base+
+  row_offset[g]*K` (B/SFA/SFB likewise) — trivial. Build per-group `LayoutSFA/SFB` via
+  `ScaleConfig::tile_atom_to_shape_SFA/SFB(make_shape(M,N,K,1))` host-side, upload arrays.
+- **REMAINING integration risk = the ONE thing to validate on the real model:** the
+  checkpoint's `weight_scale_inv` memory layout vs CUTLASS's expected **SFB layout**
+  (`tile_atom_to_shape_SFB`), and the DeepGEMM activation-quant's **SFA layout** vs
+  CUTLASS's per-token expectation. Fake-data standalone can't prove this — the
+  `needle_gate` on the real checkpoint does. If layouts differ, add a host/load-time
+  repack of the scale tensors into CUTLASS's SF layout (cheap, load-time only).
+
 ### verify
 Colab sm_120. **Correct-inference gate** (`needle_gate.py` + self-consistency: the CUTLASS
 grouped output's own autoregressive generation is the reference, vs the hand-grouped
