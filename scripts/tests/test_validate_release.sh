@@ -20,15 +20,14 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 id="bundle:$(shasum -a 256 "$ROOT/bundle-input" | awk '{print $1}')"
 case "$1" in
     id) printf '%s\n' "$id" ;;
-    qualify-publish)
-        archive="$2"; evidence="$3"; out="${ARLE_KERNEL_PROMOTE_DIR:?}"
-        expected="$(jq -er '.candidate_archive_sha256' "$evidence")"
-        actual="$(shasum -a 256 "$archive" | awk '{print $1}')"
-        [[ "$expected" == "$actual" ]]
-        mkdir -p "$out"
-        cp "$archive" "$archive.sha256" "$evidence" "$out/"
+    fetch)
+        dir="${2:-}"
+        if [[ -n "$dir" ]]; then
+            file="arle-kernels-t1-$id.tar.gz"
+            [[ -f "$dir/$file" && -f "$dir/$file.sha256" ]] || exit 3
+        fi
+        exit 0
         ;;
-    fetch) exit 0 ;;
     *) exit 2 ;;
 esac
 EOF
@@ -50,21 +49,24 @@ C="$(git -C "$REPO" rev-parse HEAD)"
 U="$(printf 'unrelated\n' | git -C "$REPO" commit-tree "$A^{tree}")"
 
 asset() {
-    local commit="$1" evidence_id="$2" file_id="${4:-$2}" dir="$3" file sha
+    local commit="$1" evidence_id="$2" file_id="${4:-$2}" dir="$3" file sha with_sidecar="${5:-1}"
     file="arle-kernels-t1-$file_id.tar.gz"
     mkdir -p "$dir"
     printf archive >"$dir/$file"
     sha="$(shasum -a 256 "$dir/$file" | awk '{print $1}')"
     printf '%s  %s\n' "$sha" "$file" >"$dir/$file.sha256"
-    jq -cn --arg id "$evidence_id" --arg commit "$commit" --arg sha "$sha" \
-        '{schema:1,status:"passed",candidate_archive_sha256:$sha,bundle_id:$id,source_commit:$commit,kernel_build_id:"kernel",bundle_capabilities:[],observations:[]}' \
-        >"$dir/$file.qualification.json"
+    if [[ "$with_sidecar" == 1 ]]; then
+        jq -cn --arg id "$evidence_id" --arg commit "$commit" --arg sha "$sha" \
+            '{schema:1,status:"passed",candidate_archive_sha256:$sha,bundle_id:$id,source_commit:$commit,kernel_build_id:"kernel",bundle_capabilities:[],observations:[]}' \
+            >"$dir/$file.qualification.json"
+    fi
 }
 ID_X="bundle:$(printf X | shasum -a 256 | awk '{print $1}')"
 ID_Y="bundle:$(printf Y | shasum -a 256 | awk '{print $1}')"
 asset "$A" "$ID_X" "$REPO/assets/x"
 asset "$A" "$ID_X" "$REPO/assets/changed" "$ID_Y"
 asset "0000000000000000000000000000000000000000" "$ID_X" "$REPO/assets/missing"
+asset "$A" "$ID_X" "$REPO/assets/candidate-only" "$ID_X" 0
 
 run_at() {
     local commit="$1" source="$2" expected="$3" pattern="${4:-}"
@@ -84,5 +86,6 @@ run_at "$B" "$REPO/assets/x" pass
 run_at "$C" "$REPO/assets/changed" fail "kernel evidence bundle identity changed"
 run_at "$U" "$REPO/assets/x" fail "kernel evidence commit is not an ancestor"
 run_at "$B" "$REPO/assets/missing" fail "kernel evidence commit unavailable locally"
+run_at "$A" "$REPO/assets/candidate-only" pass
 
 echo "release validation self-test passed"

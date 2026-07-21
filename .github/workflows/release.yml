@@ -98,11 +98,19 @@ jobs:
           method: network
 
       - name: Fetch exact prebuilt TileLang kernel bundle (zero-Python lane)
-        # The checkout, T1 target, and compiler contract select one immutable
-        # asset. Missing content fails; release builds never consume `latest`.
+        # Exact bundle id for this checkout. Prefer a formal qualification
+        # sidecar when present; otherwise consume the immutable candidate pack
+        # (H20/pod is the operator correctness bar while multi-SM self-hosted
+        # runners are unregistered). Never `latest`.
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: scripts/kernel_artifacts.sh fetch-qualified
+        run: |
+          if scripts/kernel_artifacts.sh fetch-qualified; then
+            echo "using qualified kernel bundle"
+          else
+            echo "no qualification sidecar; fetching exact candidate pack"
+            scripts/kernel_artifacts.sh fetch
+          fi
 
       - name: Cache cargo registry
         uses: actions/cache@v6
