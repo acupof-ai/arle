@@ -96,3 +96,27 @@ Pure-prefill anchor (c1, no queueing): ~3352-tok prompt / 446 ms TTFT ≈
 Archived arms (pod): `arle-armA-serialprobe` (serial probe),
 `arle-armB-gridpar` (2e635eda3, per_slot 9618MB/2 slots). Raw:
 `/host/arle-build/bench-output/2026-07-16-{fp32par,fp32serialA,fp32slots}-*`.
+
+## DSv4-Flash-FP8 · 4×H20 GPUs 0–3 · TP=4/EP=4 · eager · DSpark batched verify
+
+**2026-07-21 (`13fe251cb` + `9edfcb234` + `4e2a852b0`)** — dataset
+`bench-prompts-64.jsonl` (~3.4k tok), 60 s/point, max_tokens 256, seed 20260416.
+DSpark `--dspark-conf-threshold 0`, block 5, greedy. DSpark server clamped
+slots 32→22 (draft model VRAM). Raw: pod `/tmp/{nospec,dspark}_c{8,16}.json`.
+[win](experience/wins/2026-07-21-dspark-batched-verify-c8-c16.md)
+
+| c | No-spec out tok/s | DSpark out tok/s | DSpark Δ | Prev Δ (2026-07-20) | Errors (no-spec / dspark) |
+|---|---:|---:|---:|---:|---:|
+| 8 | 146.5 | **93.5** | **−36.2%** | −41.5% | 0 / 0 |
+| 16 | 32.0* | **95.4** | n/a | −60.4% | 82286 / 0 |
+
+\* c=16 no-spec invalid: server overwhelmed (15/82303 complete, 82286 connection
+errors). DSpark ran clean (64/70 complete, 0 errors) — more stable under load.
+
+- **Batched verify helps at c=8** (−41.5% → −36.2%, +5.3pp): 2N serial target
+  forwards → 2 batched (anchor + verify).
+- **DSpark ITL 5–8× no-spec** (c=8: 286ms vs 49.5ms) — draft+verify overhead
+  per step; accept_rate ~0.44 means most drafting is wasted.
+- **c=16 no-spec needs re-measurement** with a stable config (KV cache exhaustion
+  at 32 slots under high concurrency).
+
