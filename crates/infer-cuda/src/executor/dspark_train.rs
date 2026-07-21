@@ -11,21 +11,10 @@
 //! capture (separate stream + event fence) is future work.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use cuda_kernels::prelude::{DeviceContext, DeviceVec, HiddenStates};
 use half::bf16;
-
-/// Cumulative acceptance counters for the running acceptance-rate log.
-/// Printed every [`ACCEPT_LOG_INTERVAL`] captures so the benchmark can
-/// extract the mean acceptance rate without a separate metrics endpoint.
-static TOTAL_ACCEPTED: AtomicU64 = AtomicU64::new(0);
-static TOTAL_BLOCK: AtomicU64 = AtomicU64::new(0);
-static CAPTURE_COUNT: AtomicU64 = AtomicU64::new(0);
-
-/// Print the running mean acceptance rate every N captures.
-const ACCEPT_LOG_INTERVAL: u64 = 50;
 
 /// One DSpark spec step's experience for RL training.
 pub struct DsparkExperience {
@@ -166,26 +155,6 @@ pub fn capture_dspark_experience(
         block_size,
         vocab_size,
     });
-    record_accept(accepted, block_size);
-}
-
-/// Update the global acceptance counters and periodically log the running
-/// mean acceptance rate so benchmarks can extract it from serve output.
-fn record_accept(accepted: usize, block_size: usize) {
-    TOTAL_ACCEPTED.fetch_add(accepted as u64, Ordering::Relaxed);
-    TOTAL_BLOCK.fetch_add(block_size as u64, Ordering::Relaxed);
-    let count = CAPTURE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-    if count % ACCEPT_LOG_INTERVAL == 0 {
-        let acc = TOTAL_ACCEPTED.load(Ordering::Relaxed) as f64;
-        let blk = TOTAL_BLOCK.load(Ordering::Relaxed) as f64;
-        log::info!(
-            "dspark_accept: avg_rate={:.4} total_accept={} total_block={} n={}",
-            acc / blk.max(1.0),
-            acc as u64,
-            blk as u64,
-            count
-        );
-    }
 }
 
 /// DSv4 variant: target logits are a `[total_m, vocab]` `HiddenStates`
@@ -251,5 +220,4 @@ pub fn capture_dspark_experience_hidden(
         block_size,
         vocab_size,
     });
-    record_accept(accepted, block_size);
 }
