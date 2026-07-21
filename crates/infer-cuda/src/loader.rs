@@ -594,6 +594,25 @@ struct DirectFp8MoeRouted {
     down_quant_signature: ExpertQuantDispatchSignature,
 }
 
+/// Transpose each group's `[rows, cols]` row-major block-scale slab to
+/// `[cols, rows]` row-major, in place. Maps the checkpoint's K-contiguous
+/// `weight_scale_inv` (`n_block*k_blocks + k_block`) to the CUTLASS sm_120
+/// N-contiguous SFB layout (`n_block + k_block*n_blocks`). Load-time only.
+fn transpose_group_block_scales(scales: &mut [f32], groups: usize, rows: usize, cols: usize) {
+    let per = rows * cols;
+    debug_assert_eq!(scales.len(), groups * per);
+    let mut tmp = vec![0f32; per];
+    for g in 0..groups {
+        let block = &mut scales[g * per..(g + 1) * per];
+        for r in 0..rows {
+            for c in 0..cols {
+                tmp[c * rows + r] = block[r * cols + c];
+            }
+        }
+        block.copy_from_slice(&tmp);
+    }
+}
+
 struct ShardByteCache {
     entries: HashMap<usize, Rc<ShardBytes>>,
     order: VecDeque<usize>,
@@ -1395,6 +1414,11 @@ impl SafetensorLoader {
                     false
                 }
             };
+        // sm_120 (Blackwell) has no DeepGEMM native bridge, but the CUTLASS
+        // sm_120a grouped collective consumes the SAME contiguous grouped FP8
+        // caches — so build them here regardless of the (Hopper-only) preflight,
+        // and transpose the weight scales to CUTLASS's N-contiguous SFB layout.
+        let sm120 = ctx.compute_capability().0 == 12;
         let mut direct_fp8_routed = None;
         // The stacked tensors are HF `nn.Parameter`s — no `.weight` suffix on
         // the real Qwen3.6-35B-A3B checkpoint — but accept a `.weight`-suffixed
@@ -1404,13 +1428,14 @@ impl SafetensorLoader {
                 .into_iter()
                 .find(|name| self.has_tensor(name))
         };
-        if per_expert_quant_probe && deepgemm_native_ready {
+        if per_expert_quant_probe && (deepgemm_native_ready || sm120) {
             direct_fp8_routed = self.load_fp8_moe_groups_direct(
                 ctx,
                 names,
                 split,
                 moe_intermediate_size,
                 hidden_size,
+                sm120,
             )?;
         }
         if direct_fp8_routed.is_some() {
@@ -1732,6 +1757,10 @@ impl SafetensorLoader {
         split: &crate::moe_config::ExpertSplit,
         moe_intermediate_size: usize,
         hidden_size: usize,
+        // sm_120: transpose each expert's block scales from the checkpoint's
+        // `[n_blocks, k_blocks]` (K-contiguous) to CUTLASS's `[k_blocks,
+        // n_blocks]` (N-contiguous SFB). Hopper/DeepGEMM keeps the raw layout.
+        transpose_sfb: bool,
     ) -> Result<Option<DirectFp8MoeRouted>> {
         let t0 = Instant::now();
         ensure!(
@@ -1847,6 +1876,18 @@ impl SafetensorLoader {
             let down_scales_dst = &mut down_scales
                 [down_scale_base..down_scale_base + down.scale_rows * down.scale_cols];
             self.copy_fp8_scales_from_shard(&tensors, down, down_scales_dst)?;
+        }
+
+        // CUTLASS SFB is N-contiguous per group; the checkpoint is K-contiguous.
+        // Transpose each expert's [n_blocks, k_blocks] scale block in place.
+        if transpose_sfb {
+            transpose_group_block_scales(&mut w13_scales, groups, w13_scale_rows, w13_scale_cols);
+            transpose_group_block_scales(
+                &mut down_scales,
+                groups,
+                down_scale_rows,
+                down_scale_cols,
+            );
         }
 
         let w13 = MoeFp8ExpertGroup::from_host(
