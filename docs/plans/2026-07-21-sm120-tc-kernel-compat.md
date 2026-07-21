@@ -4,24 +4,21 @@
 > (CUTLASS sm_120a grouped FP8 MoE GEMM: c=1 prefill TTFT 84.6 s → 760 ms ~111×,
 > needle exact/DET; [wins](../experience/wins/2026-07-22-bench-sm120-fp8-moe-cutlass-grouped.md)).
 
-Two deliverables, both planned:
+Two deliverables, both SHIPPED:
 - **(A) correctness floor** — route sm_120 to the portable fallback tier, pass the
-  needle gate. Done: 1 code edit (§2). This is the interim/safety net.
-- **(B) peak performance** — the goal. Add a native FP8 tensor-core GEMM route for
-  Blackwell via **cuBLASLt FP8** (§6). The dequant→BF16 fallback (A) leaves ~2× FP8
-  throughput on the table; (B) recovers it.
+  needle gate. Done: 1 code edit (G1, §2).
+- **(B) peak performance** — SHIPPED as **G2** (§6): the **CUTLASS 4.3.5 sm_120a grouped
+  blockwise-scaling FP8 collective** replacing the pathological hand-grouped GEMV
+  fallback. **c=1 cold prefill 84.6 s → 760 ms ≈ 111×**, needle exact/DET.
 
-**Verdict.** The TC 27B FP8 path has **0** ops without a portable fallback, so (A)
-is 1 edit. Peak (B) is **not** a per-kernel Blackwell rewrite and **not** hand-written
-tcgen05 — sm_120 (GB202 workstation Blackwell) has no tcgen05; the peak path is the
-vendored library (cuBLASLt FP8), wired as one more dispatch route. The existing
-policy-driven dispatch (`quant_linear.rs:185`) and the cuBLASLt scaffold already in
-`gemm/gemv.cu:539` make it an additive route, not a restructure.
-
-**Critical path = the sm_120 bench loop, not the code.** There is no local sm_120;
-the `.cu` cannot even compile here (no nvcc). Any peak claim is a hypothesis until
-benched on the Colab RTX PRO 6000. Stand up Colab build+bench FIRST, then write,
-then bench+gate needle, then decide the scale-format tier.
+**How the target moved (measurement corrected the plan 3×, §4b/§6).** The early drafts
+below (§0 "27B is DENSE", the "cuBLASLt / ~2× dense" framing) were **superseded by
+measurement**: (1) the FP8 checkpoint is **MoE**, not dense (§4b); (2) the bottleneck is
+**prefill**, not decode (baseline bench); (3) prefill is **~99.5% the MoE grouped GEMM**,
+not dense projections (nsys) — so the peak path is the **grouped** CUTLASS collective, and
+cuBLASLt/dense (Cut-1/Cut-2) was dropped at ~0.04% headroom. The "serve hang" that once
+looked critical-path was **falsified** (world=1 serves single-process; §4b). Read §4b→§6
+for the shipped story; §0–§3 below are the original (partly superseded) survey.
 
 ## 0. Model resolution — TC-27B is DENSE, not MoE
 
