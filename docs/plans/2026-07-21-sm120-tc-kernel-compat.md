@@ -2,14 +2,24 @@
 
 > Status: Active
 
-Scope: deliverable **(A) correctness-first portable run** on sm_120. **(B)** peak-perf
-Blackwell port is enumerated in the appendix only, not planned.
+Two deliverables, both planned:
+- **(A) correctness floor** — route sm_120 to the portable fallback tier, pass the
+  needle gate. Done: 1 code edit (§2). This is the interim/safety net.
+- **(B) peak performance** — the goal. Add a native FP8 tensor-core GEMM route for
+  Blackwell via **cuBLASLt FP8** (§6). The dequant→BF16 fallback (A) leaves ~2× FP8
+  throughput on the table; (B) recovers it.
 
-**Verdict — 整齐划一 holds.** The TC 27B FP8 path has **0** ops without a portable
-fallback. Getting a correct sm_120 run is **1 code edit** (a dispatch bug) + build
-with the right arch list; every Hopper-only kernel already auto-routes to a
-portable fallback via runtime `compute_capability()` dispatch. This is "complete +
-route the portable tier", not a per-kernel Blackwell rewrite.
+**Verdict.** The TC 27B FP8 path has **0** ops without a portable fallback, so (A)
+is 1 edit. Peak (B) is **not** a per-kernel Blackwell rewrite and **not** hand-written
+tcgen05 — sm_120 (GB202 workstation Blackwell) has no tcgen05; the peak path is the
+vendored library (cuBLASLt FP8), wired as one more dispatch route. The existing
+policy-driven dispatch (`quant_linear.rs:185`) and the cuBLASLt scaffold already in
+`gemm/gemv.cu:539` make it an additive route, not a restructure.
+
+**Critical path = the sm_120 bench loop, not the code.** There is no local sm_120;
+the `.cu` cannot even compile here (no nvcc). Any peak claim is a hypothesis until
+benched on the Colab RTX PRO 6000. Stand up Colab build+bench FIRST, then write,
+then bench+gate needle, then decide the scale-format tier.
 
 ## 0. Model resolution — TC-27B is DENSE, not MoE
 
@@ -125,12 +135,65 @@ FA2-sm70 `qwen35.rs:831` `major < 8`.
 
 **6 steps, 1 code edit (landed); the rest are build + verify-existing-gate.**
 
-## 5. (B) appendix — peak-perf Blackwell port (enumerated only)
+## 5. Colab RTX PRO 6000 build+bench loop (critical-path prerequisite)
 
-A separate, throughput-only effort would add a native sm_120 fast tier: a **tcgen05
-FP8 block-scaled GEMM** (CUTLASS 3.x sm_120 collective — 5th-gen tensor cores,
-`tcgen05.mma` + tensor-memory, replacing the sm_90a wgmma+TMA JIT in
-`deepgemm_native.cu`, wired as a third route in `quant_linear.rs` behind a
-`major==12` gate) and a **Blackwell FlashAttention** (FA3/CUTLASS sm_120 build of
-`arle_fa3_shim.cu`, un-pinning `build.rs:2816` + an hd256 sm_120 instantiation),
-optionally a Blackwell TileLang sm_120 chunked-GDR cubin. None required for (A).
+Peak-perf work is unverifiable without an sm_120 box. Stand this up FIRST; it gates
+every (B) claim.
+
+- Target: RTX PRO 6000 Blackwell (sm_120, GB202, 96 GB) via Colab CLI. 96 GB fits the
+  27B FP8 checkpoint (~29 GB) with room for KV.
+- Build: sync the tree, `TORCH_CUDA_ARCH_LIST="12.0" cargo build --release --features
+  cuda` — confirm the sm_120 gencode compiles the portable tier (§3) and FA3/FlashMLA
+  stayed sm_90a-pinned (stubbed off by default).
+- Serve+bench: `arle serve --backend cuda --model-path <27B-FP8>` +
+  `scripts/needle_gate.py` (correctness) + `scripts/bench_throughput.py` (perf, vs the
+  (A) dequant-BF16 arm as the baseline the (B) route must beat).
+- Loop: write → sync → build-on-Colab → needle+bench → iterate. Every (B) row in
+  wins/ cites a Colab sm_120 bench, never a local number.
+- Open: confirm the FP8 safetensors `config.json` has `num_experts=0` (§0 pod caveat)
+  on this box while it's up.
+
+## 6. (B) peak-perf plan — cuBLASLt FP8 route
+
+Goal: recover the ~2× FP8 tensor-core throughput the (A) dequant→BF16 fallback drops.
+Not tcgen05 (absent on sm_120) — cuBLASLt FP8, wired as one dispatch route.
+
+### The one crux — scale format
+Weights are **128×128 f32 block-scaled** (DeepGEMM format). cuBLASLt on sm_120
+supports per-tensor scalar scaling or MXFP8 (32-element UE8M0 blocks) — neither is
+128×128. Resolve by measurement, not by betting:
+- **Cut 1 (prove the route)**: collapse 128×128 → one per-tensor f32 scale;
+  `cublasLtMatmul` FP8 per-tensor. Cheapest, reuses the scaffold end-to-end. **Risk:
+  precision may miss the needle gate.**
+- **Cut 2 (if needle fails)**: requantize weights to MXFP8 (32-element UE8M0) at load;
+  cuBLASLt MX matmul. Correct precision, costs a load-time requant pass + a scale-store
+  change.
+- Floor: (A) dequant→BF16 stays as the always-correct fallback for any shape/SM the
+  FP8 route rejects.
+
+### file:line
+1. `crates/cuda-kernels/csrc/gemm/fp8_cublaslt_gemm.cu` (new): model on `gemv.cu:539-612`
+   (descriptor / preference / heuristic / `algo_cache` all reusable); inputs
+   `CUDA_R_8F_E4M3`, `CUBLAS_COMPUTE_32F`, scale via `CUBLASLT_MATMUL_DESC_A/B_SCALE_POINTER`
+   (Cut 1 per-tensor) or `..._SCALE_MODE` VEC32_UE8M0 (Cut 2).
+2. `crates/cuda-kernels/src/gemm.rs` (or the gemm FFI module): declare the extern + safe
+   wrapper.
+3. `crates/infer-cuda/src/ops/generated/qwen_fp8_dense_projection.rs`: add
+   `Route::CublasLtFp8`. This file is `@generated` by
+   `scripts/reduce_operator_evidence.py` — add the variant + a `major==12` selection via
+   the generator (or a small hand-written override layer over `select_exact`), NOT by
+   editing the generated file directly.
+4. `crates/infer-cuda/src/ops/quant_linear.rs:185 qwen_fp8_dense_route`: `major==12` →
+   `CublasLtFp8`; `major==9` stays `PackDeepGemm`; all other SMs unchanged. Plus the
+   dispatch site (`~:535`) launches the new route.
+5. `build.rs`: no change — new `.cu` is auto-collected; sm_120 gencode already emitted.
+
+### verify
+Colab sm_120: `needle_gate.py` (Cut 1 must pass, else escalate to Cut 2) THEN
+`bench_throughput.py` vs the (A) dequant-BF16 arm — the (B) route must show a stable
+positive Δ or it is reverted. wins/ entry cites the Colab bench.
+
+### Blackwell attention (deferred, second hotspot)
+GEMM dominates FLOPs; land the GEMM route first. Peak hd256 attention on sm_120 (FA3/
+CUTLASS or FlashInfer sm_120 build) is a follow-up once the GEMM route is benched — the
+portable `nonpaged_prefill_attention` (§1 #3/#4) is the correct-but-slow floor until then.
