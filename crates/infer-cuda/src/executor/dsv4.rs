@@ -1815,6 +1815,291 @@ impl Dsv4CudaExecutor {
         Ok(out)
     }
 
+    /// Batched DSpark block decode for B>1. Drafts each slot's block independently
+    /// (the 3-stage draft forward is per-slot), then verifies ALL chains in ONE
+    /// batched target forward (`forward_decode_batch_verify`) instead of N serial
+    /// verifies. Accept/commit remain per-slot (the proven fold path).
+    ///
+    /// This amortizes the heaviest phase (target-model verify) across the batch,
+    /// matching the no-spec baseline's batched decode at B>1.
+    fn dspark_decode_tokens_batched(
+        &mut self,
+        rows: &[Dsv4DecodeBatchRow],
+    ) -> Result<Vec<Vec<u32>>> {
+        let n = rows.len();
+        let max_seq_len = self
+            .dspark
+            .as_ref()
+            .expect("dspark_decode_tokens_batched without dspark")
+            .max_seq_len;
+        let block = self.model.config.dspark_block_size;
+
+        // ── Phase 1a: separate fallback slots (sequence-cap) from DSpark slots.
+        let mut proposals: Vec<Option<crate::dsv4::dspark::Dsv4DsparkProposal>> =
+            (0..n).map(|_| None).collect();
+        let mut verify_positions: Vec<usize> = vec![0; n];
+        let mut fallback_tokens: Vec<Option<Vec<u32>>> = (0..n).map(|_| None).collect();
+        let mut dspark_idxs: Vec<usize> = Vec::with_capacity(n);
+        for (i, row) in rows.iter().enumerate() {
+            if row.start_pos + 1 + block + 1 > max_seq_len {
+                let token = self.model.forward_tokens(
+                    &mut self.slots[row.slot],
+                    &mut self.kv_adapter,
+                    &[row.last_token],
+                    row.start_pos,
+                    &row.params,
+                    row.position,
+                )?;
+                fallback_tokens[i] = Some(vec![token]);
+            } else {
+                dspark_idxs.push(i);
+                verify_positions[i] = row.start_pos + 1;
+            }
+        }
+
+        // ── Phase 1b: batched anchor forward (ONE target forward over N slots),
+        // capturing DSpark taps in the batched decode lane. Replaces N serial
+        // single-token target forwards.
+        if !dspark_idxs.is_empty() {
+            let slot_ids: Vec<usize> = dspark_idxs.iter().map(|&i| rows[i].slot).collect();
+            let tokens: Vec<u32> = dspark_idxs.iter().map(|&i| rows[i].last_token).collect();
+            let starts: Vec<usize> = dspark_idxs.iter().map(|&i| rows[i].start_pos).collect();
+            let positions: Vec<u64> = dspark_idxs.iter().map(|&i| rows[i].position).collect();
+            let params: Vec<SamplingParams> = dspark_idxs
+                .iter()
+                .map(|&i| rows[i].params.clone())
+                .collect();
+            let anchors = self.model.forward_decode_batch(
+                &mut self.slots,
+                &mut self.kv_adapter,
+                &slot_ids,
+                &tokens,
+                &starts,
+                &positions,
+                &params,
+            )?;
+            // ── Phase 1c: per-slot draft + proposal (draft is a small 3-stage
+            // model; each slot has independent latent_kv context, so batching
+            // the draft would require unifying variable-length context — not
+            // worth the complexity vs the already-amortized target verify).
+            for (k, &i) in dspark_idxs.iter().enumerate() {
+                let anchor = anchors[k];
+                let verify_pos = verify_positions[i];
+                let proposal = {
+                    let Self {
+                        model,
+                        slots,
+                        dspark,
+                        ..
+                    } = self;
+                    let Dsv4DsparkExec {
+                        draft,
+                        conf_threshold,
+                        slots: ds_slots,
+                        ..
+                    } = dspark
+                        .as_mut()
+                        .expect("dspark_decode_tokens_batched without dspark");
+                    let rt = &mut ds_slots[rows[i].slot];
+                    model.dspark_append_context(
+                        draft,
+                        &mut rt.df,
+                        slots[rows[i].slot].dspark_taps(),
+                        1,
+                        rows[i].start_pos,
+                    )?;
+                    let block_hidden = model.dspark_forward_block(
+                        draft,
+                        &mut rt.df,
+                        &mut rt.scratch,
+                        &mut rt.attn_states,
+                        anchor,
+                        verify_pos,
+                    )?;
+                    model.dspark_build_proposal(
+                        draft,
+                        &block_hidden,
+                        anchor,
+                        rows[i].params.temperature,
+                        *conf_threshold,
+                    )?
+                };
+                proposals[i] = Some(proposal);
+            }
+        }
+
+        // ── Phase 2: TP lockstep on proposals (rank 0's draft_len + chain wins,
+        // same as the B=1 path — divergent lengths deadlock the verify collective).
+        let tp_world = self.model.tp.config().world_size;
+        if tp_world > 1 {
+            for prop in proposals.iter_mut() {
+                let Some(p) = prop else { continue };
+                let mut payload = Vec::with_capacity(2 + block);
+                payload.push(p.draft_len as i32);
+                payload.extend(p.chain.iter().map(|&t| t as i32));
+                payload.resize(2 + block, 0);
+                let r0 = self
+                    .model
+                    .tp
+                    .broadcast_rank0_i32(&self.model.ctx, &payload)?;
+                let r0_chain: Vec<u32> = r0[1..2 + r0[0] as usize]
+                    .iter()
+                    .map(|&v| v as u32)
+                    .collect();
+                if r0_chain != p.chain {
+                    p.draft_len = r0[0] as usize;
+                    p.chain = r0_chain;
+                    p.draft_logits = None;
+                }
+            }
+        }
+
+        // ── Phase 3: batched verify over all chains (the amortized phase).
+        // If every slot hit the sequence-cap fallback, there are no chains to
+        // verify — return the fallback tokens directly.
+        let slot_ids: Vec<usize> = (0..n)
+            .filter(|&i| fallback_tokens[i].is_none())
+            .map(|i| rows[i].slot)
+            .collect();
+        if slot_ids.is_empty() {
+            return Ok(fallback_tokens.into_iter().map(|t| t.unwrap()).collect());
+        }
+        let chains: Vec<Vec<u32>> = (0..n)
+            .filter(|&i| fallback_tokens[i].is_none())
+            .map(|i| proposals[i].as_ref().unwrap().chain.clone())
+            .collect();
+        let starts: Vec<usize> = (0..n)
+            .filter(|&i| fallback_tokens[i].is_none())
+            .map(|i| verify_positions[i])
+            .collect();
+        let scheds: Vec<crate::dsv4::SpecVerifySchedule> = chains
+            .iter()
+            .zip(&starts)
+            .map(|(chain, &start)| {
+                let positions: Vec<usize> = (0..chain.len()).map(|j| start + j).collect();
+                let ancestors: Vec<Vec<usize>> =
+                    (0..chain.len()).map(|j| (0..j).collect()).collect();
+                crate::dsv4::SpecVerifySchedule {
+                    positions,
+                    ancestors,
+                }
+            })
+            .collect();
+
+        // capture_spec_rings per slot (cheap host snapshot, must run before verify
+        // overwrites the speculative KV band).
+        for (s, &slot_idx) in slot_ids.iter().enumerate() {
+            self.model.capture_spec_rings(
+                &mut self.slots[slot_idx],
+                &mut self.kv_adapter,
+                starts[s],
+                chains[s].len() - 1,
+            )?;
+        }
+
+        let verified = self.model.forward_decode_batch_verify(
+            &mut self.slots,
+            &mut self.kv_adapter,
+            &slot_ids,
+            &chains,
+            &starts,
+            &scheds,
+        )?;
+
+        // ── Phase 4: per-slot accept + rollback + commit (proven fold path).
+        let mut out: Vec<Vec<u32>> = vec![Vec::new(); n];
+        let mut vi = 0; // index into `verified` (skips fallback slots)
+        for i in 0..n {
+            if let Some(toks) = &fallback_tokens[i] {
+                out[i] = toks.clone();
+                continue;
+            }
+            let slot_idx = rows[i].slot;
+            let verify_pos = verify_positions[i];
+            let proposal = proposals[i].as_ref().unwrap();
+            let draft_len = proposal.draft_len;
+            let (argmax, _hiddens) = &verified[vi];
+            vi += 1;
+            ensure!(
+                argmax.len() == proposal.chain.len(),
+                "DSpark batched verify slot {slot_idx} argmax {} != chain {}",
+                argmax.len(),
+                proposal.chain.len()
+            );
+            let mut accepted = 0usize;
+            while accepted < draft_len && argmax[accepted] == proposal.chain[accepted + 1] {
+                accepted += 1;
+            }
+            let mut bonus = argmax[accepted];
+
+            // TP lockstep on accepted/bonus (rank 0 wins — KV tail must be identical
+            // across ranks, else next tick's combined attention corrupts).
+            if tp_world > 1 {
+                let r0 = self
+                    .model
+                    .tp
+                    .broadcast_rank0_i32(&self.model.ctx, &[accepted as i32, bonus as i32])?;
+                accepted = r0[0] as usize;
+                bonus = r0[1] as u32;
+            }
+
+            self.model.truncate_slot(
+                &mut self.slots[slot_idx],
+                &mut self.kv_adapter,
+                verify_pos,
+            )?;
+            self.model.restore_spec_ring_tail(
+                &mut self.slots[slot_idx],
+                &mut self.kv_adapter,
+                verify_pos,
+                accepted,
+                draft_len,
+            )?;
+            self.model.commit_accepted_fold(
+                &mut self.slots[slot_idx],
+                &mut self.kv_adapter,
+                0..accepted + 1,
+                verify_pos,
+            )?;
+
+            // Append only the committed prefix (anchor + accepted drafts) to the
+            // draft context; the rejected tail must not leak into the next block.
+            {
+                let Self {
+                    model,
+                    slots,
+                    dspark,
+                    ..
+                } = self;
+                let Dsv4DsparkExec {
+                    draft,
+                    slots: ds_slots,
+                    ..
+                } = dspark
+                    .as_mut()
+                    .expect("dspark_decode_tokens_batched without dspark");
+                model.dspark_append_context(
+                    draft,
+                    &mut ds_slots[slot_idx].df,
+                    slots[slot_idx].dspark_taps(),
+                    accepted + 1,
+                    verify_pos,
+                )?;
+            }
+
+            self.mtp_accepts += accepted;
+            self.mtp_rejects += draft_len - accepted;
+            self.mtp_chains += 1;
+            self.spec_slots[slot_idx] = Dsv4SpecSlotState::default();
+            let mut slot_out = Vec::with_capacity(accepted + 2);
+            slot_out.push(proposal.chain[0]); // anchor
+            slot_out.extend_from_slice(&proposal.chain[1..accepted + 1]);
+            slot_out.push(bonus);
+            out[i] = slot_out;
+        }
+        Ok(out)
+    }
+
     fn forward_decode_row(&mut self, row: &Dsv4DecodeBatchRow) -> Result<Vec<SlotToken>> {
         let tokens = self.forward_decode_tokens(
             row.slot,
@@ -1898,13 +2183,19 @@ impl Dsv4CudaExecutor {
             return Ok(out);
         }
 
-        // B>1 path. DSpark has no batched verify lane: if DSpark is on,
-        // dispatch every row individually (`forward_decode_row` handles DSpark /
-        // MTP / plain decode per-row). Otherwise run the batched lanes below.
+        // B>1 path. DSpark drafts per-slot (serial 3-stage forward) but verifies
+        // ALL chains in ONE batched target forward (`dspark_decode_tokens_batched`),
+        // amortizing the heaviest phase across the batch.
         if self.dspark.is_some() {
+            let tokens = self.dspark_decode_tokens_batched(&batch.rows)?;
             let mut out = Vec::with_capacity(batch.rows.len());
-            for row in &batch.rows {
-                out.extend(self.forward_decode_row(row)?);
+            for (row, toks) in batch.rows.iter().zip(tokens) {
+                out.extend(toks.into_iter().map(|token| SlotToken {
+                    slot: row.slot,
+                    token,
+                    logprob: None,
+                    finish: None,
+                }));
             }
             return Ok(out);
         }

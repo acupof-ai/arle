@@ -3388,6 +3388,7 @@ impl Dsv4Model {
         let stream_dim = hidden_size * hc_mult;
         let seq_len = n; // batch dimension: N independent decode rows
         let eps = self.config.rms_norm_eps;
+        let dspark = self.config.is_dspark();
         let use_deepep_transport = crate::runtime_flags::dsv4_moe_transport()?.is_deepep();
         // N>1: mirror the prefill keepalive discipline (the per-token decode
         // scratch / comm-overlap fast paths are seq_len==1 only).
@@ -5000,6 +5001,26 @@ impl Dsv4Model {
             keepalive.keep_hidden(&ffn_stream);
             stream = ffn_stream;
             stage_all("ffn_residual", &stream);
+            // DSpark T3: capture each row's wide HC stream at this layer's OUTPUT
+            // into its slot's tap buffer (decode: 1 token per row). Gated by
+            // `dspark` so the default path is byte-identical.
+            if dspark
+                && let Some(tap_idx) = self
+                    .config
+                    .dspark_target_layer_ids
+                    .iter()
+                    .position(|&l| l == layer_idx)
+            {
+                for r in 0..n {
+                    let tap = &mut slots[slot_ids[r]].dspark_taps[tap_idx];
+                    let src = stream.data.slice(r * stream_dim..(r + 1) * stream_dim);
+                    let mut dst = tap.data.slice_mut(0..stream_dim);
+                    ctx.stream
+                        .memcpy_dtod(&src, &mut dst)
+                        .map_err(|e| anyhow!("DSpark batched tap capture D2D failed: {e}"))?;
+                    keepalive.keep_vec(tap);
+                }
+            }
             if let Some(t) = _moe_t {
                 ctx.stream.synchronize().ok();
                 moe_ms += t.elapsed().as_secs_f64() * 1000.0;
