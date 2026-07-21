@@ -111,12 +111,19 @@ and the hidden is sign-corrupted → logits flattened. **Argmax ordering survive
 Param sweep confirms: `top_k=1` COHERENT, `temp≤0.7` COHERENT, `temp=1.0
 top_p={0.95,1.0}` SCRAMBLED.
 
-**Fix (HEAD):** revert both `load_final_norm_offset` sites to `loader.load_vec(...)`
-(= pre-`b4b293f0c` behavior) and delete the helper. STANDARD across all models →
-blanket revert is safe (no 4B/27B convention split; the hd256 kernels were
-27B-only, but the final-norm convention is uniform). Verified: 27B temp=1.0 +
-greedy both COHERENT, full 600 tok, matches `67e15b0a6`. **temp=1.0 on-policy grpo
-unblocked** — no more temp≤0.7 interim.
+**Fix (`d703b5240`):** revert both `load_final_norm_offset` sites to
+`loader.load_vec(...)` (= pre-`b4b293f0c` behavior) and delete the helper.
+STANDARD across all models → blanket revert is safe (no 4B/27B convention split;
+the hd256 kernels were 27B-only, but the final-norm convention is uniform).
+**Both sites verified on pod:**
+- **Main norm (3326)** — base serve, 27B temp=1.0 + greedy both COHERENT, full
+  600 tok, matches `67e15b0a6`.
+- **MTP-head norm (8373)** — `--spec-type mtp` active: coherent output + **48.3%
+  draft acceptance (~2.45 tok/step @draft=3)**; a corrupted MTP norm would give
+  near-zero acceptance. `mtp.norm.weight mean|w|=1.27` = STANDARD, same as the
+  main norm (0.96) → identical `load_vec` logic.
+
+**temp=1.0 on-policy grpo unblocked** — no more temp≤0.7 interim.
 
 ## Rule
 
