@@ -194,6 +194,24 @@ every (B) claim.
 
 ## 6. (B) peak-perf plan — CUTLASS sm_120 block-scaled GEMM
 
+**Priority (FLOP-aimed HYPOTHESIS — verify with nsys before committing kernel effort):**
+the vehicle is `Qwen3.6-35B-A3B-FP8`, so at **decode** each token activates only ~3B MoE
+params (grouped GEMM) vs ~0.1–0.2B dense projections (q/k/v/o/shared). **MoE grouped GEMM
+should dominate decode FLOPs ~10–30× → G2 (MoE grouped block-scaled) is the real decode
+lever, NOT Cut-1/Cut-2 (dense).** The current MoE grouped path already runs on the
+*hand-grouped fallback* (DeepGEMM native unavailable on sm_120), so the headroom is real.
+**Verify with an nsys decode breakdown** (grouped-GEMM vs dense-proj vs attention share)
+before sinking effort — do not assume.
+
+**Build order = Cut-2 → G2** (not win-order): Cut-2 (dense block-scaled) is the *simpler
+shape* that de-risks the shared **CUTLASS sm_120 block-scaled collective** + FFI + dispatch
++ sm_120a build; G2 reuses that collective wrapped for grouped/segmented `m_grouped` GEMM.
+Cut-2 is also the prefill win (large-M dense). **Cut-2 gate — CUTLASS version:** the
+sm_120a block-scaled collectives (example-79) need CUTLASS ≥ 3.8. The build pulls CUTLASS
+from `vendor/flashmla/csrc/cutlass/` OR DeepGEMM's `third-party/cutlass/` OR TileLang's
+`3rdparty/cutlass/` (build.rs:2576/2124/1167) — **confirm the bundled tag has the sm_120a
+collectives on the VM before writing the kernel**; a bump may be needed.
+
 Grounded by the 4-stream deep research ([2026-07-22-sm120-fp8-peak-landscape.md](../research/2026-07-22-sm120-fp8-peak-landscape.md)).
 Correction to the first draft: the peak path is **NOT cuBLASLt** — cuBLASLt on sm_120
 is per-tensor only and runs at the *throttled* legacy-MMA rate (2×). The framework
