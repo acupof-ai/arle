@@ -51,31 +51,17 @@ comment (`gemm/quantized_gemv.cu:98`); **tcgen05**: none in-tree; **TMA**: only
 
 | # | op | file:line | Hopper-fast | portable fallback | HW asm? | sm_120 status |
 |---|----|----|----|----|----|----|
-| 1 | dense FP8 proj GEMM | dispatch `ops/quant_linear.rs:535` | DeepGEMM `deepgemm_native.cu:1641` (sm_90a) | dequant→cuBLAS `quant_linear.rs:441` + GEMV `quantized_gemv.cu:1349` | DeepGEMM=TMA/wgmma; fallback=`__nv_fp8` | **DISPATCH BUG G1** |
-| 2 | KV write + q prep | `attention/decode_prep_paged.cu`; `prefill_attention_hd256_prep` | — | in-tree | none | portable |
+| 1 | dense FP8 proj GEMM | dispatch `ops/quant_linear.rs:535` | DeepGEMM `deepgemm_native.cu:1641` (sm_90a) | dequant→cuBLAS `quant_linear.rs:441` + GEMV `quantized_gemv.cu:1349` | DeepGEMM=TMA/wgmma; fallback=`__nv_fp8` | **FIXED (was G1)** |
 | 3 | full-attn prefill | `attention/nonpaged_prefill_attention.cu` (`qwen35.rs:6020`) | FA3 shim (`qwen35.rs:5960`) | this row | prefill: none; FA3: sm_90a | portable (FA3 auto-off) |
 | 4 | full-attn decode | `nonpaged_prefill_attention_devpos` (`qwen35.rs:5945`) | FA3 split / FA2-sm70 | this row | none | portable |
-| 5 | batched decode / reduce | `attention/fused_attention.cu` (`qwen35.rs:7691`) | — | in-tree | none | portable |
-| 6 | paged-attn resolve | `fused_attention.cu` `resolve_paged_attn_v1/_fp8_v1` | — | in-tree | none | portable |
-| 7 | attention gate hd256 | `attention_gate_batch_hd256` / `_paged_hd256` | — | in-tree | none | portable |
-| 8 | FA3 hopper fwd | `attention/arle_fa3_shim.cu` | this (opt-in) | falls to #3/#4 | **sm_90a wgmma** | build-pinned sm_90a, runtime-off |
+| 8 | FA3 hopper fwd | `attention/arle_fa3_shim.cu` | FA3 (opt-in, sm_90a) | falls to #3/#4 | **sm_90a wgmma** | build-pinned sm_90a, runtime-off |
 | 9 | FA2 sm70 | `attention/arle_fa2_sm70.cu` | — | falls to #3/#4 | none | gated off (major<8) |
-| 10 | conv1d | `recurrent/conv1d.cu`, `conv1d_decode_batch.cu` | — | in-tree | none | portable |
 | 11 | GDR prefill | `recurrent/gated_delta_rule.cu` `_prefill_recurrent` | FlashQLA (sm_90a) | this row | none | portable |
-| 12 | GDR decode | `recurrent/gdr_decode_batch.cu`, `gated_delta_rule.cu` `_decode` | — | in-tree | none | portable |
 | 13 | FlashQLA chunked GDR | `recurrent/gdr_prefill_*.cu` + TileLang AOT | this (opt-in) | falls to #11 | TileLang sm_90a cubin | runtime-off (flag default false) |
-| 14 | gated RMSNorm | `norm/norm.cu` `rms_norm_gated` | — | in-tree | none | portable |
-| 15 | l2norm q/k | `norm/norm.cu` | — | in-tree | none | portable |
-| 16 | input/post norm | `norm/norm.cu` `rms_norm_offset` | — | in-tree | none | portable |
-| 17 | embedding | `elementwise/*` `embedding_batched` | — | in-tree | none | portable |
-| 18 | SwiGLU act | `elementwise/elementwise_basic.cu` `silu_mul` | — | in-tree | none | portable |
-| 19 | residual add | `elementwise/elementwise_basic.cu` `add`/`add_batch` | — | in-tree | none | portable |
 | 20 | dense bf16 GEMM (MLP/o-proj) | `ops.rs:187/340` `gemm_cuda` | cuBLASLt | cuBLASLt | none | portable (cuBLAS Blackwell) |
-| 21 | RoPE | folded into prep kernels | — | in-tree | none | portable |
-| 22 | sampling | `sampling/*` `argmax_batch`, `sample` | — | in-tree | none | portable |
-| 23 | spec-decode | `dspark_draft_sample`, `_chain_accept`, `_filter_probs` | — | in-tree | none | portable |
 | 24 | LoRA merge (rollout) | `qwen35.rs:8834` `lora_device_gemm`; `dequantize_fp8_block_scaled_to_bf16` (`:5206`) | cuBLAS + dequant | same | `__nv_fp8` | portable |
-| 25 | KV page transfer | `kv/transfer.cu:30` | — | in-tree | generic PTX | portable |
+
+Plain portable (in-tree, no Hopper path, no HW asm, sm_120-native): KV prep (#2), batched decode (#5), paged resolve (#6), attn gate (#7), conv1d (#10), GDR decode (#12), RMSNorm/l2norm/input norm (#14/#15/#16), embedding (#17), SwiGLU (#18), residual (#19), RoPE (#21), sampling (#22), spec-decode (#23), KV transfer (#25) — see `csrc/` file:lines above.
 
 **~25 kernel families (~30 FFI entry points).** Off-path but present (DSv4-only, not
 TC): `decode_attention_{quantized,turboquant,varlen_fp8}.cu` (0 hits for
@@ -94,10 +80,9 @@ Fix: `major >= 9` → `major == 9` (DeepGEMM is Hopper-exclusive; `deepgemm_nati
 checks `== 9` at every entry: 1155/1505/1574/1641/1703). Zero-code interim:
 `--qwen35-deepgemm false` (`args.rs:818`).
 
-**Ops with NO portable fallback: 0.** Every other Hopper-only op is build-pinned to
-sm_90a (dormant) or runtime-gated off, each with a wired portable fallback:
-FA3 `qwen35.rs:782` `== (9,0)`; FlashQLA `runtime_flags.rs:126` default false;
-FA2-sm70 `qwen35.rs:831` `major < 8`.
+Every other Hopper-only op is build-pinned to sm_90a (dormant) or runtime-gated
+off, each with a wired portable fallback: FA3 `qwen35.rs:782` `== (9,0)`;
+FlashQLA `runtime_flags.rs:126` default false; FA2-sm70 `qwen35.rs:831` `major < 8`.
 
 ## 3. Build story for sm_120 (T2 opt-in)
 
@@ -126,14 +111,14 @@ FA2-sm70 `qwen35.rs:831` `major < 8`.
    FA3/FlashMLA stayed sm_90a-pinned (`build.rs:2816`).
 2. **Fix the dispatch defect** — `quant_linear.rs:171` `>= 9` → `== 9` (**DONE
    2026-07-21**). Interim alternative: `--qwen35-deepgemm false`.
-3. **FA3 auto-off** (no edit): `qwen35.rs:782` `== (9,0)` excludes sm_120.
-4. **FlashQLA GDR off** (no edit): `runtime_flags.rs:126` default false.
-5. **FA2-sm70 off** (no edit): `qwen35.rs:831` `major < 8` excludes sm_120.
-6. **Gate**: serve the 27B FP8 checkpoint on the sm_120 box and run
+3. **Existing runtime gates already exclude sm_120 — no edits**: FA3 `== (9,0)`
+   (`qwen35.rs:782`), FlashQLA default false (`runtime_flags.rs:126`), FA2-sm70
+   `major < 8` (`qwen35.rs:831`).
+4. **Gate**: serve the 27B FP8 checkpoint on the sm_120 box and run
    `scripts/needle_gate.py` across `115..8000` (spanning the 241 boundary); end state
    = exact needle recall + `deterministic? true` per length.
 
-**6 steps, 1 code edit (landed); the rest are build + verify-existing-gate.**
+**4 steps, 1 code edit (landed); the rest are build + verify-existing-gate.**
 
 ## 5. Colab RTX PRO 6000 build+bench loop (critical-path prerequisite)
 
