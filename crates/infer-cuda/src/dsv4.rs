@@ -5161,6 +5161,7 @@ impl Dsv4Model {
         let seq_len = m; // batch dimension: M verify rows
         let mega_epoch = self.begin_mega_moe_forward(seq_len)?;
         let eps = self.config.rms_norm_eps;
+        let dspark = self.config.is_dspark();
         let mut keepalive = Dsv4ForwardKeepalive::new(false);
 
         // Combined token list, grouped by slot (slot s's chain at [off_s..]).
@@ -5466,6 +5467,31 @@ impl Dsv4Model {
                 }
                 keepalive.keep_hidden(&ffn_stream);
                 stream = ffn_stream;
+                // DSpark T3: capture each slot's chain rows' wide HC stream at
+                // this layer's OUTPUT into its tap buffer. Row block [off_s..off_s+len_s)
+                // belongs to slot s; writes len_s rows (the full chain — the
+                // commit fold later reads only the accepted prefix).
+                if dspark
+                    && let Some(tap_idx) = self
+                        .config
+                        .dspark_target_layer_ids
+                        .iter()
+                        .position(|&l| l == layer_idx)
+                {
+                    for s in 0..n {
+                        let off = offsets[s];
+                        let len = lens[s];
+                        let tap = &mut slots[slot_ids[s]].dspark_taps[tap_idx];
+                        let src = stream
+                            .data
+                            .slice(off * stream_dim..(off + len) * stream_dim);
+                        let mut dst = tap.data.slice_mut(0..len * stream_dim);
+                        self.ctx.stream.memcpy_dtod(&src, &mut dst).map_err(|e| {
+                            anyhow!("DSpark batched verify tap capture D2D failed: {e}")
+                        })?;
+                        keepalive.keep_vec(tap);
+                    }
+                }
             }
             Ok(())
         })();
