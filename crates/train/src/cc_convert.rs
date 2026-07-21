@@ -42,6 +42,10 @@ pub struct CcWindow {
     /// lack the field → default 1.0 preserves today's passing = reward-1.0 flow.
     #[serde(default = "default_reward")]
     pub reward: f32,
+    /// Attempt hit a timeout or harness error — its records are marked
+    /// truncated so the DAPO update filter drops them (not a real fail).
+    #[serde(default)]
+    pub errored: bool,
     /// Require the dump body's `model` to equal this (the cc harness tags each
     /// sample's model id) — concurrent samples overlap in time, so wall-clock
     /// alone would cross-attribute conversations. `None` = time-only (serial).
@@ -71,6 +75,8 @@ pub struct CcRecord {
     pub gen_logprobs: Vec<f32>,
     /// Attempt reward carried from the window (SAO advantage input).
     pub reward: f32,
+    /// Attempt timed out or errored — the update filter drops it (budget artifact).
+    pub truncated: bool,
     pub masked_tokens: usize,
     pub total_tokens: usize,
 }
@@ -123,6 +129,7 @@ pub fn convert_cc_dumps(
         t_start_ms: 0,
         t_end_ms: u64::MAX,
         reward: default_reward(),
+        errored: false,
         model: None,
     }];
     let windows = if windows.is_empty() {
@@ -153,6 +160,7 @@ pub fn convert_cc_dumps(
                 records.push(request_record(
                     &format!("{}#r{seq}", window.label),
                     window.reward,
+                    window.errored,
                     sidecar,
                 ));
             }
@@ -178,7 +186,13 @@ pub fn convert_cc_dumps(
             .max_by_key(|&i| messages_len(&matched[i].0))
             .expect("matched is non-empty");
         let (body, _) = matched.swap_remove(final_idx);
-        match convert_body(&window.label, window.reward, body, tokenizer) {
+        match convert_body(
+            &window.label,
+            window.reward,
+            window.errored,
+            body,
+            tokenizer,
+        ) {
             Ok(record) => records.push(record),
             Err(err) => eprintln!("[cc-convert] window {}: {err:#}; skipped", window.label),
         }
@@ -188,7 +202,12 @@ pub fn convert_cc_dumps(
 
 /// One request's sidecar → one record: prompt = engine prompt tokens (mask 0),
 /// response = engine gen tokens (mask 1) — token-exact by construction.
-fn request_record(label: &str, reward: f32, sidecar: infer_server::TokensSidecar) -> CcRecord {
+fn request_record(
+    label: &str,
+    reward: f32,
+    truncated: bool,
+    sidecar: infer_server::TokensSidecar,
+) -> CcRecord {
     let n_gen = sidecar.gen_token_ids.len();
     CcRecord {
         label: label.to_owned(),
@@ -202,6 +221,7 @@ fn request_record(label: &str, reward: f32, sidecar: infer_server::TokensSidecar
             Vec::new()
         },
         reward,
+        truncated,
         masked_tokens: n_gen,
     }
 }
@@ -343,6 +363,7 @@ fn read_tokens_sidecar(dump_path: &Path) -> Option<infer_server::TokensSidecar> 
 fn split_record(
     label: &str,
     reward: f32,
+    truncated: bool,
     ids: &[u32],
     mask: &[u8],
     first_masked: usize,
@@ -354,6 +375,7 @@ fn split_record(
         response_mask: mask[first_masked..].to_vec(),
         gen_logprobs: Vec::new(),
         reward,
+        truncated,
         masked_tokens: mask.iter().filter(|&&m| m == 1).count(),
         total_tokens: ids.len(),
     }
@@ -364,6 +386,7 @@ fn split_record(
 fn convert_body(
     label: &str,
     reward: f32,
+    truncated: bool,
     body: serde_json::Value,
     tokenizer: &tokenizers::Tokenizer,
 ) -> Result<CcRecord> {
@@ -398,7 +421,14 @@ fn convert_body(
         "first token is supervised — the record would have an empty prompt"
     );
 
-    Ok(split_record(label, reward, ids, &mask, first_masked))
+    Ok(split_record(
+        label,
+        reward,
+        truncated,
+        ids,
+        &mask,
+        first_masked,
+    ))
 }
 
 /// Map the serve's OpenAI-shaped message onto the `chat` crate's structured
