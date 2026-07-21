@@ -307,7 +307,9 @@ mod tests {
         assert!(ops.contains(&Gemma4Op::GeGlu));
         assert_eq!(ops[ops.len() - 2], Gemma4Op::FinalRmsNorm);
         assert_eq!(ops[ops.len() - 1], Gemma4Op::LmHead);
-        assert!(!GEMMA4_RMS_NORM_ADDS_ONE);
+        const {
+            assert!(!GEMMA4_RMS_NORM_ADDS_ONE);
+        }
     }
 
     #[test]
@@ -340,7 +342,9 @@ mod tests {
     fn gemma4_norm_weight_is_plain_scale() {
         assert_eq!(gemma4_effective_norm_weight(0.0), 0.0);
         assert_eq!(gemma4_effective_norm_weight(-0.25), -0.25);
-        assert!(!GEMMA4_RMS_NORM_ADDS_ONE);
+        const {
+            assert!(!GEMMA4_RMS_NORM_ADDS_ONE);
+        }
     }
 
     #[test]

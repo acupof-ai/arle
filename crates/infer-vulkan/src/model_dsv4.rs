@@ -302,7 +302,9 @@ mod tests {
         assert_eq!(ops[ops.len() - 3], Dsv4Op::MhcHeadPre);
         assert_eq!(ops[ops.len() - 2], Dsv4Op::FinalRmsNorm);
         assert_eq!(ops[ops.len() - 1], Dsv4Op::LmHead);
-        assert!(!DSV4_PREFIX_CACHE_ENABLED);
+        const {
+            assert!(!DSV4_PREFIX_CACHE_ENABLED);
+        }
     }
 
     #[test]
