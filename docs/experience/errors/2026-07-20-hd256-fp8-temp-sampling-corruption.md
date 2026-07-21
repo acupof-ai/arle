@@ -74,18 +74,34 @@ Qwen3.6-27B-FP8, greedy agentic rollout → proper `<tool_call>` Glob/Grep, 7 tu
 located + fixed the real `lexer.py is_keyword` bug, hidden tests pass, reward 1.0.
 Matches the GOOD bisect parent. **Agentic-OPD unblocked at greedy.**
 
-## Open — a SEPARATE temp>0 defect (#59)
+## Open — a SEPARATE temp>0 defect (#59): CONFIRMED, two independent causes
 
-The fix restores the GREEDY/argmax path. temp>0 still degenerates AFTER the fix:
-deterministic (seeded), ~27-token early stop, scrambled/merged tokens
-("memoizatmemoizatization"), nonascii 0.0; the temp=0.0 control on the same serve
-is coherent to 2000 tokens. Greedy uses `argmax_logit` (untouched); temp>0 uses
-the sampled path `a41827b75` rewrote (`sample_token → sample_token_logprob` +
-qwen35 decode). So the temp>0 salad is a distinct sampled-path/logprob-capture
-bug, **not** genuine model temperature fragility (an earlier draft of this doc
-wrongly concluded "temperature at length, not a bug" — that conclusion is
-retracted). Bisect `a41827b75^` vs `a41827b75` at temp=1.0 to confirm. Blocks
-grpo/on-policy (behavior-logprobs); rejection-ce runs fine at greedy.
+The fix restores the GREEDY/argmax path but temp>0 still degenerates AFTER it —
+confirmed by a **sha-verified** probe on HEAD `9edfcb234` (product binary sha ==
+on-disk build; source has OFFSET `(1+w)` at all 4 sites; temp=1.0 → SCRAMBLED).
+This **refutes** the tempting "temp>0 collapses into b4b293f0c / earlier report was
+a stale binary" hypothesis. There are **two independent causes**:
+
+1. **Type-A = `b4b293f0c`** (hd256 q/k RMSNorm OFFSET→STANDARD) — broke greedy-at-
+   length AND temp>0; **fixed at HEAD**. Garbage `funciton/Fibonaacci/
+   _selection_selection_`. Isolated cleanly (`67e15b0a6` OFFSET=COHERENT vs
+   `b4b293f0c` STANDARD=SCRAMBLED, byte-identical through `a41827b75`).
+2. **Type-B = a second, temp>0-specific tail bug that PERSISTS at HEAD** (different
+   garbage `fkk fkk`, early-stop ~117 tok). Proven by two controls that flip to the
+   SAME garbage-B: `a41827b75`+OFFSET-overlaid, and sha-verified HEAD. Localized by
+   a zero-rebuild param sweep: **top_k=1/greedy → COHERENT** (bug lives in the
+   sampled low-prob **tail**, not attention/argmax); **COHERENT at temp≤0.7,
+   SCRAMBLED at temp=1.0** (temp<1 sharpens away from the bad tail); top_p 1.0 vs
+   0.95 no diff → not a top_p renorm bug. Regression window `67e15b0a6..a41827b75`,
+   survives to HEAD; **not** the norm and **not** `a41827b75`'s `sample_token →
+   sample_token_logprob` rewrite alone (byte-identical under STANDARD). Suspects:
+   `qwen35.rs`/`prefix_state.rs` attention-prep, `d94cf4b80` (rejection-sampling).
+   Second bisect (OFFSET held fixed, one variable) in flight.
+
+**Actionable:** on-policy grpo runs at **temp≤0.7 (coherent)** as the interim;
+temp=1.0 recovered after the Type-B fix. Key new fact: the tail was clean at
+temp=1.0 in `67e15b0a6` and got poisoned by one of the 10 following commits — a
+real **regression**, not an immutable FP8-logit-tail property.
 
 ## Rule
 

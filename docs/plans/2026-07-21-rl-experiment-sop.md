@@ -245,16 +245,27 @@ sweetspot3 29-train / 33-held-out):**
   config): this is *SFT-on-wins / rejection sampling*, **not** on-policy RL. A
   positive `delta` is a capability lift, not evidence GRPO works. Cheapest kill
   available; run it, one variable = student model.
-- **Phase 2 — `grpo` on-policy: gated on #59.** GRPO needs temp>0 for group
-  variance. temp>0 sampling on hd256/FP8 was corrupt (#59), root-caused by bisect
-  to kernel `b4b293f0c` (OFFSET→STANDARD q/k RMSNorm, which broke both greedy-at-
-  length and temp>0). The OFFSET-restore fix is **already in-tree** (current HEAD
-  has `(1+w)` at all 4 sites); a confirm probe (decode ~50 completions at temp 0.7:
-  no garble/looping, sane entropy, non-empty behavior-logprobs) is the gate. Once
-  the probe is green, flip `--update-strategy grpo --rollout-temperature 0.7
-  --samples-per-prompt 4 --sync every-group`. Do **not** run GRPO before the probe
-  — a garbage `π_behavior` makes the IS ratio meaningless and the whole arm
-  unattributable (exactly the §1.5/§4 confounder).
+- **Phase 2 — `grpo` on-policy: runnable at temp≤0.7 now; temp=1.0 gated on #59
+  Type-B.** #59 has **two independent causes** (sha-verified probe on HEAD
+  `9edfcb234`, decoded generations — not inference):
+  - **Type-A = `b4b293f0c`** (hd256 q/k RMSNorm OFFSET→STANDARD): broke greedy-at-
+    length AND temp>0. **Fixed at HEAD** (OFFSET `(1+w)` restored at all 4 sites).
+    Garbage signature `funciton/Fibonaacci/_selection_selection_`.
+  - **Type-B = a second, temp>0-specific tail bug that PERSISTS at HEAD**
+    (different garbage `fkk fkk`, early-stop ~117 tok). Localized by a zero-rebuild
+    param sweep: **top_k=1/greedy → COHERENT** (bug is in the sampled low-prob
+    tail, not attention/argmax); **COHERENT at temp≤0.7, SCRAMBLED at temp=1.0**
+    (temp<1 sharpens away from the bad tail); not a top_p renorm bug. Regression
+    window `67e15b0a6..a41827b75`, survives to HEAD; **not** the norm and **not**
+    `a41827b75`'s sample.rs rewrite alone. Suspects: `qwen35.rs`/`prefix_state.rs`
+    attention-prep, `d94cf4b80` (rejection-sampling). Second bisect (OFFSET held
+    fixed) in flight.
+  - **Actionable:** GRPO needs temp>0 for group variance — run it at
+    `--rollout-temperature 0.7` (coherent, within the industry 0.6–1.0 band) as the
+    interim, `--update-strategy grpo --samples-per-prompt 4 --sync every-group`.
+    Recover temp=1.0 after the Type-B fix. Do **not** run at temp=1.0 before the
+    fix — a garbage `π_behavior` makes the IS ratio meaningless and the arm
+    unattributable (§1.5/§4 confounder).
 - **Phase 3 — ablations/scale** on a Phase-1/2 survivor: LoRA surface, layers,
   rounds; then **≥5-seed mean±σ + Wilson CI** before any capability claim <5pp
   (matches both the ARLE rule and the sober-look finding), and multi-shape (≥2 task
