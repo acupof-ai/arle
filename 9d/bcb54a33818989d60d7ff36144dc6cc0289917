@@ -1,0 +1,25 @@
+.github/workflows/release.yml
+  s_0b41a0be89125e::t_41290e14d53ae6 101-104,107-113
+scripts/tests/test_validate_release.sh
+  s_0b41a0be89125e::t_f41b43eb7badf1 23-29,52,58-62,69,89
+scripts/validate_release.sh
+  s_0b41a0be89125e::t_a09d9541439b37 2-5,36-37,40-43,45-46,49,51-75,77-83
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "9dbcb54a33818989d60d7ff36144dc6cc0289917",
+  "prompts": {},
+  "sessions": {
+    "s_0b41a0be89125e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "02c87622-3de8-4f1b-85fc-5a4033e174b2",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
