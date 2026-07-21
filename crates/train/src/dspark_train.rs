@@ -8,9 +8,11 @@
 //! Two complementary loss signals (cf. DeepSpec `deepspec/modeling/dspark/loss.py`):
 //! - **Policy gradient**: reward = accepted/block_size, baseline = EMA.
 //!   `pg_loss = -log π(draft_tokens) * (reward - baseline)`.
-//! - **Supervised L1 on probabilities**: dense signal from the captured
-//!   `target_logits`. `l1_loss = Σ|softmax(draft) - softmax(target)|`.
-//!   This directly optimises acceptance rate (`accept ≈ 1 - 0.5·TV`).
+//! - **Supervised probability matching**: dense signal from the captured
+//!   `target_logits`. `loss = Σ(softmax(draft) - softmax(target))²`.
+//!   Squared difference is a differentiable surrogate for L1/total-variation
+//!   — same gradient direction, no `abs()` op needed. Directly optimises
+//!   acceptance rate (`accept ≈ 1 - 0.5·TV`).
 //!
 //! Per-position exponential decay (`loss_decay_gamma`) up-weights earlier
 //! tokens in the block: a mistake at position 0 voids positions 1..k.
@@ -63,9 +65,9 @@ pub struct DsparkTrainConfig {
     /// Initial value for the EMA baseline (the reward's running mean).
     /// Default 0.5 (midpoint of [0, 1] acceptance ratio).
     pub baseline_init: f32,
-    /// Weight on the supervised L1 probability-matching loss. The policy-gradient
-    /// loss receives weight `1.0 - l1_loss_alpha`. Default 0.9 (DeepSpec).
-    pub l1_loss_alpha: f32,
+    /// Weight on the supervised probability-matching loss. The policy-gradient
+    /// loss receives weight `1.0 - prob_match_alpha`. Default 0.9 (DeepSpec).
+    pub prob_match_alpha: f32,
     /// Exponential decay scale for per-position loss weighting. Position `k` in
     /// the block is weighted `exp(-k/gamma)`. `None` disables decay (uniform).
     /// Default 4.0 (DeepSpec).
@@ -82,7 +84,7 @@ impl Default for DsparkTrainConfig {
             batch_size: 64,
             baseline_ema_alpha: 0.01,
             baseline_init: 0.5,
-            l1_loss_alpha: 0.9,
+            prob_match_alpha: 0.9,
             loss_decay_gamma: Some(4.0),
             max_grad_norm: Some(1.0),
         }
@@ -93,6 +95,7 @@ impl Default for DsparkTrainConfig {
 struct MarkovParams {
     w1: TensorId, // [vocab, rank]
     w2: TensorId, // [rank, vocab]
+    rank: usize,
 }
 
 /// DSpark trainer: runs in a background thread, drains the experience
@@ -194,7 +197,7 @@ impl DsparkTrainer {
             .store
             .alloc(Tensor::new(w2_data, vec![rank, vocab_size], true)?);
 
-        self.params = Some(MarkovParams { w1, w2 });
+        self.params = Some(MarkovParams { w1, w2, rank });
         Ok(())
     }
 
@@ -246,7 +249,7 @@ impl DsparkTrainer {
         )?;
         let emb_flat_id = ops::reshape(
             emb_id,
-            &[batch * block_size, self.config.markov_rank],
+            &[batch * block_size, params.rank],
             &mut self.store,
             &mut self.tape,
         )?;
@@ -301,10 +304,9 @@ impl DsparkTrainer {
             &mut self.tape,
         )?;
 
-        // ---- Supervised L1 loss on probability distributions ----
+        // ---- Supervised probability-matching loss ----
         // Directly optimises acceptance rate: accept ≈ 1 - 0.5·TV(draft, target).
-        // We use squared difference (Frobenius) as a differentiable surrogate
-        // for L1/TV — same gradient direction, no abs() op needed.
+        // Squared difference (Frobenius) is a differentiable surrogate for L1/TV.
         let draft_probs_id = ops::softmax(corrected_id, &mut self.store, &mut self.tape)?;
         let target_probs_id = ops::softmax(target_logits_id, &mut self.store, &mut self.tape)?;
         // diff = softmax(draft) - softmax(target), computed in-graph.
@@ -326,7 +328,7 @@ impl DsparkTrainer {
             .store
             .from_slice(&expanded_weights, &[batch * block_size, vocab_size])?;
         let weighted_sq_id = ops::mul(sq_diff_id, exp_weight_id, &mut self.store, &mut self.tape)?;
-        let l1_loss_id = ops::mul_scalar(
+        let prob_match_loss_id = ops::mul_scalar(
             ops::sum(weighted_sq_id, &mut self.store, &mut self.tape)?,
             1.0 / (weight_sum * vocab_size as f32),
             &mut self.store,
@@ -334,15 +336,15 @@ impl DsparkTrainer {
         )?;
 
         // ---- Combined loss ----
-        let pg_alpha = 1.0 - self.config.l1_loss_alpha;
+        let pg_alpha = 1.0 - self.config.prob_match_alpha;
         let pg_scaled_id = ops::mul_scalar(pg_loss_id, pg_alpha, &mut self.store, &mut self.tape)?;
-        let l1_scaled_id = ops::mul_scalar(
-            l1_loss_id,
-            self.config.l1_loss_alpha,
+        let pm_scaled_id = ops::mul_scalar(
+            prob_match_loss_id,
+            self.config.prob_match_alpha,
             &mut self.store,
             &mut self.tape,
         )?;
-        let loss_id = ops::add(pg_scaled_id, l1_scaled_id, &mut self.store, &mut self.tape)?;
+        let loss_id = ops::add(pg_scaled_id, pm_scaled_id, &mut self.store, &mut self.tape)?;
 
         self.tape.backward(loss_id, &mut self.store)?;
         let (w1_id, w2_id) = (params.w1, params.w2);
@@ -352,18 +354,18 @@ impl DsparkTrainer {
         self.optim.step(&[w1_id, w2_id], &mut self.store);
         self.optim.zero_grad(&[w1_id, w2_id], &mut self.store);
 
-        let loss_val = self.store.to_host(loss_id).unwrap_or_default();
-        let loss = if loss_val.is_empty() {
-            0.0
-        } else {
-            loss_val[0]
-        };
+        let loss = self
+            .store
+            .to_host(loss_id)
+            .unwrap_or_default()
+            .first()
+            .copied()
+            .unwrap_or(0.0);
 
         // Free every intermediate tensor created during this step (params w1/w2
         // are in `live_before`, so they survive). Replaces a 22-item manual ID
         // list that leaked whenever an op was added without updating it.
-        let keep: HashSet<TensorId> = HashSet::new();
-        let _ = self.store.free_new_except(&live_before, &keep);
+        let _ = self.store.free_new_except(&live_before, &HashSet::new());
         self.tape = Tape::new();
 
         Ok(loss)
