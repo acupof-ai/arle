@@ -117,6 +117,8 @@ using StrideB = typename Gemm::GemmKernel::InternalStrideB;
 using StrideC = typename Gemm::GemmKernel::InternalStrideC;
 using StrideD = typename Gemm::GemmKernel::InternalStrideD;
 
+static_assert(cute::is_same_v<cute::tuple<StrideA, StrideB>, void>, "REVEAL_STRIDES");
+
 // Compact rank-3 strides without the tools/util header (vendored cutlass is
 // include-only). Grouped ⇒ per-group ptr, L=1, batch mode = 0: only the leading
 // dynamic mode is set; the default-constructed stride zeroes the rest (or keeps a
