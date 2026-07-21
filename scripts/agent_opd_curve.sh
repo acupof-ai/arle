@@ -10,24 +10,18 @@
 # Models auto-download from HF if not local (set HF_ENDPOINT=https://hf-mirror.com
 # for the mirror).
 #
-# Default = the 2026-07-21 deep-research canonical config
-# (docs/research/2026-07-21-rl-algo-infra-deepresearch.md): DAPO + one-step-off
-# async (--staleness 1) + dynamic sampling (--task-selection) + G=8 at
-# --rollout-temperature 1.0 (#167 fixed 2026-07-21), spec-decode via TC's own MTP
-# head (SPEC below, aligned), eval --eval-concurrency 8. DAPO carries the DeepSWE
-# bundle (no-std / no-KL / clip-higher / overlong-filter); --staleness 1 recovers
-# the async throughput strict every-group sync forfeits and needs an IS-ratio
-# preset (dapo/dr-grpo/gspo — NOT rejection-ce). Fall back to the cheap
-# SFT-on-wins baseline with UPDATE_STRATEGY=rejection-ce ROLLOUT_TEMPERATURE=0.0
-# STALENESS=0 SAMPLES=2.
-# Optional env (full-run defaults; SMOKE=1 = 2-round sizing run):
+# Defaults come from the 2026-07-21 SOTA review
+# (docs/research/2026-07-21-rl-algo-infra-deepresearch.md). Each knob is explained
+# where it is set below; override any via env. SMOKE=1 = quick 2-round sizing run.
+# Optional env (full-run defaults):
 #   ARLE_BIN=target/release/arle  OUT_ROOT=runs  GPU=0  MODEL_CACHE=models
 #   STUDENT_MODEL=<dir>           override student (else fetch STUDENT_MODEL_HF_ID)
 #   STUDENT_MODEL_HF_ID=bottlecapai/ThinkingCap-Qwen3.6-27B-FP8
-#   UPDATE_STRATEGY=dapo          {dapo,gspo,dr-grpo,grpo,rejection-ce,cispo,...}
-#   STALENESS=1                   one-step-off async (needs an IS-ratio preset)
-#   TASK_SELECTION=true           GRESO zero-variance skip + retirement
-#   ROLLOUT_TEMPERATURE=1.0       grpo/dapo need >0; rejection-ce uses 0.0 (greedy)
+#   UPDATE_STRATEGY=dapo          policy-update rule {dapo,gspo,dr-grpo,grpo,rejection-ce,...}
+#   STALENESS=1                   1 = train on a batch while the next generates
+#                                 (dapo/dr-grpo/gspo only); 0 = wait for each batch
+#   TASK_SELECTION=true           skip prompts that always pass or always fail
+#   ROLLOUT_TEMPERATURE=1.0       >0 samples (dapo/grpo); 0.0 is greedy (rejection-ce)
 #   SPEC=mtp                      spec-decode via TC's built-in MTP head (default,
 #                                 aligned, no download). dflash=external draft
 #                                 (needs C4 retrain vs TC). off=disable.
@@ -69,13 +63,10 @@ else
     ROUNDS=${ROUNDS:-16} SAMPLES=${SAMPLES:-8} EVAL_EVERY=${EVAL_EVERY:-2}
     EVAL_N=${EVAL_N:-24} TASK_LIMIT=${TASK_LIMIT:-12} BASE_REPEATS=${BASE_REPEATS:-2}
 fi
-# Canonical default = the 2026-07-21 deep-research config
-# (docs/research/2026-07-21-rl-algo-infra-deepresearch.md): DAPO (no-std/no-KL/
-# clip-higher/overlong-filter, the DeepSWE bundle) + one-step-off async
-# (--staleness 1, recovers the 2.2-2.8x that strict every-group sync forfeits;
-# needs an IS-ratio preset, which dapo is) + dynamic sampling (--task-selection)
-# + G=8 (sparse execution reward makes G=4 zero-variance groups common) at
-# temp=1.0. rejection-ce/greedy fallback: UPDATE_STRATEGY=rejection-ce
+# dapo: the update rule most recent coding-RL work uses; it also lets STALENESS=1
+# overlap generation with training (rejection-ce cannot). G=8, not 4: with a
+# pass/fail reward, 4 samples per prompt too often come out all-same → no signal.
+# For a quick supervised-style baseline instead, set UPDATE_STRATEGY=rejection-ce
 # ROLLOUT_TEMPERATURE=0.0 STALENESS=0 SAMPLES=2.
 UPDATE_STRATEGY=${UPDATE_STRATEGY:-dapo}
 ROLLOUT_TEMPERATURE=${ROLLOUT_TEMPERATURE:-1.0}
@@ -83,17 +74,13 @@ STALENESS=${STALENESS:-1}
 TASK_SELECTION=${TASK_SELECTION:-true}
 EVAL_CONCURRENCY=${EVAL_CONCURRENCY:-8}
 WRITEBACK_CAP=${WRITEBACK_CAP:-8} DIFFICULTY=${DIFFICULTY:-easy} SEED=${SEED:-0}
-# Spec-decode default = TC's OWN MTP head (--mtp-draft-tokens): the mtp.* tensors
-# ship inside ThinkingCap (mtp_num_hidden_layers=1), aligned to the student by
-# construction -> no external draft, no download, NO weight adjustment. verify is
-# distribution-preserving so results are unchanged either way; this is purely the
-# aligned-acceptance choice.
-#   SPEC=dflash  external z-lab/Qwen3.6-27B-DFlash draft. It is trained for BASE
-#                Qwen3.6-27B; on a TC student its acceptance drops (shifted
-#                distribution) and it needs retraining against TC (DSpark C4
-#                draft-head harness) before it beats the MTP head. Opt in only
-#                after that retrain.
-#   SPEC=off     no spec-decode.
+# Faster generation via speculative decoding — it never changes the output, only
+# speed. Default uses the student's own MTP head, which ships inside ThinkingCap,
+# so it matches the model and needs no extra download or setup.
+#   SPEC=dflash  a separate draft model. The public one is trained for the BASE
+#                model, so it guesses worse for our fine-tuned student and helps
+#                little until retrained. Prefer mtp.
+#   SPEC=off     plain decoding.
 SPEC=${SPEC:-mtp}
 MTP_DRAFT_TOKENS=${MTP_DRAFT_TOKENS:-3}
 DSPARK_CONF_THRESHOLD=${DSPARK_CONF_THRESHOLD:-0.0}
