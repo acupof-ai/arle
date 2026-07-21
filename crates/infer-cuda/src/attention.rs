@@ -1623,7 +1623,7 @@ pub(crate) fn dsv4_flashmla_decode_batched_enabled() -> Result<bool> {
     dsv4_flashmla_decode_enabled()
 }
 
-fn dsv4_flashmla_prefill_enabled() -> Result<bool> {
+pub(crate) fn dsv4_flashmla_prefill_enabled() -> Result<bool> {
     // Default ON: vendored FlashMLA sparse prefill replaces the scalar
     // SW/CSA/HCA attention math. Licensed 2026-06-07 on the TP=8/EP=8 H20 pod:
     // 4096-token warm prefill 7189 -> 4299 ms, and the 2048-token edge case is
@@ -6314,7 +6314,12 @@ fn mla_attention_fwd(
         // The kernel reads the pre-roped q/k, attends over the bf16 SW ring cache
         // (which it also updates), adds the sink, and un-rotates the rope tail of
         // the OUTPUT (sign = -1) before returning.
-        if let Some(meta) = chain_verify {
+        // Chain verify with a single-row chain (draft_len=0) has no sparse
+        // ancestors to exploit; fall through to the normal decode path instead
+        // of failing the FlashMLA prefill `ensure!` (q_prepared.seq_len <= 1).
+        if let Some(meta) = chain_verify
+            && token_count > 1
+        {
             let used = try_flashmla_prefill_attention(
                 ctx,
                 config,
@@ -6508,7 +6513,7 @@ fn mla_attention_fwd(
             rope.beta_slow,
         )? {
             true
-        } else if chain_verify.is_some() {
+        } else if chain_verify.is_some() && token_count > 1 {
             bail!("DSv4 chain verify requires the FlashMLA sparse prefill path");
         } else if dsv4_flashmla_decode_enabled()? {
             let flash = state.flashmla.as_mut().ok_or_else(|| {
