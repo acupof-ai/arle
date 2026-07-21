@@ -1,44 +1,37 @@
-# temp=1.0 long-gen degeneration on Qwen3.6-27B — resolved
+# hd256 q/k RMSNorm convention flip — root-caused + fixed
 
-> Status: Shipped/Resolved. The temp>0 "salad" is **temperature=1.0 + long
-> generation degeneration**, uniform across ALL Qwen3.6-27B variants (base &
-> ThinkingCap, FP8 & bf16) on the clean binary `fea8e1fd0`. NOT FP8, NOT a MoE
-> router (there is none — hybrid linear-attn), NOT ThinkingCap weights, NOT norm,
-> NOT config, NOT the sampler. Fix shipped: `--rollout-temperature 0.3`
-> (`2394a2ab0`). Full forensics + the five-hypothesis false-chain in the errors
-> entry.
+> Status: Shipped/Resolved (`e4d5580ca`). Agentic-rollout / long-context
+> degeneration = a single kernel bug: `b4b293f0c` flipped hd256 q/k RMSNorm
+> OFFSET→STANDARD, collapsing 27B attention at length. Binary bisect (clean
+> adjacent flip) → fix restores `(1+w)` at 5 hd256-only sites → pod-verified base
+> greedy agentic rollout emits tool calls, 7 turns, reward 1.0. A SEPARATE temp>0
+> sampling defect survives (#59). Full record in the errors + wins entries.
 
 ## Verdict
 
-Confirmed on clean binary by a controlled A/B (3 models × {greedy, temp=1.0} ×
-{400, 2000 tok}): base and ThinkingCap, FP8 and bf16, are **indistinguishable** —
-all coherent at greedy/top_k=1/short, all degenerate at temp=1.0 + length. The
-model ships no `repetition_penalty`; long unconstrained temp=1.0 sampling loops.
-temp=0.3 (already the rollout default) is the correct operating point.
+`b4b293f0c` (OFFSET→STANDARD) was a misattributed "fix": 27B q/k_norm weights are
+OFFSET (mean|w|=0.49<0.75, Metal-reference-confirmed), and its "verified vs 4B"
+claim is void (hd256 kernels are 27B-only). Dropping `+1` shrank q/k ~3× →
+attention collapse, length-dependent (short greedy fine → its smoke passed; long
+agentic/temp>0 broke). Fix `e4d5580ca` restores OFFSET at all 5 hd256 sites.
 
-Every static hypothesis was killed by measurement — see the errors entry:
-- MoE router quantized → no routers (hybrid linear-attn); loose grep artifact.
-- FP8 scales/values → scales bit-identical, dequant error 2.65% intrinsic floor.
-- sampling/rope/template/eos config → identical to base.
-- norm handling (`9851ced6b`) → a separate mis-fix, reverted `485eefe0d`.
-- the driving premise "base coherent / ThinkingCap salad" → artifact of a
-  pre-norm-revert binary; does not reproduce clean.
+Eight hypotheses were killed before the bisect (router/FP8-scale/FP8-value/config/
+ThinkingCap-weights/temperature/prompt-render/sampler); #48's day-one relay
+("b4b293f0c breaks temp>0") was right all along.
 
 ## Follow-ups
 
-- **Sampler exonerated (closed):** host sampler truncates top_k then cuts top_p at
-  first cum≥0.95 — the drawn token is always in-nucleus by construction; control
-  (temp=1.0 top_k=1 coherent, top_k=20 garbage) confirms the filter is live. The
-  temp=1.0 garbage token is genuinely in the model's top-20 tail — model behavior,
-  not a leak. Fix stays temp=0.3.
-- **Voided:** #55 router bf16 re-export (no-op — no routers); FP8 requant (FP8
-  faithful); bf16 swap (bf16 salads identically).
-- **OPD:** ThinkingCap-FP8 student unblocked at temp=0.3 — resume the P4 lane.
+- **#59 (open):** temp>0 sampling salad survives the hd256 fix — greedy coherent,
+  temp=1.0 scrambled/deterministic. Suspect `a41827b75`'s sampled-path rewrite.
+  Blocks grpo/on-policy behavior-logprobs; rejection-ce runs at greedy.
+- **OPD P4:** unblocked at greedy — run rejection-ce baseline now; grpo after #59.
+- ThinkingCap-FP8 re-evaluate fairly (it was never the problem).
 
 ## Links
 
-- Errors entry (full forensics + rules):
+- Errors (full chase + rules):
   [errors/2026-07-20-hd256-fp8-temp-sampling-corruption.md](../experience/errors/2026-07-20-hd256-fp8-temp-sampling-corruption.md).
-- Shipped fix: `2394a2ab0` (`--rollout-temperature` 1.0→0.3).
-- hd256 RMSNorm greedy fix (earlier, valid): `b4b293f0c`. Norm mis-fix reverted:
-  `485eefe0d`. Relay/root task: #48.
+- Wins (acceptance A/B):
+  [wins/2026-07-20-hd256-qk-rmsnorm-offset-restore.md](../experience/wins/2026-07-20-hd256-qk-rmsnorm-offset-restore.md).
+- Fix: `e4d5580ca`. Regressor: `b4b293f0c`. Bisect GOOD parent: `67e15b0a6`.
+  Relay/root: #48. Temp>0 follow-up: #59.

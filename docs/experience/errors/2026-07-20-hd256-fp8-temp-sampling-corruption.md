@@ -1,104 +1,110 @@
-# temp=1.0 long-gen degeneration on Qwen3.6-27B — a five-hypothesis false-root-cause chain
+# hd256 q/k RMSNorm convention flip (b4b293f0c) — one kernel bug, an eight-hypothesis false chase
 
-> Status: RESOLVED. The temp>0 "salad" is **temperature=1.0 + long generation
-> degeneration**, uniform across ALL Qwen3.6-27B variants (base & ThinkingCap,
-> FP8 & bf16) on the clean binary `fea8e1fd0`. NOT FP8, NOT the MoE router (there
-> is none), NOT ThinkingCap's weights, NOT norm handling, NOT config. Five static
-> hypotheses + the driving premise were each killed by measurement. Fix already
-> shipped: rollout `--rollout-temperature 0.3` (`2394a2ab0`) is the correct
-> operating point. One cheap sampler spot-check open (garbage-token nucleus leak
-> vs model tail).
+> Status: ROOT-CAUSED + FIXED (`e4d5580ca`). The agentic-rollout / long-context
+> degeneration is a **single kernel bug**: `b4b293f0c` flipped hd256 q/k RMSNorm
+> from OFFSET `x·rms·(1+w)` to STANDARD `x·rms·w`, shrinking 27B q/k ~3× and
+> collapsing attention at length. Binary bisect on the agentic greedy rollout is a
+> clean adjacent flip. Fix restores `(1+w)` at all 5 hd256-only sites; verified:
+> base greedy agentic rollout emits proper tool calls, 7 turns, fixes the real
+> bug, reward 1.0. **A separate temp>0 sampling defect survives the fix — see the
+> tail + [[project or #59]].**
 
 ## Context
 
-Adopting a concise-reasoning student (ThinkingCap-Qwen3.6-27B-FP8) for the
-agent-OPD lane. temp=1.0 rollouts looked like multilingual token-salad; a prior
-session decoded "base FP8 coherent / ThinkingCap FP8 salad, nonascii 0.37" and
-built a root cause on it. Every layer of that root cause turned out wrong.
+Agentic-OPD rollouts on Qwen3.6-27B (ThinkingCap-FP8 student) produced no edits /
+degenerate output. A prior session's relay (#48) said "b4b293f0c breaks temp>0" —
+**correct from the start.** The chase below spent eight hypotheses re-discovering
+that, because b4b293f0c passed its own smoke (short greedy needle/Fibonacci
+coherent — the damage is length-dependent) and the symptom shape (temp-graded,
+multilingual salad) pointed everywhere but the kernel.
 
-## Root Cause (measured, clean binary `fea8e1fd0`)
+## Root Cause
 
-Controlled A/B — 3 models × {greedy, temp=1.0 top_p0.95 top_k20} × length:
+`b4b293f0c` ("hd256 q/k RMSNorm convention mismatch — OFFSET→STANDARD") changed
+5 hd256 kernel sites from `x·rms·(1+weight)` to `x·rms·weight`, arguing the 27B
+q/k_norm weights are STANDARD (mean 0.2–0.75, <1) and citing the 4B hd128 model as
+verification. Both premises are wrong:
 
-| | 400 tok | 2000 tok greedy | 2000 tok temp=1.0 |
-|---|---|---|---|
-| ThinkingCap-FP8 | COHERENT | coherent (loops, no answer) | **SALAD** na0.004 |
-| **base**-FP8 | COHERENT | **COHERENT** (code, finish=stop) | **SALAD** ttr0.10 |
-| ThinkingCap-**bf16** | COHERENT | COHERENT | **SALAD** na0.018 |
+1. **The weights are OFFSET.** Measured on Qwen3.6-27B-FP8: q/k_norm `mean|w| =
+   0.490` (min 0.225, max 0.761), all 34 tensors < 0.75. A weight centered at 0.49
+   (not 1.0) is stored as a delta from 1 — the norm multiplier is `(1+w) ≈ 1.49`,
+   not `w ≈ 0.49`. The Metal reference (`mean|w| < 0.75 → w+1`) agrees exactly.
+2. **"Verified against 4B" is a red herring.** The hd256 kernels are 27B-only —
+   the fused batched kernel is guarded by `head_dim == BATCHED_DECODE_HEAD_DIM ==
+   256`, and the `*_hd256` helpers are hd256-only. The 4B (hd128) model never
+   executes these kernels, so it can't validate them.
 
-Control: temp=1.0 with **top_k=1** → base & bf16 both COHERENT, finish=stop.
-**Temperature is the flipped variable, uniform across weights and quant.** These
-are thinking models with no `repetition_penalty`; long unconstrained temp=1.0
-sampling degenerates into loops + occasional garbage. Greedy/top_k=1 are always
-coherent. Short (≤400 tok) is always coherent — the failure only shows at length.
+Dropping the `+1` shrank each q/k component ~3× → attention scores collapsed.
+**Length-dependent:** short prompts survive (greedy needle + Fibonacci coherent →
+b4b293f0c's smoke passed), long context degenerates (agentic drift, temp>0 salad).
 
-The prior "nonascii 0.37 multilingual salad, base coherent / ThinkingCap salad"
-**does not reproduce on the clean binary** — it was an artifact of a
-pre-norm-revert binary (`9851ced6b` era) and/or long unseeded generation.
+**Binary bisect — clean adjacent flip** (base Qwen3.6-27B-FP8, greedy agentic
+cc-harness rollout; pre-`fed715dc3` the rollout is greedy by default):
 
-## The false chain — each killed by measurement (CPU forensics, then GPU A/B)
+| commit | rollout |
+|---|---|
+| `67e15b0a6` (= b4b293f0c^, still `(1+w)`) | GOOD — 5 turns, `<tool_call>` Grep/Read/Bash, fixed the sqlparse bug, reward 1.0 |
+| **`b4b293f0c`** (`w`) | BAD — degenerate salad, zero tool calls |
+| `3bdcbfa84` (= a41827b75^) | BAD (so a41827b75 is exonerated for THIS bug) |
 
-1. **"MoE router was FP8-quantized" → DEAD.** The model has *no routers*: it is a
-   **hybrid linear-attention** (Mamba-style) arch — 48/64 layers are
-   `linear_attn.*`, 16 are softmax `self_attn`. The "router 65/65 vs 1/65" table
-   was a loose grep matching `.mlp.gate_proj` (dense FFN) as `.mlp.gate` (router).
-2. **"dense hd256" → WRONG.** Never checked against `layer_types`; it is hybrid
-   linear-attn, head_dim 256, `full_attention_interval` 4.
-3. **"FP8 scales broken" → DEAD.** base & ThinkingCap `weight_scale_inv` are
-   **bit-identical** (1.48M values, ratio 1.0000, zero 0/inf/nan). The export
-   reused base's scale grid — which is fine, see (4).
-4. **"FP8 value clipping against frozen scales" → DEAD.** Dequant(ThinkingCap-FP8)
-   vs ThinkingCap-bf16 = flat **2.65%** relative error (intrinsic e4m3 block-128
-   noise), saturation 0.01%, forced-clip 0.003%. A correct-requant control (scale
-   recomputed from bf16 truth) lands on the *same* 0.0265. FP8 is faithful.
-5. **"sampling/rope/template/eos config mismatch" → DEAD.** ThinkingCap's
-   `generation_config` (temp 1.0/top_p 0.95/top_k 20), rope, `chat_template.jinja`
-   (byte-identical sha256), and eos set are all identical to base.
-6. **The premise "base coherent / ThinkingCap salad at temp=1.0" → ARTIFACT.**
-   Does not reproduce on the clean binary; base & ThinkingCap are indistinguishable.
+## The eight-hypothesis false chase (each killed by measurement)
 
-Separately killed earlier: the norm mis-fix `9851ced6b` (loaded input/post
-layernorm as `w−1`, double-offsetting HF's offset norms → greedy salad), reverted
-`485eefe0d`/`d50e4782f`. The Metal reference (`mean|w|<0.75 → w+1`) settled that
-the CUDA `(1+w)` offset kernel was already correct.
+The symptom (temp-graded multilingual salad, only on hd256/FP8) misdirected the
+investigation through, in order: (1) sampler plumbing → refuted (hd128 coherent
+same binary); (2) MoE router FP8-quantized → **no routers** (hybrid linear-attn;
+loose grep of `.mlp.gate_proj` as `.mlp.gate`); (3) FP8 scales → bit-identical to
+base; (4) FP8 values/clipping → faithful 2.65% floor; (5) config/rope/template →
+identical to base; (6) ThinkingCap weights → base salads identically; (7)
+temperature default (`fed715dc3` greedy→temp>0) → **greedy salads too** at length;
+(8) prompt/render regression → `prompt_token_ids` byte-identical old vs current.
+Only after all eight did a binary bisect land on the kernel. The norm mis-fix
+`9851ced6b` (input/post layernorm `w−1`) was a *different* wrong turn, reverted
+`485eefe0d`.
 
 ## Fix
 
-- **Shipped (`2394a2ab0`), now re-attributed as correct, not a workaround:**
-  `--rollout-temperature` 1.0→0.3 (+ rubric nucleus hygiene top_p0.95/top_k20).
-  temp=0.3 (or top_k=1) is coherent across all variants; this is the right
-  operating point for these no-rep-penalty thinking models at length, NOT a patch
-  for a quant/weights bug. Keep it.
-- **Voided:** #55 router bf16 re-export (no routers → no-op); any FP8 requant (FP8
-  is faithful); any bf16 swap (bf16 salads identically).
-- **Sampler exonerated (closed).** The host sampler (`infer-plan/src/sample.rs:56-109`)
-  truncates to top_k *then* cuts top_p at the first cum≥0.95 — by construction the
-  drawn token is always within top-20 and its predecessors sum <0.95, so neither
-  nucleus-leak condition is possible; the device sampler
-  (`csrc/sampling/sampling.cu:327`) does the same. Control confirms the filter is
-  live: temp=1.0 top_k=1 COHERENT, top_k=20 garbage. So the occasional non-ASCII
-  token at temp=1.0 is genuinely inside the model's own top-20 tail — model
-  behavior, not a leak. Fix stays serving-config (temp=0.3). (arle's OpenAI
-  endpoint does not implement `logprobs`, so the per-step table couldn't be pulled
-  from the API — the source + control settle it.)
+`e4d5580ca` — restore OFFSET `(1+weight)` at all 5 hd256 q/k sites
+(`decode_prep_paged_hd256.cu`, `prefill_attention_hd256.cu`,
+`prefill_attention_paged_prep.cu`, and the 2 inline fused-batched sites in
+`fused_attention.cu`). 27B-only; 4B/hd128 untouched; keeps b4b293f0c's separate
+(correct) MTP `pre_fc_norm` load fix.
+
+**Verified on pod** (isolated build, sm_90 nvcc rebuild, HEAD e4d5580ca): base
+Qwen3.6-27B-FP8, greedy agentic rollout → proper `<tool_call>` Glob/Grep, 7 turns,
+located + fixed the real `lexer.py is_keyword` bug, hidden tests pass, reward 1.0.
+Matches the GOOD bisect parent. **Agentic-OPD unblocked at greedy.**
+
+## Open — a SEPARATE temp>0 defect (#59)
+
+The fix restores the GREEDY/argmax path. temp>0 still degenerates AFTER the fix:
+deterministic (seeded), ~27-token early stop, scrambled/merged tokens
+("memoizatmemoizatization"), nonascii 0.0; the temp=0.0 control on the same serve
+is coherent to 2000 tokens. Greedy uses `argmax_logit` (untouched); temp>0 uses
+the sampled path `a41827b75` rewrote (`sample_token → sample_token_logprob` +
+qwen35 decode). So the temp>0 salad is a distinct sampled-path/logprob-capture
+bug, **not** genuine model temperature fragility (an earlier draft of this doc
+wrongly concluded "temperature at length, not a bug" — that conclusion is
+retracted). Bisect `a41827b75^` vs `a41827b75` at temp=1.0 to confirm. Blocks
+grpo/on-policy (behavior-logprobs); rejection-ce runs fine at greedy.
 
 ## Rule
 
-- **Reproduce the premise on the CURRENT clean binary BEFORE building a
-  root-cause chain.** The entire five-probe forensic tower stood on a decoded A/B
-  from a prior session whose *sibling* inferences (the router table, "dense") were
-  themselves artifacts. Once two claims from that session fell, the premise itself
-  owed re-verification first — not more probes built on top. One clean-binary
-  A/B at the end overturned everything the CPU forensics had "narrowed."
-- **Tensor-name / architecture ground truth, not loose grep.** `.mlp.gate` matched
-  `.mlp.gate_proj`; "dense" was never checked against `layer_types`. Read the
-  index keys and the arch config before naming a mechanism. See
-  [[feedback_validate_comparison_inputs_before_bug]],
-  [[feedback_dont_file_hypothesis_as_root_cause]].
-- **Temp-graded + length-dependent symptom ⇒ characterize the sampling path
-  first.** A/B the sampling variables (temperature, top_k, length) and a reference
-  weight/quant BEFORE blaming weights or quant. Here greedy/top_k=1 coherence +
-  temp=1.0 salad across base *and* ThinkingCap, FP8 *and* bf16, localized it to
-  temperature-at-length in one controlled run. Gate a served model on the actual
-  SAMPLED generation at production temperature *and length*, never greedy or short
-  alone (2026-05-26-fp8-kv-catastrophic-was-test-artifact).
+- **When the same symptom class has bitten before, TEST the prior claim first.**
+  #48's relay named `b4b293f0c` on day one; eight hypotheses later a bisect
+  confirmed it. A cheap `git revert <named-commit> + rebuild + A/B` would have
+  cost one build, not a multi-probe forensic tower. The named prior suspect earns
+  the first experiment, not the last.
+- **Binary bisect beats forensic inference for a "worked before, broken now" +
+  deterministic symptom.** CPU forensics (scales/values/config/prompt) can only
+  find a smoking gun; they never *clear* a hypothesis. One same-prompt greedy A/B
+  across the commit window localized in 3 builds what 8 static probes could not.
+- **A "fix" is a suspect.** b4b293f0c and `9851ced6b` were both *fixes* that
+  regressed; `b4b293f0c` even had a passing smoke. Length-dependent damage escapes
+  a short-prompt gate — gate kernel-numerics changes on the SLO shape (long
+  agentic / long generation), never greedy-short alone.
+- **Convention from the stored weights, not from a sibling model.** mean|w|=0.49
+  < 0.75 = OFFSET; the 4B hd128 "verification" never ran the hd256 kernels. Verify
+  a convention against the tensors the kernel actually consumes.
+- Prior rules still hold: reproduce the premise on a clean binary before a chain
+  ([[feedback_reverify_premise_on_clean_binary_before_chain]]); tensor-name/arch
+  ground truth over loose grep ([[feedback_validate_comparison_inputs_before_bug]]).
