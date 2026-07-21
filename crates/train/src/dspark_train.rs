@@ -15,11 +15,12 @@
 //! Per-position exponential decay (`loss_decay_gamma`) up-weights earlier
 //! tokens in the block: a mistake at position 0 voids positions 1..k.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Result, ensure};
 use autograd::ops;
 use autograd::{AdamW, CpuBackend, Tape, Tensor, TensorId, TensorStore};
 
@@ -53,10 +54,15 @@ pub trait ExperienceSource: Send + Sync {
 /// actual vocab from the first drained experience, so the trainer is
 /// model-agnostic at construction.
 pub struct DsparkTrainConfig {
+    /// Markov head rank. Only used as a fallback when the trainer cannot read
+    /// the actual rank from the engine's loaded checkpoint.
     pub markov_rank: usize,
     pub learning_rate: f32,
     pub batch_size: usize,
     pub baseline_ema_alpha: f32,
+    /// Initial value for the EMA baseline (the reward's running mean).
+    /// Default 0.5 (midpoint of [0, 1] acceptance ratio).
+    pub baseline_init: f32,
     /// Weight on the supervised L1 probability-matching loss. The policy-gradient
     /// loss receives weight `1.0 - l1_loss_alpha`. Default 0.9 (DeepSpec).
     pub l1_loss_alpha: f32,
@@ -64,6 +70,8 @@ pub struct DsparkTrainConfig {
     /// the block is weighted `exp(-k/gamma)`. `None` disables decay (uniform).
     /// Default 4.0 (DeepSpec).
     pub loss_decay_gamma: Option<f32>,
+    /// Global L2 gradient norm cap. `None` disables clipping. Default 1.0.
+    pub max_grad_norm: Option<f32>,
 }
 
 impl Default for DsparkTrainConfig {
@@ -73,8 +81,10 @@ impl Default for DsparkTrainConfig {
             learning_rate: 1e-4,
             batch_size: 64,
             baseline_ema_alpha: 0.01,
+            baseline_init: 0.5,
             l1_loss_alpha: 0.9,
             loss_decay_gamma: Some(4.0),
+            max_grad_norm: Some(1.0),
         }
     }
 }
@@ -92,63 +102,100 @@ pub struct DsparkTrainer {
     store: TensorStore,
     tape: Tape,
     params: Option<MarkovParams>,
+    /// Initial weights seeded from the engine's loaded checkpoint. `None` =
+    /// random init (fallback when the engine has no Markov head to read).
+    init_weights: Option<(Vec<f32>, Vec<f32>, usize)>,
     optim: AdamW,
     baseline_ema: f32,
     running: Arc<AtomicBool>,
 }
 
 impl DsparkTrainer {
-    /// Create a new trainer. Markov params are lazily initialized on the first
-    /// `train_step` using the actual vocab size from the experience buffer,
-    /// so the trainer is model-agnostic at construction time.
-    pub fn new(config: DsparkTrainConfig) -> Result<Self> {
+    /// Create a new trainer.
+    ///
+    /// `init_weights` = `(w1 [vocab*rank], w2 [rank*vocab], rank)` read from
+    /// the engine's loaded checkpoint. When provided, the trainer seeds from
+    /// these (so acceptance never regresses at startup) and the actual `rank`
+    /// overrides `config.markov_rank`. When `None`, falls back to Xavier-ish
+    /// random init using `config.markov_rank`.
+    ///
+    /// `running` is the shared stop flag — the caller holds one end for the
+    /// guard, the trainer checks it each loop iteration. This lets the caller
+    /// grab the handle before construction (which may block on a GPU weight
+    /// read) without a partially-initialized trainer.
+    pub fn new(
+        config: DsparkTrainConfig,
+        init_weights: Option<(Vec<f32>, Vec<f32>, usize)>,
+        running: Arc<AtomicBool>,
+    ) -> Result<Self> {
         let backend: Arc<dyn autograd::Backend> = Arc::new(CpuBackend);
         let store = TensorStore::with_backend(backend);
         let tape = Tape::new();
         let optim = AdamW::new(config.learning_rate, (0.9, 0.999), 1e-8, 0.0);
+        let baseline_ema = config.baseline_init;
 
         Ok(Self {
             config,
             store,
             tape,
             params: None,
+            init_weights,
             optim,
-            baseline_ema: 0.5,
-            running: Arc::new(AtomicBool::new(false)),
+            baseline_ema,
+            running,
         })
     }
 
     /// Build the Markov head tensors with the given vocab size.
+    ///
+    /// If `init_weights` was provided at construction, seed from the checkpoint
+    /// (and use its rank). Otherwise use Xavier-ish random init with
+    /// `config.markov_rank`.
     fn init_params(&mut self, vocab_size: usize) -> Result<()> {
-        let rank = self.config.markov_rank;
+        let (rank, w1_data, w2_data) = match self.init_weights.take() {
+            Some((w1, w2, rank)) => {
+                let expected_w1 = vocab_size * rank;
+                let expected_w2 = rank * vocab_size;
+                ensure!(
+                    w1.len() == expected_w1,
+                    "init w1 size mismatch: got {}, expected {expected_w1} (vocab={vocab_size}, rank={rank})",
+                    w1.len()
+                );
+                ensure!(
+                    w2.len() == expected_w2,
+                    "init w2 size mismatch: got {}, expected {expected_w2} (vocab={vocab_size}, rank={rank})",
+                    w2.len()
+                );
+                (rank, w1, w2)
+            }
+            None => {
+                let rank = self.config.markov_rank;
+                let scale = 0.02;
+                let w1: Vec<f32> = (0..vocab_size * rank)
+                    .map(|i| {
+                        let s = (i % 1000) as f32;
+                        scale * (s * 0.1).sin()
+                    })
+                    .collect();
+                let w2: Vec<f32> = (0..rank * vocab_size)
+                    .map(|i| {
+                        let s = (i % 1000) as f32;
+                        scale * (s * 0.1).cos()
+                    })
+                    .collect();
+                (rank, w1, w2)
+            }
+        };
 
-        let w1_data: Vec<f32> = (0..vocab_size * rank)
-            .map(|i| {
-                let s = (i % 1000) as f32;
-                0.02 * (s * 0.1).sin()
-            })
-            .collect();
         let w1 = self
             .store
             .alloc(Tensor::new(w1_data, vec![vocab_size, rank], true)?);
-
-        let w2_data: Vec<f32> = (0..rank * vocab_size)
-            .map(|i| {
-                let s = (i % 1000) as f32;
-                0.02 * (s * 0.1).cos()
-            })
-            .collect();
         let w2 = self
             .store
             .alloc(Tensor::new(w2_data, vec![rank, vocab_size], true)?);
 
         self.params = Some(MarkovParams { w1, w2 });
         Ok(())
-    }
-
-    /// Get a handle to the running flag (for stopping the trainer).
-    pub fn running_handle(&self) -> Arc<AtomicBool> {
-        self.running.clone()
     }
 
     /// Run one training step on a batch of experiences.
@@ -167,6 +214,10 @@ impl DsparkTrainer {
             self.init_params(vocab_size)?;
         }
         let params = self.params.as_ref().unwrap();
+
+        // Snapshot live tensors before the forward pass so we can free every
+        // intermediate created during this step in one call (no manual ID list).
+        let live_before: HashSet<TensorId> = self.store.live_ids().into_iter().collect();
 
         let mut all_logits = Vec::with_capacity(batch * block_size * vocab_size);
         let mut all_target_logits = Vec::with_capacity(batch * block_size * vocab_size);
@@ -256,11 +307,9 @@ impl DsparkTrainer {
         // for L1/TV — same gradient direction, no abs() op needed.
         let draft_probs_id = ops::softmax(corrected_id, &mut self.store, &mut self.tape)?;
         let target_probs_id = ops::softmax(target_logits_id, &mut self.store, &mut self.tape)?;
-        // diff = draft - target; negate target on host then add.
-        let neg_target_probs: Vec<f32> = all_target_logits.iter().map(|&x| -x).collect();
-        let neg_target_id = self
-            .store
-            .from_slice(&neg_target_probs, &[batch * block_size, vocab_size])?;
+        // diff = softmax(draft) - softmax(target), computed in-graph.
+        let neg_target_id =
+            ops::mul_scalar(target_probs_id, -1.0, &mut self.store, &mut self.tape)?;
         let diff_id = ops::add(
             draft_probs_id,
             neg_target_id,
@@ -296,9 +345,12 @@ impl DsparkTrainer {
         let loss_id = ops::add(pg_scaled_id, l1_scaled_id, &mut self.store, &mut self.tape)?;
 
         self.tape.backward(loss_id, &mut self.store)?;
-        self.optim.step(&[params.w1, params.w2], &mut self.store);
-        self.optim
-            .zero_grad(&[params.w1, params.w2], &mut self.store);
+        let (w1_id, w2_id) = (params.w1, params.w2);
+        if let Some(max_norm) = self.config.max_grad_norm {
+            crate::grad_clip::clip_grad_norm(&[w1_id, w2_id], max_norm, &mut self.store);
+        }
+        self.optim.step(&[w1_id, w2_id], &mut self.store);
+        self.optim.zero_grad(&[w1_id, w2_id], &mut self.store);
 
         let loss_val = self.store.to_host(loss_id).unwrap_or_default();
         let loss = if loss_val.is_empty() {
@@ -307,33 +359,11 @@ impl DsparkTrainer {
             loss_val[0]
         };
 
-        for id in [
-            logits_id,
-            target_logits_id,
-            emb_id,
-            emb_flat_id,
-            bias_id,
-            corrected_id,
-            log_probs_id,
-            token_lp_id,
-            adv_id,
-            pg_weighted_id,
-            pg_neg_id,
-            pg_loss_id,
-            draft_probs_id,
-            target_probs_id,
-            neg_target_id,
-            diff_id,
-            sq_diff_id,
-            exp_weight_id,
-            weighted_sq_id,
-            l1_loss_id,
-            pg_scaled_id,
-            l1_scaled_id,
-            loss_id,
-        ] {
-            let _ = self.store.free(id);
-        }
+        // Free every intermediate tensor created during this step (params w1/w2
+        // are in `live_before`, so they survive). Replaces a 22-item manual ID
+        // list that leaked whenever an op was added without updating it.
+        let keep: HashSet<TensorId> = HashSet::new();
+        let _ = self.store.free_new_except(&live_before, &keep);
         self.tape = Tape::new();
 
         Ok(loss)
@@ -438,9 +468,15 @@ impl Drop for DsparkTrainSidecarGuard {
 
 /// Spawn the DSpark train sidecar thread.
 ///
-/// Drains the global experience buffer populated by the CUDA inference hot
-/// path, runs acceptance-weighted updates on the Markov head, and pushes updated weights
-/// back into the running engine via [`LoadedInferenceEngine::update_dspark_markov_weights`].
+/// Drains the experience buffer populated by the CUDA inference hot path, runs
+/// acceptance-weighted updates on the Markov head, and pushes updated weights
+/// back into the running engine via
+/// [`LoadedInferenceEngine::update_dspark_markov_weights`].
+///
+/// The sidecar reads the engine's loaded checkpoint weights (a blocking D2H
+/// copy + stream sync) *inside* the spawned thread — it must not block serve
+/// startup. The trainer is constructed there with those weights, so there is a
+/// single init path and no partially-initialized trainer state.
 ///
 /// Returns a guard that stops the thread on drop. No-ops (returns `None`) on
 /// non-CUDA backends or when the experience buffer is unavailable.
@@ -452,23 +488,42 @@ pub fn spawn_dspark_train_sidecar(
     let Some(buf) = engine.dspark_experience_buffer() else {
         return Ok(None);
     };
-    let source = InferCudaExperienceSource::new(buf);
-    let mut trainer = DsparkTrainer::new(config)?;
-    let running = trainer.running_handle();
+    // Create the stop flag on the serve thread so the guard can hold it before
+    // the (potentially slow) trainer construction runs in the spawned thread.
+    let running = Arc::new(AtomicBool::new(false));
+    let running_for_guard = Arc::clone(&running);
 
-    let engine_for_thread = Arc::clone(&engine);
     let join = std::thread::Builder::new()
         .name("dspark-train-sidecar".to_string())
         .spawn(move || {
-            trainer.run_loop(&source, move |w1, w2| {
-                if let Err(e) = engine_for_thread.update_dspark_markov_weights(&w1, &w2) {
+            // Read checkpoint weights here (blocking D2H + sync), not on the
+            // serve thread. Best-effort: fall back to random init on failure.
+            let init_weights = match engine.get_dspark_markov_weights() {
+                Ok(w) => Some(w),
+                Err(e) => {
+                    eprintln!(
+                        "dspark_train: could not seed from checkpoint weights ({e}); using random init"
+                    );
+                    None
+                }
+            };
+            let mut trainer = match DsparkTrainer::new(config, init_weights, running) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("dspark_train: failed to construct trainer: {e}");
+                    return;
+                }
+            };
+            let source = InferCudaExperienceSource::new(buf);
+            trainer.run_loop(&source, |w1, w2| {
+                if let Err(e) = engine.update_dspark_markov_weights(&w1, &w2) {
                     eprintln!("dspark_train: weight update failed: {e}");
                 }
             });
         })?;
 
     Ok(Some(DsparkTrainSidecarGuard {
-        running,
+        running: running_for_guard,
         join: Some(join),
     }))
 }
