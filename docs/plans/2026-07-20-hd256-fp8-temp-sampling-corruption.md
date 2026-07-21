@@ -5,7 +5,8 @@
 > OFFSET→STANDARD, collapsing 27B attention at length. Binary bisect (clean
 > adjacent flip) → fix restores `(1+w)` at 5 hd256-only sites → pod-verified base
 > greedy agentic rollout emits tool calls, 7 turns, reward 1.0. A SEPARATE temp>0
-> sampling defect survives (#59). Full record in the errors + wins entries.
+> sampling defect (#167 Type-B) was the same commit's `qwen35.rs` `w-1` load,
+> fixed `d703b5240`. Full record in the errors + wins entries.
 
 ## Verdict
 
@@ -21,10 +22,11 @@ ThinkingCap-weights/temperature/prompt-render/sampler); #48's day-one relay
 
 ## Follow-ups
 
-- **#59 (open):** temp>0 sampling salad survives the hd256 fix — greedy coherent,
-  temp=1.0 scrambled/deterministic. Suspect `a41827b75`'s sampled-path rewrite.
-  Blocks grpo/on-policy behavior-logprobs; rejection-ce runs at greedy.
-- **OPD P4:** unblocked at greedy — run rejection-ce baseline now; grpo after #59.
+- **#167 Type-B (fixed `d703b5240`):** the same commit's `qwen35.rs` `w-1` final-
+  norm load — sign-corrupts the STANDARD final-norm's negative channels → temp=1.0
+  sampled-tail garbage (greedy survived, hid behind the greedy gate). Revert to
+  `load_vec`. temp=1.0 grpo unblocked.
+- **OPD P4:** unblocked — rejection-ce (greedy) AND grpo (temp=1.0) both runnable.
 - ThinkingCap-FP8 re-evaluate fairly (it was never the problem).
 
 ## Links
@@ -34,4 +36,4 @@ ThinkingCap-weights/temperature/prompt-render/sampler); #48's day-one relay
 - Wins (acceptance A/B):
   [wins/2026-07-20-hd256-qk-rmsnorm-offset-restore.md](../experience/wins/2026-07-20-hd256-qk-rmsnorm-offset-restore.md).
 - Fix: `e4d5580ca`. Regressor: `b4b293f0c`. Bisect GOOD parent: `67e15b0a6`.
-  Relay/root: #48. Temp>0 follow-up: #59.
+  Relay/root: #48. Temp>0 follow-up: #167 (fixed `d703b5240`).

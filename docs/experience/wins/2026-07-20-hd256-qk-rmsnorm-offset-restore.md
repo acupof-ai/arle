@@ -40,6 +40,7 @@ is one build vs a multi-probe forensic tower. See
 
 ## Follow-up
 
-A separate temp>0 sampling defect survives this fix (#59): greedy coherent,
-temp=1.0 scrambled — suspect `a41827b75`'s sampled-path rewrite, not the RMSNorm.
-Blocks grpo/on-policy; rejection-ce runs at greedy.
+A separate temp>0 sampling defect (#167 Type-B) was ALSO in `b4b293f0c` — its
+`qwen35.rs` `w-1` final-norm load, sign-corrupting the STANDARD final-norm's
+negative channels → temp=1.0 sampled-tail garbage (greedy survived). Fixed
+`d703b5240` (revert to `load_vec`). temp=1.0 grpo unblocked.

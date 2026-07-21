@@ -77,7 +77,7 @@ Qwen3.6-27B-FP8, greedy agentic rollout → proper `<tool_call>` Glob/Grep, 7 tu
 located + fixed the real `lexer.py is_keyword` bug, hidden tests pass, reward 1.0.
 Matches the GOOD bisect parent. **Agentic-OPD unblocked at greedy.**
 
-## Type-B — a SEPARATE temp>0 defect (#59): ROOT-CAUSED + FIXED
+## Type-B — a SEPARATE temp>0 defect (#167): ROOT-CAUSED + FIXED
 
 `b4b293f0c` carried **two** wrong changes; `e4d5580ca` reverted only the kernel
 one. The Rust half survived at HEAD and is a distinct temp>0 corruption:
@@ -129,6 +129,12 @@ unblocked** — no more temp≤0.7 interim.
   deterministic symptom.** CPU forensics (scales/values/config/prompt) can only
   find a smoking gun; they never *clear* a hypothesis. One same-prompt greedy A/B
   across the commit window localized in 3 builds what 8 static probes could not.
+- **One commit can carry two bugs; a partial revert leaves the quiet one.**
+  `b4b293f0c` touched both a `.cu` kernel (Type-A, loud — killed greedy) and a
+  `.rs` loader (Type-B, quiet — greedy survived, only temp>0 broke). `e4d5580ca`
+  reverted only the `.cu` and shipped; Type-B rode to HEAD. When reverting a
+  named regressor, diff its **full** change surface, not just the file matching
+  the loudest symptom — `git show <sha> --stat` before a targeted revert.
 - **A "fix" is a suspect.** b4b293f0c and `9851ced6b` were both *fixes* that
   regressed; `b4b293f0c` even had a passing smoke. Length-dependent damage escapes
   a short-prompt gate — gate kernel-numerics changes on the SLO shape (long
