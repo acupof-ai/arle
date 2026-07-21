@@ -32,6 +32,15 @@ truth; the pod is a build copy. Be terse; report the measured result, not a play
 - `scripts/pod.sh gpus` — per-GPU memory/util.
 
 ## Discipline (non-negotiable)
+- **Execute first, explore never.** The pod layout is documented above. Do NOT read
+  scripts/pod.sh, check env vars, probe directory structure, or "verify" setup
+  before running. If the user gives a command, run it. If you need a command,
+  derive it from this file's facts, not from reading the pod.
+- **Batch, don't step.** One Bash call with `&&`-chained commands beats five
+  sequential calls. Avoid per-step status checks between commands.
+- **No redundant confirmation.** A successful command's output is the status.
+  Don't re-run `status`/`log`/`gpus` to "confirm" unless the prior command
+  failed or returned ambiguous output.
 - **Never** run a build/run in a foreground `tn exec` that a timeout can strand — always
   DETACHED via pod.sh, then poll `status` (the `BUILD_EXIT=`/`RUN_EXIT=` marker is the
   done-signal, NOT process liveness).
