@@ -1841,7 +1841,7 @@ fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
         Some(
             load_qwen35_lora_from_hf_dir_with_shared_base(
                 student_dir,
-                lora.clone(),
+                lora,
                 target_set,
                 args.lora_layer_start,
                 false,
@@ -2043,18 +2043,18 @@ fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
         None => Vec::new(),
     };
     let eval_dir = args.eval_out_dir.clone();
-    if let Some(dir) = eval_dir.as_deref() {
-        if !eval_items.is_empty() {
-            fs::create_dir_all(dir)
-                .with_context(|| format!("create eval out dir {}", dir.display()))?;
-            rubric_eval_pass(
-                &infer_student,
-                &eval_items,
-                &tokenizer,
-                args.eval_max_new_tokens,
-                &dir.join("eval_round_base.jsonl"),
-            )?;
-        }
+    if let Some(dir) = eval_dir.as_deref()
+        && !eval_items.is_empty()
+    {
+        fs::create_dir_all(dir)
+            .with_context(|| format!("create eval out dir {}", dir.display()))?;
+        rubric_eval_pass(
+            &infer_student,
+            &eval_items,
+            &tokenizer,
+            args.eval_max_new_tokens,
+            &dir.join("eval_round_base.jsonl"),
+        )?;
     }
 
     for round in 0..args.rounds {
@@ -2117,35 +2117,34 @@ fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
             .context("sync trained LoRA into rollout engine")?;
 
         // Eval this round's student in-process (rollout engine now holds round-N LoRA).
-        if let Some(dir) = eval_dir.as_deref() {
-            if !eval_items.is_empty() {
-                rubric_eval_pass(
-                    &infer_student,
-                    &eval_items,
-                    &tokenizer,
-                    args.eval_max_new_tokens,
-                    &dir.join(format!("eval_round{round}.jsonl")),
-                )?;
-            }
+        if let Some(dir) = eval_dir.as_deref()
+            && !eval_items.is_empty()
+        {
+            rubric_eval_pass(
+                &infer_student,
+                &eval_items,
+                &tokenizer,
+                args.eval_max_new_tokens,
+                &dir.join(format!("eval_round{round}.jsonl")),
+            )?;
         }
 
         // Fast adapter-only (LoRA) save — avoids the full-materialize host-loop hang.
-        if let Some(adapter_dir) = args.save_lora_adapters.as_deref() {
-            if should_save_step_checkpoint(round + 1, args.rounds, args.save_every) {
-                fs::create_dir_all(adapter_dir).with_context(|| {
-                    format!("create LoRA adapter dir {}", adapter_dir.display())
-                })?;
-                let out = adapter_dir.join(format!("adapters_round{}.safetensors", round + 1));
-                let started = Instant::now();
-                save_lora_adapters(&mut store, &student.adapter_name_map(), &out)
-                    .with_context(|| format!("save LoRA adapters at round {}", round + 1))?;
-                println!(
-                    "checkpoint_saved kind=lora_adapters mode=rubric-opd step={} dir={} seconds={:.6}",
-                    round + 1,
-                    out.display(),
-                    started.elapsed().as_secs_f64()
-                );
-            }
+        if let Some(adapter_dir) = args.save_lora_adapters.as_deref()
+            && should_save_step_checkpoint(round + 1, args.rounds, args.save_every)
+        {
+            fs::create_dir_all(adapter_dir)
+                .with_context(|| format!("create LoRA adapter dir {}", adapter_dir.display()))?;
+            let out = adapter_dir.join(format!("adapters_round{}.safetensors", round + 1));
+            let started = Instant::now();
+            save_lora_adapters(&mut store, &student.adapter_name_map(), &out)
+                .with_context(|| format!("save LoRA adapters at round {}", round + 1))?;
+            println!(
+                "checkpoint_saved kind=lora_adapters mode=rubric-opd step={} dir={} seconds={:.6}",
+                round + 1,
+                out.display(),
+                started.elapsed().as_secs_f64()
+            );
         }
 
         let mut ckpt_tape = Tape::new();
@@ -3289,7 +3288,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
         );
     }
     let mut replay =
-        (args.replay_reuse > 0).then(|| (ReplayBuffer::default(), PromptSampler::new(0x5EED_1A7)));
+        (args.replay_reuse > 0).then(|| (ReplayBuffer::default(), PromptSampler::new(0x05EE_D1A7)));
     // P7: LoRA-merge counter. A group is tagged with the version its rollouts
     // LAUNCHED under (behavior_version) and trains at the current version;
     // staleness = current − behavior (0 today; 1 for overlapped groups).
@@ -3734,20 +3733,20 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
         // Fast adapter-only (LoRA) save as a mainstream HF PEFT adapter dir
         // (adapter_config.json + adapter_model.safetensors) — loadable by HF PEFT
         // / vLLM / SGLang. Avoids the full-materialize host-loop hang.
-        if let Some(adapter_dir) = args.save_lora_adapters.as_deref() {
-            if should_save_step_checkpoint(round + 1, args.rounds, args.save_every) {
-                train::aopd_profile::time_try("save_adapters", train::aopd_profile::DISK, || {
-                    save_agent_opd_adapters(
-                        adapter_dir,
-                        &format!("adapters_round{}", round + 1),
-                        round + 1,
-                        student_dir,
-                        &student,
-                        &mut store,
-                        &lora_adapter_config,
-                    )
-                })?;
-            }
+        if let Some(adapter_dir) = args.save_lora_adapters.as_deref()
+            && should_save_step_checkpoint(round + 1, args.rounds, args.save_every)
+        {
+            train::aopd_profile::time_try("save_adapters", train::aopd_profile::DISK, || {
+                save_agent_opd_adapters(
+                    adapter_dir,
+                    &format!("adapters_round{}", round + 1),
+                    round + 1,
+                    student_dir,
+                    &student,
+                    &mut store,
+                    &lora_adapter_config,
+                )
+            })?;
         }
 
         let save_started = Instant::now();

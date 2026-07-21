@@ -9,12 +9,12 @@
 
 use std::{env, process::ExitCode};
 
+#[cfg(feature = "cuda")]
+use infer_api::LoadedInferenceEngine;
 use infer_api::{
     DEFAULT_MTP_DRAFT_TOKENS, DEFAULT_MTP_DRAFT_TOPK, EngineLoadConfig, KvCacheDtype,
     ServeHttpOptions, ServeSpecOptions, ServeSpecType, serve_http,
 };
-#[cfg(feature = "cuda")]
-use infer_api::{LoadedInferenceEngine, ServeShutdown, bind_and_serve};
 
 use crate::{
     args::{Args, ServeArgs, ServeBackendArg, ServeKvCacheDtypeArg, ServeSpecTypeArg},
@@ -174,80 +174,47 @@ fn run_config(config: ServeConfig) -> ExitCode {
         config.options.port,
     );
 
-    // DSpark train sidecar: load the engine once, spawn the acceptance-weighted trainer
-    // thread, then serve over the same engine's local router. The trainer
-    // drains the experience buffer the hot path populates and pushes updated
-    // Markov-head weights back into the running engine after each step.
+    // DSpark train sidecar: when `--dspark-train` is set alongside
+    // `--spec-type dspark`, spawn the acceptance-weighted trainer thread after
+    // the engine loads. The trainer drains the experience buffer the hot path
+    // populates and pushes updated Markov-head weights back into the running
+    // engine after each step. The guard is held for the serve lifetime so the
+    // thread stops on shutdown.
     #[cfg(feature = "cuda")]
-    if config.options.spec.spec_type == ServeSpecType::Dspark {
-        return run_dspark_serve(config);
-    }
-
-    match serve_http(config.options) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(err) => {
-            eprintln!("[ARLE serve] error: {err:#}");
-            ExitCode::FAILURE
+    let dspark_guard = std::sync::Arc::new(std::sync::Mutex::new(None));
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::type_complexity)]
+    let on_engine_loaded: Option<
+        Box<dyn Fn(&std::sync::Arc<LoadedInferenceEngine>) -> anyhow::Result<()> + Send + Sync>,
+    > = if config.options.spec.dspark_train {
+        if config.options.spec.spec_type != ServeSpecType::Dspark {
+            eprintln!("[ARLE serve] warning: --dspark-train requires --spec-type dspark; ignoring");
+            None
+        } else {
+            let dspark_guard = std::sync::Arc::clone(&dspark_guard);
+            Some(Box::new(move |engine| {
+                let guard = train::dspark_train::spawn_dspark_train_sidecar(
+                    std::sync::Arc::clone(engine),
+                    train::dspark_train::DsparkTrainConfig::default(),
+                )?;
+                let Some(guard) = guard else {
+                    anyhow::bail!(
+                        "DSpark train sidecar not started (no experience buffer); \
+                         --spec-type dspark requires a CUDA DSpark-capable engine"
+                    );
+                };
+                eprintln!("[ARLE serve] DSpark train sidecar started");
+                *dspark_guard.lock().unwrap() = Some(guard);
+                Ok(())
+            }))
         }
-    }
-}
-
-/// DSpark serve path: load the engine, spawn the train sidecar, and serve
-/// over the engine's local router so the trainer can push weight updates back
-/// into the same running engine.
-#[cfg(feature = "cuda")]
-fn run_dspark_serve(config: ServeConfig) -> ExitCode {
-    use std::sync::Arc;
-
-    let opts = config.options;
-    let max_thinking_tokens = opts.engine_config.max_thinking_tokens;
-    let engine = match LoadedInferenceEngine::load_with_config(
-        &opts.model_path,
-        opts.enable_cuda_graph,
-        opts.engine_config,
-    ) {
-        Ok(e) => Arc::new(e),
-        Err(err) => {
-            eprintln!("[ARLE serve] failed to load engine for DSpark train: {err:#}");
-            return ExitCode::FAILURE;
-        }
+    } else {
+        None
     };
+    #[cfg(not(feature = "cuda"))]
+    let on_engine_loaded = None;
 
-    let _guard = match train::dspark_train::spawn_dspark_train_sidecar(
-        Arc::clone(&engine),
-        train::dspark_train::DsparkTrainConfig::default(),
-    ) {
-        Ok(Some(guard)) => {
-            eprintln!("[ARLE serve] DSpark train sidecar started");
-            guard
-        }
-        Ok(None) => {
-            eprintln!(
-                "[ARLE serve] warning: DSpark train sidecar not started (no experience buffer)"
-            );
-            return ExitCode::FAILURE;
-        }
-        Err(err) => {
-            eprintln!("[ARLE serve] failed to start DSpark train sidecar: {err:#}");
-            return ExitCode::FAILURE;
-        }
-    };
-
-    let router = match engine.local_router(max_thinking_tokens) {
-        Ok(r) => r,
-        Err(err) => {
-            eprintln!("[ARLE serve] failed to build local router: {err:#}");
-            return ExitCode::FAILURE;
-        }
-    };
-
-    match bind_and_serve(
-        &opts.bind,
-        opts.port,
-        router,
-        &opts.model_path,
-        ServeShutdown::new(),
-    ) {
+    match serve_http(config.options, on_engine_loaded) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("[ARLE serve] error: {err:#}");
@@ -428,6 +395,7 @@ fn resolve_spec_options(backend: ServeBackend, serve_args: &ServeArgs) -> ServeS
         dspark_conf_threshold: serve_args.dspark_conf_threshold,
         mtp_draft_tokens: serve_args.mtp_draft_tokens,
         mtp_draft_topk: serve_args.mtp_draft_topk,
+        dspark_train: serve_args.dspark_train,
     }
 }
 

@@ -481,7 +481,7 @@ impl Dsv4CudaExecutor {
         // attention currently runs once per slot chunk, not once per row). The
         // verify persists per-slot spec_normed for the commit fold.
         let chain_tokens: Vec<Vec<u32>> = chains.iter().map(DraftChain::tokens).collect();
-        let verified = self.model.forward_decode_batch_verify(
+        let (verified, _verify_logits) = self.model.forward_decode_batch_verify(
             &mut self.slots,
             &mut self.kv_adapter,
             slot_ids,

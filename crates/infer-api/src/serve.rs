@@ -16,10 +16,11 @@
 //! compiled in, [`serve_http`] returns a clear error (mirrors `--doctor`).
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
-use crate::loaded::EngineLoadConfig;
+use crate::loaded::{EngineLoadConfig, LoadedInferenceEngine};
 
 /// Options for the in-process [`serve_http`] entry.
 ///
@@ -171,6 +172,8 @@ pub struct ServeSpecOptions {
     pub dspark_conf_threshold: f32,
     pub mtp_draft_tokens: Option<usize>,
     pub mtp_draft_topk: Option<usize>,
+    /// Spawn the DSpark train sidecar alongside `--spec-type dspark` serving.
+    pub dspark_train: bool,
 }
 
 pub const DEFAULT_MTP_DRAFT_TOKENS: usize = 2;
@@ -202,7 +205,11 @@ impl ServeSpecOptions {
     feature = "vulkan",
     feature = "cpu"
 ))]
-pub fn serve_http(opts: ServeHttpOptions) -> Result<()> {
+#[allow(clippy::type_complexity)]
+pub fn serve_http(
+    opts: ServeHttpOptions,
+    on_engine_loaded: Option<Box<dyn Fn(&Arc<LoadedInferenceEngine>) -> Result<()> + Send + Sync>>,
+) -> Result<()> {
     validate_kv_ssd_config(&opts.engine_config)?;
 
     // Lower the requested spec surface into the engine config. The blanket
@@ -248,13 +255,17 @@ pub fn serve_http(opts: ServeHttpOptions) -> Result<()> {
     }
 
     let shutdown = infer_server::ServeShutdown::new();
-    let router = crate::loaded::router_for_backend(
+    let (router, engine) = crate::loaded::router_for_backend(
         &opts.model_path,
         opts.enable_cuda_graph,
         engine_config,
         shutdown.clone(),
     )
     .with_context(|| format!("failed to build serve router for {}", opts.model_path))?;
+
+    if let (Some(engine), Some(hook)) = (engine.as_ref(), on_engine_loaded.as_ref()) {
+        hook(engine)?;
+    }
 
     bind_and_serve(
         opts.bind.as_str(),
@@ -411,7 +422,10 @@ pub fn serve_router_on_thread(router: axum::Router, bind: &str, port: u16) -> Re
     feature = "vulkan",
     feature = "cpu"
 )))]
-pub fn serve_http(opts: ServeHttpOptions) -> Result<()> {
+pub fn serve_http(
+    opts: ServeHttpOptions,
+    _on_engine_loaded: Option<Box<dyn Fn(&Arc<LoadedInferenceEngine>) -> Result<()> + Send + Sync>>,
+) -> Result<()> {
     validate_kv_ssd_config(&opts.engine_config)?;
     anyhow::bail!(
         "serve requires a backend build; rebuild with cuda, metal/no-cuda, vulkan/no-cuda, or cpu/no-cuda"

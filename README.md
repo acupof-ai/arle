@@ -59,6 +59,12 @@ arle serve --backend cuda --model-path /path/to/Qwen3.5-4B --port 8000
 
 # Apple Silicon (Metal)
 arle serve --backend metal --model-path mlx-community/Qwen3.6-35B-A3B-4bit --port 8000
+
+# DSpark block-drafter decode + in-process Markov-head training (CUDA)
+arle serve --backend cuda \
+  --model-path /path/to/Qwen3.6-27B \
+  --spec-type dspark --mtp-draft-model /path/to/dspark-draft \
+  --dspark-train --port 8000
 ```
 
 ### Use
@@ -83,7 +89,7 @@ print(client.chat.completions.create(
 |---|---|
 | `arle` | Interactive REPL + local agent (Eli-compatible). |
 | `arle run --prompt "…"` | One-shot agent execution. `--no-tools` to disable tools. |
-| `arle serve --backend …` | OpenAI-compatible HTTP server. |
+| `arle serve --backend …` | OpenAI-compatible HTTP server. `--spec-type dspark --dspark-train` enables DSpark block-drafter decode + in-process Markov-head training. |
 | `arle train opd` | **On-Policy Distillation** — teacher runs on the serving runtime. |
 | `arle --doctor` | Backend / hardware / model self-check. |
 
@@ -145,6 +151,8 @@ Agent and RL workloads re-process the same prompt + history + tool output every 
 **KV-recall for long context (Metal).** Past the sliding window, decode attends only `sink + recent + top-k recalled` older blocks — 9.6% of KV, identical quality to full attention. Behind `--kv-recall`.
 
 **One runtime, three surfaces.** Serving, the local agent, and OPD training run the same Rust + model code. The OPD teacher *is* the production server.
+
+**DSpark trains while serving.** `--spec-type dspark --dspark-train` runs the DSpark block-drafter for faster decode *and* trains its Markov head in-process: the hot path captures (draft, target, accepted) tuples, a background thread runs acceptance-weighted policy gradient, and updated weights hot-swap back into the running engine — no restart, no separate training job.
 
 ---
 
