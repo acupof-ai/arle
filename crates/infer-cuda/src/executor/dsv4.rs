@@ -1957,21 +1957,18 @@ impl Dsv4CudaExecutor {
         // ── Phase 3: batched verify over all chains (the amortized phase).
         // If every slot hit the sequence-cap fallback, there are no chains to
         // verify — return the fallback tokens directly.
-        let slot_ids: Vec<usize> = (0..n)
-            .filter(|&i| fallback_tokens[i].is_none())
-            .map(|i| rows[i].slot)
-            .collect();
+        let (mut slot_ids, mut chains, mut starts) = (Vec::new(), Vec::new(), Vec::new());
+        for i in 0..n {
+            if fallback_tokens[i].is_some() {
+                continue;
+            }
+            slot_ids.push(rows[i].slot);
+            chains.push(proposals[i].as_ref().unwrap().chain.clone());
+            starts.push(verify_positions[i]);
+        }
         if slot_ids.is_empty() {
             return Ok(fallback_tokens.into_iter().map(|t| t.unwrap()).collect());
         }
-        let chains: Vec<Vec<u32>> = (0..n)
-            .filter(|&i| fallback_tokens[i].is_none())
-            .map(|i| proposals[i].as_ref().unwrap().chain.clone())
-            .collect();
-        let starts: Vec<usize> = (0..n)
-            .filter(|&i| fallback_tokens[i].is_none())
-            .map(|i| verify_positions[i])
-            .collect();
         let scheds: Vec<crate::dsv4::SpecVerifySchedule> = chains
             .iter()
             .zip(&starts)
@@ -2008,7 +2005,7 @@ impl Dsv4CudaExecutor {
 
         // ── Phase 4: per-slot accept + rollback + commit (proven fold path).
         let mut out: Vec<Vec<u32>> = vec![Vec::new(); n];
-        let mut vi = 0; // index into `verified` (skips fallback slots)
+        let mut verified_iter = verified.into_iter();
         for i in 0..n {
             if let Some(toks) = &fallback_tokens[i] {
                 out[i] = toks.clone();
@@ -2018,8 +2015,7 @@ impl Dsv4CudaExecutor {
             let verify_pos = verify_positions[i];
             let proposal = proposals[i].as_ref().unwrap();
             let draft_len = proposal.draft_len;
-            let (argmax, _hiddens) = &verified[vi];
-            vi += 1;
+            let (argmax, _hiddens) = verified_iter.next().unwrap();
             ensure!(
                 argmax.len() == proposal.chain.len(),
                 "DSpark batched verify slot {slot_idx} argmax {} != chain {}",
@@ -2091,9 +2087,7 @@ impl Dsv4CudaExecutor {
             self.mtp_rejects += draft_len - accepted;
             self.mtp_chains += 1;
             self.spec_slots[slot_idx] = Dsv4SpecSlotState::default();
-            let mut slot_out = Vec::with_capacity(accepted + 2);
-            slot_out.push(proposal.chain[0]); // anchor
-            slot_out.extend_from_slice(&proposal.chain[1..accepted + 1]);
+            let mut slot_out = proposal.chain[..accepted + 1].to_vec();
             slot_out.push(bonus);
             out[i] = slot_out;
         }
@@ -2187,15 +2181,25 @@ impl Dsv4CudaExecutor {
         // ALL chains in ONE batched target forward (`dspark_decode_tokens_batched`),
         // amortizing the heaviest phase across the batch.
         if self.dspark.is_some() {
-            let tokens = self.dspark_decode_tokens_batched(&batch.rows)?;
-            let mut out = Vec::with_capacity(batch.rows.len());
-            for (row, toks) in batch.rows.iter().zip(tokens) {
-                out.extend(toks.into_iter().map(|token| SlotToken {
-                    slot: row.slot,
-                    token,
-                    logprob: None,
-                    finish: None,
-                }));
+            // The batched verify path requires FlashMLA sparse prefill
+            // (`mla_attention` chain-verify lane); without it, fall back to
+            // per-slot dispatch (the pre-batch behavior — correct but slower).
+            if crate::attention::dsv4_flashmla_prefill_enabled()? {
+                let tokens = self.dspark_decode_tokens_batched(&batch.rows)?;
+                let mut out = Vec::with_capacity(batch.rows.len());
+                for (row, toks) in batch.rows.iter().zip(tokens) {
+                    out.extend(toks.into_iter().map(|token| SlotToken {
+                        slot: row.slot,
+                        token,
+                        logprob: None,
+                        finish: None,
+                    }));
+                }
+                return Ok(out);
+            }
+            let mut out = Vec::new();
+            for row in &batch.rows {
+                out.extend(self.forward_decode_row(row)?);
             }
             return Ok(out);
         }
