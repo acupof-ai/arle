@@ -147,9 +147,31 @@ never reaches `engine.step()`. Static trace (HTTP → `submit_tx` → `lockstep_
 architecturally sound — the lockstep world=1 path (coordinator.rs:396 parks on
 `submit_rx.recv_timeout`, wakes on Submit) has no obvious bug. **Root cause needs a
 live backtrace of the parked engine thread; not yet determined — do not file a
-hypothesis.** Device-neutral (would repro on any GPU running single-GPU MoE serve);
-orthogonal to the Blackwell kernel work. Gates Cut-2 (MoE grouped GEMM bench); Cut-1
-(dense FP8 GEMM) can be developed on a dense model that takes the single-process path.
+hypothesis.** Device-neutral to sm_120 (single-GPU coordinator path, distinct from the
+8×H20 multiproc TP path which works in prod).
+
+**Reframe 2026-07-22 (DP1/DP2, Colab RTX PRO 6000 #2) — the serve hang is now
+CRITICAL-PATH, not orthogonal.** Two source-verified model-support facts collapse the
+earlier "sidestep via a dense model" plan:
+- **DP1 PASS** — dense **bf16** Qwen3-0.6B decodes on sm_120, single-process serve +
+  `bench_throughput.py` both clean: c=1 **315 tok/s output, ITL p50 3.16 ms, 12/12
+  complete**. The sm_120 runtime + serve + canonical bench harness all work for the
+  dense single-process path. (bf16 → the G1 FP8 gate is not exercised, as expected.)
+- **No dense FP8 CUDA vehicle exists.** `Qwen3ForCausalLM` FP8 is REJECTED at load —
+  the `Qwen3Dense` executor is `from_qwen3_bf16_safetensors` (`loaded.rs:2130`),
+  bf16-only. The FP8 dense `gemm_batch`/G1/Cut path is reachable ONLY via the Qwen35
+  executor family, whose fetchable checkpoints are all **MoE**.
+- **Vanilla Qwen3-MoE is also rejected** on CUDA (`Qwen3MoeForCausalLM` →
+  `Qwen3MoeUnsupported`, `loaded.rs:2055`, "use --backend metal"). The only viable CUDA
+  FP8 model is **`Qwen3.6-35B-A3B-FP8`** (`Qwen3_5MoeForConditionalGeneration`, hybrid)
+  or TC-27B — both MoE, both hit the coordinator serve hang.
+- **Consequence:** every fetchable sm_120 FP8 model is MoE, MoE serve hangs, and
+  `bench_throughput.py` needs serve → **benching any Cut-1/Cut-2 FP8 work on sm_120
+  requires either fixing the serve hang OR benching via offline-generate.** The cheapest
+  decisive probe: `arle run` (in-process `LoadedInferenceEngine`, no coordinator) on
+  `Qwen3.6-35B-A3B-FP8` — if it decodes, FP8 MoE kernels are correct on sm_120 and the
+  hang is serve-layer-only; if it hangs too, the bug is engine/kernel-deep. Then a gdb
+  backtrace of the parked serve thread names the break.
 
 ## 5. Colab RTX PRO 6000 build+bench loop (critical-path prerequisite)
 
