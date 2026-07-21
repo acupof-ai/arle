@@ -12,7 +12,7 @@
 # Optional env (full-run defaults; SMOKE=1 = 2-round sizing run):
 #   ARLE_BIN=target/release/arle  OUT_ROOT=runs  GPU=0  MODEL_CACHE=models
 #   STUDENT_MODEL=<dir>           override student (else fetch STUDENT_MODEL_HF_ID)
-#   STUDENT_MODEL_HF_ID=Qwen/Qwen3.6-27B-FP8
+#   STUDENT_MODEL_HF_ID=bottlecapai/ThinkingCap-Qwen3.6-27B-FP8
 #   DSPARK=1                      spec decode on (default; agent-OPD is serial
 #                                 B=1 so dspark ~1.9x applies at any SAMPLES). 0=off.
 #   DSPARK_DRAFT_HF_ID=z-lab/Qwen3.6-27B-DFlash   DSPARK_CONF_THRESHOLD=0.0
@@ -28,7 +28,7 @@ GPU=${GPU:-0}
 # Models: use a local dir if given, else auto-fetch from HF (honors HF_ENDPOINT
 # mirror, e.g. https://hf-mirror.com). STUDENT + DSpark draft both auto-download.
 MODEL_CACHE=${MODEL_CACHE:-models}
-STUDENT_MODEL_HF_ID=${STUDENT_MODEL_HF_ID:-Qwen/Qwen3.6-27B-FP8}
+STUDENT_MODEL_HF_ID=${STUDENT_MODEL_HF_ID:-bottlecapai/ThinkingCap-Qwen3.6-27B-FP8}
 DSPARK_DRAFT_HF_ID=${DSPARK_DRAFT_HF_ID:-z-lab/Qwen3.6-27B-DFlash}
 
 ensure_hf_model() {  # <hf_id> -> echoes local dir, downloads if absent
