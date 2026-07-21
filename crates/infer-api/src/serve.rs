@@ -16,11 +16,26 @@
 //! compiled in, [`serve_http`] returns a clear error (mirrors `--doctor`).
 
 use std::path::PathBuf;
+#[cfg(any(
+    feature = "metal",
+    feature = "cuda",
+    feature = "hip",
+    feature = "vulkan",
+    feature = "cpu"
+))]
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
-use crate::loaded::{EngineLoadConfig, LoadedInferenceEngine};
+use crate::loaded::EngineLoadConfig;
+#[cfg(any(
+    feature = "metal",
+    feature = "cuda",
+    feature = "hip",
+    feature = "vulkan",
+    feature = "cpu"
+))]
+use crate::loaded::LoadedInferenceEngine;
 
 /// Options for the in-process [`serve_http`] entry.
 ///
@@ -422,10 +437,7 @@ pub fn serve_router_on_thread(router: axum::Router, bind: &str, port: u16) -> Re
     feature = "vulkan",
     feature = "cpu"
 )))]
-pub fn serve_http(
-    opts: ServeHttpOptions,
-    _on_engine_loaded: Option<Box<dyn Fn(&Arc<LoadedInferenceEngine>) -> Result<()> + Send + Sync>>,
-) -> Result<()> {
+pub fn serve_http(opts: ServeHttpOptions, _on_engine_loaded: Option<()>) -> Result<()> {
     validate_kv_ssd_config(&opts.engine_config)?;
     anyhow::bail!(
         "serve requires a backend build; rebuild with cuda, metal/no-cuda, vulkan/no-cuda, or cpu/no-cuda"
