@@ -136,42 +136,43 @@ Real-hardware results on NVIDIA RTX PRO 6000 Blackwell (sm_120, 96 GB, CUDA 12.8
   64 layers, per-layer `shared_expert_gate`, MTP, `out_hidden_size`) — corrects §0's
   dense inference.
 
-**BLOCKER — single-GPU MoE serve hang (NOT sm_120-specific).** Decode never produces
-tokens: GPU util 0%, engine process sleeping, 1077/1080 threads in `futex_wait`, ZERO
-in CUDA/driver wait. The serve came up on the **`coordinator_local_router` relay path**
-(MoE takes the multiproc-serve gate, `infer-api/lib.rs:62`
-`cuda_model_takes_multiproc_serve` → Qwen35/Dsv4), spawning **1024 `arle-relay-worker`
-threads** (`infer-server/lib.rs:829` `max_live_requests.clamp(1,1024)`). The request
-never reaches `engine.step()`. Static trace (HTTP → `submit_tx` → `lockstep_loop`
-`TickAdmissions` → relay driver → `submit_streaming` → `engine_loop`) is
-architecturally sound — the lockstep world=1 path (coordinator.rs:396 parks on
-`submit_rx.recv_timeout`, wakes on Submit) has no obvious bug. **Root cause needs a
-live backtrace of the parked engine thread; not yet determined — do not file a
-hypothesis.** Device-neutral to sm_120 (single-GPU coordinator path, distinct from the
-8×H20 multiproc TP path which works in prod).
+**The "serve hang" DISSOLVED — direct measurement falsified it (DP2, 2026-07-22, clean
+main 9dbcb54).** The prior report (GPU 0%, 1077/1080 threads in `futex_wait`, serve on
+`coordinator_local_router` with 1024 `arle-relay-worker` threads) **does NOT reproduce
+on current main.** Single-GPU serve routes through `serve_multiproc.rs:112 world_size
+<= 1 → serving single-process (no workers)` — the engine runs **in-process, bypassing
+the coordinator / `lockstep_loop` / relay-driver chain entirely**; that chain is the
+TP>1 multiproc path, structurally unreachable on 1 GPU. The prior observation came from
+a non-`world=1` code/config state, not main. **The full FP8 sm_120 loop is end-to-end
+healthy on current main** — no blocker gates the peak-perf work.
 
-**Reframe 2026-07-22 (DP1/DP2, Colab RTX PRO 6000 #2) — the serve hang is now
-CRITICAL-PATH, not orthogonal.** Two source-verified model-support facts collapse the
-earlier "sidestep via a dense model" plan:
-- **DP1 PASS** — dense **bf16** Qwen3-0.6B decodes on sm_120, single-process serve +
-  `bench_throughput.py` both clean: c=1 **315 tok/s output, ITL p50 3.16 ms, 12/12
-  complete**. The sm_120 runtime + serve + canonical bench harness all work for the
-  dense single-process path. (bf16 → the G1 FP8 gate is not exercised, as expected.)
-- **No dense FP8 CUDA vehicle exists.** `Qwen3ForCausalLM` FP8 is REJECTED at load —
-  the `Qwen3Dense` executor is `from_qwen3_bf16_safetensors` (`loaded.rs:2130`),
-  bf16-only. The FP8 dense `gemm_batch`/G1/Cut path is reachable ONLY via the Qwen35
-  executor family, whose fetchable checkpoints are all **MoE**.
-- **Vanilla Qwen3-MoE is also rejected** on CUDA (`Qwen3MoeForCausalLM` →
-  `Qwen3MoeUnsupported`, `loaded.rs:2055`, "use --backend metal"). The only viable CUDA
-  FP8 model is **`Qwen3.6-35B-A3B-FP8`** (`Qwen3_5MoeForConditionalGeneration`, hybrid)
-  or TC-27B — both MoE, both hit the coordinator serve hang.
-- **Consequence:** every fetchable sm_120 FP8 model is MoE, MoE serve hangs, and
-  `bench_throughput.py` needs serve → **benching any Cut-1/Cut-2 FP8 work on sm_120
-  requires either fixing the serve hang OR benching via offline-generate.** The cheapest
-  decisive probe: `arle run` (in-process `LoadedInferenceEngine`, no coordinator) on
-  `Qwen3.6-35B-A3B-FP8` — if it decodes, FP8 MoE kernels are correct on sm_120 and the
-  hang is serve-layer-only; if it hangs too, the bug is engine/kernel-deep. Then a gdb
-  backtrace of the parked serve thread names the break.
+**Loop VERIFIED end-to-end (DP1 + DP2, two Colab RTX PRO 6000 sessions):**
+- **DP1** — dense **bf16** Qwen3-0.6B, single-process serve + `bench_throughput.py`
+  clean: c=1 **315 tok/s output, ITL p50 3.16 ms, 12/12 complete**. Runtime + serve +
+  canonical bench harness all work.
+- **DP2a offline** — **`Qwen3.6-35B-A3B-FP8` MoE decodes coherently** on sm_120,
+  **~11 tok/s** (`arle run`, in-process). G1 line confirmed verbatim
+  (`quant_linear.rs:176`). FP8 MoE kernels are **correct** on sm_120.
+- **DP2b serve** — same MoE, `arle serve` healthy: non-stream 0.3 s, streaming 26
+  chunks, chat 26 chunks, **4 concurrent all `finish_reason=length`**, zero stall.
+- **Current FP8 path runs on FALLBACKS = the peak headroom.** Dense FP8 → dequant→BF16
+  (G1). **MoE grouped FP8 → hand-grouped kernels** (DeepGEMM native bridge
+  `CUDA_ERROR_NOT_SUPPORTED`, `loader.rs:1391` — Hopper-only, never sm_120). The 11
+  tok/s offline baseline is on these fallbacks; Cut-1/Cut-2 (dense) + G2 (MoE grouped
+  CUTLASS block-scaled) are exactly what replaces them for peak.
+
+**Model-support facts (source-verified) that pin the vehicle to MoE:**
+- **No dense FP8 CUDA vehicle exists.** `Qwen3ForCausalLM` FP8 is REJECTED at load — the
+  `Qwen3Dense` executor is `from_qwen3_bf16_safetensors` (`loaded.rs:2130`), bf16-only.
+  The FP8 dense `gemm_batch`/G1/Cut path is reachable ONLY via the Qwen35 family.
+- **Vanilla Qwen3-MoE also rejected** (`Qwen3MoeForCausalLM` → `Qwen3MoeUnsupported`,
+  `loaded.rs:2055`). The peak-work vehicle is **`Qwen3.6-35B-A3B-FP8`** (or TC-27B) —
+  MoE, and (now proven) it serves + benches fine on a single GPU.
+
+**Next: baseline bench then peak kernels.** Run the canonical `bench_throughput.py`
+1/4/8/16 grid on `Qwen3.6-35B-A3B-FP8` (the champion row Cut-1/Cut-2/G2 must beat), then
+implement per §6. Warm Colab VM `moehang` (binary + model on disk) can serve the
+baseline before it idle-reclaims.
 
 ## 5. Colab RTX PRO 6000 build+bench loop (critical-path prerequisite)
 
