@@ -117,26 +117,15 @@ using StrideB = typename Gemm::GemmKernel::InternalStrideB;
 using StrideC = typename Gemm::GemmKernel::InternalStrideC;
 using StrideD = typename Gemm::GemmKernel::InternalStrideD;
 
-template <class> struct RevealStride;
-RevealStride<StrideA> reveal_stride_a_;
-RevealStride<StrideB> reveal_stride_b_;
-
-// Compact rank-3 strides without the tools/util header (vendored cutlass is
-// include-only). Grouped ⇒ per-group ptr, L=1, batch mode = 0: only the leading
-// dynamic mode is set; the default-constructed stride zeroes the rest (or keeps a
-// static _0). Robust to whatever the collective's InternalStride batch mode is.
-//   RowMajor    -> unit stride at mode 1; set mode 0 (leading dim)
-//   ColumnMajor -> unit stride at mode 0; set mode 1 (leading dim)
+// Compact rank-3 stride without the tools/util header (vendored cutlass is
+// include-only). All four operand InternalStrides are `Stride<int64_t, _1, _0>`
+// (revealed on sm_120a): K/N contiguous at mode 1, static-0 batch (grouped ⇒
+// per-group ptr, L=1). Only the leading (mode-0) stride is dynamic. B is the NT
+// [N,K] weight in row-major stride terms (leading=K), matching the checkpoint.
 template <class M0, class M2>
 CUTLASS_HOST_DEVICE cute::Stride<M0, cute::Int<1>, M2> arle_row_stride(
     cute::Stride<M0, cute::Int<1>, M2> s, int leading) {
   cute::get<0>(s) = static_cast<M0>(leading);
-  return s;
-}
-template <class M1, class M2>
-CUTLASS_HOST_DEVICE cute::Stride<cute::Int<1>, M1, M2> arle_col_stride(
-    cute::Stride<cute::Int<1>, M1, M2> s, int leading) {
-  cute::get<1>(s) = static_cast<M1>(leading);
   return s;
 }
 
@@ -291,10 +280,10 @@ extern "C" CUresult arle_fp8_moe_grouped_gemm_nt_sm120(
     pSFA[g] = sfa + row;
     pSFB[g] = sfb + static_cast<int64_t>(g) * n_blocks * k_blocks;
 
-    sA[g] = arle_row_stride(StrideA{}, k);  // RowMajor [Mg,K], leading = K
-    sB[g] = arle_col_stride(StrideB{}, n);  // ColumnMajor [N,K], leading = N
-    sC[g] = arle_row_stride(StrideC{}, n);  // RowMajor [Mg,N], leading = N
-    sD[g] = arle_row_stride(StrideD{}, n);
+    sA[g] = arle_row_stride(StrideA{}, k);  // A [Mg,K], leading = K
+    sB[g] = arle_row_stride(StrideB{}, k);  // B [N,K] (NT), leading = K
+    sC[g] = arle_row_stride(StrideC{}, n);  // C [Mg,N], leading = N
+    sD[g] = arle_row_stride(StrideD{}, n);  // D [Mg,N], leading = N
 
     // LayoutSFA — DeepGEMM packing: K-block stride = scale_stride_m (NOT Mg),
     // per-token (1) stride = 1. Matches `k_block*scale_stride_m + m`.
