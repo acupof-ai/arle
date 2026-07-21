@@ -1,0 +1,21 @@
+.claude/agents/devops.md
+  s_099383ef79559d::t_4dec1232b5152b 35-43
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "01192cb6fe0e5a2487ec2b4b0f8a7a4afdc40e0f",
+  "prompts": {},
+  "sessions": {
+    "s_099383ef79559d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4489c951-ff19-410c-a076-13320f5753c1",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
