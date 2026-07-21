@@ -1,0 +1,23 @@
+crates/infer-cuda/src/qwen35.rs
+  s_099383ef79559d::t_1e73e9bbeae983 3326,8373
+docs/experience/errors/2026-07-20-hd256-fp8-temp-sampling-corruption.md
+  s_099383ef79559d::t_51b560e520a61f 1-13,80-119
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "d703b524005df11e28ebd62fcfc560c3a233290d",
+  "prompts": {},
+  "sessions": {
+    "s_099383ef79559d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4489c951-ff19-410c-a076-13320f5753c1",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
