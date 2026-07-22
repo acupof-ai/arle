@@ -40,28 +40,12 @@ impl MetalGemma4Model {
         resource_plan: Option<crate::resource::MetalResourcePlan>,
     ) -> Result<LoadedMetalGemma4> {
         let _guard = mlx_sys::mlx_guard();
-        if let Some(plan) = resource_plan {
-            let previous_memory = mlx::set_memory_limit_bytes(plan.memory_limit_bytes as u64);
-            let previous_cache = mlx::set_cache_limit_bytes(plan.cache_limit_bytes as u64);
-            let previous_wired = mlx::set_wired_limit_bytes(plan.wired_limit_bytes as u64);
-            eprintln!("[infer-metal] Gemma4 resource guard: {}", plan.describe());
-            log::info!(
-                "Gemma4 Metal resource guard set MLX limits: memory={} (previous {}), cache={} (previous {}), wired={} (previous {})",
-                plan.memory_limit_bytes,
-                previous_memory,
-                plan.cache_limit_bytes,
-                previous_cache,
-                plan.wired_limit_bytes,
-                previous_wired
-            );
-        } else if let Some(limit) = crate::wired_limit::auto_wired_limit_bytes(model_dir) {
-            let previous = mlx::set_wired_limit_bytes(limit as u64);
-            log::info!(
-                "Gemma4 Metal wired limit set to {} bytes (previous {})",
-                limit,
-                previous
-            );
-        }
+        crate::resource::apply_startup_mlx_limits(
+            model_dir,
+            resource_plan.as_ref(),
+            Some("Gemma4"),
+            true,
+        );
         let parsed = crate::config::load_gemma4_config(model_dir)?;
         let tensors = load_tensor_map(model_dir)?;
         let quant = QuantRegistry::from_model_dir(model_dir)?;

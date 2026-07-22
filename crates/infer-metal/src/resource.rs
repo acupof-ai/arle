@@ -174,6 +174,44 @@ impl MetalResourcePlan {
     }
 }
 
+pub(crate) fn apply_startup_mlx_limits(
+    model_dir: &Path,
+    resource_plan: Option<&MetalResourcePlan>,
+    model_label: Option<&str>,
+    print_plan: bool,
+) {
+    if let Some(plan) = resource_plan {
+        let previous_memory = mlx::set_memory_limit_bytes(plan.memory_limit_bytes as u64);
+        let previous_cache = mlx::set_cache_limit_bytes(plan.cache_limit_bytes as u64);
+        let previous_wired = mlx::set_wired_limit_bytes(plan.wired_limit_bytes as u64);
+        if print_plan {
+            let label = model_label.map_or(String::new(), |label| format!("{label} "));
+            eprintln!("[infer-metal] {label}resource guard: {}", plan.describe());
+        }
+        let label = model_label.map_or_else(
+            || "Metal resource guard".to_string(),
+            |label| format!("{label} Metal resource guard"),
+        );
+        log::info!(
+            "{label} set MLX limits: memory={} (previous {}), cache={} (previous {}), wired={} (previous {})",
+            plan.memory_limit_bytes,
+            previous_memory,
+            plan.cache_limit_bytes,
+            previous_cache,
+            plan.wired_limit_bytes,
+            previous_wired
+        );
+    } else if let Some(limit) = wired_limit::auto_wired_limit_bytes(model_dir) {
+        let previous = mlx::set_wired_limit_bytes(limit as u64);
+        let label = model_label.map_or("Metal executor", |label| label);
+        log::info!(
+            "{label} wired limit set to {} bytes (previous {})",
+            limit,
+            previous
+        );
+    }
+}
+
 pub fn plan_resource_budget(
     model_dir: &Path,
     request: MetalResourceRequest,
