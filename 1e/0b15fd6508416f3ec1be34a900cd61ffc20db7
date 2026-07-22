@@ -1,0 +1,25 @@
+crates/infer-core/src/lib.rs
+  s_541b53377b6ce6::t_68028c808115bd 365,435-436,452,1997-2043,2922-2924,5360-5396
+crates/infer-core/src/planner.rs
+  s_541b53377b6ce6::t_e730026d5f5068 55
+docs/experience/wins/2026-07-22-core-scheduler-hot-path-cleanup-pending-remote.md
+  s_541b53377b6ce6::t_b18e7cf39760ee 1-35
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "1e0b15fd6508416f3ec1be34a900cd61ffc20db7",
+  "prompts": {},
+  "sessions": {
+    "s_541b53377b6ce6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a3c8ba8bf50baad75",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
