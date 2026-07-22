@@ -162,15 +162,6 @@ fn parse_trace_path(value: &str) -> Result<PathBuf, String> {
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
-pub(crate) enum BackendArg {
-    Auto,
-    Cpu,
-    Metal,
-    Cuda,
-    Vulkan,
-}
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
 pub(crate) enum ServeBackendArg {
     #[value(alias = "arle", alias = "native")]
     Auto,
