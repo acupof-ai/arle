@@ -74,11 +74,19 @@ lever — that VRAM is already reclaimed by `release_kv_pool`.
    (`update_strategy.rs:650`). UNTESTED to completion (every Colab G4 session
    died: hard ~1h runtime cap + mid-run VM resets; keepalive at 100% util did NOT
    defeat the cap).
-2. **Comfort-band corpus (shorter trajectories)** — the project's planned fix
-   (2026-07-03 curve plan, task "Sweet-spot corpus: stage → 27B-profile →
-   comfort-band filter"): tasks tuned to intermediate pass rate with FEWER
-   distractor modules → trajectories fit under 23K with bf16, no OOM, keeps
-   variance. This is the right structural fix.
+2. **Comfort-band corpus (shorter trajectories) — the right structural fix.**
+   Filter implemented: `scripts/comfort_band.py` reads a profile run's
+   `metrics.jsonl` (per-group `rewards` + `prompt/completion_tokens`, already
+   emitted — no runtime change) and keeps only tasks that are BOTH
+   intermediate-difficulty (`pass∈[lo,hi]` → within-group variance) AND short
+   enough (`avg_traj ≤ max-seq < 23K` → fits the writeback). The trajectory-length
+   dimension is exactly what the dynamic `TaskSelection` lacks
+   (`train_cli.rs:600`: *"No comfort-band reweighting yet — needs a corpus-level
+   difficulty spread"*). Pipeline: `gen_agent_opd_tasks.py --difficulty hard` →
+   `arle train agent-opd --task-selection false --metrics-out profile.jsonl` →
+   `comfort_band.py --metrics profile.jsonl --corpus C --out C-band` → train on
+   `C-band`. Needs one profile run on a stable 96 GB box (the profile itself is
+   GPU work; the filter is not).
 3. **Writeback sequence-offload** — a code change to raise the 96 GB writeback
    ceiling above 30K (activation offload/checkpointing), decoupling variance
    (needs hard) from trajectory length.
