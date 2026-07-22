@@ -1,0 +1,23 @@
+crates/infer-cuda/src/dsv4.rs
+  s_3185486dafaf9e::t_c7f856bff1d190 2008
+crates/infer-cuda/src/qwen35.rs
+  s_3185486dafaf9e::t_18309e5f42538c 2964
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "834d6d54e4d1584ee5e153546ac04100800e43bc",
+  "prompts": {},
+  "sessions": {
+    "s_3185486dafaf9e": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f8a5f-d057-7770-9b1d-084f9f55c6ec",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
