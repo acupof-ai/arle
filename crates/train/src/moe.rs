@@ -8,7 +8,7 @@ use autograd::{
     },
 };
 
-use crate::lora::{LinearWithLora, LoraConfig};
+use crate::lora::{LinearWithLora, LoraConfig, leak_name};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MoeConfig {
@@ -232,8 +232,4 @@ fn validate_config(cfg: MoeConfig) -> Result<()> {
         return Err(AutogradError::TapeInvariant("moe lora rank must be > 0"));
     }
     Ok(())
-}
-
-fn leak_name(name: String) -> &'static str {
-    Box::leak(name.into_boxed_str())
 }
