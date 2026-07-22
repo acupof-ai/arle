@@ -12,15 +12,7 @@ publish.workspace = true
 # durable, unit-testable foundation code. Communicator wiring (NCCL) is
 # intentionally NOT here — it is gated on H20 verification and lands later.
 #
-# Depends on nothing but std (+ optional serde for config (de)serialization).
-
-[dependencies]
-serde = { workspace = true, features = ["derive"], optional = true }
-
-[features]
-# Derive serde traits on the config/topology types. Off by default to keep the
-# foundation crate std-only.
-serde = ["dep:serde"]
+# Depends only on std.
 
 [lints]
 workspace = true
