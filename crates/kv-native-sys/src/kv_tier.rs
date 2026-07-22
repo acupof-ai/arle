@@ -346,7 +346,7 @@ struct DiskTier {
     worker_tx: Option<SyncSender<DiskWork>>,
     completion_rx: Receiver<DiskCompletion>,
     worker: Option<JoinHandle<()>>,
-    _lock: Option<nix::fcntl::Flock<std::fs::File>>,
+    _lock: Option<std::fs::File>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -432,15 +432,16 @@ impl DiskTier {
         self.drain_completions();
     }
 
-    fn lock_namespace(namespace: &Path) -> Result<nix::fcntl::Flock<std::fs::File>> {
+    fn lock_namespace(namespace: &Path) -> Result<std::fs::File> {
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
             .open(namespace.join("owner.lock"))?;
-        nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock)
-            .map_err(|(_, err)| anyhow!("namespace already owned: {err}"))
+        file.try_lock()
+            .map_err(|err| anyhow!("namespace already owned: {err}"))?;
+        Ok(file)
     }
 
     fn manifest_path(&self) -> PathBuf {
