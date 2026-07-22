@@ -66,7 +66,9 @@ pub struct DsparkTrainConfig {
     /// Default 0.5 (midpoint of [0, 1] acceptance ratio).
     pub baseline_init: f32,
     /// Weight on the supervised probability-matching loss. The policy-gradient
-    /// loss receives weight `1.0 - prob_match_alpha`. Default 0.9 (DeepSpec).
+    /// loss receives weight `1.0 - prob_match_alpha`. Default 0.5 (equal weight
+    /// to PG; DeepSpec uses 0.9 but that drowned the acceptance signal in our
+    /// 2026-07-22 benchmark).
     pub prob_match_alpha: f32,
     /// Exponential decay scale for per-position loss weighting. Position `k` in
     /// the block is weighted `exp(-k/gamma)`. `None` disables decay (uniform).
