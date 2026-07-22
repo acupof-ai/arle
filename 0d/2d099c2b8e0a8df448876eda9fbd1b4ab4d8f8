@@ -1,0 +1,21 @@
+crates/chat/src/stream.rs
+  s_e7bf5c868ad41c::t_8ac25ab92f3460 9,12,15-16,18,21-22,25,27,30-33,36-39,41-62,64-93,96-99,101-112,114-120,133,139,142,144
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "0d2d099c2b8e0a8df448876eda9fbd1b4ab4d8f8",
+  "prompts": {},
+  "sessions": {
+    "s_e7bf5c868ad41c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-af16d264bef059756",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
