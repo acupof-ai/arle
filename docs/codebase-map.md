@@ -222,7 +222,9 @@ host-only seam with zero device coupling.
  perf hotspots over `cuda-kernels`.
 - `crates/infer-cuda/src/loader.rs`: safetensors weight loading.
 - `crates/infer-cuda/src/qwen35.rs`: Qwen3.5/3.6 **hybrid** model
- (gated-delta linear attention + periodic full attention, BF16 MoE), cuda-gated.
+ (gated-delta linear attention + periodic full attention) with shape- and
+ architecture-dependent MoE dispatch: grouped FP8 DeepGEMM on Hopper or CUTLASS
+ on SM120 for eligible prefill shapes, with hand/BF16 fallbacks elsewhere.
 - `crates/infer-cuda/src/dsv4.rs` + `crates/infer-cuda/src/hc.rs`: DSv4-Flash
  FP8 model (loader + structs + MLA KV arena) and DSv4 hyper-connections
  (`hc_mult > 1` wide-residual wrap), cuda-gated.
@@ -236,8 +238,10 @@ host-only seam with zero device coupling.
  `graph.rs`: CUDA graph capture/reuse; `decode_graph_key.rs` is the host
  capture-key math (CPU-testable without nvcc).
 - `crates/cuda-kernels/src/{paged_kv,tilelang,graph_pool,tensor,kv_quant,kv_turboquant}.rs`
- + `crates/cuda-kernels/csrc/{attention,gemm,kv,quant,misc}/`: the kernel layer
- `infer-cuda` calls into.
+ + `crates/cuda-kernels/csrc/{attention,comm,elementwise,gemm,kv,moe,norm,quant,recurrent,sampling}/`:
+ the kernel layer `infer-cuda` calls into. `deepep_sidecar/` is a separate C++
+ sidecar; the legacy Rust `ffi::misc` module still exists, but no `csrc/misc/`
+ directory exists.
 
 `infer-cuda` depends on `infer-plan` + `infer-seam` + `cuda-kernels` +
 `infer-topo` + `infer-moe` + `qwen35-spec` (and optionally `qwen3-spec` /
@@ -350,7 +354,7 @@ These crates sit around the runtime graph:
 - `crates/chat`: shared protocol parsing/formatting and OpenAI chat types
 - `crates/cli`: CLI entry, arg parsing, REPL UX, `arle serve` front door, train front door
 - `crates/tools`: builtin tools, sandbox/tool execution, shared tool hooks
-- `crates/cuda-kernels`: CUDA kernel layer (extracted from the legacy `infer` crate in commit `a4e12f5`, 2026-04-15). Owns `csrc/{attention,gemm,kv,quant,misc}/`, `tools/tilelang/`, Rust FFI, `paged_kv`, `tilelang`, `graph_pool`, `tensor`, `kv_quant`, `kv_turboquant`
+- `crates/cuda-kernels`: CUDA kernel layer (extracted from the legacy `infer` crate in commit `a4e12f5`, 2026-04-15). Owns `csrc/{attention,comm,elementwise,gemm,kv,moe,norm,quant,recurrent,sampling}/`, separate C++ `deepep_sidecar/`, `tools/tilelang/`, Rust FFI, `paged_kv`, `tilelang`, `graph_pool`, `tensor`, `kv_quant`, `kv_turboquant`; legacy Rust `ffi::misc` remains, but no `csrc/misc/` exists
 - `crates/mlx-sys`: MLX C++ bridge for the Metal backend, including vendored MLX qmv kernels used by Qwen3.5 GGUF affine/tiled quant decode
 - `crates/deepep-sys`: DeepEP all-to-all transport bindings used by `infer-cuda`'s DSv4 MoE path
 - `crates/hip-sys`: thin hand-declared HIP runtime FFI (no bindgen; every entry point stubs to `HIP_NOT_COMPILED` off-box)

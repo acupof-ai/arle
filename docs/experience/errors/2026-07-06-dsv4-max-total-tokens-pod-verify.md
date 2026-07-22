@@ -1,5 +1,7 @@
 # DSv4 `--max-total-tokens` unification: no-flags auto-context crashes on FlashMLA pool sizing
 
+> Superseded/corrected by later rounds: auto-resolution was capped at 32768, then `ba36fbd39` reconciled the FlashMLA band floor in the budget gate. The failure below was an `anyhow::ensure!` error, not a Rust panic; current infeasible boots reject earlier with an actionable message.
+
 ## Context
 
 Pod-verifying `b7cd9a2e7` ("delete `INFER_DSV4_MAX_SEQ_LEN` — DSv4 serve arena

@@ -1,6 +1,6 @@
 # Commit 1 design — reuse the existing shared-expert scratch in DSv4 batched decode
 
-> Status: Active | 2026-07-07 | part of `2026-07-07-dsv4-decode-launch-bound-plan.md` Step 1
+> Status: Shipped (`de6fc4fd`); measured only inside the parent alloc-removal sweep, which was a wall-clock WASH (−0.27%, within noise). Historical implementation design below.
 
 ## One-line
 

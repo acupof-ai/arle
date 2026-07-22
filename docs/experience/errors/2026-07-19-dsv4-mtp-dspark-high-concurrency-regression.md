@@ -101,7 +101,6 @@ throughput and MTP adds overhead. Not a default-flip candidate.
 ## Rule
 
 - Speculative decode gains are c1-only until draft generation is batched.
-- DSpark is effectively disabled at B>1 by current logic; do not claim
-  DSpark throughput wins on concurrency >1.
+- Before `13426a8de`, DSpark was effectively disabled at B>1. That dispatch defect is fixed; later `13fe251cb` also batches anchor + target verify. Concurrency wins still require measured A/B because draft work remains costly and c=8 was later −7.6% vs valid no-spec.
 - Benchmark speculative configs with the production workload (long
   prompts), not synthetic short-prompt sets.

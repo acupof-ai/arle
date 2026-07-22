@@ -150,7 +150,7 @@ Prior +5.5% bar miss; default stays OFF until new multi-c license ≥~15%.
 |---|---|
 | Count-aware silu → DeepGEMM re-race | nsys shows silu pad tax; hand MoE still default |
 | Prefill QKV/gate_up pack | multi-len TTFT still binds after FA3 prefill |
-| `fused_add_rms_norm` wire | multi-shape ITL only |
+| residual + RMSNorm | **KILL** — matched c=1/2/4/8 wall A/B was WASH; treatment deleted; current symbols have zero live caller |
 
 Skip resurrecting `fused_mlp` / `split_qkv` without A/B.
 
@@ -214,7 +214,7 @@ Code: `infer-cuda/src/deepep.rs` (`deepep_ll`), `moe.rs`.
 
 | Candidate | Decision |
 |---|---|
-| residual + RMSNorm | B4 only |
+| residual + RMSNorm | **KILL** — matched c=1/2/4/8 wall A/B was WASH; treatment deleted; current symbols have zero live caller |
 | host `seqlen_k` → device | B1 deferred |
 | FA3 decode default OFF | **B0 primary** |
 | silu pad → count-aware | B4 |

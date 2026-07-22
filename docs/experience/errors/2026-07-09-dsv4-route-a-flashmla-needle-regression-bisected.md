@@ -11,6 +11,8 @@ discriminator matrix + commit bisection on the pod (TP=4, GPUs 4/5/6/7,
 `'The secret access code stated earlier is **738291**.'`, 943bacda = 8/8
 byte-identical).
 
+> Resolved/superseded 2026-07-10: `bbaaea93b` deleted Route A and the dirty-bit page-table contract passed 6/6 acceptance. `ARLE_DSV4_FLASHMLA_DECODE=0` was a temporary mitigation only; current compiled production defaults use FlashMLA decode ON.
+
 ## Root Cause
 
 **Two-tier structure inside the FlashMLA decode lane — origin + amplifier,

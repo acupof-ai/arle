@@ -1,6 +1,6 @@
 # DSv4 high-concurrency agent-workload throughput campaign
 
-> Status: Active
+> Status: Retargeted/partially shipped — decode-region reuse shipped and defaulted ON after the multi-turn c-sweep (+25.3% aggregate tok/s at c=16); pinned-DRAM and aggressive-watermark variants were killed; remaining residual work is separate.
 
 **Goal (ckl 2026-07-11)**: maximize **TTFT · TPOT · throughput** for the
 high-concurrency agent workload on DSv4-Flash-FP8. Each optimization is
@@ -57,9 +57,3 @@ high-concurrency multi-turn TTFT/TPOT/throughput + the reuse-under-concurrency w
 ## Non-goals
 - Page-granular mid-generation reuse (deferred — bigger, concurrent-share case).
 - #150 substitution (independent near-tie noise, separate track).
-
-## Blocker (current)
-The pod is contended: a sibling `fp8probe` build LOOP owns `/host/arle-build`
-(new build every ~2 min, 35 compiler procs) — no clean window to build without
-clobbering it. GPUs are free (our leftover TP=8 serve was killed). The campaign
-measurements queue until the build tree frees.
