@@ -461,6 +461,13 @@ impl DeviceContext {
         (major, minor)
     }
 
+    /// True on sm_120 (Blackwell RTX PRO 6000): no Hopper DeepGEMM bridge —
+    /// FP8 grouped MoE routes to the CUTLASS sm_120a collective instead.
+    #[must_use]
+    pub fn is_sm120(&self) -> bool {
+        self.compute_capability().0 == 12
+    }
+
     /// Query (free, total) device memory in bytes for the bound device.
     ///
     /// Wraps `cuMemGetInfo`. Used by the OPD engine time-share path to verify
