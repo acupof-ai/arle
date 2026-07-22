@@ -60,8 +60,6 @@ pub struct SchedulerConfig {
     pub chunked_prefill_size: usize,
     /// Cross-request prompt-prefix reuse via the host radix cache.
     pub enable_prefix_cache: bool,
-    /// Per-forward plan token cap from `BackendExecutor::max_tokens_per_step`.
-    pub max_tokens_per_step: usize,
     /// Admit waiters beyond `max_running_requests` by parking longest-running decode.
     pub slot_oversubscription: bool,
 }
@@ -110,7 +108,6 @@ impl Default for SchedulerConfig {
             prefix_cache_low_water_pages: 0,
             chunked_prefill_size: 2_048,
             enable_prefix_cache: true,
-            max_tokens_per_step: usize::MAX,
             slot_oversubscription: false,
         }
     }
@@ -365,6 +362,7 @@ pub struct Engine<E: BackendExecutor, K: KvPool> {
     executor: E,
     kv: K,
     config: SchedulerConfig,
+    max_tokens_per_step: usize,
     governor: Box<dyn ResourceGovernor>,
     radix: RadixCache,
     next_request_id: u64,
@@ -434,8 +432,8 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         }
         // Per-forward token cap (deepep_ll LL dispatch buffer): clamp num_slots so
         // a pure-decode forward (one token per slot) never exceeds it.
-        config.max_tokens_per_step = executor.max_tokens_per_step().max(1);
-        config.num_slots = config.num_slots.min(config.max_tokens_per_step);
+        let max_tokens_per_step = executor.max_tokens_per_step().max(1);
+        config.num_slots = config.num_slots.min(max_tokens_per_step);
         config.num_slots = config.num_slots.max(1);
         if let Some(cap) = config.max_running_requests
             && cap > config.num_slots
@@ -451,6 +449,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             executor,
             kv,
             config,
+            max_tokens_per_step,
             governor,
             radix,
             next_request_id: 0,
@@ -1995,6 +1994,53 @@ mod testing {
         }
     }
 
+    #[derive(Debug, Clone)]
+    pub(super) struct PlanTokenCapExecutor {
+        inner: MockExecutor,
+        cap: usize,
+        pub(super) capability_reads: std::rc::Rc<std::cell::Cell<usize>>,
+        pub(super) plans: std::rc::Rc<std::cell::RefCell<Vec<(bool, usize)>>>,
+    }
+
+    impl PlanTokenCapExecutor {
+        pub(super) fn with_cap(cap: usize) -> Self {
+            Self {
+                inner: MockExecutor::ready(),
+                cap,
+                capability_reads: std::rc::Rc::new(std::cell::Cell::new(0)),
+                plans: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+            }
+        }
+    }
+
+    impl BackendExecutor for PlanTokenCapExecutor {
+        type Inflight = MockInflight;
+
+        fn submit(&mut self, plan: &ForwardPlan, kv: &mut dyn KvPool) -> Result<Self::Inflight> {
+            let tokens = plan.decode_rows.len()
+                + plan
+                    .prefill_rows
+                    .iter()
+                    .map(|row| row.tokens.len())
+                    .sum::<usize>();
+            self.plans.borrow_mut().push((
+                !plan.decode_rows.is_empty() && !plan.prefill_rows.is_empty(),
+                tokens,
+            ));
+            self.inner.submit(plan, kv)
+        }
+
+        fn poll(&mut self, inflight: Self::Inflight) -> Result<PollResult<Self::Inflight>> {
+            self.inner.poll(inflight)
+        }
+
+        fn max_tokens_per_step(&self) -> usize {
+            self.capability_reads
+                .set(self.capability_reads.get().saturating_add(1));
+            self.cap
+        }
+    }
+
     /// Mock executor that reports model-default stop tokens, mirroring how a
     /// real backend (e.g. Metal) exposes its config EOS/stop ids to the engine.
     #[derive(Debug, Clone)]
@@ -2873,9 +2919,9 @@ mod tests {
     use super::testing::{
         AlignedPrefixExecutor, BackgroundPublishExecutor, DeviceMirrorExecutor, HoldGovernor,
         HybridReprefillMirror, LimitedPrefixExecutor, MockExecutor, MockKvPool,
-        RestoreAlignmentExecutor, SamplingExecutor, SidecarMissExecutor, SingleRowExecutor,
-        SlotTierMockExecutor, SpecMirrorExecutor, StopTokenExecutor, TierMockExecutor,
-        TokenBudgetGovernor, WarmupCountingExecutor,
+        PlanTokenCapExecutor, RestoreAlignmentExecutor, SamplingExecutor, SidecarMissExecutor,
+        SingleRowExecutor, SlotTierMockExecutor, SpecMirrorExecutor, StopTokenExecutor,
+        TierMockExecutor, TokenBudgetGovernor, WarmupCountingExecutor,
     };
     use super::*;
 
@@ -5308,6 +5354,43 @@ mod tests {
         let hit = engine.radix.peek_longest_prefix_match(&[1, 2, 3, 4, 5, 6]);
         assert_eq!(hit.matched_len, 4);
         assert_eq!(hit.block_ids.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn backend_plan_token_cap_bounds_mixed_plans_and_long_prompt_completes() -> Result<()> {
+        let executor = PlanTokenCapExecutor::with_cap(3);
+        let capability_reads = executor.capability_reads.clone();
+        let plans = executor.plans.clone();
+        let mut config = test_config(2);
+        config.chunked_prefill_size = 128;
+        let mut engine = Engine::with_config(executor, MockKvPool::new(2), config);
+        let decode = engine.submit_request(vec![10], 8);
+
+        engine.step()?;
+        engine.step()?;
+        let long_prompt = engine.submit_request((1u32..=17).collect(), 2);
+        engine.run_to_idle()?;
+
+        assert_eq!(
+            capability_reads.get(),
+            1,
+            "backend plan-token capability must be snapshotted at construction"
+        );
+        assert!(
+            plans.borrow().iter().all(|(_, tokens)| *tokens <= 3),
+            "every submitted plan must fit the snapshotted backend cap: {plans:?}"
+        );
+        assert!(
+            plans.borrow().iter().any(|(mixed, _)| *mixed),
+            "test must exercise mixed decode+prefill planning: {plans:?}"
+        );
+        assert_finished(engine.completed(decode).expect("decode completed"));
+        assert_finished(
+            engine
+                .completed(long_prompt)
+                .expect("long prompt completed"),
+        );
         Ok(())
     }
 

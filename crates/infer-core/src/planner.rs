@@ -52,7 +52,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         // Cap total plan tokens (decode rows + prefill chunk tokens) to the
         // executor's per-forward limit (deepep_ll LL dispatch buffer). With the
         // default `usize::MAX` both `saturating_sub` and `min` are no-ops.
-        let cap = self.config.max_tokens_per_step;
+        let cap = self.max_tokens_per_step;
         let mut budget = self
             .config
             .prefill_step_budget()
