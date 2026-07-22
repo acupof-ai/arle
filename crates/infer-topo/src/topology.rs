@@ -9,7 +9,6 @@ use crate::error::{Result, bail};
 use crate::sharding::parse_parallel_env_usize;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct MultiAxisConfig {
     pub tp_size: usize,
     pub pp_size: usize,
@@ -273,7 +272,6 @@ fn subgroup_axis_env_present(lookup: &mut impl FnMut(&str) -> Option<String>) ->
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct RankCoord {
     pub world_rank: usize,
     pub tp_rank: usize,

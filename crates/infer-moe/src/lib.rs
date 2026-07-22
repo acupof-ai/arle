@@ -1,6 +1,6 @@
 //! `infer-moe` — pure, CPU-verifiable, device-independent MoE routing / gating
 //! math (the reference the GPU kernel is verified against). Ported from the two
-//! legacy ARLE routers with GPU coupling dropped; depends on `std` (+ `serde`).
+//! legacy ARLE routers with GPU coupling dropped; depends only on `std`.
 //!
 //! # Which model uses which routing rule
 //!
