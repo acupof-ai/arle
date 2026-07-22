@@ -1,0 +1,21 @@
+scripts/check_repo_hygiene.py
+  s_b48c2c0cf799f3::t_331ceff94f8524 109-110,115-117,253-294,438,449-450
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "66b594523ac3127e88acc21aa7e162f70b02b10d",
+  "prompts": {},
+  "sessions": {
+    "s_b48c2c0cf799f3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0c6ed6de-e6c6-46cd-91c1-f828d76a7f83",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
