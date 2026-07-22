@@ -6,6 +6,8 @@
 {kv_layout.rs,dsa.rs},kv_tier.rs}`, `crates/infer-core/{planner.rs,lib.rs}`,
 `crates/infer-seam/{lib.rs,host_paged_kv_pool.rs}`.
 
+> Superseded 2026-07-10: the Route A compressor/ring/page-sharing mechanism measured here was deleted after a FlashMLA-lane correctness regression. Preserve the 69% historical measurement; do not treat the listed pools, restore path, or file sites as current architecture. Current reuse uses the prefix-state/finish-frontier path.
+
 ## Goal
 
 Ship Route A (page-granular DSv4 prefix reuse,

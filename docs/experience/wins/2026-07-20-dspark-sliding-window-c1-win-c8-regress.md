@@ -1,7 +1,8 @@
 # DSv4 DSpark sliding-window draft latent — c=1 +64%, c=4 +3%, c=8/16 regress
 
 > Status: Shipped — sliding-window fix verified; no crash at any concurrency.
-> c=1 win confirmed; c=8/16 regression is structural (serial draft, no batched verify).
+> c=1 win confirmed; c=8/16 regression was measured on the July-20 path.
+> Superseded 2026-07-21 for current-path attribution: batched anchor + one batched target verify is now implemented. Keep the July-20 measurements, but “no batched verify” is historical; corrected c=8 is 93.5 vs valid no-spec 101.2 tok/s (−7.6%). Draft generation remains per-slot.
 
 ## Context
 

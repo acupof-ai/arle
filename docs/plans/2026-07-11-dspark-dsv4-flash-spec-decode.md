@@ -1,6 +1,7 @@
 # Plan — DSpark for DeepSeek-V4-Flash (the DSv4 throughput lever)
 
-> Status: Active (P1 arch re-derived v3 — 3-stage; T1/T2 landed on wrong arch, refitting) — 2026-07-12 · Driver: DSv4 native
+> Status: Correctness + c=1 shipped; batched anchor/verify landed. c=8 remains below no-spec (93.5 vs 101.2 tok/s, −7.6%); c=16 comparison is pending. No all-concurrency default license.
+> Driver: DSv4 native
 > NextN-MTP nets only ~1.03× (accept-limited); DeepSeek's official DSpark reports
 > **60–85% per-user speedup over MTP-1 on V4-Flash**. This is the DSv4
 > high-concurrency-throughput lever, not the Qwen3.6 track (that was the substrate
