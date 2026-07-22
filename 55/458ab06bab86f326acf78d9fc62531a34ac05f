@@ -1,0 +1,21 @@
+crates/cuda-kernels/build.rs
+  s_ed62ae3914fa95::t_dd44f2d02192c5 2830-2833,2836,2881
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "55458ab06bab86f326acf78d9fc62531a34ac05f",
+  "prompts": {},
+  "sessions": {
+    "s_ed62ae3914fa95": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aeb13105894126f38",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
