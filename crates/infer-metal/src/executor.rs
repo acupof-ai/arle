@@ -14,7 +14,7 @@ use infer_plan::{ForwardPlan, SlotToken, StepOutput};
 use infer_seam::{BackendExecutor, KvPool, PollResult, PrefixBlock};
 
 #[cfg(feature = "metal")]
-use crate::{config, dflash, mlx, model_source, qwen35, wired_limit};
+use crate::{config, dflash, mlx, model_source, qwen35};
 
 #[cfg(feature = "metal")]
 const KV_CACHE_CHUNK: i32 = 256;
@@ -330,28 +330,7 @@ impl MetalExecutor {
         resource_plan: Option<crate::resource::MetalResourcePlan>,
     ) -> anyhow::Result<Self> {
         let _guard = mlx_sys::mlx_guard();
-        if let Some(plan) = resource_plan {
-            let previous_memory = mlx::set_memory_limit_bytes(plan.memory_limit_bytes as u64);
-            let previous_cache = mlx::set_cache_limit_bytes(plan.cache_limit_bytes as u64);
-            let previous_wired = mlx::set_wired_limit_bytes(plan.wired_limit_bytes as u64);
-            eprintln!("[infer-metal] resource guard: {}", plan.describe());
-            log::info!(
-                "Metal resource guard set MLX limits: memory={} (previous {}), cache={} (previous {}), wired={} (previous {})",
-                plan.memory_limit_bytes,
-                previous_memory,
-                plan.cache_limit_bytes,
-                previous_cache,
-                plan.wired_limit_bytes,
-                previous_wired
-            );
-        } else if let Some(limit) = wired_limit::auto_wired_limit_bytes(resolved) {
-            let previous = mlx::set_wired_limit_bytes(limit as u64);
-            log::info!(
-                "Metal executor wired limit set to {} bytes (previous {})",
-                limit,
-                previous
-            );
-        }
+        crate::resource::apply_startup_mlx_limits(resolved, resource_plan.as_ref(), None, true);
         let config = config::load_metal_config(resolved)?;
         if kv_cache_dtype == MetalKvCacheDtype::Int8 {
             validate_int8_kv_config(&config)?;
