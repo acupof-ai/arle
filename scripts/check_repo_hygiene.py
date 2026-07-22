@@ -134,25 +134,6 @@ def check_required_files() -> list[str]:
     return errors
 
 
-def check_latest_updates(path: Path, marker: str, max_entries: int) -> list[str]:
-    text = load_text(ROOT / path)
-    if marker not in text:
-        return [f"{path}: missing marker {marker!r}"]
-    after_marker = text.split(marker, 1)[1]
-    entries = []
-    for line in after_marker.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("Full history:") or stripped.startswith("完整历史："):
-            break
-        if stripped.startswith("- **"):
-            entries.append(stripped)
-    if not entries:
-        return [f"{path}: latest updates section has no entries"]
-    if len(entries) > max_entries:
-        return [f"{path}: latest updates section has {len(entries)} entries (max {max_entries})"]
-    return []
-
-
 def normalize_link_target(doc_path: Path, target: str) -> Path | None:
     if not target or target.startswith(("http://", "https://", "mailto:", "#")):
         return None
@@ -428,10 +409,6 @@ def main() -> int:
     errors: list[str] = []
 
     errors.extend(check_required_files())
-    # `## 📰 Latest Updates` / `## 📰 最新动态` sections were intentionally
-    # dropped from the READMEs in commit 5654142 to keep them under 166
-    # lines. The check is preserved on the function side for any future
-    # opt-in, but the README is no longer required to carry it.
     errors.extend(check_markdown_links(PUBLIC_CHECK_FILES))
     errors.extend(check_disallowed_markers(PUBLIC_CHECK_FILES))
     errors.extend(check_template(Path(".github/PULL_REQUEST_TEMPLATE.md"), PR_TEMPLATE_REQUIRED_HEADINGS))
