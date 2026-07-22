@@ -2827,10 +2827,13 @@ fn main() {
                 stem,
                 "arle_flashmla_shim" | "arle_flashmla_decode_shim" | "arle_fa3_shim"
             );
-        let is_sm120_grouped_fp8 = stem == "fp8_moe_grouped_cutlass_sm120";
+        // The sm_120 grouped-FP8 TU that also has an sm_120 gencode target: the
+        // only build that forces sm_120a gencode + defines ARLE_SM120_GROUPED_FP8.
+        let build_sm120_grouped_fp8 =
+            stem == "fp8_moe_grouped_cutlass_sm120" && sm120_grouped_fp8_target;
         if is_sm90a_only {
             nvcc_args.push("-gencode=arch=compute_90a,code=sm_90a".to_string());
-        } else if is_sm120_grouped_fp8 && sm120_grouped_fp8_target {
+        } else if build_sm120_grouped_fp8 {
             // CUTLASS sm_120 blockwise MMA needs the accelerated 'a' variant.
             nvcc_args.push("-gencode=arch=compute_120a,code=sm_120a".to_string());
         } else {
@@ -2875,7 +2878,7 @@ fn main() {
         // device `std::min`; `-lcuda` (device TMA `cuDriverGetVersion`) is already
         // linked via emit_cuda_system_link_libs. Only the sm_120 build defines the
         // macro that instantiates the collective.
-        if is_sm120_grouped_fp8 && sm120_grouped_fp8_target {
+        if build_sm120_grouped_fp8 {
             nvcc_args.extend([
                 "-std=c++17".to_string(),
                 "--expt-relaxed-constexpr".to_string(),
