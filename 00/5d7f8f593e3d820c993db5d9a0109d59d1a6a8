@@ -1,0 +1,21 @@
+docs/experience/wins/2026-07-22-g2-quality-pass-verified.md
+  s_a40c8788e19c46::t_3a39cff4597950 1,3-4,8-82,86-91
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "005d7f8f593e3d820c993db5d9a0109d59d1a6a8",
+  "prompts": {},
+  "sessions": {
+    "s_a40c8788e19c46": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a02412c444458e3f8",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
