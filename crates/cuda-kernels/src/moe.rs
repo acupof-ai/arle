@@ -287,36 +287,11 @@ pub fn build_expert_weight_ptr_table(
         .map_err(|e| anyhow::anyhow!("expert weight-ptr table H2D failed: {e}"))
 }
 
-fn build_optional_u8_ptr_table(
+fn build_optional_ptr_table<T>(
     ctx: &DeviceContext,
     experts: &[&DeviceMatrix],
     label: &str,
-    get: impl Fn(&DeviceMatrix) -> Option<&CudaSlice<u8>>,
-) -> Result<CudaSlice<u64>> {
-    let host = experts
-        .iter()
-        .enumerate()
-        .map(|(idx, expert)| {
-            let slice = get(expert).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "expert {idx} missing {label} for {} quant table",
-                    expert.weight_format
-                )
-            })?;
-            let (ptr, _guard) = slice.device_ptr(&ctx.stream);
-            Ok(ptr)
-        })
-        .collect::<Result<Vec<_>>>()?;
-    ctx.stream
-        .clone_htod(&host)
-        .map_err(|e| anyhow::anyhow!("expert {label} ptr table H2D failed: {e}"))
-}
-
-fn build_optional_f32_ptr_table(
-    ctx: &DeviceContext,
-    experts: &[&DeviceMatrix],
-    label: &str,
-    get: impl Fn(&DeviceMatrix) -> Option<&CudaSlice<f32>>,
+    get: impl Fn(&DeviceMatrix) -> Option<&CudaSlice<T>>,
 ) -> Result<CudaSlice<u64>> {
     let host = experts
         .iter()
@@ -342,7 +317,7 @@ pub fn build_expert_qweight_u8_ptr_table(
     ctx: &DeviceContext,
     experts: &[&DeviceMatrix],
 ) -> Result<CudaSlice<u64>> {
-    build_optional_u8_ptr_table(ctx, experts, "qweight_u8", |m| m.qweight_u8.as_ref())
+    build_optional_ptr_table(ctx, experts, "qweight_u8", |m| m.qweight_u8.as_ref())
 }
 
 /// Build a per-expert pointer table for ABI-generic f32 scales.
@@ -350,7 +325,7 @@ pub fn build_expert_scale_f32_ptr_table(
     ctx: &DeviceContext,
     experts: &[&DeviceMatrix],
 ) -> Result<CudaSlice<u64>> {
-    build_optional_f32_ptr_table(ctx, experts, "scale_f32", |m| m.scale_f32.as_ref())
+    build_optional_ptr_table(ctx, experts, "scale_f32", |m| m.scale_f32.as_ref())
 }
 
 /// Build a per-expert pointer table for ABI-generic FP8 scale bytes.
@@ -358,32 +333,7 @@ pub fn build_expert_qscale_fp8_ptr_table(
     ctx: &DeviceContext,
     experts: &[&DeviceMatrix],
 ) -> Result<CudaSlice<u64>> {
-    build_optional_u8_ptr_table(ctx, experts, "qscale_fp8", |m| m.qscale_fp8.as_ref())
-}
-
-fn build_optional_bf16_ptr_table(
-    ctx: &DeviceContext,
-    experts: &[&DeviceMatrix],
-    label: &str,
-    get: impl Fn(&DeviceMatrix) -> Option<&CudaSlice<bf16>>,
-) -> Result<CudaSlice<u64>> {
-    let host = experts
-        .iter()
-        .enumerate()
-        .map(|(idx, expert)| {
-            let slice = get(expert).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "expert {idx} missing {label} for {} quant table",
-                    expert.weight_format
-                )
-            })?;
-            let (ptr, _guard) = slice.device_ptr(&ctx.stream);
-            Ok(ptr)
-        })
-        .collect::<Result<Vec<_>>>()?;
-    ctx.stream
-        .clone_htod(&host)
-        .map_err(|e| anyhow::anyhow!("expert {label} ptr table H2D failed: {e}"))
+    build_optional_ptr_table(ctx, experts, "qscale_fp8", |m| m.qscale_fp8.as_ref())
 }
 
 /// Build a per-expert pointer table for W4A16 INT4 packed weights (`i8`).
@@ -391,23 +341,7 @@ pub fn build_expert_qweight_i8_ptr_table(
     ctx: &DeviceContext,
     experts: &[&DeviceMatrix],
 ) -> Result<CudaSlice<u64>> {
-    let host = experts
-        .iter()
-        .enumerate()
-        .map(|(idx, expert)| {
-            let slice = expert.qweight.as_ref().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "expert {idx} missing qweight_i8 for {} quant table",
-                    expert.weight_format
-                )
-            })?;
-            let (ptr, _guard) = slice.device_ptr(&ctx.stream);
-            Ok(ptr)
-        })
-        .collect::<Result<Vec<_>>>()?;
-    ctx.stream
-        .clone_htod(&host)
-        .map_err(|e| anyhow::anyhow!("expert qweight_i8 ptr table H2D failed: {e}"))
+    build_optional_ptr_table(ctx, experts, "qweight_i8", |m| m.qweight.as_ref())
 }
 
 /// Build a per-expert pointer table for W4A16 BF16 per-group scales.
@@ -415,7 +349,7 @@ pub fn build_expert_qscale_bf16_ptr_table(
     ctx: &DeviceContext,
     experts: &[&DeviceMatrix],
 ) -> Result<CudaSlice<u64>> {
-    build_optional_bf16_ptr_table(ctx, experts, "qscale_bf16", |m| m.qscales.as_ref())
+    build_optional_ptr_table(ctx, experts, "qscale_bf16", |m| m.qscales.as_ref())
 }
 
 /// Single grouped expert GEMM: `output[token] = input[token] @ W_expert^T`,
