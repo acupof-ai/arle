@@ -461,8 +461,9 @@ fn resolve_engine_config(
     backend: ServeBackend,
     serve_args: &ServeArgs,
 ) -> Result<EngineLoadConfig, String> {
+    let kv_cache_dtype: KvCacheDtype = serve_args.kv_cache_dtype.into();
     let mut config = EngineLoadConfig {
-        kv_cache_dtype: serve_args.kv_cache_dtype.into(),
+        kv_cache_dtype,
         ..EngineLoadConfig::default()
     };
 
