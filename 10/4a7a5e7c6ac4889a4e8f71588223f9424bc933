@@ -1,0 +1,21 @@
+docs/experience/wins/2026-07-22-g2-quality-pass-pending-remote.md
+  s_ed62ae3914fa95::t_0739d41de87b3a 1-68
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "104a7a5e7c6ac4889a4e8f71588223f9424bc933",
+  "prompts": {},
+  "sessions": {
+    "s_ed62ae3914fa95": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aeb13105894126f38",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
