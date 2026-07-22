@@ -41,32 +41,31 @@ Confounder: Colab G4 reclaims the GPU at ~1h while actively polled (two sessions
 `session_terminated` mid-rollout). A single H20 is also 96 GB — same writeback
 wall — so H20 only removes the reclaim, not the VRAM wall.
 
-## Fix — attempted, KERNEL-BLOCKED for Qwen35
+## Fix — attempted (`3e2388f77`), then REVERTED (`5240a79c5`, `64013549c`)
 
-`3e2388f77` plumbed `--kv-cache-dtype` into the agent-opd/rubric-opd rollout
-engine (valid feature; default Auto = bf16 byte-identical) to free KV-pool
-headroom via quantized KV. **But it does NOT solve this on the 27B** — decoded
-2026-07-22 on Colab G4:
+Plumbed `--kv-cache-dtype` into the agent-opd/rubric-opd rollout engine to free
+KV-pool headroom via quantized KV. **Reverted** — adversarial review (codex) +
+empirical runs killed it on three independent counts:
 
-```
-ERROR infer_server::execution: Qwen35 full-attn paged: unsupported pool format INT8
-[agent-opd] ensure KV pool (round 0) failed: engine thread closed
-[ARLE train] error: engine thread closed  → all 16 rollouts reward=0.000, rc=1
-```
+1. **Premise invalid (the killer).** agent-opd ALREADY drops the entire rollout
+   KV pool before the co-resident writeback — `InferStudent::release_kv_pool`
+   (`crates/train/src/infer_student.rs:96`, called `train_cli.rs:3240,3527`):
+   *"the pool is DEAD during the writeback — freeing it (~KV-pool GB) is the
+   agent-OPD writeback headroom lever."* The pool is fully released regardless of
+   dtype, so quantized KV frees **zero** additional writeback memory. Even with
+   working kernels it could never make the 30K writeback fit.
+2. **Kernel-blocked on Qwen35.** `Qwen35 full-attn paged: unsupported pool format
+   INT8` → engine step fails → thread closes → all 16 rollouts reward=0.000,
+   rc=1 (#68's kv-dtype landed for other paths, not this one). Controlled 3-run,
+   hard corpus, temp=1.0: **bf16 → 14/16 with real variance** (billing 6×1.0+2×0.5,
+   but 30K trajectories SKIPPED >23K cap → mean_loss=0.0000); int8/fp8 → engine
+   crash → 0/16.
+3. **Silent no-op leak.** The field went on the shared `OpdRuntimeArgs`, so
+   `train opd` / `self-opd` accepted `--kv-cache-dtype` but `load_opd_infer_student`
+   (`EngineLoadConfig::single_sequence`) never read it → silently used Auto.
 
-The Qwen35 full-attn paged attention kernel does not support INT8/FP8 KV pools
-(#68's kv-dtype landed for other paths, not this one). Controlled 3-run
-comparison, hard corpus, temp=1.0, task-limit 2:
-
-| KV dtype | result |
-|----------|--------|
-| **bf16 (no flag)** | **14/16 pass, real variance** (billing 6×1.0+2×0.5) — but 30K trajectories SKIPPED (>23K cap) → mean_loss=0.0000 |
-| int8 (`--kv-cache-dtype int8`) | engine crash "unsupported pool format INT8" → 0/16, rc=1 |
-| fp8 (`--kv-cache-dtype fp8`) | 0/16 (same crash class) |
-
-So quantized KV frees no headroom here — it kills the rollout engine. The
-plumbing stays (works for kernels that support quantized pools); it is not the
-solution for Qwen35.
+The rollout engine's KV **format** is a rollout-time lever, never a writeback
+lever — that VRAM is already reclaimed by `release_kv_pool`.
 
 ## Real path (unresolved — needs a stable box)
 
@@ -89,7 +88,11 @@ solution for Qwen35.
 A dapo `mean_loss=0.0000` with confirmed reward variance is a **length-skip**, not
 a dead gradient — grep `SKIP trajectory … > max_update_seq` first. Agentic PG
 rollouts run 20–30K tokens; the single-GPU writeback VRAM wall (~23–30K on 96 GB)
-is the binding constraint, and **quantized KV can't buy past it on Qwen35 (paged
-attention rejects INT8/FP8 pools)**. The fix is shorter trajectories
-(comfort-band corpus), not a KV-dtype flag. Colab G4 is unfit for this loop
-(hard ~1h cap + VM resets); use a persistent box (H20).
+is the binding constraint. **Quantized KV cannot buy past it** — not because of a
+kernel gap (though Qwen35 has one too), but because the rollout KV pool is already
+fully released before the writeback (`release_kv_pool`), so its dtype changes
+nothing downstream. Before proposing a memory lever, trace where the peak
+actually lives: the writeback peak is activation memory with the KV pool already
+gone. The real fix is shorter trajectories (comfort-band corpus) or writeback
+activation-offload, not a KV-dtype flag. Colab G4 is unfit for this loop (hard
+~1h cap + VM resets); use a persistent box (H20).
