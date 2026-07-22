@@ -7,7 +7,6 @@ use crate::error::{Result, bail};
 
 /// Tensor parallel configuration: one rank's placement in the TP group.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct TpConfig {
     /// Total number of TP ranks (GPUs in the tensor-parallel group).
     pub world_size: usize,
@@ -87,7 +86,6 @@ impl Default for TpConfig {
 ///
 /// The rank owns `self.size` elements starting at `self.offset`.
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ShardingSpec {
     /// Starting index of this rank's shard.
     pub offset: usize,
@@ -251,7 +249,6 @@ pub fn kv_load_block_index(num_kv_heads: usize, tp: &TpConfig) -> Result<usize> 
 
 /// Type of parallel linear layer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ParallelLinearKind {
     /// Split output dimension across TP ranks; all-reduce result.
     Column,
@@ -261,7 +258,6 @@ pub enum ParallelLinearKind {
 
 /// Configuration for a tensor-parallel linear layer.
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct TpLinearConfig {
     pub kind: ParallelLinearKind,
     pub shard: ShardingSpec,

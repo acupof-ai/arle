@@ -9,7 +9,6 @@ use crate::error::{Result, bail};
 /// How per-expert router logits become selection scores. [`Self::scoring_kind`]
 /// matches the CUDA `dsv4_route` `scoring_kind` arg (0/1/2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ScoringFunc {
     /// `scores = stable_softmax(logits)` over all experts.
     Softmax,
@@ -48,7 +47,6 @@ impl ScoringFunc {
 ///   bias-corrected key `scores[e] + bias[e]`, the weight reads un-biased
 ///   `scores[e]`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum TopkMethod {
     /// Top-k directly over the scores (Qwen3.6).
     Greedy,
@@ -70,7 +68,6 @@ impl TopkMethod {
 
 /// Device-independent description of one MoE block's router.
 #[derive(Clone, Debug, PartialEq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct MoeConfig {
     /// Number of routed experts (one router logit each).
     pub num_experts: usize,

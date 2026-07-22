@@ -42,9 +42,7 @@ infer-api = { path = "../infer-api" }
 infer-plan = { path = "../infer-plan" }
 infer-util = { path = "../infer-util" }
 deepseek-spec = { path = "../deepseek-spec" }
-qwen3-spec = { path = "../qwen3-spec" }
 qwen35-spec = { path = "../qwen35-spec" }
-thiserror = { workspace = true }
 train = { path = "../train", default-features = false }
 tools = { path = "../tools" }
 log = "0.4"

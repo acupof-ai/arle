@@ -14,15 +14,7 @@ publish.workspace = true
 # unit-testable foundation code that the GPU MoE kernel is verified against
 # later (the same role `infer-topo` plays for TP sharding).
 #
-# Depends on nothing but std (+ optional serde for config (de)serialization).
-
-[dependencies]
-serde = { workspace = true, features = ["derive"], optional = true }
-
-[features]
-# Derive serde traits on the config types. Off by default to keep the
-# foundation crate std-only.
-serde = ["dep:serde"]
+# Depends only on std.
 
 [lints]
 workspace = true

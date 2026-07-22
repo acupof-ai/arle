@@ -29,6 +29,3 @@ unexpected_cfgs = { level = "warn", check-cfg = [
     "cfg(deepep_stub)",
     "cfg(deepep_nvshmem)",
 ] }
-
-[build-dependencies]
-cc = "1"

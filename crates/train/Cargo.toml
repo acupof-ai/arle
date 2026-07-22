@@ -27,7 +27,6 @@ deepep = ["nccl", "infer-api/deepep"]
 autograd = { path = "../autograd", default-features = false, features = ["safetensors"] }
 anyhow = "1.0"
 base64 = "0.22"
-hf-hub = { version = "0.5", features = ["tokio"] }
 opentelemetry = { version = "0.31", default-features = false, features = ["logs"] }
 opentelemetry-otlp = { version = "0.31.1", default-features = false, features = ["logs", "http-proto", "reqwest-blocking-client"] }
 opentelemetry_sdk = { version = "0.31", default-features = false, features = ["logs"] }
@@ -39,9 +38,7 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokenizers = { workspace = true }
 ureq = { version = "2.12", features = ["json"] }
-qwen3-spec = { path = "../qwen3-spec" }
 qwen35-spec = { path = "../qwen35-spec" }
-deepseek-spec = { path = "../deepseek-spec" }
 chat = { path = "../chat" }
 infer-api = { path = "../infer-api", default-features = false, optional = true }
 infer-plan = { path = "../infer-plan" }
