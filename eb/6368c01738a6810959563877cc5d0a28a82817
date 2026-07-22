@@ -1,0 +1,31 @@
+crates/infer-metal/src/deepseek_ocr.rs
+  s_a3e98609df121b::t_c6d90aa64c85c3 43-48
+crates/infer-metal/src/diffusion_gemma.rs
+  s_a3e98609df121b::t_3231f608e3e477 39-44
+crates/infer-metal/src/executor.rs
+  s_a3e98609df121b::t_5dc2983a7675c6 17,333
+crates/infer-metal/src/gemma4.rs
+  s_a3e98609df121b::t_eda322d0b86083 43-48
+crates/infer-metal/src/resource.rs
+  s_a3e98609df121b::t_fedece2d2ed1bb 177-214
+docs/experience/wins/2026-07-22-metal-startup-mlx-limits.md
+  s_a3e98609df121b::t_27cd51e35a0af3 1-55
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "eb6368c01738a6810959563877cc5d0a28a82817",
+  "prompts": {},
+  "sessions": {
+    "s_a3e98609df121b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a86d7d58b687e3418",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
