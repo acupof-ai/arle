@@ -214,7 +214,7 @@ Code: `infer-cuda/src/deepep.rs` (`deepep_ll`), `moe.rs`.
 
 | Candidate | Decision |
 |---|---|
-| residual + RMSNorm | **KILL** — matched c=1/2/4/8 wall A/B was WASH; treatment deleted; current symbols have zero live caller |
+| residual + RMSNorm | KILL — see B4 verdict above |
 | host `seqlen_k` → device | B1 deferred |
 | FA3 decode default OFF | **B0 primary** |
 | silu pad → count-aware | B4 |
