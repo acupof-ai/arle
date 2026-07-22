@@ -20,7 +20,6 @@ dependencies = [
  "serde_json",
  "tokio",
  "tools",
- "uuid",
 ]
 
 [[package]]
@@ -134,7 +133,6 @@ dependencies = [
 name = "arle"
 version = "0.4.0"
 dependencies = [
- "anyhow",
  "cli",
  "infer-util",
  "serde_json",
@@ -410,7 +408,6 @@ dependencies = [
  "libc",
  "log",
  "nucleo-matcher",
- "qwen3-spec",
  "qwen35-spec",
  "reqwest",
  "rustyline",
@@ -418,7 +415,6 @@ dependencies = [
  "serde_json",
  "sysinfo",
  "tempfile",
- "thiserror 2.0.18",
  "tokio",
  "tools",
  "train",
@@ -626,7 +622,6 @@ dependencies = [
  "anyhow",
  "cc",
  "cudarc",
- "fs4",
  "half",
  "log",
  "ring",
@@ -692,7 +687,6 @@ name = "deepep-sys"
 version = "0.4.0"
 dependencies = [
  "anyhow",
- "cc",
  "libc",
  "thiserror 1.0.69",
 ]
@@ -1019,16 +1013,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
 dependencies = [
  "percent-encoding",
-]
-
-[[package]]
-name = "fs4"
-version = "1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7e72ed92b67c146290f88e9c89d60ca163ea417a446f61ffd7b72df3e7f1dfd5"
-dependencies = [
- "rustix",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1676,7 +1660,6 @@ dependencies = [
  "infer-plan",
  "infer-seam",
  "kv-native-sys",
- "libc",
  "log",
  "mlx-sys",
  "serde",
@@ -1686,9 +1669,6 @@ dependencies = [
 [[package]]
 name = "infer-moe"
 version = "0.4.0"
-dependencies = [
- "serde",
-]
 
 [[package]]
 name = "infer-plan"
@@ -1734,9 +1714,6 @@ dependencies = [
 [[package]]
 name = "infer-topo"
 version = "0.4.0"
-dependencies = [
- "serde",
-]
 
 [[package]]
 name = "infer-util"
@@ -1866,7 +1843,6 @@ dependencies = [
  "libc",
  "log",
  "memmap2",
- "nix 0.31.3",
  "tempfile",
 ]
 
@@ -3772,9 +3748,7 @@ dependencies = [
  "base64 0.22.1",
  "chat",
  "cuda-kernels",
- "deepseek-spec",
  "half",
- "hf-hub",
  "infer-api",
  "infer-plan",
  "infer-server",
@@ -3783,7 +3757,6 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
- "qwen3-spec",
  "qwen35-spec",
  "safetensors",
  "serde",
