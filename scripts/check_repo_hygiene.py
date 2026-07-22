@@ -106,10 +106,15 @@ MARKDOWN_LINK_RE = re.compile(r"\[[^\]]+\]\(([^)]+)\)")
 
 WORKSPACE_MANIFEST = Path("Cargo.toml")
 CODEBASE_MAP = Path("docs/codebase-map.md")
+KERNEL_REGISTRY = Path("docs/reviews/kernel-registry.md")
+CUDA_CSRC = Path("crates/cuda-kernels/csrc")
 WORKSPACE_MEMBER_RE = re.compile(r'^\s*"crates/([A-Za-z0-9_-]+)"\s*,?\s*$')
 # Includes `*` so wildcard mentions like `crates/infer-*` are captured whole
 # (and then skipped) instead of truncating to a non-existent crate name.
 CRATE_REF_RE = re.compile(r"crates/([A-Za-z0-9_*-]+)")
+KERNEL_FAMILY_RE = re.compile(r"csrc/\{([^}]+)\}/", re.DOTALL)
+LIVE_CU_COUNT_RE = re.compile(r"^- \*\*(\d+) `\.cu`\*\* across", re.MULTILINE)
+REGISTRY_CSRC_CELL_RE = re.compile(r"^\|[^\n]*?\|\s*`([^`]+\.cu)`(?:,\s*`([^`]+\.cu)`)?\s*\|", re.MULTILINE)
 
 
 def repo_path(path: Path) -> str:
@@ -242,6 +247,48 @@ def check_workspace_truth_surface() -> list[str]:
             errors.append(
                 f"{CODEBASE_MAP}: references crates/{name}, which does not exist in the tree"
             )
+    return errors
+
+
+def check_kernel_registry() -> list[str]:
+    text = load_text(ROOT / KERNEL_REGISTRY)
+    csrc = ROOT / CUDA_CSRC
+    families = {
+        path.name
+        for path in csrc.iterdir()
+        if path.is_dir() and any(path.rglob("*.cu"))
+    }
+    family_match = KERNEL_FAMILY_RE.search(text)
+    if family_match is None:
+        return [f"{KERNEL_REGISTRY}: missing current csrc family declaration"]
+
+    declared_families = {
+        name.strip().lstrip("> ") for name in family_match.group(1).split(",")
+    }
+    errors = []
+    if declared_families != families:
+        errors.append(
+            f"{KERNEL_REGISTRY}: declared CUDA families {sorted(declared_families)} != tree {sorted(families)}"
+        )
+
+    cu_files = list(csrc.rglob("*.cu"))
+    count_match = LIVE_CU_COUNT_RE.search(text)
+    if count_match is None:
+        errors.append(f"{KERNEL_REGISTRY}: missing live .cu count reconciliation")
+    elif int(count_match.group(1)) != len(cu_files):
+        errors.append(
+            f"{KERNEL_REGISTRY}: declared live .cu count {count_match.group(1)} != tree {len(cu_files)}"
+        )
+
+    registry_paths = set()
+    for match in REGISTRY_CSRC_CELL_RE.finditer(text):
+        first, second = match.groups()
+        registry_paths.add(first)
+        if second is not None:
+            registry_paths.add(str(Path(first).parent / second) if "/" not in second else second)
+    for rel_path in sorted(registry_paths):
+        if not (csrc / rel_path).is_file():
+            errors.append(f"{KERNEL_REGISTRY}: referenced csrc path does not exist: {rel_path}")
     return errors
 
 
@@ -388,6 +435,7 @@ def main() -> int:
     errors.extend(check_experience_doc_inventory())
     errors.extend(check_repo_wide_disallowed_markers())
     errors.extend(check_workspace_truth_surface())
+    errors.extend(check_kernel_registry())
 
     if errors:
         print("[repo-hygiene] FAIL")
@@ -398,7 +446,8 @@ def main() -> int:
     print("[repo-hygiene] OK")
     print(
         "[repo-hygiene] public docs, templates, local links, tracked junk, "
-        "repo-wide marker bans, experience entry caps, and workspace truth-surface checks all passed"
+        "repo-wide marker bans, experience entry caps, workspace truth-surface, "
+        "and kernel-registry drift checks all passed"
     )
     return 0
 
