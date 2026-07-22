@@ -1,0 +1,29 @@
+crates/infer-metal/Cargo.toml
+  s_64198bad41e253::t_351ff8e63b8700 24
+crates/infer-moe/Cargo.toml
+  s_64198bad41e253::t_e0b8b8cdf69efb 17
+crates/infer-moe/src/lib.rs
+  s_64198bad41e253::t_334fdfe9aa8199 3
+crates/infer-topo/Cargo.toml
+  s_64198bad41e253::t_2b2c92d073da52 15
+crates/infer-topo/src/lib.rs
+  s_64198bad41e253::t_93f54910342a63 4
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "1fdb1b8f8278fac1cae2b687a7644e8fffcc78a6",
+  "prompts": {},
+  "sessions": {
+    "s_64198bad41e253": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aa282c236478875ae",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
