@@ -57,7 +57,7 @@ fn should_prefetch_shards(rank: usize, available: usize, checkpoint: usize) -> b
 
 impl CudaModel {
     pub(crate) fn from_safetensors(model_path: &Path) -> Result<Self> {
-        let tp = build_tp_runtime()?;
+        let tp = build_tp_runtime(false)?;
         Self::from_safetensors_with_tp(model_path, tp)
     }
 
@@ -224,17 +224,18 @@ impl CudaModel {
 
 /// Build the tensor-parallel runtime for model load. Multi-rank `nccl` builds
 /// take the NCCL `unique_id` from `INFER_NCCL_UNIQUE_ID`; otherwise the no-op
-/// single runtime. Shared by the dense Qwen3 and Qwen3.5/3.6 hybrid loaders.
-pub(crate) fn build_tp_runtime() -> Result<crate::tp::TpRuntime> {
+/// single runtime.
+pub(crate) fn build_tp_runtime(
+    #[cfg_attr(not(feature = "nccl"), allow(unused_variables))] pin_numa: bool,
+) -> Result<crate::tp::TpRuntime> {
     #[cfg(feature = "nccl")]
     {
         let cfg = crate::tp::resolve_tp_config_from_env().map_err(|e| anyhow!("{e}"))?;
         if !cfg.is_single() {
-            // Bind this rank's CUDA device BEFORE ncclCommInitRank — NCCL pins
-            // the communicator to the current device at init, so without this
-            // every rank would init on device 0 (mirrors the proven
-            // `dsv4::build_dsv4_tp_runtime` flow).
             let ordinal = cuda_kernels::tensor::parse_device_ordinal_from_env()?;
+            if pin_numa {
+                crate::numa_pin::pin_to_gpu_numa(ordinal as usize, cfg.world_size as usize);
+            }
             cudarc::runtime::result::device::set(ordinal as i32)
                 .map_err(|e| anyhow!("cudaSetDevice({ordinal}) before NCCL init failed: {e}"))?;
             let unique_id = nccl_unique_id_from_env()?;
