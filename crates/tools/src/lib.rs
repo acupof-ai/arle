@@ -347,6 +347,18 @@ fn resolved_python_executable() -> PathBuf {
 }
 
 impl SandboxConfig {
+    fn configure_native_command(&self, cmd: &mut Command) {
+        cmd.current_dir(&self.workdir);
+        cmd.env_clear();
+        cmd.env("PATH", default_env_path());
+        cmd.env(
+            "HOME",
+            std::env::var("HOME").unwrap_or_else(|_| self.workdir.clone()),
+        );
+        cmd.env("TMPDIR", effective_tmpdir());
+        cmd.env("LANG", "C.UTF-8");
+    }
+
     fn wrap_shell(&self, user_cmd: &str) -> Command {
         match active_sandbox_backend() {
             SandboxBackend::Nsjail => self.wrap_shell_nsjail(user_cmd),
@@ -421,15 +433,7 @@ impl SandboxConfig {
         let mut cmd = Command::new("/usr/bin/sandbox-exec");
         cmd.arg("-p").arg(Self::sandbox_exec_profile());
         cmd.arg("/bin/bash").arg("-c").arg(user_cmd);
-        cmd.current_dir(&self.workdir);
-        cmd.env_clear();
-        cmd.env("PATH", default_env_path());
-        cmd.env(
-            "HOME",
-            std::env::var("HOME").unwrap_or_else(|_| self.workdir.clone()),
-        );
-        cmd.env("TMPDIR", effective_tmpdir());
-        cmd.env("LANG", "C.UTF-8");
+        self.configure_native_command(&mut cmd);
         cmd.env("PYTHONDONTWRITEBYTECODE", "1");
         cmd
     }
@@ -438,15 +442,7 @@ impl SandboxConfig {
     fn wrap_shell_bare(&self, user_cmd: &str) -> Command {
         let mut cmd = Command::new("bash");
         cmd.arg("-c").arg(user_cmd);
-        cmd.current_dir(&self.workdir);
-        cmd.env_clear();
-        cmd.env("PATH", default_env_path());
-        cmd.env(
-            "HOME",
-            std::env::var("HOME").unwrap_or_else(|_| self.workdir.clone()),
-        );
-        cmd.env("TMPDIR", effective_tmpdir());
-        cmd.env("LANG", "C.UTF-8");
+        self.configure_native_command(&mut cmd);
         cmd
     }
 
@@ -454,15 +450,7 @@ impl SandboxConfig {
     fn wrap_shell_bare(&self, user_cmd: &str) -> Command {
         let mut cmd = Command::new("cmd");
         cmd.arg("/d").arg("/c").arg(user_cmd);
-        cmd.current_dir(&self.workdir);
-        cmd.env_clear();
-        cmd.env("PATH", default_env_path());
-        cmd.env(
-            "HOME",
-            std::env::var("HOME").unwrap_or_else(|_| self.workdir.clone()),
-        );
-        cmd.env("TMPDIR", effective_tmpdir());
-        cmd.env("LANG", "C.UTF-8");
+        self.configure_native_command(&mut cmd);
         cmd
     }
 
