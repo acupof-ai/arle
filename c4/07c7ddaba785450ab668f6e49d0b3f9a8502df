@@ -1,0 +1,25 @@
+crates/train/src/lora.rs
+  s_fd7831b64934f1::t_2a46e3a7cc39bc 388,397,405
+crates/train/src/moe.rs
+  s_fd7831b64934f1::t_f62019ee4a6c8a 11
+crates/train/src/qwen35.rs
+  s_fd7831b64934f1::t_0d3543b3cc302a 27
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "c407c7ddaba785450ab668f6e49d0b3f9a8502df",
+  "prompts": {},
+  "sessions": {
+    "s_fd7831b64934f1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aa5967be398232c3a",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
