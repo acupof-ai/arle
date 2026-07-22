@@ -1123,7 +1123,7 @@ mod gpu {
         // sm_120 (Blackwell) has no DeepGEMM native bridge (Hopper-only); the FP8
         // grouped GEMMs route to the CUTLASS sm_120a grouped blockwise collective
         // instead, on the SAME contiguous grouped buffers.
-        let sm120 = ctx.compute_capability().0 == 12;
+        let sm120 = ctx.is_sm120();
 
         let fp8_grouped = match (&weights.w13_fp8_grouped, &weights.down_fp8_grouped) {
             (Some(w13), Some(down)) => Some((w13, down)),
@@ -1297,7 +1297,9 @@ mod gpu {
 
         // Contiguous only: row → local-expert map (-1 pads, refilled every
         // call for the same sentinel reason as packed_route_slot).
-        let m_indices = if use_masked {
+        // sm_120's CUTLASS collective consumes offsets+counts directly and never
+        // reads `m_indices` — skip the fill + the neg1 buffer there.
+        let m_indices = if use_masked || sm120 {
             None
         } else {
             let m_indices = cache_ptr(scratch.dg_m_indices.neg1_filled(ctx, rows)?, ctx);
@@ -1339,7 +1341,19 @@ mod gpu {
                 "Qwen FP8 DeepGEMM MoE is prefill-only and requires contiguous layout"
             );
             let moe_inter = w13.rows / 2;
-            let m_indices = m_indices.expect("contiguous path fills m_indices");
+            // Layout contract from the cache — the loader recorded whether SFB is
+            // N-contiguous (CUTLASS sm_120a) or K-contiguous (Hopper DeepGEMM).
+            // Dispatch on THIS, not a re-derived SM, so the two can't disagree.
+            let fp8_n_contiguous = w13.sfb_n_contiguous;
+            ensure!(
+                down_g.sfb_n_contiguous == fp8_n_contiguous,
+                "FP8 MoE SFB layout mismatch: w13 n_contiguous={fp8_n_contiguous} down={}",
+                down_g.sfb_n_contiguous
+            );
+            debug_assert_eq!(
+                fp8_n_contiguous, sm120,
+                "loader/executor disagree on sm_120 SFB layout"
+            );
             let scale_stride_m = rows.div_ceil(4) * 4;
             let hidden_scale_cols = hidden_dim.div_ceil(128);
             let inter_scale_cols = moe_inter.div_ceil(128);
@@ -1359,6 +1373,53 @@ mod gpu {
                 .map_err(|_| anyhow::anyhow!("FP8 DeepGEMM MoE rows overflow i32"))?;
             let active_counts = scratch.dg_active_counts.upload(ctx, &[rows_i32])?;
             let stream = ctx.stream.cu_stream();
+            // One dispatch for both grouped FP8 GEMMs (w13 + down): identical
+            // group geometry, differing only in operands + (n,k). The cache's
+            // layout contract picks the backend.
+            let run_grouped_gemm = |a: RawDevicePtr<u8>,
+                                    sfa: RawDevicePtr<f32>,
+                                    b: RawDevicePtr<u8>,
+                                    sfb: RawDevicePtr<f32>,
+                                    d: RawDevicePtr<bf16>,
+                                    n: usize,
+                                    k: usize|
+             -> Result<()> {
+                // SAFETY: ptrs from live device allocations sized to the dims passed.
+                unsafe {
+                    if fp8_n_contiguous {
+                        moe::arle_fp8_moe_grouped_gemm_nt_sm120(
+                            a,
+                            sfa,
+                            b,
+                            sfb,
+                            d,
+                            offsets_ptr,
+                            counts,
+                            local_experts,
+                            n,
+                            k,
+                            scale_stride_m,
+                            stream,
+                        )
+                    } else {
+                        moe::dsv4_deepgemm_m_grouped_fp8_gemm_nt_contiguous(
+                            a,
+                            sfa,
+                            b,
+                            sfb,
+                            d,
+                            m_indices.expect("contiguous non-sm120 FP8 path fills m_indices"),
+                            local_experts,
+                            rows,
+                            n,
+                            k,
+                            scale_stride_m,
+                            DEEPGEMM_CONTIG_ALIGN,
+                            stream,
+                        )
+                    }
+                }
+            };
             qwen_moe_profile(
                 ctx,
                 "qwen/fp8/pack_quantize_hidden",
@@ -1388,40 +1449,16 @@ mod gpu {
                 rows,
                 2 * moe_inter,
                 hidden_dim,
-                // SAFETY: ptrs from live device allocations sized to the dims passed.
-                || unsafe {
-                    if sm120 {
-                        moe::arle_fp8_moe_grouped_gemm_nt_sm120(
-                            cache_ptr(input_fp8, ctx),
-                            cache_ptr(input_scales, ctx),
-                            cache_ptr(&w13.weight, ctx),
-                            cache_ptr(&w13.scales, ctx),
-                            cache_ptr(&w13_out.data, ctx),
-                            offsets_ptr,
-                            counts,
-                            local_experts,
-                            2 * moe_inter,
-                            hidden_dim,
-                            scale_stride_m,
-                            stream,
-                        )
-                    } else {
-                        moe::dsv4_deepgemm_m_grouped_fp8_gemm_nt_contiguous(
-                            cache_ptr(input_fp8, ctx),
-                            cache_ptr(input_scales, ctx),
-                            cache_ptr(&w13.weight, ctx),
-                            cache_ptr(&w13.scales, ctx),
-                            cache_ptr(&w13_out.data, ctx),
-                            m_indices,
-                            local_experts,
-                            rows,
-                            2 * moe_inter,
-                            hidden_dim,
-                            scale_stride_m,
-                            DEEPGEMM_CONTIG_ALIGN,
-                            stream,
-                        )
-                    }
+                || {
+                    run_grouped_gemm(
+                        cache_ptr(input_fp8, ctx),
+                        cache_ptr(input_scales, ctx),
+                        cache_ptr(&w13.weight, ctx),
+                        cache_ptr(&w13.scales, ctx),
+                        cache_ptr(&w13_out.data, ctx),
+                        2 * moe_inter,
+                        hidden_dim,
+                    )
                 },
             )?;
             qwen_moe_profile(
@@ -1453,40 +1490,16 @@ mod gpu {
                 rows,
                 hidden_dim,
                 moe_inter,
-                // SAFETY: ptrs from live device allocations sized to the dims passed.
-                || unsafe {
-                    if sm120 {
-                        moe::arle_fp8_moe_grouped_gemm_nt_sm120(
-                            cache_ptr(act_fp8, ctx),
-                            cache_ptr(act_scales, ctx),
-                            cache_ptr(&down_g.weight, ctx),
-                            cache_ptr(&down_g.scales, ctx),
-                            cache_ptr(&expert_out.data, ctx),
-                            offsets_ptr,
-                            counts,
-                            local_experts,
-                            hidden_dim,
-                            moe_inter,
-                            scale_stride_m,
-                            stream,
-                        )
-                    } else {
-                        moe::dsv4_deepgemm_m_grouped_fp8_gemm_nt_contiguous(
-                            cache_ptr(act_fp8, ctx),
-                            cache_ptr(act_scales, ctx),
-                            cache_ptr(&down_g.weight, ctx),
-                            cache_ptr(&down_g.scales, ctx),
-                            cache_ptr(&expert_out.data, ctx),
-                            m_indices,
-                            local_experts,
-                            rows,
-                            hidden_dim,
-                            moe_inter,
-                            scale_stride_m,
-                            DEEPGEMM_CONTIG_ALIGN,
-                            stream,
-                        )
-                    }
+                || {
+                    run_grouped_gemm(
+                        cache_ptr(act_fp8, ctx),
+                        cache_ptr(act_scales, ctx),
+                        cache_ptr(&down_g.weight, ctx),
+                        cache_ptr(&down_g.scales, ctx),
+                        cache_ptr(&expert_out.data, ctx),
+                        hidden_dim,
+                        moe_inter,
+                    )
                 },
             )?;
 

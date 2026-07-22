@@ -1418,7 +1418,7 @@ impl SafetensorLoader {
         // sm_120a grouped collective consumes the SAME contiguous grouped FP8
         // caches — so build them here regardless of the (Hopper-only) preflight,
         // and transpose the weight scales to CUTLASS's N-contiguous SFB layout.
-        let sm120 = ctx.compute_capability().0 == 12;
+        let sm120 = ctx.is_sm120();
         let mut direct_fp8_routed = None;
         // The stacked tensors are HF `nn.Parameter`s — no `.weight` suffix on
         // the real Qwen3.6-35B-A3B checkpoint — but accept a `.weight`-suffixed
@@ -1890,6 +1890,9 @@ impl SafetensorLoader {
             );
         }
 
+        // `transpose_sfb` (== sm_120) both repacks the host scales to
+        // N-contiguous above AND records the layout on the cache, so the
+        // executor's dispatch reads one source of truth.
         let w13 = MoeFp8ExpertGroup::from_host(
             ctx,
             &w13_weight,
@@ -1897,6 +1900,7 @@ impl SafetensorLoader {
             groups,
             w13_rows,
             hidden_size,
+            transpose_sfb,
         )?;
         let down = MoeFp8ExpertGroup::from_host(
             ctx,
@@ -1905,6 +1909,7 @@ impl SafetensorLoader {
             groups,
             hidden_size,
             moe_intermediate_size,
+            transpose_sfb,
         )?;
         self.log_startup_phase(
             "moe.direct_fp8_grouped_load",
@@ -4921,6 +4926,7 @@ struct MoeFp8ExpertGroupHostSnapshot {
     groups: usize,
     rows: usize,
     cols: usize,
+    sfb_n_contiguous: bool,
 }
 
 impl MoeLayerWeights {
@@ -5320,6 +5326,7 @@ fn reload_fp8_group_opt(
                 snapshot.groups,
                 snapshot.rows,
                 snapshot.cols,
+                snapshot.sfb_n_contiguous,
             )
             .with_context(|| format!("reload {label}"))
         })
@@ -5449,6 +5456,12 @@ pub(crate) struct MoeFp8ExpertGroup {
     pub(crate) cols: usize,
     pub(crate) scale_rows: usize,
     pub(crate) scale_cols: usize,
+    /// SFB scale layout, decided once at load: `true` = N-contiguous per group
+    /// (transposed for the CUTLASS sm_120a collective), `false` = the
+    /// checkpoint's K-contiguous packing (Hopper DeepGEMM). The executor
+    /// dispatches on this field, never re-deriving the SM — so loader and
+    /// executor cannot silently disagree on the operand layout.
+    pub(crate) sfb_n_contiguous: bool,
 }
 
 impl MoeFp8ExpertGroup {
@@ -5459,6 +5472,7 @@ impl MoeFp8ExpertGroup {
         groups: usize,
         rows: usize,
         cols: usize,
+        sfb_n_contiguous: bool,
     ) -> Result<Self> {
         ensure!(groups > 0, "FP8 MoE expert group: groups must be non-zero");
         ensure!(
@@ -5493,6 +5507,7 @@ impl MoeFp8ExpertGroup {
             cols,
             scale_rows,
             scale_cols,
+            sfb_n_contiguous,
         })
     }
 
@@ -5526,6 +5541,7 @@ impl MoeFp8ExpertGroup {
                 groups: self.groups,
                 rows: self.rows,
                 cols: self.cols,
+                sfb_n_contiguous: self.sfb_n_contiguous,
             },
             freed,
         ))
@@ -5591,6 +5607,8 @@ impl MoeFp8ExpertGroup {
             cols,
             scale_rows,
             scale_cols,
+            // `empty` backs the Hopper DeepGEMM concat path — K-contiguous SFB.
+            sfb_n_contiguous: false,
         })
     }
 
