@@ -385,7 +385,7 @@ fn zeros_parameter(
     )?))
 }
 
-fn seed_from_name(name: &str) -> u64 {
+pub(crate) fn seed_from_name(name: &str) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
     for byte in name.bytes() {
         hash ^= u64::from(byte);
@@ -394,7 +394,7 @@ fn seed_from_name(name: &str) -> u64 {
     hash
 }
 
-fn next_uniform(state: &mut u64) -> f32 {
+pub(crate) fn next_uniform(state: &mut u64) -> f32 {
     *state = state
         .wrapping_mul(6_364_136_223_846_793_005)
         .wrapping_add(1_442_695_040_888_963_407);
@@ -402,7 +402,7 @@ fn next_uniform(state: &mut u64) -> f32 {
     bits as f32 / (u32::MAX >> 8) as f32
 }
 
-fn leak_name(name: String) -> &'static str {
+pub(crate) fn leak_name(name: String) -> &'static str {
     Box::leak(name.into_boxed_str())
 }
 

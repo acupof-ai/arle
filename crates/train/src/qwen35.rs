@@ -24,7 +24,7 @@ use thiserror::Error;
 
 use crate::{
     causal_lm::CausalLm,
-    lora::{LinearWithLora, LoraConfig, LoraTargetSet},
+    lora::{LinearWithLora, LoraConfig, LoraTargetSet, leak_name, next_uniform, seed_from_name},
 };
 
 #[derive(Debug, Error)]
@@ -5927,27 +5927,6 @@ fn ones_or_unmaterialized_parameter(
         let _ = name;
         Ok(store.alloc(Tensor::unmaterialized(shape.to_vec(), false)?))
     }
-}
-
-fn seed_from_name(name: &str) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    for byte in name.bytes() {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
-}
-
-fn next_uniform(state: &mut u64) -> f32 {
-    *state = state
-        .wrapping_mul(6_364_136_223_846_793_005)
-        .wrapping_add(1_442_695_040_888_963_407);
-    let bits = (*state >> 40) as u32;
-    bits as f32 / (u32::MAX >> 8) as f32
-}
-
-fn leak_name(name: String) -> &'static str {
-    Box::leak(name.into_boxed_str())
 }
 
 #[cfg(test)]
