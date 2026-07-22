@@ -909,7 +909,6 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         let mut finished_slots = Vec::new();
         // Committed tokens (prefill then decode), forwarded to `on_token` after request loops.
         let mut committed: Vec<(RequestHandle, SlotToken)> = Vec::new();
-        let model_stops = self.model_stop_token_ids.clone();
 
         // Advance chunked prefill. Non-final chunk only moves progress; final chunk transitions to decode.
         let mut prompt_sealed_slots: Vec<usize> = Vec::new();
@@ -935,7 +934,9 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                     .and_then(VecDeque::pop_front)
                 {
                     request.generated_tokens.push(token.token);
-                    if let Some(finish) = finish_reason_for(request, &token, &model_stops) {
+                    if let Some(finish) =
+                        finish_reason_for(request, &token, &self.model_stop_token_ids)
+                    {
                         finished_slots.push((row.slot, finish));
                     }
                     committed.push((request.handle, token));
@@ -981,7 +982,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                     break;
                 }
                 request.generated_tokens.push(token.token);
-                let finished = finish_reason_for(request, &token, &model_stops);
+                let finished = finish_reason_for(request, &token, &self.model_stop_token_ids);
                 committed.push((request.handle, token));
                 token_idx += 1;
                 if let Some(finish) = finished {
