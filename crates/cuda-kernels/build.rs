@@ -1,5 +1,3 @@
-#[allow(unused_imports)]
-use fs4::FileExt;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
