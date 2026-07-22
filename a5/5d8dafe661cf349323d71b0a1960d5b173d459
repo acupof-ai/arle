@@ -1,0 +1,21 @@
+crates/kv-native-sys/src/kv_tier.rs
+  s_4cf553cdcc194f::t_de923e1c806cb0 349,435,442-444
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "a55d8dafe661cf349323d71b0a1960d5b173d459",
+  "prompts": {},
+  "sessions": {
+    "s_4cf553cdcc194f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a06cfa313336908ae",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
