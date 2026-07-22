@@ -1,6 +1,6 @@
 # DSv4 Route A: Cross-Request FlashMLA Page Sharing (MODEL1 only)
 
-> Status: Shipped — 2026-07-09
+> Status: Historical shipped result; superseded 2026-07-10 — this Route A `host_to_flashmla` page-sharing implementation was deleted for correctness. Measurements below are retained as historical evidence.
 
 ## Goal
 

@@ -1,5 +1,7 @@
 # DSv4 auto-context ceiling (`29fdda704`) caps the value but does not fix the crash at TP=4
 
+> Superseded/corrected 2026-07-06: the old path returned an `anyhow::ensure!` error, not a Rust panic. `ba36fbd39` added the missing FlashMLA-band pre-check; infeasible TP4 `max_seq_len=32768` now rejects earlier with an actionable message. Historical boot results below are unchanged.
+
 ## Context
 
 Pod-verifying `29fdda704` ("cap DSv4's auto-resolved max-context at a known-safe

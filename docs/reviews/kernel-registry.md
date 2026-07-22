@@ -1,14 +1,15 @@
 # Kernel Registry — live CUDA operator index (`crates/cuda-kernels`)
 
-> **Source of truth = code, not docs.** Refreshed 2026-07-12 (post csrc reorg,
-> `9fc53e7e4`..`051edb29b`) by re-scanning all **56** `.cu` under
-> `crates/cuda-kernels/csrc/{attention,comm,deepep_sidecar,elementwise,gemm,kv,
-> moe,norm,quant,recurrent,sampling}/`, the FFI decls in
+> **Source of truth = code, not docs.** The 2026-07-12 reorg snapshot below is
+> historical. Current reconciliation: **63** `.cu` under
+> `crates/cuda-kernels/csrc/{attention,comm,elementwise,gemm,kv,moe,norm,quant,
+> recurrent,sampling}/`, the FFI decls in
 > `crates/cuda-kernels/src/ffi/`, and the **live callers in
 > `crates/infer-cuda/src/`**. **The reorg** exploded the `misc/` junk drawer
 > (0 files now): new `sampling/`·`norm/`·`recurrent/`·`elementwise/` dirs; DSv4
 > MLA/DSA/MHC + TP-repack + FlashMLA/FA3 shims → `attention/`; `kvcacheio/`
-> merged into `kv/` — every family now aligns to its `src/ffi/` split. **Dead
+> merged into `kv/`. Most families align with `src/ffi/`; legacy DSv4 attention
+> declarations remain primarily in `src/ffi/misc.rs`. **Dead
 > code deleted:** 3 Marlin W4/W4A8 GEMM `.cu` (`marlin_kernel.cu`,
 > `marlin_w4_fp8_kernel.cu`, `marlin_w4a8_kernel.cu` + `marlin_dequant.cuh` +
 > `marlin_pf8/`), `kv/paged_kv_append.cu`, `kv/scatter_kv.cu`, and their 5
@@ -43,14 +44,13 @@
 
 ## Count reconciliation
 
-- **56 `.cu`** across 10 kernel dirs (`attention` 22, `gemm` 14, `recurrent` 6,
-  `kv` 4, `quant` 3, `moe`/`elementwise` 2, `comm`/`sampling`/`norm` 1 each);
-  `deepep_sidecar/` holds a `.cpp` sidecar binary, **0 `.cu`**. The 07-12 reorg
-  moved files between dirs (misc/→domain dirs) and deleted 5 `.cu` (3 Marlin
-  GEMM + `paged_kv_append.cu` + `scatter_kv.cu`); it added no new kernels.
-- **~278 unique `extern "C"` symbols** (> 61 because most `.cu` export several
+- **63 `.cu`** across 10 kernel dirs (`attention` 28, `gemm` 15, `recurrent` 6,
+  `kv` 4, `quant` 3, `moe`/`elementwise` 2, `comm`/`sampling`/`norm` 1 each).
+  `deepep_sidecar/` is a separate C++ sidecar with **0 `.cu`**. The 2026-07-12
+  56-file count is a historical reorg snapshot, not the current inventory.
+- **~278 unique `extern "C"` symbols** (> 63 because most `.cu` export several
   launchers, and `deepgemm_native.cu`/`deepgemm_bridge_stub.cu` declare the same
-  symbol set twice). Live rows below ≈ 80; the remainder are §unwired.
+  symbol set twice). Live rows below ≈ 83; the remainder are §unwired.
 - **06-30 deletions applied:** `469e24c9b` removed whole files
   `gemm/dsv4_grouped_gemm.cu` (−408) and `gemm/quantized_gemv_mma.cu` (−330) and
   trimmed `quantized_gemv.cu` (−1097) — so the 06-30 unwired rows for
@@ -77,6 +77,8 @@
 | attention (FlashMLA) | `attention/arle_flashmla_decode_shim.cu`, `attention/arle_flashmla_decode_stubs.cu` | `arle_flashmla_sm90_sparse_decode_fwd` | `attention.rs::mla_attention`, `attention/flashmla.rs` | SM90 sparse MLA decode (vendored FlashMLA bridge) | bf16 / fp8-e4m3 kv |
 | attention (FlashMLA) | `attention/arle_flashmla_shim.cu` | `arle_flashmla_sm90_sparse_prefill_fwd` | `attention.rs::mla_attention` | SM90 sparse MLA prefill | bf16 |
 | attention (FA3) | `attention/arle_fa3_shim.cu`, `arle_fa3_stubs.cu` | `arle_fa3_fwd_hd256_bf16_cuda` | `qwen35.rs::full_attention` | FA3 hd256 full-attn (vendored FA3 bridge) | bf16 |
+| attention (FA2 SM70) | `attention/arle_fa2_sm70.cu` | `arle_fa2_sm70_attention_cuda` | `qwen35.rs::full_attention` | SM70 full attention | bf16 |
+| attention (DSpark) | `attention/dsv4_dspark_draft_attention.cu` | `dsv4_dspark_draft_attention_cuda` | `dsv4/dspark.rs::forward_stage` | DSv4 draft attention | bf16 |
 
 > Live Qwen3-dense paged attention itself runs on **TileLang AOT** kernels
 > (`tilelang_batch_{prefill,decode}_paged_hd128_q{16,32,40,64}_kv8_run_cuda`,
@@ -93,18 +95,19 @@
 
 ## attention/ — DSv4 MLA + DSA + MHC + TP repack
 
-Core DSv4 attention kernels, relocated from `csrc/misc/` into `csrc/attention/`
-in the 07-12 reorg (matching `src/ffi/attention.rs`).
+Core DSv4 attention kernels, relocated from `csrc/misc/` into split
+`csrc/attention/` translation units. Legacy declarations remain primarily in
+`src/ffi/misc.rs`; source and Rust FFI modules are not aligned 1:1.
 
 | family | csrc file | FFI symbol | Rust caller | op shape | precision |
 |---|---|---|---|---|---|
-| attention (DSv4) | `attention/dsv4_attention.cu` | `dsv4_prepare_qk_cuda` / `…_start_pos_ptr_cuda` / `…_fused_batch_start_pos_cuda` | `attention.rs::mla_attention` | Q/K RoPE prep, d_qk 576 (512 NoPE+64 RoPE) | bf16 |
-| attention (DSv4) | `attention/dsv4_attention.cu` | `dsv4_swa_attention_cuda` / `…_start_pos_ptr_cuda` | `attention.rs::mla_attention` | sliding-window attn, hd≤1024 | bf16 |
-| attention (DSv4) | `attention/dsv4_attention.cu` | `dsv4_hybrid_attention_cuda` / `…_start_pos_ptr_cuda` | `attention.rs::mla_attention` | hybrid SWA+compressed attn | bf16 |
-| attention (DSv4) | `attention/dsv4_attention.cu` | `dsv4_compressor_update_cuda` / `…_start_pos_ptr_cuda` / `…_batched_start_pos_ptr_cuda` | `attention.rs::compressor_forward` | compressor KV update | bf16 |
-| attention (DSv4) | `attention/dsv4_attention.cu` | `dsv4_update_window_cache_cuda` / `…_start_pos_ptr_cuda` / `…_batched_ptr_cuda` | `attention.rs` (Route A window cache) | sliding window cache write | bf16 |
-| attention (DSv4, Route A) | `attention/dsv4_attention.cu` | `dsv4_oproj_group_gather_cuda` / `dsv4_oproj_group_scatter_cuda` | `attention.rs::dsv4_oproj_group_{gather,scatter}` | o-proj group gather/scatter over compressor-state pool (`6a78a490d`) | bf16 |
-| attention (DSv4) | `attention/dsv4_attention.cu` | `arle_dsv4_output_inverse_rope_cuda` / `…_start_pos_ptr_cuda` / `…_batched_ptr_cuda` / `…_batch_start_pos_cuda` | `attention.rs::mla_attention` (FlashMLA out path) | inverse-RoPE on MLA output | bf16 |
+| attention (DSv4) | `attention/dsv4_prep.cu` | `dsv4_prepare_qk_cuda` / `…_start_pos_ptr_cuda` / `…_fused_batch_start_pos_cuda` | `attention.rs::mla_attention` | Q/K RoPE prep, d_qk 576 (512 NoPE+64 RoPE) | bf16 |
+| attention (DSv4) | `attention/dsv4_swa.cu` | `dsv4_swa_attention_cuda` / `…_start_pos_ptr_cuda` | `attention.rs::mla_attention` | sliding-window attn, hd≤1024 | bf16 |
+| attention (DSv4) | `attention/dsv4_hybrid.cu` | `dsv4_hybrid_attention_cuda` / `…_start_pos_ptr_cuda` | `attention.rs::mla_attention` | hybrid SWA+compressed attn | bf16 |
+| attention (DSv4) | `attention/dsv4_compressor.cu` | `dsv4_compressor_update_cuda` / `…_start_pos_ptr_cuda` / `…_batched_start_pos_ptr_cuda` | `attention.rs::compressor_forward` | compressor KV update | bf16 |
+| attention (DSv4) | `attention/dsv4_swa.cu` | `dsv4_update_window_cache_cuda` / `…_start_pos_ptr_cuda` / `…_batched_ptr_cuda` | `attention.rs` (Route A window cache) | sliding window cache write | bf16 |
+| attention (DSv4, Route A) | `attention/dsv4_oproj.cu` | `dsv4_oproj_group_gather_cuda` / `dsv4_oproj_group_scatter_cuda` | `attention.rs::dsv4_oproj_group_{gather,scatter}` | o-proj group gather/scatter over compressor-state pool (`6a78a490d`) | bf16 |
+| attention (DSv4) | `attention/dsv4_oproj.cu` | `arle_dsv4_output_inverse_rope_cuda` / `…_start_pos_ptr_cuda` / `…_batched_ptr_cuda` / `…_batch_start_pos_cuda` | `attention.rs::mla_attention` (FlashMLA out path) | inverse-RoPE on MLA output | bf16 |
 | attention (DSv4 DSA) | `attention/dsv4_dsa_official.cu` | `dsv4_deepseek_v4_topk_transform_cuda` | `attention.rs` (DSA select) | official DSA top-k transform | bf16 |
 | attention (DSv4 DSA) | `attention/dsv4_dsa_official.cu` | `dsv4_dsa_build_select_meta_cuda` | `attention.rs` | DSA block-select metadata | i32 |
 | attention (DSv4 DSA) | `attention/dsv4_dsa_official.cu` | `dsv4_dsa_fused_q_indexer_rope_hadamard_quant_cuda` | `attention.rs` | fused Q-indexer RoPE+Hadamard+quant | bf16→fp8 |
@@ -142,6 +145,7 @@ in the 07-12 reorg (matching `src/ffi/attention.rs`).
 | gemm (Marlin) | `gemm/marlin_repack.cu` | `gptq_marlin_repack_cuda` | `[ck tensor.rs::repack_for_marlin]` | GPTQ→Marlin weight repack | int4 |
 | gemm (Marlin) | `gemm/marlin_int4_fp8_preprocess.cu` | `marlin_int4_fp8_preprocess_without_zp_cuda` | `[ck tensor.rs::from_hybrid_w4_marlin]` | W4 hybrid Marlin preprocess (no zero-point) | int4/fp8 |
 | gemm (DSv4 cache) | `gemm/dsv4_fp8_cache.cu` | `dsv4_block_scaled_to_fp8_deepgemm_cuda` | `[ck tensor.rs::dsv4_fill_fp8_deepgemm_weight_cache]` | block-scaled→FP8 DeepGEMM weight cache fill | fp8-e4m3 |
+| gemm (Qwen3.6 MoE SM120) | `gemm/fp8_moe_grouped_cutlass_sm120.cu` | `arle_fp8_moe_grouped_gemm_nt_sm120_cuda` | `moe.rs::moe_forward` `[ck moe.rs]` | grouped FP8 expert GEMM | fp8-e4m3 |
 
 > `deepgemm_native.cu` is default-built when sm_90 plus vendored DeepGEMM/CUTLASS
 > sources are present; `deepgemm_bridge_stub.cu` links the same symbols and returns
@@ -220,18 +224,19 @@ in the 07-12 reorg (matching `src/ffi/attention.rs`).
 | turboquant | `quant/turboquant.cu` | `turboquant_{quantize,dequantize}_kv_cuda`, `turboquant_generate_rotation`, `turboquant_lloyd_max`, … | **0 live caller** (TurboQuant KV path unattached in rewrite) |
 | turboquant | `quant/turboquant_fast.cu` | `turboquant_fast_{quantize,dequantize}_kv_cuda`, `turboquant_generate_signs` | **0 live caller** |
 
-## kv/ — paged-KV quant/pack/migrate (present, dormant in rewrite)
+## kv/ — paged-KV quant/pack/migrate
 
-`infer-cuda` drives `PagedKVPool` only for page lifecycle. The hand-rolled
-KV-quant / migrate / append kernels have **0 `infer-cuda` caller**; the live
-paged-KV write/read is the **TileLang kv8** path (`paged_kv_append_*` is invoked
-only inside `cuda-kernels/src/tilelang.rs`, not from `infer-cuda`).
+FP8/INT8 KIVI per-channel-K quantization, refill, and fused decode are live via
+`infer-cuda/src/attention.rs`; Qwen3.5 also invokes FP8 KV quantization from
+`infer-cuda/src/qwen35.rs`. INT4, TurboQuant, per-token-K, migrate, and
+incompatible variants remain unwired.
 
 | family | csrc file(s) | FFI symbol (representative) | status |
 |---|---|---|---|
 | kv migrate | `kv/kv_cache_to_paged.cu` | `kv_cache_to_paged_*_cuda` | 0 infer-cuda caller (`scatter_kv.cu`/`scatter_write_kv_cuda` deleted 07-12) |
 | kv append | `kv/paged_kv_metadata.cu` | `paged_kv_append_{new_page,last_token}_indices_cuda` | internal to `[ck tilelang.rs]` only (`paged_kv_append.cu`/`paged_kv_append_cuda` deleted 07-12) |
-| kv quant | `kv/kv_quant.cu` | `quantize_paged_kv_{fp8,int8,int4}_*_cuda`, `dequantize_paged_kv_*_cuda`, `quantize_scatter_kv_fp8_*_cuda` | 0 live caller (quantized-KV path unattached) |
+| kv quant (live FP8/INT8) | `kv/kv_quant.cu` | `quantize_paged_kv_{fp8,int8}_per_channel_cuda`, `dequantize_paged_kv_{fp8,int8}_per_channel_k_to_hnd_cuda` | live via `infer-cuda/src/attention.rs`; FP8 quantize also via `infer-cuda/src/qwen35.rs` |
+| kv quant (unwired variants) | `kv/kv_quant.cu` | INT4, per-token-K, scatter, and incompatible quant/dequant variants | 0 live caller |
 
 ## deepep_sidecar/ — NVSHMEM DeepEP sidecar (out-of-process, no `.cu`)
 
@@ -249,7 +254,7 @@ Verified by real-call-expression grep (excluding doc comments + `use` imports).
 |---|---|---|---|
 | DSv4 FP8-KV pack + FlashMLA index-build | `attention/dsv4_fp8_kv_pack.cu`, `attention/dsv4_flashmla_decode_build_indices.cu` | `arle_dsv4_fp8_kv_pack{,_strided,_strided_batched}_cuda`, `arle_dsv4_v32_fp8_kv_pack_strided_cuda`, `arle_dsv4_flashmla_decode_build_indices{,_start_pos_ptr,_batched}_cuda` | 0 caller — the live FlashMLA path uses the **vendored** `arle_flashmla_csa_*`/`hca_*` index builders instead |
 | FlashMLA CSA prep | `attention/arle_flashmla_csa_prep.cu` | (no `extern "C"` in-file; helper TU) | linked into shim only |
-| KV-quant decode-attention | `attention/decode_attention_quantized.cu`, `decode_attention_varlen_fp8.cu` | `decode_attention_{fp8,int8,int4}_per_channel_k_cuda`, `decode_attention_varlen_fp8_cuda` | wrappers in `[ck kv_quant.rs]` have 0 call sites |
+| KV-quant decode-attention tails | `attention/decode_attention_quantized.cu`, `decode_attention_varlen_fp8.cu` | INT4 and varlen/per-token incompatible variants | 0 live caller; FP8/INT8 per-channel-K decode is live via `infer-cuda/src/attention.rs` |
 | TurboQuant decode-attention | `attention/decode_attention_turboquant.cu` | `tq_decode_attention_cuda`, `tq_rotate_query_cuda` | wrappers in `[ck kv_turboquant.rs]`, 0 live caller |
 | Activation-quant + weight-gemv | `gemm/w4_fp8_activation_quant.cu`, `gemm/w4a8_activation_quant.cu`, `gemm/turboquant_weight_gemv.cu` | `quantize_bf16_rows_to_{fp8_e4m3,int8}_cuda`, `turboquant_weight_{gemv,dequant}_cuda` | 0 caller (their consumer Marlin W4/W4A8 GEMM `.cu` deleted 07-12; TQ-GEMM lane still unwired) |
 | DSv4 misc gemv variants | `gemm/quantized_gemv.cu` | `gemv_fp8_wread_probe_cuda`, `moe_fp8_block_scaled_grouped_gemv_pair_batch_cuda`, `moe_fp4_e2m1_grouped_gemv_pair_batch_cuda`, `dequantize_fp8_block_scaled_to_bf16` unpaired variants | probe/pair-grouped variants unused; the `_batch`/`route_batch` variants are live above |
@@ -265,8 +270,9 @@ Verified by real-call-expression grep (excluding doc comments + `use` imports).
 ## Organization verdict
 
 **The 07-12 reorg resolved the `misc/` junk-drawer problem** — `misc/` is deleted
-(0 files); every family now lives in a domain dir aligned 1:1 with its
-`src/ffi/*.rs` split. The prior "recommend: move X→Y" plan below was executed
+(0 files); every source family now lives in a domain dir. Most align with
+`src/ffi/*.rs`; legacy DSv4 attention declarations remain primarily in
+`src/ffi/misc.rs`. The prior "recommend: move X→Y" plan below was executed
 verbatim. Remaining work is pruning unwired tails, not relocation.
 
 | family dir | verdict |
@@ -275,6 +281,6 @@ verbatim. Remaining work is pruning unwired tails, not relocation.
 | `moe/` | **well-organized** — DSv4 route + Qwen3.6 route (EP-mask folded into `dsv4_route.cu`) + decode-pooled all live and in-family |
 | `comm/` | **well-organized** — single-purpose; the whole CAR family is live via `tp.rs` |
 | `attention/` | **well-organized + newly-live** — live paged-prep + hd256 + FA3/FlashMLA shim + DSpark ring **plus** the DSv4 MLA/DSA/MHC + TP-repack kernels relocated here 07-12; the DSv4-specific FP8-KV-pack + FlashMLA-index `.cu` stay unwired (vendored builders won) |
-| `sampling/`, `norm/`, `elementwise/`, `recurrent/` | **new, well-organized** — split out of `misc/` 07-12, each aligned to `src/ffi/{sampling,norm,elementwise,recurrent}.rs`; hold live DSpark sampling / norms / SwiGLU+embedding / Qwen3.5 linear-attn |
-| `kv/`, `quant/` | **dormant** — internally coherent but the whole quantized-KV / KV-tier / TurboQuant subsystem is unwired in the rewrite (TileLang kv8 owns the live KV path); `kvcacheio/transfer.cu` merged into `kv/` 07-12 |
+| `sampling/`, `norm/`, `elementwise/`, `recurrent/` | **new, well-organized** — split out of `misc/` 07-12; hold live DSpark sampling / norms / SwiGLU+embedding / Qwen3.5 linear-attn |
+| `kv/`, `quant/` | **mixed** — FP8/INT8 KIVI quantize/refill/decode is live; KV-tier transport, INT4/TurboQuant, and incompatible variants remain unwired; `kvcacheio/transfer.cu` merged into `kv/` 07-12 |
 | `deepep_sidecar/` | **separate deliverable** — an out-of-process NVSHMEM sidecar binary, not a kernel dir; keep isolated. |

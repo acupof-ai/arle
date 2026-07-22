@@ -1,6 +1,7 @@
 # Plan — DSpark/DFlash draft for Qwen3.6 spec decode (OPD rollout lever)
 
-> Status: Active — P0+P1 LICENSED, P2.5 + memory-clamp RESOLVED 2026-07-11 ·
+> Status: Shipped for the serial Agent-OPD lane — sampled verification licensed, DSpark default ON there, and train-sidecar Phase 1 shipped. High-concurrency default policy remains separate/deferred.
+>
 > Driver: OPD rollout is decode-bound (decode 80.4% of rollout wall, B=1 ~11
 > tok/s @45K). Native NextN-MTP capped at 1.03×; **DSpark/DFlash backbone nets
 > 2.4–3.8×** vs no-spec, greedy
@@ -10,8 +11,7 @@
 > **Draft-KV memory clamp fixed** (`1ee72d809`): full layer caps at
 > `min(max_seq_len, max_total_tokens)`, 544→64 MB/slot, slots 32→256, long-ctx
 > unblocked ([win](../experience/wins/2026-07-11-dspark-draft-kv-cap-per-request-ceiling.md)).
-> Remaining before OPD default: P2 temp>0 rejection-sampling verify + P3 train
-> the DSpark heads (Markov/confidence) for the +14.1% tool-call lift.
+> Remaining work is the high-concurrency default policy and later DSpark-head training beyond train-sidecar Phase 1.
 
 ## Verdict first
 
