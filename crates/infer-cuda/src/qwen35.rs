@@ -2662,7 +2662,7 @@ impl Qwen35Model {
     pub(crate) fn warm_fp8_deepgemm_dense_prefill(&self) -> Result<(usize, usize)> {
         let warm_m = self.max_seq_len.min(2048);
         // sm_120 dense FP8 runs the dequant→BF16 fallback (no DeepGEMM); nothing to warm.
-        if self.ctx.compute_capability().0 == 12 {
+        if self.ctx.is_sm120() {
             return Ok((0, warm_m));
         }
         if warm_m < 1024 {
@@ -2724,7 +2724,7 @@ impl Qwen35Model {
         let warm_tokens = self.max_seq_len.min(2048);
         // sm_120 routes grouped FP8 to the AOT CUTLASS collective — no DeepGEMM
         // JIT kernels to warm (the preflight below is Hopper-only).
-        if self.ctx.compute_capability().0 == 12 {
+        if self.ctx.is_sm120() {
             return Ok((0, warm_tokens, 0, 0));
         }
         let topk = self.config.num_experts_per_tok;
