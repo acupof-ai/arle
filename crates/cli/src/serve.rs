@@ -17,7 +17,7 @@ use infer_api::{
 };
 
 use crate::{
-    args::{Args, ServeArgs, ServeBackendArg, ServeKvCacheDtypeArg, ServeSpecTypeArg},
+    args::{Args, ServeArgs, ServeBackendArg, ServeSpecTypeArg},
     hardware::CompiledBackend,
 };
 
@@ -461,13 +461,7 @@ fn resolve_engine_config(
     backend: ServeBackend,
     serve_args: &ServeArgs,
 ) -> Result<EngineLoadConfig, String> {
-    let kv_cache_dtype = match serve_args.kv_cache_dtype {
-        ServeKvCacheDtypeArg::Auto => KvCacheDtype::Auto,
-        ServeKvCacheDtypeArg::Bf16 => KvCacheDtype::Bf16,
-        ServeKvCacheDtypeArg::Int8 => KvCacheDtype::Int8,
-        ServeKvCacheDtypeArg::Fp8 => KvCacheDtype::Fp8,
-        ServeKvCacheDtypeArg::Tq4 => KvCacheDtype::Tq4,
-    };
+    let kv_cache_dtype: KvCacheDtype = serve_args.kv_cache_dtype.into();
     let mut config = EngineLoadConfig {
         kv_cache_dtype,
         ..EngineLoadConfig::default()

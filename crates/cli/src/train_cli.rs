@@ -1877,6 +1877,7 @@ fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
             chunked_prefill_size: Some(student_seq),
             dspark_draft_model: args.runtime.dspark_draft_model.clone(),
             dspark_conf_threshold: args.runtime.dspark_conf_threshold,
+            kv_cache_dtype: args.runtime.kv_cache_dtype.into(),
             ..EngineLoadConfig::default()
         },
     )
@@ -3043,6 +3044,9 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
             // MTP GPU gate passed 2026-07-17 (1.21×); default-on waits for the
             // depth sweep + an in-loop A/B.
             mtp_draft_tokens: args.runtime.mtp_draft_tokens,
+            // Opt-in quantized KV frees VRAM so the writeback fits long agentic
+            // trajectories (default Auto = bf16 baseline).
+            kv_cache_dtype: args.runtime.kv_cache_dtype.into(),
             cuda: infer_api::CudaRuntimeFlags {
                 qwen35_decode_graph: args.runtime.qwen35_decode_graph,
                 ..Default::default()
