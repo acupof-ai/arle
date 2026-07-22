@@ -1582,6 +1582,28 @@ pub unsafe fn dsv4_deepgemm_m_grouped_fp8_gemm_nt_contiguous(
     Ok(())
 }
 
+/// D2H a pair of small device `[i32; len]` arrays (raw pointers) to host,
+/// stream-ordered then synced with a SINGLE `synchronize`. Lets the sm_120 MoE
+/// caller read the shared group offsets/counts once per layer instead of the
+/// kernel re-reading + syncing on every GEMM call.
+pub fn dtoh_i32_pair(
+    ctx: &DeviceContext,
+    p0: RawDevicePtr<i32>,
+    p1: RawDevicePtr<i32>,
+    len: usize,
+) -> Result<(Vec<i32>, Vec<i32>)> {
+    let mut a = vec![0i32; len];
+    let mut b = vec![0i32; len];
+    let stream = ctx.stream.cu_stream();
+    // SAFETY: p0/p1 are valid device `[i32; len]` finalized on ctx.stream.
+    unsafe {
+        cudarc::driver::result::memcpy_dtoh_async(&mut a, p0.as_ptr() as usize as u64, stream)?;
+        cudarc::driver::result::memcpy_dtoh_async(&mut b, p1.as_ptr() as usize as u64, stream)?;
+    }
+    ctx.stream.synchronize()?;
+    Ok((a, b))
+}
+
 /// sm_120 (Blackwell) grouped blockwise-scaled FP8 GEMM (NT): per group `g`,
 /// `d[rows(g), :] = a[rows(g), :] @ b[g]^T` with DeepSeek blockwise scaling
 /// (per-token A scale 1x128 + 128x128 B block scale). The sm_120 replacement
@@ -1593,12 +1615,14 @@ pub unsafe fn dsv4_deepgemm_m_grouped_fp8_gemm_nt_contiguous(
 /// leading dim `scale_stride_m`), `sfb` the f32 128-block weight scales already
 /// N-contiguous per group (`n_block + k_block*n_blocks` — the loader transposes
 /// the checkpoint layout at load on sm_120). `d` is BF16 out `[total_M, n]`.
-/// `group_offsets`/`group_counts` are device arrays of the 128-aligned per-group
-/// row start and the real per-group row count.
+/// `host_offsets`/`host_counts` are HOST-resident slices of the 128-aligned
+/// per-group row start and the real per-group row count (length `num_groups`);
+/// the caller D2H's them once per layer (see [`dtoh_i32_pair`]) and reuses them
+/// across the w13 + down GEMMs, so the kernel does no per-call D2H/sync.
 ///
 /// # Safety
-/// All pointers must be valid on `stream` for the shapes above; `n`/`k` are
-/// 128-aligned; `group_offsets[g] + group_counts[g] <= total_M`.
+/// Device pointers must be valid on `stream` for the shapes above; `n`/`k` are
+/// 128-aligned; `host_offsets[g] + host_counts[g] <= total_M`.
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn arle_fp8_moe_grouped_gemm_nt_sm120(
     a: RawDevicePtr<u8>,
@@ -1606,14 +1630,16 @@ pub unsafe fn arle_fp8_moe_grouped_gemm_nt_sm120(
     b: RawDevicePtr<u8>,
     sfb: RawDevicePtr<f32>,
     d: RawDevicePtr<bf16>,
-    group_offsets: RawDevicePtr<i32>,
-    group_counts: RawDevicePtr<i32>,
+    host_offsets: &[i32],
+    host_counts: &[i32],
     num_groups: usize,
     n: usize,
     k: usize,
     scale_stride_m: usize,
     stream: CUstream,
 ) -> Result<()> {
+    debug_assert_eq!(host_offsets.len(), num_groups);
+    debug_assert_eq!(host_counts.len(), num_groups);
     // SAFETY: forwarded — the caller upholds this fn's `# Safety` contract.
     unsafe {
         ffi::arle_fp8_moe_grouped_gemm_nt_sm120_cuda(
@@ -1622,8 +1648,8 @@ pub unsafe fn arle_fp8_moe_grouped_gemm_nt_sm120(
             b.as_ptr(),
             sfb.as_ptr(),
             d.as_mut_ptr() as *mut Half,
-            group_offsets.as_ptr(),
-            group_counts.as_ptr(),
+            host_offsets.as_ptr(),
+            host_counts.as_ptr(),
             i32::try_from(num_groups)?,
             i32::try_from(n)?,
             i32::try_from(k)?,

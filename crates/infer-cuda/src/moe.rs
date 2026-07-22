@@ -1373,6 +1373,16 @@ mod gpu {
                 .map_err(|_| anyhow::anyhow!("FP8 DeepGEMM MoE rows overflow i32"))?;
             let active_counts = scratch.dg_active_counts.upload(ctx, &[rows_i32])?;
             let stream = ctx.stream.cu_stream();
+            // sm_120 CUTLASS grouped GEMM: the w13 + down GEMMs share identical
+            // group geometry, so D2H offsets/counts ONCE here (one sync/layer)
+            // and reuse the host slices — the kernel no longer re-reads + syncs
+            // per call. Non-sm120 (Hopper DeepGEMM) consumes device m_indices, so
+            // skip the readback there.
+            let (host_offsets, host_counts) = if fp8_n_contiguous {
+                moe::dtoh_i32_pair(ctx, offsets_ptr, counts, local_experts)?
+            } else {
+                (Vec::new(), Vec::new())
+            };
             // One dispatch for both grouped FP8 GEMMs (w13 + down): identical
             // group geometry, differing only in operands + (n,k). The cache's
             // layout contract picks the backend.
@@ -1393,8 +1403,8 @@ mod gpu {
                             b,
                             sfb,
                             d,
-                            offsets_ptr,
-                            counts,
+                            &host_offsets,
+                            &host_counts,
                             local_experts,
                             n,
                             k,

@@ -710,9 +710,11 @@ unsafe extern "C" {
 
     // sm_120 (Blackwell) grouped blockwise-scaled FP8 MoE GEMM — the sm_120
     // replacement for the Hopper-only DeepGEMM contiguous grouped call. Group
-    // geometry arrives as device `group_offsets` (128-aligned row start) +
-    // `group_counts` (real Mg); `scale_stride_m` is the SFA K-block leading dim
-    // (= DeepGEMM's `sfa_aligned_m`). Non-sm120 builds link a stub returning
+    // geometry arrives HOST-resident (`host_group_offsets` 128-aligned row start
+    // + `host_group_counts` real Mg) — the caller D2H's it once per layer and
+    // reuses it across the w13 + down GEMMs, so the kernel does no per-call
+    // D2H/sync. `scale_stride_m` is the SFA K-block leading dim (= DeepGEMM's
+    // `sfa_aligned_m`). Non-sm120 builds link a stub returning
     // `cudaErrorNotSupported`.
     pub fn arle_fp8_moe_grouped_gemm_nt_sm120_cuda(
         a: *const u8,
@@ -720,8 +722,8 @@ unsafe extern "C" {
         b: *const u8,
         sfb: *const f32,
         d: *mut Half,
-        group_offsets: *const i32,
-        group_counts: *const i32,
+        host_group_offsets: *const i32,
+        host_group_counts: *const i32,
         num_groups: i32,
         n: i32,
         k: i32,

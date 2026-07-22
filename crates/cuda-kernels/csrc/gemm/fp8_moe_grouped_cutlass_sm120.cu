@@ -249,15 +249,15 @@ extern "C" CUresult arle_fp8_moe_grouped_gemm_nt_sm120_cuda(
     const float* sfa,          // per-token f32 act scales (DeepGEMM packing)
     const uint8_t* b,          // e4m3 grouped weights [G, N, K] row-major
     const float* sfb,          // f32 128-block weight scales, N-contiguous per group
-    void* d,                   // bf16 out [total_M, N]
-    const int* group_offsets,  // device [G]: 128-aligned per-group row start
-    const int* group_counts,   // device [G]: real Mg per group
+    void* d,                        // bf16 out [total_M, N]
+    const int* host_group_offsets,  // HOST [G]: 128-aligned per-group row start
+    const int* host_group_counts,   // HOST [G]: real Mg per group
     int num_groups, int n, int k,
     int scale_stride_m,        // SFA K-block leading dim (DeepGEMM's scale_stride_m)
     cudaStream_t stream) {
   if (a == nullptr || sfa == nullptr || b == nullptr || sfb == nullptr || d == nullptr ||
-      group_offsets == nullptr || group_counts == nullptr || num_groups <= 0 || n <= 0 ||
-      k <= 0 || (n % 128) != 0 || (k % 128) != 0) {
+      host_group_offsets == nullptr || host_group_counts == nullptr || num_groups <= 0 ||
+      n <= 0 || k <= 0 || (n % 128) != 0 || (k % 128) != 0) {
     return CUDA_ERROR_INVALID_VALUE;
   }
 
@@ -266,17 +266,11 @@ extern "C" CUresult arle_fp8_moe_grouped_gemm_nt_sm120_cuda(
   const int k_blocks = k / 128;
   auto* d_bf16 = reinterpret_cast<ElementD*>(d);
 
-  // D2H the small group geometry (prefill path — a single sync is acceptable and
-  // mirrors the DeepGEMM path's own host scans).
-  std::vector<int> off(G), cnt(G);
+  // Group geometry arrives host-resident (the caller D2H's offsets/counts once
+  // per layer and reuses it for the w13 + down GEMMs) — no per-call D2H/sync.
+  const int* off = host_group_offsets;
+  const int* cnt = host_group_counts;
   cudaError_t rc;
-  if ((rc = cudaMemcpyAsync(off.data(), group_offsets, G * sizeof(int),
-                            cudaMemcpyDeviceToHost, stream)) != cudaSuccess)
-    return CUDA_ERROR_UNKNOWN;
-  if ((rc = cudaMemcpyAsync(cnt.data(), group_counts, G * sizeof(int),
-                            cudaMemcpyDeviceToHost, stream)) != cudaSuccess)
-    return CUDA_ERROR_UNKNOWN;
-  if ((rc = cudaStreamSynchronize(stream)) != cudaSuccess) return CUDA_ERROR_UNKNOWN;
 
   std::vector<ProblemShape::UnderlyingProblemShape> ps_host(G);
   std::vector<const ElementA*> pA(G);
