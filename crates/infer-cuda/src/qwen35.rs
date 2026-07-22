@@ -2961,7 +2961,7 @@ impl Qwen35Model {
         max_seq_len: usize,
         mtp_draft_tokens: Option<usize>,
     ) -> Result<Self> {
-        let tp = crate::loader::build_tp_runtime()?;
+        let tp = crate::loader::build_tp_runtime(false)?;
         Self::from_safetensors_with_tp(model_path, max_seq_len, tp, mtp_draft_tokens)
     }
 
