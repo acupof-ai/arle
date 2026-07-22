@@ -37,6 +37,9 @@
 
 #ifdef ARLE_SM120_GROUPED_FP8
 
+#include <memory>
+#include <mutex>
+#include <unordered_map>
 #include <vector>
 
 #include "cutlass/cutlass.h"
@@ -128,6 +131,11 @@ CUTLASS_HOST_DEVICE cute::Stride<M0, cute::Int<1>, M2> arle_row_stride(
   return s;
 }
 
+// Guards the per-device scratch map's lazy creation AND every scratch's grow
+// path (cudaMalloc/cudaFree). The steady state (no grow) runs lock-free via the
+// TLS fast-path in `scratch_for_current_device`.
+std::mutex g_scratch_mutex;
+
 // Persistent device scratch — allocated once, grown on demand. Reused across the
 // per-layer / per-step GEMM calls (no per-call cudaMalloc in the hot loop).
 struct GroupedScratch {
@@ -149,7 +157,10 @@ struct GroupedScratch {
   uint8_t* workspace = nullptr;
   int sm_count = 0;
 
+  // Lock-free unless a grow (or first-call sm_count query) is needed.
   cudaError_t ensure_arrays(int groups) {
+    if (groups <= capacity && sm_count != 0) return cudaSuccess;
+    std::lock_guard<std::mutex> lock(g_scratch_mutex);
     cudaError_t rc = cudaSuccess;
     if (groups > capacity) {
       free_arrays();
@@ -178,36 +189,57 @@ struct GroupedScratch {
   }
 
   cudaError_t ensure_workspace(size_t ws) {
+    if (ws <= workspace_bytes) return cudaSuccess;
+    std::lock_guard<std::mutex> lock(g_scratch_mutex);
+    if (ws <= workspace_bytes) return cudaSuccess;
     cudaError_t rc = cudaSuccess;
-    if (ws > workspace_bytes) {
-      if (workspace) cudaFree(workspace);
-      workspace = nullptr;
-      if ((rc = cudaMalloc(reinterpret_cast<void**>(&workspace), ws)) != cudaSuccess) return rc;
-      workspace_bytes = ws;
-    }
+    if (workspace) cudaFree(workspace);
+    workspace = nullptr;
+    if ((rc = cudaMalloc(reinterpret_cast<void**>(&workspace), ws)) != cudaSuccess) return rc;
+    workspace_bytes = ws;
     return cudaSuccess;
   }
 
   void free_arrays() {
-    void* fields[] = {problem_sizes, ptr_A, ptr_B, ptr_SFA, ptr_SFB, ptr_C,
-                      ptr_D, stride_A, stride_B, stride_C, stride_D,
-                      layout_SFA, layout_SFB};
-    for (void* p : fields)
-      if (p) cudaFree(p);
-    problem_sizes = nullptr; ptr_A = nullptr; ptr_B = nullptr; ptr_SFA = nullptr;
-    ptr_SFB = nullptr; ptr_C = nullptr; ptr_D = nullptr; stride_A = nullptr;
-    stride_B = nullptr; stride_C = nullptr; stride_D = nullptr;
-    layout_SFA = nullptr; layout_SFB = nullptr; capacity = 0;
+    void** fields[] = {reinterpret_cast<void**>(&problem_sizes),
+                       reinterpret_cast<void**>(&ptr_A),
+                       reinterpret_cast<void**>(&ptr_B),
+                       reinterpret_cast<void**>(&ptr_SFA),
+                       reinterpret_cast<void**>(&ptr_SFB),
+                       reinterpret_cast<void**>(&ptr_C),
+                       reinterpret_cast<void**>(&ptr_D),
+                       reinterpret_cast<void**>(&stride_A),
+                       reinterpret_cast<void**>(&stride_B),
+                       reinterpret_cast<void**>(&stride_C),
+                       reinterpret_cast<void**>(&stride_D),
+                       reinterpret_cast<void**>(&layout_SFA),
+                       reinterpret_cast<void**>(&layout_SFB)};
+    for (void** p : fields) {
+      if (*p) cudaFree(*p);
+      *p = nullptr;
+    }
+    capacity = 0;
   }
 };
 
-// One scratch per device (single-GPU serve → index 0; guarded to a small fixed set).
+// One persistent scratch per device, created lazily. Mirrors gemv.cu's
+// `g_per_device_state`: an unbounded map guarded by `g_scratch_mutex`, with a
+// TLS fast-path so the steady state skips the lock. No teardown — the scratch
+// lives for the process (static weights, prefill-only path).
+std::unordered_map<int, std::unique_ptr<GroupedScratch>> g_scratch_by_device;
+thread_local GroupedScratch* t_scratch = nullptr;
+thread_local int t_scratch_ordinal = -1;
+
 GroupedScratch& scratch_for_current_device() {
-  static GroupedScratch scratches[16];
   int dev = 0;
   cudaGetDevice(&dev);
-  if (dev < 0 || dev >= 16) dev = 0;
-  return scratches[dev];
+  if (dev == t_scratch_ordinal && t_scratch != nullptr) return *t_scratch;
+  std::lock_guard<std::mutex> lock(g_scratch_mutex);
+  auto& slot = g_scratch_by_device[dev];
+  if (!slot) slot = std::make_unique<GroupedScratch>();
+  t_scratch = slot.get();
+  t_scratch_ordinal = dev;
+  return *slot;
 }
 
 }  // namespace
@@ -263,12 +295,12 @@ extern "C" CUresult arle_fp8_moe_grouped_gemm_nt_sm120_cuda(
   const auto* a_e4m3 = reinterpret_cast<const ElementA*>(a);
   const auto* b_e4m3 = reinterpret_cast<const ElementB*>(b);
 
-  int max_m = 0;
+  bool any_rows = false;
   for (int g = 0; g < G; ++g) {
     int Mg = cnt[g];
     if (Mg < 0) Mg = 0;
     int row = off[g];
-    if (Mg > max_m) max_m = Mg;
+    if (Mg > 0) any_rows = true;
     ps_host[g] = {Mg, n, k};
 
     pA[g] = a_e4m3 + static_cast<int64_t>(row) * k;
@@ -294,7 +326,7 @@ extern "C" CUresult arle_fp8_moe_grouped_gemm_nt_sm120_cuda(
     lSFB[g] = ScaleConfig::tile_atom_to_shape_SFB(make_shape(Mg, n, k, 1));
   }
 
-  if (max_m == 0) return CUDA_SUCCESS;  // nothing routed to any local expert.
+  if (!any_rows) return CUDA_SUCCESS;  // nothing routed to any local expert.
 
   GroupedScratch& s = scratch_for_current_device();
   if ((rc = s.ensure_arrays(G)) != cudaSuccess) return CUDA_ERROR_OUT_OF_MEMORY;
