@@ -1,0 +1,21 @@
+docs/experience/errors/2026-07-22-dspark-train-loss-down-acceptance-flat.md
+  s_701dead3b9c2f3::t_0d6b7965bcf3e1 1-46
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "b02855b171bf1e90eeda6d9f0001b3ade068b4e5",
+  "prompts": {},
+  "sessions": {
+    "s_701dead3b9c2f3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4876ea73-5d7b-4a4e-a891-98c71325cbc0",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
