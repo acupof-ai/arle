@@ -114,7 +114,7 @@ WORKSPACE_MEMBER_RE = re.compile(r'^\s*"crates/([A-Za-z0-9_-]+)"\s*,?\s*$')
 CRATE_REF_RE = re.compile(r"crates/([A-Za-z0-9_*-]+)")
 KERNEL_FAMILY_RE = re.compile(r"csrc/\{([^}]+)\}/", re.DOTALL)
 LIVE_CU_COUNT_RE = re.compile(r"^- \*\*(\d+) `\.cu`\*\* across", re.MULTILINE)
-REGISTRY_CSRC_CELL_RE = re.compile(r"^\|[^\n]*?\|\s*`([^`]+\.cu)`(?:,\s*`([^`]+\.cu)`)?\s*\|", re.MULTILINE)
+CU_CODE_SPAN_RE = re.compile(r"`([^`]+\.cu)`")
 
 
 def repo_path(path: Path) -> str:
@@ -253,11 +253,12 @@ def check_workspace_truth_surface() -> list[str]:
 def check_kernel_registry() -> list[str]:
     text = load_text(ROOT / KERNEL_REGISTRY)
     csrc = ROOT / CUDA_CSRC
-    families = {
-        path.name
-        for path in csrc.iterdir()
-        if path.is_dir() and any(path.rglob("*.cu"))
+    cu_paths = {
+        path.relative_to(csrc).as_posix()
+        for path in csrc.rglob("*.cu")
+        if path.is_file()
     }
+    families = {Path(path).parts[0] for path in cu_paths}
     family_match = KERNEL_FAMILY_RE.search(text)
     if family_match is None:
         return [f"{KERNEL_REGISTRY}: missing current csrc family declaration"]
@@ -271,24 +272,30 @@ def check_kernel_registry() -> list[str]:
             f"{KERNEL_REGISTRY}: declared CUDA families {sorted(declared_families)} != tree {sorted(families)}"
         )
 
-    cu_files = list(csrc.rglob("*.cu"))
     count_match = LIVE_CU_COUNT_RE.search(text)
     if count_match is None:
         errors.append(f"{KERNEL_REGISTRY}: missing live .cu count reconciliation")
-    elif int(count_match.group(1)) != len(cu_files):
+    elif int(count_match.group(1)) != len(cu_paths):
         errors.append(
-            f"{KERNEL_REGISTRY}: declared live .cu count {count_match.group(1)} != tree {len(cu_files)}"
+            f"{KERNEL_REGISTRY}: declared live .cu count {count_match.group(1)} != tree {len(cu_paths)}"
         )
 
     registry_paths = set()
-    for match in REGISTRY_CSRC_CELL_RE.finditer(text):
-        first, second = match.groups()
-        registry_paths.add(first)
-        if second is not None:
-            registry_paths.add(str(Path(first).parent / second) if "/" not in second else second)
-    for rel_path in sorted(registry_paths):
-        if not (csrc / rel_path).is_file():
-            errors.append(f"{KERNEL_REGISTRY}: referenced csrc path does not exist: {rel_path}")
+    for line in text.splitlines():
+        if not line.startswith("|"):
+            continue
+        cells = line.split("|")
+        if len(cells) < 3:
+            continue
+        paths = CU_CODE_SPAN_RE.findall(cells[2])
+        if not paths or "†" in cells[2]:
+            continue
+        parent = Path(paths[0]).parent
+        registry_paths.update(
+            str(parent / path) if "/" not in path else path for path in paths
+        )
+    for rel_path in sorted(registry_paths - cu_paths):
+        errors.append(f"{KERNEL_REGISTRY}: referenced csrc path does not exist: {rel_path}")
     return errors
 
 

@@ -1,11 +1,8 @@
 # Kernel Registry — live CUDA operator index (`crates/cuda-kernels`)
 
 > **Source of truth = code, not docs.** The 2026-07-12 reorg snapshot below is
-> historical. Current reconciliation: **63** `.cu` under
-> `crates/cuda-kernels/csrc/{attention,comm,elementwise,gemm,kv,moe,norm,quant,
-> recurrent,sampling}/`, the FFI decls in
-> `crates/cuda-kernels/src/ffi/`, and the **live callers in
-> `crates/infer-cuda/src/`**. **The reorg** exploded the `misc/` junk drawer
+> historical; see [Count reconciliation](#count-reconciliation) for the current
+> inventory. **The reorg** exploded the `misc/` junk drawer
 > (0 files now): new `sampling/`·`norm/`·`recurrent/`·`elementwise/` dirs; DSv4
 > MLA/DSA/MHC + TP-repack + FlashMLA/FA3 shims → `attention/`; `kvcacheio/`
 > merged into `kv/`. Most families align with `src/ffi/`; legacy DSv4 attention
@@ -44,8 +41,10 @@
 
 ## Count reconciliation
 
-- **63 `.cu`** across 10 kernel dirs (`attention` 28, `gemm` 15, `recurrent` 6,
-  `kv` 4, `quant` 3, `moe`/`elementwise` 2, `comm`/`sampling`/`norm` 1 each).
+- **63 `.cu`** across 10 kernel dirs under
+  `csrc/{attention,comm,elementwise,gemm,kv,moe,norm,quant,recurrent,sampling}/`:
+  `attention` 28, `gemm` 15, `recurrent` 6, `kv` 4, `quant` 3,
+  `moe`/`elementwise` 2, `comm`/`sampling`/`norm` 1 each.
   `deepep_sidecar/` is a separate C++ sidecar with **0 `.cu`**. The 2026-07-12
   56-file count is a historical reorg snapshot, not the current inventory.
 - **~278 unique `extern "C"` symbols** (> 63 because most `.cu` export several
@@ -278,9 +277,9 @@ verbatim. Remaining work is pruning unwired tails, not relocation.
 | family dir | verdict |
 |---|---|
 | `gemm/` | **well-organized** — all live GEMM/GEMV/DeepGEMM/Marlin-repack/quant-linear ops here; carries an unwired tail (TQ-GEMM + activation-quant + GGUF variants) to prune (3 Marlin GEMM `.cu` already deleted 07-12) |
-| `moe/` | **well-organized** — DSv4 route + Qwen3.6 route (EP-mask folded into `dsv4_route.cu`) + decode-pooled all live and in-family |
+| `moe/` | **well-organized** — DSv4 route + Qwen3.6 route (EP-mask folded into `moe/dsv4_route.cu`) + decode-pooled all live and in-family |
 | `comm/` | **well-organized** — single-purpose; the whole CAR family is live via `tp.rs` |
 | `attention/` | **well-organized + newly-live** — live paged-prep + hd256 + FA3/FlashMLA shim + DSpark ring **plus** the DSv4 MLA/DSA/MHC + TP-repack kernels relocated here 07-12; the DSv4-specific FP8-KV-pack + FlashMLA-index `.cu` stay unwired (vendored builders won) |
 | `sampling/`, `norm/`, `elementwise/`, `recurrent/` | **new, well-organized** — split out of `misc/` 07-12; hold live DSpark sampling / norms / SwiGLU+embedding / Qwen3.5 linear-attn |
-| `kv/`, `quant/` | **mixed** — FP8/INT8 KIVI quantize/refill/decode is live; KV-tier transport, INT4/TurboQuant, and incompatible variants remain unwired; `kvcacheio/transfer.cu` merged into `kv/` 07-12 |
+| `kv/`, `quant/` | **mixed** — FP8/INT8 KIVI quantize/refill/decode is live; KV-tier transport, INT4/TurboQuant, and incompatible variants remain unwired; `kv/transfer.cu` was relocated from `kvcacheio/` on 07-12 |
 | `deepep_sidecar/` | **separate deliverable** — an out-of-process NVSHMEM sidecar binary, not a kernel dir; keep isolated. |
