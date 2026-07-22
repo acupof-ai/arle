@@ -415,6 +415,11 @@ impl Drop for DiskTier {
         {
             log::warn!("KV final manifest persist failed: {err}");
         }
+        if let Some(lock) = self._lock.take()
+            && let Err(err) = lock.unlock()
+        {
+            log::warn!("KV durable namespace unlock failed: {err}");
+        }
         if !self.durable {
             // KvMmapStore drops first (field order), unmapping the file.
             // Linux tolerates unlinking a still-open file, so best-effort.
