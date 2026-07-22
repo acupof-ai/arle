@@ -1,0 +1,21 @@
+crates/infer-core/src/lib.rs
+  s_541b53377b6ce6::t_a9539a8a920503 937-939,985
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "b459373b9e8efb2c970dd06aad5a8e5e4ab17b8f",
+  "prompts": {},
+  "sessions": {
+    "s_541b53377b6ce6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a3c8ba8bf50baad75",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
