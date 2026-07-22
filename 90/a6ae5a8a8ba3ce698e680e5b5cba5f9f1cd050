@@ -1,0 +1,27 @@
+docs/plans/2026-07-21-kernel-opt-fusion-campaign.md
+  s_38c2b7adf419be::t_8f352ffa887f05 217
+docs/reviews/kernel-registry.md
+  s_38c2b7adf419be::t_f620904e1fe646 4-5,44-47,280,284
+docs/support-matrix.md
+  s_38c2b7adf419be::t_d40f4ef1d775a2 209
+scripts/check_repo_hygiene.py
+  s_38c2b7adf419be::t_57d91a384b1c58 117,256-259,261,278,280,284-298
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "90a6ae5a8a8ba3ce698e680e5b5cba5f9f1cd050",
+  "prompts": {},
+  "sessions": {
+    "s_38c2b7adf419be": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e56e9edc-a3c9-4bc8-a4c4-84fd4a3c90fc",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
