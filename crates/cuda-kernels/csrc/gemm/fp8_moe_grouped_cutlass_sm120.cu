@@ -9,8 +9,7 @@
  *
  * Collective/type stack copied verbatim from CUTLASS 4.3.5 example
  *   87c_blackwell_geforce_fp8_bf16_grouped_gemm_groupwise.cu
- * (the only in-tree sm_120a grouped blockwise-scaled FP8 instantiation),
- * de-risked standalone 2026-07-22 (bit-exact vs FP32, ragged + heavy M).
+ * (the only in-tree sm_120a grouped blockwise-scaled FP8 instantiation).
  *
  * Scale layout contract (source-verified against the DeepGEMM path this replaces):
  *   SFA — activation scales stay in DeepGEMM's packing:
@@ -55,7 +54,7 @@ namespace {
 
 using ProblemShape = cutlass::gemm::GroupProblemShape<Shape<int, int, int>>;
 
-// ---- Type stack: verbatim from example 87c (the de-risked collective) ----
+// ---- Type stack: verbatim from example 87c ----
 using ElementA = cutlass::float_e4m3_t;
 using LayoutA = cutlass::layout::RowMajor;
 constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;
