@@ -1016,6 +1016,18 @@ pub(crate) enum ServeKvCacheDtypeArg {
     Tq4,
 }
 
+impl From<ServeKvCacheDtypeArg> for infer_api::KvCacheDtype {
+    fn from(arg: ServeKvCacheDtypeArg) -> Self {
+        match arg {
+            ServeKvCacheDtypeArg::Auto => Self::Auto,
+            ServeKvCacheDtypeArg::Bf16 => Self::Bf16,
+            ServeKvCacheDtypeArg::Int8 => Self::Int8,
+            ServeKvCacheDtypeArg::Fp8 => Self::Fp8,
+            ServeKvCacheDtypeArg::Tq4 => Self::Tq4,
+        }
+    }
+}
+
 /// OPD runtime toggles shared by every OPD subcommand
 /// (`train::apply_runtime_flags`; defaults = shipped behavior).
 #[derive(Debug, Clone, ClapArgs)]
@@ -1053,6 +1065,11 @@ pub(crate) struct OpdRuntimeArgs {
     /// OOMs at seq≈30K).
     #[arg(long, default_value_t = 23_000, value_name = "TOKENS")]
     pub(crate) max_update_seq: usize,
+
+    /// Rollout-engine KV cache dtype. Opt-in — quantized KV frees VRAM so long
+    /// agentic trajectories fit the writeback (default Auto = bf16 baseline).
+    #[arg(long, value_enum, default_value_t = ServeKvCacheDtypeArg::Auto)]
+    pub(crate) kv_cache_dtype: ServeKvCacheDtypeArg,
 
     /// Rollout tensor retain interval (steps).
     #[arg(long, default_value_t = 2, value_name = "N")]
