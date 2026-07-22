@@ -1,0 +1,53 @@
+docs/architecture.md
+  s_38c2b7adf419be::t_8082c76cd2a646 36,122-124,153,178-179,198,290-296
+docs/codebase-map.md
+  s_38c2b7adf419be::t_62bed064c33d77 225-227,241-244,357
+docs/experience/errors/2026-07-06-dsv4-auto-context-ceiling-still-crashes-tp4.md
+  s_38c2b7adf419be::t_666be231a49a38 3-4
+docs/experience/errors/2026-07-06-dsv4-max-total-tokens-pod-verify.md
+  s_38c2b7adf419be::t_7c21ac8a49a836 3-4
+docs/experience/errors/2026-07-09-dsv4-route-a-flashmla-needle-regression-bisected.md
+  s_38c2b7adf419be::t_39f506daa8138c 14-15
+docs/experience/errors/2026-07-19-dsv4-mtp-dspark-high-concurrency-regression.md
+  s_38c2b7adf419be::t_5041a18e0d017d 104
+docs/experience/wins/2026-07-08-dsv4-route-a-prefix-reuse-end-to-end.md
+  s_38c2b7adf419be::t_cdedafee6f5dfc 9-10
+docs/experience/wins/2026-07-09-dsv4-route-a-flashmla-page-sharing.md
+  s_38c2b7adf419be::t_37334b292702df 3
+docs/experience/wins/2026-07-19-dsv4-production-all-on-reanchor.md
+  s_38c2b7adf419be::t_17a0ffcd6b943b 27
+docs/experience/wins/2026-07-20-dspark-sliding-window-c1-win-c8-regress.md
+  s_38c2b7adf419be::t_2fc295ddb61e1a 4-5
+docs/plans/2026-07-07-dsv4-commit1-shared-expert-scratch.md
+  s_38c2b7adf419be::t_a93a8b2e5782eb 3
+docs/plans/2026-07-09-dspark-dflash-spec-decode-qwen36.md
+  s_38c2b7adf419be::t_c5e4a7ac1f7502 3-4,14
+docs/plans/2026-07-11-dspark-dsv4-flash-spec-decode.md
+  s_38c2b7adf419be::t_0ec58ced91f34e 3-4
+docs/plans/2026-07-11-dsv4-high-concurrency-throughput-campaign.md
+  s_38c2b7adf419be::t_ce30c39c06f7c4 3
+docs/plans/2026-07-21-kernel-opt-fusion-campaign.md
+  s_38c2b7adf419be::t_5ec819c36b5c9f 153,217
+docs/reviews/kernel-registry.md
+  s_38c2b7adf419be::t_f4ac85c9f53b60 3-6,11-12,47-51,53,80-81,98-100,104-110,148,227,229-232,238-239,257,273-275,284-285
+docs/support-matrix.md
+  s_38c2b7adf419be::t_ad4f4d259af305 34,62,82,126,209,211,213
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "5625abbadbff420ce1ac1249d87989c09ff20837",
+  "prompts": {},
+  "sessions": {
+    "s_38c2b7adf419be": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e56e9edc-a3c9-4bc8-a4c4-84fd4a3c90fc",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
