@@ -1,0 +1,21 @@
+crates/tools/src/lib.rs
+  s_5f39293adbeee5::t_403334cca0cb0e 350-361,436,445,453
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "4c12f37e01aac5349124b0267f281744ca8a77ea",
+  "prompts": {},
+  "sessions": {
+    "s_5f39293adbeee5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a17990a5bc61ebe1e",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
