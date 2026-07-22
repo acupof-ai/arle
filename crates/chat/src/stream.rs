@@ -9,20 +9,27 @@ use super::tool::{
 struct HiddenBlockStream {
     pending: String,
     hidden: Option<HiddenBlock>,
-    tool_buf: String,
+    tool_buf: Option<String>,
 }
 
 impl HiddenBlockStream {
-    fn push(&mut self, chunk: &str, capture_tools: bool) -> (String, Vec<ToolCall>) {
+    fn capture_tools() -> Self {
+        Self {
+            tool_buf: Some(String::new()),
+            ..Self::default()
+        }
+    }
+
+    fn push(&mut self, chunk: &str) -> (String, Vec<ToolCall>) {
         self.pending.push_str(chunk);
-        self.drain(false, capture_tools)
+        self.drain(false)
     }
 
-    fn finish(&mut self, capture_tools: bool) -> (String, Vec<ToolCall>) {
-        self.drain(true, capture_tools)
+    fn finish(&mut self) -> (String, Vec<ToolCall>) {
+        self.drain(true)
     }
 
-    fn drain(&mut self, flush: bool, capture_tools: bool) -> (String, Vec<ToolCall>) {
+    fn drain(&mut self, flush: bool) -> (String, Vec<ToolCall>) {
         let mut visible = String::new();
         let mut calls = Vec::new();
 
@@ -63,8 +70,10 @@ impl HiddenBlockStream {
                 }
             });
 
-            if capture_tools && hidden != HiddenBlock::Think {
-                self.tool_buf.push_str(&self.pending[..take_len]);
+            if hidden != HiddenBlock::Think
+                && let Some(tool_buf) = &mut self.tool_buf
+            {
+                tool_buf.push_str(&self.pending[..take_len]);
             }
             self.pending.drain(..take_len);
 
@@ -87,18 +96,21 @@ impl HiddenBlockStream {
     }
 
     fn parse_tool_buf(&mut self, hidden: HiddenBlock, calls: &mut Vec<ToolCall>) {
+        let Some(tool_buf) = &mut self.tool_buf else {
+            return;
+        };
         match hidden {
             HiddenBlock::ToolCall => {
-                if let Some(call) = parse_streaming_tool_call_block(self.tool_buf.trim()) {
+                if let Some(call) = parse_streaming_tool_call_block(tool_buf.trim()) {
                     calls.push(call);
                 }
             }
             HiddenBlock::DsmlToolCalls => {
-                calls.extend(parse_dsml_tool_calls_block(self.tool_buf.trim()));
+                calls.extend(parse_dsml_tool_calls_block(tool_buf.trim()));
             }
             HiddenBlock::Think => {}
         }
-        self.tool_buf.clear();
+        tool_buf.clear();
     }
 }
 
@@ -113,11 +125,11 @@ pub struct VisibleTextStream {
 
 impl VisibleTextStream {
     pub fn push(&mut self, chunk: &str) -> String {
-        self.stream.push(chunk, false).0
+        self.stream.push(chunk).0
     }
 
     pub fn finish(&mut self) -> String {
-        self.stream.finish(false).0
+        self.stream.finish().0
     }
 }
 
@@ -128,19 +140,30 @@ impl VisibleTextStream {
 /// Use this on the streaming path when the request carries tool definitions:
 /// it emits user-visible text exactly as `VisibleTextStream` would while
 /// surfacing each closed `<tool_call>` block as a parsed [`ToolCall`].
-#[derive(Default)]
 pub struct StreamingToolCalls {
     stream: HiddenBlockStream,
 }
 
+impl Default for StreamingToolCalls {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl StreamingToolCalls {
+    pub fn new() -> Self {
+        Self {
+            stream: HiddenBlockStream::capture_tools(),
+        }
+    }
+
     /// Feed a chunk; returns `(visible_text_to_emit, newly_completed_tool_calls)`.
     pub fn push(&mut self, chunk: &str) -> (String, Vec<ToolCall>) {
-        self.stream.push(chunk, true)
+        self.stream.push(chunk)
     }
 
     /// Flush remaining buffered text and any complete unterminated tool call.
     pub fn finish(&mut self) -> (String, Vec<ToolCall>) {
-        self.stream.finish(true)
+        self.stream.finish()
     }
 }
