@@ -20,8 +20,6 @@ pub mod cc_convert;
 pub mod cc_harness;
 #[path = "checkpoint.rs"]
 pub mod checkpoint;
-#[path = "control.rs"]
-pub mod control;
 #[path = "ema_self_teacher.rs"]
 pub mod ema_self_teacher;
 #[path = "grad_clip.rs"]
@@ -34,8 +32,6 @@ pub mod lora;
 pub mod lora_shard;
 #[path = "loss.rs"]
 pub mod loss;
-#[path = "metrics.rs"]
-pub mod metrics;
 #[path = "model_family.rs"]
 pub mod model_family;
 #[path = "opd.rs"]
@@ -60,8 +56,6 @@ pub mod rubric;
 pub mod rubric_opd;
 #[path = "sandbox.rs"]
 pub mod sandbox;
-#[path = "server.rs"]
-pub mod server;
 #[path = "spawner.rs"]
 pub mod spawner;
 #[path = "swe_dataset.rs"]
@@ -78,5 +72,4 @@ pub mod trajectory_scorer;
 pub mod update_strategy;
 
 pub use lora::{LinearWithLora, LoraAdapterConfig, LoraConfig, LoraTargetSet};
-pub use metrics::*;
 pub use trainer::cleanup_after_backward;
