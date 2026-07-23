@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # CI-side apache-tvm-ffi patch. Vanilla apache-tvm-ffi 0.1.12 hard-aborts
-# `import tilelang` (duplicate builtin TypeAttr registration vs tilelang<=0.1.11's
+# `import tilelang` (duplicate builtin TypeAttr registration vs tilelang's
 # bundled TVM — tile-ai/tilelang#2367). Rebuild tvm-ffi from sdist with the
 # first-wins patch the repo carries, against the system Python (no venv).
 # Mirrors scripts/pod-tilelang-env.sh, which does the same for the pod venv.

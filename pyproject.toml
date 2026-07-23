@@ -41,5 +41,5 @@ observe = [
     "wandb>=0.19",
 ]
 tilelang = [
-    "tilelang>=0.1.11",
+    "tilelang>=0.1.12",
 ]

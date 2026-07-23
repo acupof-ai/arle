@@ -3,9 +3,10 @@
 #
 # Builds the codegen venv from requirements-build.txt, then rebuilds
 # apache-tvm-ffi from sdist with the ARLE first-wins TypeAttr patch: tvm-ffi
-# >=0.1.12 registers builtin entries that the bundled TVM of tilelang <=0.1.11
-# still registers at load, and vanilla 0.1.12 hard-aborts the import
-# (tile-ai/tilelang#2367; upstream's only fix so far is pinning <=0.1.11).
+# >=0.1.12 registers builtin entries that tilelang's bundled TVM still
+# registers at load, and vanilla tvm-ffi 0.1.12 hard-aborts the import
+# (tile-ai/tilelang#2367). Verified with tilelang 0.1.12 + tvm-ffi 0.1.12 on
+# sm_90 (H20) and sm_70 (V100).
 # Idempotent — if the venv already imports tilelang, nothing happens.
 #
 # Pod PyPI is slow and the proxy is not always up: pre-push the sdist via tn
