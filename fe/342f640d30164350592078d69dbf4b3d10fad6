@@ -1,0 +1,29 @@
+crates/train/src/causal_lm.rs
+  s_8bd5af4c3641dd::t_269c51887bc0cd 1,5,7-8,10,15-18
+crates/train/src/qwen35.rs
+  s_8bd5af4c3641dd::t_05743cd3a9329b 24-25,4474-4486,5173
+crates/train/src/teacher_infer.rs
+  s_8bd5af4c3641dd::t_381645a43dc78a 630-637
+crates/train/src/trajectory_scorer.rs
+  s_8bd5af4c3641dd::t_a34014b2b12a42 21,69
+crates/train/tests/test_opd_step.rs
+  s_8bd5af4c3641dd::t_627f418469ce01 19
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "fe342f640d30164350592078d69dbf4b3d10fad6",
+  "prompts": {},
+  "sessions": {
+    "s_8bd5af4c3641dd": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a712b4bf8ba00b176",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
