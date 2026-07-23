@@ -23,27 +23,12 @@
 //! parser under 60 lines.
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 
 use crate::control::{TrainingController, TrainingStatus};
 
 const MAX_REQUEST_BYTES: usize = 8 * 1024;
-
-pub fn serve(controller: Arc<TrainingController>, addr: impl ToSocketAddrs) -> std::io::Result<()> {
-    let listener = TcpListener::bind(addr)?;
-    loop {
-        let (stream, _) = listener.accept()?;
-        let ctrl = Arc::clone(&controller);
-        if let Err(err) = handle_connection(ctrl, stream) {
-            eprintln!("[train_server] connection error: {err}");
-        }
-        if controller.should_stop() && controller.snapshot().finished {
-            break;
-        }
-    }
-    Ok(())
-}
 
 pub fn bind_and_serve_on_thread(
     controller: Arc<TrainingController>,

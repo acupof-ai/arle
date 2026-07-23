@@ -76,15 +76,6 @@ impl TrainingController {
         })
     }
 
-    pub fn set_record_capacity(&self, capacity: usize) {
-        let capacity = capacity.max(1);
-        self.record_cap.store(capacity, Ordering::Release);
-        let mut guard = self.records.lock().expect("records poisoned");
-        while guard.len() > capacity {
-            guard.pop_front();
-        }
-    }
-
     pub fn snapshot(&self) -> TrainingStatus {
         self.status.lock().expect("status poisoned").clone()
     }
@@ -245,7 +236,6 @@ pub fn open_run_metrics(
     open_shared_sink_with_extra(
         metrics_jsonl,
         true,
-        /* append = */ false,
         vec![Box::new(controller.metric_sink())],
     )
 }

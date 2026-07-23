@@ -122,13 +122,6 @@ pub enum Aggregation {
     GlobalTokenMean { norm_const: Option<usize> },
 }
 
-/// k3 KL(π_b‖πθ) regularizer folded into the per-token weight; the reference is
-/// the rollout/behavior policy (a teacher reference is the designed follow-up).
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct KlReg {
-    pub coef: f32,
-}
-
 /// One `update` call's roll-up: the mean per-trajectory loss plus the
 /// off-policy / critic / advantage diagnostics the metrics sink records.
 #[derive(Clone, Copy, Debug, Default)]
@@ -160,7 +153,6 @@ pub struct UpdatePreset {
     pub ratio: RatioGrain,
     pub clip: ClipForm,
     pub agg: Aggregation,
-    pub kl: Option<KlReg>,
 }
 
 impl UpdatePreset {
@@ -173,7 +165,6 @@ impl UpdatePreset {
             // Unused: ratio None routes to the fused CE op.
             clip: ClipForm::HardGate { lo: 0.0, hi: 0.0 },
             agg: Aggregation::PerSeqTokenMean,
-            kl: None,
         }
     }
 
@@ -188,7 +179,6 @@ impl UpdatePreset {
             ratio: RatioGrain::PerToken,
             clip: ClipForm::HardGate { lo, hi },
             agg: Aggregation::PerSeqTokenMean,
-            kl: None,
         }
     }
 
@@ -211,7 +201,6 @@ impl UpdatePreset {
             ratio: RatioGrain::PerToken,
             clip: ClipForm::SoftClamp { lo: 0.2, hi: 0.2 },
             agg: Aggregation::PerSeqTokenMean,
-            kl: None,
         }
     }
 
@@ -377,7 +366,6 @@ impl UpdatePreset {
             .map(|t| t.rollout_logprobs.as_ref().map_or(0, Vec::len))
             .sum();
         let step_each = matches!(self.agg, Aggregation::PerSeqTokenMean);
-        let kl_coef = self.kl.map_or(0.0, |k| k.coef);
 
         let mut loss_sum = 0.0f32;
         let mut steps = 0usize;
@@ -480,7 +468,7 @@ impl UpdatePreset {
                     rollout_logprobs,
                     weight: &weights,
                     form,
-                    kl_coef: kl_coef / norm,
+                    kl_coef: 0.0,
                 },
                 student,
                 params,

@@ -6,7 +6,7 @@
 //! `run_start`, `checkpoint`, `status`, and `run_end`.
 
 use std::env;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -133,17 +133,6 @@ impl JsonlSink {
     /// not creatable — no implicit `mkdir -p`.
     pub fn create(path: &Path) -> std::io::Result<Self> {
         let file = File::create(path)?;
-        Ok(Self {
-            writer: BufWriter::new(file),
-        })
-    }
-
-    /// Open `path` in append mode (creating it if absent) and wrap it in a
-    /// buffered writer. Use this for multi-phase binaries that already
-    /// truncated `path` at phase 1 and need subsequent phases to extend the
-    /// same JSONL file rather than restart it.
-    pub fn open_append(path: &Path) -> std::io::Result<Self> {
-        let file = OpenOptions::new().append(true).create(true).open(path)?;
         Ok(Self {
             writer: BufWriter::new(file),
         })
@@ -561,7 +550,7 @@ impl WandbProcessSink {
         let fields = sample
             .fields
             .iter()
-            .map(|(key, value)| ((*key).to_string(), json_f64(*value)))
+            .map(|(key, value)| ((*key).to_string(), f64_to_json(*value)))
             .collect::<serde_json::Map<_, _>>();
         let body = serde_json::json!({
             "type": "metric",
@@ -581,7 +570,7 @@ impl WandbProcessSink {
         let scalars = event
             .scalars
             .iter()
-            .map(|(key, value)| ((*key).to_string(), json_f64(*value)))
+            .map(|(key, value)| ((*key).to_string(), f64_to_json(*value)))
             .collect::<serde_json::Map<_, _>>();
         let bools = event
             .bools
@@ -1176,64 +1165,20 @@ impl MetricSink for SharedSink {
     }
 }
 
-/// Build a cloneable async sink from CLI-style flags.
-pub fn open_shared_sink(
-    jsonl_path: Option<&Path>,
-    also_stdout: bool,
-) -> anyhow::Result<SharedSink> {
-    open_shared_sink_with_extra(
-        jsonl_path,
-        also_stdout,
-        /* append = */ false,
-        Vec::new(),
-    )
-}
-
-/// Append-mode sibling of [`open_shared_sink`].
-pub fn open_shared_sink_append(
-    jsonl_path: Option<&Path>,
-    also_stdout: bool,
-) -> anyhow::Result<SharedSink> {
-    open_shared_sink_with_extra(
-        jsonl_path,
-        also_stdout,
-        /* append = */ true,
-        Vec::new(),
-    )
-}
-
 pub fn open_shared_sink_with_extra(
     jsonl_path: Option<&Path>,
     also_stdout: bool,
-    append: bool,
     extra_sinks: Vec<Box<dyn MetricSink>>,
 ) -> anyhow::Result<SharedSink> {
     Ok(SharedSink::new(
-        build_sink_inner(jsonl_path, also_stdout, append, extra_sinks)?,
+        build_sink_inner(jsonl_path, also_stdout, extra_sinks)?,
         shared_sink_buffer_capacity_from_env(),
     ))
-}
-
-/// Build a boxed sink for call sites that do not need a retained clone.
-pub fn open_sink(
-    jsonl_path: Option<&Path>,
-    also_stdout: bool,
-) -> anyhow::Result<Box<dyn MetricSink>> {
-    Ok(Box::new(open_shared_sink(jsonl_path, also_stdout)?))
-}
-
-/// Append-mode sibling of [`open_sink`].
-pub fn open_sink_append(
-    jsonl_path: Option<&Path>,
-    also_stdout: bool,
-) -> anyhow::Result<Box<dyn MetricSink>> {
-    Ok(Box::new(open_shared_sink_append(jsonl_path, also_stdout)?))
 }
 
 fn build_sink_inner(
     jsonl_path: Option<&Path>,
     also_stdout: bool,
-    append: bool,
     extra_sinks: Vec<Box<dyn MetricSink>>,
 ) -> anyhow::Result<Box<dyn MetricSink>> {
     let wandb = WandbConfig::from_env()
@@ -1253,16 +1198,11 @@ fn build_sink_inner(
         .transpose()?;
     let jsonl = jsonl_path
         .map(|path| {
-            let sink = if append {
-                JsonlSink::open_append(path)
-            } else {
-                JsonlSink::create(path)
-            };
-            sink.map(|s| Box::new(s) as Box<dyn MetricSink>)
+            JsonlSink::create(path)
+                .map(|s| Box::new(s) as Box<dyn MetricSink>)
                 .map_err(|e| {
                     anyhow::anyhow!(
-                        "failed to {} JSONL metrics sink at {}: {}",
-                        if append { "open" } else { "create" },
+                        "failed to create JSONL metrics sink at {}: {}",
                         path.display(),
                         e
                     )
@@ -1340,12 +1280,6 @@ fn truthy_env_value(value: &str) -> bool {
 
 fn default_wandb_helper_script() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/wandb_sink_helper.py")
-}
-
-fn json_f64(value: f64) -> serde_json::Value {
-    serde_json::Number::from_f64(value)
-        .map(serde_json::Value::Number)
-        .unwrap_or(serde_json::Value::Null)
 }
 
 fn shared_sink_buffer_capacity_from_env() -> usize {

@@ -44,10 +44,6 @@ pub struct DsparkExperience {
 /// the concrete `infer_cuda::DsparkExperienceBuffer` type.
 pub trait ExperienceSource: Send + Sync {
     fn drain(&self, n: usize) -> Vec<DsparkExperience>;
-    fn len(&self) -> usize;
-    fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
 }
 
 /// Configuration for the DSpark trainer.
@@ -441,10 +437,6 @@ impl<'a> ExperienceSource for InferCudaExperienceSource<'a> {
                 vocab_size: e.vocab_size,
             })
             .collect()
-    }
-
-    fn len(&self) -> usize {
-        self.buf.len()
     }
 }
 

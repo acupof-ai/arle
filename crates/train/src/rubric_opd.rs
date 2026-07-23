@@ -37,10 +37,6 @@ impl FlashJudge {
         }
     }
 
-    pub fn engine(&self) -> &Arc<Mutex<LoadedInferenceEngine>> {
-        &self.engine
-    }
-
     /// Judge one rollout against the rubric. The judge decodes greedily for a
     /// deterministic verdict. A lock-poison (a bug) propagates; the caller is
     /// expected to map a transient engine error to [`Verdict::parse_error`] so one
