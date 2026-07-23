@@ -3400,6 +3400,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
             if args.staleness == 0 {
                 next = round_tasks.get(pos + 1).map(|i| launch(i, policy_version));
             }
+            let gpu_busy_before = infer_api::engine_forward_busy_micros();
             let (group, behavior_version) = train::aopd_profile::time_try(
                 "cc_rollout",
                 train::aopd_profile::WALL,
@@ -3475,6 +3476,13 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
                         .unwrap_or(0),
                 ) as f64
                 / 1000.0;
+            // GPU-busy fraction of the rollout wall: engine forward wall (submit→ready)
+            // over this group's window; the remainder is agent-latency idle
+            // (tool-exec / pytest / HTTP between turns). Exact at staleness=0;
+            // over-attributes under Rolling (staleness>0) overlap.
+            let gpu_busy_secs = infer_api::engine_forward_busy_micros()
+                .saturating_sub(gpu_busy_before) as f64
+                / 1e6;
             metrics.append(&serde_json::json!({
                 "kind": "group",
                 "round": round,
@@ -3491,6 +3499,8 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
                 "completion_tokens": g_completion,
                 "rollout_secs": rollout_secs,
                 "rollout_tok_per_sec": g_completion as f64 / rollout_secs.max(1e-9),
+                "gpu_busy_secs": gpu_busy_secs,
+                "gpu_busy_frac": gpu_busy_secs / rollout_secs.max(1e-9),
             }));
 
             // Staleness 1 skips quiesce AND the releases ONLY while a next
