@@ -9,10 +9,22 @@
 **B=1 hand-kernel era is closed.** Live spine already covers FlashMLA, fused
 WQKV DeepGEMM, FA3 prefill, decode-band MoE, DSA, DSpark (substrate).
 
+> **Correction 2026-07-23 (perf-space survey re-grounding).** B0 DEMOTED from
+> PRIMARY: source-trace (git `a96db69ec`, 06-24 shared-paged migration) shows the
+> `--qwen35-fa3-decode` branch (`qwen35.rs:5880`, contiguous lane) is **orphaned
+> on the paged default path** — normal serve decodes via `full_attention_paged`
+> (c=1 `paged_attn_v1`) / `full_attention_paged_batch` (c>1, KV_SPLITS=4), neither
+> with an FA3 branch; the flag's scratch is discarded in the batched path
+> (`qwen35.rs:7649`). The −59.9% was vs the **retired serial kernel**; the paged
+> kernels already split KV, so that gain is banked. **A blind B0 A/B reads WASH.**
+> Source-trace (hypothesis) until the B0.1 log-counter confirms 0 FA3 hits on a
+> paged serve. Real #1 wall-clock lever = **A2 (slots → B≳43)**, measured-open.
+
 **Remaining wall-clock:**
 
 ```
-rank = FA3-decode default policy  >  DSv4 slot/MoE amortization  >  EP ownership
+rank = A2 DSv4 slot/MoE amortization (B≳43, measured-open)  >  C EP ownership
+       ≫  B0 FA3-decode (orphaned on paged default — probe, then port-or-delete)
        ≫  graph↔FA3 shim surgery  ≫  micro-fuse
 ```
 
@@ -20,7 +32,7 @@ DSpark = done substrate (optional free-GPU re-measure only).
 
 | Lever | Default today | Measured | Do |
 |---|---|---|---|
-| FA3 split decode | **OFF** (`--qwen35-fa3-decode false`) | c=1 ITL **−59.9%** (22.8→9.14 ms @4k) | multi-c re-license → **default ON** |
+| FA3 split decode | **OFF** — branch **orphaned on paged default** (`qwen35.rs:5880` unreached) | c=1 ITL −59.9% was vs **retired serial kernel** | B0.1 probe → delete flag or port to paged lane |
 | Qwen whole-step decode graph | **OFF** | only **+5.5%** tok/s | do not pay for device-`seqlen_k` yet |
 | DSv4 decode graph | not default | B=1 WASH/−5% | do not chase |
 | Qwen batched decode / MoE / gpu-router / FA3 prefill | **ON** | licensed | leave |
@@ -59,7 +71,7 @@ or code anchors below.
 
 ### Goals
 
-1. **Default-on FA3 split decode** after multi-c wall license (flag exists).
+1. **FA3-decode reachability probe** (branch orphaned on paged default — see Verdict) → delete flag or port into the paged lane; **no naive default-flip**.
 2. DSv4 **slot / concurrent headroom** (tokens-per-expert amortization).
 3. DeepEP **token-owned** path toward multi-shape default eligibility.
 4. Optional free-GPU DSpark c-sweep re-measure.
@@ -84,7 +96,7 @@ or code anchors below.
 |---|---|
 | DSv4 all-on c16 ≈ 196 out tok/s | `wins/2026-07-19-dsv4-production-all-on-reanchor.md` |
 | DSv4 amortize ≳43 concurrent (0.094 tok/expert · B) | `wins/2026-07-07-dsv4-decode-optimization.md` |
-| FA3 decode default OFF; −59.9% ITL @c1 | `crates/cli/src/args.rs` `qwen35_fa3_decode`; number retained |
+| FA3 decode branch orphaned on paged default; −59.9% was vs retired serial kernel | `qwen35.rs:5880` vs paged `full_attention_paged`; git `a96db69ec` |
 | FA3 ignored when decode-graph ON | `qwen35.rs:785-803` |
 | FA3 host `seqlen_k` | `qwen35.rs:5903`, `arle_fa3_shim.cu` |
 | Batched decode / MoE / gpu-router / FA3 prefill default ON | `args.rs` |
@@ -94,8 +106,8 @@ or code anchors below.
 ## Tracks
 
 ```
-B0 FA3-decode multi-c → default ON   (PRIMARY)
-A2 slot / concurrent headroom        (DSv4 thruput)
+A2 slot / concurrent headroom        (PRIMARY — measured-open, B≳43)
+B0 FA3-decode reachability probe      (branch orphaned on paged default — probe, then port-or-delete)
 C  DeepEP token ownership
 A1' free-GPU DSpark re-measure       (optional)
 B1 device-seqlen shim                (deferred)
@@ -114,20 +126,27 @@ July children still live:
 
 ## Phase plan
 
-### B0 — FA3 split decode multi-c → default ON (P0)
+### B0 — FA3-decode: reachability probe, then port-or-delete (DEMOTED from P0)
 
-**Exit:** same-binary A/B Qwen3.6 HD256, c∈{1,4,8}, `qwen35_fa3_decode` 0/1,
-**graph OFF**, batched decode ON. Needle pass. Win → flip default true + CHANGELOG.
+**Premise correction (2026-07-23):** the naive default-flip is a **no-op** — the
+FA3 branch (`qwen35.rs:5880`, contiguous lane) is orphaned on the paged default
+path since the 06-24 shared-paged migration (`a96db69ec`); a blind
+`qwen35_fa3_decode` A/B on a paged serve reads WASH. B0 is now a **probe +
+decision**, not a flip.
+
+**Exit:** log-counter proves the FA3 branch is dead on a paged serve → delete the
+flag; OR the on-path KV-split sweep shows the incumbent split kernel is the wall →
+commit to the real paged-lane port.
 
 | Step | Action |
 |---|---|
-| B0.1 | c1 regression check (4k-ish, splits=8) |
-| B0.2 | c=4,8 thruput + ITL |
-| B0.3 | multi-c holds → `args.rs` default true |
-| B0.4 | fails → errors/ + case-decode; keep opt-in; **no B1** |
-| B0.5 | document graph ON still disables FA3 decode |
+| B0.1 | One-shot log-counter in the FA3 branch (`qwen35.rs:5880`) + `decode_row_paged_default` (`executor/qwen35.rs:1464`); serve Qwen3.6 c=1 `--qwen35-fa3-decode true`; confirm FA3 counter = 0 while paged fires. |
+| B0.2 | Counter 0 (orphaned, expected) → delete `--qwen35-fa3-decode` + the contiguous FA3 lane; first confirm its only in-tree callers (OPD weight-offload drop-paged, MTP draft heads) don't need it. |
+| B0.3 | Cheap on-path lever instead: sweep the hardcoded `QWEN35_BATCHED_DECODE_KV_SPLITS = 4` (`qwen35.rs:68`) — matched A/B c∈{1,4,8} splits {4,8,16}, graph OFF, needle; nsys the batched-attn window first (combine-bound?). |
+| B0.4 | Only if B0.3 shows the split kernel is the wall → real FA3-paged port (overlaps B1): extend `arle_fa3_shim.cu` to FA3's paged/varlen API (page_table + `seqused_k` + cu_seqlens), wire into `full_attention_paged` (`qwen35.rs:6105`) + `full_attention_paged_batch` (`qwen35.rs:7849`). Incumbents already split KV → expect single-digit %, sign unknown. |
+| B0.5 | document graph ON still disables FA3 decode (moot while FA3 orphaned). |
 
-Not in B0: varlen, device `seqlen_k`, default-on graph.
+Not in B0: naive default-flip, varlen/device-`seqlen_k` before the probe.
 
 ### B1 — Graph-safe device lengths (P3 deferred)
 
@@ -216,7 +235,7 @@ Code: `infer-cuda/src/deepep.rs` (`deepep_ll`), `moe.rs`.
 |---|---|
 | residual + RMSNorm | KILL — see B4 verdict above |
 | host `seqlen_k` → device | B1 deferred |
-| FA3 decode default OFF | **B0 primary** |
+| FA3 decode orphaned on paged default | **B0 probe/delete — DEMOTED** |
 | silu pad → count-aware | B4 |
 | AR + hc_post / draft+verify megakernel | KILL / SKIP |
 
@@ -247,15 +266,15 @@ CHANGELOG. No formula → no run.
 
 ```
 Week 1
-  Day 1-2  B0 FA3-decode multi-c A/B (graph OFF) + needle
-  Day 3    B0 default flip OR errors/
-  Day 4-5  A2 slot / max-running / KV reconcile + counters
+  Day 1    B0.1 FA3 reachability probe (cheap, c=1) → delete flag or defer port
+  Day 2-4  A2 (PRIMARY) tri-budget reconcile (KV/comp · running_cap · DeepEP dispatch)
+           + c-sweep {32,64,121} on 4×H20; confirm tokens/expert ≈ 0.094·B
+  Day 5    A2 verdict: headroom lifted or VRAM/ctx ceiling written
 
 Week 2
-  Day 1-2  A2 headroom lift or document ceiling
-  Day 3    C design notes
-  Day 4    optional A1' if 4 free H20s
-  Day 5    consolidate; keep B1/B2/B4 closed unless numbers open them
+  Day 1-2  C DeepEP token-ownership design; B0.3 KV_SPLITS sweep if probe left headroom
+  Day 3    optional A1' DSpark c-sweep if 4 free H20s
+  Day 4-5  consolidate; keep B1/B2/B4 closed unless numbers open them
 ```
 
 ---
@@ -276,7 +295,7 @@ No CUDA types in `infer-core` / `infer-api`.
 
 ## Success criteria
 
-1. FA3 split decode **default-on** after multi-c license, or multi-c kill with cases.
+1. FA3-decode reachability probe run → flag+branch deleted (orphaned) OR paged-lane port licensed by A/B; **no naive default-flip shipped**.
 2. A2 documents tokens/expert vs concurrent cap; headroom lifted or VRAM ceiling written.
 3. DSpark stays licensed substrate; A1' optional.
 4. No B1 shim without graph re-license ≥ bar.
