@@ -214,13 +214,6 @@ pub struct PrefixCacheStats {
     pub cached_pages: usize,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct WaitingRequestHint {
-    session_affinity_tokens: usize,
-    immediate_reuse_tokens: usize,
-    total_reuse_tokens: usize,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WaitingInsertBias {
     BeforeEqual,
@@ -232,6 +225,12 @@ enum WaitingInsertBias {
 /// many steps before yielding, bounding park/resume ping-pong (most binding at
 /// num_slots=1, where two requests would otherwise swap every step).
 const OVERSUBSCRIPTION_MIN_SLICE: usize = 8;
+
+/// Cap on retained completions. The in-process consumer drains each engine step
+/// and reads its own completion synchronously, so only recent (largest,
+/// monotonic) handles are ever queried; beyond this the oldest — long since read
+/// — are dropped to keep `completed` from growing without bound.
+const COMPLETED_CAP: usize = 1 << 16;
 
 /// Result of attempting to admit the front waiter onto one slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -282,7 +281,6 @@ struct RequestState {
     /// device state.
     swap_seq_len: usize,
     finish: Option<FinishReason>,
-    waiting_hint: WaitingRequestHint,
     /// Monotonic stamp set each time this request is admitted/resumed into a
     /// slot. The oversubscription victim selector picks the smallest stamp
     /// (longest continuous run since its last admit); a just-resumed request
@@ -316,7 +314,6 @@ impl RequestState {
             swap_key: None,
             swap_seq_len: 0,
             finish: None,
-            waiting_hint: WaitingRequestHint::default(),
             admit_seq: 0,
             admit_gen_mark: 0,
         }
@@ -338,7 +335,6 @@ impl RequestState {
         self.swap_key = None;
         self.swap_seq_len = 0;
         self.finish = None;
-        self.waiting_hint = WaitingRequestHint::default();
         self
     }
 
@@ -622,7 +618,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                 self.enqueue_waiting_request(request, WaitingInsertBias::AfterEqual);
             }
             NormalizedRequest::Completed(request) => {
-                self.completed.insert(handle, request.into());
+                self.record_completed(handle, request.into());
             }
             NormalizedRequest::Skipped => {}
         }
@@ -870,6 +866,29 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         handle
     }
 
+    /// Record a completion, evicting the oldest (smallest-handle) entries beyond
+    /// `COMPLETED_CAP` so host RAM stays bounded. Handles are monotonic, so key
+    /// order is submission order and the dropped entries are the coldest.
+    fn record_completed(&mut self, handle: RequestHandle, completed: CompletedRequest) {
+        self.completed.insert(handle, completed);
+        while self.completed.len() > COMPLETED_CAP {
+            self.completed.pop_first();
+        }
+    }
+
+    /// Abort a waiting/parked request: release its whole-slot tier image (if any)
+    /// so it cannot leak — restore_swapped_slot (planner.rs) is the only other
+    /// release path — then record the Abort completion.
+    fn abort_waiter(&mut self, request: RequestState) {
+        if let Some(key) = request.swap_key {
+            self.executor.drop_kv_slot_entries(&[key]);
+        }
+        self.record_completed(
+            request.handle,
+            request.complete_immediately(FinishReason::Abort).into(),
+        );
+    }
+
     fn normalize_request(
         &self,
         handle: RequestHandle,
@@ -1090,7 +1109,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         self.free_slot_pages(slot);
         self.release_reused_prefix(&request.reused_prefix_pages);
         self.evict_prefix_cache_if_below_low_water();
-        self.completed.insert(request.handle, request.into());
+        self.record_completed(request.handle, request.into());
     }
 
     /// Cancel `handle`: drop it from `waiting` if not yet admitted, or free
@@ -1110,10 +1129,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
     pub fn cancel_request(&mut self, handle: RequestHandle) -> bool {
         if let Some(pos) = self.waiting.iter().position(|r| r.handle == handle) {
             let request = self.waiting.remove(pos).expect("position found above");
-            self.completed.insert(
-                handle,
-                request.complete_immediately(FinishReason::Abort).into(),
-            );
+            self.abort_waiter(request);
             return true;
         }
         if let Some(&slot) = self
@@ -1332,10 +1348,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                          {remaining_pages} free with no other request active (prompt_len={})",
                         request.prompt_len()
                     );
-                    self.completed.insert(
-                        request.handle,
-                        request.complete_immediately(FinishReason::Abort).into(),
-                    );
+                    self.abort_waiter(request);
                     return Ok(AdmitOutcome::Rejected);
                 }
                 return Ok(AdmitOutcome::Throttled);
@@ -1531,18 +1544,10 @@ fn waiting_request_precedes(
     queued: &RequestState,
     bias: WaitingInsertBias,
 ) -> bool {
-    // Admission order is a single lexicographic key: higher priority first, then
-    // more reusable KV (session-affinity, then immediate, then total reuse). On a
-    // full tie the bias decides whether `incoming` sorts before an equal `queued`.
-    let key = |r: &RequestState| {
-        (
-            r.priority,
-            r.waiting_hint.session_affinity_tokens,
-            r.waiting_hint.immediate_reuse_tokens,
-            r.waiting_hint.total_reuse_tokens,
-        )
-    };
-    match key(incoming).cmp(&key(queued)) {
+    // Higher priority sorts first; on a tie the bias decides whether `incoming`
+    // precedes an equal `queued`. (Reuse-based tiebreaks were dead: the reuse
+    // hint is only known post-admit, so every waiter compares as default here.)
+    match incoming.priority.cmp(&queued.priority) {
         std::cmp::Ordering::Greater => true,
         std::cmp::Ordering::Less => false,
         std::cmp::Ordering::Equal => matches!(bias, WaitingInsertBias::BeforeEqual),
