@@ -662,7 +662,10 @@ impl Dsv4Model {
                 // buffer: src->scratch then scratch->dst are both non-overlapping,
                 // stream order serializes the two, and one scratch serves every
                 // stage (identical keep/shift/n_bytes).
-                let mut shift_scratch = DeviceVec::zeros(ctx, keep * head_dim)?;
+                // SAFETY: uninit is sound here — the src->scratch copy fully
+                // writes the whole buffer (n_bytes == keep*head_dim*elem) before
+                // the scratch->dst copy reads it.
+                let mut shift_scratch = unsafe { DeviceVec::uninit(ctx, keep * head_dim)? };
                 let (scratch_base, _gs) = shift_scratch.data.device_ptr_mut(&ctx.stream);
                 for stage_kv in &mut df.latent_kv {
                     let (base, _g) = stage_kv.data.device_ptr_mut(&ctx.stream);
