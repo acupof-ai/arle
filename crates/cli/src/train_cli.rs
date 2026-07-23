@@ -5372,31 +5372,34 @@ mod tests {
 
     #[test]
     fn task_selection_skip_retire_math() {
-        // Monotone skip probability with the 0.9 cap (P(explore) >= 0.1).
-        assert_eq!(TaskSelection::skip_prob(0), 0.0);
-        assert!(TaskSelection::skip_prob(1) < TaskSelection::skip_prob(3));
-        assert_eq!(TaskSelection::skip_prob(100), 0.9);
+        // Variance-weighted keep probability: p=0.5 (max variance) always runs;
+        // the 0.1 floor keeps the p→0/1 tails explored; an unseen task runs.
+        assert_eq!(TaskSelection::keep_prob(None), 1.0);
+        assert_eq!(TaskSelection::keep_prob(Some(0.5)), 1.0);
+        assert_eq!(TaskSelection::keep_prob(Some(0.0)), 0.1);
+        assert_eq!(TaskSelection::keep_prob(Some(1.0)), 0.1);
+        assert!(TaskSelection::keep_prob(Some(0.5)) > TaskSelection::keep_prob(Some(0.9)));
 
         // Round 0 runs ALL tasks even with a zero-variance history.
         let mut sel = TaskSelection::new(2);
-        sel.record(0, true, 0.0);
+        sel.record(0, 0.0);
         let (run, skipped, retired) = sel.select(0);
         assert_eq!((run.len(), skipped, retired), (2, 0, 0));
 
-        // Retirement needs 3 CONSECUTIVE hot rounds.
-        sel.record(1, false, 1.0);
-        sel.record(1, false, 1.0);
+        // Retirement needs 3 CONSECUTIVE hot rounds (EMA >= 0.9).
+        sel.record(1, 1.0);
+        sel.record(1, 1.0);
         assert_eq!(sel.select(1).2, 0, "not yet 3 consecutive");
-        sel.record(1, false, 1.0);
+        sel.record(1, 1.0);
         let (run, _, retired) = sel.select(1);
         assert_eq!(retired, 1);
         assert!(!run.contains(&1), "retired task never runs again");
 
         // A sub-0.9 EMA round resets the hot streak.
         let mut sel = TaskSelection::new(1);
-        sel.record(0, false, 1.0);
-        sel.record(0, false, 1.0);
-        sel.record(0, false, 0.0);
+        sel.record(0, 1.0);
+        sel.record(0, 1.0);
+        sel.record(0, 0.0);
         assert_eq!(sel.stats[0].hot_rounds, 0);
     }
     use crate::args::{LrScheduleArg, OpdKlMaskArg};
