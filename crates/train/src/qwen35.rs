@@ -3343,6 +3343,24 @@ impl Qwen35Model {
             .map_err(qwen35_to_autograd)
     }
 
+    /// Batched sibling of [`Self::forward_hidden_states`]: post-final-norm hidden
+    /// `[batch, seq_len, hidden]` for `input_ids` (row-major, len `batch*seq_len`),
+    /// positions `0..seq_len` per row. The logits path (`forward_batch_tokens`) is
+    /// this plus `lm_head`; callers that project only a few masked positions (fused
+    /// chunked CE) take the hidden and skip the full `[batch, seq_len, vocab]` tile.
+    pub fn forward_batch_hidden(
+        &self,
+        input_ids: &[usize],
+        batch: usize,
+        seq_len: usize,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+    ) -> autograd::Result<TensorId> {
+        let position_ids = (0..seq_len).collect::<Vec<_>>();
+        self.forward_batch_hidden_indices(store, tape, input_ids, &position_ids, batch)
+            .map_err(qwen35_to_autograd)
+    }
+
     pub fn forward_batch(
         &self,
         store: &mut TensorStore,
