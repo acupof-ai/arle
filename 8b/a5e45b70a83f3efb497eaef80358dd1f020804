@@ -1,0 +1,35 @@
+crates/cli/src/args.rs
+  s_9c91b86ec3fb55::t_c1ee159d2e6af8 1028-1031
+crates/train/src/qwen35.rs
+  s_7b6fea51c93305::t_876de063e9fe82 2556-2566,2577,2581-2582
+crates/train/src/runtime_flags.rs
+  s_9c91b86ec3fb55::t_c23ad6d38d3fe8 40
+crates/train/tests/test_frozen_prompt_kv_writeback.rs
+  s_9c91b86ec3fb55::t_63d09b817b4519 624-662
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "8ba5e45b70a83f3efb497eaef80358dd1f020804",
+  "prompts": {},
+  "sessions": {
+    "s_7b6fea51c93305": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a57ca772d2323026d",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_9c91b86ec3fb55": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4779911a-69b7-49db-bc83-daf5a48d6ca3",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
