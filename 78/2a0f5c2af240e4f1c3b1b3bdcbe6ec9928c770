@@ -1,0 +1,25 @@
+CHANGELOG.md
+  s_369a57354b1459::t_ac9476a6d41dae 26-39
+docs/experience/errors/2026-07-24-relay-hello-timeout-leak-tp4-teardown.md
+  s_369a57354b1459::t_8a1ec40b0c2315 1-66
+docs/experience/wins/2026-07-23-systematic-review-fixes.md
+  s_369a57354b1459::t_99d77eab20d653 88-110,117-119
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "782a0f5c2af240e4f1c3b1b3bdcbe6ec9928c770",
+  "prompts": {},
+  "sessions": {
+    "s_369a57354b1459": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a37afa08-363e-420d-97a5-35b731b7f708",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
