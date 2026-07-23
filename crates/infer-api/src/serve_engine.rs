@@ -469,6 +469,11 @@ where
         // prefix, holding back a tail that could be the start of a stop string.
         let holdback = req.stop.as_deref().map_or(0, stop_holdback);
         let mut acc_ids: Vec<u32> = Vec::new();
+        // Cursor into acc_ids: ids already reported on a prior delta. Every
+        // emitted delta carries the ids committed since the last report, so the
+        // union of streamed token_ids equals generated_tokens with no duplicate
+        // (held-back / non-boundary tokens ride the delta that finally flushes).
+        let mut reported_upto = 0usize;
         let mut emitted = String::new();
         let mut completed = None;
         while let Ok(item) = stream_rx.recv() {
@@ -478,12 +483,14 @@ where
                     let full = self.tokenizer.decode(&acc_ids).unwrap_or_default();
                     if let Some(delta) = deliverable_delta(&full, &emitted, holdback) {
                         emitted.push_str(&delta);
+                        let token_ids = acc_ids[reported_upto..].to_vec();
+                        reported_upto = acc_ids.len();
                         let _ = tx.send(CompletionStreamDelta {
                             text_delta: delta,
                             finish_reason: None,
                             usage: None,
                             logprob: None,
-                            token_ids: vec![token],
+                            token_ids,
                             error: None,
                         });
                     }
@@ -513,13 +520,22 @@ where
             },
             None => (full, false),
         };
-        if final_text.len() > emitted.len() && final_text.starts_with(&emitted) {
+        // The held-back tail's ids were never reported (their bytes stayed inside
+        // the holdback window); attach them to the flush so the streamed token_ids
+        // union equals generated_tokens.
+        let remaining_ids = acc_ids[reported_upto..].to_vec();
+        let text_delta = if final_text.len() > emitted.len() && final_text.starts_with(&emitted) {
+            final_text[emitted.len()..].to_string()
+        } else {
+            String::new()
+        };
+        if !text_delta.is_empty() || !remaining_ids.is_empty() {
             let _ = tx.send(CompletionStreamDelta {
-                text_delta: final_text[emitted.len()..].to_string(),
+                text_delta,
                 finish_reason: None,
                 usage: None,
                 logprob: None,
-                token_ids: Vec::new(),
+                token_ids: remaining_ids,
                 error: None,
             });
         }

@@ -113,7 +113,7 @@ const MEM_FRACTION_STATIC_MAX: f64 = 0.97;
 pub const PROFILE_KV_TOKENS_FLOOR: u64 = 4096;
 
 /// Clamp a requested static-memory fraction into the safe operating band
-/// `[0.5, 0.97]`. Exposed so callers can report the clamp; the profiler applies
+/// `[0.05, 0.97]`. Exposed so callers can report the clamp; the profiler applies
 /// it internally regardless. A `NaN` fraction (a parse/compute bug) resolves to
 /// the conservative max rather than propagating `NaN` through the budget.
 #[must_use]
@@ -140,7 +140,7 @@ pub fn clamp_mem_fraction_static(mem_fraction_static: f64) -> f64 {
 /// pool charges) — computed backend-side and passed in, so this stays device-
 /// and model-neutral.
 ///
-/// `mem_fraction_static` is clamped to `[0.5, 0.97]` ([`clamp_mem_fraction_static`]).
+/// `mem_fraction_static` is clamped to `[0.05, 0.97]` ([`clamp_mem_fraction_static`]).
 /// A `cell_bytes_per_token` of 0 (a bug — an empty pool shape) returns the floor
 /// rather than dividing by zero. The result is floored at
 /// [`PROFILE_KV_TOKENS_FLOOR`] so a transient tiny `free_bytes` can't wedge
