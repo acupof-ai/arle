@@ -23,6 +23,15 @@ Progress spine. Entry classes recorded here the day they land: phase exits,
 default flips, and accept-or-reject verdicts (AGENTS.md §Docs lifecycle &
 progress spine).
 
+- **ACCEPT — agent-OPD rollout is idle-bound; concurrent mega-rollout GO**
+  (2026-07-24). First hard-gated `gpu_busy_frac` measurement (new per-group
+  timer): 0.30–0.34 on 1×H20 — ~2/3 of the rollout wall the GPU idles on
+  CC-side latency, flat under 4→8 concurrency. Unblocked by two serve fixes:
+  local-relay ack pump (watchdog-teardown class gone, `e4ac039dc`) and the
+  device-pool budget gate (KV exhaustion parks instead of killing the engine,
+  `a9d0c5412`). Case-audited passes; ~31K/request prompt traced to CC
+  ingesting the repo `CLAUDE.md` from in-repo workdirs. Details:
+  [wins](docs/experience/wins/2026-07-24-agent-opd-gpu-busy-frac-measured-go.md).
 - **ACCEPT — sm_120 FP8 MoE prefill: CUTLASS grouped GEMM (G2)** (2026-07-22).
   The Blackwell (RTX PRO 6000, sm_120) FP8 MoE prefill now runs the CUTLASS 4.3.5
   sm_120a grouped blockwise-scaling collective instead of the pathological
