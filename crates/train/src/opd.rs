@@ -2727,11 +2727,21 @@ pub fn opd_step<O: Optimizer>(
     )
 }
 
+/// Positions per fused-CE chunk in the batched rubric writeback; bounds the
+/// transient `[chunk, vocab]` logits tile (≈ chunk·vocab·4 B), the same role the
+/// single-trajectory path's `window_size` plays. 512 → ≈0.3 GB at vocab≈152 K.
+const RUBRIC_WRITEBACK_CHUNK_ROWS: usize = 512;
+
 /// Batched rubric-OPD writeback: one forward+backward over B accepted `(prompt,
-/// completion)` pairs (padded to a common length), completion-masked CE summed over
-/// rows. The 27B CE is overhead-bound (host op-dispatch, GPU ~0% util), so batching
-/// amortizes the ~64-layer per-op host dispatch over B examples — near-B× throughput.
-/// Caller micro-batches B to bound the `[B, seq, vocab]` logit VRAM.
+/// completion)` pairs (padded to a common length), completion-masked CE. The 27B
+/// CE is overhead-bound (host op-dispatch, GPU ~0% util), so batching amortizes
+/// the ~64-layer per-op host dispatch over B examples — near-B× throughput.
+///
+/// The forward yields post-final-norm hidden (not logits); a per-row fused chunked
+/// CE projects only the masked completion positions through `lm_head`, so the dense
+/// `[B, seq, vocab]` logits tile is never materialized (was ~24 GB at B=4 / 10K-tok
+/// completions). Grad-checkpoints offload to host past the length that needs it
+/// (`writeback_offload_for_seq`), mirroring the single-trajectory writeback.
 #[allow(clippy::too_many_arguments)]
 pub fn rubric_writeback_ce_step_batched<O: Optimizer>(
     student: &Qwen35Model,
@@ -2759,6 +2769,12 @@ pub fn rubric_writeback_ce_step_batched<O: Optimizer>(
     let b = batch.len();
 
     let mut tape = Tape::new();
+    // Offload per-layer grad-checkpoints to host past the length that needs it —
+    // the batched forward spans b*max_len tokens. Mirrors the single-trajectory
+    // masked writeback, which the batched path previously omitted (checkpoints
+    // stayed resident regardless of length).
+    tape.set_offload_checkpoints(crate::runtime_flags::writeback_offload_for_seq(b * max_len));
+
     // Flat [B * max_len] input, each row = prompt ++ completion ++ pad(0). Causal
     // attention + right-padding means padding never affects earlier positions, and
     // the per-row CE only targets completion positions, so padding is inert.
@@ -2775,30 +2791,43 @@ pub fn rubric_writeback_ce_step_batched<O: Optimizer>(
                 ))
         })
         .collect();
-    let logits = student
-        .forward_batch_tokens(&flat, b, max_len, store, &mut tape)
+    // Forward to post-final-norm hidden [B, max_len, hidden], NOT logits: the fused
+    // chunked CE below projects only the masked completion positions through
+    // lm_head, so the dense [B, max_len, vocab] tile is never materialized.
+    let hidden = student
+        .forward_batch_hidden(&flat, b, max_len, store, &mut tape)
         .map_err(OpdError::from)?;
 
-    // Per-row completion-masked CE, summed (the heavy forward/backward is shared).
+    // Per-row completion-masked CE via the fused indexed path, preserving the prior
+    // mean-of-row-means reduction: each row's fused call returns that row's token-
+    // mean CE (fused scales by 1/row_targets), summed and scaled by 1/b below. Row
+    // i occupies flat hidden rows [i*max_len, (i+1)*max_len); predicting position
+    // p = prompt.len()-1+j targets completion[j] (next-token convention, identical
+    // to `next_token_sft_loss_from_logits`).
     let mut total: Option<TensorId> = None;
     for (i, (prompt, completion)) in batch.iter().enumerate() {
-        let row = slice(
-            logits,
-            &[i, 0, 0],
-            &[i + 1, max_len, vocab],
+        let row_base = i * max_len + (prompt.len() - 1);
+        let mut position_indices: Vec<i32> = Vec::with_capacity(completion.len());
+        let mut target_tokens: Vec<i32> = Vec::with_capacity(completion.len());
+        for (j, &target) in completion.iter().enumerate() {
+            if target as usize >= vocab {
+                return Err(OpdError::InvalidInput(format!(
+                    "rubric batched writeback: target token {target} in row {i} exceeds vocab={vocab}"
+                )));
+            }
+            position_indices.push((row_base + j) as i32);
+            target_tokens.push(target as i32);
+        }
+        let ce = fused_linear_ce_loss_indexed(
+            hidden,
+            student.lm_head_weight_id(),
+            &position_indices,
+            &target_tokens,
+            RUBRIC_WRITEBACK_CHUNK_ROWS,
             store,
             &mut tape,
         )
         .map_err(OpdError::from)?;
-        let ce = next_token_sft_loss_from_logits(
-            row,
-            max_len,
-            prompt.len() - 1,
-            completion,
-            vocab,
-            store,
-            &mut tape,
-        )?;
         total = Some(match total {
             None => ce,
             Some(prev) => add(prev, ce, store, &mut tape).map_err(OpdError::from)?,
