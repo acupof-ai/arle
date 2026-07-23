@@ -298,6 +298,18 @@ impl DiskStore {
         }
     }
 
+    /// Flush written slots to disk so a following durable-manifest write cannot
+    /// name a slot whose bytes are still only in the page cache. O_DIRECT writes
+    /// bypass the page cache and are on-device at io_uring completion, so the
+    /// Direct arm is a no-op.
+    fn flush(&self) -> std::io::Result<()> {
+        match self {
+            Self::Mmap(store) => store.flush(),
+            #[cfg(target_os = "linux")]
+            Self::Direct(_) => Ok(()),
+        }
+    }
+
     fn reserve_indices(&mut self, indices: &[u32]) {
         match self {
             Self::Mmap(store) => store.reserve_indices(indices),
@@ -454,9 +466,19 @@ impl DiskTier {
     }
 
     fn write_manifest(&mut self) -> Result<()> {
+        // Data-before-manifest ordering barrier: msync the slots this manifest
+        // names, then fsync the manifest. Without it a crash replays the
+        // manifest onto unflushed (zero) slots → silent wrong KV. Only the
+        // durable tier persists a manifest, so this path never runs volatile.
+        if let Err(err) = self.store.flush() {
+            self.stats.failures = self.stats.failures.saturating_add(1);
+            return Err(anyhow::Error::new(err)).with_context(|| {
+                format!("KV recall data flush under {}", self.root_dir.display())
+            });
+        }
         let buf = self.manifest_bytes();
         let bytes = buf.len() as u64;
-        let result = crate::write_file_atomic_cache(&self.manifest_path(), &buf)
+        let result = crate::write_file_atomic_durable(&self.manifest_path(), &buf)
             .with_context(|| format!("KV recall manifest write under {}", self.root_dir.display()));
         if result.is_ok() {
             self.stats.metadata_write_bytes = self.stats.metadata_write_bytes.saturating_add(bytes);
@@ -930,7 +952,12 @@ fn spawn_disk_worker(
                                 "disk writer stopped after prior failure",
                             ))
                         } else {
-                            crate::write_file_atomic_cache(&manifest_path, &bytes)
+                            // Data-before-manifest barrier: flush the slots this
+                            // manifest names before persisting it. Only the durable
+                            // tier enqueues manifests, so this is durable-only.
+                            store.flush().and_then(|()| {
+                                crate::write_file_atomic_durable(&manifest_path, &bytes)
+                            })
                         };
                         if result.is_ok() {
                             counters
