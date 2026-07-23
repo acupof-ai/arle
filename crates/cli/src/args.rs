@@ -1025,8 +1025,10 @@ pub(crate) struct OpdRuntimeArgs {
     #[arg(long, value_enum, default_value_t = OpdEngineOffloadArg::Off)]
     pub(crate) engine_offload: OpdEngineOffloadArg,
 
-    /// Per-layer gradient checkpointing at student load.
-    #[arg(long, default_value_t = false, action = clap::ArgAction::Set, value_name = "BOOL")]
+    /// Per-layer gradient checkpointing at student load. Default on: the
+    /// engage decision (`should_checkpoint`) keeps the full-tape fast path
+    /// whenever it fits in free VRAM, so on = "checkpoint instead of OOM".
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set, value_name = "BOOL")]
     pub(crate) gradient_checkpointing: bool,
 
     /// Min tensor bytes for checkpoint host offload.
