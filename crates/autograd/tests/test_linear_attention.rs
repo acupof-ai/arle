@@ -3,7 +3,8 @@ mod helpers;
 use autograd::{
     Result, Tape, TensorStore,
     ops::{
-        LinearAttentionParams, linear_attention_core, linear_attention_core_with_carry, mul, sum,
+        LinearAttentionParams, linear_attention_core, linear_attention_core_with_carry,
+        linear_attention_core_with_carry_taped, mul, sum,
     },
 };
 #[cfg(any(feature = "metal", feature = "cuda"))]
@@ -817,6 +818,187 @@ fn linear_attention_grad_matches_numeric() -> Result<()> {
     assert!(
         norm_err < 8.0e-3,
         "norm grad max abs err {norm_err} at index {norm_idx}"
+    );
+
+    Ok(())
+}
+
+// Frozen-prompt-KV carry gradcheck: seed a NONZERO initial_state + conv window,
+// then finite-diff the params the carry backward corrects — a_log/dt_bias (M7:
+// initial_state must enter the position-0 decay grad) and conv1d_weight (M8: the
+// carried conv window must contribute to the weight grad). The non-carry
+// gradcheck cannot catch these (its carry is zero, so the dropped terms are 0).
+#[test]
+fn linear_attention_carry_grad_matches_numeric() -> Result<()> {
+    let params = LinearAttentionParams {
+        batch: 1,
+        seq_len: 12,
+        num_key_heads: 1,
+        num_value_heads: 2,
+        key_dim: 8,
+        value_dim: 8,
+        conv_kernel: 4,
+        eps: 1.0e-5,
+    };
+    let fixture = LinearAttentionFixture::new(params);
+    let state_shape = [
+        params.batch,
+        params.num_value_heads,
+        params.key_dim,
+        params.value_dim,
+    ];
+    let conv_win_shape = [params.batch, params.conv_kernel - 1, qkv_dim(params)];
+    let initial_state: Vec<f32> = (0..state_shape.iter().product::<usize>())
+        .map(|i| ((i as f32 * 0.09).sin()) * 0.2)
+        .collect();
+    let initial_conv: Vec<f32> = (0..conv_win_shape.iter().product::<usize>())
+        .map(|i| ((i as f32 * 0.15).cos()) * 0.18)
+        .collect();
+
+    let forward_loss =
+        |a_proj: &[f32], conv1d_weight: &[f32], dt_bias: &[f32], a_log: &[f32]| -> f32 {
+            let mut store = TensorStore::default();
+            let mut tape = Tape::new();
+            let qkv_shape = [params.batch, params.seq_len, qkv_dim(params)];
+            let z_shape = [params.batch, params.seq_len, z_dim(params)];
+            let head_shape = [params.batch, params.seq_len, params.num_value_heads];
+            let qkv = store.from_slice(&fixture.qkv, &qkv_shape).expect("qkv");
+            let z = store.from_slice(&fixture.z, &z_shape).expect("z");
+            let b_proj = store
+                .from_slice(&fixture.b_proj, &head_shape)
+                .expect("b_proj");
+            let a_proj = store.from_slice(a_proj, &head_shape).expect("a_proj");
+            let conv = store
+                .from_slice(conv1d_weight, &[qkv_dim(params), params.conv_kernel])
+                .expect("conv");
+            let dt = store
+                .from_slice(dt_bias, &[params.num_value_heads])
+                .expect("dt_bias");
+            let a_log = store
+                .from_slice(a_log, &[params.num_value_heads])
+                .expect("a_log");
+            let norm = store
+                .from_slice(&fixture.norm_weight, &[params.value_dim])
+                .expect("norm");
+            let coeff = store.from_slice(&fixture.coeff, &z_shape).expect("coeff");
+            let is = store
+                .from_slice(&initial_state, &state_shape)
+                .expect("state");
+            let ic = store
+                .from_slice(&initial_conv, &conv_win_shape)
+                .expect("conv_win");
+            let output = linear_attention_core_with_carry_taped(
+                qkv,
+                z,
+                b_proj,
+                a_proj,
+                conv,
+                dt,
+                a_log,
+                norm,
+                params,
+                Some(is),
+                Some(ic),
+                &mut store,
+                &mut tape,
+            )
+            .expect("carry forward");
+            let weighted = mul(output, coeff, &mut store, &mut tape).expect("mul");
+            let loss = sum(weighted, &mut store, &mut tape).expect("sum");
+            store.to_host(loss).expect("loss")[0]
+        };
+
+    let (analytic_a, analytic_conv, analytic_dt, analytic_a_log) = {
+        let mut store = TensorStore::default();
+        let mut tape = Tape::new();
+        let qkv_shape = [params.batch, params.seq_len, qkv_dim(params)];
+        let z_shape = [params.batch, params.seq_len, z_dim(params)];
+        let head_shape = [params.batch, params.seq_len, params.num_value_heads];
+        let qkv = store.from_slice(&fixture.qkv, &qkv_shape)?;
+        let z = store.from_slice(&fixture.z, &z_shape)?;
+        let b_proj = store.from_slice(&fixture.b_proj, &head_shape)?;
+        let a_proj = store.from_slice(&fixture.a_proj, &head_shape)?;
+        let conv1d_weight = store.from_slice(
+            &fixture.conv1d_weight,
+            &[qkv_dim(params), params.conv_kernel],
+        )?;
+        let dt_bias = store.from_slice(&fixture.dt_bias, &[params.num_value_heads])?;
+        let a_log = store.from_slice(&fixture.a_log, &[params.num_value_heads])?;
+        let norm_weight = store.from_slice(&fixture.norm_weight, &[params.value_dim])?;
+        let coeff = store.from_slice(&fixture.coeff, &z_shape)?;
+        let is = store.from_slice(&initial_state, &state_shape)?;
+        let ic = store.from_slice(&initial_conv, &conv_win_shape)?;
+        for id in [a_proj, conv1d_weight, dt_bias, a_log] {
+            store.get_mut(id).expect("tensor exists").requires_grad = true;
+        }
+        let output = linear_attention_core_with_carry_taped(
+            qkv,
+            z,
+            b_proj,
+            a_proj,
+            conv1d_weight,
+            dt_bias,
+            a_log,
+            norm_weight,
+            params,
+            Some(is),
+            Some(ic),
+            &mut store,
+            &mut tape,
+        )?;
+        let weighted = mul(output, coeff, &mut store, &mut tape)?;
+        let loss = sum(weighted, &mut store, &mut tape)?;
+        let grads = tape.backward(loss, &mut store)?;
+        (
+            store.to_host(*grads.get(&a_proj).expect("a_proj grad"))?,
+            store.to_host(*grads.get(&conv1d_weight).expect("conv grad"))?,
+            store.to_host(*grads.get(&dt_bias).expect("dt grad"))?,
+            store.to_host(*grads.get(&a_log).expect("a_log grad"))?,
+        )
+    };
+
+    let mut a_in = fixture.a_proj.clone();
+    let numeric_a = num_grad(
+        |v| forward_loss(v, &fixture.conv1d_weight, &fixture.dt_bias, &fixture.a_log),
+        &mut a_in,
+        1.0e-3,
+    );
+    let mut conv_in = fixture.conv1d_weight.clone();
+    let numeric_conv = num_grad(
+        |v| forward_loss(&fixture.a_proj, v, &fixture.dt_bias, &fixture.a_log),
+        &mut conv_in,
+        1.0e-3,
+    );
+    let mut dt_in = fixture.dt_bias.clone();
+    let numeric_dt = num_grad(
+        |v| forward_loss(&fixture.a_proj, &fixture.conv1d_weight, v, &fixture.a_log),
+        &mut dt_in,
+        1.0e-3,
+    );
+    let mut a_log_in = fixture.a_log.clone();
+    let numeric_a_log = num_grad(
+        |v| forward_loss(&fixture.a_proj, &fixture.conv1d_weight, &fixture.dt_bias, v),
+        &mut a_log_in,
+        1.0e-3,
+    );
+
+    let (a_idx, a_err) = max_err_with_index(&analytic_a, &numeric_a);
+    let (conv_idx, conv_err) = max_err_with_index(&analytic_conv, &numeric_conv);
+    let (dt_idx, dt_err) = max_err_with_index(&analytic_dt, &numeric_dt);
+    let (a_log_idx, a_log_err) = max_err_with_index(&analytic_a_log, &numeric_a_log);
+
+    assert!(a_err < 8.0e-3, "carry a_proj grad err {a_err} at {a_idx}");
+    assert!(
+        conv_err < 8.0e-3,
+        "carry conv1d_weight grad err {conv_err} at {conv_idx}"
+    );
+    assert!(
+        dt_err < 8.0e-3,
+        "carry dt_bias grad err {dt_err} at {dt_idx}"
+    );
+    assert!(
+        a_log_err < 8.0e-3,
+        "carry a_log grad err {a_log_err} at {a_log_idx}"
     );
 
     Ok(())
