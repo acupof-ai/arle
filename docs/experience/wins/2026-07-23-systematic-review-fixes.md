@@ -85,16 +85,35 @@ Fixes grouped by crate (each verified — see Verification):
 - infer-cuda: `CUDARC_CUDA_VERSION=12080 cargo check -p arle --features cuda,no-cuda`
   + clippy clean (typecheck only; nvcc/perf pending-remote H20).
 
-## Bench
+## Bench / pod verification (2026-07-24)
 
-Correctness/robustness fixes; no default-path perf flip. Perf-relevant (H1
-eviction O(uptime), H2 streaming concurrency, M2 host-RAM growth) improve a
-degenerate/long-uptime path — throughput bench is **pending-remote** (CUDA benches
-need the H20 box; local Metal path unaffected by these device-neutral changes).
+CUDA half verified on **H20 sm_90** (DSv4-Flash-FP8 TP=4/EP=4) and built on
+**Colab G4 sm_120** (Blackwell):
+- **Build:** BUILD_EXIT=0 on both arches (sm_90 DeepEP + native DeepGEMM incl. the
+  cli/train cuda lanes with no Mac typecheck; sm_120 226 AOT objects) — the CUDA
+  fixes compile with real nvcc, not just Mac typecheck.
+- **Needle gate:** 15/15 exact, 0 miss across 5 rungs — **no correctness
+  regression** (matches champion).
+- **Throughput c1/c4:** +0.5% / −0.8% vs the 2026-07-19 champion — **perf-neutral**
+  on the per-request hot path (attention/MoE/quant/decode-graph, where the CUDA
+  fixes live).
+- **Regression found + fixed:** the LOW#18 accept_n hello-read timeout leaked into
+  the steady-state relay reader → TP=4 c8+ serve teardown (framing desync). Fixed
+  in `837b89d39`; pod-confirmed c8 48/48 + c16 64/64, no teardown. See
+  errors/2026-07-24-relay-hello-timeout-leak-tp4-teardown.md.
+- **Open (not attributed to this sweep):** a reproducible c16 throughput deficit
+  (−40% vs 07-19 champion, batching/scaling — c8→c16 1.16× vs champion 1.58×),
+  measured on a binary that also carries concurrent non-sweep changes
+  (infer-cuda/executor.rs edits). This sweep's scheduler changes are O(1) /
+  behavior-equivalent and don't touch batch formation, and c1/c4 were
+  perf-neutral, so the mechanism points elsewhere — needs a champion-binary A/B +
+  a sweep-isolated build to attribute.
 
 ## Rule
 
 Full-runtime review = scoped module reviews + a per-finding adversarial refute
 pass; 16/42 raw findings were plausible-but-wrong and only the skeptic caught
 them. A silent-gradient fix ships with a finite-diff gradcheck that fails before
-and passes after — reasoning alone is not the gate.
+and passes after — reasoning alone is not the gate. And a timing-sensitive
+multiproc change is invisible to `cargo test` + Mac typecheck + CI (TP=1-only
+coverage) — only a pod **TP=N c8/c16 c-sweep** caught the relay teardown.
