@@ -752,6 +752,13 @@ impl PendingRelayCoordinator {
                     if rank >= world_size {
                         bail!("RelayCoordinator worker rank {rank} out of range [0, {world_size})");
                     }
+                    // Clear the hello-read timeout before the stream enters the
+                    // steady-state relay: completion reads must block indefinitely
+                    // (tokens can be far apart), so a leftover timeout would fire
+                    // mid-envelope → desynced framing → serve teardown (seen at c8).
+                    stream
+                        .set_read_timeout(None)
+                        .context("worker stream clear read timeout after hello")?;
                     let mut channel: Box<dyn RelayChannel> = Box::new(TcpChannel::new(stream));
                     channel
                         .set_write_timeout(Some(BROADCAST_WRITE_TIMEOUT))
