@@ -515,6 +515,8 @@ mod tests {
     /// Partial-overlap rule: a token straddling a span boundary counts.
     #[test]
     fn straddling_token_is_supervised() {
+        // one supervised span is exactly the straddling case under test
+        #[allow(clippy::single_range_in_vec_init)]
         let mask = mask_from_offsets(&[(0, 4), (4, 8), (8, 12)], &[6..10]);
         assert_eq!(mask, vec![0, 1, 1]);
     }
