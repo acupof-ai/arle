@@ -1601,6 +1601,14 @@ pub(crate) struct TrainSelfOpdArgs {
     #[arg(long, value_parser = parse_positive_usize)]
     pub(crate) teacher_topk: Option<usize>,
 
+    /// Opt in to the fused lm_head+loss path (computes full-vocab logits + KD loss
+    /// in one op to save the [window, vocab] tensor). DEFAULT IS DENSE: on H20 the
+    /// fused path ran the lm_head on the HOST (~205 s/step for the 27B, GPU idle)
+    /// vs ~3.9 s GPU-bound for dense — only enable for windows too large to
+    /// materialize [window, vocab]. See errors/2026-06-23-opd-fused-distill-default-host-bound.
+    #[arg(long, default_value_t = false)]
+    pub(crate) fused_distill: bool,
+
     /// Total SOPD training steps.
     #[arg(long, default_value_t = 5)]
     pub(crate) steps: usize,
