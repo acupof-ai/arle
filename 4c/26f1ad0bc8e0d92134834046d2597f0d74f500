@@ -1,0 +1,29 @@
+crates/train/src/metrics.rs
+  s_85a27cb9e7d29c::t_b4ad30622d1805 9,553,573,1174,1201-1202,1205
+crates/train/src/model_family.rs
+  s_85a27cb9e7d29c::t_133d00ffbf2443 5
+crates/train/src/server.rs
+  s_85a27cb9e7d29c::t_d3baa67f87eb88 26
+crates/train/src/update_strategy.rs
+  s_85a27cb9e7d29c::t_ae78c7bf5606f3 471
+crates/train/tests/test_metrics.rs
+  s_85a27cb9e7d29c::t_07e2576f3852fa 15-16,245-246
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "4c26f1ad0bc8e0d92134834046d2597f0d74f500",
+  "prompts": {},
+  "sessions": {
+    "s_85a27cb9e7d29c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aff4596efdbc561af",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
