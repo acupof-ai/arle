@@ -1,0 +1,23 @@
+docs/index.md
+  s_3bfdcf8fceb2d5::t_444fc6734061cb 64
+docs/plans/2026-07-21-kernel-opt-fusion-campaign.md
+  s_3bfdcf8fceb2d5::t_704142bebd64f1 12-22,26-27,35,74,99,109-110,129-135,137-139,143-147,149,238,269-272,275-277,298
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "2a878c639bcdab3a80cd8632f90b15b76321d983",
+  "prompts": {},
+  "sessions": {
+    "s_3bfdcf8fceb2d5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "62ec01f2-d7cd-44c5-b546-2e6a64756530",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
