@@ -1188,6 +1188,80 @@ mod tests {
         Ok(())
     }
 
+    /// The local relay driver must keep acking ticks while the engine thread is
+    /// wedged in a long operation (first-touch JIT, giant prefill chunk): a
+    /// blocking `submit_streaming` on the ack path starved the coordinator's
+    /// TICK_WINDOW and its 120s watchdog tore down the serve (2026-07-23
+    /// single-GPU OPD rollout).
+    #[test]
+    fn relay_driver_acks_ticks_while_engine_is_wedged() -> Result<()> {
+        use multiproc_relay::{RelayCoordinator, RelayEnvelope, WireRequest};
+
+        let kv = HostPagedKvPool::new(2, 256, 16);
+        let serve = Arc::new(ServeHandle::spawn(
+            EchoExecutor,
+            kv,
+            SchedulerConfig::default(),
+        ));
+
+        // Wedge the engine thread inside a control closure until released.
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let (gate_tx, gate_rx) = mpsc::channel::<()>();
+        let blocker = {
+            let serve = Arc::clone(&serve);
+            std::thread::spawn(move || {
+                let _ = serve.run_on_engine(move |_| {
+                    let _ = entered_tx.send(());
+                    let _ = gate_rx.recv();
+                });
+            })
+        };
+        entered_rx
+            .recv()
+            .expect("engine thread entered the wedge closure");
+
+        let (mut relay, engine_recv, engine_tx) = RelayCoordinator::new_local();
+        {
+            let serve = Arc::clone(&serve);
+            std::thread::spawn(move || {
+                serve_handle_relay_driver(serve, engine_recv, engine_tx, None)
+            });
+        }
+
+        // Tick 0 carries a submission whose handle assignment cannot complete
+        // while the engine is wedged; 1..=5 are empty decode ticks.
+        relay.broadcast(&RelayEnvelope::TickAdmissions {
+            seq: 0,
+            requests: vec![WireRequest {
+                request_id: 7,
+                prompt_tokens: vec![1, 2, 3],
+                max_tokens: 4,
+                sampling: SamplingParams::default(),
+            }],
+        })?;
+        for seq in 1..=5 {
+            relay.broadcast(&RelayEnvelope::TickAdmissions {
+                seq,
+                requests: vec![],
+            })?;
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while relay.min_acked_ticks() < 6 {
+            assert!(
+                Instant::now() < deadline,
+                "tick acks stalled behind the wedged engine (min_acked={}); \
+                 the watchdog-teardown regression this test gates",
+                relay.min_acked_ticks()
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        gate_tx.send(()).expect("release the wedged engine");
+        blocker.join().expect("blocker thread joins");
+        Ok(())
+    }
+
     /// `submit_streaming` yields each token live in commit order, then exactly one
     /// terminal `Done`; the ticket still resolves the same full completion.
     #[test]
