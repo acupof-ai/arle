@@ -1,0 +1,23 @@
+crates/train/src/cc_convert.rs
+  s_9c91b86ec3fb55::t_14e5365e1a3fbe 518-519
+crates/train/src/qwen35.rs
+  s_9c91b86ec3fb55::t_572a8b6e39df93 5949-5951
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "c42af5fa1c179cffc35a7094bbcf3f6025d3b58d",
+  "prompts": {},
+  "sessions": {
+    "s_9c91b86ec3fb55": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4779911a-69b7-49db-bc83-daf5a48d6ca3",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
