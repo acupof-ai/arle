@@ -2994,6 +2994,7 @@ impl Dsv4Model {
         if dsv4_decode_graph_enabled()
             && last_hidden_out.is_none()
             && !self.config.is_dspark()
+            && self.config.hc_mult != 1
             && seq_len == 1
             && matches!(
                 moe_transport,

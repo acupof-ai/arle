@@ -322,7 +322,7 @@ impl Dsv4CudaExecutor {
         self.mtp_chains += 1;
         self.mtp_note_accept(accepted, depth);
         if self.model.tp.config().rank == 0 {
-            eprintln!(
+            log::debug!(
                 "[dsv4-mtp] depth={} topk={} draft_rows={} verify_rows={} accepted={accepted} topk_bonus_hit={topk_bonus_hit} accept_total={} reject_total={} bonus={bonus}",
                 depth,
                 topk,
@@ -517,7 +517,7 @@ impl Dsv4CudaExecutor {
             self.mtp_rejects += depth - accepted;
             self.mtp_chains += 1;
             if self.model.tp.config().rank == 0 {
-                eprintln!(
+                log::debug!(
                     "[dsv4-mtp-batched] slot={slot_idx} depth={depth} topk={topk} \
                      draft_rows={} verify_rows={} accepted={accepted} \
                      topk_bonus_hit={topk_bonus_hit} accept_total={} reject_total={} bonus={bonus}",
