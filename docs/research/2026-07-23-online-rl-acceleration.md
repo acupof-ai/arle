@@ -1,0 +1,139 @@
+# Accelerating ARLE online RL (agent-OPD loop)
+
+> Status: Active — 2026-07-23. Evidence-grounded survey of the acceleration space
+> for the agent-OPD online-RL loop (rollout → pytest reward → DAPO/masked-CE
+> update → LoRA remerge). Deep-research synthesis; code claims source-traced to
+> file:line, throughput numbers from the 2026-07-11 profile, industry claims
+> external.
+
+## Verdict
+
+**"Make online RL async" does not transfer to ARLE.** The AReaL 2.77× / verl 1.7×
+headline speedups come from **disaggregating** generation GPUs from training GPUs
+so rollout ∥ update. ARLE is single-box, single-process, **colocated by design**
+(`infer_student.rs:34` one `Arc<Mutex<LoadedInferenceEngine>>`; base weights
+zero-copy shared via `--share-frozen-base`, `train_cli.rs:3086`). On one GPU set,
+rollout-decode and writeback-backward both saturate the same SMs — they **cannot**
+run simultaneously. verl states its 1.7× is "vs the colocate setup", i.e. the win
+IS de-colocation, which ARLE deliberately rejects.
+
+The three GPU stages are serial not because of a lock but because of **VRAM mutual
+exclusion**: the rollout KV pool must be physically torn down before writeback
+backward (`train_cli.rs:3523 release_kv_pool`; a resident pool+scratch atop the
+writeback forward OOMed at 97.4 GB > 96 GB). Rollout needs the pool; writeback
+needs it gone. This is the load-bearing wall — physics, not software.
+
+So acceleration here is **not** an async-systems problem. It is three different
+problems: **(1) rollout concurrency starvation, (2) wasted rollout on
+gradient-free trajectories, (3) the writeback VRAM wall.**
+
+## Where the wall goes (measured, 2026-07-11, 27B FP8, 4×2 synthetic round = 173.5 s)
+
+| Stage | % round | ms/call × n | GPU/host | Overlappable? |
+|---|---|---|---|---|
+| rollout_decode | **40.4%** | 8764 × 8 | mixed | no (VRAM + lock) |
+| writeback (fwd+bwd+opt) | **33.1%** | 14366 × 4 | gpu | no (VRAM exclusion) |
+| eval | **23.0%** | 39868 × 1 | mixed | no (round-tail barrier) |
+| pytest reward | 3.3% | 714 × 8 | **host** | already ∥ sibling decode |
+| sync_lora (weight remerge) | 0.0% | 60 × 1 | gpu | already optimal (was 60–83 s) |
+
+96.5% of the round is three non-overlapping GPU stages; provable GPU-idle = **3.5%**
+(= host pytest) on synthetic, growing to ~15–18% on real SWE-Pro (seconds-to-minutes
+pytest). **The GPU-stage-overlap ceiling on this box is that 3.5–18%, not a 2×.**
+
+## Ranked levers (ARLE-specific)
+
+### Tier 0 — one measurement unlocks the biggest lever
+
+**Measure the GPU-active fraction inside the 40.4% rollout wall.** 8764 ms/call for
+only ≤2560 gen tokens, plus DSpark's low 1.41× effective (vs serial 1.9×), both
+**hint** rollout is agent-latency-bound (GPU idle between multi-turn
+tool-exec/pytest/HTTP gaps), not GPU-bound. If true:
+
+> **Collapse the 4 serial group-rollouts into one `num_slots=8` concurrent
+> mega-rollout** (`train_cli.rs:3396` inner loop + `:3026` num_slots). The
+> continuous batcher already exists (`serve_engine.rs:126-133`); it is merely
+> starved at C≤2 (K=2 concurrent `claude` sessions). Upper bound: 4× serial →
+> ~1× concurrent on the GPU-active portion.
+
+Gated (SOLID): no code until the GPU-idle-within-rollout number is measured; the
+A/B must clear reward/loss parity (concurrent rollout = staleness drift), not just
+wall. If already bandwidth-saturated at B=2, sublinear MoE caps it.
+
+### Tier 1 — cheap, safe, attacks measured waste (highest ROI)
+
+> **Wire `scripts/comfort_band.py` as the default corpus-prep step.** ~50% of
+> rollouts currently produce zero gradient: zero-variance always-pass groups, plus
+> variance-bearing 30K-token trajectories that the 23K writeback cap SKIPS
+> (`mean_loss=0.0000`, errors/2026-07-22). comfort_band offline-filters to
+> intermediate-difficulty **and** ≤23K tasks, converting wasted rollout GPU into
+> gradient-bearing rollout. Total-wall-to-target win, zero hot-path risk.
+
+Not redundant with the runtime P5 `TaskSelection` (`train_cli.rs:599`): P5 skips
+zero-variance/too-easy tasks **online**, but a 30K variance-bearing task passes
+P5's filter (non-zero variance → `zv_streak` never increments) and wastes its
+40%-of-round rollout every round. **Length pre-filtering is the gap P5 structurally
+cannot close** — exactly comfort_band's role. Wired into `agent_opd_curve.sh`
+2026-07-23 (profile 1 round → filter → train), default on, `COMFORT_BAND=0` opts out.
+
+### Tier 2 — the writeback (33%, biggest single stage; training-kernel axis)
+
+Writeback is VRAM-bound and cannot overlap; only its internals give:
+- **seq-adaptive grad-checkpoint offload**: shipped (backward −36% @seq~1276), but
+  `WRITEBACK_OFFLOAD_MIN_SEQ=4096` gate — wrongly-on-short regressed; **tune the gate**.
+- **23K `max_update_seq` VRAM wall** (`update_strategy.rs:641`): real fix is
+  sequence-parallel / activation-offload writeback to admit 30K trajectories
+  (recovers their wasted 40%-of-round rollout). A training-VRAM project, not RL structure.
+- LA chunkwise-GEMM backward / bf16-native autograd (P1.2/P1.3): autograd-kernel work.
+
+### Tier 3 — real-corpus-gated (no-op on synthetic)
+
+- **`--staleness 1` pipeline** (already built, `train_cli.rs:3390`) hides host-bound
+  pytest/boot behind the next group's GPU rollout. On synthetic <3.5% (no-op); pays
+  only on real SWE-Pro. **Blocked** by the 97.4 GB OOM (Rolling keeps the resident KV
+  pool during writeback — shrink the pool first); needs a DAPO/ratio preset
+  (`rejection_ce` errors at `:3322`) + truncated-IS for the k=1 off-policy variance.
+- **Verify the prefix-cache flush on real prompt lengths.** On synthetic (~2560 tok)
+  `prefix_warmup` hides it; on real SWE-Pro (22K–200K shared prefix, `cc_harness.rs:27,32`)
+  the re-prefill spills onto the next rollout's critical path. Measurement, not build.
+- **DAPO filter-before-capture reorder** (DAPO path only): hoist `DropZeroAdvGroup`
+  (`update_strategy.rs:270`) ahead of `capture_rollout_logprobs` (`train_cli.rs:3595`)
+  so dropped trajectories don't pay a capture forward. Zero on the `rejection_ce` default.
+
+## Killed-in-disguise (the async playbook's traps)
+
+| Lever | Why it fails on ARLE |
+|---|---|
+| Double-buffered weights (θ_{t-1} rollout ∥ θ_t optimize) | Targets a **measured 0.0%** (sync_lora 60 ms; flush already overlapped by prefix_warmup); +27 GB into an OOM budget = **net negative** |
+| Disaggregate rollout/train GPUs on one box | Halving each stage's TP degrades throughput 1.7–2× → overlap is wash-or-loss. Only pays when GPUs are **added** |
+| LoRA-delta-at-rollout to skip the prefix flush | Stale-epoch KV = on-policy corruption; explicitly guarded (`serve_engine.rs:363-372`) |
+| Partial / interruptible rollout | pytest scores the **complete** trajectory (`cc_harness.rs:307`); a truncated agent turn = empty diff = reward 0 |
+| Truncate stragglers by wall | Selection bias against hard-but-correct long trajectories |
+| DAPO oversample-and-refill | Adds rollout wall to buy gradient density — wrong direction for wall-clock |
+
+## Already banked (do not re-file as wins)
+
+Continuous batching (exists, starved at C≤2) · fast on-device weight sync (60 ms, was
+60–83 s) · LoRA-delta-only sync · verl-colocation placement (ARLE is past it — same
+process, zero-copy base) · DAPO zero-variance drop · eval downfreq (23%→11.5%) · DSpark
+rollout decode (−29%).
+
+## Action queue
+
+Neither top move needs free GPUs to *prepare*:
+1. **Done 2026-07-23:** comfort_band wired as default corpus-prep in `agent_opd_curve.sh`.
+   Acceptance (trainable fraction rises ~50%→~100%, `mean_loss>0`) is a pod-gated run.
+2. **Next:** add a profiler that splits the 40.4% rollout wall into GPU-active vs
+   agent-latency-idle — the number that decides whether the mega-rollout lever (Tier 0)
+   is worth building. Approach: NVTX/CUDA-event the engine's decode-step span vs the
+   rollout wall, or a decode-step counter × measured step-ms vs the 8764 ms/call.
+
+## Anchors
+
+- Loop: `crates/cli/src/train_cli.rs:3340` (round) / `:3396` (group) / `:3403` rollout /
+  `:3520-3525` VRAM release / `:3614` writeback / `:3701` sync_lora / `:3766` eval
+- Engine lock: `crates/train/src/infer_student.rs:34`; weight sync `:324` → `:423`
+- Selection: `train_cli.rs:599` P5 TaskSelection; corpus filter `scripts/comfort_band.py`
+- Profile: `docs/experience/wins/2026-07-11-agent-opd-round-profile-ms-breakdown.md`
+- VRAM wall: `docs/experience/errors/2026-07-22-agent-opd-dapo-null-gradient-trajectory-vram-wall.md`
+- Prior RL infra research: `docs/research/2026-07-21-rl-algo-infra-deepresearch.md`

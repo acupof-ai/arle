@@ -21,6 +21,10 @@
 #   STALENESS=1                   1 = train on a batch while the next generates
 #                                 (dapo/dr-grpo/gspo only); 0 = wait for each batch
 #   TASK_SELECTION=true           skip prompts that always pass or always fail
+#   COMFORT_BAND=1                profile 1 round, then train only the "band": drop
+#                                 always-pass/always-fail AND >CB_MAX_SEQ tasks the
+#                                 writeback skips (0=off; auto-off under SMOKE)
+#   CB_MAX_SEQ=22000 CB_PASS_LO=0.2 CB_PASS_HI=0.8   comfort-band thresholds
 #   ROLLOUT_TEMPERATURE=1.0       >0 samples (dapo/grpo); 0.0 is greedy (rejection-ce)
 #   SPEC=mtp                      spec-decode via TC's built-in MTP head (default,
 #                                 aligned, no download). dflash=external draft
@@ -102,14 +106,55 @@ echo "[curve] out=$OUT strategy=$UPDATE_STRATEGY staleness=$STALENESS temp=$ROLL
 python3 scripts/gen_agent_opd_tasks.py \
     --out "$OUT/corpus" --seed "$SEED" --difficulty "$DIFFICULTY" --self-check
 
+# Spec-decode args, shared by the comfort-band profile round and the training run.
+spec_args=()
+case $SPEC in
+    mtp)    spec_args+=(--mtp-draft-tokens "$MTP_DRAFT_TOKENS")
+            echo "[curve] spec-decode: MTP head (TC built-in, aligned) draft_tokens=$MTP_DRAFT_TOKENS" ;;
+    dflash) spec_args+=(--dspark-draft-model "$DSPARK_DRAFT_MODEL" --dspark-conf-threshold "$DSPARK_CONF_THRESHOLD")
+            echo "[curve] spec-decode: DFlash draft=$DSPARK_DRAFT_MODEL conf=$DSPARK_CONF_THRESHOLD" ;;
+    off)    echo "[curve] spec-decode: OFF" ;;
+    *)      echo "unknown SPEC=$SPEC (want mtp|dflash|off)" >&2; exit 1 ;;
+esac
+
+# 1b. Comfort-band corpus filter (default on; COMFORT_BAND=0 or SMOKE=1 to skip).
+# One unbiased profile round (task-selection off) → drop always-pass / always-fail
+# tasks AND >CB_MAX_SEQ trajectories the writeback would skip → train only the
+# trainable band. Closes the length-waste gap the runtime P5 selector cannot: a
+# variance-bearing 30K task passes P5 but its 40%-of-round rollout is thrown away
+# every round (errors/2026-07-22). See docs/research/2026-07-23-online-rl-acceleration.md.
+CORPUS="$OUT/corpus"
+if [[ ${COMFORT_BAND:-1} == 1 && ${SMOKE:-0} != 1 ]]; then
+    echo "[curve] comfort-band: profiling $CORPUS (1 round, task-selection off) → filter"
+    CUDA_VISIBLE_DEVICES=$GPU "$ARLE_BIN" train agent-opd \
+        --student-model "$STUDENT_MODEL" \
+        --dataset "$CORPUS/tasks_train.jsonl" --staged-root "$CORPUS/staged" \
+        --work-root "$OUT/cb_work" --task-limit "$TASK_LIMIT" \
+        --update-strategy "$UPDATE_STRATEGY" --rollout-temperature "$ROLLOUT_TEMPERATURE" \
+        --samples-per-prompt "$SAMPLES" --staleness 0 --task-selection false \
+        --sync every-group --test-timeout-secs 60 --writeback-cap "$WRITEBACK_CAP" \
+        --lora-rank 16 --lora-alpha 32 --lora-target-set attention-qv --save-every 0 \
+        "${spec_args[@]}" \
+        --rounds 1 --eval-every 0 --eval-out-dir "$OUT/cb_profile" \
+        2>&1 | tee "$OUT/cb_profile.log"
+    if python3 scripts/comfort_band.py \
+            --metrics "$OUT/cb_profile/metrics.jsonl" --corpus "$CORPUS" --out "$OUT/corpus-band" \
+            --max-seq "${CB_MAX_SEQ:-22000}" --pass-lo "${CB_PASS_LO:-0.2}" --pass-hi "${CB_PASS_HI:-0.8}"; then
+        CORPUS="$OUT/corpus-band"
+        echo "[curve] comfort-band: training on filtered corpus $CORPUS"
+    else
+        echo "[curve] comfort-band: empty/failed band (rc=$?) — falling back to full corpus $CORPUS" >&2
+    fi
+fi
+
 train_args=(
     train agent-opd
     --student-model "$STUDENT_MODEL"
-    --dataset "$OUT/corpus/tasks_train.jsonl"
-    --staged-root "$OUT/corpus/staged"
+    --dataset "$CORPUS/tasks_train.jsonl"
+    --staged-root "$CORPUS/staged"
     --work-root "$OUT/work"
     --task-limit "$TASK_LIMIT"
-    --eval-dataset "$OUT/corpus/tasks_eval.jsonl"
+    --eval-dataset "$CORPUS/tasks_eval.jsonl"
     --eval-n "$EVAL_N"
     --eval-concurrency "$EVAL_CONCURRENCY"
     --update-strategy "$UPDATE_STRATEGY"
@@ -125,20 +170,8 @@ train_args=(
     --lora-target-set attention-qv
     --save-lora-adapters "$OUT/adapters"
     --save-every 0
+    "${spec_args[@]}"
 )
-case $SPEC in
-    mtp)
-        train_args+=(--mtp-draft-tokens "$MTP_DRAFT_TOKENS")
-        echo "[curve] spec-decode: MTP head (TC built-in, aligned) draft_tokens=$MTP_DRAFT_TOKENS" ;;
-    dflash)
-        train_args+=(--dspark-draft-model "$DSPARK_DRAFT_MODEL"
-                     --dspark-conf-threshold "$DSPARK_CONF_THRESHOLD")
-        echo "[curve] spec-decode: DFlash draft=$DSPARK_DRAFT_MODEL conf=$DSPARK_CONF_THRESHOLD" ;;
-    off)
-        echo "[curve] spec-decode: OFF" ;;
-    *)
-        echo "unknown SPEC=$SPEC (want mtp|dflash|off)" >&2; exit 1 ;;
-esac
 
 # 2. Baseline non-determinism envelope: same-config eval-only repeats
 #    (--rounds 0 runs just the round-0 baseline eval, trains nothing).
