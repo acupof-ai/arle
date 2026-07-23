@@ -1653,7 +1653,11 @@ impl SafetensorLoader {
             };
         let routed_quant = expert_weight_format.is_quantized();
         let grouped_t0 = Instant::now();
-        let deepgemm_ready = !routed_quant && deepgemm_native_ready;
+        // BF16 grouped DeepGEMM is Hopper-only: the contiguous kernel reads
+        // m_indices, which the sm_120 path leaves None (moe.rs), so building the
+        // caches there would panic on first prefill. Self-disable to the eager
+        // per-expert MoE, mirroring the sm120-aware FP8 gate above.
+        let deepgemm_ready = !routed_quant && deepgemm_native_ready && !sm120;
         let fp8_deepgemm_ready =
             expert_weight_format == WeightFormat::Fp8BlockScaled && deepgemm_native_ready;
         let (gate_grouped, up_grouped, down_grouped) = if deepgemm_ready {
