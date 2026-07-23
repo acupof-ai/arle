@@ -56,9 +56,11 @@ tool-exec/pytest/HTTP gaps), not GPU-bound. If true:
 > starved at C≤2 (K=2 concurrent `claude` sessions). Upper bound: 4× serial →
 > ~1× concurrent on the GPU-active portion.
 
-Gated (SOLID): no code until the GPU-idle-within-rollout number is measured; the
-A/B must clear reward/loss parity (concurrent rollout = staleness drift), not just
-wall. If already bandwidth-saturated at B=2, sublinear MoE caps it.
+Gated (SOLID): no code until the GPU-idle-within-rollout number is known — but
+that number is **derivable from telemetry already emitted**, not a new profiler
+(see Action queue #2). The A/B must clear reward/loss parity (concurrent rollout =
+staleness drift), not just wall. If already bandwidth-saturated at B≈K, sublinear
+MoE caps it.
 
 ### Tier 1 — cheap, safe, attacks measured waste (highest ROI)
 
@@ -123,10 +125,18 @@ rollout decode (−29%).
 Neither top move needs free GPUs to *prepare*:
 1. **Done 2026-07-23:** comfort_band wired as default corpus-prep in `agent_opd_curve.sh`.
    Acceptance (trainable fraction rises ~50%→~100%, `mean_loss>0`) is a pod-gated run.
-2. **Next:** add a profiler that splits the 40.4% rollout wall into GPU-active vs
-   agent-latency-idle — the number that decides whether the mega-rollout lever (Tier 0)
-   is worth building. Approach: NVTX/CUDA-event the engine's decode-step span vs the
-   rollout wall, or a decode-step counter × measured step-ms vs the 8764 ms/call.
+2. **Next — a derivation, not a build.** The GPU-busy fraction of the 40.4% rollout
+   wall decides whether the Tier-0 mega-rollout lever is worth building, and the
+   telemetry already exists: `rollout_tok_per_sec` is emitted per group
+   (`train_cli.rs:3493`, metrics.jsonl kind=group), and the engine exposes monotonic
+   `throughput_stats()` {steps, generated_tokens, requests_completed} (`infer-core/src/lib.rs:779`)
+   + `spec_decode_stats()` (`infer-api/src/loaded.rs:2450`). GPU-busy % ≈
+   `rollout_tok_per_sec ÷ peak_decode_tok_s` (peak = one serve bench at batch≈K, or
+   the known 27B-FP8+MTP decode rate). ≪ peak → idle-bound → mega-rollout wins; ≈ peak
+   → GPU-bound, do not build. The round profiler (`aopd_profile.rs`, always-on) already
+   splits rollout/writeback/eval but labels rollout a single WALL stage; only add a
+   ~5-line engine busy-ms accumulator (Δ`throughput_stats().steps` × ITL, or wrap the
+   step body) if you want the busy% auto-tracked per round instead of derived by hand.
 
 ## Anchors
 
