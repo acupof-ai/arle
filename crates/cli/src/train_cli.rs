@@ -1875,6 +1875,12 @@ fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
             max_prompt_tokens: student_seq,
             max_total_tokens: student_seq,
             chunked_prefill_size: Some(student_seq),
+            // The autograd student co-resides with this engine (same as agent-opd),
+            // so it must NOT greedily reserve 0.9 of free VRAM (the SGLang serving
+            // default) — the KV pool is num_slots-based (small). Without this cap the
+            // ~0.9 arena leaves fixed ~10% headroom on ANY card, so the masked-CE
+            // writeback OOMs (`cuda alloc_zeros failed`) GPU-size-independently.
+            mem_fraction_static: 0.2,
             dspark_draft_model: args.runtime.dspark_draft_model.clone(),
             dspark_conf_threshold: args.runtime.dspark_conf_threshold,
             ..EngineLoadConfig::default()
