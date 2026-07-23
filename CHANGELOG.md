@@ -23,6 +23,20 @@ Progress spine. Entry classes recorded here the day they land: phase exits,
 default flips, and accept-or-reject verdicts (AGENTS.md §Docs lifecycle &
 progress spine).
 
+- **ACCEPT — systematic review-fix sweep (26 findings); one relay regression
+  fixed** (2026-07-24, `f0a635e02` + `837b89d39`). 26 confirmed defects fixed
+  (2 high, 9 medium, 15 low) across scheduler / serving / OPD / kv-tier /
+  autograd / CUDA. Verified on H20 sm_90 (DSv4-Flash TP=4: build + needle 15/15 +
+  c1/c4 perf-neutral) and built on Colab G4 sm_120. The sweep introduced one
+  regression — an `accept_n` hello-read timeout leaked into the steady-state
+  relay reader → TP=4 c8+ serve teardown — found + fixed + pod-confirmed
+  (c8 48/48, c16 64/64, no teardown). Open: a c16 −40% throughput deficit on a
+  binary that also carries concurrent non-sweep executor changes; not attributed
+  to this sweep (O(1) / behavior-equivalent scheduler changes, c1/c4
+  perf-neutral) — needs a champion-binary A/B. Details:
+  wins/2026-07-23-systematic-review-fixes,
+  errors/2026-07-24-relay-hello-timeout-leak-tp4-teardown.
+
 - **DEFAULT FLIP — self-opd distill path fused → dense** (2026-07-24,
   `38bac08e6`). Self-opd now honors `--fused-distill` (new flag, default
   false) instead of hardcoding fused; dense is the validated direction
