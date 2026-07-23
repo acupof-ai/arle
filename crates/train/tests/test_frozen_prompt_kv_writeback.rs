@@ -621,3 +621,42 @@ fn rubric_batched_writeback_matches_per_row_masked_writeback() {
         "batched writeback loss {batched:.8} != mean-of-row-means {expected:.8} (diff {diff:.3e})"
     );
 }
+
+/// The long-completion pod path takes the checkpoint_sequential branch (grad
+/// checkpointing on; CPU mem-info is None ⇒ the gate always engages): its loss
+/// must equal the full-tape branch — recompute replay is exact on identical
+/// init, so any divergence is a batched-forward checkpoint-boundary bug.
+#[test]
+fn rubric_batched_writeback_checkpoint_branch_matches_full_tape() {
+    let rows: Vec<(Vec<u32>, Vec<u32>)> = vec![
+        (vec![1, 3, 8, 2, 7], vec![6, 10, 11, 12, 13, 14]),
+        (vec![1, 9, 4], vec![5, 2, 8]),
+    ];
+    let run = |checkpoint: bool| -> f32 {
+        let mut store = TensorStore::default();
+        let mut student = build_student(&mut store);
+        student.set_gradient_checkpointing(checkpoint);
+        let all_params = student.all_parameter_ids();
+        let trainable = trainable_ids(&store, &student);
+        let mut optimizer = AdamW::new(1.0e-3, (0.9, 0.999), 1.0e-8, 0.0);
+        let vocab = student.config().vocab_size;
+        rubric_writeback_ce_step_batched(
+            &student,
+            &all_params,
+            &trainable,
+            &mut optimizer,
+            &rows,
+            vocab,
+            64,
+            &mut store,
+        )
+        .expect("batched writeback")
+    };
+    let (full, ckpt) = (run(false), run(true));
+    let diff = (full - ckpt).abs();
+    println!("[gate-batched-ckpt] full={full:.8} ckpt={ckpt:.8} diff={diff:.3e}");
+    assert!(
+        diff <= 1.0e-6,
+        "checkpoint-branch loss {ckpt:.8} != full-tape {full:.8} (diff {diff:.3e})"
+    );
+}

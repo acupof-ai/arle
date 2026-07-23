@@ -2553,13 +2553,17 @@ impl Qwen35Model {
     /// re-run in backward (plus boundary host offload) for tape memory — a
     /// good trade only when the full tape would NOT fit: estimate the
     /// non-checkpointed footprint (per layer the hidden-stream tensors plus
-    /// the dominant MLP gate/up/act term, f32) against a third of free VRAM.
-    /// The estimate is a floor, not the footprint: the 27B hybrid measured
-    /// 2.54× it (83.1 GiB peak at seq=1000 vs 17.9 GiB estimated — LA
-    /// chunk_history, attention scratch and allocator slack are unmodeled),
-    /// and the old free/2 margin OOM'd the H20 at seq≈1350–1400 (agent-OPD
-    /// smoke 2026-07-03). 3× keeps the full-tape fast path only when it
-    /// truly fits. Unknown memory info keeps the safe default (checkpoint).
+    /// the dominant MLP gate/up/act term, f32, ×4 empirical) against a third
+    /// of free VRAM. The modeled term is a floor, not the footprint: the 27B
+    /// hybrid measured 2.54× it (83.1 GiB peak at seq=1000 vs 17.9 GiB — LA
+    /// chunk_history, attention scratch and allocator slack are unmodeled)
+    /// and the 0.8B hybrid ~4× (3.4–4.1 GB/layer at B=4 seq=3150 vs 0.955 —
+    /// LA saved ctx + qkv projections dominate; batched rubric writeback ran
+    /// full-tape and OOM'd the H20 at 97 GB, 2026-07-23). The ×4 covers the
+    /// worst measured ratio; the old un-scaled estimate under-fired the gate.
+    /// The free/2 margin OOM'd at seq≈1350–1400 (agent-OPD smoke 2026-07-03);
+    /// 3× keeps the full-tape fast path only when it truly fits. Unknown
+    /// memory info keeps the safe default (checkpoint).
     fn should_checkpoint(
         &self,
         batch: usize,
@@ -2570,11 +2574,12 @@ impl Qwen35Model {
         self.gradient_checkpointing
             && tape.enabled
             && store.backend().device_mem_info().is_none_or(|(free, _)| {
-                let per_layer = batch
+                let modeled = batch
                     * seq_len
                     * (8 * self.config.hidden_size + 3 * self.config.intermediate_size)
                     * 4;
-                per_layer
+                modeled
+                    .saturating_mul(4)
                     .saturating_mul(self.layers.len())
                     .saturating_mul(3)
                     > free

@@ -37,7 +37,7 @@ impl Default for TrainRuntimeFlags {
         Self {
             writeback_offload: true,
             engine_offload: EngineOffloadMode::Off,
-            gradient_checkpointing: false,
+            gradient_checkpointing: true,
             trim_before_backward: false,
             trim_after_writeback: false,
             writeback_frozen_prompt_kv: false,
