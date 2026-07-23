@@ -1927,7 +1927,7 @@ fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
         None
     };
 
-    let mut student = match prebuilt_student {
+    let student = match prebuilt_student {
         // Default path: the student was already loaded first (above), engine second.
         Some(s) => s,
         // --share-frozen-base: load the student now, AFTER the engine, importing
@@ -2668,7 +2668,7 @@ fn run_agent_opd_replay(
         records.len(),
         records_path.display()
     );
-    let mut student = load_qwen35_lora_from_hf_dir_with_shared_base(
+    let student = load_qwen35_lora_from_hf_dir_with_shared_base(
         student_dir,
         lora,
         target_set,
@@ -3113,7 +3113,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
         None
     };
 
-    let mut student = match prebuilt_student {
+    let student = match prebuilt_student {
         Some(s) => s,
         None => {
             eprintln!(
