@@ -952,6 +952,14 @@ impl BackendExecutor for CudaExecutor {
         }
     }
 
+    fn kv_device_free_pages(&self) -> Option<usize> {
+        match &self.inner {
+            CudaExecutorInner::Placeholder => None,
+            #[cfg(feature = "cuda")]
+            CudaExecutorInner::Real(real) => real.kv_device_free_pages(),
+        }
+    }
+
     fn offload_weights(&mut self) -> anyhow::Result<usize> {
         match &mut self.inner {
             // No real device weights to offload without the cuda backend.
