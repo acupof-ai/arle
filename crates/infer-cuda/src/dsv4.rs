@@ -2123,7 +2123,7 @@ impl Dsv4Model {
         // GLM (`glm_moe_dsa`) markers: re-encode FP8 MoE experts from `weight_scale_inv`,
         // and bypass the absent hyper-connections (`hc_mult == 1`, identity mixers).
         let glm = config.plain_o_proj;
-        let hc_absent = config.hc_mult == 1;
+        let hc_absent = config.is_glm();
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for layer_idx in 0..config.num_hidden_layers {
             let plan = config
@@ -2994,7 +2994,7 @@ impl Dsv4Model {
         if dsv4_decode_graph_enabled()
             && last_hidden_out.is_none()
             && !self.config.is_dspark()
-            && self.config.hc_mult != 1
+            && !self.config.is_glm()
             && seq_len == 1
             && matches!(
                 moe_transport,
@@ -3100,7 +3100,7 @@ impl Dsv4Model {
         let mut last_hidden = DeviceVec::zeros(&self.ctx, hidden_size)?;
         let mut last_normed = DeviceVec::zeros(&self.ctx, hidden_size)?;
         for (i, row) in rows.enumerate() {
-            if self.config.hc_mult == 1 {
+            if self.config.is_glm() {
                 // GLM: head hidden = stream row (stream_dim==hidden, no head HC mixer).
                 // ponytail: pod-verify GLM hc_mult==1 head hidden = stream row (identity)
                 crate::ops::copy_row_to_vec(&self.ctx, stream, row, &mut last_hidden)?;
@@ -3584,7 +3584,7 @@ impl Dsv4Model {
             // ponytail: pod-verify GLM hc_mult==1 plain residual + identity stream (no hyper-connection)
             // SAFETY: uninit device scratch; fully written before first read.
             let mut normed = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
-            let attn_mhc = if self.config.hc_mult == 1 {
+            let attn_mhc = if self.config.is_glm() {
                 crate::ops::rms_norm_batch(&self.ctx, &stream, &layer.attn_norm, eps, &mut normed)?;
                 None
             } else {
@@ -4808,7 +4808,7 @@ impl Dsv4Model {
             // GLM (hc_mult==1): plain RMSNorm of the stream (no ffn hyper-connection).
             // SAFETY: uninit device scratch; fully written before first read.
             let mut normed = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
-            let ffn_mhc = if self.config.hc_mult == 1 {
+            let ffn_mhc = if self.config.is_glm() {
                 crate::ops::rms_norm_batch(&self.ctx, &stream, &layer.ffn_norm, eps, &mut normed)?;
                 None
             } else {
@@ -5212,7 +5212,7 @@ impl Dsv4Model {
                 // ponytail: pod-verify GLM hc_mult==1 plain residual + identity stream (no hyper-connection)
                 // SAFETY: uninit device scratch; fully written before first read.
                 let mut normed = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
-                let attn_mhc = if self.config.hc_mult == 1 {
+                let attn_mhc = if self.config.is_glm() {
                     // GLM: plain RMSNorm of the stream (stream IS the hidden).
                     crate::ops::rms_norm_batch(
                         &self.ctx,
@@ -5362,7 +5362,7 @@ impl Dsv4Model {
                 // GLM (hc_mult==1): plain RMSNorm of the stream (no ffn hyper-connection).
                 // SAFETY: uninit device scratch; fully written before first read.
                 let mut normed = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
-                let ffn_mhc = if self.config.hc_mult == 1 {
+                let ffn_mhc = if self.config.is_glm() {
                     crate::ops::rms_norm_batch(
                         &self.ctx,
                         &stream,
@@ -5578,7 +5578,7 @@ impl Dsv4Model {
         let _nvtx = crate::nvtx::range("dsv4/lm_head_sample");
         // ── Head HC: fold the last token's wide stream row → one hidden vector.
         let mut last_hidden = DeviceVec::zeros(ctx, hidden_size)?;
-        if self.config.hc_mult == 1 {
+        if self.config.is_glm() {
             // GLM: head hidden = stream row (stream_dim==hidden, no head HC mixer).
             // ponytail: pod-verify GLM hc_mult==1 head hidden = stream row (identity)
             crate::stage_profile::profile(ctx, "dsv4/stage/head_hc", || {
@@ -5738,7 +5738,7 @@ impl Dsv4Model {
                     &prev_layers[layer_idx - 1].ffn_stream
                 };
                 let normed = &mut current.attn_normed;
-                let attn_mhc = if self.config.hc_mult == 1 {
+                let attn_mhc = if self.config.is_glm() {
                     crate::stage_profile::profile(ctx, "dsv4/stage/attn_hc_pre_norm", || {
                         crate::ops::rms_norm_batch(ctx, stream, &layer.attn_norm, eps, normed)
                     })?;
@@ -5830,7 +5830,7 @@ impl Dsv4Model {
             {
                 let stream = &current.attn_stream;
                 let normed = &mut current.ffn_normed;
-                let ffn_mhc = if self.config.hc_mult == 1 {
+                let ffn_mhc = if self.config.is_glm() {
                     crate::stage_profile::profile(ctx, "dsv4/stage/ffn_hc_pre_norm", || {
                         crate::ops::rms_norm_batch(ctx, stream, &layer.ffn_norm, eps, normed)
                     })?;
@@ -6118,7 +6118,7 @@ impl Dsv4Model {
             // SAFETY: fused hc_pre+rms_norm / plain rms_norm writes the full
             // [seq_len, hidden_size] buffer.
             let mut normed = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
-            let attn_mhc = if self.config.hc_mult == 1 {
+            let attn_mhc = if self.config.is_glm() {
                 // GLM: plain RMSNorm of the stream (stream IS the hidden).
                 crate::stage_profile::profile(ctx, "dsv4/stage/attn_hc_pre_norm", || {
                     crate::ops::rms_norm_batch(
@@ -6293,7 +6293,7 @@ impl Dsv4Model {
             // SAFETY: fused hc_pre+rms_norm / plain rms_norm writes the full
             // [seq_len, hidden_size] buffer.
             let mut normed = unsafe { HiddenStates::uninit(&self.ctx, hidden_size, seq_len)? };
-            let ffn_mhc = if self.config.hc_mult == 1 {
+            let ffn_mhc = if self.config.is_glm() {
                 crate::stage_profile::profile(ctx, "dsv4/stage/ffn_hc_pre_norm", || {
                     crate::ops::rms_norm_batch(
                         &self.ctx,
@@ -7144,7 +7144,7 @@ impl Dsv4Model {
         position: u64,
     ) -> Result<u32> {
         // ponytail: pod-verify GLM decode-graph path (not wired; eager path is the GLM lane)
-        if self.config.hc_mult == 1 {
+        if self.config.is_glm() {
             anyhow::bail!(
                 "DSv4 decode-graph path does not support GLM (hc_mult==1); use the eager decode path"
             );

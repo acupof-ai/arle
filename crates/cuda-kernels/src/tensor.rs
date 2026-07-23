@@ -757,6 +757,27 @@ impl DeviceVec {
         })
     }
 
+    /// Create an UNINITIALIZED tensor (no zeroing memset).
+    ///
+    /// # Safety
+    /// The buffer holds uninitialized device memory; every element must be
+    /// written before it is read.
+    #[track_caller]
+    pub unsafe fn uninit(ctx: &DeviceContext, len: usize) -> Result<Self> {
+        // SAFETY: forwards the uninitialized-memory contract to our caller.
+        let gpu_data: CudaSlice<bf16> = unsafe {
+            ctx.stream
+                .alloc(len)
+                .map_err(|e| anyhow!("Alloc failed: {}", e))?
+        };
+        record_cuda_alloc::<bf16>("alloc", "DeviceVec::uninit", len);
+        Ok(Self {
+            data: gpu_data,
+            len,
+            label: "",
+        })
+    }
+
     /// Create a tensor filled with bf16 ones (1.0).
     /// Useful for dummy RMSNorm weights (identity normalization).
     pub fn ones(ctx: &DeviceContext, len: usize) -> Result<Self> {

@@ -259,6 +259,12 @@ impl DeepSeekV4Config {
         self.dspark_block_size > 0
     }
 
+    /// GLM-5.2 has a single hyper-connection (`hc_mult == 1`, identity mixers),
+    /// unlike DSv4-Flash's multi-HC folds.
+    pub fn is_glm(&self) -> bool {
+        self.hc_mult == 1
+    }
+
     pub fn dspark_num_stages(&self) -> usize {
         self.dspark_num_stages
     }
