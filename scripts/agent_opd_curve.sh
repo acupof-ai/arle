@@ -53,13 +53,13 @@ ensure_hf_model() {  # <hf_id> -> echoes local dir, downloads if absent
     local hf_id=$1 dst="$MODEL_CACHE/${1##*/}"
     if [[ ! -f $dst/config.json ]]; then
         echo "[curve] fetching $hf_id -> $dst (HF_ENDPOINT=${HF_ENDPOINT:-huggingface.co})" >&2
-        huggingface-cli download "$hf_id" --local-dir "$dst" >&2 \
+        hf download "$hf_id" --local-dir "$dst" >&2 \
             || { echo "download failed: $hf_id" >&2; return 1; }
     fi
     echo "$dst"
 }
 
-command -v huggingface-cli >/dev/null || { echo "huggingface-cli missing (pip install huggingface_hub)" >&2; exit 1; }
+command -v hf >/dev/null || { echo "hf CLI missing (pip install -U huggingface_hub; huggingface-cli download is removed)" >&2; exit 1; }
 STUDENT_MODEL=${STUDENT_MODEL:-$(ensure_hf_model "$STUDENT_MODEL_HF_ID")}
 
 if [[ ${SMOKE:-0} == 1 ]]; then
