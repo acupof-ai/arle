@@ -23,6 +23,25 @@ Progress spine. Entry classes recorded here the day they land: phase exits,
 default flips, and accept-or-reject verdicts (AGENTS.md §Docs lifecycle &
 progress spine).
 
+- **DEFAULT FLIP — self-opd distill path fused → dense** (2026-07-24,
+  `38bac08e6`). Self-opd now honors `--fused-distill` (new flag, default
+  false) instead of hardcoding fused; dense is the validated direction
+  (fused ran lm_head on host, ~205 s/step on 27B). Pod-verified: 8-step smoke
+  loss 1.435 ≈ fused 1.440. An 88 GB transient during dense smoke steps is
+  flagged for follow-up (wins/errors 2026-07-24).
+
+- **REJECT — checkpoint-gate ×4 tightening reverted** (2026-07-24). The ×4
+  estimate fixed the B=4 long-completion writeback OOM (97.5 → 41.1 GB) but
+  the newly-engaged batched checkpoint backward crashes in linear_attention
+  dqkv, and short B=4 shapes over-fired onto a 3×-slower branch — reverted to
+  the prior estimate; long-completion batched writeback runs
+  `--writeback-batch 1` (verified, 59 GB) until the LA backward is fixed.
+  Details: errors/2026-07-24-batched-checkpoint-la-backward-crash-and-gate-overfire.
+  Related cleanups kept: per-lane `--grad-checkpointing` collapsed into the
+  shared `--gradient-checkpointing` (now default true, matching the prior
+  lane defaults); train control-plane + metrics dead code deleted (−3.2K LOC,
+  `9933e21e8`).
+
 - **ACCEPT — agent-OPD rollout is idle-bound; concurrent mega-rollout GO**
   (2026-07-24). First hard-gated `gpu_busy_frac` measurement (new per-group
   timer): 0.30–0.34 on 1×H20 — ~2/3 of the rollout wall the GPU idles on
