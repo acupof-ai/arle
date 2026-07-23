@@ -331,6 +331,18 @@ pub trait BackendExecutor {
     /// Default no-op for backends whose per-slot device KV is slot-fixed.
     fn release_kv_slot(&mut self, _slot: usize) {}
 
+    /// Free pages remaining in the backend's own device KV pool, when it
+    /// keeps one separate from the engine's accounting pool. `None` (the
+    /// default) = no separate pool; the engine's [`KvPool`] is authoritative.
+    /// The engine gates plan rows on this count so device-side exhaustion
+    /// degrades (shed the chunk / park the decode, #162) instead of failing
+    /// an alloc inside [`Self::submit`] — which is engine-fatal (#164). The
+    /// count must reflect ALL device-side retention (e.g. recall-keepalive
+    /// pages the accounting pool has already marked free).
+    fn kv_device_free_pages(&self) -> Option<usize> {
+        None
+    }
+
     /// Number of KV pages the backend's host-demoted store can
     /// hold. `0` (the default) means the backend has no tier store and the
     /// engine never calls the demote/promote hooks — the baseline eviction

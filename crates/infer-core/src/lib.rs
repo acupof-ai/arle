@@ -1484,7 +1484,57 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
     /// is identical across ranks (same admissions + plans every tick), so
     /// every rank degrades the same rows.
     fn allocate_for_plan(&mut self, plan: &mut ForwardPlan) {
+        // Device-pool budget gate: backends with a device pool separate from
+        // `self.kv` (Qwen3.6 `full_attn_kv` + recall keepalive) alloc per row
+        // inside `submit`, where a failure is engine-fatal. Gate on worst-case
+        // page need (every row lands page-misaligned) BEFORE the host alloc so
+        // device exhaustion degrades here exactly like host exhaustion.
+        // Decode rows gate first: keeping a running decode alive costs 1 page,
+        // a shed prefill chunk retries next tick for free.
+        let mut device_budget = self.executor.kv_device_free_pages();
+        let page_size = self.kv.page_size();
+        let mut fits_device = |need: usize| {
+            let Some(budget) = &mut device_budget else {
+                return true;
+            };
+            if *budget < need {
+                return false;
+            }
+            *budget -= need;
+            true
+        };
+        plan.decode_rows.retain(|row| {
+            if !fits_device(1) {
+                log::warn!(
+                    "device KV pool exhausted for decode row (slot {}); \
+                     parking the request (#164 backstop)",
+                    row.slot
+                );
+                self.requeue_preempted_decode(row.slot);
+                return false;
+            }
+            match self.alloc_with_prefix_reclaim(row.slot, 1) {
+                Ok(()) => true,
+                Err(err) => {
+                    log::warn!(
+                        "KV alloc failed for decode row (slot {}): {err:#}; \
+                         parking the request (#164 backstop)",
+                        row.slot
+                    );
+                    self.requeue_preempted_decode(row.slot);
+                    false
+                }
+            }
+        });
         plan.prefill_rows.retain(|row| {
+            if !fits_device(row.tokens.len().div_ceil(page_size) + 1) {
+                log::warn!(
+                    "device KV pool exhausted for prefill chunk (slot {}); \
+                     shedding the chunk (#164 backstop)",
+                    row.slot
+                );
+                return false;
+            }
             match self.alloc_with_prefix_reclaim(row.slot, row.tokens.len()) {
                 Ok(()) => true,
                 Err(err) => {
@@ -1497,19 +1547,6 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                 }
             }
         });
-        plan.decode_rows
-            .retain(|row| match self.alloc_with_prefix_reclaim(row.slot, 1) {
-                Ok(()) => true,
-                Err(err) => {
-                    log::warn!(
-                        "KV alloc failed for decode row (slot {}): {err:#}; \
-                         parking the request (#164 backstop)",
-                        row.slot
-                    );
-                    self.requeue_preempted_decode(row.slot);
-                    false
-                }
-            });
         plan.mode = planner::plan_mode(plan.prefill_rows.is_empty(), plan.decode_rows.is_empty());
     }
 
@@ -2379,6 +2416,36 @@ mod testing {
         }
     }
 
+    /// Echo executor with a settable device-pool free-page count, mirroring a
+    /// backend (Qwen3.6 `full_attn_kv` + recall keepalive) whose device pool
+    /// runs dry while the host pool still has pages. Exercises the
+    /// `allocate_for_plan` device-budget gate.
+    #[derive(Clone)]
+    pub(super) struct DeviceBudgetExecutor {
+        pub(super) budget: std::rc::Rc<std::cell::Cell<Option<usize>>>,
+    }
+
+    impl BackendExecutor for DeviceBudgetExecutor {
+        type Inflight = MockInflight;
+
+        fn submit(&mut self, plan: &ForwardPlan, _kv: &mut dyn KvPool) -> Result<Self::Inflight> {
+            Ok(MockInflight {
+                output: StepOutput {
+                    tokens: echo_tokens(plan),
+                },
+                return_not_ready_once: false,
+            })
+        }
+
+        fn poll(&mut self, inflight: Self::Inflight) -> Result<PollResult<Self::Inflight>> {
+            Ok(PollResult::Ready(inflight.output))
+        }
+
+        fn kv_device_free_pages(&self) -> Option<usize> {
+            self.budget.get()
+        }
+    }
+
     /// Mirrors the real CUDA executor's device KV advancement + its decode-step
     /// length invariant (`device.seq_len(slot) == DecodeRow.kv_seq_len`), so a
     /// host-side `kv_seq_len` off-by-one fails on CPU rather than only on an H20.
@@ -2949,11 +3016,11 @@ mod tests {
     use infer_seam::{BufferedDiffusionExecutor, HostPagedKvPool, KvAllocator, KvQuery};
 
     use super::testing::{
-        AlignedPrefixExecutor, BackgroundPublishExecutor, DeviceMirrorExecutor, HoldGovernor,
-        HybridReprefillMirror, LimitedPrefixExecutor, MockExecutor, MockKvPool,
-        PlanTokenCapExecutor, RestoreAlignmentExecutor, SamplingExecutor, SidecarMissExecutor,
-        SingleRowExecutor, SlotTierMockExecutor, SpecMirrorExecutor, StopTokenExecutor,
-        TierMockExecutor, TokenBudgetGovernor, WarmupCountingExecutor,
+        AlignedPrefixExecutor, BackgroundPublishExecutor, DeviceBudgetExecutor,
+        DeviceMirrorExecutor, HoldGovernor, HybridReprefillMirror, LimitedPrefixExecutor,
+        MockExecutor, MockKvPool, PlanTokenCapExecutor, RestoreAlignmentExecutor, SamplingExecutor,
+        SidecarMissExecutor, SingleRowExecutor, SlotTierMockExecutor, SpecMirrorExecutor,
+        StopTokenExecutor, TierMockExecutor, TokenBudgetGovernor, WarmupCountingExecutor,
     };
     use super::*;
 
@@ -2972,6 +3039,57 @@ mod tests {
         let mut mixed: Vec<u32> = (0..100).collect();
         mixed.extend(std::iter::repeat_n(7u32, 48));
         assert!(tail_is_degenerate_loop(&mixed));
+    }
+
+    /// Device-pool exhaustion (the backend pool running dry while the host pool
+    /// still has pages — Qwen3.6 recall keepalive) must degrade like host
+    /// exhaustion: shed prefills / park decodes, never a fatal step error
+    /// (2026-07-23 pod: TokenKVPool out-of-pages inside submit killed the
+    /// engine thread mid-rollout).
+    #[test]
+    fn device_pool_exhaustion_degrades_instead_of_fatal() -> Result<()> {
+        let budget = std::rc::Rc::new(std::cell::Cell::new(Some(0usize)));
+        let executor = DeviceBudgetExecutor {
+            budget: std::rc::Rc::clone(&budget),
+        };
+        let mut engine =
+            Engine::with_config(executor, HostPagedKvPool::new(1, 256, 16), test_config(1));
+
+        let handle = engine.submit_request((1..=20).collect(), 4);
+        // Zero device pages: the prefill chunk sheds every tick — no progress,
+        // no error, request stays live.
+        for _ in 0..3 {
+            engine.step()?;
+        }
+        assert!(engine.completed(handle).is_none());
+        assert!(!engine.is_idle());
+
+        // Pages free up mid-prefill: the request completes normally.
+        budget.set(Some(256));
+        engine.run_to_idle()?;
+        let completed = engine
+            .completed(handle)
+            .expect("completes after the device budget lifts");
+        assert_eq!(completed.generated_tokens.len(), 4);
+
+        // Decode side: a running decode degrades (#162 park / re-admit) when
+        // the device pool dries up mid-generation — steps stay Ok with no
+        // progress — and resumes to completion when it refills.
+        let handle2 = engine.submit_request((1..=20).collect(), 8);
+        engine.step()?;
+        budget.set(Some(0));
+        for _ in 0..3 {
+            engine.step()?;
+        }
+        assert!(engine.completed(handle2).is_none());
+        assert!(!engine.is_idle());
+        budget.set(Some(256));
+        engine.run_to_idle()?;
+        let resumed = engine
+            .completed(handle2)
+            .expect("gated decode resumes and completes");
+        assert_eq!(resumed.generated_tokens.len(), 8);
+        Ok(())
     }
 
     /// Drive `turns` agentic re-prefills on one slot: each turn's prompt is the

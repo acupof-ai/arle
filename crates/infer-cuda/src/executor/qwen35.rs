@@ -484,6 +484,14 @@ impl Qwen35CudaExecutor {
         }
     }
 
+    /// True device-pool headroom for the engine's plan gate. Reflects
+    /// recall-keepalive retention the host accounting pool cannot see.
+    pub(crate) fn kv_device_free_pages(&self) -> Option<usize> {
+        self.full_attn_kv
+            .as_ref()
+            .map(|pool| pool.free_page_count())
+    }
+
     /// Restore the recurrent sidecar for a page-radix prefix hit, returning the
     /// ABSOLUTE token length restored — `matched_len` on an exact hit, or the
     /// largest periodic stride boundary `B ≤ matched_len` whose sidecar is present

@@ -682,6 +682,18 @@ impl RealCudaExecutor {
         }
     }
 
+    /// Device-pool headroom for the engine's plan gate. Qwen3.6 owns a
+    /// self-allocated `full_attn_kv` whose retention (recall keepalive) the
+    /// host pool cannot see; dense Qwen mirrors the host pool exactly. DSv4's
+    /// demand-paged FlashMLA band pools have no aggregate free count yet —
+    /// `None` keeps its #164 exposure unchanged (deferred, not covered).
+    pub(crate) fn kv_device_free_pages(&self) -> Option<usize> {
+        match self {
+            Self::Qwen35(q) => q.kv_device_free_pages(),
+            Self::Dsv4(_) | Self::Qwen(_) => None,
+        }
+    }
+
     /// Re-budget the host-demoted tier store (`0` disables; pre-serve only). No-op on
     /// arms without a tier store.
     pub(crate) fn set_kv_tier_budget_bytes(&mut self, bytes: usize) {
