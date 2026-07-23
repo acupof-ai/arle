@@ -1,0 +1,21 @@
+scripts/agent_opd_curve.sh
+  s_f8dab6879bf4d7::t_3f651c0c98976d 56,62
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "1f1b6e79447dde9f0ec8bb2a92f826e23eedade6",
+  "prompts": {},
+  "sessions": {
+    "s_f8dab6879bf4d7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a858fbc239e343fe7",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
