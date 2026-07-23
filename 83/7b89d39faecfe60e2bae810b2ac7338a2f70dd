@@ -1,0 +1,21 @@
+crates/infer-server/src/multiproc_relay.rs
+  s_369a57354b1459::t_65e8ae6f7682d0 755-761
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "837b89d39faecfe60e2bae810b2ac7338a2f70dd",
+  "prompts": {},
+  "sessions": {
+    "s_369a57354b1459": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a37afa08-363e-420d-97a5-35b731b7f708",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
