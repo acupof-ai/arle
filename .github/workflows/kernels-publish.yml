@@ -71,6 +71,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The torch cu129 stack unpacks ~15 GB; stock ubuntu-latest free space is
+      # borderline and the install ENOSPC'd (2026-07-23). Drop preinstalled
+      # toolchains we never use (~25-30 GB reclaimed).
+      - name: Free runner disk
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
 
