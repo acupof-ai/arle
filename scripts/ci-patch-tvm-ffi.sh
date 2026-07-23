@@ -11,11 +11,15 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PATCH="$ROOT/crates/cuda-kernels/tools/tilelang/patches/tvm-ffi-legacy-tvm-compat.patch"
 PIN="$(grep -oE 'apache-tvm-ffi==[0-9.]+' "$ROOT/requirements-build.txt" | cut -d= -f3)"
 
-# Vanilla 0.1.12 aborts the process (SIGABRT) on import, so a clean import here
-# means the patch already landed — nothing to do. Use python3: the slim CUDA
-# image has no bare `python` (only python3), which exit-127'd the final check.
-if python3 -c "import tilelang" 2>/dev/null; then
-  echo "tilelang imports cleanly; tvm-ffi patch not needed"
+# Skip only when the import is clean AND the installed tvm-ffi already matches
+# the pin: the resolver pass installs tilelang's vanilla <=0.1.11 (which imports
+# fine), so an import-only check would silently keep the un-pinned version.
+# Use python3: the slim CUDA image has no bare `python` (only python3).
+if python3 -c "
+import importlib.metadata as m, tilelang
+assert m.version('apache-tvm-ffi') == '$PIN'
+" 2>/dev/null; then
+  echo "tilelang imports cleanly with tvm-ffi $PIN; patch already landed"
   exit 0
 fi
 

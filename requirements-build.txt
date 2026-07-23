@@ -14,7 +14,12 @@
 # triton — don't re-pin it here.
 --extra-index-url https://download.pytorch.org/whl/cu129
 torch==2.12.1+cu129
-apache-tvm-ffi==0.1.12
+# apache-tvm-ffi==0.1.12 — pin carried as a comment, NOT resolver-installed:
+# tilelang 0.1.12's metadata declares apache-tvm-ffi<=0.1.11, so a single-pass
+# `pip install -r` with the pin live is ResolutionImpossible. Installers run
+# `pip install -r` (tilelang pulls vanilla <=0.1.11 transitively), then grep
+# this line for the pin and force-install the patched 0.1.12 wheel
+# (kernels-publish inline / scripts/ci-patch-tvm-ffi.sh / scripts/pod-tilelang-env.sh).
 cuda-python==12.9.0
 tilelang==0.1.12
 # tilelang's tvm dlopens libz3 at import (wheel RUNPATH looks beside libtvm /
