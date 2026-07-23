@@ -133,10 +133,12 @@ Neither top move needs free GPUs to *prepare*:
    + `spec_decode_stats()` (`infer-api/src/loaded.rs:2450`). GPU-busy % ≈
    `rollout_tok_per_sec ÷ peak_decode_tok_s` (peak = one serve bench at batch≈K, or
    the known 27B-FP8+MTP decode rate). ≪ peak → idle-bound → mega-rollout wins; ≈ peak
-   → GPU-bound, do not build. The round profiler (`aopd_profile.rs`, always-on) already
-   splits rollout/writeback/eval but labels rollout a single WALL stage; only add a
-   ~5-line engine busy-ms accumulator (Δ`throughput_stats().steps` × ITL, or wrap the
-   step body) if you want the busy% auto-tracked per round instead of derived by hand.
+   → GPU-bound, do not build. **Auto-tracked as of 2026-07-23:** `infer-core`
+   Engine.step() now times each forward's submit→poll-Ready wall into a process-global
+   `engine_forward_busy_micros()`; `train_cli` samples it around `cc_rollout` and emits
+   **`gpu_busy_secs` + `gpu_busy_frac`** per group in metrics.jsonl (kind=group). So the
+   Tier-0 go/no-go is now a direct read of `gpu_busy_frac` from any agent-OPD round — no
+   derivation, no serve bench needed.
 
 ## Anchors
 
