@@ -53,7 +53,7 @@ authority rather than defining a second equal architecture.
 | `deepseek-spec` | DS0 readiness scaffold (2026-05-01): DeepSeek V3/V4 config, tensor-name contracts, MLA/MoE/MTP `Shard` annotations, `DeepSeekV4AttentionLayerPlan` operator summaries | Runtime model code beyond the spec |
 | `gemma-spec` | Gemma4 config spec (consumer today: `infer-vulkan` order pin; unranked in the model queue — ratification pending, roadmap §6) | Implementation code |
 | `autograd` | From-scratch autograd: `TensorStore` + `Tape` + `Backend` trait | Trainer loop, control plane |
-| `train` | Runtime-led post-training substrate (teacher via `infer-api`, student LoRA, rollout→score→LoRA-backward), train-side `/v1/train/*` control plane. Pretrain / SFT / GRPO / multi-turn retired 2026-05-18 — see OPD-only product boundary. Two families share it: **OPD** (`opd`/`self-opd`, teacher/EMA + KL) and **RFT** (`agent-opd`/`rubric-opd`, reward-selected + masked CE, no teacher/KL). "OPD-only" is the positioning, not that every subcommand is distillation. | GPU kernels, scheduler |
+| `train` | Runtime-led post-training substrate (teacher via `infer-api`, student LoRA, rollout→score→LoRA-backward). Pretrain / SFT / GRPO / multi-turn retired 2026-05-18 — see OPD-only product boundary. Two families share it: **OPD** (`opd`/`self-opd`, teacher/EMA + KL) and **RFT** (`agent-opd`/`rubric-opd`, reward-selected + masked CE, no teacher/KL). "OPD-only" is the positioning, not that every subcommand is distillation. | GPU kernels, scheduler |
 
 ## Dependency Direction
 

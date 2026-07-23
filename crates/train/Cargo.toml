@@ -27,9 +27,6 @@ deepep = ["nccl", "infer-api/deepep"]
 autograd = { path = "../autograd", default-features = false, features = ["safetensors"] }
 anyhow = "1.0"
 base64 = "0.22"
-opentelemetry = { version = "0.31", default-features = false, features = ["logs"] }
-opentelemetry-otlp = { version = "0.31.1", default-features = false, features = ["logs", "http-proto", "reqwest-blocking-client"] }
-opentelemetry_sdk = { version = "0.31", default-features = false, features = ["logs"] }
 half = "2"
 memmap2 = { workspace = true }
 safetensors = { workspace = true }

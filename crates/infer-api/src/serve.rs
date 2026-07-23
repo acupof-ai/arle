@@ -40,7 +40,7 @@ use crate::loaded::LoadedInferenceEngine;
 /// Options for the in-process [`serve_http`] entry.
 ///
 /// Mirrors the arg surface the CLI `serve` subcommand forwards. Fields that the
-/// rewrite serve stack does not yet honor (`train_control_url`, `pool_models`,
+/// rewrite serve stack does not yet honor (`pool_models`,
 /// `spec_type`, `mtp_*`) are carried so the CLI can validate + warn at one site;
 /// `serve_http` rejects any that the active backend cannot satisfy.
 #[derive(Debug, Clone)]
