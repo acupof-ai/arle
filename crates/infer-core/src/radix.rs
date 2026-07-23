@@ -52,6 +52,9 @@ pub struct TieredPrefixMatch {
 pub struct RadixCache {
     block_size: usize,
     nodes: Vec<Node>,
+    /// Reclaimed `nodes` slots (severed, awaiting reuse). `insert` pops here
+    /// before appending, bounding `nodes` growth to the live-node high-water.
+    free: Vec<usize>,
     page_to_node: BTreeMap<BlockId, usize>,
     /// Demoted blocks: backend tier key -> node index.
     tier_to_node: BTreeMap<u64, usize>,
@@ -115,6 +118,7 @@ impl RadixCache {
         Self {
             block_size: block_size.max(1),
             nodes: vec![Node::root()],
+            free: Vec::new(),
             page_to_node: BTreeMap::new(),
             tier_to_node: BTreeMap::new(),
             dropped_tier_keys: Vec::new(),
@@ -352,12 +356,17 @@ impl RadixCache {
             let node = &mut self.nodes[current];
             node.evicted = true;
             node.page_id = None;
-            if let Some(key) = node.tier_key.take() {
+            node.block = Vec::new();
+            let tier_key = node.tier_key.take();
+            let children = std::mem::take(&mut node.children);
+            if let Some(key) = tier_key {
                 self.tier_to_node.remove(&key);
                 self.dropped_tier_keys.push(key);
             }
-            let children = std::mem::take(&mut self.nodes[current].children);
             stack.extend(children.into_values());
+            // evicted=true + page_id/tier_key=None keeps every scan predicate
+            // skipping this slot until `insert` fully re-initializes it.
+            self.free.push(current);
         }
     }
 
@@ -382,10 +391,15 @@ impl RadixCache {
             let child_idx = if let Some(&child_idx) = self.nodes[node_idx].children.get(&block) {
                 child_idx
             } else {
-                let child_idx = self.nodes.len();
                 let last_access = self.tick();
-                self.nodes
-                    .push(Node::child(block.clone(), page_id, node_idx, last_access));
+                let node = Node::child(block.clone(), page_id, node_idx, last_access);
+                let child_idx = if let Some(free_idx) = self.free.pop() {
+                    self.nodes[free_idx] = node;
+                    free_idx
+                } else {
+                    self.nodes.push(node);
+                    self.nodes.len() - 1
+                };
                 self.nodes[node_idx]
                     .children
                     .insert(block.clone(), child_idx);
@@ -654,6 +668,28 @@ mod tests {
         assert_eq!(cache.demoted_block_count(), 0);
         let m = cache.peek_longest_prefix_match(&[1, 2, 3, 4]);
         assert_eq!(m.block_ids, vec![10, 21]);
+    }
+
+    #[test]
+    fn evict_then_insert_reuses_freed_slot_and_matches() {
+        let mut cache = RadixCache::new(2);
+        cache.insert(&[1, 2, 3, 4], &[10, 11]);
+        let nodes_before = cache.nodes.len();
+
+        // Evict the whole chain, then re-publish a different prompt of equal
+        // shape: the freed slots must be reused (no unbounded `nodes` growth)
+        // and the new prefix must match cleanly.
+        assert_eq!(cache.evict_lru(2), vec![11, 10]);
+        assert_eq!(cache.free.len(), 2);
+        let newly = cache.insert(&[5, 6, 7, 8], &[20, 21]);
+        assert_eq!(newly, vec![20, 21]);
+        assert!(cache.free.is_empty());
+        assert_eq!(cache.nodes.len(), nodes_before);
+
+        let m = cache.peek_longest_prefix_match(&[5, 6, 7, 8]);
+        assert_eq!(m.block_ids, vec![20, 21]);
+        // The evicted prompt is gone (its reused slots carry no stale block).
+        assert!(cache.peek_longest_prefix_match(&[1, 2, 3, 4]).is_empty());
     }
 
     #[test]
