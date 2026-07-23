@@ -248,12 +248,40 @@ is pending pod time** — see the dated `wins/` entries per row.
 > `docs/experience/wins/` (immutable per bench-spec §9) and is not
 > removed.
 
-| Surface | Status | Notes |
+Two objective families ride one substrate (teacher/rollout on `infer`, student
+LoRA + autograd `Tape` on the same backend): **OPD** (KL distillation) and **RFT**
+(reward-selected masked-CE / policy-gradient). Source of truth: `TrainCommand` /
+`UpdateStrategyArg` in `crates/cli/src/args.rs`, `UpdatePreset` in
+`crates/train/src/update_strategy.rs`.
+
+| `arle train <cmd>` | Family | Mechanism | Reward / signal | Backend | Status |
+| --- | --- | --- | --- | --- | --- |
+| `opd` | OPD (distill) | teacher forward → student rollout → KL + optional GKD hard-token CE anchor (`--sft-anchor student-rollout\|corpus-truth`, `--kl-direction`, `--kl-mask`) | teacher logits (KL) | CPU / CUDA | Supported (Beta). Wins: `2026-05-24-arle-train-opd-from-dirs`. |
+| `self-opd` | OPD (self-distill) | EMA self-teacher; GKD = λ·CE + (1−λ)·KL(student‖EMA); every N steps a held-out NLL gate reverts {student, EMA, AdamW} on regress | self EMA teacher (`--gkd-lambda>0` required — pure KL cold-starts at zero gradient) | CPU / CUDA | Supported |
+| `rubric-opd` | RFT | N rollouts/prompt → a Flash judge grades a text-level rubric **or** `--self-consistency` majority-votes → accepted rollouts written back as CE (`--writeback accepted\|correction`) | rubric (`--rubric-task math\|agentic`) or \boxed self-consistency | CUDA-only | Supported |
+| `agent-opd` | RFT | student drives read/write/replace/bash tool loop against a per-task repo sandbox (SWE-bench-Pro, CC-harness) → run hidden tests → passing trajectories → CE / PG (`--update-strategy`, see below) | execution (pytest), no text judge | CUDA-only | Supported. Errors: `2026-07-22-agent-opd-dapo-null-gradient-trajectory-vram-wall`. |
+| `cc-convert` / `ppl` | Utility | `/v1/messages` dump → verl token records (`agent-opd --replay-records`); teacher-forced perplexity for FP8/quant calibration | — | ppl: CUDA-only | Supported |
+| `env` / `estimate-memory` | Diagnostic | env probe; param-count + rough memory estimate | — | — | Supported |
+| DSpark train sidecar (`serve --dspark-train`) | Online spec-decode | in-process trainer alongside `arle serve --spec-type dspark`: drains the hot-path experience buffer → updates the Markov head, hot-swaps weights | PG + probability matching | CUDA-only | Shipped (opt-in). §4a; wins `2026-07-20-dspark-train-sidecar-e2e-verified`. |
+| Infer-side `/v1/train/*` bridge | Control plane | `infer` proxies `/v1/train/status\|events\|stop\|save` to `crates/train/src/server.rs` when `--train-control-url` is set (`arle train opd` has no `--serve` yet) | — | — | Supported (optional proxy) |
+
+**`agent-opd --update-strategy` presets** (each maps 1:1 to a `UpdatePreset`
+constructor; `TrainAgentOpdArgs::update_preset`):
+
+| Value | Algorithm | Filter / advantage |
 | --- | --- | --- |
-| `arle train opd` | **Supported (Beta)** | End-to-end CLI shipped 2026-05-24 (`14c3be9`): `arle train opd --student-model <dir> --teacher-model <dir>` runs HF/ModelScope-cached models through `qwen35_loader` + autograd `Tape` + `opd_step` + AdamW directly, no example script needed. CUDA backend. Wins: `2026-05-24-arle-train-opd-from-dirs`. Live task queue tracked in `2026-05-24-opd-mainline-task-backlog`. |
-| `arle train env` / `arle train estimate-memory` | Supported | Diagnostic surfaces preserved across the OPD-only pivot. `arle train test` was retired permanently in the 2026-05-24 T3 prune (`81842cc`); the test stubs were removed in `cli_smoke` cleanup (`e049787`). |
-| Infer-side unified `/v1/train/*` bridge | Supported (optional proxy) | `infer` exposes `/v1/train/status|events|stop|save` when `--train-control-url http://...` is configured, forwarding to the train-side server in `crates/train/src/server.rs`. OPD progress event wiring is separate scope from the OPD CLI ship — `arle train opd` currently has no `--serve` mode; the proxy will host OPD events when that wiring lands. |
-| DSpark train sidecar (`--dspark-train`) | **Shipped (opt-in)** | In-process trainer alongside `arle serve --spec-type dspark`: drains the hot-path experience buffer and updates the Markov head (PG + probability matching), hot-swapping weights back. CUDA-only. Details in §4a and [`wins`](experience/wins/2026-07-20-dspark-train-sidecar-e2e-verified.md). |
+| `rejection-ce` *(default)* | reject failures, masked CE on full passes | `PassOnly` / `None` |
+| `grpo` | group-normalized advantage, clamped per-token ratio | `KeepAll` / `Mean{group, std_norm}` |
+| `dapo` | clip-higher + dynamic sampling + token-level (batch-mean) loss | `DropZeroAdvGroup` / `Mean{group}` |
+| `dr-grpo` | GRPO minus length/std biases (fixed-constant normalizer) | `KeepAll` / `Mean{fixed norm}` |
+| `gspo` | sequence-level clipped importance ratio | sequence-level IS |
+| `cispo` | detached one-sided clamped-IS weight, batch-mean loss | one-sided IS |
+| `sao-dis` | SAO Phase 1: hard-gated per-token PG, batch-centered advantage | `KeepAll` / `Mean` |
+| `sao-value` | SAO Phase 2: per-token Skip-Obs GAE from a learned value critic | `ValueGae{γ, λ}`. Wins: `2026-07-13-sao-phase2-value-critic` |
+
+`arle train test` was retired in the 2026-05-24 T3 prune (`81842cc`). The generic
+Phase-2 `Trainer`/`GradAccumulator` and `MoeWithLora` surfaces were deleted
+2026-07-23 (dead post-pivot; wins `2026-07-23-train-crate-systematic-simplification`).
 
 ---
 
