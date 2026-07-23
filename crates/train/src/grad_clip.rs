@@ -1,9 +1,9 @@
-//! Gradient clipping — free function (`clip_grad_norm`) kept for existing
-//! call sites + `GradClip` trait surface used by the Phase 2 `Trainer`.
+//! Gradient clipping — free functions (`clip_grad_norm` /
+//! `compute_global_norm_f64`) used by the OPD training loops.
 //!
 //! See `docs/plans/train-runtime-architecture-v1.md` §4.4.
 
-use autograd::{Device, Result, TensorId, TensorStore, tensor::Dirty};
+use autograd::{Device, TensorId, TensorStore, tensor::Dirty};
 
 /// Pre-clip global L2 norm across every param's gradient.
 ///
@@ -37,10 +37,6 @@ pub fn compute_global_norm_f64(params: &[TensorId], store: &TensorStore) -> f64 
         }
     }
     total_sq_norm.sqrt()
-}
-
-fn compute_global_norm(params: &[TensorId], store: &TensorStore) -> f32 {
-    compute_global_norm_f64(params, store) as f32
 }
 
 pub fn clip_grad_norm(params: &[TensorId], max_norm: f32, store: &mut TensorStore) {
@@ -161,43 +157,4 @@ fn try_clip_grad_norm_device(params: &[TensorId], max_norm: f32, store: &mut Ten
             .expect("clipped device grad should be installable");
     }
     true
-}
-
-pub trait GradClip: Send {
-    /// Clip gradients in-place. Return pre-clip global L2 norm for logging.
-    fn clip(&mut self, store: &mut TensorStore, params: &[TensorId]) -> Result<f32>;
-}
-
-pub struct NoClip;
-
-impl GradClip for NoClip {
-    fn clip(&mut self, store: &mut TensorStore, params: &[TensorId]) -> Result<f32> {
-        // Report the true pre-clip global L2 norm so unclipped baselines
-        // still see explode/vanish gradients in logs.
-        Ok(compute_global_norm(params, store))
-    }
-}
-
-pub struct GlobalNorm {
-    pub max_norm: f32,
-}
-
-impl GlobalNorm {
-    /// Construct a `GlobalNorm` clipper. Panics if `max_norm <= 0.0` to fail
-    /// fast rather than silently becoming a no-op (see `clip_grad_norm`).
-    pub fn new(max_norm: f32) -> Self {
-        assert!(
-            max_norm > 0.0 && max_norm.is_finite(),
-            "GlobalNorm::new: max_norm must be > 0.0 and finite, got {max_norm}"
-        );
-        Self { max_norm }
-    }
-}
-
-impl GradClip for GlobalNorm {
-    fn clip(&mut self, store: &mut TensorStore, params: &[TensorId]) -> Result<f32> {
-        let pre_clip_norm = compute_global_norm(params, store);
-        clip_grad_norm(params, self.max_norm, store);
-        Ok(pre_clip_norm)
-    }
 }

@@ -37,7 +37,6 @@ pub enum ConfigJsonSource<'a> {
 }
 
 pub enum GenerationConfigSource<'a> {
-    CopyFrom(&'a Path),
     Synthesize {
         bos_token_id: Option<u32>,
         eos_token_id: u32,
@@ -208,19 +207,15 @@ pub fn save_qwen35_student_checkpoint<'a>(
     tape: &mut Tape,
     weights: Qwen35StudentWeights<'a>,
 ) -> Result<PathBuf, Qwen35CheckpointError> {
-    match weights {
-        Qwen35StudentWeights::FullMaterialized { bf16 } => {
-            save_step_checkpoint(spec, |weights_path| {
-                save_full_materialized_weights(student, store, tape, weights_path, bf16)
-            })
-        }
-        Qwen35StudentWeights::AdapterOnly {
-            bf16,
-            adapter_config,
-        } => save_step_checkpoint_with_artifact(spec, ADAPTER_WEIGHTS_FILENAME, |weights_path| {
-            save_adapter_only_weights(student, store, weights_path, bf16, adapter_config)
-        }),
-    }
+    let step_basename = format!("step_{:06}", spec.step);
+    let named = Qwen35NamedCheckpoint {
+        out_dir: spec.out_dir,
+        dirname: &step_basename,
+        tokenizer_path: spec.tokenizer_path,
+        config_json: spec.config_json,
+        generation_config: spec.generation_config,
+    };
+    save_named_qwen35_student_checkpoint(named, student, store, tape, weights)
 }
 
 fn publish_latest_after_artifact(
@@ -403,9 +398,6 @@ fn write_generation_config(
     source: GenerationConfigSource<'_>,
 ) -> Result<(), Qwen35CheckpointError> {
     match source {
-        GenerationConfigSource::CopyFrom(source_path) => {
-            fs::copy(source_path, target_path)?;
-        }
         GenerationConfigSource::Synthesize {
             bos_token_id,
             eos_token_id,
