@@ -26,6 +26,9 @@ use opentelemetry_sdk::logs::{SdkLogger, SdkLoggerProvider};
 const DEFAULT_SHARED_BUFFER_CAPACITY: usize = 1024;
 const OTLP_SERVICE_NAME_DEFAULT: &str = "arle.train";
 const WANDB_MODE_DEFAULT: &str = "offline";
+/// Bounds every MLflow HTTP call so a black-holed endpoint can't hang the
+/// worker (and, via `flush_blocking`, the foreground training loop).
+const MLFLOW_HTTP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A single metric observation for a training step.
 ///
@@ -679,7 +682,11 @@ impl MlflowSink {
         Self {
             config,
             run_id: None,
-            agent: ureq::AgentBuilder::new().build(),
+            // `.timeout` covers read+write but not connect, so bound both.
+            agent: ureq::AgentBuilder::new()
+                .timeout_connect(MLFLOW_HTTP_TIMEOUT)
+                .timeout(MLFLOW_HTTP_TIMEOUT)
+                .build(),
         }
     }
 
