@@ -1862,11 +1862,6 @@ pub(crate) struct TrainRubricOpdArgs {
     #[arg(long, value_name = "N")]
     pub(crate) lora_layer_start: Option<usize>,
 
-    /// Gradient checkpointing for the CE backward (recompute activations). On by
-    /// default; `--grad-checkpointing false` to disable.
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set, value_name = "BOOL")]
-    pub(crate) grad_checkpointing: bool,
-
     /// Directory where servable full-materialized checkpoints are written.
     #[arg(long, value_name = "DIR")]
     pub(crate) save_checkpoint: Option<PathBuf>,
@@ -2135,11 +2130,6 @@ pub(crate) struct TrainAgentOpdArgs {
     /// fit a 27B dense student CE backward; unset = all layers.
     #[arg(long, value_name = "N")]
     pub(crate) lora_layer_start: Option<usize>,
-
-    /// Gradient checkpointing for the CE backward (recompute activations). On by
-    /// default; `--grad-checkpointing false` to disable.
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set, value_name = "BOOL")]
-    pub(crate) grad_checkpointing: bool,
 
     /// Directory where servable full-materialized checkpoints are written.
     #[arg(long, value_name = "DIR")]
