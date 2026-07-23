@@ -160,7 +160,9 @@ where
     }
     fs::create_dir_all(&step_dir)?;
 
-    let result = (|| {
+    // Only the artifact/config/tokenizer writes define checkpoint integrity, so
+    // only their failure cleans up the partial dir.
+    let write_result = (|| {
         write_config_json(step_dir.join("config.json"), spec.config_json)?;
         let tokenizer_out = step_dir.join("tokenizer.json");
         if let Some(tokenizer_path) = spec.tokenizer_path {
@@ -172,17 +174,24 @@ where
             step_dir.join("generation_config.json"),
             spec.generation_config,
         )?;
-
-        let artifact_path = step_dir.join(artifact_filename);
-        save_artifact(&artifact_path)?;
-        publish_latest_after_artifact(spec.out_dir, step_basename, artifact_filename)?;
-        Ok(step_dir.clone())
+        save_artifact(&step_dir.join(artifact_filename))
     })();
-
-    if result.is_err() {
+    if let Err(err) = write_result {
         let _ = fs::remove_dir_all(&step_dir);
+        return Err(err);
     }
-    result
+
+    // `latest` is a convenience pointer, not part of the checkpoint — a publish
+    // failure (e.g. a non-symlink already sitting at `latest`) must never delete
+    // the fully-written checkpoint.
+    if let Err(err) = publish_latest_after_artifact(spec.out_dir, step_basename, artifact_filename)
+    {
+        eprintln!(
+            "[checkpoint] {} written but publishing `latest` failed: {err}",
+            step_dir.display()
+        );
+    }
+    Ok(step_dir)
 }
 
 fn validate_checkpoint_dirname(dirname: &str) -> Result<(), Qwen35CheckpointError> {
