@@ -29,6 +29,15 @@ pub fn write_file_atomic_cache(path: &Path, bytes: &[u8]) -> io::Result<()> {
     write_file_atomic_impl(path, bytes, false)
 }
 
+/// Atomic replacement for payloads that must survive a crash — the durable
+/// recall manifest. `sync_data` + parent-dir `sync_all` make the rename
+/// durable on power loss. Callers must flush the data the manifest references
+/// (e.g. [`KvMmapStore::flush`]) BEFORE calling this, so a crash never replays
+/// a manifest onto unflushed slots.
+pub fn write_file_atomic_durable(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    write_file_atomic_impl(path, bytes, true)
+}
+
 fn write_file_atomic_impl(path: &Path, bytes: &[u8], durable: bool) -> io::Result<()> {
     if path.as_os_str().is_empty() {
         return Err(io::Error::new(
@@ -241,6 +250,14 @@ impl KvMmapStore {
         &self.mapping[offset..offset + self.slot_bytes]
     }
 
+    /// msync the mapping (`MS_SYNC`) so all written slots reach disk. Cost is
+    /// proportional to dirty pages, not the sparse file's logical size. The
+    /// durable recall tier calls this before persisting the manifest that names
+    /// the slots — the data-before-manifest ordering barrier.
+    pub fn flush(&self) -> io::Result<()> {
+        self.mapping.flush()
+    }
+
     /// Return a slot to the free list.
     pub fn free_slot(&mut self, slot: u32) {
         if !self.free_list.contains(&slot) {
@@ -290,6 +307,22 @@ mod tests {
         let slot = store.alloc_slot().unwrap();
         store.write_slot(slot, b"short").unwrap();
         assert_eq!(&store.read_slot(slot)[..5], b"short");
+    }
+
+    #[test]
+    fn mmap_store_flush_then_reopen_reads_back() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("durable.mmap");
+        let slot = {
+            let mut store = KvMmapStore::create(&path, 4, 16).unwrap();
+            let slot = store.alloc_slot().unwrap();
+            store.write_slot(slot, b"durable-payload!").unwrap();
+            store.flush().unwrap();
+            slot
+        };
+        // Fresh mapping over the on-disk file: the flushed slot survives.
+        let reopened = KvMmapStore::open(&path, 4, 16).unwrap();
+        assert_eq!(reopened.read_slot(slot), b"durable-payload!");
     }
 
     #[test]
