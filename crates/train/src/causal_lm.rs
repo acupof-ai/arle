@@ -1,45 +1,21 @@
-use std::{
-    collections::{HashMap, HashSet},
-    path::Path,
-};
+use std::{collections::HashSet, path::Path};
 
 use autograd::{Result, SafetensorsRegistry, Tape, TensorId, TensorStore};
 
-pub trait CausalLm {
-    fn forward_with_positions(
-        &self,
-        store: &mut TensorStore,
-        tape: &mut Tape,
-        input_ids: &[u32],
-        position_ids: &[u32],
-    ) -> Result<TensorId>;
+use crate::qwen35::{Qwen35Model, qwen35_to_autograd};
 
-    fn param_name_map(&self) -> HashMap<&'static str, TensorId>;
-
-    fn adapter_name_map(&self) -> HashMap<&'static str, TensorId> {
-        HashMap::new()
-    }
-
-    fn materialized_param_name_map(
-        &self,
-        _store: &mut TensorStore,
-        _tape: &mut Tape,
-    ) -> Result<HashMap<&'static str, TensorId>> {
-        Ok(self.param_name_map())
-    }
-
-    fn all_parameter_ids(&self) -> Vec<TensorId>;
-}
-
-pub fn save_materialized_registry<M: CausalLm>(
-    model: &M,
+pub fn save_materialized_registry(
+    model: &Qwen35Model,
     store: &mut TensorStore,
-    tape: &mut Tape,
+    _tape: &mut Tape,
     path: &Path,
     bf16: bool,
 ) -> Result<()> {
     let mut registry = SafetensorsRegistry::new();
-    for (name, tensor_id) in model.materialized_param_name_map(store, tape)? {
+    for (name, tensor_id) in model
+        .materialized_param_name_map(store)
+        .map_err(qwen35_to_autograd)?
+    {
         registry.insert(name, tensor_id);
     }
     if bf16 {

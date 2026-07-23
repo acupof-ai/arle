@@ -21,9 +21,8 @@ pub use qwen35_spec::{LayerType, Qwen35Config, Qwen35ConfigError};
 use qwen35_spec::{Qwen35AttentionTensorNames, Qwen35MoeTensorNames};
 use thiserror::Error;
 
-use crate::{
-    causal_lm::CausalLm,
-    lora::{LinearWithLora, LoraConfig, LoraTargetSet, leak_name, next_uniform, seed_from_name},
+use crate::lora::{
+    LinearWithLora, LoraConfig, LoraTargetSet, leak_name, next_uniform, seed_from_name,
 };
 
 #[derive(Debug, Error)]
@@ -172,17 +171,6 @@ impl SequenceWindow {
     pub fn is_empty(self) -> bool {
         self.end <= self.start
     }
-}
-
-pub trait SequenceWindowedForward {
-    fn forward_logits_window(
-        &self,
-        store: &mut TensorStore,
-        tape: &mut Tape,
-        input_ids: &[u32],
-        position_ids: &[u32],
-        window: SequenceWindow,
-    ) -> Result<TensorId>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4483,14 +4471,19 @@ impl Qwen35Model {
         position_ids: &[u32],
         window: SequenceWindow,
     ) -> Result<TensorId> {
-        <Self as SequenceWindowedForward>::forward_logits_window(
-            self,
-            store,
-            tape,
-            input_ids,
-            position_ids,
-            window,
-        )
+        validate_sequence_window(input_ids, position_ids, window)?;
+        let prefix_len = window.end;
+        let token_indices = input_ids[..prefix_len]
+            .iter()
+            .map(|&id| id as usize)
+            .collect::<Vec<_>>();
+        let positions = position_ids[..prefix_len]
+            .iter()
+            .map(|&id| id as usize)
+            .collect::<Vec<_>>();
+        let hidden =
+            self.forward_batch_hidden_indices(store, tape, &token_indices, &positions, 1)?;
+        self.logits_from_hidden_window(store, tape, hidden, window)
     }
 
     #[doc(hidden)]
@@ -4621,31 +4614,6 @@ impl Qwen35Model {
     }
 }
 
-impl SequenceWindowedForward for Qwen35Model {
-    fn forward_logits_window(
-        &self,
-        store: &mut TensorStore,
-        tape: &mut Tape,
-        input_ids: &[u32],
-        position_ids: &[u32],
-        window: SequenceWindow,
-    ) -> Result<TensorId> {
-        validate_sequence_window(input_ids, position_ids, window)?;
-        let prefix_len = window.end;
-        let token_indices = input_ids[..prefix_len]
-            .iter()
-            .map(|&id| id as usize)
-            .collect::<Vec<_>>();
-        let positions = position_ids[..prefix_len]
-            .iter()
-            .map(|&id| id as usize)
-            .collect::<Vec<_>>();
-        let hidden =
-            self.forward_batch_hidden_indices(store, tape, &token_indices, &positions, 1)?;
-        self.logits_from_hidden_window(store, tape, hidden, window)
-    }
-}
-
 fn validate_sequence_window(
     input_ids: &[u32],
     position_ids: &[u32],
@@ -4669,38 +4637,6 @@ fn validate_sequence_window(
         });
     }
     Ok(())
-}
-
-impl CausalLm for Qwen35Model {
-    fn forward_with_positions(
-        &self,
-        store: &mut TensorStore,
-        tape: &mut Tape,
-        input_ids: &[u32],
-        position_ids: &[u32],
-    ) -> autograd::Result<TensorId> {
-        Qwen35Model::forward(self, store, tape, input_ids, position_ids).map_err(qwen35_to_autograd)
-    }
-
-    fn param_name_map(&self) -> HashMap<&'static str, TensorId> {
-        Qwen35Model::param_name_map(self)
-    }
-
-    fn adapter_name_map(&self) -> HashMap<&'static str, TensorId> {
-        Qwen35Model::adapter_name_map(self)
-    }
-
-    fn materialized_param_name_map(
-        &self,
-        store: &mut TensorStore,
-        _tape: &mut Tape,
-    ) -> autograd::Result<HashMap<&'static str, TensorId>> {
-        Qwen35Model::materialized_param_name_map(self, store).map_err(qwen35_to_autograd)
-    }
-
-    fn all_parameter_ids(&self) -> Vec<TensorId> {
-        Qwen35Model::all_parameter_ids(self)
-    }
 }
 
 fn linear_forward(
@@ -5234,7 +5170,7 @@ fn broadcast_to_shape(
     Ok(add_broadcast(zeros, x, store, tape)?)
 }
 
-fn qwen35_to_autograd(err: Qwen35Error) -> AutogradError {
+pub(crate) fn qwen35_to_autograd(err: Qwen35Error) -> AutogradError {
     AutogradError::TapeInvariant(Box::leak(err.to_string().into_boxed_str()))
 }
 
