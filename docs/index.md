@@ -61,7 +61,7 @@ Controlling / high-traffic:
 
 | Path | Use when |
 | --- | --- |
-| [plans/2026-07-21-kernel-opt-fusion-campaign.md](plans/2026-07-21-kernel-opt-fusion-campaign.md) | remaining kernel/path opt (FA3-decode default, slots, EP) |
+| [plans/2026-07-21-kernel-opt-fusion-campaign.md](plans/2026-07-21-kernel-opt-fusion-campaign.md) | remaining kernel/path opt (slots→B≳43 primary, FA3-decode probe, EP) |
 | [plans/2026-07-11-dsv4-high-concurrency-throughput-campaign.md](plans/2026-07-11-dsv4-high-concurrency-throughput-campaign.md) | DSv4 high-c thruput |
 | [plans/2026-07-11-dspark-dsv4-flash-spec-decode.md](plans/2026-07-11-dspark-dsv4-flash-spec-decode.md) | DSpark on DSv4 |
 | [plans/2026-07-09-dspark-dflash-spec-decode-qwen36.md](plans/2026-07-09-dspark-dflash-spec-decode-qwen36.md) | DSpark/DFlash on Qwen3.6 (licensed) |
