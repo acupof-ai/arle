@@ -359,10 +359,12 @@ impl UpdatePreset {
             all_params
         };
 
-        // GlobalTokenMean denominator: the surviving batch's masked-token count
-        // (zero-advantage trajectories contribute 0 grad either way).
+        // GlobalTokenMean denominator: masked-token count of the trajectories that
+        // actually train — VRAM-skipped ones (skip_over_max_seq) add 0 grad, so
+        // counting them would deflate every trained token's weight.
         let batch_tokens: usize = survivors
             .iter()
+            .filter(|t| !over_max_seq(t))
             .map(|t| t.rollout_logprobs.as_ref().map_or(0, Vec::len))
             .sum();
         let step_each = matches!(self.agg, Aggregation::PerSeqTokenMean);
@@ -635,15 +637,24 @@ fn seq_ratio_weight(current_lp: &[f32], behavior_lp: &[f32], clip: ClipForm) -> 
     Ok(pg_token_weight(clip.weight_form(), 1.0, s, 0.0).0)
 }
 
+/// The VRAM-wall gate as a pure predicate (no warn), so the update loop and the
+/// GlobalTokenMean denominator agree on which trajectories train.
+fn over_max_seq(traj: &ScoredTrajectory) -> bool {
+    let cap = crate::runtime_flags::max_update_seq();
+    cap != 0 && traj.prompt_ids.len() + traj.response_ids.len() > cap
+}
+
 /// H20-96GB VRAM wall: writeback backward OOMs at seq≈30K even with offload +
 /// trims (see `runtime_flags::max_update_seq`). Skip-with-warn keeps the round
 /// alive instead of killing the whole run mid-group.
 fn skip_over_max_seq(traj: &ScoredTrajectory) -> bool {
-    let cap = crate::runtime_flags::max_update_seq();
-    let seq = traj.prompt_ids.len() + traj.response_ids.len();
-    let skip = cap != 0 && seq > cap;
+    let skip = over_max_seq(traj);
     if skip {
-        eprintln!("[update] SKIP trajectory: seq {seq} > max_update_seq {cap} (VRAM wall)");
+        let seq = traj.prompt_ids.len() + traj.response_ids.len();
+        eprintln!(
+            "[update] SKIP trajectory: seq {seq} > max_update_seq {} (VRAM wall)",
+            crate::runtime_flags::max_update_seq()
+        );
     }
     skip
 }
@@ -662,6 +673,7 @@ fn update_ce<O: Optimizer>(
 ) -> Result<UpdateReport> {
     let mut loss_sum = 0.0f32;
     let mut tokens = 0usize;
+    let mut trained = 0usize;
     for traj in survivors {
         if skip_over_max_seq(traj) {
             continue;
@@ -681,10 +693,17 @@ fn update_ce<O: Optimizer>(
             store,
         )?;
         tokens += traj.response_mask.iter().filter(|&&m| m == 1).count();
+        trained += 1;
     }
+    // Average over trained trajectories only (skips add no loss), mirroring
+    // `update_pg`'s `steps` convention.
     Ok(UpdateReport {
-        loss: loss_sum / survivors.len() as f32,
-        trained: survivors.len(),
+        loss: if trained > 0 {
+            loss_sum / trained as f32
+        } else {
+            0.0
+        },
+        trained,
         tokens,
         ..UpdateReport::default()
     })
