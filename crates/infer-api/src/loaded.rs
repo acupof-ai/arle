@@ -82,7 +82,7 @@ pub struct EngineLoadConfig {
     /// Fraction of total VRAM the static KV pool may claim, profiled from
     /// MEASURED free VRAM after weights load (SGLang's `mem_fraction_static`).
     /// `reserve = total × (1 − frac)` is left for activations/scratch; the rest
-    /// of free VRAM becomes the KV token pool. Clamped to `[0.5, 0.97]` by the
+    /// of free VRAM becomes the KV token pool. Clamped to `[0.05, 0.97]` by the
     /// sizer. Wired for the dense Qwen3 CUDA pool (`profile_kv_pool_tokens`);
     /// Qwen3.5/3.6 and DSv4 keep their per-slot sizing this phase.
     #[serde(default = "default_mem_fraction_static")]
@@ -2281,6 +2281,14 @@ mod backend {
             scheduler.max_total_tokens = scheduler.max_total_tokens.min(profiled_capacity);
             scheduler.max_prompt_tokens =
                 scheduler.max_prompt_tokens.min(scheduler.max_total_tokens);
+        } else if matches!(kind, CudaModelKind::Dsv4) {
+            // scheduler_config() derived max_prompt_tokens from the DEFAULT
+            // total_pages (8192·16), unrelated to DSv4's MLA arena whose real
+            // per-slot capacity is max_total_tokens (the executor's max_seq_len).
+            // Re-bind ingress to the arena from the requested config value so a
+            // long prompt in (default-derived-cap, max_total_tokens] is not
+            // wrongly rejected; still bounded by the arena.
+            scheduler.max_prompt_tokens = config.max_prompt_tokens.min(scheduler.max_total_tokens);
         }
         if num_slots != scheduler.num_slots {
             log::warn!(
