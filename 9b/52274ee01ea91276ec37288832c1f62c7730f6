@@ -1,0 +1,25 @@
+docs/experience/wins/2026-07-24-agent-opd-gpu-busy-frac-measured-go.md
+  s_3bfdcf8fceb2d5::t_195995df1fd8d2 1-56
+CHANGELOG.md
+  s_3bfdcf8fceb2d5::t_a633532467ff9b 26-34
+docs/research/2026-07-23-online-rl-acceleration.md
+  s_3bfdcf8fceb2d5::t_771e8093334b44 61-81,89-92
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "9b52274ee01ea91276ec37288832c1f62c7730f6",
+  "prompts": {},
+  "sessions": {
+    "s_3bfdcf8fceb2d5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "62ec01f2-d7cd-44c5-b546-2e6a64756530",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
