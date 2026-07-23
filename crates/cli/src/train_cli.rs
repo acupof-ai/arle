@@ -1965,14 +1965,6 @@ fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
             .context("stream sync before first shared-base autograd forward")?;
     }
 
-    // Gradient checkpointing + suffix-detach (--lora-layer-start) are what let the
-    // 27B dense CE backward fit; without them the autograd forward+backward OOMs.
-    // This holds in self-consistency mode too: freeing the judge inference VRAM
-    // does NOT cover the full no-checkpoint activation set, so the CE micro-batch
-    // still OOMs at alloc_zeros (observed). Always honor the flag.
-    if args.grad_checkpointing {
-        student.set_gradient_checkpointing(true);
-    }
     let all_params: Vec<TensorId> = student.all_parameter_ids();
     let trainable: Vec<TensorId> = all_params
         .iter()
@@ -2687,9 +2679,6 @@ fn run_agent_opd_replay(
         &mut store,
     )
     .with_context(|| format!("load LoRA student from {}", student_dir.display()))?;
-    if args.grad_checkpointing {
-        student.set_gradient_checkpointing(true);
-    }
     // Resume: overlay a saved adapter BEFORE the GKD self-teacher snapshots the
     // student, so the frozen `self` teacher captures the resumed adapter, not zeros.
     if let Some(dir) = args.lora_adapters.as_deref() {
@@ -3176,11 +3165,6 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
         }
     }
 
-    // Gradient checkpointing + suffix-detach (--lora-layer-start) are what let the
-    // 27B dense CE backward fit; without them the autograd forward+backward OOMs.
-    if args.grad_checkpointing {
-        student.set_gradient_checkpointing(true);
-    }
     let all_params: Vec<TensorId> = student.all_parameter_ids();
     let trainable: Vec<TensorId> = all_params
         .iter()
