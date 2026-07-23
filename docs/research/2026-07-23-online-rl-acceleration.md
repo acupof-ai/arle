@@ -140,6 +140,51 @@ Neither top move needs free GPUs to *prepare*:
    Tier-0 go/no-go is now a direct read of `gpu_busy_frac` from any agent-OPD round — no
    derivation, no serve bench needed.
 
+## Reward-bearing rollout ratio (2026-07-23)
+
+Follow-up deep-dive: raise the fraction of rolled-out sample-groups that yield a
+non-zero-advantage gradient (a zero-gradient rollout wastes ~40%-of-round GPU).
+
+**Two premise corrections from the grounding:**
+- **Reward is already dense, not binary.** `sandbox.rs:465` returns
+  `passed/|fail_to_pass| ∈ [0,1]`; `RewardShape::Dense` is default-ON (`cc_harness.rs:58`).
+  Do NOT flip `--reward-shape binary` (reverts it, lowers the ratio).
+- **The ratio is computable from existing metrics** — `1 − mean(zero_variance)` over
+  kind=group rows. One `--task-selection false` profile run gives the current ratio +
+  the p-histogram; no new counter needed.
+
+**First principle:** a group of k on a task with pass-rate p is reward-bearing with
+prob `R(p,k) = 1 − p^k − (1−p)^k`, dominated by p (k=8: p=0.5→0.99, p=0.9→0.57,
+p=0.99→0.08). So curriculum (move the sampled-p toward 0.5) is the top lever, mostly free.
+
+**Landed 2026-07-23:**
+- **Variance-weighted task selection** (`train_cli.rs` `TaskSelection`): `select()` now
+  runs each task with prob ∝ its reward-bearing variance `p(1−p)` (0.1 floor), using the
+  online `ema_pass` estimate — replacing the reactive zv-streak skip that only trimmed
+  the tails. Concentrates the fixed rollout budget on the p≈0.5 band. Free (zero extra
+  rollouts); ~1.6× ratio if the corpus averages p≈0.9. Gated by the existing
+  `--task-selection`.
+- **Min-tests granularity floor** (`comfort_band.py --min-tests 2`): drops tasks with
+  `|fail_to_pass| < 2` where dense reward degenerates to binary (the toy corpus averages
+  ~1.85 tests/task). Offline, free.
+- **Script knobs** (`agent_opd_curve.sh`): `REWARD_SHAPE` (dense|anchored|binary),
+  `REPLAY_REUSE` (amortize spent rollout via the built ReplayBuffer), `CB_MIN_TESTS`.
+
+**Deferred (with reason):**
+- **Rollout temperature 0.3→~0.8** (free ratio lift) — BLOCKED by the FP8/hd256 temp>0
+  corruption (#48); unblock that sampler first.
+- **Adaptive-k pilot gating** (the only lever that raises the *within-round* rolled-out
+  ratio) — needs the measured p-distribution to tune k0 (≥3–4 to avoid false-killing
+  p≈0.5 tasks); build after the profile run.
+
+**Killed-in-disguise:** DAPO oversample-refill — ARLE already reaches ~100% *trained*-batch
+ratio via `DropZeroAdvGroup` (trains a smaller batch); refill adds +75%(p=0.9)–+1200%(p=0.99)
+rollout for zero net gradient. Adaptive-k for *more* samples on hard tasks (R(p,k) negative
+ROI at extremes). PRM (displaces pytest, the ground-truth verifier).
+
+**Next:** the pod profile run measures the actual ratio + p-histogram → sizes the
+variance-weighting and unblocks adaptive-k k0 tuning.
+
 ## Anchors
 
 - Loop: `crates/cli/src/train_cli.rs:3340` (round) / `:3396` (group) / `:3403` rollout /

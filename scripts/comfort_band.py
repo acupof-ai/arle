@@ -136,8 +136,21 @@ def run(args: argparse.Namespace) -> int:
     verdicts = {tid: classify(p, args) for tid, p in profiles.items()}
     keep_ids = {tid for tid, v in verdicts.items() if v == "keep"}
 
+    # Min-tests granularity floor: dense reward = passed/|fail_to_pass|, so at
+    # |fail_to_pass| < min_tests it can only reach {0,1} → binary, and the group
+    # collapses to zero-variance far more often. The count lives in the corpus
+    # jsonl, not the profile rows classify sees, so filter it here.
+    if args.min_tests > 1:
+        low_gran = {r["instance_id"] for r in read_jsonl(args.corpus / "tasks_train.jsonl")
+                    if len(r.get("fail_to_pass") or []) < args.min_tests}
+        dropped = keep_ids & low_gran
+        keep_ids -= low_gran
+        if dropped:
+            print(f"[comfort-band] dropped {len(dropped)} low-granularity tasks "
+                  f"(|fail_to_pass| < {args.min_tests}: dense reward = binary)")
+
     print(f"[comfort-band] profiled {len(profiles)} tasks → kept {len(keep_ids)} "
-          f"(pass∈[{args.pass_lo},{args.pass_hi}], avg_traj≤{args.max_seq})")
+          f"(pass∈[{args.pass_lo},{args.pass_hi}], avg_traj≤{args.max_seq}, tests≥{args.min_tests})")
     for tid, p in sorted(profiles.items()):
         mark = "KEEP" if verdicts[tid] == "keep" else f"drop:{verdicts[tid]}"
         print(f"  {tid:32s} pass={p.pass_rate(args.pass_threshold):.2f} "
@@ -165,6 +178,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--max-seq", type=int, default=22000,
                     help="max avg trajectory tokens (< the writeback --max-update-seq, default 23K)")
     ap.add_argument("--min-samples", type=int, default=4, help="min profiled samples for a verdict")
+    ap.add_argument("--min-tests", type=int, default=2,
+                    help="min |fail_to_pass| tests/task; below this dense reward degenerates to binary")
     ap.add_argument("--self-check", action="store_true", help="run the built-in correctness gate and exit")
     return ap
 
@@ -176,19 +191,32 @@ def self_check() -> int:
         td = Path(td)
         corpus, out = td / "c", td / "band"
         (corpus / "staged").mkdir(parents=True)
-        ids = ["arle__easy", "arle__band", "arle__hard", "arle__long"]
+        # instance_id -> fail_to_pass tests. onetest is band-difficulty + short but
+        # has only 1 test, so the granularity floor must drop it despite passing the
+        # pass/length filters (dense reward would be binary there).
+        rows = {
+            "arle__easy": ["t::1", "t::2"],
+            "arle__band": ["t::1", "t::2"],
+            "arle__hard": ["t::1", "t::2"],
+            "arle__long": ["t::1", "t::2"],
+            "arle__onetest": ["t::1"],
+        }
+        ids = list(rows)
         (corpus / "tasks_train.jsonl").write_text(
-            "".join(json.dumps({"instance_id": i, "problem_statement": "p"}) + "\n" for i in ids))
+            "".join(json.dumps({"instance_id": i, "problem_statement": "p", "fail_to_pass": rows[i]}) + "\n"
+                    for i in ids))
         (corpus / "tasks_eval.jsonl").write_text(json.dumps({"instance_id": "arle__ev"}) + "\n")
         for i in ids + ["arle__ev"]:
             (corpus / "staged" / i).mkdir()
             (corpus / "staged" / i / "mod.py").write_text("x = 1\n")
-        # 4 samples/task: easy=all pass, band=mixed short, hard=all fail, long=mixed but 30K
+        # samples/task: easy=all pass, band=mixed short, hard=all fail, long=mixed but 30K,
+        # onetest=band-mixed but 1 test → dropped by the granularity floor.
         metrics = [
             {"kind": "group", "task_id": "arle__easy", "rewards": [1, 1, 1, 1], "prompt_tokens": 4000, "completion_tokens": 400},
             {"kind": "group", "task_id": "arle__band", "rewards": [1, 1, 0, 0.5], "prompt_tokens": 8000, "completion_tokens": 800},
             {"kind": "group", "task_id": "arle__hard", "rewards": [0, 0, 0, 0], "prompt_tokens": 6000, "completion_tokens": 600},
             {"kind": "group", "task_id": "arle__long", "rewards": [1, 1, 0, 0], "prompt_tokens": 118000, "completion_tokens": 4000},
+            {"kind": "group", "task_id": "arle__onetest", "rewards": [1, 1, 0, 0.5], "prompt_tokens": 8000, "completion_tokens": 800},
             {"kind": "other"},  # ignored
         ]
         mpath = td / "profile.jsonl"
@@ -202,7 +230,7 @@ def self_check() -> int:
         assert (out / "tasks_eval.jsonl").is_file(), "eval split not copied"
         assert {r["instance_id"] for r in read_jsonl(out / "tasks_eval.jsonl")} == {"arle__ev"}
         assert (out / "staged" / "arle__ev").is_dir(), "eval staged tree not copied"
-    print("self-check OK: keeps comfort-band, drops easy/hard/long, copies eval unchanged")
+    print("self-check OK: keeps comfort-band, drops easy/hard/long/onetest(1-test), copies eval unchanged")
     return 0
 
 

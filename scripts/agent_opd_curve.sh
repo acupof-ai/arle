@@ -24,7 +24,9 @@
 #   COMFORT_BAND=1                profile 1 round, then train only the "band": drop
 #                                 always-pass/always-fail AND >CB_MAX_SEQ tasks the
 #                                 writeback skips (0=off; auto-off under SMOKE)
-#   CB_MAX_SEQ=22000 CB_PASS_LO=0.2 CB_PASS_HI=0.8   comfort-band thresholds
+#   CB_MAX_SEQ=22000 CB_PASS_LO=0.2 CB_PASS_HI=0.8 CB_MIN_TESTS=2   comfort-band thresholds
+#   REWARD_SHAPE=dense            dense|anchored|binary (dense/anchored = more reward-bearing groups)
+#   REPLAY_REUSE=0                reuse N past variance-bearing groups per fresh one (opt-in, needs dapo)
 #   ROLLOUT_TEMPERATURE=1.0       >0 samples (dapo/grpo); 0.0 is greedy (rejection-ce)
 #   SPEC=mtp                      spec-decode via TC's built-in MTP head (default,
 #                                 aligned, no download). dflash=external draft
@@ -76,6 +78,12 @@ UPDATE_STRATEGY=${UPDATE_STRATEGY:-dapo}
 ROLLOUT_TEMPERATURE=${ROLLOUT_TEMPERATURE:-1.0}
 STALENESS=${STALENESS:-1}
 TASK_SELECTION=${TASK_SELECTION:-true}
+# Reward shape: dense (default, partial pass-fraction → more reward-bearing groups) |
+# anchored (keeps sub-test variance in all-failing groups) | binary (collapses to 0/1, lowers ratio).
+REWARD_SHAPE=${REWARD_SHAPE:-dense}
+# Experience replay: reuse N past variance-bearing groups per fresh group (opt-in; needs a
+# ratio-weighted strategy — dapo default satisfies it). 0 = off, amortizes spent rollout.
+REPLAY_REUSE=${REPLAY_REUSE:-0}
 EVAL_CONCURRENCY=${EVAL_CONCURRENCY:-8}
 WRITEBACK_CAP=${WRITEBACK_CAP:-8} DIFFICULTY=${DIFFICULTY:-easy} SEED=${SEED:-0}
 # Faster generation via speculative decoding — it never changes the output, only
@@ -124,6 +132,7 @@ common_args=(
     --student-model "$STUDENT_MODEL"
     --task-limit "$TASK_LIMIT"
     --update-strategy "$UPDATE_STRATEGY"
+    --reward-shape "$REWARD_SHAPE"
     --rollout-temperature "$ROLLOUT_TEMPERATURE"
     --samples-per-prompt "$SAMPLES"
     --sync every-group
@@ -152,7 +161,8 @@ if [[ ${COMFORT_BAND:-1} == 1 && ${SMOKE:-0} != 1 ]]; then
         2>&1 | tee "$OUT/cb_profile.log"
     if python3 scripts/comfort_band.py \
             --metrics "$OUT/cb_profile/metrics.jsonl" --corpus "$CORPUS" --out "$OUT/corpus-band" \
-            --max-seq "${CB_MAX_SEQ:-22000}" --pass-lo "${CB_PASS_LO:-0.2}" --pass-hi "${CB_PASS_HI:-0.8}"; then
+            --max-seq "${CB_MAX_SEQ:-22000}" --pass-lo "${CB_PASS_LO:-0.2}" --pass-hi "${CB_PASS_HI:-0.8}" \
+            --min-tests "${CB_MIN_TESTS:-2}"; then
         CORPUS="$OUT/corpus-band"
         echo "[curve] comfort-band: training on filtered corpus $CORPUS"
     else
@@ -170,6 +180,7 @@ train_args=(
     --eval-concurrency "$EVAL_CONCURRENCY"
     --staleness "$STALENESS"
     --task-selection "$TASK_SELECTION"
+    --replay-reuse "$REPLAY_REUSE"
     --save-lora-adapters "$OUT/adapters"
 )
 

@@ -590,15 +590,14 @@ impl PromptSampler {
 
 #[derive(Debug, Clone, Copy, Default)]
 struct TaskStats {
-    zv_streak: u32,
     ema_pass: Option<f32>,
     hot_rounds: u32,
     retired: bool,
 }
 
-/// P5 pass-rate task selection: GRESO-style zero-variance skip + EMA-pass
-/// retirement. No comfort-band reweighting yet — needs a corpus-level
-/// difficulty spread to be meaningful.
+/// P5 pass-rate task selection: variance-weighted sampling — concentrate rollout
+/// on the p≈0.5 max-variance band where reward-bearing R(p,k)=1−p^k−(1−p)^k peaks
+/// — plus EMA-pass retirement of mastered tasks, with a 0.1 exploration floor.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 struct TaskSelection {
     rng: PromptSampler,
@@ -615,15 +614,21 @@ impl TaskSelection {
         }
     }
 
-    /// P(skip) = 1 − 1/(1+streak), capped so P(explore) ≥ 0.1.
-    fn skip_prob(zv_streak: u32) -> f64 {
-        (1.0 - 1.0 / (1.0 + f64::from(zv_streak))).min(0.9)
+    /// Predictive keep-probability from the online pass-estimate: run a task in
+    /// proportion to its reward-bearing variance v = p(1−p) (∈[0,0.25], max at
+    /// p=0.5), normalized so p≈0.5 always runs and a 0.1 floor keeps the tails
+    /// explored (a skipped task's EMA can only refresh on a round it runs).
+    fn keep_prob(ema_pass: Option<f32>) -> f64 {
+        let Some(p) = ema_pass else {
+            return 1.0; // unseen → run: need an estimate before we can weight
+        };
+        let v = f64::from(p) * f64::from(1.0 - p);
+        (v / 0.25).max(0.1)
     }
 
-    /// Update from a completed group; skipped rounds freeze both streaks.
-    fn record(&mut self, task: usize, zero_variance: bool, pass_rate: f32) {
+    /// Update from a completed group; skipped rounds freeze the estimate.
+    fn record(&mut self, task: usize, pass_rate: f32) {
         let s = &mut self.stats[task];
-        s.zv_streak = if zero_variance { s.zv_streak + 1 } else { 0 };
         let ema = s.ema_pass.map_or(pass_rate, |e| 0.3 * pass_rate + 0.7 * e);
         s.ema_pass = Some(ema);
         s.hot_rounds = if ema >= 0.9 { s.hot_rounds + 1 } else { 0 };
@@ -638,7 +643,7 @@ impl TaskSelection {
             let s = self.stats[i];
             if s.retired {
                 retired += 1;
-            } else if round > 0 && self.rng.next_unit() < Self::skip_prob(s.zv_streak) {
+            } else if round > 0 && self.rng.next_unit() >= Self::keep_prob(s.ema_pass) {
                 skipped += 1;
             } else {
                 run.push(i);
@@ -3445,7 +3450,6 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
             if let Some(sel) = selection.as_mut() {
                 sel.record(
                     group_idx,
-                    group_zero_variance,
                     group_passed as f32 / group.samples.len().max(1) as f32,
                 );
             }
