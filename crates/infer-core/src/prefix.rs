@@ -97,8 +97,6 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         if prefix_match.is_empty() {
             request.prefill_start_pos = 0;
             request.phase = RequestPhase::Prefilling { progress: 0 };
-            request.waiting_hint.immediate_reuse_tokens = 0;
-            request.waiting_hint.total_reuse_tokens = 0;
             return Ok(());
         }
 
@@ -131,8 +129,6 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             self.radix.release_blocks(&prefix_match.block_ids);
             self.kv.release_pages(&prefix_match.block_ids);
             request.phase = RequestPhase::Prefilling { progress: 0 };
-            request.waiting_hint.immediate_reuse_tokens = 0;
-            request.waiting_hint.total_reuse_tokens = 0;
             return Ok(());
         }
 
@@ -158,8 +154,6 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                 self.kv.release_pages(&prefix_match.block_ids);
                 // request.prefill_start_pos stays at 0 (the pre-attach default).
                 request.phase = RequestPhase::Prefilling { progress: 0 };
-                request.waiting_hint.immediate_reuse_tokens = 0;
-                request.waiting_hint.total_reuse_tokens = 0;
                 return Ok(());
             }
         };
@@ -191,8 +185,6 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                 self.radix.release_blocks(&prefix_match.block_ids);
                 self.kv.release_pages(&prefix_match.block_ids);
                 request.phase = RequestPhase::Prefilling { progress: 0 };
-                request.waiting_hint.immediate_reuse_tokens = 0;
-                request.waiting_hint.total_reuse_tokens = 0;
                 return Ok(());
             }
         } else if restored_len < prefix_match.matched_len {
@@ -216,8 +208,6 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
 
         request.prefill_start_pos = restored_len;
         request.reused_prefix_pages = prefix_match.block_ids;
-        request.waiting_hint.immediate_reuse_tokens = request.prefill_start_pos;
-        request.waiting_hint.total_reuse_tokens = request.prefill_start_pos;
         request.phase = if request.prefill_start_pos == request.prompt_len() {
             RequestPhase::Decoding
         } else {

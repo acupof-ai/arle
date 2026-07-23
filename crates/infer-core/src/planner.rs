@@ -236,7 +236,6 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         request.reused_prefix_pages.clear();
         request.prefill_start_pos = 0;
         request.phase = RequestPhase::Prefilling { progress: 0 };
-        request.waiting_hint = crate::WaitingRequestHint::default();
         self.enqueue_waiting_request(request, WaitingInsertBias::AfterEqual);
         true
     }
@@ -325,7 +324,6 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             request.reused_prefix_pages.clear();
             request.prefill_start_pos = 0;
             request.phase = RequestPhase::Prefilling { progress: 0 };
-            request.waiting_hint = crate::WaitingRequestHint::default();
             request
         } else {
             // Preempt-requeue without a slot image = recompute fallback:
