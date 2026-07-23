@@ -199,6 +199,11 @@ pub(crate) fn detect_quant_format(
                 "{name}: W4A16 weight_scale must be rank-2, got {:?}",
                 scale.shape
             );
+            ensure!(
+                scale.shape[1] != 0,
+                "{name}: W4A16 weight_scale second dim is zero, got {:?}",
+                scale.shape
+            );
             let group_size = logical_shape[1] / scale.shape[1];
             ensure!(
                 group_size > 0 && logical_shape[1] % group_size == 0,

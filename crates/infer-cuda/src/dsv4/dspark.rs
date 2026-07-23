@@ -656,18 +656,33 @@ impl Dsv4Model {
                 let elem_size = std::mem::size_of::<half::bf16>();
                 let n_bytes = keep * head_dim * elem_size;
                 let src_off = shift * head_dim * elem_size;
+                // The in-place downward shift overlaps (src = base+src_off,
+                // dst = base) whenever shift < keep, and cuMemcpyDtoDAsync is
+                // memcpy (overlap = UB), not memmove. Bounce through a scratch
+                // buffer: src->scratch then scratch->dst are both non-overlapping,
+                // stream order serializes the two, and one scratch serves every
+                // stage (identical keep/shift/n_bytes).
+                let mut shift_scratch = DeviceVec::zeros(ctx, keep * head_dim)?;
+                let (scratch_base, _gs) = shift_scratch.data.device_ptr_mut(&ctx.stream);
                 for stage_kv in &mut df.latent_kv {
                     let (base, _g) = stage_kv.data.device_ptr_mut(&ctx.stream);
-                    // SAFETY: keep+shift <= live < cap, both ranges in-bounds;
-                    // overlapping shift uses the async memmove path.
+                    // SAFETY: keep+shift <= live < cap, both stage ranges in-bounds;
+                    // scratch is a distinct buffer of exactly n_bytes.
                     unsafe {
                         cudarc::driver::result::memcpy_dtod_async(
-                            base,
+                            scratch_base,
                             base + src_off as u64,
                             n_bytes,
                             ctx.stream.cu_stream(),
                         )
-                        .map_err(|e| anyhow!("DSpark latent shift memcpy failed: {e}"))?;
+                        .map_err(|e| anyhow!("DSpark latent shift src->scratch failed: {e}"))?;
+                        cudarc::driver::result::memcpy_dtod_async(
+                            base,
+                            scratch_base,
+                            n_bytes,
+                            ctx.stream.cu_stream(),
+                        )
+                        .map_err(|e| anyhow!("DSpark latent shift scratch->dst failed: {e}"))?;
                     }
                 }
             }

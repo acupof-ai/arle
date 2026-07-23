@@ -62,11 +62,15 @@ impl Dsv4FlashMlaDecodeShape {
         let compressed_rows = if mode == DeepSeekV4AttentionMode::SlidingWindow {
             0
         } else {
+            // CSA/HCA genuinely compress — a zero ratio there is a config bug.
+            // GLM SparseIndexed doesn't compress (ratio 0): its latent pool spans
+            // the full sequence, so treat ratio as 1 to mirror the page budget in
+            // `dsv4_flashmla_slot_pages` (keeps `total_blocks` == pool pages).
             ensure!(
-                compress_ratio > 0,
+                compress_ratio > 0 || mode == DeepSeekV4AttentionMode::SparseIndexed,
                 "DSv4 FlashMLA compressed decode requires non-zero ratio"
             );
-            max_seq_len.div_ceil(compress_ratio).max(1)
+            max_seq_len.div_ceil(compress_ratio.max(1)).max(1)
         };
         let comp_blocks = compressed_rows.div_ceil(kv_arena.page_block_size);
         let max_compressed_keys = match mode {
