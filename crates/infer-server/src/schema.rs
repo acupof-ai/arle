@@ -123,6 +123,26 @@ impl PromptInput {
     }
 }
 
+/// OpenAI `stop`: a single string OR an array of strings (vLLM/SGLang/OpenAI
+/// all accept both). Normalizes either into `Vec<String>`; absence stays `None`.
+fn deserialize_stop<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StringOrVec {
+        One(String),
+        Many(Vec<String>),
+    }
+    Ok(
+        Option::<StringOrVec>::deserialize(deserializer)?.map(|stop| match stop {
+            StringOrVec::One(one) => vec![one],
+            StringOrVec::Many(many) => many,
+        }),
+    )
+}
+
 /// Minimal `/v1/completions` request body.
 #[derive(Debug, Clone, Deserialize)]
 pub struct CompletionRequest {
@@ -143,6 +163,7 @@ pub struct CompletionRequest {
     pub stream: Option<bool>,
     #[serde(default)]
     pub stream_options: Option<StreamOptions>,
+    #[serde(default, deserialize_with = "deserialize_stop")]
     pub stop: Option<Vec<String>>,
     pub return_token_ids: Option<bool>,
 }
@@ -194,6 +215,7 @@ pub struct ChatCompletionRequest {
     pub stream: Option<bool>,
     #[serde(default)]
     pub stream_options: Option<StreamOptions>,
+    #[serde(default, deserialize_with = "deserialize_stop")]
     pub stop: Option<Vec<String>>,
     /// Pass-through extra arguments for the checkpoint's Jinja chat template
     /// (vLLM / SGLang field name). The HF chat-template render receives these

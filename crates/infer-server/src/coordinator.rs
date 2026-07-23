@@ -53,6 +53,57 @@ pub fn set_messages_dump_dir(dir: impl Into<std::path::PathBuf>) -> std::io::Res
     Ok(())
 }
 
+/// Serialize `value` to JSON and offload the blocking write of `path` to a
+/// `spawn_blocking` task (fire-and-forget; log-and-continue on serialize OR write
+/// error). `what` names the artifact in the warn logs.
+fn spawn_json_dump(path: PathBuf, value: &impl serde::Serialize, what: &str) {
+    let bytes = match serde_json::to_vec(value) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            log::warn!("serialize {what} {} failed: {err}", path.display());
+            return;
+        }
+    };
+    let what = what.to_string(); // owned: the spawn_blocking closure is 'static
+    tokio::task::spawn_blocking(move || {
+        if let Err(err) = std::fs::write(&path, bytes) {
+            log::warn!("write {what} {} failed: {err}", path.display());
+        }
+    });
+}
+
+/// A 5s keep-alive ticker with the immediate first tick already consumed, so each
+/// later `.tick()` marks a real idle interval.
+async fn keepalive_ticker() -> tokio::time::Interval {
+    let mut keepalive = tokio::time::interval(Duration::from_secs(5));
+    keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    keepalive.tick().await; // the first tick fires immediately — consume it
+    keepalive
+}
+
+/// Await the next stream delta, emitting an SSE keep-alive comment on each idle
+/// tick (a long prefill still writes to the socket, and a client disconnect is
+/// seen before the first token). `None` = stream ended or client gone — the
+/// caller stops.
+async fn recv_or_keepalive(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<RelayCompletionDelta>,
+    keepalive: &mut tokio::time::Interval,
+    chunk_tx: &tokio::sync::mpsc::Sender<Result<Vec<u8>, std::convert::Infallible>>,
+) -> Option<RelayCompletionDelta> {
+    loop {
+        tokio::select! {
+            maybe = rx.recv() => return maybe,
+            _ = keepalive.tick() => {
+                // SSE comment: OpenAI clients ignore it; a failed send means the
+                // client is gone.
+                if chunk_tx.send(Ok(b": keep-alive\n\n".to_vec())).await.is_err() {
+                    return None;
+                }
+            }
+        }
+    }
+}
+
 /// Fire-and-forget dump of one `/v1/messages` body (log-and-continue on
 /// error). Returns the dump path so the handler can write its token sidecar.
 fn dump_messages_body(body: &serde_json::Value) -> Option<PathBuf> {
@@ -64,16 +115,8 @@ fn dump_messages_body(body: &serde_json::Value) -> Option<PathBuf> {
         "{epoch_ms}_{}.json",
         seq.fetch_add(1, Ordering::Relaxed)
     ));
-    let result = serde_json::to_vec(body)
-        .map_err(std::io::Error::other)
-        .and_then(|bytes| std::fs::write(&path, bytes));
-    match result {
-        Ok(()) => Some(path),
-        Err(err) => {
-            log::warn!("dump /v1/messages body to {} failed: {err}", path.display());
-            None
-        }
-    }
+    spawn_json_dump(path.clone(), body, "/v1/messages body");
+    Some(path)
 }
 
 /// Request-keyed token truth written beside a `/v1/messages` dump: the exact
@@ -118,12 +161,7 @@ fn write_tokens_sidecar(
         gen_token_ids: generated,
         gen_logprobs,
     };
-    let result = serde_json::to_vec(&sidecar)
-        .map_err(std::io::Error::other)
-        .and_then(|bytes| std::fs::write(&path, bytes));
-    if let Err(err) = result {
-        log::warn!("write tokens sidecar {} failed: {err}", path.display());
-    }
+    spawn_json_dump(path, &sidecar, "tokens sidecar");
 }
 
 /// Cap on ticks broadcast beyond the slowest rank's [`RelayEnvelope::TickAck`].
@@ -666,7 +704,10 @@ async fn completions(
             // `guard` dropped when this task exits, decrementing in_flight + unregistering sink.
             let _guard = guard;
             let mut completion_count = 0usize;
-            while let Some(delta) = rx.recv().await {
+            // Keep-alive pings while generation runs (long prefills emit no tokens),
+            // which also surfaces a client disconnect before the first token.
+            let mut keepalive = keepalive_ticker().await;
+            while let Some(delta) = recv_or_keepalive(&mut rx, &mut keepalive, &chunk_tx).await {
                 if let Some(err) = delta.error {
                     let chunk = serde_json::to_string(&completion_stream_chunk(
                         &id,
@@ -897,7 +938,12 @@ async fn chat_completions(
                 }
                 delta
             };
-            'stream: while let Some(delta) = rx.recv().await {
+            // Keep-alive pings while generation runs (long prefills emit no tokens),
+            // which also surfaces a client disconnect before the first token.
+            let mut keepalive = keepalive_ticker().await;
+            'stream: while let Some(delta) =
+                recv_or_keepalive(&mut rx, &mut keepalive, &chunk_tx).await
+            {
                 if let Some(err) = delta.error {
                     let chunk = serde_json::to_string(&chat_stream_chunk(
                         &id,
@@ -1277,10 +1323,12 @@ async fn metrics(
             .relay
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        (
-            relay.register_stats_awaiter(request_id),
-            relay.send_stats_query(request_id).is_ok(),
-        )
+        let rx = relay.register_stats_awaiter(request_id);
+        let query_ok = relay.send_stats_query(request_id).is_ok();
+        if !query_ok {
+            relay.unregister_stats_awaiter(request_id);
+        }
+        (rx, query_ok)
     };
     let counters = if query_ok {
         tokio::time::timeout(std::time::Duration::from_secs(2), rx)
@@ -1315,6 +1363,9 @@ async fn stats(
         let result = relay
             .send_stats_query(request_id)
             .map_err(|e| ApiError::internal(e.to_string()));
+        if result.is_err() {
+            relay.unregister_stats_awaiter(request_id);
+        }
         (rx, result)
     };
     send_result?;
