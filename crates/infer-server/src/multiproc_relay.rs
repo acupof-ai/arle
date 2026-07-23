@@ -710,14 +710,39 @@ impl PendingRelayCoordinator {
                     stream
                         .set_nonblocking(false)
                         .context("worker stream set_nonblocking(false)")?;
-                    let hello = read_envelope(&mut stream)
-                        .with_context(|| format!("RelayCoordinator read hello from {addr}"))?;
+                    // Bound the hello read by the remaining accept budget: a peer
+                    // that completes the handshake but sends nothing must not wedge
+                    // this single-threaded accept loop. Timeout/short read → drop
+                    // the connection and keep accepting.
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        bail!(
+                            "RelayCoordinator timed out after {accept_timeout:?} waiting for \
+                             worker connects ({}/{expected} so far)",
+                            workers.len()
+                        );
+                    }
+                    stream
+                        .set_read_timeout(Some(remaining))
+                        .context("worker stream set_read_timeout")?;
+                    let hello = match read_envelope(&mut stream) {
+                        Ok(hello) => hello,
+                        Err(err) => {
+                            log::warn!(
+                                "[relay-coordinator] read hello from {addr} failed ({err:#}); dropping connection"
+                            );
+                            continue;
+                        }
+                    };
                     let Some(RelayEnvelope::WorkerHello {
                         rank,
                         world_size: worker_world_size,
                     }) = hello
                     else {
-                        bail!("RelayCoordinator expected worker hello from {addr}");
+                        log::warn!(
+                            "[relay-coordinator] {addr} did not send a worker hello; dropping connection"
+                        );
+                        continue;
                     };
                     if worker_world_size != world_size {
                         bail!(
@@ -992,6 +1017,15 @@ impl RelayCoordinator {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(request_id, tx);
         rx
+    }
+
+    /// Drop a stats awaiter registered by [`Self::register_stats_awaiter`] when
+    /// the query send fails — otherwise the never-answered entry leaks.
+    pub fn unregister_stats_awaiter(&self, request_id: u64) {
+        self.stats_sinks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&request_id);
     }
 
     /// Send a stats query to rank-0 (does NOT broadcast to all ranks).
