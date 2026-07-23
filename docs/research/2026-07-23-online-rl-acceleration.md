@@ -58,19 +58,27 @@ tokens**. Consequences, measured on one H20:
   default-paged path (`reusable_prefix_blocks` → 0), so the near-identical
   preamble re-prefills per turn AND per sample, and its pages cannot be shared.
 
-**The lever**: hybrid prefix reuse (page-radix + recurrent sidecar — the seam
-machinery exists) over the common preamble turns 8×31K into ~1×31K + deltas:
-kills both the prefill wall and the KV ceiling at once. This dwarfs every other
-rollout lever in this doc and gates the mega-rollout (Tier 0) besides — at C=8
-today the pool cannot even hold the prompts. Until it lands: `SAMPLES=4` fits
-the pool (4×31K + headroom).
+**The levers, in cost order** (2026-07-24 update — the 31K source is found):
 
-### Tier 0 — one measurement unlocks the biggest lever
+1. **Stage CC workdirs outside the repo (config-only, do first).** The dumps
+   show `claude -p` walks up from the task workdir (under `/host/arle-build`)
+   and ingests the repo `CLAUDE.md` agent contract — that IS most of the 31K.
+   Staging sandboxes outside any repo with a `CLAUDE.md` cuts the per-request
+   prompt to the task's own few K. Turn 1 measured 178–245 s vs 21–80 s for
+   turns 2–4 — dominated by exactly this prefill.
+2. **Hybrid prefix reuse** (page-radix + recurrent sidecar — seam machinery
+   exists; `reusable_prefix_blocks` → 0 today) shares whatever preamble
+   remains across turns and samples: kills the residual re-prefill wall and
+   the KV ceiling (8×prompt → 1×prompt + deltas). Until either lands:
+   `SAMPLES=4` fits the 250K pool.
 
-**Measure the GPU-active fraction inside the 40.4% rollout wall.** 8764 ms/call for
-only ≤2560 gen tokens, plus DSpark's low 1.41× effective (vs serial 1.9×), both
-**hint** rollout is agent-latency-bound (GPU idle between multi-turn
-tool-exec/pytest/HTTP gaps), not GPU-bound. If true:
+### Tier 0 — RESOLVED 2026-07-24: gpu_busy_frac 0.30–0.34 → GO
+
+Measured on a healthy hard-gated run (busytimer-s4, 1×H20, SPEC=off SAMPLES=4;
+[wins](../experience/wins/2026-07-24-agent-opd-gpu-busy-frac-measured-go.md)):
+the GPU forwards ~135 s of each ~410 s group — **~2/3 of the rollout wall is
+idle** on CC-side latency. Doubling concurrency 4→8 held busy-frac flat (0.29),
+so occupancy has headroom for many more overlapped groups.
 
 > **Collapse the 4 serial group-rollouts into one `num_slots=8` concurrent
 > mega-rollout** (`train_cli.rs:3396` inner loop + `:3026` num_slots). The
@@ -78,11 +86,10 @@ tool-exec/pytest/HTTP gaps), not GPU-bound. If true:
 > starved at C≤2 (K=2 concurrent `claude` sessions). Upper bound: 4× serial →
 > ~1× concurrent on the GPU-active portion.
 
-Gated (SOLID): no code until the GPU-idle-within-rollout number is known — but
-that number is **derivable from telemetry already emitted**, not a new profiler
-(see Action queue #2). The A/B must clear reward/loss parity (concurrent rollout =
-staleness drift), not just wall. If already bandwidth-saturated at B≈K, sublinear
-MoE caps it.
+Now unblocked to build. Prerequisites in place: KV exhaustion parks instead of
+killing the engine (`a9d0c5412`), and the prompt-side levers above shrink the
+per-session KV footprint the mega-rollout multiplies. The A/B must clear
+reward/loss parity (concurrent rollout = staleness drift), not just wall.
 
 ### Tier 1 — cheap, safe, attacks measured waste (highest ROI)
 
