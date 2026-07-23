@@ -1,0 +1,21 @@
+crates/infer-server/src/lib.rs
+  s_3bfdcf8fceb2d5::t_1e0e0d905fc3ae 1191-1264
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "e4ac039dc9ea67b754750d13efaa0d97775dd87c",
+  "prompts": {},
+  "sessions": {
+    "s_3bfdcf8fceb2d5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "62ec01f2-d7cd-44c5-b546-2e6a64756530",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
