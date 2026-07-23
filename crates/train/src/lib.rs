@@ -24,8 +24,6 @@ pub mod checkpoint;
 pub mod control;
 #[path = "ema_self_teacher.rs"]
 pub mod ema_self_teacher;
-#[path = "grad_accum.rs"]
-pub mod grad_accum;
 #[path = "grad_clip.rs"]
 pub mod grad_clip;
 #[path = "infer_student.rs"]
@@ -40,8 +38,6 @@ pub mod loss;
 pub mod metrics;
 #[path = "model_family.rs"]
 pub mod model_family;
-#[path = "moe.rs"]
-pub mod moe;
 #[path = "opd.rs"]
 pub mod opd;
 #[path = "prompts.rs"]
@@ -82,10 +78,6 @@ pub mod trajectory_scorer;
 pub mod update_strategy;
 
 pub use causal_lm::CausalLm;
-pub use grad_accum::GradAccumulator;
 pub use lora::{LinearWithLora, LoraAdapterConfig, LoraConfig, LoraTargetSet};
 pub use metrics::*;
-pub use moe::{MoeConfig, MoeWithLora};
-pub use trainer::{
-    EvalOutcome, StepCtx, StepOutcome, Trainer, TrainerConfig, cleanup_after_backward,
-};
+pub use trainer::cleanup_after_backward;
