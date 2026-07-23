@@ -43,6 +43,28 @@ pytest). **The GPU-stage-overlap ceiling on this box is that 3.5–18%, not a 2�
 
 ## Ranked levers (ARLE-specific)
 
+### New top lever (2026-07-23 pod case-facts): share the ~31K CC-preamble prefix
+
+Decoded sidecars from the busytimer-fixed run inverted the workload model:
+every CC request carries a **30.9–31.1K-token prompt** (claude-CLI system
+prompt + tool schemas + conversation) and generates only **12–96 coherent
+tokens**. Consequences, measured on one H20:
+
+- **Wall-clock**: ~150–300 s per turn is 31K prefill (chunked at 4096 —
+  `--chunked-prefill-size 22000` clamps, `loaded.rs:2095`), not generation.
+- **KV**: 8 concurrent sessions × 31K ≈ 248K ≈ the 250K-token pool →
+  exhaustion (engine death pre-a9d0c5412; parks after).
+- **Root cause**: Qwen3.6 hybrid has prefix reuse structurally OFF on the CUDA
+  default-paged path (`reusable_prefix_blocks` → 0), so the near-identical
+  preamble re-prefills per turn AND per sample, and its pages cannot be shared.
+
+**The lever**: hybrid prefix reuse (page-radix + recurrent sidecar — the seam
+machinery exists) over the common preamble turns 8×31K into ~1×31K + deltas:
+kills both the prefill wall and the KV ceiling at once. This dwarfs every other
+rollout lever in this doc and gates the mega-rollout (Tier 0) besides — at C=8
+today the pool cannot even hold the prompts. Until it lands: `SAMPLES=4` fits
+the pool (4×31K + headroom).
+
 ### Tier 0 — one measurement unlocks the biggest lever
 
 **Measure the GPU-active fraction inside the 40.4% rollout wall.** 8764 ms/call for

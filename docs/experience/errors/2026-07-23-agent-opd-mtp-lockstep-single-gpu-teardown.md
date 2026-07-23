@@ -37,12 +37,19 @@ download` is removed in current `huggingface_hub`; fixed to `hf download`.
   engine-touching work (submit / cancel / stats). Acks are liveness, not
   admission. Regression gate:
   `infer_server::tests::relay_driver_acks_ticks_while_engine_is_wedged`.
-- **Open:** why the engine step exceeded 120 s on the pod (first-touch JIT
-  warmup vs a real hang). The fixed serve survives either; the rerun
-  discriminates: slow-then-recovers = JIT, requests hanging to the CC 600 s
-  timeout = engine hang (then debug the engine, not the relay).
+- **Resolved by the rerun (busytimer-fixed, HEAD 55684cc66):** the long engine
+  step was neither JIT nor a hang — the serve survived, decoded real turns,
+  then died on **device KV-pool exhaustion, fatal at submit**
+  (`TokenKVPool: out of pages`, `execution.rs:310`): 8 concurrent CC sessions
+  × ~31K-token **prompts** (decoded sidecars: generations are 12–96 tokens,
+  coherent; the 31K is the CC harness preamble) ≈ 248K ≈ the 250K pool.
+  **Landed (a9d0c5412):** seam hook `kv_device_free_pages()` + a device-budget
+  gate in `allocate_for_plan` — device exhaustion now sheds/parks (#162/#164
+  path) instead of killing the engine thread. Gate:
+  `infer_core::tests::device_pool_exhaustion_degrades_instead_of_fatal`.
 - **Not implicated:** the TP≥2 lockstep path (`serve_multiproc.rs` workers ack
-  after each engine step; pacing there is intentional and untouched).
+  after each engine step; pacing there is intentional and untouched); #48
+  FP8-temp>0 (decoded generations are clean at temp=1.0).
 
 ## Rule
 
