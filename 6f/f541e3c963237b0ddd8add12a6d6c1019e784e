@@ -1,0 +1,25 @@
+CHANGELOG.md
+  s_9c91b86ec3fb55::t_f5103e14243497 26-44
+crates/train/src/qwen35.rs
+  s_9c91b86ec3fb55::t_e83fc651d477ec 2562-2570,2581,2585
+docs/experience/errors/2026-07-24-batched-checkpoint-la-backward-crash-and-gate-overfire.md
+  s_9c91b86ec3fb55::t_bbd2ea82798dbc 1-54
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "6ff541e3c963237b0ddd8add12a6d6c1019e784e",
+  "prompts": {},
+  "sessions": {
+    "s_9c91b86ec3fb55": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4779911a-69b7-49db-bc83-daf5a48d6ca3",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
