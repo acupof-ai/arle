@@ -2,7 +2,7 @@ use std::{path::Path, str::FromStr};
 
 use thiserror::Error;
 
-use crate::qwen35::{LayerType, Qwen35Config};
+use crate::qwen35::Qwen35Config;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelFamily {
@@ -28,12 +28,6 @@ pub enum ModelFamilyError {
     Custom(String),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Qwen35AttentionPattern {
-    Dense,
-    Hybrid { linear_attn_every: usize },
-}
-
 pub fn resolve_model_family(
     config_path: &Path,
     requested: ModelFamily,
@@ -50,120 +44,5 @@ pub fn resolve_model_family(
             }
         }
         family => Ok(family),
-    }
-}
-
-pub fn synthetic_qwen35_config(seq: usize, pattern: Qwen35AttentionPattern) -> Qwen35Config {
-    let mut cfg = Qwen35Config {
-        hidden_size: 64,
-        intermediate_size: 128,
-        num_hidden_layers: 2,
-        vocab_size: 256,
-        rms_norm_eps: 1.0e-6,
-        stop_token_ids: vec![255],
-        bos_token_id: Some(1),
-        eos_token_id: 255,
-        tie_word_embeddings: false,
-        num_attention_heads: 4,
-        num_key_value_heads: 4,
-        head_dim: 16,
-        linear_num_key_heads: 4,
-        linear_key_head_dim: 16,
-        linear_num_value_heads: 4,
-        linear_value_head_dim: 16,
-        linear_conv_kernel_dim: 4,
-        rope_theta: 1_000_000.0,
-        rope_scaling: None,
-        partial_rotary_factor: 1.0,
-        rotary_dim: 16,
-        rope_cache_len_hint: Some(seq),
-        layer_types: vec![LayerType::FullAttention; 2],
-        num_experts: 0,
-        num_experts_per_tok: 0,
-        decoder_sparse_step: 1,
-        moe_intermediate_size: 0,
-        shared_expert_intermediate_size: 0,
-        norm_topk_prob: true,
-        mlp_only_layers: Vec::new(),
-        full_attn_gated: true,
-    };
-    apply_qwen35_attention_pattern(&mut cfg, pattern)
-        .expect("synthetic_qwen35_config must satisfy the qwen3.5 scratch contract");
-    cfg
-}
-
-pub fn synthetic_qwen35_dense_config(seq: usize) -> Qwen35Config {
-    synthetic_qwen35_config(seq, Qwen35AttentionPattern::Dense)
-}
-
-pub fn synthetic_qwen35_hybrid_config(seq: usize) -> Qwen35Config {
-    synthetic_qwen35_config(
-        seq,
-        Qwen35AttentionPattern::Hybrid {
-            linear_attn_every: 2,
-        },
-    )
-}
-
-pub fn apply_qwen35_attention_pattern(
-    cfg: &mut Qwen35Config,
-    pattern: Qwen35AttentionPattern,
-) -> Result<(), ModelFamilyError> {
-    match pattern {
-        Qwen35AttentionPattern::Dense => {
-            cfg.layer_types = vec![LayerType::FullAttention; cfg.num_hidden_layers];
-            cfg.partial_rotary_factor = 1.0;
-            cfg.rotary_dim = cfg.head_dim;
-            cfg.linear_num_key_heads = cfg.num_attention_heads;
-            cfg.linear_key_head_dim = cfg.head_dim;
-            cfg.linear_num_value_heads = cfg.num_attention_heads;
-            cfg.linear_value_head_dim = cfg.head_dim;
-        }
-        Qwen35AttentionPattern::Hybrid { linear_attn_every } => {
-            if linear_attn_every == 0 {
-                return Err(ModelFamilyError::Custom(
-                    "hybrid qwen3.5 pattern requires linear_attn_every > 0".into(),
-                ));
-            }
-            let rotary_dim = hybrid_rotary_dim(cfg.head_dim);
-            let layer_types = (0..cfg.num_hidden_layers)
-                .map(|layer_idx| {
-                    if (layer_idx + 1) % linear_attn_every == 0 {
-                        LayerType::LinearAttention
-                    } else {
-                        LayerType::FullAttention
-                    }
-                })
-                .collect::<Vec<_>>();
-            if !layer_types.contains(&LayerType::LinearAttention) {
-                return Err(ModelFamilyError::Custom(format!(
-                    "hybrid qwen3.5 pattern linear_attn_every={} produces no linear-attention layers for {} layers",
-                    linear_attn_every, cfg.num_hidden_layers
-                )));
-            }
-            cfg.layer_types = layer_types;
-            cfg.rotary_dim = rotary_dim;
-            cfg.partial_rotary_factor = rotary_dim as f32 / cfg.head_dim as f32;
-            cfg.linear_num_key_heads = cfg.num_attention_heads;
-            cfg.linear_key_head_dim = rotary_dim;
-            cfg.linear_num_value_heads = cfg.num_attention_heads;
-            cfg.linear_value_head_dim = rotary_dim;
-            cfg.linear_conv_kernel_dim = cfg.linear_conv_kernel_dim.max(4);
-        }
-    }
-    cfg.validate_train_scratch_contract()
-        .map_err(|err| ModelFamilyError::Custom(err.to_string()))
-}
-
-fn hybrid_rotary_dim(head_dim: usize) -> usize {
-    let half = head_dim / 2;
-    if half >= 2 {
-        if half.is_multiple_of(2) {
-            half
-        } else {
-            (half + 1).min(head_dim)
-        }
-    } else {
-        head_dim
     }
 }

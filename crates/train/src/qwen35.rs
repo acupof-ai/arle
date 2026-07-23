@@ -17,7 +17,6 @@ use autograd::{
         slice, transpose,
     },
 };
-use half::bf16;
 pub use qwen35_spec::{LayerType, Qwen35Config, Qwen35ConfigError};
 use qwen35_spec::{Qwen35AttentionTensorNames, Qwen35MoeTensorNames};
 use thiserror::Error;
@@ -496,18 +495,6 @@ pub struct Qwen35MoeRouteSignature {
 }
 
 #[doc(hidden)]
-#[derive(Debug, Clone, Copy)]
-pub struct Qwen35TrainParityStages {
-    pub embedding: TensorId,
-    pub layer0_rmsnorm: TensorId,
-    pub layer0_attention: TensorId,
-    pub layer0_ffn: TensorId,
-    pub layer0_residual: TensorId,
-    pub final_rmsnorm: TensorId,
-    pub lm_head: TensorId,
-}
-
-#[doc(hidden)]
 pub fn forward_rollout_cached(
     model: &Qwen35Model,
     store: &mut TensorStore,
@@ -581,19 +568,6 @@ fn qwen35_rmsnorm(
     )?);
     let offset_weight = add(weight, ones, store, tape)?;
     Ok(rmsnorm(x, offset_weight, eps, store, tape)?)
-}
-
-fn qwen35_parity_bf16_round(id: TensorId, store: &mut TensorStore) -> Result<TensorId> {
-    let (shape, requires_grad) = {
-        let tensor = store.get(id).ok_or(AutogradError::InvalidTensorId(id))?;
-        (tensor.shape.clone(), tensor.requires_grad)
-    };
-    let rounded: Vec<f32> = store
-        .to_host(id)?
-        .into_iter()
-        .map(|value| bf16::from_f32(value).to_f32())
-        .collect();
-    Ok(store.alloc(Tensor::new(rounded, shape, requires_grad)?))
 }
 
 impl Qwen35Layer {
@@ -2634,137 +2608,6 @@ impl Qwen35Model {
             ));
         }
         Ok(())
-    }
-
-    #[doc(hidden)]
-    pub fn forward_single_token_parity_stages(
-        &self,
-        store: &mut TensorStore,
-        tape: &mut Tape,
-        token_id: u32,
-        position_id: u32,
-    ) -> Result<Qwen35TrainParityStages> {
-        if tape.enabled {
-            return Err(Qwen35Error::InvalidConfig(
-                "parity diagnostics require tape disabled",
-            ));
-        }
-        if self.tp.is_enabled() {
-            return Err(Qwen35Error::InvalidConfig(
-                "parity diagnostics require a non-tensor-parallel model",
-            ));
-        }
-        if self.layers.is_empty() {
-            return Err(Qwen35Error::InvalidConfig(
-                "parity diagnostics require at least one layer",
-            ));
-        }
-        let position = position_id as usize;
-        let max_seq_len = self
-            .config
-            .rope_cache_len_hint
-            .ok_or(Qwen35Error::InvalidConfig(
-                "train-side qwen3.5 requires rope_cache_len_hint",
-            ))?;
-        if position >= max_seq_len {
-            return Err(Qwen35Error::PositionOutOfBounds {
-                position,
-                upper: max_seq_len,
-            });
-        }
-
-        let cos = select_cache_rows(self.cos_cache, &[position], store)?;
-        let sin = select_cache_rows(self.sin_cache, &[position], store)?;
-        let batch = 1;
-        let seq_len = 1;
-        let token_indices = [token_id as usize];
-        let hidden0 = embedding(self.embed_tokens, &token_indices, store, tape)?;
-        let hidden0 = reshape(
-            hidden0,
-            &[batch, seq_len, self.config.hidden_size],
-            store,
-            tape,
-        )?;
-        let hidden0 = qwen35_parity_bf16_round(hidden0, store)?;
-
-        let layer0 = &self.layers[0];
-        let layer0_norm = qwen35_rmsnorm(
-            hidden0,
-            layer0.input_layernorm,
-            self.config.rms_norm_eps,
-            store,
-            tape,
-        )?;
-        let layer0_norm = qwen35_parity_bf16_round(layer0_norm, store)?;
-        let layer0_attention = match &layer0.self_attn {
-            Qwen35Attention::Full(attn) => layer0.forward_full_attention(
-                layer0_norm,
-                attn,
-                &self.config,
-                self.tp,
-                cos,
-                sin,
-                batch,
-                seq_len,
-                store,
-                tape,
-            )?,
-            Qwen35Attention::Linear(attn) => layer0.forward_linear_attention(
-                layer0_norm,
-                attn,
-                &self.config,
-                batch,
-                seq_len,
-                store,
-                tape,
-            )?,
-        };
-        let layer0_attention = qwen35_parity_bf16_round(layer0_attention, store)?;
-        let hidden_plus_attn = add(hidden0, layer0_attention, store, tape)?;
-        let hidden_plus_attn = qwen35_parity_bf16_round(hidden_plus_attn, store)?;
-        let post_attention_norm = qwen35_rmsnorm(
-            hidden_plus_attn,
-            layer0.post_attention_layernorm,
-            self.config.rms_norm_eps,
-            store,
-            tape,
-        )?;
-        let post_attention_norm = qwen35_parity_bf16_round(post_attention_norm, store)?;
-        let layer0_ffn = layer0.forward_mlp(
-            post_attention_norm,
-            &self.config,
-            self.tp,
-            batch,
-            seq_len,
-            store,
-            tape,
-        )?;
-        let layer0_ffn = qwen35_parity_bf16_round(layer0_ffn, store)?;
-        let layer0_residual = add(hidden_plus_attn, layer0_ffn, store, tape)?;
-        let layer0_residual = qwen35_parity_bf16_round(layer0_residual, store)?;
-
-        let mut hidden = layer0_residual;
-        for layer in self.layers.iter().skip(1) {
-            hidden = layer.forward(hidden, &self.config, self.tp, cos, sin, store, tape)?;
-        }
-        let final_rmsnorm = qwen35_rmsnorm(
-            hidden,
-            self.final_norm,
-            self.config.rms_norm_eps,
-            store,
-            tape,
-        )?;
-        let lm_head = linear_forward(final_rmsnorm, self.lm_head, store, tape)?;
-
-        Ok(Qwen35TrainParityStages {
-            embedding: hidden0,
-            layer0_rmsnorm: layer0_norm,
-            layer0_attention,
-            layer0_ffn,
-            layer0_residual,
-            final_rmsnorm,
-            lm_head,
-        })
     }
 
     pub fn new_for_eval(cfg: &Qwen35Config, store: &mut TensorStore) -> Result<Self> {
