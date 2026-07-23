@@ -151,7 +151,8 @@ pub struct ThroughputStats {
 static ENGINE_FORWARD_BUSY_MICROS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// Snapshot [`ENGINE_FORWARD_BUSY_MICROS`] — the running forward-busy micros.
+/// Snapshot the running forward-busy micros (submit→ready wall, summed over
+/// `Engine` steps); the delta over a window is that engine's GPU-busy time.
 #[must_use]
 pub fn engine_forward_busy_micros() -> u64 {
     ENGINE_FORWARD_BUSY_MICROS.load(std::sync::atomic::Ordering::Relaxed)
@@ -385,7 +386,7 @@ pub struct Engine<E: BackendExecutor, K: KvPool> {
     completed: BTreeMap<RequestHandle, CompletedRequest>,
     inflight: Option<E::Inflight>,
     /// Wall clock captured just before the in-flight forward's `submit`, consumed
-    /// when its `poll` returns Ready to accrue [`ThroughputStats::busy_micros`].
+    /// when its `poll` returns Ready to accrue [`ENGINE_FORWARD_BUSY_MICROS`].
     inflight_submit_at: Option<std::time::Instant>,
     /// Plan submitted with `inflight`, kept so `apply_output` can advance chunked
     /// prefill progress and resolve which rows produced tokens.
