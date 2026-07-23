@@ -1,0 +1,41 @@
+crates/train/src/metrics.rs
+  s_7f8fc09c6bac03::t_abe5828d312680 29-31,685-689
+crates/train/src/qwen35_checkpoint.rs
+  s_f8dab6879bf4d7::t_a42c082232ee5b 163-165,177,179,181-192,194
+crates/train/src/update_strategy.rs
+  s_1908bf45a711d5::t_94ca5dfda96e0a 362-364,367,640-646,651,653-657,676,696,698-699,701-706
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "74b988b8b17b4ba63f5426ff966be3b500ecc01c",
+  "prompts": {},
+  "sessions": {
+    "s_1908bf45a711d5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ab07994935f99908c",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_7f8fc09c6bac03": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a65dbebdbed041947",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_f8dab6879bf4d7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a858fbc239e343fe7",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
