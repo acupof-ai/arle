@@ -2099,6 +2099,7 @@ fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
                         opt_ref,
                         chunk,
                         vocab,
+                        args.writeback_window,
                         store_ref,
                     )
                     .map_err(anyhow::Error::from)

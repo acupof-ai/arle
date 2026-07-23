@@ -2727,11 +2727,6 @@ pub fn opd_step<O: Optimizer>(
     )
 }
 
-/// Positions per fused-CE chunk in the batched rubric writeback; bounds the
-/// transient `[chunk, vocab]` logits tile (≈ chunk·vocab·4 B), the same role the
-/// single-trajectory path's `window_size` plays. 512 → ≈0.3 GB at vocab≈152 K.
-const RUBRIC_WRITEBACK_CHUNK_ROWS: usize = 512;
-
 /// Batched rubric-OPD writeback: one forward+backward over B accepted `(prompt,
 /// completion)` pairs (padded to a common length), completion-masked CE. The 27B
 /// CE is overhead-bound (host op-dispatch, GPU ~0% util), so batching amortizes
@@ -2742,6 +2737,8 @@ const RUBRIC_WRITEBACK_CHUNK_ROWS: usize = 512;
 /// `[B, seq, vocab]` logits tile is never materialized (was ~24 GB at B=4 / 10K-tok
 /// completions). Grad-checkpoints offload to host past the length that needs it
 /// (`writeback_offload_for_seq`), mirroring the single-trajectory writeback.
+/// `chunk_rows` bounds the transient `[chunk, vocab]` tile — same knob as the
+/// single-trajectory path's `window_size` (`--writeback-window`).
 #[allow(clippy::too_many_arguments)]
 pub fn rubric_writeback_ce_step_batched<O: Optimizer>(
     student: &Qwen35Model,
@@ -2750,6 +2747,7 @@ pub fn rubric_writeback_ce_step_batched<O: Optimizer>(
     optimizer: &mut O,
     batch: &[(Vec<u32>, Vec<u32>)],
     vocab: usize,
+    chunk_rows: usize,
     store: &mut TensorStore,
 ) -> Result<f32> {
     if batch.is_empty() {
@@ -2758,21 +2756,24 @@ pub fn rubric_writeback_ce_step_batched<O: Optimizer>(
         ));
     }
     let mut max_len = 0usize;
-    for (prompt, completion) in batch {
+    for (i, (prompt, completion)) in batch.iter().enumerate() {
         if prompt.is_empty() || completion.is_empty() {
             return Err(OpdError::InvalidInput(
                 "rubric batched writeback: empty prompt or completion in batch".to_owned(),
             ));
         }
+        validate_token_ids(
+            &format!("rubric batched writeback row {i} completion"),
+            completion,
+            vocab,
+        )?;
         max_len = max_len.max(prompt.len() + completion.len());
     }
     let b = batch.len();
 
     let mut tape = Tape::new();
-    // Offload per-layer grad-checkpoints to host past the length that needs it —
-    // the batched forward spans b*max_len tokens. Mirrors the single-trajectory
-    // masked writeback, which the batched path previously omitted (checkpoints
-    // stayed resident regardless of length).
+    // The batched forward spans b*max_len tokens — offload grad-checkpoints past
+    // the length that needs it.
     tape.set_offload_checkpoints(crate::runtime_flags::writeback_offload_for_seq(b * max_len));
 
     // Flat [B * max_len] input, each row = prompt ++ completion ++ pad(0). Causal
@@ -2791,9 +2792,6 @@ pub fn rubric_writeback_ce_step_batched<O: Optimizer>(
                 ))
         })
         .collect();
-    // Forward to post-final-norm hidden [B, max_len, hidden], NOT logits: the fused
-    // chunked CE below projects only the masked completion positions through
-    // lm_head, so the dense [B, max_len, vocab] tile is never materialized.
     let hidden = student
         .forward_batch_hidden(&flat, b, max_len, store, &mut tape)
         .map_err(OpdError::from)?;
@@ -2807,23 +2805,16 @@ pub fn rubric_writeback_ce_step_batched<O: Optimizer>(
     let mut total: Option<TensorId> = None;
     for (i, (prompt, completion)) in batch.iter().enumerate() {
         let row_base = i * max_len + (prompt.len() - 1);
-        let mut position_indices: Vec<i32> = Vec::with_capacity(completion.len());
-        let mut target_tokens: Vec<i32> = Vec::with_capacity(completion.len());
-        for (j, &target) in completion.iter().enumerate() {
-            if target as usize >= vocab {
-                return Err(OpdError::InvalidInput(format!(
-                    "rubric batched writeback: target token {target} in row {i} exceeds vocab={vocab}"
-                )));
-            }
-            position_indices.push((row_base + j) as i32);
-            target_tokens.push(target as i32);
-        }
+        let position_indices: Vec<i32> = (row_base..row_base + completion.len())
+            .map(|p| p as i32)
+            .collect();
+        let target_tokens: Vec<i32> = completion.iter().map(|&t| t as i32).collect();
         let ce = fused_linear_ce_loss_indexed(
             hidden,
             student.lm_head_weight_id(),
             &position_indices,
             &target_tokens,
-            RUBRIC_WRITEBACK_CHUNK_ROWS,
+            chunk_rows,
             store,
             &mut tape,
         )

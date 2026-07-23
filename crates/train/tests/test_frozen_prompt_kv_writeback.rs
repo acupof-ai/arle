@@ -607,6 +607,7 @@ fn rubric_batched_writeback_matches_per_row_masked_writeback() {
         &mut optimizer,
         &rows,
         vocab,
+        64,
         &mut store,
     )
     .expect("batched writeback");
