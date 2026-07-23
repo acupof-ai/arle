@@ -33,6 +33,19 @@ progress spine).
   stride, SFB load-time transpose). Opt-in on sm_120 targets only; Hopper path
   byte-unchanged. [wins](docs/experience/wins/2026-07-22-bench-sm120-fp8-moe-cutlass-grouped.md).
 
+### Removed (dead surface — `crates/train`, 2026-07-23)
+
+- **train-crate systematic simplification, −4,134 LOC.** Deleted pivot-orphaned
+  dead code and collapsed four single-impl traits, behavior-preserving (238 tests
+  green, clippy clean, `arle train {opd,self-opd} --smoke` end-to-end). Removed
+  `pub` surfaces: the generic `Trainer<O,C,S>` subsystem (`Trainer`/`TrainerConfig`/
+  `StepCtx`/`StepOutcome`/`EvalOutcome`/`GradAccumulator`/`GradClip` trait), the
+  stale `MoeWithLora`, and the `SequenceWindowedForward`/`TrajectoryScorer`/
+  `TeacherWindowedForward`/`CausalLm` traits (folded into inherent/concrete forms).
+  All had zero production callers; live free helpers (`cleanup_after_backward`,
+  `clip_grad_norm`, …) retained. Bench-exempt: host-side OPD-training, no serving
+  perf surface. [wins](docs/experience/wins/2026-07-23-train-crate-systematic-simplification.md).
+
 ## [0.4.0] - 2026-07-22
 
 Headline: **DSv4 production hardening** (prefill chunk 2048 default, FP32
