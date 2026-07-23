@@ -5946,9 +5946,9 @@ mod tests {
                 );
                 saw_suffix_adapter_site |= site.contains(".layers.1.") && site.ends_with(".lora_b");
             }
-            for input_id in entry.input_ids.iter().copied() {
-                if prefix_param_ids.contains(&input_id) {
-                    let name = prefix_params.get(&input_id).copied().unwrap_or("<unknown>");
+            for input_id in &entry.input_ids {
+                if prefix_param_ids.contains(input_id) {
+                    let name = prefix_params.get(input_id).copied().unwrap_or("<unknown>");
                     prefix_refs.push((entry.op.name(), name));
                 }
             }
