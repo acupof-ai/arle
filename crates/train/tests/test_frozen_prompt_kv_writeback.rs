@@ -19,7 +19,7 @@ use train::{
     lora::{LoraConfig, LoraTargetSet},
     opd::{
         capture_rollout_logprobs, masked_writeback_ce_step,
-        masked_writeback_ce_step_frozen_prompt_kv,
+        masked_writeback_ce_step_frozen_prompt_kv, rubric_writeback_ce_step_batched,
     },
     qwen35::{LayerType, Qwen35Config, Qwen35Model},
 };
@@ -545,5 +545,78 @@ fn frozen_prompt_kv_checkpoint_branch_matches_full() {
     assert!(
         hidden_max_diff <= 1.0e-5,
         "checkpoint-branch gen-segment hidden diff {hidden_max_diff:.3e} exceeds 1e-5"
+    );
+}
+
+/// Batched rubric writeback equivalence (reuses this file's tiny-model harness).
+///
+/// The batched CE path (forward→hidden, per-row fused indexed CE over `lm_head`,
+/// mean-of-row-means) must equal running the single-trajectory masked writeback
+/// per row (mask all-1s ⇒ every completion token a target) and averaging,
+/// against the proven `masked_writeback_ce_step` reference — so the dense-logits →
+/// fused-hidden rewrite is a pure VRAM change, not a loss-semantics change. Pins:
+///
+/// - the flat row-stride indexing (row i occupies hidden rows `[i*max_len ..]`);
+/// - the mean-of-row-means reduction under UNEQUAL completion lengths (equal
+///   lengths would hide a stride/reduction/off-by-one bug).
+#[test]
+fn rubric_batched_writeback_matches_per_row_masked_writeback() {
+    // Fresh (deterministic-init) model per call — the reported loss is at init θ,
+    // before that step's own optimizer update, so identical inits are comparable.
+    let masked_row_loss = |prompt: &[u32], completion: &[u32]| -> f32 {
+        let mut store = TensorStore::default();
+        let student = build_student(&mut store);
+        let all_params = student.all_parameter_ids();
+        let trainable = trainable_ids(&store, &student);
+        let mut optimizer = AdamW::new(1.0e-3, (0.9, 0.999), 1.0e-8, 0.0);
+        let vocab = student.config().vocab_size;
+        let mask = vec![1u8; completion.len()];
+        masked_writeback_ce_step(
+            &student,
+            &all_params,
+            &trainable,
+            &mut optimizer,
+            prompt,
+            completion,
+            &mask,
+            vocab,
+            64,
+            &mut store,
+        )
+        .expect("masked writeback row")
+    };
+
+    // Two rows, UNEQUAL completion lengths.
+    let rows: Vec<(Vec<u32>, Vec<u32>)> = vec![
+        (vec![1, 3, 8, 2, 7], vec![6, 10, 11, 12, 13, 14]),
+        (vec![1, 9, 4], vec![5, 2, 8]),
+    ];
+    let per_row: Vec<f32> = rows.iter().map(|(p, c)| masked_row_loss(p, c)).collect();
+    let expected = per_row.iter().sum::<f32>() / per_row.len() as f32;
+
+    let mut store = TensorStore::default();
+    let student = build_student(&mut store);
+    let all_params = student.all_parameter_ids();
+    let trainable = trainable_ids(&store, &student);
+    let mut optimizer = AdamW::new(1.0e-3, (0.9, 0.999), 1.0e-8, 0.0);
+    let vocab = student.config().vocab_size;
+    let batched = rubric_writeback_ce_step_batched(
+        &student,
+        &all_params,
+        &trainable,
+        &mut optimizer,
+        &rows,
+        vocab,
+        &mut store,
+    )
+    .expect("batched writeback");
+
+    let diff = (batched - expected).abs();
+    println!(
+        "[gate-batched] per_row={per_row:?} expected_mean={expected:.8} batched={batched:.8} diff={diff:.3e}"
+    );
+    assert!(
+        diff <= 1.0e-5,
+        "batched writeback loss {batched:.8} != mean-of-row-means {expected:.8} (diff {diff:.3e})"
     );
 }
