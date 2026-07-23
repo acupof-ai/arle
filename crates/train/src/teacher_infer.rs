@@ -98,17 +98,6 @@ pub trait TeacherForward {
     }
 }
 
-pub trait TeacherWindowedForward: TeacherForward {
-    fn forward_logits_window_device(
-        &self,
-        input_ids: &[u32],
-        positions: &[u32],
-        window: SequenceWindow,
-        store: &mut TensorStore,
-        tape: &mut Tape,
-    ) -> Result<DeviceLogits>;
-}
-
 pub struct TeacherEntry<'a> {
     id: String,
     teacher: &'a dyn TeacherForward,
@@ -627,29 +616,6 @@ impl TeacherForward for InProcessTeacher<'_> {
         store: &mut TensorStore,
         tape: &mut Tape,
     ) -> Result<DeviceLogits> {
-        <Self as TeacherWindowedForward>::forward_logits_window_device(
-            self, input_ids, positions, window, store, tape,
-        )
-    }
-
-    fn vocab_size(&self) -> usize {
-        self.model.config().vocab_size
-    }
-
-    fn parameter_ids(&self) -> &[TensorId] {
-        &self.parameter_ids
-    }
-}
-
-impl TeacherWindowedForward for InProcessTeacher<'_> {
-    fn forward_logits_window_device(
-        &self,
-        input_ids: &[u32],
-        positions: &[u32],
-        window: SequenceWindow,
-        store: &mut TensorStore,
-        tape: &mut Tape,
-    ) -> Result<DeviceLogits> {
         let tensor_id = self
             .model
             .forward_logits_window(store, tape, input_ids, positions, window)?;
@@ -660,6 +626,14 @@ impl TeacherWindowedForward for InProcessTeacher<'_> {
             .shape
             .clone();
         Ok(DeviceLogits { tensor_id, shape })
+    }
+
+    fn vocab_size(&self) -> usize {
+        self.model.config().vocab_size
+    }
+
+    fn parameter_ids(&self) -> &[TensorId] {
+        &self.parameter_ids
     }
 }
 

@@ -2,16 +2,6 @@ use autograd::{Tape, TensorStore};
 
 use crate::opd::OpdError;
 
-pub trait TrajectoryScorer {
-    fn score(
-        &self,
-        prompt: &[u32],
-        rollouts: &[Vec<u32>],
-        store: &mut TensorStore,
-        tape: &mut Tape,
-    ) -> Result<Vec<f32>, OpdError>;
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExactMatchScorer {
     reference: Vec<u32>,
@@ -27,10 +17,8 @@ impl ExactMatchScorer {
     pub fn reference(&self) -> &[u32] {
         &self.reference
     }
-}
 
-impl TrajectoryScorer for ExactMatchScorer {
-    fn score(
+    pub fn score(
         &self,
         _prompt: &[u32],
         rollouts: &[Vec<u32>],
@@ -78,7 +66,7 @@ pub fn select_best(rollouts: &[Vec<u32>], scores: &[f32]) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{ExactMatchScorer, TrajectoryScorer, select_best};
+    use super::{ExactMatchScorer, select_best};
     use autograd::{Tape, TensorStore};
 
     #[test]

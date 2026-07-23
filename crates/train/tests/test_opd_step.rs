@@ -16,7 +16,7 @@ use train::{
     },
     qwen35::{LayerType, Qwen35Config, Qwen35Model, SequenceWindow},
     teacher_infer::{DeviceLogits, InProcessTeacher, TeacherForward},
-    trajectory_scorer::{ExactMatchScorer, TrajectoryScorer, select_best},
+    trajectory_scorer::{ExactMatchScorer, select_best},
 };
 
 fn live_tensor_count(store: &TensorStore) -> usize {
