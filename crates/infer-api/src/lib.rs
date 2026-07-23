@@ -36,6 +36,7 @@ mod serve_engine;
 mod student_lora;
 mod types;
 
+pub use infer_core::engine_forward_busy_micros;
 pub use infer_seam::{CommBackend, CudaRuntimeFlags, MetalRuntimeFlags};
 
 #[must_use]

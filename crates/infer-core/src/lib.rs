@@ -143,6 +143,20 @@ pub struct ThroughputStats {
     pub requests_completed: u64,
 }
 
+/// Process-global GPU-busy micros: cumulative forward wall (`submit`→`poll` Ready)
+/// summed across every [`Engine`] step in this process, excluding the idle between
+/// steps when nothing is in flight. Read the delta over a window (e.g. a rollout)
+/// to split it into decode-active vs host-latency-idle. Monotonic; one engine per
+/// process makes the delta that engine's busy time.
+static ENGINE_FORWARD_BUSY_MICROS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Snapshot [`ENGINE_FORWARD_BUSY_MICROS`] — the running forward-busy micros.
+#[must_use]
+pub fn engine_forward_busy_micros() -> u64 {
+    ENGINE_FORWARD_BUSY_MICROS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// KV host-demoted counters. All zero unless the executor reports nonzero tier capacity.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct KvTierStats {
@@ -370,6 +384,9 @@ pub struct Engine<E: BackendExecutor, K: KvPool> {
     waiting: VecDeque<RequestState>,
     completed: BTreeMap<RequestHandle, CompletedRequest>,
     inflight: Option<E::Inflight>,
+    /// Wall clock captured just before the in-flight forward's `submit`, consumed
+    /// when its `poll` returns Ready to accrue [`ThroughputStats::busy_micros`].
+    inflight_submit_at: Option<std::time::Instant>,
     /// Plan submitted with `inflight`, kept so `apply_output` can advance chunked
     /// prefill progress and resolve which rows produced tokens.
     pending_plan: Option<ForwardPlan>,
@@ -457,6 +474,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             waiting: VecDeque::new(),
             completed: BTreeMap::new(),
             inflight: None,
+            inflight_submit_at: None,
             pending_plan: None,
             warmed_up: false,
             model_stop_token_ids,
@@ -624,6 +642,12 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         if let Some(inflight) = self.inflight.take() {
             match self.executor.poll(inflight)? {
                 PollResult::Ready(output) => {
+                    if let Some(submitted_at) = self.inflight_submit_at.take() {
+                        ENGINE_FORWARD_BUSY_MICROS.fetch_add(
+                            submitted_at.elapsed().as_micros() as u64,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                    }
                     let plan = self.pending_plan.take().unwrap_or_else(ForwardPlan::idle);
                     self.apply_output(&plan, output)?;
                 }
@@ -686,7 +710,9 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         if diag {
             eprintln!("[STEP-DIAG] SUBMIT plan mode={:?}", plan.mode);
         }
+        let submit_at = std::time::Instant::now();
         self.inflight = Some(self.executor.submit(&plan, &mut self.kv)?);
+        self.inflight_submit_at = Some(submit_at);
         self.pending_plan = Some(plan);
         Ok(())
     }
