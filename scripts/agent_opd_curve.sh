@@ -117,6 +117,25 @@ case $SPEC in
     *)      echo "unknown SPEC=$SPEC (want mtp|dflash|off)" >&2; exit 1 ;;
 esac
 
+# Args shared by the comfort-band profile round and the training run. Per-invocation
+# flags (dataset/work-root/staleness/task-selection/eval/rounds) are appended below.
+common_args=(
+    train agent-opd
+    --student-model "$STUDENT_MODEL"
+    --task-limit "$TASK_LIMIT"
+    --update-strategy "$UPDATE_STRATEGY"
+    --rollout-temperature "$ROLLOUT_TEMPERATURE"
+    --samples-per-prompt "$SAMPLES"
+    --sync every-group
+    --test-timeout-secs 60
+    --writeback-cap "$WRITEBACK_CAP"
+    --lora-rank 16
+    --lora-alpha 32
+    --lora-target-set attention-qv
+    --save-every 0
+    "${spec_args[@]}"
+)
+
 # 1b. Comfort-band corpus filter (default on; COMFORT_BAND=0 or SMOKE=1 to skip).
 # One unbiased profile round (task-selection off) → drop always-pass / always-fail
 # tasks AND >CB_MAX_SEQ trajectories the writeback would skip → train only the
@@ -126,15 +145,9 @@ esac
 CORPUS="$OUT/corpus"
 if [[ ${COMFORT_BAND:-1} == 1 && ${SMOKE:-0} != 1 ]]; then
     echo "[curve] comfort-band: profiling $CORPUS (1 round, task-selection off) → filter"
-    CUDA_VISIBLE_DEVICES=$GPU "$ARLE_BIN" train agent-opd \
-        --student-model "$STUDENT_MODEL" \
+    CUDA_VISIBLE_DEVICES=$GPU "$ARLE_BIN" "${common_args[@]}" \
         --dataset "$CORPUS/tasks_train.jsonl" --staged-root "$CORPUS/staged" \
-        --work-root "$OUT/cb_work" --task-limit "$TASK_LIMIT" \
-        --update-strategy "$UPDATE_STRATEGY" --rollout-temperature "$ROLLOUT_TEMPERATURE" \
-        --samples-per-prompt "$SAMPLES" --staleness 0 --task-selection false \
-        --sync every-group --test-timeout-secs 60 --writeback-cap "$WRITEBACK_CAP" \
-        --lora-rank 16 --lora-alpha 32 --lora-target-set attention-qv --save-every 0 \
-        "${spec_args[@]}" \
+        --work-root "$OUT/cb_work" --staleness 0 --task-selection false \
         --rounds 1 --eval-every 0 --eval-out-dir "$OUT/cb_profile" \
         2>&1 | tee "$OUT/cb_profile.log"
     if python3 scripts/comfort_band.py \
@@ -148,29 +161,16 @@ if [[ ${COMFORT_BAND:-1} == 1 && ${SMOKE:-0} != 1 ]]; then
 fi
 
 train_args=(
-    train agent-opd
-    --student-model "$STUDENT_MODEL"
+    "${common_args[@]}"
     --dataset "$CORPUS/tasks_train.jsonl"
     --staged-root "$CORPUS/staged"
     --work-root "$OUT/work"
-    --task-limit "$TASK_LIMIT"
     --eval-dataset "$CORPUS/tasks_eval.jsonl"
     --eval-n "$EVAL_N"
     --eval-concurrency "$EVAL_CONCURRENCY"
-    --update-strategy "$UPDATE_STRATEGY"
-    --rollout-temperature "$ROLLOUT_TEMPERATURE"
-    --samples-per-prompt "$SAMPLES"
     --staleness "$STALENESS"
     --task-selection "$TASK_SELECTION"
-    --sync every-group
-    --test-timeout-secs 60
-    --writeback-cap "$WRITEBACK_CAP"
-    --lora-rank 16
-    --lora-alpha 32
-    --lora-target-set attention-qv
     --save-lora-adapters "$OUT/adapters"
-    --save-every 0
-    "${spec_args[@]}"
 )
 
 # 2. Baseline non-determinism envelope: same-config eval-only repeats
