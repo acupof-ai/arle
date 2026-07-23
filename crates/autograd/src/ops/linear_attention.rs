@@ -1503,7 +1503,23 @@ pub(crate) fn linear_attention_backward(
                     }
 
                     let prev_state = if seq_idx == 0 {
-                        vec![0.0_f32; key_dim * value_dim]
+                        // Pre-decay state entering position 0. On the carry path this is
+                        // the seeded per-head `initial_state` (matching the forward seed at
+                        // ~1787), so `dexp_g` includes `Σ initial_state · dL/dS'_0`; without
+                        // it the a_log/dt_bias decay-gate grads are biased. Non-carry: zeros.
+                        match carry.initial_state {
+                            Some(initial_state) => {
+                                let base = state_base(
+                                    batch_idx,
+                                    value_head,
+                                    num_value_heads,
+                                    key_dim,
+                                    value_dim,
+                                );
+                                initial_state[base..base + key_dim * value_dim].to_vec()
+                            }
+                            None => vec![0.0_f32; key_dim * value_dim],
+                        }
                     } else {
                         let prev_base = state_time_base(
                             batch_idx,
@@ -1598,6 +1614,7 @@ pub(crate) fn linear_attention_backward(
         &conv_tensor.data,
         &conv_tensor.shape,
         params,
+        carry.initial_conv_window,
     )?;
     record_elapsed_subop(&mut profile, "param_grad_accum", param_started);
 
@@ -1992,6 +2009,7 @@ fn conv1d_backward(
     conv1d_weight: &[f32],
     conv1d_shape: &[usize],
     params: LinearAttentionParams,
+    initial_conv_window: Option<&[f32]>,
 ) -> Result<(Vec<f32>, Vec<f32>)> {
     let q_dim = params.num_key_heads * params.key_dim;
     let qkv_dim = q_dim * 2 + params.num_value_heads * params.value_dim;
@@ -2002,6 +2020,9 @@ fn conv1d_backward(
         });
     }
 
+    // Carried causal-conv window `[batch, conv_kernel-1, qkv_dim]`, seeded by the
+    // forward at negative `src_rel` (matching `conv_window_input` at ~1762).
+    let conv_window = params.conv_kernel.saturating_sub(1);
     let mut grad_input = vec![0.0_f32; input.len()];
     let mut grad_weight = vec![0.0_f32; conv1d_weight.len()];
     for batch_idx in 0..params.batch {
@@ -2010,15 +2031,30 @@ fn conv1d_backward(
                 let preact_idx = idx3(batch_idx, seq_idx, channel, params.seq_len, qkv_dim);
                 let dpre = grad_out[preact_idx] * silu_grad_scalar(preact[preact_idx]);
                 for tap in 0..params.conv_kernel {
-                    if seq_idx + tap + 1 < params.conv_kernel {
-                        continue;
-                    }
-                    let src_seq = seq_idx + tap + 1 - params.conv_kernel;
-                    let input_idx = idx3(batch_idx, src_seq, channel, params.seq_len, qkv_dim);
-                    grad_input[input_idx] +=
-                        dpre * conv_weight_at(conv1d_weight, conv1d_shape, channel, tap);
-                    grad_weight[conv_weight_index(conv1d_shape, channel, tap)] +=
-                        dpre * input[input_idx];
+                    // src relative to this segment's start; negative => carried window.
+                    let src_rel = seq_idx as isize + tap as isize + 1 - params.conv_kernel as isize;
+                    // The weight grad accumulates the tap's input value regardless of
+                    // source; grad flows back INTO `grad_input` only for this-segment
+                    // taps — the carried window is a frozen constant. Non-carry path:
+                    // window absent => tap_input = 0.0, identical to the old skip.
+                    let tap_input = if src_rel >= 0 {
+                        let input_idx = idx3(
+                            batch_idx,
+                            src_rel as usize,
+                            channel,
+                            params.seq_len,
+                            qkv_dim,
+                        );
+                        grad_input[input_idx] +=
+                            dpre * conv_weight_at(conv1d_weight, conv1d_shape, channel, tap);
+                        input[input_idx]
+                    } else {
+                        initial_conv_window.map_or(0.0, |window| {
+                            let window_row = (src_rel + conv_window as isize) as usize;
+                            window[idx3(batch_idx, window_row, channel, conv_window, qkv_dim)]
+                        })
+                    };
+                    grad_weight[conv_weight_index(conv1d_shape, channel, tap)] += dpre * tap_input;
                 }
             }
         }
