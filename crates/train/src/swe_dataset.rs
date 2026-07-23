@@ -35,18 +35,9 @@ pub struct SweTask {
     #[serde(default)]
     pub fail_to_pass: serde_json::Value,
 
-    /// Test files to run. Optional; tolerate string, array, or absent.
-    /// Use [`SweTask::selected_test_files`] to normalize.
-    #[serde(default)]
-    pub selected_test_files_to_run: serde_json::Value,
-
     /// Setup commands run in the sandbox before tests; may be absent.
     #[serde(default)]
     pub before_repo_set_cmd: Option<String>,
-
-    /// Optional extra requirements text; may be absent.
-    #[serde(default)]
-    pub requirements: Option<String>,
 }
 
 /// Normalize a `serde_json::Value` that may be a JSON array of strings, a
@@ -86,11 +77,6 @@ impl SweTask {
     /// `fail_to_pass` normalized to a `Vec<String>` regardless of JSON shape.
     pub fn fail_to_pass(&self) -> Vec<String> {
         normalize_string_list(&self.fail_to_pass)
-    }
-
-    /// `selected_test_files_to_run` normalized to a `Vec<String>`.
-    pub fn selected_test_files(&self) -> Vec<String> {
-        normalize_string_list(&self.selected_test_files_to_run)
     }
 }
 
@@ -153,44 +139,6 @@ mod tests {
         }"#;
         let task = task_from_line(line);
         assert_eq!(task.fail_to_pass(), vec!["a::b", "c::d"]);
-    }
-
-    #[test]
-    fn selected_test_files_tolerates_shapes() {
-        // Absent field -> empty.
-        let line = r#"{
-            "instance_id": "x__y-1",
-            "problem_statement": "p",
-            "repo": "x/y",
-            "base_commit": "c",
-            "test_patch": "d"
-        }"#;
-        let task = task_from_line(line);
-        assert!(task.selected_test_files().is_empty());
-
-        // Single string.
-        let line = r#"{
-            "instance_id": "x__y-2",
-            "problem_statement": "p",
-            "repo": "x/y",
-            "base_commit": "c",
-            "test_patch": "d",
-            "selected_test_files_to_run": "tests/test_foo.py"
-        }"#;
-        let task = task_from_line(line);
-        assert_eq!(task.selected_test_files(), vec!["tests/test_foo.py"]);
-
-        // JSON array.
-        let line = r#"{
-            "instance_id": "x__y-3",
-            "problem_statement": "p",
-            "repo": "x/y",
-            "base_commit": "c",
-            "test_patch": "d",
-            "selected_test_files_to_run": ["tests/a.py", "tests/b.py"]
-        }"#;
-        let task = task_from_line(line);
-        assert_eq!(task.selected_test_files(), vec!["tests/a.py", "tests/b.py"]);
     }
 
     #[test]

@@ -12,8 +12,8 @@ use std::time::Duration;
 use tempfile::tempdir;
 use train::metrics::{
     JsonlSink, MetricSample, MetricSink, MlflowConfig, MlflowSink, MultiSink, NullSink,
-    OtlpLogConfig, OtlpLogSink, TrainEvent, WandbConfig, WandbProcessSink, open_shared_sink,
-    open_shared_sink_append, open_sink, open_sink_append,
+    OtlpLogConfig, OtlpLogSink, TrainEvent, WandbConfig, WandbProcessSink,
+    open_shared_sink_with_extra,
 };
 
 type MockMlflowArtifactRequest = (String, String, Vec<u8>);
@@ -120,42 +120,6 @@ fn multi_sink_fans_out_to_two_files() {
 }
 
 #[test]
-fn open_sink_none_no_stdout_returns_null_like() {
-    let mut sink = open_sink(None, false).expect("open null sink");
-    let fields = [("loss", 1.0f64)];
-    // Just assert no panic.
-    sink.emit(&MetricSample {
-        step: 0,
-        phase: "train",
-        fields: &fields,
-    });
-    sink.flush();
-}
-
-#[test]
-fn open_sink_jsonl_plus_stdout_emits_without_panic() {
-    let dir = tempdir().expect("tempdir");
-    let path = dir.path().join("metrics.jsonl");
-
-    {
-        let mut sink = open_sink(Some(&path), true).expect("open multi sink");
-        let fields = [("loss", 0.25f64), ("lr", 1e-3f64), ("step_ms", 12.345f64)];
-        sink.emit(&MetricSample {
-            step: 42,
-            phase: "train",
-            fields: &fields,
-        });
-        sink.flush();
-    }
-
-    let lines = read_lines(&path);
-    assert_eq!(lines.len(), 1, "expected one line in {:?}", path);
-    let v: serde_json::Value = serde_json::from_str(&lines[0]).expect("parse");
-    assert_eq!(v["step"], serde_json::json!(42));
-    assert_eq!(v["loss"].as_f64().unwrap(), 0.25);
-}
-
-#[test]
 fn jsonl_sink_missing_parent_dir_errors() {
     // Sibling of tempdir that does not exist: parent dir must exist.
     let dir = tempdir().expect("tempdir");
@@ -230,100 +194,6 @@ fn jsonl_line_is_parseable_by_serde_json() {
     assert!(v3["grad_norm"].is_null(), "Inf should serialise as null");
 }
 
-/// Phase 4 follow-up (commit 60f7183): `JsonlSink::open_append` is the
-/// multi-phase-runner sibling of `create`. Later phases use it so JSONL output
-/// from an earlier Trainer phase doesn't get
-/// clobbered. Pins the truncate-vs-append contract so a future
-/// "simplify" refactor can't silently swap append for truncate.
-#[test]
-fn jsonl_sink_open_append_extends_existing_file() {
-    let dir = tempdir().expect("tempdir");
-    let path = dir.path().join("two_phase.jsonl");
-
-    // Phase 1: create (truncate) + two samples.
-    {
-        let mut sink = JsonlSink::create(&path).expect("create jsonl");
-        let f1 = [("loss", 1.0f64)];
-        sink.emit(&MetricSample {
-            step: 1,
-            phase: "train",
-            fields: &f1,
-        });
-        let f2 = [("loss", 0.5f64)];
-        sink.emit(&MetricSample {
-            step: 2,
-            phase: "train",
-            fields: &f2,
-        });
-    }
-
-    // Phase 2: open_append + one sample. Must NOT truncate.
-    {
-        let mut sink = JsonlSink::open_append(&path).expect("open_append jsonl");
-        let f3 = [("reward", 0.125f64)];
-        sink.emit(&MetricSample {
-            step: 3,
-            phase: "grpo",
-            fields: &f3,
-        });
-    }
-
-    let lines = read_lines(&path);
-    assert_eq!(
-        lines.len(),
-        3,
-        "open_append must extend, not truncate — got {:?}",
-        lines
-    );
-    let v1: serde_json::Value = serde_json::from_str(&lines[0]).expect("parse 1");
-    let v2: serde_json::Value = serde_json::from_str(&lines[1]).expect("parse 2");
-    let v3: serde_json::Value = serde_json::from_str(&lines[2]).expect("parse 3");
-    assert_eq!(v1["step"], serde_json::json!(1));
-    assert_eq!(v2["step"], serde_json::json!(2));
-    assert_eq!(v3["step"], serde_json::json!(3));
-    assert_eq!(v3["reward"].as_f64().unwrap(), 0.125);
-}
-
-/// Factory-level variant of the above: `open_sink_append` must yield a
-/// sink that extends rather than truncates, matching the multi-phase runner
-/// call path. Also verifies `open_sink_append` creates the file
-/// when absent (i.e. single-phase binaries wouldn't break if they
-/// accidentally used the append variant).
-#[test]
-fn open_sink_append_factory_extends_and_creates() {
-    let dir = tempdir().expect("tempdir");
-    let path = dir.path().join("factory.jsonl");
-
-    // First call: file does not exist — append factory must create it.
-    {
-        let mut sink = open_sink_append(Some(&path), false).expect("open_sink_append create");
-        let f = [("loss", 0.75f64)];
-        sink.emit(&MetricSample {
-            step: 10,
-            phase: "train",
-            fields: &f,
-        });
-    }
-    assert_eq!(read_lines(&path).len(), 1);
-
-    // Second call: file exists — append factory must extend.
-    {
-        let mut sink = open_sink_append(Some(&path), false).expect("open_sink_append extend");
-        let f = [("loss", 0.25f64)];
-        sink.emit(&MetricSample {
-            step: 11,
-            phase: "train",
-            fields: &f,
-        });
-    }
-    let lines = read_lines(&path);
-    assert_eq!(lines.len(), 2, "factory must append, got {:?}", lines);
-    let v10: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
-    let v11: serde_json::Value = serde_json::from_str(&lines[1]).unwrap();
-    assert_eq!(v10["step"], serde_json::json!(10));
-    assert_eq!(v11["step"], serde_json::json!(11));
-}
-
 #[test]
 fn jsonl_sink_serializes_lifecycle_events() {
     let dir = tempdir().expect("tempdir");
@@ -372,7 +242,8 @@ fn shared_sink_flushes_metrics_and_events() {
     let dir = tempdir().expect("tempdir");
     let path = dir.path().join("shared.jsonl");
 
-    let sink = open_shared_sink(Some(&path), false).expect("open shared sink");
+    let sink =
+        open_shared_sink_with_extra(Some(&path), false, Vec::new()).expect("open shared sink");
     let fields = [("loss", 0.125f64)];
     sink.emit_metric(&MetricSample {
         step: 1,
@@ -396,37 +267,6 @@ fn shared_sink_flushes_metrics_and_events() {
     assert_eq!(metric["phase"], serde_json::json!("train"));
     assert_eq!(event["kind"], serde_json::json!("run_end"));
     assert_eq!(event["status"], serde_json::json!("completed"));
-}
-
-#[test]
-fn open_shared_sink_append_extends_existing_file() {
-    let dir = tempdir().expect("tempdir");
-    let path = dir.path().join("shared_append.jsonl");
-
-    let sink = open_shared_sink(Some(&path), false).expect("create shared sink");
-    sink.emit_metric(&MetricSample {
-        step: 1,
-        phase: "train",
-        fields: &[("loss", 1.0)],
-    });
-    sink.flush_blocking();
-    drop(sink);
-
-    let sink = open_shared_sink_append(Some(&path), false).expect("append shared sink");
-    sink.emit_metric(&MetricSample {
-        step: 2,
-        phase: "grpo",
-        fields: &[("mean_reward", 0.5)],
-    });
-    sink.flush_blocking();
-
-    let lines = read_lines(&path);
-    assert_eq!(lines.len(), 2);
-    let first: serde_json::Value = serde_json::from_str(&lines[0]).expect("parse first");
-    let second: serde_json::Value = serde_json::from_str(&lines[1]).expect("parse second");
-    assert_eq!(first["step"], serde_json::json!(1));
-    assert_eq!(second["step"], serde_json::json!(2));
-    assert_eq!(second["phase"], serde_json::json!("grpo"));
 }
 
 #[test]
