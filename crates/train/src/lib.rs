@@ -77,7 +77,6 @@ pub mod trajectory_scorer;
 #[path = "update_strategy.rs"]
 pub mod update_strategy;
 
-pub use causal_lm::CausalLm;
 pub use lora::{LinearWithLora, LoraAdapterConfig, LoraConfig, LoraTargetSet};
 pub use metrics::*;
 pub use trainer::cleanup_after_backward;
