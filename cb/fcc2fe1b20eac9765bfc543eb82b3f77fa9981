@@ -1,0 +1,23 @@
+docs/experience/errors/2026-07-23-agent-opd-mtp-lockstep-single-gpu-teardown.md
+  s_3bfdcf8fceb2d5::t_0c9af88a851c50 40-49,51-52
+docs/research/2026-07-23-online-rl-acceleration.md
+  s_3bfdcf8fceb2d5::t_9cbcf8e6fff3af 46-67
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "cbfcc2fe1b20eac9765bfc543eb82b3f77fa9981",
+  "prompts": {},
+  "sessions": {
+    "s_3bfdcf8fceb2d5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "62ec01f2-d7cd-44c5-b546-2e6a64756530",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
