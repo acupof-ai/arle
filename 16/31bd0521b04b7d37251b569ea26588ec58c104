@@ -1,0 +1,31 @@
+crates/kv-native-sys/src/kv_tier.rs
+  s_7f1b5e46704bdf::t_a5c1d661af7a7e 301-312,469-478,481,955-960
+crates/kv-native-sys/src/lib.rs
+  s_2d99b3d15eb02d::t_a16f756a91b74b 32-40,253-260,312-327
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "1631bd0521b04b7d37251b569ea26588ec58c104",
+  "prompts": {},
+  "sessions": {
+    "s_2d99b3d15eb02d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ac2cb765678b12795",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_7f1b5e46704bdf": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aa0b3b146bc7c6d41",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
