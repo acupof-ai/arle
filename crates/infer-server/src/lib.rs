@@ -834,7 +834,14 @@ fn serve_handle_relay_driver<E, K>(
         std::thread::Builder::new()
             .name("arle-relay-worker".into())
             .spawn(move || {
-                while let Ok((request_id, _ticket, rx)) = work_rx.lock().unwrap().recv() {
+                loop {
+                    // Bind recv() in its own scope so the work_rx guard drops
+                    // BEFORE relay_stream's long blocking loop — else one worker
+                    // holds the lock for its whole stream, collapsing the pool.
+                    let next = { work_rx.lock().unwrap().recv() };
+                    let Ok((request_id, _ticket, rx)) = next else {
+                        break;
+                    };
                     relay_stream(request_id, rx, &tx);
                     handles.lock().unwrap().remove(&request_id);
                     // _ticket drops here — live_requests decremented after relay completes
@@ -843,60 +850,102 @@ fn serve_handle_relay_driver<E, K>(
             .expect("spawn relay worker");
     }
 
+    // Engine-touching work (submit / cancel / stats) runs on a dedicated thread
+    // so the pump loop below can ALWAYS ack ticks. `submit_streaming` blocks on
+    // an engine-thread round-trip; with it on the ack path, one long engine step
+    // (first-touch JIT, giant prefill chunk) starved the coordinator's
+    // TICK_WINDOW for >ACK_STALL_TIMEOUT and its watchdog tore down the serve
+    // (2026-07-23 single-GPU OPD rollout). Acks are liveness, not admission.
+    let (engine_work_tx, engine_work_rx) = std::sync::mpsc::channel::<RelayEnvelope>();
+    {
+        let serve = std::sync::Arc::clone(&serve);
+        let engine_tx = engine_tx.clone();
+        std::thread::Builder::new()
+            .name("arle-local-relay-submitter".to_string())
+            .spawn(move || {
+                for envelope in engine_work_rx {
+                    match envelope {
+                        RelayEnvelope::TickAdmissions { requests, .. } => {
+                            for wire in requests {
+                                let request_id = wire.request_id;
+                                let (prompt_tokens, max_tokens, sampling) = wire.submit_args();
+                                match serve.submit_streaming(prompt_tokens, max_tokens, sampling) {
+                                    Ok((ticket, rx)) => {
+                                        // Insert BEFORE handing to a worker so the
+                                        // worker's remove-at-stream-end can never
+                                        // race the insert.
+                                        handles.lock().unwrap().insert(request_id, ticket.handle());
+                                        let _ = work_tx.send((request_id, ticket, rx));
+                                    }
+                                    Err(e) => {
+                                        let _ = engine_tx.send(RelayEnvelope::Completion {
+                                            request_id,
+                                            delta: multiproc_relay::RelayCompletionDelta {
+                                                finish: true,
+                                                error: Some(e.to_string()),
+                                                ..Default::default()
+                                            },
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                        // Client disconnected (`InFlightGuard::drop` -> coordinator
+                        // broadcast): stop decoding the orphan so it frees its KV
+                        // slot. Ordered behind the submit that inserted the handle;
+                        // a missing/finished handle is a benign race with natural
+                        // finish.
+                        RelayEnvelope::CancelRequest { request_id } => {
+                            let handle = handles.lock().unwrap().get(&request_id).copied();
+                            if let Some(handle) = handle
+                                && serve
+                                    .run_on_engine(move |engine| engine.cancel_request(handle))
+                                    .unwrap_or(false)
+                            {
+                                log::info!(
+                                    "[local-relay-driver] cancelled req#{request_id} (client gone)"
+                                );
+                            }
+                        }
+                        RelayEnvelope::StatsQuery { request_id } => {
+                            let counters = serve.counters();
+                            let (operator_dispatch, artifact) =
+                                serve.operator_stats().unwrap_or_default();
+                            let data = Box::new(WireStats::from_counters(
+                                &counters,
+                                build_identity(artifact),
+                                operator_dispatch,
+                            ));
+                            let _ =
+                                engine_tx.send(RelayEnvelope::StatsResponse { request_id, data });
+                        }
+                        other => {
+                            log::debug!("[local-relay-submitter] unexpected envelope: {other:?}");
+                        }
+                    }
+                }
+            })
+            .expect("spawn arle-local-relay-submitter");
+    }
+
     loop {
         match engine_recv.recv() {
             Ok(Some(RelayEnvelope::TickAdmissions { seq, requests })) => {
-                for wire in requests {
-                    let request_id = wire.request_id;
-                    let (prompt_tokens, max_tokens, sampling) = wire.submit_args();
-                    match serve.submit_streaming(prompt_tokens, max_tokens, sampling) {
-                        Ok((ticket, rx)) => {
-                            // Insert BEFORE handing to a worker so the worker's
-                            // remove-at-stream-end can never race the insert.
-                            handles.lock().unwrap().insert(request_id, ticket.handle());
-                            let _ = work_tx.send((request_id, ticket, rx));
-                        }
-                        Err(e) => {
-                            let _ = engine_tx.send(RelayEnvelope::Completion {
-                                request_id,
-                                delta: multiproc_relay::RelayCompletionDelta {
-                                    finish: true,
-                                    error: Some(e.to_string()),
-                                    ..Default::default()
-                                },
-                            });
-                        }
-                    }
+                if !requests.is_empty() {
+                    let _ = engine_work_tx.send(RelayEnvelope::TickAdmissions { seq, requests });
                 }
                 // Flow-control ack (rank 0 = the only local worker); without it
                 // the lockstep loop's ack window stalls at TICK_WINDOW. A send
                 // failure means the coordinator is gone — recv EOFs us out next.
                 let _ = engine_tx.send(RelayEnvelope::TickAck { rank: 0, seq });
             }
-            // Client disconnected (`InFlightGuard::drop` -> coordinator
-            // broadcast): stop decoding the orphan so it frees its KV slot.
-            // A missing/finished handle is a benign race with natural finish.
-            Ok(Some(RelayEnvelope::CancelRequest { request_id })) => {
-                let handle = handles.lock().unwrap().get(&request_id).copied();
-                if let Some(handle) = handle
-                    && serve
-                        .run_on_engine(move |engine| engine.cancel_request(handle))
-                        .unwrap_or(false)
-                {
-                    log::info!("[local-relay-driver] cancelled req#{request_id} (client gone)");
-                }
-            }
-            Ok(Some(RelayEnvelope::StatsQuery { request_id })) => {
-                let counters = serve.counters();
-                let (operator_dispatch, artifact) = serve.operator_stats().unwrap_or_default();
-                let data = Box::new(WireStats::from_counters(
-                    &counters,
-                    build_identity(artifact),
-                    operator_dispatch,
-                ));
-                let _ = engine_tx.send(RelayEnvelope::StatsResponse { request_id, data });
+            Ok(Some(
+                envelope @ (RelayEnvelope::CancelRequest { .. } | RelayEnvelope::StatsQuery { .. }),
+            )) => {
+                let _ = engine_work_tx.send(envelope);
             }
             Ok(Some(RelayEnvelope::Shutdown)) | Ok(None) => {
+                // Dropping engine_work_tx ends the submitter's for-loop.
                 log::info!("[local-relay-driver] shutdown");
                 return;
             }
