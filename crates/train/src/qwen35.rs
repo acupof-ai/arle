@@ -2559,11 +2559,15 @@ impl Qwen35Model {
     /// chunk_history, attention scratch and allocator slack are unmodeled)
     /// and the 0.8B hybrid ~4× (3.4–4.1 GB/layer at B=4 seq=3150 vs 0.955 —
     /// LA saved ctx + qkv projections dominate; batched rubric writeback ran
-    /// full-tape and OOM'd the H20 at 97 GB, 2026-07-23). The ×4 covers the
-    /// worst measured ratio; the old un-scaled estimate under-fired the gate.
-    /// The free/2 margin OOM'd at seq≈1350–1400 (agent-OPD smoke 2026-07-03);
-    /// 3× keeps the full-tape fast path only when it truly fits. Unknown
-    /// memory info keeps the safe default (checkpoint).
+    /// full-tape and OOM'd the H20 at 97 GB, 2026-07-23). A ×4 correction was
+    /// tried and reverted 2026-07-24: it over-fired on short B=4 shapes (3×
+    /// phase-C wall) and routed long B=4 into a checkpointed batched backward
+    /// that crashes in linear_attention dqkv (errors/2026-07-24) — fix that
+    /// backward before re-tightening this gate; batched long-completion
+    /// writeback runs B=1 until then. The free/2 margin OOM'd at
+    /// seq≈1350–1400 (agent-OPD smoke 2026-07-03); 3× keeps the full-tape
+    /// fast path only when it truly fits. Unknown memory info keeps the safe
+    /// default (checkpoint).
     fn should_checkpoint(
         &self,
         batch: usize,
@@ -2574,12 +2578,11 @@ impl Qwen35Model {
         self.gradient_checkpointing
             && tape.enabled
             && store.backend().device_mem_info().is_none_or(|(free, _)| {
-                let modeled = batch
+                let per_layer = batch
                     * seq_len
                     * (8 * self.config.hidden_size + 3 * self.config.intermediate_size)
                     * 4;
-                modeled
-                    .saturating_mul(4)
+                per_layer
                     .saturating_mul(self.layers.len())
                     .saturating_mul(3)
                     > free
