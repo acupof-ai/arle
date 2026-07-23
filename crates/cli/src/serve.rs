@@ -271,11 +271,6 @@ fn resolve_config(args: &Args, serve_args: &ServeArgs) -> Result<ServeConfig, St
 
     // Surfaces the rewrite serve router does not expose yet. Reject rather than
     // silently ignore so the user is not misled into thinking they took effect.
-    if serve_args.train_control_url.is_some() {
-        return Err(
-            "--train-control-url is not yet supported by the in-process serve stack (the rewrite router has no /v1/train/* routes)".to_string(),
-        );
-    }
     if !serve_args.pool_models.is_empty() {
         return Err(
             "--pool-model is not yet supported by the in-process serve stack (the rewrite router has no engine-pool /v1/models metadata)".to_string(),
@@ -1095,25 +1090,6 @@ mod tests {
             parse_serve(&["arle", "serve", "--backend", other, "--model-path", "model"]);
         let err = resolve_config(&args, &serve).expect_err("backend mismatch rejected");
         assert!(err.contains("but this binary was built with"), "got: {err}");
-    }
-
-    #[test]
-    fn train_control_url_is_rejected() {
-        if skip_if_no_backend() {
-            return;
-        }
-        let (args, serve) = parse_serve(&[
-            "arle",
-            "serve",
-            "--backend",
-            compiled_backend_flag(),
-            "--model-path",
-            "model",
-            "--train-control-url",
-            "http://localhost:9000",
-        ]);
-        let err = resolve_config(&args, &serve).expect_err("train control url rejected");
-        assert!(err.contains("--train-control-url"), "got: {err}");
     }
 
     #[test]

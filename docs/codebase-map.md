@@ -138,17 +138,14 @@ Scratch pretrain, SFT, GRPO, and multi-turn RL surfaces were retired
 in commit `bd94c09` (see OPD-only pivot).
 Their dispatch sources, supporting modules, and tests have been deleted
 from `crates/train`; the empty legacy command namespace is also gone.
-The autograd + Trainer + checkpoint codec + tokenizer + LoRA +
-`/v1/train/*` control plane remain as OPD substrate. The OPD-teacher
+The autograd + Trainer + checkpoint codec + tokenizer + LoRA
+remain as OPD substrate. The OPD-teacher
 raw-logits + per-step student-LoRA re-merge surface is exposed at
 `infer-api` (`RawLogits`, `StudentLora*`) under `--features cuda`.
 
 Key files (surviving the pivot):
 
 - `crates/cli/src/train_cli.rs`: `arle train env`, `estimate-memory`, and `opd` front door
-- `crates/train/src/server.rs`: minimal HTTP control plane for `/v1/train/status|events|stop|save`
-- `crates/train/src/control.rs`: shared controller / status state plus recent event ring buffer
-- `crates/train/src/metrics.rs`: shared async observability sink, lifecycle/artifact events, MLflow / OTLP / W&B export adapters
 - `crates/train/src/trainer.rs`: `Trainer<O, C, S>` skeleton — kept; OPD will provide its own `step_fn`
 - `crates/train/src/{checkpoint,cli_args,grad_accum,grad_clip,loss,lora,tokenizer,causal_lm,qwen35,qwen35_checkpoint,model_family}.rs`: substrate kept for OPD
 

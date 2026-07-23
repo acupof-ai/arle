@@ -686,10 +686,6 @@ pub(crate) struct ServeArgs {
     #[arg(long, default_value_t = false)]
     pub(crate) kv_oversubscription: bool,
 
-    /// Optional upstream train control-plane URL to expose under `/v1/train/*`.
-    #[arg(long)]
-    pub(crate) train_control_url: Option<String>,
-
     /// Dump every raw `/v1/messages` request body to
     /// `<dir>/<epoch_ms>_<seq>.json` (CC-trajectory capture for
     /// `arle train cc-convert`). Fire-and-forget; unset = zero cost.

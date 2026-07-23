@@ -10,8 +10,7 @@ tiers still live in [docs/support-matrix.md](support-matrix.md) and
 
 ## Route Map
 
-This document covers the serving surface. The optional train-control proxy
-under `/v1/train/*` is documented separately in the train/runtime docs.
+This document covers the serving surface.
 
 | Category | Route | Notes |
 | --- | --- | --- |

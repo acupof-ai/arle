@@ -71,7 +71,6 @@ surfaces fall under each tier.
 
 - `POST /v1/responses` (current text/tool-call subset with non-streaming and SSE forms; structured outputs still pending)
 - CLI agent behavior
-- train-side `/v1/train/status|events|stop|save` control plane (`crates/train/src/server.rs`; reachable as an optional proxy via the serving front door's `--train-control-url`)
 - Metal serving path
 - Metal DFlash speculative decode path
 - GGUF loading path
