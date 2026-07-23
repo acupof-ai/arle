@@ -1,0 +1,45 @@
+crates/infer-api/src/serve.rs
+  s_562d799fba5835::t_6d55cbcaf07b66 43
+docs/architecture.md
+  s_9c91b86ec3fb55::t_b5b81e600fca82 56
+docs/codebase-map.md
+  s_3bfdcf8fceb2d5::t_d8770b770e3d0f 141-142
+docs/http-api.md
+  s_9c91b86ec3fb55::t_2ebb3cdd12bcc7 13
+docs/support-matrix.md
+  s_562d799fba5835::t_092fe6dfad931e 228,266
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "9933e21e89221b0c8f79fb99a77563f4dc603016",
+  "prompts": {},
+  "sessions": {
+    "s_3bfdcf8fceb2d5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "62ec01f2-d7cd-44c5-b546-2e6a64756530",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_562d799fba5835": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a421cac98764cb4b3",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_9c91b86ec3fb55": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4779911a-69b7-49db-bc83-daf5a48d6ca3",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
