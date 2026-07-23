@@ -1764,6 +1764,11 @@ pub(crate) struct TrainRubricOpdArgs {
     #[arg(long, default_value_t = 4)]
     pub(crate) writeback_batch: usize,
 
+    /// Row chunk for the fused indexed-CE lm_head projection in the batched
+    /// writeback; bounds the transient `[window, vocab]` logits tile.
+    #[arg(long, default_value_t = 2048)]
+    pub(crate) writeback_window: usize,
+
     /// Mode B: max Flash corrections written back per round (0 = select-only Mode A).
     #[arg(long, default_value_t = 0)]
     pub(crate) correction_cap: usize,
