@@ -52,8 +52,7 @@ use cudarc::cublas::{result as cublas_result, sys as cublas_sys};
 use cudarc::driver::sys::{CUdeviceptr, CUresult, cuMemcpyDtoD_v2};
 #[cfg(not(feature = "no-cuda"))]
 use cudarc::driver::{
-    CudaContext, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, DeviceRepr, PushKernelArg,
-    ValidAsZeroBits, result,
+    CudaContext, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, DeviceRepr, PushKernelArg, result,
 };
 #[cfg(not(feature = "no-cuda"))]
 use std::sync::Arc;
@@ -3727,16 +3726,15 @@ fn cuda_row_len(len: usize, rows: usize) -> Result<usize> {
 }
 
 #[cfg(not(feature = "no-cuda"))]
-fn cuda_copy_range<T: DeviceRepr + ValidAsZeroBits>(
+fn cuda_copy_range<T: DeviceRepr>(
     backend: &CudaBackend,
     src: &CudaSlice<T>,
     start: usize,
     len: usize,
 ) -> Result<CudaSlice<T>> {
-    let mut out = backend
-        .stream
-        .alloc_zeros::<T>(len)
-        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (la row slice)"))?;
+    // Uninitialized alloc: every byte is overwritten by the D2D copy below.
+    let mut out = unsafe { backend.stream.alloc::<T>(len) }
+        .map_err(|_| cuda_alloc_failed("la row slice", vec![len]))?;
     backend
         .stream
         .memcpy_dtod(&src.slice(start..start + len), &mut out)
@@ -3745,15 +3743,14 @@ fn cuda_copy_range<T: DeviceRepr + ValidAsZeroBits>(
 }
 
 #[cfg(not(feature = "no-cuda"))]
-fn cuda_concat_parts<T: DeviceRepr + ValidAsZeroBits>(
+fn cuda_concat_parts<T: DeviceRepr>(
     backend: &CudaBackend,
     parts: &[&CudaSlice<T>],
 ) -> Result<CudaSlice<T>> {
     let total: usize = parts.iter().map(|part| part.len()).sum();
-    let mut out = backend
-        .stream
-        .alloc_zeros::<T>(total)
-        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (la row concat)"))?;
+    // Uninitialized alloc: the copies below cover the full buffer.
+    let mut out = unsafe { backend.stream.alloc::<T>(total) }
+        .map_err(|_| cuda_alloc_failed("la row concat", vec![total]))?;
     let mut offset = 0;
     for part in parts {
         backend
@@ -3800,12 +3797,7 @@ fn cuda_concat_rows(backend: &CudaBackend, rows: &[&DeviceHandle]) -> Result<Dev
         Some(DeviceHandle::Cuda(_)) => {
             let parts = rows
                 .iter()
-                .map(|handle| match handle {
-                    DeviceHandle::Cuda(storage) => backend.cuda_storage_slice(storage),
-                    _ => Err(AutogradError::TapeInvariant(
-                        "linear_attention batched concat mixes dtypes",
-                    )),
-                })
+                .map(|handle| backend.cuda_slice(handle, "la row concat"))
                 .collect::<Result<Vec<_>>>()?;
             let out = cuda_concat_parts(backend, &parts)?;
             Ok(DeviceHandle::Cuda(CudaStorage::new(out)))
@@ -3813,12 +3805,7 @@ fn cuda_concat_rows(backend: &CudaBackend, rows: &[&DeviceHandle]) -> Result<Dev
         Some(DeviceHandle::CudaBf16(_)) => {
             let parts = rows
                 .iter()
-                .map(|handle| match handle {
-                    DeviceHandle::CudaBf16(storage) => backend.cuda_bf16_storage_slice(storage),
-                    _ => Err(AutogradError::TapeInvariant(
-                        "linear_attention batched concat mixes dtypes",
-                    )),
-                })
+                .map(|handle| backend.cuda_bf16_slice(handle, "la row concat"))
                 .collect::<Result<Vec<_>>>()?;
             let out = cuda_concat_parts(backend, &parts)?;
             Ok(DeviceHandle::CudaBf16(CudaBf16Storage::new(out)))
@@ -3829,17 +3816,13 @@ fn cuda_concat_rows(backend: &CudaBackend, rows: &[&DeviceHandle]) -> Result<Dev
     }
 }
 
+/// Shape gate for the device LA path. Only the head DIM is baked into the
+/// kernels (GDR_KEY_DIM/VAL_DIM=128; num_value_heads stays a runtime param);
+/// batch>1 rides per-row dispatch because the chunked kernels' chunk_state
+/// carries no batch stride.
 #[cfg(not(feature = "no-cuda"))]
-fn cuda_accum_grad(
-    backend: &CudaBackend,
-    acc: Option<DeviceHandle>,
-    next: DeviceHandle,
-    len: usize,
-) -> Result<DeviceHandle> {
-    match acc {
-        None => Ok(next),
-        Some(prev) => backend.add(&prev, &next, &[len]),
-    }
+fn cuda_la_device_supported(p: LinearAttentionDeviceParams) -> bool {
+    p.key_dim == 128 && p.value_dim == 128 && p.conv_kernel <= 5 && p.batch > 0
 }
 
 #[cfg(not(feature = "no-cuda"))]
@@ -3848,7 +3831,7 @@ fn cuda_linear_attention_forward_device(
     args: LinearAttentionDeviceForwardArgs<'_>,
 ) -> Result<Option<LinearAttentionDeviceForwardResult>> {
     let p = args.params;
-    if p.key_dim != 128 || p.value_dim != 128 || p.conv_kernel > 5 || p.batch == 0 {
+    if !cuda_la_device_supported(p) {
         return Ok(None);
     }
     if p.batch == 1 {
@@ -3861,18 +3844,15 @@ fn cuda_linear_attention_forward_device(
     let row_params = LinearAttentionDeviceParams { batch: 1, ..p };
     let rows = (0..p.batch)
         .map(|row| {
-            let qkv = cuda_row_slice(backend, args.qkv, row, p.batch)?;
-            let z = cuda_row_slice(backend, args.z, row, p.batch)?;
-            let b_proj = cuda_row_slice(backend, args.b_proj, row, p.batch)?;
-            let a_proj = cuda_row_slice(backend, args.a_proj, row, p.batch)?;
+            let slice = |src| cuda_row_slice(backend, src, row, p.batch);
             cuda_linear_attention_forward_device_row(
                 backend,
                 LinearAttentionDeviceForwardArgs {
                     params: row_params,
-                    qkv: &qkv,
-                    z: &z,
-                    b_proj: &b_proj,
-                    a_proj: &a_proj,
+                    qkv: &slice(args.qkv)?,
+                    z: &slice(args.z)?,
+                    b_proj: &slice(args.b_proj)?,
+                    a_proj: &slice(args.a_proj)?,
                     conv1d_weight: args.conv1d_weight,
                     dt_bias: args.dt_bias,
                     a_log: args.a_log,
@@ -4362,7 +4342,7 @@ fn cuda_linear_attention_backward_device(
     args: LinearAttentionDeviceBackwardArgs<'_>,
 ) -> Result<Option<LinearAttentionDeviceBackwardResult>> {
     let p = args.params;
-    if p.key_dim != 128 || p.value_dim != 128 || p.conv_kernel > 5 || p.batch == 0 {
+    if !cuda_la_device_supported(p) {
         return Ok(None);
     }
     if p.batch == 1 {
@@ -4371,90 +4351,61 @@ fn cuda_linear_attention_backward_device(
 
     // batch > 1: per-row dispatch to the proven batch==1 path. Upstream, inputs
     // and every saved ctx tensor are batch-leading contiguous rows; weights pass
-    // through whole. Per-token grads concatenate; weight grads accumulate.
+    // through whole. Per-token grads concatenate; weight grads sum across rows.
     let qkv_dim = p.num_key_heads * p.key_dim * 2 + p.num_value_heads * p.value_dim;
     let conv_len = qkv_dim * p.conv_kernel;
     let row_params = LinearAttentionDeviceParams { batch: 1, ..p };
-    let mut dqkv_rows = Vec::with_capacity(p.batch);
-    let mut dz_rows = Vec::with_capacity(p.batch);
-    let mut db_rows = Vec::with_capacity(p.batch);
-    let mut da_rows = Vec::with_capacity(p.batch);
-    let (mut dconv, mut ddt, mut da_log, mut dnorm) = (None, None, None, None);
-    for row in 0..p.batch {
-        let upstream = cuda_row_slice(backend, args.upstream, row, p.batch)?;
-        let qkv = cuda_row_slice(backend, args.qkv, row, p.batch)?;
-        let z = cuda_row_slice(backend, args.z, row, p.batch)?;
-        let b_proj = cuda_row_slice(backend, args.b_proj, row, p.batch)?;
-        let a_proj = cuda_row_slice(backend, args.a_proj, row, p.batch)?;
-        let preact = cuda_row_slice(backend, args.preact, row, p.batch)?;
-        let qkv_conv = cuda_row_slice(backend, args.qkv_conv, row, p.batch)?;
-        let q = cuda_row_slice(backend, args.q, row, p.batch)?;
-        let k = cuda_row_slice(backend, args.k, row, p.batch)?;
-        let v = cuda_row_slice(backend, args.v, row, p.batch)?;
-        let g = cuda_row_slice(backend, args.g, row, p.batch)?;
-        let g_cumsum = cuda_row_slice(backend, args.g_cumsum, row, p.batch)?;
-        let beta = cuda_row_slice(backend, args.beta, row, p.batch)?;
-        let a_inv = cuda_row_slice(backend, args.a_inv, row, p.batch)?;
-        let chunk_state = cuda_row_slice(backend, args.chunk_state, row, p.batch)?;
-        let raw_output = cuda_row_slice(backend, args.raw_output, row, p.batch)?;
-        let grads = cuda_linear_attention_backward_device_row(
-            backend,
-            LinearAttentionDeviceBackwardArgs {
-                params: row_params,
-                upstream: &upstream,
-                qkv: &qkv,
-                z: &z,
-                b_proj: &b_proj,
-                a_proj: &a_proj,
-                preact: &preact,
-                qkv_conv: &qkv_conv,
-                q: &q,
-                k: &k,
-                v: &v,
-                g: &g,
-                g_cumsum: &g_cumsum,
-                beta: &beta,
-                a_inv: &a_inv,
-                chunk_state: &chunk_state,
-                raw_output: &raw_output,
-                conv1d_weight: args.conv1d_weight,
-                dt_bias: args.dt_bias,
-                a_log: args.a_log,
-                norm_weight: args.norm_weight,
-            },
-        )?;
-        dqkv_rows.push(grads.dqkv);
-        dz_rows.push(grads.dz);
-        db_rows.push(grads.db);
-        da_rows.push(grads.da);
-        dconv = Some(cuda_accum_grad(backend, dconv, grads.dconv, conv_len)?);
-        ddt = Some(cuda_accum_grad(backend, ddt, grads.ddt, p.num_value_heads)?);
-        da_log = Some(cuda_accum_grad(
-            backend,
-            da_log,
-            grads.da_log,
-            p.num_value_heads,
-        )?);
-        dnorm = Some(cuda_accum_grad(backend, dnorm, grads.dnorm, p.value_dim)?);
-    }
-    let concat = |parts: &[DeviceHandle]| {
-        let refs: Vec<&DeviceHandle> = parts.iter().collect();
-        cuda_concat_rows(backend, &refs)
+    let rows = (0..p.batch)
+        .map(|row| {
+            let slice = |src| cuda_row_slice(backend, src, row, p.batch);
+            cuda_linear_attention_backward_device_row(
+                backend,
+                LinearAttentionDeviceBackwardArgs {
+                    params: row_params,
+                    upstream: &slice(args.upstream)?,
+                    qkv: &slice(args.qkv)?,
+                    z: &slice(args.z)?,
+                    b_proj: &slice(args.b_proj)?,
+                    a_proj: &slice(args.a_proj)?,
+                    preact: &slice(args.preact)?,
+                    qkv_conv: &slice(args.qkv_conv)?,
+                    q: &slice(args.q)?,
+                    k: &slice(args.k)?,
+                    v: &slice(args.v)?,
+                    g: &slice(args.g)?,
+                    g_cumsum: &slice(args.g_cumsum)?,
+                    beta: &slice(args.beta)?,
+                    a_inv: &slice(args.a_inv)?,
+                    chunk_state: &slice(args.chunk_state)?,
+                    raw_output: &slice(args.raw_output)?,
+                    conv1d_weight: args.conv1d_weight,
+                    dt_bias: args.dt_bias,
+                    a_log: args.a_log,
+                    norm_weight: args.norm_weight,
+                },
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let concat = |field: fn(&LinearAttentionDeviceBackwardResult) -> &DeviceHandle| {
+        let parts: Vec<&DeviceHandle> = rows.iter().map(field).collect();
+        cuda_concat_rows(backend, &parts)
     };
-    let shared = |acc: Option<DeviceHandle>| {
-        acc.ok_or(AutogradError::TapeInvariant(
-            "linear_attention batched backward produced no rows",
-        ))
+    let sum = |field: fn(&LinearAttentionDeviceBackwardResult) -> &DeviceHandle, len: usize| {
+        rows[1..]
+            .iter()
+            .try_fold(field(&rows[0]).clone(), |acc, row| {
+                backend.add(&acc, field(row), &[len])
+            })
     };
     Ok(Some(LinearAttentionDeviceBackwardResult {
-        dqkv: concat(&dqkv_rows)?,
-        dz: concat(&dz_rows)?,
-        db: concat(&db_rows)?,
-        da: concat(&da_rows)?,
-        dconv: shared(dconv)?,
-        ddt: shared(ddt)?,
-        da_log: shared(da_log)?,
-        dnorm: shared(dnorm)?,
+        dqkv: concat(|r| &r.dqkv)?,
+        dz: concat(|r| &r.dz)?,
+        db: concat(|r| &r.db)?,
+        da: concat(|r| &r.da)?,
+        dconv: sum(|r| &r.dconv, conv_len)?,
+        ddt: sum(|r| &r.ddt, p.num_value_heads)?,
+        da_log: sum(|r| &r.da_log, p.num_value_heads)?,
+        dnorm: sum(|r| &r.dnorm, p.value_dim)?,
     }))
 }
 
@@ -4904,6 +4855,8 @@ fn cuda_linear_attention_backward_device_row(
     })
 }
 
+/// GPU assist for the host-fallback backward — reachable only for shapes the
+/// device path declines (non-128 head dims); kept for those, not a hot path.
 #[cfg(not(feature = "no-cuda"))]
 fn cuda_linear_attention_scan_backward(
     backend: &CudaBackend,

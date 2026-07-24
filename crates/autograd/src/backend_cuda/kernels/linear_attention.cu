@@ -6,6 +6,11 @@
 // the key_dim x value_dim state-gradient matrix. This intentionally keeps the
 // existing Rust forward recompute and conv1d backward in place; the spike only
 // replaces the `scan_state_history` host loop.
+//
+// Index convention: int, EXCEPT products containing seq_len*key_dim*value_dim
+// (la_state_time_base) which overflow i32 near 8K total tokens and go through
+// long long. The chunked kernels below are batch==1-only (chunk_state carries
+// no batch stride); batch>1 is per-row dispatch in backend_cuda.rs.
 
 static constexpr int LINEAR_ATTENTION_MAX_DIM = 256;
 static constexpr int LINEAR_ATTENTION_BLOCK = 256;
