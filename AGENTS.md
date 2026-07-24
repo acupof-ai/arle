@@ -421,6 +421,10 @@ mechanical changes.
 - **Commit small tranches immediately.** Each self-contained change lands as its
  own commit; run verification after, fix issues in a follow-up commit, don't
  fold micro-changes into one opaque diff.
+- **Simplify before you commit — default, not optional.** Every code commit gets
+ a simplify pass on its own diff first (§0.2: delete before add, collapse
+ duplication, lowest-entropy correct form; the `/simplify` angles — reuse,
+ simplification, efficiency, altitude). No diff lands un-simplified.
 - **Never `git stash`** unrelated user changes — leave others' dirty paths in
  place, commit only your own files by explicit path.
 - After `git mv` + batch Edits, re-check `git status` and re-stage by path — the
