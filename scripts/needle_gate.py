@@ -33,7 +33,8 @@ TOPICS = [
 ]
 CUE = "\n\nRecall the secret access code stated earlier. The secret access code is"
 
-lengths = [int(x) for x in (sys.argv[1] if len(sys.argv) > 1 else
+TEMP_ARM = len(sys.argv) > 1 and sys.argv[1] == "temp"
+lengths = [int(x) for x in (sys.argv[1] if len(sys.argv) > 1 and not TEMP_ARM else
            "115,180,241,300,446,1000,2000,4000,8000").split(",")]
 runs = int(sys.argv[2]) if len(sys.argv) > 2 else 3
 depth = float(sys.argv[3]) if len(sys.argv) > 3 else 0.0
@@ -93,6 +94,43 @@ def one_chat(prompt):
 
 
 one = one_completion if os.environ.get("RAW") == "1" else one_chat
+
+
+def glued_repeat(out):
+    # Flattened-logits salad glues fragments back-to-back ("memoizatmemoizat");
+    # an order-preserving distortion passes every greedy probe, so this is the
+    # signature the temp arm keys on (errors/2026-07-20-hd256-fp8-temp-...).
+    for k in range(5, 17):
+        for i in range(len(out) - 2 * k + 1):
+            frag = out[i : i + k]
+            if frag == out[i + k : i + 2 * k] and frag.strip() and " " not in frag:
+                return out[i : i + 2 * k]
+    return None
+
+
+def temp_arm():
+    """temp=1.0 coherence arm: the greedy-only gate misses any distortion that
+    preserves argmax ordering. One sampled generation must run long and clean."""
+    want = int(os.environ.get("TEMP_TOKENS", 200))
+    prompt = "Explain, in plain prose, how a hash map works and when to use one."
+    body = {"model": os.environ.get("MODEL", "x"),
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": want, "temperature": 1.0, "seed": 7}
+    req = urllib.request.Request(BASE + "/v1/chat/completions",
+                                 data=json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json"})
+    d = json.loads(urllib.request.urlopen(req, timeout=1800).read())
+    out = d["choices"][0]["message"]["content"]
+    got = d.get("usage", {}).get("completion_tokens", 0)
+    rep = glued_repeat(out)
+    early = got < want // 2
+    verdict = "FAIL" if early or rep else "PASS"
+    print("TEMP-ARM %s tokens=%d/%d glued=%r out=%r" % (verdict, got, want, rep, out[:200]))
+    sys.exit(1 if verdict == "FAIL" else 0)
+
+
+if TEMP_ARM:
+    temp_arm()
 
 
 def classify(out):
