@@ -680,7 +680,6 @@ pub fn linear_attention_core_with_carry_taped(
     Ok(output_id)
 }
 
-#[allow(clippy::too_many_arguments)]
 /// Tape bytes the device forward saves per call — the 12 ctx tensors recorded
 /// below (f32: preact, output, g/g_cumsum/beta, chunk_state; bf16: qkv_conv,
 /// q, k, v, a_inv, raw_output). Exported so VRAM gates can model checkpointing

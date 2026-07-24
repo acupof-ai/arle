@@ -1,7 +1,10 @@
 use std::{
     collections::{HashMap, HashSet},
     f32::consts::TAU,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU8, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -2295,16 +2298,7 @@ impl Qwen35Layer {
             attn.dt_bias,
             attn.a_log,
             attn.norm,
-            LinearAttentionParams {
-                batch,
-                seq_len,
-                num_key_heads: cfg.linear_num_key_heads,
-                num_value_heads: cfg.linear_num_value_heads,
-                key_dim: cfg.linear_key_head_dim,
-                value_dim: cfg.linear_value_head_dim,
-                conv_kernel: cfg.linear_conv_kernel_dim,
-                eps: cfg.rms_norm_eps,
-            },
+            la_params(cfg, batch, seq_len),
             store,
             tape,
         )?;
@@ -2340,16 +2334,7 @@ impl Qwen35Layer {
             attn.dt_bias,
             attn.a_log,
             attn.norm,
-            LinearAttentionParams {
-                batch,
-                seq_len: gen_start,
-                num_key_heads: cfg.linear_num_key_heads,
-                num_value_heads: cfg.linear_num_value_heads,
-                key_dim: cfg.linear_key_head_dim,
-                value_dim: cfg.linear_value_head_dim,
-                conv_kernel: cfg.linear_conv_kernel_dim,
-                eps: cfg.rms_norm_eps,
-            },
+            la_params(cfg, batch, gen_start),
             None,
             None,
             true,
@@ -2393,16 +2378,7 @@ impl Qwen35Layer {
             attn.dt_bias,
             attn.a_log,
             attn.norm,
-            LinearAttentionParams {
-                batch,
-                seq_len: gen_len,
-                num_key_heads: cfg.linear_num_key_heads,
-                num_value_heads: cfg.linear_num_value_heads,
-                key_dim: cfg.linear_key_head_dim,
-                value_dim: cfg.linear_value_head_dim,
-                conv_kernel: cfg.linear_conv_kernel_dim,
-                eps: cfg.rms_norm_eps,
-            },
+            la_params(cfg, batch, gen_len),
             Some(prefix_state.state),
             Some(prefix_state.conv_window),
             store,
@@ -2460,16 +2436,7 @@ impl Qwen35Layer {
             attn.dt_bias,
             attn.a_log,
             attn.norm,
-            LinearAttentionParams {
-                batch,
-                seq_len,
-                num_key_heads: cfg.linear_num_key_heads,
-                num_value_heads: cfg.linear_num_value_heads,
-                key_dim: cfg.linear_key_head_dim,
-                value_dim: cfg.linear_value_head_dim,
-                conv_kernel: cfg.linear_conv_kernel_dim,
-                eps: cfg.rms_norm_eps,
-            },
+            la_params(cfg, batch, seq_len),
             store,
             tape,
         )?;
@@ -2513,6 +2480,21 @@ pub struct Qwen35Model {
 enum Qwen35InitMode {
     ScratchTrain,
     LoraOrFrozen { materialize_frozen_base: bool },
+}
+
+/// The one config→params mapping — every linear-attention call site and the
+/// checkpoint gate's ctx-bytes model must agree field-for-field.
+fn la_params(cfg: &Qwen35Config, batch: usize, seq_len: usize) -> LinearAttentionParams {
+    LinearAttentionParams {
+        batch,
+        seq_len,
+        num_key_heads: cfg.linear_num_key_heads,
+        num_value_heads: cfg.linear_num_value_heads,
+        key_dim: cfg.linear_key_head_dim,
+        value_dim: cfg.linear_value_head_dim,
+        conv_kernel: cfg.linear_conv_kernel_dim,
+        eps: cfg.rms_norm_eps,
+    }
 }
 
 impl Qwen35Model {
@@ -2579,23 +2561,18 @@ impl Qwen35Model {
                     .iter()
                     .filter(|layer| matches!(layer.self_attn, Qwen35Attention::Linear(_)))
                     .count();
-                let la_ctx = linear_attention_ctx_bytes(LinearAttentionParams {
-                    batch,
-                    seq_len,
-                    num_key_heads: cfg.linear_num_key_heads,
-                    num_value_heads: cfg.linear_num_value_heads,
-                    key_dim: cfg.linear_key_head_dim,
-                    value_dim: cfg.linear_value_head_dim,
-                    conv_kernel: cfg.linear_conv_kernel_dim,
-                    eps: cfg.rms_norm_eps,
-                });
+                let la_ctx = linear_attention_ctx_bytes(la_params(cfg, batch, seq_len));
                 let total = per_layer
                     .saturating_mul(self.layers.len())
                     .saturating_add(la_ctx.saturating_mul(la_layers));
                 let engage = total.saturating_mul(3) > free;
-                if engage {
+                // Log first decision and every flip: the gate's failure class is
+                // a silent false-non-engage (97 GB OOM, errors/2026-07-24), so
+                // the breadcrumb must exist even when it never engages.
+                static LAST: AtomicU8 = AtomicU8::new(u8::MAX);
+                if LAST.swap(engage as u8, Ordering::Relaxed) != engage as u8 {
                     eprintln!(
-                        "[ckpt-gate] engage batch={batch} seq={seq_len} \
+                        "[ckpt-gate] engage={engage} batch={batch} seq={seq_len} \
                          modeled={total}B (la_layers={la_layers}) free={free}B"
                     );
                 }
