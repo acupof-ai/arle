@@ -19,7 +19,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use anyhow::{Result, ensure};
@@ -201,6 +201,54 @@ impl DsparkTrainer {
         Ok(())
     }
 
+    /// #169 case probe (`ARLE_DSPARK_DUMP=<path>`): one JSONL line per trained
+    /// row — the decoded ground truth aggregate metrics kept hiding. Capped by
+    /// `ARLE_DSPARK_DUMP_ROWS` (default 512), process-global.
+    fn dump_case_rows(
+        path: &std::ffi::OsStr,
+        draft: &[f32],
+        target: &[f32],
+        pg: &[usize],
+        cond: &[usize],
+        rewards: &[f32],
+        vocab: usize,
+    ) {
+        use std::io::Write;
+        static DUMPED: AtomicUsize = AtomicUsize::new(0);
+        let cap = std::env::var("ARLE_DSPARK_DUMP_ROWS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(512);
+        let already = DUMPED.load(Ordering::Relaxed);
+        if already >= cap {
+            return;
+        }
+        let take = pg.len().min(cap - already);
+        let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        else {
+            return;
+        };
+        let argmax = |row: &[f32]| {
+            row.iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .map_or(0, |(i, _)| i)
+        };
+        for i in 0..take {
+            let d = argmax(&draft[i * vocab..(i + 1) * vocab]);
+            let t = argmax(&target[i * vocab..(i + 1) * vocab]);
+            let _ = writeln!(
+                f,
+                "{{\"cond\":{},\"drafted\":{},\"draft_argmax\":{d},\"target_argmax\":{t},\"reward\":{}}}",
+                cond[i], pg[i], rewards[i]
+            );
+        }
+        DUMPED.fetch_add(take, Ordering::Relaxed);
+    }
+
     /// Run one training step on a batch of experiences.
     pub fn train_step(&mut self, experiences: &[DsparkExperience]) -> Result<f32> {
         if experiences.is_empty() {
@@ -272,6 +320,19 @@ impl DsparkTrainer {
         let n_rows = pg_tokens.len();
         if n_rows == 0 {
             return Ok(0.0);
+        }
+        // #169 case probe: decoded per-row ground truth (drafted token vs base
+        // draft argmax vs target argmax). Env-gated, capped, append-only.
+        if let Some(path) = std::env::var_os("ARLE_DSPARK_DUMP") {
+            Self::dump_case_rows(
+                &path,
+                &draft_rows,
+                &target_rows,
+                &pg_tokens,
+                &cond_tokens,
+                &row_rewards,
+                vocab_size,
+            );
         }
         let weight_sum: f32 = token_weights.iter().sum();
 
