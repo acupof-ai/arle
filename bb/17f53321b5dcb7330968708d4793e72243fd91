@@ -1,0 +1,23 @@
+crates/autograd/src/backend_cuda.rs
+  s_9c91b86ec3fb55::t_4c00b59695cbc2 3735,3751
+crates/train/src/qwen35.rs
+  s_9c91b86ec3fb55::t_ddd3b56f90fa3f 4-7,2301,2337,2381,2439,2485-2499,2564,2569-2573,2575
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "bb17f53321b5dcb7330968708d4793e72243fd91",
+  "prompts": {},
+  "sessions": {
+    "s_9c91b86ec3fb55": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4779911a-69b7-49db-bc83-daf5a48d6ca3",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
