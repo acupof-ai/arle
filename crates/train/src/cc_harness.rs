@@ -210,7 +210,7 @@ impl CcHarness {
     /// Release each sample to its own cc→score thread as its boot lands (no
     /// group barrier), collect all `k`, convert the group's dumps in-memory.
     pub fn run_group(&self, booted: BootedGroup) -> Result<CcGroup> {
-        let samples = std::thread::scope(|scope| -> Result<Vec<ScoredSample>> {
+        let mut samples = std::thread::scope(|scope| -> Result<Vec<ScoredSample>> {
             let (tx, rx) = sync_channel(booted.k);
             for _ in 0..booted.k {
                 let (sample, workdir) = booted.rx.recv().context("cc boot thread died")??;
@@ -252,6 +252,28 @@ impl CcHarness {
             })
             .collect();
         let records = convert_cc_dumps(&self.dump_dir, &self.tokenizer, &windows)?;
+        // Backfill tokens for timed-out samples: `cc_input/output_tokens` come from
+        // the `claude` CLI stdout usage (run_sample), which is None on the 600s wall
+        // → group metrics zeroed those trajectories (2026-07-24 band=1 root cause).
+        // The serve-written sidecars survive the CLI timeout; convert_cc_dumps just
+        // read them into `records`. Per sample, the final turn = the record with the
+        // largest prompt (resent-prefix growth); use its prompt/gen lens (summing
+        // turns double-counts the prefix). Only fill the None (CLI usage stays
+        // authoritative when present).
+        for s in &mut samples {
+            if s.cc_input_tokens.is_some() {
+                continue;
+            }
+            let prefix = format!("{}#{}#r", s.task_id, s.sample);
+            let final_turn = records
+                .iter()
+                .filter(|r| r.label.starts_with(&prefix))
+                .max_by_key(|r| r.prompt_ids.len());
+            if let Some(r) = final_turn {
+                s.cc_input_tokens = Some(r.prompt_ids.len() as u64);
+                s.cc_output_tokens = Some(r.response_ids.len() as u64);
+            }
+        }
         Ok(CcGroup {
             task_id: booted.task.instance_id.clone(),
             samples,
