@@ -1,0 +1,107 @@
+CHANGELOG-history.md
+  s_f960a578089fde::t_d429783f93aabc 51,358
+crates/cuda-kernels/AGENTS.md
+  s_ee3fdcf92fb323::t_81bd211d42e4f7 16,126,199-200
+docs/codebase-map.md
+  s_f6c5cd7943b425::t_82df3ef81f84b6 12,28,176,323-324,358,361-362
+docs/environment.md
+  s_ee3fdcf92fb323::t_1048dd5b6244a7 230,295,383,468
+docs/experience/wins/2026-07-02-agent-opd-full10-e2e.md
+  s_f6c5cd7943b425::t_a8f237cdf7fa20 67
+docs/experience/wins/2026-07-02-dsv4-lm-head-shard-lever.md
+  s_ee3fdcf92fb323::t_b102d7a4af50a4 4
+docs/experience/wins/2026-07-06-bench-guidellm-dsv4-mtp-tp4.md
+  s_f6c5cd7943b425::t_ea09943451a65c 70
+docs/experience/wins/2026-07-06-bench-guidellm-dsv4-mtp.md
+  s_ee3fdcf92fb323::t_71cc462e5ff858 47
+docs/experience/wins/2026-07-08-dsv4-flashmla-budget-needle-gate-pass.md
+  s_ee3fdcf92fb323::t_380ffae84a70d9 12-13
+docs/experience/wins/2026-07-08-dsv4-route-a-prefix-reuse-end-to-end.md
+  s_ee3fdcf92fb323::t_375963234d6222 13
+docs/experience/wins/2026-07-10-dsv4-park-deletion-phase2b.md
+  s_f31b0f49b17fa5::t_12b39df671b3cc 10
+docs/experience/wins/2026-07-10-dsv4-prefix-state-pool-phase2a.md
+  s_ee3fdcf92fb323::t_50e6cd3bdb8312 13
+docs/experience/wins/2026-07-20-dspark-train-sidecar-e2e-verified.md
+  s_f960a578089fde::t_137e8eb6bdf1c5 5
+docs/experience/wins/TEMPLATE-bench-agent-load.md
+  s_ee3fdcf92fb323::t_caa957713dba98 4
+docs/onboarding.md
+  s_f960a578089fde::t_85e0f220a28f92 20,52
+docs/release-checklist.md
+  s_f960a578089fde::t_dc7f17d2b13879 24-28
+examples/opd/README.md
+  s_f960a578089fde::t_a25887ec792e22 81
+.claude/skills/arle-upstream-runtime-scan/SKILL.md
+  s_ee3fdcf92fb323::t_ecd4b2cef2c621 60
+AGENTS.md
+  s_ee3fdcf92fb323::t_f848cd015cface 376-381,435-437,476
+CHANGELOG.md
+  s_ee3fdcf92fb323::t_9ef5b2378ee93b 185,211,492,528,557,579,662,677,1114,1129
+crates/README.md
+  s_ee3fdcf92fb323::t_ac756c60c67d3a 20,34
+crates/autograd/AGENTS.md
+  s_ee3fdcf92fb323::t_df65cecf64b59a 154
+crates/cuda-kernels/tools/tilelang/README.md
+  s_ee3fdcf92fb323::t_a7352db7003b4c 5,116
+crates/cuda-kernels/vendor/README.md
+  s_ee3fdcf92fb323::t_ad25f589cb5dca 22
+crates/mlx-sys/AGENTS.md
+  s_ee3fdcf92fb323::t_95bfd1e54b3d06 154
+docs/architecture.md
+  s_ee3fdcf92fb323::t_a9b879735730d5 6,140-141,167,178,204-206,258,264,270,292
+docs/comparison.md
+  s_ee3fdcf92fb323::t_2339b5353196ed 68-69
+docs/experience/errors/2026-07-09-dsv4-route-a-flashmla-needle-regression-bisected.md
+  s_ee3fdcf92fb323::t_f1a2b85e85690e 54
+docs/experience/wins/2026-05-07-bench-qwen36-moe-topk-runtime-knob.md
+  s_ee3fdcf92fb323::t_e38fc6b0a270bb 123-124
+docs/index.md
+  s_ee3fdcf92fb323::t_3a4cf2b54cbd5c 11-13,46,50-51
+docs/support-matrix.md
+  s_ee3fdcf92fb323::t_d7813aa26cc0b8 136,233,238,306-308
+vendor/llama.cpp/README.md
+  s_ee3fdcf92fb323::t_e1385aa1b9aeb2 8
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "c37d5b3a532543318f8c3a1ce4efc901b1bdb955",
+  "prompts": {},
+  "sessions": {
+    "s_ee3fdcf92fb323": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a7591468ab1d8b0a6",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_f31b0f49b17fa5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a1b72dbed5ca29ba2",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_f6c5cd7943b425": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a87bcacee0ff8dc4f",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_f960a578089fde": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ab53dd35c9143f0a4",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
