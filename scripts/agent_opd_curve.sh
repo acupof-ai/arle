@@ -163,7 +163,7 @@ common_args=(
     --lora-alpha 32
     --lora-target-set attention-qv
     --save-every 0
-    "${spec_args[@]}"
+    ${spec_args[@]+"${spec_args[@]}"}
 )
 
 # 1b. Comfort-band corpus filter (default on; COMFORT_BAND=0 or SMOKE=1 to skip).
@@ -180,6 +180,12 @@ if [[ ${COMFORT_BAND:-1} == 1 && ${SMOKE:-0} != 1 ]]; then
         --work-root "$WORK/cb_work" --staleness 0 --task-selection false \
         --rounds 1 --eval-every 0 --eval-out-dir "$OUT/cb_profile" \
         2>&1 | tee "$OUT/cb_profile.log"
+    # Sharded data-parallel profile: each GPU worker writes only its metrics and
+    # stops; the orchestrator (agent_opd_profile_sharded.sh) merges + cuts the band.
+    if [[ ${PROFILE_METRICS_ONLY:-0} == 1 ]]; then
+        echo "[curve] PROFILE_METRICS_ONLY=1 — metrics at $OUT/cb_profile/metrics.jsonl, stopping before band cut."
+        exit 0
+    fi
     if python3 scripts/comfort_band.py \
             --metrics "$OUT/cb_profile/metrics.jsonl" --corpus "$CORPUS" --out "$OUT/corpus-band" \
             --train-name "$TRAIN_JSONL" --eval-name "$EVAL_JSONL" \
