@@ -120,9 +120,15 @@ def temp_arm():
                                  data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"})
     d = json.loads(urllib.request.urlopen(req, timeout=1800).read())
-    out = d["choices"][0]["message"]["content"]
+    msg = d["choices"][0]["message"]
+    # Thinking models put text in reasoning_content with content empty — an
+    # empty string would make the glued check vacuous (observed 2026-07-24).
+    out = (msg.get("reasoning_content") or "") + (msg.get("content") or "")
     got = d.get("usage", {}).get("completion_tokens", 0)
     rep = glued_repeat(out)
+    if not out.strip():
+        print("TEMP-ARM FAIL empty output (tokens=%d)" % got)
+        sys.exit(1)
     early = got < want // 2
     verdict = "FAIL" if early or rep else "PASS"
     print("TEMP-ARM %s tokens=%d/%d glued=%r out=%r" % (verdict, got, want, rep, out[:200]))

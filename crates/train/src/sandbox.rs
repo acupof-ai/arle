@@ -574,6 +574,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        feature = "cuda",
+        ignore = "ELKEID kills CUDA-linked fork+exec on the pod (reference_h20_pod_elkeid_kills_cuda_forks); logic covered on cpu lanes"
+    )]
     fn run_captured_does_not_hang_on_backgrounded_child() {
         let _guard = env_guard();
         // Regression: a command that backgrounds a process inheriting the stdout
@@ -617,6 +621,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        feature = "cuda",
+        ignore = "ELKEID kills CUDA-linked fork+exec on the pod (reference_h20_pod_elkeid_kills_cuda_forks); logic covered on cpu lanes"
+    )]
     fn score_detects_failing_test() {
         let _guard = env_guard();
         // Gate on pytest availability — skip if python3/pytest is absent.
@@ -644,6 +652,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        feature = "cuda",
+        ignore = "ELKEID kills CUDA-linked fork+exec on the pod (reference_h20_pod_elkeid_kills_cuda_forks); logic covered on cpu lanes"
+    )]
     fn score_resets_student_dirtied_test_file_before_applying_patch() {
         let _guard = env_guard();
         // Regression: a rollout that edits a (hidden) test file used to make the
@@ -705,6 +717,10 @@ mod tests {
     /// equivalence. Serialized on a global lock because the spawner env is
     /// process-global and Rust runs tests in parallel.
     #[test]
+    #[cfg_attr(
+        feature = "cuda",
+        ignore = "ELKEID kills CUDA-linked fork+exec on the pod (reference_h20_pod_elkeid_kills_cuda_forks); logic covered on cpu lanes"
+    )]
     fn spawner_routing_matches_direct() {
         use crate::spawner::{LISTEN_ENV, SOCKET_ENV, serve_loop};
         // One lock shared with spawner.rs's server test — cargo runs both in
