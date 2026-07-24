@@ -3857,9 +3857,15 @@ impl Qwen35Model {
                 );
             }
         } else {
+            // #170 attribution probe: full-tape per-layer VRAM ramp. free is
+            // pool-reserved-aware (cuMemGetInfo), so slope = tape + transients.
+            let vram_ramp = std::env::var("ARLE_OPD_VRAM_TRACE").is_ok();
             for (layer_index, layer) in self.layers.iter().enumerate() {
                 hidden = self.detach_before_lora_layer(hidden, layer_index, store, tape)?;
                 hidden = layer.forward(hidden, &self.config, self.tp, cos, sin, store, tape)?;
+                if vram_ramp && let Some((free, _)) = store.backend().device_mem_info() {
+                    eprintln!("[vram-ramp] layer={layer_index} free={free}");
+                }
             }
         }
         qwen35_rmsnorm(
