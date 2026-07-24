@@ -143,9 +143,7 @@ impl QwenCudaExecutor {
                     mem_fraction_static,
                 );
                 let profiled_pages = (profiled_tokens / SUPPORTED_PAGE_SIZE as u64) as usize;
-                // #178: measured VRAM is the ceiling; `requested_pages` is advisory.
-                // Flooring the profile at a constant books HBM the card lacks and
-                // OOMs the first prefill instead of the boot.
+                // #178: flooring the profile at a constant books HBM the card lacks.
                 let sized = profiled_pages.max(1);
                 log::info!(
                     "CUDA dense Qwen3 KV pool profiled from measured VRAM: free {}MB / total \
