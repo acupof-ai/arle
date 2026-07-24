@@ -1,0 +1,27 @@
+crates/cli/src/args.rs
+  s_3bfdcf8fceb2d5::t_f5060bac48b3e6 391-392,634
+crates/train/src/cc_convert.rs
+  s_3bfdcf8fceb2d5::t_9f41c6d7e1c7ae 264,310
+crates/train/src/cc_harness.rs
+  s_3bfdcf8fceb2d5::t_78e2bca1b31368 6-7,9,13,15,19,215-217,219,401
+scripts/agent_opd_curve.sh
+  s_3bfdcf8fceb2d5::t_5462d3412fe9cc 7-8,13-14,158
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "2ab7883f150094984d197ce2c2f4d6ff0ad8b977",
+  "prompts": {},
+  "sessions": {
+    "s_3bfdcf8fceb2d5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "62ec01f2-d7cd-44c5-b546-2e6a64756530",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
