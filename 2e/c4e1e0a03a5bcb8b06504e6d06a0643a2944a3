@@ -1,0 +1,25 @@
+crates/train/examples/opd_step_cuda_infer_teacher_train.rs
+  s_426dd051cb7592::t_aa750b575c5060 1077-1086
+crates/train/src/sandbox.rs
+  s_426dd051cb7592::t_6613ea1da81cc8 220-227
+crates/train/src/qwen35.rs
+  s_426dd051cb7592::t_c2317987704b02 2546-2548,2558-2579,2581-2584,6258-6264
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "2ec4e1e0a03a5bcb8b06504e6d06a0643a2944a3",
+  "prompts": {},
+  "sessions": {
+    "s_426dd051cb7592": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-af5121894873cdc62",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
