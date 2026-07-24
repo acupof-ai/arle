@@ -3267,6 +3267,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
         test_timeout_secs: args.test_timeout_secs,
         pythonpath: args.pythonpath.clone(),
         reward_shape: args.reward_shape.into(),
+        group_stagger: args.group_stagger,
         tokenizer: train::cc_harness::load_tokenizer(&student_dir.join("tokenizer.json"))?,
     });
 
