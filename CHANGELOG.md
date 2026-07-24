@@ -31,8 +31,8 @@ progress spine).
   loss parity). Checkpoint gate models the 12 LA ctx tensors exactly.
   Pod-verified:
   [wins](docs/experience/wins/2026-07-24-cuda-batched-la-device-path.md).
-  Open: gate under-models mid-length batched full-tape (~5.8× at B=4
-  seq=1040) — near-OOM at engage=false; issue filed.
+  Gate boundary calibrated ×3→×4 same day from the measured full-tape ramp
+  (#170, `b2a5d6180`); cuda-lane clippy debt cleared (#171, `0e05b052c`).
 - **ACCEPT — systematic review-fix sweep (26 findings); one relay regression
   fixed** (2026-07-24, `f0a635e02` + `837b89d39`). 26 confirmed defects fixed
   (2 high, 9 medium, 15 low) across scheduler / serving / OPD / kv-tier /
