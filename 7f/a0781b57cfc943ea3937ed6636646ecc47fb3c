@@ -1,0 +1,27 @@
+CHANGELOG.md
+  s_5dd1d01c3b1992::t_9022fe24a82fcb 26-36
+crates/train/src/runtime_flags.rs
+  s_5dd1d01c3b1992::t_de96b1cab6ae49 90-94,96
+docs/experience/wins/2026-07-24-ppl-harness-fp8-matrix.md
+  s_5dd1d01c3b1992::t_a2d65ec680946c 1-46
+docs/experience/wins/2026-07-24-writeback-offload-dial-back.md
+  s_5dd1d01c3b1992::t_90d935e4681f80 1-44
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "7fa0781b57cfc943ea3937ed6636646ecc47fb3c",
+  "prompts": {},
+  "sessions": {
+    "s_5dd1d01c3b1992": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aee65a1f002f9fd22",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
