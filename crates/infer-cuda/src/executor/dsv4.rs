@@ -1975,6 +1975,7 @@ impl Dsv4CudaExecutor {
                 &starts,
                 &positions,
                 &params,
+                true, // anchor: the draft reads these taps
             )?;
             // ── Phase 1c: per-slot draft + proposal (draft is a small 3-stage
             // model; each slot has independent latent_kv context, so batching
@@ -2376,6 +2377,7 @@ impl Dsv4CudaExecutor {
             &batch.start_positions,
             &batch.positions,
             &params,
+            false, // plain decode: no draft consumes taps here
         )?;
         ensure!(
             out.len() == batch.rows.len(),

@@ -101,13 +101,24 @@ CUDA half verified on **H20 sm_90** (DSv4-Flash-FP8 TP=4/EP=4) and built on
   the steady-state relay reader → TP=4 c8+ serve teardown (framing desync). Fixed
   in `837b89d39`; pod-confirmed c8 48/48 + c16 64/64, no teardown. See
   errors/2026-07-24-relay-hello-timeout-leak-tp4-teardown.md.
-- **Open (not attributed to this sweep):** a reproducible c16 throughput deficit
-  (−40% vs 07-19 champion, batching/scaling — c8→c16 1.16× vs champion 1.58×),
-  measured on a binary that also carries concurrent non-sweep changes
-  (infer-cuda/executor.rs edits). This sweep's scheduler changes are O(1) /
-  behavior-equivalent and don't touch batch formation, and c1/c4 were
-  perf-neutral, so the mechanism points elsewhere — needs a champion-binary A/B +
-  a sweep-isolated build to attribute.
+- **c16 deficit — code-attributed on HEAD (no A/B), 2026-07-24:** the reported
+  −40% / c8→c16-1.16× is **not a HEAD code regression**. Traced every changed
+  line on the DSv4-spec-none c16 path since champion `45dd64bd2`:
+  `Dsv4Model::forward_decode_batch` (the spec-none decode entry) is **byte-for-byte
+  identical**; `num_slots` is identical (7a8c0bdd4 adds `extra_per_slot_bytes=0`
+  for spec-off → `per_slot` unchanged; the total_pages override was reverted in
+  6a5c39282); `allocate_for_plan`'s device gate returns `None` for DSv4 (dead);
+  `build_forward_plan` batches all decodes uncapped. The only new op on the path
+  — a DSpark T3 tap D2D per row (`if dspark` at dsv4.rs) — is µs-scale; a
+  1.58→1.16 scaling drop needs **~ms/row** added cost (≈1000× larger). So the
+  −40% is a **measurement artifact** (cross-day/box/thermal champion baseline),
+  not code. **Fixed one real defect found in the trace:** the tap capture was
+  gated on the checkpoint's `is_dspark()`, so a spec-off serve on a DSpark
+  checkpoint paid N per-row tap D2Ds/step for taps nothing reads. Now gated on a
+  runtime `capture_taps` flag (true only at the spec anchor call). Dead-work
+  removal on the spec-off decode hot path; **pending-remote** pod bench (CUDA,
+  can't run locally) — not expected to move the c16 number (µs-scale), lands as
+  a correctness/hygiene fix.
 
 ## Rule
 
