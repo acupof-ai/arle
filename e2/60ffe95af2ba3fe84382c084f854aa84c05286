@@ -1,0 +1,23 @@
+crates/deepseek-spec/src/v4.rs
+  s_369a57354b1459::t_96c434072e9e1c 108-110
+docs/experience/wins/2026-07-23-systematic-review-fixes.md
+  s_369a57354b1459::t_2d2d40821c3cf0 104-123
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "e260ffe95af2ba3fe84382c084f854aa84c05286",
+  "prompts": {},
+  "sessions": {
+    "s_369a57354b1459": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a37afa08-363e-420d-97a5-35b731b7f708",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
