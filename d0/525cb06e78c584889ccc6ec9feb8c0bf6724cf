@@ -1,0 +1,23 @@
+CHANGELOG.md
+  s_9c91b86ec3fb55::t_e7d5caf30450da 26-42
+docs/experience/wins/2026-07-25-kv-pool-floor-yields-to-measured-vram.md
+  s_9c91b86ec3fb55::t_16902978befe1e 1-46
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "d0525cb06e78c584889ccc6ec9feb8c0bf6724cf",
+  "prompts": {},
+  "sessions": {
+    "s_9c91b86ec3fb55": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4779911a-69b7-49db-bc83-daf5a48d6ca3",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
