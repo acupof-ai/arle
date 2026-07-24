@@ -21,21 +21,38 @@ Single serve process, `--dspark-train`, before/after 5 min training:
 Trainer was active: loss 0.0318 → −0.0243, baseline EMA 0.5014 → 0.4874,
 n=64 batches. Loss decreased ~5× but acceptance rate *slightly decreased*.
 
-## Root Cause (hypothesis)
+## Root Cause — verified (#169, 2026-07-24)
 
-`prob_match_alpha = 0.9` (DeepSpec default) means 90% of the gradient comes
-from L2 probability matching (`Σ(softmax(draft) − softmax(target))²`) and only
-10% from policy gradient. The L2 loss pulls the draft *distribution* toward
-the target distribution, but acceptance depends on whether the draft's
-**argmax** matches the target's argmax — a distribution can be closer in L2
-yet have the same or worse top-1 agreement. The PG signal (reward =
-accepted/block_size) that directly optimizes acceptance is drowned out.
+The trainer optimized a mis-parameterized, mis-aligned objective — loss could
+fall while serve acceptance stayed flat. Four defects, all static-verified:
 
-## Fix being tested
+- **D1 — w2 frame transposed.** Serve is `[vocab, rank]` row-major
+  (`infer-cuda/src/qwen35/dspark.rs:564` load ensure; `ops.rs:146` gemm
+  contract). Trainer wrapped the same flat buffer as `[rank, vocab]` and did
+  `emb @ w2` (`train/src/dspark_train.rs:192,252`) — a different index
+  permutation. Fixed: `[vocab, rank]` + `matmul_bt`.
+- **D2 — bias leaked the row's own label.** Serve conditions on the PREVIOUS
+  chain token (`dspark.rs:966-975`); trainer embedded the token at position j
+  itself (`dspark_train.rs:240-245`).
+- **D3 — row alignment ignored head mode.** Serve `first_row =
+  !next_token_heads` (`dspark.rs:964`): same-position heads never draft row 0
+  and pair draft row j ↔ target row j−1; trainer used j↔j, rows 0.., token =
+  cond = chain[j]. Fixed per-mode; decay now indexes the draft position within
+  trained rows, not the raw row.
+- **D4 — the mode flag wasn't captured.** `DsparkExperience` lacked
+  `next_token_heads`; added at both capture fns + all call sites (qwen35 +
+  DSv4).
 
-Lower `prob_match_alpha` 0.9 → 0.5 (PG:prob_match = 1:1) so the PG gradient
-gets equal weight. Commit `b719eb252`. Benchmark pending (agent killed by user
-mid-run; needs re-run).
+## Prior hypothesis — alpha weighting
+
+The first-pass hypothesis blamed `prob_match_alpha = 0.9` (L2 drowns PG).
+The 0.9 → 0.5 flip (`b719eb252`) is predicted no-op pending re-benchmark —
+with D1-D3, both loss terms back-propagated through the wrong frame and rows,
+so no weighting could have fixed acceptance.
+
+## Accept gate
+
+Pod acceptance re-benchmark (before/after `--dspark-train` on H20) — pending.
 
 ## Rule
 

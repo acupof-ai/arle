@@ -38,6 +38,10 @@ pub struct DsparkExperience {
     pub accepted: usize,
     pub block_size: usize,
     pub vocab_size: usize,
+    /// Draft head mode (serve `first_row = !next_token_heads`): true = draft
+    /// row j drafted chain[j+1] conditioned on chain[j]; false = same-position,
+    /// row j drafted chain[j] conditioned on chain[j-1] and row 0 never drafts.
+    pub next_token_heads: bool,
 }
 
 /// Trait abstracting the experience buffer so the trainer does not depend on
@@ -90,7 +94,7 @@ impl Default for DsparkTrainConfig {
 /// The trainable Markov head parameters.
 struct MarkovParams {
     w1: TensorId, // [vocab, rank]
-    w2: TensorId, // [rank, vocab]
+    w2: TensorId, // [vocab, rank] — the serve gemm_batch weight frame
     rank: usize,
 }
 
@@ -112,7 +116,7 @@ pub struct DsparkTrainer {
 impl DsparkTrainer {
     /// Create a new trainer.
     ///
-    /// `init_weights` = `(w1 [vocab*rank], w2 [rank*vocab], rank)` read from
+    /// `init_weights` = `(w1 [vocab*rank], w2 [vocab*rank], rank)` read from
     /// the engine's loaded checkpoint. When provided, the trainer seeds from
     /// these (so acceptance never regresses at startup) and the actual `rank`
     /// overrides `config.markov_rank`. When `None`, falls back to Xavier-ish
@@ -154,7 +158,7 @@ impl DsparkTrainer {
         let (rank, w1_data, w2_data) = match self.init_weights.take() {
             Some((w1, w2, rank)) => {
                 let expected_w1 = vocab_size * rank;
-                let expected_w2 = rank * vocab_size;
+                let expected_w2 = vocab_size * rank;
                 ensure!(
                     w1.len() == expected_w1,
                     "init w1 size mismatch: got {}, expected {expected_w1} (vocab={vocab_size}, rank={rank})",
@@ -176,7 +180,7 @@ impl DsparkTrainer {
                         scale * (s * 0.1).sin()
                     })
                     .collect();
-                let w2: Vec<f32> = (0..rank * vocab_size)
+                let w2: Vec<f32> = (0..vocab_size * rank)
                     .map(|i| {
                         let s = (i % 1000) as f32;
                         scale * (s * 0.1).cos()
@@ -191,7 +195,7 @@ impl DsparkTrainer {
             .alloc(Tensor::new(w1_data, vec![vocab_size, rank], true)?);
         let w2 = self
             .store
-            .alloc(Tensor::new(w2_data, vec![rank, vocab_size], true)?);
+            .alloc(Tensor::new(w2_data, vec![vocab_size, rank], true)?);
 
         self.params = Some(MarkovParams { w1, w2, rank });
         Ok(())
@@ -204,8 +208,15 @@ impl DsparkTrainer {
         }
 
         let batch = experiences.len().min(self.config.batch_size);
-        let block_size = experiences[0].block_size;
+        let experiences = &experiences[..batch];
         let vocab_size = experiences[0].vocab_size;
+        let next_token_heads = experiences[0].next_token_heads;
+        ensure!(
+            experiences
+                .iter()
+                .all(|e| e.vocab_size == vocab_size && e.next_token_heads == next_token_heads),
+            "heterogeneous experience batch (vocab_size or next_token_heads)"
+        );
 
         // Lazily build Markov params with the actual vocab size from the
         // first experience, so the trainer is model-agnostic at construction.
@@ -218,77 +229,84 @@ impl DsparkTrainer {
         // intermediate created during this step in one call (no manual ID list).
         let live_before: HashSet<TensorId> = self.store.live_ids().into_iter().collect();
 
-        let mut all_logits = Vec::with_capacity(batch * block_size * vocab_size);
-        let mut all_target_logits = Vec::with_capacity(batch * block_size * vocab_size);
-        let mut all_tokens_usize = Vec::with_capacity(batch * block_size);
+        // Row alignment mirrors the serve drafting loop (qwen35/dspark.rs
+        // `first_row = !next_token_heads`): draft position t drafted
+        // chain[t+1] at draft-logits row t + d, conditioned on chain[t];
+        // the trunk verify (target) row t predicts chain[t+1]. Same-position
+        // heads (d = 1) never draft from row 0, so it is excluded entirely.
+        let d = usize::from(!next_token_heads);
+        let mut draft_rows: Vec<f32> = Vec::new();
+        let mut target_rows: Vec<f32> = Vec::new();
+        let mut pg_tokens: Vec<usize> = Vec::new(); // chain[t+1] — the drafted token
+        let mut cond_tokens: Vec<usize> = Vec::new(); // chain[t] — the bias condition
+        let mut token_weights: Vec<f32> = Vec::new();
+        let mut row_rewards: Vec<f32> = Vec::new();
         let mut rewards = Vec::with_capacity(batch);
-        for exp in &experiences[..batch] {
-            all_logits.extend_from_slice(&exp.draft_logits);
-            all_target_logits.extend_from_slice(&exp.target_logits);
-            all_tokens_usize.extend(exp.draft_tokens.iter().map(|&t| t as usize));
-            rewards.push(exp.accepted as f32 / exp.block_size as f32);
+        for exp in experiences {
+            let chain = &exp.draft_tokens;
+            let draft_len = exp.draft_logits.len() / vocab_size;
+            let target_len = exp.target_logits.len() / vocab_size;
+            let trained = (chain.len().saturating_sub(1))
+                .min(draft_len.saturating_sub(d))
+                .min(target_len);
+            let reward = exp.accepted as f32 / exp.block_size as f32;
+            rewards.push(reward);
+            for t in 0..trained {
+                let j = t + d;
+                draft_rows
+                    .extend_from_slice(&exp.draft_logits[j * vocab_size..(j + 1) * vocab_size]);
+                target_rows
+                    .extend_from_slice(&exp.target_logits[t * vocab_size..(t + 1) * vocab_size]);
+                pg_tokens.push(chain[t + 1] as usize);
+                cond_tokens.push(chain[t] as usize);
+                // Exponential decay over the DRAFT position t within trained
+                // rows (not the raw row index): a mistake at draft position 0
+                // voids the rest of the block.
+                token_weights.push(match self.config.loss_decay_gamma {
+                    Some(gamma) if gamma > 0.0 => (-(t as f32) / gamma).exp(),
+                    _ => 1.0,
+                });
+                row_rewards.push(reward);
+            }
         }
+        let n_rows = pg_tokens.len();
+        if n_rows == 0 {
+            return Ok(0.0);
+        }
+        let weight_sum: f32 = token_weights.iter().sum();
 
-        let logits_id = self
-            .store
-            .from_slice(&all_logits, &[batch * block_size, vocab_size])?;
-        let target_logits_id = self
-            .store
-            .from_slice(&all_target_logits, &[batch * block_size, vocab_size])?;
+        let logits_id = self.store.from_slice(&draft_rows, &[n_rows, vocab_size])?;
+        let target_logits_id = self.store.from_slice(&target_rows, &[n_rows, vocab_size])?;
 
-        // Markov bias: w2 @ w1[tokens]
-        let emb_id = ops::embedding(
-            params.w1,
-            &all_tokens_usize,
-            &mut self.store,
-            &mut self.tape,
-        )?;
+        // Markov bias in the SERVE coordinate frame: w2 is [vocab, rank]
+        // row-major (gemm_batch weight), bias[v] = Σ_r w2[v][r] · w1[cond][r]
+        // — i.e. emb [n, rank] · w2ᵀ.
+        let emb_id = ops::embedding(params.w1, &cond_tokens, &mut self.store, &mut self.tape)?;
         let emb_flat_id = ops::reshape(
             emb_id,
-            &[batch * block_size, params.rank],
+            &[n_rows, params.rank],
             &mut self.store,
             &mut self.tape,
         )?;
-        let bias_id = ops::matmul(emb_flat_id, params.w2, &mut self.store, &mut self.tape)?;
+        let bias_id = ops::matmul_bt(emb_flat_id, params.w2, &mut self.store, &mut self.tape)?;
         let corrected_id = ops::add(logits_id, bias_id, &mut self.store, &mut self.tape)?;
-
-        // Per-position exponential decay: position k in the block is weighted
-        // exp(-k/gamma). Early tokens matter more — a mistake at position 0
-        // voids the rest of the block.
-        let pos_weights: Vec<f32> = match self.config.loss_decay_gamma {
-            Some(gamma) if gamma > 0.0 => (0..block_size)
-                .map(|k| (-(k as f32) / gamma).exp())
-                .collect(),
-            _ => vec![1.0; block_size],
-        };
-        // Expand to per-token weights [batch*block].
-        let token_weights: Vec<f32> = (0..batch)
-            .flat_map(|_| pos_weights.iter().copied())
-            .collect();
-        let weight_sum: f32 = token_weights.iter().sum();
 
         // ---- Policy-gradient loss (acceptance-weighted) ----
         let log_probs_id = ops::log_softmax(corrected_id, &mut self.store, &mut self.tape)?;
-        let token_lp_id = ops::gather_last_dim(
-            log_probs_id,
-            &all_tokens_usize,
-            &mut self.store,
-            &mut self.tape,
-        )?;
+        let token_lp_id =
+            ops::gather_last_dim(log_probs_id, &pg_tokens, &mut self.store, &mut self.tape)?;
 
         let mean_reward: f32 = rewards.iter().sum::<f32>() / batch as f32;
         self.baseline_ema = (1.0 - self.config.baseline_ema_alpha) * self.baseline_ema
             + self.config.baseline_ema_alpha * mean_reward;
         let baseline = self.baseline_ema;
         // Per-token advantage × position weight.
-        let weighted_adv: Vec<f32> = rewards
+        let weighted_adv: Vec<f32> = row_rewards
             .iter()
-            .zip(token_weights.chunks(block_size))
-            .flat_map(|(&r, w)| w.iter().map(move |&wk| (r - baseline) * wk))
+            .zip(&token_weights)
+            .map(|(&r, &w)| (r - baseline) * w)
             .collect();
-        let adv_id = self
-            .store
-            .from_slice(&weighted_adv, &[batch * block_size])?;
+        let adv_id = self.store.from_slice(&weighted_adv, &[n_rows])?;
 
         let pg_weighted_id = ops::mul(token_lp_id, adv_id, &mut self.store, &mut self.tape)?;
         let pg_neg_id = ops::mul_scalar(pg_weighted_id, -1.0, &mut self.store, &mut self.tape)?;
@@ -315,14 +333,14 @@ impl DsparkTrainer {
             &mut self.tape,
         )?;
         let sq_diff_id = ops::mul(diff_id, diff_id, &mut self.store, &mut self.tape)?;
-        // Expand per-token weights to [batch*block, vocab] for element-wise mul.
+        // Expand per-token weights to [n_rows, vocab] for element-wise mul.
         let expanded_weights: Vec<f32> = token_weights
             .iter()
             .flat_map(|&w| vec![w; vocab_size])
             .collect();
         let exp_weight_id = self
             .store
-            .from_slice(&expanded_weights, &[batch * block_size, vocab_size])?;
+            .from_slice(&expanded_weights, &[n_rows, vocab_size])?;
         let weighted_sq_id = ops::mul(sq_diff_id, exp_weight_id, &mut self.store, &mut self.tape)?;
         let prob_match_loss_id = ops::mul_scalar(
             ops::sum(weighted_sq_id, &mut self.store, &mut self.tape)?,
@@ -367,7 +385,7 @@ impl DsparkTrainer {
         Ok(loss)
     }
 
-    /// Get current Markov head weights as (w1 [vocab*rank], w2 [rank*vocab]).
+    /// Get current Markov head weights as (w1 [vocab*rank], w2 [vocab*rank]).
     pub fn get_weights(&mut self) -> Result<(Vec<f32>, Vec<f32>)> {
         let Some(params) = self.params.as_ref() else {
             anyhow::bail!("Markov params not yet initialized");
@@ -435,6 +453,7 @@ impl<'a> ExperienceSource for InferCudaExperienceSource<'a> {
                 accepted: e.accepted,
                 block_size: e.block_size,
                 vocab_size: e.vocab_size,
+                next_token_heads: e.next_token_heads,
             })
             .collect()
     }
