@@ -3393,7 +3393,8 @@ impl Dsv4Model {
         let stream_dim = hidden_size * hc_mult;
         let seq_len = n; // batch dimension: N independent decode rows
         let eps = self.config.rms_norm_eps;
-        // spec-off decode reads no taps; skip the dead per-row D2D.
+        // capture only when the caller (spec anchor) consumes taps, not on
+        // is_dspark() alone — plain decode never reads them.
         let dspark = capture_taps && self.config.is_dspark();
         let use_deepep_transport = crate::runtime_flags::dsv4_moe_transport()?.is_deepep();
         // N>1: mirror the prefill keepalive discipline (the per-token decode
