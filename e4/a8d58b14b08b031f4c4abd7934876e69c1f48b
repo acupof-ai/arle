@@ -1,0 +1,25 @@
+CHANGELOG.md
+  s_74eb554d4c0f2f::t_5283a6ee2dcdd2 26-33
+docs/experience/wins/2026-07-24-agent-opd-sandbox-staging-verified.md
+  s_74eb554d4c0f2f::t_4880e078078b43 1-50
+docs/research/2026-07-23-online-rl-acceleration.md
+  s_74eb554d4c0f2f::t_0f8679f9d92e90 72-81,84-93
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "e4a8d58b14b08b031f4c4abd7934876e69c1f48b",
+  "prompts": {},
+  "sessions": {
+    "s_74eb554d4c0f2f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ad7f8599e59f59b5c",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
