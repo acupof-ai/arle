@@ -23,6 +23,23 @@ Progress spine. Entry classes recorded here the day they land: phase exits,
 default flips, and accept-or-reject verdicts (AGENTS.md §Docs lifecycle &
 progress spine).
 
+- **DEFAULT FLIP — Qwen KV pool sizing: measured VRAM outranks the page floor**
+  (2026-07-25, #178, `5c2931cd3`; wins:
+  [2026-07-25-kv-pool-floor-yields-to-measured-vram](docs/experience/wins/2026-07-25-kv-pool-floor-yields-to-measured-vram.md)).
+  The non-user-facing `total_pages = 8192` default (8.6 GB BF16) acted as a
+  floor over the free-VRAM profile, so a 32 GB V100 booked HBM it did not have
+  and OOM'd at first prefill. The profile is now the sizing; the requested count
+  is the failed-probe fallback only. Big-box behavior unchanged; DSv4 unaffected.
+- **DEFAULT FLIP — `--kv-disk` with a zero derived budget degrades to no-tier**
+  (2026-07-25, #158, `59b86ee4c`). Free space below the `max(50 GiB, 10%)`
+  reserve used to fail the boot; it now warns and serves without the disk tier.
+  An explicit `--kv-disk-limit` still fails loudly.
+- **VERDICT — DSpark V100 TP-lockstep stall: FIXED, measured** (2026-07-25,
+  #168, `6c5553b45`; errors:
+  [2026-07-21-dspark-v100-tp-lockstep-stall-kill](docs/experience/errors/2026-07-21-dspark-v100-tp-lockstep-stall-kill.md)).
+  2 h continuous DSpark load at HEAD: zero `lockstep stalled` WARNs, zero
+  errors. The earlier −91% KILL is re-grounded to the sm_70 draft path itself
+  (#179) and the pool floor (#178), not to lockstep.
 - **DEFAULT FLIP — writeback-offload threshold 4096 → 16384** (2026-07-24,
   #172; wins:
   [2026-07-24-writeback-offload-dial-back](docs/experience/wins/2026-07-24-writeback-offload-dial-back.md)).
