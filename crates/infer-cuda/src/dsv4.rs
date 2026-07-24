@@ -3281,6 +3281,10 @@ impl Dsv4Model {
         start_positions: &[usize],
         positions: &[u64],
         params: &[SamplingParams],
+        // Capture DSpark T3 taps in this forward. Only the spec-decode anchor
+        // consumes them; a plain (spec-off) decode passes `false` so a DSpark
+        // checkpoint doesn't pay N per-row tap D2Ds per step for nothing.
+        capture_taps: bool,
     ) -> Result<Vec<u32>> {
         let n = slot_ids.len();
         ensure!(n > 0, "DSv4 batched decode requires at least one row");
@@ -3301,6 +3305,7 @@ impl Dsv4Model {
             slot_ids,
             tokens,
             start_positions,
+            capture_taps,
         )?;
         let _nvtx = crate::nvtx::range("dsv4/lm_head_sample_batched");
         let fast_head = self.lm_head_shard.is_none()
@@ -3346,6 +3351,7 @@ impl Dsv4Model {
         slot_ids: &[usize],
         tokens: &[u32],
         start_positions: &[usize],
+        capture_taps: bool,
     ) -> Result<(HiddenStates, Dsv4ForwardKeepalive)> {
         let n = slot_ids.len();
         let mega_epoch = self.begin_mega_moe_forward(n)?;
@@ -3389,7 +3395,10 @@ impl Dsv4Model {
         let stream_dim = hidden_size * hc_mult;
         let seq_len = n; // batch dimension: N independent decode rows
         let eps = self.config.rms_norm_eps;
-        let dspark = self.config.is_dspark();
+        // Runtime gate, not just the checkpoint's `is_dspark()`: the plain decode
+        // lane (spec off) reaches this on a DSpark checkpoint too, but never reads
+        // the taps, so capturing them there is dead per-row D2D work every step.
+        let dspark = capture_taps && self.config.is_dspark();
         let use_deepep_transport = crate::runtime_flags::dsv4_moe_transport()?.is_deepep();
         // N>1: mirror the prefill keepalive discipline (the per-token decode
         // scratch / comm-overlap fast paths are seq_len==1 only).
