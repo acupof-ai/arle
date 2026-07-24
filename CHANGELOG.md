@@ -23,6 +23,14 @@ Progress spine. Entry classes recorded here the day they land: phase exits,
 default flips, and accept-or-reject verdicts (AGENTS.md §Docs lifecycle &
 progress spine).
 
+- **ACCEPT — agent-OPD sandbox staging outside the repo** (2026-07-24,
+  `6bd40d663`+`b0a29443e`+`031c8c3f8`+`e21557fbc`). Sandboxes under the ARLE
+  checkout made `claude -p` ingest the repo `CLAUDE.md`: ~31K prompt
+  tokens/request. Staged at `/tmp/agent-opd` instead; pod-verified
+  prompt_tokens → median 21.4K (−9.7K), rollout wall −40% (410 → 204–256 s),
+  SAMPLES=8 fits the KV pool again. Measured CC intrinsic floor ~21K/request
+  re-ranks hybrid prefix reuse as the top residual lever:
+  [wins](docs/experience/wins/2026-07-24-agent-opd-sandbox-staging-verified.md).
 - **ACCEPT — batched linear-attention CUDA device path** (2026-07-24,
   `ecc058b20` + `5f68d1f6e`). B>1 LA previously fell to a CPU fallback whose
   scan-assist kernel overflowed i32 on `state_history` (B=4×3150 →

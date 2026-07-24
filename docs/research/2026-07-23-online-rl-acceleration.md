@@ -69,25 +69,28 @@ tokens**. Consequences, measured on one H20:
 
 **The levers, in cost order** (2026-07-24 update — the 31K source is found):
 
-1. **Stage CC workdirs outside the repo (config-only, do first — LANDED).**
-   The dumps show `claude -p` walks up from the task workdir (under
-   `/host/arle-build`) and ingests the repo `CLAUDE.md` agent contract — that
-   IS most of the 31K. Root: `agent_opd_curve.sh` staged sandboxes under
-   `$OUT` = repo-relative `runs/`. Fixed: `WORK_ROOT` default
-   `/tmp/agent-opd-work` + a `boot_workdir` ancestor-CLAUDE.md warning.
-   Turn 1 measured 178–245 s vs 21–80 s for turns 2–4 — dominated by exactly
-   this prefill. Pending pod verification: prompt_tokens per request should
-   drop ~31K → few K. Durable follow-up: `claude --bare` at the spawn point
-   (`cc_harness.rs:270`) disables CLAUDE.md auto-discovery path-independently
-   (also closes the `~/.claude/CLAUDE.md` vector the path fix can't) — but it
+1. **Stage CC workdirs outside the repo — VERIFIED 2026-07-24**
+   ([wins](../experience/wins/2026-07-24-agent-opd-sandbox-staging-verified.md)).
+   Root: `agent_opd_curve.sh` staged sandboxes under `$OUT` = repo-relative
+   `runs/`; `claude -p` walked up and ingested the repo `CLAUDE.md`. Fixed
+   (`WORK_ROOT` default `/tmp/agent-opd` + warn-once guard) and pod-measured:
+   prompt_tokens 30.9–31.1K → median **21.4K** (−9.7K = the CLAUDE.md
+   payload), rollout wall ~410 → 204–256 s (−40%), SAMPLES=8 fits the 250K
+   pool again (8×21K ≈ 168K). Durable follow-up: `claude --bare` at the
+   spawn point (`cc_harness.rs:270`) disables CLAUDE.md auto-discovery
+   path-independently (also closes the `~/.claude/CLAUDE.md` vector) — but
    drops hooks/auto-memory/workdir-level CLAUDE.md too, a rollout-behavior
    change needing pod-CLI support check + its own A/B before flipping.
-2. **Prefix reuse — already built; residual gap is concurrent cold starts.**
-   With lever 1 landed the shared preamble shrinks to CC's own system prompt
-   + tool schemas (few K), so the residual win is small. If a measured run
-   still shows redundant prefill: serialize a group's first sample until its
-   preamble publishes, then admit the rest (they attach the published
-   prefix). Gate any work here on a measured prefix-hit counter, not source
+2. **Prefix reuse — back to top residual lever: CC's intrinsic floor is
+   ~21K, identical across every request.** The "residual win is small"
+   call was wrong — the measured dump shows CC's own preamble (system
+   prompt + tool schemas; `system` field only 6.4K chars, the bulk is
+   tools) is ~21K before any CLAUDE.md, and it is byte-shared across all
+   sessions and turns. The machinery exists (radix + recurrent sidecar,
+   #85); the gap is concurrent cold starts — publish happens on finish, so
+   a group's 8 first turns each prefill their own 21K. Cheapest shape:
+   serialize a group's first sample until its preamble publishes, then
+   admit the rest. Gate on a measured prefix-hit counter, not source
    survey.
 
 ### Tier 0 — RESOLVED 2026-07-24: gpu_busy_frac 0.30–0.34 → GO
