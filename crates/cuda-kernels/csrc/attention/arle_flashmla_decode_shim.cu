@@ -37,7 +37,6 @@
 // caller (we never accept nullptr for the split-KV scratch).
 //
 // Refs:
-//   docs/plans/2026-05-28-dsv4-flashmla-decode-integration.md
 //   docs/experience/wins/2026-05-28-dsv4-v2-4-flashmla-root-cause-fix.md
 //   crates/cuda-kernels/vendor/flashmla/csrc/sm90/decode/sparse_fp8/
 //   crates/cuda-kernels/vendor/flashmla/csrc/smxx/decode/

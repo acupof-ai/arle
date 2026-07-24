@@ -29,8 +29,7 @@ pub(crate) struct QwenCudaExecutor {
     /// baseline byte-identical (CUDA is the Stable backend). When on, recall is
     /// BF16-only and **eager-only** (the captured decode graph bakes `num_pages`,
     /// and recall needs a host query read-back + restricted page table between
-    /// steps), so a recall-active slot skips the graph. See
-    /// `docs/plans/2026-06-23-session-infinite-kv-memory.md`.
+    /// steps), so a recall-active slot skips the graph.
     kv_recall: bool,
     /// Recall budget regions (validated defaults): sink 32 + local 256 + top-k 8
     /// blocks of 32. The working set is bounded regardless of history length.

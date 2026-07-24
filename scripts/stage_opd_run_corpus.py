@@ -33,8 +33,6 @@ staged-root tarball. Pipeline:
 Usage:
   python3 scripts/stage_opd_run_corpus.py \
       --out-root data/opd-corpora/staged-run1 --workers 8
-
-Plan: docs/plans/2026-07-03-agentic-opd-27b-capability-curve.md (phase 2).
 """
 
 from __future__ import annotations

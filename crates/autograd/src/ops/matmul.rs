@@ -150,8 +150,7 @@ pub(crate) fn matmul_backward(
     // saved hidden / weight buffers and the upstream gradient never round-
     // trip through host. This is the contract change that retires the
     // 1 GB DtoH that Wave 1 surfaced — the LM-head GEMM's
-    // `grad_out: &[f32]` was the single largest readback per step
-    // (`docs/research/2026-05-17-cuda-training-architectural-correction.md`).
+    // `grad_out: &[f32]` was the single largest readback per step.
     // Heal host-resident operands first (mirrors matmul_bt_backward) so one
     // upstream host grad (e.g. from a host concat backward) doesn't demote
     // this GEMM — and everything downstream — to the host contract.

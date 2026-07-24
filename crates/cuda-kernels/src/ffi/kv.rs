@@ -174,8 +174,7 @@ unsafe extern "C" {
 
     /// INT8 KIVI sibling of `finalize_k_per_channel_scales_cuda`: divides
     /// accumulated absmax by 127.0 (INT8 max representable, symmetric). Same
-    /// 1e-30 floor for untouched channels. See
-    /// docs/plans/2026-05-27-int8-kv-kivi-per-channel.md.
+    /// 1e-30 floor for untouched channels.
     pub fn finalize_k_per_channel_scales_int8_cuda(
         k_static_scales: *mut f32,
         num_channels: i32,

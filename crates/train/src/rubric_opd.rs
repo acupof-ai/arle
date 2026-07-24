@@ -2,7 +2,7 @@
 //! (I2-wire) and the RFT loop. The pure judge primitives (rubric/verdict/select)
 //! live in [`crate::rubric`] and unit-test on CPU.
 //!
-//! Plan: [`docs/plans/2026-06-21-opd-ceiling-27b-dense.md`]. The judge takes the
+//! The judge takes the
 //! rollout as **text** and the engine tokenizes it with its OWN (Flash's)
 //! tokenizer, so the student's Qwen vocab never enters the judge path — the
 //! cross-tokenizer sidestep that makes a DeepSeek teacher usable for a Qwen student.

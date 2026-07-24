@@ -980,8 +980,7 @@ cudaError_t finalize_k_per_channel_scales_cuda(
 // INT8 KIVI per-channel K finalize + per-token quantize.
 //
 // Mirrors the FP8 path above; only the symmetric range constant differs
-// (INT8 max representable = 127 vs FP8 E4M3 = 448). See
-// docs/plans/2026-05-27-int8-kv-kivi-per-channel.md for rationale.
+// (INT8 max representable = 127 vs FP8 E4M3 = 448).
 // ============================================================================
 
 __global__ void finalize_k_per_channel_scales_int8_kernel(

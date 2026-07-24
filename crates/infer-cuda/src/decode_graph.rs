@@ -4,7 +4,7 @@
 //! path's per-call `HiddenStates::zeros` / `PageMeta::for_slot`, the captured
 //! decode reads/writes the FIXED buffers here: the host overwrites their contents
 //! (Stage 1) before each `graph.launch()` (Stage 2). B=1 decode only; batch
-//! buckets are deferred. See `docs/projects/2026-06-03-cuda-graph-design.md`.
+//! buckets are deferred.
 //!
 //! Capture key = `(batch_size, num_pages)`: the TileLang decode kernel takes the
 //! page-table length (`meta.num_pages`) as a scalar launch arg, which the graph

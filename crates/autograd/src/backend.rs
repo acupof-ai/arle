@@ -632,9 +632,7 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
     /// 1 GB DtoH the M5.3b / Wave 1 / P1 / P2 / P3 milestones could
     /// never kill, and per-op lazy readback is strictly cheaper because
     /// device-resident downstream backward ops never need the host
-    /// snapshot in the first place. See
-    /// `docs/research/2026-05-17-cuda-training-architectural-correction.md`
-    /// and the P3 wins entry.
+    /// snapshot in the first place. See the P3 wins entry.
     fn prefers_pre_backward_flush(&self) -> bool {
         false
     }
@@ -713,8 +711,7 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
     }
 
     /// Device-handle variant of `matmul_backward`. Foundation for the
-    /// device-resident gradient tape — see
-    /// `docs/research/2026-05-17-cuda-training-architectural-correction.md`.
+    /// device-resident gradient tape.
     ///
     /// Computes `grad_a = grad_out @ B^T` and `grad_b = A^T @ grad_out` and
     /// returns each as an *unevaluated* `DeviceHandle` so the caller can
@@ -854,8 +851,7 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
     /// holding `dest + src` elementwise. Foundation for the device-resident
     /// gradient tape — when two backward paths converge on the same
     /// parameter, the merge runs through this op rather than a host
-    /// `accumulate_grad` roundtrip. See
-    /// `docs/research/2026-05-17-cuda-training-architectural-correction.md`.
+    /// `accumulate_grad` roundtrip.
     ///
     /// `dest` and `src` must share `shape` and `product(shape)` elements.
     /// The returned handle is *unevaluated* on backends with a lazy graph
@@ -1015,8 +1011,7 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
     /// single per-row NVRTC kernel that consumes the saved forward output
     /// without a host roundtrip — kills the `[B, S, V]` × 4 B ≈ 1 GB DtoH
     /// copy that nsys identified as the single largest readback per
-    /// training step (see
-    /// `docs/research/2026-05-17-cuda-training-step-nsys-attribution.md`).
+    /// training step.
     fn log_softmax_last_axis_backward(
         &self,
         upstream: &DeviceHandle,
@@ -1111,8 +1106,7 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
     /// `d_loss → mul_scalar_backward → mean_backward → gather_backward →
     /// log_softmax_backward → matmul_backward`, so its host fallback
     /// demoted every downstream `device_path_ok` gate to host. Keeping
-    /// this on-device unblocks the whole chain — see
-    /// `docs/research/2026-05-17-cuda-training-architectural-correction.md`.
+    /// this on-device unblocks the whole chain.
     fn mul_scalar_backward_device(
         &self,
         upstream_grad: &DeviceHandle,
@@ -1139,8 +1133,7 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
     /// device memory (free L1 broadcast) and writes one slot per thread.
     ///
     /// Pairs with `mul_scalar_backward_device` to keep the CE-loss
-    /// backward chain device-resident — see
-    /// `docs/research/2026-05-17-cuda-training-architectural-correction.md`.
+    /// backward chain device-resident.
     fn mean_backward_device(
         &self,
         upstream_grad: &DeviceHandle,
@@ -1495,8 +1488,7 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
     /// Wave 1: CUDA overrides this with a single per-row NVRTC kernel so
     /// the `[B, S, V]` grad stays device-resident — keeps the `1 GB`
     /// scatter-add output off the host-roundtrip path that the host
-    /// `gather_last_dim_backward` previously forced (see
-    /// `docs/research/2026-05-17-cuda-training-step-nsys-attribution.md`).
+    /// `gather_last_dim_backward` previously forced.
     fn gather_last_dim_backward(
         &self,
         upstream: &DeviceHandle,
@@ -1962,9 +1954,8 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
     ///
     /// Keeps the embedding backward off the host so the `[B, S, H]` upstream
     /// tensor — second largest per-step DtoH in the P3.1 residue — never
-    /// crosses PCIe. See
-    /// `docs/research/2026-05-17-candle-kernel-vendor-survey.md` §1 for why
-    /// hand-write (candle's `scatter_add` deliberately omits atomics).
+    /// crosses PCIe. Hand-written because candle's `scatter_add` deliberately
+    /// omits atomics.
     fn embedding_backward_device(
         &self,
         upstream_grad: &DeviceHandle,

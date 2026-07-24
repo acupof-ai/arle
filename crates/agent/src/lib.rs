@@ -146,8 +146,7 @@ pub struct AgentTurnResult {
     /// turn finalised entirely through a deterministic policy hook
     /// (e.g. `recover_tool_calls_from_user_request`).
     pub sub_turns: Vec<SubTurnRecord>,
-    /// Why the turn ended. Encodes the four exits documented in
-    /// `docs/projects/agent-trajectory-export.md` so RL can reward
+    /// Why the turn ended. Encodes the four exits so RL can reward
     /// or penalise specific failure modes (notably `EmptyNoProgress`).
     pub terminal_state: TerminalState,
     /// Total wall-clock seconds for the turn, captured from the same
@@ -183,8 +182,8 @@ pub struct TokensRecord {
 
 /// Trajectory schema version. Bumped to `2` when the token layer
 /// (`tokens.{prompt_ids,response_ids,response_mask}`) started populating;
-/// per docs/projects/agent-trajectory-export.md the rule is "version
-/// bumps when a meaningful new payload starts populating". Records can
+/// the rule is "version bumps when a meaningful new payload starts
+/// populating". Records can
 /// still carry `tokens: null` on backends that haven't wired
 /// `tokenize()`, but the format-version contract is v2 either way so
 /// v1-only readers refuse early instead of silently misreading.

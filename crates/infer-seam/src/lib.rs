@@ -665,7 +665,7 @@ impl StepBudget {
 /// seam the AI-PC pivot adds; it is host-side and backend-neutral. Backends
 /// supply the OS-signal readers (Metal: macOS memory-pressure + wired-limit
 /// headroom + foreground/battery; CUDA: nvml free VRAM; AMD APU: unified-memory
-/// pressure). See docs/projects/2026-06-03-aipc-pivot-and-northstar.md.
+/// pressure).
 pub trait ResourceGovernor {
     /// May the engine admit more waiting work right now?
     fn admission_gate(&self) -> AdmissionVerdict;

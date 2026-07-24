@@ -1,5 +1,5 @@
 //! Compiles the AIPC HIP kernel objects with hipcc when the `hip` feature
-//! is on (#76/#77, docs/plans/2026-06-10-hip-backend-mvp.md §4).
+//! is on (#76/#77).
 //!
 //! No hipcc on the machine (this Mac) => warn and skip: the crate still
 //! typechecks, mirroring the `cuda,no-cuda` lane. The kernel sources are

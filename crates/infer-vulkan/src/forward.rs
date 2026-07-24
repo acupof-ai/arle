@@ -18,7 +18,7 @@
 //! fallback remains for ops whose device kernel is absent, but it is not the
 //! default lane.
 //!
-//! Perf-parity Steps 3+4 (see `docs/plans/amd-vulkan-perf-parity.md`): the GEMV
+//! Perf-parity Steps 3+4: the GEMV
 //! path no longer allocates scratch + round-trips per op. A **[`DeviceArena`]**
 //! of named (offset,len) sub-ranges (input activation, q8_1 quantized
 //! activation, f32 dst, the two fuse dummies) is allocated **once** on the model

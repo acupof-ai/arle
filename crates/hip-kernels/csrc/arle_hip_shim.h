@@ -1,6 +1,5 @@
 // CUDA->HIP source-compat shim, force-included (-include) when compiling
-// ARLE's CUDA kernel sources with hipcc for the AIPC lane (#76/#77,
-// docs/plans/2026-06-10-hip-backend-mvp.md §2.2/§4).
+// ARLE's CUDA kernel sources with hipcc for the AIPC lane (#76/#77).
 //
 // Mapping table adapted from ggml-org/llama.cpp
 // ggml/src/ggml-cuda/vendors/hip.h @ d2462f8f (MIT, vendored at

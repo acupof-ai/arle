@@ -547,8 +547,7 @@ impl Clone for AdamW {
 }
 
 /// Trait-level view of an optimizer. Today AdamW is the only implementor; the
-/// trait exists so the in-progress training runtime (see
-/// `docs/plans/train-runtime-architecture-v1.md` §4.1) can dispatch
+/// trait exists so the in-progress training runtime can dispatch
 /// polymorphically over future Lion/Muon/SGD impls without forking every
 /// binary. The state-codec surface (`state_schema` + `export_state` +
 /// `import_state`) is AdamW-shaped on purpose — the [`AdamWState`] value is

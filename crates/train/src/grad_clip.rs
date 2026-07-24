@@ -1,7 +1,5 @@
 //! Gradient clipping — free functions (`clip_grad_norm` /
 //! `compute_global_norm_f64`) used by the OPD training loops.
-//!
-//! See `docs/plans/train-runtime-architecture-v1.md` §4.4.
 
 use autograd::{Device, TensorId, TensorStore, tensor::Dirty};
 

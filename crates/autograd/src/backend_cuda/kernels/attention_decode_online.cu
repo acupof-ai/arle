@@ -28,8 +28,7 @@
 //
 // Measured null on wall-clock at rollout<=128 (the legacy kernel already
 // lives in shared memory and has identical HBM traffic), kept because the
-// fused single pass scales better as `visible` grows. See
-// docs/research/2026-05-29-online-softmax-null-at-rollout64.md.
+// fused single pass scales better as `visible` grows.
 //
 // Compiled via NVRTC alongside the other autograd kernels in
 // kernels.rs::concat_sources; cuda_runtime.h types come from the

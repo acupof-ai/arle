@@ -2,8 +2,7 @@
 //
 // Builds the unified per-token indices buffer that FlashMLA's
 // `sm90::decode::sparse_fp8::run_flash_splitkv_mla_fp8_sparse_kernel`
-// consumes, in the BLOCK-PAGED coord space of the FP8 KV pool described in
-// `docs/plans/2026-05-28-dsv4-flashmla-decode-integration.md` Phase D-3'.
+// consumes, in the BLOCK-PAGED coord space of the FP8 KV pool.
 //
 // Pool layout (one contiguous u8 buffer per layer, page_block_size=64):
 //   blocks [0,            sw_blocks)                 ← SW sub-pool   (per-token K stream)
