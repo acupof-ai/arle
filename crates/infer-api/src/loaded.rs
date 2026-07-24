@@ -259,12 +259,11 @@ impl EngineLoadConfig {
         match (&self.kv_ssd_root, self.kv_disk_limit) {
             (Some(root), limit) => {
                 let total = match limit {
-                    // #158: the derived budget is 0 on a disk under the 50 GiB
-                    // reserve floor — degrade to no-tier instead of fail-closing
-                    // the engine build. An explicit --kv-disk-limit still fails
-                    // loudly below (the user asked for that exact budget).
-                    None => match default_budget(root, 0.5) {
-                        0 => {
+                    // #158: derived 0 (disk under the reserve floor) degrades to
+                    // no-tier; an explicit --kv-disk-limit still fails loudly.
+                    None => {
+                        let budget = default_budget(root, 0.5);
+                        if budget == 0 {
                             log::warn!(
                                 "--kv-disk {}: derived budget is 0 (free space is \
                                  below the reserve, max(50 GiB, 10% of disk)) — \
@@ -274,8 +273,8 @@ impl EngineLoadConfig {
                             );
                             return Ok(None);
                         }
-                        b => b,
-                    },
+                        budget
+                    }
                     Some(KvTierBudget::Fraction(f)) => {
                         anyhow::ensure!(
                             f > 0.0 && f <= 1.0,
@@ -2231,7 +2230,8 @@ mod backend {
             anyhow::ensure!(
                 executor.set_kv_tier_disk(root.clone(), *budget),
                 "--kv-disk: the loaded model has no KV tier store to spill \
-                 (Qwen3-dense page tier + Qwen3.6/DSv4 slot tier)"
+                 (Qwen3-dense page tier + Qwen3.6/DSv4 slot tier; a budget \
+                 below one page also lands here — raise --kv-disk-limit)"
             );
         }
         // Session KV-recall ("infinite memory", `--kv-recall`, default off). Off →
