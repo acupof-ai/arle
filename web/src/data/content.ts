@@ -311,7 +311,7 @@ const BENCH_ROWS_EN: BenchRow[] = [
       { key: "held-out overlap 5k", value: "82.8", unit: "% (from 50)" },
     ],
     cmd: "cargo run -p train --example opd_step_cuda_realckpt_train --release --features cuda -- --lr 1e-7 --steps 5000",
-    href: "https://github.com/cklxx/arle/blob/main/docs/projects/2026-05-21-opd-cuda-cycle-wrap.md",
+    href: "https://github.com/cklxx/arle/blob/main/CHANGELOG.md",
   },
   {
     date: "2026-05-18",
@@ -385,7 +385,7 @@ const BENCH_ROWS_ZH: BenchRow[] = [
       { key: "held-out 5k overlap", value: "82.8", unit: "%（自 50）" },
     ],
     cmd: "cargo run -p train --example opd_step_cuda_realckpt_train --release --features cuda -- --lr 1e-7 --steps 5000",
-    href: "https://github.com/cklxx/arle/blob/main/docs/projects/2026-05-21-opd-cuda-cycle-wrap.md",
+    href: "https://github.com/cklxx/arle/blob/main/CHANGELOG.md",
   },
   {
     date: "2026-05-18",
@@ -768,7 +768,7 @@ export const EN: Locale = {
     contribute: {
       title: "Where a contribution lands",
       caption:
-        'No queue, no committee — <b>a weekend PR here can move a headline number</b>, and the battlefields are public: the serial phase plan lives in <a href="https://github.com/cklxx/arle/blob/main/ROADMAP.md"><code>ROADMAP.md</code></a> with one tracked issue per front. Start with <a href="https://github.com/cklxx/arle/blob/main/CONTRIBUTING.md"><code>CONTRIBUTING.md</code></a>, not the maintainer plans tree.',
+        'No queue, no committee — <b>a weekend PR here can move a headline number</b>, and the battlefields are public: one tracked <a href="https://github.com/cklxx/arle/issues">GitHub issue</a> per front. Start with <a href="https://github.com/cklxx/arle/blob/main/CONTRIBUTING.md"><code>CONTRIBUTING.md</code></a>.',
       rows: BATTLE_ROWS_EN,
       starAsk: {
         html:
@@ -868,7 +868,7 @@ export const ZH: Locale = {
     contribute: {
       title: "贡献会落在哪",
       caption:
-        '没有排队，没有委员会 —— <b>一个周末的 PR 就能改动头条数字</b>，战场全部公开：串行 phase 计划在 <a href="https://github.com/cklxx/arle/blob/main/ROADMAP.md"><code>ROADMAP.md</code></a>，每条战线一个跟踪 issue。从 <a href="https://github.com/cklxx/arle/blob/main/CONTRIBUTING.md"><code>CONTRIBUTING.md</code></a> 开始，不要先钻维护者计划树。',
+        '没有排队，没有委员会 —— <b>一个周末的 PR 就能改动头条数字</b>，战场全部公开：每条战线一个 <a href="https://github.com/cklxx/arle/issues">GitHub 跟踪 issue</a>。从 <a href="https://github.com/cklxx/arle/blob/main/CONTRIBUTING.md"><code>CONTRIBUTING.md</code></a> 开始。',
       rows: BATTLE_ROWS_ZH,
       starAsk: {
         html:

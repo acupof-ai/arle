@@ -13,7 +13,6 @@ on:
       - '**/*.md'
       - 'CLAUDE.md'
       - 'AGENTS.md'
-      - 'ROADMAP.md'
       - 'CHANGELOG.md'
       - 'README.md'
       - 'README.zh-CN.md'
@@ -96,9 +95,10 @@ jobs:
           cargo clippy -p train --features no-cuda --lib -- -D warnings
           cargo clippy -p kv-native-sys --all-targets -- -D warnings
 
-      # The only automated gate for the CUDA-Rust surface: cuda-ci.yml needs a
-      # self-hosted GPU runner (none registered), so without this step a CUDA
-      # type break lands on main silently and only surfaces at pod build time.
+      # The ONLY automated gate for the CUDA-Rust surface: there is no GPU CI
+      # (no self-hosted GPU runner; the full CUDA build is manual on the pod /
+      # ssh V100), so without this step a CUDA type break lands on main silently
+      # and only surfaces at build time.
       # `no-cuda` makes cuda-kernels' build.rs skip nvcc/TileLang compilation;
       # CUDARC_CUDA_VERSION pins cudarc's probe so no toolkit is needed.
       - name: cargo check (cuda + no-cuda typecheck, no GPU toolchain)
