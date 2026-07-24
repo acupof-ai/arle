@@ -23,6 +23,16 @@ Progress spine. Entry classes recorded here the day they land: phase exits,
 default flips, and accept-or-reject verdicts (AGENTS.md §Docs lifecycle &
 progress spine).
 
+- **ACCEPT — batched linear-attention CUDA device path** (2026-07-24,
+  `ecc058b20` + `5f68d1f6e`). B>1 LA previously fell to a CPU fallback whose
+  scan-assist kernel overflowed i32 on `state_history` (B=4×3150 →
+  ILLEGAL_ADDRESS); per-row dispatch over the proven batch==1 kernels fixes
+  the crash and the 337 s/micro-batch checkpointed pathology (now 6–23 s/mb,
+  loss parity). Checkpoint gate models the 12 LA ctx tensors exactly.
+  Pod-verified:
+  [wins](docs/experience/wins/2026-07-24-cuda-batched-la-device-path.md).
+  Open: gate under-models mid-length batched full-tape (~5.8× at B=4
+  seq=1040) — near-OOM at engage=false; issue filed.
 - **ACCEPT — systematic review-fix sweep (26 findings); one relay regression
   fixed** (2026-07-24, `f0a635e02` + `837b89d39`). 26 confirmed defects fixed
   (2 high, 9 medium, 15 low) across scheduler / serving / OPD / kv-tier /
