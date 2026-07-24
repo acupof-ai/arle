@@ -681,6 +681,21 @@ pub fn linear_attention_core_with_carry_taped(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Tape bytes the device forward saves per call — the 12 ctx tensors recorded
+/// below (f32: preact, output, g/g_cumsum/beta, chunk_state; bf16: qkv_conv,
+/// q, k, v, a_inv, raw_output). Exported so VRAM gates can model checkpointing
+/// without duplicating the alloc shapes/dtypes; keep in sync with the
+/// `alloc_device_tensor` calls in `try_linear_attention_forward_device`.
+pub fn linear_attention_ctx_bytes(params: LinearAttentionParams) -> usize {
+    let (hk, kd) = (params.num_key_heads, params.key_dim);
+    let (hv, vd) = (params.num_value_heads, params.value_dim);
+    let seq = params.seq_len;
+    let qkv_dim = 2 * hk * kd + hv * vd;
+    let f32_elems = seq * (qkv_dim + hv * vd + 3 * hv) + seq.div_ceil(64) * hv * kd * vd;
+    let bf16_elems = seq * (qkv_dim + hv * (2 * kd + 2 * vd + 64));
+    params.batch * (4 * f32_elems + 2 * bf16_elems)
+}
+
 fn try_linear_attention_forward_device(
     qkv: TensorId,
     z: TensorId,
