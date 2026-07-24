@@ -109,8 +109,12 @@ CUDA half verified on **H20 sm_90** (DSv4-Flash-FP8 TP=4/EP=4) and built on
   code trace: `Dsv4Model::forward_decode_batch` is byte-identical to champion
   `45dd64bd2` and `num_slots` is unchanged. Needle 15/15 exact DET (matches
   champion). Batch-scaling cost (M4 phase probe) is **MoE +14.4 ms/+58%** and the
-  per-row indexer scan **compidx +7.4 ms/+78%** — inherent DSv4 architecture, not
-  a regression; compidx is the known batched-compressor optimization lever.
+  indexer/compressor **compidx +7.4 ms/+78%** — inherent DSv4 architecture, not
+  a regression. NB compidx is measured with the batched-compressor pre-pass
+  already default-on (P1a/P1b + prepass, since `28650280b` 2026-06-26); this
+  +7.4 ms is the *residual* per-row GEMV/gather cost, and whether the shipped
+  batching collapsed it on TP=4 is still the pending-remote measurement, not an
+  unbuilt lever.
 - **Tap-capture fix correction (`2ffc19736`):** it is a **no-op for the production
   DSv4-Flash-FP8 checkpoint** — my load-bearing premise "`is_dspark()`=true on the
   served checkpoint" was **wrong**. Pod fact: the base `config.json` carries NO
