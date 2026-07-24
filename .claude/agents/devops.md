@@ -54,6 +54,21 @@ truth; the pod is a build copy. Be terse; report the measured result, not a play
 - To wait on a long build/run: launch a background poller (`run_in_background` Bash) that
   greps the log for the exit marker and exits — it re-invokes you. Don't foreground-sleep.
 
+## Pitfalls (learned 2026-07-24, don't repeat)
+- `tn push`'d scripts land non-executable: invoke `bash /host/…/x.sh`, never `./x.sh`.
+- In one pod exec, `cd X && nohup … &` does NOT move the commands after it — every
+  path in the same exec must be absolute. Verify a launch from a FRESH `~/bin/pod`
+  call: the launching exec can hang holding the background child's fds.
+- Your session can die mid-wait (session limits reaped two pollers in one run). A
+  long run must be answerable by any fresh session from the pod log alone: nohup +
+  on-pod watchdog + `RUN_EXIT=` in the log, launch command saved as an on-pod script.
+- `/metrics` curl snapshots interleave spurious zeros (scrape races, serve
+  restarts): prefix every snapshot with `=== $(date -u)` and read the monotone
+  nonzero envelope — never the last line or a naive max.
+- `[arle] <defunct>` zombies are unkillable and harmless — don't loop on them.
+- Before a relaunch, `rm -rf` the stale run dir + `/tmp` leftovers; after RUN_EXIT,
+  kill your watchdogs/snapshot loops — cleanup is part of the run.
+
 ## Reporting
 Relay the BUILD_EXIT/RUN_EXIT, the key log lines, and any measured number (GPU mem peak,
 loss, timing). If a build/run fails, paste the actual error — don't summarize it away.
