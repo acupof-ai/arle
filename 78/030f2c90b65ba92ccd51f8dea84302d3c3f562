@@ -1,0 +1,23 @@
+crates/infer-cuda/src/executor/qwen.rs
+  s_fc4fd4204b7128::t_fd7089a0921065 146
+crates/infer-cuda/src/executor/qwen35.rs
+  s_fc4fd4204b7128::t_a7923940931898 993-995,1033
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "78030f2c90b65ba92ccd51f8dea84302d3c3f562",
+  "prompts": {},
+  "sessions": {
+    "s_fc4fd4204b7128": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aa7d3accbab9aea71",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
