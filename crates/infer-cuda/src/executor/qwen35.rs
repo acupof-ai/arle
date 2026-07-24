@@ -3117,8 +3117,54 @@ impl Qwen35CudaExecutor {
             conv_len,
             &mut scratch_pool,
         )?;
-        self.model
-            .forward_token_logits_full(&mut slot, &mut self.workspace, input_ids, start_pos)
+        // Full-attn KV is paged (the contiguous per-slot k_caches are never
+        // allocated), so the transient forward borrows a FREE pool slot for its
+        // KV pages and returns them before this call completes.
+        let Some(pool_probe) = self.full_attn_kv.as_ref() else {
+            return self.model.forward_token_logits_full(
+                &mut slot,
+                &mut self.workspace,
+                input_ids,
+                start_pos,
+                None,
+            );
+        };
+        ensure!(
+            start_pos == 0,
+            "forward_token_logits on the paged full-attn path requires start_pos 0, got {start_pos}"
+        );
+        let kv_slot = (0..self.slots.len())
+            .find(|&s| pool_probe.seq_len(s) == 0 && self.slots[s].seq_len() == 0)
+            .ok_or_else(|| {
+                anyhow::anyhow!("forward_token_logits: no free KV slot for the transient forward")
+            })?;
+        let Self {
+            model,
+            workspace,
+            full_attn_kv,
+            ..
+        } = self;
+        let pool = full_attn_kv.as_mut().expect("full_attn_kv present");
+        pool.alloc_tokens(kv_slot, input_ids.len())?;
+        let result =
+            crate::loader::PageMeta::for_slot(&model.ctx, pool, kv_slot, 0, input_ids.len())
+                .and_then(|meta| {
+                    let mut rc = crate::qwen35::Qwen35RecallForward {
+                        pool,
+                        meta: &meta,
+                        layer0_query: Vec::new(),
+                    };
+                    model.forward_token_logits_full(
+                        &mut slot,
+                        workspace,
+                        input_ids,
+                        0,
+                        Some(&mut rc),
+                    )
+                });
+        let pool = self.full_attn_kv.as_mut().expect("full_attn_kv present");
+        pool.free_slot(kv_slot);
+        result
     }
 
     pub(crate) fn device(&self) -> &DeviceContext {

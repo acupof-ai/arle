@@ -4212,8 +4212,9 @@ impl Qwen35Model {
         ws: &mut Qwen35Workspace,
         tokens: &[u32],
         start_pos: usize,
+        recall: Option<&mut Qwen35RecallForward>,
     ) -> Result<(DeviceVec, [usize; 2])> {
-        self.forward_hidden(slot, ws, tokens, start_pos)?;
+        self.forward_hidden_capture(slot, ws, tokens, start_pos, None, recall, None)?;
         let seq_len = tokens.len();
         let eps = self.config.rms_norm_eps;
         let hidden_size = self.config.hidden_size;
