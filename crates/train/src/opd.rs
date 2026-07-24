@@ -2792,9 +2792,11 @@ pub fn rubric_writeback_ce_step_batched<O: Optimizer>(
                 ))
         })
         .collect();
+    log_writeback_vram(store, "batched", "pre forward");
     let hidden = student
         .forward_batch_hidden(&flat, b, max_len, store, &mut tape)
         .map_err(OpdError::from)?;
+    log_writeback_vram(store, "batched", "post forward");
 
     // Per-row completion-masked CE via the fused indexed path, preserving the prior
     // mean-of-row-means reduction: each row's fused call returns that row's token-
@@ -2827,11 +2829,14 @@ pub fn rubric_writeback_ce_step_batched<O: Optimizer>(
     let total = total.expect("batch is non-empty");
     let mean = mul_scalar(total, 1.0 / b as f32, store, &mut tape).map_err(OpdError::from)?;
     let loss_value = store.to_host(mean).map_err(OpdError::from)?[0];
+    log_writeback_vram(store, "batched", "post ce");
     backward_with_optional_profile(mean, loss_value, store, &mut tape)?;
+    log_writeback_vram(store, "batched", "post backward");
     optimizer.step(store, trainable_params)?;
     optimizer.zero_grad(store, trainable_params);
     let keep_extra: HashSet<TensorId> = HashSet::new();
     cleanup_after_backward(store, &mut tape, all_model_params, &keep_extra);
+    log_writeback_vram(store, "batched", "post cleanup");
     Ok(loss_value)
 }
 
