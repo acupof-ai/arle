@@ -5,7 +5,7 @@
   <!-- =================== Title band =================== -->
   <rect x="40" y="30" width="1520" height="84" fill="#0F172A" rx="8" ry="8"/>
   <text x="800" y="76" font-family="Noto Sans SC, Arial, sans-serif" font-size="30" font-weight="700" fill="#FFFFFF" text-anchor="middle">ARLE 训练-推理共生 — OPD-only Pivot (2026-05-18)</text>
-  <text x="800" y="104" font-family="Noto Sans SC, Arial, sans-serif" font-size="14" fill="#94A3B8" text-anchor="middle">commit bd94c09  ·  docs/projects/2026-05-18-opd-only-pivot.md  ·  runtime authority = 唯一立得住的差异化训练轴</text>
+  <text x="800" y="104" font-family="Noto Sans SC, Arial, sans-serif" font-size="14" fill="#94A3B8" text-anchor="middle">commit bd94c09  ·  runtime authority = 唯一立得住的差异化训练轴</text>
 
   <!-- =================== Column headers =================== -->
   <!-- Left header: deleted -->
