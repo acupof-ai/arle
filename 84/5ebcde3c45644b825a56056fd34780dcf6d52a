@@ -1,0 +1,29 @@
+.github/workflows/kernels-publish.yml
+  s_369a57354b1459::t_d7a8f8dfe52b7a 29
+scripts/README.md
+  s_369a57354b1459::t_f1d4cf1def03f7 152-156,164-165
+.github/workflows/ci.yml
+  s_369a57354b1459::t_eb24f7e9d9c9db 98-101
+.github/workflows/release.yml
+  s_369a57354b1459::t_8021c952348e68 131,154,264
+web/src/data/content.ts
+  s_369a57354b1459::t_d6c14d27a98f76 314,388,771,871
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "845ebcde3c45644b825a56056fd34780dcf6d52a",
+  "prompts": {},
+  "sessions": {
+    "s_369a57354b1459": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a37afa08-363e-420d-97a5-35b731b7f708",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
