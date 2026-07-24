@@ -48,8 +48,7 @@ execution works on the third turn.
   set. T2 (sm_100/120) is opt-in. T3 (sm < 80) is rejected at build
   time with a hint. Unknown SMs hard-fail rather than silently
   falling back.
-- Plan + tier policy live in `docs/plans/sm-coverage.md`; four
-  per-SM bench stubs are tracked under `docs/experience/wins/` as
+- Four per-SM bench stubs are tracked under `docs/experience/wins/` as
   `pending-remote` and will be filled in alongside the multi-cubin
   AOT dispatch (Phase B/C).
 
@@ -356,7 +355,7 @@ Coordinated refactor round finishing Route-A and pre-staging the internal seams 
 - `build.rs` Triton `cargo:rerun-if-changed` list is now auto-derived from a directory walk instead of a hand-maintained constant, so new Triton kernels don't silently skip rebuilds.
 
 #### Kernel crate extraction (option B landed same day)
-- Followed the hygiene round by executing the option B kernel-crate extraction (plan purged; see [`docs/architecture.md`](docs/architecture.md) + [`docs/reviews/kernel-registry.md`](docs/reviews/kernel-registry.md)) — the `backend::cuda::prelude` seam was the staging point, and commits `a4e12f5` → `0ab2cd1` → `081cf32` landed the one-day mechanical refactor. `backend/cuda/` now contains only `bootstrap.rs`; all kernel sources, FFI, paged KV, FlashInfer wrappers, graph pool, tensor primitives, KV quant, and TurboQuant live under [`crates/cuda-kernels/`](crates/cuda-kernels/) with a one-way `infer → cuda-kernels` dependency. CUDA kernel C++ sources moved from `infer/csrc/cuda/` to `crates/cuda-kernels/csrc/{attention,gemm,kv,misc,quant}/`.
+- Followed the hygiene round by executing the option B kernel-crate extraction (plan purged; see [`docs/architecture.md`](docs/architecture.md)) — the `backend::cuda::prelude` seam was the staging point, and commits `a4e12f5` → `0ab2cd1` → `081cf32` landed the one-day mechanical refactor. `backend/cuda/` now contains only `bootstrap.rs`; all kernel sources, FFI, paged KV, FlashInfer wrappers, graph pool, tensor primitives, KV quant, and TurboQuant live under [`crates/cuda-kernels/`](crates/cuda-kernels/) with a one-way `infer → cuda-kernels` dependency. CUDA kernel C++ sources moved from `infer/csrc/cuda/` to `crates/cuda-kernels/csrc/{attention,gemm,kv,misc,quant}/`.
 - The `mlx-sys` bridge was promoted from `infer/mlx-sys/` to [`crates/mlx-sys/`](crates/mlx-sys/) as part of the same Route-A flattening so both native layers (CUDA, Metal) sit peer-level under `crates/`.
 
 ### Governance

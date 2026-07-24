@@ -133,7 +133,7 @@ Notes:
 | DeepSeek-V3/R1 | Not carried | Deleted from the current registry/spec/train surface; reintroduction would require a new explicit project, not a compatibility branch inside DSv4. |
 | Mistral / Mixtral / Gemma / Phi | Planned | Not yet supported. |
 
-**Next-model roadmap priority** (canonical in [`ROADMAP.md` §Next-Model Priority Order](../ROADMAP.md#next-model-priority-order)):
+**Next-model roadmap priority:**
 
 1. **DeepSeek V4 (DS4)** — serves at TP=8/EP=8 on CUDA; GLM-5.2 (`glm_moe_dsa`) rides the same path (verification pending-remote). Long-ctx residual + DP-attn for c>1 are the remaining runtime levers.
 2. **Qwen 3.6** — **shipped on CUDA** (FP8 DeepGEMM MoE + batched paged decode) and Metal; the 122B-A10B TP4 numerical-completion gate is the remaining follow-up.
@@ -230,13 +230,12 @@ is pending pod time** — see the dated `wins/` entries per row.
 | CLI agent slash commands | Beta | Usable and documented, but not yet treated like the HTTP API for compatibility. |
 | `arle serve` front door | Stable | **In-process** serving (`crates/cli/src/serve.rs`): the single `arle` binary loads the model and serves OpenAI v1 directly — no standalone backend binaries are spawned or searched. `--bind` is honored by every backend. |
 | CLI built-in shell/python tools | Beta | Enabled by default for local trusted agent use. `--no-tools` disables them, and `arle --doctor` reports the detected sandbox backend (`nsjail`, `sandbox-exec`, or `bare`). Do not expose tool-enabled local agent prompts to untrusted users. |
-| Structured-output grammar (xgrammar FFI) | Scaffold (Phase 1) | `crates/xgrammar-sys` Rust safe wrapper over upstream `mlc-ai/xgrammar` v0.1.34 (codex's #26 WIP, FFI substrate landed; default build = stub, `--features real` builds C++ shim via `cc` + pinned upstream checkout). No HTTP, scheduler, sampler, or GPU sampling integration yet. Tracked under `docs/plans/M_xgrammar-ffi-scaffold.md`. |
+| Structured-output grammar (xgrammar FFI) | Scaffold (Phase 1) | `crates/xgrammar-sys` Rust safe wrapper over upstream `mlc-ai/xgrammar` v0.1.34 (codex's #26 WIP, FFI substrate landed; default build = stub, `--features real` builds C++ shim via `cc` + pinned upstream checkout). No HTTP, scheduler, sampler, or GPU sampling integration yet. |
 
 ## 5a. Training Surface Matrix
 
 > **2026-05-18 pivot — OPD only.** Scratch pretrain, SFT, GRPO, and
-> multi-turn RL surfaces were retired in commit `bd94c09`
-> ([`docs/projects/2026-05-18-opd-only-pivot.md`](projects/2026-05-18-opd-only-pivot.md)).
+> multi-turn RL surfaces were retired in commit `bd94c09`.
 > Rationale: the nanochat-d12 industry baseline measured 56 291 tok/s
 > single-GPU on this hardware vs ARLE 174.7 tok/s = 322× gap, making
 > from-scratch pretrain not a winnable axis; SFT/GRPO/multi-turn
@@ -304,10 +303,9 @@ If support changes for a backend, model family, platform, or quantization path,
 update all of the following together:
 
 1. `README.md`
-2. `ROADMAP.md` if roadmap status changed
-3. `docs/index.md` if the active-doc listing changed
-4. this file
-5. `CHANGELOG.md` when user-visible
+2. `docs/index.md` if the active-doc listing changed
+3. this file
+4. `CHANGELOG.md` when user-visible
 
 Related docs:
 

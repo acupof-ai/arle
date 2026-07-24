@@ -90,4 +90,3 @@ override it without affecting unknown hardware or shapes.
 - Probe: `crates/infer-cuda/examples/fp8_smallm_gemm_probe.rs`
 - Probe runner: `scripts/run_fp8_probe.sh`
 - Generated selector: `crates/infer-cuda/src/ops/generated/qwen_fp8_dense_projection.rs`
-- Plan: `docs/plans/2026-07-10-operator-artifact-dev-release-system.md`

@@ -44,7 +44,7 @@ CUDA_HOME=/usr/local/cuda \
     --model-path /host/DeepSeek-V4-Flash-FP8 --bind 0.0.0.0 --port 18195 \
     --spec-type mtp
 
-# Bench (canonical, locked params — docs/plans/guidellm-integration.md §3):
+# Bench (canonical, locked params):
 scripts/bench_guidellm.sh dsv4-mtp-full \
   --target http://localhost:18195 \
   --model DeepSeek-V4-Flash-FP8 \

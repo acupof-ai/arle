@@ -21,15 +21,11 @@ Review and update, as needed:
 
 1. `README.md`
 2. `README.zh-CN.md`
-3. `ROADMAP.md` — **read top-to-bottom**: the file is a public commitment;
-   pull anything that has actually shipped out of "Active Priorities" into
-   `CHANGELOG.md`, and re-state the next-release horizon honestly. A stale
-   ROADMAP is a worse signal than no ROADMAP.
-4. `docs/index.md`
-5. `CONTRIBUTING.md`
-6. `CHANGELOG.md`
-7. `docs/support-matrix.md`
-8. `docs/stability-policy.md`
+3. `docs/index.md`
+4. `CONTRIBUTING.md`
+5. `CHANGELOG.md`
+6. `docs/support-matrix.md`
+7. `docs/stability-policy.md`
 
 At minimum, make sure:
 
@@ -193,7 +189,6 @@ After release:
 ## 8. Short Checklist
 
 - [ ] Docs updated
-- [ ] ROADMAP reviewed top-to-bottom; shipped items moved to CHANGELOG
 - [ ] Workspace version bumped (`cargo set-version --workspace X.Y.Z`)
 - [ ] Changelog updated
 - [ ] Compatibility reviewed

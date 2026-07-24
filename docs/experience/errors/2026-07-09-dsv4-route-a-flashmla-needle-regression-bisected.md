@@ -51,9 +51,7 @@ Not in this entry — in flight on two tracks: (a) another session's fix
 series (`be123bcc`/`1b993da1`, "prefix reuse tail prefill" naming — note it
 may only cover the cache-on path; acceptance must use this entry's pt=462
 lane WITH `ARLE_DISABLE_PREFIX_CACHE=1` as well); (b) the structural
-B→C dirty-bit contract in
-[docs/plans/2026-07-09-dsv4-kv-reuse-seam-refactor.md](../../plans/2026-07-09-dsv4-kv-reuse-seam-refactor.md)
-Phase 0. Immediate production mitigation: `ARLE_DSV4_FLASHMLA_DECODE=0`
+B→C dirty-bit contract Phase 0. Immediate production mitigation: `ARLE_DSV4_FLASHMLA_DECODE=0`
 (correct, slower).
 
 ## Rule

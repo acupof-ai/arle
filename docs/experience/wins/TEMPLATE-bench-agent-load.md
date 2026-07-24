@@ -1,9 +1,7 @@
 # <SHORT TITLE> - agent-load benchmark, <WORKLOAD>, <BACKEND-LABEL>, <YYYY-MM-DD>
 
 > Template for W3/W4 agent-load benchmark entries. Copy this file for each run,
-> fill every placeholder, and never overwrite an existing dated entry. The
-> workload contract is
-> `docs/plans/2026-05-02-agent-load-bench-spec.md`.
+> fill every placeholder, and never overwrite an existing dated entry.
 
 ## Goal
 

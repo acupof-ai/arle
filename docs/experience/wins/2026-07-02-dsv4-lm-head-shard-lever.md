@@ -1,8 +1,7 @@
 # DSv4 lm_head vocab shard (`ARLE_DSV4_LM_HEAD_SHARD`) — STUB, pending-remote
 
 **Status: pending-remote** — the lever is CUDA/TP>1-only; no local Mac run is
-possible. Commissioned by
-[`docs/plans/2026-07-02-dsv4-6ms-token-plan.md`](../../plans/2026-07-02-dsv4-6ms-token-plan.md)
+possible. Commissioned by the DSv4 6ms-token plan
 lever **H3** (#99). Off by default; TP=1 and knob-off are byte-identical to
 baseline (loader + sampling both dispatch on `lm_head_shard: Option<_>`).
 

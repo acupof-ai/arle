@@ -9,8 +9,7 @@ and crate-admission governance see [architecture.md](architecture.md);
 support status by surface lives in [support-matrix.md](support-matrix.md).
 Qwen3.6 now serves on CUDA (FP8 MoE + batched paged decode — no longer
 Metal-only); the in-flight model additions are GLM-5.2 (wired on the DSv4 CUDA
-path, verification pending-remote) and the Metal VLMs (Gemma4, DeepSeek-OCR) —
-see [`ROADMAP.md` §Next-Model Priority Order](../ROADMAP.md#next-model-priority-order).
+path, verification pending-remote) and the Metal VLMs (Gemma4, DeepSeek-OCR).
 
 ## 1. Workspace at a glance
 
@@ -26,7 +25,7 @@ The repository has three practical layers:
  (agent, chat, cli, tools), the GPU/bridge crates (cuda-kernels, mlx-sys), the
  spec/topology/routing leaves (qwen3-spec, qwen35-spec, deepseek-spec,
  infer-topo, infer-moe, infer-util), and the training stack (autograd, train).
-- `docs/`: architecture, plans, research, and implementation notes (single
+- `docs/`: architecture and implementation notes (single
  source of truth; the historical `infer/docs/` parallel tree was retired
  during the 2026-04-25 truth-surface cleanup).
 
@@ -174,8 +173,7 @@ server → front door), with `infer-core` carrying **no** backend dependency.
  (`infer-core/src/lib.rs`) and `infer-api/src/loaded.rs` wires the
  cooperative governor. The earlier
  `Communicator`/`Sampler`/`GraphRunner`/`ModelArch` hypothesis traits were
- deleted. Capability-trait regrouping is trigger-gated — see
- [`plans/2026-06-12-architecture-refactor-roadmap.md`](plans/2026-06-12-architecture-refactor-roadmap.md) R6.
+ deleted.
 - `crates/infer-seam/src/kv.rs` + `kv_query.rs` + `allocator.rs` +
  `prefix_store.rs`: the three-way `KvPool = KvQuery + KvAllocator + KvPrefixStore`
  split (alloc/grow/truncate + prefix retain/release lookup) — the host-only KV
@@ -322,11 +320,8 @@ front door) + `infer-util`.
 
 ### 3.9 `infer-hip` / `infer-vulkan` — AIPC backends (experimental)
 
-The AIPC lane (#71/#76/#77; plans
-[`2026-06-10-hip-backend-mvp.md`](plans/2026-06-10-hip-backend-mvp.md),
-[`2026-06-11-hip-onbox-runbook.md`](plans/2026-06-11-hip-onbox-runbook.md))
-landed ahead of the Phase 3 ordering — ratification pending, see
-[`plans/2026-06-12-architecture-refactor-roadmap.md`](plans/2026-06-12-architecture-refactor-roadmap.md) §6.
+The AIPC lane (#71/#76/#77) landed ahead of the Phase 3 ordering — ratification
+pending.
 
 - `crates/infer-hip/src/{executor,kv_pool,model,loader}.rs`:
  `HipDsv4Executor` + `HipKvPool` seam impls; DSv4-Flash GGUF 2-bit
@@ -360,11 +355,11 @@ These crates sit around the runtime graph:
 - `crates/vulkan-kernels`: glslc-compiled shader corpus adapted from llama.cpp `vulkan-shaders` (typecheck-only without `glslc`)
 - `crates/infer-gguf`: GGUF v2/v3 memmap reader + llama.cpp-port CPU dequantizers + per-arch GGUF→spec-config mappers (`deepseek4`); consumers: `infer-hip`, `infer-vulkan`
 - `crates/kv-native-sys`: local persistence substrate for KV tier disk transport — `KvMmapStore` (file-backed sparse mmap page-slot store: memcpy writes, zero-copy `&[u8]` reads, slot allocator + free list). Unused: WAL, shm, mmap descriptors (kept for future shared-memory tier). Sharded block ops (`write_block_cache_sharded` / `read_block_into_sharded` / `remove_block_sharded`) — consumers: `infer-cuda/src/kv_tier.rs` (L2 DRAM + L3 mmap store) and `infer-metal`'s SSD tier (`kv_ssd.rs`).
-- `crates/xgrammar-sys`: Rust wrapper over upstream mlc-ai/xgrammar matcher (grammar-constrained decode) — **zero code consumers** since the monolith deletion; license-or-kill verdict pending ([roadmap §6](plans/2026-06-12-architecture-refactor-roadmap.md))
+- `crates/xgrammar-sys`: Rust wrapper over upstream mlc-ai/xgrammar matcher (grammar-constrained decode) — **zero code consumers** since the monolith deletion; license-or-kill verdict pending
 - `crates/qwen3-spec`: Qwen3 config + tensor-parallel `Shard` enum (TP layout authority)
 - `crates/qwen35-spec`: shared train↔infer Qwen3.5 config + canonical tensor-name contract + `Shard` annotations consumed by the sharded loader path
-- `crates/deepseek-spec`: DeepSeek-V4-only spec — owns `DeepSeekV4Config`, V4 tensor-name builders, shard annotations, attention operator summaries (`DeepSeekV4AttentionLayerPlan` — consumed by `infer-hip` today; making it the single DSv4 forward-order authority is roadmap tranche R3), and MoE route helpers (`deepseek-spec/src/v4.rs`). CUDA V4 hybrid attention + MoE + MTP kernels live in `infer-cuda` (`dsv4.rs` / `hc.rs` / `moe.rs` / `deepep.rs`). DS4 is the **#1 next-model priority** ([ROADMAP §Next-Model Priority Order](../ROADMAP.md#next-model-priority-order))
-- `crates/gemma-spec`: Gemma4 config spec (config load + validation). In-tree consumer today: `infer-vulkan`'s `model_gemma4` order pin. **Unranked** in the model priority queue — ratification pending (roadmap §6)
+- `crates/deepseek-spec`: DeepSeek-V4-only spec — owns `DeepSeekV4Config`, V4 tensor-name builders, shard annotations, attention operator summaries (`DeepSeekV4AttentionLayerPlan` — consumed by `infer-hip` today; making it the single DSv4 forward-order authority is roadmap tranche R3), and MoE route helpers (`deepseek-spec/src/v4.rs`). CUDA V4 hybrid attention + MoE + MTP kernels live in `infer-cuda` (`dsv4.rs` / `hc.rs` / `moe.rs` / `deepep.rs`). DS4 is the **#1 next-model priority**
+- `crates/gemma-spec`: Gemma4 config spec (config load + validation). In-tree consumer today: `infer-vulkan`'s `model_gemma4` order pin. **Unranked** in the model priority queue — ratification pending
 - `crates/autograd`: from-scratch autograd + optimizer + lr-schedule + AdamW codec (OPD substrate)
 - `crates/train`: train-side control plane + OPD stack (post-2026-05-18 pivot)
 - `crates/agent-bench`: agent-workload benchmark harness

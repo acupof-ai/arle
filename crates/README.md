@@ -17,8 +17,7 @@ Backend bridges and kernel layer:
   FFI, `DeviceContext` / `DeviceVec` / `HiddenStates`, `PagedKVPool` /
   `TileLangDecodeMetadata`, `graph_pool`). Extracted 2026-04-15 by commit
   `a4e12f5`; the dependency edge is one-way: `infer → cuda-kernels`, never
-  the reverse. See [`cuda-kernels/AGENTS.md`](cuda-kernels/AGENTS.md) and
-  [`../docs/plans/cuda-kernel-crate-extraction.md`](../docs/plans/cuda-kernel-crate-extraction.md)
+  the reverse. See [`cuda-kernels/AGENTS.md`](cuda-kernels/AGENTS.md)
   for the proto-API / prelude discipline.
 - `mlx-sys`: MLX C++ bridge and vendored MLX Metal qmv kernels used by the
   Metal backend
@@ -32,8 +31,7 @@ Shared model contract:
 - `qwen35-spec`: canonical Qwen3.5 config + tensor-name contract
 - `deepseek-spec`: DeepSeek V4 config + tensor-name contract (DS0 scaffold)
 
-Train-side runtime extension (OPD-only since 2026-05-18 pivot — see
-[`../docs/projects/2026-05-18-opd-only-pivot.md`](../docs/projects/2026-05-18-opd-only-pivot.md)):
+Train-side runtime extension (OPD-only since 2026-05-18 pivot):
 
 - `autograd`: from-scratch Rust autograd — `TensorStore` + `Tape` + `Backend`
   trait with CPU + CUDA + Metal paths

@@ -9,9 +9,8 @@ GPU1 held by a concurrent legitimate job). **Commit:** `3ebc763f9`.
 
 Correctness gate for the FlashMLA per-layer KV budget fix — `kv_budget_plan()`
 now sums each layer's real FlashMLA page need instead of `.max()` +
-uniform-divide-by-`num_layers`. Per
-`docs/plans/2026-07-08-dsv4-route-a-page-granular-prefix-reuse.md`'s KV-budget
-section: pure allocation-accounting change, expected byte-identical decode
+uniform-divide-by-`num_layers`. Per the KV-budget design: pure
+allocation-accounting change, expected byte-identical decode
 output — the gate is about catching an off-by-one in the new arithmetic, not
 numerics drift.
 

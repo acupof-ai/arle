@@ -57,7 +57,7 @@ Pick exactly one primary lane before reading upstream material:
 | Fair serving benchmark | ckl asks "ARLE vs SGLang/vLLM" or wants a best external baseline | `docs/bench-and-trace-spec.md`, `scripts/bench_throughput.py` |
 | Capacity / OOM / KV budget | memory pool, max tokens, KV dtype, mem fraction, request capacity | `docs/support-matrix.md`, server logs, `/v1/stats`, `nvidia-smi` |
 | Model PR history | Qwen3.5, DeepSeek V4, Qwen3-Next, MoE, loader, sampler, cache path | `infer/src/model/`, `crates/*-spec/`, active project docs |
-| Trace triage | external torch profiler or ARLE nsys/ncu points at a stage | `docs/resources/*profiling*`, `scripts/profile_*` |
+| Trace triage | external torch profiler or ARLE nsys/ncu points at a stage | `scripts/profile_*` |
 | OPD/eval baseline | serving correctness or capability numbers need external validation | `scripts/arle_capability_eval.py`, train/eval docs |
 
 If the lane is kernel-local, stop and switch to `kernel-optimization`.

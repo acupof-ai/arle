@@ -1297,8 +1297,6 @@ cargo test --release --features cuda --test greedy_consistency
 
 - `CLAUDE.md` §Benchmarks (every runtime change → bench entry)
 - `docs/bench-and-trace-spec.md` (§3 internal counters, §6 auto-iterate, §7 protocol rules)
-- `docs/projects/2026-05-07-arle-master-strategy.md` §0.1 main battlefront 3 axes (agent + quant + spec)
-- `docs/plans/M_quant-fp8-w4-magnitude-path.md` (formula-driven quantization plan)
 - `docs/experience/errors/2026-05-08-m_pgc-phase0-killed-ttft-under-threshold.md` (Phase 0 KILL — single-bucket + envelope clamp + BF16 contamination)
 - `docs/experience/errors/2026-05-08-e2-prefill-bn32-failed-kernel-time-not-binding.md` (E1/E2 KILL — kernel time not binding at sm_89 4k, TileLang 0.1.9 codegen rigidity)
 - `847a132` AGENTS.md §0 SOLID rule 6 (framing cross-checked from multiple angles, wall-clock ground truth)

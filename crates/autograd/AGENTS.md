@@ -84,8 +84,6 @@ the file count down. Each op file pairs with a `cpu_*_forward` /
 
 ## DeviceHandle contract (M5.3a)
 
-**Spec**: see [`docs/projects/agent-rl-self-evolving.md`](../../docs/projects/agent-rl-self-evolving.md) §M5 for the device-resident tensor milestone scope.
-
 ### Types
 
 ```rust
@@ -153,8 +151,7 @@ op's forward to a `Backend::<op>` method that takes handles.
 Grad accumulation in `tape.rs::merge_grad` + `tensor.rs::accumulate_grad`
 also forces a `to_host` on the incoming grad, for the same reason: the
 final `iter_mut().zip` sum is host-side. Moving grad accumulation onto
-the device is an M5.3b follow-up (see §7.2 M5.3 in
-[`docs/plans/rust-agent-rl-single-node.md`](../../docs/plans/rust-agent-rl-single-node.md)).
+the device is an M5.3b follow-up.
 
 ### Eval counter (Metal only, debug instrumentation)
 
@@ -185,11 +182,6 @@ that strengthens the runtime spine). It must stay narrow:
   curve. New schedules go here.
 - M5.3a Metal device-resident port done; M5.3b backend op coverage
   (porting CPU-only ops to lazy device paths) is the next milestone.
-- See
-  [`docs/projects/agent-rl-self-evolving.md`](../../docs/projects/agent-rl-self-evolving.md)
-  §M5 for the device-resident tensor scope and
-  [`docs/plans/rust-agent-rl-single-node.md`](../../docs/plans/rust-agent-rl-single-node.md)
-  §7.2 for the M5.3b op-coverage plan.
 
 ## Tests and benches
 

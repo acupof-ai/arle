@@ -65,9 +65,8 @@ shows. Read each project's own docs before committing.
 ## What ARLE is intentionally not racing
 
 - **Model coverage.** DeepSeek-V4-Flash and Qwen3.6 have shipped (Qwen3.6 now
-  serves on CUDA, not Metal-only); the ranked next-model queue on the
-  [ROADMAP](../ROADMAP.md#next-model-priority-order) is Llama 3 / 4 and DeepSeek
-  V3 / R1, which sit further back and are not carried today.
+  serves on CUDA, not Metal-only); the ranked next-model queue (Llama 3 / 4 and
+  DeepSeek V3 / R1) sits further back and is not carried today.
   vLLM / SGLang / mistral.rs / llama.cpp all have far broader coverage now.
 - **Multi-GPU tensor parallel.** Not in scope as of 2026-04-26. Single-GPU
   serving is the supported path.

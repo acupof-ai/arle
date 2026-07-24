@@ -17,7 +17,7 @@
 | --- | --- |
 | `crates/infer-*`（plan/seam/core/cuda/metal/server/api/topo/moe/util） | serving/runtime 真相：device-neutral IR、host-only seam、Engine/scheduler、backend executor、HTTP、模型 |
 | `arle`（`src/main.rs` → `crates/cli`） | 本地 CLI 入口：agent REPL、`arle serve`、`train opd` |
-| `train` | OPD 训练延伸（2026-05-18 pivot 后**仅 OPD**；pretrain/SFT/GRPO 已删除，见 [`projects/2026-05-18-opd-only-pivot.md`](projects/2026-05-18-opd-only-pivot.md)） |
+| `train` | OPD 训练延伸（2026-05-18 pivot 后**仅 OPD**；pretrain/SFT/GRPO 已删除） |
 
 统一契约：`infer-api`（`crates/infer-api/src/serve_engine.rs`、`LoadedInferenceEngine`），HTTP 与 agent CLI 共用；后端通过 `infer-seam` 的 `BackendExecutor` + `KvPool` 插入同一个 `infer-core` Engine。
 
@@ -49,7 +49,7 @@
 | --- | --- | --- | --- |
 | Multi-GPU TP/EP | DSv4 路径已接线（TP=8/EP=8）；通用 Qwen TP/PP 仍 staged | `crates/infer-topo`（sharding）、`crates/infer-cuda/src/{tp,deepep,dsv4}.rs` | architecture §Multi-GPU；support-matrix §0 |
 | CUDA speculative decode | **Not shipped** — 未移植到 rewrite（原 legacy `infer/`-only） | 未移植到 rewrite stack | support-matrix §0、§4a |
-| Qwen3.5 Medusa | **Blocked** — 需 recurrent-state rollback | — | support-matrix §4a；`plans/M_medusa-phase1b-qwen35-v2-snapshot-ring-redesign.md` |
+| Qwen3.5 Medusa | **Blocked** — 需 recurrent-state rollback | — | support-matrix §4a |
 | 分层 KV T1–T3 / NIXL | 未移植到 rewrite stack（原 legacy `infer/`-only） | `crates/kv-native-sys`（持久化 substrate） | support-matrix §0、§4b |
 | xgrammar 结构化输出 | Scaffold Phase 1 | `crates/xgrammar-sys` | support-matrix §5 |
 
@@ -146,8 +146,6 @@ Canonical bench 流程：[`bench-and-trace-spec.md`](bench-and-trace-spec.md) + 
 | 目录 | 数量级 | 说明 |
 | --- | --- | --- |
 | `docs/experience/wins/` | ~390+ | 历史 bench 记录；按日期/标签检索，不要通读 |
-| `docs/plans/` | ~129 | 含大量 KILL/superseded plan |
-| `docs/research/` | ~195 | 假设与 survey，非 shipped 真相 |
 | `docs/index.md` 顶部 session 快照 | — | 维护者 session 状态，会过时 |
 
 需要历史 context 时，从 canonical doc 里的链接跳转，而非从 wins 目录随机读。

@@ -182,8 +182,7 @@ v0.3.0.
   zero errors. Fixed: hardcoded `vocab_size` (now lazily inferred from
   experience) and draft-model selection (requires `dspark-sp+markov`, not
   backbone-only DFlash).
-  [win](docs/experience/wins/2026-07-20-dspark-train-sidecar-e2e-verified.md) ·
-  [plan](docs/plans/2026-07-19-dspark-train-sidecar.md).
+  [win](docs/experience/wins/2026-07-20-dspark-train-sidecar-e2e-verified.md).
 - **2026-07-17 — DSv4 cold-boot #69 closed (verdict: fixed in code, disk-bound residual).**
   Re-measured on current main: warm boot 33 s, all ranks build concurrent —
   the filed rank-0 serialization and 8× read amplification were fixed by the
@@ -209,9 +208,7 @@ v0.3.0.
   fix + opt-in flag; flip): c1 cold TTFT 3031→1088 ms, c16 out tok/s +126%,
   c32 +128% (209.9 tok/s), ITL p99 better outright; needle zero-miss ×2
   passes. `ARLE_DSV4_PREFILL_CHUNK` overrides. Entry:
-  [wins](docs/experience/wins/2026-07-17-dsv4-prefill-chunk-2048-default.md);
-  plan Shipped:
-  [plan](docs/plans/2026-07-17-dsv4-chunked-prefill-unification.md).
+  [wins](docs/experience/wins/2026-07-17-dsv4-prefill-chunk-2048-default.md).
 - **2026-07-17 — #164/#162 CLOSED (accept): c32 × 300 s oversubscription
   survival with real preemption (192 events, zero teardowns).** Final fix
   chain `f03a54f4a`: the evictor freed live-attached pages (cross-slot KV
@@ -492,8 +489,7 @@ v0.2.1.
   after the derived-state fix (`0b5bd3d55` — the FP8 band is decode-lane
   DERIVED state, never captured/restored; rebuilt from restored bf16
   staging), L3 read-back exact, publish overhead −0.35% (free).
-  [wins](docs/experience/wins/2026-07-10-dsv4-prefix-state-pool-phase2a.md) ·
-  plan [Phase 2](docs/plans/2026-07-09-dsv4-kv-reuse-seam-refactor.md).
+  [wins](docs/experience/wins/2026-07-10-dsv4-prefix-state-pool-phase2a.md).
 
 - **2026-07-10 — DSpark sampled (temp>0) spec decode LICENSED**: device-side
   filter/chain-rejection kernels (`e22a41637`/`9f2dd5b3b`) take sampled spec
@@ -529,8 +525,7 @@ v0.2.1.
   15/15 both cache states, concurrent 120/120, +193 MB pool budget
   reclaimed, park intact):
   [wins](docs/experience/wins/2026-07-10-dsv4-route-a-deletion-regression-fix-acceptance.md) ·
-  [errors](docs/experience/errors/2026-07-09-dsv4-route-a-flashmla-needle-regression-bisected.md) ·
-  reland plan [Phase 2](docs/plans/2026-07-09-dsv4-kv-reuse-seam-refactor.md).
+  [errors](docs/experience/errors/2026-07-09-dsv4-route-a-flashmla-needle-regression-bisected.md).
 
 - **2026-07-10 — Qwen3.6 DSpark block draft LICENSED (short-ctx greedy)**:
   36.2 ms/step, 104–108 tok/s = 2.4× plain decode on H20 after quant-lane
@@ -559,8 +554,7 @@ v0.2.1.
   (loss 0.376→0.155, pass-rate ≥ baseline, zero OOM). Phase 2 =
   teacher-rescue on real SWE-Pro.
   ([kill](docs/experience/errors/2026-07-03-agent-opd-toy-corpus-saturation-kill.md) ·
-  [run](docs/experience/wins/2026-07-03-agent-opd-27b-loop-stability-12rounds.md) ·
-  [plan](docs/plans/2026-07-03-agentic-opd-27b-capability-curve.md))
+  [run](docs/experience/wins/2026-07-03-agent-opd-27b-loop-stability-12rounds.md))
 
 - **Phase 2 re-scoped; whole-step decode CUDA graph RE-KILLED (2026-06-21).**
   The B=1 chain-map/roofline shows the wall is foundation-bound (per-step
@@ -568,7 +562,6 @@ v0.2.1.
   the graph lever measured −41%. MTP stays acceptance-gated opt-in
   (break-even ~57% accept; typical 50–53% is a wash); no universal spec-decode
   default. #70 closed.
-  ([chain-map](docs/plans/2026-06-20-dsv4-b1-decode-chain-map.md))
 
 ### Train / OPD
 
@@ -583,10 +576,7 @@ v0.2.1.
   ([kl-guard](docs/experience/wins/2026-07-06-opd-kl-batchmean-scale-guard.md) ·
   [flags](docs/experience/wins/2026-07-06-opd-engine-knobs-cli-flags-pending-remote.md) ·
   [split](docs/experience/wins/2026-07-06-opd-gkd-anchor-phase-helpers-pending-remote.md) ·
-  [dedrift](docs/experience/wins/2026-07-06-opd-rft-naming-dedrift-dead-code.md) ·
-  [metal-plan](docs/plans/2026-07-06-opd-metal-training-backend.md) ·
-  [swe-plan](docs/plans/2026-07-06-opd-real-swe-eval-teacher-in-loop.md) ·
-  [chain-plan](docs/plans/2026-07-06-opd-step-overload-chain-collapse.md))
+  [dedrift](docs/experience/wins/2026-07-06-opd-rft-naming-dedrift-dead-code.md))
 
 ### CUDA
 
@@ -642,7 +632,6 @@ v0.2.1.
 
 - **Breaking:** scratch pretrain / SFT / GRPO / multi-turn RL surfaces are
   deleted; OPD is the only training axis.
-  ([pivot](docs/projects/2026-05-18-opd-only-pivot.md))
 
 ### DSv4 perf campaign — adopt official kernels (2026-06-06 → 06-15)
 
@@ -670,9 +659,7 @@ v0.2.1.
   directly. The 2026-05-24/25 queue also landed code-only chunked-logits KL
   parity, KV-tier observability counters, the default-off T2 coordinator
   wireframe, SFT-anchor corpus attribution, and a CPU-only capability-eval
-  preflight for the P5 pure-OPD 5k adapter. Live task ordering, deferred GPU
-  gates, and artifact links are tracked in
-  `docs/projects/2026-05-24-opd-mainline-task-backlog.md`.
+  preflight for the P5 pure-OPD 5k adapter.
 - **End-to-end OPD CUDA training stack landed on Qwen3-0.6B.** Single-session
   32-commit arc through kill-or-license-gated wins brings the OPD step at the
   moderate Qwen3.5-like shape to **48.5 ms** on RTX 4070 Ti SUPER —
@@ -687,12 +674,7 @@ v0.2.1.
   silu+multiply fusion). New CUDA op surfaces: `matmul_bt` forward +
   backward, in-place AdamW, KV cache for OPD rollout, device-resident
   RoPE / argmax, fused causal-SDPA decode, fused attention-prepare
-  layout, fused grad clip. Usage manual:
-  `docs/projects/2026-05-21-arle-opd-cuda-usage-manual.md`.
-  Cycle wrap:
-  `docs/projects/2026-05-21-opd-cuda-cycle-wrap.md`.
-  Industry positioning:
-  `docs/projects/2026-05-21-opd-industry-positioning-best-framework.md`.
+  layout, fused grad clip.
 
 ### Observability
 
@@ -1129,8 +1111,7 @@ v0.2.1.
   `precompute_rope` formula (verified by
   `vanilla_inv_freq_matches_legacy_formula` test). Long-ctx bench
   validation (Qwen3-4B 64k YARN×2 / 128k YARN×4 + FP8 KV) deferred to
-  Phase 3; CUDA-side viable on RTX 4070 Ti SUPER 16 GB per
-  `docs/plans/2026-05-10-rope-yarn-phase3-cuda-bench-plan.md`.
+  Phase 3; CUDA-side viable on RTX 4070 Ti SUPER 16 GB.
   Apply to a model dir via [`scripts/setup_qwen3_yarn_config.py`](scripts/setup_qwen3_yarn_config.py).
   Consolidation:
   `docs/experience/wins/2026-05-10-m-rope-yarn-scaling-phase1-phase2-landed.md`.
@@ -1145,8 +1126,7 @@ v0.2.1.
   `GrammarCompiler` / `CompiledGrammar` / `GrammarMatcher` /
   `bitmask_size` / per-step bitmask fill APIs. No HTTP, scheduler,
   sampler, or GPU sampling integration yet — that is follow-up
-  tranche work. Plan:
-  `docs/plans/M_xgrammar-ffi-scaffold.md`.
+  tranche work.
 
 ### Metal
 
