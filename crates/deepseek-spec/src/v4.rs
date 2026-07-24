@@ -105,7 +105,9 @@ pub struct DeepSeekV4Config {
     #[serde(skip)]
     pub tensor_dialect: TensorDialect,
     // DSpark spec-decode config. `dspark_block_size == 0` ⇒ not a DSpark
-    // checkpoint (native MTP / non-spec), byte-unchanged. Real ckpt: 5.
+    // checkpoint (native MTP / non-spec), byte-unchanged. The DSpark *draft*
+    // config sets 5; the base serve `config.json` stays 0 unless `--spec-type
+    // dspark` merges the draft, so `is_dspark()` is false on a plain FP8 serve.
     #[serde(default)]
     pub dspark_block_size: usize,
     #[serde(default)]
