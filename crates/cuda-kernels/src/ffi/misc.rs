@@ -659,8 +659,7 @@ unsafe extern "C" {
     // return `cudaErrorInvalidValue` until a separate FP8-packing kernel
     // converts the bf16 sliding-window + compressed buffers into the
     // expected layout. Tracked under `--dsv4-flashmla-decode` (default
-    // OFF) and the project plan
-    // `docs/plans/2026-05-28-dsv4-flashmla-decode-integration.md`.**
+    // OFF).**
     pub fn arle_flashmla_sm90_sparse_decode_fwd(
         q: *const super::Half,
         kv: *const super::Half,

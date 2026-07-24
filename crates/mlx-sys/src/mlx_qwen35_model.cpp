@@ -47,7 +47,6 @@ bool cpp_phase_timing_enabled() {
 // automatic event-fence inserts (mlx/transforms.cpp eval_impl).
 // The win: this step's encoder work runs on its own StreamThread while
 // prev step's GPU exec drains on the other stream.
-// See docs/plans/M_e5-mlx-multi-stream-pipelining.md.
 bool cpp_dual_stream_enabled() {
     static int flag = -1;
     if (flag == -1) {

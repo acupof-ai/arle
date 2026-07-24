@@ -561,8 +561,7 @@ impl Tape {
             // the 1 GB DtoH the M5.3b / Wave 1 / P1 / P2 / P3 milestones
             // could never kill — per-op lazy readback is strictly cheaper
             // because device-resident backward ops never need the host
-            // snapshot. See
-            // `docs/research/2026-05-17-cuda-training-architectural-correction.md`.
+            // snapshot.
             if store.backend().prefers_pre_backward_flush() {
                 store.flush_to_host_batch(&device_ids)?;
             }
@@ -950,8 +949,7 @@ fn merge_grad(
         // side gets pulled back to host. Without this, the second
         // backward path that arrives at the same parameter would force a
         // `to_host(new_grad_id)` and the merged sum lives only in
-        // `existing.data` — host-resident from then on. See
-        // `docs/research/2026-05-17-cuda-training-architectural-correction.md`.
+        // `existing.data` — host-resident from then on.
         let both_on_device = {
             let existing = store.tensor(existing_grad_id)?;
             let incoming = store.tensor(new_grad_id)?;

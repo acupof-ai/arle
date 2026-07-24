@@ -508,7 +508,7 @@ pub(crate) fn load_dspark_draft(
 }
 
 /// Vocab-shard geometry for the opt-in `ARLE_DSV4_LM_HEAD_SHARD=1` lever
-/// (#99, `docs/plans/2026-07-02-dsv4-6ms-token-plan.md` H3). When set,
+/// (#99 H3). When set,
 /// `lm_head` holds `[rows_per_rank, hidden]` = this rank's contiguous vocab
 /// rows `[rank*rows_per_rank, rank*rows_per_rank + local_rows)` plus zero-pad
 /// rows up to the uniform 128-aligned `rows_per_rank`. Padding exists only
@@ -3631,8 +3631,8 @@ impl Dsv4Model {
             //   3. per row: slice the global-head output → local_attn → inverse-rope
             //      + SW-window update (the cheap per-row tail) → O-LoRA into attn_out[r].
             // The prepare/pack/finish/oproj loops stay per-row (cheap); only the
-            // attention kernel is batched (the 74k tiny gridX=1 launches — see
-            // docs/plans/dsv4-batched-flashmla-decode.md). Non-batched (FlashMLA
+            // attention kernel is batched (the 74k tiny gridX=1 launches).
+            // Non-batched (FlashMLA
             // decode off) layers fall through to the per-row `mla_attention` loop,
             // byte-unchanged. SW/HCA index builds are byte-identical (selected_ptr
             // stays 0); only CSA passes the gathered per-row top-k.
@@ -7669,7 +7669,7 @@ fn dsv4_decode_graph_enabled() -> bool {
     )
 }
 
-/// Opt-in decode lever #99 (`docs/plans/2026-07-02-dsv4-6ms-token-plan.md` H3):
+/// Opt-in decode lever #99 (H3):
 /// row-shard lm_head across TP ranks (replicated full-vocab GEMV → vocab/N rows
 /// per rank). Greedy sampling merges per-rank (max, argmax) via one 8-byte host
 /// all-gather; non-greedy all-gathers the bf16 logit slices to full vocab first.

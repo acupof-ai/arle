@@ -2,7 +2,6 @@
 """
 W4A8 pack/unpack round-trip diagnostic.
 
-Per docs/research/2026-05-08-w4a8-kernel-and-wiring-audit-clean.md (`01ace86`)
 Option 1 audit recommendation: isolate pack_w4a8 correctness from kernel
 and Rust FFI by doing manual unpack + dequant in pure Python and
 comparing against the BF16 reference.

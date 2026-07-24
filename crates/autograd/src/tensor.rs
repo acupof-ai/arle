@@ -830,8 +830,7 @@ impl TensorStore {
                 // backward each emit a grad for the LM-head weight via
                 // tied embeddings) would force a `to_host(grad_id)` and
                 // permanently demote the persistent grad to
-                // `Dirty::Host`. See
-                // `docs/research/2026-05-17-cuda-training-architectural-correction.md`.
+                // `Dirty::Host`.
                 let both_on_device = {
                     let existing = self.tensor(existing_id)?;
                     let incoming = self.tensor(grad_id)?;

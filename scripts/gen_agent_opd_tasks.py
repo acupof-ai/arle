@@ -23,8 +23,6 @@ with cwd = repo root (cwd lands on sys.path, so flat modules import).
 `sandbox.rs::score_workdir` semantics): for every task, the BASE tree must
 FAIL the hidden tests and the gold-patched tree must PASS. Needs only
 git + python3 + pytest; run it locally before shipping the corpus to a pod.
-
-Plan: docs/plans/2026-07-03-agentic-opd-27b-capability-curve.md
 """
 
 from __future__ import annotations

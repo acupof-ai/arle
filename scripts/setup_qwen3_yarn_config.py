@@ -15,7 +15,7 @@ Usage:
   ./scripts/setup_qwen3_yarn_config.py --src infer/models/Qwen3-4B \\
       --type linear --factor 2.0 --in-place
 
-Per docs/plans/2026-05-10-rope-yarn-phase3-cuda-bench-plan.md Phase 3a/b/c.
+Phase 3a/b/c.
 Tests M_rope-yarn-scaling Phase 1+2 wire (qwen3-spec config parse + inv_freq
 compute + weight_loader.rs precompute_rope_with_scaling).
 """

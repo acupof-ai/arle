@@ -6,7 +6,6 @@
 //! dedicated-thread lockstep loop broadcasts one `TickAdmissions` per step to
 //! every worker, and per-rank completion readers route rank-0's deltas into the
 //! per-request sinks the async handlers await. TP=1 never reaches here.
-//! See `docs/plans/2026-06-24-multiproc-control-data-plane-redesign.md`.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};

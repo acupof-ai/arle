@@ -1039,8 +1039,7 @@ impl Dsv4FlashMlaDecodeBatchScratch {
     /// Wired by [`Self::decode_lane_fwd`] (which sources `pool_ptr`/`sink_ptr`
     /// and the `q_batched`/`out_batched` bases) after the per-row pack/gather
     /// loop fills `q_batched[0..n]` and `build_layer_batch_meta(n)` populated the
-    /// indices/sched_meta. Stride mapping verified against the shim
-    /// (see `docs/plans/dsv4-batched-flashmla-decode.md`).
+    /// indices/sched_meta. Stride mapping verified against the shim.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn sparse_decode_fwd_batched(
         &mut self,

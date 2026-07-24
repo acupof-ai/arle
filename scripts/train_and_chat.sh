@@ -3,7 +3,7 @@
 # train → save → load → generate loop on Metal. If this ever fails, the
 # trainer-to-ARLE runtime contract is broken regardless of unit tests.
 #
-# DX-1 (docs/plans/train-eval-infer-dx-v1.md) note: we address the checkpoint
+# DX-1 note: we address the checkpoint
 # via `$OUT_DIR/latest` — a symlink the trainer refreshes on every save.
 # The caller never has to know the step number; `latest` always resolves to
 # the newest `step_NNNNNN` dir.

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Generate long-context eval data from ARLE codebase for Phase 3b PPL eval.
 
-Concatenates ARLE docs (README + ROADMAP + docs/index + support-matrix +
-architecture + codebase-map + selected plans/research) → tokenizes via
+Concatenates ARLE docs (README + docs/index + support-matrix + architecture
++ codebase-map + experience wins/errors) → tokenizes via
 Qwen3 tokenizer → splits into 40k / 64k / 80k token examples → writes
 tokenized JSONL per `eval_lm.rs::TokenizedJsonlRecord` schema.
 
@@ -13,8 +13,6 @@ Usage:
       --tokenizer infer/models/Qwen3-4B/tokenizer.json \\
       --out-dir bench-output/eval-longctx/ \\
       --target-tokens 40960 64000 81920
-
-Per docs/plans/2026-05-10-rope-yarn-phase3b-ppl-eval-plan.md §2.
 """
 
 from __future__ import annotations
@@ -28,7 +26,7 @@ def gather_arle_text(repo_root: Path) -> str:
     """Concatenate ARLE markdown docs to produce a long English text corpus."""
     sources = []
     # Top-level
-    for name in ["README.md", "ROADMAP.md", "CHANGELOG.md", "CLAUDE.md", "CONTRIBUTING.md"]:
+    for name in ["README.md", "CHANGELOG.md", "CLAUDE.md", "CONTRIBUTING.md"]:
         p = repo_root / name
         if p.exists():
             sources.append((name, p.read_text(errors="replace")))
@@ -39,8 +37,8 @@ def gather_arle_text(repo_root: Path) -> str:
         for p in sorted(docs.glob("*.md")):
             sources.append((f"docs/{p.name}", p.read_text(errors="replace")))
 
-        # Plans + research + projects (Markdown only)
-        for sub in ["plans", "research", "projects", "experience/wins", "experience/errors"]:
+        # Experience entries (Markdown only)
+        for sub in ["experience/wins", "experience/errors"]:
             d = docs / sub
             if not d.exists():
                 continue

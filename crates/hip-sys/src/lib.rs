@@ -11,8 +11,7 @@
 //! - default, or `--features hip` off-box without `libamdhip64`: every entry
 //!   point returns [`HIP_NOT_COMPILED`]; compiles and tests on any machine.
 //!
-//! On-box TODOs (need ROCm headers / real hardware, see
-//! `docs/plans/2026-06-10-hip-backend-mvp.md` §4): gfx arch-name probe
+//! On-box TODOs (need ROCm headers / real hardware): gfx arch-name probe
 //! (`hipDeviceProp_t.gcnArchName` is struct-ABI-versioned — resolve with
 //! bindgen or a pinned `hipGetDevicePropertiesR0600` decl on the box),
 //! hipBLASLt handle/matmul subset, async memcpy + module launch.

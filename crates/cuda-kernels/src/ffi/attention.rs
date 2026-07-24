@@ -369,7 +369,6 @@ unsafe extern "C" {
     /// INT8 KIVI per-channel K decode attention. Mirrors
     /// `decode_attention_fp8_per_channel_k_cuda` but reads INT8 K/V (with
     /// the cp.async-pipelined tiling from `decode_attention_int8_cuda`).
-    /// See docs/plans/2026-05-27-int8-kv-kivi-per-channel.md.
     pub fn decode_attention_int8_per_channel_k_cuda(
         q: *const Half,
         k_data: *const i8,
@@ -476,8 +475,7 @@ include!(concat!(env!("OUT_DIR"), "/ffi_tilelang_generated.rs"));
 // `crates/cuda-kernels/csrc/attention/dsv4_fp8_kv_pack.cu` for the byte
 // layout + e8m0 scale encoding).
 //
-// Phase D-3' of the FlashMLA decode integration plan
-// (`docs/plans/2026-05-28-dsv4-flashmla-decode-integration.md`). Sibling FFI
+// Phase D-3' of the FlashMLA decode integration plan. Sibling FFI
 // for the kernel-side decode dispatch lives in `ffi/misc.rs` next to
 // `arle_flashmla_sm90_sparse_decode_fwd`; runtime wire-up is a separate
 // downstream item.
@@ -634,8 +632,7 @@ unsafe extern "C" {
 // DSv4 FlashMLA sparse-decode indices builder (block-paged coords).
 //
 // Builds the unified per-decode-token indices buffer (s_q=1) in the
-// block-paged coord space of the FP8 KV pool described in
-// `docs/plans/2026-05-28-dsv4-flashmla-decode-integration.md` Phase D-3'.
+// block-paged coord space of the FP8 KV pool (Phase D-3').
 //
 // Sibling kernel of the prefill-side `arle_flashmla_csa_build_indices` /
 // `arle_flashmla_hca_build_indices`; mode_int selects between them.
@@ -737,8 +734,7 @@ unsafe extern "C" {
 // `csrc/attention/arle_fa3_shim.cu`. Build opt-in via ARLE_CUDA_ENABLE_FA3;
 // without it the stub returns `cudaErrorNotSupported` and the marker returns
 // 0 (assert it returns 1 before enabling the runtime path — flashmla stub
-// lesson). Consumer plan:
-// `docs/plans/2026-06-11-qwen35-fa3-hd256-adoption.md`.
+// lesson).
 // ============================================================================
 
 /// Mirror of `ArleFa3FwdHd256Args` in `csrc/attention/arle_fa3_shim.cu`.

@@ -375,8 +375,7 @@ fn cuda_log_softmax_last_axis_backward_matches_cpu() {
     // output (`y`) feeds the backward identity
     // `grad = upstream - exp(y) * sum(upstream, axis=-1)`. This is the
     // exact `1 015 MB` tensor that nsys identified as the single largest
-    // DtoH per training step (see
-    // `docs/research/2026-05-17-cuda-training-step-nsys-attribution.md`);
+    // DtoH per training step;
     // benching against the production shape catches reductions /
     // intrinsics drift the smaller unit-test shapes miss.
     let shape: Vec<usize> = vec![2, 512, 248_070];

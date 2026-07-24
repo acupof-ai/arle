@@ -1,7 +1,6 @@
 //! Phase 1 trajectory writer for the ARLE CLI agent loop.
 //!
-//! See `docs/projects/agent-trajectory-export.md` for the canonical
-//! schema. v1 captures the message log + per-sub-turn telemetry; v2
+//! v1 captures the message log + per-sub-turn telemetry; v2
 //! (token IDs + response_mask) is deferred until the engine surface
 //! exposes per-token state.
 //!

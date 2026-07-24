@@ -65,8 +65,7 @@ path = "examples/dsv4_parity.rs"
 required-features = ["cuda"]
 
 # Isolated small-message collective bench (one-shot custom AR/AG vs NCCL /
-# NCCL-2.27 symmetric windows) — docs/plans/2026-06-10-dsv4-oneshot-allreduce-
-# isolated-bench.md. Coordinator self-spawns ranks 1..WORLD_SIZE.
+# NCCL-2.27 symmetric windows). Coordinator self-spawns ranks 1..WORLD_SIZE.
 [[example]]
 name = "comm_bench"
 path = "examples/comm_bench.rs"

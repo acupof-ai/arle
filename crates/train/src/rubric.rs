@@ -2,8 +2,7 @@
 //! (DeepSeek-V4-Flash), and parse its structured verdict. Pure host logic — no
 //! engine/GPU — so it unit-tests on CPU.
 //!
-//! Route + rationale: [`docs/plans/2026-06-21-opd-ceiling-27b-dense.md`]. The
-//! student generates on-policy rollouts; the judge (Flash) scores each against a
+//! The student generates on-policy rollouts; the judge (Flash) scores each against a
 //! rubric at the *text* level (vocab-agnostic, sidestepping cross-tokenizer KD);
 //! accepted rollouts are written back as the student's own training targets (RFT).
 //!
