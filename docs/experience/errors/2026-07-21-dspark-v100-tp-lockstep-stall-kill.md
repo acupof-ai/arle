@@ -35,3 +35,12 @@ Not yet implemented. Two options:
 
 DSpark on single-GPU (TP=1) is KILLED until the lockstep stall is fixed.
 Multi-GPU TP≥2 DSpark results (H20) are unaffected.
+
+## Resolution — 2026-07-25
+
+Re-bench at HEAD 59b86ee4c (fresh on-box build, symbol-verified): **zero
+lockstep-stall WARNs / zero errors over ~2 h of DSpark load** — the
+world_size≤1 self-ack bypass is measured effective; stall root cause closed
+(#168). DSpark-on-V100 stays KILLED on new grounds: the non-user-facing
+8192-page pool floor OOMs 32 GB (#178) and sm_70 greedy output is garbage
+(#179) — the −91% was mostly the sm_70 draft+verify path itself.
