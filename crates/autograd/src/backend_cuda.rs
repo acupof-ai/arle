@@ -57,6 +57,17 @@ use cudarc::driver::{
 #[cfg(not(feature = "no-cuda"))]
 use std::sync::Arc;
 
+/// Borrowed FP8 block-scaled tensor parts: (weight bytes, scales, rows, cols, block_m, block_k).
+#[cfg(not(feature = "no-cuda"))]
+type Fp8BlockScaledView<'a> = (
+    &'a CudaSlice<u8>,
+    &'a CudaSlice<f32>,
+    usize,
+    usize,
+    usize,
+    usize,
+);
+
 #[cfg(not(feature = "no-cuda"))]
 const CUBLASLT_BF16_GEMMEX_MIN_N: usize = 32;
 
@@ -361,14 +372,7 @@ impl CudaBackend {
     fn cuda_fp8_block_scaled_storage<'a>(
         &self,
         storage: &'a CudaFp8BlockScaledStorage,
-    ) -> Result<(
-        &'a CudaSlice<u8>,
-        &'a CudaSlice<f32>,
-        usize,
-        usize,
-        usize,
-        usize,
-    )> {
+    ) -> Result<Fp8BlockScaledView<'a>> {
         let weight = storage.weight();
         let scales = storage.scales();
         if weight.context() != self.stream.context() || scales.context() != self.stream.context() {
@@ -407,6 +411,8 @@ impl CudaBackend {
                 ))?;
         {
             let (dst_ptr, _dst_guard) = staging.device_ptr_mut(&self.stream);
+            // SAFETY: dst spans `staging`'s len*2 = byte_count bytes (`_dst_guard` held); the
+            // caller guarantees src_device_ptr covers byte_count bytes until the sync below.
             let status = unsafe {
                 cuMemcpyDtoD_v2(
                     dst_ptr as CUdeviceptr,
@@ -768,6 +774,8 @@ impl CudaBackend {
             // lm_head [vocab, hidden] x [hidden, 8]. Padding the cuBLAS N
             // dimension with zero activation rows avoids that heuristic bug;
             // only the real row prefix is returned.
+            // SAFETY: b/a/c derive from live guarded slices — b [n,k] validated at entry, a
+            // padded to [padded_m,k], c allocated [padded_m,n] — matching the dims passed.
             unsafe {
                 cublas_result::gemm_ex(
                     *self.blas.handle(),
@@ -866,6 +874,8 @@ impl CudaBackend {
             // Row-major C[M,K] = A[M,N] @ B[N,K], using cuBLAS's column-major
             // view as C_col[K,M] = B_col[K,N] @ A_col[N,M]. See
             // `matmul_bt_device_f32_bf16` for the skinny-N padding rationale.
+            // SAFETY: b/a/c derive from live guarded slices — b [n,k] validated at entry, a
+            // padded to [padded_m,n], c allocated [padded_m,k] — matching the dims passed.
             unsafe {
                 cublas_result::gemm_ex(
                     *self.blas.handle(),
@@ -1168,6 +1178,8 @@ impl Backend for CudaBackend {
                 self.stream
                     .upgrade_device_ptr::<u8>(weight_device_ptr as CUdeviceptr, weight_len)
             };
+            // SAFETY: same caller contract as the weight slice — scale_device_ptr is resident
+            // for scale_len f32s and never freed by the borrowed handle.
             let scale_slice: CudaSlice<f32> = unsafe {
                 self.stream
                     .upgrade_device_ptr::<f32>(scale_device_ptr as CUdeviceptr, scale_len)
@@ -3689,6 +3701,8 @@ fn cuda_causal_sdpa_prefill_device(
         let (v_ptr, _v_guard) = v_bf16.device_ptr(&backend.stream);
         let (out_ptr, _out_guard) = out_bf16.device_ptr_mut(&backend.stream);
         check_cuda_ffi(
+            // SAFETY: q/k/v are live guarded bf16 copies of tape tensors whose shapes passed the
+            // envelope check; out is allocated seq*heads*dim; the dims passed mirror those shapes.
             unsafe {
                 ffi::nonpaged_prefill_attention_cuda(
                     q_ptr as *const ffi::Half,
@@ -4069,6 +4083,8 @@ fn cuda_linear_attention_forward_device_row(
         let (g_ptr, _g_guard) = g.device_ptr_mut(&backend.stream);
         let (beta_ptr, _beta_guard) = beta.device_ptr_mut(&backend.stream);
         check_cuda_ffi(
+            // SAFETY: reads qkv_conv/b/a/dt/a_log, writes q/k/v/g/beta — all live guarded slices
+            // sized above (qkv_len / head_len / num_value_heads / q_len / v_len) to match the dims.
             unsafe {
                 ffi::gated_delta_rule_prefill_chunk_prepare_cuda(
                     qkv_ptr as *const ffi::Half,
@@ -4098,6 +4114,8 @@ fn cuda_linear_attention_forward_device_row(
             let (g_ptr, _g_guard) = g.device_ptr(&backend.stream);
             let (gc_ptr, _gc_guard) = g_cumsum.device_ptr_mut(&backend.stream);
             check_cuda_ffi(
+                // SAFETY: g and g_cumsum are live guarded head_len (seq_len*num_value_heads)
+                // f32 slices — exactly the extent the cumsum kernel scans.
                 unsafe {
                     ffi::gated_delta_rule_prefill_chunk_cumsum_cuda(
                         g_ptr as *const f32,
@@ -4118,6 +4136,8 @@ fn cuda_linear_attention_forward_device_row(
             let (beta_ptr, _beta_guard) = beta.device_ptr(&backend.stream);
             let (a_tril_ptr, _a_tril_guard) = a_tril.device_ptr_mut(&backend.stream);
             check_cuda_ffi(
+                // SAFETY: k/g_cumsum/beta are live guarded inputs (q_len/head_len); a_tril is
+                // allocated a_len = seq_len*num_value_heads*64, the kernel's per-chunk tril extent.
                 unsafe {
                     ffi::gated_delta_rule_prefill_chunk_a_cuda(
                         k_ptr as *const ffi::Half,
@@ -4138,6 +4158,8 @@ fn cuda_linear_attention_forward_device_row(
             let (a_tril_ptr, _a_tril_guard) = a_tril.device_ptr(&backend.stream);
             let (a_inv_ptr, _a_inv_guard) = a_inv.device_ptr_mut(&backend.stream);
             check_cuda_ffi(
+                // SAFETY: a_tril and a_inv are both live guarded a_len slices; the solve kernel
+                // reads/writes only that per-chunk 64x64 tril extent.
                 unsafe {
                     ffi::gated_delta_rule_prefill_chunk_solve_cuda(
                         a_tril_ptr as *const f32,
@@ -4161,6 +4183,8 @@ fn cuda_linear_attention_forward_device_row(
             let (a_inv_ptr, _a_inv_guard) = a_inv.device_ptr(&backend.stream);
             let (gc_ptr, _gc_guard) = g_cumsum.device_ptr(&backend.stream);
             check_cuda_ffi(
+                // SAFETY: k/w share q_len, v/u share v_len, beta/g_cumsum head_len, a_inv a_len —
+                // all live guarded slices allocated above at the extents the dims imply.
                 unsafe {
                     ffi::gated_delta_rule_prefill_chunk_recompute_cuda(
                         k_ptr as *const ffi::Half,
@@ -4190,6 +4214,8 @@ fn cuda_linear_attention_forward_device_row(
             let (vnew_ptr, _vnew_guard) = v_new.device_ptr_mut(&backend.stream);
             let (final_ptr, _final_guard) = final_state.device_ptr_mut(&backend.stream);
             check_cuda_ffi(
+                // SAFETY: k/w/u/g_cumsum/initial_state are live guarded inputs; chunk_state holds
+                // num_chunks*state_len, v_new v_len, final_state state_len — writes stay in bounds.
                 unsafe {
                     ffi::gated_delta_rule_prefill_chunk_state_cuda(
                         k_ptr as *const ffi::Half,
@@ -4218,6 +4244,8 @@ fn cuda_linear_attention_forward_device_row(
             let (gc_ptr, _gc_guard) = g_cumsum.device_ptr(&backend.stream);
             let (raw_ptr, _raw_guard) = raw_output.device_ptr_mut(&backend.stream);
             check_cuda_ffi(
+                // SAFETY: q/k/v_new/chunk_state/g_cumsum are live guarded inputs; raw_output is
+                // allocated v_len (seq_len*num_value_heads*value_dim), the kernel's write extent.
                 unsafe {
                     ffi::gated_delta_rule_prefill_chunk_o_cuda(
                         q_ptr as *const ffi::Half,
@@ -4254,8 +4282,9 @@ fn cuda_linear_attention_forward_device_row(
             let chunk_len_i32 = i32::try_from(chunk_len).map_err(|_| {
                 AutogradError::TapeInvariant("linear_attention chunk_len exceeds i32")
             })?;
+            // SAFETY: chunk_state has num_chunks*state_len f32s; chunk_idx < num_chunks.
             let dst_addr = unsafe { (chunk_ptr as *mut f32).add(chunk_idx * state_len) } as u64;
-            let src_addr = state_ptr as u64;
+            let src_addr = state_ptr;
             launch_1d(
                 &backend.stream,
                 backend.kernels.function("linear_attention_copy_f32")?,
@@ -4266,6 +4295,9 @@ fn cuda_linear_attention_forward_device_row(
                 },
             )?;
             check_cuda_ffi(
+                // SAFETY: base = chunk_idx*64 with chunk_len = min(seq_len-base, 64), so the
+                // offset qkv_conv/b/a/raw_output views and final_state (state_len) stay inside
+                // their live guarded slices.
                 unsafe {
                     ffi::gated_delta_rule_prefill_recurrent_cuda(
                         (qkv_ptr as *const ffi::Half).add(base * qkv_dim),
@@ -7138,7 +7170,7 @@ fn cuda_rope(
     }
     // Partial rotary (cos rows = rotary_dim/2 ≤ head_dim/2): rotate the leading
     // segment, pass the tail through — mirrors `cpu_rope_forward`.
-    let rot_half = if seq > 0 { cos.len() / seq } else { 0 };
+    let rot_half = cos.len().checked_div(seq).unwrap_or(0);
     if cos.len() != sin.len() || rot_half == 0 || rot_half > half_dim || cos.len() != seq * rot_half
     {
         return Err(AutogradError::ShapeMismatch {
@@ -7232,7 +7264,7 @@ fn cuda_rope_device(
         });
     }
     // Partial rotary: see `cuda_rope_forward`.
-    let rot_half = if seq > 0 { cos.len() / seq } else { 0 };
+    let rot_half = cos.len().checked_div(seq).unwrap_or(0);
     if cos.len() != sin.len() || rot_half == 0 || rot_half > half_dim || cos.len() != seq * rot_half
     {
         return Err(AutogradError::ShapeMismatch {
@@ -9161,7 +9193,7 @@ fn cuda_rope_backward_device(
         });
     }
     // Partial rotary: see `cuda_rope_forward`.
-    let rot_half = if seq > 0 { cos.len() / seq } else { 0 };
+    let rot_half = cos.len().checked_div(seq).unwrap_or(0);
     if cos.len() != sin.len() || rot_half == 0 || rot_half > half_dim || cos.len() != seq * rot_half
     {
         return Err(AutogradError::ShapeMismatch {
