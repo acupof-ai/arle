@@ -388,7 +388,8 @@ pub(crate) struct Args {
 
     /// Path to a JSONL file that will receive one trajectory record per
     /// agent turn (Phase 1 / v1 schema). When unset, no trajectory is
-    /// written.
+    /// written. See `docs/projects/agent-trajectory-export.md` for the
+    /// canonical schema.
     #[arg(long, value_parser = parse_trace_path)]
     pub(crate) trace: Option<PathBuf>,
 
@@ -630,6 +631,7 @@ pub(crate) struct ServeArgs {
     /// budget-bounded resident subset (sink + top-k mean-key + local) instead of
     /// the full cache. Metal, and CUDA dense-Qwen3 (eager decode), with
     /// `--kv-cache-dtype bf16` only; default off → baseline byte-identical.
+    /// See `docs/plans/2026-06-23-writethrough-tiered-kv-memory.md`.
     #[arg(long, default_value_t = false)]
     pub(crate) kv_recall: bool,
 
@@ -2042,12 +2044,6 @@ pub(crate) struct TrainAgentOpdArgs {
     /// safe envelope).
     #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u8).range(0..=1))]
     pub(crate) staleness: u8,
-
-    /// Hold a task's remaining samples until the first one's opening request
-    /// radix-publishes the shared CC preamble, so the rest prefix-hit instead
-    /// of K cold prefills. Default off pending the pod A/B.
-    #[arg(long, default_value_t = false, action = clap::ArgAction::Set, value_name = "BOOL")]
-    pub(crate) group_stagger: bool,
 
     /// `PYTHONPATH` (sandbox-relative) for the bash tool + test runs, e.g.
     /// `lib:test`. Optional.
