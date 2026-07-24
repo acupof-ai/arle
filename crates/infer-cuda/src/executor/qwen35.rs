@@ -484,12 +484,19 @@ impl Qwen35CudaExecutor {
         }
     }
 
-    /// True device-pool headroom for the engine's plan gate. Reflects
-    /// recall-keepalive retention the host accounting pool cannot see.
-    pub(crate) fn kv_device_free_pages(&self) -> Option<usize> {
-        self.full_attn_kv
-            .as_ref()
-            .map(|pool| pool.free_page_count())
+    /// Plan-level fit against `full_attn_kv`'s true headroom (reflects
+    /// recall-keepalive retention the host accounting pool cannot see):
+    /// first row whose engine-projected `pages_hint` overdraws the pool.
+    pub(crate) fn kv_device_fit(&self, rows: &[infer_seam::DeviceRowDemand]) -> Option<usize> {
+        let pool = self.full_attn_kv.as_ref()?;
+        let mut free = pool.free_page_count();
+        rows.iter().position(|row| {
+            if free < row.pages_hint {
+                return true;
+            }
+            free -= row.pages_hint;
+            false
+        })
     }
 
     /// Restore the recurrent sidecar for a page-radix prefix hit, returning the

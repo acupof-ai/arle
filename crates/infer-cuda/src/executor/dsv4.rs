@@ -456,22 +456,12 @@ impl std::fmt::Debug for Dsv4CudaExecutor {
 }
 
 impl Dsv4CudaExecutor {
-    /// Device-budget plan gate (#160): tightest demand-paged FlashMLA layer
-    /// pool. None on identity/V32 (fixed bands, drawn at slot alloc).
-    /// Lockstep-safe without a collective: band pools mutate only from the
-    /// rank-identical plan stream, so every rank reads the same count.
-    pub(crate) fn kv_device_free_pages(&self) -> Option<usize> {
-        self.kv_adapter.flashmla_demand_free_pages()
-    }
-
-    /// Band growth `submit`'s `flashmla_ensure_band` will draw for this row.
-    pub(crate) fn kv_device_pages_needed(
-        &self,
-        slot: usize,
-        target_tokens: usize,
-    ) -> Option<usize> {
-        self.kv_adapter
-            .flashmla_demand_pages_needed(slot, target_tokens)
+    /// Device-budget plan gate (#160): per-layer band fit. None-equivalent on
+    /// identity/V32 (fixed bands, drawn at slot alloc). Lockstep-safe
+    /// without a collective: band pools mutate only from the rank-identical
+    /// plan stream, so every rank computes the same fit.
+    pub(crate) fn kv_device_fit(&self, rows: &[infer_seam::DeviceRowDemand]) -> Option<usize> {
+        self.kv_adapter.flashmla_demand_fit(rows)
     }
 
     fn tp_min_usize(&self, value: usize, what: &str) -> Result<usize> {

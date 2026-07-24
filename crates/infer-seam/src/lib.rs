@@ -165,6 +165,21 @@ pub struct BackendArtifactIdentity {
     pub kernel_bundle_id: String,
 }
 
+/// One planned row's device-pool demand for [`BackendExecutor::kv_device_fit`],
+/// in plan order (decode rows first, then prefill chunks).
+#[derive(Debug, Clone, Copy)]
+pub struct DeviceRowDemand {
+    pub slot: usize,
+    /// The row's KNOWN final logical span: prefill = the full prompt,
+    /// decode = seq_len + 1. Backends with shape-dependent growth (DSv4
+    /// bands) project their own page need from this.
+    pub target_tokens: usize,
+    /// The engine's worst-case page projection (1 per decode row, chunk
+    /// pages + 1 per prefill chunk), for backends whose device pool mirrors
+    /// the host accounting granularity (Qwen3.6 `full_attn_kv`).
+    pub pages_hint: usize,
+}
+
 /// Host-only engine-core to backend-executor seam.
 ///
 /// The plan and step output contain only host data. Any device tensors needed
@@ -331,29 +346,19 @@ pub trait BackendExecutor {
     /// Default no-op for backends whose per-slot device KV is slot-fixed.
     fn release_kv_slot(&mut self, _slot: usize) {}
 
-    /// Free pages remaining in the backend's own device KV pool, when it
-    /// keeps one separate from the engine's accounting pool. `None` (the
-    /// default) = no separate pool; the engine's [`KvPool`] is authoritative.
-    /// The engine gates plan rows on this count so device-side exhaustion
-    /// degrades (shed the chunk / park the decode, #162) instead of failing
-    /// an alloc inside [`Self::submit`] — which is engine-fatal (#164). The
-    /// count must reflect ALL device-side retention (e.g. recall-keepalive
-    /// pages the accounting pool has already marked free).
-    fn kv_device_free_pages(&self) -> Option<usize> {
-        None
-    }
-
-    /// Device pages [`Self::submit`] will additionally draw from that same
-    /// pool to grow `slot`'s KV to `target_tokens` (the row's KNOWN final
-    /// span: prefill = the full prompt, decode = seq_len + 1). `None` (the
-    /// default) keeps the engine's worst-case formula (1 page per decode row,
-    /// chunk pages + 1 per prefill chunk) authoritative. Backends whose
-    /// per-row growth that formula cannot see (DSv4 demand-paged FlashMLA
-    /// bands, #160: ring + comp pages per layer, whole prompt reserved at
-    /// the first chunk) override it so the [`Self::kv_device_free_pages`]
-    /// gate charges the true demand. Host bookkeeping only — never a device
+    /// Fit the planned rows (decode rows first, then prefill chunks — the
+    /// engine's shed-priority order) against the backend's own device KV
+    /// pool(s), when it keeps any separate from the engine's accounting
+    /// pool. Returns the FIRST row index whose cumulative demand does not
+    /// fit; `None` = every row fits or no separate pool (gate inert). The
+    /// engine parks/sheds the returned row and everything after it so
+    /// device-side exhaustion degrades (#162) instead of failing an alloc
+    /// inside [`Self::submit`] — which is engine-fatal (#164). Backends with
+    /// heterogeneous pools (DSv4 per-layer FlashMLA bands, #160) must pair
+    /// need and headroom PER POOL — a saturated pool with zero incremental
+    /// need is not exhaustion. Host bookkeeping only — never a device
     /// readback (CUDA-graph hot loop).
-    fn kv_device_pages_needed(&self, _slot: usize, _target_tokens: usize) -> Option<usize> {
+    fn kv_device_fit(&self, _rows: &[DeviceRowDemand]) -> Option<usize> {
         None
     }
 
