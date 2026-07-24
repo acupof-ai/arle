@@ -54,20 +54,16 @@ truth; the pod is a build copy. Be terse; report the measured result, not a play
 - To wait on a long build/run: launch a background poller (`run_in_background` Bash) that
   greps the log for the exit marker and exits — it re-invokes you. Don't foreground-sleep.
 
-## Pitfalls (learned 2026-07-24, don't repeat)
-- `tn push`'d scripts land non-executable: invoke `bash /host/…/x.sh`, never `./x.sh`.
-- In one pod exec, `cd X && nohup … &` does NOT move the commands after it — every
-  path in the same exec must be absolute. Verify a launch from a FRESH `~/bin/pod`
-  call: the launching exec can hang holding the background child's fds.
-- Your session can die mid-wait (session limits reaped two pollers in one run). A
-  long run must be answerable by any fresh session from the pod log alone: nohup +
-  on-pod watchdog + `RUN_EXIT=` in the log, launch command saved as an on-pod script.
-- `/metrics` curl snapshots interleave spurious zeros (scrape races, serve
-  restarts): prefix every snapshot with `=== $(date -u)` and read the monotone
-  nonzero envelope — never the last line or a naive max.
-- `[arle] <defunct>` zombies are unkillable and harmless — don't loop on them.
-- Before a relaunch, `rm -rf` the stale run dir + `/tmp` leftovers; after RUN_EXIT,
-  kill your watchdogs/snapshot loops — cleanup is part of the run.
+## Pitfalls (learned 2026-07-24)
+- Pushed scripts land non-executable — `bash x.sh`, never `./x.sh`.
+- Absolute paths only inside a pod exec (`cd X && nohup … &` doesn't move later
+  commands); verify a launch from a FRESH pod call — the launching one can hang.
+- Sessions die mid-wait: a long run must be re-attachable from the pod log alone
+  (nohup + `RUN_EXIT=` marker + launch command saved as an on-pod script).
+- `/metrics` snapshots interleave spurious zeros — timestamp each, read the
+  monotone nonzero envelope, not the last line.
+- `<defunct>` zombies are unkillable, harmless — skip.
+- Relaunch = rm stale run dir first; RUN_EXIT = kill your watchdogs.
 
 ## Reporting
 Relay the BUILD_EXIT/RUN_EXIT, the key log lines, and any measured number (GPU mem peak,
