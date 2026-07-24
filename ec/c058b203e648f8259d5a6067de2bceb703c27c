@@ -1,0 +1,33 @@
+crates/autograd/src/backend_cuda/kernels/linear_attention.cu
+  s_307ca10375d73f::t_ced3d52adf7405 68-70,79,232-233,239
+crates/autograd/tests/test_linear_attention.rs
+  s_8ca93ea486839a::t_9c1a03524baeee 1442-1460
+crates/autograd/src/backend_cuda.rs
+  s_8ca93ea486839a::t_deff5193ebfe91 18,55-56,3719-3844,3851,3854-3902,3904-3913,4343,4356,4365,4368-4459,4461-4470,4895,4904
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "ecc058b203e648f8259d5a6067de2bceb703c27c",
+  "prompts": {},
+  "sessions": {
+    "s_307ca10375d73f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-abe601bbe98a5dc54",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_8ca93ea486839a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-af395d7d7444718e4",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
