@@ -31,6 +31,10 @@ pub struct DsparkExperience {
     pub block_size: usize,
     /// Vocab size (== draft_logits.len() / block_size).
     pub vocab_size: usize,
+    /// Draft head mode (serve `first_row = !next_token_heads`): true = row j
+    /// drafts chain[j+1] conditioned on chain[j]; false = same-position, row j
+    /// drafts chain[j] conditioned on chain[j-1] and row 0 never drafts.
+    pub next_token_heads: bool,
 }
 
 /// Bounded ring buffer of [`DsparkExperience`].
@@ -120,6 +124,7 @@ pub fn capture_dspark_experience(
     draft_logits: &HiddenStates,
     target_logits: &DeviceVec,
     accepted: usize,
+    next_token_heads: bool,
 ) {
     let block_size = draft_tokens.len();
     if block_size == 0 {
@@ -154,12 +159,14 @@ pub fn capture_dspark_experience(
         accepted,
         block_size,
         vocab_size,
+        next_token_heads,
     });
 }
 
 /// DSv4 variant: target logits are a `[total_m, vocab]` `HiddenStates`
 /// (`seq_len` = total tokens across all slots, `hidden_dim` = vocab); only
 /// rows `[col_offset, col_offset + col_len)` belong to this slot.
+#[allow(clippy::too_many_arguments)]
 pub fn capture_dspark_experience_hidden(
     ctx: &DeviceContext,
     draft_tokens: &[u32],
@@ -168,6 +175,7 @@ pub fn capture_dspark_experience_hidden(
     col_offset: usize,
     col_len: usize,
     accepted: usize,
+    next_token_heads: bool,
 ) {
     let block_size = draft_tokens.len();
     if block_size == 0 || col_len == 0 {
@@ -219,5 +227,6 @@ pub fn capture_dspark_experience_hidden(
         accepted,
         block_size,
         vocab_size,
+        next_token_heads,
     });
 }

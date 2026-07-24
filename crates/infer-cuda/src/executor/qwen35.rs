@@ -2014,6 +2014,7 @@ impl Qwen35CudaExecutor {
                 draft_logits,
                 &logits,
                 k,
+                ds.head.cfg.next_token_heads,
             );
         }
         drop(rc);

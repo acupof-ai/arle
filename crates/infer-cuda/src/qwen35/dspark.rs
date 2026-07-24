@@ -116,7 +116,8 @@ impl Qwen35DsparkHead {
     /// weights are uploaded to a staging buffer, then the `data` pointer is
     /// flipped under the device stream's ordering guarantee (the hot path
     /// reads `markov.w1`/`markov.w2` only after a stream sync at step entry).
-    /// `w1` is `[vocab * rank]`, `w2` is `[rank * vocab]`.
+    /// `w1` is `[vocab * rank]`, `w2` is `[vocab * rank]` (both `[vocab, rank]`
+    /// row-major — the `gemm_batch` weight frame).
     pub(crate) fn update_markov_weights(
         &mut self,
         ctx: &DeviceContext,
@@ -156,7 +157,7 @@ impl Qwen35DsparkHead {
     /// Read the current Markov head weights back to host as f32.
     ///
     /// Used by the train sidecar to seed the trainer from the loaded checkpoint
-    /// instead of random init. Returns `(w1 [vocab*rank], w2 [rank*vocab], rank)`.
+    /// instead of random init. Returns `(w1 [vocab*rank], w2 [vocab*rank], rank)`.
     pub(crate) fn get_markov_weights(
         &self,
         ctx: &DeviceContext,
