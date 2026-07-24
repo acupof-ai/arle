@@ -3,19 +3,20 @@
 //! thread per sample (cc → score, so a sample scores the moment its cc exits);
 //! the NEXT group's boots run on background threads, overlapping the current
 //! group's rollout/train (CPU-only, staleness-free). Prompt + cc invocation
-//! ported verbatim from `scripts/cc_swe_baseline.py`.
+//! ported verbatim from `scripts/cc_swe_baseline.py` (plan
+//! docs/plans/2026-07-16-agent-rl-unified-infra.md §P2).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, sync_channel};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
 
-use crate::cc_convert::{CcRecord, CcWindow, convert_cc_dumps, list_dumps, read_json};
+use crate::cc_convert::{CcRecord, CcWindow, convert_cc_dumps};
 use crate::sandbox::{boot_workdir, diff_workdir, run_captured, score_workdir};
 use crate::swe_dataset::SweTask;
 
@@ -29,10 +30,6 @@ pub const CC_SESSION_TOKENS: usize = 22_000;
 /// requirement, ckl 2026-07-17): the KV pool is sized to fit ≥1 such session
 /// and the serve request caps derive from the pool, never from the typical size.
 pub const CC_MAX_SESSION_TOKENS: usize = 200_000;
-
-/// Stagger gate cap — covers a solo first turn (smoke median 139.6 s under
-/// 4-way contention); expiry releases the group cold (baseline behavior).
-const STAGGER_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// Run-wide knobs; construct literally. Stateless — boot-ahead state lives in
 /// the [`BootedGroup`] values the caller threads between calls.
@@ -51,12 +48,6 @@ pub struct CcHarness {
     pub pythonpath: Option<String>,
     /// Transform from raw pass-fraction to training reward. Default = as-is.
     pub reward_shape: RewardShape,
-    /// Hold a group's remaining samples until the first sample's opening
-    /// request finishes: 86% of the first-turn prompt (~18K of ~21K tokens) is
-    /// byte-shared across samples and radix-publishes on finish, so the rest
-    /// prefix-hit instead of K cold prefills
-    /// (wins/2026-07-24-agent-opd-sandbox-staging-verified.md).
-    pub group_stagger: bool,
     pub tokenizer: tokenizers::Tokenizer,
 }
 
@@ -219,34 +210,14 @@ impl CcHarness {
     /// Release each sample to its own cc→score thread as its boot lands (no
     /// group barrier), collect all `k`, convert the group's dumps in-memory.
     pub fn run_group(&self, booted: BootedGroup) -> Result<CcGroup> {
-        // Set when the first-released sample exits — a fast failure (spawn
-        // error, rejected request) never writes a sidecar, so the gate must
-        // not wait out its full timeout on one.
-        let first_done = AtomicBool::new(false);
         let samples = std::thread::scope(|scope| -> Result<Vec<ScoredSample>> {
             let (tx, rx) = sync_channel(booted.k);
-            let spawn = |sample: usize, workdir: PathBuf, first: bool| {
-                let (tx, task, first_done) = (tx.clone(), &booted.task, &first_done);
-                scope.spawn(move || {
-                    let s = self.run_sample(task, sample, &workdir);
-                    if first {
-                        first_done.store(true, Ordering::Relaxed);
-                    }
-                    let _ = tx.send(s);
-                });
-            };
-            let (sample, workdir) = booted.rx.recv().context("cc boot thread died")??;
-            let gate = self
-                .group_stagger
-                .then(|| (sample_model(&self.model_id, sample), epoch_ms()));
-            spawn(sample, workdir, true);
-            // Gate wait overlaps the remaining boots (background threads).
-            if let Some((tag, since_ms)) = gate {
-                self.wait_preamble_publish(&tag, since_ms, &first_done);
-            }
-            for _ in 1..booted.k {
+            for _ in 0..booted.k {
                 let (sample, workdir) = booted.rx.recv().context("cc boot thread died")??;
-                spawn(sample, workdir, false);
+                let (tx, task) = (tx.clone(), &booted.task);
+                scope.spawn(move || {
+                    let _ = tx.send(self.run_sample(task, sample, &workdir));
+                });
             }
             drop(tx);
             let mut assembler = GroupAssembler::new(booted.k);
@@ -286,32 +257,6 @@ impl CcHarness {
             samples,
             records,
         })
-    }
-
-    /// Block until the first-released sample's opening request lands its
-    /// tokens-sidecar (written at request finish, after the radix publish),
-    /// that sample exits without one, or [`STAGGER_TIMEOUT`] expires.
-    fn wait_preamble_publish(&self, tag: &str, since_ms: u64, first_done: &AtomicBool) {
-        let (start, mut rejected) = (Instant::now(), HashSet::new());
-        let reason = loop {
-            if preamble_published(&self.dump_dir, tag, since_ms, &mut rejected) {
-                break format!(
-                    "preamble published after {:.1}s",
-                    start.elapsed().as_secs_f64()
-                );
-            }
-            if first_done.load(Ordering::Relaxed) {
-                break "first sample exited without a publish — releasing group cold".to_owned();
-            }
-            if start.elapsed() >= STAGGER_TIMEOUT {
-                break format!(
-                    "no publish within {}s — releasing group cold",
-                    STAGGER_TIMEOUT.as_secs()
-                );
-            }
-            std::thread::sleep(Duration::from_millis(500));
-        };
-        eprintln!("[cc-harness] stagger: {reason}");
     }
 
     /// One sample end-to-end: `claude -p` (fork-safe `run_captured`, spawner-
@@ -399,29 +344,6 @@ impl CcHarness {
     }
 }
 
-/// A dump at/after `since_ms` (filename epoch prefix) whose tokens-sidecar
-/// exists and whose body requested `tag`. `rejected` memoizes non-matching
-/// bodies — dumps are write-once, so each parses at most once across polls.
-fn preamble_published(
-    dump_dir: &Path,
-    tag: &str,
-    since_ms: u64,
-    rejected: &mut HashSet<PathBuf>,
-) -> bool {
-    let Ok(dumps) = list_dumps(dump_dir) else {
-        return false;
-    };
-    dumps.into_iter().any(|(ms, dump)| {
-        ms >= since_ms
-            && !rejected.contains(&dump)
-            && infer_server::tokens_sidecar_path(&dump).exists()
-            && (read_json(&dump).is_ok_and(|v| v["model"].as_str() == Some(tag)) || {
-                rejected.insert(dump);
-                false
-            })
-    })
-}
-
 /// `--output-format json` prints one JSON object on stdout; `run_captured`
 /// folds stderr in, so fall back to the outermost `{…}` slice.
 fn parse_cc_json(output: &[u8], code: Option<i32>) -> (Option<serde_json::Value>, Option<String>) {
@@ -476,12 +398,7 @@ fn epoch_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
-
-    use super::{
-        GroupAssembler, REWARD_DENSE_WEIGHT, RewardShape, ScoredSample, preamble_published,
-        zero_variance,
-    };
+    use super::{GroupAssembler, REWARD_DENSE_WEIGHT, RewardShape, ScoredSample, zero_variance};
 
     fn sample(task: &str, idx: usize, reward: f32) -> ScoredSample {
         ScoredSample {
@@ -517,22 +434,6 @@ mod tests {
             .expect("b completes at K");
         assert_eq!(b.iter().map(|s| s.sample).collect::<Vec<_>>(), [0, 1]);
         assert!(!zero_variance(&b), "0.5 vs 1.0 carries advantage");
-    }
-
-    #[test]
-    fn preamble_published_needs_finished_dump_with_matching_tag() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path();
-        // Fresh rejected-set per call: the gate holds one set per (tag, group).
-        let check = |tag, since_ms| preamble_published(dir, tag, since_ms, &mut HashSet::new());
-
-        assert!(!check("m#s0", 0), "empty dir");
-        std::fs::write(dir.join("100_0.json"), r#"{"model":"m#s0"}"#).unwrap();
-        assert!(!check("m#s0", 0), "body but no sidecar");
-        std::fs::write(dir.join("100_0.tokens.json"), "{}").unwrap();
-        assert!(check("m#s0", 0));
-        assert!(!check("m#s1", 0), "other sample's tag");
-        assert!(!check("m#s0", 101), "older than the gate");
     }
 
     #[test]
