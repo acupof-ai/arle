@@ -251,6 +251,7 @@ fn sm_arch(major: i32, minor: i32) -> Result<&'static str> {
 fn compile_cubin(src: &str, arch: &'static str) -> Result<Ptx> {
     let program = NvrtcProgram::create(src, "arle_autograd_kernels.cu")?;
     let options = [format!("--gpu-architecture={arch}")];
+    // SAFETY: `program.raw()` is a live nvrtcProgram owned by `program`, destroyed only in Drop.
     unsafe { nvrtc_result::compile_program(program.raw(), &options) }.map_err(|err| {
         cuda_kernel_error(format!(
             "nvrtc compile_program failed arch={arch} err={err:?} log={}",
@@ -298,8 +299,10 @@ impl NvrtcProgram {
     }
 
     fn log(&self) -> String {
+        // SAFETY: self.prog is live while &self exists — only Drop destroys it.
         unsafe { nvrtc_result::get_program_log(self.prog) }
             .ok()
+            // SAFETY: NVRTC logs are NUL-terminated; the CStr borrow ends before `raw` drops.
             .and_then(|raw| unsafe {
                 CStr::from_ptr(raw.as_ptr())
                     .to_str()
@@ -314,6 +317,7 @@ impl NvrtcProgram {
 impl Drop for NvrtcProgram {
     fn drop(&mut self) {
         if !self.prog.is_null() {
+            // SAFETY: a non-null prog came from create_program and is destroyed exactly once, here.
             unsafe {
                 let _ = nvrtc_result::destroy_program(self.prog);
             }
@@ -326,11 +330,13 @@ fn get_cubin(
     prog: nvrtc_sys::nvrtcProgram,
 ) -> std::result::Result<Vec<u8>, nvrtc_result::NvrtcError> {
     let mut size = 0usize;
+    // SAFETY: the caller passes a live compiled program; &mut size is a valid out-pointer.
     unsafe {
         nvrtc_sys::nvrtcGetCUBINSize(prog, &mut size as *mut _).result()?;
     }
 
     let mut cubin = vec![0u8; size];
+    // SAFETY: cubin is exactly the `size` bytes nvrtcGetCUBINSize reported for this prog.
     unsafe {
         nvrtc_sys::nvrtcGetCUBIN(prog, cubin.as_mut_ptr().cast()).result()?;
     }
