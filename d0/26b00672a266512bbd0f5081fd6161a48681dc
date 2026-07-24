@@ -1,0 +1,35 @@
+crates/infer-core/src/planner.rs
+  s_c5d376b1367632::t_28ef5d4a1066e7 73-77,97,99,272,297-299,383
+crates/infer-core/src/prefix.rs
+  s_9c91b86ec3fb55::t_e3781d4d215929 80-83,96,100,145,177-181,202,217
+crates/infer-core/src/lib.rs
+  s_9c91b86ec3fb55::t_3a4d1a57f984e3 328-330,346-364,988-991,997,1314-1317,1319-1320,1336-1337,1342,1396,1404-1406,1408-1410,3891-3892,3918-3919,4469-4473,4481-4525,5242-5300
+docs/experience/wins/2026-07-24-recompute-resume-at-committed.md
+  s_9c91b86ec3fb55::t_7c2276b4f83043 1-42
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "d026b00672a266512bbd0f5081fd6161a48681dc",
+  "prompts": {},
+  "sessions": {
+    "s_9c91b86ec3fb55": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4779911a-69b7-49db-bc83-daf5a48d6ca3",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_c5d376b1367632": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ac10db2a531c958af",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
