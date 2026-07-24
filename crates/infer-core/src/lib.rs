@@ -1512,12 +1512,15 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
     /// every rank degrades the same rows.
     fn allocate_for_plan(&mut self, plan: &mut ForwardPlan) {
         // Device-pool budget gate: backends with a device pool separate from
-        // `self.kv` (Qwen3.6 `full_attn_kv` + recall keepalive) alloc per row
-        // inside `submit`, where a failure is engine-fatal. Gate on worst-case
-        // page need (every row lands page-misaligned) BEFORE the host alloc so
-        // device exhaustion degrades here exactly like host exhaustion.
-        // Decode rows gate first: keeping a running decode alive costs 1 page,
-        // a shed prefill chunk retries next tick for free.
+        // `self.kv` (Qwen3.6 `full_attn_kv` + recall keepalive, DSv4
+        // demand-paged FlashMLA bands #160) alloc per row inside `submit`,
+        // where a failure is engine-fatal. Gate on worst-case page need
+        // (every row lands page-misaligned) BEFORE the host alloc so device
+        // exhaustion degrades here exactly like host exhaustion. Per-row
+        // need: the backend's projection when it has one
+        // (`kv_device_pages_needed` — DSv4 band growth), else the engine
+        // formula. Decode rows gate first: keeping a running decode alive is
+        // the cheap row, a shed prefill chunk retries next tick for free.
         let mut device_budget = self.executor.kv_device_free_pages();
         let page_size = self.kv.page_size();
         let mut fits_device = |need: usize| {
@@ -1531,7 +1534,11 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             true
         };
         plan.decode_rows.retain(|row| {
-            if !fits_device(1) {
+            let need = self
+                .executor
+                .kv_device_pages_needed(row.slot, row.kv_seq_len + 1)
+                .unwrap_or(1);
+            if !fits_device(need) {
                 log::warn!(
                     "device KV pool exhausted for decode row (slot {}); \
                      parking the request (#164 backstop)",
@@ -1554,7 +1561,11 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             }
         });
         plan.prefill_rows.retain(|row| {
-            if !fits_device(row.tokens.len().div_ceil(page_size) + 1) {
+            let need = self
+                .executor
+                .kv_device_pages_needed(row.slot, row.total_tokens)
+                .unwrap_or(row.tokens.len().div_ceil(page_size) + 1);
+            if !fits_device(need) {
                 log::warn!(
                     "device KV pool exhausted for prefill chunk (slot {}); \
                      shedding the chunk (#164 backstop)",
@@ -2447,9 +2458,12 @@ mod testing {
     /// backend (Qwen3.6 `full_attn_kv` + recall keepalive) whose device pool
     /// runs dry while the host pool still has pages. Exercises the
     /// `allocate_for_plan` device-budget gate.
-    #[derive(Clone)]
+    #[derive(Clone, Default)]
     pub(super) struct DeviceBudgetExecutor {
         pub(super) budget: std::rc::Rc<std::cell::Cell<Option<usize>>>,
+        /// Some = backend-projected per-row device demand (DSv4 band growth,
+        /// #160); None = the engine's fixed formula.
+        pub(super) row_need: std::rc::Rc<std::cell::Cell<Option<usize>>>,
     }
 
     impl BackendExecutor for DeviceBudgetExecutor {
@@ -2470,6 +2484,10 @@ mod testing {
 
         fn kv_device_free_pages(&self) -> Option<usize> {
             self.budget.get()
+        }
+
+        fn kv_device_pages_needed(&self, _slot: usize, _target_tokens: usize) -> Option<usize> {
+            self.row_need.get()
         }
     }
 
@@ -3078,6 +3096,7 @@ mod tests {
         let budget = std::rc::Rc::new(std::cell::Cell::new(Some(0usize)));
         let executor = DeviceBudgetExecutor {
             budget: std::rc::Rc::clone(&budget),
+            ..Default::default()
         };
         let mut engine =
             Engine::with_config(executor, HostPagedKvPool::new(1, 256, 16), test_config(1));
@@ -3116,6 +3135,42 @@ mod tests {
             .completed(handle2)
             .expect("gated decode resumes and completes");
         assert_eq!(resumed.generated_tokens.len(), 8);
+        Ok(())
+    }
+
+    /// A backend-projected per-row demand (`kv_device_pages_needed`, DSv4
+    /// demand-paged band growth #160) must override the engine's fixed
+    /// formula: a row whose projected growth exceeds the device budget parks
+    /// even though the naive chunk formula would fit, and admits once the
+    /// projection drops (band already resident).
+    #[test]
+    fn device_row_projection_overrides_engine_formula() -> Result<()> {
+        let budget = std::rc::Rc::new(std::cell::Cell::new(Some(8usize)));
+        let row_need = std::rc::Rc::new(std::cell::Cell::new(Some(64usize)));
+        let executor = DeviceBudgetExecutor {
+            budget: std::rc::Rc::clone(&budget),
+            row_need: std::rc::Rc::clone(&row_need),
+        };
+        let mut engine =
+            Engine::with_config(executor, HostPagedKvPool::new(1, 256, 16), test_config(1));
+
+        // 20-token prompt: engine formula needs ceil(20/16)+1 = 3 ≤ 8 pages,
+        // but the projected band growth (64) exceeds the budget — the chunk
+        // sheds every tick instead of exhausting `band_extend` inside submit.
+        let handle = engine.submit_request((1..=20).collect(), 4);
+        for _ in 0..3 {
+            engine.step()?;
+        }
+        assert!(engine.completed(handle).is_none());
+        assert!(!engine.is_idle());
+
+        // Band now resident (projection 0): the request completes normally.
+        row_need.set(Some(0));
+        engine.run_to_idle()?;
+        let completed = engine
+            .completed(handle)
+            .expect("completes once the projected band growth fits");
+        assert_eq!(completed.generated_tokens.len(), 4);
         Ok(())
     }
 
