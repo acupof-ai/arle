@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, sync_channel};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -220,6 +220,10 @@ impl CcHarness {
     /// Release each sample to its own cc→score thread as its boot lands (no
     /// group barrier), collect all `k`, convert the group's dumps in-memory.
     pub fn run_group(&self, booted: BootedGroup) -> Result<CcGroup> {
+        // Set when the first-released sample exits — a fast failure (spawn
+        // error, rejected request) never writes a sidecar, so the gate must
+        // not wait out its full timeout on one.
+        let first_done = AtomicBool::new(false);
         let samples = std::thread::scope(|scope| -> Result<Vec<ScoredSample>> {
             let (tx, rx) = sync_channel(booted.k);
             let mut gate = None;
@@ -231,11 +235,15 @@ impl CcHarness {
                 if released == 1
                     && let Some((tag, since)) = gate.take()
                 {
-                    self.wait_preamble_publish(&tag, since);
+                    self.wait_preamble_publish(&tag, since, &first_done);
                 }
-                let (tx, task) = (tx.clone(), &booted.task);
+                let (tx, task, first_done) = (tx.clone(), &booted.task, &first_done);
                 scope.spawn(move || {
-                    let _ = tx.send(self.run_sample(task, sample, &workdir));
+                    let s = self.run_sample(task, sample, &workdir);
+                    if released == 0 {
+                        first_done.store(true, Ordering::Relaxed);
+                    }
+                    let _ = tx.send(s);
                 });
             }
             drop(tx);
@@ -279,15 +287,21 @@ impl CcHarness {
     }
 
     /// Block until the first-released sample's opening request lands its
-    /// tokens-sidecar (written at request finish, after the radix publish) or
-    /// [`STAGGER_TIMEOUT`] expires.
-    fn wait_preamble_publish(&self, tag: &str, since: SystemTime) {
+    /// tokens-sidecar (written at request finish, after the radix publish),
+    /// that sample exits without one, or [`STAGGER_TIMEOUT`] expires.
+    fn wait_preamble_publish(&self, tag: &str, since: SystemTime, first_done: &AtomicBool) {
         let start = Instant::now();
         while start.elapsed() < STAGGER_TIMEOUT {
             if preamble_published(&self.dump_dir, tag, since) {
                 eprintln!(
                     "[cc-harness] stagger: preamble published after {:.1}s",
                     start.elapsed().as_secs_f64()
+                );
+                return;
+            }
+            if first_done.load(Ordering::Relaxed) {
+                eprintln!(
+                    "[cc-harness] stagger: first sample exited without a publish — releasing group cold"
                 );
                 return;
             }
