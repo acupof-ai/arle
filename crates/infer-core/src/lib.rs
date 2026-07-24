@@ -20,8 +20,8 @@ pub use writethrough::{
 use anyhow::{Result, bail};
 use infer_plan::{FinishReason, ForwardPlan, SamplingParams, SlotToken, StepOutput};
 use infer_seam::{
-    AdmissionVerdict, BackendExecutor, KvPool, PermissiveGovernor, PollResult, ResourceGovernor,
-    StepBudget,
+    AdmissionVerdict, BackendExecutor, DeviceRowDemand, KvPool, PermissiveGovernor, PollResult,
+    ResourceGovernor, StepBudget,
 };
 
 /// Stable handle returned to callers when a request is submitted.
@@ -1510,43 +1510,52 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
     /// is identical across ranks (same admissions + plans every tick), so
     /// every rank degrades the same rows.
     fn allocate_for_plan(&mut self, plan: &mut ForwardPlan) {
-        // Device-pool budget gate: backends with a device pool separate from
+        // Device-pool budget gate: backends with device pools separate from
         // `self.kv` (Qwen3.6 `full_attn_kv` + recall keepalive, DSv4
         // demand-paged FlashMLA bands #160) alloc per row inside `submit`,
-        // where a failure is engine-fatal. Gate on worst-case page need
-        // (every row lands page-misaligned) BEFORE the host alloc so device
-        // exhaustion degrades here exactly like host exhaustion. Per-row
-        // need: the backend's projection when it has one
-        // (`kv_device_pages_needed` — DSv4 band growth), else the engine
-        // formula. Decode rows gate first: keeping a running decode alive is
-        // the cheap row, a shed prefill chunk retries next tick for free.
-        let mut device_budget = self.executor.kv_device_free_pages();
+        // where a failure is engine-fatal. `kv_device_fit` checks the rows
+        // in shed-priority order (decode first: keeping a running decode
+        // alive is the cheap row, a shed prefill chunk retries next tick for
+        // free) BEFORE the host alloc, so device exhaustion degrades here
+        // exactly like host exhaustion — park the returned row and its tail.
         let page_size = self.kv.page_size();
-        let mut fits_device = |need: usize| {
-            let Some(budget) = &mut device_budget else {
-                return true;
-            };
-            if *budget < need {
-                return false;
-            }
-            *budget -= need;
-            true
-        };
-        plan.decode_rows.retain(|row| {
-            let need = self
-                .executor
-                .kv_device_pages_needed(row.slot, row.kv_seq_len + 1)
-                .unwrap_or(1);
-            if !fits_device(need) {
+        let demands: Vec<DeviceRowDemand> = plan
+            .decode_rows
+            .iter()
+            .map(|row| DeviceRowDemand {
+                slot: row.slot,
+                target_tokens: row.kv_seq_len + 1,
+                pages_hint: 1,
+            })
+            .chain(plan.prefill_rows.iter().map(|row| DeviceRowDemand {
+                slot: row.slot,
+                target_tokens: row.total_tokens,
+                pages_hint: row.tokens.len().div_ceil(page_size) + 1,
+            }))
+            .collect();
+        if let Some(first_unfit) = self.executor.kv_device_fit(&demands) {
+            let decode_len = plan.decode_rows.len();
+            for row in plan.decode_rows.drain(first_unfit.min(decode_len)..) {
                 log::warn!(
                     "device KV pool exhausted for decode row (slot {}); \
                      parking the request (#164 backstop)",
                     row.slot
                 );
                 self.requeue_preempted_decode(row.slot);
-                return false;
             }
-            match self.alloc_with_prefix_reclaim(row.slot, 1) {
+            for row in plan
+                .prefill_rows
+                .drain(first_unfit.saturating_sub(decode_len)..)
+            {
+                log::warn!(
+                    "device KV pool exhausted for prefill chunk (slot {}); \
+                     shedding the chunk (#164 backstop)",
+                    row.slot
+                );
+            }
+        }
+        plan.decode_rows
+            .retain(|row| match self.alloc_with_prefix_reclaim(row.slot, 1) {
                 Ok(()) => true,
                 Err(err) => {
                     log::warn!(
@@ -1557,21 +1566,8 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                     self.requeue_preempted_decode(row.slot);
                     false
                 }
-            }
-        });
+            });
         plan.prefill_rows.retain(|row| {
-            let need = self
-                .executor
-                .kv_device_pages_needed(row.slot, row.total_tokens)
-                .unwrap_or(row.tokens.len().div_ceil(page_size) + 1);
-            if !fits_device(need) {
-                log::warn!(
-                    "device KV pool exhausted for prefill chunk (slot {}); \
-                     shedding the chunk (#164 backstop)",
-                    row.slot
-                );
-                return false;
-            }
             match self.alloc_with_prefix_reclaim(row.slot, row.tokens.len()) {
                 Ok(()) => true,
                 Err(err) => {
@@ -2453,16 +2449,23 @@ mod testing {
         }
     }
 
-    /// Echo executor with a settable device-pool free-page count, mirroring a
-    /// backend (Qwen3.6 `full_attn_kv` + recall keepalive) whose device pool
-    /// runs dry while the host pool still has pages. Exercises the
-    /// `allocate_for_plan` device-budget gate.
+    /// Echo executor with settable per-pool device headroom and per-row need,
+    /// mirroring a backend (Qwen3.6 `full_attn_kv`, DSv4 per-layer band
+    /// pools) whose device pools run dry while the host pool still has
+    /// pages. Exercises the `allocate_for_plan` `kv_device_fit` gate: each
+    /// `(free, need)` pool pair is checked independently per row (#160 —
+    /// pairing, not scalar extrema); `need = None` charges the engine's
+    /// `pages_hint`. Empty pools = gate inert.
     #[derive(Clone, Default)]
     pub(super) struct DeviceBudgetExecutor {
-        pub(super) budget: std::rc::Rc<std::cell::Cell<Option<usize>>>,
-        /// Some = backend-projected per-row device demand (DSv4 band growth,
-        /// #160); None = the engine's fixed formula.
-        pub(super) row_need: std::rc::Rc<std::cell::Cell<Option<usize>>>,
+        #[allow(clippy::type_complexity)]
+        pub(super) pools: std::rc::Rc<std::cell::RefCell<Vec<(usize, Option<usize>)>>>,
+    }
+
+    impl DeviceBudgetExecutor {
+        pub(super) fn set_pools(&self, pools: &[(usize, Option<usize>)]) {
+            *self.pools.borrow_mut() = pools.to_vec();
+        }
     }
 
     impl BackendExecutor for DeviceBudgetExecutor {
@@ -2481,12 +2484,21 @@ mod testing {
             Ok(PollResult::Ready(inflight.output))
         }
 
-        fn kv_device_free_pages(&self) -> Option<usize> {
-            self.budget.get()
-        }
-
-        fn kv_device_pages_needed(&self, _slot: usize, _target_tokens: usize) -> Option<usize> {
-            self.row_need.get()
+        fn kv_device_fit(&self, rows: &[infer_seam::DeviceRowDemand]) -> Option<usize> {
+            let mut pools = self.pools.borrow().clone();
+            if pools.is_empty() {
+                return None;
+            }
+            rows.iter().position(|row| {
+                let need = |pool_need: Option<usize>| pool_need.unwrap_or(row.pages_hint);
+                if pools.iter().any(|&(free, n)| need(n) > free) {
+                    return true;
+                }
+                for (free, n) in &mut pools {
+                    *free -= need(*n);
+                }
+                false
+            })
         }
     }
 
@@ -3092,11 +3104,9 @@ mod tests {
     /// engine thread mid-rollout).
     #[test]
     fn device_pool_exhaustion_degrades_instead_of_fatal() -> Result<()> {
-        let budget = std::rc::Rc::new(std::cell::Cell::new(Some(0usize)));
-        let executor = DeviceBudgetExecutor {
-            budget: std::rc::Rc::clone(&budget),
-            ..Default::default()
-        };
+        let executor = DeviceBudgetExecutor::default();
+        let pools = executor.clone();
+        pools.set_pools(&[(0, None)]);
         let mut engine =
             Engine::with_config(executor, HostPagedKvPool::new(1, 256, 16), test_config(1));
 
@@ -3110,7 +3120,7 @@ mod tests {
         assert!(!engine.is_idle());
 
         // Pages free up mid-prefill: the request completes normally.
-        budget.set(Some(256));
+        pools.set_pools(&[(256, None)]);
         engine.run_to_idle()?;
         let completed = engine
             .completed(handle)
@@ -3122,13 +3132,13 @@ mod tests {
         // progress — and resumes to completion when it refills.
         let handle2 = engine.submit_request((1..=20).collect(), 8);
         engine.step()?;
-        budget.set(Some(0));
+        pools.set_pools(&[(0, None)]);
         for _ in 0..3 {
             engine.step()?;
         }
         assert!(engine.completed(handle2).is_none());
         assert!(!engine.is_idle());
-        budget.set(Some(256));
+        pools.set_pools(&[(256, None)]);
         engine.run_to_idle()?;
         let resumed = engine
             .completed(handle2)
@@ -3137,24 +3147,21 @@ mod tests {
         Ok(())
     }
 
-    /// A backend-projected per-row demand (`kv_device_pages_needed`, DSv4
-    /// demand-paged band growth #160) must override the engine's fixed
-    /// formula: a row whose projected growth exceeds the device budget parks
-    /// even though the naive chunk formula would fit, and admits once the
-    /// projection drops (band already resident).
+    /// A backend-projected per-row demand (DSv4 demand-paged band growth,
+    /// #160) must override the engine's `pages_hint`: a row whose projected
+    /// growth exceeds the device headroom parks even though the naive chunk
+    /// formula would fit, and admits once the projection drops (band already
+    /// resident).
     #[test]
     fn device_row_projection_overrides_engine_formula() -> Result<()> {
-        let budget = std::rc::Rc::new(std::cell::Cell::new(Some(8usize)));
-        let row_need = std::rc::Rc::new(std::cell::Cell::new(Some(64usize)));
-        let executor = DeviceBudgetExecutor {
-            budget: std::rc::Rc::clone(&budget),
-            row_need: std::rc::Rc::clone(&row_need),
-        };
+        let executor = DeviceBudgetExecutor::default();
+        let pools = executor.clone();
+        pools.set_pools(&[(8, Some(64))]);
         let mut engine =
             Engine::with_config(executor, HostPagedKvPool::new(1, 256, 16), test_config(1));
 
         // 20-token prompt: engine formula needs ceil(20/16)+1 = 3 ≤ 8 pages,
-        // but the projected band growth (64) exceeds the budget — the chunk
+        // but the projected band growth (64) exceeds the headroom — the chunk
         // sheds every tick instead of exhausting `band_extend` inside submit.
         let handle = engine.submit_request((1..=20).collect(), 4);
         for _ in 0..3 {
@@ -3164,11 +3171,33 @@ mod tests {
         assert!(!engine.is_idle());
 
         // Band now resident (projection 0): the request completes normally.
-        row_need.set(Some(0));
+        pools.set_pools(&[(8, Some(0))]);
         engine.run_to_idle()?;
         let completed = engine
             .completed(handle)
             .expect("completes once the projected band growth fits");
+        assert_eq!(completed.generated_tokens.len(), 4);
+        Ok(())
+    }
+
+    /// Codex P1 regression (#160): heterogeneous pools must pair need and
+    /// headroom PER POOL. A saturated sliding-window layer (free=0, need=0)
+    /// next to a compressed layer with headroom (free>0, need=1) must ADMIT —
+    /// the old scalar min(free)/max(need) projection read this as permanent
+    /// exhaustion and parked every row forever.
+    #[test]
+    fn device_fit_pairs_need_with_pool_not_extrema() -> Result<()> {
+        let executor = DeviceBudgetExecutor::default();
+        let pools = executor.clone();
+        pools.set_pools(&[(0, Some(0)), (16, Some(1))]);
+        let mut engine =
+            Engine::with_config(executor, HostPagedKvPool::new(1, 256, 16), test_config(1));
+
+        let handle = engine.submit_request((1..=20).collect(), 4);
+        engine.run_to_idle()?;
+        let completed = engine
+            .completed(handle)
+            .expect("saturated zero-need pool must not read as exhaustion");
         assert_eq!(completed.generated_tokens.len(), 4);
         Ok(())
     }

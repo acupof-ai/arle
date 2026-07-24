@@ -952,22 +952,14 @@ impl BackendExecutor for CudaExecutor {
         }
     }
 
-    fn kv_device_free_pages(&self) -> Option<usize> {
-        match &self.inner {
-            CudaExecutorInner::Placeholder => None,
-            #[cfg(feature = "cuda")]
-            CudaExecutorInner::Real(real) => real.kv_device_free_pages(),
-        }
-    }
-
-    fn kv_device_pages_needed(&self, slot: usize, target_tokens: usize) -> Option<usize> {
+    fn kv_device_fit(&self, rows: &[infer_seam::DeviceRowDemand]) -> Option<usize> {
         match &self.inner {
             CudaExecutorInner::Placeholder => {
-                let _ = (slot, target_tokens);
+                let _ = rows;
                 None
             }
             #[cfg(feature = "cuda")]
-            CudaExecutorInner::Real(real) => real.kv_device_pages_needed(slot, target_tokens),
+            CudaExecutorInner::Real(real) => real.kv_device_fit(rows),
         }
     }
 
