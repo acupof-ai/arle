@@ -50,9 +50,17 @@ The 0.9 → 0.5 flip (`b719eb252`) is predicted no-op pending re-benchmark —
 with D1-D3, both loss terms back-propagated through the wrong frame and rows,
 so no weighting could have fixed acceptance.
 
-## Accept gate
+## Accept gate — resolved 2026-07-24
 
-Pod acceptance re-benchmark (before/after `--dspark-train` on H20) — pending.
+Post-fix re-benchmark (721a553bc, same protocol): **still flat** — windowed
+accept 0.4694 → 0.4583, slope −0.0118/5 min; trainer healthy (loss 0.0020 →
+−0.0867, 0 failed hot-swaps). Decoded case dump (N=2048, `ARLE_DSPARK_DUMP`):
+P(drafted == target_argmax) 0.580 vs base-head argmax agreement 0.479 — the
+markov bias earns ~10pp at serve, so the alignment fixes work; the residual
+gap is CAPACITY (rank-r bigram bias over 248320 vocab, 640 experiences per
+7.5 min; low-reward tercile has base-trunk agreement 0.28 — flat-target
+contexts a bigram bias cannot fix). #169 closed fixed-and-attributed; the
+acceptance lever is full draft-head training (#127).
 
 ## Rule
 
