@@ -54,23 +54,37 @@ tokens**. Consequences, measured on one H20:
   `--chunked-prefill-size 22000` clamps, `loaded.rs:2095`), not generation.
 - **KV**: 8 concurrent sessions × 31K ≈ 248K ≈ the 250K-token pool →
   exhaustion (engine death pre-a9d0c5412; parks after).
-- **Root cause**: Qwen3.6 hybrid has prefix reuse structurally OFF on the CUDA
-  default-paged path (`reusable_prefix_blocks` → 0), so the near-identical
-  preamble re-prefills per turn AND per sample, and its pages cannot be shared.
+- ~~**Root cause**: Qwen3.6 hybrid has prefix reuse structurally OFF
+  (`reusable_prefix_blocks` → 0)~~ — **RETRACTED 2026-07-24, source-survey
+  error.** The `|_| false` closure (`qwen35.rs:318`) only rejects
+  host-demoted pages; resident radix pages count fully, and the recurrent
+  sidecar save/restore is wired end-to-end since #85 (`52e2fdb47` 06-29,
+  periodic stride snapshots `312d22c8c` 07-13) — all in the measured run's
+  HEAD `0a42841ad`. Turns 2–4 at 21–80 s vs turn 1 at 178–245 s are
+  consistent with same-session reuse working. What actually limits sharing:
+  ① publish happens on **finish**, so a group's concurrent cold-start turn 1
+  × 8 can't share (each prefills its own 31K → the pool exhaustion);
+  ② every LoRA re-merge drops the whole prefix cache
+  (`serve_engine.rs:376` — correctness-mandated, stale-epoch KV).
 
 **The levers, in cost order** (2026-07-24 update — the 31K source is found):
 
-1. **Stage CC workdirs outside the repo (config-only, do first).** The dumps
-   show `claude -p` walks up from the task workdir (under `/host/arle-build`)
-   and ingests the repo `CLAUDE.md` agent contract — that IS most of the 31K.
-   Staging sandboxes outside any repo with a `CLAUDE.md` cuts the per-request
-   prompt to the task's own few K. Turn 1 measured 178–245 s vs 21–80 s for
-   turns 2–4 — dominated by exactly this prefill.
-2. **Hybrid prefix reuse** (page-radix + recurrent sidecar — seam machinery
-   exists; `reusable_prefix_blocks` → 0 today) shares whatever preamble
-   remains across turns and samples: kills the residual re-prefill wall and
-   the KV ceiling (8×prompt → 1×prompt + deltas). Until either lands:
-   `SAMPLES=4` fits the 250K pool.
+1. **Stage CC workdirs outside the repo (config-only, do first — LANDED).**
+   The dumps show `claude -p` walks up from the task workdir (under
+   `/host/arle-build`) and ingests the repo `CLAUDE.md` agent contract — that
+   IS most of the 31K. Root: `agent_opd_curve.sh` staged sandboxes under
+   `$OUT` = repo-relative `runs/`. Fixed: `WORK_ROOT` default
+   `/tmp/agent-opd-work` + a `boot_workdir` ancestor-CLAUDE.md warning.
+   Turn 1 measured 178–245 s vs 21–80 s for turns 2–4 — dominated by exactly
+   this prefill. Pending pod verification: prompt_tokens per request should
+   drop ~31K → few K.
+2. **Prefix reuse — already built; residual gap is concurrent cold starts.**
+   With lever 1 landed the shared preamble shrinks to CC's own system prompt
+   + tool schemas (few K), so the residual win is small. If a measured run
+   still shows redundant prefill: serialize a group's first sample until its
+   preamble publishes, then admit the rest (they attach the published
+   prefix). Gate any work here on a measured prefix-hit counter, not source
+   survey.
 
 ### Tier 0 — RESOLVED 2026-07-24: gpu_busy_frac 0.30–0.34 → GO
 
@@ -90,6 +104,14 @@ Now unblocked to build. Prerequisites in place: KV exhaustion parks instead of
 killing the engine (`a9d0c5412`), and the prompt-side levers above shrink the
 per-session KV footprint the mega-rollout multiplies. The A/B must clear
 reward/loss parity (concurrent rollout = staleness drift), not just wall.
+
+What already exists (2026-07-24 audit — nothing is broken, the loop is
+design-serial): within-group sample concurrency (`cc_harness.rs:192-219`,
+measured 8-way), next-group boot-ahead during rollout+train
+(`train_cli.rs:3394`), and one-group rollout/train overlap via `--staleness 1`
+(IS-corrected, curve-script default ON). The mega-rollout's new part is only
+width: >1 group **rolling** simultaneously (staleness is capped at 1, the
+published safe envelope — widening it moves the IS-correction goalposts).
 
 ### Tier 1 — cheap, safe, attacks measured waste (highest ROI)
 
