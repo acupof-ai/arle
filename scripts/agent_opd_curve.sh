@@ -111,12 +111,28 @@ command -v python3 >/dev/null || { echo "python3 missing" >&2; exit 1; }
 python3 -m pytest --version >/dev/null 2>&1 || { echo "pytest missing (scoring needs it)" >&2; exit 1; }
 [[ -x $ARLE_BIN ]] || { echo "arle binary missing at $ARLE_BIN" >&2; exit 1; }
 
+# Pre-staged corpus: CORPUS_ROOT points at a dir with train/eval jsonl + staged/
+# already built (data/opd-corpora/staged-sweetspot3), skipping synthetic generation.
+# Such roots name their splits train.jsonl/eval.jsonl; synthetic uses tasks_*.jsonl.
+CORPUS_ROOT=${CORPUS_ROOT:-}
+if [[ -n $CORPUS_ROOT ]]; then
+    TRAIN_JSONL=${TRAIN_JSONL:-train.jsonl}
+    EVAL_JSONL=${EVAL_JSONL:-eval.jsonl}
+else
+    TRAIN_JSONL=${TRAIN_JSONL:-tasks_train.jsonl}
+    EVAL_JSONL=${EVAL_JSONL:-tasks_eval.jsonl}
+fi
+
 mkdir -p "$OUT"
 echo "[curve] out=$OUT strategy=$UPDATE_STRATEGY staleness=$STALENESS temp=$ROLLOUT_TEMPERATURE spec=$SPEC rounds=$ROUNDS samples=$SAMPLES tasks=$TASK_LIMIT eval_n=$EVAL_N eval_conc=$EVAL_CONCURRENCY gpu=$GPU"
 
 # 1. Corpus (deterministic; self-check = base-FAILS / gold-PASSES gate).
-python3 scripts/gen_agent_opd_tasks.py \
-    --out "$OUT/corpus" --seed "$SEED" --difficulty "$DIFFICULTY" --self-check
+if [[ -n $CORPUS_ROOT ]]; then
+    echo "[curve] using pre-staged corpus $CORPUS_ROOT (splits $TRAIN_JSONL/$EVAL_JSONL), skipping generation"
+else
+    python3 scripts/gen_agent_opd_tasks.py \
+        --out "$OUT/corpus" --seed "$SEED" --difficulty "$DIFFICULTY" --self-check
+fi
 
 # Spec-decode args, shared by the comfort-band profile round and the training run.
 spec_args=()
@@ -156,16 +172,17 @@ common_args=(
 # trainable band. Closes the length-waste gap the runtime P5 selector cannot: a
 # variance-bearing 30K task passes P5 but its 40%-of-round rollout is thrown away
 # every round (errors/2026-07-22). See docs/research/2026-07-23-online-rl-acceleration.md.
-CORPUS="$OUT/corpus"
+CORPUS="${CORPUS_ROOT:-$OUT/corpus}"
 if [[ ${COMFORT_BAND:-1} == 1 && ${SMOKE:-0} != 1 ]]; then
     echo "[curve] comfort-band: profiling $CORPUS (1 round, task-selection off) → filter"
     CUDA_VISIBLE_DEVICES=$GPU "$ARLE_BIN" "${common_args[@]}" \
-        --dataset "$CORPUS/tasks_train.jsonl" --staged-root "$CORPUS/staged" \
+        --dataset "$CORPUS/$TRAIN_JSONL" --staged-root "$CORPUS/staged" \
         --work-root "$WORK/cb_work" --staleness 0 --task-selection false \
         --rounds 1 --eval-every 0 --eval-out-dir "$OUT/cb_profile" \
         2>&1 | tee "$OUT/cb_profile.log"
     if python3 scripts/comfort_band.py \
             --metrics "$OUT/cb_profile/metrics.jsonl" --corpus "$CORPUS" --out "$OUT/corpus-band" \
+            --train-name "$TRAIN_JSONL" --eval-name "$EVAL_JSONL" \
             --max-seq "${CB_MAX_SEQ:-22000}" --pass-lo "${CB_PASS_LO:-0.2}" --pass-hi "${CB_PASS_HI:-0.8}" \
             --min-tests "${CB_MIN_TESTS:-2}"; then
         CORPUS="$OUT/corpus-band"
@@ -177,10 +194,10 @@ fi
 
 train_args=(
     "${common_args[@]}"
-    --dataset "$CORPUS/tasks_train.jsonl"
+    --dataset "$CORPUS/$TRAIN_JSONL"
     --staged-root "$CORPUS/staged"
     --work-root "$WORK/work"
-    --eval-dataset "$CORPUS/tasks_eval.jsonl"
+    --eval-dataset "$CORPUS/$EVAL_JSONL"
     --eval-n "$EVAL_N"
     --eval-concurrency "$EVAL_CONCURRENCY"
     --staleness "$STALENESS"

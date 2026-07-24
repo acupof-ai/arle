@@ -99,14 +99,14 @@ def read_jsonl(path: Path) -> list[dict]:
     return [json.loads(ln) for ln in path.read_text().splitlines() if ln.strip()]
 
 
-def write_corpus(corpus: Path, out: Path, keep_ids: set[str]) -> tuple[int, int]:
+def write_corpus(corpus: Path, out: Path, keep_ids: set[str], train_name: str, eval_name: str) -> tuple[int, int]:
     """Emit the filtered train split + its staged trees; copy eval split as-is."""
     out.mkdir(parents=True, exist_ok=True)
     (out / "staged").mkdir(exist_ok=True)
 
-    train = read_jsonl(corpus / "tasks_train.jsonl")
+    train = read_jsonl(corpus / train_name)
     kept = [r for r in train if r["instance_id"] in keep_ids]
-    (out / "tasks_train.jsonl").write_text("".join(json.dumps(r) + "\n" for r in kept))
+    (out / train_name).write_text("".join(json.dumps(r) + "\n" for r in kept))
 
     for r in kept:
         src = corpus / "staged" / r["instance_id"]
@@ -114,12 +114,12 @@ def write_corpus(corpus: Path, out: Path, keep_ids: set[str]) -> tuple[int, int]
             shutil.copytree(src, out / "staged" / r["instance_id"], dirs_exist_ok=True)
 
     # Eval split is the held-out generalization gate — copy unchanged (+ its staged).
-    eval_src = corpus / "tasks_eval.jsonl"
+    eval_src = corpus / eval_name
     n_eval = 0
     if eval_src.is_file():
         eval_rows = read_jsonl(eval_src)
         n_eval = len(eval_rows)
-        shutil.copy2(eval_src, out / "tasks_eval.jsonl")
+        shutil.copy2(eval_src, out / eval_name)
         for r in eval_rows:
             src = corpus / "staged" / r["instance_id"]
             if src.is_dir():
@@ -141,7 +141,7 @@ def run(args: argparse.Namespace) -> int:
     # collapses to zero-variance far more often. The count lives in the corpus
     # jsonl, not the profile rows classify sees, so filter it here.
     if args.min_tests > 1:
-        low_gran = {r["instance_id"] for r in read_jsonl(args.corpus / "tasks_train.jsonl")
+        low_gran = {r["instance_id"] for r in read_jsonl(args.corpus / args.train_name)
                     if len(r.get("fail_to_pass") or []) < args.min_tests}
         dropped = keep_ids & low_gran
         keep_ids -= low_gran
@@ -162,7 +162,7 @@ def run(args: argparse.Namespace) -> int:
               "writeback can take it (it usually can't; see the errors entry).", file=sys.stderr)
         return 2
 
-    n_train, n_eval = write_corpus(args.corpus, args.out, keep_ids)
+    n_train, n_eval = write_corpus(args.corpus, args.out, keep_ids, args.train_name, args.eval_name)
     print(f"[comfort-band] wrote {args.out}: {n_train} train (band) + {n_eval} eval (held-out, unchanged)")
     return 0
 
@@ -180,6 +180,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--min-samples", type=int, default=4, help="min profiled samples for a verdict")
     ap.add_argument("--min-tests", type=int, default=2,
                     help="min |fail_to_pass| tests/task; below this dense reward degenerates to binary")
+    # Pre-staged corpora (staged-sweetspot3) use train.jsonl/eval.jsonl; gen_agent_opd_tasks.py uses tasks_*.jsonl.
+    ap.add_argument("--train-name", default="tasks_train.jsonl", help="train split filename within --corpus")
+    ap.add_argument("--eval-name", default="tasks_eval.jsonl", help="eval split filename within --corpus")
     ap.add_argument("--self-check", action="store_true", help="run the built-in correctness gate and exit")
     return ap
 
