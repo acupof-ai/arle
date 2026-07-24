@@ -990,9 +990,9 @@ impl Qwen35CudaExecutor {
 
     /// Build the shared paged full-attn KV pool, profile-sized from MEASURED free
     /// VRAM (SGLang's `mem_fraction_static`); `requested_pages` is the fallback
-    /// when the VRAM probe fails, not a floor over it (#178). The
-    /// constructor's eager build and `ensure_kv_pool`'s post-release rebuild both
-    /// go through here so the re-acquired pool matches the original sizing recipe.
+    /// for a failed probe, not a floor over it (#178). The constructor's eager
+    /// build and `ensure_kv_pool`'s post-release rebuild both go through here so
+    /// the re-acquired pool matches the original sizing recipe.
     fn build_full_attn_kv_pool(
         model: &crate::qwen35::Qwen35Model,
         num_slots: usize,
@@ -1030,9 +1030,7 @@ impl Qwen35CudaExecutor {
                     mem_fraction_static,
                 );
                 let profiled_pages = (profiled_tokens / SUPPORTED_PAGE_SIZE as u64) as usize;
-                // #178: measured VRAM is the ceiling; `requested_pages` is advisory.
-                // Flooring the profile at a constant books HBM the card lacks and
-                // OOMs the first prefill instead of the boot.
+                // #178: flooring the profile at a constant books HBM the card lacks.
                 let sized = profiled_pages.max(1);
                 log::info!(
                     "CUDA Qwen3.6 full-attn KV pool profiled from measured VRAM: free {}MB / \
