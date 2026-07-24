@@ -10,8 +10,7 @@
 
 ## Goal
 
-Ship Route A (page-granular DSv4 prefix reuse,
-`docs/plans/2026-07-08-dsv4-route-a-page-granular-prefix-reuse.md`) steps
+Ship Route A (page-granular DSv4 prefix reuse) steps
 4-6 and get cross-request prefix reuse working end-to-end for the first
 time — DSv4 had zero reuse since Route B's deletion earlier the same day.
 

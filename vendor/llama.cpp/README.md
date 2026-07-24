@@ -5,8 +5,7 @@ Operator sources copied from
 `d2462f8f7ac6d80070a587ffebf6cd73730f4280` (2026-06-10 sparse checkout),
 MIT — upstream `LICENSE` preserved in this directory. Commissioned by the
 AIPC track (#71, #76/#77): serve **DSv4-Flash at 2-bit** on Ryzen AI Max+
-395 (gfx1151), survey + lane plan in
-[`docs/plans/2026-06-10-hip-backend-mvp.md`](../../docs/plans/2026-06-10-hip-backend-mvp.md).
+395 (gfx1151).
 
 ## Rules
 

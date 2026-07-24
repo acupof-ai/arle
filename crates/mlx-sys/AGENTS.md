@@ -151,8 +151,7 @@ This crate is the bridge layer beneath P3. The current Qwen3.5 step
 model (Rust path 305.5 tok/s on M4 Pro for `1024/256`) and the DFlash
 draft path (5.9× decode reference win) both depend on the dedicated
 C++ files staying separate from `mlx_bridge.cpp`. New Metal-only fused
-ops should land here, not in `infer`. See
-[`docs/projects/mlx-backend-roadmap.md`](../../docs/projects/mlx-backend-roadmap.md).
+ops should land here, not in `infer`.
 
 ## State-mutating change — enumerate every buffer (事无巨细)
 
@@ -192,5 +191,3 @@ same-config-twice floor), not byte-identity to a reference run.
 - `infer/src/backend/metal/AGENTS.md` — the Rust consumer side.
 - `infer/src/backend/metal/mlx.rs` — the thin wrapper that turns this
   FFI into safe-ish Rust.
-- `docs/projects/mlx-backend-roadmap.md` — current Metal backend project,
-  including continuous-batching / batched-decode milestones.

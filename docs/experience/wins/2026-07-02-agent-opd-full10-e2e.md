@@ -64,4 +64,4 @@ Parity licensed (two model shapes, max_abs <= 1.2e-4); same-binary A/B:
 LA backward 4.135s -> 3.186s (29.7%, at the plan's kill threshold), backward
 phase 5.06s -> 4.22s, loss in band. Kernel kept; design lane closed per the
 kill rule — floor is the per-token sync chain, next step would be full
-chunkwise GEMMs (docs/plans/linear-attention-chunked-backward.md Outcome).
+chunkwise GEMMs.

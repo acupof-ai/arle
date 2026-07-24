@@ -2,8 +2,7 @@
 
 ## Context
 
-The DSpark train sidecar plan (`docs/plans/2026-07-19-dspark-train-sidecar.md`)
-Phase 1 wired an acceptance-weighted trainer into the `arle serve --spec-type dspark`
+The DSpark train sidecar plan Phase 1 wired an acceptance-weighted trainer into the `arle serve --spec-type dspark`
 path: the inference hot path captures (draft_tokens, draft_logits, accepted)
 tuples into a global buffer; a background thread drains it, runs a policy
 gradient step on the Markov head, and hot-swaps the updated weights back into
