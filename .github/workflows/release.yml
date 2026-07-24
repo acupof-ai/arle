@@ -128,7 +128,7 @@ jobs:
         env:
           # No GPU on CI runners — pin SM targets to avoid nvidia-smi probing.
           # T1 set: sm_80 (A100) + sm_86 (A10/3090) + sm_89 (L4/4090) + sm_90 (H100).
-          # See docs/plans/sm-coverage.md for tier policy.
+          # See docs/environment.md for tier policy.
           TORCH_CUDA_ARCH_LIST: '8.0;8.6;8.9;9.0'
           ARLE_CUDA_ENABLE_FA3: '1'
           # FlashMLA stays ENABLED here: build.rs compiles its sm90 sparse_fp8
@@ -151,7 +151,7 @@ jobs:
           path: arle-${{ github.ref_name }}-linux-x86_64.tar.gz
 
   # ── Linux x86_64: CUDA sm_70 (Volta / V100 legacy lane) ──────────────────────
-  # SM-pinned legacy build per docs/plans/sm-coverage.md §T0-legacy: TORCH_CUDA_ARCH_LIST=7.0
+  # SM-pinned legacy build per docs/environment.md §T0-legacy: TORCH_CUDA_ARCH_LIST=7.0
   # ONLY (the policy rejects `7.0;8.9` mixing so the T1 binary never carries Volta
   # fallback). HARDWARE-UNVERIFIED in CI: no V100 on the runner, and build.rs
   # hard-fails (not warn-skip) if any required operator cannot emit an sm_70 cubin
@@ -261,7 +261,7 @@ jobs:
           if-no-files-found: warn
 
   # ── Linux x86_64: CUDA Blackwell T2 (sm_100 + sm_120, opt-in) ────────────────
-  # T2 opt-in per docs/plans/sm-coverage.md: sm_100 (B100/B200) + sm_120 (RTX 5090).
+  # T2 opt-in per docs/environment.md: sm_100 (B100/B200) + sm_120 (RTX 5090).
   # HARDWARE-UNVERIFIED: no Blackwell hardware exists in CI, and TileLang 0.1.11
   # sm_120 codegen is not yet confirmed (sm-coverage.md "Why T2 is opt-in"). Same
   # contract as the V100 job: continue-on-error, attaches only if it compiles.
