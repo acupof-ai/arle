@@ -1,0 +1,23 @@
+diagrams/2026-05-25T110059/diagram.json
+  s_369a57354b1459::t_93faba6e650f01 104
+diagrams/2026-05-25T110059/diagram.svg
+  s_369a57354b1459::t_147b1baca150a4 8
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "1f05fbe26bf77fbbb342137f07cc66f8838321b5",
+  "prompts": {},
+  "sessions": {
+    "s_369a57354b1459": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a37afa08-363e-420d-97a5-35b731b7f708",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
