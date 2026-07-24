@@ -1,0 +1,21 @@
+docs/research/2026-07-24-rl-system-essence-and-roadmap.md
+  s_cd9a6a56daabe3::t_5b2e297d27b920 1-91
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "c57f1e28a5379049c230c9655f024630a0eaa6b8",
+  "prompts": {},
+  "sessions": {
+    "s_cd9a6a56daabe3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "bf8ec25a-c05e-46a4-b093-1e67694ece0c",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
