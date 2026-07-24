@@ -1,0 +1,33 @@
+crates/infer-core/src/lib.rs
+  s_f2c4e19e13f61e::t_5d39ec2fa2340d 442-445,520-521,1522-1574,2507-2511,2513,2516-2517,2522,3226-3258
+crates/infer-cuda/src/attention/kv_layout.rs
+  s_f2c4e19e13f61e::t_837f3ccd2487d7 1047-1057,1061-1062,1069,1080,1092-1093,1098
+crates/infer-cuda/src/executor.rs
+  s_f2c4e19e13f61e::t_5286f7967ac57b 685-695,698-703,705-707
+crates/infer-cuda/src/executor/dsv4.rs
+  s_f2c4e19e13f61e::t_e11c70fa08bf25 459-473
+crates/infer-cuda/src/executor/qwen35.rs
+  s_f2c4e19e13f61e::t_ac0b96f50a0be6 487-491,493-502,504,506-508,510
+crates/infer-cuda/src/lib.rs
+  s_f2c4e19e13f61e::t_b4e1927117ff35 955-963,966,969
+crates/infer-seam/src/lib.rs
+  s_f2c4e19e13f61e::t_0ec682a1e9349c 349-354,357-371
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "389464585463094464a356c7033dcacb1a31ffdf",
+  "prompts": {},
+  "sessions": {
+    "s_f2c4e19e13f61e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ad1ff1fec22585706",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
