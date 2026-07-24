@@ -87,6 +87,13 @@ def classify(p: TaskProfile, args: argparse.Namespace) -> str:
         return f"too-few-samples({p.n})"
     if p.avg_traj_tokens() > args.max_seq:
         return f"too-long({p.avg_traj_tokens():.0f}>{args.max_seq})"
+    # dapo's gradient IS the within-group reward variance (non-zero advantage);
+    # a group with near-zero std trains nothing regardless of its pass rate. This
+    # is the primary gate — it subsumes all-pass/all-fail extremes the pass-band
+    # catches, and keeps partial-solvers (std high, pass@1.0=0) the old 1.0
+    # threshold mislabeled too-hard (2026-07-24 band=1 root cause).
+    if p.reward_std() < args.min_std:
+        return f"zero-variance(std={p.reward_std():.2f})"
     rate = p.pass_rate(args.pass_threshold)
     if rate < args.pass_lo:
         return f"too-hard(pass={rate:.2f})"
@@ -174,7 +181,11 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--out", type=Path, help="output dir for the filtered comfort-band corpus")
     ap.add_argument("--pass-lo", type=float, default=0.2, help="min pass rate (below = too hard)")
     ap.add_argument("--pass-hi", type=float, default=0.8, help="max pass rate (above = too easy)")
-    ap.add_argument("--pass-threshold", type=float, default=1.0, help="reward counted as a pass")
+    ap.add_argument("--pass-threshold", type=float, default=0.5,
+                    help="reward counted as a pass (0.5 = a partial multi-test solve counts; "
+                         "1.0 mislabels dense partial-solvers too-hard — 2026-07-24)")
+    ap.add_argument("--min-std", type=float, default=0.05,
+                    help="min within-group reward std to keep (dapo advantage floor; 0 disables)")
     ap.add_argument("--max-seq", type=int, default=22000,
                     help="max avg trajectory tokens (< the writeback --max-update-seq, default 23K)")
     ap.add_argument("--min-samples", type=int, default=4, help="min profiled samples for a verdict")
