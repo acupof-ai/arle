@@ -28,15 +28,16 @@ not a suggestion.
  (per-NVTX-window vs wall-clock, per-launch vs per-token, per-layer vs
  per-request), a narrow-window X% share ≠ the actual wall-clock impact.
  Acceptance uses the wall-clock framing — never the narrow-window one.
-- **Case-as-fact — attribute decoded cases before overturning a hypothesis (做算法
- 以 case 为事实).** A negative/bug result (a regression, a failed metric, a
+- **Case-as-fact — attribute decoded cases before overturning a hypothesis.**
+ A negative/bug result (a regression, a failed metric, a
  subagent's "it's structural") is a **case to debug at the token level**, NOT a
  license to generalize into a structural KILL. Before trusting any aggregate:
  ① **decode the actual model outputs** per-case/per-step on the *failing* slice;
  ② **audit the eval harness for artifacts** (timeouts/errors bucketed as a
  class, request-errors counted as wrong, a metric rewarding the wrong thing).
  Aggregate **and** mechanism can both lie; decoded cases are ground truth. The
- fix usually falls out once attributed at case level. **先归因清楚再推翻。**
+ fix usually falls out once attributed at case level. **Attribute clearly first,
+ overturn second.**
 
 Empirical anchors (full story in the cited errors/wins entry):
 - **Agentic-OPD false-KILL** (2026-06-20): a −14pp "structural KILL" was wrong —
@@ -103,16 +104,14 @@ investigate to the file:line decomposition first → ② only THEN evaluate cost
 **Don't label difficulty / risk / "infeasible" / "multi-day" before the steps are
 concrete** — a cost guessed ahead of decomposition raises perplexity, biases the
 work down, pre-commits a wrong size. Catch yourself ranking risk before naming
-file:line steps → stop and decompose; the estimate is noise. Empirical: DSv4
-prefix-reuse (2026-06-20) decomposed into 6 file:line steps reusing the existing
-`Dsv4LayerImage` capture/restore, yet got wrapped in "hard / infeasible / HIGH
-risk" — pure noise. DSv4 batched decode (2026-06-14) hand-waved "very hard,
-multi-day new infra"; reading the code collapsed it to "one per-row `for` loop at
-`dsv4.rs:1872` → batch it → ~2× aggregate, MoE 3.70× sub-linear doesn't cap".
+file:line steps → stop and decompose; the estimate is noise. Empirical (2026-06):
+DSv4 batched decode was hand-waved "very hard, multi-day new infra" — reading the
+code collapsed it to "one per-row `for` at `dsv4.rs:1872` → batch it → ~2×, MoE
+3.70× sub-linear doesn't cap".
 
 ---
 
-## §0.2 天条 — extreme concision (code · comments · docs)
+## §0.2 Cardinal rule — extreme concision (code · comments · docs)
 
 **Say the most with the least. Every token earns its place; cut the rest.** The
 default bar for all output, not a style preference. Omit needless words (Strunk).
@@ -188,30 +187,17 @@ Models: Qwen3-dense + Qwen3.5/3.6 (hybrid·MoE) on CUDA + Metal; DeepSeek-V4-Fla
 DeepSeek-OCR VLMs + DiffusionGemma (Metal). Full tiers: docs/support-matrix.md.
 
 **Metal canonical model — globally unified (2026-05-07):
-`mlx-community/Qwen3.6-35B-A3B-4bit`** (MoE, ~19 GB, cached at
-`~/.cache/huggingface/hub/models--mlx-community--Qwen3.6-35B-A3B-4bit`).
-Production target per [`README.md`](README.md) backend matrix +
-[`ROADMAP.md`](ROADMAP.md) Next-Model queue; catches MoE perf/correctness
-regressions that Qwen3.5-0.8B (dense) can't.
-- **Scope**: every Metal serve (`arle serve --backend metal`; legacy
- `metal_serve` bin deleted), `scripts/bench_*.sh` default, smoke test, and
- Metal-track `wins`/`errors` entry. CUDA benches keep existing defaults.
-- **Opt-out**: small models stay in `models/` for unit tests that need one — set
- `INFER_TEST_MODEL_PATH=models/Qwen3.5-0.8B-MLX-4bit` and document the reason.
-- **Bench invocation**: `./scripts/bench_*.sh <label> --model
- mlx-community/Qwen3.6-35B-A3B-4bit` (HF id resolves to the cached snapshot).
- Direct: `arle serve --backend metal --model-path mlx-community/Qwen3.6-35B-A3B-4bit`.
-- **Auto-wired-limit** (always-on,
- 2026-05-07-bench-qwen36-mle-perf):
- the Metal executor auto-pins weights via `mlx::set_wired_limit` at construction
- (`infer-metal/src/wired_limit.rs`; model dir size + 1 GiB headroom, follows HF
- symlinks). c=1 p99 86 → 15 ms on Qwen3.6 (−82%). Monolith-era
- `--wired-limit-bytes` flag gone.
-- **MLX_MAX_OPS_PER_BUFFER / MLX_MAX_MB_PER_BUFFER — not a default.**
- Qwen3.5-dense-only tune; on Qwen3.6 MoE benched wash-or-loss (95% of step is
- `mx::async_eval` encoding ~600-1000 primitives). Per-workload matched-A/B only.
- Refs: baseline,
- encode-bottleneck.
+`mlx-community/Qwen3.6-35B-A3B-4bit`** (MoE, ~19 GB, HF-cached) — the default for
+every Metal serve (`arle serve --backend metal`), `scripts/bench_*.sh`, smoke,
+and Metal `wins`/`errors`; catches MoE regressions Qwen3.5-0.8B (dense) can't.
+Opt-out for unit tests: `INFER_TEST_MODEL_PATH=models/Qwen3.5-0.8B-MLX-4bit`
+(document why). CUDA benches keep their defaults.
+- **Auto-wired-limit** (always-on): the Metal executor pins weights via
+ `mlx::set_wired_limit` at construction (`infer-metal/src/wired_limit.rs`; dir
+ size + 1 GiB, follows HF symlinks) — c=1 p99 86→15 ms on Qwen3.6 (−82%).
+- **MLX_MAX_OPS_PER_BUFFER / MLX_MAX_MB_PER_BUFFER — not a default**:
+ Qwen3.5-dense tune, wash-or-loss on Qwen3.6 MoE (95% of step is `mx::async_eval`
+ encoding). Per-workload matched-A/B only.
 
 **Workspace (current, post-rewrite 2026-06-04):**
 
@@ -426,32 +412,32 @@ mechanical changes.
 
 ### Code conventions
 
-**Formatting:** `rustfmt` 默认 + `version = "Two"`（见 `rustfmt.toml`）。CI 强制 `cargo fmt --check`。
+**Formatting:** `rustfmt` defaults + `version = "Two"` (see `rustfmt.toml`). CI enforces `cargo fmt --check`.
 
-**Linting:** `cargo clippy --all-targets --all-features -- -D warnings` 是 verify 退出条件。Workspace lints 在根 `Cargo.toml` `[workspace.lints]`。
+**Linting:** `cargo clippy --all-targets --all-features -- -D warnings` is a verify exit condition. Workspace lints live in the root `Cargo.toml` `[workspace.lints]`.
 
-**13 条代码风格规则（Rust 最佳实践，不是主流）：**
+**13 code-style rules (Rust best practice, not the mainstream default):**
 
-1. **Early return（卫语句）** — 用 `let-else` / `if !cond { return }` / `?` 压平嵌套，不用 `if/else` 包裹主逻辑。Clippy `collapsible_if` 强制。
-2. **Newtype 零成本类型安全** — 语义不同的相同底层类型（slot index vs layer index vs seq len）必须用 `struct X(usize)` 包装，实现 `AsRef`/`Borrow`，不实现 `Deref`。能 `Copy` 就 `Copy`。构造时验证不变量。
-3. **入参借，出参拥有** — 函数参数用 `&T` / `&[T]` / `&str` / `impl AsRef<Path>`，返回值用拥有的 `T` / `Vec<T>` / `String`。Clippy `needless_pass_by_value` / `redundant_clone` 强制。
-4. **零拷贝优先** — 解析路径直接借用输入缓冲区（`#[serde(borrow)]`），安全类型转换用 `zerocopy`/`bytemuck`，不手写 unsafe transmute。
-5. **命名约定（RFC 430）** — 类型 `CamelCase`（缩写当一个词：`HttpServer` 不是 `HTTPServer`），函数/变量 `snake_case`，常量 `SCREAMING_SNAKE_CASE`，错误类型 `*Error` 后缀，trait 名词或 `-able`。
-6. **转换方法三件套** — `as_*(&self)` 零成本借用；`to_*(&self)` 可能分配；`into_*(self)` 消费转移。不混用。
-7. **构造器约定** — `new()` 无副作用必成功；`try_new()` 可能失败；参数 >4 个用 Builder 模式（`X::builder().a(1).b(2).build()?`）；可选配置 `with_*` 链式。
-8. **Trait 小而专注** — 一个 trait 一件事。不用"上帝 trait"。1:1 关系用 associated type；1:N 用泛型。`impl Trait` 静态分发优先；`dyn Trait` 只在需要运行时多态时用。
-9. **迭代器优先于命令式循环** — `map`/`filter`/`collect` 胜过 `for` + `push`。直接公式形状的用迭代器链；有副作用或复杂控制流的用 `for`。
-10. **`Option`/`Result` 组合子** — `map`/`and_then`/`or_else`/`ok_or`/`?` 胜过嵌套 `match`。
-11. **不可变优先** — 默认 `let`，只有真正需要修改时才 `let mut`。Clippy `unnecessary_mut_passed` 强制。
-12. **`#[must_use]` 标不该忽略的返回值** — 释放/分配/计算结果如果被忽略会出 bug，加 `#[must_use]` 并说明原因。
-13. **模块按依赖顺序排列** — 类型在前，辅助函数居中，公开 API 在后，内部实现最后。有序代码读起来像证明。
+1. **Early return (guard clauses)** — flatten nesting with `let-else` / `if !cond { return }` / `?`; don't wrap the main logic in `if/else`. Clippy `collapsible_if` enforced.
+2. **Newtype for zero-cost type safety** — distinct semantics over the same underlying type (slot index vs layer index vs seq len) must wrap in `struct X(usize)` with `AsRef`/`Borrow`, NOT `Deref`. `Copy` when you can. Validate the invariant at construction.
+3. **Borrow in, own out** — params take `&T` / `&[T]` / `&str` / `impl AsRef<Path>`; returns own `T` / `Vec<T>` / `String`. Clippy `needless_pass_by_value` / `redundant_clone` enforced.
+4. **Zero-copy first** — parse by borrowing the input buffer (`#[serde(borrow)]`); safe casts via `zerocopy`/`bytemuck`, never a hand-rolled unsafe transmute.
+5. **Naming (RFC 430)** — types `CamelCase` (acronym = one word: `HttpServer`, not `HTTPServer`), fns/vars `snake_case`, consts `SCREAMING_SNAKE_CASE`, error types `*Error`, traits a noun or `-able`.
+6. **Conversion trio** — `as_*(&self)` zero-cost borrow; `to_*(&self)` may allocate; `into_*(self)` consumes. Don't mix them.
+7. **Constructor conventions** — `new()` no side effects, must succeed; `try_new()` may fail; >4 params → Builder (`X::builder().a(1).b(2).build()?`); optional config chains `with_*`.
+8. **Small, focused traits** — one trait, one job; no god-trait. 1:1 → associated type, 1:N → generic. `impl Trait` static dispatch first; `dyn Trait` only for real runtime polymorphism.
+9. **Iterators over imperative loops** — `map`/`filter`/`collect` beats `for` + `push` for formula-shaped work; keep `for` for side effects or complex control flow.
+10. **`Option`/`Result` combinators** — `map`/`and_then`/`or_else`/`ok_or`/`?` beats a nested `match`.
+11. **Immutable first** — default `let`; `let mut` only when you truly mutate. Clippy `unnecessary_mut_passed` enforced.
+12. **`#[must_use]` on returns you must not drop** — a free/alloc/compute result that's a bug if ignored gets `#[must_use]` + the reason.
+13. **Order modules by dependency** — types first, helpers middle, public API next, internals last. Ordered code reads like a proof.
 
-**附加项目特定规则：**
+**Additional project-specific rules:**
 
-- **Flat module layout, no `mod.rs`.** `src/ops.rs` 声明 `#[path = "ops/attention.rs"] mod attention;` 同级；模型遵循 `model/qwen3.rs` + `model/qwen3/`。
-- Weights `&self`（不可变，池共享）；per-request 可变状态在 `State` 关联类型。
-- **默认无注释。** 只注释非显然的不变量、排序要求、bug workaround — 不注释代码做了什么（更清晰的名字胜过注释），不注释哪个任务/工单/步骤加的（那属于 commit message）。issue 号仅在命名具体 bug 时使用（`// #146: above 2048 the per-path maps diverged`）。需要时 ≤1 行。
-- **代码如诗 —— 见 §0.2「Code」(同一条,不复述)。** 唯一补充:形如 `i * tp_size..(i+1) * tp_size` 的范围已自我命名,别再起别名临时变量。
+- **Flat module layout, no `mod.rs`.** `src/ops.rs` declares a sibling `#[path = "ops/attention.rs"] mod attention;`; models follow `model/qwen3.rs` + `model/qwen3/`.
+- Weights are `&self` (immutable, pool-shared); per-request mutable state lives in the `State` associated type.
+- **No comments by default.** Comment only the non-obvious invariant / ordering / bug workaround — never what the code does (a clearer name wins), never which task/ticket/step added it (that's the commit message). Issue numbers only when naming a specific bug (`// #146: above 2048 the per-path maps diverged`). ≤1 line when needed.
+- **Code as poetry — see §0.2 "Code" (same rule, not repeated).** Only addition: a range like `i * tp_size..(i+1) * tp_size` already names itself — don't alias it into a temporary.
 
 ### GPU kernel work
 
@@ -469,8 +455,8 @@ Measure with `ncu` (CUDA) or Xcode Metal capture / MLX instruments (Metal).
  c-sweep must clear TTFT *and* ITL *and* output throughput before a default flip.
 - **Default flips need multi-shape verification** — single-shape ROI shows what's
  possible; ≥2 binding production shapes show what's safe.
-- **A/B must be same-binary, same-shell, same-prompt, two env flips,
- side-by-side** — cross-day claims drift backend / KV dtype / scheduler tuning.
+- **A/B: same-binary, same-shell, same-prompt, two env flips, side-by-side** —
+ cross-day claims drift backend / KV dtype / scheduler tuning.
 - **Smoke-output garbage is config-suspect first** — A/B against the prod backend
  on the *same* config before staring at new code; if prod also breaks, the
  serving config is the bug.
