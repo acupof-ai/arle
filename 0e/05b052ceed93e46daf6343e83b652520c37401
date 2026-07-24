@@ -1,0 +1,23 @@
+crates/autograd/src/backend_cuda.rs
+  s_8d77b273061645::t_f2a518b33d437a 60-70,375,414-415,777-778,877-878,1181-1182,3704-3705,4086-4087,4117-4118,4139-4140,4161-4162,4186-4187,4217-4218,4247-4248,4285,4287,4298-4300,7173,7267,9196
+crates/autograd/src/backend_cuda/kernels.rs
+  s_8d77b273061645::t_b32810d7257b0f 254,302,305,320,333,339
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "0e05b052ceed93e46daf6343e83b652520c37401",
+  "prompts": {},
+  "sessions": {
+    "s_8d77b273061645": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a6268e301569d10e6",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
