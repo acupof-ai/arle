@@ -1,0 +1,25 @@
+crates/train/src/sandbox.rs
+  s_8ca93ea486839a::t_cef986d82af3ff 290-304
+docs/research/2026-07-23-online-rl-acceleration.md
+  s_8ca93ea486839a::t_79288b691dde67 63,80-84
+scripts/agent_opd_curve.sh
+  s_8ca93ea486839a::t_204159f084873f 18,45
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "b0a29443e7085742a4a94824529641081ce63c95",
+  "prompts": {},
+  "sessions": {
+    "s_8ca93ea486839a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-af395d7d7444718e4",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
