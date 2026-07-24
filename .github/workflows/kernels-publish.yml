@@ -26,7 +26,7 @@ on:
         required: false
         type: string
       evidence_run_ids:
-        description: Comma/newline-separated CUDA CI run IDs containing qualification fragments
+        description: Comma/newline-separated run IDs whose artifacts contain a kernel-qualification-fragment (produced by the manual pod/V100 GPU gate)
         required: false
         type: string
 

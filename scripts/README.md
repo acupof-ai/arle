@@ -149,11 +149,11 @@ Labels use `[A-Za-z0-9_.-]+`; omitted build/run labels are unique timestamps.
 Labels are immutable. Receipts and logs live under
 `$POD_STATE/{builds,runs}/<label>/`.
 
-Kernel artifacts use two workflows. **Kernels Publish** candidate mode generates
-and packs the bundle once. **CUDA CI** consumes that exact candidate on each GPU,
-runs the strict gate, and emits one qualification fragment. **Kernels Publish**
-qualification mode aggregates those fragments and publishes the unchanged
-candidate plus its qualification sidecar.
+**Kernels Publish** candidate mode (CI, auto on push) generates and packs the
+bundle once. GPU qualification is **manual** — there is no GPU CI runner: run the
+strict gate on each target GPU (pod H20 / `ssh v100`), emit one qualification
+fragment per GPU, aggregate, and publish the unchanged candidate plus its
+qualification sidecar:
 
 ```bash
 scripts/kernel_artifacts.sh qualify-fragment CANDIDATE STATS_JSON FRAGMENT_JSON
@@ -161,10 +161,8 @@ scripts/kernel_artifacts.sh aggregate-qualification CANDIDATE AGGREGATE_JSON FRA
 scripts/kernel_artifacts.sh qualify-publish CANDIDATE AGGREGATE_JSON
 ```
 
-Dispatch `kernels-publish.yml` without inputs to create the candidate. Dispatch
-`cuda-ci.yml` with `kernel_candidate_run_id`, `model_path`, and the exact
-qualification profile for each required GPU. Then dispatch `kernels-publish.yml`
-with that candidate run ID and the comma-separated CUDA CI evidence run IDs.
+Dispatch `kernels-publish.yml` without inputs to create the candidate; run the
+GPU gate manually per target and hand `qualify-publish` the aggregated fragments.
 
 | Script | Purpose |
 |---|---|
