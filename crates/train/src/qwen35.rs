@@ -2543,7 +2543,9 @@ impl Qwen35Model {
     /// retention and shape variance. The 2026-07-24 ×4 revert was the broken
     /// batched LA backward crashing under checkpoint — fixed by ecc058b20 —
     /// not the ratio. Unknown memory info keeps the safe default
-    /// (checkpoint).
+    /// (checkpoint). `ARLE_FORCE_CHECKPOINT` engages unconditionally — the
+    /// CUDA finite-diff gate needs the checkpoint path at tiny shapes the
+    /// estimate would decline.
     fn should_checkpoint(
         &self,
         batch: usize,
@@ -2553,32 +2555,33 @@ impl Qwen35Model {
     ) -> bool {
         self.gradient_checkpointing
             && tape.enabled
-            && store.backend().device_mem_info().is_none_or(|(free, _)| {
-                let cfg = &self.config;
-                let per_layer =
-                    batch * seq_len * (8 * cfg.hidden_size + 3 * cfg.intermediate_size) * 4;
-                let la_layers = self
-                    .layers
-                    .iter()
-                    .filter(|layer| matches!(layer.self_attn, Qwen35Attention::Linear(_)))
-                    .count();
-                let la_ctx = linear_attention_ctx_bytes(la_params(cfg, batch, seq_len));
-                let total = per_layer
-                    .saturating_mul(self.layers.len())
-                    .saturating_add(la_ctx.saturating_mul(la_layers));
-                let engage = total.saturating_mul(4) > free;
-                // Log first decision and every flip: the gate's failure class is
-                // a silent false-non-engage (97 GB OOM, errors/2026-07-24), so
-                // the breadcrumb must exist even when it never engages.
-                static LAST: AtomicU8 = AtomicU8::new(u8::MAX);
-                if LAST.swap(engage as u8, Ordering::Relaxed) != engage as u8 {
-                    eprintln!(
-                        "[ckpt-gate] engage={engage} batch={batch} seq={seq_len} \
+            && (std::env::var_os("ARLE_FORCE_CHECKPOINT").is_some()
+                || store.backend().device_mem_info().is_none_or(|(free, _)| {
+                    let cfg = &self.config;
+                    let per_layer =
+                        batch * seq_len * (8 * cfg.hidden_size + 3 * cfg.intermediate_size) * 4;
+                    let la_layers = self
+                        .layers
+                        .iter()
+                        .filter(|layer| matches!(layer.self_attn, Qwen35Attention::Linear(_)))
+                        .count();
+                    let la_ctx = linear_attention_ctx_bytes(la_params(cfg, batch, seq_len));
+                    let total = per_layer
+                        .saturating_mul(self.layers.len())
+                        .saturating_add(la_ctx.saturating_mul(la_layers));
+                    let engage = total.saturating_mul(4) > free;
+                    // Log first decision and every flip: the gate's failure class is
+                    // a silent false-non-engage (97 GB OOM, errors/2026-07-24), so
+                    // the breadcrumb must exist even when it never engages.
+                    static LAST: AtomicU8 = AtomicU8::new(u8::MAX);
+                    if LAST.swap(engage as u8, Ordering::Relaxed) != engage as u8 {
+                        eprintln!(
+                            "[ckpt-gate] engage={engage} batch={batch} seq={seq_len} \
                          modeled={total}B (la_layers={la_layers}) free={free}B"
-                    );
-                }
-                engage
-            })
+                        );
+                    }
+                    engage
+                }))
     }
 
     pub fn supports_rollout_kv_cache(&self) -> bool {
@@ -6252,6 +6255,13 @@ mod tests {
             Qwen35Model::new_with_lora_targets(&cfg, lora, LoraTargetSet::AllLinear, store)?;
         model.set_gradient_checkpointing(true);
         assert!(model.gradient_checkpointing());
+        // The auto-gate declines the tiny shape on a real GPU (modeled ≪ free);
+        // this test exists to exercise the checkpoint path, so force-engage.
+        // SAFETY: forced checkpointing only changes which (equivalent) path
+        // concurrent tests take.
+        unsafe {
+            std::env::set_var("ARLE_FORCE_CHECKPOINT", "1");
+        }
 
         let tokens = [1_u32, 3, 8];
         let positions = [0_u32, 1, 2];
