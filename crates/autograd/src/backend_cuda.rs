@@ -3732,7 +3732,7 @@ fn cuda_copy_range<T: DeviceRepr>(
     start: usize,
     len: usize,
 ) -> Result<CudaSlice<T>> {
-    // Uninitialized alloc: every byte is overwritten by the D2D copy below.
+    // SAFETY: every byte is overwritten by the D2D copy below.
     let mut out = unsafe { backend.stream.alloc::<T>(len) }
         .map_err(|_| cuda_alloc_failed("la row slice", vec![len]))?;
     backend
@@ -3748,7 +3748,7 @@ fn cuda_concat_parts<T: DeviceRepr>(
     parts: &[&CudaSlice<T>],
 ) -> Result<CudaSlice<T>> {
     let total: usize = parts.iter().map(|part| part.len()).sum();
-    // Uninitialized alloc: the copies below cover the full buffer.
+    // SAFETY: the copies below cover the full buffer.
     let mut out = unsafe { backend.stream.alloc::<T>(total) }
         .map_err(|_| cuda_alloc_failed("la row concat", vec![total]))?;
     let mut offset = 0;
@@ -3888,9 +3888,6 @@ fn cuda_linear_attention_forward_device_row(
 ) -> Result<LinearAttentionDeviceForwardResult> {
     let p = args.params;
     debug_assert_eq!(p.batch, 1);
-    // num_value_heads is a runtime param (per-head grid blocks + dim-sized shared
-    // mem); only the head DIM is baked into the kernel (GDR_KEY_DIM/VAL_DIM=128).
-    // Qwen3.6-27B uses 48 value heads, 35B-A3B uses 32 — both ride the same kernel.
     let q_dim = p.num_key_heads * p.key_dim;
     let qkv_dim = q_dim * 2 + p.num_value_heads * p.value_dim;
     let qkv_len = p.batch * p.seq_len * qkv_dim;
@@ -4416,9 +4413,6 @@ fn cuda_linear_attention_backward_device_row(
 ) -> Result<LinearAttentionDeviceBackwardResult> {
     let p = args.params;
     debug_assert_eq!(p.batch, 1);
-    // num_value_heads is a runtime param (per-head grid blocks + dim-sized shared
-    // mem); only the head DIM is baked into the kernel (GDR_KEY_DIM/VAL_DIM=128).
-    // Qwen3.6-27B uses 48 value heads, 35B-A3B uses 32 — both ride the same kernel.
     let q_dim = p.num_key_heads * p.key_dim;
     let qkv_dim = q_dim * 2 + p.num_value_heads * p.value_dim;
     let qkv_len = p.batch * p.seq_len * qkv_dim;
