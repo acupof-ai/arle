@@ -123,10 +123,9 @@ impl QwenCudaExecutor {
         // Profile the shared paged pool from MEASURED free VRAM now that the
         // weights are resident (SGLang's mem_fraction_static). Per-token cell cost
         // = `budget_bytes_for_tokens(.., 1 token)` (storage + work bytes the pool
-        // actually charges). On a successful read, size the pool to the larger of
-        // the profiled token budget and the requested `total_pages` floor; if the
-        // VRAM probe fails (no active context / driver error), fall back to the
-        // requested `total_pages` exactly (byte-identical to before profiling).
+        // actually charges). On a successful read the profiled budget IS the
+        // sizing; if the VRAM probe fails (no active context / driver error),
+        // fall back to the requested `total_pages` exactly.
         let cell_bytes_per_token = PagedKVPool::budget_bytes_for_tokens(
             model.config.num_hidden_layers,
             model.config.num_key_value_heads,
@@ -144,12 +143,15 @@ impl QwenCudaExecutor {
                     mem_fraction_static,
                 );
                 let profiled_pages = (profiled_tokens / SUPPORTED_PAGE_SIZE as u64) as usize;
-                let sized = profiled_pages.max(requested_pages).max(1);
+                // #178: measured VRAM is the ceiling; `requested_pages` is advisory.
+                // Flooring the profile at a constant books HBM the card lacks and
+                // OOMs the first prefill instead of the boot.
+                let sized = profiled_pages.max(1);
                 log::info!(
                     "CUDA dense Qwen3 KV pool profiled from measured VRAM: free {}MB / total \
                      {}MB, mem_fraction_static {mem_fraction_static}, cell {cell_bytes_per_token}B/tok \
                      -> max_total_tokens {profiled_tokens} ({profiled_pages} pages); requested \
-                     floor {requested_pages} pages -> sizing {sized} pages",
+                     {requested_pages} pages (advisory) -> sizing {sized} pages",
                     free >> 20,
                     total >> 20,
                 );

@@ -989,7 +989,8 @@ impl Qwen35CudaExecutor {
     }
 
     /// Build the shared paged full-attn KV pool, profile-sized from MEASURED free
-    /// VRAM (SGLang's `mem_fraction_static`), floored at `requested_pages`. The
+    /// VRAM (SGLang's `mem_fraction_static`); `requested_pages` is the fallback
+    /// when the VRAM probe fails, not a floor over it (#178). The
     /// constructor's eager build and `ensure_kv_pool`'s post-release rebuild both
     /// go through here so the re-acquired pool matches the original sizing recipe.
     fn build_full_attn_kv_pool(
@@ -1029,14 +1030,17 @@ impl Qwen35CudaExecutor {
                     mem_fraction_static,
                 );
                 let profiled_pages = (profiled_tokens / SUPPORTED_PAGE_SIZE as u64) as usize;
-                let sized = profiled_pages.max(requested_pages).max(1);
+                // #178: measured VRAM is the ceiling; `requested_pages` is advisory.
+                // Flooring the profile at a constant books HBM the card lacks and
+                // OOMs the first prefill instead of the boot.
+                let sized = profiled_pages.max(1);
                 log::info!(
                     "CUDA Qwen3.6 full-attn KV pool profiled from measured VRAM: free {}MB / \
                      total {}MB, recurrent reservation {}MB ({num_slots} slots × {}MB), \
                      free_after_recurrent {}MB, mem_fraction_static {mem_fraction_static}, cell \
                      {cell_bytes_per_token}B/tok ({num_full} full-attn layers × {local_kv_heads} \
                      kv-heads × {head_dim} hd) -> max_total_tokens {profiled_tokens} \
-                     ({profiled_pages} pages); requested floor {requested_pages} pages \
+                     ({profiled_pages} pages); requested {requested_pages} pages (advisory) \
                      -> sizing {sized} pages",
                     free >> 20,
                     total >> 20,
@@ -1124,7 +1128,7 @@ impl Qwen35CudaExecutor {
 
     /// Re-acquire the shared paged full-attn KV pool after `release_kv_pool`
     /// dropped it (agent-OPD next-round rollout). Re-profiles from current free
-    /// VRAM with the construction-time `mem_fraction_static` + requested floor.
+    /// VRAM with the construction-time `mem_fraction_static`.
     /// No-op (idempotent) if the pool is already resident.
     pub(crate) fn ensure_kv_pool(&mut self) -> Result<()> {
         if self.full_attn_kv.is_some() {
