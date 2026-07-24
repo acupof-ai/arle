@@ -32,12 +32,14 @@ Measured (pod, snapshot binary at `5f68d1f6e`):
 | Short B=4 seq=1040 checkpointed | **6–9 s/mb** (337 s CPU-fallback pathology gone); loss 0.1321/0.1329 vs pre-change 0.1317–0.1323 (parity) |
 | `[ckpt-gate]` probe | engage=true at B=4 seq≈3150, modeled 41.26 GB ≈ the commit's 41.2 GB sanity |
 
-Follow-up (issue filed): at B=4 seq=1040 the **full-tape** device footprint
-measured ~79 GB vs 13.6 GB modeled (~5.8×) — `engage=false` passed a
-385-MiB-headroom near-OOM on a clean GPU and a real OOM under 50 GB
-co-tenancy. Gate boundary at mid-length batched shapes needs attribution +
-re-tightening; checkpointing now costs only ~1.5–2× there, so the risk
-asymmetry favors engaging.
+Gate boundary resolved same day (#170, `b2a5d6180`): `[vram-ramp]`
+attribution showed full-tape at B=4 seq=1040 is 39.1 GB forward (uniform
+~1.71 GB/layer) + 4.4 CE + 1.4 backward = **45 GB live = 3.3× the modeled
+floor** — the earlier "79 GB / 5.8×" read was pool retention across
+micro-batches (post-cleanup returns 0 B to CUDA free), not single-pass
+need. Gate ×3 → ×4 (calibration 2.9–3.3× measured on 0.8B, 2.54× on 27B,
+×~1.2 headroom); the original ×4 revert had been the broken batched
+backward, not the ratio.
 
 ## Rule
 
