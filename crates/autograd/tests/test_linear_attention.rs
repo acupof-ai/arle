@@ -1439,6 +1439,25 @@ fn cuda_linear_attention_qwen36_27b_chunked_grad_matches_cpu() -> Result<()> {
     )
 }
 
+#[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
+#[test]
+fn cuda_linear_attention_batched_grad_matches_cpu() -> Result<()> {
+    // batch=3 x 130 tokens (3 chunks, last partial) — exercises the per-row
+    // batched device dispatch: input row slicing, forward/backward result
+    // concatenation, and weight-grad accumulation across rows. Before the
+    // batched path, batch>1 fell back to host compute and the harness's
+    // device-residency asserts would fail.
+    let mut params = qwen35_chunked_params(130);
+    params.batch = 3;
+    let fixture = LinearAttentionFixture::new(params);
+    compare_cpu_cuda_device_linear_attention(
+        params,
+        &fixture,
+        "cuda batched linear_attention",
+        2.0e-2,
+    )
+}
+
 // ── OPD frozen-prompt-KV de-risk: prompt-boundary state + conv carry ──────────
 // Proves the ONLY genuinely-new math: carrying the gated-delta SSM state + the
 // causal-conv window across a [0..k] prompt / [k..N] generated split reproduces
