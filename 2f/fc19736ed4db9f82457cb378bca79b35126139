@@ -1,0 +1,25 @@
+crates/infer-cuda/src/dsv4.rs
+  s_3bfdcf8fceb2d5::t_21c098d489240a 3284-3287,3308,3354,3398-3401
+crates/infer-cuda/src/executor/dsv4.rs
+  s_3bfdcf8fceb2d5::t_a5e127fb108005 1978,2380
+docs/experience/wins/2026-07-23-systematic-review-fixes.md
+  s_3bfdcf8fceb2d5::t_238fa41eeab9c1 104-121
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "2ffc19736ed4db9f82457cb378bca79b35126139",
+  "prompts": {},
+  "sessions": {
+    "s_3bfdcf8fceb2d5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "62ec01f2-d7cd-44c5-b546-2e6a64756530",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
