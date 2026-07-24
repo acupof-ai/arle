@@ -1586,7 +1586,7 @@ impl Dsv4CudaExecutor {
     /// Read the current DSpark Markov head weights back to host as f32.
     ///
     /// Used by the train sidecar to seed the trainer from the loaded checkpoint
-    /// instead of random init. Returns `(w1 [vocab*rank], w2 [rank*vocab], rank)`.
+    /// instead of random init. Returns `(w1 [vocab*rank], w2 [vocab*rank], rank)`.
     pub(crate) fn get_dspark_markov_weights(&self) -> Result<(Vec<f32>, Vec<f32>, usize)> {
         let dspark = self
             .dspark
@@ -1822,6 +1822,7 @@ impl Dsv4CudaExecutor {
         // accepted) for the asynchronous acceptance-weighted trainer. Best-effort;
         // skipped when draft_logits are unavailable (TP lockstep cleared them).
         if let Some(draft_logits) = proposal.draft_logits.as_ref() {
+            // DSv4 drafts from every row (row i drafts chain[i+1]) — next-token mode.
             super::dspark_train::capture_dspark_experience_hidden(
                 &self.model.ctx,
                 &proposal.chain,
@@ -1830,6 +1831,7 @@ impl Dsv4CudaExecutor {
                 0,
                 proposal.chain.len(),
                 accepted,
+                true,
             );
         }
 
@@ -2117,6 +2119,7 @@ impl Dsv4CudaExecutor {
             // accepted) for the asynchronous acceptance-weighted trainer. Best-effort;
             // skipped when draft_logits are unavailable (e.g. sampling path overwrite).
             if let Some(draft_logits) = proposal.draft_logits.as_ref() {
+                // DSv4 drafts from every row (row i drafts chain[i+1]) — next-token mode.
                 super::dspark_train::capture_dspark_experience_hidden(
                     &self.model.ctx,
                     &proposal.chain,
@@ -2125,6 +2128,7 @@ impl Dsv4CudaExecutor {
                     logits_offset,
                     proposal.chain.len(),
                     accepted,
+                    true,
                 );
             }
             logits_offset += proposal.chain.len();
