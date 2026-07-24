@@ -259,7 +259,23 @@ impl EngineLoadConfig {
         match (&self.kv_ssd_root, self.kv_disk_limit) {
             (Some(root), limit) => {
                 let total = match limit {
-                    None => default_budget(root, 0.5),
+                    // #158: the derived budget is 0 on a disk under the 50 GiB
+                    // reserve floor — degrade to no-tier instead of fail-closing
+                    // the engine build. An explicit --kv-disk-limit still fails
+                    // loudly below (the user asked for that exact budget).
+                    None => match default_budget(root, 0.5) {
+                        0 => {
+                            log::warn!(
+                                "--kv-disk {}: derived budget is 0 (free space is \
+                                 below the reserve, max(50 GiB, 10% of disk)) — \
+                                 disabling the KV disk tier; pass --kv-disk-limit \
+                                 to force a budget",
+                                root.display()
+                            );
+                            return Ok(None);
+                        }
+                        b => b,
+                    },
                     Some(KvTierBudget::Fraction(f)) => {
                         anyhow::ensure!(
                             f > 0.0 && f <= 1.0,
@@ -1543,7 +1559,8 @@ mod backend {
                     anyhow::ensure!(
                         executor.set_kv_tier_disk(root, budget, page_size),
                         "--kv-disk: the loaded Metal model has no usable \
-                         page-addressable KV tier store"
+                         page-addressable KV tier store (a budget below one \
+                         page also lands here; raise --kv-disk-limit)"
                     );
                 }
                 let kv = MetalKvPool::new(num_slots, total_pages, page_size);
@@ -2972,3 +2989,23 @@ pub use backend::cuda_model_takes_multiproc_serve;
 pub(crate) use backend::router_for_backend;
 #[cfg(feature = "cuda")]
 pub use backend::{DSV4_AUTO_CONTEXT_CEILING, cuda_model_is_dsv4};
+
+#[cfg(test)]
+mod kv_disk_budget_tests {
+    use super::EngineLoadConfig;
+
+    // #158: a derived budget of 0 (disk under the reserve floor) must degrade
+    // to no-tier instead of fail-closing the engine build.
+    #[test]
+    fn zero_derived_budget_degrades_to_no_tier() {
+        let cfg = EngineLoadConfig {
+            kv_ssd_root: Some("/tmp/kv".into()),
+            ..EngineLoadConfig::default()
+        };
+        assert_eq!(cfg.kv_ssd_spill(1, |_, _| 0).unwrap(), None);
+        assert_eq!(
+            cfg.kv_ssd_spill(2, |_, _| 4096).unwrap(),
+            Some(("/tmp/kv".into(), 2048))
+        );
+    }
+}
