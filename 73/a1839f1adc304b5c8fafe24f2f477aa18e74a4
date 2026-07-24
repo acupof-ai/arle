@@ -1,0 +1,23 @@
+CHANGELOG.md
+  s_3bfdcf8fceb2d5::t_c882d767feaeee 26-32
+docs/experience/errors/2026-07-24-group-stagger-premise-false.md
+  s_3bfdcf8fceb2d5::t_25b2ed2587e88d 1-35
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "73a1839f1adc304b5c8fafe24f2f477aa18e74a4",
+  "prompts": {},
+  "sessions": {
+    "s_3bfdcf8fceb2d5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "62ec01f2-d7cd-44c5-b546-2e6a64756530",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
