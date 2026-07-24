@@ -2549,25 +2549,32 @@ impl Qwen35Model {
         self.gradient_checkpointing = enabled;
     }
 
+    /// Exact tape bytes the CUDA device LA path saves per linear-attention
+    /// layer: the 12 ctx tensors recorded in `ops/linear_attention.rs` (f32:
+    /// preact, output, g/g_cumsum/beta, chunk_state; bf16: qkv_conv, q, k, v,
+    /// a_inv, raw_output).
+    fn la_ctx_bytes(&self, batch: usize, seq_len: usize) -> usize {
+        let cfg = &self.config;
+        let (hk, kd) = (cfg.linear_num_key_heads, cfg.linear_key_head_dim);
+        let (hv, vd) = (cfg.linear_num_value_heads, cfg.linear_value_head_dim);
+        let qkv_dim = 2 * hk * kd + hv * vd;
+        let f32_elems =
+            seq_len * (qkv_dim + hv * vd + 3 * hv) + seq_len.div_ceil(64) * hv * kd * vd;
+        let bf16_elems = seq_len * (qkv_dim + hv * (2 * kd + 2 * vd + 64));
+        batch * (4 * f32_elems + 2 * bf16_elems)
+    }
+
     /// The one checkpointing decision. Checkpointing trades a full forward
     /// re-run in backward (plus boundary host offload) for tape memory — a
-    /// good trade only when the full tape would NOT fit: estimate the
-    /// non-checkpointed footprint (per layer the hidden-stream tensors plus
-    /// the dominant MLP gate/up/act term, f32, ×4 empirical) against a third
-    /// of free VRAM. The modeled term is a floor, not the footprint: the 27B
-    /// hybrid measured 2.54× it (83.1 GiB peak at seq=1000 vs 17.9 GiB — LA
-    /// chunk_history, attention scratch and allocator slack are unmodeled)
-    /// and the 0.8B hybrid ~4× (3.4–4.1 GB/layer at B=4 seq=3150 vs 0.955 —
-    /// LA saved ctx + qkv projections dominate; batched rubric writeback ran
-    /// full-tape and OOM'd the H20 at 97 GB, 2026-07-23). A ×4 correction was
-    /// tried and reverted 2026-07-24: it over-fired on short B=4 shapes (3×
-    /// phase-C wall) and routed long B=4 into a checkpointed batched backward
-    /// that crashes in linear_attention dqkv (errors/2026-07-24) — fix that
-    /// backward before re-tightening this gate; batched long-completion
-    /// writeback runs B=1 until then. The free/2 margin OOM'd at
-    /// seq≈1350–1400 (agent-OPD smoke 2026-07-03); 3× keeps the full-tape
-    /// fast path only when it truly fits. Unknown memory info keeps the safe
-    /// default (checkpoint).
+    /// good trade only when the full tape would NOT fit: modeled footprint
+    /// (per layer the hidden-stream + dominant MLP term, plus the exact LA
+    /// ctx bytes for hybrid layers) ×3 margin against free VRAM. The generic
+    /// term is a floor (attention scratch and allocator slack unmodeled); the
+    /// ×3 margin covers it — free/2 OOM'd at seq≈1350–1400 (agent-OPD smoke
+    /// 2026-07-03). The LA term landed with the batched LA device path
+    /// (ecc058b20); before it, batched long-completion writeback ran
+    /// full-tape and OOM'd at 97 GB (errors/2026-07-24). Unknown memory info
+    /// keeps the safe default (checkpoint).
     fn should_checkpoint(
         &self,
         batch: usize,
@@ -2582,10 +2589,20 @@ impl Qwen35Model {
                     * seq_len
                     * (8 * self.config.hidden_size + 3 * self.config.intermediate_size)
                     * 4;
-                per_layer
+                let la_layers = self
+                    .layers
+                    .iter()
+                    .filter(|layer| matches!(layer.self_attn, Qwen35Attention::Linear(_)))
+                    .count();
+                let total = per_layer
                     .saturating_mul(self.layers.len())
-                    .saturating_mul(3)
-                    > free
+                    .saturating_add(self.la_ctx_bytes(batch, seq_len).saturating_mul(la_layers));
+                let engage = total.saturating_mul(3) > free;
+                eprintln!(
+                    "[ckpt-gate] engage={engage} batch={batch} seq={seq_len} \
+                     modeled={total}B (la_layers={la_layers}) free={free}B"
+                );
+                engage
             })
     }
 
