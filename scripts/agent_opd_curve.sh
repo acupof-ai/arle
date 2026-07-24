@@ -201,12 +201,15 @@ CUDA_VISIBLE_DEVICES=$GPU "$ARLE_BIN" "${train_args[@]}" \
     --rounds "$ROUNDS" --eval-every "$EVAL_EVERY" --eval-out-dir "$OUT/eval" \
     2>&1 | tee "$OUT/train.log"
 
-# 4. Curve.
-base_extra=()
-for d in "$OUT"/base_rep*/; do [[ -d $d ]] && base_extra+=("$d"); done
-python3 scripts/plot_agent_opd_curve.py \
-    --eval-dir "$OUT/eval" --train-log "$OUT/train.log" \
-    ${base_extra:+--baseline-extra "${base_extra[@]}"} \
-    --out "$OUT/curve.png"
-
-echo "[curve] done: $OUT/curve.png $OUT/curve.json"
+# 4. Curve (plot script optional — training results stand without it).
+if [[ -f scripts/plot_agent_opd_curve.py ]]; then
+    base_extra=()
+    for d in "$OUT"/base_rep*/; do [[ -d $d ]] && base_extra+=("$d"); done
+    python3 scripts/plot_agent_opd_curve.py \
+        --eval-dir "$OUT/eval" --train-log "$OUT/train.log" \
+        ${base_extra:+--baseline-extra "${base_extra[@]}"} \
+        --out "$OUT/curve.png"
+    echo "[curve] done: $OUT/curve.png $OUT/curve.json"
+else
+    echo "[curve] done (plot skipped: scripts/plot_agent_opd_curve.py missing): $OUT/eval"
+fi
