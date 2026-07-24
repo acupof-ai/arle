@@ -1,0 +1,23 @@
+CHANGELOG.md
+  s_9c91b86ec3fb55::t_b8c7ae4c60495f 26-35
+docs/experience/wins/2026-07-24-cuda-batched-la-device-path.md
+  s_9c91b86ec3fb55::t_7e50906a007fa0 1-47
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "9fd52b78adb039e70657676d8f9ac66e1be8967c",
+  "prompts": {},
+  "sessions": {
+    "s_9c91b86ec3fb55": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4779911a-69b7-49db-bc83-daf5a48d6ca3",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
