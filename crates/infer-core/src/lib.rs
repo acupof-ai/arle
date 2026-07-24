@@ -439,6 +439,10 @@ pub struct Engine<E: BackendExecutor, K: KvPool> {
     on_token: Option<TokenObserver>,
     /// Admission mode; `Quiesced` during the OPD writeback bracket. See [`EngineMode`].
     mode: EngineMode,
+    /// Scratch for the per-step `kv_device_fit` gate (demand rows + unfit
+    /// indices), reused so an active gate never heap-allocs per step.
+    device_demand_scratch: Vec<DeviceRowDemand>,
+    device_unfit_scratch: Vec<usize>,
 }
 
 /// Per-token observer: invoked with `(handle, &token)` as each token is committed
@@ -513,6 +517,8 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             next_admit_seq: 0,
             on_token: None,
             mode: EngineMode::Serving,
+            device_demand_scratch: Vec::new(),
+            device_unfit_scratch: Vec::new(),
         }
     }
 
@@ -1513,45 +1519,59 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         // Device-pool budget gate: backends with device pools separate from
         // `self.kv` (Qwen3.6 `full_attn_kv` + recall keepalive, DSv4
         // demand-paged FlashMLA bands #160) alloc per row inside `submit`,
-        // where a failure is engine-fatal. `kv_device_fit` checks the rows
-        // in shed-priority order (decode first: keeping a running decode
-        // alive is the cheap row, a shed prefill chunk retries next tick for
-        // free) BEFORE the host alloc, so device exhaustion degrades here
-        // exactly like host exhaustion — park the returned row and its tail.
-        let page_size = self.kv.page_size();
-        let demands: Vec<DeviceRowDemand> = plan
-            .decode_rows
-            .iter()
-            .map(|row| DeviceRowDemand {
-                slot: row.slot,
-                target_tokens: row.kv_seq_len + 1,
-                pages_hint: 1,
-            })
-            .chain(plan.prefill_rows.iter().map(|row| DeviceRowDemand {
-                slot: row.slot,
-                target_tokens: row.total_tokens,
-                pages_hint: row.tokens.len().div_ceil(page_size) + 1,
-            }))
-            .collect();
-        if let Some(first_unfit) = self.executor.kv_device_fit(&demands) {
-            let decode_len = plan.decode_rows.len();
-            for row in plan.decode_rows.drain(first_unfit.min(decode_len)..) {
-                log::warn!(
-                    "device KV pool exhausted for decode row (slot {}); \
-                     parking the request (#164 backstop)",
-                    row.slot
-                );
-                self.requeue_preempted_decode(row.slot);
-            }
-            for row in plan
-                .prefill_rows
-                .drain(first_unfit.saturating_sub(decode_len)..)
-            {
-                log::warn!(
-                    "device KV pool exhausted for prefill chunk (slot {}); \
-                     shedding the chunk (#164 backstop)",
-                    row.slot
-                );
+        // where a failure is engine-fatal. `kv_device_fit` gives a PER-ROW
+        // verdict in shed-priority order (decode first: keeping a running
+        // decode alive is the cheap row, a shed prefill chunk retries next
+        // tick for free) BEFORE the host alloc, so device exhaustion
+        // degrades here exactly like host exhaustion — exactly the unfit
+        // rows park/shed; later fitting rows keep running (a stuck row must
+        // not starve the rest of the batch). Inert backends skip the gate —
+        // no demand rows are built.
+        if self.executor.kv_device_gate_active() {
+            let page_size = self.kv.page_size();
+            self.device_demand_scratch.clear();
+            self.device_unfit_scratch.clear();
+            self.device_demand_scratch
+                .extend(plan.decode_rows.iter().map(|row| DeviceRowDemand {
+                    slot: row.slot,
+                    target_tokens: row.kv_seq_len + 1,
+                    pages_hint: 1,
+                }));
+            self.device_demand_scratch
+                .extend(plan.prefill_rows.iter().map(|row| DeviceRowDemand {
+                    slot: row.slot,
+                    target_tokens: row.total_tokens,
+                    pages_hint: row.tokens.len().div_ceil(page_size) + 1,
+                }));
+            self.executor
+                .kv_device_fit(&self.device_demand_scratch, &mut self.device_unfit_scratch);
+            if !self.device_unfit_scratch.is_empty() {
+                let mut idx = 0;
+                plan.decode_rows.retain(|row| {
+                    let keep = !self.device_unfit_scratch.contains(&idx);
+                    idx += 1;
+                    if !keep {
+                        log::warn!(
+                            "device KV pool exhausted for decode row (slot {}); \
+                             parking the request (#164 backstop)",
+                            row.slot
+                        );
+                        self.requeue_preempted_decode(row.slot);
+                    }
+                    keep
+                });
+                plan.prefill_rows.retain(|row| {
+                    let keep = !self.device_unfit_scratch.contains(&idx);
+                    idx += 1;
+                    if !keep {
+                        log::warn!(
+                            "device KV pool exhausted for prefill chunk (slot {}); \
+                             shedding the chunk (#164 backstop)",
+                            row.slot
+                        );
+                    }
+                    keep
+                });
             }
         }
         plan.decode_rows
@@ -2484,21 +2504,22 @@ mod testing {
             Ok(PollResult::Ready(inflight.output))
         }
 
-        fn kv_device_fit(&self, rows: &[infer_seam::DeviceRowDemand]) -> Option<usize> {
+        fn kv_device_gate_active(&self) -> bool {
+            !self.pools.borrow().is_empty()
+        }
+
+        fn kv_device_fit(&self, rows: &[infer_seam::DeviceRowDemand], unfit: &mut Vec<usize>) {
             let mut pools = self.pools.borrow().clone();
-            if pools.is_empty() {
-                return None;
-            }
-            rows.iter().position(|row| {
+            for (idx, row) in rows.iter().enumerate() {
                 let need = |pool_need: Option<usize>| pool_need.unwrap_or(row.pages_hint);
                 if pools.iter().any(|&(free, n)| need(n) > free) {
-                    return true;
+                    unfit.push(idx);
+                    continue;
                 }
                 for (free, n) in &mut pools {
                     *free -= need(*n);
                 }
-                false
-            })
+            }
         }
     }
 
@@ -3199,6 +3220,39 @@ mod tests {
             .completed(handle)
             .expect("saturated zero-need pool must not read as exhaustion");
         assert_eq!(completed.generated_tokens.len(), 4);
+        Ok(())
+    }
+
+    /// Codex P1 regression (#160): verdicts are per-row, not first-unfit +
+    /// drain-tail. A stuck big-need row (prefill A, 8 pages > 4 free) must
+    /// not starve a later fitting row (prefill B, 3 pages) — B completes
+    /// while A sheds, and A resumes when headroom returns.
+    #[test]
+    fn device_fit_unfit_row_does_not_starve_later_fitting_rows() -> Result<()> {
+        let executor = DeviceBudgetExecutor::default();
+        let pools = executor.clone();
+        pools.set_pools(&[(4, None)]);
+        let mut engine =
+            Engine::with_config(executor, HostPagedKvPool::new(2, 256, 16), test_config(2));
+
+        let big = engine.submit_request((1..=100).collect(), 4);
+        let small = engine.submit_request((1..=20).collect(), 4);
+        for _ in 0..8 {
+            engine.step()?;
+        }
+        let completed = engine
+            .completed(small)
+            .expect("later fitting row must keep running past a stuck unfit row");
+        assert_eq!(completed.generated_tokens.len(), 4);
+        assert!(engine.completed(big).is_none());
+        assert!(!engine.is_idle());
+
+        pools.set_pools(&[(256, None)]);
+        engine.run_to_idle()?;
+        let resumed = engine
+            .completed(big)
+            .expect("stuck row resumes once headroom returns");
+        assert_eq!(resumed.generated_tokens.len(), 4);
         Ok(())
     }
 

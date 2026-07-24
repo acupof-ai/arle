@@ -346,21 +346,28 @@ pub trait BackendExecutor {
     /// Default no-op for backends whose per-slot device KV is slot-fixed.
     fn release_kv_slot(&mut self, _slot: usize) {}
 
-    /// Fit the planned rows (decode rows first, then prefill chunks — the
-    /// engine's shed-priority order) against the backend's own device KV
-    /// pool(s), when it keeps any separate from the engine's accounting
-    /// pool. Returns the FIRST row index whose cumulative demand does not
-    /// fit; `None` = every row fits or no separate pool (gate inert). The
-    /// engine parks/sheds the returned row and everything after it so
-    /// device-side exhaustion degrades (#162) instead of failing an alloc
-    /// inside [`Self::submit`] — which is engine-fatal (#164). Backends with
-    /// heterogeneous pools (DSv4 per-layer FlashMLA bands, #160) must pair
-    /// need and headroom PER POOL — a saturated pool with zero incremental
-    /// need is not exhaustion. Host bookkeeping only — never a device
-    /// readback (CUDA-graph hot loop).
-    fn kv_device_fit(&self, _rows: &[DeviceRowDemand]) -> Option<usize> {
-        None
+    /// Whether the backend keeps device KV pool(s) separate from the
+    /// engine's accounting pool, so plan rows must clear
+    /// [`Self::kv_device_fit`] before submit. `false` (the default) skips
+    /// the gate — the engine builds no demand rows at all.
+    fn kv_device_gate_active(&self) -> bool {
+        false
     }
+
+    /// Per-row fit of the planned rows (decode rows first, then prefill
+    /// chunks — the engine's shed-priority order) against the backend's own
+    /// device KV pool(s). Push the index of EVERY row that does not fit into
+    /// `unfit` (ascending); a fitting row debits the remaining headroom
+    /// cumulatively, an unfit row debits nothing so later smaller rows are
+    /// still tested — shedding exactly the unfit rows, never the tail (a
+    /// stuck low-index row must not starve later fitting rows). The engine
+    /// parks/sheds the pushed rows so device-side exhaustion degrades (#162)
+    /// instead of failing an alloc inside [`Self::submit`] — which is
+    /// engine-fatal (#164). Backends with heterogeneous pools (DSv4
+    /// per-layer FlashMLA bands, #160) must pair need and headroom PER POOL
+    /// — a saturated pool with zero incremental need is not exhaustion. Host
+    /// bookkeeping only — never a device readback (CUDA-graph hot loop).
+    fn kv_device_fit(&self, _rows: &[DeviceRowDemand], _unfit: &mut Vec<usize>) {}
 
     /// Number of KV pages the backend's host-demoted store can
     /// hold. `0` (the default) means the backend has no tier store and the
