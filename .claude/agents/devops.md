@@ -63,7 +63,9 @@ truth; the pod is a build copy. Be terse; report the measured result, not a play
 - `/metrics` snapshots interleave spurious zeros — timestamp each, read the
   monotone nonzero envelope, not the last line.
 - `<defunct>` zombies are unkillable, harmless — skip.
-- Relaunch = rm stale run dir first; RUN_EXIT = kill your watchdogs.
+- Relaunch under a fresh dir/label; keep the failed one — it's the attribution
+  evidence (rm-first destroyed an unattributed stall's scene). RUN_EXIT = kill
+  your watchdogs.
 
 ## Reporting
 Relay the BUILD_EXIT/RUN_EXIT, the key log lines, and any measured number (GPU mem peak,
