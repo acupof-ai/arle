@@ -3,10 +3,9 @@
 //! thread per sample (cc → score, so a sample scores the moment its cc exits);
 //! the NEXT group's boots run on background threads, overlapping the current
 //! group's rollout/train (CPU-only, staleness-free). Prompt + cc invocation
-//! ported verbatim from `scripts/cc_swe_baseline.py` (plan
-//! docs/plans/2026-07-16-agent-rl-unified-infra.md §P2).
+//! ported verbatim from `scripts/cc_swe_baseline.py`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -16,7 +15,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
 
-use crate::cc_convert::{CcRecord, CcWindow, convert_cc_dumps};
+use crate::cc_convert::{CcRecord, CcWindow, convert_cc_dumps, list_dumps, read_json};
 use crate::sandbox::{boot_workdir, diff_workdir, run_captured, score_workdir};
 use crate::swe_dataset::SweTask;
 
@@ -226,25 +225,28 @@ impl CcHarness {
         let first_done = AtomicBool::new(false);
         let samples = std::thread::scope(|scope| -> Result<Vec<ScoredSample>> {
             let (tx, rx) = sync_channel(booted.k);
-            let mut gate = None;
-            for released in 0..booted.k {
-                let (sample, workdir) = booted.rx.recv().context("cc boot thread died")??;
-                if released == 0 && self.group_stagger {
-                    gate = Some((sample_model(&self.model_id, sample), SystemTime::now()));
-                }
-                if released == 1
-                    && let Some((tag, since)) = gate.take()
-                {
-                    self.wait_preamble_publish(&tag, since, &first_done);
-                }
+            let spawn = |sample: usize, workdir: PathBuf, first: bool| {
                 let (tx, task, first_done) = (tx.clone(), &booted.task, &first_done);
                 scope.spawn(move || {
                     let s = self.run_sample(task, sample, &workdir);
-                    if released == 0 {
+                    if first {
                         first_done.store(true, Ordering::Relaxed);
                     }
                     let _ = tx.send(s);
                 });
+            };
+            let (sample, workdir) = booted.rx.recv().context("cc boot thread died")??;
+            let gate = self
+                .group_stagger
+                .then(|| (sample_model(&self.model_id, sample), epoch_ms()));
+            spawn(sample, workdir, true);
+            // Gate wait overlaps the remaining boots (background threads).
+            if let Some((tag, since_ms)) = gate {
+                self.wait_preamble_publish(&tag, since_ms, &first_done);
+            }
+            for _ in 1..booted.k {
+                let (sample, workdir) = booted.rx.recv().context("cc boot thread died")??;
+                spawn(sample, workdir, false);
             }
             drop(tx);
             let mut assembler = GroupAssembler::new(booted.k);
@@ -289,28 +291,27 @@ impl CcHarness {
     /// Block until the first-released sample's opening request lands its
     /// tokens-sidecar (written at request finish, after the radix publish),
     /// that sample exits without one, or [`STAGGER_TIMEOUT`] expires.
-    fn wait_preamble_publish(&self, tag: &str, since: SystemTime, first_done: &AtomicBool) {
-        let start = Instant::now();
-        while start.elapsed() < STAGGER_TIMEOUT {
-            if preamble_published(&self.dump_dir, tag, since) {
-                eprintln!(
-                    "[cc-harness] stagger: preamble published after {:.1}s",
+    fn wait_preamble_publish(&self, tag: &str, since_ms: u64, first_done: &AtomicBool) {
+        let (start, mut rejected) = (Instant::now(), HashSet::new());
+        let reason = loop {
+            if preamble_published(&self.dump_dir, tag, since_ms, &mut rejected) {
+                break format!(
+                    "preamble published after {:.1}s",
                     start.elapsed().as_secs_f64()
                 );
-                return;
             }
             if first_done.load(Ordering::Relaxed) {
-                eprintln!(
-                    "[cc-harness] stagger: first sample exited without a publish — releasing group cold"
+                break "first sample exited without a publish — releasing group cold".to_owned();
+            }
+            if start.elapsed() >= STAGGER_TIMEOUT {
+                break format!(
+                    "no publish within {}s — releasing group cold",
+                    STAGGER_TIMEOUT.as_secs()
                 );
-                return;
             }
             std::thread::sleep(Duration::from_millis(500));
-        }
-        eprintln!(
-            "[cc-harness] stagger: no publish within {}s — releasing group cold",
-            STAGGER_TIMEOUT.as_secs()
-        );
+        };
+        eprintln!("[cc-harness] stagger: {reason}");
     }
 
     /// One sample end-to-end: `claude -p` (fork-safe `run_captured`, spawner-
@@ -398,27 +399,26 @@ impl CcHarness {
     }
 }
 
-/// A `<stem>.tokens.json` sidecar newer than `since` whose `<stem>.json` body
-/// requested `tag`.
-fn preamble_published(dump_dir: &Path, tag: &str, since: SystemTime) -> bool {
-    let Ok(entries) = std::fs::read_dir(dump_dir) else {
+/// A dump at/after `since_ms` (filename epoch prefix) whose tokens-sidecar
+/// exists and whose body requested `tag`. `rejected` memoizes non-matching
+/// bodies — dumps are write-once, so each parses at most once across polls.
+fn preamble_published(
+    dump_dir: &Path,
+    tag: &str,
+    since_ms: u64,
+    rejected: &mut HashSet<PathBuf>,
+) -> bool {
+    let Ok(dumps) = list_dumps(dump_dir) else {
         return false;
     };
-    entries.flatten().any(|e| {
-        let sidecar = e.path();
-        let Some(stem) = sidecar
-            .to_str()
-            .and_then(|p| p.strip_suffix(".tokens.json"))
-        else {
-            return false;
-        };
-        e.metadata()
-            .and_then(|m| m.modified())
-            .is_ok_and(|t| t >= since)
-            && std::fs::read(format!("{stem}.json"))
-                .ok()
-                .and_then(|body| serde_json::from_slice::<serde_json::Value>(&body).ok())
-                .is_some_and(|v| v["model"].as_str() == Some(tag))
+    dumps.into_iter().any(|(ms, dump)| {
+        ms >= since_ms
+            && !rejected.contains(&dump)
+            && infer_server::tokens_sidecar_path(&dump).exists()
+            && (read_json(&dump).is_ok_and(|v| v["model"].as_str() == Some(tag)) || {
+                rejected.insert(dump);
+                false
+            })
     })
 }
 
@@ -476,7 +476,7 @@ fn epoch_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, SystemTime};
+    use std::collections::HashSet;
 
     use super::{
         GroupAssembler, REWARD_DENSE_WEIGHT, RewardShape, ScoredSample, preamble_published,
@@ -520,27 +520,19 @@ mod tests {
     }
 
     #[test]
-    fn preamble_published_needs_fresh_sidecar_with_matching_tag() {
-        let dir = std::env::temp_dir().join(format!("stagger-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        // 1s slack dodges filesystem mtime granularity.
-        let since = SystemTime::now() - Duration::from_secs(1);
+    fn preamble_published_needs_finished_dump_with_matching_tag() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        // Fresh rejected-set per call: the gate holds one set per (tag, group).
+        let check = |tag, since_ms| preamble_published(dir, tag, since_ms, &mut HashSet::new());
 
-        assert!(!preamble_published(&dir, "m#s0", since), "empty dir");
-        std::fs::write(dir.join("1_0.json"), r#"{"model":"m#s0"}"#).unwrap();
-        assert!(
-            !preamble_published(&dir, "m#s0", since),
-            "body but no sidecar"
-        );
-        std::fs::write(dir.join("1_0.tokens.json"), "{}").unwrap();
-        assert!(preamble_published(&dir, "m#s0", since));
-        assert!(
-            !preamble_published(&dir, "m#s1", since),
-            "other sample's tag"
-        );
-        let future = SystemTime::now() + Duration::from_secs(60);
-        assert!(!preamble_published(&dir, "m#s0", future), "stale sidecar");
-        std::fs::remove_dir_all(&dir).ok();
+        assert!(!check("m#s0", 0), "empty dir");
+        std::fs::write(dir.join("100_0.json"), r#"{"model":"m#s0"}"#).unwrap();
+        assert!(!check("m#s0", 0), "body but no sidecar");
+        std::fs::write(dir.join("100_0.tokens.json"), "{}").unwrap();
+        assert!(check("m#s0", 0));
+        assert!(!check("m#s1", 0), "other sample's tag");
+        assert!(!check("m#s0", 101), "older than the gate");
     }
 
     #[test]

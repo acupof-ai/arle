@@ -4,14 +4,12 @@
 #   scripts/agent_opd_curve.sh <label>
 #
 # gen corpus (+self-check) -> baseline-envelope repeats -> train+held-out-eval
-# -> curve PNG/JSON. One H20 GPU. Plan:
-# docs/plans/2026-07-03-agentic-opd-27b-capability-curve.md
+# -> curve PNG/JSON. One H20 GPU.
 #
 # Models auto-download from HF if not local (set HF_ENDPOINT=https://hf-mirror.com
 # for the mirror).
 #
-# Defaults come from the 2026-07-21 SOTA review
-# (docs/research/2026-07-21-rl-algo-infra-deepresearch.md). Each knob is explained
+# Defaults come from the 2026-07-21 SOTA review. Each knob is explained
 # where it is set below; override any via env. SMOKE=1 = quick 2-round sizing run.
 # Optional env (full-run defaults):
 #   ARLE_BIN=target/release/arle  OUT_ROOT=runs  GPU=0  MODEL_CACHE=models
@@ -23,9 +21,8 @@
 #   UPDATE_STRATEGY=dapo          policy-update rule {dapo,gspo,dr-grpo,grpo,rejection-ce,...}
 #   STALENESS=1                   1 = train on a batch while the next generates
 #                                 (dapo/dr-grpo/gspo only); 0 = wait for each batch
-#   GROUP_STAGGER=false           true = hold a group's samples until the first one's
-#                                 opening request radix-publishes the ~18K shared CC
-#                                 preamble (rest prefix-hit instead of K cold prefills)
+#   GROUP_STAGGER=false           true = prefix-share the CC preamble across a group's
+#                                 samples (first sample publishes, rest prefix-hit)
 #   TASK_SELECTION=true           skip prompts that always pass or always fail
 #   COMFORT_BAND=1                profile 1 round, then train only the "band": drop
 #                                 always-pass/always-fail AND >CB_MAX_SEQ tasks the
@@ -159,7 +156,7 @@ common_args=(
 # tasks AND >CB_MAX_SEQ trajectories the writeback would skip → train only the
 # trainable band. Closes the length-waste gap the runtime P5 selector cannot: a
 # variance-bearing 30K task passes P5 but its 40%-of-round rollout is thrown away
-# every round (errors/2026-07-22). See docs/research/2026-07-23-online-rl-acceleration.md.
+# every round (errors/2026-07-22).
 CORPUS="$OUT/corpus"
 if [[ ${COMFORT_BAND:-1} == 1 && ${SMOKE:-0} != 1 ]]; then
     echo "[curve] comfort-band: profiling $CORPUS (1 round, task-selection off) → filter"
