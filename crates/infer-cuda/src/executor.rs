@@ -682,15 +682,29 @@ impl RealCudaExecutor {
         }
     }
 
-    /// Plan-level device-pool fit for the engine's gate. Qwen3.6 checks the
+    /// Whether the engine must run the device-pool fit gate. Dense Qwen
+    /// mirrors the host pool exactly — inert.
+    pub(crate) fn kv_device_gate_active(&self) -> bool {
+        match self {
+            Self::Qwen35(q) => q.kv_device_gate_active(),
+            Self::Dsv4(d) => d.kv_device_gate_active(),
+            Self::Qwen(_) => false,
+        }
+    }
+
+    /// Per-row device-pool fit for the engine's gate. Qwen3.6 checks the
     /// engine's `pages_hint` against `full_attn_kv`'s true headroom (recall
     /// keepalive); DSv4 pairs per-layer band growth with each layer pool
-    /// (#160); dense Qwen mirrors the host pool exactly — gate inert.
-    pub(crate) fn kv_device_fit(&self, rows: &[infer_seam::DeviceRowDemand]) -> Option<usize> {
+    /// (#160).
+    pub(crate) fn kv_device_fit(
+        &self,
+        rows: &[infer_seam::DeviceRowDemand],
+        unfit: &mut Vec<usize>,
+    ) {
         match self {
-            Self::Qwen35(q) => q.kv_device_fit(rows),
-            Self::Dsv4(d) => d.kv_device_fit(rows),
-            Self::Qwen(_) => None,
+            Self::Qwen35(q) => q.kv_device_fit(rows, unfit),
+            Self::Dsv4(d) => d.kv_device_fit(rows, unfit),
+            Self::Qwen(_) => {}
         }
     }
 

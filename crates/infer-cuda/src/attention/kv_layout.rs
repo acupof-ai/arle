@@ -1044,29 +1044,29 @@ impl Dsv4KvAdapter {
         self.layers.iter().any(|l| l.flashmla_demand_paged)
     }
 
-    /// Plan-level fit for the engine's device-budget gate (#160): first row
-    /// whose band growth some demand-paged layer cannot serve. Need is
-    /// paired with headroom PER LAYER — a saturated SW-only layer is free=0
-    /// AND need=0, which a scalar min-free/max-need projection misreads as
-    /// permanent exhaustion. Per row and layer the growth is the exact
-    /// `needed - have` draw `flashmla_ensure_band` will make at submit,
-    /// including `prepare_kv_batch`'s MTP verify margin; free counts are the
-    /// host free-list lengths debited cumulatively across rows (plan slots
-    /// are distinct, so `have` stays current). No device readback
-    /// (CUDA-graph safe). None = every row fits or no demand-paged layer
-    /// (identity/V32 bands are fully drawn at slot alloc; the gate stays
-    /// inert).
+    /// Per-row fit for the engine's device-budget gate (#160): every row
+    /// whose band growth some demand-paged layer cannot serve is pushed
+    /// unfit (ascending); fitting rows debit each layer's headroom
+    /// cumulatively, unfit rows debit nothing so later smaller rows are
+    /// still tested. Need is paired with headroom PER LAYER — a saturated
+    /// SW-only layer is free=0 AND need=0, which a scalar min-free/max-need
+    /// projection misreads as permanent exhaustion. Per row and layer the
+    /// growth is the exact `needed - have` draw `flashmla_ensure_band` will
+    /// make at submit, including `prepare_kv_batch`'s MTP verify margin;
+    /// free counts are the host free-list lengths (plan slots are distinct,
+    /// so `have` stays current). No device readback (CUDA-graph safe).
     pub(crate) fn flashmla_demand_fit(
         &self,
         rows: &[infer_seam::DeviceRowDemand],
-    ) -> Option<usize> {
+        unfit: &mut Vec<usize>,
+    ) {
         let layers: Vec<&Dsv4LayerKvLayout> = self
             .layers
             .iter()
             .filter(|l| l.flashmla_demand_paged)
             .collect();
         if layers.is_empty() {
-            return None;
+            return;
         }
         let mut free: Vec<usize> = layers
             .iter()
@@ -1077,7 +1077,7 @@ impl Dsv4KvAdapter {
             })
             .collect();
         let mut needs = vec![0usize; layers.len()];
-        rows.iter().position(|row| {
+        for (idx, row) in rows.iter().enumerate() {
             let ensure_tokens = row.target_tokens + crate::dsv4::MAX_SPEC_DRAFT_DEPTH + 1;
             for (need, l) in needs.iter_mut().zip(&layers) {
                 let have = l
@@ -1089,13 +1089,13 @@ impl Dsv4KvAdapter {
                     .saturating_sub(have);
             }
             if needs.iter().zip(&free).any(|(need, f)| need > f) {
-                return true;
+                unfit.push(idx);
+                continue;
             }
             for (f, need) in free.iter_mut().zip(&needs) {
                 *f -= need;
             }
-            false
-        })
+        }
     }
 
     /// Engine-facing admission page count. Demand-paged (#154 Phase 3b): the
