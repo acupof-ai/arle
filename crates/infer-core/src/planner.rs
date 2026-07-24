@@ -70,8 +70,11 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             if !matches!(request.phase, RequestPhase::Prefilling { .. }) {
                 continue;
             }
-            let start_pos = request.prefill_start_pos.min(request.prompt_tokens.len());
-            let remaining = request.prompt_tokens.len() - start_pos;
+            // Committed stream (prompt + generated): a recompute-resumed
+            // request re-prefills its generation, then decode resumes (#156).
+            let target = request.committed_len();
+            let start_pos = request.prefill_start_pos.min(target);
+            let remaining = target - start_pos;
             let mut chunk = remaining.min(chunk_cap).min(budget);
             if chunk == 0 {
                 continue;
@@ -91,9 +94,9 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             }
             prefill_rows.push(PrefillRow {
                 slot,
-                tokens: request.prompt_tokens[start_pos..start_pos + chunk].to_vec(),
+                tokens: request.committed_slice(start_pos, chunk),
                 start_pos,
-                total_tokens: request.prompt_tokens.len(),
+                total_tokens: target,
                 params: request.sampling.clone(),
             });
             budget -= chunk;
@@ -266,12 +269,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         // provisional backend entry at the free below, so resume / follow-up
         // turns recomputed the whole generated region instead of attaching
         // through it.
-        let committed_tokens: Vec<u32> = request
-            .prompt_tokens
-            .iter()
-            .chain(request.generated_tokens.iter())
-            .copied()
-            .collect();
+        let committed_tokens = request.committed_tokens();
         if self.kv_tier_capacity() > 0 {
             // Publish ensures radix + sidecar are captured (idempotent for
             // already-cached blocks — returns empty in that case).
@@ -296,9 +294,9 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         } else {
             // Plain-recompute arms (e.g. DSv4 #154 2b — pool entries are the
             // demotion, device bands free via release_kv_slot): seal the
-            // committed sequence BEFORE free_slot_pages drops it. Serves
-            // follow-up matches only — the requeued request resets to
-            // prompt-only (#156 tracks resume-at-committed).
+            // committed sequence BEFORE free_slot_pages drops it. Self-serving
+            // (#156): the requeued request keeps its generation and re-attaches
+            // through these blocks on resume.
             let _ = self.publish_prefix_blocks(slot, &committed_tokens);
         }
         // free_slot before release_reused_prefix — same ordering fix as finish_slot.
@@ -382,7 +380,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                 let fresh = request.clone().reset_for_recompute();
                 *request = fresh;
                 let prefix_match = if self.config.enable_prefix_cache {
-                    self.lookup_prefix_for_attach(&request.prompt_tokens)
+                    self.lookup_prefix_for_attach(&request.committed_tokens())
                 } else {
                     crate::PrefixMatch::empty()
                 };

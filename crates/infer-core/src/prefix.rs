@@ -77,6 +77,10 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         if self.config.enable_prefix_cache {
             self.prefix_cache_stats.lookups = self.prefix_cache_stats.lookups.saturating_add(1);
         }
+        // Committed stream: a recompute-resumed request attaches through its
+        // generated tokens too, and only the un-restored tail re-prefills (#156).
+        let tokens = request.committed_tokens();
+        let target = tokens.len();
 
         // A full-prompt match must still run one genuine forward+sample step —
         // jumping straight to `Decoding` leaves `generated_tokens` empty, and the
@@ -89,11 +93,11 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         // BEFORE `clamp_prefix_to_backend` (#154 D4): the clamp's alignment
         // floor must see the post-trim length, or the pop un-aligns
         // `matched_len` and the backend's restore predicate rejects it.
-        if !prefix_match.is_empty() && prefix_match.matched_len == request.prompt_len() {
+        if !prefix_match.is_empty() && prefix_match.matched_len == target {
             prefix_match.block_ids.pop();
             prefix_match.matched_len = prefix_match.block_ids.len() * self.radix.block_size();
         }
-        let prefix_match = self.clamp_prefix_to_backend(prefix_match, &request.prompt_tokens);
+        let prefix_match = self.clamp_prefix_to_backend(prefix_match, &tokens);
         if prefix_match.is_empty() {
             request.prefill_start_pos = 0;
             request.phase = RequestPhase::Prefilling { progress: 0 };
@@ -138,7 +142,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         // KV causes a cross-type mismatch that corrupts model output.
         let restored = match self.executor.restore_prefix_sidecar(
             slot,
-            &request.prompt_tokens,
+            &tokens,
             prefix_match.matched_len,
             &prefix_match.block_ids,
         ) {
@@ -170,8 +174,11 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         //   over-attached host pages [B..matched_len] back to `B` (radix-retained
         //   pages survive the reclaim; they stay in `reused_prefix_pages` and are
         //   released on finish), so the tail prefill covers [B..prompt].
-        // Clamp to the prompt: a match cannot extend past this request's own prompt.
-        let restored_len = restored.min(request.prompt_len());
+        // Clamp below the committed stream: a full restore to `target` would
+        // enter Decoding with the last token's KV already materialized, and the
+        // decode seed re-feeds that token (same contract as the full-match trim
+        // above) — hold one token back so the tail prefill re-seeds from logits.
+        let restored_len = restored.min(target.saturating_sub(1));
         if restored_len > prefix_match.matched_len {
             // Same degrade contract as the sidecar-miss arm above: an
             // admission alloc failure must not propagate into the fatal step
@@ -192,9 +199,8 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         }
 
         log::info!(
-            "prefix-attach: slot={slot} matched={} restored={restored_len} prompt={}",
+            "prefix-attach: slot={slot} matched={} restored={restored_len} committed={target}",
             prefix_match.matched_len,
-            request.prompt_len()
         );
         self.prefix_cache_stats.hits = self.prefix_cache_stats.hits.saturating_add(1);
         self.prefix_cache_stats.hit_tokens = self
@@ -208,7 +214,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
 
         request.prefill_start_pos = restored_len;
         request.reused_prefix_pages = prefix_match.block_ids;
-        request.phase = if request.prefill_start_pos == request.prompt_len() {
+        request.phase = if request.prefill_start_pos == target {
             RequestPhase::Decoding
         } else {
             RequestPhase::Prefilling {

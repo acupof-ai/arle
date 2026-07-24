@@ -325,8 +325,10 @@ impl RequestState {
         self
     }
 
+    /// Generated tokens are kept (#156): recompute re-prefills the committed
+    /// stream and decode resumes after the last committed token, so the
+    /// observer never sees a token twice.
     fn reset_for_recompute(mut self) -> Self {
-        self.generated_tokens.clear();
         self.phase = RequestPhase::Prefilling { progress: 0 };
         self.prefill_start_pos = 0;
         self.reused_prefix_pages.clear();
@@ -340,6 +342,25 @@ impl RequestState {
 
     fn prompt_len(&self) -> usize {
         self.prompt_tokens.len()
+    }
+
+    /// Prompt + generated: the committed stream a prefill must materialize.
+    fn committed_len(&self) -> usize {
+        self.prompt_tokens.len() + self.generated_tokens.len()
+    }
+
+    fn committed_tokens(&self) -> Vec<u32> {
+        self.committed_slice(0, self.committed_len())
+    }
+
+    fn committed_slice(&self, start: usize, len: usize) -> Vec<u32> {
+        self.prompt_tokens
+            .iter()
+            .chain(&self.generated_tokens)
+            .skip(start)
+            .take(len)
+            .copied()
+            .collect()
     }
 }
 
@@ -964,14 +985,16 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             if !matches!(request.phase, RequestPhase::Prefilling { .. }) {
                 continue;
             }
-            let prompt_len = request.prompt_tokens.len();
-            let new_start = (row.start_pos + row.tokens.len()).min(prompt_len);
+            // Prefill target is the committed stream: a recompute-resumed
+            // request re-prefills prompt + generated before decoding (#156).
+            let target = request.committed_len();
+            let new_start = (row.start_pos + row.tokens.len()).min(target);
             self.throughput_stats.prefill_tokens = self
                 .throughput_stats
                 .prefill_tokens
                 .saturating_add(new_start.saturating_sub(row.start_pos) as u64);
             request.prefill_start_pos = new_start;
-            if new_start >= prompt_len {
+            if new_start >= target {
                 request.phase = RequestPhase::Decoding;
                 prompt_sealed_slots.push(row.slot);
                 if let Some(token) = tokens_by_slot
@@ -1288,11 +1311,13 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         let Some(candidate) = self.waiting.front() else {
             return Ok(AdmitOutcome::NoWaiter);
         };
+        // Match against the committed stream (prompt + generated): a
+        // recompute-resumed request attaches through its own requeue-published
+        // generated blocks instead of re-prefilling them (#156).
+        let committed = candidate.committed_tokens();
         let prefix_match = if self.config.enable_prefix_cache {
-            let matched = self
-                .radix
-                .peek_longest_prefix_match(&candidate.prompt_tokens);
-            self.clamp_prefix_to_backend(matched, &candidate.prompt_tokens)
+            let matched = self.radix.peek_longest_prefix_match(&committed);
+            self.clamp_prefix_to_backend(matched, &committed)
         } else {
             PrefixMatch::empty()
         };
@@ -1308,13 +1333,13 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         let reuse_matched_len = if self.config.enable_prefix_cache && candidate.swap_key.is_none() {
             let cached = self
                 .executor
-                .cached_prefix_match_len(&candidate.prompt_tokens)?
-                .min(candidate.prompt_len());
+                .cached_prefix_match_len(&committed)?
+                .min(committed.len());
             prefix_match.matched_len.max(cached)
         } else {
             prefix_match.matched_len
         };
-        let prefill_tokens = candidate.prompt_len().saturating_sub(reuse_matched_len);
+        let prefill_tokens = committed.len().saturating_sub(reuse_matched_len);
         if prefill_tokens > 0 && *active_prefills >= max_prefills {
             return Ok(AdmitOutcome::Throttled);
         }
@@ -1368,7 +1393,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                 // Tier-aware: demoted blocks in the match are promoted
                 // back into fresh pages here, so attach sees a
                 // resident-only match.
-                self.lookup_prefix_for_attach(&request.prompt_tokens)
+                self.lookup_prefix_for_attach(&committed)
             } else {
                 PrefixMatch::empty()
             };
@@ -1376,11 +1401,13 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             self.record_attached_prefix_metrics(request.reused_prefix_pages.len());
         }
 
-        *remaining_prefill_tokens = remaining_prefill_tokens.saturating_sub(
-            request
-                .prompt_len()
+        let pending_prefill = match request.phase {
+            RequestPhase::Prefilling { .. } => request
+                .committed_len()
                 .saturating_sub(request.prefill_start_pos),
-        );
+            _ => 0,
+        };
+        *remaining_prefill_tokens = remaining_prefill_tokens.saturating_sub(pending_prefill);
         *remaining_pages = remaining_pages.saturating_sub(pages_needed);
         if matches!(request.phase, RequestPhase::Prefilling { .. }) {
             *active_prefills += 1;
@@ -3861,8 +3888,8 @@ mod tests {
         assert_eq!(engine.executor.dropped.len(), 1, "failed entry dropped");
         assert_eq!(
             engine.throughput_stats().prefill_tokens,
-            16,
-            "fallback re-prefilled the prompt"
+            17,
+            "fallback re-prefilled the committed stream (prompt + 1 generated)"
         );
         Ok(())
     }
@@ -3888,8 +3915,8 @@ mod tests {
         assert_eq!(tier.demoted_slots, 0);
         assert_eq!(
             engine.throughput_stats().prefill_tokens,
-            16,
-            "plain recompute path"
+            17,
+            "plain recompute re-prefilled the committed stream (prompt + 1 generated)"
         );
         Ok(())
     }
@@ -4439,11 +4466,60 @@ mod tests {
         );
         let requeued = engine.waiting.front().expect("victim requeued");
         assert_eq!(requeued.handle, longer);
-        assert!(requeued.generated_tokens.is_empty());
+        assert_eq!(
+            requeued.generated_tokens,
+            vec![9, 10],
+            "recompute keeps committed tokens (#156)"
+        );
         assert!(matches!(
             requeued.phase,
             RequestPhase::Prefilling { progress: 0 }
         ));
+        Ok(())
+    }
+
+    /// #156: a decode preempted onto the PLAIN recompute path (no tier store,
+    /// no whole-slot image) must resume at the committed position — the
+    /// observer stream stays byte-continuous, with no token ever re-emitted.
+    #[test]
+    fn recompute_preemption_never_reemits_committed_tokens() -> Result<()> {
+        let mut engine = Engine::with_config(
+            MockExecutor::ready(),
+            MockKvPool::with_capacity(1, 4, 32),
+            test_config(1),
+        );
+        let observed = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let observed_sink = observed.clone();
+        engine.set_token_observer(Box::new(move |_, token| {
+            observed_sink.borrow_mut().push(token.token);
+        }));
+
+        let handle = engine.submit_request(vec![1, 2, 3, 4], 6);
+        for _ in 0..3 {
+            engine.step()?;
+        }
+        let (&slot, request) = engine.active.iter().next().expect("request active");
+        assert!(matches!(request.phase, RequestPhase::Decoding));
+        let committed_at_preempt = request.generated_tokens.clone();
+        assert_eq!(committed_at_preempt, vec![5, 6]);
+
+        engine.requeue_preempted_decode(slot);
+        let requeued = engine.waiting.front().expect("victim requeued");
+        assert!(requeued.swap_key.is_none(), "plain recompute path");
+        assert_eq!(requeued.generated_tokens, committed_at_preempt);
+        assert_eq!(engine.kv_system_metrics().fallback_recompute, 1);
+
+        engine.run_to_idle()?;
+        let done = engine.completed(handle).expect("completed");
+        assert_finished(done);
+        assert!(done.generated_tokens.starts_with(&committed_at_preempt));
+        let streamed = observed.borrow().clone();
+        assert_eq!(
+            streamed, done.generated_tokens,
+            "observer stream equals the final generation — nothing re-emitted"
+        );
+        let unique: std::collections::BTreeSet<u32> = streamed.iter().copied().collect();
+        assert_eq!(unique.len(), streamed.len(), "no duplicate emissions");
         Ok(())
     }
 
@@ -5159,6 +5235,65 @@ mod tests {
             request.reused_prefix_pages.len(),
             1,
             "only the non-final matched block is reused from cache"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn frontier_tail_restore_still_prefills_the_last_token() -> Result<()> {
+        // A DSv4 finish-write-through sidecar can restore PAST the trimmed
+        // radix match back to the full committed stream; entering Decoding
+        // there re-feeds the last token's KV. The restore clamp must hold one
+        // token back so the tail re-seeds from real logits.
+        use infer_seam::{PrefixBlock, pages_only_reusable_prefix_blocks};
+
+        struct FrontierRestoreExecutor(MockExecutor);
+        impl BackendExecutor for FrontierRestoreExecutor {
+            type Inflight = super::testing::MockInflight;
+            fn submit(
+                &mut self,
+                plan: &ForwardPlan,
+                kv: &mut dyn KvPool,
+            ) -> Result<Self::Inflight> {
+                self.0.submit(plan, kv)
+            }
+            fn poll(&mut self, inflight: Self::Inflight) -> Result<PollResult<Self::Inflight>> {
+                self.0.poll(inflight)
+            }
+            fn reusable_prefix_blocks(&self, blocks: &[PrefixBlock]) -> usize {
+                pages_only_reusable_prefix_blocks(blocks, |_| false)
+            }
+            fn restore_prefix_sidecar(
+                &mut self,
+                _slot: usize,
+                tokens: &[u32],
+                _matched_len: usize,
+                _prefix_pages: &[u32],
+            ) -> Result<usize> {
+                Ok(tokens.len())
+            }
+        }
+
+        let mut engine = Engine::with_config(
+            FrontierRestoreExecutor(MockExecutor::ready()),
+            MockKvPool::with_capacity(1, 4, 8),
+            test_config(1),
+        );
+        let first = engine.submit_request(vec![1, 2, 3, 4, 5, 6, 7, 8], 1);
+        engine.run_to_idle()?;
+        assert_finished(engine.completed(first).expect("first completed"));
+
+        let second = engine.submit_request(vec![1, 2, 3, 4, 5, 6, 7, 8], 1);
+        engine.step()?; // admission + attach only.
+        let (_, request) = engine
+            .active
+            .iter()
+            .find(|(_, request)| request.handle == second)
+            .expect("second admitted");
+        assert_eq!(
+            request.phase,
+            RequestPhase::Prefilling { progress: 7 },
+            "a full frontier restore must hold the last token back for prefill"
         );
         Ok(())
     }
