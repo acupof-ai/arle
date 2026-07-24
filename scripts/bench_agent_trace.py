@@ -9,8 +9,7 @@ wall time, and tokens generated. Multiple sessions run concurrently.
 
 This is the P1-and-beyond scoreboard for the Tiered KV Cache project:
 the exit gate for P1 is ">= 70% cross-session prefix hit rate" and this
-script provides the observable trace that measures it. See
-`docs/plans/tiered-kv-cache-tasks.md` §2 for context.
+script provides the observable trace that measures it.
 
 NOTE: the existing `scripts/bench_agent.py` drives the Rust *binary* via
 stdin and greps logs — a different workload shape. This replayer is
@@ -275,11 +274,9 @@ async def fetch_server_stats(
     observable from this probe; we report the delta of `tokens_out`
     and the final `kv_util` / `ttft_*` gauges as the best proxy. The
     add-the-counters change belongs in the rewrite `infer-server` /
-    `infer-core` scheduler once `/v1/stats` is re-ported. See the
-    I1 research report in
-    `docs/plans/tiered-kv-cache-tasks.md` §N.Addendum (or scroll to
+    `infer-core` scheduler once `/v1/stats` is re-ported. Scroll to
     the bottom of the file for the consolidated remote-validation
-    checklist).
+    checklist.
     """
     try:
         resp = await client.get(
@@ -1094,8 +1091,7 @@ def _print_server_probe(stats: RunStats) -> None:
     if "prefix_hit_rate" not in after.fields and "prefix_hits" not in after.fields:
         print(
             "  note:   prefix_hit_rate not exposed by /v1/stats yet; "
-            "server-side counter addition pending (see I1 research in "
-            "docs/plans/tiered-kv-cache-tasks.md)"
+            "server-side counter addition pending"
         )
 
 

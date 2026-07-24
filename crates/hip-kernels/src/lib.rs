@@ -1,5 +1,5 @@
 //! HIP kernel build + FFI layer for the AIPC DSv4-Flash 2-bit lane
-//! (#76/#77, [`docs/plans/2026-06-10-hip-backend-mvp.md`] §2/§4).
+//! (#76/#77).
 //!
 //! Kernel objects only exist when built on a ROCm box (`--features hip`
 //! with hipcc installed — pending-remote); everywhere else the crate is
@@ -12,8 +12,6 @@
 //! activation quantization, adapted from llama.cpp @ d2462f8f) and the six
 //! shim-portable DSv4 sources from `crates/cuda-kernels/csrc/`, compiled
 //! by hipcc with `csrc/arle_hip_shim.h` force-included.
-//!
-//! [`docs/plans/2026-06-10-hip-backend-mvp.md`]: https://github.com/cklxx/ARLE/blob/main/docs/plans/2026-06-10-hip-backend-mvp.md
 
 /// Per-block byte sizes, pinned against the vendored
 /// `vendor/llama.cpp/ggml-common.h` struct definitions and mirrored by the

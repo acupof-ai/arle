@@ -443,7 +443,7 @@ static cudaError_t gemm_small_n_gemv_loop(const __nv_bfloat16 *W, const __nv_bfl
 // cuBLAS heuristic top-1 is optimized for "average cost across many
 // shapes"; for a specific shape the best algo is often at index
 // 1-3. Off by default; opt in with INFER_GEMM_AUTOTUNE=1.
-// See docs/plans/M_pf-gemm-cublaslt-autotune.md, H_LP3 finding
+// See the H_LP3 finding in
 // docs/experience/wins/2026-05-07-h_lp3-diagnosed-cutlass-small-tile-gemm-bottleneck.md.
 static bool gemm_autotune_enabled() {
   static const bool enabled = []() {

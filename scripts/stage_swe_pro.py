@@ -19,8 +19,6 @@ Usage:
   python3 scripts/stage_swe_pro.py stage --candidates candidates.jsonl \
       --staged-root staged --train-out train.jsonl --eval-out eval.jsonl \
       --train-n 12 --eval-n 12
-
-Plan: docs/plans/2026-07-03-agentic-opd-27b-capability-curve.md (phase 2).
 """
 
 import argparse

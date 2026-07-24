@@ -236,8 +236,7 @@ pub(crate) fn mean_backward(
     // output demoted every downstream device override (`matmul_backward_device`,
     // `log_softmax_last_axis_backward`, `gather_last_dim_backward`,
     // `add_into_device`) to host, dragging the full `[B, S, V] ≈ 1 GB`
-    // logits tile back through DtoH per step. See
-    // `docs/research/2026-05-17-cuda-training-architectural-correction.md`.
+    // logits tile back through DtoH per step.
     let input_shape = store.tensor(a)?.shape.clone();
     let device_path_ok = {
         let upstream = store.tensor(output_grad_id)?;

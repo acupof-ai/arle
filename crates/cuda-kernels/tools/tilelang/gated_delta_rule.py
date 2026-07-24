@@ -1,7 +1,6 @@
 """TileLang chunk-wise Gated Delta Rule (GDR) kernels for Qwen3.5 hybrid.
 
-Phase 2 of `docs/plans/2026-05-05-cuda-kernel-tilelang-unification.md`:
-the canonical chunk-wise GDR pipeline with TileLang AOT stages. The
+The canonical chunk-wise GDR pipeline with TileLang AOT stages. The
 strict-lower triangular solve is kept as native CUDA C because TileLang 0.1.9
 cannot lower that stage's mixed-index fragment layout on sm_89.
 

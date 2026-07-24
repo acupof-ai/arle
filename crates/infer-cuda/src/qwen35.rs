@@ -754,8 +754,7 @@ fn qwen35_profile<T>(
 
 /// Route full-attention prefill chunks (`seq_len > 1`) through the vendored
 /// FA3 hopper fwd shim instead of the in-tree `nonpaged_prefill_attention`
-/// kernel (42.1% of prefill GPU time at 3k —
-/// `docs/reviews/2026-06-11-qwen35-post-license-reprofile-rerank.md`).
+/// kernel (42.1% of prefill GPU time at 3k).
 /// Default ON (licensed 2026-06-11: 3k prefill −36%, multi-shape verified —
 /// see `wins/2026-06-11-qwen35-fa3-prefill-licensed.md`);
 /// `--qwen35-fa3 false` is the same-binary fallback arm. On stub builds
@@ -810,8 +809,7 @@ fn qwen35_fa3_decode_splits() -> usize {
 /// `--qwen35-gdr-chunked true`: route GDN prefill chunks (`seq_len > 1`)
 /// through the FlashQLA chunked kernels (TileLang AOT, sm_90a) instead of
 /// the serial `gated_delta_rule_prefill_recurrent` kernel (28.0% of prefill
-/// GPU time pre-FA3 —
-/// `docs/reviews/2026-06-11-qwen35-post-license-reprofile-rerank.md`).
+/// GPU time pre-FA3).
 /// Default OFF (candidate arm). Only valid on the baked Qwen3.6 single-GPU
 /// shard (H=32/Hg=16/128/128 — the call site additionally shape-guards);
 /// builds without an sm_90 target link NOT_SUPPORTED stubs, so keep the gate

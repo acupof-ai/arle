@@ -3,7 +3,7 @@
 // Replaces flash_api.cpp's torch surface with a C ABI; the param-fill mirrors
 // mha_fwd's non-varlen batch=1 flow exactly (vendor/flash-attention/hopper/
 // flash_api.cpp:849-1198 — set_params_fprop + the scheduler-semaphore block).
-// Step-1 scope (docs/plans/2026-06-11-qwen35-fa3-hd256-adoption.md):
+// Step-1 scope:
 //   - b=1, contiguous q/o, contiguous slot KV viewed at exact seqlen_k
 //     (no seqused_k => is_varlen=false => no prepare_varlen machinery),
 //   - num_splits=1 for prefill; opt-in decode may pass num_splits>1

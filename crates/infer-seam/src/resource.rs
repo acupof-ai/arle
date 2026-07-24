@@ -16,7 +16,7 @@
 //! functions over numbers, no I/O, no backend types, so it keeps infer-seam's
 //! host-only character and is exhaustively unit-testable.
 //!
-//! Consumers (see `docs/plans/unified-resource-budget.md`):
+//! Consumers:
 //! - DSv4 CUDA `kv_budget_num_slots` (slot budget, then NCCL min-reduce)
 //! - Qwen3/Qwen3.5 CUDA (slot budget — the clamp they previously lacked)
 //! - Metal `plan_resource_budget` (page clamp + below-fixed guard)

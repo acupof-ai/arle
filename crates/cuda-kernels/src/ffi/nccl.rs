@@ -1,7 +1,7 @@
 //! Minimal NCCL FFI declarations. Linking is wired in F1 via build.rs.
 //!
-//! Per the F0 multi-GPU plan (docs/plans/2026-04-28-single-node-multi-gpu.md
-//! §4.2), this module declares only the symbol surface required by
+//! Per the F0 multi-GPU plan, this module declares only the symbol surface
+//! required by
 //! `CollectiveBackend::Nccl`. No build-time linkage is performed in F0:
 //! the `extern "C"` block compiles without `libnccl.so` present, and the
 //! actual library hookup lives in F1's `build.rs` work.

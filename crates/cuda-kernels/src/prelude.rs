@@ -11,8 +11,7 @@
 //!    insulated from the underlying module layout.
 //!
 //! 2. **Proto-API for the eventual `cuda-kernels` crate extraction.**
-//!    See `docs/plans/cuda-kernel-crate-extraction.md`. When one of the
-//!    trip wires (FA-3 H100, MLA / DeepSeek-V3, NCCL tensor parallel,
+//!    When one of the trip wires (FA-3 H100, MLA / DeepSeek-V3, NCCL tensor parallel,
 //!    parallel kernel build configs, second consumer of the kernel layer)
 //!    fires, this prelude becomes the public API surface of the extracted
 //!    crate. Every `pub(crate)` below becomes a real cross-crate `pub` —

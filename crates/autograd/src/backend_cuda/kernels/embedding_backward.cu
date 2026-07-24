@@ -10,7 +10,7 @@
 // atomicAdd is MANDATORY — duplicate token ids within one batch are normal
 // (e.g. `the` appears N times in a 1024-token sequence) and must accumulate
 // correctly. Candle's `index_add`/`scatter_add` skip atomics; we cannot
-// vendor those (see docs/research/2026-05-17-candle-kernel-vendor-survey.md).
+// vendor those.
 //
 // Caller MUST zero-initialize `grad_table` before launch (this kernel only
 // adds — matches the `scatter_add_rows_f32` contract).

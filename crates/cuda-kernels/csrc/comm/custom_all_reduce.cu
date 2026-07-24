@@ -2,8 +2,7 @@
 // two-shot cross-device reduction over IPC-shared buffers), plus an ARLE-derived
 // one-shot all-gather kernel reusing the same RankData/Signal/barrier framework.
 //
-// Scope: the isolated comm bench (docs/plans/2026-06-10-dsv4-oneshot-allreduce-
-// isolated-bench.md). Bootstrap is file-rendezvous based (atomic rename), one
+// Scope: the isolated comm bench. Bootstrap is file-rendezvous based (atomic rename), one
 // context per rank process; production integration (TpComm) would reuse the
 // kernels but bootstrap over the multiproc relay instead.
 

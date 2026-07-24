@@ -70,8 +70,8 @@ pub struct TokenKVPool {
     /// scale instead of computing per-(token, head) scales into `k_scales`. The
     /// per-channel scheme reduces K's outlier-channel-dominated quantization
     /// error that catastrophically compounds through Qwen3-dense's 36 layers
-    /// (see `docs/experience/errors/2026-05-26-fp8-kv-step1-divergence-known-deferred.md`
-    /// and `docs/plans/2026-05-26-fp8-kv-per-channel-k-fix.md`). V keeps
+    /// (see `docs/experience/errors/2026-05-26-fp8-kv-step1-divergence-known-deferred.md`).
+    /// V keeps
     /// per-(token, head) scales (KIVI's asymmetric choice — V doesn't have the
     /// channel-outlier structure K does).
     pub k_static_scales: Option<Vec<CudaSlice<f32>>>,
@@ -632,8 +632,7 @@ impl TokenKVPool {
         // audit (wins/2026-05-27-v100-kv-precision-parity-qwen35-4b.md)
         // showed INT8 step-1 divergence from BF16 while FP8 was bit-identical;
         // the discriminator was that FP8 had per-channel K calibration and
-        // INT8 still used per-(token, head) absmax. See
-        // docs/plans/2026-05-27-int8-kv-kivi-per-channel.md.
+        // INT8 still used per-(token, head) absmax.
         let (k_static_scales, k_kivi_calibrated) =
             if matches!(format, KVFormat::FP8E4M3 | KVFormat::INT8 | KVFormat::INT4)
                 && pool_bytes_per_layer > 0

@@ -1,8 +1,7 @@
 """TileLang batch decode HD128 paged attention with FP8 E4M3 KV.
 
 M_b.2 Phase A0 — single-config (q32_kv8 = Qwen3.5-4B) FP8 codegen smoke
-test. Predicates the rest of M_b.2 phasing per
-[`docs/plans/M_b.2-tilelang-hd128-fp8-decode.md`](../../docs/plans/M_b.2-tilelang-hd128-fp8-decode.md).
+test. Predicates the rest of M_b.2 phasing.
 
 Sister to ``batch_decode_paged_hd128.py`` (BF16 KV path landed in
 M_b.1 Phase A — `b42da5d`). Deltas:

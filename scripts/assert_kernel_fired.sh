@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Assert gate — GPU-dispatch-governance Phase 3
-# (docs/plans/gpu-dispatch-governance.md). Turns "链路不通" — an implemented
+# Assert gate — GPU-dispatch-governance Phase 3.
+# Turns "链路不通" — an implemented
 # dispatch path that never actually fired — from a bench-day surprise into a
 # red gate: fail if an EXPECTED dispatch kernel has a runtime count of 0/absent.
 #

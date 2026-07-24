@@ -611,7 +611,7 @@ struct RealMetalExecutor {
     /// Session KV-recall opt-in (`--kv-recall`). When off (default) the decode
     /// hot path does no scoring and `recall_ranges` stays `None` → baseline
     /// byte-identical. Recall is bf16-only; int8 KV falls back to full attention
-    /// (logged once). See `docs/plans/2026-06-23-session-infinite-kv-memory.md`.
+    /// (logged once).
     kv_recall: bool,
     /// Recall budget regions (validated defaults). Carved into sink + recalled
     /// top-k + local; the working set is bounded regardless of history length.

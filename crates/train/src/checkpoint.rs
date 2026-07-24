@@ -291,8 +291,7 @@ impl safetensors::View for OptimTensorView {
 /// sibling directory named `target_basename`. Used by every training
 /// binary's save-checkpoint path so downstream tooling (e.g.
 /// `infer --model-path <out>/latest`) can reference "the most recent
-/// checkpoint" without knowing the step number. Docs/plan:
-/// `docs/plans/train-eval-infer-dx-v1.md` Phase DX-1.
+/// checkpoint" without knowing the step number. Phase DX-1.
 ///
 /// `target_basename` must be a basename (e.g. `"step_000100"`), not a
 /// full path — the symlink is relative so the whole `<parent>/` tree

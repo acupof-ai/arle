@@ -83,7 +83,7 @@ fn validate_sm(spec: &SmSpec, source: &str) {
              ARLE supports T1={{80,86,89,90}} (default), T2={{100,120}} (opt-in), \
              and legacy Volta={{70}} as a separate SM-pinned build. \
              Turing/Pascal/unknown SMs are rejected. \
-             See docs/plans/sm-coverage.md and docs/support-matrix.md. \
+             See docs/environment.md and docs/support-matrix.md. \
              To restrict targets explicitly: TORCH_CUDA_ARCH_LIST=\"8.0;8.6;8.9;9.0\".",
             spec.sm, source
         );
@@ -97,7 +97,7 @@ fn validate_sm_set(sm_targets: &[SmSpec]) {
              Build V100 with TORCH_CUDA_ARCH_LIST=\"7.0\"; build the T1 release binary separately \
              with TORCH_CUDA_ARCH_LIST=\"8.0;8.6;8.9;9.0\". \
              This keeps T1 cubins free of sm_70 fallback code and keeps sm_70 binaries free of \
-             T1/Hopper-only kernels. See docs/plans/sm-coverage.md."
+             T1/Hopper-only kernels. See docs/environment.md."
         );
     }
 }
@@ -194,7 +194,7 @@ fn detect_sm_targets() -> Vec<SmSpec> {
     println!(
         "cargo:warning=No GPU detected and TORCH_CUDA_ARCH_LIST not set; defaulting to T1 SMs (sm_80, sm_86, sm_89, sm_90). \
          To target Blackwell (sm_100, sm_120), set TORCH_CUDA_ARCH_LIST=\"...;10.0\" or \"...;12.0\". \
-         See docs/plans/sm-coverage.md."
+         See docs/environment.md."
     );
     T1_SMS
         .iter()
@@ -1450,7 +1450,7 @@ fn generate_tilelang_artifacts_per_sm(
                  stderr: {}\n\n\
                  Hint: bump tilelang (pin lives in pyproject.toml) OR exclude sm_{sm_token} via:\n  \
                  {suggestion}\n\
-                 See docs/plans/sm-coverage.md.",
+                 See docs/environment.md.",
                 base_spec.kernel_name,
                 String::from_utf8_lossy(&output.stdout).trim(),
                 String::from_utf8_lossy(&output.stderr).trim(),
@@ -1679,7 +1679,7 @@ fn compile_tilelang_aot_kernels(
 
     println!("cargo:rustc-link-lib=cuda");
     println!(
-        "cargo:warning=TileLang AOT: built per-SM cubins for {} target(s) across HD64/HD128/HD256 prefill, HD64/HD128/HD256 decode, and Qwen3.5 GDR; SM dispatch via __thread cache + cuDeviceGetAttribute. See docs/plans/sm-coverage.md.",
+        "cargo:warning=TileLang AOT: built per-SM cubins for {} target(s) across HD64/HD128/HD256 prefill, HD64/HD128/HD256 decode, and Qwen3.5 GDR; SM dispatch via __thread cache + cuDeviceGetAttribute. See docs/environment.md.",
         sm_targets.len()
     );
     if has_legacy_volta(sm_targets) {
@@ -2660,8 +2660,7 @@ fn main() {
     // (Dao-AILab/flash-attention @ fc8cbad6, cutlass pin 71275920). Explicit
     // opt-in (ARLE_CUDA_ENABLE_FA3=1): the 5 fwd instantiation units are
     // nvcc-heavy and build.rs recompiles every .cu on any csrc change, so the
-    // cost is only paid on FA3-target builds. Consumer plan:
-    // docs/plans/2026-06-11-qwen35-fa3-hd256-adoption.md.
+    // cost is only paid on FA3-target builds.
     println!("cargo:rerun-if-env-changed=ARLE_CUDA_ENABLE_FA3");
     let fa3_root = Path::new("vendor/flash-attention");
     let fa3_stub = Path::new("csrc/attention/arle_fa3_stubs.cu");

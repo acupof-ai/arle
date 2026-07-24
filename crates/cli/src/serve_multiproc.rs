@@ -7,7 +7,6 @@
 //! free-running per-request relays desync (`errors/2026-06-10-dsv4-c2-layer2-
 //! lockstep-admission-deadlock.md`). Worker planners must use the SAME config
 //! (serialized via `ARLE_WORKER_ENGINE_CONFIG`): a divergent knob = NCCL deadlock.
-//! See `docs/plans/2026-06-24-multiproc-control-data-plane-redesign.md`.
 
 #![cfg(all(unix, feature = "cuda"))]
 

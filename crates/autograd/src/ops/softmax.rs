@@ -247,8 +247,7 @@ pub(crate) fn log_softmax_backward(
     // `Dirty::Device` tensor, and the upstream gradient flows from
     // `gather_last_dim_backward`'s device override. Skipping the host
     // round-trip here kills the `[B, S, V] × 4 B ≈ 1 GB` DtoH that nsys
-    // identified as the single largest readback per training step (see
-    // `docs/research/2026-05-17-cuda-training-step-nsys-attribution.md`).
+    // identified as the single largest readback per training step.
     let saved_on_device =
         store.tensor(y)?.dirty == Dirty::Device && store.tensor(y)?.device_handle.is_some();
     let upstream_on_device = store.tensor(output_grad_id)?.dirty == Dirty::Device

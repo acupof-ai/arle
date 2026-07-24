@@ -96,8 +96,7 @@ pub fn set_infer_rollout_override(use_infer: bool) {
 /// idle infer engines offload their device weights to host RAM during the
 /// student backward, freeing VRAM so long rollouts (≥256) fit on a 16 GB card.
 ///
-/// The vLLM-sleep-mode / verl HybridFlow equivalent ARLE previously lacked
-/// (see `docs/research/2026-05-29-opd-memory-best-practice.md` Tier 2).
+/// The vLLM-sleep-mode / verl HybridFlow equivalent ARLE previously lacked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EngineOffloadMode {
     /// Default — resident-weights path is unchanged.
@@ -410,8 +409,7 @@ fn greedy_next_token(
     if seq_len == 0 || vocab == 0 {
         return Err(OpdError::InvalidInput(format!(
             "OPD rollout cannot sample next token with seq_len={seq_len}, vocab={vocab}. \
-             Hint: pass a non-empty prompt and a Qwen35Config with vocab_size > 0; \
-             see docs/projects/2026-05-18-opd-only-pivot.md."
+             Hint: pass a non-empty prompt and a Qwen35Config with vocab_size > 0."
         )));
     }
     let expected_len = seq_len.checked_mul(vocab).ok_or_else(|| {
@@ -725,8 +723,7 @@ fn validate_token_ids(context: &str, tokens: &[u32], vocab: usize) -> Result<()>
         return Err(OpdError::InvalidInput(format!(
             "{context} token id {token_id} at {context}[{index}] is outside \
              student.config().vocab_size={vocab}. Hint: verify the tokenizer and \
-             student model directory match before running OPD. See \
-             docs/projects/2026-05-18-opd-only-pivot.md."
+             student model directory match before running OPD."
         )));
     }
     Ok(())
@@ -1070,8 +1067,7 @@ fn validate_loss_value(loss_value: f32) -> Result<()> {
     Err(OpdError::InvalidInput(format!(
         "OPD KL loss became non-finite ({loss_value}). Hint: check teacher/student logits \
          for NaN or Inf, verify both checkpoints use the same tokenizer/model family, and \
-         reduce the learning rate before resuming. See \
-         docs/projects/2026-05-18-opd-only-pivot.md."
+         reduce the learning rate before resuming."
     )))
 }
 
@@ -4577,8 +4573,7 @@ pub fn opd_step_with_teacher_forward_profiled_gkd_anchor<
     if prompt_ids.is_empty() {
         return Err(OpdError::InvalidInput(
             "OPD step requires a non-empty prompt_ids slice. Hint: pass at least \
-             one BOS/chat token; the OPD substrate does not synthesize prompts. \
-             See docs/projects/2026-05-18-opd-only-pivot.md."
+             one BOS/chat token; the OPD substrate does not synthesize prompts."
                 .to_owned(),
         ));
     }
@@ -4596,8 +4591,7 @@ pub fn opd_step_with_teacher_forward_profiled_gkd_anchor<
             "OPD requires teacher/student vocab_size to match, got \
              teacher.vocab_size()={teacher_vocab} and \
              student.config().vocab_size={vocab}. Hint: use model directories \
-             that share the same tokenizer before running OPD. See \
-             docs/projects/2026-05-18-opd-only-pivot.md."
+             that share the same tokenizer before running OPD."
         )));
     }
     validate_token_ids("prompt_ids", prompt_ids, vocab)?;
@@ -4983,7 +4977,6 @@ mod tests {
             assert!(message.contains("non-finite"));
             assert!(message.contains("teacher/student logits"));
             assert!(message.contains("learning rate"));
-            assert!(message.contains("2026-05-18-opd-only-pivot.md"));
         }
     }
 

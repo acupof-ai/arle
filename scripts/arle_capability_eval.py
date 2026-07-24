@@ -2,8 +2,7 @@
 """ARLE capability eval — minimal capability harness against an ARLE serve.
 
 Talks to ARLE's OpenAI v1 surface (`/v1/chat/completions` or `/v1/completions`)
-exposed by `arle serve` / `infer`. Designed for the capability-eval plan
-defined in `docs/plans/2026-05-22-arle-opd-capability-eval-plan.md` P0 phase:
+exposed by `arle serve` / `infer`. Designed for the capability-eval P0 phase:
 
     arle serve --backend cuda --model-path <path> --port 8123 &
     ARLE_BASE_URL=http://localhost:8123 \

@@ -989,7 +989,7 @@ extern "C" __global__ void linear_attention_chunked_scan_backward_f32(
 }
 
 // ── Staged chunk-parallel backward ───────────────────────────────────────────
-// docs/plans/linear-attention-chunked-backward.md. The reverse grad-state
+// The reverse grad-state
 // recurrence is affine in the incoming grad-state:
 //   G_{t-1} = gamma_t (I - beta_t k_t k_t^T) (G_t + q_t dcore_t^T)
 // so a chunk's action collapses to G_out = M_c G_in + B_c with

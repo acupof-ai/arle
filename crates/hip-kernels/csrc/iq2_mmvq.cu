@@ -1,5 +1,5 @@
 // IQ2_XXS / Q2_K mat-vec kernels + q8_1 activation quantization for the
-// AIPC DSv4-Flash 2-bit lane (#76/#77, docs/plans/2026-06-10-hip-backend-mvp.md).
+// AIPC DSv4-Flash 2-bit lane (#76/#77).
 //
 // Adapted from ggml-org/llama.cpp @ d2462f8f (MIT, vendored at
 // vendor/llama.cpp/): mul_mat_vec_q (ggml-cuda/mmvq.cu),

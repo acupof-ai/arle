@@ -1,8 +1,7 @@
 //! Isolated small-message collective bench — one-shot custom AR/AG vs NCCL.
 //!
 //! Measures the EXPOSED latency of the collectives sitting on the DSv4 decode
-//! critical path (2× allreduce + 1× Q-allgather per layer; bf16, 14–450 KB)
-//! per `docs/plans/2026-06-10-dsv4-oneshot-allreduce-isolated-bench.md`.
+//! critical path (2× allreduce + 1× Q-allgather per layer; bf16, 14–450 KB).
 //!
 //! Arms:
 //!   - `nccl`      — plain ncclAllReduce / ncclAllGather (B0 baseline)

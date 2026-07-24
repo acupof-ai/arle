@@ -95,7 +95,7 @@ impl Qwen3LayerTensorNames {
 /// `rope_scaling` schema). `None` ⇒ vanilla RoPE with `rope_theta` base.
 /// Applied during `precompute_rope` to extend native context window.
 ///
-/// Per `docs/plans/M_rope-yarn-scaling.md` Phase 1a:config 接인 only;
+/// Phase 1a:config 接인 only;
 /// inv_freq compute integration (Phase 1b-2) is the codex-pickup work.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]

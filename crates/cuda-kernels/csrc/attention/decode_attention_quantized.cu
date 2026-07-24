@@ -167,7 +167,7 @@ static int choose_decode_num_splits(
 // K/V tiles are double-buffered into shared memory via `cp.async` (mirrors
 // the INT8 sibling at line ~421); the previous version used blocking
 // `__nv_fp8x4_e4m3` global loads from inside the compute loop. GAP-C-cheap
-// (2026-05-28 SOTA audit) — see `docs/research/2026-05-28-arle-kernel-vs-sota-audit.md`.
+// (2026-05-28 SOTA audit).
 // ============================================================================
 extern "C++" {
 template <int HEAD_DIM>

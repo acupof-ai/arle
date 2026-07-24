@@ -1,5 +1,5 @@
 //! HIP backend host substrate for the AIPC DSv4-Flash 2-bit lane (#76/#77,
-//! `docs/plans/2026-06-10-hip-backend-mvp.md` §4 H2/H3).
+//! §4 H2/H3).
 //!
 //! Stage A — residency planner and DSv4 slot/KV bookkeeping over the
 //! `infer-gguf` host substrate (GGUF reader, CPU dequantizers, GGUF→DSv4

@@ -5,9 +5,7 @@
 //   - Scale divisor: 448.0f (e4m3 finite max per IEEE FP8 spec)
 //   - Conversion saturation: CUDA FP8 __NV_SATFINITE
 //
-// Used by NEW prefill-only FP8 directive (per
-// docs/research/2026-05-10-prefill-only-fp8-directive-draft.md
-// Substep PF8.1, ~60 LOC). Per-row absmax scale stored in FP32
+// Used by NEW prefill-only FP8 directive. Per-row absmax scale stored in FP32
 // sidecar tensor for downstream FP8 mma dequant.
 //
 // Why per-row absmax: e4m3 has limited dynamic range (~3 orders of

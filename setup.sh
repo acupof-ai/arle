@@ -596,7 +596,7 @@ do_build() {
                 info "SM targets (auto-detect from nvidia-smi): $detected"
             else
                 info "SM targets: T1 default {sm_80, sm_86, sm_89, sm_90}"
-                info "  set TORCH_CUDA_ARCH_LIST to override; see docs/plans/sm-coverage.md"
+                info "  set TORCH_CUDA_ARCH_LIST to override; see docs/environment.md"
             fi
         fi
         arle_features="cuda,cli"

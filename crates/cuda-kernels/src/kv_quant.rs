@@ -195,8 +195,7 @@ pub fn quantize_paged_kv_fp8(
 /// `[num_kv_heads, head_dim]` f32 scale table (populated via
 /// [`compute_k_per_channel_absmax`] + [`finalize_k_per_channel_scales`])
 /// and quantizes bf16 K → FP8 E4M3 without per-(token, head) absmax
-/// reduction. See
-/// `docs/plans/2026-05-26-fp8-kv-per-channel-k-fix.md` for the rationale.
+/// reduction.
 #[allow(clippy::too_many_arguments)]
 pub fn quantize_paged_kv_fp8_per_channel(
     ctx: &DeviceContext,
@@ -898,8 +897,7 @@ pub fn decode_attention_fp8_per_channel_k(
 
 /// INT8 KIVI decode attention: mirrors [`decode_attention_fp8_per_channel_k`]
 /// but reads INT8 K/V from the pool with cp.async pipelining (same as the
-/// per-(row, head) INT8 sibling). See
-/// docs/plans/2026-05-27-int8-kv-kivi-per-channel.md.
+/// per-(row, head) INT8 sibling).
 #[allow(clippy::too_many_arguments)]
 pub fn decode_attention_int8_per_channel_k(
     ctx: &DeviceContext,

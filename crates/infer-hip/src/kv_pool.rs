@@ -7,7 +7,7 @@
 //! pending/prev-overlap/compressed; CSA layers (1..16) add the same family
 //! at indexer width (overlap always on). Opt-in CUDA states (FlashMLA,
 //! fused-wqkv, DSA-official, DeepGEMM scratch) are datacenter-only and
-//! excluded per `docs/plans/2026-06-10-hip-backend-mvp.md` §2.2.
+//! excluded.
 //!
 //! Host bookkeeping matches `infer-metal/src/kv_pool.rs` semantics exactly
 //! (LIFO free pages, retained pages survive `free_slot`, no extra

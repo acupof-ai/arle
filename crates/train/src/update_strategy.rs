@@ -2,8 +2,6 @@
 //! six orthogonal fields over ONE update path — not a new enum arm; the named
 //! constructors below are the algorithm table. The rollout/scoring harness is
 //! preset-agnostic: it only reads [`UpdatePreset::needs`].
-//!
-//! See docs/plans/2026-07-16-agent-rl-unified-infra.md §C.
 
 use autograd::ops::fused_linear_distill::{PgStats, WeightForm, pg_token_weight};
 use autograd::{TensorId, TensorStore, optim::Optimizer};

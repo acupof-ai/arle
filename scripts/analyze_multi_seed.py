@@ -4,7 +4,7 @@
 Reads summary.json from <out_base>/seed_<N>/ and optionally one or more
 baseline summary.json paths, then reports per-seed accuracy + binomial
 95% CI, across-seed mean/sample-σ, and a verdict against the kill
-criterion in docs/research/2026-05-28-opd-effect-axis-next.md.
+criterion.
 
 Usage:
     python scripts/analyze_multi_seed.py <out_base> [--baseline path ...]

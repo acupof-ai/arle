@@ -509,8 +509,7 @@ fn default_tie_word_embeddings() -> bool {
 /// `rope_scaling` schema). `None` ⇒ vanilla RoPE with `rope_theta` base.
 /// Applied during inv_freq precompute to extend native context window.
 ///
-/// Mirror of `qwen3_spec::RopeScalingConfig`; per
-/// `docs/plans/M_rope-yarn-scaling.md` Phase 1a step 2 (2026-05-09) we
+/// Mirror of `qwen3_spec::RopeScalingConfig`; we
 /// duplicate per-crate to avoid a new shared rope-spec crate. Future
 /// refactor when DeepSeek-V4 or other model needs same enum.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -549,8 +548,7 @@ fn default_yarn_mscale() -> f32 {
 /// Compute the per-dimension RoPE inverse frequencies, optionally scaled
 /// by a long-context `RopeScalingConfig` variant.
 ///
-/// Mirror of `qwen3_spec::compute_scaled_inv_freq` per
-/// `docs/plans/M_rope-yarn-scaling.md` Phase 1b step 2 (2026-05-10).
+/// Mirror of `qwen3_spec::compute_scaled_inv_freq`.
 /// Returns a vector of `head_dim / 2` floats. `scaling = None` reproduces
 /// the standard `inv_freq[i] = 1.0 / base.powf(2*i / head_dim)` formula.
 pub fn compute_scaled_inv_freq(

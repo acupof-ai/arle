@@ -1,7 +1,6 @@
 //! Write-through tiered KV memory policy (device-neutral core).
 //!
-//! The two host-side decisions of the write-through model
-//! (`docs/plans/2026-06-23-writethrough-tiered-kv-memory.md`), as pure functions
+//! The two host-side decisions of the write-through model, as pure functions
 //! so they are fully unit-testable with no device types:
 //!
 //! 1. [`prefetch_blocks`] — at a turn's prefill, score every non-resident

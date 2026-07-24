@@ -1,9 +1,7 @@
 #!/usr/bin/env bash
 # First-class SGLang baseline runner for the ARLE 32k long-context benchmark.
 #
-# Pinned against the audited SGLang revision from:
-#   docs/plans/2026-04-23-cuda-decode-sglang-alignment.md
-#   docs/projects/2026-04-30-longctx-32k-128k-leadership.md Phase 1 S4
+# Pinned against the audited SGLang revision (Phase 1 S4).
 #
 # Usage:
 #   scripts/bench_sglang_longctx.sh <label>

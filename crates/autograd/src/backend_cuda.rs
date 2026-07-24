@@ -1758,8 +1758,7 @@ impl Backend for CudaBackend {
     /// unevaluated `CudaSlice<f32>` outputs — no host roundtrip on either
     /// side. The terminal `backend.eval(...)` in `AdamW::step_device`
     /// performs the single host fence per training step (M5.3b.11
-    /// batched-eval contract). See
-    /// `docs/research/2026-05-17-cuda-training-architectural-correction.md`.
+    /// batched-eval contract).
     fn matmul_backward_device(
         &self,
         a: &DeviceHandle,
@@ -1882,8 +1881,7 @@ impl Backend for CudaBackend {
     /// `CudaSlice<f32>` for the sum (so the previous `dest` handle remains
     /// valid for any tape consumers still holding it) and launches the
     /// `add_into_f32` 1D NVRTC kernel. Returns the unevaluated handle for
-    /// the batched terminal `eval`. See
-    /// `docs/research/2026-05-17-cuda-training-architectural-correction.md`.
+    /// the batched terminal `eval`.
     fn add_into_device(
         &self,
         dest: &DeviceHandle,
@@ -2474,8 +2472,7 @@ impl Backend for CudaBackend {
     /// `log_softmax_last_axis`. Consumes the saved forward output
     /// directly from its `DeviceHandle` (no DtoH) and the upstream gradient
     /// directly from device — kills the `1 015 MB` log_softmax-grad readback
-    /// nsys identified as the single largest transfer per training step
-    /// (see `docs/research/2026-05-17-cuda-training-step-nsys-attribution.md`).
+    /// nsys identified as the single largest transfer per training step.
     /// Returns an unevaluated `CudaSlice<f32>` handle per the M5.3b.11
     /// batched-eval contract — `Tape::backward`'s terminal eval (or the
     /// AdamW step) does the single host fence.
@@ -4640,8 +4637,7 @@ fn cuda_linear_attention_backward_device_row(
             },
         )?;
     } else {
-        // Staged chunk-parallel backward
-        // (docs/plans/linear-attention-chunked-backward.md): stage 1 emits the
+        // Staged chunk-parallel backward: stage 1 emits the
         // per-chunk affine grad-state transfer (M_c, B_c) in parallel over
         // chunk x row blocks, stage 2 runs the num_chunks-step boundary carry,
         // stage 3 replays the exact per-token grad pass per chunk in parallel.

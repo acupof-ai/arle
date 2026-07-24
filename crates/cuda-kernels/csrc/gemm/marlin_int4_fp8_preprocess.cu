@@ -13,9 +13,7 @@
 // AWQ variant SKIPPED for PF8.2 (ARLE has no AWQ checkpoint loader);
 // add later if AWQ format support lands.
 //
-// Used by NEW prefill-only FP8 directive (per
-// docs/research/2026-05-10-prefill-only-fp8-directive-draft.md
-// Substep PF8.2, ~120 LOC).
+// Used by NEW prefill-only FP8 directive (Substep PF8.2, ~120 LOC).
 //
 // License: Apache 2.0 (per vLLM upstream `marlin.cu` attribution)
 // Adapted from: https://github.com/vllm-project/vllm/blob/main/csrc/quantization/marlin/marlin_int4_fp8_preprocess.cu

@@ -11,8 +11,7 @@
 //! kernel then attends exactly the working set, and RoPE is already baked into
 //! the cached K, so the non-contiguous page subset is correct.
 //!
-//! Under the write-through model
-//! (`docs/plans/2026-06-23-writethrough-tiered-kv-memory.md`, supersedes the swap
+//! Under the write-through model (supersedes the swap
 //! plan), this module owns the **decode attend-resident** verb (the restricted
 //! page table), the **R6 reps** (mean-pooled K kept resident, computed once a
 //! block freezes — exactly the write-through-time rep), AND the **evict-drop

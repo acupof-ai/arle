@@ -2,8 +2,8 @@
 //!
 //! Mirrors [`crate::download`]'s public shape but talks to ModelScope's REST
 //! API instead of HuggingFace Hub. This exists because the ARLE OPD substrate
-//! (see `docs/projects/2026-05-18-opd-only-pivot.md`) needs PRC-friendly
-//! weight fetch — HF is sometimes throttled or blocked from PRC networks
+//! needs PRC-friendly weight fetch — HF is sometimes throttled or blocked from
+//! PRC networks
 //! while ModelScope hosts the same Qwen/etc. checkpoints first-party.
 //!
 //! Why a sibling module and not an `hf-hub` endpoint swap? `hf-hub` formats

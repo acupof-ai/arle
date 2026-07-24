@@ -28,9 +28,7 @@ session sharing the same 1024-token prefix, plus ~102 unique cold requests.
 PrefixAwareAdmission should reject ~102 cold under cold_soft_cap pressure
 and admit the warm-session continuations directly.
 
-Companion to docs/research/2026-05-10-36-prefix-aware-admission-substrate-
-complete-bench-pending.md "Open question — does this workload actually
-exercise the gate".
+Addresses the open question: does this workload actually exercise the gate.
 
 Per kernel-optimization skill v1.9.0 anti-pattern #6 ("license on capture
 exists not capture reused"): #26 added "smoke-test small-shape ≠ production-
