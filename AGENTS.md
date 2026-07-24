@@ -368,26 +368,17 @@ mechanical changes.
 
 ### Docs lifecycle & progress spine
 
-- **Per-file status header is the truth.** Every `docs/plans/` +
- `docs/projects/` doc carries `> Status: Active | Shipped | Superseded by
- <link> | Killed — <date>` directly under its title; `docs/index.md` tables
- are pointers only and carry no narrative state snapshots (they rot against
- ROADMAP — the 2026-06-10 index snapshot contradicted it by 06-21). Migrate
- legacy docs on touch, not in bulk.
 - **CHANGELOG is the progress spine.** Three event classes land a CHANGELOG
  line the same day, linking the wins/errors entry: **phase exit · default
  flip · accept-or-reject verdict**. Phase exits also cut a release tag; a tag
  without its CHANGELOG section is a regression (v0.1.5→v0.2.1 backfilled
  2026-07-02).
-- **Weekly resync (~30 min):** ① ROADMAP phase table ↔ GitHub issues (issues
- win); ② index "Active" sweep — Active docs untouched for 30 days get
- confirmed or moved to Archived; ③ CHANGELOG catch-up for the week's three
- event classes; ④ promote errors/wins patterns recurring ≥3× into
- §Distilled lessons; ⑤ wins-cap headroom — when the top-level count is
- within ~20 of the `check_repo_hygiene` cap, archive the oldest
- zero-inbound-reference entries (verify per basename via `git grep`) so
- the ratchet batches here instead of blocking mid-week pushes (it tripped
- twice on 2026-07-02). Bench-entry drift probe: diff
+- **Weekly resync (~30 min):** ① CHANGELOG catch-up for the week's three event
+ classes; ② promote errors/wins patterns recurring ≥3× into §Distilled lessons;
+ ③ wins-cap headroom — when the top-level count is within ~20 of the
+ `check_repo_hygiene` cap, archive the oldest zero-inbound-reference entries
+ (verify per basename via `git grep`) so the ratchet batches here instead of
+ blocking mid-week pushes. Bench-entry drift probe: diff
  `git log --since='7 days ago' --oneline -- 'crates/infer-*/src' crates/cuda-kernels/csrc`
  against the same for `docs/experience/`.
 
@@ -441,10 +432,9 @@ mechanical changes.
 
 ### GPU kernel work
 
-Touching `crates/cuda-kernels/csrc/` or `crates/mlx-sys/src/` hot paths? Evaluate
-against the project-specific heat map in
-`docs/reviews/kernel-registry.md`.
-Measure with `ncu` (CUDA) or Xcode Metal capture / MLX instruments (Metal).
+Touching `crates/cuda-kernels/csrc/` or `crates/mlx-sys/src/` hot paths? Measure
+with `ncu` (CUDA) or Xcode Metal capture / MLX instruments (Metal) before and
+after — no kernel change ships without a measured before/after.
 
 ### Distilled lessons (cross-module, recurring ≥3 entries)
 
@@ -483,8 +473,7 @@ Measure with `ncu` (CUDA) or Xcode Metal capture / MLX instruments (Metal).
 
 - **Always-load:** auto-memory index + latest 3 of `docs/experience/errors/` and
  `docs/experience/wins/`.
-- **On-demand:** `docs/plans/`, `docs/projects/`, `docs/research/`, full
- experience entries, `ROADMAP.md`.
+- **On-demand:** full `docs/experience/` entries.
 - **User correction → write preventive feedback memory before resuming.**
 
 Experience entry skeletons:

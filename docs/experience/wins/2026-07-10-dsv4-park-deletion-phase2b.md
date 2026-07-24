@@ -7,7 +7,7 @@
 
 ## Context
 
-Plan: `docs/plans/2026-07-09-dsv4-kv-reuse-seam-refactor.md` Phase 2b. The
+Phase 2b of the DSv4 KV-reuse seam refactor. The
 whole-slot park (`demote_slot`/`promote_slot` via `Dsv4SlotSnapshot`/
 `Dsv4LayerImage` 16 MiB blobs) was the last Route-B serialization consumer —
 a second position-exact capture path parallel to the 2a content-keyed

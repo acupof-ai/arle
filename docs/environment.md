@@ -227,9 +227,7 @@ Silicon tier (40/40 on base/pro, 50/50 on Max/Ultra) — see
 bench at c≥8**: export `MLX_MAX_OPS_PER_BUFFER=200
 MLX_MAX_MB_PER_BUFFER=200`. With Qwen3.6 MoE forward at c≥8, the MLX
 defaults force 4–5 implicit `commandBuffer.commit()` per decode step;
-boosting them collapses the cliff at c=8→c=10. Per
-`docs/research/2026-05-07-mlx-ecosystem-survey-c4-itl-gap.md`
-technique #2.
+boosting them collapses the cliff at c=8→c=10.
 
 ```bash
 MLX_MAX_OPS_PER_BUFFER=200 \
@@ -294,8 +292,7 @@ binds to. Single integer, default `0`. Parse failures are a hard error.
 Single-GPU runtime path (default): one `DeviceContext::new()` per process,
 honours this variable.
 
-Multi-GPU TP path (F1+, see
-`docs/plans/2026-04-28-single-node-multi-gpu.md`):
+Multi-GPU TP path (F1+):
 each rank thread bypasses this variable and calls
 `DeviceContext::on_device(ordinal)` directly with its assigned ordinal.
 
@@ -383,7 +380,7 @@ as diagnostics and validation gates, not stable tuning API.
 |---|---|---|---|
 | `ARLE_DSV4_MOE_BACKEND` (alias `ARLE_DSV4_MOE_TRANSPORT`) | `allreduce` (default), `deepep`, `deepep_ll` | `allreduce` | Selects the DSv4 MoE transport (`infer-cuda/src/dsv4.rs::dsv4_use_deepep_transport`). `allreduce` = local routed experts + EP all-reduce (the licensed default). `deepep` / `deepep_ll` = NVSHMEM token-owned DeepEP paths; B=1 deepep_ll is fixed (`b5f00399`) but the batched lane license is open (#61) — not default-worthy yet. |
 | `ARLE_DSV4_INCREMENTAL_KV` | `1` / unset | unset | Enables the incremental DSv4 KV state path used by the 8-rank HTTP bring-up. |
-| `ARLE_DSV4_LM_HEAD_SHARD` | `1` / unset | unset | Opt-in decode perf experiment (#99, [6ms plan H3](plans/2026-07-02-dsv4-6ms-token-plan.md)): row-shards lm_head across TP ranks (contiguous 128-aligned vocab slices, uniform-padded), replacing the replicated full-vocab GEMV per rank. Greedy sampling merges per-rank `(max, argmax)` via one 8-byte host all-gather (exact vs replicated argmax, lowest-index tie rule); non-greedy all-gathers the bf16 logit slices to full vocab before the standard sampler. TP=1 no-ops (byte-identical). Refuses MTP spec decode and `ARLE_PROBE_TOKEN_ENTROPY` at load (full-vocab batched lm_head consumers); `INFER_DSV4_DUMP_TOPK*` is skipped on this path. Off by default — license pending pod A/B + needle gate. |
+| `ARLE_DSV4_LM_HEAD_SHARD` | `1` / unset | unset | Opt-in decode perf experiment (#99): row-shards lm_head across TP ranks (contiguous 128-aligned vocab slices, uniform-padded), replacing the replicated full-vocab GEMV per rank. Greedy sampling merges per-rank `(max, argmax)` via one 8-byte host all-gather (exact vs replicated argmax, lowest-index tie rule); non-greedy all-gathers the bf16 logit slices to full vocab before the standard sampler. TP=1 no-ops (byte-identical). Refuses MTP spec decode and `ARLE_PROBE_TOKEN_ENTROPY` at load (full-vocab batched lm_head consumers); `INFER_DSV4_DUMP_TOPK*` is skipped on this path. Off by default — license pending pod A/B + needle gate. |
 | `ARLE_DSV4_OPERATOR_TRACE` | `1` / unset | unset | Enables the same CUDA-synchronizing DSv4 operator aggregate in `request_trace` JSON without emitting every per-layer event log line. The field is `dsv4_operator_trace_process_delta` and is valid for single-inflight profiling only. |
 | `ARLE_DSV4_OPERATOR_TRACE_EVENTS` | `1` / unset | unset | With `ARLE_DSV4_OPERATOR_TRACE=1`, also emits the legacy `dsv4_trace layer=... phase=...` event log lines. |
 | `ARLE_DSV4_COUNT_EXCHANGE` | `allgather`, `sendrecv` | `allgather` | Selects the tiny per-layer route-count exchange. `sendrecv` keeps the older grouped P2P fallback. |
@@ -468,7 +465,7 @@ export TORCH_CUDA_ARCH_LIST="9.0+PTX" # PyTorch +PTX suffix
 export CMAKE_CUDA_ARCHITECTURES="80;86;89;90" # CMake alias
 ```
 
-**Tier policy** (see [`plans/sm-coverage.md`](environment.md)):
+**Tier policy**:
 
 - T1 (default): `sm_80 / 86 / 89 / 90` — A100 / A10·3090 / L4·4090 / H100.
 - T2 (opt-in): `sm_100 / 120` — B100·B200 / RTX 5090. Must be requested

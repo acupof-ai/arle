@@ -67,7 +67,7 @@ export NCCL_DEBUG=WARN
   --spec-type mtp
 ```
 
-Bench (canonical, unmodified wrapper — locked params, `docs/plans/guidellm-integration.md` §3):
+Bench (canonical, unmodified wrapper — locked params):
 
 ```bash
 scripts/bench_guidellm.sh dsv4-mtp-tp4 \

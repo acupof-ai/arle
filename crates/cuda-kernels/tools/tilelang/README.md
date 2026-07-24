@@ -2,8 +2,7 @@
 
 Build-time AOT for CUDA kernels generated from TileLang. The CUDA feature
 uses TileLang as the only AOT compiler surface for paged attention and Qwen3.5
-chunk-wise GDR. See `docs/plans/tilelang-integration.md` and
-`docs/plans/2026-05-05-cuda-kernel-tilelang-unification.md` for the full plan.
+chunk-wise GDR.
 
 ## What this covers
 
@@ -53,8 +52,6 @@ via the standard PyTorch env var:
 export TORCH_CUDA_ARCH_LIST="9.0"               # H100 only
 export TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0"   # T1 fat binary
 ```
-
-See [`docs/plans/sm-coverage.md`](../../../../docs/plans/sm-coverage.md) for tier policy.
 
 ## Build
 
@@ -116,5 +113,4 @@ the production Metal executor remains `crates/mlx-sys`.
 
 If `tilelang.compile(...)` cannot AOT-export for a target SM, or if the prefill
 kernel cannot express paged-KV BatchPrefill in the version pinned, the
-generator exits non-zero and the build fails loudly. See
-`docs/plans/tilelang-integration.md` §5 for the recorded error path.
+generator exits non-zero and the build fails loudly.

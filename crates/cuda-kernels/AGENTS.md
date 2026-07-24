@@ -13,7 +13,7 @@ touching anything under `crates/cuda-kernels/`.
 
 ## Why this crate exists
 
-See `docs/architecture.md` + `docs/plans/cuda-kernel-crate-extraction.md`.
+See `docs/architecture.md`.
 Short version: the 2026-04-15 Route-A revert turned the old four-shell
 split into one kernel crate. `infer/src/backend/cuda.rs` is now a ~15-line
 `pub use` shim over this crate, so the 60+ existing `crate::backend::cuda::…`
@@ -123,7 +123,7 @@ Removing a symbol is **encouraged** if it stops meeting the three criteria.
 - **SM auto-detection order:** `TORCH_CUDA_ARCH_LIST` → `CMAKE_CUDA_ARCHITECTURES`
   → `nvidia-smi --query-gpu=compute_cap` → T1 default set `{80, 86, 89, 90}`.
   Always emit a `cargo:warning` on the T1-default fallback.
-- **Tier policy** (canonical: [`docs/plans/sm-coverage.md`](../../docs/plans/sm-coverage.md)):
+- **Tier policy:**
   T1 `{80, 86, 89, 90}` default-built; T2 `{100, 120}` opt-in via env var;
   legacy Volta `{70}` is SM-pinned for the V100 Qwen3.5 BF16 attention + GDR
   lane; other T3 `< 80` SMs panic at build time. Adding a new SM = update the
@@ -172,8 +172,6 @@ Removing a symbol is **encouraged** if it stops meeting the three criteria.
 - Historical external attention wrappers are removed; do not recreate them.
 - `csrc/attention/prefill_attention_paged_prep.cu` holds the paged-only
   prefill prep kernels that do QK norm + RoPE and write K/V directly into HND pages.
-- When optimizing, check the heat map in
-  `docs/reviews/2026-04-14-cuda-kernel-six-principles-review.md` first.
 
 ## `no-cuda` gotchas
 
@@ -198,10 +196,8 @@ With `--features cuda,no-cuda`:
   (`ffi/mla.rs` + `csrc/attention/mla_decode.cu`) was removed as dead code.
   New MLA attention should use TileLang AOT, cute-DSL, or a
   hand CUDA kernel; do not reintroduce external attention wrappers. The DSV4
-  small-substrate SKUs in
-  [`docs/plans/2026-05-05-deepseek-v4-small-substrate.md`](../../docs/plans/2026-05-05-deepseek-v4-small-substrate.md)
-  §6.1.1 use smaller dims and need a different kernel (cute-DSL or hand-port);
-  tracked as future work in that plan.
+  small-substrate SKUs use smaller dims and need a different kernel (cute-DSL or
+  hand-port) — future work.
 
 ## State-mutating change — enumerate every device buffer (事无巨细)
 
@@ -299,12 +295,5 @@ the full enumeration forced it).
 
 - `src/prelude.rs` — the full discipline rule, in-code comments.
 - `docs/architecture.md` §Future Evolution — Option A → Option B story.
-- `docs/plans/cuda-kernel-crate-extraction.md` — full extraction blueprint.
-- `docs/plans/2026-04-28-single-node-multi-gpu.md` — `CollectiveBackend`
-  method-set rationale + F0–F4 scaffold roadmap.
-- `docs/plans/2026-05-01-mla-kernel-design.md` — MLA kernel family
-  layout (P0'' future).
-- `docs/reviews/2026-04-14-cuda-kernel-six-principles-review.md` — kernel
-  optimization heat map.
 - `docs/experience/wins/2026-04-15-route-a-cuda-internal-hygiene.md` —
   what the ffi split + prelude landed, and why.

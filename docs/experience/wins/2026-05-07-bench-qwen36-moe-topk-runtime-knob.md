@@ -120,8 +120,8 @@ the win comes from exposing it, not from inventing new behavior.
 - **Quality eval** for top_k=6: small MMLU/HumanEval subset on
   Qwen3.6 35B-A3B-4bit. Defer flag-flip-to-default until quality
   delta confirmed <3%.
-- **M_e.7 MTP head wiring** (`docs/plans/M_e7-mtp-head-wiring.md`)
-  remains the highest-ROI next-tier lever (predicted ~40% c=1
+- **M_e.7 MTP head wiring** remains the highest-ROI next-tier lever
+  (predicted ~40% c=1
   reduction, multiplicative with M_e.4 + this commit).
 - **DFlash with tiny dense draft** unblocked by today's M_e.6
   viability check (Qwen3-0.6B-4bit at 200 tok/s clears the bar).

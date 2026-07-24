@@ -3,9 +3,7 @@
 This document is the canonical source for ownership boundaries, dependency
 direction, and crate-admission governance. New contributors: start at
 [onboarding.md](onboarding.md) (30 min). For "what files exist and where
-to start reading", see [codebase-map.md](codebase-map.md). For the
-extraction story behind `crates/cuda-kernels`, see
-`docs/reviews/kernel-registry.md`.
+to start reading", see [codebase-map.md](codebase-map.md).
 
 Project framing (also in [index.md](index.md) §Current Positioning): the
 `infer-*` crate graph owns serving/runtime truth, `arle` is the local front
@@ -139,9 +137,8 @@ drives the feature generically, backends opt in by overriding, and
 non-participating backends are untouched (`0`/`false`/no-op defaults keep
 the baseline byte-for-byte). The cost is a wide trait (~15 methods today)
 whose capability×backend×model coverage must stay documented (the parity
-matrix above). Regrouping into capability traits is trigger-gated — see
-[refactor roadmap](plans/2026-06-12-architecture-refactor-roadmap.md) R6;
-do not pre-split speculatively.
+matrix above). Regrouping into capability traits is trigger-gated; do not
+pre-split speculatively.
 
 ### Engine-core crate boundaries
 
@@ -167,9 +164,7 @@ do not pre-split speculatively.
 | PP (pipeline) | microbatch ring in `infer-core` + stage-aware executor | the one known gap — single-inflight assumption must be revisited |
 
 CUDA TP=8 / EP=8 (DeepGEMM FP8 MoE + DeepEP) is live in `infer-cuda` for
-DeepSeek-V4-Flash; PP is not yet wired into a forward path. Multi-GPU
-sequencing is tracked in
-`projects/2026-06-03-multigpu-port-roadmap.md`.
+DeepSeek-V4-Flash; PP is not yet wired into a forward path.
 
 ## Backend Split
 
@@ -180,8 +175,7 @@ sequencing is tracked in
 - `cpu`: development-oriented serial backend for smoke tests, CLI wiring, and
  end-to-end validation on non-GPU machines.
 - `hip`: experimental AIPC lane (AMD ROCm) — DSv4 GGUF 2-bit shim-portable
- forward; on-box validation pending-remote
- ([runbook](plans/2026-06-11-hip-onbox-runbook.md)).
+ forward; on-box validation pending-remote.
 - `vulkan`: experimental AIPC skeleton (cross-vendor) — seam impls + host
  order pins; device execution pending the shader ABI.
 
@@ -207,11 +201,9 @@ parity in another.
 
 The HIP/Vulkan columns describe the experimental AIPC lane (#76/#77): seam
 impls compile and test on any host (device layers stub off-feature); HIP
-device validation is pending-remote per the
-[on-box runbook](plans/2026-06-11-hip-onbox-runbook.md), Vulkan device
-execution pends the shader ABI. The lane started ahead of strategy v2
-Phase 3 ordering — ratification pending
-([roadmap §6](plans/2026-06-12-architecture-refactor-roadmap.md)).
+device validation is pending-remote, Vulkan device execution pends the
+shader ABI. The lane started ahead of strategy v2 Phase 3 ordering —
+ratification pending.
 
 Evidence pointers:
 
@@ -263,26 +255,19 @@ DeepGEMM MoE + DeepEP). The DSv4 contract scaffold lives in
 `crates/deepseek-spec`. GLM-5.2 (`glm_moe_dsa`, DSv4-V3.2-DSA family, 256
 experts) is the in-flight DSv4-family addition riding the same CUDA path via
 an adapter — forward tranches landed, verification pending-remote (not
-production-verified). Multi-GPU sequencing is tracked in
-`projects/2026-06-03-multigpu-port-roadmap.md`.
+production-verified).
 
 DSv4 decode is under active kernel optimization on 8×H20 (adopt-best-first):
 gated, license-or-kill on a same-load resident A/B at the B=1 SLO shape, with
 KV-precision parity (`agent-bench::dsv4_kv_precision_parity`) as the
 precondition for any default flip. Landed gated: FlashMLA fused sparse decode,
-FP8 fused `wqkv_a`, contiguous active-row MoE layout. Lever sequencing +
-SGLang-reference adopt plan:
-`plans/2026-06-05-dsv4-endgame-architecture-adopt-best-first.md`
-and `plans/2026-06-05-sglang-dsv4-decode-overlap-adopt-plan.md`.
+FP8 fused `wqkv_a`, contiguous active-row MoE layout.
 Prefill at production shapes is in repair (a MoE padded-layout i32 work-size
 overflow at >~1560 tokens).
 
 Qwen3.6 hybrid+MoE now serves on CUDA (FP8 MoE via DeepGEMM, batched paged
 decode — no longer Metal-only); the next DSv4-family in-flight addition is
-GLM-5.2 (verification pending-remote). The canonical model ranking and
-rationale live in
-[`ROADMAP.md` §Next-Model Priority Order](../ROADMAP.md#next-model-priority-order),
-with current support status in
+GLM-5.2 (verification pending-remote). Current model support status lives in
 [`docs/support-matrix.md` §3](support-matrix.md#3-model-family-matrix).
 
 ## Speculative Decode Framework
@@ -301,13 +286,10 @@ The historical caveats still bound any port:
  correctness-first verifier ran the target paged decode once per verifier
  position; a packed K+1 verifier (or MagicDec sparse-KV self-spec) is the
  prerequisite for a throughput lift. See
- `docs/projects/2026-04-30-longctx-32k-128k-leadership.md`
- §13 and
  `docs/experience/errors/2026-05-01-phase2-real-spec-regression.md`.
 - For Qwen3.5 / Medusa the gate is recurrent-state rollback: paged KV can be
  truncated, but hybrid linear-attention recurrent state needs a model-owned
- accepted-length commit/rollback. See
- `docs/plans/M_medusa-phase1b-qwen35-v2-snapshot-ring-redesign.md`.
+ accepted-length commit/rollback.
 
 ## Route-A Note (Historical)
 

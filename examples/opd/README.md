@@ -78,8 +78,7 @@ rank 32 / alpha 64, cosine LR, and teacher offload.
 `sample-prompts.jsonl` ships 20 short real-text prompts and is referenced by
 the example train binaries. The current `arle train opd` CLI accepts only
 `--prompt-ids` (comma-separated token IDs); a first-class `--prompts-file`
-flag is tracked as Phase 7 of the
-[Qwen3.5-9B→0.8B distillation plan](../../docs/plans/2026-05-21-arle-opd-qwen35-9b-to-08b-distillation-plan.md).
+flag is not yet wired.
 
 ## Example data files
 

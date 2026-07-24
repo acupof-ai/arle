@@ -10,8 +10,7 @@
 Reland of DSv4 cross-request prefix reuse: host-resident `Dsv4PrefixStatePool`,
 content-keyed by host page id, written once per completed page from the
 executor choke point, restored on radix prefix match, spilled to L3 mmap under
-the `--kv-dram` share. Plan: `docs/plans/2026-07-09-dsv4-kv-reuse-seam-refactor.md`
-Phase 2. The first pod round FAILED E2 (warm resends 40-60% corrupt,
+the `--kv-dram` share. The first pod round FAILED E2 (warm resends 40-60% corrupt,
 `'738'` early-EOS + `291→292` digit subs, cache-off control clean).
 
 ## E2 root cause — byte-proven, then fixed
