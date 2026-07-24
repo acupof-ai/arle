@@ -1,0 +1,21 @@
+crates/train/src/cc_harness.rs
+  s_426dd051cb7592::t_d77eccd18c19ea 13,223-226,238,240,242-246,290-292,302-307
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "93bb177263d3df6f71eba22e2c0b48d8b123443d",
+  "prompts": {},
+  "sessions": {
+    "s_426dd051cb7592": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-af5121894873cdc62",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
