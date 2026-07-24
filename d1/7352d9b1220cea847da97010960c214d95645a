@@ -1,0 +1,209 @@
+crates/agent/src/lib.rs
+  s_3a5e68fac5570b::t_505038bfdc8d41 149,185-186
+crates/autograd/examples/bench_step_matmul.rs
+  s_3a5e68fac5570b::t_7ca7a2a4d2cf29 3
+crates/autograd/src/backend.rs
+  s_bbea03a69e1def::t_f1dad347e663b5 635,714,854,1014,1109,1136,1491,1957-1958
+crates/autograd/src/backend_cuda.rs
+  s_7ef194cc396a52::t_d7c756436e98b9 1761,1884,2475,4640
+crates/autograd/src/backend_cuda/kernels/add_into.cu
+  s_3a5e68fac5570b::t_c12fcbe13a1d09 6
+crates/autograd/src/backend_cuda/kernels/attention_decode_online.cu
+  s_ba0fe4e04f1134::t_5ebfe96ceb325d 31
+crates/autograd/src/backend_cuda/kernels/embedding_backward.cu
+  s_3a5e68fac5570b::t_efc2900a4e53e6 13
+crates/autograd/src/backend_cuda/kernels/linear_attention.cu
+  s_3a5e68fac5570b::t_c205f992a027c2 992
+crates/autograd/src/backend_metal.rs
+  s_3a5e68fac5570b::t_d5d5669ff204ab 36-37
+crates/autograd/src/ops/matmul.rs
+  s_ba0fe4e04f1134::t_090b195378ae17 153
+crates/autograd/src/ops/reduce.rs
+  s_3a5e68fac5570b::t_c523f0818d7813 239
+crates/autograd/src/ops/softmax.rs
+  s_3a5e68fac5570b::t_39d679e9d133e1 250
+crates/autograd/src/optim.rs
+  s_7ef194cc396a52::t_4367418c0c3241 550
+crates/autograd/src/tape.rs
+  s_7ef194cc396a52::t_44844387b2e213 564,952
+crates/autograd/src/tensor.rs
+  s_3a5e68fac5570b::t_ec9a2b0e3eec84 833
+crates/autograd/tests/test_cuda_lazy_ops.rs
+  s_7ef194cc396a52::t_1655ec8a0d9d96 378
+crates/autograd/tests/test_device_handle.rs
+  s_3a5e68fac5570b::t_25d5764e2f2aba 104
+crates/cli/src/modelscope.rs
+  s_bbea03a69e1def::t_d9f8d9099e8243 5-6
+crates/cli/src/trace.rs
+  s_7ef194cc396a52::t_3a084a3987c194 3
+crates/cuda-kernels/build.rs
+  s_369a57354b1459::t_f41a8619146db0 86,100,197,1453,1682,2663
+crates/cuda-kernels/csrc/attention/arle_fa3_shim.cu
+  s_7ef194cc396a52::t_dc8d272fe5260b 6
+crates/cuda-kernels/csrc/attention/decode_attention_quantized.cu
+  s_3a5e68fac5570b::t_333b89e116cc97 170
+crates/cuda-kernels/csrc/attention/dsv4_flashmla_decode_build_indices.cu
+  s_8e4cfefd6558c7::t_1770734129f97a 5
+crates/cuda-kernels/csrc/comm/custom_all_reduce.cu
+  s_3a5e68fac5570b::t_46e5f9b208b33a 5
+crates/cuda-kernels/csrc/gemm/gemv.cu
+  s_7ef194cc396a52::t_05408ce345762f 446
+crates/cuda-kernels/csrc/gemm/marlin_int4_fp8_preprocess.cu
+  s_bbea03a69e1def::t_9ef2b2b349bf1e 16
+crates/cuda-kernels/csrc/gemm/w4_fp8_activation_quant.cu
+  s_3a5e68fac5570b::t_c10f3d16a5d873 8
+crates/cuda-kernels/csrc/kv/kv_quant.cu
+  s_8e4cfefd6558c7::t_10c00ae26c7f24 983
+crates/cuda-kernels/src/attention.rs
+  s_3a5e68fac5570b::t_7542f1ee6e8c99 6
+crates/cuda-kernels/src/ffi/attention.rs
+  s_7ef194cc396a52::t_d6e1835b0568a9 478,635,737
+crates/cuda-kernels/src/ffi/kv.rs
+  s_bbea03a69e1def::t_df914e14a158d6 177
+crates/cuda-kernels/src/ffi/misc.rs
+  s_3a5e68fac5570b::t_637e34e4bd138e 662
+crates/cuda-kernels/src/ffi/nccl.rs
+  s_bbea03a69e1def::t_8d866527bff7d1 3-4
+crates/cuda-kernels/src/kv_quant.rs
+  s_3a5e68fac5570b::t_a2b98a5cd9f59f 198,900
+crates/cuda-kernels/src/paged_kv.rs
+  s_7ef194cc396a52::t_ecaee90313e748 73-74,635
+crates/cuda-kernels/src/prelude.rs
+  s_bbea03a69e1def::t_1347a4255a1f3d 14
+crates/cuda-kernels/tools/tilelang/batch_decode_paged_hd128_fp8.py
+  s_3a5e68fac5570b::t_4565b61a01fab0 4
+crates/cuda-kernels/tools/tilelang/gated_delta_rule.py
+  s_8e4cfefd6558c7::t_f1cd8f54d78015 3
+crates/hip-kernels/build.rs
+  s_3a5e68fac5570b::t_3b7b8cf43c2391 2
+crates/hip-kernels/csrc/arle_hip_shim.h
+  s_7ef194cc396a52::t_8c57c7f7cb4eab 2
+crates/hip-kernels/csrc/iq2_mmvq.cu
+  s_7ef194cc396a52::t_f29f3ce2150152 2
+crates/hip-kernels/src/lib.rs
+  s_3a5e68fac5570b::t_b708143df2bd41 2
+crates/hip-sys/src/lib.rs
+  s_8e4cfefd6558c7::t_cff224cafa3340 14
+crates/infer-core/src/writethrough.rs
+  s_8e4cfefd6558c7::t_d4c604b570a7e7 3
+crates/infer-cuda/Cargo.toml
+  s_7ef194cc396a52::t_ba7f797ea09d14 68
+crates/infer-cuda/examples/comm_bench.rs
+  s_ba0fe4e04f1134::t_563ca2f5d08f64 4
+crates/infer-cuda/src/attention/flashmla.rs
+  s_3a5e68fac5570b::t_9eea5c17a74444 1042
+crates/infer-cuda/src/decode_graph.rs
+  s_3a5e68fac5570b::t_3c027eada4abca 7
+crates/infer-cuda/src/dsv4.rs
+  s_3a5e68fac5570b::t_ca63e9f19fe802 511,3634-3635,7672
+crates/infer-cuda/src/executor/qwen.rs
+  s_7ef194cc396a52::t_b4a48879e5a493 32
+crates/infer-cuda/src/qwen35.rs
+  s_bbea03a69e1def::t_fbe85bbdae489f 757,812
+crates/infer-cuda/src/recall.rs
+  s_7ef194cc396a52::t_358696366cee47 14
+crates/infer-hip/src/kv_pool.rs
+  s_3a5e68fac5570b::t_063711a4f9fa4d 10
+crates/infer-hip/src/lib.rs
+  s_3a5e68fac5570b::t_24107d79985b87 2
+crates/infer-metal/src/executor.rs
+  s_7ef194cc396a52::t_acda571f061647 614
+crates/infer-seam/src/lib.rs
+  s_ba0fe4e04f1134::t_c52c8af0979c94 668
+crates/infer-seam/src/resource.rs
+  s_7ef194cc396a52::t_bdbc96aff7f22e 19
+crates/infer-vulkan/src/forward.rs
+  s_3a5e68fac5570b::t_a273cd17e3de3c 21
+crates/qwen3-spec/src/lib.rs
+  s_ba0fe4e04f1134::t_16ee35197407c6 98
+crates/qwen35-spec/src/lib.rs
+  s_ba0fe4e04f1134::t_0800366741407a 512,551
+crates/train/src/checkpoint.rs
+  s_3a5e68fac5570b::t_8837f9544930a2 294
+crates/train/src/opd.rs
+  s_369a57354b1459::t_8e92ba53ad231a 99,412,726,1070,4576,4594
+crates/train/src/rubric.rs
+  s_3a5e68fac5570b::t_4009d12d00bba8 5
+crates/train/src/rubric_opd.rs
+  s_3a5e68fac5570b::t_e345cd59300420 5
+scripts/analyze_multi_seed.py
+  s_ba0fe4e04f1134::t_f97db6776a8279 7
+scripts/arle_capability_eval.py
+  s_3a5e68fac5570b::t_589aea85f93f25 5
+scripts/assert_kernel_fired.sh
+  s_3a5e68fac5570b::t_e4bed846dd55df 2-3
+scripts/bench_agent_trace.py
+  s_369a57354b1459::t_b52a802ec06beb 12,277,279,1094
+scripts/bench_sglang_longctx.sh
+  s_ba0fe4e04f1134::t_9abfa8b5c0d0ac 4
+scripts/check_repo_hygiene.py
+  s_369a57354b1459::t_05bf1ea889d5ad 206,376-377
+scripts/gen_36_warm_prefix_mix.py
+  s_3a5e68fac5570b::t_79ab3e4d13d52e 31
+scripts/gen_arle_longctx_eval.py
+  s_369a57354b1459::t_0410fbeddfcf3f 4-5,29,40-41
+scripts/setup_qwen3_yarn_config.py
+  s_bbea03a69e1def::t_b47d8f50d74b56 18
+scripts/train_and_chat.sh
+  s_3a5e68fac5570b::t_b87998bda3b8e7 6
+setup.sh
+  s_369a57354b1459::t_97d4010a900f60 599
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "d17352d9b1220cea847da97010960c214d95645a",
+  "prompts": {},
+  "sessions": {
+    "s_369a57354b1459": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a37afa08-363e-420d-97a5-35b731b7f708",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_3a5e68fac5570b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-af0fd126a848f4c5f",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_7ef194cc396a52": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a8ca21355e3a0bed4",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_8e4cfefd6558c7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ac8857be5a623a0f0",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_ba0fe4e04f1134": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ab71448b1fb38e3fd",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_bbea03a69e1def": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a241f157c5ea06c97",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
