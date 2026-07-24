@@ -1,0 +1,21 @@
+crates/infer-api/src/loaded.rs
+  s_5dd1d01c3b1992::t_e25a5366c7a82b 262-278,1562-1563,2992-3011
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "59b86ee4c917c81f5d3df89e9690c39f95020150",
+  "prompts": {},
+  "sessions": {
+    "s_5dd1d01c3b1992": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aee65a1f002f9fd22",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
