@@ -3717,7 +3717,7 @@ fn cuda_causal_sdpa_prefill_device(
 
 #[cfg(not(feature = "no-cuda"))]
 fn cuda_row_len(len: usize, rows: usize) -> Result<usize> {
-    if rows == 0 || len % rows != 0 {
+    if rows == 0 || !len.is_multiple_of(rows) {
         return Err(AutogradError::TapeInvariant(
             "linear_attention batched dispatch len not divisible by batch",
         ));
