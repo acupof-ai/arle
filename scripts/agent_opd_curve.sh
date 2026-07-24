@@ -17,6 +17,7 @@
 #   ARLE_BIN=target/release/arle  OUT_ROOT=runs  GPU=0  MODEL_CACHE=models
 #   WORK_ROOT=/tmp/agent-opd     sandbox root — MUST be outside any repo tree
 #                                 (an ancestor CLAUDE.md becomes ~31K/request CC preamble)
+#   SERVE_PORT=8000               in-process serve port (bump when another lane holds 8000)
 #   STUDENT_MODEL=<dir>           override student (else fetch STUDENT_MODEL_HF_ID)
 #   STUDENT_MODEL_HF_ID=bottlecapai/ThinkingCap-Qwen3.6-27B-FP8
 #   UPDATE_STRATEGY=dapo          policy-update rule {dapo,gspo,dr-grpo,grpo,rejection-ce,...}
@@ -138,6 +139,7 @@ common_args=(
     --reward-shape "$REWARD_SHAPE"
     --rollout-temperature "$ROLLOUT_TEMPERATURE"
     --samples-per-prompt "$SAMPLES"
+    --serve-port "${SERVE_PORT:-8000}"
     --sync every-group
     --test-timeout-secs 60
     --writeback-cap "$WRITEBACK_CAP"
