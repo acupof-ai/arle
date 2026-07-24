@@ -2045,6 +2045,13 @@ pub(crate) struct TrainAgentOpdArgs {
     #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u8).range(0..=1))]
     pub(crate) staleness: u8,
 
+    /// Group-stagger admission: hold a task's remaining samples until the first
+    /// sample's opening request finishes, so its ~18K-token shared CC preamble
+    /// (86% of the first-turn prompt) radix-publishes and the rest prefix-hit
+    /// instead of K cold ~21K prefills. Default off pending the pod A/B.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set, value_name = "BOOL")]
+    pub(crate) group_stagger: bool,
+
     /// `PYTHONPATH` (sandbox-relative) for the bash tool + test runs, e.g.
     /// `lib:test`. Optional.
     #[arg(long, value_name = "PATH")]

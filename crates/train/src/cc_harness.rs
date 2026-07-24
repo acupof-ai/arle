@@ -12,7 +12,7 @@ use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, sync_channel};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
 
@@ -31,6 +31,10 @@ pub const CC_SESSION_TOKENS: usize = 22_000;
 /// and the serve request caps derive from the pool, never from the typical size.
 pub const CC_MAX_SESSION_TOKENS: usize = 200_000;
 
+/// Stagger gate cap — covers a solo first turn (smoke median 139.6 s under
+/// 4-way contention); expiry releases the group cold (baseline behavior).
+const STAGGER_TIMEOUT: Duration = Duration::from_secs(180);
+
 /// Run-wide knobs; construct literally. Stateless — boot-ahead state lives in
 /// the [`BootedGroup`] values the caller threads between calls.
 pub struct CcHarness {
@@ -48,6 +52,12 @@ pub struct CcHarness {
     pub pythonpath: Option<String>,
     /// Transform from raw pass-fraction to training reward. Default = as-is.
     pub reward_shape: RewardShape,
+    /// Hold a group's remaining samples until the first sample's opening
+    /// request finishes: 86% of the first-turn prompt (~18K of ~21K tokens) is
+    /// byte-shared across samples and radix-publishes on finish, so the rest
+    /// prefix-hit instead of K cold prefills
+    /// (wins/2026-07-24-agent-opd-sandbox-staging-verified.md).
+    pub group_stagger: bool,
     pub tokenizer: tokenizers::Tokenizer,
 }
 
@@ -212,8 +222,17 @@ impl CcHarness {
     pub fn run_group(&self, booted: BootedGroup) -> Result<CcGroup> {
         let samples = std::thread::scope(|scope| -> Result<Vec<ScoredSample>> {
             let (tx, rx) = sync_channel(booted.k);
-            for _ in 0..booted.k {
+            let mut gate = None;
+            for released in 0..booted.k {
                 let (sample, workdir) = booted.rx.recv().context("cc boot thread died")??;
+                if released == 0 && self.group_stagger {
+                    gate = Some((sample_model(&self.model_id, sample), SystemTime::now()));
+                }
+                if released == 1
+                    && let Some((tag, since)) = gate.take()
+                {
+                    self.wait_preamble_publish(&tag, since);
+                }
                 let (tx, task) = (tx.clone(), &booted.task);
                 scope.spawn(move || {
                     let _ = tx.send(self.run_sample(task, sample, &workdir));
@@ -257,6 +276,27 @@ impl CcHarness {
             samples,
             records,
         })
+    }
+
+    /// Block until the first-released sample's opening request lands its
+    /// tokens-sidecar (written at request finish, after the radix publish) or
+    /// [`STAGGER_TIMEOUT`] expires.
+    fn wait_preamble_publish(&self, tag: &str, since: SystemTime) {
+        let start = Instant::now();
+        while start.elapsed() < STAGGER_TIMEOUT {
+            if preamble_published(&self.dump_dir, tag, since) {
+                eprintln!(
+                    "[cc-harness] stagger: preamble published after {:.1}s",
+                    start.elapsed().as_secs_f64()
+                );
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        eprintln!(
+            "[cc-harness] stagger: no publish within {}s — releasing group cold",
+            STAGGER_TIMEOUT.as_secs()
+        );
     }
 
     /// One sample end-to-end: `claude -p` (fork-safe `run_captured`, spawner-
@@ -344,6 +384,30 @@ impl CcHarness {
     }
 }
 
+/// A `<stem>.tokens.json` sidecar newer than `since` whose `<stem>.json` body
+/// requested `tag`.
+fn preamble_published(dump_dir: &Path, tag: &str, since: SystemTime) -> bool {
+    let Ok(entries) = std::fs::read_dir(dump_dir) else {
+        return false;
+    };
+    entries.flatten().any(|e| {
+        let sidecar = e.path();
+        let Some(stem) = sidecar
+            .to_str()
+            .and_then(|p| p.strip_suffix(".tokens.json"))
+        else {
+            return false;
+        };
+        e.metadata()
+            .and_then(|m| m.modified())
+            .is_ok_and(|t| t >= since)
+            && std::fs::read(format!("{stem}.json"))
+                .ok()
+                .and_then(|body| serde_json::from_slice::<serde_json::Value>(&body).ok())
+                .is_some_and(|v| v["model"].as_str() == Some(tag))
+    })
+}
+
 /// `--output-format json` prints one JSON object on stdout; `run_captured`
 /// folds stderr in, so fall back to the outermost `{…}` slice.
 fn parse_cc_json(output: &[u8], code: Option<i32>) -> (Option<serde_json::Value>, Option<String>) {
@@ -398,7 +462,12 @@ fn epoch_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{GroupAssembler, REWARD_DENSE_WEIGHT, RewardShape, ScoredSample, zero_variance};
+    use std::time::{Duration, SystemTime};
+
+    use super::{
+        GroupAssembler, REWARD_DENSE_WEIGHT, RewardShape, ScoredSample, preamble_published,
+        zero_variance,
+    };
 
     fn sample(task: &str, idx: usize, reward: f32) -> ScoredSample {
         ScoredSample {
@@ -434,6 +503,30 @@ mod tests {
             .expect("b completes at K");
         assert_eq!(b.iter().map(|s| s.sample).collect::<Vec<_>>(), [0, 1]);
         assert!(!zero_variance(&b), "0.5 vs 1.0 carries advantage");
+    }
+
+    #[test]
+    fn preamble_published_needs_fresh_sidecar_with_matching_tag() {
+        let dir = std::env::temp_dir().join(format!("stagger-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // 1s slack dodges filesystem mtime granularity.
+        let since = SystemTime::now() - Duration::from_secs(1);
+
+        assert!(!preamble_published(&dir, "m#s0", since), "empty dir");
+        std::fs::write(dir.join("1_0.json"), r#"{"model":"m#s0"}"#).unwrap();
+        assert!(
+            !preamble_published(&dir, "m#s0", since),
+            "body but no sidecar"
+        );
+        std::fs::write(dir.join("1_0.tokens.json"), "{}").unwrap();
+        assert!(preamble_published(&dir, "m#s0", since));
+        assert!(
+            !preamble_published(&dir, "m#s1", since),
+            "other sample's tag"
+        );
+        let future = SystemTime::now() + Duration::from_secs(60);
+        assert!(!preamble_published(&dir, "m#s0", future), "stale sidecar");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
