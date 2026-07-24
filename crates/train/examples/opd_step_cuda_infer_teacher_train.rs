@@ -1074,6 +1074,16 @@ mod app {
         config.target_modules = match lora_target_set {
             LoraTargetSet::AttentionQv => vec!["q_proj".to_owned(), "v_proj".to_owned()],
             LoraTargetSet::AllLinear => vec!["all-linear".to_owned()],
+            LoraTargetSet::AttentionFull => [
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "o_proj",
+                "in_proj_qkv",
+                "out_proj",
+            ]
+            .map(str::to_owned)
+            .to_vec(),
         };
         config
     }

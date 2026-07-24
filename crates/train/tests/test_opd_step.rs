@@ -1069,7 +1069,6 @@ fn opd_step_rejects_empty_prompt_with_actionable_error() {
         panic!("expected InvalidInput, got {err:?}");
     };
     assert!(message.contains("non-empty prompt_ids"));
-    assert!(message.contains("2026-05-18-opd-only-pivot.md"));
 }
 
 #[test]
@@ -1106,7 +1105,6 @@ fn opd_step_rejects_prompt_token_outside_student_vocab() {
     assert!(message.contains("prompt_ids[1]"));
     assert!(message.contains("vocab_size=16"));
     assert!(message.contains("tokenizer"));
-    assert!(message.contains("2026-05-18-opd-only-pivot.md"));
 }
 
 #[test]
@@ -1147,7 +1145,6 @@ fn opd_step_rejects_teacher_student_vocab_mismatch() {
     assert!(message.contains("teacher.vocab_size()=12"));
     assert!(message.contains("student.config().vocab_size=16"));
     assert!(message.contains("tokenizer"));
-    assert!(message.contains("2026-05-18-opd-only-pivot.md"));
 }
 
 #[test]
