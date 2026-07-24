@@ -40,10 +40,9 @@ progress spine).
   c1/c4 perf-neutral) and built on Colab G4 sm_120. The sweep introduced one
   regression — an `accept_n` hello-read timeout leaked into the steady-state
   relay reader → TP=4 c8+ serve teardown — found + fixed + pod-confirmed
-  (c8 48/48, c16 64/64, no teardown). Open: a c16 −40% throughput deficit on a
-  binary that also carries concurrent non-sweep executor changes; not attributed
-  to this sweep (O(1) / behavior-equivalent scheduler changes, c1/c4
-  perf-neutral) — needs a champion-binary A/B. Details:
+  (c8 48/48, c16 64/64, no teardown). The c16 deficit first flagged here was
+  pod-measured on HEAD `2ffc19736` and does NOT reproduce — c8→c16 1.75× (above
+  champion 1.58×), a measurement artifact, not a code regression. Details:
   wins/2026-07-23-systematic-review-fixes,
   errors/2026-07-24-relay-hello-timeout-leak-tp4-teardown.
 
