@@ -70,8 +70,6 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             if !matches!(request.phase, RequestPhase::Prefilling { .. }) {
                 continue;
             }
-            // Committed stream (prompt + generated): a recompute-resumed
-            // request re-prefills its generation, then decode resumes (#156).
             let target = request.committed_len();
             let start_pos = request.prefill_start_pos.min(target);
             let remaining = target - start_pos;
@@ -379,12 +377,13 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                     self.kv_system_metrics.fallback_recompute.saturating_add(1);
                 let fresh = request.clone().reset_for_recompute();
                 *request = fresh;
+                let committed = request.committed_tokens();
                 let prefix_match = if self.config.enable_prefix_cache {
-                    self.lookup_prefix_for_attach(&request.committed_tokens())
+                    self.lookup_prefix_for_attach(&committed)
                 } else {
                     crate::PrefixMatch::empty()
                 };
-                self.attach_prefix_to_request(slot, request, prefix_match)
+                self.attach_prefix_to_request(slot, request, &committed, prefix_match)
             }
         }
     }

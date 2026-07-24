@@ -68,36 +68,36 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         prefix_match
     }
 
+    /// `tokens` is the request's committed stream (prompt + generated, #156) —
+    /// callers already hold it for the radix lookup.
     pub(crate) fn attach_prefix_to_request(
         &mut self,
         slot: usize,
         request: &mut RequestState,
+        tokens: &[u32],
         mut prefix_match: PrefixMatch,
     ) -> Result<()> {
         if self.config.enable_prefix_cache {
             self.prefix_cache_stats.lookups = self.prefix_cache_stats.lookups.saturating_add(1);
         }
-        // Committed stream: a recompute-resumed request attaches through its
-        // generated tokens too, and only the un-restored tail re-prefills (#156).
-        let tokens = request.committed_tokens();
         let target = tokens.len();
+        // The last committed token must PREFILL, never restore: entering
+        // `Decoding` with it already materialized makes the decode seed re-feed
+        // it, duplicating its KV (see docs/experience/errors/
+        // 2026-07-06-dsv4-concurrent-decode-digit-corruption-unresolved.md).
+        // Both the full-match trim and the sidecar-restore clamp bound to this.
+        let attach_cap = target.saturating_sub(1);
 
-        // A full-prompt match must still run one genuine forward+sample step —
-        // jumping straight to `Decoding` leaves `generated_tokens` empty, and the
-        // planner's decode-seed `.or_else` fallback then silently re-feeds the
-        // prompt's own last token as the seed, duplicating it into KV (see
-        // docs/experience/errors/2026-07-06-dsv4-concurrent-decode-digit-corruption-unresolved.md,
-        // "Layer-0-15 residual bisection" section). Trim the last matched block
-        // so the tail always re-prefills through the standard chunked-prefill
-        // path, which samples the first token from real logits. The trim runs
-        // BEFORE `clamp_prefix_to_backend` (#154 D4): the clamp's alignment
-        // floor must see the post-trim length, or the pop un-aligns
+        // Trim the last matched block so the tail re-prefills through the
+        // standard chunked path, which samples the first token from real
+        // logits. Runs BEFORE `clamp_prefix_to_backend` (#154 D4): the clamp's
+        // alignment floor must see the post-trim length, or the pop un-aligns
         // `matched_len` and the backend's restore predicate rejects it.
-        if !prefix_match.is_empty() && prefix_match.matched_len == target {
+        if !prefix_match.is_empty() && prefix_match.matched_len > attach_cap {
             prefix_match.block_ids.pop();
             prefix_match.matched_len = prefix_match.block_ids.len() * self.radix.block_size();
         }
-        let prefix_match = self.clamp_prefix_to_backend(prefix_match, &tokens);
+        let prefix_match = self.clamp_prefix_to_backend(prefix_match, tokens);
         if prefix_match.is_empty() {
             request.prefill_start_pos = 0;
             request.phase = RequestPhase::Prefilling { progress: 0 };
@@ -142,7 +142,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         // KV causes a cross-type mismatch that corrupts model output.
         let restored = match self.executor.restore_prefix_sidecar(
             slot,
-            &tokens,
+            tokens,
             prefix_match.matched_len,
             &prefix_match.block_ids,
         ) {
@@ -174,11 +174,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         //   over-attached host pages [B..matched_len] back to `B` (radix-retained
         //   pages survive the reclaim; they stay in `reused_prefix_pages` and are
         //   released on finish), so the tail prefill covers [B..prompt].
-        // Clamp below the committed stream: a full restore to `target` would
-        // enter Decoding with the last token's KV already materialized, and the
-        // decode seed re-feeds that token (same contract as the full-match trim
-        // above) — hold one token back so the tail prefill re-seeds from logits.
-        let restored_len = restored.min(target.saturating_sub(1));
+        let restored_len = restored.min(attach_cap);
         if restored_len > prefix_match.matched_len {
             // Same degrade contract as the sidecar-miss arm above: an
             // admission alloc failure must not propagate into the fatal step
