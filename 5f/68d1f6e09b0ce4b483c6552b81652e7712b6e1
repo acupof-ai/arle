@@ -1,0 +1,21 @@
+crates/train/src/qwen35.rs
+  s_0c77846ccb57ef::t_3c59ff84c06d30 2552-2566,2569-2577,2592-2597,2599-2605
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "5f68d1f6e09b0ce4b483c6552b81652e7712b6e1",
+  "prompts": {},
+  "sessions": {
+    "s_0c77846ccb57ef": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f9233-ac72-74a2-b335-5cdbaa6cc06d",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
