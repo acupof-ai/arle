@@ -23,6 +23,17 @@ Progress spine. Entry classes recorded here the day they land: phase exits,
 default flips, and accept-or-reject verdicts (AGENTS.md §Docs lifecycle &
 progress spine).
 
+- **DEFAULT FLIP — writeback-offload threshold 4096 → 16384** (2026-07-24,
+  #172; wins:
+  [2026-07-24-writeback-offload-dial-back](docs/experience/wins/2026-07-24-writeback-offload-dial-back.md)).
+  Measured seq sweep 5K-28K on 27B: offload buys zero peak headroom, costs
+  −29…−38% backward; resident OOM boundary moved 9.6K → 24.6K post fused-CE +
+  batched-LA.
+- **ACCEPT — FP8 quant loss on 27B: −0.25% PPL vs bf16** (2026-07-24, #174;
+  wins:
+  [2026-07-24-ppl-harness-fp8-matrix](docs/experience/wins/2026-07-24-ppl-harness-fp8-matrix.md)).
+  First GPU run of `arle train ppl` (WikiText-2 test, ctx 2048); also fixed the
+  paged-KV panic in `forward_token_logits` (`067849cf3`).
 - **REJECT — group-stagger admission for CC preamble prefix reuse**
   (2026-07-24, reverted in `2ab7883f1`; errors:
   [2026-07-24-group-stagger-premise-false](docs/experience/errors/2026-07-24-group-stagger-premise-false.md)).

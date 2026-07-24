@@ -87,14 +87,13 @@ pub(crate) fn writeback_offload() -> bool {
 /// off when the user passes `--writeback-offload false`.
 ///
 /// The H2D re-upload serializes on the host thread and starves the GPU on short
-/// trajectories (measured: backward −36%, writeback −33%/round at seq≈1276, no
-/// OOM); resident checkpoints instead OOM the allocator at seq≥~9600 where the
-/// long forward fragments the pool (errors/2026-06-28). So offload only past a
-/// length that needs it. 4096 is conservative (2.3× margin below the OOM anchor;
-/// nested-SDPA checkpointing `0b7a1d89` already bounds inner O(seq²) memory).
-/// Refine with a measured seq sweep before widening.
+/// trajectories (measured seq sweep 5K-12K on 27B: backward −29…−38%, zero peak
+/// headroom vs resident — offload only slows this band). Post fused-CE +
+/// batched-LA, resident checkpoints survive to seq=24576 and OOM at 28672
+/// (wins/2026-07-24-writeback-offload-dial-back); 16384 keeps 1.5× margin below
+/// last-proven-good and 25 GiB peak headroom on a 96 GB H20.
 pub(crate) fn writeback_offload_for_seq(seq_len: usize) -> bool {
-    const WRITEBACK_OFFLOAD_MIN_SEQ: usize = 4096;
+    const WRITEBACK_OFFLOAD_MIN_SEQ: usize = 16384;
     writeback_offload() && seq_len >= WRITEBACK_OFFLOAD_MIN_SEQ
 }
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
