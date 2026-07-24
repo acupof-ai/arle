@@ -65,7 +65,9 @@ __device__ __forceinline__ int la_state_base(
     return ((batch * heads + head) * key_dim) * value_dim;
 }
 
-__device__ __forceinline__ int la_state_time_base(
+// 64-bit: batch*seq*heads*key_dim*value_dim overflows int32 past ~2^31 elems
+// (e.g. 4x3153x16x128x128 = 3.31e9 state_history floats).
+__device__ __forceinline__ long long la_state_time_base(
     int batch,
     int seq,
     int head,
@@ -74,7 +76,7 @@ __device__ __forceinline__ int la_state_time_base(
     int key_dim,
     int value_dim
 ) {
-    return (((batch * seq_len + seq) * heads + head) * key_dim) * value_dim;
+    return ((((long long)batch * seq_len + seq) * heads + head) * key_dim) * value_dim;
 }
 
 extern "C" __global__ void linear_attention_conv1d_silu_forward_f32_to_bf16(
@@ -227,14 +229,14 @@ extern "C" __global__ void linear_attention_scan_backward_f32(
         }
         __syncthreads();
 
-        int state_base = seq_idx == seq_len - 1
-            ? la_state_base(batch_idx, value_head, num_value_heads, key_dim, value_dim)
+        long long state_base = seq_idx == seq_len - 1
+            ? (long long)la_state_base(batch_idx, value_head, num_value_heads, key_dim, value_dim)
             : la_state_time_base(
                   batch_idx, seq_idx, value_head, seq_len, num_value_heads, key_dim, value_dim);
         const float* state = seq_idx == seq_len - 1
             ? final_state + state_base
             : state_history + state_base;
-        int prev_base = seq_idx == 0
+        long long prev_base = seq_idx == 0
             ? 0
             : la_state_time_base(
                   batch_idx, seq_idx - 1, value_head, seq_len, num_value_heads, key_dim, value_dim);
