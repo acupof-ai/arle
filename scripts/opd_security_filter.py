@@ -9,16 +9,18 @@ Ambiguous words (payload, credential, injection, vault, ...) are on the list
 on purpose: corpus supply is not scarce, so we err heavily on dropping.
 
 API:    is_security_flagged(text) -> Optional[str]   # matched rule name
-CLI:    python3 scripts/opd_security_filter.py            # fixture self-check
-        python3 scripts/opd_security_filter.py --scan DIR # report flagged files
+CLI:    python3 scripts/opd_security_filter.py             # fixture self-check
+        python3 scripts/opd_security_filter.py --scan DIR  # scan a staged file tree
+        python3 scripts/opd_security_filter.py --scan-jsonl F...  # scan every record's text fields
 """
 
 from __future__ import annotations
 
+import json
 import re
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Iterator, Optional
 
 _I = re.IGNORECASE
 
@@ -178,7 +180,48 @@ def _scan(root: Path) -> int:
     return 1 if flagged else 0
 
 
+def _walk_strings(v, prefix: str = "") -> Iterator[tuple[str, str]]:
+    """Yield (field_path, string) over every string in a JSON record, recursively."""
+    if isinstance(v, str):
+        yield prefix, v
+    elif isinstance(v, dict):
+        for k, x in v.items():
+            yield from _walk_strings(x, f"{prefix}.{k}" if prefix else k)
+    elif isinstance(v, list):
+        for i, x in enumerate(v):
+            yield from _walk_strings(x, f"{prefix}[{i}]")
+
+
+def _scan_jsonl(paths: list[Path]) -> int:
+    """Scan EVERY text field of EVERY record — the per-record gate for a shipped
+    corpus (the file-tree scan misses statement/gold_patch/test_patch text)."""
+    total = flagged = 0
+    for path in paths:
+        n = f = 0
+        for line in path.read_text(errors="replace").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            n += 1
+            rec = json.loads(line)
+            iid = rec.get("instance_id", "?")
+            for field, s in _walk_strings(rec):
+                rule = is_security_flagged(s)
+                if rule:
+                    f += 1
+                    snippet = s[:120].replace("\n", " ")
+                    print(f"FLAGGED [{rule}] {path.name}:{iid} field={field}  «{snippet}»")
+                    break
+            total += 1
+        flagged += f
+        print(f"scan-jsonl: {path.name} — {n} records, {f} flagged")
+    print(f"scan-jsonl: {total} records scanned across every text field, {flagged} flagged")
+    return 1 if flagged else 0
+
+
 if __name__ == "__main__":
     if len(sys.argv) >= 3 and sys.argv[1] == "--scan":
         sys.exit(_scan(Path(sys.argv[2])))
+    if len(sys.argv) >= 3 and sys.argv[1] == "--scan-jsonl":
+        sys.exit(_scan_jsonl([Path(p) for p in sys.argv[2:]]))
     sys.exit(_self_check())
