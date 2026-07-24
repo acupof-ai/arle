@@ -295,6 +295,22 @@ pub fn boot_workdir(
     fs::create_dir_all(&workdir)
         .with_context(|| format!("failed to create workdir {}", workdir.display()))?;
 
+    // `claude -p` ingests every ancestor CLAUDE.md as per-request preamble — a
+    // workdir under the ARLE checkout silently added ~31K tokens/request
+    // (wins/2026-07-24-agent-opd-gpu-busy-frac-measured-go.md).
+    if let Some(dir) = workdir
+        .ancestors()
+        .skip(1)
+        .find(|a| a.join("CLAUDE.md").exists())
+    {
+        eprintln!(
+            "[sandbox] WARN: workdir {} sits under {} which carries CLAUDE.md — CC ingests it as \
+             per-request preamble; stage --work-root outside any repo",
+            workdir.display(),
+            dir.display()
+        );
+    }
+
     // Copy the staged tree's CONTENTS into the workdir. `<src>/.` copies the
     // directory contents (incl. dotfiles) rather than nesting the dir itself.
     let src_contents = format!("{}/.", staged_tree.display());

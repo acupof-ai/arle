@@ -15,6 +15,8 @@
 # where it is set below; override any via env. SMOKE=1 = quick 2-round sizing run.
 # Optional env (full-run defaults):
 #   ARLE_BIN=target/release/arle  OUT_ROOT=runs  GPU=0  MODEL_CACHE=models
+#   WORK_ROOT=/tmp/agent-opd-work sandbox root — MUST be outside any repo tree
+#                                 (an ancestor CLAUDE.md becomes ~31K/request CC preamble)
 #   STUDENT_MODEL=<dir>           override student (else fetch STUDENT_MODEL_HF_ID)
 #   STUDENT_MODEL_HF_ID=bottlecapai/ThinkingCap-Qwen3.6-27B-FP8
 #   UPDATE_STRATEGY=dapo          policy-update rule {dapo,gspo,dr-grpo,grpo,rejection-ce,...}
@@ -40,6 +42,10 @@ set -euo pipefail
 LABEL=${1:?usage: agent_opd_curve.sh <label>}
 ARLE_BIN=${ARLE_BIN:-target/release/arle}
 OUT=${OUT_ROOT:-runs}/agent-opd-"$LABEL"
+# Sandboxes must stage OUTSIDE any repo tree: `claude -p` ingests every ancestor
+# CLAUDE.md, and a workdir under the ARLE checkout added ~31K tokens/request
+# (wins/2026-07-24-agent-opd-gpu-busy-frac-measured-go.md).
+WORK=${WORK_ROOT:-/tmp/agent-opd-work}/"$LABEL"
 GPU=${GPU:-0}
 
 # Models: use a local dir if given, else auto-fetch from HF (honors HF_ENDPOINT
@@ -156,7 +162,7 @@ if [[ ${COMFORT_BAND:-1} == 1 && ${SMOKE:-0} != 1 ]]; then
     echo "[curve] comfort-band: profiling $CORPUS (1 round, task-selection off) → filter"
     CUDA_VISIBLE_DEVICES=$GPU "$ARLE_BIN" "${common_args[@]}" \
         --dataset "$CORPUS/tasks_train.jsonl" --staged-root "$CORPUS/staged" \
-        --work-root "$OUT/cb_work" --staleness 0 --task-selection false \
+        --work-root "$WORK/cb_work" --staleness 0 --task-selection false \
         --rounds 1 --eval-every 0 --eval-out-dir "$OUT/cb_profile" \
         2>&1 | tee "$OUT/cb_profile.log"
     if python3 scripts/comfort_band.py \
@@ -174,7 +180,7 @@ train_args=(
     "${common_args[@]}"
     --dataset "$CORPUS/tasks_train.jsonl"
     --staged-root "$CORPUS/staged"
-    --work-root "$OUT/work"
+    --work-root "$WORK/work"
     --eval-dataset "$CORPUS/tasks_eval.jsonl"
     --eval-n "$EVAL_N"
     --eval-concurrency "$EVAL_CONCURRENCY"
