@@ -1,0 +1,31 @@
+crates/infer-seam/src/lib.rs
+  s_9c91b86ec3fb55::t_86352fab1c1499 346-359
+crates/infer-core/src/lib.rs
+  s_9c91b86ec3fb55::t_1df3d94186f538 1515-1523,1537-1541,1564-1568,2461,2464-2466,2488-2491,3099,3141-3176
+crates/infer-cuda/src/attention/kv_layout.rs
+  s_9c91b86ec3fb55::t_4371c4f41cec91 483-485,504,1048-1090
+crates/infer-cuda/src/executor.rs
+  s_9c91b86ec3fb55::t_c81a89559f3742 687-689,693-707
+crates/infer-cuda/src/executor/dsv4.rs
+  s_9c91b86ec3fb55::t_4f822d44ddbb17 459-476
+crates/infer-cuda/src/lib.rs
+  s_9c91b86ec3fb55::t_7588087ebf4e91 963-973
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "95477af2c88ae9d64ab71d30d49f8f840d93a106",
+  "prompts": {},
+  "sessions": {
+    "s_9c91b86ec3fb55": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4779911a-69b7-49db-bc83-daf5a48d6ca3",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
