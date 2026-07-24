@@ -1,0 +1,33 @@
+crates/infer-cuda/src/executor/dspark_train.rs
+  s_1b922c3121bdcc::t_49dae6806e11b1 34-37,127,162,169,178,230
+crates/infer-cuda/src/executor/dsv4.rs
+  s_1b922c3121bdcc::t_8a356339ed1248 1589,1825,1834,2122,2131
+crates/infer-cuda/src/executor/qwen35.rs
+  s_1b922c3121bdcc::t_ec662f175a053b 2017
+crates/infer-cuda/src/qwen35/dspark.rs
+  s_1b922c3121bdcc::t_d5bb7502f509f8 119-120,160
+crates/train/src/dspark_train.rs
+  s_1b922c3121bdcc::t_23e6bc171c4b20 41-44,97,119,161,183,198,211,213-219,232-243,245-274,276,278-279,281-284,287,291,296-297,304,306-307,309,336,343,388,456
+crates/train/tests/test_dspark_train.rs
+  s_1b922c3121bdcc::t_20e195adcf2a39 32,102-198
+docs/experience/errors/2026-07-22-dspark-train-loss-down-acceptance-flat.md
+  s_1b922c3121bdcc::t_c16cf17f3aeba8 24-55
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "721a553bcb49729de15b2fd82b7f5affc1345705",
+  "prompts": {},
+  "sessions": {
+    "s_1b922c3121bdcc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a01322ed7a8a9c631",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
