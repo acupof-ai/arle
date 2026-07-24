@@ -60,7 +60,7 @@ tokens**. Consequences, measured on one H20:
   host-demoted pages; resident radix pages count fully, and the recurrent
   sidecar save/restore is wired end-to-end since #85 (`52e2fdb47` 06-29,
   periodic stride snapshots `312d22c8c` 07-13) — all in the measured run's
-  HEAD `0a42841ad`. Turns 2–4 at 21–80 s vs turn 1 at 178–245 s are
+  HEAD `0a42841ad`. The turn-1 vs turns-2–4 latency gap (lever 1 below) is
   consistent with same-session reuse working. What actually limits sharing:
   ① publish happens on **finish**, so a group's concurrent cold-start turn 1
   × 8 can't share (each prefills its own 31K → the pool exhaustion);
@@ -77,7 +77,11 @@ tokens**. Consequences, measured on one H20:
    `/tmp/agent-opd-work` + a `boot_workdir` ancestor-CLAUDE.md warning.
    Turn 1 measured 178–245 s vs 21–80 s for turns 2–4 — dominated by exactly
    this prefill. Pending pod verification: prompt_tokens per request should
-   drop ~31K → few K.
+   drop ~31K → few K. Durable follow-up: `claude --bare` at the spawn point
+   (`cc_harness.rs:270`) disables CLAUDE.md auto-discovery path-independently
+   (also closes the `~/.claude/CLAUDE.md` vector the path fix can't) — but it
+   drops hooks/auto-memory/workdir-level CLAUDE.md too, a rollout-behavior
+   change needing pod-CLI support check + its own A/B before flipping.
 2. **Prefix reuse — already built; residual gap is concurrent cold starts.**
    With lever 1 landed the shared preamble shrinks to CC's own system prompt
    + tool schemas (few K), so the residual win is small. If a measured run
