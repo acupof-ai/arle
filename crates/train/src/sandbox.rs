@@ -217,6 +217,14 @@ pub(crate) fn run_captured(
 /// `kill` binary to avoid a libc dependency; failure is ignored (the group may be
 /// empty already, which is the common case).
 fn kill_group(pgid: i32) {
+    // Never signal our own group: a mis-derived pgid must not SIGKILL the
+    // caller's session (observed 3× deterministic under `cargo test -p train
+    // --features cuda` on the pod, 2026-07-24; exact mis-derivation hop
+    // unpinned — this guard closes the class).
+    // SAFETY: getpgrp takes no arguments and cannot fail.
+    if pgid <= 1 || pgid == unsafe { libc::getpgrp() } {
+        return;
+    }
     let _ = Command::new("kill")
         .arg("-KILL")
         .arg(format!("-{pgid}"))
