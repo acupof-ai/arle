@@ -38,20 +38,14 @@ not a suggestion.
  Aggregate **and** mechanism can both lie; decoded cases are ground truth. The
  fix usually falls out once attributed at case level. **先归因清楚再推翻。**
 
-Empirical anchors:
-- **Agentic-OPD "structural" false-KILL** (2026-06-20): a −14pp regression +
- plausible mechanism ("on-policy can't teach abstention") written up as a
- structural KILL — **wrong**. The gate's "+42pp teacher abstention" was 14/17
- teacher TIMEOUTS counted as abstention (fake gate); the think-on teacher
- actually over-calls (33% abstain < base 46%). Aggregate **and** subagent
- summary both misled; only decoded cases were true. Fixable, hypothesis intact.
-- **M_pf-graph Phase 0 KILL** (2026-05-08): the errors entry was 80% SOLID and
- still void — launch-overhead share not nsys-verified / graph-trigger count not
- measured against a control / 4 variables changed at once.
-- **M_pf-graph v2 framing trap** (2026-05-08): nsys "55.7% of prefill window"
- looked large, but 191ms / 60s trace = 6.4ms per prefill / 1995ms TTFT =
- **0.32% wall-clock**. The old 10% gate rejected it; the current rule keeps any
- stable positive wall-clock gain. Always cross-check the per-request total.
+Empirical anchors (full story in the cited errors/wins entry):
+- **Agentic-OPD false-KILL** (2026-06-20): a −14pp "structural KILL" was wrong —
+ its "+42pp teacher abstention" gate was 14/17 teacher TIMEOUTS miscounted;
+ only decoded cases were true, hypothesis intact.
+- **M_pf-graph Phase 0 KILL** (2026-05-08): 80% SOLID = void — launch share not
+ nsys-verified, trigger count uncontrolled, 4 variables changed at once.
+- **M_pf-graph v2 framing trap** (2026-05-08): nsys 55.7% of prefill window =
+ **0.32% wall-clock** — always cross-check the per-request total.
 
 ---
 
@@ -457,7 +451,7 @@ mechanical changes.
 - **Flat module layout, no `mod.rs`.** `src/ops.rs` 声明 `#[path = "ops/attention.rs"] mod attention;` 同级；模型遵循 `model/qwen3.rs` + `model/qwen3/`。
 - Weights `&self`（不可变，池共享）；per-request 可变状态在 `State` 关联类型。
 - **默认无注释。** 只注释非显然的不变量、排序要求、bug workaround — 不注释代码做了什么（更清晰的名字胜过注释），不注释哪个任务/工单/步骤加的（那属于 commit message）。issue 号仅在命名具体 bug 时使用（`// #146: above 2048 the per-path maps diverged`）。需要时 ≤1 行。
-- **代码如诗 — 每个表达式都有其位置。** stdlib 能精确命名操作的就用：`.unzip()` 胜过 4 行 match，`ensure!` 胜过 `if { return Err }`，`.is_some_and()` 胜过 `.map().unwrap_or()`。检验标准：*读者能一遍读懂意图吗？* 别名上一行的临时变量 = 噪声；范围 `i * tp_size..(i+1) * tp_size` 已经被命名了。
+- **代码如诗 —— 见 §0.2「Code」(同一条,不复述)。** 唯一补充:形如 `i * tp_size..(i+1) * tp_size` 的范围已自我命名,别再起别名临时变量。
 
 ### GPU kernel work
 
@@ -536,22 +530,13 @@ cargo test -p cli --release --no-default-features --features metal,no-cuda # Met
 cargo test -p kv-native-sys --profile release-fast
 ```
 
-**KV precision parity gate — re-ported 2026-06-10 (#58).** The monolith's
-trajectory-match audit is superseded by the correct-inference gate
-(`scripts/needle_gate.py` + `scripts/lever_gate.sh`): needle ladder x3
-same-config repeats vs the baseline envelope, NOT byte-identity (MoE
-non-determinism). DSv4 lever verdicts
-(wins):
-FlashMLA decode + fused-wqkv correctness LICENSED (default flips still need a
-wall-clock perf license); pooled/contig-MoE flip KILLED (−24%). Qwen dense
-KV-dtype matrix **resolved 2026-06-12 (#68)**: seam-level kv-dtype dispatch
-landed (`--kv-cache-dtype`, default bf16 unchanged); INT8/FP8 correctness
-LICENSED (needle exact 15/15 DET = BF16 envelope); the initial decode −77% at B=1
-was an uncached per-layer-per-step `cudaGetDeviceProperties` in the quant decode
-shim — fixed same day (static SM-count cache), post-fix −27% vs bf16+graph / −7%
-vs eager bf16 — opt-in only, no default flip without a perf license; TQ4 DEFERRED
-(TurboQuant page_size=1 vs TileLang PAGE_SIZE=16). Verdicts:
-wins.
+**KV precision parity gate (re-ported 2026-06-10, #58).** Parity = the
+correct-inference gate (`scripts/needle_gate.py` + `scripts/lever_gate.sh`):
+needle ladder ×3 same-config vs the baseline envelope, NOT byte-identity (MoE
+non-determinism). Per-lever verdicts — FlashMLA/fused-wqkv LICENSED, pooled/
+contig-MoE KILLED (−24%), INT8/FP8 kv-dtype (`--kv-cache-dtype`, default bf16)
+LICENSED opt-in, TQ4 deferred — live in the DSv4/Qwen wins entries; default
+flips still need a wall-clock perf license.
 
 Env vars: `TORCH_CUDA_ARCH_LIST` (SM override, PyTorch convention; alt
 `CMAKE_CUDA_ARCHITECTURES`), `INFER_TILELANG_PYTHON` (TileLang AOT Python),
