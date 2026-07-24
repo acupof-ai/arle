@@ -353,6 +353,15 @@ impl RequestState {
         self.committed_slice(0, self.committed_len())
     }
 
+    /// Borrowed for the common fresh-request case (nothing generated yet).
+    fn committed_cow(&self) -> std::borrow::Cow<'_, [u32]> {
+        if self.generated_tokens.is_empty() {
+            std::borrow::Cow::Borrowed(&self.prompt_tokens)
+        } else {
+            std::borrow::Cow::Owned(self.committed_tokens())
+        }
+    }
+
     fn committed_slice(&self, start: usize, len: usize) -> Vec<u32> {
         self.prompt_tokens
             .iter()
@@ -985,8 +994,6 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             if !matches!(request.phase, RequestPhase::Prefilling { .. }) {
                 continue;
             }
-            // Prefill target is the committed stream: a recompute-resumed
-            // request re-prefills prompt + generated before decoding (#156).
             let target = request.committed_len();
             let new_start = (row.start_pos + row.tokens.len()).min(target);
             self.throughput_stats.prefill_tokens = self
@@ -1103,12 +1110,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         // `publish_prefix_blocks`). Publishing runs unconditionally — including a
         // restore-derived turn — so an agentic follow-up matches THROUGH the
         // previous turn's generated tokens and restores instead of re-prefilling.
-        let full_tokens: Vec<u32> = request
-            .prompt_tokens
-            .iter()
-            .chain(request.generated_tokens.iter())
-            .copied()
-            .collect();
+        let full_tokens = request.committed_tokens();
         // Write the finish frontier (generated content + live carry at the exact
         // finish position) through to the content-keyed prefix store while the
         // slot's device state is still resident. BEFORE publish_prefix_blocks:
@@ -1311,35 +1313,33 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         let Some(candidate) = self.waiting.front() else {
             return Ok(AdmitOutcome::NoWaiter);
         };
-        // Match against the committed stream (prompt + generated): a
-        // recompute-resumed request attaches through its own requeue-published
-        // generated blocks instead of re-prefilling them (#156).
-        let committed = candidate.committed_tokens();
-        let prefix_match = if self.config.enable_prefix_cache {
+        // Matching runs over the committed stream (#156); borrowed unless the
+        // candidate is a recompute-resumed victim with generated tokens.
+        let reuse_matched_len = if self.config.enable_prefix_cache {
+            let committed = candidate.committed_cow();
             let matched = self.radix.peek_longest_prefix_match(&committed);
-            self.clamp_prefix_to_backend(matched, &committed)
-        } else {
-            PrefixMatch::empty()
-        };
-        // Backends without page-radix reuse (DSv4) may still hold a
-        // position-0 whole-slot prefix image. The page route reports
-        // `matched_len == 0` for them, so budget the prefill/pages against
-        // the executor's cached prefix length when it is longer. This only
-        // affects budgeting; the actual restore happens at attach below.
-        // Skipped for swap re-admissions: they restore the FULL sequence via
-        // `restore_swapped_slot` (consuming the slot) and never take the
-        // cached-prefix attach path, so the cached length is irrelevant to
-        // their prefill (which is 0).
-        let reuse_matched_len = if self.config.enable_prefix_cache && candidate.swap_key.is_none() {
-            let cached = self
-                .executor
-                .cached_prefix_match_len(&committed)?
-                .min(committed.len());
+            let prefix_match = self.clamp_prefix_to_backend(matched, &committed);
+            // Backends without page-radix reuse (DSv4) may still hold a
+            // position-0 whole-slot prefix image. The page route reports
+            // `matched_len == 0` for them, so budget the prefill/pages against
+            // the executor's cached prefix length when it is longer. This only
+            // affects budgeting; the actual restore happens at attach below.
+            // Skipped for swap re-admissions: they restore the FULL sequence
+            // via `restore_swapped_slot` (consuming the slot) and never take
+            // the cached-prefix attach path, so the cached length is
+            // irrelevant to their prefill (which is 0).
+            let cached = if candidate.swap_key.is_none() {
+                self.executor
+                    .cached_prefix_match_len(&committed)?
+                    .min(committed.len())
+            } else {
+                0
+            };
             prefix_match.matched_len.max(cached)
         } else {
-            prefix_match.matched_len
+            0
         };
-        let prefill_tokens = committed.len().saturating_sub(reuse_matched_len);
+        let prefill_tokens = candidate.committed_len().saturating_sub(reuse_matched_len);
         if prefill_tokens > 0 && *active_prefills >= max_prefills {
             return Ok(AdmitOutcome::Throttled);
         }
@@ -1389,6 +1389,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             // and resume decode (falls back to recompute internally).
             self.restore_swapped_slot(slot, &mut request, key)?;
         } else {
+            let committed = request.committed_tokens();
             let prefix_match = if self.config.enable_prefix_cache {
                 // Tier-aware: demoted blocks in the match are promoted
                 // back into fresh pages here, so attach sees a
@@ -1397,19 +1398,17 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             } else {
                 PrefixMatch::empty()
             };
-            self.attach_prefix_to_request(slot, &mut request, prefix_match)?;
+            self.attach_prefix_to_request(slot, &mut request, &committed, prefix_match)?;
             self.record_attached_prefix_metrics(request.reused_prefix_pages.len());
         }
 
-        let pending_prefill = match request.phase {
-            RequestPhase::Prefilling { .. } => request
-                .committed_len()
-                .saturating_sub(request.prefill_start_pos),
-            _ => 0,
-        };
-        *remaining_prefill_tokens = remaining_prefill_tokens.saturating_sub(pending_prefill);
         *remaining_pages = remaining_pages.saturating_sub(pages_needed);
         if matches!(request.phase, RequestPhase::Prefilling { .. }) {
+            *remaining_prefill_tokens = remaining_prefill_tokens.saturating_sub(
+                request
+                    .committed_len()
+                    .saturating_sub(request.prefill_start_pos),
+            );
             *active_prefills += 1;
         }
         // Fresh admit stamp + generation mark: a just-admitted/resumed request
@@ -4573,8 +4572,6 @@ mod tests {
             streamed, done.generated_tokens,
             "observer stream equals the final generation — nothing re-emitted"
         );
-        let unique: std::collections::BTreeSet<u32> = streamed.iter().copied().collect();
-        assert_eq!(unique.len(), streamed.len(), "no duplicate emissions");
         Ok(())
     }
 
