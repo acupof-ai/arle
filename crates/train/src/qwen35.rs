@@ -2535,13 +2535,14 @@ impl Qwen35Model {
     /// re-run in backward (plus boundary host offload) for tape memory — a
     /// good trade only when the full tape would NOT fit: modeled footprint
     /// (per layer the hidden-stream + dominant MLP term, plus the exact LA
-    /// ctx bytes for hybrid layers via `linear_attention_ctx_bytes`) ×3
-    /// margin against free VRAM. The generic term is a floor (attention
-    /// scratch and allocator slack unmodeled); the ×3 margin covers it —
-    /// free/2 OOM'd at seq≈1350–1400 (agent-OPD smoke 2026-07-03). The LA
-    /// term landed with the batched LA device path (ecc058b20); before it,
-    /// batched long-completion writeback ran full-tape and OOM'd at 97 GB
-    /// (errors/2026-07-24). Unknown memory info keeps the safe default
+    /// ctx bytes for hybrid layers via `linear_attention_ctx_bytes`) ×4
+    /// against free VRAM. ×4 is calibrated, not a guess: the measured
+    /// full-tape footprint is 2.9–3.3× the modeled floor (0.8B B=4 seq=1040
+    /// [vram-ramp]: 39.1 GB forward vs 13.6 modeled, 45 GB with CE+backward,
+    /// wins/2026-07-24; 27B hybrid measured 2.54×), ×~1.2 headroom for pool
+    /// retention and shape variance. The 2026-07-24 ×4 revert was the broken
+    /// batched LA backward crashing under checkpoint — fixed by ecc058b20 —
+    /// not the ratio. Unknown memory info keeps the safe default
     /// (checkpoint).
     fn should_checkpoint(
         &self,
@@ -2565,7 +2566,7 @@ impl Qwen35Model {
                 let total = per_layer
                     .saturating_mul(self.layers.len())
                     .saturating_add(la_ctx.saturating_mul(la_layers));
-                let engage = total.saturating_mul(3) > free;
+                let engage = total.saturating_mul(4) > free;
                 // Log first decision and every flip: the gate's failure class is
                 // a silent false-non-engage (97 GB OOM, errors/2026-07-24), so
                 // the breadcrumb must exist even when it never engages.
