@@ -261,7 +261,7 @@ pub fn newest_dump_prompt_ids(
 }
 
 /// `<epoch_ms>_<seq>.json` files under `dir`, keyed by their epoch prefix.
-fn list_dumps(dir: &Path) -> Result<Vec<(u64, PathBuf)>> {
+pub(crate) fn list_dumps(dir: &Path) -> Result<Vec<(u64, PathBuf)>> {
     let mut dumps = Vec::new();
     for entry in fs::read_dir(dir).with_context(|| format!("read dump dir {}", dir.display()))? {
         let path = entry?.path();
@@ -307,7 +307,7 @@ fn dumps_in_window(
     Ok(matched)
 }
 
-fn read_json(path: &Path) -> Result<serde_json::Value> {
+pub(crate) fn read_json(path: &Path) -> Result<serde_json::Value> {
     let raw = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     serde_json::from_str(&raw).with_context(|| format!("parse {}", path.display()))
 }
