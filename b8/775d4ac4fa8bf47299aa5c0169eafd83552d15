@@ -1,0 +1,21 @@
+AGENTS.md
+  s_db6aa5c63908d1::t_e50da5b016209a 31-32,39-40,107-110,114,190-200,415,417,419,421-433,435,437-440,458-459
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "b8775d4ac4fa8bf47299aa5c0169eafd83552d15",
+  "prompts": {},
+  "sessions": {
+    "s_db6aa5c63908d1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aa0c6b86882ce633e",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
