@@ -343,6 +343,20 @@ pub trait BackendExecutor {
         None
     }
 
+    /// Device pages [`Self::submit`] will additionally draw from that same
+    /// pool to grow `slot`'s KV to `target_tokens` (the row's KNOWN final
+    /// span: prefill = the full prompt, decode = seq_len + 1). `None` (the
+    /// default) keeps the engine's worst-case formula (1 page per decode row,
+    /// chunk pages + 1 per prefill chunk) authoritative. Backends whose
+    /// per-row growth that formula cannot see (DSv4 demand-paged FlashMLA
+    /// bands, #160: ring + comp pages per layer, whole prompt reserved at
+    /// the first chunk) override it so the [`Self::kv_device_free_pages`]
+    /// gate charges the true demand. Host bookkeeping only — never a device
+    /// readback (CUDA-graph hot loop).
+    fn kv_device_pages_needed(&self, _slot: usize, _target_tokens: usize) -> Option<usize> {
+        None
+    }
+
     /// Number of KV pages the backend's host-demoted store can
     /// hold. `0` (the default) means the backend has no tier store and the
     /// engine never calls the demote/promote hooks — the baseline eviction
