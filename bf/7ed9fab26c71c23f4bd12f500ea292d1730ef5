@@ -1,0 +1,23 @@
+AGENTS.md
+  s_307ca10375d73f::t_39a0e17fe4cc6e 131-135
+crates/infer-cuda/src/dsv4.rs
+  s_307ca10375d73f::t_dc4d771ad84167 3284,3396
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "bf7ed9fab26c71c23f4bd12f500ea292d1730ef5",
+  "prompts": {},
+  "sessions": {
+    "s_307ca10375d73f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-abe601bbe98a5dc54",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
