@@ -12,9 +12,9 @@ use autograd::{
         MoeTopK, add, add_broadcast, all_reduce_sum, cat_seq, causal_sdpa_recompute,
         causal_sdpa_with_q_start, checkpoint_sequential, embedding, linear_attention_core,
         linear_attention_core_with_carry, linear_attention_core_with_carry_taped,
-        matmul_bt_with_site, moe_grouped_linear, moe_grouped_weighted_scatter, moe_topk_softmax,
-        moe_topk_softmax_with_indices, mul, repeat_kv, reshape, rmsnorm, rope, sigmoid, silu,
-        slice, transpose,
+        linear_attention_ctx_bytes, matmul_bt_with_site, moe_grouped_linear,
+        moe_grouped_weighted_scatter, moe_topk_softmax, moe_topk_softmax_with_indices, mul,
+        repeat_kv, reshape, rmsnorm, rope, sigmoid, silu, slice, transpose,
     },
 };
 pub use qwen35_spec::{LayerType, Qwen35Config, Qwen35ConfigError};
@@ -2549,32 +2549,18 @@ impl Qwen35Model {
         self.gradient_checkpointing = enabled;
     }
 
-    /// Exact tape bytes the CUDA device LA path saves per linear-attention
-    /// layer: the 12 ctx tensors recorded in `ops/linear_attention.rs` (f32:
-    /// preact, output, g/g_cumsum/beta, chunk_state; bf16: qkv_conv, q, k, v,
-    /// a_inv, raw_output).
-    fn la_ctx_bytes(&self, batch: usize, seq_len: usize) -> usize {
-        let cfg = &self.config;
-        let (hk, kd) = (cfg.linear_num_key_heads, cfg.linear_key_head_dim);
-        let (hv, vd) = (cfg.linear_num_value_heads, cfg.linear_value_head_dim);
-        let qkv_dim = 2 * hk * kd + hv * vd;
-        let f32_elems =
-            seq_len * (qkv_dim + hv * vd + 3 * hv) + seq_len.div_ceil(64) * hv * kd * vd;
-        let bf16_elems = seq_len * (qkv_dim + hv * (2 * kd + 2 * vd + 64));
-        batch * (4 * f32_elems + 2 * bf16_elems)
-    }
-
     /// The one checkpointing decision. Checkpointing trades a full forward
     /// re-run in backward (plus boundary host offload) for tape memory — a
     /// good trade only when the full tape would NOT fit: modeled footprint
     /// (per layer the hidden-stream + dominant MLP term, plus the exact LA
-    /// ctx bytes for hybrid layers) ×3 margin against free VRAM. The generic
-    /// term is a floor (attention scratch and allocator slack unmodeled); the
-    /// ×3 margin covers it — free/2 OOM'd at seq≈1350–1400 (agent-OPD smoke
-    /// 2026-07-03). The LA term landed with the batched LA device path
-    /// (ecc058b20); before it, batched long-completion writeback ran
-    /// full-tape and OOM'd at 97 GB (errors/2026-07-24). Unknown memory info
-    /// keeps the safe default (checkpoint).
+    /// ctx bytes for hybrid layers via `linear_attention_ctx_bytes`) ×3
+    /// margin against free VRAM. The generic term is a floor (attention
+    /// scratch and allocator slack unmodeled); the ×3 margin covers it —
+    /// free/2 OOM'd at seq≈1350–1400 (agent-OPD smoke 2026-07-03). The LA
+    /// term landed with the batched LA device path (ecc058b20); before it,
+    /// batched long-completion writeback ran full-tape and OOM'd at 97 GB
+    /// (errors/2026-07-24). Unknown memory info keeps the safe default
+    /// (checkpoint).
     fn should_checkpoint(
         &self,
         batch: usize,
@@ -2585,23 +2571,34 @@ impl Qwen35Model {
         self.gradient_checkpointing
             && tape.enabled
             && store.backend().device_mem_info().is_none_or(|(free, _)| {
-                let per_layer = batch
-                    * seq_len
-                    * (8 * self.config.hidden_size + 3 * self.config.intermediate_size)
-                    * 4;
+                let cfg = &self.config;
+                let per_layer =
+                    batch * seq_len * (8 * cfg.hidden_size + 3 * cfg.intermediate_size) * 4;
                 let la_layers = self
                     .layers
                     .iter()
                     .filter(|layer| matches!(layer.self_attn, Qwen35Attention::Linear(_)))
                     .count();
+                let la_ctx = linear_attention_ctx_bytes(LinearAttentionParams {
+                    batch,
+                    seq_len,
+                    num_key_heads: cfg.linear_num_key_heads,
+                    num_value_heads: cfg.linear_num_value_heads,
+                    key_dim: cfg.linear_key_head_dim,
+                    value_dim: cfg.linear_value_head_dim,
+                    conv_kernel: cfg.linear_conv_kernel_dim,
+                    eps: cfg.rms_norm_eps,
+                });
                 let total = per_layer
                     .saturating_mul(self.layers.len())
-                    .saturating_add(self.la_ctx_bytes(batch, seq_len).saturating_mul(la_layers));
+                    .saturating_add(la_ctx.saturating_mul(la_layers));
                 let engage = total.saturating_mul(3) > free;
-                eprintln!(
-                    "[ckpt-gate] engage={engage} batch={batch} seq={seq_len} \
-                     modeled={total}B (la_layers={la_layers}) free={free}B"
-                );
+                if engage {
+                    eprintln!(
+                        "[ckpt-gate] engage batch={batch} seq={seq_len} \
+                         modeled={total}B (la_layers={la_layers}) free={free}B"
+                    );
+                }
                 engage
             })
     }
