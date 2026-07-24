@@ -23,6 +23,15 @@ Progress spine. Entry classes recorded here the day they land: phase exits,
 default flips, and accept-or-reject verdicts (AGENTS.md §Docs lifecycle &
 progress spine).
 
+- **VERDICT — #160 device-fit park gate is a backstop, not a reachable path**
+  (2026-07-25, #160 closed; wins:
+  [2026-07-24-dsv4-band-exhaustion-park-gate](docs/experience/wins/2026-07-24-dsv4-band-exhaustion-park-gate.md)).
+  Four escalating 4×H20 pressure configs (to `kv_free_pages 0`, `queue_depth
+  37`) never fire the gate: host admission and the device band pool derive from
+  the same solved capacity, so admission binds first by construction. The old
+  fatal `band_extend` path never executed — 316 KV-overflow preempts, zero
+  errors, serve survived. #156's bench debt cleared in the same session (c4/c8/c16
+  +1.9/+11.3/+16.5% vs champion; c1 −8.6% is dataset-attributable, #180).
 - **DEFAULT FLIP — Qwen KV pool sizing: measured VRAM outranks the page floor**
   (2026-07-25, #178, `5c2931cd3`; wins:
   [2026-07-25-kv-pool-floor-yields-to-measured-vram](docs/experience/wins/2026-07-25-kv-pool-floor-yields-to-measured-vram.md)).

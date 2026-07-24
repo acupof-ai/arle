@@ -48,6 +48,15 @@ c1 38.9 out / TTFT 1093 ms · c4 75.0 · c16 142.9 · c32 **209.9 out / 2474
 total tok/s**. Cold prefill ~2560 tok/s. Raw: pod
 `bench-output/2026-07-17-p3-sweep/`. Rows below are the chunk-128 era.
 
+**DATASET GONE (2026-07-25, #180)** — `bench-prompts.jsonl` (the repeated-filler
+set, prefix hit_rate 0.925) no longer exists on the pod and has no in-repo
+generator (`gen_bench_prompts.py` produces the non-degenerate variant). The rows
+below are therefore **not reproducible as written**: a substitute of 20 unique
+docs from `bench-prompts-64.jsonl` measures hit_rate 0.048-0.767 and costs the
+c1 row ~9% (TTFT 442 → 1085 ms) on identical code. Re-anchor on
+`bench-prompts-64.jsonl` at the next accepted run; until then treat c1 Δ% here
+as uninterpretable and compare c4/c8/c16 only.
+
 Champion (chunk-128 era): `00b301643` (grid-parallel FP32 + slot hoist + carry coherence +
 plan repair), build `--features cuda,nccl`. **RE-ANCHORED fingerprint
 2026-07-17**: runner = `bench_throughput.py`, **max_tokens 256** (the earlier
