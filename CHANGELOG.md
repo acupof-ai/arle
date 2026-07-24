@@ -23,6 +23,13 @@ Progress spine. Entry classes recorded here the day they land: phase exits,
 default flips, and accept-or-reject verdicts (AGENTS.md §Docs lifecycle &
 progress spine).
 
+- **REJECT — group-stagger admission for CC preamble prefix reuse**
+  (2026-07-24, reverted in `2ab7883f1`; errors:
+  [2026-07-24-group-stagger-premise-false](docs/experience/errors/2026-07-24-group-stagger-premise-false.md)).
+  Pod A/B: baseline already prefix-hits — hit trajectories identical
+  (cumulative hit_tokens 4.243M vs 4.208M), claude-CLI boot spread +
+  ~90 s turn-1 publish serialize sample starts naturally; the modeled
+  8×21K concurrent cold-prefill waste does not occur.
 - **ACCEPT — agent-OPD sandbox staging outside the repo** (2026-07-24,
   `6bd40d663`+`b0a29443e`+`031c8c3f8`+`e21557fbc`). Sandboxes under the ARLE
   checkout made `claude -p` ingest the repo `CLAUDE.md`: ~31K prompt
