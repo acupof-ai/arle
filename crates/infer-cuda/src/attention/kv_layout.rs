@@ -480,8 +480,9 @@ impl Dsv4LayerKvLayout {
     /// table changed (drives the device-table dirty bit). No-op (false) on
     /// identity (V32) layers — `mirror_band` owns their tables — and when the
     /// table already covers `tokens`. Exhaustion here is a HARD error: the
-    /// engine's page-availability admission (conservative full-projection
-    /// reserve) must make it unreachable.
+    /// engine's device-budget plan gate (`kv_device_free_pages` +
+    /// `kv_device_pages_needed`, #160 — parks over-admitted rows before
+    /// submit) must make it unreachable.
     pub(crate) fn flashmla_ensure_band(
         &mut self,
         ctx: &DeviceContext,
@@ -500,7 +501,7 @@ impl Dsv4LayerKvLayout {
         let new_pages = pool.band_extend(slot_idx, needed - have).map_err(|e| {
             anyhow!(
                 "DSv4 FlashMLA layer pool exhausted growing slot {slot_idx} to {tokens} tokens \
-                 ({have}->{needed} pages) — page-availability admission should make this \
+                 ({have}->{needed} pages) — the device-budget plan gate (#160) should make this \
                  unreachable: {e}"
             )
         })?;
@@ -1042,6 +1043,49 @@ impl Dsv4KvAdapter {
     /// uniform across layers (MODEL1 vs V32 is a model-wide shape).
     pub(crate) fn flashmla_demand_paged(&self) -> bool {
         self.layers.iter().any(|l| l.flashmla_demand_paged)
+    }
+
+    /// Tightest demand-paged layer pool's free-page count, for the engine's
+    /// device-budget plan gate (#160). Rows are charged their worst-layer
+    /// need (`flashmla_demand_pages_needed`), so min-free across layers is a
+    /// conservative shared budget: every layer can serve every charged row.
+    /// Host free-list length only — no device readback (CUDA-graph safe).
+    /// None = no demand-paged layer (identity/V32 bands are fully drawn at
+    /// slot alloc; the gate stays inert).
+    pub(crate) fn flashmla_demand_free_pages(&self) -> Option<usize> {
+        self.layers
+            .iter()
+            .filter(|l| l.flashmla_demand_paged)
+            .map(|l| {
+                l.flashmla_kv_pool
+                    .as_ref()
+                    .map_or(0, TokenKVPool::free_page_count)
+            })
+            .min()
+    }
+
+    /// Worst-layer band growth `flashmla_ensure_band` will draw for `slot`
+    /// at `target_tokens` — the same `needed - have` math and MTP verify
+    /// margin as `prepare_kv_batch`'s `ensure_tokens`. None when no layer is
+    /// demand-paged.
+    pub(crate) fn flashmla_demand_pages_needed(
+        &self,
+        slot: usize,
+        target_tokens: usize,
+    ) -> Option<usize> {
+        let ensure_tokens = target_tokens + crate::dsv4::MAX_SPEC_DRAFT_DEPTH + 1;
+        self.layers
+            .iter()
+            .filter(|l| l.flashmla_demand_paged)
+            .map(|l| {
+                let have = l
+                    .flashmla_kv_pool
+                    .as_ref()
+                    .map_or(0, |p| p.page_indices(slot).len());
+                l.flashmla_band_pages_for(ensure_tokens)
+                    .saturating_sub(have)
+            })
+            .max()
     }
 
     /// Engine-facing admission page count. Demand-paged (#154 Phase 3b): the

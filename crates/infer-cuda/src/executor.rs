@@ -684,13 +684,27 @@ impl RealCudaExecutor {
 
     /// Device-pool headroom for the engine's plan gate. Qwen3.6 owns a
     /// self-allocated `full_attn_kv` whose retention (recall keepalive) the
-    /// host pool cannot see; dense Qwen mirrors the host pool exactly. DSv4's
-    /// demand-paged FlashMLA band pools have no aggregate free count yet —
-    /// `None` keeps its #164 exposure unchanged (deferred, not covered).
+    /// host pool cannot see; dense Qwen mirrors the host pool exactly. DSv4
+    /// reports its demand-paged FlashMLA band headroom (#160); identity/V32
+    /// bands are slot-fixed and stay `None`.
     pub(crate) fn kv_device_free_pages(&self) -> Option<usize> {
         match self {
             Self::Qwen35(q) => q.kv_device_free_pages(),
-            Self::Dsv4(_) | Self::Qwen(_) => None,
+            Self::Dsv4(d) => d.kv_device_free_pages(),
+            Self::Qwen(_) => None,
+        }
+    }
+
+    /// Per-row device demand for the same gate. Only DSv4's band growth
+    /// diverges from the engine's formula (#160).
+    pub(crate) fn kv_device_pages_needed(
+        &self,
+        slot: usize,
+        target_tokens: usize,
+    ) -> Option<usize> {
+        match self {
+            Self::Dsv4(d) => d.kv_device_pages_needed(slot, target_tokens),
+            Self::Qwen35(_) | Self::Qwen(_) => None,
         }
     }
 
