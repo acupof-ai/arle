@@ -287,6 +287,21 @@ pub fn boot_workdir(
     staged_tree: &Path,
     setup_cmd: Option<&str>,
 ) -> Result<PathBuf> {
+    // An ancestor CLAUDE.md cost ~31K tokens/request of CC preamble
+    // (wins/2026-07-24-agent-opd-gpu-busy-frac-measured-go.md). Per-run
+    // invariant of work_root, so warn once, not per boot.
+    static ANCESTOR_CLAUDE_MD_WARN: std::sync::Once = std::sync::Once::new();
+    if let Some(dir) = work_root.ancestors().find(|a| a.join("CLAUDE.md").exists()) {
+        ANCESTOR_CLAUDE_MD_WARN.call_once(|| {
+            eprintln!(
+                "[sandbox] WARN: work root {} sits under {} which carries CLAUDE.md — CC ingests \
+                 it as per-request preamble; stage --work-root outside any repo",
+                work_root.display(),
+                dir.display()
+            );
+        });
+    }
+
     let workdir = work_root.join(instance_id);
     if workdir.exists() {
         fs::remove_dir_all(&workdir)
@@ -294,22 +309,6 @@ pub fn boot_workdir(
     }
     fs::create_dir_all(&workdir)
         .with_context(|| format!("failed to create workdir {}", workdir.display()))?;
-
-    // `claude -p` ingests every ancestor CLAUDE.md as per-request preamble — a
-    // workdir under the ARLE checkout silently added ~31K tokens/request
-    // (wins/2026-07-24-agent-opd-gpu-busy-frac-measured-go.md).
-    if let Some(dir) = workdir
-        .ancestors()
-        .skip(1)
-        .find(|a| a.join("CLAUDE.md").exists())
-    {
-        eprintln!(
-            "[sandbox] WARN: workdir {} sits under {} which carries CLAUDE.md — CC ingests it as \
-             per-request preamble; stage --work-root outside any repo",
-            workdir.display(),
-            dir.display()
-        );
-    }
 
     // Copy the staged tree's CONTENTS into the workdir. `<src>/.` copies the
     // directory contents (incl. dotfiles) rather than nesting the dir itself.

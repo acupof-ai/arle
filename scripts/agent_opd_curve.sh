@@ -15,7 +15,7 @@
 # where it is set below; override any via env. SMOKE=1 = quick 2-round sizing run.
 # Optional env (full-run defaults):
 #   ARLE_BIN=target/release/arle  OUT_ROOT=runs  GPU=0  MODEL_CACHE=models
-#   WORK_ROOT=/tmp/agent-opd-work sandbox root — MUST be outside any repo tree
+#   WORK_ROOT=/tmp/agent-opd     sandbox root — MUST be outside any repo tree
 #                                 (an ancestor CLAUDE.md becomes ~31K/request CC preamble)
 #   STUDENT_MODEL=<dir>           override student (else fetch STUDENT_MODEL_HF_ID)
 #   STUDENT_MODEL_HF_ID=bottlecapai/ThinkingCap-Qwen3.6-27B-FP8
@@ -42,10 +42,7 @@ set -euo pipefail
 LABEL=${1:?usage: agent_opd_curve.sh <label>}
 ARLE_BIN=${ARLE_BIN:-target/release/arle}
 OUT=${OUT_ROOT:-runs}/agent-opd-"$LABEL"
-# Sandboxes must stage OUTSIDE any repo tree: `claude -p` ingests every ancestor
-# CLAUDE.md, and a workdir under the ARLE checkout added ~31K tokens/request
-# (wins/2026-07-24-agent-opd-gpu-busy-frac-measured-go.md).
-WORK=${WORK_ROOT:-/tmp/agent-opd-work}/"$LABEL"
+WORK=${WORK_ROOT:-/tmp/agent-opd}/"$LABEL"
 GPU=${GPU:-0}
 
 # Models: use a local dir if given, else auto-fetch from HF (honors HF_ENDPOINT
