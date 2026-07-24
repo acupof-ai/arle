@@ -101,24 +101,26 @@ CUDA half verified on **H20 sm_90** (DSv4-Flash-FP8 TP=4/EP=4) and built on
   the steady-state relay reader → TP=4 c8+ serve teardown (framing desync). Fixed
   in `837b89d39`; pod-confirmed c8 48/48 + c16 64/64, no teardown. See
   errors/2026-07-24-relay-hello-timeout-leak-tp4-teardown.md.
-- **c16 deficit — code-attributed on HEAD (no A/B), 2026-07-24:** the reported
-  −40% / c8→c16-1.16× is **not a HEAD code regression**. Traced every changed
-  line on the DSv4-spec-none c16 path since champion `45dd64bd2`:
-  `Dsv4Model::forward_decode_batch` (the spec-none decode entry) is **byte-for-byte
-  identical**; `num_slots` is identical (7a8c0bdd4 adds `extra_per_slot_bytes=0`
-  for spec-off → `per_slot` unchanged; the total_pages override was reverted in
-  6a5c39282); `allocate_for_plan`'s device gate returns `None` for DSv4 (dead);
-  `build_forward_plan` batches all decodes uncapped. The only new op on the path
-  — a DSpark T3 tap D2D per row (`if dspark` at dsv4.rs) — is µs-scale; a
-  1.58→1.16 scaling drop needs **~ms/row** added cost (≈1000× larger). So the
-  −40% is a **measurement artifact** (cross-day/box/thermal champion baseline),
-  not code. **Fixed one real defect found in the trace:** the tap capture was
-  gated on the checkpoint's `is_dspark()`, so a spec-off serve on a DSpark
-  checkpoint paid N per-row tap D2Ds/step for taps nothing reads. Now gated on a
-  runtime `capture_taps` flag (true only at the spec anchor call). Dead-work
-  removal on the spec-off decode hot path; **pending-remote** pod bench (CUDA,
-  can't run locally) — not expected to move the c16 number (µs-scale), lands as
-  a correctness/hygiene fix.
+- **c16 deficit — pod-measured on HEAD `2ffc19736` (single-binary, 2026-07-24):**
+  the reported −40% / c8→c16-1.16× **does not reproduce**. Clean H20 sm_90
+  TP=4/EP=4 spec=none, 120 s/point: c1 38.4 / c8 106.4 / **c16 186.7** out tok/s →
+  **c8→c16 = 1.754×**, *above* the champion's 1.58×. The earlier 1.16× was a
+  **measurement artifact** (confounded binary / box / thermal), confirming the
+  code trace: `Dsv4Model::forward_decode_batch` is byte-identical to champion
+  `45dd64bd2` and `num_slots` is unchanged. Needle 15/15 exact DET (matches
+  champion). Batch-scaling cost (M4 phase probe) is **MoE +14.4 ms/+58%** and the
+  per-row indexer scan **compidx +7.4 ms/+78%** — inherent DSv4 architecture, not
+  a regression; compidx is the known batched-compressor optimization lever.
+- **Tap-capture fix correction (`2ffc19736`):** it is a **no-op for the production
+  DSv4-Flash-FP8 checkpoint** — my load-bearing premise "`is_dspark()`=true on the
+  served checkpoint" was **wrong**. Pod fact: the base `config.json` carries NO
+  `dspark_block_size`; the `=5` / `dspark_target_layer_ids=[40,41,42]` live in a
+  separate DSpark **draft** config merged only under `--spec-type dspark`. Runtime
+  ledger: `dspark_taps=0` on all ranks → `is_dspark()=false` → the tap capture
+  never ran for spec=none. The v4.rs "Real ckpt: 5" comment refers to the draft,
+  not the base serve checkpoint. The fix stays (a correct altitude change: gate
+  tap capture on whether the caller consumes taps, not on a checkpoint property),
+  but it removes **zero** work in this bench — not the "dead work" first claimed.
 
 ## Rule
 
