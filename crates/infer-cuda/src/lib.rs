@@ -952,14 +952,21 @@ impl BackendExecutor for CudaExecutor {
         }
     }
 
-    fn kv_device_fit(&self, rows: &[infer_seam::DeviceRowDemand]) -> Option<usize> {
+    fn kv_device_gate_active(&self) -> bool {
+        match &self.inner {
+            CudaExecutorInner::Placeholder => false,
+            #[cfg(feature = "cuda")]
+            CudaExecutorInner::Real(real) => real.kv_device_gate_active(),
+        }
+    }
+
+    fn kv_device_fit(&self, rows: &[infer_seam::DeviceRowDemand], unfit: &mut Vec<usize>) {
         match &self.inner {
             CudaExecutorInner::Placeholder => {
-                let _ = rows;
-                None
+                let _ = (rows, unfit);
             }
             #[cfg(feature = "cuda")]
-            CudaExecutorInner::Real(real) => real.kv_device_fit(rows),
+            CudaExecutorInner::Real(real) => real.kv_device_fit(rows, unfit),
         }
     }
 
