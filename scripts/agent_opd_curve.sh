@@ -23,6 +23,9 @@
 #   UPDATE_STRATEGY=dapo          policy-update rule {dapo,gspo,dr-grpo,grpo,rejection-ce,...}
 #   STALENESS=1                   1 = train on a batch while the next generates
 #                                 (dapo/dr-grpo/gspo only); 0 = wait for each batch
+#   GROUP_STAGGER=false           true = hold a group's samples until the first one's
+#                                 opening request radix-publishes the ~18K shared CC
+#                                 preamble (rest prefix-hit instead of K cold prefills)
 #   TASK_SELECTION=true           skip prompts that always pass or always fail
 #   COMFORT_BAND=1                profile 1 round, then train only the "band": drop
 #                                 always-pass/always-fail AND >CB_MAX_SEQ tasks the
@@ -140,6 +143,7 @@ common_args=(
     --rollout-temperature "$ROLLOUT_TEMPERATURE"
     --samples-per-prompt "$SAMPLES"
     --serve-port "${SERVE_PORT:-8000}"
+    --group-stagger "${GROUP_STAGGER:-false}"
     --sync every-group
     --test-timeout-secs 60
     --writeback-cap "$WRITEBACK_CAP"
