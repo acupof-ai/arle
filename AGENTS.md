@@ -128,10 +128,11 @@ default bar for all output, not a style preference. Omit needless words (Strunk)
  `ensure!`, `.is_some_and()`) over a hand-rolled block. Self-documenting names
  kill most comments (Kernighan & Pike). Named temporary that only aliases the
  prior line = noise. Test: a reader parses the intent in **one pass**.
-- **Comments — the *why*, never the *what*.** ≤1–2 lines on the non-obvious
- reason / invariant / ordering (Ousterhout: "self-documenting" is a beautiful
- lie — write only what the code *can't* say). A comment restating the code is
- debt; delete it. No essay blocks.
+- **Comments — the *why*, never the *what*, in ≤1 line.** Extremely simplified:
+ one short clause on the non-obvious reason / invariant / ordering — nothing the
+ code already says (Ousterhout: "self-documenting" is a beautiful lie). A comment
+ restating the code is debt; delete it. Needs 2+ lines? The name is wrong, not
+ the comment too short. No essay blocks.
 - **Docs — conclusion first, one type per doc.** Lead with the verdict, then
  reason, then detail (inverted pyramid). One doc = one Diátaxis mode
  (tutorial | how-to | reference | explanation) — mixing bloats. One idea per
