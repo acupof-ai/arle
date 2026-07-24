@@ -3362,10 +3362,12 @@ impl Dsv4Model {
         // Per-GEMV breakdown for this decode step (self-gates on
         // ARLE_DSV4_LINEAR_PROFILE; no-op otherwise). Reset here + print after the
         // phase log scopes the stats to ONE decode forward, exposing which linear
-        // (compressor_wkv/wgate, indexer_wq_b/weights, …) dominates compidx — the
-        // license for the batched-compressor pre-pass. NOTE: when enabled the
-        // profiler syncs per call, inflating absolute step ms; read it for the
-        // RELATIVE per-GEMV split, not the clean compidx (use phase_time alone for that).
+        // (compressor_wkv/wgate, indexer_wq_b/weights, …) dominates compidx. The
+        // batched-compressor pre-pass is default-on (P1a/P1b + prepass, since
+        // 2026-06-26); this profiler measures its residual per-GEMV cost —
+        // pending-remote on TP=4. NOTE: when enabled the profiler syncs per call,
+        // inflating absolute step ms; read it for the RELATIVE per-GEMV split, not
+        // the clean compidx (use phase_time alone for that).
         crate::linear_profile::reset();
         for r in 0..n {
             let slot = &slots[slot_ids[r]];
@@ -5055,7 +5057,8 @@ impl Dsv4Model {
         }
         // Per-step per-GEMV breakdown (rank-0 only; self-gates on
         // ARLE_DSV4_LINEAR_PROFILE). Sums the compressor/indexer m=1 GEMVs that
-        // compose compidx — confirms (or kills) the batched-compressor lever.
+        // compose compidx — the residual after the default-on batched-compressor
+        // pre-pass, for the pending-remote TP=4 perf measurement.
         crate::linear_profile::print_rank0("decode-step");
         Ok((stream, keepalive))
     }
