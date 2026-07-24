@@ -1,0 +1,27 @@
+CHANGELOG.md
+  s_fc4fd4204b7128::t_722e4ce6ac4a68 26-34
+docs/baselines.md
+  s_fc4fd4204b7128::t_a003d1ef43f94a 51-59
+docs/experience/wins/2026-07-24-dsv4-band-exhaustion-park-gate.md
+  s_fc4fd4204b7128::t_3d58478bac6237 3-5,39-71,79-83
+docs/experience/wins/2026-07-24-recompute-resume-at-committed.md
+  s_fc4fd4204b7128::t_a3b345fa8461b3 3-4,38-65
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "d3910250d743fae5362a75d33853073554ebde4b",
+  "prompts": {},
+  "sessions": {
+    "s_fc4fd4204b7128": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aa7d3accbab9aea71",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
