@@ -595,7 +595,7 @@ struct TaskStats {
     retired: bool,
 }
 
-/// P5 pass-rate task selection: variance-weighted sampling — concentrate rollout
+/// Pass-rate task selection: variance-weighted sampling — concentrate rollout
 /// on the p≈0.5 max-variance band where reward-bearing R(p,k)=1−p^k−(1−p)^k peaks
 /// — plus EMA-pass retirement of mastered tasks, with a 0.1 exploration floor.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
@@ -653,7 +653,7 @@ impl TaskSelection {
     }
 }
 
-/// P8 experience replay: age-bounded, |A|-prioritized buffer of trained
+/// Experience replay: age-bounded, |A|-prioritized buffer of trained
 /// groups. Entries keep the batch as trained — including the behavior
 /// logprobs captured at FIRST use, so a replayed update's IS ratio is taken
 /// against the true π_behavior instead of a recomputed ratio ≈ 1.
@@ -2292,7 +2292,7 @@ fn run_cc_eval(
 /// group's cc children have exited by the time this runs, so any request still
 /// in flight is an orphan by definition (its client is dead) — cancel them all,
 /// then REQUIRE active_requests == 0: a live request past this point reads
-/// stale or freed engine state (the P4 baseline's engine-thread panic).
+/// stale or freed engine state (an engine-thread panic).
 #[cfg(feature = "cuda")]
 fn quiesce_serve(
     engine: &std::sync::Arc<std::sync::Mutex<infer_api::LoadedInferenceEngine>>,
@@ -2330,7 +2330,7 @@ fn quiesce_serve(
     }
 }
 
-/// One task group's pending rollout (P7 `--staleness` dial). Staleness 0 keeps
+/// One task group's pending rollout (`--staleness` dial). Staleness 0 keeps
 /// today's boot-ahead: sandboxes build in the background, the rollout itself
 /// runs inline at collect (strictly on-policy). Staleness 1 runs the WHOLE
 /// rollout on a background thread launched before the previous group's
@@ -2465,7 +2465,7 @@ struct ReplayRecord {
     prompt_ids: Vec<u32>,
     response_ids: Vec<u32>,
     response_mask: Vec<u8>,
-    /// Generation-time behavior logprobs (one per masked token; F.6 input).
+    /// Generation-time behavior logprobs (one per masked token).
     #[serde(default)]
     gen_logprobs: Vec<f32>,
     /// Attempt reward for SAO advantage; pre-reward records (CE-only flow)
@@ -2570,9 +2570,9 @@ fn replay_pg(
                         response_mask: r.response_mask.clone(),
                         reward: r.reward,
                         rollout_logprobs,
-                        // Sidecar behavior logprobs: F.6 diagnostic only — the
-                        // IS ratio stays on the V0 recompute above until F.6
-                        // licenses the source flip.
+                        // Sidecar behavior logprobs: diagnostic only — the
+                        // IS ratio stays on the V0 recompute above until a
+                        // future license flips the source.
                         gen_logprobs: (!r.gen_logprobs.is_empty()).then(|| r.gen_logprobs.clone()),
                         group_id,
                         truncated: r.truncated,
@@ -2911,7 +2911,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
         tasks.len(),
         dataset.display()
     );
-    // P5 selection state: in-memory, this run only (metrics.jsonl has the history).
+    // Pass-rate selection state: in-memory, this run only (metrics.jsonl has the history).
     let mut selection = args.task_selection.then(|| TaskSelection::new(tasks.len()));
 
     // HELD-OUT eval tasks (separate from --dataset). Staged under
@@ -3020,15 +3020,15 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
         // agent-OPD: decode CUDA-graph default-OFF. Its captured workspace (~30 GB
         // on the 27B MoE, captured during the rollout's decode) would co-reside
         // with the masked-CE writeback and OOM it (post-rollout engine ~87 GB vs
-        // ~55 GB no-graph). F.5's ~26 GB headroom made it worth exposing as
-        // --qwen35-decode-graph; the default flip waits for the F.5 license.
+        // ~55 GB no-graph). A measured ~26 GB headroom made it worth exposing as
+        // --qwen35-decode-graph; the default flip waits for the co-residency license.
         args.runtime.qwen35_decode_graph,
         EngineLoadConfig {
             num_slots: width,
             page_size: 16,
             total_pages: cc_total_pages,
             // Request caps are POOL-derived, not per-session: capping at
-            // CC_SESSION_TOKENS silently aborted cc mid-conversation (P4
+            // CC_SESSION_TOKENS silently aborted cc mid-conversation (a
             // tripwire — sidecars showed prompt>22K → gen 0). The pool bounds
             // memory and the engine preempts under KV pressure (#162).
             max_prompt_tokens: cc_total_pages * 16 - 256,
@@ -3064,7 +3064,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
     infer_api::set_messages_dump_dir(&dump_dir)
         .with_context(|| format!("create cc dump dir {}", dump_dir.display()))?;
     let cc_model_id = infer_api::InferenceEngine::model_id(&student_engine).to_owned();
-    // Rollout = flag temperature (F.6: >0 keeps behavior logprobs non-empty) +
+    // Rollout = flag temperature (>0 keeps behavior logprobs non-empty) +
     // model nucleus from generation_config (truncates the tail — no salad).
     let mut sampling_defaults = infer_api::SamplingDefaults::from_generation_config(student_dir);
     sampling_defaults.temperature = args.rollout_temperature;
@@ -3325,7 +3325,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
     }
     let mut replay =
         (args.replay_reuse > 0).then(|| (ReplayBuffer::default(), PromptSampler::new(0x05EE_D1A7)));
-    // P7: LoRA-merge counter. A group is tagged with the version its rollouts
+    // LoRA-merge counter. A group is tagged with the version its rollouts
     // LAUNCHED under (behavior_version) and trains at the current version;
     // staleness = current − behavior (0 today; 1 for overlapped groups).
     let mut policy_version = 0u64;
@@ -3540,9 +3540,9 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
                     response_mask: r.response_mask,
                     reward: r.reward,
                     rollout_logprobs: None,
-                    // Sidecar behavior logprobs: F.6 diagnostic at staleness 0
-                    // (the IS ratio stays on the V0 recompute until F.6
-                    // licenses the flip); the ratio denominator for stale groups.
+                    // Sidecar behavior logprobs: diagnostic at staleness 0
+                    // (the IS ratio stays on the V0 recompute until a future
+                    // license flips it); the ratio denominator for stale groups.
                     gen_logprobs: (!r.gen_logprobs.is_empty()).then_some(r.gen_logprobs),
                     group_id: group_idx,
                     // Timeout/harness-error attempts: drop them from the update
@@ -3644,7 +3644,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
                     "kl_rollout": report.stats.kl_mean(),
                     "is_ratio_mean": report.stats.ratio_mean(),
                     "is_ratio_max": report.stats.ratio_max,
-                    // F.6: sidecar-vs-recompute logprob gap (0/absent tokens = no sidecar coverage).
+                    // Sidecar-vs-recompute logprob gap (0/absent tokens = no sidecar coverage).
                     "ratio_floor_mean": report.ratio_floor_mean,
                     "ratio_floor_max": report.ratio_floor_max,
                     "ratio_floor_tokens": report.ratio_floor_tokens,

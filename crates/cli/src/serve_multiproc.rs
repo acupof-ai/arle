@@ -26,7 +26,7 @@ const RELAY_TIMEOUT: Duration = Duration::from_secs(120);
 /// checkpoint load fit comfortably.
 const ENGINE_READY_FLOOR: Duration = Duration::from_secs(600);
 /// Conservative cold-read floor for scaling the barrier with checkpoint size
-/// (pod round-5: a 274 GB FP8 load off virtio needed ~31 min — the old fixed
+/// (a 274 GB FP8 load off virtio needed ~31 min — the old fixed
 /// 600 s killed every cold boot).
 const ENGINE_READY_COLD_READ_BPS: u64 = 100 << 20;
 const ENGINE_READY_CAP: Duration = Duration::from_secs(2 * 3600);

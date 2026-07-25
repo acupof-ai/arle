@@ -539,10 +539,6 @@ where
     })
 }
 
-// ---------------------------------------------------------------------------
-// Engine constructors
-// ---------------------------------------------------------------------------
-
 /// Build the default (MLX-free) scheduler-layer engine: an [`EchoExecutor`]
 /// wrapped in a [`TtftObserver`], backed by a host-side [`MetalKvPool`].
 ///
@@ -656,10 +652,8 @@ pub fn cuda_qwen35_engine_from_model_path(
     Ok(engine)
 }
 
-// ---------------------------------------------------------------------------
 // Concurrent (c>=2) drive — validates scheduler/executor behavior when multiple
 // requests are submitted at once.
-// ---------------------------------------------------------------------------
 
 /// Result of driving N concurrent requests through an engine to completion.
 #[derive(Debug, Clone)]

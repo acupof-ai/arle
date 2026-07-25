@@ -80,7 +80,7 @@ pub fn run() -> ExitCode {
     // non-Unix builds (the module isn't compiled there).
     // MUST run before the generic logger init below: workers install their own
     // `[rankN]`-prefixed logger, and `init` is call_once — a generic init first
-    // silently drops the prefix (pod round-4 finding).
+    // silently drops the prefix.
     #[cfg(all(unix, feature = "cuda"))]
     if let Some(code) = serve_multiproc::worker_entry() {
         return code;
@@ -93,7 +93,7 @@ pub fn run() -> ExitCode {
     // silent no-op, masking real failures. RUST_LOG overrides. Serve defaults
     // to `info`: the operator-facing startup truth (resolved KV tiers, the
     // checkpoint-scaled engine-ready barrier) is logged at info, and the
-    // multiproc coordinator was silently dropping it at `warn` (pod round-6).
+    // multiproc coordinator was silently dropping it at `warn`.
     // Pre-clap sniff — this must run before `Args::parse` (workers/subcommands
     // early-return) and `init` is call_once, so parse-then-init is not an option.
     let level = if std::env::args().any(|arg| arg == "serve") {

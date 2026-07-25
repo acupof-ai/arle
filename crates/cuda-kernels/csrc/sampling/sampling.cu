@@ -1,12 +1,9 @@
 #include "common.cuh"
 
-// ============================================================================
-// Argmax: find index of maximum value (fast single-request version)
-// ============================================================================
+// Argmax: find index of maximum value (fast single-request version).
 // 1 block of 1024 threads. Each thread processes ceil(n/1024) elements using
 // vectorized bf16x2 loads where possible. Final reduction via warp shuffles
 // to avoid shared memory bank conflicts in the tail.
-// ============================================================================
 
 #define ARGMAX_BLOCK 1024
 #define ARGMAX_NUM_WARPS (ARGMAX_BLOCK / WARP_SIZE)
@@ -86,13 +83,11 @@ __global__ void argmax_kernel_fast(const __nv_bfloat16 *__restrict__ x,
     }
 }
 
-// ============================================================================
 // Argmax + logprob: find max token AND compute its log-probability.
 // Same scan as argmax but also accumulates sum_exp for log-softmax denominator.
 // logprob(selected) = x_selected - log(Σ exp(x_i))
 //                   = max_val - (max_val + log(Σ exp(x_i - max_val)))
 //                   = -log(Σ exp(x_i - max_val))
-// ============================================================================
 __device__ __forceinline__ float warp_reduce_sum_f(float val) {
     #pragma unroll
     for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2)
@@ -174,14 +169,10 @@ __global__ void argmax_logprob_kernel(const __nv_bfloat16 *__restrict__ x,
     }
 }
 
-// ============================================================================
-// Batched argmax: one block per request, processes B logit vectors in one launch
-// ============================================================================
+// Batched argmax: one block per request, processes B logit vectors in one launch.
 // Input:  logits [B, vocab_size] contiguous bf16
 // Output: token_ids [B] int32
 // Launch: B blocks of 1024 threads
-// ============================================================================
-
 __global__ void argmax_batch_kernel(const __nv_bfloat16 *__restrict__ logits,
                                     int *__restrict__ token_ids,
                                     int vocab_size) {
@@ -246,9 +237,7 @@ __global__ void argmax_batch_kernel(const __nv_bfloat16 *__restrict__ logits,
     }
 }
 
-// ============================================================================
 // Batched argmax + logprob: B blocks, each computes argmax AND logprob.
-// ============================================================================
 __global__ void argmax_batch_logprob_kernel(
     const __nv_bfloat16 *__restrict__ logits,
     int *__restrict__ token_ids,
@@ -316,11 +305,9 @@ __global__ void argmax_batch_logprob_kernel(
     }
 }
 
-// ============================================================================
-// GPU Sampling: temperature → softmax → top-k → top-p → multinomial
+// GPU Sampling: temperature → softmax → top-k → top-p → multinomial.
 // Single block, 256 threads. Requires FP32 scratch buffer of vocab_size.
 // Random number and sampling parameters passed from CPU.
-// ============================================================================
 #define SAMPLE_BLOCK 256
 #define SAMPLE_NUM_WARPS (SAMPLE_BLOCK / WARP_SIZE)
 
@@ -596,7 +583,6 @@ __global__ void gpu_sample_kernel(
   }
 }
 
-// ============================================================================
 // DSpark sampled spec-decode device path.
 // Mirrors infer-plan `sample_token` filtering semantics: temperature softmax
 // normalized by the FULL vocab sum, then top-k -> top-p -> min-p applied to
@@ -606,7 +592,6 @@ __global__ void gpu_sample_kernel(
 // no curand, so same-seed-twice stays byte-identical.
 // Single-row kernels run one block (the existing gpu_sample_kernel shape);
 // the batched verify filter runs one block per row.
-// ============================================================================
 
 // Block-wide sum with broadcast to all threads. `scratch` needs
 // SAMPLE_NUM_WARPS floats; safe to reuse across calls (trailing barrier).
