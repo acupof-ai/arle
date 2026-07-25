@@ -1,0 +1,25 @@
+.claude/agents/devops.md
+  s_9c91b86ec3fb55::t_c1583c8a54343f 25-32
+docs/experience/wins/2026-07-25-pin-model-weights-in-ram.md
+  s_9c91b86ec3fb55::t_c08b231f885bc3 1-61
+scripts/pin_model_cache.py
+  s_9c91b86ec3fb55::t_224b5e0d86b404 1-141
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "ec22c4f3dd6ef08dd92e02da98f271b2695fad96",
+  "prompts": {},
+  "sessions": {
+    "s_9c91b86ec3fb55": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4779911a-69b7-49db-bc83-daf5a48d6ca3",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
