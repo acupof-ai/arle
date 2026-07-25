@@ -59,25 +59,62 @@ runtime verifies (recompute-resume, band-exhaustion park-gate, both
   now fails loudly on a missing dataset and records `dataset.sha256` next to
   every result.
 
-### Spec-decode arms — `45dd64bd2` (2026-07-19, production-all-on)
+### Spec-decode arms (short-prompt) — `6aa4ca6d1` (2026-07-25, #183+#184 clean)
 
-Different dataset (`bench-prompts-64.jsonl` ~2.8k tok, 120 s/point) → Δ is vs
-each run's own Base, not the champion. Needle 15/15 strict. MTP accept_rate
-0.704. Raw: pod `/host/arle-evidence/prod-allon-45dd64bd-dsv4-*`.
+**Separate fingerprint** — short-prompt dataset
+`dspark_natural_128in_128out.jsonl` (sha `169b7c78…`, 20 prompts),
+**max_tokens 128**, 60 s/point, c=1,4,8,16, GPUs 4-7 TP=4/EP=4. Same binary,
+same session; Δ is vs this run's own no-spec (NOT the champion — different
+workload). 0 errors all arms. Raw: pod `bench-output/2026-07-25-R2-dsv4-*`.
 
-| c  | Base  | MTP      | MTP Δ      | DSpark | DSpark Δ |
-|----|------:|---------:|-----------:|-------:|---------:|
-| 1  | 38.0  | **46.2** | **+21.6%** | 38.1   | +0.3%    |
-| 4  | 74.6  | 70.2     | −5.9%      | 74.3   | −0.4%    |
-| 8  | 123.7 | 72.0     | −41.8%     | 121.9  | −1.5%    |
-| 16 | 195.7 | 69.7     | −64.4%     | 117.6  | −39.9%   |
+| c  | no-spec | MTP   | MTP Δ  | DSpark | DSpark Δ |
+|----|--------:|------:|-------:|-------:|---------:|
+| 1  | 42.39   | 36.51 | −13.9% | **44.52** | **+5.0%** |
+| 4  | 79.46   | 42.57 | −46.4% | 61.00  | −23.2%   |
+| 8  | 136.44  | 51.74 | −62.1% | 76.57  | −43.9%   |
+| 16 | 174.46  | 61.94 | −64.5% | 90.66  | −48.0%   |
 
-- **MTP: c1-only win** — draft verification serializes under concurrency, c4+
-  regresses. Not a default-flip candidate.
-- **DSpark: not triggered** — `--dspark-max-prompt-tokens 64` routes all
-  ~2.8k-tok bench prompts to no-spec. Needs a short-prompt workload to measure
-  gain. Batched-verify c8/c16 OOM'd on a stale-memory GPU (inconclusive,
-  [win](experience/wins/2026-07-21-dspark-batched-verify-c8-c16.md)).
+accept_rate (server-stats): MTP ~0.15, DSpark ~0.30. Slot lines: no-spec
+`per_slot 338MB → 59 slots`, MTP `381MB → 49`, DSpark `607MB → 22`
+(`stages=3 block=5 target_layers=[40,41,42]`).
+
+- **Both spec arms are c=1-only** — DSpark +5.0% at c=1, net-negative at c≥4;
+  MTP negative everywhere on this shape. At c≥4 the batch is already
+  GPU-saturated, so draft/verify overhead + the reduced slot count dominate.
+  Not default-flip candidates.
+- **#183 fix confirmed** — the earlier c=16 −49.9% "DSpark collapse" was the
+  train-capture per-step 2×D2H+2×sync serializing the TP=4 NCCL pipeline
+  (default-off consumer). Gated on the train sidecar now; the curve above is
+  the real spec-decode shape, no crash.
+- **#184 confirmed** — spec scratch sized to the real verify width (6/9 rows),
+  DSpark per_slot 645→607MB.
+
+## ThinkingCap-Qwen3.6-27B-FP8 · 1×H20 · single-GPU · eager · port 8200
+
+**2026-07-25 (`6aa4ca6d1`, #183+#184 clean)** — canonical CUDA agentic model
+(`bottlecapai/ThinkingCap-Qwen3.6-27B-FP8`, ~29 GB, qwen35 hybrid, TP=1).
+Dataset `dspark_natural_128in_128out.jsonl` (sha `169b7c78…`), **max_tokens
+128**, 60 s/point, c=1,4,8,16, GPU 4. Same binary, same session; Δ vs this
+run's own no-spec. 0 errors all arms. Coherent (thinking model, answer in
+`reasoning_content`). Raw: pod `bench-output/2026-07-25-R2-tc-*`.
+
+| c  | no-spec | MTP   | MTP Δ  | DSpark | DSpark Δ  |
+|----|--------:|------:|-------:|-------:|----------:|
+| 1  | 38.62   | 42.31 | +9.6%  | **60.83** | **+57.5%** |
+| 4  | 75.10   | 40.29 | −46.4% | 52.09  | −30.6%    |
+| 8  | 126.01  | 40.59 | −67.8% | 52.52  | −58.3%    |
+| 16 | 150.89  | 40.37 | −73.3% | 53.02  | −64.9%    |
+
+accept_rate (server-stats): MTP ~0.17, DSpark ~0.10–0.13. Slot lines: no-spec
+`343360 tok / 22.5 GB`, MTP `330560 tok / 21.7 GB`, DSpark `121920 tok / 8.0
+GB` (DFlash drafter `z-lab/Qwen3.6-27B-DFlash`, `block=16 taps=[1,16,31,46,61]`).
+
+- **DSpark c=1 +57.5%** is the strongest spec-decode signal in either model —
+  27B single-GPU at c=1 is decode-bound, exactly where spec decode wins. Both
+  spec arms go net-negative at c≥4 (batch saturates the single GPU).
+- **TP=1 lockstep deadlock FIXED** — 60 s liveness probe returned coherent
+  output, 0 `lockstep stalled` lines across the sweep. The `world_size ≤ 1`
+  early-return holds; the V100 W4A16 −91% hang below does NOT reproduce here.
 
 ## Qwen3.6-27B-W4A16 · 1×V100 (sm_70) · eager · port 8080
 
