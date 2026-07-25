@@ -1,0 +1,25 @@
+CHANGELOG.md
+  s_cd9a6a56daabe3::t_f25c99e6aac602 233-241
+docs/experience/errors/2026-07-25-s1a-frozen-prefix-kv-bf16-no-vram-win-kill.md
+  s_cd9a6a56daabe3::t_56c1da29bfa8e5 1-72
+docs/plans/2026-07-25-fullchain-bf16-tape.md
+  s_cd9a6a56daabe3::t_0df31ef733bc9b 3-13
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "e5f322937d91c42fb0e19a9274ff038b85389a23",
+  "prompts": {},
+  "sessions": {
+    "s_cd9a6a56daabe3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "bf8ec25a-c05e-46a4-b093-1e67694ece0c",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
