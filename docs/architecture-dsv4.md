@@ -491,34 +491,30 @@ CUDA-only. Adaptive skip via `ARLE_DSV4_MTP_ADAPTIVE` (B=1 only).
 
 ## 7. Latest spec-decode practice — DeepSeek DSpark (2026-06-27)
 
-> **Status 2026-07-25 — IMPLEMENTED and SERVED; the official head is public and
-> already imported.** `deepseek-ai/DeepSeek-V4-Flash-DSpark` (MIT, 167 GB) ships
-> the trained head as a 3-stage draft chain; its draft delta (shards 46-48/48)
-> is on the pod at `/host/DeepSeek-V4-Flash-DSpark-draft`, requantized to
-> `mtp{0,1,2}-fp8.safetensors` and assembled at `.../-draft-fp8/`, and all four
-> TP ranks load it (`dspark_draft_model: Some(…)`). **There is nothing to train**
-> — the artifact's 4705 tensors match `Dsv4DsparkStage` field-for-field:
-> `mtp.0.main_proj.{weight,scale}` + `main_norm` on the entry stage,
-> `mtp.2.{hc_head_*, confidence_head.proj, markov_head.markov_w1/w2}` on the
-> exit stage. `config.json` carries exactly the keys `merge_dspark_metadata`
-> requires: `dspark_block_size 5`, `dspark_target_layer_ids [40,41,42]`,
-> `dspark_markov_rank 256`, `dspark_noise_token_id 128799`.
+> **Nothing to train — the trained head is public.**
+> `deepseek-ai/DeepSeek-V4-Flash-DSpark` (MIT) ships it as a 3-stage draft chain,
+> 4705 tensors matching `Dsv4DsparkStage` field-for-field: `mtp.0.main_proj.
+> {weight,scale}` + `main_norm` (entry), `mtp.2.{hc_head_*, confidence_head.proj,
+> markov_head.markov_w1/w2}` (exit). `config.json` carries every key
+> `merge_dspark_metadata` requires: `dspark_block_size 5`,
+> `dspark_target_layer_ids [40,41,42]`, `dspark_markov_rank 256`,
+> `dspark_noise_token_id 128799`. Only the ~10 GB draft delta (shards 46-48/48)
+> is needed; requantize MXFP4→FP8 with `scripts/requant_dspark_mxfp4_to_fp8.py`.
+> DSpark on DSv4-Flash is **shipped and served** (TP=4, all ranks load it).
 >
-> **The remaining wall is capacity and trigger, not the head.** The serve log
-> reads `DSpark draft reserve 19000MB, pool_total 141MB, affordable 1` — the
-> 19 GB draft reserve starves the KV pool to one slot (same class as #182) — and
-> [baselines](baselines.md)' DSv4 DSpark arm reads ~no-op only because
-> `--dspark-max-prompt-tokens 64` routed every ~2.8k-tok bench prompt to
-> no-spec. Short-prompt datasets exist at `/host/dspark_natural_*.jsonl`.
+> **The wall is capacity and trigger, not the head.** `DSpark draft reserve
+> 19000MB, pool_total 141MB, affordable 1` — the draft reserve starves the KV
+> pool to one slot (#182 class). And [baselines](baselines.md)' DSv4 DSpark arm
+> reads ~no-op because `--dspark-max-prompt-tokens 64` routes multi-k-token
+> prompts to no-spec: not measured, not ineffective.
 >
-> Paper: *DSpark:
-> Confidence-Scheduled Speculative Decoding with Semi-Autoregressive Generation*
-> (DeepSeek × Peking University, 2026-06-27), open-sourced as the **DeepSpec**
-> full-stack training/eval codebase (MIT; ships DSpark + DFlash + EAGLE-3
-> reference impls). Numbers below are the authors' claims from secondary
-> reporting — **treat as hypothesis until reproduced under our bench-and-trace
-> spec.** This section exists to anchor our own MTP roadmap against the current
-> SOTA, not to assert measured results.
+> Paper: *DSpark: Confidence-Scheduled Speculative Decoding with
+> Semi-Autoregressive Generation* (DeepSeek × PKU, 2026-06-27); code
+> [DeepSpec](https://github.com/deepseek-ai/DeepSpec) (MIT; DSpark + DFlash +
+> EAGLE-3). **DeepSpec publishes no V4 config** — only Qwen3-4B/8B/14B and
+> Gemma-4-12B — so training a V4 head means writing the DSv4 target adapter
+> yourself, plus a hidden-state cache (~38 TB at DeepSpec's Qwen3-4B default).
+> Below: authors' claims, hypothesis until reproduced under our bench spec.
 
 ### 7.1 The problem DSpark targets
 Existing draft families trade off two ways:
@@ -540,16 +536,14 @@ prefix dependency token-by-token (cheaply). Two head variants:
  (`markov_rank` ~256).
 - **RNN head**: a GRU-style cell accumulating the full prefix.
 
-**Draft width = TRUNK width, always.** The paper's generic sketch quotes
-`draft_hidden_size~1024`; do not read that as a narrow backbone — no published
-draft design runs below trunk width, because the head shares the target's frozen
-embedding and LM head, so narrowing would need a lossy projection back up over a
-129,280-vocab logit path. Real artifacts: the V4 head is `hidden_size 4096`
-(= V4-Flash trunk), and `z-lab/Qwen3.6-27B-DFlash` is `hidden_size 5120` / 5
-layers (= its trunk) — which is why `load_dspark_head`'s
-`ensure!(cfg.hidden_size == trunk_hidden)` has never tripped. The size lever is
-**layer count**, and it saturates early: DSpark reports a 2-layer head beating a
-5-layer DFlash. V4 uses 3 stages, `block_size 5`, taps `[40,41,42]`.
+**Draft width = TRUNK width.** The head shares the target's frozen embedding and
+LM head, so a narrower backbone would need a lossy projection back up over a
+129,280-vocab logit path; no published design does it. V4 head `hidden_size 4096`
+(= trunk), `z-lab/Qwen3.6-27B-DFlash` 5120 / 5 layers (= its trunk) — hence
+`load_dspark_head`'s `ensure!(cfg.hidden_size == trunk_hidden)`. The paper's
+`draft_hidden_size~1024` sketch is not an artifact shape. Size lever is **layer
+count**, saturating early (DSpark's 2-layer beats DFlash's 5-layer). V4: 3
+stages, `block_size 5`, taps `[40,41,42]`.
 
 ### 7.3 Mechanism 2 — confidence-scheduled verification
 A **confidence head** predicts a per-draft-token survival probability; a
@@ -582,16 +576,14 @@ lowest-risk first probe (it reuses the existing chain-verify + rollback
 machinery; only the `depth` decision changes), and it is exactly the axis where
 the runtime already has the batch/SLO state the scheduler needs.
 
-**Acceptance-bar framing.** State the gate as *absolute accepted tokens per
-step*, never as a percentage of the window: with confidence scheduling the
-effective window is per-request, so a ratio bar silently retightens whenever it
-moves. For calibration, published EAGLE-3-class heads reach τ ≈ 2.5–3.4 on
-120B–235B MoE targets, DeepSeek's own V3 MTP 3.96, and DSpark on V4-Pro ~5.
-**Pair the acceptance gate with a wall-clock gate at production concurrency** —
-on MoE targets verification overhead runs 1.5–3×, and at high concurrency the
-break-even acceptance can exceed 1.0, i.e. no achievable acceptance recovers the
-loss. That confounder is precisely what the confidence scheduler exists to
-manage, which is why the scheduler — not the head — is the acceptance lever.
+**Acceptance bar = absolute accepted tokens/step, never a % of the window** —
+confidence scheduling makes the window per-request, so a ratio bar retightens
+itself. Calibration: EAGLE-3-class heads reach τ ≈ 2.5–3.4 on 120B–235B MoE, V3
+native MTP 3.96, DSpark on V4-Pro ~5. **Pair it with a wall-clock gate at
+production concurrency**: MoE verify overhead runs 1.5–3×, and at high
+concurrency break-even acceptance can exceed 1.0 — no acceptance recovers the
+loss. Managing that is what the scheduler is for; hence the scheduler, not the
+head, is the acceptance lever.
 
 ---
 

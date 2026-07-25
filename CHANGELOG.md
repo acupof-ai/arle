@@ -23,22 +23,19 @@ Progress spine. Entry classes recorded here the day they land: phase exits,
 default flips, and accept-or-reject verdicts (AGENTS.md §Docs lifecycle &
 progress spine).
 
-- **VERDICT — #127 "train a DSv4 draft head" is the wrong project: the official
-  head is public and already imported** (2026-07-25; docs/architecture-dsv4.md
-  §7 corrected). `deepseek-ai/DeepSeek-V4-Flash-DSpark` (MIT) ships the trained
-  3-stage head; its draft delta is on the pod, requantized to fp8 and assembled,
-  and all four TP ranks load it. Its 4705 tensors match `Dsv4DsparkStage`
-  field-for-field and its `config.json` carries exactly the keys
-  `merge_dspark_metadata` requires. The remaining wall is capacity and trigger —
-  `DSpark draft reserve 19000MB, pool_total 141MB, affordable 1` (#182 class) and
-  `--dspark-max-prompt-tokens 64` routing every bench prompt to no-spec — plus
-  the throughput-aware verify scheduler (#124), which is inference policy, not
-  weights. Also corrected: the "draft_hidden ~1024" spec was a paper sketch; real
-  heads are trunk-width (V4 4096, Qwen3.6-DFlash 5120), and no published design
-  goes narrower. A from-scratch Rust/autograd draft trainer is killed — our
-  autograd has no FP8 GEMM, no expert parallelism and no MoE backward, and
-  DeepSpec publishes no V4 config, so that path builds a distributed MoE trainer
-  to reproduce an existing MIT checkpoint.
+- **REJECT — #127 "train a DSv4 draft head"; the trained head is public**
+  (2026-07-25; docs/architecture-dsv4.md §7 corrected).
+  `deepseek-ai/DeepSeek-V4-Flash-DSpark` (MIT) ships a 3-stage head whose 4705
+  tensors match `Dsv4DsparkStage` field-for-field; DSpark on DSv4-Flash is
+  already served at TP=4. The wall is capacity (`draft reserve 19000MB,
+  pool_total 141MB, affordable 1` — #182 class) and trigger
+  (`--dspark-max-prompt-tokens 64` routes bench prompts to no-spec), plus the
+  throughput-aware verify scheduler (#124) — inference policy, not weights.
+  Draft width is trunk width (V4 4096, Qwen3.6-DFlash 5120); the paper's
+  "~1024" is not an artifact shape. A Rust/autograd draft trainer is killed:
+  no FP8 GEMM, no expert parallelism, no MoE backward, and DeepSpec ships no V4
+  config — that path builds a distributed MoE trainer to reproduce an existing
+  MIT checkpoint.
 - **VERDICT — #160 device-fit park gate is a backstop, not a reachable path**
   (2026-07-25, #160 closed; wins:
   [2026-07-24-dsv4-band-exhaustion-park-gate](docs/experience/wins/2026-07-24-dsv4-band-exhaustion-park-gate.md)).
