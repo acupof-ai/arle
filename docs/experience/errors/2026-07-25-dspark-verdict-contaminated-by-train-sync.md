@@ -82,19 +82,27 @@ Raw: pod `bench-output/2026-07-25-R2-dsv4-*`, verified vs `result.json`.
 | 16 | 174.46 | 90.66 | −48.0% | −49.9% |
 
 **The sync collapse is real and fixed** — but the curve is only mildly better,
-NOT restored to the 07-20 +63.8%. Two reasons the c≥4 arm is still net-negative,
-neither of which the gate addresses:
+NOT restored to the 07-20 +63.8%. The residual c≥4 net-negative is **not a second
+bug — it is the spec-decode compute-bound crossover**, a single mechanism:
 
-1. **Prediction MISSED, honestly.** §Fix predicted c=1 ~63 tok/s on the *07-20
-   dataset* (`bench-prompts-64` / max_tokens 256). This run used the 128/128
-   natural set, a **different fingerprint** — so +5.0% vs +63.8% is not a clean
-   falsification, but it is NOT the predicted return either. The 07-20 number is
-   not reproduced; whether that gap is the dataset or a second cause is
-   **undecided** — a same-dataset (256-out) rerun is still owed before #128.
-2. **Slot count, not just sync.** #184 cut DSpark per_slot 645→607MB (22 slots)
-   vs no-spec's 338MB (59 slots). At c≥4 the DSpark arm runs fewer concurrent
-   slots than no-spec — a real capacity gap the sync gate does not touch. The
-   arms still differ in more than speculation.
+- Every step drafts block=5 → target verifies 6 positions (anchor+5) but commits
+  only ~2.5 tok (accept 0.30, flat across c — measured, so draft quality is NOT
+  the variable). At **c=1** the decode is memory-bound with idle compute, so the
+  6-position verify is nearly free → net +5% (27B single-GPU c=1 +57.5%, deepest
+  memory-bound point). At **c=16** the target forward is compute-bound; the 6×
+  verify positions cost ~6× step time for the same 2.5 committed tok. Throughput
+  ratio ≈ committed/positions = 2.5/6 ≈ 0.42; measured 90.66/174.46 = 0.52 (above
+  0.42 because the 6 positions share KV context — only FFN/MoE scales linearly).
+
+**Prediction MISSED, honestly.** §Fix predicted c=1 ~63 tok/s on the *07-20
+dataset* (`bench-prompts-64` / max_tokens 256); this run used the 128/128 natural
+set, a **different fingerprint**, and got +5.0%. The 07-20 number is not
+reproduced — whether that gap is the dataset or a real second effect is
+**undecided**; a same-dataset (256-out) rerun is still owed before #128.
+
+Not the cause: #184 leaves DSpark at 22 slots vs no-spec 59, but 22 ≥ the c≤16
+tested here, so slot count is not a bottleneck below c=22 — it does not explain
+the c=4/8/16 loss. (Earlier draft flagged it as a second cause; retracted.)
 
 **Verdict: DSpark is a c=1 / low-concurrency win** (+5% DSv4, +57.5% on 27B
 single-GPU where c=1 is decode-bound), net-negative at c≥4 on this shape. #128
