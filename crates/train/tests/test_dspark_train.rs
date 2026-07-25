@@ -266,14 +266,15 @@ fn dspark_trainer_saves_loadable_markov_head() {
         assert_eq!(t.dtype(), safetensors::Dtype::BF16, "{name} dtype");
         assert_eq!(t.shape(), [VOCAB, RANK], "{name} shape");
     }
-    // Values must survive the f32 -> bf16 round trip, not just the shape.
-    let t = st.tensor("markov_head.markov_w1.weight").unwrap();
-    let round: Vec<f32> = t
-        .data()
-        .chunks_exact(2)
-        .map(|b| half::bf16::from_le_bytes([b[0], b[1]]).to_f32())
-        .collect();
-    for (i, (&a, &b)) in w1.iter().zip(&round).enumerate() {
+    // Values must survive the f32 -> bf16 round trip, not just the shape — and
+    // the reader that feeds `--dspark-markov-init` must agree with the writer.
+    let (round1, _) = train::dspark_train::load_markov_head(&path).unwrap();
+    assert_eq!(round1.len(), w1.len());
+    for (i, (&a, &b)) in w1.iter().zip(&round1).enumerate() {
         assert!((a - b).abs() <= a.abs() * 0.01 + 1e-6, "w1[{i}] {a} vs {b}");
     }
+
+    // A failed save must not eat the previous good checkpoint (write + rename).
+    assert!(trainer.save_weights(&path).is_ok());
+    assert!(!path.with_extension("safetensors.tmp").exists());
 }

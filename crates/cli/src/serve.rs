@@ -174,46 +174,65 @@ fn run_config(config: ServeConfig) -> ExitCode {
         config.options.port,
     );
 
-    // DSpark train sidecar: when `--dspark-train` is set alongside
-    // `--spec-type dspark`, spawn the acceptance-weighted trainer thread after
-    // the engine loads. The trainer drains the experience buffer the hot path
-    // populates and pushes updated Markov-head weights back into the running
-    // engine after each step. The guard is held for the serve lifetime so the
-    // thread stops on shutdown.
+    // DSpark head lifecycle, both halves of it, once the engine is loaded:
+    // `--dspark-markov-init` installs a previously trained head over the draft
+    // checkpoint's, and `--dspark-train` spawns the acceptance-weighted trainer
+    // thread that drains the hot path's experience buffer and hot-swaps updated
+    // weights back in. The guard is held for the serve lifetime so the thread
+    // stops on shutdown. Both need `--spec-type dspark`.
     #[cfg(feature = "cuda")]
     let dspark_guard = std::sync::Arc::new(std::sync::Mutex::new(None));
     #[cfg(feature = "cuda")]
     #[allow(clippy::type_complexity)]
     let on_engine_loaded: Option<
         Box<dyn Fn(&std::sync::Arc<LoadedInferenceEngine>) -> anyhow::Result<()> + Send + Sync>,
-    > = if config.options.spec.dspark_train {
-        if config.options.spec.spec_type != ServeSpecType::Dspark {
-            eprintln!("[ARLE serve] warning: --dspark-train requires --spec-type dspark; ignoring");
+    > = {
+        let train = config.options.spec.dspark_train;
+        let init = config.options.spec.dspark_markov_init.clone();
+        let is_dspark = config.options.spec.spec_type == ServeSpecType::Dspark;
+        if (train || init.is_some()) && !is_dspark {
+            eprintln!(
+                "[ARLE serve] warning: --dspark-train / --dspark-markov-init require \
+                 --spec-type dspark; ignoring"
+            );
+        }
+        if !is_dspark || (!train && init.is_none()) {
             None
         } else {
             let dspark_guard = std::sync::Arc::clone(&dspark_guard);
             let save_path = config.options.spec.dspark_train_out.clone();
-            Some(Box::new(move |engine| {
-                let guard = train::dspark_train::spawn_dspark_train_sidecar(
-                    std::sync::Arc::clone(engine),
-                    train::dspark_train::DsparkTrainConfig {
-                        save_path: save_path.clone(),
-                        ..Default::default()
-                    },
-                )?;
-                let Some(guard) = guard else {
-                    anyhow::bail!(
-                        "DSpark train sidecar not started (no experience buffer); \
+            Some(Box::new(
+                move |engine: &std::sync::Arc<LoadedInferenceEngine>| {
+                    if let Some(path) = &init {
+                        let (w1, w2) = train::dspark_train::load_markov_head(path)?;
+                        engine.update_dspark_markov_weights(&w1, &w2)?;
+                        eprintln!(
+                            "[ARLE serve] DSpark Markov head loaded from {}",
+                            path.display()
+                        );
+                    }
+                    if !train {
+                        return Ok(());
+                    }
+                    let guard = train::dspark_train::spawn_dspark_train_sidecar(
+                        std::sync::Arc::clone(engine),
+                        train::dspark_train::DsparkTrainConfig {
+                            save_path: save_path.clone(),
+                            ..Default::default()
+                        },
+                    )?;
+                    let Some(guard) = guard else {
+                        anyhow::bail!(
+                            "DSpark train sidecar not started (no experience buffer); \
                          --spec-type dspark requires a CUDA DSpark-capable engine"
-                    );
-                };
-                eprintln!("[ARLE serve] DSpark train sidecar started");
-                *dspark_guard.lock().unwrap() = Some(guard);
-                Ok(())
-            }))
+                        );
+                    };
+                    eprintln!("[ARLE serve] DSpark train sidecar started");
+                    *dspark_guard.lock().unwrap() = Some(guard);
+                    Ok(())
+                },
+            ))
         }
-    } else {
-        None
     };
     #[cfg(not(feature = "cuda"))]
     let on_engine_loaded = None;
@@ -396,6 +415,7 @@ fn resolve_spec_options(backend: ServeBackend, serve_args: &ServeArgs) -> ServeS
         mtp_draft_topk: serve_args.mtp_draft_topk,
         dspark_train: serve_args.dspark_train,
         dspark_train_out: serve_args.dspark_train_out.clone(),
+        dspark_markov_init: serve_args.dspark_markov_init.clone(),
     }
 }
 
