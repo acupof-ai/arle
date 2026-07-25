@@ -93,9 +93,19 @@ static BUFFER: OnceLock<DsparkExperienceBuffer> = OnceLock::new();
 /// Default capacity: enough for ~10s of B=1 traffic at 50 tok/s with block_size=7.
 const DEFAULT_CAPACITY: usize = 4096;
 
-/// Get or create the global buffer.
+/// Get or create the global buffer. Called by the `--dspark-train` sidecar at
+/// spawn — which is what arms [`capturing`].
 pub fn buffer() -> &'static DsparkExperienceBuffer {
     BUFFER.get_or_init(|| DsparkExperienceBuffer::new(DEFAULT_CAPACITY))
+}
+
+/// Whether the training sidecar is consuming experiences. The sidecar is the
+/// only thing that initializes `BUFFER`, so its presence IS the `--dspark-train`
+/// signal — no second flag to keep in sync. Capture costs two vocab-wide D2H
+/// copies and two full stream syncs per verify step, so the default serve must
+/// not pay it (#183).
+fn capturing() -> bool {
+    BUFFER.get().is_some()
 }
 
 /// Copy `HiddenStates` (bf16) to host as f32.
@@ -134,7 +144,7 @@ pub fn capture_dspark_experience(
     next_token_heads: bool,
 ) {
     let block_size = draft_tokens.len();
-    if block_size == 0 {
+    if block_size == 0 || !capturing() {
         return;
     }
     let draft_logits_host = hidden_states_to_host(ctx, draft_logits);
@@ -186,7 +196,7 @@ pub fn capture_dspark_experience_hidden(
     next_token_heads: bool,
 ) {
     let block_size = draft_tokens.len();
-    if block_size == 0 || col_len == 0 {
+    if block_size == 0 || col_len == 0 || !capturing() {
         return;
     }
     let vocab = target_logits.hidden_dim;
