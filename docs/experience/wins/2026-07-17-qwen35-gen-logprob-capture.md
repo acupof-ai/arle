@@ -2,7 +2,7 @@
 
 > Status: Shipped — F.6 ratio-floor measured on real cc rollout groups
 > (H20 f6d, 2026-07-18), per plan §P6
-> ([2026-07-16-agent-rl-unified-infra](../../plans/2026-07-16-agent-rl-unified-infra.md)).
+> (2026-07-16-agent-rl-unified-infra).
 > Sibling of [2026-07-17-qwen35-mtp-rejection-sampling](2026-07-17-qwen35-mtp-rejection-sampling.md).
 
 ## F.6 verdict (H20 f6d, 2026-07-18)

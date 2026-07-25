@@ -2,7 +2,7 @@
 
 > Status: pending-remote — CUDA runtime change, no local GPU. Covered by plan
 > gates F.1-F.5 of
-> [2026-07-16-agent-rl-unified-infra.md](../../plans/2026-07-16-agent-rl-unified-infra.md)
+> 2026-07-16-agent-rl-unified-infra.md
 > (P4 pod validation): correct-inference needle gate across re-merge, reward
 > parity audit, wall-clock A/B vs the bash loop.
 
