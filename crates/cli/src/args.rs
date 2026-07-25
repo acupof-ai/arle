@@ -747,6 +747,12 @@ pub(crate) struct ServeArgs {
     #[arg(long, value_name = "LR")]
     pub(crate) dspark_train_lr: Option<f32>,
 
+    /// Experiences per DSpark train step. Step cost is linear in this, so it
+    /// trades gradient noise for optimizer steps at a fixed data rate, not for
+    /// throughput.
+    #[arg(long, value_name = "N")]
+    pub(crate) dspark_train_batch: Option<usize>,
+
     /// Constrain DSpark training to the base checkpoint's singular spectrum,
     /// optimizing only the singular frames (ISO, arXiv:2607.19331). The step
     /// logs `iso_drift` either way, so a run without this flag measures whether

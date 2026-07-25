@@ -91,6 +91,11 @@ pub struct DsparkTrainConfig {
     /// the actual rank from the engine's loaded checkpoint.
     pub markov_rank: usize,
     pub learning_rate: f32,
+    /// Experiences per optimizer step. Every cost in a step is linear in
+    /// experiences (~200 ms each at vocab 248320, against a ~110 ms fixed floor),
+    /// so batching does NOT change how fast experiences are consumed — it only
+    /// divides how many optimizer steps you get out of them. Measured at the real
+    /// head shape: 64 -> 20.9 s/step, 8 -> 1.70 s/step. Small wins.
     pub batch_size: usize,
     pub baseline_ema_alpha: f32,
     /// Starting value for the EMA baseline (the reward's running mean).
@@ -132,7 +137,7 @@ impl Default for DsparkTrainConfig {
         Self {
             markov_rank: 256,
             learning_rate: 1e-4,
-            batch_size: 64,
+            batch_size: 8,
             baseline_ema_alpha: 0.01,
             baseline_init: None,
             prob_match_alpha: 0.5,
