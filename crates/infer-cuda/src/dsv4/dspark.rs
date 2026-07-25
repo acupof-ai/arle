@@ -856,15 +856,16 @@ impl Dsv4Model {
 /// Proposal from one DSpark block draft. `chain[0]` = anchor, `chain[1..]` = the
 /// drafted tokens surviving confidence truncation (`draft_len`). Consumed by the
 /// verify path: `chain` feeds [`Dsv4Model::forward_tokens_verify`] as `tokens`;
-/// `draft_logits` = the corrected per-step logits (base + Markov bias) retained
-/// for the sampled-mode accept test's draft distribution `q`.
+/// `draft_logits` = the RAW base rows (pre-Markov-bias), matching what the
+/// qwen35 lane captures: the trainer re-derives the bias from its own live
+/// `w1`/`w2`, so handing it corrected rows double-biases the objective (#176).
 #[allow(dead_code)]
 pub(crate) struct Dsv4DsparkProposal {
     /// Verify input ids `[anchor, d0 .. d_{L-1}]` (len == `draft_len + 1`).
     pub chain: Vec<u32>,
     /// Number of drafted tokens `L` surviving confidence truncation.
     pub draft_len: usize,
-    /// Corrected per-step logits `[vocab, draft_len]` for the accepted prefix.
+    /// Raw base logits `[vocab, draft_len]` for the drafted prefix, pre-bias.
     /// `None` when the block truncated to zero drafts.
     pub draft_logits: Option<HiddenStates>,
     /// DIAG: base-only (pre-Markov) greedy argmax per block row `[block]`. Splits
@@ -922,9 +923,6 @@ impl Dsv4Model {
             temperature,
             ..Default::default()
         };
-        // Retained corrected logits (base + bias) for every step, for draft_probs.
-        // SAFETY: uninit scratch; every row written in the loop below.
-        let mut corrected = unsafe { HiddenStates::uninit(ctx, vocab, block)? };
         let mut base_row = HiddenStates::zeros(ctx, vocab, 1)?;
         let mut sum_row = HiddenStates::zeros(ctx, vocab, 1)?;
         let mut step_vec = DeviceVec::zeros(ctx, vocab)?;
@@ -959,11 +957,8 @@ impl Dsv4Model {
                     &base_row
                 };
 
-            // Retain the corrected row + stage it for the sampler.
-            let dst = i * vocab..(i + 1) * vocab;
-            ctx.stream
-                .memcpy_dtod(&corrected_row.data, &mut corrected.data.slice_mut(dst))
-                .map_err(|e| anyhow!("DSpark corrected retain copy failed: {e}"))?;
+            // Stage the corrected row for the sampler. Not retained: the trainer
+            // capture wants raw base rows, and `base_logits` already holds them.
             ctx.stream
                 .memcpy_dtod(&corrected_row.data, &mut step_vec.data)
                 .map_err(|e| anyhow!("DSpark step row copy failed: {e}"))?;
@@ -989,7 +984,7 @@ impl Dsv4Model {
         } else {
             // SAFETY: uninit scratch; the leading `draft_len` rows are copied.
             let mut out = unsafe { HiddenStates::uninit(ctx, vocab, draft_len)? };
-            let src = corrected.data.slice(0..draft_len * vocab);
+            let src = base_logits.data.slice(0..draft_len * vocab);
             ctx.stream
                 .memcpy_dtod(&src, &mut out.data)
                 .map_err(|e| anyhow!("DSpark draft logits copy failed: {e}"))?;
