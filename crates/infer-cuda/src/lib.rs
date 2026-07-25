@@ -329,6 +329,7 @@ impl CudaExecutor {
         mem_fraction_static: f64,
         dspark_draft_model: Option<&std::path::Path>,
         dspark_conf_threshold: f32,
+        dspark_train_head_rank: Option<usize>,
         mtp_draft_tokens: Option<usize>,
     ) -> anyhow::Result<Self> {
         Ok(Self {
@@ -342,6 +343,7 @@ impl CudaExecutor {
                     mem_fraction_static,
                     dspark_draft_model,
                     dspark_conf_threshold,
+                    dspark_train_head_rank,
                     mtp_draft_tokens,
                 )?,
             )),

@@ -418,6 +418,11 @@ fn resolve_spec_options(backend: ServeBackend, serve_args: &ServeArgs) -> ServeS
         dspark_train: serve_args.dspark_train,
         dspark_train_out: serve_args.dspark_train_out.clone(),
         dspark_train_iso: serve_args.dspark_train_iso,
+        // The sidecar needs a head to write into; a DFlash backbone ships none.
+        // Rank comes from the trainer's own default so there is one source.
+        dspark_train_head_rank: serve_args
+            .dspark_train
+            .then(|| train::dspark_train::DsparkTrainConfig::default().markov_rank),
         dspark_markov_init: serve_args.dspark_markov_init.clone(),
     }
 }

@@ -489,6 +489,7 @@ pub(crate) fn load_dspark_head(
     trunk_layers: usize,
     trunk_vocab: usize,
     confidence_threshold: f32,
+    train_head_rank: Option<usize>,
 ) -> Result<Qwen35DsparkHead> {
     let cfg = DsparkConfig::from_dir(dir)
         .map_err(|e| anyhow!("dspark draft config at {}: {e}", dir.display()))?;
@@ -571,6 +572,28 @@ pub(crate) fn load_dspark_head(
         );
         let rank = w1.cols;
         Some(DsparkMarkovHead { w1, w2, rank })
+    } else if let Some(rank) = train_head_rank {
+        // Self-RL cold start: the checkpoint is a DFlash backbone with no
+        // `markov_head.*`, so there is no head for the train sidecar to write
+        // into — `update_markov_weights` would fail on every publish and the
+        // loop would never close. Materialize the slot instead. `w2 = 0` makes
+        // `bias = Σ_r w2[v][r]·w1[c][r]` identically zero, so an untrained head
+        // is an exact no-op on acceptance, while `∂bias/∂w2 = w1[c] ≠ 0` keeps it
+        // trainable. Only requested when training is on: a serve would otherwise
+        // pay a vocab-wide gemm to add zero.
+        ensure!(rank > 0, "dspark train head rank must be positive");
+        let w1_bytes: Vec<u8> = (0..trunk_vocab * rank)
+            .flat_map(|i| bf16::from_f32(0.02 * ((i % 1000) as f32 * 0.1).sin()).to_le_bytes())
+            .collect();
+        let w2_bytes = vec![0u8; trunk_vocab * rank * 2];
+        log::info!(
+            "CUDA Qwen3.6 DSpark: checkpoint has no markov head; materializing a              trainable one [{trunk_vocab}, {rank}] with w2=0 (no-op until trained)"
+        );
+        Some(DsparkMarkovHead {
+            w1: DeviceMatrix::from_safetensors(ctx, &w1_bytes, trunk_vocab, rank)?,
+            w2: DeviceMatrix::from_safetensors(ctx, &w2_bytes, trunk_vocab, rank)?,
+            rank,
+        })
     } else {
         None
     };
