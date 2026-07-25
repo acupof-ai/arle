@@ -1,0 +1,27 @@
+crates/infer-cuda/src/dsv4/dspark.rs
+  s_9c91b86ec3fb55::t_ec67d33c40363e 859-861,868,960-961,987
+crates/infer-cuda/src/executor/dspark_train.rs
+  s_9c91b86ec3fb55::t_f742b1638c43af 23-27,36,125-127,133,152-156,158,170,222-227,229-230,241
+crates/infer-cuda/src/executor/qwen35.rs
+  s_9c91b86ec3fb55::t_f13b26fb7b4e3e 2036
+docs/experience/wins/2026-07-25-dspark-capture-shape-and-bias.md
+  s_9c91b86ec3fb55::t_95ec09d8d700ee 1-62
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "e2aa4f5d86b1c7779347e711bc884f9b85eefc68",
+  "prompts": {},
+  "sessions": {
+    "s_9c91b86ec3fb55": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4779911a-69b7-49db-bc83-daf5a48d6ca3",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
