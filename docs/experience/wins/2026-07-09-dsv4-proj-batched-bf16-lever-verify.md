@@ -21,8 +21,7 @@ len=500, `--max-total-tokens 2048`).
   DeepGEMM lane isn't the binding constraint.
 - **Correctness effect NOT re-measurable at HEAD**: both arms sat at ~82%
   n=2 miss because HEAD carried the same-day Route A FlashMLA-lane
-  regression
-  ([errors/2026-07-09-dsv4-route-a-flashmla-needle-regression-bisected.md](../errors/2026-07-09-dsv4-route-a-flashmla-needle-regression-bisected.md)),
+  regression (Route A was deleted 2026-07-10),
   which swamps the FP8-gate signal (108/108 misses were the regression's
   truncation class, zero digit-substitution). The lever's license basis
   remains Experiment B (2026-07-07, pre-window: n=2 miss 57.1%→30.0%, its

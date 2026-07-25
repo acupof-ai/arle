@@ -25,9 +25,8 @@ a dated `wins/` entry says so. Project framing:
 > `infer-core` (`Engine<E,K>`) → `infer-cuda` / `infer-metal` (executors) →
 > `infer-server` / `infer-api` (serving front door). Per-capability
 > re-verification on the new stack is ongoing; the rows below are current status.
-> Source of truth:
-> `projects/2026-06-04-qwen35-dsv4-final-report.md`
-> + `projects/2026-06-04-rewrite-completion-verification-report.md`.
+> Source of truth: the per-capability rows in this file, cross-checked against
+> `docs/baselines.md` (champion benches) and `CHANGELOG.md`.
 
 | Backend | New-stack status | What is verified | Open |
 | --- | --- | --- | --- |
@@ -94,7 +93,7 @@ below predates the rewrite; verify against §0 + dated `wins/` entries.
 
 ### CUDA GPU / SM Matrix
 
-Tier policy and rationale: see [`plans/sm-coverage.md`](environment.md).
+Tier policy and rationale: see [`environment.md`](environment.md) §CUDA SM matrix.
 Env var contract: see [`environment.md`](environment.md) §`TORCH_CUDA_ARCH_LIST`.
 
 | Tier | SM | Representative GPUs | Status | Default-built |
@@ -112,7 +111,7 @@ Notes:
 
 - Hosted CI does not provide full CUDA runtime correctness coverage.
 - CUDA correctness and performance still require dedicated GPU validation.
-- T1 ship gate requires four-card bench validation (sm_80 + sm_86 + sm_89 + sm_90); see [`plans/sm-coverage.md`](environment.md) §5.
+- T1 ship gate requires four-card bench validation (sm_80 + sm_86 + sm_89 + sm_90); see [`environment.md`](environment.md) §CUDA SM matrix.
 - sm_70 builds must be SM-pinned (`TORCH_CUDA_ARCH_LIST=7.0`) and are limited
  to the V100 Qwen3.5 BF16 attention + GDR path while Volta fallbacks are
  validated.
@@ -208,7 +207,7 @@ is pending pod time** — see the dated `wins/` entries per row.
 | --- | --- | --- |
 | Metal DFlash (Qwen3.5 dense/MoE) | **Shipped for compatible models** | `--draft-model` selects a compatible draft; model/checkpoint compatibility fails closed, and CUDA-oriented `--spec-type` and `--mtp-draft-model` are rejected on Metal. |
 | Metal NextN/MTP (Qwen3.6) | **Shipped** | Qwen3.6-27B-MTP-4bit: 12.3 → 17.75 tok/s (+44%), 68.8% draft acceptance, bit-identical output. Default-on, `--no-speculative` to disable. ([wins](experience/wins/2026-06-21-metal-qwen36-mtp-spec-decode.md)) |
-| CUDA speculative decoding | DSv4 MTP (explicit opt-in) | `arle serve --backend cuda --spec-type mtp --mtp-draft-tokens N --mtp-draft-topk K` lowers into the DSv4 checkpoint-native MTP head. `N` is clamped `[1, 8]`; `K` is the per-level draft candidate width. The verifier stays on the chain-shaped path, so D2/T2 uses 3 verifier rows while top-k only widens candidate matching (`1c41c4a8`, wins). Classical/self/external draft routes remain not shipped; Qwen3.5 Medusa is blocked on recurrent-state accepted-length rollback. See `plans/2026-05-01-longctx-spec-decode-phase2.md` and `plans/M_medusa-phase1b-qwen35-v2-snapshot-ring-redesign.md`. |
+| CUDA speculative decoding | DSv4 MTP (explicit opt-in) | `arle serve --backend cuda --spec-type mtp --mtp-draft-tokens N --mtp-draft-topk K` lowers into the DSv4 checkpoint-native MTP head. `N` is clamped `[1, 8]`; `K` is the per-level draft candidate width. The verifier stays on the chain-shaped path, so D2/T2 uses 3 verifier rows while top-k only widens candidate matching (`1c41c4a8`, wins). Classical/self/external draft routes remain not shipped; Qwen3.5 Medusa is blocked on recurrent-state accepted-length rollback. |
 | CUDA DSpark block-drafter (Qwen3.6 + DSv4-Flash) | **Shipped** | `arle serve --backend cuda --spec-type dspark --mtp-draft-model <DSpark/DFlash dir>` loads the external block drafter. Each Qwen request verifies its block in one target forward, but multi-request Qwen DSpark/MTP loops per row. DSv4 has a separate cross-slot batched speculative path. |
 | DSpark train sidecar | **Shipped (opt-in)** | `--dspark-train` (requires `--spec-type dspark`, CUDA-only): spawns a background thread that drains the experience buffer the hot path populates and runs acceptance-weighted policy gradient + probability matching on the Markov head, hot-swapping updated weights back into the running engine. Seeds from the loaded checkpoint so acceptance never regresses at startup. E2E verified on H20 ([wins](experience/wins/2026-07-20-dspark-train-sidecar-e2e-verified.md)). No-op without `--spec-type dspark` or on non-CUDA backends. |
 

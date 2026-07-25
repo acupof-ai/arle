@@ -9,9 +9,8 @@
 **Agent contract:** [`../AGENTS.md`](../AGENTS.md) (`CLAUDE.md` symlinks to it) ·
 working method: [`agent-method.md`](agent-method.md)
 
-Plans / projects / research / reviews / roadmap were removed 2026-07-24 — the doc
-tree is verified fact only (reference docs + experience wins/errors + CHANGELOG).
-`git log -- docs/` recovers the removed corpus.
+The doc tree is reference docs + `plans/` + `research/` + experience wins/errors
++ CHANGELOG. `git log -- docs/` recovers anything removed.
 
 ---
 

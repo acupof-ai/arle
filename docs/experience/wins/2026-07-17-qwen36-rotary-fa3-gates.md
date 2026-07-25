@@ -51,8 +51,8 @@ Raw evidence:
 
 Only receipt-owned process groups were stopped. The selected GPUs returned to
 0 MiB; foreign holders on GPUs 1 and 4 were unchanged and were not signalled.
-DSv4 TP=4/EP=4 was subsequently verified on free GPUs `3,5,6,7`; see
-[the production-all-on anchor](2026-07-19-dsv4-production-all-on-tp4-anchor.md).
+DSv4 TP=4/EP=4 was subsequently verified on free GPUs `3,5,6,7`; the current
+champion row lives in [baselines.md](../../baselines.md).
 Formal publication still requires the same candidate's physical SM80, SM86,
 SM89, and SM90 fragments.
 
