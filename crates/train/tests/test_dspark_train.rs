@@ -278,3 +278,78 @@ fn dspark_trainer_saves_loadable_markov_head() {
     assert!(trainer.save_weights(&path).is_ok());
     assert!(!path.with_extension("safetensors.tmp").exists());
 }
+
+/// ISO composed with the real trainer: after N acceptance-weighted steps the
+/// head's singular spectrum must still be the base checkpoint's, and the head
+/// must still have moved. Pinning the spectrum by accident freezing the whole
+/// head would pass a spectrum check and learn nothing.
+#[test]
+fn iso_fixed_spectrum_pins_the_spectrum_without_freezing_the_head() {
+    let seed_w1: Vec<f32> = (0..VOCAB * RANK)
+        .map(|i| ((i * 31 % 97) as f32 / 97.0 - 0.5) * (1.0 + (i % RANK) as f32 / 4.0))
+        .collect();
+    let seed_w2: Vec<f32> = (0..VOCAB * RANK)
+        .map(|i| (i * 17 % 89) as f32 / 89.0 - 0.5)
+        .collect();
+
+    let run = |iso: bool| -> (Vec<f32>, f32) {
+        let mut trainer = DsparkTrainer::new(
+            DsparkTrainConfig {
+                markov_rank: RANK,
+                learning_rate: 1e-2, // large enough that an unconstrained step moves Σ
+                iso_fixed_spectrum: iso,
+                // Retraction shares the publish cadence; 10 steps at 2 lands on
+                // a boundary, so the strict on-manifold invariant must hold at
+                // the end AND the cadence path is the one under test.
+                swap_every: 2,
+                ..Default::default()
+            },
+            Some((seed_w1.clone(), seed_w2.clone(), RANK)),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+        .unwrap();
+        let batch = vec![make_experience(BLOCK); 4];
+        for _ in 0..10 {
+            trainer.train_step(&batch).unwrap();
+        }
+        let (w1, _) = trainer.get_weights().unwrap();
+        // Gram spectrum proxy: ‖w1ᵀw1 − w1₀ᵀw1₀‖_F / ‖w1₀ᵀw1₀‖_F. Same statement
+        // as ‖σ(W)−σ(W₀)‖ up to the frame, without needing an eigensolver.
+        let gram = |w: &[f32]| -> Vec<f64> {
+            let mut g = vec![0.0f64; RANK * RANK];
+            for row in w.chunks_exact(RANK) {
+                for (i, &a) in row.iter().enumerate() {
+                    for (j, &b) in row.iter().enumerate() {
+                        g[i * RANK + j] += f64::from(a) * f64::from(b);
+                    }
+                }
+            }
+            g
+        };
+        let (g0, g1) = (gram(&seed_w1), gram(&w1));
+        let num: f64 = g0.iter().zip(&g1).map(|(a, b)| (a - b).powi(2)).sum();
+        let den: f64 = g0.iter().map(|a| a * a).sum();
+        (w1, (num / den).sqrt() as f32)
+    };
+
+    let (w1_iso, drift_iso) = run(true);
+    let (_, drift_free) = run(false);
+    assert!(
+        drift_iso < 1e-3,
+        "ISO must hold the base spectrum: relative Gram drift {drift_iso}"
+    );
+    assert!(
+        drift_free > drift_iso * 10.0,
+        "the unconstrained arm must move the spectrum, else the test proves nothing: \
+         free={drift_free} iso={drift_iso}"
+    );
+    let moved = w1_iso
+        .iter()
+        .zip(&seed_w1)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        moved > 1e-5,
+        "ISO must still rotate the frames, not freeze the head: max |Δw1| = {moved}"
+    );
+}

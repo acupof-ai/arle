@@ -201,6 +201,7 @@ fn run_config(config: ServeConfig) -> ExitCode {
         } else {
             let dspark_guard = std::sync::Arc::clone(&dspark_guard);
             let save_path = config.options.spec.dspark_train_out.clone();
+            let iso = config.options.spec.dspark_train_iso;
             Some(Box::new(
                 move |engine: &std::sync::Arc<LoadedInferenceEngine>| {
                     if let Some(path) = &init {
@@ -218,6 +219,7 @@ fn run_config(config: ServeConfig) -> ExitCode {
                         std::sync::Arc::clone(engine),
                         train::dspark_train::DsparkTrainConfig {
                             save_path: save_path.clone(),
+                            iso_fixed_spectrum: iso,
                             ..Default::default()
                         },
                     )?;
@@ -415,6 +417,7 @@ fn resolve_spec_options(backend: ServeBackend, serve_args: &ServeArgs) -> ServeS
         mtp_draft_topk: serve_args.mtp_draft_topk,
         dspark_train: serve_args.dspark_train,
         dspark_train_out: serve_args.dspark_train_out.clone(),
+        dspark_train_iso: serve_args.dspark_train_iso,
         dspark_markov_init: serve_args.dspark_markov_init.clone(),
     }
 }

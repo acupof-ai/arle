@@ -739,6 +739,13 @@ pub(crate) struct ServeArgs {
     #[arg(long, value_name = "FILE")]
     pub(crate) dspark_train_out: Option<PathBuf>,
 
+    /// Constrain DSpark training to the base checkpoint's singular spectrum,
+    /// optimizing only the singular frames (ISO, arXiv:2607.19331). The step
+    /// logs `iso_drift` either way, so a run without this flag measures whether
+    /// the fixed-spectrum premise actually holds for this head.
+    #[arg(long, default_value_t = false)]
+    pub(crate) dspark_train_iso: bool,
+
     /// Replace the draft checkpoint's Markov head with one saved by
     /// `--dspark-train-out`. This is how a trained head is put back into a
     /// serve — copying the file into the draft dir does nothing, since the
