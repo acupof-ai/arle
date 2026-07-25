@@ -1,0 +1,23 @@
+docs/experience/errors/2026-07-25-dspark-block-truncation-is-not-a-throughput-win.md
+  s_9c91b86ec3fb55::t_aaf279c21c682a 1-55
+docs/experience/wins/2026-07-25-dspark-train-batch8-removes-the-serve-stall.md
+  s_9c91b86ec3fb55::t_10123ad97f923e 1-43
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "750e28b7355f33e32eef5df269ebafb7eee45301",
+  "prompts": {},
+  "sessions": {
+    "s_9c91b86ec3fb55": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4779911a-69b7-49db-bc83-daf5a48d6ca3",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
