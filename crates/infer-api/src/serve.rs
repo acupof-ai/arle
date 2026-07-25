@@ -200,6 +200,8 @@ pub struct ServeSpecOptions {
     /// Rank of the trainable Markov head to materialize when the draft ships
     /// without one. Set by the CLI from `--dspark-train`.
     pub dspark_train_head_rank: Option<usize>,
+    /// Cap the DSpark draft block length.
+    pub dspark_block_size: Option<usize>,
     /// A saved Markov head to install over the draft checkpoint's at startup.
     pub dspark_markov_init: Option<std::path::PathBuf>,
 }
@@ -280,6 +282,7 @@ pub fn serve_http(
             engine_config.dspark_draft_model = Some(std::path::PathBuf::from(dir));
             engine_config.dspark_conf_threshold = opts.spec.dspark_conf_threshold;
             engine_config.dspark_train_head_rank = opts.spec.dspark_train_head_rank;
+            engine_config.dspark_block_size = opts.spec.dspark_block_size;
         }
     }
 

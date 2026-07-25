@@ -231,6 +231,7 @@ impl RealCudaExecutor {
         dspark_draft_model: Option<&Path>,
         dspark_conf_threshold: f32,
         dspark_train_head_rank: Option<usize>,
+        dspark_block_size: Option<usize>,
         mtp_draft_tokens: Option<usize>,
     ) -> Result<Self> {
         Ok(Self::Qwen35(Box::new(
@@ -244,6 +245,7 @@ impl RealCudaExecutor {
                 dspark_draft_model,
                 dspark_conf_threshold,
                 dspark_train_head_rank,
+                dspark_block_size,
                 mtp_draft_tokens,
             )?,
         )))

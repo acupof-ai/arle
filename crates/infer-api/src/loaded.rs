@@ -133,6 +133,10 @@ pub struct EngineLoadConfig {
     /// `--dspark-train`, whose sidecar has nothing to write into otherwise.
     #[serde(default)]
     pub dspark_train_head_rank: Option<usize>,
+    /// Cap the draft block length. A block longer than the accepted prefix costs a
+    /// draft forward and a verify row per position and can never commit them.
+    #[serde(default)]
+    pub dspark_block_size: Option<usize>,
     /// CUDA runtime toggles (CLI flags → `infer_cuda::apply_runtime_flags`
     /// before executor construction; multiproc workers included).
     #[serde(default)]
@@ -207,6 +211,7 @@ impl Default for EngineLoadConfig {
             dspark_draft_model: None,
             dspark_conf_threshold: default_dspark_conf_threshold(),
             dspark_train_head_rank: None,
+            dspark_block_size: None,
             cuda: infer_seam::CudaRuntimeFlags::default(),
             metal: infer_seam::MetalRuntimeFlags::default(),
             diffusion_max_denoising_steps: None,
@@ -2171,6 +2176,7 @@ mod backend {
                 config.dspark_draft_model.as_deref(),
                 config.dspark_conf_threshold,
                 config.dspark_train_head_rank,
+                config.dspark_block_size,
                 config.mtp_draft_tokens,
             )?,
             // DSv4 multi-rank serve. The DSv4 executor resolves its TP

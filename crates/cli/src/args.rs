@@ -747,6 +747,15 @@ pub(crate) struct ServeArgs {
     #[arg(long, value_name = "LR")]
     pub(crate) dspark_train_lr: Option<f32>,
 
+    /// Cap the DSpark draft block length (checkpoint value if unset). The chain
+    /// stops at the first rejection, so every position past the accepted prefix
+    /// costs a draft forward and a verify row that can never commit: TC-27B +
+    /// DFlash at block 16 keeps 3.28 tokens per chain and discards 79.5% of the
+    /// drafted work. This is the fixed-length stand-in for the confidence head's
+    /// adaptive truncation.
+    #[arg(long, value_name = "N")]
+    pub(crate) dspark_block_size: Option<usize>,
+
     /// Experiences per DSpark train step. Step cost is linear in this, so it
     /// trades gradient noise for optimizer steps at a fixed data rate, not for
     /// throughput.
