@@ -6,7 +6,8 @@
 > This file is a pure index — no narrative state.
 
 **Progress spine:** [`CHANGELOG.md`](../CHANGELOG.md)  
-**Agent contract:** [`../AGENTS.md`](../AGENTS.md) · [`../CLAUDE.md`](../CLAUDE.md)
+**Agent contract:** [`../AGENTS.md`](../AGENTS.md) (`CLAUDE.md` symlinks to it) ·
+working method: [`agent-method.md`](agent-method.md)
 
 Plans / projects / research / reviews / roadmap were removed 2026-07-24 — the doc
 tree is verified fact only (reference docs + experience wins/errors + CHANGELOG).
