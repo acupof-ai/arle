@@ -73,10 +73,32 @@ f64 (the paper likewise uses FP64 for its polar step); the only large work is tw
   were already frame rotations; one printed number per step turns that from an
   assumption into a result.
 
+## The placement argument is only half true
+
+The loop is self-RL — experiences are the serve's own drafts, the reward is its
+own acceptance, no external data anywhere. But the *objective* is a 50/50 hybrid:
+`prob_match_alpha` defaults to 0.5, so half the gradient is dense
+probability-matching against the trunk's full target distribution. That half is
+self-distillation, i.e. **dense per-token supervision — exactly the regime the
+paper's own control condition says moves the spectrum by 100×.** Only the policy-
+gradient half is the RLVR regime ISO's observation was made in.
+
+So the head is not cleanly RLVR-shaped, and this sharpens the experiment into a
+falsifiable prediction rather than a hope: **`iso_drift` should scale with
+`prob_match_alpha`.** At `prob_match_alpha = 0` (pure acceptance PG) drift should
+sit near the isotropic floor and the fixed-spectrum constraint should be nearly
+free; at 1.0 (pure self-distillation) drift should be large and ISO should hurt.
+The step line prints both numbers together so a log is self-describing.
+
+If drift turns out large at the 0.5 default, the useful conclusion is not "ISO
+fails here" — it is that the objective is half dense supervision, and the
+fixed-spectrum constraint and the probability-matching term are pulling against
+each other.
+
 ## Open
 
-The effect on acceptance rate is unmeasured — this needs the TC-27B DSpark
-training run to A/B `--dspark-train-iso` on/off with `iso_drift` recorded in the
-off arm. If the off arm's drift is already ~1e-3, the constraint is nearly free
-and should help; if it is large, this head does rescale its spectrum and ISO's
-premise does not hold here, which is itself the answer.
+The effect on acceptance rate is unmeasured. The run that decides it is a
+`prob_match_alpha` sweep (0 / 0.5 / 1.0) with `--dspark-train-iso` off, reading
+`iso_drift` — that measures the premise before spending anything on the
+constraint. Only then is the on/off A/B worth running, at whichever alpha the
+drift says is in ISO's regime.
