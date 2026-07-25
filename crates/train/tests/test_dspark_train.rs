@@ -147,6 +147,7 @@ fn dspark_trainer_serve_frame_and_alignment() {
         prob_match_alpha: alpha,
         loss_decay_gamma: Some(gamma),
         max_grad_norm: Some(1.0),
+        ..Default::default()
     };
     let mut trainer = DsparkTrainer::new(
         config,
@@ -230,4 +231,49 @@ fn dspark_trainer_converges() {
         prev_loss < first_loss,
         "loss should decrease with consistent positive reward: start={first_loss} end={prev_loss}"
     );
+}
+
+/// The saved head must land in the DRAFT LOADER's frame — those exact tensor
+/// names, bf16, `[vocab, rank]` — or the checkpoint is unloadable and a whole
+/// training run is wasted.
+#[test]
+fn dspark_trainer_saves_loadable_markov_head() {
+    let mut trainer = DsparkTrainer::new(
+        DsparkTrainConfig {
+            markov_rank: RANK,
+            ..Default::default()
+        },
+        None,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .unwrap();
+    trainer
+        .train_step(&vec![make_experience(BLOCK); 4])
+        .unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("nested/markov_head.safetensors");
+    trainer.save_weights(&path).unwrap();
+
+    let bytes = std::fs::read(&path).unwrap();
+    let st = safetensors::SafeTensors::deserialize(&bytes).unwrap();
+    let (w1, _) = trainer.get_weights().unwrap();
+    for name in [
+        "markov_head.markov_w1.weight",
+        "markov_head.markov_w2.weight",
+    ] {
+        let t = st.tensor(name).unwrap();
+        assert_eq!(t.dtype(), safetensors::Dtype::BF16, "{name} dtype");
+        assert_eq!(t.shape(), [VOCAB, RANK], "{name} shape");
+    }
+    // Values must survive the f32 -> bf16 round trip, not just the shape.
+    let t = st.tensor("markov_head.markov_w1.weight").unwrap();
+    let round: Vec<f32> = t
+        .data()
+        .chunks_exact(2)
+        .map(|b| half::bf16::from_le_bytes([b[0], b[1]]).to_f32())
+        .collect();
+    for (i, (&a, &b)) in w1.iter().zip(&round).enumerate() {
+        assert!((a - b).abs() <= a.abs() * 0.01 + 1e-6, "w1[{i}] {a} vs {b}");
+    }
 }

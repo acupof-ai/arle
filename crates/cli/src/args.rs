@@ -734,6 +734,11 @@ pub(crate) struct ServeArgs {
     #[arg(long, default_value_t = false)]
     pub(crate) dspark_train: bool,
 
+    /// Write the trained DSpark Markov head here (bf16 safetensors, the draft
+    /// loader's own tensor names). Without it the head is lost at shutdown.
+    #[arg(long, value_name = "FILE")]
+    pub(crate) dspark_train_out: Option<PathBuf>,
+
     /// Number of MTP draft tokens to propose per verify block on CUDA.
     #[arg(long, value_name = "N")]
     pub(crate) mtp_draft_tokens: Option<usize>,

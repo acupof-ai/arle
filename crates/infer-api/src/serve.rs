@@ -189,6 +189,8 @@ pub struct ServeSpecOptions {
     pub mtp_draft_topk: Option<usize>,
     /// Spawn the DSpark train sidecar alongside `--spec-type dspark` serving.
     pub dspark_train: bool,
+    /// Where the sidecar checkpoints the trained Markov head.
+    pub dspark_train_out: Option<std::path::PathBuf>,
 }
 
 pub const DEFAULT_MTP_DRAFT_TOKENS: usize = 2;
