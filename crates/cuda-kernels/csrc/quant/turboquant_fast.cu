@@ -87,12 +87,10 @@ __device__ __forceinline__ uint8_t cooperative_pack(
     return my_contrib;
 }
 
-// ============================================================================
 // Kernel: TurboQuant Fast Quantize (Hadamard-based)
 //
 // Grid:  (num_kv_heads, batch_size)
 // Block: (head_dim)  — D threads, one per coordinate
-// ============================================================================
 __global__ void turboquant_fast_quantize_kernel(
     const __nv_bfloat16* __restrict__ kv_bf16,
     uint8_t* __restrict__ packed_out,
@@ -110,10 +108,8 @@ __global__ void turboquant_fast_quantize_kernel(
     int d = threadIdx.x;
     if (d >= head_dim) return;
 
-    // ─── Load ───
     float x = __bfloat162float(kv_bf16[batch_idx * kv_dim + kv_head * head_dim + d]);
 
-    // ─── Norm computation ───
     extern __shared__ float smem[];
     float sq = x * x;
     sq = warp_reduce_sum_fast(sq);
@@ -134,22 +130,21 @@ __global__ void turboquant_fast_quantize_kernel(
 
     if (d == 0) norms_out[batch_idx * gridDim.x + kv_head] = __float2half(norm);
 
-    // ─── Normalize + sign flip ───
+    // Normalize + sign flip.
     float y = x * inv_norm * (float)signs[d];
 
-    // ─── Fast Walsh-Hadamard Transform (in-place via shared memory) ───
+    // Fast Walsh-Hadamard Transform (in-place via shared memory).
     smem[d] = y;
     fwht_inplace(smem, head_dim, d);
     y = smem[d];
 
-    // ─── Searchsorted ───
     int idx = 0;
     // Branchless for 3-bit (8 levels): just 7 comparisons
     for (int k = 1; k < num_levels; k++) {
         idx += (y >= boundaries[k]) ? 1 : 0;
     }
 
-    // ─── Bitpack via shared memory (no atomics) ───
+    // Bitpack via shared memory (no atomics).
     int effective_bits = (bits == 3) ? 4 : bits;
     int indices_per_byte = 8 / effective_bits;
     int byte_idx = d / indices_per_byte;
@@ -185,12 +180,10 @@ __global__ void turboquant_fast_quantize_kernel(
     }
 }
 
-// ============================================================================
 // Kernel: TurboQuant Fast Dequantize (Hadamard-based)
 //
 // Grid:  (num_kv_heads, token_count)
 // Block: (head_dim)
-// ============================================================================
 __global__ void turboquant_fast_dequantize_kernel(
     const uint8_t* __restrict__ packed_in,
     const __half* __restrict__ norms_in,
@@ -209,7 +202,7 @@ __global__ void turboquant_fast_dequantize_kernel(
     int d = threadIdx.x;
     if (d >= head_dim) return;
 
-    // ─── Unpack ───
+    // Unpack.
     int effective_bits = (bits == 3) ? 4 : bits;
     int indices_per_byte = 8 / effective_bits;
     int byte_idx = d / indices_per_byte;
@@ -220,25 +213,21 @@ __global__ void turboquant_fast_dequantize_kernel(
     int idx = (packed_byte >> (sub_idx * effective_bits)) & ((1 << effective_bits) - 1);
     if (idx >= num_levels) idx = num_levels - 1;
 
-    // ─── Gather centroid ───
     float y = centroids[idx];
 
-    // ─── Inverse FWHT + sign flip ───
+    // Inverse FWHT + sign flip.
     extern __shared__ float smem[];
     smem[d] = y;
     ifwht_inplace(smem, head_dim, d);
     float x_hat = smem[d] * (float)signs[d];
 
-    // ─── Scale by norm ───
     float norm = __half2float(norms_in[token * gridDim.x + kv_head]);
     x_hat *= norm;
 
     kv_bf16[token * kv_dim + kv_head * head_dim + d] = __float2bfloat16(x_hat);
 }
 
-// ============================================================================
 // Kernel: Fast Dequant Pool -> Working Buffer (in-place NHD for TileLang)
-// ============================================================================
 __global__ void turboquant_fast_dequantize_inplace_kernel(
     const uint8_t* __restrict__ pool_data,
     const __half* __restrict__ pool_norms,
@@ -272,9 +261,7 @@ __global__ void turboquant_fast_dequantize_inplace_kernel(
     work_bf16[pool_idx * kv_dim + kv_head * head_dim + d] = __float2bfloat16(x_hat);
 }
 
-// ============================================================================
 // Kernel: Fast Quantize Single Token (paged pool, decode path)
-// ============================================================================
 __global__ void turboquant_fast_quantize_single_kernel(
     const __nv_bfloat16* __restrict__ kv_bf16,
     uint8_t* __restrict__ pool_data,
@@ -341,9 +328,7 @@ __global__ void turboquant_fast_quantize_single_kernel(
     }
 }
 
-// ============================================================================
 // Host-side: generate random signs for Hadamard rotation
-// ============================================================================
 extern "C" void turboquant_generate_signs(
     int8_t* signs,    // output: [D] signs ∈ {-1, +1}
     int head_dim,
@@ -362,10 +347,7 @@ extern "C" void turboquant_generate_signs(
     }
 }
 
-// ============================================================================
 // C API — Fast (Hadamard) launcher functions
-// ============================================================================
-
 extern "C" CUresult turboquant_fast_quantize_kv_cuda(
     const void* kv_bf16, void* packed_out, void* norms_out,
     const void* signs, const void* boundaries,

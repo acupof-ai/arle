@@ -24,10 +24,6 @@ use infer_seam::{BackendExecutor, KvPool, PollResult};
 
 pub use infer_metal::MetalKvPool;
 
-// ---------------------------------------------------------------------------
-// OS-impact probe
-// ---------------------------------------------------------------------------
-
 /// OS-impact accounting for a workflow run.
 ///
 /// On the EchoExecutor (scheduler-only) path this stays all-zero — there is no
@@ -312,10 +308,6 @@ impl WorkflowMetrics {
         self.total_generated as f64 / self.total_decode_wall().as_secs_f64().max(1e-9)
     }
 }
-
-// ---------------------------------------------------------------------------
-// TTFT observation
-// ---------------------------------------------------------------------------
 
 /// Shared, single-threaded observation cell for [`TtftObserver`].
 ///

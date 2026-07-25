@@ -1985,7 +1985,7 @@ mod tests {
 
     #[test]
     fn repair_generation_is_recorded_as_its_own_sub_turn() {
-        // codex Phase-1 P2: when the main generation produces malformed
+        // When the main generation produces malformed
         // tool-call XML and `repair_tool_calls` issues a second engine
         // call, that call must appear in `sub_turns`. Otherwise the
         // trajectory shows a `tool_use` whose `completion_text` exists
@@ -2053,7 +2053,7 @@ mod tests {
 
     #[test]
     fn tool_use_ids_stay_unique_across_recovered_and_engine_branches() {
-        // codex Phase-1 P2: when iteration 0 is the deterministic
+        // When iteration 0 is the deterministic
         // "recovered_user_request" branch (no engine call → previously
         // didn't bump sub_turns.len()) and iteration 1 is an engine
         // sub-turn that itself produces tool calls, both used to
@@ -2579,7 +2579,7 @@ mod tests {
         // malformed → repair → tool → final: 3 engine sub-turns (main
         // + repair + final-after-tool) and 1 tool result. The trace
         // must:
-        //   - record all 3 SubTurnRecords (codex Phase-1 P2 fix)
+        //   - record all 3 SubTurnRecords
         //   - emit a non-degenerate token mask with both 0 and 1
         //   - have len(mask) == len(ids) and mask ∈ {0, 1}
         //   - cover at least the LATEST sub-turn's response in mask=1
@@ -2645,7 +2645,7 @@ mod tests {
 
     #[test]
     fn tokens_is_none_when_prompt_delta_break() {
-        // codex Phase-2 P1 follow-up: when a later sub-turn's
+        // When a later sub-turn's
         // prompt_token_ids does NOT extend prior context (e.g. the
         // tokenizer's BPE merges drifted across boundaries, or a
         // streaming bug returns garbled IDs), the agent's prefix-match
