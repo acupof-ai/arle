@@ -83,11 +83,37 @@ data**, because CPU autograd on a `[248320, 256]` head costs ~1 s/step while the
 serve produces ~20 chains/s. The ring buffer drops the rest. A 127M-parameter
 head trained on 832 samples is not a tested method.
 
-Two ways forward, in order: (a) run hours not minutes, which is cheap to start
-and answers it directly; (b) cut the per-step cost — the trainer densely updates
-all 248320 rows of `w1` when a batch touches at most a few hundred condition
-tokens, so a sparse-row update is the obvious ~1000× on that factor. Do (a)
-first; only (b) if the long run says the signal is real but slow.
+**The step rate was the wrong number in the first draft of this entry.** It is
+not ~1 s/step — the srl6 timestamps give **~65 s/step** (13 steps in ~14 min), and
+a local bench at the real head shape confirms the scale: 20.9 s/step at batch 64
+on an M4 Pro. That reframes the problem from "needs a longer run" to "the step
+cost has to collapse first": 4000 steps at 65 s is 3 days.
+
+Measured the cost curve rather than guessing where it goes (vocab 248320,
+block 16):
+
+| batch | rows | steady step |
+|---:|---:|---:|
+| 1 | 15 | 321 ms |
+| 2 | 30 | 532 ms |
+| 8 | 120 | 1.70 s |
+| 64 | 960 | 20.9 s |
+
+That is ~200 ms per experience against a ~110 ms fixed floor — so the cost is
+linear in experiences and there is **no optimizer wall**. Two consequences:
+
+- **Batch size does not change data throughput, only steps per unit data.** The
+  trainer consumes ~5 experiences/s at any batch size. Batching 64 of them just
+  spends 8× the data on one gradient step. Default is now **8** (`--dspark-train-batch`
+  to tune): same data rate, ~11× the optimizer steps, 65 s/step -> ~6 s/step on the
+  pod. 4000 steps goes from 3 days to under 7 hours.
+- **A sparse-`w1` rewrite is not the fix.** It would attack the 110 ms floor,
+  which is 6% of a batch-8 step. The dense per-row vocab-wide work is the other
+  94%, and that is inherent to a full-vocab probability-matching objective — only
+  a GPU-side trainer or a vocab-subset loss changes it.
+
+Next is now simply the long run at batch 8, which is what will license or kill
+the method.
 
 ISO's fixed-spectrum retraction does **not** apply to this configuration:
 `w2 = 0` has no base spectrum to preserve, so it belongs to adapting DSv4's real
