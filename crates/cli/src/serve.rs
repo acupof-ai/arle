@@ -20,6 +20,8 @@ use crate::{
     args::{Args, ServeArgs, ServeBackendArg, ServeKvCacheDtypeArg, ServeSpecTypeArg},
     hardware::CompiledBackend,
 };
+#[cfg(feature = "cuda")]
+use train::dspark_train::DsparkTrainConfig;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ServeBackend {
@@ -202,6 +204,7 @@ fn run_config(config: ServeConfig) -> ExitCode {
             let dspark_guard = std::sync::Arc::clone(&dspark_guard);
             let save_path = config.options.spec.dspark_train_out.clone();
             let iso = config.options.spec.dspark_train_iso;
+            let lr = config.options.spec.dspark_train_lr;
             Some(Box::new(
                 move |engine: &std::sync::Arc<LoadedInferenceEngine>| {
                     if let Some(path) = &init {
@@ -217,9 +220,10 @@ fn run_config(config: ServeConfig) -> ExitCode {
                     }
                     let guard = train::dspark_train::spawn_dspark_train_sidecar(
                         std::sync::Arc::clone(engine),
-                        train::dspark_train::DsparkTrainConfig {
+                        DsparkTrainConfig {
                             save_path: save_path.clone(),
                             iso_fixed_spectrum: iso,
+                            learning_rate: lr.unwrap_or(DsparkTrainConfig::default().learning_rate),
                             ..Default::default()
                         },
                     )?;
@@ -418,6 +422,7 @@ fn resolve_spec_options(backend: ServeBackend, serve_args: &ServeArgs) -> ServeS
         dspark_train: serve_args.dspark_train,
         dspark_train_out: serve_args.dspark_train_out.clone(),
         dspark_train_iso: serve_args.dspark_train_iso,
+        dspark_train_lr: serve_args.dspark_train_lr,
         // The sidecar needs a head to write into; a DFlash backbone ships none.
         // Rank comes from the trainer's own default so there is one source.
         dspark_train_head_rank: serve_args
