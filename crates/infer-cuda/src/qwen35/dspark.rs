@@ -490,9 +490,26 @@ pub(crate) fn load_dspark_head(
     trunk_vocab: usize,
     confidence_threshold: f32,
     train_head_rank: Option<usize>,
+    block_size_cap: Option<usize>,
 ) -> Result<Qwen35DsparkHead> {
-    let cfg = DsparkConfig::from_dir(dir)
+    let mut cfg = DsparkConfig::from_dir(dir)
         .map_err(|e| anyhow!("dspark draft config at {}: {e}", dir.display()))?;
+    // A block longer than the accepted prefix is pure waste: the chain stops at
+    // the first rejection, so every position past it costs a draft forward and a
+    // verify row and can never be committed. Measured on TC-27B + DFlash:
+    // accept_rate 0.205 at block 16 keeps 3.28 tokens, discarding 79.5% of the
+    // drafted work. Clamping here is the single correct point — rope_cap, the ctx
+    // ring, and the per-slot scratch all size off `cfg.block_size`.
+    if let Some(cap) = block_size_cap {
+        let capped = cfg.block_size.min(cap.max(1));
+        if capped != cfg.block_size {
+            log::info!(
+                "CUDA Qwen3.6 DSpark: block_size {} -> {capped} (--dspark-block-size)",
+                cfg.block_size
+            );
+            cfg.block_size = capped;
+        }
+    }
     ensure!(
         cfg.hidden_size == trunk_hidden,
         "dspark hidden {} != trunk hidden {trunk_hidden}",
