@@ -307,12 +307,11 @@ impl Dsv4Model {
         // shared spec-ring snapshots.
         let dspark_on = dspark_draft_model.is_some();
         // Spec decode is on when the serve config requests it — `Some(n)` from
-        // `--spec-type mtp`, `dspark_on` from `--spec-type dspark` — OR the
-        // `ARLE_DSV4_SPEC_DECODE` env gate is set (backward-compat fallback).
-        // Both routes need the per-slot spec-ring snapshots, so both flip
-        // `spec_decode_on`. Resolved once and stored on the model so per-slot
-        // construction reads the same decision.
-        let spec_decode_on = mtp_draft_tokens.is_some() || dspark_on || dsv4_spec_decode_enabled();
+        // `--spec-type mtp`, `dspark_on` from `--spec-type dspark`. Both routes
+        // need the per-slot spec-ring snapshots, so both flip `spec_decode_on`.
+        // Resolved once and stored on the model so per-slot construction reads
+        // the same decision.
+        let spec_decode_on = mtp_draft_tokens.is_some() || dspark_on;
         // Peek model_type: GLM-5.2 (`glm_moe_dsa`) parses through the GLM dialect
         // adapter (V32 shape, plain-o, hc_mult=1, num_nextn=0, Glm tensor names);
         // every other DSv4 checkpoint loads through the strict DSv4 parser
@@ -387,7 +386,7 @@ impl Dsv4Model {
                 !spec_decode_on,
                 "ARLE_DSV4_LM_HEAD_SHARD=1 does not support MTP spec decode (the MTP \
                  verify/draft heads consume full-vocab lm_head logits); disable spec \
-                 decode (--spec-type / ARLE_DSV4_SPEC_DECODE) or unset the shard knob"
+                 decode (drop --spec-type) or unset the shard knob"
             );
             ensure!(
                 !crate::probe::token_entropy(),

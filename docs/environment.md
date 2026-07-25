@@ -70,7 +70,7 @@ workers see them; train flags apply via `train::apply_runtime_flags`):
 | `ARLE_GDR_CHUNKWISE_PREFILL` / `ARLE_LA_BACKWARD_MONO` / `ARLE_AUTOGRAD_DECODE_ATTN_LEGACY` | `arle train <opd> --gdr-chunkwise-prefill` / `--la-backward-mono` / `--autograd-decode-attn-legacy` |
 
 Deferred (read site inside frozen DSv4 files this pass):
-`ARLE_DSV4_SPEC_DECODE`, `ARLE_DSV4_DECODE_GRAPH`, `ARLE_DSV4_WHOLE_STEP_GRAPH`,
+`ARLE_DSV4_DECODE_GRAPH`, `ARLE_DSV4_WHOLE_STEP_GRAPH`,
 `ARLE_DSV4_MOE_TRANSPORT`/`ARLE_DSV4_MOE_BACKEND`, `ARLE_DSV4_LM_HEAD_SHARD`.
 
 ---

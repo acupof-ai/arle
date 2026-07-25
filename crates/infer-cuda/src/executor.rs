@@ -255,7 +255,7 @@ impl RealCudaExecutor {
     /// `mtp_draft_tokens`: `Some(n)` = config-driven MTP spec decode on (draft
     /// depth `n`); `mtp_draft_topk`: `Some(k)` = per-level MTP draft candidate
     /// width (`1` = chain-only candidates).
-    /// `None` falls back to the `ARLE_DSV4_SPEC_DECODE` env gate.
+    /// `None` = no MTP head (DSpark or plain decode).
     pub(crate) fn from_dsv4_fp8_safetensors(
         model_path: impl AsRef<Path>,
         num_slots: usize,

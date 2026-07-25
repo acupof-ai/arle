@@ -100,8 +100,7 @@ pub(crate) struct Dsv4CudaExecutor {
     pub(crate) kv_adapter: crate::attention::Dsv4KvAdapter,
     pub(crate) spec_slots: Vec<Dsv4SpecSlotState>,
     /// `Some(n)` = config-driven MTP spec decode on (draft depth `n`, from the
-    /// serve path's `--spec-type mtp`); `None` falls back to the
-    /// `ARLE_DSV4_SPEC_DECODE` env gate at each spec branch.
+    /// serve path's `--spec-type mtp`); `None` = no MTP head.
     pub(crate) spec_draft_tokens: Option<usize>,
     /// MTP draft candidate width. `None`/`Some(1)` keeps chain-only candidates;
     /// `Some(k>1)` widens the draft matrix while verifier rows stay chain-shaped.

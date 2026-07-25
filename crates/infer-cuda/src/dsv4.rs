@@ -295,8 +295,7 @@ pub(crate) struct Dsv4Layer {
 
 /// One shipped DSv4 MTP draft head (`mtp.0.*`): a full transformer layer plus
 /// the DeepSeek MTP input-combine and output-head tensors. Loaded when
-/// `--spec-type mtp`/`--mtp-draft-tokens` requests MTP, or by the
-/// backwards-compatible `ARLE_DSV4_SPEC_DECODE` env fallback.
+/// `--spec-type mtp`/`--mtp-draft-tokens` requests MTP.
 pub(crate) struct Dsv4MtpLayer {
     pub layer: Dsv4Layer,
     pub head_hc: Dsv4HyperConnection,
@@ -381,9 +380,9 @@ pub(crate) struct Dsv4Model {
     pub head_hc: Dsv4HyperConnection,
     pub mtp: Option<Dsv4MtpLayer>,
     /// Resolved at construction: spec decode is on when the serve config
-    /// requested `--spec-type mtp` OR the `ARLE_DSV4_SPEC_DECODE` env gate is
-    /// set. Per-slot construction (`Dsv4SlotState::new`) reads this so the
-    /// MTP-head load and the per-slot rollback snapshots agree on one decision.
+    /// requested `--spec-type mtp` / `--spec-type dspark`. Per-slot construction
+    /// (`Dsv4SlotState::new`) reads this so the MTP-head load and the per-slot
+    /// rollback snapshots agree on one decision.
     pub spec_decode_on: bool,
     pub tp: crate::tp::TpRuntime,
     #[cfg(all(feature = "cuda", feature = "nccl"))]
@@ -6586,13 +6585,6 @@ fn dsv4_lm_head_shard_enabled() -> bool {
 fn dsv4_whole_step_graph_enabled() -> bool {
     matches!(
         std::env::var("ARLE_DSV4_WHOLE_STEP_GRAPH").as_deref(),
-        Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
-    )
-}
-
-pub(crate) fn dsv4_spec_decode_enabled() -> bool {
-    matches!(
-        std::env::var("ARLE_DSV4_SPEC_DECODE").as_deref(),
         Ok("1" | "true" | "TRUE" | "yes" | "on" | "ON")
     )
 }

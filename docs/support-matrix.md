@@ -58,7 +58,7 @@ the checkpoint download; throughput and long-generation validation remain pendin
 
 **Now in the new stack (was legacy-only):** TP / EP / DeepEP multi-GPU, DeepGEMM
 (FP8 grouped GEMM), DSv4 (MLA + FP8 KV) with incremental decode + MTP
-speculative decode (**shipped, explicit opt-in** via `--spec-type mtp`; the backward-compatible `ARLE_DSV4_SPEC_DECODE` gate also requires a truthy value), INT8/FP8 paged quant-KV
+speculative decode (**shipped, explicit opt-in** via `--spec-type mtp` / `--spec-type dspark`), INT8/FP8 paged quant-KV
 dispatch (opt-in, #68), tiered KV **T1 default-on + T2 opt-in disk spill**
 (#82–#84), and the HTTP/serving surface (`infer-server` + `infer-api`, both
 executors wired). **Still pending re-port / verification:** PP (pipeline
