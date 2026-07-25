@@ -1,0 +1,21 @@
+docs/baselines.md
+  s_cb6ca280b792fe::t_2f270841991b1a 3,5,8,10-12,14-15,17-25,34-36,38-43,46-80,89-94,101-102,111-116,122-125,127-129
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "0a40cd10527ae379cb466c5ee76395b1b02b44d5",
+  "prompts": {},
+  "sessions": {
+    "s_cb6ca280b792fe": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1a00414d-2267-47d4-813e-3c9e7cb88d53",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
