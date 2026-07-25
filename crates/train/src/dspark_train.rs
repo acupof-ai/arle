@@ -233,6 +233,13 @@ impl DsparkTrainer {
                 (rank, w1, w2)
             }
             None => {
+                // Cold start: growing a head on a draft that ships without one
+                // (a DFlash backbone — `fc` fusion, no `markov_head.*`). `w2 = 0`
+                // makes `bias = Σ_r w2[v][r]·w1[c][r]` identically zero, so step 0
+                // is an exact no-op and acceptance cannot regress below the
+                // unbiased draft. `∂bias/∂w2 = w1[c] ≠ 0`, so w2 still trains and
+                // unfreezes w1 as it grows. Random-initializing both bolts a
+                // random rank-`markov_rank` bias onto a working drafter.
                 let rank = self.config.markov_rank;
                 let scale = 0.02;
                 let w1: Vec<f32> = (0..vocab_size * rank)
@@ -241,13 +248,7 @@ impl DsparkTrainer {
                         scale * (s * 0.1).sin()
                     })
                     .collect();
-                let w2: Vec<f32> = (0..vocab_size * rank)
-                    .map(|i| {
-                        let s = (i % 1000) as f32;
-                        scale * (s * 0.1).cos()
-                    })
-                    .collect();
-                (rank, w1, w2)
+                (rank, w1, vec![0.0; vocab_size * rank])
             }
         };
 
