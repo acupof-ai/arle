@@ -28,6 +28,9 @@ fn d_dsa_indexer_sms() -> usize {
 fn d_mtp_min_accept() -> f32 {
     0.55
 }
+fn d_spec_max_batch() -> usize {
+    1
+}
 fn d_deepep_num_sms() -> u32 {
     20
 }
@@ -103,6 +106,11 @@ pub struct CudaRuntimeFlags {
     /// Minimum accept-rate EMA to keep speculating under --mtp-adaptive.
     #[serde(default = "d_mtp_min_accept")]
     pub mtp_min_accept: f32,
+    /// Speculate (MTP/DSpark) only when the decode batch is ≤ this. Above it,
+    /// spec is a compute-bound loss, so route decode to the plain batched path.
+    /// Default 1: only true c=1 speculates.
+    #[serde(default = "d_spec_max_batch")]
+    pub spec_max_batch: usize,
     /// DeepEP intranode SM budget (positive, even).
     #[serde(default = "d_deepep_num_sms")]
     pub deepep_num_sms: u32,
@@ -136,6 +144,7 @@ impl Default for CudaRuntimeFlags {
             dsv4_decode_reuse: false,
             mtp_adaptive: false,
             mtp_min_accept: d_mtp_min_accept(),
+            spec_max_batch: d_spec_max_batch(),
             deepep_num_sms: d_deepep_num_sms(),
             deepep_max_dispatch_tokens_per_rank: None,
         }
