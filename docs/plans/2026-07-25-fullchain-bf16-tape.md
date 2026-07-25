@@ -1,5 +1,16 @@
 # Full-chain bf16 mixed-precision training — design + implementation spec
 
+> **STATUS 2026-07-25.** S0 (config) + S1a (frozen prefix K/V) SHIPPED & correct
+> (loss byte-identical, needle 5/5 DET). **S1a REJECTED as a VRAM lever** — on
+> Qwen3.6-27B the frozen K/V is 0.13 MB/tok (16 full-attn layers of 64), ~400×
+> smaller than the GDN linear-attention forward-capture transient that actually
+> sets the peak (+52.7 GB at seq1024); bf16 there measured **+288 MiB** (quantize
+> double-buffer) and did not move the OOM wall. §7 Stage-1a below is superseded.
+> **The peak is the forward `la_*` capture transient, not retained K/V** — S1b
+> re-targets the GDN linear-attention forward buffers, and any store-time downcast
+> must quantize in place / free-then-alloc (the +320 MiB double-buffer sank S1a).
+> KILL entry: `docs/experience/errors/2026-07-25-s1a-frozen-prefix-kv-bf16-no-vram-win-kill.md`
+
 Goal: halve the two buffers that set the LoRA-backward peak (retained activations +
 transient emitted grads) so the agent-OPD token wall moves from ~30K to ~60K, via a
 single ergonomic knob `--tape-precision {fp32,bf16}` (default `fp32`, byte-identical).
