@@ -126,6 +126,13 @@ pub struct EngineLoadConfig {
     /// ignore it).
     #[serde(default = "default_dspark_conf_threshold")]
     pub dspark_conf_threshold: f32,
+    /// Materialize a trainable Markov head of this rank when the draft
+    /// checkpoint ships without one (DFlash backbones do). `None` = leave the
+    /// drafter head-less, which is what a plain serve wants: an untrained head
+    /// adds zero to every logit at the cost of a vocab-wide gemm. Set only by
+    /// `--dspark-train`, whose sidecar has nothing to write into otherwise.
+    #[serde(default)]
+    pub dspark_train_head_rank: Option<usize>,
     /// CUDA runtime toggles (CLI flags → `infer_cuda::apply_runtime_flags`
     /// before executor construction; multiproc workers included).
     #[serde(default)]
@@ -199,6 +206,7 @@ impl Default for EngineLoadConfig {
             student_lora_alpha: default_student_lora_alpha(),
             dspark_draft_model: None,
             dspark_conf_threshold: default_dspark_conf_threshold(),
+            dspark_train_head_rank: None,
             cuda: infer_seam::CudaRuntimeFlags::default(),
             metal: infer_seam::MetalRuntimeFlags::default(),
             diffusion_max_denoising_steps: None,
@@ -2162,6 +2170,7 @@ mod backend {
                 config.mem_fraction_static,
                 config.dspark_draft_model.as_deref(),
                 config.dspark_conf_threshold,
+                config.dspark_train_head_rank,
                 config.mtp_draft_tokens,
             )?,
             // DSv4 multi-rank serve. The DSv4 executor resolves its TP

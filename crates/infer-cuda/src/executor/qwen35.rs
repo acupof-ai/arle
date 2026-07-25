@@ -812,6 +812,7 @@ impl Qwen35CudaExecutor {
         mem_fraction_static: f64,
         dspark_draft_model: Option<&Path>,
         dspark_conf_threshold: f32,
+        dspark_train_head_rank: Option<usize>,
         mtp_draft_tokens: Option<usize>,
     ) -> Result<Self> {
         let total_t0 = Instant::now();
@@ -865,6 +866,7 @@ impl Qwen35CudaExecutor {
                     model.config.num_hidden_layers,
                     model.config.vocab_size,
                     dspark_conf_threshold,
+                    dspark_train_head_rank,
                 )?;
                 model.set_spec_draft_tokens(head.block_size());
                 log::info!(
