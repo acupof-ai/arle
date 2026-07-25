@@ -1,0 +1,25 @@
+crates/infer-cuda/src/dsv4.rs
+  s_1bb149460173f2::t_5afe9163b8443c 25-26,29-30,32-33
+crates/infer-cuda/src/dsv4/budget.rs
+  s_1bb149460173f2::t_4adb3e6a3917d6 1-674
+crates/infer-cuda/src/dsv4/load.rs
+  s_1bb149460173f2::t_4e8944dc440f1e 1-533
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "6aa4ca6d11274f420e405d5e1897d81dea203d95",
+  "prompts": {},
+  "sessions": {
+    "s_1bb149460173f2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a63cf57f4d73476e8",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
