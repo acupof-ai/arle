@@ -675,7 +675,7 @@ mod gpu {
 
         if use_deepgemm {
             // DeepGEMM: aligned/banded pack → SM90 BF16 m-grouped
-            // GEMMs → scatter/combine. Fills `out` exactly like step 8.
+            // GEMMs → scatter/combine. Fills `out` exactly like the scatter/combine stage.
             deepgemm_routed_tail(
                 ctx,
                 weights,
@@ -1034,9 +1034,9 @@ mod gpu {
         add_shared_expert_gated(ctx, weights, normed, scratch, out)
     }
 
-    /// Step 9 of the MoE block, shared by the hand and DeepGEMM expert paths:
+    /// Shared dense expert of the MoE block, shared by the hand and DeepGEMM expert paths:
     /// dense shared-expert SwiGLU, sigmoid-gated and accumulated into the
-    /// routed output (`out` is RMW'd; the combine fully wrote it in step 8).
+    /// routed output (`out` is RMW'd; the scatter/combine stage fully wrote it).
     fn add_shared_expert_gated(
         ctx: &DeviceContext,
         weights: &MoeLayerWeights,
@@ -1072,10 +1072,10 @@ mod gpu {
         Ok(())
     }
 
-    /// Steps 4-8 of the MoE block on the DeepGEMM SM90 BF16 m-grouped GEMMs
+    /// Expert path of the MoE block on the DeepGEMM SM90 BF16 m-grouped GEMMs
     /// (`--qwen35-deepgemm`): pack → gate GEMM + up GEMM → silu_mul →
     /// down GEMM → scatter/combine into `out`. `counts` was already filled by
-    /// step 3's count kernel.
+    /// the per-expert route-count kernel.
     ///
     /// Per-call dispatch (masked vs contiguous):
     ///

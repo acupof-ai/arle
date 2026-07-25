@@ -93,7 +93,7 @@ below predates the rewrite; verify against §0 + dated `wins/` entries.
 
 ### CUDA GPU / SM Matrix
 
-Tier policy and rationale: see [`environment.md`](environment.md) §CUDA SM matrix.
+Tier policy and rationale: see [`environment.md`](environment.md).
 Env var contract: see [`environment.md`](environment.md) §`TORCH_CUDA_ARCH_LIST`.
 
 | Tier | SM | Representative GPUs | Status | Default-built |
@@ -111,7 +111,7 @@ Notes:
 
 - Hosted CI does not provide full CUDA runtime correctness coverage.
 - CUDA correctness and performance still require dedicated GPU validation.
-- T1 ship gate requires four-card bench validation (sm_80 + sm_86 + sm_89 + sm_90); see [`environment.md`](environment.md) §CUDA SM matrix.
+- T1 ship gate requires four-card bench validation (sm_80 + sm_86 + sm_89 + sm_90); see [`environment.md`](environment.md).
 - sm_70 builds must be SM-pinned (`TORCH_CUDA_ARCH_LIST=7.0`) and are limited
  to the V100 Qwen3.5 BF16 attention + GDR path while Volta fallbacks are
  validated.
