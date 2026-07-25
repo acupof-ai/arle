@@ -1,0 +1,43 @@
+crates/cli/src/args.rs
+  s_9c91b86ec3fb55::t_a0c89dee842067 742-748
+crates/cli/src/serve.rs
+  s_089e26e9e41120::t_d096edcf4a126b 204,222,420
+crates/infer-api/src/serve.rs
+  s_9c91b86ec3fb55::t_eb2f4f32e36202 194-195
+crates/train/src/iso_spectrum.rs
+  s_9c91b86ec3fb55::t_42770c39bc1416 1-257
+crates/train/src/lib.rs
+  s_9c91b86ec3fb55::t_2b4b33ad18ce51 52-53
+crates/train/src/dspark_train.rs
+  s_9c91b86ec3fb55::t_b10ec573c5e24d 113-118,137,161-163,165-170,203-205,334-342,501-518,610-621,623,634-642
+crates/train/tests/test_dspark_train.rs
+  s_9c91b86ec3fb55::t_df9f4a6087e79f 281-355
+docs/experience/wins/2026-07-25-iso-fixed-spectrum-dspark-head.md
+  s_9c91b86ec3fb55::t_020913442c4560 1-82
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "b8e6664a30bacc3d19e5f5758c5d747cc9c4b817",
+  "prompts": {},
+  "sessions": {
+    "s_089e26e9e41120": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "93e66a8f-c20a-4ba9-96f2-283f6d98cbb1",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_9c91b86ec3fb55": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4779911a-69b7-49db-bc83-daf5a48d6ca3",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
