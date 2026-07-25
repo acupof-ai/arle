@@ -48,14 +48,41 @@ c1 38.9 out / TTFT 1093 ms · c4 75.0 · c16 142.9 · c32 **209.9 out / 2474
 total tok/s**. Cold prefill ~2560 tok/s. Raw: pod
 `bench-output/2026-07-17-p3-sweep/`. Rows below are the chunk-128 era.
 
-**DATASET GONE (2026-07-25, #180)** — `bench-prompts.jsonl` (the repeated-filler
-set, prefix hit_rate 0.925) no longer exists on the pod and has no in-repo
-generator (`gen_bench_prompts.py` produces the non-degenerate variant). The rows
-below are therefore **not reproducible as written**: a substitute of 20 unique
-docs from `bench-prompts-64.jsonl` measures hit_rate 0.048-0.767 and costs the
-c1 row ~9% (TTFT 442 → 1085 ms) on identical code. Re-anchor on
-`bench-prompts-64.jsonl` at the next accepted run; until then treat c1 Δ% here
-as uninterpretable and compare c4/c8/c16 only.
+### CHAMPION (re-anchored 2026-07-25, #180) — `d0525cb06`
+
+Dataset `bench-prompts-20.jsonl`, sha256 `e095ddf1fcc9325a43bb510b36e2afcb6c56d68af3ecc032503b8430b4f3fc49`,
+**reproducible byte-for-byte from the repo** (verified local vs pod):
+
+```
+python3 scripts/gen_bench_prompts.py bench-prompts-64.jsonl 64 13400 256   # sha256 3543ac33…
+head -20 bench-prompts-64.jsonl > bench-prompts-20.jsonl
+```
+
+Runner `bench_throughput.py` via `run_dsv4_bench.sh`, 60 s/point, seed
+20260416, max_tokens 256, GPUs 0-3 TP=4/EP=4 eager, no
+`--max-running-requests`. Slot line: `59 slots, per_slot 338MB, budget
+20584MB, comp capacity 84736 tok`. Prefix hit_rate 0.048 (c1) → 0.767 (c16).
+
+| c | complete | out tok/s | total tok/s | TTFT p50/p99 ms | ITL p50/p99 ms |
+|---|---:|---:|---:|---|---|
+| 1 | 10 | 38.66 | 456 | 1085 / 1113 | 21.9 / 41.0 |
+| 4 | 20 | 74.67 | 876 | 1447 / 2985 | 43.8 / 89.2 |
+| 8 | 40 | 152.82 | 1793 | 1069 / 1204 | 47.5 / 93.2 |
+| 16 | 48 | 197.51 | 2319 | 2238 / 2265 | 71.4 / 119.0 |
+
+0 errors / 0 incomplete / 0 correctness_failed at every point. Raw: pod
+`bench-output/2026-07-24-b156-d0525cb0/`.
+
+**Why re-anchored:** the previous champion's dataset `bench-prompts.jsonl` (the
+repeated-filler set, prefix hit_rate 0.925) no longer exists anywhere and has no
+generator — `gen_bench_prompts.py` deliberately produces the non-degenerate
+variant. Rule 3 (dataset change re-anchors) applied. The lost prefix reuse costs
+the c1 row ~9% on identical code (TTFT 442 → 1085 ms), so **the rows below are
+retired for comparison** — they are kept only for their same-era A/B deltas.
+`run_dsv4_bench.sh` now fails loudly on a missing dataset and records
+`dataset.sha256` next to every result, so a silent substitution cannot recur.
+
+### RETIRED (dataset lost — do not compute Δ% against these)
 
 Champion (chunk-128 era): `00b301643` (grid-parallel FP32 + slot hoist + carry coherence +
 plan repair), build `--features cuda,nccl`. **RE-ANCHORED fingerprint
