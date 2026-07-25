@@ -122,7 +122,9 @@ fn matrix_roots(s: &[f64], k: usize) -> Result<(Vec<f64>, Vec<f64>)> {
     let trace: f64 = (0..k).map(|i| s[i * k + i]).sum();
     ensure!(
         trace > 0.0 && trace.is_finite(),
-        "iso: non-positive gram trace {trace} — parameter is zero or diverged"
+        "iso: non-positive gram trace {trace} — a zero factor has no base spectrum \
+         to preserve. ISO adapts an existing head; it cannot grow one from a \
+         cold start"
     );
     let ridge = 1e-6 * trace / k as f64;
     let mut a: Vec<f64> = s.to_vec();
