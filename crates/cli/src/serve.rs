@@ -192,10 +192,14 @@ fn run_config(config: ServeConfig) -> ExitCode {
             None
         } else {
             let dspark_guard = std::sync::Arc::clone(&dspark_guard);
+            let save_path = config.options.spec.dspark_train_out.clone();
             Some(Box::new(move |engine| {
                 let guard = train::dspark_train::spawn_dspark_train_sidecar(
                     std::sync::Arc::clone(engine),
-                    train::dspark_train::DsparkTrainConfig::default(),
+                    train::dspark_train::DsparkTrainConfig {
+                        save_path: save_path.clone(),
+                        ..Default::default()
+                    },
                 )?;
                 let Some(guard) = guard else {
                     anyhow::bail!(
@@ -391,6 +395,7 @@ fn resolve_spec_options(backend: ServeBackend, serve_args: &ServeArgs) -> ServeS
         mtp_draft_tokens: serve_args.mtp_draft_tokens,
         mtp_draft_topk: serve_args.mtp_draft_topk,
         dspark_train: serve_args.dspark_train,
+        dspark_train_out: serve_args.dspark_train_out.clone(),
     }
 }
 
