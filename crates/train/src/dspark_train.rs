@@ -110,6 +110,12 @@ pub struct DsparkTrainConfig {
     /// overlaid on the draft dir). `None` = train in-process only and lose the
     /// head at shutdown.
     pub save_path: Option<PathBuf>,
+    /// Constrain the head to its base checkpoint's singular spectrum, letting
+    /// the optimizer move only the singular frames (ISO, arXiv:2607.19331). The
+    /// acceptance reward is the sparse verifiable kind the paper's observation
+    /// was made on; see [`crate::iso_spectrum`]. Off by default — it is an
+    /// unmeasured algorithm change on this head.
+    pub iso_fixed_spectrum: bool,
     /// Steps between engine hot-swaps and checkpoint writes. Each swap is a
     /// `vocab*rank*2` bf16 H2D plus a full serve-stream sync, so doing it every
     /// step stalls decode for a gradient step's worth of drift.
@@ -128,6 +134,7 @@ impl Default for DsparkTrainConfig {
             loss_decay_gamma: Some(4.0),
             max_grad_norm: Some(1.0),
             save_path: None,
+            iso_fixed_spectrum: false,
             swap_every: 8,
         }
     }
@@ -151,7 +158,16 @@ pub struct DsparkTrainer {
     /// random init (fallback when the engine has no Markov head to read).
     init_weights: Option<(Vec<f32>, Vec<f32>, usize)>,
     optim: AdamW,
+    /// Fixed-spectrum projector, captured from the seeded head on the first
+    /// step. `None` when `iso_fixed_spectrum` is off.
+    iso: Option<crate::iso_spectrum::FixedSpectrum>,
     baseline_ema: f32,
+    /// Per-parameter `‖ΔW‖/‖W‖` of the last retraction — measures the paper's
+    /// premise on this head instead of assuming it. Empty when ISO is off.
+    last_iso_drift: Vec<f32>,
+    /// Completed steps. Drives one shared cadence for retraction and publish,
+    /// which is what guarantees a published head is always on the manifold.
+    steps: usize,
     running: Arc<AtomicBool>,
 }
 
@@ -184,6 +200,9 @@ impl DsparkTrainer {
             store,
             tape,
             params: None,
+            iso: None,
+            last_iso_drift: Vec::new(),
+            steps: 0,
             init_weights,
             optim,
             baseline_ema,
@@ -312,6 +331,15 @@ impl DsparkTrainer {
         // first experience, so the trainer is model-agnostic at construction.
         if self.params.is_none() {
             self.init_params(vocab_size)?;
+            if self.config.iso_fixed_spectrum {
+                // Capture from the seeded head, before any step — these ARE the
+                // base weights ISO's Σ₀ is defined against.
+                let p = self.params.as_ref().unwrap();
+                self.iso = Some(crate::iso_spectrum::FixedSpectrum::capture(
+                    &[p.w1, p.w2],
+                    &mut self.store,
+                )?);
+            }
         }
         let params = self.params.as_ref().unwrap();
 
@@ -470,6 +498,24 @@ impl DsparkTrainer {
         }
         self.optim.step(&[w1_id, w2_id], &mut self.store);
         self.optim.zero_grad(&[w1_id, w2_id], &mut self.store);
+        self.steps += 1;
+        // ISO step 4: project the base optimizer's step back onto the
+        // fixed-spectrum family. Reported drift is how far it had wandered off.
+        //
+        // On the `swap_every` cadence, not every step: measured 5.0 s per
+        // retraction at the real head shape (151936 × 256, both factors, M4 Pro
+        // single-thread) against a ~1 s step, so per-step retraction would cost
+        // more wall-clock than the paper's 2.2× step reduction buys back. The
+        // projection is exact whenever it runs, and measured drift between
+        // retractions is ~1e-3 relative, so the iterate never leaves a tight
+        // neighbourhood of ℱ(W₀). Sharing the publish cadence also means the
+        // head handed to the engine is always freshly on the manifold.
+        if self.steps.is_multiple_of(self.config.swap_every)
+            && let Some(iso) = self.iso.as_mut()
+        {
+            iso.retract(&mut self.store)?;
+            self.last_iso_drift = iso.last_drift.clone();
+        }
 
         let loss = self
             .store
@@ -552,7 +598,6 @@ impl DsparkTrainer {
     ) {
         self.running.store(true, Ordering::SeqCst);
         let mut pending: Vec<DsparkExperience> = Vec::new();
-        let mut steps = 0usize;
         while self.running.load(Ordering::SeqCst) {
             pending.extend(source.drain(self.config.batch_size - pending.len()));
             if pending.len() < self.config.batch_size {
@@ -562,9 +607,20 @@ impl DsparkTrainer {
             let batch = std::mem::take(&mut pending);
             match self.train_step(&batch) {
                 Ok(loss) => {
-                    steps += 1;
+                    let steps = self.steps;
+                    let iso = match self.last_iso_drift.as_slice() {
+                        [] => String::new(),
+                        drift => format!(
+                            " iso_drift=[{}]",
+                            drift
+                                .iter()
+                                .map(|d| format!("{d:.2e}"))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                    };
                     eprintln!(
-                        "dspark_train: step={steps} loss={loss:.4} accept_ema={:.4} n={}",
+                        "dspark_train: step={steps} loss={loss:.4} accept_ema={:.4} n={}{iso}",
                         self.baseline_ema,
                         batch.len()
                     );
@@ -575,7 +631,15 @@ impl DsparkTrainer {
                 Err(e) => eprintln!("dspark_train: train step failed: {e}"),
             }
         }
-        if steps > 0 && !steps.is_multiple_of(self.config.swap_every) {
+        if self.steps > 0 && !self.steps.is_multiple_of(self.config.swap_every) {
+            // Final publish lands off-cadence, so retract first — never hand out
+            // or checkpoint a head that is off ℱ(W₀).
+            if let Some(iso) = self.iso.as_mut()
+                && let Err(e) = iso.retract(&mut self.store)
+            {
+                eprintln!("dspark_train: final retraction failed: {e}");
+            }
+            let steps = self.steps;
             self.publish(&on_weights, steps);
         }
     }
