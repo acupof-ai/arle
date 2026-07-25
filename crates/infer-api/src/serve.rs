@@ -193,6 +193,8 @@ pub struct ServeSpecOptions {
     pub dspark_train_out: Option<std::path::PathBuf>,
     /// Constrain DSpark training to the base checkpoint's singular spectrum.
     pub dspark_train_iso: bool,
+    /// Override the train sidecar learning rate.
+    pub dspark_train_lr: Option<f32>,
     /// Rank of the trainable Markov head to materialize when the draft ships
     /// without one. Set by the CLI from `--dspark-train`.
     pub dspark_train_head_rank: Option<usize>,
