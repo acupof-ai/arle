@@ -230,6 +230,15 @@ v0.3.0.
 
 ### Verdicts (selected)
 
+- **2026-07-25 — bf16 tape Stage 1a (frozen prefix K/V) rejected: no VRAM win on
+  Qwen3.6-27B.** `--tape-precision bf16` on `PrefixKv.k/v` measured **+288 MiB**
+  (not lower) at the writeback and did not move the OOM wall — the frozen K/V is
+  0.13 MB/tok (16 full-attn layers of 64), ~400× smaller than the GDN
+  linear-attention forward-capture transient that sets the peak (+52.7 GB at
+  seq1024). Mechanism correct (loss byte-identical, needle 5/5 DET); it points at
+  the wrong buffer. S0 config + S1a quantize/widen substrate kept (no-op at fp32
+  default) for Stage 1b, which re-targets the `la_*` forward buffers.
+  [errors](docs/experience/errors/2026-07-25-s1a-frozen-prefix-kv-bf16-no-vram-win-kill.md)
 - **2026-07-21 — #167 closed: Qwen3.6 temp>0 sampled-tail garbage fixed (accept).**
   `b4b293f0c` carried two independent RMSNorm bugs. Type-A (kernel, `e4d5580ca`):
   hd256 q/k `(1+w)`→`w`. Type-B (load, `d703b5240`): a `w-1` transform on the final
