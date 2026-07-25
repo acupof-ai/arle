@@ -540,7 +540,6 @@ array reorder_qwen35_v_cols_input(
 
 } // namespace
 
-// ── Quantized linear helper ────────────────────────────────────────────────
 
 struct QWeight {
     array w = array(0);
@@ -578,7 +577,6 @@ struct QWeight {
     }
 };
 
-// ── Layer weight structs ───────────────────────────────────────────────────
 
 struct FullAttnLayerWeights {
     array input_ln_w = array(0), post_attn_ln_w = array(0);
@@ -641,7 +639,6 @@ struct LayerWeights {
     } moe;
 };
 
-// ── Model struct ───────────────────────────────────────────────────────────
 
 struct Qwen35CompiledModel {
     struct GdrTapeEntry {
@@ -762,7 +759,6 @@ struct Qwen35CompiledModel {
     // Cleared at start of each step, populated during forward().
     mutable std::vector<array> intermediates;
 
-    // ── Session KV-recall query emit ──────────────────────────────────
     // Opt-in (Rust sets `recall_emit_query`). When on, `full_attn_step`
     // stashes the layer-0 decode query — mean-pooled over the query heads
     // of each KV group, shape [nkv, hd] for B=1 — so Rust can score the
@@ -773,7 +769,6 @@ struct Qwen35CompiledModel {
     mutable array last_decode_query = array(0);
     mutable bool has_last_decode_query = false;
 
-    // ── DFlash support ────────────────────────────────────────────────
     // When tape_mode is on, gdr_step() records innovation tapes for each GDR layer.
     bool tape_mode = false;
     bool gdr_metal_kernel_enabled = true;
@@ -910,7 +905,6 @@ struct Qwen35CompiledModel {
             && v_full.shape(3) == hd;
     }
 
-    // ── Full attention decode step ─────────────────────────────────────
 
     array full_attn_step(
         const array& x, const FullAttnLayerWeights& lw,
@@ -1274,7 +1268,6 @@ struct Qwen35CompiledModel {
         return result;
     }
 
-    // ── GDR decode step ────────────────────────────────────────────────
 
     array gdr_step(
         const array& x, const GdrLayerWeights& lw,
@@ -1505,7 +1498,6 @@ struct Qwen35CompiledModel {
         return result;
     }
 
-    // ── MLP block ──────────────────────────────────────────────────────
 
     // Separate MLP: 2 matmul (matching mlx_lm, no split overhead)
     array mlp_separate(
@@ -1613,7 +1605,6 @@ struct Qwen35CompiledModel {
             moe.num_experts, moe.top_k, moe.norm_topk_prob);
     }
 
-    // ── Full forward pass ──────────────────────────────────────────────
     // inputs layout:
     //   [0]        : token ids / token batch
     //   BF16:
@@ -1882,7 +1873,6 @@ struct Qwen35CompiledModel {
     }
 };
 
-// ── FFI ────────────────────────────────────────────────────────────────────
 
 QWeight& qwen35_weight_by_id(Qwen35CompiledModel* model, int32_t id) {
     if (id < 0 || id >= static_cast<int32_t>(model->weight_pool.size())) {
@@ -3336,7 +3326,6 @@ int32_t qwen35_compiled_prefill(
     }
 }
 
-// ── DFlash speculative verify — parallel forward over a draft block ───────
 // Same forward path as prefill (current_seq_len = block_size) but always
 // returns all-position logits (current_last_logits_only = false). DFlash
 // needs logits for every drafted token to compute greedy acceptance.
@@ -3709,7 +3698,6 @@ int32_t qwen35_compiled_verify_block_batched_sampled(
     }
 }
 
-// ── Full decode loop in C++ ────────────────────────────────────────────────
 // Keeps ALL intermediate arrays alive within the loop body, matching
 // Python's behavior where locals survive until the next loop iteration.
 // This eliminates the GPU buffer release/realloc overhead that caused
@@ -3855,7 +3843,6 @@ int32_t qwen35_compiled_generate(
                 }
                 async_eval(y);
 
-                // ── Decode loop ──
                 int generated = 0;
                 // Keep previous step's locals alive in these vectors
                 std::vector<array> prev_step_arrays;
@@ -4019,7 +4006,6 @@ int32_t qwen35_compiled_generate(
     }
 }
 
-// ── DFlash tape mode API ─────────────────────────────────────────────
 
 void qwen35_set_tape_mode(void* model, bool enabled) {
     auto* m = reinterpret_cast<Qwen35CompiledModel*>(model);
@@ -4082,7 +4068,6 @@ int32_t qwen35_read_and_clear_gdr_tapes(
     }
 }
 
-// ── Hidden state capture API ─────────────────────────────────────────
 
 void qwen35_set_capture_layers(void* model, const int32_t* layer_ids, int32_t count) {
     auto* m = reinterpret_cast<Qwen35CompiledModel*>(model);

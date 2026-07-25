@@ -568,8 +568,7 @@ pub fn q8_1_quantize_dispatch(ne: u32) -> Dispatch {
     Dispatch::x(ne.div_ceil(Q8_1_X4_VALUES_PER_GROUP).max(1))
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// RoPE (NeoX) push-constant contract (full-attention on-device, Step 6). The
+// RoPE (NeoX) push-constant contract (full-attention on-device). The
 // `rope_neox.comp` (+ `rope_head.glsl`, `rope_funcs.glsl`) rotates pairs
 // `(x[d], x[d + n_dims/2])` by `angle = pos * theta_scale^d` for `d < n_dims/2`,
 // passing through dims `>= n_dims`. The host f32 reference it replaces is
@@ -578,7 +577,6 @@ pub fn q8_1_quantize_dispatch(ne: u32) -> Dispatch {
 // one (or several batched) head vectors of `head_dim` elements at a fixed
 // position, with no YaRN (ext_factor=0), no freq-factor table (has_ff=0), no
 // set_rows (set_rows_stride=0), and no mscale (attn_factor=1, freq_scale=1).
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// Push-constant block for `rope_neox.comp` = the `rope_params` struct in
 /// `rope_params.glsl`, laid out as 29 std430 4-byte words in declared order:
@@ -673,12 +671,10 @@ pub fn rope_neox_dispatch(rotary_dim: u32, nrows: u32) -> Dispatch {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Elementwise / norm push-constant contracts (perf-parity Step 5b). These move
+// Elementwise / norm push-constant contracts. These move
 // the per-layer RMSNorm / SwiGLU / residual-Add off the host (where each forced
 // a device→host→device hop around a GEMV) onto the already-compiled device
 // kernels, reverse-engineered from their `.comp` push-constant interfaces.
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// `rms_norm.comp` (+ `generic_binary_head.glsl`, all-f32, no rope fusion),
 /// applying the PLAIN weight `out[i] = x[i] * inv_rms * w[i]` for ONE row of
@@ -849,7 +845,6 @@ pub fn f16_kv_pack_dispatch(n: u32) -> Dispatch {
     Dispatch::x(n.div_ceil(256).max(1))
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // Qwen3.5 gated-delta linear-attention push-constant contracts (linear-attention
 // on-device port). The two model-specific shaders (`qwen35_ssm_conv.comp`,
 // `qwen35_gated_delta_net.comp`) replace the host depthwise-conv1d + recurrent
@@ -859,7 +854,6 @@ pub fn f16_kv_pack_dispatch(n: u32) -> Dispatch {
 // workgroup per value head with `local_size_x = 128` threads over the `val_dim`
 // state columns. Still oracle-gated byte-for-byte against the host f32 routine
 // (the per-head scalar reductions keep the host's serial order).
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// Push-constant block for `qwen35_ssm_conv.comp` = `{num_channels, seq_len,
 /// kernel_size}` (3 `uint`s). Depthwise causal conv1d over all `qkv` channels:
@@ -962,8 +956,7 @@ pub fn qwen36_moe_weighted_accum_dispatch(hidden: u32) -> Dispatch {
     Dispatch::x(hidden.div_ceil(256).max(1))
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Flash-attention push-constant contract (full-attention on-device, Step 6).
+// Flash-attention push-constant contract (full-attention on-device).
 // `flash_attn.comp` (+ `flash_attn_base.glsl`) is the scalar/subgroup-shuffle
 // FA path llama.cpp uses for N==1 decode on RDNA (coopmat is NV/prefill). The
 // registered [`FlashAttentionSpec::f32_f16`] specializes it to:
@@ -977,7 +970,6 @@ pub fn qwen36_moe_weighted_accum_dispatch(hidden: u32) -> Dispatch {
 // This contract drives ONE query head against `[kv_len, head_dim]` f16 K and V
 // (single KV head; the forward dispatches once per query head with the head's
 // own K/V sub-range, so gqa_ratio stays 1 and the GQA mapping is host-side).
-// ─────────────────────────────────────────────────────────────────────────────
 
 /// Push-constant block for `flash_attn.comp` = the 33-field `parameter` struct
 /// in `flash_attn_base.glsl`, in declared order:
@@ -1437,9 +1429,9 @@ mod real {
     /// The per-dispatch object graph (`fs::read(.spv)` → `ShaderModule` →
     /// `DescriptorSetLayout` → `ComputePipeline`) now lives in the cache's
     /// cache-miss builder (`cache.rs`), and the bind+push+dispatch body is
-    /// `record_dispatch` into a Step-1 `CommandRecorder` — no NULL-fence
+    /// `record_dispatch` into a `CommandRecorder` — no NULL-fence
     /// `one_shot_submit` drain on this path. A persistent cache + a batch-record
-    /// `CommandRecorder` is the real decode path (wired in Step 4); this keeps
+    /// `CommandRecorder` is the real decode path; this keeps
     /// the proven single-shot launchers/tests working through the same builder.
     pub fn launch_with_params_and_specialization(
         kernel: Kernel,

@@ -8,7 +8,6 @@
 
 using namespace mlx::core;
 
-// ── Error handling ──────────────────────────────────────────────────────────
 // Thread-local last error string. Functions that can fail set this and return
 // nullptr. Rust checks for nullptr and calls mlx_last_error() to get the message.
 inline thread_local std::string g_mlx_last_error;

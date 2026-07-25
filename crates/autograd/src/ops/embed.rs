@@ -16,7 +16,7 @@ pub fn embedding(
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
-    // M5.3b.7: dispatch on device-handle presence (same shape as the rope
+    // Dispatch on device-handle presence (same shape as the rope
     // gate — `device_handle.is_some() && dirty != Host`). Embedding is
     // the very first op in a forward pass; taking the lazy branch here
     // lets downstream lazy ops (rmsnorm, matmul, silu, rope, exp,
@@ -188,7 +188,7 @@ pub(crate) fn embedding_backward(
         });
     }
 
-    // Wave 2 Commit A: route Dirty::Device upstream through
+    // Route Dirty::Device upstream through
     // `embedding_backward_device` so the `[1, S, H]` upstream tensor and the
     // resulting `[V, H]` table grad stay on-device. atomicAdd inside the
     // kernel handles duplicate token ids (e.g. `the` appearing N times in a

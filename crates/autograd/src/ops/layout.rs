@@ -12,13 +12,12 @@ pub fn reshape(
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
-    // M5.3b.12: dispatch on device-handle presence (same gate as rope /
+    // Dispatch on device-handle presence (same gate as rope /
     // embedding / gather / AdamW). Reshape is free on MLX — `mlx_reshape`
     // is metadata-only — so taking the lazy branch when x is device-
     // resident keeps the whole forward chain on-device. Qwen3.5 hits this
     // ~6× per attention layer (q/k/v projection + attn-out reshape) × 28
-    // layers = ~168 evals/step that previously tripped the old
-    // `ensure_host`-at-public-entry path.
+    // layers = ~168 evals/step.
     let has_device_handle = {
         let t = store.tensor(x)?;
         t.device_handle.is_some() && t.dirty != Dirty::Host
@@ -114,10 +113,10 @@ pub fn transpose(
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
-    // M5.3b.12: same gate as `reshape`. `mlx_transpose_axes` is a lazy
+    // Same gate as `reshape`. `mlx_transpose_axes` is a lazy
     // view op — MLX fuses it into downstream GEMMs, so we pay nothing
     // for staying on device. Qwen3.5 q/k/v projections transpose once
-    // each × 3 × 28 layers = 84 evals/step of old eager-path churn.
+    // each × 3 × 28 layers = 84 evals/step.
     let has_device_handle = {
         let t = store.tensor(x)?;
         t.device_handle.is_some() && t.dirty != Dirty::Host
@@ -208,11 +207,11 @@ pub fn slice(
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
-    // M5.3b.16: dispatch on device-handle presence (same gate as reshape /
+    // Dispatch on device-handle presence (same gate as reshape /
     // transpose / rope / embedding). `mlx_slice` is lazy on Metal — fuses
     // with downstream matmul. Qwen3.5 hits this 2× per attention layer
     // (q/gate split from the fused q_full projection) × 28 layers = 56
-    // evals/step that previously forced a host readback of q_full.
+    // evals/step.
     let has_device_handle = {
         let t = store.tensor(x)?;
         t.device_handle.is_some() && t.dirty != Dirty::Host

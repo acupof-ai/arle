@@ -18,7 +18,6 @@
 #include <cstdint>
 #include <cfloat>
 
-// ─── warp reduction helpers ───
 
 __device__ __forceinline__ float warp_reduce_max_abs(float val) {
     #pragma unroll
@@ -27,13 +26,11 @@ __device__ __forceinline__ float warp_reduce_max_abs(float val) {
     return val;
 }
 
-// ============================================================================
 // Quantize: bf16 → int8 + f32 scale
 //
 // Processes tokens [start_pos .. start_pos + token_count).
 // Grid: (num_kv_heads, token_count)   Block: (head_dim)
 // head_dim must be <= 1024 and a multiple of 32 (warp size).
-// ============================================================================
 __global__ void quantize_kv_kernel(
     const __nv_bfloat16* __restrict__ kv_bf16,   // [num_kv_heads, max_seq_len, head_dim]
     int8_t* __restrict__ kv_int8,                 // [num_kv_heads, max_seq_len, head_dim]
@@ -53,11 +50,9 @@ __global__ void quantize_kv_kernel(
     int offset = kv_head * max_seq_len * head_dim + pos * head_dim + d;
     float val = __bfloat162float(kv_bf16[offset]);
 
-    // ─── compute per-head per-token absmax via warp + shared mem reduction ───
     float abs_val = fabsf(val);
     abs_val = warp_reduce_max_abs(abs_val);
 
-    // Cross-warp reduction via shared memory
     int warp_id = d / 32;
     int lane_id = d % 32;
     int num_warps = (head_dim + 31) / 32;
@@ -66,7 +61,6 @@ __global__ void quantize_kv_kernel(
     if (lane_id == 0) smem[warp_id] = abs_val;
     __syncthreads();
 
-    // Final reduction in warp 0
     __shared__ float s_scale;
     if (warp_id == 0) {
         float v = (lane_id < num_warps) ? smem[lane_id] : 0.0f;
@@ -74,25 +68,21 @@ __global__ void quantize_kv_kernel(
         if (lane_id == 0) {
             float absmax = v;
             s_scale = (absmax > 0.0f) ? (absmax / 127.0f) : 1.0f;
-            // Store scale
             scales[kv_head * max_seq_len + pos] = s_scale;
         }
     }
     __syncthreads();
 
-    // Quantize
     float scale = s_scale;
     int q = __float2int_rn(val / scale);
     q = max(-127, min(127, q));
     kv_int8[offset] = static_cast<int8_t>(q);
 }
 
-// ============================================================================
 // Dequantize: int8 + f32 scale → bf16
 //
 // Processes tokens [0 .. token_count).
 // Grid: (num_kv_heads, token_count)   Block: (head_dim)
-// ============================================================================
 __global__ void dequantize_kv_kernel(
     const int8_t* __restrict__ kv_int8,          // [num_kv_heads, max_seq_len, head_dim]
     const float* __restrict__ scales,            // [num_kv_heads, max_seq_len]
@@ -112,9 +102,6 @@ __global__ void dequantize_kv_kernel(
     kv_bf16[offset] = __float2bfloat16(val);
 }
 
-// ============================================================================
-// C API
-// ============================================================================
 extern "C" {
 
 // Quantize bf16 KV data to INT8 for tokens [start_pos .. start_pos + token_count).
@@ -160,14 +147,12 @@ cudaError_t dequantize_kv_int8_to_bf16_cuda(
     return cudaGetLastError();
 }
 
-// ============================================================================
 // BF16 → FP8 E4M3 quantize for paged KV pool (NHD layout).
 //
 // Converts token rows from the bf16 HND working buffer to scaled FP8 E4M3
 // durable storage in NHD row layout.
 //
 // Grid: (num_kv_heads, batch_size)   Block: (head_dim)
-// ============================================================================
 __global__ void quantize_paged_kv_fp8_kernel(
     const __nv_bfloat16* __restrict__ kv_bf16,    // working buffer [page, head, token, dim]
     __nv_fp8_e4m3* __restrict__ kv_fp8,           // FP8 pool [max_total_tokens * kv_dim]
@@ -658,7 +643,6 @@ cudaError_t dequantize_paged_kv_int8_per_channel_k_to_hnd_cuda(
     return cudaGetLastError();
 }
 
-// ============================================================================
 // Dequantize paged INT8 KV → bf16 working buffer (NHD paged layout).
 //
 // Reads INT8 data + f32 scales at scattered pool indices and writes bf16
@@ -668,7 +652,6 @@ cudaError_t dequantize_paged_kv_int8_per_channel_k_to_hnd_cuda(
 // NHD scale layout: pool_idx * num_kv_heads + kv_head
 //
 // Grid: (num_kv_heads, total_tokens)   Block: (head_dim)
-// ============================================================================
 __global__ void dequantize_paged_kv_kernel(
     const int8_t* __restrict__ kv_int8,          // [max_total_tokens * kv_dim]
     const float* __restrict__ scales,            // [max_total_tokens * num_kv_heads]
@@ -693,12 +676,10 @@ __global__ void dequantize_paged_kv_kernel(
     kv_bf16[data_offset] = __float2bfloat16(val);
 }
 
-// ============================================================================
 // Quantize new tokens (1 per request) from bf16 working → INT8 paged pool.
 //
 // Grid: (num_kv_heads, batch_size)   Block: (head_dim)
 // head_dim must be <= 1024 and a multiple of 32.
-// ============================================================================
 __global__ void quantize_paged_kv_single_kernel(
     const __nv_bfloat16* __restrict__ kv_bf16,   // HND work buffer [page, head, token, dim]
     int8_t* __restrict__ kv_int8,                 // INT8 pool [max_total_tokens * kv_dim]
@@ -725,7 +706,6 @@ __global__ void quantize_paged_kv_single_kernel(
     int data_offset = pool_idx * kv_dim + kv_head * head_dim + d;
     float val = __bfloat162float(kv_bf16[src_offset]);
 
-    // ─── per-head per-token absmax via warp + shared mem reduction ───
     float abs_val = fabsf(val);
     abs_val = warp_reduce_max_abs(abs_val);
 
@@ -799,7 +779,6 @@ cudaError_t quantize_paged_kv_single_cuda(
     return cudaGetLastError();
 }
 
-// ============================================================================
 // KIVI per-channel K scale quantization (FP8 E4M3 only).
 //
 // Reads K from the HND-paged bf16 working buffer and writes FP8 E4M3 to the
@@ -813,7 +792,6 @@ cudaError_t quantize_paged_kv_single_cuda(
 // quantization error that catastrophically compounds through deep dense
 // transformers. V keeps its per-(token, head) scales (KIVI's asymmetric
 // choice — V doesn't show the same outlier-channel structure).
-// ============================================================================
 
 __global__ void quantize_paged_kv_fp8_per_channel_kernel(
     const __nv_bfloat16* __restrict__ kv_bf16,      // HND-paged work buffer [page, head, token, dim]
@@ -850,12 +828,10 @@ __global__ void quantize_paged_kv_fp8_per_channel_kernel(
     kv_fp8[dst_offset] = __nv_fp8_e4m3(val * inv_scale);
 }
 
-// ============================================================================
 // Per-channel K absmax: scan a batch of K rows and update the per-channel
 // scale table. Uses atomicMax-on-bits to maintain the running absmax
 // across multiple invocations (so multiple prefill batches contribute).
 // Final scale = running_absmax / 448.0 (FP8 E4M3 max representable).
-// ============================================================================
 
 static __device__ __forceinline__ void atomic_max_float(float* addr, float val) {
     int* iaddr = reinterpret_cast<int*>(addr);
@@ -976,12 +952,10 @@ cudaError_t finalize_k_per_channel_scales_cuda(
     return cudaGetLastError();
 }
 
-// ============================================================================
 // INT8 KIVI per-channel K finalize + per-token quantize.
 //
 // Mirrors the FP8 path above; only the symmetric range constant differs
 // (INT8 max representable = 127 vs FP8 E4M3 = 448).
-// ============================================================================
 
 __global__ void finalize_k_per_channel_scales_int8_kernel(
     float* k_static_scales,
@@ -1064,14 +1038,12 @@ cudaError_t quantize_paged_kv_int8_per_channel_cuda(
     return cudaGetLastError();
 }
 
-// ============================================================================
 // INT4 KIVI per-channel K — 4-bit packed (2 nibbles per byte).
 //
 // Range: symmetric int4 [-7, 7]. Pool storage uses `kv_dim/2` bytes per
 // token. Layout: dim 2k → low nibble of byte k; dim 2k+1 → high nibble.
 // PoC parallel to TQ4 — both target 4× compression vs BF16; TQ4 handles K
 // outliers via Hadamard rotation, this path uses KIVI per-channel K scaling.
-// ============================================================================
 
 __global__ void finalize_k_per_channel_scales_int4_kernel(
     float* k_static_scales,

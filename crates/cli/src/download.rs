@@ -33,7 +33,6 @@ pub(crate) fn download_model_with_progress(model_id: &str) -> Result<PathBuf> {
 
     let mp = MultiProgress::new();
 
-    // ── mandatory files ──────────────────────────────────────────────────
     let mandatory = ["config.json", "tokenizer.json", "tokenizer_config.json"];
     for name in &mandatory {
         if filenames.iter().any(|f| f == name) {
@@ -41,7 +40,6 @@ pub(crate) fn download_model_with_progress(model_id: &str) -> Result<PathBuf> {
         }
     }
 
-    // ── optional config files ────────────────────────────────────────────
     let optional = [
         "special_tokens_map.json",
         "generation_config.json",
@@ -55,7 +53,6 @@ pub(crate) fn download_model_with_progress(model_id: &str) -> Result<PathBuf> {
         }
     }
 
-    // ── weight shards ────────────────────────────────────────────────────
     let weight_files: Vec<&str> = filenames
         .iter()
         .filter(|f| {
@@ -76,7 +73,6 @@ pub(crate) fn download_model_with_progress(model_id: &str) -> Result<PathBuf> {
         fetch_with_bar(&repo, name, model_id, &mp)?;
     }
 
-    // ── resolve cache dir ────────────────────────────────────────────────
     let first = mandatory
         .iter()
         .find(|name| filenames.iter().any(|f| f == *name))
@@ -116,7 +112,6 @@ fn fetch_with_bar(
         .progress_chars("━╸─"),
     );
 
-    // Truncate filename for display
     let display_name = if filename.len() > 28 {
         format!("...{}", &filename[filename.len() - 25..])
     } else {

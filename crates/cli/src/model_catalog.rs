@@ -46,7 +46,6 @@ pub(crate) const DEEPSEEK_OCR_MODEL_ID: &str = "sahilchachra/unlimited-ocr-mxfp8
 /// Curated catalog of selectable models. Display order is decided by
 /// `recommend_models` (flagship picks first), not by position here.
 pub(crate) const CATALOG: &[CatalogEntry] = &[
-    // ── MLX quantized (Metal-optimized) ──────────────────────────────────
     CatalogEntry {
         hf_id: "mlx-community/Qwen3-0.6B-4bit",
         display_name: "Qwen3 0.6B",
@@ -67,7 +66,6 @@ pub(crate) const CATALOG: &[CatalogEntry] = &[
         implemented: true,
         recommended: None,
     },
-    // ── Full-precision (CUDA + CPU) ──────────────────────────────────────
     CatalogEntry {
         hf_id: "Qwen/Qwen3-0.6B",
         display_name: "Qwen3 0.6B",
@@ -108,7 +106,6 @@ pub(crate) const CATALOG: &[CatalogEntry] = &[
         implemented: true,
         recommended: None,
     },
-    // ── Community quantized (popular picks) ──────────────────────────────
     CatalogEntry {
         hf_id: "mlx-community/Qwen3-4B-4bit",
         display_name: "Qwen3 4B",
@@ -129,7 +126,6 @@ pub(crate) const CATALOG: &[CatalogEntry] = &[
         implemented: true,
         recommended: None,
     },
-    // ── Qwen3.6 dense (GatedDeltaNet) — highest quality, self-speculative ─
     // OptiQ mixed 4/8-bit: PPL 7.82 (vs uniform-4bit 8.56). Its own NextN-MTP
     // head is auto-enabled for spec decode (~18 tok/s, past the bandwidth floor).
     CatalogEntry {
@@ -142,7 +138,6 @@ pub(crate) const CATALOG: &[CatalogEntry] = &[
         implemented: true,
         recommended: Some("best quality · spec decode"),
     },
-    // ── Qwen3.5 / Qwen3.6 Mixture-of-Experts (Metal-only, Phase 1). ──────
     CatalogEntry {
         hf_id: "mlx-community/Qwen3.6-35B-A3B-4bit",
         display_name: "Qwen3.6 35B-A3B",
@@ -153,7 +148,6 @@ pub(crate) const CATALOG: &[CatalogEntry] = &[
         implemented: true,
         recommended: Some("fastest · MoE"),
     },
-    // ── CUDA agentic flagship — ThinkingCap 27B FP8 ──────────────────────
     // 73% fewer tokens than base Qwen3.6-27B-FP8 at identical agentic reward
     // (5/5 greedy); card claims "50% fewer thinking tokens, preserved quality".
     CatalogEntry {

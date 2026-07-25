@@ -1,7 +1,6 @@
 #include "common.cuh"
 #include <cmath>
 
-// ============================================================================
 // Batched Gated Delta Rule Decode — B requests in one kernel launch
 //
 // 2D grid: (num_value_heads, B). Each block handles one (head, request) pair.
@@ -17,7 +16,6 @@
 //
 // Grid:  (num_value_heads, B)
 // Block: 512 threads (128 val × 4 j_slices)
-// ============================================================================
 
 #define GDR_B_KEY_DIM 128
 #define GDR_B_VAL_DIM 128
@@ -72,9 +70,7 @@ __global__ void gdr_decode_batch_kernel(
             __bfloat162float(my_qkv[q_dim_total + k_dim_total + v_head * val_dim + val_idx]);
     }
 
-    // ====================================================================
     // L2 normalize q and k — only j_slice=0 contributes
-    // ====================================================================
     float q_sq = (j_slice == 0) ? q_val * q_val : 0.0f;
     q_sq = warp_reduce_sum(q_sq);
     if (lane_id == 0) warp_norms[warp_id] = q_sq;
@@ -109,9 +105,7 @@ __global__ void gdr_decode_batch_kernel(
         smem_k[val_idx] = k_val;
     }
 
-    // ====================================================================
     // Compute g and beta for this (value_head, request)
-    // ====================================================================
     if (threadIdx.x == 0) {
         float a_val = __bfloat162float(a_proj_batch[b * num_value_heads + v_head]);
         float b_val = __bfloat162float(b_proj_batch[b * num_value_heads + v_head]);
@@ -129,17 +123,13 @@ __global__ void gdr_decode_batch_kernel(
     float exp_g = s_exp_g;
     float beta = s_beta;
 
-    // ====================================================================
     // State pointer — per-request
-    // ====================================================================
     float* my_state = state_ptrs[b] + v_head * key_dim * val_dim;
 
     int j_start = j_slice * GDR_B_J_PER_SLICE;
     int j_end = j_start + GDR_B_J_PER_SLICE;
 
-    // ====================================================================
     // Pass 1: Decay + partial kv_mem
-    // ====================================================================
     float partial_kv = 0.0f;
     for (int j = j_start; j < j_end; j++) {
         float s = my_state[j * val_dim + val_idx];
@@ -156,9 +146,7 @@ __global__ void gdr_decode_batch_kernel(
 
     float my_delta = (smem_v[val_idx] - kv_mem) * beta;
 
-    // ====================================================================
     // Pass 2: Rank-1 update + partial output
-    // ====================================================================
     float partial_out = 0.0f;
     for (int j = j_start; j < j_end; j++) {
         float s = my_state[j * val_dim + val_idx];

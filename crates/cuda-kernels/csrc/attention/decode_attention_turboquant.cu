@@ -38,7 +38,6 @@ __device__ __forceinline__ float tq_warp_reduce_max(float val) {
     return val;
 }
 
-// ============================================================================
 // Phase 1: Partial attention from TQ-packed KV.
 //
 // Grid: (num_splits, batch_size * num_qo_heads)
@@ -52,7 +51,6 @@ __device__ __forceinline__ float tq_warp_reduce_max(float val) {
 //   V_norms:  f16 norms [max_tokens, num_kv_heads]
 //   centroids_k: [num_levels] f32 — K codebook
 //   centroids_v: [num_levels] f32 — V codebook
-// ============================================================================
 template <int HEAD_DIM, int NUM_SPLITS>
 __global__ void tq_decode_attention_partial_kernel(
     const __nv_bfloat16* __restrict__ Q_rot,      // pre-rotated query
@@ -125,12 +123,10 @@ __global__ void tq_decode_attention_partial_kernel(
     }
 }
 
-// ============================================================================
 // Phase 1 production kernel: Q_rot scores against packed K centroids.
 //
 // Each warp processes one KV token at a time. Online softmax accumulation.
 // V is dequantized in registers (IFWHT via shared memory).
-// ============================================================================
 template <int HEAD_DIM>
 __global__ void tq_decode_attention_kernel(
     const __nv_bfloat16* __restrict__ Q_rot,
@@ -184,7 +180,6 @@ __global__ void tq_decode_attention_kernel(
     for (int t = 0; t < num_tokens; t++) {
         int pool_idx = kv_indices[kv_start + t];
 
-        // ── Score: q_rot[d] * centroid_k[idx_k[d]] ──
         int k_byte_idx = d / indices_per_byte;
         int k_sub = d % indices_per_byte;
         int k_offset = pool_idx * (num_kv_heads * packed_per_head) + kv_head * packed_per_head;
@@ -201,7 +196,6 @@ __global__ void tq_decode_attention_kernel(
         // Reduce across all dimensions to get full score
         partial_score = tq_warp_reduce_sum(partial_score);
 
-        // Cross-warp reduction via shared memory
         int warp_id = d / TQ_WARP_SIZE;
         int lane_id = d % TQ_WARP_SIZE;
         int num_warps = HEAD_DIM / TQ_WARP_SIZE;
@@ -219,12 +213,11 @@ __global__ void tq_decode_attention_kernel(
         __syncthreads();
         score = smem[0];
 
-        // ── Online softmax update ──
         float m_new = fmaxf(m_local, score);
         float exp_diff = expf(m_local - m_new);
         float exp_score = expf(score - m_new);
 
-        // ── V dequant: unpack + centroid gather (no rotation needed for scoring) ──
+        // V dequant: unpack + centroid gather (no rotation needed for scoring).
         // Note: V still needs inverse rotation for the weighted sum.
         // For simplicity, store centroid-space V and apply IFWHT after accumulation.
         // Actually, V needs full dequant per token. Use shared memory IFWHT.
@@ -255,7 +248,6 @@ __global__ void tq_decode_attention_kernel(
         // Note: signs for V would be applied here too
         float v_val = smem[d] * rsqrtf((float)HEAD_DIM) * v_norm;
 
-        // ── Accumulate: o = o * exp(m_old - m_new) + exp(score - m_new) * v ──
         o_local = o_local * exp_diff + exp_score * v_val;
         l_local = l_local * exp_diff + exp_score;
         m_local = m_new;
@@ -263,17 +255,14 @@ __global__ void tq_decode_attention_kernel(
         __syncthreads();  // Ensure smem is free for next token
     }
 
-    // ── Final output: o / l ──
     float result = (l_local > 0.0f) ? (o_local / l_local) : 0.0f;
     O[bh * HEAD_DIM + d] = __float2bfloat16(result);
 }
 
-// ============================================================================
 // Host-side: Rotate Q via sign flip + FWHT (preparation for fused attention).
 //
 // Grid: (batch_size * num_qo_heads,)
 // Block: (HEAD_DIM,)
-// ============================================================================
 __global__ void tq_rotate_query_kernel(
     const __nv_bfloat16* __restrict__ Q,
     __nv_bfloat16* __restrict__ Q_rot,
@@ -307,9 +296,6 @@ __global__ void tq_rotate_query_kernel(
     Q_rot[bh * head_dim + d] = __float2bfloat16(smem[d] * rsqrtf((float)head_dim));
 }
 
-// ============================================================================
-// C API launchers
-// ============================================================================
 
 extern "C" CUresult tq_rotate_query_cuda(
     const void* Q,

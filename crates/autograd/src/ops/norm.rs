@@ -13,7 +13,7 @@ pub fn rmsnorm(
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
-    // M5.3b.6: dispatch on device-handle presence (mirrors the rope
+    // Dispatch on device-handle presence (mirrors the rope
     // pattern so Dirty::Both after `ensure_device` stays lazy too).
     // When the lazy path wins, forward skips the host-side inv_rms
     // computation entirely — `rmsnorm_backward` recomputes inv_rms
@@ -189,12 +189,10 @@ pub(crate) fn rmsnorm_backward(
         return Ok(GradPairs::new());
     }
 
-    // Wave 2.1: route through `rms_norm_backward_device` whenever
-    // upstream, x, and weight are all device-resident. Pre-2.1 this op
-    // unconditionally `ensure_host(x)` + read `tensor_host` for all three
-    // operands — every layer's rmsnorm thus demoted x back to host before
-    // any downstream device op could see it, poisoning the entire post-
-    // P3.1 chain.
+    // Route through `rms_norm_backward_device` whenever
+    // upstream, x, and weight are all device-resident. A host path would
+    // `ensure_host(x)` + read `tensor_host` for all three operands, demoting
+    // x back to host before any downstream device op could see it.
     let device_path_ok = {
         let upstream = store.tensor(output_grad_id)?;
         let x_t = store.tensor(x)?;

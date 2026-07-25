@@ -2860,7 +2860,7 @@ impl Qwen35Model {
     /// (the pool grows to `num_slots` at full concurrency); the budget reserves
     /// for the worst case even though idle slots hold no block.
     ///
-    /// Full-attn K/V is NO LONGER per-slot since the shared-paged migration: it
+    /// Full-attn K/V is not per-slot: it
     /// lives in the executor's one shared profile-sized [`PagedKVPool`], so the
     /// per-slot budget excludes it (the `kv_bytes` term is 0). The slot clamp
     /// then reflects only the small recurrent state; the pool reserves the bulk
@@ -4383,12 +4383,12 @@ impl Qwen35Model {
             h_prev.len
         );
 
-        // ── 1. Candidate token embedding. ──
+        // Candidate token embedding.
         let token_ids = upload_i32(&self.ctx, &[token as i32])?;
         let mut emb = HiddenStates::zeros(&self.ctx, hidden, 1)?;
         embedding_batch(&self.ctx, &self.embed_tokens, &token_ids, &mut emb)?;
 
-        // ── 2. Pre-fc RMSNorms over [embedding ; previous hidden], concat. ──
+        // Pre-fc RMSNorms over [embedding ; previous hidden], concat.
         // fc is [hidden, 2*hidden]; the concat input is [norm(emb) ; norm(h_prev)]
         // (embedding first — matches the Metal `qwen3_5_mtp` loader order).
         let mut concat = HiddenStates::zeros(&self.ctx, 2 * hidden, 1)?;
@@ -4413,8 +4413,8 @@ impl Qwen35Model {
         let mut h_fc = HiddenStates::zeros(&self.ctx, hidden, 1)?;
         gemm_batch(&self.ctx, &mtp.fc, &concat, &mut h_fc)?;
 
-        // ── 3. One transformer block (Full attn over the head's own per-block
-        //       KV + dense MLP), mirroring the trunk layer body. ──
+        // One transformer block (Full attn over the head's own per-block
+        //       KV + dense MLP), mirroring the trunk layer body.
         let layer = &mtp.layer;
         let Qwen35Attn::Full(full_attn) = &layer.attn else {
             unreachable!("MTP head layer is always full attention");
@@ -4472,7 +4472,7 @@ impl Qwen35Model {
         let mut h_layer = HiddenStates::zeros(&self.ctx, hidden, 1)?;
         add_batch(&self.ctx, &hidden_mid, &mlp_out, &mut h_layer)?;
 
-        // ── 4. Final head RMSNorm + SHARED lm_head + token selection. ──
+        // Final head RMSNorm + SHARED lm_head + token selection.
         rms_norm_offset(&self.ctx, &h_layer, &mtp.norm, eps, &mut normed)?;
         let vocab = self.output_projection().rows;
         let mut logits = HiddenStates::zeros(&self.ctx, vocab, 1)?;
@@ -5809,7 +5809,7 @@ impl Qwen35Model {
         let sm_scale = 1.0f32 / (c.head_dim as f32).sqrt();
         let kv_len = start_pos + seq_len;
 
-        // ── 1. Prep: q/k RMSNorm + RoPE + write K/V into the contiguous cache. ──
+        // Prep: q/k RMSNorm + RoPE + write K/V into the contiguous cache.
         {
             let (qf_ptr, _g0) = q_full.data.device_ptr(&self.ctx.stream);
             let (k_ptr, _g1) = k_batch.data.device_ptr(&self.ctx.stream);
@@ -5852,7 +5852,7 @@ impl Qwen35Model {
             })?;
         }
 
-        // ── 2. Attention over the contiguous cache (causal; decode = qlen 1). ──
+        // Attention over the contiguous cache (causal; decode = qlen 1).
         // Decode (`seq_len == 1`) takes the devpos entry: the kv length is read
         // from the staged `start_pos` DEVICE buffer inside the kernel (same
         // math — kv_len = start_pos + token + 1 either way), so the launch is
@@ -6047,7 +6047,7 @@ impl Qwen35Model {
             )?;
         }
 
-        // ── 3. Per-head sigmoid gate from q_full's gate half. ──
+        // Per-head sigmoid gate from q_full's gate half.
         {
             let (qf_ptr, _g0) = q_full.data.device_ptr(&self.ctx.stream);
             let (o_ptr, _g1) = attn_out.data.device_ptr_mut(&self.ctx.stream);
@@ -6149,7 +6149,7 @@ impl Qwen35Model {
         let k_pool_ptr = rc.pool.k_ptr(full_idx, &self.ctx.stream);
         let v_pool_ptr = rc.pool.v_ptr(full_idx, &self.ctx.stream);
 
-        // ── 1. Prep: q/k RMSNorm + RoPE; write K/V into the pool's tail page. ──
+        // Prep: q/k RMSNorm + RoPE; write K/V into the pool's tail page.
         {
             #[cfg(test)]
             let prep_capture = if !decode {
@@ -6254,7 +6254,7 @@ impl Qwen35Model {
             prep_probe::finish(&self.ctx, prep_capture, q_prepped)?;
         }
 
-        // ── 1.5. For quantized pools: BF16 work buffer → quantized data buffer. ──
+        // For quantized pools: BF16 work buffer → quantized data buffer.
         // The prep kernel above wrote the new tokens BF16 into `k_work` / `v_work`
         // (= `k_ptr` / `v_ptr` for FP8/INT8 pools). Quantize them into `k_data[layer]`
         // so the FP8 attention kernel can read the complete token history (prefix from
@@ -6300,7 +6300,7 @@ impl Qwen35Model {
             }
         }
 
-        // ── 2. Paged attention over the recall page table (RoPE pre-baked). ──
+        // Paged attention over the recall page table (RoPE pre-baked).
         {
             #[cfg(test)]
             let attn_capture = if !decode {
@@ -6449,7 +6449,7 @@ impl Qwen35Model {
             attn_probe::finish(&self.ctx, attn_capture, attn_out)?;
         }
 
-        // ── 3. Per-head sigmoid gate from q_full's gate half. ──
+        // Per-head sigmoid gate from q_full's gate half.
         {
             let (qf_ptr, _g0) = q_full.data.device_ptr(&self.ctx.stream);
             let (o_ptr, _g1) = attn_out.data.device_ptr_mut(&self.ctx.stream);
@@ -7891,8 +7891,8 @@ impl Qwen35Model {
         let k_pool_ptr = pool.k_ptr(full_idx, &self.ctx.stream);
         let v_pool_ptr = pool.v_ptr(full_idx, &self.ctx.stream);
 
-        // ── 1. Prep: q/k RMSNorm + partial RoPE; write each row's new K/V into
-        //    its slot's tail page (grid `(num_kv_heads, B)`, batch_size = B). ──
+        // Prep: q/k RMSNorm + partial RoPE; write each row's new K/V into
+        //    its slot's tail page (grid `(num_kv_heads, B)`, batch_size = B).
         {
             let (qf_ptr, _g0) = q_full.data.device_ptr(&self.ctx.stream);
             let (k_ptr, _g1) = k_batch.data.device_ptr(&self.ctx.stream);
@@ -7938,7 +7938,7 @@ impl Qwen35Model {
             }
         }
 
-        // ── 2. Paged decode over each row's page slice (`bsz=B`, RoPE pre-baked). ──
+        // Paged decode over each row's page slice (`bsz=B`, RoPE pre-baked).
         {
             let kernel = ffi::resolve_paged_attn_v1(
                 c.head_dim as u32,
@@ -7986,7 +7986,7 @@ impl Qwen35Model {
             }
         }
 
-        // ── 3. Separable per-head sigmoid gate over all B rows. ──
+        // Separable per-head sigmoid gate over all B rows.
         {
             let (qf_ptr, _g0) = q_full.data.device_ptr(&self.ctx.stream);
             let (o_ptr, _g1) = attn_out.data.device_ptr_mut(&self.ctx.stream);

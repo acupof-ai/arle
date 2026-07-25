@@ -43,7 +43,6 @@ pub(crate) fn pick_model(
     let mut items: Vec<String> = Vec::new();
     let mut actions: Vec<PickerAction> = Vec::new();
 
-    // ── Local models ─────────────────────────────────────────────────────
     if !local_models.is_empty() {
         for (name, path) in local_models {
             items.push(local_model_item(name, path));
@@ -51,9 +50,7 @@ pub(crate) fn pick_model(
         }
     }
 
-    // ── Recommended downloads ────────────────────────────────────────────
     if !recommended.is_empty() {
-        // Separator
         if !local_models.is_empty() {
             items.push(separator_item("── download ──"));
             actions.push(PickerAction::Separator);
@@ -65,11 +62,9 @@ pub(crate) fn pick_model(
         }
     }
 
-    // ── Search option ────────────────────────────────────────────────────
     items.push(search_item());
     actions.push(PickerAction::Search);
 
-    // ── Show picker ──────────────────────────────────────────────────────
     // Clamp the default into range and never land it on the separator (which
     // would loop). Callers pass the best available option; this is the seat
     // belt for an out-of-range or unlucky index.

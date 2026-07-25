@@ -1,7 +1,6 @@
 #include "common.cuh"
 #include <cmath>
 
-// ============================================================================
 // Gated Delta Rule — Recurrent decode step for linear attention
 //
 // Each block handles one value head (32 blocks total for Qwen3.5-4B).
@@ -16,7 +15,6 @@
 //
 // Thread mapping: val_idx ∈ [0, val_dim), j_slice ∈ [0, J_SLICES).
 // GQA: num_key_heads < num_value_heads, so multiple value heads share one key head.
-// ============================================================================
 
 #define GDR_KEY_DIM 128
 #define GDR_VAL_DIM 128
@@ -68,9 +66,7 @@ __global__ void gated_delta_rule_decode_kernel(
             __bfloat162float(qkv[q_dim_total + k_dim_total + v_head * val_dim + val_idx]);
     }
 
-    // ========================================================================
     // L2 normalize q and k — only j_slice=0 contributes to avoid 4× counting
-    // ========================================================================
     float q_sq = (j_slice == 0) ? q_val * q_val : 0.0f;
     q_sq = warp_reduce_sum(q_sq);
     if (lane_id == 0) warp_norms[warp_id] = q_sq;
@@ -106,9 +102,7 @@ __global__ void gated_delta_rule_decode_kernel(
         smem_k[val_idx] = k_val;
     }
 
-    // ========================================================================
     // Compute g and beta for this value head
-    // ========================================================================
     if (threadIdx.x == 0) {
         float a_val = __bfloat162float(a_proj[v_head]);
         float b_val = __bfloat162float(b_proj[v_head]);
@@ -126,17 +120,13 @@ __global__ void gated_delta_rule_decode_kernel(
     float exp_g = s_exp_g;
     float beta = s_beta;
 
-    // ========================================================================
     // State pointer — layout [key_dim, val_dim], val_dim contiguous
-    // ========================================================================
     float* my_state = state + v_head * key_dim * val_dim;
 
     int j_start = j_slice * GDR_J_PER_SLICE;
     int j_end = j_start + GDR_J_PER_SLICE;
 
-    // ========================================================================
     // Pass 1: Decay + partial kv_mem (each j_slice handles 32 j-iterations)
-    // ========================================================================
     float partial_kv = 0.0f;
     for (int j = j_start; j < j_end; j++) {
         float s = my_state[j * val_dim + val_idx];
@@ -154,9 +144,7 @@ __global__ void gated_delta_rule_decode_kernel(
 
     float my_delta = (smem_v[val_idx] - kv_mem) * beta;
 
-    // ========================================================================
     // Pass 2: Rank-1 update + partial output
-    // ========================================================================
     float partial_out = 0.0f;
     for (int j = j_start; j < j_end; j++) {
         float s = my_state[j * val_dim + val_idx];
@@ -372,7 +360,6 @@ cudaError_t gated_delta_rule_prefill_recurrent_cuda(
 
 } // extern "C"
 
-// ============================================================================
 // FlashQLA chunked-prefill prep — unpack the fused [q|k|v] projection row
 // into the FlashQLA tensor layouts and derive g/beta.
 //
@@ -392,7 +379,6 @@ cudaError_t gated_delta_rule_prefill_recurrent_cuda(
 // Grid (S, H): block y handles v-head y (v copy + g/beta); blocks y < Hg
 // additionally l2norm key-head y's q/k. 128 threads = one element per
 // thread; block reduce via 4-warp partials.
-// ============================================================================
 
 __global__ void gdr_fq_prep_kernel(
     const __nv_bfloat16* __restrict__ qkv,
@@ -419,7 +405,7 @@ __global__ void gdr_fq_prep_kernel(
     const int qkv_stride = 2 * q_dim_total + num_value_heads * GDR_VAL_DIM;
     const __nv_bfloat16* token_qkv = qkv + (size_t)token * qkv_stride;
 
-    // ── v copy + g/beta (every block: head is a v-head). ──
+    // v copy + g/beta (every block: head is a v-head).
     const float v_val =
         __bfloat162float(token_qkv[2 * q_dim_total + head * GDR_VAL_DIM + d]);
     v_out[((size_t)token * num_value_heads + head) * GDR_VAL_DIM + d] =
@@ -439,7 +425,7 @@ __global__ void gdr_fq_prep_kernel(
             1.0f / (1.0f + expf(-b_val));
     }
 
-    // ── q/k l2norm (key-head blocks only). ──
+    // q/k l2norm (key-head blocks only).
     if (head >= num_key_heads) return;
 
     __shared__ float warp_partials[2][GDR_VAL_DIM / WARP_SIZE];  // [q|k][4]
