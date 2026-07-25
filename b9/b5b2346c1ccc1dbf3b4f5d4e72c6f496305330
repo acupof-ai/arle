@@ -1,0 +1,31 @@
+crates/cli/src/args.rs
+  s_9c91b86ec3fb55::t_24e0723bee909e 742-748
+crates/cli/src/serve.rs
+  s_9c91b86ec3fb55::t_489175b87913d9 177-182,189-199,204-226,228-234,418
+crates/infer-api/src/serve.rs
+  s_9c91b86ec3fb55::t_974d624e9fe4d3 194-195
+crates/train/src/dspark_train.rs
+  s_9c91b86ec3fb55::t_7e5d5b90c87f5f 26,48-77,501-505,520,534-540
+crates/train/tests/test_dspark_train.rs
+  s_9c91b86ec3fb55::t_c193e05ef08422 269-273,276-279
+docs/experience/wins/2026-07-25-dspark-train-persists-and-swap-cadence.md
+  s_9c91b86ec3fb55::t_395499e98e797b 25-32,46-54
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "b9b5b2346c1ccc1dbf3b4f5d4e72c6f496305330",
+  "prompts": {},
+  "sessions": {
+    "s_9c91b86ec3fb55": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4779911a-69b7-49db-bc83-daf5a48d6ca3",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
