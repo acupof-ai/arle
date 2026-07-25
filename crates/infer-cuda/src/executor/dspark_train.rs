@@ -14,7 +14,6 @@ use std::collections::VecDeque;
 use std::sync::{Mutex, OnceLock};
 
 use cuda_kernels::prelude::{DeviceContext, DeviceVec, HiddenStates};
-use half::bf16;
 
 /// One DSpark spec step's experience for RL training.
 pub struct DsparkExperience {
@@ -201,11 +200,12 @@ pub fn capture_dspark_experience_hidden(
     }
     let draft_logits_host = hidden_states_to_host(ctx, draft_logits);
     // Slice the target logits to this slot's rows: [col_offset, col_offset+col_len).
-    let byte_off = col_offset * vocab * std::mem::size_of::<bf16>();
-    let byte_len = col_len * vocab * std::mem::size_of::<bf16>();
+    // CudaSlice indexes in ELEMENTS of bf16, not bytes — no size_of scaling.
+    let off = col_offset * vocab;
+    let len = col_len * vocab;
     let target_logits_host: Vec<f32> = match ctx
         .stream
-        .clone_dtoh(&target_logits.data.slice(byte_off..byte_off + byte_len))
+        .clone_dtoh(&target_logits.data.slice(off..off + len))
     {
         Ok(host_bf16) => {
             let _ = ctx.sync();
