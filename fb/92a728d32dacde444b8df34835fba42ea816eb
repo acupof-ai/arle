@@ -1,0 +1,23 @@
+CHANGELOG.md
+  s_9c91b86ec3fb55::t_a6b2fd5c750c85 26-38
+docs/architecture-dsv4.md
+  s_9c91b86ec3fb55::t_64cf665a689427 494-503,505-509,511-517,539-546,579-586
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "fb92a728d32dacde444b8df34835fba42ea816eb",
+  "prompts": {},
+  "sessions": {
+    "s_9c91b86ec3fb55": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4779911a-69b7-49db-bc83-daf5a48d6ca3",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
