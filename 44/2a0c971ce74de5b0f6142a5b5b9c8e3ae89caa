@@ -1,0 +1,33 @@
+crates/cuda-kernels/csrc/attention/nonpaged_prefill_attention.cu
+  s_089e26e9e41120::t_5d5581b55a862c 60,62-66,76,124
+scripts/pod_ncu_nonpaged.sh
+  s_ff2cc9a6ba32bd::t_7b8724be076a34 1-62
+scripts/pod_nsys_nonpaged.sh
+  s_ff2cc9a6ba32bd::t_6bf84d920dc1fc 1-53
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "442a0c971ce74de5b0f6142a5b5b9c8e3ae89caa",
+  "prompts": {},
+  "sessions": {
+    "s_089e26e9e41120": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "93e66a8f-c20a-4ba9-96f2-283f6d98cbb1",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_ff2cc9a6ba32bd": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a6e607bc3b0bd8568",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
