@@ -7,11 +7,11 @@ use crate::{
 };
 
 pub fn softmax(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
-    // M5.3b.2: route Dirty::Device inputs through the lazy
+    // Route Dirty::Device inputs through the lazy
     // `backend.softmax_last_axis` (composes `mlx_softmax_axis` into the MLX
     // graph with no eval). Dirty::Host / Dirty::Both stay on the host fast
     // path so host-resident producers don't pay an upload+device-reduce
-    // +readback. Mirrors the M5.3b.1 `sum` dispatch shape.
+    // +readback.
     let dirty = store.tensor(x)?.dirty.clone();
     match dirty {
         Dirty::Device => softmax_device_lazy(x, store, tape, SoftmaxKind::Softmax),
@@ -20,7 +20,7 @@ pub fn softmax(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<
 }
 
 pub fn log_softmax(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
-    // See `softmax` for the dispatch rationale (M5.3b.2).
+    // See `softmax` for the dispatch rationale.
     let dirty = store.tensor(x)?.dirty.clone();
     match dirty {
         Dirty::Device => softmax_device_lazy(x, store, tape, SoftmaxKind::LogSoftmax),
@@ -240,7 +240,7 @@ pub(crate) fn log_softmax_backward(
         });
     }
 
-    // Wave 1 (post-M5.3b nsys attribution): fast-path the backward when
+    // Fast-path the backward when
     // BOTH the saved forward output and the upstream gradient are still
     // device-resident. This is the production CUDA path: the saved
     // `LogSoftmaxCtx { y }` is produced by `softmax_device_lazy` on a

@@ -324,11 +324,10 @@ __global__ void turboquant_quantize_kernel(
         norms_out[norm_offset] = __float2half(norm);
     }
 
-    // ─── Step 3: x_unit = x / norm ───
     float x_unit = x_val * inv_norm;
 
-    // ─── Step 4: Rotation y[d] = sum_j(Pi[d][j] * x_unit[j]) ───
-    // Load x_unit into shared memory for broadcast access.
+    // Rotation y[d] = sum_j(Pi[d][j] * x_unit[j]). Load x_unit into shared
+    // memory for broadcast access.
     s_x[d] = x_unit;
     __syncthreads();
 
@@ -339,21 +338,18 @@ __global__ void turboquant_quantize_kernel(
         y += Pi_row[j] * s_x[j];
     }
 
-    // ─── Step 5: Searchsorted (binary search in boundaries) ───
-    // boundaries[0] = -1.0, boundaries[num_levels] = 1.0
-    // Interior boundaries: boundaries[1..num_levels-1]
+    // Searchsorted (binary search in boundaries): boundaries[0] = -1.0,
+    // boundaries[num_levels] = 1.0, interior boundaries[1..num_levels-1].
     // Find largest k such that boundaries[k] <= y.
     int idx = 0;
     for (int k = 1; k < num_levels; k++) {
         if (y >= boundaries[k]) idx = k;
     }
 
-    // ─── Step 6: Cooperative bitpack ───
-    // Pack `bits`-bit indices into bytes. LSB-first packing.
-    // Each thread has one index (0..num_levels-1). Threads cooperate to write packed bytes.
-    // Strategy: each group of (8/bits) threads packs into one byte.
-    // For bits=3, we round up: 2 indices per byte (stored as 4-bit pairs, wastes 1 bit each).
-    // For bits=2, 4 indices per byte. For bits=4, 2 indices per byte.
+    // Cooperative bitpack: pack `bits`-bit indices into bytes, LSB-first. Each
+    // thread has one index (0..num_levels-1); a group of (8/bits) threads packs
+    // into one byte. bits=3 rounds up to 2 indices/byte (4-bit pairs, wastes 1
+    // bit each); bits=2 → 4 indices/byte; bits=4 → 2 indices/byte.
 
     int effective_bits = bits;
     if (bits == 3) effective_bits = 4;  // round up to nibble for simplicity
@@ -373,22 +369,18 @@ __global__ void turboquant_quantize_kernel(
     atomicOr((unsigned int*)(s_packed + (byte_idx & ~3)), (unsigned int)shifted << (8 * (byte_idx & 3)));
     __syncthreads();
 
-    // ─── Step 7: Store packed bytes ───
     int dst_offset = batch_idx * (gridDim.x * packed_per_head) + kv_head * packed_per_head;
     if (d < packed_per_head) {
         packed_out[dst_offset + d] = s_packed[d];
     }
 }
 
-// ============================================================================
 // Kernel 2: TurboQuant Dequantize KV
 //
 // Packed indices + f16 norm → BF16 KV.
 //
 // Grid:  (num_kv_heads, token_count)
 // Block: (head_dim)
-// ============================================================================
-
 __global__ void turboquant_dequantize_kernel(
     const uint8_t* __restrict__ packed_in,        // [tokens, num_kv_heads * packed_per_head]
     const __half* __restrict__ norms_in,           // [tokens, num_kv_heads]
@@ -407,7 +399,7 @@ __global__ void turboquant_dequantize_kernel(
 
     if (d >= head_dim) return;
 
-    // ─── Step 1: Unpack index for coordinate d ───
+    // Unpack index for coordinate d.
     int effective_bits = bits;
     if (bits == 3) effective_bits = 4;
 
@@ -420,28 +412,24 @@ __global__ void turboquant_dequantize_kernel(
     int idx = (packed_byte >> (sub_idx * effective_bits)) & ((1 << effective_bits) - 1);
     if (idx >= num_levels) idx = num_levels - 1;  // safety clamp
 
-    // ─── Step 2: Gather centroid value ───
     float y_hat = centroids[idx];
 
-    // ─── Step 3: Load y_hat into shared memory for rotation ───
+    // Load y_hat into shared memory for rotation.
     extern __shared__ float smem[];
     smem[d] = y_hat;
     __syncthreads();
 
-    // ─── Step 4: Inverse rotation: x_hat[d] = sum_j(Pi[j][d] * y_hat[j]) ───
-    // Pi^{-1} = Pi^T for orthogonal matrix.
-    // Pi^T[d][j] = Pi[j][d], so x_hat[d] = sum_j Pi[j * D + d] * y_hat[j]
+    // Inverse rotation: x_hat[d] = sum_j(Pi[j][d] * y_hat[j]). Pi^{-1} = Pi^T
+    // for orthogonal, so Pi^T[d][j] = Pi[j][d] and x_hat[d] = sum_j Pi[j*D+d] * y_hat[j].
     float x_hat = 0.0f;
     for (int j = 0; j < head_dim; j++) {
         x_hat += Pi[j * head_dim + d] * smem[j];
     }
 
-    // ─── Step 5: Scale by norm ───
     int norm_offset = token * gridDim.x + kv_head;
     float norm = __half2float(norms_in[norm_offset]);
     x_hat *= norm;
 
-    // ─── Step 6: Store bf16 ───
     int dst_offset = token * kv_dim + kv_head * head_dim + d;
     kv_bf16[dst_offset] = __float2bfloat16(x_hat);
 }

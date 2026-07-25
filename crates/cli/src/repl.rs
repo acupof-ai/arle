@@ -2078,7 +2078,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn export_markdown_empty_history() {
         // Empty = only the system prompt with no user/assistant turns.
@@ -2157,7 +2156,6 @@ mod tests {
         assert!(name.starts_with("arle-") && name.ends_with(".md"));
     }
 
-
     #[test]
     fn stats_accumulator_sums_across_turns() {
         let mut s = SessionStats::default();
@@ -2197,7 +2195,6 @@ mod tests {
         assert_eq!(s.avg_tps(), 0.0);
     }
 
-
     #[test]
     fn models_command_offline_message() {
         let _env = crate::test_env_lock();
@@ -2229,7 +2226,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-
     #[test]
     fn detect_family_matches_known_ids() {
         assert_eq!(detect_family("Qwen/Qwen3-4B"), "qwen3");
@@ -2247,7 +2243,6 @@ mod tests {
         // Pre-2000 sanity: 1999-12-31 23:59:59 UTC = 946_684_799.
         assert_eq!(format_iso8601_utc(946_684_799), "1999-12-31T23:59:59Z");
     }
-
 
     #[test]
     fn brief_tool_args_prefers_known_scalar_field() {

@@ -47,7 +47,7 @@ impl SafetensorsRegistry {
     /// Like [`load_into`], but fails if any tensor currently registered in
     /// `self` is missing from the file. Use on resume paths where a partial
     /// or mismatched checkpoint must not silently hybridize with base-model
-    /// weights (codex review 2026-04-20 on 49512b1, #1 High).
+    /// weights.
     pub fn load_into_strict(&mut self, store: &mut TensorStore, path: &Path) -> Result<()> {
         self.load_into_impl(store, path, true)
     }
