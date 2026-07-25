@@ -27,10 +27,12 @@ progress spine).
   (2026-07-25; docs/architecture-dsv4.md §7 corrected).
   `deepseek-ai/DeepSeek-V4-Flash-DSpark` (MIT) ships a 3-stage head whose 4705
   tensors match `Dsv4DsparkStage` field-for-field; DSpark on DSv4-Flash is
-  already served at TP=4. The wall is capacity (`draft reserve 19000MB,
-  pool_total 141MB, affordable 1` — #182 class) and trigger
-  (`--dspark-max-prompt-tokens 64` routes bench prompts to no-spec), plus the
-  throughput-aware verify scheduler (#124) — inference policy, not weights.
+  already served at TP=4. The wall is trigger
+  (`--dspark-max-prompt-tokens 64` routes bench prompts to no-spec — not
+  measured, not ineffective) plus the throughput-aware verify scheduler (#124),
+  which is inference policy, not weights. Capacity at HEAD is unmeasured: the
+  19 GB draft reserve seen on a 2026-07-14 binary no longer exists as a term, and
+  the draft now shards through the trunk's own `ExpertSplit`/`TpConfig`.
   Draft width is trunk width (V4 4096, Qwen3.6-DFlash 5120); the paper's
   "~1024" is not an artifact shape. A Rust/autograd draft trainer is killed:
   no FP8 GEMM, no expert parallelism, no MoE backward, and DeepSpec ships no V4

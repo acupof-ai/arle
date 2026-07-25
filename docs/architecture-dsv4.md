@@ -502,11 +502,16 @@ CUDA-only. Adaptive skip via `ARLE_DSV4_MTP_ADAPTIVE` (B=1 only).
 > is needed; requantize MXFP4→FP8 with `scripts/requant_dspark_mxfp4_to_fp8.py`.
 > DSpark on DSv4-Flash is **shipped and served** (TP=4, all ranks load it).
 >
-> **The wall is capacity and trigger, not the head.** `DSpark draft reserve
-> 19000MB, pool_total 141MB, affordable 1` — the draft reserve starves the KV
-> pool to one slot (#182 class). And [baselines](baselines.md)' DSv4 DSpark arm
-> reads ~no-op because `--dspark-max-prompt-tokens 64` routes multi-k-token
-> prompts to no-spec: not measured, not ineffective.
+> **The wall is trigger, and capacity is unmeasured.**
+> [baselines](baselines.md)' DSv4 DSpark arm reads ~no-op because
+> `--dspark-max-prompt-tokens 64` routes multi-k-token prompts to no-spec: not
+> measured, not ineffective. On capacity, a 2026-07-14 binary logged an explicit
+> `DSpark draft reserve 19000MB → pool_total 141MB, affordable 1`; **that reserve
+> term no longer exists.** At HEAD `load_dspark_draft` shards the draft's experts
+> and attention through the same `ExpertSplit`/`TpConfig` as the trunk (≈1/EP of
+> the ~20 GB fp8 draft per rank), and the only budget term is a small per-slot
+> `latent_kv + attn` over `sliding_window + block_size` (`executor/dsv4.rs:560`).
+> Read the budget line at HEAD before designing anything.
 >
 > Paper: *DSpark: Confidence-Scheduled Speculative Decoding with
 > Semi-Autoregressive Generation* (DeepSeek × PKU, 2026-06-27); code
