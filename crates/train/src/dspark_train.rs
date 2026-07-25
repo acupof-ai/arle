@@ -18,6 +18,7 @@
 //! tokens in the block: a mistake at position 0 voids positions 1..k.
 
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -74,6 +75,15 @@ pub struct DsparkTrainConfig {
     pub loss_decay_gamma: Option<f32>,
     /// Global L2 gradient norm cap. `None` disables clipping. Default 1.0.
     pub max_grad_norm: Option<f32>,
+    /// Where to write the trained Markov head (`markov_head.markov_w{1,2}.weight`,
+    /// bf16 safetensors — the draft loader's own frame, so the file can be
+    /// overlaid on the draft dir). `None` = train in-process only and lose the
+    /// head at shutdown.
+    pub save_path: Option<PathBuf>,
+    /// Steps between engine hot-swaps and checkpoint writes. Each swap is a
+    /// `vocab*rank*2` bf16 H2D plus a full serve-stream sync, so doing it every
+    /// step stalls decode for a gradient step's worth of drift.
+    pub swap_every: usize,
 }
 
 impl Default for DsparkTrainConfig {
@@ -87,6 +97,8 @@ impl Default for DsparkTrainConfig {
             prob_match_alpha: 0.5,
             loss_decay_gamma: Some(4.0),
             max_grad_norm: Some(1.0),
+            save_path: None,
+            swap_every: 8,
         }
     }
 }
@@ -456,31 +468,101 @@ impl DsparkTrainer {
         Ok((w1, w2))
     }
 
+    /// Write the current Markov head to `path` in the draft loader's own frame
+    /// (`markov_head.markov_w{1,2}.weight`, bf16 `[vocab, rank]`), so the file
+    /// can be overlaid on a draft checkpoint dir.
+    pub fn save_weights(&mut self, path: &Path) -> Result<()> {
+        let rank = self
+            .params
+            .as_ref()
+            .map(|p| p.rank)
+            .ok_or_else(|| anyhow::anyhow!("Markov params not yet initialized"))?;
+        let (w1, w2) = self.get_weights()?;
+        let rows = w1.len() / rank;
+        let to_bf16 = |v: &[f32]| -> Vec<u8> {
+            v.iter()
+                .flat_map(|&x| half::bf16::from_f32(x).to_le_bytes())
+                .collect()
+        };
+        let (w1_b, w2_b) = (to_bf16(&w1), to_bf16(&w2));
+        let tensors = [
+            ("markov_head.markov_w1.weight", &w1_b),
+            ("markov_head.markov_w2.weight", &w2_b),
+        ]
+        .map(|(name, bytes)| {
+            (
+                name.to_string(),
+                safetensors::tensor::TensorView::new(
+                    safetensors::Dtype::BF16,
+                    vec![rows, rank],
+                    bytes,
+                )
+                .expect("bf16 view over own buffer"),
+            )
+        });
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        safetensors::serialize_to_file(tensors, None, path)
+            .map_err(|e| anyhow::anyhow!("markov head save to {} failed: {e}", path.display()))
+    }
+
     /// Run the training loop. Blocks until `running` is set to false.
+    ///
+    /// Trains on full batches only — a 3-row step on an idle serve is gradient
+    /// noise — and swaps/checkpoints every `swap_every` steps rather than every
+    /// step (each swap costs the serve a full stream sync).
     pub fn run_loop(
         &mut self,
         source: &dyn ExperienceSource,
         on_weights: impl Fn(Vec<f32>, Vec<f32>) + Send,
     ) {
         self.running.store(true, Ordering::SeqCst);
+        let mut pending: Vec<DsparkExperience> = Vec::new();
+        let mut steps = 0usize;
         while self.running.load(Ordering::SeqCst) {
-            let experiences = source.drain(self.config.batch_size);
-            if experiences.is_empty() {
+            pending.extend(source.drain(self.config.batch_size - pending.len()));
+            if pending.len() < self.config.batch_size {
                 std::thread::sleep(Duration::from_millis(100));
                 continue;
             }
-            match self.train_step(&experiences) {
+            let batch = std::mem::take(&mut pending);
+            match self.train_step(&batch) {
                 Ok(loss) => {
+                    steps += 1;
                     eprintln!(
-                        "dspark_train: loss={loss:.4} baseline={:.4} n={}",
+                        "dspark_train: step={steps} loss={loss:.4} accept_ema={:.4} n={}",
                         self.baseline_ema,
-                        experiences.len()
+                        batch.len()
                     );
-                    if let Ok((w1, w2)) = self.get_weights() {
-                        on_weights(w1, w2);
+                    if steps.is_multiple_of(self.config.swap_every) {
+                        self.publish(&on_weights, steps);
                     }
                 }
                 Err(e) => eprintln!("dspark_train: train step failed: {e}"),
+            }
+        }
+        if steps > 0 && !steps.is_multiple_of(self.config.swap_every) {
+            self.publish(&on_weights, steps);
+        }
+    }
+
+    /// Hot-swap into the engine and checkpoint, if a save path is configured.
+    fn publish(&mut self, on_weights: &(impl Fn(Vec<f32>, Vec<f32>) + Send), steps: usize) {
+        match self.get_weights() {
+            Ok((w1, w2)) => on_weights(w1, w2),
+            Err(e) => {
+                eprintln!("dspark_train: weight read failed: {e}");
+                return;
+            }
+        }
+        if let Some(path) = self.config.save_path.clone() {
+            match self.save_weights(&path) {
+                Ok(()) => eprintln!(
+                    "dspark_train: saved markov head at step {steps} -> {}",
+                    path.display()
+                ),
+                Err(e) => eprintln!("dspark_train: save failed: {e}"),
             }
         }
     }
