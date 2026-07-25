@@ -61,7 +61,10 @@ above champion and outside the ±3% drift band. The recompute path itself was
 heavily exercised during the #160 pressure runs: 316 `KV-overflow preempt →
 requeued for recompute`, zero errored or incomplete requests.
 
-Raw: pod `/host/arle-build/bench-output/2026-07-24-b156-d0525cb0/`.
+Raw: pod `/host/arle-build/bench-output/2026-07-24-b156-d0525cb0/`. **These rows
+are now the anchored champion** (#180, `04e769cbf`): the substitute dataset
+regenerates byte-for-byte from the repo (sha256 `e095ddf1…`), the lost one never
+will, so Rule 3 re-anchored on the reproducible one.
 
 ## Rule
 
