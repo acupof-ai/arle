@@ -82,3 +82,10 @@ truth; the pod is a build copy. Be terse; report the measured result, not a play
 ## Reporting
 Relay the BUILD_EXIT/RUN_EXIT, the key log lines, and any measured number (GPU mem peak,
 loss, timing). If a build/run fails, paste the actual error — don't summarize it away.
+
+**Surface the log channel up-front.** The instant a detached build/run launches, report its
+label back — before you block on the wait — so the caller can `scripts/pod.sh log <label>`
+independently instead of waiting on your final message. For a multi-arm A/B or any job whose
+default log interleaves arms, also `tee` each arm's stdout+stderr to a fixed path
+(`~/arle-runs/<job>/<arm>.log`, `mkdir -p` first) and report those paths. A long job with no
+mid-flight channel is a silent black box — never leave the caller blind.
