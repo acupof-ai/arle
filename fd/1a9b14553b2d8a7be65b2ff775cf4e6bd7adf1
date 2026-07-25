@@ -1,0 +1,57 @@
+CHANGELOG.md
+  s_cb6ca280b792fe::t_8ffc8506f3ae16 26-57
+crates/infer-cuda/src/dsv4.rs
+  s_cb6ca280b792fe::t_1ef2461f27002d 298,383-385
+crates/infer-cuda/src/dsv4/load.rs
+  s_cb6ca280b792fe::t_67d271e72456b7 310-314,389
+crates/infer-cuda/src/executor.rs
+  s_cb6ca280b792fe::t_9188738c18fce1 258
+crates/infer-cuda/src/executor/dsv4.rs
+  s_9c91b86ec3fb55::t_d97a676706e34b 103
+crates/infer-cuda/src/executor/spec_decode.rs
+  s_cb6ca280b792fe::t_7dbf90e9b75ab1 619
+crates/infer-cuda/src/lib.rs
+  s_cb6ca280b792fe::t_f70f5cb3d3e94a 371-372
+docs/architecture-dsv4.md
+  s_cb6ca280b792fe::t_2bea4f3c63a895 486
+docs/environment.md
+  s_cb6ca280b792fe::t_b1bba06466b6ca 73
+docs/experience/wins/2026-07-26-spec-decode-concurrency-gate.md
+  s_cb6ca280b792fe::t_7333d9c85617f2 1-62
+docs/support-matrix.md
+  s_4008cd8aef74e8::t_8abff1a1836423 61
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "fd1a9b14553b2d8a7be65b2ff775cf4e6bd7adf1",
+  "prompts": {},
+  "sessions": {
+    "s_4008cd8aef74e8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-af95684996bd3bfc8",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_9c91b86ec3fb55": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4779911a-69b7-49db-bc83-daf5a48d6ca3",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_cb6ca280b792fe": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1a00414d-2267-47d4-813e-3c9e7cb88d53",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
