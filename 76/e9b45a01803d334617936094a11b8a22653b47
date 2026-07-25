@@ -1,0 +1,55 @@
+docs/experience/errors/2026-07-03-agent-opd-toy-corpus-saturation-kill.md
+  s_44e90edf230702::t_1d2ecad3bb137f 6
+docs/experience/errors/2026-07-05-multiproc-lockstep-ack-hang-no-timeout.md
+  s_44e90edf230702::t_fe613fb4aedc2b 6,191
+docs/experience/wins/2026-07-03-agent-opd-27b-loop-stability-12rounds.md
+  s_44e90edf230702::t_185d2634a5ad7d 6
+docs/experience/wins/2026-07-05-dsv4-p1-p2-p4-needle-gate.md
+  s_44e90edf230702::t_8960d7eac64406 19
+docs/experience/wins/2026-07-10-dspark-partial-ctx-drafting.md
+  s_44e90edf230702::t_63091c151ce612 5
+docs/experience/wins/2026-07-10-dsv4-finish-writethrough-decode-reuse.md
+  s_44e90edf230702::t_918fa76ba72252 10
+docs/experience/wins/2026-07-10-qwen-fp8-smallm-deepgemm-crossover.md
+  s_44e90edf230702::t_84bfb2620bf4b4 9
+docs/experience/wins/2026-07-10-qwen36-dspark-block-draft-licensed-2p4x.md
+  s_44e90edf230702::t_dd255ae1102c2b 9
+docs/experience/wins/2026-07-11-dspark-p1-license-qwen36-27b.md
+  s_44e90edf230702::t_13c7ae0d7438d1 7
+docs/experience/wins/2026-07-11-dsv4-decode-reuse-delta-and-concurrency-ab.md
+  s_44e90edf230702::t_ee470c235ea464 6
+docs/experience/wins/2026-07-11-metal-kv-tier-convergence-smoke.md
+  s_44e90edf230702::t_957f01144a3efa 8
+docs/experience/wins/2026-07-13-cc-harness-loop-and-prefix-reuse-validated.md
+  s_44e90edf230702::t_a89ef687e53180 10
+docs/experience/wins/2026-07-16-bench-update-preset-seam.md
+  s_44e90edf230702::t_b53ecc41f6b2eb 5
+docs/experience/wins/2026-07-17-dsv4-prefill-chunk-2048-default.md
+  s_44e90edf230702::t_1469506575eed9 8
+docs/experience/wins/2026-07-17-qwen35-gen-logprob-capture.md
+  s_44e90edf230702::t_dd8d0079d74284 5
+docs/experience/wins/2026-07-17-qwen35-mtp-rejection-sampling.md
+  s_44e90edf230702::t_f47551c64e4c8e 6
+docs/experience/wins/2026-07-24-agent-opd-gpu-busy-frac-measured-go.md
+  s_44e90edf230702::t_03623d8192b76f 6
+docs/experience/wins/README.md
+  s_44e90edf230702::t_e48762d6de83be 44
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "76e9b45a01803d334617936094a11b8a22653b47",
+  "prompts": {},
+  "sessions": {
+    "s_44e90edf230702": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "585a4f62-ee7f-45e9-8947-d992463c772d",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
