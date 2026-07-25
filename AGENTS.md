@@ -95,6 +95,8 @@ wall-clock perf license.
 old+new paths in the tree.
 
 **Approach-first for >3 files or architectural decisions** — outline and wait.
+Never delete content outside the stated scope; inside it, prefer deletion-style
+refactors (collapse duplicates, converge on one flow) over layering adapters.
 
 ---
 
@@ -129,7 +131,11 @@ re-check `git status` — the fmt hook de-stages renames.
 
 **CHANGELOG is the progress spine.** Three event classes land a line the same
 day, linking the wins/errors entry: **phase exit · default flip ·
-accept-or-reject verdict**. Phase exits also cut a release tag.
+accept-or-reject verdict**. Phase exits also cut a release tag. Weekly (~30 min):
+CHANGELOG catch-up; promote patterns recurring ≥3× into `docs/agent-method.md`;
+archive the oldest zero-inbound-reference wins entries before the
+`check_repo_hygiene` cap blocks a push; drift-probe
+`git log --since='7 days ago' -- 'crates/infer-*/src'` against `docs/experience/`.
 
 **Code layout gotchas.** Flat modules, no `mod.rs` — `src/ops.rs` declares a
 sibling `#[path = "ops/attention.rs"] mod attention;`. Weights are `&self`
