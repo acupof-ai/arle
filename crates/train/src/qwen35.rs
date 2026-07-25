@@ -1661,6 +1661,9 @@ impl Qwen35Layer {
         // Pin as constants so the gen-segment concat treats them as frozen.
         store.set_requires_grad(k, false)?;
         store.set_requires_grad(v, false)?;
+        // Largest retained buffer, no grad chain — the bf16 tape's first target.
+        store.quantize_frozen_bf16(k)?;
+        store.quantize_frozen_bf16(v)?;
         Ok(PrefixKv { k, v })
     }
 
