@@ -1,0 +1,35 @@
+crates/cli/src/args.rs
+  s_9c91b86ec3fb55::t_08d428a4e56d3f 750-758
+crates/cli/src/serve.rs
+  s_9c91b86ec3fb55::t_39298bb82695af 429
+crates/infer-api/src/loaded.rs
+  s_9c91b86ec3fb55::t_35142d130efb0f 136-139,214,2179
+crates/infer-api/src/serve.rs
+  s_9c91b86ec3fb55::t_0c95a90709d540 203-204,285
+crates/infer-cuda/src/executor.rs
+  s_9c91b86ec3fb55::t_929428940e0bcf 234,248
+crates/infer-cuda/src/executor/qwen35.rs
+  s_9c91b86ec3fb55::t_07f00f9ee6ef2c 816,871
+crates/infer-cuda/src/lib.rs
+  s_9c91b86ec3fb55::t_a077b511492631 333,348
+crates/infer-cuda/src/qwen35/dspark.rs
+  s_9c91b86ec3fb55::t_f6b3bd8f7110e6 493,495,497-512
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "49b02be24f2daaf1216f17f99523fc58b64df89f",
+  "prompts": {},
+  "sessions": {
+    "s_9c91b86ec3fb55": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4779911a-69b7-49db-bc83-daf5a48d6ca3",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
