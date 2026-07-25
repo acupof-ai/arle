@@ -516,7 +516,6 @@ v0.2.1.
   copy-restore path) and broke V32/GLM band contiguity. Kept for the record:
   ~~`prepare_kv_batch` and `mirror_full_band` hardcoded `slot*lsp + i` instead of
   using engine-provided `slot_pages[i]`; 89.7% hit rate, 3.3× cold→hot~~.
-  [errors](docs/experience/errors/2026-07-10-dsv4-prefix-reuse-identity-fix-was-noop-and-v32-hazard.md)
 - **2026-07-10 — Qwen FP8 small-M dense GEMM: DeepGEMM from M=2 LICENSED;
   M=1 GEMV variants KILLED**: measured crossover (DeepGEMM flat 47.5–57.8 µs
   in M vs ~linear GEMV) moves `QWEN_FP8_DEEPGEMM_DENSE_MIN_M` 16→2 — matched
@@ -590,8 +589,7 @@ v0.2.1.
   dirty-bit contract on every host-band change. Pod acceptance 6/6 (solo
   15/15 both cache states, concurrent 120/120, +193 MB pool budget
   reclaimed, park intact):
-  [wins](docs/experience/wins/2026-07-10-dsv4-route-a-deletion-regression-fix-acceptance.md) ·
-  [errors](docs/experience/errors/2026-07-09-dsv4-route-a-flashmla-needle-regression-bisected.md).
+  [wins](docs/experience/wins/2026-07-10-dsv4-route-a-deletion-regression-fix-acceptance.md).
 
 - **2026-07-10 — Qwen3.6 DSpark block draft LICENSED (short-ctx greedy)**:
   36.2 ms/step, 104–108 tok/s = 2.4× plain decode on H20 after quant-lane
