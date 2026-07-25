@@ -514,8 +514,8 @@ impl AgentSession {
             // iteration (always advances, including on the recovered
             // branch) so synthesized tool_use IDs `tu_{base}_{n}` stay
             // unique even when iteration 0 emits a recovered tool call
-            // and iteration 1 produces an engine-driven one. (codex
-            // Phase-1 P2). `sub_turn_record_index` is the position the
+            // and iteration 1 produces an engine-driven one.
+            // `sub_turn_record_index` is the position the
             // next SubTurnRecord will land in the `sub_turns` Vec; it
             // only advances when we actually invoke the engine.
             let tool_use_id_base = turn;
@@ -716,7 +716,6 @@ impl AgentSession {
                         // don't append its record here, the trajectory shows
                         // a `tool_use` with no matching engine call in any
                         // `completion_text` and under-reports engine work.
-                        // (codex Phase-1 P2)
                         sub_turns.push(repair_outcome.record);
 
                         // Phase 2 token layer: repair was a real engine
@@ -785,7 +784,7 @@ impl AgentSession {
             // IDs off `tool_use_id_base` (= the loop turn), which is
             // monotone across both engine and recovered branches; the
             // earlier `sub_turn_index` was tied to `sub_turns.len()`
-            // and collided across recovered + engine pairs (codex P2).
+            // and collided across recovered + engine pairs.
             let _ = emitted_engine_call;
             let assistant_blocks = build_assistant_blocks(&content, &tool_calls, tool_use_id_base);
             trajectory_messages.push(TrajectoryMessage {
@@ -855,7 +854,7 @@ impl AgentSession {
             // user + assistant tool_call + ChatML tool wrappers + tool
             // result + next assistant prompt prefix). The prompt-delta
             // logic at the top of each engine sub-turn captures those
-            // tokens with mask=0 — see codex Phase-2 P1. Tokenizing
+            // tokens with mask=0. Tokenizing
             // bare tool result strings missed the wrappers and yielded
             // a reconstruction the model never actually saw.
 
@@ -1164,7 +1163,7 @@ fn scalar_tool_result(result: &str) -> Option<String> {
 /// Result of a successful repair turn. The caller appends `record` to its
 /// `sub_turns` so the repair generation is visible in the trajectory; the
 /// `parsed` half replaces the main generation's malformed parse output.
-/// (codex Phase-1 P2: repair was an unrecorded engine call.)
+/// (Repair was previously an unrecorded engine call.)
 struct RepairOutcome {
     parsed: ParsedAssistantResponse,
     record: SubTurnRecord,

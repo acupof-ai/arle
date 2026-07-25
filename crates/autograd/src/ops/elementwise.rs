@@ -49,7 +49,7 @@ pub fn add(a: TensorId, b: TensorId, store: &mut TensorStore, tape: &mut Tape) -
 }
 
 pub fn mul(a: TensorId, b: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
-    // M5.3b.17: dispatch is OR-lazy — if EITHER operand is device-resident,
+    // Dispatch is OR-lazy — if EITHER operand is device-resident,
     // upload the other and stay on the MLX graph. Same rationale as
     // `add_broadcast`: the hot path is `attn * gate` and `silu(gate) * up`
     // in Qwen3.5, where both operands are Dirty::Device chained from prior
@@ -308,9 +308,9 @@ pub(crate) fn mul_backward(
         return Ok(GradPairs::new());
     }
 
-    // Wave 2.1: route through `mul_backward_device` whenever upstream and
-    // both saved operands are device-resident. Pre-2.1 this op did
-    // `to_host(upstream) + tensor_host(a) + tensor_host(b)`, which forced
+    // Route through `mul_backward_device` whenever upstream and
+    // both saved operands are device-resident. The host path does
+    // `to_host(upstream) + tensor_host(a) + tensor_host(b)`, forcing
     // three readbacks per layer (Qwen3.5 hot paths `attn * gate` and
     // `silu(gate) * up` × 28 layers).
     let upstream_shape = store.tensor(output_grad_id)?.shape.clone();
@@ -404,13 +404,13 @@ pub(crate) fn mul_scalar_backward(
         return Ok(GradPairs::new());
     }
 
-    // P3: route Dirty::Device upstream through `mul_scalar_backward_device`
-    // so the gradient stays on-device. Pre-P3 this op did
+    // Route Dirty::Device upstream through `mul_scalar_backward_device`
+    // so the gradient stays on-device. The host path does
     // `to_host(upstream) → mul_scalar_forward → alloc Tensor::new`, which
-    // (combined with `mean_backward`'s host fallback) was the *first*
-    // host op in the CE-loss backward chain — see the M5.3b architectural-
-    // correction doc. Keeping this on-device unblocks every downstream
-    // `device_path_ok` gate (matmul / softmax / gather / accumulate_grad).
+    // (combined with `mean_backward`'s host fallback) is the *first*
+    // host op in the CE-loss backward chain. Keeping this on-device unblocks
+    // every downstream `device_path_ok` gate (matmul / softmax / gather /
+    // accumulate_grad).
     let upstream_shape = store.tensor(output_grad_id)?.shape.clone();
     let input_shape = store.tensor(a)?.shape.clone();
     let device_path_ok = {

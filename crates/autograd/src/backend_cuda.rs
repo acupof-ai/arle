@@ -1625,9 +1625,9 @@ impl Backend for CudaBackend {
             todo!("GPU required: cuda sum_all is unavailable under feature no-cuda")
         }
 
-        // Device-resident reduction. Previously this downloaded the whole
+        // Device-resident reduction. The host-reduce alternative downloads the whole
         // `x` (e.g. the `[seq, vocab]` KL-loss intermediate, ~32 MB/chunk at
-        // vocab=248320) to host, summed single-threaded, and re-uploaded the
+        // vocab=248320) to host, sums single-threaded, and re-uploads the
         // scalar — a full-tensor DtoH + blocking `synchronize()` per `mean`
         // in the OPD CE/KL head (`log_softmax → mul → mean`, see
         // `ops::reduce::mean_device_lazy`). That serialized the GPU behind a
@@ -6783,7 +6783,7 @@ fn cuda_write_scalar_at(
 // same way until one element remains. Returns a 1-element device handle with
 // NO host transfer and NO `synchronize()` — the launches are enqueued on the
 // backend stream and the caller's terminal eval forces them. This is the
-// device-resident sibling of the host-reduce path `sum_all` used to take.
+// device-resident sibling of the host-reduce path `sum_all` takes.
 #[cfg(not(feature = "no-cuda"))]
 fn cuda_sum_all_device(
     backend: &CudaBackend,

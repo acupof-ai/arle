@@ -145,14 +145,12 @@ pub(crate) fn matmul_backward(
         }
     }
 
-    // P2 (device-resident gradient tape): when all three operands are still
-    // device-resident, dispatch through `matmul_backward_device` so the
-    // saved hidden / weight buffers and the upstream gradient never round-
-    // trip through host. This is the contract change that retires the
-    // 1 GB DtoH that Wave 1 surfaced — the LM-head GEMM's
-    // `grad_out: &[f32]` was the single largest readback per step.
-    // Heal host-resident operands first (mirrors matmul_bt_backward) so one
-    // upstream host grad (e.g. from a host concat backward) doesn't demote
+    // When all three operands are still device-resident, dispatch through
+    // `matmul_backward_device` so the saved hidden / weight buffers and the
+    // upstream gradient never round-trip through host — the LM-head GEMM's
+    // `grad_out: &[f32]` is otherwise the single largest (1 GB) readback per
+    // step. Heal host-resident operands first (mirrors matmul_bt_backward) so
+    // one upstream host grad (e.g. from a host concat backward) doesn't demote
     // this GEMM — and everything downstream — to the host contract.
     if store.backend().device() != Device::Cpu {
         store.ensure_device(a)?;
