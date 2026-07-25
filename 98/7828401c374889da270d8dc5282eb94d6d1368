@@ -1,0 +1,23 @@
+crates/infer-cuda/src/executor/dspark_train.rs
+  s_9c91b86ec3fb55::t_faf35386189d08 96-97,102-110,147,199
+docs/experience/errors/2026-07-25-dspark-verdict-contaminated-by-train-sync.md
+  s_9c91b86ec3fb55::t_3c5cf5da83d56e 1-63
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "987828401c374889da270d8dc5282eb94d6d1368",
+  "prompts": {},
+  "sessions": {
+    "s_9c91b86ec3fb55": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4779911a-69b7-49db-bc83-daf5a48d6ca3",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
