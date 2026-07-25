@@ -7,11 +7,18 @@ MEMORY_LIMIT_MIB="${ARLE_GPU_MEMORY_LIMIT_MIB:-2000}"
 mkdir -p "$CLAIMS"
 
 field() { awk -F= -v key="$2" '$1==key {sub(/^[^=]*=/, ""); print; exit}' "$1" 2>/dev/null; }
+# A claim is live only if its pid still exists, matches the recorded start time,
+# AND is not a zombie. Killed runs reparent to pid 1, which in this container is
+# not an init that reaps, so a defunct holder keeps a /proc entry forever and
+# would pin its GPU for good.
 stale() {
-  local c="$1" pid start
+  local c="$1" pid start stat
   pid="$(field "$c" pid)"; start="$(field "$c" start)"
-  [ -n "$pid" ] && [ -r "$PROC_ROOT/$pid/stat" ] && [ "$(awk '{print $22}' "$PROC_ROOT/$pid/stat")" = "$start" ] && return 1
-  return 0
+  [ -n "$pid" ] && [ -r "$PROC_ROOT/$pid/stat" ] || return 0
+  stat="$(cat "$PROC_ROOT/$pid/stat" 2>/dev/null)" || return 0
+  [ "$(awk '{print $22}' <<< "$stat")" = "$start" ] || return 0
+  [ "$(awk '{print $3}' <<< "$stat")" = "Z" ] && return 0
+  return 1
 }
 load_gpus() {
   nvidia-smi --query-gpu=index,uuid,memory.used,compute_cap --format=csv,noheader,nounits
@@ -58,9 +65,13 @@ for idx in indices:
     if os.path.isfile(claim):
         values = dict(line.rstrip("\n").split("=", 1) for line in open(claim) if "=" in line)
         pid, start = values.get("pid", ""), values.get("start", "")
-        try: actual = open(os.path.join(proc, pid, "stat")).read().split()[21]
-        except OSError: actual = ""
-        if pid and actual == start: raise SystemExit(f"GPU {idx} is claimed")
+        try:
+            fields = open(os.path.join(proc, pid, "stat")).read().split()
+            actual, state = fields[21], fields[2]
+        except OSError: actual, state = "", ""
+        # state "Z": the holder was killed and never reaped (pid 1 here is not an
+        # init), so its /proc entry outlives it — that is a dead claim, not a live one.
+        if pid and actual == start and state != "Z": raise SystemExit(f"GPU {idx} is claimed")
         os.unlink(claim)
     if used > int(limit): raise SystemExit(f"GPU {idx} memory is occupied")
     if uuid in busy: raise SystemExit(f"GPU {idx} has a compute application")
