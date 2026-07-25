@@ -1,0 +1,31 @@
+crates/autograd/src/tape.rs
+  s_ff2cc9a6ba32bd::t_0a26cdef31ebf8 824-832
+docs/experience/wins/2026-07-25-checkpoint-fetch-per-layer.md
+  s_089e26e9e41120::t_d47e8e13543a7c 1-55
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "e4be96108124782e1c08412e6ff6d8534ac002bf",
+  "prompts": {},
+  "sessions": {
+    "s_089e26e9e41120": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "93e66a8f-c20a-4ba9-96f2-283f6d98cbb1",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_ff2cc9a6ba32bd": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a6e607bc3b0bd8568",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
