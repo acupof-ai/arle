@@ -32,6 +32,13 @@ progress spine).
   fatal `band_extend` path never executed — 316 KV-overflow preempts, zero
   errors, serve survived. #156's bench debt cleared in the same session (c4/c8/c16
   +1.9/+11.3/+16.5% vs champion; c1 −8.6% is dataset-attributable, #180).
+- **REJECT — "DSv4 cold boot is serialized on rank 0"** (2026-07-25, #181 closed
+  not-planned). The 25-min cold boot is a storage ceiling, not a code defect:
+  `/host` (ext4 on virtio `/dev/vda2`) reads at 0.19-0.23 GB/s and does **not**
+  scale with concurrency (`dd iflag=direct`: 1 stream 0.229, 4 streams 0.20, 16
+  streams 0.19 GB/s). `loader.rs`'s single-rank 16-thread prefetch already
+  saturates it, and warming the page cache once from rank 0 is what keeps a
+  4× read amplification (~100 min) from happening. Warm re-boot: 90 s.
 - **DEFAULT FLIP — Qwen KV pool sizing: measured VRAM outranks the page floor**
   (2026-07-25, #178, `5c2931cd3`; wins:
   [2026-07-25-kv-pool-floor-yields-to-measured-vram](docs/experience/wins/2026-07-25-kv-pool-floor-yields-to-measured-vram.md)).
