@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use autograd::ops;
 use autograd::{AdamW, CpuBackend, Tape, Tensor, TensorId, TensorStore};
 
@@ -43,6 +43,36 @@ pub struct DsparkExperience {
     /// row j drafted chain[j+1] conditioned on chain[j]; false = same-position,
     /// row j drafted chain[j] conditioned on chain[j-1] and row 0 never drafts.
     pub next_token_heads: bool,
+}
+
+/// Saved-head tensor names — the draft loader's own, so a head trained here and
+/// one read off a checkpoint are the same artifact.
+const MARKOV_W1: &str = "markov_head.markov_w1.weight";
+const MARKOV_W2: &str = "markov_head.markov_w2.weight";
+
+/// Read a head written by [`DsparkTrainer::save_weights`] back as host f32
+/// `(w1, w2)`, ready for `LoadedInferenceEngine::update_dspark_markov_weights`.
+pub fn load_markov_head(path: &Path) -> Result<(Vec<f32>, Vec<f32>)> {
+    let bytes =
+        std::fs::read(path).with_context(|| format!("read markov head {}", path.display()))?;
+    let st = safetensors::SafeTensors::deserialize(&bytes)
+        .map_err(|e| anyhow::anyhow!("parse markov head {}: {e}", path.display()))?;
+    let read = |name: &str| -> Result<Vec<f32>> {
+        let t = st
+            .tensor(name)
+            .map_err(|e| anyhow::anyhow!("{} missing {name}: {e}", path.display()))?;
+        ensure!(
+            t.dtype() == safetensors::Dtype::BF16,
+            "{} {name}: expected BF16, got {:?}",
+            path.display(),
+            t.dtype()
+        );
+        Ok(t.data()
+            .chunks_exact(2)
+            .map(|b| half::bf16::from_le_bytes([b[0], b[1]]).to_f32())
+            .collect())
+    };
+    Ok((read(MARKOV_W1)?, read(MARKOV_W2)?))
 }
 
 /// Trait abstracting the experience buffer so the trainer does not depend on
@@ -468,9 +498,11 @@ impl DsparkTrainer {
         Ok((w1, w2))
     }
 
-    /// Write the current Markov head to `path` in the draft loader's own frame
-    /// (`markov_head.markov_w{1,2}.weight`, bf16 `[vocab, rank]`), so the file
-    /// can be overlaid on a draft checkpoint dir.
+    /// Write the current Markov head to `path` as a standalone bf16 safetensors
+    /// file. Load it back with [`load_markov_head`] + `--dspark-markov-init` —
+    /// **not** by copying into the draft dir: `SafetensorLoader` reads only the
+    /// shards `model.safetensors.index.json` lists, so a loose file there is
+    /// silently ignored.
     pub fn save_weights(&mut self, path: &Path) -> Result<()> {
         let rank = self
             .params
@@ -485,11 +517,7 @@ impl DsparkTrainer {
                 .collect()
         };
         let (w1_b, w2_b) = (to_bf16(&w1), to_bf16(&w2));
-        let tensors = [
-            ("markov_head.markov_w1.weight", &w1_b),
-            ("markov_head.markov_w2.weight", &w2_b),
-        ]
-        .map(|(name, bytes)| {
+        let tensors = [(MARKOV_W1, &w1_b), (MARKOV_W2, &w2_b)].map(|(name, bytes)| {
             (
                 name.to_string(),
                 safetensors::tensor::TensorView::new(
@@ -503,8 +531,13 @@ impl DsparkTrainer {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        safetensors::serialize_to_file(tensors, None, path)
-            .map_err(|e| anyhow::anyhow!("markov head save to {} failed: {e}", path.display()))
+        // Write-then-rename: `serialize_to_file` truncates first, so a failed
+        // periodic save would otherwise destroy the last good checkpoint.
+        let tmp = path.with_extension("safetensors.tmp");
+        safetensors::serialize_to_file(tensors, None, &tmp)
+            .map_err(|e| anyhow::anyhow!("markov head save to {} failed: {e}", tmp.display()))?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
     }
 
     /// Run the training loop. Blocks until `running` is set to false.

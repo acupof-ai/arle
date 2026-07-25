@@ -739,6 +739,13 @@ pub(crate) struct ServeArgs {
     #[arg(long, value_name = "FILE")]
     pub(crate) dspark_train_out: Option<PathBuf>,
 
+    /// Replace the draft checkpoint's Markov head with one saved by
+    /// `--dspark-train-out`. This is how a trained head is put back into a
+    /// serve — copying the file into the draft dir does nothing, since the
+    /// loader reads only the shards `model.safetensors.index.json` lists.
+    #[arg(long, value_name = "FILE")]
+    pub(crate) dspark_markov_init: Option<PathBuf>,
+
     /// Number of MTP draft tokens to propose per verify block on CUDA.
     #[arg(long, value_name = "N")]
     pub(crate) mtp_draft_tokens: Option<usize>,

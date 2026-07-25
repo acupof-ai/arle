@@ -22,10 +22,14 @@ real training run worthless:
 
 ## What Worked
 
-- `DsparkTrainer::save_weights` writes bf16 safetensors under the **draft
-  loader's own names** (`markov_head.markov_w{1,2}.weight`, `[vocab, rank]`), so
-  the file overlays a draft checkpoint dir with no conversion step. Path comes
-  from `--dspark-train-out`.
+- `DsparkTrainer::save_weights` (`--dspark-train-out`) writes bf16 safetensors
+  under the **draft loader's own names** (`markov_head.markov_w{1,2}.weight`,
+  `[vocab, rank]`), write-then-rename so a failed periodic save cannot eat the
+  last good checkpoint.
+- `load_markov_head` + `--dspark-markov-init` puts a trained head back into a
+  serve, reusing `update_dspark_markov_weights` — the same call the sidecar
+  hot-swaps through. Reader and writer live next to each other so the frame
+  contract is one file.
 - `run_loop` accumulates into a full `batch_size` before stepping, and
   publishes (swap + checkpoint) every `swap_every` = 8 steps, plus once on exit.
   Default-off path is untouched; the train path trades 8× less serve stall for
@@ -39,9 +43,15 @@ real training run worthless:
 
 - **A training loop without persistence is a profiler, not a trainer.** Check
   for the write path before scheduling GPU hours.
-- **Save in the consumer's frame.** The loader's tensor names and layout are the
-  contract; a conversion script between trainer and loader is a second thing to
-  keep in sync.
+- **"Just drop the file in the model dir" is not a load path.** The first cut
+  saved in the loader's tensor frame and called it an overlay. It isn't:
+  `loader.rs:864` reads only the shards `model.safetensors.index.json` lists and
+  `has_tensor` (`:2055`) only consults the weight map, so a loose file there is
+  silently ignored — a whole run's output, invisible. Matching the *names* is
+  half the contract; the discovery mechanism is the other half. An explicit
+  install flag beats mutating someone else's checkpoint dir either way.
+- **A periodic save must be write-then-rename.** `serialize_to_file` truncates
+  first; a kill or a full disk mid-write destroys the previous checkpoint too.
 - **A background thread that syncs the serve stream is a hot-path cost.** Same
   class as [#183](../errors/2026-07-25-dspark-verdict-contaminated-by-train-sync.md):
   cadence it, don't do it per step.
