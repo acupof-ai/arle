@@ -1,0 +1,41 @@
+crates/cli/src/args.rs
+  s_cb6ca280b792fe::t_56e21cc3fd156f 922-927,1009
+crates/infer-cuda/src/executor/dsv4.rs
+  s_cb6ca280b792fe::t_ac527cb6712cdf 2291-2312,2314,2337,2402-2405
+crates/infer-cuda/src/executor/qwen35.rs
+  s_4008cd8aef74e8::t_9e3450bcd6e96a 2483-2490,2514-2519,2521-2525,2527-2551,2553-2558,2560-2572,3432-3433,3685-3686,3871-3872,4110-4111
+crates/infer-cuda/src/executor/spec_decode.rs
+  s_cb6ca280b792fe::t_702cf4ec874e8e 17-53,708-723
+crates/infer-cuda/src/runtime_flags.rs
+  s_cb6ca280b792fe::t_cfeb90530340f5 66,91,186-190
+crates/infer-seam/src/runtime_flags.rs
+  s_cb6ca280b792fe::t_8f0c7a8bd7ce36 31-33,109-113,147
+docs/plans/2026-07-25-spec-decode-concurrency-gate.md
+  s_cb6ca280b792fe::t_95290e0f7aeb34 1-171
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "69560ae55d2b10f177fc4d65da34611cdef94bca",
+  "prompts": {},
+  "sessions": {
+    "s_4008cd8aef74e8": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-af95684996bd3bfc8",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_cb6ca280b792fe": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1a00414d-2267-47d4-813e-3c9e7cb88d53",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
