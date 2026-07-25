@@ -187,7 +187,6 @@ pub struct TokensRecord {
 /// still carry `tokens: null` on backends that haven't wired
 /// `tokenize()`, but the format-version contract is v2 either way so
 /// v1-only readers refuse early instead of silently misreading.
-/// (codex Phase-2 P2)
 pub const TRAJECTORY_SCHEMA_VERSION: i32 = 2;
 
 /// Anthropic-shaped trajectory message. User and tool messages carry a
