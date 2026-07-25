@@ -1,0 +1,21 @@
+docs/experience/wins/2026-07-25-dspark-self-rl-first-closed-loop.md
+  s_089e26e9e41120::t_b6dca537924500 80-88
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "55790bbb595f69ae6f4ab7bac4ff0e4188c5be99",
+  "prompts": {},
+  "sessions": {
+    "s_089e26e9e41120": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "93e66a8f-c20a-4ba9-96f2-283f6d98cbb1",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
