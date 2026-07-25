@@ -753,6 +753,9 @@ pub(crate) struct Dsv4DsparkPromptTaps {
 }
 
 struct Dsv4SpecVerifyScratch {
+    /// Allocated row capacity ([`Dsv4Model::spec_verify_rows`]) — the ceiling
+    /// `set_rows` validates against.
+    rows: usize,
     embeddings: HiddenStates,
     initial_stream: HiddenStates,
     layers: Vec<Dsv4SpecVerifyLayerScratch>,
@@ -772,26 +775,25 @@ impl Dsv4SpecVerifyScratch {
     fn new(model: &Dsv4Model) -> Result<Self> {
         let hidden_size = model.config.hidden_size;
         let stream_dim = hidden_size * model.config.hc_mult;
+        let rows = model.spec_verify_rows();
         let layers: Vec<_> = (0..model.layers.len())
-            .map(|_| Dsv4SpecVerifyLayerScratch::new(&model.ctx, hidden_size, stream_dim))
+            .map(|_| Dsv4SpecVerifyLayerScratch::new(&model.ctx, hidden_size, stream_dim, rows))
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
+            rows,
             // SAFETY: uninit device scratch; fully written before first read.
-            embeddings: unsafe {
-                HiddenStates::uninit(&model.ctx, hidden_size, MAX_SPEC_VERIFY_ROWS)?
-            },
+            embeddings: unsafe { HiddenStates::uninit(&model.ctx, hidden_size, rows)? },
             // SAFETY: uninit device scratch; fully written before first read.
-            initial_stream: unsafe {
-                HiddenStates::uninit(&model.ctx, stream_dim, MAX_SPEC_VERIFY_ROWS)?
-            },
+            initial_stream: unsafe { HiddenStates::uninit(&model.ctx, stream_dim, rows)? },
             layers,
         })
     }
 
     fn set_rows(&mut self, rows: usize) -> Result<()> {
         ensure!(
-            rows > 0 && rows <= MAX_SPEC_VERIFY_ROWS,
-            "DSv4 spec-verify scratch rows {rows} exceed capacity {MAX_SPEC_VERIFY_ROWS}"
+            rows > 0 && rows <= self.rows,
+            "DSv4 spec-verify scratch rows {rows} exceed allocated {}",
+            self.rows
         );
         self.embeddings.seq_len = rows;
         self.initial_stream.seq_len = rows;
@@ -814,24 +816,27 @@ impl Dsv4SpecVerifyScratch {
 }
 
 impl Dsv4SpecVerifyLayerScratch {
-    fn new(ctx: &DeviceContext, hidden_size: usize, stream_dim: usize) -> Result<Self> {
+    fn new(
+        ctx: &DeviceContext,
+        hidden_size: usize,
+        stream_dim: usize,
+        rows: usize,
+    ) -> Result<Self> {
         Ok(Self {
             // SAFETY: uninit device scratch; fully written before first read.
-            attn_normed: unsafe { HiddenStates::uninit(ctx, hidden_size, MAX_SPEC_VERIFY_ROWS)? },
+            attn_normed: unsafe { HiddenStates::uninit(ctx, hidden_size, rows)? },
             // SAFETY: uninit device scratch; fully written before first read.
-            attn_out: unsafe { HiddenStates::uninit(ctx, hidden_size, MAX_SPEC_VERIFY_ROWS)? },
+            attn_out: unsafe { HiddenStates::uninit(ctx, hidden_size, rows)? },
             // SAFETY: uninit device scratch; fully written before first read.
-            attn_stream: unsafe { HiddenStates::uninit(ctx, stream_dim, MAX_SPEC_VERIFY_ROWS)? },
+            attn_stream: unsafe { HiddenStates::uninit(ctx, stream_dim, rows)? },
             // SAFETY: uninit device scratch; fully written before first read.
-            ffn_normed: unsafe { HiddenStates::uninit(ctx, hidden_size, MAX_SPEC_VERIFY_ROWS)? },
+            ffn_normed: unsafe { HiddenStates::uninit(ctx, hidden_size, rows)? },
             // SAFETY: uninit device scratch; fully written before first read.
-            moe_out: unsafe { HiddenStates::uninit(ctx, hidden_size, MAX_SPEC_VERIFY_ROWS)? },
+            moe_out: unsafe { HiddenStates::uninit(ctx, hidden_size, rows)? },
             // SAFETY: uninit device scratch; fully written before first read.
-            moe_with_shared: unsafe {
-                HiddenStates::uninit(ctx, hidden_size, MAX_SPEC_VERIFY_ROWS)?
-            },
+            moe_with_shared: unsafe { HiddenStates::uninit(ctx, hidden_size, rows)? },
             // SAFETY: uninit device scratch; fully written before first read.
-            ffn_stream: unsafe { HiddenStates::uninit(ctx, stream_dim, MAX_SPEC_VERIFY_ROWS)? },
+            ffn_stream: unsafe { HiddenStates::uninit(ctx, stream_dim, rows)? },
         })
     }
 
@@ -1191,7 +1196,7 @@ impl Dsv4SlotState {
                             HiddenStates::uninit(
                                 &model.ctx,
                                 model.config.hidden_size,
-                                MAX_SPEC_VERIFY_ROWS,
+                                model.spec_verify_rows(),
                             )
                         }
                     })
@@ -2338,9 +2343,24 @@ impl Dsv4Model {
     /// adds them): the shared-scratch N-row batched-decode buffers and the
     /// per-(slot,CSA-layer) DSA key-cache band. The FP8 MLA KV arena is drawn from
     /// the shared pool, never the per-slot divisor.
+    /// Verify rows a slot can ever be asked for: DSpark verifies its block plus
+    /// the anchor, MTP a depth-clamped chain plus the anchor
+    /// ([`crate::executor::spec_decode`] clamps to `MAX_SPEC_DRAFT_DEPTH`).
+    /// `MAX_SPEC_VERIFY_ROWS` is the validation ceiling, not the allocation width
+    /// — sizing the per-slot scratch at it booked ~300MB/slot nothing touches, and
+    /// capped DSpark at 22 slots (#184).
+    pub(crate) fn spec_verify_rows(&self) -> usize {
+        let rows = if self.config.is_dspark() {
+            self.config.dspark_block_size + 1
+        } else {
+            MAX_SPEC_DRAFT_DEPTH + 1
+        };
+        rows.min(MAX_SPEC_VERIFY_ROWS)
+    }
+
     pub(crate) fn per_slot_device_bytes(&self, max_seq_len: usize) -> Result<usize> {
         let bf16 = std::mem::size_of::<half::bf16>();
-        let rows = MAX_SPEC_VERIFY_ROWS;
+        let rows = self.spec_verify_rows();
         let hidden = self.config.hidden_size;
         let stream_dim = hidden * self.config.hc_mult;
         let n = self.layers.len();
