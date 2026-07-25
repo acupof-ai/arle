@@ -77,17 +77,15 @@ sequence is the A/B that identifies the bug.
 ## Open
 
 Acceptance is unimproved, and the run cannot yet say whether that is the method
-or the budget. The budget looks decisive: 13 steps × 64 = 832 experiences
-consumed against 17299 draft chains produced — **the sidecar sees ~5% of its own
-data**, because CPU autograd on a `[248320, 256]` head costs ~1 s/step while the
-serve produces ~20 chains/s. The ring buffer drops the rest. A 127M-parameter
-head trained on 832 samples is not a tested method.
+or the budget. The budget is decisive: 13 steps × 64 = 832 experiences consumed
+against 17299 draft chains produced — **the sidecar sees ~5% of its own data**,
+and the ring buffer drops the rest. A 127M-parameter head trained on 832 samples
+is not a tested method.
 
-**The step rate was the wrong number in the first draft of this entry.** It is
-not ~1 s/step — the srl6 timestamps give **~65 s/step** (13 steps in ~14 min), and
-a local bench at the real head shape confirms the scale: 20.9 s/step at batch 64
-on an M4 Pro. That reframes the problem from "needs a longer run" to "the step
-cost has to collapse first": 4000 steps at 65 s is 3 days.
+The step rate is **~65 s/step** (srl6 timestamps: 13 steps in ~14 min); a local
+bench at the real head shape puts it at 20.9 s/step at batch 64 on an M4 Pro. So
+the problem is not "needs a longer run" but "the step cost has to collapse
+first": 4000 steps at 65 s is 3 days.
 
 Measured the cost curve rather than guessing where it goes (vocab 248320,
 block 16):
