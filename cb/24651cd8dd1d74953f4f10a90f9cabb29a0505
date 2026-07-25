@@ -1,0 +1,23 @@
+CHANGELOG.md
+  s_cd9a6a56daabe3::t_9856a0b6f6c959 26-36
+docs/experience/wins/2026-07-25-backward-reoffload-device-win-host-wall.md
+  s_cd9a6a56daabe3::t_994ee78b2b7dba 1-58
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "cb24651cd8dd1d74953f4f10a90f9cabb29a0505",
+  "prompts": {},
+  "sessions": {
+    "s_cd9a6a56daabe3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "bf8ec25a-c05e-46a4-b093-1e67694ece0c",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
