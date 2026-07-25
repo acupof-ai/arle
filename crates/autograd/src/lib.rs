@@ -19,7 +19,7 @@ pub mod optim;
 // CLI-driven runtime toggles (train flags -> statics; no env reads).
 #[path = "runtime_flags.rs"]
 mod runtime_flags;
-pub use runtime_flags::{AutogradRuntimeFlags, apply_runtime_flags};
+pub use runtime_flags::{AutogradRuntimeFlags, TapePrecision, apply_runtime_flags};
 #[cfg(feature = "safetensors")]
 #[path = "safetensors_io.rs"]
 pub mod safetensors_io;

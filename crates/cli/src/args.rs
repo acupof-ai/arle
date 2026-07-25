@@ -1093,6 +1093,11 @@ pub(crate) struct OpdRuntimeArgs {
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set, value_name = "BOOL")]
     pub(crate) autograd_decode_attn_legacy: bool,
 
+    /// Autograd tape storage precision. bf16 halves retained-activation + emitted-grad
+    /// VRAM (compute + accumulators + fp32 islands unchanged). CUDA-only; no-op on Metal.
+    #[arg(long, value_enum, default_value_t = TapePrecisionArg::Fp32)]
+    pub(crate) tape_precision: TapePrecisionArg,
+
     /// DSpark/DFlash block-drafter checkpoint dir for the in-process rollout
     /// engine (spec decode; CUDA Qwen3.5/3.6, single-GPU only — mirrors serve's
     /// `--spec-type dspark --mtp-draft-model`).
@@ -1128,6 +1133,14 @@ pub(crate) enum OpdEngineOffloadArg {
     Teacher,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum TapePrecisionArg {
+    /// fp32 storage (default; byte-identical to shipped behavior).
+    Fp32,
+    /// bf16 storage for retained activations + emitted grads; compute stays fp32. CUDA-only.
+    Bf16,
+}
+
 impl OpdRuntimeArgs {
     pub(crate) fn to_flags(&self) -> train::TrainRuntimeFlags {
         train::TrainRuntimeFlags {
@@ -1155,6 +1168,10 @@ impl OpdRuntimeArgs {
                 gdr_chunkwise_prefill: self.gdr_chunkwise_prefill,
                 la_backward_mono: self.la_backward_mono,
                 decode_attn_legacy: self.autograd_decode_attn_legacy,
+                tape_precision: match self.tape_precision {
+                    TapePrecisionArg::Fp32 => autograd::TapePrecision::Fp32,
+                    TapePrecisionArg::Bf16 => autograd::TapePrecision::Bf16,
+                },
             },
         }
     }

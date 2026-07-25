@@ -2,7 +2,22 @@
 //! [`apply_runtime_flags`] once at CLI start. The statics are the single
 //! truth — no env reads.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering::Relaxed};
+
+/// Storage dtype for forward-retained activations + transient emitted grads
+/// (`--tape-precision`). CUDA-only; compute (cuBLAS accumulate), persistent grad
+/// accumulators, and every fp32 island are unaffected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TapePrecision {
+    Fp32 = 0,
+    Bf16 = 1,
+}
+
+impl TapePrecision {
+    fn from_u8(v: u8) -> Self {
+        if v == 1 { Self::Bf16 } else { Self::Fp32 }
+    }
+}
 
 /// Autograd knobs the OPD CLI flags control (defaults = shipped behavior).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,6 +40,8 @@ pub struct AutogradRuntimeFlags {
     pub la_backward_mono: bool,
     /// Force the legacy two-pass decode attention kernel (`--autograd-decode-attn-legacy`).
     pub decode_attn_legacy: bool,
+    /// Storage dtype for retained activations + emitted grads (`--tape-precision`).
+    pub tape_precision: TapePrecision,
 }
 
 impl Default for AutogradRuntimeFlags {
@@ -39,6 +56,7 @@ impl Default for AutogradRuntimeFlags {
             gdr_chunkwise_prefill: false,
             la_backward_mono: false,
             decode_attn_legacy: false,
+            tape_precision: TapePrecision::Fp32,
         }
     }
 }
@@ -52,6 +70,7 @@ static MOE_LORA_BWD_EXPERT_TILE: AtomicUsize = AtomicUsize::new(16);
 static GDR_CHUNKWISE_PREFILL: AtomicBool = AtomicBool::new(false);
 static LA_BACKWARD_MONO: AtomicBool = AtomicBool::new(false);
 static DECODE_ATTN_LEGACY: AtomicBool = AtomicBool::new(false);
+static TAPE_PRECISION: AtomicU8 = AtomicU8::new(0);
 
 pub fn apply_runtime_flags(f: &AutogradRuntimeFlags) {
     CHECKPOINT_OFFLOAD_MIN_BYTES.store(f.checkpoint_offload_min_bytes, Relaxed);
@@ -63,6 +82,7 @@ pub fn apply_runtime_flags(f: &AutogradRuntimeFlags) {
     GDR_CHUNKWISE_PREFILL.store(f.gdr_chunkwise_prefill, Relaxed);
     LA_BACKWARD_MONO.store(f.la_backward_mono, Relaxed);
     DECODE_ATTN_LEGACY.store(f.decode_attn_legacy, Relaxed);
+    TAPE_PRECISION.store(f.tape_precision as u8, Relaxed);
 }
 
 pub(crate) fn checkpoint_offload_min_bytes() -> usize {
@@ -95,4 +115,13 @@ pub(crate) fn la_backward_mono() -> bool {
 #[cfg_attr(any(not(feature = "cuda"), feature = "no-cuda"), allow(dead_code))]
 pub(crate) fn decode_attn_legacy() -> bool {
     DECODE_ATTN_LEGACY.load(Relaxed)
+}
+#[cfg_attr(any(not(feature = "cuda"), feature = "no-cuda"), allow(dead_code))]
+pub(crate) fn tape_precision() -> TapePrecision {
+    TapePrecision::from_u8(TAPE_PRECISION.load(Relaxed))
+}
+/// `true` when retained activations + emitted grads store bf16 (CUDA-only path).
+#[cfg_attr(any(not(feature = "cuda"), feature = "no-cuda"), allow(dead_code))]
+pub(crate) fn tape_bf16() -> bool {
+    matches!(tape_precision(), TapePrecision::Bf16)
 }
