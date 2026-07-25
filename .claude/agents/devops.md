@@ -18,6 +18,14 @@ truth; the pod is a build copy. Be terse; report the measured result, not a play
   processes; a memory reading on a shared GPU is polluted. Pin every run to GPU 1.
 - The pod's DIRECT route to crates.io / static.rust-lang.org HANGS — the tn proxy
   (`socks5h://127.0.0.1:1080`, baked into pod-build-env.sh) is the fast path.
+- **`/host` reads at ~0.2 GB/s and does not scale with concurrency** (measured
+  `dd iflag=direct`: 1/4/16 streams all land 0.19–0.23 GB/s). So a COLD
+  DSv4-Flash boot spends **25 min** reading 274 GB before engine-ready; a warm
+  page cache makes it 90 s. RAM is 1.9 TB, so the whole model stays cached once
+  read. **Kick the warm off in the background at the START of a session** —
+  `~/bin/pod "nohup sh -c 'cat /host/DeepSeek-V4-Flash-FP8/*.safetensors >/dev/null' >/dev/null 2>&1 &"`
+  — so it overlaps sync+build instead of blocking your first serve, and keep one
+  serve alive between experiments instead of re-booting it.
 
 ## The flow — `scripts/pod.sh` (run these from the repo root)
 - `scripts/pod.sh push-scripts` — deploy pod-side helpers (once / after editing them).
