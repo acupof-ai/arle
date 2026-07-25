@@ -79,8 +79,23 @@ accept_rate (server-stats): MTP ~0.15, DSpark ~0.30. Slot lines: no-spec
 (`stages=3 block=5 target_layers=[40,41,42]`).
 
 - **Both spec arms are c=1-only** — DSpark +5.0% at c=1, net-negative at c≥4;
-  MTP negative everywhere on this shape. At c≥4 the batch is already
-  GPU-saturated, so draft/verify overhead + the reduced slot count dominate.
+  MTP negative everywhere on this shape. The crossover is the spec-decode
+  compute-bound transition, one mechanism (verify cost is free only while the
+  GPU has idle compute):
+
+  ```
+  each step: draft block=5 → target verifies 6 positions → commit ~2.5 tok (accept 0.30, flat vs c)
+                                      │
+              ┌───────────────────────┴───────────────────────┐
+          c=1: batch small                              c=16: batch full
+          GPU memory-bound                              GPU compute-bound
+          verify 6 pos ≈ free                           verify 6 pos = ~6× time
+              │                                                │
+        2.5 tok / ~1× time                            2.5 tok / ~6× time
+              ▼                                                ▼
+        ✅ +5%  (27B c=1 +57.5%)                    ❌ 2.5/6 ≈ 0.42 → measured 90.66/174.46 = 0.52
+  ```
+
   Not default-flip candidates.
 - **#183 fix confirmed** — the earlier c=16 −49.9% "DSpark collapse" was the
   train-capture per-step 2×D2H+2×sync serializing the TP=4 NCCL pipeline
