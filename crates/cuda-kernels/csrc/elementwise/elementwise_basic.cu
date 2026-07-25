@@ -35,10 +35,8 @@ __host__ __forceinline__ bool is_bf16x4_aligned(const void *ptr) {
   return (reinterpret_cast<uintptr_t>(ptr) & (sizeof(uint2) - 1)) == 0;
 }
 
-// ============================================================================
-// SiLU(gate) * up — element-wise, BF16 in, FP32 compute, BF16 out
+// SiLU(gate) * up — element-wise, BF16 in, FP32 compute, BF16 out.
 // Must compute sigmoid in FP32 to avoid precision loss.
-// ============================================================================
 __global__ void silu_mul_native_kernel(
     const __nv_bfloat16 *__restrict__ gate,
     const __nv_bfloat16 *__restrict__ up,
@@ -182,9 +180,7 @@ extern "C" CUresult add_scaled_row_segment_cuda(
   return (CUresult)cudaGetLastError();
 }
 
-// ============================================================================
 // Element-wise BF16 add: out = a + b
-// ============================================================================
 __global__ void add_native_kernel(
     const __nv_bfloat16 *__restrict__ a,
     const __nv_bfloat16 *__restrict__ b,
@@ -259,10 +255,8 @@ extern "C" cudaError_t add_assign_cuda(
   return cudaGetLastError();
 }
 
-// ============================================================================
 // Embedding lookup — single token decode
 // out[i] = table[token_id * hidden_dim + i] for i in 0..hidden_dim
-// ============================================================================
 __global__ void embedding_decode_native_kernel(
     const __nv_bfloat16 *__restrict__ table,
     const int *__restrict__ token_id,
@@ -284,10 +278,8 @@ extern "C" CUresult embedding_decode_cuda(
   return (CUresult)cudaGetLastError();
 }
 
-// ============================================================================
 // Embedding lookup — batched (B tokens)
 // out[b * hidden_dim + i] = table[token_ids[b] * hidden_dim + i]
-// ============================================================================
 __global__ void embedding_batched_native_kernel(
     const __nv_bfloat16 *__restrict__ table,
     const int *__restrict__ token_ids,

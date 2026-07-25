@@ -1851,8 +1851,6 @@ impl TokenKVPool {
         !self.k_data.is_empty()
     }
 
-    // ── Pointer accessors ──
-    //
     // `k_ptr` / `v_ptr` = the "write target" for decode_prep_paged:
     //   BF16 -> per-layer data buffer (also read by TileLang)
     //   FP8/INT8 → shared bf16 working buffer (quantized to pool after write)
@@ -2016,8 +2014,8 @@ impl TokenKVPool {
         }
     }
 
-    // ── Convenience accessors that mirror the old PagedKVPool API so callers ──
-    // ── can transition incrementally.                                         ──
+    // Convenience accessors that mirror the old PagedKVPool API so callers can
+    // transition incrementally.
 
     /// Build TileLang paged-KV indptr array for a batch of slots.
     /// `indptr[i+1] - indptr[i]` = page count for request `i`.
@@ -2482,7 +2480,7 @@ impl TokenKVPool {
     }
 }
 
-// ── Type alias for backward compatibility ──────────────────────────────────
+// Type alias for backward compatibility
 
 /// Backward-compatible alias. New code should use `TokenKVPool` directly.
 pub type PagedKVPool = TokenKVPool;

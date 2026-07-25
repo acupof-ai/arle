@@ -1766,7 +1766,7 @@ fn resolve_export_path(path_arg: &str) -> PathBuf {
     p
 }
 
-/// Build the markdown body per the wave-2 brief.
+/// Build the markdown body for a conversation export.
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn render_history_markdown(model_id: &str, history: &[ChatMessage]) -> String {
     let ts = iso8601_utc_now();

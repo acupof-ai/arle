@@ -1111,7 +1111,7 @@ pub(crate) struct OpdRuntimeArgs {
 
     /// Whole-step Qwen3.5/3.6 decode graph for the in-process rollout engine
     /// (mirrors serve's flag). Default off = unchanged behavior; flipping it
-    /// on waits for the F.5 co-residency license.
+    /// on waits for the co-residency license.
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set, value_name = "BOOL")]
     pub(crate) qwen35_decode_graph: bool,
 
@@ -2038,7 +2038,7 @@ pub(crate) struct TrainAgentOpdArgs {
     /// Serve-side temperature for requests that omit it (CC sends none). 0.3, not
     /// 1.0: hd256/FP8 (Qwen3.6-27B) sampling corrupts at temp>0 above ~0.3 (#48;
     /// b4b293f0c fixed greedy/argmax only, the temp>0 distribution still degrades)
-    /// — 0.3 stays coherent AND keeps behavior logprobs non-empty (F.6). Restore
+    /// — 0.3 stays coherent AND keeps behavior logprobs non-empty. Restore
     /// 1.0 once the hd256/FP8 temp>0 fix lands.
     #[arg(long, default_value_t = 0.3, value_name = "T")]
     pub(crate) rollout_temperature: f32,
