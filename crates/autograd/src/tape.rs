@@ -821,6 +821,15 @@ impl Tape {
         match result {
             Ok((grads, keep)) => {
                 store.free_new_except(&live_before, &keep)?;
+                // Re-offload the replayed hidden (mirror of forward) so only one
+                // checkpoint is device-resident, not all N. Readback keeps a host
+                // copy → safe for any reuse. Hidden only, not shared params.
+                if self.offload_checkpoints
+                    && let Some(&hidden_id) = entry.input_ids.first()
+                    && hidden_id != entry.output_id
+                {
+                    store.offload_checkpoint_to_host(hidden_id)?;
+                }
                 trim_after_checkpoint_replay(store)?;
                 if let (Some(outer), Some(mut inner)) = (profile, inner_profile) {
                     // The inner wall already sits inside this entry's own
