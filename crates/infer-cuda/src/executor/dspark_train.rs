@@ -20,7 +20,11 @@ use half::bf16;
 pub struct DsparkExperience {
     /// Draft tokens proposed by the draft head `[block_size]`.
     pub draft_tokens: Vec<u32>,
-    /// Draft logits `[block_size, vocab]` as f32, copied from device.
+    /// RAW draft logits `[draft_rows, vocab]` as f32, **pre-Markov-bias** — the
+    /// trainer re-derives the bias from its own live `w1`/`w2`, so corrected rows
+    /// would double-bias the objective (#176). `draft_rows <= block_size`:
+    /// confidence truncation shortens it, and the anchor-carrying chain makes it
+    /// one shorter still. The trainer recomputes the count from `vocab_size`.
     pub draft_logits: Vec<f32>,
     /// Target (trunk) logits `[block_size, vocab]` as f32, copied from device.
     /// Used for the L1 regularization term that prevents reward hacking.
@@ -29,7 +33,7 @@ pub struct DsparkExperience {
     pub accepted: usize,
     /// Block size (== draft_tokens.len()).
     pub block_size: usize,
-    /// Vocab size (== draft_logits.len() / block_size).
+    /// Vocab width, from the target's own shape — never a draft/block ratio.
     pub vocab_size: usize,
     /// Draft head mode (serve `first_row = !next_token_heads`): true = row j
     /// drafts chain[j+1] conditioned on chain[j]; false = same-position, row j
@@ -118,11 +122,15 @@ fn hidden_states_to_host(ctx: &DeviceContext, hs: &HiddenStates) -> Vec<f32> {
 ///
 /// Best-effort: returns immediately on any error so a capture failure never
 /// aborts the decode step. The D2H copy + sync does add per-step latency.
+/// `vocab` is passed in rather than inferred: the caller knows it, and deriving
+/// it from `draft_logits.len() / draft_tokens.len()` is wrong whenever the two
+/// disagree — confidence truncation and the anchor-carrying chain both do (#176).
 pub fn capture_dspark_experience(
     ctx: &DeviceContext,
     draft_tokens: &[u32],
     draft_logits: &HiddenStates,
     target_logits: &DeviceVec,
+    vocab: usize,
     accepted: usize,
     next_token_heads: bool,
 ) {
@@ -141,12 +149,13 @@ pub fn capture_dspark_experience(
     if draft_logits_host.is_empty() || target_logits_host.is_empty() {
         return;
     }
-    let vocab_size = draft_logits_host.len() / block_size;
-    // Validate target logits shape matches draft (block_size * vocab). A
-    // mismatch here would silently feed garbage to the trainer's L1 loss.
-    if target_logits_host.len() != block_size * vocab_size {
+    // Row counts may legitimately differ (truncated drafts); only the vocab
+    // width must divide both, and the target must cover the whole chain.
+    if !draft_logits_host.len().is_multiple_of(vocab)
+        || target_logits_host.len() != block_size * vocab
+    {
         log::warn!(
-            "dspark_train: draft/target shape mismatch: draft_len={} target_len={} block_size={block_size} vocab={vocab_size}",
+            "dspark_train: draft/target shape mismatch: draft_len={} target_len={} block_size={block_size} vocab={vocab}",
             draft_logits_host.len(),
             target_logits_host.len()
         );
@@ -158,7 +167,7 @@ pub fn capture_dspark_experience(
         target_logits: target_logits_host,
         accepted,
         block_size,
-        vocab_size,
+        vocab_size: vocab,
         next_token_heads,
     });
 }
@@ -210,12 +219,15 @@ pub fn capture_dspark_experience_hidden(
     if draft_logits_host.is_empty() || target_logits_host.is_empty() {
         return;
     }
-    // Validate draft/target vocab agree before pushing (a mismatch here means
-    // the slice above grabbed the wrong rows and would silently corrupt training).
-    let vocab_size = draft_logits_host.len() / block_size;
-    if target_logits_host.len() != col_len * vocab_size {
+    // #176: vocab comes from the target's `hidden_dim`, never from
+    // draft_len/block_size — DSv4's chain carries the anchor while the draft
+    // logits do not, so that ratio was always short by one row and the guard
+    // dropped every push. The trainer re-derives the row count itself.
+    if !draft_logits_host.len().is_multiple_of(vocab) || target_logits_host.len() != col_len * vocab
+    {
         log::warn!(
-            "dspark_train: draft/target vocab mismatch: draft_vocab={vocab_size} target_len={} col_len={col_len}",
+            "dspark_train: draft/target shape mismatch: draft_len={} target_len={} vocab={vocab} col_len={col_len}",
+            draft_logits_host.len(),
             target_logits_host.len()
         );
         return;
@@ -226,7 +238,7 @@ pub fn capture_dspark_experience_hidden(
         target_logits: target_logits_host,
         accepted,
         block_size,
-        vocab_size,
+        vocab_size: vocab,
         next_token_heads,
     });
 }

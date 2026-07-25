@@ -2033,6 +2033,7 @@ impl Qwen35CudaExecutor {
                 &chain,
                 draft_logits,
                 &logits,
+                model.config.vocab_size,
                 k,
                 ds.head.cfg.next_token_heads,
             );
