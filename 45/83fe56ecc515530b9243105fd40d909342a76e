@@ -1,0 +1,33 @@
+needle_gate_identity.log
+  s_4504a4e312b2d1::t_4593f38b0fca7f 1
+serve_dsv4-preflight.log
+  s_1bb149460173f2::t_2e2d839ea9a6c6 1
+docs/experience/errors/2026-07-25-dspark-verdict-contaminated-by-train-sync.md
+  s_1bb149460173f2::t_19b73b9f155dd3 31-55,65-68,71-74
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "4583fe56ecc515530b9243105fd40d909342a76e",
+  "prompts": {},
+  "sessions": {
+    "s_1bb149460173f2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a63cf57f4d73476e8",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_4504a4e312b2d1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a2de9016e4bda7e97",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
