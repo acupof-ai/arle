@@ -1,0 +1,23 @@
+crates/infer-cuda/src/moe.rs
+  s_44e90edf230702::t_9aef430ad71cec 678,1037,1039,1075,1078
+docs/support-matrix.md
+  s_44e90edf230702::t_4fc15a472c3a53 96,114
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "1dcb73cb7f96e985694c91b6d5501bf67aeb1d53",
+  "prompts": {},
+  "sessions": {
+    "s_44e90edf230702": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "585a4f62-ee7f-45e9-8947-d992463c772d",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
