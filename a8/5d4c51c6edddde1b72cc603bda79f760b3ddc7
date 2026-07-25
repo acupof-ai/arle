@@ -1,0 +1,61 @@
+CHANGELOG.md
+  s_44e90edf230702::t_694b3092d45e92 592
+docs/experience/wins/2026-07-06-dsv4-mtp-guidellm-canonical-bench.md
+  s_3fafca7bcb157f::t_22f593c8454d82 9,327-328
+docs/experience/wins/2026-07-09-dsv4-proj-batched-bf16-lever-verify.md
+  s_35061a5e9bf0d9::t_c9aeb1a9e0f2db 24
+docs/experience/wins/2026-07-10-dsv4-prefix-reuse-identity-fix.md
+  s_2eda122629d742::t_1354937b67247f 50
+docs/experience/wins/2026-07-17-qwen36-rotary-fa3-gates.md
+  s_2ff3482e84af0b::t_d88eafaa5ad853 54-55
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "a85d4c51c6edddde1b72cc603bda79f760b3ddc7",
+  "prompts": {},
+  "sessions": {
+    "s_2eda122629d742": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ae0718f390e95791b",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_2ff3482e84af0b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ab10f0c0a55c726fd",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_35061a5e9bf0d9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a6c41b95ad37dd1e6",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_3fafca7bcb157f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a0c1799bc83e702c7",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_44e90edf230702": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "585a4f62-ee7f-45e9-8947-d992463c772d",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
