@@ -244,9 +244,8 @@ pub(crate) fn rmsnorm_backward(
         return Ok(grads);
     }
 
-    // Host fallback (CPU/Metal). If the forward took the lazy device path
-    // (M5.3b.6), inv_rms was saved empty — recompute it from the now-host
-    // x.
+    // Host fallback (CPU/Metal). If the forward took the lazy device path,
+    // inv_rms was saved empty — recompute it from the now-host x.
     store.ensure_host(x)?;
     let upstream = store.tensor_host(output_grad_id)?;
     let x_tensor = store.tensor_host(x)?;
