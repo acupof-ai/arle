@@ -1,0 +1,129 @@
+crates/autograd/src/backend.rs
+  s_2eda122629d742::t_d67ff100f0dbf1 632,634,718,965,975,1007,1039,1054,1071,1088,1095,1102-1103,1119,1197,1248,1280,1381,1424,1455,1486,1506,1517,1537,1819,1883,1887-1888,1940,1971,2017,2025,2054,2092,2121,2150,2213,2302
+crates/autograd/src/backend_cuda.rs
+  s_2eda122629d742::t_f265ce921688da 1753,1760-1761,1948,1950,1971,2035,2057,2446,2471,2476-2477,2498,2813,2839,2906-2907,2909-2911,2944,2964,2982,3001,3020,3042,3077,3170,3243,3313,3437,3441,3565,5319,5901,5940,8631,8702,8826,8829,8935,9003,9050,9147
+crates/autograd/src/backend_metal.rs
+  s_089e26e9e41120::t_d32346a835c81c 288,329,372,403,439,466,495-496,563,700,721,737,767,793,818,884,897,975,982-983,1322,1535,1968,2655
+crates/autograd/src/ops.rs
+  s_2eda122629d742::t_7248a3269490d5 65,67-68,83,93,96-98,118,120-122,181,185-187,196,198-200,210,213-216,238,241-243,316,319-320,331,346,349-351,438,442-443,448,450-454,459,467
+crates/autograd/src/ops/activation.rs
+  s_94bdb1f9b09061::t_1e1c9cdbe6f69c 14,18-19,83,158,162-163,227,232,315-319,378,448,522
+crates/autograd/src/ops/embed.rs
+  s_2eda122629d742::t_f6616a5216fe82 19,191
+crates/autograd/src/ops/gather.rs
+  s_44e90edf230702::t_0b83c63e08328e 18,23,196-197
+crates/autograd/src/ops/reduce.rs
+  s_94bdb1f9b09061::t_506fe1192e2eb6 10,15,60,80,82,85,231-235
+crates/autograd/src/ops/rope.rs
+  s_35061a5e9bf0d9::t_e1a70ccac73e51 17-19,26-27,184-188
+crates/autograd/src/tensor.rs
+  s_28c9fa871b073e::t_b45e37df0bacc2 905-907
+crates/cuda-kernels/csrc/attention/decode_attention_turboquant.cu
+  s_3fafca7bcb157f::t_d976f9049f9eff 220
+crates/cuda-kernels/csrc/norm/norm.cu
+  s_2eda122629d742::t_1f7f07541d8c74 250,507
+crates/cuda-kernels/csrc/recurrent/gated_delta_rule.cu
+  s_35061a5e9bf0d9::t_a967853ead3d6c 408,428
+crates/infer-cuda/src/attention.rs
+  s_35061a5e9bf0d9::t_954b999e311dca 1677,7928,8488-8489
+crates/infer-cuda/src/attention/flashmla.rs
+  s_35061a5e9bf0d9::t_8757c91d03da8f 194-195
+crates/infer-cuda/src/dsv4.rs
+  s_2ff3482e84af0b::t_cc3b989849c85d 2672-2673,3549
+crates/infer-cuda/src/moe.rs
+  s_35061a5e9bf0d9::t_a90472cac428a6 567,571,659,677,694,709,759,861,940,998,1033,1221,1558,1647,3027,3458,3503,3545,3583
+crates/infer-cuda/src/qwen35.rs
+  s_1bb149460173f2::t_ff5f802dc00756 2863,4386,4391,4416-4417,4475,5812,5855,6050,6152,6257,6303,6452,7894-7895,7941,7989
+crates/qwen3-spec/src/lib.rs
+  s_28c9fa871b073e::t_0b805b7a9abb52 825,976,978
+crates/qwen35-spec/src/lib.rs
+  s_28c9fa871b073e::t_0cfce9157c5b81 135,453,643,2114
+crates/vulkan-kernels/src/cache.rs
+  s_2ff3482e84af0b::t_5c459834a8e2fb 1,60
+crates/vulkan-kernels/src/lib.rs
+  s_2ff3482e84af0b::t_08c49335a131e2 571,674,959,1432,1434
+crates/vulkan-sys/src/lib.rs
+  s_2ff3482e84af0b::t_a98fdc09f369e2 803,1395
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "e5a28af60e400174ec61a49a56d626a05874750b",
+  "prompts": {},
+  "sessions": {
+    "s_089e26e9e41120": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "93e66a8f-c20a-4ba9-96f2-283f6d98cbb1",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_1bb149460173f2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a63cf57f4d73476e8",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_28c9fa871b073e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ac6cb1c55411067be",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_2eda122629d742": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ae0718f390e95791b",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_2ff3482e84af0b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ab10f0c0a55c726fd",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_35061a5e9bf0d9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a6c41b95ad37dd1e6",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_3fafca7bcb157f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a0c1799bc83e702c7",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_44e90edf230702": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "585a4f62-ee7f-45e9-8947-d992463c772d",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_94bdb1f9b09061": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a1e0f679a9fe2d4a2",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
