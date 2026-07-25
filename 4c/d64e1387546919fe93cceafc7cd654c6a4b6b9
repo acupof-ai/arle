@@ -1,0 +1,21 @@
+docs/experience/errors/2026-07-25-dspark-verdict-contaminated-by-train-sync.md
+  s_cb6ca280b792fe::t_5312226c46d2a9 3-6,71-103
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "4cd64e1387546919fe93cceafc7cd654c6a4b6b9",
+  "prompts": {},
+  "sessions": {
+    "s_cb6ca280b792fe": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1a00414d-2267-47d4-813e-3c9e7cb88d53",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
