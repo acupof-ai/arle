@@ -608,10 +608,16 @@ impl DsparkTrainer {
             match self.train_step(&batch) {
                 Ok(loss) => {
                     let steps = self.steps;
+                    // `pm_alpha` rides along with the drift: only the PG half of
+                    // the objective is the RLVR regime ISO's fixed-spectrum
+                    // premise was observed in, so a drift number is only
+                    // interpretable next to how much of the step was dense
+                    // self-distillation.
                     let iso = match self.last_iso_drift.as_slice() {
                         [] => String::new(),
                         drift => format!(
-                            " iso_drift=[{}]",
+                            " pm_alpha={:.2} iso_drift=[{}]",
+                            self.config.prob_match_alpha,
                             drift
                                 .iter()
                                 .map(|d| format!("{d:.2e}"))
