@@ -2,7 +2,6 @@
 #include <cstdint>
 
 #define NONPAGED_PREFILL_TILE 64
-#define NONPAGED_PREFILL_MAX_HEAD_DIM 256
 #define NONPAGED_PREFILL_MAX_WARPS 8
 
 __global__ void nonpaged_prefill_attention_kernel(
@@ -44,7 +43,6 @@ __global__ void nonpaged_prefill_attention_kernel(
   int q_dim = num_q_heads * head_dim;
   int kv_len = start_pos + token + 1;
 
-  __shared__ __nv_bfloat16 q_s[NONPAGED_PREFILL_MAX_HEAD_DIM];
   __shared__ float scores[NONPAGED_PREFILL_TILE];
   __shared__ float warp_partials[NONPAGED_PREFILL_MAX_WARPS *
                                  NONPAGED_PREFILL_TILE];
@@ -53,15 +51,19 @@ __global__ void nonpaged_prefill_attention_kernel(
   __shared__ float running_sum_s;
   __shared__ float rescale_s;
 
-  q_s[dim] = q[token * q_dim + q_head * head_dim + dim];
   if (dim == 0) {
     running_max_s = -INFINITY;
     running_sum_s = 0.0f;
   }
   __syncthreads();
 
-  float q_val = __bfloat162float(q_s[dim]);
+  float q_val = __bfloat162float(q[token * q_dim + q_head * head_dim + dim]);
   float o_acc = 0.0f;
+  // Fold the loop-invariant int64 offset into base pointers once (this is the only
+  // term that can overflow int32); the hot loop then indexes with int32 row*head_dim
+  // (< max_seq_len*head_dim < 2^31), keeping no live 64-bit reg pair across the loop.
+  const __nv_bfloat16 *k_base = k_cache + (int64_t)kv_head * max_seq_len * head_dim + dim;
+  const __nv_bfloat16 *v_base = v_cache + (int64_t)kv_head * max_seq_len * head_dim + dim;
 
   for (int tile_start = 0; tile_start < kv_len; tile_start += NONPAGED_PREFILL_TILE) {
     int tile_len = min(NONPAGED_PREFILL_TILE, kv_len - tile_start);
@@ -71,8 +73,7 @@ __global__ void nonpaged_prefill_attention_kernel(
       // Softmax is permutation-invariant, so a wrapped ring walk accumulates
       // identically to a contiguous one — only the physical row differs.
       int row = ring_modulus > 0 ? ((ring_base + abs_pos) % ring_modulus) : abs_pos;
-      int k_idx = (kv_head * max_seq_len + row) * head_dim + dim;
-      float partial = q_val * __bfloat162float(k_cache[k_idx]);
+      float partial = q_val * __bfloat162float(k_base[row * head_dim]);
       partial = warp_reduce_sum(partial);
       if (lane == 0) {
         warp_partials[warp * NONPAGED_PREFILL_TILE + pos] = partial;
@@ -119,9 +120,8 @@ __global__ void nonpaged_prefill_attention_kernel(
       float weight = expf(scores[pos] - current_max);
       int abs_pos = tile_start + pos;
       int row = ring_modulus > 0 ? ((ring_base + abs_pos) % ring_modulus) : abs_pos;
-      int v_idx = (kv_head * max_seq_len + row) * head_dim + dim;
       row_sum += weight;
-      o_acc += weight * __bfloat162float(v_cache[v_idx]);
+      o_acc += weight * __bfloat162float(v_base[row * head_dim]);
     }
     if (dim == 0) {
       running_sum_s += row_sum;
