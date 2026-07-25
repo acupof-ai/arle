@@ -1,0 +1,21 @@
+crates/infer-cuda/src/dsv4.rs
+  s_1bb149460173f2::t_449a640b3aa416 756-758,778,780,783,785,787,794-796,819-824,827,829,831,833,835,837,839,1199,2346-2360,2363
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "4db5d36698028ea2e4b6a9d5efca50acfb45cd73",
+  "prompts": {},
+  "sessions": {
+    "s_1bb149460173f2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a63cf57f4d73476e8",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
