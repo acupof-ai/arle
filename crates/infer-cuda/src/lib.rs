@@ -368,8 +368,8 @@ impl CudaExecutor {
     /// speculative-decode head with draft depth `n` (config-driven, the serve
     /// path's `--spec-type mtp` / `--mtp-draft-tokens`); `mtp_draft_topk`
     /// controls the per-level draft candidate width while verifier rows stay
-    /// chain-shaped. `None` falls back to the `ARLE_DSV4_SPEC_DECODE` env gate
-    /// for backward compat.
+    /// chain-shaped. `None` = no MTP head (spec decode off unless
+    /// `--spec-type dspark` supplies a draft model).
     #[cfg(feature = "cuda")]
     pub fn from_dsv4_fp8_safetensors(
         model_path: impl AsRef<Path>,

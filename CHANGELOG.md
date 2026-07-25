@@ -23,17 +23,38 @@ Progress spine. Entry classes recorded here the day they land: phase exits,
 default flips, and accept-or-reject verdicts (AGENTS.md §Docs lifecycle &
 progress spine).
 
-- **VERDICT — backward re-offload lifts the OPD-writeback device wall to seq
-  24576, but 256K needs LA-chunk not more offload** (2026-07-25, `e4be96108`;
-  win: [2026-07-25-backward-reoffload-device-win-host-wall](docs/experience/wins/2026-07-25-backward-reoffload-device-win-host-wall.md)).
-  Matched pod A/B on 27B-FP8: offload ON passes seq 24576 where OFF CUDA-OOMs —
-  the backward asymmetry was a real leak (replayed hidden fetched per-layer,
-  never re-offloaded, so all N co-resident). But the ON sweep then hits a host
-  memcg SIGKILL at 28672–32768 (device 20 GB free — offloaded hidden overruns
-  the besteffort pod RAM) and a device CUDA-OOM at 40960+ (one GDN layer's
-  O(seq) saved backward context fills 97 GB alone). Trainable ceiling moved
-  ~24576→~28672, one step not an order of magnitude. Keep the fix (net-positive
-  at default); redirect the 256K push to chunking the LA recompute working set.
+- **PHASE EXIT — spec-decode concurrency gate; three dispatch ladders → one
+  `route_decode`** (2026-07-26, `69560ae55`;
+  win: [2026-07-26-spec-decode-concurrency-gate](docs/experience/wins/2026-07-26-spec-decode-concurrency-gate.md)).
+  MTP/DSpark speculate only at decode batch ≤ `--spec-max-batch`; above it,
+  where spec is a compute-bound loss, decode routes to the plain batched path.
+  One pure `route_decode(spec_kind, n_rows, gate)` shared by both CUDA
+  executors replaces the qwen35 (rows==1 + serial rows>1) and dsv4 (B>1)
+  ladders.
+- **DEFAULT — `spec_max_batch = 1`** (2026-07-26, `69560ae55`). Pod A/B PASS:
+  gate=1 keeps DSpark's c=1 +5.4% (128/128) / +58.4% (256-out) and pins c≥4 to
+  ≈ no-spec (±2%); gate=16 reproduces the old c=16 −47.7% loss. Raising to 4
+  re-admits the c=4 −22% loss, so 1 is the measured optimum.
+- **VERDICT — #128 DSpark accept-or-kill: KEEP as a c=1 feature; the 07-20
+  +63.8% vs 07-25 +5% gap was the dataset** (2026-07-26). Same code gives +58%
+  at accept_rate 0.51 (256-out) and +5% at 0.30 (128/128) — draft-friendliness,
+  one mechanism, not a second effect. `ARLE_DSV4_SPEC_DECODE` env gate deleted;
+  `--spec-type` is the single opt-in.
+
+- **VERDICT — backward re-offload lifts the OPD-writeback device wall
+  24576→32768, but 256K needs LA-chunk not more offload** (2026-07-25,
+  `e4be96108`; win: [2026-07-25-backward-reoffload-device-wall-24576-to-32768](docs/experience/wins/2026-07-25-backward-reoffload-device-wall-24576-to-32768.md)).
+  Matched pod A/B on 27B-FP8: offload ON runs clean through seq 32768 (loss
+  10.87) where OFF CUDA-OOMs at 24576 — the backward asymmetry was a real leak
+  (replayed hidden fetched per-layer, never re-offloaded, so all N co-resident).
+  The device CUDA-OOM wall is now at 40960 (`concat_axis2`, 409 MiB free): one
+  GDN layer's O(seq) saved backward context fills 97 GB alone, with checkpoint
+  already at one layer resident — a recompute working set, not a retained
+  buffer, so offload/bf16 can't touch it. Trainable ceiling 24576→32768 (1.33×),
+  not the order of magnitude 256K needs. Keep the fix (net-positive at default);
+  redirect to chunking the LA recompute working set. (A first probe mis-attributed
+  two foreign-job SIGKILLs to our host memcg; a clean re-measure showed both seqs
+  pass — corrected in the win entry.)
 - **REJECT — #127 "train a DSv4 draft head"; the trained head is public**
   (2026-07-25; docs/architecture-dsv4.md §7 corrected).
   `deepseek-ai/DeepSeek-V4-Flash-DSpark` (MIT) ships a 3-stage head whose 4705

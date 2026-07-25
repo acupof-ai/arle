@@ -483,7 +483,7 @@ counters are recomputed by `truncate_decode_len` + `flashmla_truncate_slot`.
 `forward_tokens_verify_stream_persistent` (`dsv4.rs:4351`), writes no slot KV.
 **Commit/selftest verifier** `forward_tokens_verify` (`dsv4.rs:1968`) is
 non-frozen and writes slot KV — selftest only. **Off by default**:
-`spec_decode_on = mtp_draft_tokens.is_some() || ARLE_DSV4_SPEC_DECODE`;
+`spec_decode_on = mtp_draft_tokens.is_some() || dspark_on`;
 `--spec-type` defaults `None`; `--spec-type mtp` defaults draft tokens to 2;
 CUDA-only. Adaptive skip via `ARLE_DSV4_MTP_ADAPTIVE` (B=1 only).
 
