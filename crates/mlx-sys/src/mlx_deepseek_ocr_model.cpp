@@ -83,7 +83,6 @@ array swiglu(const array& gate, const array& up) {
     return (gate * sigmoid(gate)) * up;
 }
 
-// ── Weight wrappers ──────────────────────────────────────────────────────
 
 // A decoder / projector linear: dense BF16 or MXFP8 (uint8 scales, no biases).
 struct QWeight {
@@ -144,7 +143,6 @@ struct LayerCache {
     int cap = 0; // allocated capacity (0 = not yet allocated)
 };
 
-// ── SAM-base encoder ─────────────────────────────────────────────────────
 
 struct SamBlock {
     int window_size = 0; // 0 = global attention
@@ -278,7 +276,6 @@ struct DeepseekOcrModel {
         return lm_head.apply(y);
     }
 
-    // ── Decoder attention (plain MHA, full RoPE, causal) ────────────────
     array attention(const array& x, const DecoderLayer& layer, LayerCache& cache, int offset) const {
         const int s = x.shape(0);
         auto x3 = reshape(x, {1, s, hidden_size});
@@ -419,7 +416,6 @@ struct DeepseekOcrModel {
         return x;
     }
 
-    // ── Vision: SAM ─────────────────────────────────────────────────────
 
     // Relative-position bias following sam.py get_rel_pos/add_decomposed_rel_pos
     // with q_size == k_size (no interpolation needed at fixed window/grid).
@@ -597,7 +593,6 @@ struct DeepseekOcrModel {
         return x; // [1, h', w', 1024]
     }
 
-    // ── Vision: CLIP ────────────────────────────────────────────────────
 
     array clip_attention(const array& x, const ClipLayer& layer) const {
         const int b = x.shape(0);
@@ -695,7 +690,6 @@ struct DeepseekOcrModel {
         return concatenate(std::vector<array>{flat, sep}, 0); // [side*(side+1)+1, n_embed]
     }
 
-    // ── Generate ────────────────────────────────────────────────────────
 
     void reset_request_state(int total_tokens) {
         layer_caches.assign(layers.size(), LayerCache{});

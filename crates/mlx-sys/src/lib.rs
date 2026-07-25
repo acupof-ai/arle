@@ -43,7 +43,6 @@ pub const MLX_BFLOAT16: i32 = 12;
 pub const MLX_COMPLEX64: i32 = 13;
 
 unsafe extern "C" {
-    // === Error handling ===
 
     /// Returns the last error message, or null if no error.
     /// Thread-local — safe to call from any thread.
@@ -56,8 +55,6 @@ unsafe extern "C" {
     /// Returns Metal's recommended max GPU working set in bytes, or 0 when no
     /// system Metal device is available.
     pub fn mlx_metal_recommended_max_working_set_size() -> u64;
-
-    // === Array lifecycle ===
 
     pub fn mlx_array_new_float32(val: f32) -> *mut mlx_array;
     pub fn mlx_array_new_int32(val: i32) -> *mut mlx_array;
@@ -90,8 +87,6 @@ unsafe extern "C" {
         out_len: usize,
     ) -> usize;
 
-    // === Binary ops ===
-
     pub fn mlx_add(a: *mut mlx_array, b: *mut mlx_array) -> *mut mlx_array;
     pub fn mlx_subtract(a: *mut mlx_array, b: *mut mlx_array) -> *mut mlx_array;
     pub fn mlx_multiply(a: *mut mlx_array, b: *mut mlx_array) -> *mut mlx_array;
@@ -104,8 +99,6 @@ unsafe extern "C" {
     ) -> *mut mlx_array;
     pub fn mlx_gather_axis1_i32(values: *mut mlx_array, indices: *mut mlx_array) -> *mut mlx_array;
 
-    // === Unary ops ===
-
     pub fn mlx_exp(a: *mut mlx_array) -> *mut mlx_array;
     pub fn mlx_log1p(a: *mut mlx_array) -> *mut mlx_array;
     pub fn mlx_negative(a: *mut mlx_array) -> *mut mlx_array;
@@ -116,8 +109,6 @@ unsafe extern "C" {
     pub fn mlx_erf(a: *mut mlx_array) -> *mut mlx_array;
     pub fn mlx_log(a: *mut mlx_array) -> *mut mlx_array;
 
-    // === Shape ops ===
-
     pub fn mlx_reshape(a: *mut mlx_array, shape: *const i32, ndim: usize) -> *mut mlx_array;
     /// Reverse all axes.
     pub fn mlx_transpose(a: *mut mlx_array) -> *mut mlx_array;
@@ -127,8 +118,6 @@ unsafe extern "C" {
     pub fn mlx_broadcast_to(a: *mut mlx_array, shape: *const i32, ndim: usize) -> *mut mlx_array;
     pub fn mlx_expand_dims(a: *mut mlx_array, axis: i32) -> *mut mlx_array;
     pub fn mlx_zeros(shape: *const i32, ndim: usize, dtype: i32) -> *mut mlx_array;
-
-    // === Indexing ===
 
     pub fn mlx_take_axis(a: *mut mlx_array, indices: *mut mlx_array, axis: i32) -> *mut mlx_array;
     pub fn mlx_slice(
@@ -166,8 +155,6 @@ unsafe extern "C" {
         vocab: i32,
     ) -> *mut mlx_array;
 
-    // === Reduction ===
-
     pub fn mlx_sum_axis(a: *mut mlx_array, axis: i32, keepdims: bool) -> *mut mlx_array;
     pub fn mlx_mean_axis(a: *mut mlx_array, axis: i32, keepdims: bool) -> *mut mlx_array;
     pub fn mlx_max_axis(a: *mut mlx_array, axis: i32, keepdims: bool) -> *mut mlx_array;
@@ -175,8 +162,6 @@ unsafe extern "C" {
     pub fn mlx_softmax_axis(a: *mut mlx_array, axis: i32, precise: bool) -> *mut mlx_array;
     pub fn mlx_argmax(a: *mut mlx_array, keepdims: bool) -> *mut mlx_array;
     pub fn mlx_argmax_axis(a: *mut mlx_array, axis: i32, keepdims: bool) -> *mut mlx_array;
-
-    // === Quantized ===
 
     pub fn mlx_fused_quantized_gated_mlp(
         x: *mut mlx_array,
@@ -232,11 +217,7 @@ unsafe extern "C" {
         cols: i32,
     ) -> *mut mlx_array;
 
-    // === Contiguous ===
-
     pub fn mlx_contiguous(a: *mut mlx_array) -> *mut mlx_array;
-
-    // === Conv ===
 
     pub fn mlx_conv1d(
         input: *mut mlx_array,
@@ -246,8 +227,6 @@ unsafe extern "C" {
         dilation: i32,
         groups: i32,
     ) -> *mut mlx_array;
-
-    // === Fused ops ===
 
     /// g = exp(-exp(A_log) * softplus(alpha + dt_bias))
     /// Fuses 10 ops into 1 C++ call.
@@ -297,8 +276,6 @@ unsafe extern "C" {
         use_metal_kernel: i32,
         out_result: *mut *mut mlx_array,
     );
-
-    // === Compiled DFlash draft model ===
 
     pub fn dflash_draft_new() -> *mut std::ffi::c_void;
     pub fn dflash_draft_free(model: *mut std::ffi::c_void);
@@ -399,8 +376,6 @@ unsafe extern "C" {
         out_hidden: *mut *mut mlx_array,
         out_kv_caches: *mut *mut mlx_array,
     ) -> i32;
-
-    // === DiffusionGemma / Gemma4 block-diffusion model ===
 
     pub fn diffusion_gemma_new() -> *mut std::ffi::c_void;
     pub fn diffusion_gemma_free(model: *mut std::ffi::c_void);
@@ -637,7 +612,6 @@ unsafe extern "C" {
         out_finish: *mut i32,
     ) -> i32;
 
-    // === DeepSeek-OCR (deepseekocr / UnlimitedOCRForCausalLM) ===
     //
     // VLM with a DeepEncoder (SAM-base + CLIP-large + 16x conv compressor +
     // linear projector) and a DeepSeek-MoE decoder. Decoder weights are MXFP8
@@ -829,8 +803,6 @@ unsafe extern "C" {
         out_len: *mut i32,
         out_finish: *mut i32,
     ) -> i32;
-
-    // === Compiled Qwen3.5 model ===
 
     pub fn qwen35_compiled_new() -> *mut std::ffi::c_void;
     pub fn qwen35_compiled_free(model: *mut std::ffi::c_void);
@@ -1357,8 +1329,6 @@ unsafe extern "C" {
         n_stop_tokens: i32,
     ) -> i32;
 
-    // === Qwen3.6 MoE block ===
-
     /// Qwen3.5/3.6 SparseMoeBlock forward (Metal only).
     ///
     /// Composes MLX ops to reproduce `Qwen3NextSparseMoeBlock.__call__` in one
@@ -1414,8 +1384,6 @@ unsafe extern "C" {
         top_k: i32,
         norm_topk_prob: bool,
     ) -> *mut mlx_array;
-
-    // === Fast ops ===
 
     /// RMS normalization. Pass null for weight to use no learnable weight.
     pub fn mlx_fast_rms_norm(x: *mut mlx_array, weight: *mut mlx_array, eps: f32)
@@ -1488,8 +1456,6 @@ unsafe extern "C" {
         gqa_factor: i32,
     ) -> *mut mlx_array;
 
-    // === Qwen3.5 DFlash support ===
-
     pub fn qwen35_set_tape_mode(model: *mut std::ffi::c_void, enabled: bool);
     pub fn qwen35_get_tape_count(model: *mut std::ffi::c_void) -> i32;
     pub fn qwen35_get_tape(
@@ -1521,16 +1487,10 @@ unsafe extern "C" {
         out: *mut *mut mlx_array,
     ) -> i32;
 
-    // === Random ===
-
     pub fn mlx_random_categorical(logits: *mut mlx_array, axis: i32) -> *mut mlx_array;
-
-    // === Transforms ===
 
     pub fn mlx_eval(arrays: *mut *mut mlx_array, count: usize);
     pub fn mlx_async_eval(arrays: *mut *mut mlx_array, count: usize);
-
-    // === IO ===
 
     /// Load safetensors file. Returns count of loaded tensors.
     /// Names and arrays are written to out_names/out_arrays (caller must free via
@@ -1545,8 +1505,6 @@ unsafe extern "C" {
         arrays: *mut *mut mlx_array,
         count: i32,
     );
-
-    // === Metal kernel ===
 
     pub fn mlx_metal_kernel_new(
         name: *const std::ffi::c_char,
@@ -1575,8 +1533,6 @@ unsafe extern "C" {
         n_int_templates: usize,
         n_dtype_templates: usize,
     );
-
-    // === Memory management ===
 
     /// Current active MLX allocator memory in bytes.
     pub fn mlx_get_active_memory() -> usize;

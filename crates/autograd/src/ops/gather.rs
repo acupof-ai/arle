@@ -15,12 +15,12 @@ pub fn gather_last_dim(
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
-    // M5.3b.9: dispatch on device-handle presence (same gate as rope /
+    // Dispatch on device-handle presence (same gate as rope /
     // rmsnorm / embedding — `device_handle.is_some() && dirty != Host`).
     // `gather_last_dim` is the final op in the CE-loss path: logits come
     // straight out of the output matmul, so staying on-device through the
     // per-row gather keeps the entire forward lazy. Dirty::Host inputs
-    // take the eager host path for parity.
+    // take the eager host path.
     let has_device_handle = {
         let t = store.tensor(src)?;
         t.device_handle.is_some() && t.dirty != Dirty::Host
@@ -193,8 +193,8 @@ pub(crate) fn gather_last_dim_backward(
         });
     }
 
-    // Wave 1 (post-M5.3b nsys attribution): fast-path the backward when
-    // the upstream gradient is still device-resident. This keeps the
+    // Fast-path the backward when the upstream gradient is still
+    // device-resident. This keeps the
     // `[B, S, V]` grad on-device for `log_softmax_last_axis_backward`'s
     // upstream — the two backwards form the chain that nsys flagged as
     // the host-readback bottleneck. Only the int32 `indices` array

@@ -50,8 +50,6 @@ const PORT_SCAN_SPAN: u16 = 200;
 /// Max time to wait for the spawned serve to answer `/v1/models`.
 const SERVE_READY_TIMEOUT: Duration = Duration::from_secs(180);
 
-// ───────────────────────────── Agent config ─────────────────────────────
-
 /// ARLE's own agent preference, persisted at
 /// `${XDG_CONFIG_HOME:-$HOME/.config}/arle/agent.toml`.
 ///
@@ -171,8 +169,6 @@ fn agent_config_path() -> Option<PathBuf> {
     Some(base.join("arle").join("agent.toml"))
 }
 
-// ────────────────────────────── Launch mode ─────────────────────────────
-
 /// How to run Eli once the local model is serving.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EliMode {
@@ -198,8 +194,6 @@ impl EliMode {
         }
     }
 }
-
-// ────────────────────────────── Free port ───────────────────────────────
 
 /// Scan `[base, base+span)` for a TCP port that is currently free to bind on
 /// `127.0.0.1`. Returns the first free port, so "端口被占用" is handled by
@@ -227,8 +221,6 @@ pub(crate) fn find_free_port(base: u16, span: u16) -> Result<u16> {
 fn port_is_free(port: u16) -> bool {
     TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)).is_ok()
 }
-
-// ───────────────────────────── Eli binary ───────────────────────────────
 
 /// Locate the `eli` executable. Resolution order:
 /// 1. `$ELI_BIN` (explicit override),
@@ -293,8 +285,6 @@ fn sibling_eli_candidates() -> Vec<PathBuf> {
     out.push(PathBuf::from("../eli/target/release/eli")); // CWD-relative dev fallback
     out
 }
-
-// ──────────────────────────── Serve child ───────────────────────────────
 
 /// Owns the spawned `arle serve` child and guarantees it is killed on drop
 /// (Eli exit) or on SIGINT (the installed Ctrl-C handler flips `interrupted`).
@@ -419,8 +409,6 @@ fn parse_first_model_id(http_response: &str) -> Option<String> {
     Some(rest[..end].to_string())
 }
 
-// ───────────────────────────── Eli env ──────────────────────────────────
-
 /// The env var set that routes Eli at the local OpenAI-compatible endpoint.
 /// Pure function (no process env mutation) so it is unit-testable.
 pub(crate) fn eli_env(port: u16, served_id: &str) -> Vec<(String, String)> {
@@ -434,8 +422,6 @@ pub(crate) fn eli_env(port: u16, served_id: &str) -> Vec<(String, String)> {
         ("ELI_FALLBACK_MODELS".into(), String::new()),
     ]
 }
-
-// ───────────────────────────── Launch ───────────────────────────────────
 
 /// Serve `model` locally on a free port and hand the session to Eli.
 ///

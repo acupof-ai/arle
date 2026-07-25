@@ -26,16 +26,12 @@
 #include <cfloat>
 #include <cmath>
 
-// ─── Constants ───
-
 // Maximum supported head_dim (128 for Qwen3.5/Llama).
 #define TQ_MAX_HEAD_DIM 256
 
 // Maximum bits supported.
 #define TQ_MAX_BITS 4
 #define TQ_MAX_CENTROIDS (1 << TQ_MAX_BITS)  // 16
-
-// ─── Warp reduction helpers ───
 
 __device__ __forceinline__ float warp_reduce_sum(float val) {
     #pragma unroll
@@ -51,9 +47,7 @@ __device__ __forceinline__ float warp_reduce_max(float val) {
     return val;
 }
 
-// ============================================================================
 // Lloyd-Max codebook generation (host-side, called once at init)
-// ============================================================================
 
 // Beta((D-1)/2, (D-1)/2) PDF on [-1, 1], unnormalized.
 // For D=128: f(x) ∝ (1 - x²)^62
@@ -119,12 +113,10 @@ extern "C" void turboquant_lloyd_max(
     }
 }
 
-// ============================================================================
 // Generate random orthogonal rotation matrix via QR decomposition.
 //
 // Uses a simple seeded Gaussian → Householder QR on the host.
 // Output: Pi[D * D] stored in row-major order.
-// ============================================================================
 
 // Simple xoshiro256** PRNG for deterministic cross-platform rotation generation.
 static uint64_t tq_rotl(uint64_t x, int k) { return (x << k) | (x >> (64 - k)); }
@@ -262,7 +254,6 @@ extern "C" void turboquant_generate_rotation(
     delete[] A;
 }
 
-// ============================================================================
 // Kernel 1: TurboQuant Quantize KV
 //
 // BF16 KV → packed indices + f16 norm.
@@ -273,7 +264,6 @@ extern "C" void turboquant_generate_rotation(
 //
 // Grid:  (num_kv_heads, batch_size)
 // Block: (head_dim)   — one thread per coordinate
-// ============================================================================
 
 // Shared memory: rotation matrix tile (D floats) + reduction scratch.
 __global__ void turboquant_quantize_kernel(
@@ -294,11 +284,9 @@ __global__ void turboquant_quantize_kernel(
 
     if (d >= head_dim) return;
 
-    // ─── Step 1: Load bf16 value ───
     int src_offset = batch_idx * kv_dim + kv_head * head_dim + d;
     float x_val = __bfloat162float(kv_bf16[src_offset]);
 
-    // ─── Step 2: Compute ||x||_2 via shared memory reduction ───
     extern __shared__ float smem[];  // [head_dim] for reduction + [head_dim] for x_unit
     float* s_x = smem;
     float* s_norm = smem + head_dim;

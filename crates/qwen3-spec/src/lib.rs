@@ -94,9 +94,6 @@ impl Qwen3LayerTensorNames {
 /// Long-context RoPE scaling config (HF transformers / SGLang
 /// `rope_scaling` schema). `None` ⇒ vanilla RoPE with `rope_theta` base.
 /// Applied during `precompute_rope` to extend native context window.
-///
-/// Phase 1a:config 接인 only;
-/// inv_freq compute integration (Phase 1b-2) is the codex-pickup work.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RopeScalingConfig {
@@ -137,10 +134,6 @@ fn default_yarn_mscale() -> f32 {
 /// (scaling = None) reproduces the standard
 /// `inv_freq[i] = 1.0 / base.powf(2*i / head_dim)` formula used by all
 /// Qwen3-family models pre-2026-05.
-///
-/// Phase 1b of M_rope-yarn-scaling: pure-function inv_freq compute is
-/// independent of CUDA / Metal precompute_rope path. Phase 2 (codex
-/// pickup) wires this into `weight_loader.rs::precompute_rope`.
 pub fn compute_scaled_inv_freq(
     head_dim: usize,
     base: f32,
@@ -829,7 +822,7 @@ mod tests {
 
     #[test]
     fn vanilla_inv_freq_matches_legacy_formula() {
-        // Phase 1b sanity: scaling=None must reproduce the existing
+        // scaling=None must reproduce the existing
         // weight_loader.rs::precompute_rope inv_freq exactly.
         let head_dim = 128;
         let base = 1_000_000.0_f32;
@@ -980,10 +973,9 @@ mod tests {
 
     #[test]
     fn end_to_end_yarn_parsed_config_drives_scaled_inv_freq() {
-        // Phase 1c integration: prove that JSON config with rope_scaling
+        // Prove that JSON config with rope_scaling
         // round-trips through Qwen3Config and drives compute_scaled_inv_freq
-        // correctly (i.e., M_rope-yarn-scaling Phase 1+2 chain works end-to-end
-        // without separate manual RopeScalingConfig construction).
+        // correctly (without separate manual RopeScalingConfig construction).
         let cfg = Qwen3Config::from_json_str(
             r#"{
                 "hidden_size": 2560,

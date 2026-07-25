@@ -1269,7 +1269,6 @@ array gguf_embedding_cpp(
 
 extern "C" {
 
-// === Error handling ===
 
 const char* mlx_last_error() {
     return g_mlx_last_error.empty() ? nullptr : g_mlx_last_error.c_str();
@@ -1283,7 +1282,6 @@ int32_t mlx_metal_nax_available() {
     MLX_TRY_RETURN_VALUE(-1, metal::is_nax_available() ? 1 : 0);
 }
 
-// === Array lifecycle ===
 
 mlx_array* mlx_array_new_float32(float val) {
     MLX_TRY_RETURN(from_arr(array(val)));
@@ -1374,7 +1372,6 @@ size_t mlx_array_export_bytes(mlx_array* a, void* out, size_t out_len) {
     }());
 }
 
-// === Binary ops ===
 
 mlx_array* mlx_add(mlx_array* a, mlx_array* b) {
     MLX_TRY_RETURN(from_arr(add(*to_arr(a), *to_arr(b))));
@@ -1501,7 +1498,6 @@ mlx_array* mlx_gather_axis1_i32(mlx_array* values, mlx_array* indices) {
     }());
 }
 
-// === Unary ops ===
 
 mlx_array* mlx_exp(mlx_array* a) {
     MLX_TRY_RETURN(from_arr(exp(*to_arr(a))));
@@ -1539,7 +1535,6 @@ mlx_array* mlx_log(mlx_array* a) {
     MLX_TRY_RETURN(from_arr(log(*to_arr(a))));
 }
 
-// === Shape ops ===
 
 mlx_array* mlx_reshape(mlx_array* a, const int32_t* shape, size_t ndim) {
     MLX_TRY_RETURN([&]() {
@@ -1581,7 +1576,6 @@ mlx_array* mlx_zeros(const int32_t* shape, size_t ndim, int32_t dtype) {
     }());
 }
 
-// === Indexing ===
 
 mlx_array* mlx_take_axis(mlx_array* a, mlx_array* indices, int32_t axis) {
     MLX_TRY_RETURN(from_arr(take(*to_arr(a), *to_arr(indices), static_cast<int>(axis))));
@@ -1666,7 +1660,6 @@ mlx_array* mlx_scatter_add_rows_f32(const float* updates_data,
     }());
 }
 
-// === Reduction ===
 
 mlx_array* mlx_sum_axis(mlx_array* a, int32_t axis, bool keepdims) {
     MLX_TRY_RETURN(from_arr(sum(*to_arr(a), static_cast<int>(axis), keepdims)));
@@ -1696,7 +1689,6 @@ mlx_array* mlx_argmax_axis(mlx_array* a, int axis, bool keepdims) {
     MLX_TRY_RETURN(from_arr(argmax(*to_arr(a), axis, keepdims)));
 }
 
-// === Quantized ===
 
 mlx_array* mlx_quantized_matmul(mlx_array* x, mlx_array* w, mlx_array* scales,
                                 mlx_array* biases, bool transpose,
@@ -1774,7 +1766,6 @@ mlx_array* mlx_gguf_embedding(
         *to_arr(ids), *to_arr(w), format, rows, cols)));
 }
 
-// === Fast ops ===
 
 mlx_array* mlx_fast_rms_norm(mlx_array* x, mlx_array* weight, float eps) {
     MLX_TRY_RETURN([&]() {
@@ -2051,13 +2042,11 @@ mlx_array* mlx_batched_sdpa_2pass(
     )));
 }
 
-// === Random ===
 
 mlx_array* mlx_random_categorical(mlx_array* logits, int32_t axis) {
     MLX_TRY_RETURN(from_arr(random::categorical(*to_arr(logits), static_cast<int>(axis))));
 }
 
-// === Transforms ===
 
 void mlx_eval(mlx_array** arrays, size_t count) {
     try {
@@ -2111,7 +2100,6 @@ void mlx_async_eval(mlx_array** arrays, size_t count) {
     }
 }
 
-// === IO ===
 
 int32_t mlx_load_safetensors(const char* path,
                              const char*** out_names,
@@ -2159,13 +2147,11 @@ void mlx_free_loaded_tensors(const char** names, mlx_array** arrays, int32_t cou
     delete[] arrays;
 }
 
-// === Contiguous ===
 
 mlx_array* mlx_contiguous(mlx_array* a) {
     MLX_TRY_RETURN(from_arr(contiguous(*to_arr(a))));
 }
 
-// === Conv1d ===
 
 mlx_array* mlx_conv1d(mlx_array* input, mlx_array* weight,
                       int32_t stride, int32_t padding,
@@ -2174,7 +2160,6 @@ mlx_array* mlx_conv1d(mlx_array* input, mlx_array* weight,
                                    stride, padding, dilation, groups)));
 }
 
-// === Fused compute_g ===
 // g = exp(-exp(A_log) * softplus(alpha + dt_bias))
 // Fuses 10 ops into 1 C++ call (no heap allocs for intermediates).
 
@@ -2196,7 +2181,6 @@ struct mlx_metal_kernel {
     std::string header;
 };
 
-// === Fused GDR layer forward ===
 // Full GDR linear attention decode step in C++ — eliminates ~40 FFI calls per layer.
 // Matches mlx_lm's GatedDeltaNet.__call__ for decode (T=1).
 
@@ -2356,7 +2340,6 @@ void mlx_gdr_layer_forward(
     }
 }
 
-// === Metal kernel ===
 
 void* mlx_metal_kernel_new(const char* name,
                            const char** input_names, size_t n_inputs,
@@ -2456,7 +2439,6 @@ void mlx_metal_kernel_apply(void* kernel,
     }
 }
 
-// === Memory management ===
 
 /// Current active MLX allocator memory in bytes.
 size_t mlx_get_active_memory() {

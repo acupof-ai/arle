@@ -1235,7 +1235,7 @@ pub fn cpu_transpose_swap(
 /// `old_shape`) whose per-axis coordinate is in `[starts[i], ends[i])`.
 /// Returns `(sliced_data, new_shape)` with `new_shape[i] = ends[i] - starts[i]`.
 /// Used by the `Backend::slice` default fallback so device-default and host
-/// paths share one numerical reference. M5.3b.16.
+/// paths share one numerical reference.
 pub fn cpu_slice(
     data: &[f32],
     old_shape: &[usize],

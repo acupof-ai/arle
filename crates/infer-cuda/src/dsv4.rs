@@ -2669,8 +2669,8 @@ impl Dsv4Model {
         // the big layers or wasted budget on the small ones). NOT covered by
         // the per-slot reservation above. Pod-verified 2026-07-06: without
         // this check, a `max_seq_len` that clears `affordable > 0` can still
-        // be too large for the pool's own band, and the mismatch previously
-        // surfaced as a hard `ensure!` panic in `kv_layout.rs` that crashes
+        // be too large for the pool's own band, and the mismatch
+        // surfaces as a hard `ensure!` panic in `kv_layout.rs` that crashes
         // every worker rank instead of this same clean startup rejection.
         let flashmla_page_bytes = self
             .kv_arena
@@ -3546,7 +3546,7 @@ impl Dsv4Model {
         // fused inside the single `mla_attention_prepare_compressed_only` call, so
         // writes vs gemm-gather are NOT separable without touching the callee) vs
         // the ONE batched `csa_select_official_batched` READ (logits + topk). These
-        // two sum ≈ compidx_ms + the previously-untimed batched read. Only touched
+        // two sum ≈ compidx_ms + the batched read. Only touched
         // when phase_time.
         let (mut perrow_ms, mut batchedread_ms) = (0f64, 0f64);
 
