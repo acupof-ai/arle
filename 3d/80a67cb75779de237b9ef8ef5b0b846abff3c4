@@ -1,0 +1,41 @@
+crates/autograd/src/lib.rs
+  s_44e90edf230702::t_368d645585f200 22
+crates/autograd/src/runtime_flags.rs
+  s_35061a5e9bf0d9::t_d5a541ca3be558 5-20,43-44,59,73,85,119-127
+crates/cli/src/args.rs
+  s_cd9a6a56daabe3::t_3ee9839b4a2ee1 1096-1100,1136-1143,1171-1174
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "3d80a67cb75779de237b9ef8ef5b0b846abff3c4",
+  "prompts": {},
+  "sessions": {
+    "s_35061a5e9bf0d9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a6c41b95ad37dd1e6",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_44e90edf230702": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "585a4f62-ee7f-45e9-8947-d992463c772d",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_cd9a6a56daabe3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "bf8ec25a-c05e-46a4-b093-1e67694ece0c",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
