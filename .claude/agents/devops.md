@@ -22,10 +22,14 @@ truth; the pod is a build copy. Be terse; report the measured result, not a play
   `dd iflag=direct`: 1/4/16 streams all land 0.19–0.23 GB/s). So a COLD
   DSv4-Flash boot spends **25 min** reading 274 GB before engine-ready; a warm
   page cache makes it 90 s. RAM is 1.9 TB, so the whole model stays cached once
-  read. **Kick the warm off in the background at the START of a session** —
-  `~/bin/pod "nohup sh -c 'cat /host/DeepSeek-V4-Flash-FP8/*.safetensors >/dev/null' >/dev/null 2>&1 &"`
-  — so it overlaps sync+build instead of blocking your first serve, and keep one
-  serve alive between experiments instead of re-booting it.
+  read. **Pin it at the START of a session** and the boot cost is paid once per
+  box uptime, not once per serve:
+  `~/bin/pod "setsid nohup python3 /host/pin_model_cache.py /host/DeepSeek-V4-Flash-FP8 > /host/pin-model-cache.log 2>&1 < /dev/null &"`
+  (`scripts/pin_model_cache.py`, `tn push` it once). Measured 2026-07-25: 294 GB
+  `VmLck`, survives `drop_caches=3` intact, and a full re-read right after that
+  drop runs at **7.7 GB/s / 38 s** instead of 0.19 GB/s / 25 min. Check with
+  `grep Mlocked /proc/meminfo`; it dies with the container, so re-run after any
+  pod restart.
 
 ## The flow — `scripts/pod.sh` (run these from the repo root)
 - `scripts/pod.sh push-scripts` — deploy pod-side helpers (once / after editing them).
