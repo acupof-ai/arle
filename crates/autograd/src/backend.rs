@@ -484,6 +484,17 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         ))
     }
 
+    /// Re-store a frozen f32 handle as bf16 (`--tape-precision bf16`); consumers
+    /// widen on read. Only sound for frozen leaves. Default passthrough; CUDA overrides.
+    fn quantize_frozen_to_bf16(
+        &self,
+        handle: &DeviceHandle,
+        shape: &[usize],
+    ) -> Result<DeviceHandle> {
+        let _ = shape;
+        Ok(handle.clone())
+    }
+
     /// Import a frozen FP8 block-scaled base weight as a NON-OWNING device view
     /// over buffers owned by a foreign allocator (the infer-cuda rollout/eval
     /// engine's resident base `DeviceMatrix`), for the `--share-frozen-base`
