@@ -564,11 +564,11 @@ mod gpu {
             out.seq_len
         );
 
-        // ── 1. Router gemm → logits[T, E] (token-major). ────────────────────
+        // Router gemm → logits[T, E] (token-major).
         let logits = scratch.logits.get(ctx, num_experts, num_tokens)?;
         gemm_batch(ctx, &weights.router_gate, normed, logits)?;
 
-        // ── 2. Route: DEVICE kernel (default) or host reference fallback. ───
+        // Route: DEVICE kernel (default) or host reference fallback.
         let total_routes = num_tokens * topk;
         // The device kernel implements greedy top-k (zero selection bias) with
         // no group-limited masking; any other routing config falls back to the
@@ -656,7 +656,7 @@ mod gpu {
         let route_indices_ptr = cache_ptr(route_indices, ctx);
         let route_weights_ptr = cache_ptr(route_weights, ctx);
 
-        // ── 3. Per-expert route counts (LOCAL experts only). ────────────────
+        // Per-expert route counts (LOCAL experts only).
         // Kernels write these through raw device pointers, so no Rust `mut`.
         // counts MUST be zeroed every call (atomicAdd accumulator).
         let counts_ptr = cache_ptr(scratch.counts.get_zeroed(ctx, local_experts)?, ctx);
@@ -674,7 +674,7 @@ mod gpu {
         }
 
         if use_deepgemm {
-            // ── 4-8 (DeepGEMM): aligned/banded pack → SM90 BF16 m-grouped
+            // DeepGEMM: aligned/banded pack → SM90 BF16 m-grouped
             // GEMMs → scatter/combine. Fills `out` exactly like step 8.
             deepgemm_routed_tail(
                 ctx,
@@ -691,7 +691,7 @@ mod gpu {
             return add_shared_expert_gated(ctx, weights, normed, scratch, out);
         }
 
-        // ── 3b. Group offsets for the hand path (compact exclusive scan).
+        // Group offsets for the hand path (compact exclusive scan).
         // offsets and scan_total are fully written by the scan before any read.
         let offsets = scratch.offsets.get(ctx, local_experts)?;
         let scan_total = scratch.scan_total.get(ctx, 1)?;
@@ -706,7 +706,7 @@ mod gpu {
             )?;
         }
 
-        // ── 4. Pack routed tokens grouped-by-expert (with route slots). ─────
+        // Pack routed tokens grouped-by-expert (with route slots).
         // Single-GPU packs every one of the `total_routes` slots exactly once
         // (offsets + cursors partition `[0, R)`), so the reused buffers need no
         // re-init. Under EP only routes hitting LOCAL experts get packed, so
@@ -756,7 +756,7 @@ mod gpu {
             .expert_indices
             .upload_const(ctx, &expert_index_table)?;
 
-        // ── 5-7 shape resolution. Grouped-mode loads carry shapes on the
+        // Shape resolution. Grouped-mode loads carry shapes on the
         // group (per-expert Vecs are cleared); concat already enforced
         // uniformity + the same [n, k] slab layout the ptr tables expose.
         let moe_inter = match (
@@ -858,7 +858,7 @@ mod gpu {
             None
         };
 
-        // ── 5+6. Gate+up GEMM + SwiGLU (UNCLAMPED — Qwen3.6 has no clamp). ──
+        // Gate+up GEMM + SwiGLU (UNCLAMPED — Qwen3.6 has no clamp).
         // act rows are written within `offsets/counts` (decode path) or fully
         // (batch path's silu_mul); under EP the act tail past the local route
         // count is stale either way, and nothing reads it (both down GEMMs
@@ -937,7 +937,7 @@ mod gpu {
             silu_mul(ctx, gate_out, up_out, act)?;
         }
 
-        // ── 7. Grouped down GEMM → expert_out[R, H]. ────────────────────────
+        // Grouped down GEMM → expert_out[R, H].
         let expert_out = scratch.expert_out.get(ctx, hidden_dim, total_routes)?;
         if use_bf16_decode_kernels {
             // SAFETY: down weight table + act/expert_out valid on ctx.stream;
@@ -995,7 +995,7 @@ mod gpu {
             }
         }
 
-        // ── 8. Scatter weighted expert outputs to route slots, combine topk. ─
+        // Scatter weighted expert outputs to route slots, combine topk.
         // route_out[slot] = weight · expert_out[slot]; combine sums over topk.
         // Single-GPU the scatter writes ALL `total_routes` slots (route↔slot
         // bijection), so reuse needs no re-init; under EP the unwritten
@@ -1030,7 +1030,7 @@ mod gpu {
             )?;
         }
 
-        // ── 9. Shared expert: dense SwiGLU · sigmoid(x @ shared_gate_router).
+        // Shared expert: dense SwiGLU · sigmoid(x @ shared_gate_router).
         add_shared_expert_gated(ctx, weights, normed, scratch, out)
     }
 
@@ -1218,7 +1218,7 @@ mod gpu {
             "DeepGEMM MoE padded rows {rows} x max(H={hidden_dim}, I={moe_inter_for_abi}) exceeds the i32 kernel ABI"
         );
 
-        // ── 4 (DG). Pack routed tokens + pad-row sentinels. ─────────────────
+        // DG: Pack routed tokens + pad-row sentinels.
         // packed_route_slot MUST be -1-refilled every call even single-GPU:
         // the pack writes only the R real rows, and every PAD row has to read
         // -1 so the scatter skips it (pad GEMM outputs are garbage — masked
@@ -1555,7 +1555,7 @@ mod gpu {
         })?;
         let moe_inter = gate_g.rows;
 
-        // ── 5+6+7 (DG). gate GEMM + up GEMM → silu_mul → down GEMM. ─────────
+        // DG: gate GEMM + up GEMM → silu_mul → down GEMM.
         // Heuristics-only hint: expected valid rows per group.
         let expected_m = total_routes.div_ceil(local_experts).max(1);
         let gate_out = scratch.gate_out.get(ctx, moe_inter, rows)?;
@@ -1644,7 +1644,7 @@ mod gpu {
             },
         )?;
 
-        // ── 8 (DG). Scatter weighted expert rows to route slots, combine. ───
+        // DG: Scatter weighted expert rows to route slots, combine.
         // The scatter walks ALL `rows` padded rows and skips route_slot < 0,
         // so exactly the R real rows land in route_out. Single-GPU that is a
         // route↔slot bijection (all experts local → all R slots written);
@@ -3024,7 +3024,7 @@ mod dsv4_gpu {
         // Fail loud if the native DeepGEMM bridge is a build-time stub.
         moe::dsv4_deepgemm_native_preflight()?;
 
-        // ── 1+2. Router gemm → logits[T, E] → route on device. ───────────────
+        // Router gemm → logits[T, E] → route on device.
         let (route_indices, route_weights) =
             crate::stage_profile::profile(ctx, "dsv4/stage/moe_route", || -> Result<_> {
                 let _nvtx = crate::nvtx::range("dsv4/moe_route");
@@ -3455,7 +3455,7 @@ mod dsv4_gpu {
                 );
             }
         }
-        // ── 3. Per-local-expert counts → group offsets (EP-aware start/range). ──
+        // Per-local-expert counts → group offsets (EP-aware start/range).
         let counts = ctx
             .stream
             .alloc_zeros::<i32>(experts_per_rank)
@@ -3500,7 +3500,7 @@ mod dsv4_gpu {
             )?;
         }
 
-        // ── 4. Pack routed tokens grouped-by-local-expert (aligned rows). ──────
+        // Pack routed tokens grouped-by-local-expert (aligned rows).
         let packed_rows =
             deepgemm_contig_rows_cap(total_routes.max(1), experts_per_rank, contig_align);
         let packed_hidden = HiddenStates::zeros(ctx, hidden_dim, packed_rows)?;
@@ -3542,7 +3542,7 @@ mod dsv4_gpu {
             )?;
         }
 
-        // ── 5. FP8 DeepGEMM 5-call grouped expert pipeline → aligned rows. ─────
+        // FP8 DeepGEMM 5-call grouped expert pipeline → aligned rows.
         let intermediate = layer.intermediate;
         ensure!(
             hidden_dim.is_multiple_of(128) && intermediate.is_multiple_of(128),
@@ -3580,7 +3580,7 @@ mod dsv4_gpu {
         };
         keepalive.keep_hidden(&expert_out);
 
-        // ── 6. Scatter weighted expert outputs to route slots, combine topk. ────
+        // Scatter weighted expert outputs to route slots, combine topk.
         let nvtx_combine = crate::nvtx::range("dsv4/combine_scatter");
         let route_out = HiddenStates::zeros(ctx, hidden_dim, total_routes.max(1))?;
         keepalive.keep_hidden(&route_out);

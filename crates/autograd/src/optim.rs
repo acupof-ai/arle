@@ -418,11 +418,9 @@ impl AdamW {
         removed
     }
 
-    // ------------------------------------------------------------------
     // Accessors used by the opaque state codec in `adamw_state.rs`.
     // They deliberately avoid exposing the private `ParamMoments` struct.
     // Device-resident moments readback through the stored backend.
-    // ------------------------------------------------------------------
 
     /// Materialize `(m, v)` as owned host vectors for the caller, regardless
     /// of whether the moments are currently host- or device-resident.

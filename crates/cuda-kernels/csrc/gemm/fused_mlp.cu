@@ -1,11 +1,9 @@
 #include "common.cuh"
 
-// ============================================================================
 // Phase 1: Gate + Up projection (interleaved) → SiLU activation
 // Computes act[i] = silu(gate_proj[i] @ x) * (up_proj[i] @ x)
 // BF16×4 vectorized loads, warp shuffle reduction.
 // Gate and up share the same x vector — read x once per pass.
-// ============================================================================
 #define FUSED_MLP_TILE 256
 #define FUSED_MLP_INTER_PER_BLOCK 4
 #define MLP_NUM_WARPS (FUSED_MLP_TILE / WARP_SIZE)
@@ -71,7 +69,6 @@ __global__ void fused_mlp_intermediate_kernel(
       u_sum += __bfloat162float(u_hi.y) * __bfloat162float(x_hi.y);
     }
 
-    // Scalar tail
     if (K_tail > 0) {
       const __nv_bfloat16 *gate_row = gate_proj + inter_idx * hidden_size;
       const __nv_bfloat16 *up_row = up_proj + inter_idx * hidden_size;
@@ -87,14 +84,12 @@ __global__ void fused_mlp_intermediate_kernel(
     up_sums[r] = u_sum;
   }
 
-  // Warp-level reduction
   #pragma unroll
   for (int r = 0; r < FUSED_MLP_INTER_PER_BLOCK; r++) {
     gate_sums[r] = warp_reduce_sum(gate_sums[r]);
     up_sums[r] = warp_reduce_sum(up_sums[r]);
   }
 
-  // Inter-warp reduction via shared memory
   __shared__ float warp_gate[FUSED_MLP_INTER_PER_BLOCK][MLP_NUM_WARPS];
   __shared__ float warp_up[FUSED_MLP_INTER_PER_BLOCK][MLP_NUM_WARPS];
 
@@ -107,7 +102,6 @@ __global__ void fused_mlp_intermediate_kernel(
   }
   __syncthreads();
 
-  // First warp reduces across all warps and writes activation
   if (warp_id == 0) {
     #pragma unroll
     for (int r = 0; r < FUSED_MLP_INTER_PER_BLOCK; r++) {
@@ -133,12 +127,10 @@ __global__ void fused_mlp_intermediate_kernel(
   }
 }
 
-// ============================================================================
 // Phase 2: Down projection — out = down_proj @ act
 // Register accumulation across all K (single final reduction).
 // BF16×4 vectorized loads, warp shuffle reduction.
 // OUT_PER_BLOCK=8: each block processes 8 output rows.
-// ============================================================================
 #define FUSED_MLP_OUT_PER_BLOCK 8
 
 __global__ void fused_mlp_output_kernel(
@@ -186,7 +178,6 @@ __global__ void fused_mlp_output_kernel(
       sum += __bfloat162float(d_hi.y) * __bfloat162float(a_hi.y);
     }
 
-    // Scalar tail
     if (K_tail > 0) {
       const __nv_bfloat16 *dp_row = down_proj + row * intermediate_size;
       int k_start = K4 * 4;
@@ -198,13 +189,11 @@ __global__ void fused_mlp_output_kernel(
     acc[r] = sum;
   }
 
-  // Warp-level reduction
   #pragma unroll
   for (int r = 0; r < FUSED_MLP_OUT_PER_BLOCK; r++) {
     acc[r] = warp_reduce_sum(acc[r]);
   }
 
-  // Inter-warp reduction via shared memory
   __shared__ float warp_sums[FUSED_MLP_OUT_PER_BLOCK][MLP_NUM_WARPS];
 
   if (lane_id == 0) {
@@ -215,7 +204,6 @@ __global__ void fused_mlp_output_kernel(
   }
   __syncthreads();
 
-  // First warp reduces across all warps and writes output
   if (warp_id == 0) {
     #pragma unroll
     for (int r = 0; r < FUSED_MLP_OUT_PER_BLOCK; r++) {

@@ -186,10 +186,6 @@ impl BuiltinToolKind {
     }
 }
 
-// ============================================================================
-// Sandbox configuration
-// ============================================================================
-
 struct SandboxConfig {
     timeout_secs: u64,
     max_memory_mb: u64,
@@ -496,10 +492,6 @@ impl SandboxConfig {
     }
 }
 
-// ============================================================================
-// Tool definition
-// ============================================================================
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Tool {
     pub name: String,
@@ -524,10 +516,6 @@ pub fn builtin_tools() -> Vec<Tool> {
         .map(BuiltinToolKind::into_tool)
         .collect()
 }
-
-// ============================================================================
-// Builtin tool policy hooks
-// ============================================================================
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct BuiltinToolPolicyHooks;
@@ -889,10 +877,6 @@ fn asks_for_exact_scalar_output(user_input: &str) -> bool {
     .iter()
     .any(|needle| lower.contains(needle))
 }
-
-// ============================================================================
-// Tool execution
-// ============================================================================
 
 fn argument_as_str<'a>(arguments: &'a Value, key: &str) -> &'a str {
     arguments.get(key).and_then(Value::as_str).unwrap_or("")

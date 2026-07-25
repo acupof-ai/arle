@@ -902,9 +902,9 @@ impl TensorStore {
         // Wave 1 (post-M5.3b nsys attribution): preserve the device
         // handle on `Dirty::Device` tensors so the post-backward grad map
         // doesn't force a host readback for tensors that subsequent
-        // backward ops will consume on-device. Pre-Wave-1 this always
-        // called `ensure_host`, which on the `[B, S, V] ≈ 1 GB`
-        // log_softmax grad triggered the same readback the pre-backward
+        // backward ops will consume on-device. A plain `ensure_host` here
+        // would, on the `[B, S, V] ≈ 1 GB`
+        // log_softmax grad, trigger the same readback the pre-backward
         // flush used to. The device-aware backward overrides on `CudaBackend`
         // (and the dispatchers in `ops::softmax::log_softmax_backward` /
         // `ops::gather::gather_last_dim_backward`) keep the chain

@@ -191,8 +191,8 @@ impl Dsv4FlashMlaDecodeState {
         let num_sm_parts_max = (num_sm_parts as usize).max(256);
 
         // SCRATCH buffers (`sw_bulk_*`/`one_*`/`comp_*`/`indices`/`lse_*`/`o_accum`/
-        // `tp_*`) are NO LONGER allocated here — they live in the model-wide
-        // [`Dsv4FlashMlaDecodeScratch`] (#85 P3). Only the slot-shape constants +
+        // `tp_*`) are not allocated here — they live in the model-wide
+        // [`Dsv4FlashMlaDecodeScratch`] (#85). Only the slot-shape constants +
         // CONSTANT-after-init scheduler metadata remain per (slot, layer).
         let mut state = Self {
             slot_idx,

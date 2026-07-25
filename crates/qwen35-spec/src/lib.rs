@@ -132,8 +132,7 @@ pub struct Qwen35MtpTensorNames {
 ///     `{mlp}.experts.down_proj` `[E, hidden, moe_inter]`. Both are HF
 ///     `nn.Parameter`s, stored WITHOUT a `.weight` suffix — verified against
 ///     the production Qwen3.6-35B-A3B safetensors index (BF16, E=256,
-///     moe_inter=512, hidden=2048; gate-first row order proven e2e in
-///     `wins/2026-05-30-qwen36-moe-cuda-e2e-h20-real-model.md`).
+///     moe_inter=512, hidden=2048; gate-first row order proven e2e).
 ///
 /// The legacy mlx-lm `switch_mlp.*` stacked convention is NOT part of this
 /// contract (loaders reject it loudly).
@@ -451,7 +450,7 @@ struct TextConfig {
     #[serde(default)]
     seq_length: Option<usize>,
 
-    // ── Mixture-of-Experts fields (Qwen3.6 / Qwen3_5_Moe). ─────────────────
+    // Mixture-of-Experts fields (Qwen3.6 / Qwen3_5_Moe).
     // Accepted both flat inside `text_config` (Qwen3.6 HF layout) and nested
     // under a `moe_config` sub-block. When both are present the nested values
     // are merged on top of the flat ones (any non-default nested field wins).
@@ -641,7 +640,7 @@ pub struct Qwen35Config {
     pub rope_cache_len_hint: Option<usize>,
     pub layer_types: Vec<LayerType>,
 
-    // ── Mixture-of-Experts (Qwen3.6 / Qwen3_5_Moe). ────────────────────────
+    // Mixture-of-Experts (Qwen3.6 / Qwen3_5_Moe).
     // `num_experts == 0` means the model is dense (classic Qwen3.5). When
     // populated, these fields describe the `SparseMoeBlock` shape per the
     // mlx-lm `qwen3_5_moe.py` reference. See [`Qwen35Config::is_moe`] and
@@ -2112,9 +2111,7 @@ mod tests {
         assert!(config.is_stop_token(248_167));
     }
 
-    // ──────────────────────────── Phase 1b step 2 ─────────────────────────
-    // RoPE inv_freq + attention_factor compute helper tests
-    // (mirror of qwen3-spec; M_rope-yarn-scaling 2026-05-10)
+    // RoPE inv_freq + attention_factor compute helper tests (mirror of qwen3-spec).
 
     #[test]
     fn vanilla_inv_freq_matches_legacy_formula() {

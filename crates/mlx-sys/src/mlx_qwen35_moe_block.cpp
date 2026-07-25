@@ -299,12 +299,10 @@ array qwen35_moe_block_forward_cpp(
             "qwen35_moe_block_forward: hidden must have rank >= 2 (got rank < 2)");
     }
 
-    // ── Router ────────────────────────────────────────────────────────
     // gates: [..., E]
     auto gates = qmm(x, router_w, router_scales, router_biases, router_group_size, router_bits);
     gates = mlx::core::softmax(gates, /*axis=*/-1, /*precise=*/true);
 
-    // ── Top-k via argpartition + slice the last k of the last axis ────
     // argpartition places the k largest elements at positions [E-k, E).
     const int kth = num_experts - top_k;
     auto part = mlx::core::argpartition(gates, kth, /*axis=*/-1);
@@ -318,7 +316,6 @@ array qwen35_moe_block_forward_cpp(
     // stop[-1] already num_experts
     auto inds = mlx::core::slice(part, start, stop, strides);
 
-    // ── Gather scores and optional renormalization ────────────────────
     auto scores = mlx::core::take_along_axis(gates, inds, /*axis=*/-1);
     if (norm_topk_prob) {
         auto denom = mlx::core::sum(scores, /*axis=*/-1, /*keepdims=*/true);
@@ -331,7 +328,6 @@ array qwen35_moe_block_forward_cpp(
         scores = mlx::core::astype(scores, x.dtype());
     }
 
-    // ── Switch-MLP experts ───────────────────────────────────────────
     // y_switch: [..., top_k, H]
     auto y_switch = switch_glu_forward(
         x, inds,
@@ -345,7 +341,6 @@ array qwen35_moe_block_forward_cpp(
     auto y_weighted = mlx::core::multiply(y_switch, scores_bcast);
     auto y = mlx::core::sum(y_weighted, /*axis=*/-2, /*keepdims=*/false);
 
-    // ── Dense shared expert ──────────────────────────────────────────
     auto shared_y = quantized_swiglu(
         x,
         shared_gate_w, shared_gate_scales, shared_gate_biases,

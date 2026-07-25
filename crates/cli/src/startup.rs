@@ -37,15 +37,12 @@ pub(crate) fn resolve_model_interactive(args: &Args) -> Result<String> {
         return infer_util::hf_hub::resolve_model_source(args.model_path.as_deref());
     }
 
-    // ── Interactive startup ──────────────────────────────────────────────
     let info = hardware::detect_system();
     banner::print_startup_banner(&info);
 
-    // Discover locally available models.
     let local_snapshots = discover_local_snapshots();
     let local_models = local_models_from_snapshots(&local_snapshots);
 
-    // Get catalog recommendations.
     let recommended = model_catalog::recommend_models(&info);
 
     // If we found exactly one local model and nothing else makes sense,

@@ -1750,15 +1750,15 @@ impl Backend for CudaBackend {
         }
     }
 
-    /// Device-resident matmul backward — foundation for the post-G3
+    /// Device-resident matmul backward for the
     /// device-resident gradient tape. Mirrors the cuBLAS dispatch of the
     /// host-buffer `matmul_backward` (`grad_a = dC @ B^T`,
     /// `grad_b = A^T @ dC` via two SGEMMs with `OP_T` on the transposed
     /// operand) but consumes existing device handles and returns
     /// unevaluated `CudaSlice<f32>` outputs — no host roundtrip on either
     /// side. The terminal `backend.eval(...)` in `AdamW::step_device`
-    /// performs the single host fence per training step (M5.3b.11
-    /// batched-eval contract).
+    /// performs the single host fence per training step (batched-eval
+    /// contract).
     fn matmul_backward_device(
         &self,
         a: &DeviceHandle,
@@ -1945,9 +1945,9 @@ impl Backend for CudaBackend {
         }
     }
 
-    /// P3: device-resident backward for `mul_scalar`. Pure elementwise
+    /// Device-resident backward for `mul_scalar`. Pure elementwise
     /// `grad_x[i] = upstream[i] * k` via a 1D NVRTC kernel; returns an
-    /// unevaluated handle per the M5.3b.11 batched-eval contract.
+    /// unevaluated handle per the batched-eval contract.
     fn mul_scalar_backward_device(
         &self,
         upstream_grad: &DeviceHandle,
@@ -1968,7 +1968,7 @@ impl Backend for CudaBackend {
         }
     }
 
-    /// P3: device-resident backward for `mean`. Scalar `upstream_grad`
+    /// Device-resident backward for `mean`. Scalar `upstream_grad`
     /// (rank-0 device handle) broadcast-divided by `elem_count` across
     /// `output_shape`. Returns an unevaluated handle.
     fn mean_backward_device(
@@ -2032,7 +2032,7 @@ impl Backend for CudaBackend {
         }
     }
 
-    /// M5.3b: device-resident row-wise softmax over the last axis. The
+    /// Device-resident row-wise softmax over the last axis. The
     /// default trait implementation falls back to
     /// `readback → host compute → upload`, which on production shapes
     /// (`[B, S, V] = 2 × 512 × 248070 × 4 B ≈ 1 GB`) dominates per-step
@@ -2054,7 +2054,7 @@ impl Backend for CudaBackend {
         }
     }
 
-    /// M5.3b: device-resident row-wise log-softmax over the last axis.
+    /// Device-resident row-wise log-softmax over the last axis.
     /// Same rationale as `softmax_last_axis` (no host roundtrip; the
     /// existing `log_softmax_last_axis_f32` NVRTC kernel runs against
     /// the device-side slice in place).
@@ -2443,7 +2443,7 @@ impl Backend for CudaBackend {
         }
     }
 
-    /// M5.3b: device-resident gather along the last axis. Reuses the
+    /// Device-resident gather along the last axis. Reuses the
     /// existing `gather_last_dim_f32` NVRTC kernel against the
     /// device-side `src` slice, returning a fresh `CudaSlice<f32>` of
     /// length `product(src_shape[..-1])` without a host roundtrip. The
@@ -2468,13 +2468,13 @@ impl Backend for CudaBackend {
         }
     }
 
-    /// Wave 1 (post-M5.3b nsys attribution): device-resident backward for
+    /// Device-resident backward for
     /// `log_softmax_last_axis`. Consumes the saved forward output
     /// directly from its `DeviceHandle` (no DtoH) and the upstream gradient
     /// directly from device — kills the `1 015 MB` log_softmax-grad readback
     /// nsys identified as the single largest transfer per training step.
-    /// Returns an unevaluated `CudaSlice<f32>` handle per the M5.3b.11
-    /// batched-eval contract — `Tape::backward`'s terminal eval (or the
+    /// Returns an unevaluated `CudaSlice<f32>` handle per the batched-eval
+    /// contract — `Tape::backward`'s terminal eval (or the
     /// AdamW step) does the single host fence.
     fn log_softmax_last_axis_backward(
         &self,
@@ -2495,7 +2495,7 @@ impl Backend for CudaBackend {
         }
     }
 
-    /// Wave 1: device-resident backward for `gather_last_dim`. Produces a
+    /// Device-resident backward for `gather_last_dim`. Produces a
     /// zero-filled `[B, S, V]` (or any `src_shape`) grad on-device and
     /// writes the per-prefix upstream scalar at `(row, ids[row])` — one
     /// thread per prefix row, no atomics needed since indices across rows
@@ -2810,7 +2810,7 @@ impl Backend for CudaBackend {
         }
     }
 
-    /// Wave 2 Commit A: device-resident embedding backward.
+    /// Device-resident embedding backward.
     /// Allocates a zero-filled `[vocab, hidden]` grad on-device and
     /// atomicAdd-scatters the per-token-position upstream slice into
     /// `grad_table[ids[row], :]`. `atomicAdd` is mandatory for the
@@ -2836,7 +2836,7 @@ impl Backend for CudaBackend {
         }
     }
 
-    /// Wave 2 Commit A: device-resident add_broadcast backward.
+    /// Device-resident add_broadcast backward.
     /// Reduces the upstream `[a_shape]` tensor along broadcast axes into
     /// a `[b_shape]` grad via a per-output-element shared-memory block
     /// reduction. Mirrors the `add_broadcast` forward layout contract
@@ -2903,13 +2903,12 @@ impl Backend for CudaBackend {
         }
     }
 
-    /// Wave 2.0: device-grad fused AdamW. Same kernel as `adamw_step`
-    /// (`adamw_step_f32` from G3) but the gradient is sourced directly from
+    /// Device-grad fused AdamW. Same kernel as `adamw_step`
+    /// (`adamw_step_f32`) but the gradient is sourced directly from
     /// the caller's `DeviceHandle::Cuda` — **no `clone_htod`**. This kills
-    /// the per-param-per-grad-accum-step DtoH that Wave 2 Commit A
-    /// inadvertently introduced when `embedding_backward` /
-    /// `add_broadcast_backward` started producing device-resident grads.
-    /// See `docs/experience/wins/2026-05-17-bench-pretrain-wave2a-embedding-addbcast.md`.
+    /// the per-param-per-grad-accum-step DtoH incurred when
+    /// `embedding_backward` /
+    /// `add_broadcast_backward` produce device-resident grads.
     #[allow(clippy::too_many_arguments)]
     fn adamw_step_device(
         &self,
@@ -2942,7 +2941,7 @@ impl Backend for CudaBackend {
         }
     }
 
-    /// Wave 2.1: device-resident backward for `silu(x)`. Single 1D NVRTC
+    /// Device-resident backward for `silu(x)`. Single 1D NVRTC
     /// kernel `dx[i] = upstream[i] * silu'(x[i])`; both `upstream` and the
     /// saved input `x` stay on-device. Returned handle is unevaluated.
     fn silu_backward_device(
@@ -2962,7 +2961,7 @@ impl Backend for CudaBackend {
         }
     }
 
-    /// Wave 2.1: device-resident backward for `gelu(x)` (erf form).
+    /// Device-resident backward for `gelu(x)` (erf form).
     fn gelu_backward_device(
         &self,
         upstream: &DeviceHandle,
@@ -2980,7 +2979,7 @@ impl Backend for CudaBackend {
         }
     }
 
-    /// Wave 2.1: device-resident backward for `sigmoid(x)`. Consumes the
+    /// Device-resident backward for `sigmoid(x)`. Consumes the
     /// saved output `y`: `dx[i] = upstream[i] * y[i] * (1 - y[i])`.
     fn sigmoid_backward_device(
         &self,
@@ -2999,7 +2998,7 @@ impl Backend for CudaBackend {
         }
     }
 
-    /// Wave 2.1: device-resident backward for `exp(x)`. Consumes the saved
+    /// Device-resident backward for `exp(x)`. Consumes the saved
     /// output `y = exp(x)`: `dx[i] = upstream[i] * y[i]`.
     fn exp_backward_device(
         &self,
@@ -3018,7 +3017,7 @@ impl Backend for CudaBackend {
         }
     }
 
-    /// Wave 2.1: device-resident backward for `mul(a, b)`. Two 1D NVRTC
+    /// Device-resident backward for `mul(a, b)`. Two 1D NVRTC
     /// kernels — one per side — gated by `need_grad_a` / `need_grad_b`.
     fn mul_backward_device(
         &self,
@@ -3040,7 +3039,7 @@ impl Backend for CudaBackend {
         }
     }
 
-    /// Wave 2.1: device-resident backward for `rms_norm`. Three NVRTC
+    /// Device-resident backward for `rms_norm`. Three NVRTC
     /// kernels: per-row `inv_rms`, per-row `grad_x` with shared-mem `dot`
     /// reduction, per-col `grad_w` reduction.
     fn rms_norm_backward_device(
@@ -3075,7 +3074,7 @@ impl Backend for CudaBackend {
         }
     }
 
-    /// Wave 2.1: device-resident backward for `rope`. Single NVRTC kernel
+    /// Device-resident backward for `rope`. Single NVRTC kernel
     /// — same body as `rope_f32` with the `sin` sign inlined-negated.
     /// `cos`/`sin` are uploaded fresh (tiny: `[seq, head_dim/2]`).
     fn rope_backward_device(
@@ -3168,7 +3167,7 @@ fn cuda_adamw_step(
         },
     )?;
 
-    // Per the Backend::adamw_step eval contract (M5.3b.11): return
+    // Per the Backend::adamw_step eval contract : return
     // unevaluated handles. These are Arc clones of the same in-place
     // buffers, not fresh allocations.
     Ok((param.clone(), m.clone(), v.clone()))
@@ -3241,7 +3240,7 @@ fn cuda_adamw_step_device(
         },
     )?;
 
-    // Eval contract (M5.3b.11): return unevaluated; caller batches the
+    // Eval contract : return unevaluated; caller batches the
     // terminal `stream.synchronize()` for the whole optimizer step.
     Ok((param.clone(), m.clone(), v.clone()))
 }
@@ -3311,7 +3310,7 @@ fn cuda_softmax_like(
 // `CudaSlice<f32>` and returns a fresh `CudaSlice<f32>` instead of doing
 // `upload → kernel → readback`. No `synchronize()` — the caller owns the
 // terminal eval (Tape::backward / AdamW::step_device batched flush per the
-// M5.3b.11 contract). Reused for both `softmax_last_axis_f32` and
+// batched-eval contract). Reused for both `softmax_last_axis_f32` and
 // `log_softmax_last_axis_f32` (selected by `kernel_name`).
 #[cfg(not(feature = "no-cuda"))]
 fn cuda_softmax_like_device(
@@ -3435,11 +3434,11 @@ fn cuda_gather_last_dim_device(
     Ok(DeviceHandle::Cuda(CudaStorage::new(d_out)))
 }
 
-// Wave 1 (post-M5.3b nsys attribution): device-resident log_softmax
+// Device-resident log_softmax
 // backward. `upstream` and `log_softmax_output` arrive as borrowed CUDA
 // slices via the `Backend::log_softmax_last_axis_backward` contract; the
 // fresh grad allocation stays device-resident and is returned unevaluated
-// for the tape's terminal eval (mirrors the M5.3b forward helper pattern).
+// for the tape's terminal eval (mirrors the forward helper pattern).
 // Same 256-thread shared-mem reduce shape as `softmax_last_axis_f32`.
 #[cfg(not(feature = "no-cuda"))]
 fn cuda_log_softmax_last_axis_backward(
@@ -3563,7 +3562,7 @@ fn cuda_softmax_last_axis_backward(
     Ok(DeviceHandle::Cuda(CudaStorage::new(d_grad)))
 }
 
-// Wave 1: device-resident backward for gather_last_dim. Allocates a
+// Device-resident backward for gather_last_dim. Allocates a
 // zero-filled `[product(src_shape)]` grad on-device and scatters the
 // per-prefix upstream scalar into `(row, ids[row])`. Only the int32
 // `indices` array crosses PCIe; the `[prefix_rows]` upstream slice stays
@@ -5317,9 +5316,7 @@ fn cuda_matmul_backward(
 // `CudaSlice<f32>` handles via `cuda_slice` and emits the gradients as
 // fresh `CudaSlice<f32>` buffers wrapped in `DeviceHandle::Cuda`. No
 // `synchronize()` — the caller's terminal `eval` does the single host
-// fence per training step (M5.3b.11 contract). Foundation for the
-// post-G3 device-resident gradient tape; the dispatch wiring lands in a
-// follow-up subagent.
+// fence per training step (contract).
 #[cfg(not(feature = "no-cuda"))]
 #[allow(clippy::too_many_arguments)]
 fn cuda_matmul_backward_device(
@@ -5901,7 +5898,7 @@ fn cuda_causal_sdpa_recompute_backward_device(
     ))
 }
 
-// P3: device-resident backward for `mul_scalar(x, k)`. Reads
+// Device-resident backward for `mul_scalar(x, k)`. Reads
 // `upstream[i] * k` via `mul_scalar_backward_f32` (functionally identical
 // to the forward `mul_scalar_f32`, but kept as a separately-registered
 // kernel so the audit trail in nsys traces matches the autograd op name).
@@ -5940,7 +5937,7 @@ fn cuda_mul_scalar_backward_device(
     Ok(DeviceHandle::Cuda(CudaStorage::new(d_out)))
 }
 
-// P3: device-resident backward for `mean(x)`. The upstream is a rank-0
+// Device-resident backward for `mean(x)`. The upstream is a rank-0
 // device scalar; the kernel reads it once per thread (block-broadcast
 // from L1 after the first warp) and writes `upstream * (1/N)` across
 // `elem_count` slots. Returned handle is unevaluated.
@@ -6024,8 +6021,6 @@ fn cuda_sum_backward_device(
 // Device-resident gradient accumulation. Allocates a fresh output buffer
 // and writes `dest[i] + src[i]` via the `add_into_f32` NVRTC kernel. The
 // returned handle is unevaluated — terminal `eval` is the caller's.
-// Foundation for the post-G3 device-resident gradient tape; dispatch wires
-// in a follow-up subagent.
 #[cfg(not(feature = "no-cuda"))]
 fn cuda_add_into_device(
     backend: &CudaBackend,
@@ -8633,7 +8628,7 @@ fn cuda_download(
     Ok(host)
 }
 
-// Wave 2 Commit A: device-resident embedding backward. Allocates a
+// Device-resident embedding backward. Allocates a
 // zero-filled `[vocab, hidden]` grad on-device and atomicAdd-scatters the
 // per-token-position upstream slice into `grad_table[ids[row], :]`. Only the
 // int32 `indices` array crosses PCIe; the `[n_ids, hidden]` upstream stays
@@ -8704,7 +8699,7 @@ fn cuda_embedding_backward_device(
     Ok(DeviceHandle::Cuda(CudaStorage::new(d_grad)))
 }
 
-// Wave 2 Commit A: device-resident add_broadcast backward. Reduces the
+// Device-resident add_broadcast backward. Reduces the
 // upstream tensor along broadcast axes into a `[b_shape]` grad. One block
 // per output element; threads cooperatively reduce over the cartesian
 // product of contracted axes via shared memory.
@@ -8828,10 +8823,10 @@ fn cuda_add_broadcast_backward_device(
     Ok(DeviceHandle::Cuda(CudaStorage::new(d_grad)))
 }
 
-// Wave 2.1: shared helper for the 4 elementwise activation/exp backward
+// Shared helper for the 4 elementwise activation/exp backward
 // ops. All consume one extra device buffer (`saved`, either x or y) plus
 // `upstream`; output is the same `shape`. Returned handle is unevaluated
-// per the M5.3b.11 batched-eval contract.
+// per the batched-eval contract.
 #[cfg(not(feature = "no-cuda"))]
 fn cuda_elementwise_backward_with_saved(
     backend: &CudaBackend,
@@ -8937,7 +8932,7 @@ fn cuda_exp_backward_device(
     )
 }
 
-// Wave 2.1: device-resident backward for `mul(a, b)`. Two independent 1D
+// Device-resident backward for `mul(a, b)`. Two independent 1D
 // NVRTC kernels, each gated by `need_grad_*` so the unused side is never
 // launched (mirrors `matmul_backward_device`'s short-circuit). Returned
 // handles are unevaluated.
@@ -9005,7 +9000,7 @@ fn cuda_mul_backward_device(
     Ok((grad_a, grad_b))
 }
 
-// Wave 2.1: device-resident backward for `rms_norm`. Three kernels:
+// Device-resident backward for `rms_norm`. Three kernels:
 //   1. `rms_norm_inv_rms_f32` — one block per row, reduces sum_sq and
 //      emits `inv_rms[rows]` to a device scratch buffer.
 //   2. `rms_norm_backward_x_f32` — one block per row, consumes the saved
@@ -9052,7 +9047,7 @@ fn cuda_rms_norm_backward_device(
         });
     }
 
-    // Phase 1: inv_rms scratch buffer.
+    // Inv_rms scratch buffer.
     let mut d_inv = backend
         .stream
         .alloc_zeros::<f32>(rows.max(1))
@@ -9149,7 +9144,7 @@ fn cuda_rms_norm_backward_device(
     Ok((grad_x, grad_w))
 }
 
-// Wave 2.1: device-resident backward for `rope`. Same launch shape as
+// Device-resident backward for `rope`. Same launch shape as
 // `cuda_rope` (one block per (batch, head, token); block=min(half_dim,256)).
 // Only difference vs the forward kernel is the inlined `sin -> -sin` sign
 // flip — `cpu_rope_backward` does the equivalent via a host

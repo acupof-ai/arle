@@ -4,11 +4,9 @@
 #define NORM_BLOCK 256
 #define NORM_NUM_WARPS (NORM_BLOCK / WARP_SIZE)
 
-// ============================================================================
 // RMSNorm: out[i] = x[i] * weight[i] / sqrt(mean(x^2) + eps)
 // BF16×4 vectorized loads, warp shuffle reduction.
 // Single block, 256 threads — suitable for decode (n=2560).
-// ============================================================================
 __global__ void rms_norm_kernel(const __nv_bfloat16 *__restrict__ x,
                                 const __nv_bfloat16 *__restrict__ weight,
                                 __nv_bfloat16 *__restrict__ out, int n, float eps) {
@@ -20,7 +18,6 @@ __global__ void rms_norm_kernel(const __nv_bfloat16 *__restrict__ x,
 
   const uint2 *x_vec = reinterpret_cast<const uint2 *>(x);
 
-  // Pass 1: Compute sum of squares (FP32 accumulator)
   float local_sum = 0.0f;
   for (int i = tid; i < n4; i += NORM_BLOCK) {
     uint2 xv = x_vec[i];
@@ -32,28 +29,23 @@ __global__ void rms_norm_kernel(const __nv_bfloat16 *__restrict__ x,
     float v3 = __bfloat162float(hi.y);
     local_sum += v0 * v0 + v1 * v1 + v2 * v2 + v3 * v3;
   }
-  // Scalar tail
   for (int i = n4 * 4 + tid; i < n; i += NORM_BLOCK) {
     float val = __bfloat162float(x[i]);
     local_sum += val * val;
   }
 
-  // Warp shuffle reduction
   local_sum = warp_reduce_sum(local_sum);
 
-  // Inter-warp reduction via shared memory
   __shared__ float warp_sums[NORM_NUM_WARPS];
   if (lane_id == 0) warp_sums[warp_id] = local_sum;
   __syncthreads();
 
-  // First warp reduces
   float total = 0.0f;
   if (warp_id == 0) {
     float val = (lane_id < NORM_NUM_WARPS) ? warp_sums[lane_id] : 0.0f;
     total = warp_reduce_sum(val);
   }
 
-  // Broadcast inv_rms to all threads
   __shared__ float s_inv_rms;
   if (tid == 0) {
     s_inv_rms = 1.0f / sqrtf(total / n + eps);
@@ -61,7 +53,6 @@ __global__ void rms_norm_kernel(const __nv_bfloat16 *__restrict__ x,
   __syncthreads();
   float inv_rms = s_inv_rms;
 
-  // Pass 2: Normalize and scale (BF16×4 vectorized)
   const uint2 *w_vec = reinterpret_cast<const uint2 *>(weight);
   uint2 *out_vec = reinterpret_cast<uint2 *>(out);
 
@@ -89,18 +80,15 @@ __global__ void rms_norm_kernel(const __nv_bfloat16 *__restrict__ x,
     result.y = *reinterpret_cast<unsigned int *>(&r_hi);
     out_vec[i] = result;
   }
-  // Scalar tail
   for (int i = n4 * 4 + tid; i < n; i += NORM_BLOCK) {
     __nv_bfloat16 normed = __float2bfloat16(__bfloat162float(x[i]) * inv_rms);
     out[i] = __float2bfloat16(__bfloat162float(normed) * __bfloat162float(weight[i]));
   }
 }
 
-// ============================================================================
 // Fused Add + RMSNorm: hidden += residual; out = rms_norm(hidden, weight)
 // One kernel replaces two: saves one global read of hidden.
 // BF16×4 vectorized, warp shuffle reduction.
-// ============================================================================
 __global__ void fused_add_rms_norm_kernel(
     __nv_bfloat16 *__restrict__ hidden,          // in/out: hidden state (updated in-place)
     const __nv_bfloat16 *__restrict__ residual,   // in: residual to add
@@ -117,7 +105,6 @@ __global__ void fused_add_rms_norm_kernel(
   uint2 *hidden_vec = reinterpret_cast<uint2 *>(hidden);
   const uint2 *res_vec = reinterpret_cast<const uint2 *>(residual);
 
-  // Pass 1: Add residual to hidden, compute sum of squares
   float local_sum = 0.0f;
   for (int i = tid; i < n4; i += NORM_BLOCK) {
     uint2 hv = hidden_vec[i];
@@ -133,7 +120,6 @@ __global__ void fused_add_rms_norm_kernel(
     float s2 = __bfloat162float(h_hi.x) + __bfloat162float(r_hi.x);
     float s3 = __bfloat162float(h_hi.y) + __bfloat162float(r_hi.y);
 
-    // Write updated hidden
     __nv_bfloat162 s_lo, s_hi;
     s_lo.x = __float2bfloat16(s0);
     s_lo.y = __float2bfloat16(s1);
@@ -151,7 +137,6 @@ __global__ void fused_add_rms_norm_kernel(
     float v3 = __bfloat162float(s_hi.y);
     local_sum += v0 * v0 + v1 * v1 + v2 * v2 + v3 * v3;
   }
-  // Scalar tail
   for (int i = n4 * 4 + tid; i < n; i += NORM_BLOCK) {
     float s = __bfloat162float(hidden[i]) + __bfloat162float(residual[i]);
     hidden[i] = __float2bfloat16(s);
@@ -159,7 +144,6 @@ __global__ void fused_add_rms_norm_kernel(
     local_sum += v * v;
   }
 
-  // Warp shuffle reduction
   local_sum = warp_reduce_sum(local_sum);
 
   __shared__ float warp_sums[NORM_NUM_WARPS];
@@ -179,7 +163,6 @@ __global__ void fused_add_rms_norm_kernel(
   __syncthreads();
   float inv_rms = s_inv_rms;
 
-  // Pass 2: Normalize and scale (read updated hidden, write out)
   const uint2 *h_vec_r = reinterpret_cast<const uint2 *>(hidden);
   const uint2 *w_vec = reinterpret_cast<const uint2 *>(weight);
   uint2 *out_vec = reinterpret_cast<uint2 *>(out);
@@ -207,17 +190,14 @@ __global__ void fused_add_rms_norm_kernel(
     result.y = *reinterpret_cast<unsigned int *>(&r_hi);
     out_vec[i] = result;
   }
-  // Scalar tail
   for (int i = n4 * 4 + tid; i < n; i += NORM_BLOCK) {
     __nv_bfloat16 normed = __float2bfloat16(__bfloat162float(hidden[i]) * inv_rms);
     out[i] = __float2bfloat16(__bfloat162float(normed) * __bfloat162float(weight[i]));
   }
 }
 
-// ============================================================================
 // Batched RMSNorm: each block handles one vector (blockIdx.x = token index)
 // BF16×4 vectorized, warp shuffle reduction.
-// ============================================================================
 __global__ void rms_norm_batched_kernel(const __nv_bfloat16 *__restrict__ x,
                                          const __nv_bfloat16 *__restrict__ weight,
                                          __nv_bfloat16 *__restrict__ out,
@@ -232,7 +212,6 @@ __global__ void rms_norm_batched_kernel(const __nv_bfloat16 *__restrict__ x,
   int n4 = hidden_dim / 4;
   const uint2 *x_vec = reinterpret_cast<const uint2 *>(x_row);
 
-  // Pass 1: sum of squares
   float local_sum = 0.0f;
   for (int i = tid; i < n4; i += NORM_BLOCK) {
     uint2 xv = x_vec[i];
@@ -268,7 +247,7 @@ __global__ void rms_norm_batched_kernel(const __nv_bfloat16 *__restrict__ x,
   __syncthreads();
   float inv_rms = s_inv_rms;
 
-  // Pass 2: normalize and scale. The uint4 path requires every row start to be
+  // The uint4 path requires every row start to be
   // 16-byte aligned; hidden_dim=260 is 8-byte aligned per row but not 16-byte.
   const bool use_uint4 =
       ((((uintptr_t)x_row | (uintptr_t)weight | (uintptr_t)out_row) & 0xF) == 0);
@@ -358,14 +337,12 @@ __global__ void rms_norm_batched_kernel(const __nv_bfloat16 *__restrict__ x,
   }
 }
 
-// ============================================================================
 // Batched RMSNorm with fp32 input, bf16 output.
 //
 // Used to let the residual stream stay in fp32 across layers while still
 // feeding bf16 downstream GEMMs. Reading fp32 here avoids the bf16 rounding
 // that compounds Q4_K-level weight noise through 36 layers on Qwen3.5-4B.
 // Precision chain: fp32 -> fp32 rsqrt -> fp32 * fp32 weight -> bf16 store.
-// ============================================================================
 __global__ void rms_norm_batched_f32_in_kernel(
     const float *__restrict__ x,                     // [seq_len, hidden_dim] fp32
     const __nv_bfloat16 *__restrict__ weight,        // [hidden_dim] bf16
@@ -378,7 +355,6 @@ __global__ void rms_norm_batched_f32_in_kernel(
   int warp_id = tid / WARP_SIZE;
   int lane_id = tid % WARP_SIZE;
 
-  // Pass 1: sum of squares (fp32)
   float local_sum = 0.0f;
   for (int i = tid; i < hidden_dim; i += NORM_BLOCK) {
     float v = x_row[i];
@@ -403,18 +379,15 @@ __global__ void rms_norm_batched_f32_in_kernel(
   __syncthreads();
   float inv_rms = s_inv_rms;
 
-  // Pass 2: normalize × weight, store bf16
   for (int i = tid; i < hidden_dim; i += NORM_BLOCK) {
     float n = x_row[i] * inv_rms * __bfloat162float(weight[i]);
     out_row[i] = __float2bfloat16(n);
   }
 }
 
-// ============================================================================
 // fp32 += bf16 accumulator. Used to maintain an fp32 residual shadow that
 // absorbs bf16-produced layer outputs without losing precision across
 // 36 layers of compounding.
-// ============================================================================
 __global__ void add_bf16_into_f32_kernel(
     float *__restrict__ out,                       // fp32 in/out
     const __nv_bfloat16 *__restrict__ in,          // bf16 read-only
@@ -425,10 +398,8 @@ __global__ void add_bf16_into_f32_kernel(
     out[i] += __bfloat162float(in[i]);
 }
 
-// ============================================================================
 // bf16 → fp32 cast, used once per prefill to seed the fp32 residual shadow
 // from the bf16 embedding output.
-// ============================================================================
 __global__ void cast_bf16_to_f32_kernel(
     const __nv_bfloat16 *__restrict__ in,
     float *__restrict__ out,
@@ -439,10 +410,8 @@ __global__ void cast_bf16_to_f32_kernel(
     out[i] = __bfloat162float(in[i]);
 }
 
-// ============================================================================
 // fp32 → bf16 cast, used at the end of prefill to hand back a bf16 hidden
 // state for the final norm + LM head projection that still consume bf16.
-// ============================================================================
 __global__ void cast_f32_to_bf16_kernel(
     const float *__restrict__ in,
     __nv_bfloat16 *__restrict__ out,
@@ -453,12 +422,10 @@ __global__ void cast_f32_to_bf16_kernel(
     out[i] = __float2bfloat16(in[i]);
 }
 
-// ============================================================================
 // Batched Fused Add + RMSNorm: one block per token (blockIdx.x = token index)
 // hidden[b] += residual[b]; out[b] = rms_norm(hidden[b], weight)
 // Saves one global read of hidden compared to separate add + batched rms_norm.
 // Grid: <<<seq_len, NORM_BLOCK>>>
-// ============================================================================
 __global__ void fused_add_rms_norm_batched_kernel(
     __nv_bfloat16 *__restrict__ hidden,          // in/out [seq_len, hidden_dim]
     const __nv_bfloat16 *__restrict__ residual,   // in [seq_len, hidden_dim]
@@ -479,7 +446,6 @@ __global__ void fused_add_rms_norm_batched_kernel(
   uint2 *hidden_vec = reinterpret_cast<uint2 *>(hidden_row);
   const uint2 *res_vec = reinterpret_cast<const uint2 *>(res_row);
 
-  // Pass 1: Add residual to hidden, compute sum of squares
   float local_sum = 0.0f;
   for (int i = tid; i < n4; i += NORM_BLOCK) {
     uint2 hv = hidden_vec[i];
@@ -495,7 +461,6 @@ __global__ void fused_add_rms_norm_batched_kernel(
     float s2 = __bfloat162float(h_hi.x) + __bfloat162float(r_hi.x);
     float s3 = __bfloat162float(h_hi.y) + __bfloat162float(r_hi.y);
 
-    // Write updated hidden
     __nv_bfloat162 s_lo, s_hi;
     s_lo.x = __float2bfloat16(s0);
     s_lo.y = __float2bfloat16(s1);
@@ -513,7 +478,6 @@ __global__ void fused_add_rms_norm_batched_kernel(
     float v3 = __bfloat162float(s_hi.y);
     local_sum += v0 * v0 + v1 * v1 + v2 * v2 + v3 * v3;
   }
-  // Scalar tail
   for (int i = n4 * 4 + tid; i < hidden_dim; i += NORM_BLOCK) {
     float s = __bfloat162float(hidden_row[i]) + __bfloat162float(res_row[i]);
     hidden_row[i] = __float2bfloat16(s);
@@ -521,7 +485,6 @@ __global__ void fused_add_rms_norm_batched_kernel(
     local_sum += v * v;
   }
 
-  // Warp shuffle reduction
   local_sum = warp_reduce_sum(local_sum);
 
   __shared__ float warp_sums[NORM_NUM_WARPS];
@@ -541,7 +504,7 @@ __global__ void fused_add_rms_norm_batched_kernel(
   __syncthreads();
   float inv_rms = s_inv_rms;
 
-  // Pass 2: Normalize and scale (read updated hidden, write out). Keep the
+  // Keep the
   // uint4 path only when row starts are 16-byte aligned.
   const bool use_uint4 =
       ((((uintptr_t)hidden_row | (uintptr_t)weight | (uintptr_t)out_row) & 0xF) == 0);
@@ -700,10 +663,8 @@ cudaError_t cast_f32_to_bf16_cuda(
     return cudaGetLastError();
 }
 
-// ============================================================================
 // RMSNorm with (1+weight) offset — Qwen3.5 / Gemma style
 // out[i] = x[i] * (1 + weight[i]) / sqrt(mean(x^2) + eps)
-// ============================================================================
 cudaError_t rms_norm_offset_cuda(const __nv_bfloat16 *x, const __nv_bfloat16 *weight,
                            __nv_bfloat16 *out, int n, float eps, cudaStream_t stream);
 
@@ -720,9 +681,7 @@ cudaError_t rms_norm_gated_cuda(const __nv_bfloat16 *x, const float *weight,
                           int num_heads, int head_dim, float eps, cudaStream_t stream);
 } // extern "C"
 
-// ============================================================================
 // (1+weight) RMSNorm kernel
-// ============================================================================
 __global__ void rms_norm_offset_kernel(const __nv_bfloat16 *__restrict__ x,
                                         const __nv_bfloat16 *__restrict__ weight,
                                         __nv_bfloat16 *__restrict__ out, int n, float eps) {
@@ -763,7 +722,6 @@ __global__ void rms_norm_offset_kernel(const __nv_bfloat16 *__restrict__ x,
   __syncthreads();
   float inv_rms = s_inv_rms;
 
-  // Pass 2: out[i] = (x[i] * inv_rms * (1 + weight[i])) cast to bf16
   // NOTE: GemmaRMSNorm does ALL computation in float32, only rounds to bf16 at the end.
   // No intermediate bf16 rounding (unlike Llama/Qwen3.5 RMSNorm).
   const uint2 *w_vec = reinterpret_cast<const uint2 *>(weight);
@@ -792,9 +750,7 @@ __global__ void rms_norm_offset_kernel(const __nv_bfloat16 *__restrict__ x,
   }
 }
 
-// ============================================================================
 // Fused Add + (1+weight) RMSNorm
-// ============================================================================
 __global__ void fused_add_rms_norm_offset_kernel(
     __nv_bfloat16 *__restrict__ hidden,
     const __nv_bfloat16 *__restrict__ residual,
@@ -887,10 +843,8 @@ __global__ void fused_add_rms_norm_offset_kernel(
   }
 }
 
-// ============================================================================
 // Batched (1+weight) RMSNorm: one block per token.
 // Grid: <<<seq_len, NORM_BLOCK>>>
-// ============================================================================
 __global__ void rms_norm_batched_offset_kernel(
     const __nv_bfloat16 *__restrict__ x,
     const __nv_bfloat16 *__restrict__ weight,
@@ -907,7 +861,6 @@ __global__ void rms_norm_batched_offset_kernel(
 
   const uint2 *x_vec = reinterpret_cast<const uint2 *>(x_row);
 
-  // Pass 1: sum of squares
   float local_sum = 0.0f;
   for (int i = tid; i < n4; i += NORM_BLOCK) {
     uint2 xv = x_vec[i];
@@ -938,7 +891,6 @@ __global__ void rms_norm_batched_offset_kernel(
   __syncthreads();
   float inv_rms = s_inv_rms;
 
-  // Pass 2: out = x * inv_rms * (1 + weight), all in f32
   const uint2 *w_vec = reinterpret_cast<const uint2 *>(weight);
   uint2 *out_vec = reinterpret_cast<uint2 *>(out_row);
 
@@ -965,12 +917,10 @@ __global__ void rms_norm_batched_offset_kernel(
   }
 }
 
-// ============================================================================
 // Gated RMSNorm for linear attention output:
 //   out = rms_norm(x, f32_weight) * silu(gate)
 // Per-head normalization: x is [num_heads * head_dim], weight is [head_dim] (broadcast).
 // Grid: num_heads blocks, head_dim threads.
-// ============================================================================
 __global__ void rms_norm_gated_kernel(
     const __nv_bfloat16 *__restrict__ x,
     const float *__restrict__ weight,
@@ -985,7 +935,6 @@ __global__ void rms_norm_gated_kernel(
 
   int offset = head * head_dim + tid;
 
-  // RMSNorm over this head's slice
   float x_val = __bfloat162float(x[offset]);
   float sq = x_val * x_val;
   sq = warp_reduce_sum(sq);
@@ -1011,14 +960,12 @@ __global__ void rms_norm_gated_kernel(
   float w = weight[tid];
   normed *= w;
 
-  // SiLU gate
   float g = __bfloat162float(gate[offset]);
   float silu_g = g / (1.0f + expf(-g));
 
   out[offset] = __float2bfloat16(normed * silu_g);
 }
 
-// C API implementations
 extern "C" {
 
 cudaError_t rms_norm_offset_cuda(const __nv_bfloat16 *x, const __nv_bfloat16 *weight,

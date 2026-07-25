@@ -1525,11 +1525,9 @@ fn handle_image_command(backend_name: &str, pending_images: &mut Vec<ChatPromptI
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────
 // Inline tool-call rendering — one dim line per call:
 //   `  ⏵ name(args) → result`
 // Args/result are aggressively truncated so the line stays scannable.
-// ─────────────────────────────────────────────────────────────────────────
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 const TOOL_NAME_MAX: usize = 32;
@@ -1620,16 +1618,13 @@ fn truncate_one_line(s: &str, max: usize) -> String {
     format!("{}…", cut.trim_end())
 }
 
-// ─────────────────────────────────────────────────────────────────────────
 // /models — listing + (descoped) switch pointer.
 //
-// Hot-swap notes (2026-04-20 wave-2 UX polish):
-// Mid-REPL engine reinit would require owning the `LoadedInferenceEngine`
-// inside the REPL rather than taking `&mut dyn InferenceEngine`. Threading
-// the concrete type through the existing API would cascade into
-// `lib.rs`/`startup.rs` — outside the "crates/cli/ only" scope guard in the
-// wave-2 brief. Ship listing today; track hot-swap separately.
-// ─────────────────────────────────────────────────────────────────────────
+// Hot-swap is descoped: mid-REPL engine reinit would require owning the
+// `LoadedInferenceEngine` inside the REPL rather than taking `&mut dyn
+// InferenceEngine`. Threading the concrete type through the existing API would
+// cascade into `lib.rs`/`startup.rs`. Ship listing today; track hot-swap
+// separately.
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn handle_models_command(maybe_idx: Option<usize>) {
@@ -1711,9 +1706,7 @@ pub(crate) fn detect_family(model_id: &str) -> &'static str {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────
 // /export — markdown conversation dump.
-// ─────────────────────────────────────────────────────────────────────────
 
 #[cfg(any(feature = "cuda", feature = "metal", feature = "cpu"))]
 fn handle_export_command(model_id: &str, history: &[ChatMessage], path_arg: &str) {
@@ -2085,7 +2078,6 @@ mod tests {
         );
     }
 
-    // ── /export — markdown dump ─────────────────────────────────────────
 
     #[test]
     fn export_markdown_empty_history() {
@@ -2165,7 +2157,6 @@ mod tests {
         assert!(name.starts_with("arle-") && name.ends_with(".md"));
     }
 
-    // ── /stats session accumulator ──────────────────────────────────────
 
     #[test]
     fn stats_accumulator_sums_across_turns() {
@@ -2206,7 +2197,6 @@ mod tests {
         assert_eq!(s.avg_tps(), 0.0);
     }
 
-    // ── /models offline fallback ────────────────────────────────────────
 
     #[test]
     fn models_command_offline_message() {
@@ -2239,7 +2229,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    // ── Misc helpers ────────────────────────────────────────────────────
 
     #[test]
     fn detect_family_matches_known_ids() {
@@ -2259,7 +2248,6 @@ mod tests {
         assert_eq!(format_iso8601_utc(946_684_799), "1999-12-31T23:59:59Z");
     }
 
-    // ── Inline tool-call rendering ──────────────────────────────────────
 
     #[test]
     fn brief_tool_args_prefers_known_scalar_field() {

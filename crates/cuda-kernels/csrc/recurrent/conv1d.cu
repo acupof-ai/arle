@@ -1,20 +1,16 @@
 #include "common.cuh"
 
-// ============================================================================
 // Causal Depthwise Conv1d for Gated Delta Net linear attention
 //
 // Prefill: Parallel causal conv1d over the entire sequence.
-// ============================================================================
 
 #define CONV1D_BLOCK 256
 
-// ============================================================================
 // Prefill kernel: parallel causal conv1d over sequence
 // x_seq: [num_channels, seq_len] bf16 (column-major: token i at offset i * num_channels)
 // Actually stored as [seq_len * num_channels] row-major (token i starts at i * num_channels)
 // out_seq: [seq_len * num_channels] bf16
 // conv_state: [num_channels, K-1] bf16 (updated with last K-1 values)
-// ============================================================================
 __global__ void conv1d_prefill_kernel(
     const __nv_bfloat16* __restrict__ x_seq,
     const __nv_bfloat16* __restrict__ conv_weight,
@@ -66,13 +62,11 @@ __global__ void conv1d_prefill_kernel(
     // chunk's tail instead of the previous chunk's.
 }
 
-// ============================================================================
 // State-update kernel: rebuild the conv ring from the chunk tail. One thread
 // per channel; reproduces the exact ring semantics of the writer branch that
 // previously lived in conv1d_prefill_kernel (including seq_len < kernel-1,
 // where the new ring = shifted old state ++ all of x_seq — old state is staged
 // through registers before the in-place overwrite).
-// ============================================================================
 __global__ void conv1d_state_update_kernel(
     const __nv_bfloat16* __restrict__ x_seq,
     __nv_bfloat16* __restrict__ conv_state,

@@ -1,4 +1,4 @@
-//! Compile-once pipeline cache for the Vulkan decode path (perf-parity Step 2).
+//! Compile-once pipeline cache for the Vulkan decode path.
 //!
 //! Per-dispatch, the legacy `launch_with_params_and_specialization` rebuilt the
 //! entire pipeline object graph from scratch — `fs::read(.spv)` → `ShaderModule`
@@ -57,7 +57,7 @@ impl std::hash::Hash for CacheKey {
 ///
 /// Lifetime `'a` ties cached pipelines to the `VulkanContext` they were built
 /// against; the cache must be dropped before that context. A persistent cache
-/// is built once at model load and threaded through the whole decode (Step 4);
+/// is built once at model load and threaded through the whole decode;
 /// the legacy `launch_*` path routes through a transient cache so its build
 /// also flows through the single cache-miss builder below.
 pub struct KernelCache<'a> {

@@ -14,19 +14,17 @@ pub fn rope(
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
-    // M5.3b.5: route `x` through the lazy `backend.rope` whenever a live
-    // device handle is available — that is, `Dirty::Device` (device is
-    // authoritative) AND `Dirty::Both` (host and device in sync; either
-    // source is valid, device is cheaper). This is wider than the silu /
+    // Route `x` through the lazy `backend.rope` whenever a live device handle
+    // is available — `Dirty::Device` (device authoritative) or `Dirty::Both`
+    // (host and device in sync; device is cheaper). Wider than the silu /
     // softmax / exp dispatch (Dirty::Device only) because rope is typically
     // called on q/k right after a rank-3 matmul + rank-4 reshape; if the
     // reshape path is ever made lazy too, the output lands Dirty::Both and
     // we want to stay on-device through rope. cos/sin stay on the host:
     // Qwen's rope caches are precomputed per seq length and the per-call
     // uploads are tiny vs. the 4-D rotation. Dirty::Host inputs take the
-    // eager host path for parity with the pre-M5.3b.5 behavior. Backward
-    // stays on the eager `rope_forward(gy, cos, -sin)` path;
-    // `tape.backward`'s pre-walk batch-flush takes care of the
+    // eager host path. Backward stays on the eager `rope_forward(gy, cos, -sin)`
+    // path; `tape.backward`'s pre-walk batch-flush takes care of the
     // Dirty::Device output tensors before `rope_backward` reads them.
     let has_device_handle = {
         let t = store.tensor(x)?;
@@ -183,14 +181,11 @@ pub(crate) fn rope_backward(
         });
     }
 
-    // Wave 2.1: route through `rope_backward_device` whenever upstream is
-    // device-resident. Pre-2.1 this op did `tensor_host(upstream)
-    // → backend.rope_forward(host, ...)`, demoting every layer's q/k
-    // grad to host immediately after `mul_scalar_backward_device` /
-    // `matmul_backward_device` had kept it on-device. The kernel handles
-    // partial rotary (tail passthrough) — the full-head `==` gate here made
-    // every Qwen3.6 full-attn q/k grad fall to host and cascade the whole
-    // upstream chain (Transpose/Slice backwards) onto the CPU.
+    // Route through `rope_backward_device` whenever upstream is
+    // device-resident. The kernel handles partial rotary (tail passthrough) —
+    // the full-head `==` gate here would make every Qwen3.6 full-attn q/k grad
+    // fall to host and cascade the whole upstream chain (Transpose/Slice
+    // backwards) onto the CPU.
     let device_path_ok = {
         let upstream = store.tensor(output_grad_id)?;
         upstream.dirty != Dirty::Host

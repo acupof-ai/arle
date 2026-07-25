@@ -61,10 +61,8 @@ __device__ inline void cp_async_wait() {
 }
 }  // namespace marlin
 
-// ============================================================================
 // Repack kernel: GPTQ int32-packed [K/8, N] → Marlin tile layout
 // Only supports 4-bit, no act_order, no A8 mode (the common case).
-// ============================================================================
 __global__ void gptq_marlin_repack_kernel_4bit(
     const uint32_t* __restrict__ b_q_weight_ptr,
     uint32_t* __restrict__ out_ptr,
@@ -144,9 +142,7 @@ __global__ void gptq_marlin_repack_kernel_4bit(
     }
 }
 
-// ============================================================================
 // C API
-// ============================================================================
 extern "C" {
 
 // Repack GPTQ weights to Marlin layout.

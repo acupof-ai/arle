@@ -541,7 +541,7 @@ impl Tape {
             // Batch-flush all Dirty::Device tape outputs in a single
             // `mlx_eval` call before walking the backward graph. The naive
             // per-id `ensure_host` loop would call `eval` once per handle —
-            // a regression once M5.3b.1 made `sum` lazy, because both `y`
+            // a regression with lazy `sum`, because both `y`
             // and `loss` end up Dirty::Device and each per-id eval crosses
             // the FFI boundary + grabs the shared MLX guard. MLX consumes the batch
             // as one graph realization (terminal handles share upstream
@@ -556,10 +556,9 @@ impl Tape {
                 })
                 .map(|entry| entry.output_id)
                 .collect();
-            // P3.1: only flush all tape outputs to host upfront when the
+            // only flush all tape outputs to host upfront when the
             // backend prefers it (Metal). On CUDA this batch readback is
-            // the 1 GB DtoH the M5.3b / Wave 1 / P1 / P2 / P3 milestones
-            // could never kill — per-op lazy readback is strictly cheaper
+            // the 1 GB DtoH that per-op lazy readback avoids — strictly cheaper
             // because device-resident backward ops never need the host
             // snapshot.
             if store.backend().prefers_pre_backward_flush() {
@@ -598,10 +597,10 @@ impl Tape {
             } else {
                 store.fill_like(loss_id, 1.0)?
             };
-            // P3.1: seed the backward chain with a device-resident `1.0`
+            // seed the backward chain with a device-resident `1.0`
             // when the backend has device residency. Without this the
-            // every-op `device_path_ok` gate in M5.3b / Wave 1 / P1 / P2 /
-            // P3 falls through to host fallback, because `g.dirty=Host`
+            // every-op `device_path_ok` gate
+            // falls through to host fallback, because `g.dirty=Host`
             // from the first step. Explicit seed gradients follow the same
             // device-residency rule so downstream ops stay on-device.
             store.ensure_device(loss_grad_id)?;

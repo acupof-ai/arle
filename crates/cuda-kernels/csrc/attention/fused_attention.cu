@@ -1,7 +1,6 @@
 #include "common.cuh"
 #include <cstdio>
 
-// ============================================================================
 // Fused GQA Attention Kernel (bf16 version) — Tiled Online Softmax
 //
 // Processes KV cache in tiles of TILE_SIZE from global memory using the
@@ -13,16 +12,12 @@
 // - Tiles of K/V loaded from global cache into shared memory
 // - Online softmax merges partial results across tiles
 // - bf16 storage, fp32 accumulators
-// ============================================================================
 
 #define TILE_SIZE 64
 #define HEAD_DIM 128
 #define THREADS_PER_BLOCK 128
 #define NUM_WARPS (THREADS_PER_BLOCK / WARP_SIZE)  // 4
 
-// ============================================================================
-// Device helpers
-// ============================================================================
 
 __device__ __forceinline__ __nv_bfloat16 rms_norm_elem(
     __nv_bfloat16 x,
@@ -51,12 +46,10 @@ __device__ __forceinline__ void apply_rope_pair(
     x1 = __float2bfloat16(temp * fs + fx1 * fc);
 }
 
-// ============================================================================
 // Tiled attention for a single Q head using online softmax.
 //
 // All shared memory buffers are allocated by the caller (kernel) and passed in.
 // No __shared__ declarations inside this function.
-// ============================================================================
 __device__ void tiled_attention(
     const __nv_bfloat16* __restrict__ smem_q,
     const __nv_bfloat16* __restrict__ k_cache_base,
@@ -78,7 +71,6 @@ __device__ void tiled_attention(
     int warp_id,
     int lane_id
 ) {
-    // Initialize online softmax state
     float o_acc = 0.0f;  // output accumulator for dimension tid (register)
 
     if (tid == 0) {
@@ -87,11 +79,9 @@ __device__ void tiled_attention(
     }
     __syncthreads();
 
-    // Tile loop over KV cache
     for (int tile_start = 0; tile_start < seq_len; tile_start += TILE_SIZE) {
         int tile_len = min(TILE_SIZE, seq_len - tile_start);
 
-        // --- Load K/V tile from global cache into shared memory ---
         for (int i = tid; i < tile_len * HEAD_DIM; i += THREADS_PER_BLOCK) {
             int pos_in_tile = i / HEAD_DIM;
             int dim = i % HEAD_DIM;
@@ -101,7 +91,6 @@ __device__ void tiled_attention(
         }
         __syncthreads();
 
-        // --- Compute scores: Q · K^T * scale ---
         // Thread-per-dimension dot product, warp reduce, cross-warp combine
         float q_val = __bfloat162float(smem_q[tid]);
 
@@ -124,7 +113,6 @@ __device__ void tiled_attention(
         }
         __syncthreads();
 
-        // --- Find tile max ---
         float tile_max_local = -INFINITY;
         if (tid < tile_len) {
             tile_max_local = smem_scores[tid];
@@ -156,7 +144,6 @@ __device__ void tiled_attention(
         float scale_old = smem_scratch[0];
         o_acc *= scale_old;
 
-        // --- Exp weights + V accumulation ---
         float local_sum = 0.0f;
         float current_max = smem_running_max;
         for (int pos = 0; pos < tile_len; pos++) {
@@ -172,15 +159,12 @@ __device__ void tiled_attention(
         __syncthreads();
     }
 
-    // --- Final normalize ---
     float final_sum = smem_running_sum;
     float result = (final_sum > 0.0f) ? (o_acc / final_sum) : 0.0f;
     output_buf[q_head_idx * head_dim + tid] = __float2bfloat16(result);
 }
 
-// ============================================================================
 // Main kernel — supports arbitrary GQA ratio via gqa_ratio parameter
-// ============================================================================
 __global__ void fused_gqa_attention_single_token_kernel(
     const __nv_bfloat16* __restrict__ q_full,
     const __nv_bfloat16* __restrict__ k_full,
@@ -222,9 +206,7 @@ __global__ void fused_gqa_attention_single_token_kernel(
 
     int cache_base_offset = kv_head_idx * max_seq_len * head_dim;
 
-    // ========================================================================
     // Phase 1: K head — slice → norm → rope → write to global cache
-    // ========================================================================
     __nv_bfloat16 k_elem = k_full[kv_head_idx * head_dim + tid];
 
     float k_sq = __bfloat162float(k_elem);
@@ -265,16 +247,12 @@ __global__ void fused_gqa_attention_single_token_kernel(
     }
     __syncthreads();
 
-    // ========================================================================
     // Phase 2: V head — slice → write to global cache
-    // ========================================================================
     __nv_bfloat16 v_elem = v_full[kv_head_idx * head_dim + tid];
     v_cache[cache_base_offset + current_pos * head_dim + tid] = v_elem;
     __syncthreads();
 
-    // ========================================================================
     // Phase 3: Loop over all Q heads for this KV head
-    // ========================================================================
     for (int q = 0; q < gqa_ratio; q++) {
         int q_head_idx = kv_head_idx * gqa_ratio + q;
         if (q_head_idx >= num_qheads) break;
@@ -333,7 +311,6 @@ __global__ void fused_gqa_attention_single_token_kernel(
     }
 }
 
-// ============================================================================
 // Batched decode attention — split-KV variant
 //
 // Processes B requests in a single launch. Each request has its own KV cache
@@ -344,7 +321,6 @@ __global__ void fused_gqa_attention_single_token_kernel(
 //   blockIdx.y = split_id (KV chunk index)
 //   blockIdx.z = batch_idx
 // Threads: HEAD_DIM (256)
-// ============================================================================
 
 #define NUM_KV_SPLITS 4
 #define BATCHED_BLOCK_N 64
@@ -387,13 +363,11 @@ __global__ void fused_gqa_attention_decode_batched_kernel(
     float scale = 1.0f / sqrtf((float)head_dim);
     float qk_scale = scale * 1.44269504f;  // scale * log2(e) for exp2 trick
 
-    // ---- Shared memory for Q/K norm computation ----
     __shared__ float smem_scratch[BATCHED_DECODE_NUM_WARPS];
 
     int warp_id = tid / WARP_SIZE;
     int lane_id = tid % WARP_SIZE;
 
-    // ---- Load Q, apply RMSNorm + RoPE ----
     int q_full_dim = num_qheads * head_dim * 2;
     int q_base = batch_idx * q_full_dim + q_head_idx * 2 * head_dim;
     float q_val = __bfloat162float(q_batch[q_base + tid]);
@@ -430,7 +404,6 @@ __global__ void fused_gqa_attention_decode_batched_kernel(
         q_rot = smem_q_rope[pair] * sin_val + smem_q_rope[tid] * cos_val;
     }
 
-    // ---- Load K, apply RMSNorm + RoPE ----
     int kv_base = batch_idx * num_kvheads * head_dim + kv_head_idx * head_dim;
     float k_val = __bfloat162float(k_batch[kv_base + tid]);
 
@@ -463,10 +436,8 @@ __global__ void fused_gqa_attention_decode_batched_kernel(
         k_rot = smem_k_rope[pair] * sin_val + smem_k_rope[tid] * cos_val;
     }
 
-    // ---- Load V ----
     float v_val = __bfloat162float(v_batch[kv_base + tid]);
 
-    // ---- Split 0 only: write current K/V to KV cache ----
     // Cast away const for cache write — k_cache_ptrs/v_cache_ptrs point to mutable cache buffers
     // but the pointer array itself is const.
     __nv_bfloat16* k_cache = const_cast<__nv_bfloat16*>(k_cache_ptrs[batch_idx]);
@@ -479,7 +450,6 @@ __global__ void fused_gqa_attention_decode_batched_kernel(
         v_cache[cur_off] = __float2bfloat16(v_val);
     }
 
-    // ---- Compute this split's KV range ----
     // seq_lens includes the current decode token; split-KV scans only the prefix
     // because split 0 handles the current token from registers below.
     int past_seq_len = max(0, seq_lens[batch_idx] - 1);
@@ -488,7 +458,6 @@ __global__ void fused_gqa_attention_decode_batched_kernel(
     int split_start = split_id * tiles_per_split * BATCHED_BLOCK_N;
     int split_end = min((split_id + 1) * tiles_per_split * BATCHED_BLOCK_N, past_seq_len);
 
-    // ---- Online softmax attention over this split's KV chunk ----
     float acc = 0.0f;  // output accumulator for dimension tid
     float m_i = -1e38f;  // running max (finite instead of -inf to avoid NaN)
     float l_i = 0.0f;    // running sum
@@ -522,19 +491,16 @@ __global__ void fused_gqa_attention_decode_batched_kernel(
             __syncthreads();
         }
 
-        // Find tile max
         float tile_max = -INFINITY;
         for (int pos = 0; pos < tile_len; pos++) {
             tile_max = fmaxf(tile_max, smem_qk[pos]);
         }
 
-        // Online softmax update
         float m_new = fmaxf(m_i, tile_max);
         float alpha = exp2f(m_i - m_new);
         acc *= alpha;
         l_i *= alpha;
 
-        // Accumulate weighted V
         for (int pos = 0; pos < tile_len; pos++) {
             float w = exp2f(smem_qk[pos] - m_new);
             float v_elem = __bfloat162float(v_cache_head[(tile_start + pos) * head_dim + tid]);
@@ -544,7 +510,6 @@ __global__ void fused_gqa_attention_decode_batched_kernel(
         m_i = m_new;
     }
 
-    // ---- Split 0: handle current token from registers ----
     if (split_id == 0) {
         // Dot product of q_rot and k_rot
         float dot = q_rot * k_rot;
@@ -568,7 +533,6 @@ __global__ void fused_gqa_attention_decode_batched_kernel(
         m_i = m_new;
     }
 
-    // ---- Write partial results (FP32, unnormalized) ----
     int partial_base_head = (batch_idx * num_qheads + q_head_idx) * NUM_KV_SPLITS;
     int partial_out_offset = (partial_base_head + split_id) * head_dim + tid;
     partial_out[partial_out_offset] = acc;
@@ -580,13 +544,11 @@ __global__ void fused_gqa_attention_decode_batched_kernel(
     }
 }
 
-// ============================================================================
 // Batched attention reduce kernel
 //
 // Merges NUM_KV_SPLITS partial results per Q head per batch item.
 // Grid: (num_qheads, batch_size)
 // Threads: HEAD_DIM (128)
-// ============================================================================
 __global__ void attention_decode_reduce_batched_kernel(
     const float* __restrict__ partial_out, // [B, num_qheads, NUM_KV_SPLITS, HEAD_DIM]
     const float* __restrict__ partial_m,   // [B, num_qheads, NUM_KV_SPLITS]
@@ -625,9 +587,6 @@ __global__ void attention_decode_reduce_batched_kernel(
     output[out_offset] = __float2bfloat16(result);
 }
 
-// ============================================================================
-// C API
-// ============================================================================
 extern "C" {
 
 cudaError_t fused_gqa_attention_decode_batched(

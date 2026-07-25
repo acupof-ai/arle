@@ -970,9 +970,7 @@ fn run_tilelang_paged(
     Ok(())
 }
 
-// ============================================================================
 // DSv4-Flash MLA attention core
-// ============================================================================
 //
 // The MLA attention is a genuinely new subsystem next to the dense-BF16 paged
 // path above (it is NOT a GEMM swap): a low-rank Q/KV projection (`wq_a → q_norm
@@ -1676,8 +1674,7 @@ fn dsv4_prefill_indexer_deepgemm_enabled() -> bool {
 }
 
 pub(crate) fn dsv4_dsa_official_enabled() -> Result<bool> {
-    // The legacy CSA selector was removed; the vendored/official DSA selector is
-    // now the only CSA select implementation.
+    // The vendored/official DSA selector is the only CSA select implementation.
     Ok(true)
 }
 
@@ -7928,7 +7925,7 @@ fn compressor_forward(
     // `compressed.seq_len` (host bookkeeping). The actual GPU state write runs
     // later in ONE `dsv4_compressor_update_batched` over all N rows, BEFORE any
     // reader (the P1b pack / csa cache-write). MUST early-return before the GEMV
-    // match below (else the ∝n GEMVs this campaign removes would still run).
+    // match below (else the ∝n GEMVs this batched path replaces would still run).
     // Decode-only: token_count==1; requires the start_pos_ptr path.
     if let Some(sink) = defer_update {
         ensure!(
@@ -8488,8 +8485,8 @@ pub(crate) fn dsv4_dsa_cache_write_gather_row(
     // rotated_keys is a transient drain-immediate ring: Hadamard writes the delta
     // at ring-relative 0 and the fused-store reads it back the same launch, so
     // BOTH the hadamard dst and the store src are ring-relative 0 (dst_row, the
-    // absolute packed-row offset, no longer indexes into rotated_keys — only into
-    // cache_locs / the FP8 cache band).
+    // absolute packed-row offset, indexes only cache_locs / the FP8 cache band,
+    // not rotated_keys).
     let rotated_dst_ptr = {
         let (p, g) = official.rotated_keys.device_ptr_mut(&ctx.stream);
         drop(g);

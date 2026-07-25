@@ -35,12 +35,10 @@ __device__ __forceinline__ float warp_reduce_sum(float val) {
 }
 
 
-// ============================================================================
 // Phase 2: Merge partial results across splits.
 //
 // Grid: (total_q_heads,)
 // Block: (HEAD_DIM,) — each thread handles 1 dimension
-// ============================================================================
 template <int HEAD_DIM>
 __global__ void decode_attention_merge_kernel(
     const float* __restrict__ partial_out,
@@ -79,11 +77,7 @@ __global__ void decode_attention_merge_kernel(
     O[q_idx * HEAD_DIM + d] = __float2bfloat16(final_o);
 }
 
-// ============================================================================
 
-// ============================================================================
-// C API
-// ============================================================================
 extern "C" {
 
 // Workspace size for partial results.
@@ -157,7 +151,6 @@ static int choose_decode_num_splits(
 
 
 // FP8 E4M3 fused-dequant decode attention (same split-KV, no scales).
-// ============================================================================
 // KIVI per-channel K partial kernel: reads K scale from a
 // `[num_kv_heads, head_dim]` static table; V keeps per-(token, head) scales
 // (KIVI's asymmetric scheme). The per-channel K scale lookup uses each
@@ -168,7 +161,6 @@ static int choose_decode_num_splits(
 // the INT8 sibling at line ~421); the previous version used blocking
 // `__nv_fp8x4_e4m3` global loads from inside the compute loop. GAP-C-cheap
 // (2026-05-28 SOTA audit).
-// ============================================================================
 extern "C++" {
 template <int HEAD_DIM>
 __global__ void decode_attention_fp8_per_channel_k_partial_kernel(
@@ -419,7 +411,6 @@ cudaError_t decode_attention_fp8_per_channel_k_cuda(
     float* p_m   = ws_float + num_splits * total_q * head_dim;
     float* p_l   = p_m + num_splits * total_q;
 
-    // Phase 1
     {
         dim3 grid(num_splits, total_q_heads);
         dim3 block(BLOCK_SIZE);
@@ -454,7 +445,6 @@ cudaError_t decode_attention_fp8_per_channel_k_cuda(
     return cudaGetLastError();
 }
 
-// ============================================================================
 // INT8 KIVI per-channel K decode attention.
 //
 // Reads K scale from a `[num_kv_heads, head_dim]` static table preloaded
@@ -463,7 +453,6 @@ cudaError_t decode_attention_fp8_per_channel_k_cuda(
 // double-buffered tile pipeline as the FP8 sibling
 // `decode_attention_fp8_per_channel_k_partial_kernel`; the only differences
 // here are int8/float dequant in the QK / PV inner loop.
-// ============================================================================
 extern "C++" {
 template <int HEAD_DIM>
 __global__ void decode_attention_int8_per_channel_k_partial_kernel(
@@ -709,7 +698,6 @@ cudaError_t decode_attention_int8_per_channel_k_cuda(
     float* p_m   = ws_float + num_splits * total_q * head_dim;
     float* p_l   = p_m + num_splits * total_q;
 
-    // Phase 1
     {
         dim3 grid(num_splits, total_q_heads);
         dim3 block(BLOCK_SIZE);
@@ -744,11 +732,9 @@ cudaError_t decode_attention_int8_per_channel_k_cuda(
     return cudaGetLastError();
 }
 
-// ============================================================================
 // INT4 KIVI per-channel K decode attention. 4-bit packed K/V, unpacked
 // on-the-fly during compute. Same KIVI scheme as INT8/FP8 siblings:
 // per-channel K + per-(row, head) V.
-// ============================================================================
 extern "C++" {
 template <int HEAD_DIM>
 __global__ void decode_attention_int4_per_channel_k_partial_kernel(

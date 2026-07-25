@@ -78,8 +78,6 @@ const MANIFEST_MAGIC: &str = "ARLE-KVTIER-MANIFEST-V2";
 static DISK_TIER_NAMESPACE_COUNTER: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
 
-// ---- OS probes (unchanged) ----
-
 fn meminfo_field_bytes(field: &str) -> Option<usize> {
     let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
     let prefix = format!("{field}:");
@@ -123,8 +121,6 @@ fn disk_free_total_bytes(path: &Path) -> Option<(usize, usize)> {
 fn disk_free_total_bytes(_path: &Path) -> Option<(usize, usize)> {
     None
 }
-
-// ---- Budget helpers (unchanged) ----
 
 pub fn default_t1_budget_bytes(dram_fraction: f64) -> usize {
     let budget = dram_l2_budget(
@@ -178,8 +174,6 @@ pub fn default_t2_budget_bytes(root: &Path, ssd_fraction: f64) -> usize {
     budget
 }
 
-// ---- chunked-blob key layout ----
-
 /// One u64 key space partitioned by a top-byte namespace so features sharing a
 /// store never collide; callers own the namespace constants. Manifest keys
 /// carry the feature key in the low bits; chunk keys carry
@@ -226,8 +220,6 @@ fn parse_chunk_manifest(bytes: &[u8]) -> Result<(usize, usize)> {
     Ok((chunks, bytes))
 }
 
-// ---- KvTierStore ----
-
 pub struct KvTierStore {
     host_capacity_pages: usize,
     bytes_per_page: usize,
@@ -241,8 +233,6 @@ struct HostDemotedEntry {
     stamp: u64,
     payload: Vec<u8>,
 }
-
-// ---- DiskTier ----
 
 enum DiskStore {
     Mmap(crate::KvMmapStore),
@@ -975,8 +965,6 @@ fn spawn_disk_worker(
         .expect("spawn KV disk writer");
     (work_tx, completion_rx, worker, worker_stats)
 }
-
-// ---- KvTierStore impl ----
 
 impl Drop for KvTierStore {
     fn drop(&mut self) {
@@ -1818,8 +1806,6 @@ pub fn weights_epoch_tag(model_path: &Path) -> String {
         format!("path-{hash:016x}")
     }
 }
-
-// ---- Tests ----
 
 #[cfg(test)]
 mod tests {

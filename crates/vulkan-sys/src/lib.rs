@@ -800,7 +800,7 @@ mod real {
         dispatches_in_batch: u64,
         /// Total `vkQueueSubmit` calls over the recorder's life — the submits/token
         /// instrument. The forward loop snapshots this around a token to report the
-        /// per-token submit count (perf-parity Step 4).
+        /// per-token submit count.
         submit_count: u64,
     }
 
@@ -1392,7 +1392,7 @@ mod real {
     }
 
     /// A persistent descriptor pool + a round-robin ring of pre-allocated
-    /// `VkDescriptorSet`s, reused across dispatches (perf-parity Step 5a). The
+    /// `VkDescriptorSet`s, reused across dispatches. The
     /// per-dispatch `DescriptorSet::storage_buffers*` path creates and destroys a
     /// whole `VkDescriptorPool` every call (~900/token), which dominates the host
     /// GEMV-prep bucket. This mirrors `ggml-vulkan`'s

@@ -79,9 +79,7 @@ __device__ __forceinline__ fp8x2_e4m3_t pack_fp8(float x, float y) {
   return __nv_fp8x2_e4m3(make_float2(fp8_e4m3_clip(x), fp8_e4m3_clip(y)));
 }
 
-// ---------------------------------------------------------------------------
 // SGLang dsv4_fused_q_indexer_rope_hadamard_quant
-// ---------------------------------------------------------------------------
 
 constexpr uint32_t kFusedQBlockSize = 128;
 constexpr uint32_t kFusedQNumWarps = kFusedQBlockSize / kWarpSize;
@@ -189,9 +187,7 @@ __global__ __launch_bounds__(kFusedQBlockSize, 16) void fused_q_indexer_rope_had
   params.weights_out[work_id] = weight_val * params.weight_scale * scale;
 }
 
-// ---------------------------------------------------------------------------
 // SGLang rotate_activation for 128-dim BF16 rows.
-// ---------------------------------------------------------------------------
 
 __global__ __launch_bounds__(kFusedQBlockSize, 16) void hadamard128_bf16_kernel(
     const bf16_t* __restrict__ input,
@@ -326,9 +322,7 @@ __global__ __launch_bounds__(kFusedQBlockSize, 16) void hadamard128_bf16_batched
   out_vec.store(out_ptr, lane_id);
 }
 
-// ---------------------------------------------------------------------------
 // SGLang fused_store_index_k_cache, raw C ABI.
-// ---------------------------------------------------------------------------
 
 template <typename IndicesT, uint32_t kPageBits>
 __global__ void fused_store_indexer_cache_kernel(
@@ -422,11 +416,9 @@ __global__ void fused_store_indexer_cache_batched_kernel(
   reinterpret_cast<float*>(scale_ptr)[0] = scale;
 }
 
-// ---------------------------------------------------------------------------
 // SGLang deepseek_v4_topk_transform_512 port, raw C ABI. Our symbol drops the
 // `_512` suffix: `topk` is a runtime arg (`params.topk`, ≤ kMaxTopK=1024), NOT
 // fixed at 512 — upstream only baked the canonical CSA k into the name.
-// ---------------------------------------------------------------------------
 
 constexpr uint32_t kMaxTopK = 1024;
 constexpr uint32_t kTopKBlockSize = 512;

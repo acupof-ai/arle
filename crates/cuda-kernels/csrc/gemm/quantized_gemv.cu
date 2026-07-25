@@ -1094,9 +1094,7 @@ __global__ void dsv4_fp4_route_gemv_batch_kernel(
     }
 }
 
-// ============================================================================
 // Batched W8A16 GEMV: [B, K] × [N, K]^T → [B, N]
-// ============================================================================
 __global__ void w8a16_gemv_batch_kernel(
     const uint8_t* __restrict__ weight,
     const __nv_bfloat16* __restrict__ scales,
@@ -1270,14 +1268,12 @@ __global__ void w4a16_gemm_batch_kernel(
     }
 }
 
-// ============================================================================
 // Batched W4A16 GEMV: [B, K] × [N, K/2]^T → [B, N]
 // Same nibble extraction as single W4A16, with batch dimension in grid.y.
 //
 // sm_70 (V100) variant: shared-mem caches the input vector so GEMV_ROWS rows
 // share one HBM read of input (~75% less input HBM traffic). Compute structure
 // (8 int4/iter, uint32 loads) is unchanged to keep register pressure identical.
-// ============================================================================
 #if __CUDA_ARCH__ == 700
 __global__ void w4a16_gemv_batch_kernel(
     const uint8_t* __restrict__ weight,
@@ -1408,11 +1404,9 @@ __global__ void w4a16_gemv_batch_kernel(
 }
 #endif
 
-// ============================================================================
 // Grouped W4A16 GEMV (MoE): one weight/scale ptr per expert, routed tokens.
 // W4A16 nibble-extraction (zero-point 8) fused with the grouped dispatch
 // (offsets/counts/expert_indices) so each expert processes its routed rows.
-// ============================================================================
 __global__ void w4a16_grouped_gemv_batch_kernel(
     const uint64_t* __restrict__ weight_ptrs,
     const uint64_t* __restrict__ scale_ptrs,
@@ -1583,10 +1577,8 @@ __global__ void w4a16_grouped_gemv_pair_batch_kernel(
     }
 }
 
-// ============================================================================
 // Batched W2A16 GEMV: [B, K] × [N, K/4]^T → [B, N]
 // Same 2-bit extraction as single W2A16, with batch dimension in grid.y.
-// ============================================================================
 __global__ void w2a16_gemv_batch_kernel(
     const uint8_t* __restrict__ weight,
     const __nv_bfloat16* __restrict__ scales,
@@ -1632,7 +1624,6 @@ __global__ void w2a16_gemv_batch_kernel(
     }
 }
 
-// ============================================================================
 // Q6_K (GGUF) native packed GEMV + dequant.
 //
 // One superblock = 256 K-dim elements = 210 bytes:
@@ -1646,7 +1637,6 @@ __global__ void w2a16_gemv_batch_kernel(
 //   q3 at y[l+ 96] = (ql[l+32] >> 4)  | ((qh[l]>>6 & 3)<<4)
 // Signed weight = (6bit - 32). Scale: scales[is + quadrant*2], is = l/16.
 // Second half uses ql+=64, qh+=32, sc+=8.
-// ============================================================================
 #define Q6K_SB_SIZE 256
 #define Q6K_SB_BYTES 210
 #define Q6K_GEMV_ROWS 8
@@ -1854,7 +1844,6 @@ __global__ void q6k_dequant_chunk_kernel(
     out[row * k_len + out_k] = __float2bfloat16(w);
 }
 
-// ============================================================================
 // Q3_K (GGUF) native packed GEMV + dequant.
 //
 // One superblock = 256 K-dim elements = 110 bytes:
@@ -1879,7 +1868,6 @@ __global__ void q6k_dequant_chunk_kernel(
 // NOTE: must combine the 6 bits BEFORE subtracting 32. Subtracting first and
 // then OR'ing bit 4 into a negative i8 loses the bit to sign extension.
 // (matches dequant_q3_k in gguf.rs after fix for the same bug.)
-// ============================================================================
 #define Q3K_SB_SIZE 256
 #define Q3K_SB_BYTES 110
 #define Q3K_GEMV_ROWS 8
@@ -2040,7 +2028,6 @@ __global__ void q3k_dequant_chunk_kernel(
     out[row * k_len + out_k] = __float2bfloat16(w);
 }
 
-// ============================================================================
 // Q4_K (GGUF Q4_K_M / Q4_K_S) native packed GEMV + dequant.
 //
 // One superblock = 256 K-dim elements = 144 bytes:
@@ -2059,7 +2046,6 @@ __global__ void q3k_dequant_chunk_kernel(
 // Each warp processes one row's superblocks sequentially. Within a superblock,
 // the 32 lanes cover 1 sub-block (32 elements) per iteration for 8 iterations,
 // yielding 256 elements/superblock with every lane active.
-// ============================================================================
 #define Q4K_GEMV_ROWS 8
 #define Q4K_GEMV_THREADS 256  // = Q4K_GEMV_ROWS * 32
 #define Q4K_SB_SIZE 256
@@ -2249,7 +2235,6 @@ __global__ void q4k_dequant_chunk_kernel(
     out[row * k_len + out_k] = __float2bfloat16(w);
 }
 
-// ============================================================================
 // Q5_K (GGUF Q5_K_M / Q5_K_S) native packed GEMV + dequant.
 //
 // One superblock = 256 K-dim elements = 176 bytes:
@@ -2257,7 +2242,6 @@ __global__ void q4k_dequant_chunk_kernel(
 //
 // Q5_K shares Q4_K's scale/min packing and element order. `qs` stores low
 // nibbles, while `qh[l]` contributes one high bit for each of the 8 sub-blocks.
-// ============================================================================
 #define Q5K_GEMV_ROWS 8
 #define Q5K_GEMV_THREADS 256
 #define Q5K_SB_SIZE 256
@@ -2535,9 +2519,7 @@ __global__ void qxk_embedding_decode_kernel(
     out[tid] = __float2bfloat16(value);
 }
 
-// ============================================================================
 // C API
-// ============================================================================
 extern "C" {
 
 cudaError_t gemv_fp8_block_scaled_batch_cuda(
@@ -2965,8 +2947,6 @@ cudaError_t moe_fp4_e2m1_grouped_gemv_pair_batch_cuda(
     return cudaGetLastError();
 }
 
-// ── Q6_K (GGUF) native packed ──
-
 cudaError_t q6k_gemv_cuda(
     const uint8_t* weight,
     const __nv_bfloat16* input, __nv_bfloat16* output,
@@ -3060,8 +3040,6 @@ cudaError_t q6k_dequant_chunk_cuda(
     return cudaGetLastError();
 }
 
-// ── Q3_K (GGUF) native packed ──
-
 cudaError_t q3k_gemv_cuda(
     const uint8_t* weight,
     const __nv_bfloat16* input, __nv_bfloat16* output,
@@ -3097,8 +3075,6 @@ cudaError_t q3k_dequant_chunk_cuda(
         weight, out, N, K, k_start, k_len);
     return cudaGetLastError();
 }
-
-// ── Q4_K (GGUF) native packed ──
 
 cudaError_t q4k_gemv_cuda(
     const uint8_t* weight,
@@ -3136,8 +3112,6 @@ cudaError_t q4k_dequant_chunk_cuda(
         weight, out, N, K, k_start, k_len);
     return cudaGetLastError();
 }
-
-// ── Q5_K (GGUF) native packed ──
 
 cudaError_t q5k_gemv_cuda(
     const uint8_t* weight,
