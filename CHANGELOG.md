@@ -23,6 +23,17 @@ Progress spine. Entry classes recorded here the day they land: phase exits,
 default flips, and accept-or-reject verdicts (AGENTS.md §Docs lifecycle &
 progress spine).
 
+- **VERDICT — backward re-offload lifts the OPD-writeback device wall to seq
+  24576, but 256K needs LA-chunk not more offload** (2026-07-25, `e4be96108`;
+  win: [2026-07-25-backward-reoffload-device-win-host-wall](docs/experience/wins/2026-07-25-backward-reoffload-device-win-host-wall.md)).
+  Matched pod A/B on 27B-FP8: offload ON passes seq 24576 where OFF CUDA-OOMs —
+  the backward asymmetry was a real leak (replayed hidden fetched per-layer,
+  never re-offloaded, so all N co-resident). But the ON sweep then hits a host
+  memcg SIGKILL at 28672–32768 (device 20 GB free — offloaded hidden overruns
+  the besteffort pod RAM) and a device CUDA-OOM at 40960+ (one GDN layer's
+  O(seq) saved backward context fills 97 GB alone). Trainable ceiling moved
+  ~24576→~28672, one step not an order of magnitude. Keep the fix (net-positive
+  at default); redirect the 256K push to chunking the LA recompute working set.
 - **REJECT — #127 "train a DSv4 draft head"; the trained head is public**
   (2026-07-25; docs/architecture-dsv4.md §7 corrected).
   `deepseek-ai/DeepSeek-V4-Flash-DSpark` (MIT) ships a 3-stage head whose 4705
