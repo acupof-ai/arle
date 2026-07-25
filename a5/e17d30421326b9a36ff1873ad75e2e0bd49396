@@ -1,0 +1,23 @@
+crates/train/src/dspark_train.rs
+  s_9c91b86ec3fb55::t_06c13fa3b5789f 236-242,251
+crates/train/src/iso_spectrum.rs
+  s_9c91b86ec3fb55::t_23c17605c99e1e 125-127
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "a5e17d30421326b9a36ff1873ad75e2e0bd49396",
+  "prompts": {},
+  "sessions": {
+    "s_9c91b86ec3fb55": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4779911a-69b7-49db-bc83-daf5a48d6ca3",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
