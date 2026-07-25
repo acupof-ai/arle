@@ -1,6 +1,6 @@
 use crate::{
     AutogradError, Result,
-    backend::{Backend, CpuBackend, DeviceHandle},
+    backend::{Backend, CpuBackend, Device, DeviceHandle},
 };
 use std::{collections::HashSet, fmt, path::PathBuf, sync::Arc};
 
@@ -635,6 +635,30 @@ impl TensorStore {
         tensor.data.clear();
         tensor.checkpoint_residency = CheckpointResidency::None;
         Ok(())
+    }
+
+    /// Re-store a frozen leaf as bf16 device-resident (`--tape-precision bf16`).
+    /// No-op unless the flag is set and the backend is CUDA. Frozen leaves only:
+    /// the bf16 handle drops the f32 host mirror, so a later backward needing the
+    /// exact f32 value would read the widened (lossy) copy.
+    pub fn quantize_frozen_bf16(&mut self, id: TensorId) -> Result<()> {
+        if !crate::runtime_flags::tape_bf16() || self.backend().device() != Device::Cuda {
+            return Ok(());
+        }
+        self.ensure_device(id)?;
+        let (handle, shape) = {
+            let tensor = self.tensor(id)?;
+            let handle = tensor
+                .device_handle
+                .as_ref()
+                .ok_or(AutogradError::TapeInvariant(
+                    "quantize_frozen_bf16: tensor has no device handle",
+                ))?
+                .clone();
+            (handle, tensor.shape.clone())
+        };
+        let bf16 = self.backend().quantize_frozen_to_bf16(&handle, &shape)?;
+        self.replace_device_handle(id, bf16)
     }
 
     /// Drop the cached host mirror for a tensor after ensuring a device handle

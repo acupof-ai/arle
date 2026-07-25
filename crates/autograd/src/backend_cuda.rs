@@ -1062,6 +1062,29 @@ impl Backend for CudaBackend {
         }
     }
 
+    fn quantize_frozen_to_bf16(
+        &self,
+        handle: &DeviceHandle,
+        shape: &[usize],
+    ) -> Result<DeviceHandle> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (handle, shape);
+            todo!("GPU required: cuda bf16 quantize is unavailable under feature no-cuda")
+        }
+
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            // Idempotent: non-f32-Cuda handles pass through unchanged.
+            let DeviceHandle::Cuda(_) = handle else {
+                return Ok(handle.clone());
+            };
+            let src = self.cuda_slice(handle, "quantize_frozen_to_bf16")?;
+            let bits = self.local_f32_as_bf16(src, shape_size(shape))?;
+            Ok(DeviceHandle::CudaBf16(CudaBf16Storage::new(bits)))
+        }
+    }
+
     fn upload_fp8_block_scaled(
         &self,
         weight: &[u8],
