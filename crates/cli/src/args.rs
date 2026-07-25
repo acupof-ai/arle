@@ -739,6 +739,14 @@ pub(crate) struct ServeArgs {
     #[arg(long, value_name = "FILE")]
     pub(crate) dspark_train_out: Option<PathBuf>,
 
+    /// DSpark train sidecar learning rate. The default suits adapting a
+    /// pretrained head; a head grown from `w2 = 0` needs orders more, since the
+    /// logit bias must reach the top-2 gap (O(1)) to change any decision and
+    /// AdamW moves it ~lr per step. Aggressive values risk only acceptance —
+    /// the trunk verifies every token, so correctness cannot regress.
+    #[arg(long, value_name = "LR")]
+    pub(crate) dspark_train_lr: Option<f32>,
+
     /// Constrain DSpark training to the base checkpoint's singular spectrum,
     /// optimizing only the singular frames (ISO, arXiv:2607.19331). The step
     /// logs `iso_drift` either way, so a run without this flag measures whether
