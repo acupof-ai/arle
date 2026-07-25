@@ -6,7 +6,7 @@
 
 Task: dense_ffn ~26 ms/step profiled at M=16 vs ~3.2 ms "weight-read floor";
 plain decode 23 ms/tok vs "~7 ms roofline" (27 GB FP8 / 4 TB/s H20). Plan:
-[dspark plan §Next wall](../../plans/2026-07-09-dspark-dflash-spec-decode-qwen36.md).
+dspark plan §Next wall.
 Harness: `crates/infer-cuda/examples/fp8_smallm_gemm_probe.rs` (CUDA events,
 200 iters warmed, deterministic non-NaN fills) + one nsys pass; H20, GPU-idle,
 Qwen3.6-27B dense shapes.

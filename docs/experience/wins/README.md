@@ -41,7 +41,7 @@ and writing a fresh file would lose the trail.
 
 - **Benchmark snapshots that succeeded** → `wins/`
 - **Benchmark or runtime regressions, or recurring bugs** → [`../errors/`](../errors/)
-- **Forward-looking plans / project docs that haven't shipped yet** → [`../../plans/`](../../plans/) and [`../../projects/`](../../projects/)
+- **Forward-looking plans / project docs that haven't shipped yet** → [`../../plans/`](../../plans/) and `../../projects/`
 
 ---
 

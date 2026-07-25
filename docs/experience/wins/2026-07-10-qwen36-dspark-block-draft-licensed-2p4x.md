@@ -6,7 +6,7 @@
 ## Context
 
 `--spec-type dspark --mtp-draft-model <dir>` (plan:
-[2026-07-09-dspark-dflash-spec-decode-qwen36](../../plans/2026-07-09-dspark-dflash-spec-decode-qwen36.md)).
+2026-07-09-dspark-dflash-spec-decode-qwen36).
 Verify/rollback substrate reused from the MTP lane; drafter = z-lab DFlash
 5-layer block-16 (backbone-only; markov/confidence heads pending AEON/FR
 checkpoints). H20, Qwen3.6-27B-FP8, GPU-idle, greedy 500-tok probes.

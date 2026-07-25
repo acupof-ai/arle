@@ -3,7 +3,7 @@
 ## Context
 
 The agentic-OPD capability-curve plan
-([plans/2026-07-03-agentic-opd-27b-capability-curve.md](../../plans/2026-07-03-agentic-opd-27b-capability-curve.md))
+(plans/2026-07-03-agentic-opd-27b-capability-curve.md)
 needed a held-out task suite where the untrained 27B Qwen3.6-FP8 lands at a
 10–40% pass-rate so an RFT curve has dynamic range. Real SWE-bench-Pro was
 rejected up front (decoded 0-accept wall,

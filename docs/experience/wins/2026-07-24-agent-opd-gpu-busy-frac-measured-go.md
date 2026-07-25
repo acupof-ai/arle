@@ -3,7 +3,7 @@
 ## Context
 
 The online-RL acceleration survey
-([research](../../research/2026-07-23-online-rl-acceleration.md)) gated its
+(research) gated its
 biggest lever — collapsing serial group-rollouts into one concurrent
 mega-rollout — on one number: the GPU-active fraction inside the rollout wall.
 The `gpu_busy_frac` timer (engine-forward wall via `ENGINE_FORWARD_BUSY_MICROS`,

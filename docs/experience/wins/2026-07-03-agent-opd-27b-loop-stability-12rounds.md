@@ -3,7 +3,7 @@
 ## Goal
 
 First full-shape run of the agentic-OPD capability-curve harness
-([plan](../../plans/2026-07-03-agentic-opd-27b-capability-curve.md)): 12 train
+(plan): 12 train
 tasks × best-of-2 rollouts per round, held-out execution-eval (n=24, greedy)
 every 2 rounds plus a 3-repeat baseline envelope — the loop the 37.3×
 optimization campaign ([full20](2026-07-03-opd-full20-curve.md)) was built

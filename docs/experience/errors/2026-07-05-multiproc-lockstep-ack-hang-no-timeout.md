@@ -3,7 +3,7 @@
 ## Context
 
 Found while pod-verifying the DSv4 KV three-layer refactor
-([plan](../../plans/2026-07-04-dsv4-dsa-kv-three-layer.md),
+(plan,
 [wins entry](../wins/2026-07-05-dsv4-p1-p2-p4-needle-gate.md)): serving
 DeepSeek-V4-Flash-FP8 TP=4/EP=4 on 4×H20, a request with `prompt_tokens≈8106`
 hangs the entire server indefinitely (`/v1/stats` frozen at `steps=0`), while
@@ -188,7 +188,7 @@ Two separate open questions this surfaces, not one:
 
 ## Round 4 — SPMD admission livelock, fixed (`5fd6a8984`)
 
-Design doc: [plans/2026-07-05-spmd-admission-page-sync.md](../../plans/2026-07-05-spmd-admission-page-sync.md).
+Design doc: plans/2026-07-05-spmd-admission-page-sync.md.
 Live simultaneous 5-process gdb snapshots (coordinator + all 4 workers, 3
 timepoints ~15-40s apart) proved the stuck rank ROTATES (rank3 →
 {rank1,rank2} → rank1) while others idle — proof against a static 4-way NCCL
