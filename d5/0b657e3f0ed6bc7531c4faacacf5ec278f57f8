@@ -1,0 +1,35 @@
+crates/autograd/src/backend.rs
+  s_2eda122629d742::t_dfc8cbc712f0cb 1488-1489
+crates/autograd/src/backend_cuda.rs
+  s_2eda122629d742::t_326770a9029e53 1628,1630,6786
+crates/autograd/src/ops/broadcast.rs
+  s_2eda122629d742::t_06aca881255584 154
+crates/autograd/src/ops/matmul.rs
+  s_94bdb1f9b09061::t_f18399c6b9bbe4 148-153
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "d50b657e3f0ed6bc7531c4faacacf5ec278f57f8",
+  "prompts": {},
+  "sessions": {
+    "s_2eda122629d742": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ae0718f390e95791b",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_94bdb1f9b09061": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a1e0f679a9fe2d4a2",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
