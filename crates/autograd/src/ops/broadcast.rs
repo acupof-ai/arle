@@ -151,7 +151,7 @@ pub(crate) fn add_broadcast_backward(
     let a_requires_grad = store.tensor(a)?.requires_grad;
     let b_requires_grad = store.tensor(b)?.requires_grad;
 
-    // Wave 2 Commit A: route Dirty::Device upstream through
+    // Route Dirty::Device upstream through
     // `add_broadcast_backward_device` so the `[B, S, H]` upstream tensor
     // and the `[H]`-shaped b-grad stay on-device. grad_a is the upstream
     // tensor itself (no reduce); just share its handle when device-resident

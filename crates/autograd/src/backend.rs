@@ -1485,8 +1485,8 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
     ///
     /// CUDA overrides this with a single per-row NVRTC kernel so
     /// the `[B, S, V]` grad stays device-resident — keeps the `1 GB`
-    /// scatter-add output off the host-roundtrip path that the host
-    /// `gather_last_dim_backward` previously forced.
+    /// scatter-add output off the host-roundtrip path the host
+    /// `gather_last_dim_backward` forces.
     fn gather_last_dim_backward(
         &self,
         upstream: &DeviceHandle,

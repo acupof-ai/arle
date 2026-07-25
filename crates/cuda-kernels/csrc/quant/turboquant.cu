@@ -434,15 +434,12 @@ __global__ void turboquant_dequantize_kernel(
     kv_bf16[dst_offset] = __float2bfloat16(x_hat);
 }
 
-// ============================================================================
 // Kernel 3: TurboQuant Quantize Single Token (paged pool, decode path)
 //
 // Quantize 1 new token per request from bf16 working buffer → TQ paged pool.
 //
 // Grid:  (num_kv_heads, batch_size)
 // Block: (head_dim)
-// ============================================================================
-
 __global__ void turboquant_quantize_single_kernel(
     const __nv_bfloat16* __restrict__ kv_bf16,   // working buffer: [batch, kv_dim]
     uint8_t* __restrict__ pool_data,               // pool: [max_tokens, num_kv_heads * packed_per_head]
@@ -542,15 +539,12 @@ __global__ void turboquant_quantize_single_kernel(
     }
 }
 
-// ============================================================================
 // Kernel 4: TurboQuant Dequantize from Paged Pool
 //
 // Scatter-read from paged pool → contiguous bf16 working buffer.
 //
 // Grid:  (num_kv_heads, total_tokens)
 // Block: (head_dim)
-// ============================================================================
-
 __global__ void turboquant_dequantize_paged_kernel(
     const uint8_t* __restrict__ pool_data,        // [max_tokens, num_kv_heads * packed_per_head]
     const __half* __restrict__ pool_norms,         // [max_tokens, num_kv_heads]
@@ -607,10 +601,7 @@ __global__ void turboquant_dequantize_paged_kernel(
     kv_bf16[dst_offset] = __float2bfloat16(x_hat);
 }
 
-// ============================================================================
 // C API — launcher functions
-// ============================================================================
-
 extern "C" CUresult turboquant_quantize_kv_cuda(
     const void* kv_bf16,
     void* packed_out,
@@ -741,10 +732,7 @@ extern "C" CUresult turboquant_dequantize_paged_cuda(
     return cudaGetLastError() == cudaSuccess ? CUDA_SUCCESS : CUDA_ERROR_LAUNCH_FAILED;
 }
 
-// ============================================================================
 // Kernel 5: Dequantize Pool → Working Buffer (in-place NHD layout)
-// ============================================================================
-
 __global__ void turboquant_dequantize_inplace_kernel(
     const uint8_t* __restrict__ pool_data,
     const __half* __restrict__ pool_norms,

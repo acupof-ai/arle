@@ -17,7 +17,7 @@
 #include <cstdint>
 #include <cfloat>
 
-// ─── In-place Fast Walsh-Hadamard Transform in shared memory ───
+// In-place Fast Walsh-Hadamard Transform in shared memory.
 //
 // D must be a power of 2. Each thread handles one element.
 // After FWHT, output is scaled by 1/√D for normalization.
@@ -33,20 +33,17 @@ __device__ __forceinline__ void fwht_inplace(float* smem, int D, int tid) {
         }
     }
     __syncthreads();
-    // Normalize
     smem[tid] *= rsqrtf((float)D);
     __syncthreads();
 }
 
-// ─── Inverse FWHT (same as forward — FWHT is its own inverse up to scaling) ───
+// Inverse FWHT (same as forward — FWHT is its own inverse up to scaling).
 __device__ __forceinline__ void ifwht_inplace(float* smem, int D, int tid) {
     // FWHT is self-inverse: H * H = D * I, so iH = H / D.
     // We already have 1/√D from forward, so applying again gives 1/D * D = identity.
     // Just apply FWHT again (with same 1/√D normalization).
     fwht_inplace(smem, D, tid);
 }
-
-// ─── Warp reduction helpers ───
 
 __device__ __forceinline__ float warp_reduce_sum_fast(float val) {
     #pragma unroll
@@ -55,7 +52,7 @@ __device__ __forceinline__ float warp_reduce_sum_fast(float val) {
     return val;
 }
 
-// ─── Cooperative bitpack without atomics ───
+// Cooperative bitpack without atomics.
 //
 // Each thread computes its byte contribution and uses warp shuffle to
 // collect bits from neighboring threads into complete bytes.
