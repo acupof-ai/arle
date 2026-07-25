@@ -1,0 +1,37 @@
+crates/cli/src/args.rs
+  s_72b2867539854b::t_89d132394c78ed 750-755
+crates/cli/src/serve.rs
+  s_9c91b86ec3fb55::t_7c1590ff5c090b 208,228,428
+crates/infer-api/src/serve.rs
+  s_72b2867539854b::t_6234c54c58b98c 198-199
+crates/train/src/dspark_train.rs
+  s_72b2867539854b::t_88f5c9dd22a196 94-98,140
+docs/experience/wins/2026-07-25-dspark-self-rl-first-closed-loop.md
+  s_72b2867539854b::t_2e0044ae01b636 86-116
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "382cfda3e7248cef5cc16aefa7bfe6f1bb83600b",
+  "prompts": {},
+  "sessions": {
+    "s_72b2867539854b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "444258c2-05f4-4799-8de8-7b0e9a4accf7",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_9c91b86ec3fb55": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4779911a-69b7-49db-bc83-daf5a48d6ca3",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
