@@ -3,7 +3,7 @@
 ## Context
 
 Campaign item #1 measurement (plan
-[2026-07-11-high-concurrency-throughput](../../plans/2026-07-11-dsv4-high-concurrency-throughput-campaign.md)):
+2026-07-11-high-concurrency-throughput):
 quantify the finish-write-through decode-region reuse and prove reuse-ON does
 not regress the serving path. H20 TP=4 GPUs 4-7, DSv4-Flash-FP8, HEAD
 `025a93392`, binary `915362723201…`.

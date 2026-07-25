@@ -7,7 +7,7 @@
 Made the cc-harness (Claude-Code drives the served student) the online iterative
 OPD rollout, replacing the weak 8-turn in-process loop, and fixed the shared 17K
 system-prompt re-prefill. Plan:
-[cc-as-harness online OPD](../../plans/2026-07-13-cc-as-harness-online-opd.md).
+cc-as-harness online OPD.
 
 ## What worked
 

@@ -5,7 +5,7 @@
 The Metal disk tier (`MetalSsdTier` on the sharded-file substrate S3) was
 converged onto the shared `KvTierStore` (moved from `infer-cuda` to
 `kv-native-sys`, mmap substrate S2), and substrate S3 was deleted repo-wide
-([plan](../../plans/2026-07-10-metal-kv-tier-convergence.md)). Functional gates
+(plan). Functional gates
 passed (cli 209 tests, kv-native-sys 24); this is the runtime demote/promote
 smoke that was outstanding.
 

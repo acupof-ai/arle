@@ -16,7 +16,7 @@ P2+P4 (`2dd9d07c`) commit messages deferred: prove the `Dsv4BlockMap`
 comp-row single-sourcing (P1/P2) and the CSA select-boundary shape guard (P4)
 preserve correct inference on the >2048 comp-row-addressing path this
 refactor targets, per
-[the plan doc](../../plans/2026-07-04-dsv4-dsa-kv-three-layer.md).
+the plan doc.
 
 ## Results — needle matrix (non-degenerate filler, depth 0)
 

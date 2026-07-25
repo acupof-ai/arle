@@ -7,7 +7,7 @@
 ## Context
 
 Landed the finish-write-through decode-region reuse plan
-([2026-07-10-dsv4-finish-writethrough-reuse.md](../../plans/2026-07-10-dsv4-finish-writethrough-reuse.md))
+(2026-07-10-dsv4-finish-writethrough-reuse.md)
 behind `--dsv4-decode-reuse` (default OFF → byte-identical). On a request finish,
 the slot's full frontier state (generated-region content + the live carry —
 overlap/idx_overlap/ring/pending — captured at the exact finish position

@@ -2,7 +2,7 @@
 
 ## Context
 
-[P2.5](../../plans/2026-07-09-dspark-dflash-spec-decode-qwen36.md): prefix-cache-hit
+P2.5: prefix-cache-hit
 requests degraded to plain decode forever — the draft-ctx append gate required
 `ctx_len == start_pos` (fresh slot 0 vs restored start_pos>0) and `pending`
 required coverage from 0. At OPD's ~91% hit rate DSpark was near-inert.

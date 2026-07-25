@@ -3,7 +3,7 @@
 > Status: GPU gate RUN 2026-07-17 (H20, Qwen3.6-27B-FP8, depth=2, c=1) —
 > correctness PASS, speedup 1.21× (below the 1.3-2× expectation; depth sweep +
 > counters follow-up filed). Plan §P8
-> ([2026-07-16-agent-rl-unified-infra](../../plans/2026-07-16-agent-rl-unified-infra.md)).
+> (2026-07-16-agent-rl-unified-infra).
 
 ## Context
 

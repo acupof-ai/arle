@@ -4,7 +4,7 @@
 
 The OPD rollout is decode-bound and native NextN-MTP capped at ~1.03× (accept-
 length-limited). Plan
-[2026-07-09-dspark-dflash-spec-decode-qwen36](../../plans/2026-07-09-dspark-dflash-spec-decode-qwen36.md)
+2026-07-09-dspark-dflash-spec-decode-qwen36
 adopts the z-lab **DFlash** block drafter (backbone-only; our DSpark Markov +
 confidence heads are P3-trained) as an alternate draft source for the existing
 Qwen3.6 spec-decode substrate. P0 (contract) + load kill-gate already passed;

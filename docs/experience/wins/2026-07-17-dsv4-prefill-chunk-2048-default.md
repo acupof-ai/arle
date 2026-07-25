@@ -5,7 +5,7 @@
 ## Verdict
 
 Default flip LICENSED (plan Phase 3,
-[plan](../../plans/2026-07-17-dsv4-chunked-prefill-unification.md)). Every
+plan). Every
 DSv4 prefill tick was hard-capped at 128 tokens (planner one-unit cap ×
 sliding_window alignment; the CLI flag was cosmetic). Effective chunk is now
 2048 by default (`ARLE_DSV4_PREFILL_CHUNK` overrides both ways).
