@@ -28,17 +28,31 @@ chain drafts full width). The draft head works. The step does not.
 
 ## Root Cause
 
-The step carried a cost that belongs to a default-off feature. Both DSpark
-verify lanes (`executor/dsv4.rs:1843`, `:2140`) called
-`capture_dspark_experience{,_hidden}` unconditionally, and those do **two
-vocab-wide bf16 D2H copies plus two full `ctx.sync()` per verify step** before
-any shape guard runs. The only consumer is the `--dspark-train` RL sidecar,
-which was off.
+`aec71ef16` (2026-07-21 16:13, "wire DSv4-Flash into train sidecar") added the
+`capture_dspark_experience{,_hidden}` call sites to both DSpark verify lanes
+(`executor/dsv4.rs:1843`, `:2140`) — **unconditionally**. Each does two
+vocab-wide bf16 D2H copies, two host bf16→f32 conversions of ~1.4M elements, and
+two full `ctx.sync()`, per verify step, before any shape guard runs. The only
+consumer is the `--dspark-train` sidecar, which is default-off.
 
-A full stream sync per step serializes a TP=4 NCCL pipeline — which is exactly
-the shape of the observed loss: ~0 at c=1, worsening monotonically to −50% at
-c=16. So the concurrency collapse is not attributable to verify overhead until
-the sync is gone.
+**This is a regression against a measured win, not a first-measurement
+disappointment.** `591772a43` (2026-07-20 18:55) measured DSpark **c=1 +63.8%**
+(63.7 vs 38.9 tok/s,
+[win](../wins/2026-07-20-dspark-sliding-window-c1-win-c8-regress.md)).
+`aec71ef16` lands 21 h later — after that measurement and after the 07-21
+batched-verify work — and `git log -S"capture_dspark_experience"` confirms it is
+the commit that introduced the call sites. Today's c=1 is **+1.4%**.
+
+Magnitude checks out, so the attribution is not just ordering: 07-20 c=1 63.7
+tok/s at ~2.5 tok/step ⇒ 39 ms/step; today 43.3 tok/s at 2.48 tok/step ⇒ 57
+ms/step. The +18 ms/step gap is the right size for two syncs plus 1.4M host
+element conversions. At c≥4 the same per-step sync serializes the whole TP=4
+NCCL batch, giving the monotone −28 / −47 / −50%.
+
+**Why it sat unmeasured for 4 days:** the two attempts in between were both
+blocked, not negative — 07-21's DSpark arm OOM'd on a stale-memory GPU, and the
+07-19 baselines row had DSpark never triggering. A blocked arm reads the same as
+a quiet one on a dashboard.
 
 ## Fix
 
@@ -48,8 +62,16 @@ initializes the global buffer (`spawn_dspark_train_sidecar` →
 `--dspark-train` signal — no second flag to drift out of sync. Both capture
 entry points bail on `!capturing()` before touching device memory.
 
+The clean re-measure must use `bench-prompts-64.jsonl` + `max_tokens 256` — the
+07-20 dataset — so the prediction is falsifiable: c=1 should return to ~63 tok/s.
+Anything materially short of that means a second cause is still in the path.
+
 ## Rule
 
+- **A feature-wiring commit is a perf change to every path it touches.** No bench
+  entry was cut for `aec71ef16` because it read as plumbing for a default-off
+  flag; it silently added a stream sync to the hot loop. The gate is "does this
+  execute on the default path", not "is the feature on by default".
 - **A hot-path producer for a default-off consumer must be gated on the consumer,
   not on its own arguments.** The #176 guard checked shapes and dropped the push
   — but the D2H and the syncs ran *before* the guard, so the cost was paid on
