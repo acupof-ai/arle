@@ -63,6 +63,7 @@ static DSV4_MOE_CONTIG_DECODE: AtomicBool = AtomicBool::new(false);
 static DSV4_DECODE_REUSE: AtomicBool = AtomicBool::new(true); // default ON (2026-07-11 pod license)
 static MTP_ADAPTIVE: AtomicBool = AtomicBool::new(false);
 static MTP_MIN_ACCEPT_BITS: AtomicU32 = AtomicU32::new(0x3F0C_CCCD); // 0.55f32
+static SPEC_MAX_BATCH: AtomicUsize = AtomicUsize::new(1);
 static DEEPEP_NUM_SMS: AtomicU32 = AtomicU32::new(20);
 
 /// Apply the CLI-resolved flags. Must run before executor construction; the
@@ -87,6 +88,7 @@ pub fn apply_runtime_flags(f: &CudaRuntimeFlags) {
     DSV4_DECODE_REUSE.store(f.dsv4_decode_reuse, Relaxed);
     MTP_ADAPTIVE.store(f.mtp_adaptive, Relaxed);
     MTP_MIN_ACCEPT_BITS.store(f.mtp_min_accept.to_bits(), Relaxed);
+    SPEC_MAX_BATCH.store(f.spec_max_batch.max(1), Relaxed);
     DEEPEP_NUM_SMS.store(f.deepep_num_sms, Relaxed);
     DEEPEP_MAX_DISPATCH_TOKENS_PER_RANK
         .store(f.deepep_max_dispatch_tokens_per_rank.unwrap_or(0), Relaxed);
@@ -180,6 +182,11 @@ pub(crate) fn mtp_adaptive() -> bool {
 }
 pub(crate) fn mtp_min_accept() -> f32 {
     f32::from_bits(MTP_MIN_ACCEPT_BITS.load(Relaxed))
+}
+/// Concurrency gate for speculative decode (`--spec-max-batch`): speculate only
+/// when the decode batch is ≤ this, else route to the plain batched path.
+pub(crate) fn spec_max_batch() -> usize {
+    SPEC_MAX_BATCH.load(Relaxed)
 }
 #[cfg(feature = "deepep")]
 pub(crate) fn deepep_num_sms() -> u32 {

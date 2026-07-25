@@ -14,6 +14,43 @@ use crate::dsv4::SpecVerifySchedule;
 
 use super::{DeviceVec, Dsv4CudaExecutor};
 
+/// Which speculative-decode scheme a serve is configured for. Both CUDA
+/// executors resolve this from their own state (`dspark`/`mtp` handles).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SpecKind {
+    None,
+    Mtp,
+    Dspark,
+}
+
+/// The decode path a batch of `n_rows` should take this tick.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum DecodeRoute {
+    /// Plain batched (or single-row) decode: 1 token/row, scales with batch.
+    Plain,
+    /// MTP speculative decode — c=1 / low-concurrency win.
+    Mtp,
+    /// DSpark speculative decode — c=1 / low-concurrency win.
+    Dspark,
+}
+
+/// Speculate only at or below the concurrency gate. At small batch the GPU is
+/// memory-bound and the B+1 verify positions are ~free, so speculation wins;
+/// above the gate the target forward is compute-bound and the same verify costs
+/// ~(B+1)× step time for ~2.5 committed tokens, a net loss — so fall back to the
+/// plain batched path that scales. `gate` is `--spec-max-batch` (default 1).
+/// Pure so the routing is unit-tested without a GPU.
+pub(super) fn route_decode(spec_kind: SpecKind, n_rows: usize, gate: usize) -> DecodeRoute {
+    if spec_kind == SpecKind::None || n_rows > gate {
+        return DecodeRoute::Plain;
+    }
+    match spec_kind {
+        SpecKind::Dspark => DecodeRoute::Dspark,
+        SpecKind::Mtp => DecodeRoute::Mtp,
+        SpecKind::None => DecodeRoute::Plain,
+    }
+}
+
 fn mtp_phase_time_enabled() -> bool {
     matches!(
         std::env::var("ARLE_DSV4_MTP_PHASE_TIME").as_deref(),
@@ -668,7 +705,22 @@ impl Dsv4CudaExecutor {
 
 #[cfg(test)]
 mod tests {
-    use super::{DraftChain, DraftNode, mtp_should_speculate};
+    use super::{DecodeRoute, DraftChain, DraftNode, SpecKind, mtp_should_speculate, route_decode};
+
+    #[test]
+    fn route_gate_speculates_at_or_below_gate_plain_above() {
+        // No spec configured -> always Plain, any batch.
+        assert_eq!(route_decode(SpecKind::None, 1, 1), DecodeRoute::Plain);
+        assert_eq!(route_decode(SpecKind::None, 8, 1), DecodeRoute::Plain);
+        // Default gate=1: only true c=1 speculates.
+        assert_eq!(route_decode(SpecKind::Dspark, 1, 1), DecodeRoute::Dspark);
+        assert_eq!(route_decode(SpecKind::Mtp, 1, 1), DecodeRoute::Mtp);
+        assert_eq!(route_decode(SpecKind::Dspark, 2, 1), DecodeRoute::Plain);
+        assert_eq!(route_decode(SpecKind::Mtp, 4, 1), DecodeRoute::Plain);
+        // Raised gate keeps spec through the gate, plain past it.
+        assert_eq!(route_decode(SpecKind::Dspark, 4, 4), DecodeRoute::Dspark);
+        assert_eq!(route_decode(SpecKind::Dspark, 5, 4), DecodeRoute::Plain);
+    }
 
     #[test]
     fn mtp_gate_speculates_high_accept_skips_low_with_probe() {

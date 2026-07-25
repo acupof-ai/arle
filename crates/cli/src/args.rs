@@ -919,6 +919,12 @@ pub(crate) struct ServeArgs {
     #[arg(long, default_value_t = 0.55, value_name = "F")]
     pub(crate) mtp_min_accept: f32,
 
+    /// Speculate (MTP/DSpark) only when the decode batch is ≤ this; above it,
+    /// spec is a compute-bound loss, so decode routes to the plain batched path.
+    /// Default 1: only true c=1 speculates.
+    #[arg(long, default_value_t = 1, value_name = "N")]
+    pub(crate) spec_max_batch: usize,
+
     /// DeepEP intranode SM budget (positive, even).
     #[arg(long, default_value_t = 20, value_name = "N")]
     pub(crate) deepep_num_sms: u32,
@@ -1000,6 +1006,7 @@ impl ServeArgs {
             dsv4_decode_reuse: self.dsv4_decode_reuse,
             mtp_adaptive: self.mtp_adaptive,
             mtp_min_accept: self.mtp_min_accept,
+            spec_max_batch: self.spec_max_batch,
             deepep_num_sms: self.deepep_num_sms,
             deepep_max_dispatch_tokens_per_rank: self.deepep_max_dispatch_tokens_per_rank,
         }

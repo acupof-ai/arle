@@ -2480,44 +2480,14 @@ impl Qwen35CudaExecutor {
             return Ok(StepOutput { tokens: Vec::new() });
         }
 
-        // rows == 1 keeps the existing single-row path byte-identical
-        // (including the whole-step B=1 decode-graph lane, which is gated to
-        // rows==1 PLANS — batched/mixed steps never capture or replay).
-        if rows == 1 {
-            let (slot, (token, logprob)) = if let Some(row) = plan.prefill_rows.first() {
-                (row.slot, self.submit_prefill_row(row)?)
-            } else {
-                let row = &plan.decode_rows[0];
-                if self.dspark.is_some() {
-                    return Ok(StepOutput {
-                        tokens: self.dspark_decode_row(row)?,
-                    });
-                }
-                if self.mtp.is_some() {
-                    return Ok(StepOutput {
-                        tokens: self.mtp_decode_row(row)?,
-                    });
-                }
-                (
-                    row.slot,
-                    self.submit_decode_row(row, /* allow_graph = */ true)?,
-                )
-            };
-            return Ok(StepOutput {
-                tokens: vec![SlotToken {
-                    slot,
-                    token,
-                    logprob,
-                    finish: None,
-                }],
-            });
-        }
+        // A decode-only single-row plan is the only one eligible for the
+        // whole-step B=1 decode-graph lane (`allow_graph`); it is gated to
+        // rows==1 PLANS so batched/mixed steps never capture or replay.
+        let allow_graph = plan.prefill_rows.is_empty() && plan.decode_rows.len() == 1;
 
-        // Multi-row plans (DSv4 executor pattern): per-prefill single-row
-        // sub-steps, then ONE decode sub-batch. Plan rows always address
-        // disjoint slots (a request is either Prefilling or Decoding), so the
-        // sequential sub-steps are math-identical to consecutive single-mode
-        // ticks.
+        // Plan rows always address disjoint slots (a request is either
+        // Prefilling or Decoding), so the sequential prefill sub-steps below are
+        // math-identical to consecutive single-mode ticks.
         let mut seen_slots = std::collections::BTreeSet::new();
         for slot in plan
             .prefill_rows
@@ -2541,38 +2511,66 @@ impl Qwen35CudaExecutor {
                 finish: None,
             });
         }
-        if self.dspark.is_some() {
-            // DSpark decode is per-row (each row runs its own draft + block
-            // verify); batched spec verify is a later increment.
-            for row in &plan.decode_rows {
-                tokens.extend(self.dspark_decode_row(row)?);
-            }
-            return Ok(StepOutput { tokens });
-        }
-        if self.mtp.is_some() {
-            for row in &plan.decode_rows {
-                tokens.extend(self.mtp_decode_row(row)?);
-            }
-            return Ok(StepOutput { tokens });
-        }
-        match plan.decode_rows.len() {
-            0 => {}
-            1 => {
-                // Mixed tick with a single decode row: eager (the B=1 graph
-                // lane stays gated to rows==1 plans in stage 1).
-                let row = &plan.decode_rows[0];
-                let (token, logprob) =
-                    self.submit_decode_row(row, /* allow_graph = */ false)?;
-                tokens.push(SlotToken {
-                    slot: row.slot,
-                    token,
-                    logprob,
-                    finish: None,
-                });
-            }
-            _ => tokens.extend(self.submit_decode_batch(&plan.decode_rows)?),
-        }
+        tokens.extend(self.dispatch_decode_rows(&plan.decode_rows, allow_graph)?);
         Ok(StepOutput { tokens })
+    }
+
+    /// The spec scheme this executor is configured for (`--spec-type`).
+    fn spec_kind(&self) -> super::spec_decode::SpecKind {
+        if self.dspark.is_some() {
+            super::spec_decode::SpecKind::Dspark
+        } else if self.mtp.is_some() {
+            super::spec_decode::SpecKind::Mtp
+        } else {
+            super::spec_decode::SpecKind::None
+        }
+    }
+
+    /// Route a decode sub-batch through the concurrency gate, then execute the
+    /// chosen path. This is the single `dspark → mtp → plain` dispatch ladder for
+    /// both the B=1 and batched entry points. At or below `--spec-max-batch` a
+    /// spec scheme drafts per row (the c=1 win); above it — where spec is a
+    /// compute-bound loss — decode falls to the plain batched path that scales.
+    fn dispatch_decode_rows(
+        &mut self,
+        decode_rows: &[DecodeRow],
+        allow_graph: bool,
+    ) -> Result<Vec<SlotToken>> {
+        use super::spec_decode::DecodeRoute;
+        let route = super::spec_decode::route_decode(
+            self.spec_kind(),
+            decode_rows.len(),
+            crate::runtime_flags::spec_max_batch(),
+        );
+        match route {
+            DecodeRoute::Dspark => {
+                let mut tokens = Vec::with_capacity(decode_rows.len());
+                for row in decode_rows {
+                    tokens.extend(self.dspark_decode_row(row)?);
+                }
+                Ok(tokens)
+            }
+            DecodeRoute::Mtp => {
+                let mut tokens = Vec::with_capacity(decode_rows.len());
+                for row in decode_rows {
+                    tokens.extend(self.mtp_decode_row(row)?);
+                }
+                Ok(tokens)
+            }
+            DecodeRoute::Plain => match decode_rows {
+                [] => Ok(Vec::new()),
+                [row] => {
+                    let (token, logprob) = self.submit_decode_row(row, allow_graph)?;
+                    Ok(vec![SlotToken {
+                        slot: row.slot,
+                        token,
+                        logprob,
+                        finish: None,
+                    }])
+                }
+                rows => self.submit_decode_batch(rows),
+            },
+        }
     }
 
     /// One prefill row as its own single-row sub-step (the pre-batching
@@ -3431,6 +3429,8 @@ mod tier_io_tests {
             None,
             0.0,
             None,
+            None,
+            None,
         )
         .expect("load Qwen3.6 W4A16 executor");
         executor.decode_graph_armed = false;
@@ -3682,6 +3682,8 @@ mod tier_io_tests {
             None,
             0.0,
             None,
+            None,
+            None,
         )
         .expect("load Qwen3.6 W4A16 executor");
         executor.decode_graph_armed = false;
@@ -3865,6 +3867,8 @@ mod tier_io_tests {
             0.9,
             None,
             0.0,
+            None,
+            None,
             None,
         )
         .expect("load Qwen3.6 W4A16 executor");
@@ -4102,6 +4106,8 @@ mod tier_io_tests {
             0.9,
             None,
             0.0,
+            None,
+            None,
             None,
         )
         .expect("load Qwen3.6 W4A16 executor");

@@ -2288,10 +2288,30 @@ impl Dsv4CudaExecutor {
             return Ok(out);
         }
 
-        // B>1 path. DSpark drafts per-slot (serial 3-stage forward) but verifies
-        // ALL chains in ONE batched target forward (`dspark_decode_tokens_batched`),
+        // B>1 path. The concurrency gate (`--spec-max-batch`, default 1) decides
+        // the route: spec drafts only at or below the gate (the c=1 win); above
+        // it spec is a compute-bound loss, so decode falls to the plain batched
+        // path that scales. Same `route_decode` the qwen35 executor uses.
+        use super::spec_decode::{DecodeRoute, SpecKind, route_decode};
+        let spec_on = self.spec_requested();
+        let all_greedy = batch.rows.iter().all(|row| row.params.is_greedy());
+        let spec_kind = if self.dspark.is_some() {
+            SpecKind::Dspark
+        } else if spec_on {
+            SpecKind::Mtp
+        } else {
+            SpecKind::None
+        };
+        let route = route_decode(
+            spec_kind,
+            batch.rows.len(),
+            crate::runtime_flags::spec_max_batch(),
+        );
+
+        // DSpark drafts per-slot (serial 3-stage forward) but verifies ALL chains
+        // in ONE batched target forward (`dspark_decode_tokens_batched`),
         // amortizing the heaviest phase across the batch.
-        if self.dspark.is_some() {
+        if route == DecodeRoute::Dspark {
             // The batched verify path requires FlashMLA sparse prefill
             // (`mla_attention` chain-verify lane); without it, fall back to
             // per-slot dispatch (the pre-batch behavior — correct but slower).
@@ -2314,9 +2334,7 @@ impl Dsv4CudaExecutor {
             }
             return Ok(out);
         }
-        let spec_on = self.spec_requested();
-        let all_greedy = batch.rows.iter().all(|row| row.params.is_greedy());
-        if spec_on && all_greedy && self.dspark.is_none() {
+        if route == DecodeRoute::Mtp && all_greedy {
             // Self-heal an un-seeded / desynced MTP stream (#140), the batched
             // twin of the B=1 path: a slot entering Decoding without a tail
             // prefill (full prefix-cache hit / whole-slot promote) has pending=
@@ -2381,9 +2399,10 @@ impl Dsv4CudaExecutor {
         }
 
         // True batched decode (layer-major driver, batched attention + grouped
-        // MoE). B=1 is the single-row reference above; B>1 always batches. If
-        // spec was requested but sampling is not greedy, disable spec state for
-        // these rows and use the same normal batched decode lane.
+        // MoE). B=1 is the single-row reference above; B>1 always batches.
+        // Reached when spec was requested but this batch routed to Plain — the
+        // concurrency gate (n_rows > spec_max_batch) or non-greedy sampling. Drop
+        // the per-row spec state so a later c=1 tick re-seeds cleanly.
         if spec_on {
             for row in &batch.rows {
                 self.spec_slots[row.slot] = Dsv4SpecSlotState::default();
