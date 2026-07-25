@@ -6,8 +6,7 @@
 > guidellm attempt. Two more environment-layer blockers were found and fixed en
 > route (guidellm CLI version drift; a transformers/checkpoint config-load
 > bug). But the canonical **sweep** profile still cannot complete at TP=4 — a
-> genuine, reproduced (round 2, `2026-07-06-bench-guidellm-dsv4-mtp-tp4.md`)
-> capacity ceiling: only **1** concurrent 4096-token request fits in the KV
+> genuine, reproduced (round 2) capacity ceiling: only **1** concurrent 4096-token request fits in the KV
 > pool at the max `--max-total-tokens` the MTP startup gate allows. A bounded
 > c=1 exploration run (non-canonical) produced real, guidellm-computed
 > numbers. GPU1 was occupied the entire session (same foreign tenant as
@@ -325,8 +324,8 @@ Additional columns from the raw table:
 
 ## Δ vs baseline
 
-- **Baseline:** [2026-07-06 TP=4 attempt](2026-07-06-bench-guidellm-dsv4-mtp-tp4.md)
-  (blocked entirely by the SSE-usage bug; zero guidellm-computed numbers).
+- **Baseline:** the 2026-07-06 TP=4 attempt (blocked entirely by the SSE-usage
+  bug; zero guidellm-computed numbers).
   This session is the first to produce a real, tool-computed guidellm table
   for DSv4+MTP, even though it's the non-canonical c=1 shape rather than the
   full sweep.

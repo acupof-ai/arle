@@ -354,14 +354,6 @@ write layout against the decode-time read layout for an off-by-one.
 
 ---
 
-**Background reading (industry landscape, not project status)**:
-- [`resources/kv-cache-quantization.md`](resources/kv-cache-quantization.md)
- — methods survey (uniform, heterogeneous K/V, KIVI, KVQuant,
- TurboQuant), frameworks (LMDeploy, TensorRT-LLM, llm-compressor),
- evaluation methodology.
-
----
-
 ## 7. Update rule
 
 If the status of any quantization scheme changes (new format, fix
