@@ -1,7 +1,9 @@
 # DSpark's −50% at c=16 was a default-off training sidecar's stream sync (#183)
 
-> Status: gate landed, **re-measure pending-remote** (#183). The DSpark
-> accept-or-kill verdict (#128) is NOT decidable from the 2026-07-25 run.
+> Status: gate landed; clean re-measure DONE on `6aa4ca6d1` (#183+#184). The
+> per-step-sync collapse is GONE, but DSpark c=1 came back at **+5.0%**, not the
+> predicted ~+63% — so a second effect remains and the #128 verdict is still
+> open (see §Re-measure).
 
 ## Context
 
@@ -66,7 +68,39 @@ The clean re-measure must use `bench-prompts-64.jsonl` + `max_tokens 256` — th
 07-20 dataset — so the prediction is falsifiable: c=1 should return to ~63 tok/s.
 Anything materially short of that means a second cause is still in the path.
 
-## Rule
+## Re-measure (2026-07-25, `6aa4ca6d1`, #183 gate + #184 scratch)
+
+Clean 6-arm run, DSv4-Flash-FP8 4×H20 TP=4 GPUs 4-7, dataset
+`dspark_natural_128in_128out.jsonl`, **max_tokens 128**, 60 s/point, 0 errors.
+Raw: pod `bench-output/2026-07-25-R2-dsv4-*`, verified vs `result.json`.
+
+| c | no-spec | DSpark | Δ | (contaminated 07-25) |
+|---|---:|---:|---:|---:|
+| 1 | 42.39 | **44.52** | **+5.0%** | +1.4% |
+| 4 | 79.46 | 61.00 | −23.2% | −28.1% |
+| 8 | 136.44 | 76.57 | −43.9% | −47.3% |
+| 16 | 174.46 | 90.66 | −48.0% | −49.9% |
+
+**The sync collapse is real and fixed** — but the curve is only mildly better,
+NOT restored to the 07-20 +63.8%. Two reasons the c≥4 arm is still net-negative,
+neither of which the gate addresses:
+
+1. **Prediction MISSED, honestly.** §Fix predicted c=1 ~63 tok/s on the *07-20
+   dataset* (`bench-prompts-64` / max_tokens 256). This run used the 128/128
+   natural set, a **different fingerprint** — so +5.0% vs +63.8% is not a clean
+   falsification, but it is NOT the predicted return either. The 07-20 number is
+   not reproduced; whether that gap is the dataset or a second cause is
+   **undecided** — a same-dataset (256-out) rerun is still owed before #128.
+2. **Slot count, not just sync.** #184 cut DSpark per_slot 645→607MB (22 slots)
+   vs no-spec's 338MB (59 slots). At c≥4 the DSpark arm runs fewer concurrent
+   slots than no-spec — a real capacity gap the sync gate does not touch. The
+   arms still differ in more than speculation.
+
+**Verdict: DSpark is a c=1 / low-concurrency win** (+5% DSv4, +57.5% on 27B
+single-GPU where c=1 is decode-bound), net-negative at c≥4 on this shape. #128
+accept-or-kill still needs the same-dataset 256-out rerun to close reason (1).
+
+## Rule (open items above)
 
 - **A feature-wiring commit is a perf change to every path it touches.** No bench
   entry was cut for `aec71ef16` because it read as plumbing for a default-off
