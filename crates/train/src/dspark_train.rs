@@ -93,9 +93,14 @@ pub struct DsparkTrainConfig {
     pub learning_rate: f32,
     pub batch_size: usize,
     pub baseline_ema_alpha: f32,
-    /// Initial value for the EMA baseline (the reward's running mean).
-    /// Default 0.5 (midpoint of [0, 1] acceptance ratio).
-    pub baseline_init: f32,
+    /// Starting value for the EMA baseline (the reward's running mean).
+    /// `None` (default) seeds it from the first batch's mean reward. A pinned
+    /// value biases every advantage until the EMA walks to the true mean, which
+    /// at `baseline_ema_alpha` 0.01 takes hundreds of steps: the old 0.5 default
+    /// against a measured mean reward of 0.20 left `r - baseline` negative on
+    /// every step for ~340 steps, so the policy-gradient term pushed down the
+    /// log-prob of every drafted token regardless of whether it was accepted.
+    pub baseline_init: Option<f32>,
     /// Weight on the supervised probability-matching loss. The policy-gradient
     /// loss receives weight `1.0 - prob_match_alpha`. Default 0.5.
     pub prob_match_alpha: f32,
@@ -129,7 +134,7 @@ impl Default for DsparkTrainConfig {
             learning_rate: 1e-4,
             batch_size: 64,
             baseline_ema_alpha: 0.01,
-            baseline_init: 0.5,
+            baseline_init: None,
             prob_match_alpha: 0.5,
             loss_decay_gamma: Some(4.0),
             max_grad_norm: Some(1.0),
@@ -193,7 +198,7 @@ impl DsparkTrainer {
         let store = TensorStore::with_backend(backend);
         let tape = Tape::new();
         let optim = AdamW::new(config.learning_rate, (0.9, 0.999), 1e-8, 0.0);
-        let baseline_ema = config.baseline_init;
+        let baseline_ema = config.baseline_init.unwrap_or(0.0);
 
         Ok(Self {
             config,
@@ -429,8 +434,15 @@ impl DsparkTrainer {
             ops::gather_last_dim(log_probs_id, &pg_tokens, &mut self.store, &mut self.tape)?;
 
         let mean_reward: f32 = rewards.iter().sum::<f32>() / batch as f32;
-        self.baseline_ema = (1.0 - self.config.baseline_ema_alpha) * self.baseline_ema
-            + self.config.baseline_ema_alpha * mean_reward;
+        if self.steps == 0 && self.config.baseline_init.is_none() {
+            // Seed from data, not from a guess: an advantage centred on the
+            // wrong constant is a uniform push away from whatever the drafter
+            // currently proposes.
+            self.baseline_ema = mean_reward;
+        } else {
+            self.baseline_ema = (1.0 - self.config.baseline_ema_alpha) * self.baseline_ema
+                + self.config.baseline_ema_alpha * mean_reward;
+        }
         let baseline = self.baseline_ema;
         // Per-token advantage × position weight.
         let weighted_adv: Vec<f32> = row_rewards

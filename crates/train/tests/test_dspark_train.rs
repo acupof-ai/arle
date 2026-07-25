@@ -143,7 +143,7 @@ fn dspark_trainer_serve_frame_and_alignment() {
         learning_rate: 1e-4,
         batch_size: 1,
         baseline_ema_alpha: ema_alpha,
-        baseline_init,
+        baseline_init: Some(baseline_init),
         prob_match_alpha: alpha,
         loss_decay_gamma: Some(gamma),
         max_grad_norm: Some(1.0),
