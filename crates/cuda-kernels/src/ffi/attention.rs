@@ -152,6 +152,27 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    /// Ragged-window ring variant of [`nonpaged_prefill_attention_ring_cuda`]:
+    /// one launch for `seq_len` rows with per-row key ranges. `ring_base_dev[t]`
+    /// / `kv_len_dev[t]` (device i32, `seq_len` each) are row t's window
+    /// `[base, base+len)`, walked non-causally. Ranges are device-resident, so
+    /// the caller must guarantee `kv_len_dev[t] <= ring_modulus`.
+    pub fn nonpaged_prefill_attention_ring_varlen_cuda(
+        q: *const Half,
+        k_cache: *const Half,
+        v_cache: *const Half,
+        out: *mut Half,
+        num_q_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        seq_len: i32,
+        ring_base_dev: *const i32,
+        kv_len_dev: *const i32,
+        ring_modulus: i32,
+        sm_scale: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
     /// Device-position variant of [`nonpaged_prefill_attention_cuda`]:
     /// `start_pos_dev` is one device-resident i32 (kv_len = *start_pos_dev +
     /// token + 1 inside the kernel), making the launch CUDA-graph

@@ -306,6 +306,9 @@ pub(crate) struct DsparkScratch {
     ids: SliceSlot<i32>,
     /// Absolute (unshifted) start position for sliding-ring prep launches.
     start_pos_abs: SliceSlot<i32>,
+    /// Per-row draft attention windows, `[ring_base; block] ++ [kv_len; block]`
+    /// — identical for every layer, so one upload serves the whole forward.
+    attn_win: SliceSlot<i32>,
     hidden: HiddenSlot,
     normed: HiddenSlot,
     hidden_mid: HiddenSlot,
@@ -860,6 +863,25 @@ impl Qwen35Model {
         let embed_ms = super::mtp_phase_lap(ctx, &mut pt);
 
         let start_abs = scratch.start_pos_abs.upload(&self.ctx, &[start as i32])?;
+        // Per-row attention windows. HF sliding window keeps keys with
+        // q_pos - k_pos < window, never below `ctx_base`; the ctx buffer is an
+        // absolute ring, so row `row` walks `[lo, start+block)` mapped through
+        // `% cap`. `lo` reads only start/row/window/ctx_base — layer-independent,
+        // so one table serves all 5 layers and one ragged-window launch replaces
+        // `block` single-row ones.
+        let mut win = vec![0i32; 2 * block];
+        for row in 0..block {
+            let lo = (start + row)
+                .saturating_sub(cfg.sliding_window - 1)
+                .max(df.ctx_base);
+            let kv_len = kv_len_total - lo;
+            // kv_len == q_pos+1−lo ≤ window+block == cap, so the ring read never
+            // revisits a physical row (the kernel cannot check this host-side).
+            ensure!(kv_len <= head.cap, "dspark draft row window {kv_len} > cap");
+            win[row] = lo as i32;
+            win[block + row] = kv_len as i32;
+        }
+        let win_dev = scratch.attn_win.upload(&self.ctx, &win)?;
         for (li, layer) in head.layers.iter().enumerate() {
             let cap_li = head.cap;
             let h = scratch.hidden.get(ctx, hidden, block)?;
@@ -921,54 +943,38 @@ impl Qwen35Model {
             }
 
             prep_ms += super::mtp_phase_lap(ctx, &mut pt);
-            // Non-causal attention: every noise row attends the whole
-            // `[ctx ++ block]` key range. Per-row launches with `seq_len=1` and
-            // `kv_len = start+block` express the non-causal window through the
-            // causal kernel; sliding layers shift the K/V base by `lo` rows
-            // (a uniform in-band offset in the `[head][cap][dim]` layout).
+            // Non-causal attention: every noise row attends its whole window of
+            // the `[ctx ++ block]` key range, in one ragged-window launch.
             let attn_heads = scratch.attn_heads.get(ctx, q_dim, block)?;
             {
                 let sm_scale = 1.0 / (cfg.head_dim as f32).sqrt();
-                let elem = std::mem::size_of::<ffi::Half>() as u64;
                 let (q_ptr, _g0) = q_prepped.data.device_ptr(&ctx.stream);
                 let (kc_ptr, _g1) = df.k_ctx[li].data.device_ptr(&ctx.stream);
                 let (vc_ptr, _g2) = df.v_ctx[li].data.device_ptr(&ctx.stream);
                 let (o_ptr, _g3) = attn_heads.data.device_ptr_mut(&ctx.stream);
+                let (w_ptr, _g4) = win_dev.device_ptr(&ctx.stream);
                 let nq = cfg.num_attention_heads as i32;
                 let nkv = cfg.num_key_value_heads as i32;
                 let hd = cfg.head_dim as i32;
-                for row in 0..block {
-                    let q_pos = start + row;
-                    let q_off = (q_ptr + (row * q_dim) as u64 * elem) as *const ffi::Half;
-                    let o_off = (o_ptr + (row * q_dim) as u64 * elem) as *mut ffi::Half;
-                    // HF sliding window keeps keys with q_pos - k_pos < window;
-                    // never below ctx_base. The ctx buffer is an absolute
-                    // ring: walk `[lo, start+block)` mapped through `% cap_li`
-                    // (order-independent softmax → identical to a linear walk).
-                    let lo = q_pos
-                        .saturating_sub(cfg.sliding_window - 1)
-                        .max(df.ctx_base);
-                    let kv_len = kv_len_total - lo;
-                    // SAFETY: kv_len == q_pos+1−lo ≤ window+block == cap_li,
-                    // so the ring read never revisits a physical row.
-                    unsafe {
-                        ffi::nonpaged_prefill_attention_ring_cuda(
-                            q_off,
-                            kc_ptr as *const ffi::Half,
-                            vc_ptr as *const ffi::Half,
-                            o_off,
-                            nq,
-                            nkv,
-                            hd,
-                            1,
-                            kv_len as i32,
-                            lo as i32,
-                            cap_li as i32,
-                            sm_scale,
-                            ctx.stream.cu_stream(),
-                        )
-                        .result()?;
-                    }
+                // SAFETY: `win` holds 2*block i32 (bases then lengths, each
+                // length ≤ cap_li as asserted above).
+                unsafe {
+                    ffi::nonpaged_prefill_attention_ring_varlen_cuda(
+                        q_ptr as *const ffi::Half,
+                        kc_ptr as *const ffi::Half,
+                        vc_ptr as *const ffi::Half,
+                        o_ptr as *mut ffi::Half,
+                        nq,
+                        nkv,
+                        hd,
+                        block as i32,
+                        w_ptr as *const i32,
+                        (w_ptr as *const i32).add(block),
+                        cap_li as i32,
+                        sm_scale,
+                        ctx.stream.cu_stream(),
+                    )
+                    .result()?;
                 }
             }
 

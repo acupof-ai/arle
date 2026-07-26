@@ -18,6 +18,8 @@ __global__ void nonpaged_prefill_attention_kernel(
     int max_seq_len,
     int ring_base,        // sliding-window ring: absolute position of logical key 0
     int ring_modulus,     // >0: physical row = (ring_base + abs_pos) % ring_modulus
+    const int *__restrict__ ring_base_dev,  // per-token ring_base (ragged windows)
+    const int *__restrict__ kv_len_dev,     // per-token key count; null = causal
     float sm_scale) {
   int q_head = blockIdx.x;
   int token = blockIdx.y;
@@ -41,7 +43,13 @@ __global__ void nonpaged_prefill_attention_kernel(
   int gqa_ratio = num_q_heads / num_kv_heads;
   int kv_head = q_head / gqa_ratio;
   int q_dim = num_q_heads * head_dim;
+  // Ragged windows: each query row carries its own [ring_base, ring_base+kv_len)
+  // key range (DSpark's per-row sliding lower bound). Absent → causal.
   int kv_len = start_pos + token + 1;
+  if (kv_len_dev != nullptr) {
+    kv_len = kv_len_dev[token];
+    ring_base = ring_base_dev[token];
+  }
 
   __shared__ float scores[NONPAGED_PREFILL_TILE];
   __shared__ float warp_partials[NONPAGED_PREFILL_MAX_WARPS *
@@ -171,6 +179,8 @@ extern "C" cudaError_t nonpaged_prefill_attention_cuda(
       max_seq_len,
       /*ring_base=*/0,
       /*ring_modulus=*/0,
+      /*ring_base_dev=*/nullptr,
+      /*kv_len_dev=*/nullptr,
       sm_scale);
   return cudaGetLastError();
 }
@@ -219,6 +229,57 @@ extern "C" cudaError_t nonpaged_prefill_attention_ring_cuda(
       /*max_seq_len=*/ring_modulus,
       ring_base,
       ring_modulus,
+      /*ring_base_dev=*/nullptr,
+      /*kv_len_dev=*/nullptr,
+      sm_scale);
+  return cudaGetLastError();
+}
+
+// Ragged-window ring variant: one launch for `seq_len` query rows whose key
+// ranges differ. `ring_base_dev[t]` / `kv_len_dev[t]` (device i32, `seq_len`
+// each) give row t's window `[base, base+len)`; the walk is non-causal within
+// each row. Replaces DSpark's per-row `seq_len=1` launches — same math, one
+// grid. Ranges live on device, so the host cannot bound-check them: the caller
+// must guarantee `kv_len_dev[t] <= ring_modulus`.
+extern "C" cudaError_t nonpaged_prefill_attention_ring_varlen_cuda(
+    const uint16_t *q,
+    const uint16_t *k_cache,
+    const uint16_t *v_cache,
+    uint16_t *out,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int seq_len,
+    const int *ring_base_dev,
+    const int *kv_len_dev,
+    int ring_modulus,
+    float sm_scale,
+    cudaStream_t stream) {
+  if (num_q_heads <= 0 || num_kv_heads <= 0 || seq_len < 0 || ring_modulus <= 0 ||
+      ring_base_dev == nullptr || kv_len_dev == nullptr ||
+      (head_dim != 128 && head_dim != 256) || num_q_heads % num_kv_heads != 0) {
+    return cudaErrorInvalidValue;
+  }
+  if (seq_len == 0) {
+    return cudaSuccess;
+  }
+  dim3 grid(num_q_heads, seq_len);
+  nonpaged_prefill_attention_kernel<<<grid, head_dim, 0, stream>>>(
+      reinterpret_cast<const __nv_bfloat16 *>(q),
+      reinterpret_cast<const __nv_bfloat16 *>(k_cache),
+      reinterpret_cast<const __nv_bfloat16 *>(v_cache),
+      reinterpret_cast<__nv_bfloat16 *>(out),
+      num_q_heads,
+      num_kv_heads,
+      head_dim,
+      seq_len,
+      /*start_pos=*/0,
+      /*start_pos_dev=*/nullptr,
+      /*max_seq_len=*/ring_modulus,
+      /*ring_base=*/0,
+      ring_modulus,
+      ring_base_dev,
+      kv_len_dev,
       sm_scale);
   return cudaGetLastError();
 }
@@ -268,6 +329,8 @@ extern "C" cudaError_t nonpaged_prefill_attention_devpos_cuda(
       max_seq_len,
       /*ring_base=*/0,
       /*ring_modulus=*/0,
+      /*ring_base_dev=*/nullptr,
+      /*kv_len_dev=*/nullptr,
       sm_scale);
   return cudaGetLastError();
 }
