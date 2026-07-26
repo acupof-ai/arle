@@ -195,3 +195,20 @@ host 不是 ground truth,只是另一条数值路。真正的 oracle 是解析�
 3. bench 条目(`docs/experience/wins/`)+ CHANGELOG + companion win 交叉引用;订正
    companion win 根因段(峰值主体是 `state_history` 的 `[seq,heads,key_dim·value_dim]`,
    非 `[heads,seq,dim]` 激活)。
+
+## 9. Forward carry-衔接的逐位理论验证(独立于实测)
+
+dconv gradcheck 曾报 abs 2.63,需判定是"backward 纯接线漏"还是"forward conv-carry 时序也错"。
+逐行对比 device kernel 与 host oracle,证明 **forward 衔接逐位一致,bug 纯在 backward**:
+
+**conv-carry(device `linear_attention.cu:107` vs host `conv_window_input` `:1842`)**
+- 索引: device `src_t = t+tap+1-kernel_size`;host `src_rel = seq_idx+tap+1-conv_kernel`。`t↔seq_idx`、`kernel_size==conv_kernel` → 同式。
+- 边界读: device `conv_tail[(src_t+tail_len)*channels+c]`,`tail_len=conv_kernel-1`;host `window[(src_rel+conv_window)*qkv_dim+channel]`,`conv_window=conv_kernel-1`。`src_t+tail_len == src_rel+conv_window`,`channels==qkv_dim` → 逐位同址。
+- ∴ conv carry 只修正 gen 段前 `k-1` 个 token 的 `qkv_conv`,device/host 完全一致。
+
+**state-carry(device 递归 `backend_cuda.rs:4349` vs host scan `:1867`)**
+- device: chunk 0 在 `recurrent_cuda` 之前先 `copy(chunk_state[0] ← final_state)`(`:4356`),`final_state` = seed 的 carry → `chunk_state[0] = carry`。
+- host: `state = initial_state`(`:1867`)后顺序 scan。
+- ∴ 两者"gen 段入口态 = carry"语义等价;递归吃的 `qkv_conv.add(0)` 已含 conv carry 修正,host `preact` 同源。
+
+**结论**: forward 无时序缺口,dconv 2.63 是纯 backward `grad_weight` 漏接(conv_tail 未接入 launch),已由本轮 fix 打通。预测: pod gradcheck dconv → ~1e-4(非 carry 同量级),dq 1.74e-3 随之降到 floor 下(conv→preact→dq 连带)。若残差仍在,则此逐位证明有漏,回审。
