@@ -1,0 +1,25 @@
+crates/autograd/src/backend.rs
+  s_089e26e9e41120::t_49058d6ec1857f 393-395
+crates/autograd/src/backend_cuda.rs
+  s_089e26e9e41120::t_97fead7a00897f 4460,4485,4920-4934
+crates/autograd/src/ops/linear_attention.rs
+  s_089e26e9e41120::t_11979470b4b1b3 951-952,954,991,1087-1092,1128,1269-1273,1295
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "8c4e4ec83977da66fbf0b86c4b3568d369ba5a23",
+  "prompts": {},
+  "sessions": {
+    "s_089e26e9e41120": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "93e66a8f-c20a-4ba9-96f2-283f6d98cbb1",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
