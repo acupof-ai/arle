@@ -16,10 +16,10 @@
 python3 scripts/bench_throughput.py \
   --url <url> \
   --model <model> \
-  --prompts-jsonl bench-agent-32k-64.jsonl \
+  --prompts-jsonl bench-agent-119k-16x8.jsonl \
   --concurrency-grid 1,4,8,16 \
-  --requests-per-concurrency 16 \
-  --max-tokens 256 \
+  --requests-per-concurrency 128 \
+  --max-tokens 214 \
   --seed 20260416 \
   --timeout-seconds 900 \
   --output bench-output/<label>/bench

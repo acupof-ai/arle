@@ -11,12 +11,12 @@ LABEL="${1:?usage: run_dsv4_bench.sh <label> [data.jsonl]}"
 MODEL="/host/DeepSeek-V4-Flash-FP8"
 PORT="${PORT:-8000}"
 TARGET="http://localhost:${PORT}"
-DATA="${2:-/host/bench-agent-32k-64.jsonl}"
+DATA="${2:-/host/bench-agent-119k-16x8.jsonl}"
 # #180: the old default pointed at a dataset that no longer exists anywhere and
 # had no generator — a silent substitution makes every Delta% uninterpretable.
 if [[ ! -f "$DATA" ]]; then
   echo "dataset $DATA missing. Regenerate the anchored pair:" >&2
-  echo "  python3 scripts/gen_bench_prompts.py bench-agent-32k-64.jsonl 64 32768 256" >&2
+  echo "  python3 scripts/gen_bench_prompts.py bench-agent-119k-16x8.jsonl 16 119000 214 8" >&2
   exit 1
 fi
 RATES="${RATES:-1,4,8,16}"

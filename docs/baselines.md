@@ -15,18 +15,19 @@ Screening compares new runs against the champion row — no second arm. Rules:
    re-measure the champion before comparing.
 4. **Anchor audit**: every ~5 accepted updates (and before any default flip),
    one A/B against the oldest archived binary bounds accumulated drift.
-5. **One workload**: every champion row runs the 32k-token long-agent dataset
-   (bench spec §3.3). Rows below the 2026-07-26 line predate that rule and are
-   short-prompt fingerprints — they are historical evidence, not comparison
-   targets. Re-anchor on the long-agent dataset before screening against them.
+5. **One workload**: every champion row runs the multi-turn long-agent dataset
+   at the TraceLab medians (bench spec §3.3), and reports cold vs warm turns
+   separately. Rows below the 2026-07-26 line predate that rule — short-prompt
+   fingerprints, or the one-shot 32k dataset that could never hit the prefix
+   cache. Historical evidence, not comparison targets; re-anchor first.
 
 ```
-python3 scripts/gen_bench_prompts.py bench-agent-32k-64.jsonl 64 32768 256
+python3 scripts/gen_bench_prompts.py bench-agent-119k-16x8.jsonl 16 119000 214 8
 ```
 
 ## ThinkingCap-Qwen3.6-27B-FP8 · 1×H20 · single-GPU · eager — LONG-AGENT ANCHOR
 
-### CHAMPION — `f4f419629` (2026-07-26, first long-agent row)
+### `f4f419629` (2026-07-26) · RETIRED cold-cache fingerprint — NOT a champion
 
 Dataset `bench-agent-32k-64.jsonl`, sha256
 `683b3736b2b162a07e419bf8ed8639fb70e6bc4f9a2cd8c5c586b39060ab8ef5`, reproducible
@@ -41,12 +42,15 @@ construction. 0 errors / 0 incomplete / 0 correctness_failed at every point.
 | 4 | 8        | 12.9      | 1748.9      | 152.0  |
 | 8 | 8        | 14.3      | 1906.7      | 139.5  |
 
-- **The workload is prefill, not decode.** 68.4 s per request at c=1; 256 output
-  tokens at the measured ~28 ms ITL is ~7 s of it, so **~89% is the 33k
-  prefill** (~540 tok/s). The same serve on ~130-token prompts reports 38 out
-  tok/s — an 11× difference that is entirely prompt length.
-- Consequence for spec decode: it accelerates the ~10% decode slice. The
-  short-prompt rows below made that slice look like the whole request.
+- **Retired the same day: prefix hit rate 0 by construction.** Each request got
+  a unique 32k context, so every one paid a full cold prefill. Real coding-agent
+  serving hits the prefix cache 95.7% of the time (TraceLab arXiv:2606.30560),
+  which makes this row a measurement of a machine nobody runs.
+- The "~89% is prefill, decode is the ~10% slice" reading taken from it is
+  **withdrawn**. At the trace medians a step is TTFT 3.1 s vs 4.6 s of decode —
+  decode is ~60% of per-step wall clock. Do not cite this row for scoping.
+- Kept as evidence of cold-prefill cost at 33k (~540 tok/s, degrading from
+  ~1270 tok/s at ~5k), which is still the right number for a cache miss.
 - c=16 not yet measured on this dataset (KV budget check pending).
 
 ## DSv4-Flash-FP8 · 4×H20 · TP=4/EP=4 · eager · port 8000
