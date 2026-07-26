@@ -34,8 +34,12 @@ progress spine).
   rounding vs the f32 oracle (A/B-confirmed), not logic bugs — the bf16 gradient
   is the correct adjoint of the bf16 forward. Trainable seq (single H20)
   24576 → 40960 (1.67×; the 64× arithmetic was retracted, `274af1271`).
-  Pending-remote: end-to-end OPD loss parity vs the host path + backward
-  wall-clock perf license (device chunked vs host recompute).
+  Loss parity CONFIRMED (cross-commit A/B vs `a03bf04f2` host baseline, replay lane,
+  12 epochs × 3 runs/arm): cross-arm mean Δ ≤ 2e-4/epoch, under arm A's own ≤5e-4
+  run jitter — device is statistically indistinguishable from host, well inside the
+  <1e-2 bf16-grad bar. Perf license: device chunked backward is +2.6% slower
+  (565.2 s vs host 550.6 s median, seq=24576) — a deliberate VRAM-for-time trade,
+  paying ~2.6%/step to unlock the 1.67× trainable-seq wall.
 
 - **FINDING — the DSpark draft is a good ranker and a bad argmax** (2026-07-26,
   `d420d894e`;
