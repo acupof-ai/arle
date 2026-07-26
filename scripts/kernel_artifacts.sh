@@ -2,6 +2,7 @@
 # Immutable TileLang AOT bundles on the `kernel-artifacts` GitHub Release.
 # Asset names are exact source/toolchain identities; bundle and file SHA-256
 # metadata reject partial, stale, or overwritten content.
+# `sync`: pre-build — pull the current source's bundle into generated/, else no-op.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -530,6 +531,20 @@ remote_assets() {
 }
 
 case "${1:-help}" in
+    sync)
+        # Pull the current source's bundle into generated/ (build.rs then skips
+        # TileLang codegen; nvcc still runs), or no-op → build from source.
+        # Caller-run pre-build step: needs network + gh; build.rs never calls it.
+        cd "$ROOT"
+        id="$(kernel_bundle_id)"
+        file="arle-kernels-$LANE-$id.tar.gz"
+        if gh release view "$REL" -R "$REPO" --json assets \
+            --jq '.assets[].name' 2>/dev/null | grep -Fxq "$file"; then
+            "$0" fetch
+        else
+            echo "no published bundle for $id ($file); build from source" >&2
+        fi
+        ;;
     id)
         kernel_bundle_id
         ;;
