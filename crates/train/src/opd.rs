@@ -2904,6 +2904,9 @@ fn build_masked_loss_targets(
 struct VramSample {
     free: usize,
     total: usize,
+    /// Async-mempool `(reserved, used)`; `reserved - used` = the allocator hoard
+    /// `cuMemGetInfo` can't split from live tensors. `None` on host backends.
+    pool: Option<(u64, u64)>,
 }
 
 impl VramSample {
@@ -2922,6 +2925,13 @@ impl VramSample {
     fn total_mib(self) -> usize {
         self.total >> 20
     }
+
+    /// Pool pages held but not backing live allocations, in MiB (0 if unknown).
+    fn hoarded_mib(self) -> usize {
+        self.pool
+            .map(|(reserved, used)| (reserved.saturating_sub(used) >> 20) as usize)
+            .unwrap_or(0)
+    }
 }
 
 fn writeback_vram_trace_enabled() -> bool {
@@ -2937,12 +2947,17 @@ fn log_writeback_vram(store: &TensorStore, scope: &str, label: &str) -> Option<V
     }
     match store.backend().device_mem_info() {
         Some((free, total)) => {
-            let sample = VramSample { free, total };
+            let sample = VramSample {
+                free,
+                total,
+                pool: store.backend().mem_pool_stats(),
+            };
             eprintln!(
-                "[opd-vram] {scope} {label}: used={}MiB free={}MiB total={}MiB",
+                "[opd-vram] {scope} {label}: used={}MiB free={}MiB total={}MiB hoarded={}MiB",
                 sample.used_mib(),
                 sample.free_mib(),
                 sample.total_mib(),
+                sample.hoarded_mib(),
             );
             Some(sample)
         }
@@ -2964,18 +2979,23 @@ fn log_writeback_vram_ledger(
         return;
     }
     let used = |sample: Option<VramSample>| sample.map(|s| s.used_mib()).unwrap_or(0);
+    let hoarded = |sample: Option<VramSample>| sample.map(|s| s.hoarded_mib()).unwrap_or(0);
     let allocator_delta = match (base, post_cleanup) {
         (Some(base), Some(cleanup)) => cleanup.used().saturating_sub(base.used()) >> 20,
         _ => 0,
     };
     eprintln!(
         "[opd-vram-ledger] {scope} base_used_mib={} post_forward_used_mib={} \
-         post_backward_used_mib={} post_cleanup_used_mib={} allocator_retained_delta_mib={}",
+         post_backward_used_mib={} post_cleanup_used_mib={} allocator_retained_delta_mib={} \
+         hoarded_fwd/bwd/clean_mib={}/{}/{}",
         used(base),
         used(post_forward),
         used(post_backward),
         used(post_cleanup),
         allocator_delta,
+        hoarded(post_forward),
+        hoarded(post_backward),
+        hoarded(post_cleanup),
     );
 }
 

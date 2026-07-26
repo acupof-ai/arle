@@ -452,6 +452,14 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         None
     }
 
+    /// Async-mempool `(reserved, used)` bytes for this backend, or `None` for
+    /// host backends. `reserved - used` is the allocator hoard — freed pages the
+    /// pool keeps for reuse, which `device_mem_info` counts as "used". Lets OPD
+    /// separate hoard from live tensors without a `&CudaBackend` downcast.
+    fn mem_pool_stats(&self) -> Option<(u64, u64)> {
+        None
+    }
+
     fn upload(&self, host: &[f32], _shape: &[usize]) -> Result<DeviceHandle> {
         Ok(DeviceHandle::Cpu(host.to_vec()))
     }
