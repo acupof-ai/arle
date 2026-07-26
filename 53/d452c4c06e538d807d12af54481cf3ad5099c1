@@ -1,0 +1,31 @@
+crates/train/src/opd.rs
+  s_cd9a6a56daabe3::t_69497de569fdea 2973-2974
+docs/experience/wins/2026-07-26-remove-backward-trims-fragmentation-40960.md
+  s_832df139545666::t_01a56bb23665cc 1-75
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "53d452c4c06e538d807d12af54481cf3ad5099c1",
+  "prompts": {},
+  "sessions": {
+    "s_832df139545666": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a33bc2330b0c0892d",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_cd9a6a56daabe3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "bf8ec25a-c05e-46a4-b093-1e67694ece0c",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
