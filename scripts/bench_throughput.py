@@ -204,7 +204,11 @@ async def send_streaming(
                         finish_reason = str(reason)
                     text = choice.get("text")
                     if text is None:
-                        text = (choice.get("delta") or {}).get("content")
+                        delta = choice.get("delta") or {}
+                        # A thinking model streams the block as reasoning_content;
+                        # those are output tokens and usage counts them, so not
+                        # reading them reports zero events on a short cap.
+                        text = delta.get("content") or delta.get("reasoning_content")
                     if not text:
                         continue
                     now = time.perf_counter()

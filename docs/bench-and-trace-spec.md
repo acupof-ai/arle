@@ -46,22 +46,54 @@ failures on the DSv4 config; c32 accounting drift) — do not reintroduce it.
 Published results use a checked JSONL workload:
 
 ```bash
+python3 scripts/gen_bench_prompts.py bench-agent-32k-64.jsonl 64 32768 256
 python3 scripts/bench_throughput.py \
   --url http://127.0.0.1:8000 \
   --model <model> \
-  --prompts-jsonl <workload.jsonl> \
+  --prompts-jsonl bench-agent-32k-64.jsonl \
   --concurrency-grid 1,4,8,16 \
-  --seconds-per-concurrency 120 \
-  --max-tokens <n> \
+  --requests-per-concurrency 16 \
+  --max-tokens 256 \
   --seed 20260416 \
+  --timeout-seconds 900 \
   --output bench-output/<label>/bench
 ```
 
-`--requests-per-concurrency` may replace the duration for short deterministic
-runs. Synthetic prompts are smoke-only. They may repeat prefixes and therefore
-cannot license cache-sensitive changes.
+Synthetic prompts are smoke-only. They may repeat prefixes and therefore cannot
+license cache-sensitive changes.
 
 The JSON artifact is the source of truth. CSV is a view. Preserve both.
+
+### 3.3 Workload — long agent sequences, one shape for everything
+
+**Every performance claim runs on `gen_bench_prompts.py`'s 32k-token agent
+contexts.** That is the shape ARLE actually serves: a coding agent replays its
+whole transcript — system, tool schemas, tool outputs — on every turn. Short
+prompts are a different machine. At ~3.4k tokens the run is decode-dominated
+and the prefill, KV-residency, page-table, and long-context attention paths are
+barely exercised; a treatment can post a large short-prompt delta and be a wash
+or a regression on the real workload. Do not publish a short-prompt number and
+call it a serving result.
+
+Rules:
+
+- `count` ≥ the highest benched concurrency, so no request reuses a context.
+- Every context carries a unique header and per-round indices. Report the
+  prefix hit rate; a high one on this dataset means the harness is broken, not
+  that the cache is good.
+- **Confirm the length.** The generator estimates tokens at 3.6 chars/token —
+  a ratio, not a tokenizer. Record `usage.prompt_tokens` p50 from the run and
+  state it next to the target. Outside ±10%, re-generate with a corrected
+  `target_tokens` before reporting; a run whose real p50 is 24k is not a 32k
+  run.
+- Prefer `--requests-per-concurrency` over `--seconds-per-concurrency` here:
+  one 32k request is seconds of work, so a duration budget silently changes the
+  completed-request count across arms.
+- A shorter context is legitimate only as an explicit **context-scaling sweep**
+  (e.g. 4k/8k/16k/32k against the same treatment), never as the single reported
+  point.
+- KV budget is the usual failure: 32k × concurrency must fit, or the run
+  measures preemption. Record the slot line and the queue/preempt counters.
 
 ### 3.0 Rolling baseline — the default iteration path
 
@@ -137,9 +169,10 @@ and the model-specific gate are required.
 
 ## 6. Duration and stop rules
 
-Use 120 seconds per concurrency by default. A shorter run counts only when it
-completes enough work for stable medians and the report states why. Extend or
-repeat when:
+On the long-agent workload use a fixed request count (§3.3); 120 seconds per
+concurrency is the fallback for short-prompt smoke only. A run counts when it
+completes enough work for stable medians and the report states the budget.
+Extend or repeat when:
 
 - the first and second halves differ by more than 5%;
 - queue depth, prefix-hit rate, or memory residency is still moving;
