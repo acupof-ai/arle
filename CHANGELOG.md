@@ -23,6 +23,16 @@ Progress spine. Entry classes recorded here the day they land: phase exits,
 default flips, and accept-or-reject verdicts (AGENTS.md §Docs lifecycle &
 progress spine).
 
+- **ACCEPT — one ragged-window launch per DSpark draft layer** (2026-07-26,
+  `9a27eda4b`;
+  bench: [2026-07-26-dspark-ragged-window-draft-attention](docs/experience/wins/2026-07-26-dspark-ragged-window-draft-attention.md)).
+  Each draft layer launched 16 single-row non-causal attentions, leaving the GPU
+  95% idle per launch; `nonpaged_prefill_attention_ring_varlen_cuda` takes device
+  per-row window arrays and runs one grid. Measured: draft `attn` 1.53 → 0.19
+  ms/slot, draft −32% and tick −6.2% at c=8, aggregate tok/s +4.2% / +2.3% /
+  +1.9% at c=1/4/8 (medians of 3 interleaved trials per arm; AFTER wins all 9
+  paired points). Acceptance unchanged.
+
 - **ACCEPT (mechanism only, no serving delta) — one batched argmax per DSpark
   tick** (2026-07-26, `308c8b247`;
   bench: [2026-07-26-dspark-batched-argmax-tick](docs/experience/wins/2026-07-26-dspark-batched-argmax-tick.md)).
