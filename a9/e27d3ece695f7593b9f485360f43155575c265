@@ -1,0 +1,21 @@
+Makefile
+  s_8fd1e8d938ece4::t_c056ebd550c2db 12,24,45-49,52
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "a9e27d3ece695f7593b9f485360f43155575c265",
+  "prompts": {},
+  "sessions": {
+    "s_8fd1e8d938ece4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aca036d2af84dd8cf",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
