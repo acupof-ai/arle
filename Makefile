@@ -9,6 +9,7 @@
 #   make test-metal               # CI-mirrored Metal tests (cli crate + smoke)
 #   make bench-metal              # native throughput bench (Qwen3.6 default)
 #   make build-cuda               # Linux / NVIDIA GPU → target/release/arle
+#   make kernels-sync             # pull source-matched AOT bundle → generated/ (auto before build-cuda)
 #   make check-cuda               # Mac-safe CUDA-Rust typecheck (no nvcc needed)
 #   make test                     # any platform (CPU-only, CI-mirrored)
 #   make test-py
@@ -20,7 +21,7 @@
 
 METAL_MODEL ?= mlx-community/Qwen3.6-35B-A3B-4bit
 
-.PHONY: hygiene build-metal check-metal test-metal bench-metal build-cuda check-cuda test test-py pre-push install-hooks web-install web-dev web-build web-check web-clean
+.PHONY: hygiene build-metal check-metal test-metal bench-metal build-cuda check-cuda kernels-sync test test-py pre-push install-hooks web-install web-dev web-build web-check web-clean
 
 hygiene:
 	python3 scripts/check_repo_hygiene.py
@@ -41,9 +42,14 @@ bench-metal:
 	python3 scripts/bench_local_metal.py http://localhost:8000 $(METAL_MODEL)
 
 # ── CUDA (Linux / NVIDIA GPU) ─────────────────────────────────────────────────
+# Pull the source-matched AOT bundle (content hash, not git) into generated/ so
+# build.rs skips ~1h TileLang codegen; no-op offline / on a miss.
+kernels-sync:
+	scripts/kernel_artifacts.sh sync
+
 # sccache (when installed) wraps both rustc and nvcc — including the TileLang
 # AOT cubins — so kernel rebuilds after a csrc/.cuh touch are cache hits.
-build-cuda:
+build-cuda: kernels-sync
 	@if command -v sccache >/dev/null 2>&1; then \
 		echo "[build-cuda] sccache detected: wrapping rustc + nvcc"; \
 		CUDA_HOME=$${CUDA_HOME:-/usr/local/cuda} \

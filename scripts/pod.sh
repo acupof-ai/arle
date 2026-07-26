@@ -69,6 +69,14 @@ case "$cmd" in
     dirty_digest="$(POD_TREE="$ROOT" bash "$ROOT/scripts/pod-remote-build.sh" source-digest "$ROOT")"
     : > "$stage/files"
     while IFS= read -r -d '' path; do [ -f "$ROOT/$path" ] && printf '%s\0' "$path" >> "$stage/files"; done < <(git -C "$ROOT" ls-files -co --exclude-standard -z)
+    # Ship the source-matched AOT bundle (gitignored generated/, so outside the
+    # digest) so the pod reuses it instead of ~1h TileLang codegen. Miss/offline
+    # → no-op, pod builds from source. build.rs rejects any stale artifact.
+    bash "$ROOT/scripts/kernel_artifacts.sh" sync || true
+    if [ -d "$ROOT/crates/cuda-kernels/generated" ]; then
+      while IFS= read -r -d '' path; do printf '%s\0' "$path" >> "$stage/files"; done \
+        < <(cd "$ROOT" && find crates/cuda-kernels/generated -type f -print0)
+    fi
     git -C "$ROOT" ls-files -d -z > "$stage/deletes"
     COPYFILE_DISABLE=1 tar -C "$ROOT" --null -T "$stage/files" -czf "$stage/tree.tgz"
     archive_sha="$(shasum -a 256 "$stage/tree.tgz" | cut -d' ' -f1)"
