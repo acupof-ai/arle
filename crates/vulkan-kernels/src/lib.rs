@@ -1641,7 +1641,7 @@ mod tests {
         );
         assert_eq!(
             Kernel::GemvQ4K.specialization_u32(),
-            &[(0, 32), (1, 1), (2, 1)]
+            &[(0, 64), (1, 1), (2, 1)]
         );
         assert_eq!(
             Kernel::GemvQ5K.specialization_u32(),
