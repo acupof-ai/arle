@@ -39,7 +39,17 @@ rounds, `ARLE_DSPARK_PHASE` medians over ~2400 draft ticks per arm:
 
 Round 2 reproduces it to two decimals (8.96 → 0.14). 0.14 ms is one batched
 pass, so the speculation settles on the first round essentially always — as the
-0.052-logit bias predicted.
+0.052-logit bias predicted. That is the load-bearing number: the worst case
+(`block` rounds) costs exactly what the per-row path did, so the win *is* the
+round count, and 0.14 ms is what bounds it.
+
+A simplify pass (`0ade41244`) followed: greedy became a slice copy out of
+`dspark_block_greedy` rather than a per-row scan, the round loop stopped
+allocating a device buffer per argmax (`argmax_rows_into`), and the four markov
+scratch slots gained block-shaped twins so the row-shaped path (sampling, and
+the confidence head in the same call) no longer frees and rezeroes a
+`[vocab, block]` buffer every tick. Re-measured: argmax 0.13 ms, draft total
+2.85 ms, and all four output hashes still identical.
 
 **Output is bit-identical.** Four eval prompts, 300 greedy tokens each, sha256
 over the whole `choices[0]` object: all four hashes match between the two
@@ -58,7 +68,13 @@ rejections — the same chain, as designed.
   so batching the bias buys nothing there; the same speculation would apply if
   that ever changes.
 - The confidence head's own per-row markov lookup
-  (`dspark_confident_prefix_len`) is untouched — no checkpoint here ships one.
+  (`dspark_confident_prefix_len`) is untouched — no checkpoint here ships one,
+  so there is nothing to measure. It is a strictly easier batch than this one
+  (`prev_tokens` is fully known before the call, so no fixed point to iterate),
+  and it would re-spend part of this win on any checkpoint that does ship one.
+- Serving under `--dspark-train` runs the full correction against a `w2` that
+  is identically zero at cold start, so the corrected argmax equals the base
+  argmax by construction. A `w2_all_zero` flag captured at load would skip it.
 
 ## Rule
 
