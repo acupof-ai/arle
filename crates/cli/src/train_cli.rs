@@ -653,13 +653,9 @@ impl TaskSelection {
     }
 }
 
-/// Experience replay: age-bounded, |A|-prioritized buffer of trained
-/// groups. Entries keep the batch as trained — including the behavior
-/// logprobs captured at FIRST use, so a replayed update's IS ratio is taken
-/// against the true π_behavior instead of a recomputed ratio ≈ 1.
-/// Fresh-anchored by call order: the round loop draws AFTER the fresh
-/// group's update and pushes after drawing, so an entry is first drawable
-/// at the next draw.
+/// Experience replay: age-bounded, |A|-prioritized buffer of trained groups.
+/// Entries retain the generation-time behavior sidecars, so every reuse stays
+/// corrected against the policy that sampled the trajectories.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 #[derive(Clone)]
 struct ReplayEntry {
@@ -2458,16 +2454,14 @@ fn save_agent_opd_adapters(
 
 /// One `--replay-records` JSONL row (`arle train cc-convert` output).
 #[cfg(feature = "cuda")]
-#[derive(serde::Deserialize)]
+#[derive(Clone, serde::Deserialize)]
 struct ReplayRecord {
-    #[serde(default)]
     label: Option<String>,
     prompt_ids: Vec<u32>,
     response_ids: Vec<u32>,
     response_mask: Vec<u8>,
     /// Generation-time behavior logprobs (one per masked token).
-    #[serde(default)]
-    gen_logprobs: Vec<f32>,
+    gen_logprobs: Option<Vec<f32>>,
     /// Attempt reward for SAO advantage; pre-reward records (CE-only flow)
     /// default to 1.0 = a passing trajectory, keeping rejection-CE unchanged.
     #[serde(default = "replay_default_reward")]
@@ -2483,33 +2477,83 @@ fn replay_default_reward() -> f32 {
     1.0
 }
 
+#[cfg(feature = "cuda")]
+fn replay_groups(
+    preset: train::update_strategy::UpdatePreset,
+    records: &[ReplayRecord],
+    per_epoch_cap: usize,
+) -> Vec<Vec<train::update_strategy::ScoredTrajectory>> {
+    use train::update_strategy::ScoredTrajectory;
+
+    let mut all_groups: Vec<(&str, Vec<ScoredTrajectory>)> = Vec::new();
+    for record in records {
+        let key = task_key(record.label.as_deref());
+        let group_id = all_groups
+            .iter()
+            .position(|(group_key, _)| *group_key == key)
+            .unwrap_or_else(|| {
+                all_groups.push((key, Vec::new()));
+                all_groups.len() - 1
+            });
+        all_groups[group_id].1.push(ScoredTrajectory {
+            prompt_ids: record.prompt_ids.clone(),
+            response_ids: record.response_ids.clone(),
+            response_mask: record.response_mask.clone(),
+            reward: record.reward,
+            behavior_logprobs: record.gen_logprobs.clone(),
+            group_id,
+            truncated: record.truncated,
+        });
+    }
+
+    let mut used = 0usize;
+    let mut selected = Vec::new();
+    for (_, group) in all_groups {
+        let trainable = preset.planned_training_count(&group);
+        if trainable == 0 {
+            continue;
+        }
+        if trainable > per_epoch_cap.saturating_sub(used) {
+            break;
+        }
+        used += trainable;
+        selected.push(group);
+    }
+    selected
+}
+
 /// Task key for SAO grouping: the label prefix before `#` (`iid#sample` → `iid`).
 #[cfg(feature = "cuda")]
 fn task_key(label: Option<&str>) -> &str {
     label.unwrap_or("").split('#').next().unwrap_or("")
 }
 
-/// PG-preset replay: group cc records by task, then per group capture
-/// π_behavior (θ is the current adapter = the rollout policy) and apply the same
-/// [`train::update_strategy::UpdatePreset::update`] the online path uses. One
-/// update call per group, so batch-scoped advantages center over the group —
-/// the replay grain IS the group.
+/// A replay record is CE-trainable iff its reward cleared the bar and it has at
+/// least one masked target token. Imitating a failed fix (reward < 1.0) or a
+/// mask-less record is actively harmful, so both the preflight batch and the CE
+/// loop select on this identical predicate.
+fn ce_trainable(record: &ReplayRecord) -> bool {
+    record.reward >= 1.0 && record.response_mask.iter().any(|&mask| mask == 1)
+}
+
+/// PG-preset replay: group cc records by task and apply the same
+/// [`train::update_strategy::UpdatePreset::update`] the online path uses. The
+/// generation-time sidecar is the sole behavior denominator.
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
 fn replay_pg(
     preset: train::update_strategy::UpdatePreset,
     args: &TrainAgentOpdArgs,
-    records: &[ReplayRecord],
+    groups: &[Vec<train::update_strategy::ScoredTrajectory>],
     student: &train::qwen35::Qwen35Model,
     all_params: &[autograd::TensorId],
     trainable: &[autograd::TensorId],
     optimizer: &mut autograd::optim::AdamW,
     vocab: usize,
     epochs: usize,
-    per_epoch_cap: usize,
     store: &mut autograd::TensorStore,
 ) -> Result<()> {
-    use train::update_strategy::{Advantage, ScoredTrajectory};
+    use train::update_strategy::Advantage;
 
     // Value critic (ValueGae only), built after the `trainable` filter so it
     // rides `all_params` (kept, never stepped) — mirrors the online path.
@@ -2527,61 +2571,17 @@ fn replay_pg(
         _ => None,
     };
 
-    // First-seen-ordered task groups (small n → linear find is the lowest-entropy
-    // form). `--writeback-cap` bounds the records considered, as in the CE path.
-    let mut groups: Vec<(&str, Vec<usize>)> = Vec::new();
-    for (idx, record) in records.iter().take(per_epoch_cap).enumerate() {
-        let key = task_key(record.label.as_deref());
-        match groups.iter_mut().find(|(k, _)| *k == key) {
-            Some((_, idxs)) => idxs.push(idx),
-            None => groups.push((key, vec![idx])),
-        }
-    }
     eprintln!(
-        "[agent-opd] replay PG: preset={preset:?} groups={} records={}",
-        groups.len(),
-        records.len()
+        "[agent-opd] replay PG: preset={preset:?} groups={}",
+        groups.len()
     );
 
-    let needs = preset.needs();
     for epoch in 0..epochs {
         let mut losses = Vec::new();
-        for (group_id, (_key, idxs)) in groups.iter().enumerate() {
-            let batch: Vec<ScoredTrajectory> = idxs
-                .iter()
-                .map(|&idx| {
-                    let r = &records[idx];
-                    let rollout_logprobs = needs
-                        .rollout_logprobs
-                        .then(|| {
-                            train::opd::capture_rollout_logprobs(
-                                student,
-                                &r.prompt_ids,
-                                &r.response_ids,
-                                &r.response_mask,
-                                store,
-                            )
-                            .map_err(anyhow::Error::from)
-                        })
-                        .transpose()?;
-                    Ok(ScoredTrajectory {
-                        prompt_ids: r.prompt_ids.clone(),
-                        response_ids: r.response_ids.clone(),
-                        response_mask: r.response_mask.clone(),
-                        reward: r.reward,
-                        rollout_logprobs,
-                        // Sidecar behavior logprobs: diagnostic only — the
-                        // IS ratio stays on the V0 recompute above until a
-                        // future license flips the source.
-                        gen_logprobs: (!r.gen_logprobs.is_empty()).then(|| r.gen_logprobs.clone()),
-                        group_id,
-                        truncated: r.truncated,
-                    })
-                })
-                .collect::<Result<_>>()?;
+        for batch in groups {
             let report = preset
                 .update(
-                    &batch,
+                    batch,
                     student,
                     all_params,
                     trainable,
@@ -2629,7 +2629,6 @@ fn run_agent_opd_replay(
         opd::{gkd_writeback_step, masked_writeback_ce_step_dispatch},
         qwen35_checkpoint::load_qwen35_lora_adapters,
         qwen35_loader::load_qwen35_lora_from_hf_dir_with_shared_base,
-        update_strategy::RatioGrain,
     };
 
     use crate::args::GkdTeacherArg;
@@ -2647,21 +2646,48 @@ fn run_agent_opd_replay(
     if records.is_empty() {
         bail!("no records in {}", records_path.display());
     }
-    for (idx, record) in records.iter().enumerate() {
-        if record.response_ids.len() != record.response_mask.len() {
-            bail!(
-                "replay record {idx} ({:?}): response_ids len {} != response_mask len {}",
-                record.label,
-                record.response_ids.len(),
-                record.response_mask.len()
-            );
-        }
-    }
+    let preset = args.update_preset();
+    let per_epoch_cap = args.writeback_cap.unwrap_or(usize::MAX);
 
-    let (mut store, train_backend, backend_label) = build_opd_store(args.backend)?;
     let hf_config = Qwen35Config::from_json_file(student_dir.join("config.json"))
         .with_context(|| format!("read config.json from {}", student_dir.display()))?;
     let vocab = hf_config.vocab_size;
+    let replay_groups = if preset.needs().behavior_logprobs {
+        let groups = replay_groups(preset, &records, per_epoch_cap);
+        for batch in &groups {
+            preset
+                .preflight(batch, vocab, args.writeback_window)
+                .map_err(anyhow::Error::from)
+                .with_context(|| {
+                    format!("validate replay records from {}", records_path.display())
+                })?;
+        }
+        groups
+    } else {
+        let batch: Vec<_> = records
+            .iter()
+            .filter(|record| ce_trainable(record))
+            .take(per_epoch_cap)
+            .enumerate()
+            .map(
+                |(group_id, record)| train::update_strategy::ScoredTrajectory {
+                    prompt_ids: record.prompt_ids.clone(),
+                    response_ids: record.response_ids.clone(),
+                    response_mask: record.response_mask.clone(),
+                    reward: record.reward,
+                    behavior_logprobs: record.gen_logprobs.clone(),
+                    group_id,
+                    truncated: record.truncated,
+                },
+            )
+            .collect();
+        preset
+            .preflight(&batch, vocab, args.writeback_window)
+            .map_err(anyhow::Error::from)
+            .with_context(|| format!("validate replay records from {}", records_path.display()))?;
+        Vec::new()
+    };
+    let (mut store, train_backend, backend_label) = build_opd_store(args.backend)?;
 
     eprintln!(
         "[arle train agent-opd] replay: {} record(s) from {} on {backend_label} (no rollout engine)",
@@ -2730,13 +2756,11 @@ fn run_agent_opd_replay(
     // Default rejection-CE (incl. GKD) is byte-identical to before; ratio-
     // weighted presets dispatch to the same `UpdatePreset::update` the online
     // path uses.
-    let preset = args.update_preset();
     let epochs = args.replay_epochs.max(1);
-    let per_epoch_cap = args.writeback_cap.unwrap_or(usize::MAX);
     // The flat CE arm keeps the pre-preset record-order + filter-then-cap
     // semantics byte-identical and hosts the GKD teacher fork (a distribution-
     // level KL, not a per-token weight — it dies in T5 with the cc harness).
-    if preset.ratio == RatioGrain::None {
+    if !preset.needs().behavior_logprobs {
         // Rejection sampling: imitate only SOLVED trajectories. Now that cc
         // collects failing attempts too (for SAO's 0-reward arm), CE must reject
         // them — imitating a failed fix is actively harmful. reward == 1.0 iff all
@@ -2745,7 +2769,7 @@ fn run_agent_opd_replay(
             let mut losses = Vec::new();
             for record in records
                 .iter()
-                .filter(|r| r.reward >= 1.0)
+                .filter(|r| ce_trainable(r))
                 .take(per_epoch_cap)
             {
                 let loss = if let Some(ema) = gkd_teacher.as_mut() {
@@ -2793,7 +2817,11 @@ fn run_agent_opd_replay(
                 };
                 losses.push(loss);
             }
-            let mean_loss = losses.iter().sum::<f32>() / losses.len() as f32;
+            let mean_loss = if losses.is_empty() {
+                0.0
+            } else {
+                losses.iter().sum::<f32>() / losses.len() as f32
+            };
             eprintln!(
                 "[agent-opd] replay epoch={epoch} trained_pairs={} mean_loss={mean_loss:.4}",
                 losses.len()
@@ -2803,14 +2831,13 @@ fn run_agent_opd_replay(
         replay_pg(
             preset,
             args,
-            &records,
+            &replay_groups,
             &student,
             all_params.as_slice(),
             trainable.as_slice(),
             &mut optimizer,
             vocab,
             epochs,
-            per_epoch_cap,
             &mut store,
         )?;
     }
@@ -2829,6 +2856,21 @@ fn run_agent_opd_replay(
         )?;
     }
     eprintln!("[arle train agent-opd] replay done ({epochs} epoch(s))");
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn validate_online_rollout_temperature(
+    preset: train::update_strategy::UpdatePreset,
+    strategy: crate::args::UpdateStrategyArg,
+    temperature: f32,
+) -> Result<()> {
+    if preset.needs().behavior_logprobs && temperature <= 0.0 {
+        bail!(
+            "--rollout-temperature must be > 0 for ratio-weighted --update-strategy {strategy:?}; \
+             greedy rollout does not produce behavior logprobs (rejection-ce permits greedy)"
+        );
+    }
     Ok(())
 }
 
@@ -2863,6 +2905,12 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
     if let Some(records_path) = args.replay_records.clone() {
         return run_agent_opd_replay(&args, &records_path, lora, target_set);
     }
+    let update_preset = args.update_preset();
+    validate_online_rollout_temperature(
+        update_preset,
+        args.update_strategy,
+        args.rollout_temperature,
+    )?;
     let dataset = args
         .dataset
         .as_deref()
@@ -3186,8 +3234,6 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
     );
 
     let mut optimizer = AdamW::new(args.lr, (0.9, 0.999), 1.0e-8, 0.0);
-    // Pluggable policy-update preset (default rejection-CE = byte-identical).
-    let update_preset = args.update_preset();
     // Value critic (ValueGae presets): its weight is created AFTER the
     // `trainable` filter and is not a student param, so the policy optimizer /
     // LoRA sync / adapter save never touch it — fully isolated, own AdamW.
@@ -3298,16 +3344,9 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
 
     let needs = update_preset.needs();
     let sync_every_group = matches!(args.sync, crate::args::SyncArg::EveryGroup);
-    if !sync_every_group && needs.rollout_logprobs {
-        eprintln!(
-            "[agent-opd] WARNING: --sync every-round with a ratio-weighted preset — π_behavior is \
-             captured at update time, so intra-round drift is NOT corrected (ratios ≈ 1). \
-             Generation-time logprobs land in P6; every-group is the faithful cadence."
-        );
-    }
     let preset_name = clap::ValueEnum::to_possible_value(&args.update_strategy)
         .map_or_else(String::new, |v| v.get_name().to_owned());
-    if args.replay_reuse > 0 && !needs.rollout_logprobs {
+    if args.replay_reuse > 0 && !needs.behavior_logprobs {
         bail!(
             "--replay-reuse {} with --update-strategy {preset_name}: the preset has no IS ratio \
              (ratio == None), so replayed groups would be uncorrected off-policy. Use a \
@@ -3315,7 +3354,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
             args.replay_reuse
         );
     }
-    if args.staleness > 0 && !needs.rollout_logprobs {
+    if args.staleness > 0 && !needs.behavior_logprobs {
         bail!(
             "--staleness {} with --update-strategy {preset_name}: the preset has no IS ratio \
              (ratio == None), so stale groups would be uncorrected off-policy. Use a \
@@ -3539,23 +3578,16 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
                     response_ids: r.response_ids,
                     response_mask: r.response_mask,
                     reward: r.reward,
-                    rollout_logprobs: None,
-                    // Sidecar behavior logprobs: diagnostic at staleness 0
-                    // (the IS ratio stays on the V0 recompute until a future
-                    // license flips it); the ratio denominator for stale groups.
-                    gen_logprobs: (!r.gen_logprobs.is_empty()).then_some(r.gen_logprobs),
+                    behavior_logprobs: (!r.gen_logprobs.is_empty()).then_some(r.gen_logprobs),
                     group_id: group_idx,
                     // Timeout/harness-error attempts: drop them from the update
                     // (a budget artifact, not a learnable fail) via DAPO's filter.
                     truncated: r.truncated,
                 })
                 .collect();
-            // VRAM-wall length guard, applied HERE — before `capture_rollout_logprobs`
-            // runs an unguarded recompute forward and before the writeback. A
-            // trajectory over `max_update_seq` OOM-hangs the capture forward in an
-            // H2D staging copy (37K-token sqlparse hung `cuMemcpyHtoDAsync`, f6g
-            // 2026-07-19); update()'s own `skip_over_max_seq` is downstream, too late
-            // to protect capture. Skipped here == skipped by update() anyway.
+            // VRAM-wall length guard before writeback. Skipped here == skipped
+            // by update() anyway, while keeping an overlong record out of the
+            // batch-wide sidecar validation and any subsequent model forward.
             if args.runtime.max_update_seq != 0 {
                 batch.retain(|t| {
                     let seq = t.prompt_ids.len() + t.response_ids.len();
@@ -3577,38 +3609,8 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
                 batch.truncate(cap_left);
                 cap_left -= batch.len();
             }
-            // Capture π_behavior when the preset needs it. STALE groups pin
-            // the denominator to the generation-time sidecar (the V0 recompute
-            // reflects the post-merge policy — the missing-old-logits failure)
-            // and drop uncaptured trajectories. On-policy groups recompute at
-            // V0: faithful under every-group sync (θ == rollout policy); under
-            // every-round this approximates π_behavior with the already-updated
-            // θ (startup warning above).
-            if needs.rollout_logprobs {
-                let dropped = train::update_strategy::apply_staleness_denominator(
-                    &mut batch,
-                    group_staleness,
-                );
-                if dropped > 0 {
-                    eprintln!(
-                        "[agent-opd] staleness {group_staleness}: dropped {dropped} trajectory(ies) \
-                         without sidecar gen_logprobs (fallback/greedy capture path)"
-                    );
-                }
-                if group_staleness == 0 {
-                    for traj in &mut batch {
-                        let lp = train::opd::capture_rollout_logprobs(
-                            &student,
-                            &traj.prompt_ids,
-                            &traj.response_ids,
-                            &traj.response_mask,
-                            &mut store,
-                        )
-                        .map_err(anyhow::Error::from)?;
-                        traj.rollout_logprobs = Some(lp);
-                    }
-                }
-            }
+            // The update validates the entire ratio-weighted batch before any
+            // critic/student forward. Ratio-free CE/GKD ignores absent sidecars.
             // One update + its metrics row; `extra` carries the arm-specific
             // fields (fresh: group; replay: group/task_id/replayed/age).
             let mut run_update = |batch: &[train::update_strategy::ScoredTrajectory],
@@ -3644,10 +3646,6 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
                     "kl_rollout": report.stats.kl_mean(),
                     "is_ratio_mean": report.stats.ratio_mean(),
                     "is_ratio_max": report.stats.ratio_max,
-                    // Sidecar-vs-recompute logprob gap (0/absent tokens = no sidecar coverage).
-                    "ratio_floor_mean": report.ratio_floor_mean,
-                    "ratio_floor_max": report.ratio_floor_max,
-                    "ratio_floor_tokens": report.ratio_floor_tokens,
                     "clip_frac": report.stats.clip_frac(),
                     "adv_mean": report.adv_mean,
                     "adv_std": report.adv_std,
@@ -3671,9 +3669,8 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
             )?;
 
             // Experience replay (fresh-anchored: only after the fresh group
-            // trained). Stored batches carry the behavior logprobs captured at
-            // first use, so the preset's IS ratio corrects staleness; the
-            // fresh batch is pushed AFTER drawing (first drawable next group).
+            // trained). Stored batches retain the immutable generation-time
+            // behavior sidecars. Push after drawing: first drawable next group.
             if let Some((buffer, rng)) = replay.as_mut() {
                 for entry in buffer.draw(round, args.replay_reuse, rng) {
                     run_update(
@@ -5304,6 +5301,137 @@ mod tests {
         TaskSelection, current_grad_norm, default_cosine_warmup_steps, embedded_tiny_qwen35_config,
         kl_mask_arg, maybe_save_full_student_checkpoint, opd_summary, validate_prompt_collection,
     };
+    #[cfg(feature = "cuda")]
+    use super::{ReplayRecord, replay_groups};
+
+    #[cfg(feature = "cuda")]
+    fn replay_record(gen_logprobs: Option<Vec<f32>>) -> ReplayRecord {
+        ReplayRecord {
+            label: Some("task#0".to_owned()),
+            prompt_ids: vec![1],
+            response_ids: vec![2],
+            response_mask: vec![1],
+            gen_logprobs,
+            reward: 1.0,
+            truncated: false,
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn replay_preflight_uses_train_validation() {
+        let missing = replay_groups(
+            train::update_strategy::UpdatePreset::grpo(),
+            &[replay_record(None)],
+            usize::MAX,
+        );
+        let err = train::update_strategy::UpdatePreset::grpo()
+            .preflight(&missing[0], 100, 1)
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("requires generation-time behavior_logprobs")
+        );
+
+        let misaligned = replay_groups(
+            train::update_strategy::UpdatePreset::grpo(),
+            &[replay_record(Some(vec![]))],
+            usize::MAX,
+        );
+        let err = train::update_strategy::UpdatePreset::grpo()
+            .preflight(&misaligned[0], 100, 1)
+            .unwrap_err();
+        assert!(err.to_string().contains("masked token count 1"));
+
+        assert!(
+            train::update_strategy::UpdatePreset::rejection_ce()
+                .preflight(&missing[0], 100, 1)
+                .is_ok()
+        );
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn replay_group_filter_and_cap_are_atomic() {
+        let mut records = Vec::new();
+        for (label, reward) in [
+            ("a#0", 1.0),
+            ("b#0", 1.0),
+            ("a#1", 0.0),
+            ("b#1", 0.0),
+            ("c#0", 1.0),
+            ("c#1", 0.0),
+        ] {
+            let mut record = replay_record(Some(vec![-0.5]));
+            record.label = Some(label.to_owned());
+            record.reward = reward;
+            records.push(record);
+        }
+        let groups = replay_groups(train::update_strategy::UpdatePreset::grpo(), &records, 3);
+        assert_eq!(
+            groups.len(),
+            1,
+            "second two-record group exceeds remaining cap"
+        );
+        assert_eq!(groups[0].len(), 2, "records are grouped before capping");
+
+        let mut filtered = records.clone();
+        filtered[0].truncated = true;
+        filtered[1].truncated = true;
+        filtered[2].reward = 1.0;
+        let groups = replay_groups(train::update_strategy::UpdatePreset::dapo(), &filtered, 2);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(
+            groups[0][0].group_id, 1,
+            "filter uses each complete task group"
+        );
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn replay_cap_excludes_bad_sidecar_and_ce_remains_ratio_free() {
+        let mut records = vec![
+            replay_record(Some(vec![-0.5])),
+            replay_record(Some(vec![-0.5])),
+        ];
+        records[0].label = Some("a#0".to_owned());
+        records[1].label = Some("b#0".to_owned());
+        records[1].gen_logprobs = Some(vec![f32::NAN]);
+        let groups = replay_groups(train::update_strategy::UpdatePreset::grpo(), &records, 1);
+        assert_eq!(groups.len(), 1);
+        train::update_strategy::UpdatePreset::grpo()
+            .preflight(&groups[0], 100, 1)
+            .unwrap();
+
+        let ce_groups = replay_groups(
+            train::update_strategy::UpdatePreset::rejection_ce(),
+            &[replay_record(None)],
+            usize::MAX,
+        );
+        train::update_strategy::UpdatePreset::rejection_ce()
+            .preflight(&ce_groups[0], 100, 1)
+            .unwrap();
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn online_ratio_temperature_guard_preserves_replay_and_ratio_free_greedy() {
+        use crate::args::UpdateStrategyArg;
+
+        let err = super::validate_online_rollout_temperature(
+            train::update_strategy::UpdatePreset::grpo(),
+            UpdateStrategyArg::Grpo,
+            0.0,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("must be > 0"));
+        super::validate_online_rollout_temperature(
+            train::update_strategy::UpdatePreset::rejection_ce(),
+            UpdateStrategyArg::RejectionCe,
+            0.0,
+        )
+        .unwrap();
+    }
 
     #[test]
     fn replay_buffer_retention_math() {
@@ -5315,8 +5443,7 @@ mod tests {
                     response_ids: vec![2],
                     response_mask: vec![1],
                     reward,
-                    rollout_logprobs: Some(vec![-0.5]),
-                    gen_logprobs: None,
+                    behavior_logprobs: Some(vec![-0.5]),
                     group_id: 0,
                     truncated: false,
                 })

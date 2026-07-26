@@ -3,7 +3,9 @@
 **Date:** 2026-07-26
 **Scope:** `crates/train`, `crates/autograd`, training-facing `infer-api` / `infer-cuda`, and CUDA kernels reached by training paths
 **Method:** selected-reference source comparison plus adversarial source verification
-**Evidence boundary:** current-worktree source and existing tests only. No test, CUDA execution, `nsys`, `ncu`, convergence run, or matched performance A/B was run for this revision.
+**Evidence boundary:** the audit verdict below was based on the then-current source and existing tests. No CUDA performance or convergence claim is made.
+
+**Post-audit update (2026-07-26):** the CP0-A behavior-denominator defect is fixed and runtime-accepted. Ratio-weighted online, stale, experience-replay, and offline-replay updates now consume the immutable generation-time `gen_logprobs` sidecar; malformed or absent evidence fails during shared preflight before model work. Focused local tests, CUDA/no-CUDA typechecks, an isolated H20 CUDA build, H20 offline replay positive/negative gates, and a real online stochastic GRPO update passed. The online run trained 672 tokens from two variance-bearing trajectories with finite IS telemetry (`is_ratio_mean=0.952895`, `is_ratio_max=9.580126`). No performance or convergence claim is made.
 
 The external comparison was intentionally selective. It covers GKD, MiniLLM, GRPO, DAPO, Dr.GRPO, GSPO, CISPO-like detached weighting, and FLA Gated DeltaNet at the level needed for the findings below. It does **not** claim complete method coverage for SAO, CISPO, DSpark/DFlash, ISO, perplexity evaluation, or `cc-convert`; those are excluded from paper-completeness claims unless explicitly discussed.
 
@@ -26,7 +28,7 @@ Strong decisions:
 Primary gaps, classified by evidence rather than a fixed count:
 
 - **P1 correctness:** no common finite-value transaction protects every optimizer mutation.
-- **P1 correctness:** ratio-weighted online/replay updates do not use the real generation-time sidecar as the behavior-policy denominator.
+- **P1 correctness, fixed after the audit:** ratio-weighted online/replay updates now use the real generation-time sidecar as the behavior-policy denominator and fail closed on invalid evidence.
 - **P1 algorithm identity:** GRPO/DAPO/Dr.GRPO/GSPO names are attached to a detached clamped-weight gradient, not their paper surrogates.
 - **P1 kernel coverage:** host-taped GDN carry exists and CUDA recurrence has carry-forward substrate, but production taped carry forward/backward is not device-closed.
 - **P1 kernel coverage:** Qwen3.6 MoE training is host-orchestrated around per-expert backend GEMMs.
@@ -62,30 +64,21 @@ A framework rewrite is not justified.
 
 Static inspection can establish control flow, reductions, state schemas, synchronization, residency transitions, and unsupported configurations. It cannot establish performance magnitude, convergence, acceptance improvement, or paper-level quality parity.
 
-### 2.1 CP0-A: behavior-policy identity
+### 2.1 CP0-A: behavior-policy identity — fixed after the audit
 
-**Current facts**
+The audit found that serving already recorded the filtered generation-time probability, but training retained parallel sidecar and recomputed-denominator fields. Offline replay and fresh online updates reconstructed the denominator from the train model; stale updates alone promoted the sidecar. That was invalid whenever temperature or sampler filtering changed the distribution, and it made denominator identity depend on staleness.
 
-- CUDA serving records `gen_logprobs` at generation commit under the same filtered distribution used by sampling: `crates/infer-server/src/coordinator.rs:130-166`.
-- replay records deserialize this sidecar: `crates/cli/src/train_cli.rs:2459-2478`.
-- `ScoredTrajectory` carries both recomputed and generation-time logprobs, but documents the sidecar as diagnostic-only: `crates/train/src/update_strategy.rs:23-41`.
-- replay recomputes `rollout_logprobs` from the current train model and does not use the real sidecar as the denominator: `crates/cli/src/train_cli.rs:2546-2579`.
-- the online path warns and continues for `--sync every-round`: `crates/cli/src/train_cli.rs:3299-3306`.
-- `staleness == 0` runs rollout inline under the current serving policy, but still captures the denominator later from the train model; `staleness > 0` explicitly overlaps a rollout with training: `crates/cli/src/train_cli.rs:3379-3427`.
-
-`--sync every-group` is not a general correctness bypass. It may make a narrow `staleness == 0` path equivalent when serving and training distributions are provably identical at sampling and recomputation, but it does not prove equality under filtering/sampler differences, replay, asynchronous staleness, or any future policy transform.
-
-**Required rule**
+The current worktree has one contract:
 
 ```text
 behavior denominator = generation-time gen_logprobs sidecar
-if sidecar absent:
-    continue only after proving the exact sampling distribution equals recomputation
-otherwise:
-    fail closed before backward
+ratio-weighted survivor without aligned finite sidecar = error before model work
+ratio-free CE/GKD = no sidecar requirement
 ```
 
-This is **sidecar-first**, not “recompute-first with a diagnostic sidecar.” Missing/misaligned/non-finite sidecars, including token-mask length mismatches, must be explicit errors for ratio-weighted updates.
+`ScoredTrajectory` now has one `behavior_logprobs` field (`crates/train/src/update_strategy.rs:26-35`). `UpdatePreset::preflight` and the update seam share validation (`crates/train/src/update_strategy.rs:272-307`), while offline and online admission both bind `gen_logprobs` directly (`crates/cli/src/train_cli.rs:2458-2503,2651-2678,3575`). Staleness controls policy-version distance only. `capture_rollout_logprobs` remains solely for GSPO's current-policy sequence numerator (`crates/train/src/update_strategy.rs:447-454`).
+
+Greedy online rollout cannot supply this evidence, so ratio-weighted presets reject `temperature <= 0` before expensive initialization; ratio-free training remains legal (`crates/cli/src/train_cli.rs:2857-2903`).
 
 ### 2.2 CP0-B: named-paper attribution
 
@@ -189,9 +182,9 @@ mutate optimizer exactly once
 
 A non-finite loss or norm must skip parameters, moments, step/schedule, EMA, infer synchronization, and artifact publication. Sanitizing chunked KL gradients and continuing is a different algorithm and must not substitute for fail-closed production behavior.
 
-### 5.2 P1 correctness: behavior sidecar exists but is not authoritative
+### 5.2 Resolved correctness gap: behavior sidecar is authoritative
 
-The mechanism and correction are defined in CP0-A. The defect is no longer “generation logprobs are missing.” They exist. The defect is that online and replay ratio paths ignore them as the estimator denominator and recompute after generation.
+The CP0-A fix described in §2.1 removes the invalid post-generation denominator reconstruction. Focused tests cover missing, misaligned, and non-finite sidecars; zero-target and filtered trajectories do not acquire a false sidecar requirement. H20 offline replay proved that valid sidecars train across repeated epochs and malformed records fail before model initialization. A real online stochastic GRPO run then trained 672 tokens from two trajectories with reward variance and finite IS telemetry, closing the runtime gate.
 
 ### 5.3 P1 algorithm identity: paper presets share the wrong surrogate gradient
 
@@ -368,7 +361,7 @@ No tests were run for this audit revision. The repository contains tests for pri
 Critical gates still needed:
 
 1. **Whole-step finite skip:** non-finite loss or accumulated norm leaves parameters, moments, schedule, EMA, infer state, and publication unchanged.
-2. **Behavior sidecar:** sidecar is authoritative; missing/misaligned sidecar fails unless an explicit equivalence proof path is selected and tested.
+2. **Behavior sidecar:** completed locally and on H20 for offline replay and a real online stochastic ratio update.
 3. **Surrogate gradient oracle:** positive/negative advantages, ratio below/inside/above bounds, including GSPO sequence-level cases.
 4. **Production GDN carry:** path probe plus forward/input/carry-boundary/conv-weight parity across lengths.
 5. **Save-exit-resume equivalence:** uninterrupted versus process-exit continuation for each mode claiming exact resume.
@@ -384,8 +377,8 @@ Critical gates still needed:
 1. enforce finite validation before every loss backward;
 2. enforce finite global norm after all accumulation and before any mutation;
 3. remove gradient sanitization as a silent production continuation policy;
-4. switch ratio estimators to sidecar-first behavior logprobs;
-5. fail closed when sidecar validity or exact sampling equivalence is absent;
+4. ~~switch ratio estimators to generation-time behavior logprobs;~~ **completed**
+5. ~~fail closed when sidecar evidence is absent or invalid;~~ **completed**
 6. move entropy/top-k capability validation before expensive initialization.
 
 **Exit gate:** whole-step finite-skip and sidecar-authority tests pass.
@@ -452,7 +445,7 @@ Prioritize by measured full-step contribution and licensed objective value: MoE 
 | MiniLLM relation | Divergence overlap only | token reverse KL exists; sequence-level PG estimator is not implemented |
 | Self-OPD | Experimental/competitive substrate | exact factor-parameter EMA; deployment/quality and continuation gaps |
 | Rubric RFT | Usable, not fully licensed | coherent masked CE; selection/resource/evidence gaps |
-| Agent RFT | Conditional blocker for named claims | sidecar ignored as denominator; detached surrogate mislabeled |
+| Agent RFT | Denominator contract fixed; named claims still blocked | generation-time sidecar is authoritative; detached surrogate remains mislabeled |
 | Precision | Stable but conservative | clear FP32/BF16/FP8 boundary; finite transaction incomplete |
 | GDN training | P1 device-closure gap | host carry context and CUDA intermediates are not one production taped unit |
 | Qwen3.6 MoE | P1 host-orchestrated hybrid | frozen weights may remain resident; routing/activation/gradient orchestration is host-mediated |
@@ -464,7 +457,7 @@ Prioritize by measured full-step contribution and licensed objective value: MoE 
 | Training TP | Partial capability | full-attention substrate and verification executable exist; CLI/hybrid/MoE support absent |
 | Test evidence | Useful when executed, not run here | GPU tests can skip; production identity gates remain missing |
 
-The immediate work is four exact contracts: finite mutation, sidecar-first behavior identity, truthful surrogate gradients, and carry-aware GDN device closure. Exact continuation follows as a schema design task, not a codec wiring task.
+The immediate unresolved contracts are finite mutation, truthful surrogate gradients, and carry-aware GDN device closure. Behavior-policy identity is now enforced by the generation-time sidecar. Exact continuation follows as a schema design task, not a codec wiring task.
 
 ---
 

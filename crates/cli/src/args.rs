@@ -2071,7 +2071,8 @@ pub(crate) struct TrainAgentOpdArgs {
     /// Serve-side temperature for requests that omit it (CC sends none). 0.3, not
     /// 1.0: hd256/FP8 (Qwen3.6-27B) sampling corrupts at temp>0 above ~0.3 (#48;
     /// b4b293f0c fixed greedy/argmax only, the temp>0 distribution still degrades)
-    /// — 0.3 stays coherent AND keeps behavior logprobs non-empty. Restore
+    /// — 0.3 stays coherent AND keeps behavior logprobs non-empty. Ratio-weighted
+    /// strategies require T > 0; rejection-ce permits greedy T <= 0. Restore
     /// 1.0 once the hd256/FP8 temp>0 fix lands.
     #[arg(long, default_value_t = 0.3, value_name = "T")]
     pub(crate) rollout_temperature: f32,
@@ -2111,7 +2112,9 @@ pub(crate) struct TrainAgentOpdArgs {
     #[arg(long, default_value_t = 3)]
     pub(crate) rounds: usize,
 
-    /// Cap on CE writeback pairs trained per round (unset = all accepted).
+    /// Cap on trained trajectories per round/epoch (unset = all accepted). Replay
+    /// PG keeps task groups atomic: if the next full trainable group exceeds the
+    /// remaining cap, replay stops instead of truncating that group.
     #[arg(long, value_name = "N")]
     pub(crate) writeback_cap: Option<usize>,
 
