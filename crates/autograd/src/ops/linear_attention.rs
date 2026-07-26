@@ -948,8 +948,10 @@ fn try_linear_attention_forward_device(
                 a_inv: Some(a_inv_id),
                 chunk_state: Some(chunk_state_id),
                 raw_output: Some(raw_output_id),
+                // State carry lives in chunk_state[0] → None (Some would misfire
+                // needs_host_recompute). Conv carry is a real backward input → keep it.
                 initial_state: None,
-                initial_conv_window: None,
+                initial_conv_window,
                 batch: params.batch,
                 seq_len: params.seq_len,
                 num_key_heads: params.num_key_heads,
@@ -986,6 +988,7 @@ fn try_linear_attention_backward_device(
     a_inv: Option<TensorId>,
     chunk_state: Option<TensorId>,
     raw_output: Option<TensorId>,
+    initial_conv_window: Option<TensorId>,
     params: LinearAttentionParams,
     store: &mut TensorStore,
 ) -> Result<Option<GradPairs>> {
@@ -1081,6 +1084,12 @@ fn try_linear_attention_backward_device(
     let a_inv_handle = handle(store, a_inv)?;
     let chunk_state_handle = handle(store, chunk_state)?;
     let raw_output_handle = handle(store, raw_output)?;
+    let conv_tail_handle = initial_conv_window
+        .map(|id| {
+            store.ensure_device(id)?;
+            handle(store, id)
+        })
+        .transpose()?;
 
     let Some(device_grads) =
         store
@@ -1116,6 +1125,7 @@ fn try_linear_attention_backward_device(
                 a_inv: &a_inv_handle,
                 chunk_state: &chunk_state_handle,
                 raw_output: &raw_output_handle,
+                initial_conv_window: conv_tail_handle.as_ref(),
             })?
     else {
         return Ok(None);
@@ -1256,13 +1266,11 @@ pub(crate) fn linear_attention_backward(
         store,
     )?;
 
-    // The OPD frozen-prompt-KV carry path is host-only (see
-    // `linear_attention_core_with_carry_taped`); when it is present the device
-    // fast path has no carry-aware kernel, so fall through to the host recompute
-    // that re-seeds the carry below. The default path (no carry) keeps the device
-    // backward unchanged.
-    let has_carry = initial_state.is_some() || initial_conv_window.is_some();
-    if !has_carry
+    // Only the recurrent-state carry forces the host recompute (it must rebuild the
+    // full-sequence state); the conv-window carry is just a device backward input,
+    // fed through below. The default path (both None) still takes the device backward.
+    let needs_host_recompute = initial_state.is_some();
+    if !needs_host_recompute
         && let Some(grads) = try_linear_attention_backward_device(
             output_grad_id,
             qkv,
@@ -1284,6 +1292,7 @@ pub(crate) fn linear_attention_backward(
             a_inv,
             chunk_state,
             raw_output,
+            initial_conv_window,
             params,
             store,
         )?

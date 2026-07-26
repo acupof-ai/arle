@@ -4457,6 +4457,7 @@ fn cuda_linear_attention_backward_device(
     let rows = (0..p.batch)
         .map(|row| {
             let slice = |src| cuda_row_slice(backend, src, row, p.batch);
+            let initial_conv_window = args.initial_conv_window.map(slice).transpose()?;
             cuda_linear_attention_backward_device_row(
                 backend,
                 LinearAttentionDeviceBackwardArgs {
@@ -4481,6 +4482,7 @@ fn cuda_linear_attention_backward_device(
                     dt_bias: args.dt_bias,
                     a_log: args.a_log,
                     norm_weight: args.norm_weight,
+                    initial_conv_window: initial_conv_window.as_ref(),
                 },
             )
         })
@@ -4915,10 +4917,21 @@ fn cuda_linear_attention_backward_device_row(
         let (preact_ptr, _preact_guard) = preact.device_ptr(&backend.stream);
         let (qkv_ptr, _qkv_guard) = qkv.device_ptr(&backend.stream);
         let (conv_ptr, _conv_guard) = conv1d_weight.device_ptr(&backend.stream);
-        // conv_tail nullptr: carry backward reroute is tranche 2 (kernel ABI ready).
-        // See docs/research/2026-07-26-carry-aware-chunked-gdn-backward.md §4.2③.
-        let conv_tail_ptr = 0u64;
-        let conv_tail_len_i32 = 0i32;
+        // conv_tail: carried boundary window (nullptr → zero-pad default). Its boundary
+        // taps' grad_weight is real; grad_input stays off (carry frozen).
+        let conv_tail = args
+            .initial_conv_window
+            .map(|h| backend.cuda_slice(h, "linear_attention_backward conv_tail"))
+            .transpose()?;
+        let conv_tail_dev = conv_tail.map(|s| s.device_ptr(&backend.stream));
+        let conv_tail_ptr = conv_tail_dev.as_ref().map_or(0u64, |(ptr, _)| *ptr);
+        let conv_tail_len_i32 = conv_tail
+            .map(|_| i32::try_from(p.conv_kernel - 1))
+            .transpose()
+            .map_err(|_| {
+                AutogradError::TapeInvariant("linear_attention conv_tail_len exceeds i32")
+            })?
+            .unwrap_or(0);
         launch_1d(
             &backend.stream,
             backend

@@ -46,9 +46,33 @@ Two harness defects surfaced on the first run, both invisible at short lengths:
   `assistant:` cue. The runner also only counted `delta.content`, so a thinking
   model streaming `reasoning_content` reported zero events on a short cap.
 
+## Correction, same day — the 89% prefill figure is a cold-cache artifact
+
+The dataset above gave every request a unique 32k context, so prefix reuse was
+structurally impossible and every request paid a full prefill. Real coding-agent
+serving is the opposite. TraceLab (arXiv:2606.30560, 4,265 Claude Code / Codex
+sessions, 350k LLM steps) measures a **95.7% global prefix-cache hit rate**, with
+per-step medians of **119K prefix tokens, 875 append tokens, 214 output tokens**.
+Per step that is TTFT 3.1 s against decode 214 tok @ 46.8 tok/s ≈ 4.6 s — **~60%
+of per-step wall clock is decode, not prefill.** Prefix tokens are 59.5% of API
+cost only because they are numerous, at one tenth the per-token rate: they are
+cache reads, not prefills.
+
+So "~89% is prefill, decode-side work is the 10% slice" is wrong for the served
+workload and must not be cited. The generator now emits `sessions × turns`
+conversations where turn k's text is a strict prefix of turn k+1's, laid out
+turn-major, with the TraceLab medians as defaults; bench spec §3.3 carries the
+rule and requires cold and warm slices to be reported separately.
+
 ## Rule
 
-A benchmark shape is a claim about the machine under test. At ~3.4k tokens the
+A benchmark shape is a claim about the machine under test — and the cache state
+is part of the shape. Reach for a published trace characterization before
+inventing a workload: TraceLab had the per-step medians and the 95.7% hit rate
+already measured, and one search would have caught the unique-context design
+before it produced a headline number that pointed the roadmap the wrong way.
+
+At ~3.4k tokens the
 run is decode-bound and the prefill, KV-residency, page-table, and long-context
 attention paths are barely exercised — a treatment can post a large delta there
 and move nothing that a user waits on. Measure the shape you serve, and confirm

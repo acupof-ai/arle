@@ -84,7 +84,9 @@ reading the code collapsed it to "one per-row `for` at `dsv4.rs:1872` → batch 
 
 - **SLO verdict from the SLO workload, not a smoke shape** — a c=1 short-prompt
   nsys "2× win" routinely flips on production prompt length. The workload is the
-  32k-token long-agent dataset (bench spec §3.3); anything shorter is a smoke
+  multi-turn long-agent dataset at the TraceLab medians (bench spec §3.3):
+  119K prefix, 875 append, 214 output, 95.7% prefix hit. Anything shorter, or
+  anything that cannot hit the prefix cache, is a smoke
   shape, whatever it measures.
 - **`plan_label=mixed` is reachability, not acceptance** — a c-sweep must clear
   TTFT *and* ITL *and* output throughput before a default flip, on ≥2 binding
