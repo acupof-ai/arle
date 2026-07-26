@@ -13,7 +13,7 @@
 use std::collections::VecDeque;
 use std::sync::{Mutex, OnceLock};
 
-use cuda_kernels::prelude::{DeviceContext, DeviceVec, HiddenStates};
+use cuda_kernels::prelude::{DeviceContext, HiddenStates};
 
 /// One DSpark spec step's experience for RL training.
 pub struct DsparkExperience {
@@ -122,68 +122,12 @@ fn hidden_states_to_host(ctx: &DeviceContext, hs: &HiddenStates) -> Vec<f32> {
     }
 }
 
-/// Capture a DSpark experience from the hot path.
-///
-/// Called after `dspark_accept_commit` returns the accepted count `k`.
-/// `draft_logits` are the draft head's outputs (`scratch.logits`); `target_logits`
-/// are the trunk's verify outputs. Both are device-resident; this function copies
-/// them to host (via a stream sync) and pushes the tuple to the global buffer.
+/// Capture a DSpark experience after the accept returns `k`. `target_logits`
+/// spans a whole batched tick; only rows `[col_offset, +col_len)` are this
+/// slot's. Copies both to host (stream sync) into the global buffer.
 ///
 /// Best-effort: returns immediately on any error so a capture failure never
 /// aborts the decode step. The D2H copy + sync does add per-step latency.
-/// `vocab` is passed in rather than inferred: the caller knows it, and deriving
-/// it from `draft_logits.len() / draft_tokens.len()` is wrong whenever the two
-/// disagree — confidence truncation and the anchor-carrying chain both do (#176).
-pub fn capture_dspark_experience(
-    ctx: &DeviceContext,
-    draft_tokens: &[u32],
-    draft_logits: &HiddenStates,
-    target_logits: &DeviceVec,
-    vocab: usize,
-    accepted: usize,
-    next_token_heads: bool,
-) {
-    let block_size = draft_tokens.len();
-    if block_size == 0 || !capturing() {
-        return;
-    }
-    let draft_logits_host = hidden_states_to_host(ctx, draft_logits);
-    let target_logits_host = match target_logits.to_host(ctx) {
-        Ok(v) => v,
-        Err(e) => {
-            log::warn!("dspark_train: D2H target logits copy failed: {e}");
-            return;
-        }
-    };
-    if draft_logits_host.is_empty() || target_logits_host.is_empty() {
-        return;
-    }
-    // Row counts may legitimately differ (truncated drafts); only the vocab
-    // width must divide both, and the target must cover the whole chain.
-    if !draft_logits_host.len().is_multiple_of(vocab)
-        || target_logits_host.len() != block_size * vocab
-    {
-        log::warn!(
-            "dspark_train: draft/target shape mismatch: draft_len={} target_len={} block_size={block_size} vocab={vocab}",
-            draft_logits_host.len(),
-            target_logits_host.len()
-        );
-        return;
-    }
-    buffer().push(DsparkExperience {
-        draft_tokens: draft_tokens.to_vec(),
-        draft_logits: draft_logits_host,
-        target_logits: target_logits_host,
-        accepted,
-        block_size,
-        vocab_size: vocab,
-        next_token_heads,
-    });
-}
-
-/// DSv4 variant: target logits are a `[total_m, vocab]` `HiddenStates`
-/// (`seq_len` = total tokens across all slots, `hidden_dim` = vocab); only
-/// rows `[col_offset, col_offset + col_len)` belong to this slot.
 #[allow(clippy::too_many_arguments)]
 pub fn capture_dspark_experience_hidden(
     ctx: &DeviceContext,

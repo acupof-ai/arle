@@ -41,7 +41,9 @@ use cuda_kernels::prelude::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates
 use cuda_kernels::tensor::{
     HostMatrixSnapshot, WeightFormat, cache_ptr, offload_raw_slice, reload_raw_slice,
 };
-use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut, sys::CUevent_flags};
+use cudarc::driver::{
+    CudaSlice, CudaView, CudaViewMut, DevicePtr, DevicePtrMut, sys::CUevent_flags,
+};
 use half::bf16;
 use infer_plan::SamplingParams;
 use infer_topo::TpConfig;
@@ -121,7 +123,7 @@ pub(crate) mod conv_probe {
         seq_len: usize,
         channels: usize,
         kernel_size: usize,
-        input: &CudaSlice<bf16>,
+        input: &CudaView<'_, bf16>,
         weight: &DeviceVec,
         state: &DeviceVec,
     ) -> Result<Option<Pending>> {
@@ -157,7 +159,7 @@ pub(crate) mod conv_probe {
     pub(super) fn finish(
         ctx: &DeviceContext,
         pending: Option<Pending>,
-        output: &HiddenStates,
+        output: &CudaViewMut<'_, bf16>,
         state: &DeviceVec,
     ) -> Result<()> {
         let Some(pending) = pending else {
@@ -165,7 +167,7 @@ pub(crate) mod conv_probe {
         };
         let output = ctx
             .stream
-            .clone_dtoh(&output.data)
+            .clone_dtoh(output)
             .map_err(|e| anyhow!("conv output D2H failed: {e}"))?;
         let post_state = ctx
             .stream
@@ -259,9 +261,9 @@ pub(crate) mod gdr_probe {
         num_v_heads: usize,
         key_dim: usize,
         val_dim: usize,
-        qkv: &CudaSlice<bf16>,
-        b_proj: &CudaSlice<bf16>,
-        a_proj: &CudaSlice<bf16>,
+        qkv: &CudaViewMut<'_, bf16>,
+        b_proj: &CudaView<'_, bf16>,
+        a_proj: &CudaView<'_, bf16>,
         dt_bias: &DeviceVec,
         a_log: &CudaSlice<f32>,
         state: &CudaSlice<f32>,
@@ -313,7 +315,7 @@ pub(crate) mod gdr_probe {
     pub(super) fn finish(
         ctx: &DeviceContext,
         pending: Option<Pending>,
-        output: &HiddenStates,
+        output: &CudaViewMut<'_, bf16>,
         state: &CudaSlice<f32>,
     ) -> Result<()> {
         let Some(pending) = pending else {
@@ -321,7 +323,7 @@ pub(crate) mod gdr_probe {
         };
         let output = ctx
             .stream
-            .clone_dtoh(&output.data)
+            .clone_dtoh(output)
             .map_err(|e| anyhow!("gdr output D2H failed: {e}"))?;
         let post_state = ctx
             .stream
@@ -1704,7 +1706,7 @@ pub(crate) struct Qwen35SpecSlotState {
     conv_snap: Vec<DeviceVec>,
     /// Per-linear-layer capture of the verify forward's gated-delta inputs, for
     /// the cheap partial-accept linear-only replay (see [`Qwen35LinearCapture`]).
-    capture: Qwen35LinearCapture,
+    pub(crate) capture: Qwen35LinearCapture,
     /// Persistent 1-element argmax scratch shared by the draft + the two verify
     /// rows, so a spec step performs ZERO per-token argmax allocations and the
     /// verify argmax stays on-device (no full `[seq, vocab]` D2H).
@@ -1905,12 +1907,13 @@ pub(crate) struct FullAttnScratch {
 /// per-slot contiguous cache. The default build hands a `for_slot` page table
 /// over the slot's FULL resident pages (full attention, no eviction); the
 /// `--kv-recall` cycle layers a working-set restriction on top of the SAME
-/// pool. `layer0_query` collects the post-RoPE layer-0 full-attn query for the
-/// recall score (unused on the default path; populated only on prefill).
+/// pool. `Some` on `layer0_query` opts into the layer-0 post-RoPE query
+/// readback for the recall score — a mid-forward D2H, so only the recall
+/// prefill asks for it.
 pub(crate) struct Qwen35RecallForward<'a> {
     pub(crate) pool: &'a mut PagedKVPool,
     pub(crate) meta: &'a crate::loader::PageMeta,
-    pub(crate) layer0_query: Vec<f32>,
+    pub(crate) layer0_query: Option<Vec<f32>>,
 }
 
 #[derive(Default)]
@@ -1932,6 +1935,28 @@ pub(crate) struct LinearAttnScratch {
     fq_g: SliceSlot<f32>,
     fq_g_cumsum: SliceSlot<f32>,
     fq_beta: SliceSlot<f32>,
+}
+
+/// One slot's contiguous column range in a ragged batch. Its `len` token-major
+/// columns advance THIS slot's state; its capture receives them from offset 0.
+pub(crate) struct LinearRow<'a> {
+    pub(crate) slot: &'a mut Qwen35SlotState,
+    pub(crate) len: usize,
+    pub(crate) capture: Option<&'a mut Qwen35LinearCapture>,
+}
+
+/// How [`Qwen35Model::linear_attention`] reaches per-slot conv + recurrent
+/// state. Everything else in the layer runs once over all columns.
+pub(crate) enum LinearCore<'a, 'r> {
+    /// Ragged `B×T`: one single-slot multi-token launch per row.
+    Rows(&'a mut [LinearRow<'r>]),
+    /// Pure decode, one token per row: staged pointer tables advance all B
+    /// states in ONE conv + ONE GDR launch. Row `r`'s channels sit at `r*C`;
+    /// conv `[C, K-1]` and GDR `[Vh, Kd, Vd]` match the single-slot layout.
+    Tables {
+        conv: &'a CudaSlice<u64>,
+        gdr: &'a CudaSlice<u64>,
+    },
 }
 
 #[derive(Default)]
@@ -3722,8 +3747,13 @@ impl Qwen35Model {
             self.max_seq_len
         );
         self.stage_step_inputs(ws, tokens, start_pos)?;
-        self.forward_hidden_staged(slot, ws, seq_len, start_pos, capture, recall, taps)?;
-        slot.seq_len += seq_len;
+        let mut rows = [LinearRow {
+            slot,
+            len: seq_len,
+            capture,
+        }];
+        self.forward_hidden_staged(&mut rows, ws, start_pos, recall, taps)?;
+        rows[0].slot.seq_len += seq_len;
         Ok(())
     }
 
@@ -3750,33 +3780,38 @@ impl Qwen35Model {
 
     /// The pure-GPU layer stack over already-staged inputs: embeds the staged
     /// token ids, runs every layer over the workspace buffers, and advances
-    /// the recurrent/conv/KV device state in place. Does NOT advance
-    /// `slot.seq_len` and performs NO H2D/D2H/sync — at `seq_len == 1` this is
-    /// the CUDA-graph-capturable decode body (every per-step scalar is read
-    /// from the staged device buffers; see
+    /// each row's recurrent/conv/KV device state in place. Does NOT advance
+    /// `slot.seq_len` and performs NO H2D/D2H/sync — at one row of one token
+    /// this is the CUDA-graph-capturable decode body (every per-step scalar is
+    /// read from the staged device buffers; see
     /// [`Self::forward_decode_step_captured`] for the capture-safety table).
     ///
-    /// `start_pos` (host) is consumed only by the `seq_len > 1` prefill
-    /// attention launch; the `seq_len == 1` path reads the position from the
-    /// staged device buffer.
+    /// `rows` are the ragged per-slot token spans, token-major and in the same
+    /// order as the staged ids; the full-attn layers get their identity from
+    /// `recall`'s page table instead. `start_pos` (host) is consumed only by
+    /// the multi-token NON-paged attention launch, which is single-row.
     fn forward_hidden_staged(
         &self,
-        slot: &mut Qwen35SlotState,
+        rows: &mut [LinearRow<'_>],
         ws: &mut Qwen35Workspace,
-        seq_len: usize,
         start_pos: usize,
-        mut capture: Option<&mut Qwen35LinearCapture>,
         mut recall: Option<&mut Qwen35RecallForward>,
         mut taps: Option<&mut dspark::Qwen35DsparkTaps>,
     ) -> Result<()> {
         // Single chokepoint for every recurrent-reading forward (prefill /
-        // decode / spec-capture / OPD): the slot's recurrent block MUST be
+        // decode / spec-capture / OPD): each row's recurrent block MUST be
         // resident — a missed `acquire_recurrent` hook would otherwise read an
         // empty `gdr_states` as a silent no-op.
         ensure!(
-            slot.has_recurrent(),
+            rows.iter().all(|r| r.slot.has_recurrent()),
             "Qwen3.6 forward: slot recurrent state not acquired (missing \
              acquire_recurrent at the start_pos==0 prefill)"
+        );
+        let seq_len: usize = rows.iter().map(|r| r.len).sum();
+        ensure!(
+            recall.is_some() || rows.len() == 1,
+            "Qwen3.6 forward: the contiguous full-attn cache is single-row, got {} rows",
+            rows.len()
         );
         let c = &self.config;
         let eps = c.rms_norm_eps;
@@ -3843,16 +3878,17 @@ impl Qwen35Model {
                                     full_attn,
                                     normed,
                                     full_idx,
+                                    rc.pool,
+                                    rc.meta,
                                     full,
                                     attn_out,
-                                    rc,
-                                    seq_len == 1,
+                                    rc.layer0_query.as_mut(),
                                 )
                             } else {
                                 self.full_attention(
                                     full_attn,
                                     normed,
-                                    slot,
+                                    &mut *rows[0].slot,
                                     full_idx,
                                     start_pos,
                                     start_pos_dev,
@@ -3865,7 +3901,6 @@ impl Qwen35Model {
                     full_idx += 1;
                 }
                 Qwen35Attn::Linear(lin) => {
-                    let cap = capture.as_deref_mut();
                     qwen35_profile(
                         &self.ctx,
                         "qwen/linear_attention",
@@ -3873,7 +3908,12 @@ impl Qwen35Model {
                         seq_len,
                         || {
                             self.linear_attention(
-                                lin, normed, slot, linear_idx, linear, attn_out, cap,
+                                lin,
+                                normed,
+                                LinearCore::Rows(&mut *rows),
+                                linear_idx,
+                                linear,
+                                attn_out,
                             )
                         },
                     )?;
@@ -4027,8 +4067,13 @@ impl Qwen35Model {
         );
         let seq_len = tokens.len();
         self.stage_step_inputs(ws, tokens, start_pos)?;
-        self.forward_hidden_staged(slot, ws, seq_len, start_pos, None, Some(recall), taps)?;
-        slot.seq_len += seq_len;
+        let mut rows = [LinearRow {
+            slot,
+            len: seq_len,
+            capture: None,
+        }];
+        self.forward_hidden_staged(&mut rows, ws, start_pos, Some(recall), taps)?;
+        rows[0].slot.seq_len += seq_len;
         self.lm_head_logits(ws, seq_len)?;
         self.sample_workspace_logits(ws, params, position)
     }
@@ -4169,7 +4214,12 @@ impl Qwen35Model {
         ws: &mut Qwen35Workspace,
         start_pos: usize,
     ) -> Result<()> {
-        self.forward_hidden_staged(slot, ws, 1, start_pos, None, None, None)?;
+        let mut rows = [LinearRow {
+            slot,
+            len: 1,
+            capture: None,
+        }];
+        self.forward_hidden_staged(&mut rows, ws, start_pos, None, None)?;
         self.lm_head_logits(ws, 1)
     }
 
@@ -6086,38 +6136,42 @@ impl Qwen35Model {
         Ok(())
     }
 
-    /// Opt-in paged full attention over the recall [`PagedKVPool`] (`--kv-recall`).
+    /// Paged full attention over `meta`'s ragged page table: qkv GEMM → prep →
+    /// paged attention → sigmoid gate → o_proj → all-reduce. The dispatch
+    /// `(batch, total_q, max_qlen)` makes 1×T, B×1 and the B×T middle one path.
+    /// RoPE is baked into the cached K at write time, so a recall-restricted
+    /// page subset attends exactly those pages (the dense-Qwen3 argument).
     ///
-    /// Mirrors [`Self::full_attention_into`]'s q/k/v GEMM → prep → attention →
-    /// gate → o_proj → all-reduce shape, but the prep writes this step's K/V into
-    /// the pool's tail page and the attention reads the page table in `rc.meta`
-    /// (a recall-restricted page subset on decode, the full resident list on
-    /// prefill). RoPE is baked into the cached K at write time, so a
-    /// non-contiguous page subset attends exactly those pages (the dense-Qwen3
-    /// recall correctness argument). HD256 paged kernels (BF16 pool only).
-    ///
-    /// `decode` is `seq_len == 1`. On the layer-0 decode step the post-RoPE
-    /// prepped Q is read back into `rc.layer0_query` for the next-step recall
-    /// score (head-major `[num_q_heads * head_dim]`, matching
-    /// `recompute_recall_plan`).
+    /// `layer0_query` is the `--kv-recall` sink: on a multi-row prefill the
+    /// post-RoPE layer-0 Q is read back for the next step's recall score
+    /// (head-major `[num_q_heads * head_dim]`, matching `recompute_recall_plan`).
     #[allow(clippy::too_many_arguments)]
     fn full_attention_paged(
         &self,
         attn: &FullAttn,
         normed: &HiddenStates,
         full_idx: usize,
+        pool: &PagedKVPool,
+        meta: &crate::loader::PageMeta,
         fw: &mut FullAttnScratch,
         out: &mut HiddenStates,
-        rc: &mut Qwen35RecallForward,
-        decode: bool,
+        layer0_query: Option<&mut Vec<f32>>,
     ) -> Result<()> {
         let c = &self.config;
-        let seq_len = normed.seq_len;
+        let rows = normed.seq_len;
+        ensure!(
+            meta.total_q == rows,
+            "Qwen3.6 paged full attention: page table covers {} query tokens != {rows} rows",
+            meta.total_q
+        );
+        // `max_qlen == 1` is the decode kernel's contract (one q row per batch
+        // element); anything longer goes through the ragged prefill kernel.
+        let decode = meta.seq_len == 1;
         let q_dim = self.local_full_attn_q_dim();
         let kv_dim = self.local_full_attn_kv_dim();
         let q_proj_dim = self.local_full_attn_q_proj_dim();
         let sm_scale = 1.0f32 / (c.head_dim as f32).sqrt();
-        let stride_page = rc.pool.kv_dim * rc.pool.page_size;
+        let stride_page = pool.kv_dim * pool.page_size;
 
         let FullAttnScratch {
             q_full,
@@ -6127,14 +6181,14 @@ impl Qwen35Model {
             attn_heads,
             ..
         } = fw;
-        let q_full = q_full.get(&self.ctx, q_proj_dim, seq_len)?;
-        let k_batch = k_batch.get(&self.ctx, kv_dim, seq_len)?;
-        let v_batch = v_batch.get(&self.ctx, kv_dim, seq_len)?;
+        let q_full = q_full.get(&self.ctx, q_proj_dim, rows)?;
+        let k_batch = k_batch.get(&self.ctx, kv_dim, rows)?;
+        let v_batch = v_batch.get(&self.ctx, kv_dim, rows)?;
         qwen35_profile(
             &self.ctx,
             "qwen/full_paged/qkv_gemm",
             Some(full_idx),
-            seq_len,
+            rows,
             || {
                 gemm_batch(&self.ctx, &attn.q_proj, normed, q_full)?;
                 gemm_batch(&self.ctx, &attn.k_proj, normed, k_batch)?;
@@ -6143,20 +6197,20 @@ impl Qwen35Model {
             },
         )?;
 
-        let q_prepped = q_prepped.get(&self.ctx, q_dim, seq_len)?;
-        let attn_out = attn_heads.get(&self.ctx, q_dim, seq_len)?;
+        let q_prepped = q_prepped.get(&self.ctx, q_dim, rows)?;
+        let attn_out = attn_heads.get(&self.ctx, q_dim, rows)?;
 
-        let k_pool_ptr = rc.pool.k_ptr(full_idx, &self.ctx.stream);
-        let v_pool_ptr = rc.pool.v_ptr(full_idx, &self.ctx.stream);
+        let k_pool_ptr = pool.k_ptr(full_idx, &self.ctx.stream);
+        let v_pool_ptr = pool.v_ptr(full_idx, &self.ctx.stream);
 
-        // Prep: q/k RMSNorm + RoPE; write K/V into the pool's tail page.
+        // Prep: q/k RMSNorm + RoPE; write each row's K/V into its tail page(s).
         {
             #[cfg(test)]
-            let prep_capture = if !decode {
+            let prep_capture = if !decode && meta.batch == 1 {
                 prep_probe::begin(
                     &self.ctx,
                     full_idx,
-                    seq_len,
+                    rows,
                     self.local_q_heads,
                     self.local_kv_heads,
                     c.head_dim,
@@ -6168,7 +6222,7 @@ impl Qwen35Model {
                     &attn.k_norm,
                     &self.cos_cache,
                     &self.sin_cache,
-                    &rc.meta.start_positions,
+                    &meta.start_positions,
                 )?
             } else {
                 None
@@ -6180,20 +6234,22 @@ impl Qwen35Model {
             let (kn_ptr, _g4) = attn.k_norm.data.device_ptr(&self.ctx.stream);
             let (cos_ptr, _g5) = self.cos_cache.data.device_ptr(&self.ctx.stream);
             let (sin_ptr, _g6) = self.sin_cache.data.device_ptr(&self.ctx.stream);
-            let (positions_ptr, _gp) = rc.meta.positions.device_ptr(&self.ctx.stream);
-            let (kv_indices_ptr, _gi) = rc.meta.kv_indices.device_ptr(&self.ctx.stream);
-            let (kv_indptr_ptr, _gpi) = rc.meta.kv_indptr.device_ptr(&self.ctx.stream);
-            let (last_page_len_ptr, _gl) = rc.meta.kv_last_page_len.device_ptr(&self.ctx.stream);
-            let (start_pos_ptr, _gs) = rc.meta.start_positions.device_ptr(&self.ctx.stream);
+            let (positions_ptr, _gp) = meta.positions.device_ptr(&self.ctx.stream);
+            let (kv_indices_ptr, _gi) = meta.kv_indices.device_ptr(&self.ctx.stream);
+            let (kv_indptr_ptr, _gpi) = meta.kv_indptr.device_ptr(&self.ctx.stream);
+            let (last_page_len_ptr, _gl) = meta.kv_last_page_len.device_ptr(&self.ctx.stream);
+            let (start_pos_ptr, _gs) = meta.start_positions.device_ptr(&self.ctx.stream);
             {
                 let (qp_ptr, _g7) = q_prepped.data.device_ptr_mut(&self.ctx.stream);
                 qwen35_profile(
                     &self.ctx,
                     "qwen/full_paged/prep",
                     Some(full_idx),
-                    seq_len,
+                    rows,
                     || {
-                        // SAFETY: all buffers valid on ctx.stream; pool tail page allocated.
+                        // SAFETY: all buffers valid on ctx.stream; pool tail page
+                        // allocated; per-row offsets come from the meta's own
+                        // prefix sums, so each launch stays inside its row.
                         unsafe {
                             if decode {
                                 ffi::decode_prep_paged_hd256_cuda(
@@ -6213,37 +6269,45 @@ impl Qwen35Model {
                                     last_page_len_ptr as *const i32,
                                     self.local_q_heads as i32,
                                     self.local_kv_heads as i32,
-                                    rc.pool.page_size as i32,
+                                    pool.page_size as i32,
                                     stride_page as i32,
-                                    1,
+                                    meta.batch as i32,
                                     c.rotary_dim as i32,
                                     c.rms_norm_eps,
                                     self.ctx.stream.cu_stream(),
                                 )
                                 .result()?;
                             } else {
-                                ffi::prefill_attention_paged_prep_hd256_cuda(
-                                    qf_ptr as *const ffi::Half,
-                                    qp_ptr as *mut ffi::Half,
-                                    k_ptr as *const ffi::Half,
-                                    v_ptr as *const ffi::Half,
-                                    qn_ptr as *const ffi::Half,
-                                    kn_ptr as *const ffi::Half,
-                                    cos_ptr as *const ffi::Half,
-                                    sin_ptr as *const ffi::Half,
-                                    kv_indices_ptr as *const i32,
-                                    rc.pool.page_size as i32,
-                                    k_pool_ptr as *mut ffi::Half,
-                                    v_pool_ptr as *mut ffi::Half,
-                                    self.local_q_heads as i32,
-                                    self.local_kv_heads as i32,
-                                    seq_len as i32,
-                                    start_pos_ptr as *const i32,
-                                    c.rotary_dim as i32,
-                                    c.rms_norm_eps,
-                                    self.ctx.stream.cu_stream(),
-                                )
-                                .result()?;
+                                // The prep reads ONE scalar start_pos off a
+                                // table based at element 0 — launch per row.
+                                let elem = std::mem::size_of::<ffi::Half>() as u64;
+                                for b in 0..meta.batch {
+                                    let (col, pages) = (meta.q_offsets[b], meta.page_offsets[b]);
+                                    let len = meta.q_offsets[b + 1] - col;
+                                    ffi::prefill_attention_paged_prep_hd256_cuda(
+                                        (qf_ptr + (col * q_proj_dim) as u64 * elem)
+                                            as *const ffi::Half,
+                                        (qp_ptr + (col * q_dim) as u64 * elem) as *mut ffi::Half,
+                                        (k_ptr + (col * kv_dim) as u64 * elem) as *const ffi::Half,
+                                        (v_ptr + (col * kv_dim) as u64 * elem) as *const ffi::Half,
+                                        qn_ptr as *const ffi::Half,
+                                        kn_ptr as *const ffi::Half,
+                                        cos_ptr as *const ffi::Half,
+                                        sin_ptr as *const ffi::Half,
+                                        (kv_indices_ptr + (pages * 4) as u64) as *const i32,
+                                        pool.page_size as i32,
+                                        k_pool_ptr as *mut ffi::Half,
+                                        v_pool_ptr as *mut ffi::Half,
+                                        self.local_q_heads as i32,
+                                        self.local_kv_heads as i32,
+                                        len as i32,
+                                        (start_pos_ptr + (b * 4) as u64) as *const i32,
+                                        c.rotary_dim as i32,
+                                        c.rms_norm_eps,
+                                        self.ctx.stream.cu_stream(),
+                                    )
+                                    .result()?;
+                                }
                             }
                         }
                         Ok(())
@@ -6259,38 +6323,38 @@ impl Qwen35Model {
         // (= `k_ptr` / `v_ptr` for FP8/INT8 pools). Quantize them into `k_data[layer]`
         // so the FP8 attention kernel can read the complete token history (prefix from
         // prior steps + new tokens just written) from one contiguous FP8 pool.
-        if rc.pool.format != KVFormat::BF16 {
-            let new_rows = rc.meta.new_token_rows.as_ref().ok_or_else(|| {
+        if pool.format != KVFormat::BF16 {
+            let new_rows = meta.new_token_rows.as_ref().ok_or_else(|| {
                 anyhow!(
                     "Qwen35 full-attn FP8/INT8 pool missing new_token_rows in PageMeta \
                      (format={:?})",
-                    rc.pool.format
+                    pool.format
                 )
             })?;
             let kv_dim = self.local_full_attn_kv_dim();
-            match rc.pool.format {
+            match pool.format {
                 KVFormat::FP8E4M3 => {
                     kv_quant::quantize_paged_kv_fp8(
                         &self.ctx,
-                        rc.pool.k_ptr(full_idx, &self.ctx.stream),
-                        rc.pool.k_data_ptr(full_idx, &self.ctx.stream),
-                        rc.pool.k_scales_ptr(full_idx, &self.ctx.stream),
+                        pool.k_ptr(full_idx, &self.ctx.stream),
+                        pool.k_data_ptr(full_idx, &self.ctx.stream),
+                        pool.k_scales_ptr(full_idx, &self.ctx.stream),
                         new_rows,
                         self.local_kv_heads,
                         c.head_dim,
                         kv_dim,
-                        seq_len,
+                        rows,
                     )?;
                     kv_quant::quantize_paged_kv_fp8(
                         &self.ctx,
-                        rc.pool.v_ptr(full_idx, &self.ctx.stream),
-                        rc.pool.v_data_ptr(full_idx, &self.ctx.stream),
-                        rc.pool.v_scales_ptr(full_idx, &self.ctx.stream),
+                        pool.v_ptr(full_idx, &self.ctx.stream),
+                        pool.v_data_ptr(full_idx, &self.ctx.stream),
+                        pool.v_scales_ptr(full_idx, &self.ctx.stream),
                         new_rows,
                         self.local_kv_heads,
                         c.head_dim,
                         kv_dim,
-                        seq_len,
+                        rows,
                     )?;
                 }
                 other => anyhow::bail!(
@@ -6303,11 +6367,11 @@ impl Qwen35Model {
         // Paged attention over the recall page table (RoPE pre-baked).
         {
             #[cfg(test)]
-            let attn_capture = if !decode {
+            let attn_capture = if !decode && meta.batch == 1 {
                 attn_probe::begin(
                     &self.ctx,
                     full_idx,
-                    seq_len,
+                    rows,
                     self.local_q_heads,
                     self.local_kv_heads,
                     c.head_dim,
@@ -6319,20 +6383,17 @@ impl Qwen35Model {
                     &self.cos_cache,
                     &self.sin_cache,
                     c.rms_norm_eps,
-                    &rc.meta.start_positions,
+                    &meta.start_positions,
                 )?
             } else {
                 None
             };
-            let (bsz, total_q, max_q) = if decode {
-                (1, 1, 1)
-            } else {
-                (1, seq_len as i32, seq_len as i32)
-            };
-            let (q_indptr_ptr, _g1) = rc.meta.q_indptr.device_ptr(&self.ctx.stream);
-            let (kv_indptr_ptr, _g2) = rc.meta.kv_indptr.device_ptr(&self.ctx.stream);
-            let (kv_indices_ptr, _g3) = rc.meta.kv_indices.device_ptr(&self.ctx.stream);
-            let (last_page_len_ptr, _g4) = rc.meta.kv_last_page_len.device_ptr(&self.ctx.stream);
+            let (bsz, total_q, max_q) =
+                (meta.batch as i32, meta.total_q as i32, meta.seq_len as i32);
+            let (q_indptr_ptr, _g1) = meta.q_indptr.device_ptr(&self.ctx.stream);
+            let (kv_indptr_ptr, _g2) = meta.kv_indptr.device_ptr(&self.ctx.stream);
+            let (kv_indices_ptr, _g3) = meta.kv_indices.device_ptr(&self.ctx.stream);
+            let (last_page_len_ptr, _g4) = meta.kv_last_page_len.device_ptr(&self.ctx.stream);
             let phase = if decode {
                 ffi::AttnPhase::Decode
             } else {
@@ -6345,9 +6406,9 @@ impl Qwen35Model {
                     &self.ctx,
                     "qwen/full_paged/attention",
                     Some(full_idx),
-                    seq_len,
+                    rows,
                     || {
-                        match rc.pool.format {
+                        match pool.format {
                             KVFormat::BF16 => {
                                 // SAFETY: kernel signature from paged_attn_v1 ABI (18-arg BF16).
                                 let kernel = ffi::resolve_paged_attn_v1(
@@ -6378,11 +6439,11 @@ impl Qwen35Model {
                                         bsz,
                                         total_q,
                                         max_q,
-                                        rc.pool.max_total_pages as i32,
-                                        rc.meta.num_pages as i32,
+                                        pool.max_total_pages as i32,
+                                        meta.num_pages as i32,
                                         self.local_q_heads as i32,
                                         self.local_kv_heads as i32,
-                                        rc.pool.page_size as i32,
+                                        pool.page_size as i32,
                                         sm_scale,
                                         self.ctx.stream.cu_stream(),
                                     )
@@ -6406,10 +6467,10 @@ impl Qwen35Model {
                                         self.local_kv_heads
                                     )
                                 })?;
-                                let k_data = rc.pool.k_data_ptr(full_idx, &self.ctx.stream);
-                                let v_data = rc.pool.v_data_ptr(full_idx, &self.ctx.stream);
-                                let k_scales = rc.pool.k_scales_ptr(full_idx, &self.ctx.stream);
-                                let v_scales = rc.pool.v_scales_ptr(full_idx, &self.ctx.stream);
+                                let k_data = pool.k_data_ptr(full_idx, &self.ctx.stream);
+                                let v_data = pool.v_data_ptr(full_idx, &self.ctx.stream);
+                                let k_scales = pool.k_scales_ptr(full_idx, &self.ctx.stream);
+                                let v_scales = pool.v_scales_ptr(full_idx, &self.ctx.stream);
                                 // SAFETY: ptrs from live device allocations sized to the dims passed.
                                 unsafe {
                                     kernel(
@@ -6426,11 +6487,11 @@ impl Qwen35Model {
                                         bsz,
                                         total_q,
                                         max_q,
-                                        rc.pool.max_total_pages as i32,
-                                        rc.meta.num_pages as i32,
+                                        pool.max_total_pages as i32,
+                                        meta.num_pages as i32,
                                         self.local_q_heads as i32,
                                         self.local_kv_heads as i32,
-                                        rc.pool.page_size as i32,
+                                        pool.page_size as i32,
                                         sm_scale,
                                         self.ctx.stream.cu_stream(),
                                     )
@@ -6454,12 +6515,12 @@ impl Qwen35Model {
             let (qf_ptr, _g0) = q_full.data.device_ptr(&self.ctx.stream);
             let (o_ptr, _g1) = attn_out.data.device_ptr_mut(&self.ctx.stream);
             // SAFETY: q_full/attn_out valid on ctx.stream; gate iterates
-            // batch_size * num_q_heads (batch_size = seq_len; decode = 1).
+            // rows * num_q_heads.
             qwen35_profile(
                 &self.ctx,
                 "qwen/full_paged/gate",
                 Some(full_idx),
-                seq_len,
+                rows,
                 || {
                     // SAFETY: ptrs from live device allocations sized to the dims passed.
                     unsafe {
@@ -6467,7 +6528,7 @@ impl Qwen35Model {
                             qf_ptr as *const ffi::Half,
                             o_ptr as *mut ffi::Half,
                             self.local_q_heads as i32,
-                            seq_len as i32,
+                            rows as i32,
                             self.ctx.stream.cu_stream(),
                         )
                         .result()?;
@@ -6480,22 +6541,23 @@ impl Qwen35Model {
         // Layer-0 PREFILL: read back the post-RoPE prepped Q for the recall score
         // (head-major `[num_q_heads * head_dim]`). Under the write-through model the
         // whole recall cycle (score → evict → prefetch) runs ONCE per prefill, not
-        // per decode step, so ONLY the multi-token prefill needs this signal — the
-        // decode path (`seq_len == 1`) ignores `rc.layer0_query` entirely, so we
-        // skip the D2H there to keep the decode hot path lean (zero extra readback).
-        // `q_prepped` is token-major `[seq_len, q_dim]`; the recall query is the
-        // mean of the last `m` prompt tokens' queries (R3 — "what am I about to
-        // generate"), matching the `[num_q_heads * head_dim]` rep shape.
-        if full_idx == 0 && seq_len > 1 {
+        // per decode step, so only the multi-token prefill needs this signal — the
+        // D2H stays off every other paged forward. `q_prepped` is token-major
+        // `[rows, q_dim]`; the recall query is the mean of the last `m` prompt
+        // tokens' queries (R3 — "what am I about to generate").
+        if let Some(dst) = layer0_query
+            && full_idx == 0
+            && rows > 1
+        {
             let host: Vec<bf16> = self
                 .ctx
                 .stream
                 .clone_dtoh(&q_prepped.data)
                 .map_err(|e| anyhow!("recall layer0 q dtoh: {e}"))?;
             const RECALL_PREFILL_Q_TOKENS: usize = 16; // R3 default `m`.
-            let m = RECALL_PREFILL_Q_TOKENS.min(seq_len);
+            let m = RECALL_PREFILL_Q_TOKENS.min(rows);
             let mut q = vec![0.0_f32; q_dim];
-            for t in (seq_len - m)..seq_len {
+            for t in (rows - m)..rows {
                 let base = t * q_dim;
                 for (d, slot) in q.iter_mut().enumerate() {
                     *slot += host[base + d].to_f32();
@@ -6505,14 +6567,14 @@ impl Qwen35Model {
             for v in &mut q {
                 *v *= inv;
             }
-            rc.layer0_query = q;
+            *dst = q;
         }
 
         qwen35_profile(
             &self.ctx,
             "qwen/full_paged/o_proj",
             Some(full_idx),
-            seq_len,
+            rows,
             || gemm_batch(&self.ctx, &attn.o_proj, attn_out, out),
         )?;
         // Row-parallel o_proj: sum the per-rank partials (no-op single-GPU).
@@ -6520,28 +6582,30 @@ impl Qwen35Model {
             &self.ctx,
             "qwen/full_paged/allreduce",
             Some(full_idx),
-            seq_len,
+            rows,
             || self.tp.all_reduce_sum(&self.ctx, out),
         )?;
         Ok(())
     }
 
-    /// Gated-delta-rule linear attention into `out` (`[hidden, seq]`, beta=0
+    /// Gated-delta-rule linear attention into `out` (`[hidden, rows]`, beta=0
     /// out-proj GEMM): in-proj → depthwise conv1d → RECURRENT gated-delta
     /// (advances the per-slot state in place) → gated output RMSNorm →
     /// out-proj. The conv ring + recurrent state carry across prefill/decode.
+    ///
+    /// `rows = normed.seq_len` is the FLAT column count. Every weight-heavy
+    /// step runs once over all of them; only [`LinearCore`] is per-slot.
     fn linear_attention(
         &self,
         attn: &LinearAttn,
         normed: &HiddenStates,
-        slot: &mut Qwen35SlotState,
+        core: LinearCore<'_, '_>,
         linear_idx: usize,
         lw: &mut LinearAttnScratch,
         out: &mut HiddenStates,
-        capture: Option<&mut Qwen35LinearCapture>,
     ) -> Result<()> {
         let c = &self.config;
-        let seq_len = normed.seq_len;
+        let rows = normed.seq_len;
         // LOCAL per-rank widths (= global config on a single GPU): the fused
         // [q|k|v] shard, conv channels, recurrent state, and kernel launches all
         // follow this rank's linear k/v head shard. b/a widths come off the
@@ -6567,15 +6631,15 @@ impl Qwen35Model {
             fq_g_cumsum,
             fq_beta,
         } = lw;
-        let qkv = qkv.get(&self.ctx, qkv_dim, seq_len)?;
-        let z = z.get(&self.ctx, z_dim, seq_len)?;
-        let b_proj = b_proj.get(&self.ctx, b_dim, seq_len)?;
-        let a_proj = a_proj.get(&self.ctx, a_dim, seq_len)?;
+        let qkv = qkv.get(&self.ctx, qkv_dim, rows)?;
+        let z = z.get(&self.ctx, z_dim, rows)?;
+        let b_proj = b_proj.get(&self.ctx, b_dim, rows)?;
+        let a_proj = a_proj.get(&self.ctx, a_dim, rows)?;
         qwen35_profile(
             &self.ctx,
             "qwen/linear/in_proj",
             Some(linear_idx),
-            seq_len,
+            rows,
             || {
                 gemm_batch(&self.ctx, &attn.in_proj_qkv, normed, qkv)?;
                 gemm_batch(&self.ctx, &attn.in_proj_z, normed, z)?;
@@ -6585,73 +6649,136 @@ impl Qwen35Model {
             },
         )?;
 
-        // ── Spec-verify capture: stash this layer's gated-delta inputs (the
-        //    post-in_proj fused `qkv` PRE-conv1d + the `b`/`a` gates) for ALL
-        //    rows, so a partial-accept replay can re-run only conv1d + GDR over
-        //    the accepted prefix (see [`Qwen35LinearCapture`]). conv1d below
-        //    reads `qkv` and writes a SEPARATE `qkv_conv`, so `qkv` is still the
-        //    pristine in_proj output here. No-op (and zero cost) off the spec
-        //    verify path. ──
-        if let Some(cap) = capture {
-            ensure!(
-                linear_idx < cap.qkv.len(),
-                "spec capture has {} linear slots, layer idx {linear_idx} out of range",
-                cap.qkv.len()
-            );
-            ensure!(
-                seq_len <= cap.rows,
-                "spec capture sized for {} rows, verify seq_len {seq_len} exceeds it",
-                cap.rows
-            );
-            // Token-major contiguous: rows `[0..seq_len)` occupy `[0..seq_len*w)`.
-            let dst_qkv = &mut cap.qkv[linear_idx];
-            let mut dq = dst_qkv.data.slice_mut(0..seq_len * qkv_dim);
-            self.ctx
-                .stream
-                .memcpy_dtod(&qkv.data, &mut dq)
-                .map_err(|e| anyhow!("spec linear qkv capture failed: {e}"))?;
-            let dst_b = &mut cap.b_proj[linear_idx];
-            let mut db = dst_b.data.slice_mut(0..seq_len * b_dim);
-            self.ctx
-                .stream
-                .memcpy_dtod(&b_proj.data, &mut db)
-                .map_err(|e| anyhow!("spec linear b capture failed: {e}"))?;
-            let dst_a = &mut cap.a_proj[linear_idx];
-            let mut da = dst_a.data.slice_mut(0..seq_len * a_dim);
-            self.ctx
-                .stream
-                .memcpy_dtod(&a_proj.data, &mut da)
-                .map_err(|e| anyhow!("spec linear a capture failed: {e}"))?;
+        let qkv_conv = qkv_conv.get(&self.ctx, qkv_dim, rows)?;
+        let gdr_out = gdr_out.get(&self.ctx, z_dim, rows)?;
+        match core {
+            LinearCore::Rows(rs) => {
+                let total: usize = rs.iter().map(|r| r.len).sum();
+                ensure!(
+                    total == rows,
+                    "linear rows total {total} != {rows} staged columns"
+                );
+                let mut off = 0usize;
+                for r in rs.iter_mut() {
+                    // THIS row's columns land at ITS capture offset 0, so a
+                    // partial-accept replay re-runs only this slot's prefix.
+                    if let Some(cap) = r.capture.as_deref_mut() {
+                        ensure!(
+                            linear_idx < cap.qkv.len(),
+                            "spec capture has {} linear slots, layer idx {linear_idx} out of range",
+                            cap.qkv.len()
+                        );
+                        ensure!(
+                            r.len <= cap.rows,
+                            "spec capture sized for {} rows, row len {} exceeds it",
+                            cap.rows,
+                            r.len
+                        );
+                        for (src, w, dst) in [
+                            (&qkv.data, qkv_dim, &mut cap.qkv[linear_idx]),
+                            (&b_proj.data, b_dim, &mut cap.b_proj[linear_idx]),
+                            (&a_proj.data, a_dim, &mut cap.a_proj[linear_idx]),
+                        ] {
+                            let mut d = dst.data.slice_mut(0..r.len * w);
+                            self.ctx
+                                .stream
+                                .memcpy_dtod(&src.slice(off * w..(off + r.len) * w), &mut d)
+                                .map_err(|e| anyhow!("spec linear capture failed: {e}"))?;
+                        }
+                    }
+                    self.advance_linear_conv_gdr(
+                        attn,
+                        &qkv.data.slice(off * qkv_dim..(off + r.len) * qkv_dim),
+                        &b_proj.data.slice(off * b_dim..(off + r.len) * b_dim),
+                        &a_proj.data.slice(off * a_dim..(off + r.len) * a_dim),
+                        r.slot,
+                        linear_idx,
+                        r.len,
+                        &mut qkv_conv
+                            .data
+                            .slice_mut(off * qkv_dim..(off + r.len) * qkv_dim),
+                        &mut gdr_out.data.slice_mut(off * z_dim..(off + r.len) * z_dim),
+                        fq_q,
+                        fq_k,
+                        fq_v,
+                        fq_a,
+                        fq_g,
+                        fq_g_cumsum,
+                        fq_beta,
+                    )?;
+                    off += r.len;
+                }
+            }
+            LinearCore::Tables { conv, gdr } => {
+                let (x_ptr, _g0) = qkv.data.device_ptr(&self.ctx.stream);
+                let (w_ptr, _g1) = attn.conv1d_weight.data.device_ptr(&self.ctx.stream);
+                let (b_ptr, _g2) = b_proj.data.device_ptr(&self.ctx.stream);
+                let (a_ptr, _g3) = a_proj.data.device_ptr(&self.ctx.stream);
+                let (dt_ptr, _g4) = attn.dt_bias.data.device_ptr(&self.ctx.stream);
+                let (alog_ptr, _g5) = attn.a_log.device_ptr(&self.ctx.stream);
+                let (conv_tbl, _g6) = conv.device_ptr(&self.ctx.stream);
+                let (gdr_tbl, _g7) = gdr.device_ptr(&self.ctx.stream);
+                let (cv_ptr, _g8) = qkv_conv.data.device_ptr_mut(&self.ctx.stream);
+                let (o_ptr, _g9) = gdr_out.data.device_ptr_mut(&self.ctx.stream);
+                qwen35_profile(
+                    &self.ctx,
+                    "qwen/linear/conv1d",
+                    Some(linear_idx),
+                    rows,
+                    || {
+                        // SAFETY: x/weight/out are live `[B, C]`/`[C*K]` buffers on
+                        // ctx.stream; the table's first B entries point at live
+                        // `[C, K-1]` conv rings.
+                        unsafe {
+                            ffi::conv1d_decode_batch_cuda(
+                                x_ptr as *const ffi::Half,
+                                w_ptr as *const ffi::Half,
+                                conv_tbl as *mut *mut ffi::Half,
+                                cv_ptr as *mut ffi::Half,
+                                qkv_dim as i32,
+                                c.linear_conv_kernel_dim as i32,
+                                rows as i32,
+                                self.ctx.stream.cu_stream(),
+                            )
+                            .result()?;
+                        }
+                        Ok(())
+                    },
+                )?;
+                qwen35_profile(
+                    &self.ctx,
+                    "qwen/linear/gdr_recurrent",
+                    Some(linear_idx),
+                    rows,
+                    || {
+                        // SAFETY: all buffers live on ctx.stream; the table's first
+                        // B entries point at live `[Vh, Kd, Vd]` f32 states.
+                        unsafe {
+                            ffi::gdr_decode_batch_cuda(
+                                cv_ptr as *const ffi::Half,
+                                b_ptr as *const ffi::Half,
+                                a_ptr as *const ffi::Half,
+                                dt_ptr as *const ffi::Half,
+                                alog_ptr as *const f32,
+                                gdr_tbl as *mut *mut f32,
+                                o_ptr as *mut ffi::Half,
+                                self.local_linear_k_heads as i32,
+                                self.local_linear_v_heads as i32,
+                                c.linear_key_head_dim as i32,
+                                c.linear_value_head_dim as i32,
+                                rows as i32,
+                                self.ctx.stream.cu_stream(),
+                            )
+                            .result()?;
+                        }
+                        Ok(())
+                    },
+                )?;
+            }
         }
 
-        // ── conv1d (advances the per-slot conv ring) + gated-delta rule
-        //    (advances the per-slot recurrent state). Factored into
-        //    [`Self::advance_linear_conv_gdr`] so the partial-accept linear-only
-        //    replay re-runs the IDENTICAL kernel dispatch over the accepted
-        //    prefix from the verify capture (byte-identical state advance). ──
-        let qkv_conv = qkv_conv.get(&self.ctx, qkv_dim, seq_len)?;
-        let gdr_out = gdr_out.get(&self.ctx, z_dim, seq_len)?;
-        self.advance_linear_conv_gdr(
-            attn,
-            &qkv.data,
-            &b_proj.data,
-            &a_proj.data,
-            slot,
-            linear_idx,
-            seq_len,
-            qkv_conv,
-            gdr_out,
-            fq_q,
-            fq_k,
-            fq_v,
-            fq_a,
-            fq_g,
-            fq_g_cumsum,
-            fq_beta,
-        )?;
-
         // ── gated output RMSNorm (per value head; gate = z). ──
-        let normed_out = normed_out.get(&self.ctx, z_dim, seq_len)?;
+        let normed_out = normed_out.get(&self.ctx, z_dim, rows)?;
         {
             let (x_ptr, _g0) = gdr_out.data.device_ptr(&self.ctx.stream);
             let (w_ptr, _g1) = attn.norm_weight.device_ptr(&self.ctx.stream);
@@ -6660,8 +6787,8 @@ impl Qwen35Model {
             // SAFETY: gdr_out/norm/z/out valid on ctx.stream; per-head layout from config.
             // The kernel launches exactly `num_heads` blocks, each normalizing one
             // flat `[val_dim]` slice at `blockIdx.x * val_dim` — gdr_out/z are
-            // `[seq_len, Vh*Vd]` row-major, so the grid must cover all
-            // seq_len*Vh (token, head) slices, not just token 0. `weight[tid]`
+            // `[rows, Vh*Vd]` row-major, so the grid must cover all
+            // rows*Vh (token, head) slices, not just token 0. `weight[tid]`
             // is a per-[Vd] broadcast (no blockIdx dependence), so the
             // extension is exact (the monolith's `rms_norm_gated_batch_into`
             // passed `seq_len * num_heads` identically).
@@ -6669,7 +6796,7 @@ impl Qwen35Model {
                 &self.ctx,
                 "qwen/linear/norm",
                 Some(linear_idx),
-                seq_len,
+                rows,
                 || {
                     // SAFETY: ptrs from live device allocations sized to the dims passed.
                     unsafe {
@@ -6678,7 +6805,7 @@ impl Qwen35Model {
                             w_ptr as *const f32,
                             gate_ptr as *const ffi::Half,
                             o_ptr as *mut ffi::Half,
-                            (self.local_linear_v_heads * seq_len) as i32,
+                            (self.local_linear_v_heads * rows) as i32,
                             c.linear_value_head_dim as i32,
                             c.rms_norm_eps,
                             self.ctx.stream.cu_stream(),
@@ -6694,15 +6821,16 @@ impl Qwen35Model {
             &self.ctx,
             "qwen/linear/out_proj",
             Some(linear_idx),
-            seq_len,
+            rows,
             || gemm_batch(&self.ctx, &attn.out_proj, normed_out, out),
         )?;
-        // Row-parallel out_proj: sum the per-rank partials (no-op single-GPU).
+        // Row-parallel out_proj: ONE all-reduce over the exact `[hidden, rows]`
+        // buffer (no-op single-GPU).
         qwen35_profile(
             &self.ctx,
             "qwen/linear/allreduce",
             Some(linear_idx),
-            seq_len,
+            rows,
             || self.tp.all_reduce_sum(&self.ctx, out),
         )?;
         Ok(())
@@ -6720,23 +6848,23 @@ impl Qwen35Model {
     /// `qkv_in` is the post-in_proj fused `[q|k|v]` PRE-conv1d (`qkv_dim` wide,
     /// token-major); conv1d reads it and writes the SEPARATE `qkv_conv`, which
     /// the GDR then consumes. `b_in`/`a_in` are the `in_proj_b`/`in_proj_a`
-    /// gate projections. The caller passes buffers that hold AT LEAST `seq_len`
-    /// rows from offset 0 (the kernels read only the first `seq_len`); on the
-    /// replay path the capture buffers hold `depth+1` rows and `seq_len = k+1`.
+    /// gate projections. Every view spans EXACTLY this slot's `seq_len` rows —
+    /// in a ragged batch that is a column-range slice of the shared scratch, so
+    /// each slot's state sees only its own tokens.
     /// `gdr_out` is written but discarded by the replay (only the state
     /// side-effect matters); the trunk path norms it.
     #[allow(clippy::too_many_arguments)]
     fn advance_linear_conv_gdr(
         &self,
         attn: &LinearAttn,
-        qkv_in: &CudaSlice<bf16>,
-        b_in: &CudaSlice<bf16>,
-        a_in: &CudaSlice<bf16>,
+        qkv_in: &CudaView<'_, bf16>,
+        b_in: &CudaView<'_, bf16>,
+        a_in: &CudaView<'_, bf16>,
         slot: &mut Qwen35SlotState,
         linear_idx: usize,
         seq_len: usize,
-        qkv_conv: &mut HiddenStates,
-        gdr_out: &mut HiddenStates,
+        qkv_conv: &mut CudaViewMut<'_, bf16>,
+        gdr_out: &mut CudaViewMut<'_, bf16>,
         fq_q: &mut HiddenSlot,
         fq_k: &mut HiddenSlot,
         fq_v: &mut HiddenSlot,
@@ -6773,7 +6901,7 @@ impl Qwen35Model {
                 let (x_ptr, _g0) = qkv_in.device_ptr(&self.ctx.stream);
                 let (w_ptr, _g1) = attn.conv1d_weight.data.device_ptr(&self.ctx.stream);
                 let (s_ptr, _g2) = conv_state.data.device_ptr_mut(&self.ctx.stream);
-                let (o_ptr, _g3) = qkv_conv.data.device_ptr_mut(&self.ctx.stream);
+                let (o_ptr, _g3) = qkv_conv.device_ptr_mut(&self.ctx.stream);
                 // SAFETY: qkv/weight/state/out valid on ctx.stream; weight len checked
                 // by the kernel against num_channels*kernel.
                 qwen35_profile(
@@ -6828,7 +6956,7 @@ impl Qwen35Model {
             let fq_beta = fq_beta.get(&self.ctx, g_len)?;
             let gdr_state = &mut slot.gdr_states[linear_idx];
 
-            let (qkv_ptr, _g0) = qkv_conv.data.device_ptr(&self.ctx.stream);
+            let (qkv_ptr, _g0) = qkv_conv.device_ptr(&self.ctx.stream);
             let (b_ptr, _g1) = b_in.device_ptr(&self.ctx.stream);
             let (a_ptr, _g2) = a_in.device_ptr(&self.ctx.stream);
             let (dt_ptr, _g3) = attn.dt_bias.data.device_ptr(&self.ctx.stream);
@@ -6841,7 +6969,7 @@ impl Qwen35Model {
             let (gc_ptr, _g10) = fq_g_cumsum.device_ptr_mut(&self.ctx.stream);
             let (beta_ptr, _g11) = fq_beta.device_ptr_mut(&self.ctx.stream);
             let (s_ptr, _g12) = gdr_state.device_ptr_mut(&self.ctx.stream);
-            let (o_ptr, _g13) = gdr_out.data.device_ptr_mut(&self.ctx.stream);
+            let (o_ptr, _g13) = gdr_out.device_ptr_mut(&self.ctx.stream);
             // SAFETY: all buffers valid on ctx.stream, shapes per the slot
             // `.get` calls above. The slot state pointer is passed as BOTH
             // h0 and ht (in-place chunk chaining): each fwd CTA reads its h0
@@ -6918,7 +7046,7 @@ impl Qwen35Model {
                 self.local_linear_v_heads,
                 c.linear_key_head_dim,
                 c.linear_value_head_dim,
-                &qkv_conv.data,
+                qkv_conv,
                 b_in,
                 a_in,
                 &attn.dt_bias,
@@ -6926,13 +7054,13 @@ impl Qwen35Model {
                 gdr_state,
             )?;
             {
-                let (qkv_ptr, _g0) = qkv_conv.data.device_ptr(&self.ctx.stream);
+                let (qkv_ptr, _g0) = qkv_conv.device_ptr(&self.ctx.stream);
                 let (b_ptr, _g1) = b_in.device_ptr(&self.ctx.stream);
                 let (a_ptr, _g2) = a_in.device_ptr(&self.ctx.stream);
                 let (dt_ptr, _g3) = attn.dt_bias.data.device_ptr(&self.ctx.stream);
                 let (alog_ptr, _g4) = attn.a_log.device_ptr(&self.ctx.stream);
                 let (s_ptr, _g5) = gdr_state.device_ptr_mut(&self.ctx.stream);
-                let (o_ptr, _g6) = gdr_out.data.device_ptr_mut(&self.ctx.stream);
+                let (o_ptr, _g6) = gdr_out.device_ptr_mut(&self.ctx.stream);
                 qwen35_profile(
                     &self.ctx,
                     "qwen/linear/gdr_recurrent",
@@ -7036,9 +7164,8 @@ impl Qwen35Model {
             "spec replay needs {rows} rows but capture holds {}",
             capture.rows
         );
-        // The capture buffers hold rows `[0..depth+1)` token-major from offset 0;
-        // `advance_linear_conv_gdr` reads only the first `rows = k+1` from the
-        // base pointer, so the full `.data` slices are passed as-is (no slicing).
+        // Each slot's capture holds ITS OWN rows token-major from offset 0, so
+        // the accepted prefix is the leading `rows = k+1` columns.
         let qkv_dim = self.local_linear_qkv_dim();
         let z_dim = self.local_linear_z_dim();
         let Qwen35Workspace { linear, .. } = ws;
@@ -7059,16 +7186,18 @@ impl Qwen35Model {
         let mut li = 0usize;
         for layer in &self.layers {
             if let Qwen35Attn::Linear(attn) = &layer.attn {
+                let b_dim = attn.in_proj_b.rows;
+                let a_dim = attn.in_proj_a.rows;
                 self.advance_linear_conv_gdr(
                     attn,
-                    &capture.qkv[li].data,
-                    &capture.b_proj[li].data,
-                    &capture.a_proj[li].data,
+                    &capture.qkv[li].data.slice(0..rows * qkv_dim),
+                    &capture.b_proj[li].data.slice(0..rows * b_dim),
+                    &capture.a_proj[li].data.slice(0..rows * a_dim),
                     slot,
                     li,
                     rows,
-                    qkv_conv,
-                    gdr_out,
+                    &mut qkv_conv.data.slice_mut(..),
+                    &mut gdr_out.data.slice_mut(..),
                     fq_q,
                     fq_k,
                     fq_v,
@@ -7102,7 +7231,7 @@ impl Qwen35Model {
     ///     column-offset pointers instead of copy-in/out:
     ///     [`Self::full_attention_batch_rows`]);
     ///   - conv1d + GDR (one batched kernel each via per-layer device pointer
-    ///     tables: [`Self::linear_attention_batch`]);
+    ///     tables: [`LinearCore::Tables`]);
     ///   - sampling (batched greedy argmax; non-greedy rows host-sample).
     ///
     /// FORMULA (the c=4 prediction this path is licensed against): at B=4 the
@@ -7264,11 +7393,14 @@ impl Qwen35Model {
                         "Qwen3.5 batched decode linear layer {linear_idx} outside pointer tables {}",
                         conv_state_ptrs.len()
                     );
-                    self.linear_attention_batch(
+                    self.linear_attention(
                         lin,
                         normed,
-                        &conv_state_ptrs[linear_idx],
-                        &gdr_state_ptrs[linear_idx],
+                        LinearCore::Tables {
+                            conv: &conv_state_ptrs[linear_idx],
+                            gdr: &gdr_state_ptrs[linear_idx],
+                        },
+                        linear_idx,
                         linear,
                         attn_out,
                     )?;
@@ -7378,7 +7510,7 @@ impl Qwen35Model {
     /// PAGED batched decode (the shared-paged default lane): the exact body of
     /// [`Self::forward_decode_batch`] (embed → layer loop → final norm → batched
     /// lm_head + argmax), but full-attn layers route through
-    /// [`Self::full_attention_paged_batch`] against the shared `pool` + the
+    /// [`Self::full_attention_paged`] against the shared `pool` + the
     /// B-row `meta` ([`PageMeta::for_decode_batch`]) instead of the contiguous
     /// per-slot caches. The engine has already appended this step's token to
     /// each row's slot in the pool and built `meta`; this method only runs the
@@ -7422,10 +7554,10 @@ impl Qwen35Model {
             sample_positions.len()
         );
         ensure!(
-            meta.batch == b && meta.seq_len == 1,
-            "Qwen3.6 paged batched decode meta (batch {}, seq_len {}) != {} rows",
+            meta.batch == b && meta.total_q == b,
+            "Qwen3.6 paged batched decode meta (batch {}, total_q {}) != {} one-token rows",
             meta.batch,
-            meta.seq_len,
+            meta.total_q,
             b
         );
         // Pre-mutation validation: every row in bounds, recurrent resident, and
@@ -7504,8 +7636,8 @@ impl Qwen35Model {
 
             match &layer.attn {
                 Qwen35Attn::Full(full_attn) => {
-                    self.full_attention_paged_batch(
-                        full_attn, normed, full_idx, pool, meta, full, attn_out,
+                    self.full_attention_paged(
+                        full_attn, normed, full_idx, pool, meta, full, attn_out, None,
                     )?;
                     full_idx += 1;
                 }
@@ -7515,11 +7647,14 @@ impl Qwen35Model {
                         "Qwen3.6 paged batched decode linear layer {linear_idx} outside pointer tables {}",
                         conv_state_ptrs.len()
                     );
-                    self.linear_attention_batch(
+                    self.linear_attention(
                         lin,
                         normed,
-                        &conv_state_ptrs[linear_idx],
-                        &gdr_state_ptrs[linear_idx],
+                        LinearCore::Tables {
+                            conv: &conv_state_ptrs[linear_idx],
+                            gdr: &gdr_state_ptrs[linear_idx],
+                        },
+                        linear_idx,
                         linear,
                         attn_out,
                     )?;
@@ -7826,334 +7961,6 @@ impl Qwen35Model {
 
         gemm_batch(&self.ctx, &attn.o_proj, attn_heads, out)?;
         // Row-parallel o_proj: ONE all-reduce over the exact `[hidden, B]`
-        // buffer — message length is B valid columns by construction (no-op
-        // single-GPU).
-        self.tp.all_reduce_sum(&self.ctx, out)?;
-        Ok(())
-    }
-
-    /// PAGED batched-decode full attention (the shared-paged default lane). Same
-    /// three-step structure as the single-row [`Self::full_attention_paged`]
-    /// (prep → ungated paged attention → separable sigmoid gate), but at
-    /// `batch_size == B` against a B-row [`PageMeta::for_decode_batch`] page
-    /// table: every HD256 kernel already grids over `batch_idx`
-    /// (`decode_prep_paged_hd256` grid `(num_kv_heads, B)` reading
-    /// `positions[b]`/`page_indptr[b]`; the TileLang decode kernel grids
-    /// `(1, num_q_heads, B)` via `bsz`; `attention_gate_paged_hd256` iterates
-    /// `q_dim * B`), so each row writes/attends ONLY its own slot's pages. The
-    /// gate is a SEPARABLE post-step on `q_full`'s gate half — no gated-paged
-    /// kernel needed. B==1 routes through `full_attention_paged` instead (kept
-    /// byte-identical), so this method only runs for B>1.
-    #[allow(clippy::too_many_arguments)]
-    fn full_attention_paged_batch(
-        &self,
-        attn: &FullAttn,
-        normed: &HiddenStates,
-        full_idx: usize,
-        pool: &mut PagedKVPool,
-        meta: &crate::loader::PageMeta,
-        fw: &mut FullAttnScratch,
-        out: &mut HiddenStates,
-    ) -> Result<()> {
-        let c = &self.config;
-        let b = normed.seq_len;
-        let q_dim = self.local_full_attn_q_dim();
-        let kv_dim = self.local_full_attn_kv_dim();
-        let q_proj_dim = self.local_full_attn_q_proj_dim();
-        let sm_scale = 1.0f32 / (c.head_dim as f32).sqrt();
-        let stride_page = pool.kv_dim * pool.page_size;
-        ensure!(
-            meta.batch == b && meta.seq_len == 1,
-            "Qwen3.6 paged batched decode meta (batch {}, seq_len {}) != {} decode rows",
-            meta.batch,
-            meta.seq_len,
-            b
-        );
-
-        let FullAttnScratch {
-            q_full,
-            k_batch,
-            v_batch,
-            q_prepped,
-            attn_heads,
-            ..
-        } = fw;
-        let q_full = q_full.get(&self.ctx, q_proj_dim, b)?;
-        let k_batch = k_batch.get(&self.ctx, kv_dim, b)?;
-        let v_batch = v_batch.get(&self.ctx, kv_dim, b)?;
-        gemm_batch(&self.ctx, &attn.q_proj, normed, q_full)?;
-        gemm_batch(&self.ctx, &attn.k_proj, normed, k_batch)?;
-        gemm_batch(&self.ctx, &attn.v_proj, normed, v_batch)?;
-
-        let q_prepped = q_prepped.get(&self.ctx, q_dim, b)?;
-        let attn_out = attn_heads.get(&self.ctx, q_dim, b)?;
-
-        let k_pool_ptr = pool.k_ptr(full_idx, &self.ctx.stream);
-        let v_pool_ptr = pool.v_ptr(full_idx, &self.ctx.stream);
-
-        // Prep: q/k RMSNorm + partial RoPE; write each row's new K/V into
-        //    its slot's tail page (grid `(num_kv_heads, B)`, batch_size = B).
-        {
-            let (qf_ptr, _g0) = q_full.data.device_ptr(&self.ctx.stream);
-            let (k_ptr, _g1) = k_batch.data.device_ptr(&self.ctx.stream);
-            let (v_ptr, _g2) = v_batch.data.device_ptr(&self.ctx.stream);
-            let (qn_ptr, _g3) = attn.q_norm.data.device_ptr(&self.ctx.stream);
-            let (kn_ptr, _g4) = attn.k_norm.data.device_ptr(&self.ctx.stream);
-            let (cos_ptr, _g5) = self.cos_cache.data.device_ptr(&self.ctx.stream);
-            let (sin_ptr, _g6) = self.sin_cache.data.device_ptr(&self.ctx.stream);
-            let (qp_ptr, _g7) = q_prepped.data.device_ptr_mut(&self.ctx.stream);
-            let (positions_ptr, _gp) = meta.positions.device_ptr(&self.ctx.stream);
-            let (kv_indices_ptr, _gi) = meta.kv_indices.device_ptr(&self.ctx.stream);
-            let (kv_indptr_ptr, _gpi) = meta.kv_indptr.device_ptr(&self.ctx.stream);
-            let (last_page_len_ptr, _gl) = meta.kv_last_page_len.device_ptr(&self.ctx.stream);
-            // SAFETY: all buffers are live `[B, *]` device arrays on ctx.stream;
-            // meta's `[B]`/`[B+1]` page-table arrays were just uploaded; each
-            // row's tail page is allocated (engine appended one token per row).
-            unsafe {
-                ffi::decode_prep_paged_hd256_cuda(
-                    qf_ptr as *const ffi::Half,
-                    qp_ptr as *mut ffi::Half,
-                    k_ptr as *const ffi::Half,
-                    v_ptr as *const ffi::Half,
-                    qn_ptr as *const ffi::Half,
-                    kn_ptr as *const ffi::Half,
-                    cos_ptr as *const ffi::Half,
-                    sin_ptr as *const ffi::Half,
-                    positions_ptr as *const i32,
-                    k_pool_ptr as *mut ffi::Half,
-                    v_pool_ptr as *mut ffi::Half,
-                    kv_indices_ptr as *const i32,
-                    kv_indptr_ptr as *const i32,
-                    last_page_len_ptr as *const i32,
-                    self.local_q_heads as i32,
-                    self.local_kv_heads as i32,
-                    pool.page_size as i32,
-                    stride_page as i32,
-                    b as i32,
-                    c.rotary_dim as i32,
-                    c.rms_norm_eps,
-                    self.ctx.stream.cu_stream(),
-                )
-                .result()?;
-            }
-        }
-
-        // Paged decode over each row's page slice (`bsz=B`, RoPE pre-baked).
-        {
-            let kernel = ffi::resolve_paged_attn_v1(
-                c.head_dim as u32,
-                self.local_q_heads as u32,
-                self.local_kv_heads as u32,
-                ffi::AttnPhase::Decode,
-            )
-            .ok_or_else(|| {
-                anyhow!(
-                    "no HD256 paged decode kernel for q{}_kv{}",
-                    self.local_q_heads,
-                    self.local_kv_heads
-                )
-            })?;
-            let (qp_ptr, _g0) = q_prepped.data.device_ptr_mut(&self.ctx.stream);
-            let (q_indptr_ptr, _g1) = meta.q_indptr.device_ptr(&self.ctx.stream);
-            let (kv_indptr_ptr, _g2) = meta.kv_indptr.device_ptr(&self.ctx.stream);
-            let (kv_indices_ptr, _g3) = meta.kv_indices.device_ptr(&self.ctx.stream);
-            let (last_page_len_ptr, _g4) = meta.kv_last_page_len.device_ptr(&self.ctx.stream);
-            let (ao_ptr, _g5) = attn_out.data.device_ptr_mut(&self.ctx.stream);
-            // SAFETY: q/page-table/out buffers valid on ctx.stream; paged_attn_v1
-            // ABI — decode dispatches `(bsz, total_q, max_q) = (B, B, 1)`.
-            unsafe {
-                kernel(
-                    qp_ptr as *mut ffi::Half,
-                    q_indptr_ptr as *const i32,
-                    k_pool_ptr as *mut ffi::Half,
-                    v_pool_ptr as *mut ffi::Half,
-                    kv_indptr_ptr as *const i32,
-                    kv_indices_ptr as *const i32,
-                    last_page_len_ptr as *const i32,
-                    ao_ptr as *mut ffi::Half,
-                    b as i32,
-                    b as i32,
-                    1,
-                    pool.max_total_pages as i32,
-                    meta.num_pages as i32,
-                    self.local_q_heads as i32,
-                    self.local_kv_heads as i32,
-                    pool.page_size as i32,
-                    sm_scale,
-                    self.ctx.stream.cu_stream(),
-                )
-                .result()?;
-            }
-        }
-
-        // Separable per-head sigmoid gate over all B rows.
-        {
-            let (qf_ptr, _g0) = q_full.data.device_ptr(&self.ctx.stream);
-            let (o_ptr, _g1) = attn_out.data.device_ptr_mut(&self.ctx.stream);
-            // SAFETY: q_full/attn_out are live `[B, *]` buffers on ctx.stream;
-            // the gate kernel iterates `q_dim * B`.
-            unsafe {
-                ffi::attention_gate_paged_hd256_cuda(
-                    qf_ptr as *const ffi::Half,
-                    o_ptr as *mut ffi::Half,
-                    self.local_q_heads as i32,
-                    b as i32,
-                    self.ctx.stream.cu_stream(),
-                )
-                .result()?;
-            }
-        }
-
-        gemm_batch(&self.ctx, &attn.o_proj, attn_out, out)?;
-        self.tp.all_reduce_sum(&self.ctx, out)?;
-        Ok(())
-    }
-
-    /// Batched-decode gated-delta linear attention: batched in-projections
-    /// over all B rows, then the BATCHED conv1d + GDR kernels
-    /// (`conv1d_decode_batch_cuda` / `gdr_decode_batch_cuda`) advancing every
-    /// row's per-slot conv ring + recurrent state through the pre-staged
-    /// per-layer device pointer tables — one launch each for all B rows
-    /// (monolith `decode_batch_linear_attn_layer_graphable` re-port). Layout
-    /// contracts verified against the single-row kernels:
-    ///   - `x_batch [B, C]`: the in_proj GEMM output is token-major, so row
-    ///     r's channels are contiguous at r*C — exactly the batch kernel's
-    ///     `x_batch[b * num_channels + c]`;
-    ///   - conv state `[C, K-1]` per slot: identical layout in `conv1d.cu`
-    ///     (`conv_state[c * state_width + i]`) and the batch kernel
-    ///     (`conv_state_ptrs[b] + c * sw`);
-    ///   - GDR state `[Vh, Kd, Vd]` f32 per slot: identical in both kernels;
-    ///   - `rms_norm_gated` over `[B, Vh*Vd]` row-major gdr_out/z: pass
-    ///     `num_heads = Vh*B`, the same per-(token, head) grid extension the
-    ///     single-row path already uses for `seq_len > 1`.
-    fn linear_attention_batch(
-        &self,
-        attn: &LinearAttn,
-        normed: &HiddenStates,
-        conv_table: &CudaSlice<u64>,
-        gdr_table: &CudaSlice<u64>,
-        lw: &mut LinearAttnScratch,
-        out: &mut HiddenStates,
-    ) -> Result<()> {
-        let c = &self.config;
-        let b = normed.seq_len;
-        let qkv_dim = self.local_linear_qkv_dim();
-        let z_dim = self.local_linear_z_dim();
-        let b_dim = attn.in_proj_b.rows;
-        let a_dim = attn.in_proj_a.rows;
-
-        let LinearAttnScratch {
-            qkv,
-            z,
-            b_proj,
-            a_proj,
-            qkv_conv,
-            gdr_out,
-            normed_out,
-            // Batched decode is per-token recurrent; FlashQLA scratch unused.
-            fq_q: _,
-            fq_k: _,
-            fq_v: _,
-            fq_a: _,
-            fq_g: _,
-            fq_g_cumsum: _,
-            fq_beta: _,
-        } = lw;
-        let qkv = qkv.get(&self.ctx, qkv_dim, b)?;
-        let z = z.get(&self.ctx, z_dim, b)?;
-        let b_proj = b_proj.get(&self.ctx, b_dim, b)?;
-        let a_proj = a_proj.get(&self.ctx, a_dim, b)?;
-        gemm_batch(&self.ctx, &attn.in_proj_qkv, normed, qkv)?;
-        gemm_batch(&self.ctx, &attn.in_proj_z, normed, z)?;
-        gemm_batch(&self.ctx, &attn.in_proj_b, normed, b_proj)?;
-        gemm_batch(&self.ctx, &attn.in_proj_a, normed, a_proj)?;
-
-        // ── Batched conv1d (advances every row's conv ring in place). ──
-        let qkv_conv = qkv_conv.get(&self.ctx, qkv_dim, b)?;
-        {
-            let (x_ptr, _g0) = qkv.data.device_ptr(&self.ctx.stream);
-            let (w_ptr, _g1) = attn.conv1d_weight.data.device_ptr(&self.ctx.stream);
-            let (tbl_ptr, _g2) = conv_table.device_ptr(&self.ctx.stream);
-            let (o_ptr, _g3) = qkv_conv.data.device_ptr_mut(&self.ctx.stream);
-            // SAFETY: x/weight/out are live `[B, C]`/`[C*K]` buffers on
-            // ctx.stream; `tbl_ptr` is the staged `[>=B]` u64 table whose
-            // first B entries point at live `[C, K-1]` conv rings.
-            unsafe {
-                ffi::conv1d_decode_batch_cuda(
-                    x_ptr as *const ffi::Half,
-                    w_ptr as *const ffi::Half,
-                    tbl_ptr as *mut *mut ffi::Half,
-                    o_ptr as *mut ffi::Half,
-                    qkv_dim as i32,
-                    c.linear_conv_kernel_dim as i32,
-                    b as i32,
-                    self.ctx.stream.cu_stream(),
-                )
-                .result()?;
-            }
-        }
-
-        // ── Batched gated-delta recurrent (advances every row's state). ──
-        let gdr_out = gdr_out.get(&self.ctx, z_dim, b)?;
-        {
-            let (qkv_ptr, _g0) = qkv_conv.data.device_ptr(&self.ctx.stream);
-            let (b_ptr, _g1) = b_proj.data.device_ptr(&self.ctx.stream);
-            let (a_ptr, _g2) = a_proj.data.device_ptr(&self.ctx.stream);
-            let (dt_ptr, _g3) = attn.dt_bias.data.device_ptr(&self.ctx.stream);
-            let (alog_ptr, _g4) = attn.a_log.device_ptr(&self.ctx.stream);
-            let (tbl_ptr, _g5) = gdr_table.device_ptr(&self.ctx.stream);
-            let (o_ptr, _g6) = gdr_out.data.device_ptr_mut(&self.ctx.stream);
-            // SAFETY: all buffers live on ctx.stream; `tbl_ptr` is the staged
-            // `[>=B]` u64 table whose first B entries point at live
-            // `[Vh, Kd, Vd]` f32 states; head dims from this rank's shard.
-            unsafe {
-                ffi::gdr_decode_batch_cuda(
-                    qkv_ptr as *const ffi::Half,
-                    b_ptr as *const ffi::Half,
-                    a_ptr as *const ffi::Half,
-                    dt_ptr as *const ffi::Half,
-                    alog_ptr as *const f32,
-                    tbl_ptr as *mut *mut f32,
-                    o_ptr as *mut ffi::Half,
-                    self.local_linear_k_heads as i32,
-                    self.local_linear_v_heads as i32,
-                    c.linear_key_head_dim as i32,
-                    c.linear_value_head_dim as i32,
-                    b as i32,
-                    self.ctx.stream.cu_stream(),
-                )
-                .result()?;
-            }
-        }
-
-        // ── Gated output RMSNorm over all (token, head) slices. ──
-        let normed_out = normed_out.get(&self.ctx, z_dim, b)?;
-        {
-            let (x_ptr, _g0) = gdr_out.data.device_ptr(&self.ctx.stream);
-            let (w_ptr, _g1) = attn.norm_weight.device_ptr(&self.ctx.stream);
-            let (gate_ptr, _g2) = z.data.device_ptr(&self.ctx.stream);
-            let (o_ptr, _g3) = normed_out.data.device_ptr_mut(&self.ctx.stream);
-            // SAFETY: same per-(token, head) grid extension as the single-row
-            // path's `seq_len > 1` case — `num_heads = Vh*B` covers all B*Vh
-            // `[Vd]` slices of the row-major `[B, Vh*Vd]` buffers; `weight`
-            // is a per-`[Vd]` broadcast with no blockIdx dependence.
-            unsafe {
-                ffi::rms_norm_gated_cuda(
-                    x_ptr as *const ffi::Half,
-                    w_ptr as *const f32,
-                    gate_ptr as *const ffi::Half,
-                    o_ptr as *mut ffi::Half,
-                    (self.local_linear_v_heads * b) as i32,
-                    c.linear_value_head_dim as i32,
-                    c.rms_norm_eps,
-                    self.ctx.stream.cu_stream(),
-                )
-                .result()?;
-            }
-        }
-
-        gemm_batch(&self.ctx, &attn.out_proj, normed_out, out)?;
-        // Row-parallel out_proj: ONE all-reduce over the exact `[hidden, B]`
         // buffer — message length is B valid columns by construction (no-op
         // single-GPU).
         self.tp.all_reduce_sum(&self.ctx, out)?;
