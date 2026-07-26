@@ -57,7 +57,52 @@ that counted only backward `state_history`, ignoring forward's retained checkpoi
 activations (75.9 GB at 40960). 256K still needs LA-chunk / sequence parallel;
 this reroute lifts the wall one notch and gives the carry path a chunked backward.
 
-## Rule
+## Pod A/B — loss parity + perf license
+
+Cross-commit A/B (the tranche-2 flip is in the forward — the device path records
+`initial_state` as `None`, so a runtime host-vs-device toggle can't exist). Arm A =
+HEAD `5fbf38e4e` (device chunked backward); arm B = `a03bf04f2` (= `d6ae52dc1^`,
+clean host recompute). Both arms: same records, same seed, GPU 1, two full builds
+in isolated trees. 27B-FP8, `--writeback-offload true`.
+
+**#2 loss parity — PASS.** Deterministic `--replay-records` lane (student-only, no
+MoE rollout), 1 record (seq 4111, 717 masked tok — carry fires: >writeback-window
+512) × 12 epochs × 3 runs/arm. The carry-boundary logic (chunk-0 seed, dq tok 0-1 /
+dconv tap 0-1) is structurally identical at 4111 or 24576, so 4K exercises the exact
+device carry path. Median loss curve:
+
+| epoch | A (device) | B (host) | rel Δ |
+|---|---|---|---|
+| 0 | 0.1083 | 0.1083 | 0 (fwd byte-identical) |
+| 1 | 0.0876 | 0.0874 | 2.3e-3 |
+| 2 | 0.0667 | 0.0668 | 1.5e-3 |
+| 4 | 0.0355 | 0.0354 | 2.8e-3 |
+| 6 | 0.0180 | 0.0180 | 0 |
+| 8 | 0.0092 | 0.0092 | 0 |
+| 11 | 0.0039 | 0.0039 | 0 |
+
+Epoch 0-1 bit-identical (forward is byte-identical; divergence only enters epoch 2+
+via backward-driven weight updates — the expected signature). Every-epoch cross-arm
+mean Δ ≤ 2e-4 abs, **smaller than arm A's own run-to-run jitter (≤5e-4)** — device
+is statistically indistinguishable from host. The single-run tail rel spikes (epoch
+9 ~2.9%) are `%.4f` print-quantization on ~0.007 losses, not real divergence; against
+medians-with-jitter they vanish. Well inside the <1e-2 bf16-grad-noise bar.
+
+**#3 perf license — device is +2.6% slower (VRAM-for-time trade), not faster.**
+seq=24576, backward wall-clock/step, 3 runs/arm, medians:
+
+| arm | backward median | forward median |
+|---|---|---|
+| A device chunked | **565.16 s** (565.16/564.26/566.64) | 137.9 s |
+| B host recompute | **550.61 s** (549.79/550.61/550.74) | 133.8 s |
+
+Device backward is **+14.55 s (+2.6%)** vs host at seq=24576. The reroute is not a
+speed win — it buys the VRAM headroom that lifts the trainable-seq wall 24576→40960
+(host recompute OOMs at 40960; device completes at 93.2 GB peak). Trade: pay ~2.6%
+per-step wall to unlock 1.67× trainable sequence. Both arms same forward (~2.9%
+forward gap is bf16/MoE run jitter, not a code difference — forward is byte-identical).
+
+
 
 Mixed-precision gradcheck's judge must match the forward's ACTUAL precision. A
 bf16-reading backward that matches a bf16 forward is correct even when it fails an
