@@ -1,0 +1,21 @@
+scripts/kernel_artifacts.sh
+  s_cb6ca280b792fe::t_18daf81f0d1528 5,534-547
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "c12b92dc531be3bf2e3d3490378feee87881b16e",
+  "prompts": {},
+  "sessions": {
+    "s_cb6ca280b792fe": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1a00414d-2267-47d4-813e-3c9e7cb88d53",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
