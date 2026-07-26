@@ -1,0 +1,49 @@
+docs/agent-method.md
+  s_9c91b86ec3fb55::t_7e2c88a71248ce 87-89
+docs/baselines.md
+  s_8031688e20aead::t_a5c895f9b8c635 18-22,25,30,45-53
+docs/bench-and-trace-spec.md
+  s_9c91b86ec3fb55::t_6792ab87c74a08 78-94,97-106
+docs/experience/wins/2026-07-26-long-agent-32k-is-the-workload.md
+  s_9c91b86ec3fb55::t_f54f931f997f3f 49-66,69-75
+docs/experience/wins/TEMPLATE-bench.md
+  s_9c91b86ec3fb55::t_005d5570f393c4 19,21-22
+scripts/gen_bench_prompts.py
+  s_2c38145338af2e::t_4d200f0038da41 4,6-7,9-17,29-37,98-107,109-130,132-138
+scripts/run_dsv4_bench.sh
+  s_9c91b86ec3fb55::t_fd38e9a7113040 14,19
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "8c3a4c6a70c875f16e67accbb289d4ad2b7ddcc6",
+  "prompts": {},
+  "sessions": {
+    "s_2c38145338af2e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-adb19fa9a0af554fd",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_8031688e20aead": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-abdcf2d70c2e2c350",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_9c91b86ec3fb55": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4779911a-69b7-49db-bc83-daf5a48d6ca3",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
