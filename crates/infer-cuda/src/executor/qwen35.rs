@@ -2028,6 +2028,7 @@ impl Qwen35CudaExecutor {
             false => Vec::new(),
         };
 
+        let rank_probe = std::env::var("ARLE_DSPARK_RANK").is_ok();
         let tap_ms = crate::qwen35::mtp_phase_lap(&model.ctx, &mut pt);
         let (mut accept_ms, mut cap_ms, mut trunc_ms, mut ext_ms) = (0.0, 0.0, 0.0, 0.0);
 
@@ -2083,6 +2084,14 @@ impl Qwen35CudaExecutor {
                     k,
                     ds.head.cfg.next_token_heads,
                 );
+                // Where the trunk's token sat in the draft's own ranking at the
+                // position that broke the chain — the width a candidate tree
+                // would need to survive it.
+                if rank_probe && k + 1 < c.chain.len() && !argmax.is_empty() {
+                    let row = k + usize::from(!ds.head.cfg.next_token_heads);
+                    let rank = model.draft_token_rank(draft_logits, row, argmax[c.row0 + k])?;
+                    eprintln!("[dspark-rank] k={k} rank={rank}");
+                }
             }
             cap_ms += crate::qwen35::mtp_phase_lap(&model.ctx, &mut pt);
             if k + 1 < c.chain.len() {
