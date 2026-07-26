@@ -23,6 +23,8 @@ Progress spine. Entry classes recorded here the day they land: phase exits,
 default flips, and accept-or-reject verdicts (AGENTS.md §Docs lifecycle &
 progress spine).
 
+- **ACCEPT — Agent RFT uses generation-time behavior probabilities** (2026-07-26; win: [2026-07-26-agent-rft-sidecar-denominator](docs/experience/wins/2026-07-26-agent-rft-sidecar-denominator.md)). Ratio-weighted fresh, stale, experience-replay, and offline-replay updates now share one immutable `gen_logprobs` denominator; malformed evidence fails during shared preflight before model work, while CE/GKD remain sidecar-free. Isolated H20 CUDA build and two-epoch offline replay passed; missing/misaligned sidecars failed before model initialization. A real online stochastic GRPO run (`rft-toy08b-g2`) trained 672 tokens from two variance-bearing trajectories with finite IS telemetry (`mean=0.952895`, `max=9.580126`), closing the runtime gate.
+
 - **DEFAULT FLIP — OPD carry GDN backward routes through the device chunked
   path** (2026-07-26, `d6ae52dc1` + `c4709d348`;
   bench: [2026-07-26-carry-gdn-device-reroute-tranche2](docs/experience/wins/2026-07-26-carry-gdn-device-reroute-tranche2.md)).
@@ -40,6 +42,18 @@ progress spine).
   <1e-2 bf16-grad bar. Perf license: device chunked backward is +2.6% slower
   (565.2 s vs host 550.6 s median, seq=24576) — a deliberate VRAM-for-time trade,
   paying ~2.6%/step to unlock the 1.67× trainable-seq wall.
+
+- **REJECT (current form) — online markov-head self-RL cannot reach training
+  scale, and the markov path taxes 22.5%** (2026-07-26, `14669ec33`;
+  bench: [2026-07-26-markov-head-online-selfrl-cannot-reach-scale](docs/experience/errors/2026-07-26-markov-head-online-selfrl-cannot-reach-scale.md)).
+  On DeepSpec's own dataset (`mlabonne/open-perfectblend`, target-regenerated
+  answers) 1500 prompts yielded 220 sidecar steps × batch 8 = 1760 samples
+  against a 127M-parameter head; the learned bias spans 0.052 logits against an
+  O(1) top-2 gap, and k_mean is flat (3.831 → 3.837). Turning the head on costs
+  −22.5% tok/s (203.8 → 158.0) because it leaves the batched-argmax path. Batch
+  the markov gemm first, then train offline. Also fixes
+  `--dspark-markov-init` on a DFlash backbone, which had no head slot to
+  install into without `--dspark-train`.
 
 - **FINDING — the DSpark draft is a good ranker and a bad argmax** (2026-07-26,
   `d420d894e`;
