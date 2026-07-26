@@ -332,6 +332,14 @@ pub(crate) struct DsparkScratch {
     markov_bias: HiddenSlot,
     step_logits: HiddenSlot,
     step_sum: HiddenSlot,
+    /// Block-shaped twins of the four above. The slots reuse only on an exact
+    /// shape match, and the row-shaped path (sampling, and the confidence head
+    /// inside the same call) interleaves with the batched one — sharing would
+    /// free and rezero a `[vocab, block]` buffer every tick.
+    markov_prevs: SliceSlot<i32>,
+    markov_rows: HiddenSlot,
+    markov_bias_rows: HiddenSlot,
+    step_sum_rows: HiddenSlot,
     conf_feat: VecSlot,
     conf_out: VecSlot,
     argmax: SliceSlot<i32>,
@@ -351,39 +359,6 @@ pub(crate) struct DsparkScratch {
     chain_draft: SliceSlot<i32>,
     u_accept: SliceSlot<f32>,
     u_residual: SliceSlot<f32>,
-}
-
-/// On-device argmax over one token row of a `[vocab, seq]` bf16 buffer
-/// (`ops::argmax_row_into` for the `HiddenStates` shape — same kernel, no copy).
-fn argmax_hs_row(
-    ctx: &DeviceContext,
-    logits: &HiddenStates,
-    row: usize,
-    scratch: &mut CudaSlice<i32>,
-) -> Result<u32> {
-    let vocab = logits.hidden_dim;
-    ensure!(row < logits.seq_len, "dspark argmax row {row} oob");
-    {
-        let (l_ptr, _gl) = logits.data.device_ptr(&ctx.stream);
-        let (o_ptr, _go) = scratch.device_ptr_mut(&ctx.stream);
-        // SAFETY: row bounds checked; the kernel reads `vocab` bf16 from the
-        // row offset and writes one i32.
-        unsafe {
-            ffi::argmax_cuda(
-                (l_ptr + (row * vocab * 2) as u64) as *const ffi::Half,
-                o_ptr as *mut i32,
-                vocab as i32,
-                ctx.stream.cu_stream(),
-            )
-            .result()?;
-        }
-    }
-    ctx.sync()?;
-    let token = ctx
-        .stream
-        .clone_dtoh(scratch)
-        .map_err(|e| anyhow!("D2H dspark argmax failed: {e}"))?;
-    Ok(token[0] as u32)
 }
 
 /// Uniform-stream salts: draft draw / accept test / residual+bonus draw at the
@@ -1029,22 +1004,18 @@ impl Qwen35Model {
         df.q_rows = 0;
         let first_row = usize::from(!cfg.next_token_heads);
         let mut drafts = Vec::with_capacity(block);
+        // Greedy resolves the whole block in one batched pass; sampling has to
+        // walk the chain a row at a time (it syncs per draw regardless).
+        if !sampling {
+            let am = self.dspark_block_greedy(head, scratch, df, anchor)?;
+            drafts.extend_from_slice(&am[first_row..block]);
+        }
         let mut prev = anchor;
-        // Greedy resolves the whole block in one batched pass — with a markov
-        // head via chain speculation, without one directly off the logits.
-        let block_argmax = if sampling {
-            None
-        } else if let Some(m) = &head.markov {
-            Some(self.markov_block_argmax(m, scratch, df, block, first_row, anchor)?)
-        } else {
-            Some(self.argmax_rows(df.logits.get(ctx, vocab, block)?)?)
-        };
-        for row in first_row..block {
-            // Corrected logits row: base + markov bias when the head is present.
-            // Batched greedy already folded the bias in; only sampling walks
-            // the chain a row at a time.
-            let (src, src_row) = if let (Some(m), None) = (&head.markov, &block_argmax) {
-                // step_logits = base_row + markov_w2 · markov_w1[prev]
+        let sample_rows = if sampling { first_row..block } else { 0..0 };
+        for row in sample_rows {
+            // Corrected logits row: base + markov bias when the head is present
+            // (`step_logits = base_row + markov_w2 · markov_w1[prev]`).
+            let (src, src_row) = if let Some(m) = &head.markov {
                 let tok_dev = scratch.markov_tok.upload(ctx, &[prev as i32])?;
                 let emb = scratch.markov_emb.get(ctx, m.rank, 1)?;
                 embedding_batch(ctx, &m.w1, tok_dev, emb)?;
@@ -1069,7 +1040,7 @@ impl Qwen35Model {
             } else {
                 (df.logits.get(ctx, vocab, block)?, row)
             };
-            let tok = if sampling {
+            let tok = {
                 // Filter + q-row store + multinomial draw in one device call;
                 // uniform from the host (seed, position) stream plain decode
                 // would consume at this position (SALT_DRAW = 0).
@@ -1107,10 +1078,6 @@ impl Qwen35Model {
                     as u32;
                 df.q_rows += 1;
                 tok
-            } else if let Some(am) = &block_argmax {
-                am[src_row]
-            } else {
-                argmax_hs_row(ctx, src, src_row, scratch.argmax.get(ctx, 1)?)?
             };
             drafts.push(tok);
             prev = tok;
@@ -1137,26 +1104,30 @@ impl Qwen35Model {
         Ok(chain)
     }
 
-    /// Greedy block selection with a markov head, batched by speculating the
-    /// chain on itself. `bias = w2·w1[prev]` makes row r depend on row r-1's
-    /// choice, which is what forces the per-row path; but the base argmax is a
-    /// near-perfect guess for `prev` (the learned bias is small next to the
-    /// top-2 gap), so guess every row's predecessor, correct all rows in one
-    /// batched pass, and re-run only while a guess disagreed. Each round
-    /// confirms at least one more row, so `block` rounds is the hard bound and
-    /// the result is bit-identical to walking the chain.
-    fn markov_block_argmax(
+    /// Greedy token for every block row. Without a markov head that is one
+    /// batched argmax; with one, `bias = w2·w1[prev]` makes row r depend on row
+    /// r-1's choice, so the block is resolved by speculating the chain on
+    /// itself: the base argmax is a near-perfect guess for `prev` (the learned
+    /// bias is small next to the top-2 gap), so guess every predecessor,
+    /// correct all rows in one batched pass, and re-run while a guess
+    /// disagreed. Each round confirms one more row — `block` rounds bound it —
+    /// and the result is what walking the chain produces.
+    fn dspark_block_greedy(
         &self,
-        m: &DsparkMarkovHead,
+        head: &Qwen35DsparkHead,
         scratch: &mut DsparkScratch,
         df: &mut Qwen35DsparkSlotState,
-        block: usize,
-        first_row: usize,
         anchor: u32,
     ) -> Result<Vec<u32>> {
         let ctx = &self.ctx;
         let vocab = self.output_projection().rows;
-        let mut toks = self.argmax_rows(df.logits.get(ctx, vocab, block)?)?;
+        let block = head.cfg.block_size;
+        let first_row = usize::from(!head.cfg.next_token_heads);
+        let ids = scratch.argmax.get(ctx, block)?;
+        let mut toks = self.argmax_rows_into(df.logits.get(ctx, vocab, block)?, ids)?;
+        let Some(m) = &head.markov else {
+            return Ok(toks);
+        };
         // prevs[row] feeds row: the anchor for the first drafted row, else the
         // token chosen one row earlier.
         let mut prevs = vec![anchor as i32; block];
@@ -1164,25 +1135,28 @@ impl Qwen35Model {
             for row in first_row + 1..block {
                 prevs[row] = toks[row - 1] as i32;
             }
-            let tok_dev = scratch.markov_tok.upload(ctx, &prevs)?;
-            let emb = scratch.markov_emb.get(ctx, m.rank, block)?;
+            let tok_dev = scratch.markov_prevs.upload(ctx, &prevs)?;
+            let emb = scratch.markov_rows.get(ctx, m.rank, block)?;
             embedding_batch(ctx, &m.w1, tok_dev, emb)?;
-            let bias = scratch.markov_bias.get(ctx, vocab, block)?;
+            let bias = scratch.markov_bias_rows.get(ctx, vocab, block)?;
             gemm_batch(
                 ctx,
                 &m.w2,
-                scratch.markov_emb.get(ctx, m.rank, block)?,
+                scratch.markov_rows.get(ctx, m.rank, block)?,
                 bias,
             )?;
-            let sum = scratch.step_sum.get(ctx, vocab, block)?;
+            let sum = scratch.step_sum_rows.get(ctx, vocab, block)?;
             add_batch(
                 ctx,
                 df.logits.get(ctx, vocab, block)?,
-                scratch.markov_bias.get(ctx, vocab, block)?,
+                scratch.markov_bias_rows.get(ctx, vocab, block)?,
                 sum,
             )?;
-            let next = self.argmax_rows(scratch.step_sum.get(ctx, vocab, block)?)?;
-            let settled = (first_row + 1..block).all(|row| prevs[row] == next[row - 1] as i32);
+            let ids = scratch.argmax.get(ctx, block)?;
+            let next = self.argmax_rows_into(scratch.step_sum_rows.get(ctx, vocab, block)?, ids)?;
+            // prevs[row] is toks[row-1], so this is "the correction moved no
+            // row that another row's bias depends on".
+            let settled = (first_row..block.saturating_sub(1)).all(|r| toks[r] == next[r]);
             toks = next;
             if settled {
                 return Ok(toks);
@@ -1281,12 +1255,28 @@ impl Qwen35Model {
     /// accept scan is host arithmetic once this lands, so a batched tick costs
     /// one sync instead of one per chain row per slot.
     pub(crate) fn argmax_rows(&self, logits: &HiddenStates) -> Result<Vec<u32>> {
+        let mut ids_dev = self
+            .ctx
+            .stream
+            .alloc_zeros::<i32>(logits.seq_len)
+            .map_err(|e| anyhow!("dspark argmax ids alloc failed: {e}"))?;
+        self.argmax_rows_into(logits, &mut ids_dev)
+    }
+
+    /// [`Self::argmax_rows`] into caller-held scratch — the draft path calls it
+    /// once per speculation round, so it must not allocate.
+    pub(crate) fn argmax_rows_into(
+        &self,
+        logits: &HiddenStates,
+        ids_dev: &mut CudaSlice<i32>,
+    ) -> Result<Vec<u32>> {
         let ctx = &self.ctx;
         let (rows, vocab) = (logits.seq_len, logits.hidden_dim);
-        let mut ids_dev = ctx
-            .stream
-            .alloc_zeros::<i32>(rows)
-            .map_err(|e| anyhow!("dspark argmax ids alloc failed: {e}"))?;
+        ensure!(
+            ids_dev.len() == rows,
+            "dspark argmax scratch {} != {rows} rows",
+            ids_dev.len()
+        );
         {
             let (l_ptr, _gl) = logits.data.device_ptr(&ctx.stream);
             let (o_ptr, _go) = ids_dev.device_ptr_mut(&ctx.stream);
@@ -1304,7 +1294,7 @@ impl Qwen35Model {
         }
         let ids: Vec<i32> = ctx
             .stream
-            .clone_dtoh(&ids_dev)
+            .clone_dtoh(ids_dev)
             .map_err(|e| anyhow!("D2H dspark argmax failed: {e}"))?;
         ids.into_iter()
             .map(|id| {
