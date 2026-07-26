@@ -1,0 +1,23 @@
+CHANGELOG.md
+  s_7685101b283eb6::t_9e1c0b221dedfb 26-27,39-44
+docs/experience/wins/2026-07-26-carry-gdn-device-reroute-tranche2.md
+  s_7685101b283eb6::t_ba38111115c59d 60-105
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "1976074dab6ec66bdb5a050d5e1311bcb3eeb917",
+  "prompts": {},
+  "sessions": {
+    "s_7685101b283eb6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a686b0f7f7bfc7a64",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
