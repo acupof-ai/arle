@@ -1,0 +1,41 @@
+crates/autograd/src/ops/checkpoint.rs
+  s_7685101b283eb6::t_08c2648ccbcb6b 157-165,169-172
+crates/cli/src/args.rs
+  s_0687ad858d0f07::t_bc44fb05b04c37 2074-2075,2115-2117
+crates/train/src/update_strategy.rs
+  s_0687ad858d0f07::t_bf6a179a957f7c 16,20,24,33-35,246,272-310,327,386-387,404-407,417,454,465,519,543-635,762,780,785,839-907,910-951
+docs/experience/wins/2026-07-17-qwen35-gen-logprob-capture.md
+  s_0687ad858d0f07::t_b4e761154effd2 1,3-6,60-64,66,68-70
+docs/experience/wins/2026-07-25-backward-reoffload-device-wall-24576-to-32768.md
+  s_7685101b283eb6::t_149acc6cce472b 1,13,17-18,20-26,28-32,36-55
+docs/experience/wins/2026-07-26-agent-rft-sidecar-denominator.md
+  s_0687ad858d0f07::t_648e7ea99ab616 1-107
+docs/research/2026-07-26-training-architecture-algorithm-kernel-audit.md
+  s_0687ad858d0f07::t_8b2c899cbcd691 6-8,31,67,69,71,75-76,79-81,185,187,364,380-381,448,460
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "29b5deffe6340f9bcc94155150d25e7f8051d323",
+  "prompts": {},
+  "sessions": {
+    "s_0687ad858d0f07": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6cab79ae-2d5c-4239-81e7-196afb71725e",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_7685101b283eb6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a686b0f7f7bfc7a64",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
