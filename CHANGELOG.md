@@ -23,6 +23,20 @@ Progress spine. Entry classes recorded here the day they land: phase exits,
 default flips, and accept-or-reject verdicts (AGENTS.md §Docs lifecycle &
 progress spine).
 
+- **DEFAULT FLIP — OPD carry GDN backward routes through the device chunked
+  path** (2026-07-26, `d6ae52dc1` + `c4709d348`;
+  bench: [2026-07-26-carry-gdn-device-reroute-tranche2](docs/experience/wins/2026-07-26-carry-gdn-device-reroute-tranche2.md)).
+  `linear_attention_core_with_carry_taped` no longer forces the host
+  full-sequence recompute (`state_history` ≈ 86 GB at seq=40960); it seeds the
+  carry into `chunk_state[0]` and reuses the seq-independent device chunked
+  backward. Host recompute demoted to CPU/unsupported fallback. Live device-carry
+  gradcheck PASSED on pod (`5fbf38e4e`); dq 1.74e-3 / dconv 6.29e-3 are bf16
+  rounding vs the f32 oracle (A/B-confirmed), not logic bugs — the bf16 gradient
+  is the correct adjoint of the bf16 forward. Trainable seq (single H20)
+  24576 → 40960 (1.67×; the 64× arithmetic was retracted, `274af1271`).
+  Pending-remote: end-to-end OPD loss parity vs the host path + backward
+  wall-clock perf license (device chunked vs host recompute).
+
 - **AMEND — DSpark block size is a lever at concurrency, not only an
   instrument** (2026-07-26;
   bench: [2026-07-26-dspark-block-size-is-a-lever-at-concurrency](docs/experience/wins/2026-07-26-dspark-block-size-is-a-lever-at-concurrency.md)).
