@@ -62,6 +62,7 @@ workers see them; train flags apply via `train::apply_runtime_flags`):
 | `ARLE_OPD_ENGINE_OFFLOAD` | `arle train <opd> --engine-offload off\|all\|student\|teacher` |
 | `ARLE_OPD_GRADIENT_CHECKPOINTING` | `arle train <opd> --gradient-checkpointing` |
 | `ARLE_OPD_CHECKPOINT_OFFLOAD_MIN_BYTES` | `arle train <opd> --checkpoint-offload-min-bytes` |
+| `ARLE_OPD_TRIM_BEFORE_BACKWARD` / `_TRIM_AFTER_WRITEBACK` / `_TRIM_AFTER_CHECKPOINT_REPLAY` | `arle train <opd> --trim-before-backward` / `--trim-after-writeback` / `--trim-after-checkpoint-replay` |
 | `ARLE_OPD_ROLLOUT_RETAIN_INTERVAL` / `_ROLLOUT_PROGRESS_INTERVAL` | `arle train <opd> --rollout-retain-interval` / `--rollout-progress-interval` |
 | `ARLE_OPD_MOE_LORA_BWD_EXPERT_TILE` / `_LORA_LINEAR_BWD_TILE_ROWS` | `arle train <opd> --moe-lora-bwd-expert-tile` / `--lora-linear-bwd-tile-rows` |
 | `ARLE_OPD_WRITEBACK_FROZEN_PROMPT_KV` | `arle train <opd> --writeback-frozen-prompt-kv` |
