@@ -362,7 +362,16 @@ fn compare_cpu_cuda_device_linear_attention_carry(
     rel_tol: f32,
     carry: Option<(&[f32], &[f32])>,
 ) -> Result<()> {
-    const ABS_TOL: f32 = 1.0e-3;
+    // Non-carry compares stay strict at 1e-3. The carry variant's device backward
+    // reads the saved bf16 qkv_conv (bit-matching the production forward, which stores
+    // conv output as bf16), while the CPU oracle recomputes conv in f32 — a legitimate
+    // precision gap, not a logic bug. It concentrates on the carry-fed boundary tokens
+    // (dq worst at tok 0-1) and conv boundary taps (dconv worst at taps 0-1), the largest-
+    // magnitude rows. A/B (2026-07-26): switching the backward's k/v/q read from bf16 to
+    // f32 silu(preact) drops dq 1.74e-3→5.1e-4 and dconv 6.29e-3→3.2e-4, both under 1e-3
+    // — confirming pure bf16 rounding. Tolerance covers the measured bf16 residual (dconv
+    // 6.29e-3) with margin; the production bf16 gradient is the correct one to ship.
+    let abs_tol: f32 = if carry.is_some() { 1.0e-2 } else { 1.0e-3 };
     let qkv_shape = [params.batch, params.seq_len, qkv_dim(params)];
     let z_shape = [params.batch, params.seq_len, z_dim(params)];
     let head_shape = [params.batch, params.seq_len, params.num_value_heads];
@@ -633,19 +642,19 @@ fn compare_cpu_cuda_device_linear_attention_carry(
     for (name, err, abs) in checks {
         eprintln!("{label} {name} max_rel_err={err:.6e} max_abs_err={abs:.6e}");
         assert!(err.is_finite(), "{label} {name} error is non-finite");
-        if err > rel_tol && abs > ABS_TOL && first_failure.is_none() {
+        if err > rel_tol && abs > abs_tol && first_failure.is_none() {
             first_failure = Some((name, err, abs));
         }
     }
     if let Some((name, err, abs)) = first_failure {
-        panic!("{label} {name} max rel err {err} > {rel_tol} and max abs err {abs} > {ABS_TOL}");
+        panic!("{label} {name} max rel err {err} > {rel_tol} and max abs err {abs} > {abs_tol}");
     }
     let ddt_rel = max_rel_err(&cuda_dt_grad, &cpu_dt_grad);
     let ddt_abs = max_abs_err(&cuda_dt_grad, &cpu_dt_grad);
     eprintln!("{label} ddt_bias max_rel_err={ddt_rel:.6e} max_abs_err={ddt_abs:.6e}");
     assert!(
-        ddt_rel.is_finite() && (ddt_rel <= rel_tol || ddt_abs <= ABS_TOL),
-        "{label} ddt_bias max rel err {ddt_rel} > {rel_tol} and max abs err {ddt_abs} > {ABS_TOL}"
+        ddt_rel.is_finite() && (ddt_rel <= rel_tol || ddt_abs <= abs_tol),
+        "{label} ddt_bias max rel err {ddt_rel} > {rel_tol} and max abs err {ddt_abs} > {abs_tol}"
     );
     for (name, values) in [
         ("cuda_out", &cuda_out_host),
