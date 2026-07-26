@@ -158,38 +158,43 @@ Agent and RL workloads re-process the same prompt + history + tool output every 
 ## Architecture
 
 ```mermaid
-flowchart TB
- classDef entry fill:#1a1a2e,stroke:#e94560,color:#eee,rx:8,ry:8
- classDef core fill:#0f3460,stroke:#e94560,color:#eee,rx:8,ry:8
- classDef seam fill:#533483,stroke:#e94560,color:#eee,rx:8,ry:8
- classDef exec fill:#190e36,stroke:#4ecca3,color:#eee,rx:8,ry:8
+flowchart TD
+  CLI["CLI orchestration<br/>crates/cli/src/train_cli.rs"]
+  OPD["OPD / self-OPD<br/>student rollout + teacher rescoring<br/>KL / reverse-KL / beta-JSD"]
+  RUBRIC["Rubric-OPD<br/>sample -> judge -> accepted CE"]
+  AGENT["Agent-OPD<br/>tool trajectory -> reward<br/>UpdatePreset"]
+  DSPARK["DSpark online training<br/>verify-logit capture -> Markov-head update"]
+  STUDENT["Qwen3.5 / Qwen3.6 train model<br/>crates/train/src/qwen35.rs"]
+  TEACHER["infer-api or EMA teacher<br/>BF16 logits boundary"]
+  LOSS["Loss graph<br/>CE / KL / JSD / weighted PG"]
+  TAPE["Autograd Tape<br/>checkpoint / recompute / offload"]
+  BACKEND["Backend seam<br/>CPU reference + optional CUDA overrides"]
+  OPT["Production host AdamW<br/>FP32 params and moments"]
+  SYNC["LoRA D2H<br/>infer-engine re-merge"]
+  ART["Immutable model/adapter artifact<br/>publish latest last"]
+  CODEC["Trainer-state v2 codec<br/>not wired to production CLI"]
 
- Serve["arle serve<br/><sub>OpenAI v1</sub>"]
- Agent["arle<br/><sub>local agent</sub>"]
- Train["arle train opd<br/><sub>OPD</sub>"]
-
- Core["infer-core<br/><sub>device-neutral Engine · scheduler · KV cache</sub>"]
-
- Seam["infer-seam<br/><sub>two traits: BackendExecutor · KvPool</sub>"]
-
- CUDA["infer-cuda<br/><sub>FlashMLA · DeepGEMM · DeepEP</sub>"]
- Metal["infer-metal<br/><sub>MLX bridge</sub>"]
-
- Serve --> Core
- Agent --> Core
- Train --> Core
- Core --> Seam
- Seam --> CUDA
- Seam --> Metal
-
- class Serve,Agent,Train entry
- class Core core
- class Seam seam
- class CUDA,Metal exec
+  CLI --> OPD
+  CLI --> RUBRIC
+  CLI --> AGENT
+  CLI --> DSPARK
+  OPD --> STUDENT
+  OPD --> TEACHER
+  RUBRIC --> STUDENT
+  AGENT --> STUDENT
+  STUDENT --> LOSS
+  TEACHER --> LOSS
+  LOSS --> TAPE
+  TAPE --> BACKEND
+  BACKEND --> OPT
+  OPT --> SYNC
+  OPT --> ART
+  CODEC -. "no production call edge" .-> ART
+  DSPARK -->|"two BF16 vocab-wide D2H copies"| DSPCPU["CpuBackend + host AdamW"]
+  DSPCPU -->|"BF16 saved head / host hot-swap"| SYNC
 ```
 
-One runtime, three surfaces, two pluggable backends. A new backend implements
-the two seam traits — no changes to the scheduler, cache, or server.
+The training stack shares the production model/runtime authority: serving or EMA teachers score student trajectories, one autograd substrate drives OPD and RFT objectives, and LoRA updates merge back into the live inference engine. The current device-residency and restart gaps are documented in the [training architecture and kernel audit](docs/research/2026-07-26-training-architecture-algorithm-kernel-audit.md).
 
 Deep dive: [docs/onboarding.md](docs/onboarding.md) (30 min) · [docs/architecture.md](docs/architecture.md) · [docs/codebase-map.md](docs/codebase-map.md).
 
