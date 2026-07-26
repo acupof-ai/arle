@@ -1,0 +1,21 @@
+crates/infer-cuda/src/decode_graph.rs
+  s_d72e71ecefe4ea::t_09e11bc5aea393 97-98,100,178
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "f4f419629d5d9bb1c3927678b3cba9ff01507fe4",
+  "prompts": {},
+  "sessions": {
+    "s_d72e71ecefe4ea": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a7b1013643a5f389e",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
