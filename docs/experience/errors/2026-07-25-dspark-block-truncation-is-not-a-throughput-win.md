@@ -47,6 +47,15 @@ steps, or in raising block size above 16 where per-row verify cost finally bites
 The trend here says **larger** blocks are worth probing, which the current
 downward-only clamp cannot express.
 
+## Amendment, 2026-07-26 — the regime, not the conclusion
+
+Everything above holds **at c=1**. At c=8 the same sweep inverts: block 8 beats
+block 16 by 6.8% because 8·16 = 136 verify rows is no longer latency-bound
+(verify 62.1 → 39.1 ms for the same k_med = 2 accepted drafts). See
+[2026-07-26-dspark-block-size-is-a-lever-at-concurrency](../wins/2026-07-26-dspark-block-size-is-a-lever-at-concurrency.md).
+The flag is a lever above the crossover; the error was fixing a serving default
+from a single-stream measurement.
+
 ## Rule
 
 Before claiming discarded work is recoverable, name the unit that actually costs
