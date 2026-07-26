@@ -234,6 +234,8 @@ pub fn linear_attention_core(
         norm_weight,
         params,
         requires_grad,
+        None,
+        None,
         store,
         tape,
     )? {
@@ -706,6 +708,8 @@ fn try_linear_attention_forward_device(
     norm_weight: TensorId,
     params: LinearAttentionParams,
     requires_grad: bool,
+    initial_state: Option<TensorId>,
+    initial_conv_window: Option<TensorId>,
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<Option<TensorId>> {
@@ -722,7 +726,11 @@ fn try_linear_attention_forward_device(
         dt_bias,
         a_log,
         norm_weight,
-    ] {
+    ]
+    .into_iter()
+    .chain(initial_state)
+    .chain(initial_conv_window)
+    {
         store.ensure_device(tensor_id)?;
     }
 
@@ -774,6 +782,17 @@ fn try_linear_attention_forward_device(
         .as_ref()
         .expect("device")
         .clone();
+    // Carry handles (None = default zero-seed): frozen prompt state + conv window for OPD.
+    let resolve = |id| -> Result<_> {
+        Ok(store
+            .tensor(id)?
+            .device_handle
+            .as_ref()
+            .expect("device")
+            .clone())
+    };
+    let initial_state_handle = initial_state.map(resolve).transpose()?;
+    let initial_conv_handle = initial_conv_window.map(resolve).transpose()?;
 
     let Some(result) =
         store
@@ -797,6 +816,8 @@ fn try_linear_attention_forward_device(
                 dt_bias: &dt_handle,
                 a_log: &a_log_handle,
                 norm_weight: &norm_handle,
+                initial_state: initial_state_handle.as_ref(),
+                initial_conv_window: initial_conv_handle.as_ref(),
             })?
     else {
         return Ok(None);

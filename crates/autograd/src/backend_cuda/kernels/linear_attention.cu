@@ -92,7 +92,9 @@ extern "C" __global__ void linear_attention_conv1d_silu_forward_f32_to_bf16(
     int total,
     int channels,
     int seq_len,
-    int kernel_size
+    int kernel_size,
+    const float* __restrict__ conv_tail,
+    int tail_len
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= total) {
@@ -102,10 +104,14 @@ extern "C" __global__ void linear_attention_conv1d_silu_forward_f32_to_bf16(
     int t = idx / channels;
     float sum = 0.0f;
     for (int tap = 0; tap < kernel_size; ++tap) {
-        if (t + tap + 1 < kernel_size) {
+        int src_t = t + tap + 1 - kernel_size;
+        if (src_t < 0) {
+            // Carried boundary window feeds the left taps; nullptr keeps the zero-pad default.
+            if (conv_tail != nullptr) {
+                sum += conv_tail[(src_t + tail_len) * channels + c] * weight[c * kernel_size + tap];
+            }
             continue;
         }
-        int src_t = t + tap + 1 - kernel_size;
         sum += x[src_t * channels + c] * weight[c * kernel_size + tap];
     }
     preact[idx] = sum;
@@ -1748,7 +1754,9 @@ extern "C" __global__ void linear_attention_conv1d_silu_backward_f32(
     int total,
     int channels,
     int seq_len,
-    int kernel_size
+    int kernel_size,
+    const float* __restrict__ conv_tail,
+    int tail_len
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= total) {
@@ -1758,10 +1766,16 @@ extern "C" __global__ void linear_attention_conv1d_silu_backward_f32(
     int t = idx / channels;
     float dpre = grad_post_silu[idx] * la_silu_grad(preact[idx]);
     for (int tap = 0; tap < kernel_size; ++tap) {
-        if (t + tap + 1 < kernel_size) {
+        int src_t = t + tap + 1 - kernel_size;
+        if (src_t < 0) {
+            // Carried history did contribute to the forward → its weight-grad is real. Carry is
+            // frozen (requires_grad=false), so no grad_input flows back into it.
+            if (conv_tail != nullptr) {
+                atomicAdd(&grad_weight[c * kernel_size + tap],
+                          dpre * conv_tail[(src_t + tail_len) * channels + c]);
+            }
             continue;
         }
-        int src_t = t + tap + 1 - kernel_size;
         int input_idx = src_t * channels + c;
         float x = input[input_idx];
         float w = weight[c * kernel_size + tap];
