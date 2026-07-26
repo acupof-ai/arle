@@ -1,0 +1,21 @@
+crates/infer-cuda/src/qwen35/dspark.rs
+  s_9c91b86ec3fb55::t_abfdbc09093052 335-342,1007-1012,1014-1018,1043,1107-1115,1117,1124-1130,1138-1139,1141,1145,1148,1152,1155-1159,1258-1259,1261,1263-1279,1297
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "0ade41244cacb78977ef89200af9f864c6d6301a",
+  "prompts": {},
+  "sessions": {
+    "s_9c91b86ec3fb55": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4779911a-69b7-49db-bc83-daf5a48d6ca3",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
