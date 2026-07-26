@@ -23,6 +23,23 @@ Progress spine. Entry classes recorded here the day they land: phase exits,
 default flips, and accept-or-reject verdicts (AGENTS.md §Docs lifecycle &
 progress spine).
 
+- **ACCEPT (mechanism only, no serving delta) — one batched argmax per DSpark
+  tick** (2026-07-26, `308c8b247`;
+  bench: [2026-07-26-dspark-batched-argmax-tick](docs/experience/wins/2026-07-26-dspark-batched-argmax-tick.md)).
+  The greedy accept scan read argmax row by row through launch + sync + D2H, up
+  to 128 pipeline drains per c=8 tick; `argmax_rows()` does the whole verify
+  output in one launch. Measured: draft argmax 0.56 → 0.04 ms/slot, tick
+  −3.9% at c=8, aggregate tok/s within noise (+1.1% / +1.2% / −0.4% at
+  c=1/4/8). Kept for the removed work, not claimed as a speedup. The predicted
+  −18% did not materialize: commit's cost is the rejection rollback, not the
+  argmax D2H.
+- **WORKLOAD — bench workload is multi-turn agent sessions at the TraceLab
+  medians** (2026-07-26, `08e1f10f8`;
+  bench: [2026-07-26-long-agent-32k-is-the-workload](docs/experience/wins/2026-07-26-long-agent-32k-is-the-workload.md)).
+  One-shot unique 32k contexts could never hit the prefix cache; real
+  coding-agent serving hits it 95.7% (arXiv:2606.30560). `f4f419629`'s
+  "~89% is prefill" reading is withdrawn — at the trace medians decode is
+  ~60% of per-step wall clock.
 - **PHASE EXIT — spec-decode concurrency gate; three dispatch ladders → one
   `route_decode`** (2026-07-26, `69560ae55`;
   win: [2026-07-26-spec-decode-concurrency-gate](docs/experience/wins/2026-07-26-spec-decode-concurrency-gate.md)).
