@@ -1,0 +1,21 @@
+crates/autograd/tests/test_linear_attention.rs
+  s_7685101b283eb6::t_7752a87ece566e 365-374,645,650,656-657
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "c4709d3480c23075898ad133058aa39a83830013",
+  "prompts": {},
+  "sessions": {
+    "s_7685101b283eb6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a686b0f7f7bfc7a64",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
