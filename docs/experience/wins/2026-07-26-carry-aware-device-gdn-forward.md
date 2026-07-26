@@ -1,6 +1,7 @@
 # Carry-aware device GDN forward — ABI + seed (tranche 1)
 
-> Status: Shipped (device path dead until tranche 2 routes it — see Rule)
+> Status: Shipped. Tranche 2 routed it live + gradcheck passed —
+> see `2026-07-26-carry-gdn-device-reroute-tranche2.md`.
 
 ## Goal
 
