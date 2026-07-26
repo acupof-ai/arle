@@ -1084,18 +1084,6 @@ pub(crate) struct OpdRuntimeArgs {
     #[arg(long, default_value_t = 2 << 20, value_name = "BYTES")]
     pub(crate) checkpoint_offload_min_bytes: usize,
 
-    /// Trim the device memory pool before backward.
-    #[arg(long, default_value_t = false, action = clap::ArgAction::Set, value_name = "BOOL")]
-    pub(crate) trim_before_backward: bool,
-
-    /// Trim the device memory pool after writeback.
-    #[arg(long, default_value_t = false, action = clap::ArgAction::Set, value_name = "BOOL")]
-    pub(crate) trim_after_writeback: bool,
-
-    /// Trim the device memory pool after each checkpoint replay.
-    #[arg(long, default_value_t = false, action = clap::ArgAction::Set, value_name = "BOOL")]
-    pub(crate) trim_after_checkpoint_replay: bool,
-
     /// Skip update records longer than this (0 = unlimited; H20-96GB backward
     /// OOMs at seq≈30K).
     #[arg(long, default_value_t = 23_000, value_name = "TOKENS")]
@@ -1201,15 +1189,12 @@ impl OpdRuntimeArgs {
                 OpdEngineOffloadArg::Teacher => train::opd::EngineOffloadMode::Teacher,
             },
             gradient_checkpointing: self.gradient_checkpointing,
-            trim_before_backward: self.trim_before_backward,
-            trim_after_writeback: self.trim_after_writeback,
             writeback_frozen_prompt_kv: self.writeback_frozen_prompt_kv,
             rollout_retain_interval: self.rollout_retain_interval,
             rollout_progress_interval: self.rollout_progress_interval,
             max_update_seq: self.max_update_seq,
             autograd: autograd::AutogradRuntimeFlags {
                 checkpoint_offload_min_bytes: self.checkpoint_offload_min_bytes,
-                trim_after_checkpoint_replay: self.trim_after_checkpoint_replay,
                 legacy_lora_linear_bwd: self.legacy_lora_linear_bwd,
                 lora_linear_bwd_tile_rows: self.lora_linear_bwd_tile_rows,
                 legacy_sdpa_bwd: self.legacy_sdpa_bwd,
@@ -1996,9 +1981,9 @@ pub(crate) struct TrainAgentOpdArgs {
     pub(crate) staged_root: Option<PathBuf>,
 
     /// Replay pre-converted token records (`arle train cc-convert` output JSONL)
-    /// through the same masked-CE writeback instead of rolling out: no rollout
-    /// engine, sandboxes, or datasets are loaded. Honors --writeback-cap; saves
-    /// adapters via --save-lora-adapters.
+    /// through masked writeback instead of rolling out. Ratio-weighted presets
+    /// require a finite generation-time `gen_logprobs` sidecar per masked token;
+    /// CE/GKD permits records without it. Validated before model/store creation.
     #[arg(long, value_name = "FILE")]
     pub(crate) replay_records: Option<PathBuf>,
 
@@ -2008,9 +1993,8 @@ pub(crate) struct TrainAgentOpdArgs {
 
     /// Experience replay: after each fresh group's update, additionally train
     /// on up to N groups drawn from an age-bounded (≤10 rounds),
-    /// |A|-prioritized buffer. IS-corrected by the preset's ratio vs the
-    /// behavior logprobs stored at first use — requires a ratio-weighted
-    /// --update-strategy. 0 = off.
+    /// |A|-prioritized buffer. IS-corrected against each trajectory's stored
+    /// generation-time behavior sidecar; requires a ratio-weighted strategy.
     #[arg(long, default_value_t = 0, value_name = "N")]
     pub(crate) replay_reuse: usize,
 
@@ -2102,12 +2086,9 @@ pub(crate) struct TrainAgentOpdArgs {
     pub(crate) sync: SyncArg,
 
     /// Rollout/train overlap: 0 = task groups strictly sequential (on-policy);
-    /// 1 = admit the next group's rollouts before this group's train+merge —
-    /// cc rolls while the GPU trains. Trajectories are tagged with the policy
-    /// version they launched under and the preset's IS ratio (denominator =
-    /// generation-time sidecar logprobs) corrects the one-step drift, so a
-    /// ratio-weighted --update-strategy is required. Max 1 (the published
-    /// safe envelope).
+    /// 1 = admit the next group's rollouts before this group's train+merge.
+    /// Ratio-weighted strategies use the generation-time behavior sidecar for
+    /// both fresh and stale groups, so overlap does not change the denominator.
     #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u8).range(0..=1))]
     pub(crate) staleness: u8,
 
@@ -2141,8 +2122,8 @@ pub(crate) struct TrainAgentOpdArgs {
     pub(crate) writeback_window: usize,
 
     /// Policy-update preset. `rejection-ce` (default) = reject failures +
-    /// masked CE. The rest select an `UpdatePreset` value: sao-dis | sao-value |
-    /// grpo | dapo | dr-grpo | gspo | cispo.
+    /// masked CE. Ratio-weighted presets require finite generation-time
+    /// behavior logprobs for every masked token and fail closed otherwise.
     #[arg(long, value_enum, default_value_t = UpdateStrategyArg::RejectionCe)]
     pub(crate) update_strategy: UpdateStrategyArg,
 
