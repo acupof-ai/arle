@@ -37,6 +37,16 @@ progress spine).
   Pending-remote: end-to-end OPD loss parity vs the host path + backward
   wall-clock perf license (device chunked vs host recompute).
 
+- **FINDING — the DSpark draft is a good ranker and a bad argmax** (2026-07-26,
+  `d420d894e`;
+  bench: [2026-07-26-dspark-draft-is-a-good-ranker-bad-argmax](docs/experience/wins/2026-07-26-dspark-draft-is-a-good-ranker-bad-argmax.md)).
+  At the position that breaks the chain the trunk's token is inside the draft's
+  top-2 47.0% of the time (top-4 73.3%, top-8 87.8%; rank median 2). Width-2
+  candidates project `E[k]` 2.19 → ~5.1. Draft-side cost is ~zero — DSpark's
+  non-causal block means row r's logits do not depend on the token picked at
+  rows < r — so only verify pays. Cashing it needs tree attention; outlined, not
+  started.
+
 - **AMEND — DSpark block size is a lever at concurrency, not only an
   instrument** (2026-07-26;
   bench: [2026-07-26-dspark-block-size-is-a-lever-at-concurrency](docs/experience/wins/2026-07-26-dspark-block-size-is-a-lever-at-concurrency.md)).
