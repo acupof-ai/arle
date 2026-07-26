@@ -2028,6 +2028,9 @@ impl Qwen35CudaExecutor {
             false => Vec::new(),
         };
 
+        let tap_ms = crate::qwen35::mtp_phase_lap(&model.ctx, &mut pt);
+        let (mut accept_ms, mut cap_ms, mut trunc_ms, mut ext_ms) = (0.0, 0.0, 0.0, 0.0);
+
         // 5. Per row: accept + rollback (paged KV self-heals under the crop),
         //    extend the draft ctx, stage the bonus as the next anchor.
         for c in &batch {
@@ -2065,6 +2068,7 @@ impl Qwen35CudaExecutor {
                     params,
                 )?
             };
+            accept_ms += crate::qwen35::mtp_phase_lap(&model.ctx, &mut pt);
             // Draft logits live in the SLOT: a tick drafts every row before
             // verifying any, so a shared buffer would pair the wrong slot.
             let df = ds.slots[c.slot].as_mut().expect("seeded slot");
@@ -2080,13 +2084,16 @@ impl Qwen35CudaExecutor {
                     ds.head.cfg.next_token_heads,
                 );
             }
+            cap_ms += crate::qwen35::mtp_phase_lap(&model.ctx, &mut pt);
             if k + 1 < c.chain.len() {
                 full_attn_kv
                     .as_mut()
                     .expect("paged (gated by seeded)")
                     .truncate_slot(c.slot, c.start + k + 1)?;
             }
+            trunc_ms += crate::qwen35::mtp_phase_lap(&model.ctx, &mut pt);
             model.dspark_append_ctx(&ds.head, df, &mut ds.scratch, c.row0, k + 1, c.start)?;
+            ext_ms += crate::qwen35::mtp_phase_lap(&model.ctx, &mut pt);
             df.pending = Some(bonus);
             ds.accepts += k;
             ds.rejects += c.chain.len() - 1 - k;
@@ -2102,8 +2109,11 @@ impl Qwen35CudaExecutor {
                 })
                 .collect();
         }
-        let commit_ms = crate::qwen35::mtp_phase_lap(&model.ctx, &mut pt);
+        let commit_ms = tap_ms + accept_ms + cap_ms + trunc_ms + ext_ms;
         if pt.is_some() {
+            eprintln!(
+                "[dspark-commit] tap={tap_ms:.2} accept={accept_ms:.2} cap={cap_ms:.2} trunc={trunc_ms:.2} ext={ext_ms:.2} ms"
+            );
             eprintln!(
                 "[dspark-phase] rows={} chain_rows={total_rows} draft={draft_ms:.2} snap={snap_ms:.2} verify={verify_ms:.2} commit={commit_ms:.2} ms",
                 batch.len()
