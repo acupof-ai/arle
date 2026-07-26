@@ -547,7 +547,29 @@ pub fn linear_attention_core_with_carry_taped(
             .map(|tensor| acc || tensor.requires_grad)
     })?;
 
-    // Always host (carry-aware device kernel deferred to pod increment).
+    // Device path seeds the carry into chunk_state[0] and reuses the chunked backward
+    // (records carry ctx as None → has_carry stays false → device backward). Host below
+    // is the CPU/unsupported fallback.
+    if let Some(output_id) = try_linear_attention_forward_device(
+        qkv,
+        z,
+        b_proj,
+        a_proj,
+        conv1d_weight,
+        dt_bias,
+        a_log,
+        norm_weight,
+        params,
+        requires_grad,
+        initial_state,
+        initial_conv_window,
+        store,
+        tape,
+    )? {
+        return Ok(output_id);
+    }
+
+    // Host fallback (carry-aware device kernel unsupported for this shape/dtype).
     for tensor_id in [
         qkv,
         z,
