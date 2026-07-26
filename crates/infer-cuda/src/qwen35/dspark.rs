@@ -1272,8 +1272,16 @@ impl Qwen35Model {
             // snapshot, then linear-only replay of the accepted prefix from the
             // verify capture; the paged full-attn KV self-heals under the pool
             // truncate + seq_len rewind (position-indexed rows).
+            let mut pt = super::dspark_phase_start(&self.ctx);
             spec.restore_trunk(&self.ctx, slot)?;
+            let restore_ms = super::mtp_phase_lap(&self.ctx, &mut pt);
             self.replay_linear_only(slot, ws, &spec.capture, k)?;
+            let replay_ms = super::mtp_phase_lap(&self.ctx, &mut pt);
+            if pt.is_some() {
+                eprintln!(
+                    "[dspark-accept] k={k} depth={depth} restore={restore_ms:.2} replay={replay_ms:.2} ms"
+                );
+            }
             slot.set_seq_len(start_pos + k + 1);
         }
         Ok((emitted, bonus, k))
