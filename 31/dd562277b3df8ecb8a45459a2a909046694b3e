@@ -1,0 +1,45 @@
+crates/autograd/src/backend.rs
+  s_74bc2c03b66921::t_8f52bcc58bb85b 347-351
+crates/autograd/src/backend_cuda.rs
+  s_089e26e9e41120::t_7d00c589dfdbf2 3881-3883,3896-3897,3953-3964,3966-3979,3981-3983,4045,4061-4075,4108-4117,4135-4137,4918-4921,4939-4941
+crates/autograd/src/backend_cuda/kernels/linear_attention.cu
+  s_2a0c78cdedb11a::t_8b3f28984ad364 95-97,107-112,1757-1759,1769-1776
+crates/autograd/src/ops/linear_attention.rs
+  s_089e26e9e41120::t_80748e7d3e8942 237-238,711-712,729-733,785-795,819-820
+docs/research/2026-07-26-carry-aware-chunked-gdn-backward.md
+  s_089e26e9e41120::t_4392670e411583 1-197
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "31dd562277b3df8ecb8a45459a2a909046694b3e",
+  "prompts": {},
+  "sessions": {
+    "s_089e26e9e41120": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "93e66a8f-c20a-4ba9-96f2-283f6d98cbb1",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_2a0c78cdedb11a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-ac1318d77e14f830c",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_74bc2c03b66921": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a48c5455dcc6c8a4d",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
