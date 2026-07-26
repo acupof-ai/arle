@@ -1,0 +1,31 @@
+crates/train/src/opd.rs
+  s_0687ad858d0f07::t_0347e93148ea6a 2973
+crates/train/src/runtime_flags.rs
+  s_7685101b283eb6::t_795da182e1c71b 65-66
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "a9d6110ca618f0ad712b09efe3e953e23314b893",
+  "prompts": {},
+  "sessions": {
+    "s_0687ad858d0f07": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6cab79ae-2d5c-4239-81e7-196afb71725e",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_7685101b283eb6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a686b0f7f7bfc7a64",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
