@@ -7,7 +7,7 @@ trap 'rm -rf "$TMP"' EXIT
 LOCAL="$TMP/local"; NODE="$TMP/node/tree"; TREE="$TMP/pod/tree"; STATE="$TMP/state"; BIN="$TMP/bin"
 mkdir -p "$LOCAL/scripts" "$TMP/node" "$TMP/pod" "$STATE" "$BIN"
 cp "$ROOT/.gitignore" "$LOCAL/"
-cp "$ROOT/scripts/"{pod.sh,pod-remote-build.sh,pod-remote-run.sh,pick-gpu.sh,reap_run.py,pod-build-env.sh,pod-tilelang-env.sh,cuda_prebuilt_manifest.sh} "$LOCAL/scripts/"
+cp "$ROOT/scripts/"{pod.sh,pod-remote-build.sh,pod-remote-run.sh,pick-gpu.sh,reap_run.py,pod-build-env.sh,pod-tilelang-env.sh,cuda_prebuilt_manifest.sh,kernel_artifacts.sh} "$LOCAL/scripts/"
 
 git -C "$LOCAL" init -q
 git -C "$LOCAL" config user.email test@example.com
