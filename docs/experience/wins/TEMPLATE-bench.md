@@ -16,17 +16,18 @@
 python3 scripts/bench_throughput.py \
   --url <url> \
   --model <model> \
-  --prompts-jsonl <workload.jsonl> \
+  --prompts-jsonl bench-agent-32k-64.jsonl \
   --concurrency-grid 1,4,8,16 \
-  --seconds-per-concurrency 120 \
-  --max-tokens <n> \
+  --requests-per-concurrency 16 \
+  --max-tokens 256 \
   --seed 20260416 \
+  --timeout-seconds 900 \
   --output bench-output/<label>/bench
 ```
 
 - Baseline: `<commit, binary hash, flags>`
 - Treatment: `<commit, binary hash, one changed flag>`
-- Prompt tokens: `<p50 / min / max>`
+- Prompt tokens: `<p50 / min / max>` — target 32768, within ±10% (spec §3.3)
 - Completion tokens: `<p50 / min / max>`
 - Trials: `<n>`
 

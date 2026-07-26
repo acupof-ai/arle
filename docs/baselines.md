@@ -15,20 +15,53 @@ Screening compares new runs against the champion row — no second arm. Rules:
    re-measure the champion before comparing.
 4. **Anchor audit**: every ~5 accepted updates (and before any default flip),
    one A/B against the oldest archived binary bounds accumulated drift.
+5. **One workload**: every champion row runs the 32k-token long-agent dataset
+   (bench spec §3.3). Rows below the 2026-07-26 line predate that rule and are
+   short-prompt fingerprints — they are historical evidence, not comparison
+   targets. Re-anchor on the long-agent dataset before screening against them.
+
+```
+python3 scripts/gen_bench_prompts.py bench-agent-32k-64.jsonl 64 32768 256
+```
+
+## ThinkingCap-Qwen3.6-27B-FP8 · 1×H20 · single-GPU · eager — LONG-AGENT ANCHOR
+
+### CHAMPION — `f4f419629` (2026-07-26, first long-agent row)
+
+Dataset `bench-agent-32k-64.jsonl`, sha256
+`683b3736b2b162a07e419bf8ed8639fb70e6bc4f9a2cd8c5c586b39060ab8ef5`, reproducible
+from the repo (rule 5). Runner `bench_throughput.py`, 8 req/point, max_tokens
+256, seed 20260416, `--max-running-requests 16`, GPU 0, no spec decode.
+Measured `prompt_tokens` 33000 (target 32768, +0.7%). Prefix hit rate 0 by
+construction. 0 errors / 0 incomplete / 0 correctness_failed at every point.
+
+| c | complete | out tok/s | total tok/s | wall s |
+|---|---------:|----------:|------------:|-------:|
+| 1 | 8        | 3.4       | 486.0       | 547.0  |
+| 4 | 8        | 12.9      | 1748.9      | 152.0  |
+| 8 | 8        | 14.3      | 1906.7      | 139.5  |
+
+- **The workload is prefill, not decode.** 68.4 s per request at c=1; 256 output
+  tokens at the measured ~28 ms ITL is ~7 s of it, so **~89% is the 33k
+  prefill** (~540 tok/s). The same serve on ~130-token prompts reports 38 out
+  tok/s — an 11× difference that is entirely prompt length.
+- Consequence for spec decode: it accelerates the ~10% decode slice. The
+  short-prompt rows below made that slice look like the whole request.
+- c=16 not yet measured on this dataset (KV budget check pending).
 
 ## DSv4-Flash-FP8 · 4×H20 · TP=4/EP=4 · eager · port 8000
 
 ### CHAMPION — Base, `d0525cb06` (re-anchored 2026-07-25, #180)
 
+> **Short-prompt fingerprint, retired 2026-07-26 (rule 5).** ~3.4k-token docs
+> from the pre-long-agent `gen_bench_prompts.py`; that generator now emits the
+> 32k agent shape, so this dataset is no longer reproducible from the repo and
+> the row cannot be re-measured. Kept as evidence for the numbers it licensed.
+
 GPUs 0-3 (H20 indices don't re-anchor — same silicon). Dataset
 `bench-prompts-20.jsonl`, sha256
-`e095ddf1fcc9325a43bb510b36e2afcb6c56d68af3ecc032503b8430b4f3fc49`,
-**reproducible byte-for-byte from the repo** (verified local vs pod):
-
-```
-python3 scripts/gen_bench_prompts.py bench-prompts-64.jsonl 64 13400 256   # sha256 3543ac33…
-head -20 bench-prompts-64.jsonl > bench-prompts-20.jsonl
-```
+`e095ddf1fcc9325a43bb510b36e2afcb6c56d68af3ecc032503b8430b4f3fc49`
+(first 20 lines of `bench-prompts-64.jsonl`, 64 docs × 13400 chars).
 
 Runner `bench_throughput.py` via `run_dsv4_bench.sh`, 60 s/point, seed
 20260416, max_tokens 256, no `--max-running-requests`. Slot line `59 slots /
@@ -59,9 +92,9 @@ runtime verifies (recompute-resume, band-exhaustion park-gate, both
   now fails loudly on a missing dataset and records `dataset.sha256` next to
   every result.
 
-### Spec-decode arms (short-prompt) — `6aa4ca6d1` (2026-07-25, #183+#184 clean)
+### Spec-decode arms — `6aa4ca6d1` (2026-07-25) · RETIRED short-prompt fingerprint
 
-**Separate fingerprint** — short-prompt dataset
+Retired 2026-07-26 (rule 5): 128-token prompts, not a serving shape. Dataset
 `dspark_natural_128in_128out.jsonl` (sha `169b7c78…`, 20 prompts),
 **max_tokens 128**, 60 s/point, c=1,4,8,16, GPUs 4-7 TP=4/EP=4. Same binary,
 same session; Δ is vs this run's own no-spec (NOT the champion — different
@@ -106,7 +139,8 @@ accept_rate (server-stats): MTP ~0.15, DSpark ~0.30. Slot lines: no-spec
 
 ## ThinkingCap-Qwen3.6-27B-FP8 · 1×H20 · single-GPU · eager · port 8200
 
-**2026-07-25 (`6aa4ca6d1`, #183+#184 clean)** — canonical CUDA agentic model
+**2026-07-25 (`6aa4ca6d1`) · RETIRED short-prompt fingerprint** (rule 5) —
+canonical CUDA agentic model
 (`bottlecapai/ThinkingCap-Qwen3.6-27B-FP8`, ~29 GB, qwen35 hybrid, TP=1).
 Dataset `dspark_natural_128in_128out.jsonl` (sha `169b7c78…`), **max_tokens
 128**, 60 s/point, c=1,4,8,16, GPU 4. Same binary, same session; Δ vs this
