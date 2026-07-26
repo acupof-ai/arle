@@ -1,9 +1,9 @@
-# Qwen3.5/3.6 generation-time behavior-logprob capture → sidecar → F.6 ratio-floor
+# Qwen3.5/3.6 generation-time behavior-logprob capture → authoritative ratio denominator
 
-> Status: Shipped — F.6 ratio-floor measured on real cc rollout groups
-> (H20 f6d, 2026-07-18), per plan §P6
-> (2026-07-16-agent-rl-unified-infra).
-> Sibling of [2026-07-17-qwen35-mtp-rejection-sampling](2026-07-17-qwen35-mtp-rejection-sampling.md).
+> Status: Shipped — capture/F.6 measured on H20 (2026-07-18); the
+> denominator flip and fail-closed replay contract were verified on H20
+> offline replay and a real online stochastic update on 2026-07-26; see
+> [2026-07-26-agent-rft-sidecar-denominator](2026-07-26-agent-rft-sidecar-denominator.md).
 
 ## F.6 verdict (H20 f6d, 2026-07-18)
 
@@ -57,18 +57,17 @@ it through the serve into the `.tokens.json` sidecar.
   (already in the seam) → engine token observer → `StreamItem`/`PendingTokens`
   → `RelayCompletionDelta.logprobs` (serde-default, both local and multiproc
   lanes) → `TokensSidecar.gen_logprobs` (all-or-nothing vs `gen_token_ids`).
-- **Consumer + F.6:** cc-convert threads sidecar logprobs into
-  `CcRecord.gen_logprobs` (one per masked token, mask order = recompute target
-  order); the PG update emits `ratio_floor_mean/max/tokens` =
-  `exp(logp_recompute − logp_sidecar)` stats whenever both sources exist. The
-  IS ratio stays on the V0 recompute until F.6 licenses the flip.
+- **Consumer:** cc-convert threads sidecar logprobs into
+  `CcRecord.gen_logprobs` (one per masked token, mask order = target order).
+  The 2026-07-26 contract binds this vector directly to every ratio-weighted
+  denominator. The earlier recompute-vs-sidecar `ratio_floor_*` diagnostic and
+  its redundant forward were removed after F.6 licensed the flip.
 
-## Gate (pending-remote)
+## Gate
 
-F.6 ratio-floor row on one collected group (temp=1 rollout → cc-convert →
-`--replay-records` PG update) + needle ×3 unaffected + baseline tok/s A/B
-(logprob reads add ≤ (depth+1)·4 B D2H per spec step on an already-synced
-stream; expected wash).
+Capture and the F.6 comparison are complete. The authoritative-denominator
+acceptance evidence is recorded in the 2026-07-26 follow-up; no throughput
+claim is attached to deleting the redundant recompute forward.
 
 ## Rule
 

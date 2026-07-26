@@ -13,16 +13,15 @@ use crate::opd::{
 use crate::qwen35::Qwen35Model;
 
 /// What the harness must collect for a preset: whether to keep failing
-/// trajectories, and whether to capture π_behavior logprobs before the update.
+/// trajectories, and whether generation must return behavior-policy logprobs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RolloutNeeds {
     pub keep_failing: bool,
-    pub rollout_logprobs: bool,
+    pub behavior_logprobs: bool,
 }
 
 /// One scored rollout: the verl-style `(prompt, response, mask)` record plus its
-/// scalar reward, group key, and (for ratio-weighted presets) the captured
-/// behavior-policy logprobs.
+/// scalar reward, group key, and generation-time behavior-policy logprobs.
 #[derive(Clone, Debug)]
 pub struct ScoredTrajectory {
     pub prompt_ids: Vec<u32>,
@@ -31,14 +30,9 @@ pub struct ScoredTrajectory {
     pub response_mask: Vec<u8>,
     /// Graded pytest reward in [0,1]; pass ⇔ `reward >= 1.0`.
     pub reward: f32,
-    /// π_behavior logprob per masked target position — the IS-ratio denominator
-    /// (the policy the trajectory was SAMPLED from; equals πθ at V0 today,
-    /// stale-θ under future async staleness). `Some` iff `needs.rollout_logprobs`.
-    pub rollout_logprobs: Option<Vec<f32>>,
-    /// Generation-time behavior logprobs from the serve sidecar (same order as
-    /// `rollout_logprobs`). F.6 diagnostic input only for now: the IS ratio
-    /// keeps the V0 recompute until F.6 licenses flipping the source.
-    pub gen_logprobs: Option<Vec<f32>>,
+    /// Generation-time π_behavior logprob per masked target position.
+    /// Required iff `needs.behavior_logprobs`.
+    pub behavior_logprobs: Option<Vec<f32>>,
     /// Per-prompt group key (task index) for [`Scope::Group`] baselines.
     pub group_id: usize,
     /// Hit the turn/token budget (input to the DAPO overlong filter).
@@ -134,13 +128,6 @@ pub struct UpdateReport {
     pub critic_mse: f32,
     pub adv_mean: f32,
     pub adv_std: f32,
-    /// F.6 precision diagnostic over trajectories carrying BOTH the sidecar's
-    /// generation-time logprobs and the V0 recompute: per-token
-    /// `exp(logp_recompute − logp_sidecar)` mean / max, and the tokens covered
-    /// (0 = no sidecar coverage this update).
-    pub ratio_floor_mean: f32,
-    pub ratio_floor_max: f32,
-    pub ratio_floor_tokens: usize,
 }
 
 /// One policy-update algorithm as data. Extend = a new constructor value.
@@ -256,7 +243,7 @@ impl UpdatePreset {
     pub fn needs(&self) -> RolloutNeeds {
         RolloutNeeds {
             keep_failing: self.filter != SampleFilter::PassOnly,
-            rollout_logprobs: self.ratio != RatioGrain::None,
+            behavior_logprobs: self.ratio != RatioGrain::None,
         }
     }
 
@@ -282,6 +269,45 @@ impl UpdatePreset {
         }
     }
 
+    fn validated_training<'a>(
+        &self,
+        batch: &'a [ScoredTrajectory],
+        vocab: usize,
+        window: usize,
+    ) -> Result<Vec<&'a ScoredTrajectory>> {
+        validate_trajectory_structure(batch)?;
+        if window == 0 {
+            return Err(OpdError::InvalidInput(
+                "masked writeback window_size must be > 0".to_owned(),
+            ));
+        }
+        if vocab > i32::MAX as usize {
+            return Err(OpdError::InvalidInput(format!(
+                "masked writeback vocab {vocab} exceeds i32::MAX"
+            )));
+        }
+        let training: Vec<_> = self
+            .filter_batch(batch)
+            .into_iter()
+            .filter(|traj| !over_max_seq(traj) && masked_target_count(traj) > 0)
+            .collect();
+        validate_training_inputs(&training, vocab, self.needs().behavior_logprobs)?;
+        Ok(training)
+    }
+
+    /// Number of trajectories that pass the preset and deterministic skip gates.
+    pub fn planned_training_count(&self, batch: &[ScoredTrajectory]) -> usize {
+        self.filter_batch(batch)
+            .into_iter()
+            .filter(|traj| !over_max_seq(traj) && masked_target_count(traj) > 0)
+            .count()
+    }
+
+    /// Validate every deterministic input before model, critic, or optimizer work.
+    pub fn preflight(&self, batch: &[ScoredTrajectory], vocab: usize, window: usize) -> Result<()> {
+        self.validated_training(batch, vocab, window).map(drop)
+    }
+
     /// Apply one round's update over `batch`, returning the mean per-trajectory
     /// loss (same reduction as the pre-preset per-trajectory writeback loop)
     /// plus the diagnostics the metrics sink records.
@@ -298,7 +324,7 @@ impl UpdatePreset {
         window: usize,
         store: &mut TensorStore,
     ) -> Result<UpdateReport> {
-        let survivors = self.filter_batch(batch);
+        let survivors = self.validated_training(batch, vocab, window)?;
         if survivors.is_empty() {
             return Ok(UpdateReport::default());
         }
@@ -357,14 +383,8 @@ impl UpdatePreset {
             all_params
         };
 
-        // GlobalTokenMean denominator: masked-token count of the trajectories that
-        // actually train — VRAM-skipped ones (skip_over_max_seq) add 0 grad, so
-        // counting them would deflate every trained token's weight.
-        let batch_tokens: usize = survivors
-            .iter()
-            .filter(|t| !over_max_seq(t))
-            .map(|t| t.rollout_logprobs.as_ref().map_or(0, Vec::len))
-            .sum();
+        // GlobalTokenMean counts only trajectories that passed preflight.
+        let batch_tokens: usize = survivors.iter().map(|t| masked_target_count(t)).sum();
         let step_each = matches!(self.agg, Aggregation::PerSeqTokenMean);
 
         let mut loss_sum = 0.0f32;
@@ -380,34 +400,11 @@ impl UpdatePreset {
         let mut adv_sum = 0.0f64;
         let mut adv_sq = 0.0f64;
         let mut adv_n = 0usize;
-        // F.6: per-token exp(logp_recompute − logp_sidecar) over trajectories
-        // where both sources exist — measures the serve↔train numerics gap
-        // (FP8 serve vs bf16 train) plus any θ staleness.
-        let mut rf_sum = 0.0f64;
-        let mut rf_max = 0.0f32;
-        let mut rf_tokens = 0usize;
-
         for (i, traj) in survivors.iter().enumerate() {
-            if skip_over_max_seq(traj) {
-                continue;
-            }
-            let rollout_logprobs = traj.rollout_logprobs.as_deref().ok_or_else(|| {
-                OpdError::InvalidInput(
-                    "ratio-weighted update requires rollout_logprobs (harness must capture \
-                     π_behavior when needs.rollout_logprobs)"
-                        .to_owned(),
-                )
-            })?;
-            if let Some(gen_lp) = traj.gen_logprobs.as_deref()
-                && gen_lp.len() == rollout_logprobs.len()
-            {
-                for (&recompute, &sidecar) in rollout_logprobs.iter().zip(gen_lp) {
-                    let ratio = (recompute - sidecar).exp();
-                    rf_sum += f64::from(ratio);
-                    rf_max = rf_max.max(ratio);
-                }
-                rf_tokens += gen_lp.len();
-            }
+            let behavior_logprobs = traj
+                .behavior_logprobs
+                .as_deref()
+                .expect("ratio-weighted batch validated before policy/critic forward");
             let (advantages, returns) = match critic.as_deref_mut() {
                 Some(c) => c.advantages(
                     student,
@@ -417,7 +414,7 @@ impl UpdatePreset {
                     traj.reward,
                     store,
                 )?,
-                None => (vec![scalar_advs[i]; rollout_logprobs.len()], Vec::new()),
+                None => (vec![scalar_advs[i]; behavior_logprobs.len()], Vec::new()),
             };
             if advantages.is_empty() {
                 continue; // no LLM tokens to train
@@ -454,7 +451,7 @@ impl UpdatePreset {
                         &traj.response_mask,
                         store,
                     )?;
-                    let s = seq_ratio_weight(&current_lp, rollout_logprobs, self.clip)?;
+                    let s = seq_ratio_weight(&current_lp, behavior_logprobs, self.clip)?;
                     for w in &mut weights {
                         *w *= s;
                     }
@@ -465,7 +462,7 @@ impl UpdatePreset {
 
             let (loss, traj_stats) = masked_writeback_step(
                 WritebackLoss::Pg {
-                    rollout_logprobs,
+                    rollout_logprobs: behavior_logprobs,
                     weight: &weights,
                     form,
                     kl_coef: 0.0,
@@ -518,16 +515,8 @@ impl UpdatePreset {
             } else {
                 String::new()
             };
-            let rf_suffix = if rf_tokens > 0 {
-                format!(
-                    " ratio_floor_mean={:.4} ratio_floor_max={rf_max:.4} (F.6, {rf_tokens} tokens)",
-                    rf_sum / rf_tokens as f64,
-                )
-            } else {
-                String::new()
-            };
             eprintln!(
-                "[update] trained={steps} mean_policy_loss={:.4} kl={:.4e} clip_frac={:.3}{critic_suffix}{rf_suffix}",
+                "[update] trained={steps} mean_policy_loss={:.4} kl={:.4e} clip_frac={:.3}{critic_suffix}",
                 loss_sum / steps as f32,
                 stats.kl_mean(),
                 stats.clip_frac(),
@@ -547,32 +536,103 @@ impl UpdatePreset {
             critic_mse,
             adv_mean: adv_mean as f32,
             adv_std: adv_std.sqrt() as f32,
-            ratio_floor_mean: (rf_sum / rf_tokens.max(1) as f64) as f32,
-            ratio_floor_max: rf_max,
-            ratio_floor_tokens: rf_tokens,
         })
     }
 }
 
-/// P7 staleness: pin the IS-ratio denominator for a version-tagged group.
-/// Staleness 0 leaves the batch alone (caller captures the V0 recompute —
-/// θ == π_behavior). A STALE group must use the generation-time sidecar: the
-/// V0 recompute reflects the post-merge policy (the missing-old-logits
-/// failure), so a stale trajectory without sidecar coverage is dropped —
-/// never trained with a fake ratio ≈ 1. Returns the number dropped.
-pub fn apply_staleness_denominator(batch: &mut Vec<ScoredTrajectory>, staleness: u64) -> usize {
-    if staleness == 0 {
-        return 0;
+fn validate_trajectory_structure(batch: &[ScoredTrajectory]) -> Result<()> {
+    for (idx, traj) in batch.iter().enumerate() {
+        if !traj.reward.is_finite() {
+            return Err(OpdError::InvalidInput(format!(
+                "trajectory {idx}: reward must be finite, got {}",
+                traj.reward
+            )));
+        }
+        if traj.response_ids.len() != traj.response_mask.len() {
+            return Err(OpdError::InvalidInput(format!(
+                "trajectory {idx}: response_ids len {} != response_mask len {}",
+                traj.response_ids.len(),
+                traj.response_mask.len()
+            )));
+        }
+        if let Some((position, mask)) = traj
+            .response_mask
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, mask)| *mask > 1)
+        {
+            return Err(OpdError::InvalidInput(format!(
+                "trajectory {idx}: response_mask[{position}]={mask}, expected 0 or 1"
+            )));
+        }
     }
-    let before = batch.len();
-    batch.retain_mut(|t| {
-        let Some(lp) = t.gen_logprobs.clone() else {
-            return false;
-        };
-        t.rollout_logprobs = Some(lp);
-        true
-    });
-    before - batch.len()
+    Ok(())
+}
+
+fn masked_target_count(traj: &ScoredTrajectory) -> usize {
+    traj.response_mask.iter().filter(|&&mask| mask == 1).count()
+}
+
+fn validate_training_inputs(
+    training: &[&ScoredTrajectory],
+    vocab: usize,
+    needs_behavior: bool,
+) -> Result<()> {
+    for (idx, traj) in training.iter().enumerate() {
+        if traj.prompt_ids.is_empty() {
+            return Err(OpdError::InvalidInput(format!(
+                "training trajectory {idx}: masked writeback requires a non-empty prompt"
+            )));
+        }
+        let seq_len = traj
+            .prompt_ids
+            .len()
+            .checked_add(traj.response_ids.len())
+            .ok_or_else(|| {
+                OpdError::InvalidInput(format!(
+                    "training trajectory {idx}: prompt + response length overflow"
+                ))
+            })?;
+        if seq_len > i32::MAX as usize {
+            return Err(OpdError::InvalidInput(format!(
+                "training trajectory {idx}: length {seq_len} exceeds i32::MAX position indices"
+            )));
+        }
+        for (position, (&token, &mask)) in traj
+            .response_ids
+            .iter()
+            .zip(&traj.response_mask)
+            .enumerate()
+        {
+            if mask == 1 && token as usize >= vocab {
+                return Err(OpdError::InvalidInput(format!(
+                    "training trajectory {idx}: masked target token {token} at response index {position} exceeds vocab={vocab}"
+                )));
+            }
+        }
+        if needs_behavior {
+            let behavior = traj.behavior_logprobs.as_deref().ok_or_else(|| {
+                OpdError::InvalidInput(format!(
+                    "training trajectory {idx}: ratio-weighted update requires generation-time behavior_logprobs sidecar"
+                ))
+            })?;
+            let targets = masked_target_count(traj);
+            if behavior.len() != targets {
+                return Err(OpdError::InvalidInput(format!(
+                    "training trajectory {idx}: behavior_logprobs len {} != masked token count {targets}",
+                    behavior.len()
+                )));
+            }
+            if let Some(position) = behavior.iter().position(|value| !value.is_finite()) {
+                return Err(OpdError::InvalidInput(format!(
+                    "training trajectory {idx}: behavior_logprobs[{position}] is not finite ({})",
+                    behavior[position]
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Reward-centered advantage per trajectory: `A_i = r_i − mean(scope)`,
@@ -642,21 +702,6 @@ fn over_max_seq(traj: &ScoredTrajectory) -> bool {
     cap != 0 && traj.prompt_ids.len() + traj.response_ids.len() > cap
 }
 
-/// H20-96GB VRAM wall: writeback backward OOMs at seq≈30K even with offload +
-/// trims (see `runtime_flags::max_update_seq`). Skip-with-warn keeps the round
-/// alive instead of killing the whole run mid-group.
-fn skip_over_max_seq(traj: &ScoredTrajectory) -> bool {
-    let skip = over_max_seq(traj);
-    if skip {
-        let seq = traj.prompt_ids.len() + traj.response_ids.len();
-        eprintln!(
-            "[update] SKIP trajectory: seq {seq} > max_update_seq {} (VRAM wall)",
-            crate::runtime_flags::max_update_seq()
-        );
-    }
-    skip
-}
-
 /// Masked-CE loop over the surviving trajectories (`ratio == None`), mean loss.
 #[allow(clippy::too_many_arguments)]
 fn update_ce<O: Optimizer>(
@@ -673,9 +718,6 @@ fn update_ce<O: Optimizer>(
     let mut tokens = 0usize;
     let mut trained = 0usize;
     for traj in survivors {
-        if skip_over_max_seq(traj) {
-            continue;
-        }
         // Dispatch (not `masked_writeback_step(Ce)` directly) so the default
         // path stays byte-identical, honoring `--writeback-frozen-prompt-kv`.
         loss_sum += masked_writeback_ce_step_dispatch(
@@ -717,8 +759,7 @@ mod tests {
             response_ids: vec![2],
             response_mask: vec![1],
             reward,
-            rollout_logprobs: None,
-            gen_logprobs: None,
+            behavior_logprobs: None,
             group_id,
             truncated: false,
         }
@@ -736,12 +777,12 @@ mod tests {
             (UpdatePreset::gspo(), true, true),
             (UpdatePreset::cispo(), true, true),
         ];
-        for (preset, keep_failing, rollout_logprobs) in cases {
+        for (preset, keep_failing, behavior_logprobs) in cases {
             assert_eq!(
                 preset.needs(),
                 RolloutNeeds {
                     keep_failing,
-                    rollout_logprobs
+                    behavior_logprobs
                 },
                 "{preset:?}"
             );
@@ -795,25 +836,119 @@ mod tests {
     }
 
     #[test]
-    fn staleness_version_tag_and_sidecar_denominator() {
-        // Group launched at policy version v, trained at v+1 → staleness 1.
-        let (behavior_version, policy_version) = (3u64, 4u64);
-        let staleness = policy_version - behavior_version;
-        assert_eq!(staleness, 1);
-
-        // Stale: the sidecar becomes the ratio denominator; the trajectory
-        // without sidecar coverage is dropped (never trained at ratio ≈ 1).
-        let mut batch = vec![traj(1.0, 0), traj(0.0, 0)];
-        batch[0].gen_logprobs = Some(vec![-0.25]);
-        assert_eq!(apply_staleness_denominator(&mut batch, staleness), 1);
-        assert_eq!(batch.len(), 1);
-        assert_eq!(batch[0].rollout_logprobs.as_deref(), Some(&[-0.25f32][..]));
-
-        // On-policy (staleness 0): untouched — the V0 recompute stays the
-        // denominator even when a sidecar is absent.
+    fn behavior_sidecars_fail_closed() {
         let mut batch = vec![traj(1.0, 0)];
-        assert_eq!(apply_staleness_denominator(&mut batch, 0), 0);
-        assert!(batch[0].rollout_logprobs.is_none());
+        let err = UpdatePreset::grpo().preflight(&batch, 100, 1).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("requires generation-time behavior_logprobs")
+        );
+
+        batch[0].behavior_logprobs = Some(vec![f32::NAN]);
+        let err = UpdatePreset::grpo().preflight(&batch, 100, 1).unwrap_err();
+        assert!(err.to_string().contains("is not finite"));
+
+        batch[0].behavior_logprobs = Some(vec![]);
+        let err = UpdatePreset::grpo().preflight(&batch, 100, 1).unwrap_err();
+        assert!(err.to_string().contains("masked token count 1"));
+    }
+
+    #[test]
+    fn trajectory_structure_accepts_mixed_mask_and_rejects_mismatch() {
+        let mut batch = vec![traj(1.0, 0)];
+        batch[0].response_ids = vec![2, 3];
+        batch[0].response_mask = vec![1, 0];
+        assert!(validate_trajectory_structure(&batch).is_ok());
+
+        batch[0].response_mask.pop();
+        let err = validate_trajectory_structure(&batch).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("response_ids len 2 != response_mask len 1")
+        );
+
+        batch[0].response_mask = vec![1, 2];
+        let err = validate_trajectory_structure(&batch).unwrap_err();
+        assert!(err.to_string().contains("expected 0 or 1"));
+    }
+
+    #[test]
+    fn dapo_filtered_malformed_sidecars_do_not_block() {
+        let mut batch = vec![traj(1.0, 0), traj(0.0, 0), traj(1.0, 1), traj(1.0, 1)];
+        batch[0].truncated = true;
+        batch[1].behavior_logprobs = Some(vec![-0.5]);
+        batch[2].behavior_logprobs = Some(vec![f32::NAN]);
+        UpdatePreset::dapo().preflight(&batch, 100, 1).unwrap();
+    }
+
+    #[test]
+    fn preflight_rejects_deterministic_training_inputs() {
+        for reward in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut batch = vec![traj(reward, 0)];
+            batch[0].behavior_logprobs = Some(vec![-0.5]);
+            assert!(
+                UpdatePreset::grpo()
+                    .preflight(&batch, 100, 1)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("reward must be finite")
+            );
+        }
+
+        let mut batch = vec![traj(1.0, 0)];
+        batch[0].behavior_logprobs = Some(vec![-0.5]);
+        batch[0].prompt_ids.clear();
+        assert!(
+            UpdatePreset::grpo()
+                .preflight(&batch, 100, 1)
+                .unwrap_err()
+                .to_string()
+                .contains("non-empty prompt")
+        );
+
+        let mut batch = vec![traj(1.0, 0)];
+        batch[0].behavior_logprobs = Some(vec![-0.5]);
+        batch[0].response_ids[0] = 100;
+        assert!(
+            UpdatePreset::grpo()
+                .preflight(&batch, 100, 1)
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds vocab=100")
+        );
+        assert!(
+            UpdatePreset::grpo()
+                .preflight(&batch, 101, 0)
+                .unwrap_err()
+                .to_string()
+                .contains("window_size must be > 0")
+        );
+    }
+
+    #[test]
+    fn preflight_validates_second_training_trajectory_before_execution() {
+        let mut batch = vec![traj(1.0, 0), traj(0.0, 0)];
+        batch[0].behavior_logprobs = Some(vec![-0.5]);
+        batch[1].behavior_logprobs = Some(vec![f32::NAN]);
+        let err = UpdatePreset::grpo().preflight(&batch, 100, 1).unwrap_err();
+        assert!(err.to_string().contains("training trajectory 1"));
+    }
+
+    #[test]
+    fn skipped_trajectories_do_not_require_valid_sidecars() {
+        let mut batch = vec![traj(1.0, 0), traj(0.0, 0), traj(1.0, 1), traj(1.0, 1)];
+        batch[0].truncated = true;
+        batch[1].behavior_logprobs = Some(vec![-0.5]);
+        batch[2].behavior_logprobs = Some(vec![f32::NAN]);
+        batch[3].response_mask[0] = 0;
+        UpdatePreset::dapo().preflight(&batch, 100, 1).unwrap();
+
+        let mut zero_target = traj(1.0, 0);
+        zero_target.response_mask[0] = 0;
+        zero_target.behavior_logprobs = Some(vec![f32::NAN]);
+        UpdatePreset::grpo()
+            .preflight(&[zero_target], 100, 1)
+            .unwrap();
     }
 
     #[test]
