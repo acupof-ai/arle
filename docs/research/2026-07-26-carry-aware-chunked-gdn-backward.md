@@ -8,9 +8,10 @@
 
 OPD masked-writeback 的反传掉进一条 **host 全序列 recompute**,它一次性物化
 `state_history`(每 token 一份完整 K⊗V 外积态,≈86 GB @ seq=40960)。而
-**device 反传早就 chunk 化了**(峰值与 seq 无关),只是它吃不到 carry 场景的输入。
-补齐 device forward 的 carry seed,让 OPD 路径复用已有的 chunked device 反传,
-删掉 host recompute —— 峰值 `O(seq·KV)` → `O(seq/64·KV)`,约 **64× 降**。
+**device 反传早就 chunk 化了**,只是它吃不到 carry 场景的输入。
+补齐 device forward 的 carry seed,让 OPD 路径复用已有的 chunked device 反传。
+**实测(§4.3):可训墙 24576→40960(1.67×),非理论算术的 64× 显存降**——forward 保留态
+才是新墙。256K 仍靠 LA-chunk / 序列并行。
 
 ## 2. 背景:GDN 反传的两个世界
 
@@ -138,12 +139,27 @@ carry 不再落到它们。
 
 ### 4.3 数字
 
-| 项 | host recompute(现状) | carry-seeded chunked(方案) |
+**理论(仅 backward scratch 项)**:
+
+| 项 | host recompute | carry-seeded chunked |
 |---|---|---|
 | 主 buffer | `state_history` = seq·KV | `chunk_state` = (seq/64)·KV |
-| @ seq=40960, 32h, 128×128 | ≈86 GB | ≈1.34 GB |
 | 反传 scratch 峰值 | O(seq·KV) | O(wave·64·KV),wave=8,与 seq 无关 |
-| 可训 seq(单卡 H20) | 32768(offload 后) | ~256K 量级 |
+
+**实测(2026-07-26 H20 pod,27B-FP8,masked writeback,`--writeback-offload true`)——理论 ≠ 实际,如实记录**:
+
+| seq | rc | smi 峰值 | post_forward | post_backward | 结论 |
+|---|---|---|---|---|---|
+| 24576 | 0 | 70603 MiB | 59403 | 70603 | 完成 |
+| **40960** | **0** | **93163 MiB** | 75915 | 93163 | **原 OOM(97GB/409MiB free)→ 完成** |
+| 65536 | 1 | 79211 MiB | — | — | forward group 3/64 `alloc_zeros failed` |
+
+**"≈86GB→1.34GB"是错误算术,撤回**:它只算了 backward 的 `state_history` 一项,忽略了
+forward 保留的 checkpoint 激活(40960 时 forward 就占 75.9GB)。真实收益是**墙从
+24576→40960**(1.67× 可训长度),不是 64× 显存降。40960 backward 峰值 93.2GB 里,主体是
+forward 保留态 + chunked backward 的 wave scratch,不是被消除的 `state_history`。这与
+companion win 的结论一致:**256K 靠 LA-chunk / 序列并行,不靠这个**。65536 是新的
+forward-alloc 墙(比旧墙远一格)。可训 seq(单卡 H20):**24576 → 40960**。
 
 ## 5. 三条路对比(为什么先做这条)
 
