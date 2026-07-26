@@ -1024,6 +1024,11 @@ impl Qwen35Model {
         let first_row = usize::from(!cfg.next_token_heads);
         let mut drafts = Vec::with_capacity(block);
         let mut prev = anchor;
+        // Without a markov head every row's logits are final before the scan,
+        // so one launch replaces `block` sync-per-row argmax round-trips.
+        let block_argmax = (!sampling && head.markov.is_none())
+            .then(|| self.argmax_rows(df.logits.get(ctx, vocab, block)?))
+            .transpose()?;
         for row in first_row..block {
             // Corrected logits row: base + markov bias when the head is present.
             let (src, src_row) = if let Some(m) = &head.markov {
@@ -1090,6 +1095,8 @@ impl Qwen35Model {
                     as u32;
                 df.q_rows += 1;
                 tok
+            } else if let Some(am) = &block_argmax {
+                am[src_row]
             } else {
                 argmax_hs_row(ctx, src, src_row, scratch.argmax.get(ctx, 1)?)?
             };
@@ -1178,12 +1185,52 @@ impl Qwen35Model {
         self.spec_draft_tokens = n;
     }
 
+    /// Per-row argmax over a whole verify output in one launch + one D2H. The
+    /// accept scan is host arithmetic once this lands, so a batched tick costs
+    /// one sync instead of one per chain row per slot.
+    pub(crate) fn argmax_rows(&self, logits: &HiddenStates) -> Result<Vec<u32>> {
+        let ctx = &self.ctx;
+        let (rows, vocab) = (logits.seq_len, logits.hidden_dim);
+        let mut ids_dev = ctx
+            .stream
+            .alloc_zeros::<i32>(rows)
+            .map_err(|e| anyhow!("dspark argmax ids alloc failed: {e}"))?;
+        {
+            let (l_ptr, _gl) = logits.data.device_ptr(&ctx.stream);
+            let (o_ptr, _go) = ids_dev.device_ptr_mut(&ctx.stream);
+            // SAFETY: logits [rows, vocab] bf16; ids [rows] sized above.
+            unsafe {
+                ffi::argmax_batch_cuda(
+                    l_ptr as *const ffi::Half,
+                    o_ptr as *mut i32,
+                    rows as i32,
+                    vocab as i32,
+                    ctx.stream.cu_stream(),
+                )
+                .result()?;
+            }
+        }
+        let ids: Vec<i32> = ctx
+            .stream
+            .clone_dtoh(&ids_dev)
+            .map_err(|e| anyhow!("D2H dspark argmax failed: {e}"))?;
+        ids.into_iter()
+            .map(|id| {
+                ensure!((0..vocab as i32).contains(&id), "dspark argmax id {id} oob");
+                Ok(id as u32)
+            })
+            .collect()
+    }
+
     /// Accept scan + trunk rollback over a DSpark verify (`spec_step` steps 4-5
     /// with the draft source swapped out). This chain occupies `logits` rows
     /// `[row0, row0 + chain_len)` of the (possibly batched) verify output; the
     /// pre-verify trunk snapshot must already be in `spec`.
     /// Returns `(emitted, bonus, k)`; the caller crops the paged pool to
     /// `start_pos + k + 1` when `k + 1 < chain.len()`.
+    /// `argmax` is the whole verify output's per-row argmax (see
+    /// [`Self::argmax_rows`]) — reading it row by row on device would drain the
+    /// pipeline once per chain row per slot.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn dspark_accept_commit(
         &self,
@@ -1191,16 +1238,20 @@ impl Qwen35Model {
         spec: &mut Qwen35SpecSlotState,
         ws: &mut Qwen35Workspace,
         chain: &[u32],
-        logits: &HiddenStates,
+        argmax: &[u32],
         row0: usize,
         start_pos: usize,
     ) -> Result<(Vec<u32>, u32, usize)> {
         let depth = chain.len() - 1;
+        ensure!(
+            row0 + chain.len() <= argmax.len(),
+            "dspark accept: chain rows outside the verify argmax"
+        );
         // Longest prefix where each draft equals the trunk argmax at its row.
         let mut k = 0usize;
         let bonus;
         loop {
-            let am = argmax_hs_row(&self.ctx, logits, row0 + k, &mut spec.argmax_scratch)?;
+            let am = argmax[row0 + k];
             if k < depth && am == chain[k + 1] {
                 k += 1;
             } else {
