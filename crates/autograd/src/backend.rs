@@ -390,6 +390,9 @@ pub struct LinearAttentionDeviceBackwardArgs<'a> {
     pub a_inv: &'a DeviceHandle,
     pub chunk_state: &'a DeviceHandle,
     pub raw_output: &'a DeviceHandle,
+    // OPD conv carry (None = default). Feeds the conv1d backward boundary taps'
+    // grad_weight; the recurrent state carry lives in chunk_state[0], not here.
+    pub initial_conv_window: Option<&'a DeviceHandle>,
 }
 
 #[derive(Debug, Clone)]

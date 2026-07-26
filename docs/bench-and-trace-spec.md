@@ -75,12 +75,35 @@ barely exercised; a treatment can post a large short-prompt delta and be a wash
 or a regression on the real workload. Do not publish a short-prompt number and
 call it a serving result.
 
+**The workload is multi-turn, and prefix reuse is part of the machine under
+test.** A real agent's turn k+1 replays turn k's transcript verbatim and appends
+to it, so the served prefill is the ~1k-token delta, not the whole context —
+only turn 0 of a session pays full price. A dataset of one-shot unique contexts
+measures a permanent cache miss and reports a prefill-bound machine that nobody
+runs. `gen_bench_prompts.py` emits `sessions × turns` prompts where turn k's
+text is a strict prefix of turn k+1's, laid out turn-major so the in-flight set
+at concurrency C is C distinct sessions and every reused prefix belongs to a
+turn that already completed.
+
+Shape defaults come from the coding-agent trace medians in TraceLab
+(arXiv:2606.30560; 4,265 real Claude Code / Codex sessions, 350k LLM steps):
+**119K prefix tokens, 875 append tokens, 214 output tokens per step, 8.8 steps
+per request, 95.7% global prefix-cache hit rate.** Deviating is allowed and
+sometimes forced (KV budget), but the deviation is a stated parameter of the
+run, not a silent default.
+
 Rules:
 
-- `count` ≥ the highest benched concurrency, so no request reuses a context.
-- Every context carries a unique header and per-round indices. Report the
-  prefix hit rate; a high one on this dataset means the harness is broken, not
-  that the cache is good.
+- `sessions` ≥ the highest benched concurrency, and
+  `--requests-per-concurrency` a multiple of `sessions` — otherwise the tail
+  turns never run and the point silently measures cold prefill only.
+- Sessions are mutually unique (header + per-round indices), so reuse comes
+  only from a session's own history. Report `prefix_hits` / `hit_tokens` from
+  `/v1/stats` and compare against the 95.7% reference. A cold turn 1 means
+  reuse is broken (eviction, KV pressure, or a cache-defeating treatment) —
+  that is a finding, not a number to average through.
+- Report the cold and warm slices separately. One blended tok/s hides which of
+  the two a treatment moved, and their ratio depends entirely on `turns`.
 - **Confirm the length.** The generator estimates tokens at 3.6 chars/token —
   a ratio, not a tokenizer. Record `usage.prompt_tokens` p50 from the run and
   state it next to the target. Outside ±10%, re-generate with a corrected
