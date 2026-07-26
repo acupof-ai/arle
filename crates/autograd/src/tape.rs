@@ -797,7 +797,6 @@ impl Tape {
             }
             let mut inner_tape = Tape::new();
             let replay_output = checkpoint_fn(store, &mut inner_tape, &entry.input_ids)?;
-            trim_after_checkpoint_replay(store)?;
             let weighted = ops::mul(replay_output, output_grad_id, store, &mut inner_tape)?;
             let loss = ops::sum(weighted, store, &mut inner_tape)?;
             let inner_grads = inner_tape.backward_collect_targets_only(
@@ -830,7 +829,6 @@ impl Tape {
                 {
                     store.offload_checkpoint_to_host(hidden_id)?;
                 }
-                trim_after_checkpoint_replay(store)?;
                 if let (Some(outer), Some(mut inner)) = (profile, inner_profile) {
                     // The inner wall already sits inside this entry's own
                     // Checkpoint envelope — merge the attribution rows only.
@@ -841,7 +839,6 @@ impl Tape {
             }
             Err(err) => {
                 let _ = store.free_new_except(&live_before, &HashSet::new());
-                let _ = trim_after_checkpoint_replay(store);
                 Err(err)
             }
         }
@@ -857,13 +854,6 @@ fn backward_vram_profile_enabled() -> bool {
         std::env::var("ARLE_OPD_BACKWARD_VRAM_PROFILE").as_deref(),
         Ok(value) if !matches!(value, "0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF")
     )
-}
-
-fn trim_after_checkpoint_replay(store: &TensorStore) -> Result<()> {
-    if crate::runtime_flags::trim_after_checkpoint_replay() {
-        store.backend().trim_memory_pool()?;
-    }
-    Ok(())
 }
 
 fn log_backward_vram_profile(

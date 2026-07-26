@@ -24,8 +24,6 @@ impl TapePrecision {
 pub struct AutogradRuntimeFlags {
     /// Min tensor bytes for checkpoint host offload (`--checkpoint-offload-min-bytes`).
     pub checkpoint_offload_min_bytes: usize,
-    /// Trim the device pool after each checkpoint replay (`--trim-after-checkpoint-replay`).
-    pub trim_after_checkpoint_replay: bool,
     /// Legacy full-matmul LoRA linear backward A/B arm (`--legacy-lora-linear-bwd`).
     pub legacy_lora_linear_bwd: bool,
     /// Row tile for the LoRA linear backward (`--lora-linear-bwd-tile-rows`).
@@ -48,7 +46,6 @@ impl Default for AutogradRuntimeFlags {
     fn default() -> Self {
         Self {
             checkpoint_offload_min_bytes: 2 << 20,
-            trim_after_checkpoint_replay: false,
             legacy_lora_linear_bwd: false,
             lora_linear_bwd_tile_rows: 1024,
             legacy_sdpa_bwd: false,
@@ -62,7 +59,6 @@ impl Default for AutogradRuntimeFlags {
 }
 
 static CHECKPOINT_OFFLOAD_MIN_BYTES: AtomicUsize = AtomicUsize::new(2 << 20);
-static TRIM_AFTER_CHECKPOINT_REPLAY: AtomicBool = AtomicBool::new(false);
 static LEGACY_LORA_LINEAR_BWD: AtomicBool = AtomicBool::new(false);
 static LORA_LINEAR_BWD_TILE_ROWS: AtomicUsize = AtomicUsize::new(1024);
 static LEGACY_SDPA_BWD: AtomicBool = AtomicBool::new(false);
@@ -74,7 +70,6 @@ static TAPE_PRECISION: AtomicU8 = AtomicU8::new(0);
 
 pub fn apply_runtime_flags(f: &AutogradRuntimeFlags) {
     CHECKPOINT_OFFLOAD_MIN_BYTES.store(f.checkpoint_offload_min_bytes, Relaxed);
-    TRIM_AFTER_CHECKPOINT_REPLAY.store(f.trim_after_checkpoint_replay, Relaxed);
     LEGACY_LORA_LINEAR_BWD.store(f.legacy_lora_linear_bwd, Relaxed);
     LORA_LINEAR_BWD_TILE_ROWS.store(f.lora_linear_bwd_tile_rows.max(1), Relaxed);
     LEGACY_SDPA_BWD.store(f.legacy_sdpa_bwd, Relaxed);
@@ -87,9 +82,6 @@ pub fn apply_runtime_flags(f: &AutogradRuntimeFlags) {
 
 pub(crate) fn checkpoint_offload_min_bytes() -> usize {
     CHECKPOINT_OFFLOAD_MIN_BYTES.load(Relaxed)
-}
-pub(crate) fn trim_after_checkpoint_replay() -> bool {
-    TRIM_AFTER_CHECKPOINT_REPLAY.load(Relaxed)
 }
 pub(crate) fn legacy_lora_linear_bwd() -> bool {
     LEGACY_LORA_LINEAR_BWD.load(Relaxed)
