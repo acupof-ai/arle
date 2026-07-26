@@ -1084,18 +1084,6 @@ pub(crate) struct OpdRuntimeArgs {
     #[arg(long, default_value_t = 2 << 20, value_name = "BYTES")]
     pub(crate) checkpoint_offload_min_bytes: usize,
 
-    /// Trim the device memory pool before backward.
-    #[arg(long, default_value_t = false, action = clap::ArgAction::Set, value_name = "BOOL")]
-    pub(crate) trim_before_backward: bool,
-
-    /// Trim the device memory pool after writeback.
-    #[arg(long, default_value_t = false, action = clap::ArgAction::Set, value_name = "BOOL")]
-    pub(crate) trim_after_writeback: bool,
-
-    /// Trim the device memory pool after each checkpoint replay.
-    #[arg(long, default_value_t = false, action = clap::ArgAction::Set, value_name = "BOOL")]
-    pub(crate) trim_after_checkpoint_replay: bool,
-
     /// Skip update records longer than this (0 = unlimited; H20-96GB backward
     /// OOMs at seq≈30K).
     #[arg(long, default_value_t = 23_000, value_name = "TOKENS")]
@@ -1201,15 +1189,12 @@ impl OpdRuntimeArgs {
                 OpdEngineOffloadArg::Teacher => train::opd::EngineOffloadMode::Teacher,
             },
             gradient_checkpointing: self.gradient_checkpointing,
-            trim_before_backward: self.trim_before_backward,
-            trim_after_writeback: self.trim_after_writeback,
             writeback_frozen_prompt_kv: self.writeback_frozen_prompt_kv,
             rollout_retain_interval: self.rollout_retain_interval,
             rollout_progress_interval: self.rollout_progress_interval,
             max_update_seq: self.max_update_seq,
             autograd: autograd::AutogradRuntimeFlags {
                 checkpoint_offload_min_bytes: self.checkpoint_offload_min_bytes,
-                trim_after_checkpoint_replay: self.trim_after_checkpoint_replay,
                 legacy_lora_linear_bwd: self.legacy_lora_linear_bwd,
                 lora_linear_bwd_tile_rows: self.lora_linear_bwd_tile_rows,
                 legacy_sdpa_bwd: self.legacy_sdpa_bwd,
