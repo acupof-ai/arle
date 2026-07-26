@@ -1,0 +1,21 @@
+docs/experience/wins/2026-07-26-dspark-batched-verify-varlen-forward.md
+  s_cb6ca280b792fe::t_0062424fec78e5 53-89,98-102
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "93b4e2c502ecacb32175ea1b05d3f3e326e6bbee",
+  "prompts": {},
+  "sessions": {
+    "s_cb6ca280b792fe": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "1a00414d-2267-47d4-813e-3c9e7cb88d53",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
