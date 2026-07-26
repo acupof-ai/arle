@@ -23,6 +23,14 @@ Progress spine. Entry classes recorded here the day they land: phase exits,
 default flips, and accept-or-reject verdicts (AGENTS.md §Docs lifecycle &
 progress spine).
 
+- **AMEND — DSpark block size is a lever at concurrency, not only an
+  instrument** (2026-07-26;
+  bench: [2026-07-26-dspark-block-size-is-a-lever-at-concurrency](docs/experience/wins/2026-07-26-dspark-block-size-is-a-lever-at-concurrency.md)).
+  The 2026-07-25 verdict ("keep the default at 16, the flag is not a lever") was
+  measured at c=1 and generalized past its regime. At c=8, block 8 beats 16 by
+  6.8% (3/3 trials) for the same k_med = 2 accepted drafts: verify 62.1 → 39.1
+  ms, tick −30%. No default flip — that needs the long-agent re-measure.
+
 - **ACCEPT — one ragged-window launch per DSpark draft layer** (2026-07-26,
   `9a27eda4b`;
   bench: [2026-07-26-dspark-ragged-window-draft-attention](docs/experience/wins/2026-07-26-dspark-ragged-window-draft-attention.md)).
