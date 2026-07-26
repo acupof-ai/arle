@@ -1,0 +1,23 @@
+scripts/pod.sh
+  s_1eb426185c4384::t_64c2d2d156dfb0 49
+scripts/tests/test_pod_flow.sh
+  s_1eb426185c4384::t_378f6e4feac734 10
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "4b2aa55f51458dd4af596d76620c66894738938b",
+  "prompts": {},
+  "sessions": {
+    "s_1eb426185c4384": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6409c3ad-86e8-436d-a92c-172f853cc0a0",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
