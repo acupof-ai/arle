@@ -2021,6 +2021,12 @@ impl Qwen35CudaExecutor {
         let ds = dspark.as_mut().expect("dspark");
         // The tap fc projection is batch-wide; only the K/V append is per slot.
         model.dspark_tap_features(&ds.head, &mut ds.taps, &mut ds.scratch)?;
+        // One argmax over every chain's rows: the greedy accept scan is host
+        // arithmetic from here, so the loop below adds no device syncs.
+        let argmax = match decode_rows.iter().any(|r| r.params.is_greedy()) {
+            true => model.argmax_rows(&logits)?,
+            false => Vec::new(),
+        };
 
         // 5. Per row: accept + rollback (paged KV self-heals under the crop),
         //    extend the draft ctx, stage the bonus as the next anchor.
@@ -2034,7 +2040,7 @@ impl Qwen35CudaExecutor {
                     spec,
                     workspace,
                     &c.chain,
-                    &logits,
+                    &argmax,
                     c.row0,
                     c.start,
                 )?;
