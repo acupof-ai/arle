@@ -1,0 +1,37 @@
+crates/autograd/src/backend.rs
+  s_cd9a6a56daabe3::t_7f60b6657fa067 455-462
+crates/autograd/src/backend_cuda.rs
+  s_cd9a6a56daabe3::t_f893cb5f3e6b60 1035-1053
+crates/cuda-kernels/src/tensor.rs
+  s_089e26e9e41120::t_597750d06248f5 482-510
+crates/train/src/opd.rs
+  s_cd9a6a56daabe3::t_f2954f623ed504 2907-2909,2928-2934,2950-2954,2956,2960,2982,2989-2990,2996-2998
+docs/experience/wins/2026-07-26-mempool-hoard-ledger.md
+  s_089e26e9e41120::t_dd9b5ea6ef5cc9 1-36
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "84d24c65c1e742af78483f38f7e8ec87281e6b30",
+  "prompts": {},
+  "sessions": {
+    "s_089e26e9e41120": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "93e66a8f-c20a-4ba9-96f2-283f6d98cbb1",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_cd9a6a56daabe3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "bf8ec25a-c05e-46a4-b093-1e67694ece0c",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
