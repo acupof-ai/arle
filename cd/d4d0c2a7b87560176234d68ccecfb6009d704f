@@ -1,0 +1,23 @@
+README.md
+  s_9614b124f21878::t_55421366e4aa74 161-194,197
+docs/research/2026-07-26-training-architecture-algorithm-kernel-audit.md
+  s_9614b124f21878::t_7f26aaf14a9ef4 1-858
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "cdd4d0c2a7b87560176234d68ccecfb6009d704f",
+  "prompts": {},
+  "sessions": {
+    "s_9614b124f21878": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ea4ac315-f42c-47bb-b401-eb358e1fbd3b",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
