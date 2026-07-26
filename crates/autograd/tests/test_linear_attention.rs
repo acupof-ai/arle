@@ -348,10 +348,31 @@ fn compare_cpu_cuda_device_linear_attention(
     label: &str,
     rel_tol: f32,
 ) -> Result<()> {
+    compare_cpu_cuda_device_linear_attention_carry(params, fixture, label, rel_tol, None)
+}
+
+/// CPU-vs-CUDA grad compare, optionally seeding an OPD frozen-prompt carry
+/// `(initial_state, initial_conv_window)`. With a carry the CUDA path exercises
+/// the tranche-2 device carry route (host CPU stays the oracle).
+#[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
+fn compare_cpu_cuda_device_linear_attention_carry(
+    params: LinearAttentionParams,
+    fixture: &LinearAttentionFixture,
+    label: &str,
+    rel_tol: f32,
+    carry: Option<(&[f32], &[f32])>,
+) -> Result<()> {
     const ABS_TOL: f32 = 1.0e-3;
     let qkv_shape = [params.batch, params.seq_len, qkv_dim(params)];
     let z_shape = [params.batch, params.seq_len, z_dim(params)];
     let head_shape = [params.batch, params.seq_len, params.num_value_heads];
+    let state_shape = [
+        params.batch,
+        params.num_value_heads,
+        params.key_dim,
+        params.value_dim,
+    ];
+    let conv_win_shape = [params.batch, params.conv_kernel - 1, qkv_dim(params)];
 
     let nvrtc_started = Instant::now();
     let cuda_backend = CudaBackend::new(0)
@@ -384,19 +405,39 @@ fn compare_cpu_cuda_device_linear_attention(
             .expect("cpu tensor exists")
             .requires_grad = true;
     }
-    let cpu_out = linear_attention_core(
-        cpu_qkv,
-        cpu_z,
-        cpu_b,
-        cpu_a,
-        cpu_conv,
-        cpu_dt,
-        cpu_a_log,
-        cpu_norm,
-        params,
-        &mut cpu_store,
-        &mut cpu_tape,
-    )?;
+    let cpu_out = if let Some((state, conv)) = carry {
+        let is = cpu_store.from_slice(state, &state_shape)?;
+        let ic = cpu_store.from_slice(conv, &conv_win_shape)?;
+        linear_attention_core_with_carry_taped(
+            cpu_qkv,
+            cpu_z,
+            cpu_b,
+            cpu_a,
+            cpu_conv,
+            cpu_dt,
+            cpu_a_log,
+            cpu_norm,
+            params,
+            Some(is),
+            Some(ic),
+            &mut cpu_store,
+            &mut cpu_tape,
+        )?
+    } else {
+        linear_attention_core(
+            cpu_qkv,
+            cpu_z,
+            cpu_b,
+            cpu_a,
+            cpu_conv,
+            cpu_dt,
+            cpu_a_log,
+            cpu_norm,
+            params,
+            &mut cpu_store,
+            &mut cpu_tape,
+        )?
+    };
     let cpu_weighted = mul(cpu_out, cpu_coeff, &mut cpu_store, &mut cpu_tape)?;
     let cpu_loss = sum(cpu_weighted, &mut cpu_store, &mut cpu_tape)?;
     let cpu_grads = cpu_tape.backward(cpu_loss, &mut cpu_store)?;
@@ -448,19 +489,39 @@ fn compare_cpu_cuda_device_linear_attention(
             .requires_grad = true;
     }
     let cuda_forward_started = Instant::now();
-    let cuda_out = linear_attention_core(
-        cuda_qkv,
-        cuda_z,
-        cuda_b,
-        cuda_a,
-        cuda_conv,
-        cuda_dt,
-        cuda_a_log,
-        cuda_norm,
-        params,
-        &mut cuda_store,
-        &mut cuda_tape,
-    )?;
+    let cuda_out = if let Some((state, conv)) = carry {
+        let is = cuda_store.from_slice(state, &state_shape)?;
+        let ic = cuda_store.from_slice(conv, &conv_win_shape)?;
+        linear_attention_core_with_carry_taped(
+            cuda_qkv,
+            cuda_z,
+            cuda_b,
+            cuda_a,
+            cuda_conv,
+            cuda_dt,
+            cuda_a_log,
+            cuda_norm,
+            params,
+            Some(is),
+            Some(ic),
+            &mut cuda_store,
+            &mut cuda_tape,
+        )?
+    } else {
+        linear_attention_core(
+            cuda_qkv,
+            cuda_z,
+            cuda_b,
+            cuda_a,
+            cuda_conv,
+            cuda_dt,
+            cuda_a_log,
+            cuda_norm,
+            params,
+            &mut cuda_store,
+            &mut cuda_tape,
+        )?
+    };
     cuda_store.backend().device_synchronize()?;
     eprintln!(
         "{label} stage=cuda_forward seconds={:.3}",
@@ -1419,6 +1480,38 @@ fn cuda_linear_attention_chunk_parallel_grad_matches_cpu() -> Result<()> {
         &fixture,
         "cuda chunk-parallel linear_attention",
         2.0e-2,
+    )
+}
+
+#[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
+#[test]
+fn cuda_linear_attention_carry_grad_matches_cpu() -> Result<()> {
+    // Tranche-2 device carry route: seeded carry → device chunked backward vs CPU host oracle.
+    let params = LinearAttentionParams {
+        batch: 1,
+        seq_len: 200,
+        num_key_heads: 2,
+        num_value_heads: 4,
+        key_dim: 128,
+        value_dim: 128,
+        conv_kernel: 4,
+        eps: 1.0e-5,
+    };
+    let fixture = LinearAttentionFixture::new(params);
+    let state_len = params.batch * params.num_value_heads * params.key_dim * params.value_dim;
+    let conv_len = params.batch * (params.conv_kernel - 1) * qkv_dim(params);
+    let initial_state: Vec<f32> = (0..state_len)
+        .map(|i| (i as f32 * 0.09).sin() * 0.2)
+        .collect();
+    let initial_conv: Vec<f32> = (0..conv_len)
+        .map(|i| (i as f32 * 0.15).cos() * 0.18)
+        .collect();
+    compare_cpu_cuda_device_linear_attention_carry(
+        params,
+        &fixture,
+        "cuda carry linear_attention",
+        2.0e-2,
+        Some((&initial_state, &initial_conv)),
     )
 }
 
