@@ -1032,6 +1032,25 @@ impl Backend for CudaBackend {
         self.mem_get_info().ok()
     }
 
+    #[cfg(not(feature = "no-cuda"))]
+    fn mem_pool_stats(&self) -> Option<(u64, u64)> {
+        // SAFETY: pool belongs to this backend's live context; each read writes
+        // one u64 through a valid pointer to the local.
+        unsafe {
+            let pool = result::device::get_mem_pool(self.stream.context().cu_device()).ok()?;
+            let read = |attr| -> Option<u64> {
+                let mut v: u64 = 0;
+                result::mem_pool::get_attribute(pool, attr, (&mut v as *mut u64).cast()).ok()?;
+                Some(v)
+            };
+            use cudarc::driver::sys::CUmemPool_attribute::*;
+            Some((
+                read(CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT)?,
+                read(CU_MEMPOOL_ATTR_USED_MEM_CURRENT)?,
+            ))
+        }
+    }
+
     fn upload(&self, host: &[f32], shape: &[usize]) -> Result<DeviceHandle> {
         #[cfg(feature = "no-cuda")]
         {
