@@ -479,35 +479,6 @@ impl DeviceContext {
         cudarc::driver::result::mem_get_info().map_err(|e| anyhow!("cuMemGetInfo failed: {e}"))
     }
 
-    /// Async-mempool `(reserved, used)` bytes: `reserved` = pages the pool holds
-    /// from the OS, `used` = pages backing live allocations. `reserved - used` is
-    /// the hoard — freed blocks the pool keeps for reuse, which `cuMemGetInfo`
-    /// reports as "used" and so can't distinguish from live tensors. Best-effort:
-    /// `None` on any driver error.
-    pub fn mem_pool_stats(&self) -> Option<(u64, u64)> {
-        self.ctx.bind_to_thread().ok()?;
-        // SAFETY: `cu_device()` is this context's live device; each read writes
-        // one u64 through a valid pointer to the local.
-        unsafe {
-            let pool = cudarc::driver::result::device::get_mem_pool(self.ctx.cu_device()).ok()?;
-            let read = |attr| -> Option<u64> {
-                let mut v: u64 = 0;
-                cudarc::driver::result::mem_pool::get_attribute(
-                    pool,
-                    attr,
-                    (&mut v as *mut u64).cast::<core::ffi::c_void>(),
-                )
-                .ok()?;
-                Some(v)
-            };
-            use cudarc::driver::sys::CUmemPool_attribute::*;
-            Some((
-                read(CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT)?,
-                read(CU_MEMPOOL_ATTR_USED_MEM_CURRENT)?,
-            ))
-        }
-    }
-
     /// Release unused blocks cached in the device's async memory pool back to
     /// the OS so `nvidia-smi` / `mem_info_bytes` reflect freed weight VRAM.
     ///
