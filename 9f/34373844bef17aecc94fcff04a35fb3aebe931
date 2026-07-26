@@ -1,0 +1,31 @@
+docs/agent-method.md
+  s_9c91b86ec3fb55::t_a293409d2e6926 86-88
+docs/bench-and-trace-spec.md
+  s_9c91b86ec3fb55::t_a4b19ddfccbef8 49,53,55-56,58,62-63,67-97,172-175
+docs/experience/wins/TEMPLATE-bench.md
+  s_9c91b86ec3fb55::t_ce709314db8c65 19,21-22,24,30
+scripts/bench_throughput.py
+  s_9c91b86ec3fb55::t_f44acd45f75f3c 207-211
+scripts/gen_bench_prompts.py
+  s_9c91b86ec3fb55::t_7688f54ad88f07 2,4,6-13,18-22,24,27-39,41-84,86,89-94,96,98-105,108-109
+scripts/run_dsv4_bench.sh
+  s_9c91b86ec3fb55::t_64bf7349508679 4,14,19,23-25,32,38-39
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "9f34373844bef17aecc94fcff04a35fb3aebe931",
+  "prompts": {},
+  "sessions": {
+    "s_9c91b86ec3fb55": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4779911a-69b7-49db-bc83-daf5a48d6ca3",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
