@@ -1,0 +1,21 @@
+docs/experience/wins/2026-07-26-dspark-markov-chain-self-speculation.md
+  s_9c91b86ec3fb55::t_c2a83e4cc502d9 42-52,71-77
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "d9c56bdc11ca792c0612bd5d22f47e1121dd8ee2",
+  "prompts": {},
+  "sessions": {
+    "s_9c91b86ec3fb55": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4779911a-69b7-49db-bc83-daf5a48d6ca3",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
