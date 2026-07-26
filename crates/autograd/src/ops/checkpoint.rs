@@ -154,6 +154,19 @@ where
             Ok(h)
         })?;
         li = end;
+        if trace_checkpoint_group_vram()
+            && let Some((free, total)) = store.backend().device_mem_info()
+        {
+            eprintln!(
+                "[ckpt-group-vram] after_group end={end}/{num_layers} used={}MiB free={}MiB",
+                (total - free) >> 20,
+                free >> 20,
+            );
+        }
     }
     Ok(hidden)
+}
+
+fn trace_checkpoint_group_vram() -> bool {
+    std::env::var("ARLE_OPD_VRAM_TRACE").is_ok_and(|v| v != "0" && v != "false")
 }
