@@ -2532,6 +2532,7 @@ fn task_key(label: Option<&str>) -> &str {
 /// least one masked target token. Imitating a failed fix (reward < 1.0) or a
 /// mask-less record is actively harmful, so both the preflight batch and the CE
 /// loop select on this identical predicate.
+#[cfg(feature = "cuda")]
 fn ce_trainable(record: &ReplayRecord) -> bool {
     record.reward >= 1.0 && record.response_mask.iter().any(|&mask| mask == 1)
 }
