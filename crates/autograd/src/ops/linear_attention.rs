@@ -493,14 +493,11 @@ pub fn linear_attention_core_with_carry(
 /// `initial_conv_window`, records `BackwardOp::LinearAttention` so grad flows
 /// into the 8 projection inputs exactly as `linear_attention_core` does. The
 /// carry inputs are CONSTANTS (the frozen prompt KV, `requires_grad = false`) —
-/// they are NOT in `input_ids`, so no grad flows into them. The backward
-/// (`linear_attention_backward`) re-seeds the SAME carry into its recompute via
-/// the two new `LinearAttentionCtx` fields, which is required for correct
-/// boundary grads.
+/// no grad flows into them.
 ///
-/// Host-only: the carry-aware device kernel is deferred to the pod increment, so
-/// this always takes the host recording branch (the gates run on the host
-/// backend). The default `linear_attention_core` device path is untouched.
+/// Tries the device forward first (seeds the carry into `chunk_state[0]`, reuses
+/// the chunked backward); falls back to the host recompute on CPU / unsupported
+/// shapes. The default `linear_attention_core` device path is untouched.
 #[allow(clippy::too_many_arguments)]
 pub fn linear_attention_core_with_carry_taped(
     qkv: TensorId,
