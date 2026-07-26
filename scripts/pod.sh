@@ -41,6 +41,14 @@ pod_path() {
     *) echo "node path is outside NODE_TREE: $1" >&2; exit 2 ;;
   esac
 }
+# NUL-list of tarball contents: git-tracked + untracked (honors .gitignore), plus
+# the AOT bundle in generated/ (gitignored → shipped explicitly so the pod reuses
+# it, not outside source_digest so it can't trip apply-sync's guard).
+tarball_files() {
+  { git -C "$ROOT" ls-files -co --exclude-standard -z
+    ( cd "$ROOT" && find crates/cuda-kernels/generated -type f -print0 2>/dev/null ); } |
+    while IFS= read -r -d '' p; do [ -f "$ROOT/$p" ] && printf '%s\0' "$p"; done
+}
 
 case "$cmd" in
   push-scripts)
@@ -67,16 +75,8 @@ case "$cmd" in
     trap 'rm -rf "$stage"' EXIT
     head="$(git -C "$ROOT" rev-parse HEAD)"
     dirty_digest="$(POD_TREE="$ROOT" bash "$ROOT/scripts/pod-remote-build.sh" source-digest "$ROOT")"
-    : > "$stage/files"
-    while IFS= read -r -d '' path; do [ -f "$ROOT/$path" ] && printf '%s\0' "$path" >> "$stage/files"; done < <(git -C "$ROOT" ls-files -co --exclude-standard -z)
-    # Ship the source-matched AOT bundle (gitignored generated/, so outside the
-    # digest) so the pod reuses it instead of ~1h TileLang codegen. Miss/offline
-    # → no-op, pod builds from source. build.rs rejects any stale artifact.
-    bash "$ROOT/scripts/kernel_artifacts.sh" sync || true
-    if [ -d "$ROOT/crates/cuda-kernels/generated" ]; then
-      while IFS= read -r -d '' path; do printf '%s\0' "$path" >> "$stage/files"; done \
-        < <(cd "$ROOT" && find crates/cuda-kernels/generated -type f -print0)
-    fi
+    bash "$ROOT/scripts/kernel_artifacts.sh" sync || true   # source-matched AOT bundle → generated/ (no-op offline/miss)
+    tarball_files > "$stage/files"
     git -C "$ROOT" ls-files -d -z > "$stage/deletes"
     COPYFILE_DISABLE=1 tar -C "$ROOT" --null -T "$stage/files" -czf "$stage/tree.tgz"
     archive_sha="$(shasum -a 256 "$stage/tree.tgz" | cut -d' ' -f1)"
