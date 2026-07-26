@@ -1,0 +1,21 @@
+crates/autograd/src/tape.rs
+  s_2c38145338af2e::t_cd78c0a404548f 800,833,844,849-858
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "e0f0571be3dec0a04a3e68678a207f41e4905cba",
+  "prompts": {},
+  "sessions": {
+    "s_2c38145338af2e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-adb19fa9a0af554fd",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
