@@ -344,6 +344,11 @@ pub struct LinearAttentionDeviceForwardArgs<'a> {
     pub dt_bias: &'a DeviceHandle,
     pub a_log: &'a DeviceHandle,
     pub norm_weight: &'a DeviceHandle,
+    // OPD frozen-prompt carry (None = default zero-seed, byte-identical path).
+    // initial_state: [batch, num_value_heads, key_dim, value_dim] (final_state layout).
+    // initial_conv_window: [batch, conv_kernel-1, qkv_dim].
+    pub initial_state: Option<&'a DeviceHandle>,
+    pub initial_conv_window: Option<&'a DeviceHandle>,
 }
 
 #[derive(Debug, Clone)]

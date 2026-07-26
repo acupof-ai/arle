@@ -3878,6 +3878,9 @@ fn cuda_linear_attention_forward_device(
     let rows = (0..p.batch)
         .map(|row| {
             let slice = |src| cuda_row_slice(backend, src, row, p.batch);
+            // Carry is batch-leading like the other inputs — slice per row too.
+            let initial_state = args.initial_state.map(slice).transpose()?;
+            let initial_conv_window = args.initial_conv_window.map(slice).transpose()?;
             cuda_linear_attention_forward_device_row(
                 backend,
                 LinearAttentionDeviceForwardArgs {
@@ -3890,6 +3893,8 @@ fn cuda_linear_attention_forward_device(
                     dt_bias: args.dt_bias,
                     a_log: args.a_log,
                     norm_weight: args.norm_weight,
+                    initial_state: initial_state.as_ref(),
+                    initial_conv_window: initial_conv_window.as_ref(),
                 },
             )
         })
@@ -3945,17 +3950,37 @@ fn cuda_linear_attention_forward_device_row(
     let norm_weight =
         backend.cuda_slice(args.norm_weight, "linear_attention_forward norm_weight")?;
 
+    // OPD carry (None = default zero-seed). initial_state seeds final_state (→ chunk_state[0]);
+    // conv_tail feeds the conv1d boundary taps. tail_len = conv_kernel-1 rows of qkv_dim channels.
+    let conv_tail_len = p.conv_kernel - 1;
+    let carry_state = args
+        .initial_state
+        .map(|h| backend.cuda_slice(h, "linear_attention_forward initial_state"))
+        .transpose()?;
+    let carry_conv = args
+        .initial_conv_window
+        .map(|h| backend.cuda_slice(h, "linear_attention_forward initial_conv_window"))
+        .transpose()?;
+
     for (label, got, expected) in [
-        ("qkv", qkv.len(), qkv_len),
-        ("z", z.len(), z_len),
-        ("b_proj", b_proj.len(), head_len),
-        ("a_proj", a_proj.len(), head_len),
-        ("conv1d_weight", conv1d_weight.len(), conv_len),
-        ("dt_bias", dt_bias.len(), p.num_value_heads),
-        ("a_log", a_log.len(), p.num_value_heads),
-        ("norm_weight", norm_weight.len(), p.value_dim),
+        ("qkv", Some(qkv.len()), qkv_len),
+        ("z", Some(z.len()), z_len),
+        ("b_proj", Some(b_proj.len()), head_len),
+        ("a_proj", Some(a_proj.len()), head_len),
+        ("conv1d_weight", Some(conv1d_weight.len()), conv_len),
+        ("dt_bias", Some(dt_bias.len()), p.num_value_heads),
+        ("a_log", Some(a_log.len()), p.num_value_heads),
+        ("norm_weight", Some(norm_weight.len()), p.value_dim),
+        ("initial_state", carry_state.map(|s| s.len()), state_len),
+        (
+            "initial_conv_window",
+            carry_conv.map(|s| s.len()),
+            conv_tail_len * qkv_dim,
+        ),
     ] {
-        if got != expected {
+        if let Some(got) = got
+            && got != expected
+        {
             return Err(AutogradError::TapeInvariant(Box::leak(
                 format!(
                     "cuda linear_attention_forward_device {label} len mismatch: got={got} expected={expected}"
@@ -4017,7 +4042,7 @@ fn cuda_linear_attention_forward_device_row(
         .stream
         .alloc_zeros::<u16>(v_len)
         .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (la u)"))?;
-    let initial_state = backend
+    let mut initial_state = backend
         .stream
         .alloc_zeros::<f32>(state_len)
         .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (la initial_state)"))?;
@@ -4033,6 +4058,21 @@ fn cuda_linear_attention_forward_device_row(
         .stream
         .alloc_zeros::<f32>(state_len)
         .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (la final_state)"))?;
+    let use_chunkwise = p.seq_len <= 32 && linear_attention_gdr_chunkwise_prefill_enabled();
+    // Seed carry so chunk_state[0] = carry. Only the taken branch's buffer needs it: the
+    // recurrent branch runs final_state → chunk_state[0], the chunkwise branch reads initial_state
+    // (final_state is output-only there). Seed the one the branch consumes — the other is dead.
+    if let Some(state) = carry_state {
+        let dst = if use_chunkwise {
+            &mut initial_state
+        } else {
+            &mut final_state
+        };
+        backend
+            .stream
+            .memcpy_dtod(state, dst)
+            .map_err(|_| AutogradError::TapeInvariant("cuda D2D copy failed (la carry seed)"))?;
+    }
     let mut raw_output = backend
         .stream
         .alloc_zeros::<u16>(v_len)
@@ -4058,7 +4098,6 @@ fn cuda_linear_attention_forward_device_row(
         .map_err(|_| AutogradError::TapeInvariant("linear_attention key_dim exceeds i32"))?;
     let value_dim_i32 = i32::try_from(p.value_dim)
         .map_err(|_| AutogradError::TapeInvariant("linear_attention value_dim exceeds i32"))?;
-    let use_chunkwise = p.seq_len <= 32 && linear_attention_gdr_chunkwise_prefill_enabled();
 
     {
         let stage_started = linear_attention_debug_stage_start();
@@ -4066,6 +4105,16 @@ fn cuda_linear_attention_forward_device_row(
         let (qkv_conv_ptr, _qkv_conv_guard) = qkv_conv.device_ptr_mut(&backend.stream);
         let (qkv_ptr, _qkv_guard) = qkv.device_ptr(&backend.stream);
         let (conv_ptr, _conv_guard) = conv1d_weight.device_ptr(&backend.stream);
+        // conv_tail = carried boundary window (nullptr → default zero-tap path, byte-identical).
+        let conv_tail = carry_conv.map(|s| s.device_ptr(&backend.stream));
+        let conv_tail_ptr = conv_tail.as_ref().map_or(0u64, |(ptr, _)| *ptr);
+        let conv_tail_len_i32 = carry_conv
+            .map(|_| i32::try_from(conv_tail_len))
+            .transpose()
+            .map_err(|_| {
+                AutogradError::TapeInvariant("linear_attention conv_tail_len exceeds i32")
+            })?
+            .unwrap_or(0);
         let total_i32 = i32::try_from(qkv_len)
             .map_err(|_| AutogradError::TapeInvariant("linear_attention qkv_len exceeds i32"))?;
         launch_1d(
@@ -4083,7 +4132,9 @@ fn cuda_linear_attention_forward_device_row(
                     .arg(&total_i32)
                     .arg(&qkv_dim_i32)
                     .arg(&seq_len_i32)
-                    .arg(&conv_kernel_i32);
+                    .arg(&conv_kernel_i32)
+                    .arg(&conv_tail_ptr)
+                    .arg(&conv_tail_len_i32);
                 builder
             },
         )?;
@@ -4864,6 +4915,10 @@ fn cuda_linear_attention_backward_device_row(
         let (preact_ptr, _preact_guard) = preact.device_ptr(&backend.stream);
         let (qkv_ptr, _qkv_guard) = qkv.device_ptr(&backend.stream);
         let (conv_ptr, _conv_guard) = conv1d_weight.device_ptr(&backend.stream);
+        // conv_tail nullptr: carry backward reroute is tranche 2 (kernel ABI ready).
+        // See docs/research/2026-07-26-carry-aware-chunked-gdn-backward.md §4.2③.
+        let conv_tail_ptr = 0u64;
+        let conv_tail_len_i32 = 0i32;
         launch_1d(
             &backend.stream,
             backend
@@ -4881,7 +4936,9 @@ fn cuda_linear_attention_backward_device_row(
                     .arg(&total_i32)
                     .arg(&qkv_dim_i32)
                     .arg(&seq_len_i32)
-                    .arg(&conv_kernel_i32);
+                    .arg(&conv_kernel_i32)
+                    .arg(&conv_tail_ptr)
+                    .arg(&conv_tail_len_i32);
                 builder
             },
         )?;
