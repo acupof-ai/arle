@@ -16,6 +16,10 @@ pub struct TrainRuntimeFlags {
     pub engine_offload: EngineOffloadMode,
     /// Per-layer gradient checkpointing at student load (`--gradient-checkpointing`).
     pub gradient_checkpointing: bool,
+    /// Trim the device pool before backward (`--trim-before-backward`).
+    pub trim_before_backward: bool,
+    /// Trim the device pool after writeback (`--trim-after-writeback`).
+    pub trim_after_writeback: bool,
     /// Frozen-prompt-KV writeback path (`--writeback-frozen-prompt-kv`).
     pub writeback_frozen_prompt_kv: bool,
     /// Rollout tensor retain interval (`--rollout-retain-interval`).
@@ -34,6 +38,8 @@ impl Default for TrainRuntimeFlags {
             writeback_offload: true,
             engine_offload: EngineOffloadMode::Off,
             gradient_checkpointing: true,
+            trim_before_backward: false,
+            trim_after_writeback: false,
             writeback_frozen_prompt_kv: false,
             rollout_retain_interval: 2,
             rollout_progress_interval: 16,
@@ -46,6 +52,8 @@ impl Default for TrainRuntimeFlags {
 static WRITEBACK_OFFLOAD: AtomicBool = AtomicBool::new(true);
 static ENGINE_OFFLOAD: AtomicU8 = AtomicU8::new(0);
 static GRADIENT_CHECKPOINTING: AtomicBool = AtomicBool::new(false);
+static TRIM_BEFORE_BACKWARD: AtomicBool = AtomicBool::new(false);
+static TRIM_AFTER_WRITEBACK: AtomicBool = AtomicBool::new(false);
 static WRITEBACK_FROZEN_PROMPT_KV: AtomicBool = AtomicBool::new(false);
 static ROLLOUT_RETAIN_INTERVAL: AtomicUsize = AtomicUsize::new(2);
 static ROLLOUT_PROGRESS_INTERVAL: AtomicUsize = AtomicUsize::new(16);
@@ -55,6 +63,8 @@ pub fn apply_runtime_flags(f: &TrainRuntimeFlags) {
     WRITEBACK_OFFLOAD.store(f.writeback_offload, Relaxed);
     ENGINE_OFFLOAD.store(f.engine_offload as u8, Relaxed);
     GRADIENT_CHECKPOINTING.store(f.gradient_checkpointing, Relaxed);
+    TRIM_BEFORE_BACKWARD.store(f.trim_before_backward, Relaxed);
+    TRIM_AFTER_WRITEBACK.store(f.trim_after_writeback, Relaxed);
     WRITEBACK_FROZEN_PROMPT_KV.store(f.writeback_frozen_prompt_kv, Relaxed);
     ROLLOUT_RETAIN_INTERVAL.store(f.rollout_retain_interval.max(1), Relaxed);
     ROLLOUT_PROGRESS_INTERVAL.store(f.rollout_progress_interval.max(1), Relaxed);
@@ -97,6 +107,12 @@ pub(crate) fn engine_offload() -> EngineOffloadMode {
 }
 pub(crate) fn gradient_checkpointing() -> bool {
     GRADIENT_CHECKPOINTING.load(Relaxed)
+}
+pub(crate) fn trim_before_backward() -> bool {
+    TRIM_BEFORE_BACKWARD.load(Relaxed)
+}
+pub(crate) fn trim_after_writeback() -> bool {
+    TRIM_AFTER_WRITEBACK.load(Relaxed)
 }
 pub(crate) fn writeback_frozen_prompt_kv() -> bool {
     WRITEBACK_FROZEN_PROMPT_KV.load(Relaxed)
