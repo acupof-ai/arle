@@ -46,7 +46,7 @@ pod_path() {
 # it, not outside source_digest so it can't trip apply-sync's guard).
 tarball_files() {
   { git -C "$ROOT" ls-files -co --exclude-standard -z
-    ( cd "$ROOT" && find crates/cuda-kernels/generated -type f -print0 2>/dev/null ); } |
+    ( cd "$ROOT" && [ -d crates/cuda-kernels/generated ] && find crates/cuda-kernels/generated -type f -print0; ) || :; } |
     while IFS= read -r -d '' p; do [ -f "$ROOT/$p" ] && printf '%s\0' "$p"; done
 }
 
