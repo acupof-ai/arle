@@ -94,7 +94,10 @@ impl DecodeGraphContext {
                 page_table_offsets: alloc_i32(ctx, 1)?,
                 start_positions: alloc_i32(ctx, 1)?,
                 positions: alloc_i32(ctx, 1)?,
+                q_offsets: vec![0, seq_len],
+                page_offsets: vec![0, 0],
                 seq_len,
+                total_q: seq_len,
                 num_pages: 0,
                 // Captured graph is B=1 only (batch fixed at DECODE_GRAPH_BATCH).
                 batch: 1,
@@ -172,6 +175,7 @@ impl DecodeGraphContext {
         write_i32(ctx, &mut self.meta.start_positions, &[kv_seq_len as i32])?;
         write_i32(ctx, &mut self.meta.positions, &[(total_len - 1) as i32])?;
         self.meta.num_pages = num_pages;
+        self.meta.page_offsets[1] = num_pages;
         self.meta.seq_len = DECODE_GRAPH_BATCH;
 
         let key = decode_graph_key_for(pool.page_size, kv_seq_len);

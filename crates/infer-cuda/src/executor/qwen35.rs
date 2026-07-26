@@ -29,6 +29,18 @@ fn speculative_chain_fits(start: usize, depth: usize, max_seq_len: usize) -> boo
         .is_some_and(|last_position| last_position < max_seq_len)
 }
 
+/// One chain in a batched DSpark verify. `row0` indexes both the shared
+/// logits and the tap features.
+struct DsparkChain {
+    /// Index of the originating row in the tick's `decode_rows`.
+    out: usize,
+    slot: usize,
+    start: usize,
+    row0: usize,
+    chain: Vec<u32>,
+    partial_ctx: bool,
+}
+
 fn merge_tier_io_stats(
     slot: &kv_native_sys::TierIoStats,
     recall: &kv_native_sys::TierIoStats,
@@ -891,7 +903,9 @@ impl Qwen35CudaExecutor {
         if let Err(e) = model.ctx.trim_memory_pool() {
             log::warn!("pre-KV-budget trim_memory_pool failed (non-fatal): {e}");
         }
-        let dspark_slot_bytes = dspark_head.as_ref().map_or(0, |h| h.slot_state_bytes());
+        let dspark_slot_bytes = dspark_head
+            .as_ref()
+            .map_or(0, |h| h.slot_state_bytes(model.config.vocab_size));
         let num_slots = model.kv_budget_num_slots(num_slots, dspark_slot_bytes)?;
         cuda_startup_log(
             "qwen35_kv_budget",
@@ -1142,9 +1156,9 @@ impl Qwen35CudaExecutor {
             self.kv_pool_requested_pages,
             self.kv_pool_mem_fraction_static,
             self.kv_format,
-            self.dspark
-                .as_ref()
-                .map_or(0, |ds| ds.head.slot_state_bytes()),
+            self.dspark.as_ref().map_or(0, |ds| {
+                ds.head.slot_state_bytes(self.model.config.vocab_size)
+            }),
         )?;
         log::info!(
             "Qwen3.6 re-acquired full-attn KV pool: {}MB (agent-OPD next-round rollout)",
@@ -1349,6 +1363,13 @@ impl Qwen35CudaExecutor {
         self.full_attn_kv.is_some()
     }
 
+    /// Multi-row page tables and the batched HD256 kernels are BF16-only.
+    fn paged_kv_bf16(&self) -> bool {
+        self.full_attn_kv
+            .as_ref()
+            .is_some_and(|p| p.format == KVFormat::BF16)
+    }
+
     /// Actual shared full-attn paged-pool page count, so the host admission pool
     /// mirrors the device pool 1:1 (like dense). `None` only if the pool was
     /// dropped (OPD offload), in which case the caller falls back to the
@@ -1433,7 +1454,7 @@ impl Qwen35CudaExecutor {
         let mut rc = crate::qwen35::Qwen35RecallForward {
             pool,
             meta: &meta,
-            layer0_query: Vec::new(),
+            layer0_query: None,
         };
         let Some(ds) = dspark.as_mut() else {
             return model.forward_tokens_recall(
@@ -1476,11 +1497,12 @@ impl Qwen35CudaExecutor {
             // only for the full-attention layer.
             df.rebase(row.start_pos);
         }
+        model.dspark_tap_features(&ds.head, &mut ds.taps, &mut ds.scratch)?;
         model.dspark_append_ctx(
             &ds.head,
             df,
-            &mut ds.taps,
             &mut ds.scratch,
+            0,
             row.tokens.len(),
             row.start_pos,
         )?;
@@ -1533,7 +1555,7 @@ impl Qwen35CudaExecutor {
         let mut rc = crate::qwen35::Qwen35RecallForward {
             pool,
             meta: &meta,
-            layer0_query: Vec::new(),
+            layer0_query: None,
         };
         model.forward_tokens_recall(
             &mut slots[slot],
@@ -1544,50 +1566,6 @@ impl Qwen35CudaExecutor {
             position,
             &mut rc,
         )
-    }
-
-    /// One DSpark decode row: the block spec step when the slot is seeded
-    /// (pending anchor + contiguous draft ctx), else a tapped warm step that
-    /// re-seeds it. Emits 1..=block_size+1 tokens for this slot.
-    fn dspark_decode_row(&mut self, row: &DecodeRow) -> Result<Vec<SlotToken>> {
-        ensure!(
-            row.slot < self.num_slots,
-            "decode slot {} outside Qwen3.5 executor slots {}",
-            row.slot,
-            self.num_slots
-        );
-        ensure!(
-            self.slots[row.slot].seq_len() == row.kv_seq_len,
-            "Qwen3.5 materialized state len {} != DecodeRow.kv_seq_len {} for slot {}",
-            self.slots[row.slot].seq_len(),
-            row.kv_seq_len,
-            row.slot
-        );
-        let position = row.kv_seq_len.saturating_add(1) as u64;
-        let start = row.kv_seq_len;
-        let ds = self
-            .dspark
-            .as_ref()
-            .expect("dspark_decode_row without dspark");
-        // The verify appends block_size+1 rows, so the whole chain must fit the
-        // trunk cap; near the cap, degrade to single-token steps. Greedy rows
-        // verify by argmax match; sampling rows by rejection sampling.
-        let seeded = self.full_attn_paged()
-            && speculative_chain_fits(start, ds.head.block_size(), self.model.max_seq_len())
-            && matches!(
-                ds.slots[row.slot].as_ref(),
-                Some(s) if s.pending == Some(row.last_token) && s.ctx_end == start
-            );
-        if !seeded {
-            let (token, logprob) = self.dspark_warm_decode_row(row, position)?;
-            return Ok(vec![SlotToken {
-                slot: row.slot,
-                token,
-                logprob,
-                finish: None,
-            }]);
-        }
-        self.dspark_spec_row(row)
     }
 
     /// One MTP spec-decode row (`--spec-type mtp`): the spec draft/verify step
@@ -1657,7 +1635,7 @@ impl Qwen35CudaExecutor {
             let mut rc = crate::qwen35::Qwen35RecallForward {
                 pool,
                 meta: &meta,
-                layer0_query: Vec::new(),
+                layer0_query: None,
             };
             let (logits, dims, hidden) = model.forward_tokens_with_hidden(
                 &mut slots[slot],
@@ -1787,7 +1765,7 @@ impl Qwen35CudaExecutor {
                 .map(|pool| crate::qwen35::Qwen35RecallForward {
                     pool,
                     meta: meta.as_ref().expect("paged (gated)"),
-                    layer0_query: Vec::new(),
+                    layer0_query: None,
                 });
             model.spec_step(
                 &mut slots[slot],
@@ -1871,7 +1849,7 @@ impl Qwen35CudaExecutor {
         let mut rc = crate::qwen35::Qwen35RecallForward {
             pool,
             meta: &meta,
-            layer0_query: Vec::new(),
+            layer0_query: None,
         };
         let ds = dspark.as_mut().expect("dspark warm without dspark");
         // Gap (whole-slot promote / restored prefix): rebase at the current
@@ -1898,64 +1876,139 @@ impl Qwen35CudaExecutor {
             &mut rc,
             taps,
         )?;
-        if let Some(df) = ds.slots[slot].as_mut() {
-            model.dspark_append_ctx(
-                &ds.head,
-                df,
-                &mut ds.taps,
-                &mut ds.scratch,
-                1,
-                row.kv_seq_len,
-            )?;
+        if ds.slots[slot].is_some() {
+            model.dspark_tap_features(&ds.head, &mut ds.taps, &mut ds.scratch)?;
+            let df = ds.slots[slot].as_mut().expect("checked above");
+            model.dspark_append_ctx(&ds.head, df, &mut ds.scratch, 0, 1, row.kv_seq_len)?;
             df.pending = Some(token);
         }
         Ok((token, logprob))
     }
 
-    /// One DSpark block spec step: draft a block from the draft head's ctx
-    /// cache, verify the chain in ONE trunk forward over the paged pool
-    /// (linear-capture + taps), accept the longest matching prefix, roll the
-    /// trunk back on partial accept, crop the pool, and extend the draft ctx
-    /// with the accepted rows' features. Greedy rows are token-exact to no-spec
-    /// decode (every committed token is a trunk argmax); sampling rows commit
-    /// rejection-sampled tokens distributed exactly as filtered target sampling.
-    fn dspark_spec_row(&mut self, row: &DecodeRow) -> Result<Vec<SlotToken>> {
-        let slot = row.slot;
-        let start = row.kv_seq_len;
-        if self.dspark.as_ref().expect("dspark").spec[slot].is_none() {
-            let st = self.model.new_spec_slot_state()?;
-            self.dspark.as_mut().expect("dspark").spec[slot] = Some(st);
-        }
+    /// One DSpark tick: draft per slot, verify EVERY chain in ONE trunk
+    /// forward, then accept/roll back per row. Greedy stays token-exact to
+    /// no-spec decode; sampling commits rejection-sampled tokens.
+    ///
+    /// A row falls back to its own warm step (unpaged pool, chain past the
+    /// trunk cap, no contiguous anchor, or an empty block) without stopping
+    /// the rest of the tick.
+    fn dspark_decode_batch(&mut self, decode_rows: &[DecodeRow]) -> Result<Vec<SlotToken>> {
+        let mut out: Vec<Vec<SlotToken>> = (0..decode_rows.len()).map(|_| Vec::new()).collect();
+        let mut batch: Vec<DsparkChain> = Vec::with_capacity(decode_rows.len());
         let mut pt = crate::qwen35::dspark_phase_start(&self.model.ctx);
-        // 1. Draft the block (draft-head-only; no trunk/pool state touched —
-        //    the speculative noise K/V rows in the draft cache self-heal).
-        let (chain, partial_ctx) = {
-            let Self { model, dspark, .. } = self;
-            let ds = dspark.as_mut().expect("dspark");
-            let df = ds.slots[slot].as_mut().expect("seeded slot");
-            let partial_ctx = df.ctx_base > 0;
-            let chain = model.dspark_draft_block(
-                &ds.head,
-                df,
-                &mut ds.scratch,
-                row.last_token,
+        for (i, row) in decode_rows.iter().enumerate() {
+            ensure!(
+                row.slot < self.num_slots,
+                "decode slot {} outside Qwen3.5 executor slots {}",
+                row.slot,
+                self.num_slots
+            );
+            ensure!(
+                self.slots[row.slot].seq_len() == row.kv_seq_len,
+                "Qwen3.5 materialized state len {} != DecodeRow.kv_seq_len {} for slot {}",
+                self.slots[row.slot].seq_len(),
+                row.kv_seq_len,
+                row.slot
+            );
+            let start = row.kv_seq_len;
+            // The verify appends the whole chain, so it must fit the trunk cap.
+            let seeded = {
+                let ds = self
+                    .dspark
+                    .as_ref()
+                    .expect("dspark_decode_batch without dspark");
+                self.full_attn_paged()
+                    && speculative_chain_fits(start, ds.head.block_size(), self.model.max_seq_len())
+                    && matches!(
+                        ds.slots[row.slot].as_ref(),
+                        Some(s) if s.pending == Some(row.last_token) && s.ctx_end == start
+                    )
+            };
+            // 1. Draft — no trunk/pool state touched; noise K/V self-heal.
+            let drafted = seeded
+                .then(|| {
+                    let Self { model, dspark, .. } = self;
+                    let ds = dspark.as_mut().expect("dspark");
+                    let df = ds.slots[row.slot].as_mut().expect("seeded slot");
+                    let partial_ctx = df.ctx_base > 0;
+                    model
+                        .dspark_draft_block(
+                            &ds.head,
+                            df,
+                            &mut ds.scratch,
+                            row.last_token,
+                            start,
+                            &row.params,
+                        )
+                        .map(|chain| (chain, partial_ctx))
+                })
+                .transpose()?
+                .filter(|(chain, _)| chain.len() >= 2);
+            let Some((chain, partial_ctx)) = drafted else {
+                let (token, logprob) =
+                    self.dspark_warm_decode_row(row, start.saturating_add(1) as u64)?;
+                out[i] = vec![SlotToken {
+                    slot: row.slot,
+                    token,
+                    logprob,
+                    finish: None,
+                }];
+                continue;
+            };
+            batch.push(DsparkChain {
+                out: i,
+                slot: row.slot,
                 start,
-                &row.params,
-            )?;
-            (chain, partial_ctx)
-        };
-        let draft_ms = crate::qwen35::mtp_phase_lap(&self.model.ctx, &mut pt);
-        if chain.len() < 2 {
-            // Confidence head rejected the whole block — warm step instead.
-            let position = start.saturating_add(1) as u64;
-            let (token, logprob) = self.dspark_warm_decode_row(row, position)?;
-            return Ok(vec![SlotToken {
-                slot,
-                token,
-                logprob,
-                finish: None,
-            }]);
+                row0: 0,
+                chain,
+                partial_ctx,
+            });
         }
+        let draft_ms = crate::qwen35::mtp_phase_lap(&self.model.ctx, &mut pt);
+        if batch.is_empty() {
+            return Ok(out.into_iter().flatten().collect());
+        }
+        let mut total_rows = 0usize;
+        for c in &mut batch {
+            c.row0 = total_rows;
+            total_rows += c.chain.len();
+        }
+        let chains: Vec<u32> = batch.iter().flat_map(|c| c.chain.iter().copied()).collect();
+
+        // 2. Snapshot each trunk's linear state (partial-accept rollback base).
+        for c in &batch {
+            if self.dspark.as_ref().expect("dspark").spec[c.slot].is_none() {
+                let st = self.model.new_spec_slot_state()?;
+                self.dspark.as_mut().expect("dspark").spec[c.slot] = Some(st);
+            }
+            let Self {
+                model,
+                slots,
+                dspark,
+                ..
+            } = self;
+            dspark.as_mut().expect("dspark").spec[c.slot]
+                .as_mut()
+                .expect("built above")
+                .snapshot_trunk(&model.ctx, &slots[c.slot])?;
+        }
+        let snap_ms = crate::qwen35::mtp_phase_lap(&self.model.ctx, &mut pt);
+
+        // 3. Reserve + verify, all-or-nothing: seq_lens advance only on
+        //    success, so any failure must give every reserved row back.
+        let logits = match self.dspark_verify_forward(&batch, &chains, total_rows) {
+            Ok(logits) => logits,
+            Err(e) => {
+                let pool = self.full_attn_kv.as_mut().expect("paged (gated by seeded)");
+                for c in &batch {
+                    if pool.seq_len(c.slot) > c.start {
+                        pool.truncate_slot(c.slot, c.start)?;
+                    }
+                }
+                return Err(e);
+            }
+        };
+        let verify_ms = crate::qwen35::mtp_phase_lap(&self.model.ctx, &mut pt);
 
         let Self {
             model,
@@ -1966,116 +2019,153 @@ impl Qwen35CudaExecutor {
             ..
         } = self;
         let ds = dspark.as_mut().expect("dspark");
-        let spec = ds.spec[slot].as_mut().expect("built above");
-        // 2. Snapshot the trunk linear state (partial-accept rollback base).
-        spec.snapshot_trunk(&model.ctx, &slots[slot])?;
-        let snap_ms = crate::qwen35::mtp_phase_lap(&model.ctx, &mut pt);
-        // 3. Verify the chain over the paged pool, capturing linear inputs
-        //    (replay substrate) + trunk taps (ctx features of accepted rows).
+        // The tap fc projection is batch-wide; only the K/V append is per slot.
+        model.dspark_tap_features(&ds.head, &mut ds.taps, &mut ds.scratch)?;
+
+        // 5. Per row: accept + rollback (paged KV self-heals under the crop),
+        //    extend the draft ctx, stage the bonus as the next anchor.
+        for c in &batch {
+            let params = &decode_rows[c.out].params;
+            let spec = ds.spec[c.slot].as_mut().expect("built above");
+            let (emitted, bonus, k) = if params.is_greedy() {
+                // Greedy: delta policy, no behavior logprob (P6 sidecar skips greedy).
+                let (tokens, bonus, k) = model.dspark_accept_commit(
+                    &mut slots[c.slot],
+                    spec,
+                    workspace,
+                    &c.chain,
+                    &logits,
+                    c.row0,
+                    c.start,
+                )?;
+                (
+                    tokens.into_iter().map(|t| (t, None)).collect::<Vec<_>>(),
+                    bonus,
+                    k,
+                )
+            } else {
+                let df = ds.slots[c.slot].as_mut().expect("seeded slot");
+                model.dspark_accept_commit_sampled(
+                    &mut slots[c.slot],
+                    spec,
+                    workspace,
+                    &ds.head,
+                    df,
+                    &mut ds.scratch,
+                    &c.chain,
+                    &logits,
+                    c.row0,
+                    c.start,
+                    params,
+                )?
+            };
+            // Draft logits live in the SLOT: a tick drafts every row before
+            // verifying any, so a shared buffer would pair the wrong slot.
+            let df = ds.slots[c.slot].as_mut().expect("seeded slot");
+            if let Some(draft_logits) = df.logits.as_ref() {
+                super::dspark_train::capture_dspark_experience_hidden(
+                    &model.ctx,
+                    &c.chain,
+                    draft_logits,
+                    &logits,
+                    c.row0,
+                    c.chain.len(),
+                    k,
+                    ds.head.cfg.next_token_heads,
+                );
+            }
+            if k + 1 < c.chain.len() {
+                full_attn_kv
+                    .as_mut()
+                    .expect("paged (gated by seeded)")
+                    .truncate_slot(c.slot, c.start + k + 1)?;
+            }
+            model.dspark_append_ctx(&ds.head, df, &mut ds.scratch, c.row0, k + 1, c.start)?;
+            df.pending = Some(bonus);
+            ds.accepts += k;
+            ds.rejects += c.chain.len() - 1 - k;
+            ds.chains += 1;
+            ds.partial_ctx_chains += usize::from(c.partial_ctx);
+            out[c.out] = emitted
+                .into_iter()
+                .map(|(token, logprob)| SlotToken {
+                    slot: c.slot,
+                    token,
+                    logprob,
+                    finish: None,
+                })
+                .collect();
+        }
+        let commit_ms = crate::qwen35::mtp_phase_lap(&model.ctx, &mut pt);
+        if pt.is_some() {
+            eprintln!(
+                "[dspark-phase] rows={} chain_rows={total_rows} draft={draft_ms:.2} snap={snap_ms:.2} verify={verify_ms:.2} commit={commit_ms:.2} ms",
+                batch.len()
+            );
+        }
+        Ok(out.into_iter().flatten().collect())
+    }
+
+    /// Reserve, build the ragged page table, run the one trunk forward.
+    /// Chain `i` owns logits rows `[c.row0, +len)`. The caller rolls the pool
+    /// back on any error.
+    fn dspark_verify_forward(
+        &mut self,
+        batch: &[DsparkChain],
+        chains: &[u32],
+        total_rows: usize,
+    ) -> Result<cuda_kernels::prelude::HiddenStates> {
+        let Self {
+            model,
+            slots,
+            workspace,
+            full_attn_kv,
+            dspark,
+            ..
+        } = self;
+        let ds = dspark.as_mut().expect("dspark");
         let pool = full_attn_kv.as_mut().expect("paged (gated by seeded)");
-        ensure!(
-            pool.seq_len(slot) == start,
-            "Qwen3.6 dspark verify: pool seq_len {} != start {start} for slot {slot}",
-            pool.seq_len(slot)
-        );
-        pool.alloc_tokens(slot, chain.len())?;
-        let meta = crate::loader::PageMeta::for_slot(&model.ctx, pool, slot, start, chain.len())?;
+        let mut rows = Vec::with_capacity(batch.len());
+        for c in batch {
+            ensure!(
+                pool.seq_len(c.slot) == c.start,
+                "Qwen3.6 dspark verify: pool seq_len {} != start {} for slot {}",
+                pool.seq_len(c.slot),
+                c.start,
+                c.slot
+            );
+            pool.alloc_tokens(c.slot, c.chain.len())?;
+            rows.push((c.slot, c.start, c.chain.len()));
+        }
+        let meta = crate::loader::PageMeta::for_rows(&model.ctx, pool, &rows)?;
         let mut rc = crate::qwen35::Qwen35RecallForward {
             pool,
             meta: &meta,
-            layer0_query: Vec::new(),
+            layer0_query: None,
         };
         ds.taps.prepare(
             ds.head.target_layer_ids(),
             model.config.hidden_size,
-            chain.len(),
+            total_rows,
         );
-        let logits = model.dspark_verify_logits(
-            &mut slots[slot],
-            workspace,
-            &chain,
-            start,
-            spec,
-            &mut rc,
-            &mut ds.taps,
-        )?;
-        let verify_ms = crate::qwen35::mtp_phase_lap(&model.ctx, &mut pt);
-        // 4. Accept scan + trunk rollback (linear replay; full-attn KV
-        //    self-heals under the pool crop below).
-        let (emitted, bonus, k) = if row.params.is_greedy() {
-            // Greedy: delta policy, no behavior logprob (P6 sidecar skips greedy).
-            let (tokens, bonus, k) = model.dspark_accept_commit(
-                &mut slots[slot],
-                spec,
-                workspace,
-                &chain,
-                &logits,
-                start,
-            )?;
-            (tokens.into_iter().map(|t| (t, None)).collect(), bonus, k)
-        } else {
-            model.dspark_accept_commit_sampled(
-                &mut slots[slot],
-                spec,
-                workspace,
-                &ds.head,
-                &mut ds.scratch,
-                &chain,
-                &logits,
-                start,
-                &row.params,
-            )?
-        };
-        // 4b. Train sidecar: capture (draft_tokens, draft_logits, target_logits,
-        //     accepted) for the asynchronous acceptance-weighted trainer. The draft
-        //     logits live in `scratch.logits` from the draft step; greedy path
-        //     leaves them intact. Sampling path may overwrite — capture is
-        //     best-effort and skips when unavailable.
-        if let Some(draft_logits) = ds.scratch.logits.as_ref() {
-            super::dspark_train::capture_dspark_experience(
-                &model.ctx,
-                &chain,
-                draft_logits,
-                &logits,
-                model.config.vocab_size,
-                k,
-                ds.head.cfg.next_token_heads,
-            );
-        }
-        drop(rc);
-        if k + 1 < chain.len() {
-            full_attn_kv
-                .as_mut()
-                .expect("paged (gated by seeded)")
-                .truncate_slot(slot, start + k + 1)?;
-        }
-        let accept_ms = crate::qwen35::mtp_phase_lap(&model.ctx, &mut pt);
-        // 5. Extend the draft ctx cache with the accepted rows' features and
-        //    stage the bonus as the next block's anchor.
-        let df = ds.slots[slot].as_mut().expect("seeded slot");
-        model.dspark_append_ctx(&ds.head, df, &mut ds.taps, &mut ds.scratch, k + 1, start)?;
-        let append_ms = crate::qwen35::mtp_phase_lap(&model.ctx, &mut pt);
-        if pt.is_some() {
-            eprintln!(
-                "[dspark-phase] chain={} accept={k} base={} draft={draft_ms:.2} snap={snap_ms:.2} verify={verify_ms:.2} accept_commit={accept_ms:.2} append={append_ms:.2} ms",
-                chain.len(),
-                df.ctx_base
-            );
-        }
-        df.pending = Some(bonus);
-        ds.accepts += k;
-        ds.rejects += chain.len() - 1 - k;
-        ds.chains += 1;
-        ds.partial_ctx_chains += usize::from(partial_ctx);
-        Ok(emitted
-            .into_iter()
-            .map(|(token, logprob)| SlotToken {
-                slot,
-                token,
-                logprob,
-                finish: None,
+        let mut free_slots: Vec<Option<&mut crate::qwen35::Qwen35SlotState>> =
+            slots.iter_mut().map(Some).collect();
+        let mut free_caps: Vec<Option<&mut crate::qwen35::Qwen35LinearCapture>> = ds
+            .spec
+            .iter_mut()
+            .map(|s| s.as_mut().map(|st| &mut st.capture))
+            .collect();
+        let mut fwd: Vec<crate::qwen35::LinearRow<'_>> = batch
+            .iter()
+            .map(|c| crate::qwen35::LinearRow {
+                slot: free_slots[c.slot]
+                    .take()
+                    .expect("one row per slot per tick"),
+                len: c.chain.len(),
+                capture: free_caps[c.slot].take(),
             })
-            .collect())
+            .collect();
+        model.dspark_verify_logits(&mut fwd, workspace, chains, &mut rc, &mut ds.taps)
     }
 
     /// One prefill row over the recall pool (`--kv-recall`). The ONLY place the whole
@@ -2124,7 +2214,7 @@ impl Qwen35CudaExecutor {
             let mut rc = crate::qwen35::Qwen35RecallForward {
                 pool,
                 meta: &meta,
-                layer0_query: Vec::new(),
+                layer0_query: Some(Vec::new()),
             };
             let token = model.forward_tokens_recall(
                 &mut slots[slot],
@@ -2135,7 +2225,7 @@ impl Qwen35CudaExecutor {
                 position,
                 &mut rc,
             )?;
-            (token, rc.layer0_query)
+            (token, rc.layer0_query.expect("opted in above"))
         };
 
         let cache_len = row.start_pos + row.tokens.len();
@@ -2279,7 +2369,7 @@ impl Qwen35CudaExecutor {
         let mut rc = crate::qwen35::Qwen35RecallForward {
             pool,
             meta: &meta,
-            layer0_query: Vec::new(),
+            layer0_query: None,
         };
         model.forward_tokens_recall(
             &mut slots[slot],
@@ -2536,20 +2626,16 @@ impl Qwen35CudaExecutor {
         decode_rows: &[DecodeRow],
         allow_graph: bool,
     ) -> Result<Vec<SlotToken>> {
-        use super::spec_decode::DecodeRoute;
-        let route = super::spec_decode::route_decode(
-            self.spec_kind(),
-            decode_rows.len(),
-            crate::runtime_flags::spec_max_batch(),
-        );
-        match route {
-            DecodeRoute::Dspark => {
-                let mut tokens = Vec::with_capacity(decode_rows.len());
-                for row in decode_rows {
-                    tokens.extend(self.dspark_decode_row(row)?);
-                }
-                Ok(tokens)
-            }
+        use super::spec_decode::{DecodeRoute, SpecKind};
+        let kind = self.spec_kind();
+        // A quant-KV pool cannot build a multi-row page table — hold at c=1.
+        let gate = if kind == SpecKind::Dspark && !self.paged_kv_bf16() {
+            1
+        } else {
+            crate::runtime_flags::spec_max_batch()
+        };
+        match super::spec_decode::route_decode(kind, decode_rows.len(), gate) {
+            DecodeRoute::Dspark => self.dspark_decode_batch(decode_rows),
             DecodeRoute::Mtp => {
                 let mut tokens = Vec::with_capacity(decode_rows.len());
                 for row in decode_rows {
@@ -2900,13 +2986,8 @@ impl Qwen35CudaExecutor {
         // all-reduces — but the correctness floor keeps quant-KV and `--kv-recall`
         // (per-row restricted page table) on the serial per-row path.
         if self.full_attn_paged() {
-            let paged_bf16 = self
-                .full_attn_kv
-                .as_ref()
-                .map(|p| p.format == KVFormat::BF16)
-                .unwrap_or(false);
             if qwen35_batched_decode_enabled()
-                && paged_bf16
+                && self.paged_kv_bf16()
                 && !self.recall_active()
                 && self.model.tp.is_single()
             {
@@ -3175,7 +3256,7 @@ impl Qwen35CudaExecutor {
                     let mut rc = crate::qwen35::Qwen35RecallForward {
                         pool,
                         meta: &meta,
-                        layer0_query: Vec::new(),
+                        layer0_query: None,
                     };
                     model.forward_token_logits_full(
                         &mut slot,

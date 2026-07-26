@@ -317,11 +317,16 @@ pub(crate) struct PageMeta {
     pub(crate) page_table_offsets: CudaSlice<i32>,
     pub(crate) start_positions: CudaSlice<i32>,
     pub(crate) positions: CudaSlice<i32>,
+    /// Host mirrors of `q_indptr` / `kv_indptr` — the multi-token prep kernel
+    /// is single-row, so it is launched per row at these offsets.
+    pub(crate) q_offsets: Vec<usize>,
+    pub(crate) page_offsets: Vec<usize>,
+    /// Longest row's new-token count — the kernel's `max_qlen`.
     pub(crate) seq_len: usize,
+    /// Sum of every row's new-token count — the kernel's `total_q_tokens`.
+    pub(crate) total_q: usize,
     pub(crate) num_pages: usize,
-    /// Decode batch size (rows). 1 for prefill/single-row decode (byte-identical
-    /// to before this field existed); B>1 only for [`Self::for_decode_batch`],
-    /// which drives the batched paged-decode kernel over B independent rows.
+    /// Row count — the kernel's `batch_size`.
     pub(crate) batch: usize,
     /// Host copy of the request's prefix length (tokens already in the pool
     /// before this forward). Quant formats use it to size the prefix refill.
@@ -337,40 +342,62 @@ pub(crate) struct PageMeta {
 }
 
 impl PageMeta {
-    pub(crate) fn for_slot(
+    /// Ragged page table over `rows` of `(slot, start_pos, len)`. The prefix-sum
+    /// indptrs cover 1×T (prefill/verify), B×1 (decode) and the B×T middle;
+    /// the kernel triple is `(batch, total_q, seq_len)`.
+    pub(crate) fn for_rows(
         ctx: &DeviceContext,
         pool: &PagedKVPool,
-        slot: usize,
-        start_pos: usize,
-        seq_len: usize,
+        rows: &[(usize, usize, usize)],
     ) -> Result<Self> {
-        let total_len = start_pos + seq_len;
-        ensure!(
-            pool.seq_len(slot) == total_len,
-            "PagedKVPool seq_len {} != materialized total_len {} for slot {}",
-            pool.seq_len(slot),
-            total_len,
-            slot
-        );
-        let num_pages = total_len.div_ceil(pool.page_size);
-        let pages = pool.page_indices(slot);
-        ensure!(
-            pages.len() >= num_pages,
-            "slot {} has {} pages, expected at least {}",
-            slot,
-            pages.len(),
-            num_pages
-        );
-        let last_page_len = total_len % pool.page_size;
-        let last_page_len = if last_page_len == 0 {
-            pool.page_size
-        } else {
-            last_page_len
-        };
-        let page_ids = pages[..num_pages]
-            .iter()
-            .map(|&page| page as i32)
-            .collect::<Vec<_>>();
+        ensure!(!rows.is_empty(), "page table needs at least one row");
+        let batch = rows.len();
+        let mut q_indptr = Vec::with_capacity(batch + 1);
+        let mut kv_indptr = Vec::with_capacity(batch + 1);
+        let mut kv_indices = Vec::new();
+        let mut last_page_lens = Vec::with_capacity(batch);
+        let mut start_positions = Vec::with_capacity(batch);
+        let mut positions = Vec::with_capacity(batch);
+        q_indptr.push(0);
+        kv_indptr.push(0);
+        let (mut total_q, mut total_pages, mut max_len) = (0usize, 0usize, 0usize);
+        for &(slot, start_pos, len) in rows {
+            ensure!(
+                len > 0,
+                "page-table row for slot {slot} has no query tokens"
+            );
+            let total_len = start_pos + len;
+            ensure!(
+                pool.seq_len(slot) == total_len,
+                "PagedKVPool seq_len {} != materialized total_len {} for slot {}",
+                pool.seq_len(slot),
+                total_len,
+                slot
+            );
+            let num_pages = total_len.div_ceil(pool.page_size);
+            let pages = pool.page_indices(slot);
+            ensure!(
+                pages.len() >= num_pages,
+                "slot {} has {} pages, expected at least {}",
+                slot,
+                pages.len(),
+                num_pages
+            );
+            kv_indices.extend(pages[..num_pages].iter().map(|&page| page as i32));
+            let last_page_len = total_len % pool.page_size;
+            last_page_lens.push(if last_page_len == 0 {
+                pool.page_size as i32
+            } else {
+                last_page_len as i32
+            });
+            start_positions.push(start_pos as i32);
+            positions.push((total_len - 1) as i32);
+            total_q += len;
+            total_pages += num_pages;
+            max_len = max_len.max(len);
+            q_indptr.push(total_q as i32);
+            kv_indptr.push(total_pages as i32);
+        }
         // Quant formats (INT8/FP8) need explicit token-row lists: the prefix
         // refill + new-row quantize kernels address the pool by global token
         // row, and the fused decode kernel consumes the packed
@@ -378,8 +405,14 @@ impl PageMeta {
         // overhead on the default path.
         let quant = matches!(pool.format, KVFormat::INT8 | KVFormat::FP8E4M3);
         let (new_token_rows, prefix_token_rows, quant_decode_meta) = if quant {
+            // The refill/quantize row lists are indexed as one contiguous range.
+            ensure!(
+                batch == 1,
+                "quantized KV page table is single-row, got {batch}"
+            );
+            let (slot, start_pos, len) = rows[0];
             let new_rows = pool
-                .token_rows_for_range(slot, start_pos, seq_len)
+                .token_rows_for_range(slot, start_pos, len)
                 .into_iter()
                 .map(|row| row as i32)
                 .collect::<Vec<_>>();
@@ -405,21 +438,34 @@ impl PageMeta {
             (None, None, None)
         };
         Ok(Self {
-            q_indptr: upload_i32(ctx, &[0, seq_len as i32])?,
-            kv_indptr: upload_i32(ctx, &[0, num_pages as i32])?,
-            kv_indices: upload_i32(ctx, &page_ids)?,
-            kv_last_page_len: upload_i32(ctx, &[last_page_len as i32])?,
+            q_indptr: upload_i32(ctx, &q_indptr)?,
+            kv_indptr: upload_i32(ctx, &kv_indptr)?,
+            kv_indices: upload_i32(ctx, &kv_indices)?,
+            kv_last_page_len: upload_i32(ctx, &last_page_lens)?,
             page_table_offsets: upload_i32(ctx, &[0])?,
-            start_positions: upload_i32(ctx, &[start_pos as i32])?,
-            positions: upload_i32(ctx, &[(total_len - 1) as i32])?,
-            seq_len,
-            num_pages,
-            batch: 1,
-            start_pos,
+            start_positions: upload_i32(ctx, &start_positions)?,
+            positions: upload_i32(ctx, &positions)?,
+            q_offsets: q_indptr.iter().map(|&q| q as usize).collect(),
+            page_offsets: kv_indptr.iter().map(|&p| p as usize).collect(),
+            seq_len: max_len,
+            total_q,
+            num_pages: total_pages,
+            batch,
+            start_pos: rows[0].1,
             new_token_rows,
             prefix_token_rows,
             quant_decode_meta,
         })
+    }
+
+    pub(crate) fn for_slot(
+        ctx: &DeviceContext,
+        pool: &PagedKVPool,
+        slot: usize,
+        start_pos: usize,
+        seq_len: usize,
+    ) -> Result<Self> {
+        Self::for_rows(ctx, pool, &[(slot, start_pos, seq_len)])
     }
 
     /// Session KV-recall decode page table (BF16 only): build the metadata over a
@@ -465,7 +511,10 @@ impl PageMeta {
             page_table_offsets: upload_i32(ctx, &[0])?,
             start_positions: upload_i32(ctx, &[(total_len - 1) as i32])?,
             positions: upload_i32(ctx, &[(total_len - 1) as i32])?,
+            q_offsets: vec![0, 1],
+            page_offsets: vec![0, num_pages],
             seq_len: 1,
+            total_q: 1,
             num_pages,
             batch: 1,
             start_pos: total_len - 1,
@@ -475,15 +524,8 @@ impl PageMeta {
         })
     }
 
-    /// Batched decode page table (BF16 only): one decode row per `rows` entry,
-    /// each `(slot, total_len)` describing that row's current cache length
-    /// (INCLUDING this step's just-appended token). Concatenates each row's
-    /// page-id list into `kv_indices`, with `kv_indptr` the per-row prefix sum
-    /// and `kv_last_page_len`/`positions` one entry per row. `seq_len` stays 1
-    /// (decode dispatch); `batch` carries the row count so the prep + paged
-    /// attention launch over `(B, B, 1)`. The TileLang decode kernel reads each
-    /// row's `[kv_indptr[b], kv_indptr[b+1])` page slice and derives its own KV
-    /// length, so rows attend only their own slot's pages.
+    /// Batched decode page table (BF16 only). `total_len` INCLUDES this step's
+    /// just-appended token.
     pub(crate) fn for_decode_batch(
         ctx: &DeviceContext,
         pool: &PagedKVPool,
@@ -494,66 +536,14 @@ impl PageMeta {
             "batched paged decode is BF16-only, got {:?}",
             pool.format
         );
-        ensure!(!rows.is_empty(), "batched decode page table needs >=1 row");
-        let batch = rows.len();
-        let mut q_indptr: Vec<i32> = Vec::with_capacity(batch + 1);
-        let mut kv_indptr: Vec<i32> = Vec::with_capacity(batch + 1);
-        let mut kv_indices: Vec<i32> = Vec::new();
-        let mut last_page_lens: Vec<i32> = Vec::with_capacity(batch);
-        let mut positions: Vec<i32> = Vec::with_capacity(batch);
-        q_indptr.push(0);
-        kv_indptr.push(0);
-        let mut total_pages = 0usize;
-        for &(slot, total_len) in rows {
-            ensure!(total_len > 0, "decode row slot {slot} has empty cache");
-            ensure!(
-                pool.seq_len(slot) == total_len,
-                "PagedKVPool seq_len {} != decode-row total_len {} for slot {}",
-                pool.seq_len(slot),
-                total_len,
-                slot
-            );
-            let num_pages = total_len.div_ceil(pool.page_size);
-            let pages = pool.page_indices(slot);
-            ensure!(
-                pages.len() >= num_pages,
-                "slot {} has {} pages, expected at least {}",
-                slot,
-                pages.len(),
-                num_pages
-            );
-            for &page in &pages[..num_pages] {
-                kv_indices.push(page as i32);
-            }
-            total_pages += num_pages;
-            let last_page_len = total_len % pool.page_size;
-            let last_page_len = if last_page_len == 0 {
-                pool.page_size
-            } else {
-                last_page_len
-            };
-            last_page_lens.push(last_page_len as i32);
-            positions.push((total_len - 1) as i32);
-            q_indptr.push((q_indptr.len()) as i32);
-            kv_indptr.push(total_pages as i32);
-        }
-        Ok(Self {
-            q_indptr: upload_i32(ctx, &q_indptr)?,
-            kv_indptr: upload_i32(ctx, &kv_indptr)?,
-            kv_indices: upload_i32(ctx, &kv_indices)?,
-            kv_last_page_len: upload_i32(ctx, &last_page_lens)?,
-            page_table_offsets: upload_i32(ctx, &[0])?,
-            start_positions: upload_i32(ctx, &positions)?,
-            positions: upload_i32(ctx, &positions)?,
-            seq_len: 1,
-            num_pages: total_pages,
-            batch,
-            // Batched decode is BF16-only; quant refill fields stay None.
-            start_pos: 0,
-            new_token_rows: None,
-            prefix_token_rows: None,
-            quant_decode_meta: None,
-        })
+        let rows = rows
+            .iter()
+            .map(|&(slot, total_len)| {
+                ensure!(total_len > 0, "decode row slot {slot} has empty cache");
+                Ok((slot, total_len - 1, 1))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Self::for_rows(ctx, pool, &rows)
     }
 }
 
