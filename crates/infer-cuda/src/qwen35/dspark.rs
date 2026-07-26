@@ -1030,14 +1030,20 @@ impl Qwen35Model {
         let first_row = usize::from(!cfg.next_token_heads);
         let mut drafts = Vec::with_capacity(block);
         let mut prev = anchor;
-        // Without a markov head every row's logits are final before the scan,
-        // so one launch replaces `block` sync-per-row argmax round-trips.
-        let block_argmax = (!sampling && head.markov.is_none())
-            .then(|| self.argmax_rows(df.logits.get(ctx, vocab, block)?))
-            .transpose()?;
+        // Greedy resolves the whole block in one batched pass — with a markov
+        // head via chain speculation, without one directly off the logits.
+        let block_argmax = if sampling {
+            None
+        } else if let Some(m) = &head.markov {
+            Some(self.markov_block_argmax(m, scratch, df, block, first_row, anchor)?)
+        } else {
+            Some(self.argmax_rows(df.logits.get(ctx, vocab, block)?)?)
+        };
         for row in first_row..block {
             // Corrected logits row: base + markov bias when the head is present.
-            let (src, src_row) = if let Some(m) = &head.markov {
+            // Batched greedy already folded the bias in; only sampling walks
+            // the chain a row at a time.
+            let (src, src_row) = if let (Some(m), None) = (&head.markov, &block_argmax) {
                 // step_logits = base_row + markov_w2 · markov_w1[prev]
                 let tok_dev = scratch.markov_tok.upload(ctx, &[prev as i32])?;
                 let emb = scratch.markov_emb.get(ctx, m.rank, 1)?;
@@ -1129,6 +1135,62 @@ impl Qwen35Model {
         chain.push(anchor);
         chain.extend(drafts);
         Ok(chain)
+    }
+
+    /// Greedy block selection with a markov head, batched by speculating the
+    /// chain on itself. `bias = w2·w1[prev]` makes row r depend on row r-1's
+    /// choice, which is what forces the per-row path; but the base argmax is a
+    /// near-perfect guess for `prev` (the learned bias is small next to the
+    /// top-2 gap), so guess every row's predecessor, correct all rows in one
+    /// batched pass, and re-run only while a guess disagreed. Each round
+    /// confirms at least one more row, so `block` rounds is the hard bound and
+    /// the result is bit-identical to walking the chain.
+    fn markov_block_argmax(
+        &self,
+        m: &DsparkMarkovHead,
+        scratch: &mut DsparkScratch,
+        df: &mut Qwen35DsparkSlotState,
+        block: usize,
+        first_row: usize,
+        anchor: u32,
+    ) -> Result<Vec<u32>> {
+        let ctx = &self.ctx;
+        let vocab = self.output_projection().rows;
+        let mut toks = self.argmax_rows(df.logits.get(ctx, vocab, block)?)?;
+        // prevs[row] feeds row: the anchor for the first drafted row, else the
+        // token chosen one row earlier.
+        let mut prevs = vec![anchor as i32; block];
+        for _ in 0..block {
+            for row in first_row + 1..block {
+                prevs[row] = toks[row - 1] as i32;
+            }
+            let tok_dev = scratch.markov_tok.upload(ctx, &prevs)?;
+            let emb = scratch.markov_emb.get(ctx, m.rank, block)?;
+            embedding_batch(ctx, &m.w1, tok_dev, emb)?;
+            let bias = scratch.markov_bias.get(ctx, vocab, block)?;
+            gemm_batch(
+                ctx,
+                &m.w2,
+                scratch.markov_emb.get(ctx, m.rank, block)?,
+                bias,
+            )?;
+            let sum = scratch.step_sum.get(ctx, vocab, block)?;
+            add_batch(
+                ctx,
+                df.logits.get(ctx, vocab, block)?,
+                scratch.markov_bias.get(ctx, vocab, block)?,
+                sum,
+            )?;
+            let next = self.argmax_rows(scratch.step_sum.get(ctx, vocab, block)?)?;
+            let settled = (first_row + 1..block).all(|row| prevs[row] == next[row - 1] as i32);
+            toks = next;
+            if settled {
+                return Ok(toks);
+            }
+        }
+        Err(anyhow!(
+            "dspark markov chain failed to settle in {block} rounds"
+        ))
     }
 
     /// Confidence-head seam: acceptance-confident prefix length over the block
