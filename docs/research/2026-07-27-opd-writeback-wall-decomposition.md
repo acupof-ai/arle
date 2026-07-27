@@ -1,5 +1,40 @@
 # OPD writeback 显存墙：逐 op 实测归因与无损 128K 单卡路径
 
+## Correction (2026-07-27, clean HEAD `585e49337`, 4-arm re-measure)
+
+The earlier "40960 passes on main" below is RETRACTED. It rested on a pod probe
+binary `6da8e866` that does not exist in the repo — an unrebuildable mystery
+binary, not a baseline. On a clean current-HEAD build, 40960 OOMs in **every**
+config:
+
+| config | mempool | where it dies | free at the failing alloc |
+|---|---|---|---|
+| attention-qv | retain=false | backward `add_into` (gated-Q grad, 1920 MiB) | 56 GiB free — fragmentation |
+| attention-qv | retain=true | backward `add_into` (1920 MiB) | 18 GiB free |
+| all-linear (default) | retain=true | forward group 3 `mul` (SwiGLU, 2720 MiB) | 15.9 MiB — true OOM |
+| all-linear (default) | retain=false | forward group 3 `mul` (2720 MiB) | 1680 MiB — true OOM, hoard=0 |
+
+Three plain conclusions:
+1. **Not mempool.** all-linear dies on the same `mul` whether the pool hoards
+   or releases (hoard=0 still OOMs). The mempool A/B is rejected.
+2. **Not a regression.** The "it passed" binary is unrebuildable, so it is not a
+   baseline (see `Talk-like-a-human` sibling: a baseline is a commit you can
+   rebuild, not a hash nobody has). The wall is the current measurement.
+3. **A real capacity wall.** Inside a checkpoint group the forward runs
+   tape-disabled and frees intermediates only at the closure's exit
+   (`checkpoint.rs` `free_new_except`), so the peak = the sum of ONE layer's
+   intermediates. At seq=40960 that single-layer peak eats 58 GiB → 1.6 GiB.
+   all-linear carries a full extra ring of LoRA-delta intermediates (live
+   tensors 1852 vs attention-qv's 922), pushing that peak past 97.5 GiB.
+
+The forward failure is the gated dense-MLP SwiGLU (`silu(gate)*up`,
+`[40960, 17408]` = 2.72 GiB) — the last straw on top of ~53 GiB already live in
+the same layer's forward.
+
+Everything below this block is the pre-correction analysis; read it as history.
+
+---
+
 ## 结论先说
 
 **40960 在当前 main 上已经不 OOM：rc=0，loss=8.685793，backward 层内峰值 pool_used 85.9 GiB / reserved 89.4 GiB，都在 97.5 GiB 之下。之前的"墙"是 mempool 缓存高水位（forward 后 hoard 39 GiB），不是活张量；per-replay trim 已把它压住。**
@@ -142,3 +177,13 @@ error: unexpected argument '--cuda-mempool-retain' found
 ## 方法教训
 
 显存问题必须同时看 `driver used`、`pool reserved` 和 `pool used`。只看 `nvidia-smi` 或 `device_mem_info()`，会把 allocator 缓存误判为活张量，再把错误输入包装成精确的 buffer 账本和序列上限。**先证明数字代表什么，再用它做归因和外推。**
+
+## Bottom line (post-correction)
+
+40960 does not fit on one H20 today, in any config. The wall is a real
+single-layer forward peak (58 GiB → 1.6 GiB in one layer), not mempool and not a
+regression. To make it fit, cut that per-layer peak — chunk the attention
+forward-recompute and the dense-MLP SwiGLU intermediates along the sequence so
+the peak divides by the chunk count. That touches autograd ops, so it needs an
+approach doc before code. Until then, 40960 single-card lossless writeback is
+blocked by capacity, full stop — no more mempool or regression chasing.
