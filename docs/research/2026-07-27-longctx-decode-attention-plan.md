@@ -200,16 +200,41 @@ to 13.9 ms across its wrapped children; `qwen/full_attention` (56.76) to 54.9.
 Close both gaps before optimizing either, and add a `qwen/step` wrapper so the
 profile is checkable against ITL.
 
-**Step 2 — PackGQA + split-KV in `batch_decode_paged_hd256.py`.** Grid over
-`num_kv_heads × splits × batch`; pack the group's `gqa_ratio` query rows into M.
-At 24/4 that is 6 real rows instead of 1, KV read once instead of six times, and
-`4 × splits × batch` blocks instead of 24. Upstream `example_gqa_decode*` is the
-model. Expected direction is large — the current kernel runs at 1% of peak
-bandwidth and 2% occupancy — but nothing here is a measurement.
+**Step 2 — route sm_90 paged decode to the vendored FA3, keep TileLang for the
+rest.** FA3 hopper is sm_90-only, so this is a capability split, not two
+implementations of one job: **sm_90 → FA3 paged split-KV + PackGQA; sm_70 and
+anything else → the existing TileLang kernel.** PackGQA and split-KV are exactly
+defects (1)–(3) above, already implemented and validated upstream.
 
-**Step 3 — SM-conditional `BLOCK_N`.** 16 exists for L4's 99 KB shared cap.
-Gate it on the compile target rather than pinning the whole family to the
-smallest device.
+Three facts checked against the vendored source, so the integration has no
+unknowns left:
+
+- **No relayout.** `paged_kv.h:117` builds `mK_paged = make_tensor(ptr_K,
+  shape_K, stride_K)(_, _, bidh, _)` over dims `(page_size, head_dim, head,
+  page)` with an arbitrary CuTe stride tuple. Our HND pool
+  `[page, kv_head, page_size, head_dim]` is expressible as
+  `stride_K = (head_dim, 1, page_size*head_dim, kv_dim*page_size)` — the last
+  term is the `stride_page` the call site already computes
+  (`qwen35.rs:6174`).
+- **`pagedkv_tma = false`.** qwen35's `SUPPORTED_PAGE_SIZE = 16` is smaller than
+  FA3's hdim256 `kBlockN`, and the TMA paged path asserts
+  `page_size % kBlockN == 0` (`mainloop_fwd_sm90_tma_gmma_ws.hpp:537`). The
+  non-TMA `PagedKVManager` gather path has no such constraint and is what the
+  vendored `flash_fwd_hdim256_bf16_paged{,_split}_sm90.cu` units serve.
+- **Start at `b = 1`, one call per request.** The shim is already written for
+  `params.b = 1`; a request's page slice is `kv_indices + kv_indptr[i]`, which is
+  a rectangular 1-row page table for free. FA3's ragged input wants a padded
+  `[b, max_pages]` table, so batching is a second step — take it only if c≥4
+  measures worse than the TileLang batched launch it replaces.
+
+Touches: `arle_fa3_shim.cu` (paged fields + branch), `ffi/attention.rs` (struct
+mirror), `qwen35.rs:6407` (dispatch + per-request loop). The `--qwen35-fa3-decode`
+flag does not survive this — FA3 becomes the sm_90 path, not an arm.
+
+**Step 3 — nothing to do about `BLOCK_N` on sm_90.** The 16-per-page tile exists
+for L4's 99 KB shared cap; once sm_90 leaves this kernel, the constraint only
+binds the devices that actually have it. Revisit only if sm_70 becomes a
+serving target again.
 
 **Step 4 — re-measure, then delete.** Same long-agent dataset, same
 `ARLE_QWEN35_PROFILE` decomposition, plus the 4K/c=1 needle. Only then does the
