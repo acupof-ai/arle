@@ -452,12 +452,17 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         None
     }
 
-    /// Async-mempool `(reserved, used)` bytes for this backend, or `None` for
-    /// host backends. `reserved - used` is the allocator hoard — freed pages the
-    /// pool keeps for reuse, which `device_mem_info` counts as "used". Lets OPD
-    /// separate hoard from live tensors without a `&CudaBackend` downcast.
+    /// Async-mempool `(reserved, used)` bytes; `reserved - used` is the hoard
+    /// `device_mem_info` can't split from live tensors. `None` off-device.
     fn mem_pool_stats(&self) -> Option<(u64, u64)> {
         None
+    }
+
+    /// Hoard in MiB. `None` (never a true 0) when unavailable or the two-attr
+    /// read is inconsistent (`used > reserved`, a concurrent alloc between reads).
+    fn hoarded_mib(&self) -> Option<u64> {
+        let (reserved, used) = self.mem_pool_stats()?;
+        (reserved >= used).then(|| (reserved - used) >> 20)
     }
 
     fn upload(&self, host: &[f32], _shape: &[usize]) -> Result<DeviceHandle> {
