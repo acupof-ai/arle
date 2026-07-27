@@ -2904,9 +2904,8 @@ fn build_masked_loss_targets(
 struct VramSample {
     free: usize,
     total: usize,
-    /// Async-mempool `(reserved, used)`; `reserved - used` = the allocator hoard
-    /// `cuMemGetInfo` can't split from live tensors. `None` on host backends.
-    pool: Option<(u64, u64)>,
+    /// Mempool hoard (`reserved - used`) in MiB; `None` = probe unavailable, not 0.
+    hoarded_mib: Option<u64>,
 }
 
 impl VramSample {
@@ -2925,17 +2924,15 @@ impl VramSample {
     fn total_mib(self) -> usize {
         self.total >> 20
     }
-
-    /// Pool pages held but not backing live allocations, in MiB (0 if unknown).
-    fn hoarded_mib(self) -> usize {
-        self.pool
-            .map(|(reserved, used)| (reserved.saturating_sub(used) >> 20) as usize)
-            .unwrap_or(0)
-    }
 }
 
 fn writeback_vram_trace_enabled() -> bool {
     std::env::var("ARLE_OPD_VRAM_TRACE").is_ok()
+}
+
+/// `n/a` keeps an unavailable probe distinct from a measured `0MiB`.
+fn fmt_hoarded(mib: Option<u64>) -> String {
+    mib.map_or_else(|| "n/a".to_string(), |m| format!("{m}MiB"))
 }
 
 /// Log device VRAM at a writeback milestone when `ARLE_OPD_VRAM_TRACE` is set
@@ -2950,14 +2947,14 @@ fn log_writeback_vram(store: &TensorStore, scope: &str, label: &str) -> Option<V
             let sample = VramSample {
                 free,
                 total,
-                pool: store.backend().mem_pool_stats(),
+                hoarded_mib: store.backend().hoarded_mib(),
             };
             eprintln!(
-                "[opd-vram] {scope} {label}: used={}MiB free={}MiB total={}MiB hoarded={}MiB",
+                "[opd-vram] {scope} {label}: used={}MiB free={}MiB total={}MiB hoarded={}",
                 sample.used_mib(),
                 sample.free_mib(),
                 sample.total_mib(),
-                sample.hoarded_mib(),
+                fmt_hoarded(sample.hoarded_mib),
             );
             Some(sample)
         }
@@ -2979,7 +2976,7 @@ fn log_writeback_vram_ledger(
         return;
     }
     let used = |sample: Option<VramSample>| sample.map(|s| s.used_mib()).unwrap_or(0);
-    let hoarded = |sample: Option<VramSample>| sample.map(|s| s.hoarded_mib()).unwrap_or(0);
+    let hoarded = |sample: Option<VramSample>| fmt_hoarded(sample.and_then(|s| s.hoarded_mib));
     let allocator_delta = match (base, post_cleanup) {
         (Some(base), Some(cleanup)) => cleanup.used().saturating_sub(base.used()) >> 20,
         _ => 0,
