@@ -1,0 +1,21 @@
+docs/experience/errors/2026-07-27-dspark-training-single-process-only.md
+  s_e8f84d1a60c60c::t_dd3de8b3f6c1f6 1,49,51-60,62-76
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "cfbb2dc284855b70382f7dc44e225e8af2167688",
+  "prompts": {},
+  "sessions": {
+    "s_e8f84d1a60c60c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aff3aa9bf3e8934e8",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
