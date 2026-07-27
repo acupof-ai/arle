@@ -6,8 +6,8 @@ use crate::{
     AutogradError, Result,
     backend::{CausalSdpaDeviceBackwardArgs, Device, cpu_causal_sdpa_recompute_backward},
     ops::{
-        add, add_broadcast, matmul, mul_scalar, reshape, slice, softmax, softmax_backward,
-        transpose,
+        add, add_broadcast, broadcast_expand, matmul, mul_scalar, reshape, slice, softmax,
+        softmax_backward, transpose,
     },
     tape::{BackwardOp, GradPairs, SavedContext, TapeEntry},
     tensor::{Dirty, Tensor, TensorId, TensorStore},
@@ -37,21 +37,23 @@ pub fn repeat_kv(
         });
     }
 
-    let expanded = vec![x_shape[0], x_shape[1], n_rep, x_shape[2], x_shape[3]];
+    // Fused prefill SDPA is GQA-native (reads kv_heads directly); this expand
+    // exists only because the non-GQA recompute backward requires q/k/v at
+    // equal head count. `broadcast_expand` copies without a zeros carrier.
     let reshaped = reshape(
         x,
         &[x_shape[0], x_shape[1], 1, x_shape[2], x_shape[3]],
         store,
         tape,
     )?;
-    let zeros = store.alloc(Tensor::new(
-        vec![0.0; expanded.iter().product()],
-        expanded,
-        false,
-    )?);
-    let repeated = add_broadcast(zeros, reshaped, store, tape)?;
+    let expanded = broadcast_expand(
+        reshaped,
+        &[x_shape[0], x_shape[1], n_rep, x_shape[2], x_shape[3]],
+        store,
+        tape,
+    )?;
     reshape(
-        repeated,
+        expanded,
         &[x_shape[0], x_shape[1] * n_rep, x_shape[2], x_shape[3]],
         store,
         tape,

@@ -2,9 +2,67 @@ mod helpers;
 
 use autograd::{
     Result, Tape, Tensor, TensorStore,
-    ops::{cat_heads, reshape, slice, sum},
+    ops::{broadcast_expand, cat_heads, reshape, slice, sum},
 };
 use helpers::{max_abs_err, num_grad};
+
+#[test]
+fn broadcast_expand_grad_matches_central_difference() -> Result<()> {
+    // [2,1,3] -> [2,4,3]: gradient must sum-reduce over the expanded axis.
+    let src_shape = [2usize, 1, 3];
+    let tgt_shape = [2usize, 4, 3];
+    let x_data = vec![0.2, -0.1, 0.3, -0.4, 0.7, -0.2];
+
+    let mut store = TensorStore::default();
+    let mut tape = Tape::new();
+    let x = store.from_slice(&x_data, &src_shape)?;
+    store.get_mut(x).expect("x exists").requires_grad = true;
+
+    let y = broadcast_expand(x, &tgt_shape, &mut store, &mut tape)?;
+    assert_eq!(store.get(y).expect("y").shape, tgt_shape.to_vec());
+    // forward is a pure copy: every expanded slice equals src.
+    let y_data = store.to_host(y)?;
+    for rep in 0..4 {
+        for b in 0..2 {
+            for d in 0..3 {
+                assert_eq!(
+                    y_data[(b * 4 + rep) * 3 + d],
+                    x_data[b * 3 + d],
+                    "expand copy mismatch"
+                );
+            }
+        }
+    }
+
+    let loss = sum(y, &mut store, &mut tape)?;
+    let grads = tape.backward(loss, &mut store)?;
+    let grad_id = grads
+        .get(&x)
+        .copied()
+        .expect("broadcast_expand grad exists");
+    let analytic = store.to_host(grad_id)?;
+    // d(sum(expand(x)))/dx = n_rep for each element.
+    assert_eq!(analytic, vec![4.0; 6]);
+
+    let mut probe = x_data.clone();
+    let numeric = num_grad(
+        |xd| {
+            let mut s = TensorStore::default();
+            let mut t = Tape::new();
+            let xi = s.from_slice(xd, &src_shape).expect("x");
+            let yi = broadcast_expand(xi, &tgt_shape, &mut s, &mut t).expect("expand");
+            let li = sum(yi, &mut s, &mut t).expect("sum");
+            s.to_host(li).expect("loss")[0]
+        },
+        &mut probe,
+        1e-3,
+    );
+    assert!(
+        max_abs_err(&analytic, &numeric) < 1e-2,
+        "analytic {analytic:?} vs numeric {numeric:?}"
+    );
+    Ok(())
+}
 
 #[test]
 fn reshape_backward_restores_input_shape() -> Result<()> {
