@@ -2,6 +2,7 @@ use smallvec::smallvec;
 
 use crate::{
     AutogradError, Result,
+    backend::{broadcast_offset, validate_broadcast},
     tape::{BackwardOp, GradPairs, SavedContext, Tape, TapeEntry},
     tensor::{Dirty, Tensor, TensorId, TensorStore},
 };
@@ -593,6 +594,115 @@ fn transpose_data(
         *slot = data[input_index];
     }
     Ok((output, output_shape))
+}
+
+/// Broadcast-copy `src` up to `target_shape` (right-aligned; each src axis is 1
+/// or equal). Replaces the `add_broadcast(zeros, src)` idiom in `repeat_kv`: no
+/// full-size zeros carrier on the tape. Gradient = sum-reduce over the expanded
+/// axes, bit-identical to the old add-broadcast path.
+pub fn broadcast_expand(
+    src: TensorId,
+    target_shape: &[usize],
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<TensorId> {
+    let (src_shape, requires_grad) = {
+        let t = store.tensor(src)?;
+        (t.shape.clone(), t.requires_grad)
+    };
+    validate_broadcast(target_shape, &src_shape)?;
+
+    let use_lazy = {
+        let t = store.tensor(src)?;
+        t.device_handle.is_some() && t.dirty != Dirty::Host
+    };
+    let output_id = if use_lazy {
+        store.ensure_device(src)?;
+        let src_handle = store
+            .tensor(src)?
+            .device_handle
+            .as_ref()
+            .expect("ensure_device")
+            .clone();
+        let out = store
+            .backend()
+            .broadcast_expand(&src_handle, &src_shape, target_shape)?;
+        store.alloc_device_tensor(target_shape.to_vec(), out)?
+    } else {
+        let src_tensor = store.tensor_host(src)?;
+        let out = store.backend().broadcast_expand_forward(
+            &src_tensor.data,
+            &src_tensor.shape,
+            target_shape,
+        )?;
+        store.alloc(Tensor::new(out, target_shape.to_vec(), false)?)
+    };
+    store.set_requires_grad(output_id, requires_grad)?;
+
+    if requires_grad {
+        tape.record(TapeEntry {
+            op: BackwardOp::BroadcastExpand,
+            output_id,
+            input_ids: smallvec![src],
+            saved: SavedContext::BroadcastExpandCtx { src_shape },
+        });
+    }
+
+    Ok(output_id)
+}
+
+pub(crate) fn broadcast_expand_backward(
+    entry: &TapeEntry,
+    output_grad_id: TensorId,
+    store: &mut TensorStore,
+) -> Result<GradPairs> {
+    let src = *entry.input_ids.first().ok_or(AutogradError::TapeInvariant(
+        "broadcast_expand missing input",
+    ))?;
+    if !store.tensor(src)?.requires_grad {
+        return Ok(GradPairs::new());
+    }
+    let SavedContext::BroadcastExpandCtx { src_shape } = entry.saved.clone() else {
+        return Err(AutogradError::TapeInvariant(
+            "broadcast_expand backward missing saved shape",
+        ));
+    };
+    let target_shape = store.tensor(output_grad_id)?.shape.clone();
+
+    // grad_src = sum-reduce upstream over the expanded axes — identical to the
+    // `b`-branch of `add_broadcast_backward`.
+    let device_path_ok = {
+        let upstream = store.tensor(output_grad_id)?;
+        upstream.dirty != Dirty::Host && upstream.device_handle.is_some()
+    };
+    let mut grads = GradPairs::new();
+    if device_path_ok {
+        let upstream_handle = store
+            .tensor(output_grad_id)?
+            .device_handle
+            .as_ref()
+            .expect("checked above")
+            .clone();
+        let grad_handle = store.backend().add_broadcast_backward_device(
+            &upstream_handle,
+            &target_shape,
+            &src_shape,
+        )?;
+        let grad_id = store.alloc_device_tensor(src_shape, grad_handle)?;
+        grads.push((src, grad_id));
+        return Ok(grads);
+    }
+
+    let upstream = store.tensor_host(output_grad_id)?;
+    let src_size = shape_numel(&src_shape);
+    let mut grad_src = vec![0.0; src_size];
+    for (index, value) in upstream.data.iter().enumerate() {
+        let offset = broadcast_offset(index, &target_shape, &src_shape);
+        grad_src[offset] += *value;
+    }
+    let grad_id = store.alloc(Tensor::new(grad_src, src_shape, false)?);
+    grads.push((src, grad_id));
+    Ok(grads)
 }
 
 fn contiguous_strides(shape: &[usize]) -> Vec<usize> {

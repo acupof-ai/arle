@@ -99,6 +99,9 @@ pub enum SavedContext {
     ReshapeCtx {
         input_shape: Vec<usize>,
     },
+    BroadcastExpandCtx {
+        src_shape: Vec<usize>,
+    },
     SliceCtx {
         input_shape: Vec<usize>,
         starts: Vec<usize>,
@@ -197,6 +200,7 @@ pub enum BackwardOp {
     Gelu,
     RoPE,
     Reshape,
+    BroadcastExpand,
     Slice,
     CatHeads,
     CatSeq,
@@ -236,6 +240,7 @@ impl BackwardOp {
             BackwardOp::Gelu => "Gelu",
             BackwardOp::RoPE => "RoPE",
             BackwardOp::Reshape => "Reshape",
+            BackwardOp::BroadcastExpand => "BroadcastExpand",
             BackwardOp::Slice => "Slice",
             BackwardOp::CatHeads => "CatHeads",
             BackwardOp::CatSeq => "CatSeq",
@@ -752,6 +757,9 @@ impl Tape {
                     BackwardOp::Gelu => ops::gelu_backward(&entry, output_grad_id, store)?,
                     BackwardOp::RoPE => ops::rope_backward(&entry, output_grad_id, store)?,
                     BackwardOp::Reshape => ops::reshape_backward(&entry, output_grad_id, store)?,
+                    BackwardOp::BroadcastExpand => {
+                        ops::broadcast_expand_backward(&entry, output_grad_id, store)?
+                    }
                     BackwardOp::Slice => ops::slice_backward(&entry, output_grad_id, store)?,
                     BackwardOp::CatHeads => ops::cat_heads_backward(&entry, output_grad_id, store)?,
                     BackwardOp::CatSeq => ops::cat_seq_backward(&entry, output_grad_id, store)?,

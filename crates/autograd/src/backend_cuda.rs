@@ -2240,6 +2240,23 @@ impl Backend for CudaBackend {
         }
     }
 
+    fn broadcast_expand(
+        &self,
+        src: &DeviceHandle,
+        src_shape: &[usize],
+        target_shape: &[usize],
+    ) -> Result<DeviceHandle> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (src, src_shape, target_shape);
+            todo!("GPU required: cuda broadcast_expand is unavailable under feature no-cuda")
+        }
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            cuda_broadcast_expand_device(self, src, src_shape, target_shape)
+        }
+    }
+
     fn exp_forward(&self, a: &[f32]) -> Result<Vec<f32>> {
         #[cfg(feature = "no-cuda")]
         {
@@ -7751,6 +7768,83 @@ fn cuda_add_broadcast_device(
                 .arg(&mut d_out)
                 .arg(&d_out_shape)
                 .arg(&d_b_strides)
+                .arg(&out_rank_i32)
+                .arg(&total_i32);
+            builder
+        },
+    )?;
+    Ok(DeviceHandle::Cuda(CudaStorage::new(d_out)))
+}
+
+#[cfg(not(feature = "no-cuda"))]
+fn cuda_broadcast_expand_device(
+    backend: &CudaBackend,
+    src: &DeviceHandle,
+    src_shape: &[usize],
+    target_shape: &[usize],
+) -> Result<DeviceHandle> {
+    // Reuse `add_broadcast_f32` with a zeroed `a`: out = 0 + src_broadcast. The
+    // zero carrier is a scratch buffer freed on return — never a tape tensor.
+    validate_broadcast(target_shape, src_shape)?;
+    let total = shape_size(target_shape);
+    let src_size = shape_size(src_shape);
+    let d_src = backend.cuda_slice(src, "broadcast_expand")?;
+    if d_src.len() != src_size {
+        return Err(AutogradError::DataLengthMismatch {
+            len: d_src.len(),
+            shape: src_shape.to_vec(),
+            size: src_size,
+        });
+    }
+
+    let out_rank = target_shape.len();
+    let rank_offset = out_rank - src_shape.len();
+    let mut src_strides = vec![0_i32; out_rank];
+    let mut stride: i32 = 1;
+    for i in (0..src_shape.len()).rev() {
+        let dim = src_shape[i];
+        if dim == 1 {
+            src_strides[rank_offset + i] = 0;
+        } else {
+            src_strides[rank_offset + i] = stride;
+        }
+        stride = stride.saturating_mul(dim as i32);
+    }
+
+    let out_shape_i32: Vec<i32> = target_shape.iter().map(|&d| d as i32).collect();
+    let d_out_shape = backend
+        .stream
+        .clone_htod(&out_shape_i32)
+        .map_err(|_| AutogradError::TapeInvariant("cuda htod copy failed"))?;
+    let d_src_strides = backend
+        .stream
+        .clone_htod(&src_strides)
+        .map_err(|_| AutogradError::TapeInvariant("cuda htod copy failed"))?;
+    let mut d_out = backend
+        .stream
+        .alloc_zeros::<f32>(total)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
+    let d_zero = backend
+        .stream
+        .alloc_zeros::<f32>(total)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
+
+    let out_rank_i32 = i32::try_from(out_rank)
+        .map_err(|_| AutogradError::TapeInvariant("cuda broadcast_expand rank exceeds i32"))?;
+    let total_i32 = i32::try_from(total)
+        .map_err(|_| AutogradError::TapeInvariant("cuda broadcast_expand total exceeds i32"))?;
+
+    launch_1d(
+        &backend.stream,
+        backend.kernels.function("add_broadcast_f32")?,
+        total,
+        |mut builder| {
+            builder
+                .arg(&d_zero)
+                .arg(d_src)
+                .arg(&mut d_out)
+                .arg(&d_out_shape)
+                .arg(&d_src_strides)
                 .arg(&out_rank_i32)
                 .arg(&total_i32);
             builder
