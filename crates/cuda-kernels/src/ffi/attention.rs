@@ -807,8 +807,12 @@ pub struct ArleFa3FwdHd256Args {
     /// qwen35 HND pool `[page, h_k, page_size, d]` without a relayout.
     pub page_table: *const i32,
     pub page_size: i32,
-    /// Pages in the pool, not in this request.
+    /// Pages in the POOL — the extent of the page dimension.
     pub num_pages: i32,
+    /// Elements between consecutive pages in the pool. FA3's 4th K/V dim IS
+    /// the page dim when a page table is set, so this is its stride.
+    pub k_page_stride: i64,
+    pub v_page_stride: i64,
 }
 
 unsafe extern "C" {
