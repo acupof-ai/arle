@@ -67,19 +67,7 @@ use crate::workspace::{HiddenSlot, SliceSlot, VecSlot};
 pub(crate) mod dspark;
 
 const DEFAULT_ROPE_CACHE_LEN: usize = 32_768;
-/// Split-KV workspace is sized for the cap; the per-step count is chosen to
-/// fill the GPU (see `batched_decode_kv_splits`). Must match
-/// `BATCHED_DECODE_MAX_KV_SPLITS` in `fused_attention.cu`.
-const QWEN35_BATCHED_DECODE_MAX_KV_SPLITS: usize = 64;
-
-/// Blocks the decode attention grid supplies per SM before the KV axis has to
-/// make up the difference: the grid is (kv_heads, splits, batch), and four KV
-/// heads at batch 1 leave 78 SMs almost entirely idle.
-fn batched_decode_kv_splits(kv_heads: usize, batch: usize, sm_count: usize) -> usize {
-    (2 * sm_count)
-        .div_ceil((kv_heads * batch).max(1))
-        .clamp(1, QWEN35_BATCHED_DECODE_MAX_KV_SPLITS)
-}
+const QWEN35_BATCHED_DECODE_KV_SPLITS: usize = 4;
 
 #[cfg(test)]
 pub(crate) mod conv_probe {
@@ -1906,9 +1894,9 @@ pub(crate) struct FullAttnScratch {
     fa3_lseaccum: SliceSlot<f32>,
     fa3_semaphore: SliceSlot<i32>,
     /// Batched split-KV decode scratch for full attention:
-    /// `[B, local_q_heads, QWEN35_BATCHED_DECODE_MAX_KV_SPLITS, head_dim]`.
+    /// `[B, local_q_heads, QWEN35_BATCHED_DECODE_KV_SPLITS, head_dim]`.
     batch_partial_out: SliceSlot<f32>,
-    /// `[B, local_q_heads, QWEN35_BATCHED_DECODE_MAX_KV_SPLITS]`.
+    /// `[B, local_q_heads, QWEN35_BATCHED_DECODE_KV_SPLITS]`.
     batch_partial_m: SliceSlot<f32>,
     batch_partial_l: SliceSlot<f32>,
 }
@@ -7817,8 +7805,7 @@ impl Qwen35Model {
                 self.local_q_heads,
                 self.local_kv_heads
             );
-            let kv_splits = batched_decode_kv_splits(self.local_kv_heads, b, self.ctx.sm_count());
-            let partial_scalars = b * self.local_q_heads * QWEN35_BATCHED_DECODE_MAX_KV_SPLITS;
+            let partial_scalars = b * self.local_q_heads * QWEN35_BATCHED_DECODE_KV_SPLITS;
             let partial_out = batch_partial_out.get(&self.ctx, partial_scalars * c.head_dim)?;
             let partial_m = batch_partial_m.get(&self.ctx, partial_scalars)?;
             let partial_l = batch_partial_l.get(&self.ctx, partial_scalars)?;
@@ -7866,7 +7853,6 @@ impl Qwen35Model {
                     c.rotary_dim as i32,
                     self.max_seq_len as i32,
                     b as i32,
-                    kv_splits as i32,
                     c.rms_norm_eps,
                     self.ctx.stream.cu_stream(),
                 )
@@ -7879,7 +7865,6 @@ impl Qwen35Model {
                     self.local_q_heads as i32,
                     c.head_dim as i32,
                     b as i32,
-                    kv_splits as i32,
                     self.ctx.stream.cu_stream(),
                 )
                 .result()?;
