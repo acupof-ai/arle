@@ -11,11 +11,11 @@ use crate::{
 };
 use mlx_sys::{
     MLX_FLOAT32, MLX_INT32, mlx_add, mlx_array, mlx_array_data_float32, mlx_array_free,
-    mlx_array_from_data, mlx_array_new_float32, mlx_array_size, mlx_concatenate_axis,
-    mlx_contiguous, mlx_erf, mlx_eval, mlx_exp, mlx_fast_rms_norm, mlx_logsumexp_axis, mlx_matmul,
-    mlx_mean_axis, mlx_multiply, mlx_negative, mlx_reciprocal, mlx_reshape,
-    mlx_scatter_add_rows_f32, mlx_sigmoid, mlx_slice, mlx_softmax_axis, mlx_sqrt, mlx_subtract,
-    mlx_sum_axis, mlx_take_axis, mlx_tanh, mlx_transpose_axes,
+    mlx_array_from_data, mlx_array_new_float32, mlx_array_size, mlx_broadcast_to,
+    mlx_concatenate_axis, mlx_contiguous, mlx_erf, mlx_eval, mlx_exp, mlx_fast_rms_norm,
+    mlx_logsumexp_axis, mlx_matmul, mlx_mean_axis, mlx_multiply, mlx_negative, mlx_reciprocal,
+    mlx_reshape, mlx_scatter_add_rows_f32, mlx_sigmoid, mlx_slice, mlx_softmax_axis, mlx_sqrt,
+    mlx_subtract, mlx_sum_axis, mlx_take_axis, mlx_tanh, mlx_transpose_axes,
 };
 use std::ffi::c_void;
 use std::sync::MutexGuard;
@@ -322,7 +322,39 @@ impl Backend for MetalBackend {
         Ok(out)
     }
 
-    // Lazy reduce-sum-all: reshape `x` into a 1-D `[N]` view (an MLX no-op
+    // Lazy right-aligned expand via `mlx_broadcast_to` — no readback/upload. The
+    // default `broadcast_expand` round-trips src through host, which is a full
+    // sync + transfer in every GQA `repeat_kv` backward; MLX broadcasts size-1
+    // dims to `target_shape` natively and stays in the graph.
+    fn broadcast_expand(
+        &self,
+        src: &DeviceHandle,
+        _src_shape: &[usize],
+        target_shape: &[usize],
+    ) -> Result<DeviceHandle> {
+        let DeviceHandle::Metal(src_handle) = src else {
+            return Err(AutogradError::TapeInvariant(
+                "metal backend cannot broadcast_expand a non-metal device handle",
+            ));
+        };
+        let shape_i32: Vec<i32> = target_shape.iter().map(|&d| d as i32).collect();
+        let _guard = mlx_guard();
+        // Safety: `src_handle` is a live MLX array borrowed for this call; the
+        // returned node transfers into a new `MlxHandle`; `mlx_guard()`
+        // serializes MLX global access.
+        let out = unsafe {
+            let out_arr =
+                mlx_broadcast_to(src_handle.as_ptr(), shape_i32.as_ptr(), shape_i32.len());
+            if out_arr.is_null() {
+                return Err(AutogradError::TapeInvariant(
+                    "mlx_broadcast_to returned null",
+                ));
+            }
+            DeviceHandle::Metal(MlxHandle::from_raw(out_arr))
+        };
+        Ok(out)
+    }
+
     // when the input is contiguous) and call `mlx_sum_axis(_, 0, keepdims=false)`
     // to produce a rank-0 scalar that composes into MLX's lazy graph. NO
     // `mlx_eval` here — the tape's terminal flush (`ensure_host` on the loss)
