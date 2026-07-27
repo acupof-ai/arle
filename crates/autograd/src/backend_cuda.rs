@@ -632,7 +632,7 @@ impl CudaBackend {
                 let mut c = self
                     .stream
                     .alloc_zeros::<f32>(m * n)
-                    .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
+                    .map_err(|_| cuda_alloc_failed("matmul", vec![m, n]))?;
 
                 let cfg = GemmConfig::<f32> {
                     transa: cublasOperation_t::CUBLAS_OP_N,
@@ -663,7 +663,7 @@ impl CudaBackend {
                 let mut c = self
                     .stream
                     .alloc_zeros::<f32>(batch * m * n)
-                    .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
+                    .map_err(|_| cuda_alloc_failed("matmul_batched", vec![batch, m, n]))?;
 
                 let gemm = GemmConfig::<f32> {
                     transa: cublasOperation_t::CUBLAS_OP_N,
