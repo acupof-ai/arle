@@ -1,7 +1,7 @@
 # Agent RFT uses generation-time behavior probabilities — 2026-07-26
 
-> Status: accepted — denominator identity, offline replay, and a real online
-> stochastic ratio-weighted update are verified on H20.
+> Status: accepted — denominator identity, offline replay, and real online
+> stochastic fresh, stale, and experience-replay updates are verified on H20.
 
 ## Context
 
@@ -78,18 +78,27 @@ H20, isolated source `/host/arle-denom-verify`:
 - The online case followed the normal Claude Code → in-process ARLE serve →
   tool/edit → pytest scoring → sidecar conversion → `UpdatePreset::update`
   path. It did not use `--replay-records` or fabricate behavior probabilities.
-- A separate `staleness=1` probe recorded a real version-lagged group. The
-  combined stale + experience-replay positive is still pending an exclusive
-  GPU window: a variance-bearing attempt reached writeback but an unrelated 27B
-  campaign co-resident on GPU 1 reduced KV capacity and then caused allocation
-  failure. No foreign process was killed, and that run is not counted as gate
-  evidence.
+- Combined stale + experience replay positive: `rootcause-g65-markers-gpu1-20260727e`,
+  Qwen3.5-0.8B, GRPO, temperature `0.3`, `staleness=1`, `replay-reuse=1`,
+  `--max-update-seq 30000`, physical H20 GPU 1 idle at launch; `RUN_EXIT=0`.
+- A real stale group trained four trajectories / 1,756 tokens with
+  `is_ratio_mean=0.965588` and `is_ratio_max=4.973502`. Round 1 then completed
+  five age-1 replay updates (`replayed_groups=5`), each training the original
+  four trajectories / 1,756 tokens; the final replay had
+  `is_ratio_mean=0.965304` and `is_ratio_max=4.949177`.
+- A preceding identical-shape run completed the numerical stale/replay path but
+  stalled before its round summary. A marker-only diagnostic rebuild then closed
+  every post-replay boundary and exited normally. The stall was not reproduced,
+  so it is not filed as a root cause or code fix.
 
 Raw online artifacts:
 
 - `/host/arle-runs/rft-toy08b-g2/run.log`
 - `/host/arle-runs/rft-toy08b-g2/metrics.jsonl`
 - `/host/arle-runs/rft-toy08b-g2/eval/dumps/`
+- `/host/arle-runs/rootcause-g65-markers-gpu1-20260727e/run.log`
+- `/host/arle-runs/rootcause-g65-markers-gpu1-20260727e/metrics.jsonl`
+- `/host/arle-runs/denom-marker-build-20260727/build.log`
 
 Earlier 27B and long-prompt 0.8B attempts were invalid acceptance cases because
 KV capacity and harness timeouts produced no trainable trajectories. The smaller
