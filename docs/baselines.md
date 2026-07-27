@@ -29,52 +29,41 @@ python3 scripts/gen_bench_prompts.py bench-agent-119k-16x8.jsonl 16 119000 214 8
 
 ### CHAMPION — `c1c05d61c` (2026-07-27) · FA3 paged decode
 
-Dataset `bench-agent-32k-8x8.jsonl`, sha256 `78c70bda3d6b538138b3594abf43c6c074c779a03ba47ad9ccd1942645fbc3bd`,
-regenerable via `gen_bench_prompts.py bench-agent-32k-8x8.jsonl 8 32000 214 8`
-(8 sessions × 8 turns, multi-turn — rule 5). Runner `bench_throughput.py`,
-64 req/point, max_tokens 214, greedy, seed 20260416,
-`--max-running-requests 8`, GPU 0/2. `prompt_tokens` p50 34959 (target 32000,
-+9.2%, inside ±10%). Prefix hit rate **0.9585** vs the TraceLab 95.7% reference.
-0 errors; 1 of 64 incomplete per point (300 s client timeout).
+Dataset `bench-agent-32k-16x8.jsonl`, sha256
+`8867f63eaac2f053...`, regenerable via
+`gen_bench_prompts.py bench-agent-32k-16x8.jsonl 16 32000 214 8` (16 sessions ×
+8 turns; sessions ≥ max concurrency, rule 5). Runner `bench_throughput.py`,
+128 req/point, max_tokens 214, greedy, seed 20260416,
+`--max-running-requests 16`, GPUs 0 (no-spec) and 2 (DSpark), same binary and
+session. `prompt_tokens` p50 34959. 0 errors.
 
-**Prefill** — flat across concurrency, i.e. saturated:
-
-| c | TTFT p50 | prefill tok/s |
-|---|---:|---:|
-| 1 | 16.4 s | 3360 |
-| 8 | 13.3 s | 3682 |
-
-TTFT is measured from client submit, so at c=1 it is mostly queue wait across 64
-sequential requests; `prefill tok/s` takes the least-queued request per point.
-
-**Decode** — two metrics, both needed. `ITL p50` is the unstalled inter-token
-gap (the kernel's number, meaningless on a spec arm where a whole accepted chain
-lands per step). `TPOT` is token-weighted `Σ(e2e−ttft)/Σ(n−1)`, i.e. what the
-request experiences including queueing.
-
-| c | arm | ITL p50 | TPOT | decode tok/s/req | aggregate decode tok/s | total tok/s |
+| c | arm | wall s | total tok/s | TTFT p50 | ITL p50 | ITL p90 |
 |---|---|---:|---:|---:|---:|---:|
-| 1 | no-spec | **27.94 ms** | 86.6 ms | 11.6 | 11.6 | 1189.3 |
-| 1 | DSpark block 16 | (burst) | **65.3 ms** | 15.3 | 15.3 | 1205.8 |
-| 8 | no-spec | **63.89 ms** | 1177.9 ms | 0.85 | 6.8 | 1948.6 |
-| 8 | DSpark block 16 | (burst) | **947.5 ms** | 1.06 | 8.4 | 1864.4 |
+| 1 | no-spec | 3273.9 | 1344.4 | 14.1 s | **28.71 ms** | 29.80 |
+| 1 | DSpark 16 | 3227.7 | 1364.2 (+1.5%) | 14.4 s | (burst) | 80.28 |
+| 8 | no-spec | 1788.3 | **2460.8** | 12.2 s | **65.92 ms** | 3808.6 |
+| 8 | DSpark 16 | 1910.5 | 2304.6 (**−6.3%**) | 13.1 s | (burst) | 256.2 |
+| 16 | no-spec | 1770.1 | **2486.0** | 16.1 s | **107.67 ms** | 8128.1 |
+| 16 | DSpark 16 | 1905.9 | 2310.1 (**−7.1%**) | 27.4 s | (burst) | 8351.5 |
 
-- **FA3 paged decode is the whole delta vs the pre-2026-07-27 numbers**: ITL p50
-  76.98 → 27.94 ms at c=1 (**2.76×**) and 140.49 → 63.89 ms at c=8 (**2.20×**).
-  See [2026-07-27-fa3-paged-decode-32k-2.76x](experience/wins/2026-07-27-fa3-paged-decode-32k-2.76x.md).
-- **DSpark's edge collapsed from 2.04× to 1.33×** (c=1, TPOT). It was never
-  mostly a speculation win — a 72 ms decode step made "emit several tokens per
-  step" look valuable. At 28 ms the same acceptance buys a third as much. Spec
-  decode was compensating for a kernel defect; price any future spec work
-  against this row, not against the old one.
-- **TPOT ≫ ITL at c≥4 is queueing, not decode.** 1177.9 vs 63.89 ms means ~95%
-  of the decode span is waiting — chunked prefill of other requests taking the
-  step. That is the next bottleneck and it is a scheduler problem, not a kernel
-  one.
-- **c=4 not measured** (this run's grid was 1,8).
-- sm_90 only: FA3 hopper is Hopper-only, every other target keeps the TileLang
+`ITL p50` is meaningless on a spec arm (a whole accepted chain lands per step);
+compare those rows on wall clock and total tok/s.
+
+- **FA3 paged decode is the delta vs everything before 2026-07-27**: ITL p50
+  76.98 → 28.71 ms at c=1 (**2.68×**) and 140.49 → 65.92 ms at c=8 (**2.13×**).
+  c=1 reproduces the 8-session run (27.94 ms) to 0.8% on a different dataset.
+  [win](experience/wins/2026-07-27-fa3-paged-decode-32k-2.76x.md)
+- **DSpark is net-negative at serving concurrency.** +1.5% at c=1, −6.3% at c=8,
+  −7.1% at c=16. Before FA3 it was +57.5% at c=1 on short prompts; the edge was
+  never mostly speculation — it was paying for a 2.7× too expensive decode step.
+  [repricing](research/2026-07-27-dspark-repriced-after-fa3.md)
+- **The machine saturates at c=8**: 2460.8 → 2486.0 tok/s from c=8 to c=16
+  (+1.0%) while ITL p50 goes 65.9 → 107.7 ms and ITL p90 hits 8.1 s. Past c=8
+  concurrency buys queueing, not throughput. That is the next bottleneck and it
+  is a scheduler problem.
+- sm_90 only: FA3 hopper is Hopper-only; other targets keep the TileLang
   `batch_decode_paged_hd256` kernel.
-
+- c=4 not measured (grid was 1,8,16).
 
 ### `f4f419629` (2026-07-26) · RETIRED cold-cache fingerprint — NOT a champion
 
