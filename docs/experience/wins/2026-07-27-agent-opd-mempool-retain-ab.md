@@ -1,6 +1,6 @@
 # Agent-OPD CUDA mempool retain A/B — CUDA, 2026-07-27
 
-> Status: pending-remote
+> Status: pending-remote (first run rejected: treatment was a no-op)
 
 ## Goal
 
@@ -39,22 +39,24 @@ ARLE_OPD_VRAM_TRACE=1 arle train agent-opd \
 
 | arm | release threshold verified | forward groups | backward | pool reserved peak MiB | pool used peak MiB | loss | wall time | result |
 |---|---|---:|---|---:|---:|---:|---:|---|
-| retain=true | pending | | | | | | | pending |
-| retain=false | pending | | | | | | | pending |
+| retain=true | `u64::MAX` | 3 / 64 | not entered | 91360 | 34688 | n/a | 34 s | forward OOM |
+| retain=false | **read back `u64::MAX`; invalid arm** | 3 / 64 | not entered | 91360 | 34688 | n/a | 32 s | rejected |
 
 For every checkpoint group, retain driver used/free, mempool reserved current, mempool used current, and live tensor count. On failure, retain the exact phase, layer/group, operation, requested bytes, free bytes, and exit code.
 
-Raw artifacts: pending remote.
+Raw artifacts: `/host/arle-runs/mempool-ab-20260727/` on the H20 host. Binary SHA-256: `b651603ccf496887ea35493908f960cc92e3187f8f5746cabf9b8d4b74f5d3b7`.
 
 ## Problems
 
 The train CLI previously had no `--cuda-mempool-retain` control, so the causal A/B could not run. The new flag preserves `true` as the shipped default and exposes `false` only as the treatment arm. Context creation explicitly writes `u64::MAX` for `true` and `0` for `false`, then reads and logs the effective CUDA release threshold; an unverified write is a silent no-op, not an A/B.
 
+The first remote run exposed a second writer: loading the in-process rollout engine applied an inference `CudaRuntimeFlags::default()` and reset the process-global mempool knob to `true` before creating its context. The CLI command contained `--cuda-mempool-retain false`, but the context logged `requested_retain=true`. The treatment was therefore rejected, and no 64K run was attempted. The rollout engine config now carries the OPD value explicitly; the matched A/B still requires a rebuild and rerun.
+
 The older reference binary is not a baseline because its exact commit, dirty state, build inputs, and allocator state are unknown.
 
 ## Learnings
 
-Pending remote.
+The first remote attempt was rejected rather than interpreted: both arms executed with `u64::MAX`, produced identical group traces, and failed at forward group 3. A process-global runtime flag must be propagated through every later runtime-config application, not only set once before the first backend.
 
 - PASS mechanism: treatment makes `pool reserved` track `pool used` materially more closely and moves the 40960 failure boundary or completes the writeback.
 - Correctness gate: on a shorter sequence runnable in both arms, loss and gradients remain within the existing writeback tolerance.

@@ -3096,6 +3096,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
             mtp_draft_tokens: args.runtime.mtp_draft_tokens,
             cuda: infer_api::CudaRuntimeFlags {
                 qwen35_decode_graph: args.runtime.qwen35_decode_graph,
+                mempool_retain: args.runtime.cuda_mempool_retain,
                 ..Default::default()
             },
             ..EngineLoadConfig::default()
