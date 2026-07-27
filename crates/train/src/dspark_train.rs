@@ -27,6 +27,8 @@ use anyhow::{Context, Result, ensure};
 use autograd::ops;
 use autograd::{AdamW, CpuBackend, Tape, Tensor, TensorId, TensorStore};
 
+use crate::grad_clip::{ensure_finite_loss, finite_optimizer_step};
+
 /// One DSpark spec step's experience for RL training.
 ///
 /// Mirrors `infer_cuda::DsparkExperience`; redefined here to avoid a hard
@@ -439,16 +441,16 @@ impl DsparkTrainer {
             ops::gather_last_dim(log_probs_id, &pg_tokens, &mut self.store, &mut self.tape)?;
 
         let mean_reward: f32 = rewards.iter().sum::<f32>() / batch as f32;
-        if self.steps == 0 && self.config.baseline_init.is_none() {
+        let next_baseline = if self.steps == 0 && self.config.baseline_init.is_none() {
             // Seed from data, not from a guess: an advantage centred on the
             // wrong constant is a uniform push away from whatever the drafter
             // currently proposes.
-            self.baseline_ema = mean_reward;
+            mean_reward
         } else {
-            self.baseline_ema = (1.0 - self.config.baseline_ema_alpha) * self.baseline_ema
-                + self.config.baseline_ema_alpha * mean_reward;
-        }
-        let baseline = self.baseline_ema;
+            (1.0 - self.config.baseline_ema_alpha) * self.baseline_ema
+                + self.config.baseline_ema_alpha * mean_reward
+        };
+        let baseline = next_baseline;
         // Per-token advantage × position weight.
         let weighted_adv: Vec<f32> = row_rewards
             .iter()
@@ -507,15 +509,25 @@ impl DsparkTrainer {
             &mut self.store,
             &mut self.tape,
         )?;
+        let (w1_id, w2_id) = (params.w1, params.w2);
         let loss_id = ops::add(pg_scaled_id, pm_scaled_id, &mut self.store, &mut self.tape)?;
+        let loss = self
+            .store
+            .to_host(loss_id)?
+            .first()
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("DSpark loss tensor is empty"))?;
+        ensure_finite_loss(loss, &[w1_id, w2_id], &mut self.optim, &mut self.store)?;
 
         self.tape.backward(loss_id, &mut self.store)?;
-        let (w1_id, w2_id) = (params.w1, params.w2);
-        if let Some(max_norm) = self.config.max_grad_norm {
-            crate::grad_clip::clip_grad_norm(&[w1_id, w2_id], max_norm, &mut self.store);
-        }
-        self.optim.step(&[w1_id, w2_id], &mut self.store);
-        self.optim.zero_grad(&[w1_id, w2_id], &mut self.store);
+        finite_optimizer_step(
+            loss,
+            &[w1_id, w2_id],
+            self.config.max_grad_norm.unwrap_or(0.0),
+            &mut self.optim,
+            &mut self.store,
+        )?;
+        self.baseline_ema = next_baseline;
         self.steps += 1;
         // ISO step 4: project the base optimizer's step back onto the
         // fixed-spectrum family. Reported drift is how far it had wandered off.
@@ -528,26 +540,24 @@ impl DsparkTrainer {
         // retractions is ~1e-3 relative, so the iterate never leaves a tight
         // neighbourhood of ℱ(W₀). Sharing the publish cadence also means the
         // head handed to the engine is always freshly on the manifold.
-        if self.steps.is_multiple_of(self.config.swap_every)
+        let retract_result = if self.steps.is_multiple_of(self.config.swap_every)
             && let Some(iso) = self.iso.as_mut()
         {
-            iso.retract(&mut self.store)?;
-            self.last_iso_drift = iso.last_drift.clone();
-        }
-
-        let loss = self
-            .store
-            .to_host(loss_id)
-            .unwrap_or_default()
-            .first()
-            .copied()
-            .unwrap_or(0.0);
+            let result = iso.retract(&mut self.store);
+            if result.is_ok() {
+                self.last_iso_drift = iso.last_drift.clone();
+            }
+            result
+        } else {
+            Ok(())
+        };
 
         // Free every intermediate tensor created during this step (params w1/w2
-        // are in `live_before`, so they survive). Replaces a 22-item manual ID
-        // list that leaked whenever an op was added without updating it.
+        // are in `live_before`, so they survive). Runs even if retraction failed,
+        // so a failed step never leaves stale tape entries for the next batch.
         let _ = self.store.free_new_except(&live_before, &HashSet::new());
         self.tape = Tape::new();
+        retract_result?;
 
         Ok(loss)
     }

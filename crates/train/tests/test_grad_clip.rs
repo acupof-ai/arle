@@ -5,10 +5,10 @@
 
 #[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
 use autograd::backend_cuda::CudaBackend;
-use autograd::{Tensor, TensorId, TensorStore};
+use autograd::{AdamW, Tensor, TensorId, TensorStore};
 #[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
 use std::sync::Arc;
-use train::grad_clip::clip_grad_norm;
+use train::grad_clip::{FiniteStepError, clip_grad_norm, finite_optimizer_step};
 
 /// Build a `TensorStore` with two params and pre-filled gradients.
 ///
@@ -184,8 +184,49 @@ fn global_norm_above_f32_max_still_scales_to_finite_grads() {
     );
 }
 
-// GC-7 — guard non-finite max_norm: NaN / ±Inf used to bypass the
-// `max_norm <= 0.0` gate in `clip_grad_norm` (NaN comparisons always
+#[test]
+fn finite_step_rejects_non_finite_grad_without_mutating_params() {
+    let mut store = TensorStore::default();
+    let param = store.alloc(Tensor::new(vec![3.0], vec![1], true).unwrap());
+    let grad = store.alloc(Tensor::new(vec![f32::NAN], vec![1], false).unwrap());
+    store.accumulate_grad(param, grad).unwrap();
+    let mut optimizer = AdamW::new(0.1, (0.9, 0.999), 1e-8, 0.0);
+
+    let err = finite_optimizer_step(1.0, &[param], 1.0, &mut optimizer, &mut store)
+        .expect_err("non-finite gradient must reject the whole update");
+
+    assert!(matches!(err, FiniteStepError::NonFiniteGradNorm(norm) if norm.is_nan()));
+    assert_eq!(store.get(param).unwrap().data, vec![3.0]);
+    assert!(store.get(param).unwrap().grad.is_none());
+}
+
+#[test]
+fn finite_step_rejects_non_finite_loss_and_clears_pending_grads() {
+    let (mut store, params) = setup_two_params_with_grads();
+    let before: Vec<Vec<f32>> = params
+        .iter()
+        .map(|&param| store.get(param).unwrap().data.clone())
+        .collect();
+    let mut optimizer = AdamW::new(0.1, (0.9, 0.999), 1e-8, 0.0);
+
+    let err = finite_optimizer_step(f32::INFINITY, &params, 1.0, &mut optimizer, &mut store)
+        .expect_err("non-finite loss must reject before optimizer mutation");
+
+    assert!(matches!(err, FiniteStepError::NonFiniteLoss(value) if value.is_infinite()));
+    let after: Vec<Vec<f32>> = params
+        .iter()
+        .map(|&param| store.get(param).unwrap().data.clone())
+        .collect();
+    assert_eq!(after, before);
+    assert!(
+        params
+            .iter()
+            .all(|&param| store.get(param).unwrap().grad.is_none())
+    );
+}
+
+// Non-finite max_norm used to bypass the `max_norm <= 0.0` gate in
+// `clip_grad_norm` (NaN comparisons always
 // false) and then poison every gradient via `scale = max_norm /
 // total_norm`. Codex review ef24ca6 P2. Any non-finite (or non-positive)
 // value is now a documented no-op, matching the CLI warning path so all call

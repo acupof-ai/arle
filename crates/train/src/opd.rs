@@ -37,7 +37,7 @@ use std::{
 
 use crate::{
     causal_lm::live_tensor_ids,
-    grad_clip::clip_grad_norm,
+    grad_clip::{FiniteStepError, finite_optimizer_step},
     loss::{
         DEFAULT_KL_CHUNK_SIZE, KlDirection, cross_entropy_loss, fused_linear_distill_loss,
         generalized_beta_jsd_loss, generalized_beta_jsd_loss_chunked, kl_distill_loss,
@@ -153,6 +153,8 @@ pub fn engine_offload_mode() -> EngineOffloadMode {
 pub enum OpdError {
     #[error(transparent)]
     Autograd(#[from] AutogradError),
+    #[error(transparent)]
+    FiniteStep(#[from] FiniteStepError),
     #[error(transparent)]
     Qwen35(#[from] Qwen35Error),
     #[error("{0}")]
@@ -652,31 +654,6 @@ fn retain_rollout_step_tensors(
         keep.insert(buffer_id);
     }
     store.retain_ids(&keep);
-}
-
-fn sanitize_non_finite_grads(params: &[TensorId], store: &mut TensorStore) -> Result<usize> {
-    let mut replaced = 0usize;
-    for &param_id in params {
-        let Some(grad_id) = store.get(param_id).and_then(|tensor| tensor.grad) else {
-            continue;
-        };
-        let Some(grad) = store.get_mut(grad_id) else {
-            continue;
-        };
-        for value in &mut grad.data {
-            if !value.is_finite() {
-                *value = 0.0;
-                replaced += 1;
-            }
-        }
-    }
-    if replaced > 0 {
-        println!(
-            "opd_grad_sanitize params={} non_finite_replaced={replaced}",
-            params.len()
-        );
-    }
-    Ok(replaced)
 }
 
 fn rollout_full_forward(
@@ -2825,11 +2802,11 @@ pub fn rubric_writeback_ce_step_batched<O: Optimizer>(
     let total = total.expect("batch is non-empty");
     let mean = mul_scalar(total, 1.0 / b as f32, store, &mut tape).map_err(OpdError::from)?;
     let loss_value = store.to_host(mean).map_err(OpdError::from)?[0];
+    validate_loss_value(loss_value)?;
     log_writeback_vram(store, "batched", "post ce");
     backward_with_optional_profile(mean, loss_value, store, &mut tape)?;
     log_writeback_vram(store, "batched", "post backward");
-    optimizer.step(store, trainable_params)?;
-    optimizer.zero_grad(store, trainable_params);
+    finite_optimizer_step(loss_value, trainable_params, 0.0, optimizer, store)?;
     let keep_extra: HashSet<TensorId> = HashSet::new();
     cleanup_after_backward(store, &mut tape, all_model_params, &keep_extra);
     log_writeback_vram(store, "batched", "post cleanup");
@@ -3265,6 +3242,7 @@ pub fn masked_writeback_step<O: Optimizer>(
     };
 
     let loss_value = store.to_host(loss).map_err(OpdError::from)?[0];
+    validate_loss_value(loss_value)?;
     let ce_secs = t_ce.elapsed().as_secs_f64();
     eprintln!("[masked-writeback] phase=fused_ce seconds={ce_secs:.3}");
     let t_bwd = Instant::now();
@@ -3281,8 +3259,7 @@ pub fn masked_writeback_step<O: Optimizer>(
     }
     let t_opt = Instant::now();
     if step_optimizer {
-        optimizer.step(store, trainable_params)?;
-        optimizer.zero_grad(store, trainable_params);
+        finite_optimizer_step(loss_value, trainable_params, 0.0, optimizer, store)?;
     }
     cleanup_after_backward(store, &mut tape, all_model_params, &keep_extra);
     let opt_secs = t_opt.elapsed().as_secs_f64();
@@ -3652,9 +3629,9 @@ impl ValueCritic {
         let sq = mul(diff, diff, store, &mut tape).map_err(OpdError::from)?;
         let mse = mean(sq, store, &mut tape).map_err(OpdError::from)?;
         let mse_value = store.to_host(mse).map_err(OpdError::from)?[0];
+        validate_loss_value(mse_value)?;
         tape.backward(mse, store).map_err(OpdError::from)?;
-        self.opt.step(&self.params, store);
-        self.opt.zero_grad(&self.params, store);
+        finite_optimizer_step(mse_value, &self.params, 0.0, &mut self.opt, store)?;
         store.retain_ids(&keep_ids);
         Ok(mse_value)
     }
@@ -3796,6 +3773,7 @@ pub fn masked_writeback_ce_step_frozen_prompt_kv<O: Optimizer>(
     .map_err(OpdError::from)?;
 
     let loss_value = store.to_host(loss).map_err(OpdError::from)?[0];
+    validate_loss_value(loss_value)?;
     let ce_secs = t_ce.elapsed().as_secs_f64();
     eprintln!("[masked-writeback-frozen] phase=fused_ce seconds={ce_secs:.3}");
     let t_bwd = Instant::now();
@@ -3804,8 +3782,7 @@ pub fn masked_writeback_ce_step_frozen_prompt_kv<O: Optimizer>(
     let vram_post_backward = log_writeback_vram(store, "masked-writeback-frozen", "post backward");
     eprintln!("[masked-writeback-frozen] phase=backward seconds={bwd_secs:.3}");
     let t_opt = Instant::now();
-    optimizer.step(store, trainable_params)?;
-    optimizer.zero_grad(store, trainable_params);
+    finite_optimizer_step(loss_value, trainable_params, 0.0, optimizer, store)?;
     cleanup_after_backward(store, &mut tape, all_model_params, &keep_extra);
     let opt_secs = t_opt.elapsed().as_secs_f64();
     let vram_post_cleanup = log_writeback_vram(store, "masked-writeback-frozen", "post cleanup");
@@ -4073,9 +4050,9 @@ pub fn gkd_writeback_step<O: Optimizer, T: TeacherForward + ?Sized>(
         )
     })?;
     let loss_value = store.to_host(loss).map_err(OpdError::from)?[0];
+    validate_loss_value(loss_value)?;
     backward_with_optional_profile(loss, loss_value, store, &mut tape)?;
-    optimizer.step(store, trainable_params)?;
-    optimizer.zero_grad(store, trainable_params);
+    finite_optimizer_step(loss_value, trainable_params, 0.0, optimizer, store)?;
     cleanup_after_backward(store, &mut tape, all_model_params, &keep_extra);
 
     eprintln!("[gkd-writeback] DONE mean_kl={loss_value:.6} total_targets={total_targets}");
@@ -4384,17 +4361,17 @@ fn run_windowed_gkd_route<O: Optimizer, T: TeacherForward + ?Sized>(
     }
 
     let loss_value = loss_result?;
-    validate_loss_value(loss_value)?;
 
     let phase_started = Instant::now();
-    clip_grad_norm(rt.student_params, rt.cfg.grad_clip, store);
+    finite_optimizer_step(
+        loss_value,
+        rt.student_params,
+        rt.cfg.grad_clip,
+        optimizer,
+        store,
+    )?;
     record_profile(profile, |profile| {
         profile.grad_clip_seconds += phase_started.elapsed().as_secs_f64();
-    });
-    let phase_started = Instant::now();
-    optimizer.step(store, rt.student_params)?;
-    record_profile(profile, |profile| {
-        profile.optimizer_step_seconds += phase_started.elapsed().as_secs_f64();
     });
     log_opd_step_trace(rt.total_started, "optimizer_step_done", "");
 
@@ -4482,19 +4459,17 @@ fn run_chunked_kl_route<O: Optimizer, T: TeacherForward + ?Sized>(
         student_offload_fn.as_deref(),
         student_reload_fn.as_deref(),
     )?;
-    validate_loss_value(loss_value)?;
-
-    sanitize_non_finite_grads(rt.student_params, store)?;
 
     let phase_started = Instant::now();
-    clip_grad_norm(rt.student_params, rt.cfg.grad_clip, store);
+    finite_optimizer_step(
+        loss_value,
+        rt.student_params,
+        rt.cfg.grad_clip,
+        optimizer,
+        store,
+    )?;
     record_profile(profile, |profile| {
         profile.grad_clip_seconds += phase_started.elapsed().as_secs_f64();
-    });
-    let phase_started = Instant::now();
-    optimizer.step(store, rt.student_params)?;
-    record_profile(profile, |profile| {
-        profile.optimizer_step_seconds += phase_started.elapsed().as_secs_f64();
     });
 
     Ok(OpdStepOutcome {
@@ -4723,14 +4698,9 @@ pub fn opd_step_with_teacher_forward_profiled_gkd_anchor<
             profile.backward_seconds += phase_started.elapsed().as_secs_f64();
         });
         let phase_started = Instant::now();
-        clip_grad_norm(student_params, cfg.grad_clip, store);
+        finite_optimizer_step(loss_value, student_params, cfg.grad_clip, optimizer, store)?;
         record_profile(&mut profile, |profile| {
             profile.grad_clip_seconds += phase_started.elapsed().as_secs_f64();
-        });
-        let phase_started = Instant::now();
-        optimizer.step(store, student_params)?;
-        record_profile(&mut profile, |profile| {
-            profile.optimizer_step_seconds += phase_started.elapsed().as_secs_f64();
         });
 
         Ok(OpdStepOutcome {
