@@ -2931,7 +2931,7 @@ fn writeback_vram_trace_enabled() -> bool {
 }
 
 /// `n/a` keeps an unavailable probe distinct from a measured `0MiB`.
-fn fmt_hoarded(mib: Option<u64>) -> String {
+pub fn fmt_hoarded(mib: Option<u64>) -> String {
     mib.map_or_else(|| "n/a".to_string(), |m| format!("{m}MiB"))
 }
 

@@ -2179,16 +2179,12 @@ fn log_opd_vram(label: &str, backend: &std::sync::Arc<dyn autograd::Backend>) {
     match backend.device_mem_info() {
         Some((free, total)) => {
             let used = total.saturating_sub(free);
-            // n/a (not 0) when the probe is unavailable, so it stays distinct.
-            let hoarded = backend
-                .hoarded_mib()
-                .map_or_else(|| "n/a".to_string(), |m| format!("{m}MiB"));
             eprintln!(
                 "[opd-vram] {label}: used={}MiB free={}MiB total={}MiB hoarded={}",
                 used >> 20,
                 free >> 20,
                 total >> 20,
-                hoarded,
+                train::opd::fmt_hoarded(backend.hoarded_mib()),
             );
         }
         None => eprintln!("[opd-vram] {label}: device_mem_info unavailable"),
