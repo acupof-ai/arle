@@ -1,0 +1,25 @@
+crates/train/src/dspark_train.rs
+  s_0687ad858d0f07::t_c22e97769996b9 30-31,444,448,450-453,512,514-520,523-530,543,546-553,556-557,560
+crates/train/src/grad_clip.rs
+  s_0687ad858d0f07::t_e3f1619e0c1e1a 4-14,50-88
+crates/train/src/update_strategy.rs
+  s_0687ad858d0f07::t_1e5f7979cf5bea 408-419,424,426-448,451-485,487-490,494-495,498-518,520-526
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "a48ebbc02c3102b487c947733968ae285f5bbebb",
+  "prompts": {},
+  "sessions": {
+    "s_0687ad858d0f07": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6cab79ae-2d5c-4239-81e7-196afb71725e",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
