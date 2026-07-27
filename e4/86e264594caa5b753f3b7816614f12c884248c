@@ -1,0 +1,21 @@
+crates/autograd/src/backend_cuda.rs
+  s_84ca5df9b733b0::t_6ea2fa0301ca7b 6182-6185
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "e486e264594caa5b753f3b7816614f12c884248c",
+  "prompts": {},
+  "sessions": {
+    "s_84ca5df9b733b0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-aab55111bea9d6d37",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
