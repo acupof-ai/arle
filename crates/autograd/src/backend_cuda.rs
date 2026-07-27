@@ -7820,14 +7820,9 @@ fn cuda_broadcast_expand_device(
         .stream
         .clone_htod(&src_strides)
         .map_err(|_| AutogradError::TapeInvariant("cuda htod copy failed"))?;
-    let mut d_out = backend
-        .stream
-        .alloc_zeros::<f32>(total)
-        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
-    let d_zero = backend
-        .stream
-        .alloc_zeros::<f32>(total)
-        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
+    // Uninit output: the kernel writes every element, no zero operand, no carrier.
+    let mut d_out = unsafe { backend.stream.alloc::<f32>(total) }
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc failed"))?;
 
     let out_rank_i32 = i32::try_from(out_rank)
         .map_err(|_| AutogradError::TapeInvariant("cuda broadcast_expand rank exceeds i32"))?;
@@ -7836,11 +7831,10 @@ fn cuda_broadcast_expand_device(
 
     launch_1d(
         &backend.stream,
-        backend.kernels.function("add_broadcast_f32")?,
+        backend.kernels.function("broadcast_copy_f32")?,
         total,
         |mut builder| {
             builder
-                .arg(&d_zero)
                 .arg(d_src)
                 .arg(&mut d_out)
                 .arg(&d_out_shape)

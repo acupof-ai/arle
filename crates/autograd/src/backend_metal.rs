@@ -355,6 +355,7 @@ impl Backend for MetalBackend {
         Ok(out)
     }
 
+    // Lazy reduce-sum-all: reshape `x` into a 1-D `[N]` view (an MLX no-op
     // when the input is contiguous) and call `mlx_sum_axis(_, 0, keepdims=false)`
     // to produce a rank-0 scalar that composes into MLX's lazy graph. NO
     // `mlx_eval` here — the tape's terminal flush (`ensure_host` on the loss)
