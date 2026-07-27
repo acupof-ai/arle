@@ -316,13 +316,18 @@ __global__ void fused_gqa_attention_single_token_kernel(
 // Processes B requests in a single launch. Each request has its own KV cache
 // (accessed via pointer arrays). Uses split-KV + online softmax.
 //
-// Grid: (num_qheads, NUM_KV_SPLITS, batch_size)
-//   blockIdx.x = q_head_idx
+// Grid: (num_kvheads, num_kv_splits, batch_size)
+//   blockIdx.x = kv_head_idx (serves gqa_ratio query heads)
 //   blockIdx.y = split_id (KV chunk index)
 //   blockIdx.z = batch_idx
 // Threads: HEAD_DIM (256)
 
+// Default split count. The launcher raises it to fill the GPU: the grid is
+// (kv_heads, splits, batch), so at batch 1 four kv heads leave 78 SMs idle
+// unless the KV axis supplies the blocks.
 #define NUM_KV_SPLITS 4
+#define BATCHED_DECODE_MAX_KV_SPLITS 64
+#define BATCHED_DECODE_MAX_GQA 8
 #define BATCHED_BLOCK_N 64
 #define BATCHED_DECODE_HEAD_DIM 256
 #define BATCHED_DECODE_THREADS 256
@@ -340,21 +345,27 @@ __global__ void fused_gqa_attention_decode_batched_kernel(
     const int* __restrict__ seq_lens,              // [B] seq_len (= pos + 1)
     const __nv_bfloat16* const* __restrict__ k_cache_ptrs, // [B] device ptrs to per-request K cache
     const __nv_bfloat16* const* __restrict__ v_cache_ptrs, // [B] device ptrs to per-request V cache
-    float* __restrict__ partial_out,               // [B, num_qheads, NUM_KV_SPLITS, HEAD_DIM]
-    float* __restrict__ partial_m,                 // [B, num_qheads, NUM_KV_SPLITS]
-    float* __restrict__ partial_l,                 // [B, num_qheads, NUM_KV_SPLITS]
+    float* __restrict__ partial_out,               // [B, num_qheads, num_kv_splits, HEAD_DIM]
+    float* __restrict__ partial_m,                 // [B, num_qheads, num_kv_splits]
+    float* __restrict__ partial_l,                 // [B, num_qheads, num_kv_splits]
     int num_qheads,
     int num_kvheads,
     int gqa_ratio,
     int head_dim,
     int rotary_dim,
     int max_seq_len,
+    int num_kv_splits,
     float rms_eps
 ) {
-    int q_head_idx = blockIdx.x;
+    // One CTA per (KV head, split, request) — NOT per query head. The KV cache
+    // is stored per KV head, so a query-head grid made all `gqa_ratio` blocks
+    // walk the same cache independently: gqa_ratio x the KV traffic and
+    // gqa_ratio x the current-token cache write. Here the tile is loaded once
+    // and reused across the group from registers.
+    int kv_head_idx = blockIdx.x;
     int split_id = blockIdx.y;
     int batch_idx = blockIdx.z;
-    int kv_head_idx = q_head_idx / gqa_ratio;
+    int q_head_0 = kv_head_idx * gqa_ratio;
 
     int tid = threadIdx.x;  // 0..HEAD_DIM-1
     int half_rotary = rotary_dim / 2;
@@ -364,61 +375,64 @@ __global__ void fused_gqa_attention_decode_batched_kernel(
     float qk_scale = scale * 1.44269504f;  // scale * log2(e) for exp2 trick
 
     __shared__ float smem_scratch[BATCHED_DECODE_NUM_WARPS];
+    __shared__ float smem_q[BATCHED_DECODE_MAX_GQA][BATCHED_DECODE_HEAD_DIM];
+    __shared__ float smem_qk[BATCHED_DECODE_MAX_GQA][BATCHED_BLOCK_N];
 
     int warp_id = tid / WARP_SIZE;
     int lane_id = tid % WARP_SIZE;
 
     int q_full_dim = num_qheads * head_dim * 2;
-    int q_base = batch_idx * q_full_dim + q_head_idx * 2 * head_dim;
-    float q_val = __bfloat162float(q_batch[q_base + tid]);
 
-    // RMSNorm for Q
-    float q_sq = q_val * q_val;
-    float q_sq_sum = warp_reduce_sum(q_sq);
-    if (lane_id == 0) smem_scratch[warp_id] = q_sq_sum;
-    __syncthreads();
-    if (tid == 0) {
-        float total = 0.0f;
+    // RMSNorm + RoPE every query head of the group into shared. Q is 256 floats
+    // per head, so the whole group is 6 KB and the tile loop reads it from
+    // there instead of re-deriving it per block.
+    for (int h = 0; h < gqa_ratio; h++) {
+        int q_base = batch_idx * q_full_dim + (q_head_0 + h) * 2 * head_dim;
+        float q_val = __bfloat162float(q_batch[q_base + tid]);
+        float q_sq_sum = warp_reduce_sum(q_val * q_val);
+        if (lane_id == 0) smem_scratch[warp_id] = q_sq_sum;
+        __syncthreads();
+        if (tid == 0) {
+            float total = 0.0f;
             for (int i = 0; i < BATCHED_DECODE_NUM_WARPS; i++) total += smem_scratch[i];
-        smem_scratch[0] = 1.0f / sqrtf(total / head_dim + rms_eps);
+            smem_scratch[0] = 1.0f / sqrtf(total / head_dim + rms_eps);
+        }
+        __syncthreads();
+        // #58: hd256 q_norm is an OFFSET
+        float q_normed = q_val * smem_scratch[0] * (1.0f + __bfloat162float(q_norm_weight[tid]));
+        smem_q[h][tid] = q_normed;
+        __syncthreads();
+        // RoPE — partial half-split: lo = 0..rotary_dim/2-1,
+        // hi = rotary_dim/2..rotary_dim-1; dims >= rotary_dim pass through.
+        float q_rot = q_normed;
+        if (tid < half_rotary) {
+            float cos_val = __bfloat162float(cos_cache[current_pos * rotary_dim + tid]);
+            float sin_val = __bfloat162float(sin_cache[current_pos * rotary_dim + tid]);
+            q_rot = smem_q[h][tid] * cos_val - smem_q[h][tid + half_rotary] * sin_val;
+        } else if (tid < rotary_dim) {
+            int pair = tid - half_rotary;
+            float cos_val = __bfloat162float(cos_cache[current_pos * rotary_dim + pair]);
+            float sin_val = __bfloat162float(sin_cache[current_pos * rotary_dim + pair]);
+            q_rot = smem_q[h][pair] * sin_val + smem_q[h][tid] * cos_val;
+        }
+        __syncthreads();
+        smem_q[h][tid] = q_rot;
     }
     __syncthreads();
-    float q_rms = smem_scratch[0];
-    float q_normed = q_val * q_rms * (1.0f + __bfloat162float(q_norm_weight[tid]));  // #58: hd256 q_norm OFFSET
-
-    // RoPE for Q — partial half-split: lo = 0..rotary_dim/2-1,
-    // hi = rotary_dim/2..rotary_dim-1; dims >= rotary_dim pass through.
-    __shared__ float smem_q_rope[BATCHED_DECODE_HEAD_DIM];
-    smem_q_rope[tid] = q_normed;
-    __syncthreads();
-
-    float q_rot = q_normed;
-    if (tid < half_rotary) {
-        float cos_val = __bfloat162float(cos_cache[current_pos * rotary_dim + tid]);
-        float sin_val = __bfloat162float(sin_cache[current_pos * rotary_dim + tid]);
-        q_rot = smem_q_rope[tid] * cos_val - smem_q_rope[tid + half_rotary] * sin_val;
-    } else if (tid < rotary_dim) {
-        int pair = tid - half_rotary;
-        float cos_val = __bfloat162float(cos_cache[current_pos * rotary_dim + pair]);
-        float sin_val = __bfloat162float(sin_cache[current_pos * rotary_dim + pair]);
-        q_rot = smem_q_rope[pair] * sin_val + smem_q_rope[tid] * cos_val;
-    }
 
     int kv_base = batch_idx * num_kvheads * head_dim + kv_head_idx * head_dim;
     float k_val = __bfloat162float(k_batch[kv_base + tid]);
 
-    float k_sq = k_val * k_val;
-    float k_sq_sum = warp_reduce_sum(k_sq);
+    float k_sq_sum = warp_reduce_sum(k_val * k_val);
     if (lane_id == 0) smem_scratch[warp_id] = k_sq_sum;
     __syncthreads();
     if (tid == 0) {
         float total = 0.0f;
-            for (int i = 0; i < BATCHED_DECODE_NUM_WARPS; i++) total += smem_scratch[i];
+        for (int i = 0; i < BATCHED_DECODE_NUM_WARPS; i++) total += smem_scratch[i];
         smem_scratch[0] = 1.0f / sqrtf(total / head_dim + rms_eps);
     }
     __syncthreads();
-    float k_rms = smem_scratch[0];
-    float k_normed = k_val * k_rms * (1.0f + __bfloat162float(k_norm_weight[tid]));  // #58: hd256 k_norm OFFSET
+    float k_normed = k_val * smem_scratch[0] * (1.0f + __bfloat162float(k_norm_weight[tid]));  // #58 OFFSET
 
     __shared__ float smem_k_rope[BATCHED_DECODE_HEAD_DIM];
     smem_k_rope[tid] = k_normed;
@@ -454,121 +468,149 @@ __global__ void fused_gqa_attention_decode_batched_kernel(
     // because split 0 handles the current token from registers below.
     int past_seq_len = max(0, seq_lens[batch_idx] - 1);
     int tiles_total = (past_seq_len + BATCHED_BLOCK_N - 1) / BATCHED_BLOCK_N;
-    int tiles_per_split = (tiles_total + NUM_KV_SPLITS - 1) / NUM_KV_SPLITS;
+    int tiles_per_split = (tiles_total + num_kv_splits - 1) / num_kv_splits;
     int split_start = split_id * tiles_per_split * BATCHED_BLOCK_N;
     int split_end = min((split_id + 1) * tiles_per_split * BATCHED_BLOCK_N, past_seq_len);
 
-    float acc = 0.0f;  // output accumulator for dimension tid
-    float m_i = -1e38f;  // running max (finite instead of -inf to avoid NaN)
-    float l_i = 0.0f;    // running sum
+    // Unrolled over the compile-time cap and predicated on `gqa_ratio`: a
+    // runtime bound makes the index non-constant and spills all three arrays to
+    // local memory, which is the hot loop's innermost access.
+    float acc[BATCHED_DECODE_MAX_GQA];
+    float m_i[BATCHED_DECODE_MAX_GQA];
+    float l_i[BATCHED_DECODE_MAX_GQA];
+    #pragma unroll
+    for (int h = 0; h < BATCHED_DECODE_MAX_GQA; h++) {
+        acc[h] = 0.0f;
+        m_i[h] = -1e38f;  // finite instead of -inf to avoid NaN
+        l_i[h] = 0.0f;
+    }
 
-    // K/V cache base for this KV head
     const __nv_bfloat16* k_cache_head = k_cache_ptrs[batch_idx] + cache_head_offset;
     const __nv_bfloat16* v_cache_head = v_cache_ptrs[batch_idx] + cache_head_offset;
 
-    // Shared memory for scores within a tile
-    __shared__ float smem_qk[BATCHED_BLOCK_N];
-
+    // Per-key: one warp owns one key and reduces its own dot product with a
+    // shuffle. The previous shape gave every key two __syncthreads() and a
+    // single-threaded 8-add — 65536 barriers per CTA at 32k, with 255 threads
+    // idle inside each one. Barriers now cost one per tile, not per key.
     for (int tile_start = split_start; tile_start < split_end; tile_start += BATCHED_BLOCK_N) {
         int tile_len = min(BATCHED_BLOCK_N, split_end - tile_start);
 
-        // Compute QK dot products for all positions in this tile
-        // Each thread holds one dimension of Q; we iterate over K positions
-        for (int pos = 0; pos < tile_len; pos++) {
-            int abs_pos = tile_start + pos;
-            float k_elem = __bfloat162float(k_cache_head[abs_pos * head_dim + tid]);
-            float dot = q_rot * k_elem;
-            dot = warp_reduce_sum(dot);
-            if (lane_id == 0) {
-                smem_scratch[warp_id] = dot;
+        for (int pos = warp_id; pos < tile_len; pos += BATCHED_DECODE_NUM_WARPS) {
+            const __nv_bfloat16* k_row = k_cache_head + (size_t)(tile_start + pos) * head_dim;
+            float k_reg[8];
+            #pragma unroll
+            for (int i = 0; i < 8; i++) {
+                k_reg[i] = __bfloat162float(k_row[lane_id + i * WARP_SIZE]);
             }
-            __syncthreads();
-            if (tid == 0) {
-                float score = 0.0f;
-                for (int w = 0; w < BATCHED_DECODE_NUM_WARPS; w++) score += smem_scratch[w];
-                smem_qk[pos] = score * qk_scale;
+            // One K row, `gqa_ratio` dot products — this is the read the
+            // query-head grid used to repeat.
+            #pragma unroll
+            for (int h = 0; h < BATCHED_DECODE_MAX_GQA; h++) {
+                if (h >= gqa_ratio) continue;
+                float dot = 0.0f;
+                #pragma unroll
+                for (int i = 0; i < 8; i++) {
+                    dot += smem_q[h][lane_id + i * WARP_SIZE] * k_reg[i];
+                }
+                dot = warp_reduce_sum(dot);
+                if (lane_id == 0) smem_qk[h][pos] = dot * qk_scale;
             }
-            __syncthreads();
+        }
+        __syncthreads();
+
+        #pragma unroll
+        for (int h = 0; h < BATCHED_DECODE_MAX_GQA; h++) {
+            if (h >= gqa_ratio) continue;
+            float tile_max = -INFINITY;
+            for (int pos = 0; pos < tile_len; pos++) {
+                tile_max = fmaxf(tile_max, smem_qk[h][pos]);
+            }
+            float m_new = fmaxf(m_i[h], tile_max);
+            float alpha = exp2f(m_i[h] - m_new);
+            acc[h] *= alpha;
+            l_i[h] *= alpha;
+            m_i[h] = m_new;
         }
 
-        float tile_max = -INFINITY;
         for (int pos = 0; pos < tile_len; pos++) {
-            tile_max = fmaxf(tile_max, smem_qk[pos]);
+            // One V element per thread per key, shared by the whole group.
+            float v_elem = __bfloat162float(v_cache_head[(size_t)(tile_start + pos) * head_dim + tid]);
+            #pragma unroll
+            for (int h = 0; h < BATCHED_DECODE_MAX_GQA; h++) {
+                if (h >= gqa_ratio) continue;
+                float w = exp2f(smem_qk[h][pos] - m_i[h]);
+                acc[h] += w * v_elem;
+                l_i[h] += w;
+            }
         }
-
-        float m_new = fmaxf(m_i, tile_max);
-        float alpha = exp2f(m_i - m_new);
-        acc *= alpha;
-        l_i *= alpha;
-
-        for (int pos = 0; pos < tile_len; pos++) {
-            float w = exp2f(smem_qk[pos] - m_new);
-            float v_elem = __bfloat162float(v_cache_head[(tile_start + pos) * head_dim + tid]);
-            acc += w * v_elem;
-            l_i += w;
-        }
-        m_i = m_new;
+        __syncthreads();
     }
 
     if (split_id == 0) {
-        // Dot product of q_rot and k_rot
-        float dot = q_rot * k_rot;
-        dot = warp_reduce_sum(dot);
-        if (lane_id == 0) smem_scratch[warp_id] = dot;
-        __syncthreads();
-        if (tid == 0) {
-            float score = 0.0f;
-            for (int w = 0; w < BATCHED_DECODE_NUM_WARPS; w++) score += smem_scratch[w];
-            smem_scratch[0] = score * qk_scale;
+        // Current token, whole group in one barrier pair: each warp reduces its
+        // slice of every head's dot into smem_qk (free at this point), then one
+        // sync and each head folds its own partials.
+        #pragma unroll
+        for (int h = 0; h < BATCHED_DECODE_MAX_GQA; h++) {
+            if (h >= gqa_ratio) continue;
+            float dot = warp_reduce_sum(smem_q[h][tid] * k_rot);
+            if (lane_id == 0) smem_qk[h][warp_id] = dot;
         }
         __syncthreads();
-        float qk_cur = smem_scratch[0];
+        #pragma unroll
+        for (int h = 0; h < BATCHED_DECODE_MAX_GQA; h++) {
+            if (h >= gqa_ratio) continue;
+            float qk_cur = 0.0f;
+            for (int w = 0; w < BATCHED_DECODE_NUM_WARPS; w++) qk_cur += smem_qk[h][w];
+            qk_cur *= qk_scale;
 
-        float m_new = fmaxf(m_i, qk_cur);
-        float alpha = exp2f(m_i - m_new);
-        float p_cur = exp2f(qk_cur - m_new);
+            float m_new = fmaxf(m_i[h], qk_cur);
+            float alpha = exp2f(m_i[h] - m_new);
+            float p_cur = exp2f(qk_cur - m_new);
 
-        acc = acc * alpha + v_val * p_cur;
-        l_i = l_i * alpha + p_cur;
-        m_i = m_new;
+            acc[h] = acc[h] * alpha + v_val * p_cur;
+            l_i[h] = l_i[h] * alpha + p_cur;
+            m_i[h] = m_new;
+        }
     }
 
-    int partial_base_head = (batch_idx * num_qheads + q_head_idx) * NUM_KV_SPLITS;
-    int partial_out_offset = (partial_base_head + split_id) * head_dim + tid;
-    partial_out[partial_out_offset] = acc;
-
-    int scalar_offset = partial_base_head + split_id;
-    if (tid == 0) {
-        partial_m[scalar_offset] = m_i;
-        partial_l[scalar_offset] = l_i;
+    #pragma unroll
+    for (int h = 0; h < BATCHED_DECODE_MAX_GQA; h++) {
+        if (h >= gqa_ratio) continue;
+        int partial_base_head = (batch_idx * num_qheads + q_head_0 + h) * num_kv_splits;
+        partial_out[(partial_base_head + split_id) * head_dim + tid] = acc[h];
+        if (tid == 0) {
+            partial_m[partial_base_head + split_id] = m_i[h];
+            partial_l[partial_base_head + split_id] = l_i[h];
+        }
     }
 }
 
 // Batched attention reduce kernel
 //
-// Merges NUM_KV_SPLITS partial results per Q head per batch item.
+// Merges `num_kv_splits` partial results per Q head per batch item.
 // Grid: (num_qheads, batch_size)
 // Threads: HEAD_DIM (128)
 __global__ void attention_decode_reduce_batched_kernel(
-    const float* __restrict__ partial_out, // [B, num_qheads, NUM_KV_SPLITS, HEAD_DIM]
-    const float* __restrict__ partial_m,   // [B, num_qheads, NUM_KV_SPLITS]
-    const float* __restrict__ partial_l,   // [B, num_qheads, NUM_KV_SPLITS]
+    const float* __restrict__ partial_out, // [B, num_qheads, num_kv_splits, HEAD_DIM]
+    const float* __restrict__ partial_m,   // [B, num_qheads, num_kv_splits]
+    const float* __restrict__ partial_l,   // [B, num_qheads, num_kv_splits]
     __nv_bfloat16* __restrict__ output,    // [B, q_dim]
     int num_qheads,
-    int head_dim
+    int head_dim,
+    int num_kv_splits
 ) {
     int q_head_idx = blockIdx.x;
     int batch_idx = blockIdx.y;
     int tid = threadIdx.x;  // 0..HEAD_DIM-1
 
-    int base = (batch_idx * num_qheads + q_head_idx) * NUM_KV_SPLITS;
+    int base = (batch_idx * num_qheads + q_head_idx) * num_kv_splits;
 
     float acc = 0.0f;
     float m_global = -INFINITY;
     float l_global = 0.0f;
 
-    #pragma unroll
-    for (int s = 0; s < NUM_KV_SPLITS; s++) {
+    for (int s = 0; s < num_kv_splits; s++) {
         float m_s = partial_m[base + s];
         float l_s = partial_l[base + s];
         float p = partial_out[(base + s) * head_dim + tid];
@@ -611,6 +653,7 @@ cudaError_t fused_gqa_attention_decode_batched(
     int rotary_dim,
     int max_seq_len,
     int batch_size,
+    int num_kv_splits,
     float rms_eps,
     cudaStream_t stream
 ) {
@@ -622,10 +665,11 @@ cudaError_t fused_gqa_attention_decode_batched(
         num_kvheads <= 0 || gqa_ratio <= 0 ||
         num_qheads != num_kvheads * gqa_ratio || head_dim != BATCHED_DECODE_HEAD_DIM ||
         rotary_dim <= 0 || rotary_dim > head_dim || rotary_dim % 2 != 0 ||
-        max_seq_len <= 0 || batch_size <= 0) {
+        max_seq_len <= 0 || batch_size <= 0 || gqa_ratio > BATCHED_DECODE_MAX_GQA ||
+        num_kv_splits <= 0 || num_kv_splits > BATCHED_DECODE_MAX_KV_SPLITS) {
         return cudaErrorInvalidValue;
     }
-    dim3 grid(num_qheads, NUM_KV_SPLITS, batch_size);
+    dim3 grid(num_kvheads, num_kv_splits, batch_size);
     int threads = BATCHED_DECODE_THREADS;
 
     fused_gqa_attention_decode_batched_kernel<<<grid, threads, 0, stream>>>(
@@ -636,7 +680,7 @@ cudaError_t fused_gqa_attention_decode_batched(
         k_cache_ptrs, v_cache_ptrs,
         partial_out, partial_m, partial_l,
         num_qheads, num_kvheads, gqa_ratio, head_dim,
-        rotary_dim, max_seq_len, rms_eps
+        rotary_dim, max_seq_len, num_kv_splits, rms_eps
     );
     return cudaGetLastError();
 }
@@ -649,11 +693,13 @@ cudaError_t attention_decode_reduce_batched(
     int num_qheads,
     int head_dim,
     int batch_size,
+    int num_kv_splits,
     cudaStream_t stream
 ) {
     if (partial_out == nullptr || partial_m == nullptr || partial_l == nullptr ||
         output == nullptr || num_qheads <= 0 || head_dim != BATCHED_DECODE_HEAD_DIM ||
-        batch_size <= 0) {
+        batch_size <= 0 || num_kv_splits <= 0 ||
+        num_kv_splits > BATCHED_DECODE_MAX_KV_SPLITS) {
         return cudaErrorInvalidValue;
     }
     dim3 grid(num_qheads, batch_size);
@@ -661,7 +707,7 @@ cudaError_t attention_decode_reduce_batched(
 
     attention_decode_reduce_batched_kernel<<<grid, threads, 0, stream>>>(
         partial_out, partial_m, partial_l,
-        output, num_qheads, head_dim
+        output, num_qheads, head_dim, num_kv_splits
     );
     return cudaGetLastError();
 }
