@@ -201,6 +201,14 @@ impl DsparkTrainer {
         init_weights: Option<(Vec<f32>, Vec<f32>, usize)>,
         running: Arc<AtomicBool>,
     ) -> Result<Self> {
+        // ISO adapts a seeded head; a cold start makes w2 = 0 (no base spectrum
+        // to freeze), so reject the combination up front rather than failing
+        // every train step on the thread. Plan: reject cold heads before training.
+        ensure!(
+            !(config.iso_fixed_spectrum && init_weights.is_none()),
+            "--dspark-train-iso requires a seeded head (--dspark-markov-init): ISO \
+             freezes the base spectrum and cannot grow a head from a cold w2 = 0 start"
+        );
         let backend: Arc<dyn autograd::Backend> = Arc::new(CpuBackend);
         let store = TensorStore::with_backend(backend);
         let tape = Tape::new();
@@ -579,11 +587,10 @@ impl DsparkTrainer {
             anyhow::bail!("Markov params not yet initialized");
         };
         let (w1_leaf, w2_leaf) = (params.w1, params.w2);
-        if let Some(iso) = self.iso.take() {
-            let w1 = iso.materialize(0, &mut self.store);
-            let w2 = iso.materialize(1, &mut self.store);
-            self.iso = Some(iso);
-            return Ok((w1?, w2?));
+        if let Some(iso) = self.iso.as_ref() {
+            let w1 = iso.materialize(0, &mut self.store)?;
+            let w2 = iso.materialize(1, &mut self.store)?;
+            return Ok((w1, w2));
         }
         let w1 = self.store.to_host(w1_leaf)?;
         let w2 = self.store.to_host(w2_leaf)?;

@@ -325,7 +325,7 @@ fn iso_fixed_spectrum_pins_the_spectrum_without_freezing_the_head() {
                     }
                 }
             }
-            let mut eig = jacobi_eigvals(&g, RANK);
+            let mut eig = train::iso_spectrum::jacobi_eig(&g, RANK).1;
             eig.sort_by(|a, b| a.partial_cmp(b).unwrap());
             eig
         };
@@ -412,7 +412,7 @@ fn iso_resume_recovers_the_same_spectrum() {
                 }
             }
         }
-        let mut e = jacobi_eigvals(&g, RANK);
+        let mut e = train::iso_spectrum::jacobi_eig(&g, RANK).1;
         e.sort_by(|x, y| x.partial_cmp(y).unwrap());
         e
     };
@@ -429,42 +429,18 @@ fn iso_resume_recovers_the_same_spectrum() {
     );
 }
 
-/// Sorted-agnostic symmetric eigenvalues of an SPD `[k,k]` by cyclic Jacobi —
-/// the σ² multiset, for the spectrum-drift check above.
-fn jacobi_eigvals(s: &[f64], k: usize) -> Vec<f64> {
-    let mut a = s.to_vec();
-    for _ in 0..30 {
-        let mut off = 0.0;
-        for p in 0..k {
-            for q in (p + 1)..k {
-                off += a[p * k + q] * a[p * k + q];
-            }
-        }
-        if off.sqrt() <= 1e-15 {
-            break;
-        }
-        for p in 0..k {
-            for q in (p + 1)..k {
-                let apq = a[p * k + q];
-                if apq.abs() < 1e-300 {
-                    continue;
-                }
-                let theta = (a[q * k + q] - a[p * k + p]) / (2.0 * apq);
-                let t = theta.signum() / (theta.abs() + (theta * theta + 1.0).sqrt());
-                let c = 1.0 / (t * t + 1.0).sqrt();
-                let sn = t * c;
-                for i in 0..k {
-                    let (aip, aiq) = (a[i * k + p], a[i * k + q]);
-                    a[i * k + p] = c * aip - sn * aiq;
-                    a[i * k + q] = sn * aip + c * aiq;
-                }
-                for i in 0..k {
-                    let (api, aqi) = (a[p * k + i], a[q * k + i]);
-                    a[p * k + i] = c * api - sn * aqi;
-                    a[q * k + i] = sn * api + c * aqi;
-                }
-            }
-        }
-    }
-    (0..k).map(|r| a[r * k + r]).collect()
+/// ISO on + no seeded head (cold w2 = 0) must be rejected at construction, not
+/// fail every train step on the background thread.
+#[test]
+fn iso_without_seed_is_rejected_at_construction() {
+    let r = DsparkTrainer::new(
+        DsparkTrainConfig {
+            markov_rank: RANK,
+            iso_fixed_spectrum: true,
+            ..Default::default()
+        },
+        None,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    );
+    assert!(r.is_err(), "ISO with no seeded head must fail fast");
 }

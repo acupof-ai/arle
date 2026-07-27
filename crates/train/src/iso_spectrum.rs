@@ -194,8 +194,8 @@ fn gram(id: TensorId, store: &mut TensorStore) -> Result<Vec<f64>> {
 
 /// Symmetric eigendecomposition of an SPD `[k, k]` by cyclic Jacobi. Returns
 /// `(V, λ)`: `V` row-major `[k, k]` with eigenvector `r` in column `r`, and
-/// eigenvalues `λ[r]`.
-fn jacobi_eig(s: &[f64], k: usize) -> (Vec<f64>, Vec<f64>) {
+/// eigenvalues `λ[r]`. Exposed for the DSpark spectrum-invariant test.
+pub fn jacobi_eig(s: &[f64], k: usize) -> (Vec<f64>, Vec<f64>) {
     let mut a = s.to_vec();
     let mut v = identity(k);
     for _ in 0..JACOBI_SWEEPS {
@@ -354,6 +354,7 @@ mod tests {
         g
     }
 
+    /// Relative L2 distance between two flattened matrices / sorted spectra.
     fn frob(a: &[f64], b: &[f64]) -> f64 {
         let diff: f64 = a.iter().zip(b).map(|(x, y)| (x - y).powi(2)).sum();
         let den: f64 = b.iter().map(|x| x * x).sum();
@@ -365,13 +366,6 @@ mod tests {
         let (_, mut l) = jacobi_eig(g, k);
         l.sort_by(|a, b| a.partial_cmp(b).unwrap());
         l
-    }
-
-    /// Relative L2 distance between two sorted spectra.
-    fn rel(a: &[f64], b: &[f64]) -> f64 {
-        let diff: f64 = a.iter().zip(b).map(|(x, y)| (x - y).powi(2)).sum();
-        let den: f64 = b.iter().map(|x| x * x).sum();
-        (diff / den.max(1e-30)).sqrt()
     }
 
     fn grad_of(id: TensorId, store: &mut TensorStore) -> Vec<f32> {
@@ -431,7 +425,7 @@ mod tests {
             k,
         );
         assert!(
-            rel(&sv_kick, &sv0) > 0.1,
+            frob(&sv_kick, &sv0) > 0.1,
             "kick must move the singular values"
         );
 
@@ -443,7 +437,7 @@ mod tests {
             k,
         );
         assert!(
-            rel(&sv_after, &sv0) < 1e-3,
+            frob(&sv_after, &sv0) < 1e-3,
             "retraction must restore σ(W₀): {sv_after:?} vs {sv0:?}"
         );
         assert!(iso.last_drift[0] > 0.0, "drift must report the kick");
