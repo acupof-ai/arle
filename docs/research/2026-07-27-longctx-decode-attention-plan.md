@@ -25,19 +25,15 @@ Arm: no-spec, `bench-agent-32k-8x8.jsonl` (8 sessions × 8 turns, sha
 divides generated tokens by a wall clock that is mostly prefill on a 32k
 workload. Decode speed is `1000 / TPOT`.
 
-TPOT is linear in context, and the slope falls out of the cold/warm split within
-each point (cold = turn 0 at ~32.4k prompt tokens, warm = later turns at ~35.0k):
+TPOT is linear in context. Anchoring on a measured short prompt rather than
+extrapolating (see the byte ledger below): **26.6 ms at 66 tokens, 72.1 ms at
+32k → 1.57 ms per 1k context tokens.** The context-free step is 26.6 ms, not the
+5 ms an earlier two-point extrapolation produced — that value sat below the
+7.3 ms physical weight-read floor, which is how it was caught.
 
-| c | TPOT @ 32.4k | TPOT @ 35.0k | slope | intercept |
-|---|---:|---:|---:|---:|
-| 1 | 73.1 ms | 78.4 ms | 2.09 ms / 1k ctx | 5.0 ms |
-| 4 | 91.1 ms | 96.5 ms | 2.13 ms / 1k ctx | 22.1 ms |
-| 8 | 136.6 ms | 143.1 ms | 2.56 ms / 1k ctx | 53.6 ms |
-
-**~73 of the 77 ms at c=1 is context-scaling.** The context-free step is ~5 ms.
-Whatever is slow is slow per context token, which is attention over the KV
-cache, not the MoE FFN and not the 48 gated-delta-net layers (their state is
-context-independent).
+A single-request ITL probe (no bench harness, no queueing) puts c=1 at 32k at
+**ITL p50 72.1 ms, 3 trials within 0.4%** — the number the rest of this document
+decomposes.
 
 TPOT p99 blowing to ~9 s at c≥4 while p50 stays at 95/140 ms is a separate
 issue — queueing/preemption tail, not decode speed. It gets its own
@@ -50,43 +46,66 @@ Geometry: 64 layers, `full_attention_interval 4` → **16 full-attention layers*
 bf16 KV. So **64 KB of KV per context token** and **2.1 GB read per decode step
 at 32k** — 0.52 ms at 4 TB/s.
 
-Two structural findings in
-`crates/cuda-kernels/csrc/attention/fused_attention.cu`, both read directly off
-the kernel, neither inferred:
+### The hot kernel is TileLang, and it took three wrong turns to find it
 
-**1. KV is read `gqa_ratio` times over.** The grid is keyed on the query head
-(`:319`), and the KV head is derived from it (`:435`):
+`ARLE_QWEN35_PROFILE=1`, one 32k request, 190 decode steps, per-step CUDA time:
 
-```c
-// Grid: (num_qheads, NUM_KV_SPLITS, batch_size)
-int q_head_idx = blockIdx.x;
-int kv_head_idx = q_head_idx / gqa_ratio;   // 24 / 4 = 6
-```
+| label | ms/step | calls/step |
+|---|---:|---:|
+| `qwen/full_attention` (parent, 16 layers) | 56.76 | 16 |
+| → **`qwen/full_paged/attention`** | **50.84** | 16 |
+| `qwen/linear_attention` (parent, 48 GDN layers) | 20.35 | 48 |
+| `qwen/dense_ffn` | 16.37 | 64 |
+| `qwen/full_paged/qkv_gemm` | 2.42 | 16 |
+| everything else | ~5.4 | |
+| **total** | **≈95** | |
 
-Six CTAs each walk the same KV head's entire cache independently. Real traffic
-is **6 × 2.1 = 12.9 GB per step**, not 2.1 GB. Against the measured TPOT that is
-168 GB/s at c=1 and 735 GB/s at c=8 — 4% and 18% of peak.
+**Attention is 53% of the step: 3.18 ms per layer at 32k.** Per layer the KV is
+134 MB, so that is **42 GB/s — 1% of peak**, matching the context-term estimate
+from the short-prompt anchor independently.
 
-**2. The split count is a compile-time constant** (`:325`):
+It resolves through `ffi::resolve_paged_attn_v1` to a **TileLang AOT kernel**,
+`tools/tilelang/batch_decode_paged_hd256.py` → `batch_decode_paged_hd256_q24_kv4`.
+Four diseases, all in that one 285-line file, all read off the source:
 
-```c
-#define NUM_KV_SPLITS 4
-```
+1. **64× M-padding.** `BLOCK_M = 64` with one real query row:
+   ```python
+   # Rows 1..63 are padding to satisfy TileLang's tensor-core
+   # M-divisibility constraint; they are masked out below.
+   ```
+   98.4% of every QK and PV GEMM is padding.
+2. **One CTA per query head.** `T.Kernel(1, num_q_heads, batch_size)` — the KV
+   cache is per KV head, so the `gqa_ratio` = 6 blocks of a group each walk it
+   independently.
+3. **No split-KV.** At c=1 the grid is **24 CTAs × 128 threads = 3072 threads**
+   on a 78-SM, 159 744-thread GPU — about 2% occupancy — and each CTA walks
+   32k serially in 2048 `BLOCK_N=16` iterations at `num_stages=2`.
+4. **`BLOCK_N = 16` is one page, chosen for a GPU we do not serve.** The
+   docstring is explicit: `BLOCK_N=64` needs 128 KB of shared and "would not
+   load on L4 / sm_89 (99 KB cap)". H20 lifts to 228 KB.
 
-At c=1 the grid is (24, 4, 1) = **96 CTAs on a 78-SM H20**, each serially walking
-8192 context tokens in 64-token tiles. This is the same shape as the DSpark
-draft-attention finding earlier the same day
-([2026-07-26-dspark-ragged-window-draft-attention](../experience/wins/2026-07-26-dspark-ragged-window-draft-attention.md)):
-not launch overhead, too few blocks.
+(1) and (2) are what PackGQA fixes — pack the group's `gqa_ratio` real rows into
+M instead of padding, which simultaneously drops BLOCK_M waste from 63/64 to
+10/16 and cuts KV traffic 6×. (3) is split-KV. (4) is an SM-conditional tile.
+Upstream TileLang ships this shape in `example_gqa_decode*`, which this file's
+own docstring cites.
 
-The two interact, and the direction matters: **fixing (1) makes (2) mandatory.**
-A GQA-aware grid is `(num_kvheads, splits, batch)` = **16 CTAs** at c=1 with
-splits still 4. The traffic fix alone would trade a 6× read reduction for a 6×
-occupancy loss.
+### Three wrong turns, recorded because each was cheap to avoid
 
-There is precedent for the tunable form already in the tree: the FA3 decode path
-carries `qwen35_fa3_decode_splits`, runtime-settable and clamped to [2, 256]
-(`crates/infer-cuda/src/runtime_flags.rs:81`). Only this batched path is pinned.
+- **Hand-wrote a GQA + warp-per-key + scaled-splits rewrite of
+  `fused_gqa_attention_decode_batched_kernel`** (`c00efdb9c`): measured −20.5%,
+  reverted (`fcf709e0f`). That kernel is in the **non-paged** lane, which this
+  configuration never enters.
+- **Turned on `--qwen35-fa3-decode`**: ITL p50 72.4 ms vs 72.1 ms off. FA3's
+  call site is in the same unused non-paged lane. Four configurations —
+  batched/per-row × FA3 on/off — all landed at 72.1–72.4 ms, which should have
+  been read immediately as "none of these four is executing".
+- **Concluded from that identity that attention was not the bottleneck**: wrong,
+  caused by an aggregation bug that dropped `full_paged/attention` from the
+  per-step table.
+
+The cost of all three was one command: `ARLE_QWEN35_PROFILE=1`. **Profile before
+touching a kernel, and confirm the kernel you are editing is the one that runs.**
 
 ## The byte ledger (measured from the checkpoint's tensor table)
 
@@ -139,121 +158,82 @@ across a batch, KV traffic does not. A KV-bound engine cannot batch its way out
 — which is exactly the measured 8.6 → 9.9 aggregate decode tok/s from c=1 to
 c=8.
 
-## Do not hand-write this kernel — the vendored path is already wired
-
-`--qwen35-fa3-decode` routes decode through the **vendored FA3 split-KV +
-PackGQA** path. PackGQA is the GQA-aware CTA mapping; split-KV is the scaled
-split count. Both "fixes" below already exist upstream.
-
-It is default OFF, with the reason in the source: *"until the 4K/c=1 needle +
-ITL gate licenses it"*. **That gate was simply never run** — nothing else blocks
-it. The units are git-tracked at `crates/cuda-kernels/vendor/flash-attention/`
-(849 files; note the path is package-relative, not the repo-root `vendor/`,
-which holds only `llama.cpp` and `mlx-sys`), pinned to Dao-AILab @ `fc8cbad6`
-with FA3's own cutlass `71275920`, and the vendored set is exactly
-`flash_fwd_hdim256_bf16_{packgqa,split,paged,paged_split}_sm90.cu` — head_dim
-256, bf16, sm90. Our shape. `scripts/pod-build-env.sh` already exports
-`ARLE_CUDA_ENABLE_FA3=1`, so the pod binaries have carried the real kernels all
-along.
-
-**A hand-written attempt was measured and reverted** (`c00efdb9c`, reverted in
-`fcf709e0f`): GQA-aware grid + warp-per-key QK + SM-scaled splits together ran
-**−20.5%** (32k, c=1: total 1157.6 → 920.2 tok/s, ITL p90 80.9 → 162.9 ms). The
-diagnosis above survives; the hand-rolled fix does not.
-
-## What is still a hypothesis
-
-- That occupancy is the binding constraint at c=1. The CTA count and the
-  bandwidth gap are consistent with it, and the c=1 → c=8 move (96 → 768 CTAs,
-  168 → 735 GB/s) is the right shape, but nothing here measures achieved
-  occupancy or memory throughput. `ncu` decides it.
-- That the ~735 GB/s at c=8 — where the CTA count is no longer starving — is a
-  per-CTA efficiency ceiling rather than a second instance of the same problem.
-  Candidates: unvectorized bf16 loads, page-table indirection per tile, the
-  256-thread/one-output-dim mapping limiting ILP on the QK dot. Not diagnosed.
-- That the 2.09 ms/1k slope is entirely attention. It is the only
-  context-dependent term in the step, but it has not been isolated with a phase
-  timer.
-
 ## What this deletes
 
-Full-attention decode currently has four implementations of one job, selected by
-two boolean flags, and one of them has no caller at all:
+Full-attention decode has five implementations of one job. The profile says
+exactly one of them runs:
 
-| path | selector | state |
+| path | selector | runs at c=1? |
 |---|---|---|
-| `fused_gqa_attention_decode_batched_kernel` + `attention_decode_reduce_batched_kernel` | `--qwen35-batched-decode-attention` (default on) + `head_dim == 256` | hand-rolled split-KV; the −20.5% revert targeted this |
-| per-row loop over the same single-row kernels | the `else` of the same flag | pure A/B arm |
-| paged `decode_prep_paged_hd256_cuda` + devpos kernel | `seq_len == 1` in the paged lane | default there |
-| **vendored FA3 split-KV + PackGQA** | `--qwen35-fa3-decode` (default off) | stub build today |
-| `fused_gqa_attention_single_token_kernel` | — | **zero Rust callers**; compiles into every build (SHARED 35376) |
+| **`batch_decode_paged_hd256` (TileLang)** | `resolve_paged_attn_v1` in the paged lane | **yes — 53% of the step** |
+| `fused_gqa_attention_decode_batched_kernel` + its reduce | `--qwen35-batched-decode-attention` (default on) | no |
+| per-row loop over single-row kernels | the `else` of that flag | no |
+| vendored FA3 split-KV + PackGQA | `--qwen35-fa3-decode` (default off) | no |
+| `fused_gqa_attention_single_token_kernel` | — | **zero Rust callers** |
 
-Licensing FA3 converges these to one. The deletion list, in order:
+Three of the four non-running paths are dead weight that cost measurement time
+today. The deletion list:
 
-1. **Now, no gate needed:** `fused_gqa_attention_single_token_kernel` — dead code,
-   grep confirms no FFI extern and no call site.
-2. **On FA3 license:** the hand-rolled batched kernel and its reduce kernel
-   (~330 lines of `.cu`), their two FFI externs, `QWEN35_BATCHED_DECODE_KV_SPLITS`,
-   and the three `batch_partial_*` scratch slots.
-3. **With them:** `--qwen35-batched-decode-attention` and its per-row `else`
-   arm — an A/B flag has no meaning once there is one implementation.
-4. **And the selector itself:** `--qwen35-fa3-decode` becomes the only path, so
-   the flag goes too. `--qwen35-fa3-decode-splits` stays only if the sweep shows
-   the default is workload-dependent.
+1. **Now:** `fused_gqa_attention_single_token_kernel` — no FFI extern, no call
+   site, compiles into every build.
+2. **Now:** the `--qwen35-batched-decode-attention` `else` arm. A per-row A/B
+   against a kernel that the serving configuration never reaches measures
+   nothing.
+3. **After the TileLang fix lands:** `fused_gqa_attention_decode_batched_kernel`
+   + `attention_decode_reduce_batched_kernel` (~330 lines of `.cu`), their two
+   FFI externs, `QWEN35_BATCHED_DECODE_KV_SPLITS`, the three `batch_partial_*`
+   scratch slots, and the flag itself.
+4. **Decide, do not leave ambiguous:** `--qwen35-fa3-decode`. Either wire FA3
+   into the paged lane (it is the reference implementation of exactly the fix
+   below) and delete the TileLang kernel, or delete the flag. What must not
+   survive is a flag whose gate cannot be run because its call site is
+   unreachable.
 
-What stays: `arle_fa3_stubs.cu` (non-sm90 builds still need the symbols) and the
-paged prep kernel (FA3 consumes prepped q).
-
-The rule this follows is the repo's own — converge on one flow, do not layer an
-adapter beside the old one. A flag that selects between two implementations of
-the same kernel is a half-state, not a feature.
+The rule is the repo's own: converge on one flow. A flag selecting between two
+implementations of the same kernel is a half-state — and this instance cost
+three measurement cycles before the profiler showed neither side was live.
 
 ## Order of work
 
-Each step is gated on the previous one producing a number.
+**Step 1 — make coverage honest.** `qwen/linear_attention` (20.35 ms/step) sums
+to 13.9 ms across its wrapped children; `qwen/full_attention` (56.76) to 54.9.
+Close both gaps before optimizing either, and add a `qwen/step` wrapper so the
+profile is checkable against ITL.
 
-**Step 0 — attribute, no code.** One `ncu` on
-`fused_gqa_attention_decode_batched_kernel` at c=1 and c=8: achieved occupancy,
-`dram__bytes_read.sum` (does it equal 6× the theoretical minimum?), and warp
-stall reasons. Plus a context sweep (4k/8k/16k/32k, same treatment) to confirm
-the slope is linear and attention-shaped rather than a threshold effect. This
-step decides whether the rest of the plan is aimed at the right target.
+**Step 2 — PackGQA + split-KV in `batch_decode_paged_hd256.py`.** Grid over
+`num_kv_heads × splits × batch`; pack the group's `gqa_ratio` query rows into M.
+At 24/4 that is 6 real rows instead of 1, KV read once instead of six times, and
+`4 × splits × batch` blocks instead of 24. Upstream `example_gqa_decode*` is the
+model. Expected direction is large — the current kernel runs at 1% of peak
+bandwidth and 2% occupancy — but nothing here is a measurement.
 
-**Step 0b — free A/B, no code.** Turn on `--qwen35-fa3-decode` and sweep
-`--qwen35-fa3-decode-splits` against the baseline arm. It answers "are splits the
-binding constraint" without writing a kernel, and per the adopt-official-first
-rule it also answers whether a vendored decode kernel can serve head_dim 256 +
-GQA 6 outright, which would delete steps 1–2 rather than implement them.
+**Step 3 — SM-conditional `BLOCK_N`.** 16 exists for L4's 99 KB shared cap.
+Gate it on the compile target rather than pinning the whole family to the
+smallest device.
 
-**Step 1 — GQA-aware CTA mapping.** Grid over `num_kvheads`; each CTA holds the
-`gqa_ratio` query vectors for its KV head and computes that many dot products per
-loaded K tile. Upper bound: 6× less KV traffic, at every concurrency, independent
-of occupancy headroom. Ship with step 2 or the occupancy loss eats it.
+**Step 4 — re-measure, then delete.** Same long-agent dataset, same
+`ARLE_QWEN35_PROFILE` decomposition, plus the 4K/c=1 needle. Only then does the
+deletion list above land.
 
-**Step 2 — scale splits to the GPU.** Replace the `#define` with a runtime value
-chosen so `kv_heads × splits × batch ≈ 2 × SM count` (≈ 39 at c=1 post-step-1,
-falling to ~5 at c=8). Mirror the FA3 flag's shape — runtime-settable, clamped —
-so the sweep that picks the constant is reproducible.
-
-**Step 3 — FP8 KV cache.** Halves the dominant term again: 64 → 32 KB/token.
-`decode_attention_varlen_fp8.cu` and `CudaKvCacheDtype` already exist, so this is
-a serve flag plus a needle gate, not new kernel work. Sequenced last because it
-trades quality for bandwidth and the first two do not.
-
-## Gates
-
-Steps 1–3 are runtime changes on the decode hot path: each needs a dated
-`wins/` entry with a before/after `ncu` (the GPU-kernel gate), and re-measured
-TPOT on this same long-agent dataset — not on short prompts, which is the regime
-error this whole line of work has already made twice
-([block size](../experience/wins/2026-07-26-dspark-block-size-is-a-lever-at-concurrency.md)).
-Step 3 additionally needs a needle gate before any default flip.
+Steps 2–3 are GPU kernel work: each needs `ncu` before/after and a dated
+`wins/` entry, re-measured at 32k — not on short prompts, where the entire
+context term is invisible.
 
 ## Rule
 
+**Profile first, and prove the kernel you are about to edit is the one that
+runs.** Three optimization attempts here — a hand-written kernel, a vendored
+FA3 flag, and a four-way configuration sweep — all landed on code the serving
+path never executes, because the model has two full-attention lanes and the
+flags only reach the unused one. One `ARLE_QWEN35_PROFILE=1` run answered it,
+and every step before that was wasted.
+
 Report prefill and decode separately or the headline number is meaningless: the
 same run that reads as "4.1 output tok/s" is a saturated 4086 tok/s prefill plus
-a decode running at 4% of memory peak, and only one of those is worth an
-engineer's week. And when a decode step is slow, get the KV traffic from the
-grid mapping before profiling anything — a `blockIdx` keyed on the query head
-under GQA is a `gqa_ratio`× read amplification sitting in plain sight.
+a decode at 1% of memory peak, and only one of those is worth an engineer's
+week.
+
+And when a portability constraint sets a performance constant — `BLOCK_N = 16`
+so the cubin loads on L4 — write down which device pays for it. This one costs
+the H20 serving path a 4× longer inner loop for a GPU that is not in the
+support matrix.
