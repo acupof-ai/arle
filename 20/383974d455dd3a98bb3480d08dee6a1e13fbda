@@ -1,0 +1,33 @@
+crates/autograd/src/tape.rs
+  s_cd9a6a56daabe3::t_035733296c7ad2 4,327-359,367-368,389-390,432-461,702-710,788-790,832-834,873-880,889,892,895,900-902,915-916,918,926,928,933,939-943,945,961-993
+crates/autograd/src/ops/checkpoint.rs
+  s_089e26e9e41120::t_c53c333459cefd 167-170,173,176-178
+crates/train/src/qwen35.rs
+  s_cd9a6a56daabe3::t_ed00c27dc71e4c 22,625,628,636,638,647,649-652
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "20383974d455dd3a98bb3480d08dee6a1e13fbda",
+  "prompts": {},
+  "sessions": {
+    "s_089e26e9e41120": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "93e66a8f-c20a-4ba9-96f2-283f6d98cbb1",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_cd9a6a56daabe3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "bf8ec25a-c05e-46a4-b093-1e67694ece0c",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
