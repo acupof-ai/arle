@@ -686,17 +686,20 @@ fn fused_linear_ce_loss_indexed_device(
     Ok(loss_id)
 }
 
-/// How the (detached) importance ratio `r` gates the base weight inside
-/// [`fused_linear_pg_loss_indexed`].
+/// How the importance ratio `r` turns a detached advantage into the effective
+/// `-w·logπθ` gradient coefficient used by [`fused_linear_pg_loss_indexed`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum WeightForm {
-    /// Binary DIS gate: keep iff `(1−lo) < r < (1+hi)`, else drop the token.
+    /// SAO DIS: keep `base` iff `(1−lo) < r < (1+hi)`, else drop the token.
     HardGate { lo: f32, hi: f32 },
-    /// CISPO-family: the clamped ratio IS the gate factor, `clamp(r, 1−lo, 1+hi)`.
-    SoftClamp { lo: f32, hi: f32 },
-    /// Caller already folded any ratio factor into the weight (e.g. GSPO's
-    /// sequence-level clamp); the op applies the weight as-is.
-    Precomputed,
+    /// CISPO: use the detached coefficient `base·clamp(r, 1−lo, 1+hi)`.
+    DetachedSoftClamp { lo: f32, hi: f32 },
+    /// PPO clipped surrogate: `base·r` unless the sign-dependent clipped branch
+    /// is active (positive above `1+hi`, negative below `1−lo`), then zero.
+    PpoClip { lo: f32, hi: f32 },
+    /// Caller already computed the effective gradient coefficient. `ratio` and
+    /// `clipped` preserve the raw sequence-level GSPO telemetry.
+    Precomputed { ratio: f32, clipped: bool },
 }
 
 /// Off-policy diagnostics accumulated by [`fused_linear_pg_loss_indexed`]:
@@ -728,36 +731,63 @@ impl PgStats {
     pub fn ratio_mean(&self) -> f64 {
         self.ratio_sum / self.tokens.max(1) as f64
     }
-    fn observe(&mut self, logp: f32, rollout_logp: f32, clipped: bool) {
+    fn observe(
+        &mut self,
+        logp: f32,
+        rollout_logp: f32,
+        token_ratio: f32,
+        telemetry_ratio: f32,
+        clipped: bool,
+    ) {
         let d = f64::from(logp - rollout_logp);
-        let r = d.exp();
-        self.kl_sum += r - 1.0 - d;
+        let token_ratio = f64::from(token_ratio);
+        let telemetry_ratio = f64::from(telemetry_ratio);
+        self.kl_sum += token_ratio - 1.0 - d;
         self.clipped += usize::from(clipped);
         self.tokens += 1;
-        self.ratio_sum += r;
-        self.ratio_max = self.ratio_max.max(r);
+        self.ratio_sum += telemetry_ratio;
+        self.ratio_max = self.ratio_max.max(telemetry_ratio);
     }
 }
 
-/// `w = base·gate(r) − kl_coef·(r−1)`, all DETACHED (k3 KL gradient w.r.t. logp
-/// is `r−1`; the sign makes descending the loss decrease KL(π_b‖πθ)). Single
-/// source of truth for the host and device paths. Returns `(w, ratio_clipped)`.
+fn checked_ratio(logp: f32, rollout_logp: f32) -> Result<f32> {
+    let ratio = (f64::from(logp) - f64::from(rollout_logp)).exp();
+    if !ratio.is_finite() || ratio <= 0.0 || ratio > f64::from(f32::MAX) {
+        return Err(AutogradError::TapeInvariant(
+            "fused_linear_pg_loss_indexed: importance ratio must be finite, positive, and fit f32",
+        ));
+    }
+    let ratio = ratio as f32;
+    if ratio == 0.0 {
+        return Err(AutogradError::TapeInvariant(
+            "fused_linear_pg_loss_indexed: importance ratio underflowed f32",
+        ));
+    }
+    Ok(ratio)
+}
+
+/// Effective detached gradient coefficient for `-w·logp`, plus whether the
+/// ratio was outside the form's active interval. The PPO branch is the exact
+/// derivative of `-min(rA, clamp(r)A)`: the clipped branch has zero derivative.
 pub fn pg_token_weight(form: WeightForm, base: f32, r: f32, kl_coef: f32) -> (f32, bool) {
-    let (gate, clipped) = match form {
+    let (mut w, clipped) = match form {
         WeightForm::HardGate { lo, hi } => {
             if (1.0 - lo) < r && r < (1.0 + hi) {
-                (1.0, false)
+                (base, false)
             } else {
                 (0.0, true)
             }
         }
-        WeightForm::SoftClamp { lo, hi } => {
+        WeightForm::DetachedSoftClamp { lo, hi } => {
             let clamped = r.clamp(1.0 - lo, 1.0 + hi);
-            (clamped, clamped != r)
+            (base * clamped, clamped != r)
         }
-        WeightForm::Precomputed => (1.0, false),
+        WeightForm::PpoClip { lo, hi } => {
+            let clipped = (base >= 0.0 && r > 1.0 + hi) || (base < 0.0 && r < 1.0 - lo);
+            (if clipped { 0.0 } else { base * r }, clipped)
+        }
+        WeightForm::Precomputed { clipped, .. } => (base, clipped),
     };
-    let mut w = base * gate;
     // Guarded so kl_coef=0 stays byte-identical even at r=inf (0.0·inf = NaN).
     if kl_coef != 0.0 {
         w -= kl_coef * (r - 1.0);
@@ -810,16 +840,20 @@ pub fn fused_linear_pg_loss_indexed(
         });
     }
     let (lo, hi) = match form {
-        WeightForm::HardGate { lo, hi } | WeightForm::SoftClamp { lo, hi } => (lo, hi),
-        WeightForm::Precomputed => (0.0, 0.0),
+        WeightForm::HardGate { lo, hi }
+        | WeightForm::DetachedSoftClamp { lo, hi }
+        | WeightForm::PpoClip { lo, hi } => (lo, hi),
+        WeightForm::Precomputed { .. } => (0.0, 0.0),
     };
     if !(token_weight.iter().all(|a| a.is_finite())
         && lo.is_finite()
+        && lo >= 0.0
         && hi.is_finite()
+        && hi >= 0.0
         && kl_coef.is_finite())
     {
         return Err(AutogradError::TapeInvariant(
-            "fused_linear_pg_loss_indexed: token_weight/clip bounds/kl_coef must be finite",
+            "fused_linear_pg_loss_indexed: token_weight/clip bounds/kl_coef must be finite and clip bounds must be >= 0",
         ));
     }
     if rollout_logprobs.iter().any(|value| !value.is_finite()) {
@@ -878,9 +912,22 @@ pub fn fused_linear_pg_loss_indexed(
             let log_probs = log_softmax_row(&logits);
             let logp = log_probs[target];
             // Detached weight: ratio/gate/base are constants, no grad path.
-            let r = (logp - rollout_logprobs[local]).exp();
-            let (w, clipped) = pg_token_weight(form, token_weight[local], r, kl_coef);
-            stats.observe(logp, rollout_logprobs[local], clipped);
+            let token_ratio = checked_ratio(logp, rollout_logprobs[local])?;
+            let telemetry_ratio = match form {
+                WeightForm::Precomputed { ratio, .. } => ratio,
+                _ => token_ratio,
+            };
+            let (mut w, clipped) = pg_token_weight(form, token_weight[local], telemetry_ratio, 0.0);
+            if kl_coef != 0.0 {
+                w -= kl_coef * (token_ratio - 1.0);
+            }
+            stats.observe(
+                logp,
+                rollout_logprobs[local],
+                token_ratio,
+                telemetry_ratio,
+                clipped,
+            );
             loss_sum -= w * logp;
 
             // d_logits = w · (softmax − onehot), the CE gradient scaled by w.
@@ -1011,9 +1058,22 @@ fn fused_linear_pg_loss_indexed_device(
         let mut neg_w = Vec::with_capacity(gathered_logp.len());
         for (offset, &logp) in gathered_logp.iter().enumerate() {
             let idx = chunk_start + offset;
-            let r = (logp - rollout_logprobs[idx]).exp();
-            let (w, clipped) = pg_token_weight(form, token_weight[idx], r, kl_coef);
-            stats.observe(logp, rollout_logprobs[idx], clipped);
+            let token_ratio = checked_ratio(logp, rollout_logprobs[idx])?;
+            let telemetry_ratio = match form {
+                WeightForm::Precomputed { ratio, .. } => ratio,
+                _ => token_ratio,
+            };
+            let (mut w, clipped) = pg_token_weight(form, token_weight[idx], telemetry_ratio, 0.0);
+            if kl_coef != 0.0 {
+                w -= kl_coef * (token_ratio - 1.0);
+            }
+            stats.observe(
+                logp,
+                rollout_logprobs[idx],
+                token_ratio,
+                telemetry_ratio,
+                clipped,
+            );
             neg_w.push(-w);
         }
         let neg_w_id = store.from_slice(&neg_w, &[chunk_len])?;
@@ -1639,14 +1699,45 @@ mod tests {
         token_weight: &[f32],
         form: WeightForm,
         chunk_rows: usize,
-    ) -> Result<(f32, Vec<f32>, Vec<f32>)> {
+    ) -> Result<(f32, Vec<f32>, Vec<f32>, PgStats)> {
+        run_pg_with_kl(
+            hidden_data,
+            weight_data,
+            seq,
+            hidden_dim,
+            vocab,
+            positions,
+            targets,
+            rollout_logprobs,
+            token_weight,
+            form,
+            0.0,
+            chunk_rows,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_pg_with_kl(
+        hidden_data: &[f32],
+        weight_data: &[f32],
+        seq: usize,
+        hidden_dim: usize,
+        vocab: usize,
+        positions: &[i32],
+        targets: &[i32],
+        rollout_logprobs: &[f32],
+        token_weight: &[f32],
+        form: WeightForm,
+        kl_coef: f32,
+        chunk_rows: usize,
+    ) -> Result<(f32, Vec<f32>, Vec<f32>, PgStats)> {
         let mut store = TensorStore::default();
         let mut tape = Tape::new();
         let hidden = store.from_slice(hidden_data, &[1, seq, hidden_dim])?;
         store.get_mut(hidden).expect("hidden").requires_grad = true;
         let weight = store.from_slice(weight_data, &[vocab, hidden_dim])?;
         store.get_mut(weight).expect("weight").requires_grad = true;
-        let (loss, _stats) = fused_linear_pg_loss_indexed(
+        let (loss, stats) = fused_linear_pg_loss_indexed(
             hidden,
             weight,
             positions,
@@ -1654,7 +1745,7 @@ mod tests {
             rollout_logprobs,
             token_weight,
             form,
-            0.0,
+            kl_coef,
             chunk_rows,
             &mut store,
             &mut tape,
@@ -1663,7 +1754,7 @@ mod tests {
         let grads: HashMap<_, _> = tape.backward(loss, &mut store)?;
         let d_hidden = store.to_host(*grads.get(&hidden).expect("d_hidden"))?;
         let d_weight = store.to_host(*grads.get(&weight).expect("d_weight"))?;
-        Ok((loss_value, d_hidden, d_weight))
+        Ok((loss_value, d_hidden, d_weight, stats))
     }
 
     fn max_abs(a: &[f32], b: &[f32]) -> f32 {
@@ -1672,6 +1763,212 @@ mod tests {
             .zip(b.iter())
             .map(|(x, y)| (x - y).abs())
             .fold(0.0_f32, f32::max)
+    }
+
+    fn max_abs_scaled(actual: &[f32], reference: &[f32], scale: f32) -> f32 {
+        assert_eq!(actual.len(), reference.len());
+        actual
+            .iter()
+            .zip(reference)
+            .map(|(actual, reference)| (actual - scale * reference).abs())
+            .fold(0.0_f32, f32::max)
+    }
+
+    #[test]
+    fn ppo_fused_gradient_matches_two_signs_three_ratio_regions() -> Result<()> {
+        let (seq, hidden_dim, vocab) = (1usize, 8usize, 16usize);
+        let hidden_data = deterministic_vec(seq * hidden_dim, 17);
+        let weight_data = deterministic_vec(vocab * hidden_dim, 23);
+        let positions = [0];
+        let targets = [5];
+        let current = model_target_logprobs(
+            &hidden_data,
+            &weight_data,
+            hidden_dim,
+            vocab,
+            &positions,
+            &targets,
+        )[0];
+        let (_, ce_dh, ce_dw) = run_ce(
+            &hidden_data,
+            &weight_data,
+            seq,
+            hidden_dim,
+            vocab,
+            &positions,
+            &targets,
+            1,
+        )?;
+        let form = WeightForm::PpoClip { lo: 0.2, hi: 0.2 };
+        let cases: [(f32, f32, f32); 6] = [
+            (1.0, 0.5, 0.5),
+            (1.0, 1.0, 1.0),
+            (1.0, 1.5, 0.0),
+            (-1.0, 0.5, 0.0),
+            (-1.0, 1.0, -1.0),
+            (-1.0, 1.5, -1.5),
+        ];
+        for (advantage, ratio, expected_scale) in cases {
+            let rollout = [current - ratio.ln()];
+            let (_, pg_dh, pg_dw, _) = run_pg(
+                &hidden_data,
+                &weight_data,
+                seq,
+                hidden_dim,
+                vocab,
+                &positions,
+                &targets,
+                &rollout,
+                &[advantage],
+                form,
+                1,
+            )?;
+            let dh_err = max_abs_scaled(&pg_dh, &ce_dh, expected_scale);
+            let dw_err = max_abs_scaled(&pg_dw, &ce_dw, expected_scale);
+            assert!(
+                dh_err < 1e-5 && dw_err < 1e-5,
+                "advantage={advantage} ratio={ratio} scale={expected_scale} dh={dh_err} dw={dw_err}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn cispo_fused_gradient_remains_detached_soft_clamp() -> Result<()> {
+        let (seq, hidden_dim, vocab) = (1usize, 8usize, 16usize);
+        let hidden_data = deterministic_vec(seq * hidden_dim, 29);
+        let weight_data = deterministic_vec(vocab * hidden_dim, 31);
+        let positions = [0];
+        let targets = [7];
+        let current = model_target_logprobs(
+            &hidden_data,
+            &weight_data,
+            hidden_dim,
+            vocab,
+            &positions,
+            &targets,
+        )[0];
+        let (_, ce_dh, ce_dw) = run_ce(
+            &hidden_data,
+            &weight_data,
+            seq,
+            hidden_dim,
+            vocab,
+            &positions,
+            &targets,
+            1,
+        )?;
+        let ratio = 3.0f32;
+        let (_, pg_dh, pg_dw, _) = run_pg(
+            &hidden_data,
+            &weight_data,
+            seq,
+            hidden_dim,
+            vocab,
+            &positions,
+            &targets,
+            &[current - ratio.ln()],
+            &[-2.0],
+            WeightForm::DetachedSoftClamp { lo: 0.2, hi: 0.5 },
+            1,
+        )?;
+        let expected_scale = -3.0;
+        assert!(max_abs_scaled(&pg_dh, &ce_dh, expected_scale) < 1e-5);
+        assert!(max_abs_scaled(&pg_dw, &ce_dw, expected_scale) < 1e-5);
+        Ok(())
+    }
+
+    #[test]
+    fn precomputed_preserves_sequence_ratio_telemetry() -> Result<()> {
+        let hidden_data = deterministic_vec(8, 37);
+        let weight_data = deterministic_vec(16 * 8, 41);
+        let current = model_target_logprobs(&hidden_data, &weight_data, 8, 16, &[0], &[3])[0];
+        let token_ratio = 2.0f32;
+        let (_, _, _, stats) = run_pg(
+            &hidden_data,
+            &weight_data,
+            1,
+            8,
+            16,
+            &[0],
+            &[3],
+            &[current - token_ratio.ln()],
+            &[0.0],
+            WeightForm::Precomputed {
+                ratio: 1.5,
+                clipped: true,
+            },
+            1,
+        )?;
+        assert_eq!(stats.tokens, 1);
+        assert_eq!(stats.clipped, 1);
+        assert!((stats.ratio_sum - 1.5).abs() < 1e-6);
+        assert!((stats.ratio_max - 1.5).abs() < 1e-6);
+        let expected_kl = f64::from(token_ratio) - 1.0 - f64::from(token_ratio.ln());
+        assert!((stats.kl_sum - expected_kl).abs() < 1e-6);
+        let (_, kl_dh, kl_dw, _) = run_pg_with_kl(
+            &hidden_data,
+            &weight_data,
+            1,
+            8,
+            16,
+            &[0],
+            &[3],
+            &[current - token_ratio.ln()],
+            &[0.0],
+            WeightForm::Precomputed {
+                ratio: 1.5,
+                clipped: true,
+            },
+            0.25,
+            1,
+        )?;
+        let (_, ce_dh, ce_dw) = run_ce(&hidden_data, &weight_data, 1, 8, 16, &[0], &[3], 1)?;
+        let expected_scale = -0.25 * (token_ratio - 1.0);
+        assert!(max_abs_scaled(&kl_dh, &ce_dh, expected_scale) < 1e-5);
+        assert!(max_abs_scaled(&kl_dw, &ce_dw, expected_scale) < 1e-5);
+        Ok(())
+    }
+
+    #[test]
+    fn pg_rejects_ratio_overflow_and_negative_bounds() -> Result<()> {
+        let hidden_data = deterministic_vec(8, 43);
+        let weight_data = deterministic_vec(16 * 8, 47);
+        let overflow = run_pg(
+            &hidden_data,
+            &weight_data,
+            1,
+            8,
+            16,
+            &[0],
+            &[3],
+            &[-1000.0],
+            &[1.0],
+            WeightForm::PpoClip { lo: 0.2, hi: 0.2 },
+            1,
+        )
+        .unwrap_err();
+        assert!(overflow.to_string().contains("importance ratio"));
+
+        let underflow = checked_ratio(-104.0, 0.0).unwrap_err();
+        assert!(underflow.to_string().contains("underflowed"));
+
+        let negative = run_pg(
+            &hidden_data,
+            &weight_data,
+            1,
+            8,
+            16,
+            &[0],
+            &[3],
+            &[-1.0],
+            &[1.0],
+            WeightForm::HardGate { lo: -0.1, hi: 0.2 },
+            1,
+        )
+        .unwrap_err();
+        assert!(negative.to_string().contains("clip bounds must be >= 0"));
+        Ok(())
     }
 
     /// Unit-weight reduction: with `advantage = 1/N` and `rollout_logprobs` set
@@ -1705,7 +2002,7 @@ mod tests {
             &targets,
             3,
         )?;
-        let (pg_loss, pg_dh, pg_dw) = run_pg(
+        let (pg_loss, pg_dh, pg_dw, _) = run_pg(
             &hidden_data,
             &weight_data,
             seq,
