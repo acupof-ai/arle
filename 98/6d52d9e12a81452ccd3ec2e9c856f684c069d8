@@ -1,0 +1,27 @@
+crates/cli/src/args.rs
+  s_0687ad858d0f07::t_e3c6a0b71363cb 2022-2037
+crates/cli/src/train_cli.rs
+  s_0687ad858d0f07::t_5d63b77840dcc5 3459-3480,3485,3513,3661-3671,3760,3808-3814,3823-3827,3898,3923,3926-3928
+crates/train/src/cc_harness.rs
+  s_0687ad858d0f07::t_7bf6e407d5c216 134-180,470-510
+docs/experience/wins/2026-07-27-dapo-dynamic-sampling.md
+  s_0687ad858d0f07::t_8a60a5023a5ed5 1-61
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "986d52d9e12a81452ccd3ec2e9c856f684c069d8",
+  "prompts": {},
+  "sessions": {
+    "s_0687ad858d0f07": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6cab79ae-2d5c-4239-81e7-196afb71725e",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
