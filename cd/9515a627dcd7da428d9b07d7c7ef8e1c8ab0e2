@@ -1,0 +1,53 @@
+crates/autograd/src/ops/checkpoint.rs
+  s_089e26e9e41120::t_c53c333459cefd 165-168,171,174-176
+  s_7685101b283eb6::t_08c2648ccbcb6b 164
+  s_7685101b283eb6::t_df3c13f14b3752 161-163
+  s_b829a168ce1033::t_79e1e7e4c3f16e 116,148,158-159
+crates/autograd/src/tape.rs
+  s_cd9a6a56daabe3::t_035733296c7ad2 5,328-360,368-369,390-391,429,433-468,709-711,789-791,833-835,874-881,890,893,896,901-903,916-917,919,927,929,934,940-944,946,962-1001
+  s_cd9a6a56daabe3::t_484c557b9cce24 4
+crates/train/src/qwen35.rs
+  s_cd9a6a56daabe3::t_ed00c27dc71e4c 22,625,628,636,638,647,649-652
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "cd9515a627dcd7da428d9b07d7c7ef8e1c8ab0e2",
+  "prompts": {},
+  "sessions": {
+    "s_089e26e9e41120": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "93e66a8f-c20a-4ba9-96f2-283f6d98cbb1",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_7685101b283eb6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a686b0f7f7bfc7a64",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_b829a168ce1033": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "agent-a207a0519a1e860e7",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    },
+    "s_cd9a6a56daabe3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "bf8ec25a-c05e-46a4-b093-1e67694ece0c",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
