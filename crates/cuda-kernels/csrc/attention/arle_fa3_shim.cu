@@ -79,9 +79,11 @@ typedef struct {
     // inside a page, k_head_stride = between KV heads, k_batch_stride = between
     // pages. That expresses the qwen35 HND pool [page, h_k, page_size, d]
     // without a relayout (paged_kv.h builds a CuTe tensor from these directly).
-    const int* page_table;  // i32 [num_pages] page indices for this request
+    const int* page_table;  // i32 page indices for this request
     int page_size;
-    int num_pages;          // pages in the pool, not in this request
+    int num_pages;          // pages in the POOL (the 4th dim's extent)
+    long long k_page_stride;  // elements between pages in the pool
+    long long v_page_stride;
 } ArleFa3FwdHd256Args;
 
 cudaError_t arle_fa3_fwd_hd256_bf16_cuda(const ArleFa3FwdHd256Args* a,
@@ -121,10 +123,17 @@ cudaError_t arle_fa3_fwd_hd256_bf16_cuda(const ArleFa3FwdHd256Args* a,
     };
     params.q_batch_stride =
         batch_extent(a->seqlen_q, a->q_row_stride, a->num_heads, a->q_head_stride);
+    // Paged: the 4th (batch) dim of FA3's K/V tensor IS the page dim
+    // (flash_fwd_launch_template.h:98-100), so its stride is the pool's page
+    // stride, not the contiguous batch extent.
     params.k_batch_stride =
-        batch_extent(a->seqlen_k, a->k_row_stride, a->num_heads_k, a->k_head_stride);
+        a->page_table != nullptr
+            ? a->k_page_stride
+            : batch_extent(a->seqlen_k, a->k_row_stride, a->num_heads_k, a->k_head_stride);
     params.v_batch_stride =
-        batch_extent(a->seqlen_k, a->v_row_stride, a->num_heads_k, a->v_head_stride);
+        a->page_table != nullptr
+            ? a->v_page_stride
+            : batch_extent(a->seqlen_k, a->v_row_stride, a->num_heads_k, a->v_head_stride);
     params.o_batch_stride =
         batch_extent(a->seqlen_q, a->o_row_stride, a->num_heads, a->o_head_stride);
 
@@ -169,7 +178,8 @@ cudaError_t arle_fa3_fwd_hd256_bf16_cuda(const ArleFa3FwdHd256Args* a,
     // Non-TMA gather: qwen35's page_size (16) is below the hdim256 kBlockN and
     // the TMA paged path asserts page_size % kBlockN == 0.
     const bool paged = a->page_table != nullptr;
-    if (paged && (a->page_size <= 0 || a->num_pages <= 0)) {
+    if (paged && (a->page_size <= 0 || a->num_pages <= 0 ||
+                  a->k_page_stride <= 0 || a->v_page_stride <= 0)) {
         return cudaErrorInvalidValue;
     }
     params.page_table = paged ? const_cast<int*>(a->page_table) : nullptr;

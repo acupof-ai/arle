@@ -5976,6 +5976,8 @@ impl Qwen35Model {
                                 page_table: std::ptr::null(),
                                 page_size: 0,
                                 num_pages: 0,
+                                k_page_stride: 0,
+                                v_page_stride: 0,
                             };
                             ffi::arle_fa3_fwd_hd256_bf16_cuda(&args, self.ctx.stream.cu_stream())
                                 .result()?;
@@ -6059,6 +6061,8 @@ impl Qwen35Model {
                                 page_table: std::ptr::null(),
                                 page_size: 0,
                                 num_pages: 0,
+                                k_page_stride: 0,
+                                v_page_stride: 0,
                             };
                             ffi::arle_fa3_fwd_hd256_bf16_cuda(&args, self.ctx.stream.cu_stream())
                                 .result()?;
@@ -6434,7 +6438,6 @@ impl Qwen35Model {
                             && qwen35_fa3_enabled(&self.ctx)
                         {
                             let kv_len = meta.start_pos + rows;
-                            let pages = meta.page_offsets[1] - meta.page_offsets[0];
                             let splits = qwen35_fa3_decode_splits();
                             let lse = fa3_lse.get(&self.ctx, self.local_q_heads * rows)?;
                             let oaccum = fa3_oaccum
@@ -6478,7 +6481,9 @@ impl Qwen35Model {
                                 page_table: (kv_indices_ptr + (meta.page_offsets[0] * 4) as u64)
                                     as *const i32,
                                 page_size: pool.page_size as i32,
-                                num_pages: pages as i32,
+                                num_pages: pool.max_total_pages as i32,
+                                k_page_stride: stride_page as i64,
+                                v_page_stride: stride_page as i64,
                             };
                             // SAFETY: q/o are the live prepped/out buffers; k/v
                             // are the layer's pool base; the page table is this
