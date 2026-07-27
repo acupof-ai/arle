@@ -157,6 +157,55 @@ impl IsoFrames {
     }
 }
 
+/// Non-mutating spectrum measurement, independent of retraction. Captures the
+/// base head's singular values (as sorted Gram eigenvalues σ²) once, then reports
+/// each parameter's relative spectral drift `‖σ²(W) − σ²(W₀)‖ / ‖σ²(W₀)‖` on
+/// demand — so an ISO-**off** run genuinely measures whether unconstrained
+/// updates leave the spectrum near-fixed (the paper's premise), not just the
+/// ISO-on retraction residual. This is the drift the α-sweep reads.
+pub struct SpectrumProbe {
+    /// `(param, sorted σ²(W₀), k)`, parallel to the captured param list.
+    bases: Vec<(TensorId, Vec<f64>, usize)>,
+}
+
+impl SpectrumProbe {
+    /// Capture the base spectrum of each parameter. Rank-2 `[n, k]`, `n >= k`.
+    pub fn capture(params: &[TensorId], store: &mut TensorStore) -> Result<Self> {
+        let mut bases = Vec::with_capacity(params.len());
+        for &id in params {
+            let k = store
+                .get(id)
+                .map(|t| t.shape.clone())
+                .ok_or_else(|| anyhow::anyhow!("iso probe: parameter {id:?} not in store"))?
+                .get(1)
+                .copied()
+                .ok_or_else(|| anyhow::anyhow!("iso probe: parameter {id:?} is not rank-2"))?;
+            bases.push((id, sorted_eigvals(&gram(id, store)?, k), k));
+        }
+        Ok(Self { bases })
+    }
+
+    /// Relative spectral drift per captured parameter, measured on the current
+    /// weights without mutating them.
+    pub fn drift(&self, store: &mut TensorStore) -> Result<Vec<f32>> {
+        let mut out = Vec::with_capacity(self.bases.len());
+        for (id, base, k) in &self.bases {
+            let now = sorted_eigvals(&gram(*id, store)?, *k);
+            let num: f64 = base.iter().zip(&now).map(|(a, b)| (a - b).powi(2)).sum();
+            let den: f64 = base.iter().map(|a| a * a).sum();
+            out.push((num / den.max(1e-30)).sqrt() as f32);
+        }
+        Ok(out)
+    }
+}
+
+/// Sorted eigenvalues of a symmetric `[k, k]` — the σ² multiset.
+fn sorted_eigvals(gram: &[f64], k: usize) -> Vec<f64> {
+    let (_, mut lambda) = jacobi_eig(gram, k);
+    lambda.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    lambda
+}
+
 /// `X ← X (XᵀX)^{-1/2}` for a `[·, k]` tensor; returns the relative drift
 /// `‖X − X'‖_F / ‖X‖_F`.
 fn polar_in_place(id: TensorId, k: usize, store: &mut TensorStore) -> Result<f32> {
@@ -494,5 +543,32 @@ mod tests {
         let mut store = store();
         let id = store.alloc(Tensor::new(vec![0.0; 32 * 4], vec![32, 4], true).unwrap());
         assert!(IsoFrames::capture(&[id], &mut store).is_err());
+    }
+
+    #[test]
+    fn spectrum_probe_reports_zero_then_the_kick() {
+        // The ISO-off premise instrument: ~0 drift on an unchanged head, rising
+        // drift once a step scales the spectrum. Non-mutating.
+        let mut store = store();
+        let (n, k) = (48, 6);
+        let id = store.alloc(Tensor::new(base(n, k), vec![n, k], true).unwrap());
+        let probe = SpectrumProbe::capture(&[id], &mut store).unwrap();
+        assert!(
+            probe.drift(&mut store).unwrap()[0] < 1e-5,
+            "unchanged head must read ~0"
+        );
+
+        // A pure frame rotation leaves σ fixed → still ~0 (the premise's null).
+        // A spectrum-scaling kick must move it.
+        {
+            let p = store.get_mut(id).unwrap();
+            for x in p.data.iter_mut() {
+                *x *= 1.3;
+            }
+        }
+        assert!(
+            probe.drift(&mut store).unwrap()[0] > 0.1,
+            "scaled head must read drift"
+        );
     }
 }

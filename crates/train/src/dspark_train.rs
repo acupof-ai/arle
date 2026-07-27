@@ -173,9 +173,15 @@ pub struct DsparkTrainer {
     /// ISO frame optimizer, captured from the seeded head on the first step.
     /// `None` when `iso_fixed_spectrum` is off; the head then trains dense w1/w2.
     iso: Option<crate::iso_spectrum::IsoFrames>,
+    /// Non-mutating spectrum probe, captured on BOTH arms — measures the head's
+    /// σ²-drift from its base so an ISO-off run reports whether unconstrained
+    /// updates stay near-isospectral (the paper's premise), not just the ISO-on
+    /// retraction residual.
+    spectrum_probe: Option<crate::iso_spectrum::SpectrumProbe>,
     baseline_ema: f32,
-    /// Per-parameter `‖ΔW‖/‖W‖` of the last retraction — measures the paper's
-    /// premise on this head instead of assuming it. Empty when ISO is off.
+    /// Per-parameter relative spectral drift measured at the last cadence — the
+    /// paper's premise on this head, emitted on both ISO on/off. Empty until the
+    /// first cadence.
     last_iso_drift: Vec<f32>,
     /// Completed steps. Drives one shared cadence for retraction and publish,
     /// which is what guarantees a published head is always on the manifold.
@@ -221,6 +227,7 @@ impl DsparkTrainer {
             tape,
             params: None,
             iso: None,
+            spectrum_probe: None,
             last_iso_drift: Vec::new(),
             steps: 0,
             init_weights,
@@ -352,13 +359,19 @@ impl DsparkTrainer {
         // first experience, so the trainer is model-agnostic at construction.
         if self.params.is_none() {
             self.init_params(vocab_size)?;
+            let p = self.params.as_ref().unwrap();
+            let (w1, w2) = (p.w1, p.w2);
+            // Base spectrum, captured on BOTH arms before any step — so an ISO-off
+            // run measures whether unconstrained updates stay near-isospectral.
+            self.spectrum_probe = Some(crate::iso_spectrum::SpectrumProbe::capture(
+                &[w1, w2],
+                &mut self.store,
+            )?);
             if self.config.iso_fixed_spectrum {
-                // Capture from the seeded head, before any step — these ARE the
-                // base weights ISO's Σ₀ is defined against. The w1/w2 leaves stay
-                // as the reconstruction target; the frames become trainable.
-                let p = self.params.as_ref().unwrap();
+                // The w1/w2 leaves stay as the reconstruction target; the frames
+                // become trainable. Σ₀ is defined against these base weights.
                 self.iso = Some(crate::iso_spectrum::IsoFrames::capture(
-                    &[p.w1, p.w2],
+                    &[w1, w2],
                     &mut self.store,
                 )?);
             }
@@ -547,8 +560,7 @@ impl DsparkTrainer {
         self.baseline_ema = next_baseline;
         self.steps += 1;
         // ISO: polar-retract both frames back onto the orthonormal manifold, so
-        // σ(U diag(Σ₀) Vᵀ) = Σ₀ exactly. Reported drift is how far the step had
-        // wandered off — the paper's premise, measured on this head.
+        // σ(U diag(Σ₀) Vᵀ) = Σ₀ exactly.
         //
         // On the `swap_every` cadence, not every step: measured 5.0 s per
         // retraction at the real head shape (151936 × 256, both frames, M4 Pro
@@ -557,17 +569,24 @@ impl DsparkTrainer {
         // Measured inter-retraction drift is ~1e-3 relative, so the iterate never
         // leaves a tight neighbourhood of ℱ(W₀), and sharing the publish cadence
         // means the head handed to the engine is always freshly on the manifold.
-        let retract_result = if self.steps.is_multiple_of(self.config.swap_every)
-            && let Some(iso) = self.iso.as_mut()
-        {
-            let result = iso.retract(&mut self.store);
-            if result.is_ok() {
-                self.last_iso_drift = iso.last_drift.clone();
-            }
-            result
+        let on_cadence = self.steps.is_multiple_of(self.config.swap_every);
+        let retract_result = if on_cadence && let Some(iso) = self.iso.as_mut() {
+            iso.retract(&mut self.store)
         } else {
             Ok(())
         };
+        // Spectrum drift on the cadence, measured on the trainable dense leaves.
+        // ISO-OFF: the leaves ARE the trained head, so this is the paper's premise
+        // — did the unconstrained step stay near-isospectral. ISO-ON: the leaves
+        // are the frozen capture source (frames train, leaves don't move), so drift
+        // is ~0 by construction — the served head's spectrum is Σ₀ definitionally,
+        // and the ISO-off arm is the one that tests the premise.
+        if on_cadence
+            && retract_result.is_ok()
+            && let Some(probe) = self.spectrum_probe.as_ref()
+        {
+            self.last_iso_drift = probe.drift(&mut self.store)?;
+        }
 
         // Free every intermediate tensor created during this step (params w1/w2
         // are in `live_before`, so they survive). Runs even if retraction failed,
@@ -665,11 +684,12 @@ impl DsparkTrainer {
                     // the objective is the RLVR regime ISO's fixed-spectrum
                     // premise was observed in, so a drift number is only
                     // interpretable next to how much of the step was dense
-                    // self-distillation.
+                    // self-distillation. Emitted on both ISO on/off (the probe
+                    // fills `last_iso_drift` each cadence), so the α-sweep reads it.
                     let iso = match self.last_iso_drift.as_slice() {
                         [] => String::new(),
                         drift => format!(
-                            " pm_alpha={:.2} iso_drift=[{}]",
+                            " pm_alpha={:.2} spectrum_drift=[{}]",
                             self.config.prob_match_alpha,
                             drift
                                 .iter()
