@@ -430,6 +430,29 @@ fn run_opd(args: TrainOpdArgs) -> ExitCode {
     ExitCode::FAILURE
 }
 
+/// Reject advertised-but-unimplemented distillation objectives before any
+/// model/store is loaded, so a no-op flag fails fast instead of silently
+/// running a different objective mid-training.
+fn reject_unimplemented_gkd_objectives(
+    gkd_entropy_weight: f32,
+    teacher_topk: Option<usize>,
+) -> Result<()> {
+    if gkd_entropy_weight != 0.0 {
+        bail!(
+            "--gkd-entropy-weight {gkd_entropy_weight} is not implemented: the per-position \
+             entropy-weighted objective (AEPO) does not exist yet. Omit the flag (0.0) to run \
+             unweighted KL."
+        );
+    }
+    if teacher_topk.is_some() {
+        bail!(
+            "--teacher-topk requires an engine-side top-k teacher-logprob producer (H20 Piece A) \
+             that is not wired. Omit the flag to run dense KL."
+        );
+    }
+    Ok(())
+}
+
 fn validate_train_opd_gkd_args(gkd_lambda: f32, sft_anchor: OpdSftAnchorArg) -> Result<()> {
     if !(0.0..=1.0).contains(&gkd_lambda) || !gkd_lambda.is_finite() {
         bail!("--gkd-lambda must be finite and in [0.0, 1.0], got {gkd_lambda}");
@@ -1056,6 +1079,7 @@ fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
         .as_deref()
         .ok_or_else(|| anyhow!("--student-model <dir> is required for non-smoke runs"))?;
     validate_train_opd_gkd_args(args.gkd_lambda, args.sft_anchor)?;
+    reject_unimplemented_gkd_objectives(0.0, args.teacher_topk)?;
     let sft_anchor = opd_sft_anchor_arg(args.sft_anchor);
     let corpus_sft_only = args.sft_anchor == OpdSftAnchorArg::CorpusTruth && args.gkd_lambda == 1.0;
     if corpus_sft_only && args.logits_window_size == 0 {
@@ -1425,6 +1449,7 @@ fn run_opd_smoke(args: TrainOpdArgs) -> Result<()> {
     };
 
     validate_train_opd_gkd_args(args.gkd_lambda, args.sft_anchor)?;
+    reject_unimplemented_gkd_objectives(0.0, args.teacher_topk)?;
     if args.sft_anchor != OpdSftAnchorArg::StudentRollout {
         bail!("train opd --smoke does not support --sft-anchor corpus-truth");
     }
@@ -2896,6 +2921,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
     };
 
     let student_dir = args.student_model.as_path();
+    reject_unimplemented_gkd_objectives(args.gkd_entropy_weight, None)?;
     let target_set = parse_lora_target_set(&args.lora_target_set)?;
     let lora = LoraConfig {
         rank: args.lora_rank,
@@ -3950,6 +3976,7 @@ fn run_self_opd_from_dir(args: TrainSelfOpdArgs) -> Result<()> {
         .student_model
         .as_deref()
         .ok_or_else(|| anyhow!("--student-model <dir> is required for non-smoke runs"))?;
+    reject_unimplemented_gkd_objectives(0.0, args.teacher_topk)?;
     let target_set = parse_lora_target_set(&args.lora_target_set)?;
     let lora = LoraConfig {
         rank: args.lora_rank,
@@ -4214,6 +4241,7 @@ fn run_self_opd_smoke(args: TrainSelfOpdArgs) -> Result<()> {
     };
 
     let cfg = embedded_tiny_qwen35_config();
+    reject_unimplemented_gkd_objectives(0.0, args.teacher_topk)?;
     let target_set = parse_lora_target_set(&args.lora_target_set)?;
     let lora = LoraConfig {
         rank: args.lora_rank.min(4),
@@ -5302,8 +5330,17 @@ mod tests {
     use super::{
         OpdLrSchedule, OpdStepMetric, PretrainPresetArg, PromptSampler, ReplayBuffer, ScratchShape,
         TaskSelection, current_grad_norm, default_cosine_warmup_steps, embedded_tiny_qwen35_config,
-        kl_mask_arg, maybe_save_full_student_checkpoint, opd_summary, validate_prompt_collection,
+        kl_mask_arg, maybe_save_full_student_checkpoint, opd_summary,
+        reject_unimplemented_gkd_objectives, validate_prompt_collection,
     };
+
+    #[test]
+    fn unimplemented_gkd_objectives_fail_before_load() {
+        assert!(reject_unimplemented_gkd_objectives(0.0, None).is_ok());
+        assert!(reject_unimplemented_gkd_objectives(0.5, None).is_err());
+        assert!(reject_unimplemented_gkd_objectives(0.0, Some(64)).is_err());
+    }
+
     #[cfg(feature = "cuda")]
     use super::{ReplayRecord, replay_groups};
 
