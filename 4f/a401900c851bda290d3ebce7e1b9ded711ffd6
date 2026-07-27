@@ -1,0 +1,23 @@
+docs/experience/errors/2026-07-27-dspark-prob-match-loss-inert-at-vocab-scale.md
+  s_0687ad858d0f07::t_d255673d004bf0 1-70
+docs/experience/wins/2026-07-27-iso-paper-faithful-dspark-head.md
+  s_0687ad858d0f07::t_da7edf162ce4d4 102-133
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "4fa401900c851bda290d3ebce7e1b9ded711ffd6",
+  "prompts": {},
+  "sessions": {
+    "s_0687ad858d0f07": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6cab79ae-2d5c-4239-81e7-196afb71725e",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
