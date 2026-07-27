@@ -2179,11 +2179,18 @@ fn log_opd_vram(label: &str, backend: &std::sync::Arc<dyn autograd::Backend>) {
     match backend.device_mem_info() {
         Some((free, total)) => {
             let used = total.saturating_sub(free);
+            // hoard = pool pages held but not backing live tensors (reserved -
+            // used); cuMemGetInfo counts it as "used". 0 on host backends.
+            let hoarded = backend
+                .mem_pool_stats()
+                .map(|(reserved, used)| reserved.saturating_sub(used) >> 20)
+                .unwrap_or(0);
             eprintln!(
-                "[opd-vram] {label}: used={}MiB free={}MiB total={}MiB",
+                "[opd-vram] {label}: used={}MiB free={}MiB total={}MiB hoarded={}MiB",
                 used >> 20,
                 free >> 20,
                 total >> 20,
+                hoarded,
             );
         }
         None => eprintln!("[opd-vram] {label}: device_mem_info unavailable"),
