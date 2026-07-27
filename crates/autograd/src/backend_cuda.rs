@@ -3760,8 +3760,7 @@ fn cuda_causal_sdpa_prefill_device(
         )?;
     }
 
-    // FFI returns only the launch code; sync here (trace-gated) to pin an async
-    // execution fault to this kernel instead of the next alloc.
+    // Trace-gated sync: pin an async kernel fault here, not at the next alloc.
     if std::env::var("ARLE_SDPA_TRACE").is_ok() {
         backend.stream.synchronize().map_err(|e| {
             leak_err(format!(
@@ -5214,8 +5213,8 @@ fn cuda_alloc_failed(op: &'static str, shape: Vec<usize>) -> AutogradError {
     AutogradError::CudaAllocFailed { op, shape, bytes }
 }
 
-// A ~GB alloc failing with tens of GB free is a sticky async fault, not
-// capacity: surface the driver code + live free/total, not just "failed".
+// Alloc failure: report driver code + live free/total to tell fragmentation
+// from a sticky async fault (fails with GB free).
 #[cfg(not(feature = "no-cuda"))]
 fn cuda_alloc_failed_rich(
     backend: &CudaBackend,

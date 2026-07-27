@@ -5973,6 +5973,9 @@ impl Qwen35Model {
                                 softmax_scale: sm_scale,
                                 is_causal: 0,
                                 num_splits: splits as i32,
+                                page_table: std::ptr::null(),
+                                page_size: 0,
+                                num_pages: 0,
                             };
                             ffi::arle_fa3_fwd_hd256_bf16_cuda(&args, self.ctx.stream.cu_stream())
                                 .result()?;
@@ -6053,6 +6056,9 @@ impl Qwen35Model {
                                 softmax_scale: sm_scale,
                                 is_causal: 1,
                                 num_splits: 1,
+                                page_table: std::ptr::null(),
+                                page_size: 0,
+                                num_pages: 0,
                             };
                             ffi::arle_fa3_fwd_hd256_bf16_cuda(&args, self.ctx.stream.cu_stream())
                                 .result()?;
@@ -6179,6 +6185,10 @@ impl Qwen35Model {
             v_batch,
             q_prepped,
             attn_heads,
+            fa3_lse,
+            fa3_oaccum,
+            fa3_lseaccum,
+            fa3_semaphore,
             ..
         } = fw;
         let q_full = q_full.get(&self.ctx, q_proj_dim, rows)?;
@@ -6408,6 +6418,83 @@ impl Qwen35Model {
                     Some(full_idx),
                     rows,
                     || {
+                        // sm_90 decode goes to the vendored FA3 paged split-KV
+                        // + PackGQA units: one CTA per KV head serving the whole
+                        // GQA group, split along KV to fill the SMs. The
+                        // TileLang kernel it replaces pads BLOCK_M=64 around one
+                        // real query row and gives one CTA per query head, so it
+                        // reads the KV `gqa_ratio` times at ~2% occupancy.
+                        // Batch > 1 needs a padded [b, max_pages] table and
+                        // stays on TileLang until that is built; every non-sm_90
+                        // target keeps TileLang permanently (FA3 is Hopper-only).
+                        if decode
+                            && meta.batch == 1
+                            && pool.format == KVFormat::BF16
+                            && c.head_dim == 256
+                            && qwen35_fa3_enabled(&self.ctx)
+                        {
+                            let kv_len = meta.start_pos + rows;
+                            let pages = meta.page_offsets[1] - meta.page_offsets[0];
+                            let splits = qwen35_fa3_decode_splits();
+                            let lse = fa3_lse.get(&self.ctx, self.local_q_heads * rows)?;
+                            let oaccum = fa3_oaccum.get(
+                                &self.ctx,
+                                splits * self.local_q_heads * rows * c.head_dim,
+                            )?;
+                            let lseaccum =
+                                fa3_lseaccum.get(&self.ctx, splits * self.local_q_heads * rows)?;
+                            let sem = fa3_semaphore.get(&self.ctx, 1)?;
+                            let (lse_ptr, _f0) = lse.device_ptr_mut(&self.ctx.stream);
+                            let (oaccum_ptr, _f1) = oaccum.device_ptr_mut(&self.ctx.stream);
+                            let (lseaccum_ptr, _f2) = lseaccum.device_ptr_mut(&self.ctx.stream);
+                            let (sem_ptr, _f3) = sem.device_ptr_mut(&self.ctx.stream);
+                            let head_dim = c.head_dim as i64;
+                            let args = ffi::ArleFa3FwdHd256Args {
+                                q: qp_ptr as *const ffi::Half,
+                                k: k_pool_ptr as *const ffi::Half,
+                                v: v_pool_ptr as *const ffi::Half,
+                                o: ao_ptr as *mut ffi::Half,
+                                softmax_lse: lse_ptr as *mut f32,
+                                out_accum: oaccum_ptr as *mut f32,
+                                softmax_lse_accum: lseaccum_ptr as *mut f32,
+                                tile_count_semaphore: sem_ptr as *mut i32,
+                                seqlen_q: rows as i32,
+                                seqlen_k: kv_len as i32,
+                                num_heads: self.local_q_heads as i32,
+                                num_heads_k: self.local_kv_heads as i32,
+                                head_dim: c.head_dim as i32,
+                                q_row_stride: (self.local_q_heads * c.head_dim) as i64,
+                                // HND pool [page, h_k, page_size, d]: tokens are
+                                // contiguous inside a (page, head), heads stride
+                                // by a page's worth, pages by the whole page.
+                                k_row_stride: head_dim,
+                                v_row_stride: head_dim,
+                                o_row_stride: (self.local_q_heads * c.head_dim) as i64,
+                                q_head_stride: head_dim,
+                                k_head_stride: pool.page_size as i64 * head_dim,
+                                v_head_stride: pool.page_size as i64 * head_dim,
+                                o_head_stride: head_dim,
+                                softmax_scale: sm_scale,
+                                is_causal: 0,
+                                num_splits: splits as i32,
+                                page_table: (kv_indices_ptr
+                                    + (meta.page_offsets[0] * 4) as u64)
+                                    as *const i32,
+                                page_size: pool.page_size as i32,
+                                num_pages: pages as i32,
+                            };
+                            // SAFETY: q/o are the live prepped/out buffers; k/v
+                            // are the layer's pool base; the page table is this
+                            // request's slice of `kv_indices`, `pages` long.
+                            unsafe {
+                                ffi::arle_fa3_fwd_hd256_bf16_cuda(
+                                    &args,
+                                    self.ctx.stream.cu_stream(),
+                                )
+                                .result()?;
+                            }
+                            return Ok(());
+                        }
                         match pool.format {
                             KVFormat::BF16 => {
                                 // SAFETY: kernel signature from paged_attn_v1 ABI (18-arg BF16).
