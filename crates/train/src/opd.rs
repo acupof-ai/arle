@@ -2904,7 +2904,7 @@ fn build_masked_loss_targets(
 struct VramSample {
     free: usize,
     total: usize,
-    /// Mempool hoard (`reserved - used`) in MiB; `None` = probe unavailable, not 0.
+    /// Mempool hoard in MiB; `None` = probe unavailable, not a measured 0.
     hoarded_mib: Option<u64>,
 }
 

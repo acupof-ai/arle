@@ -1034,8 +1034,7 @@ impl Backend for CudaBackend {
 
     #[cfg(not(feature = "no-cuda"))]
     fn mem_pool_stats(&self) -> Option<(u64, u64)> {
-        // SAFETY: pool belongs to this backend's live context; each read writes
-        // one u64 through a valid pointer to the local.
+        // SAFETY: pool is this backend's live context; each read writes one u64.
         unsafe {
             let pool = result::device::get_mem_pool(self.stream.context().cu_device()).ok()?;
             let read = |attr| -> Option<u64> {
