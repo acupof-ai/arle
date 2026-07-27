@@ -442,13 +442,7 @@ impl UpdatePreset {
 
                 // Token-mean the PG objective, mirroring CE's 1/N: per-trajectory
                 // masked count, or the batch/fixed constant for GlobalTokenMean.
-                let norm = match self.agg {
-                    Aggregation::PerSeqTokenMean => advantages.len(),
-                    Aggregation::GlobalTokenMean { norm_const } => {
-                        norm_const.unwrap_or(batch_tokens)
-                    }
-                }
-                .max(1) as f32;
+                let norm = token_mean_norm(self.agg, advantages.len(), batch_tokens);
                 let mut weights: Vec<f32> = advantages.iter().map(|a| a / norm).collect();
 
                 let form = match self.ratio {
@@ -702,6 +696,19 @@ fn centered_advantages(survivors: &[&ScoredTrajectory], scope: Scope, std_norm: 
         .collect()
 }
 
+/// PG token-mean denominator. GlobalTokenMean with a fixed `norm_const` is
+/// Dr.GRPO's length-debiasing: a per-token divide by the constant generation
+/// budget, independent of each trajectory's actual length (the length bias GRPO
+/// carries via per-sequence `advantages.len()`). Group averaging is separate —
+/// it lives in `centered_advantages`.
+fn token_mean_norm(agg: Aggregation, seq_tokens: usize, batch_tokens: usize) -> f32 {
+    match agg {
+        Aggregation::PerSeqTokenMean => seq_tokens,
+        Aggregation::GlobalTokenMean { norm_const } => norm_const.unwrap_or(batch_tokens),
+    }
+    .max(1) as f32
+}
+
 /// GSPO length-normalized sequence ratio `exp(mean_t(logπθ − logπ_b))`.
 fn sequence_ratio(current_lp: &[f32], behavior_lp: &[f32]) -> Result<f32> {
     if current_lp.len() != behavior_lp.len() {
@@ -846,6 +853,25 @@ mod tests {
         let gn = centered_advantages(&refs, Scope::Group, true);
         assert!((gn[0] - 0.5 / (0.5 + 1e-6)).abs() < 1e-6, "{gn:?}");
         assert_eq!(gn[2], 0.0);
+    }
+
+    #[test]
+    fn dr_grpo_norm_is_fixed_constant_independent_of_length() {
+        // Dr.GRPO: fixed generation budget divides every token, regardless of a
+        // trajectory's own length — a short and a long trajectory share the
+        // denominator, so long ones are not down-weighted (GRPO's length bias).
+        let dr = Aggregation::GlobalTokenMean {
+            norm_const: Some(4096),
+        };
+        assert_eq!(token_mean_norm(dr, 10, 999), 4096.0);
+        assert_eq!(token_mean_norm(dr, 4000, 999), 4096.0);
+        // GRPO (no fixed const) falls back to the batch's actual token count.
+        let grpo = Aggregation::GlobalTokenMean { norm_const: None };
+        assert_eq!(token_mean_norm(grpo, 10, 512), 512.0);
+        // PerSeqTokenMean divides by the trajectory's own length (the bias).
+        assert_eq!(token_mean_norm(Aggregation::PerSeqTokenMean, 10, 512), 10.0);
+        // Empty guard: never divide by zero.
+        assert_eq!(token_mean_norm(Aggregation::PerSeqTokenMean, 0, 0), 1.0);
     }
 
     #[test]
