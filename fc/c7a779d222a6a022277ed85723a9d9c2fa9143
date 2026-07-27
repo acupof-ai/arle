@@ -1,0 +1,25 @@
+CHANGELOG.md
+  s_0687ad858d0f07::t_54f7f34db9b1be 28
+docs/experience/wins/2026-07-26-agent-rft-sidecar-denominator.md
+  s_0687ad858d0f07::t_3d41e6aa44a298 3-4,81-92,99-101
+docs/research/2026-07-26-training-architecture-algorithm-kernel-audit.md
+  s_0687ad858d0f07::t_089b7e831d1d9a 8,187
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "fcc7a779d222a6a022277ed85723a9d9c2fa9143",
+  "prompts": {},
+  "sessions": {
+    "s_0687ad858d0f07": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6cab79ae-2d5c-4239-81e7-196afb71725e",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
