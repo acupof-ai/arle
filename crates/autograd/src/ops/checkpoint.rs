@@ -144,7 +144,6 @@ where
         if tape.offload_checkpoints && end == num_layers {
             tape.set_skip_next_checkpoint_input_offload(true);
         }
-        let checkpoint_fn_before = tape.checkpoint_fn_count();
         hidden = checkpoint(input_ids, store, tape, move |s, t, inp| {
             let mut h = *inp.first().ok_or(AutogradError::TapeInvariant(
                 "checkpoint_sequential missing hidden input",
@@ -154,12 +153,6 @@ where
             }
             Ok(h)
         })?;
-        let checkpoint_fn_after = tape.checkpoint_fn_count();
-        if trace_checkpoint_group_vram() && checkpoint_fn_after == checkpoint_fn_before + 1 {
-            eprintln!(
-                "[checkpoint-map] checkpoint_fn={checkpoint_fn_before} layers={start}..{stop}"
-            );
-        }
         li = end;
         if trace_checkpoint_group_vram()
             && let Some((free, total)) = store.backend().device_mem_info()
