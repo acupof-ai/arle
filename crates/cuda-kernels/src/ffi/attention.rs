@@ -800,6 +800,15 @@ pub struct ArleFa3FwdHd256Args {
     pub is_causal: i32,
     /// 1 = direct fwd; >1 = split-KV decode fwd + combine (max 256).
     pub num_splits: i32,
+    /// Paged KV: i32 page indices for THIS request, or null for a contiguous
+    /// KV view. When set, `k`/`v` are the pool base and the strides describe
+    /// one page (`k_row_stride` between tokens inside a page, `k_head_stride`
+    /// between KV heads, `k_batch_stride` between pages), which expresses the
+    /// qwen35 HND pool `[page, h_k, page_size, d]` without a relayout.
+    pub page_table: *const i32,
+    pub page_size: i32,
+    /// Pages in the pool, not in this request.
+    pub num_pages: i32,
 }
 
 unsafe extern "C" {

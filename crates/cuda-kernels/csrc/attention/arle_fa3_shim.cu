@@ -74,6 +74,14 @@ typedef struct {
     float softmax_scale;
     int is_causal;
     int num_splits;  // 1 = direct fwd; >1 = split-KV + combine (<=256)
+    // Paged KV (null page_table = contiguous). k/v then point at the pool base
+    // and the strides describe one page: k_row_stride = stride between tokens
+    // inside a page, k_head_stride = between KV heads, k_batch_stride = between
+    // pages. That expresses the qwen35 HND pool [page, h_k, page_size, d]
+    // without a relayout (paged_kv.h builds a CuTe tensor from these directly).
+    const int* page_table;  // i32 [num_pages] page indices for this request
+    int page_size;
+    int num_pages;          // pages in the pool, not in this request
 } ArleFa3FwdHd256Args;
 
 cudaError_t arle_fa3_fwd_hd256_bf16_cuda(const ArleFa3FwdHd256Args* a,
@@ -158,9 +166,16 @@ cudaError_t arle_fa3_fwd_hd256_bf16_cuda(const ArleFa3FwdHd256Args* a,
     params.arch = 90;
     params.num_sm = device_num_sm();
 
-    params.page_table = nullptr;
-    params.page_size = 1;
-    params.num_pages = 0;
+    // Non-TMA gather: qwen35's page_size (16) is below the hdim256 kBlockN and
+    // the TMA paged path asserts page_size % kBlockN == 0.
+    const bool paged = a->page_table != nullptr;
+    if (paged && (a->page_size <= 0 || a->num_pages <= 0)) {
+        return cudaErrorInvalidValue;
+    }
+    params.page_table = paged ? const_cast<int*>(a->page_table) : nullptr;
+    params.page_table_batch_stride = 0;  // b == 1
+    params.page_size = paged ? a->page_size : 1;
+    params.num_pages = paged ? a->num_pages : 0;
     params.pagedkv_tma = false;
 
     params.num_splits = a->num_splits <= 1 ? 1 : a->num_splits;
@@ -213,9 +228,15 @@ cudaError_t arle_fa3_fwd_hd256_bf16_cuda(const ArleFa3FwdHd256Args* a,
         params.lseaccum_batch_stride = params.lseaccum_split_stride;
         params.lseaccum_head_stride = a->seqlen_q;
 
-        run_mha_fwd_<90, cutlass::bfloat16_t, 256, 256, /*Split=*/true,
-                     /*PagedKVNonTMA=*/false, /*Has_softcap=*/false,
-                     /*PackGQA=*/true>(params, stream);
+        if (paged) {
+            run_mha_fwd_<90, cutlass::bfloat16_t, 256, 256, /*Split=*/true,
+                         /*PagedKVNonTMA=*/true, /*Has_softcap=*/false,
+                         /*PackGQA=*/true>(params, stream);
+        } else {
+            run_mha_fwd_<90, cutlass::bfloat16_t, 256, 256, /*Split=*/true,
+                         /*PagedKVNonTMA=*/false, /*Has_softcap=*/false,
+                         /*PackGQA=*/true>(params, stream);
+        }
         cudaError_t st = cudaGetLastError();
         if (st != cudaSuccess) return st;
         params.is_bf16 = true;
@@ -224,9 +245,18 @@ cudaError_t arle_fa3_fwd_hd256_bf16_cuda(const ArleFa3FwdHd256Args* a,
         return cudaGetLastError();
     }
 
-    run_mha_fwd_<90, cutlass::bfloat16_t, 256, 256, /*Split=*/false,
-                 /*PagedKVNonTMA=*/false, /*Has_softcap=*/false,
-                 /*PackGQA=*/false>(params, stream);
+    if (paged) {
+        // The vendored paged instantiations are PackGQA-only, which is also the
+        // shape we want: one CTA per KV head serving the whole GQA group.
+        params.pack_gqa = true;
+        run_mha_fwd_<90, cutlass::bfloat16_t, 256, 256, /*Split=*/false,
+                     /*PagedKVNonTMA=*/true, /*Has_softcap=*/false,
+                     /*PackGQA=*/true>(params, stream);
+    } else {
+        run_mha_fwd_<90, cutlass::bfloat16_t, 256, 256, /*Split=*/false,
+                     /*PagedKVNonTMA=*/false, /*Has_softcap=*/false,
+                     /*PackGQA=*/false>(params, stream);
+    }
     return cudaGetLastError();
 }
 
