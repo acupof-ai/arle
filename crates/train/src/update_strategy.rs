@@ -405,111 +405,125 @@ impl UpdatePreset {
         let mut adv_sum = 0.0f64;
         let mut adv_sq = 0.0f64;
         let mut adv_n = 0usize;
-        for (i, traj) in survivors.iter().enumerate() {
-            let behavior_logprobs = traj
-                .behavior_logprobs
-                .as_deref()
-                .expect("ratio-weighted batch validated before policy/critic forward");
-            let (advantages, returns) = match critic.as_deref_mut() {
-                Some(c) => c.advantages(
-                    student,
-                    &traj.prompt_ids,
-                    &traj.response_ids,
-                    &traj.response_mask,
-                    traj.reward,
-                    store,
-                )?,
-                None => (vec![scalar_advs[i]; behavior_logprobs.len()], Vec::new()),
-            };
-            if advantages.is_empty() {
-                continue; // no LLM tokens to train
-            }
-            // No signal → no update: stepping on zero advantage lets AdamW weight
-            // decay / momentum drift the weights on zero gradient.
-            if critic.is_none() && scalar_advs[i] == 0.0 {
-                continue;
-            }
-            for &a in &advantages {
-                adv_sum += f64::from(a);
-                adv_sq += f64::from(a) * f64::from(a);
-            }
-            adv_n += advantages.len();
-
-            // Token-mean the PG objective, mirroring CE's 1/N: per-trajectory
-            // masked count, or the batch/fixed constant for GlobalTokenMean.
-            let norm = match self.agg {
-                Aggregation::PerSeqTokenMean => advantages.len(),
-                Aggregation::GlobalTokenMean { norm_const } => norm_const.unwrap_or(batch_tokens),
-            }
-            .max(1) as f32;
-            let mut weights: Vec<f32> = advantages.iter().map(|a| a / norm).collect();
-
-            let form = match self.ratio {
-                RatioGrain::PerToken => self.clip.weight_form(),
-                RatioGrain::PerSequence => {
-                    // GSPO: seq ratio at CURRENT θ (one tape-off capture pass),
-                    // clipped at the sequence level, broadcast into the weights.
-                    let current_lp = capture_rollout_logprobs(
+        // GlobalTokenMean accumulates gradients across trajectories into a single
+        // step; any mid-loop error would otherwise leave those grads pending and
+        // leak into the next batch. Run the accumulation as one fallible unit and
+        // clear pending grads on any failure so a batch is all-or-nothing.
+        let accumulate = (|| -> std::result::Result<(), OpdError> {
+            for (i, traj) in survivors.iter().enumerate() {
+                let behavior_logprobs = traj
+                    .behavior_logprobs
+                    .as_deref()
+                    .expect("ratio-weighted batch validated before policy/critic forward");
+                let (advantages, returns) = match critic.as_deref_mut() {
+                    Some(c) => c.advantages(
                         student,
                         &traj.prompt_ids,
                         &traj.response_ids,
                         &traj.response_mask,
+                        traj.reward,
                         store,
-                    )?;
-                    let s = sequence_ratio(&current_lp, behavior_logprobs)?;
-                    let mut clipped = false;
-                    for w in &mut weights {
-                        let (effective, token_clipped) =
-                            pg_token_weight(self.clip.weight_form(), *w, s, 0.0);
-                        *w = effective;
-                        clipped |= token_clipped;
-                    }
-                    WeightForm::Precomputed { ratio: s, clipped }
+                    )?,
+                    None => (vec![scalar_advs[i]; behavior_logprobs.len()], Vec::new()),
+                };
+                if advantages.is_empty() {
+                    continue; // no LLM tokens to train
                 }
-                RatioGrain::None => unreachable!("CE path handled in update()"),
-            };
+                // No signal → no update: stepping on zero advantage lets AdamW weight
+                // decay / momentum drift the weights on zero gradient.
+                if critic.is_none() && scalar_advs[i] == 0.0 {
+                    continue;
+                }
+                for &a in &advantages {
+                    adv_sum += f64::from(a);
+                    adv_sq += f64::from(a) * f64::from(a);
+                }
+                adv_n += advantages.len();
 
-            let (loss, traj_stats) = masked_writeback_step(
-                WritebackLoss::Pg {
-                    rollout_logprobs: behavior_logprobs,
-                    weight: &weights,
-                    form,
-                    kl_coef: 0.0,
-                },
-                student,
-                params,
-                trainable,
-                opt,
-                step_each,
-                &traj.prompt_ids,
-                &traj.response_ids,
-                &traj.response_mask,
-                vocab,
-                window,
-                store,
-            )?;
-            stats.merge(traj_stats);
-            if let Some(c) = critic.as_deref_mut() {
-                // Fit the critic toward the observed returns (frozen-attention MSE).
-                mse_sum += c.update(
+                // Token-mean the PG objective, mirroring CE's 1/N: per-trajectory
+                // masked count, or the batch/fixed constant for GlobalTokenMean.
+                let norm = match self.agg {
+                    Aggregation::PerSeqTokenMean => advantages.len(),
+                    Aggregation::GlobalTokenMean { norm_const } => {
+                        norm_const.unwrap_or(batch_tokens)
+                    }
+                }
+                .max(1) as f32;
+                let mut weights: Vec<f32> = advantages.iter().map(|a| a / norm).collect();
+
+                let form = match self.ratio {
+                    RatioGrain::PerToken => self.clip.weight_form(),
+                    RatioGrain::PerSequence => {
+                        // GSPO: seq ratio at CURRENT θ (one tape-off capture pass),
+                        // clipped at the sequence level, broadcast into the weights.
+                        let current_lp = capture_rollout_logprobs(
+                            student,
+                            &traj.prompt_ids,
+                            &traj.response_ids,
+                            &traj.response_mask,
+                            store,
+                        )?;
+                        let s = sequence_ratio(&current_lp, behavior_logprobs)?;
+                        let mut clipped = false;
+                        for w in &mut weights {
+                            let (effective, token_clipped) =
+                                pg_token_weight(self.clip.weight_form(), *w, s, 0.0);
+                            *w = effective;
+                            clipped |= token_clipped;
+                        }
+                        WeightForm::Precomputed { ratio: s, clipped }
+                    }
+                    RatioGrain::None => unreachable!("CE path handled in update()"),
+                };
+
+                let (loss, traj_stats) = masked_writeback_step(
+                    WritebackLoss::Pg {
+                        rollout_logprobs: behavior_logprobs,
+                        weight: &weights,
+                        form,
+                        kl_coef: 0.0,
+                    },
                     student,
+                    params,
+                    trainable,
+                    opt,
+                    step_each,
                     &traj.prompt_ids,
                     &traj.response_ids,
                     &traj.response_mask,
-                    &returns,
+                    vocab,
+                    window,
                     store,
                 )?;
-                adv_abs_sum += advantages.iter().map(|a| a.abs()).sum::<f32>();
-                adv_tokens += advantages.len();
+                stats.merge(traj_stats);
+                if let Some(c) = critic.as_deref_mut() {
+                    // Fit the critic toward the observed returns (frozen-attention MSE).
+                    mse_sum += c.update(
+                        student,
+                        &traj.prompt_ids,
+                        &traj.response_ids,
+                        &traj.response_mask,
+                        &returns,
+                        store,
+                    )?;
+                    adv_abs_sum += advantages.iter().map(|a| a.abs()).sum::<f32>();
+                    adv_tokens += advantages.len();
+                }
+                loss_sum += loss;
+                if !loss_sum.is_finite() {
+                    return Err(OpdError::InvalidInput(format!(
+                        "policy loss became non-finite while accumulating trajectory {i}: {loss_sum}"
+                    )));
+                }
+                steps += 1;
             }
-            loss_sum += loss;
-            if !loss_sum.is_finite() {
-                opt.zero_grad(store, trainable);
-                return Err(OpdError::InvalidInput(format!(
-                    "policy loss became non-finite while accumulating trajectory {i}: {loss_sum}"
-                )));
-            }
-            steps += 1;
+            Ok(())
+        })();
+        if let Err(e) = accumulate {
+            // Any accumulation failure aborts the whole batch: drop pending grads
+            // so nothing leaks into the next GlobalTokenMean step.
+            opt.zero_grad(store, trainable);
+            return Err(e);
         }
 
         if !step_each && steps > 0 {

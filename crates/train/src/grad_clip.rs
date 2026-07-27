@@ -1,7 +1,17 @@
 //! Gradient clipping — free functions (`clip_grad_norm` /
 //! `compute_global_norm_f64`) used by the OPD training loops.
 
-use autograd::{Device, TensorId, TensorStore, tensor::Dirty};
+use autograd::{AutogradError, Device, Optimizer, TensorId, TensorStore, tensor::Dirty};
+
+#[derive(Debug, thiserror::Error)]
+pub enum FiniteStepError {
+    #[error("training loss became non-finite ({0})")]
+    NonFiniteLoss(f32),
+    #[error("global gradient norm became non-finite ({0})")]
+    NonFiniteGradNorm(f64),
+    #[error(transparent)]
+    Optimizer(#[from] AutogradError),
+}
 
 /// Pre-clip global L2 norm across every param's gradient.
 ///
@@ -35,6 +45,45 @@ pub fn compute_global_norm_f64(params: &[TensorId], store: &TensorStore) -> f64 
         }
     }
     total_sq_norm.sqrt()
+}
+
+pub fn ensure_finite_loss<O: Optimizer>(
+    loss: f32,
+    params: &[TensorId],
+    optimizer: &mut O,
+    store: &mut TensorStore,
+) -> Result<(), FiniteStepError> {
+    if loss.is_finite() {
+        return Ok(());
+    }
+    optimizer.zero_grad(store, params);
+    Err(FiniteStepError::NonFiniteLoss(loss))
+}
+
+/// Commit one optimizer update only when both the scalar loss and the complete
+/// accumulated gradient set are finite. Any rejected update clears pending grads.
+pub fn finite_optimizer_step<O: Optimizer>(
+    loss: f32,
+    params: &[TensorId],
+    max_norm: f32,
+    optimizer: &mut O,
+    store: &mut TensorStore,
+) -> Result<f64, FiniteStepError> {
+    ensure_finite_loss(loss, params, optimizer, store)?;
+
+    let global_norm = compute_global_norm_f64(params, store);
+    if !global_norm.is_finite() {
+        optimizer.zero_grad(store, params);
+        return Err(FiniteStepError::NonFiniteGradNorm(global_norm));
+    }
+
+    clip_grad_norm(params, max_norm, store);
+    if let Err(error) = optimizer.step(store, params) {
+        optimizer.zero_grad(store, params);
+        return Err(FiniteStepError::Optimizer(error));
+    }
+    optimizer.zero_grad(store, params);
+    Ok(global_norm)
 }
 
 pub fn clip_grad_norm(params: &[TensorId], max_norm: f32, store: &mut TensorStore) {
