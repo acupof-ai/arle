@@ -3456,13 +3456,33 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
                 handle: std::thread::spawn(move || harness.run_group(booted)),
             }
         };
-        let mut next = round_tasks.first().map(|i| launch(i, policy_version));
-        for (pos, &group_idx) in round_tasks.iter().enumerate() {
+        // DAPO dynamic sampling: `work` grows as dead groups get replaced (below);
+        // `reserve` draws this round's unscheduled tasks, so the launch cap AND
+        // reserve exhaustion both terminate an all-dead corpus. Off ⇒
+        // max_launches == target ⇒ refill is inert (one path, static behavior).
+        let target = round_tasks.len();
+        let max_launches = if args.dynamic_sampling {
+            ((target as f32) * args.dynamic_sampling_max_factor).ceil() as usize
+        } else {
+            target
+        };
+        let mut refill = train::cc_harness::RefillBudget::new(
+            target,
+            max_launches,
+            args.dynamic_sampling_token_budget,
+        );
+        let scheduled: std::collections::HashSet<usize> = round_tasks.iter().copied().collect();
+        let mut reserve = (0..tasks.len()).filter(|i| !scheduled.contains(i));
+        let mut work = round_tasks;
+        let mut next = work.first().map(|i| launch(i, policy_version));
+        let mut pos = 0;
+        while pos < work.len() {
+            let group_idx = work[pos];
             let pending = next.take().expect("launched ahead");
             // Boot-ahead (staleness 0): the next group's sandboxes build during
             // this group's rollout + train (CPU only — staleness-free).
             if args.staleness == 0 {
-                next = round_tasks.get(pos + 1).map(|i| launch(i, policy_version));
+                next = work.get(pos + 1).map(|i| launch(i, policy_version));
             }
             let gpu_busy_before = infer_api::engine_forward_busy_micros();
             let (group, behavior_version) = train::aopd_profile::time_try(
@@ -3490,7 +3510,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
             // group's train + merge — cc rolls while the GPU trains; the
             // version tag + sidecar IS ratio below correct the one-step drift.
             if args.staleness > 0 {
-                next = round_tasks.get(pos + 1).map(|i| launch(i, policy_version));
+                next = work.get(pos + 1).map(|i| launch(i, policy_version));
             }
             let group_staleness = policy_version - behavior_version;
 
@@ -3638,6 +3658,17 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
                 batch.truncate(cap_left);
                 cap_left -= batch.len();
             }
+            // Exact "does this group train?" signal (matches update's own filter)
+            // — drives DAPO refill without running the update twice. On a dead
+            // group, append a replacement task (grow `work` now so the
+            // last-group sync check stays correct); the launch is deferred to
+            // end-of-body so a refill thread never races the VRAM release.
+            let group_trained = update_preset.planned_training_count(&batch) > 0;
+            if refill.complete(work.len(), group_trained, g_completion)
+                && let Some(idx) = reserve.next()
+            {
+                work.push(idx);
+            }
             // The update validates the entire ratio-weighted batch before any
             // critic/student forward. Ratio-free CE/GKD ignores absent sidecars.
             // One update + its metrics row; `extra` carries the arm-specific
@@ -3726,7 +3757,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
             // prefix-cache drop in one engine-thread closure); every-round
             // syncs once, at the last group. Then re-acquire the KV pool for
             // the next rollout.
-            let synced = sync_every_group || pos + 1 == round_tasks.len();
+            let synced = sync_every_group || pos + 1 == work.len();
             if synced {
                 let sync_started = Instant::now();
                 infer_student
@@ -3774,6 +3805,13 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
                     }
                 }));
             }
+            // Launch a deferred DAPO refill (appended above) only now that the KV
+            // pool is restored — boot-ahead may have left `next` empty when the
+            // dead group looked last. Static path: `work` didn't grow, no-op.
+            pos += 1;
+            if next.is_none() {
+                next = work.get(pos).map(|i| launch(i, policy_version));
+            }
         }
 
         let mean_loss = if losses.is_empty() {
@@ -3782,8 +3820,11 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
             losses.iter().sum::<f32>() / losses.len() as f32
         };
         eprintln!(
-            "[arle train agent-opd] round {round}: tasks={} rollouts={rollouts} passed={passed} tasks_passed={tasks_passed} zero_variance_groups={zero_variance_groups} mean_loss={mean_loss:.4}",
-            round_tasks.len(),
+            "[arle train agent-opd] round {round}: tasks={} groups={} effective={} discarded={} rollouts={rollouts} passed={passed} tasks_passed={tasks_passed} zero_variance_groups={zero_variance_groups} mean_loss={mean_loss:.4}",
+            target,
+            work.len(),
+            refill.effective,
+            refill.discarded,
         );
         log_opd_vram(&format!("after round {round} writeback"), &train_backend);
 
@@ -3854,7 +3895,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
         eprintln!("[agent-opd] phase=round_tail_save seconds={save_secs:.3}");
 
         // Per-round metrics row; the update/group rows land per group above.
-        let groups = round_tasks.len().max(1);
+        let groups = work.len().max(1);
         let reward_mean = reward_sum / rollouts.max(1) as f64;
         // Mean drift over the round's masked tokens; None on ratio-free presets.
         let rollout_train_k3_kl =
@@ -3879,9 +3920,12 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
         metrics.append(&serde_json::json!({
             "kind": "round",
             "round": round,
-            "tasks": round_tasks.len(),
+            "tasks": target,
             "tasks_skipped": tasks_skipped,
             "tasks_retired": tasks_retired,
+            "groups_launched": work.len(),
+            "groups_effective": refill.effective,
+            "groups_discarded": refill.discarded,
             "rollouts": rollouts,
             "passed": passed,
             "pass_at_k": tasks_passed as f32 / groups as f32,
