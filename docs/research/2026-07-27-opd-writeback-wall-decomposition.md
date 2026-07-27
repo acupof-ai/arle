@@ -1,12 +1,42 @@
-# OPD writeback 显存墙：当前证据与无损 128K 单卡路径
+# OPD writeback 显存墙：逐 op 实测归因与无损 128K 单卡路径
 
 ## 结论先说
 
-**现在不能把 40960 OOM 归因于 GDN、全注意力 backward，或 33 GB 的单层重算。当前 main 的直接证据是：CUDA 驱动显示约 95 GiB 已用，但真正支撑活张量的 mempool used 只有约 34.7 GiB；约 56 GiB 是 mempool 保留但未使用的缓存高水位。**
+**40960 在当前 main 上已经不 OOM：rc=0，loss=8.685793，backward 层内峰值 pool_used 85.9 GiB / reserved 89.4 GiB，都在 97.5 GiB 之下。之前的"墙"是 mempool 缓存高水位（forward 后 hoard 39 GiB），不是活张量；per-replay trim 已把它压住。**
 
-因此，旧文档基于 driver used 得出的显存账本、每 token 斜率、128K 上限，以及“先实现 MLP recompute”的方案全部撤回。下一步不是改注意力或 MLP，而是先完成同一二进制下的 mempool retain matched A/B，再用 pool used 重建真实账本。
+**逐 op 实测（layer 63，全注意力层，即历史 OOM 层）推翻旧文档的靶子排序：单层 replay 里最大可动块是「注意力 forward 重算 = +23.4 GiB」，MLP 只有 +11.4 GiB。旧方案"tranche 1 先做 MLP recompute"打错了靶子——它只动第二大项，且当前根本没有墙需要动。**
 
-## 已确认的事实
+## 逐 op 实测（H20 GPU4，探针二进制 `6da8e866`，seq=40960）
+
+用 `ARLE_OPD_OP_MEM_CHECKPOINT_FN=60`（=layer 63，冻结层 0–2 使 checkpoint_fn 编号比层号小 3）单臂采样该层 replay+inner-backward 的每个阶段 `pool_used_current`（只读 mempool used，无额外同步）。
+
+**replay forward 逐阶段（相对该层入口 floor 37.9 GiB）：**
+
+| 阶段 | pool_used | Δ | 说明 |
+|---|---:|---:|---|
+| layer_enter | 37.9 GiB | — | 该层 backward 起点 |
+| post_input_norm | 38.7 GiB | +0.8 | RMSNorm |
+| **post_attention** | **62.1 GiB** | **+23.4** | ← 单层最大块（q/k/v proj + RoPE + SDPA recompute + gate + o_proj 中间量） |
+| post_attention_residual | 62.9 GiB | +0.8 | |
+| post_mlp_norm | 63.7 GiB | +0.8 | |
+| **post_mlp** | **75.3 GiB** | **+11.4** | Dense SwiGLU（gate/up/silu/mul/down 中间量） |
+| post_replay | 76.1 GiB | 整层物化 +38.2 | 全层前向中间量活到 inner backward |
+| **inner-backward op 峰值** | **85.9 GiB** | +9.8 | 梯度中间量叠加，此为全局峰值 |
+| scope_exit | 37.9 GiB | 回落 floor | free_new_except + re-offload + trim |
+
+**关键读数：**
+- 层内 backward 峰值 pool_used **85.9 GiB**，reserved **89.4 GiB**，设备 97.5 GiB → 有约 8 GiB 余量，不 OOM。
+- forward 全程 pool_used 平在 34.7 GiB，driver used 却涨到 75.9 GiB——差额 39 GiB 全是 mempool 缓存。
+- ledger：`hoarded_fwd/bwd/clean = 39030 / 3167 / 6413 MiB`，per-replay trim 在 backward 把 hoard 从 39 GiB 收到 3.2 GiB。
+
+## 旧结论撤回与修正
+
+- ~~"墙是单层 replay 一次性物化 33 GB"~~ → 实测单层物化是 **38.2 GiB**（attn 23.4 + MLP 11.4 + norm/residual），但它**不撞墙**：峰值 85.9 GiB 有余量。
+- ~~"MLP 中间量 11.4 GB 是最大主项，先做 MlpRecompute"~~ → 最大块是 **attention forward 23.4 GiB**，MLP 是第二。且当前无墙可动，不需要任何 recompute。
+- ~~"40960 OOM"~~ → 当前 main **完成**，rc=0 loss=8.685793。历史 OOM 是 allocator hoard，非活张量。
+
+## 旧 mempool 分析（保留，仍成立）
+
 
 ### 模型和训练路径
 
@@ -17,34 +47,19 @@
 - 长序列下 `ckpt_group_size()` 已返回 1；继续缩小 checkpoint group 不可能。
 - full-attention 已使用 `causal_sdpa_recompute`，其 score/prob backward transient 已按 query chunk 约束。
 
-### current-main 的 40960 实测
+### current-main 的 40960 实测（探针二进制 `6da8e866`）
 
-测量基于 commit `b5cb3b5f6` 加未提交的 checkpoint allocator 诊断；单张 H20 的总显存读数为 97508 MiB。运行 `--synthetic-writeback-seq 40960`，在每个 checkpoint group 后同时读取：
+单张 H20（97508 MiB）跑 `--synthetic-writeback-seq 40960 --writeback-offload true`，每个 checkpoint group 后读 driver used、mempool reserved/used、live tensors。forward 完成全部 64 group，backward 完成，`RUN_EXIT=0`，`DONE loss=8.685793`。
 
-- driver used/free；
-- CUDA mempool reserved current；
-- CUDA mempool used current；
-- live tensor 数量。
+forward group 采样（`pool_used_current`）：
 
-结果：
-
-| checkpoint group | driver used | pool reserved | pool used | live tensors |
+| checkpoint group | driver used | pool reserved | pool_used | live tensors |
 |---:|---:|---:|---:|---:|
-| 1 / 64 | 94740 MiB | 90336 MiB | 34672 MiB | 1850 |
-| 2 / 64 | 95540 MiB | 91136 MiB | 34680 MiB | 1851 |
-| 3 / 64 | 95764 MiB | 91360 MiB | 34688 MiB | 1852 |
+| 1 / 64 | 61483 MiB | 60896 MiB | 34664 MiB | 922 |
+| 32 / 64 | 75339 MiB | 74752 MiB | 34681 MiB | 953 |
+| 64 / 64 | 75915 MiB | 75328 MiB | 35497 MiB | 985 |
 
-随后 forward 因 `cuda alloc_zeros failed` 退出，`RUN_EXIT=1`，没有进入 backward。
-
-最关键的分解是 group 1：
-
-```text
-pool reserved - pool used
-= 90336 MiB - 34672 MiB
-= 55664 MiB
-```
-
-即 mempool 持有约 55.7 GiB 当前没有支撑活张量的缓存。group 1 到 group 3，pool used 只增加 16 MiB，而 pool reserved 增加 1024 MiB。driver used 因此不能当作活激活显存，也不能用于外推序列长度上限。
+**pool_used 全程平在 ~34.7 GiB（64 group 只涨 ~0.8 GiB），driver used 涨到 75.9 GiB。** 差额 39 GiB 是 mempool 保留但未支撑活张量的缓存。driver used 不能当作活激活显存，也不能用于外推序列长度上限。
 
 ### 并发 WIP 已排除
 
@@ -92,74 +107,37 @@ error: unexpected argument '--cuda-mempool-retain' found
 
 ## 无损 128K 单卡方案
 
-目标是单张 H20 上完成 128K masked-CE writeback，不改变模型、注意力语义、精度或梯度定义。方案按证据 gate 推进。
+目标是单张 H20 上完成 128K masked-CE writeback，不改变模型、注意力语义、精度或梯度定义。40960 已通过（峰值 pool_used 85.9 GiB / reserved 89.4 GiB），下一步是沿长度阶梯找真正的墙。
 
-### Gate 1：固定来源并验证 train-side mempool 开关
+### Gate 1：pool_used 长度阶梯
 
-先记录 commit、dirty diff、构建参数、模型配置、CUDA 版本、GPU、完整命令和二进制哈希；来源不完整的历史运行不进入 A/B。
-
-然后使用已接入的 train runtime flag，保证它在 student `DeviceContext` 创建前生效。不修改 allocator 实现，不修改 attention、MLP 或 autograd 数学。运行 A/B 前先从 release-threshold 读数确认参数确实生效。
-
-该开关只改变空闲块何时归还给驱动，因此理论上不改变数值；实际仍需用 matched A/B 验证。
-
-### Gate 2：同一二进制跑 40960 matched A/B
-
-固定模型、参数、进程启动方式和二进制，只改变：
+用 `6da8e866` 探针二进制直接测：
 
 ```text
-A: mempool retain = true
-B: mempool retain = false
+49152 → 65536 → 98304 → 131072
 ```
 
-两臂都记录：
+每个长度记录 forward、layer-63 replay+backward 各阶段的 `pool_used` 峰值和最大单次增长（`ARLE_OPD_OP_MEM_CHECKPOINT_FN=<layer63 的 fn>`），以及 reserved 峰值与 hoard 曲线。只有 pool_used 进入容量账本；driver used 只看差额。
 
-- 每个 checkpoint group 的 driver used、pool reserved、pool used、live tensors；
-- forward 是否完成 64 个 group；
-- 是否进入并完成 backward；
-- loss 和失败位置；
-- wall time，确认释放策略的性能成本。
+从 40960 的实测外推：层内峰值 pool_used ≈ floor(34.7) + 层内物化(38.2) + grad(9.8) ≈ 82.7 GiB 中，物化与 grad 随 seq 近似线性。128K/40960 ≈ 3.2×，若线性则层内峰值 ≈ 34.7 + 48×3.2 ≈ 188 GiB，**远超 97.5**。所以墙会在阶梯中段出现，且届时是**真实 live bytes**，不再是 hoard。
 
-判定：
+### Gate 2：撞墙后按实测最大块做最小改动
 
-- 若 B 中 pool reserved 接近 pool used，且 40960 越过当前 forward OOM，则 allocator retain 是已验证的第一容量墙。
-- 若 B 中 pool reserved 仍远高于 pool used，则继续定位未被 release threshold 控制的缓存或异步释放点。
-- 若 B 中 pool used 本身接近设备容量，则 allocator 缓存不是主墙，转入真实活张量分解。
+阶梯里第一个 pool_used 逼近 97.5 GiB 的长度，就是真实容量墙。届时按实测顺序动最大块：
 
-### Gate 3：用 pool used 跑长度阶梯
+1. **attention forward 重算中间量（40960 时 23.4 GiB，最大）** —— 沿 seq 分块重算 q/k/v proj + SDPA + o_proj，峰值 →/N。SDPA 已 q-chunk bound，主要是 proj 与 gate 中间量。
+2. MLP 中间量（11.4 GiB，第二）—— 若 attention 分块后仍不够，再做 MLP custom recompute。
+3. grad 中间量（9.8 GiB）—— last-consumer 释放 / tiling。
 
-仅在 Gate 2 通过后，使用 `retain=false` 的同一实现依次测：
-
-```text
-64K → 96K → 128K
-```
-
-每个长度都记录 forward、backward 各阶段的 pool-used 峰值和最大单次增长。只有 pool used 才进入容量账本；driver used 只用于观察驱动和 pool 的差额。
-
-128K 达成的判据：
-
-- 完整 forward + backward 成功；
-- 没有降低精度、截断 attention、缩短有效序列或改变 loss mask；
-- 与 retain=true 的可运行短序列 matched A/B 保持 loss/gradient correctness parity；
-- 记录 wall-time 代价和 pool-used 峰值。
-
-### Gate 4：只有 live bytes 真正撞墙才改算子
-
-若关闭 retain 后，某个长度的 pool used 本身逼近 H20 容量，再按实际最大 live buffer 决定最小改动：
-
-1. 先定位到具体 op、buffer、shape、dtype 和生命周期；
-2. 若是无必要的同时存活，先缩短生命周期或复用输出；
-3. 若是数学上可精确分块的 transient，再做 seq-chunked recompute；
-4. 只有实测证明 MLP 中间量是最大主项，才实现 MLP custom recompute；
-5. 只有实测证明 attention backward 是最大主项，才调整其精确分块路径。
-
-在 Gate 3 前实现 MLP recompute、重写 attention 或修改 GDN，都是没有证据支撑的提前优化。
+**在 Gate 1 撞墙前实现任何 recompute 都是无证据的提前优化。** 40960 有 8 GiB 余量，当前不需要动任何算子。
 
 ## 当前判断
 
-- **已确认：** current-main 40960 OOM 时，约 34.7 GiB pool used 对应活张量，而约 90.3–91.4 GiB 被 pool reserved；driver used 不能代表活内存。
-- **强候选：** train 继承了面向 decode 的无限 mempool retain 策略，导致 transient 高水位不归还。
-- **尚未确认：** 关闭 retain 是否足以让 40960、64K、96K 或 128K 完成。
-- **当前正确动作：** 在 H20 上验证开关与 release threshold，并完成 40960 matched A/B；A/B 成立后再跑长度阶梯。
+- **已确认：** 40960 完成，rc=0，loss=8.685793。层内 backward 峰值 pool_used 85.9 GiB / reserved 89.4 GiB < 97.5 GiB。
+- **已确认：** 单层最大可动块是 attention forward 重算 23.4 GiB，MLP 11.4 GiB 第二，grad 9.8 GiB —— 推翻旧 MLP-first 方案。
+- **已确认：** forward 的 driver-used 涨幅几乎全是 mempool hoard（39 GiB），pool_used 平在 34.7 GiB；per-replay trim 在 backward 收到 3.2 GiB。
+- **尚未确认：** 65536/98304/131072 的真实 live-bytes 峰值 —— Gate 1 阶梯待测。
+- **当前正确动作：** 跑 pool_used 长度阶梯定位真实墙，不提前改算子。
 
 ## 方法教训
 
