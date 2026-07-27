@@ -94,6 +94,10 @@ wall-clock perf license.
 **No half-states.** Finish a refactor unit or revert it; never leave parallel
 old+new paths in the tree.
 
+**Talk like a human.** Say the finding in plain words first, numbers second.
+No jargon wall, no hedging, no restating the question. If a sentence needs a
+glossary, rewrite it.
+
 **Approach-first for >3 files or architectural decisions** — outline and wait.
 Never delete content outside the stated scope; inside it, prefer deletion-style
 refactors (collapse duplicates, converge on one flow) over layering adapters.
