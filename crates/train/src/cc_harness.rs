@@ -131,6 +131,53 @@ pub fn zero_variance(samples: &[ScoredSample]) -> bool {
     samples.windows(2).all(|w| w[0].reward == w[1].reward)
 }
 
+/// DAPO dynamic sampling: boot replacement groups until `target` of them train
+/// a nonzero batch, so a round holds variance-bearing groups instead of padding
+/// with dead (zero-advantage / all-truncated) ones. Terminates deterministically
+/// on an impossible corpus via the launch cap (and caller-side reserve
+/// exhaustion). Pure accounting — the caller owns launch and the reserve pool.
+pub struct RefillBudget {
+    /// Effective (nonzero-batch) groups wanted this round.
+    pub target: usize,
+    /// Hard cap on total group launches; ≥ `target`.
+    pub max_launches: usize,
+    /// Cumulative rollout-token cap across refills (0 = unbounded).
+    pub token_budget: u64,
+    pub effective: usize,
+    pub discarded: usize,
+    pub tokens: u64,
+}
+
+impl RefillBudget {
+    #[must_use]
+    pub fn new(target: usize, max_launches: usize, token_budget: u64) -> Self {
+        Self {
+            target,
+            max_launches: max_launches.max(target),
+            token_budget,
+            effective: 0,
+            discarded: 0,
+            tokens: 0,
+        }
+    }
+
+    /// Record a completed group; return whether to boot a replacement.
+    /// `committed` = groups launched/scheduled so far. Refill only replaces a
+    /// dead group, and only while under the launch and token budgets.
+    pub fn complete(&mut self, committed: usize, trained: bool, tokens: u64) -> bool {
+        self.tokens = self.tokens.saturating_add(tokens);
+        if trained {
+            self.effective += 1;
+        } else {
+            self.discarded += 1;
+        }
+        !trained
+            && self.effective < self.target
+            && committed < self.max_launches
+            && (self.token_budget == 0 || self.tokens < self.token_budget)
+    }
+}
+
 /// Sample-level group assembly: a group completes at its `k`-th scored sample,
 /// regardless of completion order across interleaved tasks.
 pub struct GroupAssembler {
@@ -420,7 +467,47 @@ fn epoch_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{GroupAssembler, REWARD_DENSE_WEIGHT, RewardShape, ScoredSample, zero_variance};
+    use super::{
+        GroupAssembler, REWARD_DENSE_WEIGHT, RefillBudget, RewardShape, ScoredSample, zero_variance,
+    };
+
+    // Model the round loop: `target` base slots, one replacement per dead group
+    // while under budget. corpus[i] = whether the i-th group trained.
+    fn drain(target: usize, max_launches: usize, corpus: &[bool]) -> (RefillBudget, usize) {
+        let mut b = RefillBudget::new(target, max_launches, 0);
+        let (mut work, mut pos) = (target, 0);
+        while pos < work && pos < corpus.len() {
+            work += usize::from(b.complete(work, corpus[pos], 100));
+            pos += 1;
+        }
+        (b, work)
+    }
+
+    #[test]
+    fn refill_replaces_dead_groups_up_to_target() {
+        let (b, _) = drain(3, 100, &[false, false, true, true, true, true]);
+        assert_eq!((b.effective, b.discarded), (3, 2));
+    }
+
+    #[test]
+    fn all_dead_corpus_terminates_at_launch_cap() {
+        // Impossible corpus: the attempt cap ends the round — no infinite loop.
+        let (b, launches) = drain(4, 6, &[false; 100]);
+        assert_eq!((b.effective, launches), (0, 6));
+    }
+
+    #[test]
+    fn token_budget_halts_refill() {
+        let mut b = RefillBudget::new(10, 100, 500);
+        let d: Vec<bool> = (0..6).map(|i| b.complete(10 + i, false, 100)).collect();
+        assert_eq!(d, [true, true, true, true, false, false]);
+    }
+
+    #[test]
+    fn off_mode_never_refills() {
+        // work == max_launches ⇒ no refill ⇒ byte-identical to the static path.
+        assert!(!RefillBudget::new(3, 3, 0).complete(3, false, 0));
+    }
 
     fn sample(task: &str, idx: usize, reward: f32) -> ScoredSample {
         ScoredSample {
