@@ -403,6 +403,7 @@ as diagnostics and validation gates, not stable tuning API.
 | `ARLE_DEEPEP_SIDECAR_PREBUILT` | path | unset | Build-time fast path for only the ARLE DeepEP sidecar binary. When set, `crates/cuda-kernels/build.rs` bakes this path into `ARLE_DEEPEP_SIDECAR_PATH` and skips sidecar compilation even if `ARLE_DEEPEP_DIR` is set. |
 | `ARLE_CUDA_ENABLE_FLASHMLA_DECODE` | `1`, unset | unset | Build-time opt-in for vendored FlashMLA sparse-FP8 decode instantiations. Leave unset on CUDA 12.5 H20 builds: those headers do not provide `__nv_fp8_e8m0`, and the runtime decode path is controlled by the `--dsv4-flashmla-decode` flag. Sparse prefill still builds when FlashMLA is enabled. |
 | `ARLE_CUDA_DISABLE_FLASHMLA_DECODE` | `1`, unset | unset | Build-time kill switch for FlashMLA sparse-FP8 decode compilation. Decode FFI symbols are satisfied by stubs while sparse prefill can remain enabled. |
+| `ARLE_CUDA_ENABLE_FA3` | `1`, unset | unset (`1` in `scripts/pod-build-env.sh`) | Build-time opt-in for the vendored FA3 hopper hdim256/bf16/sm90 forward units — prefill, and the split-KV + PackGQA decode behind `--qwen35-fa3-decode`. **Requires `vendor/flash-attention/hopper` to exist**; `vendor/` is gitignored, so on a fresh clone this flag silently builds `arle_fa3_stubs.cu` instead and both FA3 flags become no-ops (`qwen35_fa3_enabled` returns false, logging `FA3 stub build`). See §6. |
 | `ARLE_NVCC_WRAPPER` | command | unset | Optional wrapper for CUDA compilation in `crates/cuda-kernels/build.rs` and `crates/deepep-sys/build.rs`. Typical value: `sccache`, which runs `sccache /usr/local/cuda/bin/nvcc ...`. |
 | `ARLE_NVCC_SPLIT_COMPILE` | integer | unset | Optional `nvcc --split-compile=<N>` value for CUDA compilation in `crates/cuda-kernels/build.rs` and `crates/deepep-sys/build.rs`. Use a bounded value such as `8` or `16` on high-core build hosts; unset preserves the current nvcc behavior. |
 | `ARLE_NVCC_PARALLEL` | integer | `min(cores, 8)` | Worker count for the bounded parallel nvcc pool over native `.cu` compilation in `crates/cuda-kernels/build.rs`. `1` restores the previous serial loop. Capped at 8 by default because one multi-arch nvcc invocation can take 1-2 GB of RAM. Archive (`ar`) ordering is queue-order, identical to the serial loop. |
@@ -557,6 +558,30 @@ Defaults to `$HOME/.cache/huggingface`.
 ---
 
 ## 6. Environment Dependencies
+
+### Gitignored vendored subtrees
+
+`.gitignore` carries `/vendor/*` with only `llama.cpp` unignored, so a fresh
+clone is missing every other vendored kernel source. `build.rs` degrades to
+stubs rather than failing, which means the corresponding runtime flag becomes a
+silent no-op — the failure mode is a benchmark that measures the fallback while
+the log line says the feature is on.
+
+| subtree | pin | consumed by | absent → |
+|---|---|---|---|
+| `vendor/flash-attention` | `fc8cbad6`, submodule `csrc/cutlass` @ `71275920` | `ARLE_CUDA_ENABLE_FA3`: FA3 prefill + `--qwen35-fa3-decode` | `arle_fa3_stubs.cu`, both flags no-op |
+| `vendor/flashmla` | see `build.rs` | FlashMLA sparse prefill/decode | stub FFI, `--dsv4-flashmla-*` no-op |
+| `vendor/deepgemm` | `ARLE_DEEPGEMM_ROOT` | DSv4 grouped expert GEMM | DSv4 fails preflight (no silent fallback) |
+
+```bash
+git clone --filter=blob:none --no-checkout https://github.com/Dao-AILab/flash-attention.git vendor/flash-attention
+git -C vendor/flash-attention checkout fc8cbad6
+git clone --filter=blob:none --no-checkout https://github.com/NVIDIA/cutlass.git vendor/flash-attention/csrc/cutlass
+git -C vendor/flash-attention/csrc/cutlass checkout 7127592069c2fe01b041e174ba4345ef9b279671
+```
+
+`scripts/pod.sh sync` ships a git-tracked tarball, so it does **not** carry
+these — feed a vendored subtree to a remote tree separately.
 
 ### `LD_LIBRARY_PATH`
 

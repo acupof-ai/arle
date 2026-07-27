@@ -6,6 +6,7 @@
 use autograd::ops::fused_linear_distill::{PgStats, WeightForm, pg_token_weight};
 use autograd::{TensorId, TensorStore, optim::Optimizer};
 
+use crate::grad_clip::finite_optimizer_step;
 use crate::opd::{
     OpdError, Result, ValueCritic, WritebackLoss, capture_rollout_logprobs,
     masked_writeback_ce_step_dispatch, masked_writeback_step,
@@ -502,12 +503,17 @@ impl UpdatePreset {
                 adv_tokens += advantages.len();
             }
             loss_sum += loss;
+            if !loss_sum.is_finite() {
+                opt.zero_grad(store, trainable);
+                return Err(OpdError::InvalidInput(format!(
+                    "policy loss became non-finite while accumulating trajectory {i}: {loss_sum}"
+                )));
+            }
             steps += 1;
         }
 
         if !step_each && steps > 0 {
-            opt.step(store, trainable)?;
-            opt.zero_grad(store, trainable);
+            finite_optimizer_step(loss_sum, trainable, 0.0, opt, store)?;
         }
         let critic_mse = if critic.is_some() && steps > 0 {
             mse_sum / steps as f32
