@@ -51,6 +51,30 @@ launches, not columns. That is consistent with the ragged-window result — afte
 `attn` collapsed, what remains is `mlp` + `head` re-reading draft weights once
 per slot.
 
+## Confirmed on the real dataset (2026-07-27)
+
+The numbers above came from 8 canned prompts with `(v{i})` suffixes, where
+`k_med = 2`. On `mlabonne/open-perfectblend`'s held-out eval split the draft
+reaches further — `k_mean` 3.68 at block 16 — so truncating to 8 does cut
+accepted tokens, which is the objection this entry needed to answer. It does not
+cut throughput; verify falls faster than acceptance does. Two rounds, `arle-mkvc`,
+c=8, 48 requests, `ARLE_DSPARK_PHASE` medians:
+
+| | block 16 | block 8 |
+|---|---:|---:|
+| k_mean | 3.68 | 2.25 (−39%) |
+| verify | 68.54 ms | 43.57 ms (−36%) |
+| commit | 19.50 ms | 13.21 ms (−32%) |
+| draft | 20.87 ms | 20.22 ms (−3%) |
+| tick | 111.99 ms | 79.70 ms (−29%) |
+| tokens per tick | 33.03 | 29.37 (−11%) |
+| **decode tok/s** (tokens/tick ÷ tick) | **295.0** | **368.4 (+24.9%)** |
+| wall tok/s | 197.1 | 222.6 (+12.9%) |
+
+Both rounds land within 0.2% of these. The −29% tick more than pays for the −11%
+tokens it carries. Note the two metrics disagree in magnitude because wall
+includes prefill and inter-tick gaps; decode tok/s is the isolated claim.
+
 ## Problems
 
 - **This does not overturn the c=1 finding.** The old entry's root cause — a
