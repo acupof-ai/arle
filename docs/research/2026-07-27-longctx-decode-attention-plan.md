@@ -146,16 +146,15 @@ PackGQA** path. PackGQA is the GQA-aware CTA mapping; split-KV is the scaled
 split count. Both "fixes" below already exist upstream.
 
 It is default OFF, with the reason in the source: *"until the 4K/c=1 needle +
-ITL gate licenses it"*. That gate was never run, and it could not have been:
-`build.rs` requires `ARLE_CUDA_ENABLE_FA3=1` **and** `vendor/flash-attention/hopper`
-to exist, and `vendor/` is gitignored (`/vendor/*`, only `llama.cpp` unignored).
-On any fresh clone the FA3 symbols come from `arle_fa3_stubs.cu`, so the flag is
-a silent no-op — the same shape as the sm_120 missing-CUTLASS trap.
-
-Vendoring is fully pinned in `build.rs:2659`: Dao-AILab/flash-attention @
-`fc8cbad6`, cutlass `71275920`, and the units it wants are exactly
+ITL gate licenses it"*. **That gate was simply never run** — nothing else blocks
+it. The units are git-tracked at `crates/cuda-kernels/vendor/flash-attention/`
+(849 files; note the path is package-relative, not the repo-root `vendor/`,
+which holds only `llama.cpp` and `mlx-sys`), pinned to Dao-AILab @ `fc8cbad6`
+with FA3's own cutlass `71275920`, and the vendored set is exactly
 `flash_fwd_hdim256_bf16_{packgqa,split,paged,paged_split}_sm90.cu` — head_dim
-256, bf16, sm90. Our shape.
+256, bf16, sm90. Our shape. `scripts/pod-build-env.sh` already exports
+`ARLE_CUDA_ENABLE_FA3=1`, so the pod binaries have carried the real kernels all
+along.
 
 **A hand-written attempt was measured and reverted** (`c00efdb9c`, reverted in
 `fcf709e0f`): GQA-aware grid + warp-per-key QK + SM-scaled splits together ran
