@@ -38,6 +38,8 @@ pub struct AutogradRuntimeFlags {
     pub la_backward_mono: bool,
     /// Force the legacy two-pass decode attention kernel (`--autograd-decode-attn-legacy`).
     pub decode_attn_legacy: bool,
+    /// Retain the cuMemAllocAsync pool across syncs (`--cuda-mempool-retain`).
+    pub cuda_mempool_retain: bool,
     /// Storage dtype for retained activations + emitted grads (`--tape-precision`).
     pub tape_precision: TapePrecision,
 }
@@ -53,6 +55,7 @@ impl Default for AutogradRuntimeFlags {
             gdr_chunkwise_prefill: false,
             la_backward_mono: false,
             decode_attn_legacy: false,
+            cuda_mempool_retain: true,
             tape_precision: TapePrecision::Fp32,
         }
     }
@@ -77,6 +80,8 @@ pub fn apply_runtime_flags(f: &AutogradRuntimeFlags) {
     GDR_CHUNKWISE_PREFILL.store(f.gdr_chunkwise_prefill, Relaxed);
     LA_BACKWARD_MONO.store(f.la_backward_mono, Relaxed);
     DECODE_ATTN_LEGACY.store(f.decode_attn_legacy, Relaxed);
+    #[cfg(feature = "cuda")]
+    cuda_kernels::tensor::set_mempool_retain(f.cuda_mempool_retain);
     TAPE_PRECISION.store(f.tape_precision as u8, Relaxed);
 }
 

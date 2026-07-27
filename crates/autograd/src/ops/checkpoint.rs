@@ -144,6 +144,7 @@ where
         if tape.offload_checkpoints && end == num_layers {
             tape.set_skip_next_checkpoint_input_offload(true);
         }
+        let checkpoint_fn_before = tape.checkpoint_fn_count();
         hidden = checkpoint(input_ids, store, tape, move |s, t, inp| {
             let mut h = *inp.first().ok_or(AutogradError::TapeInvariant(
                 "checkpoint_sequential missing hidden input",
@@ -153,14 +154,29 @@ where
             }
             Ok(h)
         })?;
+        let checkpoint_fn_after = tape.checkpoint_fn_count();
+        if trace_checkpoint_group_vram() && checkpoint_fn_after == checkpoint_fn_before + 1 {
+            eprintln!(
+                "[checkpoint-map] checkpoint_fn={checkpoint_fn_before} layers={start}..{stop}"
+            );
+        }
         li = end;
         if trace_checkpoint_group_vram()
             && let Some((free, total)) = store.backend().device_mem_info()
         {
+            // pool_used = bytes actually backing live tensors; pool_reserved =
+            // what the mempool holds (used + free-but-cached). driver `used`
+            // (total-free) ≥ pool_reserved: the gap between driver-used and
+            // pool_used is high-water the allocator caches, NOT live activation.
+            let (pr, pu) = store.backend().mem_pool_stats().unwrap_or((0, 0));
             eprintln!(
-                "[ckpt-group-vram] after_group end={end}/{num_layers} used={}MiB free={}MiB",
+                "[ckpt-group-vram] after_group end={end}/{num_layers} used={}MiB free={}MiB \
+                 pool_reserved={}MiB pool_used={}MiB live_tensors={}",
                 (total - free) >> 20,
                 free >> 20,
+                pr >> 20,
+                pu >> 20,
+                store.live_ids().len(),
             );
         }
     }
