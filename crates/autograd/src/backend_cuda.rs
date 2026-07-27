@@ -3760,6 +3760,16 @@ fn cuda_causal_sdpa_prefill_device(
         )?;
     }
 
+    // FFI returns only the launch code; sync here (trace-gated) to pin an async
+    // execution fault to this kernel instead of the next alloc.
+    if std::env::var("ARLE_SDPA_TRACE").is_ok() {
+        backend.stream.synchronize().map_err(|e| {
+            leak_err(format!(
+                "sdpa fused async fault: seq={seq} dim={dim} err={e:?}"
+            ))
+        })?;
+    }
+
     let out_f32 = backend.import_local_bf16_as_f32(&out_bf16, out_len)?;
     let out_handle = DeviceHandle::Cuda(CudaStorage::new(out_f32));
     let (out, out_shape) = backend.transpose_axes_swap(&out_handle, &[1, seq, heads, dim], 1, 2)?; // [1, h, s, d]
@@ -5204,6 +5214,26 @@ fn cuda_alloc_failed(op: &'static str, shape: Vec<usize>) -> AutogradError {
     AutogradError::CudaAllocFailed { op, shape, bytes }
 }
 
+// A ~GB alloc failing with tens of GB free is a sticky async fault, not
+// capacity: surface the driver code + live free/total, not just "failed".
+#[cfg(not(feature = "no-cuda"))]
+fn cuda_alloc_failed_rich(
+    backend: &CudaBackend,
+    op: &'static str,
+    bytes: usize,
+    err: &dyn std::fmt::Debug,
+) -> AutogradError {
+    leak_err(format!(
+        "alloc {op} failed: bytes={bytes} err={err:?} free_total={:?}",
+        backend.mem_get_info().ok()
+    ))
+}
+
+#[cfg(not(feature = "no-cuda"))]
+fn leak_err(msg: String) -> AutogradError {
+    AutogradError::TapeInvariant(Box::leak(msg.into_boxed_str()))
+}
+
 // Compute both matmul gradients via two cuBLAS SGEMM calls with an OP_T on
 // whichever operand must be transposed; avoids the host-side physical
 // transpose the old CPU fallback did and keeps the math on-device.
@@ -6286,7 +6316,7 @@ fn cuda_unary_1d_device(
     let mut d_out = backend
         .stream
         .alloc_zeros::<f32>(size)
-        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
+        .map_err(|e| cuda_alloc_failed_rich(backend, op_label, size * 4, &e))?;
     let n = i32::try_from(size)
         .map_err(|_| AutogradError::TapeInvariant("cuda unary length exceeds i32"))?;
     launch_1d(
@@ -6359,7 +6389,7 @@ fn cuda_binary_1d_device(
     let mut d_out = backend
         .stream
         .alloc_zeros::<f32>(size)
-        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
+        .map_err(|e| cuda_alloc_failed_rich(backend, op_label, size * 4, &e))?;
     let n = i32::try_from(size)
         .map_err(|_| AutogradError::TapeInvariant("cuda binary length exceeds i32"))?;
     launch_1d(
