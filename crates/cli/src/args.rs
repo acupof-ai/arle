@@ -2019,6 +2019,22 @@ pub(crate) struct TrainAgentOpdArgs {
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set, value_name = "BOOL")]
     pub(crate) task_selection: bool,
 
+    /// DAPO dynamic sampling: boot replacement groups (from the round's
+    /// unscheduled tasks) for dead ones — zero-variance or all-truncated — until
+    /// the round trains as many effective groups as it scheduled tasks. Capped by
+    /// `--dynamic-sampling-max-factor`× launches and, if set, cumulative rollout
+    /// tokens; an all-dead corpus terminates at the cap without an optimizer step.
+    #[arg(long, default_value_t = false)]
+    pub(crate) dynamic_sampling: bool,
+
+    /// Launch cap as a multiple of the scheduled task count (attempt budget).
+    #[arg(long, default_value_t = 3.0, value_name = "X")]
+    pub(crate) dynamic_sampling_max_factor: f32,
+
+    /// Cumulative rollout-completion-token budget for refills (0 = unbounded).
+    #[arg(long, default_value_t = 0, value_name = "N")]
+    pub(crate) dynamic_sampling_token_budget: u64,
+
     /// HELD-OUT eval task set (SWE-bench-Pro JSONL, SAME schema as --dataset but
     /// SEPARATE tasks — no overlap, so the pass-rate measures generalization).
     /// When set, an eval-only rollout+score pass runs at round boundaries (a
