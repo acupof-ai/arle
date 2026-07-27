@@ -99,6 +99,38 @@ speculative acceptance, not loss; (5) record retraction wall, step wall, spectru
 error, accepted tokens/target-step. A failed premise or A/B keeps ISO non-default
 and records an `errors/` verdict — it does not propagate into Agent-RFT.
 
+### H20 sweep run (2026-07-27) — INCONCLUSIVE, do not green-light the A/B
+
+Qwen3.6-27B-FP8 single-GPU, cold head, ISO-off, α ∈ {0, 0.5, 1}, w1 axis:
+
+| α | w1 spectrum_drift | train loss | verdict |
+|---|---|---|---|
+| 0 (pure PG) | 2.07e-6 | ≈−0.4 (active) | near-isospectral, but see confound 2 |
+| 0.5 | 1.7–2.6e-6 | ≈−0.07 | PM half contributes ~0 |
+| 1 (pure PM) | 4e-10 | **0.0000** | null arm — no gradient |
+
+Two confounds make this neither a confirm nor a clean falsification:
+
+1. **α=1 is a null discriminator.** The prob-match loss
+   `mean_{v∈vocab}(softmax(draft)−softmax(target))²` divides a TV-style surrogate
+   by 248,320 classes; on a head where the draft already tracks the trunk it
+   underflows f32 print precision → loss 0.0000, `accept_ema` drifts *down* (no
+   learning). So α=1's tiny drift is "head didn't move," not "dense supervision
+   preserves the spectrum" — the arm meant to show LARGE drift produced no signal.
+2. **Cold head confounds the α=0 arm too.** `bias = w2·w1[cond]`, so
+   `∂bias/∂w1 = w2 ≈ 0` at a cold (w2=0) start — w1's gradient is gated by the
+   near-zero w2, so 2.07e-6 is partly "w1 barely trained," not cleanly "w1
+   trained hard yet stayed isospectral." The plan specified a **nonzero
+   pretrained** head for exactly this reason; using a cold head to dodge the
+   missing seeded-Qwen head was too clever.
+
+To measure the premise cleanly: a **nonzero pretrained Qwen3.6 DSpark head**
+(both factors non-zero, so each gets real gradient) + a PM regime that actually
+moves the head (higher `--dspark-train-lr`, or harder traffic with real
+draft↔target divergence, or per-active-class PM normalization instead of
+`/vocab` — see the 7b finding). Until then the ISO premise is unmeasured; #32
+stays gated.
+
 ## Rule
 
 - **A "fixed-spectrum retraction" is not the ISO optimizer.** Preserving σ(W₀)
