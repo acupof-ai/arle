@@ -5,9 +5,15 @@ number measured before that was priced against a step 2.8× too expensive.
 
 ## What changed
 
-| c=1, 32k long-agent | before | after |
-|---|---:|---:|
-| DSpark vs no-spec (TPOT) | 2.04× | **1.33×** |
+| 32k long-agent, total tok/s | DSpark vs no-spec |
+|---|---:|
+| c=1 | **+1.5%** |
+| c=8 | **−6.3%** |
+| c=16 | **−7.1%** |
+
+Before FA3, DSpark was +57.5% at c=1 on short prompts and +2.04× on this
+dataset. It is now a rounding error at c=1 and a **loss** at every concurrency
+that matters.
 
 Acceptance did not move — same draft, same `k`. Speculation's value is
 `(k+1) × step_cost` saved against `verify_cost`; shrinking `step_cost` shrinks
@@ -45,13 +51,14 @@ transformers. Nothing here is cheap.
 
 ## Order
 
-1. **Scheduling first.** 95% of the c≥4 decode span is queueing. Until that
-   number moves, every spec-decode change is optimizing 5% of the wall clock.
-2. **Re-measure DSpark after**, on this dataset, against
-   [the champion row](../baselines.md). The 1.33× is itself provisional — it was
-   measured with the queueing tax present in both arms.
-3. **Only then** decide whether tree speculation is worth the GDN state cost. It
-   needs the 47% to be real at whatever `k` survives step 2.
+1. **Stop spending on DSpark for concurrent serving.** It is measured negative at
+   c=8 and c=16 against the champion row. Keep it available for c=1 latency
+   work, where it is +1.5% and costs nothing to leave in.
+2. **Scheduling.** The machine saturates at c=8 (+1.0% from c=8 to c=16 while
+   ITL p90 reaches 8.1 s). That is where the remaining throughput is.
+3. **Revisit tree speculation only if a single-stream latency target appears.**
+   The 47% top-2 rescue is real, but it buys `E[k]`, and `E[k]` is now worth a
+   third of what it was — against ~2 GB/slot of GDN state.
 
 ## Rule
 
