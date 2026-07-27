@@ -74,11 +74,8 @@ typedef struct {
     float softmax_scale;
     int is_causal;
     int num_splits;  // 1 = direct fwd; >1 = split-KV + combine (<=256)
-    // Paged KV (null page_table = contiguous). k/v then point at the pool base
-    // and the strides describe one page: k_row_stride = stride between tokens
-    // inside a page, k_head_stride = between KV heads, k_batch_stride = between
-    // pages. That expresses the qwen35 HND pool [page, h_k, page_size, d]
-    // without a relayout (paged_kv.h builds a CuTe tensor from these directly).
+    // Paged KV (null = contiguous): k/v are the pool base and the strides
+    // describe one page, matching the HND pool [page, h_k, page_size, d].
     const int* page_table;  // i32 page indices for this request
     int page_size;
     int num_pages;          // pages in the POOL (the 4th dim's extent)
@@ -123,9 +120,7 @@ cudaError_t arle_fa3_fwd_hd256_bf16_cuda(const ArleFa3FwdHd256Args* a,
     };
     params.q_batch_stride =
         batch_extent(a->seqlen_q, a->q_row_stride, a->num_heads, a->q_head_stride);
-    // Paged: the 4th (batch) dim of FA3's K/V tensor IS the page dim
-    // (flash_fwd_launch_template.h:98-100), so its stride is the pool's page
-    // stride, not the contiguous batch extent.
+    // Paged: FA3's 4th K/V dim is the page dim (launch template :98-100).
     params.k_batch_stride =
         a->page_table != nullptr
             ? a->k_page_stride
@@ -256,9 +251,7 @@ cudaError_t arle_fa3_fwd_hd256_bf16_cuda(const ArleFa3FwdHd256Args* a,
     }
 
     if (paged) {
-        // The vendored paged instantiations are PackGQA-only, which is also the
-        // shape we want: one CTA per KV head serving the whole GQA group.
-        params.pack_gqa = true;
+        params.pack_gqa = true;  // the vendored paged units are PackGQA-only
         run_mha_fwd_<90, cutlass::bfloat16_t, 256, 256, /*Split=*/false,
                      /*PagedKVNonTMA=*/true, /*Has_softcap=*/false,
                      /*PackGQA=*/true>(params, stream);

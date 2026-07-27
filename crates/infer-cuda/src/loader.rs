@@ -321,6 +321,10 @@ pub(crate) struct PageMeta {
     /// is single-row, so it is launched per row at these offsets.
     pub(crate) q_offsets: Vec<usize>,
     pub(crate) page_offsets: Vec<usize>,
+    /// Host mirror of each row's total KV length (prefix + this forward's new
+    /// tokens). The FA3 paged decode path launches one call per request and
+    /// needs `seqlen_k` on the host to do it.
+    pub(crate) kv_lens: Vec<usize>,
     /// Longest row's new-token count — the kernel's `max_qlen`.
     pub(crate) seq_len: usize,
     /// Sum of every row's new-token count — the kernel's `total_q_tokens`.
@@ -357,6 +361,7 @@ impl PageMeta {
         let mut kv_indices = Vec::new();
         let mut last_page_lens = Vec::with_capacity(batch);
         let mut start_positions = Vec::with_capacity(batch);
+        let mut kv_lens = Vec::with_capacity(batch);
         let mut positions = Vec::with_capacity(batch);
         q_indptr.push(0);
         kv_indptr.push(0);
@@ -392,6 +397,7 @@ impl PageMeta {
             });
             start_positions.push(start_pos as i32);
             positions.push((total_len - 1) as i32);
+            kv_lens.push(total_len);
             total_q += len;
             total_pages += num_pages;
             max_len = max_len.max(len);
@@ -447,6 +453,7 @@ impl PageMeta {
             positions: upload_i32(ctx, &positions)?,
             q_offsets: q_indptr.iter().map(|&q| q as usize).collect(),
             page_offsets: kv_indptr.iter().map(|&p| p as usize).collect(),
+            kv_lens,
             seq_len: max_len,
             total_q,
             num_pages: total_pages,
@@ -513,6 +520,7 @@ impl PageMeta {
             positions: upload_i32(ctx, &[(total_len - 1) as i32])?,
             q_offsets: vec![0, 1],
             page_offsets: vec![0, num_pages],
+            kv_lens: vec![total_len],
             seq_len: 1,
             total_q: 1,
             num_pages,
