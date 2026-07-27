@@ -88,6 +88,60 @@ There is precedent for the tunable form already in the tree: the FA3 decode path
 carries `qwen35_fa3_decode_splits`, runtime-settable and clamped to [2, 256]
 (`crates/infer-cuda/src/runtime_flags.rs:81`). Only this batched path is pinned.
 
+## The byte ledger (measured from the checkpoint's tensor table)
+
+Batch 1 has no weight reuse, so a decode step streams essentially the whole
+model out of HBM. Summed from `model.safetensors.index.json`, FP8:
+
+| what | bytes/step | share |
+|---|---:|---:|
+| MLP (gate+up+down × 64 layers) | 17.12 GB | 58% |
+| GDN (`in_proj_qkv` + `in_proj_z` + `out_proj` × 48 layers) | 5.54 GB | 19% |
+| `lm_head` | 2.54 GB | 8.7% |
+| full-attention weights (q/k/v/o × 16 layers) | 1.68 GB | 5.7% |
+| **KV cache @ 32k** | **2.10 GB** | **7.2%** |
+| GDN recurrent state (48 × [48,128,128] fp32, r+w) | 0.30 GB | 1.0% |
+| **total** | **≈29.3 GB** | |
+
+Floor at 4.0 TB/s: **7.3 ms**. Real stacks land at 35–65% of peak → 11–21 ms →
+48–91 tok/s, which brackets the Qwen3-32B FP8 reference on this same H20
+(46.2 tok/s, Qwen's own speed benchmark). Split against the measured 77 ms:
+
+| | bytes | time | effective | % peak |
+|---|---:|---:|---:|---:|
+| weights (the constant term) | 26.9 GB | ~10 ms | 2.7 TB/s | **67%** |
+| KV (the context term) | 2.10 GB | ~67 ms | 31 GB/s | **0.8%** |
+
+**The weight path is healthy.** KV is 7.2% of the bytes and 87% of the time.
+
+This also explains why concurrency buys nothing here: weight traffic amortizes
+across a batch, KV traffic does not. A KV-bound engine cannot batch its way out
+— which is exactly the measured 8.6 → 9.9 aggregate decode tok/s from c=1 to
+c=8.
+
+## Do not hand-write this kernel — the vendored path is already wired
+
+`--qwen35-fa3-decode` routes decode through the **vendored FA3 split-KV +
+PackGQA** path. PackGQA is the GQA-aware CTA mapping; split-KV is the scaled
+split count. Both "fixes" below already exist upstream.
+
+It is default OFF, with the reason in the source: *"until the 4K/c=1 needle +
+ITL gate licenses it"*. That gate was never run, and it could not have been:
+`build.rs` requires `ARLE_CUDA_ENABLE_FA3=1` **and** `vendor/flash-attention/hopper`
+to exist, and `vendor/` is gitignored (`/vendor/*`, only `llama.cpp` unignored).
+On any fresh clone the FA3 symbols come from `arle_fa3_stubs.cu`, so the flag is
+a silent no-op — the same shape as the sm_120 missing-CUTLASS trap.
+
+Vendoring is fully pinned in `build.rs:2659`: Dao-AILab/flash-attention @
+`fc8cbad6`, cutlass `71275920`, and the units it wants are exactly
+`flash_fwd_hdim256_bf16_{packgqa,split,paged,paged_split}_sm90.cu` — head_dim
+256, bf16, sm90. Our shape.
+
+**A hand-written attempt was measured and reverted** (`c00efdb9c`, reverted in
+`fcf709e0f`): GQA-aware grid + warp-per-key QK + SM-scaled splits together ran
+**−20.5%** (32k, c=1: total 1157.6 → 920.2 tok/s, ITL p90 80.9 → 162.9 ms). The
+diagnosis above survives; the hand-rolled fix does not.
+
 ## What is still a hypothesis
 
 - That occupancy is the binding constraint at c=1. The CTA count and the
@@ -101,6 +155,39 @@ carries `qwen35_fa3_decode_splits`, runtime-settable and clamped to [2, 256]
 - That the 2.09 ms/1k slope is entirely attention. It is the only
   context-dependent term in the step, but it has not been isolated with a phase
   timer.
+
+## What this deletes
+
+Full-attention decode currently has four implementations of one job, selected by
+two boolean flags, and one of them has no caller at all:
+
+| path | selector | state |
+|---|---|---|
+| `fused_gqa_attention_decode_batched_kernel` + `attention_decode_reduce_batched_kernel` | `--qwen35-batched-decode-attention` (default on) + `head_dim == 256` | hand-rolled split-KV; the −20.5% revert targeted this |
+| per-row loop over the same single-row kernels | the `else` of the same flag | pure A/B arm |
+| paged `decode_prep_paged_hd256_cuda` + devpos kernel | `seq_len == 1` in the paged lane | default there |
+| **vendored FA3 split-KV + PackGQA** | `--qwen35-fa3-decode` (default off) | stub build today |
+| `fused_gqa_attention_single_token_kernel` | — | **zero Rust callers**; compiles into every build (SHARED 35376) |
+
+Licensing FA3 converges these to one. The deletion list, in order:
+
+1. **Now, no gate needed:** `fused_gqa_attention_single_token_kernel` — dead code,
+   grep confirms no FFI extern and no call site.
+2. **On FA3 license:** the hand-rolled batched kernel and its reduce kernel
+   (~330 lines of `.cu`), their two FFI externs, `QWEN35_BATCHED_DECODE_KV_SPLITS`,
+   and the three `batch_partial_*` scratch slots.
+3. **With them:** `--qwen35-batched-decode-attention` and its per-row `else`
+   arm — an A/B flag has no meaning once there is one implementation.
+4. **And the selector itself:** `--qwen35-fa3-decode` becomes the only path, so
+   the flag goes too. `--qwen35-fa3-decode-splits` stays only if the sweep shows
+   the default is workload-dependent.
+
+What stays: `arle_fa3_stubs.cu` (non-sm90 builds still need the symbols) and the
+paged prep kernel (FA3 consumes prepped q).
+
+The rule this follows is the repo's own — converge on one flow, do not layer an
+adapter beside the old one. A flag that selects between two implementations of
+the same kernel is a half-state, not a feature.
 
 ## Order of work
 
