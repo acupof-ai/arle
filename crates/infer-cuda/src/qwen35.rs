@@ -6437,10 +6437,8 @@ impl Qwen35Model {
                             let pages = meta.page_offsets[1] - meta.page_offsets[0];
                             let splits = qwen35_fa3_decode_splits();
                             let lse = fa3_lse.get(&self.ctx, self.local_q_heads * rows)?;
-                            let oaccum = fa3_oaccum.get(
-                                &self.ctx,
-                                splits * self.local_q_heads * rows * c.head_dim,
-                            )?;
+                            let oaccum = fa3_oaccum
+                                .get(&self.ctx, splits * self.local_q_heads * rows * c.head_dim)?;
                             let lseaccum =
                                 fa3_lseaccum.get(&self.ctx, splits * self.local_q_heads * rows)?;
                             let sem = fa3_semaphore.get(&self.ctx, 1)?;
@@ -6477,8 +6475,7 @@ impl Qwen35Model {
                                 softmax_scale: sm_scale,
                                 is_causal: 0,
                                 num_splits: splits as i32,
-                                page_table: (kv_indices_ptr
-                                    + (meta.page_offsets[0] * 4) as u64)
+                                page_table: (kv_indices_ptr + (meta.page_offsets[0] * 4) as u64)
                                     as *const i32,
                                 page_size: pool.page_size as i32,
                                 num_pages: pages as i32,
