@@ -206,6 +206,7 @@ fn run_config(config: ServeConfig) -> ExitCode {
             let iso = config.options.spec.dspark_train_iso;
             let lr = config.options.spec.dspark_train_lr;
             let batch = config.options.spec.dspark_train_batch;
+            let prob_match_alpha = config.options.spec.dspark_prob_match_alpha;
             Some(Box::new(
                 move |engine: &std::sync::Arc<LoadedInferenceEngine>| {
                     if let Some(path) = &init {
@@ -226,6 +227,8 @@ fn run_config(config: ServeConfig) -> ExitCode {
                             iso_fixed_spectrum: iso,
                             learning_rate: lr.unwrap_or(DsparkTrainConfig::default().learning_rate),
                             batch_size: batch.unwrap_or(DsparkTrainConfig::default().batch_size),
+                            prob_match_alpha: prob_match_alpha
+                                .unwrap_or(DsparkTrainConfig::default().prob_match_alpha),
                             ..Default::default()
                         },
                     )?;
@@ -426,6 +429,7 @@ fn resolve_spec_options(backend: ServeBackend, serve_args: &ServeArgs) -> ServeS
         dspark_train_iso: serve_args.dspark_train_iso,
         dspark_train_lr: serve_args.dspark_train_lr,
         dspark_train_batch: serve_args.dspark_train_batch,
+        dspark_prob_match_alpha: serve_args.dspark_prob_match_alpha,
         dspark_block_size: serve_args.dspark_block_size,
         // The sidecar needs a head to write into, and so does `--dspark-markov-init`
         // (`update_markov_weights` has nothing to install over) — a DFlash backbone
