@@ -1,4 +1,4 @@
-# DSpark test-time training is single-process-only; every DSpark model is multiproc, 2026-07-27
+# DSpark test-time training is single-process-only; multiproc TP silently no-ops it, 2026-07-27
 
 ## Context
 
@@ -46,16 +46,31 @@ real substrate. Before claiming a training path works, confirm the *serving mode
 of the production model* reaches the trainer, not just that the trainer passes
 its own unit tests.
 
-## Open — the premise is unmeasured, not disproven
+## Open — the premise IS runnable single-GPU; multiproc is separate future work
 
-To run the ISO premise sweep, one of:
-1. **Wire the DSpark sidecar + head-init into the multiproc rank-0/coordinator
-   path** (`serve_multiproc.rs`) — a bounded new feature; the trainer already
-   runs on a CPU sidecar independent of TP, so it's a plumbing job (route rank-0
-   experiences + head-sync through the coordinator). This is the general fix and
-   unblocks all DSpark test-time training under TP.
-2. **Stage a dense-Qwen3 (single-process) DSpark substrate** — smaller, off the
-   validated Qwen3.6-MoE substrate, so a weaker premise signal.
+**Correction to the first framing:** the ISO premise sweep is NOT structurally
+blocked. `world_size <= 1` → `bind_relay_and_spawn_workers` returns `None` →
+single-process serve → `on_engine_loaded` fires → the sidecar runs
+(serve_multiproc.rs:111). Qwen3.6-27B-FP8 (~27 GB) fits one H20 (96 GB) at
+`WORLD_SIZE=1`, and the ISO-**off** premise sweep needs **no seeded head**: a
+cold-grown head (w2=0, w1 Xavier-init) trains ISO-off, and `SpectrumProbe`
+captures w1's nonzero base spectrum → a real drift signal. The `iso_without_seed`
+guard only fires when ISO is ON, so ISO-off cold is allowed. The devops agent hit
+the multiproc wall only because the staged *seeded heads* were DSv4-vocab
+(forcing TP) — an asset artifact, not a necessity.
 
-Until then Phase 5's H20 license is **unmeasured** (not failed): the ISO A/B and
-Agent-RFT ISO (#32) stay gated. Do not treat "unrun" as "premise holds."
+So the sweep runs today: serve Qwen3.6-27B-FP8 single-GPU, `--spec-type dspark
+--dspark-train --dspark-prob-match-alpha {0,0.5,1}`, no `--dspark-markov-init`, no
+`--dspark-train-iso`; read w1 `spectrum_drift`.
+
+**The multiproc gap is real but SEPARATE — it is not the #32 blocker.** Wiring the
+DSpark sidecar into the multiproc rank-0 worker (route rank-0's process-global
+experience buffer + an mpsc weight-swap drained between lockstep ticks — the
+draft is TP-collective but rank-0's chain is authoritative, dsv4.rs:1801/1835, so
+only rank-0's head matters) is future work for TP-scale DSpark *training*. It is
+not needed to measure the ISO premise. Filed as its own follow-up, not gated on
+the sweep.
+
+Until the sweep runs, Phase 5's H20 license is **unmeasured** (not failed): the
+ISO A/B and Agent-RFT ISO (#32) stay gated. Do not treat "unrun" as "premise
+holds."
