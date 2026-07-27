@@ -458,8 +458,8 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         None
     }
 
-    /// Hoard in MiB. `None` (never a true 0) when unavailable or the two-attr
-    /// read is inconsistent (`used > reserved`, a concurrent alloc between reads).
+    /// Hoard in MiB. `None` (not a false 0) if unavailable or `used > reserved`
+    /// (a torn two-attr read).
     fn hoarded_mib(&self) -> Option<u64> {
         let (reserved, used) = self.mem_pool_stats()?;
         (reserved >= used).then(|| (reserved - used) >> 20)
