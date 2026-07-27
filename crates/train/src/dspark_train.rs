@@ -170,9 +170,9 @@ pub struct DsparkTrainer {
     /// random init (fallback when the engine has no Markov head to read).
     init_weights: Option<(Vec<f32>, Vec<f32>, usize)>,
     optim: AdamW,
-    /// Fixed-spectrum projector, captured from the seeded head on the first
-    /// step. `None` when `iso_fixed_spectrum` is off.
-    iso: Option<crate::iso_spectrum::FixedSpectrum>,
+    /// ISO frame optimizer, captured from the seeded head on the first step.
+    /// `None` when `iso_fixed_spectrum` is off; the head then trains dense w1/w2.
+    iso: Option<crate::iso_spectrum::IsoFrames>,
     baseline_ema: f32,
     /// Per-parameter `‖ΔW‖/‖W‖` of the last retraction — measures the paper's
     /// premise on this head instead of assuming it. Empty when ISO is off.
@@ -346,19 +346,34 @@ impl DsparkTrainer {
             self.init_params(vocab_size)?;
             if self.config.iso_fixed_spectrum {
                 // Capture from the seeded head, before any step — these ARE the
-                // base weights ISO's Σ₀ is defined against.
+                // base weights ISO's Σ₀ is defined against. The w1/w2 leaves stay
+                // as the reconstruction target; the frames become trainable.
                 let p = self.params.as_ref().unwrap();
-                self.iso = Some(crate::iso_spectrum::FixedSpectrum::capture(
+                self.iso = Some(crate::iso_spectrum::IsoFrames::capture(
                     &[p.w1, p.w2],
                     &mut self.store,
                 )?);
             }
         }
-        let params = self.params.as_ref().unwrap();
+        let (rank, w1_leaf, w2_leaf) = {
+            let p = self.params.as_ref().unwrap();
+            (p.rank, p.w1, p.w2)
+        };
 
         // Snapshot live tensors before the forward pass so we can free every
         // intermediate created during this step in one call (no manual ID list).
         let live_before: HashSet<TensorId> = self.store.live_ids().into_iter().collect();
+
+        // ISO on: the head reads reconstructed `W = U diag(Σ₀) Vᵀ` (on the tape,
+        // so backward flows to the frames); the trainable set is the frames. Off:
+        // train the dense w1/w2 leaves directly. Both build the same forward.
+        let (w1_id, w2_id, trainable) = if let Some(iso) = self.iso.as_ref() {
+            let w1 = iso.reconstruct(0, &mut self.store, &mut self.tape)?;
+            let w2 = iso.reconstruct(1, &mut self.store, &mut self.tape)?;
+            (w1, w2, iso.frame_ids())
+        } else {
+            (w1_leaf, w2_leaf, vec![w1_leaf, w2_leaf])
+        };
 
         // Row alignment mirrors the serve drafting loop (qwen35/dspark.rs
         // `first_row = !next_token_heads`): draft position t drafted
@@ -425,14 +440,9 @@ impl DsparkTrainer {
         // Markov bias in the SERVE coordinate frame: w2 is [vocab, rank]
         // row-major (gemm_batch weight), bias[v] = Σ_r w2[v][r] · w1[cond][r]
         // — i.e. emb [n, rank] · w2ᵀ.
-        let emb_id = ops::embedding(params.w1, &cond_tokens, &mut self.store, &mut self.tape)?;
-        let emb_flat_id = ops::reshape(
-            emb_id,
-            &[n_rows, params.rank],
-            &mut self.store,
-            &mut self.tape,
-        )?;
-        let bias_id = ops::matmul_bt(emb_flat_id, params.w2, &mut self.store, &mut self.tape)?;
+        let emb_id = ops::embedding(w1_id, &cond_tokens, &mut self.store, &mut self.tape)?;
+        let emb_flat_id = ops::reshape(emb_id, &[n_rows, rank], &mut self.store, &mut self.tape)?;
+        let bias_id = ops::matmul_bt(emb_flat_id, w2_id, &mut self.store, &mut self.tape)?;
         let corrected_id = ops::add(logits_id, bias_id, &mut self.store, &mut self.tape)?;
 
         // ---- Policy-gradient loss (acceptance-weighted) ----
@@ -509,7 +519,6 @@ impl DsparkTrainer {
             &mut self.store,
             &mut self.tape,
         )?;
-        let (w1_id, w2_id) = (params.w1, params.w2);
         let loss_id = ops::add(pg_scaled_id, pm_scaled_id, &mut self.store, &mut self.tape)?;
         let loss = self
             .store
@@ -517,29 +526,29 @@ impl DsparkTrainer {
             .first()
             .copied()
             .ok_or_else(|| anyhow::anyhow!("DSpark loss tensor is empty"))?;
-        ensure_finite_loss(loss, &[w1_id, w2_id], &mut self.optim, &mut self.store)?;
+        ensure_finite_loss(loss, &trainable, &mut self.optim, &mut self.store)?;
 
         self.tape.backward(loss_id, &mut self.store)?;
         finite_optimizer_step(
             loss,
-            &[w1_id, w2_id],
+            &trainable,
             self.config.max_grad_norm.unwrap_or(0.0),
             &mut self.optim,
             &mut self.store,
         )?;
         self.baseline_ema = next_baseline;
         self.steps += 1;
-        // ISO step 4: project the base optimizer's step back onto the
-        // fixed-spectrum family. Reported drift is how far it had wandered off.
+        // ISO: polar-retract both frames back onto the orthonormal manifold, so
+        // σ(U diag(Σ₀) Vᵀ) = Σ₀ exactly. Reported drift is how far the step had
+        // wandered off — the paper's premise, measured on this head.
         //
         // On the `swap_every` cadence, not every step: measured 5.0 s per
-        // retraction at the real head shape (151936 × 256, both factors, M4 Pro
+        // retraction at the real head shape (151936 × 256, both frames, M4 Pro
         // single-thread) against a ~1 s step, so per-step retraction would cost
-        // more wall-clock than the paper's 2.2× step reduction buys back. The
-        // projection is exact whenever it runs, and measured drift between
-        // retractions is ~1e-3 relative, so the iterate never leaves a tight
-        // neighbourhood of ℱ(W₀). Sharing the publish cadence also means the
-        // head handed to the engine is always freshly on the manifold.
+        // more wall-clock than the paper's 2.2× step reduction buys back.
+        // Measured inter-retraction drift is ~1e-3 relative, so the iterate never
+        // leaves a tight neighbourhood of ℱ(W₀), and sharing the publish cadence
+        // means the head handed to the engine is always freshly on the manifold.
         let retract_result = if self.steps.is_multiple_of(self.config.swap_every)
             && let Some(iso) = self.iso.as_mut()
         {
@@ -562,13 +571,22 @@ impl DsparkTrainer {
         Ok(loss)
     }
 
-    /// Get current Markov head weights as (w1 [vocab*rank], w2 [vocab*rank]).
+    /// Current Markov head as `(w1 [vocab*rank], w2 [vocab*rank])`. With ISO on,
+    /// materialize `W = U diag(Σ₀) Vᵀ` from the frames — callers retract first,
+    /// so the returned head is on ℱ(W₀). Off: read the dense w1/w2 leaves.
     pub fn get_weights(&mut self) -> Result<(Vec<f32>, Vec<f32>)> {
         let Some(params) = self.params.as_ref() else {
             anyhow::bail!("Markov params not yet initialized");
         };
-        let w1 = self.store.to_host(params.w1)?;
-        let w2 = self.store.to_host(params.w2)?;
+        let (w1_leaf, w2_leaf) = (params.w1, params.w2);
+        if let Some(iso) = self.iso.take() {
+            let w1 = iso.materialize(0, &mut self.store);
+            let w2 = iso.materialize(1, &mut self.store);
+            self.iso = Some(iso);
+            return Ok((w1?, w2?));
+        }
+        let w1 = self.store.to_host(w1_leaf)?;
+        let w2 = self.store.to_host(w2_leaf)?;
         Ok((w1, w2))
     }
 

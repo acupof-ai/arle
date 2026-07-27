@@ -313,9 +313,10 @@ fn iso_fixed_spectrum_pins_the_spectrum_without_freezing_the_head() {
             trainer.train_step(&batch).unwrap();
         }
         let (w1, _) = trainer.get_weights().unwrap();
-        // Gram spectrum proxy: ‖w1ᵀw1 − w1₀ᵀw1₀‖_F / ‖w1₀ᵀw1₀‖_F. Same statement
-        // as ‖σ(W)−σ(W₀)‖ up to the frame, without needing an eigensolver.
-        let gram = |w: &[f32]| -> Vec<f64> {
+        // Spectrum drift = relative L2 between the SORTED eigenvalues of w1ᵀw1
+        // (= σ(W)² multiset). Paper ISO rotates the frames freely, so the Gram
+        // MATRIX moves; only its eigenvalue multiset is fixed — compare that.
+        let spectrum = |w: &[f32]| -> Vec<f64> {
             let mut g = vec![0.0f64; RANK * RANK];
             for row in w.chunks_exact(RANK) {
                 for (i, &a) in row.iter().enumerate() {
@@ -324,9 +325,11 @@ fn iso_fixed_spectrum_pins_the_spectrum_without_freezing_the_head() {
                     }
                 }
             }
-            g
+            let mut eig = jacobi_eigvals(&g, RANK);
+            eig.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            eig
         };
-        let (g0, g1) = (gram(&seed_w1), gram(&w1));
+        let (g0, g1) = (spectrum(&seed_w1), spectrum(&w1));
         let num: f64 = g0.iter().zip(&g1).map(|(a, b)| (a - b).powi(2)).sum();
         let den: f64 = g0.iter().map(|a| a * a).sum();
         (w1, (num / den).sqrt() as f32)
@@ -336,7 +339,7 @@ fn iso_fixed_spectrum_pins_the_spectrum_without_freezing_the_head() {
     let (_, drift_free) = run(false);
     assert!(
         drift_iso < 1e-3,
-        "ISO must hold the base spectrum: relative Gram drift {drift_iso}"
+        "ISO must hold the base singular values: relative spectrum drift {drift_iso}"
     );
     assert!(
         drift_free > drift_iso * 10.0,
@@ -352,4 +355,116 @@ fn iso_fixed_spectrum_pins_the_spectrum_without_freezing_the_head() {
         moved > 1e-5,
         "ISO must still rotate the frames, not freeze the head: max |Δw1| = {moved}"
     );
+}
+
+/// Exit/resume must preserve the original Σ₀. ISO retracts before every publish,
+/// so a saved head is on ℱ(W₀) and its singular values ARE Σ₀ — a resumed trainer
+/// re-captures the same spectrum from the reloaded weight, no separate Σ₀ file.
+#[test]
+fn iso_resume_recovers_the_same_spectrum() {
+    let seed_w1: Vec<f32> = (0..VOCAB * RANK)
+        .map(|i| ((i * 29 % 83) as f32 / 83.0 - 0.5) * (1.0 + (i % RANK) as f32 / 3.0))
+        .collect();
+    let seed_w2: Vec<f32> = (0..VOCAB * RANK)
+        .map(|i| (i * 19 % 71) as f32 / 71.0 - 0.5)
+        .collect();
+    let cfg = || DsparkTrainConfig {
+        markov_rank: RANK,
+        learning_rate: 1e-2,
+        iso_fixed_spectrum: true,
+        // Retract every step so both the saved and resumed heads are read
+        // on-manifold — the invariant under test is capture↔materialize, not the
+        // between-cadence drift the other ISO test already covers.
+        swap_every: 1,
+        ..Default::default()
+    };
+    let flag = || std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    // Train, then save a retracted head.
+    let mut a = DsparkTrainer::new(
+        cfg(),
+        Some((seed_w1.clone(), seed_w2.clone(), RANK)),
+        flag(),
+    )
+    .unwrap();
+    let batch = vec![make_experience(BLOCK); 4];
+    for _ in 0..4 {
+        a.train_step(&batch).unwrap();
+    }
+    let (saved_w1, _) = a.get_weights().unwrap(); // materialized (retract-then-read)
+
+    // Resume: a fresh trainer seeded from the saved head re-captures Σ₀.
+    let mut b = DsparkTrainer::new(
+        cfg(),
+        Some((saved_w1.clone(), seed_w2.clone(), RANK)),
+        flag(),
+    )
+    .unwrap();
+    b.train_step(&batch).unwrap();
+    let (resumed_w1, _) = b.get_weights().unwrap();
+
+    let sv = |w: &[f32]| {
+        let mut g = vec![0.0f64; RANK * RANK];
+        for row in w.chunks_exact(RANK) {
+            for (i, &x) in row.iter().enumerate() {
+                for (j, &y) in row.iter().enumerate() {
+                    g[i * RANK + j] += f64::from(x) * f64::from(y);
+                }
+            }
+        }
+        let mut e = jacobi_eigvals(&g, RANK);
+        e.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        e
+    };
+    let (s_saved, s_resumed) = (sv(&saved_w1), sv(&resumed_w1));
+    let num: f64 = s_saved
+        .iter()
+        .zip(&s_resumed)
+        .map(|(x, y)| (x - y).powi(2))
+        .sum();
+    let den: f64 = s_saved.iter().map(|x| x * x).sum();
+    assert!(
+        (num / den).sqrt() < 1e-3,
+        "resumed spectrum must equal the saved Σ₀: {s_resumed:?} vs {s_saved:?}"
+    );
+}
+
+/// Sorted-agnostic symmetric eigenvalues of an SPD `[k,k]` by cyclic Jacobi —
+/// the σ² multiset, for the spectrum-drift check above.
+fn jacobi_eigvals(s: &[f64], k: usize) -> Vec<f64> {
+    let mut a = s.to_vec();
+    for _ in 0..30 {
+        let mut off = 0.0;
+        for p in 0..k {
+            for q in (p + 1)..k {
+                off += a[p * k + q] * a[p * k + q];
+            }
+        }
+        if off.sqrt() <= 1e-15 {
+            break;
+        }
+        for p in 0..k {
+            for q in (p + 1)..k {
+                let apq = a[p * k + q];
+                if apq.abs() < 1e-300 {
+                    continue;
+                }
+                let theta = (a[q * k + q] - a[p * k + p]) / (2.0 * apq);
+                let t = theta.signum() / (theta.abs() + (theta * theta + 1.0).sqrt());
+                let c = 1.0 / (t * t + 1.0).sqrt();
+                let sn = t * c;
+                for i in 0..k {
+                    let (aip, aiq) = (a[i * k + p], a[i * k + q]);
+                    a[i * k + p] = c * aip - sn * aiq;
+                    a[i * k + q] = sn * aip + c * aiq;
+                }
+                for i in 0..k {
+                    let (api, aqi) = (a[p * k + i], a[q * k + i]);
+                    a[p * k + i] = c * api - sn * aqi;
+                    a[q * k + i] = sn * api + c * aqi;
+                }
+            }
+        }
+    }
+    (0..k).map(|r| a[r * k + r]).collect()
 }
