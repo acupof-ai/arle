@@ -1,0 +1,27 @@
+crates/cli/src/args.rs
+  s_0687ad858d0f07::t_f966c92ba7fd23 765-772
+crates/cli/src/serve.rs
+  s_0687ad858d0f07::t_8825187b0e7b70 209,230-231,432
+crates/infer-api/src/serve.rs
+  s_0687ad858d0f07::t_b4d97489587be4 200-201
+docs/experience/wins/2026-07-27-dspark-prob-match-alpha-flag.md
+  s_0687ad858d0f07::t_a47cb70519ad94 1-64
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "327d172e4ad0cb07ca2b89bc17c7585157973c92",
+  "prompts": {},
+  "sessions": {
+    "s_0687ad858d0f07": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6cab79ae-2d5c-4239-81e7-196afb71725e",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
