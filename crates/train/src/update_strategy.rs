@@ -86,20 +86,23 @@ pub enum RatioGrain {
     PerSequence,
 }
 
-/// Clip applied to the (detached) ratio before it weights the loss.
+/// Ratio objective applied to a detached advantage.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ClipForm {
     /// Binary keep/drop gate: `1` iff `(1−lo) < r < (1+hi)` (SAO DIS).
     HardGate { lo: f32, hi: f32 },
-    /// `clamp(r, 1−lo, 1+hi)` as the weight factor (CISPO family).
-    SoftClamp { lo: f32, hi: f32 },
+    /// Detached `clamp(r, 1−lo, 1+hi)` coefficient (CISPO only).
+    DetachedSoftClamp { lo: f32, hi: f32 },
+    /// Sign-aware PPO clipped surrogate (GRPO/DAPO/Dr.GRPO/GSPO).
+    PpoClip { lo: f32, hi: f32 },
 }
 
 impl ClipForm {
     fn weight_form(self) -> WeightForm {
         match self {
             Self::HardGate { lo, hi } => WeightForm::HardGate { lo, hi },
-            Self::SoftClamp { lo, hi } => WeightForm::SoftClamp { lo, hi },
+            Self::DetachedSoftClamp { lo, hi } => WeightForm::DetachedSoftClamp { lo, hi },
+            Self::PpoClip { lo, hi } => WeightForm::PpoClip { lo, hi },
         }
     }
 }
@@ -175,7 +178,8 @@ impl UpdatePreset {
         }
     }
 
-    /// GRPO (Shao et al. 2024): group-normalized advantage, clamped token ratio.
+    /// GRPO (Shao et al. 2024): group-normalized advantage, token-level
+    /// sign-aware PPO clipped surrogate.
     pub fn grpo() -> Self {
         Self {
             filter: SampleFilter::KeepAll,
@@ -184,7 +188,7 @@ impl UpdatePreset {
                 std_norm: true,
             },
             ratio: RatioGrain::PerToken,
-            clip: ClipForm::SoftClamp { lo: 0.2, hi: 0.2 },
+            clip: ClipForm::PpoClip { lo: 0.2, hi: 0.2 },
             agg: Aggregation::PerSeqTokenMean,
         }
     }
@@ -198,7 +202,7 @@ impl UpdatePreset {
                 scope: Scope::Group,
                 std_norm: false,
             },
-            clip: ClipForm::SoftClamp { lo: 0.2, hi: 0.28 },
+            clip: ClipForm::PpoClip { lo: 0.2, hi: 0.28 },
             agg: Aggregation::GlobalTokenMean { norm_const: None },
             ..Self::grpo()
         }
@@ -223,7 +227,7 @@ impl UpdatePreset {
     pub fn gspo() -> Self {
         Self {
             ratio: RatioGrain::PerSequence,
-            clip: ClipForm::SoftClamp { lo: 3e-4, hi: 4e-4 },
+            clip: ClipForm::PpoClip { lo: 3e-4, hi: 4e-4 },
             ..Self::grpo()
         }
     }
@@ -233,7 +237,7 @@ impl UpdatePreset {
     /// bound (the paper leaves ε_high^IS workload-tuned). Batch token-mean.
     pub fn cispo() -> Self {
         Self {
-            clip: ClipForm::SoftClamp { lo: 1.0, hi: 3.0 },
+            clip: ClipForm::DetachedSoftClamp { lo: 1.0, hi: 3.0 },
             agg: Aggregation::GlobalTokenMean { norm_const: None },
             ..Self::grpo()
         }
@@ -338,9 +342,9 @@ impl UpdatePreset {
         )
     }
 
-    /// Weighted policy-gradient path: per-trajectory detached weights =
-    /// advantage × aggregation norm × (seq-ratio factor for GSPO), the token
-    /// ratio gate applied inside the fused op per `clip`.
+    /// Weighted policy-gradient path: advantage × aggregation norm is passed to
+    /// the fused PG ABI; token PPO/CISPO/SAO semantics are selected by `clip`,
+    /// while GSPO precomputes the sequence-level sign-aware coefficient.
     #[allow(clippy::too_many_arguments)]
     fn update_pg<O: Optimizer>(
         &self,
@@ -451,11 +455,15 @@ impl UpdatePreset {
                         &traj.response_mask,
                         store,
                     )?;
-                    let s = seq_ratio_weight(&current_lp, behavior_logprobs, self.clip)?;
+                    let s = sequence_ratio(&current_lp, behavior_logprobs)?;
+                    let mut clipped = false;
                     for w in &mut weights {
-                        *w *= s;
+                        let (effective, token_clipped) =
+                            pg_token_weight(self.clip.weight_form(), *w, s, 0.0);
+                        *w = effective;
+                        clipped |= token_clipped;
                     }
-                    WeightForm::Precomputed
+                    WeightForm::Precomputed { ratio: s, clipped }
                 }
                 RatioGrain::None => unreachable!("CE path handled in update()"),
             };
@@ -674,9 +682,8 @@ fn centered_advantages(survivors: &[&ScoredTrajectory], scope: Scope, std_norm: 
         .collect()
 }
 
-/// GSPO sequence weight: `s = exp(mean_t(logπθ − logπ_b))` gated/clamped at the
-/// sequence level via the same [`pg_token_weight`] the op uses per token.
-fn seq_ratio_weight(current_lp: &[f32], behavior_lp: &[f32], clip: ClipForm) -> Result<f32> {
+/// GSPO length-normalized sequence ratio `exp(mean_t(logπθ − logπ_b))`.
+fn sequence_ratio(current_lp: &[f32], behavior_lp: &[f32]) -> Result<f32> {
     if current_lp.len() != behavior_lp.len() {
         return Err(OpdError::InvalidInput(format!(
             "seq-ratio capture len {} != behavior logprobs len {}",
@@ -684,15 +691,24 @@ fn seq_ratio_weight(current_lp: &[f32], behavior_lp: &[f32], clip: ClipForm) -> 
             behavior_lp.len()
         )));
     }
-    let n = current_lp.len().max(1) as f32;
-    let s = (current_lp
+    if current_lp.is_empty() {
+        return Err(OpdError::InvalidInput(
+            "seq-ratio capture must be non-empty".to_owned(),
+        ));
+    }
+    let mean_delta = current_lp
         .iter()
         .zip(behavior_lp)
-        .map(|(c, b)| c - b)
-        .sum::<f32>()
-        / n)
-        .exp();
-    Ok(pg_token_weight(clip.weight_form(), 1.0, s, 0.0).0)
+        .map(|(&current, &behavior)| f64::from(current) - f64::from(behavior))
+        .sum::<f64>()
+        / current_lp.len() as f64;
+    let ratio = mean_delta.exp();
+    if !ratio.is_finite() || ratio <= 0.0 || ratio > f64::from(f32::MAX) {
+        return Err(OpdError::InvalidInput(
+            "sequence importance ratio must be finite, positive, and fit f32".to_owned(),
+        ));
+    }
+    Ok(ratio as f32)
 }
 
 /// The VRAM-wall gate as a pure predicate (no warn), so the update loop and the
@@ -813,26 +829,64 @@ mod tests {
     }
 
     #[test]
-    fn weight_builder_hard_soft_precomputed() {
+    fn weight_builder_distinguishes_hard_cispo_and_ppo() {
         let hard = WeightForm::HardGate { lo: 0.2, hi: 0.5 };
-        let soft = WeightForm::SoftClamp { lo: 0.2, hi: 0.5 };
-        // HardGate: base passes untouched inside (1−lo, 1+hi), else 0.
+        let cispo = WeightForm::DetachedSoftClamp { lo: 0.2, hi: 0.5 };
+        let ppo = WeightForm::PpoClip { lo: 0.2, hi: 0.5 };
         assert_eq!(pg_token_weight(hard, 2.0, 1.0, 0.0), (2.0, false));
         assert_eq!(pg_token_weight(hard, 2.0, 1.6, 0.0), (0.0, true));
-        // SoftClamp: w = base · clamp(r, 1−lo, 1+hi), detached.
-        assert_eq!(pg_token_weight(soft, 2.0, 1.2, 0.0), (2.4, false));
-        assert_eq!(pg_token_weight(soft, 2.0, 3.0, 0.0), (3.0, true));
-        assert_eq!(pg_token_weight(soft, 2.0, 0.5, 0.0), (1.6, true));
-        // KL folds into the weight: w −= coef·(r−1).
-        let (w, clipped) = pg_token_weight(WeightForm::Precomputed, 1.0, 2.0, 0.1);
+
+        // CISPO remains a detached clamped coefficient on both signs.
+        assert_eq!(pg_token_weight(cispo, 2.0, 1.2, 0.0), (2.4, false));
+        assert_eq!(pg_token_weight(cispo, 2.0, 3.0, 0.0), (3.0, true));
+        assert_eq!(pg_token_weight(cispo, -2.0, 0.5, 0.0), (-1.6, true));
+
+        // PPO's clipped branch depends on the advantage sign.
+        let cases = [
+            (2.0, 0.5, 1.0, false),
+            (2.0, 1.0, 2.0, false),
+            (2.0, 1.6, 0.0, true),
+            (-2.0, 0.5, 0.0, true),
+            (-2.0, 1.0, -2.0, false),
+            (-2.0, 1.6, -3.2, false),
+        ];
+        for (base, ratio, expected, clipped) in cases {
+            assert_eq!(
+                pg_token_weight(ppo, base, ratio, 0.0),
+                (expected, clipped),
+                "base={base} ratio={ratio}"
+            );
+        }
+
+        let (w, clipped) = pg_token_weight(
+            WeightForm::Precomputed {
+                ratio: 2.0,
+                clipped: false,
+            },
+            1.0,
+            2.0,
+            0.1,
+        );
         assert!((w - 0.9).abs() < 1e-6);
         assert!(!clipped);
-        // Precomputed-seq (GSPO): s = exp(mean Δlogp), clamped at seq level.
-        let clip = ClipForm::SoftClamp { lo: 3e-4, hi: 4e-4 };
-        let s = seq_ratio_weight(&[0.0, 0.0], &[-0.2, 0.2], clip).unwrap();
+
+        let s = sequence_ratio(&[0.0, 0.0], &[-0.2, 0.2]).unwrap();
         assert!((s - 1.0).abs() < 1e-6, "mean Δ=0 → s=1, got {s}");
-        let s = seq_ratio_weight(&[0.5, 0.5], &[0.0, 0.0], clip).unwrap();
-        assert!((s - 1.0004).abs() < 1e-6, "clamped to 1+hi, got {s}");
+        let s = sequence_ratio(&[0.5, 0.5], &[0.0, 0.0]).unwrap();
+        assert!((s - 0.5f32.exp()).abs() < 1e-6, "got {s}");
+        assert_eq!(pg_token_weight(ppo, 1.0, 1.6, 0.0), (0.0, true));
+        assert_eq!(pg_token_weight(ppo, -1.0, 1.6, 0.0), (-1.6, false));
+    }
+
+    #[test]
+    fn sequence_ratio_uses_f64_and_fails_closed() {
+        let ratio = sequence_ratio(&[1.0e20, -1.0e20], &[0.0, 0.0]).unwrap();
+        assert_eq!(ratio, 1.0);
+
+        let overflow = sequence_ratio(&[1000.0], &[0.0]).unwrap_err();
+        assert!(overflow.to_string().contains("sequence importance ratio"));
+        let empty = sequence_ratio(&[], &[]).unwrap_err();
+        assert!(empty.to_string().contains("must be non-empty"));
     }
 
     #[test]
