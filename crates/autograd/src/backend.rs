@@ -1240,21 +1240,26 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         self.upload(&out, a_shape)
     }
 
-    /// Broadcast-copy `src` up to `target_shape` (host). = add-broadcast onto a
-    /// zero carrier, minus the carrier — a pure right-aligned expand.
+    /// Broadcast-copy `src` up to `target_shape` (host): a pure right-aligned
+    /// expand, `out[i] = src[broadcast_offset(i)]` — no zero carrier.
     fn broadcast_expand_forward(
         &self,
         src: &[f32],
         src_shape: &[usize],
         target_shape: &[usize],
     ) -> Result<Vec<f32>> {
-        let zeros = vec![0.0_f32; shape_size(target_shape)];
-        cpu_add_broadcast_forward(&zeros, target_shape, src, src_shape)
+        validate_broadcast(target_shape, src_shape)?;
+        let total = shape_size(target_shape);
+        let mut out = vec![0.0_f32; total];
+        for (i, slot) in out.iter_mut().enumerate() {
+            *slot = src[broadcast_offset(i, target_shape, src_shape)];
+        }
+        Ok(out)
     }
 
     /// Device-handle variant of `broadcast_expand_forward`. Default falls back
-    /// to `readback → host → upload`; CUDA overrides to reuse `add_broadcast_f32`
-    /// against an internally-zeroed output (no separate zeros tape tensor).
+    /// to `readback → host → upload`; CUDA/Metal override with an in-place
+    /// device expand (no zero carrier, no round-trip).
     fn broadcast_expand(
         &self,
         src: &DeviceHandle,

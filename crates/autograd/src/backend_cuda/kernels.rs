@@ -92,6 +92,7 @@ const FUNCTION_NAMES: &[&str] = &[
     "gather_last_dim_f32",
     "scatter_add_rows_f32",
     "add_broadcast_f32",
+    "broadcast_copy_f32",
     "transpose_axes_swap_f32",
     "slice_f32",
     "concat_axis2_f32",
