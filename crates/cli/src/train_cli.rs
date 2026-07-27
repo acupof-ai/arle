@@ -658,6 +658,11 @@ impl TaskSelection {
         s.retired = s.retired || s.hot_rounds >= 3;
     }
 
+    /// A mastered task (EMA pass ≥ 0.9 for 3 rounds) — never a DAPO refill target.
+    fn is_retired(&self, task: usize) -> bool {
+        self.stats[task].retired
+    }
+
     /// Task indices to run this round + (skipped, retired) counts.
     /// Round 0 runs ALL tasks: no history yet, and the baseline needs it.
     fn select(&mut self, round: usize) -> (Vec<usize>, usize, usize) {
@@ -3472,7 +3477,14 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
             args.dynamic_sampling_token_budget,
         );
         let scheduled: std::collections::HashSet<usize> = round_tasks.iter().copied().collect();
-        let mut reserve = (0..tasks.len()).filter(|i| !scheduled.contains(i));
+        // Refill reserve: this round's unscheduled tasks, MINUS retired ones — a
+        // mastered task must not be resurrected by a dead group's replacement.
+        let mut reserve = (0..tasks.len())
+            .filter(|i| {
+                !scheduled.contains(i) && selection.as_ref().is_none_or(|sel| !sel.is_retired(*i))
+            })
+            .collect::<Vec<_>>()
+            .into_iter();
         let mut work = round_tasks;
         let mut next = work.first().map(|i| launch(i, policy_version));
         let mut pos = 0;
@@ -3650,6 +3662,12 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
                     keep
                 });
             }
+            // Deadness for DAPO refill = "no learning signal", judged on the
+            // batch BEFORE the writeback-cap truncation — an exhausted cap is a
+            // budget artifact, not a zero-variance group, and must not classify a
+            // live group as dead (which would refill forever once cap_left == 0).
+            // Matches update's own filter, so no double forward.
+            let group_trained = update_preset.planned_training_count(&batch) > 0;
             if args.writeback_cap.is_some() {
                 if !needs.keep_failing {
                     // Don't let failures (rejected inside `update`) burn budget.
@@ -3658,13 +3676,15 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
                 batch.truncate(cap_left);
                 cap_left -= batch.len();
             }
-            // Exact "does this group train?" signal (matches update's own filter)
-            // — drives DAPO refill without running the update twice. On a dead
-            // group, append a replacement task (grow `work` now so the
-            // last-group sync check stays correct); the launch is deferred to
-            // end-of-body so a refill thread never races the VRAM release.
-            let group_trained = update_preset.planned_training_count(&batch) > 0;
-            if refill.complete(work.len(), group_trained, g_completion)
+            // Append a replacement for a dead group (grow `work` now so the
+            // last-group sync check stays correct; launch is deferred to
+            // end-of-body so a refill thread never races the VRAM release). Always
+            // count the group in `refill`; only skip the append once the writeback
+            // cap is spent — a replacement could not train anyway.
+            let cap_open = args.writeback_cap.is_none() || cap_left > 0;
+            let want_refill = refill.complete(work.len(), group_trained, g_completion);
+            if cap_open
+                && want_refill
                 && let Some(idx) = reserve.next()
             {
                 work.push(idx);
