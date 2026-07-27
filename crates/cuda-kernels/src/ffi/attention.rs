@@ -102,6 +102,7 @@ unsafe extern "C" {
         rotary_dim: i32,
         max_seq_len: i32,
         batch_size: i32,
+        num_kv_splits: i32,
         rms_eps: f32,
         stream: CUstream,
     ) -> CUresult;
@@ -114,6 +115,7 @@ unsafe extern "C" {
         num_qheads: i32,
         head_dim: i32,
         batch_size: i32,
+        num_kv_splits: i32,
         stream: CUstream,
     ) -> CUresult;
 
