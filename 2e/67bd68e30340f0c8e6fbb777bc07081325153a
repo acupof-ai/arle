@@ -1,0 +1,23 @@
+crates/train/src/iso_spectrum.rs
+  s_0687ad858d0f07::t_14825239fa7f05 1,7-11,13-14,17-18,20,22-30,32-33,36,39-40,42-44,46-60,64-67,69,79-80,82-130,132-134,137-149,151-154,160-184,195-246,252,295-297,334-340,342-424,426,429-432,434-435,439-444,446-447,452-502
+crates/train/tests/test_dspark_train.rs
+  s_0687ad858d0f07::t_fb2be6ab7bdaec 316-319,328-330,332,342,359-470
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "2e67bd68e30340f0c8e6fbb777bc07081325153a",
+  "prompts": {},
+  "sessions": {
+    "s_0687ad858d0f07": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6cab79ae-2d5c-4239-81e7-196afb71725e",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
