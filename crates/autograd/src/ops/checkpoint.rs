@@ -113,6 +113,7 @@ where
         + 'static,
     PF: Fn(usize) -> Vec<TensorId>,
 {
+    let trace_vram = trace_checkpoint_group_vram();
     let mut hidden = input;
     let mut li = 0;
     while li < num_layers {
@@ -144,6 +145,7 @@ where
         if tape.offload_checkpoints && end == num_layers {
             tape.set_skip_next_checkpoint_input_offload(true);
         }
+        let checkpoint_fn = trace_vram.then(|| tape.checkpoint_fn_count());
         hidden = checkpoint(input_ids, store, tape, move |s, t, inp| {
             let mut h = *inp.first().ok_or(AutogradError::TapeInvariant(
                 "checkpoint_sequential missing hidden input",
@@ -153,23 +155,25 @@ where
             }
             Ok(h)
         })?;
-        li = end;
-        if trace_checkpoint_group_vram()
-            && let Some((free, total)) = store.backend().device_mem_info()
+        if let Some(checkpoint_fn) = checkpoint_fn
+            && tape.checkpoint_fn_count() == checkpoint_fn + 1
         {
-            // pool_used = bytes actually backing live tensors; pool_reserved =
-            // what the mempool holds (used + free-but-cached). driver `used`
-            // (total-free) ≥ pool_reserved: the gap between driver-used and
-            // pool_used is high-water the allocator caches, NOT live activation.
-            let (pr, pu) = store.backend().mem_pool_stats().unwrap_or((0, 0));
+            eprintln!("[checkpoint-map] checkpoint_fn={checkpoint_fn} layers={start}..{stop}");
+        }
+        li = end;
+        if trace_vram && let Some((free, total)) = store.backend().device_mem_info() {
+            let pool = store.backend().mem_pool_stats();
+            let fmt_pool = |value: Option<u64>| {
+                value.map_or_else(|| "n/a".to_string(), |bytes| format!("{}MiB", bytes >> 20))
+            };
             eprintln!(
                 "[ckpt-group-vram] after_group end={end}/{num_layers} used={}MiB free={}MiB \
-                 pool_reserved={}MiB pool_used={}MiB live_tensors={}",
+                 pool_reserved={} pool_used_current={} live_tensors={}",
                 (total - free) >> 20,
                 free >> 20,
-                pr >> 20,
-                pu >> 20,
-                store.live_ids().len(),
+                fmt_pool(pool.map(|(reserved, _)| reserved)),
+                fmt_pool(pool.map(|(_, used)| used)),
+                store.live_tensor_count(),
             );
         }
     }

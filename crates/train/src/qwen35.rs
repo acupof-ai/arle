@@ -19,6 +19,7 @@ use autograd::{
         moe_grouped_weighted_scatter, moe_topk_softmax, moe_topk_softmax_with_indices, mul,
         repeat_kv, reshape, rmsnorm, rope, sigmoid, silu, slice, transpose,
     },
+    tape::checkpoint_replay_mem_stage,
 };
 pub use qwen35_spec::{LayerType, Qwen35Config, Qwen35ConfigError};
 use qwen35_spec::{Qwen35AttentionTensorNames, Qwen35MoeTensorNames};
@@ -621,8 +622,10 @@ impl Qwen35Layer {
         }
         let batch = x_shape[0];
         let seq_len = x_shape[1];
+        checkpoint_replay_mem_stage(tape, store, "layer_enter");
 
         let h = qwen35_rmsnorm(x, self.input_layernorm, cfg.rms_norm_eps, store, tape)?;
+        checkpoint_replay_mem_stage(tape, store, "post_input_norm");
         let attn_out = match &self.self_attn {
             Qwen35Attention::Full(attn) => self
                 .forward_full_attention(h, attn, cfg, tp, cos, sin, batch, seq_len, store, tape)?,
@@ -630,7 +633,9 @@ impl Qwen35Layer {
                 self.forward_linear_attention(h, attn, cfg, batch, seq_len, store, tape)?
             }
         };
+        checkpoint_replay_mem_stage(tape, store, "post_attention");
         let x = add(x, attn_out, store, tape)?;
+        checkpoint_replay_mem_stage(tape, store, "post_attention_residual");
 
         let h = qwen35_rmsnorm(
             x,
@@ -639,8 +644,12 @@ impl Qwen35Layer {
             store,
             tape,
         )?;
+        checkpoint_replay_mem_stage(tape, store, "post_mlp_norm");
         let mlp_out = self.forward_mlp(h, cfg, tp, batch, seq_len, store, tape)?;
-        Ok(add(x, mlp_out, store, tape)?)
+        checkpoint_replay_mem_stage(tape, store, "post_mlp");
+        let out = add(x, mlp_out, store, tape)?;
+        checkpoint_replay_mem_stage(tape, store, "layer_exit");
+        Ok(out)
     }
 
     /// OPD frozen-prompt-KV phase 1 (per layer, OFF-TAPE): capture this layer's

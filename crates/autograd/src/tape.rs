@@ -1,7 +1,8 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fmt,
-    sync::Arc,
+    io::{BufWriter, Write},
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -324,6 +325,39 @@ pub(crate) type GradPairs = SmallVec<[(TensorId, TensorId); 2]>;
 pub(crate) type CheckpointFn =
     Arc<dyn Fn(&mut TensorStore, &mut Tape, &[TensorId]) -> Result<TensorId> + Send + Sync>;
 
+#[derive(Debug, Clone)]
+struct CheckpointOpMemRecord {
+    stage: &'static str,
+    op_seq: Option<usize>,
+    op: Option<BackwardOp>,
+    site: Option<&'static str>,
+    pool: Option<(u64, u64)>,
+    live_tensors: usize,
+}
+
+#[derive(Debug)]
+struct CheckpointOpMemScope {
+    checkpoint_fn: usize,
+    next_op_seq: usize,
+    records: Vec<CheckpointOpMemRecord>,
+}
+
+impl CheckpointOpMemScope {
+    fn new(checkpoint_fn: usize) -> Self {
+        Self {
+            checkpoint_fn,
+            next_op_seq: 0,
+            records: Vec::with_capacity(512),
+        }
+    }
+
+    fn next_op_seq(&mut self) -> usize {
+        let op_seq = self.next_op_seq;
+        self.next_op_seq += 1;
+        op_seq
+    }
+}
+
 #[derive(Default)]
 pub struct Tape {
     pub entries: Vec<TapeEntry>,
@@ -331,6 +365,8 @@ pub struct Tape {
     checkpoint_fns: Vec<CheckpointFn>,
     pub(crate) offload_checkpoints: bool,
     skip_next_checkpoint_input_offload: bool,
+    checkpoint_op_mem_scope: Option<Arc<Mutex<CheckpointOpMemScope>>>,
+    checkpoint_op_mem_disarmed: bool,
 }
 
 impl fmt::Debug for Tape {
@@ -351,6 +387,8 @@ impl Tape {
             checkpoint_fns: Vec::new(),
             offload_checkpoints: false,
             skip_next_checkpoint_input_offload: false,
+            checkpoint_op_mem_scope: None,
+            checkpoint_op_mem_disarmed: false,
         }
     }
 
@@ -388,8 +426,44 @@ impl Tape {
     /// Number of registered checkpoint replay closures (one per checkpoint
     /// group). OPD VRAM attribution only — each closure captures host-side
     /// `Arc`s (the layer stack), not per-group device tensors.
-    pub fn checkpoint_fn_count(&self) -> usize {
+    pub(crate) fn checkpoint_fn_count(&self) -> usize {
         self.checkpoint_fns.len()
+    }
+
+    fn checkpoint_op_mem_record(
+        &self,
+        stage: &'static str,
+        op_seq: Option<usize>,
+        entry: Option<&TapeEntry>,
+        store: &TensorStore,
+    ) {
+        let Some(scope) = &self.checkpoint_op_mem_scope else {
+            return;
+        };
+        let mut scope = scope.lock().expect("checkpoint op memory scope poisoned");
+        scope.records.push(CheckpointOpMemRecord {
+            stage,
+            op_seq,
+            op: entry.map(|entry| entry.op),
+            site: entry.and_then(TapeEntry::profile_site),
+            pool: store.backend().mem_pool_stats(),
+            live_tensors: store.live_tensor_count(),
+        });
+    }
+
+    fn checkpoint_op_mem_begin(&self, entry: &TapeEntry, store: &TensorStore) -> Option<usize> {
+        let scope = self.checkpoint_op_mem_scope.as_ref()?;
+        let mut scope = scope.lock().expect("checkpoint op memory scope poisoned");
+        let op_seq = scope.next_op_seq();
+        scope.records.push(CheckpointOpMemRecord {
+            stage: "pre_op",
+            op_seq: Some(op_seq),
+            op: Some(entry.op),
+            site: entry.profile_site(),
+            pool: store.backend().mem_pool_stats(),
+            live_tensors: store.live_tensor_count(),
+        });
+        Some(op_seq)
     }
 
     pub fn backward(
@@ -632,6 +706,9 @@ impl Tape {
                     None => continue,
                 };
 
+                let inner_op_seq = (entry.op != BackwardOp::Checkpoint)
+                    .then(|| self.checkpoint_op_mem_begin(&entry, store))
+                    .flatten();
                 if profile.is_some() {
                     sync_profile_boundary(store)?;
                 }
@@ -709,6 +786,9 @@ impl Tape {
                         profile.as_deref_mut(),
                     )?,
                 };
+                if let Some(op_seq) = inner_op_seq {
+                    self.checkpoint_op_mem_record("post_op", Some(op_seq), Some(&entry), store);
+                }
                 if vram_profile {
                     log_backward_vram_profile("after_op", entry_index, &entry, store)?;
                 }
@@ -750,6 +830,9 @@ impl Tape {
                         store.free(output_grad_id)?;
                     }
                 }
+                if let Some(op_seq) = inner_op_seq {
+                    self.checkpoint_op_mem_record("post_merge", Some(op_seq), Some(&entry), store);
+                }
                 if vram_profile {
                     log_backward_vram_profile("after_merge", entry_index, &entry, store)?;
                 }
@@ -788,6 +871,14 @@ impl Tape {
                 "checkpoint backward missing replay function",
             ))?
             .clone();
+        let selected = !self.checkpoint_op_mem_disarmed
+            && selected_checkpoint_fn().is_some_and(|selected| selected == function_id);
+        if selected {
+            self.checkpoint_op_mem_disarmed = true;
+            self.checkpoint_op_mem_scope =
+                Some(Arc::new(Mutex::new(CheckpointOpMemScope::new(function_id))));
+            self.checkpoint_op_mem_record("scope_enter", None, None, store);
+        }
 
         let live_before = store.live_ids().into_iter().collect::<HashSet<_>>();
         let mut inner_profile = profile.as_ref().map(|_| BackwardProfile::default());
@@ -796,16 +887,20 @@ impl Tape {
                 store.ensure_checkpoint_device(input_id)?;
             }
             let mut inner_tape = Tape::new();
+            inner_tape.checkpoint_op_mem_scope = self.checkpoint_op_mem_scope.clone();
             let replay_output = checkpoint_fn(store, &mut inner_tape, &entry.input_ids)?;
             self.trim_after_checkpoint_replay(store)?;
+            self.checkpoint_op_mem_record("post_replay", None, None, store);
             let weighted = ops::mul(replay_output, output_grad_id, store, &mut inner_tape)?;
             let loss = ops::sum(weighted, store, &mut inner_tape)?;
-            let inner_grads = inner_tape.backward_collect_targets_only(
+            let inner_result = inner_tape.backward_collect_targets_only(
                 loss,
                 store,
                 &entry.input_ids,
                 inner_profile.as_mut(),
-            )?;
+            );
+            self.checkpoint_op_mem_record("post_inner", None, None, store);
+            let inner_grads = inner_result?;
 
             let mut grads = GradPairs::new();
             let mut keep = HashSet::new();
@@ -818,12 +913,10 @@ impl Tape {
             Ok((grads, keep))
         })();
 
-        match result {
-            Ok((grads, keep)) => {
+        let result = match result {
+            Ok((grads, keep)) => (|| {
                 store.free_new_except(&live_before, &keep)?;
-                // Re-offload the replayed hidden (mirror of forward) so only one
-                // checkpoint is device-resident, not all N. Readback keeps a host
-                // copy → safe for any reuse. Hidden only, not shared params.
+                // Mirror forward offload so only one replay hidden stays resident.
                 if self.offload_checkpoints
                     && let Some(&hidden_id) = entry.input_ids.first()
                     && hidden_id != entry.output_id
@@ -831,20 +924,26 @@ impl Tape {
                     store.offload_checkpoint_to_host(hidden_id)?;
                 }
                 self.trim_after_checkpoint_replay(store)?;
+                self.checkpoint_op_mem_record("scope_exit", None, None, store);
                 if let (Some(outer), Some(mut inner)) = (profile, inner_profile) {
-                    // The inner wall already sits inside this entry's own
-                    // Checkpoint envelope — merge the attribution rows only.
+                    // The inner wall already sits inside the Checkpoint envelope.
                     inner.total_duration = Duration::ZERO;
                     outer.merge(&inner);
                 }
                 Ok(grads)
-            }
+            })(),
             Err(err) => {
                 let _ = store.free_new_except(&live_before, &HashSet::new());
                 let _ = self.trim_after_checkpoint_replay(store);
                 Err(err)
             }
+        };
+        if selected {
+            if let Some(scope) = self.checkpoint_op_mem_scope.take() {
+                flush_checkpoint_op_mem(&scope);
+            }
         }
+        result
     }
 
     /// Trim the pool after a checkpoint replay's backward, under offload only:
@@ -857,6 +956,46 @@ impl Tape {
             store.backend().trim_memory_pool()?;
         }
         Ok(())
+    }
+}
+
+fn selected_checkpoint_fn() -> Option<usize> {
+    std::env::var("ARLE_OPD_OP_MEM_CHECKPOINT_FN")
+        .ok()?
+        .parse()
+        .ok()
+}
+
+pub fn checkpoint_replay_mem_stage(tape: &Tape, store: &TensorStore, stage: &'static str) {
+    tape.checkpoint_op_mem_record(stage, None, None, store);
+}
+
+fn flush_checkpoint_op_mem(scope: &Arc<Mutex<CheckpointOpMemScope>>) {
+    let scope = scope.lock().expect("checkpoint op memory scope poisoned");
+    let stderr = std::io::stderr();
+    let mut out = BufWriter::new(stderr.lock());
+    for record in &scope.records {
+        let op_seq = record
+            .op_seq
+            .map_or_else(|| "-1".to_owned(), |seq| seq.to_string());
+        let reserved = record
+            .pool
+            .map_or_else(|| "n/a".to_owned(), |(bytes, _)| (bytes >> 20).to_string());
+        let used = record
+            .pool
+            .map_or_else(|| "n/a".to_owned(), |(_, bytes)| (bytes >> 20).to_string());
+        let _ = writeln!(
+            out,
+            "[autograd-op-mem] checkpoint_fn={} stage={} op_seq={} op={} site={} pool_reserved_mib={} pool_used_current_mib={} live_tensors={}",
+            scope.checkpoint_fn,
+            record.stage,
+            op_seq,
+            record.op.map_or("-", BackwardOp::name),
+            record.site.unwrap_or("-"),
+            reserved,
+            used,
+            record.live_tensors,
+        );
     }
 }
 
