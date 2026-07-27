@@ -732,7 +732,7 @@ impl CudaBackend {
             let c_bf16 = self
                 .stream
                 .alloc_zeros::<u16>(m * n)
-                .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
+                .map_err(|_| cuda_alloc_failed("matmul_bt_bf16_empty", vec![m, n]))?;
             let c = self.import_local_bf16_as_f32(&c_bf16, m * n)?;
             return Ok((c, out_shape));
         }
@@ -759,7 +759,7 @@ impl CudaBackend {
         let mut c_bf16 = self
             .stream
             .alloc_zeros::<u16>(c_len)
-            .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
+            .map_err(|_| cuda_alloc_failed("matmul_bt_bf16", vec![padded_m, n]))?;
         {
             let (b_ptr, _b_guard) = b.device_ptr(&self.stream);
             let (a_ptr, _a_guard) = a_for_gemm.device_ptr(&self.stream);
@@ -838,7 +838,7 @@ impl CudaBackend {
             let c_bf16 = self
                 .stream
                 .alloc_zeros::<u16>(m * k)
-                .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
+                .map_err(|_| cuda_alloc_failed("matmul_bf16_empty", vec![m, k]))?;
             let c = self.import_local_bf16_as_f32(&c_bf16, m * k)?;
             return Ok((c, out_shape));
         }
@@ -865,7 +865,7 @@ impl CudaBackend {
         let mut c_bf16 = self
             .stream
             .alloc_zeros::<u16>(c_len)
-            .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
+            .map_err(|_| cuda_alloc_failed("matmul_bf16", vec![padded_m, k]))?;
         {
             let (b_ptr, _b_guard) = b.device_ptr(&self.stream);
             let (a_ptr, _a_guard) = a_for_gemm.device_ptr(&self.stream);
@@ -1251,7 +1251,7 @@ impl Backend for CudaBackend {
             let slice = self
                 .stream
                 .alloc_zeros::<f32>(size)
-                .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
+                .map_err(|_| cuda_alloc_failed("zeros", shape.to_vec()))?;
             Ok(DeviceHandle::Cuda(CudaStorage::new(slice)))
         }
     }
@@ -1596,7 +1596,7 @@ impl Backend for CudaBackend {
             let mut c = self
                 .stream
                 .alloc_zeros::<f32>(m * n)
-                .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
+                .map_err(|_| cuda_alloc_failed("matmul_bt", vec![m, n]))?;
 
             let cfg = GemmConfig::<f32> {
                 transa: cublasOperation_t::CUBLAS_OP_T,
@@ -1643,7 +1643,7 @@ impl Backend for CudaBackend {
             let mut out = self
                 .stream
                 .alloc_zeros::<f32>(size)
-                .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
+                .map_err(|_| cuda_alloc_failed("add", shape.to_vec()))?;
             let n = i32::try_from(size)
                 .map_err(|_| AutogradError::TapeInvariant("cuda add length exceeds i32"))?;
             launch_1d(
