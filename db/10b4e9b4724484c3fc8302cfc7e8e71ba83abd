@@ -1,0 +1,21 @@
+docs/research/2026-07-27-opd-writeback-wall-decomposition.md
+  s_cd9a6a56daabe3::t_e30359fce1904b 1,5,7-38,50,52,54,56,58-60,62,110,112,114,117,120,122,124,126,128-130,132,136-140
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "db10b4e9b4724484c3fc8302cfc7e8e71ba83abd",
+  "prompts": {},
+  "sessions": {
+    "s_cd9a6a56daabe3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "bf8ec25a-c05e-46a4-b093-1e67694ece0c",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
