@@ -1,0 +1,23 @@
+crates/autograd/src/ops/fused_linear_distill.rs
+  s_0687ad858d0f07::t_b0254ef9f3c36e 689-690,693,695-702,734-741,743-745,748-749,753-771,773,776,781,783-787,789,843-846,850,852,856,915-930,1061-1076,1702-1733,1740,1748,1757,1768-1973,2005
+crates/train/src/update_strategy.rs
+  s_0687ad858d0f07::t_097c4835061cf4 89,94-97,104-105,181-182,191,205,230,240,345-347,458-459,461-464,466,685-686,694-699,702-711,832,834-835,838-869,872-873,875-889
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "7bf66b90d807458facd1008b5609aae429b76777",
+  "prompts": {},
+  "sessions": {
+    "s_0687ad858d0f07": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6cab79ae-2d5c-4239-81e7-196afb71725e",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
