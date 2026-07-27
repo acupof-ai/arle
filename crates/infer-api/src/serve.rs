@@ -197,6 +197,8 @@ pub struct ServeSpecOptions {
     pub dspark_train_lr: Option<f32>,
     /// Override the train sidecar batch size (experiences per optimizer step).
     pub dspark_train_batch: Option<usize>,
+    /// Override the DSpark objective mix (PG = 1−α, probability-matching = α).
+    pub dspark_prob_match_alpha: Option<f32>,
     /// Rank of the trainable Markov head to materialize when the draft ships
     /// without one. Set by the CLI from `--dspark-train`.
     pub dspark_train_head_rank: Option<usize>,

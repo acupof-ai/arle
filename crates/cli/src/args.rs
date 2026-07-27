@@ -762,6 +762,14 @@ pub(crate) struct ServeArgs {
     #[arg(long, value_name = "N")]
     pub(crate) dspark_train_batch: Option<usize>,
 
+    /// DSpark objective mix: PG weight is `1 − α`, probability-matching weight is
+    /// `α` (default 0.5). α=0 is pure acceptance policy-gradient (the RLVR regime
+    /// ISO's fixed-spectrum premise was observed in); α=1 is pure dense
+    /// self-distillation. The step logs `iso_drift` next to `pm_alpha`, so an
+    /// α-sweep measures whether drift scales with the dense fraction.
+    #[arg(long, value_name = "ALPHA")]
+    pub(crate) dspark_prob_match_alpha: Option<f32>,
+
     /// Constrain DSpark training to the base checkpoint's singular spectrum,
     /// optimizing only the singular frames (ISO, arXiv:2607.19331). The step
     /// logs `iso_drift` either way, so a run without this flag measures whether
