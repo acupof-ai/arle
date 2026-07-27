@@ -1,0 +1,21 @@
+docs/research/2026-07-27-longctx-decode-attention-plan.md
+  s_9c91b86ec3fb55::t_86e424014430f9 28-32,34-36,49,51,53-108,163-164,166,168-194,198-220,224-230,233-239
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "bd2aefeb85915286286ff5161a9fe8139aae0ff5",
+  "prompts": {},
+  "sessions": {
+    "s_9c91b86ec3fb55": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4779911a-69b7-49db-bc83-daf5a48d6ca3",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
