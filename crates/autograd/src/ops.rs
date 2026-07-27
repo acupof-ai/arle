@@ -47,7 +47,9 @@ pub(crate) use elementwise::{add_backward, mul_backward, mul_scalar_backward};
 pub(crate) use embed::embedding_backward;
 pub(crate) use fused_linear_distill::{fused_linear_distill_backward, generalized_jsd_backward};
 pub(crate) use gather::gather_last_dim_backward;
-pub(crate) use layout::{reshape_backward, slice_backward, transpose_backward};
+pub(crate) use layout::{
+    broadcast_expand_backward, reshape_backward, slice_backward, transpose_backward,
+};
 pub(crate) use linear_attention::linear_attention_backward;
 pub(crate) use matmul::{matmul_backward, matmul_bt_backward};
 pub(crate) use moe::{
@@ -319,6 +321,15 @@ pub fn reshape(
     // host-eager path. No `ensure_host` here — it would flush the q/k/v
     // projection matmul's output to host before every attention-layer reshape.
     layout::reshape(x, shape, store, tape)
+}
+
+pub fn broadcast_expand(
+    src: TensorId,
+    target_shape: &[usize],
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<TensorId> {
+    layout::broadcast_expand(src, target_shape, store, tape)
 }
 
 pub fn transpose(
