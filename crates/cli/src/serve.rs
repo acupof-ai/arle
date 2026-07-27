@@ -125,6 +125,24 @@ fn apply_probe_env(serve_args: &ServeArgs) {
 }
 
 fn run_config(config: ServeConfig) -> ExitCode {
+    // The DSpark train sidecar + `--dspark-markov-init` are wired only on the
+    // single-process serve path (`on_engine_loaded` below); the multiproc
+    // coordinator returns before that hook exists. Fail fast rather than serve
+    // with the sidecar silently inert — a no-op flag must reject, not no-op.
+    #[cfg(all(unix, feature = "cuda"))]
+    if config.backend == ServeBackend::Cuda
+        && (config.options.spec.dspark_train || config.options.spec.dspark_markov_init.is_some())
+        && infer_api::cuda_model_takes_multiproc_serve(&config.options.model_path)
+    {
+        eprintln!(
+            "[ARLE serve] --dspark-train / --dspark-markov-init require a single-process \
+             serve, but this model runs multiproc TP; the train sidecar is not wired into \
+             the coordinator. Serve a single-GPU model (e.g. Qwen3.6-27B-FP8 TP=1) for \
+             DSpark test-time training."
+        );
+        return ExitCode::FAILURE;
+    }
+
     // Multi-rank TP CUDA models (DSv4, Qwen3.5/3.6 MoE): SPMD (B) split. The parent
     // becomes the engine-less coordinator — binds the relay, spawns all N workers,
     // and runs the thin coordinator HTTP loop. Single GPU returns `None` and falls
