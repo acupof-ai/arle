@@ -800,17 +800,14 @@ pub struct ArleFa3FwdHd256Args {
     pub is_causal: i32,
     /// 1 = direct fwd; >1 = split-KV decode fwd + combine (max 256).
     pub num_splits: i32,
-    /// Paged KV: i32 page indices for THIS request, or null for a contiguous
-    /// KV view. When set, `k`/`v` are the pool base and the strides describe
-    /// one page (`k_row_stride` between tokens inside a page, `k_head_stride`
-    /// between KV heads, `k_batch_stride` between pages), which expresses the
-    /// qwen35 HND pool `[page, h_k, page_size, d]` without a relayout.
+    /// Page indices for THIS request; null = contiguous KV. When set, `k`/`v`
+    /// are the pool base and the strides describe one page, which expresses the
+    /// HND pool `[page, h_k, page_size, d]` without a relayout.
     pub page_table: *const i32,
     pub page_size: i32,
     /// Pages in the POOL — the extent of the page dimension.
     pub num_pages: i32,
-    /// Elements between consecutive pages in the pool. FA3's 4th K/V dim IS
-    /// the page dim when a page table is set, so this is its stride.
+    /// FA3's 4th K/V dim is the page dim when paged, so this is its stride.
     pub k_page_stride: i64,
     pub v_page_stride: i64,
 }
