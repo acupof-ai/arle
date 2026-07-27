@@ -1130,6 +1130,10 @@ pub(crate) struct OpdRuntimeArgs {
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set, value_name = "BOOL")]
     pub(crate) autograd_decode_attn_legacy: bool,
 
+    /// Retain the cuMemAllocAsync pool across syncs (caching allocator).
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set, value_name = "BOOL")]
+    pub(crate) cuda_mempool_retain: bool,
+
     /// Autograd tape storage precision. bf16 halves retained-activation + emitted-grad
     /// VRAM (compute + accumulators + fp32 islands unchanged). CUDA-only; no-op on Metal.
     #[arg(long, value_enum, default_value_t = TapePrecisionArg::Fp32)]
@@ -1202,6 +1206,7 @@ impl OpdRuntimeArgs {
                 gdr_chunkwise_prefill: self.gdr_chunkwise_prefill,
                 la_backward_mono: self.la_backward_mono,
                 decode_attn_legacy: self.autograd_decode_attn_legacy,
+                cuda_mempool_retain: self.cuda_mempool_retain,
                 tape_precision: match self.tape_precision {
                     TapePrecisionArg::Fp32 => autograd::TapePrecision::Fp32,
                     TapePrecisionArg::Bf16 => autograd::TapePrecision::Bf16,
