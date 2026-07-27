@@ -1,0 +1,31 @@
+crates/autograd/src/ops/checkpoint.rs
+  s_089e26e9e41120::t_c53c333459cefd 147,157-162,167-171,173-174,177-179
+crates/autograd/src/runtime_flags.rs
+  s_089e26e9e41120::t_2a1c22a2afbf8a 41-42,58,83-84
+crates/cli/src/args.rs
+  s_089e26e9e41120::t_fcaba05890d55a 1133-1136,1209
+crates/cuda-kernels/src/tensor.rs
+  s_089e26e9e41120::t_e5cd06a8762728 372-374,376-389,392,394-400
+docs/experience/wins/2026-07-27-agent-opd-mempool-retain-ab.md
+  s_089e26e9e41120::t_cc20cb30092241 1-62
+docs/research/2026-07-27-opd-writeback-wall-decomposition.md
+  s_089e26e9e41120::t_14840ce7a95e7a 1,3,5,7,9,11,13-18,20,22,24-27,29,31-35,37,39,41-45,47,49,51-166
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "647185a0e85b1f17ddecd2fa364429ab170b1f53",
+  "prompts": {},
+  "sessions": {
+    "s_089e26e9e41120": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "93e66a8f-c20a-4ba9-96f2-283f6d98cbb1",
+        "model": "unknown"
+      },
+      "human_author": "cklxx <q1293822641@gmail.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
