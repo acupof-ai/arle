@@ -105,14 +105,34 @@ model out of HBM. Summed from `model.safetensors.index.json`, FP8:
 
 Floor at 4.0 TB/s: **7.3 ms**. Real stacks land at 35–65% of peak → 11–21 ms →
 48–91 tok/s, which brackets the Qwen3-32B FP8 reference on this same H20
-(46.2 tok/s, Qwen's own speed benchmark). Split against the measured 77 ms:
+(46.2 tok/s, Qwen's own speed benchmark).
+
+The constant term is measured, not extrapolated: a 66-token prompt, no spec,
+c=1, on today's binary gives **37.60 tok/s = 26.6 ms/token** (6 trials, spread
+0.6%) — against `baselines.md`'s `6aa4ca6d1` row of 38.62 tok/s at 128 tokens,
+i.e. inside the ±3% drift band. **Short-context decode has not regressed.**
+Splitting the 32k measurement against that anchor:
 
 | | bytes | time | effective | % peak |
 |---|---:|---:|---:|---:|
-| weights (the constant term) | 26.9 GB | ~10 ms | 2.7 TB/s | **67%** |
-| KV (the context term) | 2.10 GB | ~67 ms | 31 GB/s | **0.8%** |
+| weights (constant term) | 26.9 GB | 26.6 ms | 1.01 TB/s | **25%** |
+| KV (context term) | 2.10 GB | 51.4 ms | 41 GB/s | **1.0%** |
 
-**The weight path is healthy.** KV is 7.2% of the bytes and 87% of the time.
+KV is 7.2% of the bytes and 66% of the time, at 1% of peak bandwidth. The weight
+path is not catastrophic but it is not healthy either — 25% against a 35–65%
+band leaves 1.4–2.6× on the table there too.
+
+Context slope from this anchor: **1.57 ms per 1k context tokens** (51.4 ms /
+32.6k). An earlier estimate of 2.09 ms/1k came from extrapolating two
+cold/warm points 2.5k apart back to zero; that extrapolation also put the
+constant term at 5 ms, below the 7.3 ms physical weight floor, which is how it
+was caught. Use the short-prompt anchor, not the extrapolation.
+
+**Nothing here is a regression — it is an exposure.** Every 27B row before
+2026-07-26 used 128-token prompts (`RETIRED short-prompt fingerprint` in
+`baselines.md`); the multi-turn 32k workload became mandatory one day earlier
+under bench spec rule 5. The context term was always there and was never
+measured at the target length.
 
 This also explains why concurrency buys nothing here: weight traffic amortizes
 across a batch, KV traffic does not. A KV-bound engine cannot batch its way out
