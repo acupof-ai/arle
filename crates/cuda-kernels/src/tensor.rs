@@ -369,23 +369,35 @@ impl DeviceContext {
         // #29 only fixed for the MoE scratch. PyTorch's caching allocator + SGLang do
         // exactly this. `trim_memory_pool()` still reclaims VRAM explicitly when needed
         // (e.g. weight offload). Best-effort: a failure here is not fatal.
-        // Default on; opt out with `--cuda-mempool-retain false` to restore the
-        // old release-at-sync behavior (for an A/B of the decode-alloc win, or
-        // if a memory-tight shape needs aggressive release).
+        // Default on; `--cuda-mempool-retain false` restores release-at-sync.
+        // Configure the device's default pool on every context creation. `false`
+        // must reset a threshold a prior context may have raised on the same device.
         let retain_pool = MEMPOOL_RETAIN.load(std::sync::atomic::Ordering::Relaxed);
-        if retain_pool {
-            // SAFETY: `cu_device()` is the live device of the context created
-            // above; the attribute write passes a valid pointer to a local u64
-            // that outlives the call. Failure is tolerated (logged, non-fatal).
-            unsafe {
-                if let Ok(pool) = cudarc::driver::result::device::get_mem_pool(ctx.cu_device()) {
-                    let mut threshold: u64 = u64::MAX;
-                    if let Err(e) = cudarc::driver::result::mem_pool::set_attribute(
+        let mut threshold = if retain_pool { u64::MAX } else { 0 };
+        // SAFETY: `cu_device()` is the live device of the context created above;
+        // attribute calls use pointers to local u64 values that outlive each call.
+        unsafe {
+            if let Ok(pool) = cudarc::driver::result::device::get_mem_pool(ctx.cu_device()) {
+                if let Err(e) = cudarc::driver::result::mem_pool::set_attribute(
+                    pool,
+                    cudarc::driver::sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_RELEASE_THRESHOLD,
+                    (&mut threshold as *mut u64).cast::<core::ffi::c_void>(),
+                ) {
+                    log::warn!("set cuMemAllocAsync release threshold failed (non-fatal): {e}");
+                } else {
+                    let mut effective = 0u64;
+                    match cudarc::driver::result::mem_pool::get_attribute(
                         pool,
                         cudarc::driver::sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_RELEASE_THRESHOLD,
-                        (&mut threshold as *mut u64).cast::<core::ffi::c_void>(),
+                        (&mut effective as *mut u64).cast::<core::ffi::c_void>(),
                     ) {
-                        log::warn!("set cuMemAllocAsync release threshold failed (non-fatal): {e}");
+                        Ok(()) => log::info!(
+                            "cuMemAllocAsync pool: requested_retain={retain_pool} \
+                             effective_release_threshold={effective} bytes"
+                        ),
+                        Err(e) => log::warn!(
+                            "read cuMemAllocAsync release threshold failed (non-fatal): {e}"
+                        ),
                     }
                 }
             }
