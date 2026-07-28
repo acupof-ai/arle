@@ -1630,6 +1630,12 @@ pub(crate) fn dsv4_flashmla_prefill_enabled() -> Result<bool> {
     Ok(cuda_kernels::HAS_FLASHMLA)
 }
 
+fn dsv4_q8kv8_prefill_enabled() -> Result<bool> {
+    // Experimental: fp8 q8kv8 sparse prefill. Default OFF; A/B only.
+    // tp>1 not supported (h_q must be multiple of 64).
+    Ok(std::env::var("ARLE_DSV4_Q8KV8_PREFILL").as_deref() == Ok("1"))
+}
+
 fn dsv4_fp8_linear_deepgemm_enabled() -> Result<bool> {
     // Default ON: prefill wq_a|wkv projection fusion routes the shared hidden
     // activation through FP8 DeepGEMM instead of the scalar FP8 GEMV path. Licensed
@@ -2612,6 +2618,72 @@ fn try_flashmla_prefill_attention(
         // SAFETY: ensure! above bounds tp_rank*local_heads + local_heads <= sink len.
         unsafe { (sink_base as *const f32).add(tp_rank * local_heads) }
     };
+
+    // q8kv8 fp8 sparse prefill (experimental, tp=1, h_q%64==0)
+    if dsv4_q8kv8_prefill_enabled()? && tp_world == 1 && local_heads % 64 == 0 {
+        let _nvtx = crate::nvtx::range("dsv4/q8kv8_prefill");
+        let head_dim = config.head_dim;
+        let q_elems = token_count * local_heads * head_dim;
+        let kv_elems = kv_rows * head_dim;
+
+        let mut q_fp8 = ctx.stream.alloc_zeros::<u8>(q_elems)?;
+        let mut kv_fp8 = ctx.stream.alloc_zeros::<u8>(kv_elems)?;
+        let mut scale = ctx.stream.alloc_zeros::<f32>(2)?;
+        scale.copy_region_from_host(ctx, 0, &[1.0f32, 1.0f32])?;
+
+        let (q_src, _qg) = q_prepared.data.device_ptr(&ctx.stream);
+        let (q_dst, _dg) = q_fp8.device_ptr_mut(&ctx.stream);
+        unsafe {
+            ffi::arle_bf16_to_fp8_e4m3_cuda(
+                q_src as *const ffi::Half,
+                q_dst as *mut u8,
+                q_elems as i64,
+                ctx.stream.cu_stream(),
+            )
+            .result()?;
+        }
+
+        let (kv_src, _kg) = kv_unified.data.device_ptr(&ctx.stream);
+        let (kv_dst, _dg) = kv_fp8.device_ptr_mut(&ctx.stream);
+        unsafe {
+            ffi::arle_bf16_to_fp8_e4m3_cuda(
+                kv_src as *const ffi::Half,
+                kv_dst as *mut u8,
+                kv_elems as i64,
+                ctx.stream.cu_stream(),
+            )
+            .result()?;
+        }
+
+        let (q_fp8_ptr, _qfg) = q_fp8.device_ptr(&ctx.stream);
+        let (kv_fp8_ptr, _kfg) = kv_fp8.device_ptr(&ctx.stream);
+        let (scale_ptr, _sg) = scale.device_ptr(&ctx.stream);
+        // indices reuse FlashMLA prefill indices; topk_length=null → fixed topk
+        unsafe {
+            ffi::arle_q8kv8_sparse_prefill_fwd(
+                q_fp8_ptr as *const u8,
+                kv_fp8_ptr as *const u8,
+                indices_ptr as *const i32,
+                scale_ptr as *const f32,
+                scale_ptr as *const f32,
+                sink_ptr,
+                std::ptr::null(),
+                flash_out_ptr as *mut ffi::Half,
+                max_ptr as *mut f32,
+                lse_ptr as *mut f32,
+                token_count as i32,
+                kv_rows as i32,
+                local_heads as i32,
+                head_dim as i32,
+                topk_unified as i32,
+                sm_scale,
+                ctx.stream.cu_stream(),
+            )
+            .result()
+            .map_err(|e| anyhow!("DSv4 q8kv8 prefill failed: {e}"))?;
+        }
+        return Ok(true);
+    }
 
     {
         let _nvtx = crate::nvtx::range("dsv4/flashmla_prefill_fwd");

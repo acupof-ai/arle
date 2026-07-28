@@ -74,4 +74,14 @@ unsafe extern "C" {
         inter_dim: i32,
         stream: CUstream,
     ) -> CUresult;
+
+    // bf16 -> fp8 (e4m3) per-tensor cast with identity scale. Feeds the q8kv8
+    // sparse prefill kernel, which expects fp8 Q/KV. See
+    // csrc/elementwise/bf16_to_fp8.cu.
+    pub fn arle_bf16_to_fp8_e4m3_cuda(
+        input: *const Half,
+        output: *mut u8,
+        n: i64,
+        stream: CUstream,
+    ) -> i32;
 }
