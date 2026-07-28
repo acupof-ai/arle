@@ -129,9 +129,14 @@ fn run_config(config: ServeConfig) -> ExitCode {
     // single-process serve path (`on_engine_loaded` below); the multiproc
     // coordinator returns before that hook exists. Fail fast rather than serve
     // with the sidecar silently inert — a no-op flag must reject, not no-op.
+    // Gate on the RESOLVED world size, not just model kind: a multiproc-capable
+    // model (Qwen3.5/3.6, DSv4) at INFER_TP_SIZE=1 serves single-process, where
+    // the sidecar DOES run — rejecting that would block DSpark test-time training
+    // on the one config that supports it.
     #[cfg(all(unix, feature = "cuda"))]
     if config.backend == ServeBackend::Cuda
         && (config.options.spec.dspark_train || config.options.spec.dspark_markov_init.is_some())
+        && crate::serve_multiproc::world_size_from_env() > 1
         && infer_api::cuda_model_takes_multiproc_serve(&config.options.model_path)
     {
         eprintln!(
