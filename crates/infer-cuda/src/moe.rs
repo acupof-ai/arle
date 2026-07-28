@@ -540,8 +540,18 @@ mod gpu {
         // its winning side and only remainder chunks land in between.
         let has_deepgemm_grouped = weights.gate_grouped.is_some()
             || (weights.w13_fp8_grouped.is_some() && weights.down_fp8_grouped.is_some());
+        // FP8 experts only have the CONTIGUOUS DeepGEMM layout; the masked band
+        // (`R <= DEEPGEMM_MASKED_BAND`) is BF16-only and errors out mid-step. The
+        // routed-row floor is a tunable, so this must gate rather than assert —
+        // a lowered floor falls back to the hand kernels instead of killing the
+        // engine (measured 2026-07-28: `--qwen35-deepgemm-min-routes 64` at c=16
+        // is R=128, exactly the masked band).
+        let fp8_masked_unsupported = weights.expert_weight_format
+            == WeightFormat::Fp8BlockScaled
+            && num_tokens * topk <= DEEPGEMM_MASKED_BAND;
         let use_deepgemm = qwen35_deepgemm_enabled()
             && has_deepgemm_grouped
+            && !fp8_masked_unsupported
             && num_tokens * topk >= crate::runtime_flags::qwen35_deepgemm_min_routes();
         if !use_deepgemm {
             // Grouped-mode loads cleared the per-expert Vecs (the hand
