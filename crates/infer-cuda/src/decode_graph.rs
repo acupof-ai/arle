@@ -90,6 +90,9 @@ impl DecodeGraphContext {
                 q_indptr: alloc_i32(ctx, 2)?,
                 kv_indptr: alloc_i32(ctx, 2)?,
                 kv_indices: alloc_i32(ctx, max_pages)?,
+                kv_lens_dev: alloc_i32(ctx, 1)?,
+                page_table_rect: alloc_i32(ctx, max_pages)?,
+                page_table_stride: 0,
                 kv_last_page_len: alloc_i32(ctx, 1)?,
                 page_table_offsets: alloc_i32(ctx, 1)?,
                 start_positions: alloc_i32(ctx, 1)?,
@@ -167,6 +170,11 @@ impl DecodeGraphContext {
         let page_ids: Vec<i32> = pages[..num_pages].iter().map(|&p| p as i32).collect();
         // Only the valid prefix is written; the kernel walks just num_pages.
         write_i32_prefix(ctx, &mut self.meta.kv_indices, &page_ids)?;
+        // B=1, so the rectangular table is the same page list at stride
+        // num_pages; the buffer addresses are baked into the capture.
+        write_i32_prefix(ctx, &mut self.meta.page_table_rect, &page_ids)?;
+        write_i32(ctx, &mut self.meta.kv_lens_dev, &[total_len as i32])?;
+        self.meta.page_table_stride = num_pages;
         write_i32(
             ctx,
             &mut self.meta.kv_last_page_len,

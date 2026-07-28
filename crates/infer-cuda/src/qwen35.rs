@@ -5939,6 +5939,10 @@ impl Qwen35Model {
                                 out_accum: std::ptr::null_mut(),
                                 softmax_lse_accum: std::ptr::null_mut(),
                                 tile_count_semaphore: sem_ptr as *mut i32,
+                                cu_seqlens_q: std::ptr::null(),
+                                seqused_k: std::ptr::null(),
+                                batch: 1,
+                                total_q: seq_len as i32,
                                 seqlen_q: seq_len as i32,
                                 seqlen_k: kv_len as i32,
                                 num_heads: self.local_q_heads as i32,
@@ -5956,6 +5960,7 @@ impl Qwen35Model {
                                 is_causal: 1,
                                 num_splits: 1,
                                 page_table: std::ptr::null(),
+                                page_table_batch_stride: 0,
                                 page_size: 0,
                                 num_pages: 0,
                                 k_page_stride: 0,
@@ -6329,76 +6334,78 @@ impl Qwen35Model {
                             && c.head_dim == 256
                             && qwen35_fa3_enabled(&self.ctx)
                         {
-                            let max_q = meta.seq_len;
+                            // ONE launch for the whole batch: q/o are packed
+                            // [total_q, h, d] behind `q_indptr`, and each row's KV
+                            // extent comes from `kv_lens_dev` against the
+                            // rectangular page table. `seqused_k` does not drop the
+                            // K/V batch strides (only `cu_seqlens_k` does,
+                            // flash_api.cpp:105-108), which is what lets a paged
+                            // batch share a launch — per row it was 16 CTAs on 78
+                            // SMs, serialized.
                             let splits = qwen35_fa3_decode_splits();
-                            let lse = fa3_lse.get(&self.ctx, self.local_q_heads * max_q)?;
-                            let oaccum = fa3_oaccum
-                                .get(&self.ctx, splits * self.local_q_heads * max_q * c.head_dim)?;
-                            let lseaccum =
-                                fa3_lseaccum.get(&self.ctx, splits * self.local_q_heads * max_q)?;
+                            let accum_rows = self.local_q_heads * meta.total_q;
+                            let lse = fa3_lse.get(&self.ctx, accum_rows)?;
+                            let oaccum =
+                                fa3_oaccum.get(&self.ctx, splits * accum_rows * c.head_dim)?;
+                            let lseaccum = fa3_lseaccum.get(&self.ctx, splits * accum_rows)?;
                             let sem = fa3_semaphore.get(&self.ctx, 1)?;
                             let (lse_ptr, _f0) = lse.device_ptr_mut(&self.ctx.stream);
                             let (oaccum_ptr, _f1) = oaccum.device_ptr_mut(&self.ctx.stream);
                             let (lseaccum_ptr, _f2) = lseaccum.device_ptr_mut(&self.ctx.stream);
                             let (sem_ptr, _f3) = sem.device_ptr_mut(&self.ctx.stream);
+                            let (kv_lens_ptr, _f4) = meta.kv_lens_dev.device_ptr(&self.ctx.stream);
+                            let (rect_ptr, _f5) = meta.page_table_rect.device_ptr(&self.ctx.stream);
                             let head_dim = c.head_dim as i64;
-                            let q_dim_l = (self.local_q_heads * c.head_dim) as u64;
-                            let elem = std::mem::size_of::<bf16>() as u64;
-                            // One call per request: FA3 zeroes the page stride
-                            // when seqused_k is set, so a ragged batch cannot
-                            // share one launch. Split-KV keeps each one busy.
-                            for row in 0..meta.batch {
-                                let kv_len = meta.kv_lens[row];
-                                let q0 = meta.q_offsets[row] as u64 * q_dim_l * elem;
-                                let qlen = meta.q_offsets[row + 1] - meta.q_offsets[row];
-                                let args = ffi::ArleFa3FwdHd256Args {
-                                    q: (qp_ptr + q0) as *const ffi::Half,
-                                    k: k_pool_ptr as *const ffi::Half,
-                                    v: v_pool_ptr as *const ffi::Half,
-                                    o: (ao_ptr + q0) as *mut ffi::Half,
-                                    softmax_lse: lse_ptr as *mut f32,
-                                    out_accum: oaccum_ptr as *mut f32,
-                                    softmax_lse_accum: lseaccum_ptr as *mut f32,
-                                    tile_count_semaphore: sem_ptr as *mut i32,
-                                    seqlen_q: qlen as i32,
-                                    seqlen_k: kv_len as i32,
-                                    num_heads: self.local_q_heads as i32,
-                                    num_heads_k: self.local_kv_heads as i32,
-                                    head_dim: c.head_dim as i32,
-                                    q_row_stride: (self.local_q_heads * c.head_dim) as i64,
-                                    // HND pool [page, h_k, page_size, d]: tokens are
-                                    // contiguous inside a (page, head), heads stride
-                                    // by a page's worth, pages by the whole page.
-                                    k_row_stride: head_dim,
-                                    v_row_stride: head_dim,
-                                    o_row_stride: (self.local_q_heads * c.head_dim) as i64,
-                                    q_head_stride: head_dim,
-                                    k_head_stride: pool.page_size as i64 * head_dim,
-                                    v_head_stride: pool.page_size as i64 * head_dim,
-                                    o_head_stride: head_dim,
-                                    softmax_scale: sm_scale,
-                                    // Bottom-right aligned; the shim demotes to
-                                    // non-causal at qlen 1.
-                                    is_causal: 1,
-                                    num_splits: splits as i32,
-                                    page_table: (kv_indices_ptr
-                                        + (meta.page_offsets[row] * 4) as u64)
-                                        as *const i32,
-                                    page_size: pool.page_size as i32,
-                                    num_pages: pool.max_total_pages as i32,
-                                    k_page_stride: stride_page as i64,
-                                    v_page_stride: stride_page as i64,
-                                };
-                                // SAFETY: q/o are the live prepped/out buffers; k/v
-                                // are the layer's pool base; the page table is this
-                                // request's slice of `kv_indices`, `pages` long.
-                                unsafe {
-                                    ffi::arle_fa3_fwd_hd256_bf16_cuda(
-                                        &args,
-                                        self.ctx.stream.cu_stream(),
-                                    )
-                                    .result()?;
-                                }
+                            let args = ffi::ArleFa3FwdHd256Args {
+                                q: qp_ptr as *const ffi::Half,
+                                k: k_pool_ptr as *const ffi::Half,
+                                v: v_pool_ptr as *const ffi::Half,
+                                o: ao_ptr as *mut ffi::Half,
+                                softmax_lse: lse_ptr as *mut f32,
+                                out_accum: oaccum_ptr as *mut f32,
+                                softmax_lse_accum: lseaccum_ptr as *mut f32,
+                                tile_count_semaphore: sem_ptr as *mut i32,
+                                cu_seqlens_q: q_indptr_ptr as *const i32,
+                                seqused_k: kv_lens_ptr as *const i32,
+                                batch: meta.batch as i32,
+                                total_q: meta.total_q as i32,
+                                seqlen_q: meta.seq_len as i32,
+                                seqlen_k: meta.kv_lens.iter().copied().max().unwrap_or(0) as i32,
+                                num_heads: self.local_q_heads as i32,
+                                num_heads_k: self.local_kv_heads as i32,
+                                head_dim: c.head_dim as i32,
+                                q_row_stride: (self.local_q_heads * c.head_dim) as i64,
+                                // HND pool [page, h_k, page_size, d]: tokens are
+                                // contiguous inside a (page, head), heads stride
+                                // by a page's worth, pages by the whole page.
+                                k_row_stride: head_dim,
+                                v_row_stride: head_dim,
+                                o_row_stride: (self.local_q_heads * c.head_dim) as i64,
+                                q_head_stride: head_dim,
+                                k_head_stride: pool.page_size as i64 * head_dim,
+                                v_head_stride: pool.page_size as i64 * head_dim,
+                                o_head_stride: head_dim,
+                                softmax_scale: sm_scale,
+                                // Bottom-right aligned; the shim demotes to
+                                // non-causal at qlen 1.
+                                is_causal: 1,
+                                num_splits: splits as i32,
+                                page_table: rect_ptr as *const i32,
+                                page_table_batch_stride: meta.page_table_stride as i64,
+                                page_size: pool.page_size as i32,
+                                num_pages: pool.max_total_pages as i32,
+                                k_page_stride: stride_page as i64,
+                                v_page_stride: stride_page as i64,
+                            };
+                            // SAFETY: q/o are the live prepped/out buffers; k/v are
+                            // the layer's pool base; the page table is the meta's
+                            // rectangular mirror, `batch * page_table_stride` long.
+                            unsafe {
+                                ffi::arle_fa3_fwd_hd256_bf16_cuda(
+                                    &args,
+                                    self.ctx.stream.cu_stream(),
+                                )
+                                .result()?;
                             }
                             return Ok(());
                         }
