@@ -69,6 +69,13 @@ pub(crate) mod dspark;
 const DEFAULT_ROPE_CACHE_LEN: usize = 32_768;
 const QWEN35_BATCHED_DECODE_KV_SPLITS: usize = 4;
 
+/// Longest query the FA3 paged path takes. FA3 zeroes the page stride when
+/// `seqused_k` is set, so a ragged batch needs one launch per request; that is
+/// free for decode/verify shapes and ruinous for prefill chunks, where the
+/// TileLang kernel does the whole batch in one launch (measured 2026-07-28:
+/// c=8 TTFT p50 12.07 → 18.23 s with prefill routed here).
+const FA3_MAX_QLEN: usize = 64;
+
 #[cfg(test)]
 pub(crate) mod conv_probe {
     use super::*;
@@ -6342,23 +6349,18 @@ impl Qwen35Model {
                     Some(full_idx),
                     rows,
                     || {
-                        // sm_90: FA3 paged + PackGQA for every query length —
-                        // decode (1 row), spec verify (block+1), prefill chunks.
-                        // The TileLang kernel it replaces pads BLOCK_M=64 around
-                        // the real rows and gives one CTA per query head, 6× the
-                        // KV traffic. Non-Hopper keeps it.
-                        if pool.format == KVFormat::BF16
+                        // sm_90 short queries — decode (1 row) and spec verify
+                        // (block+1): FA3 paged split-KV + PackGQA. The TileLang
+                        // kernel it replaces pads BLOCK_M=64 around the real rows
+                        // and gives one CTA per query head, 6× the KV traffic.
+                        // Prefill chunks and non-Hopper keep it.
+                        if meta.seq_len <= FA3_MAX_QLEN
+                            && pool.format == KVFormat::BF16
                             && c.head_dim == 256
                             && qwen35_fa3_enabled(&self.ctx)
                         {
-                            // Split-KV only pays where the query is too short to
-                            // fill the SMs; a real prefill chunk already does.
                             let max_q = meta.seq_len;
-                            let splits = if max_q <= 64 {
-                                qwen35_fa3_decode_splits()
-                            } else {
-                                1
-                            };
+                            let splits = qwen35_fa3_decode_splits();
                             let lse = fa3_lse.get(&self.ctx, self.local_q_heads * max_q)?;
                             let oaccum = fa3_oaccum
                                 .get(&self.ctx, splits * self.local_q_heads * max_q * c.head_dim)?;
