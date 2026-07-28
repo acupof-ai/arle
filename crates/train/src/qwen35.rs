@@ -645,7 +645,36 @@ impl Qwen35Layer {
             tape,
         )?;
         checkpoint_replay_mem_stage(tape, store, "post_mlp_norm");
-        let mlp_out = self.forward_mlp(h, cfg, tp, batch, seq_len, store, tape)?;
+        // Seq-chunk the MLP recompute when enabled (256K writeback lever): MLP is
+        // position-wise, so chunking is bit-identical up to add-order. Off-tape
+        // forward (checkpoint replay / no grad) keeps the single call.
+        let mlp_chunk = crate::runtime_flags::mlp_seq_chunk();
+        let mlp_out = if mlp_chunk > 0 && tape.enabled {
+            let mut param_ids = Vec::new();
+            collect_mlp_ids(&self.mlp, false, &mut param_ids);
+            param_ids.retain(|&id| store.get(id).is_some_and(|t| t.requires_grad));
+            let layer = self.clone();
+            let cfg = cfg.clone();
+            autograd::ops::checkpoint_seq_chunked(
+                h,
+                param_ids,
+                mlp_chunk,
+                store,
+                tape,
+                move |st, tp_tape, inp| {
+                    let shape = st
+                        .get(inp[0])
+                        .ok_or(AutogradError::InvalidTensorId(inp[0]))?
+                        .shape
+                        .clone();
+                    layer
+                        .forward_mlp(inp[0], &cfg, tp, shape[0], shape[1], st, tp_tape)
+                        .map_err(qwen35_to_autograd)
+                },
+            )?
+        } else {
+            self.forward_mlp(h, cfg, tp, batch, seq_len, store, tape)?
+        };
         checkpoint_replay_mem_stage(tape, store, "post_mlp");
         let out = add(x, mlp_out, store, tape)?;
         checkpoint_replay_mem_stage(tape, store, "layer_exit");

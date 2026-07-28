@@ -174,6 +174,13 @@ pub enum SavedContext {
     CheckpointCtx {
         function_id: usize,
     },
+    SeqChunkedRecomputeCtx {
+        function_id: usize,
+        batch: usize,
+        seq: usize,
+        dim: usize,
+        chunk: usize,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -213,6 +220,7 @@ pub enum BackwardOp {
     CausalSdpaRecompute,
     AllReduceSum,
     Checkpoint,
+    SeqChunkedRecompute,
 }
 
 impl BackwardOp {
@@ -253,6 +261,7 @@ impl BackwardOp {
             BackwardOp::CausalSdpaRecompute => "CausalSdpaRecompute",
             BackwardOp::AllReduceSum => "AllReduceSum",
             BackwardOp::Checkpoint => "Checkpoint",
+            BackwardOp::SeqChunkedRecompute => "SeqChunkedRecompute",
         }
     }
 }
@@ -793,6 +802,12 @@ impl Tape {
                         store,
                         profile.as_deref_mut(),
                     )?,
+                    BackwardOp::SeqChunkedRecompute => self.seq_chunked_recompute_backward(
+                        &entry,
+                        output_grad_id,
+                        store,
+                        profile.as_deref_mut(),
+                    )?,
                 };
                 if let Some(op_seq) = inner_op_seq {
                     self.checkpoint_op_mem_record("post_op", Some(op_seq), Some(&entry), store);
@@ -946,12 +961,135 @@ impl Tape {
                 Err(err)
             }
         };
-        if selected {
-            if let Some(scope) = self.checkpoint_op_mem_scope.take() {
-                flush_checkpoint_op_mem(&scope);
-            }
+        if selected && let Some(scope) = self.checkpoint_op_mem_scope.take() {
+            flush_checkpoint_op_mem(&scope);
         }
         result
+    }
+
+    /// Backward for [`ops::checkpoint_seq_chunked`]. Re-runs the position-wise
+    /// `replay` on `chunk` seq rows at a time so the recompute peak is
+    /// `O(chunk · intermediate)`, not `O(seq · intermediate)`. Per chunk: slice
+    /// the block input rows + the matching upstream-grad rows on a DISABLED
+    /// scratch tape (detached leaves — their grads don't scatter back through a
+    /// recorded slice), replay on an enabled chunk tape, collect `d_x_c` + param
+    /// grads, write `d_x_c` into the full-seq `d_input`'s disjoint rows, add param
+    /// grads, then free the chunk's live set + trim. Host-side scatter/accumulate
+    /// keeps it backend-neutral; the win is the per-chunk free, not device copies.
+    fn seq_chunked_recompute_backward(
+        &mut self,
+        entry: &TapeEntry,
+        output_grad_id: TensorId,
+        store: &mut TensorStore,
+        _profile: Option<&mut BackwardProfile>,
+    ) -> Result<GradPairs> {
+        let SavedContext::SeqChunkedRecomputeCtx {
+            function_id,
+            batch,
+            seq,
+            dim,
+            chunk,
+        } = entry.saved
+        else {
+            return Err(AutogradError::TapeInvariant(
+                "seq_chunked_recompute backward missing saved context",
+            ));
+        };
+        let replay = self
+            .checkpoint_fns
+            .get(function_id)
+            .ok_or(AutogradError::TapeInvariant(
+                "seq_chunked_recompute backward missing replay function",
+            ))?
+            .clone();
+        let input_id = *entry.input_ids.first().ok_or(AutogradError::TapeInvariant(
+            "seq_chunked_recompute backward missing input",
+        ))?;
+        let param_ids = &entry.input_ids[1..];
+
+        let need_input_grad = store.tensor(input_id)?.requires_grad;
+        let row = dim;
+        let mut d_input = need_input_grad.then(|| vec![0.0_f32; batch * seq * dim]);
+        // Param grads accumulate across chunks in host buffers, sized on first hit.
+        let mut d_param: Vec<Option<Vec<f32>>> = vec![None; param_ids.len()];
+
+        let mut start = 0;
+        while start < seq {
+            let end = (start + chunk).min(seq);
+            let live_before = store.live_ids().into_iter().collect::<HashSet<_>>();
+
+            // Detached chunk leaves: slice off a disabled scratch tape so the
+            // sub-backward treats x_c/grad_c as inputs, not slices of the full seq.
+            let mut scratch = Tape::new();
+            scratch.set_enabled(false);
+            store.ensure_checkpoint_device(input_id)?;
+            let x_c = ops::slice(
+                input_id,
+                &[0, start, 0],
+                &[batch, end, dim],
+                store,
+                &mut scratch,
+            )?;
+            store.set_requires_grad(x_c, need_input_grad)?;
+            let grad_c = ops::slice(
+                output_grad_id,
+                &[0, start, 0],
+                &[batch, end, dim],
+                store,
+                &mut scratch,
+            )?;
+
+            let mut chunk_tape = Tape::new();
+            let mut chunk_inputs = vec![x_c];
+            chunk_inputs.extend_from_slice(param_ids);
+            let y_c = replay(store, &mut chunk_tape, &chunk_inputs)?;
+            let weighted = ops::mul(y_c, grad_c, store, &mut chunk_tape)?;
+            let loss = ops::sum(weighted, store, &mut chunk_tape)?;
+            let grads =
+                chunk_tape.backward_collect_targets_only(loss, store, &chunk_inputs, None)?;
+
+            if let (Some(d_input), Some(&g)) = (d_input.as_mut(), grads.get(&x_c)) {
+                let g_host = store.to_host(g)?;
+                let base = start * row;
+                for b in 0..batch {
+                    let src = b * (end - start) * row;
+                    let dst = b * seq * row + base;
+                    d_input[dst..dst + (end - start) * row]
+                        .copy_from_slice(&g_host[src..src + (end - start) * row]);
+                }
+            }
+            for (slot, &pid) in param_ids.iter().enumerate() {
+                if let Some(&g) = grads.get(&pid) {
+                    let g_host = store.to_host(g)?;
+                    match d_param[slot].as_mut() {
+                        None => d_param[slot] = Some(g_host),
+                        Some(acc) => {
+                            for (a, b) in acc.iter_mut().zip(&g_host) {
+                                *a += b;
+                            }
+                        }
+                    }
+                }
+            }
+
+            store.free_new_except(&live_before, &HashSet::new())?;
+            self.trim_after_checkpoint_replay(store)?;
+            start = end;
+        }
+
+        let mut pairs = GradPairs::new();
+        if let Some(d_input) = d_input {
+            let g = store.from_slice(&d_input, &[batch, seq, dim])?;
+            pairs.push((input_id, g));
+        }
+        for (slot, &pid) in param_ids.iter().enumerate() {
+            if let Some(data) = d_param[slot].take() {
+                let shape = store.tensor(pid)?.shape.clone();
+                let g = store.from_slice(&data, &shape)?;
+                pairs.push((pid, g));
+            }
+        }
+        Ok(pairs)
     }
 
     /// Trim the pool after a checkpoint replay's backward, under offload only:
