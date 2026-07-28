@@ -83,5 +83,5 @@ unsafe extern "C" {
         output: *mut u8,
         n: i64,
         stream: CUstream,
-    ) -> i32;
+    ) -> CUresult;
 }
