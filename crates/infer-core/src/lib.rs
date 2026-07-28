@@ -1041,7 +1041,8 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         }
 
         // Decode rows: append token(s) + check stop/length. Speculative backends may return multiple tokens
-        // per row; first was pre-allocated in `allocate_for_plan`, extras get one more logical append.
+        // per row; the first was pre-allocated in `allocate_for_plan`, extras grow the slot to the
+        // committed length (a no-op for a backend that already grew it to draft its chain).
         for row in &plan.decode_rows {
             let Some(mut tokens) = tokens_by_slot.remove(&row.slot) else {
                 continue;
@@ -1052,7 +1053,11 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                 // has no spec-depth to pre-budget, so on true exhaustion
                 // degrade like the repair does — park the request (#162 path)
                 // and drop the unappended tail — instead of a fatal unwind.
-                if token_idx > 0 && self.alloc_with_prefix_reclaim(row.slot, 1).is_err() {
+                if token_idx > 0
+                    && self
+                        .alloc_to_len_with_prefix_reclaim(row.slot, row.kv_seq_len + 1 + token_idx)
+                        .is_err()
+                {
                     self.requeue_preempted_decode(row.slot);
                     break;
                 }
