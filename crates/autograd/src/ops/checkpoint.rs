@@ -209,7 +209,11 @@ where
 {
     let mut input_ids = vec![input];
     input_ids.extend(param_ids);
-    if !tape.enabled {
+    // Off (chunk == 0, below the seq-adaptive threshold) or a disabled tape
+    // (checkpoint replay-forward) → inline on the current tape: normal autograd,
+    // no recompute, byte-identical to a plain block. Zero overhead, so the caller
+    // can invoke unconditionally.
+    if chunk == 0 || !tape.enabled {
         return replay(store, tape, &input_ids);
     }
     let shape = store.tensor(input)?.shape.clone();
@@ -219,13 +223,6 @@ where
             got: shape.len(),
         });
     };
-    // chunk == 0 → off: inline on the live tape (normal autograd, no recompute),
-    // byte-identical to a plain block. The recompute path only earns its keep at
-    // long seq; below the threshold this is a zero-overhead passthrough, so the
-    // caller can invoke unconditionally.
-    if chunk == 0 {
-        return replay(store, tape, &input_ids);
-    }
 
     let live_before = store.live_ids().into_iter().collect::<HashSet<_>>();
     tape.enabled = false;
