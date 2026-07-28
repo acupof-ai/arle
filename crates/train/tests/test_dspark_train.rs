@@ -446,3 +446,70 @@ fn iso_without_seed_is_rejected_at_construction() {
     );
     assert!(r.is_err(), "ISO with no seeded head must fail fast");
 }
+
+/// Pure prob-match (α=1) at a large vocab must produce a live loss and move the
+/// head. Guards the 2026-07-28 fix: the PM term was `Σ(Δsoftmax)²/(wsum·V)`, which
+/// at V≈248k underflowed f32 to 0.0000 — a null objective that trained nothing.
+/// A small-V α=0.5 oracle cannot catch that; this reproduces the regime. Seeds a
+/// nonzero head so w1's gradient isn't gated by cold w2≈0.
+#[test]
+fn prob_match_alpha_one_trains_at_large_vocab() {
+    const V: usize = 8192; // large enough that a /V normalization underflows the term
+    const R: usize = 8;
+    let seed_w1: Vec<f32> = (0..V * R)
+        .map(|i| ((i % 97) as f32 / 97.0 - 0.5) * 0.1)
+        .collect();
+    let seed_w2: Vec<f32> = (0..V * R)
+        .map(|i| ((i % 89) as f32 / 89.0 - 0.5) * 0.1)
+        .collect();
+
+    // Draft and target deliberately diverge, so the prob-match distance is real.
+    let mut draft_logits = vec![0.0f32; BLOCK * V];
+    let mut target_logits = vec![0.0f32; BLOCK * V];
+    let mut tokens = Vec::with_capacity(BLOCK);
+    for b in 0..BLOCK {
+        let d = (b * 7 + 3) % V;
+        let t = (b * 13 + 500) % V;
+        tokens.push(d as u32);
+        draft_logits[b * V + d] = 6.0;
+        target_logits[b * V + t] = 6.0;
+    }
+    let exp = DsparkExperience {
+        draft_tokens: tokens,
+        draft_logits,
+        target_logits,
+        accepted: BLOCK,
+        block_size: BLOCK,
+        vocab_size: V,
+        next_token_heads: false,
+    };
+
+    let mut trainer = DsparkTrainer::new(
+        DsparkTrainConfig {
+            markov_rank: R,
+            learning_rate: 1e-2,
+            batch_size: 4,
+            prob_match_alpha: 1.0, // pure prob-match — PG weight is zero
+            ..Default::default()
+        },
+        Some((seed_w1.clone(), seed_w2, R)),
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .unwrap();
+
+    let loss = trainer.train_step(&vec![exp; 4]).unwrap();
+    assert!(
+        loss > 1e-3,
+        "α=1 PM loss must be a live gradient at V={V}, not underflowed to ~0: got {loss}"
+    );
+    let (w1, _) = trainer.get_weights().unwrap();
+    let moved = w1
+        .iter()
+        .zip(&seed_w1)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        moved > 1e-6,
+        "pure PM must move the head: max |Δw1| = {moved}"
+    );
+}
