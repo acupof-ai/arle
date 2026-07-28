@@ -2629,7 +2629,7 @@ fn try_flashmla_prefill_attention(
         let mut q_fp8 = ctx.stream.alloc_zeros::<u8>(q_elems)?;
         let mut kv_fp8 = ctx.stream.alloc_zeros::<u8>(kv_elems)?;
         let mut scale = ctx.stream.alloc_zeros::<f32>(2)?;
-        scale.copy_region_from_host(ctx, 0, &[1.0f32, 1.0f32])?;
+        ctx.stream.memcpy_htod(&[1.0f32, 1.0f32], &mut scale)?;
 
         let (q_src, _qg) = q_prepared.data.device_ptr(&ctx.stream);
         let (q_dst, _dg) = q_fp8.device_ptr_mut(&ctx.stream);
