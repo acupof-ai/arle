@@ -322,9 +322,18 @@ pub(crate) struct PageMeta {
     pub(crate) q_offsets: Vec<usize>,
     pub(crate) page_offsets: Vec<usize>,
     /// Host mirror of each row's total KV length (prefix + this forward's new
-    /// tokens). The FA3 paged decode path launches one call per request and
-    /// needs `seqlen_k` on the host to do it.
+    /// tokens).
     pub(crate) kv_lens: Vec<usize>,
+    /// Device `[batch]` copy of `kv_lens` — FA3's `seqused_k`, which is what
+    /// lets one launch cover a ragged batch.
+    pub(crate) kv_lens_dev: CudaSlice<i32>,
+    /// RECTANGULAR page table `[batch, page_table_stride]`, each row padded with
+    /// its own last page. FA3 strides rows by a scalar, so the ragged
+    /// `kv_indices` cannot be shared; rows never read past `kv_lens`, so the
+    /// padding is unreachable.
+    pub(crate) page_table_rect: CudaSlice<i32>,
+    /// Row stride of `page_table_rect` — the longest row's page count.
+    pub(crate) page_table_stride: usize,
     /// Longest row's new-token count — the kernel's `max_qlen`.
     pub(crate) seq_len: usize,
     /// Sum of every row's new-token count — the kernel's `total_q_tokens`.
@@ -443,10 +452,26 @@ impl PageMeta {
         } else {
             (None, None, None)
         };
+        // Rectangular mirror for FA3's scalar row stride. Pad with each row's
+        // own last page so a stray read stays inside the request's KV.
+        let stride = (1..=batch)
+            .map(|r| kv_indptr[r] as usize - kv_indptr[r - 1] as usize)
+            .max()
+            .unwrap_or(0);
+        let mut rect = Vec::with_capacity(batch * stride);
+        for r in 0..batch {
+            let (lo, hi) = (kv_indptr[r] as usize, kv_indptr[r + 1] as usize);
+            rect.extend_from_slice(&kv_indices[lo..hi]);
+            let pad = kv_indices[hi - 1];
+            rect.resize(rect.len() + stride - (hi - lo), pad);
+        }
         Ok(Self {
             q_indptr: upload_i32(ctx, &q_indptr)?,
             kv_indptr: upload_i32(ctx, &kv_indptr)?,
             kv_indices: upload_i32(ctx, &kv_indices)?,
+            kv_lens_dev: upload_i32(ctx, &kv_lens.iter().map(|&l| l as i32).collect::<Vec<_>>())?,
+            page_table_rect: upload_i32(ctx, &rect)?,
+            page_table_stride: stride,
             kv_last_page_len: upload_i32(ctx, &last_page_lens)?,
             page_table_offsets: upload_i32(ctx, &[0])?,
             start_positions: upload_i32(ctx, &start_positions)?,
@@ -514,6 +539,9 @@ impl PageMeta {
             q_indptr: upload_i32(ctx, &[0, 1])?,
             kv_indptr: upload_i32(ctx, &[0, num_pages as i32])?,
             kv_indices: upload_i32(ctx, &page_ids)?,
+            kv_lens_dev: upload_i32(ctx, &[total_len as i32])?,
+            page_table_rect: upload_i32(ctx, &page_ids)?,
+            page_table_stride: num_pages,
             kv_last_page_len: upload_i32(ctx, &[last_page_len as i32])?,
             page_table_offsets: upload_i32(ctx, &[0])?,
             start_positions: upload_i32(ctx, &[(total_len - 1) as i32])?,
