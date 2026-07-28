@@ -535,8 +535,8 @@ pub(crate) struct Dsv4FlashMlaDecodeBatchScratch {
     /// across the batch (split dim folds b in via `num_splits`). Strides match
     /// the single-row path (split stride = s_q*h_q).
     pub(super) lse_accum: CudaSlice<f32>,
-    /// `[num_sm_parts + max_batch, h_q * head_dim]` f32 — split-KV O accumulator,
-    /// shared across the batch (see `lse_accum`).
+    /// `[num_sm_parts + max_batch, h_q * d_v]` f32 — split-KV O accumulator,
+    /// shared across the batch (see `lse_accum`). d_v=512 always.
     pub(super) o_accum: CudaSlice<f32>,
     /// `[num_sm_parts_max * 8]` i32 — tile-scheduler metadata. RECOMPUTED PER
     /// FORWARD via `sched_meta(b=n)` (the cached-constant pitfall: the b=1 cached
@@ -549,9 +549,9 @@ pub(crate) struct Dsv4FlashMlaDecodeBatchScratch {
     /// PHASE B: each row r's prepared Q is written into `[r, ..]` by the per-row
     /// pack/gather before the ONE batched fwd reads the whole `[0, n)` prefix.
     pub(super) q_batched: CudaSlice<half::bf16>,
-    /// `[max_batch, h_q * head_dim]` bf16 — full global-head fwd output, read
+    /// `[max_batch, h_q * d_v]` bf16 — full global-head fwd output, read
     /// per-row by the finish step (TP out-slice on the TP path, direct copy on
-    /// single-GPU). PHASE B.
+    /// single-GPU). PHASE B. d_v=512 always.
     pub(super) out_batched: CudaSlice<half::bf16>,
     /// `[max_batch, tp_world * local_heads * head_dim]` bf16 — TP all-gather
     /// landing buffer (TP path only). PHASE B: the gather loop uses the `[0,
@@ -575,11 +575,14 @@ pub(crate) struct Dsv4FlashMlaDecodeBatchScratch {
     pub(super) layer_shapes: Vec<Dsv4FlashMlaDecodeShape>,
     pub(super) max_batch: usize,
     pub(super) max_topk_unified: usize,
-    /// Global heads (64/128); PHASE B: row stride `h_q*head_dim` of the
-    /// q_batched/out_batched buffers (`h_q_d`).
+    /// Global heads (64/128); PHASE B: row stride component of q_batched
+    /// (`h_q*head_dim`) and out_batched (`h_q*d_v`).
     pub(super) h_q: usize,
     /// PHASE B: `h_q_d` row stride component.
     pub(super) head_dim: usize,
+    /// Output latent dim (d_v=512 always; == head_dim for MODEL1, < head_dim
+    /// for V32). Sizes out_batched/o_accum and the finish-step output slice.
+    pub(super) d_v: usize,
     pub(super) num_sm_parts: i32,
     pub(super) fixed_overhead_num_blocks: i32,
     pub(super) block_size_topk: i32,
@@ -610,6 +613,17 @@ impl Dsv4FlashMlaDecodeBatchScratch {
             "DSv4 batched FlashMLA decode requires a uniform h_q across layers"
         );
         let head_dim = config.head_dim;
+        let model_type_int = match (
+            config.head_dim,
+            config.qk_rope_head_dim,
+            config.kv_lora_rank,
+        ) {
+            (512, 64, _) => DSV4_FLASHMLA_MODEL1,
+            (576, 64, 512) => DSV4_FLASHMLA_V32,
+            (hd, rd, kv) => anyhow::bail!(
+                "DSv4 batched FlashMLA decode meta: unsupported (head_dim={hd}, rope={rd}, kv_lora={kv})"
+            ),
+        };
         let max_topk_unified = layer_shapes
             .iter()
             .map(|s| s.topk_unified)
@@ -626,7 +640,7 @@ impl Dsv4FlashMlaDecodeBatchScratch {
             ffi::arle_flashmla_sm90_sparse_decode_get_meta(
                 h_q as i32,
                 DSV4_FLASHMLA_S_Q as i32,
-                DSV4_FLASHMLA_MODEL1,
+                model_type_int,
                 &mut num_sm_parts,
                 &mut fixed_overhead_num_blocks,
                 &mut block_size_topk,
@@ -645,6 +659,16 @@ impl Dsv4FlashMlaDecodeBatchScratch {
         let h_q_d = h_q
             .checked_mul(head_dim)
             .ok_or_else(|| anyhow!("DSv4 batched FlashMLA h_q*d overflow"))?;
+        // Output (out_batched/o_accum) is [b, h_q, d_v]: d_v=512 always (shim
+        // hard-asserts). For MODEL1 d_v==head_dim; for V32 d_v=512 < head_dim=576.
+        let d_v = if model_type_int == DSV4_FLASHMLA_V32 {
+            512
+        } else {
+            head_dim
+        };
+        let h_q_d_v = h_q
+            .checked_mul(d_v)
+            .ok_or_else(|| anyhow!("DSv4 batched FlashMLA h_q*d_v overflow"))?;
         let tp_gather_cols = h_q_d; // tp_world * local_heads * head_dim == global h_q * head_dim
         // Size the per-row page table for the WIDEST layer's band (CSA total_blocks);
         // narrower SW-only layers use a row_width prefix of this shared buffer.
@@ -665,11 +689,11 @@ impl Dsv4FlashMlaDecodeBatchScratch {
                 .alloc_zeros::<i32>(max_batch * max_total_blocks)?,
             lse_out: ctx.stream.alloc_zeros::<f32>(max_batch * h_q)?,
             lse_accum: ctx.stream.alloc_zeros::<f32>(accum_splits_max * h_q)?,
-            o_accum: ctx.stream.alloc_zeros::<f32>(accum_splits_max * h_q_d)?,
+            o_accum: ctx.stream.alloc_zeros::<f32>(accum_splits_max * h_q_d_v)?,
             sched_meta: ctx.stream.alloc_zeros::<i32>(num_sm_parts_max * 8)?,
             num_splits: ctx.stream.alloc_zeros::<i32>(max_batch + 1)?,
             q_batched: ctx.stream.alloc_zeros::<half::bf16>(max_batch * h_q_d)?,
-            out_batched: ctx.stream.alloc_zeros::<half::bf16>(max_batch * h_q_d)?,
+            out_batched: ctx.stream.alloc_zeros::<half::bf16>(max_batch * h_q_d_v)?,
             tp_gathered_q: ctx
                 .stream
                 .alloc_zeros::<half::bf16>(max_batch * tp_gather_cols)?,
@@ -688,6 +712,7 @@ impl Dsv4FlashMlaDecodeBatchScratch {
             max_topk_unified,
             h_q,
             head_dim,
+            d_v,
             num_sm_parts,
             fixed_overhead_num_blocks,
             block_size_topk,
@@ -1057,22 +1082,28 @@ impl Dsv4FlashMlaDecodeBatchScratch {
             n > 0 && n <= self.max_batch,
             "DSv4 batched fwd n={n} invalid"
         );
-        // The batched-decode lane (lever #60, default-OFF) is MODEL1-only: it bakes
-        // 584 B/tok + d_qk==d_v==512 strides below. V32/GLM (head_dim=576, d_v=512
-        // latent, 656 B/tok) would be silently mis-strided here, so it MUST route
-        // through the single-row `try_flashmla_decode_attention` V32 path instead.
-        ensure!(
-            config.head_dim == 512,
-            "DSv4 batched FlashMLA decode is MODEL1-only (head_dim=512); V32 \
-             (head_dim={}) must use the single-row decode lane",
-            config.head_dim
-        );
+        // MODEL1 (head_dim=512, d_qk=d_v=512, 584 B/tok) and V32/GLM
+        // (head_dim=576, d_qk=576, d_v=512 latent, 656 B/tok). Mirrors the
+        // single-row decode path's dim mapping; the shim hard-asserts d_v==512.
+        let (model_type_int, bytes_per_token) = match (
+            config.head_dim,
+            config.qk_rope_head_dim,
+            config.kv_lora_rank,
+        ) {
+            (512, 64, _) => (DSV4_FLASHMLA_MODEL1, DSV4_FLASH_KV_BYTES_PER_TOKEN_I32),
+            (576, 64, 512) => (DSV4_FLASHMLA_V32, DSV4_V32_KV_BYTES_PER_TOKEN_I32),
+            (hd, rd, kv) => anyhow::bail!(
+                "DSv4 batched FlashMLA decode: unsupported (head_dim={hd}, rope={rd}, kv_lora={kv})"
+            ),
+        };
+        let is_v32 = model_type_int == DSV4_FLASHMLA_V32;
         let global_heads = shape.h_q;
         let head_dim = config.head_dim;
-        let bytes_per_token = DSV4_FLASH_KV_BYTES_PER_TOKEN_I32;
+        let d_qk = head_dim as i32;
+        let d_v = if is_v32 { 512_i32 } else { head_dim as i32 };
         let stride_kv_block_bytes = 64_i32 * bytes_per_token;
         let stride_q = (global_heads * head_dim) as i32; // per-row Q stride (s_q=1)
-        let stride_o = stride_q;
+        let stride_o = (global_heads as i32) * d_v;
         // Reader pitch MUST equal the writer pitch: the batched indices builder
         // (dsv4_flashmla_decode_build_indices.cu:210) writes row r at
         // `r * shape.topk_unified` (this layer's actual topk, mode-dependent), NOT
@@ -1108,17 +1139,17 @@ impl Dsv4FlashMlaDecodeBatchScratch {
                 1,
                 global_heads as i32,
                 1,
-                head_dim as i32,
-                head_dim as i32,
+                d_qk,
+                d_v,
                 (shape.sw_blocks + shape.comp_blocks) as i32,
                 64,
                 stride_indices,
                 self.num_sm_parts,
-                DSV4_FLASHMLA_MODEL1,
+                model_type_int,
                 sm_scale,
                 stride_q,
                 stride_q,
-                head_dim as i32,
+                d_qk,
                 stride_kv_block_bytes,
                 bytes_per_token,
                 stride_indices,
@@ -1127,16 +1158,16 @@ impl Dsv4FlashMlaDecodeBatchScratch {
                 1,
                 stride_o,
                 stride_o,
-                head_dim as i32,
+                d_v,
                 // Split-KV accum strides: the accum buffers are `[num_sm_parts+b,
                 // s_q=1, h_q(*d_v)]` (shim:202-203), so split stride = s_q*h_q etc.
                 // — identical to the single-row path; b folds into the split index
                 // via num_splits, NOT a stride.
-                stride_lse,      // stride_lse_accum_split = s_q*h_q = global_heads
-                stride_lse,      // stride_lse_accum_s_q  = h_q     = global_heads
-                stride_o,        // stride_o_accum_split  = s_q*h_q*d_v
-                stride_o,        // stride_o_accum_s_q    = h_q*d_v
-                head_dim as i32, // stride_o_accum_h_q = d_v
+                stride_lse, // stride_lse_accum_split = s_q*h_q = global_heads
+                stride_lse, // stride_lse_accum_s_q  = h_q     = global_heads
+                stride_o,   // stride_o_accum_split  = s_q*h_q*d_v
+                stride_o,   // stride_o_accum_s_q    = h_q*d_v
+                d_v,        // stride_o_accum_h_q = d_v
                 ctx.stream.cu_stream(),
             )
             .result()
@@ -1165,6 +1196,12 @@ impl Dsv4FlashMlaDecodeBatchScratch {
 
     pub(super) fn h_q_d(&self) -> usize {
         self.h_q * self.head_dim
+    }
+
+    /// Output row stride: `h_q * d_v` (d_v=512 always). For MODEL1 == h_q_d();
+    /// for V32 (d_v=512 < head_dim=576) this is the out_batched/o_accum row pitch.
+    pub(super) fn h_q_d_v(&self) -> usize {
+        self.h_q * self.d_v
     }
 
     /// PHASE B: gather row `r`'s prepared local Q into `q_batched[r]` as
@@ -1268,7 +1305,7 @@ impl Dsv4FlashMlaDecodeBatchScratch {
             "DSv4 batched out row {r} >= max_batch {}",
             self.max_batch
         );
-        let d = self.h_q_d();
+        let d = self.h_q_d_v();
         let tp_world = tp.config().world_size;
         let tp_rank = tp.config().rank;
         let local_width = local_heads * config.head_dim;
@@ -1284,14 +1321,14 @@ impl Dsv4FlashMlaDecodeBatchScratch {
             let (dst_ptr, dst_guard) = local_attn.data.device_ptr_mut(&ctx.stream);
             {
                 let _nvtx = crate::nvtx::range("dsv4/flashmla_out_slice_batched");
-                // SAFETY: src is one global-head row (h_q*head_dim), dst this
-                // rank's local block; same args as the single-row out-slice.
+                // SAFETY: src is one global-head output row (h_q*d_v); dst this
+                // rank's local block. Same args as the single-row out-slice.
                 unsafe {
                     ffi::dsv4_tp_out_slice_cuda(
                         src_ptr as *const ffi::Half,
                         dst_ptr as *mut ffi::Half,
                         1,
-                        (self.h_q * config.head_dim) as i32,
+                        self.h_q_d_v() as i32,
                         local_width as i32,
                         (tp_rank * local_width) as i32,
                         ctx.stream.cu_stream(),
@@ -1331,7 +1368,7 @@ impl Dsv4FlashMlaDecodeBatchScratch {
             "DSv4 batched out-slice n={n} out of range (1..={})",
             self.max_batch
         );
-        let d = self.h_q_d();
+        let d = self.h_q_d_v();
         let tp_world = tp.config().world_size;
         let tp_rank = tp.config().rank;
         let local_width = local_heads * config.head_dim;
@@ -1347,7 +1384,7 @@ impl Dsv4FlashMlaDecodeBatchScratch {
             let (dst_ptr, dst_guard) = local_attn_batched.data.device_ptr_mut(&ctx.stream);
             {
                 let _nvtx = crate::nvtx::range("dsv4/flashmla_out_slice_batched");
-                // SAFETY: src is `n` global-head rows (stride h_q*head_dim), dst is
+                // SAFETY: src is `n` global-head output rows (stride h_q*d_v), dst is
                 // n local rows (stride local_width); same per-row args as
                 // `slice_out_row`, with s_q=n so the kernel loops rows internally.
                 unsafe {
@@ -1355,7 +1392,7 @@ impl Dsv4FlashMlaDecodeBatchScratch {
                         src_ptr as *const ffi::Half,
                         dst_ptr as *mut ffi::Half,
                         n as i32,
-                        (self.h_q * config.head_dim) as i32,
+                        self.h_q_d_v() as i32,
                         local_width as i32,
                         (tp_rank * local_width) as i32,
                         ctx.stream.cu_stream(),
