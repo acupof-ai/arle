@@ -44,9 +44,6 @@ pub struct CudaRuntimeFlags {
     /// Batched rows>1 Qwen3.5/3.6 decode; off = sequential per-row A/B arm.
     #[serde(default = "d_true")]
     pub qwen35_batched_decode: bool,
-    /// Batched decode attention kernel; off = per-row attention A/B arm.
-    #[serde(default = "d_true")]
-    pub qwen35_batched_decode_attention: bool,
     /// DeepGEMM grouped expert GEMMs (load-time: builds grouped weight caches).
     #[serde(default = "d_true")]
     pub qwen35_deepgemm: bool,
@@ -59,9 +56,6 @@ pub struct CudaRuntimeFlags {
     /// FA3 full-attention prefill (silently ignored on stub builds).
     #[serde(default = "d_true")]
     pub qwen35_fa3: bool,
-    /// FA3 split-KV decode (not graph-replay safe; ignored with decode graph).
-    #[serde(default)]
-    pub qwen35_fa3_decode: bool,
     /// FA3 decode split count (clamped to \[2, 256\]).
     #[serde(default = "d_fa3_decode_splits")]
     pub qwen35_fa3_decode_splits: usize,
@@ -124,12 +118,10 @@ impl Default for CudaRuntimeFlags {
         Self {
             qwen35_decode_graph: false,
             qwen35_batched_decode: true,
-            qwen35_batched_decode_attention: true,
             qwen35_deepgemm: true,
             qwen35_moe_decode_kernel: true,
             qwen35_gpu_router: true,
             qwen35_fa3: true,
-            qwen35_fa3_decode: false,
             qwen35_fa3_decode_splits: d_fa3_decode_splits(),
             qwen35_gdr_chunked: false,
             decode_metadata_fast_page16: false,

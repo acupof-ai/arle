@@ -48,12 +48,10 @@ static DEEPEP_MAX_DISPATCH_TOKENS_PER_RANK: AtomicU32 = AtomicU32::new(0);
 
 static QWEN35_DECODE_GRAPH: AtomicBool = AtomicBool::new(false);
 static QWEN35_BATCHED_DECODE: AtomicBool = AtomicBool::new(true);
-static QWEN35_BATCHED_DECODE_ATTENTION: AtomicBool = AtomicBool::new(true);
 static QWEN35_DEEPGEMM: AtomicBool = AtomicBool::new(true);
 static QWEN35_MOE_DECODE_KERNEL: AtomicBool = AtomicBool::new(true);
 static QWEN35_GPU_ROUTER: AtomicBool = AtomicBool::new(true);
 static QWEN35_FA3: AtomicBool = AtomicBool::new(true);
-static QWEN35_FA3_DECODE: AtomicBool = AtomicBool::new(false);
 static QWEN35_FA3_DECODE_SPLITS: AtomicUsize = AtomicUsize::new(8);
 static QWEN35_GDR_CHUNKED: AtomicBool = AtomicBool::new(false);
 static NUMA_PIN: AtomicBool = AtomicBool::new(true);
@@ -72,12 +70,10 @@ static DEEPEP_NUM_SMS: AtomicU32 = AtomicU32::new(20);
 pub fn apply_runtime_flags(f: &CudaRuntimeFlags) {
     QWEN35_DECODE_GRAPH.store(f.qwen35_decode_graph, Relaxed);
     QWEN35_BATCHED_DECODE.store(f.qwen35_batched_decode, Relaxed);
-    QWEN35_BATCHED_DECODE_ATTENTION.store(f.qwen35_batched_decode_attention, Relaxed);
     QWEN35_DEEPGEMM.store(f.qwen35_deepgemm, Relaxed);
     QWEN35_MOE_DECODE_KERNEL.store(f.qwen35_moe_decode_kernel, Relaxed);
     QWEN35_GPU_ROUTER.store(f.qwen35_gpu_router, Relaxed);
     QWEN35_FA3.store(f.qwen35_fa3, Relaxed);
-    QWEN35_FA3_DECODE.store(f.qwen35_fa3_decode, Relaxed);
     QWEN35_FA3_DECODE_SPLITS.store(f.qwen35_fa3_decode_splits.clamp(2, 256), Relaxed);
     QWEN35_GDR_CHUNKED.store(f.qwen35_gdr_chunked, Relaxed);
     SHARD_CACHE_BYTES.store(f.shard_cache_bytes.unwrap_or(usize::MAX), Relaxed);
@@ -109,9 +105,6 @@ pub(crate) fn qwen35_decode_graph() -> bool {
 pub(crate) fn qwen35_batched_decode() -> bool {
     QWEN35_BATCHED_DECODE.load(Relaxed)
 }
-pub(crate) fn qwen35_batched_decode_attention() -> bool {
-    QWEN35_BATCHED_DECODE_ATTENTION.load(Relaxed)
-}
 pub(crate) fn qwen35_deepgemm() -> bool {
     QWEN35_DEEPGEMM.load(Relaxed)
 }
@@ -123,9 +116,6 @@ pub(crate) fn qwen35_gpu_router() -> bool {
 }
 pub(crate) fn qwen35_fa3() -> bool {
     QWEN35_FA3.load(Relaxed)
-}
-pub(crate) fn qwen35_fa3_decode() -> bool {
-    QWEN35_FA3_DECODE.load(Relaxed)
 }
 pub(crate) fn qwen35_fa3_decode_splits() -> usize {
     QWEN35_FA3_DECODE_SPLITS.load(Relaxed)
