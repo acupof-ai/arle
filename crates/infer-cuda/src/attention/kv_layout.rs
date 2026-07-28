@@ -727,9 +727,8 @@ impl Dsv4KvAdapter {
             })
             .transpose()?;
         // One model-wide batched (b=N) FlashMLA decode scratch (#60). Built for
-        // canonical MODEL1 FlashMLA decode when the arena is live; V32/GLM keeps
-        // the single-row path because the batched sparse-decode shim below is
-        // MODEL1-only.
+        // both MODEL1 (head_dim=512) and V32/GLM (head_dim=576) when the arena
+        // is live; the batched shim now handles both dim mappings.
         // Build the per-layer FlashMLA decode shapes ONCE (shared by the batched
         // scratch and the new single-row shared scratch). Both gate on the same
         // `dsv4_flashmla_decode_alloc_enabled` predicate as the per-slot state.
@@ -748,16 +747,12 @@ impl Dsv4KvAdapter {
                     )
                 })
                 .collect::<Result<Vec<_>>>()?;
-            let batch = if config.head_dim == 512 {
-                Some(Dsv4FlashMlaDecodeBatchScratch::new(
-                    ctx,
-                    config,
-                    num_slots,
-                    &layer_shapes,
-                )?)
-            } else {
-                None
-            };
+            let batch = Some(Dsv4FlashMlaDecodeBatchScratch::new(
+                ctx,
+                config,
+                num_slots,
+                &layer_shapes,
+            )?);
             // ONE model-wide single-row decode scratch (#85 P3), hoisted from the
             // per-(slot,layer) state. Worst-case-sized across all FlashMLA layers.
             let single = Dsv4FlashMlaDecodeScratch::new(ctx, config, &layer_shapes)?;
