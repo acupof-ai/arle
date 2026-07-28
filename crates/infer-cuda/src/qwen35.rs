@@ -6422,21 +6422,28 @@ impl Qwen35Model {
                     Some(full_idx),
                     rows,
                     || {
-                        // sm_90 decode: FA3 paged split-KV + PackGQA. The
-                        // TileLang kernel it replaces pads BLOCK_M=64 around one
-                        // real query row and gives one CTA per query head — 6×
-                        // the KV traffic at ~2% occupancy. Non-Hopper keeps it.
-                        if decode
-                            && pool.format == KVFormat::BF16
+                        // sm_90: FA3 paged + PackGQA for every query length —
+                        // decode (1 row), spec verify (block+1), prefill chunks.
+                        // The TileLang kernel it replaces pads BLOCK_M=64 around
+                        // the real rows and gives one CTA per query head, 6× the
+                        // KV traffic. Non-Hopper keeps it.
+                        if pool.format == KVFormat::BF16
                             && c.head_dim == 256
                             && qwen35_fa3_enabled(&self.ctx)
                         {
-                            let splits = qwen35_fa3_decode_splits();
-                            let lse = fa3_lse.get(&self.ctx, self.local_q_heads)?;
+                            // Split-KV only pays where the query is too short to
+                            // fill the SMs; a real prefill chunk already does.
+                            let max_q = meta.seq_len;
+                            let splits = if max_q <= 64 {
+                                qwen35_fa3_decode_splits()
+                            } else {
+                                1
+                            };
+                            let lse = fa3_lse.get(&self.ctx, self.local_q_heads * max_q)?;
                             let oaccum = fa3_oaccum
-                                .get(&self.ctx, splits * self.local_q_heads * c.head_dim)?;
+                                .get(&self.ctx, splits * self.local_q_heads * max_q * c.head_dim)?;
                             let lseaccum =
-                                fa3_lseaccum.get(&self.ctx, splits * self.local_q_heads)?;
+                                fa3_lseaccum.get(&self.ctx, splits * self.local_q_heads * max_q)?;
                             let sem = fa3_semaphore.get(&self.ctx, 1)?;
                             let (lse_ptr, _f0) = lse.device_ptr_mut(&self.ctx.stream);
                             let (oaccum_ptr, _f1) = oaccum.device_ptr_mut(&self.ctx.stream);
@@ -6450,16 +6457,18 @@ impl Qwen35Model {
                             // share one launch. Split-KV keeps each one busy.
                             for row in 0..meta.batch {
                                 let kv_len = meta.kv_lens[row];
+                                let q0 = meta.q_offsets[row] as u64 * q_dim_l * elem;
+                                let qlen = meta.q_offsets[row + 1] - meta.q_offsets[row];
                                 let args = ffi::ArleFa3FwdHd256Args {
-                                    q: (qp_ptr + row as u64 * q_dim_l * elem) as *const ffi::Half,
+                                    q: (qp_ptr + q0) as *const ffi::Half,
                                     k: k_pool_ptr as *const ffi::Half,
                                     v: v_pool_ptr as *const ffi::Half,
-                                    o: (ao_ptr + row as u64 * q_dim_l * elem) as *mut ffi::Half,
+                                    o: (ao_ptr + q0) as *mut ffi::Half,
                                     softmax_lse: lse_ptr as *mut f32,
                                     out_accum: oaccum_ptr as *mut f32,
                                     softmax_lse_accum: lseaccum_ptr as *mut f32,
                                     tile_count_semaphore: sem_ptr as *mut i32,
-                                    seqlen_q: 1,
+                                    seqlen_q: qlen as i32,
                                     seqlen_k: kv_len as i32,
                                     num_heads: self.local_q_heads as i32,
                                     num_heads_k: self.local_kv_heads as i32,
@@ -6476,7 +6485,9 @@ impl Qwen35Model {
                                     v_head_stride: pool.page_size as i64 * head_dim,
                                     o_head_stride: head_dim,
                                     softmax_scale: sm_scale,
-                                    is_causal: 0,
+                                    // Bottom-right aligned; the shim demotes to
+                                    // non-causal at qlen 1.
+                                    is_causal: 1,
                                     num_splits: splits as i32,
                                     page_table: (kv_indices_ptr
                                         + (meta.page_offsets[row] * 4) as u64)
