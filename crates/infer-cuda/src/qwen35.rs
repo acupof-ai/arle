@@ -1127,9 +1127,6 @@ pub(crate) struct Qwen35RecurrentSnapshot {
     pub(crate) gdr: Vec<Vec<f32>>,
     /// `[num_linear]` conv1d rings (bf16), copied verbatim from device.
     pub(crate) conv: Vec<Vec<bf16>>,
-    /// Serialized full-attention KV pages captured at prefill end.
-    /// `None` when the executor has no `full_attn_kv` pool (non-paged path).
-    pub(crate) full_attn_kv: Option<Vec<u8>>,
 }
 
 impl Qwen35RecurrentSnapshot {
@@ -1138,24 +1135,21 @@ impl Qwen35RecurrentSnapshot {
     pub(crate) fn host_bytes(&self) -> usize {
         self.gdr.iter().map(|v| v.len() * 4).sum::<usize>()
             + self.conv.iter().map(|v| v.len() * 2).sum::<usize>()
-            + self.full_attn_kv.as_ref().map_or(0, |v| v.len())
     }
 
-    /// Flatten the recurrent + full-attn KV snapshot into ONE length-prefixed
-    /// buffer for the sidecar [`kv_native_sys::KvTierStore`] (opaque-`u64`
-    /// key). The recurrent state and the full-attn KV are serialized together as
-    /// one atomic blob — a partial store/restore corrupts model output. Exact
-    /// byte-inverse of [`Self::from_bytes`] (proven in `recurrent_snapshot_byte_inverse`).
-    /// Header: `[num_gdr][num_conv][has_kv][kv_len]` (u64 LE), then the KV bytes,
-    /// then each gdr vec `[len:u64][f32 LE...]` and each conv vec `[len:u64][bf16 LE...]`.
+    /// Flatten the recurrent snapshot into ONE length-prefixed buffer for the
+    /// sidecar [`kv_native_sys::KvTierStore`] (opaque-`u64` key). Exact
+    /// byte-inverse of [`Self::from_bytes`]. Header: `[num_gdr][num_conv]`
+    /// (u64 LE), then each gdr vec `[len:u64][f32 LE...]` and each conv vec
+    /// `[len:u64][bf16 LE...]`.
+    ///
+    /// The full-attention KV is deliberately NOT in here: restore mirrors the
+    /// radix prefix's own device pages, which is the whole point of the
+    /// host-authoritative page model (`executor/qwen35.rs::mirror_host_slot`).
     pub(crate) fn to_bytes(&self) -> Vec<u8> {
-        let kv = self.full_attn_kv.as_deref().unwrap_or(&[]);
         let mut buf = Vec::with_capacity(self.host_bytes() + 64);
         buf.extend_from_slice(&(self.gdr.len() as u64).to_le_bytes());
         buf.extend_from_slice(&(self.conv.len() as u64).to_le_bytes());
-        buf.extend_from_slice(&(self.full_attn_kv.is_some() as u64).to_le_bytes());
-        buf.extend_from_slice(&(kv.len() as u64).to_le_bytes());
-        buf.extend_from_slice(kv);
         for gdr in &self.gdr {
             buf.extend_from_slice(&(gdr.len() as u64).to_le_bytes());
             for &x in gdr {
@@ -1188,17 +1182,6 @@ impl Qwen35RecurrentSnapshot {
         };
         let num_gdr = take_u64(&mut pos)? as usize;
         let num_conv = take_u64(&mut pos)? as usize;
-        let has_kv = take_u64(&mut pos)? != 0;
-        let kv_len = take_u64(&mut pos)? as usize;
-        let kv_end = pos
-            .checked_add(kv_len)
-            .ok_or_else(|| anyhow!("recurrent snapshot kv length overflow"))?;
-        let kv_bytes = bytes
-            .get(pos..kv_end)
-            .ok_or_else(|| anyhow!("recurrent snapshot truncated reading full-attn kv"))?
-            .to_vec();
-        pos = kv_end;
-        let full_attn_kv = has_kv.then_some(kv_bytes);
         let mut gdr = Vec::with_capacity(num_gdr);
         for _ in 0..num_gdr {
             let len = take_u64(&mut pos)? as usize;
@@ -1236,11 +1219,7 @@ impl Qwen35RecurrentSnapshot {
             "recurrent snapshot has {} trailing bytes after deserialize",
             bytes.len() - pos
         );
-        Ok(Self {
-            gdr,
-            conv,
-            full_attn_kv,
-        })
+        Ok(Self { gdr, conv })
     }
 }
 
@@ -1376,7 +1355,6 @@ impl Qwen35SlotState {
             return Ok(Qwen35RecurrentSnapshot {
                 gdr: Vec::new(),
                 conv: Vec::new(),
-                full_attn_kv: None,
             });
         }
         let gdr = self
@@ -1400,11 +1378,7 @@ impl Qwen35SlotState {
         ctx.stream
             .synchronize()
             .map_err(|e| anyhow!("sync after recurrent snapshot: {e}"))?;
-        Ok(Qwen35RecurrentSnapshot {
-            gdr,
-            conv,
-            full_attn_kv: None,
-        })
+        Ok(Qwen35RecurrentSnapshot { gdr, conv })
     }
 
     /// H2D restore from a sidecar snapshot. The slot MUST have acquired recurrent
@@ -1538,7 +1512,8 @@ impl Qwen35SlotState {
     ///
     /// Captured buffers (every device buffer the slot owns, proven complete):
     ///   (a) full-attn KV pages — `full_attn_kv.page_indices(slot)` →
-    ///       `copy_pages_to_host`, then `free_slot` returns them to the pool.
+    ///       `copy_pages_to_host`, then the page mirror is dropped (the host
+    ///       pool owns the pages and frees them right after `demote_slot`).
     ///   (b) `gdr_states[0..num_linear]` (f32) — `clone_dtoh` each.
     ///   (c) `conv_states[0..num_linear]` (bf16) — `clone_dtoh` each.
     ///   (d) `seq_len`.
@@ -1597,16 +1572,17 @@ impl Qwen35SlotState {
             seq_len: self.seq_len,
         };
         // Free every device buffer now that the image owns the state.
-        full_attn_kv.free_slot(slot);
+        full_attn_kv.mirror_slot(slot, &[], 0)?;
         self.release_recurrent(recurrent_pool);
         self.seq_len = 0;
         Ok(image)
     }
 
     /// Restore a whole-slot image into this slot — the exact byte-inverse of
-    /// [`Self::swap_out_image`]. Allocate fresh pages + recurrent block, H2D the
-    /// captured bytes verbatim (the SAME session restores its OWN state, so this
-    /// is a byte-restore, not a reuse), and set `seq_len`. The engine resumes
+    /// [`Self::swap_out_image`]. Mirror the host pages the engine re-allocated
+    /// for the slot, acquire a recurrent block, H2D the captured bytes verbatim
+    /// (the SAME session restores its OWN state, so this is a byte-restore, not
+    /// a reuse), and set `seq_len`. The engine resumes
     /// decode immediately after `promote_slot`, so the trailing `ctx.sync()`
     /// makes the device restore complete before the host image can be dropped.
     pub(crate) fn swap_in_image(
@@ -1619,6 +1595,7 @@ impl Qwen35SlotState {
         gdr_state_len: usize,
         conv_len: usize,
         image: &Qwen35SlotImage,
+        slot_pages: &[u32],
     ) -> Result<()> {
         // A scheduler-free slot may still hold its FINISHED previous occupant's
         // device state: this arm vacates lazily at the next position-0 prefill,
@@ -1629,7 +1606,7 @@ impl Qwen35SlotState {
             self.release_recurrent(recurrent_pool);
         }
         if full_attn_kv.seq_len(slot) != 0 {
-            full_attn_kv.free_slot(slot);
+            full_attn_kv.mirror_slot(slot, &[], 0)?;
         }
         self.seq_len = 0;
         ensure!(
@@ -1638,15 +1615,15 @@ impl Qwen35SlotState {
             image.gdr_host.len(),
             image.conv_host.len()
         );
-        // (a) Allocate exactly the captured pages and H2D the full-attn bytes.
-        let pages = full_attn_kv.alloc_tokens(slot, image.seq_len)?;
+        // (a) Mirror exactly the captured page count and H2D the full-attn bytes.
         ensure!(
-            pages.len() == image.full_attn_page_count,
-            "Qwen3.6 swap-in allocated {} pages != captured {}",
-            pages.len(),
+            slot_pages.len() == image.full_attn_page_count,
+            "Qwen3.6 swap-in host slot holds {} pages != captured {}",
+            slot_pages.len(),
             image.full_attn_page_count
         );
-        full_attn_kv.copy_pages_from_host(ctx, &pages, &image.full_attn_pages)?;
+        full_attn_kv.mirror_slot(slot, slot_pages, image.seq_len)?;
+        full_attn_kv.copy_pages_from_host(ctx, slot_pages, &image.full_attn_pages)?;
         // (b) + (c) acquire a fresh recurrent block (alloc+zero) then H2D-restore.
         self.acquire_recurrent(ctx, num_linear, gdr_state_len, conv_len, recurrent_pool)?;
         for (dst, src) in self.gdr_states.iter_mut().zip(&image.gdr_host) {

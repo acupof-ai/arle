@@ -283,16 +283,16 @@ impl RealCudaExecutor {
         plan: &ForwardPlan,
         host_kv: &mut dyn KvPool,
     ) -> Result<StepOutput> {
-        // The descriptor is built per arm: Qwen-dense lowers it into its device
-        // page pool (host-authoritative mirror), DSv4 validates + adapts it.
-        // Qwen3.5 hybrid owns per-slot KV state and consumes neither, so it
-        // skips the per-step page-id flattening entirely.
+        // Both Qwen arms lower the host pool's page table into their device pool
+        // (host-authoritative mirror); DSv4 validates + adapts the descriptor.
+        // Qwen3.5 reads the host pool directly rather than the flattened
+        // descriptor — its spec path also GROWS the slot mid-step.
         match self {
             Self::Qwen(q) => {
                 let kv_batch = KvBatchDescriptor::from_plan(plan, host_kv)?;
                 q.submit(plan, host_kv, &kv_batch)
             }
-            Self::Qwen35(q) => q.submit(plan),
+            Self::Qwen35(q) => q.submit(plan, host_kv),
             Self::Dsv4(d) => {
                 let kv_batch = KvBatchDescriptor::from_plan(plan, host_kv)?;
                 d.submit(plan, &kv_batch)
@@ -512,10 +512,7 @@ impl RealCudaExecutor {
 
     pub(crate) fn promote_slot(&mut self, key: u64, slot: usize, slot_pages: &[u32]) -> Result<()> {
         match self {
-            Self::Qwen35(q) => {
-                let _ = slot_pages;
-                q.promote_slot(key, slot)
-            }
+            Self::Qwen35(q) => q.promote_slot(key, slot, slot_pages),
             Self::Dsv4(_) | Self::Qwen(_) => {
                 anyhow::bail!("whole-slot KV tier store is only implemented for Qwen3.6 CUDA")
             }
@@ -672,11 +669,15 @@ impl RealCudaExecutor {
     /// device pages in the same tick, or the host admission pool over-reports
     /// free capacity and the planner licenses chunks the device pool can't
     /// hold (engine-fatal at submit). DSv4 returns demand-paged FlashMLA band
-    /// pages (#154 Phase 3b); Qwen3.5/3.6 frees its self-allocated
-    /// `full_attn_kv` slot; dense Qwen mirrors the host pool (nothing to free).
+    /// pages (#154 Phase 3b); Qwen3.5/3.6 drops its page mirror (and any recall
+    /// keepalive); dense Qwen mirrors the host pool (nothing to free).
     pub(crate) fn release_kv_slot(&mut self, slot: usize) {
         match self {
-            Self::Qwen35(q) => q.release_kv_slot(slot),
+            Self::Qwen35(q) => {
+                if let Err(err) = q.release_kv_slot(slot) {
+                    warn!("Qwen3.5 release_kv_slot({slot}) failed: {err:#}");
+                }
+            }
             Self::Dsv4(d) => {
                 if let Err(err) = d.kv_adapter.flashmla_free_slot(slot) {
                     warn!("DSv4 release_kv_slot({slot}) failed: {err:#}");
@@ -690,25 +691,21 @@ impl RealCudaExecutor {
     /// mirrors the host pool exactly — inert.
     pub(crate) fn kv_device_gate_active(&self) -> bool {
         match self {
-            Self::Qwen35(q) => q.kv_device_gate_active(),
             Self::Dsv4(d) => d.kv_device_gate_active(),
-            Self::Qwen(_) => false,
+            Self::Qwen(_) | Self::Qwen35(_) => false,
         }
     }
 
-    /// Per-row device-pool fit for the engine's gate. Qwen3.6 checks the
-    /// engine's `pages_hint` against `full_attn_kv`'s true headroom (recall
-    /// keepalive); DSv4 pairs per-layer band growth with each layer pool
-    /// (#160).
+    /// Per-row device-pool fit for the engine's gate. Only DSv4 still needs it
+    /// (per-layer band growth paired with each layer pool, #160); the two Qwen
+    /// arms mirror the host pool, which is the fit authority.
     pub(crate) fn kv_device_fit(
         &self,
         rows: &[infer_seam::DeviceRowDemand],
         unfit: &mut Vec<usize>,
     ) {
-        match self {
-            Self::Qwen35(q) => q.kv_device_fit(rows, unfit),
-            Self::Dsv4(d) => d.kv_device_fit(rows, unfit),
-            Self::Qwen(_) => {}
+        if let Self::Dsv4(d) = self {
+            d.kv_device_fit(rows, unfit);
         }
     }
 

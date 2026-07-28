@@ -23,6 +23,17 @@ fn qwen35_batched_decode_enabled() -> bool {
     crate::runtime_flags::qwen35_batched_decode()
 }
 
+/// Grow the host pool's `slot` to `target` logical tokens. Speculative decode
+/// materializes a whole draft chain's KV in one forward, past the single token
+/// the engine pre-allocated for the row; the engine's post-step append of the
+/// accepted extras then finds the slot already long enough and no-ops.
+fn grow_host_slot_to(host_kv: &mut dyn KvPool, slot: usize, target: usize) -> Result<()> {
+    match target.checked_sub(host_kv.seq_len(slot)) {
+        Some(0) | None => Ok(()),
+        Some(missing) => host_kv.alloc(slot, missing),
+    }
+}
+
 fn speculative_chain_fits(start: usize, depth: usize, max_seq_len: usize) -> bool {
     start
         .checked_add(depth)
@@ -330,8 +341,35 @@ impl Qwen35CudaExecutor {
         pages_only_reusable_prefix_blocks(blocks, |_| false)
     }
 
-    /// Serialize the slot's recurrent state + full-attn KV as ONE atomic blob
-    /// and store it into `slot_tier` under `NS_SIDECAR`, keyed by the token hash
+    /// Lower the host pool's authoritative page table for `slot` into the device
+    /// pool, the way `executor/qwen.rs` does.
+    ///
+    /// The device `PagedKVPool` runs no allocator of its own: host page ids index
+    /// its storage rows 1:1, so a slot mirroring a published prefix's pages reads
+    /// that prefix's KV straight out of HBM — which is what makes a radix hit free
+    /// instead of a host round-trip (`PagedKVPool::mirror_slot`).
+    fn mirror_host_slot(
+        &mut self,
+        host_kv: &dyn KvPool,
+        slot: usize,
+        seq_len: usize,
+    ) -> Result<()> {
+        let host_pages = host_kv.page_indices(slot);
+        let pool = self
+            .full_attn_kv
+            .as_mut()
+            .expect("full_attn_kv present (full_attn_paged)");
+        let need = seq_len.div_ceil(pool.page_size);
+        ensure!(
+            host_pages.len() >= need,
+            "host pool holds {} pages for slot {slot}, {need} needed to cover {seq_len} tokens",
+            host_pages.len()
+        );
+        pool.mirror_slot(slot, &host_pages[..need], seq_len)
+    }
+
+    /// Serialize the slot's recurrent state and store it into `slot_tier` under
+    /// `NS_SIDECAR`, keyed by the token hash
     /// of the published radix prefix. Records the prefix's tail page → key so
     /// `release_sidecar_pages` drops the blob when the radix evicts that page.
     ///
@@ -361,7 +399,7 @@ impl Qwen35CudaExecutor {
         let periodic = std::mem::take(&mut self.periodic_boundary_snapshots[slot]);
         let boundary = tokens.len().saturating_sub(1) / SUPPORTED_PAGE_SIZE * SUPPORTED_PAGE_SIZE;
         let pending = self.prefill_boundary_snapshot[slot].take();
-        let (mat_len, mut snap) = match pending {
+        let (mat_len, snap) = match pending {
             Some((pos, snap)) if pos == boundary && boundary > 0 => (pos, snap),
             _ => {
                 // Legacy best-effort: raw seq_len aligns to a page ~1/16 of the
@@ -388,58 +426,20 @@ impl Qwen35CudaExecutor {
                 tokens.len(),
             );
         }
-        // Copy KV[0..mat_len] to host ONCE (snapshot_recurrent synchronized the
-        // stream). full-attn KV is position-indexed and append-only, so pages
-        // [0..mat_len) are byte-identical whether copied at `mat_len` or the
-        // current end, AND every periodic boundary `pos ≤ mat_len` is a page-major
-        // PREFIX of this buffer — slice it instead of re-copying (avoids O(N²) D2H
-        // across the periodic boundaries).
-        let host_kv = match self.full_attn_kv.as_ref() {
-            Some(pool) => {
-                let n_pages = mat_len / SUPPORTED_PAGE_SIZE;
-                let all_pages = pool.page_indices(slot);
-                let pages = all_pages[..n_pages.min(all_pages.len())].to_vec();
-                if pages.is_empty() {
-                    None
-                } else {
-                    match pool.copy_pages_to_host(&self.model.ctx, &pages) {
-                        Ok(data) => Some(data),
-                        Err(e) => {
-                            log::warn!(
-                                "slot {slot}: full-attn KV D2H failed: {e}; skipping sidecar entry"
-                            );
-                            return Ok(()); // don't store an incomplete (KV-less) blob
-                        }
-                    }
-                }
-            }
-            None => None,
-        };
-        // Bytes per KV page (page-major layout): slice `[..pages * page_bytes]`
-        // gives KV[0..pages*16] for any periodic boundary.
-        let n_pages = (mat_len / SUPPORTED_PAGE_SIZE).max(1);
-        let page_bytes = host_kv.as_ref().map(|d| d.len() / n_pages);
-
         // PERIODIC sidecars at each stride boundary `0 < pos ≤ mat_len` snapshotted
         // during this prefill — for a FUTURE cross-conversation restore that shares
-        // only a leading prefix. Each blob = the recurrent state captured at EXACTLY
-        // `pos` + KV[0..pos] sliced from `host_kv` (snapshot-position == key-position).
-        // Saved BEFORE the primary so the primary can MOVE `host_kv` (no clone).
-        for (pos, mut psnap) in periodic {
+        // only a leading prefix. Each blob is the recurrent state captured at
+        // EXACTLY `pos` (snapshot-position == key-position). The full-attention KV
+        // is NOT in here: restore mirrors the radix prefix's own device pages.
+        for (pos, psnap) in periodic {
             if pos == 0 || pos > mat_len {
-                continue; // beyond the copied/published prefix — nothing to key
+                continue; // beyond the published prefix — nothing to key
             }
-            psnap.full_attn_kv = match (host_kv.as_ref(), page_bytes) {
-                (Some(kv), Some(pb)) => Some(kv[..(pos / SUPPORTED_PAGE_SIZE) * pb].to_vec()),
-                _ => None,
-            };
             let pkey = crate::qwen35::hash_prefix_tokens(&tokens[..pos]);
             self.store_sidecar_blob(pos, pkey, psnap.to_bytes(), prefix_pages);
         }
 
-        // PRIMARY sidecar at `mat_len` (the exact-resend restore target) — the
-        // within-conversation reuse path, unchanged.
-        snap.full_attn_kv = host_kv;
+        // PRIMARY sidecar at `mat_len` (the exact-resend restore target).
         self.store_sidecar_blob(mat_len, key, snap.to_bytes(), prefix_pages);
         Ok(())
     }
@@ -482,52 +482,27 @@ impl Qwen35CudaExecutor {
     /// planner licensed prefill chunks the device pool could not hold — an
     /// engine-fatal alloc error at submit. Safe here: sidecar/tier capture runs
     /// before the engine frees host pages, and no forward is in flight for a
-    /// slot being released. Idempotent with the prefill-start `free_slot`.
-    pub(crate) fn release_kv_slot(&mut self, slot: usize) {
+    /// slot being released. Idempotent with the prefill-start mirror clear.
+    pub(crate) fn release_kv_slot(&mut self, slot: usize) -> Result<()> {
         if slot >= self.num_slots {
-            return;
+            return Ok(());
         }
         let parked = std::mem::take(&mut self.recall_keepalive[slot]);
         if let Some(pool) = self.full_attn_kv.as_mut() {
             for (_logical, physical) in parked {
                 pool.release_evicted_page(physical);
             }
-            pool.free_slot(slot);
+            pool.mirror_slot(slot, &[], 0)?;
         }
-    }
-
-    pub(crate) fn kv_device_gate_active(&self) -> bool {
-        self.full_attn_kv.is_some()
-    }
-
-    /// Per-row fit against `full_attn_kv`'s true headroom (reflects
-    /// recall-keepalive retention the host accounting pool cannot see):
-    /// every row whose engine-projected `pages_hint` overdraws the pool is
-    /// pushed unfit; fitting rows debit cumulatively.
-    pub(crate) fn kv_device_fit(
-        &self,
-        rows: &[infer_seam::DeviceRowDemand],
-        unfit: &mut Vec<usize>,
-    ) {
-        let Some(pool) = self.full_attn_kv.as_ref() else {
-            return;
-        };
-        let mut free = pool.free_page_count();
-        for (idx, row) in rows.iter().enumerate() {
-            if free < row.pages_hint {
-                unfit.push(idx);
-            } else {
-                free -= row.pages_hint;
-            }
-        }
+        Ok(())
     }
 
     /// Restore the recurrent sidecar for a page-radix prefix hit, returning the
     /// ABSOLUTE token length restored — `matched_len` on an exact hit, or the
     /// largest periodic stride boundary `B ≤ matched_len` whose sidecar is present
     /// (a cross-conversation hit where no sidecar was saved exactly at
-    /// `matched_len`). Acquires recurrent buffers, restores state + full-attn
-    /// KV[0..B], and sets the device pool seq_len to `B` for the
+    /// `matched_len`). Acquires recurrent buffers, restores the recurrent state,
+    /// mirrors the prefix's own pages, and sets the device pool seq_len to `B` for the
     /// `prefill_row_paged_default` invariant; the engine truncates the host pool
     /// to `B` and re-prefills `[B..prompt]`. A MISS at every boundary returns
     /// `Err` so the caller full-recomputes.
@@ -546,7 +521,7 @@ impl Qwen35CudaExecutor {
         slot: usize,
         tokens: &[u32],
         matched_len: usize,
-        _prefix_pages: &[u32],
+        prefix_pages: &[u32],
     ) -> anyhow::Result<usize> {
         let matched_len = matched_len.min(tokens.len());
         if std::env::var_os("ARLE_KVDRIFT_DEBUG").is_some() {
@@ -559,7 +534,7 @@ impl Qwen35CudaExecutor {
                 slot,
                 matched_len,
                 tokens.len(),
-                _prefix_pages.len(),
+                prefix_pages.len(),
                 self.slots[slot].seq_len(),
                 pool_len,
             );
@@ -617,7 +592,7 @@ impl Qwen35CudaExecutor {
             // full-recomputes. Must clean up full_attn_kv and seq_len here — the
             // caller's Err handler won't do it.
             if let Some(pool) = self.full_attn_kv.as_mut() {
-                pool.free_slot(slot);
+                pool.mirror_slot(slot, &[], 0)?;
             }
             self.slots[slot].set_seq_len(0);
             return Err(anyhow::anyhow!(
@@ -631,21 +606,19 @@ impl Qwen35CudaExecutor {
         self.slots[slot].restore_recurrent_from_snapshot(&self.model.ctx, &snap)?;
         self.slots[slot].set_seq_len(boundary);
 
-        // Rebuild the device KV pool to EXACTLY `boundary` pages, restoring
-        // KV[0..boundary] from the blob; the re-prefill of [boundary..prompt]
-        // allocates fresh tail pages (never reuses the radix [B..matched_len] KV).
+        // Point the device pool at the restored prefix's OWN pages. The engine
+        // already attached `prefix_pages` to the host slot, and host page ids
+        // index the device pool's storage rows 1:1, so the prefix's KV is read
+        // straight out of HBM — the sidecar carries recurrent state only. The
+        // re-prefill of [boundary..prompt] mirrors the host's fresh tail pages.
         if let Some(pool) = self.full_attn_kv.as_mut() {
-            pool.free_slot(slot);
-            let new_pages = pool.alloc_tokens(slot, boundary).map_err(|e| {
-                anyhow::anyhow!("device pool prefix alloc failed for slot {slot}: {e}")
-            })?;
-            if let Some(kv_data) = snap.full_attn_kv.as_deref() {
-                pool.copy_pages_from_host(&self.model.ctx, &new_pages, kv_data)
-                    .map_err(|e| {
-                        anyhow::anyhow!("device pool KV H2D restore failed for slot {slot}: {e}")
-                    })?;
-            }
-            // Stream-order: H2D above is ordered before subsequent kernels; no explicit sync needed.
+            let need = boundary.div_ceil(SUPPORTED_PAGE_SIZE);
+            ensure!(
+                prefix_pages.len() >= need,
+                "prefix restore: {} attached pages cover less than boundary {boundary} for slot {slot}",
+                prefix_pages.len()
+            );
+            pool.mirror_slot(slot, &prefix_pages[..need], boundary)?;
         }
         // Fresh prefill sequence for [boundary..prompt]: drop any prior occupant's
         // periodic snapshots so this request's saves never inherit stale entries.
@@ -751,7 +724,7 @@ impl Qwen35CudaExecutor {
     /// device restore is complete before the host image can be dropped. Exactly
     /// TWO collectives on every path (read+parse consensus, restore consensus) —
     /// nothing rank-local errs between them.
-    pub(crate) fn promote_slot(&mut self, key: u64, slot: usize) -> Result<()> {
+    pub(crate) fn promote_slot(&mut self, key: u64, slot: usize, slot_pages: &[u32]) -> Result<()> {
         ensure!(
             slot < self.num_slots,
             "Qwen3.6 promote slot {slot} outside executor slots {}",
@@ -798,6 +771,7 @@ impl Qwen35CudaExecutor {
                 gdr_len,
                 conv_len,
                 &image,
+                slot_pages,
             )
         };
         let restore_ok = usize::from(restored.is_ok());
@@ -1395,6 +1369,7 @@ impl Qwen35CudaExecutor {
         &mut self,
         row: &infer_plan::PrefillRow,
         position: u64,
+        host_kv: &dyn KvPool,
     ) -> Result<(u32, Option<f32>)> {
         let slot = row.slot;
         if std::env::var_os("ARLE_KVDRIFT_DEBUG").is_some() {
@@ -1413,25 +1388,24 @@ impl Qwen35CudaExecutor {
             );
         }
         {
+            // The device pool must hold exactly `start_pos` tokens before the
+            // append. On a prefix hit that is the restored prefix's length, whose
+            // pages the host pool already attached — mirroring them is what makes
+            // the hit free. A mismatch means an upstream restore left the two
+            // pools' cursors apart.
             let pool = self
                 .full_attn_kv
-                .as_mut()
+                .as_ref()
                 .expect("full_attn_kv present (full_attn_paged)");
-            // The pool must hold exactly `start_pos` tokens before appending the
-            // tail. `free_slot` runs at `start_pos == 0` in `submit_prefill_row`;
-            // prefix reuse (start_pos > 0) is gated off for hybrid models by
-            // `reusable_prefix_blocks` returning 0, so this path always sees
-            // start_pos == 0. A mismatch here would mean a soundness gate failed.
             ensure!(
                 pool.seq_len(slot) == row.start_pos,
-                "Qwen3.6 default-paged prefill: device pool seq_len {} != start_pos {} for slot {} \
-                 (reusable_prefix_blocks soundness gate bypassed)",
+                "Qwen3.6 default-paged prefill: device pool seq_len {} != start_pos {} for slot {}",
                 pool.seq_len(slot),
                 row.start_pos,
                 slot
             );
-            pool.alloc_tokens(slot, row.tokens.len())?;
         }
+        self.mirror_host_slot(host_kv, slot, row.start_pos + row.tokens.len())?;
         let meta = {
             let pool = self.full_attn_kv.as_ref().expect("full_attn_kv present");
             crate::loader::PageMeta::for_slot(
@@ -1519,12 +1493,13 @@ impl Qwen35CudaExecutor {
         &mut self,
         row: &DecodeRow,
         position: u64,
+        host_kv: &dyn KvPool,
     ) -> Result<(u32, Option<f32>)> {
         let slot = row.slot;
         {
             let pool = self
                 .full_attn_kv
-                .as_mut()
+                .as_ref()
                 .expect("full_attn_kv present (full_attn_paged)");
             // The pool must already hold exactly this step's cache length before
             // appending the new token; a mismatch means an upstream prefill left
@@ -1538,8 +1513,8 @@ impl Qwen35CudaExecutor {
                 row.kv_seq_len,
                 slot
             );
-            pool.alloc_tokens(slot, 1)?;
         }
+        self.mirror_host_slot(host_kv, slot, row.kv_seq_len + 1)?;
         let meta = {
             let pool = self.full_attn_kv.as_ref().expect("full_attn_kv present");
             crate::loader::PageMeta::for_slot(&self.model.ctx, pool, slot, row.kv_seq_len, 1)?
@@ -1574,7 +1549,11 @@ impl Qwen35CudaExecutor {
     /// tokens for this slot. Greedy rows verify by argmax match (token-exact
     /// to no-spec greedy); sampling rows by rejection sampling (exact w.r.t.
     /// the filtered target policy).
-    fn mtp_decode_row(&mut self, row: &DecodeRow) -> Result<Vec<SlotToken>> {
+    fn mtp_decode_row(
+        &mut self,
+        row: &DecodeRow,
+        host_kv: &mut dyn KvPool,
+    ) -> Result<Vec<SlotToken>> {
         ensure!(
             row.slot < self.num_slots,
             "decode slot {} outside Qwen3.5 executor slots {}",
@@ -1590,7 +1569,7 @@ impl Qwen35CudaExecutor {
                 Some(s) if s.pending == row.last_token
             );
         if !seeded {
-            let (token, logprob) = self.mtp_warm_decode_row(row)?;
+            let (token, logprob) = self.mtp_warm_decode_row(row, host_kv)?;
             return Ok(vec![SlotToken {
                 slot: row.slot,
                 token,
@@ -1598,7 +1577,7 @@ impl Qwen35CudaExecutor {
                 finish: None,
             }]);
         }
-        self.mtp_spec_row(row, depth)
+        self.mtp_spec_row(row, depth, host_kv)
     }
 
     /// Warm step: a single forward that ALSO captures the seed hidden + pending
@@ -1606,19 +1585,23 @@ impl Qwen35CudaExecutor {
     /// step. Returns the pending token as the
     /// decode output (the prefill already returned the first token; this is the
     /// second). The spec step starts from the stored (pending, hidden).
-    fn mtp_warm_decode_row(&mut self, row: &DecodeRow) -> Result<(u32, Option<f32>)> {
+    fn mtp_warm_decode_row(
+        &mut self,
+        row: &DecodeRow,
+        host_kv: &mut dyn KvPool,
+    ) -> Result<(u32, Option<f32>)> {
         let slot = row.slot;
         let start = row.kv_seq_len;
         if self.full_attn_paged() {
             {
-                let pool = self.full_attn_kv.as_mut().expect("paged (gated)");
+                let pool = self.full_attn_kv.as_ref().expect("paged (gated)");
                 ensure!(
                     pool.seq_len(slot) == start,
                     "MTP warm decode: pool seq_len {} != start {start} for slot {slot}",
                     pool.seq_len(slot),
                 );
-                pool.alloc_tokens(slot, 1)?;
             }
+            self.mirror_host_slot(host_kv, slot, start + 1)?;
             let meta = {
                 let pool = self.full_attn_kv.as_ref().expect("paged (gated)");
                 crate::loader::PageMeta::for_slot(&self.model.ctx, pool, slot, start, 1)?
@@ -1723,19 +1706,30 @@ impl Qwen35CudaExecutor {
     /// rolled back + the paged pool truncated to the accepted prefix. Returns the
     /// emitted tokens (accepted drafts + bonus); updates the seed state for the
     /// next step.
-    fn mtp_spec_row(&mut self, row: &DecodeRow, depth: usize) -> Result<Vec<SlotToken>> {
+    fn mtp_spec_row(
+        &mut self,
+        row: &DecodeRow,
+        depth: usize,
+        host_kv: &mut dyn KvPool,
+    ) -> Result<Vec<SlotToken>> {
         let slot = row.slot;
         let start = row.kv_seq_len;
-        // The verify forward appends depth+1 tokens; allocate the paged pool
-        // upfront (paged path only). On partial accept we truncate the excess.
+        // The verify forward appends depth+1 tokens. The engine pre-allocated one
+        // (the row's committed token); grow the host pool by the rest, then mirror
+        // — on partial accept we truncate both back to the accepted prefix, and
+        // `alloc_to_len_with_prefix_reclaim` makes the engine's post-step append of
+        // the accepted extras a no-op.
         if self.full_attn_paged() {
-            let pool = self.full_attn_kv.as_mut().expect("paged (gated)");
-            ensure!(
-                pool.seq_len(slot) == start,
-                "MTP spec decode: pool seq_len {} != start {start} for slot {slot}",
-                pool.seq_len(slot),
-            );
-            pool.alloc_tokens(slot, depth + 1)?;
+            {
+                let pool = self.full_attn_kv.as_ref().expect("paged (gated)");
+                ensure!(
+                    pool.seq_len(slot) == start,
+                    "MTP spec decode: pool seq_len {} != start {start} for slot {slot}",
+                    pool.seq_len(slot),
+                );
+            }
+            grow_host_slot_to(host_kv, slot, start + depth + 1)?;
+            self.mirror_host_slot(host_kv, slot, start + depth + 1)?;
         }
         let meta = if self.full_attn_paged() {
             let pool = self.full_attn_kv.as_ref().expect("paged (gated)");
@@ -1779,13 +1773,8 @@ impl Qwen35CudaExecutor {
                 rc.as_mut(),
             )?
         };
-        // Partial accept: truncate the paged pool to the accepted prefix.
-        if full_attn_kv.is_some() && emitted.len() < depth + 1 {
-            full_attn_kv
-                .as_mut()
-                .expect("paged (gated)")
-                .truncate_slot(slot, start + emitted.len())?;
-        }
+        // Partial accept: truncate both pools to the accepted prefix.
+        let truncate_to = (emitted.len() < depth + 1).then(|| start + emitted.len());
         // Commit: accumulate the spec-decode counters + update the next seed.
         let mtp_exec = mtp.as_mut().expect("mtp (gated)");
         let accepted = emitted.len() - 1;
@@ -1795,6 +1784,13 @@ impl Qwen35CudaExecutor {
         if let Some(st) = mtp_exec.slots[slot].as_mut() {
             st.pending = next_pending;
             st.hidden = next_hidden;
+        }
+        if let Some(len) = truncate_to
+            && let Some(pool) = full_attn_kv.as_mut()
+        {
+            host_kv.truncate_slot(slot, len)?;
+            let need = len.div_ceil(pool.page_size);
+            pool.mirror_slot(slot, &host_kv.page_indices(slot)[..need], len)?;
         }
         Ok(emitted
             .into_iter()
@@ -1814,16 +1810,17 @@ impl Qwen35CudaExecutor {
         &mut self,
         row: &DecodeRow,
         position: u64,
+        host_kv: &mut dyn KvPool,
     ) -> Result<(u32, Option<f32>)> {
         let slot = row.slot;
         if !self.full_attn_paged() {
             if let Some(df) = self.dspark.as_mut().and_then(|ds| ds.slots[slot].as_mut()) {
                 df.pending = None;
             }
-            return self.submit_decode_row(row, false);
+            return self.submit_decode_row(row, false, host_kv);
         }
         {
-            let pool = self.full_attn_kv.as_mut().expect("paged (checked)");
+            let pool = self.full_attn_kv.as_ref().expect("paged (checked)");
             ensure!(
                 pool.seq_len(slot) == row.kv_seq_len,
                 "Qwen3.6 dspark warm decode: pool seq_len {} != kv_seq_len {} for slot {}",
@@ -1831,8 +1828,8 @@ impl Qwen35CudaExecutor {
                 row.kv_seq_len,
                 slot
             );
-            pool.alloc_tokens(slot, 1)?;
         }
+        self.mirror_host_slot(host_kv, slot, row.kv_seq_len + 1)?;
         let meta = {
             let pool = self.full_attn_kv.as_ref().expect("paged (checked)");
             crate::loader::PageMeta::for_slot(&self.model.ctx, pool, slot, row.kv_seq_len, 1)?
@@ -1892,7 +1889,11 @@ impl Qwen35CudaExecutor {
     /// A row falls back to its own warm step (unpaged pool, chain past the
     /// trunk cap, no contiguous anchor, or an empty block) without stopping
     /// the rest of the tick.
-    fn dspark_decode_batch(&mut self, decode_rows: &[DecodeRow]) -> Result<Vec<SlotToken>> {
+    fn dspark_decode_batch(
+        &mut self,
+        decode_rows: &[DecodeRow],
+        host_kv: &mut dyn KvPool,
+    ) -> Result<Vec<SlotToken>> {
         let mut out: Vec<Vec<SlotToken>> = (0..decode_rows.len()).map(|_| Vec::new()).collect();
         let mut batch: Vec<DsparkChain> = Vec::with_capacity(decode_rows.len());
         let mut pt = crate::qwen35::dspark_phase_start(&self.model.ctx);
@@ -1946,7 +1947,7 @@ impl Qwen35CudaExecutor {
                 .filter(|(chain, _)| chain.len() >= 2);
             let Some((chain, partial_ctx)) = drafted else {
                 let (token, logprob) =
-                    self.dspark_warm_decode_row(row, start.saturating_add(1) as u64)?;
+                    self.dspark_warm_decode_row(row, start.saturating_add(1) as u64, host_kv)?;
                 out[i] = vec![SlotToken {
                     slot: row.slot,
                     token,
@@ -1996,14 +1997,14 @@ impl Qwen35CudaExecutor {
 
         // 3. Reserve + verify, all-or-nothing: seq_lens advance only on
         //    success, so any failure must give every reserved row back.
-        let logits = match self.dspark_verify_forward(&batch, &chains, total_rows) {
+        let logits = match self.dspark_verify_forward(&batch, &chains, total_rows, host_kv) {
             Ok(logits) => logits,
             Err(e) => {
-                let pool = self.full_attn_kv.as_mut().expect("paged (gated by seeded)");
                 for c in &batch {
-                    if pool.seq_len(c.slot) > c.start {
-                        pool.truncate_slot(c.slot, c.start)?;
+                    if host_kv.seq_len(c.slot) > c.start {
+                        host_kv.truncate_slot(c.slot, c.start)?;
                     }
+                    self.mirror_host_slot(host_kv, c.slot, c.start)?;
                 }
                 return Err(e);
             }
@@ -2095,10 +2096,11 @@ impl Qwen35CudaExecutor {
             }
             cap_ms += crate::qwen35::mtp_phase_lap(&model.ctx, &mut pt);
             if k + 1 < c.chain.len() {
-                full_attn_kv
-                    .as_mut()
-                    .expect("paged (gated by seeded)")
-                    .truncate_slot(c.slot, c.start + k + 1)?;
+                let len = c.start + k + 1;
+                let pool = full_attn_kv.as_mut().expect("paged (gated by seeded)");
+                host_kv.truncate_slot(c.slot, len)?;
+                let need = len.div_ceil(pool.page_size);
+                pool.mirror_slot(c.slot, &host_kv.page_indices(c.slot)[..need], len)?;
             }
             trunc_ms += crate::qwen35::mtp_phase_lap(&model.ctx, &mut pt);
             model.dspark_append_ctx(&ds.head, df, &mut ds.scratch, c.row0, k + 1, c.start)?;
@@ -2139,7 +2141,25 @@ impl Qwen35CudaExecutor {
         batch: &[DsparkChain],
         chains: &[u32],
         total_rows: usize,
+        host_kv: &mut dyn KvPool,
     ) -> Result<cuda_kernels::prelude::HiddenStates> {
+        // One forward writes each chain's whole KV, past the single token the
+        // engine pre-allocated per row: grow the host pool to cover it, then
+        // mirror. The caller truncates both pools back on partial accept.
+        for c in batch {
+            {
+                let pool = self.full_attn_kv.as_ref().expect("paged (gated by seeded)");
+                ensure!(
+                    pool.seq_len(c.slot) == c.start,
+                    "Qwen3.6 dspark verify: pool seq_len {} != start {} for slot {}",
+                    pool.seq_len(c.slot),
+                    c.start,
+                    c.slot
+                );
+            }
+            grow_host_slot_to(host_kv, c.slot, c.start + c.chain.len())?;
+            self.mirror_host_slot(host_kv, c.slot, c.start + c.chain.len())?;
+        }
         let Self {
             model,
             slots,
@@ -2150,18 +2170,10 @@ impl Qwen35CudaExecutor {
         } = self;
         let ds = dspark.as_mut().expect("dspark");
         let pool = full_attn_kv.as_mut().expect("paged (gated by seeded)");
-        let mut rows = Vec::with_capacity(batch.len());
-        for c in batch {
-            ensure!(
-                pool.seq_len(c.slot) == c.start,
-                "Qwen3.6 dspark verify: pool seq_len {} != start {} for slot {}",
-                pool.seq_len(c.slot),
-                c.start,
-                c.slot
-            );
-            pool.alloc_tokens(c.slot, c.chain.len())?;
-            rows.push((c.slot, c.start, c.chain.len()));
-        }
+        let rows: Vec<_> = batch
+            .iter()
+            .map(|c| (c.slot, c.start, c.chain.len()))
+            .collect();
         let meta = crate::loader::PageMeta::for_rows(&model.ctx, pool, &rows)?;
         let mut rc = crate::qwen35::Qwen35RecallForward {
             pool,
@@ -2206,16 +2218,11 @@ impl Qwen35CudaExecutor {
         &mut self,
         row: &infer_plan::PrefillRow,
         position: u64,
+        host_kv: &mut dyn KvPool,
     ) -> Result<(u32, Option<f32>)> {
         let slot = row.slot;
         let cfg = self.recall_cfg;
-        {
-            let pool = self
-                .full_attn_kv
-                .as_mut()
-                .expect("full_attn_kv present (recall_active)");
-            pool.alloc_tokens(slot, row.tokens.len())?;
-        }
+        self.mirror_host_slot(host_kv, slot, row.start_pos + row.tokens.len())?;
         let meta = {
             let pool = self.full_attn_kv.as_ref().expect("full_attn_kv present");
             crate::loader::PageMeta::for_slot(
@@ -2307,9 +2314,14 @@ impl Qwen35CudaExecutor {
                 Ok(p) => p.into_owned(),
                 Err(_) => continue,
             };
-            if let Some(pool) = self.full_attn_kv.as_mut()
-                && let Some(new_page) = pool.reinstate_slot_page(slot, logical)
-            {
+            // Reinstate on the host single-allocator (it owns the free stack),
+            // mirror the refreshed table down, then refill the page's KV.
+            let Some(new_page) = host_kv.reinstate_slot_page(slot, logical) else {
+                continue;
+            };
+            let seq_len = host_kv.seq_len(slot);
+            self.mirror_host_slot(host_kv, slot, seq_len)?;
+            if let Some(pool) = self.full_attn_kv.as_mut() {
                 pool.copy_pages_from_host(&self.model.ctx, &[new_page], &payload)?;
             }
         }
@@ -2346,6 +2358,9 @@ impl Qwen35CudaExecutor {
             if !mirrored {
                 continue; // tier full → keep page resident (no KV loss)
             }
+            // Host first (it owns the free stack); the device pool's sentinel
+            // comes back down with the next mirror.
+            host_kv.evict_slot_page(slot, logical);
             if let Some(pool) = self.full_attn_kv.as_mut() {
                 pool.evict_slot_page(slot, logical);
             }
@@ -2355,15 +2370,14 @@ impl Qwen35CudaExecutor {
 
     /// One decode row over the recall pool (`--kv-recall`): append + attend, ZERO tier I/O.
     /// Working set fixed at prefill. Alloc token, read fixed `recall_pages`, forward + sample.
-    fn decode_row_recall(&mut self, row: &DecodeRow, position: u64) -> Result<(u32, Option<f32>)> {
+    fn decode_row_recall(
+        &mut self,
+        row: &DecodeRow,
+        position: u64,
+        host_kv: &mut dyn KvPool,
+    ) -> Result<(u32, Option<f32>)> {
         let slot = row.slot;
-        {
-            let pool = self
-                .full_attn_kv
-                .as_mut()
-                .expect("full_attn_kv present (recall_active)");
-            pool.alloc_tokens(slot, 1)?;
-        }
+        self.mirror_host_slot(host_kv, slot, row.kv_seq_len + 1)?;
         let cache_len = row.kv_seq_len + 1;
         let recall_pages: Vec<u32> = match self.recall.get(slot).and_then(|s| s.recall_pages()) {
             Some(p) => p.to_vec(),
@@ -2589,7 +2603,16 @@ impl Qwen35CudaExecutor {
         Ok(())
     }
 
-    pub(crate) fn submit(&mut self, plan: &ForwardPlan) -> Result<StepOutput> {
+    pub(crate) fn submit(
+        &mut self,
+        plan: &ForwardPlan,
+        host_kv: &mut dyn KvPool,
+    ) -> Result<StepOutput> {
+        ensure!(
+            host_kv.page_size() == SUPPORTED_PAGE_SIZE,
+            "host CudaKvPool page_size={} does not match Qwen3.5 device page_size={SUPPORTED_PAGE_SIZE}",
+            host_kv.page_size()
+        );
         let rows = plan.decode_rows.len() + plan.prefill_rows.len();
         if rows == 0 {
             return Ok(StepOutput { tokens: Vec::new() });
@@ -2618,7 +2641,7 @@ impl Qwen35CudaExecutor {
 
         let mut tokens = Vec::with_capacity(rows);
         for row in &plan.prefill_rows {
-            let (token, logprob) = self.submit_prefill_row(row)?;
+            let (token, logprob) = self.submit_prefill_row(row, host_kv)?;
             tokens.push(SlotToken {
                 slot: row.slot,
                 token,
@@ -2626,7 +2649,7 @@ impl Qwen35CudaExecutor {
                 finish: None,
             });
         }
-        tokens.extend(self.dispatch_decode_rows(&plan.decode_rows, allow_graph)?);
+        tokens.extend(self.dispatch_decode_rows(&plan.decode_rows, allow_graph, host_kv)?);
         Ok(StepOutput { tokens })
     }
 
@@ -2650,6 +2673,7 @@ impl Qwen35CudaExecutor {
         &mut self,
         decode_rows: &[DecodeRow],
         allow_graph: bool,
+        host_kv: &mut dyn KvPool,
     ) -> Result<Vec<SlotToken>> {
         use super::spec_decode::{DecodeRoute, SpecKind};
         let kind = self.spec_kind();
@@ -2660,18 +2684,18 @@ impl Qwen35CudaExecutor {
             crate::runtime_flags::spec_max_batch()
         };
         match super::spec_decode::route_decode(kind, decode_rows.len(), gate) {
-            DecodeRoute::Dspark => self.dspark_decode_batch(decode_rows),
+            DecodeRoute::Dspark => self.dspark_decode_batch(decode_rows, host_kv),
             DecodeRoute::Mtp => {
                 let mut tokens = Vec::with_capacity(decode_rows.len());
                 for row in decode_rows {
-                    tokens.extend(self.mtp_decode_row(row)?);
+                    tokens.extend(self.mtp_decode_row(row, host_kv)?);
                 }
                 Ok(tokens)
             }
             DecodeRoute::Plain => match decode_rows {
                 [] => Ok(Vec::new()),
                 [row] => {
-                    let (token, logprob) = self.submit_decode_row(row, allow_graph)?;
+                    let (token, logprob) = self.submit_decode_row(row, allow_graph, host_kv)?;
                     Ok(vec![SlotToken {
                         slot: row.slot,
                         token,
@@ -2679,14 +2703,18 @@ impl Qwen35CudaExecutor {
                         finish: None,
                     }])
                 }
-                rows => self.submit_decode_batch(rows),
+                rows => self.submit_decode_batch(rows, host_kv),
             },
         }
     }
 
     /// One prefill row as its own single-row sub-step (the pre-batching
     /// single-row prefill arm, factored).
-    fn submit_prefill_row(&mut self, row: &infer_plan::PrefillRow) -> Result<(u32, Option<f32>)> {
+    fn submit_prefill_row(
+        &mut self,
+        row: &infer_plan::PrefillRow,
+        host_kv: &mut dyn KvPool,
+    ) -> Result<(u32, Option<f32>)> {
         ensure!(
             row.slot < self.num_slots,
             "prefill slot {} outside Qwen3.5 executor slots {}",
@@ -2767,7 +2795,7 @@ impl Qwen35CudaExecutor {
                     for (_logical, physical) in parked {
                         pool.release_evicted_page(physical);
                     }
-                    pool.free_slot(row.slot);
+                    pool.mirror_slot(row.slot, &[], 0)?;
                 }
                 // Stale L3 tier entries keyed by (slot, logical) from the prior
                 // occupant are left to the store's LRU/capacity eviction: re-recall
@@ -2777,20 +2805,21 @@ impl Qwen35CudaExecutor {
                 // without a per-session key registry (the dense arm's
                 // `drop_tier_session` makes the same call, see its doc).
             } else if let Some(pool) = self.full_attn_kv.as_mut() {
-                // Default paged (no recall): just recycle the slot's pages.
-                pool.free_slot(row.slot);
+                // Default paged (no recall): drop the mirror; the host pool owns
+                // the pages and already recycled or radix-retained them.
+                pool.mirror_slot(row.slot, &[], 0)?;
             }
         }
         let position = (row.start_pos + row.tokens.len()) as u64;
         if self.recall_active() {
-            return self.prefill_row_recall(row, position);
+            return self.prefill_row_recall(row, position, host_kv);
         }
         // Default paged prefill: full attention over all resident pages, no
         // eviction (the dense model applied to Qwen3.6 — Phase 2).
         if self.slots[row.slot].has_recurrent() {
-            return self.prefill_row_snapshotted(row, position);
+            return self.prefill_row_snapshotted(row, position, host_kv);
         }
-        self.prefill_row_paged_default(row, position)
+        self.prefill_row_paged_default(row, position, host_kv)
     }
 
     /// Prefill a hybrid row, splitting the forward at recurrent-snapshot
@@ -2816,6 +2845,7 @@ impl Qwen35CudaExecutor {
         &mut self,
         row: &infer_plan::PrefillRow,
         position: u64,
+        host_kv: &dyn KvPool,
     ) -> Result<(u32, Option<f32>)> {
         let start = row.start_pos;
         let end = start + row.tokens.len();
@@ -2864,7 +2894,7 @@ impl Qwen35CudaExecutor {
                     total_tokens: row.total_tokens,
                     params: row.params.clone(),
                 };
-                self.prefill_row_paged_default(&seg, cut as u64)?; // token discarded
+                self.prefill_row_paged_default(&seg, cut as u64, host_kv)?; // token discarded
                 cursor = cut;
             }
             // State is now materialized at exactly `cut` (either forwarded to it,
@@ -2878,7 +2908,7 @@ impl Qwen35CudaExecutor {
             did_cut = true;
         }
         if !did_cut {
-            return self.prefill_row_paged_default(row, position); // no boundary crossed
+            return self.prefill_row_paged_default(row, position, host_kv); // no boundary crossed
         }
         // Final tail `[cursor..end]` (cuts are all `< end`, so this is non-empty).
         let tail = infer_plan::PrefillRow {
@@ -2888,7 +2918,7 @@ impl Qwen35CudaExecutor {
             total_tokens: row.total_tokens,
             params: row.params.clone(),
         };
-        self.prefill_row_paged_default(&tail, position)
+        self.prefill_row_paged_default(&tail, position, host_kv)
     }
 
     /// One decode row as a single-row forward (the pre-batching single-row
@@ -2898,6 +2928,7 @@ impl Qwen35CudaExecutor {
         &mut self,
         row: &DecodeRow,
         allow_graph: bool,
+        host_kv: &mut dyn KvPool,
     ) -> Result<(u32, Option<f32>)> {
         ensure!(
             row.slot < self.num_slots,
@@ -2934,7 +2965,7 @@ impl Qwen35CudaExecutor {
         // above still holds — the slot's seq_len is advanced in lockstep inside
         // the recall forward.
         if self.recall_active() {
-            return self.decode_row_recall(row, position);
+            return self.decode_row_recall(row, position, host_kv);
         }
         // Default paged decode: append + attend the full resident page set. The
         // whole-step decode-graph lane bakes per-step device addresses (the page
@@ -2943,7 +2974,7 @@ impl Qwen35CudaExecutor {
         // for the legacy contiguous path) is a contiguous-cache optimization a
         // later phase re-enables over a stable paged table.
         if self.full_attn_paged() {
-            return self.decode_row_paged_default(row, position);
+            return self.decode_row_paged_default(row, position, host_kv);
         }
         // Legacy contiguous path (no paged pool — e.g. OPD weight offload dropped
         // it): the whole-step graph lane first (opt-in), with eager
@@ -2983,7 +3014,11 @@ impl Qwen35CudaExecutor {
     /// batch-only workspace). The per-step position is read from a staged
     /// device scalar at replay, so a slot's seq_len advancing via a batched
     /// step replays correctly on its next single-row graphed step.
-    fn submit_decode_batch(&mut self, rows: &[DecodeRow]) -> Result<Vec<SlotToken>> {
+    fn submit_decode_batch(
+        &mut self,
+        rows: &[DecodeRow],
+        host_kv: &mut dyn KvPool,
+    ) -> Result<Vec<SlotToken>> {
         debug_assert!(rows.len() > 1);
         // Per-row watermark/validation BEFORE any device mutation (dup-slot
         // ensure ran at plan level in `submit`).
@@ -3016,13 +3051,13 @@ impl Qwen35CudaExecutor {
                 && !self.recall_active()
                 && self.model.tp.is_single()
             {
-                return self.submit_decode_batch_paged(rows);
+                return self.submit_decode_batch_paged(rows, host_kv);
             }
             // Correctness floor: recall / quant-KV / TP → serial per-row paged.
             let mut tokens = Vec::with_capacity(rows.len());
             for row in rows {
                 let (token, logprob) =
-                    self.submit_decode_row(row, /* allow_graph = */ false)?;
+                    self.submit_decode_row(row, /* allow_graph = */ false, host_kv)?;
                 tokens.push(SlotToken {
                     slot: row.slot,
                     token,
@@ -3039,7 +3074,7 @@ impl Qwen35CudaExecutor {
             let mut tokens = Vec::with_capacity(rows.len());
             for row in rows {
                 let (token, logprob) =
-                    self.submit_decode_row(row, /* allow_graph = */ false)?;
+                    self.submit_decode_row(row, /* allow_graph = */ false, host_kv)?;
                 tokens.push(SlotToken {
                     slot: row.slot,
                     token,
@@ -3110,19 +3145,23 @@ impl Qwen35CudaExecutor {
     /// B sequential single-row paged decodes (each row attends only its own
     /// slot's pages via its `kv_indptr` slice). BF16 single-GPU, no recall (gated
     /// by the caller in `submit_decode_batch`).
-    fn submit_decode_batch_paged(&mut self, rows: &[DecodeRow]) -> Result<Vec<SlotToken>> {
+    fn submit_decode_batch_paged(
+        &mut self,
+        rows: &[DecodeRow],
+        host_kv: &mut dyn KvPool,
+    ) -> Result<Vec<SlotToken>> {
         debug_assert!(rows.len() > 1);
         // Append this step's token to every row's slot BEFORE building the page
         // table (the pool must hold the POST-append length the meta encodes). The
         // pool seq_len must equal the engine's kv_seq_len pre-append, exactly as
         // `decode_row_paged_default` checks — a mismatch means an upstream prefill
         // left the slot inconsistent (e.g. leaked radix reuse).
-        {
-            let pool = self
-                .full_attn_kv
-                .as_mut()
-                .expect("full_attn_kv present (full_attn_paged)");
-            for row in rows {
+        for row in rows {
+            {
+                let pool = self
+                    .full_attn_kv
+                    .as_ref()
+                    .expect("full_attn_kv present (full_attn_paged)");
                 ensure!(
                     pool.seq_len(row.slot) == row.kv_seq_len,
                     "Qwen3.6 paged batched decode: pool seq_len {} != kv_seq_len {} for slot {}",
@@ -3130,8 +3169,8 @@ impl Qwen35CudaExecutor {
                     row.kv_seq_len,
                     row.slot
                 );
-                pool.alloc_tokens(row.slot, 1)?;
             }
+            self.mirror_host_slot(host_kv, row.slot, row.kv_seq_len + 1)?;
         }
 
         let slot_indices: Vec<usize> = rows.iter().map(|r| r.slot).collect();
@@ -3274,7 +3313,12 @@ impl Qwen35CudaExecutor {
             ..
         } = self;
         let pool = full_attn_kv.as_mut().expect("full_attn_kv present");
-        pool.alloc_tokens(kv_slot, input_ids.len())?;
+        // Mirror model: claim detached pages and mirror them in rather than
+        // running the device pool's slot allocator, which must not be mixed with
+        // `mirror_slot` on the same pool. No scheduler row here — this transient
+        // forward has no host pool to lower from.
+        let scratch = pool.alloc_detached_pages(input_ids.len().div_ceil(pool.page_size))?;
+        pool.mirror_slot(kv_slot, &scratch, input_ids.len())?;
         let result =
             crate::loader::PageMeta::for_slot(&model.ctx, pool, kv_slot, 0, input_ids.len())
                 .and_then(|meta| {
@@ -3292,7 +3336,8 @@ impl Qwen35CudaExecutor {
                     )
                 });
         let pool = self.full_attn_kv.as_mut().expect("full_attn_kv present");
-        pool.free_slot(kv_slot);
+        pool.mirror_slot(kv_slot, &[], 0)?;
+        pool.release_pages(&scratch);
         result
     }
 
