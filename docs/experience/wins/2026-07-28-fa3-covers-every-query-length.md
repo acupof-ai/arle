@@ -26,21 +26,36 @@ only a few 17-row GEMMs are added. The honest ceiling is ~1.05×.
 
 ## What Worked
 
-One predicate, not two paths. Per-request `seqlen_q` from `meta.q_offsets`,
-causal (the shim demotes to non-causal at qlen 1), split-KV only below 64 query
-rows — a real prefill chunk already fills the SMs. The vendored units needed
-nothing: `arle_fa3_shim.cu` sizes `out_accum`/`softmax_lse` by `seqlen_q`
-already, and both paged dispatches (Split true/false) are compiled.
+Per-request `seqlen_q` from `meta.q_offsets`, causal (the shim demotes to
+non-causal at qlen 1), split-KV always. The vendored units needed nothing:
+`arle_fa3_shim.cu` sizes `out_accum`/`softmax_lse` by `seqlen_q` already, and
+both paged dispatches (Split true/false) are compiled.
 
-Prefill chunks now take FA3 too, which is what makes it one predicate instead
-of a widened special case.
+I first widened it to **every** query length, prefill included. That regressed
+TTFT p50 51% at c=8 and is reverted — the gate is `FA3_MAX_QLEN = 64`, so
+decode and verify take FA3 and prefill chunks keep the TileLang paged kernel
+([entry](../errors/2026-07-28-fa3-prefill-per-request-launch-regression.md)).
 
-Needle gate on the new binary (`needle_gate.py 512,4096,16384,32768 3 0.0`,
-`qwen3_nonthink`, RAW): **exact=3 miss=0 DET at every length**. No-spec decode
-unchanged — ITL p50 26.34 vs 26.1 ms — so the widened predicate costs the path
-that already had FA3 nothing.
+Needle gate, `needle_gate.py 512,4096,16384,32768 3 0.0` (`qwen3_nonthink`,
+RAW): **exact=3 miss=0 DET at every length**, on the dense 27B **and** on
+`Qwen3.6-35B-A3B-FP8`. The MoE needed no work — its `head_dim` is also 256 and
+it shares `full_attention_paged`; it only diverges at the FFN. It does exercise
+a GQA ratio of 8 against the dense model's 6, which PackGQA had not been
+checked at.
 
-Bench: pending-remote.
+Decode, c=1, `bench-agent-32k-16x8`, token-weighted mean ITL:
+
+| | no-spec | DSpark 16 |
+|---|---:|---:|
+| all turns | 29.68 ms (33.7 tok/s) | **9.55 ms (104.7)** |
+| warm turns | 30.24 ms (33.1) | **9.06 ms (110.4)** |
+
+**3.11× per token**, up from 1.48× before the verify path reached FA3. The
+verify step now costs 9.55 × E[k+1]=3.19 ≈ 30.5 ms against a 29.68 ms decode
+step — **1.03×**, which is the floor: verifying 17 tokens reads the same KV
+bytes as verifying 1.
+
+c=8/16 pending-remote on the capped-gate binary.
 
 ## Problems
 
