@@ -1170,11 +1170,18 @@ impl Qwen35Layer {
     ) -> Result<TensorId> {
         match &self.mlp {
             Qwen35Mlp::Dense(mlp) => {
-                let gate = mlp.gate_proj.forward(h, store, tape)?;
+                let gate_raw = mlp.gate_proj.forward(h, store, tape)?;
                 let up = mlp.up_proj.forward(h, store, tape)?;
-                let gate = silu(gate, store, tape)?;
+                let gate = silu(gate_raw, store, tape)?;
                 let act = mul(gate, up, store, tape)?;
                 let mlp_out = mlp.down_proj.forward(act, store, tape)?;
+                // tape-disabled checkpoint forward: free dead transients now
+                // instead of at closure exit, cutting the single-layer peak.
+                if !tape.enabled {
+                    for id in [gate_raw, gate, up, act] {
+                        store.free(id)?;
+                    }
+                }
                 maybe_tp_all_reduce(mlp_out, tp, store, tape)
             }
             Qwen35Mlp::Sparse(mlp) => {
