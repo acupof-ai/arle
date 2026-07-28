@@ -646,6 +646,30 @@ unsafe extern "C" {
         stream: super::CUstream,
     ) -> super::CUresult;
 
+    // SGLang sparse_mla_q8kv8_prefill_sm90: native FP8 (q8 x kv8) sparse MLA
+    // prefill. q/kv are fp8 device pointers (per-tensor scale 1.0); out is
+    // bf16. d_qk ∈ {512, 576}, d_v = 512, h_kv = 1. See
+    // csrc/attention/arle_q8kv8_prefill_shim.cu.
+    pub fn arle_q8kv8_sparse_prefill_fwd(
+        q: *const u8,
+        kv: *const u8,
+        indices: *const i32,
+        q_scale: *const f32,
+        kv_scale: *const f32,
+        attn_sink: *const f32,
+        topk_length: *const i32,
+        out: *mut super::Half,
+        max_logits: *mut f32,
+        lse: *mut f32,
+        s_q: i32,
+        s_kv: i32,
+        h_q: i32,
+        d_qk: i32,
+        topk: i32,
+        sm_scale: f32,
+        stream: super::CUstream,
+    ) -> super::CUresult;
+
     // FlashMLA SM90 sparse FP8 decode (vendored sgl-project/FlashMLA @ df022eb).
     //
     // Wraps `sm90::decode::sparse_fp8::run_flash_splitkv_mla_fp8_sparse_kernel`
