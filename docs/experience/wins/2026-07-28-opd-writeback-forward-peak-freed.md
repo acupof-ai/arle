@@ -1,6 +1,11 @@
 # OPD writeback forward peak — as-you-go free — CUDA, 2026-07-28
 
-> Status: Shipped (commit `e736c485a`). Forward wall cleared; full step still OOMs in backward (next lever below).
+> Status: Shipped (commit `e736c485a`). Forward wall cleared. The full step
+> still OOMs in backward; that lever (seq-chunked attention forward-recompute in
+> the checkpoint replay) is a standalone autograd/kernel project, **deferred —
+> Phase 7a closed 2026-07-28**. See the Learnings note and the research doc's
+> backward per-op probe for why. 40960 single-card lossless writeback is not a
+> current product need; this win stands on its own target (forward peak freed).
 
 ## Goal
 
