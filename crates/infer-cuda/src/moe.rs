@@ -115,6 +115,10 @@ pub(crate) fn deepgemm_contig_rows_cap(
 /// CUDA-core kernels (pod A/B 2026-06-11: decode R=8 hand wins +8%, prefill
 /// R=16384 DeepGEMM wins -33% needle wall; 1024 = 128-token chunk x top-8
 /// keeps both measured regimes on their winning side).
+///
+/// The DEFAULT — the live value is `--qwen35-deepgemm-min-routes`, so the
+/// mid-band the A/B never covered (batched decode is `R = top_k * B`, so
+/// R=128 at c=16) is reachable without a rebuild.
 pub(crate) const QWEN35_DEEPGEMM_MIN_ROUTES: usize = 1024;
 
 /// Routed-row ceiling for the decode-specialized weight-read-bound grouped
@@ -538,7 +542,7 @@ mod gpu {
             || (weights.w13_fp8_grouped.is_some() && weights.down_fp8_grouped.is_some());
         let use_deepgemm = qwen35_deepgemm_enabled()
             && has_deepgemm_grouped
-            && num_tokens * topk >= QWEN35_DEEPGEMM_MIN_ROUTES;
+            && num_tokens * topk >= crate::runtime_flags::qwen35_deepgemm_min_routes();
         if !use_deepgemm {
             // Grouped-mode loads cleared the per-expert Vecs (the hand
             // kernels run through the rebuilt ptr tables into the grouped

@@ -2635,6 +2635,8 @@ fn try_flashmla_prefill_attention(
         {
             let (q_src, _qg) = q_prepared.data.device_ptr(&ctx.stream);
             let (q_dst, _dg) = q_fp8.device_ptr_mut(&ctx.stream);
+            // SAFETY: both buffers are live on ctx.stream and hold exactly
+            // q_elems elements; the cast writes that many and no more.
             unsafe {
                 ffi::arle_bf16_to_fp8_e4m3_cuda(
                     q_src as *const ffi::Half,
@@ -2648,6 +2650,8 @@ fn try_flashmla_prefill_attention(
         {
             let (kv_src, _kg) = kv_unified.data.device_ptr(&ctx.stream);
             let (kv_dst, _dg) = kv_fp8.device_ptr_mut(&ctx.stream);
+            // SAFETY: both buffers are live on ctx.stream and hold exactly
+            // kv_elems elements; the cast writes that many and no more.
             unsafe {
                 ffi::arle_bf16_to_fp8_e4m3_cuda(
                     kv_src as *const ffi::Half,
@@ -2663,6 +2667,8 @@ fn try_flashmla_prefill_attention(
         let (kv_fp8_ptr, _kfg) = kv_fp8.device_ptr(&ctx.stream);
         let (scale_ptr, _sg) = scale.device_ptr(&ctx.stream);
         // indices reuse FlashMLA prefill indices; topk_length=null → fixed topk
+        // SAFETY: q/kv are the fp8 buffers filled above, scale holds the two
+        // constants, and indices is FlashMLA's live prefill index buffer.
         unsafe {
             ffi::arle_q8kv8_sparse_prefill_fwd(
                 q_fp8_ptr as *const u8,
