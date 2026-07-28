@@ -871,6 +871,11 @@ pub(crate) struct ServeArgs {
     /// FA3 decode split count (clamped to [2, 256]).
     #[arg(long, default_value_t = 8, value_name = "N")]
     pub(crate) qwen35_fa3_decode_splits: usize,
+    /// Routed-row floor for the DeepGEMM grouped expert path (default 1024).
+    /// Batched decode is `R = top_k * B`, so 1024 keeps decode off DeepGEMM;
+    /// lower it to reach the uncharacterized mid-band.
+    #[arg(long, default_value_t = 1024)]
+    pub(crate) qwen35_deepgemm_min_routes: usize,
 
     /// FlashQLA chunked GDN prefill (sm_90a baked Qwen3.6 shard only).
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set, value_name = "BOOL")]
@@ -993,6 +998,7 @@ impl ServeArgs {
             qwen35_gpu_router: self.qwen35_gpu_router,
             qwen35_fa3: self.qwen35_fa3,
             qwen35_fa3_decode_splits: self.qwen35_fa3_decode_splits,
+            qwen35_deepgemm_min_routes: self.qwen35_deepgemm_min_routes,
             qwen35_gdr_chunked: self.qwen35_gdr_chunked,
             decode_metadata_fast_page16: self.decode_metadata_fast_page16,
             marlin_w4_fp8_prefill: self.marlin_w4_fp8_prefill,

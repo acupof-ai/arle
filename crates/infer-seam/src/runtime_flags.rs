@@ -22,6 +22,9 @@ fn d_true() -> bool {
 fn d_fa3_decode_splits() -> usize {
     8
 }
+fn d_deepgemm_min_routes() -> usize {
+    1024
+}
 fn d_dsa_indexer_sms() -> usize {
     78
 }
@@ -59,6 +62,11 @@ pub struct CudaRuntimeFlags {
     /// FA3 decode split count (clamped to \[2, 256\]).
     #[serde(default = "d_fa3_decode_splits")]
     pub qwen35_fa3_decode_splits: usize,
+    /// Routed-row floor for the DeepGEMM grouped expert path. Default 1024,
+    /// the compile-time `QWEN35_DEEPGEMM_MIN_ROUTES`; lower it to reach the
+    /// uncharacterized mid-band (batched decode is `R = top_k * B`).
+    #[serde(default = "d_deepgemm_min_routes")]
+    pub qwen35_deepgemm_min_routes: usize,
     /// FlashQLA chunked GDN prefill (sm_90a baked Qwen3.6 shard only).
     #[serde(default)]
     pub qwen35_gdr_chunked: bool,
@@ -123,6 +131,7 @@ impl Default for CudaRuntimeFlags {
             qwen35_gpu_router: true,
             qwen35_fa3: true,
             qwen35_fa3_decode_splits: d_fa3_decode_splits(),
+            qwen35_deepgemm_min_routes: d_deepgemm_min_routes(),
             qwen35_gdr_chunked: false,
             decode_metadata_fast_page16: false,
             marlin_w4_fp8_prefill: false,
