@@ -645,16 +645,18 @@ impl Qwen35Layer {
             tape,
         )?;
         checkpoint_replay_mem_stage(tape, store, "post_mlp_norm");
-        // Seq-chunk the MLP recompute when enabled (256K writeback lever): MLP is
-        // position-wise, so chunking is bit-identical up to add-order. Off-tape
-        // forward (checkpoint replay / no grad) keeps the single call.
-        let mlp_chunk = crate::runtime_flags::mlp_seq_chunk();
-        let mlp_out = if mlp_chunk > 0 && tape.enabled {
+        // Seq-adaptive MLP recompute chunking (256K writeback lever): MLP is
+        // position-wise, so chunking is bit-identical up to add-order. The peak
+        // scales with TOTAL rows = batch*seq (backward slices [batch,chunk,dim]),
+        // so gate on `batch*seq_len` — matching `writeback_offload_for_seq`. Below
+        // the threshold, run the plain block (no per-layer collect/clone).
+        let mlp_chunk = crate::runtime_flags::mlp_seq_chunk_for_seq(batch * seq_len);
+        let mlp_out = if mlp_chunk > 0 {
             let mut param_ids = Vec::new();
             collect_mlp_ids(&self.mlp, false, &mut param_ids);
             param_ids.retain(|&id| store.get(id).is_some_and(|t| t.requires_grad));
             let layer = self.clone();
-            let cfg = cfg.clone();
+            let cfg_owned = cfg.clone();
             autograd::ops::checkpoint_seq_chunked(
                 h,
                 param_ids,
@@ -668,7 +670,7 @@ impl Qwen35Layer {
                         .shape
                         .clone();
                     layer
-                        .forward_mlp(inp[0], &cfg, tp, shape[0], shape[1], st, tp_tape)
+                        .forward_mlp(inp[0], &cfg_owned, tp, shape[0], shape[1], st, tp_tape)
                         .map_err(qwen35_to_autograd)
                 },
             )?
