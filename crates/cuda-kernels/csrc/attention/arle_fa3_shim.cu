@@ -1,11 +1,16 @@
 // ARLE torch-free shim over vendored FA3 hopper fwd (hdim256, bf16, sm_90a).
 //
 // Replaces flash_api.cpp's torch surface with a C ABI; the param-fill mirrors
-// mha_fwd's non-varlen batch=1 flow exactly (vendor/flash-attention/hopper/
-// flash_api.cpp:849-1198 — set_params_fprop + the scheduler-semaphore block).
-// Step-1 scope:
-//   - b=1, contiguous q/o, contiguous slot KV viewed at exact seqlen_k
-//     (no seqused_k => is_varlen=false => no prepare_varlen machinery),
+// mha_fwd (vendor/flash-attention/hopper/flash_api.cpp:849-1198 —
+// set_params_fprop + the scheduler-semaphore block).
+//
+// ONE call per layer, whatever the batch: q/o are packed [total_q, h, d] with
+// `cu_seqlens_q` (so rows may have different query lengths — decode is qlen 1
+// everywhere, spec verify is one chain per row), and each row's KV extent comes
+// from `seqused_k` against a rectangular page table strided by
+// `page_table_batch_stride`. `seqused_k` does NOT drop the K/V batch strides —
+// only `cu_seqlens_k` does (flash_api.cpp:105-108) — which is what lets a paged
+// batch share one launch.
 //   - num_splits=1 for prefill; opt-in decode may pass num_splits>1
 //     (out_accum + softmax_lse_accum + combine), which forces PackGQA,
 //   - causal bottom-right alignment (chunked-prefill semantics), with the
@@ -58,8 +63,12 @@ typedef struct {
     float* out_accum;           // fp32 [splits, b=1, h, seqlen_q, d], split only
     float* softmax_lse_accum;   // fp32 [splits, b=1, h, seqlen_q], split only
     int* tile_count_semaphore;  // device i32 scratch (>= 1 element)
-    int seqlen_q;
-    int seqlen_k;
+    const int* cu_seqlens_q;    // i32 [batch+1] prefix sum over query rows
+    const int* seqused_k;       // i32 [batch] per-row KV extent in tokens
+    int batch;
+    int total_q;                // cu_seqlens_q[batch]
+    int seqlen_q;               // longest row's query length
+    int seqlen_k;               // longest row's KV length
     int num_heads;    // h   (Qwen3.6: 16)
     int num_heads_k;  // h_k (Qwen3.6: 2)
     int head_dim;     // must be 256
@@ -76,7 +85,8 @@ typedef struct {
     int num_splits;  // 1 = direct fwd; >1 = split-KV + combine (<=256)
     // Paged KV (null = contiguous): k/v are the pool base and the strides
     // describe one page, matching the HND pool [page, h_k, page_size, d].
-    const int* page_table;  // i32 page indices for this request
+    const int* page_table;  // i32 [batch, page_table_batch_stride]
+    long long page_table_batch_stride;
     int page_size;
     int num_pages;          // pages in the POOL (the 4th dim's extent)
     long long k_page_stride;  // elements between pages in the pool
@@ -87,7 +97,14 @@ cudaError_t arle_fa3_fwd_hd256_bf16_cuda(const ArleFa3FwdHd256Args* a,
                                          cudaStream_t stream) {
     if (a == nullptr || a->head_dim != 256 || a->seqlen_q <= 0 ||
         a->seqlen_k <= 0 || a->num_heads <= 0 || a->num_heads_k <= 0 ||
-        a->num_heads % a->num_heads_k != 0) {
+        a->num_heads % a->num_heads_k != 0 || a->batch <= 0 ||
+        a->total_q <= 0) {
+        return cudaErrorInvalidValue;
+    }
+    // Both null = one uniform row (the contiguous slot-cache lane); both set =
+    // a ragged batch sharing one launch. Upstream's own nullability contract.
+    const bool varlen = a->cu_seqlens_q != nullptr;
+    if (varlen != (a->seqused_k != nullptr) || (!varlen && a->batch != 1)) {
         return cudaErrorInvalidValue;
     }
 
@@ -107,11 +124,11 @@ cudaError_t arle_fa3_fwd_hd256_bf16_cuda(const ArleFa3FwdHd256Args* a,
     params.v_head_stride = a->v_head_stride;
     params.o_head_stride = a->o_head_stride;
     params.v_dim_stride = 1;
-    // b=1: batch strides are never walked past index 0, but mirror the
-    // non-varlen fill (flash_api.cpp:101-108) so the TMA descriptors see
-    // self-consistent extents. Take the larger of the row/head walks so both
-    // token-major ([S, h, d]) and head-major cache ([h_k, max_seq, d]) views
-    // yield a plausible batch extent.
+    // Varlen: q/o are packed and addressed through cu_seqlens_q, so their batch
+    // strides are never walked (flash_api.cpp:101-104 skips them). Otherwise
+    // mirror the non-varlen fill so the TMA descriptors see self-consistent
+    // extents; take the larger of the row/head walks so both token-major
+    // ([S, h, d]) and head-major cache ([h_k, max_seq, d]) views work.
     auto batch_extent = [](int64_t rows, int64_t row_stride, int64_t heads,
                            int64_t head_stride) {
         int64_t by_row = rows * row_stride;
@@ -119,7 +136,9 @@ cudaError_t arle_fa3_fwd_hd256_bf16_cuda(const ArleFa3FwdHd256Args* a,
         return by_row > by_head ? by_row : by_head;
     };
     params.q_batch_stride =
-        batch_extent(a->seqlen_q, a->q_row_stride, a->num_heads, a->q_head_stride);
+        varlen ? 0
+               : batch_extent(a->seqlen_q, a->q_row_stride, a->num_heads,
+                              a->q_head_stride);
     // Paged: FA3's 4th K/V dim is the page dim (launch template :98-100).
     params.k_batch_stride =
         a->page_table != nullptr
@@ -130,17 +149,21 @@ cudaError_t arle_fa3_fwd_hd256_bf16_cuda(const ArleFa3FwdHd256Args* a,
             ? a->v_page_stride
             : batch_extent(a->seqlen_k, a->v_row_stride, a->num_heads_k, a->v_head_stride);
     params.o_batch_stride =
-        batch_extent(a->seqlen_q, a->o_row_stride, a->num_heads, a->o_head_stride);
+        varlen ? 0
+               : batch_extent(a->seqlen_q, a->o_row_stride, a->num_heads,
+                              a->o_head_stride);
 
     params.softmax_lse_ptr = a->softmax_lse;
+    params.cu_seqlens_q = const_cast<int*>(a->cu_seqlens_q);
+    params.seqused_k = const_cast<int*>(a->seqused_k);
 
-    params.b = 1;
-    params.b_k = 1;
+    params.b = a->batch;
+    params.b_k = a->batch;
     params.h = a->num_heads;
     params.h_k = a->num_heads_k;
     params.seqlen_q = a->seqlen_q;
     params.seqlen_k = a->seqlen_k;
-    params.total_q = a->seqlen_q;
+    params.total_q = a->total_q;
     params.total_k = a->seqlen_k;
     params.seqlen_q_rounded = round_multiple(a->seqlen_q, 128);
     params.seqlen_k_rounded = round_multiple(a->seqlen_k, 128);
@@ -178,7 +201,7 @@ cudaError_t arle_fa3_fwd_hd256_bf16_cuda(const ArleFa3FwdHd256Args* a,
         return cudaErrorInvalidValue;
     }
     params.page_table = paged ? const_cast<int*>(a->page_table) : nullptr;
-    params.page_table_batch_stride = 0;  // b == 1
+    params.page_table_batch_stride = paged ? a->page_table_batch_stride : 0;
     params.page_size = paged ? a->page_size : 1;
     params.num_pages = paged ? a->num_pages : 0;
     params.pagedkv_tma = false;
@@ -216,22 +239,22 @@ cudaError_t arle_fa3_fwd_hd256_bf16_cuda(const ArleFa3FwdHd256Args* a,
         if (a->out_accum == nullptr || a->softmax_lse_accum == nullptr) {
             return cudaErrorInvalidValue;
         }
-        // Match flash_api_stable.cpp's non-varlen split allocation:
-        // out_accum [splits, batch=1, h, seqlen_q, dv] contiguous,
-        // lse_accum [splits, batch=1, h, seqlen_q] contiguous.
+        // Varlen split allocation (flash_api.cpp:1102-1112):
+        // out_accum [splits, h, total_q, dv], lse_accum [splits, h, total_q].
+        // No batch dim — cu_seqlens_q already flattens the rows.
         params.is_fp32 = false;
         params.oaccum_ptr = a->out_accum;
         params.softmax_lseaccum_ptr = a->softmax_lse_accum;
         params.oaccum_split_stride =
-            static_cast<int64_t>(a->num_heads) * a->seqlen_q * a->head_dim;
-        params.oaccum_batch_stride = params.oaccum_split_stride;
+            static_cast<int64_t>(a->num_heads) * a->total_q * a->head_dim;
+        params.oaccum_batch_stride = 0;
         params.oaccum_head_stride =
-            static_cast<int64_t>(a->seqlen_q) * a->head_dim;
+            static_cast<int64_t>(a->total_q) * a->head_dim;
         params.oaccum_row_stride = a->head_dim;
         params.lseaccum_split_stride =
-            static_cast<int64_t>(a->num_heads) * a->seqlen_q;
-        params.lseaccum_batch_stride = params.lseaccum_split_stride;
-        params.lseaccum_head_stride = a->seqlen_q;
+            static_cast<int64_t>(a->num_heads) * a->total_q;
+        params.lseaccum_batch_stride = 0;
+        params.lseaccum_head_stride = a->total_q;
 
         if (paged) {
             run_mha_fwd_<90, cutlass::bfloat16_t, 256, 256, /*Split=*/true,

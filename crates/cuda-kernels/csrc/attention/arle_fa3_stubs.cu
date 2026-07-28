@@ -8,32 +8,9 @@
 
 extern "C" {
 
-typedef struct {
-    const void* q;
-    const void* k;
-    const void* v;
-    void* o;
-    float* softmax_lse;
-    float* out_accum;
-    float* softmax_lse_accum;
-    int* tile_count_semaphore;
-    int seqlen_q;
-    int seqlen_k;
-    int num_heads;
-    int num_heads_k;
-    int head_dim;
-    long long q_row_stride;
-    long long k_row_stride;
-    long long v_row_stride;
-    long long o_row_stride;
-    long long q_head_stride;
-    long long k_head_stride;
-    long long v_head_stride;
-    long long o_head_stride;
-    float softmax_scale;
-    int is_causal;
-    int num_splits;
-} ArleFa3FwdHd256Args;
+// Opaque: the stub never dereferences the args, so mirroring the real
+// struct here only invites drift.
+typedef struct ArleFa3FwdHd256Args ArleFa3FwdHd256Args;
 
 cudaError_t arle_fa3_fwd_hd256_bf16_cuda(const ArleFa3FwdHd256Args* a,
                                          cudaStream_t stream) {

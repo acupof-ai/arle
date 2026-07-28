@@ -763,26 +763,37 @@ unsafe extern "C" {
 /// separate row/head strides express both token-major q/o (`[S, h, d]`:
 /// row = h*d, head = d) and the qwen35 head-major slot caches
 /// (`[h_k, max_seq, d]`: row = d, head = max_seq*d) without relayout.
-/// Step-1 prefill contract: b=1, slot KV viewed at exact `seqlen_k`,
-/// `num_splits=1`, causal bottom-right alignment. Decode may opt into
-/// `num_splits > 1`, using the upstream split-KV + PackGQA + combine path.
+/// ONE call per layer whatever the batch: q/o are packed `[total_q, h, d]`
+/// addressed through `cu_seqlens_q`, and each row's KV extent comes from
+/// `seqused_k` against a rectangular page table strided by
+/// `page_table_batch_stride`. `num_splits > 1` opts into the upstream split-KV
+/// + PackGQA + combine path.
 #[repr(C)]
 pub struct ArleFa3FwdHd256Args {
     pub q: *const Half,
     pub k: *const Half,
     pub v: *const Half,
     pub o: *mut Half,
-    /// fp32 scratch, `num_heads * seqlen_q` elements.
+    /// fp32 scratch, `num_heads * total_q` elements.
     pub softmax_lse: *mut f32,
-    /// fp32 split scratch, `num_splits * num_heads * seqlen_q * head_dim`
+    /// fp32 split scratch, `num_splits * num_heads * total_q * head_dim`
     /// elements; null when `num_splits <= 1`.
     pub out_accum: *mut f32,
-    /// fp32 split LSE scratch, `num_splits * num_heads * seqlen_q` elements;
+    /// fp32 split LSE scratch, `num_splits * num_heads * total_q` elements;
     /// null when `num_splits <= 1`.
     pub softmax_lse_accum: *mut f32,
     /// device i32 scratch (>= 1 element); the shim zeroes it per launch.
     pub tile_count_semaphore: *mut i32,
+    /// device i32 `[batch + 1]` prefix sum over query rows.
+    pub cu_seqlens_q: *const i32,
+    /// device i32 `[batch]` per-row KV extent in tokens.
+    pub seqused_k: *const i32,
+    pub batch: i32,
+    /// `cu_seqlens_q[batch]`.
+    pub total_q: i32,
+    /// Longest row's query length.
     pub seqlen_q: i32,
+    /// Longest row's KV length.
     pub seqlen_k: i32,
     pub num_heads: i32,
     pub num_heads_k: i32,
@@ -800,10 +811,12 @@ pub struct ArleFa3FwdHd256Args {
     pub is_causal: i32,
     /// 1 = direct fwd; >1 = split-KV decode fwd + combine (max 256).
     pub num_splits: i32,
-    /// Page indices for THIS request; null = contiguous KV. When set, `k`/`v`
-    /// are the pool base and the strides describe one page, which expresses the
-    /// HND pool `[page, h_k, page_size, d]` without a relayout.
+    /// Rectangular page table `[batch, page_table_batch_stride]`; null =
+    /// contiguous KV. When set, `k`/`v` are the pool base and the strides
+    /// describe one page, which expresses the HND pool
+    /// `[page, h_k, page_size, d]` without a relayout.
     pub page_table: *const i32,
+    pub page_table_batch_stride: i64,
     pub page_size: i32,
     /// Pages in the POOL — the extent of the page dimension.
     pub num_pages: i32,
