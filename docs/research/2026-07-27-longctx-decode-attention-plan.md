@@ -96,8 +96,8 @@ own docstring cites.
   `fused_gqa_attention_decode_batched_kernel`** (`c00efdb9c`): measured −20.5%,
   reverted (`fcf709e0f`). That kernel is in the **non-paged** lane, which this
   configuration never enters.
-- **Turned on `--qwen35-fa3-decode`**: ITL p50 72.4 ms vs 72.1 ms off. FA3's
-  call site is in the same unused non-paged lane. Four configurations —
+- **Turned on `--qwen35-fa3-decode`** (since deleted): ITL p50 72.4 ms vs 72.1
+  off. Its call site was in the same unused non-paged lane. Four configurations —
   batched/per-row × FA3 on/off — all landed at 72.1–72.4 ms, which should have
   been read immediately as "none of these four is executing".
 - **Concluded from that identity that attention was not the bottleneck**: wrong,
@@ -160,38 +160,27 @@ c=8.
 
 ## What this deletes
 
-Full-attention decode has five implementations of one job. The profile says
-exactly one of them runs:
+Full-attention decode had five implementations of one job. The profile said
+exactly one of them ran at c=1: `batch_decode_paged_hd256` (TileLang), 53% of
+the step.
 
-| path | selector | runs at c=1? |
-|---|---|---|
-| **`batch_decode_paged_hd256` (TileLang)** | `resolve_paged_attn_v1` in the paged lane | **yes — 53% of the step** |
-| `fused_gqa_attention_decode_batched_kernel` + its reduce | `--qwen35-batched-decode-attention` (default on) | no |
-| per-row loop over single-row kernels | the `else` of that flag | no |
-| vendored FA3 split-KV + PackGQA | `--qwen35-fa3-decode` (default off) | no |
-| `fused_gqa_attention_single_token_kernel` | — | **zero Rust callers** |
+Closed out 2026-07-27/28:
 
-Three of the four non-running paths are dead weight that cost measurement time
-today. The deletion list:
+- `fused_gqa_attention_single_token_kernel` — deleted (`5dc0d28e7`, 185 lines,
+  zero Rust callers).
+- `--qwen35-fa3-decode` — deleted. FA3 went into the paged lane unconditionally
+  instead, for every query length; a second differently-gated FA3 entry that
+  the decode graph can never use is the half-state.
+- `--qwen35-batched-decode-attention` — deleted. It was a same-binary A/B knob;
+  `head_dim != 256` still selects the per-row arm, which is the real selector.
+- `fused_gqa_attention_decode_batched_kernel` + `attention_decode_reduce_batched_kernel`
+  — **kept, and the premise here was wrong.** They are not dead: `forward_decode_batch`
+  is the contiguous-KV lane for OPD weight offload, where no paged pool exists.
+  The paged lane never reaches them; the offload build has nothing else.
 
-1. **Now:** `fused_gqa_attention_single_token_kernel` — no FFI extern, no call
-   site, compiles into every build.
-2. **Now:** the `--qwen35-batched-decode-attention` `else` arm. A per-row A/B
-   against a kernel that the serving configuration never reaches measures
-   nothing.
-3. **After the TileLang fix lands:** `fused_gqa_attention_decode_batched_kernel`
-   + `attention_decode_reduce_batched_kernel` (~330 lines of `.cu`), their two
-   FFI externs, `QWEN35_BATCHED_DECODE_KV_SPLITS`, the three `batch_partial_*`
-   scratch slots, and the flag itself.
-4. **Decide, do not leave ambiguous:** `--qwen35-fa3-decode`. Either wire FA3
-   into the paged lane (it is the reference implementation of exactly the fix
-   below) and delete the TileLang kernel, or delete the flag. What must not
-   survive is a flag whose gate cannot be run because its call site is
-   unreachable.
-
-The rule is the repo's own: converge on one flow. A flag selecting between two
-implementations of the same kernel is a half-state — and this instance cost
-three measurement cycles before the profiler showed neither side was live.
+The rule holds — converge on one flow — but "unreachable from the serving path"
+is not "unreachable". Check every caller of the lane, not every caller of the
+kernel.
 
 ## Order of work
 

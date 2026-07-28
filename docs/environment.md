@@ -34,11 +34,10 @@ workers see them; train flags apply via `train::apply_runtime_flags`):
 | --- | --- |
 | `ARLE_QWEN35_DECODE_GRAPH` | `arle serve --qwen35-decode-graph` |
 | `ARLE_QWEN35_BATCHED_DECODE` | `arle serve --qwen35-batched-decode` |
-| `ARLE_QWEN35_BATCHED_DECODE_ATTENTION` | `arle serve --qwen35-batched-decode-attention` |
 | `ARLE_QWEN35_DEEPGEMM` | `arle serve --qwen35-deepgemm` |
 | `ARLE_QWEN35_MOE_DECODE_KERNEL` | `arle serve --qwen35-moe-decode-kernel` |
 | `ARLE_QWEN35_GPU_ROUTER` | `arle serve --qwen35-gpu-router` |
-| `ARLE_QWEN35_FA3` / `_FA3_DECODE` / `_FA3_DECODE_SPLITS` | `arle serve --qwen35-fa3` / `--qwen35-fa3-decode` / `--qwen35-fa3-decode-splits` |
+| `ARLE_QWEN35_FA3` / `_FA3_DECODE_SPLITS` | `arle serve --qwen35-fa3` / `--qwen35-fa3-decode-splits` |
 | `ARLE_QWEN35_GDR_CHUNKED` | `arle serve --qwen35-gdr-chunked` |
 | `INFER_CUDA_DECODE_GRAPH` | `arle serve --cuda-graph` / `--no-cuda-graph` (env override removed) |
 | `INFER_DECODE_METADATA_FAST_PAGE16` | `arle serve --decode-metadata-fast-page16` |
@@ -403,7 +402,7 @@ as diagnostics and validation gates, not stable tuning API.
 | `ARLE_DEEPEP_SIDECAR_PREBUILT` | path | unset | Build-time fast path for only the ARLE DeepEP sidecar binary. When set, `crates/cuda-kernels/build.rs` bakes this path into `ARLE_DEEPEP_SIDECAR_PATH` and skips sidecar compilation even if `ARLE_DEEPEP_DIR` is set. |
 | `ARLE_CUDA_ENABLE_FLASHMLA_DECODE` | `1`, unset | unset | Build-time opt-in for vendored FlashMLA sparse-FP8 decode instantiations. Leave unset on CUDA 12.5 H20 builds: those headers do not provide `__nv_fp8_e8m0`, and the runtime decode path is controlled by the `--dsv4-flashmla-decode` flag. Sparse prefill still builds when FlashMLA is enabled. |
 | `ARLE_CUDA_DISABLE_FLASHMLA_DECODE` | `1`, unset | unset | Build-time kill switch for FlashMLA sparse-FP8 decode compilation. Decode FFI symbols are satisfied by stubs while sparse prefill can remain enabled. |
-| `ARLE_CUDA_ENABLE_FA3` | `1`, unset | unset (`1` in `scripts/pod-build-env.sh`) | Build-time opt-in for the vendored FA3 hopper hdim256/bf16/sm90 forward units — prefill, and the split-KV + PackGQA decode behind `--qwen35-fa3-decode`. The units are git-tracked at `crates/cuda-kernels/vendor/flash-attention/` (note: package-relative, not the repo-root `vendor/`), so the only thing gating them is this variable plus an sm_90 target. Unset builds `arle_fa3_stubs.cu` and both FA3 flags become no-ops, logging `FA3 stub build`. |
+| `ARLE_CUDA_ENABLE_FA3` | `1`, unset | unset (`1` in `scripts/pod-build-env.sh`) | Build-time opt-in for the vendored FA3 hopper hdim256/bf16/sm90 forward units. On the paged lane they serve every query length — decode, spec verify, prefill chunks — with split-KV + PackGQA below 64 query rows. The units are git-tracked at `crates/cuda-kernels/vendor/flash-attention/` (package-relative, not the repo-root `vendor/`), so the only gate is this variable plus an sm_90 target. Unset builds `arle_fa3_stubs.cu`, `--qwen35-fa3` becomes a no-op and the lane falls back to the TileLang paged kernels, logging `FA3 stub build`. |
 | `ARLE_NVCC_WRAPPER` | command | unset | Optional wrapper for CUDA compilation in `crates/cuda-kernels/build.rs` and `crates/deepep-sys/build.rs`. Typical value: `sccache`, which runs `sccache /usr/local/cuda/bin/nvcc ...`. |
 | `ARLE_NVCC_SPLIT_COMPILE` | integer | unset | Optional `nvcc --split-compile=<N>` value for CUDA compilation in `crates/cuda-kernels/build.rs` and `crates/deepep-sys/build.rs`. Use a bounded value such as `8` or `16` on high-core build hosts; unset preserves the current nvcc behavior. |
 | `ARLE_NVCC_PARALLEL` | integer | `min(cores, 8)` | Worker count for the bounded parallel nvcc pool over native `.cu` compilation in `crates/cuda-kernels/build.rs`. `1` restores the previous serial loop. Capped at 8 by default because one multi-arch nvcc invocation can take 1-2 GB of RAM. Archive (`ar`) ordering is queue-order, identical to the serial loop. |

@@ -41,7 +41,12 @@ GPU 2, 3 trials:
 | TileLang | 72.1 ms | 13.9 |
 | **FA3 paged split-KV + PackGQA** | **26.1 ms** | **38.3** |
 
-**2.76×**, all three trials within 0.4%. The number lands where the byte ledger
+**2.76×**, all three trials within 0.4%. Read the p50 only — that probe timed
+`for line in urllib_response`, which stamps buffer fills rather than SSE
+arrivals, so its mean is an artifact (2026-07-28: it reported mean 72.6 ms
+against its own p50 of 26.3 on a binary the harness measured at 28.64 ms
+mean / 28.71 p50, max 32.3). The harness's `itl_s` is the metric of record;
+the probe has been dropped. The number lands where the byte ledger
 says it should: the short-context step measured **26.6 ms** on the same binary,
 so **the context term went from 45.5 ms to ≈0**. Short context is unchanged —
 37.96 tok/s vs `baselines.md`'s 38.62, inside the ±3% drift band.
@@ -66,22 +71,23 @@ assumed:
 
 ## Problems
 
-- **Scoped to sm_90 + BF16 + batch 1 decode.** FA3 hopper is Hopper-only, so
-  every other target keeps TileLang permanently — a capability split, not two
-  implementations of one job. Batch > 1 needs a padded `[b, max_pages]` page
-  table and still runs the TileLang kernel; c≥4 is unmeasured and is the next
-  tranche.
+- **Scoped to sm_90 + BF16.** FA3 hopper is Hopper-only, so every other target
+  keeps TileLang permanently — a capability split, not two implementations of
+  one job. Batch and query length were closed out later: all batch sizes
+  2026-07-27, every query length (spec verify, prefill chunks) 2026-07-28
+  ([entry](2026-07-28-fa3-covers-every-query-length.md)).
 - **Three wrong turns preceded the profile**, all avoidable by running it first:
   a hand-written GQA/warp-per-key/scaled-splits rewrite of
   `fused_gqa_attention_decode_batched_kernel` (−20.5%, reverted `fcf709e0f`);
   `--qwen35-fa3-decode`, which moved nothing (72.4 vs 72.1 ms); and a four-way
   batched/per-row × FA3 sweep that landed within 0.4% because **none of the four
   paths executes** — they are all in the non-paged lane.
-- **The deletion is not done.** Five full-attention decode implementations still
-  exist and exactly one runs. `fused_gqa_attention_single_token_kernel` was
-  deleted (`5dc0d28e7`, 185 lines, zero callers); the batched kernel + reduce +
-  their FFI + scratch + `--qwen35-batched-decode-attention` + its per-row arm
-  remain, as does `--qwen35-fa3-decode` now that FA3 is not a flag.
+- **The deletion finished 2026-07-28**, and not the way this entry assumed:
+  `forward_decode_batch` is NOT dead — it is the contiguous-KV lane for OPD
+  weight offload, where no paged pool exists. What went was the flag surface on
+  top of it: `--qwen35-fa3-decode` (default-off, never licensed, structurally
+  incompatible with the decode graph) and `--qwen35-batched-decode-attention`
+  (a same-binary A/B knob; head_dim != 256 still selects the per-row arm).
 - No `ncu` before/after. The 2.76× and the needle gate are the evidence; the
   per-kernel bandwidth number is not measured.
 

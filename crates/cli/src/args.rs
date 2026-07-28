@@ -848,10 +848,6 @@ pub(crate) struct ServeArgs {
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set, value_name = "BOOL")]
     pub(crate) qwen35_batched_decode: bool,
 
-    /// Batched decode attention kernel; false = per-row attention A/B arm.
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set, value_name = "BOOL")]
-    pub(crate) qwen35_batched_decode_attention: bool,
-
     /// DeepGEMM grouped expert GEMMs (read at load: builds grouped weight caches).
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set, value_name = "BOOL")]
     pub(crate) qwen35_deepgemm: bool,
@@ -867,10 +863,6 @@ pub(crate) struct ServeArgs {
     /// FA3 full-attention prefill (silently in-tree on stub builds).
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set, value_name = "BOOL")]
     pub(crate) qwen35_fa3: bool,
-
-    /// FA3 split-KV decode (ignored while the decode graph is on).
-    #[arg(long, default_value_t = false, action = clap::ArgAction::Set, value_name = "BOOL")]
-    pub(crate) qwen35_fa3_decode: bool,
 
     /// FA3 decode split count (clamped to [2, 256]).
     #[arg(long, default_value_t = 8, value_name = "N")]
@@ -992,12 +984,10 @@ impl ServeArgs {
         infer_api::CudaRuntimeFlags {
             qwen35_decode_graph: self.qwen35_decode_graph,
             qwen35_batched_decode: self.qwen35_batched_decode,
-            qwen35_batched_decode_attention: self.qwen35_batched_decode_attention,
             qwen35_deepgemm: self.qwen35_deepgemm,
             qwen35_moe_decode_kernel: self.qwen35_moe_decode_kernel,
             qwen35_gpu_router: self.qwen35_gpu_router,
             qwen35_fa3: self.qwen35_fa3,
-            qwen35_fa3_decode: self.qwen35_fa3_decode,
             qwen35_fa3_decode_splits: self.qwen35_fa3_decode_splits,
             qwen35_gdr_chunked: self.qwen35_gdr_chunked,
             decode_metadata_fast_page16: self.decode_metadata_fast_page16,
