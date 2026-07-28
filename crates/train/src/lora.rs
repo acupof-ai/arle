@@ -243,9 +243,17 @@ impl LinearWithLora {
         let mut projected = matmul_bt_with_site(flat_x, self.weight, store, tape, self.base_name)?;
         if let Some(lora) = &self.lora {
             let low_rank = matmul_bt_with_site(flat_x, lora.lora_a, store, tape, lora.lora_a_name)?;
-            let delta = matmul_bt_with_site(low_rank, lora.lora_b, store, tape, lora.lora_b_name)?;
-            let delta = mul_scalar(delta, lora.scale, store, tape)?;
-            projected = add(projected, delta, store, tape)?;
+            let delta_raw =
+                matmul_bt_with_site(low_rank, lora.lora_b, store, tape, lora.lora_b_name)?;
+            let delta = mul_scalar(delta_raw, lora.scale, store, tape)?;
+            let base = projected;
+            projected = add(base, delta, store, tape)?;
+            // tape-disabled checkpoint forward: free the base + delta ring now.
+            if !tape.enabled {
+                for id in [base, low_rank, delta_raw, delta] {
+                    store.free(id)?;
+                }
+            }
         }
 
         let mut output_shape = x_shape[..x_shape.len() - 1].to_vec();
