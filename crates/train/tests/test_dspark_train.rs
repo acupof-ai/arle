@@ -190,7 +190,9 @@ fn dspark_trainer_serve_frame_and_alignment() {
             .map(|(&a, &b)| (a - b) * (a - b))
             .sum::<f32>();
     }
-    let expected = (1.0 - alpha) * (pg / wsum) + alpha * (pm / (wsum * V as f32));
+    // PM is the per-token mean of the squared-L2 distribution distance (a
+    // sum over vocab), NOT averaged over vocab — matches dspark_train.rs.
+    let expected = (1.0 - alpha) * (pg / wsum) + alpha * (pm / wsum);
     assert!(
         (loss - expected).abs() < 1e-4,
         "trainer loss {loss} != serve-frame reference {expected}"
