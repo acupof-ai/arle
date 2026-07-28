@@ -276,6 +276,10 @@ pub(crate) enum OpdTeacherRuntimeArg {
     InProcess,
     /// Load the teacher through infer-api and score raw logits through the runtime.
     Infer,
+    /// Score raw logits over HTTP against a separately-served teacher (--teacher-url).
+    /// Keeps the teacher off the training GPU — the only way the full FP8 teacher
+    /// fits alongside an FP8 student on one card.
+    Api,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -1413,6 +1417,11 @@ pub(crate) struct TrainOpdArgs {
     /// Teacher scoring runtime. `infer` supports runtime-only teacher checkpoints.
     #[arg(long, value_enum, default_value_t = OpdTeacherRuntimeArg::InProcess)]
     pub(crate) teacher_runtime: OpdTeacherRuntimeArg,
+
+    /// Raw-logits endpoint for `--teacher-runtime api` (e.g.
+    /// `http://127.0.0.1:8137/v1/raw_logits`). Required with `api`, ignored otherwise.
+    #[arg(long, value_name = "URL")]
+    pub(crate) teacher_url: Option<String>,
 
     /// Initial prompt token ids, comma-separated. Defaults to `1,3,8`.
     #[arg(long, value_name = "IDS")]
