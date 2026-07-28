@@ -27,7 +27,35 @@ python3 scripts/gen_bench_prompts.py bench-agent-119k-16x8.jsonl 16 119000 214 8
 
 ## Qwen3.6 on 1×H20 · single-GPU · eager — LONG-AGENT ANCHOR
 
-### CHAMPION — `55bf627bc` (2026-07-28) · FA3 paged, qlen ≤ 64
+### CHAMPION — `1fad68524` (2026-07-28) · host-authoritative KV mirror
+
+MoE arm only, re-anchored on `arle-mirror` after qwen35 dropped its second KV
+allocator. Same dataset, seed, runner, GPU as the table below.
+
+| c | arm | TTFT cold | TTFT warm | TPOT | decode tok/s | total tok/s |
+|---|---|---:|---:|---:|---:|---:|
+| 1 | MoE no-spec | 9.3 s | **0.6 s** | 16.03 ms | 62.4 | **7529.0** |
+| 8 | MoE no-spec | 0.7 s | 0.4 s | **61.40 ms** | 16.3 | **23360.0** |
+| 16 | MoE no-spec | 1.9 s | 0.6 s | **109.42 ms** | 9.1 | **26139.4** |
+
+128/128 complete, 0 errors at all three points; needle gate exact=3 DET at
+512/4k/16k/32k.
+
+- **Warm TTFT is now flat in prefix length** — 0.147–0.175 s across 4k→33k in a
+  matched c=1 probe, against 0.480→3.020 s before. A radix hit costs a page-table
+  mirror, not a host KV round-trip.
+  [entry](experience/wins/2026-07-28-qwen35-host-authoritative-kv-mirror.md)
+- **The c=8 wall was the restore work, not pure queueing.** The prior entry read
+  the c=8→16 plateau as scheduler queueing; TPOT moves 224.29 → 61.40 ms at c=8
+  with no scheduler change, so most of that wall was requests serialized behind
+  per-turn sidecar restores. What remains of the plateau is still worth attacking.
+- **`prefill tok/s` is no longer meaningful on this arm** — warm TTFT is
+  dominated by cache-hit bookkeeping, so `prompt_tokens / TTFT` measures the hit,
+  not a compute rate. Dropped from the table rather than reported as throughput.
+- Dense arms have not been re-anchored on this binary; the `55bf627bc` rows below
+  remain the reference for them.
+
+### PRIOR — `55bf627bc` (2026-07-28) · FA3 paged, qlen ≤ 64
 
 Three arms, one binary (`arle-fa3c`), one session, one dataset. Models:
 `bottlecapai/ThinkingCap-Qwen3.6-27B-FP8` (~29 GB dense, canonical CUDA agentic
@@ -81,8 +109,10 @@ Cold/warm decode at c=1: dense no-spec 27.58/28.99 ms, DSpark 11.91/**8.77 ms
 - **All three arms hit the same wall at c=8**: c=8→16 buys +0.7% (dense
   no-spec), −0.4% (DSpark), +1.2% (MoE) total tok/s while TPOT doubles. Model-
   and spec-independent, so it is queueing, not compute — ITL p50 at c=8 is
-  66.07 ms (no-spec) vs 66.19 ms (DSpark), and p90 is 4035 vs 3823 ms. The
-  bimodal ITL is the scheduler, and it is the next thing worth attacking.
+  66.07 ms (no-spec) vs 66.19 ms (DSpark), and p90 is 4035 vs 3823 ms.
+  **Partly withdrawn**: most of this wall was requests serialized behind
+  per-turn sidecar restores, not the scheduler — the KV-mirror champion above
+  takes MoE c=8 TPOT to 61.40 ms with no scheduler change.
 - **FA3 on prefill chunks is a wash and is capped anyway** — `FA3_MAX_QLEN = 64`
   keeps prefill on TileLang; FA3 needs one launch per request when `seqused_k`
   is set, which cost 51% of TTFT at c=8.
