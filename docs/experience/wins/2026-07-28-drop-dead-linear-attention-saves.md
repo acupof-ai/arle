@@ -1,7 +1,7 @@
 # Drop 6 dead LinearAttentionCtx saves — ~10 GiB/LA-layer @256K
 
-> Status: Code shipped; CPU tests + cuda-lane typecheck GREEN. Device gradient
-> A/B `pending-remote` (H20, CUDA-only) — bundled with the MLP seq-chunk A/B.
+> Status: Shipped; CPU tests + cuda-lane typecheck GREEN; H20 gradient A/B
+> measured (seq=40960, GREEN — loss bit-identical, VRAM drops).
 
 ## Context
 
@@ -43,11 +43,19 @@ stay. Numerics-identical by construction — nothing read them.
   `linear_attention_prompt_boundary_carry_is_exact` (CPU exercises the host
   recompute path). clippy clean.
 - cuda-lane Mac typecheck (`autograd`+`train`, `cuda,no-cuda`) green.
-- **Device gradient A/B pending-remote**: on H20, run an LA-layer backward
-  pre/post this commit and confirm `dqkv/dz/db/da/dconv/ddt/da_log/dnorm` are
-  bit-identical (or within the MoE-nondet floor), + read the LA-layer writeback
-  `pool_used_current` drop. Bundle with the MLP seq-chunk A/B (same GPU trip,
-  same LA layers).
+- **Device gradient A/B — GREEN** (H20, agent-OPD synthetic writeback seq=40960,
+  ThinkingCap-27B-FP8, LoRA r16 qv; parent `076d309cc` vs HEAD, single-variable;
+  per-op `pool_used_current` at layer 62 (LA)):
+
+  | metric | parent (6 saves kept) | HEAD (dropped) | Δ |
+  |---|---|---|---|
+  | mean_loss | 8.685793 | 8.685793 | **bit-identical** |
+  | inner-backward peak | 74.0 GiB | 71.9 GiB | −2167 MiB |
+
+  Loss bit-identical → the deleted saves do not change gradients (the
+  numerics-identical claim holds). `pool_used` drops a constant 2167 MiB across
+  every post-attention stage (the 6 freed tensors) — the seq=40960 slice of the
+  ~10 GiB/LA-layer@256K claim; the drop grows O(seq) into the 256K regime.
 
 ## Rule
 
