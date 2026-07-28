@@ -927,6 +927,48 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         self.upload(&host, shape)
     }
 
+    /// All-gather local sequence shards along axis 1 of `[1, S/N, H]` into the
+    /// full `[1, S, H]`, concatenated in rank order (context-parallel forward).
+    /// `local_shape` is this rank's shard. Single-rank / CPU / no-communicator
+    /// semantics are identity (S/N == S), so the default just re-uploads.
+    fn all_gather_seq_device(
+        &self,
+        x: &DeviceHandle,
+        local_shape: &[usize],
+    ) -> Result<DeviceHandle> {
+        let host = self.readback(x)?;
+        let size = shape_size(local_shape);
+        if host.len() != size {
+            return Err(crate::AutogradError::DataLengthMismatch {
+                len: host.len(),
+                shape: local_shape.to_vec(),
+                size,
+            });
+        }
+        self.upload(&host, local_shape)
+    }
+
+    /// Reduce-scatter sum: sum the full-sequence `[1, S, H]` across ranks, keep
+    /// this rank's `[1, S/N, H]` row slice — the adjoint of `all_gather_seq`.
+    /// `local_shape` is this rank's output shard. Single-rank / CPU / no-communicator
+    /// semantics are identity, so the default re-uploads the (already local) input.
+    fn reduce_scatter_sum_device(
+        &self,
+        x: &DeviceHandle,
+        local_shape: &[usize],
+    ) -> Result<DeviceHandle> {
+        let host = self.readback(x)?;
+        let size = shape_size(local_shape);
+        if host.len() != size {
+            return Err(crate::AutogradError::DataLengthMismatch {
+                len: host.len(),
+                shape: local_shape.to_vec(),
+                size,
+            });
+        }
+        self.upload(&host, local_shape)
+    }
+
     /// Sum of squares for a device handle, returned on host as `f64`.
     /// The default fallback reads the full tensor; CUDA overrides with a
     /// partial-reduction kernel so gradient clipping can stay device-resident.
