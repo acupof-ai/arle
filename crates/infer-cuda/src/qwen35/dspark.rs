@@ -644,6 +644,22 @@ pub(crate) fn load_dspark_head(
     // RoPE tables cover the full per-request token ceiling (absolute positions).
     let rope_cap = max_seq_len.min(max_total_tokens.max(1)) + cfg.block_size;
     let cap = cfg.sliding_window + cfg.block_size;
+    let full = cfg
+        .layer_types
+        .iter()
+        .filter(|t| matches!(t, qwen35_spec::DsparkLayerType::Full))
+        .count();
+    if full > 0 {
+        // Honoring them needs a ctx ring the length of the request (671 MB/slot
+        // at 32k vs 42 MB), so they are windowed on purpose — but silently
+        // windowing a full-attention layer moves acceptance, so say it.
+        log::warn!(
+            "dspark draft: {full}/{} layers declare full attention; all run the \
+             {}-token sliding window (ctx ring is {cap} rows)",
+            cfg.layer_types.len(),
+            cfg.sliding_window
+        );
+    }
     let (cos_cache, sin_cache) =
         crate::ops::precompute_rope(ctx, cfg.head_dim, rope_cap, cfg.rope_theta, None)?;
     Ok(Qwen35DsparkHead {
