@@ -310,15 +310,9 @@ pub fn linear_attention_core(
                 norm_weight,
                 preact: None,
                 qkv_conv: None,
-                q: None,
-                k: None,
-                v: None,
                 g: None,
-                g_cumsum: None,
                 beta: None,
-                a_inv: None,
                 chunk_state: None,
-                raw_output: None,
                 initial_state: None,
                 initial_conv_window: None,
                 batch: params.batch,
@@ -675,15 +669,9 @@ pub fn linear_attention_core_with_carry_taped(
                 norm_weight,
                 preact: None,
                 qkv_conv: None,
-                q: None,
-                k: None,
-                v: None,
                 g: None,
-                g_cumsum: None,
                 beta: None,
-                a_inv: None,
                 chunk_state: None,
-                raw_output: None,
                 initial_state,
                 initial_conv_window,
                 batch: params.batch,
@@ -855,40 +843,12 @@ fn try_linear_attention_forward_device(
         store.alloc_device_tensor(vec![params.batch, params.seq_len, qkv_dim], result.preact)?;
     let qkv_conv_id =
         store.alloc_device_tensor(vec![params.batch, params.seq_len, qkv_dim], result.qkv_conv)?;
-    let q_id = store.alloc_device_tensor(
-        vec![
-            params.batch,
-            params.seq_len,
-            params.num_value_heads,
-            params.key_dim,
-        ],
-        result.q,
-    )?;
-    let k_id = store.alloc_device_tensor(
-        vec![
-            params.batch,
-            params.seq_len,
-            params.num_value_heads,
-            params.key_dim,
-        ],
-        result.k,
-    )?;
-    let v_id = store.alloc_device_tensor(
-        vec![
-            params.batch,
-            params.seq_len,
-            params.num_value_heads,
-            params.value_dim,
-        ],
-        result.v,
-    )?;
+    // q/k/v/g_cumsum/a_inv/raw_output are forward-only scratch: the device backward
+    // recomputes them and never reads the saved copies (backend_cuda.rs row worker).
+    // Not retained → their `result.*` handles free here instead of pinning the tape
+    // (~10 GiB/LA-layer at seq=256K).
     let g_id = store.alloc_device_tensor(head_shape.clone(), result.g)?;
-    let g_cumsum_id = store.alloc_device_tensor(head_shape.clone(), result.g_cumsum)?;
     let beta_id = store.alloc_device_tensor(head_shape, result.beta)?;
-    let a_inv_id = store.alloc_device_tensor(
-        vec![params.batch, params.seq_len, params.num_value_heads, 64],
-        result.a_inv,
-    )?;
     let chunk_state_id = store.alloc_device_tensor(
         vec![
             params.batch,
@@ -898,15 +858,6 @@ fn try_linear_attention_forward_device(
             params.value_dim,
         ],
         result.chunk_state,
-    )?;
-    let raw_output_id = store.alloc_device_tensor(
-        vec![
-            params.batch,
-            params.seq_len,
-            params.num_value_heads,
-            params.value_dim,
-        ],
-        result.raw_output,
     )?;
     let output_id = store.alloc_device_tensor(output_shape, result.output)?;
     store.set_requires_grad(output_id, requires_grad)?;
@@ -936,15 +887,9 @@ fn try_linear_attention_forward_device(
                 norm_weight,
                 preact: Some(preact_id),
                 qkv_conv: Some(qkv_conv_id),
-                q: Some(q_id),
-                k: Some(k_id),
-                v: Some(v_id),
                 g: Some(g_id),
-                g_cumsum: Some(g_cumsum_id),
                 beta: Some(beta_id),
-                a_inv: Some(a_inv_id),
                 chunk_state: Some(chunk_state_id),
-                raw_output: Some(raw_output_id),
                 // State carry lives in chunk_state[0] → None (Some would misfire
                 // needs_host_recompute). Conv carry is a real backward input → keep it.
                 initial_state: None,
@@ -976,15 +921,9 @@ fn try_linear_attention_backward_device(
     norm_weight: TensorId,
     preact: Option<TensorId>,
     qkv_conv: Option<TensorId>,
-    q: Option<TensorId>,
-    k: Option<TensorId>,
-    v: Option<TensorId>,
     g: Option<TensorId>,
-    g_cumsum: Option<TensorId>,
     beta: Option<TensorId>,
-    a_inv: Option<TensorId>,
     chunk_state: Option<TensorId>,
-    raw_output: Option<TensorId>,
     initial_conv_window: Option<TensorId>,
     params: LinearAttentionParams,
     store: &mut TensorStore,
@@ -998,31 +937,13 @@ fn try_linear_attention_backward_device(
     let Some(qkv_conv) = qkv_conv else {
         return Ok(None);
     };
-    let Some(q) = q else {
-        return Ok(None);
-    };
-    let Some(k) = k else {
-        return Ok(None);
-    };
-    let Some(v) = v else {
-        return Ok(None);
-    };
     let Some(g) = g else {
-        return Ok(None);
-    };
-    let Some(g_cumsum) = g_cumsum else {
         return Ok(None);
     };
     let Some(beta) = beta else {
         return Ok(None);
     };
-    let Some(a_inv) = a_inv else {
-        return Ok(None);
-    };
     let Some(chunk_state) = chunk_state else {
-        return Ok(None);
-    };
-    let Some(raw_output) = raw_output else {
         return Ok(None);
     };
 
@@ -1038,15 +959,9 @@ fn try_linear_attention_backward_device(
         norm_weight,
         preact,
         qkv_conv,
-        q,
-        k,
-        v,
         g,
-        g_cumsum,
         beta,
-        a_inv,
         chunk_state,
-        raw_output,
     ] {
         store.ensure_device(tensor_id)?;
     }
@@ -1072,15 +987,9 @@ fn try_linear_attention_backward_device(
     let norm_handle = handle(store, norm_weight)?;
     let preact_handle = handle(store, preact)?;
     let qkv_conv_handle = handle(store, qkv_conv)?;
-    let q_handle = handle(store, q)?;
-    let k_handle = handle(store, k)?;
-    let v_handle = handle(store, v)?;
     let g_handle = handle(store, g)?;
-    let g_cumsum_handle = handle(store, g_cumsum)?;
     let beta_handle = handle(store, beta)?;
-    let a_inv_handle = handle(store, a_inv)?;
     let chunk_state_handle = handle(store, chunk_state)?;
-    let raw_output_handle = handle(store, raw_output)?;
     let conv_tail_handle = initial_conv_window
         .map(|id| {
             store.ensure_device(id)?;
@@ -1113,15 +1022,9 @@ fn try_linear_attention_backward_device(
                 norm_weight: &norm_handle,
                 preact: &preact_handle,
                 qkv_conv: &qkv_conv_handle,
-                q: &q_handle,
-                k: &k_handle,
-                v: &v_handle,
                 g: &g_handle,
-                g_cumsum: &g_cumsum_handle,
                 beta: &beta_handle,
-                a_inv: &a_inv_handle,
                 chunk_state: &chunk_state_handle,
-                raw_output: &raw_output_handle,
                 initial_conv_window: conv_tail_handle.as_ref(),
             })?
     else {
@@ -1214,15 +1117,9 @@ pub(crate) fn linear_attention_backward(
         norm_weight,
         preact,
         qkv_conv,
-        q,
-        k,
-        v,
         g,
-        g_cumsum,
         beta,
-        a_inv,
         chunk_state,
-        raw_output,
         initial_state,
         initial_conv_window,
         batch,
@@ -1280,15 +1177,9 @@ pub(crate) fn linear_attention_backward(
             norm_weight,
             preact,
             qkv_conv,
-            q,
-            k,
-            v,
             g,
-            g_cumsum,
             beta,
-            a_inv,
             chunk_state,
-            raw_output,
             initial_conv_window,
             params,
             store,
