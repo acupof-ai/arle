@@ -5926,7 +5926,7 @@ impl Qwen35Model {
                             // chunked-prefill semantics. Gate + o_proj follow
                             // unchanged.
                             let lse = fa3_lse.get(&self.ctx, self.local_q_heads * seq_len)?;
-                            let sem = fa3_semaphore.get(&self.ctx, 1)?;
+                            let sem = fa3_semaphore.get(&self.ctx, 5)?;
                             let (lse_ptr, _g4) = lse.device_ptr_mut(&self.ctx.stream);
                             let (sem_ptr, _g5) = sem.device_ptr_mut(&self.ctx.stream);
                             let head_dim = c.head_dim as i64;
@@ -5939,6 +5939,7 @@ impl Qwen35Model {
                                 out_accum: std::ptr::null_mut(),
                                 softmax_lse_accum: std::ptr::null_mut(),
                                 tile_count_semaphore: sem_ptr as *mut i32,
+                                metadata_capacity: 5,
                                 cu_seqlens_q: std::ptr::null(),
                                 seqused_k: std::ptr::null(),
                                 batch: 1,
@@ -6348,7 +6349,8 @@ impl Qwen35Model {
                             let oaccum =
                                 fa3_oaccum.get(&self.ctx, splits * accum_rows * c.head_dim)?;
                             let lseaccum = fa3_lseaccum.get(&self.ctx, splits * accum_rows)?;
-                            let sem = fa3_semaphore.get(&self.ctx, 1)?;
+                            let meta_cap = meta.batch.div_ceil(4) * 4 * 4 + 1;
+                            let sem = fa3_semaphore.get(&self.ctx, meta_cap)?;
                             let (lse_ptr, _f0) = lse.device_ptr_mut(&self.ctx.stream);
                             let (oaccum_ptr, _f1) = oaccum.device_ptr_mut(&self.ctx.stream);
                             let (lseaccum_ptr, _f2) = lseaccum.device_ptr_mut(&self.ctx.stream);
@@ -6365,6 +6367,7 @@ impl Qwen35Model {
                                 out_accum: oaccum_ptr as *mut f32,
                                 softmax_lse_accum: lseaccum_ptr as *mut f32,
                                 tile_count_semaphore: sem_ptr as *mut i32,
+                                metadata_capacity: meta_cap as i32,
                                 cu_seqlens_q: q_indptr_ptr as *const i32,
                                 seqused_k: kv_lens_ptr as *const i32,
                                 batch: meta.batch as i32,

@@ -62,7 +62,10 @@ typedef struct {
     float* softmax_lse;         // fp32 [h * seqlen_q] scratch
     float* out_accum;           // fp32 [splits, b=1, h, seqlen_q, d], split only
     float* softmax_lse_accum;   // fp32 [splits, b=1, h, seqlen_q], split only
-    int* tile_count_semaphore;  // device i32 scratch (>= 1 element)
+    // Device i32 scratch for the scheduler metadata + semaphore. Size it
+    // `round_up(batch, 4) * 4 + 1` and the shim's own check can never trip.
+    int* tile_count_semaphore;
+    int metadata_capacity;  // elements available at tile_count_semaphore
     const int* cu_seqlens_q;    // i32 [batch+1] prefix sum over query rows
     const int* seqused_k;       // i32 [batch] per-row KV extent in tokens
     int batch;
@@ -212,28 +215,45 @@ cudaError_t arle_fa3_fwd_hd256_bf16_cuda(const ArleFa3FwdHd256Args* a,
     // head for each GQA query head.
     params.pack_gqa = params.num_splits > 1;
 
-    // Scheduler template selectors (flash_api.cpp:993-994).
-    params.varlen_sort_batches = true;  // !is_local
-    params.head_swizzle = params.is_causal;
+    params.varlen_sort_batches = !params.is_local;
 
-    // Non-varlen, sm90: upstream needs a zeroed semaphore for causal
-    // non-split. The split decode path also passes it through combine, so keep
-    // one reusable zeroed device i32 for both cases.
-    if (params.is_causal || params.num_splits > 1) {
-        if (a->tile_count_semaphore == nullptr) return cudaErrorInvalidValue;
-        cudaError_t st =
-            cudaMemsetAsync(a->tile_count_semaphore, 0, sizeof(int), stream);
+    // Scheduler metadata (flash_api.cpp:995-1027). Varlen makes the launch
+    // template run `prepare_varlen_num_blocks` for us
+    // (flash_fwd_launch_template.h:163), but that kernel WRITES through
+    // num_splits_dynamic / num_m_blocks / varlen_batch_idx / num_nheads_in_l2 —
+    // leaving them null is an illegal access, not a fallback. One caller-owned
+    // i32 buffer carves all of them plus the semaphore, exactly as upstream
+    // slices its `tile_count_semaphore` tensor.
+    const bool needs_semaphore =
+        ((params.is_causal || params.is_local) && params.num_splits == 1) ||
+        varlen;
+    params.head_swizzle = params.is_causal || params.is_local;
+    const int b_rounded = round_multiple(params.b, 4);  // 16B pointer alignment
+    int num_prepare_vectors = varlen ? 2 : 0;
+    if (params.varlen_sort_batches) num_prepare_vectors += 1;
+    if (params.head_swizzle) num_prepare_vectors += 1;
+    const int head_swizzle_offset =
+        b_rounded * (params.varlen_sort_batches ? 3 : 2);
+    const int sem_offset = b_rounded * num_prepare_vectors;
+    const int metadata_size = int(needs_semaphore) + sem_offset;
+    int* meta = a->tile_count_semaphore;
+    if (metadata_size > 0 && meta == nullptr) return cudaErrorInvalidValue;
+    if (a->metadata_capacity < metadata_size) return cudaErrorInvalidValue;
+    // Varlen zeroes it inside prepare_varlen_num_blocks; otherwise do it here.
+    if (needs_semaphore && !varlen) {
+        cudaError_t st = cudaMemsetAsync(meta, 0, sizeof(int), stream);
         if (st != cudaSuccess) return st;
-        params.tile_count_semaphore = a->tile_count_semaphore;
-    } else {
-        params.tile_count_semaphore = nullptr;
     }
-    params.tile_count_semaphore_offset = 0;
+    params.prepare_varlen_pdl = false;
+    params.num_splits_dynamic_ptr = varlen ? meta : nullptr;
+    params.num_m_blocks_ptr = varlen ? meta + b_rounded : nullptr;
+    params.varlen_batch_idx_ptr =
+        varlen && params.varlen_sort_batches ? meta + b_rounded * 2 : nullptr;
+    params.num_nheads_in_l2_ptr =
+        varlen && params.head_swizzle ? meta + head_swizzle_offset : nullptr;
+    params.tile_count_semaphore = needs_semaphore ? meta + sem_offset : nullptr;
+    params.tile_count_semaphore_offset = sem_offset;
     params.skip_scheduler_metadata_computation = false;
-    params.num_splits_dynamic_ptr = nullptr;
-    params.num_m_blocks_ptr = nullptr;
-    params.varlen_batch_idx_ptr = nullptr;
-    params.num_nheads_in_l2_ptr = nullptr;
 
     if (params.num_splits > 1) {
         if (a->out_accum == nullptr || a->softmax_lse_accum == nullptr) {

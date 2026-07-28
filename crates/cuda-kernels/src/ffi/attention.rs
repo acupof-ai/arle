@@ -782,8 +782,11 @@ pub struct ArleFa3FwdHd256Args {
     /// fp32 split LSE scratch, `num_splits * num_heads * total_q` elements;
     /// null when `num_splits <= 1`.
     pub softmax_lse_accum: *mut f32,
-    /// device i32 scratch (>= 1 element); the shim zeroes it per launch.
+    /// Device i32 scratch for the scheduler metadata + semaphore. Size it
+    /// `round_up(batch, 4) * 4 + 1`.
     pub tile_count_semaphore: *mut i32,
+    /// Elements available at `tile_count_semaphore`.
+    pub metadata_capacity: i32,
     /// device i32 `[batch + 1]` prefix sum over query rows.
     pub cu_seqlens_q: *const i32,
     /// device i32 `[batch]` per-row KV extent in tokens.
