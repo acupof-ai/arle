@@ -2290,9 +2290,9 @@ impl Dsv4Model {
         let ctx = &self.ctx;
 
         // Batched (b=N) FlashMLA decode lane (#60, the #1 concurrency lever).
-        // MODEL1 B>1 uses this as the canonical path when the model-wide batched
-        // scratch exists. V32/GLM has no MODEL1 batch scratch and remains on the
-        // single-row fallback. N=1 never reaches this function.
+        // B>1 uses this as the canonical path when the model-wide batched
+        // scratch exists (both MODEL1 and V32/GLM). N=1 never reaches this
+        // function.
         let batched_attn_lane = crate::attention::dsv4_flashmla_decode_batched_enabled()?
             && kv_adapter.has_flashmla_batch_scratch();
 
