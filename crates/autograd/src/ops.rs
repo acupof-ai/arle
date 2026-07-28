@@ -61,7 +61,7 @@ pub(crate) use reduce::{mean_backward, sum_backward};
 pub(crate) use rope::rope_backward;
 pub(crate) use softmax::{log_softmax_backward, softmax_backward};
 
-pub use checkpoint::{checkpoint, checkpoint_sequential};
+pub use checkpoint::{checkpoint, checkpoint_seq_chunked, checkpoint_sequential};
 
 pub fn exp(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
     // Inner `activation::exp` dispatches on `dirty`; a Dirty::Device

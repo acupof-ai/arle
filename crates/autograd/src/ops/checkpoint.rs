@@ -183,3 +183,163 @@ where
 fn trace_checkpoint_group_vram() -> bool {
     std::env::var("ARLE_OPD_VRAM_TRACE").is_ok_and(|v| v != "0" && v != "false")
 }
+
+/// Seq-chunked recompute of a POSITION-WISE block: `replay(store, tape, inp)`
+/// maps row `i` of `inp[0]` (`[batch, seq, dim]` hidden) to row `i` of the
+/// output independently (RMSNorm, residual, MLP — NOT attention); `inp[1..]` are
+/// the block's trainable params (grads accumulate across chunks). Forward runs
+/// `replay` once full-seq tape-disabled (frees its own transients) for the
+/// output; the backward (`Tape::seq_chunked_recompute_backward`) re-runs `replay`
+/// on `chunk` seq rows at a time, so the recompute peak drops from
+/// `O(seq · intermediate)` to `O(chunk · intermediate)` — the 256K writeback
+/// lever. Bit-identical to the unchunked block up to float add-order. `chunk == 0`
+/// or `>= seq` => single-shot recompute (peak = full block). Runs only under an
+/// enabled tape; a disabled tape (checkpoint forward pass) just replays.
+pub fn checkpoint_seq_chunked<F>(
+    input: TensorId,
+    param_ids: Vec<TensorId>,
+    chunk: usize,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+    replay: F,
+) -> Result<TensorId>
+where
+    F: Fn(&mut TensorStore, &mut Tape, &[TensorId]) -> Result<TensorId> + Send + Sync + 'static,
+{
+    let mut input_ids = vec![input];
+    input_ids.extend(param_ids);
+    if !tape.enabled {
+        return replay(store, tape, &input_ids);
+    }
+    let shape = store.tensor(input)?.shape.clone();
+    let &[batch, seq, dim] = shape.as_slice() else {
+        return Err(AutogradError::InvalidRank {
+            expected: "rank-3 [batch, seq, dim]",
+            got: shape.len(),
+        });
+    };
+
+    let live_before = store.live_ids().into_iter().collect::<HashSet<_>>();
+    tape.enabled = false;
+    let forward = replay(store, tape, &input_ids);
+    tape.enabled = true;
+    let output_id = match forward {
+        Ok(id) => id,
+        Err(err) => {
+            let _ = store.free_new_except(&live_before, &HashSet::new());
+            return Err(err);
+        }
+    };
+    let mut keep = HashSet::from([output_id]);
+    keep.extend(input_ids.iter().copied());
+    store.free_new_except(&live_before, &keep)?;
+
+    let requires_grad = input_ids
+        .iter()
+        .any(|&id| store.get(id).is_some_and(|tensor| tensor.requires_grad));
+    if requires_grad {
+        let effective_chunk = if chunk == 0 { seq } else { chunk };
+        let function_id = tape.register_checkpoint_fn(Arc::new(replay));
+        tape.record(TapeEntry {
+            op: BackwardOp::SeqChunkedRecompute,
+            output_id,
+            input_ids: input_ids.into_iter().collect(),
+            saved: SavedContext::SeqChunkedRecomputeCtx {
+                function_id,
+                batch,
+                seq,
+                dim,
+                chunk: effective_chunk,
+            },
+        });
+    }
+    Ok(output_id)
+}
+
+#[cfg(test)]
+mod seq_chunked_tests {
+    use crate::{Result, Tape, ops, tensor::TensorStore};
+
+    fn seed(len: usize, s: u64) -> Vec<f32> {
+        let mut state = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+        (0..len)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((state >> 33) as f32 / (1u64 << 31) as f32 - 1.0) * 0.5
+            })
+            .collect()
+    }
+
+    /// A position-wise MLP block reshaped rank-2 so matmul_bt applies:
+    /// out = (silu(x@Wg^T) * (x@Wu^T)) @ Wd^T. Reads its own seq from `x`'s
+    /// shape so it is seq-agnostic — the contract a chunked replay must honor.
+    fn mlp_block(
+        x: crate::tensor::TensorId,
+        wg: crate::tensor::TensorId,
+        wu: crate::tensor::TensorId,
+        wd: crate::tensor::TensorId,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+    ) -> Result<crate::tensor::TensorId> {
+        let shape = store.tensor(x)?.shape.clone();
+        let (b, s, h) = (shape[0], shape[1], shape[2]);
+        let flat = ops::reshape(x, &[b * s, h], store, tape)?;
+        let gate = ops::silu(ops::matmul_bt(flat, wg, store, tape)?, store, tape)?;
+        let up = ops::matmul_bt(flat, wu, store, tape)?;
+        let act = ops::mul(gate, up, store, tape)?;
+        let out = ops::matmul_bt(act, wd, store, tape)?;
+        ops::reshape(out, &[b, s, h], store, tape)
+    }
+
+    #[test]
+    fn chunked_matches_unchunked() -> Result<()> {
+        let (b, s, h, i) = (1usize, 6usize, 4usize, 8usize);
+        let (xd, wgd, wud) = (seed(b * s * h, 1), seed(i * h, 2), seed(i * h, 3));
+        let wdd = seed(h * i, 4);
+
+        let run = |chunk: Option<usize>| -> Result<(f32, Vec<f32>, Vec<f32>)> {
+            let mut store = TensorStore::default();
+            let mut tape = Tape::new();
+            let x = store.from_slice(&xd, &[b, s, h])?;
+            store.set_requires_grad(x, true)?;
+            let wg = store.from_slice(&wgd, &[i, h])?;
+            store.set_requires_grad(wg, true)?;
+            let wu = store.from_slice(&wud, &[i, h])?;
+            store.set_requires_grad(wu, true)?;
+            let wd = store.from_slice(&wdd, &[h, i])?;
+            store.set_requires_grad(wd, true)?;
+            let out = match chunk {
+                None => mlp_block(x, wg, wu, wd, &mut store, &mut tape)?,
+                Some(c) => super::checkpoint_seq_chunked(
+                    x,
+                    vec![wg, wu, wd],
+                    c,
+                    &mut store,
+                    &mut tape,
+                    move |st, tp, inp| mlp_block(inp[0], inp[1], inp[2], inp[3], st, tp),
+                )?,
+            };
+            let loss = ops::sum(out, &mut store, &mut tape)?;
+            let loss_v = store.to_host(loss)?[0];
+            let grads = tape.backward(loss, &mut store)?;
+            let dx = store.to_host(*grads.get(&x).expect("dx"))?;
+            let dwg = store.to_host(*grads.get(&wg).expect("dwg"))?;
+            Ok((loss_v, dx, dwg))
+        };
+
+        let (l0, dx0, dwg0) = run(None)?;
+        let (l1, dx1, dwg1) = run(Some(2))?; // 3 chunks of 2 over seq=6
+        let max = |a: &[f32], b: &[f32]| {
+            a.iter()
+                .zip(b)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0_f32, f32::max)
+        };
+        assert!((l0 - l1).abs() < 1e-5, "loss {l0} vs {l1}");
+        assert!(max(&dx0, &dx1) < 1e-5, "d_input mismatch");
+        assert!(max(&dwg0, &dwg1) < 1e-5, "d_weight mismatch");
+        Ok(())
+    }
+}
