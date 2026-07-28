@@ -25,18 +25,21 @@ Screening compares new runs against the champion row — no second arm. Rules:
 python3 scripts/gen_bench_prompts.py bench-agent-119k-16x8.jsonl 16 119000 214 8
 ```
 
-## ThinkingCap-Qwen3.6-27B-FP8 · 1×H20 · single-GPU · eager — LONG-AGENT ANCHOR
+## Qwen3.6 on 1×H20 · single-GPU · eager — LONG-AGENT ANCHOR
 
-### CHAMPION — `5d2ad36fd` (2026-07-28) · FA3 paged at every query length
+### CHAMPION — `55bf627bc` (2026-07-28) · FA3 paged, qlen ≤ 64
 
-Canonical CUDA agentic model (`bottlecapai/ThinkingCap-Qwen3.6-27B-FP8`, ~29 GB,
-qwen35 hybrid, TP=1). Dataset `bench-agent-32k-16x8.jsonl`, sha256
-`8867f63eaac2f053…`, regenerable via
+Three arms, one binary (`arle-fa3c`), one session, one dataset. Models:
+`bottlecapai/ThinkingCap-Qwen3.6-27B-FP8` (~29 GB dense, canonical CUDA agentic
+model) and `Qwen3.6-35B-A3B-FP8` (MoE, 3B active). Both TP=1, qwen35 hybrid,
+head_dim 256 — they share `full_attention_paged` and diverge only at the FFN.
+
+Dataset `bench-agent-32k-16x8.jsonl`, sha256 `8867f63eaac2f053…`, regenerable via
 `gen_bench_prompts.py bench-agent-32k-16x8.jsonl 16 32000 214 8` (16 sessions ×
 8 turns; sessions ≥ max concurrency, rule 5). Runner `bench_throughput.py`,
-128 req/point, max_tokens 214, greedy, seed 20260416,
-`--max-running-requests 16`, GPUs 0 (no-spec) and 2 (DSpark), same binary and
-session. `prompt_tokens` p50 34828. 0 errors.
+128 req/point, `--concurrency-grid 1,8,16`, max_tokens 214, greedy, seed
+20260416, `--max-running-requests 16`. `prompt_tokens` p50 34828. Needle gate
+exact=3 DET at 512/4k/16k/32k on every arm. 0 errors at all 9 points.
 
 **Prefill and decode are separate SLOs — never averaged into one tok/s.**
 Prefill = TTFT and `prompt_tokens / TTFT`. Decode = token-weighted mean ITL
@@ -44,35 +47,52 @@ Prefill = TTFT and `prompt_tokens / TTFT`. Decode = token-weighted mean ITL
 whole accepted chain lands per step, so ITL p50 there is ~0.02 ms and
 meaningless. Never use `e2e − ttft` — this harness carries ~4.7 s of
 post-stream teardown in `e2e`, inflating TPOT ~1.85×. Cold = each session's
-turn 0 (nothing to reuse); warm = turns 1-7.
+turn 0 (nothing to reuse); warm = turns 1-7. `total tok/s` counts prompt +
+generated tokens over wall time: a capacity number, not a latency one.
 
-| c | arm | TTFT p50 cold | TTFT p50 warm | prefill tok/s | decode mean ITL | decode tok/s | total tok/s |
+| c | arm | TTFT cold | TTFT warm | prefill tok/s | TPOT | decode tok/s | total tok/s |
 |---|---|---:|---:|---:|---:|---:|---:|
-| 1 | no-spec | 48.0 s | 13.1 s | 4257 | 29.68 ms | 33.7 | 1345.5 |
-| 1 | DSpark 16 | 48.3 s | 13.2 s | 4213 | **9.55 ms** | **104.7** | 1431.7 |
+| 1 | dense no-spec | 48.7 s | 14.2 s | 4252 | 28.71 ms | 34.8 | 1403.3 |
+| 1 | dense DSpark 16 | 48.3 s | 13.3 s | 3801 | **9.39 ms** | **106.6** | 1504.8 |
+| 1 | MoE no-spec | 18.6 s | 4.8 s | **10991** | 15.93 ms | 62.8 | 3174.0 |
+| 8 | dense no-spec | 21.9 s | 15.3 s | 4416 | 908.39 ms | 1.1 | 2007.7 |
+| 8 | dense DSpark 16 | 22.7 s | 15.7 s | 4301 | 838.64 ms | 1.2 | 2140.7 |
+| 8 | MoE no-spec | 10.9 s | 3.4 s | 11268 | 224.29 ms | 4.5 | **5689.0** |
+| 16 | dense no-spec | 75.2 s | 26.9 s | 4071 | 1822.09 ms | 0.5 | 2027.4 |
+| 16 | dense DSpark 16 | 72.3 s | 23.8 s | 4231 | 1755.26 ms | 0.6 | 2132.3 |
+| 16 | MoE no-spec | 27.5 s | 8.1 s | 10701 | 453.79 ms | 2.2 | 5759.6 |
 
-Warm-turn decode: no-spec 30.24 ms (33.1 tok/s), DSpark **9.06 ms (110.4 tok/s)**.
+Cold/warm decode at c=1: dense no-spec 27.58/28.99 ms, DSpark 11.91/**8.77 ms
+(114.1 tok/s warm)**, MoE 14.98/16.10 ms. DSpark is the only arm that gets
+*faster* warm — a hit prefix leaves the drafter more context to work with.
 
-c=8 and c=16 are re-measuring on this binary (2026-07-28, pending). Do not
-carry the previous row's c=8/16 forward — they were measured with FA3 reaching
-only the no-spec arm, which is the defect this row fixes.
-
-- **DSpark is 3.11× per token at c=1** (9.55 vs 29.68 ms), up from 1.48× before
-  the verify path reached FA3. A verify step now costs 9.55 × E[k+1]=3.19 ≈
-  30.5 ms against a 29.68 ms decode step — **1.03×**, the physical floor, since
+- **DSpark is 3.06× per token at c=1** (9.39 vs 28.71 ms), up from 1.48× before
+  the verify path reached FA3. A verify step costs 9.39 × E[k+1]=3.19 ≈ 30.0 ms
+  against a 28.71 ms decode step — **1.04×**, the physical floor, since
   verifying 17 tokens reads the same KV bytes as verifying 1.
   [entry](experience/wins/2026-07-28-fa3-covers-every-query-length.md)
-- **Total tok/s only moves +6.4%** because a warm request spends 13.1 s in
-  prefill against 6.3 s of decode. Decode speed is a latency result; total
-  tok/s is a capacity result. They answer different questions.
-- **FA3 on prefill chunks is a wash** — 4257 vs 4352 tok/s, inside the ±3%
-  drift band. It was enabled to get one predicate, not for prefill speed.
+- **The spec win decays with concurrency: 3.06× (c=1) → 1.08× (c=8) → 1.04×
+  (c=16).** Expected, not a defect — once the batch is full the GPU is already
+  saturated with real tokens and there is no idle capacity for drafts to
+  reclaim. Total tok/s still moves +6.6% at c=8.
+- **MoE beats dense on every axis at equal spec setting** — 1.80× decode
+  (62.8 vs 34.8), 2.6× prefill, 2.26× total at c=1 — on the *identical* FA3
+  kernel at GQA 8. Comparing MoE against the DSpark row is apples to oranges.
+- **All three arms hit the same wall at c=8**: c=8→16 buys +0.7% (dense
+  no-spec), −0.4% (DSpark), +1.2% (MoE) total tok/s while TPOT doubles. Model-
+  and spec-independent, so it is queueing, not compute — ITL p50 at c=8 is
+  66.07 ms (no-spec) vs 66.19 ms (DSpark), and p90 is 4035 vs 3823 ms. The
+  bimodal ITL is the scheduler, and it is the next thing worth attacking.
+- **FA3 on prefill chunks is a wash and is capped anyway** — `FA3_MAX_QLEN = 64`
+  keeps prefill on TileLang; FA3 needs one launch per request when `seqused_k`
+  is set, which cost 51% of TTFT at c=8.
+  [entry](experience/errors/2026-07-28-fa3-prefill-per-request-launch-regression.md)
 - **FA3 paged is the delta vs anything before 2026-07-27**: decode mean ITL
   76.98 → 28.64 ms at c=1 on the same dataset.
   [entry](experience/wins/2026-07-27-fa3-paged-decode-32k-2.76x.md)
 - sm_90 only: FA3 hopper is Hopper-only; other targets keep the TileLang
   `batch_decode_paged_hd256` kernel.
-- c=4 not measured (grid is 1,8,16).
+- c=4 not measured (grid is 1,8,16). MoE has no DSpark arm (no drafter).
 
 **Superseded fingerprints** (deleted 2026-07-28 — one dataset per question,
 rule 5). What survives them:

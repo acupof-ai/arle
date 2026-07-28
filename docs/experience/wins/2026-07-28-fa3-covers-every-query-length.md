@@ -43,19 +43,26 @@ it shares `full_attention_paged`; it only diverges at the FFN. It does exercise
 a GQA ratio of 8 against the dense model's 6, which PackGQA had not been
 checked at.
 
-Decode, c=1, `bench-agent-32k-16x8`, token-weighted mean ITL:
+Decode, `bench-agent-32k-16x8`, token-weighted mean ITL, capped-gate binary
+`arle-fa3c`, all three arms one session (full table in
+[baselines](../../baselines.md)):
 
-| | no-spec | DSpark 16 |
-|---|---:|---:|
-| all turns | 29.68 ms (33.7 tok/s) | **9.55 ms (104.7)** |
-| warm turns | 30.24 ms (33.1) | **9.06 ms (110.4)** |
+| | no-spec | DSpark 16 | ratio |
+|---|---:|---:|---:|
+| c=1, all turns | 28.71 ms (34.8 tok/s) | **9.39 ms (106.6)** | 3.06× |
+| c=1, warm turns | 28.99 ms (34.5) | **8.77 ms (114.1)** | 3.31× |
+| c=8 | 908.39 ms | 838.64 ms | 1.08× |
+| c=16 | 1822.09 ms | 1755.26 ms | 1.04× |
 
-**3.11× per token**, up from 1.48× before the verify path reached FA3. The
-verify step now costs 9.55 × E[k+1]=3.19 ≈ 30.5 ms against a 29.68 ms decode
-step — **1.03×**, which is the floor: verifying 17 tokens reads the same KV
+**3.06× per token at c=1**, up from 1.48× before the verify path reached FA3.
+The verify step costs 9.39 × E[k+1]=3.19 ≈ 30.0 ms against a 28.71 ms decode
+step — **1.04×**, which is the floor: verifying 17 tokens reads the same KV
 bytes as verifying 1.
 
-c=8/16 pending-remote on the capped-gate binary.
+The decay to 1.08× at c=8 is not the spec path failing. Both arms collapse
+identically there (ITL p50 66.07 vs 66.19 ms, p90 4035 vs 3823 ms) and the MoE
+arm collapses too — it is the scheduler queueing, and it caps every arm's total
+tok/s at c=8. Speculation only converts *idle* capacity; a full batch has none.
 
 ## Problems
 
