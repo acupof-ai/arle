@@ -53,6 +53,7 @@ static QWEN35_MOE_DECODE_KERNEL: AtomicBool = AtomicBool::new(true);
 static QWEN35_GPU_ROUTER: AtomicBool = AtomicBool::new(true);
 static QWEN35_FA3: AtomicBool = AtomicBool::new(true);
 static QWEN35_FA3_DECODE_SPLITS: AtomicUsize = AtomicUsize::new(8);
+static QWEN35_DEEPGEMM_MIN_ROUTES: AtomicUsize = AtomicUsize::new(1024);
 static QWEN35_GDR_CHUNKED: AtomicBool = AtomicBool::new(false);
 static NUMA_PIN: AtomicBool = AtomicBool::new(true);
 static COMM_NCCL_ONLY: AtomicBool = AtomicBool::new(false);
@@ -75,6 +76,7 @@ pub fn apply_runtime_flags(f: &CudaRuntimeFlags) {
     QWEN35_GPU_ROUTER.store(f.qwen35_gpu_router, Relaxed);
     QWEN35_FA3.store(f.qwen35_fa3, Relaxed);
     QWEN35_FA3_DECODE_SPLITS.store(f.qwen35_fa3_decode_splits.clamp(2, 256), Relaxed);
+    QWEN35_DEEPGEMM_MIN_ROUTES.store(f.qwen35_deepgemm_min_routes.max(1), Relaxed);
     QWEN35_GDR_CHUNKED.store(f.qwen35_gdr_chunked, Relaxed);
     SHARD_CACHE_BYTES.store(f.shard_cache_bytes.unwrap_or(usize::MAX), Relaxed);
     NUMA_PIN.store(f.numa_pin, Relaxed);
@@ -119,6 +121,9 @@ pub(crate) fn qwen35_fa3() -> bool {
 }
 pub(crate) fn qwen35_fa3_decode_splits() -> usize {
     QWEN35_FA3_DECODE_SPLITS.load(Relaxed)
+}
+pub(crate) fn qwen35_deepgemm_min_routes() -> usize {
+    QWEN35_DEEPGEMM_MIN_ROUTES.load(Relaxed)
 }
 pub(crate) fn qwen35_gdr_chunked() -> bool {
     QWEN35_GDR_CHUNKED.load(Relaxed)
