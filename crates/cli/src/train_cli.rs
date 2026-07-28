@@ -951,6 +951,7 @@ enum OpdCliTeacher<'a> {
     InProcess(train::teacher_infer::InProcessTeacher<'a>),
     #[cfg(feature = "cuda")]
     Infer(train::teacher_infer::InferTeacher),
+    Api(train::teacher_infer::ApiTeacher),
     CorpusSftOnly {
         vocab_size: usize,
     },
@@ -975,6 +976,9 @@ impl train::teacher_infer::TeacherForward for OpdCliTeacher<'_> {
             }
             #[cfg(feature = "cuda")]
             Self::Infer(teacher) => train::teacher_infer::TeacherForward::forward_logits_device(
+                teacher, input_ids, positions, store, tape,
+            ),
+            Self::Api(teacher) => train::teacher_infer::TeacherForward::forward_logits_device(
                 teacher, input_ids, positions, store, tape,
             ),
             Self::CorpusSftOnly { .. } => {
@@ -1010,6 +1014,11 @@ impl train::teacher_infer::TeacherForward for OpdCliTeacher<'_> {
                     teacher, input_ids, positions, window, store, tape,
                 )
             }
+            Self::Api(teacher) => {
+                train::teacher_infer::TeacherForward::forward_logits_window_device(
+                    teacher, input_ids, positions, window, store, tape,
+                )
+            }
             Self::CorpusSftOnly { .. } => {
                 Err(train::teacher_infer::TeacherForwardError::InvalidInput(
                     "corpus-truth SFT-only teacher was asked to score windowed KL logits; \
@@ -1025,6 +1034,7 @@ impl train::teacher_infer::TeacherForward for OpdCliTeacher<'_> {
             Self::InProcess(teacher) => train::teacher_infer::TeacherForward::vocab_size(teacher),
             #[cfg(feature = "cuda")]
             Self::Infer(teacher) => train::teacher_infer::TeacherForward::vocab_size(teacher),
+            Self::Api(teacher) => train::teacher_infer::TeacherForward::vocab_size(teacher),
             Self::CorpusSftOnly { vocab_size } => *vocab_size,
         }
     }
@@ -1036,6 +1046,7 @@ impl train::teacher_infer::TeacherForward for OpdCliTeacher<'_> {
             }
             #[cfg(feature = "cuda")]
             Self::Infer(teacher) => train::teacher_infer::TeacherForward::parameter_ids(teacher),
+            Self::Api(teacher) => train::teacher_infer::TeacherForward::parameter_ids(teacher),
             Self::CorpusSftOnly { .. } => &[],
         }
     }
@@ -1051,6 +1062,9 @@ impl train::teacher_infer::TeacherForward for OpdCliTeacher<'_> {
             Self::Infer(teacher) => {
                 train::teacher_infer::TeacherForward::offload_engine_weights(teacher)
             }
+            Self::Api(teacher) => {
+                train::teacher_infer::TeacherForward::offload_engine_weights(teacher)
+            }
             Self::CorpusSftOnly { .. } => Ok(0),
         }
     }
@@ -1064,6 +1078,9 @@ impl train::teacher_infer::TeacherForward for OpdCliTeacher<'_> {
             }
             #[cfg(feature = "cuda")]
             Self::Infer(teacher) => {
+                train::teacher_infer::TeacherForward::reload_engine_weights(teacher)
+            }
+            Self::Api(teacher) => {
                 train::teacher_infer::TeacherForward::reload_engine_weights(teacher)
             }
             Self::CorpusSftOnly { .. } => Ok(()),
@@ -1206,6 +1223,9 @@ fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
         OpdTeacherRuntimeArg::Infer if corpus_sft_only => OpdCliTeacher::CorpusSftOnly {
             vocab_size: cfg.vocab_size,
         },
+        OpdTeacherRuntimeArg::Api if corpus_sft_only => OpdCliTeacher::CorpusSftOnly {
+            vocab_size: cfg.vocab_size,
+        },
         OpdTeacherRuntimeArg::InProcess => {
             let teacher = teacher_model
                 .as_ref()
@@ -1232,6 +1252,18 @@ fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
                 maybe_preoffload_infer_teacher_before_steps(&teacher, &train_backend)?;
                 teacher
             }
+        }
+        OpdTeacherRuntimeArg::Api => {
+            // Teacher lives in a separate `arle serve` (own GPU); we only POST tokens
+            // and receive raw logits. No teacher weights on the training device — the
+            // only layout that fits the full FP8 teacher beside an FP8 student.
+            let url = args.teacher_url.as_deref().ok_or_else(|| {
+                anyhow!("--teacher-runtime api requires --teacher-url (the raw_logits endpoint)")
+            })?;
+            OpdCliTeacher::Api(
+                train::teacher_infer::ApiTeacher::new(url, cfg.vocab_size)
+                    .with_request_dtype("bf16"),
+            )
         }
     };
 

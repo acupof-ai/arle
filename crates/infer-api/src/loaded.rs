@@ -385,6 +385,11 @@ pub(crate) fn classify_cuda_model(v: &serde_json::Value) -> CudaModelKind {
     }
 }
 
+// OPD API-teacher raw-logits HTTP surface (CUDA-only; merged into router_cuda).
+#[cfg(feature = "cuda")]
+#[path = "loaded/raw_logits_route.rs"]
+mod raw_logits_route;
+
 #[cfg(test)]
 mod hot_workspace_tests {
     use super::EngineLoadConfig;
@@ -2598,7 +2603,8 @@ mod backend {
             model_id,
             config.max_thinking_tokens,
             None,
-        );
+        )
+        .merge(super::raw_logits_route::raw_logits_router(engine.clone()));
         Ok((router, engine))
     }
 
