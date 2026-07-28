@@ -143,15 +143,9 @@ pub enum SavedContext {
         norm_weight: TensorId,
         preact: Option<TensorId>,
         qkv_conv: Option<TensorId>,
-        q: Option<TensorId>,
-        k: Option<TensorId>,
-        v: Option<TensorId>,
         g: Option<TensorId>,
-        g_cumsum: Option<TensorId>,
         beta: Option<TensorId>,
-        a_inv: Option<TensorId>,
         chunk_state: Option<TensorId>,
-        raw_output: Option<TensorId>,
         /// OPD frozen-prompt-KV carry: seeds the recurrent state + conv window
         /// from a prior (prompt) segment so the backward recompute reproduces the
         /// forward exactly. `None` for the default full-sequence path.
