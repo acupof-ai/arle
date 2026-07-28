@@ -27,63 +27,58 @@ python3 scripts/gen_bench_prompts.py bench-agent-119k-16x8.jsonl 16 119000 214 8
 
 ## Qwen3.6 on 1×H20 · single-GPU · eager — LONG-AGENT ANCHOR
 
-### CHAMPION — `1fad68524` (2026-07-28) · host-authoritative KV mirror
+### CHAMPION — `a956f69b1` (2026-07-28) · host-authoritative KV mirror + batched FA3
 
-Both no-spec arms re-anchored on `arle-mirror` after qwen35 dropped its second
-KV allocator. Same dataset, seed, runner as the table below.
+Both no-spec arms on `arle-fa3b2`. Same dataset, seed, runner as the table
+below; MoE on one GPU, dense on another, same box.
 
-| c | arm | TTFT cold | TTFT warm | TPOT | decode tok/s | total tok/s |
-|---|---|---:|---:|---:|---:|---:|
-| 1 | MoE no-spec | 9.3 s | **0.6 s** | 16.03 ms | 62.4 | **7529.0** |
-| 8 | MoE no-spec | 0.7 s | 0.4 s | **61.40 ms** | 16.3 | **23360.0** |
-| 16 | MoE no-spec | 1.9 s | 0.6 s | **109.42 ms** | 9.1 | **26139.4** |
-| 1 | dense no-spec | 19.0 s | **1.0 s** | 28.68 ms | 34.9 | **5017.6** |
-| 8 | dense no-spec | 1.3 s | 0.5 s | **93.66 ms** | 10.7 | **20928.5** |
-| 16 | dense no-spec | 4.1 s | 0.8 s | **165.42 ms** | 6.0 | **23496.5** |
+| c | arm | TTFT cold | TTFT warm | TPOT | ITL p50 | decode tok/s | total tok/s |
+|---|---|---:|---:|---:|---:|---:|---:|
+| 1 | MoE no-spec | 9.2 s | **0.7 s** | 16.22 ms | 16.17 ms | 61.7 | 6707.2 |
+| 8 | MoE no-spec | 0.6 s | 0.5 s | **44.10 ms** | 38.31 ms | 22.7 | **27967.8** |
+| 16 | MoE no-spec | 1.8 s | 0.6 s | **73.74 ms** | 60.90 ms | 13.6 | **33858.9** |
+| 1 | dense no-spec | 19.0 s | **1.0 s** | 28.83 ms | 28.78 ms | 34.7 | 5028.2 |
+| 8 | dense no-spec | 1.2 s | 0.5 s | **81.87 ms** | 52.30 ms | 12.2 | **24702.9** |
+| 16 | dense no-spec | 4.2 s | 0.7 s | **122.15 ms** | 66.55 ms | 8.2 | **30045.6** |
 
 0 errors at all six points; needle gate exact=3 DET at 512/4k/16k/32k. MoE
-128/128 complete; dense 127/128 at every point (one request per point never
-finished — unexplained, not an error, tracked against the next dense run).
+128/128 complete; dense 126/128 (two requests per point never finished —
+unexplained, not an error, still open).
 
-Against `55bf627bc`: dense c=1 TPOT is unchanged to 0.1% (28.71 → 28.68 ms —
-the decode step itself was not touched), while c=8 TPOT moves 908.39 → 93.66 ms
-and c=16 1822.09 → 165.42 ms. The MoE baseline was re-run on the same GPU in the
-same session and reproduced its cross-session row (TPOT 15.95 / 219.99 / 455.92
-vs 15.93 / 224.29 / 453.79), so the comparison is matched, not cross-session.
+Two changes stack here, both measured separately:
 
-**The decode step scales as `a + b·B`, and `b` is the same on both models.**
-Fitting ITL p50 (tail-free) at c=8/16: MoE `12.7 ms + 5.12·B`, dense
-`24.6 ms + 5.19·B`. The intercepts differ as expected — dense reads 27 GB of
-weights per step, MoE only its active 3B plus shared — but the per-row marginal
-is identical, which is what makes high concurrency expensive: it is never
-amortized, so TPOT doubles when `c` doubles.
+1. **The KV mirror** ([entry](experience/wins/2026-07-28-qwen35-host-authoritative-kv-mirror.md))
+   — qwen35 dropped its second device allocator, so a radix hit costs a page-table
+   mirror instead of a host KV round-trip. Warm TTFT stops scaling with prefix
+   length: 33k 3.020 → 0.175 s, flat across a 8× span.
+2. **Batched FA3** ([entry](experience/wins/2026-07-28-fa3-one-launch-per-layer.md))
+   — paged full attention was launched once per row per layer. One launch per
+   layer now: nsys shows 34,212 → 3,049 launches over the same window, FA3's
+   share of GPU time 44.3% → 19.6%.
 
-That marginal is **not** KV-bandwidth-bound. Dense carries 64 KB of KV per token
-(4 kv_heads × 256 × 2 × 2 B × 16 full-attn layers) against MoE's 20 KB (2 × 256 ×
-2 × 2 × 10) — 3.2× the bytes per row at the same 35k context, so a bandwidth-bound
-marginal would differ by ~3×. It differs by 1.4%. Roofline for the marginal is
-0.56 ms/row (dense) and 0.175 ms/row (MoE) against 5.1 ms measured: 9× and 29×.
-Being both model- and shape-independent points at a fixed per-row cost outside
-the model math. A c=16 nsys capture to attribute it is the open work.
+**The decode step still scales as `a + b·B`, but `b` fell.** Fitting ITL p50 at
+c=8/16: MoE `12.7 + 5.12·B` → `15.7 + 2.82·B`, dense `24.6 + 5.19·B` →
+`38.0 + 1.78·B`. Dense gains more on the marginal because it has 16
+full-attention layers to MoE's 10, i.e. more per-row launches to delete. (The
+dense fit is two points over a heavy tail — treat its intercept as indicative.)
 
-Dense additionally still has a tail problem the MoE arm does not: 9-11% of
-inter-token gaps exceed 3× p50 and carry ~35% of decode wall (p90 475 ms vs p50
-108 ms at c=16), against 3% / 9-13% for MoE. Dense prefill is 4× slower, so its
-chunks block decode for longer.
-
-- **Warm TTFT is now flat in prefix length** — 0.147–0.175 s across 4k→33k in a
-  matched c=1 probe, against 0.480→3.020 s before. A radix hit costs a page-table
-  mirror, not a host KV round-trip.
-  [entry](experience/wins/2026-07-28-qwen35-host-authoritative-kv-mirror.md)
-- **The c=8 wall was the restore work, not pure queueing.** The prior entry read
-  the c=8→16 plateau as scheduler queueing; TPOT moves 224.29 → 61.40 ms at c=8
-  with no scheduler change, so most of that wall was requests serialized behind
-  per-turn sidecar restores. What remains of the plateau is still worth attacking.
-- **`prefill tok/s` is no longer meaningful on this arm** — warm TTFT is
-  dominated by cache-hit bookkeeping, so `prompt_tokens / TTFT` measures the hit,
-  not a compute rate. Dropped from the table rather than reported as throughput.
-- Dense arms have not been re-anchored on this binary; the `55bf627bc` rows below
-  remain the reference for them.
+- **c=1 is untouched by design** — 16.03 → 16.22 ms (MoE), 28.68 → 28.83 ms
+  (dense). One row is one launch either way; the whole win is in the batch.
+- **MoE expert decode is now the wall**: `dsv4_fp8_grouped_{down,swiglu}_decode`
+  are 53.9% of GPU time at 1,025 µs/layer against an ~89 µs weight-read roofline
+  at R=128 (113 active experts × 3.15 MB FP8 at 4 TB/s). The kernels are tuned
+  for `B ≤ ACT_TILE(8)` (`moe.rs:120`), where each weight row is read once; B=16
+  should cost 2 passes, not 11×. Unexplained — ncu, not arithmetic, is next.
+- **Dense has a tail problem MoE does not, and it got relatively worse.** 17.3%
+  of dense inter-token gaps exceed 3× p50 and carry **55.4%** of decode wall at
+  c=16 (was 10.7%/35.2%), against 6.1%/21.7% for MoE. Nothing regressed — the
+  steady-state step got 1.62× faster, so the prefill-blocking spikes now dominate
+  the mean. Dense prefill is ~2× slower per token than MoE's, so its chunks block
+  decode longer. This is why dense TPOT only moves 1.35× while its p50 moves
+  1.62×.
+- **`prefill tok/s` is not meaningful on either arm** — warm TTFT is dominated by
+  cache-hit bookkeeping, so `prompt_tokens / TTFT` measures the hit, not a
+  compute rate. Dropped from the table rather than reported as throughput.
 
 ### PRIOR — `55bf627bc` (2026-07-28) · FA3 paged, qlen ≤ 64
 
