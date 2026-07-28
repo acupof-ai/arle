@@ -2822,7 +2822,10 @@ fn main() {
             || is_fa3_kernel
             || matches!(
                 stem,
-                "arle_flashmla_shim" | "arle_flashmla_decode_shim" | "arle_fa3_shim"
+                "arle_flashmla_shim"
+                    | "arle_flashmla_decode_shim"
+                    | "arle_fa3_shim"
+                    | "arle_q8kv8_prefill_shim"
             );
         // The sm_120 grouped-FP8 TU that also has an sm_120 gencode target: the
         // only build that forces sm_120a gencode + defines ARLE_SM120_GROUPED_FP8.
@@ -2916,6 +2919,24 @@ fn main() {
                     "-I{}",
                     flashmla_root.join("csrc/kerutils/include").display()
                 ),
+            ]);
+        }
+
+        // SGLang sparse_mla_q8kv8_prefill_sm90 shim: native FP8 (q8 x kv8)
+        // sparse MLA prefill. Reuses FlashMLA's vendored CUTLASS tree for the
+        // CuTe/WGMMA headers the kernel pulls in. sm_90a gencode set above.
+        if is_sm90a_only && stem == "arle_q8kv8_prefill_shim" {
+            nvcc_args.extend([
+                "-std=c++17".to_string(),
+                "--expt-relaxed-constexpr".to_string(),
+                "--expt-extended-lambda".to_string(),
+                "--use_fast_math".to_string(),
+                "-DNDEBUG".to_string(),
+                "-DCUTE_USE_PACKED_TUPLE=1".to_string(),
+                "-DCUTLASS_ENABLE_TENSOR_CORE_MMA=1".to_string(),
+                "-Xcudafe=--diag_suppress=177".to_string(),
+                format!("-I{}", flashmla_root.join("csrc/cutlass/include").display()),
+                "-Ivendor/q8kv8_prefill".to_string(),
             ]);
         }
 
