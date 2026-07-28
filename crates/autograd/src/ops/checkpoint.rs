@@ -193,7 +193,8 @@ fn trace_checkpoint_group_vram() -> bool {
 /// on `chunk` seq rows at a time, so the recompute peak drops from
 /// `O(seq · intermediate)` to `O(chunk · intermediate)` — the 256K writeback
 /// lever. Bit-identical to the unchunked block up to float add-order. `chunk == 0`
-/// or `>= seq` => single-shot recompute (peak = full block). Runs only under an
+/// => inline passthrough on the live tape (off, zero overhead); `chunk >= seq`
+/// => single-shot recompute. Runs only under an
 /// enabled tape; a disabled tape (checkpoint forward pass) just replays.
 pub fn checkpoint_seq_chunked<F>(
     input: TensorId,
@@ -218,6 +219,13 @@ where
             got: shape.len(),
         });
     };
+    // chunk == 0 → off: inline on the live tape (normal autograd, no recompute),
+    // byte-identical to a plain block. The recompute path only earns its keep at
+    // long seq; below the threshold this is a zero-overhead passthrough, so the
+    // caller can invoke unconditionally.
+    if chunk == 0 {
+        return replay(store, tape, &input_ids);
+    }
 
     let live_before = store.live_ids().into_iter().collect::<HashSet<_>>();
     tape.enabled = false;
@@ -238,7 +246,7 @@ where
         .iter()
         .any(|&id| store.get(id).is_some_and(|tensor| tensor.requires_grad));
     if requires_grad {
-        let effective_chunk = if chunk == 0 { seq } else { chunk };
+        let effective_chunk = chunk.min(seq);
         let function_id = tape.register_checkpoint_fn(Arc::new(replay));
         tape.record(TapeEntry {
             op: BackwardOp::SeqChunkedRecompute,
@@ -331,6 +339,7 @@ mod seq_chunked_tests {
 
         let (l0, dx0, dwg0) = run(None)?;
         let (l1, dx1, dwg1) = run(Some(2))?; // 3 chunks of 2 over seq=6
+        let (lz, dxz, dwgz) = run(Some(0))?; // chunk=0 → inline passthrough (default-off)
         let max = |a: &[f32], b: &[f32]| {
             a.iter()
                 .zip(b)
@@ -340,6 +349,10 @@ mod seq_chunked_tests {
         assert!((l0 - l1).abs() < 1e-5, "loss {l0} vs {l1}");
         assert!(max(&dx0, &dx1) < 1e-5, "d_input mismatch");
         assert!(max(&dwg0, &dwg1) < 1e-5, "d_weight mismatch");
+        // chunk=0 inline must equal the plain block exactly (byte-identical path).
+        assert!((l0 - lz).abs() < 1e-6, "chunk=0 loss {l0} vs {lz}");
+        assert!(max(&dx0, &dxz) < 1e-6, "chunk=0 d_input mismatch");
+        assert!(max(&dwg0, &dwgz) < 1e-6, "chunk=0 d_weight mismatch");
         Ok(())
     }
 }

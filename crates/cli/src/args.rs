@@ -1092,11 +1092,6 @@ pub(crate) struct OpdRuntimeArgs {
     #[arg(long, default_value_t = 2, value_name = "N")]
     pub(crate) rollout_retain_interval: usize,
 
-    /// Seq-chunk size for the per-layer MLP recompute (0 = off). 256K writeback
-    /// lever: bounds the recompute peak to O(chunk · intermediate).
-    #[arg(long, default_value_t = 0, value_name = "TOKENS")]
-    pub(crate) mlp_seq_chunk: usize,
-
     /// Rollout progress log interval (steps; the log line itself is gated by
     /// the ARLE_OPD_ROLLOUT_PROGRESS instrumentation env).
     #[arg(long, default_value_t = 16, value_name = "N")]
@@ -1201,7 +1196,6 @@ impl OpdRuntimeArgs {
             rollout_retain_interval: self.rollout_retain_interval,
             rollout_progress_interval: self.rollout_progress_interval,
             max_update_seq: self.max_update_seq,
-            mlp_seq_chunk: self.mlp_seq_chunk,
             autograd: autograd::AutogradRuntimeFlags {
                 checkpoint_offload_min_bytes: self.checkpoint_offload_min_bytes,
                 legacy_lora_linear_bwd: self.legacy_lora_linear_bwd,
