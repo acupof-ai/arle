@@ -524,9 +524,15 @@ impl DsparkTrainer {
             .store
             .from_slice(&expanded_weights, &[n_rows, vocab_size])?;
         let weighted_sq_id = ops::mul(sq_diff_id, exp_weight_id, &mut self.store, &mut self.tape)?;
+        // Per-token mean of the squared-L2 distribution distance ‖softmax(draft) −
+        // softmax(target)‖² — the TV surrogate from line 504, which is a SUM over
+        // vocab (TV = ½Σ|p−q|), not a mean. Dividing by vocab_size too averaged a
+        // sum-over-classes quantity as a per-class mean → ~1/248320 → the term
+        // (and its gradient) underflowed f32, making prob_match_alpha inert at
+        // production vocab scale. Normalize per token only.
         let prob_match_loss_id = ops::mul_scalar(
             ops::sum(weighted_sq_id, &mut self.store, &mut self.tape)?,
-            1.0 / (weight_sum * vocab_size as f32),
+            1.0 / weight_sum,
             &mut self.store,
             &mut self.tape,
         )?;
