@@ -29,17 +29,47 @@ python3 scripts/gen_bench_prompts.py bench-agent-119k-16x8.jsonl 16 119000 214 8
 
 ### CHAMPION — `1fad68524` (2026-07-28) · host-authoritative KV mirror
 
-MoE arm only, re-anchored on `arle-mirror` after qwen35 dropped its second KV
-allocator. Same dataset, seed, runner, GPU as the table below.
+Both no-spec arms re-anchored on `arle-mirror` after qwen35 dropped its second
+KV allocator. Same dataset, seed, runner as the table below.
 
 | c | arm | TTFT cold | TTFT warm | TPOT | decode tok/s | total tok/s |
 |---|---|---:|---:|---:|---:|---:|
 | 1 | MoE no-spec | 9.3 s | **0.6 s** | 16.03 ms | 62.4 | **7529.0** |
 | 8 | MoE no-spec | 0.7 s | 0.4 s | **61.40 ms** | 16.3 | **23360.0** |
 | 16 | MoE no-spec | 1.9 s | 0.6 s | **109.42 ms** | 9.1 | **26139.4** |
+| 1 | dense no-spec | 19.0 s | **1.0 s** | 28.68 ms | 34.9 | **5017.6** |
+| 8 | dense no-spec | 1.3 s | 0.5 s | **93.66 ms** | 10.7 | **20928.5** |
+| 16 | dense no-spec | 4.1 s | 0.8 s | **165.42 ms** | 6.0 | **23496.5** |
 
-128/128 complete, 0 errors at all three points; needle gate exact=3 DET at
-512/4k/16k/32k.
+0 errors at all six points; needle gate exact=3 DET at 512/4k/16k/32k. MoE
+128/128 complete; dense 127/128 at every point (one request per point never
+finished — unexplained, not an error, tracked against the next dense run).
+
+Against `55bf627bc`: dense c=1 TPOT is unchanged to 0.1% (28.71 → 28.68 ms —
+the decode step itself was not touched), while c=8 TPOT moves 908.39 → 93.66 ms
+and c=16 1822.09 → 165.42 ms. The MoE baseline was re-run on the same GPU in the
+same session and reproduced its cross-session row (TPOT 15.95 / 219.99 / 455.92
+vs 15.93 / 224.29 / 453.79), so the comparison is matched, not cross-session.
+
+**The decode step scales as `a + b·B`, and `b` is the same on both models.**
+Fitting ITL p50 (tail-free) at c=8/16: MoE `12.7 ms + 5.12·B`, dense
+`24.6 ms + 5.19·B`. The intercepts differ as expected — dense reads 27 GB of
+weights per step, MoE only its active 3B plus shared — but the per-row marginal
+is identical, which is what makes high concurrency expensive: it is never
+amortized, so TPOT doubles when `c` doubles.
+
+That marginal is **not** KV-bandwidth-bound. Dense carries 64 KB of KV per token
+(4 kv_heads × 256 × 2 × 2 B × 16 full-attn layers) against MoE's 20 KB (2 × 256 ×
+2 × 2 × 10) — 3.2× the bytes per row at the same 35k context, so a bandwidth-bound
+marginal would differ by ~3×. It differs by 1.4%. Roofline for the marginal is
+0.56 ms/row (dense) and 0.175 ms/row (MoE) against 5.1 ms measured: 9× and 29×.
+Being both model- and shape-independent points at a fixed per-row cost outside
+the model math. A c=16 nsys capture to attribute it is the open work.
+
+Dense additionally still has a tail problem the MoE arm does not: 9-11% of
+inter-token gaps exceed 3× p50 and carry ~35% of decode wall (p90 475 ms vs p50
+108 ms at c=16), against 3% / 9-13% for MoE. Dense prefill is 4× slower, so its
+chunks block decode for longer.
 
 - **Warm TTFT is now flat in prefix length** — 0.147–0.175 s across 4k→33k in a
   matched c=1 probe, against 0.480→3.020 s before. A radix hit costs a page-table
