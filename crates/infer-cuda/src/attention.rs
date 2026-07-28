@@ -2631,28 +2631,32 @@ fn try_flashmla_prefill_attention(
         let mut scale = ctx.stream.alloc_zeros::<f32>(2)?;
         ctx.stream.memcpy_htod(&[1.0f32, 1.0f32], &mut scale)?;
 
-        let (q_src, _qg) = q_prepared.data.device_ptr(&ctx.stream);
-        let (q_dst, _dg) = q_fp8.device_ptr_mut(&ctx.stream);
-        unsafe {
-            ffi::arle_bf16_to_fp8_e4m3_cuda(
-                q_src as *const ffi::Half,
-                q_dst as *mut u8,
-                q_elems as i64,
-                ctx.stream.cu_stream(),
-            )
-            .result()?;
+        // Scoped so the write guards drop before the read pointers below.
+        {
+            let (q_src, _qg) = q_prepared.data.device_ptr(&ctx.stream);
+            let (q_dst, _dg) = q_fp8.device_ptr_mut(&ctx.stream);
+            unsafe {
+                ffi::arle_bf16_to_fp8_e4m3_cuda(
+                    q_src as *const ffi::Half,
+                    q_dst as *mut u8,
+                    q_elems as i64,
+                    ctx.stream.cu_stream(),
+                )
+                .result()?;
+            }
         }
-
-        let (kv_src, _kg) = kv_unified.data.device_ptr(&ctx.stream);
-        let (kv_dst, _dg) = kv_fp8.device_ptr_mut(&ctx.stream);
-        unsafe {
-            ffi::arle_bf16_to_fp8_e4m3_cuda(
-                kv_src as *const ffi::Half,
-                kv_dst as *mut u8,
-                kv_elems as i64,
-                ctx.stream.cu_stream(),
-            )
-            .result()?;
+        {
+            let (kv_src, _kg) = kv_unified.data.device_ptr(&ctx.stream);
+            let (kv_dst, _dg) = kv_fp8.device_ptr_mut(&ctx.stream);
+            unsafe {
+                ffi::arle_bf16_to_fp8_e4m3_cuda(
+                    kv_src as *const ffi::Half,
+                    kv_dst as *mut u8,
+                    kv_elems as i64,
+                    ctx.stream.cu_stream(),
+                )
+                .result()?;
+            }
         }
 
         let (q_fp8_ptr, _qfg) = q_fp8.device_ptr(&ctx.stream);
