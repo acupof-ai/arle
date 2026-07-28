@@ -1127,9 +1127,6 @@ pub(crate) struct Qwen35RecurrentSnapshot {
     pub(crate) gdr: Vec<Vec<f32>>,
     /// `[num_linear]` conv1d rings (bf16), copied verbatim from device.
     pub(crate) conv: Vec<Vec<bf16>>,
-    /// Serialized full-attention KV pages captured at prefill end.
-    /// `None` when the executor has no `full_attn_kv` pool (non-paged path).
-    pub(crate) full_attn_kv: Option<Vec<u8>>,
 }
 
 impl Qwen35RecurrentSnapshot {
@@ -1138,24 +1135,22 @@ impl Qwen35RecurrentSnapshot {
     pub(crate) fn host_bytes(&self) -> usize {
         self.gdr.iter().map(|v| v.len() * 4).sum::<usize>()
             + self.conv.iter().map(|v| v.len() * 2).sum::<usize>()
-            + self.full_attn_kv.as_ref().map_or(0, |v| v.len())
     }
 
-    /// Flatten the recurrent + full-attn KV snapshot into ONE length-prefixed
-    /// buffer for the sidecar [`kv_native_sys::KvTierStore`] (opaque-`u64`
-    /// key). The recurrent state and the full-attn KV are serialized together as
-    /// one atomic blob — a partial store/restore corrupts model output. Exact
-    /// byte-inverse of [`Self::from_bytes`] (proven in `recurrent_snapshot_byte_inverse`).
-    /// Header: `[num_gdr][num_conv][has_kv][kv_len]` (u64 LE), then the KV bytes,
-    /// then each gdr vec `[len:u64][f32 LE...]` and each conv vec `[len:u64][bf16 LE...]`.
+    /// Flatten the recurrent snapshot into ONE length-prefixed buffer for the
+    /// sidecar [`kv_native_sys::KvTierStore`] (opaque-`u64` key). Exact byte-inverse
+    /// of [`Self::from_bytes`] (proven in `recurrent_snapshot_byte_inverse`).
+    /// Header: `[num_gdr][num_conv]` (u64 LE), then each gdr vec
+    /// `[len:u64][f32 LE...]` and each conv vec `[len:u64][bf16 LE...]`.
+    ///
+    /// Full-attention KV is deliberately NOT carried here: the restore path only
+    /// runs after the caller's `attach_pages` put the matched prefix's pages on
+    /// device, so the blob would be a redundant host round-trip of the whole
+    /// prefix — 64 KB/token, and the dominant term in warm TTFT until 2026-07-28.
     pub(crate) fn to_bytes(&self) -> Vec<u8> {
-        let kv = self.full_attn_kv.as_deref().unwrap_or(&[]);
         let mut buf = Vec::with_capacity(self.host_bytes() + 64);
         buf.extend_from_slice(&(self.gdr.len() as u64).to_le_bytes());
         buf.extend_from_slice(&(self.conv.len() as u64).to_le_bytes());
-        buf.extend_from_slice(&(self.full_attn_kv.is_some() as u64).to_le_bytes());
-        buf.extend_from_slice(&(kv.len() as u64).to_le_bytes());
-        buf.extend_from_slice(kv);
         for gdr in &self.gdr {
             buf.extend_from_slice(&(gdr.len() as u64).to_le_bytes());
             for &x in gdr {
@@ -1188,17 +1183,6 @@ impl Qwen35RecurrentSnapshot {
         };
         let num_gdr = take_u64(&mut pos)? as usize;
         let num_conv = take_u64(&mut pos)? as usize;
-        let has_kv = take_u64(&mut pos)? != 0;
-        let kv_len = take_u64(&mut pos)? as usize;
-        let kv_end = pos
-            .checked_add(kv_len)
-            .ok_or_else(|| anyhow!("recurrent snapshot kv length overflow"))?;
-        let kv_bytes = bytes
-            .get(pos..kv_end)
-            .ok_or_else(|| anyhow!("recurrent snapshot truncated reading full-attn kv"))?
-            .to_vec();
-        pos = kv_end;
-        let full_attn_kv = has_kv.then_some(kv_bytes);
         let mut gdr = Vec::with_capacity(num_gdr);
         for _ in 0..num_gdr {
             let len = take_u64(&mut pos)? as usize;
@@ -1236,11 +1220,7 @@ impl Qwen35RecurrentSnapshot {
             "recurrent snapshot has {} trailing bytes after deserialize",
             bytes.len() - pos
         );
-        Ok(Self {
-            gdr,
-            conv,
-            full_attn_kv,
-        })
+        Ok(Self { gdr, conv })
     }
 }
 
@@ -1376,7 +1356,6 @@ impl Qwen35SlotState {
             return Ok(Qwen35RecurrentSnapshot {
                 gdr: Vec::new(),
                 conv: Vec::new(),
-                full_attn_kv: None,
             });
         }
         let gdr = self
@@ -1400,11 +1379,7 @@ impl Qwen35SlotState {
         ctx.stream
             .synchronize()
             .map_err(|e| anyhow!("sync after recurrent snapshot: {e}"))?;
-        Ok(Qwen35RecurrentSnapshot {
-            gdr,
-            conv,
-            full_attn_kv: None,
-        })
+        Ok(Qwen35RecurrentSnapshot { gdr, conv })
     }
 
     /// H2D restore from a sidecar snapshot. The slot MUST have acquired recurrent
@@ -8341,6 +8316,33 @@ fn rms_norm_offset_vec(
 mod tests {
     use super::*;
     use qwen35_spec::LayerType;
+
+    /// The recurrent sidecar carries the recurrent state ONLY — a blob that
+    /// smuggles the full-attn KV back in would silently restore the pre-2026-07-28
+    /// host round-trip (64 KB/token) that dominated warm TTFT. Ragged per-vec
+    /// lengths exercise the length-prefixed layout; a truncated or over-long
+    /// buffer must error rather than restore garbage.
+    #[test]
+    fn recurrent_snapshot_byte_inverse() {
+        let snap = Qwen35RecurrentSnapshot {
+            gdr: vec![
+                vec![1.5_f32, -2.0, f32::from_bits(0x4048_f5c3)],
+                vec![],
+                vec![0.0, -0.0, 123.456],
+            ],
+            conv: vec![vec![bf16::from_f32(0.25), bf16::from_f32(-7.0)], vec![]],
+        };
+        let bytes = snap.to_bytes();
+        // 8 gdr floats + 2 conv halves + 2 header + 5 per-vec length words.
+        assert_eq!(bytes.len(), 16 + 5 * 8 + 6 * 4 + 2 * 2);
+        let back = Qwen35RecurrentSnapshot::from_bytes(&bytes).expect("round-trip");
+        assert_eq!(back.gdr, snap.gdr);
+        assert_eq!(back.conv, snap.conv);
+        assert!(Qwen35RecurrentSnapshot::from_bytes(&bytes[..bytes.len() - 1]).is_err());
+        let mut over = bytes.clone();
+        over.push(0);
+        assert!(Qwen35RecurrentSnapshot::from_bytes(&over).is_err());
+    }
 
     /// G3 whole-slot spill: `from_bytes(to_bytes(img))` must reproduce EVERY
     /// field byte-for-byte (the new correctness surface — the device buffers and
