@@ -1,5 +1,50 @@
 # OPD writeback 显存墙：逐 op 实测归因与无损 128K 单卡路径
 
+## Correction (2026-07-28, post-Move-1 `e736c485a`, backward per-op probe)
+
+Move 1 (free dead MLP+LoRA transients in the tape-disabled forward, commit
+`e736c485a`) cleared the **forward** wall: seq=40960 all-linear now completes
+64/64 forward groups, flat at free≈20 GB (was OOM at group 3). The wall **moved
+to backward** and is now measured, not modeled:
+
+- **Mempool is not the lever.** `--cuda-mempool-retain false` freed the full
+  ~35 GB forward-end hoard (driver free 18447 → 53167 MiB, verified
+  `effective_release_threshold=0`) — backward still OOMs on the **identical**
+  `add [40960,17408]`=2720 MiB. Same op/shape/bytes across a 35 GB free swing ⇒
+  live-bytes wall, not hoard, not fragmentation. The mempool A/B is closed.
+- **The binding chunk is the ATTENTION recompute inside checkpoint backward, not
+  MLP.** Per-op probe (`ARLE_OPD_OP_MEM_CHECKPOINT_FN=63`, layer 63, verbatim
+  `pool_used_current`):
+
+  | stage | pool_used | Δ |
+  |---|---:|---:|
+  | layer_enter | 38357 MiB | — |
+  | post_input_norm | 39157 MiB | +800 |
+  | **post_attention** | **63497 MiB** | **+24340** ← dominant |
+  | post_attention_residual | 64297 MiB | +800 |
+  | post_mlp_norm | 65097 MiB | +800 |
+  | → MLP `add [40960,17408]`=2720 MiB **fails** (pool already 65 GB) | | |
+
+  The failing alloc is MLP-shaped but MLP is only the straw: the attention
+  recompute fills the pool with +24 GB *before* MLP begins. Cutting the MLP alloc
+  alone won't help. This corroborates the retracted binary's ~24 GB-attn vs
+  ~11 GB-MLP ranking — but that binary's `checkpoint_fn` "3-behind-layer"
+  numbering was **wrong**: this binary logs `[checkpoint-map] checkpoint_fn=N
+  layers=N..N+1`, i.e. **1:1 with layer index**.
+- **Why no `free()` fix works here.** `checkpoint_backward` (tape.rs:897-926)
+  re-runs the whole layer forward with the inner tape *enabled*, so the recompute
+  intermediates are genuinely needed for the grad walk and are freed only at
+  closure exit. Move 1's `!tape.enabled` gate correctly does not fire. The fix is
+  structural: seq-chunk the attention forward-recompute (q/k/v proj + SDPA +
+  o_proj) inside the backward replay so its peak divides by the chunk count —
+  mirroring what Move 1 did for the forward, but at the recompute layer.
+
+Next: an approach doc for seq-chunked attention recompute (autograd op + kernel +
+Metal). MLP-SwiGLU chunking (old "Move 5") and GDN dead-store (old "Move 2") both
+target non-binding blocks — deferred. Everything below is history.
+
+---
+
 ## Correction (2026-07-27, clean HEAD `585e49337`, 4-arm re-measure)
 
 The earlier "40960 passes on main" below is RETRACTED. It rested on a pod probe
