@@ -287,6 +287,16 @@ impl KvAllocator for HostPagedKvPool {
         Some(page)
     }
 
+    fn reinstate_slot_page(&mut self, slot: usize, logical_page: usize) -> Option<u32> {
+        if *self.slot_pages.get(slot)?.get(logical_page)? != EVICTED_PAGE {
+            return None; // already resident
+        }
+        let page = self.free.pop()?;
+        self.attach(page);
+        self.slot_pages[slot][logical_page] = page;
+        Some(page)
+    }
+
     fn truncate_slot(&mut self, slot: usize, new_len: usize) -> anyhow::Result<()> {
         if self.fixed_pages_per_slot.is_some() {
             if slot >= self.slot_pages.len() {
