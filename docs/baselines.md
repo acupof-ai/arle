@@ -27,69 +27,65 @@ python3 scripts/gen_bench_prompts.py bench-agent-119k-16x8.jsonl 16 119000 214 8
 
 ## ThinkingCap-Qwen3.6-27B-FP8 · 1×H20 · single-GPU · eager — LONG-AGENT ANCHOR
 
-### CHAMPION — `c1c05d61c` (2026-07-27) · FA3 paged decode
+### CHAMPION — `5d2ad36fd` (2026-07-28) · FA3 paged at every query length
 
-Dataset `bench-agent-32k-16x8.jsonl`, sha256
-`8867f63eaac2f053...`, regenerable via
+Canonical CUDA agentic model (`bottlecapai/ThinkingCap-Qwen3.6-27B-FP8`, ~29 GB,
+qwen35 hybrid, TP=1). Dataset `bench-agent-32k-16x8.jsonl`, sha256
+`8867f63eaac2f053…`, regenerable via
 `gen_bench_prompts.py bench-agent-32k-16x8.jsonl 16 32000 214 8` (16 sessions ×
 8 turns; sessions ≥ max concurrency, rule 5). Runner `bench_throughput.py`,
 128 req/point, max_tokens 214, greedy, seed 20260416,
 `--max-running-requests 16`, GPUs 0 (no-spec) and 2 (DSpark), same binary and
-session. `prompt_tokens` p50 34959. 0 errors.
+session. `prompt_tokens` p50 34828. 0 errors.
 
-| c | arm | wall s | total tok/s | TTFT p50 | ITL p50 | ITL p90 |
-|---|---|---:|---:|---:|---:|---:|
-| 1 | no-spec | 3273.9 | 1344.4 | 14.1 s | **28.71 ms** | 29.80 |
-| 1 | DSpark 16 | 3227.7 | 1364.2 (+1.5%) | 14.4 s | (burst) | 80.28 |
-| 8 | no-spec | 1788.3 | **2460.8** | 12.2 s | **65.92 ms** | 3808.6 |
-| 8 | DSpark 16 | 1910.5 | 2304.6 (**−6.3%**) | 13.1 s | (burst) | 256.2 |
-| 16 | no-spec | 1770.1 | **2486.0** | 16.1 s | **107.67 ms** | 8128.1 |
-| 16 | DSpark 16 | 1905.9 | 2310.1 (**−7.1%**) | 27.4 s | (burst) | 8351.5 |
+**Prefill and decode are separate SLOs — never averaged into one tok/s.**
+Prefill = TTFT and `prompt_tokens / TTFT`. Decode = token-weighted mean ITL
+(`Σ itl_s / count`), which is the only decode metric valid on a spec arm: a
+whole accepted chain lands per step, so ITL p50 there is ~0.02 ms and
+meaningless. Never use `e2e − ttft` — this harness carries ~4.7 s of
+post-stream teardown in `e2e`, inflating TPOT ~1.85×. Cold = each session's
+turn 0 (nothing to reuse); warm = turns 1-7.
 
-`ITL p50` is meaningless on a spec arm (a whole accepted chain lands per step);
-compare those rows on wall clock and total tok/s.
+| c | arm | TTFT p50 cold | TTFT p50 warm | prefill tok/s | decode mean ITL | decode tok/s | total tok/s |
+|---|---|---:|---:|---:|---:|---:|---:|
+| 1 | no-spec | 48.0 s | 13.1 s | 4257 | 29.68 ms | 33.7 | 1345.5 |
+| 1 | DSpark 16 | 48.3 s | 13.2 s | 4213 | **9.55 ms** | **104.7** | 1431.7 |
 
-- **FA3 paged decode is the delta vs everything before 2026-07-27**: ITL p50
-  76.98 → 28.71 ms at c=1 (**2.68×**) and 140.49 → 65.92 ms at c=8 (**2.13×**).
-  c=1 reproduces the 8-session run (27.94 ms) to 0.8% on a different dataset.
-  [win](experience/wins/2026-07-27-fa3-paged-decode-32k-2.76x.md)
-- **DSpark is net-negative at serving concurrency.** +1.5% at c=1, −6.3% at c=8,
-  −7.1% at c=16. Before FA3 it was +57.5% at c=1 on short prompts; the edge was
-  never mostly speculation — it was paying for a 2.7× too expensive decode step.
-  [repricing](research/2026-07-27-dspark-repriced-after-fa3.md)
-- **The machine saturates at c=8**: 2460.8 → 2486.0 tok/s from c=8 to c=16
-  (+1.0%) while ITL p50 goes 65.9 → 107.7 ms and ITL p90 hits 8.1 s. Past c=8
-  concurrency buys queueing, not throughput. That is the next bottleneck and it
-  is a scheduler problem.
+Warm-turn decode: no-spec 30.24 ms (33.1 tok/s), DSpark **9.06 ms (110.4 tok/s)**.
+
+c=8 and c=16 are re-measuring on this binary (2026-07-28, pending). Do not
+carry the previous row's c=8/16 forward — they were measured with FA3 reaching
+only the no-spec arm, which is the defect this row fixes.
+
+- **DSpark is 3.11× per token at c=1** (9.55 vs 29.68 ms), up from 1.48× before
+  the verify path reached FA3. A verify step now costs 9.55 × E[k+1]=3.19 ≈
+  30.5 ms against a 29.68 ms decode step — **1.03×**, the physical floor, since
+  verifying 17 tokens reads the same KV bytes as verifying 1.
+  [entry](experience/wins/2026-07-28-fa3-covers-every-query-length.md)
+- **Total tok/s only moves +6.4%** because a warm request spends 13.1 s in
+  prefill against 6.3 s of decode. Decode speed is a latency result; total
+  tok/s is a capacity result. They answer different questions.
+- **FA3 on prefill chunks is a wash** — 4257 vs 4352 tok/s, inside the ±3%
+  drift band. It was enabled to get one predicate, not for prefill speed.
+- **FA3 paged is the delta vs anything before 2026-07-27**: decode mean ITL
+  76.98 → 28.64 ms at c=1 on the same dataset.
+  [entry](experience/wins/2026-07-27-fa3-paged-decode-32k-2.76x.md)
 - sm_90 only: FA3 hopper is Hopper-only; other targets keep the TileLang
   `batch_decode_paged_hd256` kernel.
-- c=4 not measured (grid was 1,8,16).
+- c=4 not measured (grid is 1,8,16).
 
-### `f4f419629` (2026-07-26) · RETIRED cold-cache fingerprint — NOT a champion
+**Superseded fingerprints** (deleted 2026-07-28 — one dataset per question,
+rule 5). What survives them:
 
-Dataset `bench-agent-32k-64.jsonl`, sha256
-`683b3736b2b162a07e419bf8ed8639fb70e6bc4f9a2cd8c5c586b39060ab8ef5`, reproducible
-from the repo (rule 5). Runner `bench_throughput.py`, 8 req/point, max_tokens
-256, seed 20260416, `--max-running-requests 16`, GPU 0, no spec decode.
-Measured `prompt_tokens` 33000 (target 32768, +0.7%). Prefix hit rate 0 by
-construction. 0 errors / 0 incomplete / 0 correctness_failed at every point.
-
-| c | complete | out tok/s | total tok/s | wall s |
-|---|---------:|----------:|------------:|-------:|
-| 1 | 8        | 3.4       | 486.0       | 547.0  |
-| 4 | 8        | 12.9      | 1748.9      | 152.0  |
-| 8 | 8        | 14.3      | 1906.7      | 139.5  |
-
-- **Retired the same day: prefix hit rate 0 by construction.** Each request got
-  a unique 32k context, so every one paid a full cold prefill. Real coding-agent
-  serving hits the prefix cache 95.7% of the time (TraceLab arXiv:2606.30560),
-  which makes this row a measurement of a machine nobody runs.
-- The "~89% is prefill, decode is the ~10% slice" reading taken from it is
-  **withdrawn**. At the trace medians a step is TTFT 3.1 s vs 4.6 s of decode —
-  decode is ~60% of per-step wall clock. Do not cite this row for scoping.
-- Kept as evidence of cold-prefill cost at 33k (~540 tok/s, degrading from
-  ~1270 tok/s at ~5k), which is still the right number for a cache miss.
-- c=16 not yet measured on this dataset (KV budget check pending).
+- 2026-07-25 short-prompt row (`6aa4ca6d1`, `dspark_natural_128in_128out.jsonl`):
+  DSpark accept_rate 0.10–0.13, MTP ~0.17; per-slot KV `343360 tok / 22.5 GB`
+  no-spec vs `121920 tok / 8.0 GB` DSpark. Its headline "DSpark c=1 +57.5%" is
+  explained, not reproduced — the drafter was carrying a decode kernel that
+  cost 2.7× too much.
+- 2026-07-26 cold-cache row (`f4f419629`, `bench-agent-32k-64.jsonl`): cold
+  prefill at 33k ran ~540 tok/s, degrading from ~1270 at ~5k. Prefix hit rate
+  was 0 by construction, so it measured a machine nobody runs; the "~89% is
+  prefill" reading taken from it was already withdrawn.
 
 ## DSv4-Flash-FP8 · 4×H20 · TP=4/EP=4 · eager · port 8000
 
@@ -178,34 +174,6 @@ accept_rate (server-stats): MTP ~0.15, DSpark ~0.30. Slot lines: no-spec
   the real spec-decode shape, no crash.
 - **#184 confirmed** — spec scratch sized to the real verify width (6/9 rows),
   DSpark per_slot 645→607MB.
-
-## ThinkingCap-Qwen3.6-27B-FP8 · 1×H20 · single-GPU · eager · port 8200
-
-**2026-07-25 (`6aa4ca6d1`) · RETIRED short-prompt fingerprint** (rule 5) —
-canonical CUDA agentic model
-(`bottlecapai/ThinkingCap-Qwen3.6-27B-FP8`, ~29 GB, qwen35 hybrid, TP=1).
-Dataset `dspark_natural_128in_128out.jsonl` (sha `169b7c78…`), **max_tokens
-128**, 60 s/point, c=1,4,8,16, GPU 4. Same binary, same session; Δ vs this
-run's own no-spec. 0 errors all arms. Coherent (thinking model, answer in
-`reasoning_content`). Raw: pod `bench-output/2026-07-25-R2-tc-*`.
-
-| c  | no-spec | MTP   | MTP Δ  | DSpark | DSpark Δ  |
-|----|--------:|------:|-------:|-------:|----------:|
-| 1  | 38.62   | 42.31 | +9.6%  | **60.83** | **+57.5%** |
-| 4  | 75.10   | 40.29 | −46.4% | 52.09  | −30.6%    |
-| 8  | 126.01  | 40.59 | −67.8% | 52.52  | −58.3%    |
-| 16 | 150.89  | 40.37 | −73.3% | 53.02  | −64.9%    |
-
-accept_rate (server-stats): MTP ~0.17, DSpark ~0.10–0.13. Slot lines: no-spec
-`343360 tok / 22.5 GB`, MTP `330560 tok / 21.7 GB`, DSpark `121920 tok / 8.0
-GB` (DFlash drafter `z-lab/Qwen3.6-27B-DFlash`, `block=16 taps=[1,16,31,46,61]`).
-
-- **DSpark c=1 +57.5%** is the strongest spec-decode signal in either model —
-  27B single-GPU at c=1 is decode-bound, exactly where spec decode wins. Both
-  spec arms go net-negative at c≥4 (batch saturates the single GPU).
-- **TP=1 lockstep deadlock FIXED** — 60 s liveness probe returned coherent
-  output, 0 `lockstep stalled` lines across the sweep. The `world_size ≤ 1`
-  early-return holds; the V100 W4A16 −91% hang below does NOT reproduce here.
 
 ## Qwen3.6-27B-W4A16 · 1×V100 (sm_70) · eager · port 8080
 
