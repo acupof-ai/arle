@@ -361,7 +361,7 @@ impl Qwen35CudaExecutor {
         let periodic = std::mem::take(&mut self.periodic_boundary_snapshots[slot]);
         let boundary = tokens.len().saturating_sub(1) / SUPPORTED_PAGE_SIZE * SUPPORTED_PAGE_SIZE;
         let pending = self.prefill_boundary_snapshot[slot].take();
-        let (mat_len, snap) = match pending {
+        let (mat_len, mut snap) = match pending {
             Some((pos, snap)) if pos == boundary && boundary > 0 => (pos, snap),
             _ => {
                 // Legacy best-effort: raw seq_len aligns to a page ~1/16 of the
@@ -388,24 +388,58 @@ impl Qwen35CudaExecutor {
                 tokens.len(),
             );
         }
-        // The full-attn KV is NOT captured here — the restore side re-derives it
-        // from the pages the radix hands back (see `restore_recurrent_sidecar`).
-        // Only the recurrent state, which has no page representation, is stored.
+        // Copy KV[0..mat_len] to host ONCE (snapshot_recurrent synchronized the
+        // stream). full-attn KV is position-indexed and append-only, so pages
+        // [0..mat_len) are byte-identical whether copied at `mat_len` or the
+        // current end, AND every periodic boundary `pos ≤ mat_len` is a page-major
+        // PREFIX of this buffer — slice it instead of re-copying (avoids O(N²) D2H
+        // across the periodic boundaries).
+        let host_kv = match self.full_attn_kv.as_ref() {
+            Some(pool) => {
+                let n_pages = mat_len / SUPPORTED_PAGE_SIZE;
+                let all_pages = pool.page_indices(slot);
+                let pages = all_pages[..n_pages.min(all_pages.len())].to_vec();
+                if pages.is_empty() {
+                    None
+                } else {
+                    match pool.copy_pages_to_host(&self.model.ctx, &pages) {
+                        Ok(data) => Some(data),
+                        Err(e) => {
+                            log::warn!(
+                                "slot {slot}: full-attn KV D2H failed: {e}; skipping sidecar entry"
+                            );
+                            return Ok(()); // don't store an incomplete (KV-less) blob
+                        }
+                    }
+                }
+            }
+            None => None,
+        };
+        // Bytes per KV page (page-major layout): slice `[..pages * page_bytes]`
+        // gives KV[0..pages*16] for any periodic boundary.
+        let n_pages = (mat_len / SUPPORTED_PAGE_SIZE).max(1);
+        let page_bytes = host_kv.as_ref().map(|d| d.len() / n_pages);
 
         // PERIODIC sidecars at each stride boundary `0 < pos ≤ mat_len` snapshotted
         // during this prefill — for a FUTURE cross-conversation restore that shares
-        // only a leading prefix. Each blob is the recurrent state captured at
-        // EXACTLY `pos` (snapshot-position == key-position).
-        for (pos, psnap) in periodic {
+        // only a leading prefix. Each blob = the recurrent state captured at EXACTLY
+        // `pos` + KV[0..pos] sliced from `host_kv` (snapshot-position == key-position).
+        // Saved BEFORE the primary so the primary can MOVE `host_kv` (no clone).
+        for (pos, mut psnap) in periodic {
             if pos == 0 || pos > mat_len {
-                continue; // beyond the published prefix — nothing to key
+                continue; // beyond the copied/published prefix — nothing to key
             }
+            psnap.full_attn_kv = match (host_kv.as_ref(), page_bytes) {
+                (Some(kv), Some(pb)) => Some(kv[..(pos / SUPPORTED_PAGE_SIZE) * pb].to_vec()),
+                _ => None,
+            };
             let pkey = crate::qwen35::hash_prefix_tokens(&tokens[..pos]);
             self.store_sidecar_blob(pos, pkey, psnap.to_bytes(), prefix_pages);
         }
 
         // PRIMARY sidecar at `mat_len` (the exact-resend restore target) — the
-        // within-conversation reuse path.
+        // within-conversation reuse path, unchanged.
+        snap.full_attn_kv = host_kv;
         self.store_sidecar_blob(mat_len, key, snap.to_bytes(), prefix_pages);
         Ok(())
     }
@@ -597,16 +631,21 @@ impl Qwen35CudaExecutor {
         self.slots[slot].restore_recurrent_from_snapshot(&self.model.ctx, &snap)?;
         self.slots[slot].set_seq_len(boundary);
 
-        // The caller's `attach_pages(matched_len)` already put the matched prefix's
-        // pages on device, and `boundary ≤ matched_len`, so KV[0..boundary] is a
-        // prefix of what is attached. Drop the tail past `boundary` instead of
-        // round-tripping the whole prefix through host memory; `truncate_slot`
-        // only decrements the slot's attach count, so radix-retained pages stay
-        // alive and the re-prefill of [boundary..prompt] gets fresh tail pages.
+        // Rebuild the device KV pool to EXACTLY `boundary` pages, restoring
+        // KV[0..boundary] from the blob; the re-prefill of [boundary..prompt]
+        // allocates fresh tail pages (never reuses the radix [B..matched_len] KV).
         if let Some(pool) = self.full_attn_kv.as_mut() {
-            pool.truncate_slot(slot, boundary).map_err(|e| {
-                anyhow::anyhow!("device pool prefix truncate failed for slot {slot}: {e}")
+            pool.free_slot(slot);
+            let new_pages = pool.alloc_tokens(slot, boundary).map_err(|e| {
+                anyhow::anyhow!("device pool prefix alloc failed for slot {slot}: {e}")
             })?;
+            if let Some(kv_data) = snap.full_attn_kv.as_deref() {
+                pool.copy_pages_from_host(&self.model.ctx, &new_pages, kv_data)
+                    .map_err(|e| {
+                        anyhow::anyhow!("device pool KV H2D restore failed for slot {slot}: {e}")
+                    })?;
+            }
+            // Stream-order: H2D above is ordered before subsequent kernels; no explicit sync needed.
         }
         // Fresh prefill sequence for [boundary..prompt]: drop any prior occupant's
         // periodic snapshots so this request's saves never inherit stale entries.
