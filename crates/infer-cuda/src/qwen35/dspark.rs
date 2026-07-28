@@ -340,8 +340,8 @@ pub(crate) struct DsparkScratch {
     markov_rows: HiddenSlot,
     markov_bias_rows: HiddenSlot,
     step_sum_rows: HiddenSlot,
-    conf_feat: VecSlot,
-    conf_out: VecSlot,
+    conf_feat: HiddenSlot,
+    conf_out: HiddenSlot,
     argmax: SliceSlot<i32>,
     /// Row count of the tap features held in `feat_b` (the whole batch).
     feat_seq: usize,
@@ -1183,42 +1183,62 @@ impl Qwen35Model {
         let hidden = head.cfg.hidden_size;
         let block = head.cfg.block_size;
         let in_dim = conf.weight.cols;
-        for (i, &prev) in prev_tokens.iter().enumerate().take(block) {
-            let feat = scratch.conf_feat.get(ctx, in_dim)?;
-            {
-                let final_normed = scratch.final_normed.get(ctx, hidden, block)?;
+        let n = prev_tokens.len().min(block);
+        if n == 0 {
+            return Ok(usize::MAX);
+        }
+        // All `n` rows in one GEMM: the head gates every draft step, so a
+        // per-row GEMV would cost `block` device syncs to save at most a few
+        // hundred µs of arithmetic.
+        let feat = scratch.conf_feat.get(ctx, in_dim, n)?;
+        {
+            let final_normed = scratch.final_normed.get(ctx, hidden, block)?;
+            for i in 0..n {
                 let src = final_normed.data.slice(i * hidden..(i + 1) * hidden);
-                let mut dst = feat.data.slice_mut(0..hidden);
+                let mut dst = feat.data.slice_mut(i * in_dim..i * in_dim + hidden);
                 ctx.stream
                     .memcpy_dtod(&src, &mut dst)
                     .map_err(|e| anyhow!("dspark conf feature copy failed: {e}"))?;
             }
-            if conf.with_markov {
-                let m = head.markov.as_ref().expect("validated at load");
-                let tok_dev = scratch.markov_tok.upload(ctx, &[prev as i32])?;
-                let emb = scratch.markov_emb.get(ctx, m.rank, 1)?;
-                embedding_batch(ctx, &m.w1, tok_dev, emb)?;
-                let feat = scratch.conf_feat.get(ctx, in_dim)?;
-                let src = emb.data.slice(0..m.rank);
-                let mut dst = feat.data.slice_mut(hidden..hidden + m.rank);
+        }
+        if conf.with_markov {
+            let m = head.markov.as_ref().expect("validated at load");
+            let prevs: Vec<i32> = prev_tokens[..n].iter().map(|&t| t as i32).collect();
+            let tok_dev = scratch.markov_prevs.upload(ctx, &prevs)?;
+            let emb = scratch.markov_rows.get(ctx, m.rank, n)?;
+            embedding_batch(ctx, &m.w1, tok_dev, emb)?;
+            let emb = scratch.markov_rows.get(ctx, m.rank, n)?;
+            let feat = scratch.conf_feat.get(ctx, in_dim, n)?;
+            for i in 0..n {
+                let src = emb.data.slice(i * m.rank..(i + 1) * m.rank);
+                let mut dst = feat
+                    .data
+                    .slice_mut(i * in_dim + hidden..i * in_dim + hidden + m.rank);
                 ctx.stream
                     .memcpy_dtod(&src, &mut dst)
                     .map_err(|e| anyhow!("dspark conf markov copy failed: {e}"))?;
             }
-            let out = scratch.conf_out.get(ctx, 1)?;
-            gemv(ctx, &conf.weight, scratch.conf_feat.get(ctx, in_dim)?, out)?;
-            let mut host = [bf16::ZERO];
-            scratch
-                .conf_out
-                .get(ctx, 1)?
-                .copy_region_to_host(ctx, 0, 1, &mut host)?;
-            ctx.sync()?;
-            let logit = host[0].to_f32() + conf.bias;
-            if 1.0 / (1.0 + (-logit).exp()) < head.confidence_threshold {
-                return Ok(i);
-            }
         }
-        Ok(usize::MAX)
+        let out = scratch.conf_out.get(ctx, 1, n)?;
+        gemm_batch(
+            ctx,
+            &conf.weight,
+            scratch.conf_feat.get(ctx, in_dim, n)?,
+            out,
+        )?;
+        let host = ctx
+            .stream
+            .clone_dtoh(&scratch.conf_out.get(ctx, 1, n)?.data)
+            .map_err(|e| anyhow!("D2H dspark confidence failed: {e}"))?;
+        ctx.sync()?;
+        let keep = host
+            .iter()
+            .position(|&h| {
+                let logit = h.to_f32() + conf.bias;
+                1.0 / (1.0 + (-logit).exp()) < head.confidence_threshold
+            })
+            .unwrap_or(usize::MAX);
+        Ok(keep)
     }
 
     /// Size the reused per-slot spec state (`new_spec_slot_state` capture rows,
