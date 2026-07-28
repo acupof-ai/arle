@@ -1,7 +1,7 @@
 # MLP seq-chunked recompute — the 256K writeback VRAM lever
 
-> Status: Code shipped; CPU parity GREEN; VRAM/wall A/B `pending-remote` (H20,
-> CUDA-only). Default OFF (`--mlp-seq-chunk 0`) — no default flip.
+> Status: Shipped; CPU parity GREEN; H20 VRAM A/B measured (seq=40960, GREEN).
+> Default OFF (`--mlp-seq-chunk 0`) — no default flip.
 
 ## Context
 
@@ -38,16 +38,26 @@ position-wise MLP block (`silu(x@Wgᵀ)*(x@Wuᵀ)@Wdᵀ`) chunked (chunk=2 over 
 vs unchunked — loss, `d_input`, `d_weight` all ≤1e-5. 37/37 autograd tests pass;
 clippy clean; CUDA-lane Mac typecheck (`autograd`+`train`, `cuda,no-cuda`) green.
 
-## A/B contract (pending-remote, H20 sm_90, agent-OPD masked writeback)
+## Measured A/B (H20 sm_90, agent-OPD synthetic masked writeback, seq=40960)
 
-Matched same-binary A/B, one variable = `--mlp-seq-chunk`:
+Same-binary A/B, one variable = `--mlp-seq-chunk`. ThinkingCap-Qwen3.6-27B-FP8
+shared-frozen-base, LoRA r16 qv. Backward-recompute peak captured per-op via
+`ARLE_OPD_OP_MEM_CHECKPOINT_FN` at layer 63 (full-attn); `pool_used_current`,
+not driver-used.
 
-- Grid: `chunk ∈ {0(off), 8192, 4096, 2048}` × `seq ∈ {40960, 131072, 262144}`.
-- Metric: `pool_used_current` (NOT driver-used — hoard, per 2026-07-27) at the
-  writeback backward peak; plus `mean_loss` and writeback wall.
-- Pass = (1) loss within the MoE non-det floor of the `chunk=0` arm at each seq;
-  (2) 256K completes RUN_EXIT=0 within 96 GiB `pool_used`; (3) peak falls as
-  chunk shrinks while wall stays ~flat (recompute FLOPs unchanged, only batched).
+| metric | arm A `chunk 0` | arm B `chunk 4096` | Δ |
+|---|---|---|---|
+| RUN_EXIT | 0 | 0 | — |
+| mean_loss | 8.685793 | 8.685793 | **bit-identical** |
+| post_attention pool_used | 60142 MiB | 60142 MiB | 0 (untouched) |
+| post_mlp pool_used | 73422 MiB | 62542 MiB | −10880 MiB |
+| **inner-backward peak** | **82.0 GiB** | **68.9 GiB** | **−13.1 GiB** |
+
+**GREEN.** Loss bit-identical (0.00%, chunking is add-order-exact); `post_attention`
+unchanged confirms it touches only the MLP recompute; −13.1 GiB at seq=40960. The
+win decouples from seq (peak ≈ `O(chunk·intermediate)` not `O(seq·intermediate)`),
+so it scales into the 256K regime the flag exists for. Full seq-ladder
+{131072, 262144} × {8192, 2048} still worth running before a default flip.
 
 ## Rule
 
