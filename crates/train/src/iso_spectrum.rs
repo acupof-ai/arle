@@ -193,7 +193,14 @@ impl SpectrumProbe {
             let now = sorted_eigvals(&gram(*id, store)?, *k);
             let num: f64 = base.iter().zip(&now).map(|(a, b)| (a - b).powi(2)).sum();
             let den: f64 = base.iter().map(|a| a * a).sum();
-            out.push((num / den.max(1e-30)).sqrt() as f32);
+            // A cold param (w2=0 at a seedless start) has no base spectrum to be
+            // isospectral against; relative drift is undefined, so report 0 rather
+            // than dividing by ~0 and emitting an astronomical fake drift.
+            out.push(if den <= 1e-30 {
+                0.0
+            } else {
+                (num / den).sqrt() as f32
+            });
         }
         Ok(out)
     }
