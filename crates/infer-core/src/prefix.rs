@@ -222,11 +222,8 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
 
     // record_prefix_tier_hits moved into materialize_prefix_blocks.
 
-    /// Grow `slot` to at least `target` logical tokens. A backend that already
-    /// grew the slot during `submit` — a speculative executor materializes its
-    /// whole draft chain's KV before verify — leaves nothing to do, so this
-    /// no-ops instead of double-appending. Backends that don't pre-grow see the
-    /// same single-token append as before.
+    /// Grow `slot` to at least `target`. A speculative executor already grew it
+    /// to draft its chain, so this no-ops instead of double-appending.
     pub(crate) fn alloc_to_len_with_prefix_reclaim(
         &mut self,
         slot: usize,
