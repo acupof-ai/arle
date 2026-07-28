@@ -1,8 +1,12 @@
 # Paper-faithful ISO on the DSpark acceptance head, 2026-07-27
 
-> Status: correctness complete; local invariant + chain-rule + resume gates
-> green; **acceptance effect unmeasured** — H20 A/B pending-remote. Default off
-> (`--dspark-train-iso`).
+> Status: implementation correct (local invariant + chain-rule + resume gates
+> green), but the **premise is FALSIFIED** on this head — the 2026-07-28 warm
+> sweep shows no objective separates spectrum drift (see
+> [errors/2026-07-28-iso-premise-fails-on-dspark-head.md](../errors/2026-07-28-iso-premise-fails-on-dspark-head.md)).
+> ISO stays default-off (`--dspark-train-iso`) and does NOT propagate to
+> Agent-RFT. Kept as a win for the correct implementation + the chain-rule /
+> tape-reconstruction technique, which transfer to any future ISO target.
 >
 > Supersedes the 2026-07-25 projection prototype (AdamW-on-dense-`W` + periodic
 > `project(W)`). That was *a* fixed-spectrum retraction, not the paper optimizer;
@@ -99,37 +103,26 @@ speculative acceptance, not loss; (5) record retraction wall, step wall, spectru
 error, accepted tokens/target-step. A failed premise or A/B keeps ISO non-default
 and records an `errors/` verdict — it does not propagate into Agent-RFT.
 
-### H20 sweep run (2026-07-27) — INCONCLUSIVE, do not green-light the A/B
+### H20 sweep — FALSIFIED (2026-07-28, warm head, PM-fixed)
 
-Qwen3.6-27B-FP8 single-GPU, cold head, ISO-off, α ∈ {0, 0.5, 1}, w1 axis:
+The 2026-07-27 cold-head run was inconclusive on two confounds (α=1 PM loss
+underflowed f32 → null arm; cold w2≈0 gated w1's gradient). Both were fixed — a
+nonzero warm-started head and per-token PM normalization (2026-07-28 win) — and
+the clean re-run **falsifies the premise**:
 
-| α | w1 spectrum_drift | train loss | verdict |
-|---|---|---|---|
-| 0 (pure PG) | 2.07e-6 | ≈−0.4 (active) | near-isospectral, but see confound 2 |
-| 0.5 | 1.7–2.6e-6 | ≈−0.07 | PM half contributes ~0 |
-| 1 (pure PM) | 4e-10 | **0.0000** | null arm — no gradient |
+| α | w1 spectrum_drift | loss |
+|---|---|---|
+| 0 (pure PG) | 2.6e-6 | ~−0.4 |
+| 0.5 | 3.67e-6 | ~−0.05 |
+| 1 (pure dense PM, live) | 4.21e-6 | ~0.35 |
 
-Two confounds make this neither a confirm nor a clean falsification:
-
-1. **α=1 is a null discriminator.** The prob-match loss
-   `mean_{v∈vocab}(softmax(draft)−softmax(target))²` divides a TV-style surrogate
-   by 248,320 classes; on a head where the draft already tracks the trunk it
-   underflows f32 print precision → loss 0.0000, `accept_ema` drifts *down* (no
-   learning). So α=1's tiny drift is "head didn't move," not "dense supervision
-   preserves the spectrum" — the arm meant to show LARGE drift produced no signal.
-2. **Cold head confounds the α=0 arm too.** `bias = w2·w1[cond]`, so
-   `∂bias/∂w1 = w2 ≈ 0` at a cold (w2=0) start — w1's gradient is gated by the
-   near-zero w2, so 2.07e-6 is partly "w1 barely trained," not cleanly "w1
-   trained hard yet stayed isospectral." The plan specified a **nonzero
-   pretrained** head for exactly this reason; using a cold head to dodge the
-   missing seeded-Qwen head was too clever.
-
-To measure the premise cleanly: a **nonzero pretrained Qwen3.6 DSpark head**
-(both factors non-zero, so each gets real gradient) + a PM regime that actually
-moves the head (higher `--dspark-train-lr`, or harder traffic with real
-draft↔target divergence, or per-active-class PM normalization instead of
-`/vocab` — see the 7b finding). Until then the ISO premise is unmeasured; #32
-stays gated.
+All three arms drift ~1e-6. The α=1 positive control — dense supervision, which
+the paper says moves the spectrum ~100× — is only ~1.6× the pure-PG arm, and its
+loss (~0.35) confirms PM is a live gradient this time, not the null. Near-
+isospectral drift is a property of this low-rank head under *every* objective, so
+it cannot evidence that RLVR uniquely preserves the spectrum. Full verdict:
+[errors/2026-07-28-iso-premise-fails-on-dspark-head.md](../errors/2026-07-28-iso-premise-fails-on-dspark-head.md).
+ISO stays non-default; #32 stays gated.
 
 ## Rule
 
