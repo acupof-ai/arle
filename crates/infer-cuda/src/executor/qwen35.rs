@@ -23,10 +23,8 @@ fn qwen35_batched_decode_enabled() -> bool {
     crate::runtime_flags::qwen35_batched_decode()
 }
 
-/// Grow the host pool's `slot` to `target` logical tokens. Speculative decode
-/// materializes a whole draft chain's KV in one forward, past the single token
-/// the engine pre-allocated for the row; the engine's post-step append of the
-/// accepted extras then finds the slot already long enough and no-ops.
+/// Grow the host pool's `slot` to `target` — spec decode writes a whole draft
+/// chain past the one token the engine pre-allocated.
 fn grow_host_slot_to(host_kv: &mut dyn KvPool, slot: usize, target: usize) -> Result<()> {
     match target.checked_sub(host_kv.seq_len(slot)) {
         Some(0) | None => Ok(()),
@@ -341,13 +339,9 @@ impl Qwen35CudaExecutor {
         pages_only_reusable_prefix_blocks(blocks, |_| false)
     }
 
-    /// Lower the host pool's authoritative page table for `slot` into the device
-    /// pool, the way `executor/qwen.rs` does.
-    ///
-    /// The device `PagedKVPool` runs no allocator of its own: host page ids index
-    /// its storage rows 1:1, so a slot mirroring a published prefix's pages reads
-    /// that prefix's KV straight out of HBM — which is what makes a radix hit free
-    /// instead of a host round-trip (`PagedKVPool::mirror_slot`).
+    /// Lower the host pool's page table into the device pool (`mirror_slot`), as
+    /// `executor/qwen.rs` does. Host page ids index device storage rows 1:1, so a
+    /// mirrored prefix reads its KV straight out of HBM.
     fn mirror_host_slot(
         &mut self,
         host_kv: &dyn KvPool,
@@ -606,11 +600,8 @@ impl Qwen35CudaExecutor {
         self.slots[slot].restore_recurrent_from_snapshot(&self.model.ctx, &snap)?;
         self.slots[slot].set_seq_len(boundary);
 
-        // Point the device pool at the restored prefix's OWN pages. The engine
-        // already attached `prefix_pages` to the host slot, and host page ids
-        // index the device pool's storage rows 1:1, so the prefix's KV is read
-        // straight out of HBM — the sidecar carries recurrent state only. The
-        // re-prefill of [boundary..prompt] mirrors the host's fresh tail pages.
+        // Point the device pool at the prefix's OWN pages, already attached by the
+        // engine and resident in HBM — the sidecar carries recurrent state only.
         if let Some(pool) = self.full_attn_kv.as_mut() {
             let need = boundary.div_ceil(SUPPORTED_PAGE_SIZE);
             ensure!(
@@ -1388,11 +1379,8 @@ impl Qwen35CudaExecutor {
             );
         }
         {
-            // The device pool must hold exactly `start_pos` tokens before the
-            // append. On a prefix hit that is the restored prefix's length, whose
-            // pages the host pool already attached — mirroring them is what makes
-            // the hit free. A mismatch means an upstream restore left the two
-            // pools' cursors apart.
+            // Both pools must sit at `start_pos` before the append; a mismatch
+            // means an upstream restore left their cursors apart.
             let pool = self
                 .full_attn_kv
                 .as_ref()
@@ -1714,11 +1702,8 @@ impl Qwen35CudaExecutor {
     ) -> Result<Vec<SlotToken>> {
         let slot = row.slot;
         let start = row.kv_seq_len;
-        // The verify forward appends depth+1 tokens. The engine pre-allocated one
-        // (the row's committed token); grow the host pool by the rest, then mirror
-        // — on partial accept we truncate both back to the accepted prefix, and
-        // `alloc_to_len_with_prefix_reclaim` makes the engine's post-step append of
-        // the accepted extras a no-op.
+        // Verify appends depth+1; the engine pre-allocated one. Grow the host
+        // pool by the rest, truncate both back on partial accept.
         if self.full_attn_paged() {
             {
                 let pool = self.full_attn_kv.as_ref().expect("paged (gated)");
@@ -2143,9 +2128,8 @@ impl Qwen35CudaExecutor {
         total_rows: usize,
         host_kv: &mut dyn KvPool,
     ) -> Result<cuda_kernels::prelude::HiddenStates> {
-        // One forward writes each chain's whole KV, past the single token the
-        // engine pre-allocated per row: grow the host pool to cover it, then
-        // mirror. The caller truncates both pools back on partial accept.
+        // One forward writes each chain's whole KV; the caller truncates both
+        // pools back on partial accept.
         for c in batch {
             {
                 let pool = self.full_attn_kv.as_ref().expect("paged (gated by seeded)");
@@ -2314,8 +2298,7 @@ impl Qwen35CudaExecutor {
                 Ok(p) => p.into_owned(),
                 Err(_) => continue,
             };
-            // Reinstate on the host single-allocator (it owns the free stack),
-            // mirror the refreshed table down, then refill the page's KV.
+            // Host owns the free stack: reinstate there, mirror down, refill.
             let Some(new_page) = host_kv.reinstate_slot_page(slot, logical) else {
                 continue;
             };
@@ -2358,8 +2341,7 @@ impl Qwen35CudaExecutor {
             if !mirrored {
                 continue; // tier full → keep page resident (no KV loss)
             }
-            // Host first (it owns the free stack); the device pool's sentinel
-            // comes back down with the next mirror.
+            // Host first — it owns the free stack.
             host_kv.evict_slot_page(slot, logical);
             if let Some(pool) = self.full_attn_kv.as_mut() {
                 pool.evict_slot_page(slot, logical);
@@ -2805,8 +2787,7 @@ impl Qwen35CudaExecutor {
                 // without a per-session key registry (the dense arm's
                 // `drop_tier_session` makes the same call, see its doc).
             } else if let Some(pool) = self.full_attn_kv.as_mut() {
-                // Default paged (no recall): drop the mirror; the host pool owns
-                // the pages and already recycled or radix-retained them.
+                // Drop the mirror; the host pool owns these pages.
                 pool.mirror_slot(row.slot, &[], 0)?;
             }
         }
@@ -3313,10 +3294,8 @@ impl Qwen35CudaExecutor {
             ..
         } = self;
         let pool = full_attn_kv.as_mut().expect("full_attn_kv present");
-        // Mirror model: claim detached pages and mirror them in rather than
-        // running the device pool's slot allocator, which must not be mixed with
-        // `mirror_slot` on the same pool. No scheduler row here — this transient
-        // forward has no host pool to lower from.
+        // No scheduler row, so no host pool to lower from: detached pages, not
+        // the slot allocator (which must not be mixed with `mirror_slot`).
         let scratch = pool.alloc_detached_pages(input_ids.len().div_ceil(pool.page_size))?;
         pool.mirror_slot(kv_slot, &scratch, input_ids.len())?;
         let result =

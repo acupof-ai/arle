@@ -40,13 +40,9 @@ pub trait KvAllocator {
         None
     }
 
-    /// Inverse of [`KvAllocator::evict_slot_page`] — claim a free physical page
-    /// and put it back at `logical_page`, replacing the evicted sentinel. The
-    /// caller is responsible for refilling the page's KV from the tier; the
-    /// allocator only hands back the id. `None` when that logical page is not
-    /// evicted, is out of range, or the pool has no free page. Same opt-in
-    /// footprint as `evict_slot_page` (`--kv-recall` prefetch only), so the
-    /// default impl is a no-op.
+    /// Inverse of [`KvAllocator::evict_slot_page`]: claim a free page back into
+    /// `logical_page`. `None` if it is not evicted or the pool is empty. The
+    /// caller refills the KV. Opt-in (`--kv-recall` prefetch), so default no-op.
     fn reinstate_slot_page(&mut self, _slot: usize, _logical_page: usize) -> Option<u32> {
         None
     }

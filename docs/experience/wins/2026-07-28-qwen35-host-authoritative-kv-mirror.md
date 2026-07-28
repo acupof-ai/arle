@@ -1,68 +1,55 @@
-# Qwen3.5/3.6 off its second KV allocator — warm TTFT stops scaling with prefix length
+# Qwen3.5/3.6 off its second KV allocator — warm TTFT stops scaling with prefix
 
 ## Context
 
-`executor/qwen35.rs` ran the device `PagedKVPool`'s OWN `alloc_tokens` /
-`free_slot`, a second allocator whose page ids were unrelated to the engine's
-host pool. A radix prefix hit was therefore only a *token* match: the KV bytes
-behind it were unreachable by page identity, so the recurrent sidecar carried
-the whole matched prefix's full-attention KV and round-tripped it through the
-host at every turn — D2H + serialize on save, tier read + deserialize + H2D on
-restore. Measured at 0.27 ms/token, strictly linear in prefix length
-(`errors/2026-07-28-qwen35-second-kv-allocator-blocks-page-reuse.md`).
-
-`executor/qwen.rs` never had this: the host pool is its single allocator and
-each row's page list is lowered with `PagedKVPool::mirror_slot`, host page ids
-indexing device storage rows 1:1.
+`executor/qwen35.rs` ran the device pool's own allocator, a page-id space
+unrelated to the engine's host pool. A radix hit was therefore only a *token*
+match, so the recurrent sidecar carried the matched prefix's whole
+full-attention KV through the host every turn — 0.27 ms/token, linear in prefix
+length (`errors/2026-07-28-qwen35-second-kv-allocator-blocks-page-reuse.md`).
+`executor/qwen.rs` never had this: host pool as single allocator, page list
+lowered with `mirror_slot`, host ids indexing device rows 1:1.
 
 ## What Worked
 
-Converged qwen35 onto that same host-authoritative model. All 23 device-allocator
-call sites became `mirror_host_slot`, and the sidecar's `full_attn_kv` blob is
-gone — restore now mirrors the radix prefix's own pages, which are already in HBM.
+All 23 device-allocator sites became `mirror_host_slot`; the sidecar's
+`full_attn_kv` blob is gone — restore mirrors the prefix's own resident pages.
 
-Three gaps the seam had to close first, all small:
+Three seam gaps closed first:
 
-- `KvAllocator::reinstate_slot_page` — the inverse of `evict_slot_page`, which
-  the `--kv-recall` prefetch path needed on the host side (default no-op impl).
-- `alloc_to_len_with_prefix_reclaim` — speculative decode materializes a whole
-  draft chain's KV in one forward, past the single token the engine
-  pre-allocated. The executor now grows the host pool itself and the engine's
-  post-step append of the accepted extras grows-to-target instead of blindly
-  appending, so it no-ops rather than double-counting.
-- `promote_slot` passes the engine's `slot_pages` through to the whole-slot swap
-  restore (the seam already carried them; the qwen35 arm had ignored them).
+- `KvAllocator::reinstate_slot_page` — inverse of `evict_slot_page`, needed by
+  `--kv-recall` prefetch on the host side.
+- `alloc_to_len_with_prefix_reclaim` — spec decode writes a whole draft chain
+  past the one token the engine pre-allocated, so the executor grows the host
+  pool and the engine's post-step append grows-to-target instead of blindly
+  appending.
+- `promote_slot` forwards the engine's `slot_pages` into the whole-slot swap.
 
-Deleted with their reason: `kv_device_gate_active` / `kv_device_fit` for this arm
-(the device pool no longer allocates, so the host pool is the fit authority —
-same as dense Qwen).
+Deleted: `kv_device_gate_active` / `kv_device_fit` for this arm — the device
+pool no longer allocates, so the host pool is the fit authority.
 
 ## Measurement
 
-Matched A/B, one box, one model, same prompts, sequential on the same GPU.
-`Qwen3.6-35B-A3B-FP8` (MoE), 1×H20, eager, c=1, `ttft_scale.py` — one long prompt
-resent to a warm server, so TTFT is almost entirely restore cost.
+Matched A/B, one box, one GPU, one model, sequential. `Qwen3.6-35B-A3B-FP8`,
+1×H20, eager, `ttft_scale.py` at c=1 (one long prompt resent warm, so TTFT is
+almost all restore cost).
 
-| prefix | baseline warm TTFT | mirror warm TTFT | Δ |
-|--------|-------------------|------------------|---|
+| prefix | base warm TTFT | mirror warm TTFT | Δ |
+|--------|---------------:|-----------------:|---|
 | 4k  | 0.480 s | 0.161 s | 3.0× |
 | 8k  | 0.814 s | 0.147 s | 5.5× |
 | 16k | 1.708 s | 0.162 s | 10.6× |
 | 33k | 3.020 s | 0.175 s | **17.3×** |
 
-Warm TTFT is now flat in prefix length (0.147–0.175 s across a 8× span) — the
-linear per-token term is gone, which is the signature the diagnosis predicted.
-Cold TTFT also drops (33k 37.94 → 28.96 s, −24%; 16k 35.95 → 27.81 s, −23%) from
-the save-side D2H + serialize disappearing.
+Warm TTFT is now flat across an 8× prefix span — the linear per-token term is
+gone. Cold drops too (33k 37.94 → 28.96 s) from the save-side D2H.
 
-Correctness gate: `needle_gate.py 512,4096,16384,32768 3 0.0` — exact=3 DET at
-every length on both arms, identical.
+Gate: `needle_gate.py 512,4096,16384,32768 3 0.0` — exact=3 DET on both arms.
 
 ## Rule
 
 **Two pools with the same page-id type are one address space or they are not —
-decide it once, at the seam, not per executor.** The sidecar's KV blob was not a
-feature; it was the cost of a second allocator, and it stayed invisible until
-someone measured warm TTFT against prefix length. When a backend carries its own
-copy of state the engine already owns, the copy is the symptom — look for the
-ownership split above it.
+decide it at the seam, once, not per executor.** The sidecar's KV blob was the
+cost of a second allocator, and stayed invisible until someone plotted warm TTFT
+against prefix length. When a backend keeps its own copy of state the engine
+already owns, the copy is the symptom; look for the ownership split above it.

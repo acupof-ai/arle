@@ -1137,15 +1137,10 @@ impl Qwen35RecurrentSnapshot {
             + self.conv.iter().map(|v| v.len() * 2).sum::<usize>()
     }
 
-    /// Flatten the recurrent snapshot into ONE length-prefixed buffer for the
-    /// sidecar [`kv_native_sys::KvTierStore`] (opaque-`u64` key). Exact
-    /// byte-inverse of [`Self::from_bytes`]. Header: `[num_gdr][num_conv]`
-    /// (u64 LE), then each gdr vec `[len:u64][f32 LE...]` and each conv vec
-    /// `[len:u64][bf16 LE...]`.
-    ///
-    /// The full-attention KV is deliberately NOT in here: restore mirrors the
-    /// radix prefix's own device pages, which is the whole point of the
-    /// host-authoritative page model (`executor/qwen35.rs::mirror_host_slot`).
+    /// Flatten for the sidecar tier store — exact byte-inverse of
+    /// [`Self::from_bytes`]. Header `[num_gdr][num_conv]` (u64 LE), then each vec
+    /// `[len:u64][elems...]`. No full-attention KV: restore mirrors the radix
+    /// prefix's own device pages.
     pub(crate) fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(self.host_bytes() + 64);
         buf.extend_from_slice(&(self.gdr.len() as u64).to_le_bytes());
@@ -1511,9 +1506,8 @@ impl Qwen35SlotState {
     /// the host image complete before any device buffer is reused.
     ///
     /// Captured buffers (every device buffer the slot owns, proven complete):
-    ///   (a) full-attn KV pages — `full_attn_kv.page_indices(slot)` →
-    ///       `copy_pages_to_host`, then the page mirror is dropped (the host
-    ///       pool owns the pages and frees them right after `demote_slot`).
+    ///   (a) full-attn KV pages — `copy_pages_to_host`, then drop the mirror
+    ///       (the host pool frees them right after `demote_slot`).
     ///   (b) `gdr_states[0..num_linear]` (f32) — `clone_dtoh` each.
     ///   (c) `conv_states[0..num_linear]` (bf16) — `clone_dtoh` each.
     ///   (d) `seq_len`.
@@ -1578,11 +1572,10 @@ impl Qwen35SlotState {
         Ok(image)
     }
 
-    /// Restore a whole-slot image into this slot — the exact byte-inverse of
-    /// [`Self::swap_out_image`]. Mirror the host pages the engine re-allocated
-    /// for the slot, acquire a recurrent block, H2D the captured bytes verbatim
-    /// (the SAME session restores its OWN state, so this is a byte-restore, not
-    /// a reuse), and set `seq_len`. The engine resumes
+    /// Restore a whole-slot image — the exact byte-inverse of
+    /// [`Self::swap_out_image`]. Mirror the host pages the engine re-allocated,
+    /// acquire a recurrent block, H2D the captured bytes verbatim (the SAME
+    /// session restores its OWN state), set `seq_len`. The engine resumes
     /// decode immediately after `promote_slot`, so the trailing `ctx.sync()`
     /// makes the device restore complete before the host image can be dropped.
     pub(crate) fn swap_in_image(
@@ -1615,7 +1608,7 @@ impl Qwen35SlotState {
             image.gdr_host.len(),
             image.conv_host.len()
         );
-        // (a) Mirror exactly the captured page count and H2D the full-attn bytes.
+        // (a) Mirror the captured page count, H2D the full-attn bytes.
         ensure!(
             slot_pages.len() == image.full_attn_page_count,
             "Qwen3.6 swap-in host slot holds {} pages != captured {}",
