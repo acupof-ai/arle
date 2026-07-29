@@ -45,7 +45,7 @@ impl Default for TrainRuntimeFlags {
 
 static WRITEBACK_OFFLOAD: AtomicBool = AtomicBool::new(true);
 static ENGINE_OFFLOAD: AtomicU8 = AtomicU8::new(0);
-static GRADIENT_CHECKPOINTING: AtomicBool = AtomicBool::new(false);
+static GRADIENT_CHECKPOINTING: AtomicBool = AtomicBool::new(true);
 static WRITEBACK_FROZEN_PROMPT_KV: AtomicBool = AtomicBool::new(false);
 static ROLLOUT_RETAIN_INTERVAL: AtomicUsize = AtomicUsize::new(2);
 static ROLLOUT_PROGRESS_INTERVAL: AtomicUsize = AtomicUsize::new(16);
