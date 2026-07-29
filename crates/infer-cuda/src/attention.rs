@@ -55,6 +55,39 @@ const DSV4_FLASH_KV_BYTES_PER_TOKEN_I32: i32 = 584;
 /// 512 (NoPE fp8) + 16 (4× F32 block scales) + 128 (bf16 rope) = 656. Matches
 /// the shim `V32_BYTES_PER_TOKEN` and the vendored decode's inline reads.
 const DSV4_V32_KV_BYTES_PER_TOKEN_I32: i32 = 656;
+
+/// FlashMLA model-family dims, resolved once from the config's attention shape.
+/// The single source of the `(head_dim, rope, kv_lora) → (model_type, bytes/tok,
+/// d_v)` table — prefill, single-row decode, and batched decode all call this
+/// instead of re-matching the tuple. `d_v` (value/output latent) is 512 for both
+/// families; MODEL1's d_qk==d_v==512, V32's d_qk=576 but output latent stays 512.
+struct FlashMlaModelMeta {
+    model_type_int: i32,
+    bytes_per_token: i32,
+    d_v: i32,
+}
+
+fn dsv4_flashmla_model_meta(config: &DeepSeekV4Config) -> Result<FlashMlaModelMeta> {
+    match (
+        config.head_dim,
+        config.qk_rope_head_dim,
+        config.kv_lora_rank,
+    ) {
+        (512, 64, _) => Ok(FlashMlaModelMeta {
+            model_type_int: DSV4_FLASHMLA_MODEL1,
+            bytes_per_token: DSV4_FLASH_KV_BYTES_PER_TOKEN_I32,
+            d_v: 512,
+        }),
+        (576, 64, 512) => Ok(FlashMlaModelMeta {
+            model_type_int: DSV4_FLASHMLA_V32,
+            bytes_per_token: DSV4_V32_KV_BYTES_PER_TOKEN_I32,
+            d_v: 512,
+        }),
+        (hd, rd, kv) => anyhow::bail!(
+            "DSv4 FlashMLA: unsupported (head_dim={hd}, rope={rd}, kv_lora={kv}); want MODEL1 (512,64) or V32 (576,64,kv512)"
+        ),
+    }
+}
 const DSV4_FLASHMLA_OVERRIDE_ENV: i8 = -1;
 const DSV4_FLASHMLA_OVERRIDE_OFF: i8 = 0;
 const DSV4_FLASHMLA_OVERRIDE_ON: i8 = 1;
@@ -2274,17 +2307,8 @@ fn try_flashmla_prefill_attention(
         return Ok(false);
     }
     // MODEL1 (head_dim=512) + V32 (GLM, head_dim=576 = 512 latent + 64 rope).
-    let (model_type_int, bytes_per_token) = match (
-        config.head_dim,
-        config.qk_rope_head_dim,
-        config.kv_lora_rank,
-    ) {
-        (512, 64, _) => (DSV4_FLASHMLA_MODEL1, DSV4_FLASH_KV_BYTES_PER_TOKEN_I32),
-        (576, 64, 512) => (DSV4_FLASHMLA_V32, DSV4_V32_KV_BYTES_PER_TOKEN_I32),
-        (hd, rd, kv) => anyhow::bail!(
-            "DSv4 FlashMLA prefill: unsupported (head_dim={hd}, rope={rd}, kv_lora={kv}); want MODEL1 (512,64) or V32 (576,64,kv512)"
-        ),
-    };
+    let meta = dsv4_flashmla_model_meta(config)?;
+    let (model_type_int, bytes_per_token) = (meta.model_type_int, meta.bytes_per_token);
     let is_v32 = model_type_int == DSV4_FLASHMLA_V32;
     let _ = (model_type_int, bytes_per_token, is_v32);
     ensure!(
@@ -2637,32 +2661,23 @@ fn try_flashmla_prefill_attention(
             let mut scale = ctx.stream.alloc_zeros::<f32>(2)?;
             ctx.stream.memcpy_htod(&[1.0f32, 1.0f32], &mut scale)?;
             // Cast the gathered global-head Q and the shared latent KV to fp8.
-            {
-                let (q_dst, _dg) = q_fp8.device_ptr_mut(&ctx.stream);
-                // SAFETY: q_for_flashmla spans token_count*global_width; q_fp8 holds q_elems.
-                unsafe {
-                    ffi::arle_bf16_to_fp8_e4m3_cuda(
-                        q_for_flashmla as *const ffi::Half,
-                        q_dst as *mut u8,
-                        q_elems as i64,
-                        ctx.stream.cu_stream(),
-                    )
-                    .result()?;
-                }
-            }
-            {
-                let (kv_dst, _dg) = kv_fp8.device_ptr_mut(&ctx.stream);
-                // SAFETY: kv_ptr spans kv_rows*head_dim; kv_fp8 holds kv_elems.
-                unsafe {
-                    ffi::arle_bf16_to_fp8_e4m3_cuda(
-                        kv_ptr as *const ffi::Half,
-                        kv_dst as *mut u8,
-                        kv_elems as i64,
-                        ctx.stream.cu_stream(),
-                    )
-                    .result()?;
-                }
-            }
+            let cast_fp8 =
+                |src: *const ffi::Half, dst: &mut CudaSlice<u8>, n: usize| -> Result<()> {
+                    let (dst_ptr, _dg) = dst.device_ptr_mut(&ctx.stream);
+                    // SAFETY: src spans n elements; dst holds n bytes, fully written.
+                    unsafe {
+                        ffi::arle_bf16_to_fp8_e4m3_cuda(
+                            src,
+                            dst_ptr as *mut u8,
+                            n as i64,
+                            ctx.stream.cu_stream(),
+                        )
+                        .result()?;
+                    }
+                    Ok(())
+                };
+            cast_fp8(q_for_flashmla as *const ffi::Half, &mut q_fp8, q_elems)?;
+            cast_fp8(kv_ptr as *const ffi::Half, &mut kv_fp8, kv_elems)?;
             let (q_fp8_ptr, _qfg) = q_fp8.device_ptr(&ctx.stream);
             let (kv_fp8_ptr, _kfg) = kv_fp8.device_ptr(&ctx.stream);
             let (scale_ptr, _sg) = scale.device_ptr(&ctx.stream);
@@ -2856,17 +2871,8 @@ fn try_flashmla_decode_attention(
     // MODEL1 (DSv4, head_dim=512) and V32 (GLM, head_dim=576 = 512 latent NoPE
     // + 64 RoPE). The FlashMLA shim reads q[heads, d_qk] and writes out[heads,
     // d_v=512 latent]; for MODEL1 d_qk==d_v==512, for V32 d_qk=576 but d_v=512.
-    let (model_type_int, bytes_per_token) = match (
-        config.head_dim,
-        config.qk_rope_head_dim,
-        config.kv_lora_rank,
-    ) {
-        (512, 64, _) => (DSV4_FLASHMLA_MODEL1, DSV4_FLASH_KV_BYTES_PER_TOKEN_I32),
-        (576, 64, 512) => (DSV4_FLASHMLA_V32, DSV4_V32_KV_BYTES_PER_TOKEN_I32),
-        (hd, rd, kv) => anyhow::bail!(
-            "DSv4 FlashMLA decode: unsupported (head_dim={hd}, rope={rd}, kv_lora={kv}); want MODEL1 (512,64) or V32 (576,64,kv512)"
-        ),
-    };
+    let meta = dsv4_flashmla_model_meta(config)?;
+    let (model_type_int, bytes_per_token) = (meta.model_type_int, meta.bytes_per_token);
     let is_v32 = model_type_int == DSV4_FLASHMLA_V32;
     ensure!(
         local_attn.seq_len == 1,
