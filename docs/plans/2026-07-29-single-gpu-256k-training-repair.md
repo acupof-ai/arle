@@ -8,17 +8,19 @@
 
 ## Execution status
 
-- T1: implemented; CUDA autograd gate passed.
-- T2.1: long-query fused forward implemented; long-shape gate pending.
+- T1: wide elementwise, GDN, and slice offsets implemented; CUDA gate pending
+  for the final slice tranche.
+- T2.1: long-query fused forward implemented; CUDA 65,536 gate passed.
 - T2.2: CP-only attention deleted; both paths use rectangular recompute.
-- T2.3: 512 GiB host capture removed; boundary-only device mode still pending.
+- T2.3: 512 GiB host capture removed; CUDA boundary capture streams state only.
 - T2.4: byte-budget mono fallback and context estimator implemented.
 - T3.1: persistent CUDA gradient accumulation implemented; CUDA gate passed.
-- T3.2: pending.
-- T3.3: checkpoint forward now chunks MLP replay; device-only backward pending.
-- T4: pending.
-- T5: 64K forward/CE passed; the first backward run OOMed on a 4.56 GiB
-  full-sequence MLP replay allocation. The repair rerun is in progress.
+- T3.2: indexed CE implemented; CPU parity and exact 64K CE passed.
+- T3.3: checkpoint replay chunks MLP; device-only accumulation remains pending.
+- T4: programmatic checkpoint default aligned; remaining items pending.
+- T5: exact `b5f078ae0` passed 64K forward/CE, then OOMed in the first
+  full-attention backward replay. Last-use activation release and wide slice
+  offsets are committed in `e01aa6606`; rerun pending.
 
 ## Outcome
 
@@ -38,18 +40,14 @@ set, and optimizer. Passing a synthetic sub-path is diagnosis, not acceptance.
 ## Current truth
 
 - The default admission fence drops updates above 23,000 tokens.
-- The latest clean single-GPU evidence completes 49,152 tokens with MLP chunk
-  4096; backward takes 2,460 seconds.
-- 57,344 still OOMs in `add_into_device` while allocating a 2.82 GB gradient.
-- At roughly 61,680 tokens, existing f32 elementwise kernels cross an `i32`
-  flattened-index boundary.
-- At exactly 256K, GDN `qkv_len = 262144 * 8192 = 2^31`, so the current
-  forward/backward ABI rejects it before the kernel runs.
-- Full attention rejects fused prefill above 65,535 queries; its fallback only
-  chunks heads, leaving one `[256K, 256K]` f32 matrix (256 GiB).
+- The latest completed single-GPU update remains 49,152 tokens.
+- Wide elementwise, GDN, attention, and slice paths remove the known 256K
+  indexing and quadratic-attention walls; the final slice tranche is pending
+  CUDA validation.
 - No existing run proves a complete 64K, 128K, or 256K update.
-- The 2026-07-29 candidate completed 64K forward in 734.963 seconds, then
-  backward OOMed with 25.6 MiB driver-free while the CUDA pool hoarded 48.2 GiB.
+- Exact `b5f078ae0` completed 64K forward in 749.656 seconds and CE in 2.956
+  seconds. Backward OOMed after 181 seconds in layer 63 gated-q slice backward:
+  3,072 MiB requested with 25 MiB free; peak was 97,483/97,508 MiB.
 
 Therefore the capability is **49,152 verified; 256K unsupported** until the final
 gate below passes.
@@ -64,24 +62,6 @@ gate below passes.
 5. Each tranche is independently buildable, testable, measurable, and revertible.
 6. Preserve unrelated worktree edits; stage and commit only explicit paths.
 7. Every runtime tranche gets a dated `docs/experience/wins/` or `errors/` entry.
-
-## Worktree preflight
-
-The shared worktree already contains uncommitted edits in:
-
-- `crates/autograd/src/backend_cuda.rs`
-- `crates/autograd/src/ops.rs`
-- `crates/autograd/src/ops/attention.rs`
-- `crates/autograd/src/tape.rs`
-- `crates/train/src/context_parallel.rs`
-- `crates/train/src/opd.rs`
-
-Before implementation:
-
-1. Record `git status --short`, `git diff --stat`, and the exact HEAD.
-2. Identify the owner and intent of every overlapping hunk.
-3. Re-review the resulting current code after concurrent work settles.
-4. Never overwrite or revert an unowned hunk.
 
 ## Dependency order
 
