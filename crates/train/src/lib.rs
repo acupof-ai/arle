@@ -19,6 +19,8 @@ pub mod cc_convert;
 pub mod cc_harness;
 #[path = "checkpoint.rs"]
 pub mod checkpoint;
+#[path = "context_parallel.rs"]
+pub mod context_parallel;
 #[path = "ema_self_teacher.rs"]
 pub mod ema_self_teacher;
 #[path = "grad_clip.rs"]
