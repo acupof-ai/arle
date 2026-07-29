@@ -79,6 +79,12 @@ impl Qwen35DsparkHead {
     fn kv_dim(&self) -> usize {
         self.cfg.num_key_value_heads * self.cfg.head_dim
     }
+    /// Batched drafting covers the greedy no-markov head only — the markov
+    /// chain resolves row r from row r-1, which no batching removes.
+    pub(crate) fn batchable_draft(&self) -> bool {
+        self.markov.is_none()
+    }
+
     pub(crate) fn block_size(&self) -> usize {
         self.cfg.block_size
     }
@@ -343,6 +349,9 @@ pub(crate) struct DsparkScratch {
     conf_feat: HiddenSlot,
     conf_out: HiddenSlot,
     argmax: SliceSlot<i32>,
+    /// Batched-draft logits, `[B * block, vocab]` — the per-slot `df.logits`
+    /// stay the training capture's view and are filled from here.
+    logits_b: HiddenSlot,
     /// Row count of the tap features held in `feat_b` (the whole batch).
     feat_seq: usize,
     /// Sampled-mode device buffers (allocated on first temp>0 spec step only;
@@ -1120,6 +1129,231 @@ impl Qwen35Model {
         Ok(chain)
     }
 
+    /// Batched twin of [`Self::dspark_draft_block`]: ONE 5-layer forward over
+    /// every slot's block. The draft GEMMs are weight-bound at `block` rows
+    /// (52 µs for 6 rows), so B serial drafts re-read the same weights B times;
+    /// batching reads them once. Only the two ring kernels stay per-slot — they
+    /// carry each slot's own K/V traffic, which no batching removes.
+    ///
+    /// Greedy, no-markov only: both other paths walk the chain with a device
+    /// sync per row, and batching does not remove a sync. `chains[i]` is slot
+    /// `i`'s `[anchor, d1..]`, empty when that slot's block was rejected.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn dspark_draft_blocks(
+        &self,
+        head: &Qwen35DsparkHead,
+        dfs: &mut [&mut Qwen35DsparkSlotState],
+        scratch: &mut DsparkScratch,
+        anchors: &[u32],
+        starts: &[usize],
+    ) -> Result<Vec<Vec<u32>>> {
+        let cfg = &head.cfg;
+        let ctx = &self.ctx;
+        let block = cfg.block_size;
+        let b = dfs.len();
+        ensure!(
+            b == anchors.len() && b == starts.len(),
+            "dspark batched draft: {b} slots vs {} anchors / {} starts",
+            anchors.len(),
+            starts.len()
+        );
+        let rows = b * block;
+        let hidden = cfg.hidden_size;
+        let (q_dim, kv_dim) = (head.q_dim(), head.kv_dim());
+        let eps = cfg.rms_norm_eps;
+
+        let mut ids = vec![cfg.mask_token_id as i32; rows];
+        // Per-row attention windows, laid out `[all bases][all lengths]` so one
+        // upload serves every slot and every layer (see the row-shaped twin).
+        let mut win = vec![0i32; 2 * rows];
+        let mut pos = vec![0i32; b];
+        for (s, df) in dfs.iter().enumerate() {
+            let start = starts[s];
+            ensure!(df.ctx_end == start, "dspark draft: ctx_end != start");
+            ensure!(
+                start + block <= head.rope_cap,
+                "dspark draft past cache cap"
+            );
+            ids[s * block] = anchors[s] as i32;
+            pos[s] = start as i32;
+            for row in 0..block {
+                let lo = (start + row)
+                    .saturating_sub(cfg.sliding_window - 1)
+                    .max(df.ctx_base);
+                let kv_len = start + block - lo;
+                ensure!(kv_len <= head.cap, "dspark draft row window {kv_len} > cap");
+                win[s * block + row] = lo as i32;
+                win[rows + s * block + row] = kv_len as i32;
+            }
+        }
+
+        let ids_dev = scratch.ids.upload(ctx, &ids)?;
+        let h = scratch.hidden.get(ctx, hidden, rows)?;
+        embedding_batch(ctx, &self.embed_tokens, ids_dev, h)?;
+        let pos_dev = scratch.start_pos_abs.upload(ctx, &pos)?;
+        let win_dev = scratch.attn_win.upload(ctx, &win)?;
+
+        let elem = std::mem::size_of::<half::f16>() as u64;
+        for (li, layer) in head.layers.iter().enumerate() {
+            let cap_li = head.cap;
+            let h = scratch.hidden.get(ctx, hidden, rows)?;
+            let normed = scratch.normed.get(ctx, hidden, rows)?;
+            rms_norm_batch(ctx, h, &layer.input_layernorm, eps, normed)?;
+
+            let q_full = scratch.q_full.get(ctx, 2 * q_dim, rows)?;
+            gemm_batch(ctx, &layer.q_proj, normed, q_full)?;
+            let k_new = scratch.k_new.get(ctx, kv_dim, rows)?;
+            gemm_batch(ctx, &layer.k_proj, normed, k_new)?;
+            let v_new = scratch.v_new.get(ctx, kv_dim, rows)?;
+            gemm_batch(ctx, &layer.v_proj, normed, v_new)?;
+
+            let q_prepped = scratch.q_prepped.get(ctx, q_dim, rows)?;
+            let attn_heads = scratch.attn_heads.get(ctx, q_dim, rows)?;
+            {
+                let (qf_ptr, _g0) = q_full.data.device_ptr(&ctx.stream);
+                let (k_ptr, _g1) = k_new.data.device_ptr(&ctx.stream);
+                let (v_ptr, _g2) = v_new.data.device_ptr(&ctx.stream);
+                let (qn_ptr, _g3) = layer.q_norm.data.device_ptr(&ctx.stream);
+                let (kn_ptr, _g4) = layer.k_norm.data.device_ptr(&ctx.stream);
+                let (cos_ptr, _g5) = head.cos_cache.data.device_ptr(&ctx.stream);
+                let (sin_ptr, _g6) = head.sin_cache.data.device_ptr(&ctx.stream);
+                let (qp_ptr, _g7) = q_prepped.data.device_ptr_mut(&ctx.stream);
+                let (ao_ptr, _g8) = attn_heads.data.device_ptr_mut(&ctx.stream);
+                let (w_ptr, _g9) = win_dev.device_ptr(&ctx.stream);
+                let (sp_ptr, _g10) = pos_dev.device_ptr(&ctx.stream);
+                let nq = cfg.num_attention_heads as i32;
+                let nkv = cfg.num_key_value_heads as i32;
+                let hd = cfg.head_dim as i32;
+                let sm_scale = 1.0 / (cfg.head_dim as f32).sqrt();
+                for (s, df) in dfs.iter_mut().enumerate() {
+                    let off = (s * block) as u64;
+                    let (kc_ptr, _gk) = df.k_ctx[li].data.device_ptr_mut(&ctx.stream);
+                    let (vc_ptr, _gv) = df.v_ctx[li].data.device_ptr_mut(&ctx.stream);
+                    // SAFETY: every pointer is offset by this slot's `block`
+                    // rows inside a `rows`-row buffer; the ring bounds and the
+                    // `kv_len <= cap` guard are the row-shaped path's.
+                    unsafe {
+                        ffi::prefill_attention_hd256_prep_ring_cuda(
+                            (qf_ptr + off * 2 * q_dim as u64 * elem) as *const ffi::Half,
+                            (k_ptr + off * kv_dim as u64 * elem) as *const ffi::Half,
+                            (v_ptr + off * kv_dim as u64 * elem) as *const ffi::Half,
+                            qn_ptr as *const ffi::Half,
+                            kn_ptr as *const ffi::Half,
+                            cos_ptr as *const ffi::Half,
+                            sin_ptr as *const ffi::Half,
+                            (qp_ptr + off * q_dim as u64 * elem) as *mut ffi::Half,
+                            kc_ptr as *mut ffi::Half,
+                            vc_ptr as *mut ffi::Half,
+                            nq,
+                            nkv,
+                            hd,
+                            block as i32,
+                            (sp_ptr + s as u64 * 4) as *const i32,
+                            hd,
+                            eps,
+                            cap_li as i32,
+                            ctx.stream.cu_stream(),
+                        )
+                        .result()?;
+                    }
+                    // SAFETY: q/out offset as above; the window table holds
+                    // `rows` bases then `rows` lengths, so this slot's pair is
+                    // at `off` and `rows + off`.
+                    unsafe {
+                        ffi::nonpaged_prefill_attention_ring_varlen_cuda(
+                            (qp_ptr + off * q_dim as u64 * elem) as *const ffi::Half,
+                            kc_ptr as *const ffi::Half,
+                            vc_ptr as *const ffi::Half,
+                            (ao_ptr + off * q_dim as u64 * elem) as *mut ffi::Half,
+                            nq,
+                            nkv,
+                            hd,
+                            block as i32,
+                            (w_ptr as *const i32).add(s * block),
+                            (w_ptr as *const i32).add(rows + s * block),
+                            cap_li as i32,
+                            sm_scale,
+                            ctx.stream.cu_stream(),
+                        )
+                        .result()?;
+                    }
+                }
+            }
+
+            let attn_out_h = scratch.attn_out_h.get(ctx, hidden, rows)?;
+            gemm_batch(ctx, &layer.o_proj, attn_heads, attn_out_h)?;
+            let hidden_mid = scratch.hidden_mid.get(ctx, hidden, rows)?;
+            add_batch(
+                ctx,
+                scratch.hidden.get(ctx, hidden, rows)?,
+                attn_out_h,
+                hidden_mid,
+            )?;
+            let normed = scratch.normed.get(ctx, hidden, rows)?;
+            rms_norm_batch(
+                ctx,
+                hidden_mid,
+                &layer.post_attention_layernorm,
+                eps,
+                normed,
+            )?;
+            let mlp_out = scratch.attn_out_h.get(ctx, hidden, rows)?;
+            self.dense_mlp(&layer.mlp, normed, &mut scratch.dense, mlp_out)?;
+            add_batch(
+                ctx,
+                scratch.hidden_mid.get(ctx, hidden, rows)?,
+                mlp_out,
+                scratch.hidden.get(ctx, hidden, rows)?,
+            )?;
+        }
+
+        let final_normed = scratch.final_normed.get(ctx, hidden, rows)?;
+        rms_norm_batch(
+            ctx,
+            scratch.hidden.get(ctx, hidden, rows)?,
+            &head.norm,
+            eps,
+            final_normed,
+        )?;
+        let vocab = self.output_projection().rows;
+        let logits = scratch.logits_b.get(ctx, vocab, rows)?;
+        gemm_batch(ctx, self.output_projection(), final_normed, logits)?;
+
+        // One argmax over every slot's rows — one D2H for the whole tick.
+        let ids_dev = scratch.argmax.get(ctx, rows)?;
+        let am = self.argmax_rows_into(scratch.logits_b.get(ctx, vocab, rows)?, ids_dev)?;
+
+        let first_row = usize::from(!cfg.next_token_heads);
+        let mut chains = Vec::with_capacity(b);
+        for (s, df) in dfs.iter_mut().enumerate() {
+            // The training capture and the rank probe read the draft logits per
+            // slot after the verify, so each slot keeps its own copy.
+            df.q_rows = 0;
+            let src = scratch
+                .logits_b
+                .get(ctx, vocab, rows)?
+                .data
+                .slice(s * block * vocab..(s + 1) * block * vocab);
+            let dst = df.logits.get(ctx, vocab, block)?;
+            ctx.stream
+                .memcpy_dtod(&src, &mut dst.data)
+                .map_err(|e| anyhow!("dspark batched draft logits copy failed: {e}"))?;
+
+            let drafts = &am[s * block + first_row..(s + 1) * block];
+            let prev_tokens: Vec<u32> = std::iter::once(anchors[s])
+                .chain(drafts.iter().copied())
+                .take(drafts.len())
+                .collect();
+            let keep =
+                self.dspark_confident_prefix_len_at(head, scratch, &prev_tokens, s * block, rows)?;
+            let mut chain = Vec::with_capacity(1 + drafts.len());
+            chain.push(anchors[s]);
+            chain.extend(&drafts[..keep.min(drafts.len())]);
+            chains.push(chain);
+        }
+        Ok(chains)
+    }
+
     /// Greedy token for every block row. Without a markov head that is one
     /// batched argmax; with one, `bias = w2·w1[prev]` makes row r depend on row
     /// r-1's choice, so the block is resolved by speculating the chain on
@@ -1192,6 +1426,20 @@ impl Qwen35Model {
         scratch: &mut DsparkScratch,
         prev_tokens: &[u32],
     ) -> Result<usize> {
+        let block = head.cfg.block_size;
+        self.dspark_confident_prefix_len_at(head, scratch, prev_tokens, 0, block)
+    }
+
+    /// [`Self::dspark_confident_prefix_len`] over one slot's rows inside a
+    /// `total_rows`-row batched forward.
+    fn dspark_confident_prefix_len_at(
+        &self,
+        head: &Qwen35DsparkHead,
+        scratch: &mut DsparkScratch,
+        prev_tokens: &[u32],
+        row_off: usize,
+        total_rows: usize,
+    ) -> Result<usize> {
         let Some(conf) = &head.confidence else {
             return Ok(usize::MAX);
         };
@@ -1208,9 +1456,10 @@ impl Qwen35Model {
         // hundred µs of arithmetic.
         let feat = scratch.conf_feat.get(ctx, in_dim, n)?;
         {
-            let final_normed = scratch.final_normed.get(ctx, hidden, block)?;
+            let final_normed = scratch.final_normed.get(ctx, hidden, total_rows)?;
             for i in 0..n {
-                let src = final_normed.data.slice(i * hidden..(i + 1) * hidden);
+                let r = row_off + i;
+                let src = final_normed.data.slice(r * hidden..(r + 1) * hidden);
                 let mut dst = feat.data.slice_mut(i * in_dim..i * in_dim + hidden);
                 ctx.stream
                     .memcpy_dtod(&src, &mut dst)

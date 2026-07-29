@@ -1882,7 +1882,8 @@ impl Qwen35CudaExecutor {
         let mut out: Vec<Vec<SlotToken>> = (0..decode_rows.len()).map(|_| Vec::new()).collect();
         let mut batch: Vec<DsparkChain> = Vec::with_capacity(decode_rows.len());
         let mut pt = crate::qwen35::dspark_phase_start(&self.model.ctx);
-        for (i, row) in decode_rows.iter().enumerate() {
+        let mut seeded = Vec::with_capacity(decode_rows.len());
+        for row in decode_rows {
             ensure!(
                 row.slot < self.num_slots,
                 "decode slot {} outside Qwen3.5 executor slots {}",
@@ -1896,40 +1897,87 @@ impl Qwen35CudaExecutor {
                 row.kv_seq_len,
                 row.slot
             );
-            let start = row.kv_seq_len;
             // The verify appends the whole chain, so it must fit the trunk cap.
-            let seeded = {
-                let ds = self
-                    .dspark
-                    .as_ref()
-                    .expect("dspark_decode_batch without dspark");
+            let ds = self
+                .dspark
+                .as_ref()
+                .expect("dspark_decode_batch without dspark");
+            seeded.push(
                 self.full_attn_paged()
-                    && speculative_chain_fits(start, ds.head.block_size(), self.model.max_seq_len())
+                    && speculative_chain_fits(
+                        row.kv_seq_len,
+                        ds.head.block_size(),
+                        self.model.max_seq_len(),
+                    )
                     && matches!(
                         ds.slots[row.slot].as_ref(),
-                        Some(s) if s.pending == Some(row.last_token) && s.ctx_end == start
-                    )
-            };
-            // 1. Draft — no trunk/pool state touched; noise K/V self-heal.
-            let drafted = seeded
-                .then(|| {
-                    let Self { model, dspark, .. } = self;
-                    let ds = dspark.as_mut().expect("dspark");
-                    let df = ds.slots[row.slot].as_mut().expect("seeded slot");
-                    let partial_ctx = df.ctx_base > 0;
-                    model
-                        .dspark_draft_block(
-                            &ds.head,
-                            df,
-                            &mut ds.scratch,
-                            row.last_token,
-                            start,
-                            &row.params,
-                        )
-                        .map(|chain| (chain, partial_ctx))
-                })
-                .transpose()?
-                .filter(|(chain, _)| chain.len() >= 2);
+                        Some(s) if s.pending == Some(row.last_token) && s.ctx_end == row.kv_seq_len
+                    ),
+            );
+        }
+
+        // 1. Draft — no trunk/pool state touched; noise K/V self-heal. The
+        //    draft GEMMs are weight-bound at block rows, so every seeded slot
+        //    goes through ONE forward when the head allows it.
+        let mut pre: Vec<Option<Vec<u32>>> = vec![None; decode_rows.len()];
+        let mut idx: Vec<usize> = (0..decode_rows.len()).filter(|&i| seeded[i]).collect();
+        if idx.len() >= 2
+            && decode_rows.iter().all(|r| r.params.is_greedy())
+            && self.dspark.as_ref().expect("dspark").head.batchable_draft()
+        {
+            idx.sort_by_key(|&i| decode_rows[i].slot);
+            let anchors: Vec<u32> = idx.iter().map(|&i| decode_rows[i].last_token).collect();
+            let starts: Vec<usize> = idx.iter().map(|&i| decode_rows[i].kv_seq_len).collect();
+            let want: Vec<usize> = idx.iter().map(|&i| decode_rows[i].slot).collect();
+            let Self { model, dspark, .. } = self;
+            let ds = dspark.as_mut().expect("dspark");
+            let mut dfs: Vec<&mut crate::qwen35::dspark::Qwen35DsparkSlotState> = ds
+                .slots
+                .iter_mut()
+                .enumerate()
+                .filter(|(s, _)| want.contains(s))
+                .map(|(_, st)| st.as_mut().expect("seeded slot"))
+                .collect();
+            let chains = model.dspark_draft_blocks(
+                &ds.head,
+                &mut dfs,
+                &mut ds.scratch,
+                &anchors,
+                &starts,
+            )?;
+            for (n, &i) in idx.iter().enumerate() {
+                pre[i] = Some(chains[n].clone());
+            }
+        }
+
+        for (i, row) in decode_rows.iter().enumerate() {
+            let start = row.kv_seq_len;
+            let drafted = match pre[i].take() {
+                Some(chain) => {
+                    let ds = self.dspark.as_ref().expect("dspark");
+                    let partial_ctx = ds.slots[row.slot].as_ref().expect("seeded").ctx_base > 0;
+                    Some((chain, partial_ctx))
+                }
+                None => seeded[i]
+                    .then(|| {
+                        let Self { model, dspark, .. } = self;
+                        let ds = dspark.as_mut().expect("dspark");
+                        let df = ds.slots[row.slot].as_mut().expect("seeded slot");
+                        let partial_ctx = df.ctx_base > 0;
+                        model
+                            .dspark_draft_block(
+                                &ds.head,
+                                df,
+                                &mut ds.scratch,
+                                row.last_token,
+                                start,
+                                &row.params,
+                            )
+                            .map(|chain| (chain, partial_ctx))
+                    })
+                    .transpose()?,
+            }
+            .filter(|(chain, _)| chain.len() >= 2);
             let Some((chain, partial_ctx)) = drafted else {
                 let (token, logprob) =
                     self.dspark_warm_decode_row(row, start.saturating_add(1) as u64, host_kv)?;
