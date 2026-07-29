@@ -11,18 +11,34 @@
 // Actually stored as [seq_len * num_channels] row-major (token i starts at i * num_channels)
 // out_seq: [seq_len * num_channels] bf16
 // conv_state: [num_channels, K-1] bf16 (updated with last K-1 values)
+// The `*_ptrs`/`row_len` triple non-null selects the varlen form: block row
+// `blockIdx.y` is one slot, reading its own capture buffer and ring, writing
+// its `row_len[s]` rows to `out_seq + s * seq_len`. Null = the single-slot
+// form. One launch per layer replays a whole speculative batch.
 __global__ void conv1d_prefill_kernel(
     const __nv_bfloat16* __restrict__ x_seq,
+    const __nv_bfloat16* const* __restrict__ x_ptrs,
     const __nv_bfloat16* __restrict__ conv_weight,
     __nv_bfloat16* __restrict__ conv_state,
+    __nv_bfloat16* const* __restrict__ state_ptrs,
+    const int* __restrict__ row_len,
     __nv_bfloat16* __restrict__ out_seq,
     int num_channels,
     int seq_len,
     int kernel_size
 ) {
+    const int s = blockIdx.y;
+    int len = seq_len;
+    if (x_ptrs) {
+        x_seq = x_ptrs[s];
+        conv_state = state_ptrs[s];
+        len = row_len[s];
+        out_seq += static_cast<size_t>(s) * seq_len * num_channels;
+    }
+
     // Each thread handles one (channel, position) pair
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = num_channels * seq_len;
+    int total = num_channels * len;
     if (idx >= total) return;
 
     int c = idx % num_channels;
@@ -69,11 +85,21 @@ __global__ void conv1d_prefill_kernel(
 // through registers before the in-place overwrite).
 __global__ void conv1d_state_update_kernel(
     const __nv_bfloat16* __restrict__ x_seq,
+    const __nv_bfloat16* const* __restrict__ x_ptrs,
     __nv_bfloat16* __restrict__ conv_state,
+    __nv_bfloat16* const* __restrict__ state_ptrs,
+    const int* __restrict__ row_len,
     int num_channels,
     int seq_len,
     int kernel_size
 ) {
+    const int s = blockIdx.y;
+    if (x_ptrs) {
+        x_seq = x_ptrs[s];
+        conv_state = state_ptrs[s];
+        seq_len = row_len[s];
+    }
+
     int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= num_channels) return;
 
@@ -110,7 +136,8 @@ cudaError_t conv1d_prefill_cuda(
     int total = num_channels * seq_len;
     int blocks = (total + CONV1D_BLOCK - 1) / CONV1D_BLOCK;
     conv1d_prefill_kernel<<<blocks, CONV1D_BLOCK, 0, stream>>>(
-        x_seq, conv_weight, conv_state, out_seq, num_channels, seq_len, kernel_size
+        x_seq, nullptr, conv_weight, conv_state, nullptr, nullptr,
+        out_seq, num_channels, seq_len, kernel_size
     );
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
@@ -122,7 +149,41 @@ cudaError_t conv1d_prefill_cuda(
     // "state is advanced when the call's stream work completes".
     int state_blocks = (num_channels + CONV1D_BLOCK - 1) / CONV1D_BLOCK;
     conv1d_state_update_kernel<<<state_blocks, CONV1D_BLOCK, 0, stream>>>(
-        x_seq, conv_state, num_channels, seq_len, kernel_size
+        x_seq, nullptr, conv_state, nullptr, nullptr, num_channels, seq_len, kernel_size
+    );
+    return cudaGetLastError();
+}
+
+// Varlen twin: `batch` slots, each reading its own `x_ptrs[s]` for `row_len[s]`
+// rows into its own ring, writing to `out_seq + s * max_len` rows.
+cudaError_t conv1d_prefill_varlen_cuda(
+    const __nv_bfloat16* const* x_ptrs,
+    const __nv_bfloat16* conv_weight,
+    __nv_bfloat16* const* state_ptrs,
+    const int* row_len,
+    __nv_bfloat16* out_seq,
+    int num_channels,
+    int max_len,
+    int kernel_size,
+    int batch,
+    cudaStream_t stream
+) {
+    if (batch <= 0 || max_len <= 0) {
+        return cudaErrorInvalidValue;
+    }
+    int total = num_channels * max_len;
+    dim3 grid((total + CONV1D_BLOCK - 1) / CONV1D_BLOCK, batch);
+    conv1d_prefill_kernel<<<grid, CONV1D_BLOCK, 0, stream>>>(
+        nullptr, x_ptrs, conv_weight, nullptr, state_ptrs, row_len,
+        out_seq, num_channels, max_len, kernel_size
+    );
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        return err;
+    }
+    dim3 sgrid((num_channels + CONV1D_BLOCK - 1) / CONV1D_BLOCK, batch);
+    conv1d_state_update_kernel<<<sgrid, CONV1D_BLOCK, 0, stream>>>(
+        nullptr, x_ptrs, nullptr, state_ptrs, row_len, num_channels, max_len, kernel_size
     );
     return cudaGetLastError();
 }

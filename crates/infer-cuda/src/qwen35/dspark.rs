@@ -408,6 +408,8 @@ pub(crate) struct Qwen35DsparkExec {
     pub(crate) spec: Vec<Option<Qwen35SpecSlotState>>,
     pub(crate) taps: Qwen35DsparkTaps,
     pub(crate) scratch: DsparkScratch,
+    /// Device pointer tables for the batched partial-accept rollback.
+    pub(crate) replay_tables: Qwen35ReplayTables,
     pub(crate) accepts: usize,
     pub(crate) rejects: usize,
     /// Verified draft chains, and the subset drafted from a partial
@@ -424,6 +426,7 @@ impl Qwen35DsparkExec {
             spec: (0..num_slots).map(|_| None).collect(),
             taps: Qwen35DsparkTaps::default(),
             scratch: DsparkScratch::default(),
+            replay_tables: Qwen35ReplayTables::default(),
             accepts: 0,
             rejects: 0,
             chains: 0,
@@ -685,6 +688,14 @@ pub(crate) fn load_dspark_head(
         cap,
         rope_cap,
     })
+}
+
+/// One partially-accepted chain to rewind (`k` accepted of its drafted depth).
+pub(crate) struct DsparkRollback<'a> {
+    pub(crate) slot: &'a mut Qwen35SlotState,
+    pub(crate) spec: &'a mut Qwen35SpecSlotState,
+    pub(crate) start_pos: usize,
+    pub(crate) k: usize,
 }
 
 /// Elementwise add over two same-length device buffers.
@@ -1601,13 +1612,9 @@ impl Qwen35Model {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn dspark_accept_commit(
         &self,
-        slot: &mut Qwen35SlotState,
-        spec: &mut Qwen35SpecSlotState,
-        ws: &mut Qwen35Workspace,
         chain: &[u32],
         argmax: &[u32],
         row0: usize,
-        start_pos: usize,
     ) -> Result<(Vec<u32>, u32, usize)> {
         let depth = chain.len() - 1;
         ensure!(
@@ -1628,24 +1635,56 @@ impl Qwen35Model {
         }
         let mut emitted: Vec<u32> = chain[1..=k].to_vec();
         emitted.push(bonus);
-        if k < depth {
-            // Rewind the 48 gated-delta recurrent/conv states to the pre-verify
-            // snapshot, then linear-only replay of the accepted prefix from the
-            // verify capture; the paged full-attn KV self-heals under the pool
-            // truncate + seq_len rewind (position-indexed rows).
-            let mut pt = super::dspark_phase_start(&self.ctx);
-            spec.restore_trunk(&self.ctx, slot)?;
-            let restore_ms = super::mtp_phase_lap(&self.ctx, &mut pt);
-            self.replay_linear_only(slot, ws, &spec.capture, k)?;
-            let replay_ms = super::mtp_phase_lap(&self.ctx, &mut pt);
-            if pt.is_some() {
-                eprintln!(
-                    "[dspark-accept] k={k} depth={depth} restore={restore_ms:.2} replay={replay_ms:.2} ms"
-                );
-            }
-            slot.set_seq_len(start_pos + k + 1);
-        }
         Ok((emitted, bonus, k))
+    }
+
+    /// Rewind a partially-accepted batch: every slot's 48 gated-delta
+    /// recurrent/conv states go back to the pre-verify snapshot, then ONE
+    /// linear-only replay of every accepted prefix from the verify captures.
+    /// The paged full-attn KV self-heals under the pool truncate + seq_len
+    /// rewind (position-indexed rows).
+    pub(crate) fn dspark_rollback_batch(
+        &self,
+        rolls: &mut [DsparkRollback<'_>],
+        tables: &mut Qwen35ReplayTables,
+        ws: &mut Qwen35Workspace,
+    ) -> Result<()> {
+        if rolls.is_empty() {
+            return Ok(());
+        }
+        let mut pt = super::dspark_phase_start(&self.ctx);
+        for r in rolls.iter_mut() {
+            r.spec.restore_trunk(&self.ctx, r.slot)?;
+        }
+        let restore_ms = super::mtp_phase_lap(&self.ctx, &mut pt);
+        // The varlen replay is the recurrent kernel; keep the opt-in FlashQLA
+        // chunked path on its own per-slot route rather than switching it out.
+        if super::qwen35_gdr_chunked_enabled() {
+            for r in rolls.iter_mut() {
+                self.replay_linear_only(r.slot, ws, &r.spec.capture, r.k)?;
+                r.slot.set_seq_len(r.start_pos + r.k + 1);
+            }
+            return Ok(());
+        }
+        let ks: Vec<usize> = rolls.iter().map(|r| r.k).collect();
+        let mut slots: Vec<&mut Qwen35SlotState> = Vec::with_capacity(rolls.len());
+        let mut captures: Vec<&Qwen35LinearCapture> = Vec::with_capacity(rolls.len());
+        for DsparkRollback { slot, spec, .. } in rolls.iter_mut() {
+            slots.push(&mut **slot);
+            captures.push(&spec.capture);
+        }
+        self.replay_linear_only_batched(&mut slots, &captures, &ks, tables, ws)?;
+        let replay_ms = super::mtp_phase_lap(&self.ctx, &mut pt);
+        if pt.is_some() {
+            eprintln!(
+                "[dspark-accept] rows={} restore={restore_ms:.2} replay={replay_ms:.2} ms",
+                rolls.len()
+            );
+        }
+        for r in rolls.iter_mut() {
+            r.slot.set_seq_len(r.start_pos + r.k + 1);
+        }
+        Ok(())
     }
 
     /// Rejection-sampling twin of [`Self::dspark_accept_commit`] (mirrors

@@ -1703,6 +1703,58 @@ pub(crate) struct Qwen35SpecSlotState {
 /// offset `t*width`), so rows `[0..=k]` slice contiguously as `[0..(k+1)*width]`.
 /// Allocated only with the spec state, so the baseline decode path never pays.
 #[allow(dead_code)] // populated by linear_attention under capture; read by replay_linear_only
+/// Device pointer tables for [`Qwen35Model::replay_linear_only_batched`]: per
+/// linear layer, one `[B]` table of each per-slot buffer the varlen kernels
+/// index. Re-staged every tick — the accepted set and lengths change per step.
+/// One flat `[KIND, layer, slot]` u64 buffer, so the whole staging is a single
+/// H2D per tick. The accepted set changes every tick, so this cannot be cached.
+#[derive(Default)]
+pub(crate) struct Qwen35ReplayTables {
+    ptrs: SliceSlot<u64>,
+    row_len: SliceSlot<i32>,
+    host: Vec<u64>,
+}
+
+/// Table order inside [`Qwen35ReplayTables::ptrs`].
+const REPLAY_TABLES: usize = 5;
+
+impl Qwen35ReplayTables {
+    fn stage(
+        &mut self,
+        ctx: &DeviceContext,
+        slots: &mut [&mut Qwen35SlotState],
+        captures: &[&Qwen35LinearCapture],
+        ks: &[usize],
+        num_linear: usize,
+    ) -> Result<()> {
+        let b = slots.len();
+        let stride = num_linear * b;
+        self.host.clear();
+        self.host.resize(REPLAY_TABLES * stride, 0);
+        for li in 0..num_linear {
+            for (s, slot) in slots.iter_mut().enumerate() {
+                let at = li * b + s;
+                self.host[at] = captures[s].qkv[li].data.device_ptr(&ctx.stream).0;
+                self.host[stride + at] = captures[s].b_proj[li].data.device_ptr(&ctx.stream).0;
+                self.host[2 * stride + at] = captures[s].a_proj[li].data.device_ptr(&ctx.stream).0;
+                self.host[3 * stride + at] =
+                    slot.conv_states[li].data.device_ptr_mut(&ctx.stream).0;
+                self.host[4 * stride + at] = slot.gdr_states[li].device_ptr_mut(&ctx.stream).0;
+            }
+        }
+        let dst = self.ptrs.get(ctx, self.host.len())?;
+        ctx.stream
+            .memcpy_htod(&self.host, dst)
+            .map_err(|e| anyhow!("H2D replay pointer tables: {e}"))?;
+        let lens: Vec<i32> = ks.iter().map(|k| (k + 1) as i32).collect();
+        let dst = self.row_len.get(ctx, b)?;
+        ctx.stream
+            .memcpy_htod(&lens, dst)
+            .map_err(|e| anyhow!("H2D replay row lengths: {e}"))?;
+        Ok(())
+    }
+}
+
 pub(crate) struct Qwen35LinearCapture {
     /// Number of layers (== `num_linear`); the per-row stride is each buffer's
     /// `len / (depth+1)`.
@@ -7216,6 +7268,114 @@ impl Qwen35Model {
         ensure!(
             li == num_linear,
             "spec replay advanced {li} linear layers != slot count {num_linear}"
+        );
+        Ok(())
+    }
+
+    /// [`Self::replay_linear_only`] for a whole speculative batch: ONE conv1d
+    /// and ONE gated-delta launch per linear layer over every slot, instead of
+    /// `2 * num_linear` launches per slot. Each slot keeps its own capture and
+    /// its own state — the varlen kernels reach them through `tables`.
+    ///
+    /// Sub-100 µs launches dominate this path (48 layers x B slots x 2), so the
+    /// win is launch count, not arithmetic.
+    pub(crate) fn replay_linear_only_batched(
+        &self,
+        slots: &mut [&mut Qwen35SlotState],
+        captures: &[&Qwen35LinearCapture],
+        ks: &[usize],
+        tables: &mut Qwen35ReplayTables,
+        ws: &mut Qwen35Workspace,
+    ) -> Result<()> {
+        let b = slots.len();
+        ensure!(
+            b == captures.len() && b == ks.len(),
+            "batched replay: {b} slots vs {} captures / {} ks",
+            captures.len(),
+            ks.len()
+        );
+        let num_linear = slots[0].conv_states.len();
+        let max_len = ks.iter().map(|k| k + 1).max().unwrap_or(0);
+        ensure!(max_len >= 1, "batched replay with no rows");
+        for (s, cap) in captures.iter().enumerate() {
+            ensure!(
+                cap.qkv.len() == num_linear && ks[s] < cap.rows,
+                "batched replay slot {s}: capture {} layers / {} rows cannot hold {} rows of \
+                 {num_linear} layers",
+                cap.qkv.len(),
+                cap.rows,
+                ks[s] + 1
+            );
+        }
+        let ctx = &self.ctx;
+        tables.stage(ctx, slots, captures, ks, num_linear)?;
+
+        let qkv_dim = self.local_linear_qkv_dim();
+        let z_dim = self.local_linear_z_dim();
+        let rows = b * max_len;
+        let Qwen35Workspace { linear, .. } = ws;
+        let qkv_conv = linear.qkv_conv.get(ctx, qkv_dim, rows)?;
+        let gdr_out = linear.gdr_out.get(ctx, z_dim, rows)?;
+        let (cv_ptr, _gc) = qkv_conv.data.device_ptr_mut(&ctx.stream);
+        let (go_ptr, _gg) = gdr_out.data.device_ptr_mut(&ctx.stream);
+        let stride = num_linear * b;
+        let (tbl, _gt) = tables
+            .ptrs
+            .get(ctx, REPLAY_TABLES * stride)?
+            .device_ptr(&ctx.stream);
+        let (len_ptr, _gl) = tables.row_len.get(ctx, b)?.device_ptr(&ctx.stream);
+        let c = &self.config;
+        let mut li = 0usize;
+        for layer in &self.layers {
+            let Qwen35Attn::Linear(attn) = &layer.attn else {
+                continue;
+            };
+            let (w_ptr, _g0) = attn.conv1d_weight.data.device_ptr(&ctx.stream);
+            let (dt_ptr, _g1) = attn.dt_bias.data.device_ptr(&ctx.stream);
+            let (alog_ptr, _g2) = attn.a_log.device_ptr(&ctx.stream);
+            let at = |kind: usize| tbl + ((kind * stride + li * b) as u64) * 8;
+            let (qkv_tbl, b_tbl, a_tbl, conv_tbl, gdr_tbl) = (at(0), at(1), at(2), at(3), at(4));
+            // SAFETY: every table holds `b` live pointers staged above; the
+            // shared conv/gdr scratch is `[b * max_len, dim]`, the row block
+            // each slot writes.
+            unsafe {
+                ffi::conv1d_prefill_varlen_cuda(
+                    qkv_tbl as *const *const ffi::Half,
+                    w_ptr as *const ffi::Half,
+                    conv_tbl as *const *mut ffi::Half,
+                    len_ptr as *const i32,
+                    cv_ptr as *mut ffi::Half,
+                    qkv_dim as i32,
+                    max_len as i32,
+                    c.linear_conv_kernel_dim as i32,
+                    b as i32,
+                    ctx.stream.cu_stream(),
+                )
+                .result()?;
+                ffi::gated_delta_rule_prefill_recurrent_varlen_cuda(
+                    cv_ptr as *const ffi::Half,
+                    b_tbl as *const *const ffi::Half,
+                    a_tbl as *const *const ffi::Half,
+                    dt_ptr as *const ffi::Half,
+                    alog_ptr as *const f32,
+                    gdr_tbl as *const *mut f32,
+                    len_ptr as *const i32,
+                    go_ptr as *mut ffi::Half,
+                    self.local_linear_k_heads as i32,
+                    self.local_linear_v_heads as i32,
+                    c.linear_key_head_dim as i32,
+                    c.linear_value_head_dim as i32,
+                    max_len as i32,
+                    b as i32,
+                    ctx.stream.cu_stream(),
+                )
+                .result()?;
+            }
+            li += 1;
+        }
+        ensure!(
+            li == num_linear,
+            "batched replay advanced {li} linear layers != slot count {num_linear}"
         );
         Ok(())
     }
