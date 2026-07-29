@@ -1277,6 +1277,24 @@ fn cuda_add_into_device_matches_cpu() {
 }
 
 #[test]
+fn cuda_accumulate_into_device_updates_dest() {
+    let Ok(backend) = CudaBackend::new(0) else {
+        return;
+    };
+    let shape = vec![10_000];
+    let dest = rng_vec(0xACD, shape[0], 1.0);
+    let src = rng_vec(0x9AC, shape[0], 1.0);
+    let expected: Vec<f32> = dest.iter().zip(&src).map(|(d, s)| d + s).collect();
+    let dest_h = backend.upload(&dest, &shape).expect("upload dest");
+    let src_h = backend.upload(&src, &shape).expect("upload src");
+    let out = backend
+        .accumulate_into_device(&dest_h, &src_h, &shape)
+        .expect("accumulate");
+    backend.eval(&[&out]).expect("eval");
+    assert!(max_abs_diff(&backend.readback(&dest_h).expect("read"), &expected) < 1e-6);
+}
+
+#[test]
 fn cuda_trim_memory_pool_releases_unused_pages() {
     use cudarc::driver::{result, sys};
 

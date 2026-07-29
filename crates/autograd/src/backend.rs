@@ -872,19 +872,7 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
     /// Lazy on backends that support it (e.g. Metal defers to `mlx_eval`).
     fn add(&self, a: &DeviceHandle, b: &DeviceHandle, shape: &[usize]) -> Result<DeviceHandle>;
 
-    /// In-place gradient accumulation: returns a fresh `DeviceHandle`
-    /// holding `dest + src` elementwise. Foundation for the device-resident
-    /// gradient tape — when two backward paths converge on the same
-    /// parameter, the merge runs through this op rather than a host
-    /// `accumulate_grad` roundtrip.
-    ///
-    /// `dest` and `src` must share `shape` and `product(shape)` elements.
-    /// The returned handle is *unevaluated* on backends with a lazy graph
-    /// (CUDA returns a `CudaSlice` ready for the batched `eval`).
-    ///
-    /// The default implementation does `readback both → host add → upload`
-    /// so CPU/Metal inherit correct behaviour; CUDA overrides with a
-    /// 1D NVRTC kernel.
+    /// Return `dest + src` without changing either input.
     fn add_into_device(
         &self,
         dest: &DeviceHandle,
@@ -907,6 +895,16 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
             .map(|(d, s)| d + s)
             .collect();
         self.upload(&out, shape)
+    }
+
+    /// Accumulate `src` into an exclusively owned persistent gradient.
+    fn accumulate_into_device(
+        &self,
+        dest: &DeviceHandle,
+        src: &DeviceHandle,
+        shape: &[usize],
+    ) -> Result<DeviceHandle> {
+        self.add_into_device(dest, src, shape)
     }
 
     /// Device-handle all-reduce sum over the backend communicator.

@@ -102,6 +102,7 @@ const FUNCTION_NAMES: &[&str] = &[
     "log_softmax_last_axis_backward_f32",
     "gather_last_dim_backward_f32",
     "add_into_f32",
+    "accumulate_into_f32",
     "mean_backward_f32",
     "mul_scalar_backward_f32",
     "embedding_backward_f32",

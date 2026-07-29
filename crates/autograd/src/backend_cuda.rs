@@ -1917,11 +1917,6 @@ impl Backend for CudaBackend {
         }
     }
 
-    /// Device-resident gradient accumulation. Allocates a fresh
-    /// `CudaSlice<f32>` for the sum (so the previous `dest` handle remains
-    /// valid for any tape consumers still holding it) and launches the
-    /// `add_into_f32` 1D NVRTC kernel. Returns the unevaluated handle for
-    /// the batched terminal `eval`.
     fn add_into_device(
         &self,
         dest: &DeviceHandle,
@@ -1937,6 +1932,24 @@ impl Backend for CudaBackend {
         #[cfg(not(feature = "no-cuda"))]
         {
             cuda_add_into_device(self, dest, src, shape)
+        }
+    }
+
+    fn accumulate_into_device(
+        &self,
+        dest: &DeviceHandle,
+        src: &DeviceHandle,
+        shape: &[usize],
+    ) -> Result<DeviceHandle> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (dest, src, shape);
+            todo!("GPU required: cuda accumulate_into_device is unavailable under feature no-cuda")
+        }
+
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            cuda_accumulate_into_device(self, dest, src, shape)
         }
     }
 
@@ -6336,8 +6349,7 @@ fn cuda_add_into_device(
         .stream
         .alloc_zeros::<f32>(size)
         .map_err(|e| cuda_alloc_failed_rich(backend, "add_into_device", size * 4, &e))?;
-    let n = i32::try_from(size)
-        .map_err(|_| AutogradError::TapeInvariant("cuda add_into length exceeds i32"))?;
+    let n = size as u64;
     launch_1d(
         &backend.stream,
         backend.kernels.function("add_into_f32")?,
@@ -6348,6 +6360,37 @@ fn cuda_add_into_device(
         },
     )?;
     Ok(DeviceHandle::Cuda(CudaStorage::new(d_out)))
+}
+
+#[cfg(not(feature = "no-cuda"))]
+fn cuda_accumulate_into_device(
+    backend: &CudaBackend,
+    dest: &DeviceHandle,
+    src: &DeviceHandle,
+    shape: &[usize],
+) -> Result<DeviceHandle> {
+    let d_dest = backend.cuda_slice(dest, "accumulate_into_device")?;
+    let d_src = backend.cuda_slice(src, "accumulate_into_device")?;
+    let size = shape_size(shape);
+    if d_dest.len() != size || d_src.len() != size {
+        return Err(AutogradError::DataLengthMismatch {
+            len: d_dest.len().min(d_src.len()),
+            shape: shape.to_vec(),
+            size,
+        });
+    }
+    let n = size as u64;
+    let (dest_ptr, _dest_guard) = d_dest.device_ptr(&backend.stream);
+    launch_1d(
+        &backend.stream,
+        backend.kernels.function("accumulate_into_f32")?,
+        size,
+        |mut builder| {
+            builder.arg(&dest_ptr).arg(d_src).arg(&n);
+            builder
+        },
+    )?;
+    Ok(dest.clone())
 }
 
 #[cfg(not(feature = "no-cuda"))]

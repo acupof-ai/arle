@@ -826,6 +826,23 @@ impl TensorStore {
     }
 
     pub fn accumulate_grad(&mut self, param_id: TensorId, grad_id: TensorId) -> Result<()> {
+        self.accumulate_grad_inner(param_id, grad_id, false)
+    }
+
+    pub(crate) fn accumulate_grad_owned(
+        &mut self,
+        param_id: TensorId,
+        grad_id: TensorId,
+    ) -> Result<()> {
+        self.accumulate_grad_inner(param_id, grad_id, true)
+    }
+
+    fn accumulate_grad_inner(
+        &mut self,
+        param_id: TensorId,
+        grad_id: TensorId,
+        owned: bool,
+    ) -> Result<()> {
         let (requires_grad, shape, existing_grad) = {
             let tensor = self.tensor(param_id)?;
             (tensor.requires_grad, tensor.shape.clone(), tensor.grad)
@@ -845,16 +862,6 @@ impl TensorStore {
 
         match existing_grad {
             Some(existing_id) => {
-                // P2 (device-resident gradient tape): when both the
-                // persistent param-grad tensor and the incoming new grad
-                // are still device-resident, fuse with `add_into_device`
-                // and re-install the device handle on the persistent
-                // grad. Without this, the second `accumulate_grad` call
-                // per training step (gather + log_softmax + matmul
-                // backward each emit a grad for the LM-head weight via
-                // tied embeddings) would force a `to_host(grad_id)` and
-                // permanently demote the persistent grad to
-                // `Dirty::Host`.
                 let both_on_device = {
                     let existing = self.tensor(existing_id)?;
                     let incoming = self.tensor(grad_id)?;
@@ -876,11 +883,19 @@ impl TensorStore {
                         .as_ref()
                         .expect("checked above")
                         .clone();
-                    let sum_handle = self.backend().add_into_device(
-                        &existing_handle,
-                        &incoming_handle,
-                        &shape,
-                    )?;
+                    let sum_handle = if owned {
+                        self.backend().accumulate_into_device(
+                            &existing_handle,
+                            &incoming_handle,
+                            &shape,
+                        )?
+                    } else {
+                        self.backend().add_into_device(
+                            &existing_handle,
+                            &incoming_handle,
+                            &shape,
+                        )?
+                    };
                     self.replace_device_handle(existing_id, sum_handle)?;
                 } else {
                     let incoming = self.to_host(grad_id)?;
@@ -1239,5 +1254,36 @@ mod tests {
                 .iter()
                 .all(|&value| value == 2.0)
         );
+    }
+
+    #[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
+    #[test]
+    fn cuda_accumulate_grad_keeps_input_grad_stable() {
+        use std::sync::Arc;
+
+        use crate::backend_cuda::CudaBackend;
+
+        let mut store = TensorStore::with_backend(Arc::new(CudaBackend::new(0).expect("cuda")));
+        let param = store.alloc(Tensor::new(vec![0.0; 4], vec![4], true).expect("param"));
+        let first = store
+            .from_slice(&[1.0, 2.0, 3.0, 4.0], &[4])
+            .expect("first");
+        let second = store
+            .from_slice(&[4.0, 3.0, 2.0, 1.0], &[4])
+            .expect("second");
+        store.ensure_device(first).expect("first device");
+        store.ensure_device(second).expect("second device");
+        store
+            .accumulate_grad(param, first)
+            .expect("first accumulate");
+        store
+            .accumulate_grad(param, second)
+            .expect("second accumulate");
+        assert_eq!(
+            store.to_host(first).expect("first read"),
+            [1.0, 2.0, 3.0, 4.0]
+        );
+        let grad = store.get(param).expect("param").grad.expect("grad");
+        assert_eq!(store.to_host(grad).expect("grad read"), [5.0; 4]);
     }
 }
