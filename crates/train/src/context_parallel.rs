@@ -117,14 +117,14 @@ mod tests {
     #[test]
     fn even_split_covers_sequence_disjointly() {
         let size = 4;
-        let seq = 32; // 32 % 4 == 0 → equal shards of 8
+        let seq = 32;
         let mut covered = vec![false; seq];
         for rank in 0..size {
             let s = CpContext::new(rank, size).shard(seq);
             assert_eq!(s.len(), 8);
-            for p in s.start..s.end {
-                assert!(!covered[p], "position {p} double-covered");
-                covered[p] = true;
+            for slot in &mut covered[s.start..s.end] {
+                assert!(!*slot);
+                *slot = true;
             }
         }
         assert!(
