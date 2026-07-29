@@ -194,13 +194,21 @@ cudaError_t gated_delta_rule_decode_cuda(
     return cudaGetLastError();
 }
 
+// `state_ptrs`/`row_len` non-null selects the varlen form: block row
+// `blockIdx.y` is one slot, scanning `qkv + s * seq_len` (the varlen conv
+// output) and its own `b_ptrs[s]`/`a_ptrs[s]` capture into its own state.
+// Null = the single-slot form. One launch per layer replays a whole batch.
 __global__ void gated_delta_rule_prefill_recurrent_kernel(
     const __nv_bfloat16* __restrict__ qkv,
     const __nv_bfloat16* __restrict__ b_proj,
     const __nv_bfloat16* __restrict__ a_proj,
+    const __nv_bfloat16* const* __restrict__ b_ptrs,
+    const __nv_bfloat16* const* __restrict__ a_ptrs,
     const __nv_bfloat16* __restrict__ dt_bias,
     const float* __restrict__ A_log,
     float* __restrict__ state,
+    float* const* __restrict__ state_ptrs,
+    const int* __restrict__ row_len,
     __nv_bfloat16* __restrict__ output,
     int num_key_heads,
     int num_value_heads,
@@ -208,6 +216,15 @@ __global__ void gated_delta_rule_prefill_recurrent_kernel(
     int val_dim,
     int seq_len
 ) {
+    const int slot = blockIdx.y;
+    int row_base = 0;
+    if (state_ptrs) {
+        state = state_ptrs[slot];
+        b_proj = b_ptrs[slot];
+        a_proj = a_ptrs[slot];
+        row_base = slot * seq_len;
+        seq_len = row_len[slot];
+    }
     int v_head = blockIdx.x;
     int val_idx = threadIdx.x & 0x7F;
     int j_slice = threadIdx.x >> 7;
@@ -219,6 +236,10 @@ __global__ void gated_delta_rule_prefill_recurrent_kernel(
     int k_dim_total = q_dim_total;
     int qkv_stride = q_dim_total + k_dim_total + val_dim * num_value_heads;
     int out_stride = num_value_heads * val_dim;
+    // Rebase to this slot's conv output / output rows; b/a already point at
+    // this slot's own capture, whose rows start at 0.
+    qkv += static_cast<size_t>(row_base) * qkv_stride;
+    output += static_cast<size_t>(row_base) * out_stride;
 
     __shared__ float smem_q[GDR_KEY_DIM];
     __shared__ float smem_k[GDR_KEY_DIM];
@@ -352,8 +373,39 @@ cudaError_t gated_delta_rule_prefill_recurrent_cuda(
         return cudaErrorInvalidValue;
     }
     gated_delta_rule_prefill_recurrent_kernel<<<num_value_heads, GDR_BLOCK_DIM, 0, stream>>>(
-        qkv, b_proj, a_proj, dt_bias, A_log, state, output,
+        qkv, b_proj, a_proj, nullptr, nullptr, dt_bias, A_log, state, nullptr, nullptr, output,
         num_key_heads, num_value_heads, key_dim, val_dim, seq_len
+    );
+    return cudaGetLastError();
+}
+
+// Varlen twin: `batch` slots read `qkv`/write `output` at their own
+// `s * max_len` row block (the varlen conv output's layout) and take b/a from
+// their own capture. One launch per layer for a whole batch's replay.
+cudaError_t gated_delta_rule_prefill_recurrent_varlen_cuda(
+    const __nv_bfloat16* qkv,
+    const __nv_bfloat16* const* b_ptrs,
+    const __nv_bfloat16* const* a_ptrs,
+    const __nv_bfloat16* dt_bias,
+    const float* A_log,
+    float* const* state_ptrs,
+    const int* row_len,
+    __nv_bfloat16* output,
+    int num_key_heads,
+    int num_value_heads,
+    int key_dim,
+    int val_dim,
+    int max_len,
+    int batch,
+    cudaStream_t stream
+) {
+    if (key_dim != GDR_KEY_DIM || val_dim != GDR_VAL_DIM || batch <= 0 || max_len <= 0) {
+        return cudaErrorInvalidValue;
+    }
+    dim3 grid(num_value_heads, batch);
+    gated_delta_rule_prefill_recurrent_kernel<<<grid, GDR_BLOCK_DIM, 0, stream>>>(
+        qkv, nullptr, nullptr, b_ptrs, a_ptrs, dt_bias, A_log, nullptr, state_ptrs, row_len,
+        output, num_key_heads, num_value_heads, key_dim, val_dim, max_len
     );
     return cudaGetLastError();
 }

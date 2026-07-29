@@ -2066,22 +2066,19 @@ impl Qwen35CudaExecutor {
         let tap_ms = crate::qwen35::mtp_phase_lap(&model.ctx, &mut pt);
         let (mut accept_ms, mut cap_ms, mut trunc_ms, mut ext_ms) = (0.0, 0.0, 0.0, 0.0);
 
-        // 5. Per row: accept + rollback (paged KV self-heals under the crop),
-        //    extend the draft ctx, stage the bonus as the next anchor.
+        // 5. Per row: accept, extend the draft ctx, stage the bonus as the next
+        //    anchor. The greedy rollback is deferred to one batched pass below
+        //    — nothing here reads the trunk linear state or `seq_len`.
+        let mut rollback: Vec<(usize, usize, usize)> = Vec::with_capacity(batch.len());
         for c in &batch {
             let params = &decode_rows[c.out].params;
             let spec = ds.spec[c.slot].as_mut().expect("built above");
             let (emitted, bonus, k) = if params.is_greedy() {
                 // Greedy: delta policy, no behavior logprob (P6 sidecar skips greedy).
-                let (tokens, bonus, k) = model.dspark_accept_commit(
-                    &mut slots[c.slot],
-                    spec,
-                    workspace,
-                    &c.chain,
-                    &argmax,
-                    c.row0,
-                    c.start,
-                )?;
+                let (tokens, bonus, k) = model.dspark_accept_commit(&c.chain, &argmax, c.row0)?;
+                if k + 1 < c.chain.len() {
+                    rollback.push((c.slot, c.start, k));
+                }
                 (
                     tokens.into_iter().map(|t| (t, None)).collect::<Vec<_>>(),
                     bonus,
@@ -2152,6 +2149,33 @@ impl Qwen35CudaExecutor {
                     finish: None,
                 })
                 .collect();
+        }
+        // One restore + ONE linear-only replay launch per layer for every
+        // partially-accepted chain, instead of `2 * num_linear` launches each.
+        if !rollback.is_empty() {
+            rollback.sort_by_key(|r| r.0);
+            let want: Vec<usize> = rollback.iter().map(|r| r.0).collect();
+            let mut rolls: Vec<crate::qwen35::dspark::DsparkRollback<'_>> = slots
+                .iter_mut()
+                .enumerate()
+                .filter(|(i, _)| want.contains(i))
+                .zip(
+                    ds.spec
+                        .iter_mut()
+                        .enumerate()
+                        .filter(|(i, _)| want.contains(i)),
+                )
+                .zip(rollback.iter())
+                .map(
+                    |(((_, slot), (_, spec)), r)| crate::qwen35::dspark::DsparkRollback {
+                        slot,
+                        spec: spec.as_mut().expect("spec state built above"),
+                        start_pos: r.1,
+                        k: r.2,
+                    },
+                )
+                .collect();
+            model.dspark_rollback_batch(&mut rolls, &mut ds.replay_tables, workspace)?;
         }
         let commit_ms = tap_ms + accept_ms + cap_ms + trunc_ms + ext_ms;
         if pt.is_some() {
