@@ -28,6 +28,8 @@ pub mod moe;
 pub mod norm;
 #[path = "ops/reduce.rs"]
 pub mod reduce;
+#[path = "ops/ring_attention.rs"]
+pub mod ring_attention;
 #[path = "ops/rope.rs"]
 pub mod rope;
 #[path = "ops/softmax.rs"]
