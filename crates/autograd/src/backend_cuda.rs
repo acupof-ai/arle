@@ -27,9 +27,9 @@ use crate::{
     backend::{
         Backend, CausalSdpaDeviceBackwardArgs, CausalSdpaDeviceGradTriplet, Device,
         DeviceGradClipResult, DeviceHandle, LinearAttentionDeviceBackwardArgs,
-        LinearAttentionDeviceBackwardResult, LinearAttentionDeviceForwardArgs,
-        LinearAttentionDeviceForwardResult, LinearAttentionScanBackwardArgs,
-        LinearAttentionScanBackwardGrads,
+        LinearAttentionDeviceBackwardResult, LinearAttentionDeviceBoundaryArgs,
+        LinearAttentionDeviceForwardArgs, LinearAttentionDeviceForwardResult,
+        LinearAttentionScanBackwardArgs, LinearAttentionScanBackwardGrads,
     },
 };
 #[cfg(not(feature = "no-cuda"))]
@@ -1431,6 +1431,24 @@ impl Backend for CudaBackend {
         #[cfg(not(feature = "no-cuda"))]
         {
             cuda_linear_attention_forward_device(self, args)
+        }
+    }
+
+    fn linear_attention_boundary_device(
+        &self,
+        args: LinearAttentionDeviceBoundaryArgs<'_>,
+    ) -> Result<Option<DeviceHandle>> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = args;
+            todo!(
+                "GPU required: cuda linear_attention_boundary_device is unavailable under feature no-cuda"
+            )
+        }
+
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            cuda_linear_attention_boundary_device(self, args)
         }
     }
 
@@ -4054,7 +4072,7 @@ fn cuda_concat_rows(backend: &CudaBackend, rows: &[&DeviceHandle]) -> Result<Dev
 /// carries no batch stride.
 #[cfg(not(feature = "no-cuda"))]
 fn cuda_la_device_supported(p: LinearAttentionDeviceParams) -> bool {
-    p.key_dim == 128 && p.value_dim == 128 && p.conv_kernel <= 5 && p.batch > 0
+    p.key_dim == 128 && p.value_dim == 128 && p.conv_kernel > 0 && p.conv_kernel <= 5 && p.batch > 0
 }
 
 #[cfg(not(feature = "no-cuda"))]
@@ -4116,6 +4134,216 @@ fn cuda_linear_attention_forward_device(
         chunk_state: concat(|r| &r.chunk_state)?,
         raw_output: concat(|r| &r.raw_output)?,
     }))
+}
+
+#[cfg(not(feature = "no-cuda"))]
+fn cuda_linear_attention_boundary_device(
+    backend: &CudaBackend,
+    args: LinearAttentionDeviceBoundaryArgs<'_>,
+) -> Result<Option<DeviceHandle>> {
+    let p = args.params;
+    if !cuda_la_device_supported(p) {
+        return Ok(None);
+    }
+    if p.batch == 1 {
+        return cuda_linear_attention_boundary_device_row(backend, args).map(Some);
+    }
+
+    let row_params = LinearAttentionDeviceParams { batch: 1, ..p };
+    let rows = (0..p.batch)
+        .map(|row| {
+            let slice = |src| cuda_row_slice(backend, src, row, p.batch);
+            let qkv = slice(args.qkv)?;
+            let b_proj = slice(args.b_proj)?;
+            let a_proj = slice(args.a_proj)?;
+            let initial_state = args.initial_state.map(slice).transpose()?;
+            let initial_conv_window = args.initial_conv_window.map(slice).transpose()?;
+            cuda_linear_attention_boundary_device_row(
+                backend,
+                LinearAttentionDeviceBoundaryArgs {
+                    params: row_params,
+                    qkv: &qkv,
+                    b_proj: &b_proj,
+                    a_proj: &a_proj,
+                    conv1d_weight: args.conv1d_weight,
+                    dt_bias: args.dt_bias,
+                    a_log: args.a_log,
+                    initial_state: initial_state.as_ref(),
+                    initial_conv_window: initial_conv_window.as_ref(),
+                },
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let parts = rows.iter().collect::<Vec<_>>();
+    cuda_concat_rows(backend, &parts).map(Some)
+}
+
+#[cfg(not(feature = "no-cuda"))]
+fn cuda_linear_attention_boundary_device_row(
+    backend: &CudaBackend,
+    args: LinearAttentionDeviceBoundaryArgs<'_>,
+) -> Result<DeviceHandle> {
+    let p = args.params;
+    debug_assert_eq!(p.batch, 1);
+    let q_dim = p.num_key_heads * p.key_dim;
+    let qkv_dim = q_dim * 2 + p.num_value_heads * p.value_dim;
+    let qkv_len = p.seq_len * qkv_dim;
+    let head_len = p.seq_len * p.num_value_heads;
+    let state_len = p.num_value_heads * p.key_dim * p.value_dim;
+    let conv_tail_len = p.conv_kernel - 1;
+    let qkv = backend.cuda_slice(args.qkv, "linear_attention_boundary qkv")?;
+    let b_proj = backend.cuda_slice(args.b_proj, "linear_attention_boundary b_proj")?;
+    let a_proj = backend.cuda_slice(args.a_proj, "linear_attention_boundary a_proj")?;
+    let conv1d_weight = backend.cuda_slice(
+        args.conv1d_weight,
+        "linear_attention_boundary conv1d_weight",
+    )?;
+    let dt_bias = backend.cuda_slice(args.dt_bias, "linear_attention_boundary dt_bias")?;
+    let a_log = backend.cuda_slice(args.a_log, "linear_attention_boundary a_log")?;
+    let carry_state = args
+        .initial_state
+        .map(|h| backend.cuda_slice(h, "linear_attention_boundary initial_state"))
+        .transpose()?;
+    let carry_conv = args
+        .initial_conv_window
+        .map(|h| backend.cuda_slice(h, "linear_attention_boundary initial_conv_window"))
+        .transpose()?;
+
+    for (got, expected) in [
+        (qkv.len(), qkv_len),
+        (b_proj.len(), head_len),
+        (a_proj.len(), head_len),
+        (conv1d_weight.len(), qkv_dim * p.conv_kernel),
+        (dt_bias.len(), p.num_value_heads),
+        (a_log.len(), p.num_value_heads),
+    ] {
+        if got != expected {
+            return Err(AutogradError::TapeInvariant(
+                "linear_attention_boundary input length mismatch",
+            ));
+        }
+    }
+    if carry_state.is_some_and(|x| x.len() != state_len)
+        || carry_conv.is_some_and(|x| x.len() != conv_tail_len * qkv_dim)
+    {
+        return Err(AutogradError::TapeInvariant(
+            "linear_attention_boundary carry length mismatch",
+        ));
+    }
+
+    let b_bf16 = backend.local_f32_as_bf16(b_proj, head_len)?;
+    let a_bf16 = backend.local_f32_as_bf16(a_proj, head_len)?;
+    let dt_bf16 = backend.local_f32_as_bf16(dt_bias, p.num_value_heads)?;
+    let chunk_rows = p.seq_len.min(64);
+    let mut qkv_chunk = backend
+        .stream
+        .alloc_zeros::<u16>(chunk_rows * qkv_dim)
+        .map_err(|_| cuda_alloc_failed("la boundary qkv", vec![chunk_rows, qkv_dim]))?;
+    let mut raw_chunk = backend
+        .stream
+        .alloc_zeros::<u16>(chunk_rows * p.num_value_heads * p.value_dim)
+        .map_err(|_| {
+            cuda_alloc_failed(
+                "la boundary raw",
+                vec![chunk_rows, p.num_value_heads, p.value_dim],
+            )
+        })?;
+    let mut state = backend
+        .stream
+        .alloc_zeros::<f32>(state_len)
+        .map_err(|_| cuda_alloc_failed("la boundary state", vec![state_len]))?;
+    if let Some(initial) = carry_state {
+        backend
+            .stream
+            .memcpy_dtod(initial, &mut state)
+            .map_err(|_| AutogradError::TapeInvariant("la boundary state seed failed"))?;
+    }
+
+    let qkv_dim_i32 = i32::try_from(qkv_dim)
+        .map_err(|_| AutogradError::TapeInvariant("linear_attention qkv_dim exceeds i32"))?;
+    let conv_kernel_i32 = i32::try_from(p.conv_kernel)
+        .map_err(|_| AutogradError::TapeInvariant("linear_attention conv_kernel exceeds i32"))?;
+    let num_key_heads_i32 = i32::try_from(p.num_key_heads)
+        .map_err(|_| AutogradError::TapeInvariant("linear_attention key heads exceeds i32"))?;
+    let num_value_heads_i32 = i32::try_from(p.num_value_heads)
+        .map_err(|_| AutogradError::TapeInvariant("linear_attention value heads exceeds i32"))?;
+    let key_dim_i32 = i32::try_from(p.key_dim)
+        .map_err(|_| AutogradError::TapeInvariant("linear_attention key_dim exceeds i32"))?;
+    let value_dim_i32 = i32::try_from(p.value_dim)
+        .map_err(|_| AutogradError::TapeInvariant("linear_attention value_dim exceeds i32"))?;
+    let conv_tail = carry_conv.map(|x| x.device_ptr(&backend.stream));
+    let conv_tail_ptr = conv_tail.as_ref().map_or(0u64, |(ptr, _)| *ptr);
+    let conv_tail_len_i32 = if carry_conv.is_some() {
+        i32::try_from(conv_tail_len)
+            .map_err(|_| AutogradError::TapeInvariant("linear_attention conv tail exceeds i32"))?
+    } else {
+        0
+    };
+
+    for start in (0..p.seq_len).step_by(64) {
+        let rows = (p.seq_len - start).min(64);
+        let head_start = start * p.num_value_heads;
+        let total = rows * qkv_dim;
+        let total_u64 = total as u64;
+        let start_i32 = i32::try_from(start)
+            .map_err(|_| AutogradError::TapeInvariant("linear_attention start exceeds i32"))?;
+        {
+            let (out_ptr, _out_guard) = qkv_chunk.device_ptr_mut(&backend.stream);
+            let (qkv_ptr, _qkv_guard) = qkv.device_ptr(&backend.stream);
+            let (conv_ptr, _conv_guard) = conv1d_weight.device_ptr(&backend.stream);
+            launch_1d(
+                &backend.stream,
+                backend
+                    .kernels
+                    .function("linear_attention_conv1d_silu_boundary_f32_to_bf16")?,
+                total,
+                |mut builder| {
+                    builder
+                        .arg(&out_ptr)
+                        .arg(&qkv_ptr)
+                        .arg(&conv_ptr)
+                        .arg(&total_u64)
+                        .arg(&start_i32)
+                        .arg(&qkv_dim_i32)
+                        .arg(&conv_kernel_i32)
+                        .arg(&conv_tail_ptr)
+                        .arg(&conv_tail_len_i32);
+                    builder
+                },
+            )?;
+        }
+        let rows_i32 = i32::try_from(rows)
+            .map_err(|_| AutogradError::TapeInvariant("linear_attention rows exceeds i32"))?;
+        let (qkv_ptr, _qkv_guard) = qkv_chunk.device_ptr(&backend.stream);
+        let (b_ptr, _b_guard) = b_bf16.device_ptr(&backend.stream);
+        let (a_ptr, _a_guard) = a_bf16.device_ptr(&backend.stream);
+        let (dt_ptr, _dt_guard) = dt_bf16.device_ptr(&backend.stream);
+        let (a_log_ptr, _a_log_guard) = a_log.device_ptr(&backend.stream);
+        let (state_ptr, _state_guard) = state.device_ptr_mut(&backend.stream);
+        let (raw_ptr, _raw_guard) = raw_chunk.device_ptr_mut(&backend.stream);
+        check_cuda_ffi(
+            // SAFETY: all pointers cover the dimensions passed below.
+            unsafe {
+                ffi::gated_delta_rule_prefill_recurrent_cuda(
+                    qkv_ptr as *const ffi::Half,
+                    (b_ptr as *const ffi::Half).add(head_start),
+                    (a_ptr as *const ffi::Half).add(head_start),
+                    dt_ptr as *const ffi::Half,
+                    a_log_ptr as *const f32,
+                    state_ptr as *mut f32,
+                    raw_ptr as *mut ffi::Half,
+                    num_key_heads_i32,
+                    num_value_heads_i32,
+                    key_dim_i32,
+                    value_dim_i32,
+                    rows_i32,
+                    backend.stream.cu_stream(),
+                )
+            },
+            "gated_delta_rule_prefill_recurrent_cuda",
+        )?;
+    }
+    Ok(DeviceHandle::Cuda(CudaStorage::new(state)))
 }
 
 #[cfg(not(feature = "no-cuda"))]

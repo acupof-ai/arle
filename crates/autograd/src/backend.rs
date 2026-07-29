@@ -351,6 +351,19 @@ pub struct LinearAttentionDeviceForwardArgs<'a> {
     pub initial_conv_window: Option<&'a DeviceHandle>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct LinearAttentionDeviceBoundaryArgs<'a> {
+    pub params: LinearAttentionDeviceParams,
+    pub qkv: &'a DeviceHandle,
+    pub b_proj: &'a DeviceHandle,
+    pub a_proj: &'a DeviceHandle,
+    pub conv1d_weight: &'a DeviceHandle,
+    pub dt_bias: &'a DeviceHandle,
+    pub a_log: &'a DeviceHandle,
+    pub initial_state: Option<&'a DeviceHandle>,
+    pub initial_conv_window: Option<&'a DeviceHandle>,
+}
+
 #[derive(Debug, Clone)]
 pub struct LinearAttentionDeviceForwardResult {
     pub output: DeviceHandle,
@@ -602,6 +615,13 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         &self,
         _args: LinearAttentionDeviceForwardArgs<'_>,
     ) -> Result<Option<LinearAttentionDeviceForwardResult>> {
+        Ok(None)
+    }
+
+    fn linear_attention_boundary_device(
+        &self,
+        _args: LinearAttentionDeviceBoundaryArgs<'_>,
+    ) -> Result<Option<DeviceHandle>> {
         Ok(None)
     }
 
