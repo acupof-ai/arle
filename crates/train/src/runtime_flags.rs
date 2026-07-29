@@ -62,27 +62,11 @@ pub fn apply_runtime_flags(f: &TrainRuntimeFlags) {
     autograd::apply_runtime_flags(&f.autograd);
 }
 
-/// VRAM wall: H20-96GB OOMs the writeback backward at seq≈30K even with offload
-/// (alloc_zeros mul_backward, 2026-07-18); 22K peaked 90.7GB. 0 = unlimited.
 pub(crate) fn max_update_seq() -> usize {
     MAX_UPDATE_SEQ.load(Relaxed)
 }
 
-/// Per-layer MLP recompute seq-chunk, seq-adaptive (no flag). Position-wise, so
-/// bit-identical to unchunked up to float add-order; caps the writeback backward
-/// recompute peak at `O(chunk·intermediate)`. `total_rows` = batch*seq (the peak
-/// scales with total rows, matching `writeback_offload_for_seq`). Returns 0
-/// (inline, byte-identical to the un-chunked block, zero overhead) at/below the
-/// last-proven-safe un-chunked point; a fixed chunk above it. `ARLE_OPD_MLP_SEQ_CHUNK`
-/// overrides both the chunk size and — when set — forces chunking regardless of
-/// threshold (the escape hatch for a sub-threshold OOM, and the manual A/B lever).
-///
-/// Threshold from the H20 seq-ladder: un-chunked backward survives total_rows=40960
-/// (peak 82/96 GiB) but OOMs at 49152 (`mul_backward grad_a`); chunk=4096 completes
-/// there. So engage just past the last-safe point. (MLP-chunk's single-card reach
-/// tops out at 49152: 57344 OOMs on non-MLP backward terms this lever can't touch,
-/// and seq>61680 hits i32 kernel-index walls in the forward — 256K needs those
-/// fixed first, orthogonal to this lever.)
+/// Chunk MLP replay above the last verified unchunked shape.
 pub fn mlp_seq_chunk_for_seq(total_rows: usize) -> usize {
     const MLP_SEQ_CHUNK_MIN_ROWS: usize = 40961;
     const MLP_SEQ_CHUNK: usize = 4096;
@@ -103,15 +87,7 @@ pub(crate) fn writeback_offload() -> bool {
     WRITEBACK_OFFLOAD.load(Relaxed)
 }
 
-/// Grad-checkpoint host-offload gate: seq-adaptive under the default flag, hard
-/// off when the user passes `--writeback-offload false`.
-///
-/// The H2D re-upload serializes on the host thread and starves the GPU on short
-/// trajectories (measured seq sweep 5K-12K on 27B: backward −29…−38%, zero peak
-/// headroom vs resident — offload only slows this band). Post fused-CE +
-/// batched-LA, resident checkpoints survive to seq=24576 and OOM at 28672
-/// (wins/2026-07-24-writeback-offload-dial-back); 16384 keeps 1.5× margin below
-/// last-proven-good and 25 GiB peak headroom on a 96 GB H20.
+/// Offload only where resident checkpoints no longer fit.
 pub(crate) fn writeback_offload_for_seq(seq_len: usize) -> bool {
     const WRITEBACK_OFFLOAD_MIN_SEQ: usize = 16384;
     writeback_offload() && seq_len >= WRITEBACK_OFFLOAD_MIN_SEQ

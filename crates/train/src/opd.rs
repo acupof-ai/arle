@@ -2838,14 +2838,9 @@ fn build_masked_loss_targets(
     if seq_len < 2 || prompt_len == 0 {
         return targets;
     }
-    // p ranges over predicting positions [prompt_len - 1 ..= seq_len - 2]; the
-    // target is full[p + 1]. Lower-bounding p at prompt_len - 1 starts loss at
-    // the first response token (predicted by the prompt's final token).
     let p_start = prompt_len - 1;
     for p in p_start..=(seq_len - 2) {
         let target_pos = p + 1;
-        // target_pos >= prompt_len always holds here (p >= prompt_len - 1), so
-        // the response index never underflows.
         let resp_idx = target_pos - prompt_len;
         if resp_idx < response_mask.len() && response_mask[resp_idx] == 1 {
             targets.push((p, full[target_pos] as usize));
@@ -2854,30 +2849,6 @@ fn build_masked_loss_targets(
     targets
 }
 
-/// Masked single-trajectory CE writeback for agent-OPD: ONE checkpointed
-/// forward over the whole `prompt ++ response` trajectory → hidden states, then
-/// a CHUNKED fused cross-entropy on the masked (LLM-generated) positions that
-/// never materializes the full `[seq, vocab]` logits tile.
-///
-/// Replaces the prior O(N²) windowed loop (each `sequence_windows` window
-/// re-forwarded the growing prefix via `forward_logits_window` and materialized
-/// a `[1, window, vocab]` f32 tile — 1.9 GB at window=2048, which `alloc_zeros`
-/// failed on the fragmented caching pool at the 64 GB-resident shared-base
-/// engine; shrinking the window only moved the OOM window-to-window). Now:
-/// `forward_hidden_states` once (gradient-checkpointed) → `[1, seq, hidden]`,
-/// then `fused_linear_ce_loss_indexed(hidden, lm_head, positions, targets,
-/// chunk_rows)` chunks over the masked positions, computing
-/// `logits_chunk = hidden_chunk @ lm_headᵀ` + CE + gradient per chunk and
-/// freeing each — peak transient ≈ `chunk * vocab * 4` bytes (≈0.25 GB at
-/// chunk=256, vocab=248320), so it fits at 64 GB resident with ~30 GB headroom.
-///
-/// `window_size` is reused as `chunk_rows` (positions per chunk; default
-/// 256-512). The fused loss already produces the mean CE per masked token (and
-/// the `/N` gradient), so `backward` + a single `optimizer.step` apply the
-/// per-token-mean update — the effective LR stays independent of trajectory
-/// length. The lm_head's `d_weight` only flows if it is trainable; under
-/// `--share-frozen-base` the head is frozen/tied so only `d_hidden` flows. The
-/// returned scalar is the mean CE per masked (LLM-generated) token.
 #[allow(clippy::too_many_arguments)]
 #[derive(Clone, Copy)]
 struct VramSample {
@@ -2914,9 +2885,6 @@ pub fn fmt_hoarded(mib: Option<u64>) -> String {
     mib.map_or_else(|| "n/a".to_string(), |m| format!("{m}MiB"))
 }
 
-/// Log device VRAM at a writeback milestone when `ARLE_OPD_VRAM_TRACE` is set
-/// (default off). Brackets forward/backward/cleanup to attribute retained
-/// allocator floor separately from live tensors.
 fn log_writeback_vram(store: &TensorStore, scope: &str, label: &str) -> Option<VramSample> {
     if !writeback_vram_trace_enabled() {
         return None;
@@ -2975,31 +2943,18 @@ fn log_writeback_vram_ledger(
     );
 }
 
-/// Per-token loss the shared masked-writeback skeleton applies. `Ce` is the
-/// byte-identical rejection-sampling default — PG at uniform weight `1/N`, kept
-/// as its own arm because the fused CE op needs no per-chunk logprob readback.
-/// `Pg` is the weighted policy-gradient path (SAO/GRPO-family presets). Only the
-/// single fused-loss call branches on this — forward / backward / optimizer /
-/// offload are shared.
+/// Loss applied by the shared writeback step.
 pub enum WritebackLoss<'a> {
     Ce,
     Pg {
-        /// π_behavior per masked target position (the policy the trajectory was
-        /// SAMPLED from — the IS-ratio denominator), same order as the fused ops.
         rollout_logprobs: &'a [f32],
-        /// FINAL per-token detached base weight: advantage already scaled by the
-        /// preset's aggregation norm; the ratio/gate factor is applied inside
-        /// the op per `form`.
         weight: &'a [f32],
         form: WeightForm,
-        /// k3 KL(π_b‖πθ) coefficient folded into the weight (0 = off), already
-        /// aggregation-scaled like `weight`.
         kl_coef: f32,
     },
 }
 
-/// Thin byte-identical wrapper over [`masked_writeback_step`] for the default
-/// rejection-sampling CE path — public API + behavior unchanged.
+/// CE compatibility wrapper.
 pub fn masked_writeback_ce_step<O: Optimizer>(
     student: &Qwen35Model,
     all_model_params: &[TensorId],
@@ -3030,13 +2985,7 @@ pub fn masked_writeback_ce_step<O: Optimizer>(
     .map(|(loss, _)| loss)
 }
 
-/// Frozen-prompt-KV gen-segment split shared by the SAO writeback/capture/critic
-/// forwards. `gen_start = prompt_len - 1`: the boundary token predicts the first
-/// response token, so every masked target position `p >= gen_start` and rebasing
-/// into the gen tensor with `p - gen_start` is always `>= 0`. The prefix covers
-/// absolute positions `0..gen_start` (captured off-tape, seeds attention); the
-/// gen segment covers `gen_start..seq_len`. Only the forward's context differs
-/// from the full path — the masked-position loss/logprobs/values are identical.
+/// Frozen prompt and trainable generated segment.
 struct GenSegment {
     prompt_prefix: Vec<u32>,
     gen_ids: Vec<u32>,
@@ -3045,8 +2994,6 @@ struct GenSegment {
 }
 
 impl GenSegment {
-    /// Caller must ensure `prompt_len > 1` (a non-empty prompt prefix requires
-    /// `gen_start = prompt_len - 1 >= 1`, enforced by the `prompt_len > 1` gate).
     fn split(full: &[u32], prompt_len: usize) -> Self {
         let gen_start = prompt_len - 1;
         let seq_len = full.len();
@@ -3059,18 +3006,7 @@ impl GenSegment {
     }
 }
 
-/// Shared masked single-trajectory writeback skeleton: ONE checkpointed forward
-/// over `prompt ++ response` → hidden states, then a CHUNKED fused loss on the
-/// masked (LLM-generated) positions that never materializes `[seq, vocab]`. Only
-/// the fused-loss call branches on `loss_kind` (CE vs DIS); everything else —
-/// forward, backward, optimizer step, seq-adaptive offload, VRAM logging — is
-/// shared. See [`masked_writeback_ce_step`] for the CE-path rationale.
-///
-/// When `--writeback-frozen-prompt-kv` is set (and `prompt_len > 1`) the forward
-/// runs ONLY the generated segment, seeding attention from an off-tape
-/// prompt-prefix capture — cutting the shared-prompt cost ~5-8×. The dropped
-/// LoRA-grad-on-prompt-KV term is ~0 at lora_b=0, so loss + response-position
-/// grads match the full path; the flag-off path is byte-identical.
+/// One checkpointed forward, chunked loss, backward, and optional optimizer step.
 #[allow(clippy::too_many_arguments)]
 pub fn masked_writeback_step<O: Optimizer>(
     loss_kind: WritebackLoss,
@@ -3078,9 +3014,7 @@ pub fn masked_writeback_step<O: Optimizer>(
     all_model_params: &[TensorId],
     trainable_params: &[TensorId],
     optimizer: &mut O,
-    // `false` = grad-accumulate only (GlobalTokenMean batches trajectories into
-    // ONE step): grads survive `cleanup_after_backward`'s keep-set; the caller
-    // steps + zeroes once at batch end.
+    // False accumulates gradients for a later optimizer step.
     step_optimizer: bool,
     prompt_ids: &[u32],
     response_ids: &[u32],
