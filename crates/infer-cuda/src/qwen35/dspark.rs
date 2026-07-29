@@ -1640,9 +1640,15 @@ impl Qwen35Model {
             return Ok(());
         }
         let mut pt = super::dspark_phase_start(&self.ctx);
+        let (mut gdr, mut conv) = ((Vec::new(), Vec::new()), (Vec::new(), Vec::new()));
+        let (gdr_bytes, conv_bytes) = rolls[0].spec.linear_state_bytes();
         for r in rolls.iter_mut() {
-            r.spec.restore_trunk(&self.ctx, r.slot)?;
+            r.spec
+                .linear_state_addrs(&self.ctx, r.slot, &mut gdr, &mut conv)?;
         }
+        // Restore: live <- snapshot, so the snapshot side is the source.
+        self.batched_copy(tables, &gdr.1, &gdr.0, gdr_bytes)?;
+        self.batched_copy(tables, &conv.1, &conv.0, conv_bytes)?;
         let restore_ms = super::mtp_phase_lap(&self.ctx, &mut pt);
         // The varlen replay is the recurrent kernel; leave the opt-in chunked
         // path on its own route.
