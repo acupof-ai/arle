@@ -3184,20 +3184,32 @@ pub fn masked_writeback_step<O: Optimizer>(
     // so backward (seed 1.0) applies the per-token-mean update directly.
     let t_ce = Instant::now();
     let (loss, pg_stats) = match loss_kind {
-        WritebackLoss::Ce => (
-            fused_linear_ce_loss_indexed(
-                hidden,
-                student.lm_head_weight_id(),
-                &position_indices,
-                &target_tokens,
-                chunk_rows,
-                inv_n_override,
-                store,
-                &mut tape,
-            )
-            .map_err(OpdError::from)?,
-            PgStats::default(),
-        ),
+        WritebackLoss::Ce => {
+            // A CP sequence shard can legitimately own ZERO masked targets (e.g. a
+            // prompt-heavy prefix shard), which the fused CE rejects. That rank must
+            // still backprop through `hidden` so the forward's all_gather_seq KV
+            // gather fires its reduce_scatter adjoint — else the CP group deadlocks.
+            // A zero loss that depends on hidden (sum·0) yields exactly that: value
+            // 0, grad 0, collectives in lockstep, and the post-backward grad
+            // all-reduce sums a genuine zero contribution from this rank.
+            let loss = if cp.is_enabled() && position_indices.is_empty() {
+                let s = autograd::ops::sum(hidden, store, &mut tape).map_err(OpdError::from)?;
+                mul_scalar(s, 0.0, store, &mut tape).map_err(OpdError::from)?
+            } else {
+                fused_linear_ce_loss_indexed(
+                    hidden,
+                    student.lm_head_weight_id(),
+                    &position_indices,
+                    &target_tokens,
+                    chunk_rows,
+                    inv_n_override,
+                    store,
+                    &mut tape,
+                )
+                .map_err(OpdError::from)?
+            };
+            (loss, PgStats::default())
+        }
         WritebackLoss::Pg {
             rollout_logprobs,
             weight,

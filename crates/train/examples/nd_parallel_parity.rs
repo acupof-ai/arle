@@ -55,11 +55,15 @@ fn main() {
 }
 
 // Prompt/response shared by the reference and every CP rank. Seq len 14 splits
-// evenly across CP_SIZE=2 (a hard all_gather precondition).
+// evenly across CP_SIZE=2 (a hard all_gather precondition). A SHORT prompt (4) so
+// masked targets (predicting positions [prompt_len-1 .. seq-2] = [3..12]) straddle
+// BOTH shards — shard0 [0,7) owns targets 3..6, shard1 [7,14) owns 7..12. A
+// prompt-heavy split (all targets on one shard) would leave the other shard empty
+// and only ever exercise the zero-loss path, never real cross-shard parity.
 #[cfg(all(feature = "cuda", feature = "nccl"))]
 fn trajectory() -> (Vec<u32>, Vec<u32>, Vec<u8>) {
-    let prompt: Vec<u32> = vec![1, 3, 8, 2, 7, 4, 9, 5];
-    let response: Vec<u32> = vec![6, 10, 11, 12, 13, 14];
+    let prompt: Vec<u32> = vec![1, 3, 8, 2];
+    let response: Vec<u32> = vec![7, 4, 9, 5, 6, 10, 11, 12, 13, 14];
     let mask = vec![1u8; response.len()];
     (prompt, response, mask)
 }
