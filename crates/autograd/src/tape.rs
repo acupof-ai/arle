@@ -9,7 +9,9 @@ use std::{
 use smallvec::SmallVec;
 
 use crate::{
-    AutogradError, Result, ops,
+    AutogradError, Result,
+    backend::DeviceHandle,
+    ops,
     tensor::{Dirty, TensorId, TensorStore},
 };
 
@@ -1304,6 +1306,19 @@ fn merge_grad(
                 && incoming.device_handle.is_some()
         };
         if both_on_device {
+            // In-place accumulation avoids a THIRD full-size grad buffer
+            // (add_into_device's alloc_zeros) — the OOM at long-seq writeback.
+            // Safe ONLY when this buffer is uniquely owned: grads fan out by
+            // Arc clone (clone_tensor / add_backward push one grad to both
+            // inputs), so a shared buffer mutated in place would corrupt a live
+            // sibling. Probe strong-count on the store-held handle BEFORE the
+            // clone below (the clone would bump it). `Some(1)` = sole owner.
+            let uniquely_owned = store
+                .tensor(existing_grad_id)?
+                .device_handle
+                .as_ref()
+                .and_then(DeviceHandle::device_buffer_strong_count)
+                == Some(1);
             let existing_handle = store
                 .tensor(existing_grad_id)?
                 .device_handle
@@ -1316,10 +1331,17 @@ fn merge_grad(
                 .as_ref()
                 .expect("checked above")
                 .clone();
-            let sum_handle =
+            let sum_handle = if uniquely_owned {
+                store.backend().accumulate_into_device(
+                    &existing_handle,
+                    &incoming_handle,
+                    &expected,
+                )?
+            } else {
                 store
                     .backend()
-                    .add_into_device(&existing_handle, &incoming_handle, &expected)?;
+                    .add_into_device(&existing_handle, &incoming_handle, &expected)?
+            };
             store.replace_device_handle(existing_grad_id, sum_handle)?;
         } else {
             let incoming_data = store.to_host(new_grad_id)?;
@@ -1441,6 +1463,25 @@ mod tests {
             store.get(y).and_then(|tensor| tensor.grad).is_none(),
             "intermediate grad is not persisted on the tensor"
         );
+    }
+
+    #[test]
+    fn merge_grad_sums_fanned_out_leaf_touches() {
+        // A leaf used twice (`x*x`) fans its grad out to both `mul` inputs, then
+        // merge_grad sums the two contributions into the leaf's grad slot — the
+        // exact path the guarded in-place accumulate gates on. Pin the summed
+        // value so a broken merge (in-place clobber of a shared buffer, or a
+        // dropped contribution) fails here regardless of backend: d/dx Σ(x*x) = 2x.
+        let mut store = TensorStore::default();
+        let x = store.alloc(Tensor::new(vec![2.0, -3.0, 0.5], vec![3], true).expect("create x"));
+        let mut tape = Tape::new();
+        let sq = ops::mul(x, x, &mut store, &mut tape).expect("x*x");
+        let loss = ops::sum(sq, &mut store, &mut tape).expect("sum");
+
+        let grads = tape.backward(loss, &mut store).expect("backward");
+        let gx = grads.get(&x).copied().expect("leaf grad present");
+        let data = store.to_host(gx).expect("read grad");
+        assert_eq!(data, vec![4.0, -6.0, 1.0], "Σ of both fan-out touches = 2x");
     }
 
     #[test]
