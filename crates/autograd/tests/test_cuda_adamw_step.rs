@@ -67,7 +67,7 @@ fn cuda_adamw_step_matches_cpu_5_steps() {
     let mut host_param = param_init.clone();
     let mut host_m = vec![0.0_f32; size];
     let mut host_v = vec![0.0_f32; size];
-    for step in 0..STEPS {
+    for (step, grad) in grads_per_step.iter().enumerate() {
         let t = step as i32 + 1;
         let bc1 = 1.0 - BETA1.powi(t);
         let bc2 = 1.0 - BETA2.powi(t);
@@ -75,7 +75,7 @@ fn cuda_adamw_step_matches_cpu_5_steps() {
             &mut host_param,
             &mut host_m,
             &mut host_v,
-            &grads_per_step[step],
+            grad,
             LR,
             BETA1,
             BETA2,
@@ -97,24 +97,13 @@ fn cuda_adamw_step_matches_cpu_5_steps() {
         .upload(&vec![0.0_f32; size], &shape)
         .expect("upload zero v");
 
-    for step in 0..STEPS {
+    for (step, grad) in grads_per_step.iter().enumerate() {
         let t = step as i32 + 1;
         let bc1 = 1.0 - BETA1.powi(t);
         let bc2 = 1.0 - BETA2.powi(t);
         let (new_param, new_m, new_v) = backend
             .adamw_step(
-                &param_h,
-                &m_h,
-                &v_h,
-                &grads_per_step[step],
-                &shape,
-                LR,
-                BETA1,
-                BETA2,
-                EPS,
-                WD,
-                bc1,
-                bc2,
+                &param_h, &m_h, &v_h, grad, &shape, LR, BETA1, BETA2, EPS, WD, bc1, bc2,
             )
             .expect("cuda adamw_step");
         param_h = new_param;
