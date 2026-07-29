@@ -3656,9 +3656,7 @@ pub fn masked_writeback_ce_step_frozen_prompt_kv<O: Optimizer>(
     .map(|(loss, _)| loss)
 }
 
-/// Dispatch between the byte-identical baseline `masked_writeback_ce_step` and
-/// the gated frozen-prompt-KV variant. The env check lives HERE only; with the
-/// flag unset (or "0"/"false") the default path is byte-identical.
+/// Dispatch CE writeback with optional context parallelism.
 #[allow(clippy::too_many_arguments)]
 pub fn masked_writeback_ce_step_dispatch<O: Optimizer>(
     student: &Qwen35Model,
@@ -3673,38 +3671,22 @@ pub fn masked_writeback_ce_step_dispatch<O: Optimizer>(
     cp: crate::context_parallel::CpContext,
     store: &mut TensorStore,
 ) -> Result<f32> {
-    let frozen = crate::runtime_flags::writeback_frozen_prompt_kv() && !cp.is_enabled();
-    if frozen {
-        masked_writeback_ce_step_frozen_prompt_kv(
-            student,
-            all_model_params,
-            trainable_params,
-            optimizer,
-            prompt_ids,
-            response_ids,
-            response_mask,
-            vocab,
-            window_size,
-            store,
-        )
-    } else {
-        masked_writeback_step(
-            WritebackLoss::Ce,
-            student,
-            all_model_params,
-            trainable_params,
-            optimizer,
-            true,
-            prompt_ids,
-            response_ids,
-            response_mask,
-            vocab,
-            window_size,
-            cp,
-            store,
-        )
-        .map(|(loss, _)| loss)
-    }
+    masked_writeback_step(
+        WritebackLoss::Ce,
+        student,
+        all_model_params,
+        trainable_params,
+        optimizer,
+        true,
+        prompt_ids,
+        response_ids,
+        response_mask,
+        vocab,
+        window_size,
+        cp,
+        store,
+    )
+    .map(|(loss, _)| loss)
 }
 
 /// Group the masked (LLM-generated) predicting positions into maximal
