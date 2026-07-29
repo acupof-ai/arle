@@ -40,9 +40,7 @@ use crate::{
 };
 
 pub(crate) use activation::{exp_backward, gelu_backward, sigmoid_backward, silu_backward};
-pub(crate) use attention::{
-    cat_heads_backward, cat_seq_backward, causal_sdpa_recompute_backward, cp_causal_sdpa_backward,
-};
+pub(crate) use attention::{cat_heads_backward, cat_seq_backward, causal_sdpa_recompute_backward};
 pub(crate) use broadcast::add_broadcast_backward;
 pub(crate) use collective::{
     all_gather_seq_backward, all_reduce_sum_backward, reduce_scatter_sum_backward,

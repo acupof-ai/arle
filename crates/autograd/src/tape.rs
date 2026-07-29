@@ -164,11 +164,8 @@ pub enum SavedContext {
         q: TensorId,
         k: TensorId,
         v: TensorId,
-    },
-    CpCausalSdpaCtx {
-        q: TensorId,
-        k: TensorId,
-        v: TensorId,
+        // q's absolute start position over the KV; 0 for square (full-seq) causal
+        // attention, >0 for a context-parallel query shard over a gathered prefix.
         q_start: usize,
     },
     CheckpointCtx {
@@ -218,7 +215,6 @@ pub enum BackwardOp {
     GeneralizedJsd,
     LinearAttention,
     CausalSdpaRecompute,
-    CpCausalSdpa,
     AllReduceSum,
     AllGatherSeq,
     ReduceScatterSum,
@@ -262,7 +258,6 @@ impl BackwardOp {
             BackwardOp::GeneralizedJsd => "GeneralizedJsd",
             BackwardOp::LinearAttention => "LinearAttention",
             BackwardOp::CausalSdpaRecompute => "CausalSdpaRecompute",
-            BackwardOp::CpCausalSdpa => "CpCausalSdpa",
             BackwardOp::AllReduceSum => "AllReduceSum",
             BackwardOp::AllGatherSeq => "AllGatherSeq",
             BackwardOp::ReduceScatterSum => "ReduceScatterSum",
@@ -798,9 +793,6 @@ impl Tape {
                     }
                     BackwardOp::CausalSdpaRecompute => {
                         ops::causal_sdpa_recompute_backward(&entry, output_grad_id, store)?
-                    }
-                    BackwardOp::CpCausalSdpa => {
-                        ops::cp_causal_sdpa_backward(&entry, output_grad_id, store)?
                     }
                     BackwardOp::AllReduceSum => {
                         ops::all_reduce_sum_backward(&entry, output_grad_id, store)?

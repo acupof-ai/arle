@@ -2011,18 +2011,15 @@ impl Backend for CudaBackend {
 
             // No communicator (single-process / CPU parity path): identity — the
             // gathered full sequence equals this rank's local shard (world==1).
+            // Device buffers are functional (write-fresh; see add_into_device), and
+            // this branch skips the in-place NCCL write, so sharing the input Arc is
+            // safe — no alloc, no D2D copy.
             #[cfg(feature = "nccl")]
             let world = self.nccl.as_ref().map_or(1, |nccl| nccl.world_size());
             #[cfg(not(feature = "nccl"))]
             let world = 1usize;
             if world <= 1 {
-                let mut out = self.stream.alloc_zeros::<f32>(local_len).map_err(|_| {
-                    AutogradError::TapeInvariant("cuda all_gather_seq alloc failed")
-                })?;
-                self.stream
-                    .memcpy_dtod(src, &mut out)
-                    .map_err(|_| AutogradError::TapeInvariant("cuda all_gather_seq D2D failed"))?;
-                return Ok(DeviceHandle::Cuda(CudaStorage::new(out)));
+                return Ok(x.clone());
             }
 
             // NCCL all-gather: shards are equal-length (seq % world == 0), so the
@@ -2082,6 +2079,7 @@ impl Backend for CudaBackend {
             let world = 1usize;
             if world <= 1 {
                 // Identity: input already this rank's [1, S/N, H] (== full at N=1).
+                // Share the input Arc (functional buffers) — no alloc, no D2D copy.
                 if src.len() != local_len {
                     return Err(AutogradError::DataLengthMismatch {
                         len: src.len(),
@@ -2089,13 +2087,7 @@ impl Backend for CudaBackend {
                         size: local_len,
                     });
                 }
-                let mut out = self.stream.alloc_zeros::<f32>(local_len).map_err(|_| {
-                    AutogradError::TapeInvariant("cuda reduce_scatter_sum alloc failed")
-                })?;
-                self.stream.memcpy_dtod(src, &mut out).map_err(|_| {
-                    AutogradError::TapeInvariant("cuda reduce_scatter_sum D2D failed")
-                })?;
-                return Ok(DeviceHandle::Cuda(CudaStorage::new(out)));
+                return Ok(x.clone());
             }
 
             #[cfg(feature = "nccl")]
