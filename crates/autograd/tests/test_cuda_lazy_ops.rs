@@ -1277,6 +1277,55 @@ fn cuda_add_into_device_matches_cpu() {
 }
 
 #[test]
+fn cuda_trim_memory_pool_releases_unused_pages() {
+    use cudarc::driver::{result, sys};
+
+    let backend = CudaBackend::new(0).expect("cuda");
+    // SAFETY: handles come from the active CUDA device.
+    let (current, default) = unsafe {
+        let device = result::device::get(0).expect("device");
+        (
+            result::device::get_mem_pool(device).expect("current pool"),
+            result::device::get_default_mem_pool(device).expect("default pool"),
+        )
+    };
+    assert_eq!(current, default);
+    let mut threshold = u64::MAX;
+    // SAFETY: threshold is the required u64 attribute payload.
+    unsafe {
+        result::mem_pool::set_attribute(
+            current,
+            sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_RELEASE_THRESHOLD,
+            (&mut threshold as *mut u64).cast(),
+        )
+        .expect("set threshold");
+    }
+    let n = 16 << 20;
+    let handle = backend.upload(&vec![0.0; n], &[n]).expect("upload");
+    backend.eval(&[&handle]).expect("eval");
+    drop(handle);
+    backend.stream_synchronize().expect("sync");
+    let (pre_reserved, pre_used) = backend.mem_pool_stats().expect("pre stats");
+    let pre_free = backend.device_mem_info().expect("pre memory").0;
+    assert!(pre_reserved.saturating_sub(pre_used) >= 16 << 20);
+    assert!(backend.trim_memory_pool().expect("trim"));
+    let (post_reserved, post_used) = backend.mem_pool_stats().expect("post stats");
+    let post_free = backend.device_mem_info().expect("post memory").0;
+    threshold = 0;
+    // SAFETY: threshold is the required u64 attribute payload.
+    unsafe {
+        result::mem_pool::set_attribute(
+            current,
+            sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_RELEASE_THRESHOLD,
+            (&mut threshold as *mut u64).cast(),
+        )
+        .expect("reset threshold");
+    }
+    assert!(post_reserved.saturating_sub(post_used) < 8 << 20);
+    assert!(post_free >= pre_free + (16 << 20));
+}
+
+#[test]
 fn cuda_embedding_backward_device_matches_cpu() {
     let Ok(backend) = CudaBackend::new(0) else {
         eprintln!("skipping cuda_embedding_backward_device_matches_cpu: no CUDA device");
