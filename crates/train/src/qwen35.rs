@@ -263,6 +263,22 @@ impl Qwen35TensorParallelConfig {
         )
     }
 
+    fn local_moe_intermediate_size(self, cfg: &Qwen35Config) -> Result<usize> {
+        divide_tp(
+            cfg.moe_intermediate_size,
+            self.world_size,
+            "moe_intermediate_size must divide tensor-parallel world size",
+        )
+    }
+
+    fn local_shared_expert_intermediate_size(self, cfg: &Qwen35Config) -> Result<usize> {
+        divide_tp(
+            cfg.shared_expert_intermediate_size,
+            self.world_size,
+            "shared_expert_intermediate_size must divide tensor-parallel world size",
+        )
+    }
+
     fn full_attn_q_proj_dim(self, cfg: &Qwen35Config) -> Result<usize> {
         let local_heads = self.local_attention_heads(cfg)?;
         Ok(if cfg.full_attn_gated {
@@ -1261,12 +1277,7 @@ impl Qwen35Layer {
                 maybe_tp_all_reduce(mlp_out, tp, store, tape)
             }
             Qwen35Mlp::Sparse(mlp) => {
-                if tp.is_enabled() {
-                    return Err(Qwen35Error::InvalidConfig(
-                        "train-side Qwen3.6 MoE MLP currently requires single-rank TP",
-                    ));
-                }
-                self.forward_sparse_mlp(mlp, h, cfg, batch, seq_len, store, tape)
+                self.forward_sparse_mlp(mlp, h, cfg, tp, batch, seq_len, store, tape)
             }
         }
     }
@@ -1286,24 +1297,18 @@ impl Qwen35Layer {
     ) -> Result<TensorId> {
         match &self.mlp {
             Qwen35Mlp::Dense(_) => self.forward_mlp(h, cfg, tp, batch, seq_len, store, tape),
-            Qwen35Mlp::Sparse(mlp) => {
-                if tp.is_enabled() {
-                    return Err(Qwen35Error::InvalidConfig(
-                        "train-side Qwen3.6 MoE MLP currently requires single-rank TP",
-                    ));
-                }
-                self.forward_sparse_mlp_collecting_routes(
-                    layer_index,
-                    mlp,
-                    h,
-                    cfg,
-                    batch,
-                    seq_len,
-                    route_signatures,
-                    store,
-                    tape,
-                )
-            }
+            Qwen35Mlp::Sparse(mlp) => self.forward_sparse_mlp_collecting_routes(
+                layer_index,
+                mlp,
+                h,
+                cfg,
+                tp,
+                batch,
+                seq_len,
+                route_signatures,
+                store,
+                tape,
+            ),
         }
     }
 
@@ -1324,11 +1329,6 @@ impl Qwen35Layer {
         match &self.mlp {
             Qwen35Mlp::Dense(_) => self.forward_mlp(h, cfg, tp, batch, seq_len, store, tape),
             Qwen35Mlp::Sparse(mlp) => {
-                if tp.is_enabled() {
-                    return Err(Qwen35Error::InvalidConfig(
-                        "train-side Qwen3.6 MoE MLP currently requires single-rank TP",
-                    ));
-                }
                 let route = frozen_routes
                     .get(*next_route)
                     .ok_or(Qwen35Error::InvalidConfig(
@@ -1340,6 +1340,7 @@ impl Qwen35Layer {
                     mlp,
                     h,
                     cfg,
+                    tp,
                     batch,
                     seq_len,
                     route,
@@ -1355,6 +1356,7 @@ impl Qwen35Layer {
         mlp: &Qwen35SparseMlp,
         h: TensorId,
         cfg: &Qwen35Config,
+        tp: Qwen35TensorParallelConfig,
         batch: usize,
         seq_len: usize,
         store: &mut TensorStore,
@@ -1416,7 +1418,10 @@ impl Qwen35Layer {
             broadcast_to_shape(shared_expert_gate, &[tokens, cfg.hidden_size], store, tape)?;
         let shared = mul(shared, shared_expert_gate, store, tape)?;
 
+        // Row-parallel down_proj (routed + shared) yields per-rank partial sums;
+        // one all-reduce on their sum completes both across the TP group.
         let out = add(routed, shared, store, tape)?;
+        let out = maybe_tp_all_reduce(out, tp, store, tape)?;
         Ok(reshape(
             out,
             &[batch, seq_len, cfg.hidden_size],
@@ -1432,6 +1437,7 @@ impl Qwen35Layer {
         mlp: &Qwen35SparseMlp,
         h: TensorId,
         cfg: &Qwen35Config,
+        tp: Qwen35TensorParallelConfig,
         batch: usize,
         seq_len: usize,
         route_signatures: &mut Vec<Qwen35MoeRouteSignature>,
@@ -1502,6 +1508,7 @@ impl Qwen35Layer {
         let shared = mul(shared, shared_expert_gate, store, tape)?;
 
         let out = add(routed, shared, store, tape)?;
+        let out = maybe_tp_all_reduce(out, tp, store, tape)?;
         Ok(reshape(
             out,
             &[batch, seq_len, cfg.hidden_size],
@@ -1517,6 +1524,7 @@ impl Qwen35Layer {
         mlp: &Qwen35SparseMlp,
         h: TensorId,
         cfg: &Qwen35Config,
+        tp: Qwen35TensorParallelConfig,
         batch: usize,
         seq_len: usize,
         route: &Qwen35MoeRouteSignature,
@@ -1588,6 +1596,7 @@ impl Qwen35Layer {
         let shared = mul(shared, shared_expert_gate, store, tape)?;
 
         let out = add(routed, shared, store, tape)?;
+        let out = maybe_tp_all_reduce(out, tp, store, tape)?;
         Ok(reshape(
             out,
             &[batch, seq_len, cfg.hidden_size],
@@ -3035,11 +3044,6 @@ impl Qwen35Model {
                 store,
             )?;
             let mlp = if cfg.is_moe_layer(layer_idx) {
-                if tp.is_enabled() {
-                    return Err(Qwen35Error::InvalidConfig(
-                        "train-side Qwen3.6 MoE MLP currently requires single-rank TP",
-                    ));
-                }
                 if !cfg.norm_topk_prob {
                     return Err(Qwen35Error::InvalidConfig(
                         "train-side Qwen3.6 MoE currently requires norm_topk_prob=true",
@@ -3049,6 +3053,7 @@ impl Qwen35Model {
                 Qwen35Mlp::Sparse(Box::new(new_sparse_mlp(
                     &moe_names,
                     cfg,
+                    tp,
                     base_requires_grad,
                     materialize_frozen_base,
                     layer_lora,
@@ -4937,6 +4942,7 @@ fn linear_with_base_init(
 fn new_sparse_mlp(
     names: &Qwen35MoeTensorNames,
     cfg: &Qwen35Config,
+    tp: Qwen35TensorParallelConfig,
     base_requires_grad: bool,
     materialize_frozen_base: bool,
     lora: Option<LoraConfig>,
@@ -4954,6 +4960,12 @@ fn new_sparse_mlp(
     // (no LoRA adapters). Only attention + shared expert carry LoRA.
     let expert_lora = if lora_skip_experts { None } else { lora };
 
+    // TP: column-parallel gate/up shard the intermediate (out) dim; row-parallel
+    // down shards its input dim. Router stays replicated (full num_experts). The
+    // forward all-reduces the summed expert+shared output over the TP group.
+    let local_moe_intermediate = tp.local_moe_intermediate_size(cfg)?;
+    let local_shared_intermediate = tp.local_shared_expert_intermediate_size(cfg)?;
+
     let experts = (0..cfg.num_experts)
         .map(|expert_idx| {
             let gate_proj_name = leak_name(names.expert_gate_proj(expert_idx));
@@ -4963,7 +4975,7 @@ fn new_sparse_mlp(
                 gate_proj: linear_with_base_init(
                     gate_proj_name,
                     cfg.hidden_size,
-                    cfg.moe_intermediate_size,
+                    local_moe_intermediate,
                     base_requires_grad,
                     lora_for_name(expert_lora, lora_target_set, gate_proj_name),
                     materialize_frozen_base,
@@ -4972,7 +4984,7 @@ fn new_sparse_mlp(
                 up_proj: linear_with_base_init(
                     up_proj_name,
                     cfg.hidden_size,
-                    cfg.moe_intermediate_size,
+                    local_moe_intermediate,
                     base_requires_grad,
                     lora_for_name(expert_lora, lora_target_set, up_proj_name),
                     materialize_frozen_base,
@@ -4980,7 +4992,7 @@ fn new_sparse_mlp(
                 )?,
                 down_proj: linear_with_base_init(
                     down_proj_name,
-                    cfg.moe_intermediate_size,
+                    local_moe_intermediate,
                     cfg.hidden_size,
                     base_requires_grad,
                     lora_for_name(expert_lora, lora_target_set, down_proj_name),
@@ -5004,7 +5016,7 @@ fn new_sparse_mlp(
         shared_gate_proj: linear_with_base_init(
             shared_gate_proj_name,
             cfg.hidden_size,
-            cfg.shared_expert_intermediate_size,
+            local_shared_intermediate,
             base_requires_grad,
             lora_for_name(lora, lora_target_set, shared_gate_proj_name),
             materialize_frozen_base,
@@ -5013,7 +5025,7 @@ fn new_sparse_mlp(
         shared_up_proj: linear_with_base_init(
             shared_up_proj_name,
             cfg.hidden_size,
-            cfg.shared_expert_intermediate_size,
+            local_shared_intermediate,
             base_requires_grad,
             lora_for_name(lora, lora_target_set, shared_up_proj_name),
             materialize_frozen_base,
@@ -5021,7 +5033,7 @@ fn new_sparse_mlp(
         )?,
         shared_down_proj: linear_with_base_init(
             shared_down_proj_name,
-            cfg.shared_expert_intermediate_size,
+            local_shared_intermediate,
             cfg.hidden_size,
             base_requires_grad,
             lora_for_name(lora, lora_target_set, shared_down_proj_name),
