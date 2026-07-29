@@ -21,7 +21,7 @@ hip = ["infer-api/hip"]
 # Vulkan backend (cross-vendor / Windows lane). Pair with `no-cuda` off-box;
 # train/autograd have no Vulkan code, so only infer-api forwards.
 vulkan = ["infer-api/vulkan"]
-nccl = ["cuda", "infer-api/nccl"]
+nccl = ["cuda", "infer-api/nccl", "train/nccl", "autograd/nccl"]
 deepep = ["nccl", "infer-api/deepep"]
 
 [dependencies]
