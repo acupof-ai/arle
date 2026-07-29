@@ -118,6 +118,40 @@ extern "C" __global__ void linear_attention_conv1d_silu_forward_f32_to_bf16(
     out_bf16[idx] = la_float_to_bf16(la_silu(sum));
 }
 
+extern "C" __global__ void linear_attention_conv1d_silu_boundary_f32_to_bf16(
+    unsigned short* __restrict__ out_bf16,
+    const float* __restrict__ x,
+    const float* __restrict__ weight,
+    unsigned long long total,
+    int start_seq,
+    int channels,
+    int kernel_size,
+    const float* __restrict__ conv_tail,
+    int tail_len
+) {
+    unsigned long long idx =
+        static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= total) {
+        return;
+    }
+    int c = idx % channels;
+    int t = start_seq + static_cast<int>(idx / channels);
+    float sum = 0.0f;
+    for (int tap = 0; tap < kernel_size; ++tap) {
+        int src_t = t + tap + 1 - kernel_size;
+        if (src_t < 0) {
+            if (conv_tail != nullptr) {
+                sum += conv_tail[(src_t + tail_len) * channels + c] *
+                    weight[c * kernel_size + tap];
+            }
+        } else {
+            sum += x[static_cast<unsigned long long>(src_t) * channels + c] *
+                weight[c * kernel_size + tap];
+        }
+    }
+    out_bf16[idx] = la_float_to_bf16(la_silu(sum));
+}
+
 extern "C" __global__ void linear_attention_scan_backward_f32(
     float* __restrict__ dqkv,
     float* __restrict__ dz,

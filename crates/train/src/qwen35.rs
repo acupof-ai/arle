@@ -14,7 +14,7 @@ use autograd::{
         LinearAttentionParams, MoeGroupedLinearExpert, MoeGroupedLinearInput, MoeGroupedRoute,
         MoeTopK, add, add_broadcast, all_gather_seq, all_reduce_sum, cat_seq,
         causal_sdpa_recompute, causal_sdpa_recompute_with_q_start, causal_sdpa_with_q_start,
-        checkpoint_sequential, embedding, linear_attention_core, linear_attention_core_with_carry,
+        checkpoint_sequential, embedding, linear_attention_boundary, linear_attention_core,
         linear_attention_core_with_carry_taped, linear_attention_ctx_bytes, matmul_bt_with_site,
         moe_grouped_linear, moe_grouped_weighted_scatter, moe_topk_softmax,
         moe_topk_softmax_with_indices, mul, repeat_kv, reshape, rmsnorm, rope, sigmoid, silu,
@@ -2436,11 +2436,7 @@ impl Qwen35Layer {
         Ok(attn.out_proj.forward(linear, store, tape)?)
     }
 
-    /// OPD frozen-prompt-KV phase 1: run the gated-delta recurrence over the
-    /// prompt prefix (`h_prefix` = rows `0..gen_start`) off-tape via
-    /// `linear_attention_core_with_carry` with `capture_boundary=true`, returning
-    /// the boundary recurrent state + conv window as `requires_grad=false`
-    /// constants. The output is discarded (only the boundary carry matters).
+    /// Capture only the frozen prompt carry.
     #[allow(clippy::too_many_arguments)]
     fn forward_linear_attention_capture_prefix_state(
         &self,
@@ -2453,37 +2449,24 @@ impl Qwen35Layer {
         tape: &mut Tape,
     ) -> Result<PrefixState> {
         let qkv = attn.in_proj_qkv.forward(h_prefix, store, tape)?;
-        let z = attn.in_proj_z.forward(h_prefix, store, tape)?;
         let b_proj = attn.in_proj_b.forward(h_prefix, store, tape)?;
         let a_proj = attn.in_proj_a.forward(h_prefix, store, tape)?;
-        let (_, final_state, conv_window) = linear_attention_core_with_carry(
+        let (state, conv_window) = linear_attention_boundary(
             qkv,
-            z,
             b_proj,
             a_proj,
             attn.conv1d_weight,
             attn.dt_bias,
             attn.a_log,
-            attn.norm,
             la_params(cfg, batch, gen_start),
             None,
             None,
-            true,
             store,
         )?;
-        let state = final_state.ok_or(Qwen35Error::InvalidConfig(
-            "linear-attention prefix capture must return a boundary state",
-        ))?;
-        let conv_window = conv_window.ok_or(Qwen35Error::InvalidConfig(
-            "linear-attention prefix capture must return a conv window",
-        ))?;
         Ok(PrefixState { state, conv_window })
     }
 
-    /// OPD frozen-prompt-KV phase 2: TAPED gated-delta recurrence over the gen
-    /// rows only (`h_gen` = rows `gen_start..seq_len`), seeded from the captured
-    /// prefix `(state, conv_window)` so the suffix is reproduced exactly. Grad
-    /// flows into the gen rows' projections; the carry is a constant.
+    /// Train generated rows from the frozen prompt carry.
     #[allow(clippy::too_many_arguments)]
     fn forward_linear_attention_gen_segment(
         &self,

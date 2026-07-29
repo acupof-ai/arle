@@ -1,5 +1,7 @@
 mod helpers;
 
+#[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
+use autograd::ops::linear_attention_boundary;
 use autograd::{
     Result, Tape, TensorStore,
     ops::{
@@ -1449,6 +1451,36 @@ fn cuda_linear_attention_qwen35_chunked_grad_matches_cpu() -> Result<()> {
         "cuda qwen35 chunked linear_attention",
         2.0e-2,
     )
+}
+
+#[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
+#[test]
+fn cuda_linear_attention_boundary_matches_cpu() -> Result<()> {
+    let params = qwen35_chunked_params(17);
+    let fixture = LinearAttentionFixture::new(params);
+    let (_, cpu_state) = la_full(&fixture, params)?;
+    let mut store = TensorStore::with_backend(Arc::new(CudaBackend::new(0)?));
+    let qd = qkv_dim(params);
+    let hd = params.num_value_heads;
+    let ids = [
+        store.from_slice(&fixture.qkv, &[1, params.seq_len, qd])?,
+        store.from_slice(&fixture.b_proj, &[1, params.seq_len, hd])?,
+        store.from_slice(&fixture.a_proj, &[1, params.seq_len, hd])?,
+        store.from_slice(&fixture.conv1d_weight, &[qd, params.conv_kernel])?,
+        store.from_slice(&fixture.dt_bias, &[hd])?,
+        store.from_slice(&fixture.a_log, &[hd])?,
+    ];
+    for id in ids {
+        store.ensure_device(id)?;
+    }
+    let (state, conv) = linear_attention_boundary(
+        ids[0], ids[1], ids[2], ids[3], ids[4], ids[5], params, None, None, &mut store,
+    )?;
+    let expected_conv =
+        &fixture.qkv[(params.seq_len - params.conv_kernel + 1) * qd..params.seq_len * qd];
+    assert!(max_abs_err(&store.to_host(state)?, &cpu_state) <= 1.0e-3);
+    assert!(max_abs_err(&store.to_host(conv)?, expected_conv) <= 1.0e-6);
+    Ok(())
 }
 
 #[cfg(all(feature = "cuda", not(feature = "no-cuda")))]
