@@ -1363,13 +1363,13 @@ fn cuda_embedding_backward_device_matches_cpu() {
     const H: usize = 160;
     const V: usize = 248_070;
     let upstream_shape: Vec<usize> = vec![1, B * S, H];
-    let upstream = rng_vec(0xE_B_07, B * S * H, 1.0);
+    let upstream = rng_vec(0xEB07, B * S * H, 1.0);
 
     // Part A — uniformly random indices (production-ish). Most are unique
     // because B*S=1024 << V=248070, but the kernel must remain correct under
     // ANY id distribution. Use `rng_ids` for a deterministic LCG sequence.
     let ids_random = rng_ids(0x1d5, B * S, V as i32);
-    let ids_random_i32: Vec<i32> = ids_random.iter().copied().collect();
+    let ids_random_i32 = ids_random.clone();
     let ids_random_usize: Vec<usize> = ids_random.iter().map(|&i| i as usize).collect();
 
     // Host reference uses the existing scatter_add reference path.
@@ -1927,19 +1927,18 @@ fn cuda_rms_norm_backward_device_matches_cpu() {
     // `Backend::rms_norm_backward_device` default impl).
     let rows = size / hidden;
     let mut inv_rms = vec![0.0_f32; rows];
-    for r in 0..rows {
+    for (r, inv) in inv_rms.iter_mut().enumerate() {
         let base = r * hidden;
         let mut sum_sq = 0.0_f32;
         for c in 0..hidden {
             let v = x[base + c];
             sum_sq += v * v;
         }
-        inv_rms[r] = 1.0 / ((sum_sq / hidden as f32) + eps).sqrt();
+        *inv = 1.0 / ((sum_sq / hidden as f32) + eps).sqrt();
     }
     let mut host_grad_x = vec![0.0_f32; size];
-    for r in 0..rows {
+    for (r, &inv) in inv_rms.iter().enumerate() {
         let base = r * hidden;
-        let inv = inv_rms[r];
         let mut dot = 0.0_f32;
         for c in 0..hidden {
             dot += upstream[base + c] * weight[c] * x[base + c];
@@ -1951,9 +1950,8 @@ fn cuda_rms_norm_backward_device_matches_cpu() {
         }
     }
     let mut host_grad_w = vec![0.0_f32; hidden];
-    for r in 0..rows {
+    for (r, &inv) in inv_rms.iter().enumerate() {
         let base = r * hidden;
-        let inv = inv_rms[r];
         for c in 0..hidden {
             host_grad_w[c] += upstream[base + c] * x[base + c] * inv;
         }
