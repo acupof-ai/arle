@@ -217,10 +217,15 @@ fn try_clip_grad_norm_device(params: &[TensorId], max_norm: f32, store: &mut Ten
 /// param — but it MUST still enter every collective or NCCL deadlocks the group.
 /// So a missing grad is materialized as a zero grad of the param's shape and
 /// reduced like any other (contributing 0 to the sum).
+///
+/// The per-position element counts are checked identical across ranks first
+/// (`assert_cp_param_layout_agrees`): NCCL has no size rendezvous, so an order
+/// mismatch would otherwise spin the GPU forever with no error.
 pub fn all_reduce_cp_grads(
     params: &[TensorId],
     store: &mut TensorStore,
 ) -> Result<(), AutogradError> {
+    assert_cp_param_layout_agrees(params, store)?;
     for &param_id in params {
         let grad_id = match store.get(param_id).and_then(|tensor| tensor.grad) {
             Some(grad_id) => grad_id,
@@ -256,6 +261,41 @@ pub fn all_reduce_cp_grads(
         };
         let reduced = store.backend().all_reduce_sum_device(&handle, &shape)?;
         store.replace_device_handle(grad_id, reduced)?;
+    }
+    Ok(())
+}
+
+/// Fail fast if the CP ranks disagree on the per-position param element counts.
+///
+/// `all_reduce_cp_grads` issues one collective per param by index; NCCL matches
+/// nothing about shape, so a divergent order (e.g. a HashMap-seeded param list)
+/// silently wedges the GPU. This gathers each rank's fixed-length count vector
+/// (same length on every rank — one entry per param — so the gather itself can
+/// never mismatch) and rejects the step the moment two ranks differ.
+fn assert_cp_param_layout_agrees(
+    params: &[TensorId],
+    store: &mut TensorStore,
+) -> Result<(), AutogradError> {
+    let n = params.len();
+    let local: Vec<f32> = params
+        .iter()
+        .map(|&id| store.get(id).map_or(0.0, |t| t.size as f32))
+        .collect();
+    let handle = store.backend().upload(&local, &[n])?;
+    let gathered = store.backend().all_gather_seq_device(&handle, &[n])?;
+    let gathered = store.backend().readback(&gathered)?;
+    let world = gathered.len() / n; // world==1 → identity, loop is a no-op
+    for rank in 1..world {
+        for i in 0..n {
+            if gathered[rank * n + i] != gathered[i] {
+                return Err(AutogradError::TapeInvariant(
+                    "CP param layout diverges across ranks: gradient all-reduce \
+                     would pair mismatched shapes into one NCCL collective. The \
+                     per-rank trainable-param order must be identical (no HashMap \
+                     iteration in its construction).",
+                ));
+            }
+        }
     }
     Ok(())
 }
