@@ -33,6 +33,19 @@ impl SeqShard {
     pub fn contains(self, pos: usize) -> bool {
         pos >= self.start && pos < self.end
     }
+
+    /// Filter `(global_position, target)` loss pairs to those this shard owns,
+    /// rebased to shard-local row indices. A target at global position `p` lives on
+    /// the shard containing `p`; its local row is `p - start`. The global target
+    /// count (for `inv_n = 1/global_targets`) is the sum of per-shard lengths.
+    pub fn local_targets(self, positions: &[usize], targets: &[u32]) -> (Vec<usize>, Vec<u32>) {
+        positions
+            .iter()
+            .zip(targets)
+            .filter(|&(&p, _)| self.contains(p))
+            .map(|(&p, &t)| (p - self.start, t))
+            .unzip()
+    }
 }
 
 impl CpContext {
@@ -48,11 +61,12 @@ impl CpContext {
         self.size > 1
     }
 
-    /// This rank's sequence shard of a `seq_len`-long trajectory. Even split when
-    /// `seq_len % size == 0`; otherwise the remainder rows go to the LAST rank
-    /// (equal-length shards are an NCCL all-gather precondition, so callers that
-    /// need the ring should pad to a multiple — the remainder path keeps a
-    /// single-node run correct meanwhile).
+    /// This rank's sequence shard of a `seq_len`-long trajectory. Delegates to the
+    /// canonical even-split-remainder-to-last-rank formula (`lora_shard::shard_range`
+    /// → `infer_topo::column_shard`), so CP sequence shards line up with how base
+    /// weights and LoRA deltas are split. Equal-length shards when `seq_len % size
+    /// == 0` (an NCCL all-gather precondition); the remainder path keeps a single
+    /// node correct, callers needing the ring pad to a multiple.
     pub fn shard(self, seq_len: usize) -> SeqShard {
         if self.size <= 1 {
             return SeqShard {
@@ -60,31 +74,11 @@ impl CpContext {
                 end: seq_len,
             };
         }
-        let base = seq_len / self.size;
-        let start = self.rank * base;
-        let end = if self.rank + 1 == self.size {
-            seq_len
-        } else {
-            start + base
-        };
-        SeqShard { start, end }
-    }
-
-    /// Filter `(global_position, target)` loss pairs to those the local shard owns,
-    /// rebased to shard-local row indices. A target at global position `p` lives on
-    /// the rank whose shard contains `p`; its local row is `p - shard.start`.
-    pub fn local_targets(
-        self,
-        shard: SeqShard,
-        positions: &[usize],
-        targets: &[u32],
-    ) -> (Vec<usize>, Vec<u32>) {
-        positions
-            .iter()
-            .zip(targets)
-            .filter(|&(&p, _)| shard.contains(p))
-            .map(|(&p, &t)| (p - shard.start, t))
-            .unzip()
+        let range = crate::lora_shard::shard_range(seq_len, self.rank, self.size);
+        SeqShard {
+            start: range.start,
+            end: range.end,
+        }
     }
 }
 
@@ -150,19 +144,15 @@ mod tests {
         let positions = vec![1usize, 4, 7];
         let targets = vec![100u32, 200, 300];
 
-        let (p0, t0) = CpContext::new(0, size).local_targets(
-            CpContext::new(0, size).shard(seq),
-            &positions,
-            &targets,
-        );
+        let (p0, t0) = CpContext::new(0, size)
+            .shard(seq)
+            .local_targets(&positions, &targets);
         assert_eq!(p0, vec![1]); // pos 1 → local row 1
         assert_eq!(t0, vec![100]);
 
-        let (p1, t1) = CpContext::new(1, size).local_targets(
-            CpContext::new(1, size).shard(seq),
-            &positions,
-            &targets,
-        );
+        let (p1, t1) = CpContext::new(1, size)
+            .shard(seq)
+            .local_targets(&positions, &targets);
         assert_eq!(p1, vec![0, 3]); // pos 4→row 0, pos 7→row 3
         assert_eq!(t1, vec![200, 300]);
 
