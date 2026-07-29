@@ -1,5 +1,11 @@
 # OPD writeback 显存墙：逐 op 实测归因与无损 128K 单卡路径
 
+> **Superseded (2026-07-29)** by
+> [`docs/plans/2026-07-29-single-gpu-256k-training-repair.md`](../plans/2026-07-29-single-gpu-256k-training-repair.md),
+> the single current capability page. The per-op attribution below remains
+> accurate as a decomposition; the up-to-date single-GPU ladder and terminal
+> ceiling live in that plan's T5.
+
 ## Correction (2026-07-28, post-Move-1 `e736c485a`, backward per-op probe)
 
 Move 1 (free dead MLP+LoRA transients in the tape-disabled forward, commit
