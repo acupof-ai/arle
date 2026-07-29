@@ -205,3 +205,57 @@ fn try_clip_grad_norm_device(params: &[TensorId], max_norm: f32, store: &mut Ten
     }
     true
 }
+
+/// All-reduce-sum every trainable param's gradient across the context-parallel
+/// group. CP replicates weights and shards the sequence, so each rank holds its
+/// shard's contribution to the (replicated) weight grad; summing over the group
+/// gives the exact single-card grad. Must run AFTER backward and BEFORE the
+/// optimizer step, and only reduce `trainable_params` (activation grads stay
+/// local).
+///
+/// A rank whose sequence shard owns zero masked targets produces NO grad for a
+/// param — but it MUST still enter every collective or NCCL deadlocks the group.
+/// So a missing grad is materialized as a zero grad of the param's shape and
+/// reduced like any other (contributing 0 to the sum).
+pub fn all_reduce_cp_grads(
+    params: &[TensorId],
+    store: &mut TensorStore,
+) -> Result<(), AutogradError> {
+    for &param_id in params {
+        let grad_id = match store.get(param_id).and_then(|tensor| tensor.grad) {
+            Some(grad_id) => grad_id,
+            None => {
+                // Zero grad of the param's shape so this rank still participates.
+                let shape = store
+                    .get(param_id)
+                    .ok_or(AutogradError::InvalidTensorId(param_id))?
+                    .shape
+                    .clone();
+                let zero = store.backend().zeros(&shape)?;
+                let zero_id = store.alloc_device_tensor(shape, zero)?;
+                store.accumulate_grad(param_id, zero_id)?;
+                store
+                    .get(param_id)
+                    .and_then(|tensor| tensor.grad)
+                    .expect("grad set by accumulate_grad")
+            }
+        };
+        store.ensure_device(grad_id)?;
+        let (handle, shape) = {
+            let grad = store
+                .get(grad_id)
+                .ok_or(AutogradError::InvalidTensorId(grad_id))?;
+            let handle = grad
+                .device_handle
+                .as_ref()
+                .ok_or(AutogradError::TapeInvariant(
+                    "all_reduce_cp_grads: grad missing device handle after ensure_device",
+                ))?
+                .clone();
+            (handle, grad.shape.clone())
+        };
+        let reduced = store.backend().all_reduce_sum_device(&handle, &shape)?;
+        store.replace_device_handle(grad_id, reduced)?;
+    }
+    Ok(())
+}

@@ -57,6 +57,21 @@ impl CpContext {
         Self { rank, size }
     }
 
+    /// Read the CP group from the launcher's env (`ARLE_TRAIN_CP_RANK` /
+    /// `ARLE_TRAIN_CP_SIZE`). Defaults to `single()` when unset — the byte-identical
+    /// single-card path — so callers can read it unconditionally.
+    pub fn from_env() -> Self {
+        let rank = std::env::var("ARLE_TRAIN_CP_RANK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let size = std::env::var("ARLE_TRAIN_CP_SIZE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1);
+        Self { rank, size }
+    }
+
     pub fn is_enabled(self) -> bool {
         self.size > 1
     }

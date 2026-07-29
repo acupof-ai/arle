@@ -2790,6 +2790,7 @@ pub fn rubric_writeback_ce_step_batched<O: Optimizer>(
             &position_indices,
             &target_tokens,
             chunk_rows,
+            None,
             store,
             &mut tape,
         )
@@ -3022,6 +3023,7 @@ pub fn masked_writeback_ce_step<O: Optimizer>(
         response_mask,
         vocab,
         window_size,
+        crate::context_parallel::CpContext::single(),
         store,
     )
     .map(|(loss, _)| loss)
@@ -3084,6 +3086,7 @@ pub fn masked_writeback_step<O: Optimizer>(
     response_mask: &[u8],
     vocab: usize,
     window_size: usize,
+    cp: crate::context_parallel::CpContext,
     store: &mut TensorStore,
 ) -> Result<(f32, PgStats)> {
     if prompt_ids.is_empty() {
@@ -3125,15 +3128,28 @@ pub fn masked_writeback_step<O: Optimizer>(
     let total_targets = loss_targets.len();
     let chunk_rows = window_size; // reused: positions per fused-CE chunk.
 
+    // Context-parallel sequence shard: this rank owns absolute rows
+    // [shard.start, shard.end). `total_targets` stays GLOBAL (built over `full`)
+    // so inv_n = 1/global weights every rank's grad correctly; the post-backward
+    // all-reduce-sum then yields the exact global mean.
+    let shard = cp.shard(seq_len);
+    // inv_n override only under CP (single-card keeps the fused op's local default,
+    // byte-identical). Under CP local == global at the op, so we must pass global.
+    let inv_n_override = cp.is_enabled().then(|| 1.0_f32 / total_targets as f32);
+
     // Frozen-prompt-KV: forward only the gen segment, rebasing masked positions
     // into it. gen_start=0 keeps positions absolute for the byte-identical full
     // path. Every masked target p >= prompt_len-1 = gen_start, so p-gen_start>=0.
-    let frozen = crate::runtime_flags::writeback_frozen_prompt_kv() && prompt_len > 1;
+    // Disabled under CP (the gen-segment path is single-rank; CP shards the full
+    // sequence instead).
+    let frozen =
+        crate::runtime_flags::writeback_frozen_prompt_kv() && prompt_len > 1 && !cp.is_enabled();
     let gen_start = if frozen { prompt_len - 1 } else { 0 };
 
     // Split the (predicting-position p, target token) pairs into the parallel
     // i32 index/target arrays the fused chunked CE consumes. `p` indexes the
-    // hidden tensor's sequence rows; the targets are the hard next tokens.
+    // hidden tensor's sequence rows; the targets are the hard next tokens. Under
+    // CP, filter to this shard's rows and rebase p -> p - shard.start.
     let mut position_indices: Vec<i32> = Vec::with_capacity(total_targets);
     let mut target_tokens: Vec<i32> = Vec::with_capacity(total_targets);
     for &(p, target) in &loss_targets {
@@ -3144,8 +3160,15 @@ pub fn masked_writeback_step<O: Optimizer>(
                 "masked writeback target token {target} at position {p} exceeds vocab={vocab}"
             )));
         }
-        position_indices.push((p - gen_start) as i32);
-        target_tokens.push(target as i32);
+        if cp.is_enabled() {
+            if shard.contains(p) {
+                position_indices.push((p - shard.start) as i32);
+                target_tokens.push(target as i32);
+            }
+        } else {
+            position_indices.push((p - gen_start) as i32);
+            target_tokens.push(target as i32);
+        }
     }
 
     let mut tape = Tape::new();
@@ -3182,6 +3205,17 @@ pub fn masked_writeback_step<O: Optimizer>(
             .map_err(|err| {
                 map_qwen35_forward_error("masked writeback frozen-prompt-KV student hidden", err)
             })?
+    } else if cp.is_enabled() {
+        // CP: embed only this rank's shard rows; attention gathers the full KV.
+        // positions carry ABSOLUTE ids so RoPE cos/sin match the gathered prefix.
+        student
+            .forward_hidden_states(
+                store,
+                &mut tape,
+                &full[shard.start..shard.end],
+                &positions[shard.start..shard.end],
+            )
+            .map_err(|err| map_qwen35_forward_error("masked writeback CP student hidden", err))?
     } else {
         student
             .forward_hidden_states(store, &mut tape, &full, &positions)
@@ -3205,6 +3239,7 @@ pub fn masked_writeback_step<O: Optimizer>(
                 &position_indices,
                 &target_tokens,
                 chunk_rows,
+                inv_n_override,
                 store,
                 &mut tape,
             )
@@ -3217,6 +3252,15 @@ pub fn masked_writeback_step<O: Optimizer>(
             form,
             kl_coef,
         } => {
+            // PG under CP needs per-shard rollout_logprobs/weight + a global-count
+            // inv_n in the PG op — deferred (brick scope is CE writeback). CE is the
+            // agent-OPD writeback loss; PG-CP lands with the PG inv_n_override.
+            if cp.is_enabled() {
+                return Err(OpdError::InvalidInput(
+                    "context-parallel writeback supports the CE loss only (PG-CP deferred)"
+                        .to_owned(),
+                ));
+            }
             if rollout_logprobs.len() != total_targets || weight.len() != total_targets {
                 return Err(OpdError::InvalidInput(format!(
                     "masked writeback PG rollout_logprobs/weight len {}/{} != masked targets {total_targets}",
@@ -3245,11 +3289,22 @@ pub fn masked_writeback_step<O: Optimizer>(
     validate_loss_value(loss_value)?;
     let ce_secs = t_ce.elapsed().as_secs_f64();
     eprintln!("[masked-writeback] phase=fused_ce seconds={ce_secs:.3}");
+    // Return forward's ~40 GB checkpoint hoard to the driver so backward gets the
+    // full envelope (frees pages only; live grads stay).
+    store.backend().trim_memory_pool().ok();
     let t_bwd = Instant::now();
     backward_with_optional_profile(loss, loss_value, store, &mut tape)?;
     let bwd_secs = t_bwd.elapsed().as_secs_f64();
     let vram_post_backward = log_writeback_vram(store, "masked-writeback", "post backward");
     eprintln!("[masked-writeback] phase=backward seconds={bwd_secs:.3}");
+    // Context-parallel: weights are replicated across the CP group, so each rank's
+    // shard produced only its contribution to every weight grad. All-reduce-sum the
+    // trainable grads to the exact global grad — MUST be after backward and before
+    // the optimizer step, and gated on `step_optimizer` so PG's grad-accumulation
+    // (step_optimizer=false) doesn't re-scale earlier microsteps by `size`.
+    if cp.is_enabled() && step_optimizer {
+        crate::grad_clip::all_reduce_cp_grads(trainable_params, store).map_err(OpdError::from)?;
+    }
     // Pre-step grad-norm telemetry. The prod `clip_grad_norm` logger sits on the
     // non-writeback OPD paths; the agentic-OPD writeback steps the optimizer here
     // directly, so surface the global L2 norm at this step too (env-gated).
@@ -3767,6 +3822,7 @@ pub fn masked_writeback_ce_step_frozen_prompt_kv<O: Optimizer>(
         &position_indices,
         &target_tokens,
         chunk_rows,
+        None,
         store,
         &mut tape,
     )
@@ -3813,9 +3869,10 @@ pub fn masked_writeback_ce_step_dispatch<O: Optimizer>(
     response_mask: &[u8],
     vocab: usize,
     window_size: usize,
+    cp: crate::context_parallel::CpContext,
     store: &mut TensorStore,
 ) -> Result<f32> {
-    let frozen = crate::runtime_flags::writeback_frozen_prompt_kv();
+    let frozen = crate::runtime_flags::writeback_frozen_prompt_kv() && !cp.is_enabled();
     if frozen {
         masked_writeback_ce_step_frozen_prompt_kv(
             student,
@@ -3830,18 +3887,22 @@ pub fn masked_writeback_ce_step_dispatch<O: Optimizer>(
             store,
         )
     } else {
-        masked_writeback_ce_step(
+        masked_writeback_step(
+            WritebackLoss::Ce,
             student,
             all_model_params,
             trainable_params,
             optimizer,
+            true,
             prompt_ids,
             response_ids,
             response_mask,
             vocab,
             window_size,
+            cp,
             store,
         )
+        .map(|(loss, _)| loss)
     }
 }
 
