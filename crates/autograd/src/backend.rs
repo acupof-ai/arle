@@ -125,6 +125,14 @@ impl CudaStorage {
     pub(crate) fn slice(&self) -> &cudarc::driver::CudaSlice<f32> {
         self.inner.as_ref()
     }
+
+    /// Strong-count of the backing device buffer. `1` means this handle is the
+    /// sole owner, so an in-place mutation cannot corrupt a sibling that shares
+    /// the same `Arc` (grads fan out by refcount clone, not deep copy — see
+    /// `clone_tensor`). Used to gate in-place gradient accumulation.
+    pub(crate) fn strong_count(&self) -> usize {
+        Arc::strong_count(&self.inner)
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -274,6 +282,23 @@ pub enum DeviceHandle {
     CudaBf16(CudaBf16Storage),
     #[cfg(feature = "cuda")]
     CudaFp8BlockScaled(CudaFp8BlockScaledStorage),
+}
+
+impl DeviceHandle {
+    /// Strong-count of the backing device buffer when it lives on a refcounted
+    /// device allocation (CUDA f32). `Some(1)` means this handle is the sole
+    /// owner and an in-place mutation is safe; `Some(n>1)` means a sibling
+    /// aliases the same buffer (grads fan out by `Arc` clone — see
+    /// `clone_tensor`) so in-place would corrupt it. `None` for handles with no
+    /// meaningful single-owner semantics here (CPU/Metal/bf16/fp8), which the
+    /// caller treats as "not provably unique" → allocating fallback.
+    pub fn device_buffer_strong_count(&self) -> Option<usize> {
+        match self {
+            #[cfg(feature = "cuda")]
+            DeviceHandle::Cuda(storage) => Some(storage.strong_count()),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
