@@ -1289,7 +1289,11 @@ fn merge_grad(
             }
         }
         if should_store_grad {
-            store.accumulate_grad(tensor_id, new_grad_id)?;
+            if keep_in_grads {
+                store.accumulate_grad(tensor_id, new_grad_id)?;
+            } else {
+                store.accumulate_grad_owned(tensor_id, new_grad_id)?;
+            }
         }
         if new_grad_id != existing_grad_id && store.get(new_grad_id).is_some() {
             store.free(new_grad_id)?;
@@ -1301,7 +1305,7 @@ fn merge_grad(
         }
     } else {
         if should_store_grad {
-            store.accumulate_grad(tensor_id, new_grad_id)?;
+            store.accumulate_grad_owned(tensor_id, new_grad_id)?;
         }
         if store.get(new_grad_id).is_some() {
             store.free(new_grad_id)?;
