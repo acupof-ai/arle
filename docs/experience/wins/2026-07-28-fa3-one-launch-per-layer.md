@@ -69,6 +69,29 @@ An occupancy-only fix was measured first and is strictly worse:
 `--qwen35-fa3-decode-splits` 8→32 buys c=16 TPOT 105.14 → 70.71 ms (1.49×) and
 still pays 16 serialized launches and 16 combines. Batching subsumes it.
 
+## Open after this
+
+- **MoE expert decode is now the wall** — `dsv4_fp8_grouped_{down,swiglu}_decode`
+  at 53.9% of GPU time, 1,025 µs/layer against an ~89 µs weight-read roofline
+  (R=128, ~113 active experts, FP8, 4 TB/s). ncu: DRAM 5-12%, SM 20-25%, L2
+  5-9%, occupancy 20-27% against a 25-37.5% theoretical ceiling set by 72/86
+  registers, waves/SM 105. Neither bandwidth- nor compute-bound — latency-bound
+  with occupancy too low to hide it.
+  Three replacements measured and rejected: the batch kernels are 10.8× worse
+  at c=16 (`--qwen35-moe-decode-kernel false`); DeepGEMM masked FP8 exists
+  upstream and is the sm90 best practice, but its band is O(E) — 256 experts at
+  EP=1 means 32,768 padded rows for 128 real ones and a 524k-block pack grid;
+  DeepGEMM contiguous pads per group the same way. Both grouped layouts assume
+  few experts with many rows each. The remaining path is the hand kernel itself:
+  cp.async/TMA pipelining, registers to ≤64, persistent tile scheduler.
+- **Dense carries a prefill-blocking tail MoE does not** — 17.3% of inter-token
+  gaps exceed 3× p50 and carry 55.4% of decode wall at c=16 (p90 426 vs p50 66.6
+  ms), against 6.1%/21.7% for MoE. Nothing regressed: the steady-state step got
+  1.62× faster and the spikes did not, so dense TPOT moves 1.35× while its p50
+  moves 1.62×. Scheduler-side, not kernel-side.
+- **Dense loses 2/128 requests per point** (never finish, not errors). MoE is
+  128/128. Unexplained.
+
 ## Rule
 
 **A per-row loop around a batched kernel is a claim about the kernel's API —

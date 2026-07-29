@@ -27,140 +27,59 @@ python3 scripts/gen_bench_prompts.py bench-agent-119k-16x8.jsonl 16 119000 214 8
 
 ## Qwen3.6 on 1×H20 · single-GPU · eager — LONG-AGENT ANCHOR
 
-### CHAMPION — `a956f69b1` (2026-07-28) · host-authoritative KV mirror + batched FA3
-
-Both no-spec arms on `arle-fa3b2`. Same dataset, seed, runner as the table
-below; MoE on one GPU, dense on another, same box.
+### CHAMPION — `a956f69b1` (2026-07-28) · KV mirror + batched FA3 · `arle-fa3b2`
 
 | c | arm | TTFT cold | TTFT warm | TPOT | ITL p50 | decode tok/s | total tok/s |
 |---|---|---:|---:|---:|---:|---:|---:|
-| 1 | MoE no-spec | 9.2 s | **0.7 s** | 16.22 ms | 16.17 ms | 61.7 | 6707.2 |
-| 8 | MoE no-spec | 0.6 s | 0.5 s | **44.10 ms** | 38.31 ms | 22.7 | **27967.8** |
-| 16 | MoE no-spec | 1.8 s | 0.6 s | **73.74 ms** | 60.90 ms | 13.6 | **33858.9** |
-| 1 | dense no-spec | 19.0 s | **1.0 s** | 28.83 ms | 28.78 ms | 34.7 | 5028.2 |
-| 8 | dense no-spec | 1.2 s | 0.5 s | **81.87 ms** | 52.30 ms | 12.2 | **24702.9** |
-| 16 | dense no-spec | 4.2 s | 0.7 s | **122.15 ms** | 66.55 ms | 8.2 | **30045.6** |
+| 1 | MoE no-spec | 9.2 s | 0.7 s | 16.22 ms | 16.17 ms | 61.7 | 6707.2 |
+| 8 | MoE no-spec | 0.6 s | 0.5 s | 44.10 ms | 38.31 ms | 22.7 | 27967.8 |
+| 16 | MoE no-spec | 1.8 s | 0.6 s | 73.74 ms | 60.90 ms | 13.6 | 33858.9 |
+| 1 | dense no-spec | 19.0 s | 1.0 s | 28.83 ms | 28.78 ms | 34.7 | 5028.2 |
+| 8 | dense no-spec | 1.2 s | 0.5 s | 81.87 ms | 52.30 ms | 12.2 | 24702.9 |
+| 16 | dense no-spec | 4.2 s | 0.7 s | 122.15 ms | 66.55 ms | 8.2 | 30045.6 |
 
-0 errors at all six points; needle gate exact=3 DET at 512/4k/16k/32k. MoE
-128/128 complete; dense 126/128 (two requests per point never finished —
-unexplained, not an error, still open).
+ITL p50 fit: MoE `15.7 + 2.82·B` ms, dense `38.0 + 1.78·B` ms.
+Gate exact=3 DET at 512/4k/16k/32k. 0 errors. MoE 128/128, dense 126/128.
 
-Two changes stack here, both measured separately:
-
-1. **The KV mirror** ([entry](experience/wins/2026-07-28-qwen35-host-authoritative-kv-mirror.md))
-   — qwen35 dropped its second device allocator, so a radix hit costs a page-table
-   mirror instead of a host KV round-trip. Warm TTFT stops scaling with prefix
-   length: 33k 3.020 → 0.175 s, flat across a 8× span.
-2. **Batched FA3** ([entry](experience/wins/2026-07-28-fa3-one-launch-per-layer.md))
-   — paged full attention was launched once per row per layer. One launch per
-   layer now: nsys shows 34,212 → 3,049 launches over the same window, FA3's
-   share of GPU time 44.3% → 19.6%.
-
-**The decode step still scales as `a + b·B`, but `b` fell.** Fitting ITL p50 at
-c=8/16: MoE `12.7 + 5.12·B` → `15.7 + 2.82·B`, dense `24.6 + 5.19·B` →
-`38.0 + 1.78·B`. Dense gains more on the marginal because it has 16
-full-attention layers to MoE's 10, i.e. more per-row launches to delete. (The
-dense fit is two points over a heavy tail — treat its intercept as indicative.)
-
-- **c=1 is untouched by design** — 16.03 → 16.22 ms (MoE), 28.68 → 28.83 ms
-  (dense). One row is one launch either way; the whole win is in the batch.
-- **MoE expert decode is now the wall**: `dsv4_fp8_grouped_{down,swiglu}_decode`
-  are 53.9% of GPU time at 1,025 µs/layer against an ~89 µs weight-read roofline
-  at R=128 (113 active experts × 3.15 MB FP8 at 4 TB/s). The kernels are tuned
-  for `B ≤ ACT_TILE(8)` (`moe.rs:120`), where each weight row is read once; B=16
-  should cost 2 passes, not 11×. Unexplained — ncu, not arithmetic, is next.
-- **Dense has a tail problem MoE does not, and it got relatively worse.** 17.3%
-  of dense inter-token gaps exceed 3× p50 and carry **55.4%** of decode wall at
-  c=16 (was 10.7%/35.2%), against 6.1%/21.7% for MoE. Nothing regressed — the
-  steady-state step got 1.62× faster, so the prefill-blocking spikes now dominate
-  the mean. Dense prefill is ~2× slower per token than MoE's, so its chunks block
-  decode longer. This is why dense TPOT only moves 1.35× while its p50 moves
-  1.62×.
-- **`prefill tok/s` is not meaningful on either arm** — warm TTFT is dominated by
-  cache-hit bookkeeping, so `prompt_tokens / TTFT` measures the hit, not a
-  compute rate. Dropped from the table rather than reported as throughput.
-
-### PRIOR — `55bf627bc` (2026-07-28) · FA3 paged, qlen ≤ 64
-
-Three arms, one binary (`arle-fa3c`), one session, one dataset. Models:
-`bottlecapai/ThinkingCap-Qwen3.6-27B-FP8` (~29 GB dense, canonical CUDA agentic
-model) and `Qwen3.6-35B-A3B-FP8` (MoE, 3B active). Both TP=1, qwen35 hybrid,
-head_dim 256 — they share `full_attention_paged` and diverge only at the FFN.
-
-Dataset `bench-agent-32k-16x8.jsonl`, sha256 `8867f63eaac2f053…`, regenerable via
-`gen_bench_prompts.py bench-agent-32k-16x8.jsonl 16 32000 214 8` (16 sessions ×
-8 turns; sessions ≥ max concurrency, rule 5). Runner `bench_throughput.py`,
-128 req/point, `--concurrency-grid 1,8,16`, max_tokens 214, greedy, seed
-20260416, `--max-running-requests 16`. `prompt_tokens` p50 34828. Needle gate
-exact=3 DET at 512/4k/16k/32k on every arm. 0 errors at all 9 points.
-
-**Prefill and decode are separate SLOs — never averaged into one tok/s.**
-Prefill = TTFT and `prompt_tokens / TTFT`. Decode = token-weighted mean ITL
-(`Σ itl_s / count`), which is the only decode metric valid on a spec arm: a
-whole accepted chain lands per step, so ITL p50 there is ~0.02 ms and
-meaningless. Never use `e2e − ttft` — this harness carries ~4.7 s of
-post-stream teardown in `e2e`, inflating TPOT ~1.85×. Cold = each session's
-turn 0 (nothing to reuse); warm = turns 1-7. `total tok/s` counts prompt +
-generated tokens over wall time: a capacity number, not a latency one.
+### PRIOR — `55bf627bc` (2026-07-28) · FA3 paged, qlen ≤ 64 · `arle-fa3c`
 
 | c | arm | TTFT cold | TTFT warm | prefill tok/s | TPOT | decode tok/s | total tok/s |
 |---|---|---:|---:|---:|---:|---:|---:|
 | 1 | dense no-spec | 48.7 s | 14.2 s | 4252 | 28.71 ms | 34.8 | 1403.3 |
-| 1 | dense DSpark 16 | 48.3 s | 13.3 s | 3801 | **9.39 ms** | **106.6** | 1504.8 |
-| 1 | MoE no-spec | 18.6 s | 4.8 s | **10991** | 15.93 ms | 62.8 | 3174.0 |
+| 1 | dense DSpark 16 | 48.3 s | 13.3 s | 3801 | 9.39 ms | 106.6 | 1504.8 |
+| 1 | MoE no-spec | 18.6 s | 4.8 s | 10991 | 15.93 ms | 62.8 | 3174.0 |
 | 8 | dense no-spec | 21.9 s | 15.3 s | 4416 | 908.39 ms | 1.1 | 2007.7 |
 | 8 | dense DSpark 16 | 22.7 s | 15.7 s | 4301 | 838.64 ms | 1.2 | 2140.7 |
-| 8 | MoE no-spec | 10.9 s | 3.4 s | 11268 | 224.29 ms | 4.5 | **5689.0** |
+| 8 | MoE no-spec | 10.9 s | 3.4 s | 11268 | 224.29 ms | 4.5 | 5689.0 |
 | 16 | dense no-spec | 75.2 s | 26.9 s | 4071 | 1822.09 ms | 0.5 | 2027.4 |
 | 16 | dense DSpark 16 | 72.3 s | 23.8 s | 4231 | 1755.26 ms | 0.6 | 2132.3 |
 | 16 | MoE no-spec | 27.5 s | 8.1 s | 10701 | 453.79 ms | 2.2 | 5759.6 |
 
-Cold/warm decode at c=1: dense no-spec 27.58/28.99 ms, DSpark 11.91/**8.77 ms
-(114.1 tok/s warm)**, MoE 14.98/16.10 ms. DSpark is the only arm that gets
-*faster* warm — a hit prefix leaves the drafter more context to work with.
+Cold/warm decode at c=1: dense no-spec 27.58/28.99 ms, DSpark 11.91/8.77 ms,
+MoE 14.98/16.10 ms. Gate exact=3 DET on every arm. 0 errors.
 
-- **DSpark is 3.06× per token at c=1** (9.39 vs 28.71 ms), up from 1.48× before
-  the verify path reached FA3. A verify step costs 9.39 × E[k+1]=3.19 ≈ 30.0 ms
-  against a 28.71 ms decode step — **1.04×**, the physical floor, since
-  verifying 17 tokens reads the same KV bytes as verifying 1.
-  [entry](experience/wins/2026-07-28-fa3-covers-every-query-length.md)
-- **The spec win decays with concurrency: 3.06× (c=1) → 1.08× (c=8) → 1.04×
-  (c=16).** Expected, not a defect — once the batch is full the GPU is already
-  saturated with real tokens and there is no idle capacity for drafts to
-  reclaim. Total tok/s still moves +6.6% at c=8.
-- **MoE beats dense on every axis at equal spec setting** — 1.80× decode
-  (62.8 vs 34.8), 2.6× prefill, 2.26× total at c=1 — on the *identical* FA3
-  kernel at GQA 8. Comparing MoE against the DSpark row is apples to oranges.
-- **All three arms hit the same wall at c=8**: c=8→16 buys +0.7% (dense
-  no-spec), −0.4% (DSpark), +1.2% (MoE) total tok/s while TPOT doubles. Model-
-  and spec-independent, so it is queueing, not compute — ITL p50 at c=8 is
-  66.07 ms (no-spec) vs 66.19 ms (DSpark), and p90 is 4035 vs 3823 ms.
-  **Partly withdrawn**: most of this wall was requests serialized behind
-  per-turn sidecar restores, not the scheduler — the KV-mirror champion above
-  takes MoE c=8 TPOT to 61.40 ms with no scheduler change.
-- **FA3 on prefill chunks is a wash and is capped anyway** — `FA3_MAX_QLEN = 64`
-  keeps prefill on TileLang; FA3 needs one launch per request when `seqused_k`
-  is set, which cost 51% of TTFT at c=8.
-  [entry](experience/errors/2026-07-28-fa3-prefill-per-request-launch-regression.md)
-- **FA3 paged is the delta vs anything before 2026-07-27**: decode mean ITL
-  76.98 → 28.64 ms at c=1 on the same dataset.
-  [entry](experience/wins/2026-07-27-fa3-paged-decode-32k-2.76x.md)
-- sm_90 only: FA3 hopper is Hopper-only; other targets keep the TileLang
-  `batch_decode_paged_hd256` kernel.
-- c=4 not measured (grid is 1,8,16). MoE has no DSpark arm (no drafter).
+### Environment (both rows above)
 
-**Superseded fingerprints** (deleted 2026-07-28 — one dataset per question,
-rule 5). What survives them:
+- **Box** 1×H20 (sm_90, 78 SM), TP=1, eager, `--max-running-requests 16`.
+- **Models** `bottlecapai/ThinkingCap-Qwen3.6-27B-FP8` (dense, 64 layers, 16
+  full-attn, kv_heads 4) · `Qwen3.6-35B-A3B-FP8` (MoE, 40 layers, 10 full-attn,
+  kv_heads 2, 256 experts, top_k 8). Both qwen35 hybrid, head_dim 256.
+- **Dataset** `bench-agent-32k-16x8.jsonl`, sha256 `8867f63eaac2f053…`,
+  `gen_bench_prompts.py bench-agent-32k-16x8.jsonl 16 32000 214 8`.
+  `prompt_tokens` p50 34828.
+- **Runner** `bench_throughput.py`, 128 req/point, `--concurrency-grid 1,8,16`,
+  max_tokens 214, greedy, seed 20260416.
+- **Gate** `needle_gate.py 512,4096,16384,32768 3 0.0`.
+- **Metric definitions** TTFT and decode are separate SLOs, never averaged.
+  Decode = token-weighted mean ITL (`Σ itl_s / count`); ITL p50 is the
+  steady-state step. Never `e2e − ttft` (this harness carries ~4.7 s teardown,
+  inflating TPOT ~1.85×). Cold = session turn 0, warm = turns 1-7. `total tok/s`
+  = prompt+generated over wall: capacity, not latency.
 
-- 2026-07-25 short-prompt row (`6aa4ca6d1`, `dspark_natural_128in_128out.jsonl`):
-  DSpark accept_rate 0.10–0.13, MTP ~0.17; per-slot KV `343360 tok / 22.5 GB`
-  no-spec vs `121920 tok / 8.0 GB` DSpark. Its headline "DSpark c=1 +57.5%" is
-  explained, not reproduced — the drafter was carrying a decode kernel that
-  cost 2.7× too much.
-- 2026-07-26 cold-cache row (`f4f419629`, `bench-agent-32k-64.jsonl`): cold
-  prefill at 33k ran ~540 tok/s, degrading from ~1270 at ~5k. Prefix hit rate
-  was 0 by construction, so it measured a machine nobody runs; the "~89% is
-  prefill" reading taken from it was already withdrawn.
+Analysis lives in the linked entries, not here:
+[KV mirror](experience/wins/2026-07-28-qwen35-host-authoritative-kv-mirror.md) ·
+[batched FA3](experience/wins/2026-07-28-fa3-one-launch-per-layer.md) ·
+[FA3 qlen coverage](experience/wins/2026-07-28-fa3-covers-every-query-length.md)
 
 ## DSv4-Flash-FP8 · 4×H20 · TP=4/EP=4 · eager · port 8000
 
