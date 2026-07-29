@@ -37,6 +37,8 @@ pub mod loss;
 pub mod model_family;
 #[path = "opd.rs"]
 pub mod opd;
+#[path = "pipeline_parallel.rs"]
+pub mod pipeline_parallel;
 #[path = "prompts.rs"]
 pub mod prompts;
 #[path = "qwen35.rs"]
