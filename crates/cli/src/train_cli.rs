@@ -2882,6 +2882,7 @@ fn run_agent_opd_replay(
                         &record.response_mask,
                         vocab,
                         args.writeback_window,
+                        train::context_parallel::CpContext::from_env(),
                         &mut store,
                     )
                     .with_context(|| format!("replay writeback ({:?})", record.label))?
@@ -3363,6 +3364,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
             &response_mask,
             vocab,
             args.writeback_window,
+            train::context_parallel::CpContext::from_env(),
             &mut store,
         )?;
         log_opd_vram("synthetic-writeback post-writeback", &train_backend);
