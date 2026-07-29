@@ -546,8 +546,7 @@ mod gpu {
         // a lowered floor falls back to the hand kernels instead of killing the
         // engine (measured 2026-07-28: `--qwen35-deepgemm-min-routes 64` at c=16
         // is R=128, exactly the masked band).
-        let fp8_masked_unsupported = weights.expert_weight_format
-            == WeightFormat::Fp8BlockScaled
+        let fp8_masked_unsupported = weights.expert_weight_format == WeightFormat::Fp8BlockScaled
             && num_tokens * topk <= DEEPGEMM_MASKED_BAND;
         let use_deepgemm = qwen35_deepgemm_enabled()
             && has_deepgemm_grouped
