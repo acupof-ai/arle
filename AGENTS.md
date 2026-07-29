@@ -144,9 +144,9 @@ archive the oldest zero-inbound-reference wins entries before the
 **Code layout gotchas.** Flat modules, no `mod.rs` — `src/ops.rs` declares a
 sibling `#[path = "ops/attention.rs"] mod attention;`. Weights are `&self`
 (immutable, pool-shared); per-request mutable state lives in the `State`
-associated type. Comments carry the non-obvious *why* in ≤1 line, never the
-*what* and never which task added it; issue numbers only when naming a specific
-bug.
+associated type. Comments carry the non-obvious *why* in ≤1 line, in English,
+never the *what* and never which task added it; issue numbers only when naming a
+specific bug. If the code already reads clearly, leave it bare — no comment.
 
 **Memory.** Always-loaded: the auto-memory index + the latest 3 of
 `docs/experience/{errors,wins}/`; full entries on demand. Skeletons:
