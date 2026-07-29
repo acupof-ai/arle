@@ -1,7 +1,32 @@
 # N-D parallel OPD training — design (DP · PP · CP · TP · EP)
 
-> Status: **design proposal, awaiting sign-off. Nothing here is implemented.**
+> Status: **CP is implemented (option B); mesh convergence + parity gate landed
+> 2026-07-29.** The other axes are staged, not built — see the axis table.
 > Scope: >3 files + architectural → approach-first per the agent contract.
+
+## Implemented (2026-07-29): the seam converged onto one mesh
+
+Train now reads its parallelism coordinates from the one device mesh
+(`infer_topo::MultiAxisConfig` / `RankCoord`) — the same mesh serving reads —
+instead of two private duplicate configs. Landed:
+
+- `crates/train/Cargo.toml`: depends on `infer-topo` (std-only, device-neutral).
+- `crates/train/src/context_parallel.rs`: `train_mesh()` builds
+  `MultiAxisConfig` + `RankCoord`; `CpContext::from_env`/`from_mesh` derive
+  `{rank, size}` from `attn_cp_rank`/`attn_cp_size`. Pure-CP is byte-identical to
+  the pre-convergence `{rank, size}` (unit-tested).
+- `crates/train/src/qwen35.rs`: `Qwen35TensorParallelConfig::from_coord(cfg, coord)`
+  maps to `attn_tp_rank`/`attn_tp_size` — TP from the same mesh.
+- `crates/train/src/opd.rs`: the CP shard-filter collapsed to one flat
+  filter+rebase over `cp.shard()` (vocab check now explicitly over the full set).
+- Parity: local unit tests in `context_parallel.rs` (pure-CP byte-identity,
+  DP×CP coordinate split, shard-union reconstructs the single-card target set);
+  `crates/train/examples/nd_parallel_parity.rs` (`cuda,nccl`) is the model-level
+  N-vs-1 loss-parity gate — **pending-remote** (needs pod ≥2 GPU + NCCL).
+
+DP is carried as mesh coordinates only (unit-tested); its data-plane (launcher +
+batch-shard + count reduce), plus EP/PP/ring-A/MoE-TP, are the deferred
+workstreams in §7 — none is locally verifiable, so none is marked done.
 
 ## 0. The one correction that reshapes everything
 
@@ -31,7 +56,7 @@ may depend on it without breaching backend isolation.
 
 | Axis | Train-side state (file:line) | Gap to "supported" |
 |---|---|---|
-| **CP** | option B live + N=2 verified: `cp.is_enabled()` branch qwen35.rs L1674 all-gathers full KV → `causal_sdpa_recompute_with_q_start(q,k_full,v_full,q_start)` L1717 | attention **not sharded** — rank N-1 holds full KV + full scores → OOM at 256K. Needs ring (option A). |
+| **CP** | option B implemented + converged onto the mesh: `cp.is_enabled()` branch qwen35.rs L1674 all-gathers full KV → `causal_sdpa_recompute_with_q_start(q,k_full,v_full,q_start)` L1717. Local shard-parity unit-tested; model-level N=2 loss parity is the pending-remote `nd_parallel_parity` gate | attention **not sharded** — rank N-1 holds full KV + full scores → OOM at 256K. Needs ring (option A). |
 | **TP** | attention-TP proven `a2_qwen35_tp_lora_fd.rs` L181/L191; `maybe_tp_all_reduce` L313 | **MoE MLP rejects TP** ("requires single-rank TP" L1256/L1282/L1319). MoE-TP unbuilt. |
 | **EP** | **train side has none.** DeepEP dispatch/combine exist only in *serving* (`infer-cuda/moe.rs` `dsv4_moe_forward_deepep` L3781); train MoE uses grouped-linear on token rows (qwen35.rs L1355-1401), no all-to-all | Bring differentiable all-to-all into train MoE + its backward. **Real work, not wiring.** |
 | **DP** | CP's post-backward weight all-reduce (`all_reduce_cp_grads`, opd.rs L3238) is already DP-semantics | Batch-shard dataloader on `attn_dp_size>1`. Near-free once mesh drives it. |
@@ -146,9 +171,13 @@ No ungrounded extrapolation — measure the row before deciding.
 
 ## 6. Hazards carried forward (xp)
 
-1. **A single crashed rank hangs the whole group silently** — the exact CP-wedge
-   failure mode. Production N-D training needs an NCCL watchdog / timeout, or every
-   256K ladder OOM is a 20-min silent hang. Not yet present.
+1. **A rank that HANGS without exiting wedges the group silently.** The launcher
+   (`train_multiproc.rs:92`) already tears the group down on a rank that
+   crash-*exits* — a 100 ms `try_wait` poll that kills survivors on the first exit.
+   The residual gap is the rank that deadlocks *inside* a collective without
+   exiting: `try_wait` never fires and there is no NCCL-level timeout / heartbeat /
+   `ncclCommAbort`, so a 256K ladder OOM that hangs (rather than exits) is a silent
+   wait. Add a per-step deadline + `ncclCommAbort` for production N-D training.
 2. **Mesh construction must not reintroduce HashMap-order collective deadlock**
    (§2). First assert when wiring `ncclCommSplit`.
 3. **linear-attn may be the real 256K wall, not full-attn.** Qwen3.6 is hybrid;
@@ -174,9 +203,16 @@ Named so "five axes supported" doesn't silently omit them; none blocks P0.
   global targets; with DP×CP both sharding targets, the global count must all-reduce
   across *both* axes, not CP alone. Verify the invariant per axis combination.
 
-## 8. Decision needed
+## 8. Status and next binding constraint
 
-Sign off on: (a) converge train onto `MultiAxisConfig`/`RankCoord`, delete
-`CpContext`/`Qwen35TensorParallelConfig` duplication; (b) build **P0 ring
-attention only** now, other four axes stay identity in the mesh; (c) landing order
-P0→P1→P2. On sign-off I implement P0; I do not touch TP/EP/DP/PP impls.
+**Shipped (2026-07-29):** decision (a) — train converged onto
+`MultiAxisConfig`/`RankCoord`; the `CpContext`/`Qwen35TensorParallelConfig`
+duplication is now a derived view, one mesh with two consumers (serve + train).
+CP option B rides the mesh; local shard-parity is unit-tested; the model-level
+N=2 gate (`nd_parallel_parity`) is pending-remote.
+
+**Not built** — decision (b)/(c) stand: only CP is implemented; TP is
+attention-only; DP/PP/EP are identity in the train mesh. The next binding
+constraint is still **P0 ring attention** (option A) — the only 256K activation
+wall — but note the linear-attn CP peak (§6.3) is unmeasured and may be the real
+wall after ring. Measure the seq-ladder before committing to option A.
