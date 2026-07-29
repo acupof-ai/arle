@@ -459,8 +459,7 @@ impl CudaBackend {
             return Ok(out);
         }
 
-        let n_i32 = i32::try_from(len)
-            .map_err(|_| AutogradError::TapeInvariant("bf16 import length exceeds i32"))?;
+        let n_u64 = len as u64;
         {
             let (src_ptr, _src_guard) = staging.device_ptr(&self.stream);
             let (dst_ptr, _dst_guard) = out.device_ptr_mut(&self.stream);
@@ -469,7 +468,7 @@ impl CudaBackend {
                 self.kernels.function("bf16_bits_to_f32")?,
                 len,
                 |mut builder| {
-                    builder.arg(&src_ptr).arg(&dst_ptr).arg(&n_i32);
+                    builder.arg(&src_ptr).arg(&dst_ptr).arg(&n_u64);
                     builder
                 },
             )?;
@@ -487,8 +486,7 @@ impl CudaBackend {
             return Ok(out);
         }
 
-        let n_i32 = i32::try_from(len)
-            .map_err(|_| AutogradError::TapeInvariant("f32->bf16 length exceeds i32"))?;
+        let n_u64 = len as u64;
         {
             let (src_ptr, _src_guard) = src.device_ptr(&self.stream);
             let (dst_ptr, _dst_guard) = out.device_ptr_mut(&self.stream);
@@ -497,7 +495,7 @@ impl CudaBackend {
                 self.kernels.function("f32_to_bf16_bits")?,
                 len,
                 |mut builder| {
-                    builder.arg(&src_ptr).arg(&dst_ptr).arg(&n_i32);
+                    builder.arg(&src_ptr).arg(&dst_ptr).arg(&n_u64);
                     builder
                 },
             )?;
