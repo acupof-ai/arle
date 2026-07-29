@@ -51,9 +51,11 @@ c=16 +8.6%** tok/s; TPOT −64 / −50 / −47 / −22 / −6.7%.
 ## Still open
 
 The other 46% of the D2D calls is the linear capture — 3 copies per slot per
-layer out of the packed verify rows. One packed capture per layer would make it
-3 per layer and would let the varlen replay take row offsets instead of pointer
-tables: a deletion, not another table.
+layer out of the packed verify rows. Batched the same way in the
+[follow-up](2026-07-29-dspark-batched-linear-capture.md), which was the smaller
+change; the alternative, one packed capture per layer, would also let the varlen
+replay take row offsets instead of three of its five pointer tables. That is a
+deletion rather than another table, and it is still available.
 
 ## Rule
 
