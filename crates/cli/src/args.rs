@@ -2261,6 +2261,18 @@ pub(crate) struct TrainAgentOpdArgs {
     #[arg(long)]
     pub(crate) cp_devices: Option<String>,
 
+    /// Data-parallel group size (batch sharded across N GPUs, one process per
+    /// rank; weights replicated, grads all-reduced). 1 = single-card (default,
+    /// byte-identical). >1 spawns N ranks and requires the nccl feature. Combined
+    /// with cp_size>1 is not yet wired (needs ncclCommSplit subgroups).
+    #[arg(long, default_value_t = 1)]
+    pub(crate) dp_size: usize,
+
+    /// Comma-separated CUDA device ordinals for the DP ranks. Defaults to
+    /// 0..dp_size. Length must equal dp_size when set.
+    #[arg(long)]
+    pub(crate) dp_devices: Option<String>,
+
     /// Skip LoRA on all routed MoE expert projections (gate/up/down per expert).
     /// Keeps LoRA only on attention projections (q/k/v/o) and shared experts.
     /// Drops LoRA params from ~6.1B to ~59M and Adam state from ~49 GB to ~0.5 GB,
@@ -2309,6 +2321,19 @@ impl TrainAgentOpdArgs {
                 .filter_map(|s| s.trim().parse().ok())
                 .collect(),
             None => (0..self.cp_size.max(1)).collect(),
+        }
+    }
+
+    /// Per-rank CUDA device ordinals for data parallelism. `--dp-devices` if set
+    /// (must be `dp_size` entries), else `0..dp_size`.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    pub(crate) fn dp_devices(&self) -> Vec<usize> {
+        match &self.dp_devices {
+            Some(spec) => spec
+                .split(',')
+                .filter_map(|s| s.trim().parse().ok())
+                .collect(),
+            None => (0..self.dp_size.max(1)).collect(),
         }
     }
 
