@@ -613,17 +613,7 @@ impl Dsv4FlashMlaDecodeBatchScratch {
             "DSv4 batched FlashMLA decode requires a uniform h_q across layers"
         );
         let head_dim = config.head_dim;
-        let model_type_int = match (
-            config.head_dim,
-            config.qk_rope_head_dim,
-            config.kv_lora_rank,
-        ) {
-            (512, 64, _) => DSV4_FLASHMLA_MODEL1,
-            (576, 64, 512) => DSV4_FLASHMLA_V32,
-            (hd, rd, kv) => anyhow::bail!(
-                "DSv4 batched FlashMLA decode meta: unsupported (head_dim={hd}, rope={rd}, kv_lora={kv})"
-            ),
-        };
+        let model_type_int = dsv4_flashmla_model_meta(config)?.model_type_int;
         let max_topk_unified = layer_shapes
             .iter()
             .map(|s| s.topk_unified)
@@ -1085,22 +1075,12 @@ impl Dsv4FlashMlaDecodeBatchScratch {
         // MODEL1 (head_dim=512, d_qk=d_v=512, 584 B/tok) and V32/GLM
         // (head_dim=576, d_qk=576, d_v=512 latent, 656 B/tok). Mirrors the
         // single-row decode path's dim mapping; the shim hard-asserts d_v==512.
-        let (model_type_int, bytes_per_token) = match (
-            config.head_dim,
-            config.qk_rope_head_dim,
-            config.kv_lora_rank,
-        ) {
-            (512, 64, _) => (DSV4_FLASHMLA_MODEL1, DSV4_FLASH_KV_BYTES_PER_TOKEN_I32),
-            (576, 64, 512) => (DSV4_FLASHMLA_V32, DSV4_V32_KV_BYTES_PER_TOKEN_I32),
-            (hd, rd, kv) => anyhow::bail!(
-                "DSv4 batched FlashMLA decode: unsupported (head_dim={hd}, rope={rd}, kv_lora={kv})"
-            ),
-        };
-        let is_v32 = model_type_int == DSV4_FLASHMLA_V32;
+        let meta = dsv4_flashmla_model_meta(config)?;
+        let (model_type_int, bytes_per_token) = (meta.model_type_int, meta.bytes_per_token);
         let global_heads = shape.h_q;
         let head_dim = config.head_dim;
         let d_qk = head_dim as i32;
-        let d_v = if is_v32 { 512_i32 } else { head_dim as i32 };
+        let d_v = meta.d_v;
         let stride_kv_block_bytes = 64_i32 * bytes_per_token;
         let stride_q = (global_heads * head_dim) as i32; // per-row Q stride (s_q=1)
         let stride_o = (global_heads as i32) * d_v;
