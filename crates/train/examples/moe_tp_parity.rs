@@ -34,17 +34,21 @@ use train::{
 };
 
 #[cfg(all(feature = "cuda", feature = "nccl"))]
-const DEFAULT_EPS: f32 = 2.0e-3;
+const DEFAULT_EPS: f32 = 1.0e-2;
 #[cfg(all(feature = "cuda", feature = "nccl"))]
 const REL_TOL: f32 = 1.0e-2;
 #[cfg(all(feature = "cuda", feature = "nccl"))]
 const PROBE_RANK: usize = 0;
 #[cfg(all(feature = "cuda", feature = "nccl"))]
 const PROBE_INDEX: usize = 3;
-// A routed expert's down_proj is row-parallel (in_features = moe_intermediate
-// sharded), so its lora_b lives on the rank's shard — a genuine TP-local probe.
+// Probe the SHARED expert's down_proj, not a routed expert's: every token flows
+// through the shared expert, so its lora_b gradient is O(1) and a finite-diff
+// step clears several fp32 ULPs. A routed expert (experts.0) only sees the ~top_k
+// tokens routed to it, so its gradient is sub-ULP against a ~0.9 loss and the FD
+// degenerates. down_proj is row-parallel (in = shared_expert_intermediate/N
+// sharded), so lora_b still lives on the rank's shard — a genuine TP-local probe.
 #[cfg(all(feature = "cuda", feature = "nccl"))]
-const PROBE_SUFFIX: &str = ".layers.0.mlp.experts.0.down_proj.weight.lora_b";
+const PROBE_SUFFIX: &str = ".layers.0.mlp.shared_expert.down_proj.weight.lora_b";
 
 #[cfg(all(feature = "cuda", feature = "nccl"))]
 fn main() -> Result<()> {
@@ -135,8 +139,11 @@ fn coordinator_main() -> Result<()> {
     let base = run_case(&root, "base", world, &devices, probe_rank, probe_index, 0.0)?;
     let plus = run_case(&root, "plus", world, &devices, probe_rank, probe_index, eps)?;
 
-    let numeric = (plus.total_loss - minus.total_loss) / (2.0 * eps);
-    let analytic = base.grad[probe_index];
+    // Central difference in f64 so the plus−minus subtraction isn't fp32
+    // cancellation-bound; the shared-expert probe + eps=1e-2 keep the step well
+    // above one fp32 ULP of the ~O(1) loss.
+    let numeric = (plus.total_loss as f64 - minus.total_loss as f64) / (2.0 * eps as f64);
+    let analytic = base.grad[probe_index] as f64;
     let denom = analytic.abs().max(numeric.abs()).max(1.0e-6);
     let rel_err = (analytic - numeric).abs() / denom;
 
@@ -151,7 +158,7 @@ fn coordinator_main() -> Result<()> {
         "analytic={analytic:.9e} numeric={numeric:.9e} rel_err={rel_err:.3e} tol={REL_TOL:.1e}"
     );
     ensure!(
-        rel_err <= REL_TOL,
+        rel_err <= REL_TOL as f64,
         "MoE-TP finite-diff mismatch: analytic={analytic} numeric={numeric} rel_err={rel_err}"
     );
     println!("PASS");
