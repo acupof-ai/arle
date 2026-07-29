@@ -2034,17 +2034,22 @@ impl Backend for CudaBackend {
                     AutogradError::TapeInvariant("cuda all_gather_seq full alloc failed")
                 })?;
                 let nccl = self.nccl.as_ref().expect("world>1 implies nccl present");
-                let (src_ptr, _src_guard) = src.device_ptr(&self.stream);
-                let (dst_ptr, _dst_guard) = out.device_ptr_mut(&self.stream);
-                unsafe {
-                    nccl.all_gather(
-                        src_ptr as *const _,
-                        dst_ptr as *mut _,
-                        local_len,
-                        DType::F32,
-                        self.stream.cu_stream().cast(),
-                    )
-                    .map_err(|_| AutogradError::TapeInvariant("NCCL all_gather_seq failed"))?;
+                // Scope the device-ptr guards so their SyncOnDrop borrow of `out`
+                // ends before `out` is moved into the handle (mirrors the implicit
+                // drop in all_reduce_sum_device's `if let` block).
+                {
+                    let (src_ptr, _src_guard) = src.device_ptr(&self.stream);
+                    let (dst_ptr, _dst_guard) = out.device_ptr_mut(&self.stream);
+                    unsafe {
+                        nccl.all_gather(
+                            src_ptr as *const _,
+                            dst_ptr as *mut _,
+                            local_len,
+                            DType::F32,
+                            self.stream.cu_stream().cast(),
+                        )
+                        .map_err(|_| AutogradError::TapeInvariant("NCCL all_gather_seq failed"))?;
+                    }
                 }
                 return Ok(DeviceHandle::Cuda(CudaStorage::new(out)));
             }
@@ -2106,18 +2111,24 @@ impl Backend for CudaBackend {
                     AutogradError::TapeInvariant("cuda reduce_scatter_sum alloc failed")
                 })?;
                 let nccl = self.nccl.as_ref().expect("world>1 implies nccl present");
-                let (src_ptr, _src_guard) = src.device_ptr(&self.stream);
-                let (dst_ptr, _dst_guard) = out.device_ptr_mut(&self.stream);
-                unsafe {
-                    nccl.reduce_scatter(
-                        src_ptr as *const _,
-                        dst_ptr as *mut _,
-                        local_len,
-                        DType::F32,
-                        ReduceOp::Sum,
-                        self.stream.cu_stream().cast(),
-                    )
-                    .map_err(|_| AutogradError::TapeInvariant("NCCL reduce_scatter_sum failed"))?;
+                // Scope the device-ptr guards so their SyncOnDrop borrow of `out`
+                // ends before `out` is moved into the handle.
+                {
+                    let (src_ptr, _src_guard) = src.device_ptr(&self.stream);
+                    let (dst_ptr, _dst_guard) = out.device_ptr_mut(&self.stream);
+                    unsafe {
+                        nccl.reduce_scatter(
+                            src_ptr as *const _,
+                            dst_ptr as *mut _,
+                            local_len,
+                            DType::F32,
+                            ReduceOp::Sum,
+                            self.stream.cu_stream().cast(),
+                        )
+                        .map_err(|_| {
+                            AutogradError::TapeInvariant("NCCL reduce_scatter_sum failed")
+                        })?;
+                    }
                 }
                 return Ok(DeviceHandle::Cuda(CudaStorage::new(out)));
             }
