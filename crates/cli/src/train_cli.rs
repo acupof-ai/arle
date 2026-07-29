@@ -4617,6 +4617,12 @@ fn load_opd_infer_student(
             dspark_draft_model: runtime.dspark_draft_model.clone(),
             dspark_conf_threshold: runtime.dspark_conf_threshold,
             mem_fraction_static: runtime.rollout_mem_fraction,
+            // Whole-step decode graph for the rollout: eager per-token decode is
+            // host-launch-bound (~156 ms/token), the OPD step's dominant cost.
+            cuda: infer_api::CudaRuntimeFlags {
+                qwen35_decode_graph: runtime.qwen35_decode_graph,
+                ..Default::default()
+            },
             ..EngineLoadConfig::single_sequence(max_seq_len)
         },
     )
