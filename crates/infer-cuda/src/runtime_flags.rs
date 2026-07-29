@@ -59,6 +59,10 @@ static NUMA_PIN: AtomicBool = AtomicBool::new(true);
 static COMM_NCCL_ONLY: AtomicBool = AtomicBool::new(false);
 static DSV4_DSA_INDEXER_SMS: AtomicUsize = AtomicUsize::new(78);
 static DSV4_MOE_CONTIG_DECODE: AtomicBool = AtomicBool::new(false);
+// Setter-only (NOT in `apply_runtime_flags`): the OPD trainer flips it right
+// before the rollout student loads, and the engine's own `apply_runtime_flags`
+// during load must not reset it. Off = serving default (grouped-FP8 experts).
+static QWEN35_MOE_EXPERTS_BF16_RESIDENT: AtomicBool = AtomicBool::new(false);
 static DSV4_DECODE_REUSE: AtomicBool = AtomicBool::new(true); // default ON (2026-07-11 pod license)
 static MTP_ADAPTIVE: AtomicBool = AtomicBool::new(false);
 static MTP_MIN_ACCEPT_BITS: AtomicU32 = AtomicU32::new(0x3F0C_CCCD); // 0.55f32
@@ -152,6 +156,17 @@ pub(crate) fn dsv4_moe_contig_decode() -> bool {
 /// A/B-harness lever (`infer_cuda::set_dsv4_moe_contig_decode`).
 pub(crate) fn set_dsv4_moe_contig_decode(enabled: bool) {
     DSV4_MOE_CONTIG_DECODE.store(enabled, Relaxed);
+}
+/// When set, the Qwen3.6 MoE loader dequantizes routed FP8 experts to BF16
+/// per-expert at load instead of building the fused grouped-FP8 cache, so
+/// per-step LoRA re-merge has a mutable per-expert `DeviceMatrix` to fold into.
+pub(crate) fn qwen35_moe_experts_bf16_resident() -> bool {
+    QWEN35_MOE_EXPERTS_BF16_RESIDENT.load(Relaxed)
+}
+/// Set by `infer_cuda::set_qwen35_moe_experts_bf16_resident` before the OPD
+/// rollout student loads (target set includes experts).
+pub(crate) fn set_qwen35_moe_experts_bf16_resident(enabled: bool) {
+    QWEN35_MOE_EXPERTS_BF16_RESIDENT.store(enabled, Relaxed);
 }
 pub(crate) fn dsv4_decode_reuse_enabled() -> bool {
     DSV4_DECODE_REUSE.load(Relaxed)
