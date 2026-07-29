@@ -142,10 +142,21 @@ pub fn causal_sdpa_recompute(
     store: &mut TensorStore,
     tape: &mut crate::Tape,
 ) -> Result<TensorId> {
+    causal_sdpa_recompute_with_q_start(q, k, v, 0, store, tape)
+}
+
+pub fn causal_sdpa_recompute_with_q_start(
+    q: TensorId,
+    k: TensorId,
+    v: TensorId,
+    q_start: usize,
+    store: &mut TensorStore,
+    tape: &mut crate::Tape,
+) -> Result<TensorId> {
     let q_shape = store.tensor(q)?.shape.clone();
     let k_shape = store.tensor(k)?.shape.clone();
     let v_shape = store.tensor(v)?.shape.clone();
-    validate_attention_shapes(&q_shape, &k_shape, &v_shape)?;
+    validate_cached_attention_shapes(&q_shape, &k_shape, &v_shape, q_start)?;
 
     let requires_grad = store.tensor(q)?.requires_grad
         || store.tensor(k)?.requires_grad
@@ -155,15 +166,59 @@ pub fn causal_sdpa_recompute(
     store.ensure_device(k)?;
     store.ensure_device(v)?;
 
-    let output_id = if let Some(fused) = try_causal_sdpa_prefill_device(q, k, v, 0, store)? {
+    let output_id = if let Some(fused) = try_causal_sdpa_prefill_device(q, k, v, q_start, store)? {
         fused
-    } else {
-        // Composed fallback, off-tape (this entry owns the backward): the
-        // with-q-start path head-chunks itself to the transient budget.
+    } else if store.backend().device() == Device::Cuda && q_shape[0] == 1 && q_shape[2] > 65_535 {
         let live_before = store.live_ids().into_iter().collect::<HashSet<_>>();
         let mut inner_tape = crate::Tape::new();
         inner_tape.set_enabled(false);
-        let out = causal_sdpa_with_q_start(q, k, v, 0, store, &mut inner_tape)?;
+        let (batch, heads, seq, dim) = (q_shape[0], q_shape[1], q_shape[2], q_shape[3]);
+        let merged_heads = batch * heads;
+        let mut chunks = Vec::new();
+        let mut q0 = 0;
+        while q0 < seq {
+            let q1 = (q0 + 65_535).min(seq);
+            let q_part = slice(
+                q,
+                &[0, 0, q0, 0],
+                &[batch, heads, q1, dim],
+                store,
+                &mut inner_tape,
+            )?;
+            let k_part = slice(
+                k,
+                &[0, 0, 0, 0],
+                &[batch, heads, q_start + q1, dim],
+                store,
+                &mut inner_tape,
+            )?;
+            let v_part = slice(
+                v,
+                &[0, 0, 0, 0],
+                &[batch, heads, q_start + q1, dim],
+                store,
+                &mut inner_tape,
+            )?;
+            let out = try_causal_sdpa_prefill_device(q_part, k_part, v_part, q_start + q0, store)?
+                .ok_or(AutogradError::TapeInvariant(
+                    "long causal SDPA chunk rejected by fused prefill",
+                ))?;
+            let out = reshape(out, &[merged_heads, q1 - q0, dim], store, &mut inner_tape)?;
+            chunks.push(out);
+            let keep = chunks.iter().copied().collect();
+            store.free_new_except(&live_before, &keep)?;
+            q0 = q1;
+        }
+        let joined = concat_seq_chunks(&chunks, merged_heads, dim, store)?;
+        let out = reshape(joined, &q_shape, store, &mut inner_tape)?;
+        let keep = HashSet::from([q, k, v, out]);
+        store.free_new_except(&live_before, &keep)?;
+        out
+    } else {
+        let live_before = store.live_ids().into_iter().collect::<HashSet<_>>();
+        let mut inner_tape = crate::Tape::new();
+        inner_tape.set_enabled(false);
+        let out = causal_sdpa_with_q_start(q, k, v, q_start, store, &mut inner_tape)?;
         let keep = HashSet::from([q, k, v, out]);
         store.free_new_except(&live_before, &keep)?;
         out
@@ -175,12 +230,7 @@ pub fn causal_sdpa_recompute(
             op: BackwardOp::CausalSdpaRecompute,
             output_id,
             input_ids: smallvec![q, k, v],
-            saved: SavedContext::CausalSdpaRecomputeCtx {
-                q,
-                k,
-                v,
-                q_start: 0,
-            },
+            saved: SavedContext::CausalSdpaRecomputeCtx { q, k, v, q_start },
         });
     }
 
@@ -459,56 +509,6 @@ pub(crate) fn causal_sdpa_recompute_backward(
 
 fn legacy_sdpa_backward_enabled() -> bool {
     crate::runtime_flags::legacy_sdpa_bwd()
-}
-
-/// Context-parallel causal SDPA: a rank's LOCAL query shard `[1, H, q_len, hd]`
-/// attends the GATHERED causal-prefix KV `[1, H, kv_len, hd]` (kv_len = q_start +
-/// q_len), where absolute q positions are `q_start .. q_start+q_len`. The caller
-/// gathers the prefix KV (via `all_gather_seq` + prefix `slice`). It records the
-/// same `CausalSdpaRecompute` op as the square path — only with `q_start != 0` —
-/// so the shared rectangular backward handles it; no separate op/backward. At
-/// `q_start == 0, kv_len == q_len` it IS `causal_sdpa_recompute`.
-pub fn cp_causal_sdpa(
-    q: TensorId,
-    k: TensorId,
-    v: TensorId,
-    q_start: usize,
-    store: &mut TensorStore,
-    tape: &mut crate::Tape,
-) -> Result<TensorId> {
-    let q_shape = store.tensor(q)?.shape.clone();
-    let k_shape = store.tensor(k)?.shape.clone();
-    let v_shape = store.tensor(v)?.shape.clone();
-    validate_cached_attention_shapes(&q_shape, &k_shape, &v_shape, q_start)?;
-
-    let requires_grad = store.tensor(q)?.requires_grad
-        || store.tensor(k)?.requires_grad
-        || store.tensor(v)?.requires_grad;
-
-    store.ensure_device(q)?;
-    store.ensure_device(k)?;
-    store.ensure_device(v)?;
-
-    // Forward off-tape (this entry owns the backward): the with-q-start path
-    // head-chunks itself to the transient budget.
-    let live_before = store.live_ids().into_iter().collect::<HashSet<_>>();
-    let mut inner_tape = crate::Tape::new();
-    inner_tape.set_enabled(false);
-    let out = causal_sdpa_with_q_start(q, k, v, q_start, store, &mut inner_tape)?;
-    let keep = HashSet::from([q, k, v, out]);
-    store.free_new_except(&live_before, &keep)?;
-    store.set_requires_grad(out, requires_grad)?;
-
-    if tape.enabled && requires_grad {
-        tape.record(crate::TapeEntry {
-            op: BackwardOp::CausalSdpaRecompute,
-            output_id: out,
-            input_ids: smallvec![q, k, v],
-            saved: SavedContext::CausalSdpaRecomputeCtx { q, k, v, q_start },
-        });
-    }
-
-    Ok(out)
 }
 
 /// Per-q-chunk rows for the chunked SDPA backward recompute — bounds the live
@@ -1006,9 +1006,20 @@ pub fn cat_seq(
     let (seq_a, seq_b) = (a_shape[2], b_shape[2]);
     let total_seq = seq_a + seq_b;
     let requires_grad = store.tensor(a)?.requires_grad || store.tensor(b)?.requires_grad;
-
-    let mut data = vec![0.0_f32; batch * heads * total_seq * head_dim];
-    {
+    let device_path = [a, b].into_iter().all(|id| {
+        store
+            .tensor(id)
+            .is_ok_and(|t| t.dirty != Dirty::Host && t.device_handle.is_some())
+    });
+    let output_id = if device_path {
+        let a_handle = store.tensor(a)?.device_handle.as_ref().expect("device");
+        let b_handle = store.tensor(b)?.device_handle.as_ref().expect("device");
+        let (handle, shape) = store
+            .backend()
+            .concat_axis2(a_handle, &a_shape, b_handle, &b_shape)?;
+        store.alloc_device_tensor(shape, handle)?
+    } else {
+        let mut data = vec![0.0_f32; batch * heads * total_seq * head_dim];
         let a_host = store.tensor_host(a)?;
         let b_host = store.tensor_host(b)?;
         for bh in 0..(batch * heads) {
@@ -1021,9 +1032,13 @@ pub fn cat_seq(
             data[out_base + a_len..out_base + a_len + b_len]
                 .copy_from_slice(&b_host.data[b_base..b_base + b_len]);
         }
-    }
-    let out_shape = vec![batch, heads, total_seq, head_dim];
-    let output_id = store.alloc(Tensor::new(data, out_shape, requires_grad)?);
+        store.alloc(Tensor::new(
+            data,
+            vec![batch, heads, total_seq, head_dim],
+            requires_grad,
+        )?)
+    };
+    store.set_requires_grad(output_id, requires_grad)?;
 
     if tape.enabled && requires_grad {
         tape.record(TapeEntry {
@@ -1459,12 +1474,9 @@ mod tests {
         Ok(())
     }
 
-    // cp_causal_sdpa forward+backward on the rectangular (context-parallel) shape
-    // must match the composed-primitive oracle (causal_sdpa_with_q_start on an
-    // enabled tape). This is the local (N=1-agnostic) correctness gate for the CP
-    // attention op — the gathered-prefix KV is simulated by passing a full kv_len.
     #[test]
-    fn cp_causal_sdpa_matches_composed() -> Result<()> {
+    #[allow(clippy::type_complexity)]
+    fn causal_sdpa_recompute_with_q_start_matches_composed() -> Result<()> {
         const HEADS: usize = 2;
         const HEAD_DIM: usize = 8;
         const Q_LEN: usize = 5;
@@ -1477,14 +1489,14 @@ mod tests {
         let v_data = det_vec(HEADS * KV_LEN * HEAD_DIM, 0x59d0_74c3, 0.6);
         let up_data = det_vec(HEADS * Q_LEN * HEAD_DIM, 0x0a5f_3d18, 0.5);
 
-        let run = |cp: bool| -> Result<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)> {
+        let run = |owning: bool| -> Result<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)> {
             let mut store = TensorStore::default();
             let mut tape = crate::Tape::new();
             let q = store.alloc(Tensor::new(q_data.clone(), q_shape.clone(), true)?);
             let k = store.alloc(Tensor::new(k_data.clone(), kv_shape.clone(), true)?);
             let v = store.alloc(Tensor::new(v_data.clone(), kv_shape.clone(), true)?);
-            let out = if cp {
-                cp_causal_sdpa(q, k, v, Q_START, &mut store, &mut tape)?
+            let out = if owning {
+                causal_sdpa_recompute_with_q_start(q, k, v, Q_START, &mut store, &mut tape)?
             } else {
                 causal_sdpa_with_q_start(q, k, v, Q_START, &mut store, &mut tape)?
             };
@@ -1502,14 +1514,11 @@ mod tests {
         };
 
         let (ref_out, ref_gq, ref_gk, ref_gv) = run(false)?;
-        let (cp_out, cp_gq, cp_gk, cp_gv) = run(true)?;
-        assert!(
-            max_abs_diff(&ref_out, &cp_out) < 1e-4,
-            "cp forward diverged"
-        );
-        assert!(max_abs_diff(&ref_gq, &cp_gq) < 1e-4, "cp grad_q diverged");
-        assert!(max_abs_diff(&ref_gk, &cp_gk) < 1e-4, "cp grad_k diverged");
-        assert!(max_abs_diff(&ref_gv, &cp_gv) < 1e-4, "cp grad_v diverged");
+        let (out, gq, gk, gv) = run(true)?;
+        assert!(max_abs_diff(&ref_out, &out) < 1e-4);
+        assert!(max_abs_diff(&ref_gq, &gq) < 1e-4);
+        assert!(max_abs_diff(&ref_gk, &gk) < 1e-4);
+        assert!(max_abs_diff(&ref_gv, &gv) < 1e-4);
         Ok(())
     }
 }

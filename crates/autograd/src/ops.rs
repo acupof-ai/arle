@@ -166,7 +166,7 @@ pub fn causal_sdpa_with_q_start(
     attention::causal_sdpa_with_q_start(q, k, v, q_start, store, tape)
 }
 
-pub fn cp_causal_sdpa(
+pub fn causal_sdpa_recompute_with_q_start(
     q: TensorId,
     k: TensorId,
     v: TensorId,
@@ -174,7 +174,7 @@ pub fn cp_causal_sdpa(
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
-    attention::cp_causal_sdpa(q, k, v, q_start, store, tape)
+    attention::causal_sdpa_recompute_with_q_start(q, k, v, q_start, store, tape)
 }
 
 pub fn cat_seq(
