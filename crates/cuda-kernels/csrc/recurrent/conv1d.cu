@@ -191,13 +191,17 @@ cudaError_t conv1d_prefill_varlen_cuda(
 // snapshot/restore is 48 layers x B slots of them per tick, and each
 // `cuMemcpyDtoDAsync` costs ~11 µs of host driver time against ~2 µs of
 // bandwidth.
+// `words_each` non-null gives each buffer its own 16B-word count; null means
+// they all copy `words`.
 __global__ void batched_copy_uniform_kernel(
     void* const* __restrict__ dst_ptrs,
     const void* const* __restrict__ src_ptrs,
+    const int* __restrict__ words_each,
     size_t words
 ) {
     const uint4* src = static_cast<const uint4*>(src_ptrs[blockIdx.y]);
     uint4* dst = static_cast<uint4*>(dst_ptrs[blockIdx.y]);
+    if (words_each) words = words_each[blockIdx.y];
     for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < words;
          i += static_cast<size_t>(gridDim.x) * blockDim.x) {
         dst[i] = src[i];
@@ -206,21 +210,30 @@ __global__ void batched_copy_uniform_kernel(
 
 extern "C" {
 
-// `bytes` must be a multiple of 16 and every buffer 16B-aligned (cudaMalloc is).
+// `bytes` (or every `words_each` entry x16) must be a multiple of 16 and every
+// buffer 16B-aligned (cudaMalloc is). `max_words` sizes the grid.
 cudaError_t batched_copy_uniform_cuda(
     void* const* dst_ptrs,
     const void* const* src_ptrs,
+    const int* words_each,
     size_t bytes,
+    size_t max_words,
     int count,
     cudaStream_t stream
 ) {
-    if (count <= 0 || bytes == 0 || (bytes & 15)) {
+    if (count <= 0 || (bytes & 15)) {
         return cudaErrorInvalidValue;
     }
     size_t words = bytes >> 4;
-    size_t need = (words + CONV1D_BLOCK - 1) / CONV1D_BLOCK;
+    size_t span = words_each ? max_words : words;
+    if (span == 0) {
+        return cudaErrorInvalidValue;
+    }
+    size_t need = (span + CONV1D_BLOCK - 1) / CONV1D_BLOCK;
     dim3 grid(static_cast<unsigned>(need < 1024 ? need : 1024), count);
-    batched_copy_uniform_kernel<<<grid, CONV1D_BLOCK, 0, stream>>>(dst_ptrs, src_ptrs, words);
+    batched_copy_uniform_kernel<<<grid, CONV1D_BLOCK, 0, stream>>>(
+        dst_ptrs, src_ptrs, words_each, words
+    );
     return cudaGetLastError();
 }
 
