@@ -167,6 +167,7 @@ fn forward_backward_inline(
         &position_indices,
         &target_tokens,
         64,
+        None,
         store,
         &mut tape,
     )

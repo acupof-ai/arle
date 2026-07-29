@@ -100,7 +100,7 @@ fn fused_masked_ce_in(
     let weight = store.from_slice(weight_data, &[vocab, hidden_dim])?;
 
     let loss = fused_linear_ce_loss_indexed(
-        hidden, weight, positions, targets, chunk_rows, &mut store, &mut tape,
+        hidden, weight, positions, targets, chunk_rows, None, &mut store, &mut tape,
     )?;
     let loss_value = store.to_host(loss)?[0];
     let grads = tape.backward(loss, &mut store)?;
