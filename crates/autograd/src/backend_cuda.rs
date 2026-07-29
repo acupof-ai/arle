@@ -1502,15 +1502,14 @@ impl Backend for CudaBackend {
 
         #[cfg(not(feature = "no-cuda"))]
         {
+            self.stream.context().bind_to_thread().map_err(|_| {
+                AutogradError::TapeInvariant("cuda bind failed before mempool trim")
+            })?;
             self.stream.synchronize().map_err(|_| {
                 AutogradError::TapeInvariant("cuda synchronize failed before mempool trim")
             })?;
-            // Safety: the pool belongs to this backend's live CUDA context and
-            // the stream is synchronized above, so no queued allocation uses it.
             let pool = unsafe { result::device::get_mem_pool(self.stream.context().cu_device()) }
                 .map_err(|_| AutogradError::TapeInvariant("cuda get_mem_pool failed"))?;
-            // Safety: trimming the current device pool after stream sync only
-            // releases retained allocator pages; live allocations stay owned.
             unsafe { result::mem_pool::trim_to(pool, 0) }
                 .map_err(|_| AutogradError::TapeInvariant("cuda mem_pool trim_to(0) failed"))?;
             Ok(true)

@@ -303,6 +303,7 @@ fn backward_with_optional_profile(
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<()> {
+    store.backend().trim_memory_pool()?;
     if !opd_backward_profile_enabled() {
         tape.backward_accumulate_only(loss, store)?;
         return Ok(());
@@ -3289,9 +3290,6 @@ pub fn masked_writeback_step<O: Optimizer>(
     validate_loss_value(loss_value)?;
     let ce_secs = t_ce.elapsed().as_secs_f64();
     eprintln!("[masked-writeback] phase=fused_ce seconds={ce_secs:.3}");
-    // Return forward's ~40 GB checkpoint hoard to the driver so backward gets the
-    // full envelope (frees pages only; live grads stay).
-    store.backend().trim_memory_pool().ok();
     let t_bwd = Instant::now();
     backward_with_optional_profile(loss, loss_value, store, &mut tape)?;
     let bwd_secs = t_bwd.elapsed().as_secs_f64();
