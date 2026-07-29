@@ -988,11 +988,15 @@ impl Qwen35SlotImage {
         buf.extend_from_slice(&self.full_attn_pages);
         for gdr in &self.gdr_host {
             buf.extend_from_slice(&(gdr.len() as u64).to_le_bytes());
-            push_le_slice(&mut buf, gdr);
+            for &x in gdr {
+                buf.extend_from_slice(&x.to_le_bytes());
+            }
         }
         for conv in &self.conv_host {
             buf.extend_from_slice(&(conv.len() as u64).to_le_bytes());
-            push_le_slice(&mut buf, conv);
+            for &x in conv {
+                buf.extend_from_slice(&x.to_le_bytes());
+            }
         }
         buf
     }
@@ -1114,32 +1118,6 @@ pub(crate) type RecurrentBlock = (Vec<CudaSlice<f32>>, Vec<DeviceVec>);
 /// dist (`None` = uncaptured: greedy / delta policy).
 pub(crate) type CommittedToken = (u32, Option<f32>);
 
-/// The snapshot wire format is the host's native little-endian element layout,
-/// so a whole slice copies as bytes — element-wise `to_le_bytes` here costs
-/// 37.7M calls per dense request finish (measured: 300-700 ms of GPU-idle stall
-/// at every step boundary).
-const _: () = assert!(cfg!(target_endian = "little"), "snapshot format is LE");
-
-fn push_le_slice<T: Copy>(buf: &mut Vec<u8>, src: &[T]) {
-    // SAFETY: T is a plain arithmetic type with no padding, and the target is
-    // little-endian (asserted above), so the slice's bytes ARE the wire format.
-    let bytes = unsafe {
-        std::slice::from_raw_parts(src.as_ptr().cast::<u8>(), std::mem::size_of_val(src))
-    };
-    buf.extend_from_slice(bytes);
-}
-
-fn read_le_vec<T: Copy + Default>(raw: &[u8], len: usize) -> Vec<T> {
-    let mut out = vec![T::default(); len];
-    // SAFETY: `raw` is checked by the caller to hold exactly `len * size_of::<T>()`
-    // bytes; the destination is freshly allocated and correctly aligned, and
-    // `copy_nonoverlapping` tolerates an unaligned source.
-    unsafe {
-        std::ptr::copy_nonoverlapping(raw.as_ptr(), out.as_mut_ptr().cast::<u8>(), raw.len());
-    }
-    out
-}
-
 /// D2H snapshot of the recurrent state at a prefix boundary.
 /// Used by the sidecar prefix-cache to restore the recurrent layers
 /// when reusing a Qwen3.5/3.6 hybrid prefix via the page-radix path.
@@ -1169,11 +1147,15 @@ impl Qwen35RecurrentSnapshot {
         buf.extend_from_slice(&(self.conv.len() as u64).to_le_bytes());
         for gdr in &self.gdr {
             buf.extend_from_slice(&(gdr.len() as u64).to_le_bytes());
-            push_le_slice(&mut buf, gdr);
+            for &x in gdr {
+                buf.extend_from_slice(&x.to_le_bytes());
+            }
         }
         for conv in &self.conv {
             buf.extend_from_slice(&(conv.len() as u64).to_le_bytes());
-            push_le_slice(&mut buf, conv);
+            for &x in conv {
+                buf.extend_from_slice(&x.to_le_bytes());
+            }
         }
         buf
     }
@@ -1204,7 +1186,11 @@ impl Qwen35RecurrentSnapshot {
             let raw = bytes
                 .get(pos..end)
                 .ok_or_else(|| anyhow!("recurrent snapshot truncated reading gdr state"))?;
-            gdr.push(read_le_vec::<f32>(raw, len));
+            gdr.push(
+                raw.chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect(),
+            );
             pos = end;
         }
         let mut conv = Vec::with_capacity(num_conv);
@@ -1216,7 +1202,11 @@ impl Qwen35RecurrentSnapshot {
             let raw = bytes
                 .get(pos..end)
                 .ok_or_else(|| anyhow!("recurrent snapshot truncated reading conv state"))?;
-            conv.push(read_le_vec::<bf16>(raw, len));
+            conv.push(
+                raw.chunks_exact(2)
+                    .map(|c| bf16::from_le_bytes([c[0], c[1]]))
+                    .collect(),
+            );
             pos = end;
         }
         ensure!(
