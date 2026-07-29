@@ -1526,8 +1526,10 @@ impl Backend for CudaBackend {
             self.stream.synchronize().map_err(|_| {
                 AutogradError::TapeInvariant("cuda synchronize failed before mempool trim")
             })?;
+            // SAFETY: the context is bound above.
             let pool = unsafe { result::device::get_mem_pool(self.stream.context().cu_device()) }
                 .map_err(|_| AutogradError::TapeInvariant("cuda get_mem_pool failed"))?;
+            // SAFETY: the pool belongs to this context.
             unsafe { result::mem_pool::trim_to(pool, 0) }
                 .map_err(|_| AutogradError::TapeInvariant("cuda mem_pool trim_to(0) failed"))?;
             Ok(true)
@@ -8220,7 +8222,7 @@ fn cuda_broadcast_expand_device(
         .stream
         .clone_htod(&src_strides)
         .map_err(|_| AutogradError::TapeInvariant("cuda htod copy failed"))?;
-    // Uninit output: the kernel writes every element, no zero operand, no carrier.
+    // SAFETY: the kernel writes every element.
     let mut d_out = unsafe { backend.stream.alloc::<f32>(total) }
         .map_err(|_| AutogradError::TapeInvariant("cuda alloc failed"))?;
 
@@ -9210,7 +9212,6 @@ mod tests {
             .clone_htod(&bf16_bits)
             .map_err(|_| AutogradError::TapeInvariant("cuda htod copy failed (bf16 test)"))?;
         let (src_ptr, _src_guard) = src.device_ptr(&backend.stream);
-        let src_ptr = src_ptr as u64;
 
         let staging = backend.copy_bf16_device_ptr_to_local(src_ptr, bf16_bits.len())?;
         let copied = backend
