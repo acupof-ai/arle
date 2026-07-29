@@ -89,12 +89,35 @@ pub(crate) fn maybe_spawn_cp_ranks_and_wait(cp_size: usize, cp_devices: &[usize]
 
         // Wait for the first exit; on any exit (success or crash) kill the rest so
         // a single rank's failure can't leave the others blocked in a collective.
+        // A rank that HANGS inside a collective never exits, so try_wait alone can't
+        // see it — an opt-in no-progress deadline (ARLE_TRAIN_CP_STEP_TIMEOUT_SECS)
+        // tears the group down on a hang. Off by default so a legit long step is
+        // never killed; set it to bound a ladder/OOM probe.
+        let hang_timeout = std::env::var("ARLE_TRAIN_CP_STEP_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&s| s > 0)
+            .map(Duration::from_secs);
+        let start = std::time::Instant::now();
         let (exit_rank, code) = loop {
             if let Some(hit) = children
                 .iter_mut()
                 .find_map(|(r, c)| c.try_wait().ok().flatten().map(|s| (*r, s.code())))
             {
                 break hit;
+            }
+            if let Some(limit) = hang_timeout
+                && start.elapsed() > limit
+            {
+                log::error!(
+                    "no CP rank exited within {limit:?}; assuming a hung collective, tearing down"
+                );
+                for (rank, child) in &mut children {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    log::info!("killed hung CP rank {rank}");
+                }
+                anyhow::bail!("CP group hung: no rank progressed within {limit:?}");
             }
             std::thread::sleep(Duration::from_millis(100));
         };
