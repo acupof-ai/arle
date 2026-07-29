@@ -53,6 +53,12 @@
 #define FP8D_SWIGLU_ROW_TILE 1 // gate/up rows per warp; >1 hurt B=1 occupancy in the probe
 #define FP8D_ROW_TILE 4   // weight rows per warp (down kernel only)
 #define FP8D_SCALE_BLK 128
+// 4 blocks x 256 threads = 32 warps/SM = 50% occupancy on sm90 (64-warp
+// ceiling), which caps the compiler at 65536/(256*4) = 64 registers/thread.
+// Measured before: 72 (swiglu) / 86 (down) regs -> 37.5% / 25% theoretical,
+// 26.6% / 20.1% achieved, with DRAM at 5-12% — far too few warps resident to
+// hide the load latency this kernel has no other way to cover.
+#define FP8D_MIN_BLOCKS_PER_SM 4
 
 static __device__ __forceinline__ float fp8d_warp_reduce_sum(float val) {
 #pragma unroll
@@ -73,11 +79,11 @@ static __device__ __forceinline__ float fp8d_swiglu_clamped(float gate, float up
 
 // Accumulate 16 FP8 weights (one block scale) against 16 BF16 activations in
 // ascending k. `xp` points at the 16 contiguous BF16 activation elements.
+// Activations are shared across the weight rows a warp owns, so the caller
+// hoists the two 16B loads out of the row loop; this form takes them by value.
 static __device__ __forceinline__ float
-fp8d_dot16(float acc, const uint8_t* __restrict__ w, float scale,
-           const __nv_bfloat16* __restrict__ xp) {
-    const uint4 x0 = *reinterpret_cast<const uint4*>(xp);       // bf16[0..8)
-    const uint4 x1 = *reinterpret_cast<const uint4*>(xp + 8);   // bf16[8..16)
+fp8d_dot16_x(float acc, const uint8_t* __restrict__ w, float scale,
+             const uint4& x0, const uint4& x1) {
     const __nv_bfloat16* xb0 = reinterpret_cast<const __nv_bfloat16*>(&x0);
     const __nv_bfloat16* xb1 = reinterpret_cast<const __nv_bfloat16*>(&x1);
     const auto* w4 = reinterpret_cast<const __nv_fp8x4_e4m3*>(w);
@@ -109,7 +115,7 @@ fp8d_dot16(float acc, const uint8_t* __restrict__ w, float scale,
 // and writes act = silu(gate·x) * (up·x) directly for the ≤8 routed rows.
 // N = intermediate, K = hidden. scale geometry: [N/128, K/128] for both
 // gate and up (scale_cols = K/128).
-__global__ void dsv4_fp8_grouped_swiglu_decode_kernel(
+__global__ __launch_bounds__(FP8D_THREADS, FP8D_MIN_BLOCKS_PER_SM) void dsv4_fp8_grouped_swiglu_decode_kernel(
     const uint64_t* __restrict__ weight_gate_ptrs,
     const uint64_t* __restrict__ scale_gate_ptrs,
     const uint64_t* __restrict__ weight_up_ptrs,
@@ -179,15 +185,17 @@ __global__ void dsv4_fp8_grouped_swiglu_decode_kernel(
         for (int b = 0; b < FP8D_ACT_TILE; ++b) {
             if (b < tile) {
                 const __nv_bfloat16* xp = input + (int64_t)(route_base + b) * K + k;
+                const uint4 x0 = *reinterpret_cast<const uint4*>(xp);
+                const uint4 x1 = *reinterpret_cast<const uint4*>(xp + 8);
 #pragma unroll
                 for (int r = 0; r < FP8D_SWIGLU_ROW_TILE; ++r) {
                     if (r < rows) {
-                        acc_g[b][r] = fp8d_dot16(
+                        acc_g[b][r] = fp8d_dot16_x(
                             acc_g[b][r], reinterpret_cast<const uint8_t*>(&wg4[r]),
-                            scale_g[r], xp);
-                        acc_u[b][r] = fp8d_dot16(
+                            scale_g[r], x0, x1);
+                        acc_u[b][r] = fp8d_dot16_x(
                             acc_u[b][r], reinterpret_cast<const uint8_t*>(&wu4[r]),
-                            scale_u[r], xp);
+                            scale_u[r], x0, x1);
                     }
                 }
             }
@@ -220,7 +228,7 @@ __global__ void dsv4_fp8_grouped_swiglu_decode_kernel(
 // Single-output decode grouped GEMM (down/w2 projection). A warp owns
 // FP8D_ROW_TILE consecutive output rows (K is short for w2 — keeps enough
 // loads in flight). N = hidden, K = intermediate. scale geometry [N/128, K/128].
-__global__ void dsv4_fp8_grouped_down_decode_kernel(
+__global__ __launch_bounds__(FP8D_THREADS, FP8D_MIN_BLOCKS_PER_SM) void dsv4_fp8_grouped_down_decode_kernel(
     const uint64_t* __restrict__ weight_ptrs,
     const uint64_t* __restrict__ scale_ptrs,
     const __nv_bfloat16* __restrict__ input,
@@ -273,12 +281,14 @@ __global__ void dsv4_fp8_grouped_down_decode_kernel(
         for (int b = 0; b < FP8D_ACT_TILE; ++b) {
             if (b < tile) {
                 const __nv_bfloat16* xp = input + (int64_t)(route_base + b) * K + k;
+                const uint4 x0 = *reinterpret_cast<const uint4*>(xp);
+                const uint4 x1 = *reinterpret_cast<const uint4*>(xp + 8);
 #pragma unroll
                 for (int r = 0; r < FP8D_ROW_TILE; ++r) {
                     if (r < rows) {
-                        acc[b][r] = fp8d_dot16(
+                        acc[b][r] = fp8d_dot16_x(
                             acc[b][r], reinterpret_cast<const uint8_t*>(&w4[r]),
-                            scale[r], xp);
+                            scale[r], x0, x1);
                     }
                 }
             }
