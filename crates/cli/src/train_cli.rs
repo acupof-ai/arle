@@ -4607,6 +4607,7 @@ fn load_opd_infer_student(
         EngineLoadConfig {
             dspark_draft_model: runtime.dspark_draft_model.clone(),
             dspark_conf_threshold: runtime.dspark_conf_threshold,
+            mem_fraction_static: runtime.rollout_mem_fraction,
             ..EngineLoadConfig::single_sequence(max_seq_len)
         },
     )
