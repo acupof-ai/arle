@@ -2301,10 +2301,13 @@ impl Dsv4CudaExecutor {
         } else {
             SpecKind::None
         };
+        // DSv4 still drafts per slot, so it keeps the c=1 gate the 2026-07-26
+        // campaign licensed (−47.7% at c=16 with the gate open). Only Qwen3.5,
+        // whose draft and rollback batch, honours a wider `--spec-max-batch`.
         let route = route_decode(
             spec_kind,
             batch.rows.len(),
-            crate::runtime_flags::spec_max_batch(),
+            crate::runtime_flags::spec_max_batch().min(1),
         );
 
         // DSpark drafts per-slot (serial 3-stage forward) but verifies ALL chains

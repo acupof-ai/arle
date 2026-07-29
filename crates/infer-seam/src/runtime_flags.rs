@@ -32,7 +32,9 @@ fn d_mtp_min_accept() -> f32 {
     0.55
 }
 fn d_spec_max_batch() -> usize {
-    1
+    // Qwen3.5 DSpark's measured envelope; every unbatched scheme clamps to 1
+    // at its own call site.
+    16
 }
 fn d_deepep_num_sms() -> u32 {
     20

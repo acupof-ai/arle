@@ -2729,11 +2729,20 @@ impl Qwen35CudaExecutor {
     ) -> Result<Vec<SlotToken>> {
         use super::spec_decode::{DecodeRoute, SpecKind};
         let kind = self.spec_kind();
-        // A quant-KV pool cannot build a multi-row page table — hold at c=1.
-        let gate = if kind == SpecKind::Dspark && !self.paged_kv_bf16() {
-            1
-        } else {
-            crate::runtime_flags::spec_max_batch()
+        // Only a batched DSpark draft pays above c=1. MTP still drafts per row,
+        // a markov head resolves row r from row r-1, sampling syncs per draw,
+        // and a quant-KV pool cannot build a multi-row page table — each holds
+        // the gate at 1.
+        let batched = kind == SpecKind::Dspark
+            && self.paged_kv_bf16()
+            && self
+                .dspark
+                .as_ref()
+                .is_some_and(|ds| ds.head.batchable_draft())
+            && decode_rows.iter().all(|r| r.params.is_greedy());
+        let gate = match batched {
+            true => crate::runtime_flags::spec_max_batch(),
+            false => 1,
         };
         match super::spec_decode::route_decode(kind, decode_rows.len(), gate) {
             DecodeRoute::Dspark => self.dspark_decode_batch(decode_rows, host_kv),
