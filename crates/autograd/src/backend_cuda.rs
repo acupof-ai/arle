@@ -20,6 +20,7 @@ use crate::{
         matmul_bt_output_shape, matmul_output_shape, validate_broadcast,
         validate_decode_gqa_cache_shapes, validate_decode_gqa_shapes, validate_fp8_block_scaled,
         validate_qwen_decode_prepare_kv_shapes, validate_qwen_decode_prepare_q_shapes,
+        validate_slice_shape,
     },
 };
 use crate::{
@@ -3020,6 +3021,26 @@ impl Backend for CudaBackend {
         #[cfg(not(feature = "no-cuda"))]
         {
             cuda_slice_backward_device(self, upstream, input_shape, starts, ends)
+        }
+    }
+
+    fn write_slice_device(
+        &self,
+        dest: &DeviceHandle,
+        upstream: &DeviceHandle,
+        input_shape: &[usize],
+        starts: &[usize],
+        ends: &[usize],
+    ) -> Result<DeviceHandle> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (dest, upstream, input_shape, starts, ends);
+            todo!("GPU required: cuda write_slice_device is unavailable under feature no-cuda")
+        }
+
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            cuda_write_slice_device(self, dest, upstream, input_shape, starts, ends)
         }
     }
 
@@ -9105,55 +9126,38 @@ fn cuda_slice_backward_device(
     starts: &[usize],
     ends: &[usize],
 ) -> Result<DeviceHandle> {
-    let rank = input_shape.len();
-    if starts.len() != rank {
-        return Err(AutogradError::InvalidIndicesLen {
-            expected: rank,
-            got: starts.len(),
-        });
-    }
-    if ends.len() != rank {
-        return Err(AutogradError::InvalidIndicesLen {
-            expected: rank,
-            got: ends.len(),
-        });
-    }
-    for ((&start, &end), &dim) in starts.iter().zip(ends.iter()).zip(input_shape.iter()) {
-        if start > end {
-            return Err(AutogradError::TapeInvariant(
-                "slice start must be <= end for every axis",
-            ));
-        }
-        if end > dim {
-            return Err(AutogradError::IndexOutOfBounds {
-                index: end,
-                upper: dim,
-            });
-        }
-        if start > dim {
-            return Err(AutogradError::IndexOutOfBounds {
-                index: start,
-                upper: dim,
-            });
-        }
-    }
+    validate_slice_shape(input_shape, starts, ends)?;
+    let d_grad = backend
+        .stream
+        .alloc_zeros::<f32>(shape_size(input_shape))
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (slice_bwd)"))?;
+    let dest = DeviceHandle::Cuda(CudaStorage::new(d_grad));
+    cuda_write_slice_device(backend, &dest, upstream, input_shape, starts, ends)
+}
 
-    let upstream_shape: Vec<usize> = starts
-        .iter()
-        .zip(ends.iter())
-        .map(|(&start, &end)| end - start)
-        .collect();
+#[cfg(not(feature = "no-cuda"))]
+fn cuda_write_slice_device(
+    backend: &CudaBackend,
+    dest: &DeviceHandle,
+    upstream: &DeviceHandle,
+    input_shape: &[usize],
+    starts: &[usize],
+    ends: &[usize],
+) -> Result<DeviceHandle> {
+    let upstream_shape = validate_slice_shape(input_shape, starts, ends)?;
     let upstream_size = shape_size(&upstream_shape);
     let input_size = shape_size(input_shape);
+    let d_dest = backend.cuda_slice(dest, "write_slice_device")?;
     let d_up = backend.cuda_slice(upstream, "slice_backward_device")?;
-    if d_up.len() != upstream_size {
+    if d_dest.len() != input_size || d_up.len() != upstream_size {
         return Err(AutogradError::DataLengthMismatch {
-            len: d_up.len(),
-            shape: upstream_shape.clone(),
-            size: upstream_size,
+            len: d_dest.len().min(d_up.len()),
+            shape: input_shape.to_vec(),
+            size: input_size,
         });
     }
 
+    let rank = input_shape.len();
     let input_shape_i32: Vec<i32> = input_shape.iter().map(|&d| d as i32).collect();
     let starts_i32: Vec<i32> = starts.iter().map(|&d| d as i32).collect();
     let upstream_shape_i32: Vec<i32> = upstream_shape.iter().map(|&d| d as i32).collect();
@@ -9169,13 +9173,10 @@ fn cuda_slice_backward_device(
         .stream
         .clone_htod(&upstream_shape_i32)
         .map_err(|_| AutogradError::TapeInvariant("cuda htod copy failed (slice_bwd shape)"))?;
-    let mut d_grad = backend
-        .stream
-        .alloc_zeros::<f32>(input_size)
-        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (slice_bwd)"))?;
     let rank_i = i32::try_from(rank)
         .map_err(|_| AutogradError::TapeInvariant("cuda slice_bwd rank exceeds i32"))?;
     let upstream_size_u64 = upstream_size as u64;
+    let (dest_ptr, _dest_guard) = d_dest.device_ptr(&backend.stream);
 
     launch_1d(
         &backend.stream,
@@ -9183,7 +9184,7 @@ fn cuda_slice_backward_device(
         upstream_size,
         |mut builder| {
             builder
-                .arg(&mut d_grad)
+                .arg(&dest_ptr)
                 .arg(d_up)
                 .arg(&d_input_shape)
                 .arg(&d_starts)
@@ -9193,7 +9194,7 @@ fn cuda_slice_backward_device(
             builder
         },
     )?;
-    Ok(DeviceHandle::Cuda(CudaStorage::new(d_grad)))
+    Ok(dest.clone())
 }
 
 #[cfg(all(test, not(feature = "no-cuda")))]

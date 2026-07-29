@@ -1909,6 +1909,39 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         self.upload(&grad, input_shape)
     }
 
+    fn write_slice_device(
+        &self,
+        dest: &DeviceHandle,
+        upstream: &DeviceHandle,
+        input_shape: &[usize],
+        starts: &[usize],
+        ends: &[usize],
+    ) -> Result<DeviceHandle> {
+        let mut dest_host = self.readback(dest)?;
+        let upstream_host = self.readback(upstream)?;
+        let expected_shape = validate_slice_shape(input_shape, starts, ends)?;
+        let input_size = shape_size(input_shape);
+        let expected_size = shape_size(&expected_shape);
+        if dest_host.len() != input_size || upstream_host.len() != expected_size {
+            return Err(crate::AutogradError::DataLengthMismatch {
+                len: dest_host.len().min(upstream_host.len()),
+                shape: input_shape.to_vec(),
+                size: input_size,
+            });
+        }
+        let strides = broadcast_strides(input_shape);
+        for (out_index, &value) in upstream_host.iter().enumerate() {
+            let out_coords = linear_to_coords(out_index, &expected_shape);
+            let input_index: usize = out_coords
+                .iter()
+                .enumerate()
+                .map(|(axis, &coord)| (coord + starts[axis]) * strides[axis])
+                .sum();
+            dest_host[input_index] = value;
+        }
+        self.upload(&dest_host, input_shape)
+    }
+
     /// In-place AdamW step for a single parameter given host-resident
     /// gradient `grad` and device-resident `param` / `m` / `v` handles.
     ///
