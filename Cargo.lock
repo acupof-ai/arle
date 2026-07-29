@@ -1558,7 +1558,6 @@ version = "0.4.0"
 dependencies = [
  "anyhow",
  "axum",
- "base64 0.22.1",
  "cuda-kernels",
  "cudarc",
  "fastrace",
@@ -3598,7 +3597,6 @@ version = "0.4.0"
 dependencies = [
  "anyhow",
  "autograd",
- "base64 0.22.1",
  "chat",
  "cuda-kernels",
  "half",
