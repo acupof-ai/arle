@@ -2993,6 +2993,15 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
         .as_deref()
         .ok_or_else(|| anyhow!("--staged-root is required without --replay-records"))?;
 
+    // Context-parallel coordinator: if --cp-size > 1 and this is NOT already a
+    // spawned rank, fan out one worker per rank and wait. MUST run before the
+    // sandbox-spawner fork and the first CUDA context below — the coordinator owns
+    // neither (each rank forks its own helper + builds its own NCCL backend).
+    #[cfg(all(unix, feature = "cuda"))]
+    if crate::train_multiproc::maybe_spawn_cp_ranks_and_wait(args.cp_size, &args.cp_devices())? {
+        return Ok(());
+    }
+
     // Pre-CUDA sandbox-spawner: fork ONE non-CUDA helper to own all rollout
     // subprocess spawns (bash/cp/git/pytest) BEFORE the first CUDA context below.
     // The parent is still non-CUDA-resident here, so this single fork is
@@ -4665,13 +4674,41 @@ fn build_opd_store(
         use std::sync::Arc;
         let want_cuda = matches!(arg, OpdBackendArg::Cuda | OpdBackendArg::Auto);
         if want_cuda {
-            let backend =
-                autograd::backend_cuda::CudaBackend::new(0).context("init CUDA backend (GPU 0)")?;
+            // Context-parallel: build an NCCL-backed backend so the sequence-shard
+            // collectives (all_gather_seq / reduce_scatter_sum / grad all-reduce)
+            // have a communicator. The launcher publishes rank/size/uid via env;
+            // cp.size<=1 keeps the single-card new(0) (byte-identical).
+            let cp = train::context_parallel::CpContext::from_env();
+            let backend = if cp.is_enabled() {
+                #[cfg(feature = "nccl")]
+                {
+                    let ordinal = std::env::var("INFER_CUDA_DEVICE")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(0);
+                    let uid = infer_api::nccl_unique_id_from_env()
+                        .context("CP: read INFER_NCCL_UNIQUE_ID")?;
+                    autograd::backend_cuda::CudaBackend::new_with_nccl(
+                        ordinal, uid, cp.size, cp.rank,
+                    )
+                    .context("init CUDA+NCCL backend for context parallelism")?
+                }
+                #[cfg(not(feature = "nccl"))]
+                {
+                    bail!(
+                        "context parallelism (ARLE_TRAIN_CP_SIZE>1) requires the nccl feature; \
+                         rebuild with --features cuda,nccl"
+                    );
+                }
+            } else {
+                autograd::backend_cuda::CudaBackend::new(0).context("init CUDA backend (GPU 0)")?
+            };
             let backend: Arc<dyn autograd::Backend> = Arc::new(backend);
+            let label = if cp.is_enabled() { "cuda:cp" } else { "cuda:0" };
             return Ok((
                 autograd::TensorStore::with_backend(backend.clone()),
                 backend,
-                "cuda:0",
+                label,
             ));
         }
     }

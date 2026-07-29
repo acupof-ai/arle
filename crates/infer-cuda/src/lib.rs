@@ -124,6 +124,10 @@ pub use kv_native_sys::{default_t2_budget_bytes, resolve_dram_budget_bytes};
 /// Rank-0 NCCL `unique_id` mint for multiproc launchers (see [`loader::mint_nccl_unique_id_hex`]).
 #[cfg(feature = "nccl")]
 pub use loader::mint_nccl_unique_id_hex;
+/// Decode the NCCL `unique_id` a launcher published via `INFER_NCCL_UNIQUE_ID`
+/// (context-parallel training reuses the serve rendezvous channel).
+#[cfg(feature = "nccl")]
+pub use loader::nccl_unique_id_from_env;
 
 /// Process-local override for DSv4 FlashMLA decode dispatch. `None` restores
 /// the `--dsv4-flashmla-decode` flag default. Intended for resident A/B

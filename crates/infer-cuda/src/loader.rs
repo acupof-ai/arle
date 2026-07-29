@@ -248,7 +248,7 @@ pub(crate) fn build_tp_runtime(
 /// Decode the NCCL `unique_id` from `INFER_NCCL_UNIQUE_ID` (128 hex bytes = 256
 /// chars).
 #[cfg(feature = "nccl")]
-pub(crate) fn nccl_unique_id_from_env() -> Result<cuda_kernels::ffi::nccl::ncclUniqueId> {
+pub fn nccl_unique_id_from_env() -> Result<cuda_kernels::ffi::nccl::ncclUniqueId> {
     let hex = std::env::var("INFER_NCCL_UNIQUE_ID").map_err(|_| {
         anyhow!(
             "multi-rank TP requires INFER_NCCL_UNIQUE_ID (128 hex-encoded bytes \

@@ -95,15 +95,15 @@ pub use infer_server::{
 // Per-step student LoRA re-merge contract (OPD P2), re-exported from `infer-cuda`
 // so consumers see them at the `infer-api` surface (mirrors the legacy
 // `infer::server_engine::StudentLora*` path the `train` crate couples to).
-/// Rank-0 NCCL `unique_id` mint for the multiproc-serve coordinator.
-#[cfg(feature = "nccl")]
-pub use infer_cuda::mint_nccl_unique_id_hex;
 #[cfg(feature = "cuda")]
 pub use infer_cuda::{
     DsparkExperience, DsparkExperienceBuffer, SharedFp8BaseProjection, StudentLoraLayer,
     StudentLoraMatrices, StudentLoraProjection, StudentLoraProjectionUpdate, StudentLoraUpdate,
     set_qwen35_moe_experts_bf16_resident,
 };
+/// Rank-0 NCCL `unique_id` mint for the multiproc-serve coordinator.
+#[cfg(feature = "nccl")]
+pub use infer_cuda::{mint_nccl_unique_id_hex, nccl_unique_id_from_env};
 #[cfg(feature = "metal")]
 pub use infer_metal::recommended_max_working_set_size_bytes as metal_recommended_max_working_set_size_bytes;
 #[cfg(feature = "cuda")]
