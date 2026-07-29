@@ -427,6 +427,11 @@ pub fn fused_linear_ce_loss_indexed(
     position_indices: &[i32],
     target_tokens: &[i32],
     chunk_rows: usize,
+    // Override the 1/N loss+grad scale. `None` = 1/num_targets (single-device).
+    // Context parallelism passes Some(1/global_targets) so each sequence-shard's
+    // grad is weighted by the GLOBAL token count; the post-backward all-reduce-sum
+    // then yields the exact global mean.
+    inv_n_override: Option<f32>,
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
@@ -447,6 +452,7 @@ pub fn fused_linear_ce_loss_indexed(
             position_indices,
             target_tokens,
             chunk_rows,
+            inv_n_override,
             &shape,
             store,
             tape,
@@ -464,7 +470,7 @@ pub fn fused_linear_ce_loss_indexed(
     let num_targets = position_indices.len();
     // CE with temperature=1: loss = mean over positions of -log p[target];
     // d_logits = (softmax - onehot) / N. Both share the 1/N mean scale.
-    let inv_n = 1.0_f32 / num_targets as f32;
+    let inv_n = inv_n_override.unwrap_or(1.0_f32 / num_targets as f32);
     let mut loss_sum = 0.0_f32;
 
     for chunk_start in (0..num_targets).step_by(chunk_rows) {
@@ -560,6 +566,7 @@ fn fused_linear_ce_loss_indexed_device(
     position_indices: &[i32],
     target_tokens: &[i32],
     chunk_rows: usize,
+    inv_n_override: Option<f32>,
     shape: &FusedLinearDistillShape,
     store: &mut TensorStore,
     tape: &mut Tape,
@@ -568,7 +575,7 @@ fn fused_linear_ce_loss_indexed_device(
     let need_weight_grad = store.tensor(weight)?.requires_grad;
     let requires_grad = need_hidden_grad || need_weight_grad;
     let num_targets = position_indices.len();
-    let inv_n = 1.0_f32 / num_targets as f32;
+    let inv_n = inv_n_override.unwrap_or(1.0_f32 / num_targets as f32);
 
     // 2D view [total_rows, hidden_dim] so `embedding` can row-gather chunk
     // positions. reshape is a metadata-only lazy op; grad flows back to `hidden`.
@@ -1677,7 +1684,7 @@ mod tests {
         let weight = store.from_slice(weight_data, &[vocab, hidden_dim])?;
         store.get_mut(weight).expect("weight").requires_grad = true;
         let loss = fused_linear_ce_loss_indexed(
-            hidden, weight, positions, targets, chunk_rows, &mut store, &mut tape,
+            hidden, weight, positions, targets, chunk_rows, None, &mut store, &mut tape,
         )?;
         let loss_value = store.to_host(loss)?[0];
         let grads: HashMap<_, _> = tape.backward(loss, &mut store)?;

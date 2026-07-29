@@ -66,7 +66,7 @@ fn run_once(
 
     let start = Instant::now();
     let loss = autograd::ops::fused_linear_distill::fused_linear_ce_loss_indexed(
-        hidden, weight, &positions, &targets_v, chunk, &mut store, &mut tape,
+        hidden, weight, &positions, &targets_v, chunk, None, &mut store, &mut tape,
     )
     .expect("fused ce");
     let loss_value = store.to_host(loss).expect("loss")[0];
