@@ -12,12 +12,13 @@ use autograd::{
     AutogradError, Device, Tape, Tensor, TensorId, TensorStore,
     ops::{
         LinearAttentionParams, MoeGroupedLinearExpert, MoeGroupedLinearInput, MoeGroupedRoute,
-        MoeTopK, add, add_broadcast, all_reduce_sum, cat_seq, causal_sdpa_recompute,
-        causal_sdpa_with_q_start, checkpoint_sequential, embedding, linear_attention_core,
-        linear_attention_core_with_carry, linear_attention_core_with_carry_taped,
-        linear_attention_ctx_bytes, matmul_bt_with_site, moe_grouped_linear,
-        moe_grouped_weighted_scatter, moe_topk_softmax, moe_topk_softmax_with_indices, mul,
-        repeat_kv, reshape, rmsnorm, rope, sigmoid, silu, slice, transpose,
+        MoeTopK, add, add_broadcast, all_gather_seq, all_reduce_sum, cat_seq,
+        causal_sdpa_recompute, causal_sdpa_with_q_start, checkpoint_sequential, cp_causal_sdpa,
+        embedding, linear_attention_core, linear_attention_core_with_carry,
+        linear_attention_core_with_carry_taped, linear_attention_ctx_bytes, matmul_bt_with_site,
+        moe_grouped_linear, moe_grouped_weighted_scatter, moe_topk_softmax,
+        moe_topk_softmax_with_indices, mul, repeat_kv, reshape, rmsnorm, rope, sigmoid, silu,
+        slice, transpose,
     },
     tape::checkpoint_replay_mem_stage,
 };
@@ -603,6 +604,7 @@ impl Qwen35Layer {
         x: TensorId,
         cfg: &Qwen35Config,
         tp: Qwen35TensorParallelConfig,
+        cp: crate::context_parallel::CpContext,
         cos: TensorId,
         sin: TensorId,
         store: &mut TensorStore,
@@ -627,8 +629,9 @@ impl Qwen35Layer {
         let h = qwen35_rmsnorm(x, self.input_layernorm, cfg.rms_norm_eps, store, tape)?;
         checkpoint_replay_mem_stage(tape, store, "post_input_norm");
         let attn_out = match &self.self_attn {
-            Qwen35Attention::Full(attn) => self
-                .forward_full_attention(h, attn, cfg, tp, cos, sin, batch, seq_len, store, tape)?,
+            Qwen35Attention::Full(attn) => self.forward_full_attention(
+                h, attn, cfg, tp, cp, cos, sin, batch, seq_len, store, tape,
+            )?,
             Qwen35Attention::Linear(attn) => {
                 self.forward_linear_attention(h, attn, cfg, batch, seq_len, store, tape)?
             }
@@ -711,7 +714,17 @@ impl Qwen35Layer {
                 // The prompt residual stream needs the layer's attention output;
                 // recompute it via the standard full-sequence path (off-tape).
                 let attn_out = self.forward_full_attention(
-                    h, attn, cfg, tp, cos_prefix, sin_prefix, batch, gen_start, store, tape,
+                    h,
+                    attn,
+                    cfg,
+                    tp,
+                    crate::context_parallel::CpContext::single(),
+                    cos_prefix,
+                    sin_prefix,
+                    batch,
+                    gen_start,
+                    store,
+                    tape,
                 )?;
                 (attn_out, LayerPrefix::Full(prefix))
             }
@@ -938,8 +951,19 @@ impl Qwen35Layer {
 
         let h = qwen35_rmsnorm(x, self.input_layernorm, cfg.rms_norm_eps, store, tape)?;
         let attn_out = match &self.self_attn {
-            Qwen35Attention::Full(attn) => self
-                .forward_full_attention(h, attn, cfg, tp, cos, sin, batch, seq_len, store, tape)?,
+            Qwen35Attention::Full(attn) => self.forward_full_attention(
+                h,
+                attn,
+                cfg,
+                tp,
+                crate::context_parallel::CpContext::single(),
+                cos,
+                sin,
+                batch,
+                seq_len,
+                store,
+                tape,
+            )?,
             Qwen35Attention::Linear(attn) => {
                 self.forward_linear_attention(h, attn, cfg, batch, seq_len, store, tape)?
             }
@@ -998,8 +1022,19 @@ impl Qwen35Layer {
 
         let h = qwen35_rmsnorm(x, self.input_layernorm, cfg.rms_norm_eps, store, tape)?;
         let attn_out = match &self.self_attn {
-            Qwen35Attention::Full(attn) => self
-                .forward_full_attention(h, attn, cfg, tp, cos, sin, batch, seq_len, store, tape)?,
+            Qwen35Attention::Full(attn) => self.forward_full_attention(
+                h,
+                attn,
+                cfg,
+                tp,
+                crate::context_parallel::CpContext::single(),
+                cos,
+                sin,
+                batch,
+                seq_len,
+                store,
+                tape,
+            )?,
             Qwen35Attention::Linear(attn) => {
                 self.forward_linear_attention(h, attn, cfg, batch, seq_len, store, tape)?
             }
@@ -1557,6 +1592,7 @@ impl Qwen35Layer {
         attn: &Qwen35FullAttention,
         cfg: &Qwen35Config,
         tp: Qwen35TensorParallelConfig,
+        cp: crate::context_parallel::CpContext,
         cos: TensorId,
         sin: TensorId,
         batch: usize,
@@ -1636,10 +1672,54 @@ impl Qwen35Layer {
         let k = rope(k, cos, sin, store, tape)?;
 
         let kv_repeat = local_attention_heads / local_key_value_heads;
-        let k = repeat_kv(k, kv_repeat, store, tape)?;
-        let v = repeat_kv(v, kv_repeat, store, tape)?;
-
-        let attn_hidden = causal_sdpa_recompute(q, k, v, store, tape)?;
+        let attn_hidden = if cp.is_enabled() {
+            // Context-parallel: q is this rank's LOCAL shard [b, heads, seq_len, hd];
+            // it attends the causal prefix of the FULL sequence, so gather K/V from
+            // every rank and slice the prefix this rank's q needs. The launcher pads
+            // global seq to a multiple of cp.size (all_gather needs equal shards and
+            // the RoPE positions must agree with q_start), so global = seq_len*size
+            // and this rank owns absolute rows [q_start, q_start+seq_len).
+            let full_seq = seq_len * cp.size;
+            let q_start = cp.rank * seq_len;
+            let kv_end = q_start + seq_len;
+            // Cheap tripwire: RoPE cos/sin (from the writeback's sharded positions)
+            // must be exactly this rank's seq_len rows, or q_start disagrees with the
+            // absolute positions baked into q/k → silent wrong attention geometry.
+            debug_assert_eq!(
+                store.get(cos).map(|t| t.shape[t.shape.len() - 2]),
+                Some(seq_len),
+                "CP: cos rows must equal local seq_len (launcher must shard positions)"
+            );
+            // all_gather_seq is a rank-major flat concat on the leading post-batch
+            // axis, so gather in SEQ-major [b, seq/N, kv_heads, hd] (else heads
+            // interleave), then restore [b, kv_heads, seq, hd], slice the prefix,
+            // and GQA-repeat locally (gather pre-repeat = kv_repeat× less comm).
+            let gather_kv = |x: TensorId, store: &mut TensorStore, tape: &mut Tape| {
+                let xm = transpose(x, 1, 2, store, tape)?; // [b, seq/N, kv_heads, hd]
+                let xf = all_gather_seq(
+                    xm,
+                    vec![batch, full_seq, local_key_value_heads, cfg.head_dim],
+                    store,
+                    tape,
+                )?; // [b, seq, kv_heads, hd]
+                let xf = transpose(xf, 1, 2, store, tape)?; // [b, kv_heads, seq, hd]
+                let xf = slice(
+                    xf,
+                    &[0, 0, 0, 0],
+                    &[batch, local_key_value_heads, kv_end, cfg.head_dim],
+                    store,
+                    tape,
+                )?; // [b, kv_heads, kv_end, hd]
+                repeat_kv(xf, kv_repeat, store, tape) // [b, attn_heads, kv_end, hd]
+            };
+            let k_full = gather_kv(k, store, tape)?;
+            let v_full = gather_kv(v, store, tape)?;
+            cp_causal_sdpa(q, k_full, v_full, q_start, store, tape)?
+        } else {
+            let k = repeat_kv(k, kv_repeat, store, tape)?;
+            let v = repeat_kv(v, kv_repeat, store, tape)?;
+            causal_sdpa_recompute(q, k, v, store, tape)?
+        };
         let attn_hidden = if let Some(gate) = gate {
             let gate = sigmoid(gate, store, tape)?;
             mul(attn_hidden, gate, store, tape)?
@@ -2510,6 +2590,7 @@ impl Qwen35Layer {
 pub struct Qwen35Model {
     config: Qwen35Config,
     tp: Qwen35TensorParallelConfig,
+    cp: crate::context_parallel::CpContext,
     lora: Option<LoraConfig>,
     lora_target_set: LoraTargetSet,
     lora_layer_start: Option<usize>,
@@ -2579,6 +2660,13 @@ impl Qwen35Model {
 
     pub fn set_gradient_checkpointing(&mut self, enabled: bool) {
         self.gradient_checkpointing = enabled;
+    }
+
+    /// Set the context-parallel group (sequence-shard axis). Known only after load
+    /// (from env at the launcher), so it's a setter, not a constructor arg. Default
+    /// `single()` = single-card, byte-identical.
+    pub fn set_cp(&mut self, cp: crate::context_parallel::CpContext) {
+        self.cp = cp;
     }
 
     /// The one checkpointing decision. Checkpointing trades a full forward
@@ -3263,6 +3351,7 @@ impl Qwen35Model {
         Ok(Self {
             config: cfg.clone(),
             tp,
+            cp: crate::context_parallel::CpContext::single(),
             lora,
             lora_target_set,
             lora_layer_start,
@@ -3721,7 +3810,16 @@ impl Qwen35Model {
                 let layers = Arc::clone(&layers);
                 move |idx: usize, h, s: &mut TensorStore, t: &mut Tape| {
                     layers[idx]
-                        .forward(h, &cfg, tp, cos_id, sin_id, s, t)
+                        .forward(
+                            h,
+                            &cfg,
+                            tp,
+                            crate::context_parallel::CpContext::single(),
+                            cos_id,
+                            sin_id,
+                            s,
+                            t,
+                        )
                         .map_err(qwen35_to_autograd)
                 }
             };
@@ -3822,6 +3920,7 @@ impl Qwen35Model {
             let layers = Arc::new(self.layers.clone());
             let cfg = self.config.clone();
             let tp = self.tp;
+            let cp = self.cp;
             let (cos_id, sin_id) = (cos, sin);
 
             // Per-layer wall aggregation for ARLE_OPD_PROFILE=1 (this is the
@@ -3845,7 +3944,7 @@ impl Qwen35Model {
                 move |idx: usize, h, s: &mut TensorStore, t: &mut Tape| {
                     if !profile_enabled {
                         return layers[idx]
-                            .forward(h, &cfg, tp, cos_id, sin_id, s, t)
+                            .forward(h, &cfg, tp, cp, cos_id, sin_id, s, t)
                             .map_err(qwen35_to_autograd);
                     }
                     if profile_sync {
@@ -3853,7 +3952,7 @@ impl Qwen35Model {
                     }
                     let t0 = Instant::now();
                     let result = layers[idx]
-                        .forward(h, &cfg, tp, cos_id, sin_id, s, t)
+                        .forward(h, &cfg, tp, cp, cos_id, sin_id, s, t)
                         .map_err(qwen35_to_autograd);
                     if profile_sync {
                         let _ = s.backend().stream_synchronize();
@@ -3916,7 +4015,16 @@ impl Qwen35Model {
             let vram_ramp = std::env::var("ARLE_OPD_VRAM_TRACE").is_ok();
             for (layer_index, layer) in self.layers.iter().enumerate() {
                 hidden = self.detach_before_lora_layer(hidden, layer_index, store, tape)?;
-                hidden = layer.forward(hidden, &self.config, self.tp, cos, sin, store, tape)?;
+                hidden = layer.forward(
+                    hidden,
+                    &self.config,
+                    self.tp,
+                    self.cp,
+                    cos,
+                    sin,
+                    store,
+                    tape,
+                )?;
                 if vram_ramp && let Some((free, _)) = store.backend().device_mem_info() {
                     eprintln!("[vram-ramp] layer={layer_index} free={free}");
                 }
