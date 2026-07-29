@@ -488,6 +488,7 @@ impl UpdatePreset {
                     vocab,
                     window,
                     crate::context_parallel::CpContext::single(),
+                    crate::context_parallel::DpContext::single(),
                     store,
                 )?;
                 stats.merge(traj_stats);
@@ -775,6 +776,7 @@ fn update_ce<O: Optimizer>(
             vocab,
             window,
             crate::context_parallel::CpContext::single(),
+            crate::context_parallel::DpContext::single(),
             store,
         )?;
         tokens += traj.response_mask.iter().filter(|&&m| m == 1).count();
