@@ -142,6 +142,72 @@ impl CpContext {
     }
 }
 
+/// A rank's position on the data-parallel axis (`attn_dp` of the mesh). DP shards
+/// the BATCH (disjoint trajectories per rank) and replicates weights, so weight
+/// grads all-reduce like CP's — the same collective, a different sharded axis.
+///
+/// The correctness crux vs CP: under CP every rank shares ONE trajectory, so its
+/// masked-target count is already global. Under DP each rank owns a DIFFERENT
+/// trajectory, so the global-mean `inv_n` needs the SUM of per-rank counts over
+/// the DP group — otherwise every rank scales by its own local count and the mean
+/// is wrong. `global_target_count` is that reduction (host arithmetic; the wire
+/// all-reduce feeds it the summed count). This module owns the math; the launcher
+/// + cross-rank reduce are the pending-remote data-plane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DpContext {
+    pub rank: usize,
+    pub size: usize,
+}
+
+impl DpContext {
+    pub const fn single() -> Self {
+        Self { rank: 0, size: 1 }
+    }
+
+    /// The DP view of the mesh for explicit axis sizes + world rank (pure, no env).
+    /// Falls back to `single()` on a misconfigured mesh.
+    pub fn from_mesh(attn_dp: usize, attn_cp: usize, world_rank: usize) -> Self {
+        match train_mesh(attn_dp, attn_cp, world_rank) {
+            Some((cfg, coord)) => Self {
+                rank: coord.attn_dp_rank,
+                size: cfg.attn_dp_size,
+            },
+            None => Self::single(),
+        }
+    }
+
+    pub fn is_enabled(self) -> bool {
+        self.size > 1
+    }
+
+    /// This rank's disjoint slice of a `batch_len`-long trajectory list — the same
+    /// even-split-remainder-to-last-rank formula CP uses for the sequence, so DP
+    /// batch shards and CP sequence shards tile identically.
+    pub fn batch_shard(self, batch_len: usize) -> SeqShard {
+        if self.size <= 1 {
+            return SeqShard {
+                start: 0,
+                end: batch_len,
+            };
+        }
+        let range = crate::lora_shard::shard_range(batch_len, self.rank, self.size);
+        SeqShard {
+            start: range.start,
+            end: range.end,
+        }
+    }
+}
+
+/// Global masked-target count for the mean-CE `inv_n`, given this rank's local
+/// count and the SUM of local counts already reduced over the DP group
+/// (`dp_group_sum`; equals `local_count` when DP is off). CP shares one trajectory
+/// so it contributes no extra factor — `dp_group_sum` is the global count directly.
+/// Returns `None` when the count is zero (nothing to train), so the caller keeps
+/// the fused op's local default.
+pub fn global_inv_n(dp_group_sum: usize) -> Option<f32> {
+    (dp_group_sum > 0).then(|| 1.0 / dp_group_sum as f32)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,6 +321,46 @@ mod tests {
     #[test]
     fn from_mesh_out_of_range_rank_falls_back_to_single() {
         assert_eq!(CpContext::from_mesh(1, 2, 5), CpContext::single());
+    }
+
+    // DP view of the mesh: world rank composes CP-inner, DP-outer, so the DP axis
+    // is world_rank / cp. Mirror of the CP-axis test — one mesh, two views.
+    #[test]
+    fn dp_from_mesh_derives_dp_axis() {
+        let (dp, cp) = (2usize, 2usize);
+        // (world_rank, expected dp_rank)
+        for (world, dp_rank) in [(0, 0), (1, 0), (2, 1), (3, 1)] {
+            let ctx = DpContext::from_mesh(dp, cp, world);
+            assert_eq!(ctx.size, dp, "DP view size is the DP axis");
+            assert_eq!(ctx.rank, dp_rank, "world {world} -> dp_rank {dp_rank}");
+        }
+    }
+
+    // DP batch shards tile the trajectory list disjointly, remainder to last rank.
+    #[test]
+    fn dp_batch_shard_partitions_disjointly() {
+        let (size, batch) = (3usize, 10usize);
+        let mut covered = vec![false; batch];
+        for rank in 0..size {
+            let s = DpContext::from_mesh(size, 1, rank).batch_shard(batch);
+            for slot in &mut covered[s.start..s.end] {
+                assert!(!*slot, "overlap");
+                *slot = true;
+            }
+        }
+        assert!(covered.iter().all(|&c| c), "every trajectory covered once");
+    }
+
+    // The global-mean inv_n: DP sums per-rank counts (each rank a different
+    // trajectory) into the global count; CP shares one trajectory so its count is
+    // already global. A zero count yields None (nothing to train).
+    #[test]
+    fn global_inv_n_uses_dp_group_sum() {
+        // DP=2 with local counts 4 and 6 -> global 10 -> inv_n 0.1.
+        assert_eq!(global_inv_n(10), Some(0.1));
+        // Single card / CP: dp_group_sum == the one trajectory's count.
+        assert_eq!(global_inv_n(8), Some(0.125));
+        assert_eq!(global_inv_n(0), None);
     }
 
     // The full parity invariant: the union of every CP shard's rebased targets
