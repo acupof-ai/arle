@@ -1786,6 +1786,45 @@ impl Qwen35SpecSlotState {
         slot.restore_linear_from(ctx, &self.gdr_snap, &self.conv_snap)
     }
 
+    /// Append this slot's `(snapshot, live)` linear-state addresses — gdr into
+    /// `gdr`, conv into `conv`. The caller picks the direction and issues one
+    /// batched copy for the whole speculative batch.
+    pub(crate) fn linear_state_addrs(
+        &mut self,
+        ctx: &DeviceContext,
+        slot: &mut Qwen35SlotState,
+        gdr: &mut (Vec<u64>, Vec<u64>),
+        conv: &mut (Vec<u64>, Vec<u64>),
+    ) -> Result<()> {
+        ensure!(
+            self.gdr_snap.len() == slot.gdr_states.len()
+                && self.conv_snap.len() == slot.conv_states.len(),
+            "spec snapshot scratch sized {}/{} != slot linear layers {}/{}",
+            self.gdr_snap.len(),
+            self.conv_snap.len(),
+            slot.gdr_states.len(),
+            slot.conv_states.len()
+        );
+        for (s, l) in self.gdr_snap.iter_mut().zip(slot.gdr_states.iter_mut()) {
+            gdr.0.push(s.device_ptr_mut(&ctx.stream).0);
+            gdr.1.push(l.device_ptr_mut(&ctx.stream).0);
+        }
+        for (s, l) in self.conv_snap.iter_mut().zip(slot.conv_states.iter_mut()) {
+            conv.0.push(s.data.device_ptr_mut(&ctx.stream).0);
+            conv.1.push(l.data.device_ptr_mut(&ctx.stream).0);
+        }
+        Ok(())
+    }
+
+    /// Per-layer byte counts of the two linear states, in `linear_state_addrs`
+    /// order.
+    pub(crate) fn linear_state_bytes(&self) -> (usize, usize) {
+        (
+            self.gdr_snap.first().map_or(0, |b| b.len() * 4),
+            self.conv_snap.first().map_or(0, |b| b.len * 2),
+        )
+    }
+
     /// Mutable access to the persistent 1-element argmax scratch (the warm step
     /// seeds the spec state with the greedy pending token).
     pub(crate) fn argmax_scratch_mut(&mut self) -> &mut CudaSlice<i32> {
@@ -7267,6 +7306,48 @@ impl Qwen35Model {
             li == num_linear,
             "spec replay advanced {li} linear layers != slot count {num_linear}"
         );
+        Ok(())
+    }
+
+    /// `dst[i] <- src[i]` for `n` equal-sized buffers in one launch. A spec
+    /// snapshot is 48 layers x B slots of ~3 MB, and each `memcpy_dtod` costs
+    /// ~11 µs of host driver time against ~2 µs of bandwidth.
+    pub(crate) fn batched_copy(
+        &self,
+        tables: &mut Qwen35ReplayTables,
+        dst: &[u64],
+        src: &[u64],
+        bytes: usize,
+    ) -> Result<()> {
+        ensure!(
+            dst.len() == src.len(),
+            "batched copy dst/src length mismatch"
+        );
+        if dst.is_empty() || bytes == 0 {
+            return Ok(());
+        }
+        let ctx = &self.ctx;
+        let n = dst.len();
+        tables.host.clear();
+        tables.host.extend_from_slice(dst);
+        tables.host.extend_from_slice(src);
+        let tbl = tables.ptrs.get(ctx, 2 * n)?;
+        ctx.stream
+            .memcpy_htod(&tables.host, tbl)
+            .map_err(|e| anyhow!("H2D batched copy tables: {e}"))?;
+        let (base, _g) = tbl.device_ptr(&ctx.stream);
+        // SAFETY: the table holds `n` dst then `n` src live addresses; every
+        // buffer is `bytes` long and cudaMalloc-aligned.
+        unsafe {
+            ffi::batched_copy_uniform_cuda(
+                base as *const *mut std::ffi::c_void,
+                (base + (n as u64) * 8) as *const *const std::ffi::c_void,
+                bytes,
+                n as i32,
+                ctx.stream.cu_stream(),
+            )
+            .result()?;
+        }
         Ok(())
     }
 

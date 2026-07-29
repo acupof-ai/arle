@@ -186,3 +186,42 @@ cudaError_t conv1d_prefill_varlen_cuda(
 }
 
 } // extern "C"
+
+// `count` equal-sized device-to-device copies in one launch. The DSpark spec
+// snapshot/restore is 48 layers x B slots of them per tick, and each
+// `cuMemcpyDtoDAsync` costs ~11 µs of host driver time against ~2 µs of
+// bandwidth.
+__global__ void batched_copy_uniform_kernel(
+    void* const* __restrict__ dst_ptrs,
+    const void* const* __restrict__ src_ptrs,
+    size_t words
+) {
+    const uint4* src = static_cast<const uint4*>(src_ptrs[blockIdx.y]);
+    uint4* dst = static_cast<uint4*>(dst_ptrs[blockIdx.y]);
+    for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < words;
+         i += static_cast<size_t>(gridDim.x) * blockDim.x) {
+        dst[i] = src[i];
+    }
+}
+
+extern "C" {
+
+// `bytes` must be a multiple of 16 and every buffer 16B-aligned (cudaMalloc is).
+cudaError_t batched_copy_uniform_cuda(
+    void* const* dst_ptrs,
+    const void* const* src_ptrs,
+    size_t bytes,
+    int count,
+    cudaStream_t stream
+) {
+    if (count <= 0 || bytes == 0 || (bytes & 15)) {
+        return cudaErrorInvalidValue;
+    }
+    size_t words = bytes >> 4;
+    size_t need = (words + CONV1D_BLOCK - 1) / CONV1D_BLOCK;
+    dim3 grid(static_cast<unsigned>(need < 1024 ? need : 1024), count);
+    batched_copy_uniform_kernel<<<grid, CONV1D_BLOCK, 0, stream>>>(dst_ptrs, src_ptrs, words);
+    return cudaGetLastError();
+}
+
+} // extern "C"

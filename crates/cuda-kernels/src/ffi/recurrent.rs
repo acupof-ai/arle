@@ -94,6 +94,17 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    /// `count` equal-sized D2D copies in one launch. `bytes` must be a multiple
+    /// of 16. Replaces a `cuMemcpyDtoDAsync` loop whose cost is the ~11 µs of
+    /// host driver time per call, not the bandwidth.
+    pub fn batched_copy_uniform_cuda(
+        dst_ptrs: *const *mut std::ffi::c_void,
+        src_ptrs: *const *const std::ffi::c_void,
+        bytes: usize,
+        count: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn conv1d_prefill_cuda(
         x_seq: *const Half,
         conv_weight: *const Half,

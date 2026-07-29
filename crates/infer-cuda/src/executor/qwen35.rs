@@ -2008,22 +2008,42 @@ impl Qwen35CudaExecutor {
         }
         let chains: Vec<u32> = batch.iter().flat_map(|c| c.chain.iter().copied()).collect();
 
-        // 2. Snapshot each trunk's linear state (partial-accept rollback base).
+        // 2. Snapshot every trunk's linear state (partial-accept rollback base)
+        //    in one launch per state kind.
         for c in &batch {
             if self.dspark.as_ref().expect("dspark").spec[c.slot].is_none() {
                 let st = self.model.new_spec_slot_state()?;
                 self.dspark.as_mut().expect("dspark").spec[c.slot] = Some(st);
             }
+        }
+        {
             let Self {
                 model,
                 slots,
                 dspark,
                 ..
             } = self;
-            dspark.as_mut().expect("dspark").spec[c.slot]
-                .as_mut()
-                .expect("built above")
-                .snapshot_trunk(&model.ctx, &slots[c.slot])?;
+            let ds = dspark.as_mut().expect("dspark");
+            let want: Vec<usize> = batch.iter().map(|c| c.slot).collect();
+            let (mut gdr, mut conv) = ((Vec::new(), Vec::new()), (Vec::new(), Vec::new()));
+            let mut bytes = (0, 0);
+            for ((_, slot), (_, spec)) in slots
+                .iter_mut()
+                .enumerate()
+                .filter(|(i, _)| want.contains(i))
+                .zip(
+                    ds.spec
+                        .iter_mut()
+                        .enumerate()
+                        .filter(|(i, _)| want.contains(i)),
+                )
+            {
+                let spec = spec.as_mut().expect("built above");
+                bytes = spec.linear_state_bytes();
+                spec.linear_state_addrs(&model.ctx, slot, &mut gdr, &mut conv)?;
+            }
+            model.batched_copy(&mut ds.replay_tables, &gdr.0, &gdr.1, bytes.0)?;
+            model.batched_copy(&mut ds.replay_tables, &conv.0, &conv.1, bytes.1)?;
         }
         let snap_ms = crate::qwen35::mtp_phase_lap(&self.model.ctx, &mut pt);
 
