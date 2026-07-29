@@ -3605,6 +3605,7 @@ dependencies = [
  "infer-api",
  "infer-plan",
  "infer-server",
+ "infer-topo",
  "libc",
  "memmap2",
  "qwen35-spec",

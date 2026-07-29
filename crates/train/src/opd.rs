@@ -3083,28 +3083,33 @@ pub fn masked_writeback_step<O: Optimizer>(
 
     // Split the (predicting-position p, target token) pairs into the parallel
     // i32 index/target arrays the fused chunked CE consumes. `p` indexes the
-    // hidden tensor's sequence rows; the targets are the hard next tokens. Under
-    // CP, filter to this shard's rows and rebase p -> p - shard.start.
-    let mut position_indices: Vec<i32> = Vec::with_capacity(total_targets);
-    let mut target_tokens: Vec<i32> = Vec::with_capacity(total_targets);
+    // hidden tensor's sequence rows; the targets are the hard next tokens.
+    //
+    // Vocab bound-check runs over the FULL global set on every rank (not per
+    // shard): a bad token must fail all ranks together, or one rank errors while
+    // the others wedge in the next collective. Clear OPD error before the autograd
+    // bounds check (the lm_head's [vocab, hidden] also enforces it).
     for &(p, target) in &loss_targets {
-        // Guard tokenizer/vocab misalignment with a clear OPD error before the
-        // autograd bounds check (the lm_head's [vocab, hidden] also enforces it).
         if target >= vocab {
             return Err(OpdError::InvalidInput(format!(
                 "masked writeback target token {target} at position {p} exceeds vocab={vocab}"
             )));
         }
-        if cp.is_enabled() {
-            if shard.contains(p) {
-                position_indices.push((p - shard.start) as i32);
-                target_tokens.push(target as i32);
-            }
-        } else {
-            position_indices.push((p - gen_start) as i32);
-            target_tokens.push(target as i32);
-        }
     }
+    // One rebase offset covers both paths: CP filters to this shard and rebases by
+    // shard.start; non-CP's shard is the whole sequence (filter keeps all) and
+    // rebases by gen_start (frozen-prompt-KV, disabled under CP). `shard.contains`
+    // is always true off-CP, so the single filter is byte-identical to either path.
+    let rebase = if cp.is_enabled() {
+        shard.start
+    } else {
+        gen_start
+    };
+    let (position_indices, target_tokens): (Vec<i32>, Vec<i32>) = loss_targets
+        .iter()
+        .filter(|&&(p, _)| shard.contains(p))
+        .map(|&(p, target)| ((p - rebase) as i32, target as i32))
+        .unzip();
 
     let mut tape = Tape::new();
     // Offload per-layer grad-checkpoints to host RAM only past a length that needs
