@@ -313,6 +313,22 @@ impl LinearWithLora {
         }
     }
 
+    /// LoRA adapter `(name, id)` pairs in a fixed A-then-B order. Param
+    /// registration order must be identical on every process: CP/TP grad
+    /// all-reduce issues one collective per param by position, and
+    /// `adapter_name_map`'s HashMap iteration order is per-process randomized,
+    /// so two ranks would pair mismatched shapes into the same collective and
+    /// wedge NCCL (no size rendezvous).
+    pub fn adapter_ordered(&self) -> Vec<(&'static str, TensorId)> {
+        match &self.lora {
+            Some(lora) => vec![
+                (lora.lora_a_name, lora.lora_a),
+                (lora.lora_b_name, lora.lora_b),
+            ],
+            None => Vec::new(),
+        }
+    }
+
     pub fn merged_tensor(&self, store: &mut TensorStore) -> Result<Tensor> {
         let shape = store
             .get(self.weight)
