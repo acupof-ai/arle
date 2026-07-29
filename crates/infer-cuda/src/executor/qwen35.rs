@@ -3493,6 +3493,15 @@ mod tier_io_tests {
     use super::*;
     use half::bf16;
     use infer_plan::{ForwardMode, PrefillRow};
+    use infer_seam::{HostPagedKvPool, KvAllocator};
+
+    /// The engine allocates the host pages `submit` mirrors from; these probes
+    /// drive the executor directly, so they allocate their own.
+    fn host_pool(slot: usize, tokens: usize) -> HostPagedKvPool {
+        let mut pool = HostPagedKvPool::new(slot + 1, 4096, SUPPORTED_PAGE_SIZE);
+        pool.alloc(slot, tokens).expect("host pages for the probe");
+        pool
+    }
 
     const FACTUAL_S33: [u32; 33] = [
         248045, 846, 198, 3710, 369, 279, 6511, 314, 8071, 30, 30299, 391, 30982, 66463, 494,
@@ -3682,24 +3691,28 @@ mod tier_io_tests {
         ] {
             crate::qwen35::conv_probe::arm();
             let mut guard = ConvProbeGuard(true);
+            let mut host_kv = host_pool(slot, tokens.len());
             executor
-                .submit(&ForwardPlan {
-                    mode: ForwardMode::Prefill,
-                    decode_rows: Vec::new(),
-                    prefill_rows: vec![PrefillRow {
-                        slot,
-                        tokens: tokens.to_vec(),
-                        start_pos: 0,
-                        total_tokens: tokens.len(),
-                        params: SamplingParams {
-                            temperature: 0.0,
-                            top_k: -1,
-                            ..Default::default()
-                        },
-                    }],
-                    microbatch: None,
-                    spec: None,
-                })
+                .submit(
+                    &ForwardPlan {
+                        mode: ForwardMode::Prefill,
+                        decode_rows: Vec::new(),
+                        prefill_rows: vec![PrefillRow {
+                            slot,
+                            tokens: tokens.to_vec(),
+                            start_pos: 0,
+                            total_tokens: tokens.len(),
+                            params: SamplingParams {
+                                temperature: 0.0,
+                                top_k: -1,
+                                ..Default::default()
+                            },
+                        }],
+                        microbatch: None,
+                        spec: None,
+                    },
+                    &mut host_kv,
+                )
                 .expect("production paged prefill");
             let captures = crate::qwen35::conv_probe::drain();
             guard.0 = false;
@@ -3935,24 +3948,28 @@ mod tier_io_tests {
         ] {
             crate::qwen35::gdr_probe::arm();
             let mut guard = GdrProbeGuard(true);
+            let mut host_kv = host_pool(slot, tokens.len());
             executor
-                .submit(&ForwardPlan {
-                    mode: ForwardMode::Prefill,
-                    decode_rows: Vec::new(),
-                    prefill_rows: vec![PrefillRow {
-                        slot,
-                        tokens: tokens.to_vec(),
-                        start_pos: 0,
-                        total_tokens: tokens.len(),
-                        params: SamplingParams {
-                            temperature: 0.0,
-                            top_k: -1,
-                            ..Default::default()
-                        },
-                    }],
-                    microbatch: None,
-                    spec: None,
-                })
+                .submit(
+                    &ForwardPlan {
+                        mode: ForwardMode::Prefill,
+                        decode_rows: Vec::new(),
+                        prefill_rows: vec![PrefillRow {
+                            slot,
+                            tokens: tokens.to_vec(),
+                            start_pos: 0,
+                            total_tokens: tokens.len(),
+                            params: SamplingParams {
+                                temperature: 0.0,
+                                top_k: -1,
+                                ..Default::default()
+                            },
+                        }],
+                        microbatch: None,
+                        spec: None,
+                    },
+                    &mut host_kv,
+                )
                 .expect("production paged prefill");
             let captures = crate::qwen35::gdr_probe::drain();
             guard.0 = false;
@@ -4122,24 +4139,28 @@ mod tier_io_tests {
         ] {
             crate::qwen35::prep_probe::arm();
             let mut guard = PrepProbeGuard(true);
+            let mut host_kv = host_pool(slot, tokens.len());
             executor
-                .submit(&ForwardPlan {
-                    mode: ForwardMode::Prefill,
-                    decode_rows: Vec::new(),
-                    prefill_rows: vec![PrefillRow {
-                        slot,
-                        tokens: tokens.to_vec(),
-                        start_pos: 0,
-                        total_tokens: tokens.len(),
-                        params: SamplingParams {
-                            temperature: 0.0,
-                            top_k: -1,
-                            ..Default::default()
-                        },
-                    }],
-                    microbatch: None,
-                    spec: None,
-                })
+                .submit(
+                    &ForwardPlan {
+                        mode: ForwardMode::Prefill,
+                        decode_rows: Vec::new(),
+                        prefill_rows: vec![PrefillRow {
+                            slot,
+                            tokens: tokens.to_vec(),
+                            start_pos: 0,
+                            total_tokens: tokens.len(),
+                            params: SamplingParams {
+                                temperature: 0.0,
+                                top_k: -1,
+                                ..Default::default()
+                            },
+                        }],
+                        microbatch: None,
+                        spec: None,
+                    },
+                    &mut host_kv,
+                )
                 .expect("production paged prefill");
             let captures = crate::qwen35::prep_probe::drain();
             guard.0 = false;
@@ -4360,24 +4381,28 @@ mod tier_io_tests {
         ] {
             crate::qwen35::attn_probe::arm();
             let mut guard = AttnProbeGuard(true);
+            let mut host_kv = host_pool(slot, tokens.len());
             executor
-                .submit(&ForwardPlan {
-                    mode: ForwardMode::Prefill,
-                    decode_rows: Vec::new(),
-                    prefill_rows: vec![PrefillRow {
-                        slot,
-                        tokens: tokens.to_vec(),
-                        start_pos: 0,
-                        total_tokens: tokens.len(),
-                        params: SamplingParams {
-                            temperature: 0.0,
-                            top_k: -1,
-                            ..Default::default()
-                        },
-                    }],
-                    microbatch: None,
-                    spec: None,
-                })
+                .submit(
+                    &ForwardPlan {
+                        mode: ForwardMode::Prefill,
+                        decode_rows: Vec::new(),
+                        prefill_rows: vec![PrefillRow {
+                            slot,
+                            tokens: tokens.to_vec(),
+                            start_pos: 0,
+                            total_tokens: tokens.len(),
+                            params: SamplingParams {
+                                temperature: 0.0,
+                                top_k: -1,
+                                ..Default::default()
+                            },
+                        }],
+                        microbatch: None,
+                        spec: None,
+                    },
+                    &mut host_kv,
+                )
                 .expect("production paged prefill");
             let captures = crate::qwen35::attn_probe::drain();
             guard.0 = false;
