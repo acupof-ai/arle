@@ -107,7 +107,7 @@ extern "C" __global__ void linear_attention_conv1d_silu_forward_f32_to_bf16(
             }
             continue;
         }
-        sum += x[src_t * channels + c] * weight[c * kernel_size + tap];
+        sum += x[static_cast<unsigned long long>(src_t) * channels + c] * weight[c * kernel_size + tap];
     }
     preact[idx] = sum;
     out_bf16[idx] = la_float_to_bf16(la_silu(sum));
@@ -1806,7 +1806,7 @@ extern "C" __global__ void linear_attention_conv1d_silu_backward_f32(
             }
             continue;
         }
-        int input_idx = src_t * channels + c;
+        unsigned long long input_idx = static_cast<unsigned long long>(src_t) * channels + c;
         float x = input[input_idx];
         float w = weight[c * kernel_size + tap];
         atomicAdd(&grad_input[input_idx], dpre * w);
