@@ -1,9 +1,10 @@
 extern "C" __global__ void bf16_bits_to_f32(
     const unsigned short* __restrict__ input,
     float* __restrict__ output,
-    int n
+    unsigned long long n
 ) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned long long idx =
+        static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (idx >= n) {
         return;
     }
@@ -14,9 +15,10 @@ extern "C" __global__ void bf16_bits_to_f32(
 extern "C" __global__ void f32_to_bf16_bits(
     const float* __restrict__ input,
     unsigned short* __restrict__ output,
-    int n
+    unsigned long long n
 ) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned long long idx =
+        static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (idx >= n) {
         return;
     }
