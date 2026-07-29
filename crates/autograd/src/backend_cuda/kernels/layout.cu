@@ -40,18 +40,19 @@ extern "C" __global__ void slice_f32(
     const int* __restrict__ starts,
     const int* __restrict__ new_shape,
     int rank,
-    int total
+    unsigned long long total
 ) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned long long idx =
+        (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= total) return;
 
-    int linear = idx;
-    int old_offset = 0;
+    unsigned long long linear = idx;
+    unsigned long long old_offset = 0;
     for (int d = rank - 1; d >= 0; --d) {
         int coord = linear % new_shape[d];
         linear /= new_shape[d];
 
-        int stride = 1;
+        unsigned long long stride = 1;
         for (int s = rank - 1; s > d; --s) {
             stride *= old_shape[s];
         }
@@ -126,18 +127,19 @@ extern "C" __global__ void slice_backward_f32(
     const int* __restrict__ starts,
     const int* __restrict__ upstream_shape,
     int rank,
-    int total
+    unsigned long long total
 ) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned long long idx =
+        (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= total) return;
 
-    int linear = idx;
-    int input_offset = 0;
+    unsigned long long linear = idx;
+    unsigned long long input_offset = 0;
     for (int d = rank - 1; d >= 0; --d) {
         int coord = linear % upstream_shape[d];
         linear /= upstream_shape[d];
 
-        int stride = 1;
+        unsigned long long stride = 1;
         for (int s = rank - 1; s > d; --s) {
             stride *= input_shape[s];
         }
