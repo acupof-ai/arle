@@ -1661,8 +1661,7 @@ impl Backend for CudaBackend {
                 .stream
                 .alloc_zeros::<f32>(size)
                 .map_err(|_| cuda_alloc_failed("add", shape.to_vec()))?;
-            let n = i32::try_from(size)
-                .map_err(|_| AutogradError::TapeInvariant("cuda add length exceeds i32"))?;
+            let n = size as u64;
             launch_1d(
                 &self.stream,
                 self.kernels.function("add_f32")?,
@@ -4542,8 +4541,8 @@ fn cuda_linear_attention_forward_device_row(
                 AutogradError::TapeInvariant("linear_attention conv_tail_len exceeds i32")
             })?
             .unwrap_or(0);
-        let total_i32 = i32::try_from(qkv_len)
-            .map_err(|_| AutogradError::TapeInvariant("linear_attention qkv_len exceeds i32"))?;
+        let total_u64 = u64::try_from(qkv_len)
+            .map_err(|_| AutogradError::TapeInvariant("linear_attention qkv_len exceeds u64"))?;
         launch_1d(
             &backend.stream,
             backend
@@ -4556,7 +4555,7 @@ fn cuda_linear_attention_forward_device_row(
                     .arg(&qkv_conv_ptr)
                     .arg(&qkv_ptr)
                     .arg(&conv_ptr)
-                    .arg(&total_i32)
+                    .arg(&total_u64)
                     .arg(&qkv_dim_i32)
                     .arg(&seq_len_i32)
                     .arg(&conv_kernel_i32)
@@ -5036,14 +5035,22 @@ fn cuda_linear_attention_backward_device_row(
         .map_err(|_| AutogradError::TapeInvariant("linear_attention value_dim exceeds i32"))?;
     let qkv_dim_i32 = i32::try_from(qkv_dim)
         .map_err(|_| AutogradError::TapeInvariant("linear_attention qkv_dim exceeds i32"))?;
-    let total_i32 = i32::try_from(qkv_len)
-        .map_err(|_| AutogradError::TapeInvariant("linear_attention qkv_len exceeds i32"))?;
+    let total_u64 = u64::try_from(qkv_len)
+        .map_err(|_| AutogradError::TapeInvariant("linear_attention qkv_len exceeds u64"))?;
     let conv_kernel_i32 = i32::try_from(p.conv_kernel)
         .map_err(|_| AutogradError::TapeInvariant("linear_attention conv_kernel exceeds i32"))?;
+    let carry_len = num_chunks * rows * state_elems;
+    let staged_elems = carry_len.saturating_mul(3).saturating_add(
+        num_chunks
+            .saturating_mul(rows)
+            .saturating_mul(p.key_dim)
+            .saturating_mul(p.key_dim),
+    );
+    let staged_bytes = staged_elems.saturating_mul(std::mem::size_of::<f32>());
+    let free_bytes = backend.mem_get_info().map_or(0, |(free, _)| free);
+    let use_mono = linear_attention_mono_backward_forced() || staged_bytes > free_bytes / 2;
 
-    if linear_attention_mono_backward_forced() {
-        // Legacy monolithic scan: one block per (batch x value_head) walks every
-        // chunk sequentially. Kept as the A/B fallback (--la-backward-mono).
+    if use_mono {
         let mut grad_state_scratch = backend
             .stream
             .alloc_zeros::<f32>(state_len)
@@ -5133,10 +5140,6 @@ fn cuda_linear_attention_backward_device_row(
             },
         )?;
     } else {
-        // Staged chunk-parallel backward: stage 1 emits the
-        // per-chunk affine grad-state transfer (M_c, B_c) in parallel over
-        // chunk x row blocks, stage 2 runs the num_chunks-step boundary carry,
-        // stage 3 replays the exact per-token grad pass per chunk in parallel.
         let rows_i32 = i32::try_from(rows)
             .map_err(|_| AutogradError::TapeInvariant("linear_attention rows exceeds i32"))?;
         let num_chunks_i32 = i32::try_from(num_chunks)
@@ -5145,10 +5148,6 @@ fn cuda_linear_attention_backward_device_row(
         let wave_i32 = i32::try_from(wave)
             .map_err(|_| AutogradError::TapeInvariant("linear_attention wave exceeds i32"))?;
         let grid = wave * rows;
-        let carry_len = num_chunks * rows * state_elems;
-
-        // g_in[c] = grad-state entering chunk c from the right; the last chunk's
-        // slot must stay zero (alloc_zeros provides it) — stage 2 fills the rest.
         let mut g_in_scratch = backend
             .stream
             .alloc_zeros::<f32>(carry_len)
@@ -5367,7 +5366,7 @@ fn cuda_linear_attention_backward_device_row(
                     .arg(&preact_ptr)
                     .arg(&qkv_ptr)
                     .arg(&conv_ptr)
-                    .arg(&total_i32)
+                    .arg(&total_u64)
                     .arg(&qkv_dim_i32)
                     .arg(&seq_len_i32)
                     .arg(&conv_kernel_i32)
@@ -6632,8 +6631,7 @@ fn cuda_unary_1d(backend: &CudaBackend, a: &[f32], kernel_name: &'static str) ->
         .stream
         .alloc_zeros::<f32>(n_usize)
         .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
-    let n = i32::try_from(n_usize)
-        .map_err(|_| AutogradError::TapeInvariant("cuda unary length exceeds i32"))?;
+    let n = n_usize as u64;
     launch_1d(
         &backend.stream,
         backend.kernels.function(kernel_name)?,
@@ -6662,8 +6660,7 @@ fn cuda_scalar_1d(
         .stream
         .alloc_zeros::<f32>(n_usize)
         .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
-    let n = i32::try_from(n_usize)
-        .map_err(|_| AutogradError::TapeInvariant("cuda scalar length exceeds i32"))?;
+    let n = n_usize as u64;
     launch_1d(
         &backend.stream,
         backend.kernels.function(kernel_name)?,
@@ -6702,8 +6699,7 @@ fn cuda_binary_1d(
         .stream
         .alloc_zeros::<f32>(n_usize)
         .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
-    let n = i32::try_from(n_usize)
-        .map_err(|_| AutogradError::TapeInvariant("cuda binary length exceeds i32"))?;
+    let n = n_usize as u64;
     launch_1d(
         &backend.stream,
         backend.kernels.function(kernel_name)?,
@@ -6737,8 +6733,7 @@ fn cuda_unary_1d_device(
         .stream
         .alloc_zeros::<f32>(size)
         .map_err(|e| cuda_alloc_failed_rich(backend, op_label, size * 4, &e))?;
-    let n = i32::try_from(size)
-        .map_err(|_| AutogradError::TapeInvariant("cuda unary length exceeds i32"))?;
+    let n = size as u64;
     launch_1d(
         &backend.stream,
         backend.kernels.function(kernel_name)?,
@@ -6773,8 +6768,7 @@ fn cuda_scalar_1d_device(
         .stream
         .alloc_zeros::<f32>(size)
         .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
-    let n = i32::try_from(size)
-        .map_err(|_| AutogradError::TapeInvariant("cuda scalar length exceeds i32"))?;
+    let n = size as u64;
     launch_1d(
         &backend.stream,
         backend.kernels.function(kernel_name)?,
@@ -6810,8 +6804,7 @@ fn cuda_binary_1d_device(
         .stream
         .alloc_zeros::<f32>(size)
         .map_err(|e| cuda_alloc_failed_rich(backend, op_label, size * 4, &e))?;
-    let n = i32::try_from(size)
-        .map_err(|_| AutogradError::TapeInvariant("cuda binary length exceeds i32"))?;
+    let n = size as u64;
     launch_1d(
         &backend.stream,
         backend.kernels.function(kernel_name)?,
@@ -9455,10 +9448,6 @@ fn cuda_add_broadcast_backward_device(
     Ok(DeviceHandle::Cuda(CudaStorage::new(d_grad)))
 }
 
-// Shared helper for the 4 elementwise activation/exp backward
-// ops. All consume one extra device buffer (`saved`, either x or y) plus
-// `upstream`; output is the same `shape`. Returned handle is unevaluated
-// per the batched-eval contract.
 #[cfg(not(feature = "no-cuda"))]
 fn cuda_elementwise_backward_with_saved(
     backend: &CudaBackend,
@@ -9482,8 +9471,7 @@ fn cuda_elementwise_backward_with_saved(
         .stream
         .alloc_zeros::<f32>(size)
         .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
-    let n = i32::try_from(size)
-        .map_err(|_| AutogradError::TapeInvariant("cuda activation_backward length exceeds i32"))?;
+    let n = size as u64;
     launch_1d(
         &backend.stream,
         backend.kernels.function(kernel_name)?,
@@ -9564,10 +9552,6 @@ fn cuda_exp_backward_device(
     )
 }
 
-// Device-resident backward for `mul(a, b)`. Two independent 1D
-// NVRTC kernels, each gated by `need_grad_*` so the unused side is never
-// launched (mirrors `matmul_backward_device`'s short-circuit). Returned
-// handles are unevaluated.
 #[cfg(not(feature = "no-cuda"))]
 fn cuda_mul_backward_device(
     backend: &CudaBackend,
@@ -9592,8 +9576,7 @@ fn cuda_mul_backward_device(
             size,
         });
     }
-    let n = i32::try_from(size)
-        .map_err(|_| AutogradError::TapeInvariant("cuda mul_backward length exceeds i32"))?;
+    let n = size as u64;
 
     let grad_a = if need_grad_a {
         let mut d_out = backend.stream.alloc_zeros::<f32>(size).map_err(|_| {

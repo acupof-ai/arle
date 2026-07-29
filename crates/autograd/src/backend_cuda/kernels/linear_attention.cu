@@ -1,16 +1,4 @@
-// Qwen3.5 linear-attention backward scan spike.
-//
-// One CUDA block owns one (batch, value_head) stream and walks sequence in
-// reverse. The recurrence dependency is along time, so the cheap parallelism is
-// inside each step: threads cooperate across key_dim/value_dim reductions and
-// the key_dim x value_dim state-gradient matrix. This intentionally keeps the
-// existing Rust forward recompute and conv1d backward in place; the spike only
-// replaces the `scan_state_history` host loop.
-//
-// Index convention: int, EXCEPT products containing seq_len*key_dim*value_dim
-// (la_state_time_base) which overflow i32 near 8K total tokens and go through
-// long long. The chunked kernels below are batch==1-only (chunk_state carries
-// no batch stride); batch>1 is per-row dispatch in backend_cuda.rs.
+// Flattened offsets are 64-bit; dimensions remain 32-bit.
 
 static constexpr int LINEAR_ATTENTION_MAX_DIM = 256;
 static constexpr int LINEAR_ATTENTION_BLOCK = 256;
@@ -44,11 +32,17 @@ __device__ __forceinline__ float la_softplus(float x) {
     return x > 20.0f ? x : log1pf(expf(x));
 }
 
-__device__ __forceinline__ int la_idx3(int batch, int seq, int dim, int seq_len, int width) {
-    return (batch * seq_len + seq) * width + dim;
+__device__ __forceinline__ unsigned long long la_idx3(
+    int batch,
+    int seq,
+    int dim,
+    int seq_len,
+    int width
+) {
+    return (static_cast<unsigned long long>(batch) * seq_len + seq) * width + dim;
 }
 
-__device__ __forceinline__ int la_idx4(
+__device__ __forceinline__ unsigned long long la_idx4(
     int batch,
     int seq,
     int head,
@@ -57,7 +51,7 @@ __device__ __forceinline__ int la_idx4(
     int heads,
     int width
 ) {
-    return (((batch * seq_len + seq) * heads + head) * width) + dim;
+    return (((static_cast<unsigned long long>(batch) * seq_len + seq) * heads + head) * width) + dim;
 }
 
 __device__ __forceinline__ int la_state_base(
@@ -89,14 +83,15 @@ extern "C" __global__ void linear_attention_conv1d_silu_forward_f32_to_bf16(
     unsigned short* __restrict__ out_bf16,
     const float* __restrict__ x,
     const float* __restrict__ weight,
-    int total,
+    unsigned long long total,
     int channels,
     int seq_len,
     int kernel_size,
     const float* __restrict__ conv_tail,
     int tail_len
 ) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned long long idx =
+        static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (idx >= total) {
         return;
     }
@@ -316,7 +311,7 @@ extern "C" __global__ void linear_attention_scan_backward_f32(
 
         float local_dot_beta = 0.0f;
         for (int v = tid; v < value_dim; v += blockDim.x) {
-            int out_idx = la_idx4(
+            unsigned long long out_idx = la_idx4(
                 batch_idx, seq_idx, value_head, v, seq_len, num_value_heads, value_dim);
             float normed = core_out[v] * inv_rms * norm_weight[v];
             float gate = z[out_idx];
@@ -819,7 +814,7 @@ extern "C" __global__ void linear_attention_chunked_scan_backward_f32(
 
             float local_dot_beta = 0.0f;
             for (int v = tid; v < value_dim; v += blockDim.x) {
-                int out_idx = la_idx4(
+                unsigned long long out_idx = la_idx4(
                     batch_idx, seq_idx, value_head, v, seq_len, num_value_heads, value_dim);
                 float normed = core_out[v] * inv_rms * norm_weight[v];
                 float gate = z[out_idx];
@@ -1227,7 +1222,7 @@ extern "C" __global__ void linear_attention_chunk_transfer_f32(
 
         float local_dot_beta = 0.0f;
         for (int v = tid; v < value_dim; v += blockDim.x) {
-            int out_idx = la_idx4(
+            unsigned long long out_idx = la_idx4(
                 batch_idx, seq_idx, value_head, v, seq_len, num_value_heads, value_dim);
             float dcore_v = upstream[out_idx] * la_silu(z[out_idx]);
             dcore[v] = dcore_v;
@@ -1569,7 +1564,7 @@ extern "C" __global__ void linear_attention_chunk_grad_f32(
 
             float local_dot_beta = 0.0f;
             for (int v = tid; v < value_dim; v += blockDim.x) {
-                int out_idx = la_idx4(
+                unsigned long long out_idx = la_idx4(
                     batch_idx, seq_idx, value_head, v, seq_len, num_value_heads, value_dim);
                 float normed = core_out[v] * inv_rms * norm_weight[v];
                 float gate = z[out_idx];
@@ -1785,14 +1780,15 @@ extern "C" __global__ void linear_attention_conv1d_silu_backward_f32(
     const float* __restrict__ preact,
     const float* __restrict__ input,
     const float* __restrict__ weight,
-    int total,
+    unsigned long long total,
     int channels,
     int seq_len,
     int kernel_size,
     const float* __restrict__ conv_tail,
     int tail_len
 ) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned long long idx =
+        static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (idx >= total) {
         return;
     }
