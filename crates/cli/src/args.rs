@@ -1166,6 +1166,12 @@ pub(crate) struct OpdRuntimeArgs {
     /// serve's `--spec-type mtp --mtp-draft-tokens`). None (default) = off.
     #[arg(long, value_name = "N")]
     pub(crate) mtp_draft_tokens: Option<usize>,
+
+    /// KV-pool fraction of post-weights free VRAM for the in-process rollout
+    /// engine. The rollout is single-sequence, so the default 0.9 starves the
+    /// per-step LoRA re-merge scratch (OOM); lower it to leave re-merge room.
+    #[arg(long, default_value_t = 0.9, value_name = "F")]
+    pub(crate) rollout_mem_fraction: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
