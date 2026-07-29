@@ -16,9 +16,9 @@ private duplicate configs.
 | Axis | Core landed + CPU-gated | Pending-remote (pod NCCL) |
 |---|---|---|
 | **Mesh** | `train_mesh()` → `MultiAxisConfig`+`RankCoord`; `CpContext`/`Qwen35TensorParallelConfig`/`DpContext`/`PpContext` are derived views, one source of truth | — |
-| **CP** | option B live + converged; ring option-A flash-2 merge+backward (`ops/ring_attention.rs`) U2-gated vs full-softmax reference | ring device kernels + NCCL `ring_send_recv_kv`; model N=2 parity; default stays option B |
+| **CP** | option B live + converged; ring option-A is a **live tape op** (`cp_causal_sdpa`, `BackwardOp::RingAttention`) — world==1 taped grad matches `causal_sdpa_recompute`, multi-block merge+backward matches full-softmax reference | ring KV NCCL transport (remote blocks → same tile kernels); model N=2 parity; default stays option B |
 | **TP** | attention-TP live; **MoE-TP** built (column/row-parallel experts+shared, `maybe_tp_all_reduce`) | MoE finite-diff on ≥2 GPU |
-| **EP** | differentiable dispatch/combine permutation + adjoint (`ops/collective_ep.rs`), adjoint-gated `<S·x,y>=<x,Sᵀ·y>` | NCCL all-to-all transport; capacity + router aux loss; qwen35 routing hook |
+| **EP** | **live tape op** — `ep_dispatch_op`/`ep_combine_op` (`BackwardOp::EpDispatch`/`EpCombine`), backward = the transpose; dropped token gets zero grad; gated through the real tape | NCCL all-to-all transport; capacity + router aux loss; qwen35 routing hook |
 | **DP** | `DpContext` coord + batch-shard + `global_inv_n` global-mean math | DP launcher + count all-reduce + `opd.rs` gate `(cp‖dp)` |
 | **PP** | `PpContext` layer-partition (`pipeline_parallel.rs`); 1F1B documented as wrong-fit for single-pass writeback | cross-stage activation send/recv; layer-loop split |
 
