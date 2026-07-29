@@ -184,18 +184,7 @@ fn trace_checkpoint_group_vram() -> bool {
     std::env::var("ARLE_OPD_VRAM_TRACE").is_ok_and(|v| v != "0" && v != "false")
 }
 
-/// Seq-chunked recompute of a POSITION-WISE block: `replay(store, tape, inp)`
-/// maps row `i` of `inp[0]` (`[batch, seq, dim]` hidden) to row `i` of the
-/// output independently (RMSNorm, residual, MLP — NOT attention); `inp[1..]` are
-/// the block's trainable params (grads accumulate across chunks). Forward runs
-/// `replay` once full-seq tape-disabled (frees its own transients) for the
-/// output; the backward (`Tape::seq_chunked_recompute_backward`) re-runs `replay`
-/// on `chunk` seq rows at a time, so the recompute peak drops from
-/// `O(seq · intermediate)` to `O(chunk · intermediate)` — the 256K writeback
-/// lever. Bit-identical to the unchunked block up to float add-order. `chunk == 0`
-/// => inline passthrough on the live tape (off, zero overhead); `chunk >= seq`
-/// => single-shot recompute. Runs only under an
-/// enabled tape; a disabled tape (checkpoint forward pass) just replays.
+/// Chunk a position-wise block in forward and backward.
 pub fn checkpoint_seq_chunked<F>(
     input: TensorId,
     param_ids: Vec<TensorId>,
@@ -209,11 +198,7 @@ where
 {
     let mut input_ids = vec![input];
     input_ids.extend(param_ids);
-    // Off (chunk == 0, below the seq-adaptive threshold) or a disabled tape
-    // (checkpoint replay-forward) → inline on the current tape: normal autograd,
-    // no recompute, byte-identical to a plain block. Zero overhead, so the caller
-    // can invoke unconditionally.
-    if chunk == 0 || !tape.enabled {
+    if chunk == 0 {
         return replay(store, tape, &input_ids);
     }
     let shape = store.tensor(input)?.shape.clone();
@@ -224,10 +209,33 @@ where
         });
     };
 
+    let outer_enabled = tape.enabled;
     let live_before = store.live_ids().into_iter().collect::<HashSet<_>>();
     tape.enabled = false;
-    let forward = replay(store, tape, &input_ids);
-    tape.enabled = true;
+    let forward = (|| {
+        let mut output = None;
+        for start in (0..seq).step_by(chunk) {
+            let end = (start + chunk).min(seq);
+            let x = crate::ops::slice(input, &[0, start, 0], &[batch, end, dim], store, tape)?;
+            let mut chunk_inputs = vec![x];
+            chunk_inputs.extend_from_slice(&input_ids[1..]);
+            let y = replay(store, tape, &chunk_inputs)?;
+            let y = crate::ops::reshape(y, &[batch, 1, end - start, dim], store, tape)?;
+            output = Some(match output {
+                None => y,
+                Some(acc) => crate::ops::cat_seq(acc, y, store, tape)?,
+            });
+            store.free_new_except(
+                &live_before,
+                &HashSet::from([output.expect("chunk output")]),
+            )?;
+        }
+        let output = output.ok_or(AutogradError::TapeInvariant(
+            "seq_chunked_recompute empty sequence",
+        ))?;
+        crate::ops::reshape(output, &[batch, seq, dim], store, tape)
+    })();
+    tape.enabled = outer_enabled;
     let output_id = match forward {
         Ok(id) => id,
         Err(err) => {
@@ -242,7 +250,7 @@ where
     let requires_grad = input_ids
         .iter()
         .any(|&id| store.get(id).is_some_and(|tensor| tensor.requires_grad));
-    if requires_grad {
+    if outer_enabled && requires_grad {
         let effective_chunk = chunk.min(seq);
         let function_id = tape.register_checkpoint_fn(Arc::new(replay));
         tape.record(TapeEntry {
