@@ -1,33 +1,61 @@
-extern "C" __global__ void add_f32(float* out, const float* a, const float* b, int n) {
-    int i = (blockIdx.x * blockDim.x) + threadIdx.x;
+extern "C" __global__ void add_f32(
+    float* out,
+    const float* a,
+    const float* b,
+    unsigned long long n
+) {
+    unsigned long long i =
+        static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i < n) {
         out[i] = a[i] + b[i];
     }
 }
 
-extern "C" __global__ void mul_f32(float* out, const float* a, const float* b, int n) {
-    int i = (blockIdx.x * blockDim.x) + threadIdx.x;
+extern "C" __global__ void mul_f32(
+    float* out,
+    const float* a,
+    const float* b,
+    unsigned long long n
+) {
+    unsigned long long i =
+        static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i < n) {
         out[i] = a[i] * b[i];
     }
 }
 
-extern "C" __global__ void mul_scalar_f32(float* out, const float* a, float s, int n) {
-    int i = (blockIdx.x * blockDim.x) + threadIdx.x;
+extern "C" __global__ void mul_scalar_f32(
+    float* out,
+    const float* a,
+    float s,
+    unsigned long long n
+) {
+    unsigned long long i =
+        static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i < n) {
         out[i] = a[i] * s;
     }
 }
 
-extern "C" __global__ void sigmoid_f32(float* out, const float* a, int n) {
-    int i = (blockIdx.x * blockDim.x) + threadIdx.x;
+extern "C" __global__ void sigmoid_f32(
+    float* out,
+    const float* a,
+    unsigned long long n
+) {
+    unsigned long long i =
+        static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i < n) {
         out[i] = 1.0f / (1.0f + __expf(-a[i]));
     }
 }
 
-extern "C" __global__ void gelu_f32(float* out, const float* a, int n) {
-    int i = (blockIdx.x * blockDim.x) + threadIdx.x;
+extern "C" __global__ void gelu_f32(
+    float* out,
+    const float* a,
+    unsigned long long n
+) {
+    unsigned long long i =
+        static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i < n) {
         float x = a[i];
         float x3 = x * x * x;
@@ -36,15 +64,25 @@ extern "C" __global__ void gelu_f32(float* out, const float* a, int n) {
     }
 }
 
-extern "C" __global__ void exp_f32(float* out, const float* a, int n) {
-    int i = (blockIdx.x * blockDim.x) + threadIdx.x;
+extern "C" __global__ void exp_f32(
+    float* out,
+    const float* a,
+    unsigned long long n
+) {
+    unsigned long long i =
+        static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i < n) {
         out[i] = expf(a[i]);
     }
 }
 
-extern "C" __global__ void neg_f32(float* out, const float* a, int n) {
-    int i = (blockIdx.x * blockDim.x) + threadIdx.x;
+extern "C" __global__ void neg_f32(
+    float* out,
+    const float* a,
+    unsigned long long n
+) {
+    unsigned long long i =
+        static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i < n) {
         out[i] = -a[i];
     }
