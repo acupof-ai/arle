@@ -196,6 +196,16 @@ impl Qwen35TensorParallelConfig {
         Self { rank, world_size }
     }
 
+    /// TP placement from the one device mesh: the attention-TP sub-axis of
+    /// `infer_topo` (`attn_tp_rank` / `attn_tp_size`), so train and serve derive
+    /// TP coordinates from a single `MultiAxisConfig` instead of two private configs.
+    pub fn from_coord(cfg: infer_topo::MultiAxisConfig, coord: infer_topo::RankCoord) -> Self {
+        Self {
+            rank: coord.attn_tp_rank,
+            world_size: cfg.attn_tp_size(),
+        }
+    }
+
     pub fn is_enabled(self) -> bool {
         self.world_size > 1
     }

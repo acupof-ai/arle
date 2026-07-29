@@ -37,6 +37,9 @@ tokenizers = { workspace = true }
 ureq = { version = "2.12", features = ["json"] }
 qwen35-spec = { path = "../qwen35-spec" }
 chat = { path = "../chat" }
+# Device-neutral coord/sharding math (std-only): the one mesh both serve and
+# train read parallelism coordinates from.
+infer-topo = { path = "../infer-topo" }
 infer-api = { path = "../infer-api", default-features = false, optional = true }
 infer-plan = { path = "../infer-plan" }
 # cc-convert reuses the REAL /v1/messages -> ChatCompletionRequest mapping
