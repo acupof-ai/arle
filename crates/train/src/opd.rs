@@ -3690,15 +3690,7 @@ impl ValueCritic {
     }
 }
 
-/// Frozen-prompt-KV variant of `masked_writeback_ce_step`: forwards + backwards
-/// ONLY the generated segment. `gen_start = prompt_len - 1` (the boundary token
-/// predicts the first response token); the gen rows are `full[gen_start..]` and
-/// the cached prefix covers absolute positions `0..gen_start`. The dropped term
-/// (LoRA gradient on the prompt KV) is exactly zero at lora_b=0 and small
-/// otherwise, so the loss + response-position grads match the full path. Gated
-/// behind `--writeback-frozen-prompt-kv` via
-/// `masked_writeback_ce_step_dispatch`; this function is NOT a branch inside the
-/// byte-identical baseline `masked_writeback_ce_step`.
+/// Frozen-prompt compatibility wrapper.
 #[allow(clippy::too_many_arguments)]
 pub fn masked_writeback_ce_step_frozen_prompt_kv<O: Optimizer>(
     student: &Qwen35Model,
@@ -3712,145 +3704,22 @@ pub fn masked_writeback_ce_step_frozen_prompt_kv<O: Optimizer>(
     window_size: usize,
     store: &mut TensorStore,
 ) -> Result<f32> {
-    if prompt_ids.is_empty() {
-        return Err(OpdError::InvalidInput(
-            "masked writeback requires a non-empty prompt".to_owned(),
-        ));
-    }
-    if window_size == 0 {
-        return Err(OpdError::InvalidInput(
-            "masked writeback window_size must be > 0".to_owned(),
-        ));
-    }
-
-    let prompt_len = prompt_ids.len();
-    let full: Vec<u32> = prompt_ids
-        .iter()
-        .copied()
-        .chain(response_ids.iter().copied())
-        .collect();
-    let seq_len = full.len();
-    if seq_len > u32::MAX as usize {
-        return Err(OpdError::InvalidInput(format!(
-            "masked writeback trajectory length {seq_len} exceeds u32::MAX \
-             position ids."
-        )));
-    }
-
-    let loss_targets = build_masked_loss_targets(&full, prompt_len, response_mask);
-    if loss_targets.is_empty() {
-        eprintln!(
-            "[masked-writeback-frozen] no LLM-generated targets (prompt_len={prompt_len}, \
-             response_len={}, mask_ones={}); skipping (nothing to train)",
-            response_ids.len(),
-            response_mask.iter().filter(|&&m| m == 1).count(),
-        );
-        return Ok(0.0);
-    }
-    let total_targets = loss_targets.len();
-    let chunk_rows = window_size;
-
-    // gen_start = prompt_len - 1: the boundary token predicts the first response
-    // token. The prefix capture covers positions 0..gen_start; the gen segment
-    // covers gen_start..seq_len (= [full[gen_start]] ++ response_ids).
-    let gen_start = prompt_len - 1;
-    let prompt_prefix: Vec<u32> = full[0..gen_start].to_vec();
-    let gen_ids: Vec<u32> = full[gen_start..].to_vec();
-    let prompt_positions: Vec<u32> = (0..gen_start as u32).collect();
-    let gen_positions: Vec<u32> = (gen_start as u32..seq_len as u32).collect();
-
-    // Rebase predicting-position p into the [0, gen_len) gen tensor. Since every
-    // p >= prompt_len - 1 = gen_start, (p - gen_start) >= 0.
-    let mut position_indices: Vec<i32> = Vec::with_capacity(total_targets);
-    let mut target_tokens: Vec<i32> = Vec::with_capacity(total_targets);
-    for &(p, target) in &loss_targets {
-        if target >= vocab {
-            return Err(OpdError::InvalidInput(format!(
-                "masked writeback target token {target} at position {p} exceeds vocab={vocab}"
-            )));
-        }
-        position_indices.push((p - gen_start) as i32);
-        target_tokens.push(target as i32);
-    }
-
-    let mut tape = Tape::new();
-    let offload_checkpoints = crate::runtime_flags::writeback_offload_for_seq(seq_len);
-    tape.set_offload_checkpoints(offload_checkpoints);
-    tape.set_enabled(true);
-    eprintln!("[masked-writeback-frozen] offload_checkpoints={offload_checkpoints}");
-    let keep_extra: HashSet<TensorId> = HashSet::new();
-    let gen_len = gen_ids.len();
-    eprintln!(
-        "[masked-writeback-frozen] seq_len={seq_len} gen_start={gen_start} gen_len={gen_len} \
-         total_targets={total_targets} chunk_rows={chunk_rows}"
-    );
-
-    // ONE checkpointed gen-segment forward → [1, gen_len, hidden]; the prompt
-    // prefix KV/state is captured off-tape and seeds the attention.
-    let vram_base = log_writeback_vram(
+    masked_writeback_step(
+        WritebackLoss::Ce,
+        student,
+        all_model_params,
+        trainable_params,
+        optimizer,
+        true,
+        prompt_ids,
+        response_ids,
+        response_mask,
+        vocab,
+        window_size,
+        crate::context_parallel::CpContext::single(),
         store,
-        "masked-writeback-frozen",
-        "pre forward_hidden_states_gen_segment",
-    );
-    let t_fwd = Instant::now();
-    let hidden = student
-        .forward_hidden_states_gen_segment(
-            store,
-            &mut tape,
-            &prompt_prefix,
-            &gen_ids,
-            &prompt_positions,
-            &gen_positions,
-        )
-        .map_err(|err| {
-            map_qwen35_forward_error("masked writeback frozen-prompt-KV student hidden", err)
-        })?;
-    let fwd_secs = t_fwd.elapsed().as_secs_f64();
-    let vram_post_forward = log_writeback_vram(
-        store,
-        "masked-writeback-frozen",
-        "post forward_hidden_states_gen_segment",
-    );
-    eprintln!("[masked-writeback-frozen] phase=forward_gen_segment seconds={fwd_secs:.3}");
-
-    let t_ce = Instant::now();
-    let loss = fused_linear_ce_loss_indexed(
-        hidden,
-        student.lm_head_weight_id(),
-        &position_indices,
-        &target_tokens,
-        chunk_rows,
-        None,
-        store,
-        &mut tape,
     )
-    .map_err(OpdError::from)?;
-
-    let loss_value = store.to_host(loss).map_err(OpdError::from)?[0];
-    validate_loss_value(loss_value)?;
-    let ce_secs = t_ce.elapsed().as_secs_f64();
-    eprintln!("[masked-writeback-frozen] phase=fused_ce seconds={ce_secs:.3}");
-    let t_bwd = Instant::now();
-    backward_with_optional_profile(loss, loss_value, store, &mut tape)?;
-    let bwd_secs = t_bwd.elapsed().as_secs_f64();
-    let vram_post_backward = log_writeback_vram(store, "masked-writeback-frozen", "post backward");
-    eprintln!("[masked-writeback-frozen] phase=backward seconds={bwd_secs:.3}");
-    let t_opt = Instant::now();
-    finite_optimizer_step(loss_value, trainable_params, 0.0, optimizer, store)?;
-    cleanup_after_backward(store, &mut tape, all_model_params, &keep_extra);
-    let opt_secs = t_opt.elapsed().as_secs_f64();
-    let vram_post_cleanup = log_writeback_vram(store, "masked-writeback-frozen", "post cleanup");
-    log_writeback_vram_ledger(
-        "masked-writeback-frozen",
-        vram_base,
-        vram_post_forward,
-        vram_post_backward,
-        vram_post_cleanup,
-    );
-    eprintln!("[masked-writeback-frozen] phase=optimizer_cleanup seconds={opt_secs:.3}");
-
-    eprintln!("[masked-writeback-frozen] DONE loss={loss_value:.6} total_targets={total_targets}");
-    Ok(loss_value)
+    .map(|(loss, _)| loss)
 }
 
 /// Dispatch between the byte-identical baseline `masked_writeback_ce_step` and
