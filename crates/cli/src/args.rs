@@ -2245,6 +2245,18 @@ pub(crate) struct TrainAgentOpdArgs {
     #[arg(long, default_value_t = 0)]
     pub(crate) synthetic_writeback_seq: usize,
 
+    /// Context-parallel group size (sequence sharded across N GPUs, one process
+    /// per rank). 1 = single-card (default, byte-identical). >1 spawns N ranks and
+    /// requires the nccl feature. The 256K writeback needs this — single-card peaks
+    /// past one card at ~seq 49152.
+    #[arg(long, default_value_t = 1)]
+    pub(crate) cp_size: usize,
+
+    /// Comma-separated CUDA device ordinals for the CP ranks (e.g. "0,1,2,3").
+    /// Defaults to 0..cp_size. Length must equal cp_size when set.
+    #[arg(long)]
+    pub(crate) cp_devices: Option<String>,
+
     /// Skip LoRA on all routed MoE expert projections (gate/up/down per expert).
     /// Keeps LoRA only on attention projections (q/k/v/o) and shared experts.
     /// Drops LoRA params from ~6.1B to ~59M and Adam state from ~49 GB to ~0.5 GB,
@@ -2283,6 +2295,19 @@ pub(crate) struct TrainAgentOpdArgs {
 }
 
 impl TrainAgentOpdArgs {
+    /// Per-rank CUDA device ordinals for context parallelism. `--cp-devices` if
+    /// set (must be `cp_size` entries), else `0..cp_size`.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    pub(crate) fn cp_devices(&self) -> Vec<usize> {
+        match &self.cp_devices {
+            Some(spec) => spec
+                .split(',')
+                .filter_map(|s| s.trim().parse().ok())
+                .collect(),
+            None => (0..self.cp_size.max(1)).collect(),
+        }
+    }
+
     /// The `--update-strategy` preset; the sao-* flags override the SAO presets'
     /// clip/GAE fields (their clap defaults ARE the preset defaults).
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
