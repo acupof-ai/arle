@@ -12,9 +12,9 @@ use smallvec::smallvec;
 use crate::{
     AutogradError, Result,
     backend::{
-        Device, LinearAttentionDeviceBackwardArgs, LinearAttentionDeviceForwardArgs,
-        LinearAttentionDeviceParams, LinearAttentionScanBackwardArgs,
-        LinearAttentionScanBackwardParams,
+        Device, DeviceHandle, LinearAttentionDeviceBackwardArgs, LinearAttentionDeviceBoundaryArgs,
+        LinearAttentionDeviceForwardArgs, LinearAttentionDeviceParams,
+        LinearAttentionScanBackwardArgs, LinearAttentionScanBackwardParams,
     },
     tape::{BackwardOp, GradPairs, SavedContext, Tape, TapeEntry},
     tensor::{Tensor, TensorId, TensorStore},
@@ -30,6 +30,21 @@ pub struct LinearAttentionParams {
     pub value_dim: usize,
     pub conv_kernel: usize,
     pub eps: f32,
+}
+
+impl From<LinearAttentionParams> for LinearAttentionDeviceParams {
+    fn from(p: LinearAttentionParams) -> Self {
+        Self {
+            batch: p.batch,
+            seq_len: p.seq_len,
+            num_key_heads: p.num_key_heads,
+            num_value_heads: p.num_value_heads,
+            key_dim: p.key_dim,
+            value_dim: p.value_dim,
+            conv_kernel: p.conv_kernel,
+            eps: p.eps,
+        }
+    }
 }
 
 struct LinearAttentionForward {
@@ -399,7 +414,7 @@ pub fn linear_attention_core_with_carry(
     let a_log_tensor = store.tensor_host(a_log)?;
     let norm_tensor = store.tensor_host(norm_weight)?;
 
-    let conv_window = params.conv_kernel.saturating_sub(1);
+    let conv_window = params.conv_kernel - 1;
     let initial_state_data = initial_state.map(|id| store.tensor_host(id)).transpose()?;
     let initial_conv_data = initial_conv_window
         .map(|id| store.tensor_host(id))
@@ -480,6 +495,96 @@ pub fn linear_attention_core_with_carry(
     };
 
     Ok((output_id, final_state_id, conv_window_id))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn linear_attention_boundary(
+    qkv: TensorId,
+    b_proj: TensorId,
+    a_proj: TensorId,
+    conv1d_weight: TensorId,
+    dt_bias: TensorId,
+    a_log: TensorId,
+    params: LinearAttentionParams,
+    initial_state: Option<TensorId>,
+    initial_conv_window: Option<TensorId>,
+    store: &mut TensorStore,
+) -> Result<(TensorId, TensorId)> {
+    validate_boundary_shapes(
+        qkv,
+        b_proj,
+        a_proj,
+        conv1d_weight,
+        dt_bias,
+        a_log,
+        params,
+        store,
+    )?;
+
+    let window = params.conv_kernel - 1;
+    if store.backend().device() != Device::Cuda || params.seq_len < window {
+        return Err(AutogradError::TapeInvariant(
+            "linear attention boundary requires CUDA and a full conv window",
+        ));
+    }
+
+    let qkv_handle = device_handle(qkv, store)?;
+    let b_handle = device_handle(b_proj, store)?;
+    let a_handle = device_handle(a_proj, store)?;
+    let conv_handle = device_handle(conv1d_weight, store)?;
+    let dt_handle = device_handle(dt_bias, store)?;
+    let a_log_handle = device_handle(a_log, store)?;
+    let initial_state_handle = initial_state
+        .map(|id| device_handle(id, store))
+        .transpose()?;
+    let initial_conv_handle = initial_conv_window
+        .map(|id| device_handle(id, store))
+        .transpose()?;
+    let state = store
+        .backend()
+        .linear_attention_boundary_device(LinearAttentionDeviceBoundaryArgs {
+            params: params.into(),
+            qkv: &qkv_handle,
+            b_proj: &b_handle,
+            a_proj: &a_handle,
+            conv1d_weight: &conv_handle,
+            dt_bias: &dt_handle,
+            a_log: &a_log_handle,
+            initial_state: initial_state_handle.as_ref(),
+            initial_conv_window: initial_conv_handle.as_ref(),
+        })?
+        .ok_or(AutogradError::TapeInvariant(
+            "linear attention boundary unsupported",
+        ))?;
+    let state = store.alloc_device_tensor(
+        vec![
+            params.batch,
+            params.num_value_heads,
+            params.key_dim,
+            params.value_dim,
+        ],
+        state,
+    )?;
+    let qkv_dim =
+        2 * params.num_key_heads * params.key_dim + params.num_value_heads * params.value_dim;
+    let conv = if window == 0 {
+        store.alloc(Tensor::new(
+            Vec::new(),
+            vec![params.batch, 0, qkv_dim],
+            false,
+        )?)
+    } else {
+        let mut tape = Tape::new();
+        tape.set_enabled(false);
+        crate::ops::slice(
+            qkv,
+            &[0, params.seq_len - window, 0],
+            &[params.batch, params.seq_len, qkv_dim],
+            store,
+            &mut tape,
+        )?
+    };
+    Ok((state, conv))
 }
 
 /// TAPED carry variant for the OPD frozen-prompt-KV generated segment: runs the
@@ -689,19 +794,40 @@ pub fn linear_attention_core_with_carry_taped(
     Ok(output_id)
 }
 
-/// Tape bytes the device forward saves per call — the 12 ctx tensors recorded
-/// below (f32: preact, output, g/g_cumsum/beta, chunk_state; bf16: qkv_conv,
-/// q, k, v, a_inv, raw_output). Exported so VRAM gates can model checkpointing
-/// without duplicating the alloc shapes/dtypes; keep in sync with the
-/// `alloc_device_tensor` calls in `try_linear_attention_forward_device`.
+/// Bytes retained by `try_linear_attention_forward_device`.
 pub fn linear_attention_ctx_bytes(params: LinearAttentionParams) -> usize {
     let (hk, kd) = (params.num_key_heads, params.key_dim);
     let (hv, vd) = (params.num_value_heads, params.value_dim);
     let seq = params.seq_len;
     let qkv_dim = 2 * hk * kd + hv * vd;
-    let f32_elems = seq * (qkv_dim + hv * vd + 3 * hv) + seq.div_ceil(64) * hv * kd * vd;
-    let bf16_elems = seq * (qkv_dim + hv * (2 * kd + 2 * vd + 64));
+    let f32_elems = seq * (qkv_dim + hv * vd + 2 * hv) + seq.div_ceil(64) * hv * kd * vd;
+    let bf16_elems = seq * qkv_dim;
     params.batch * (4 * f32_elems + 2 * bf16_elems)
+}
+
+#[test]
+fn linear_attention_ctx_bytes_counts_retained_tensors() {
+    let params = LinearAttentionParams {
+        batch: 2,
+        seq_len: 65,
+        num_key_heads: 2,
+        num_value_heads: 3,
+        key_dim: 4,
+        value_dim: 5,
+        conv_kernel: 4,
+        eps: 1e-6,
+    };
+    assert_eq!(linear_attention_ctx_bytes(params), 36_060);
+}
+
+fn device_handle(id: TensorId, store: &mut TensorStore) -> Result<DeviceHandle> {
+    store.ensure_device(id)?;
+    Ok(store
+        .tensor(id)?
+        .device_handle
+        .as_ref()
+        .expect("device")
+        .clone())
 }
 
 fn try_linear_attention_forward_device(
@@ -724,97 +850,26 @@ fn try_linear_attention_forward_device(
         return Ok(None);
     }
 
-    for tensor_id in [
-        qkv,
-        z,
-        b_proj,
-        a_proj,
-        conv1d_weight,
-        dt_bias,
-        a_log,
-        norm_weight,
-    ]
-    .into_iter()
-    .chain(initial_state)
-    .chain(initial_conv_window)
-    {
-        store.ensure_device(tensor_id)?;
-    }
-
-    let qkv_handle = store
-        .tensor(qkv)?
-        .device_handle
-        .as_ref()
-        .expect("device")
-        .clone();
-    let z_handle = store
-        .tensor(z)?
-        .device_handle
-        .as_ref()
-        .expect("device")
-        .clone();
-    let b_handle = store
-        .tensor(b_proj)?
-        .device_handle
-        .as_ref()
-        .expect("device")
-        .clone();
-    let a_handle = store
-        .tensor(a_proj)?
-        .device_handle
-        .as_ref()
-        .expect("device")
-        .clone();
-    let conv_handle = store
-        .tensor(conv1d_weight)?
-        .device_handle
-        .as_ref()
-        .expect("device")
-        .clone();
-    let dt_handle = store
-        .tensor(dt_bias)?
-        .device_handle
-        .as_ref()
-        .expect("device")
-        .clone();
-    let a_log_handle = store
-        .tensor(a_log)?
-        .device_handle
-        .as_ref()
-        .expect("device")
-        .clone();
-    let norm_handle = store
-        .tensor(norm_weight)?
-        .device_handle
-        .as_ref()
-        .expect("device")
-        .clone();
-    // Carry handles (None = default zero-seed): frozen prompt state + conv window for OPD.
-    let resolve = |id| -> Result<_> {
-        Ok(store
-            .tensor(id)?
-            .device_handle
-            .as_ref()
-            .expect("device")
-            .clone())
-    };
-    let initial_state_handle = initial_state.map(resolve).transpose()?;
-    let initial_conv_handle = initial_conv_window.map(resolve).transpose()?;
+    let qkv_handle = device_handle(qkv, store)?;
+    let z_handle = device_handle(z, store)?;
+    let b_handle = device_handle(b_proj, store)?;
+    let a_handle = device_handle(a_proj, store)?;
+    let conv_handle = device_handle(conv1d_weight, store)?;
+    let dt_handle = device_handle(dt_bias, store)?;
+    let a_log_handle = device_handle(a_log, store)?;
+    let norm_handle = device_handle(norm_weight, store)?;
+    let initial_state_handle = initial_state
+        .map(|id| device_handle(id, store))
+        .transpose()?;
+    let initial_conv_handle = initial_conv_window
+        .map(|id| device_handle(id, store))
+        .transpose()?;
 
     let Some(result) =
         store
             .backend()
             .linear_attention_forward_device(LinearAttentionDeviceForwardArgs {
-                params: LinearAttentionDeviceParams {
-                    batch: params.batch,
-                    seq_len: params.seq_len,
-                    num_key_heads: params.num_key_heads,
-                    num_value_heads: params.num_value_heads,
-                    key_dim: params.key_dim,
-                    value_dim: params.value_dim,
-                    conv_kernel: params.conv_kernel,
-                    eps: params.eps,
-                },
+                params: params.into(),
                 qkv: &qkv_handle,
                 z: &z_handle,
                 b_proj: &b_handle,
@@ -839,30 +894,26 @@ fn try_linear_attention_forward_device(
         params.num_value_heads * params.value_dim,
     ];
     let head_shape = vec![params.batch, params.seq_len, params.num_value_heads];
-    let preact_id =
-        store.alloc_device_tensor(vec![params.batch, params.seq_len, qkv_dim], result.preact)?;
-    let qkv_conv_id =
-        store.alloc_device_tensor(vec![params.batch, params.seq_len, qkv_dim], result.qkv_conv)?;
-    // q/k/v/g_cumsum/a_inv/raw_output are forward-only scratch: the device backward
-    // recomputes them and never reads the saved copies (backend_cuda.rs row worker).
-    // Not retained → their `result.*` handles free here instead of pinning the tape
-    // (~10 GiB/LA-layer at seq=256K).
-    let g_id = store.alloc_device_tensor(head_shape.clone(), result.g)?;
-    let beta_id = store.alloc_device_tensor(head_shape, result.beta)?;
-    let chunk_state_id = store.alloc_device_tensor(
-        vec![
-            params.batch,
-            num_chunks,
-            params.num_value_heads,
-            params.key_dim,
-            params.value_dim,
-        ],
-        result.chunk_state,
-    )?;
     let output_id = store.alloc_device_tensor(output_shape, result.output)?;
     store.set_requires_grad(output_id, requires_grad)?;
 
     if requires_grad {
+        let preact_id = store
+            .alloc_device_tensor(vec![params.batch, params.seq_len, qkv_dim], result.preact)?;
+        let qkv_conv_id = store
+            .alloc_device_tensor(vec![params.batch, params.seq_len, qkv_dim], result.qkv_conv)?;
+        let g_id = store.alloc_device_tensor(head_shape.clone(), result.g)?;
+        let beta_id = store.alloc_device_tensor(head_shape, result.beta)?;
+        let chunk_state_id = store.alloc_device_tensor(
+            vec![
+                params.batch,
+                num_chunks,
+                params.num_value_heads,
+                params.key_dim,
+                params.value_dim,
+            ],
+            result.chunk_state,
+        )?;
         tape.record(TapeEntry {
             op: BackwardOp::LinearAttention,
             output_id,
@@ -1641,9 +1692,56 @@ fn validate_shapes(
     params: LinearAttentionParams,
     store: &TensorStore,
 ) -> Result<()> {
+    validate_boundary_shapes(
+        qkv,
+        b_proj,
+        a_proj,
+        conv1d_weight,
+        dt_bias,
+        a_log,
+        params,
+        store,
+    )?;
+    for (tensor, expected) in [
+        (
+            z,
+            vec![
+                params.batch,
+                params.seq_len,
+                params.num_value_heads * params.value_dim,
+            ],
+        ),
+        (norm_weight, vec![params.value_dim]),
+    ] {
+        let shape = &store.tensor(tensor)?.shape;
+        if *shape != expected {
+            return Err(AutogradError::ShapeMismatch {
+                expected,
+                got: shape.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_boundary_shapes(
+    qkv: TensorId,
+    b_proj: TensorId,
+    a_proj: TensorId,
+    conv1d_weight: TensorId,
+    dt_bias: TensorId,
+    a_log: TensorId,
+    params: LinearAttentionParams,
+    store: &TensorStore,
+) -> Result<()> {
+    if params.conv_kernel == 0 {
+        return Err(AutogradError::TapeInvariant(
+            "linear attention conv kernel is zero",
+        ));
+    }
     let q_dim = params.num_key_heads * params.key_dim;
     let qkv_dim = q_dim * 2 + params.num_value_heads * params.value_dim;
-    let z_dim = params.num_value_heads * params.value_dim;
     let expected_rank3 = |tensor: TensorId, dim: usize| -> Result<()> {
         let shape = &store.tensor(tensor)?.shape;
         if shape != &vec![params.batch, params.seq_len, dim] {
@@ -1655,7 +1753,6 @@ fn validate_shapes(
         Ok(())
     };
     expected_rank3(qkv, qkv_dim)?;
-    expected_rank3(z, z_dim)?;
     expected_rank3(b_proj, params.num_value_heads)?;
     expected_rank3(a_proj, params.num_value_heads)?;
 
@@ -1674,11 +1771,8 @@ fn validate_shapes(
         });
     }
 
-    for (tensor, expected) in [
-        (dt_bias, vec![params.num_value_heads]),
-        (a_log, vec![params.num_value_heads]),
-        (norm_weight, vec![params.value_dim]),
-    ] {
+    for tensor in [dt_bias, a_log] {
+        let expected = vec![params.num_value_heads];
         let shape = &store.tensor(tensor)?.shape;
         if *shape != expected {
             return Err(AutogradError::ShapeMismatch {
