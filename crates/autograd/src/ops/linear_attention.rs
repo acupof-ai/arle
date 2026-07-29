@@ -345,20 +345,7 @@ pub fn linear_attention_core(
     Ok(output_id)
 }
 
-/// Host linear-attention forward that can seed the recurrent state + causal-conv
-/// window from a prior segment and surface the boundary `final_state` + conv tail.
-///
-/// This is the OPD frozen-prompt-KV split primitive: the prompt pass runs with
-/// `capture_boundary = true` (off-tape, `requires_grad = false`) to harvest the
-/// boundary `(final_state, conv_window)`; the generated pass seeds them via
-/// `initial_state` / `initial_conv_window`. The split reproduces the full-sequence
-/// suffix exactly because the gated-delta recurrence is Markovian in `state` and
-/// the conv1d is a fixed-width causal window.
-///
-/// `initial_state` shape: `[batch, num_value_heads, key_dim, value_dim]`.
-/// `initial_conv_window` shape: `[batch, conv_kernel-1, qkv_dim]`.
-/// Returns `(output, Some(final_state) if capture, Some(conv_window) if capture)`.
-/// Host-only (no device dispatch, no tape) — the forward-correctness de-risk gate.
+/// Host reference with recurrent and convolution carry.
 #[allow(clippy::too_many_arguments)]
 pub fn linear_attention_core_with_carry(
     qkv: TensorId,
@@ -587,16 +574,7 @@ pub fn linear_attention_boundary(
     Ok((state, conv))
 }
 
-/// TAPED carry variant for the OPD frozen-prompt-KV generated segment: runs the
-/// gated-delta forward seeded from a prior (prompt) segment's `initial_state` +
-/// `initial_conv_window`, records `BackwardOp::LinearAttention` so grad flows
-/// into the 8 projection inputs exactly as `linear_attention_core` does. The
-/// carry inputs are CONSTANTS (the frozen prompt KV, `requires_grad = false`) —
-/// no grad flows into them.
-///
-/// Tries the device forward first (seeds the carry into `chunk_state[0]`, reuses
-/// the chunked backward); falls back to the host recompute on CPU / unsupported
-/// shapes. The default `linear_attention_core` device path is untouched.
+/// Taped generated segment seeded by frozen carry.
 #[allow(clippy::too_many_arguments)]
 pub fn linear_attention_core_with_carry_taped(
     qkv: TensorId,
@@ -643,9 +621,7 @@ pub fn linear_attention_core_with_carry_taped(
             .map(|tensor| acc || tensor.requires_grad)
     })?;
 
-    // Device path seeds the carry into chunk_state[0] and reuses the chunked backward
-    // (records carry ctx as None → has_carry stays false → device backward). Host below
-    // is the CPU/unsupported fallback.
+    // Carry is constant; device backward reuses chunk_state[0].
     if let Some(output_id) = try_linear_attention_forward_device(
         qkv,
         z,
