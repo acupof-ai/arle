@@ -15,10 +15,10 @@ use autograd::{
         MoeTopK, add, add_broadcast, all_gather_seq, all_reduce_sum, cat_seq,
         causal_sdpa_recompute, causal_sdpa_recompute_with_q_start, causal_sdpa_with_q_start,
         checkpoint_sequential, embedding, linear_attention_boundary, linear_attention_core,
-        linear_attention_core_with_carry_taped, linear_attention_ctx_bytes, matmul_bt_with_site,
-        moe_grouped_linear, moe_grouped_weighted_scatter, moe_topk_softmax,
-        moe_topk_softmax_with_indices, mul, repeat_kv, reshape, rmsnorm, rope, sigmoid, silu,
-        slice, transpose,
+        linear_attention_core_with_carry, linear_attention_core_with_carry_taped,
+        linear_attention_ctx_bytes, matmul_bt_with_site, moe_grouped_linear,
+        moe_grouped_weighted_scatter, moe_topk_softmax, moe_topk_softmax_with_indices, mul,
+        repeat_kv, reshape, rmsnorm, rope, sigmoid, silu, slice, transpose,
     },
     tape::checkpoint_replay_mem_stage,
 };
@@ -2451,18 +2451,44 @@ impl Qwen35Layer {
         let qkv = attn.in_proj_qkv.forward(h_prefix, store, tape)?;
         let b_proj = attn.in_proj_b.forward(h_prefix, store, tape)?;
         let a_proj = attn.in_proj_a.forward(h_prefix, store, tape)?;
-        let (state, conv_window) = linear_attention_boundary(
-            qkv,
-            b_proj,
-            a_proj,
-            attn.conv1d_weight,
-            attn.dt_bias,
-            attn.a_log,
-            la_params(cfg, batch, gen_start),
-            None,
-            None,
-            store,
-        )?;
+        let params = la_params(cfg, batch, gen_start);
+        let (state, conv_window) = if store.backend().device() == Device::Cuda {
+            linear_attention_boundary(
+                qkv,
+                b_proj,
+                a_proj,
+                attn.conv1d_weight,
+                attn.dt_bias,
+                attn.a_log,
+                params,
+                None,
+                None,
+                store,
+            )?
+        } else {
+            let z = attn.in_proj_z.forward(h_prefix, store, tape)?;
+            let (_, state, conv) = linear_attention_core_with_carry(
+                qkv,
+                z,
+                b_proj,
+                a_proj,
+                attn.conv1d_weight,
+                attn.dt_bias,
+                attn.a_log,
+                attn.norm,
+                params,
+                None,
+                None,
+                true,
+                store,
+            )?;
+            (
+                state.ok_or(Qwen35Error::InvalidConfig("missing linear-attention state"))?,
+                conv.ok_or(Qwen35Error::InvalidConfig(
+                    "missing linear-attention conv tail",
+                ))?,
+            )
+        };
         Ok(PrefixState { state, conv_window })
     }
 
