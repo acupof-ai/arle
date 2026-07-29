@@ -1986,6 +1986,146 @@ impl Backend for CudaBackend {
         }
     }
 
+    fn all_gather_seq_device(
+        &self,
+        x: &DeviceHandle,
+        local_shape: &[usize],
+    ) -> Result<DeviceHandle> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (x, local_shape);
+            todo!("GPU required: cuda all_gather_seq_device is unavailable under feature no-cuda")
+        }
+
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            let local_len = shape_size(local_shape);
+            let src = self.cuda_slice(x, "all_gather_seq")?;
+            if src.len() != local_len {
+                return Err(AutogradError::DataLengthMismatch {
+                    len: src.len(),
+                    shape: local_shape.to_vec(),
+                    size: local_len,
+                });
+            }
+
+            // No communicator (single-process / CPU parity path): identity — the
+            // gathered full sequence equals this rank's local shard (world==1).
+            #[cfg(feature = "nccl")]
+            let world = self.nccl.as_ref().map_or(1, |nccl| nccl.world_size());
+            #[cfg(not(feature = "nccl"))]
+            let world = 1usize;
+            if world <= 1 {
+                let mut out = self.stream.alloc_zeros::<f32>(local_len).map_err(|_| {
+                    AutogradError::TapeInvariant("cuda all_gather_seq alloc failed")
+                })?;
+                self.stream
+                    .memcpy_dtod(src, &mut out)
+                    .map_err(|_| AutogradError::TapeInvariant("cuda all_gather_seq D2D failed"))?;
+                return Ok(DeviceHandle::Cuda(CudaStorage::new(out)));
+            }
+
+            // NCCL all-gather: shards are equal-length (seq % world == 0), so the
+            // full [1, S, H] is the rank-order concatenation of each [1, S/N, H].
+            #[cfg(feature = "nccl")]
+            {
+                let full_len = local_len * world;
+                let mut out = self.stream.alloc_zeros::<f32>(full_len).map_err(|_| {
+                    AutogradError::TapeInvariant("cuda all_gather_seq full alloc failed")
+                })?;
+                let nccl = self.nccl.as_ref().expect("world>1 implies nccl present");
+                let (src_ptr, _src_guard) = src.device_ptr(&self.stream);
+                let (dst_ptr, _dst_guard) = out.device_ptr_mut(&self.stream);
+                unsafe {
+                    nccl.all_gather(
+                        src_ptr as *const _,
+                        dst_ptr as *mut _,
+                        local_len,
+                        DType::F32,
+                        self.stream.cu_stream().cast(),
+                    )
+                    .map_err(|_| AutogradError::TapeInvariant("NCCL all_gather_seq failed"))?;
+                }
+                return Ok(DeviceHandle::Cuda(CudaStorage::new(out)));
+            }
+            #[cfg(not(feature = "nccl"))]
+            unreachable!("world>1 without nccl feature")
+        }
+    }
+
+    fn reduce_scatter_sum_device(
+        &self,
+        x: &DeviceHandle,
+        local_shape: &[usize],
+    ) -> Result<DeviceHandle> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (x, local_shape);
+            todo!(
+                "GPU required: cuda reduce_scatter_sum_device is unavailable under feature no-cuda"
+            )
+        }
+
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            let local_len = shape_size(local_shape);
+            let src = self.cuda_slice(x, "reduce_scatter_sum")?;
+
+            #[cfg(feature = "nccl")]
+            let world = self.nccl.as_ref().map_or(1, |nccl| nccl.world_size());
+            #[cfg(not(feature = "nccl"))]
+            let world = 1usize;
+            if world <= 1 {
+                // Identity: input already this rank's [1, S/N, H] (== full at N=1).
+                if src.len() != local_len {
+                    return Err(AutogradError::DataLengthMismatch {
+                        len: src.len(),
+                        shape: local_shape.to_vec(),
+                        size: local_len,
+                    });
+                }
+                let mut out = self.stream.alloc_zeros::<f32>(local_len).map_err(|_| {
+                    AutogradError::TapeInvariant("cuda reduce_scatter_sum alloc failed")
+                })?;
+                self.stream.memcpy_dtod(src, &mut out).map_err(|_| {
+                    AutogradError::TapeInvariant("cuda reduce_scatter_sum D2D failed")
+                })?;
+                return Ok(DeviceHandle::Cuda(CudaStorage::new(out)));
+            }
+
+            #[cfg(feature = "nccl")]
+            {
+                if src.len() != local_len * world {
+                    return Err(AutogradError::DataLengthMismatch {
+                        len: src.len(),
+                        shape: local_shape.to_vec(),
+                        size: local_len * world,
+                    });
+                }
+                let mut out = self.stream.alloc_zeros::<f32>(local_len).map_err(|_| {
+                    AutogradError::TapeInvariant("cuda reduce_scatter_sum alloc failed")
+                })?;
+                let nccl = self.nccl.as_ref().expect("world>1 implies nccl present");
+                let (src_ptr, _src_guard) = src.device_ptr(&self.stream);
+                let (dst_ptr, _dst_guard) = out.device_ptr_mut(&self.stream);
+                unsafe {
+                    nccl.reduce_scatter(
+                        src_ptr as *const _,
+                        dst_ptr as *mut _,
+                        local_len,
+                        DType::F32,
+                        ReduceOp::Sum,
+                        self.stream.cu_stream().cast(),
+                    )
+                    .map_err(|_| AutogradError::TapeInvariant("NCCL reduce_scatter_sum failed"))?;
+                }
+                return Ok(DeviceHandle::Cuda(CudaStorage::new(out)));
+            }
+            #[cfg(not(feature = "nccl"))]
+            unreachable!("world>1 without nccl feature")
+        }
+    }
+
     /// Device-resident backward for `mul_scalar`. Pure elementwise
     /// `grad_x[i] = upstream[i] * k` via a 1D NVRTC kernel; returns an
     /// unevaluated handle per the batched-eval contract.

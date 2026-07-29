@@ -165,6 +165,12 @@ pub enum SavedContext {
         k: TensorId,
         v: TensorId,
     },
+    CpCausalSdpaCtx {
+        q: TensorId,
+        k: TensorId,
+        v: TensorId,
+        q_start: usize,
+    },
     CheckpointCtx {
         function_id: usize,
     },
@@ -212,6 +218,7 @@ pub enum BackwardOp {
     GeneralizedJsd,
     LinearAttention,
     CausalSdpaRecompute,
+    CpCausalSdpa,
     AllReduceSum,
     AllGatherSeq,
     ReduceScatterSum,
@@ -255,6 +262,7 @@ impl BackwardOp {
             BackwardOp::GeneralizedJsd => "GeneralizedJsd",
             BackwardOp::LinearAttention => "LinearAttention",
             BackwardOp::CausalSdpaRecompute => "CausalSdpaRecompute",
+            BackwardOp::CpCausalSdpa => "CpCausalSdpa",
             BackwardOp::AllReduceSum => "AllReduceSum",
             BackwardOp::AllGatherSeq => "AllGatherSeq",
             BackwardOp::ReduceScatterSum => "ReduceScatterSum",
@@ -790,6 +798,9 @@ impl Tape {
                     }
                     BackwardOp::CausalSdpaRecompute => {
                         ops::causal_sdpa_recompute_backward(&entry, output_grad_id, store)?
+                    }
+                    BackwardOp::CpCausalSdpa => {
+                        ops::cp_causal_sdpa_backward(&entry, output_grad_id, store)?
                     }
                     BackwardOp::AllReduceSum => {
                         ops::all_reduce_sum_backward(&entry, output_grad_id, store)?
