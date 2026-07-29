@@ -860,6 +860,11 @@ impl Tape {
                         store.free(output_grad_id)?;
                     }
                 }
+                if return_filter.is_some_and(|targets| !targets.contains(&entry.output_id))
+                    && store.get(entry.output_id).is_some()
+                {
+                    store.free(entry.output_id)?;
+                }
                 if let Some(op_seq) = inner_op_seq {
                     self.checkpoint_op_mem_record("post_merge", Some(op_seq), Some(&entry), store);
                 }
@@ -1425,6 +1430,7 @@ mod tests {
             !grads.contains_key(&prod),
             "intermediate grad should be freed after its last consumer"
         );
+        assert!(store.get(prod).is_none());
         let x_grad = store.to_host(grads[&x]).expect("x grad host");
         assert_eq!(x_grad, vec![4.0, 5.0]);
     }
