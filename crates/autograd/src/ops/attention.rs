@@ -175,7 +175,12 @@ pub fn causal_sdpa_recompute(
             op: BackwardOp::CausalSdpaRecompute,
             output_id,
             input_ids: smallvec![q, k, v],
-            saved: SavedContext::CausalSdpaRecomputeCtx { q, k, v },
+            saved: SavedContext::CausalSdpaRecomputeCtx {
+                q,
+                k,
+                v,
+                q_start: 0,
+            },
         });
     }
 
@@ -288,7 +293,7 @@ pub(crate) fn causal_sdpa_recompute_backward(
     output_grad_id: TensorId,
     store: &mut TensorStore,
 ) -> Result<GradPairs> {
-    let SavedContext::CausalSdpaRecomputeCtx { q, k, v } = entry.saved.clone() else {
+    let SavedContext::CausalSdpaRecomputeCtx { q, k, v, q_start } = entry.saved.clone() else {
         return Err(AutogradError::TapeInvariant(
             "causal_sdpa_recompute backward missing saved context",
         ));
@@ -298,7 +303,6 @@ pub(crate) fn causal_sdpa_recompute_backward(
     let k_shape = store.tensor(k)?.shape.clone();
     let v_shape = store.tensor(v)?.shape.clone();
     let upstream_shape = store.tensor(output_grad_id)?.shape.clone();
-    validate_attention_shapes(&q_shape, &k_shape, &v_shape)?;
     if upstream_shape != q_shape {
         return Err(AutogradError::ShapeMismatch {
             expected: q_shape.clone(),
@@ -313,6 +317,31 @@ pub(crate) fn causal_sdpa_recompute_backward(
     if !need_grad_q && !need_grad_k && !need_grad_v {
         return Ok(grads);
     }
+
+    // Context-parallel query shard: q attends a gathered KV prefix (q_len < kv_len,
+    // q_start > 0). The fused-square device kernel and the CPU path both assume a
+    // square window, so route straight to the rectangular chunked recompute (the
+    // only path that honors q_start + kv_len != q_len).
+    if q_start != 0 || q_shape[2] != k_shape[2] {
+        validate_cached_attention_shapes(&q_shape, &k_shape, &v_shape, q_start)?;
+        let merged_heads = q_shape[0] * q_shape[1];
+        let q_chunk = sdpa_backward_q_chunk(merged_heads, k_shape[2]);
+        return causal_sdpa_recompute_backward_device_chunked(
+            q,
+            k,
+            v,
+            output_grad_id,
+            &q_shape,
+            &k_shape,
+            q_start,
+            need_grad_q,
+            need_grad_k,
+            need_grad_v,
+            q_chunk,
+            store,
+        );
+    }
+    validate_attention_shapes(&q_shape, &k_shape, &v_shape)?;
 
     let device_path_ok = {
         let q_tensor = store.tensor(q)?;
@@ -435,11 +464,10 @@ fn legacy_sdpa_backward_enabled() -> bool {
 /// Context-parallel causal SDPA: a rank's LOCAL query shard `[1, H, q_len, hd]`
 /// attends the GATHERED causal-prefix KV `[1, H, kv_len, hd]` (kv_len = q_start +
 /// q_len), where absolute q positions are `q_start .. q_start+q_len`. The caller
-/// gathers the prefix KV (via `all_gather_seq` + prefix `slice`); this op owns the
-/// rectangular attention + its backward, so per-step score/prob transients never
-/// hit the outer tape. Backward reuses the chunked rectangular recompute (bit-
-/// identical up to add-order). At q_start=0, kv_len==q_len it is exactly
-/// `causal_sdpa` (the single-rank / N=1 identity).
+/// gathers the prefix KV (via `all_gather_seq` + prefix `slice`). It records the
+/// same `CausalSdpaRecompute` op as the square path — only with `q_start != 0` —
+/// so the shared rectangular backward handles it; no separate op/backward. At
+/// `q_start == 0, kv_len == q_len` it IS `causal_sdpa_recompute`.
 pub fn cp_causal_sdpa(
     q: TensorId,
     k: TensorId,
@@ -473,58 +501,14 @@ pub fn cp_causal_sdpa(
 
     if tape.enabled && requires_grad {
         tape.record(crate::TapeEntry {
-            op: BackwardOp::CpCausalSdpa,
+            op: BackwardOp::CausalSdpaRecompute,
             output_id: out,
             input_ids: smallvec![q, k, v],
-            saved: SavedContext::CpCausalSdpaCtx { q, k, v, q_start },
+            saved: SavedContext::CausalSdpaRecomputeCtx { q, k, v, q_start },
         });
     }
 
     Ok(out)
-}
-
-pub(crate) fn cp_causal_sdpa_backward(
-    entry: &TapeEntry,
-    output_grad_id: TensorId,
-    store: &mut TensorStore,
-) -> Result<GradPairs> {
-    let SavedContext::CpCausalSdpaCtx { q, k, v, q_start } = entry.saved.clone() else {
-        return Err(AutogradError::TapeInvariant(
-            "cp_causal_sdpa backward missing saved context",
-        ));
-    };
-    let q_shape = store.tensor(q)?.shape.clone();
-    let kv_shape = store.tensor(k)?.shape.clone();
-    let upstream_shape = store.tensor(output_grad_id)?.shape.clone();
-    if upstream_shape != q_shape {
-        return Err(AutogradError::ShapeMismatch {
-            expected: q_shape.clone(),
-            got: upstream_shape,
-        });
-    }
-    let need_grad_q = store.tensor(q)?.requires_grad;
-    let need_grad_k = store.tensor(k)?.requires_grad;
-    let need_grad_v = store.tensor(v)?.requires_grad;
-    if !need_grad_q && !need_grad_k && !need_grad_v {
-        return Ok(GradPairs::new());
-    }
-
-    let merged_heads = q_shape[0] * q_shape[1];
-    let q_chunk = sdpa_backward_q_chunk(merged_heads, kv_shape[2]);
-    causal_sdpa_recompute_backward_device_chunked(
-        q,
-        k,
-        v,
-        output_grad_id,
-        &q_shape,
-        &kv_shape,
-        q_start,
-        need_grad_q,
-        need_grad_k,
-        need_grad_v,
-        q_chunk,
-        store,
-    )
 }
 
 /// Per-q-chunk rows for the chunked SDPA backward recompute — bounds the live
