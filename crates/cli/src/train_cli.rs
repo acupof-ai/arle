@@ -2883,6 +2883,7 @@ fn run_agent_opd_replay(
                         vocab,
                         args.writeback_window,
                         train::context_parallel::CpContext::from_env(),
+                        train::context_parallel::DpContext::from_env(),
                         &mut store,
                     )
                     .with_context(|| format!("replay writeback ({:?})", record.label))?
@@ -2997,12 +2998,19 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
         .as_deref()
         .ok_or_else(|| anyhow!("--staged-root is required without --replay-records"))?;
 
-    // Context-parallel coordinator: if --cp-size > 1 and this is NOT already a
-    // spawned rank, fan out one worker per rank and wait. MUST run before the
-    // sandbox-spawner fork and the first CUDA context below — the coordinator owns
-    // neither (each rank forks its own helper + builds its own NCCL backend).
+    // Context/data-parallel coordinator: if --cp-size or --dp-size > 1 and this is
+    // NOT already a spawned rank, fan out one worker per rank and wait. MUST run
+    // before the sandbox-spawner fork and the first CUDA context below — the
+    // coordinator owns neither (each rank forks its own helper + NCCL backend).
+    // CP and DP are mutually exclusive here (combined rejected in build_opd_store).
     #[cfg(all(unix, feature = "cuda"))]
-    if crate::train_multiproc::maybe_spawn_cp_ranks_and_wait(args.cp_size, &args.cp_devices())? {
+    if crate::train_multiproc::maybe_spawn_ranks_and_wait("CP", args.cp_size, &args.cp_devices())?
+        || crate::train_multiproc::maybe_spawn_ranks_and_wait(
+            "DP",
+            args.dp_size,
+            &args.dp_devices(),
+        )?
+    {
         return Ok(());
     }
 
@@ -3378,6 +3386,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
             vocab,
             args.writeback_window,
             train::context_parallel::CpContext::from_env(),
+            train::context_parallel::DpContext::from_env(),
             &mut store,
         )?;
         log_opd_vram("synthetic-writeback post-writeback", &train_backend);
@@ -4679,37 +4688,56 @@ fn build_opd_store(
         use std::sync::Arc;
         let want_cuda = matches!(arg, OpdBackendArg::Cuda | OpdBackendArg::Auto);
         if want_cuda {
-            // Context-parallel: build an NCCL-backed backend so the sequence-shard
-            // collectives (all_gather_seq / reduce_scatter_sum / grad all-reduce)
-            // have a communicator. The launcher publishes rank/size/uid via env;
-            // cp.size<=1 keeps the single-card new(0) (byte-identical).
+            // Context/data-parallel: build an NCCL-backed backend so the shard
+            // collectives (all_gather_seq / reduce_scatter_sum / weight+count
+            // all-reduce) have a communicator. The launcher publishes rank/size/uid
+            // via env; both axes size<=1 keeps the single-card new(0) (byte-identical).
+            // Pure CP or pure DP each use one flat comm over their group; combined
+            // CP×DP needs ncclCommSplit subgroups (pod-only) — reject it here rather
+            // than silently reduce over the wrong group.
             let cp = train::context_parallel::CpContext::from_env();
-            let backend = if cp.is_enabled() {
+            let dp = train::context_parallel::DpContext::from_env();
+            if cp.is_enabled() && dp.is_enabled() {
+                bail!(
+                    "combined CP×DP (ARLE_TRAIN_CP_SIZE>1 and ARLE_TRAIN_DP_SIZE>1) needs \
+                     ncclCommSplit subgroups — not yet wired; run one axis at a time"
+                );
+            }
+            let backend = if cp.is_enabled() || dp.is_enabled() {
                 #[cfg(feature = "nccl")]
                 {
+                    let (world, rank) = if cp.is_enabled() {
+                        (cp.size, cp.rank)
+                    } else {
+                        (dp.size, dp.rank)
+                    };
                     let ordinal = std::env::var("INFER_CUDA_DEVICE")
                         .ok()
                         .and_then(|v| v.parse().ok())
                         .unwrap_or(0);
                     let uid = infer_api::nccl_unique_id_from_env()
-                        .context("CP: read INFER_NCCL_UNIQUE_ID")?;
-                    autograd::backend_cuda::CudaBackend::new_with_nccl(
-                        ordinal, uid, cp.size, cp.rank,
-                    )
-                    .context("init CUDA+NCCL backend for context parallelism")?
+                        .context("CP/DP: read INFER_NCCL_UNIQUE_ID")?;
+                    autograd::backend_cuda::CudaBackend::new_with_nccl(ordinal, uid, world, rank)
+                        .context("init CUDA+NCCL backend for context/data parallelism")?
                 }
                 #[cfg(not(feature = "nccl"))]
                 {
                     bail!(
-                        "context parallelism (ARLE_TRAIN_CP_SIZE>1) requires the nccl feature; \
-                         rebuild with --features cuda,nccl"
+                        "context/data parallelism (ARLE_TRAIN_CP_SIZE>1 or ARLE_TRAIN_DP_SIZE>1) \
+                         requires the nccl feature; rebuild with --features cuda,nccl"
                     );
                 }
             } else {
                 autograd::backend_cuda::CudaBackend::new(0).context("init CUDA backend (GPU 0)")?
             };
             let backend: Arc<dyn autograd::Backend> = Arc::new(backend);
-            let label = if cp.is_enabled() { "cuda:cp" } else { "cuda:0" };
+            let label = if cp.is_enabled() {
+                "cuda:cp"
+            } else if dp.is_enabled() {
+                "cuda:dp"
+            } else {
+                "cuda:0"
+            };
             return Ok((
                 autograd::TensorStore::with_backend(backend.clone()),
                 backend,

@@ -18,26 +18,37 @@ use std::time::Duration;
 use anyhow::Context;
 use anyhow::Result;
 
-/// If this process is a spawned CP worker (`ARLE_TRAIN_CP_RANK` set), install a
-/// `[cpN]` stderr prefix and return true. Unlike serve's worker_entry this does
-/// NOT short-circuit dispatch — the child flows through clap into the normal
-/// agent-opd handler as its rank; `build_opd_store` reads the CP env to build the
-/// NCCL backend.
+/// If this process is a spawned CP/DP worker (`ARLE_TRAIN_CP_RANK` or
+/// `ARLE_TRAIN_DP_RANK` set), install a `[cpN]`/`[dpN]` stderr prefix and return
+/// true. Unlike serve's worker_entry this does NOT short-circuit dispatch — the
+/// child flows through clap into the normal agent-opd handler as its rank;
+/// `build_opd_store` reads the CP/DP env to build the NCCL backend.
 pub(crate) fn install_cp_worker_logger() -> bool {
-    let Ok(rank) = std::env::var("ARLE_TRAIN_CP_RANK") else {
-        return false;
-    };
-    infer_util::logging::init_stderr_with_prefix("info", &format!("[cp{rank}] "));
-    true
+    for (env, tag) in [("ARLE_TRAIN_CP_RANK", "cp"), ("ARLE_TRAIN_DP_RANK", "dp")] {
+        if let Ok(rank) = std::env::var(env) {
+            infer_util::logging::init_stderr_with_prefix("info", &format!("[{tag}{rank}] "));
+            return true;
+        }
+    }
+    false
 }
 
-/// Coordinator side: if `cp_size > 1` and this is NOT already a worker, mint the
-/// NCCL unique id, spawn `cp_size` rank children (per-rank env: rank/size/device +
-/// the minted uid), wait for the first to exit, and return `Ok(true)` so the
-/// caller returns without running training itself. `Ok(false)` = run in-process
-/// (single-card, or this process IS a spawned worker).
-pub(crate) fn maybe_spawn_cp_ranks_and_wait(cp_size: usize, cp_devices: &[usize]) -> Result<bool> {
-    if cp_size <= 1 || std::env::var("ARLE_TRAIN_CP_RANK").is_ok() {
+/// Coordinator side: if `size > 1` on the `axis` ("CP"/"DP") and this is NOT
+/// already a worker, mint the NCCL unique id, spawn `size` rank children (per-rank
+/// env `ARLE_TRAIN_{axis}_RANK`/`_SIZE` + device + the minted uid), wait for the
+/// first to exit, and return `Ok(true)` so the caller returns without training
+/// itself. `Ok(false)` = run in-process (single-card, or this IS a spawned worker).
+/// CP and DP are mutually exclusive here (combined needs ncclCommSplit subgroups,
+/// rejected in `build_opd_store`).
+pub(crate) fn maybe_spawn_ranks_and_wait(
+    axis: &str,
+    size: usize,
+    devices: &[usize],
+) -> Result<bool> {
+    if size <= 1
+        || std::env::var("ARLE_TRAIN_CP_RANK").is_ok()
+        || std::env::var("ARLE_TRAIN_DP_RANK").is_ok()
+    {
         return Ok(false);
     }
 
@@ -46,28 +57,31 @@ pub(crate) fn maybe_spawn_cp_ranks_and_wait(cp_size: usize, cp_devices: &[usize]
     let uid_hex = infer_api::mint_nccl_unique_id_hex().context("mint NCCL unique id")?;
     #[cfg(not(feature = "nccl"))]
     {
-        let _ = cp_devices;
+        let _ = devices;
         anyhow::bail!(
-            "context parallelism (--cp-size {cp_size}) requires the nccl feature; \
-             rebuild with --features cuda,nccl"
+            "{axis} parallelism (--{}-size {size}) requires the nccl feature; \
+             rebuild with --features cuda,nccl",
+            axis.to_lowercase()
         );
     }
 
     #[cfg(feature = "nccl")]
     {
+        let rank_env = format!("ARLE_TRAIN_{axis}_RANK");
+        let size_env = format!("ARLE_TRAIN_{axis}_SIZE");
         let exe = std::env::current_exe().context("current_exe")?;
-        let mut children: Vec<(usize, std::process::Child)> = Vec::with_capacity(cp_size);
-        for rank in 0..cp_size {
-            let device = cp_devices.get(rank).copied().unwrap_or(rank);
+        let mut children: Vec<(usize, std::process::Child)> = Vec::with_capacity(size);
+        for rank in 0..size {
+            let device = devices.get(rank).copied().unwrap_or(rank);
             let mut cmd = std::process::Command::new(&exe);
             for arg in std::env::args().skip(1) {
                 cmd.arg(arg);
             }
-            cmd.env("ARLE_TRAIN_CP_RANK", rank.to_string());
-            cmd.env("ARLE_TRAIN_CP_SIZE", cp_size.to_string());
+            cmd.env(&rank_env, rank.to_string());
+            cmd.env(&size_env, size.to_string());
             cmd.env("INFER_CUDA_DEVICE", device.to_string());
             cmd.env("INFER_NCCL_UNIQUE_ID", &uid_hex);
-            // Each CP rank's rollout engine is single-GPU (this launcher owns the
+            // Each rank's rollout engine is single-GPU (this launcher owns the
             // per-rank device via INFER_CUDA_DEVICE). Strip any inherited TP-serving
             // env so resolve_tp_config_from_env doesn't build a spurious rollout TP
             // communicator on the training uid (else rank>0 dies with NCCL RemoteError).
@@ -82,18 +96,22 @@ pub(crate) fn maybe_spawn_cp_ranks_and_wait(cp_size: usize, cp_devices: &[usize]
             }
             let child = cmd
                 .spawn()
-                .with_context(|| format!("spawn CP rank {rank}"))?;
-            log::info!("spawned CP rank {rank} pid={} device={device}", child.id());
+                .with_context(|| format!("spawn {axis} rank {rank}"))?;
+            log::info!(
+                "spawned {axis} rank {rank} pid={} device={device}",
+                child.id()
+            );
             children.push((rank, child));
         }
 
         // Wait for the first exit; on any exit (success or crash) kill the rest so
         // a single rank's failure can't leave the others blocked in a collective.
         // A rank that HANGS inside a collective never exits, so try_wait alone can't
-        // see it — an opt-in no-progress deadline (ARLE_TRAIN_CP_STEP_TIMEOUT_SECS)
+        // see it — an opt-in no-progress deadline (ARLE_TRAIN_STEP_TIMEOUT_SECS)
         // tears the group down on a hang. Off by default so a legit long step is
         // never killed; set it to bound a ladder/OOM probe.
-        let hang_timeout = std::env::var("ARLE_TRAIN_CP_STEP_TIMEOUT_SECS")
+        let hang_timeout = std::env::var("ARLE_TRAIN_STEP_TIMEOUT_SECS")
+            .or_else(|_| std::env::var("ARLE_TRAIN_CP_STEP_TIMEOUT_SECS"))
             .ok()
             .and_then(|v| v.parse().ok())
             .filter(|&s| s > 0)
@@ -110,18 +128,18 @@ pub(crate) fn maybe_spawn_cp_ranks_and_wait(cp_size: usize, cp_devices: &[usize]
                 && start.elapsed() > limit
             {
                 log::error!(
-                    "no CP rank exited within {limit:?}; assuming a hung collective, tearing down"
+                    "no {axis} rank exited within {limit:?}; assuming a hung collective, tearing down"
                 );
                 for (rank, child) in &mut children {
                     let _ = child.kill();
                     let _ = child.wait();
-                    log::info!("killed hung CP rank {rank}");
+                    log::info!("killed hung {axis} rank {rank}");
                 }
-                anyhow::bail!("CP group hung: no rank progressed within {limit:?}");
+                anyhow::bail!("{axis} group hung: no rank progressed within {limit:?}");
             }
             std::thread::sleep(Duration::from_millis(100));
         };
-        log::info!("CP rank {exit_rank} exited (code={code:?}); tearing down group");
+        log::info!("{axis} rank {exit_rank} exited (code={code:?}); tearing down group");
         for (rank, child) in &mut children {
             if *rank != exit_rank {
                 let _ = child.kill();
@@ -130,7 +148,7 @@ pub(crate) fn maybe_spawn_cp_ranks_and_wait(cp_size: usize, cp_devices: &[usize]
         }
         match code {
             Some(0) => Ok(true),
-            other => anyhow::bail!("CP rank {exit_rank} exited with {other:?}"),
+            other => anyhow::bail!("{axis} rank {exit_rank} exited with {other:?}"),
         }
     }
 }

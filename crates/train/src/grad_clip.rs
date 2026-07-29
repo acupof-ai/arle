@@ -206,6 +206,18 @@ fn try_clip_grad_norm_device(params: &[TensorId], max_norm: f32, store: &mut Ten
     true
 }
 
+/// Sum a per-rank integer count across the collective group (DP global-target
+/// count for the mean-CE `inv_n`). Uploads the local count as a 1-elem tensor,
+/// all-reduce-sums it, reads it back. world==1 is identity (the backend's
+/// `all_reduce_sum_device` no-ops without an NCCL comm), so single-card returns
+/// `local` unchanged — byte-identical.
+pub fn dp_group_sum_count(local: usize, store: &mut TensorStore) -> Result<usize, AutogradError> {
+    let handle = store.backend().upload(&[local as f32], &[1])?;
+    let reduced = store.backend().all_reduce_sum_device(&handle, &[1])?;
+    let summed = store.backend().readback(&reduced)?;
+    Ok(summed.first().map(|&v| v.round() as usize).unwrap_or(local))
+}
+
 /// All-reduce-sum every trainable param's gradient across the context-parallel
 /// group. CP replicates weights and shards the sequence, so each rank holds its
 /// shard's contribution to the (replicated) weight grad; summing over the group

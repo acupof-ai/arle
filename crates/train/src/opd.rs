@@ -2980,6 +2980,7 @@ pub fn masked_writeback_ce_step<O: Optimizer>(
         vocab,
         window_size,
         crate::context_parallel::CpContext::single(),
+        crate::context_parallel::DpContext::single(),
         store,
     )
     .map(|(loss, _)| loss)
@@ -3022,6 +3023,7 @@ pub fn masked_writeback_step<O: Optimizer>(
     vocab: usize,
     window_size: usize,
     cp: crate::context_parallel::CpContext,
+    dp: crate::context_parallel::DpContext,
     store: &mut TensorStore,
 ) -> Result<(f32, PgStats)> {
     if prompt_ids.is_empty() {
@@ -3068,9 +3070,19 @@ pub fn masked_writeback_step<O: Optimizer>(
     // so inv_n = 1/global weights every rank's grad correctly; the post-backward
     // all-reduce-sum then yields the exact global mean.
     let shard = cp.shard(seq_len);
-    // inv_n override only under CP (single-card keeps the fused op's local default,
-    // byte-identical). Under CP local == global at the op, so we must pass global.
-    let inv_n_override = cp.is_enabled().then(|| 1.0_f32 / total_targets as f32);
+    // inv_n override under CP or DP (single-card keeps the fused op's local default,
+    // byte-identical). CP shares ONE trajectory so total_targets is already global.
+    // DP gives each rank a DIFFERENT trajectory, so the global count is the sum over
+    // the DP group. world==1 on both axes makes dp_group_sum_count identity.
+    let inv_n_override = if dp.is_enabled() {
+        let global =
+            crate::grad_clip::dp_group_sum_count(total_targets, store).map_err(OpdError::from)?;
+        crate::context_parallel::global_inv_n(global)
+    } else if cp.is_enabled() {
+        Some(1.0_f32 / total_targets as f32)
+    } else {
+        None
+    };
 
     // Frozen-prompt-KV: forward only the gen segment, rebasing masked positions
     // into it. gen_start=0 keeps positions absolute for the byte-identical full
@@ -3192,13 +3204,12 @@ pub fn masked_writeback_step<O: Optimizer>(
             form,
             kl_coef,
         } => {
-            // PG under CP needs per-shard rollout_logprobs/weight + a global-count
+            // PG under CP/DP needs per-shard rollout_logprobs/weight + a global-count
             // inv_n in the PG op — deferred (brick scope is CE writeback). CE is the
-            // agent-OPD writeback loss; PG-CP lands with the PG inv_n_override.
-            if cp.is_enabled() {
+            // agent-OPD writeback loss; PG-parallel lands with the PG inv_n_override.
+            if cp.is_enabled() || dp.is_enabled() {
                 return Err(OpdError::InvalidInput(
-                    "context-parallel writeback supports the CE loss only (PG-CP deferred)"
-                        .to_owned(),
+                    "parallel writeback supports the CE loss only (PG-CP/DP deferred)".to_owned(),
                 ));
             }
             if rollout_logprobs.len() != total_targets || weight.len() != total_targets {
@@ -3234,12 +3245,15 @@ pub fn masked_writeback_step<O: Optimizer>(
     let bwd_secs = t_bwd.elapsed().as_secs_f64();
     let vram_post_backward = log_writeback_vram(store, "masked-writeback", "post backward");
     eprintln!("[masked-writeback] phase=backward seconds={bwd_secs:.3}");
-    // Context-parallel: weights are replicated across the CP group, so each rank's
-    // shard produced only its contribution to every weight grad. All-reduce-sum the
-    // trainable grads to the exact global grad — MUST be after backward and before
-    // the optimizer step, and gated on `step_optimizer` so PG's grad-accumulation
-    // (step_optimizer=false) doesn't re-scale earlier microsteps by `size`.
-    if cp.is_enabled() && step_optimizer {
+    // CP replicates weights across the sequence-shard group and DP across the
+    // batch-shard group; either way each rank produced only its contribution to
+    // every weight grad. All-reduce-sum the trainable grads to the exact global
+    // grad — MUST be after backward and before the optimizer step, and gated on
+    // `step_optimizer` so PG's grad-accumulation (step_optimizer=false) doesn't
+    // re-scale earlier microsteps by the group size. The collective is the same
+    // sum over whatever NCCL group the backend holds (CP or DP); world==1 is a
+    // no-op, so single-card stays byte-identical.
+    if (cp.is_enabled() || dp.is_enabled()) && step_optimizer {
         crate::grad_clip::all_reduce_cp_grads(trainable_params, store).map_err(OpdError::from)?;
     }
     // Pre-step grad-norm telemetry. The prod `clip_grad_norm` logger sits on the
@@ -3656,6 +3670,7 @@ pub fn masked_writeback_ce_step_frozen_prompt_kv<O: Optimizer>(
         vocab,
         window_size,
         crate::context_parallel::CpContext::single(),
+        crate::context_parallel::DpContext::single(),
         store,
     )
     .map(|(loss, _)| loss)
@@ -3674,6 +3689,7 @@ pub fn masked_writeback_ce_step_dispatch<O: Optimizer>(
     vocab: usize,
     window_size: usize,
     cp: crate::context_parallel::CpContext,
+    dp: crate::context_parallel::DpContext,
     store: &mut TensorStore,
 ) -> Result<f32> {
     masked_writeback_step(
@@ -3689,6 +3705,7 @@ pub fn masked_writeback_ce_step_dispatch<O: Optimizer>(
         vocab,
         window_size,
         cp,
+        dp,
         store,
     )
     .map(|(loss, _)| loss)

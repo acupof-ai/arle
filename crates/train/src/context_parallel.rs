@@ -176,6 +176,17 @@ impl DpContext {
         }
     }
 
+    /// Read the DP group from the launcher env (`ARLE_TRAIN_DP_RANK` /
+    /// `ARLE_TRAIN_DP_SIZE`), derived through the one mesh. Defaults to `single()`
+    /// when unset — the byte-identical single-card path.
+    pub fn from_env() -> Self {
+        let dp = env_usize("ARLE_TRAIN_DP_SIZE", 1);
+        // Pure-DP world rank == the DP rank (CP inner axis is size 1 here); the
+        // combined DP×CP launcher composes the world rank from both.
+        let world_rank = env_usize("ARLE_TRAIN_DP_RANK", 0);
+        Self::from_mesh(dp, 1, world_rank)
+    }
+
     pub fn is_enabled(self) -> bool {
         self.size > 1
     }

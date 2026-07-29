@@ -174,6 +174,7 @@ fn run_writeback_in(mut store: TensorStore, cp: CpContext) -> Result<f32> {
         cfg.vocab_size,
         WINDOW,
         cp,
+        train::context_parallel::DpContext::single(),
         &mut store,
     )
     .map(|(loss, _)| loss)
