@@ -432,6 +432,101 @@ fn legacy_sdpa_backward_enabled() -> bool {
     crate::runtime_flags::legacy_sdpa_bwd()
 }
 
+/// Context-parallel causal SDPA: a rank's LOCAL query shard `[1, H, q_len, hd]`
+/// attends the GATHERED causal-prefix KV `[1, H, kv_len, hd]` (kv_len = q_start +
+/// q_len), where absolute q positions are `q_start .. q_start+q_len`. The caller
+/// gathers the prefix KV (via `all_gather_seq` + prefix `slice`); this op owns the
+/// rectangular attention + its backward, so per-step score/prob transients never
+/// hit the outer tape. Backward reuses the chunked rectangular recompute (bit-
+/// identical up to add-order). At q_start=0, kv_len==q_len it is exactly
+/// `causal_sdpa` (the single-rank / N=1 identity).
+pub fn cp_causal_sdpa(
+    q: TensorId,
+    k: TensorId,
+    v: TensorId,
+    q_start: usize,
+    store: &mut TensorStore,
+    tape: &mut crate::Tape,
+) -> Result<TensorId> {
+    let q_shape = store.tensor(q)?.shape.clone();
+    let k_shape = store.tensor(k)?.shape.clone();
+    let v_shape = store.tensor(v)?.shape.clone();
+    validate_cached_attention_shapes(&q_shape, &k_shape, &v_shape, q_start)?;
+
+    let requires_grad = store.tensor(q)?.requires_grad
+        || store.tensor(k)?.requires_grad
+        || store.tensor(v)?.requires_grad;
+
+    store.ensure_device(q)?;
+    store.ensure_device(k)?;
+    store.ensure_device(v)?;
+
+    // Forward off-tape (this entry owns the backward): the with-q-start path
+    // head-chunks itself to the transient budget.
+    let live_before = store.live_ids().into_iter().collect::<HashSet<_>>();
+    let mut inner_tape = crate::Tape::new();
+    inner_tape.set_enabled(false);
+    let out = causal_sdpa_with_q_start(q, k, v, q_start, store, &mut inner_tape)?;
+    let keep = HashSet::from([q, k, v, out]);
+    store.free_new_except(&live_before, &keep)?;
+    store.set_requires_grad(out, requires_grad)?;
+
+    if tape.enabled && requires_grad {
+        tape.record(crate::TapeEntry {
+            op: BackwardOp::CpCausalSdpa,
+            output_id: out,
+            input_ids: smallvec![q, k, v],
+            saved: SavedContext::CpCausalSdpaCtx { q, k, v, q_start },
+        });
+    }
+
+    Ok(out)
+}
+
+pub(crate) fn cp_causal_sdpa_backward(
+    entry: &TapeEntry,
+    output_grad_id: TensorId,
+    store: &mut TensorStore,
+) -> Result<GradPairs> {
+    let SavedContext::CpCausalSdpaCtx { q, k, v, q_start } = entry.saved.clone() else {
+        return Err(AutogradError::TapeInvariant(
+            "cp_causal_sdpa backward missing saved context",
+        ));
+    };
+    let q_shape = store.tensor(q)?.shape.clone();
+    let kv_shape = store.tensor(k)?.shape.clone();
+    let upstream_shape = store.tensor(output_grad_id)?.shape.clone();
+    if upstream_shape != q_shape {
+        return Err(AutogradError::ShapeMismatch {
+            expected: q_shape.clone(),
+            got: upstream_shape,
+        });
+    }
+    let need_grad_q = store.tensor(q)?.requires_grad;
+    let need_grad_k = store.tensor(k)?.requires_grad;
+    let need_grad_v = store.tensor(v)?.requires_grad;
+    if !need_grad_q && !need_grad_k && !need_grad_v {
+        return Ok(GradPairs::new());
+    }
+
+    let merged_heads = q_shape[0] * q_shape[1];
+    let q_chunk = sdpa_backward_q_chunk(merged_heads, kv_shape[2]);
+    causal_sdpa_recompute_backward_device_chunked(
+        q,
+        k,
+        v,
+        output_grad_id,
+        &q_shape,
+        &kv_shape,
+        q_start,
+        need_grad_q,
+        need_grad_k,
+        need_grad_v,
+        q_chunk,
+        store,
+    )
+}
+
 /// Per-q-chunk rows for the chunked SDPA backward recompute — bounds the live
 /// `[merged_heads, q_chunk, seq]` score/prob transients to avoid the O(seq²)
 /// peak (the writeback-OOM fix). The unchunked path materialized the full
@@ -1377,6 +1472,60 @@ mod tests {
         assert!(dq < 1e-4, "rect grad_q diverged: {dq:.3e}");
         assert!(dk < 1e-4, "rect grad_k diverged: {dk:.3e}");
         assert!(dv < 1e-4, "rect grad_v diverged: {dv:.3e}");
+        Ok(())
+    }
+
+    // cp_causal_sdpa forward+backward on the rectangular (context-parallel) shape
+    // must match the composed-primitive oracle (causal_sdpa_with_q_start on an
+    // enabled tape). This is the local (N=1-agnostic) correctness gate for the CP
+    // attention op — the gathered-prefix KV is simulated by passing a full kv_len.
+    #[test]
+    fn cp_causal_sdpa_matches_composed() -> Result<()> {
+        const HEADS: usize = 2;
+        const HEAD_DIM: usize = 8;
+        const Q_LEN: usize = 5;
+        const KV_LEN: usize = 12;
+        const Q_START: usize = KV_LEN - Q_LEN;
+        let q_shape = vec![1usize, HEADS, Q_LEN, HEAD_DIM];
+        let kv_shape = vec![1usize, HEADS, KV_LEN, HEAD_DIM];
+        let q_data = det_vec(HEADS * Q_LEN * HEAD_DIM, 0x7c2e_11a5, 0.4);
+        let k_data = det_vec(HEADS * KV_LEN * HEAD_DIM, 0x3b91_ee02, 0.4);
+        let v_data = det_vec(HEADS * KV_LEN * HEAD_DIM, 0x59d0_74c3, 0.6);
+        let up_data = det_vec(HEADS * Q_LEN * HEAD_DIM, 0x0a5f_3d18, 0.5);
+
+        let run = |cp: bool| -> Result<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)> {
+            let mut store = TensorStore::default();
+            let mut tape = crate::Tape::new();
+            let q = store.alloc(Tensor::new(q_data.clone(), q_shape.clone(), true)?);
+            let k = store.alloc(Tensor::new(k_data.clone(), kv_shape.clone(), true)?);
+            let v = store.alloc(Tensor::new(v_data.clone(), kv_shape.clone(), true)?);
+            let out = if cp {
+                cp_causal_sdpa(q, k, v, Q_START, &mut store, &mut tape)?
+            } else {
+                causal_sdpa_with_q_start(q, k, v, Q_START, &mut store, &mut tape)?
+            };
+            let out_host = store.to_host(out)?;
+            let up = store.alloc(Tensor::new(up_data.clone(), q_shape.clone(), false)?);
+            let weighted = crate::ops::mul(out, up, &mut store, &mut tape)?;
+            let loss = crate::ops::sum(weighted, &mut store, &mut tape)?;
+            let grads = tape.backward(loss, &mut store)?;
+            Ok((
+                out_host,
+                store.to_host(grads[&q])?,
+                store.to_host(grads[&k])?,
+                store.to_host(grads[&v])?,
+            ))
+        };
+
+        let (ref_out, ref_gq, ref_gk, ref_gv) = run(false)?;
+        let (cp_out, cp_gq, cp_gk, cp_gv) = run(true)?;
+        assert!(
+            max_abs_diff(&ref_out, &cp_out) < 1e-4,
+            "cp forward diverged"
+        );
+        assert!(max_abs_diff(&ref_gq, &cp_gq) < 1e-4, "cp grad_q diverged");
+        assert!(max_abs_diff(&ref_gk, &cp_gk) < 1e-4, "cp grad_k diverged");
+        assert!(max_abs_diff(&ref_gv, &cp_gv) < 1e-4, "cp grad_v diverged");
         Ok(())
     }
 }
