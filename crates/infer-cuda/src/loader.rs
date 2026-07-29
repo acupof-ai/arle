@@ -1709,7 +1709,10 @@ impl SafetensorLoader {
         // m_indices, which the sm_120 path leaves None (moe.rs), so building the
         // caches there would panic on first prefill. Self-disable to the eager
         // per-expert MoE, mirroring the sm120-aware FP8 gate above.
-        let deepgemm_ready = !routed_quant && deepgemm_native_ready && !sm120;
+        // Also skip when BF16-resident: the grouped concat clears the per-expert
+        // Vecs, but the OPD LoRA re-merge needs them mutable per expert.
+        let deepgemm_ready =
+            !routed_quant && deepgemm_native_ready && !sm120 && !experts_bf16_resident;
         let fp8_deepgemm_ready =
             expert_weight_format == WeightFormat::Fp8BlockScaled && deepgemm_native_ready;
         let (gate_grouped, up_grouped, down_grouped) = if deepgemm_ready {
