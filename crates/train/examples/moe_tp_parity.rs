@@ -1,22 +1,28 @@
-//! MoE-TP parity gate: tensor-parallel MoE forward must equal the single-rank MoE.
+//! MoE-TP gate: train-side Qwen3.6 MoE column/row-parallel expert sharding
+//! participates correctly in autograd, verified by finite difference.
 //!
-//! Weights are name-seeded (deterministic), so a world=N run builds column/row
-//! shards of the SAME logical experts + shared expert the world=1 run builds
-//! whole. `forward_sparse_mlp` all-reduces the routed+shared partials over the TP
-//! group, so every rank's final logits must equal the single-rank logits within
-//! the correct-inference envelope — a wrong expert shard, a mis-split shared
-//! expert, or a dropped all-reduce breaks it. Router is replicated (full
-//! num_experts) so routing is bit-identical across ranks by construction.
+//! Mirrors `a2_qwen35_tp_lora_fd` (which proves attention-TP) but on a MoE layer:
+//! spawns `world` NCCL ranks that each build a TP-sharded MoE model, forward to a
+//! sum-of-squared-logits loss (the routed+shared row-parallel all-reduce is on the
+//! tape), and compares the central difference of the DISTRIBUTED total loss to the
+//! analytic gradient of one rank-local sharded expert `down_proj.lora_b` element.
+//!
+//! Why finite-diff, not "world=2 sum vs world=1": weights are name-seeded, so a
+//! world=2 run builds each `[hidden, moe_intermediate/N]` shard from the SAME seed
+//! — identical across ranks, NOT complementary halves of the world=1 weight (the
+//! strides differ). So a world=2-vs-1 reconstruction is not a valid identity. The
+//! finite-diff gate is self-consistent: it validates forward+backward+all-reduce
+//! against the numeric gradient of the actual sharded loss, no reconstruction.
 //!
 //! Run on a GPU host (≥2 GPUs):
-//!   ARLE_MOE_TP_CUDA_DEVICES=4,5 \
+//!   ARLE_MOE_TP_WORLD=2 ARLE_MOE_TP_CUDA_DEVICES=4,5 \
 //!     cargo run -p train --release --no-default-features \
 //!       --features cuda,nccl --example moe_tp_parity
 
 #[cfg(all(feature = "cuda", feature = "nccl"))]
 use anyhow::{Context, Result, anyhow, ensure};
 #[cfg(all(feature = "cuda", feature = "nccl"))]
-use autograd::{TensorStore, backend_cuda::CudaBackend, tape::Tape};
+use autograd::{TensorStore, backend_cuda::CudaBackend, ops, tape::Tape};
 #[cfg(all(feature = "cuda", feature = "nccl"))]
 use cuda_kernels::ffi::nccl;
 #[cfg(all(feature = "cuda", feature = "nccl"))]
@@ -28,9 +34,17 @@ use train::{
 };
 
 #[cfg(all(feature = "cuda", feature = "nccl"))]
-const WORLD: usize = 2;
+const DEFAULT_EPS: f32 = 2.0e-3;
 #[cfg(all(feature = "cuda", feature = "nccl"))]
-const REL_TOL: f32 = 2.0e-3; // MoE nondeterminism envelope, not byte-identity
+const REL_TOL: f32 = 1.0e-2;
+#[cfg(all(feature = "cuda", feature = "nccl"))]
+const PROBE_RANK: usize = 0;
+#[cfg(all(feature = "cuda", feature = "nccl"))]
+const PROBE_INDEX: usize = 3;
+// A routed expert's down_proj is row-parallel (in_features = moe_intermediate
+// sharded), so its lora_b lives on the rank's shard — a genuine TP-local probe.
+#[cfg(all(feature = "cuda", feature = "nccl"))]
+const PROBE_SUFFIX: &str = ".layers.0.mlp.experts.0.down_proj.weight.lora_b";
 
 #[cfg(all(feature = "cuda", feature = "nccl"))]
 fn main() -> Result<()> {
@@ -46,7 +60,7 @@ fn main() {
 }
 
 // Tiny MoE config: moe_intermediate_size + shared_expert_intermediate_size must
-// divide WORLD (column/row-parallel), num_experts > 0, one sparse layer.
+// divide `world`; num_experts > 0; one sparse full-attention layer.
 #[cfg(all(feature = "cuda", feature = "nccl"))]
 fn tiny_moe_config() -> Qwen35Config {
     Qwen35Config {
@@ -76,19 +90,142 @@ fn tiny_moe_config() -> Qwen35Config {
         num_experts: 4,
         num_experts_per_tok: 2,
         decoder_sparse_step: 1,
-        moe_intermediate_size: 8, // /WORLD=2 → 4 per rank (column/row)
-        shared_expert_intermediate_size: 8, // /WORLD=2 → 4 per rank
+        moe_intermediate_size: 8,
+        shared_expert_intermediate_size: 8,
         norm_topk_prob: true,
         mlp_only_layers: Vec::new(),
         full_attn_gated: true,
     }
 }
 
-// Forward the tiny MoE model at a given TP config, return the mean-abs logit (a
-// cheap scalar fingerprint of the whole forward; TP-reduce errors move it).
 #[cfg(all(feature = "cuda", feature = "nccl"))]
-fn forward_fingerprint(store: &mut TensorStore, tp: Qwen35TensorParallelConfig) -> Result<f32> {
+#[derive(Debug)]
+struct CaseResult {
+    total_loss: f32,
+    grad: Vec<f32>,
+}
+
+#[cfg(all(feature = "cuda", feature = "nccl"))]
+fn coordinator_main() -> Result<()> {
+    let world = env_usize("ARLE_MOE_TP_WORLD", 2)?;
+    ensure!(world >= 2, "ARLE_MOE_TP_WORLD must be >= 2");
+    let devices = parse_devices(world)?;
+    let eps = env_f32("ARLE_MOE_TP_EPS", DEFAULT_EPS)?;
+    let probe_rank = env_usize("ARLE_MOE_TP_PROBE_RANK", PROBE_RANK)?;
+    let probe_index = env_usize("ARLE_MOE_TP_PROBE_INDEX", PROBE_INDEX)?;
+    ensure!(
+        probe_rank < world,
+        "probe_rank {probe_rank} >= world {world}"
+    );
+
+    let root = std::env::var("ARLE_MOE_TP_DIR")
+        .unwrap_or_else(|_| format!("/tmp/arle_moe_tp_parity_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).with_context(|| format!("create {root}"))?;
+
+    let minus = run_case(
+        &root,
+        "minus",
+        world,
+        &devices,
+        probe_rank,
+        probe_index,
+        -eps,
+    )?;
+    let base = run_case(&root, "base", world, &devices, probe_rank, probe_index, 0.0)?;
+    let plus = run_case(&root, "plus", world, &devices, probe_rank, probe_index, eps)?;
+
+    let numeric = (plus.total_loss - minus.total_loss) / (2.0 * eps);
+    let analytic = base.grad[probe_index];
+    let denom = analytic.abs().max(numeric.abs()).max(1.0e-6);
+    let rel_err = (analytic - numeric).abs() / denom;
+
+    println!(
+        "moe_tp_parity world={world} devices={devices:?} probe=rank{probe_rank}[{probe_index}] eps={eps:.1e}"
+    );
+    println!(
+        "loss_minus={:.9e} loss_base={:.9e} loss_plus={:.9e}",
+        minus.total_loss, base.total_loss, plus.total_loss
+    );
+    println!(
+        "analytic={analytic:.9e} numeric={numeric:.9e} rel_err={rel_err:.3e} tol={REL_TOL:.1e}"
+    );
+    ensure!(
+        rel_err <= REL_TOL,
+        "MoE-TP finite-diff mismatch: analytic={analytic} numeric={numeric} rel_err={rel_err}"
+    );
+    println!("PASS");
+    Ok(())
+}
+
+#[cfg(all(feature = "cuda", feature = "nccl"))]
+fn run_case(
+    root: &str,
+    label: &str,
+    world: usize,
+    devices: &[usize],
+    probe_rank: usize,
+    probe_index: usize,
+    delta: f32,
+) -> Result<CaseResult> {
+    let case_dir = format!("{root}/{label}");
+    let _ = std::fs::remove_dir_all(&case_dir);
+    std::fs::create_dir_all(&case_dir).with_context(|| format!("create {case_dir}"))?;
+
+    let exe = std::env::current_exe()?;
+    let mut children = Vec::with_capacity(world);
+    for (rank, device) in devices.iter().copied().enumerate().take(world) {
+        let child = std::process::Command::new(&exe)
+            .env("ARLE_MOE_TP_RANK", rank.to_string())
+            .env("ARLE_MOE_TP_WORLD", world.to_string())
+            .env("ARLE_MOE_TP_DIR", &case_dir)
+            .env("ARLE_MOE_TP_CUDA_DEVICE", device.to_string())
+            .env("ARLE_MOE_TP_PROBE_RANK", probe_rank.to_string())
+            .env("ARLE_MOE_TP_PROBE_INDEX", probe_index.to_string())
+            .env("ARLE_MOE_TP_PROBE_DELTA", format!("{delta:.9e}"))
+            .spawn()
+            .with_context(|| format!("spawn MoE-TP rank {rank} case {label}"))?;
+        children.push((rank, child));
+    }
+    for (rank, mut child) in children {
+        ensure!(
+            child.wait()?.success(),
+            "MoE-TP rank {rank} case {label} failed"
+        );
+    }
+
+    let mut total_loss = 0.0f32;
+    let mut probe_grad = None;
+    for rank in 0..world {
+        let result = read_rank_result(&case_dir, rank)?;
+        total_loss += result.total_loss;
+        if rank == probe_rank {
+            probe_grad = Some(result.grad);
+        }
+    }
+    Ok(CaseResult {
+        total_loss,
+        grad: probe_grad.ok_or_else(|| anyhow!("missing probe rank {probe_rank} result"))?,
+    })
+}
+
+#[cfg(all(feature = "cuda", feature = "nccl"))]
+fn rank_main(rank: usize) -> Result<()> {
+    let world = env_usize("ARLE_MOE_TP_WORLD", 2)?;
+    let dir = std::env::var("ARLE_MOE_TP_DIR").context("ARLE_MOE_TP_DIR missing")?;
+    let device = env_usize("ARLE_MOE_TP_CUDA_DEVICE", rank)?;
+    let probe_rank = env_usize("ARLE_MOE_TP_PROBE_RANK", PROBE_RANK)?;
+    let probe_index = env_usize("ARLE_MOE_TP_PROBE_INDEX", PROBE_INDEX)?;
+    let delta = env_f32("ARLE_MOE_TP_PROBE_DELTA", 0.0)?;
+
+    let unique_id = nccl_rendezvous(rank, &dir)?;
+    let backend = CudaBackend::new_with_nccl(device, unique_id, world, rank)
+        .with_context(|| format!("rank {rank} CudaBackend::new_with_nccl device {device}"))?;
+    let mut store = TensorStore::with_backend(std::sync::Arc::new(backend));
+    let mut tape = Tape::new();
+
     let cfg = tiny_moe_config();
+    let tp = Qwen35TensorParallelConfig::new(rank, world);
     let model = Qwen35Model::new_with_lora_targets_and_tp(
         &cfg,
         LoraConfig {
@@ -97,73 +234,45 @@ fn forward_fingerprint(store: &mut TensorStore, tp: Qwen35TensorParallelConfig) 
         },
         LoraTargetSet::AllLinear,
         tp,
-        store,
+        &mut store,
     )?;
-    let mut tape = Tape::new();
-    let input_ids = [1u32, 2, 4];
-    let position_ids = [0u32, 1, 2];
-    let logits = model.forward_batch(store, &mut tape, &input_ids, &position_ids, 1, 3)?;
-    let host = store.to_host(logits)?;
-    ensure!(!host.is_empty(), "empty logits");
-    Ok(host.iter().map(|v| v.abs()).sum::<f32>() / host.len() as f32)
-}
-
-#[cfg(all(feature = "cuda", feature = "nccl"))]
-fn coordinator_main() -> Result<()> {
-    let devices = parse_devices(WORLD)?;
-    let root = std::env::var("ARLE_MOE_TP_DIR")
-        .unwrap_or_else(|_| format!("/tmp/arle_moe_tp_parity_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
-    std::fs::create_dir_all(&root).with_context(|| format!("create {root}"))?;
-
-    // Single-rank reference (no NCCL) on the first device.
-    let ref_fp = {
-        let backend = CudaBackend::new(devices[0]).context("CudaBackend::new ref")?;
-        let mut store = TensorStore::with_backend(std::sync::Arc::new(backend));
-        forward_fingerprint(&mut store, Qwen35TensorParallelConfig::single())?
-    };
-
-    // TP ranks.
-    let exe = std::env::current_exe()?;
-    let mut children = Vec::with_capacity(WORLD);
-    for (rank, &device) in devices.iter().enumerate().take(WORLD) {
-        let child = std::process::Command::new(&exe)
-            .env("ARLE_MOE_TP_RANK", rank.to_string())
-            .env("ARLE_MOE_TP_DIR", &root)
-            .env("ARLE_MOE_TP_CUDA_DEVICE", device.to_string())
-            .spawn()
-            .with_context(|| format!("spawn MoE-TP rank {rank}"))?;
-        children.push((rank, child));
-    }
-    for (rank, mut child) in children {
-        ensure!(child.wait()?.success(), "MoE-TP rank {rank} failed");
+    let adapters = model.adapter_name_map();
+    let (probe_name, &probe_id) = adapters
+        .iter()
+        .find(|(name, _)| name.ends_with(PROBE_SUFFIX))
+        .ok_or_else(|| anyhow!("missing adapter ending with {PROBE_SUFFIX}"))?;
+    let probe_len = store
+        .get(probe_id)
+        .ok_or_else(|| anyhow!("missing probe tensor {probe_id:?}"))?
+        .data
+        .len();
+    ensure!(
+        probe_index < probe_len,
+        "probe index {probe_index} out of range for {probe_name} len {probe_len}"
+    );
+    if rank == probe_rank {
+        let probe = store
+            .get_mut(probe_id)
+            .ok_or_else(|| anyhow!("missing mutable probe tensor {probe_id:?}"))?;
+        probe.data[probe_index] += delta;
     }
 
-    // Every rank's post-all-reduce fingerprint must match the single-rank ref.
-    for rank in 0..WORLD {
-        let fp = read_fp(&root, rank)?;
-        let denom = ref_fp.abs().max(fp.abs()).max(1.0e-6);
-        let rel = (ref_fp - fp).abs() / denom;
-        println!("rank {rank}: fp={fp:.9e} ref={ref_fp:.9e} rel_err={rel:.3e}");
-        ensure!(
-            rel <= REL_TOL,
-            "MoE-TP rank {rank} logits diverge from single-rank: rel_err={rel}"
-        );
-    }
-    println!("PASS");
-    Ok(())
-}
+    let input_ids = [1_u32, 2, 4];
+    let position_ids = [0_u32, 1, 2];
+    let logits = model.forward_batch(&mut store, &mut tape, &input_ids, &position_ids, 1, 3)?;
+    let squared = ops::mul(logits, logits, &mut store, &mut tape)?;
+    let loss = ops::sum(squared, &mut store, &mut tape)?;
+    let grads = tape.backward(loss, &mut store)?;
 
-#[cfg(all(feature = "cuda", feature = "nccl"))]
-fn rank_main(rank: usize) -> Result<()> {
-    let dir = std::env::var("ARLE_MOE_TP_DIR").context("ARLE_MOE_TP_DIR missing")?;
-    let device = env_usize("ARLE_MOE_TP_CUDA_DEVICE", rank)?;
-    let unique_id = nccl_rendezvous(rank, &dir)?;
-    let backend = CudaBackend::new_with_nccl(device, unique_id, WORLD, rank)
-        .with_context(|| format!("rank {rank} CudaBackend::new_with_nccl device {device}"))?;
-    let mut store = TensorStore::with_backend(std::sync::Arc::new(backend));
-    let fp = forward_fingerprint(&mut store, Qwen35TensorParallelConfig::new(rank, WORLD))?;
-    write_fp(&dir, rank, fp)
+    let total_loss = *store
+        .to_host(loss)?
+        .first()
+        .ok_or_else(|| anyhow!("rank {rank} loss readback empty"))?;
+    let grad_id = *grads
+        .get(&probe_id)
+        .ok_or_else(|| anyhow!("rank {rank} missing grad for {probe_name}"))?;
+    let grad = store.to_host(grad_id)?;
+    write_rank_result(&dir, rank, total_loss, &grad)
 }
 
 #[cfg(all(feature = "cuda", feature = "nccl"))]
@@ -200,27 +309,46 @@ fn nccl_rendezvous(rank: usize, dir: &str) -> Result<nccl::ncclUniqueId> {
 }
 
 #[cfg(all(feature = "cuda", feature = "nccl"))]
-fn write_fp(dir: &str, rank: usize, fp: f32) -> Result<()> {
+fn write_rank_result(dir: &str, rank: usize, loss: f32, grad: &[f32]) -> Result<()> {
+    let grad_csv = grad
+        .iter()
+        .map(|v| format!("{v:.9e}"))
+        .collect::<Vec<_>>()
+        .join(",");
     let path = format!("{dir}/rank_{rank}.txt");
     let tmp = format!("{path}.tmp");
-    std::fs::write(&tmp, format!("{fp:.9e}\n"))?;
+    std::fs::write(&tmp, format!("loss={loss:.9e}\ngrad={grad_csv}\n"))?;
     std::fs::rename(&tmp, path)?;
     Ok(())
 }
 
 #[cfg(all(feature = "cuda", feature = "nccl"))]
-fn read_fp(dir: &str, rank: usize) -> Result<f32> {
+fn read_rank_result(dir: &str, rank: usize) -> Result<CaseResult> {
     let path = format!("{dir}/rank_{rank}.txt");
     let text = std::fs::read_to_string(&path).with_context(|| format!("read {path}"))?;
-    text.trim()
-        .parse::<f32>()
-        .with_context(|| format!("parse fp in {path}"))
+    let mut loss = None;
+    let mut grad = None;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("loss=") {
+            loss = Some(rest.parse::<f32>()?);
+        } else if let Some(rest) = line.strip_prefix("grad=") {
+            grad = Some(
+                rest.split(',')
+                    .map(|p| p.parse::<f32>().map_err(|e| anyhow!("{e}")))
+                    .collect::<Result<Vec<_>>>()?,
+            );
+        }
+    }
+    Ok(CaseResult {
+        total_loss: loss.ok_or_else(|| anyhow!("{path} missing loss"))?,
+        grad: grad.ok_or_else(|| anyhow!("{path} missing grad"))?,
+    })
 }
 
 #[cfg(all(feature = "cuda", feature = "nccl"))]
-fn parse_devices(need: usize) -> Result<Vec<usize>> {
+fn parse_devices(world: usize) -> Result<Vec<usize>> {
     let raw = std::env::var("ARLE_MOE_TP_CUDA_DEVICES").unwrap_or_else(|_| {
-        (0..need)
+        (0..world)
             .map(|i| i.to_string())
             .collect::<Vec<_>>()
             .join(",")
@@ -231,8 +359,8 @@ fn parse_devices(need: usize) -> Result<Vec<usize>> {
         .map(|p| p.trim().parse::<usize>().map_err(|e| anyhow!("{e}")))
         .collect::<Result<Vec<_>>>()?;
     ensure!(
-        devices.len() >= need,
-        "need {need} devices, got {}",
+        devices.len() >= world,
+        "need {world} devices, got {}",
         devices.len()
     );
     Ok(devices)
@@ -240,6 +368,14 @@ fn parse_devices(need: usize) -> Result<Vec<usize>> {
 
 #[cfg(all(feature = "cuda", feature = "nccl"))]
 fn env_usize(name: &str, default: usize) -> Result<usize> {
+    match std::env::var(name) {
+        Ok(v) => v.parse().with_context(|| format!("{name} parse: {v}")),
+        Err(_) => Ok(default),
+    }
+}
+
+#[cfg(all(feature = "cuda", feature = "nccl"))]
+fn env_f32(name: &str, default: f32) -> Result<f32> {
     match std::env::var(name) {
         Ok(v) => v.parse().with_context(|| format!("{name} parse: {v}")),
         Err(_) => Ok(default),
