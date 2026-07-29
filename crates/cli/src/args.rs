@@ -929,10 +929,11 @@ pub(crate) struct ServeArgs {
     #[arg(long, default_value_t = 0.55, value_name = "F")]
     pub(crate) mtp_min_accept: f32,
 
-    /// Speculate (MTP/DSpark) only when the decode batch is ≤ this; above it,
-    /// spec is a compute-bound loss, so decode routes to the plain batched path.
-    /// Default 1: only true c=1 speculates.
-    #[arg(long, default_value_t = 1, value_name = "N")]
+    /// Speculate (MTP/DSpark) only when the decode batch is ≤ this; above it
+    /// decode routes to the plain batched path. Default 16 = the measured
+    /// DSpark envelope (+77% at c=2, +8.5% at c=16); MTP, which does not batch
+    /// its draft, still wants 1.
+    #[arg(long, default_value_t = 16, value_name = "N")]
     pub(crate) spec_max_batch: usize,
 
     /// DeepEP intranode SM budget (positive, even).
