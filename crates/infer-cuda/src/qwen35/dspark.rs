@@ -406,8 +406,10 @@ pub(crate) struct Qwen35DsparkExec {
     pub(crate) spec: Vec<Option<Qwen35SpecSlotState>>,
     pub(crate) taps: Qwen35DsparkTaps,
     pub(crate) scratch: DsparkScratch,
-    /// Pointer tables for the batched rollback.
+    /// Pointer tables for the batched rollback replay.
     pub(crate) replay_tables: Qwen35ReplayTables,
+    /// Staging for the batched state snapshot/restore.
+    pub(crate) copy: Qwen35CopyScratch,
     pub(crate) accepts: usize,
     pub(crate) rejects: usize,
     /// Verified draft chains, and the subset drafted from a partial
@@ -425,6 +427,7 @@ impl Qwen35DsparkExec {
             taps: Qwen35DsparkTaps::default(),
             scratch: DsparkScratch::default(),
             replay_tables: Qwen35ReplayTables::default(),
+            copy: Qwen35CopyScratch::default(),
             accepts: 0,
             rejects: 0,
             chains: 0,
@@ -1634,6 +1637,7 @@ impl Qwen35Model {
         &self,
         rolls: &mut [DsparkRollback<'_>],
         tables: &mut Qwen35ReplayTables,
+        copy: &mut Qwen35CopyScratch,
         ws: &mut Qwen35Workspace,
     ) -> Result<()> {
         if rolls.is_empty() {
@@ -1641,14 +1645,19 @@ impl Qwen35Model {
         }
         let mut pt = super::dspark_phase_start(&self.ctx);
         let (mut gdr, mut conv) = ((Vec::new(), Vec::new()), (Vec::new(), Vec::new()));
-        let (gdr_bytes, conv_bytes) = rolls[0].spec.linear_state_bytes();
+        let (gdr_bytes, conv_bytes) = self.linear_state_bytes();
         for r in rolls.iter_mut() {
-            r.spec
-                .linear_state_addrs(&self.ctx, r.slot, &mut gdr, &mut conv)?;
+            r.spec.linear_state_addrs(
+                &self.ctx,
+                r.slot,
+                (gdr_bytes, conv_bytes),
+                &mut gdr,
+                &mut conv,
+            )?;
         }
         // Restore: live <- snapshot, so the snapshot side is the source.
-        self.batched_copy(&mut tables.copy, &gdr.1, &gdr.0, &[gdr_bytes])?;
-        self.batched_copy(&mut tables.copy, &conv.1, &conv.0, &[conv_bytes])?;
+        self.batched_copy(copy, &gdr.1, &gdr.0, &[gdr_bytes])?;
+        self.batched_copy(copy, &conv.1, &conv.0, &[conv_bytes])?;
         let restore_ms = super::mtp_phase_lap(&self.ctx, &mut pt);
         // The varlen replay is the recurrent kernel; leave the opt-in chunked
         // path on its own route.

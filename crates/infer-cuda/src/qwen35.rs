@@ -1703,8 +1703,6 @@ pub(crate) struct Qwen35SpecSlotState {
 /// offset `t*width`), so rows `[0..=k]` slice contiguously as `[0..(k+1)*width]`.
 /// Allocated only with the spec state, so the baseline decode path never pays.
 #[allow(dead_code)] // populated by linear_attention under capture; read by replay_linear_only
-/// Per-slot buffer addresses the varlen replay kernels index, one `[B]` table
-/// per linear layer. Re-staged every tick: the accepted set changes.
 /// Pointer/length staging for [`Qwen35Model::batched_copy`].
 #[derive(Default)]
 pub(crate) struct Qwen35CopyScratch {
@@ -1714,16 +1712,43 @@ pub(crate) struct Qwen35CopyScratch {
     hlen: Vec<i32>,
 }
 
-/// Flat `[kind, layer, slot]`, so staging is one H2D per tick.
+/// Per-slot buffer addresses the varlen replay kernels index, one `[B]` table
+/// per (kind, linear layer), flat so staging is one H2D. Re-staged every tick:
+/// the accepted set changes.
 #[derive(Default)]
 pub(crate) struct Qwen35ReplayTables {
-    pub(crate) copy: Qwen35CopyScratch,
     ptrs: SliceSlot<u64>,
     row_len: SliceSlot<i32>,
     host: Vec<u64>,
+    layout: ReplayLayout,
 }
 
-/// qkv / b / a / conv-state / gdr-state.
+/// Where each table sits in the flat staging buffer — one definition, used by
+/// the host writer and the device reader.
+#[derive(Clone, Copy, Default)]
+struct ReplayLayout {
+    base: u64,
+    stride: usize,
+    batch: usize,
+}
+
+impl ReplayLayout {
+    fn at(&self, kind: usize, li: usize) -> usize {
+        kind * self.stride + li * self.batch
+    }
+
+    /// Device address of table `kind`'s `[B]` row for linear layer `li`.
+    fn table(&self, kind: usize, li: usize) -> u64 {
+        self.base + (self.at(kind, li) as u64) * 8
+    }
+}
+
+/// [`Qwen35ReplayTables`] kinds, in layout order.
+const TBL_QKV: usize = 0;
+const TBL_B: usize = 1;
+const TBL_A: usize = 2;
+const TBL_CONV: usize = 3;
+const TBL_GDR: usize = 4;
 const REPLAY_TABLES: usize = 5;
 
 impl Qwen35ReplayTables {
@@ -1736,18 +1761,25 @@ impl Qwen35ReplayTables {
         num_linear: usize,
     ) -> Result<()> {
         let b = slots.len();
-        let stride = num_linear * b;
+        let lay = ReplayLayout {
+            base: 0,
+            stride: num_linear * b,
+            batch: b,
+        };
+        self.layout = lay;
         self.host.clear();
-        self.host.resize(REPLAY_TABLES * stride, 0);
+        self.host.resize(REPLAY_TABLES * lay.stride, 0);
         for li in 0..num_linear {
             for (s, slot) in slots.iter_mut().enumerate() {
-                let at = li * b + s;
-                self.host[at] = captures[s].qkv[li].data.device_ptr(&ctx.stream).0;
-                self.host[stride + at] = captures[s].b_proj[li].data.device_ptr(&ctx.stream).0;
-                self.host[2 * stride + at] = captures[s].a_proj[li].data.device_ptr(&ctx.stream).0;
-                self.host[3 * stride + at] =
-                    slot.conv_states[li].data.device_ptr_mut(&ctx.stream).0;
-                self.host[4 * stride + at] = slot.gdr_states[li].device_ptr_mut(&ctx.stream).0;
+                let mut put = |kind: usize, addr: u64| self.host[lay.at(kind, li) + s] = addr;
+                put(TBL_QKV, captures[s].qkv[li].data.device_ptr(&ctx.stream).0);
+                put(TBL_B, captures[s].b_proj[li].data.device_ptr(&ctx.stream).0);
+                put(TBL_A, captures[s].a_proj[li].data.device_ptr(&ctx.stream).0);
+                put(
+                    TBL_CONV,
+                    slot.conv_states[li].data.device_ptr_mut(&ctx.stream).0,
+                );
+                put(TBL_GDR, slot.gdr_states[li].device_ptr_mut(&ctx.stream).0);
             }
         }
         let dst = self.ptrs.get(ctx, self.host.len())?;
@@ -1803,6 +1835,7 @@ impl Qwen35SpecSlotState {
         &mut self,
         ctx: &DeviceContext,
         slot: &mut Qwen35SlotState,
+        bytes: (usize, usize),
         gdr: &mut (Vec<u64>, Vec<u64>),
         conv: &mut (Vec<u64>, Vec<u64>),
     ) -> Result<()> {
@@ -1815,6 +1848,16 @@ impl Qwen35SpecSlotState {
             slot.gdr_states.len(),
             slot.conv_states.len()
         );
+        // The batched copy takes a size, not a slice — every pair must be it.
+        ensure!(
+            self.gdr_snap.iter().all(|b| b.len() * 4 == bytes.0)
+                && slot.gdr_states.iter().all(|b| b.len() * 4 == bytes.0)
+                && self.conv_snap.iter().all(|b| b.len * 2 == bytes.1)
+                && slot.conv_states.iter().all(|b| b.len * 2 == bytes.1),
+            "spec linear state buffers are not uniformly {}/{} bytes",
+            bytes.0,
+            bytes.1
+        );
         for (s, l) in self.gdr_snap.iter_mut().zip(slot.gdr_states.iter_mut()) {
             gdr.0.push(s.device_ptr_mut(&ctx.stream).0);
             gdr.1.push(l.device_ptr_mut(&ctx.stream).0);
@@ -1824,15 +1867,6 @@ impl Qwen35SpecSlotState {
             conv.1.push(l.data.device_ptr_mut(&ctx.stream).0);
         }
         Ok(())
-    }
-
-    /// Per-layer byte counts of the two linear states, in `linear_state_addrs`
-    /// order.
-    pub(crate) fn linear_state_bytes(&self) -> (usize, usize) {
-        (
-            self.gdr_snap.first().map_or(0, |b| b.len() * 4),
-            self.conv_snap.first().map_or(0, |b| b.len * 2),
-        )
     }
 
     /// Mutable access to the persistent 1-element argmax scratch (the warm step
@@ -2667,6 +2701,15 @@ impl Qwen35Model {
     /// requested draft depth. Snapshot scratch matches [`Self::new_slot_state`]'s
     /// linear-state dims exactly so a snapshot/restore is a straight D2D copy.
     #[allow(dead_code)] // called by the executor spec-slot init in a later increment
+    /// Per-layer bytes of the two linear states, in `linear_state_addrs` order.
+    pub(crate) fn linear_state_bytes(&self) -> (usize, usize) {
+        let c = &self.config;
+        (
+            self.local_linear_v_heads * c.linear_key_head_dim * c.linear_value_head_dim * 4,
+            self.local_linear_qkv_dim() * (c.linear_conv_kernel_dim - 1) * 2,
+        )
+    }
+
     pub(crate) fn new_spec_slot_state(&self) -> Result<Qwen35SpecSlotState> {
         let c = &self.config;
         let num_full = c.num_full_attention_layers();
@@ -6764,9 +6807,9 @@ impl Qwen35Model {
                     total == rows,
                     "linear rows total {total} != {rows} staged columns"
                 );
-                // THIS row's columns land at ITS capture offset 0, so a
-                // partial-accept replay re-runs only this slot's prefix. All
-                // rows' copies go out as three launches, not three per row.
+                // Each row's columns land at ITS capture offset 0, so a
+                // partial-accept replay re-runs only that slot's prefix. Three
+                // launches for the whole batch, not three per row.
                 if rs.iter().any(|r| r.capture.is_some()) {
                     let (mut dst, mut src, mut sz) = (Vec::new(), Vec::new(), Vec::new());
                     let mut off = 0usize;
@@ -6799,8 +6842,6 @@ impl Qwen35Model {
                 }
                 let mut off = 0usize;
                 for r in rs.iter_mut() {
-                    // THIS row's columns land at ITS capture offset 0, so a
-                    // partial-accept replay re-runs only this slot's prefix.
                     self.advance_linear_conv_gdr(
                         attn,
                         &qkv.data.slice(off * qkv_dim..(off + r.len) * qkv_dim),
@@ -7446,6 +7487,10 @@ impl Qwen35Model {
             .ptrs
             .get(ctx, REPLAY_TABLES * stride)?
             .device_ptr(&ctx.stream);
+        let lay = ReplayLayout {
+            base: tbl,
+            ..tables.layout
+        };
         let (len_ptr, _gl) = tables.row_len.get(ctx, b)?.device_ptr(&ctx.stream);
         let c = &self.config;
         let mut li = 0usize;
@@ -7456,8 +7501,11 @@ impl Qwen35Model {
             let (w_ptr, _g0) = attn.conv1d_weight.data.device_ptr(&ctx.stream);
             let (dt_ptr, _g1) = attn.dt_bias.data.device_ptr(&ctx.stream);
             let (alog_ptr, _g2) = attn.a_log.device_ptr(&ctx.stream);
-            let at = |kind: usize| tbl + ((kind * stride + li * b) as u64) * 8;
-            let (qkv_tbl, b_tbl, a_tbl, conv_tbl, gdr_tbl) = (at(0), at(1), at(2), at(3), at(4));
+            let qkv_tbl = lay.table(TBL_QKV, li);
+            let b_tbl = lay.table(TBL_B, li);
+            let a_tbl = lay.table(TBL_A, li);
+            let conv_tbl = lay.table(TBL_CONV, li);
+            let gdr_tbl = lay.table(TBL_GDR, li);
             // SAFETY: each table holds `b` pointers staged above; the shared
             // scratch is `[b * max_len, dim]`.
             unsafe {

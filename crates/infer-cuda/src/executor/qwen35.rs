@@ -1927,14 +1927,17 @@ impl Qwen35CudaExecutor {
             idx.sort_by_key(|&i| decode_rows[i].slot);
             let anchors: Vec<u32> = idx.iter().map(|&i| decode_rows[i].last_token).collect();
             let starts: Vec<usize> = idx.iter().map(|&i| decode_rows[i].kv_seq_len).collect();
-            let want: Vec<usize> = idx.iter().map(|&i| decode_rows[i].slot).collect();
             let Self { model, dspark, .. } = self;
             let ds = dspark.as_mut().expect("dspark");
+            let mut pick = vec![false; ds.slots.len()];
+            for &i in &idx {
+                pick[decode_rows[i].slot] = true;
+            }
             let mut dfs: Vec<&mut crate::qwen35::dspark::Qwen35DsparkSlotState> = ds
                 .slots
                 .iter_mut()
                 .enumerate()
-                .filter(|(s, _)| want.contains(s))
+                .filter(|(s, _)| pick[*s])
                 .map(|(_, st)| st.as_mut().expect("seeded slot"))
                 .collect();
             let chains = model.dspark_draft_blocks(
@@ -2024,27 +2027,24 @@ impl Qwen35CudaExecutor {
                 ..
             } = self;
             let ds = dspark.as_mut().expect("dspark");
-            let want: Vec<usize> = batch.iter().map(|c| c.slot).collect();
+            let mut pick = vec![false; slots.len()];
+            for c in &batch {
+                pick[c.slot] = true;
+            }
+            let bytes = model.linear_state_bytes();
             let (mut gdr, mut conv) = ((Vec::new(), Vec::new()), (Vec::new(), Vec::new()));
-            let mut bytes = (0, 0);
             for ((_, slot), (_, spec)) in slots
                 .iter_mut()
                 .enumerate()
-                .filter(|(i, _)| want.contains(i))
-                .zip(
-                    ds.spec
-                        .iter_mut()
-                        .enumerate()
-                        .filter(|(i, _)| want.contains(i)),
-                )
+                .filter(|(i, _)| pick[*i])
+                .zip(ds.spec.iter_mut().enumerate().filter(|(i, _)| pick[*i]))
             {
-                let spec = spec.as_mut().expect("built above");
-                bytes = spec.linear_state_bytes();
-                spec.linear_state_addrs(&model.ctx, slot, &mut gdr, &mut conv)?;
+                spec.as_mut()
+                    .expect("built above")
+                    .linear_state_addrs(&model.ctx, slot, bytes, &mut gdr, &mut conv)?;
             }
-            let copy = &mut ds.replay_tables.copy;
-            model.batched_copy(copy, &gdr.0, &gdr.1, &[bytes.0])?;
-            model.batched_copy(copy, &conv.0, &conv.1, &[bytes.1])?;
+            model.batched_copy(&mut ds.copy, &gdr.0, &gdr.1, &[bytes.0])?;
+            model.batched_copy(&mut ds.copy, &conv.0, &conv.1, &[bytes.1])?;
         }
         let snap_ms = crate::qwen35::mtp_phase_lap(&self.model.ctx, &mut pt);
 
@@ -2173,17 +2173,15 @@ impl Qwen35CudaExecutor {
         // One replay launch per layer for every partially-accepted chain.
         if !rollback.is_empty() {
             rollback.sort_by_key(|r| r.0);
-            let want: Vec<usize> = rollback.iter().map(|r| r.0).collect();
+            let mut pick = vec![false; slots.len()];
+            for r in &rollback {
+                pick[r.0] = true;
+            }
             let mut rolls: Vec<crate::qwen35::dspark::DsparkRollback<'_>> = slots
                 .iter_mut()
                 .enumerate()
-                .filter(|(i, _)| want.contains(i))
-                .zip(
-                    ds.spec
-                        .iter_mut()
-                        .enumerate()
-                        .filter(|(i, _)| want.contains(i)),
-                )
+                .filter(|(i, _)| pick[*i])
+                .zip(ds.spec.iter_mut().enumerate().filter(|(i, _)| pick[*i]))
                 .zip(rollback.iter())
                 .map(
                     |(((_, slot), (_, spec)), r)| crate::qwen35::dspark::DsparkRollback {
@@ -2194,7 +2192,12 @@ impl Qwen35CudaExecutor {
                     },
                 )
                 .collect();
-            model.dspark_rollback_batch(&mut rolls, &mut ds.replay_tables, workspace)?;
+            model.dspark_rollback_batch(
+                &mut rolls,
+                &mut ds.replay_tables,
+                &mut ds.copy,
+                workspace,
+            )?;
         }
         let commit_ms = tap_ms + accept_ms + cap_ms + trunc_ms + ext_ms;
         if pt.is_some() {
