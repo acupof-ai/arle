@@ -1012,6 +1012,30 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         self.upload(&host, local_shape)
     }
 
+    /// One context-parallel ring step: send this rank's KV block to the next rank
+    /// and return the block received from the previous rank (a ring rotation of
+    /// `[1, kv_heads, block, head_dim]` blocks). `block_shape` is one block's shape
+    /// (equal on every rank — the launcher pads the sequence to a multiple of the
+    /// CP size). Single-rank / CPU / no-communicator semantics are identity: with
+    /// one rank the ring degenerates to the local block, so the default returns the
+    /// input. CUDA overrides with `nccl.send`/`recv` inside a `group_start/end`.
+    fn ring_send_recv_kv(
+        &self,
+        block: &DeviceHandle,
+        block_shape: &[usize],
+    ) -> Result<DeviceHandle> {
+        let host = self.readback(block)?;
+        let size = shape_size(block_shape);
+        if host.len() != size {
+            return Err(crate::AutogradError::DataLengthMismatch {
+                len: host.len(),
+                shape: block_shape.to_vec(),
+                size,
+            });
+        }
+        self.upload(&host, block_shape)
+    }
+
     /// Sum of squares for a device handle, returned on host as `f64`.
     /// The default fallback reads the full tensor; CUDA overrides with a
     /// partial-reduction kernel so gradient clipping can stay device-resident.
