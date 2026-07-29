@@ -2979,6 +2979,10 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
         return run_agent_opd_replay(&args, &records_path, lora, target_set);
     }
     let update_preset = args.update_preset();
+    // Per-rank serve port: CP ranks re-exec identical argv, so they'd all bind the
+    // same --serve-port. Offset by CP rank so rank>0 doesn't collide (EADDRINUSE);
+    // single-card (rank 0) keeps the exact requested port.
+    let serve_port = args.serve_port + train::context_parallel::CpContext::from_env().rank as u16;
     validate_online_rollout_temperature(
         update_preset,
         args.update_strategy,
@@ -3203,11 +3207,11 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
     let serve_thread = infer_api::serve_router_on_thread(
         student_engine.local_router(0)?, // thinking unbounded — the serve default
         "127.0.0.1",
-        args.serve_port,
+        serve_port,
     )?;
     eprintln!(
         "[arle train agent-opd] cc serve on http://127.0.0.1:{} (model={cc_model_id}, dumps={})",
-        args.serve_port,
+        serve_port,
         dump_dir.display()
     );
 
@@ -3391,7 +3395,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
     let harness = Arc::new(train::cc_harness::CcHarness {
         work_root: args.work_root.clone(),
         dump_dir,
-        base_url: format!("http://127.0.0.1:{}", args.serve_port),
+        base_url: format!("http://127.0.0.1:{}", serve_port),
         model_id: cc_model_id,
         cc_timeout_secs: args.cc_timeout,
         test_timeout_secs: args.test_timeout_secs,
