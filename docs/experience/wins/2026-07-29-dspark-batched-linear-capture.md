@@ -35,6 +35,19 @@ which is the shape a `3 * B`-per-layer cost predicts. Gate exact=3 DET at
 Shipped, against no-spec: **c=1 +37% / c=2 +88% / c=4 +83% / c=8 +37% /
 c=16 +17%** tok/s; TPOT −64 / −51 / −48 / −26 / **−13%**.
 
+`output_tokens_per_s` is not decode speed on this fingerprint: 48 requests carry
+1.53M prompt tokens against 7,700 output tokens, so at c=1 each request spends
+6.2 s in prefill and 1.9-5.0 s decoding — the column measures prefill there. Per
+request, decode is `1000 / TPOT`:
+
+| c | no-spec | DSpark | |
+|---|---:|---:|---:|
+| 1 | 34.6 | **97.3** | 2.81× |
+| 2 | 26.8 | 54.7 | 2.04× |
+| 4 | 16.9 | 32.6 | 1.93× |
+| 8 | 13.9 | 18.9 | 1.36× |
+| 16 | 9.8 | 11.3 | 1.15× |
+
 ## Still open
 
 Speculation now pays everywhere, but the margin still falls with concurrency
@@ -45,6 +58,11 @@ launches: the DSpark head's train sidecar, whose `prob_match` normalization fix
 is still owed an acceptance A/B.
 
 ## Rule
+
+**Do not headline `output_tokens / wall` on a prefill-heavy fingerprint.** At
+c=1 this set is 55-76% prefill, so the column reads as a +37% decode result
+where decode actually went 2.81×. TTFT and decode are separate SLOs; a table
+that mixes them hides the win it is reporting.
 
 **A per-(row, layer) copy is a `B * L` launch pile wearing a memcpy's clothes.**
 Three of them looked like bookkeeping next to a 27B forward and cost 7.4% of
