@@ -1,6 +1,6 @@
 # FP8 grouped-MoE LoRA re-merge unblocked — BF16-resident experts, CUDA, 2026-07-29
 
-> Status: pending-remote
+> Status: functional gate PASSED on H20 (3 steps, finite loss); MMLU curve pending
 
 ## Context
 
@@ -48,11 +48,30 @@ kernel format; any per-step weight mutation must write in place and all experts
 in a layer must share one format. Lazy per-tensor promote is an attn/dense-only
 trick — it does not generalize to grouped experts.
 
-## Verification (pending-remote)
+## Verification (functional gate PASSED)
 
 Mac has no nvcc; typecheck via CI Lint mirror passed
 (`CUDARC_CUDA_VERSION=12080 cargo check --no-default-features
---features cuda,no-cuda` for infer-api + cli). Functional gate to run on the
-H20 box: `arle train opd --lora-target-set all-linear` clears step 3 (was the
-failure point) with finite loss over ≥50 steps, then the iso64 MMLU curve
-(base 34%) confirms on-policy KL recovers accuracy.
+--features cuda,no-cuda` for infer-api + cli). H20 functional gate: `arle train
+opd --lora-target-set all-linear` on iso64 cleared step 3 (the original failure
+point) and ran 3 steps to completion with finite loss `[0.53, 2.21, 0.63]`.
+
+The residency switch alone was not enough — it took two companion fixes to
+actually run end-to-end, each surfaced only at runtime on the H20:
+
+1. **Empty per-expert Vec** (commit 227790953): the BF16 dequant flips
+   `expert_weight_format` to `DenseBf16`, which made `deepgemm_ready=true` on
+   Hopper — the BF16 grouped concat then cleared the per-expert `gate/up/down`
+   Vecs the re-merge needs. Fix: gate `deepgemm_ready` on
+   `!experts_bf16_resident` (see errors/2026-07-29-bf16-resident-experts-cleared-by-grouped-cache).
+2. **VRAM budget** (commit 5563ba032 + ARLE_FORCE_CHECKPOINT): the in-process
+   rollout engine profiled its KV pool at `mem_fraction_static=0.9` of
+   post-weights free VRAM, and BF16-resident experts doubled routed VRAM — so
+   the per-step re-merge scratch OOM'd (step 3), and once the KV pool shrank the
+   ckpt-gate false-non-engaged and the backward tape OOM'd (step 1). Fix: new
+   `--rollout-mem-fraction 0.1` (single-sequence rollout needs a tiny KV pool)
+   + `ARLE_FORCE_CHECKPOINT=1` to force gradient checkpointing the gate's memory
+   model underestimated for the MoE all-linear backward.
+
+MMLU curve still pending: serve `step_000050` + aligned MMLU n=100 seed=0 vs the
+29-30% merged baseline (>37% = on-policy KL meaningfully recovers accuracy).
