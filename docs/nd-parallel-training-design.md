@@ -1,32 +1,36 @@
 # N-D parallel OPD training — design (DP · PP · CP · TP · EP)
 
-> Status: **CP is implemented (option B); mesh convergence + parity gate landed
-> 2026-07-29.** The other axes are staged, not built — see the axis table.
+> Status: **all five axes have a landed, CPU-verified core (2026-07-29); the
+> multi-rank NCCL data-planes are pending-remote.** "Core" = the correctness-
+> load-bearing math/config (adjoints, coordinate derivation, shard tiling), gated
+> by local unit tests. "Pending-remote" = the wire transport + model-level parity,
+> which need a pod (≥2 GPU + NCCL) and are not locally verifiable.
 > Scope: >3 files + architectural → approach-first per the agent contract.
 
-## Implemented (2026-07-29): the seam converged onto one mesh
+## What landed (2026-07-29), per axis
 
-Train now reads its parallelism coordinates from the one device mesh
-(`infer_topo::MultiAxisConfig` / `RankCoord`) — the same mesh serving reads —
-instead of two private duplicate configs. Landed:
+Train reads all parallelism coordinates from the one device mesh
+(`infer_topo::MultiAxisConfig` / `RankCoord`) — the same mesh serving reads — not
+private duplicate configs.
 
-- `crates/train/Cargo.toml`: depends on `infer-topo` (std-only, device-neutral).
-- `crates/train/src/context_parallel.rs`: `train_mesh()` builds
-  `MultiAxisConfig` + `RankCoord`; `CpContext::from_env`/`from_mesh` derive
-  `{rank, size}` from `attn_cp_rank`/`attn_cp_size`. Pure-CP is byte-identical to
-  the pre-convergence `{rank, size}` (unit-tested).
-- `crates/train/src/qwen35.rs`: `Qwen35TensorParallelConfig::from_coord(cfg, coord)`
-  maps to `attn_tp_rank`/`attn_tp_size` — TP from the same mesh.
-- `crates/train/src/opd.rs`: the CP shard-filter collapsed to one flat
-  filter+rebase over `cp.shard()` (vocab check now explicitly over the full set).
-- Parity: local unit tests in `context_parallel.rs` (pure-CP byte-identity,
-  DP×CP coordinate split, shard-union reconstructs the single-card target set);
-  `crates/train/examples/nd_parallel_parity.rs` (`cuda,nccl`) is the model-level
-  N-vs-1 loss-parity gate — **pending-remote** (needs pod ≥2 GPU + NCCL).
+| Axis | Core landed + CPU-gated | Pending-remote (pod NCCL) |
+|---|---|---|
+| **Mesh** | `train_mesh()` → `MultiAxisConfig`+`RankCoord`; `CpContext`/`Qwen35TensorParallelConfig`/`DpContext`/`PpContext` are derived views, one source of truth | — |
+| **CP** | option B live + converged; ring option-A flash-2 merge+backward (`ops/ring_attention.rs`) U2-gated vs full-softmax reference | ring device kernels + NCCL `ring_send_recv_kv`; model N=2 parity; default stays option B |
+| **TP** | attention-TP live; **MoE-TP** built (column/row-parallel experts+shared, `maybe_tp_all_reduce`) | MoE finite-diff on ≥2 GPU |
+| **EP** | differentiable dispatch/combine permutation + adjoint (`ops/collective_ep.rs`), adjoint-gated `<S·x,y>=<x,Sᵀ·y>` | NCCL all-to-all transport; capacity + router aux loss; qwen35 routing hook |
+| **DP** | `DpContext` coord + batch-shard + `global_inv_n` global-mean math | DP launcher + count all-reduce + `opd.rs` gate `(cp‖dp)` |
+| **PP** | `PpContext` layer-partition (`pipeline_parallel.rs`); 1F1B documented as wrong-fit for single-pass writeback | cross-stage activation send/recv; layer-loop split |
 
-DP is carried as mesh coordinates only (unit-tested); its data-plane (launcher +
-batch-shard + count reduce), plus EP/PP/ring-A/MoE-TP, are the deferred
-workstreams in §7 — none is locally verifiable, so none is marked done.
+Local gate (all pass): `cargo test -p train -p autograd --no-default-features
+--features no-cuda` (193 + 50 lib tests) + clippy + Mac CUDA typecheck. The
+model-level parity gate `crates/train/examples/nd_parallel_parity.rs`
+(`cuda,nccl`) and every wire transport above are **pending-remote**.
+
+Nothing here is marked "shipped end-to-end": each axis's math/config is verified,
+its NCCL data-plane and default-flip await the pod. Option B stays CP's default
+until the ring passes pod parity (no half-states; unverified path never default).
+
 
 ## 0. The one correction that reshapes everything
 
@@ -205,14 +209,21 @@ Named so "five axes supported" doesn't silently omit them; none blocks P0.
 
 ## 8. Status and next binding constraint
 
-**Shipped (2026-07-29):** decision (a) — train converged onto
-`MultiAxisConfig`/`RankCoord`; the `CpContext`/`Qwen35TensorParallelConfig`
-duplication is now a derived view, one mesh with two consumers (serve + train).
-CP option B rides the mesh; local shard-parity is unit-tested; the model-level
-N=2 gate (`nd_parallel_parity`) is pending-remote.
+**Landed (2026-07-29):** the mesh convergence (decision a) plus a CPU-verified
+core for all five axes — see the per-axis table at the top. Every axis now has
+its correctness-load-bearing piece in-tree and unit-gated: mesh coordinate
+derivation, CP ring flash-2 merge+backward, MoE-TP, EP dispatch/combine adjoint,
+DP global-mean, PP layer partition.
 
-**Not built** — decision (b)/(c) stand: only CP is implemented; TP is
-attention-only; DP/PP/EP are identity in the train mesh. The next binding
-constraint is still **P0 ring attention** (option A) — the only 256K activation
-wall — but note the linear-attn CP peak (§6.3) is unmeasured and may be the real
-wall after ring. Measure the seq-ladder before committing to option A.
+**Pending-remote (the gating work now):** each axis's NCCL data-plane and
+model-level parity — ring device kernels + `ring_send_recv_kv`, EP all-to-all
+transport + capacity/aux-loss, DP launcher + count reduce, PP activation
+send/recv, MoE-TP finite-diff. All need a pod (≥2 GPU + NCCL); none is locally
+verifiable, so none is a default flip yet. Option B stays CP's default until the
+ring passes pod parity.
+
+**Next binding constraint:** the pod seq-ladder to measure the linear-attn CP
+activation peak at 256K (§6.3, unmeasured) — it decides whether the ring
+full-attn path alone fits 256K or whether linear-attn boundary-gradient sharding
+becomes mandatory. Measure before flipping the ring on.
+
