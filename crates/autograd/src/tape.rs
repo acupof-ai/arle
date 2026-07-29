@@ -180,6 +180,27 @@ pub enum SavedContext {
         dim: usize,
         chunk: usize,
     },
+    // Expert-parallel dispatch/combine plan: `src[slot]` is the source token row
+    // (usize::MAX = capacity drop). `dim` is the row width. Backward applies the
+    // transpose permutation (dispatch↔combine).
+    EpPlanCtx {
+        input: TensorId,
+        src: Vec<usize>,
+        num_tokens: usize,
+        dim: usize,
+    },
+    // Ring-attention context-parallel tile: `blocks` are (k, v, k_abs) TensorIds
+    // ring-delivered in forward order; `lse`/`out` are the saved per-row logsumexp
+    // and normalized output the flash-2 backward replays against.
+    RingAttentionCtx {
+        q: TensorId,
+        blocks: SmallVec<[(TensorId, TensorId, usize); 4]>,
+        lse: TensorId,
+        out: TensorId,
+        rows: usize,
+        dim: usize,
+        q_abs: usize,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -220,6 +241,9 @@ pub enum BackwardOp {
     AllReduceSum,
     AllGatherSeq,
     ReduceScatterSum,
+    EpDispatch,
+    EpCombine,
+    RingAttention,
     Checkpoint,
     SeqChunkedRecompute,
 }
@@ -263,6 +287,9 @@ impl BackwardOp {
             BackwardOp::AllReduceSum => "AllReduceSum",
             BackwardOp::AllGatherSeq => "AllGatherSeq",
             BackwardOp::ReduceScatterSum => "ReduceScatterSum",
+            BackwardOp::EpDispatch => "EpDispatch",
+            BackwardOp::EpCombine => "EpCombine",
+            BackwardOp::RingAttention => "RingAttention",
             BackwardOp::Checkpoint => "Checkpoint",
             BackwardOp::SeqChunkedRecompute => "SeqChunkedRecompute",
         }
@@ -805,6 +832,17 @@ impl Tape {
                     BackwardOp::ReduceScatterSum => {
                         ops::reduce_scatter_sum_backward(&entry, output_grad_id, store)?
                     }
+                    BackwardOp::EpDispatch => {
+                        ops::collective_ep::ep_dispatch_backward(&entry, output_grad_id, store)?
+                    }
+                    BackwardOp::EpCombine => {
+                        ops::collective_ep::ep_combine_backward(&entry, output_grad_id, store)?
+                    }
+                    BackwardOp::RingAttention => ops::ring_attention::cp_ring_attention_backward(
+                        &entry,
+                        output_grad_id,
+                        store,
+                    )?,
                     BackwardOp::Checkpoint => self.checkpoint_backward(
                         &entry,
                         output_grad_id,
