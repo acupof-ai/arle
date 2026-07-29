@@ -100,7 +100,9 @@ unsafe extern "C" {
     pub fn batched_copy_uniform_cuda(
         dst_ptrs: *const *mut std::ffi::c_void,
         src_ptrs: *const *const std::ffi::c_void,
+        words_each: *const i32,
         bytes: usize,
+        max_words: usize,
         count: i32,
         stream: CUstream,
     ) -> CUresult;
