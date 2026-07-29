@@ -14,7 +14,6 @@ publish = false
 [dependencies]
 anyhow = "1.0"
 axum = "0.8"
-base64 = "0.22"
 fastrace = { version = "0.7.16", features = ["enable"] }
 infer-core = { path = "../infer-core" }
 infer-plan = { path = "../infer-plan", features = ["serde"] }

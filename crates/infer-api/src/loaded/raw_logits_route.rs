@@ -13,10 +13,15 @@
 
 use std::sync::Arc;
 
-use axum::{Json, Router, extract::State, http::StatusCode, response::IntoResponse, routing::post};
-use base64::{Engine as _, engine::general_purpose::STANDARD};
+use axum::{
+    Json, Router,
+    extract::State,
+    http::{HeaderMap, StatusCode, header::CONTENT_TYPE},
+    response::IntoResponse,
+    routing::post,
+};
 use half::bf16;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use crate::loaded::LoadedInferenceEngine;
 
@@ -30,13 +35,6 @@ struct RawLogitsRequest {
     #[serde(default)]
     #[allow(dead_code)]
     dtype: Option<String>,
-}
-
-#[derive(Serialize)]
-struct RawLogitsResponse {
-    shape: [usize; 2],
-    dtype: &'static str,
-    logits_b64: String,
 }
 
 /// A raw-logits sub-router bound to the CUDA engine, ready to `.merge()` into the
@@ -71,17 +69,19 @@ async fn handle_raw_logits(
     });
     match result {
         Ok((shape, host)) => {
-            // bf16-LE bytes -> base64. ApiTeacher decodes exactly this (dtype=bf16).
-            let mut bytes = Vec::with_capacity(host.len() * 2);
+            // Raw bf16-LE body (no base64/JSON): the [seq, vocab] block is ~1 GB,
+            // and base64+JSON of it dominated the client step (multi-GB string
+            // parse). Shape rides headers; ApiTeacher reads bytes + bulk-decodes.
+            let mut body = Vec::with_capacity(host.len() * 2);
             for v in &host {
-                bytes.extend_from_slice(&bf16::from_f32(*v).to_bits().to_le_bytes());
+                body.extend_from_slice(&bf16::from_f32(*v).to_bits().to_le_bytes());
             }
-            Json(RawLogitsResponse {
-                shape,
-                dtype: "bf16",
-                logits_b64: STANDARD.encode(&bytes),
-            })
-            .into_response()
+            let mut headers = HeaderMap::new();
+            headers.insert(CONTENT_TYPE, "application/octet-stream".parse().unwrap());
+            headers.insert("x-logits-rows", shape[0].into());
+            headers.insert("x-logits-cols", shape[1].into());
+            headers.insert("x-logits-dtype", "bf16".parse().unwrap());
+            (headers, body).into_response()
         }
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,

@@ -10,6 +10,7 @@
 use std::sync::Arc;
 use std::{
     collections::HashSet,
+    io::Read,
     sync::Mutex,
     time::{Duration, Instant},
 };
@@ -19,11 +20,10 @@ use autograd::Backend;
 #[cfg(feature = "cuda")]
 use autograd::ops::slice;
 use autograd::{AutogradError, Tape, Tensor, TensorId, TensorStore};
-use base64::{Engine as _, engine::general_purpose};
 use half::bf16;
 #[cfg(feature = "cuda")]
 use infer_api::LoadedInferenceEngine;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::qwen35::{Qwen35Error, Qwen35Model, SequenceWindow};
 
@@ -344,14 +344,6 @@ struct ApiTeacherRequest<'a> {
     dtype: &'a str,
 }
 
-#[derive(Debug, Deserialize)]
-struct ApiTeacherResponse {
-    shape: Vec<usize>,
-    dtype: String,
-    logits: Option<Vec<f32>>,
-    logits_b64: Option<String>,
-}
-
 impl ApiTeacher {
     pub fn new(endpoint: impl Into<String>, vocab_size: usize) -> Self {
         Self::with_timeout(endpoint, vocab_size, Duration::from_secs(30))
@@ -389,7 +381,11 @@ impl ApiTeacher {
             .unwrap_or_default()
     }
 
-    fn post_logits(&self, input_ids: &[u32], positions: &[u32]) -> Result<ApiTeacherResponse> {
+    /// POST the token/position sequence, return the raw bf16-LE logits bytes and
+    /// `[rows, cols]` shape (from headers). The body is the raw `[seq, vocab]`
+    /// block (~1 GB) — base64+JSON of it dominated the step, so the wire is now
+    /// `application/octet-stream` with no string encode/parse.
+    fn post_logits(&self, input_ids: &[u32], positions: &[u32]) -> Result<(Vec<u8>, [usize; 2])> {
         let body = ApiTeacherRequest {
             input_ids,
             positions,
@@ -405,22 +401,33 @@ impl ApiTeacher {
         if let Some(api_key) = self.api_key.as_deref() {
             request = request.set("Authorization", &format!("Bearer {api_key}"));
         }
-        request
-            .send_json(body)
-            .map_err(|err| {
-                TeacherForwardError::ApiRuntime(format!(
-                    "POST {} failed: {err}. Hint: the API teacher endpoint must accept \
-                     {{input_ids, positions, dtype}} and return full token logits.",
-                    self.endpoint
-                ))
-            })?
-            .into_json()
-            .map_err(|err| {
-                TeacherForwardError::ApiRuntime(format!(
-                    "decode JSON response from {} failed: {err}",
-                    self.endpoint
-                ))
-            })
+        let resp = request.send_json(body).map_err(|err| {
+            TeacherForwardError::ApiRuntime(format!(
+                "POST {} failed: {err}. Hint: the API teacher endpoint must accept \
+                 {{input_ids, positions, dtype}} and return raw bf16 token logits.",
+                self.endpoint
+            ))
+        })?;
+        let rows: usize = resp
+            .header("x-logits-rows")
+            .and_then(|v| v.parse().ok())
+            .ok_or_else(|| {
+                TeacherForwardError::ApiDecode("response missing x-logits-rows header".to_owned())
+            })?;
+        let cols: usize = resp
+            .header("x-logits-cols")
+            .and_then(|v| v.parse().ok())
+            .ok_or_else(|| {
+                TeacherForwardError::ApiDecode("response missing x-logits-cols header".to_owned())
+            })?;
+        let mut bytes = Vec::with_capacity(rows * cols * 2);
+        resp.into_reader().read_to_end(&mut bytes).map_err(|err| {
+            TeacherForwardError::ApiRuntime(format!(
+                "read raw-logits body from {} failed: {err}",
+                self.endpoint
+            ))
+        })?;
+        Ok((bytes, [rows, cols]))
     }
 }
 
@@ -447,11 +454,11 @@ impl TeacherForward for ApiTeacher {
 
         let total_started = Instant::now();
         let http_started = Instant::now();
-        let response = self.post_logits(input_ids, positions)?;
+        let (bytes, raw_shape) = self.post_logits(input_ids, positions)?;
         let http_seconds = http_started.elapsed().as_secs_f64();
         let decode_started = Instant::now();
-        let shape = normalize_api_teacher_shape(&response.shape, input_ids.len(), self.vocab_size)?;
-        let logits = decode_api_teacher_logits(&response, shape_size(&shape))?;
+        let shape = normalize_api_teacher_shape(&raw_shape, input_ids.len(), self.vocab_size)?;
+        let logits = decode_bf16_le_logits(&bytes, shape_size(&shape))?;
         let decode_seconds = decode_started.elapsed().as_secs_f64();
         let upload_started = Instant::now();
         let tensor_id = store.alloc(Tensor::new(logits, shape.clone(), false)?);
@@ -491,52 +498,6 @@ fn normalize_api_teacher_shape(
             shape, seq_len, vocab_size, seq_len, vocab_size
         ))),
     }
-}
-
-fn decode_api_teacher_logits(
-    response: &ApiTeacherResponse,
-    expected_len: usize,
-) -> Result<Vec<f32>> {
-    if let Some(logits) = response.logits.as_ref() {
-        if logits.len() != expected_len {
-            return Err(TeacherForwardError::ApiDecode(format!(
-                "JSON logits length mismatch: got {}, expected {}",
-                logits.len(),
-                expected_len
-            )));
-        }
-        return Ok(logits.clone());
-    }
-
-    let encoded = response.logits_b64.as_deref().ok_or_else(|| {
-        TeacherForwardError::ApiDecode(
-            "response must include either `logits` or `logits_b64`".to_owned(),
-        )
-    })?;
-    let bytes = general_purpose::STANDARD.decode(encoded).map_err(|err| {
-        TeacherForwardError::ApiDecode(format!("base64 decode logits_b64 failed: {err}"))
-    })?;
-    match response.dtype.to_ascii_lowercase().as_str() {
-        "f32" | "float32" => decode_f32_le_logits(&bytes, expected_len),
-        "bf16" | "bfloat16" => decode_bf16_le_logits(&bytes, expected_len),
-        dtype => Err(TeacherForwardError::ApiDecode(format!(
-            "unsupported logits dtype '{dtype}', expected f32 or bf16"
-        ))),
-    }
-}
-
-fn decode_f32_le_logits(bytes: &[u8], expected_len: usize) -> Result<Vec<f32>> {
-    if bytes.len() != expected_len * std::mem::size_of::<f32>() {
-        return Err(TeacherForwardError::ApiDecode(format!(
-            "f32 logits byte length mismatch: got {}, expected {}",
-            bytes.len(),
-            expected_len * std::mem::size_of::<f32>()
-        )));
-    }
-    Ok(bytes
-        .chunks_exact(4)
-        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-        .collect())
 }
 
 fn decode_bf16_le_logits(bytes: &[u8], expected_len: usize) -> Result<Vec<f32>> {
@@ -949,52 +910,7 @@ mod tests {
     }
 
     #[test]
-    fn api_teacher_decodes_f32_base64_logits() -> Result<()> {
-        let values = [1.25f32, -2.5, 3.75, 4.0];
-        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let response = ApiTeacherResponse {
-            shape: vec![1, 4],
-            dtype: "f32".to_owned(),
-            logits: None,
-            logits_b64: Some(general_purpose::STANDARD.encode(bytes)),
-        };
-
-        let shape = normalize_api_teacher_shape(&response.shape, 1, 4)?;
-        let decoded = decode_api_teacher_logits(&response, shape_size(&shape))?;
-
-        assert_eq!(shape, vec![1, 1, 4]);
-        assert_eq!(decoded, values);
-        Ok(())
-    }
-
-    #[test]
-    fn api_teacher_accepts_multitoken_full_sequence_logits() -> Result<()> {
-        let logits = (0..12).map(|i| i as f32).collect::<Vec<_>>();
-        let response = ApiTeacherResponse {
-            shape: vec![3, 4],
-            dtype: "f32".to_owned(),
-            logits: Some(logits.clone()),
-            logits_b64: None,
-        };
-
-        let shape = normalize_api_teacher_shape(&response.shape, 3, 4)?;
-        let decoded = decode_api_teacher_logits(&response, shape_size(&shape))?;
-
-        assert_eq!(shape, vec![1, 3, 4]);
-        assert_eq!(decoded, logits);
-        Ok(())
-    }
-
-    #[test]
-    fn api_teacher_rejects_last_row_shape_for_multitoken_sequence() {
-        let err = normalize_api_teacher_shape(&[1, 4], 3, 4)
-            .expect_err("last-row logits must not masquerade as full sequence logits");
-        assert!(err.to_string().contains("shape mismatch"));
-        assert!(err.to_string().contains("seq_len=3"));
-    }
-
-    #[test]
-    fn api_teacher_decodes_bf16_base64_logits() -> Result<()> {
+    fn decode_bf16_le_logits_bulk() -> Result<()> {
         let values = [
             bf16::from_f32(1.25),
             bf16::from_f32(-2.5),
@@ -1005,19 +921,26 @@ mod tests {
             .iter()
             .flat_map(|v| v.to_bits().to_le_bytes())
             .collect();
-        let response = ApiTeacherResponse {
-            shape: vec![1, 1, 4],
-            dtype: "bf16".to_owned(),
-            logits: None,
-            logits_b64: Some(general_purpose::STANDARD.encode(bytes)),
-        };
-
-        let shape = normalize_api_teacher_shape(&response.shape, 1, 4)?;
-        let decoded = decode_api_teacher_logits(&response, shape_size(&shape))?;
-
-        assert_eq!(shape, vec![1, 1, 4]);
+        let decoded = decode_bf16_le_logits(&bytes, 4)?;
         assert_eq!(decoded, [1.25, -2.5, 3.75, 4.0]);
+        // length mismatch is rejected
+        assert!(decode_bf16_le_logits(&bytes, 3).is_err());
         Ok(())
+    }
+
+    #[test]
+    fn api_teacher_accepts_multitoken_full_sequence_shape() -> Result<()> {
+        let shape = normalize_api_teacher_shape(&[3, 4], 3, 4)?;
+        assert_eq!(shape, vec![1, 3, 4]);
+        Ok(())
+    }
+
+    #[test]
+    fn api_teacher_rejects_last_row_shape_for_multitoken_sequence() {
+        let err = normalize_api_teacher_shape(&[1, 4], 3, 4)
+            .expect_err("last-row logits must not masquerade as full sequence logits");
+        assert!(err.to_string().contains("shape mismatch"));
+        assert!(err.to_string().contains("seq_len=3"));
     }
 
     #[test]
@@ -1076,21 +999,20 @@ mod tests {
                 ));
             }
             let values = [0.5f32, 1.5, -2.0, 4.25];
-            let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-            let body = serde_json::json!({
-                "shape": [1, 4],
-                "dtype": "f32",
-                "logits_b64": general_purpose::STANDARD.encode(bytes),
-            })
-            .to_string();
+            let body: Vec<u8> = values
+                .iter()
+                .flat_map(|v| bf16::from_f32(*v).to_bits().to_le_bytes())
+                .collect();
             let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
+                 x-logits-rows: 1\r\nx-logits-cols: 4\r\nx-logits-dtype: bf16\r\n\
+                 Content-Length: {}\r\n\r\n",
                 body.len(),
-                body
             );
             stream
                 .write_all(response.as_bytes())
                 .map_err(|err| err.to_string())?;
+            stream.write_all(&body).map_err(|err| err.to_string())?;
             Ok(())
         });
 
