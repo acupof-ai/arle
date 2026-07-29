@@ -13,8 +13,8 @@ use autograd::{
     ops::{
         LinearAttentionParams, MoeGroupedLinearExpert, MoeGroupedLinearInput, MoeGroupedRoute,
         MoeTopK, add, add_broadcast, all_gather_seq, all_reduce_sum, cat_seq,
-        causal_sdpa_recompute, causal_sdpa_with_q_start, checkpoint_sequential, cp_causal_sdpa,
-        embedding, linear_attention_core, linear_attention_core_with_carry,
+        causal_sdpa_recompute, causal_sdpa_recompute_with_q_start, causal_sdpa_with_q_start,
+        checkpoint_sequential, embedding, linear_attention_core, linear_attention_core_with_carry,
         linear_attention_core_with_carry_taped, linear_attention_ctx_bytes, matmul_bt_with_site,
         moe_grouped_linear, moe_grouped_weighted_scatter, moe_topk_softmax,
         moe_topk_softmax_with_indices, mul, repeat_kv, reshape, rmsnorm, rope, sigmoid, silu,
@@ -1714,7 +1714,7 @@ impl Qwen35Layer {
             };
             let k_full = gather_kv(k, store, tape)?;
             let v_full = gather_kv(v, store, tape)?;
-            cp_causal_sdpa(q, k_full, v_full, q_start, store, tape)?
+            causal_sdpa_recompute_with_q_start(q, k_full, v_full, q_start, store, tape)?
         } else {
             let k = repeat_kv(k, kv_repeat, store, tape)?;
             let v = repeat_kv(v, kv_repeat, store, tape)?;
@@ -1891,7 +1891,8 @@ impl Qwen35Layer {
         let k_full = cat_seq(prefix_kv.k, k_gen, store, tape)?;
         let v_full = cat_seq(prefix_kv.v, v_gen, store, tape)?;
 
-        let attn_hidden = causal_sdpa_with_q_start(q, k_full, v_full, gen_start, store, tape)?;
+        let attn_hidden =
+            causal_sdpa_recompute_with_q_start(q, k_full, v_full, gen_start, store, tape)?;
         let attn_hidden = if let Some(gate) = gate {
             let gate = sigmoid(gate, store, tape)?;
             mul(attn_hidden, gate, store, tape)?

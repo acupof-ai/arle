@@ -30,7 +30,10 @@ use autograd::backend::{
     cpu_softmax_backward, cpu_softmax_forward_last_axis, cpu_transpose_swap,
 };
 use autograd::backend_cuda::CudaBackend;
-use autograd::{Backend, DeviceHandle};
+use autograd::{
+    Backend, DeviceHandle, Tape, Tensor, TensorStore, ops::causal_sdpa_recompute_with_q_start,
+};
+use std::sync::Arc;
 
 /// Deterministic LCG → uniform `(-half_range, half_range)` floats.
 /// Same seed → same sequence → host vs device replay identically.
@@ -2074,4 +2077,41 @@ fn cuda_rope_backward_device_matches_cpu() {
         dev_grad[idx],
         host_grad[idx]
     );
+}
+
+#[test]
+fn cuda_long_rectangular_sdpa_stays_fused() {
+    let Ok(backend) = CudaBackend::new(0) else {
+        return;
+    };
+    let mut store = TensorStore::with_backend(Arc::new(backend));
+    let mut tape = Tape::new();
+    tape.set_enabled(false);
+    let q_shape = [1, 1, 65_536, 128];
+    let kv_shape = [1, 1, 65_537, 128];
+    let q = store.alloc(
+        Tensor::new(vec![0.0; q_shape.iter().product()], q_shape.to_vec(), false)
+            .expect("q tensor"),
+    );
+    let k = store.alloc(
+        Tensor::new(
+            vec![0.0; kv_shape.iter().product()],
+            kv_shape.to_vec(),
+            false,
+        )
+        .expect("k tensor"),
+    );
+    let v = store.alloc(
+        Tensor::new(
+            vec![0.0; kv_shape.iter().product()],
+            kv_shape.to_vec(),
+            false,
+        )
+        .expect("v tensor"),
+    );
+    let out = causal_sdpa_recompute_with_q_start(q, k, v, 1, &mut store, &mut tape)
+        .expect("long rectangular SDPA");
+    let out = store.to_host(out).expect("readback");
+    assert_eq!(out.len(), q_shape.iter().product());
+    assert!(out.iter().all(|x| *x == 0.0));
 }
