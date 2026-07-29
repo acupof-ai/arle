@@ -79,8 +79,7 @@ impl Qwen35DsparkHead {
     fn kv_dim(&self) -> usize {
         self.cfg.num_key_value_heads * self.cfg.head_dim
     }
-    /// Batched drafting covers the greedy no-markov head only — the markov
-    /// chain resolves row r from row r-1, which no batching removes.
+    /// Markov resolves row r from row r-1, so it cannot batch.
     pub(crate) fn batchable_draft(&self) -> bool {
         self.markov.is_none()
     }
@@ -349,8 +348,7 @@ pub(crate) struct DsparkScratch {
     conf_feat: HiddenSlot,
     conf_out: HiddenSlot,
     argmax: SliceSlot<i32>,
-    /// Batched-draft logits, `[B * block, vocab]` — the per-slot `df.logits`
-    /// stay the training capture's view and are filled from here.
+    /// Batched-draft logits `[B*block, vocab]`; per-slot `df.logits` copy from here.
     logits_b: HiddenSlot,
     /// Row count of the tap features held in `feat_b` (the whole batch).
     feat_seq: usize,
@@ -408,7 +406,7 @@ pub(crate) struct Qwen35DsparkExec {
     pub(crate) spec: Vec<Option<Qwen35SpecSlotState>>,
     pub(crate) taps: Qwen35DsparkTaps,
     pub(crate) scratch: DsparkScratch,
-    /// Device pointer tables for the batched partial-accept rollback.
+    /// Pointer tables for the batched rollback.
     pub(crate) replay_tables: Qwen35ReplayTables,
     pub(crate) accepts: usize,
     pub(crate) rejects: usize,
@@ -690,7 +688,7 @@ pub(crate) fn load_dspark_head(
     })
 }
 
-/// One partially-accepted chain to rewind (`k` accepted of its drafted depth).
+/// One partially-accepted chain to rewind (`k` of its depth accepted).
 pub(crate) struct DsparkRollback<'a> {
     pub(crate) slot: &'a mut Qwen35SlotState,
     pub(crate) spec: &'a mut Qwen35SpecSlotState,
@@ -1140,15 +1138,10 @@ impl Qwen35Model {
         Ok(chain)
     }
 
-    /// Batched twin of [`Self::dspark_draft_block`]: ONE 5-layer forward over
-    /// every slot's block. The draft GEMMs are weight-bound at `block` rows
-    /// (52 µs for 6 rows), so B serial drafts re-read the same weights B times;
-    /// batching reads them once. Only the two ring kernels stay per-slot — they
-    /// carry each slot's own K/V traffic, which no batching removes.
-    ///
-    /// Greedy, no-markov only: both other paths walk the chain with a device
-    /// sync per row, and batching does not remove a sync. `chains[i]` is slot
-    /// `i`'s `[anchor, d1..]`, empty when that slot's block was rejected.
+    /// Batched [`Self::dspark_draft_block`]: one forward over every slot's
+    /// block. The draft GEMMs are weight-bound at `block` rows, so B serial
+    /// drafts re-read the same weights B times. Only the ring kernels stay
+    /// per-slot. Greedy no-markov only — the other paths sync per row.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn dspark_draft_blocks(
         &self,
@@ -1174,8 +1167,7 @@ impl Qwen35Model {
         let eps = cfg.rms_norm_eps;
 
         let mut ids = vec![cfg.mask_token_id as i32; rows];
-        // Per-row attention windows, laid out `[all bases][all lengths]` so one
-        // upload serves every slot and every layer (see the row-shaped twin).
+        // `[all bases][all lengths]`: one upload for every slot and layer.
         let mut win = vec![0i32; 2 * rows];
         let mut pos = vec![0i32; b];
         for (s, df) in dfs.iter().enumerate() {
@@ -1240,9 +1232,8 @@ impl Qwen35Model {
                     let off = (s * block) as u64;
                     let (kc_ptr, _gk) = df.k_ctx[li].data.device_ptr_mut(&ctx.stream);
                     let (vc_ptr, _gv) = df.v_ctx[li].data.device_ptr_mut(&ctx.stream);
-                    // SAFETY: every pointer is offset by this slot's `block`
-                    // rows inside a `rows`-row buffer; the ring bounds and the
-                    // `kv_len <= cap` guard are the row-shaped path's.
+                    // SAFETY: offset by this slot's `block` rows inside a
+                    // `rows`-row buffer; ring bounds guarded above.
                     unsafe {
                         ffi::prefill_attention_hd256_prep_ring_cuda(
                             (qf_ptr + off * 2 * q_dim as u64 * elem) as *const ffi::Half,
@@ -1267,9 +1258,8 @@ impl Qwen35Model {
                         )
                         .result()?;
                     }
-                    // SAFETY: q/out offset as above; the window table holds
-                    // `rows` bases then `rows` lengths, so this slot's pair is
-                    // at `off` and `rows + off`.
+                    // SAFETY: q/out offset as above; the window table is
+                    // `rows` bases then `rows` lengths.
                     unsafe {
                         ffi::nonpaged_prefill_attention_ring_varlen_cuda(
                             (qp_ptr + off * q_dim as u64 * elem) as *const ffi::Half,
@@ -1330,15 +1320,14 @@ impl Qwen35Model {
         let logits = scratch.logits_b.get(ctx, vocab, rows)?;
         gemm_batch(ctx, self.output_projection(), final_normed, logits)?;
 
-        // One argmax over every slot's rows — one D2H for the whole tick.
+        // One D2H for the whole tick.
         let ids_dev = scratch.argmax.get(ctx, rows)?;
         let am = self.argmax_rows_into(scratch.logits_b.get(ctx, vocab, rows)?, ids_dev)?;
 
         let first_row = usize::from(!cfg.next_token_heads);
         let mut chains = Vec::with_capacity(b);
         for (s, df) in dfs.iter_mut().enumerate() {
-            // The training capture and the rank probe read the draft logits per
-            // slot after the verify, so each slot keeps its own copy.
+            // The training capture reads these per slot after the verify.
             df.q_rows = 0;
             let src = scratch
                 .logits_b
@@ -1638,11 +1627,9 @@ impl Qwen35Model {
         Ok((emitted, bonus, k))
     }
 
-    /// Rewind a partially-accepted batch: every slot's 48 gated-delta
-    /// recurrent/conv states go back to the pre-verify snapshot, then ONE
-    /// linear-only replay of every accepted prefix from the verify captures.
-    /// The paged full-attn KV self-heals under the pool truncate + seq_len
-    /// rewind (position-indexed rows).
+    /// Rewind a partially-accepted batch: restore every slot's gated-delta
+    /// state, then one linear-only replay of every accepted prefix. The paged
+    /// full-attn KV self-heals under the truncate + seq_len rewind.
     pub(crate) fn dspark_rollback_batch(
         &self,
         rolls: &mut [DsparkRollback<'_>],
@@ -1657,8 +1644,8 @@ impl Qwen35Model {
             r.spec.restore_trunk(&self.ctx, r.slot)?;
         }
         let restore_ms = super::mtp_phase_lap(&self.ctx, &mut pt);
-        // The varlen replay is the recurrent kernel; keep the opt-in FlashQLA
-        // chunked path on its own per-slot route rather than switching it out.
+        // The varlen replay is the recurrent kernel; leave the opt-in chunked
+        // path on its own route.
         if super::qwen35_gdr_chunked_enabled() {
             for r in rolls.iter_mut() {
                 self.replay_linear_only(r.slot, ws, &r.spec.capture, r.k)?;
