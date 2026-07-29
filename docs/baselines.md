@@ -27,7 +27,21 @@ python3 scripts/gen_bench_prompts.py bench-agent-119k-16x8.jsonl 16 119000 214 8
 
 ## Qwen3.6 on 1×H20 · single-GPU · eager — LONG-AGENT ANCHOR
 
-### CHAMPION — `a956f69b1` (2026-07-28) · KV mirror + batched FA3 · `arle-fa3b2`
+### CHAMPION (DSpark arm) — `d05d0aee6` (2026-07-29) · batched draft / replay / snapshot / capture · `arle-v`
+
+| c | arm | TTFT cold | TTFT warm | prefill tok/s | TPOT | decode tok/s | total tok/s |
+|---|---|---:|---:|---:|---:|---:|---:|
+| 1 | dense DSpark 6 | 19.4 s | 1.0 s | 78053 | 9.77 ms | 102.3 | 7440.0 |
+| 8 | dense DSpark 6 | 1.0 s | 0.7 s | 75607 | 60.74 ms | 16.5 | 32090.2 |
+| 16 | dense DSpark 6 | 3.9 s | 1.0 s | 58685 | 107.94 ms | 9.3 | 33037.7 |
+
+vs the dense no-spec rows below (same fingerprint; these commits touch only the
+spec path): decode 34.7 → 102.3 / 12.2 → 16.5 / 8.2 → 9.3 tok/s. TTFT unchanged.
+Serve adds `--spec-type dspark --mtp-draft-model Qwen3.6-27B-DFlash
+--dspark-block-size 6`; `--spec-max-batch` is the shipped default 16.
+Gate exact=3 DET at 512/4k/16k/32k. 0 errors. 126/128.
+
+### CHAMPION (no-spec) — `a956f69b1` (2026-07-28) · KV mirror + batched FA3 · `arle-fa3b2`
 
 | c | arm | TTFT cold | TTFT warm | TPOT | ITL p50 | decode tok/s | total tok/s |
 |---|---|---:|---:|---:|---:|---:|---:|
