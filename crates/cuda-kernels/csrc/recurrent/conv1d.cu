@@ -11,10 +11,8 @@
 // Actually stored as [seq_len * num_channels] row-major (token i starts at i * num_channels)
 // out_seq: [seq_len * num_channels] bf16
 // conv_state: [num_channels, K-1] bf16 (updated with last K-1 values)
-// The `*_ptrs`/`row_len` triple non-null selects the varlen form: block row
-// `blockIdx.y` is one slot, reading its own capture buffer and ring, writing
-// its `row_len[s]` rows to `out_seq + s * seq_len`. Null = the single-slot
-// form. One launch per layer replays a whole speculative batch.
+// Non-null `x_ptrs` selects the varlen form: `blockIdx.y` is one slot, reading
+// its own buffer and ring, writing `row_len[s]` rows at `out_seq + s*seq_len`.
 __global__ void conv1d_prefill_kernel(
     const __nv_bfloat16* __restrict__ x_seq,
     const __nv_bfloat16* const* __restrict__ x_ptrs,
@@ -154,8 +152,7 @@ cudaError_t conv1d_prefill_cuda(
     return cudaGetLastError();
 }
 
-// Varlen twin: `batch` slots, each reading its own `x_ptrs[s]` for `row_len[s]`
-// rows into its own ring, writing to `out_seq + s * max_len` rows.
+// Varlen twin: slot `s` reads `x_ptrs[s]` for `row_len[s]` rows.
 cudaError_t conv1d_prefill_varlen_cuda(
     const __nv_bfloat16* const* x_ptrs,
     const __nv_bfloat16* conv_weight,

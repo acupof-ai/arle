@@ -60,10 +60,8 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    /// Varlen partial-accept replay: slot `s` reads `qkv`/writes `output` at its
-    /// own `s * max_len` row block and takes b/a from its own capture, running
-    /// `row_len[s]` rows into `state_ptrs[s]`. One launch per layer for a whole
-    /// speculative batch.
+    /// Varlen replay: slot `s` reads qkv / writes output at its `s * max_len`
+    /// block, running `row_len[s]` rows into `state_ptrs[s]`.
     pub fn gated_delta_rule_prefill_recurrent_varlen_cuda(
         qkv: *const Half,
         b_ptrs: *const *const Half,
@@ -82,8 +80,7 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    /// Varlen twin of [`conv1d_prefill_cuda`]: slot `s` reads `x_ptrs[s]` for
-    /// `row_len[s]` rows and writes `out_seq + s * max_len` rows.
+    /// Varlen twin: slot `s` reads `x_ptrs[s]`, writes at `s * max_len`.
     pub fn conv1d_prefill_varlen_cuda(
         x_ptrs: *const *const Half,
         conv_weight: *const Half,
