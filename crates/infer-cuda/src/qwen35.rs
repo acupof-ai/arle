@@ -1703,11 +1703,9 @@ pub(crate) struct Qwen35SpecSlotState {
 /// offset `t*width`), so rows `[0..=k]` slice contiguously as `[0..(k+1)*width]`.
 /// Allocated only with the spec state, so the baseline decode path never pays.
 #[allow(dead_code)] // populated by linear_attention under capture; read by replay_linear_only
-/// Device pointer tables for [`Qwen35Model::replay_linear_only_batched`]: per
-/// linear layer, one `[B]` table of each per-slot buffer the varlen kernels
-/// index. Re-staged every tick — the accepted set and lengths change per step.
-/// One flat `[KIND, layer, slot]` u64 buffer, so the whole staging is a single
-/// H2D per tick. The accepted set changes every tick, so this cannot be cached.
+/// Per-slot buffer addresses the varlen replay kernels index, one `[B]` table
+/// per linear layer. Re-staged every tick: the accepted set changes.
+/// Flat `[kind, layer, slot]`, so staging is one H2D per tick.
 #[derive(Default)]
 pub(crate) struct Qwen35ReplayTables {
     ptrs: SliceSlot<u64>,
@@ -1715,7 +1713,7 @@ pub(crate) struct Qwen35ReplayTables {
     host: Vec<u64>,
 }
 
-/// Table order inside [`Qwen35ReplayTables::ptrs`].
+/// qkv / b / a / conv-state / gdr-state.
 const REPLAY_TABLES: usize = 5;
 
 impl Qwen35ReplayTables {
@@ -7272,13 +7270,10 @@ impl Qwen35Model {
         Ok(())
     }
 
-    /// [`Self::replay_linear_only`] for a whole speculative batch: ONE conv1d
-    /// and ONE gated-delta launch per linear layer over every slot, instead of
-    /// `2 * num_linear` launches per slot. Each slot keeps its own capture and
-    /// its own state — the varlen kernels reach them through `tables`.
-    ///
-    /// Sub-100 µs launches dominate this path (48 layers x B slots x 2), so the
-    /// win is launch count, not arithmetic.
+    /// [`Self::replay_linear_only`] for a whole batch: one conv1d and one
+    /// gated-delta launch per layer instead of two per slot per layer. Each
+    /// slot keeps its own capture and state, reached through `tables`. The
+    /// launches are sub-100 µs, so the win is their count.
     pub(crate) fn replay_linear_only_batched(
         &self,
         slots: &mut [&mut Qwen35SlotState],
@@ -7335,9 +7330,8 @@ impl Qwen35Model {
             let (alog_ptr, _g2) = attn.a_log.device_ptr(&ctx.stream);
             let at = |kind: usize| tbl + ((kind * stride + li * b) as u64) * 8;
             let (qkv_tbl, b_tbl, a_tbl, conv_tbl, gdr_tbl) = (at(0), at(1), at(2), at(3), at(4));
-            // SAFETY: every table holds `b` live pointers staged above; the
-            // shared conv/gdr scratch is `[b * max_len, dim]`, the row block
-            // each slot writes.
+            // SAFETY: each table holds `b` pointers staged above; the shared
+            // scratch is `[b * max_len, dim]`.
             unsafe {
                 ffi::conv1d_prefill_varlen_cuda(
                     qkv_tbl as *const *const ffi::Half,

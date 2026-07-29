@@ -1916,9 +1916,8 @@ impl Qwen35CudaExecutor {
             );
         }
 
-        // 1. Draft — no trunk/pool state touched; noise K/V self-heal. The
-        //    draft GEMMs are weight-bound at block rows, so every seeded slot
-        //    goes through ONE forward when the head allows it.
+        // 1. Draft — no trunk/pool state touched; noise K/V self-heal. Weight-
+        //    bound at block rows, so every seeded slot shares one forward.
         let mut pre: Vec<Option<Vec<u32>>> = vec![None; decode_rows.len()];
         let mut idx: Vec<usize> = (0..decode_rows.len()).filter(|&i| seeded[i]).collect();
         if idx.len() >= 2
@@ -2067,8 +2066,8 @@ impl Qwen35CudaExecutor {
         let (mut accept_ms, mut cap_ms, mut trunc_ms, mut ext_ms) = (0.0, 0.0, 0.0, 0.0);
 
         // 5. Per row: accept, extend the draft ctx, stage the bonus as the next
-        //    anchor. The greedy rollback is deferred to one batched pass below
-        //    — nothing here reads the trunk linear state or `seq_len`.
+        //    anchor. The greedy rollback batches below — nothing here reads the
+        //    trunk linear state or `seq_len`.
         let mut rollback: Vec<(usize, usize, usize)> = Vec::with_capacity(batch.len());
         for c in &batch {
             let params = &decode_rows[c.out].params;
@@ -2150,8 +2149,7 @@ impl Qwen35CudaExecutor {
                 })
                 .collect();
         }
-        // One restore + ONE linear-only replay launch per layer for every
-        // partially-accepted chain, instead of `2 * num_linear` launches each.
+        // One replay launch per layer for every partially-accepted chain.
         if !rollback.is_empty() {
             rollback.sort_by_key(|r| r.0);
             let want: Vec<usize> = rollback.iter().map(|r| r.0).collect();
