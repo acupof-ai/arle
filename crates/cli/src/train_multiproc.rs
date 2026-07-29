@@ -67,6 +67,19 @@ pub(crate) fn maybe_spawn_cp_ranks_and_wait(cp_size: usize, cp_devices: &[usize]
             cmd.env("ARLE_TRAIN_CP_SIZE", cp_size.to_string());
             cmd.env("INFER_CUDA_DEVICE", device.to_string());
             cmd.env("INFER_NCCL_UNIQUE_ID", &uid_hex);
+            // Each CP rank's rollout engine is single-GPU (this launcher owns the
+            // per-rank device via INFER_CUDA_DEVICE). Strip any inherited TP-serving
+            // env so resolve_tp_config_from_env doesn't build a spurious rollout TP
+            // communicator on the training uid (else rank>0 dies with NCCL RemoteError).
+            for k in [
+                "INFER_TP_SIZE",
+                "INFER_TP_RANK",
+                "INFER_CUDA_DEVICES",
+                "ARLE_TP_SIZE",
+                "ARLE_TP_RANK",
+            ] {
+                cmd.env_remove(k);
+            }
             let child = cmd
                 .spawn()
                 .with_context(|| format!("spawn CP rank {rank}"))?;
