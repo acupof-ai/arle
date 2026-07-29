@@ -4861,7 +4861,7 @@ fn register_linear(
     for (name, id) in linear.parameter_name_map() {
         register_named(param_names, name, id);
     }
-    for (name, id) in linear.adapter_name_map() {
+    for (name, id) in linear.adapter_ordered() {
         register_named(adapter_names, name, id);
     }
 }
@@ -5108,7 +5108,7 @@ fn lora_for_name(
 
 fn collect_linear_ids(linear: &LinearWithLora, ids: &mut Vec<TensorId>) {
     ids.extend(linear.parameter_name_map().values().copied());
-    ids.extend(linear.adapter_name_map().values().copied());
+    ids.extend(linear.adapter_ordered().into_iter().map(|(_, id)| id));
 }
 
 fn collect_mlp_ids(mlp: &Qwen35Mlp, skip_experts: bool, ids: &mut Vec<TensorId>) {
