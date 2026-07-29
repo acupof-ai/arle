@@ -19,7 +19,7 @@ private duplicate configs.
 | **CP** | option B live + converged; ring option-A is a **live tape op** (`cp_causal_sdpa`, `BackwardOp::RingAttention`) — world==1 taped grad matches `causal_sdpa_recompute`, multi-block merge+backward matches full-softmax reference | ring KV NCCL transport (remote blocks → same tile kernels); model N=2 parity; default stays option B |
 | **TP** | attention-TP live; **MoE-TP** built (column/row-parallel experts+shared, `maybe_tp_all_reduce`) | MoE finite-diff on ≥2 GPU |
 | **EP** | **live tape op** — `ep_dispatch_op`/`ep_combine_op` (`BackwardOp::EpDispatch`/`EpCombine`), backward = the transpose; dropped token gets zero grad; gated through the real tape | NCCL all-to-all transport; capacity + router aux loss; qwen35 routing hook |
-| **DP** | `DpContext` coord + batch-shard + `global_inv_n` global-mean math | DP launcher + count all-reduce + `opd.rs` gate `(cp‖dp)` |
+| **DP** | **wired end-to-end** — `DpContext` threaded into `masked_writeback_step`; global count all-reduce for `inv_n`; grad-reduce gate `(cp‖dp)`; `--dp-size` launcher; world==1 byte-identical | multi-rank correctness (≥2 GPU); combined CP×DP (`ncclCommSplit` subgroups) |
 | **PP** | `PpContext` layer-partition (`pipeline_parallel.rs`); 1F1B documented as wrong-fit for single-pass writeback | cross-stage activation send/recv; layer-loop split |
 
 Local gate (all pass): `cargo test -p train -p autograd --no-default-features
