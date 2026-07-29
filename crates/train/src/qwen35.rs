@@ -2452,7 +2452,9 @@ impl Qwen35Layer {
         let b_proj = attn.in_proj_b.forward(h_prefix, store, tape)?;
         let a_proj = attn.in_proj_a.forward(h_prefix, store, tape)?;
         let params = la_params(cfg, batch, gen_start);
-        let (state, conv_window) = if store.backend().device() == Device::Cuda {
+        let (state, conv_window) = if store.backend().device() == Device::Cuda
+            && params.seq_len >= params.conv_kernel - 1
+        {
             linear_attention_boundary(
                 qkv,
                 b_proj,
