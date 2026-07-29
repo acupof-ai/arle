@@ -8406,8 +8406,7 @@ fn cuda_slice_device(
         .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (slice)"))?;
     let rank_i = i32::try_from(rank)
         .map_err(|_| AutogradError::TapeInvariant("cuda slice rank exceeds i32"))?;
-    let total_i = i32::try_from(total)
-        .map_err(|_| AutogradError::TapeInvariant("cuda slice total exceeds i32"))?;
+    let total_u64 = total as u64;
 
     launch_1d(
         &backend.stream,
@@ -8421,7 +8420,7 @@ fn cuda_slice_device(
                 .arg(&d_starts)
                 .arg(&d_new_shape)
                 .arg(&rank_i)
-                .arg(&total_i);
+                .arg(&total_u64);
             builder
         },
     )?;
@@ -9176,8 +9175,7 @@ fn cuda_slice_backward_device(
         .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (slice_bwd)"))?;
     let rank_i = i32::try_from(rank)
         .map_err(|_| AutogradError::TapeInvariant("cuda slice_bwd rank exceeds i32"))?;
-    let upstream_size_i = i32::try_from(upstream_size)
-        .map_err(|_| AutogradError::TapeInvariant("cuda slice_bwd total exceeds i32"))?;
+    let upstream_size_u64 = upstream_size as u64;
 
     launch_1d(
         &backend.stream,
@@ -9191,7 +9189,7 @@ fn cuda_slice_backward_device(
                 .arg(&d_starts)
                 .arg(&d_upstream_shape)
                 .arg(&rank_i)
-                .arg(&upstream_size_i);
+                .arg(&upstream_size_u64);
             builder
         },
     )?;
