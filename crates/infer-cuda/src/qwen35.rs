@@ -1705,9 +1705,19 @@ pub(crate) struct Qwen35SpecSlotState {
 #[allow(dead_code)] // populated by linear_attention under capture; read by replay_linear_only
 /// Per-slot buffer addresses the varlen replay kernels index, one `[B]` table
 /// per linear layer. Re-staged every tick: the accepted set changes.
+/// Pointer/length staging for [`Qwen35Model::batched_copy`].
+#[derive(Default)]
+pub(crate) struct Qwen35CopyScratch {
+    ptrs: SliceSlot<u64>,
+    lens: SliceSlot<i32>,
+    host: Vec<u64>,
+    hlen: Vec<i32>,
+}
+
 /// Flat `[kind, layer, slot]`, so staging is one H2D per tick.
 #[derive(Default)]
 pub(crate) struct Qwen35ReplayTables {
+    pub(crate) copy: Qwen35CopyScratch,
     ptrs: SliceSlot<u64>,
     row_len: SliceSlot<i32>,
     host: Vec<u64>,
@@ -1959,6 +1969,8 @@ pub(crate) struct Qwen35RecallForward<'a> {
 
 #[derive(Default)]
 pub(crate) struct LinearAttnScratch {
+    /// Staging for the batched spec-capture copies.
+    capture_copy: Qwen35CopyScratch,
     qkv: HiddenSlot,
     z: HiddenSlot,
     b_proj: HiddenSlot,
@@ -6709,6 +6721,7 @@ impl Qwen35Model {
         let a_dim = attn.in_proj_a.rows;
 
         let LinearAttnScratch {
+            capture_copy,
             qkv,
             z,
             b_proj,
@@ -6751,34 +6764,43 @@ impl Qwen35Model {
                     total == rows,
                     "linear rows total {total} != {rows} staged columns"
                 );
-                let mut off = 0usize;
-                for r in rs.iter_mut() {
-                    // THIS row's columns land at ITS capture offset 0, so a
-                    // partial-accept replay re-runs only this slot's prefix.
-                    if let Some(cap) = r.capture.as_deref_mut() {
+                // THIS row's columns land at ITS capture offset 0, so a
+                // partial-accept replay re-runs only this slot's prefix. All
+                // rows' copies go out as three launches, not three per row.
+                if rs.iter().any(|r| r.capture.is_some()) {
+                    let (mut dst, mut src, mut sz) = (Vec::new(), Vec::new(), Vec::new());
+                    let mut off = 0usize;
+                    for r in rs.iter_mut() {
+                        let len = r.len;
+                        let at = off;
+                        off += len;
+                        let Some(cap) = r.capture.as_deref_mut() else {
+                            continue;
+                        };
                         ensure!(
-                            linear_idx < cap.qkv.len(),
-                            "spec capture has {} linear slots, layer idx {linear_idx} out of range",
-                            cap.qkv.len()
+                            linear_idx < cap.qkv.len() && len <= cap.rows,
+                            "spec capture is {} layers x {} rows, cannot hold layer \
+                             {linear_idx} x {len} rows",
+                            cap.qkv.len(),
+                            cap.rows
                         );
-                        ensure!(
-                            r.len <= cap.rows,
-                            "spec capture sized for {} rows, row len {} exceeds it",
-                            cap.rows,
-                            r.len
-                        );
-                        for (src, w, dst) in [
+                        for (s_ptr, w, d) in [
                             (&qkv.data, qkv_dim, &mut cap.qkv[linear_idx]),
                             (&b_proj.data, b_dim, &mut cap.b_proj[linear_idx]),
                             (&a_proj.data, a_dim, &mut cap.a_proj[linear_idx]),
                         ] {
-                            let mut d = dst.data.slice_mut(0..r.len * w);
-                            self.ctx
-                                .stream
-                                .memcpy_dtod(&src.slice(off * w..(off + r.len) * w), &mut d)
-                                .map_err(|e| anyhow!("spec linear capture failed: {e}"))?;
+                            let elem = std::mem::size_of::<bf16>();
+                            dst.push(d.data.device_ptr_mut(&self.ctx.stream).0);
+                            src.push(s_ptr.device_ptr(&self.ctx.stream).0 + (at * w * elem) as u64);
+                            sz.push(len * w * elem);
                         }
                     }
+                    self.batched_copy(capture_copy, &dst, &src, &sz)?;
+                }
+                let mut off = 0usize;
+                for r in rs.iter_mut() {
+                    // THIS row's columns land at ITS capture offset 0, so a
+                    // partial-accept replay re-runs only this slot's prefix.
                     self.advance_linear_conv_gdr(
                         attn,
                         &qkv.data.slice(off * qkv_dim..(off + r.len) * qkv_dim),
@@ -7309,40 +7331,65 @@ impl Qwen35Model {
         Ok(())
     }
 
-    /// `dst[i] <- src[i]` for `n` equal-sized buffers in one launch. A spec
-    /// snapshot is 48 layers x B slots of ~3 MB, and each `memcpy_dtod` costs
-    /// ~11 µs of host driver time against ~2 µs of bandwidth.
+    /// `dst[i] <- src[i]` for `n` buffers in one launch. `bytes` is one size
+    /// for all or one per buffer. A spec snapshot is 48 layers x B slots of
+    /// ~3 MB, and each `memcpy_dtod` costs ~11 µs of host driver time against
+    /// ~2 µs of bandwidth.
     pub(crate) fn batched_copy(
         &self,
-        tables: &mut Qwen35ReplayTables,
+        s: &mut Qwen35CopyScratch,
         dst: &[u64],
         src: &[u64],
-        bytes: usize,
+        bytes: &[usize],
     ) -> Result<()> {
         ensure!(
             dst.len() == src.len(),
             "batched copy dst/src length mismatch"
         );
-        if dst.is_empty() || bytes == 0 {
+        ensure!(
+            bytes.len() == 1 || bytes.len() == dst.len(),
+            "batched copy {} sizes for {} buffers",
+            bytes.len(),
+            dst.len()
+        );
+        if dst.is_empty() || bytes.iter().all(|b| *b == 0) {
             return Ok(());
         }
+        ensure!(
+            bytes.iter().all(|b| b % 16 == 0),
+            "batched copy sizes must be 16B multiples"
+        );
         let ctx = &self.ctx;
         let n = dst.len();
-        tables.host.clear();
-        tables.host.extend_from_slice(dst);
-        tables.host.extend_from_slice(src);
-        let tbl = tables.ptrs.get(ctx, 2 * n)?;
+        s.host.clear();
+        s.host.extend_from_slice(dst);
+        s.host.extend_from_slice(src);
+        let tbl = s.ptrs.get(ctx, 2 * n)?;
         ctx.stream
-            .memcpy_htod(&tables.host, tbl)
+            .memcpy_htod(&s.host, tbl)
             .map_err(|e| anyhow!("H2D batched copy tables: {e}"))?;
         let (base, _g) = tbl.device_ptr(&ctx.stream);
-        // SAFETY: the table holds `n` dst then `n` src live addresses; every
-        // buffer is `bytes` long and cudaMalloc-aligned.
+        let (len_ptr, max_words) = if bytes.len() == 1 {
+            (0u64, 0usize)
+        } else {
+            s.hlen.clear();
+            s.hlen.extend(bytes.iter().map(|b| (b / 16) as i32));
+            let max = s.hlen.iter().copied().max().unwrap_or(0) as usize;
+            let d = s.lens.get(ctx, n)?;
+            ctx.stream
+                .memcpy_htod(&s.hlen, d)
+                .map_err(|e| anyhow!("H2D batched copy sizes: {e}"))?;
+            (d.device_ptr(&ctx.stream).0, max)
+        };
+        // SAFETY: the table holds `n` dst then `n` src live addresses, each
+        // buffer at least its `bytes` entry and cudaMalloc-aligned.
         unsafe {
             ffi::batched_copy_uniform_cuda(
                 base as *const *mut std::ffi::c_void,
                 (base + (n as u64) * 8) as *const *const std::ffi::c_void,
-                bytes,
+                len_ptr as *const i32,
+                bytes[0],
+                max_words,
                 n as i32,
                 ctx.stream.cu_stream(),
             )

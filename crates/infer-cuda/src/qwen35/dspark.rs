@@ -1647,8 +1647,8 @@ impl Qwen35Model {
                 .linear_state_addrs(&self.ctx, r.slot, &mut gdr, &mut conv)?;
         }
         // Restore: live <- snapshot, so the snapshot side is the source.
-        self.batched_copy(tables, &gdr.1, &gdr.0, gdr_bytes)?;
-        self.batched_copy(tables, &conv.1, &conv.0, conv_bytes)?;
+        self.batched_copy(&mut tables.copy, &gdr.1, &gdr.0, &[gdr_bytes])?;
+        self.batched_copy(&mut tables.copy, &conv.1, &conv.0, &[conv_bytes])?;
         let restore_ms = super::mtp_phase_lap(&self.ctx, &mut pt);
         // The varlen replay is the recurrent kernel; leave the opt-in chunked
         // path on its own route.

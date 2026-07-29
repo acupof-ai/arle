@@ -2042,8 +2042,9 @@ impl Qwen35CudaExecutor {
                 bytes = spec.linear_state_bytes();
                 spec.linear_state_addrs(&model.ctx, slot, &mut gdr, &mut conv)?;
             }
-            model.batched_copy(&mut ds.replay_tables, &gdr.0, &gdr.1, bytes.0)?;
-            model.batched_copy(&mut ds.replay_tables, &conv.0, &conv.1, bytes.1)?;
+            let copy = &mut ds.replay_tables.copy;
+            model.batched_copy(copy, &gdr.0, &gdr.1, &[bytes.0])?;
+            model.batched_copy(copy, &conv.0, &conv.1, &[bytes.1])?;
         }
         let snap_ms = crate::qwen35::mtp_phase_lap(&self.model.ctx, &mut pt);
 
