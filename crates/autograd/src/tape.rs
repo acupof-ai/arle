@@ -979,15 +979,7 @@ impl Tape {
         result
     }
 
-    /// Backward for [`ops::checkpoint_seq_chunked`]. Re-runs the position-wise
-    /// `replay` on `chunk` seq rows at a time so the recompute peak is
-    /// `O(chunk · intermediate)`, not `O(seq · intermediate)`. Per chunk: slice
-    /// the block input rows + the matching upstream-grad rows on a DISABLED
-    /// scratch tape (detached leaves — their grads don't scatter back through a
-    /// recorded slice), replay on an enabled chunk tape, collect `d_x_c` + param
-    /// grads, write `d_x_c` into the full-seq `d_input`'s disjoint rows, add param
-    /// grads, then free the chunk's live set + trim. Host-side scatter/accumulate
-    /// keeps it backend-neutral; the win is the per-chunk free, not device copies.
+    /// Replays position-wise chunks and accumulates their gradients on device.
     fn seq_chunked_recompute_backward(
         &mut self,
         entry: &TapeEntry,
@@ -1020,10 +1012,14 @@ impl Tape {
         let param_ids = &entry.input_ids[1..];
 
         let need_input_grad = store.tensor(input_id)?.requires_grad;
-        let row = dim;
-        let mut d_input = need_input_grad.then(|| vec![0.0_f32; batch * seq * dim]);
-        // Param grads accumulate across chunks in host buffers, sized on first hit.
-        let mut d_param: Vec<Option<Vec<f32>>> = vec![None; param_ids.len()];
+        let input_shape = vec![batch, seq, dim];
+        let mut d_input = if need_input_grad {
+            let handle = store.backend().zeros(&input_shape)?;
+            Some(store.alloc_device_tensor(input_shape.clone(), handle)?)
+        } else {
+            None
+        };
+        let mut d_param: Vec<Option<TensorId>> = vec![None; param_ids.len()];
 
         let mut start = 0;
         while start < seq {
@@ -1060,44 +1056,83 @@ impl Tape {
             let grads =
                 chunk_tape.backward_collect_targets_only(loss, store, &chunk_inputs, None)?;
 
-            if let (Some(d_input), Some(&g)) = (d_input.as_mut(), grads.get(&x_c)) {
-                let g_host = store.to_host(g)?;
-                let base = start * row;
-                for b in 0..batch {
-                    let src = b * (end - start) * row;
-                    let dst = b * seq * row + base;
-                    d_input[dst..dst + (end - start) * row]
-                        .copy_from_slice(&g_host[src..src + (end - start) * row]);
-                }
+            if let (Some(dest), Some(&g)) = (d_input, grads.get(&x_c)) {
+                store.ensure_device(g)?;
+                let dest_handle = store
+                    .tensor(dest)?
+                    .device_handle
+                    .as_ref()
+                    .expect("device accumulator")
+                    .clone();
+                let grad_handle = store
+                    .tensor(g)?
+                    .device_handle
+                    .as_ref()
+                    .expect("ensure_device")
+                    .clone();
+                let updated = store.backend().write_slice_device(
+                    &dest_handle,
+                    &grad_handle,
+                    &input_shape,
+                    &[0, start, 0],
+                    &[batch, end, dim],
+                )?;
+                store.replace_device_handle(dest, updated)?;
             }
             for (slot, &pid) in param_ids.iter().enumerate() {
                 if let Some(&g) = grads.get(&pid) {
-                    let g_host = store.to_host(g)?;
-                    match d_param[slot].as_mut() {
-                        None => d_param[slot] = Some(g_host),
+                    store.ensure_device(g)?;
+                    match d_param[slot] {
+                        None => {
+                            let tensor = store.tensor(g)?;
+                            let handle = tensor
+                                .device_handle
+                                .as_ref()
+                                .expect("ensure_device")
+                                .clone();
+                            d_param[slot] =
+                                Some(store.alloc_device_tensor(tensor.shape.clone(), handle)?);
+                        }
                         Some(acc) => {
-                            for (a, b) in acc.iter_mut().zip(&g_host) {
-                                *a += b;
-                            }
+                            let shape = store.tensor(acc)?.shape.clone();
+                            let acc_handle = store
+                                .tensor(acc)?
+                                .device_handle
+                                .as_ref()
+                                .expect("device accumulator")
+                                .clone();
+                            let grad_handle = store
+                                .tensor(g)?
+                                .device_handle
+                                .as_ref()
+                                .expect("ensure_device")
+                                .clone();
+                            let updated = store.backend().accumulate_into_device(
+                                &acc_handle,
+                                &grad_handle,
+                                &shape,
+                            )?;
+                            store.replace_device_handle(acc, updated)?;
                         }
                     }
                 }
             }
 
-            store.free_new_except(&live_before, &HashSet::new())?;
+            let keep = d_input
+                .into_iter()
+                .chain(d_param.iter().flatten().copied())
+                .collect();
+            store.free_new_except(&live_before, &keep)?;
             self.trim_after_checkpoint_replay(store)?;
             start = end;
         }
 
         let mut pairs = GradPairs::new();
-        if let Some(d_input) = d_input {
-            let g = store.from_slice(&d_input, &[batch, seq, dim])?;
+        if let Some(g) = d_input.take() {
             pairs.push((input_id, g));
         }
         for (slot, &pid) in param_ids.iter().enumerate() {
-            if let Some(data) = d_param[slot].take() {
-                let shape = store.tensor(pid)?.shape.clone();
-                let g = store.from_slice(&data, &shape)?;
+            if let Some(g) = d_param[slot].take() {
                 pairs.push((pid, g));
             }
         }
