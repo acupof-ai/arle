@@ -1447,6 +1447,11 @@ impl SafetensorLoader {
         // and transpose the weight scales to CUTLASS's N-contiguous SFB layout.
         let sm120 = ctx.is_sm120();
         let mut direct_fp8_routed = None;
+        // The OPD rollout student re-merges LoRA into experts each step, which
+        // needs a mutable per-expert BF16 `DeviceMatrix`. Suppress the fused
+        // grouped-FP8 path so experts load per-expert (below) and get
+        // dequantized to BF16 after the format is known.
+        let experts_bf16_resident = crate::runtime_flags::qwen35_moe_experts_bf16_resident();
         // The stacked tensors are HF `nn.Parameter`s — no `.weight` suffix on
         // the real Qwen3.6-35B-A3B checkpoint — but accept a `.weight`-suffixed
         // export too.
@@ -1455,7 +1460,7 @@ impl SafetensorLoader {
                 .into_iter()
                 .find(|name| self.has_tensor(name))
         };
-        if per_expert_quant_probe && (deepgemm_native_ready || sm120) {
+        if !experts_bf16_resident && per_expert_quant_probe && (deepgemm_native_ready || sm120) {
             direct_fp8_routed = self.load_fp8_moe_groups_direct(
                 ctx,
                 names,
@@ -1677,6 +1682,27 @@ impl SafetensorLoader {
             } else {
                 routed_expert_weight_format(&gate, &up, &down)?
             };
+        // BF16-resident student: dequantize the per-expert FP8 experts to dense
+        // BF16 in place, so the whole layer is one BF16 kernel + a stable ptr
+        // table the per-step LoRA re-merge can fold into. Must run before the
+        // grouped-cache decision and pointer-table build below so both see the
+        // final DenseBf16 format.
+        let mut expert_weight_format = expert_weight_format;
+        let mut gate_sig = gate_sig;
+        let mut down_sig = down_sig;
+        if experts_bf16_resident && expert_weight_format == WeightFormat::Fp8BlockScaled {
+            for (proj, experts) in [("gate", &mut gate), ("up", &mut up), ("down", &mut down)] {
+                for (e, m) in experts.iter_mut().enumerate() {
+                    dequantize_fp8_expert_to_bf16_in_place(ctx, m).with_context(|| {
+                        format!("dequantize FP8 {proj} expert {e} of `{}`", names.mlp_prefix)
+                    })?;
+                }
+            }
+            expert_weight_format = WeightFormat::DenseBf16;
+            // FP8 quant signatures are stale now the experts are dense BF16.
+            gate_sig = None;
+            down_sig = None;
+        }
         let routed_quant = expert_weight_format.is_quantized();
         let grouped_t0 = Instant::now();
         // BF16 grouped DeepGEMM is Hopper-only: the contiguous kernel reads
@@ -4814,6 +4840,81 @@ impl ExpertQuantDispatchSignature {
             group_size: matrix.group_size,
         }
     }
+}
+
+/// Dequantize one FP8-block-scaled routed expert to dense BF16 in place, swapping
+/// its `DeviceMatrix` storage to `DenseBf16`. Mirrors `promote_lora_target_to_bf16`
+/// (qwen35.rs) but runs at load for the whole layer so the MoE forward sees one
+/// uniform BF16 kernel — the per-expert lazy promote can't apply to grouped MoE
+/// (the forward dispatches one kernel per layer and reads a static ptr table).
+fn dequantize_fp8_expert_to_bf16_in_place(
+    ctx: &DeviceContext,
+    matrix: &mut DeviceMatrix,
+) -> Result<()> {
+    if matrix.weight_format == WeightFormat::DenseBf16 {
+        return Ok(());
+    }
+    ensure!(
+        matrix.weight_format == WeightFormat::Fp8BlockScaled
+            && matrix.quant_block_m > 0
+            && matrix.quant_block_k > 0
+            && matrix.quant_scale_rows > 0
+            && matrix.quant_scale_cols > 0,
+        "BF16-resident expert dequant needs FP8 block-scaled metadata; got {:?}",
+        matrix.weight_format
+    );
+    let mut dense = ctx
+        .stream
+        .alloc_zeros::<half::bf16>(matrix.rows * matrix.cols)
+        .map_err(|e| anyhow!("expert BF16 dequant alloc failed: {e}"))?;
+    {
+        let qweight = matrix
+            .qweight_u8
+            .as_ref()
+            .ok_or_else(|| anyhow!("FP8 expert missing qweight"))?;
+        let scales = matrix
+            .scale_f32
+            .as_ref()
+            .ok_or_else(|| anyhow!("FP8 expert missing f32 scales"))?;
+        ensure!(
+            qweight.len() == matrix.rows * matrix.cols,
+            "FP8 expert qweight len {} != rows*cols {}",
+            qweight.len(),
+            matrix.rows * matrix.cols
+        );
+        let (qw_ptr, _gq) = qweight.device_ptr(&ctx.stream);
+        let (scale_ptr, _gs) = scales.device_ptr(&ctx.stream);
+        let (dense_ptr, _gd) = dense.device_ptr_mut(&ctx.stream);
+        // SAFETY: ptrs from live device allocations sized to the dims passed.
+        unsafe {
+            cuda_kernels::ffi::dequantize_fp8_block_scaled_to_bf16_cuda(
+                qw_ptr as *const u8,
+                scale_ptr as *const f32,
+                dense_ptr as *mut cuda_kernels::ffi::Half,
+                matrix.rows as i32,
+                matrix.cols as i32,
+                matrix.quant_scale_rows as i32,
+                matrix.quant_scale_cols as i32,
+                matrix.quant_block_m as i32,
+                matrix.quant_block_k as i32,
+                ctx.stream.cu_stream(),
+            )
+        }
+        .result()
+        .map_err(|e| anyhow!("FP8->BF16 expert dequant failed: {e}"))?;
+    }
+    // Event tracking is disabled: sync before dropping the FP8 source so the
+    // async dequant kernel has finished reading it (mirrors the grouped path).
+    ctx.sync()?;
+    matrix.data = dense;
+    matrix.weight_format = WeightFormat::DenseBf16;
+    matrix.qweight_u8 = None;
+    matrix.scale_f32 = None;
+    matrix.quant_scale_rows = 0;
+    matrix.quant_scale_cols = 0;
+    matrix.quant_block_m = 0;
+    matrix.quant_block_k = 0;
+    Ok(())
 }
 
 fn validate_expert_projection_dispatch_signature(

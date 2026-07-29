@@ -145,6 +145,15 @@ pub fn set_dsv4_moe_contig_decode(enabled: bool) {
     runtime_flags::set_dsv4_moe_contig_decode(enabled);
 }
 
+/// Make the Qwen3.6 MoE loader keep routed experts as per-expert BF16
+/// `DeviceMatrix` (dequantized from FP8 at load) so the OPD rollout student can
+/// re-merge LoRA into experts each step. Call BEFORE loading the student engine;
+/// off = serving default (fused grouped-FP8 experts, no per-expert re-merge).
+#[cfg(feature = "cuda")]
+pub fn set_qwen35_moe_experts_bf16_resident(enabled: bool) {
+    runtime_flags::set_qwen35_moe_experts_bf16_resident(enabled);
+}
+
 #[cfg(feature = "cuda")]
 pub fn reset_dsv4_linear_profile() {
     linear_profile::reset();
