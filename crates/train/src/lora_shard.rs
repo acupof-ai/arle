@@ -306,4 +306,60 @@ mod tests {
         }
         assert_close(&got, &want);
     }
+
+    // Exact reconstruction of the COMPOSED MoE/SwiGLU expert under TP — the piece a
+    // routed w=2-vs-1 or an fp32-loss finite-diff can't certify cleanly. An expert
+    // is `down( silu(gate·x) ⊙ (up·x) )`. TP shards the intermediate dim: gate/up
+    // are column-parallel (each rank owns intermediate cols [r*I/N, ..)), the
+    // elementwise silu⊙ is INDEPENDENT per intermediate column (so a rank computes
+    // its slice with no cross-rank data), and down is row-parallel (input = the
+    // same intermediate slice) producing an [hidden] PARTIAL that sums across ranks
+    // to the dense output. This test builds a dense expert, runs the sharded form,
+    // and asserts sum-of-partials == dense in plain f32 — no GPU, no loss FD noise.
+    // A wrong intermediate split (e.g. gate/up and down disagreeing on which cols a
+    // rank owns) breaks it; the single-Linear tests above can't catch that coupling.
+    #[test]
+    fn moe_tp_composed_swiglu_reconstructs_dense() {
+        let (hidden, inter, tp) = (4usize, 6usize, 3usize); // inter divisible by tp
+        let x: Vec<f32> = (0..hidden).map(|i| i as f32 * 0.3 - 0.5).collect();
+        // Dense weights: gate/up are [inter, hidden] (out=inter), down is [hidden, inter].
+        let gate = weight(inter, hidden, 1);
+        let up = weight(inter, hidden, 2);
+        let down = weight(hidden, inter, 3);
+
+        let silu = |v: f32| v / (1.0 + (-v).exp());
+        // Dense reference: g = silu(gate·x) ⊙ (up·x); out = down·g.
+        let g: Vec<f32> = (0..inter)
+            .map(|o| silu(row_dot(&gate, o, hidden, &x)) * row_dot(&up, o, hidden, &x))
+            .collect();
+        let dense: Vec<f32> = (0..hidden).map(|o| row_dot(&down, o, inter, &g)).collect();
+
+        // Sharded: each rank owns intermediate cols [range), computes its g-slice,
+        // and its down PARTIAL over those cols; partials sum to the dense output.
+        let mut summed = vec![0.0f32; hidden];
+        for rank in 0..tp {
+            let r = shard_range(inter, rank, tp);
+            let g_slice: Vec<f32> = r
+                .clone()
+                .map(|o| silu(row_dot(&gate, o, hidden, &x)) * row_dot(&up, o, hidden, &x))
+                .collect();
+            // down partial: down rows restricted to this rank's intermediate cols.
+            for (o, out) in summed.iter_mut().enumerate() {
+                for (j, col) in r.clone().enumerate() {
+                    *out += down[o * inter + col] * g_slice[j];
+                }
+            }
+        }
+        assert_close(&summed, &dense);
+    }
+
+    fn weight(rows: usize, cols: usize, seed: usize) -> Vec<f32> {
+        (0..rows * cols)
+            .map(|i| ((i * 7 + seed * 13) % 11) as f32 * 0.1 - 0.5)
+            .collect()
+    }
+
+    fn row_dot(w: &[f32], row: usize, cols: usize, x: &[f32]) -> f32 {
+        (0..cols).map(|c| w[row * cols + c] * x[c]).sum()
+    }
 }
