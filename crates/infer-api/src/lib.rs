@@ -102,6 +102,7 @@ pub use infer_cuda::mint_nccl_unique_id_hex;
 pub use infer_cuda::{
     DsparkExperience, DsparkExperienceBuffer, SharedFp8BaseProjection, StudentLoraLayer,
     StudentLoraMatrices, StudentLoraProjection, StudentLoraProjectionUpdate, StudentLoraUpdate,
+    set_qwen35_moe_experts_bf16_resident,
 };
 #[cfg(feature = "metal")]
 pub use infer_metal::recommended_max_working_set_size_bytes as metal_recommended_max_working_set_size_bytes;

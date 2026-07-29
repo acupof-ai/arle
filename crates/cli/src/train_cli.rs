@@ -1205,6 +1205,13 @@ fn run_opd_from_dirs(args: TrainOpdArgs) -> Result<()> {
     let infer_student = if corpus_sft_only {
         None
     } else {
+        // The rollout student re-merges LoRA into experts each step only when the
+        // target set covers them (all-linear); tell the loader to keep routed FP8
+        // experts as per-expert BF16 so that merge has a mutable matrix to fold
+        // into. Attention-only training keeps the cheaper grouped-FP8 experts.
+        if matches!(target_set, train::lora::LoraTargetSet::AllLinear) {
+            infer_api::set_qwen35_moe_experts_bf16_resident(true);
+        }
         load_opd_infer_student(
             student_dir,
             args.prompt_max_tokens + args.rollout_len + 32,
