@@ -2159,6 +2159,73 @@ impl Backend for CudaBackend {
         }
     }
 
+    fn ring_send_recv_kv(
+        &self,
+        block: &DeviceHandle,
+        block_shape: &[usize],
+    ) -> Result<DeviceHandle> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (block, block_shape);
+            todo!("GPU required: cuda ring_send_recv_kv is unavailable under feature no-cuda")
+        }
+
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            let len = shape_size(block_shape);
+            let src = self.cuda_slice(block, "ring_send_recv_kv")?;
+            if src.len() != len {
+                return Err(AutogradError::DataLengthMismatch {
+                    len: src.len(),
+                    shape: block_shape.to_vec(),
+                    size: len,
+                });
+            }
+
+            #[cfg(feature = "nccl")]
+            let world = self.nccl.as_ref().map_or(1, |nccl| nccl.world_size());
+            #[cfg(not(feature = "nccl"))]
+            let world = 1usize;
+            // Single rank: the ring degenerates to the local block (identity).
+            if world <= 1 {
+                return Ok(block.clone());
+            }
+
+            // Ring rotation: send this block to (rank+1)%world, receive the block
+            // from (rank-1+world)%world, both inside one group so NCCL pairs the
+            // matched send/recv without deadlock. Blocks are equal-length (the
+            // launcher pads seq to a multiple of world), so recv fills `len`.
+            #[cfg(feature = "nccl")]
+            {
+                let nccl = self.nccl.as_ref().expect("world>1 implies nccl present");
+                let rank = nccl.rank();
+                let next = (rank + 1) % world;
+                let prev = (rank + world - 1) % world;
+                let mut out = self.stream.alloc_zeros::<f32>(len).map_err(|_| {
+                    AutogradError::TapeInvariant("cuda ring_send_recv_kv alloc failed")
+                })?;
+                {
+                    let (src_ptr, _src_guard) = src.device_ptr(&self.stream);
+                    let (dst_ptr, _dst_guard) = out.device_ptr_mut(&self.stream);
+                    let stream = self.stream.cu_stream().cast();
+                    nccl.group_start()
+                        .map_err(|_| AutogradError::TapeInvariant("ring group_start failed"))?;
+                    unsafe {
+                        nccl.send(src_ptr as *const _, len, DType::F32, next, stream)
+                            .map_err(|_| AutogradError::TapeInvariant("ring send failed"))?;
+                        nccl.recv(dst_ptr as *mut _, len, DType::F32, prev, stream)
+                            .map_err(|_| AutogradError::TapeInvariant("ring recv failed"))?;
+                    }
+                    nccl.group_end()
+                        .map_err(|_| AutogradError::TapeInvariant("ring group_end failed"))?;
+                }
+                return Ok(DeviceHandle::Cuda(CudaStorage::new(out)));
+            }
+            #[cfg(not(feature = "nccl"))]
+            unreachable!("world>1 without nccl feature")
+        }
+    }
+
     /// Device-resident backward for `mul_scalar`. Pure elementwise
     /// `grad_x[i] = upstream[i] * k` via a 1D NVRTC kernel; returns an
     /// unevaluated handle per the batched-eval contract.
