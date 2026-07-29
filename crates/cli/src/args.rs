@@ -1083,9 +1083,7 @@ pub(crate) struct OpdRuntimeArgs {
     #[arg(long, value_enum, default_value_t = OpdEngineOffloadArg::Off)]
     pub(crate) engine_offload: OpdEngineOffloadArg,
 
-    /// Per-layer gradient checkpointing at student load. Default on: the
-    /// engage decision (`should_checkpoint`) keeps the full-tape fast path
-    /// whenever it fits in free VRAM, so on = "checkpoint instead of OOM".
+    /// Enable per-layer gradient checkpointing when needed.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set, value_name = "BOOL")]
     pub(crate) gradient_checkpointing: bool,
 
@@ -1093,8 +1091,7 @@ pub(crate) struct OpdRuntimeArgs {
     #[arg(long, default_value_t = 2 << 20, value_name = "BYTES")]
     pub(crate) checkpoint_offload_min_bytes: usize,
 
-    /// Skip update records longer than this (0 = unlimited; H20-96GB backward
-    /// OOMs at seq≈30K).
+    /// Skip longer update records (0 = unlimited).
     #[arg(long, default_value_t = 23_000, value_name = "TOKENS")]
     pub(crate) max_update_seq: usize,
 

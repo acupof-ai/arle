@@ -255,15 +255,12 @@ pub fn causal_sdpa_with_q_start(
     let q_len = q_shape[2];
     let kv_len = k_shape[2];
     let head_dim = q_shape[3];
-    // Off-tape only: on-tape the composed primitives carry the gradient graph.
     if !tape.enabled
         && let Some(fused) = try_causal_sdpa_prefill_device(q, k, v, q_start, store)?
     {
         return Ok(fused);
     }
-    // Bound the composed path's 4 simultaneous `[heads, q_len, kv_len]`
-    // transients (scores/scaled/masked/probs) to the budget; heads are
-    // independent, so chunking is numerically exact.
+    // Bound the four score-sized transients.
     let chunk = sdpa_head_chunk(heads, q_len, kv_len);
     if chunk < heads {
         return sdpa_head_chunked(q, k, v, q_start, chunk, store, tape);
@@ -511,14 +508,8 @@ fn legacy_sdpa_backward_enabled() -> bool {
     crate::runtime_flags::legacy_sdpa_bwd()
 }
 
-/// Per-q-chunk rows for the chunked SDPA backward recompute — bounds the live
-/// `[merged_heads, q_chunk, seq]` score/prob transients to avoid the O(seq²)
-/// peak (the writeback-OOM fix). The unchunked path materialized the full
-/// `[merged_heads, seq, seq]` scores + `[1, seq, seq]` mask + probs (~88 GB at
-/// seq=18168); q-chunking caps the peak at O(q_chunk·seq).
+/// Fit backward score transients in 4 GiB.
 fn sdpa_backward_q_chunk(merged_heads: usize, seq_len: usize) -> usize {
-    // ~6 simultaneous `[merged_heads, q_chunk, seq]` f32 transients per chunk
-    // (scores/scaled/masked/probs/d_probs/d_scores). Budget them to ~4 GiB.
     let per_row = merged_heads
         .saturating_mul(seq_len)
         .saturating_mul(4)
@@ -526,13 +517,7 @@ fn sdpa_backward_q_chunk(merged_heads: usize, seq_len: usize) -> usize {
     ((4usize << 30) / per_row.saturating_mul(6)).clamp(1, seq_len)
 }
 
-// Chunked SDPA backward recompute. q-chunks the query rows so peak memory is
-// O(q_chunk·seq), not O(seq²): per chunk it recomputes scores/probs at
-// `[merged_heads, q_chunk, seq]` with a `[1, q_chunk, seq]` windowed causal mask.
-// grad_q is per-q-chunk (concatenated along seq); grad_k and grad_v accumulate
-// across q-chunks (they range over ALL kv positions). Numerically identical to
-// the unchunked backward — softmax is row-wise, so each q-row's gradient is
-// independent, and grad_k/grad_v are exact sums over q.
+// Query chunks bound memory; key and value gradients accumulate across chunks.
 #[allow(clippy::too_many_arguments)]
 fn causal_sdpa_recompute_backward_device_legacy_chunked(
     q: TensorId,
