@@ -2828,13 +2828,11 @@ fn la_params(cfg: &Qwen35Config, batch: usize, seq_len: usize) -> LinearAttentio
 /// `log_ckpt_peak`'s drift exists to name.
 fn la_layer_peak_bytes(cfg: &Qwen35Config, batch: usize, seq_len: usize) -> usize {
     let p = la_params(cfg, batch, seq_len);
-    // The residual stream x and h belong to the layer, not the kernel.
-    let residual = batch
-        .saturating_mul(seq_len)
-        .saturating_mul(8 * cfg.hidden_size);
+    // x and h: the residual stream is the layer's, not the kernel's.
+    let residual = 2 * cfg.hidden_size;
     linear_attention_row_transient_bytes(p)
         .saturating_add(linear_attention_ctx_bytes(p))
-        .saturating_add(residual)
+        .saturating_add(batch.saturating_mul(seq_len).saturating_mul(4 * residual))
 }
 
 /// Peak device bytes a single FULL-attention layer holds. `repeat_kv`

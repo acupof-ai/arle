@@ -8,8 +8,8 @@ use crate::{
     tensor::{TensorId, TensorStore},
 };
 
-/// Clone an accumulator's buffer for an in-place kernel. Probe before the clone
-/// bumps the count: writing through a shared buffer corrupts the sibling.
+/// Probe before cloning: an in-place write through a shared buffer corrupts the
+/// sibling, and `TensorStore::device_handle` bumps the count past 1.
 fn sole_owned_handle(id: TensorId, store: &mut TensorStore) -> Result<DeviceHandle> {
     store.ensure_device(id)?;
     let handle = store
@@ -28,18 +28,8 @@ fn sole_owned_handle(id: TensorId, store: &mut TensorStore) -> Result<DeviceHand
     Ok(handle.clone())
 }
 
-fn device_handle(id: TensorId, store: &mut TensorStore) -> Result<DeviceHandle> {
-    store.ensure_device(id)?;
-    Ok(store
-        .tensor(id)?
-        .device_handle
-        .as_ref()
-        .expect("ensure_device")
-        .clone())
-}
-
 /// Output rows partition by chunk: one full-size buffer, disjoint ranges assigned
-/// in place. No append API by design.
+/// in place.
 pub struct SeqAccum {
     id: TensorId,
     shape: Vec<usize>,
@@ -63,7 +53,8 @@ impl SeqAccum {
         })
     }
 
-    /// Keep-set entry for the caller's per-chunk `free_new_except`.
+    /// Never clone the handle behind it: both writers mutate the buffer in place,
+    /// so a live second reference turns into an error at the next write.
     pub fn id(&self) -> TensorId {
         self.id
     }
@@ -75,7 +66,6 @@ impl SeqAccum {
         src: TensorId,
         store: &mut TensorStore,
     ) -> Result<()> {
-        store.ensure_device(src)?;
         let src_shape = &store.tensor(src)?.shape;
         let mut expected = self.shape.clone();
         expected[self.row_axis] = src_shape.get(self.row_axis).copied().unwrap_or(0);
@@ -88,7 +78,7 @@ impl SeqAccum {
         let mut ends = self.shape.clone();
         ends[self.row_axis] = start + expected[self.row_axis];
         let dest = sole_owned_handle(self.id, store)?;
-        let src_handle = device_handle(src, store)?;
+        let src_handle = store.device_handle(src)?;
         let updated =
             store
                 .backend()
@@ -102,30 +92,25 @@ impl SeqAccum {
 }
 
 /// Every chunk contributes to the whole tensor: one buffer summed in place.
-/// `offload` parks it on host between chunks — the accumulate is the only moment
-/// it must be resident, and a full-seq k/v grad dwarfs one chunk's.
 pub struct ChunkSum {
     id: Option<TensorId>,
-    offload: bool,
 }
 
 impl ChunkSum {
-    pub fn new(offload: bool) -> Self {
-        Self { id: None, offload }
+    pub fn new() -> Self {
+        Self { id: None }
     }
 
-    /// Keep-set entry for the caller's per-chunk `free_new_except`.
+    /// See `SeqAccum::id`.
     pub fn id(&self) -> Option<TensorId> {
         self.id
     }
 
     pub fn add(&mut self, part: TensorId, store: &mut TensorStore) -> Result<()> {
-        let src = device_handle(part, store)?;
+        let src = store.device_handle(part)?;
         match self.id {
-            // Adopt the first chunk's buffer instead of copying it: the caller's
-            // `free_new_except` drops `part`, restoring sole ownership before the
-            // next accumulate. A caller that keeps `part` alive trips
-            // `sole_owned_handle` rather than corrupting it.
+            // Adopt the first chunk's buffer instead of copying it; the caller's
+            // `free_new_except` drops `part`, restoring sole ownership.
             None => {
                 let shape = store.tensor(part)?.shape.clone();
                 self.id = Some(store.alloc_device_tensor(shape, src)?);
@@ -139,17 +124,36 @@ impl ChunkSum {
                 store.replace_device_handle(acc, updated)?;
             }
         }
-        if self.offload {
-            store.offload_to_host(self.id.expect("set above"))?;
+        Ok(())
+    }
+
+    /// Evict until the next `add`, which re-uploads. Only the caller knows
+    /// another chunk follows — parking after the last one is a whole-accumulator
+    /// round trip that `finish` immediately undoes. Skipped below
+    /// `checkpoint_offload_min_bytes`, where the transfer costs more than the
+    /// peak it saves.
+    pub fn park(&mut self, store: &mut TensorStore) -> Result<()> {
+        let Some(id) = self.id else { return Ok(()) };
+        if store.tensor(id)?.size * size_of::<f32>()
+            >= crate::runtime_flags::checkpoint_offload_min_bytes()
+        {
+            store.offload_to_host(id)?;
         }
         Ok(())
     }
 
-    /// Device-resident id, or `None` when no chunk contributed.
+    /// Brings a parked accumulator back to device; `None` when no chunk
+    /// contributed.
     pub fn finish(self, store: &mut TensorStore) -> Result<Option<TensorId>> {
         if let Some(id) = self.id {
             store.ensure_device(id)?;
         }
         Ok(self.id)
+    }
+}
+
+impl Default for ChunkSum {
+    fn default() -> Self {
+        Self::new()
     }
 }

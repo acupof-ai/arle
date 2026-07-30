@@ -423,7 +423,7 @@ fn matmul_bt_lora_backward_tiled(
     let mut grad_a = need_grad_a
         .then(|| SeqAccum::new(vec![m, k], 0, store))
         .transpose()?;
-    let mut grad_b_acc = ChunkSum::new(false);
+    let mut grad_b_acc = ChunkSum::new();
 
     let mut row0 = 0usize;
     while row0 < m {
@@ -475,8 +475,12 @@ fn matmul_bt_lora_backward_tiled(
             grad_b_acc.add(part, store)?;
         }
 
-        let mut keep: HashSet<TensorId> = grad_a.as_ref().map(SeqAccum::id).into_iter().collect();
-        keep.extend(grad_b_acc.id());
+        let keep = grad_a
+            .as_ref()
+            .map(SeqAccum::id)
+            .into_iter()
+            .chain(grad_b_acc.id())
+            .collect();
         store.free_new_except(&live_before, &keep)?;
         row0 = row1;
     }
