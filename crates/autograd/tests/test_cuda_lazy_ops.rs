@@ -2113,3 +2113,37 @@ fn cuda_long_rectangular_sdpa_stays_fused() {
     assert_eq!(out.len(), q_shape.iter().product());
     assert!(out.iter().all(|x| *x == 0.0));
 }
+
+// Regression gate for the rectangular chunked SDPA backward above the 65535
+// grid-dim boundary — the CP rank>0 geometry (q_start != 0, q_len != kv_len) that
+// routes through `causal_sdpa_recompute_backward_device_chunked`, a path no square
+// test exercises. rank 1 of a cp=2 seq=131072 step: local q 65536, gathered prefix
+// 131072, q_start 65536, on one GPU (no NCCL). Forward+backward must complete.
+#[test]
+fn rectangular_cp_sdpa_backward_above_65535_completes() {
+    let Ok(backend) = CudaBackend::new(0) else {
+        eprintln!("skipping: no CUDA device");
+        return;
+    };
+    let mut store = TensorStore::with_backend(Arc::new(backend));
+    let mut tape = Tape::new();
+    tape.set_enabled(true);
+    let (q_len, kv_len, q_start) = (65_536usize, 131_072usize, 65_536usize);
+    let mk = |store: &mut TensorStore, seed: u64, seq: usize| {
+        let shape = vec![1usize, 4, seq, 128];
+        let size: usize = shape.iter().product();
+        store.alloc(Tensor::new(rng_vec(seed, size, 0.25), shape, true).expect("tensor"))
+    };
+    let q = mk(&mut store, 1, q_len);
+    let k = mk(&mut store, 2, kv_len);
+    let v = mk(&mut store, 3, kv_len);
+    let out =
+        autograd::ops::causal_sdpa_recompute_with_q_start(q, k, v, q_start, &mut store, &mut tape)
+            .expect("forward");
+    let loss = autograd::ops::sum(out, &mut store, &mut tape).expect("sum");
+    let grads = tape.backward(loss, &mut store).expect("backward");
+    assert_eq!(
+        store.to_host(grads[&q]).expect("grad_q readback").len(),
+        q_len * 4 * 128
+    );
+}
