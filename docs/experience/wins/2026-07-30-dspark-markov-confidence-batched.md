@@ -242,9 +242,16 @@ values at the two ends" item below is this, unsolved. In the paper's objective
 | arm | B | τ | Θ |
 |---|---:|---:|---:|
 | no-spec | 16 | 1.000 | 128.1 |
-| block 6 | 96 | 2.400 | **146.2** |
+| block 2 | 16 | 1.734 | 138.6 |
+| block 4 | 48 | 2.277 | **154.0** |
+| block 6 | 96 | 2.400 | **146.2** (repeat trial 152.8) |
 | block 11 | 176 | 2.584 | 123.2 |
 | block 16 | 256 | 2.440 | **110.8 — under no-spec** |
+
+Block 2/4 close the curve's low end: the c=16 interior maximum sits at
+block 4–6 (154.0 vs 152.8, within trial noise), rising monotonically from
+no-spec below it and falling monotonically above it — exactly the unimodal
+shape Algorithm 1's break-when-falling search assumes.
 
 Algorithm 1 initializes `Θ_best ← R·SPS(R)` (line 6, the no-spec point) and
 breaks the moment throughput stops rising (line 13), so **it cannot ship the
@@ -253,12 +260,24 @@ answers the rejection.
 
 What survives: **the ragged-chain penalty blocks it.** Algorithm 1 emits unequal
 `ℓ_r` by construction, and this engine charges 3.1× for that (`fr16` at
-threshold 0 vs 0.15: 354.1 vs 1095.7 ms at 253.9 vs 256.0 rows). Fix that first
-or the scheduler loses on arrival. Then the cheap half is worth measuring alone:
-`SPS(B)` is a profiled table, and depth indexed on running-request count captures
-the c=1↔c=16 swing with no confidence head at all. Per-request allocation — the
-cumulative survival `∏c_i`, STS calibration, the batch-global greedy — is the
-second increment, not the first.
+threshold 0 vs 0.15: 354.1 vs 1095.7 ms at 253.9 vs 256.0 rows). The zero-code
+cross-check landed the same verdict: uniform 64 rows (blk4, 103.91 ms TPOT) ≈
+uniform 96 rows (fr6t0, 104.73) while ragged **76** rows (fr6@0.5) costs 159.68 —
+fewer rows, 54% slower. Raggedness itself is the cost, not row count. Fix that
+first or the scheduler loses on arrival. sglang's deployed DSpark answers it
+with graph-tier rounding (`ragged_verify.py::round_up_grid` — pad the ragged
+layout up to pre-captured CUDA-graph tiers), not by avoiding raggedness.
+
+The port target is sglang's deployed pipeline
+(`speculative/dspark_components/`), not a home-grown subset: the confidence
+head always runs (no threshold switch — static truncation is an eval-only
+convenience, default-off there too), STS per-position temperatures calibrate
+it, survival is `cumprod(confidence)`, and the batch token budget
+`argmax_B τ*(B)/step_time(B)` uses **lagged** survival (1–2 steps prior,
+`_shift_to_lag`) — which dissolves the "head output arrives post-draft, too
+late to schedule" objection; only the per-request top-k allocation reads the
+current step. Their SPS cost model is `bias + α(num_reqs) + θ(total rows)` —
+the same additive decomposition we measured (116 ms + 0.53 ms/row at c=16).
 
 ## Rule
 
