@@ -279,6 +279,18 @@ late to schedule" objection; only the per-request top-k allocation reads the
 current step. Their SPS cost model is `bias + α(num_reqs) + θ(total rows)` —
 the same additive decomposition we measured (116 ms + 0.53 ms/row at c=16).
 
+## Scheduler core landed — bench pending-remote
+
+The port's first tranche is in (same day): static truncation deleted
+(`--dspark-conf-threshold` removed), confidence → survival cumprod →
+`qwen35_spec::dspark_verify_lens` (goodput argmax + global admission, B=0 arm
+seeded), cost model `--dspark-sps-bias-ms`/`--dspark-sps-row-ms` defaulting to
+the measured 211 + 0.53. Both stacks call the one function: Qwen3.5/3.6
+batch-global (R=b), DSv4 per-slot (R=1). No lag ring (sync engine — current
+survival precedes verify), no STS (no fitted temperatures yet). Host unit gate
+`budget_scales_with_survival`; GPU A/B **pending-remote**, deliberately after
+the ragged-chain fix per the section above.
+
 ## Rule
 
 **A claim that a path cannot be verified is a claim about the disk, and disks are

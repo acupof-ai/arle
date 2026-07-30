@@ -341,7 +341,8 @@ impl CudaExecutor {
         kv_dtype: CudaKvCacheDtype,
         mem_fraction_static: f64,
         dspark_draft_model: Option<&std::path::Path>,
-        dspark_conf_threshold: f32,
+        dspark_sps_bias_ms: f32,
+        dspark_sps_row_ms: f32,
         dspark_train_head_rank: Option<usize>,
         dspark_block_size: Option<usize>,
         mtp_draft_tokens: Option<usize>,
@@ -356,7 +357,8 @@ impl CudaExecutor {
                     kv_dtype,
                     mem_fraction_static,
                     dspark_draft_model,
-                    dspark_conf_threshold,
+                    dspark_sps_bias_ms,
+                    dspark_sps_row_ms,
                     dspark_train_head_rank,
                     dspark_block_size,
                     mtp_draft_tokens,
@@ -391,7 +393,8 @@ impl CudaExecutor {
         mtp_draft_tokens: Option<usize>,
         mtp_draft_topk: Option<usize>,
         dspark_draft_model: Option<&std::path::Path>,
-        dspark_conf_threshold: f32,
+        dspark_sps_bias_ms: f32,
+        dspark_sps_row_ms: f32,
     ) -> anyhow::Result<Self> {
         Ok(Self {
             inner: CudaExecutorInner::Real(Box::new(
@@ -402,7 +405,8 @@ impl CudaExecutor {
                     mtp_draft_tokens,
                     mtp_draft_topk,
                     dspark_draft_model,
-                    dspark_conf_threshold,
+                    dspark_sps_bias_ms,
+                    dspark_sps_row_ms,
                 )?,
             )),
         })

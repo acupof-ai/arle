@@ -788,7 +788,8 @@ impl Qwen35CudaExecutor {
         kv_dtype: CudaKvCacheDtype,
         mem_fraction_static: f64,
         dspark_draft_model: Option<&Path>,
-        dspark_conf_threshold: f32,
+        dspark_sps_bias_ms: f32,
+        dspark_sps_row_ms: f32,
         dspark_train_head_rank: Option<usize>,
         dspark_block_size: Option<usize>,
         mtp_draft_tokens: Option<usize>,
@@ -843,7 +844,10 @@ impl Qwen35CudaExecutor {
                     model.config.hidden_size,
                     model.config.num_hidden_layers,
                     model.config.vocab_size,
-                    dspark_conf_threshold,
+                    qwen35_spec::DsparkSps {
+                        bias_ms: dspark_sps_bias_ms,
+                        row_ms: dspark_sps_row_ms,
+                    },
                     dspark_train_head_rank,
                     dspark_block_size,
                 )?;

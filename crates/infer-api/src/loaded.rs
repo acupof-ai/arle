@@ -122,10 +122,13 @@ pub struct EngineLoadConfig {
     /// ranks load it too. `None` = spec off (baseline byte-identical).
     #[serde(default)]
     pub dspark_draft_model: Option<std::path::PathBuf>,
-    /// Confidence-head truncation threshold (checkpoints without the head
-    /// ignore it).
-    #[serde(default = "default_dspark_conf_threshold")]
-    pub dspark_conf_threshold: f32,
+    /// DSpark verify-step cost model `step_ms = bias + row · verify_rows`
+    /// driving the goodput budget (checkpoints without a confidence head
+    /// ignore it). Defaults are the H20 ThinkingCap-27B c=16 measurement.
+    #[serde(default = "default_dspark_sps_bias_ms")]
+    pub dspark_sps_bias_ms: f32,
+    #[serde(default = "default_dspark_sps_row_ms")]
+    pub dspark_sps_row_ms: f32,
     /// Materialize a trainable Markov head of this rank when the draft
     /// checkpoint ships without one (DFlash backbones do). `None` = leave the
     /// drafter head-less, which is what a plain serve wants: an untrained head
@@ -154,8 +157,12 @@ pub struct EngineLoadConfig {
     pub vulkan_submit_cap: Option<usize>,
 }
 
-fn default_dspark_conf_threshold() -> f32 {
-    0.0
+fn default_dspark_sps_bias_ms() -> f32 {
+    211.0
+}
+
+fn default_dspark_sps_row_ms() -> f32 {
+    0.53
 }
 
 /// `--lora-alpha` default (the common rank-32 PEFT convention); a free function
@@ -209,7 +216,8 @@ impl Default for EngineLoadConfig {
             student_lora_adapters: None,
             student_lora_alpha: default_student_lora_alpha(),
             dspark_draft_model: None,
-            dspark_conf_threshold: default_dspark_conf_threshold(),
+            dspark_sps_bias_ms: default_dspark_sps_bias_ms(),
+            dspark_sps_row_ms: default_dspark_sps_row_ms(),
             dspark_train_head_rank: None,
             dspark_block_size: None,
             cuda: infer_seam::CudaRuntimeFlags::default(),
@@ -2179,7 +2187,8 @@ mod backend {
                 kv_dtype,
                 config.mem_fraction_static,
                 config.dspark_draft_model.as_deref(),
-                config.dspark_conf_threshold,
+                config.dspark_sps_bias_ms,
+                config.dspark_sps_row_ms,
                 config.dspark_train_head_rank,
                 config.dspark_block_size,
                 config.mtp_draft_tokens,
@@ -2207,7 +2216,8 @@ mod backend {
                 config.mtp_draft_tokens,
                 config.mtp_draft_topk,
                 config.dspark_draft_model.as_deref(),
-                config.dspark_conf_threshold,
+                config.dspark_sps_bias_ms,
+                config.dspark_sps_row_ms,
             )?,
             CudaModelKind::DiffusionGemma | CudaModelKind::Qwen3MoeUnsupported => {
                 unreachable!("checked before CUDA executor build")
