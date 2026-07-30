@@ -1,6 +1,5 @@
-//! The two accumulators a chunked forward/backward needs. Both write through one
-//! device buffer in place, so neither can hold old+new at once — the quadratic
-//! fold that OOM'd the 131072 forward is not expressible here.
+//! Chunked forward/backward accumulators. Both write one device buffer in place,
+//! so the quadratic fold that OOM'd the 131072 forward is unwritable here.
 
 use crate::{
     AutogradError, Result,
@@ -8,8 +7,8 @@ use crate::{
     tensor::{TensorId, TensorStore},
 };
 
-/// Probe before cloning: an in-place write through a shared buffer corrupts the
-/// sibling, and `TensorStore::device_handle` bumps the count past 1.
+/// Probe before cloning — `device_handle` bumps the count, and an in-place write
+/// through a shared buffer corrupts the sibling.
 fn sole_owned_handle(id: TensorId, store: &mut TensorStore) -> Result<DeviceHandle> {
     store.ensure_device(id)?;
     let handle = store
@@ -28,8 +27,7 @@ fn sole_owned_handle(id: TensorId, store: &mut TensorStore) -> Result<DeviceHand
     Ok(handle.clone())
 }
 
-/// Output rows partition by chunk: one full-size buffer, disjoint ranges assigned
-/// in place.
+/// Output rows partition by chunk: disjoint ranges assigned into one buffer.
 pub struct SeqAccum {
     id: TensorId,
     shape: Vec<usize>,
@@ -53,13 +51,11 @@ impl SeqAccum {
         })
     }
 
-    /// Never clone the handle behind it: both writers mutate the buffer in place,
-    /// so a live second reference turns into an error at the next write.
+    /// Never clone the handle behind it; the next write errors on a shared buffer.
     pub fn id(&self) -> TensorId {
         self.id
     }
 
-    /// Assign `src` into rows `start .. start + src.shape[row_axis]`.
     pub fn write_rows(
         &mut self,
         start: usize,
@@ -109,8 +105,8 @@ impl ChunkSum {
     pub fn add(&mut self, part: TensorId, store: &mut TensorStore) -> Result<()> {
         let src = store.device_handle(part)?;
         match self.id {
-            // Adopt the first chunk's buffer instead of copying it; the caller's
-            // `free_new_except` drops `part`, restoring sole ownership.
+            // Adopt rather than copy: `free_new_except` drops `part`, restoring
+            // sole ownership.
             None => {
                 let shape = store.tensor(part)?.shape.clone();
                 self.id = Some(store.alloc_device_tensor(shape, src)?);
@@ -127,11 +123,8 @@ impl ChunkSum {
         Ok(())
     }
 
-    /// Evict until the next `add`, which re-uploads. Only the caller knows
-    /// another chunk follows — parking after the last one is a whole-accumulator
-    /// round trip that `finish` immediately undoes. Skipped below
-    /// `checkpoint_offload_min_bytes`, where the transfer costs more than the
-    /// peak it saves.
+    /// Evict until the next `add`. Never after the last chunk — `finish` re-uploads,
+    /// making it a whole-accumulator round trip for nothing.
     pub fn park(&mut self, store: &mut TensorStore) -> Result<()> {
         let Some(id) = self.id else { return Ok(()) };
         if store.tensor(id)?.size * size_of::<f32>()
@@ -142,8 +135,7 @@ impl ChunkSum {
         Ok(())
     }
 
-    /// Brings a parked accumulator back to device; `None` when no chunk
-    /// contributed.
+    /// Brings a parked accumulator back to device.
     pub fn finish(self, store: &mut TensorStore) -> Result<Option<TensorId>> {
         if let Some(id) = self.id {
             store.ensure_device(id)?;

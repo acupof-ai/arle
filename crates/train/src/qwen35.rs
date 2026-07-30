@@ -2820,12 +2820,10 @@ fn la_params(cfg: &Qwen35Config, batch: usize, seq_len: usize) -> LinearAttentio
     }
 }
 
-/// Peak device bytes a single LINEAR-attention layer holds. This is the whole
-/// O(seq) story of a checkpointed forward: `linear_attention_core` runs the entire
-/// sequence in one call, while MLP and full attention recompute in `OPD_SEQ_CHUNK`
-/// row chunks. On the 27B hybrid this slope is 211712 B/token against a measured
-/// 231424, i.e. it UNDER-models by 9% — the unaccounted term is what
-/// `log_ckpt_peak`'s drift exists to name.
+/// Peak device bytes one LINEAR-attention layer holds — the whole O(seq) story of a
+/// checkpointed forward, since `linear_attention_core` runs the full sequence in one
+/// call while MLP and full attention chunk. UNDER-models the measured 27B slope
+/// (211712 vs 231424 B/token, −9%); `log_ckpt_peak` exists to name that drift.
 fn la_layer_peak_bytes(cfg: &Qwen35Config, batch: usize, seq_len: usize) -> usize {
     let p = la_params(cfg, batch, seq_len);
     // x and h: the residual stream is the layer's, not the kernel's.
