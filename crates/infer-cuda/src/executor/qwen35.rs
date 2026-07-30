@@ -2122,6 +2122,12 @@ impl Qwen35CudaExecutor {
                     params,
                 )?
             };
+            // Every chain, not just the rolled-back ones: the pre-2026-07-30
+            // print sat inside `k < depth`, so fully-accepted chains never
+            // appeared and every accept rate read off it was a lower bound.
+            if pt.is_some() {
+                eprintln!("[dspark-accept] k={k} depth={}", c.chain.len() - 1);
+            }
             accept_ms += crate::qwen35::mtp_phase_lap(&model.ctx, &mut pt);
             // Draft logits live in the SLOT: a tick drafts every row before
             // verifying any, so a shared buffer would pair the wrong slot.
