@@ -1920,10 +1920,7 @@ impl Qwen35CudaExecutor {
         //    bound at block rows, so every seeded slot shares one forward.
         let mut pre: Vec<Option<Vec<u32>>> = vec![None; decode_rows.len()];
         let mut idx: Vec<usize> = (0..decode_rows.len()).filter(|&i| seeded[i]).collect();
-        if idx.len() >= 2
-            && decode_rows.iter().all(|r| r.params.is_greedy())
-            && self.dspark.as_ref().expect("dspark").head.batchable_draft()
-        {
+        if idx.len() >= 2 && decode_rows.iter().all(|r| r.params.is_greedy()) {
             idx.sort_by_key(|&i| decode_rows[i].slot);
             let anchors: Vec<u32> = idx.iter().map(|&i| decode_rows[i].last_token).collect();
             let starts: Vec<usize> = idx.iter().map(|&i| decode_rows[i].kv_seq_len).collect();
@@ -2762,16 +2759,11 @@ impl Qwen35CudaExecutor {
         use super::spec_decode::{DecodeRoute, SpecKind};
         let kind = self.spec_kind();
         // Only a batched greedy DSpark draft pays above c=1. MTP still drafts
-        // per row; a markov head resolves row r from row r-1; sampling loses
-        // −15.5% at c=8 and −26.4% at c=16 because the rejection test commits
-        // far less per verify row; a quant-KV pool cannot build a multi-row page
-        // table. Each holds the gate at 1.
+        // per row; sampling loses −15.5% at c=8 and −26.4% at c=16 because the
+        // rejection test commits far less per verify row; a quant-KV pool cannot
+        // build a multi-row page table. Each holds the gate at 1.
         let batched = kind == SpecKind::Dspark
             && self.paged_kv_bf16()
-            && self
-                .dspark
-                .as_ref()
-                .is_some_and(|ds| ds.head.batchable_draft())
             && decode_rows.iter().all(|r| r.params.is_greedy());
         let gate = match batched {
             true => crate::runtime_flags::spec_max_batch(),

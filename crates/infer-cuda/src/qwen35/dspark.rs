@@ -79,11 +79,6 @@ impl Qwen35DsparkHead {
     fn kv_dim(&self) -> usize {
         self.cfg.num_key_value_heads * self.cfg.head_dim
     }
-    /// Markov resolves row r from row r-1, so it cannot batch.
-    pub(crate) fn batchable_draft(&self) -> bool {
-        self.markov.is_none()
-    }
-
     pub(crate) fn block_size(&self) -> usize {
         self.cfg.block_size
     }
@@ -337,17 +332,10 @@ pub(crate) struct DsparkScratch {
     markov_bias: HiddenSlot,
     step_logits: HiddenSlot,
     step_sum: HiddenSlot,
-    /// Block-shaped twins of the four above. The slots reuse only on an exact
-    /// shape match, and the row-shaped path (sampling, and the confidence head
-    /// inside the same call) interleaves with the batched one — sharing would
-    /// free and rezero a `[vocab, block]` buffer every tick.
-    markov_prevs: SliceSlot<i32>,
-    markov_rows: HiddenSlot,
-    markov_bias_rows: HiddenSlot,
-    step_sum_rows: HiddenSlot,
-    conf_feat: HiddenSlot,
-    conf_out: HiddenSlot,
-    argmax: SliceSlot<i32>,
+    /// Row-shaped twins of the four above, grouped so a caller can borrow the
+    /// base logits out of this same scratch and pass these beside them.
+    mk: MarkovScratch,
+    conf: ConfScratch,
     /// Batched-draft logits `[B*block, vocab]`; per-slot `df.logits` copy from here.
     logits_b: HiddenSlot,
     /// Row count of the tap features held in `feat_b` (the whole batch).
@@ -366,6 +354,25 @@ pub(crate) struct DsparkScratch {
     chain_draft: SliceSlot<i32>,
     u_accept: SliceSlot<f32>,
     u_residual: SliceSlot<f32>,
+}
+
+#[derive(Default)]
+struct MarkovScratch {
+    prevs: SliceSlot<i32>,
+    emb: HiddenSlot,
+    bias: HiddenSlot,
+    sum: HiddenSlot,
+    ids: SliceSlot<i32>,
+}
+
+/// Own `prevs`/`emb`: the settle's are `block`-shaped, these `block - first_row`.
+#[derive(Default)]
+struct ConfScratch {
+    prevs: SliceSlot<i32>,
+    emb: HiddenSlot,
+    feat: HiddenSlot,
+    out: HiddenSlot,
+    copy: Qwen35CopyScratch,
 }
 
 /// Uniform-stream salts: draft draw / accept test / residual+bonus draw at the
@@ -1044,7 +1051,14 @@ impl Qwen35Model {
         // Greedy resolves the whole block in one batched pass; sampling walks
         // the chain because a markov bias makes row r depend on row r-1's draw.
         if !sampling {
-            let am = self.dspark_block_greedy(head, scratch, df, anchor)?;
+            let am = self.dspark_settle_rows(
+                head.markov.as_ref(),
+                df.logits.get(ctx, vocab, block)?,
+                &mut scratch.mk,
+                &[anchor],
+                block,
+                first_row,
+            )?;
             drafts.extend_from_slice(&am[first_row..block]);
         }
         // No markov head: every row reads a precomputed logits row, so the
@@ -1182,7 +1196,15 @@ impl Qwen35Model {
                 "[dspark-draft] embed={embed_ms:.2} prep={prep_ms:.2} attn={attn_ms:.2} mlp={mlp_ms:.2} head={head_ms:.2} argmax={argmax_ms:.2} ms"
             );
         }
-        let keep = self.dspark_confident_prefix_len(head, scratch, &prev_tokens)?;
+        let keep = self.dspark_confident_keeps(
+            head,
+            scratch.final_normed.get(ctx, hidden, block)?,
+            &mut scratch.conf,
+            &prev_tokens,
+            1,
+            block,
+            first_row,
+        )?[0];
         drafts.truncate(keep.min(drafts.len()));
 
         let mut chain = Vec::with_capacity(1 + drafts.len());
@@ -1194,7 +1216,7 @@ impl Qwen35Model {
     /// Batched [`Self::dspark_draft_block`]: one forward over every slot's
     /// block. The draft GEMMs are weight-bound at `block` rows, so B serial
     /// drafts re-read the same weights B times. Only the ring kernels stay
-    /// per-slot. Greedy no-markov only — the other paths sync per row.
+    /// per-slot. Greedy only — a sampled draw syncs per row.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn dspark_draft_blocks(
         &self,
@@ -1379,12 +1401,19 @@ impl Qwen35Model {
         let logits = scratch.logits_b.get(ctx, vocab, rows)?;
         gemm_batch(ctx, self.output_projection(), final_normed, logits)?;
 
-        // One D2H for the whole tick.
-        let ids_dev = scratch.argmax.get(ctx, rows)?;
-        let am = self.argmax_rows_into(scratch.logits_b.get(ctx, vocab, rows)?, ids_dev)?;
-
+        // One D2H for the whole tick, and one markov settle over every slot.
         let first_row = usize::from(!cfg.next_token_heads);
-        let mut chains = Vec::with_capacity(b);
+        let am = self.dspark_settle_rows(
+            head.markov.as_ref(),
+            scratch.logits_b.get(ctx, vocab, rows)?,
+            &mut scratch.mk,
+            anchors,
+            block,
+            first_row,
+        )?;
+
+        let n = block - first_row;
+        let mut prevs = Vec::with_capacity(b * n);
         for (s, df) in dfs.iter_mut().enumerate() {
             df.q_rows = 0;
             let src = scratch
@@ -1396,75 +1425,87 @@ impl Qwen35Model {
             ctx.stream
                 .memcpy_dtod(&src, &mut dst.data)
                 .map_err(|e| anyhow!("dspark batched draft logits copy failed: {e}"))?;
-
+            if n > 0 {
+                prevs.push(anchors[s]);
+                prevs.extend_from_slice(&am[s * block + first_row..(s + 1) * block - 1]);
+            }
+        }
+        let keeps = self.dspark_confident_keeps(
+            head,
+            scratch.final_normed.get(ctx, hidden, rows)?,
+            &mut scratch.conf,
+            &prevs,
+            b,
+            block,
+            first_row,
+        )?;
+        let mut chains = Vec::with_capacity(b);
+        for (s, &anchor) in anchors.iter().enumerate() {
             let drafts = &am[s * block + first_row..(s + 1) * block];
-            let prev_tokens: Vec<u32> = std::iter::once(anchors[s])
-                .chain(drafts.iter().copied())
-                .take(drafts.len())
-                .collect();
-            let keep =
-                self.dspark_confident_prefix_len_at(head, scratch, &prev_tokens, s * block, rows)?;
             let mut chain = Vec::with_capacity(1 + drafts.len());
-            chain.push(anchors[s]);
-            chain.extend(&drafts[..keep.min(drafts.len())]);
+            chain.push(anchor);
+            chain.extend(&drafts[..keeps[s].min(drafts.len())]);
             chains.push(chain);
         }
         Ok(chains)
     }
 
-    /// Greedy token for every block row. Without a markov head that is one
-    /// batched argmax; with one, `bias = w2·w1[prev]` makes row r depend on row
-    /// r-1's choice, so the block is resolved by speculating the chain on
-    /// itself: the base argmax is a near-perfect guess for `prev` (the learned
-    /// bias is small next to the top-2 gap), so guess every predecessor,
-    /// correct all rows in one batched pass, and re-run while a guess
-    /// disagreed. Each round confirms one more row — `block` rounds bound it —
-    /// and the result is what walking the chain produces.
-    fn dspark_block_greedy(
+    /// Greedy token for every row of a `[vocab, b*block]` draft output. A markov
+    /// `bias = w2·w1[prev]` makes row r depend on row r-1, so the chain
+    /// speculates on itself: the base argmax is a near-perfect guess for `prev`,
+    /// so guess every predecessor, correct all rows at once, and re-run while a
+    /// guess disagreed. Each round confirms one more row, so `block` bounds it.
+    ///
+    /// Every slot settles in the same rounds — `w2` is `[vocab, rank]`, so the
+    /// GEMM is weight-bound and B serial settles re-read it B times. Costs two
+    /// `[vocab, b*block]` buffers, 48 MB each at block 6 / B 16.
+    fn dspark_settle_rows(
         &self,
-        head: &Qwen35DsparkHead,
-        scratch: &mut DsparkScratch,
-        df: &mut Qwen35DsparkSlotState,
-        anchor: u32,
+        m: Option<&DsparkMarkovHead>,
+        base: &HiddenStates,
+        mk: &mut MarkovScratch,
+        anchors: &[u32],
+        block: usize,
+        first_row: usize,
     ) -> Result<Vec<u32>> {
         let ctx = &self.ctx;
-        let vocab = self.output_projection().rows;
-        let block = head.cfg.block_size;
-        let first_row = usize::from(!head.cfg.next_token_heads);
-        let ids = scratch.argmax.get(ctx, block)?;
-        let mut toks = self.argmax_rows_into(df.logits.get(ctx, vocab, block)?, ids)?;
-        let Some(m) = &head.markov else {
+        let (rows, vocab) = (base.seq_len, base.hidden_dim);
+        let b = anchors.len();
+        ensure!(
+            rows == b * block,
+            "dspark settle: {rows} rows != {b} slots x {block}"
+        );
+        let ids = mk.ids.get(ctx, rows)?;
+        let mut toks = self.argmax_rows_into(base, ids)?;
+        let Some(m) = m else {
             return Ok(toks);
         };
-        // prevs[row] feeds row: the anchor for the first drafted row, else the
-        // token chosen one row earlier.
-        let mut prevs = vec![anchor as i32; block];
+        // The anchor feeds the slot's first drafted row, then its own tokens.
+        let mut prevs = vec![0i32; rows];
         for _ in 0..block {
-            for row in first_row + 1..block {
-                prevs[row] = toks[row - 1] as i32;
+            for (s, &anchor) in anchors.iter().enumerate() {
+                for row in 0..block {
+                    prevs[s * block + row] = if row <= first_row {
+                        anchor as i32
+                    } else {
+                        toks[s * block + row - 1] as i32
+                    };
+                }
             }
-            let tok_dev = scratch.markov_prevs.upload(ctx, &prevs)?;
-            let emb = scratch.markov_rows.get(ctx, m.rank, block)?;
+            let tok_dev = mk.prevs.upload(ctx, &prevs)?;
+            let emb = mk.emb.get(ctx, m.rank, rows)?;
             embedding_batch(ctx, &m.w1, tok_dev, emb)?;
-            let bias = scratch.markov_bias_rows.get(ctx, vocab, block)?;
-            gemm_batch(
-                ctx,
-                &m.w2,
-                scratch.markov_rows.get(ctx, m.rank, block)?,
-                bias,
-            )?;
-            let sum = scratch.step_sum_rows.get(ctx, vocab, block)?;
-            add_batch(
-                ctx,
-                df.logits.get(ctx, vocab, block)?,
-                scratch.markov_bias_rows.get(ctx, vocab, block)?,
-                sum,
-            )?;
-            let ids = scratch.argmax.get(ctx, block)?;
-            let next = self.argmax_rows_into(scratch.step_sum_rows.get(ctx, vocab, block)?, ids)?;
-            // prevs[row] is toks[row-1], so this is "the correction moved no
-            // row that another row's bias depends on".
-            let settled = (first_row..block.saturating_sub(1)).all(|r| toks[r] == next[r]);
+            let bias = mk.bias.get(ctx, vocab, rows)?;
+            gemm_batch(ctx, &m.w2, mk.emb.get(ctx, m.rank, rows)?, bias)?;
+            let sum = mk.sum.get(ctx, vocab, rows)?;
+            add_batch(ctx, base, mk.bias.get(ctx, vocab, rows)?, sum)?;
+            let ids = mk.ids.get(ctx, rows)?;
+            let next = self.argmax_rows_into(mk.sum.get(ctx, vocab, rows)?, ids)?;
+            // "the correction moved no row another row's bias depends on".
+            let settled = (0..b).all(|s| {
+                (first_row..block.saturating_sub(1))
+                    .all(|r| toks[s * block + r] == next[s * block + r])
+            });
             toks = next;
             if settled {
                 return Ok(toks);
@@ -1475,93 +1516,98 @@ impl Qwen35Model {
         ))
     }
 
-    /// Confidence-head seam: acceptance-confident prefix length over the block
-    /// rows (`sigmoid(proj([hidden_i ; markov_w1[prev_i]])) >= threshold`).
-    /// Head absent → the full block survives.
-    fn dspark_confident_prefix_len(
+    /// Per-slot confident prefix length
+    /// (`sigmoid(proj([hidden_i ; markov_w1[prev_i]])) >= threshold`) over a
+    /// `[hidden, b*block]` draft forward; `prevs` is slot-major, `b*(block -
+    /// first_row)` long. Head absent → the whole block survives. One GEMM, two
+    /// copy launches and one sync for the batch.
+    #[allow(clippy::too_many_arguments)]
+    fn dspark_confident_keeps(
         &self,
         head: &Qwen35DsparkHead,
-        scratch: &mut DsparkScratch,
-        prev_tokens: &[u32],
-    ) -> Result<usize> {
-        let block = head.cfg.block_size;
-        self.dspark_confident_prefix_len_at(head, scratch, prev_tokens, 0, block)
-    }
-
-    /// [`Self::dspark_confident_prefix_len`] over one slot's rows inside a
-    /// `total_rows`-row batched forward.
-    fn dspark_confident_prefix_len_at(
-        &self,
-        head: &Qwen35DsparkHead,
-        scratch: &mut DsparkScratch,
-        prev_tokens: &[u32],
-        row_off: usize,
-        total_rows: usize,
-    ) -> Result<usize> {
+        final_normed: &HiddenStates,
+        cs: &mut ConfScratch,
+        prevs: &[u32],
+        b: usize,
+        block: usize,
+        first_row: usize,
+    ) -> Result<Vec<usize>> {
+        let n = block - first_row;
         let Some(conf) = &head.confidence else {
-            return Ok(usize::MAX);
+            return Ok(vec![usize::MAX; b]);
         };
+        if n == 0 || b == 0 {
+            return Ok(vec![usize::MAX; b]);
+        }
+        ensure!(
+            prevs.len() == b * n,
+            "dspark confidence: {} prevs != {b} slots x {n}",
+            prevs.len()
+        );
         let ctx = &self.ctx;
         let hidden = head.cfg.hidden_size;
-        let block = head.cfg.block_size;
         let in_dim = conf.weight.cols;
-        let n = prev_tokens.len().min(block);
-        if n == 0 {
-            return Ok(usize::MAX);
-        }
-        // All `n` rows in one GEMM: the head gates every draft step, so a
-        // per-row GEMV would cost `block` device syncs to save at most a few
-        // hundred µs of arithmetic.
-        let feat = scratch.conf_feat.get(ctx, in_dim, n)?;
-        {
-            let final_normed = scratch.final_normed.get(ctx, hidden, total_rows)?;
+        let elem = std::mem::size_of::<bf16>();
+        let total = b * n;
+        // batched_copy moves 16B words and checks its sizes, not these strides.
+        ensure!(
+            (in_dim * elem).is_multiple_of(16) && (hidden * elem).is_multiple_of(16),
+            "dspark confidence rows {in_dim}/{hidden} are not 16B-aligned"
+        );
+        // Feature row `s*n + i` reads draft row `s*block + i`.
+        let fbase = cs
+            .feat
+            .get(ctx, in_dim, total)?
+            .data
+            .device_ptr_mut(&ctx.stream)
+            .0;
+        let hbase = final_normed.data.device_ptr(&ctx.stream).0;
+        let (mut dst, mut src) = (Vec::with_capacity(total), Vec::with_capacity(total));
+        for s in 0..b {
             for i in 0..n {
-                let r = row_off + i;
-                let src = final_normed.data.slice(r * hidden..(r + 1) * hidden);
-                let mut dst = feat.data.slice_mut(i * in_dim..i * in_dim + hidden);
-                ctx.stream
-                    .memcpy_dtod(&src, &mut dst)
-                    .map_err(|e| anyhow!("dspark conf feature copy failed: {e}"))?;
+                dst.push(fbase + ((s * n + i) * in_dim * elem) as u64);
+                src.push(hbase + ((s * block + i) * hidden * elem) as u64);
             }
         }
+        self.batched_copy(&mut cs.copy, &dst, &src, &[hidden * elem])?;
         if conf.with_markov {
             let m = head.markov.as_ref().expect("validated at load");
-            let prevs: Vec<i32> = prev_tokens[..n].iter().map(|&t| t as i32).collect();
-            let tok_dev = scratch.markov_prevs.upload(ctx, &prevs)?;
-            let emb = scratch.markov_rows.get(ctx, m.rank, n)?;
+            let toks: Vec<i32> = prevs.iter().map(|&t| t as i32).collect();
+            let tok_dev = cs.prevs.upload(ctx, &toks)?;
+            let emb = cs.emb.get(ctx, m.rank, total)?;
             embedding_batch(ctx, &m.w1, tok_dev, emb)?;
-            let emb = scratch.markov_rows.get(ctx, m.rank, n)?;
-            let feat = scratch.conf_feat.get(ctx, in_dim, n)?;
-            for i in 0..n {
-                let src = emb.data.slice(i * m.rank..(i + 1) * m.rank);
-                let mut dst = feat
-                    .data
-                    .slice_mut(i * in_dim + hidden..i * in_dim + hidden + m.rank);
-                ctx.stream
-                    .memcpy_dtod(&src, &mut dst)
-                    .map_err(|e| anyhow!("dspark conf markov copy failed: {e}"))?;
+            let ebase = cs
+                .emb
+                .get(ctx, m.rank, total)?
+                .data
+                .device_ptr(&ctx.stream)
+                .0;
+            dst.clear();
+            src.clear();
+            for r in 0..total {
+                dst.push(fbase + (r * in_dim * elem + hidden * elem) as u64);
+                src.push(ebase + (r * m.rank * elem) as u64);
             }
+            self.batched_copy(&mut cs.copy, &dst, &src, &[m.rank * elem])?;
         }
-        let out = scratch.conf_out.get(ctx, 1, n)?;
-        gemm_batch(
-            ctx,
-            &conf.weight,
-            scratch.conf_feat.get(ctx, in_dim, n)?,
-            out,
-        )?;
+        let out = cs.out.get(ctx, 1, total)?;
+        gemm_batch(ctx, &conf.weight, cs.feat.get(ctx, in_dim, total)?, out)?;
         let host = ctx
             .stream
-            .clone_dtoh(&scratch.conf_out.get(ctx, 1, n)?.data)
+            .clone_dtoh(&cs.out.get(ctx, 1, total)?.data)
             .map_err(|e| anyhow!("D2H dspark confidence failed: {e}"))?;
         ctx.sync()?;
-        let keep = host
-            .iter()
-            .position(|&h| {
-                let logit = h.to_f32() + conf.bias;
-                1.0 / (1.0 + (-logit).exp()) < head.confidence_threshold
+        Ok((0..b)
+            .map(|s| {
+                host[s * n..(s + 1) * n]
+                    .iter()
+                    .position(|&h| {
+                        let logit = h.to_f32() + conf.bias;
+                        1.0 / (1.0 + (-logit).exp()) < head.confidence_threshold
+                    })
+                    .unwrap_or(usize::MAX)
             })
-            .unwrap_or(usize::MAX);
-        Ok(keep)
+            .collect())
     }
 
     /// Size the reused per-slot spec state (`new_spec_slot_state` capture rows,
