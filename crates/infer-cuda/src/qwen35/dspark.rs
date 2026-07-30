@@ -1734,7 +1734,7 @@ impl Qwen35Model {
         let replay_ms = super::mtp_phase_lap(&self.ctx, &mut pt);
         if pt.is_some() {
             eprintln!(
-                "[dspark-accept] rows={} restore={restore_ms:.2} replay={replay_ms:.2} ms",
+                "[dspark-rollback] rows={} restore={restore_ms:.2} replay={replay_ms:.2} ms",
                 rolls.len()
             );
         }
