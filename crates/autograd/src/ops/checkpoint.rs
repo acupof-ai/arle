@@ -4,7 +4,7 @@ use smallvec::SmallVec;
 
 use crate::{
     AutogradError, Result,
-    ops::seq_accum::SeqAccum,
+    ops::chunk_accum::SeqAccum,
     tape::{BackwardOp, CheckpointFn, SavedContext, Tape, TapeEntry},
     tensor::{TensorId, TensorStore},
 };

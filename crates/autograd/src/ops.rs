@@ -6,6 +6,8 @@ pub mod attention;
 pub mod broadcast;
 #[path = "ops/checkpoint.rs"]
 pub mod checkpoint;
+#[path = "ops/chunk_accum.rs"]
+pub mod chunk_accum;
 #[path = "ops/collective.rs"]
 pub mod collective;
 #[path = "ops/collective_ep.rs"]
@@ -34,8 +36,6 @@ pub mod reduce;
 pub mod ring_attention;
 #[path = "ops/rope.rs"]
 pub mod rope;
-#[path = "ops/seq_accum.rs"]
-pub mod seq_accum;
 #[path = "ops/softmax.rs"]
 pub mod softmax;
 
@@ -431,6 +431,7 @@ pub fn matmul_bt_with_site(
 pub use linear_attention::{
     LinearAttentionParams, linear_attention_boundary, linear_attention_core_with_carry,
     linear_attention_core_with_carry_taped, linear_attention_ctx_bytes,
+    linear_attention_row_transient_bytes,
 };
 
 pub fn linear_attention_core(

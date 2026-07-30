@@ -6,8 +6,9 @@ use crate::{
     AutogradError, Result,
     backend::{CausalSdpaDeviceBackwardArgs, Device, cpu_causal_sdpa_recompute_backward},
     ops::{
-        add, add_broadcast, broadcast_expand, matmul, mul_scalar, reshape, seq_accum::SeqAccum,
-        slice, softmax, softmax_backward, transpose,
+        add_broadcast, broadcast_expand,
+        chunk_accum::{ChunkSum, SeqAccum},
+        matmul, mul_scalar, reshape, slice, softmax, softmax_backward, transpose,
     },
     tape::{BackwardOp, GradPairs, SavedContext, TapeEntry},
     tensor::{Dirty, Tensor, TensorId, TensorStore},
@@ -585,8 +586,8 @@ fn causal_sdpa_recompute_backward_device_chunked(
     let mut grad_q_3d = need_grad_q
         .then(|| SeqAccum::new(vec![merged_heads, q_len, head_dim], 1, store))
         .transpose()?;
-    let mut grad_k_acc: Option<TensorId> = None;
-    let mut grad_v_acc: Option<TensorId> = None;
+    let mut grad_k_acc = ChunkSum::new(false);
+    let mut grad_v_acc = ChunkSum::new(false);
 
     let mut q0 = 0usize;
     while q0 < q_len {
@@ -621,10 +622,7 @@ fn causal_sdpa_recompute_backward_device_chunked(
         if need_grad_v {
             let probs_t = transpose(probs, 1, 2, store, &mut tape)?;
             let grad_v_part = matmul(probs_t, up_chunk_3d, store, &mut tape)?;
-            grad_v_acc = Some(match grad_v_acc {
-                None => grad_v_part,
-                Some(acc) => add(acc, grad_v_part, store, &mut tape)?,
-            });
+            grad_v_acc.add(grad_v_part, store)?;
         }
 
         if need_grad_q || need_grad_k {
@@ -655,10 +653,7 @@ fn causal_sdpa_recompute_backward_device_chunked(
                 let d_scores_t = transpose(d_scores, 1, 2, store, &mut tape)?;
                 let grad_k_part = matmul(d_scores_t, q_chunk_3d, store, &mut tape)?;
                 let grad_k_part = mul_scalar(grad_k_part, scale, store, &mut tape)?;
-                grad_k_acc = Some(match grad_k_acc {
-                    None => grad_k_part,
-                    Some(acc) => add(acc, grad_k_part, store, &mut tape)?,
-                });
+                grad_k_acc.add(grad_k_part, store)?;
             }
         }
 
@@ -667,8 +662,8 @@ fn causal_sdpa_recompute_backward_device_chunked(
         // accumulators. Bounds peak to O(q_chunk·seq).
         let mut keep: HashSet<TensorId> =
             grad_q_3d.as_ref().map(SeqAccum::id).into_iter().collect();
-        keep.extend(grad_k_acc);
-        keep.extend(grad_v_acc);
+        keep.extend(grad_k_acc.id());
+        keep.extend(grad_v_acc.id());
         store.free_new_except(&live_before, &keep)?;
 
         q0 = q1;
@@ -676,9 +671,11 @@ fn causal_sdpa_recompute_backward_device_chunked(
 
     let mut grads = GradPairs::new();
     if need_grad_v {
-        let grad_v_3d = grad_v_acc.ok_or(AutogradError::TapeInvariant(
-            "causal_sdpa_recompute device backward: grad_v requested but no chunk produced it",
-        ))?;
+        let grad_v_3d = grad_v_acc
+            .finish(store)?
+            .ok_or(AutogradError::TapeInvariant(
+                "causal_sdpa_recompute device backward: grad_v requested but no chunk produced it",
+            ))?;
         let grad_v = reshape(grad_v_3d, kv_shape, store, &mut tape)?;
         grads.push((v, grad_v));
     }
@@ -687,9 +684,11 @@ fn causal_sdpa_recompute_backward_device_chunked(
         grads.push((q, grad_q));
     }
     if need_grad_k {
-        let grad_k_3d = grad_k_acc.ok_or(AutogradError::TapeInvariant(
-            "causal_sdpa_recompute device backward: grad_k requested but no chunk produced it",
-        ))?;
+        let grad_k_3d = grad_k_acc
+            .finish(store)?
+            .ok_or(AutogradError::TapeInvariant(
+                "causal_sdpa_recompute device backward: grad_k requested but no chunk produced it",
+            ))?;
         let grad_k = reshape(grad_k_3d, kv_shape, store, &mut tape)?;
         grads.push((k, grad_k));
     }

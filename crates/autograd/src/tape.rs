@@ -12,7 +12,7 @@ use crate::{
     AutogradError, Result,
     backend::DeviceHandle,
     ops,
-    ops::seq_accum::SeqAccum,
+    ops::chunk_accum::{ChunkSum, SeqAccum},
     tensor::{Dirty, TensorId, TensorStore},
 };
 
@@ -1068,7 +1068,9 @@ impl Tape {
         let mut d_input = need_input_grad
             .then(|| SeqAccum::new(vec![batch, seq, dim], 1, store))
             .transpose()?;
-        let mut d_param: Vec<Option<TensorId>> = vec![None; param_ids.len()];
+        // Full-seq param grads (k/v) dominate device memory; park each on host
+        // between chunks.
+        let mut d_param: Vec<ChunkSum> = param_ids.iter().map(|_| ChunkSum::new(true)).collect();
 
         let mut start = 0;
         while start < seq {
@@ -1110,47 +1112,7 @@ impl Tape {
             }
             for (slot, &pid) in param_ids.iter().enumerate() {
                 if let Some(&g) = grads.get(&pid) {
-                    store.ensure_device(g)?;
-                    match d_param[slot] {
-                        None => {
-                            let tensor = store.tensor(g)?;
-                            let handle = tensor
-                                .device_handle
-                                .as_ref()
-                                .expect("ensure_device")
-                                .clone();
-                            d_param[slot] =
-                                Some(store.alloc_device_tensor(tensor.shape.clone(), handle)?);
-                        }
-                        Some(acc) => {
-                            store.ensure_device(acc)?;
-                            let shape = store.tensor(acc)?.shape.clone();
-                            let acc_handle = store
-                                .tensor(acc)?
-                                .device_handle
-                                .as_ref()
-                                .expect("device accumulator")
-                                .clone();
-                            let grad_handle = store
-                                .tensor(g)?
-                                .device_handle
-                                .as_ref()
-                                .expect("ensure_device")
-                                .clone();
-                            let updated = store.backend().accumulate_into_device(
-                                &acc_handle,
-                                &grad_handle,
-                                &shape,
-                            )?;
-                            store.replace_device_handle(acc, updated)?;
-                        }
-                    }
-                    // Full-seq param grads (k/v) dominate device memory; keep
-                    // them on host between chunks and only materialize on device
-                    // during the accumulate. Saves ~2× seq·heads·head_dim·4 bytes.
-                    if let Some(acc) = d_param[slot] {
-                        store.offload_to_host(acc)?;
-                    }
+                    d_param[slot].add(g, store)?;
                 }
             }
 
@@ -1158,23 +1120,19 @@ impl Tape {
                 .as_ref()
                 .map(SeqAccum::id)
                 .into_iter()
-                .chain(d_param.iter().flatten().copied())
+                .chain(d_param.iter().filter_map(ChunkSum::id))
                 .collect();
             store.free_new_except(&live_before, &keep)?;
             self.trim_after_checkpoint_replay(store)?;
             start = end;
         }
 
-        for g in d_param.iter().flatten().copied() {
-            store.ensure_device(g)?;
-        }
-
         let mut pairs = GradPairs::new();
         if let Some(acc) = d_input.take() {
             pairs.push((input_id, acc.finish()));
         }
-        for (slot, &pid) in param_ids.iter().enumerate() {
-            if let Some(g) = d_param[slot].take() {
+        for (&pid, acc) in param_ids.iter().zip(d_param) {
+            if let Some(g) = acc.finish(store)? {
                 pairs.push((pid, g));
             }
         }
