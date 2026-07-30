@@ -1802,60 +1802,181 @@ fn linear_attention_carry_none_matches_full_first_rows() -> Result<()> {
     Ok(())
 }
 
-// Context-parallel correctness spec: N equal shards, each seeded by the previous
-// shard's (final_state, conv_tail), must reconstruct the full sequence — exactly
-// what a CP carry-ring passes rank→rank in order. This is the GPU-free reference
-// the device carry-ring (forward_linear_attention under cp) must match; a per-shard
-// isolated recurrence (today's CP bug) fails here on every shard past the first.
-fn assert_cp_carry_chain_exact(params: LinearAttentionParams, n_shards: usize, label: &str) {
+// Context-parallel correctness spec (all-to-all-to-head, per Megatron gated-delta-net):
+// running the recurrence on a value-head SUBSET and concatenating over subsets must
+// equal running on all heads. This is the math `linear_attention_core_cp` relies on
+// after its all-to-all transport hands each rank the full sequence for 1/N of the
+// heads — GPU-free, and it fails if the recurrence ever crossed value-heads (it must
+// not: state, conv taps, a_log[h], dt_bias[h], beta[h], per-head rmsnorm are all
+// head-local). Replaces the old carry-chain spec, which tested the rejected serial ring.
+fn assert_head_split_exact(params: LinearAttentionParams, n_shards: usize, label: &str) {
     let fixture = LinearAttentionFixture::new(params);
-    let (output_full, final_state_full) = la_full(&fixture, params).expect("full");
-    let seq = params.seq_len;
-    let zd = z_dim(params);
+    let (output_full, _final_full) = la_full(&fixture, params).expect("full");
     assert_eq!(
-        seq % n_shards,
+        params.num_value_heads % n_shards,
         0,
-        "{label}: seq must divide into equal shards"
+        "{label}: value heads must divide into equal shards"
     );
-    let shard = seq / n_shards;
+    assert_eq!(
+        params.num_key_heads % n_shards,
+        0,
+        "{label}: key heads must divide into equal shards"
+    );
+    let vh_l = params.num_value_heads / n_shards;
+    let vd = params.value_dim;
+    let seq = params.seq_len;
 
-    let mut carry: Option<(Vec<f32>, Vec<f32>)> = None;
-    let mut last_state = Vec::new();
+    // For each shard, run the core on that shard's head slice and place its output
+    // rows back into the value-head layout, then compare to the full run.
+    let mut reconstructed = vec![0.0_f32; output_full.len()];
     for s in 0..n_shards {
-        let (a, b) = (s * shard, (s + 1) * shard);
-        let seed = carry.as_ref().map(|(st, w)| (st.as_slice(), w.as_slice()));
-        let (out, state, window) = la_segment(&fixture, params, a, b, seed).expect("segment");
-        let (idx, max_diff) = max_err_with_index(&out, &output_full[a * zd..b * zd]);
-        assert!(
-            max_diff <= 1.0e-6,
-            "{label}: shard {s} output diverged at idx {idx}: max_abs_diff={max_diff:.3e}",
-        );
-        last_state = state.clone();
-        carry = Some((state, window));
+        let (out, _st, _w) = la_head_slice(&fixture, params, s, n_shards).expect("head slice");
+        // out is [seq, vh_l*vd]; scatter it into the [seq, num_value_heads*vd] full row.
+        for t in 0..seq {
+            let dst = t * params.num_value_heads * vd + s * vh_l * vd;
+            let src = t * vh_l * vd;
+            reconstructed[dst..dst + vh_l * vd].copy_from_slice(&out[src..src + vh_l * vd]);
+        }
     }
-    let (sidx, smax) = max_err_with_index(&last_state, &final_state_full);
+    let (idx, max_diff) = max_err_with_index(&reconstructed, &output_full);
     assert!(
-        smax <= 1.0e-6,
-        "{label}: chained final_state diverged at idx {sidx}: max_abs_diff={smax:.3e}",
+        max_diff <= 1.0e-6,
+        "{label}: head-split reconstruction diverged at idx {idx}: max_abs_diff={max_diff:.3e}",
     );
 }
 
+// Run linear_attention_core on shard `s` of `n_shards` value-heads (and the matching
+// key-head slice), returning that shard's [seq, vh_l*vd] output. Slices the packed
+// qkv/z/b/a channels + conv/dt/a_log weights to the shard's head range — the CPU
+// analog of what all-to-all-to-head delivers on device.
+fn la_head_slice(
+    fixture: &LinearAttentionFixture,
+    full: LinearAttentionParams,
+    s: usize,
+    n_shards: usize,
+) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+    assert_eq!(full.batch, 1, "head-slice helper assumes batch == 1");
+    let (kh_l, vh_l) = (
+        full.num_key_heads / n_shards,
+        full.num_value_heads / n_shards,
+    );
+    let params = LinearAttentionParams {
+        num_key_heads: kh_l,
+        num_value_heads: vh_l,
+        ..full
+    };
+    let (q_dim, k_dim) = (
+        full.num_key_heads * full.key_dim,
+        full.num_key_heads * full.key_dim,
+    );
+    let (kd, vd) = (full.key_dim, full.value_dim);
+    let seq = full.seq_len;
+    let qkv_full = qkv_dim(full);
+
+    // Per-row gather of this shard's q|k|v channels out of the packed qkv row.
+    let (q_off, k_off, v_off) = (
+        s * kh_l * kd,
+        q_dim + s * kh_l * kd,
+        q_dim + k_dim + s * vh_l * vd,
+    );
+    let mut qkv = Vec::with_capacity(seq * (kh_l * kd * 2 + vh_l * vd));
+    for t in 0..seq {
+        let base = t * qkv_full;
+        qkv.extend_from_slice(&fixture.qkv[base + q_off..base + q_off + kh_l * kd]);
+        qkv.extend_from_slice(&fixture.qkv[base + k_off..base + k_off + kh_l * kd]);
+        qkv.extend_from_slice(&fixture.qkv[base + v_off..base + v_off + vh_l * vd]);
+    }
+    let z = head_rows(
+        &fixture.z,
+        seq,
+        full.num_value_heads * vd,
+        s * vh_l * vd,
+        vh_l * vd,
+    );
+    let b_proj = head_rows(&fixture.b_proj, seq, full.num_value_heads, s * vh_l, vh_l);
+    let a_proj = head_rows(&fixture.a_proj, seq, full.num_value_heads, s * vh_l, vh_l);
+
+    // Weights: conv1d packs [q|k|v] on the channel axis; dt_bias/a_log per value-head;
+    // norm shared per value_dim.
+    let mut conv = Vec::new();
+    for &(base, w) in &[
+        (0usize, kh_l * kd),
+        (q_dim, kh_l * kd),
+        (q_dim + k_dim, vh_l * vd),
+    ] {
+        let start = base + s * w;
+        for ch in start..start + w {
+            conv.extend_from_slice(
+                &fixture.conv1d_weight[ch * full.conv_kernel..(ch + 1) * full.conv_kernel],
+            );
+        }
+    }
+    let dt_bias = fixture.dt_bias[s * vh_l..(s + 1) * vh_l].to_vec();
+    let a_log = fixture.a_log[s * vh_l..(s + 1) * vh_l].to_vec();
+
+    let mut store = TensorStore::default();
+    let qkv = store.from_slice(&qkv, &[1, seq, kh_l * kd * 2 + vh_l * vd])?;
+    let z = store.from_slice(&z, &[1, seq, vh_l * vd])?;
+    let b_proj = store.from_slice(&b_proj, &[1, seq, vh_l])?;
+    let a_proj = store.from_slice(&a_proj, &[1, seq, vh_l])?;
+    let conv1d_weight = store.from_slice(&conv, &[kh_l * kd * 2 + vh_l * vd, full.conv_kernel])?;
+    let dt_bias = store.from_slice(&dt_bias, &[vh_l])?;
+    let a_log = store.from_slice(&a_log, &[vh_l])?;
+    let norm_weight = store.from_slice(&fixture.norm_weight, &[vd])?;
+
+    let (output, final_state, conv_window) = linear_attention_core_with_carry(
+        qkv,
+        z,
+        b_proj,
+        a_proj,
+        conv1d_weight,
+        dt_bias,
+        a_log,
+        norm_weight,
+        params,
+        None,
+        None,
+        true,
+        &mut store,
+    )?;
+    Ok((
+        store.to_host(output)?,
+        store.to_host(final_state.expect("final_state"))?,
+        store.to_host(conv_window.expect("conv_window"))?,
+    ))
+}
+
+// Gather `width` channels at `offset` from each of `seq` rows of a `[seq, row]` tensor.
+fn head_rows(data: &[f32], seq: usize, row: usize, offset: usize, width: usize) -> Vec<f32> {
+    let mut out = Vec::with_capacity(seq * width);
+    for t in 0..seq {
+        out.extend_from_slice(&data[t * row + offset..t * row + offset + width]);
+    }
+    out
+}
+
 #[test]
-fn linear_attention_cp_carry_chain_reconstructs_full() {
-    // 4-way CP over a 32-token sequence (shard 8), conv_kernel=4 forces a real
-    // 3-row conv ring across every shard boundary. Also 2-way and an 8-way (shard
-    // == conv_window+1) split to stress the boundary at the kernel width.
+fn linear_attention_cp_head_split_reconstructs_full() {
+    // key_heads == value_heads == 4 so cp=2 and cp=4 both divide BOTH counts — the
+    // regime linear_attention_core_cp asserts. conv_kernel=4 exercises the packed
+    // [q|k|v] conv-weight head-slice.
     let params = LinearAttentionParams {
         batch: 1,
-        seq_len: 32,
-        num_key_heads: 1,
-        num_value_heads: 2,
+        seq_len: 16,
+        num_key_heads: 4,
+        num_value_heads: 4,
         key_dim: 6,
         value_dim: 4,
         conv_kernel: 4,
         eps: 1.0e-5,
     };
-    assert_cp_carry_chain_exact(params, 2, "cp=2");
-    assert_cp_carry_chain_exact(params, 4, "cp=4");
-    assert_cp_carry_chain_exact(params, 8, "cp=8");
+    assert_head_split_exact(params, 2, "cp=2");
+    assert_head_split_exact(params, 4, "cp=4");
+    // GQA (value_heads > key_heads) at cp=2: key-heads still divide, ratio preserved.
+    let gqa = LinearAttentionParams {
+        num_key_heads: 2,
+        num_value_heads: 4,
+        ..params
+    };
+    assert_head_split_exact(gqa, 2, "cp=2 gqa 2:1");
 }

@@ -23,7 +23,7 @@
 /// Per-block partial attention statistics for one (batch·head) tile.
 /// `out` is the UNNORMALIZED `P_j @ V_j`; `m`/`l` are the per-row running max and
 /// denominator of the online softmax.
-struct BlockStats {
+pub(crate) struct BlockStats {
     out: Vec<f32>, // [rows, dim] unnormalized
     m: Vec<f32>,   // [rows] row max
     l: Vec<f32>,   // [rows] row denom (sum of exp(S - m))

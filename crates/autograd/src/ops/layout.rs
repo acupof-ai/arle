@@ -305,6 +305,120 @@ fn slice_host_eager(
     Ok(output_id)
 }
 
+/// Concatenate N tensors of equal rank along `axis`. All inputs must match on
+/// every axis except `axis`. General over rank and axis (unlike the rank-4-only
+/// `cat_seq`/`cat_heads`): the CP linear-attn transport concats rank-3 activations
+/// on the feature axis and the rank-2 packed conv weight on axis 0. Host path —
+/// this is layout glue, and the CP shuffle it feeds is pod-only regardless.
+pub fn cat(
+    inputs: &[TensorId],
+    axis: usize,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<TensorId> {
+    if inputs.is_empty() {
+        return Err(AutogradError::InvalidIndicesLen {
+            expected: 1,
+            got: 0,
+        });
+    }
+    if inputs.len() == 1 {
+        return Ok(inputs[0]);
+    }
+    let first = store.tensor(inputs[0])?.shape.clone();
+    if axis >= first.len() {
+        return Err(AutogradError::AxisOutOfBounds {
+            axis,
+            rank: first.len(),
+        });
+    }
+    let input_shapes: Vec<Vec<usize>> = inputs
+        .iter()
+        .map(|&id| {
+            let s = store.tensor(id)?.shape.clone();
+            if s.len() != first.len()
+                || s.iter()
+                    .enumerate()
+                    .any(|(a, &d)| a != axis && d != first[a])
+            {
+                return Err(AutogradError::ShapeMismatch {
+                    expected: first.clone(),
+                    got: s.clone(),
+                });
+            }
+            Ok(s)
+        })
+        .collect::<Result<_>>()?;
+
+    let outer: usize = first[..axis].iter().product();
+    let inner: usize = first[axis + 1..].iter().product();
+    let axis_total: usize = input_shapes.iter().map(|s| s[axis]).sum();
+    let requires_grad = inputs
+        .iter()
+        .any(|&id| store.tensor(id).is_ok_and(|t| t.requires_grad));
+
+    let mut out_shape = first.clone();
+    out_shape[axis] = axis_total;
+    let mut data = vec![0.0_f32; outer * axis_total * inner];
+    let mut axis_off = 0usize;
+    for (i, &id) in inputs.iter().enumerate() {
+        let axis_i = input_shapes[i][axis];
+        let src = store.tensor_host(id)?;
+        for o in 0..outer {
+            let src_base = o * axis_i * inner;
+            let dst_base = (o * axis_total + axis_off) * inner;
+            let len = axis_i * inner;
+            data[dst_base..dst_base + len].copy_from_slice(&src.data[src_base..src_base + len]);
+        }
+        axis_off += axis_i;
+    }
+
+    let output_id = store.alloc(Tensor::new(data, out_shape, requires_grad)?);
+    TapeEntry {
+        op: BackwardOp::Cat,
+        output_id,
+        input_ids: inputs.iter().copied().collect(),
+        saved: SavedContext::CatCtx { axis, input_shapes },
+    }
+    .record(store, tape)?;
+    Ok(output_id)
+}
+
+pub(crate) fn cat_backward(
+    entry: &TapeEntry,
+    output_grad_id: TensorId,
+    store: &mut TensorStore,
+) -> Result<GradPairs> {
+    let SavedContext::CatCtx { axis, input_shapes } = entry.saved.clone() else {
+        return Err(AutogradError::TapeInvariant(
+            "cat backward missing saved context",
+        ));
+    };
+    let upstream = store.tensor_host(output_grad_id)?.data.clone();
+    let axis_total: usize = input_shapes.iter().map(|s| s[axis]).sum();
+    let inner: usize = input_shapes[0][axis + 1..].iter().product();
+    let outer: usize = input_shapes[0][..axis].iter().product();
+
+    let mut grads = GradPairs::new();
+    let mut axis_off = 0usize;
+    for (i, &input_id) in entry.input_ids.iter().enumerate() {
+        let axis_i = input_shapes[i][axis];
+        if store.tensor(input_id)?.requires_grad {
+            let mut grad = vec![0.0_f32; outer * axis_i * inner];
+            for o in 0..outer {
+                let src_base = (o * axis_total + axis_off) * inner;
+                let dst_base = o * axis_i * inner;
+                let len = axis_i * inner;
+                grad[dst_base..dst_base + len].copy_from_slice(&upstream[src_base..src_base + len]);
+            }
+            let grad_id = store.alloc(Tensor::new(grad, input_shapes[i].clone(), false)?);
+            grads.push((input_id, grad_id));
+        }
+        axis_off += axis_i;
+    }
+    Ok(grads)
+}
+
 pub(crate) fn reshape_backward(
     entry: &TapeEntry,
     output_grad_id: TensorId,
@@ -711,5 +825,49 @@ fn shape_numel(shape: &[usize]) -> usize {
         1
     } else {
         shape.iter().product()
+    }
+}
+
+#[cfg(test)]
+mod cat_tests {
+    use super::*;
+    use crate::{Tensor, ops, tape::Tape, tensor::TensorStore};
+
+    // slice → cat round-trips a rank-3 tensor on the feature axis, and grads flow
+    // back to each split unchanged (cat's adjoint is the inverse split). This is the
+    // strided-copy branch the CP linear-attn transport relies on.
+    #[test]
+    fn cat_last_axis_roundtrip_and_grad() -> Result<()> {
+        let mut store = TensorStore::default();
+        let mut tape = Tape::new();
+        // [b=1, seq=2, dim=6], three feature regions of width 2.
+        let data: Vec<f32> = (0..12).map(|i| i as f32).collect();
+        let x = store.alloc(Tensor::new(data.clone(), vec![1, 2, 6], true)?);
+        let a = ops::slice(x, &[0, 0, 0], &[1, 2, 2], &mut store, &mut tape)?;
+        let b = ops::slice(x, &[0, 0, 2], &[1, 2, 4], &mut store, &mut tape)?;
+        let c = ops::slice(x, &[0, 0, 4], &[1, 2, 6], &mut store, &mut tape)?;
+        let y = cat(&[a, b, c], 2, &mut store, &mut tape)?;
+        assert_eq!(store.tensor(y)?.shape, vec![1, 2, 6]);
+        assert_eq!(store.to_host(y)?, data);
+
+        let sq = ops::mul(y, y, &mut store, &mut tape)?;
+        let loss = ops::sum(sq, &mut store, &mut tape)?;
+        let grads = tape.backward(loss, &mut store)?;
+        let want: Vec<f32> = data.iter().map(|v| 2.0 * v).collect();
+        assert_eq!(store.to_host(grads[&x])?, want);
+        Ok(())
+    }
+
+    // Axis-0 concat of rank-2 tensors — the packed-conv-weight regime.
+    #[test]
+    fn cat_axis0_rank2() -> Result<()> {
+        let mut store = TensorStore::default();
+        let mut tape = Tape::new();
+        let a = store.alloc(Tensor::new(vec![1.0, 2.0], vec![1, 2], false)?);
+        let b = store.alloc(Tensor::new(vec![3.0, 4.0, 5.0, 6.0], vec![2, 2], false)?);
+        let y = cat(&[a, b], 0, &mut store, &mut tape)?;
+        assert_eq!(store.tensor(y)?.shape, vec![3, 2]);
+        assert_eq!(store.to_host(y)?, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        Ok(())
     }
 }

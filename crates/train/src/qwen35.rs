@@ -628,7 +628,7 @@ impl Qwen35Layer {
                 h, attn, cfg, tp, cp, cos, sin, batch, seq_len, store, tape,
             )?,
             Qwen35Attention::Linear(attn) => {
-                self.forward_linear_attention(h, attn, cfg, batch, seq_len, store, tape)?
+                self.forward_linear_attention(h, attn, cfg, cp, batch, seq_len, store, tape)?
             }
         };
         checkpoint_replay_mem_stage(tape, store, "post_attention");
@@ -720,8 +720,16 @@ impl Qwen35Layer {
                 let prefix = self.forward_linear_attention_capture_prefix_state(
                     h, attn, cfg, batch, gen_start, store, tape,
                 )?;
-                let attn_out =
-                    self.forward_linear_attention(h, attn, cfg, batch, gen_start, store, tape)?;
+                let attn_out = self.forward_linear_attention(
+                    h,
+                    attn,
+                    cfg,
+                    crate::context_parallel::CpContext::single(),
+                    batch,
+                    gen_start,
+                    store,
+                    tape,
+                )?;
                 (attn_out, LayerPrefix::Linear(prefix))
             }
         };
@@ -952,9 +960,16 @@ impl Qwen35Layer {
                 store,
                 tape,
             )?,
-            Qwen35Attention::Linear(attn) => {
-                self.forward_linear_attention(h, attn, cfg, batch, seq_len, store, tape)?
-            }
+            Qwen35Attention::Linear(attn) => self.forward_linear_attention(
+                h,
+                attn,
+                cfg,
+                crate::context_parallel::CpContext::single(),
+                batch,
+                seq_len,
+                store,
+                tape,
+            )?,
         };
         let x = add(x, attn_out, store, tape)?;
 
@@ -1023,9 +1038,16 @@ impl Qwen35Layer {
                 store,
                 tape,
             )?,
-            Qwen35Attention::Linear(attn) => {
-                self.forward_linear_attention(h, attn, cfg, batch, seq_len, store, tape)?
-            }
+            Qwen35Attention::Linear(attn) => self.forward_linear_attention(
+                h,
+                attn,
+                cfg,
+                crate::context_parallel::CpContext::single(),
+                batch,
+                seq_len,
+                store,
+                tape,
+            )?,
         };
         let x = add(x, attn_out, store, tape)?;
 
@@ -2566,6 +2588,7 @@ impl Qwen35Layer {
         h: TensorId,
         attn: &Qwen35LinearAttention,
         cfg: &Qwen35Config,
+        cp: crate::context_parallel::CpContext,
         batch: usize,
         seq_len: usize,
         store: &mut TensorStore,
@@ -2575,7 +2598,10 @@ impl Qwen35Layer {
         let z = attn.in_proj_z.forward(h, store, tape)?;
         let b_proj = attn.in_proj_b.forward(h, store, tape)?;
         let a_proj = attn.in_proj_a.forward(h, store, tape)?;
-        let linear = linear_attention_core(
+        // CP shards sequence; linear_attention_core_cp all-to-alls it into the head
+        // axis and runs the full-seq recurrence on this rank's head slice. cp.size==1
+        // is the single-card core verbatim.
+        let linear = autograd::ops::linear_attention_core_cp(
             qkv,
             z,
             b_proj,
@@ -2585,6 +2611,8 @@ impl Qwen35Layer {
             attn.a_log,
             attn.norm,
             la_params(cfg, batch, seq_len),
+            cp.size,
+            cp.rank,
             store,
             tape,
         )?;
