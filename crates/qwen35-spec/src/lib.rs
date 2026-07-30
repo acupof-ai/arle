@@ -1165,13 +1165,15 @@ pub enum DsparkLayerType {
 
 /// DSpark block-draft config, parsed from the DRAFT checkpoint dir's
 /// `config.json`. Covers both checkpoint flavors:
-/// - **DFlash** (z-lab): `dflash_config.{mask_token_id,target_layer_ids}`,
-///   same-position denoising — block rows `1..block_size` fill their OWN
-///   positions, so a block proposes `block_size - 1` draft tokens.
-/// - **DSpark** (DeepSpec): top-level `mask_token_id`/`target_layer_ids`,
-///   next-token labels — every block row predicts position+1, so a block
-///   proposes up to `block_size` draft tokens. Markov/confidence heads are
-///   detected from the safetensors, not the config.
+/// - **DFlash** (z-lab, `architectures: [..DFlash..]`): same-position
+///   denoising — block rows `1..block_size` fill their OWN positions, so a
+///   block proposes `block_size - 1` draft tokens.
+/// - **DSpark** (DeepSpec, `architectures: [..DSpark..]`): next-token labels —
+///   the anchor row is the first prediction position, so a block proposes up
+///   to `block_size` draft tokens. Markov/confidence heads are detected from
+///   the safetensors, not the config. Either flavor may nest
+///   `mask_token_id`/`target_layer_ids` under `dflash_config` or keep them
+///   top-level.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DsparkConfig {
     pub hidden_size: usize,
@@ -1208,8 +1210,10 @@ impl DsparkConfig {
                 .and_then(serde_json::Value::as_f64)
                 .map_or(default, |f| f as f32)
         };
-        // DFlash nests mask/target ids under "dflash_config"; DSpark keeps them
-        // top-level. The nesting also selects the proposal convention.
+        // Both families may nest mask/target ids under "dflash_config" (a
+        // DSpark checkpoint's backbone IS DFlash) — nesting is a field-lookup
+        // detail only. The proposal convention is discriminated by
+        // `architectures`, matching DeepSpec's eval dispatch.
         let dflash = v.get("dflash_config").filter(|d| d.is_object());
         let field = |name: &str| dflash.and_then(|d| d.get(name)).or_else(|| v.get(name));
         let mask_token_id = field("mask_token_id")
@@ -1260,7 +1264,12 @@ impl DsparkConfig {
                 .ok_or(Qwen35ConfigError::InvalidConfig("block_size"))?,
             mask_token_id,
             target_layer_ids,
-            next_token_heads: dflash.is_none(),
+            next_token_heads: v
+                .get("architectures")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|a| a.first())
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|s| s.contains("DSpark")),
         })
     }
 
