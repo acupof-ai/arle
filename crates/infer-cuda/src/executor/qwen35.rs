@@ -2082,9 +2082,6 @@ impl Qwen35CudaExecutor {
         };
 
         let rank_probe = std::env::var("ARLE_DSPARK_RANK").is_ok();
-        // Own flag, not ARLE_DSPARK_PHASE: the accept length is host arithmetic,
-        // and reading it off a run whose every lap syncs cannot rank drafts.
-        let accept_probe = std::env::var("ARLE_DSPARK_ACCEPT").is_ok();
         let tap_ms = crate::qwen35::mtp_phase_lap(&model.ctx, &mut pt);
         let (mut accept_ms, mut cap_ms, mut trunc_ms, mut ext_ms) = (0.0, 0.0, 0.0, 0.0);
 
@@ -2122,12 +2119,6 @@ impl Qwen35CudaExecutor {
                     params,
                 )?
             };
-            // Every chain, not just the rolled-back ones: the pre-2026-07-30
-            // print sat inside `k < depth`, so fully-accepted chains never
-            // appeared and every accept rate read off it was a lower bound.
-            if accept_probe {
-                eprintln!("[dspark-accept] k={k} depth={}", c.chain.len() - 1);
-            }
             accept_ms += crate::qwen35::mtp_phase_lap(&model.ctx, &mut pt);
             // Draft logits live in the SLOT: a tick drafts every row before
             // verifying any, so a shared buffer would pair the wrong slot.
