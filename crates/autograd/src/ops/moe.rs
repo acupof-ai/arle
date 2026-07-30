@@ -247,11 +247,7 @@ pub fn moe_topk_softmax_with_indices(
     }
     let indices = indices.to_vec();
 
-    let weights_id = store.alloc(Tensor::new(
-        weights,
-        vec![tokens, top_k],
-        input.requires_grad,
-    )?);
+    let weights_id = store.alloc(Tensor::new(weights, vec![tokens, top_k], false)?);
     TapeEntry {
         op: BackwardOp::MoeTopKSoftmax,
         output_id: weights_id,
@@ -381,11 +377,7 @@ pub fn moe_gather_rows(
         .iter()
         .flat_map(|&row| input.data[row * cols..(row + 1) * cols].iter().copied())
         .collect();
-    let output_id = store.alloc(Tensor::new(
-        data,
-        vec![rows.len(), cols],
-        input.requires_grad,
-    )?);
+    let output_id = store.alloc(Tensor::new(data, vec![rows.len(), cols], false)?);
     TapeEntry {
         op: BackwardOp::MoeGatherRows,
         output_id,

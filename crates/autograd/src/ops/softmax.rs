@@ -109,11 +109,7 @@ fn softmax_host_eager(
             .log_softmax_forward_last_axis(&input.data, &input.shape)?,
     };
 
-    let output_id = store.alloc(Tensor::new(
-        output,
-        input.shape.clone(),
-        input.requires_grad,
-    )?);
+    let output_id = store.alloc(Tensor::new(output, input.shape.clone(), false)?);
     TapeEntry {
         op: kind.backward_op(),
         output_id,

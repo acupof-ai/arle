@@ -130,11 +130,7 @@ fn embedding_host_eager(
     // Raw indices do not carry an explicit [B, S] shape, so M1 treats them as a
     // single batch row `[1, S]` instead of introducing a separate integer tensor store.
     let output_shape = vec![1, seq_len, hidden];
-    let output_id = store.alloc(Tensor::new(
-        output,
-        output_shape,
-        table_tensor.requires_grad,
-    )?);
+    let output_id = store.alloc(Tensor::new(output, output_shape, false)?);
     TapeEntry {
         op: BackwardOp::Embedding,
         output_id,

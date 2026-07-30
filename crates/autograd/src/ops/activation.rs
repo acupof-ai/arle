@@ -56,11 +56,7 @@ fn exp_device_lazy(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Res
 fn exp_host_eager(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
     let input = store.tensor_host(x)?;
     let output = store.backend().exp_forward(&input.data)?;
-    let output_id = store.alloc(Tensor::new(
-        output,
-        input.shape.clone(),
-        input.requires_grad,
-    )?);
+    let output_id = store.alloc(Tensor::new(output, input.shape.clone(), false)?);
 
     TapeEntry {
         op: BackwardOp::Exp,
@@ -125,11 +121,7 @@ fn gelu_host_eager(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Res
         .iter()
         .map(|&value| 0.5 * value * (1.0 + erff(value * INV_SQRT_2)))
         .collect();
-    let output_id = store.alloc(Tensor::new(
-        output,
-        input.shape.clone(),
-        input.requires_grad,
-    )?);
+    let output_id = store.alloc(Tensor::new(output, input.shape.clone(), false)?);
 
     TapeEntry {
         op: BackwardOp::Gelu,
@@ -188,11 +180,7 @@ fn silu_device_lazy(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Re
 fn silu_host_eager(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
     let input = store.tensor_host(x)?;
     let output = store.backend().silu_forward(&input.data)?;
-    let output_id = store.alloc(Tensor::new(
-        output,
-        input.shape.clone(),
-        input.requires_grad,
-    )?);
+    let output_id = store.alloc(Tensor::new(output, input.shape.clone(), false)?);
 
     TapeEntry {
         op: BackwardOp::Silu,
@@ -252,11 +240,7 @@ fn sigmoid_device_lazy(x: TensorId, store: &mut TensorStore, tape: &mut Tape) ->
 fn sigmoid_host_eager(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
     let input = store.tensor_host(x)?;
     let output = store.backend().sigmoid_forward(&input.data)?;
-    let output_id = store.alloc(Tensor::new(
-        output,
-        input.shape.clone(),
-        input.requires_grad,
-    )?);
+    let output_id = store.alloc(Tensor::new(output, input.shape.clone(), false)?);
 
     TapeEntry {
         op: BackwardOp::Sigmoid,

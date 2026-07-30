@@ -2832,14 +2832,14 @@ fn la_layer_peak_bytes(cfg: &Qwen35Config, batch: usize, seq_len: usize) -> usiz
     let (hk, kd) = (p.num_key_heads, p.key_dim);
     let (hv, vd) = (p.num_value_heads, p.value_dim);
     let qkv_dim = 2 * hk * kd + hv * vd;
-    // backend_cuda `..._forward_device_row` buffers the return does NOT keep:
-    // a_tril + g_cumsum (f32); q/k/w, v/u/v_new/raw_output, a_inv, b/a casts (bf16).
-    let transient = 4 * (64 * hv + hv) + 2 * (3 * hv * kd + 4 * hv * vd + 64 * hv + 2 * hv);
-    // Its taped f32 inputs (qkv/z/b_proj/a_proj) plus the residual stream x and h.
-    let inputs = 4 * (qkv_dim + hv * vd + 2 * hv + 2 * cfg.hidden_size);
+    // Per row: `..._forward_device_row`'s own buffers (a_tril + g_cumsum f32; q/k/w,
+    // v/u/v_new/raw_output, a_inv, b/a casts bf16), plus its taped f32 inputs
+    // (qkv/z/b_proj/a_proj) and the residual stream x and h.
+    let f32_elems = 64 * hv + hv + qkv_dim + hv * vd + 2 * hv + 2 * cfg.hidden_size;
+    let bf16_elems = 3 * hv * kd + 4 * hv * vd + 64 * hv + 2 * hv;
     batch
         .saturating_mul(seq_len)
-        .saturating_mul(transient + inputs)
+        .saturating_mul(4 * f32_elems + 2 * bf16_elems)
         .saturating_add(linear_attention_ctx_bytes(p))
 }
 
@@ -2852,8 +2852,11 @@ fn full_attn_layer_peak_bytes(
     batch: usize,
     seq_len: usize,
 ) -> Result<usize> {
-    let per_row = 4 * (2 * tp.local_attention_heads(cfg)? * cfg.head_dim + 2 * cfg.hidden_size);
-    Ok(batch.saturating_mul(seq_len).saturating_mul(per_row))
+    let kv = 2 * tp.local_attention_heads(cfg)? * cfg.head_dim;
+    let residual = 2 * cfg.hidden_size;
+    Ok(batch
+        .saturating_mul(seq_len)
+        .saturating_mul(4 * (kv + residual)))
 }
 
 impl Qwen35Model {
@@ -2972,14 +2975,12 @@ impl Qwen35Model {
             + 'static,
         PF: Fn(usize) -> Vec<TensorId>,
     {
-        // Floor and watermark are one measurement pair: no rebase, no `actual`.
+        // The rebase sets the watermark to current used, so it reads back as the floor.
         let floor = store
             .backend()
             .reset_mem_pool_used_high()
-            .is_ok()
-            .then(|| store.backend().mem_pool_stats())
-            .flatten()
-            .map(|(_, used)| used);
+            .ok()
+            .and_then(|()| store.backend().mem_pool_used_high());
         let out = checkpoint_sequential(
             hidden,
             self.layers.len(),
@@ -3013,20 +3014,25 @@ impl Qwen35Model {
         store: &TensorStore,
         tape: &Tape,
     ) -> Result<()> {
+        // Without both the floor and the watermark there is no drift to report.
+        let (Some(floor), Some(actual)) = (floor, store.backend().mem_pool_used_high()) else {
+            return Ok(());
+        };
+        static HIGH: AtomicU64 = AtomicU64::new(0);
+        if HIGH.fetch_max(actual, Ordering::Relaxed) >= actual {
+            return Ok(());
+        }
         let cfg = &self.config;
-        let has = |pred: fn(&Qwen35Attention) -> bool| {
-            self.layers.iter().any(|layer| pred(&layer.self_attn))
-        };
-        let la = if has(|attn| matches!(attn, Qwen35Attention::Linear(_))) {
-            la_layer_peak_bytes(cfg, batch, seq_len)
-        } else {
-            0
-        };
-        let full = if has(|attn| matches!(attn, Qwen35Attention::Full(_))) {
-            full_attn_layer_peak_bytes(cfg, self.tp, batch, seq_len)?
-        } else {
-            0
-        };
+        // Group size is 1, so the peak is the largest single layer.
+        let mut layer = 0;
+        for l in &self.layers {
+            layer = layer.max(match &l.self_attn {
+                Qwen35Attention::Linear(_) => la_layer_peak_bytes(cfg, batch, seq_len),
+                Qwen35Attention::Full(_) => {
+                    full_attn_layer_peak_bytes(cfg, self.tp, batch, seq_len)?
+                }
+            });
+        }
         // Offloaded groups leave nothing behind; resident ones keep one hidden each.
         let saved = if tape.offload_checkpoints() {
             0
@@ -3036,32 +3042,17 @@ impl Qwen35Model {
                 .saturating_mul(cfg.hidden_size * 4)
                 .saturating_mul(self.layers.len())
         };
-        let layer = la.max(full);
-        let modeled = floor
-            .unwrap_or(0)
-            .saturating_add(layer.saturating_add(saved) as u64);
-        let actual = floor.and_then(|_| store.backend().mem_pool_used_high());
-        static HIGH: AtomicU64 = AtomicU64::new(0);
-        let ratchet = actual.unwrap_or(modeled);
-        if HIGH.fetch_max(ratchet, Ordering::Relaxed) >= ratchet {
-            return Ok(());
-        }
+        let modeled = floor.saturating_add(layer.saturating_add(saved) as u64);
         let mib = |bytes: u64| bytes >> 20;
-        let fmt = |bytes: Option<u64>| {
-            bytes.map_or_else(|| "n/a".to_string(), |bytes| format!("{}MiB", mib(bytes)))
-        };
         eprintln!(
-            "[ckpt-peak] unvalidated batch={batch} seq={seq_len} floor={} layer={}MiB \
-             saved={}MiB modeled={}MiB actual={} drift={}",
-            fmt(floor),
+            "[ckpt-peak] unvalidated batch={batch} seq={seq_len} floor={}MiB layer={}MiB \
+             saved={}MiB modeled={}MiB actual={}MiB drift={:+}MiB",
+            mib(floor),
             mib(layer as u64),
             mib(saved as u64),
             mib(modeled),
-            fmt(actual),
-            actual.map_or_else(
-                || "n/a".to_string(),
-                |actual| format!("{:+}MiB", mib(actual) as i64 - mib(modeled) as i64)
-            ),
+            mib(actual),
+            mib(actual) as i64 - mib(modeled) as i64,
         );
         Ok(())
     }
