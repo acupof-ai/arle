@@ -1801,3 +1801,61 @@ fn linear_attention_carry_none_matches_full_first_rows() -> Result<()> {
     );
     Ok(())
 }
+
+// Context-parallel correctness spec: N equal shards, each seeded by the previous
+// shard's (final_state, conv_tail), must reconstruct the full sequence — exactly
+// what a CP carry-ring passes rank→rank in order. This is the GPU-free reference
+// the device carry-ring (forward_linear_attention under cp) must match; a per-shard
+// isolated recurrence (today's CP bug) fails here on every shard past the first.
+fn assert_cp_carry_chain_exact(params: LinearAttentionParams, n_shards: usize, label: &str) {
+    let fixture = LinearAttentionFixture::new(params);
+    let (output_full, final_state_full) = la_full(&fixture, params).expect("full");
+    let seq = params.seq_len;
+    let zd = z_dim(params);
+    assert_eq!(
+        seq % n_shards,
+        0,
+        "{label}: seq must divide into equal shards"
+    );
+    let shard = seq / n_shards;
+
+    let mut carry: Option<(Vec<f32>, Vec<f32>)> = None;
+    let mut last_state = Vec::new();
+    for s in 0..n_shards {
+        let (a, b) = (s * shard, (s + 1) * shard);
+        let seed = carry.as_ref().map(|(st, w)| (st.as_slice(), w.as_slice()));
+        let (out, state, window) = la_segment(&fixture, params, a, b, seed).expect("segment");
+        let (idx, max_diff) = max_err_with_index(&out, &output_full[a * zd..b * zd]);
+        assert!(
+            max_diff <= 1.0e-6,
+            "{label}: shard {s} output diverged at idx {idx}: max_abs_diff={max_diff:.3e}",
+        );
+        last_state = state.clone();
+        carry = Some((state, window));
+    }
+    let (sidx, smax) = max_err_with_index(&last_state, &final_state_full);
+    assert!(
+        smax <= 1.0e-6,
+        "{label}: chained final_state diverged at idx {sidx}: max_abs_diff={smax:.3e}",
+    );
+}
+
+#[test]
+fn linear_attention_cp_carry_chain_reconstructs_full() {
+    // 4-way CP over a 32-token sequence (shard 8), conv_kernel=4 forces a real
+    // 3-row conv ring across every shard boundary. Also 2-way and an 8-way (shard
+    // == conv_window+1) split to stress the boundary at the kernel width.
+    let params = LinearAttentionParams {
+        batch: 1,
+        seq_len: 32,
+        num_key_heads: 1,
+        num_value_heads: 2,
+        key_dim: 6,
+        value_dim: 4,
+        conv_kernel: 4,
+        eps: 1.0e-5,
+    };
+    assert_cp_carry_chain_exact(params, 2, "cp=2");
+    assert_cp_carry_chain_exact(params, 4, "cp=4");
+    assert_cp_carry_chain_exact(params, 8, "cp=8");
+}
