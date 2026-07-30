@@ -7,7 +7,7 @@ use crate::{
         Device, cpu_matmul_bt_backward, matmul_bt_output_shape as backend_matmul_bt_output_shape,
         matmul_output_shape as backend_matmul_output_shape,
     },
-    ops::seq_accum::SeqAccum,
+    ops::chunk_accum::{ChunkSum, SeqAccum},
     tape::{BackwardOp, GradPairs, SavedContext, Tape, TapeEntry},
     tensor::{Dirty, Tensor, TensorId, TensorStore},
 };
@@ -423,7 +423,7 @@ fn matmul_bt_lora_backward_tiled(
     let mut grad_a = need_grad_a
         .then(|| SeqAccum::new(vec![m, k], 0, store))
         .transpose()?;
-    let mut grad_b_acc = None;
+    let mut grad_b_acc = ChunkSum::new(false);
 
     let mut row0 = 0usize;
     while row0 < m {
@@ -471,13 +471,12 @@ fn matmul_bt_lora_backward_tiled(
             acc.write_rows(row0, chunk, store)?;
         }
         if let Some(handle) = grad_b_part {
-            grad_b_acc = Some(match grad_b_acc {
-                None => handle,
-                Some(acc) => store.backend().add_into_device(&acc, &handle, b_shape)?,
-            });
+            let part = store.alloc_device_tensor(b_shape.to_vec(), handle)?;
+            grad_b_acc.add(part, store)?;
         }
 
-        let keep = grad_a.as_ref().map(SeqAccum::id).into_iter().collect();
+        let mut keep: HashSet<TensorId> = grad_a.as_ref().map(SeqAccum::id).into_iter().collect();
+        keep.extend(grad_b_acc.id());
         store.free_new_except(&live_before, &keep)?;
         row0 = row1;
     }
@@ -487,10 +486,12 @@ fn matmul_bt_lora_backward_tiled(
         grads.push((a, acc.finish()));
     }
     if need_grad_b {
-        let handle = grad_b_acc.ok_or(AutogradError::TapeInvariant(
-            "matmul_bt lora tiled backward requested grad_b but produced none",
-        ))?;
-        grads.push((b, store.alloc_device_tensor(b_shape.to_vec(), handle)?));
+        let grad_b = grad_b_acc
+            .finish(store)?
+            .ok_or(AutogradError::TapeInvariant(
+                "matmul_bt lora tiled backward requested grad_b but produced none",
+            ))?;
+        grads.push((b, grad_b));
     }
     if upstream_shape != [m, n] {
         return Err(AutogradError::ShapeMismatch {
