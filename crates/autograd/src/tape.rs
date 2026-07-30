@@ -27,6 +27,11 @@ pub enum SavedContext {
     Tensors(SmallVec<[TensorId; 4]>),
     TensorAndScalar(TensorId, f32),
     Shape(Vec<usize>),
+    AllToAllCtx {
+        in_shape: Vec<usize>,
+        scatter_axis: usize,
+        gather_axis: usize,
+    },
     MatmulCtx {
         a: TensorId,
         b: TensorId,
@@ -192,7 +197,8 @@ pub enum SavedContext {
     },
     // Ring-attention context-parallel tile: `blocks` are (k, v, k_abs) TensorIds
     // ring-delivered in forward order; `lse`/`out` are the saved per-row logsumexp
-    // and normalized output the flash-2 backward replays against.
+    // and normalized output the flash-2 backward replays against. `cp_size`/`cp_rank`
+    // drive the device ring's rotation + grad ring-back (1/0 = single-block host path).
     RingAttentionCtx {
         q: TensorId,
         blocks: SmallVec<[(TensorId, TensorId, usize); 4]>,
@@ -201,6 +207,8 @@ pub enum SavedContext {
         rows: usize,
         dim: usize,
         q_abs: usize,
+        cp_size: usize,
+        cp_rank: usize,
     },
 }
 
@@ -242,6 +250,7 @@ pub enum BackwardOp {
     AllReduceSum,
     AllGatherSeq,
     ReduceScatterSum,
+    AllToAll,
     EpDispatch,
     EpCombine,
     RingAttention,
@@ -288,6 +297,7 @@ impl BackwardOp {
             BackwardOp::AllReduceSum => "AllReduceSum",
             BackwardOp::AllGatherSeq => "AllGatherSeq",
             BackwardOp::ReduceScatterSum => "ReduceScatterSum",
+            BackwardOp::AllToAll => "AllToAll",
             BackwardOp::EpDispatch => "EpDispatch",
             BackwardOp::EpCombine => "EpCombine",
             BackwardOp::RingAttention => "RingAttention",
@@ -844,6 +854,9 @@ impl Tape {
                     }
                     BackwardOp::ReduceScatterSum => {
                         ops::reduce_scatter_sum_backward(&entry, output_grad_id, store)?
+                    }
+                    BackwardOp::AllToAll => {
+                        ops::all_to_all_backward(&entry, output_grad_id, store)?
                     }
                     BackwardOp::EpDispatch => {
                         ops::collective_ep::ep_dispatch_backward(&entry, output_grad_id, store)?

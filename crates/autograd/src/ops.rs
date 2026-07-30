@@ -49,7 +49,8 @@ pub(crate) use activation::{exp_backward, gelu_backward, sigmoid_backward, silu_
 pub(crate) use attention::{cat_heads_backward, cat_seq_backward, causal_sdpa_recompute_backward};
 pub(crate) use broadcast::add_broadcast_backward;
 pub(crate) use collective::{
-    all_gather_seq_backward, all_reduce_sum_backward, reduce_scatter_sum_backward,
+    all_gather_seq_backward, all_reduce_sum_backward, all_to_all_backward,
+    reduce_scatter_sum_backward,
 };
 pub(crate) use elementwise::{add_backward, mul_backward, mul_scalar_backward};
 pub(crate) use embed::embedding_backward;
@@ -99,6 +100,16 @@ pub fn reduce_scatter_sum(
     tape: &mut Tape,
 ) -> Result<TensorId> {
     collective::reduce_scatter_sum(x, local_shape, store, tape)
+}
+
+pub fn all_to_all(
+    x: TensorId,
+    scatter_axis: usize,
+    gather_axis: usize,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<TensorId> {
+    collective::all_to_all(x, scatter_axis, gather_axis, store, tape)
 }
 
 pub fn gelu(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {

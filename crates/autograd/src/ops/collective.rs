@@ -232,6 +232,109 @@ pub(crate) fn reduce_scatter_sum_backward(
     Ok(smallvec![(x, grad_id)])
 }
 
+/// Differentiable all-to-all that swaps a *scatter* axis for a *gather* axis —
+/// the linear-attention CP transport (Megatron `MambaContextParallel`). Forward
+/// splits `scatter_axis` across ranks and concatenates each rank's slice along
+/// `gather_axis`: `[seq/N, b, hidden]` → `[seq, b, hidden/N]` (full sequence for
+/// 1/N of the heads). It is self-adjoint with the two axes swapped, so backward
+/// is the same op reversed. Single-rank / CPU is identity (`out_shape ==
+/// in_shape`), which is the locally-verifiable core; the multi-rank NCCL shuffle
+/// is pod-gated like the other collectives.
+pub fn all_to_all(
+    x: TensorId,
+    scatter_axis: usize,
+    gather_axis: usize,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<TensorId> {
+    store.ensure_device(x)?;
+    let (in_shape, input_handle) = {
+        let tensor = store.tensor(x)?;
+        let handle = tensor
+            .device_handle
+            .as_ref()
+            .ok_or(AutogradError::TapeInvariant(
+                "all_to_all: ensure_device left tensor without a device handle",
+            ))?
+            .clone();
+        (tensor.shape.clone(), handle)
+    };
+
+    let (out_handle, out_shape) =
+        store
+            .backend()
+            .all_to_all_device(&input_handle, &in_shape, scatter_axis, gather_axis)?;
+    let output_id = store.alloc_device_tensor(out_shape, out_handle)?;
+
+    TapeEntry {
+        op: BackwardOp::AllToAll,
+        output_id,
+        input_ids: smallvec![x],
+        saved: SavedContext::AllToAllCtx {
+            in_shape,
+            scatter_axis,
+            gather_axis,
+        },
+    }
+    .record(store, tape)?;
+
+    Ok(output_id)
+}
+
+pub(crate) fn all_to_all_backward(
+    entry: &TapeEntry,
+    output_grad_id: TensorId,
+    store: &mut TensorStore,
+) -> Result<GradPairs> {
+    let x = *entry
+        .input_ids
+        .first()
+        .ok_or(AutogradError::TapeInvariant("all_to_all missing input"))?;
+    if !store.tensor(x)?.requires_grad {
+        return Ok(GradPairs::new());
+    }
+    let SavedContext::AllToAllCtx {
+        in_shape,
+        scatter_axis,
+        gather_axis,
+    } = &entry.saved
+    else {
+        return Err(AutogradError::TapeInvariant(
+            "all_to_all backward missing saved context",
+        ));
+    };
+    let (in_shape, scatter_axis, gather_axis) = (in_shape.clone(), *scatter_axis, *gather_axis);
+
+    store.ensure_device(output_grad_id)?;
+    let (upstream_handle, upstream_shape) = {
+        let tensor = store.tensor(output_grad_id)?;
+        let handle = tensor
+            .device_handle
+            .as_ref()
+            .ok_or(AutogradError::TapeInvariant(
+                "all_to_all backward: upstream missing device handle",
+            ))?
+            .clone();
+        (handle, tensor.shape.clone())
+    };
+    // Adjoint = the same shuffle with scatter/gather swapped, mapping the upstream
+    // grad back to this rank's input shape.
+    let (grad_handle, grad_shape) = store.backend().all_to_all_device(
+        &upstream_handle,
+        &upstream_shape,
+        gather_axis,
+        scatter_axis,
+    )?;
+    if grad_shape != in_shape {
+        return Err(AutogradError::ShapeMismatch {
+            expected: in_shape,
+            got: grad_shape,
+        });
+    }
+    let grad_id = store.alloc_device_tensor(in_shape, grad_handle)?;
+    Ok(smallvec![(x, grad_id)])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -284,6 +387,34 @@ mod tests {
         let grads = tape.backward(loss, &mut store)?;
         assert_eq!(store.to_host(y)?, vec![2.0, 5.0, -1.0]);
         assert_eq!(store.to_host(grads[&x])?, vec![1.0, 1.0, 1.0]);
+        Ok(())
+    }
+
+    // world==1: all_to_all is identity on shape and value (no rank to shuffle to),
+    // and self-adjoint — the backward is the same op with axes swapped, which at
+    // N=1 is also identity. Tier-1 linear-attn CP gate, runnable on CPU before any
+    // NCCL wiring. `[seq/N,b,hidden] -> [seq,b,hidden/N]` collapses to identity.
+    #[test]
+    fn all_to_all_single_rank_is_identity() -> Result<()> {
+        let mut store = TensorStore::default();
+        let mut tape = Tape::new();
+        let x = store.alloc(Tensor::new(
+            vec![1.0, -2.0, 3.5, 4.0, 5.0, -6.0],
+            vec![3, 1, 2],
+            true,
+        )?);
+        // scatter seq (axis 0) into head (axis 2): identity at world==1.
+        let y = all_to_all(x, 0, 2, &mut store, &mut tape)?;
+        let yy = ops::mul(y, y, &mut store, &mut tape)?;
+        let loss = ops::sum(yy, &mut store, &mut tape)?;
+
+        let grads = tape.backward(loss, &mut store)?;
+        assert_eq!(store.tensor(y)?.shape, vec![3, 1, 2]);
+        assert_eq!(store.to_host(y)?, vec![1.0, -2.0, 3.5, 4.0, 5.0, -6.0]);
+        assert_eq!(
+            store.to_host(grads[&x])?,
+            vec![2.0, -4.0, 7.0, 8.0, 10.0, -12.0]
+        );
         Ok(())
     }
 }
