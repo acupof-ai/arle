@@ -773,8 +773,8 @@ fn qkv_elems(p: LinearAttentionParams) -> usize {
     2 * p.num_key_heads * p.key_dim + p.num_value_heads * p.value_dim
 }
 
-/// The taped f32 inputs the row kernel reads, one row's worth: qkv, z, b_proj,
-/// a_proj. Both byte counts below include it, so summing them double-counts.
+/// The row kernel's taped f32 inputs: qkv, z, b_proj, a_proj. Both byte counts
+/// below include it, so summing them double-counts.
 fn taped_input_elems(p: LinearAttentionParams) -> usize {
     qkv_elems(p) + p.num_value_heads * p.value_dim + 2 * p.num_value_heads
 }
@@ -788,8 +788,8 @@ pub fn linear_attention_ctx_bytes(params: LinearAttentionParams) -> usize {
     params.batch * (4 * f32_elems + 2 * bf16_elems)
 }
 
-/// Bytes `..._forward_device_row` holds live until it returns. Beside the kernel
-/// so a buffer change and its count move together.
+/// Live bytes inside `..._forward_device_row`. Beside the kernel so a buffer
+/// change and its count move together.
 pub fn linear_attention_row_transient_bytes(params: LinearAttentionParams) -> usize {
     let (hv, kd, vd) = (params.num_value_heads, params.key_dim, params.value_dim);
     // f32: a_tril, g_cumsum, plus the taped inputs.
@@ -802,8 +802,7 @@ pub fn linear_attention_row_transient_bytes(params: LinearAttentionParams) -> us
         .saturating_mul(4 * f32_elems + 2 * bf16_elems)
 }
 
-/// Pinned so editing the row kernel's buffers, or what it retains, forces a
-/// deliberate recount here.
+/// Pinned so editing the row kernel's buffers forces a deliberate recount.
 #[test]
 fn linear_attention_byte_counts_are_pinned() {
     let p = LinearAttentionParams {
