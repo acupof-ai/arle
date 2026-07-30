@@ -21,47 +21,74 @@ Screening compares new runs against the champion row — no second arm. Rules:
    fingerprints, or the one-shot 32k dataset that could never hit the prefix
    cache. Historical evidence, not comparison targets; re-anchor first.
 
-The canonical shape is the bench spec's TraceLab median — 119K prefix tokens:
-
 ```
 python3 scripts/gen_bench_prompts.py bench-agent-119k-16x8.jsonl 16 119000 214 8
 ```
 
-**Every row below deviates to 32K, and the deviation is KV budget, not choice.**
-The dense arm's 16 full-attention layers hold 4 kv_heads × 256 head_dim × 2 ×
-bf16 = 4 KB per token per layer, so **64 KB per token**: 119K × 16 concurrent
-needs **122 GB** of KV against the ~69 GB left after 27B FP8 weights on a 96 GB
-H20. 32K needs 36 GB and fits. Rule 3 makes prefix length part of the
-fingerprint, so a 119K row is a *new* anchor at lower concurrency, not a
-re-measure of these — and until one exists, no row here satisfies rule 5 at the
-TraceLab median. Deviating is allowed; the spec requires the deviation be a
-stated parameter, which is what this paragraph is.
+**Stated deviation: every row runs 32K, not the spec's 119K median.** Dense KV is
+64 KB/token (16 full-attn layers × 4 kv_heads × 256 head_dim × 2 × bf16), so
+119K×c16 needs 122 GB against ~69 GB free after weights; 32K needs 36 GB. Per
+rule 3 a 119K row is a new anchor, not a re-measure — until one exists, nothing
+here meets rule 5.
 
 ## Qwen3.6 on 1×H20 · single-GPU · eager — LONG-AGENT ANCHOR
 
 ### CHAMPION (DSpark arm) — `51985031d` (2026-07-30) · batched draft / replay / snapshot / capture / markov+confidence · `arle-mk`
 
-**A spec row carries its accept rate.** Two drafts at the same TPOT are not the
-same result — `tok/row` (committed tokens per verify row, against plain decode's
-1.0) is what says whether the margin survives more concurrency. Rows before this
-one have no accept column; re-measure before comparing them on it. `prefill
-tok/s` is dropped: the pre-2026-07-30 rows' formula isn't reproducible from the
-report, and TTFT is the prefill SLO.
+Two drafts at one TPOT are not one result, so a spec row carries `tok/row`
+(committed tokens per verify row; plain decode = 1.0). Earlier rows lack it —
+re-measure before comparing. `prefill tok/s` dropped: formula not reproducible,
+and TTFT is the prefill SLO.
 
-| c | arm | TTFT cold | TTFT warm | TPOT | step | decode tok/s | total tok/s | prefix hit | accept | tok/row |
-|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 1 | dense DSpark 6 | 19.3 s | 1.1 s | 9.80 ms | 34.8 ms | 102.0 | 7440.7 | 0.883 | 0.509 | 0.591 |
-| 8 | dense DSpark 6 | — | 0.7 s | 60.70 ms | 145.7 ms | 16.5 | 31754.1 | 1.000 | 0.280 | 0.400 |
-| 16 | dense DSpark 6 | 6.8 s | 1.2 s | 109.43 ms | 262.7 ms | 9.1 | 32559.0 | 1.000 | 0.280 | 0.400 |
+| c | arm | pt | TTFT cold | TTFT warm | TPOT | burst | decode tok/s | total tok/s | occ | prefix hit | accept | tok/row |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | dense DSpark 6 | 1st | 19.3 s | 1.1 s | 9.80 ms | 34.8 ms | 102.0 | 7440.7 | 0.26 | 0.883 | 0.509 | 0.591 |
+| 2 | dense DSpark 6 | 1st | — | 1.2 s | 31.26 ms | 110.8 ms | 32.0 | 8292.3 | 0.47 | 0.883 | 0.509 | 0.591 |
+| 4 | dense DSpark 6 | 2nd | — | 0.5 s | 32.10 ms | 78.2 ms | 31.2 | 25432.8 | 0.85 | 1.000 | 0.287 | 0.406 |
+| 8 | dense DSpark 6 | 2nd | — | 0.7 s | 60.70 ms | 145.7 ms | 16.5 | 31754.1 | 0.87 | 1.000 | 0.280 | 0.400 |
+| 16 | dense DSpark 6 | 3rd | 6.8 s | 1.2 s | 109.43 ms | 262.7 ms | 9.1 | 32559.0 | 0.87 | 1.000 | 0.280 | 0.400 |
 
-**`step` replaces ITL p50 on a spec row, and ITL p50 must not be reported for
-one.** A spec step emits `k+1` tokens back-to-back, so most recorded ITLs are the
-within-chain gap, not the step: `dflash6` at c=16 reads p50 **0.02 ms** against
-p90 476.8 ms, where the no-spec row's 66.00 / 444.6 is the honest steady-state
-step. `step = TPOT × (accepted+chains)/chains`, free from the `/stats`
-`spec_decode` counters, is the comparable quantity — the no-spec champion's c=16
-step is 124.81 ms, so this arm verifies 96 rows in 2.1× the time to commit 2.4×
-the tokens.
+c=2/c=4 carry `TTFT p50` in the warm column — that runner does not separate turn 0.
+Re-run through `row.py` before quoting a cold TTFT there.
+
+**`pt` (point position within its serve) is in the table because `accept` tracks
+it, not `c`.** A serve's first point misses the dataset's 16 turn-0 sessions
+(113/128 = 0.883); later points inherit the previous point's cache (128/128), and
+`accept` splits on the same line: 0.509 at both 1st points (c=1 *and* c=2, in
+different serves) vs 0.280-0.287 later. Settled at matched `c`: `FR t0` as the
+*sole* point of a fresh serve at c=16 gives accept **0.532** / tok/row 0.610
+against **0.313** / 0.428 at the same c=16 as a later point — **+70% from cache
+state, `c` fixed**. So "accept halves at concurrency" is **withdrawn** here and in
+the linked win. Mechanism: `df.rebase()` (`executor/qwen35.rs:1460`, `:1842`) — a
+prefix hit skips the trunk prefill and leaves the draft suffix-only, matching
+`partial_ctx_chains/chains` 0.75 → 1.00.
+
+That cold point is **not** a TPOT trial for this row (235.54 ms / 4.2 tok/s vs
+104.73 / 9.5 warm — all 128 requests pay a full 35K prefill); cache state is part
+of the fingerprint under rule 3. It does price the cold operating point at **2.2×
+warm TPOT**.
+
+`prefix hit` is a **delta** of the cumulative `/stats` counters — the `hit_rate`
+field is lifetime-cumulative (0.872/0.933/0.955) and per-point reporting of it is
+wrong. c=1/c=2 share byte-identical `chains`/`mean_k`/`accept`: greedy on fixed
+prompts is deterministic, so a difference between two points means their
+*contexts* differed, not their sampling.
+
+**`burst` replaces ITL p50 on a spec row; ITL p50 must not be reported for one.**
+A spec step emits `k+1` tokens back-to-back, so most recorded ITLs are the
+within-chain gap — `dflash6` c=16 reads p50 **0.02 ms** / p90 476.8 against the
+no-spec row's honest 66.00 / 444.6. `burst = TPOT × (accepted+chains)/chains` is
+the interval between one request's bursts, free from `/stats`, and degenerates to
+TPOT at `mean_k` 0 — so the two compare directly: this arm takes 2.1× the no-spec
+c=16 burst (262.7 vs 124.81 ms) to commit 2.4× the tokens.
+
+**`burst` is not the GPU step; it only tracks one where `occ` is high.** `occ` =
+`out tok/s / (c × decode tok/s)` is the fraction of wall clock a slot spends
+decoding rather than waiting on prefill. At **0.26 (c=1) and 0.47 (c=2)**,
+`steps = chains/c` over-counts idle slots and inflates `burst` by ~1/occ — the
+c=1→c=2 jump 34.8 → 110.8 ms is mostly that artifact, not a 3× step. From c=4 on
+`occ` is 0.85-0.87 (no-spec 0.89), close enough for same-`c` cross-arm reads.
+Never read `burst` as a kernel cost.
 
 Re-measure of the `d05d0aee6` row on the markov/confidence batching binary:
 TPOT 9.77 → 9.80 / 60.74 → 60.70 / 107.94 → 109.43 ms (**+0.3 / −0.07 / +1.4%**,
@@ -74,27 +101,31 @@ Serve adds `--spec-type dspark --mtp-draft-model Qwen3.6-27B-DFlash
 --dspark-block-size 6`; `--spec-max-batch` is the shipped default 16.
 Gate exact=3 DET at 512/4k/16k/32k. 0 errors. 126/128.
 
-**Candidate, not yet a champion — `dspark-fr-native` + `--dspark-conf-threshold 0`**
-(`arle-mk`, same binary and fingerprint as the row above). At rows and depth
-matched exactly to this champion (96 rows, depth 5.00): c=1 decode 107.2 tok/s
-(**+5.1%**), c=16 TPOT 104.73 ms (**−4.3%**), step 268.7 ms, tok/row 0.428
-(**+7.0%**). Gate exact=3 DET at 512/4k/16k/32k. Threshold 0 makes the confidence
-head execute and truncate nothing — with its default 0.5 the same checkpoint loses
+**Challenger, REJECTED as a champion change — `dspark-fr-native`** (`arle-mk`,
+same fingerprint). Predicts better everywhere (`tok/row` 0.620 vs 0.591 at 1st
+points, 0.428 vs 0.400-0.406 later), gate exact=3 DET at 512/4k/16k/32k — but
+TPOT is mixed:
+
+| c | `dflash6` TPOT | challenger TPOT | Δ |
+|---:|---:|---:|---:|
+| 1 | 9.80 ms | 9.33 ms | **−4.8%** |
+| 2 | 31.26 ms | 35.51 ms | **+13.6% worse** |
+| 4 | 32.10 ms | 31.96 ms | −0.4% |
+| 8 | 60.70 ms | 60.41 ms | −0.5% |
+| 16 | 109.43 ms | 104.73 ms | **−4.3%** |
+
+Both ends by 4-5%, loses c=2 by 13.6%, washes at c=4/8 — rule 2, no champion
+change. **The first version called it a candidate off c=1 and c=16 alone; adding
+c=2/4/8 reversed it.** Two ends are not a sweep. Open: the c=2 loss is
+unexplained, and the c=16 points sit at different `pt` (2nd vs 3rd).
+`--dspark-conf-threshold` is now default 0 — at the old 0.5 this checkpoint lost
 34% ([win](experience/wins/2026-07-30-dspark-markov-confidence-batched.md)).
-Blocking a flip: the c=8 point, rule 2's third trial, and a decision on shipping a
-checkpoint with its own head switched off.
 
-**Missing points, pending a free GPU: c=2 and c=4.** The `--spec-max-batch` flip
-that created this arm was licensed on +77% / +71% there — the largest gains — so
-the region where speculation pays most is not in this table.
-
-**The accept rate itself halves at concurrency** (0.509 → 0.280), and every chain
-at c≥8 drafts on a rebased context (`partial_ctx_chains/chains` 0.75 → 1.00)
-while prefix reuse *improves* (0.883 → 1.000). A prefix-cache or sidecar restore
-skips the trunk prefill, so `df.rebase()` (`executor/qwen35.rs:1460`, `:1842`)
-leaves the draft holding a suffix-only context. Correlation with a named probe,
-not a root cause: count rebases per request and bucket accept by
-`ctx_end - ctx_base` at chain time.
+**The c=2/c=4 region is healthy.** The denominator now exists (`arle-mk`, no spec
+flags): no-spec TPOT **78.40 ms at c=2, 64.67 at c=4**, so `dflash6` runs 2.5×
+and 2.0× the no-spec rate there. Per-request decode being worst at those points
+(32.0 / 31.2 tok/s against 102.0 at c=1) is the no-spec arm's shape too, not a
+spec defect.
 
 ### CHAMPION (no-spec) — `a956f69b1` (2026-07-28) · KV mirror + batched FA3 · `arle-fa3b2`
 
@@ -118,10 +149,10 @@ bounded under 2.3%, so those rolling verdicts hold. The audit ran alongside four
 other arms on separate GPUs and still reproduced, which also bounds the
 concurrent-arm perturbation.
 
-Open, one point: the same no-spec arm on `51985031d` reads 28.71 / **84.47** /
-124.81 ms — c=1 and c=16 match the archive, c=8 is +2.8% against it. At the band
-edge, not reproduced at the other two points; rule 2 escalation (≥3 trials/arm) if
-it recurs.
+The same no-spec arm on `51985031d` reads 28.71 / **84.47** / 124.81 ms — c=1 and
+c=16 match the archive, c=8 is +2.8%. Band edge, not reproduced at the other two
+points; rule 2 escalation (≥3 trials/arm) if it recurs. It also supplies the
+c=2/c=4 points the archive lacks: **78.40 / 64.67 ms** (decode 12.8 / 15.5 tok/s).
 
 ### PRIOR — `55bf627bc` (2026-07-28) · FA3 paged, qlen ≤ 64 · `arle-fa3c`
 

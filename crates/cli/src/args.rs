@@ -725,10 +725,11 @@ pub(crate) struct ServeArgs {
     #[arg(long, value_name = "PATH_OR_REPO")]
     pub(crate) mtp_draft_model: Option<String>,
 
-    /// DSpark confidence-head truncation threshold: proposals are cut at the
-    /// first position with sigmoid(confidence) below it. Checkpoints without
-    /// the head ignore it.
-    #[arg(long, default_value_t = 0.5, value_name = "T")]
+    /// Cut proposals at the first position with sigmoid(confidence) below this.
+    /// `0` (default) skips the head: a verify row is 0.2% of the step, so saved
+    /// rows never pay for the ragged chain left behind (block 6 c=16 TPOT
+    /// 104.73 → 159.68 ms at 0.5).
+    #[arg(long, default_value_t = 0.0, value_name = "T")]
     pub(crate) dspark_conf_threshold: f32,
 
     /// Spawn the DSpark train sidecar alongside `--spec-type dspark` serving.
@@ -1153,8 +1154,8 @@ pub(crate) struct OpdRuntimeArgs {
     pub(crate) dspark_draft_model: Option<PathBuf>,
 
     /// DSpark confidence-head truncation threshold for --dspark-draft-model
-    /// (matches serve's default).
-    #[arg(long, default_value_t = 0.5, value_name = "T")]
+    /// (matches serve's default: 0 = off).
+    #[arg(long, default_value_t = 0.0, value_name = "T")]
     pub(crate) dspark_conf_threshold: f32,
 
     /// Whole-step Qwen3.5/3.6 decode graph for the in-process rollout engine
