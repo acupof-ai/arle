@@ -344,6 +344,195 @@ pub fn linear_attention_core(
     Ok(output_id)
 }
 
+/// Context-parallel gated-delta attention: all-to-all the sequence shard into the
+/// head axis, run the full-sequence recurrence on this rank's head slice, all-to-all
+/// back. Model-agnostic — parameterized by `LinearAttentionParams`, so any
+/// gated-delta / Mamba-hybrid model reuses it (the sibling of `cp_causal_sdpa` for
+/// full attention). `cp_size == 1` is `linear_attention_core` verbatim (byte-
+/// identical single card). This mirrors Megatron's gated-delta-net CP: the fused
+/// qkv rides one all-to-all per region and the packed conv weight is section-sliced
+/// per rank — `linear_attention_core`'s interface is untouched.
+///
+/// Correctness rests on head independence: the recurrence never crosses value-heads
+/// (state, conv taps, `a_log[h]`, `dt_bias[h]`, `beta[h]`, per-head rmsnorm are all
+/// head-local), so running it on a 1/N head slice and concatenating == running on
+/// all heads. That math is proven GPU-free by the head-split parity test; the a2a
+/// transport (world>1) is pod-only (`all_to_all` world>1 is pending-remote NCCL).
+///
+/// `params.seq_len` is this rank's shard; the full sequence is `seq_len * cp_size`.
+/// Requires `num_{value,key}_heads % cp_size == 0`.
+#[allow(clippy::too_many_arguments)]
+pub fn linear_attention_core_cp(
+    qkv: TensorId,
+    z: TensorId,
+    b_proj: TensorId,
+    a_proj: TensorId,
+    conv1d_weight: TensorId,
+    dt_bias: TensorId,
+    a_log: TensorId,
+    norm_weight: TensorId,
+    params: LinearAttentionParams,
+    cp_size: usize,
+    cp_rank: usize,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<TensorId> {
+    if cp_size <= 1 {
+        return linear_attention_core(
+            qkv,
+            z,
+            b_proj,
+            a_proj,
+            conv1d_weight,
+            dt_bias,
+            a_log,
+            norm_weight,
+            params,
+            store,
+            tape,
+        );
+    }
+    let n = cp_size;
+    if !params.num_value_heads.is_multiple_of(n) || !params.num_key_heads.is_multiple_of(n) {
+        return Err(AutogradError::TapeInvariant(
+            "linear_attention_core_cp: num_value_heads and num_key_heads must divide cp_size",
+        ));
+    }
+    let batch = params.batch;
+    let local_seq = params.seq_len;
+    let full_seq = local_seq * n;
+    let (q_dim, k_dim, v_dim) = (
+        params.num_key_heads * params.key_dim,
+        params.num_key_heads * params.key_dim,
+        params.num_value_heads * params.value_dim,
+    );
+
+    // qkv packs [q|k|v] with different head widths, so a contiguous dim/N slice
+    // would cut a region. Split to q/k/v, all-to-all each to its head slice (heads
+    // are outer within a region, so dim/N == this rank's head range), re-fuse.
+    // z/b/a are single regions — one all-to-all each.
+    let q = crate::ops::slice(qkv, &[0, 0, 0], &[batch, local_seq, q_dim], store, tape)?;
+    let k = crate::ops::slice(
+        qkv,
+        &[0, 0, q_dim],
+        &[batch, local_seq, q_dim + k_dim],
+        store,
+        tape,
+    )?;
+    let v = crate::ops::slice(
+        qkv,
+        &[0, 0, q_dim + k_dim],
+        &[batch, local_seq, q_dim + k_dim + v_dim],
+        store,
+        tape,
+    )?;
+    let q = crate::ops::all_to_all(q, 1, 2, store, tape)?;
+    let k = crate::ops::all_to_all(k, 1, 2, store, tape)?;
+    let v = crate::ops::all_to_all(v, 1, 2, store, tape)?;
+    let qkv = crate::ops::cat(&[q, k, v], 2, store, tape)?;
+    let z = crate::ops::all_to_all(z, 1, 2, store, tape)?;
+    let b_proj = crate::ops::all_to_all(b_proj, 1, 2, store, tape)?;
+    let a_proj = crate::ops::all_to_all(a_proj, 1, 2, store, tape)?;
+
+    // Frozen weights sliced to this rank's head range. conv1d packs [q|k|v] on the
+    // channel axis (same region surgery); dt_bias/a_log are per-value-head; norm is
+    // per-value_dim (shared across heads → unsliced). Read-only slices — base
+    // tensors, not LoRA, so no gradient reassembly.
+    let (kh_l, vh_l) = (params.num_key_heads / n, params.num_value_heads / n);
+    let conv1d_weight = slice_conv_weight_to_head(
+        conv1d_weight,
+        params.num_key_heads,
+        params.num_value_heads,
+        params.key_dim,
+        params.value_dim,
+        cp_rank,
+        n,
+        store,
+        tape,
+    )?;
+    let dt_bias = crate::ops::slice(
+        dt_bias,
+        &[cp_rank * vh_l],
+        &[(cp_rank + 1) * vh_l],
+        store,
+        tape,
+    )?;
+    let a_log = crate::ops::slice(
+        a_log,
+        &[cp_rank * vh_l],
+        &[(cp_rank + 1) * vh_l],
+        store,
+        tape,
+    )?;
+
+    let local_params = LinearAttentionParams {
+        batch,
+        seq_len: full_seq,
+        num_key_heads: kh_l,
+        num_value_heads: vh_l,
+        ..params
+    };
+    let out = linear_attention_core(
+        qkv,
+        z,
+        b_proj,
+        a_proj,
+        conv1d_weight,
+        dt_bias,
+        a_log,
+        norm_weight,
+        local_params,
+        store,
+        tape,
+    )?;
+    // [b, full_seq, v_dim/N] -> [b, local_seq, v_dim]: sequence shard restored.
+    crate::ops::all_to_all(out, 2, 1, store, tape)
+}
+
+/// Slice the packed `[qkv_dim, conv_kernel]` conv weight to this cp rank's head
+/// range. conv_dim packs q|k|v channel regions; the rank owns a contiguous head
+/// slice within each, gathered and re-fused so the local weight matches the a2a'd
+/// activation layout.
+#[allow(clippy::too_many_arguments)]
+fn slice_conv_weight_to_head(
+    conv1d_weight: TensorId,
+    num_key_heads: usize,
+    num_value_heads: usize,
+    key_dim: usize,
+    value_dim: usize,
+    cp_rank: usize,
+    cp_size: usize,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<TensorId> {
+    let (q_dim, k_dim) = (num_key_heads * key_dim, num_key_heads * key_dim);
+    let (qk_local, v_local) = (
+        num_key_heads / cp_size * key_dim,
+        num_value_heads / cp_size * value_dim,
+    );
+    let conv_kernel = store.tensor(conv1d_weight)?.shape[1];
+    // Region base offsets and this rank's local widths: [q | k | v].
+    let regions = [
+        (0usize, qk_local),
+        (q_dim, qk_local),
+        (q_dim + k_dim, v_local),
+    ];
+    let sliced: Vec<TensorId> = regions
+        .iter()
+        .map(|&(base, width)| {
+            let start = base + cp_rank * width;
+            crate::ops::slice(
+                conv1d_weight,
+                &[start, 0],
+                &[start + width, conv_kernel],
+                store,
+                tape,
+            )
+        })
+        .collect::<Result<_>>()?;
+    crate::ops::cat(&sliced, 0, store, tape)
+}
+
 /// Host reference with recurrent and convolution carry.
 #[allow(clippy::too_many_arguments)]
 pub fn linear_attention_core_with_carry(
