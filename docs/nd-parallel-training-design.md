@@ -16,7 +16,7 @@ private duplicate configs.
 | Axis | Core landed + CPU-gated | Pending-remote (pod NCCL) |
 |---|---|---|
 | **Mesh** | `train_mesh()` → `MultiAxisConfig`+`RankCoord`; `CpContext`/`Qwen35TensorParallelConfig`/`DpContext`/`PpContext` are derived views, one source of truth | — |
-| **CP** | option B live + converged; ring option-A is a **live tape op** (`cp_causal_sdpa`, `BackwardOp::RingAttention`) — world==1 taped grad matches `causal_sdpa_recompute`, multi-block merge+backward matches full-softmax reference | ring KV NCCL transport (remote blocks → same tile kernels); model N=2 parity; default stays option B |
+| **CP** | option B live + converged; ring option-A is a **live tape op** (`cp_causal_sdpa`, `BackwardOp::RingAttention`) — world==1 taped grad matches `causal_sdpa_recompute`, multi-block merge+backward matches full-softmax reference | **ladder measured (2026-07-30): option B fits 256K, no OOM** — ring NOT needed for memory. The real 256K blocker is a post-backward CP-collective hang (§8), not the KV wall. Default stays option B. |
 | **TP** | attention-TP live; **MoE-TP** built (column/row-parallel experts+shared, `maybe_tp_all_reduce`) | MoE finite-diff on ≥2 GPU |
 | **EP** | **live tape op** — `ep_dispatch_op`/`ep_combine_op` (`BackwardOp::EpDispatch`/`EpCombine`), backward = the transpose; dropped token gets zero grad; gated through the real tape | NCCL all-to-all transport; capacity + router aux loss; qwen35 routing hook |
 | **DP** | **wired end-to-end** — `DpContext` threaded into `masked_writeback_step`; global count all-reduce for `inv_n`; grad-reduce gate `(cp‖dp)`; `--dp-size` launcher; world==1 byte-identical | multi-rank correctness (≥2 GPU); combined CP×DP (`ncclCommSplit` subgroups) |
@@ -60,7 +60,7 @@ may depend on it without breaching backend isolation.
 
 | Axis | Train-side state (file:line) | Gap to "supported" |
 |---|---|---|
-| **CP** | option B implemented + converged onto the mesh: `cp.is_enabled()` branch qwen35.rs L1674 all-gathers full KV → `causal_sdpa_recompute_with_q_start(q,k_full,v_full,q_start)` L1717. Local shard-parity unit-tested; model-level N=2 loss parity is the pending-remote `nd_parallel_parity` gate | attention **not sharded** — rank N-1 holds full KV + full scores → OOM at 256K. Needs ring (option A). |
+| **CP** | option B implemented + converged onto the mesh: `cp.is_enabled()` branch qwen35.rs L1674 all-gathers full KV → `causal_sdpa_recompute_with_q_start(q,k_full,v_full,q_start)` L1717. Local shard-parity unit-tested; N=2 loss parity PASSES on pod (rel_err 4.19e-5) | KV **not sharded** — every rank gathers full KV (O(full_seq), ~1 GB/layer bf16 @256K). No "full scores": the fused forward is a flash-2 kernel (`nonpaged_prefill_attention.cu`), no `[seq,seq]` transient. Ladder (2026-07-30) proved option B fits 256K, so the ring is a memory optimization that isn't currently needed — not a correctness gap. |
 | **TP** | attention-TP proven `a2_qwen35_tp_lora_fd.rs` L181/L191; `maybe_tp_all_reduce` L313 | **MoE MLP rejects TP** ("requires single-rank TP" L1256/L1282/L1319). MoE-TP unbuilt. |
 | **EP** | **train side has none.** DeepEP dispatch/combine exist only in *serving* (`infer-cuda/moe.rs` `dsv4_moe_forward_deepep` L3781); train MoE uses grouped-linear on token rows (qwen35.rs L1355-1401), no all-to-all | Bring differentiable all-to-all into train MoE + its backward. **Real work, not wiring.** |
 | **DP** | CP's post-backward weight all-reduce (`all_reduce_cp_grads`, opd.rs L3238) is already DP-semantics | Batch-shard dataloader on `attn_dp_size>1`. Near-free once mesh drives it. |
@@ -222,8 +222,21 @@ send/recv, MoE-TP finite-diff. All need a pod (≥2 GPU + NCCL); none is locally
 verifiable, so none is a default flip yet. Option B stays CP's default until the
 ring passes pod parity.
 
-**Next binding constraint:** the pod seq-ladder to measure the linear-attn CP
-activation peak at 256K (§6.3, unmeasured) — it decides whether the ring
-full-attn path alone fits 256K or whether linear-attn boundary-gradient sharding
-becomes mandatory. Measure before flipping the ring on.
+**Next binding constraint (MEASURED 2026-07-30):** the pod seq-ladder ran — cp=4,
+27B FP8, 4×H20. **Option B fits 256K: every rung 65536→262144 completed forward
+AND backward with no OOM** (262144 peak 96.4/97.9 GB, `[ckpt-gate]` auto-engaging
+checkpointing). Peak is checkpoint-recompute-bounded, not O(full_seq) — 131072→
+196608 peak *dropped* (81→79 GB). So the CP ring / EP / linear-attn sharding are
+NOT required for 256K on memory grounds; the §6.3 linear-attn peak did not bind.
+See `docs/experience/wins/2026-07-30-cp-ladder-option-b-fits-256k.md`.
+
+The ladder surfaced the ACTUAL next wall, which the memory argument was blind to:
+262144 completed both memory-heavy phases then **hung post-backward in the CP
+collective** (3 of 4 ranks flushed `phase=backward`, all parked in NCCL
+busy-wait). A seq-scale-specific collective desync, not a memory wall. Ruled out:
+ckpt-gate (engage byte-identical across ranks), empty-shard `sum·0` (no empty
+shard at 65536 local), generic checkpoint-recompute-under-CP (seq=8192 + forced
+checkpoint completes lockstep). Surviving suspect: the >65535 chunked-SDPA branch
+(`attention.rs:171`) — 262144/cp=4 is the only rung whose local seq (65536)
+crosses it. This desync — not the ring — is what blocks a completing 256K step.
 
