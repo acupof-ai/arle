@@ -14,7 +14,7 @@
 use super::*;
 
 use crate::ops::rms_norm_batch;
-use qwen35_spec::{DsparkConfig, dspark_tensor_names};
+use qwen35_spec::{DsparkConfig, DsparkSps, dspark_tensor_names, dspark_verify_lens};
 
 struct DsparkLayer {
     /// Gate-padded `[2*q_dim, hidden]`: head `h` occupies rows
@@ -58,8 +58,8 @@ pub(crate) struct Qwen35DsparkHead {
     layers: Vec<DsparkLayer>,
     markov: Option<DsparkMarkovHead>,
     confidence: Option<DsparkConfidenceHead>,
-    /// sigmoid(conf) < threshold truncates the proposal (`--dspark-conf-threshold`).
-    confidence_threshold: f32,
+    /// Verify-step cost model driving the goodput budget (`--dspark-sps-*-ms`).
+    sps: DsparkSps,
     /// Draft RoPE tables (full rotary over head_dim, `rope_theta`), `rope_cap`
     /// absolute positions.
     cos_cache: DeviceVec,
@@ -494,7 +494,7 @@ pub(crate) fn load_dspark_head(
     trunk_hidden: usize,
     trunk_layers: usize,
     trunk_vocab: usize,
-    confidence_threshold: f32,
+    sps: DsparkSps,
     train_head_rank: Option<usize>,
     block_size_cap: Option<usize>,
 ) -> Result<Qwen35DsparkHead> {
@@ -683,7 +683,7 @@ pub(crate) fn load_dspark_head(
     let (cos_cache, sin_cache) =
         crate::ops::precompute_rope(ctx, cfg.head_dim, rope_cap, cfg.rope_theta, None)?;
     Ok(Qwen35DsparkHead {
-        confidence_threshold,
+        sps,
         cfg,
         fc,
         hidden_norm: loader.load_vec_any(ctx, &names.hidden_norm)?,
@@ -1184,8 +1184,8 @@ impl Qwen35Model {
             prev = tok;
         }
 
-        // Confidence seam: truncate the proposal at the first low-confidence
-        // position; absent head = keep the whole block.
+        // Confidence seam: goodput-budget the proposal (R=1 on this per-slot
+        // path); absent head = keep the whole block.
         let prev_tokens: Vec<u32> = std::iter::once(anchor)
             .chain(drafts.iter().copied())
             .take(drafts.len())
@@ -1196,7 +1196,7 @@ impl Qwen35Model {
                 "[dspark-draft] embed={embed_ms:.2} prep={prep_ms:.2} attn={attn_ms:.2} mlp={mlp_ms:.2} head={head_ms:.2} argmax={argmax_ms:.2} ms"
             );
         }
-        let keep = self.dspark_confident_keeps(
+        let keep = self.dspark_verify_keeps(
             head,
             scratch.final_normed.get(ctx, hidden, block)?,
             &mut scratch.conf,
@@ -1430,7 +1430,7 @@ impl Qwen35Model {
                 prevs.extend_from_slice(&am[s * block + first_row..(s + 1) * block - 1]);
             }
         }
-        let keeps = self.dspark_confident_keeps(
+        let keeps = self.dspark_verify_keeps(
             head,
             scratch.final_normed.get(ctx, hidden, rows)?,
             &mut scratch.conf,
@@ -1516,13 +1516,14 @@ impl Qwen35Model {
         ))
     }
 
-    /// Per-slot confident prefix length
-    /// (`sigmoid(proj([hidden_i ; markov_w1[prev_i]])) >= threshold`) over a
-    /// `[hidden, b*block]` draft forward; `prevs` is slot-major, `b*(block -
+    /// Per-slot draft-keep lengths: confidence
+    /// `sigmoid(proj([hidden_i ; markov_w1[prev_i]]))` over a `[hidden,
+    /// b*block]` draft forward, cumprod'd into survival and fed to the goodput
+    /// budget ([`dspark_verify_lens`]). `prevs` is slot-major, `b*(block -
     /// first_row)` long. Head absent → the whole block survives. One GEMM, two
     /// copy launches and one sync for the batch.
     #[allow(clippy::too_many_arguments)]
-    fn dspark_confident_keeps(
+    fn dspark_verify_keeps(
         &self,
         head: &Qwen35DsparkHead,
         final_normed: &HiddenStates,
@@ -1536,8 +1537,7 @@ impl Qwen35Model {
         let Some(conf) = &head.confidence else {
             return Ok(vec![usize::MAX; b]);
         };
-        // A non-positive threshold never truncates — skip the GEMM, D2H and sync.
-        if n == 0 || b == 0 || head.confidence_threshold <= 0.0 {
+        if n == 0 || b == 0 {
             return Ok(vec![usize::MAX; b]);
         }
         ensure!(
@@ -1598,17 +1598,21 @@ impl Qwen35Model {
             .clone_dtoh(&cs.out.get(ctx, 1, total)?.data)
             .map_err(|e| anyhow!("D2H dspark confidence failed: {e}"))?;
         ctx.sync()?;
-        Ok((0..b)
+        let survivals: Vec<Vec<f32>> = (0..b)
             .map(|s| {
+                let mut acc = 1.0f32;
                 host[s * n..(s + 1) * n]
                     .iter()
-                    .position(|&h| {
+                    .map(|h| {
                         let logit = h.to_f32() + conf.bias;
-                        1.0 / (1.0 + (-logit).exp()) < head.confidence_threshold
+                        acc *= 1.0 / (1.0 + (-logit).exp());
+                        acc
                     })
-                    .unwrap_or(usize::MAX)
+                    .collect()
             })
-            .collect())
+            .collect();
+        let refs: Vec<&[f32]> = survivals.iter().map(Vec::as_slice).collect();
+        Ok(dspark_verify_lens(&refs, head.sps))
     }
 
     /// Size the reused per-slot spec state (`new_spec_slot_state` capture rows,

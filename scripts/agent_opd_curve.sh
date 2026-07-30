@@ -35,7 +35,7 @@
 #                                 aligned, no download). dflash=external draft
 #                                 (needs C4 retrain vs TC). off=disable.
 #   MTP_DRAFT_TOKENS=3            MTP draft depth (SPEC=mtp)
-#   DSPARK_DRAFT_HF_ID=z-lab/Qwen3.6-27B-DFlash   DSPARK_CONF_THRESHOLD=0.0  (SPEC=dflash)
+#   DSPARK_DRAFT_HF_ID=z-lab/Qwen3.6-27B-DFlash  (SPEC=dflash)
 #   ROUNDS=16 SAMPLES=8 EVAL_EVERY=2 EVAL_N=24 EVAL_CONCURRENCY=8
 #   TASK_LIMIT=12 WRITEBACK_CAP=8 BASE_REPEATS=2 DIFFICULTY=easy SEED=0
 set -euo pipefail
@@ -99,7 +99,6 @@ WRITEBACK_CAP=${WRITEBACK_CAP:-8} DIFFICULTY=${DIFFICULTY:-easy} SEED=${SEED:-0}
 #   SPEC=off     plain decoding.
 SPEC=${SPEC:-mtp}
 MTP_DRAFT_TOKENS=${MTP_DRAFT_TOKENS:-3}
-DSPARK_CONF_THRESHOLD=${DSPARK_CONF_THRESHOLD:-0.0}
 DSPARK_DRAFT_MODEL=""
 if [[ $SPEC == dflash ]]; then
     DSPARK_DRAFT_MODEL=${DSPARK_DRAFT_MODEL:-$(ensure_hf_model "$DSPARK_DRAFT_HF_ID")}
@@ -139,8 +138,8 @@ spec_args=()
 case $SPEC in
     mtp)    spec_args+=(--mtp-draft-tokens "$MTP_DRAFT_TOKENS")
             echo "[curve] spec-decode: MTP head (TC built-in, aligned) draft_tokens=$MTP_DRAFT_TOKENS" ;;
-    dflash) spec_args+=(--dspark-draft-model "$DSPARK_DRAFT_MODEL" --dspark-conf-threshold "$DSPARK_CONF_THRESHOLD")
-            echo "[curve] spec-decode: DFlash draft=$DSPARK_DRAFT_MODEL conf=$DSPARK_CONF_THRESHOLD" ;;
+    dflash) spec_args+=(--dspark-draft-model "$DSPARK_DRAFT_MODEL")
+            echo "[curve] spec-decode: DFlash draft=$DSPARK_DRAFT_MODEL" ;;
     off)    echo "[curve] spec-decode: OFF" ;;
     *)      echo "unknown SPEC=$SPEC (want mtp|dflash|off)" >&2; exit 1 ;;
 esac
