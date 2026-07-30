@@ -1952,7 +1952,8 @@ fn run_rubric_opd_impl(args: TrainRubricOpdArgs) -> Result<()> {
             // writeback OOMs (`cuda alloc_zeros failed`) GPU-size-independently.
             mem_fraction_static: 0.2,
             dspark_draft_model: args.runtime.dspark_draft_model.clone(),
-            dspark_conf_threshold: args.runtime.dspark_conf_threshold,
+            dspark_sps_bias_ms: args.runtime.dspark_sps_bias_ms,
+            dspark_sps_row_ms: args.runtime.dspark_sps_row_ms,
             ..EngineLoadConfig::default()
         },
     )
@@ -3182,7 +3183,8 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
             // so the student's weights + writeback activations fit alongside.
             mem_fraction_static: 0.2,
             dspark_draft_model: args.runtime.dspark_draft_model.clone(),
-            dspark_conf_threshold: args.runtime.dspark_conf_threshold,
+            dspark_sps_bias_ms: args.runtime.dspark_sps_bias_ms,
+            dspark_sps_row_ms: args.runtime.dspark_sps_row_ms,
             // MTP GPU gate passed 2026-07-17 (1.21×); default-on waits for the
             // depth sweep + an in-loop A/B.
             mtp_draft_tokens: args.runtime.mtp_draft_tokens,
@@ -4615,7 +4617,8 @@ fn load_opd_infer_student(
         true,
         EngineLoadConfig {
             dspark_draft_model: runtime.dspark_draft_model.clone(),
-            dspark_conf_threshold: runtime.dspark_conf_threshold,
+            dspark_sps_bias_ms: runtime.dspark_sps_bias_ms,
+            dspark_sps_row_ms: runtime.dspark_sps_row_ms,
             mem_fraction_static: runtime.rollout_mem_fraction,
             // Whole-step decode graph for the rollout: eager per-token decode is
             // host-launch-bound (~156 ms/token), the OPD step's dominant cost.

@@ -887,7 +887,7 @@ impl Dsv4Model {
         block_hidden: &HiddenStates,
         anchor: u32,
         temperature: f32,
-        conf_threshold: f32,
+        sps: qwen35_spec::DsparkSps,
     ) -> Result<Dsv4DsparkProposal> {
         let ctx = &self.ctx;
         let hidden = self.config.hidden_size;
@@ -974,8 +974,7 @@ impl Dsv4Model {
             .chain(drafts.iter().copied())
             .take(drafts.len())
             .collect();
-        let keep =
-            self.dspark_confident_prefix_len(exit, block_hidden, conf_threshold, &prev_tokens)?;
+        let keep = self.dspark_verify_keep(exit, block_hidden, sps, &prev_tokens)?;
         let draft_len = keep.min(drafts.len());
         drafts.truncate(draft_len);
 
@@ -1002,25 +1001,23 @@ impl Dsv4Model {
         })
     }
 
-    /// Confidence-head seam: acceptance-confident prefix length over the block
-    /// rows — the first `i` with `sigmoid(proj(feat_i)) < threshold` truncates the
-    /// proposal there. `feat_i = block_hidden[:, i]` for the plain head, or
+    /// Confidence-head seam: draft-keep length over the block rows —
+    /// `sigmoid(proj(feat_i))` cumprod'd into survival and fed to the goodput
+    /// budget ([`qwen35_spec::dspark_verify_lens`], R=1: this path drafts one
+    /// slot at a time). `feat_i = block_hidden[:, i]` for the plain head, or
     /// `[block_hidden[:, i] ; markov_w1[prev_i]]` for the with-markov head (keyed
-    /// on the loaded `proj` input width: `hidden` vs `hidden + rank`). Head absent
-    /// or `threshold <= 0` → the full block survives (`usize::MAX`).
-    fn dspark_confident_prefix_len(
+    /// on the loaded `proj` input width: `hidden` vs `hidden + rank`). Head
+    /// absent → the full block survives (`usize::MAX`).
+    fn dspark_verify_keep(
         &self,
         exit: &Dsv4DsparkStage,
         block_hidden: &HiddenStates,
-        threshold: f32,
+        sps: qwen35_spec::DsparkSps,
         prev_tokens: &[u32],
     ) -> Result<usize> {
         let Some(conf) = &exit.confidence_proj else {
             return Ok(usize::MAX);
         };
-        if threshold <= 0.0 {
-            return Ok(usize::MAX);
-        }
         let ctx = &self.ctx;
         let hidden = self.config.hidden_size;
         let block = self.config.dspark_block_size;
@@ -1045,6 +1042,8 @@ impl Dsv4Model {
 
         let mut feat = DeviceVec::zeros(ctx, in_dim)?;
         let mut out = DeviceVec::zeros(ctx, 1)?;
+        let mut survival = Vec::with_capacity(prev_tokens.len().min(block));
+        let mut acc = 1.0f32;
         for (i, &prev) in prev_tokens.iter().enumerate().take(block) {
             // feat[..hidden] = block_hidden[:, i].
             let src = block_hidden.data.slice(i * hidden..(i + 1) * hidden);
@@ -1064,10 +1063,9 @@ impl Dsv4Model {
             // No bias tensor in this checkpoint — the raw proj output is the logit.
             crate::ops::gemv(ctx, conf, &feat, &mut out)?;
             let logit = out.to_host(ctx)?[0];
-            if 1.0 / (1.0 + (-logit).exp()) < threshold {
-                return Ok(i);
-            }
+            acc *= 1.0 / (1.0 + (-logit).exp());
+            survival.push(acc);
         }
-        Ok(usize::MAX)
+        Ok(qwen35_spec::dspark_verify_lens(&[&survival], sps)[0])
     }
 }

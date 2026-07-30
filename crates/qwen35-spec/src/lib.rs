@@ -1285,6 +1285,82 @@ impl DsparkConfig {
     }
 }
 
+/// Additive verify-step cost model `step_ms = bias + row · verify_rows`, the
+/// same shape sglang profiles for its DSpark planner. Defaults are H20
+/// ThinkingCap-27B c=16 measurements (trunk 116 + draft 95 fixed, 0.53/row).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DsparkSps {
+    pub bias_ms: f32,
+    pub row_ms: f32,
+}
+
+impl Default for DsparkSps {
+    fn default() -> Self {
+        Self {
+            bias_ms: 211.0,
+            row_ms: 0.53,
+        }
+    }
+}
+
+/// DSpark §3.2.2 / sglang `compute_verify_token_budget` + `verify_lens_topk`:
+/// per-request draft-keep lengths maximizing goodput
+/// `Θ(B) = (R + Σ top-B survival) / (bias + row·(R + B))`.
+/// `survivals[r][j]` = calibrated `P(first j+1 drafts of request r all accept)`
+/// (cumprod of per-position confidence, monotone decreasing). B=0 is an arm,
+/// so the result never predicts worse than not speculating. Survival is
+/// monotone per request, so the global admission cut yields prefix lengths.
+pub fn dspark_verify_lens(survivals: &[&[f32]], sps: DsparkSps) -> Vec<usize> {
+    const EPS: f32 = 1e-6;
+    let r = survivals.len() as f32;
+    let mut all: Vec<f32> = survivals
+        .iter()
+        .flat_map(|s| s.iter().copied())
+        .filter(|p| *p >= EPS)
+        .collect();
+    all.sort_unstable_by(|a, b| b.total_cmp(a));
+    let mut best = r / (sps.bias_ms + sps.row_ms * r);
+    let mut cut = f32::INFINITY;
+    let mut sum = 0.0f32;
+    for (i, &p) in all.iter().enumerate() {
+        sum += p;
+        let theta = (r + sum) / (sps.bias_ms + sps.row_ms * (r + (i + 1) as f32));
+        if theta > best {
+            (best, cut) = (theta, p);
+        }
+    }
+    survivals
+        .iter()
+        .map(|s| s.iter().take_while(|p| **p >= cut.max(EPS)).count())
+        .collect()
+}
+
+#[cfg(test)]
+mod dspark_schedule_tests {
+    use super::*;
+
+    #[test]
+    fn budget_scales_with_survival() {
+        let sps = DsparkSps::default();
+        // Confident chains: cheap rows, keep everything.
+        let hi = [0.9f32, 0.8, 0.7, 0.6];
+        assert_eq!(dspark_verify_lens(&[&hi, &hi], sps), vec![4, 4]);
+        // Hopeless chains: B=0 arm wins, verify nothing beyond the anchor.
+        let lo = [1e-8f32; 4];
+        assert_eq!(dspark_verify_lens(&[&lo, &lo], sps), vec![0, 0]);
+        // Mixed: the confident request keeps more than the doubtful one.
+        let mid = [0.5f32, 0.02, 0.001, 0.0002];
+        let lens = dspark_verify_lens(&[&hi, &mid], sps);
+        assert!(lens[0] > lens[1], "expected {lens:?} descending");
+        // Expensive rows flip the same inputs toward the no-spec arm.
+        let dear = DsparkSps {
+            bias_ms: 1.0,
+            row_ms: 100.0,
+        };
+        assert_eq!(dspark_verify_lens(&[&hi, &hi], dear), vec![0, 0]);
+    }
+}
+
 /// Tensor names of one DSpark draft decoder layer (standard Qwen3 layer shape).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DsparkLayerTensorNames {

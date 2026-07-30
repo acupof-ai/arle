@@ -725,12 +725,15 @@ pub(crate) struct ServeArgs {
     #[arg(long, value_name = "PATH_OR_REPO")]
     pub(crate) mtp_draft_model: Option<String>,
 
-    /// Cut proposals at the first position with sigmoid(confidence) below this.
-    /// `0` (default) skips the head: a verify row is 0.2% of the step, so saved
-    /// rows never pay for the ragged chain left behind (block 6 c=16 TPOT
-    /// 104.73 → 159.68 ms at 0.5).
-    #[arg(long, default_value_t = 0.0, value_name = "T")]
-    pub(crate) dspark_conf_threshold: f32,
+    /// Verify-step cost model `step_ms = bias + row · verify_rows` driving the
+    /// DSpark goodput budget (needs a confidence head in the drafter). Default
+    /// is the H20 ThinkingCap-27B c=16 measurement.
+    #[arg(long, default_value_t = 211.0, value_name = "MS")]
+    pub(crate) dspark_sps_bias_ms: f32,
+
+    /// Marginal verify-row cost for the DSpark goodput budget.
+    #[arg(long, default_value_t = 0.53, value_name = "MS")]
+    pub(crate) dspark_sps_row_ms: f32,
 
     /// Spawn the DSpark train sidecar alongside `--spec-type dspark` serving.
     /// Drains the experience buffer the hot path populates and hot-swaps updated
@@ -1153,10 +1156,14 @@ pub(crate) struct OpdRuntimeArgs {
     #[arg(long, value_name = "DIR")]
     pub(crate) dspark_draft_model: Option<PathBuf>,
 
-    /// DSpark confidence-head truncation threshold for --dspark-draft-model
-    /// (matches serve's default: 0 = off).
-    #[arg(long, default_value_t = 0.0, value_name = "T")]
-    pub(crate) dspark_conf_threshold: f32,
+    /// DSpark goodput-budget cost model for --dspark-draft-model (mirrors
+    /// serve's `--dspark-sps-bias-ms` / `--dspark-sps-row-ms`).
+    #[arg(long, default_value_t = 211.0, value_name = "MS")]
+    pub(crate) dspark_sps_bias_ms: f32,
+
+    /// Marginal verify-row cost (mirrors serve's `--dspark-sps-row-ms`).
+    #[arg(long, default_value_t = 0.53, value_name = "MS")]
+    pub(crate) dspark_sps_row_ms: f32,
 
     /// Whole-step Qwen3.5/3.6 decode graph for the in-process rollout engine
     /// (mirrors serve's flag). Default off = unchanged behavior; flipping it

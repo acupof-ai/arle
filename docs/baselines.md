@@ -118,7 +118,8 @@ Both ends by 4-5%, loses c=2 by 13.6%, washes at c=4/8 — rule 2, no champion
 change. **The first version called it a candidate off c=1 and c=16 alone; adding
 c=2/4/8 reversed it.** Two ends are not a sweep. Open: the c=2 loss is
 unexplained, and the c=16 points sit at different `pt` (2nd vs 3rd).
-`--dspark-conf-threshold` is now default 0 — at the old 0.5 this checkpoint lost
+Static confidence truncation is deleted — the head now feeds the goodput
+budget (`--dspark-sps-*-ms`); at the old 0.5 threshold this checkpoint lost
 34% ([win](experience/wins/2026-07-30-dspark-markov-confidence-batched.md)).
 
 **The c=2/c=4 region is healthy.** The denominator now exists (`arle-mk`, no spec

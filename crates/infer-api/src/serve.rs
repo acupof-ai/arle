@@ -184,7 +184,8 @@ impl ServeSpecType {
 pub struct ServeSpecOptions {
     pub spec_type: ServeSpecType,
     pub mtp_draft_model: Option<String>,
-    pub dspark_conf_threshold: f32,
+    pub dspark_sps_bias_ms: f32,
+    pub dspark_sps_row_ms: f32,
     pub mtp_draft_tokens: Option<usize>,
     pub mtp_draft_topk: Option<usize>,
     /// Spawn the DSpark train sidecar alongside `--spec-type dspark` serving.
@@ -282,7 +283,8 @@ pub fn serve_http(
                 )
             })?;
             engine_config.dspark_draft_model = Some(std::path::PathBuf::from(dir));
-            engine_config.dspark_conf_threshold = opts.spec.dspark_conf_threshold;
+            engine_config.dspark_sps_bias_ms = opts.spec.dspark_sps_bias_ms;
+            engine_config.dspark_sps_row_ms = opts.spec.dspark_sps_row_ms;
             engine_config.dspark_train_head_rank = opts.spec.dspark_train_head_rank;
             engine_config.dspark_block_size = opts.spec.dspark_block_size;
         }

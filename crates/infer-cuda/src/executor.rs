@@ -229,7 +229,8 @@ impl RealCudaExecutor {
         kv_dtype: CudaKvCacheDtype,
         mem_fraction_static: f64,
         dspark_draft_model: Option<&Path>,
-        dspark_conf_threshold: f32,
+        dspark_sps_bias_ms: f32,
+        dspark_sps_row_ms: f32,
         dspark_train_head_rank: Option<usize>,
         dspark_block_size: Option<usize>,
         mtp_draft_tokens: Option<usize>,
@@ -243,7 +244,8 @@ impl RealCudaExecutor {
                 kv_dtype,
                 mem_fraction_static,
                 dspark_draft_model,
-                dspark_conf_threshold,
+                dspark_sps_bias_ms,
+                dspark_sps_row_ms,
                 dspark_train_head_rank,
                 dspark_block_size,
                 mtp_draft_tokens,
@@ -263,7 +265,8 @@ impl RealCudaExecutor {
         mtp_draft_tokens: Option<usize>,
         mtp_draft_topk: Option<usize>,
         dspark_draft_model: Option<&Path>,
-        dspark_conf_threshold: f32,
+        dspark_sps_bias_ms: f32,
+        dspark_sps_row_ms: f32,
     ) -> Result<Self> {
         Ok(Self::Dsv4(Box::new(
             Dsv4CudaExecutor::from_dsv4_fp8_safetensors(
@@ -273,7 +276,8 @@ impl RealCudaExecutor {
                 mtp_draft_tokens,
                 mtp_draft_topk,
                 dspark_draft_model,
-                dspark_conf_threshold,
+                dspark_sps_bias_ms,
+                dspark_sps_row_ms,
             )?,
         )))
     }

@@ -13,7 +13,6 @@ CUDA_VISIBLE_DEVICES="0,1,2,3" INFER_TP_SIZE=4 INFER_CUDA_DEVICES=0,1,2,3 \
     --spec-type dspark \
     --mtp-draft-model /host/DeepSeek-V4-Flash-DSpark-draft-fp8 \
     --mtp-draft-tokens 5 \
-    --dspark-conf-threshold 0 \
     --comm-backend nccl \
     --max-running-requests 32 \
     --port 8000

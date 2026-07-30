@@ -139,8 +139,8 @@ pub(crate) struct Dsv4CudaExecutor {
 /// per-request latent cache + attention state set, indexed by slot.
 pub(crate) struct Dsv4DsparkExec {
     draft: crate::dsv4::Dsv4DsparkDraft,
-    /// Confidence-head truncation threshold (`--dspark-conf-threshold`).
-    conf_threshold: f32,
+    /// Verify-step cost model driving the goodput budget (`--dspark-sps-*-ms`).
+    sps: qwen35_spec::DsparkSps,
     /// Per-request token ceiling — the block spec step falls back to a single
     /// non-spec token when the worst-case chain would cross it.
     max_seq_len: usize,
@@ -488,7 +488,8 @@ impl Dsv4CudaExecutor {
         mtp_draft_tokens: Option<usize>,
         mtp_draft_topk: Option<usize>,
         dspark_draft_model: Option<&Path>,
-        dspark_conf_threshold: f32,
+        dspark_sps_bias_ms: f32,
+        dspark_sps_row_ms: f32,
     ) -> Result<Self> {
         ensure!(num_slots > 0, "Dsv4CudaExecutor requires at least one slot");
         ensure!(max_seq_len > 0, "Dsv4CudaExecutor requires max_seq_len > 0");
@@ -687,7 +688,8 @@ impl Dsv4CudaExecutor {
                     &model,
                     &kv_adapter,
                     draft,
-                    dspark_conf_threshold,
+                    dspark_sps_bias_ms,
+                    dspark_sps_row_ms,
                     max_seq_len,
                     num_slots,
                 )
@@ -733,7 +735,8 @@ impl Dsv4CudaExecutor {
         model: &crate::dsv4::Dsv4Model,
         kv_adapter: &crate::attention::Dsv4KvAdapter,
         draft: crate::dsv4::Dsv4DsparkDraft,
-        conf_threshold: f32,
+        sps_bias_ms: f32,
+        sps_row_ms: f32,
         max_seq_len: usize,
         num_slots: usize,
     ) -> Result<Dsv4DsparkExec> {
@@ -790,15 +793,18 @@ impl Dsv4CudaExecutor {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        let sps = qwen35_spec::DsparkSps {
+            bias_ms: sps_bias_ms,
+            row_ms: sps_row_ms,
+        };
         log::info!(
             "CUDA DSv4 DSpark runtime initialized: stages={num_stages} block={block_size} \
-             conf_threshold={conf_threshold} \
-             target_layers={:?}",
+             sps={sps:?} target_layers={:?}",
             model.config.dspark_target_layer_ids,
         );
         Ok(Dsv4DsparkExec {
             draft,
-            conf_threshold,
+            sps,
             max_seq_len,
             slots,
         })
@@ -1753,7 +1759,7 @@ impl Dsv4CudaExecutor {
             } = self;
             let Dsv4DsparkExec {
                 draft,
-                conf_threshold,
+                sps,
                 slots: ds_slots,
                 ..
             } = dspark
@@ -1779,13 +1785,7 @@ impl Dsv4CudaExecutor {
                 anchor,
                 verify_pos,
             )?;
-            model.dspark_build_proposal(
-                draft,
-                &block_hidden,
-                anchor,
-                params.temperature,
-                *conf_threshold,
-            )?
+            model.dspark_build_proposal(draft, &block_hidden, anchor, params.temperature, *sps)?
         };
         ensure!(
             proposal.chain.len() == proposal.draft_len + 1 && proposal.chain[0] == anchor,
@@ -2011,7 +2011,7 @@ impl Dsv4CudaExecutor {
                     } = self;
                     let Dsv4DsparkExec {
                         draft,
-                        conf_threshold,
+                        sps,
                         slots: ds_slots,
                         ..
                     } = dspark
@@ -2038,7 +2038,7 @@ impl Dsv4CudaExecutor {
                         &block_hidden,
                         anchor,
                         rows[i].params.temperature,
-                        *conf_threshold,
+                        *sps,
                     )?
                 };
                 proposals[i] = Some(proposal);
