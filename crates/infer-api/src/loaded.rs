@@ -155,7 +155,7 @@ pub struct EngineLoadConfig {
 }
 
 fn default_dspark_conf_threshold() -> f32 {
-    0.5
+    0.0
 }
 
 /// `--lora-alpha` default (the common rank-32 PEFT convention); a free function
