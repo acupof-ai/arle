@@ -56,7 +56,7 @@ where
                 store.offload_checkpoint_to_host(id)?;
             }
         }
-        let checkpoint_fn: CheckpointFn = Arc::new(replay);
+        let checkpoint_fn: CheckpointFn = Arc::new(move |st, tp, _start, inp| replay(st, tp, inp));
         let function_id = tape.register_checkpoint_fn(checkpoint_fn);
         tape.record(TapeEntry {
             op: BackwardOp::Checkpoint,
@@ -194,12 +194,15 @@ pub fn checkpoint_seq_chunked<F>(
     replay: F,
 ) -> Result<TensorId>
 where
-    F: Fn(&mut TensorStore, &mut Tape, &[TensorId]) -> Result<TensorId> + Send + Sync + 'static,
+    F: Fn(&mut TensorStore, &mut Tape, usize, &[TensorId]) -> Result<TensorId>
+        + Send
+        + Sync
+        + 'static,
 {
     let mut input_ids = vec![input];
     input_ids.extend(param_ids);
     if chunk == 0 {
-        return replay(store, tape, &input_ids);
+        return replay(store, tape, 0, &input_ids);
     }
     let shape = store.tensor(input)?.shape.clone();
     let &[batch, seq, dim] = shape.as_slice() else {
@@ -219,7 +222,7 @@ where
             let x = crate::ops::slice(input, &[0, start, 0], &[batch, end, dim], store, tape)?;
             let mut chunk_inputs = vec![x];
             chunk_inputs.extend_from_slice(&input_ids[1..]);
-            let y = replay(store, tape, &chunk_inputs)?;
+            let y = replay(store, tape, start, &chunk_inputs)?;
             let y = crate::ops::reshape(y, &[batch, 1, end - start, dim], store, tape)?;
             output = Some(match output {
                 None => y,
@@ -331,7 +334,7 @@ mod seq_chunked_tests {
                     c,
                     &mut store,
                     &mut tape,
-                    move |st, tp, inp| mlp_block(inp[0], inp[1], inp[2], inp[3], st, tp),
+                    move |st, tp, _start, inp| mlp_block(inp[0], inp[1], inp[2], inp[3], st, tp),
                 )?,
             };
             let loss = ops::sum(out, &mut store, &mut tape)?;
