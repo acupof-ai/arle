@@ -21,9 +21,21 @@ Screening compares new runs against the champion row — no second arm. Rules:
    fingerprints, or the one-shot 32k dataset that could never hit the prefix
    cache. Historical evidence, not comparison targets; re-anchor first.
 
+The canonical shape is the bench spec's TraceLab median — 119K prefix tokens:
+
 ```
 python3 scripts/gen_bench_prompts.py bench-agent-119k-16x8.jsonl 16 119000 214 8
 ```
+
+**Every row below deviates to 32K, and the deviation is KV budget, not choice.**
+The dense arm's 16 full-attention layers hold 4 kv_heads × 256 head_dim × 2 ×
+bf16 = 4 KB per token per layer, so **64 KB per token**: 119K × 16 concurrent
+needs **122 GB** of KV against the ~69 GB left after 27B FP8 weights on a 96 GB
+H20. 32K needs 36 GB and fits. Rule 3 makes prefix length part of the
+fingerprint, so a 119K row is a *new* anchor at lower concurrency, not a
+re-measure of these — and until one exists, no row here satisfies rule 5 at the
+TraceLab median. Deviating is allowed; the spec requires the deviation be a
+stated parameter, which is what this paragraph is.
 
 ## Qwen3.6 on 1×H20 · single-GPU · eager — LONG-AGENT ANCHOR
 
@@ -36,11 +48,20 @@ one have no accept column; re-measure before comparing them on it. `prefill
 tok/s` is dropped: the pre-2026-07-30 rows' formula isn't reproducible from the
 report, and TTFT is the prefill SLO.
 
-| c | arm | TTFT cold | TTFT warm | TPOT | decode tok/s | total tok/s | prefix hit | accept | tok/row |
-|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| 1 | dense DSpark 6 | 19.3 s | 1.1 s | 9.80 ms | 102.0 | 7440.7 | 0.883 | 0.509 | 0.591 |
-| 8 | dense DSpark 6 | — | 0.7 s | 60.70 ms | 16.5 | 31754.1 | 1.000 | 0.280 | 0.400 |
-| 16 | dense DSpark 6 | 6.8 s | 1.2 s | 109.43 ms | 9.1 | 32559.0 | 1.000 | 0.280 | 0.400 |
+| c | arm | TTFT cold | TTFT warm | TPOT | step | decode tok/s | total tok/s | prefix hit | accept | tok/row |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | dense DSpark 6 | 19.3 s | 1.1 s | 9.80 ms | 34.8 ms | 102.0 | 7440.7 | 0.883 | 0.509 | 0.591 |
+| 8 | dense DSpark 6 | — | 0.7 s | 60.70 ms | 145.7 ms | 16.5 | 31754.1 | 1.000 | 0.280 | 0.400 |
+| 16 | dense DSpark 6 | 6.8 s | 1.2 s | 109.43 ms | 262.7 ms | 9.1 | 32559.0 | 1.000 | 0.280 | 0.400 |
+
+**`step` replaces ITL p50 on a spec row, and ITL p50 must not be reported for
+one.** A spec step emits `k+1` tokens back-to-back, so most recorded ITLs are the
+within-chain gap, not the step: `dflash6` at c=16 reads p50 **0.02 ms** against
+p90 476.8 ms, where the no-spec row's 66.00 / 444.6 is the honest steady-state
+step. `step = TPOT × (accepted+chains)/chains`, free from the `/stats`
+`spec_decode` counters, is the comparable quantity — the no-spec champion's c=16
+step is 124.81 ms, so this arm verifies 96 rows in 2.1× the time to commit 2.4×
+the tokens.
 
 Re-measure of the `d05d0aee6` row on the markov/confidence batching binary:
 TPOT 9.77 → 9.80 / 60.74 → 60.70 / 107.94 → 109.43 ms (**+0.3 / −0.07 / +1.4%**,
@@ -52,6 +73,20 @@ spec path): decode 34.7 → 102.0 / 12.2 → 16.5 / 8.2 → 9.1 tok/s. TTFT unch
 Serve adds `--spec-type dspark --mtp-draft-model Qwen3.6-27B-DFlash
 --dspark-block-size 6`; `--spec-max-batch` is the shipped default 16.
 Gate exact=3 DET at 512/4k/16k/32k. 0 errors. 126/128.
+
+**Candidate, not yet a champion — `dspark-fr-native` + `--dspark-conf-threshold 0`**
+(`arle-mk`, same binary and fingerprint as the row above). At rows and depth
+matched exactly to this champion (96 rows, depth 5.00): c=1 decode 107.2 tok/s
+(**+5.1%**), c=16 TPOT 104.73 ms (**−4.3%**), step 268.7 ms, tok/row 0.428
+(**+7.0%**). Gate exact=3 DET at 512/4k/16k/32k. Threshold 0 makes the confidence
+head execute and truncate nothing — with its default 0.5 the same checkpoint loses
+34% ([win](experience/wins/2026-07-30-dspark-markov-confidence-batched.md)).
+Blocking a flip: the c=8 point, rule 2's third trial, and a decision on shipping a
+checkpoint with its own head switched off.
+
+**Missing points, pending a free GPU: c=2 and c=4.** The `--spec-max-batch` flip
+that created this arm was licensed on +77% / +71% there — the largest gains — so
+the region where speculation pays most is not in this table.
 
 **The accept rate itself halves at concurrency** (0.509 → 0.280), and every chain
 at c≥8 drafts on a rebased context (`partial_ctx_chains/chains` 0.75 → 1.00)
