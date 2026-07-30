@@ -779,9 +779,26 @@ pub fn linear_attention_ctx_bytes(params: LinearAttentionParams) -> usize {
     params.batch * (4 * f32_elems + 2 * bf16_elems)
 }
 
-#[test]
-fn linear_attention_ctx_bytes_counts_retained_tensors() {
-    let params = LinearAttentionParams {
+/// Bytes `..._forward_device_row` holds live until it returns: its own buffers
+/// plus the taped f32 inputs it reads. Lives beside the kernel so a buffer change
+/// and its count move together — the caller sizing a layer can't see them.
+pub fn linear_attention_row_transient_bytes(params: LinearAttentionParams) -> usize {
+    let (hk, kd) = (params.num_key_heads, params.key_dim);
+    let (hv, vd) = (params.num_value_heads, params.value_dim);
+    let qkv_dim = 2 * hk * kd + hv * vd;
+    // f32: a_tril, g_cumsum, and the taped qkv/z/b_proj/a_proj it reads.
+    let f32_elems = 64 * hv + hv + qkv_dim + hv * vd + 2 * hv;
+    // bf16: q/k/w, v/u/v_new/raw_output, a_inv, b/a casts.
+    let bf16_elems = 3 * hv * kd + 4 * hv * vd + 64 * hv + 2 * hv;
+    params
+        .batch
+        .saturating_mul(params.seq_len)
+        .saturating_mul(4 * f32_elems + 2 * bf16_elems)
+}
+
+#[cfg(test)]
+fn byte_count_params() -> LinearAttentionParams {
+    LinearAttentionParams {
         batch: 2,
         seq_len: 65,
         num_key_heads: 2,
@@ -790,8 +807,21 @@ fn linear_attention_ctx_bytes_counts_retained_tensors() {
         value_dim: 5,
         conv_kernel: 4,
         eps: 1e-6,
-    };
-    assert_eq!(linear_attention_ctx_bytes(params), 36_060);
+    }
+}
+
+#[test]
+fn linear_attention_ctx_bytes_counts_retained_tensors() {
+    assert_eq!(linear_attention_ctx_bytes(byte_count_params()), 36_060);
+}
+
+/// Pinned so editing the row kernel's buffers forces a deliberate recount here.
+#[test]
+fn linear_attention_row_transient_bytes_counts_kernel_buffers() {
+    assert_eq!(
+        linear_attention_row_transient_bytes(byte_count_params()),
+        204_880
+    );
 }
 
 fn device_handle(id: TensorId, store: &mut TensorStore) -> Result<DeviceHandle> {

@@ -16,9 +16,10 @@ use autograd::{
         causal_sdpa_recompute, causal_sdpa_recompute_with_q_start, causal_sdpa_with_q_start,
         checkpoint_sequential, embedding, linear_attention_boundary, linear_attention_core,
         linear_attention_core_with_carry, linear_attention_core_with_carry_taped,
-        linear_attention_ctx_bytes, matmul_bt_with_site, moe_grouped_linear,
-        moe_grouped_weighted_scatter, moe_topk_softmax, moe_topk_softmax_with_indices, mul,
-        repeat_kv, reshape, rmsnorm, rope, sigmoid, silu, slice, transpose,
+        linear_attention_ctx_bytes, linear_attention_row_transient_bytes, matmul_bt_with_site,
+        moe_grouped_linear, moe_grouped_weighted_scatter, moe_topk_softmax,
+        moe_topk_softmax_with_indices, mul, repeat_kv, reshape, rmsnorm, rope, sigmoid, silu,
+        slice, transpose,
     },
     tape::checkpoint_replay_mem_stage,
 };
@@ -2820,27 +2821,20 @@ fn la_params(cfg: &Qwen35Config, batch: usize, seq_len: usize) -> LinearAttentio
 }
 
 /// Peak device bytes a single LINEAR-attention layer holds. This is the whole
-/// O(seq) story of a checkpointed forward: `linear_attention_core` runs the
-/// entire sequence in one call, while MLP and full attention recompute in
-/// `OPD_SEQ_CHUNK` row chunks. Three exactly-enumerable parts — the retained
-/// backward ctx, the row kernel's own buffers (all live until its return), and
-/// the taped f32 tensors it reads. On the 27B hybrid this slope is 211712
-/// B/token against a measured 231424, i.e. it UNDER-models by 9% — the unaccounted
-/// term is what `log_ckpt_peak`'s drift exists to name.
+/// O(seq) story of a checkpointed forward: `linear_attention_core` runs the entire
+/// sequence in one call, while MLP and full attention recompute in `OPD_SEQ_CHUNK`
+/// row chunks. On the 27B hybrid this slope is 211712 B/token against a measured
+/// 231424, i.e. it UNDER-models by 9% — the unaccounted term is what
+/// `log_ckpt_peak`'s drift exists to name.
 fn la_layer_peak_bytes(cfg: &Qwen35Config, batch: usize, seq_len: usize) -> usize {
     let p = la_params(cfg, batch, seq_len);
-    let (hk, kd) = (p.num_key_heads, p.key_dim);
-    let (hv, vd) = (p.num_value_heads, p.value_dim);
-    let qkv_dim = 2 * hk * kd + hv * vd;
-    // Per row: `..._forward_device_row`'s own buffers (a_tril + g_cumsum f32; q/k/w,
-    // v/u/v_new/raw_output, a_inv, b/a casts bf16), plus its taped f32 inputs
-    // (qkv/z/b_proj/a_proj) and the residual stream x and h.
-    let f32_elems = 64 * hv + hv + qkv_dim + hv * vd + 2 * hv + 2 * cfg.hidden_size;
-    let bf16_elems = 3 * hv * kd + 4 * hv * vd + 64 * hv + 2 * hv;
-    batch
+    // The residual stream x and h belong to the layer, not the kernel.
+    let residual = batch
         .saturating_mul(seq_len)
-        .saturating_mul(4 * f32_elems + 2 * bf16_elems)
+        .saturating_mul(8 * cfg.hidden_size);
+    linear_attention_row_transient_bytes(p)
         .saturating_add(linear_attention_ctx_bytes(p))
+        .saturating_add(residual)
 }
 
 /// Peak device bytes a single FULL-attention layer holds. `repeat_kv`

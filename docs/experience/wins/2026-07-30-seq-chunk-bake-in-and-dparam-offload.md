@@ -112,6 +112,12 @@ errored; backward just skipped the node and `grads.get(&x)` returned `None`. One
 `set_requires_grad(output_id, requires_grad)` fixes it. A VRAM-only review would
 have shipped a silently wrong gradient.
 
+`ChunkSum` was verified against a tree with someone else's in-flight CP
+ring-attention edits in the same two files, so the staged hunks were compiled and
+tested alone in a throwaway worktree at HEAD: 39 test groups green,
+`clippy -D warnings` clean, CUDA-lane typecheck clean. `ring_attention.rs:377,542`
+fail `needless_range_loop` at HEAD already — pre-existing, not touched here.
+
 ## Measured — seq ladder (H20, 1 GPU, untraced)
 
 Prior rungs, for the wall this entry moves:
@@ -174,11 +180,39 @@ requiring grad" is unreachable. The mark lands on a *disabled* tape too, which i
 what a `checkpoint` inner replay needs — `tape.rs:1449` pins that and fails if the
 mark moves inside the `enabled` branch (mutation-verified, not just passing).
 
-**`SeqAccum` (`ops/seq_accum.rs`) has no append.** Five sites folded
+**`SeqAccum` (`ops/chunk_accum.rs`) has no append.** Five sites folded
 `concat_axis2` per chunk; three also kept every chunk in a `Vec` until the fold,
 for a ≈3× peak. All five now allocate the final shape once and assign disjoint
 rows. The quadratic form is no longer expressible. `concat_row_chunks` and
 `concat_seq_chunks` are deleted. Net for the two changes: **−170 lines**.
+
+**`ChunkSum` closes the other axis.** `SeqAccum` only covers grads whose rows
+partition by chunk. The reduce axis — a grad every chunk contributes to in full —
+was still four hand-rolled folds in three mechanisms, and two of the three held
+old+new at once, the exact shape `SeqAccum` was built to forbid:
+
+| site | was | device copies at peak |
+|---|---|---:|
+| `attention.rs` grad_v, grad_k | `ops::add` on a *disabled* tape | 3 |
+| `matmul.rs` grad_b | `add_into_device` (allocs a fresh full-size buffer) | 3 |
+| `tape.rs` d_param | `accumulate_into_device` + `offload_to_host` | 2, host-parked |
+
+Only the last was right, and it was 40 inlined lines inside a private `Tape`
+method where nothing else could reach it. All four now use `ChunkSum`, so
+`accumulate_into_device`'s true in-place path and the between-chunk host park are
+the default rather than one site's local knowledge. Both accumulators need sole
+ownership of their buffer; that probe is now one shared `sole_owned_handle` —
+`accumulate_into_device` previously had the requirement in a doc comment and no
+check. Net **−54 lines**, and the two attention grads drop from 3 full-size
+`[merged_heads, kv_len, head_dim]` buffers to 1.
+
+**The LA memory formula moved next to the kernel it counts.** It enumerated
+buffers inside `..._forward_device_row` (`autograd`) from `crates/train` — a
+kernel edit could invalidate it with no compile error and no test. Split at the
+honest seam: `linear_attention_row_transient_bytes` sits beside
+`linear_attention_ctx_bytes` with a pinned count, and `la_layer_peak_bytes` keeps
+only the residual stream, which really is the layer's. The 9% under-model is
+unchanged — this makes it *attributable*, not smaller.
 
 **`ckpt_group_size` was dead arithmetic returning 1 at every length** — verified
 for seq ∈ {128, 1024, 8192, 40960, 65536, 131072}, because `attn_floor = 12 GiB`
