@@ -1,10 +1,11 @@
 # MLP seq-chunked recompute — the 256K writeback VRAM lever
 
-> Status: Shipped; CPU parity GREEN; H20 seq-ladder measured. **Default-ON,
-> seq-adaptive** (`total_rows ≥ 40961` → chunk 4096; `ARLE_OPD_MLP_SEQ_CHUNK` env
-> override). Not a 256K unlock on its own — single-card writeback ceiling moves
-> 40960→49152; 256K is blocked earlier by i32 kernel-index walls + non-MLP
-> backward terms (see Ceiling).
+> Status: Shipped; CPU parity GREEN; H20 seq-ladder measured. The
+> `total_rows ≥ 40961` threshold and `ARLE_OPD_MLP_SEQ_CHUNK` override described
+> below were **deleted 2026-07-30** — chunking is unconditional at
+> `runtime_flags::OPD_SEQ_CHUNK = 4096`
+> (`2026-07-30-seq-chunk-bake-in-and-dparam-offload.md`). Not a 256K unlock on
+> its own — this lever moves the single-card writeback ceiling 40960→49152.
 
 ## Context
 
@@ -31,13 +32,9 @@ new `BackwardOp::SeqChunkedRecompute`; reuses the `CheckpointFn` registry. Peak
 recompute drops from `O(seq · intermediate)` to `O(chunk · intermediate)`.
 
 Wired in `Qwen35Layer::forward`: the MLP segment routes through
-`checkpoint_seq_chunked` when `runtime_flags::mlp_seq_chunk_for_seq(batch*seq)`
-returns > 0 (seq-adaptive, default-on ≥ 40961 total rows), else the plain call.
-`chunk == 0` in the op is an inline passthrough (byte-identical, zero overhead).
-No CLI flag — the earlier manual `--mlp-seq-chunk` was deleted; `ARLE_OPD_MLP_SEQ_CHUNK`
-env forces a chunk (escape hatch for a sub-threshold OOM + manual A/B lever). The
-gate is on `batch*seq` (total rows), matching `writeback_offload_for_seq` — the
-recompute peak is `O(batch·chunk·intermediate)`, not per-sequence.
+`checkpoint_seq_chunked`. As shipped this was gated on
+`mlp_seq_chunk_for_seq(batch*seq) > 0` (≥ 40961 rows, `ARLE_OPD_MLP_SEQ_CHUNK`
+override); both were deleted 2026-07-30 for one unconditional path.
 
 ## Verification
 
@@ -60,7 +57,7 @@ touches only the MLP recompute.
 
 ## Measured — seq-ladder ceiling (H20, untraced clean wall)
 
-Total-token `--synthetic-writeback-seq`, chunk from the env override:
+Total-token `--synthetic-writeback-seq`, chunk from the (then-live) env override:
 
 | total rows | chunk 0 | chunk 4096 |
 |---|---|---|

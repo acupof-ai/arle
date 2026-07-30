@@ -1134,6 +1134,7 @@ impl Tape {
                                 Some(store.alloc_device_tensor(tensor.shape.clone(), handle)?);
                         }
                         Some(acc) => {
+                            store.ensure_device(acc)?;
                             let shape = store.tensor(acc)?.shape.clone();
                             let acc_handle = store
                                 .tensor(acc)?
@@ -1155,6 +1156,12 @@ impl Tape {
                             store.replace_device_handle(acc, updated)?;
                         }
                     }
+                    // Full-seq param grads (k/v) dominate device memory; keep
+                    // them on host between chunks and only materialize on device
+                    // during the accumulate. Saves ~2× seq·heads·head_dim·4 bytes.
+                    if let Some(acc) = d_param[slot] {
+                        store.offload_to_host(acc)?;
+                    }
                 }
             }
 
@@ -1165,6 +1172,10 @@ impl Tape {
             store.free_new_except(&live_before, &keep)?;
             self.trim_after_checkpoint_replay(store)?;
             start = end;
+        }
+
+        for g in d_param.iter().flatten().copied() {
+            store.ensure_device(g)?;
         }
 
         let mut pairs = GradPairs::new();

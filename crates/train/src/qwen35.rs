@@ -674,13 +674,8 @@ impl Qwen35Layer {
             tape,
         )?;
         checkpoint_replay_mem_stage(tape, store, "post_mlp_norm");
-        // Seq-adaptive MLP recompute chunking (256K writeback lever): MLP is
-        // position-wise, so chunking is bit-identical up to add-order. The peak
-        // scales with TOTAL rows = batch*seq (backward slices [batch,chunk,dim]),
-        // so gate on `batch*seq_len` — matching `writeback_offload_for_seq`. Below
-        // the threshold, run the plain block (no per-layer collect/clone).
-        let mlp_chunk = crate::runtime_flags::mlp_seq_chunk_for_seq(batch * seq_len);
-        let mlp_out = if mlp_chunk > 0 {
+        // MLP is position-wise — chunking is exact.
+        let mlp_out = {
             let mut param_ids = Vec::new();
             collect_mlp_ids(&self.mlp, false, &mut param_ids);
             param_ids.retain(|&id| store.get(id).is_some_and(|t| t.requires_grad));
@@ -689,7 +684,7 @@ impl Qwen35Layer {
             autograd::ops::checkpoint_seq_chunked(
                 h,
                 param_ids,
-                mlp_chunk,
+                crate::runtime_flags::OPD_SEQ_CHUNK,
                 store,
                 tape,
                 move |st, tp_tape, _start, inp| {
@@ -703,8 +698,6 @@ impl Qwen35Layer {
                         .map_err(qwen35_to_autograd)
                 },
             )?
-        } else {
-            self.forward_mlp(h, cfg, tp, batch, seq_len, store, tape)?
         };
         checkpoint_replay_mem_stage(tape, store, "post_mlp");
         let out = add(x, mlp_out, store, tape)?;
@@ -1623,12 +1616,9 @@ impl Qwen35Layer {
         let local_key_value_heads = tp.local_key_value_heads(cfg)?;
         let kv_repeat = local_attention_heads / local_key_value_heads;
 
-        // Long-sequence single-GPU path: k/v are small (kv_dim * seq) so keep
-        // them full-sequence; chunk q_proj + SDPA + o_proj to bound the
-        // full-seq f32 GEMM-output memory (the 131K forward OOM site). CP is
-        // multi-GPU and uses its own q-shard + all-gather-kv path.
-        let attn_chunk = crate::runtime_flags::attn_seq_chunk_for_seq(batch * seq_len);
-        if !cp.is_enabled() && attn_chunk > 0 {
+        // Non-CP: k/v full-seq (small), chunk q_proj+SDPA+o_proj to bound the
+        // full-seq f32 GEMM output. CP uses its own q-shard + all-gather-kv.
+        if !cp.is_enabled() {
             return self.forward_full_attention_chunked(
                 h,
                 attn,
@@ -1641,7 +1631,7 @@ impl Qwen35Layer {
                 local_attention_heads,
                 local_key_value_heads,
                 kv_repeat,
-                attn_chunk,
+                crate::runtime_flags::OPD_SEQ_CHUNK,
                 store,
                 tape,
             );
