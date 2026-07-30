@@ -1555,7 +1555,7 @@ impl Qwen35Model {
             (in_dim * elem).is_multiple_of(16) && (hidden * elem).is_multiple_of(16),
             "dspark confidence rows {in_dim}/{hidden} are not 16B-aligned"
         );
-        // Feature row `s*n + i` reads draft row `s*block + i`.
+        // Feature row `s*n + i` reads the drafted row `s*block + first_row + i`.
         let fbase = cs
             .feat
             .get(ctx, in_dim, total)?
@@ -1567,7 +1567,7 @@ impl Qwen35Model {
         for s in 0..b {
             for i in 0..n {
                 dst.push(fbase + ((s * n + i) * in_dim * elem) as u64);
-                src.push(hbase + ((s * block + i) * hidden * elem) as u64);
+                src.push(hbase + ((s * block + first_row + i) * hidden * elem) as u64);
             }
         }
         self.batched_copy(&mut cs.copy, &dst, &src, &[hidden * elem])?;
