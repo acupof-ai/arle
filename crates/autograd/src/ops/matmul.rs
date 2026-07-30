@@ -7,6 +7,7 @@ use crate::{
         Device, cpu_matmul_bt_backward, matmul_bt_output_shape as backend_matmul_bt_output_shape,
         matmul_output_shape as backend_matmul_output_shape,
     },
+    ops::seq_accum::SeqAccum,
     tape::{BackwardOp, GradPairs, SavedContext, Tape, TapeEntry},
     tensor::{Dirty, Tensor, TensorId, TensorStore},
 };
@@ -33,21 +34,18 @@ pub fn matmul(
         .clone();
     let a_shape = store.tensor(a)?.shape.clone();
     let b_shape = store.tensor(b)?.shape.clone();
-    let requires_grad = store.tensor(a)?.requires_grad || store.tensor(b)?.requires_grad;
     let (out_handle, out_shape) = store
         .backend()
         .matmul(&a_handle, &a_shape, &b_handle, &b_shape)?;
     let output_id = store.alloc_device_tensor(out_shape, out_handle)?;
-    store.set_requires_grad(output_id, requires_grad)?;
 
-    if requires_grad {
-        tape.record(TapeEntry {
-            op: BackwardOp::Matmul,
-            output_id,
-            input_ids: smallvec![a, b],
-            saved: SavedContext::MatmulCtx { a, b },
-        });
+    TapeEntry {
+        op: BackwardOp::Matmul,
+        output_id,
+        input_ids: smallvec![a, b],
+        saved: SavedContext::MatmulCtx { a, b },
     }
+    .record(store, tape)?;
 
     Ok(output_id)
 }
@@ -84,21 +82,18 @@ pub fn matmul_bt_with_site(
         .clone();
     let a_shape = store.tensor(a)?.shape.clone();
     let b_shape = store.tensor(b)?.shape.clone();
-    let requires_grad = store.tensor(a)?.requires_grad || store.tensor(b)?.requires_grad;
     let (out_handle, out_shape) = store
         .backend()
         .matmul_bt(&a_handle, &a_shape, &b_handle, &b_shape)?;
     let output_id = store.alloc_device_tensor(out_shape, out_handle)?;
-    store.set_requires_grad(output_id, requires_grad)?;
 
-    if requires_grad {
-        tape.record(TapeEntry {
-            op: BackwardOp::MatmulBT,
-            output_id,
-            input_ids: smallvec![a, b],
-            saved: SavedContext::MatmulBTCtx { a, b, site },
-        });
+    TapeEntry {
+        op: BackwardOp::MatmulBT,
+        output_id,
+        input_ids: smallvec![a, b],
+        saved: SavedContext::MatmulBTCtx { a, b, site },
     }
+    .record(store, tape)?;
 
     Ok(output_id)
 }
@@ -425,7 +420,9 @@ fn matmul_bt_lora_backward_tiled(
     let mut tape = Tape::new();
     tape.set_enabled(false);
     let live_before = store.live_ids().into_iter().collect::<HashSet<_>>();
-    let mut grad_a_chunks = Vec::new();
+    let mut grad_a = need_grad_a
+        .then(|| SeqAccum::new(vec![m, k], 0, store))
+        .transpose()?;
     let mut grad_b_acc = None;
 
     let mut row0 = 0usize;
@@ -466,8 +463,12 @@ fn matmul_bt_lora_backward_tiled(
             need_grad_a,
             need_grad_b,
         )?;
-        if let Some(handle) = grad_a_part {
-            grad_a_chunks.push(store.alloc_device_tensor(a_chunk_shape, handle)?);
+        if let Some(acc) = grad_a.as_mut() {
+            let handle = grad_a_part.ok_or(AutogradError::TapeInvariant(
+                "matmul_bt lora tiled backward requested grad_a but a chunk produced none",
+            ))?;
+            let chunk = store.alloc_device_tensor(a_chunk_shape, handle)?;
+            acc.write_rows(row0, chunk, store)?;
         }
         if let Some(handle) = grad_b_part {
             grad_b_acc = Some(match grad_b_acc {
@@ -476,21 +477,14 @@ fn matmul_bt_lora_backward_tiled(
             });
         }
 
-        let keep = grad_a_chunks.iter().copied().collect::<HashSet<_>>();
+        let keep = grad_a.as_ref().map(SeqAccum::id).into_iter().collect();
         store.free_new_except(&live_before, &keep)?;
         row0 = row1;
     }
 
     let mut grads = GradPairs::new();
-    if need_grad_a {
-        let grad_a = concat_row_chunks(&grad_a_chunks, k, store)?;
-        if store.tensor(grad_a)?.shape != a_shape {
-            return Err(AutogradError::ShapeMismatch {
-                expected: a_shape.to_vec(),
-                got: store.tensor(grad_a)?.shape.clone(),
-            });
-        }
-        grads.push((a, grad_a));
+    if let Some(acc) = grad_a {
+        grads.push((a, acc.finish()));
     }
     if need_grad_b {
         let handle = grad_b_acc.ok_or(AutogradError::TapeInvariant(
@@ -505,56 +499,6 @@ fn matmul_bt_lora_backward_tiled(
         });
     }
     Ok(Some(grads))
-}
-
-fn concat_row_chunks(
-    chunks: &[TensorId],
-    cols: usize,
-    store: &mut TensorStore,
-) -> Result<TensorId> {
-    if chunks.is_empty() {
-        return Err(AutogradError::InvalidIndicesLen {
-            expected: 1,
-            got: 0,
-        });
-    }
-    if chunks.len() == 1 {
-        return Ok(chunks[0]);
-    }
-
-    store.ensure_device(chunks[0])?;
-    let mut acc_handle =
-        store
-            .tensor(chunks[0])?
-            .device_handle
-            .clone()
-            .ok_or(AutogradError::TapeInvariant(
-                "concat_row_chunks: chunk missing device handle",
-            ))?;
-    let rows0 = store.tensor(chunks[0])?.shape[0];
-    let mut acc_shape = vec![1, 1, rows0, cols];
-
-    for &id in &chunks[1..] {
-        store.ensure_device(id)?;
-        let rows = store.tensor(id)?.shape[0];
-        let next_handle =
-            store
-                .tensor(id)?
-                .device_handle
-                .clone()
-                .ok_or(AutogradError::TapeInvariant(
-                    "concat_row_chunks: chunk missing device handle",
-                ))?;
-        let next_shape = vec![1, 1, rows, cols];
-        let (out_handle, out_shape) =
-            store
-                .backend()
-                .concat_axis2(&acc_handle, &acc_shape, &next_handle, &next_shape)?;
-        acc_handle = out_handle;
-        acc_shape = out_shape;
-    }
-
-    store.alloc_device_tensor(vec![acc_shape[2], cols], acc_handle)
 }
 
 fn matmul_output_shape(a_shape: &[usize], b_shape: &[usize]) -> Result<Vec<usize>> {

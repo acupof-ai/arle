@@ -4,6 +4,7 @@ use smallvec::SmallVec;
 
 use crate::{
     AutogradError, Result,
+    ops::seq_accum::SeqAccum,
     tape::{BackwardOp, CheckpointFn, SavedContext, Tape, TapeEntry},
     tensor::{TensorId, TensorStore},
 };
@@ -58,12 +59,13 @@ where
         }
         let checkpoint_fn: CheckpointFn = Arc::new(move |st, tp, _start, inp| replay(st, tp, inp));
         let function_id = tape.register_checkpoint_fn(checkpoint_fn);
-        tape.record(TapeEntry {
+        TapeEntry {
             op: BackwardOp::Checkpoint,
             output_id,
             input_ids,
             saved: SavedContext::CheckpointCtx { function_id },
-        });
+        }
+        .record(store, tape)?;
     } else if tape.offload_checkpoints {
         let _ = tape.take_skip_next_checkpoint_input_offload();
         // FROZEN group (no trainable param → no backward replay, no tape entry):
@@ -212,47 +214,26 @@ where
         });
     };
 
+    let requires_grad = input_ids
+        .iter()
+        .any(|&id| store.get(id).is_some_and(|tensor| tensor.requires_grad));
     let outer_enabled = tape.enabled;
     let live_before = store.live_ids().into_iter().collect::<HashSet<_>>();
     tape.enabled = false;
     let forward = (|| {
-        // Write each chunk into its own rows of one full-seq buffer. Growing the
-        // output by cat_seq instead copies every prior chunk again (O(seq²/chunk)
-        // traffic) and holds old+new at once — that doubled peak is what OOMed
-        // `concat_axis2` at seq=131072.
-        let out_shape = vec![batch, seq, dim];
-        let handle = store.backend().zeros(&out_shape)?;
-        let output = store.alloc_device_tensor(out_shape.clone(), handle)?;
+        let mut out = SeqAccum::new(vec![batch, seq, dim], 1, store)?;
+        // Not left to `record` below: that only fires on an enabled outer tape.
+        store.set_requires_grad(out.id(), requires_grad)?;
         for start in (0..seq).step_by(chunk) {
             let end = (start + chunk).min(seq);
             let x = crate::ops::slice(input, &[0, start, 0], &[batch, end, dim], store, tape)?;
             let mut chunk_inputs = vec![x];
             chunk_inputs.extend_from_slice(&input_ids[1..]);
             let y = replay(store, tape, start, &chunk_inputs)?;
-            store.ensure_device(y)?;
-            let dest = store
-                .tensor(output)?
-                .device_handle
-                .as_ref()
-                .expect("full-seq output")
-                .clone();
-            let src = store
-                .tensor(y)?
-                .device_handle
-                .as_ref()
-                .expect("ensure_device")
-                .clone();
-            let updated = store.backend().write_slice_device(
-                &dest,
-                &src,
-                &out_shape,
-                &[0, start, 0],
-                &[batch, end, dim],
-            )?;
-            store.replace_device_handle(output, updated)?;
-            store.free_new_except(&live_before, &HashSet::from([output]))?;
+            out.write_rows(start, y, store)?;
+            store.free_new_except(&live_before, &HashSet::from([out.id()]))?;
         }
-        Ok(output)
+        Ok(out.finish())
     })();
     tape.enabled = outer_enabled;
     let output_id = match forward {
@@ -266,15 +247,10 @@ where
     keep.extend(input_ids.iter().copied());
     store.free_new_except(&live_before, &keep)?;
 
-    let requires_grad = input_ids
-        .iter()
-        .any(|&id| store.get(id).is_some_and(|tensor| tensor.requires_grad));
-    // The output is a fresh device alloc, which defaults to requires_grad=false.
-    store.set_requires_grad(output_id, requires_grad)?;
     if outer_enabled && requires_grad {
         let effective_chunk = chunk.min(seq);
         let function_id = tape.register_checkpoint_fn(Arc::new(replay));
-        tape.record(TapeEntry {
+        TapeEntry {
             op: BackwardOp::SeqChunkedRecompute,
             output_id,
             input_ids: input_ids.into_iter().collect(),
@@ -285,7 +261,8 @@ where
                 dim,
                 chunk: effective_chunk,
             },
-        });
+        }
+        .record(store, tape)?;
     }
     Ok(output_id)
 }

@@ -12,6 +12,7 @@ use crate::{
     AutogradError, Result,
     backend::DeviceHandle,
     ops,
+    ops::seq_accum::SeqAccum,
     tensor::{Dirty, TensorId, TensorStore},
 };
 
@@ -362,6 +363,23 @@ impl TapeEntry {
             _ => None,
         }
     }
+
+    /// The output's `requires_grad` is derived here — the OR over `input_ids` — so
+    /// a call site can't forget it, or let the mark drift away from its alloc. The
+    /// mark lands even on a disabled tape, which is what a `checkpoint` inner
+    /// replay needs. Fast-path legal only while `set_requires_grad` leaves device
+    /// residency alone.
+    pub fn record(self, store: &mut TensorStore, tape: &mut Tape) -> Result<()> {
+        let requires_grad = self
+            .input_ids
+            .iter()
+            .any(|&id| store.get(id).is_some_and(|tensor| tensor.requires_grad));
+        store.set_requires_grad(self.output_id, requires_grad)?;
+        if tape.enabled && requires_grad {
+            tape.entries.push(self);
+        }
+        Ok(())
+    }
 }
 
 pub(crate) type GradPairs = SmallVec<[(TensorId, TensorId); 2]>;
@@ -433,12 +451,6 @@ impl Tape {
             skip_next_checkpoint_input_offload: false,
             checkpoint_op_mem_scope: None,
             checkpoint_op_mem_disarmed: false,
-        }
-    }
-
-    pub fn record(&mut self, entry: TapeEntry) {
-        if self.enabled {
-            self.entries.push(entry);
         }
     }
 
@@ -1052,13 +1064,9 @@ impl Tape {
         let param_ids = &entry.input_ids[1..];
 
         let need_input_grad = store.tensor(input_id)?.requires_grad;
-        let input_shape = vec![batch, seq, dim];
-        let mut d_input = if need_input_grad {
-            let handle = store.backend().zeros(&input_shape)?;
-            Some(store.alloc_device_tensor(input_shape.clone(), handle)?)
-        } else {
-            None
-        };
+        let mut d_input = need_input_grad
+            .then(|| SeqAccum::new(vec![batch, seq, dim], 1, store))
+            .transpose()?;
         let mut d_param: Vec<Option<TensorId>> = vec![None; param_ids.len()];
 
         let mut start = 0;
@@ -1096,28 +1104,8 @@ impl Tape {
             let grads =
                 chunk_tape.backward_collect_targets_only(loss, store, &chunk_inputs, None)?;
 
-            if let (Some(dest), Some(&g)) = (d_input, grads.get(&x_c)) {
-                store.ensure_device(g)?;
-                let dest_handle = store
-                    .tensor(dest)?
-                    .device_handle
-                    .as_ref()
-                    .expect("device accumulator")
-                    .clone();
-                let grad_handle = store
-                    .tensor(g)?
-                    .device_handle
-                    .as_ref()
-                    .expect("ensure_device")
-                    .clone();
-                let updated = store.backend().write_slice_device(
-                    &dest_handle,
-                    &grad_handle,
-                    &input_shape,
-                    &[0, start, 0],
-                    &[batch, end, dim],
-                )?;
-                store.replace_device_handle(dest, updated)?;
+            if let (Some(dest), Some(&g)) = (d_input.as_mut(), grads.get(&x_c)) {
+                dest.write_rows(start, g, store)?;
             }
             for (slot, &pid) in param_ids.iter().enumerate() {
                 if let Some(&g) = grads.get(&pid) {
@@ -1166,6 +1154,8 @@ impl Tape {
             }
 
             let keep = d_input
+                .as_ref()
+                .map(SeqAccum::id)
                 .into_iter()
                 .chain(d_param.iter().flatten().copied())
                 .collect();
@@ -1179,8 +1169,8 @@ impl Tape {
         }
 
         let mut pairs = GradPairs::new();
-        if let Some(g) = d_input.take() {
-            pairs.push((input_id, g));
+        if let Some(acc) = d_input.take() {
+            pairs.push((input_id, acc.finish()));
         }
         for (slot, &pid) in param_ids.iter().enumerate() {
             if let Some(g) = d_param[slot].take() {
@@ -1430,6 +1420,39 @@ fn merge_grad(
 mod tests {
     use super::*;
     use crate::tensor::Tensor;
+
+    /// A fresh `alloc_device_tensor` defaults to `requires_grad=false`; `record`
+    /// must mark it from its inputs with no help from the call site, and must do so
+    /// even when the tape is off (`checkpoint`'s inner replay runs disabled).
+    #[test]
+    fn record_marks_output_from_inputs_even_when_disabled() {
+        for enabled in [true, false] {
+            let mut store = TensorStore::default();
+            let mut tape = Tape::new();
+            tape.set_enabled(enabled);
+            let x = store.alloc(Tensor::new(vec![2.0, -3.0], vec![2], true).expect("create x"));
+            let handle = store.backend().zeros(&[2]).expect("device zeros");
+            let out = store
+                .alloc_device_tensor(vec![2], handle)
+                .expect("device alloc");
+            assert!(!store.tensor(out).expect("out").requires_grad);
+
+            TapeEntry {
+                op: BackwardOp::Mul,
+                output_id: out,
+                input_ids: smallvec::smallvec![x, x],
+                saved: SavedContext::Tensors(smallvec::smallvec![x, x]),
+            }
+            .record(&mut store, &mut tape)
+            .expect("record");
+
+            assert!(
+                store.tensor(out).expect("out").requires_grad,
+                "enabled={enabled}"
+            );
+            assert_eq!(tape.entries.len(), usize::from(enabled));
+        }
+    }
 
     #[test]
     fn backward_on_empty_tape_does_not_panic() {

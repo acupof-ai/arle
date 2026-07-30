@@ -101,24 +101,21 @@ pub fn ep_dispatch_op(
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
-    let requires_grad = store.tensor(input)?.requires_grad;
     let data = store.tensor_host(input)?.data;
     let out = ep_dispatch(&data, plan, dim);
     let output_id = store.alloc(Tensor::new(out, vec![plan.num_slots(), dim], false)?);
-    store.set_requires_grad(output_id, requires_grad)?;
-    if tape.enabled && requires_grad {
-        tape.record(TapeEntry {
-            op: BackwardOp::EpDispatch,
-            output_id,
-            input_ids: smallvec![input],
-            saved: SavedContext::EpPlanCtx {
-                input,
-                src: plan_src_flat(plan),
-                num_tokens: plan.num_tokens,
-                dim,
-            },
-        });
+    TapeEntry {
+        op: BackwardOp::EpDispatch,
+        output_id,
+        input_ids: smallvec![input],
+        saved: SavedContext::EpPlanCtx {
+            input,
+            src: plan_src_flat(plan),
+            num_tokens: plan.num_tokens,
+            dim,
+        },
     }
+    .record(store, tape)?;
     Ok(output_id)
 }
 
@@ -131,24 +128,21 @@ pub fn ep_combine_op(
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
-    let requires_grad = store.tensor(input)?.requires_grad;
     let data = store.tensor_host(input)?.data;
     let out = ep_combine(&data, plan, dim);
     let output_id = store.alloc(Tensor::new(out, vec![plan.num_tokens, dim], false)?);
-    store.set_requires_grad(output_id, requires_grad)?;
-    if tape.enabled && requires_grad {
-        tape.record(TapeEntry {
-            op: BackwardOp::EpCombine,
-            output_id,
-            input_ids: smallvec![input],
-            saved: SavedContext::EpPlanCtx {
-                input,
-                src: plan_src_flat(plan),
-                num_tokens: plan.num_tokens,
-                dim,
-            },
-        });
+    TapeEntry {
+        op: BackwardOp::EpCombine,
+        output_id,
+        input_ids: smallvec![input],
+        saved: SavedContext::EpPlanCtx {
+            input,
+            src: plan_src_flat(plan),
+            num_tokens: plan.num_tokens,
+            dim,
+        },
     }
+    .record(store, tape)?;
     Ok(output_id)
 }
 

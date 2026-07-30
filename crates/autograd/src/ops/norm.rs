@@ -45,10 +45,7 @@ fn rmsnorm_device_lazy(
     store.ensure_device(weight)?;
     store.ensure_device(x)?;
 
-    let (x_shape, x_requires_grad) = {
-        let t = store.tensor(x)?;
-        (t.shape.clone(), t.requires_grad)
-    };
+    let x_shape = store.tensor(x)?.shape.clone();
     let hidden = *x_shape.last().ok_or(AutogradError::InvalidRank {
         expected: "at least 1",
         got: 0,
@@ -69,30 +66,26 @@ fn rmsnorm_device_lazy(
             "rmsnorm: ensure_device left x without a device handle",
         ))?
         .clone();
-    let requires_grad = x_requires_grad || weight_tensor.requires_grad;
-
     let out_handle = store
         .backend()
         .rms_norm(&x_handle, &weight_tensor.data, &x_shape, eps)?;
     let output_id = store.alloc_device_tensor(x_shape, out_handle)?;
-    store.set_requires_grad(output_id, requires_grad)?;
 
-    if requires_grad {
-        // Empty inv_rms signals "recompute from x in backward". x is
-        // Dirty::Device here; tape.backward's batch-flush will make it
-        // Dirty::Both before rmsnorm_backward runs.
-        tape.record(TapeEntry {
-            op: BackwardOp::RMSNorm,
-            output_id,
-            input_ids: smallvec![x, weight],
-            saved: SavedContext::RMSNormCtx {
-                x,
-                weight,
-                inv_rms: Vec::new(),
-                eps,
-            },
-        });
+    // Empty inv_rms signals "recompute from x in backward". x is
+    // Dirty::Device here; tape.backward's batch-flush will make it
+    // Dirty::Both before rmsnorm_backward runs.
+    TapeEntry {
+        op: BackwardOp::RMSNorm,
+        output_id,
+        input_ids: smallvec![x, weight],
+        saved: SavedContext::RMSNormCtx {
+            x,
+            weight,
+            inv_rms: Vec::new(),
+            eps,
+        },
     }
+    .record(store, tape)?;
 
     Ok(output_id)
 }
@@ -137,7 +130,7 @@ fn rmsnorm_host_eager(
                 1.0 / ((sum_sq / hidden as f32) + eps).sqrt()
             })
             .collect();
-        tape.record(TapeEntry {
+        TapeEntry {
             op: BackwardOp::RMSNorm,
             output_id,
             input_ids: smallvec![x, weight],
@@ -147,7 +140,8 @@ fn rmsnorm_host_eager(
                 inv_rms,
                 eps,
             },
-        });
+        }
+        .record(store, tape)?;
     }
 
     Ok(output_id)

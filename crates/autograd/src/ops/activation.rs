@@ -29,10 +29,7 @@ fn exp_device_lazy(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Res
     // tensor, but re-calling guards a future Dirty::Both path from silent
     // drift (mirrors `silu_device_lazy`).
     store.ensure_device(x)?;
-    let (input_shape, requires_grad) = {
-        let tensor = store.tensor(x)?;
-        (tensor.shape.clone(), tensor.requires_grad)
-    };
+    let input_shape = store.tensor(x)?.shape.clone();
     let input_handle = store
         .tensor(x)?
         .device_handle
@@ -44,16 +41,14 @@ fn exp_device_lazy(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Res
 
     let out_handle = store.backend().exp(&input_handle, &input_shape)?;
     let output_id = store.alloc_device_tensor(input_shape, out_handle)?;
-    store.set_requires_grad(output_id, requires_grad)?;
 
-    if requires_grad {
-        tape.record(TapeEntry {
-            op: BackwardOp::Exp,
-            output_id,
-            input_ids: smallvec![x],
-            saved: SavedContext::Tensor(output_id),
-        });
+    TapeEntry {
+        op: BackwardOp::Exp,
+        output_id,
+        input_ids: smallvec![x],
+        saved: SavedContext::Tensor(output_id),
     }
+    .record(store, tape)?;
 
     Ok(output_id)
 }
@@ -67,14 +62,13 @@ fn exp_host_eager(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Resu
         input.requires_grad,
     )?);
 
-    if input.requires_grad {
-        tape.record(TapeEntry {
-            op: BackwardOp::Exp,
-            output_id,
-            input_ids: smallvec![x],
-            saved: SavedContext::Tensor(output_id),
-        });
+    TapeEntry {
+        op: BackwardOp::Exp,
+        output_id,
+        input_ids: smallvec![x],
+        saved: SavedContext::Tensor(output_id),
     }
+    .record(store, tape)?;
 
     Ok(output_id)
 }
@@ -100,10 +94,7 @@ pub fn gelu(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<Ten
 
 fn gelu_device_lazy(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
     store.ensure_device(x)?;
-    let (input_shape, requires_grad) = {
-        let tensor = store.tensor(x)?;
-        (tensor.shape.clone(), tensor.requires_grad)
-    };
+    let input_shape = store.tensor(x)?.shape.clone();
     let input_handle = store
         .tensor(x)?
         .device_handle
@@ -115,16 +106,14 @@ fn gelu_device_lazy(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Re
 
     let out_handle = store.backend().gelu(&input_handle, &input_shape)?;
     let output_id = store.alloc_device_tensor(input_shape, out_handle)?;
-    store.set_requires_grad(output_id, requires_grad)?;
 
-    if requires_grad {
-        tape.record(TapeEntry {
-            op: BackwardOp::Gelu,
-            output_id,
-            input_ids: smallvec![x],
-            saved: SavedContext::GeluCtx { x },
-        });
+    TapeEntry {
+        op: BackwardOp::Gelu,
+        output_id,
+        input_ids: smallvec![x],
+        saved: SavedContext::GeluCtx { x },
     }
+    .record(store, tape)?;
 
     Ok(output_id)
 }
@@ -142,14 +131,13 @@ fn gelu_host_eager(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Res
         input.requires_grad,
     )?);
 
-    if input.requires_grad {
-        tape.record(TapeEntry {
-            op: BackwardOp::Gelu,
-            output_id,
-            input_ids: smallvec![x],
-            saved: SavedContext::GeluCtx { x },
-        });
+    TapeEntry {
+        op: BackwardOp::Gelu,
+        output_id,
+        input_ids: smallvec![x],
+        saved: SavedContext::GeluCtx { x },
     }
+    .record(store, tape)?;
 
     Ok(output_id)
 }
@@ -173,10 +161,7 @@ fn silu_device_lazy(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Re
     // tensor, but re-calling guards a future Dirty::Both path from silent
     // drift (mirrors `softmax_device_lazy`).
     store.ensure_device(x)?;
-    let (input_shape, requires_grad) = {
-        let tensor = store.tensor(x)?;
-        (tensor.shape.clone(), tensor.requires_grad)
-    };
+    let input_shape = store.tensor(x)?.shape.clone();
     let input_handle = store
         .tensor(x)?
         .device_handle
@@ -188,16 +173,14 @@ fn silu_device_lazy(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Re
 
     let out_handle = store.backend().silu(&input_handle, &input_shape)?;
     let output_id = store.alloc_device_tensor(input_shape, out_handle)?;
-    store.set_requires_grad(output_id, requires_grad)?;
 
-    if requires_grad {
-        tape.record(TapeEntry {
-            op: BackwardOp::Silu,
-            output_id,
-            input_ids: smallvec![x],
-            saved: SavedContext::SiluCtx { x },
-        });
+    TapeEntry {
+        op: BackwardOp::Silu,
+        output_id,
+        input_ids: smallvec![x],
+        saved: SavedContext::SiluCtx { x },
     }
+    .record(store, tape)?;
 
     Ok(output_id)
 }
@@ -211,14 +194,13 @@ fn silu_host_eager(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Res
         input.requires_grad,
     )?);
 
-    if input.requires_grad {
-        tape.record(TapeEntry {
-            op: BackwardOp::Silu,
-            output_id,
-            input_ids: smallvec![x],
-            saved: SavedContext::SiluCtx { x },
-        });
+    TapeEntry {
+        op: BackwardOp::Silu,
+        output_id,
+        input_ids: smallvec![x],
+        saved: SavedContext::SiluCtx { x },
     }
+    .record(store, tape)?;
 
     Ok(output_id)
 }
@@ -243,10 +225,7 @@ pub fn sigmoid(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<
 
 fn sigmoid_device_lazy(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
     store.ensure_device(x)?;
-    let (input_shape, requires_grad) = {
-        let tensor = store.tensor(x)?;
-        (tensor.shape.clone(), tensor.requires_grad)
-    };
+    let input_shape = store.tensor(x)?.shape.clone();
     let input_handle = store
         .tensor(x)?
         .device_handle
@@ -258,16 +237,14 @@ fn sigmoid_device_lazy(x: TensorId, store: &mut TensorStore, tape: &mut Tape) ->
 
     let out_handle = store.backend().sigmoid(&input_handle, &input_shape)?;
     let output_id = store.alloc_device_tensor(input_shape, out_handle)?;
-    store.set_requires_grad(output_id, requires_grad)?;
 
-    if requires_grad {
-        tape.record(TapeEntry {
-            op: BackwardOp::Sigmoid,
-            output_id,
-            input_ids: smallvec![x],
-            saved: SavedContext::SigmoidCtx { y: output_id },
-        });
+    TapeEntry {
+        op: BackwardOp::Sigmoid,
+        output_id,
+        input_ids: smallvec![x],
+        saved: SavedContext::SigmoidCtx { y: output_id },
     }
+    .record(store, tape)?;
 
     Ok(output_id)
 }
@@ -281,14 +258,13 @@ fn sigmoid_host_eager(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> 
         input.requires_grad,
     )?);
 
-    if input.requires_grad {
-        tape.record(TapeEntry {
-            op: BackwardOp::Sigmoid,
-            output_id,
-            input_ids: smallvec![x],
-            saved: SavedContext::SigmoidCtx { y: output_id },
-        });
+    TapeEntry {
+        op: BackwardOp::Sigmoid,
+        output_id,
+        input_ids: smallvec![x],
+        saved: SavedContext::SigmoidCtx { y: output_id },
     }
+    .record(store, tape)?;
 
     Ok(output_id)
 }
