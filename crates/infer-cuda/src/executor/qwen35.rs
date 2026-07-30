@@ -1940,12 +1940,14 @@ impl Qwen35CudaExecutor {
                 .filter(|(s, _)| pick[*s])
                 .map(|(_, st)| st.as_mut().expect("seeded slot"))
                 .collect();
+            let sp: Vec<&SamplingParams> = idx.iter().map(|&i| &decode_rows[i].params).collect();
             let chains = model.dspark_draft_blocks(
                 &ds.head,
                 &mut dfs,
                 &mut ds.scratch,
                 &anchors,
                 &starts,
+                &sp,
             )?;
             for (n, &i) in idx.iter().enumerate() {
                 pre[i] = Some(chains[n].clone());
@@ -2754,16 +2756,14 @@ impl Qwen35CudaExecutor {
         use super::spec_decode::{DecodeRoute, SpecKind};
         let kind = self.spec_kind();
         // Only a batched DSpark draft pays above c=1. MTP still drafts per row,
-        // a markov head resolves row r from row r-1, sampling syncs per draw,
-        // and a quant-KV pool cannot build a multi-row page table — each holds
-        // the gate at 1.
+        // a markov head resolves row r from row r-1, and a quant-KV pool cannot
+        // build a multi-row page table — each holds the gate at 1.
         let batched = kind == SpecKind::Dspark
             && self.paged_kv_bf16()
             && self
                 .dspark
                 .as_ref()
-                .is_some_and(|ds| ds.head.batchable_draft())
-            && decode_rows.iter().all(|r| r.params.is_greedy());
+                .is_some_and(|ds| ds.head.batchable_draft());
         let gate = match batched {
             true => crate::runtime_flags::spec_max_batch(),
             false => 1,
