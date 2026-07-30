@@ -216,27 +216,43 @@ where
     let live_before = store.live_ids().into_iter().collect::<HashSet<_>>();
     tape.enabled = false;
     let forward = (|| {
-        let mut output = None;
+        // Write each chunk into its own rows of one full-seq buffer. Growing the
+        // output by cat_seq instead copies every prior chunk again (O(seq²/chunk)
+        // traffic) and holds old+new at once — that doubled peak is what OOMed
+        // `concat_axis2` at seq=131072.
+        let out_shape = vec![batch, seq, dim];
+        let handle = store.backend().zeros(&out_shape)?;
+        let output = store.alloc_device_tensor(out_shape.clone(), handle)?;
         for start in (0..seq).step_by(chunk) {
             let end = (start + chunk).min(seq);
             let x = crate::ops::slice(input, &[0, start, 0], &[batch, end, dim], store, tape)?;
             let mut chunk_inputs = vec![x];
             chunk_inputs.extend_from_slice(&input_ids[1..]);
             let y = replay(store, tape, start, &chunk_inputs)?;
-            let y = crate::ops::reshape(y, &[batch, 1, end - start, dim], store, tape)?;
-            output = Some(match output {
-                None => y,
-                Some(acc) => crate::ops::cat_seq(acc, y, store, tape)?,
-            });
-            store.free_new_except(
-                &live_before,
-                &HashSet::from([output.expect("chunk output")]),
+            store.ensure_device(y)?;
+            let dest = store
+                .tensor(output)?
+                .device_handle
+                .as_ref()
+                .expect("full-seq output")
+                .clone();
+            let src = store
+                .tensor(y)?
+                .device_handle
+                .as_ref()
+                .expect("ensure_device")
+                .clone();
+            let updated = store.backend().write_slice_device(
+                &dest,
+                &src,
+                &out_shape,
+                &[0, start, 0],
+                &[batch, end, dim],
             )?;
+            store.replace_device_handle(output, updated)?;
+            store.free_new_except(&live_before, &HashSet::from([output]))?;
         }
-        let output = output.ok_or(AutogradError::TapeInvariant(
-            "seq_chunked_recompute empty sequence",
-        ))?;
-        crate::ops::reshape(output, &[batch, seq, dim], store, tape)
+        Ok(output)
     })();
     tape.enabled = outer_enabled;
     let output_id = match forward {
@@ -253,6 +269,8 @@ where
     let requires_grad = input_ids
         .iter()
         .any(|&id| store.get(id).is_some_and(|tensor| tensor.requires_grad));
+    // The output is a fresh device alloc, which defaults to requires_grad=false.
+    store.set_requires_grad(output_id, requires_grad)?;
     if outer_enabled && requires_grad {
         let effective_chunk = chunk.min(seq);
         let function_id = tape.register_checkpoint_fn(Arc::new(replay));
