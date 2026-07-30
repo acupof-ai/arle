@@ -40,10 +40,7 @@ where
     keep.extend(input_ids.iter().copied());
     store.free_new_except(&live_before, &keep)?;
 
-    let requires_grad = input_ids
-        .iter()
-        .any(|&id| store.get(id).is_some_and(|tensor| tensor.requires_grad));
-    if requires_grad {
+    if store.any_requires_grad(&input_ids) {
         // Offload the saved inputs to host RAM: each layer's input is the prior
         // layer's output and is untouched until backward replay (which re-fetches
         // via ensure_device), so this frees the ~30 GB of grad-checkpoints a long
@@ -214,9 +211,7 @@ where
         });
     };
 
-    let requires_grad = input_ids
-        .iter()
-        .any(|&id| store.get(id).is_some_and(|tensor| tensor.requires_grad));
+    let requires_grad = store.any_requires_grad(&input_ids);
     let outer_enabled = tape.enabled;
     let live_before = store.live_ids().into_iter().collect::<HashSet<_>>();
     tape.enabled = false;

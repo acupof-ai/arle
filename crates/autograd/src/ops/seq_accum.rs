@@ -1,6 +1,5 @@
 use crate::{
     AutogradError, Result,
-    backend::DeviceHandle,
     tensor::{TensorId, TensorStore},
 };
 
@@ -44,40 +43,32 @@ impl SeqAccum {
         store: &mut TensorStore,
     ) -> Result<()> {
         store.ensure_device(src)?;
-        let src_shape = store.tensor(src)?.shape.clone();
-        let conforms =
-            src_shape.len() == self.shape.len()
-                && src_shape.iter().zip(&self.shape).enumerate().all(
-                    |(axis, (src_dim, dest_dim))| axis == self.row_axis || src_dim == dest_dim,
-                );
-        if !conforms {
-            return Err(AutogradError::ShapeMismatch {
-                expected: self.shape.clone(),
-                got: src_shape,
-            });
+        let src_shape = &store.tensor(src)?.shape;
+        let mut expected = self.shape.clone();
+        expected[self.row_axis] = src_shape.get(self.row_axis).copied().unwrap_or(0);
+        if *src_shape != expected {
+            let got = src_shape.clone();
+            return Err(AutogradError::ShapeMismatch { expected, got });
         }
         let mut starts = vec![0; self.shape.len()];
         starts[self.row_axis] = start;
         let mut ends = self.shape.clone();
-        ends[self.row_axis] = start + src_shape[self.row_axis];
-        // Probe before the clone bumps it: in-place write would corrupt a sibling.
-        if store
+        ends[self.row_axis] = start + expected[self.row_axis];
+        let dest_handle = store
             .tensor(self.id)?
             .device_handle
             .as_ref()
-            .and_then(DeviceHandle::device_buffer_strong_count)
+            .expect("accumulator allocated on device");
+        // Probe before the clone bumps it: in-place write would corrupt a sibling.
+        if dest_handle
+            .device_buffer_strong_count()
             .is_some_and(|count| count != 1)
         {
             return Err(AutogradError::TapeInvariant(
                 "SeqAccum buffer is shared; write_rows needs sole ownership",
             ));
         }
-        let dest = store
-            .tensor(self.id)?
-            .device_handle
-            .as_ref()
-            .expect("accumulator allocated on device")
-            .clone();
+        let dest = dest_handle.clone();
         let src_handle = store
             .tensor(src)?
             .device_handle

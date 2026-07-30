@@ -800,6 +800,13 @@ impl TensorStore {
         Ok(())
     }
 
+    /// An op's output requires grad iff any input does. Freed inputs read as
+    /// false, matching a checkpoint replay whose saved set is already reclaimed.
+    pub fn any_requires_grad(&self, ids: &[TensorId]) -> bool {
+        ids.iter()
+            .any(|&id| self.get(id).is_some_and(|tensor| tensor.requires_grad))
+    }
+
     pub fn detach(&mut self, id: TensorId) -> Result<TensorId> {
         let detached = self.clone_tensor(id)?;
         self.set_requires_grad(detached, false)?;

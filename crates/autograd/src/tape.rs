@@ -370,10 +370,7 @@ impl TapeEntry {
     /// replay needs. Fast-path legal only while `set_requires_grad` leaves device
     /// residency alone.
     pub fn record(self, store: &mut TensorStore, tape: &mut Tape) -> Result<()> {
-        let requires_grad = self
-            .input_ids
-            .iter()
-            .any(|&id| store.get(id).is_some_and(|tensor| tensor.requires_grad));
+        let requires_grad = store.any_requires_grad(&self.input_ids);
         store.set_requires_grad(self.output_id, requires_grad)?;
         if tape.enabled && requires_grad {
             tape.entries.push(self);
