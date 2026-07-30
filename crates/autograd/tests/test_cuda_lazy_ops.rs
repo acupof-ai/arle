@@ -2147,3 +2147,168 @@ fn rectangular_cp_sdpa_backward_above_65535_completes() {
         q_len * 4 * 128
     );
 }
+
+// === Track A U2 micro-gate: device ring block kernels vs the green host reference ===
+// Runs the N-block device ring (fwd_merge → finalize → per-block bwd) on ONE GPU,
+// no NCCL, and diffs against ring_forward_tile / ring_backward_tile — the verified
+// flash-2 host spec. Same shape as the host ring_matches_full_softmax test
+// (seq=12, dim=4, N=3). Inputs are bf16-quantized on BOTH sides so the bar
+// isolates a merge/adjoint bug (O(1) error) from bf16 rounding (~1e-2): a correct
+// kernel matches the bf16-fed host math to ~1e-4; a wrong merge blows past it.
+#[test]
+fn cuda_ring_block_matches_host_reference_fwd_bwd() {
+    use autograd::backend::RingBlockDims;
+    use autograd::ops::ring_attention::{ring_backward_tile, ring_forward_tile};
+
+    let Ok(backend) = CudaBackend::new(0) else {
+        eprintln!("skipping cuda_ring_block_matches_host_reference_fwd_bwd: no CUDA device");
+        return;
+    };
+
+    let (seq, dim, n) = (12usize, 4usize, 3usize);
+    let blk = seq / n;
+    let scale = 1.0 / (dim as f32).sqrt();
+    // bf16-quantize (round-to-nearest-even, matching CUDA __float2bfloat16) so the
+    // host reference sees the SAME inputs the kernel does — the 1e-4 bar then
+    // isolates a merge/adjoint bug from bf16 rounding.
+    let to_bf16 = |x: f32| -> f32 {
+        let bits = x.to_bits();
+        if (bits & 0x7fff_ffff) > 0x7f80_0000 {
+            return x; // NaN passthrough
+        }
+        let rounded = bits.wrapping_add(0x7fff + ((bits >> 16) & 1));
+        f32::from_bits(rounded & 0xffff_0000)
+    };
+    let bf16 = |v: &[f32]| -> Vec<f32> { v.iter().map(|&x| to_bf16(x)).collect() };
+    let q = bf16(&rng_vec(1, seq * dim, 0.5));
+    let k = bf16(&rng_vec(2, seq * dim, 0.5));
+    let v = bf16(&rng_vec(3, seq * dim, 0.5));
+    let d_out = bf16(&rng_vec(4, seq * dim, 0.5));
+
+    // --- HOST reference (per q-shard, causal prefix of blocks). ---
+    let mut host_out = vec![0.0f32; seq * dim];
+    let mut host_lse = vec![0.0f32; seq];
+    let mut host_gq = vec![0.0f32; seq * dim];
+    let mut host_gk = vec![0.0f32; seq * dim];
+    let mut host_gv = vec![0.0f32; seq * dim];
+    for shard in 0..n {
+        let q_abs = shard * blk;
+        let q_shard = &q[q_abs * dim..(q_abs + blk) * dim];
+        let do_shard = &d_out[q_abs * dim..(q_abs + blk) * dim];
+        let blocks: Vec<(&[f32], &[f32], usize)> = (0..=shard)
+            .map(|j| {
+                let s = j * blk;
+                (
+                    &k[s * dim..(s + blk) * dim],
+                    &v[s * dim..(s + blk) * dim],
+                    s,
+                )
+            })
+            .collect();
+        let (o, lse) = ring_forward_tile(q_shard, &blocks, blk, dim, scale, q_abs);
+        host_out[q_abs * dim..(q_abs + blk) * dim].copy_from_slice(&o);
+        host_lse[q_abs..q_abs + blk].copy_from_slice(&lse);
+        let (gq, per_block) =
+            ring_backward_tile(q_shard, &blocks, &o, &lse, do_shard, blk, dim, scale, q_abs);
+        for (i, val) in gq.iter().enumerate() {
+            host_gq[q_abs * dim + i] += val;
+        }
+        for (j, (gk, gv)) in per_block.iter().enumerate() {
+            let s = j * blk;
+            for (i, val) in gk.iter().enumerate() {
+                host_gk[s * dim + i] += val;
+            }
+            for (i, val) in gv.iter().enumerate() {
+                host_gv[s * dim + i] += val;
+            }
+        }
+    }
+
+    // --- DEVICE ring, per shard: N fwd_merge (one KV block each) → finalize → N bwd. ---
+    // Single (batch·head) tile; q_rows = blk. Blocks are the causal prefix 0..=shard.
+    let dev_upload = |data: &[f32], len: usize| backend.upload(data, &[len]).expect("upload");
+    let neg_inf = vec![f32::NEG_INFINITY; blk];
+    let mut dev_out = vec![0.0f32; seq * dim];
+    let mut dev_gq = vec![0.0f32; seq * dim];
+    let mut dev_gk = vec![0.0f32; seq * dim];
+    let mut dev_gv = vec![0.0f32; seq * dim];
+    for shard in 0..n {
+        let q_abs = shard * blk;
+        let q_h = dev_upload(&q[q_abs * dim..(q_abs + blk) * dim], blk * dim);
+        // Forward: merge blocks 0..=shard in order.
+        let mut acc_m = dev_upload(&neg_inf, blk);
+        let mut acc_l = dev_upload(&vec![0.0f32; blk], blk);
+        let mut acc_o = dev_upload(&vec![0.0f32; blk * dim], blk * dim);
+        for j in 0..=shard {
+            let s = j * blk;
+            let k_h = dev_upload(&k[s * dim..(s + blk) * dim], blk * dim);
+            let v_h = dev_upload(&v[s * dim..(s + blk) * dim], blk * dim);
+            let dims = RingBlockDims {
+                num_q_tiles: 1,
+                num_q_heads: 1,
+                num_kv_heads: 1,
+                head_dim: dim,
+                q_rows: blk,
+                blk_len: blk,
+                q_abs,
+                k_abs: s,
+                sm_scale: scale,
+            };
+            let (m2, l2, o2) = backend
+                .ring_block_fwd_merge(&q_h, &k_h, &v_h, &acc_m, &acc_l, &acc_o, dims)
+                .expect("ring fwd merge");
+            acc_m = m2;
+            acc_l = l2;
+            acc_o = o2;
+        }
+        let (out_h, lse_h) = backend
+            .ring_block_finalize(&acc_m, &acc_l, &acc_o, blk, dim)
+            .expect("ring finalize");
+        let out_v = backend.readback(&out_h).expect("out readback");
+        dev_out[q_abs * dim..(q_abs + blk) * dim].copy_from_slice(&out_v);
+
+        // Backward: grad_q accumulates across blocks; grad_k/grad_v per source block.
+        let do_h = dev_upload(&d_out[q_abs * dim..(q_abs + blk) * dim], blk * dim);
+        let mut grad_q = dev_upload(&vec![0.0f32; blk * dim], blk * dim);
+        for j in 0..=shard {
+            let s = j * blk;
+            let k_h = dev_upload(&k[s * dim..(s + blk) * dim], blk * dim);
+            let v_h = dev_upload(&v[s * dim..(s + blk) * dim], blk * dim);
+            let dims = RingBlockDims {
+                num_q_tiles: 1,
+                num_q_heads: 1,
+                num_kv_heads: 1,
+                head_dim: dim,
+                q_rows: blk,
+                blk_len: blk,
+                q_abs,
+                k_abs: s,
+                sm_scale: scale,
+            };
+            let (gq2, gk_b, gv_b) = backend
+                .ring_block_bwd(&q_h, &k_h, &v_h, &out_h, &lse_h, &do_h, &grad_q, dims)
+                .expect("ring bwd");
+            grad_q = gq2;
+            let gk_v = backend.readback(&gk_b).expect("gk readback");
+            let gv_v = backend.readback(&gv_b).expect("gv readback");
+            for i in 0..blk * dim {
+                dev_gk[s * dim + i] += gk_v[i];
+                dev_gv[s * dim + i] += gv_v[i];
+            }
+        }
+        let gq_v = backend.readback(&grad_q).expect("gq readback");
+        dev_gq[q_abs * dim..(q_abs + blk) * dim].copy_from_slice(&gq_v);
+    }
+
+    let check = |name: &str, dev: &[f32], host: &[f32]| {
+        let err = max_abs_diff(dev, host);
+        assert!(
+            err < 1e-4,
+            "ring device {name} != host reference: max_abs={err:.3e}"
+        );
+    };
+    check("out", &dev_out, &host_out);
+    check("grad_q", &dev_gq, &host_gq);
+    check("grad_k", &dev_gk, &host_gk);
+    check("grad_v", &dev_gv, &host_gv);
+}

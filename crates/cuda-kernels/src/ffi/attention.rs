@@ -193,6 +193,74 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    /// Context-parallel ring attention: fuse one q-tile × one KV block into the
+    /// running flash-2 (M, L, O) accumulator on-device (no full-seq buffer, no
+    /// readback between ring steps). Functional: reads `*_in`, writes `*_out`
+    /// (`[num_q_tiles, q_rows]` M/L, `[num_q_tiles, q_rows, head_dim]` O, f32) —
+    /// caller inits the first block's `*_in` M to -inf, L/O to 0. Absolute causal
+    /// mask via q_abs/k_abs.
+    pub fn ring_block_attention_fwd_merge_cuda(
+        q: *const Half,
+        k_blk: *const Half,
+        v_blk: *const Half,
+        acc_m_in: *const f32,
+        acc_l_in: *const f32,
+        acc_o_in: *const f32,
+        acc_m_out: *mut f32,
+        acc_l_out: *mut f32,
+        acc_o_out: *mut f32,
+        num_q_tiles: i32,
+        num_q_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        q_rows: i32,
+        blk_len: i32,
+        q_abs: i32,
+        k_abs: i32,
+        sm_scale: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    /// Finalize the ring accumulator after all blocks: `out = O / L` (f32) and
+    /// `lse = M + ln(L)` (f32, one per row). `total_rows = num_q_tiles * q_rows`.
+    /// `out` is f32 — the ring output stays on the f32 autograd tape.
+    pub fn ring_block_attention_finalize_cuda(
+        acc_m: *const f32,
+        acc_l: *const f32,
+        acc_o: *const f32,
+        out: *mut f32,
+        lse: *mut f32,
+        total_rows: i32,
+        head_dim: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    /// Per-block ring-attention backward (flash-2 adjoint): reconstruct
+    /// `P = exp(S·scale − lse)` from the saved final `lse`, accumulate `grad_q`
+    /// in place (row-unique, sequential-safe) and `grad_k_blk`/`grad_v_blk` via
+    /// atomicAdd (GQA q-heads + q-rows fan into one kv row). f32 grad buffers.
+    pub fn ring_block_attention_bwd_cuda(
+        q: *const Half,
+        k_blk: *const Half,
+        v_blk: *const Half,
+        out: *const f32,
+        lse: *const f32,
+        d_out: *const Half,
+        grad_q: *mut f32,
+        grad_k_blk: *mut f32,
+        grad_v_blk: *mut f32,
+        num_q_tiles: i32,
+        num_q_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        q_rows: i32,
+        blk_len: i32,
+        q_abs: i32,
+        k_abs: i32,
+        sm_scale: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
     /// Hand-written FA2-style forward attention for sm_70 (V100). BF16 I/O,
     /// FP16 (half2) internal math, FP32 accumulation. Tiled online softmax
     /// (Br=8 Q tokens, Bc=16 KV tiles), causal chunked-prefill semantics.

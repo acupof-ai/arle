@@ -32,7 +32,7 @@ struct BlockStats {
 /// One block's unnormalized softmax numerator + row stats. `q`:[rows,dim],
 /// `k`/`v`:[blk,dim]. `q_abs` = absolute row of q's row 0; `k_abs` = absolute row
 /// of the block's col 0. Future-masked cols contribute nothing.
-fn block_stats(
+pub(crate) fn block_stats(
     q: &[f32],
     k: &[f32],
     v: &[f32],
@@ -220,18 +220,26 @@ pub fn ring_backward_tile(
 
 use crate::{
     AutogradError, Result,
+    backend::{Device, DeviceHandle, RingBlockDims},
     tape::{BackwardOp, GradPairs, SavedContext, Tape, TapeEntry},
     tensor::{Tensor, TensorId, TensorStore},
 };
 use smallvec::smallvec;
 
 /// Context-parallel causal attention over the LOCAL shard. `q`/`k`/`v` are
-/// `[B,H,S,D]`; world==1 (one local block) = plain causal attention. Records the
-/// forward output + per-row LSE so backward replays the flash-2 adjoint.
+/// `[B,H,S,D]` — this rank's contiguous sequence shard at absolute rows
+/// `[cp_rank*S, (cp_rank+1)*S)`. On CUDA with `cp_size > 1` it runs the device
+/// ring: `cp_size` KV rotations feeding the one-block flash-2 kernel + on-device
+/// merge, never materializing the full sequence (peak O(S·D), not O(full_seq·D) —
+/// the fix for the option-B slice_bwd OOM). CPU / world==1 keep the verified host
+/// `ring_forward_tile` path (one local block, q_abs=0). Records out + per-row LSE
+/// so backward replays the flash-2 adjoint.
 pub fn cp_causal_sdpa(
     q: TensorId,
     k: TensorId,
     v: TensorId,
+    cp_size: usize,
+    cp_rank: usize,
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
@@ -243,6 +251,12 @@ pub fn cp_causal_sdpa(
         });
     }
     let (b, h, s, d) = (shape[0], shape[1], shape[2], shape[3]);
+
+    if store.backend().device() == Device::Cuda && cp_size > 1 {
+        return cp_causal_sdpa_device_ring(q, k, v, cp_size, cp_rank, &shape, store, tape);
+    }
+
+    // CPU / world==1: the whole local sequence is one KV block at absolute row 0.
     let tiles = b * h;
     let scale = 1.0 / (d as f32).sqrt();
     let qd = store.tensor_host(q)?.data;
@@ -253,7 +267,6 @@ pub fn cp_causal_sdpa(
     let mut lse = vec![0.0f32; tiles * s];
     for t in 0..tiles {
         let (qt, kt, vt) = (&qd[t * tile..], &kd[t * tile..], &vd[t * tile..]);
-        // world==1: the whole local sequence is one KV block at absolute row 0.
         let blocks = [(&kt[..tile], &vt[..tile], 0usize)];
         let (o, l) = ring_forward_tile(&qt[..tile], &blocks, s, d, scale, 0);
         out[t * tile..(t + 1) * tile].copy_from_slice(&o);
@@ -274,10 +287,132 @@ pub fn cp_causal_sdpa(
             rows: s,
             dim: d,
             q_abs: 0,
+            cp_size: 1,
+            cp_rank: 0,
         },
     }
     .record(store, tape)?;
     Ok(out_id)
+}
+
+/// The device ring forward. `q`/`k`/`v` are `[b, H, s, d]` local shards; kernel
+/// tiles are `[b*H, s, d]` (q) / `[b*Hkv, s, d]` (k/v), GQA resolved per block in
+/// the kernel. Rings k and v `cp_size` times; step j attends the block owned by
+/// rank `(cp_rank - j + cp_size) % cp_size` (its rows `owner*s .. owner*s+s`),
+/// merged on-device. Every rank issues exactly `cp_size` symmetric send/recvs.
+#[allow(clippy::too_many_arguments)]
+fn cp_causal_sdpa_device_ring(
+    q: TensorId,
+    k: TensorId,
+    v: TensorId,
+    cp_size: usize,
+    cp_rank: usize,
+    shape: &[usize],
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<TensorId> {
+    let (b, h, s, d) = (shape[0], shape[1], shape[2], shape[3]);
+    let (kv_shape, kv_heads) = {
+        let ks = store.tensor(k)?.shape.clone();
+        (ks.clone(), ks[1])
+    };
+    let scale = 1.0 / (d as f32).sqrt();
+    let num_q_tiles = b * h;
+    let dims_for = |blk_len: usize, k_abs: usize| RingBlockDims {
+        num_q_tiles,
+        num_q_heads: h,
+        num_kv_heads: kv_heads,
+        head_dim: d,
+        q_rows: s,
+        blk_len,
+        q_abs: cp_rank * s,
+        k_abs,
+        sm_scale: scale,
+    };
+
+    store.ensure_device(q)?;
+    store.ensure_device(k)?;
+    store.ensure_device(v)?;
+    let q_h = device_handle(store, q, "ring q")?;
+    let rows = num_q_tiles * s;
+    // Accumulator init: M=-inf, L=0, O=0 (device-resident, f32).
+    let mut acc_m = store
+        .backend()
+        .upload(&vec![f32::NEG_INFINITY; rows], &[rows])?;
+    let mut acc_l = store.backend().upload(&vec![0.0f32; rows], &[rows])?;
+    let mut acc_o = store
+        .backend()
+        .upload(&vec![0.0f32; rows * d], &[rows * d])?;
+
+    // Rotate fresh k/v handles so the tape inputs stay immutable; save each step's
+    // block handles + k_abs for the backward replay.
+    let mut k_cur = device_handle(store, k, "ring k")?;
+    let mut v_cur = device_handle(store, v, "ring v")?;
+    let block_elems = b * kv_heads * s * d;
+    let mut step_blocks: smallvec::SmallVec<[(TensorId, TensorId, usize); 4]> = smallvec![];
+    for j in 0..cp_size {
+        let owner = (cp_rank + cp_size - j) % cp_size;
+        let k_abs = owner * s;
+        let (m2, l2, o2) = store.backend().ring_block_fwd_merge(
+            &q_h,
+            &k_cur,
+            &v_cur,
+            &acc_m,
+            &acc_l,
+            &acc_o,
+            dims_for(s, k_abs),
+        )?;
+        acc_m = m2;
+        acc_l = l2;
+        acc_o = o2;
+        // Persist this step's block for backward (as tape tensors), then rotate.
+        let k_id = store.alloc_device_tensor(kv_shape.clone(), k_cur.clone())?;
+        let v_id = store.alloc_device_tensor(kv_shape.clone(), v_cur.clone())?;
+        step_blocks.push((k_id, v_id, k_abs));
+        if j + 1 < cp_size {
+            k_cur = store.backend().ring_send_recv_kv(&k_cur, &[block_elems])?;
+            v_cur = store.backend().ring_send_recv_kv(&v_cur, &[block_elems])?;
+        }
+    }
+
+    let (out_h, lse_h) = store
+        .backend()
+        .ring_block_finalize(&acc_m, &acc_l, &acc_o, rows, d)?;
+    let out_id = store.alloc_device_tensor(shape.to_vec(), out_h)?;
+    let lse_id = store.alloc_device_tensor(vec![b, h, s], lse_h)?;
+
+    TapeEntry {
+        op: BackwardOp::RingAttention,
+        output_id: out_id,
+        input_ids: smallvec![q, k, v],
+        saved: SavedContext::RingAttentionCtx {
+            q,
+            blocks: step_blocks,
+            lse: lse_id,
+            out: out_id,
+            rows: s,
+            dim: d,
+            q_abs: cp_rank * s,
+            cp_size,
+            cp_rank,
+        },
+    }
+    .record(store, tape)?;
+    Ok(out_id)
+}
+
+fn device_handle(store: &mut TensorStore, id: TensorId, op: &'static str) -> Result<DeviceHandle> {
+    store.ensure_device(id)?;
+    store
+        .tensor(id)?
+        .device_handle
+        .clone()
+        .ok_or(AutogradError::TapeInvariant(match op {
+            "ring q" => "ring: q missing device handle",
+            "ring k" => "ring: k missing device handle",
+            "ring v" => "ring: v missing device handle",
+            _ => "ring: input missing device handle",
+        }))
 }
 
 pub(crate) fn cp_ring_attention_backward(
@@ -293,15 +428,34 @@ pub(crate) fn cp_ring_attention_backward(
         rows,
         dim,
         q_abs,
+        cp_size,
+        cp_rank,
     } = &entry.saved
     else {
         return Err(AutogradError::TapeInvariant(
             "ring attention backward missing RingAttentionCtx",
         ));
     };
-    let (q, lse, out, rows, dim, q_abs) = (*q, *lse, *out, *rows, *dim, *q_abs);
-    // world==1 records exactly one block; the multi-block ring accumulates grad_k/v
-    // per owner via reduce_scatter (pending-remote). Here one local block covers it.
+    let (q, lse, out, rows, dim, q_abs, cp_size, _cp_rank) =
+        (*q, *lse, *out, *rows, *dim, *q_abs, *cp_size, *cp_rank);
+
+    if store.backend().device() == Device::Cuda && cp_size > 1 {
+        return cp_ring_attention_backward_device(
+            &entry.input_ids,
+            blocks,
+            q,
+            lse,
+            out,
+            output_grad_id,
+            rows,
+            dim,
+            q_abs,
+            cp_size,
+            store,
+        );
+    }
+
+    // world==1: one local block covers everything (host reference path).
     let (k, v, _k_abs) = blocks[0];
     let need = store.tensor(q)?.requires_grad
         || store.tensor(k)?.requires_grad
@@ -351,6 +505,113 @@ pub(crate) fn cp_ring_attention_backward(
     grads.push((q, store.alloc(Tensor::new(gq, shape.clone(), false)?)));
     grads.push((k, store.alloc(Tensor::new(gk, shape.clone(), false)?)));
     grads.push((v, store.alloc(Tensor::new(gv, shape, false)?)));
+    Ok(grads)
+}
+
+/// Device ring backward. `input_ids = [q, k, v]` are THIS rank's local shards;
+/// `blocks[j]` are the rotated (k, v, k_abs) handles the forward saved per step.
+/// Recompute each block's (grad_q, grad_k, grad_v) from the saved out/lse,
+/// accumulate grad_q locally, and ring grad_k/grad_v BACK to their owners: step j's
+/// block came from j hops forward, so its grad returns via `cp_size - j` more
+/// forward hops (a full loop), landing each on the rank whose LOCAL k/v produced
+/// it, where it sums. Rank-symmetric — the ring-home is a function of the hop
+/// count `j`, not of `cp_rank`.
+#[allow(clippy::too_many_arguments)]
+fn cp_ring_attention_backward_device(
+    input_ids: &[TensorId],
+    blocks: &smallvec::SmallVec<[(TensorId, TensorId, usize); 4]>,
+    q: TensorId,
+    lse: TensorId,
+    out: TensorId,
+    output_grad_id: TensorId,
+    rows: usize,
+    dim: usize,
+    q_abs: usize,
+    cp_size: usize,
+    store: &mut TensorStore,
+) -> Result<GradPairs> {
+    let (k_local, v_local) = (input_ids[1], input_ids[2]);
+    let need = store.tensor(q)?.requires_grad
+        || store.tensor(k_local)?.requires_grad
+        || store.tensor(v_local)?.requires_grad;
+    let mut grads = GradPairs::new();
+    if !need {
+        return Ok(grads);
+    }
+
+    let shape = store.tensor(q)?.shape.clone();
+    let (b, h, d) = (shape[0], shape[1], shape[3]);
+    let kv_shape = store.tensor(k_local)?.shape.clone();
+    let kv_heads = kv_shape[1];
+    let scale = 1.0 / (dim as f32).sqrt();
+    let num_q_tiles = b * h;
+    let block_elems = b * kv_heads * rows * d;
+
+    let q_h = device_handle(store, q, "ring q")?;
+    let out_h = device_handle(store, out, "ring out")?;
+    let lse_h = device_handle(store, lse, "ring lse")?;
+    store.ensure_device(output_grad_id)?;
+    let dout_h = device_handle(store, output_grad_id, "ring d_out")?;
+
+    // grad_q accumulates across blocks (device-resident); start at zeros.
+    let mut grad_q = store.backend().upload(
+        &vec![0.0f32; num_q_tiles * rows * d],
+        &[num_q_tiles * rows * d],
+    )?;
+    // Per-step grad_k/grad_v handles, produced in forward-ring order.
+    let mut step_gk: smallvec::SmallVec<[DeviceHandle; 4]> = smallvec![];
+    let mut step_gv: smallvec::SmallVec<[DeviceHandle; 4]> = smallvec![];
+    for &(k_id, v_id, k_abs) in blocks.iter() {
+        let k_h = device_handle(store, k_id, "ring k")?;
+        let v_h = device_handle(store, v_id, "ring v")?;
+        let dims = RingBlockDims {
+            num_q_tiles,
+            num_q_heads: h,
+            num_kv_heads: kv_heads,
+            head_dim: d,
+            q_rows: rows,
+            blk_len: rows,
+            q_abs,
+            k_abs,
+            sm_scale: scale,
+        };
+        let (gq2, gk_b, gv_b) = store
+            .backend()
+            .ring_block_bwd(&q_h, &k_h, &v_h, &out_h, &lse_h, &dout_h, &grad_q, dims)?;
+        grad_q = gq2;
+        step_gk.push(gk_b);
+        step_gv.push(gv_b);
+    }
+
+    // Ring each step's grad block back to its owner and sum. Step j's block was
+    // received after j forward hops; `cp_size - j` more forward hops complete the
+    // loop, returning it to the rank that owns that K/V — where it accumulates
+    // into that rank's local grad. Every rank issues the same symmetric rotations.
+    let mut gk_acc = store
+        .backend()
+        .upload(&vec![0.0f32; block_elems], &[block_elems])?;
+    let mut gv_acc = store
+        .backend()
+        .upload(&vec![0.0f32; block_elems], &[block_elems])?;
+    for (j, (mut gk_h, mut gv_h)) in step_gk.into_iter().zip(step_gv).enumerate() {
+        for _ in 0..(cp_size - j) {
+            gk_h = store.backend().ring_send_recv_kv(&gk_h, &[block_elems])?;
+            gv_h = store.backend().ring_send_recv_kv(&gv_h, &[block_elems])?;
+        }
+        gk_acc = store
+            .backend()
+            .add_into_device(&gk_acc, &gk_h, &[block_elems])?;
+        gv_acc = store
+            .backend()
+            .add_into_device(&gv_acc, &gv_h, &[block_elems])?;
+    }
+
+    grads.push((q, store.alloc_device_tensor(shape, grad_q)?));
+    grads.push((
+        k_local,
+        store.alloc_device_tensor(kv_shape.clone(), gk_acc)?,
+    ));
+    grads.push((v_local, store.alloc_device_tensor(kv_shape, gv_acc)?));
     Ok(grads)
 }
 
@@ -599,7 +860,7 @@ mod tests {
         let mut s1 = TensorStore::default();
         let mut t1 = Tape::new();
         let (q1, k1, v1) = (mk(&mut s1, 1), mk(&mut s1, 2), mk(&mut s1, 3));
-        let o1 = cp_causal_sdpa(q1, k1, v1, &mut s1, &mut t1).unwrap();
+        let o1 = cp_causal_sdpa(q1, k1, v1, 1, 0, &mut s1, &mut t1).unwrap();
         let loss1 = ops::sum(o1, &mut s1, &mut t1).unwrap();
         let g1 = t1.backward(loss1, &mut s1).unwrap();
 

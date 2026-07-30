@@ -12,9 +12,9 @@ use autograd::{
     AutogradError, Device, Tape, Tensor, TensorId, TensorStore,
     ops::{
         LinearAttentionParams, MoeGroupedLinearExpert, MoeGroupedLinearInput, MoeGroupedRoute,
-        MoeTopK, add, add_broadcast, all_gather_seq, all_reduce_sum, cat_seq,
-        causal_sdpa_recompute, causal_sdpa_recompute_with_q_start, causal_sdpa_with_q_start,
-        checkpoint_sequential, embedding, linear_attention_boundary, linear_attention_core,
+        MoeTopK, add, add_broadcast, all_reduce_sum, cat_seq, causal_sdpa_recompute,
+        causal_sdpa_recompute_with_q_start, causal_sdpa_with_q_start, checkpoint_sequential,
+        embedding, linear_attention_boundary, linear_attention_core,
         linear_attention_core_with_carry, linear_attention_core_with_carry_taped,
         linear_attention_ctx_bytes, linear_attention_row_transient_bytes, matmul_bt_with_site,
         moe_grouped_linear, moe_grouped_weighted_scatter, moe_topk_softmax,
@@ -1677,48 +1677,23 @@ impl Qwen35Layer {
 
         let kv_repeat = local_attention_heads / local_key_value_heads;
         let attn_hidden = if cp.is_enabled() {
-            // Context-parallel: q is this rank's LOCAL shard [b, heads, seq_len, hd];
-            // it attends the causal prefix of the FULL sequence, so gather K/V from
-            // every rank and slice the prefix this rank's q needs. The launcher pads
-            // global seq to a multiple of cp.size (all_gather needs equal shards and
-            // the RoPE positions must agree with q_start), so global = seq_len*size
-            // and this rank owns absolute rows [q_start, q_start+seq_len).
-            let full_seq = seq_len * cp.size;
-            let q_start = cp.rank * seq_len;
-            let kv_end = q_start + seq_len;
-            // Cheap tripwire: RoPE cos/sin (from the writeback's sharded positions)
-            // must be exactly this rank's seq_len rows, or q_start disagrees with the
-            // absolute positions baked into q/k → silent wrong attention geometry.
+            // Context-parallel ring attention: q/k/v are this rank's LOCAL shard
+            // ([b, heads, seq_len, hd] / [b, kv_heads, seq_len, hd]) at absolute
+            // rows [cp.rank*seq_len, ..). The ring rotates K/V cp.size times through
+            // the flash-2 device kernel, attending the causal prefix on-device —
+            // NEVER materializing the full sequence (peak O(seq_len·hd), not
+            // O(full_seq·hd)), which is the fix for the option-B slice_bwd OOM at
+            // local seq > 65535. GQA repeat happens per-block inside the kernel, so
+            // k/v ship at kv_heads width (kv_repeat× less comm). The launcher pads
+            // global seq to a multiple of cp.size and shards RoPE positions so the
+            // absolute q_abs = cp.rank*seq_len agrees with the baked-in positions.
+            let _ = kv_repeat; // GQA resolved inside the ring kernel, not here
             debug_assert_eq!(
                 store.get(cos).map(|t| t.shape[t.shape.len() - 2]),
                 Some(seq_len),
                 "CP: cos rows must equal local seq_len (launcher must shard positions)"
             );
-            // all_gather_seq is a rank-major flat concat on the leading post-batch
-            // axis, so gather in SEQ-major [b, seq/N, kv_heads, hd] (else heads
-            // interleave), then restore [b, kv_heads, seq, hd], slice the prefix,
-            // and GQA-repeat locally (gather pre-repeat = kv_repeat× less comm).
-            let gather_kv = |x: TensorId, store: &mut TensorStore, tape: &mut Tape| {
-                let xm = transpose(x, 1, 2, store, tape)?; // [b, seq/N, kv_heads, hd]
-                let xf = all_gather_seq(
-                    xm,
-                    vec![batch, full_seq, local_key_value_heads, cfg.head_dim],
-                    store,
-                    tape,
-                )?; // [b, seq, kv_heads, hd]
-                let xf = transpose(xf, 1, 2, store, tape)?; // [b, kv_heads, seq, hd]
-                let xf = slice(
-                    xf,
-                    &[0, 0, 0, 0],
-                    &[batch, local_key_value_heads, kv_end, cfg.head_dim],
-                    store,
-                    tape,
-                )?; // [b, kv_heads, kv_end, hd]
-                repeat_kv(xf, kv_repeat, store, tape) // [b, attn_heads, kv_end, hd]
-            };
-            let k_full = gather_kv(k, store, tape)?;
-            let v_full = gather_kv(v, store, tape)?;
-            causal_sdpa_recompute_with_q_start(q, k_full, v_full, q_start, store, tape)?
+            autograd::ops::ring_attention::cp_causal_sdpa(q, k, v, cp.size, cp.rank, store, tape)?
         } else {
             let k = repeat_kv(k, kv_repeat, store, tape)?;
             let v = repeat_kv(v, kv_repeat, store, tape)?;

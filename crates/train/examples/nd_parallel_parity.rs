@@ -54,16 +54,26 @@ fn main() {
     eprintln!("nd_parallel_parity requires --features cuda,nccl");
 }
 
-// Prompt/response shared by the reference and every CP rank. Seq len 14 splits
+// Prompt/response shared by the reference and every CP rank. Default seq 14 splits
 // evenly across CP_SIZE=2 (a hard all_gather precondition). A SHORT prompt (4) so
-// masked targets (predicting positions [prompt_len-1 .. seq-2] = [3..12]) straddle
-// BOTH shards — shard0 [0,7) owns targets 3..6, shard1 [7,14) owns 7..12. A
-// prompt-heavy split (all targets on one shard) would leave the other shard empty
-// and only ever exercise the zero-loss path, never real cross-shard parity.
+// masked targets (predicting positions [prompt_len-1 .. seq-2]) straddle BOTH
+// shards. `ARLE_ND_SEQ` overrides the total length (must be even, >= 6) to drive a
+// >65535-local-seq case (131072 → local 65536, the ring path): the prompt stays 4,
+// the response fills the rest with a deterministic vocab-cycling pattern so every
+// rank builds the identical trajectory and targets still cross the shard boundary.
 #[cfg(all(feature = "cuda", feature = "nccl"))]
 fn trajectory() -> (Vec<u32>, Vec<u32>, Vec<u8>) {
+    let seq = std::env::var("ARLE_ND_SEQ")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(14);
     let prompt: Vec<u32> = vec![1, 3, 8, 2];
-    let response: Vec<u32> = vec![7, 4, 9, 5, 6, 10, 11, 12, 13, 14];
+    // Vocab is 16 (tiny_full_attn_config); cycle non-special ids 4..=13 so targets
+    // are deterministic and never hit the eos (15) / bos (1). Response length = seq
+    // - prompt_len.
+    let response: Vec<u32> = (0..seq - prompt.len())
+        .map(|i| 4 + (i % 10) as u32)
+        .collect();
     let mask = vec![1u8; response.len()];
     (prompt, response, mask)
 }

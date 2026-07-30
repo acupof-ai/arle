@@ -21,6 +21,24 @@ pub enum Device {
 
 pub type CausalSdpaHostGradTriplet = (Option<Vec<f32>>, Option<Vec<f32>>, Option<Vec<f32>>);
 
+/// Geometry for one context-parallel ring-attention block op. `num_q_tiles =
+/// batch * num_q_heads`; `q_rows` = this rank's local q length; `blk_len` = the
+/// current ring block's KV length; `q_abs`/`k_abs` = absolute row of q row 0 /
+/// block col 0 for the causal mask. GQA is resolved device-side via
+/// `num_q_heads / num_kv_heads`.
+#[derive(Debug, Clone, Copy)]
+pub struct RingBlockDims {
+    pub num_q_tiles: usize,
+    pub num_q_heads: usize,
+    pub num_kv_heads: usize,
+    pub head_dim: usize,
+    pub q_rows: usize,
+    pub blk_len: usize,
+    pub q_abs: usize,
+    pub k_abs: usize,
+    pub sm_scale: f32,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct CausalSdpaDeviceBackwardArgs<'a> {
     pub q: &'a DeviceHandle,
@@ -708,6 +726,64 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         Ok(false)
     }
 
+    /// One context-parallel ring block: fuse this q-tile-set × one KV block into
+    /// the running flash-2 `(acc_m, acc_l, acc_o)` accumulator and return the
+    /// updated accumulators. `q`/`k_blk`/`v_blk` are f32 handles (converted to
+    /// bf16 device-side); `acc_*` are f32. Device-only fast path — CPU/world==1
+    /// route through the host `ring_forward_tile` in the ops layer, so this
+    /// default never runs there; a non-CUDA caller reaching it is a bug.
+    fn ring_block_fwd_merge(
+        &self,
+        _q: &DeviceHandle,
+        _k_blk: &DeviceHandle,
+        _v_blk: &DeviceHandle,
+        _acc_m: &DeviceHandle,
+        _acc_l: &DeviceHandle,
+        _acc_o: &DeviceHandle,
+        _dims: RingBlockDims,
+    ) -> Result<(DeviceHandle, DeviceHandle, DeviceHandle)> {
+        Err(crate::AutogradError::TapeInvariant(
+            "ring_block_fwd_merge is a CUDA-only device path",
+        ))
+    }
+
+    /// Normalize the ring accumulator after all blocks: `out = O / L` (f32
+    /// handle), `lse = M + ln(L)` (f32, one per row). `total_rows = num_q_tiles
+    /// * q_rows`.
+    fn ring_block_finalize(
+        &self,
+        _acc_m: &DeviceHandle,
+        _acc_l: &DeviceHandle,
+        _acc_o: &DeviceHandle,
+        _total_rows: usize,
+        _head_dim: usize,
+    ) -> Result<(DeviceHandle, DeviceHandle)> {
+        Err(crate::AutogradError::TapeInvariant(
+            "ring_block_finalize is a CUDA-only device path",
+        ))
+    }
+
+    /// Per-block ring backward (flash-2 adjoint) from the saved `out`/`lse`.
+    /// Accumulates into `grad_q` (in/out, returned) and returns this block's
+    /// `grad_k_blk`/`grad_v_blk`. `out` is the finalize f32 output; `d_out` is
+    /// the upstream grad (f32). Device-only, like `ring_block_fwd_merge`.
+    #[allow(clippy::too_many_arguments)]
+    fn ring_block_bwd(
+        &self,
+        _q: &DeviceHandle,
+        _k_blk: &DeviceHandle,
+        _v_blk: &DeviceHandle,
+        _out: &DeviceHandle,
+        _lse: &DeviceHandle,
+        _d_out: &DeviceHandle,
+        _grad_q: &DeviceHandle,
+        _dims: RingBlockDims,
+    ) -> Result<(DeviceHandle, DeviceHandle, DeviceHandle)> {
+        Err(crate::AutogradError::TapeInvariant(
+            "ring_block_bwd is a CUDA-only device path",
+        ))
+    }
+
     /// Whether `Tape::backward` should `flush_to_host_batch` every
     /// device-resident tape output **before** walking backward. Metal
     /// returns `true` because each `mlx_eval` round-trip dominates at
@@ -1047,6 +1123,39 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
             });
         }
         self.upload(&host, block_shape)
+    }
+
+    /// This backend's collective group size / rank (from the NCCL communicator).
+    /// Default `(1, 0)` — single card / CPU / no communicator. The ring op reads
+    /// these to size the rotation and compute per-block absolute positions, the
+    /// same way `all_gather_seq_device` reads `world` from `self.nccl`.
+    fn collective_world_rank(&self) -> (usize, usize) {
+        (1, 0)
+    }
+
+    /// All-to-all: split `scatter_axis` across ranks, concatenate each rank's
+    /// slice along `gather_axis`. Returns `(handle, out_shape)` — the shape
+    /// changes (`[seq/N,b,hidden]` → `[seq,b,hidden/N]`), so the caller can't
+    /// derive it. Single-rank / CPU / no-communicator semantics are identity
+    /// (out_shape == in_shape); the default returns the input unchanged.
+    fn all_to_all_device(
+        &self,
+        x: &DeviceHandle,
+        in_shape: &[usize],
+        scatter_axis: usize,
+        gather_axis: usize,
+    ) -> Result<(DeviceHandle, Vec<usize>)> {
+        let _ = (scatter_axis, gather_axis);
+        let host = self.readback(x)?;
+        let size = shape_size(in_shape);
+        if host.len() != size {
+            return Err(crate::AutogradError::DataLengthMismatch {
+                len: host.len(),
+                shape: in_shape.to_vec(),
+                size,
+            });
+        }
+        Ok((self.upload(&host, in_shape)?, in_shape.to_vec()))
     }
 
     /// Sum of squares for a device handle, returned on host as `f64`.
