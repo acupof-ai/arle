@@ -899,6 +899,13 @@ def emit_kernel(spec, target):
     the single-kernel path and --batch. The heavy tilelang.compile() call runs
     under whatever thread pool the caller uses.
     """
+    # Kernel modules read this at trace time to pick the sub-sm_80 fp16-MMA path.
+    # A stale value still links, so refuse rather than emit sm_90 shapes for sm_70.
+    if os.environ.get("ARLE_TILELANG_CUDA_ARCH") != str(spec["cuda_arch"]):
+        raise RuntimeError(
+            f"ARLE_TILELANG_CUDA_ARCH is {os.environ.get('ARLE_TILELANG_CUDA_ARCH')!r} "
+            f"but {spec['out_name']} targets sm_{spec['cuda_arch']}"
+        )
     prim_func, wrapper_spec = resolve_prim_func(
         spec["kernel_family"], spec["kernel_path"],
         spec.get("num_q_heads"), spec.get("num_kv_heads"), spec.get("kernel_key"),
@@ -941,7 +948,13 @@ def run_batch(manifest_path: str) -> int:
     nvcc is a subprocess, so threads parallelize. Prints one RESULT line per
     kernel: `RESULT\t<out_key>\t<func_name>\t<c_path>`. On any failure the whole
     batch exits non-zero so build.rs surfaces it (same fail-fast as before).
+
+    One arch group at a time: kernel modules read ARLE_TILELANG_CUDA_ARCH at trace
+    time (below sm_80 it selects the fp16-MMA path), and a process-global cannot
+    hold a per-thread value. Grouping keeps the single tilelang import and the
+    within-arch fan-out, which is where the speedup lives.
     """
+    import collections
     import concurrent.futures
 
     with open(manifest_path) as f:
@@ -953,18 +966,24 @@ def run_batch(manifest_path: str) -> int:
     for t in list(targets):
         targets[t] = parse_target(t)
 
-    workers = int(os.environ.get("ARLE_TILELANG_BATCH_WORKERS", "0")) or min(
-        len(specs), os.cpu_count() or 1
-    )
+    by_arch = collections.defaultdict(list)
+    for s in specs:
+        by_arch[s["cuda_arch"]].append(s)
+
     results, errors = [], []
-    with concurrent.futures.ThreadPoolExecutor(workers, "aot-batch") as ex:
-        fut_to_spec = {ex.submit(emit_kernel, s, targets[s["target"]]): s for s in specs}
-        for fut in concurrent.futures.as_completed(fut_to_spec):
-            s = fut_to_spec[fut]
-            try:
-                results.append(fut.result())
-            except Exception as e:  # noqa: BLE001 — collect all, report, fail
-                errors.append((s.get("out_key", s.get("kernel_name", "?")), repr(e)))
+    for cuda_arch, group in sorted(by_arch.items()):
+        os.environ["ARLE_TILELANG_CUDA_ARCH"] = str(cuda_arch)
+        workers = int(os.environ.get("ARLE_TILELANG_BATCH_WORKERS", "0")) or min(
+            len(group), os.cpu_count() or 1
+        )
+        with concurrent.futures.ThreadPoolExecutor(workers, "aot-batch") as ex:
+            fut_to_spec = {ex.submit(emit_kernel, s, targets[s["target"]]): s for s in group}
+            for fut in concurrent.futures.as_completed(fut_to_spec):
+                s = fut_to_spec[fut]
+                try:
+                    results.append(fut.result())
+                except Exception as e:  # noqa: BLE001 — collect all, report, fail
+                    errors.append((s.get("out_key", s.get("kernel_name", "?")), repr(e)))
     for out_key, func_name, c_path in results:
         print(f"RESULT\t{out_key}\t{func_name}\t{c_path}")
     if errors:
