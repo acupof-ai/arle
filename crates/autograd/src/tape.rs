@@ -465,6 +465,10 @@ impl Tape {
         self.offload_checkpoints = on;
     }
 
+    pub fn offload_checkpoints(&self) -> bool {
+        self.offload_checkpoints
+    }
+
     pub(crate) fn set_skip_next_checkpoint_input_offload(&mut self, skip: bool) {
         self.skip_next_checkpoint_input_offload = skip;
     }

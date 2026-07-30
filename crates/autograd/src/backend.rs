@@ -497,6 +497,19 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         (reserved >= used).then(|| (reserved - used) >> 20)
     }
 
+    /// Peak pool used-bytes since the last [`Self::reset_mem_pool_used_high`].
+    /// The only way to see a transient the hot loop can't sync on. `None`
+    /// off-device.
+    fn mem_pool_used_high(&self) -> Option<u64> {
+        None
+    }
+
+    /// Rebase the used-bytes watermark onto current used, scoping the next read
+    /// to one phase instead of the whole process.
+    fn reset_mem_pool_used_high(&self) -> Result<()> {
+        Ok(())
+    }
+
     fn upload(&self, host: &[f32], _shape: &[usize]) -> Result<DeviceHandle> {
         Ok(DeviceHandle::Cpu(host.to_vec()))
     }
