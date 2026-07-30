@@ -121,6 +121,10 @@ pub enum SavedContext {
     CatSeqCtx {
         seq_counts: Vec<usize>,
     },
+    CatCtx {
+        axis: usize,
+        input_shapes: Vec<Vec<usize>>,
+    },
     TransposeCtx {
         axis1: usize,
         axis2: usize,
@@ -240,6 +244,7 @@ pub enum BackwardOp {
     Slice,
     CatHeads,
     CatSeq,
+    Cat,
     Transpose,
     AddBroadcast,
     Embedding,
@@ -287,6 +292,7 @@ impl BackwardOp {
             BackwardOp::Slice => "Slice",
             BackwardOp::CatHeads => "CatHeads",
             BackwardOp::CatSeq => "CatSeq",
+            BackwardOp::Cat => "Cat",
             BackwardOp::Transpose => "Transpose",
             BackwardOp::AddBroadcast => "AddBroadcast",
             BackwardOp::Embedding => "Embedding",
@@ -825,6 +831,7 @@ impl Tape {
                     BackwardOp::Slice => ops::slice_backward(&entry, output_grad_id, store)?,
                     BackwardOp::CatHeads => ops::cat_heads_backward(&entry, output_grad_id, store)?,
                     BackwardOp::CatSeq => ops::cat_seq_backward(&entry, output_grad_id, store)?,
+                    BackwardOp::Cat => ops::cat_backward(&entry, output_grad_id, store)?,
                     BackwardOp::Transpose => {
                         ops::transpose_backward(&entry, output_grad_id, store)?
                     }
