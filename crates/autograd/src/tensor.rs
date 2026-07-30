@@ -944,9 +944,8 @@ impl TensorStore {
         Ok(self.tensor(id)?.clone())
     }
 
-    /// The device-side `tensor_host`: residency first, then an owned handle. A
-    /// caller needing the pre-clone refcount must reach for `tensor` directly —
-    /// this bumps it.
+    /// The device-side `tensor_host`. Bumps the refcount — a caller that needs the
+    /// pre-clone count must read `tensor` directly.
     pub fn device_handle(&mut self, id: TensorId) -> Result<DeviceHandle> {
         self.ensure_device(id)?;
         Ok(self

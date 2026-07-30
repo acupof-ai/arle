@@ -1108,8 +1108,7 @@ impl Tape {
             if let (Some(dest), Some(&g)) = (d_input.as_mut(), grads.get(&x_c)) {
                 dest.write_rows(start, g, store)?;
             }
-            // Full-seq param grads (k/v) dominate device memory; park each over
-            // the next chunk's replay, which is the only reason they are large.
+            // Full-seq k/v grads dominate device memory; park each over the next replay.
             for (slot, &pid) in param_ids.iter().enumerate() {
                 if let Some(&g) = grads.get(&pid) {
                     d_param[slot].add(g, store)?;
