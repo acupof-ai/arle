@@ -27,19 +27,39 @@ python3 scripts/gen_bench_prompts.py bench-agent-119k-16x8.jsonl 16 119000 214 8
 
 ## Qwen3.6 on 1×H20 · single-GPU · eager — LONG-AGENT ANCHOR
 
-### CHAMPION (DSpark arm) — `d05d0aee6` (2026-07-29) · batched draft / replay / snapshot / capture · `arle-v`
+### CHAMPION (DSpark arm) — `51985031d` (2026-07-30) · batched draft / replay / snapshot / capture / markov+confidence · `arle-mk`
 
-| c | arm | TTFT cold | TTFT warm | prefill tok/s | TPOT | decode tok/s | total tok/s |
-|---|---|---:|---:|---:|---:|---:|---:|
-| 1 | dense DSpark 6 | 19.4 s | 1.0 s | 78053 | 9.77 ms | 102.3 | 7440.0 |
-| 8 | dense DSpark 6 | 1.0 s | 0.7 s | 75607 | 60.74 ms | 16.5 | 32090.2 |
-| 16 | dense DSpark 6 | 3.9 s | 1.0 s | 58685 | 107.94 ms | 9.3 | 33037.7 |
+**A spec row carries its accept rate.** Two drafts at the same TPOT are not the
+same result — `tok/row` (committed tokens per verify row, against plain decode's
+1.0) is what says whether the margin survives more concurrency. Rows before this
+one have no accept column; re-measure before comparing them on it. `prefill
+tok/s` is dropped: the pre-2026-07-30 rows' formula isn't reproducible from the
+report, and TTFT is the prefill SLO.
+
+| c | arm | TTFT cold | TTFT warm | TPOT | decode tok/s | total tok/s | prefix hit | accept | tok/row |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | dense DSpark 6 | 19.3 s | 1.1 s | 9.80 ms | 102.0 | 7440.7 | 0.883 | 0.509 | 0.591 |
+| 8 | dense DSpark 6 | — | 0.7 s | 60.70 ms | 16.5 | 31754.1 | 1.000 | 0.280 | 0.400 |
+| 16 | dense DSpark 6 | 6.8 s | 1.2 s | 109.43 ms | 9.1 | 32559.0 | 1.000 | 0.280 | 0.400 |
+
+Re-measure of the `d05d0aee6` row on the markov/confidence batching binary:
+TPOT 9.77 → 9.80 / 60.74 → 60.70 / 107.94 → 109.43 ms (**+0.3 / −0.07 / +1.4%**,
+inside the ±3% band) — that change adds a code path DFlash never enters, and the
+row confirms it. `prompt_tokens` p50 34963.
 
 vs the dense no-spec rows below (same fingerprint; these commits touch only the
-spec path): decode 34.7 → 102.3 / 12.2 → 16.5 / 8.2 → 9.3 tok/s. TTFT unchanged.
+spec path): decode 34.7 → 102.0 / 12.2 → 16.5 / 8.2 → 9.1 tok/s. TTFT unchanged.
 Serve adds `--spec-type dspark --mtp-draft-model Qwen3.6-27B-DFlash
 --dspark-block-size 6`; `--spec-max-batch` is the shipped default 16.
 Gate exact=3 DET at 512/4k/16k/32k. 0 errors. 126/128.
+
+**The accept rate itself halves at concurrency** (0.509 → 0.280), and every chain
+at c≥8 drafts on a rebased context (`partial_ctx_chains/chains` 0.75 → 1.00)
+while prefix reuse *improves* (0.883 → 1.000). A prefix-cache or sidecar restore
+skips the trunk prefill, so `df.rebase()` (`executor/qwen35.rs:1460`, `:1842`)
+leaves the draft holding a suffix-only context. Correlation with a named probe,
+not a root cause: count rebases per request and bucket accept by
+`ctx_end - ctx_base` at chain time.
 
 ### CHAMPION (no-spec) — `a956f69b1` (2026-07-28) · KV mirror + batched FA3 · `arle-fa3b2`
 
@@ -54,6 +74,19 @@ Gate exact=3 DET at 512/4k/16k/32k. 0 errors. 126/128.
 
 ITL p50 fit: MoE `15.7 + 2.82·B` ms, dense `38.0 + 1.78·B` ms.
 Gate exact=3 DET at 512/4k/16k/32k. 0 errors. MoE 128/128, dense 126/128.
+
+**Anchor audit (rule 4), 2026-07-30** — `arle-fa3b2`, the archived binary for this
+row, re-run against its own numbers: dense no-spec TPOT 28.82 / 82.20 / 124.91 ms
+vs the 28.83 / 81.87 / 122.15 above = **−0.03 / +0.40 / +2.26%**. Accumulated
+drift over the five accepted DSpark updates and the `--spec-max-batch` flip is
+bounded under 2.3%, so those rolling verdicts hold. The audit ran alongside four
+other arms on separate GPUs and still reproduced, which also bounds the
+concurrent-arm perturbation.
+
+Open, one point: the same no-spec arm on `51985031d` reads 28.71 / **84.47** /
+124.81 ms — c=1 and c=16 match the archive, c=8 is +2.8% against it. At the band
+edge, not reproduced at the other two points; rule 2 escalation (≥3 trials/arm) if
+it recurs.
 
 ### PRIOR — `55bf627bc` (2026-07-28) · FA3 paged, qlen ≤ 64 · `arle-fa3c`
 
