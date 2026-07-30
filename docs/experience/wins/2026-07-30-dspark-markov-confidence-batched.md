@@ -47,50 +47,58 @@ calls; `batchable_draft()` is deleted.
 All inside the ±3% band, which is the point: the new code is a path DFlash never
 enters. Gate exact=3 DET at 512/4k/16k/32k, 0 errors, 126/128.
 
-## The markov settle is free; the confidence head costs 130 ms a step
+## The markov settle is free; the confidence head is 56% of the step
 
-Six arms, one binary, one fingerprint, run concurrently on one GPU each (180
+Seven arms, one binary, one fingerprint, run concurrently on one GPU each (180
 cores, load 16, so the only shared resource is idle). All three drafts have
 identical geometry — 5 layers, hidden 5120, intermediate 17408, 32 heads, 8 kv,
 head_dim 128 — so block size and the two heads are the only variables, and
-`dspark-aeon` (markov, no confidence) separates them.
+`dspark-aeon` (markov, no confidence) at block 6 holds both fixed against DFlash.
 
-Decode tok/s, and the marginal cost of a verify row against the no-spec step
+Decode tok/s, plus the marginal cost of a verify row against the no-spec step
 (115.2 ms at c=16):
 
-| arm | heads | block | c=1 | c=8 | **c=16** | rows/step @16 | **ms/row @16** |
-|---|---|---:|---:|---:|---:|---:|---:|
-| no-spec | — | — | 34.8 | 11.8 | 8.0 | 0.0 | — |
-| DFlash | none | 6 | 102.0 | **16.5** | **9.1** | 81.1 | 1.32 |
-| DFlash | none | 16 | 109.1 | 12.6 | 6.9 | 221.2 | 0.86 |
-| aeon | markov | 11 | **113.0** | 14.2 | 7.7 | 149.5 | **1.14** |
-| FR | markov+conf | 6 | 92.3 | 11.8 | 6.3 | 47.6 | **4.04** |
-| FR | markov+conf | 16 | 97.0 | 10.9 | 5.8 | 41.8 | **4.47** |
+| arm | heads | block | c=1 | c=8 | **c=16** | rows/step @16 | step @16 | **ms/row** |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| no-spec | — | — | 34.8 | 11.8 | 8.0 | 0.0 | 115.2 | — |
+| DFlash | none | 6 | 102.0 | **16.5** | 9.1 | 81.1 | 222.2 | 1.32 |
+| **aeon** | **markov** | 6 | 103.0 | 15.9 | **9.2** | **80.1** | **225.6** | **1.38** |
+| aeon | markov | 11 | **113.0** | 14.2 | 7.7 | 149.5 | 285.3 | 1.14 |
+| DFlash | none | 16 | 109.1 | 12.6 | 6.9 | 221.2 | 305.2 | 0.86 |
+| FR | markov+conf | 6 | 92.3 | 11.8 | 6.3 | 47.6 | 307.7 | **4.04** |
+| FR | markov+conf | 16 | 97.0 | 10.9 | 5.8 | 41.8 | 302.1 | **4.47** |
 
-**The batched markov settle costs nothing** — `aeon` sits at 1.14 ms/row, among
-the head-free arms, and this is the first measurement of a markov checkpoint
-speculating above c=1 at all.
+**The batched markov settle is free.** `aeon6` and `dflash6` verify the same
+number of rows (80.1 vs 81.1/step) and step in the same time (225.6 vs 222.2 ms):
+the markov head costs **+3.4 ms/step, 1.5%**, with only the head differing. At
+c=16 it ties the champion (TPOT 108.33 vs 109.43) on a slightly better accept
+(0.415 vs 0.400 tok/row) — and this is the first measurement of a markov
+checkpoint speculating above c=1 at all, because until now the gate forbade it.
 
-**The confidence head costs a fixed ~130 ms/step at c=16, block-independent.**
-Priced at DFlash's row cost, FR block 6 should step in 178 ms (115.2 + 47.6×1.32)
-and block 16 in 170; they measure 307.7 and 302.1. Equal excess at unequal blocks
-means a per-step cost, and `dspark_confident_keeps` runs exactly once per step.
-Not diagnosed further — the device work in it is one 5376×96 GEMM and two copy
-launches, which cannot be 130 ms, so the next step is an nsys capture of the FR
-draft, not another guess.
+**The confidence head costs +127 ms/step at c=16 — 56% of the step.** Same
+isolation, one variable: `fr6` is `aeon6` plus the confidence head. Priced at
+`aeon6`'s 1.38 ms/row, `fr6`'s 47.6 rows should step in 180.9 ms
+(115.2 + 47.6×1.38); it measures 307.7. Block-independent (block 16 shows the
+same excess), which fits a cost paid once per step, and
+`dspark_confident_keeps` is called exactly once per step. Not diagnosed further:
+its device work is one 5376×96 GEMM and two copy launches, which cannot be
+127 ms, so the next step is an nsys capture of the FR draft — the candidate worth
+checking first is `gemm_batch` routing `conf.weight` (a **single-row** `[1, 5376]`
+matrix) into `quant_linear::gemm_batch` if the checkpoint stores it quantized.
 
-The prize is large enough to be worth it: at DFlash's row cost FR block 6 reaches
-**10.8 tok/s at c=16 against the champion's 9.14 (+18%)**, because its accuracy
-*comes from* the truncation — 0.568 tokens per verify row against DFlash's 0.400
-is the largest accuracy gap measured on this model, with plain decode's
-break-even at 1.0.
+The prize justifies the capture: at `aeon6`'s row cost, FR block 6 reaches **10.8
+tok/s at c=16 against the champion's 9.14 (+18%)**, because its accuracy *comes
+from* the truncation — 0.568 tokens per verify row against DFlash's 0.400 is the
+largest accuracy gap measured on this model, with plain decode's break-even at
+1.0.
 
 ## Reject, for now — DFlash block 6 stays the default draft
 
-Every markov arm loses at c=16 today, and two lose to *not speculating*: FR 6.3
-and FR 16 5.8 against no-spec's 8.0. `--spec-max-batch` is a user flag, so a
-markov user wanting the old behaviour sets it to 1; the shipped default draft has
-no confidence head and is unaffected.
+`aeon6` ties it (+1.1% decode at c=16, −3.6% at c=8 — mixed and inside the band,
+so not a champion change), and every confidence-head arm loses badly enough to
+fall below *not speculating*: FR 6.3 and 5.8 against no-spec's 8.0.
+`--spec-max-batch` is a user flag, so a markov user wanting the old behaviour sets
+it to 1; the shipped default draft has no confidence head and is unaffected.
 
 Loosening the threshold makes it worse — the head at 0.5 already cuts where
 marginal accuracy stops covering a verify row:
