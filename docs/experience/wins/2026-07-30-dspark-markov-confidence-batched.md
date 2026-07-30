@@ -99,45 +99,14 @@ So the head does exactly what it is for — truncating lifts tokens per verify r
 shorter, *variable-length* chain eats roughly four times what the saved rows are
 worth.
 
-**Hypothesis, not a root cause:** truncation is the only thing that makes the
-trunk verify's row count vary step to step, and `HiddenSlot`/`VecSlot`/
-`SliceSlot::get` (`workspace.rs:56`, `:109`, `:135`) reuse a cached buffer only
-on an **exact** size match — any change, including a shrink, frees and
-re-allocates (`HiddenStates::zeros` = cudaMalloc + memset), the logits buffer
-among them at `[248320, rows]` = 47 MB. Not settled: the one within-arm test
-(steps whose row count repeats the previous step's should skip every realloc) saw
-no difference, but it ran on the phase instrument below, which covers only 17% of
-the step. The cheap next probe is a counter on `HiddenStates::zeros` per step.
+**Root cause open.** The workspace-slot realloc hypothesis
+(`HiddenSlot::get` exact-size reuse, `workspace.rs:56`) is weakened: the cudarc
+mempool is already a caching allocator (`CU_MEMPOOL_ATTR_RELEASE_THRESHOLD =
+u64::MAX`, `tensor.rs:370`), so a freed 47 MB logits buffer should be re-served
+without a hard cudaMalloc. What is settled is the *shape* of the cost — see the
+blk4 cross-check below: raggedness itself, not row count and not the head.
 
-## Two instruments that could not carry this, and one that could
-
-Corrects the first version of this entry, which reported the excess as
-**+127 ms/step paid once per step, 56% of the step, block-independent**, and named
-`gemm_batch` routing a quantized `conf.weight` into `quant_linear::gemm_batch` as
-the first suspect. All three parts were wrong:
-
-- **The suspect does not exist.** `confidence_head.proj.weight` is BF16
-  `[1, 5376]` in the checkpoint, so `gemm_batch` takes the plain `gemm_cuda`
-  path. One safetensors header read, no GPU.
-- **`rows/step` and `step @16` were miscomputed** — the old table read 81.1 rows
-  and 222.2 ms where the counters give exactly 96.0 and 262.7. 96.0 is
-  16 slots × 6 rows on the nose, and the phase instrument's `chain_rows`
-  independently reads 96.0.
-- **"Block-independent, so it is a fixed per-step cost" was an artifact.** fr6
-  +202 ms and fr16 +258 ms look alike because their `rows/step` are alike
-  (76 vs 83.5), not because the cost is fixed. Across four FR arms at three
-  thresholds the excess per row is 2.66/3.09/3.55/2.93 ms — per row, not per
-  step. And with the truncation removed it is zero, so it was never the head.
-- **`ARLE_DSPARK_PHASE` cannot attribute a 30% wall-clock gap.** It syncs at
-  every lap: aeon6's step goes 269.9 → **931.2 ms** and the four phases sum to
-  159.20, leaving 83% outside any span. A reading off it ("fr6's step is cheaper
-  than aeon6's") is not a claim about the real step.
-
-What settled it was a flag that removes one behaviour and keeps every
-instruction: `--dspark-conf-threshold 0`, matched to a head-free arm on rows and
-depth. No profiler.
-
-## DEFAULT FLIP — `--dspark-conf-threshold` 0.5 → 0
+## DEFAULT FLIP — `--dspark-conf-threshold` 0.5 → 0 (flag since deleted)
 
 **The shipped default was the worst arm in the table**: at c≥8 it made spec
 decode slower than not speculating. TPOT ms, one flag apart, same binary and
@@ -154,14 +123,17 @@ dataset; no-spec is the mean of two runs that agreed to 2.7%:
 Worth −13.9/−28.7/−34.4% at c=1/8/16 on block 6, −15.9/−22.6% at c=1/16 on
 block 16. Only the c=1 pairs match on point order (c=16 is point 3 vs 2, c=8 is
 cross-serve), but five comparisons carry one sign at 14-34% against 2.7% noise.
-`0` also skips the head (`dspark.rs:1541`) — it can never truncate, so the GEMM,
-D2H and sync are dead work. Gate at `0`: **exact=3 DET at 512/4k/16k/32k**.
+Gate at `0`: **exact=3 DET at 512/4k/16k/32k**. (The flag itself was deleted
+the same day — the head now always feeds the goodput scheduler; see the final
+section.)
 
 Whether `FR t0` displaces `dflash6` as champion *draft* is separate and still
 open — its three c=16 trials read 104.73 / 184.77 / 235.54 ms.
 
-**Reject the confidence head as a policy.** A looser cut only widens the gap,
-because it leaves a longer variable-length chain:
+**Reject the static threshold as a policy — not the head.** The head's
+predictions are good (truncating lifts tok/row 33%); a fixed per-position cut
+is the wrong consumer of them, and a looser cut only widens the gap because it
+leaves a longer variable-length chain:
 
 | threshold | depth | tok/row | rows/step | step @16 | TPOT c=16 |
 |---|---:|---:|---:|---:|---:|
@@ -220,11 +192,11 @@ Not a champion flip yet: c=8 is a wash and the third trial disagrees with itself
 
 ## Build the paper's scheduler — after the ragged-chain penalty
 
-**Retracts this entry's previous section, "do not build Algorithm 1 here."** That
-argued rows are too cheap to schedule, off a 0.53 ms marginal row cost. Wrong
-twice: 160 rows is 85 ms, **32% of the step** — a small per-row figure is not a
-small row budget; and the disproof ran the *static threshold*, which is precisely
-the prior art DSpark (arXiv 2607.05147) §3.2.2 names and replaces.
+(An earlier revision argued "do not build Algorithm 1 here" off the 0.53 ms
+marginal row cost. Wrong twice: 160 rows is 85 ms, **32% of the step** — a
+small per-row figure is not a small row budget; and the disproof ran the
+*static threshold*, precisely the prior art DSpark (arXiv 2607.05147) §3.2.2
+names and replaces.)
 
 The paper's premise holds on our hardware. §3.2: an extra verified token is
 near-free under light load and costs batch capacity under high concurrency.
