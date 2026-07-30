@@ -1049,6 +1049,39 @@ impl Backend for CudaBackend {
         }
     }
 
+    #[cfg(not(feature = "no-cuda"))]
+    fn mem_pool_used_high(&self) -> Option<u64> {
+        // SAFETY: pool is this backend's live context; the read writes one u64.
+        unsafe {
+            let pool = result::device::get_mem_pool(self.stream.context().cu_device()).ok()?;
+            let mut high: u64 = 0;
+            result::mem_pool::get_attribute(
+                pool,
+                cudarc::driver::sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_USED_MEM_HIGH,
+                (&mut high as *mut u64).cast(),
+            )
+            .ok()?;
+            Some(high)
+        }
+    }
+
+    #[cfg(not(feature = "no-cuda"))]
+    fn reset_mem_pool_used_high(&self) -> Result<()> {
+        // The driver accepts only 0 here; it means "rebase onto current used".
+        let mut zero: u64 = 0;
+        // SAFETY: pool belongs to this backend's context; the write reads one u64.
+        unsafe {
+            let pool = result::device::get_mem_pool(self.stream.context().cu_device())
+                .map_err(|_| AutogradError::TapeInvariant("cuda get_mem_pool failed"))?;
+            result::mem_pool::set_attribute(
+                pool,
+                cudarc::driver::sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_USED_MEM_HIGH,
+                (&mut zero as *mut u64).cast(),
+            )
+            .map_err(|_| AutogradError::TapeInvariant("cuda USED_MEM_HIGH reset failed"))
+        }
+    }
+
     fn upload(&self, host: &[f32], shape: &[usize]) -> Result<DeviceHandle> {
         #[cfg(feature = "no-cuda")]
         {

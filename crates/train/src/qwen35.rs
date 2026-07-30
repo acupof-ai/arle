@@ -3,7 +3,7 @@ use std::{
     f32::consts::TAU,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU8, Ordering},
+        atomic::{AtomicU8, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -295,38 +295,6 @@ impl Qwen35TensorParallelConfig {
     fn full_attn_kv_dim(self, cfg: &Qwen35Config) -> Result<usize> {
         Ok(self.local_key_value_heads(cfg)? * cfg.head_dim)
     }
-}
-
-/// Max layers per gradient-checkpoint group. Group checkpointing does one host
-/// offload per K layers (K× less PCIe), BUT a group's forward holds all K
-/// layers' live activations until it's saved — so K× the per-layer activation,
-/// which OOMs at long seq. `ckpt_group_size` derives K from seq_len: 1 at long
-/// seq (caps live activation), up to this max at short seq. The frozen/LoRA
-/// boundary still forces a group split.
-const CKPT_GROUP_MAX: usize = 8;
-
-/// Adaptive checkpoint group size: bound a group's live forward activations to
-/// ~8 GiB. The per-layer peak is dominated by the ATTENTION transient at long
-/// seq — the composed-SDPA fallback holds `chunk×seq²` scores plus the same
-/// again for softmax (head-chunked to budget inside the autograd op), and the
-/// linear attention layers carry comparable chunk-state buffers — NOT the MLP
-/// `seq×(hidden+3×intermediate)` term the original formula used (it under-counted
-/// the seq=16000 peak ~6×: measured +43 GiB for a 2-layer group vs the formula's
-/// ~7 GiB, so it returned group_size=2 and OOMed). Model the peak as the MLP term
-/// PLUS the ~12 GiB attention transient floor (scores+softmax, both head-chunked);
-/// at seq≳8000 this drives group_size→1 so a single layer's recompute fits on top
-/// of the post-release floor. A group holds `group_size ×` this until saved.
-fn ckpt_group_size(seq_len: usize, hidden: usize, intermediate: usize) -> usize {
-    // MLP gate/up/act activations.
-    let mlp = seq_len
-        .saturating_mul(hidden + 3 * intermediate)
-        .saturating_mul(4);
-    // Head-chunked SDPA scores + softmax, each capped ~6 GiB by the chunker, plus
-    // linear-attention chunk state of the same order — a ~12 GiB attention floor
-    // that the MLP-only estimate ignored.
-    let attn_floor = 12usize << 30;
-    let per_layer = mlp.saturating_add(attn_floor).max(1);
-    ((8usize << 30) / per_layer).clamp(1, CKPT_GROUP_MAX)
 }
 
 fn divide_tp(value: usize, world_size: usize, message: &'static str) -> Result<usize> {
@@ -2851,6 +2819,43 @@ fn la_params(cfg: &Qwen35Config, batch: usize, seq_len: usize) -> LinearAttentio
     }
 }
 
+/// Peak device bytes a single LINEAR-attention layer holds. This is the whole
+/// O(seq) story of a checkpointed forward: `linear_attention_core` runs the
+/// entire sequence in one call, while MLP and full attention recompute in
+/// `OPD_SEQ_CHUNK` row chunks. Three exactly-enumerable parts — the retained
+/// backward ctx, the row kernel's own buffers (all live until its return), and
+/// the taped f32 tensors it reads. On the 27B hybrid this slope is 211712
+/// B/token against a measured 231424, i.e. it UNDER-models by 9% — the unaccounted
+/// term is what `log_ckpt_peak`'s drift exists to name.
+fn la_layer_peak_bytes(cfg: &Qwen35Config, batch: usize, seq_len: usize) -> usize {
+    let p = la_params(cfg, batch, seq_len);
+    let (hk, kd) = (p.num_key_heads, p.key_dim);
+    let (hv, vd) = (p.num_value_heads, p.value_dim);
+    let qkv_dim = 2 * hk * kd + hv * vd;
+    // backend_cuda `..._forward_device_row` buffers the return does NOT keep:
+    // a_tril + g_cumsum (f32); q/k/w, v/u/v_new/raw_output, a_inv, b/a casts (bf16).
+    let transient = 4 * (64 * hv + hv) + 2 * (3 * hv * kd + 4 * hv * vd + 64 * hv + 2 * hv);
+    // Its taped f32 inputs (qkv/z/b_proj/a_proj) plus the residual stream x and h.
+    let inputs = 4 * (qkv_dim + hv * vd + 2 * hv + 2 * cfg.hidden_size);
+    batch
+        .saturating_mul(seq_len)
+        .saturating_mul(transient + inputs)
+        .saturating_add(linear_attention_ctx_bytes(p))
+}
+
+/// Peak device bytes a single FULL-attention layer holds. `repeat_kv`
+/// materializes k/v at the full sequence × local attention heads; everything
+/// downstream is chunk-bounded.
+fn full_attn_layer_peak_bytes(
+    cfg: &Qwen35Config,
+    tp: Qwen35TensorParallelConfig,
+    batch: usize,
+    seq_len: usize,
+) -> Result<usize> {
+    let per_row = 4 * (2 * tp.local_attention_heads(cfg)? * cfg.head_dim + 2 * cfg.hidden_size);
+    Ok(batch.saturating_mul(seq_len).saturating_mul(per_row))
+}
+
 impl Qwen35Model {
     pub fn new(cfg: &Qwen35Config, store: &mut TensorStore) -> Result<Self> {
         Self::new_internal(
@@ -2943,6 +2948,122 @@ impl Qwen35Model {
                     }
                     engage
                 }))
+    }
+
+    /// Run the layer stack checkpointed one layer per group. Groups of K do one
+    /// host offload per K layers, but a group's forward holds all K layers' live
+    /// activations until it saves — K× the per-layer peak, which OOMs at long
+    /// seq. The frozen/LoRA boundary still forces a split.
+    fn checkpoint_layers<PF, FF>(
+        &self,
+        hidden: TensorId,
+        batch: usize,
+        seq_len: usize,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+        layer_params: PF,
+        layer_fn: FF,
+    ) -> Result<TensorId>
+    where
+        FF: Fn(usize, TensorId, &mut TensorStore, &mut Tape) -> autograd::Result<TensorId>
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+        PF: Fn(usize) -> Vec<TensorId>,
+    {
+        // Floor and watermark are one measurement pair: no rebase, no `actual`.
+        let floor = store
+            .backend()
+            .reset_mem_pool_used_high()
+            .is_ok()
+            .then(|| store.backend().mem_pool_stats())
+            .flatten()
+            .map(|(_, used)| used);
+        let out = checkpoint_sequential(
+            hidden,
+            self.layers.len(),
+            1,
+            self.lora_layer_start,
+            store,
+            tape,
+            layer_params,
+            layer_fn,
+        )?;
+        self.log_ckpt_peak(batch, seq_len, floor, store, tape)?;
+        Ok(out)
+    }
+
+    /// Print the modeled post-checkpoint peak against the measured one, once per
+    /// new high-water. `should_checkpoint` only answers "would the FULL tape
+    /// fit" — nothing modeled what checkpointing actually leaves resident, so
+    /// every memory wall cost a ~3000 s run to find. The model: one layer is
+    /// live at a time, so peak = the floor measured just before the stack + the
+    /// widest single layer + the saved checkpoints that stayed on device.
+    ///
+    /// Treat the number as a FIRST MEASUREMENT, not a validated model. The two
+    /// H20 points on hand (seq 65536 → 66987 MiB, 131072 → 81451 MiB) are two
+    /// unknowns in two equations and cannot validate anything, and no constant
+    /// here was fitted to close a gap. `drift` is the output that matters.
+    fn log_ckpt_peak(
+        &self,
+        batch: usize,
+        seq_len: usize,
+        floor: Option<u64>,
+        store: &TensorStore,
+        tape: &Tape,
+    ) -> Result<()> {
+        let cfg = &self.config;
+        let has = |pred: fn(&Qwen35Attention) -> bool| {
+            self.layers.iter().any(|layer| pred(&layer.self_attn))
+        };
+        let la = if has(|attn| matches!(attn, Qwen35Attention::Linear(_))) {
+            la_layer_peak_bytes(cfg, batch, seq_len)
+        } else {
+            0
+        };
+        let full = if has(|attn| matches!(attn, Qwen35Attention::Full(_))) {
+            full_attn_layer_peak_bytes(cfg, self.tp, batch, seq_len)?
+        } else {
+            0
+        };
+        // Offloaded groups leave nothing behind; resident ones keep one hidden each.
+        let saved = if tape.offload_checkpoints() {
+            0
+        } else {
+            batch
+                .saturating_mul(seq_len)
+                .saturating_mul(cfg.hidden_size * 4)
+                .saturating_mul(self.layers.len())
+        };
+        let layer = la.max(full);
+        let modeled = floor
+            .unwrap_or(0)
+            .saturating_add(layer.saturating_add(saved) as u64);
+        let actual = floor.and_then(|_| store.backend().mem_pool_used_high());
+        static HIGH: AtomicU64 = AtomicU64::new(0);
+        let ratchet = actual.unwrap_or(modeled);
+        if HIGH.fetch_max(ratchet, Ordering::Relaxed) >= ratchet {
+            return Ok(());
+        }
+        let mib = |bytes: u64| bytes >> 20;
+        let fmt = |bytes: Option<u64>| {
+            bytes.map_or_else(|| "n/a".to_string(), |bytes| format!("{}MiB", mib(bytes)))
+        };
+        eprintln!(
+            "[ckpt-peak] unvalidated batch={batch} seq={seq_len} floor={} layer={}MiB \
+             saved={}MiB modeled={}MiB actual={} drift={}",
+            fmt(floor),
+            mib(layer as u64),
+            mib(saved as u64),
+            mib(modeled),
+            fmt(actual),
+            actual.map_or_else(
+                || "n/a".to_string(),
+                |actual| format!("{:+}MiB", mib(actual) as i64 - mib(modeled) as i64)
+            ),
+        );
+        Ok(())
     }
 
     pub fn supports_rollout_kv_cache(&self) -> bool {
@@ -4049,15 +4170,10 @@ impl Qwen35Model {
                 .iter()
                 .map(|l| l.checkpoint_param_ids(self.lora_skip_experts, store))
                 .collect();
-            hidden = checkpoint_sequential(
+            hidden = self.checkpoint_layers(
                 hidden,
-                self.layers.len(),
-                ckpt_group_size(
-                    batch * seq_len,
-                    self.config.hidden_size,
-                    self.config.intermediate_size,
-                ),
-                self.lora_layer_start,
+                batch,
+                seq_len,
                 store,
                 tape,
                 |idx| param_ids[idx].clone(),
@@ -4193,15 +4309,10 @@ impl Qwen35Model {
                 .iter()
                 .map(|l| l.checkpoint_param_ids(self.lora_skip_experts, store))
                 .collect();
-            hidden = checkpoint_sequential(
+            hidden = self.checkpoint_layers(
                 hidden,
-                self.layers.len(),
-                ckpt_group_size(
-                    batch * seq_len,
-                    self.config.hidden_size,
-                    self.config.intermediate_size,
-                ),
-                self.lora_layer_start,
+                batch,
+                seq_len,
                 store,
                 tape,
                 |idx| param_ids[idx].clone(),
@@ -4645,15 +4756,10 @@ impl Qwen35Model {
                 .iter()
                 .map(|l| l.checkpoint_param_ids(self.lora_skip_experts, store))
                 .collect();
-            hidden = checkpoint_sequential(
+            hidden = self.checkpoint_layers(
                 hidden,
-                self.layers.len(),
-                ckpt_group_size(
-                    batch * gen_len,
-                    self.config.hidden_size,
-                    self.config.intermediate_size,
-                ),
-                self.lora_layer_start,
+                batch,
+                gen_len,
                 store,
                 tape,
                 |idx| param_ids[idx].clone(),
@@ -6656,13 +6762,9 @@ mod tests {
             .iter()
             .filter(|entry| entry.op == BackwardOp::Checkpoint)
             .count();
-        // Layers are checkpointed in adaptive (seq-len-derived) groups (no LoRA
-        // boundary here), so one entry per group, not per layer.
-        let group = super::ckpt_group_size(positions.len(), cfg.hidden_size, cfg.intermediate_size);
-        let expected_groups = cfg.num_hidden_layers.div_ceil(group);
         assert_eq!(
-            checkpoint_entries, expected_groups,
-            "one checkpoint entry per adaptive layer group is required"
+            checkpoint_entries, cfg.num_hidden_layers,
+            "one checkpoint entry per layer is required"
         );
         let adapter_ids = model
             .adapter_name_map()
