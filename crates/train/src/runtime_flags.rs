@@ -83,6 +83,27 @@ pub fn mlp_seq_chunk_for_seq(total_rows: usize) -> usize {
     }
 }
 
+/// Chunk full-attention q-proj + SDPA + o-proj replay above the last verified
+/// unchunked shape. The q projection (gated: 2× heads×head_dim) dominates the
+/// per-layer forward peak at long seq; chunking it keeps the q/LoRA f32
+/// materialization bounded by the chunk row count. k/v are small enough to
+/// keep full-sequence.
+pub fn attn_seq_chunk_for_seq(total_rows: usize) -> usize {
+    const ATTN_SEQ_CHUNK_MIN_ROWS: usize = 40961;
+    const ATTN_SEQ_CHUNK: usize = 4096;
+    if let Some(override_chunk) = std::env::var("ARLE_OPD_ATTN_SEQ_CHUNK")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        return override_chunk;
+    }
+    if total_rows >= ATTN_SEQ_CHUNK_MIN_ROWS {
+        ATTN_SEQ_CHUNK
+    } else {
+        0
+    }
+}
+
 pub(crate) fn writeback_offload() -> bool {
     WRITEBACK_OFFLOAD.load(Relaxed)
 }

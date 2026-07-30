@@ -367,7 +367,7 @@ impl TapeEntry {
 pub(crate) type GradPairs = SmallVec<[(TensorId, TensorId); 2]>;
 
 pub(crate) type CheckpointFn =
-    Arc<dyn Fn(&mut TensorStore, &mut Tape, &[TensorId]) -> Result<TensorId> + Send + Sync>;
+    Arc<dyn Fn(&mut TensorStore, &mut Tape, usize, &[TensorId]) -> Result<TensorId> + Send + Sync>;
 
 #[derive(Debug, Clone)]
 struct CheckpointOpMemRecord {
@@ -963,7 +963,7 @@ impl Tape {
             }
             let mut inner_tape = Tape::new();
             inner_tape.checkpoint_op_mem_scope = self.checkpoint_op_mem_scope.clone();
-            let replay_output = checkpoint_fn(store, &mut inner_tape, &entry.input_ids)?;
+            let replay_output = checkpoint_fn(store, &mut inner_tape, 0, &entry.input_ids)?;
             self.trim_after_checkpoint_replay(store)?;
             self.checkpoint_op_mem_record("post_replay", None, None, store);
             let weighted = ops::mul(replay_output, output_grad_id, store, &mut inner_tape)?;
@@ -1090,7 +1090,7 @@ impl Tape {
             let mut chunk_tape = Tape::new();
             let mut chunk_inputs = vec![x_c];
             chunk_inputs.extend_from_slice(param_ids);
-            let y_c = replay(store, &mut chunk_tape, &chunk_inputs)?;
+            let y_c = replay(store, &mut chunk_tape, start, &chunk_inputs)?;
             let weighted = ops::mul(y_c, grad_c, store, &mut chunk_tape)?;
             let loss = ops::sum(weighted, store, &mut chunk_tape)?;
             let grads =
