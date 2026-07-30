@@ -1,8 +1,10 @@
-# Seq-chunk bake-in + d_param host-offload — the 65536 writeback wall
+# Seq-chunk bake-in, d_param offload, and the quadratic-fold walls at 65536/131072
 
-> Status: **PENDING-REMOTE (65536 / 131072 in flight on H20 GPU 5 / GPU 1)**.
-> Code shipped and locally gated; the GPU verdict lands in this file's Measured
-> table before this entry is called green.
+> Status: **PENDING-REMOTE — partial.** Four fixes shipped and locally gated. The
+> two forward walls (65536 `slice_bwd`, 131072 `concat_axis2`) are both cleared and
+> measured; **no completed step at either length** — the 131072 re-run was stopped
+> by hand at 99 min, still in forward. Needs a serial 65536 and 131072 to green,
+> plus a 40960 run to license deleting `trim_after_checkpoint_replay`.
 
 ## Context
 
@@ -56,9 +58,44 @@ doing plain assignment (`grad[input_offset] = upstream[idx]`,
 `kernels/layout.cu:154`) over disjoint rows, with only shape metadata crossing
 PCIe. Peak drops from 2× the output to 1×; traffic from quadratic to linear.
 
-This also explains the pre-existing 40960 `concat_axis2` OOM that
-`trim_after_checkpoint_replay` (`tape.rs:1193-1197`) was added to work around —
-same root cause, treated at the symptom.
+**It does *not* explain the 40960 OOM** that `trim_after_checkpoint_replay`
+(`tape.rs:1193-1197`) was added for — an earlier draft of this entry claimed it
+did, wrongly. At exactly 40960 the then-live `≥ 40961` threshold meant
+`checkpoint_seq_chunked` took its `chunk == 0` passthrough, so `cat_seq` never
+ran. That OOM was the **backward**'s `concat_row_chunks` (`matmul.rs:510`, inside
+`matmul_bt_lora_backward_tiled`). Both sites raise the identical string
+`alloc_zeros failed (concat_axis2)`, which is what made the misattribution easy.
+
+The same quadratic fold exists in **five** places, and the two unnamed so far are
+the worse ones: `concat_row_chunks` (`matmul.rs:510`) and `concat_seq_chunks`
+(`attention.rs:713`) each fold `concat_axis2` while their callers hold *every*
+chunk live in a `Vec` — peak ≈3× the result, not 2×. That is the 40960 wall, and
+the trim stays until a remote 40960 run licenses its removal.
+
+## Where the chunked path actually runs — two corrections
+
+**`checkpoint_seq_chunked` records no tape entry during the writeback forward.**
+The enclosing `checkpoint()` disables the tape around the whole layer replay
+(`checkpoint.rs:27`), so `if outer_enabled && requires_grad` is always false and
+the chunk loop runs purely to produce the output. The entry — and with it the
+pinned k/v saved inputs — appears only in the **backward** replay, which runs on
+a fresh `Tape::new()` (`enabled: true`, `tape.rs:964`). So the full-attention
+k/v are transient in the forward: created inside the replay, absent from the
+outer checkpoint's `keep` set, reclaimed at `checkpoint.rs:40`. They are neither
+offloaded nor pinned across the forward, and are recomputed from scratch in
+backward.
+
+Consequence for the `set_requires_grad` fix above: it repairs the *backward
+replay's* path, not a forward one. `chunked_matches_unchunked` caught it because
+that test calls the op directly on an enabled tape — the configuration the real
+OPD forward never presents, and the one the backward replay always does.
+
+**`ckpt_group_size` is dead arithmetic that always returns 1.** Its
+`attn_floor = 12 GiB` (`qwen35.rs:327`) alone exceeds the 8 GiB budget, so the
+integer division is 0 and `clamp(1, 8)` yields 1 — at *every* sequence length,
+seq=128 included. The `mlp` term it computes is never load-bearing. That is why
+exactly one layer's checkpoint group is live at a time, and it is a property of
+the constant, not a decision anyone made.
 
 ## Verification
 
@@ -85,26 +122,37 @@ Prior rungs, for the wall this entry moves:
 | 57344 | 575.5 s | 2.64 s | 2460.4 s | `RUN_EXIT=0` loss 6.1978 |
 | 65536 (pre-fix) | 743.1 s | 2.95 s | — | **OOM `slice_bwd`**, peak 96788 MiB |
 | 131072 (d_param fix only) | — | — | — | **forward OOM `concat_axis2`**, peak 94580 MiB |
-| 131072 (+ cat_seq fix) | | | | *rebuilding* |
+| 131072 (+ cat_seq fix) | >99 min, not finished | — | — | **no OOM**, peak 85899 MiB — stopped by hand |
 
-131072 never reached the backward: it OOMed in the **forward**, at
-`concat_axis2`, which is the third finding of this session and had nothing to do
-with the d_param fix.
+The 131072 re-run cleared the wall that killed the previous attempt — the
+`concat_axis2` OOM does not recur and the forward peak drops **94580 → 85899 MiB
+(−8.7 GB)** — but it was stopped at 99 minutes before the forward completed, so
+there is no `phase=` timing and no backward verdict. What the row licenses: the
+`cat_seq` fold was the 131072 forward wall. What it does not: that 131072
+completes.
 
-**The two in-flight rows' wall-clock is not comparable to the rows above them.**
-They run concurrently on one box and this forward is host-bound (GPU util 8-19%
-at steady state, CPU pinned at 100% with CPU-time tracking wall-clock 1:1), so
-they contend for host cycles the earlier rows had to themselves — 65536's forward
-is already past 19 min against the 12.4 min it took alone. Peak VRAM is unaffected
-(separate cards); only the seconds are. Re-measure serially before quoting a
-backward time.
+**Wall-clock across these rows is not comparable.** An early pair ran
+concurrently on one box, and this forward is host-bound (GPU util 8-19% at steady
+state, CPU pinned at 100% with CPU-time tracking wall-clock 1:1), so they
+contended for host cycles the 49152/57344 rows had to themselves — 65536's
+forward went past 19 min against the 12.4 min it took alone. Peak VRAM is
+unaffected (separate cards); only the seconds are. Re-measure serially before
+quoting any timing.
 
 Peak VRAM *is* comparable, and gives the seq slope: 66987 MiB at 65536 vs
-94580 MiB at 131072 → **~27.6 GB per 65536 tokens**, intercept ~39.4 GB. Linear
-extrapolation puts 262144 at ~149.8 GB: **out of reach on one 97871 MiB card**
-regardless of this fix. What that 27.6 GB is made of is the next question, and
-the answer decides whether 256K single-card is reachable at all or CP is
-mandatory.
+85899 MiB at 131072 → **~19 GB per 65536 tokens** post-fix (it was 27.6 GB before
+the `cat_seq` fix removed the doubled fold peak). Extrapolating the post-fix slope
+puts 262144 near 124 GB: still **out of reach on one 97871 MiB card**.
+
+**That slope is the 48 linear-attention layers.** `forward_linear_attention`
+(`qwen35.rs:2620`) runs the whole sequence in one `linear_attention_core` call —
+neither seq-chunked nor host-offloaded, unlike the MLP and full-attention paths.
+Only one layer is live at a time, so the peak is one LA layer's O(seq) state, and
+`la_layer_peak_bytes` now models it at 211712 B/token against the measured 231424
+(**under-models by 9%**, the dangerous direction). Chunking LA is the next lever
+and the precondition for 256K on one card; it is *not* a copy of the MLP fix,
+because LA is recurrent (`chunk_state` carries along seq) and needs the GDR
+chunked form with explicit boundary state.
 
 131072 does **not** hit the `> 65_535` chunked-SDPA branch
 (`attention.rs:171`) — the q chunk is `OPD_SEQ_CHUNK` = 4096, so every SDPA call
@@ -112,10 +160,46 @@ stays on the fused fast path regardless of total seq. That branch remains
 untested, and CP is still the first thing that would reach it
 (`reference_sdpa_65535_grid_boundary_untested_under_cp`).
 
+## The structural fix (`2b4509f05`, `fba949e24`)
+
+Four bugs in one day, all the same shape: something that should have been a type
+or an invariant was a convention — *remember* to mark the gradient, *remember* to
+preallocate, *remember* to update the memory constant. Conventions hold in code
+one person writes once; across 64 call sites and 19 files they leak.
+
+**`requires_grad` is now derived, not maintained.** `TapeEntry::record`
+(`tape.rs:372`) computes the OR over `input_ids` and marks the output itself, so
+31 manual marks, 51 guards and 29 orphaned locals are gone, and "recorded but not
+requiring grad" is unreachable. The mark lands on a *disabled* tape too, which is
+what a `checkpoint` inner replay needs — `tape.rs:1449` pins that and fails if the
+mark moves inside the `enabled` branch (mutation-verified, not just passing).
+
+**`SeqAccum` (`ops/seq_accum.rs`) has no append.** Five sites folded
+`concat_axis2` per chunk; three also kept every chunk in a `Vec` until the fold,
+for a ≈3× peak. All five now allocate the final shape once and assign disjoint
+rows. The quadratic form is no longer expressible. `concat_row_chunks` and
+`concat_seq_chunks` are deleted. Net for the two changes: **−170 lines**.
+
+**`ckpt_group_size` was dead arithmetic returning 1 at every length** — verified
+for seq ∈ {128, 1024, 8192, 40960, 65536, 131072}, because `attn_floor = 12 GiB`
+alone exceeded the 8 GiB budget. "One layer per checkpoint group" was a property
+of a stale constant, not a decision. Deleted, along with the three duplicated
+`checkpoint_sequential` blocks, which collapse into one `checkpoint_layers`.
+In its place `[ckpt-peak]` prints modeled vs actual peak on each new high-water
+(`CU_MEMPOOL_ATTR_USED_MEM_HIGH` through two defaulted `Backend` methods, so no
+backend type crosses the seam) — the 9% under-model shows up in a log line
+instead of in an OOM 3000 seconds later.
+
 ## Rule
 
 A threshold on an *exact* transform is dead weight — it doubles the code paths
 and the un-taken one is the one that rots. Gate a tradeoff; bake in an identity.
+
+**A convention that fails silently is a bug with a delay.** Prefer deriving a
+value at the one place it's consumed over maintaining it at N places that produce
+it; prefer an API that can't express the wrong shape over a comment asking for the
+right one. Both fixes here were net deletions — that is the tell that the
+abstraction was missing rather than that a new one was wanted.
 
 When a chunked loop accumulates a full-sequence result — a gradient or an output
 — **allocate the final shape once and write disjoint slices into it.** Growing it
