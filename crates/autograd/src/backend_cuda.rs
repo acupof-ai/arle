@@ -30,7 +30,7 @@ use crate::{
         DeviceGradClipResult, DeviceHandle, LinearAttentionDeviceBackwardArgs,
         LinearAttentionDeviceBackwardResult, LinearAttentionDeviceBoundaryArgs,
         LinearAttentionDeviceForwardArgs, LinearAttentionDeviceForwardResult,
-        LinearAttentionScanBackwardArgs, LinearAttentionScanBackwardGrads,
+        LinearAttentionScanBackwardArgs, LinearAttentionScanBackwardGrads, RingBlockDims,
     },
 };
 #[cfg(not(feature = "no-cuda"))]
@@ -1544,6 +1544,68 @@ impl Backend for CudaBackend {
         }
     }
 
+    fn ring_block_fwd_merge(
+        &self,
+        q: &DeviceHandle,
+        k_blk: &DeviceHandle,
+        v_blk: &DeviceHandle,
+        acc_m: &DeviceHandle,
+        acc_l: &DeviceHandle,
+        acc_o: &DeviceHandle,
+        dims: RingBlockDims,
+    ) -> Result<(DeviceHandle, DeviceHandle, DeviceHandle)> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (q, k_blk, v_blk, acc_m, acc_l, acc_o, dims);
+            todo!("GPU required: cuda ring_block_fwd_merge is unavailable under feature no-cuda")
+        }
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            cuda_ring_block_fwd_merge(self, q, k_blk, v_blk, acc_m, acc_l, acc_o, dims)
+        }
+    }
+
+    fn ring_block_finalize(
+        &self,
+        acc_m: &DeviceHandle,
+        acc_l: &DeviceHandle,
+        acc_o: &DeviceHandle,
+        total_rows: usize,
+        head_dim: usize,
+    ) -> Result<(DeviceHandle, DeviceHandle)> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (acc_m, acc_l, acc_o, total_rows, head_dim);
+            todo!("GPU required: cuda ring_block_finalize is unavailable under feature no-cuda")
+        }
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            cuda_ring_block_finalize(self, acc_m, acc_l, acc_o, total_rows, head_dim)
+        }
+    }
+
+    fn ring_block_bwd(
+        &self,
+        q: &DeviceHandle,
+        k_blk: &DeviceHandle,
+        v_blk: &DeviceHandle,
+        out: &DeviceHandle,
+        lse: &DeviceHandle,
+        d_out: &DeviceHandle,
+        grad_q: &DeviceHandle,
+        dims: RingBlockDims,
+    ) -> Result<(DeviceHandle, DeviceHandle, DeviceHandle)> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (q, k_blk, v_blk, out, lse, d_out, grad_q, dims);
+            todo!("GPU required: cuda ring_block_bwd is unavailable under feature no-cuda")
+        }
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            cuda_ring_block_bwd(self, q, k_blk, v_blk, out, lse, d_out, grad_q, dims)
+        }
+    }
+
     fn trim_memory_pool(&self) -> Result<bool> {
         #[cfg(feature = "no-cuda")]
         {
@@ -2256,6 +2318,65 @@ impl Backend for CudaBackend {
             }
             #[cfg(not(feature = "nccl"))]
             unreachable!("world>1 without nccl feature")
+        }
+    }
+
+    fn collective_world_rank(&self) -> (usize, usize) {
+        #[cfg(feature = "nccl")]
+        {
+            self.nccl
+                .as_ref()
+                .map_or((1, 0), |nccl| (nccl.world_size(), nccl.rank()))
+        }
+        #[cfg(not(feature = "nccl"))]
+        {
+            (1, 0)
+        }
+    }
+
+    fn all_to_all_device(
+        &self,
+        x: &DeviceHandle,
+        in_shape: &[usize],
+        scatter_axis: usize,
+        gather_axis: usize,
+    ) -> Result<(DeviceHandle, Vec<usize>)> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (x, in_shape, scatter_axis, gather_axis);
+            todo!("GPU required: cuda all_to_all_device is unavailable under feature no-cuda")
+        }
+
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            let _ = (scatter_axis, gather_axis);
+            let len = shape_size(in_shape);
+            let src = self.cuda_slice(x, "all_to_all")?;
+            if src.len() != len {
+                return Err(AutogradError::DataLengthMismatch {
+                    len: src.len(),
+                    shape: in_shape.to_vec(),
+                    size: len,
+                });
+            }
+
+            #[cfg(feature = "nccl")]
+            let world = self.nccl.as_ref().map_or(1, |nccl| nccl.world_size());
+            #[cfg(not(feature = "nccl"))]
+            let world = 1usize;
+            // Single rank: no rank to shuffle to — identity on shape and value.
+            // Share the input Arc (functional buffers) — no alloc, no D2D copy.
+            if world <= 1 {
+                return Ok((x.clone(), in_shape.to_vec()));
+            }
+
+            // world>1 needs a strided seq↔head shuffle (split scatter_axis into N,
+            // send/recv-pair each slice, concat along gather_axis) — no single NCCL
+            // primitive, and the layout kernels are pod-only (nvcc, ≥2 GPU). Loud
+            // pending-remote boundary, never a silent wrong-shape identity.
+            Err(AutogradError::TapeInvariant(
+                "all_to_all_device world>1 is pending-remote (NCCL seq↔head shuffle; needs pod)",
+            ))
         }
     }
 
@@ -3983,6 +4104,238 @@ fn cuda_gather_last_dim_backward(
     )?;
 
     Ok(DeviceHandle::Cuda(CudaStorage::new(d_grad)))
+}
+
+// --- Context-parallel ring attention (Track A device path) ---
+// One-block-pure kernels + on-device flash-2 merge; the ring rotation and tape
+// live in ops/ring_attention.rs. q/k/v arrive as f32 handles (tape tensors),
+// converted to bf16 for the kernel (matching the training activation precision);
+// the (m,l,o) accumulators and grads stay f32 for a stable merge.
+#[cfg(not(feature = "no-cuda"))]
+fn ring_i32(v: usize, label: &'static str) -> Result<i32> {
+    i32::try_from(v).map_err(|_| AutogradError::TapeInvariant(label))
+}
+
+#[cfg(not(feature = "no-cuda"))]
+#[allow(clippy::too_many_arguments)]
+fn cuda_ring_block_fwd_merge(
+    backend: &CudaBackend,
+    q: &DeviceHandle,
+    k_blk: &DeviceHandle,
+    v_blk: &DeviceHandle,
+    acc_m: &DeviceHandle,
+    acc_l: &DeviceHandle,
+    acc_o: &DeviceHandle,
+    dims: RingBlockDims,
+) -> Result<(DeviceHandle, DeviceHandle, DeviceHandle)> {
+    let q_slice = backend.cuda_slice(q, "ring q")?;
+    let k_slice = backend.cuda_slice(k_blk, "ring k")?;
+    let v_slice = backend.cuda_slice(v_blk, "ring v")?;
+    let q_bf16 = backend.local_f32_as_bf16(q_slice, q_slice.len())?;
+    let k_bf16 = backend.local_f32_as_bf16(k_slice, k_slice.len())?;
+    let v_bf16 = backend.local_f32_as_bf16(v_slice, v_slice.len())?;
+    let m_in = backend.cuda_slice(acc_m, "ring acc_m")?;
+    let l_in = backend.cuda_slice(acc_l, "ring acc_l")?;
+    let o_in = backend.cuda_slice(acc_o, "ring acc_o")?;
+    let rows = dims.num_q_tiles * dims.q_rows;
+    let mut m_out = backend
+        .stream
+        .alloc_zeros::<f32>(rows)
+        .map_err(|_| cuda_alloc_failed("ring m_out", vec![rows]))?;
+    let mut l_out = backend
+        .stream
+        .alloc_zeros::<f32>(rows)
+        .map_err(|_| cuda_alloc_failed("ring l_out", vec![rows]))?;
+    let mut o_out = backend
+        .stream
+        .alloc_zeros::<f32>(rows * dims.head_dim)
+        .map_err(|_| cuda_alloc_failed("ring o_out", vec![rows * dims.head_dim]))?;
+    {
+        let (q_ptr, _qg) = q_bf16.device_ptr(&backend.stream);
+        let (k_ptr, _kg) = k_bf16.device_ptr(&backend.stream);
+        let (v_ptr, _vg) = v_bf16.device_ptr(&backend.stream);
+        let (mi_ptr, _mig) = m_in.device_ptr(&backend.stream);
+        let (li_ptr, _lig) = l_in.device_ptr(&backend.stream);
+        let (oi_ptr, _oig) = o_in.device_ptr(&backend.stream);
+        let (mo_ptr, _mog) = m_out.device_ptr_mut(&backend.stream);
+        let (lo_ptr, _log) = l_out.device_ptr_mut(&backend.stream);
+        let (oo_ptr, _oog) = o_out.device_ptr_mut(&backend.stream);
+        check_cuda_ffi(
+            // SAFETY: q/k/v are live bf16 copies; acc_*_in are f32 handles of the right
+            // length; *_out are freshly allocated rows / rows*hd; dims mirror the shapes.
+            unsafe {
+                ffi::ring_block_attention_fwd_merge_cuda(
+                    q_ptr as *const ffi::Half,
+                    k_ptr as *const ffi::Half,
+                    v_ptr as *const ffi::Half,
+                    mi_ptr as *const f32,
+                    li_ptr as *const f32,
+                    oi_ptr as *const f32,
+                    mo_ptr as *mut f32,
+                    lo_ptr as *mut f32,
+                    oo_ptr as *mut f32,
+                    ring_i32(dims.num_q_tiles, "ring num_q_tiles i32")?,
+                    ring_i32(dims.num_q_heads, "ring num_q_heads i32")?,
+                    ring_i32(dims.num_kv_heads, "ring num_kv_heads i32")?,
+                    ring_i32(dims.head_dim, "ring head_dim i32")?,
+                    ring_i32(dims.q_rows, "ring q_rows i32")?,
+                    ring_i32(dims.blk_len, "ring blk_len i32")?,
+                    ring_i32(dims.q_abs, "ring q_abs i32")?,
+                    ring_i32(dims.k_abs, "ring k_abs i32")?,
+                    dims.sm_scale,
+                    backend.stream.cu_stream(),
+                )
+            },
+            "ring_block_attention_fwd_merge_cuda",
+        )?;
+    }
+    Ok((
+        DeviceHandle::Cuda(CudaStorage::new(m_out)),
+        DeviceHandle::Cuda(CudaStorage::new(l_out)),
+        DeviceHandle::Cuda(CudaStorage::new(o_out)),
+    ))
+}
+
+#[cfg(not(feature = "no-cuda"))]
+fn cuda_ring_block_finalize(
+    backend: &CudaBackend,
+    acc_m: &DeviceHandle,
+    acc_l: &DeviceHandle,
+    acc_o: &DeviceHandle,
+    total_rows: usize,
+    head_dim: usize,
+) -> Result<(DeviceHandle, DeviceHandle)> {
+    let m_slice = backend.cuda_slice(acc_m, "ring fin m")?;
+    let l_slice = backend.cuda_slice(acc_l, "ring fin l")?;
+    let o_slice = backend.cuda_slice(acc_o, "ring fin o")?;
+    let out_len = total_rows * head_dim;
+    let mut out_f32 = backend
+        .stream
+        .alloc_zeros::<f32>(out_len)
+        .map_err(|_| cuda_alloc_failed("ring finalize out", vec![out_len]))?;
+    let mut lse = backend
+        .stream
+        .alloc_zeros::<f32>(total_rows)
+        .map_err(|_| cuda_alloc_failed("ring finalize lse", vec![total_rows]))?;
+    {
+        let (m_ptr, _mg) = m_slice.device_ptr(&backend.stream);
+        let (l_ptr, _lg) = l_slice.device_ptr(&backend.stream);
+        let (o_ptr, _og) = o_slice.device_ptr(&backend.stream);
+        let (out_ptr, _outg) = out_f32.device_ptr_mut(&backend.stream);
+        let (lse_ptr, _lseg) = lse.device_ptr_mut(&backend.stream);
+        check_cuda_ffi(
+            // SAFETY: acc_* are f32 handles length rows / rows*hd; out is rows*hd f32;
+            // lse is rows f32; dims mirror the shapes.
+            unsafe {
+                ffi::ring_block_attention_finalize_cuda(
+                    m_ptr as *const f32,
+                    l_ptr as *const f32,
+                    o_ptr as *const f32,
+                    out_ptr as *mut f32,
+                    lse_ptr as *mut f32,
+                    ring_i32(total_rows, "ring total_rows i32")?,
+                    ring_i32(head_dim, "ring head_dim i32")?,
+                    backend.stream.cu_stream(),
+                )
+            },
+            "ring_block_attention_finalize_cuda",
+        )?;
+    }
+    Ok((
+        DeviceHandle::Cuda(CudaStorage::new(out_f32)),
+        DeviceHandle::Cuda(CudaStorage::new(lse)),
+    ))
+}
+
+#[cfg(not(feature = "no-cuda"))]
+#[allow(clippy::too_many_arguments)]
+fn cuda_ring_block_bwd(
+    backend: &CudaBackend,
+    q: &DeviceHandle,
+    k_blk: &DeviceHandle,
+    v_blk: &DeviceHandle,
+    out: &DeviceHandle,
+    lse: &DeviceHandle,
+    d_out: &DeviceHandle,
+    grad_q: &DeviceHandle,
+    dims: RingBlockDims,
+) -> Result<(DeviceHandle, DeviceHandle, DeviceHandle)> {
+    let q_slice = backend.cuda_slice(q, "ring bwd q")?;
+    let k_slice = backend.cuda_slice(k_blk, "ring bwd k")?;
+    let v_slice = backend.cuda_slice(v_blk, "ring bwd v")?;
+    let out_slice = backend.cuda_slice(out, "ring bwd out")?;
+    let lse_slice = backend.cuda_slice(lse, "ring bwd lse")?;
+    let do_slice = backend.cuda_slice(d_out, "ring bwd d_out")?;
+    let gq_slice = backend.cuda_slice(grad_q, "ring bwd grad_q")?;
+    let q_bf16 = backend.local_f32_as_bf16(q_slice, q_slice.len())?;
+    let k_bf16 = backend.local_f32_as_bf16(k_slice, k_slice.len())?;
+    let v_bf16 = backend.local_f32_as_bf16(v_slice, v_slice.len())?;
+    let do_bf16 = backend.local_f32_as_bf16(do_slice, do_slice.len())?;
+    // grad_q is in/out: copy the running accumulator so the kernel's += lands on a
+    // fresh handle (the tape input stays immutable).
+    let mut gq_out = backend
+        .stream
+        .alloc_zeros::<f32>(gq_slice.len())
+        .map_err(|_| cuda_alloc_failed("ring grad_q out", vec![gq_slice.len()]))?;
+    backend
+        .stream
+        .memcpy_dtod(gq_slice, &mut gq_out)
+        .map_err(|_| AutogradError::TapeInvariant("cuda D2D copy failed (ring grad_q carry)"))?;
+    let blk_elems = dims.num_q_tiles / (dims.num_q_heads / dims.num_kv_heads).max(1)
+        * dims.blk_len
+        * dims.head_dim;
+    let mut gk = backend
+        .stream
+        .alloc_zeros::<f32>(blk_elems)
+        .map_err(|_| cuda_alloc_failed("ring grad_k", vec![blk_elems]))?;
+    let mut gv = backend
+        .stream
+        .alloc_zeros::<f32>(blk_elems)
+        .map_err(|_| cuda_alloc_failed("ring grad_v", vec![blk_elems]))?;
+    {
+        let (q_ptr, _qg) = q_bf16.device_ptr(&backend.stream);
+        let (k_ptr, _kg) = k_bf16.device_ptr(&backend.stream);
+        let (v_ptr, _vg) = v_bf16.device_ptr(&backend.stream);
+        let (out_ptr, _og) = out_slice.device_ptr(&backend.stream);
+        let (lse_ptr, _lg) = lse_slice.device_ptr(&backend.stream);
+        let (do_ptr, _dg) = do_bf16.device_ptr(&backend.stream);
+        let (gq_ptr, _gqg) = gq_out.device_ptr_mut(&backend.stream);
+        let (gk_ptr, _gkg) = gk.device_ptr_mut(&backend.stream);
+        let (gv_ptr, _gvg) = gv.device_ptr_mut(&backend.stream);
+        check_cuda_ffi(
+            // SAFETY: bf16 copies + f32 out/lse/grad handles of matching length; gk/gv
+            // sized to one block's [Tkv, blk_len, hd]; dims mirror the shapes.
+            unsafe {
+                ffi::ring_block_attention_bwd_cuda(
+                    q_ptr as *const ffi::Half,
+                    k_ptr as *const ffi::Half,
+                    v_ptr as *const ffi::Half,
+                    out_ptr as *const f32,
+                    lse_ptr as *const f32,
+                    do_ptr as *const ffi::Half,
+                    gq_ptr as *mut f32,
+                    gk_ptr as *mut f32,
+                    gv_ptr as *mut f32,
+                    ring_i32(dims.num_q_tiles, "ring bwd num_q_tiles i32")?,
+                    ring_i32(dims.num_q_heads, "ring bwd num_q_heads i32")?,
+                    ring_i32(dims.num_kv_heads, "ring bwd num_kv_heads i32")?,
+                    ring_i32(dims.head_dim, "ring bwd head_dim i32")?,
+                    ring_i32(dims.q_rows, "ring bwd q_rows i32")?,
+                    ring_i32(dims.blk_len, "ring bwd blk_len i32")?,
+                    ring_i32(dims.q_abs, "ring bwd q_abs i32")?,
+                    ring_i32(dims.k_abs, "ring bwd k_abs i32")?,
+                    dims.sm_scale,
+                    backend.stream.cu_stream(),
+                )
+            },
+            "ring_block_attention_bwd_cuda",
+        )?;
+    }
+    Ok((
+        DeviceHandle::Cuda(CudaStorage::new(gq_out)),
+        DeviceHandle::Cuda(CudaStorage::new(gk)),
+        DeviceHandle::Cuda(CudaStorage::new(gv)),
+    ))
 }
 
 // Fused causal prefill SDPA — the production inference kernel
