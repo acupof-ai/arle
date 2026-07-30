@@ -6,8 +6,8 @@ use crate::{
     AutogradError, Result,
     backend::{CausalSdpaDeviceBackwardArgs, Device, cpu_causal_sdpa_recompute_backward},
     ops::{
-        add, add_broadcast, broadcast_expand, matmul, mul_scalar, reshape, slice, softmax,
-        softmax_backward, transpose,
+        add, add_broadcast, broadcast_expand, matmul, mul_scalar, reshape, seq_accum::SeqAccum,
+        slice, softmax, softmax_backward, transpose,
     },
     tape::{BackwardOp, GradPairs, SavedContext, TapeEntry},
     tensor::{Dirty, Tensor, TensorId, TensorStore},
@@ -158,10 +158,6 @@ pub fn causal_sdpa_recompute_with_q_start(
     let v_shape = store.tensor(v)?.shape.clone();
     validate_cached_attention_shapes(&q_shape, &k_shape, &v_shape, q_start)?;
 
-    let requires_grad = store.tensor(q)?.requires_grad
-        || store.tensor(k)?.requires_grad
-        || store.tensor(v)?.requires_grad;
-
     store.ensure_device(q)?;
     store.ensure_device(k)?;
     store.ensure_device(v)?;
@@ -173,8 +169,7 @@ pub fn causal_sdpa_recompute_with_q_start(
         let mut inner_tape = crate::Tape::new();
         inner_tape.set_enabled(false);
         let (batch, heads, seq, dim) = (q_shape[0], q_shape[1], q_shape[2], q_shape[3]);
-        let merged_heads = batch * heads;
-        let mut chunks = Vec::new();
+        let mut accum = SeqAccum::new(q_shape.clone(), 2, store)?;
         let mut q0 = 0;
         while q0 < seq {
             let q1 = (q0 + 65_535).min(seq);
@@ -203,14 +198,11 @@ pub fn causal_sdpa_recompute_with_q_start(
                 .ok_or(AutogradError::TapeInvariant(
                     "long causal SDPA chunk rejected by fused prefill",
                 ))?;
-            let out = reshape(out, &[merged_heads, q1 - q0, dim], store, &mut inner_tape)?;
-            chunks.push(out);
-            let keep = chunks.iter().copied().collect();
-            store.free_new_except(&live_before, &keep)?;
+            accum.write_rows(q0, out, store)?;
+            store.free_new_except(&live_before, &HashSet::from([accum.id()]))?;
             q0 = q1;
         }
-        let joined = concat_seq_chunks(&chunks, merged_heads, dim, store)?;
-        let out = reshape(joined, &q_shape, store, &mut inner_tape)?;
+        let out = accum.finish();
         let keep = HashSet::from([q, k, v, out]);
         store.free_new_except(&live_before, &keep)?;
         out
@@ -223,16 +215,14 @@ pub fn causal_sdpa_recompute_with_q_start(
         store.free_new_except(&live_before, &keep)?;
         out
     };
-    store.set_requires_grad(output_id, requires_grad)?;
 
-    if tape.enabled && requires_grad {
-        tape.record(crate::TapeEntry {
-            op: BackwardOp::CausalSdpaRecompute,
-            output_id,
-            input_ids: smallvec![q, k, v],
-            saved: SavedContext::CausalSdpaRecomputeCtx { q, k, v, q_start },
-        });
+    crate::TapeEntry {
+        op: BackwardOp::CausalSdpaRecompute,
+        output_id,
+        input_ids: smallvec![q, k, v],
+        saved: SavedContext::CausalSdpaRecomputeCtx { q, k, v, q_start },
     }
+    .record(store, tape)?;
 
     Ok(output_id)
 }
@@ -591,7 +581,10 @@ fn causal_sdpa_recompute_backward_device_chunked(
     // (except the kept accumulators / grad_q chunks) is freed after each chunk.
     let live_before: HashSet<TensorId> = store.live_ids().into_iter().collect();
 
-    let mut grad_q_chunks: Vec<TensorId> = Vec::new();
+    // Rows are the *local* q shard (q_len), not kv_len — a CP shard has q_len < kv_len.
+    let mut grad_q_3d = need_grad_q
+        .then(|| SeqAccum::new(vec![merged_heads, q_len, head_dim], 1, store))
+        .transpose()?;
     let mut grad_k_acc: Option<TensorId> = None;
     let mut grad_v_acc: Option<TensorId> = None;
 
@@ -652,10 +645,10 @@ fn causal_sdpa_recompute_backward_device_chunked(
                 ))?;
 
             // grad_q chunk: scale·(d_scores @ k) → `[merged_heads, rows, head_dim]`.
-            if need_grad_q {
+            if let Some(acc) = grad_q_3d.as_mut() {
                 let grad_q_part = matmul(d_scores, k_3d, store, &mut tape)?;
                 let grad_q_part = mul_scalar(grad_q_part, scale, store, &mut tape)?;
-                grad_q_chunks.push(grad_q_part);
+                acc.write_rows(q0, grad_q_part, store)?;
             }
             // grad_k contribution: scale·(d_scores^T @ q_chunk) → `[merged_heads, seq, head_dim]`.
             if need_grad_k {
@@ -671,8 +664,9 @@ fn causal_sdpa_recompute_backward_device_chunked(
 
         // Free this chunk's `[*, rows, seq]` transients (scores/scaled/masked/
         // probs/d_probs/d_scores + q/upstream slices); keep only the running
-        // accumulators and the per-chunk grad_q outputs. Bounds peak to O(q_chunk·seq).
-        let mut keep: HashSet<TensorId> = grad_q_chunks.iter().copied().collect();
+        // accumulators. Bounds peak to O(q_chunk·seq).
+        let mut keep: HashSet<TensorId> =
+            grad_q_3d.as_ref().map(SeqAccum::id).into_iter().collect();
         keep.extend(grad_k_acc);
         keep.extend(grad_v_acc);
         store.free_new_except(&live_before, &keep)?;
@@ -688,10 +682,8 @@ fn causal_sdpa_recompute_backward_device_chunked(
         let grad_v = reshape(grad_v_3d, kv_shape, store, &mut tape)?;
         grads.push((v, grad_v));
     }
-    if need_grad_q {
-        // Concatenate per-q-chunk grads along the sequence axis.
-        let grad_q_3d = concat_seq_chunks(&grad_q_chunks, merged_heads, head_dim, store)?;
-        let grad_q = reshape(grad_q_3d, q_shape, store, &mut tape)?;
+    if let Some(acc) = grad_q_3d {
+        let grad_q = reshape(acc.finish(), q_shape, store, &mut tape)?;
         grads.push((q, grad_q));
     }
     if need_grad_k {
@@ -703,64 +695,6 @@ fn causal_sdpa_recompute_backward_device_chunked(
     }
 
     Ok(grads)
-}
-
-/// Concatenate per-q-chunk grad tensors `[merged_heads, rows_i, head_dim]`
-/// along the sequence axis into `[merged_heads, seq, head_dim]`. Folds the
-/// backend's `concat_axis2` over rank-4 `[merged_heads, 1, rows, head_dim]`
-/// views (CUDA-resident; CPU fallback readback/upload). Tape-free recompute
-/// path, so no backward node is recorded.
-fn concat_seq_chunks(
-    chunks: &[TensorId],
-    merged_heads: usize,
-    head_dim: usize,
-    store: &mut TensorStore,
-) -> Result<TensorId> {
-    if chunks.is_empty() {
-        return Err(AutogradError::InvalidIndicesLen {
-            expected: 1,
-            got: 0,
-        });
-    }
-    if chunks.len() == 1 {
-        return Ok(chunks[0]);
-    }
-
-    // Accumulate the running concat as a device handle + its rank-4 shape.
-    store.ensure_device(chunks[0])?;
-    let mut acc_handle =
-        store
-            .tensor(chunks[0])?
-            .device_handle
-            .clone()
-            .ok_or(AutogradError::TapeInvariant(
-                "concat_seq_chunks: chunk missing device handle",
-            ))?;
-    let rows0 = store.tensor(chunks[0])?.shape[1];
-    let mut acc_shape = vec![merged_heads, 1, rows0, head_dim];
-
-    for &id in &chunks[1..] {
-        store.ensure_device(id)?;
-        let rows = store.tensor(id)?.shape[1];
-        let next_handle =
-            store
-                .tensor(id)?
-                .device_handle
-                .clone()
-                .ok_or(AutogradError::TapeInvariant(
-                    "concat_seq_chunks: chunk missing device handle",
-                ))?;
-        let next_shape = vec![merged_heads, 1, rows, head_dim];
-        let (out_handle, out_shape) =
-            store
-                .backend()
-                .concat_axis2(&acc_handle, &acc_shape, &next_handle, &next_shape)?;
-        acc_handle = out_handle;
-        acc_shape = out_shape;
-    }
-
-    let seq_total = acc_shape[2];
-    store.alloc_device_tensor(vec![merged_heads, seq_total, head_dim], acc_handle)
 }
 
 /// Concatenate rank-4 `[batch, heads_i, seq, head_dim]` tensors along the
@@ -831,14 +765,13 @@ pub fn cat_heads(
 
     let output_id = store.alloc(Tensor::new(data, out_shape, requires_grad)?);
 
-    if tape.enabled && requires_grad {
-        tape.record(TapeEntry {
-            op: BackwardOp::CatHeads,
-            output_id,
-            input_ids: inputs.iter().copied().collect(),
-            saved: SavedContext::CatHeadsCtx { head_counts },
-        });
+    TapeEntry {
+        op: BackwardOp::CatHeads,
+        output_id,
+        input_ids: inputs.iter().copied().collect(),
+        saved: SavedContext::CatHeadsCtx { head_counts },
     }
+    .record(store, tape)?;
 
     Ok(output_id)
 }
@@ -1023,18 +956,16 @@ pub fn cat_seq(
             requires_grad,
         )?)
     };
-    store.set_requires_grad(output_id, requires_grad)?;
 
-    if tape.enabled && requires_grad {
-        tape.record(TapeEntry {
-            op: BackwardOp::CatSeq,
-            output_id,
-            input_ids: smallvec![a, b],
-            saved: SavedContext::CatSeqCtx {
-                seq_counts: vec![seq_a, seq_b],
-            },
-        });
+    TapeEntry {
+        op: BackwardOp::CatSeq,
+        output_id,
+        input_ids: smallvec![a, b],
+        saved: SavedContext::CatSeqCtx {
+            seq_counts: vec![seq_a, seq_b],
+        },
     }
+    .record(store, tape)?;
     Ok(output_id)
 }
 

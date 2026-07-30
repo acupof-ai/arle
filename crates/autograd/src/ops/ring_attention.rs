@@ -245,10 +245,6 @@ pub fn cp_causal_sdpa(
     let (b, h, s, d) = (shape[0], shape[1], shape[2], shape[3]);
     let tiles = b * h;
     let scale = 1.0 / (d as f32).sqrt();
-    let requires_grad = store.tensor(q)?.requires_grad
-        || store.tensor(k)?.requires_grad
-        || store.tensor(v)?.requires_grad;
-
     let qd = store.tensor_host(q)?.data;
     let kd = store.tensor_host(k)?.data;
     let vd = store.tensor_host(v)?.data;
@@ -266,23 +262,21 @@ pub fn cp_causal_sdpa(
 
     let out_id = store.alloc(Tensor::new(out, shape.clone(), false)?);
     let lse_id = store.alloc(Tensor::new(lse, vec![b, h, s], false)?);
-    store.set_requires_grad(out_id, requires_grad)?;
-    if tape.enabled && requires_grad {
-        tape.record(TapeEntry {
-            op: BackwardOp::RingAttention,
-            output_id: out_id,
-            input_ids: smallvec![q, k, v],
-            saved: SavedContext::RingAttentionCtx {
-                q,
-                blocks: smallvec![(k, v, 0usize)],
-                lse: lse_id,
-                out: out_id,
-                rows: s,
-                dim: d,
-                q_abs: 0,
-            },
-        });
+    TapeEntry {
+        op: BackwardOp::RingAttention,
+        output_id: out_id,
+        input_ids: smallvec![q, k, v],
+        saved: SavedContext::RingAttentionCtx {
+            q,
+            blocks: smallvec![(k, v, 0usize)],
+            lse: lse_id,
+            out: out_id,
+            rows: s,
+            dim: d,
+            q_abs: 0,
+        },
     }
+    .record(store, tape)?;
     Ok(out_id)
 }
 

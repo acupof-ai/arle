@@ -40,14 +40,8 @@ fn add_broadcast_device_lazy(
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
-    let (a_shape, a_requires_grad) = {
-        let t = store.tensor(a)?;
-        (t.shape.clone(), t.requires_grad)
-    };
-    let (b_shape, b_requires_grad) = {
-        let t = store.tensor(b)?;
-        (t.shape.clone(), t.requires_grad)
-    };
+    let a_shape = store.tensor(a)?.shape.clone();
+    let b_shape = store.tensor(b)?.shape.clone();
 
     store.ensure_device(a)?;
     store.ensure_device(b)?;
@@ -67,18 +61,15 @@ fn add_broadcast_device_lazy(
     let out_handle = store
         .backend()
         .add_broadcast(&a_handle, &a_shape, &b_handle, &b_shape)?;
-    let requires_grad = a_requires_grad || b_requires_grad;
     let output_id = store.alloc_device_tensor(a_shape.clone(), out_handle)?;
-    store.set_requires_grad(output_id, requires_grad)?;
 
-    if requires_grad {
-        tape.record(TapeEntry {
-            op: BackwardOp::AddBroadcast,
-            output_id,
-            input_ids: smallvec![a, b],
-            saved: SavedContext::AddBroadcastCtx { a_shape, b_shape },
-        });
+    TapeEntry {
+        op: BackwardOp::AddBroadcast,
+        output_id,
+        input_ids: smallvec![a, b],
+        saved: SavedContext::AddBroadcastCtx { a_shape, b_shape },
     }
+    .record(store, tape)?;
 
     Ok(output_id)
 }
@@ -108,17 +99,16 @@ fn add_broadcast_host_eager(
 
     let requires_grad = a_tensor.requires_grad || b_tensor.requires_grad;
     let output_id = store.alloc(Tensor::new(output, a_tensor.shape.clone(), requires_grad)?);
-    if requires_grad {
-        tape.record(TapeEntry {
-            op: BackwardOp::AddBroadcast,
-            output_id,
-            input_ids: smallvec![a, b],
-            saved: SavedContext::AddBroadcastCtx {
-                a_shape: a_tensor.shape,
-                b_shape: b_tensor.shape,
-            },
-        });
+    TapeEntry {
+        op: BackwardOp::AddBroadcast,
+        output_id,
+        input_ids: smallvec![a, b],
+        saved: SavedContext::AddBroadcastCtx {
+            a_shape: a_tensor.shape,
+            b_shape: b_tensor.shape,
+        },
     }
+    .record(store, tape)?;
 
     Ok(output_id)
 }

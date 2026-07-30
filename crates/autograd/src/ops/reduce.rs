@@ -27,10 +27,7 @@ fn sum_device_lazy(a: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Res
     // drift. We extract scalar metadata in a scoped borrow so we never hit
     // the `Tensor::clone` assert against `Dirty::Device`.
     store.ensure_device(a)?;
-    let (input_shape, requires_grad) = {
-        let tensor = store.tensor(a)?;
-        (tensor.shape.clone(), tensor.requires_grad)
-    };
+    let input_shape = store.tensor(a)?.shape.clone();
     let input_handle = store
         .tensor(a)?
         .device_handle
@@ -42,16 +39,14 @@ fn sum_device_lazy(a: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Res
 
     let out_handle = store.backend().sum_all(&input_handle, &input_shape)?;
     let output_id = store.alloc_device_tensor(Vec::new(), out_handle)?;
-    store.set_requires_grad(output_id, requires_grad)?;
 
-    if requires_grad {
-        tape.record(TapeEntry {
-            op: BackwardOp::Sum,
-            output_id,
-            input_ids: smallvec![a],
-            saved: SavedContext::Shape(input_shape),
-        });
+    TapeEntry {
+        op: BackwardOp::Sum,
+        output_id,
+        input_ids: smallvec![a],
+        saved: SavedContext::Shape(input_shape),
     }
+    .record(store, tape)?;
 
     Ok(output_id)
 }
@@ -64,14 +59,13 @@ fn sum_host_eager(a: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Resu
     let value = input.data.iter().sum::<f32>();
     let output_id = store.alloc(Tensor::new(vec![value], Vec::new(), input.requires_grad)?);
 
-    if input.requires_grad {
-        tape.record(TapeEntry {
-            op: BackwardOp::Sum,
-            output_id,
-            input_ids: smallvec![a],
-            saved: SavedContext::Shape(input.shape.clone()),
-        });
+    TapeEntry {
+        op: BackwardOp::Sum,
+        output_id,
+        input_ids: smallvec![a],
+        saved: SavedContext::Shape(input.shape.clone()),
     }
+    .record(store, tape)?;
 
     Ok(output_id)
 }
@@ -94,9 +88,9 @@ pub fn mean(a: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<Ten
 
 fn mean_device_lazy(a: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
     store.ensure_device(a)?;
-    let (input_shape, numel, requires_grad) = {
+    let (input_shape, numel) = {
         let tensor = store.tensor(a)?;
-        (tensor.shape.clone(), tensor.size, tensor.requires_grad)
+        (tensor.shape.clone(), tensor.size)
     };
     let input_handle = store
         .tensor(a)?
@@ -111,16 +105,14 @@ fn mean_device_lazy(a: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Re
     let inv_numel = if numel == 0 { 0.0 } else { 1.0 / numel as f32 };
     let out_handle = store.backend().mul_scalar(&sum_handle, inv_numel, &[])?;
     let output_id = store.alloc_device_tensor(Vec::new(), out_handle)?;
-    store.set_requires_grad(output_id, requires_grad)?;
 
-    if requires_grad {
-        tape.record(TapeEntry {
-            op: BackwardOp::Mean,
-            output_id,
-            input_ids: smallvec![a],
-            saved: SavedContext::MeanCtx { input: a, numel },
-        });
+    TapeEntry {
+        op: BackwardOp::Mean,
+        output_id,
+        input_ids: smallvec![a],
+        saved: SavedContext::MeanCtx { input: a, numel },
     }
+    .record(store, tape)?;
 
     Ok(output_id)
 }
@@ -130,17 +122,16 @@ fn mean_host_eager(a: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Res
     let value = input.data.iter().sum::<f32>() / input.size as f32;
     let output_id = store.alloc(Tensor::new(vec![value], Vec::new(), input.requires_grad)?);
 
-    if input.requires_grad {
-        tape.record(TapeEntry {
-            op: BackwardOp::Mean,
-            output_id,
-            input_ids: smallvec![a],
-            saved: SavedContext::MeanCtx {
-                input: a,
-                numel: input.size,
-            },
-        });
+    TapeEntry {
+        op: BackwardOp::Mean,
+        output_id,
+        input_ids: smallvec![a],
+        saved: SavedContext::MeanCtx {
+            input: a,
+            numel: input.size,
+        },
     }
+    .record(store, tape)?;
 
     Ok(output_id)
 }

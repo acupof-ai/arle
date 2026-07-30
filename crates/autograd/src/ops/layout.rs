@@ -38,10 +38,7 @@ fn reshape_device_lazy(
 ) -> Result<TensorId> {
     store.ensure_device(x)?;
 
-    let (input_shape, requires_grad) = {
-        let t = store.tensor(x)?;
-        (t.shape.clone(), t.requires_grad)
-    };
+    let input_shape = store.tensor(x)?.shape.clone();
     if shape_numel(shape) != shape_numel(&input_shape) {
         return Err(AutogradError::ShapeMismatch {
             expected: input_shape,
@@ -60,16 +57,14 @@ fn reshape_device_lazy(
 
     let out_handle = store.backend().reshape(&x_handle, shape)?;
     let output_id = store.alloc_device_tensor(shape.to_vec(), out_handle)?;
-    store.set_requires_grad(output_id, requires_grad)?;
 
-    if requires_grad {
-        tape.record(TapeEntry {
-            op: BackwardOp::Reshape,
-            output_id,
-            input_ids: smallvec![x],
-            saved: SavedContext::ReshapeCtx { input_shape },
-        });
+    TapeEntry {
+        op: BackwardOp::Reshape,
+        output_id,
+        input_ids: smallvec![x],
+        saved: SavedContext::ReshapeCtx { input_shape },
     }
+    .record(store, tape)?;
 
     Ok(output_id)
 }
@@ -93,16 +88,15 @@ fn reshape_host_eager(
         shape.to_vec(),
         input.requires_grad,
     )?);
-    if input.requires_grad {
-        tape.record(TapeEntry {
-            op: BackwardOp::Reshape,
-            output_id,
-            input_ids: smallvec![x],
-            saved: SavedContext::ReshapeCtx {
-                input_shape: input.shape,
-            },
-        });
+    TapeEntry {
+        op: BackwardOp::Reshape,
+        output_id,
+        input_ids: smallvec![x],
+        saved: SavedContext::ReshapeCtx {
+            input_shape: input.shape,
+        },
     }
+    .record(store, tape)?;
 
     Ok(output_id)
 }
@@ -138,10 +132,7 @@ fn transpose_device_lazy(
 ) -> Result<TensorId> {
     store.ensure_device(x)?;
 
-    let (input_shape, requires_grad) = {
-        let t = store.tensor(x)?;
-        (t.shape.clone(), t.requires_grad)
-    };
+    let input_shape = store.tensor(x)?.shape.clone();
     let rank = input_shape.len();
     if axis1 >= rank {
         return Err(AutogradError::AxisOutOfBounds { axis: axis1, rank });
@@ -164,16 +155,14 @@ fn transpose_device_lazy(
             .backend()
             .transpose_axes_swap(&x_handle, &input_shape, axis1, axis2)?;
     let output_id = store.alloc_device_tensor(new_shape, out_handle)?;
-    store.set_requires_grad(output_id, requires_grad)?;
 
-    if requires_grad {
-        tape.record(TapeEntry {
-            op: BackwardOp::Transpose,
-            output_id,
-            input_ids: smallvec![x],
-            saved: SavedContext::TransposeCtx { axis1, axis2 },
-        });
+    TapeEntry {
+        op: BackwardOp::Transpose,
+        output_id,
+        input_ids: smallvec![x],
+        saved: SavedContext::TransposeCtx { axis1, axis2 },
     }
+    .record(store, tape)?;
 
     Ok(output_id)
 }
@@ -189,14 +178,13 @@ fn transpose_host_eager(
     let (data, shape) = transpose_data(&input.data, &input.shape, axis1, axis2)?;
     let output_id = store.alloc(Tensor::new(data, shape, input.requires_grad)?);
 
-    if input.requires_grad {
-        tape.record(TapeEntry {
-            op: BackwardOp::Transpose,
-            output_id,
-            input_ids: smallvec![x],
-            saved: SavedContext::TransposeCtx { axis1, axis2 },
-        });
+    TapeEntry {
+        op: BackwardOp::Transpose,
+        output_id,
+        input_ids: smallvec![x],
+        saved: SavedContext::TransposeCtx { axis1, axis2 },
     }
+    .record(store, tape)?;
 
     Ok(output_id)
 }
@@ -233,10 +221,7 @@ fn slice_device_lazy(
 ) -> Result<TensorId> {
     store.ensure_device(x)?;
 
-    let (input_shape, requires_grad) = {
-        let t = store.tensor(x)?;
-        (t.shape.clone(), t.requires_grad)
-    };
+    let input_shape = store.tensor(x)?.shape.clone();
     let rank = input_shape.len();
     if starts.len() != rank {
         return Err(AutogradError::InvalidIndicesLen {
@@ -282,20 +267,18 @@ fn slice_device_lazy(
         .backend()
         .slice(&x_handle, &input_shape, starts, ends)?;
     let output_id = store.alloc_device_tensor(new_shape, out_handle)?;
-    store.set_requires_grad(output_id, requires_grad)?;
 
-    if requires_grad {
-        tape.record(TapeEntry {
-            op: BackwardOp::Slice,
-            output_id,
-            input_ids: smallvec![x],
-            saved: SavedContext::SliceCtx {
-                input_shape,
-                starts: starts.to_vec(),
-                ends: ends.to_vec(),
-            },
-        });
+    TapeEntry {
+        op: BackwardOp::Slice,
+        output_id,
+        input_ids: smallvec![x],
+        saved: SavedContext::SliceCtx {
+            input_shape,
+            starts: starts.to_vec(),
+            ends: ends.to_vec(),
+        },
     }
+    .record(store, tape)?;
 
     Ok(output_id)
 }
@@ -311,18 +294,17 @@ fn slice_host_eager(
     let (data, shape) = slice_data(&input.data, &input.shape, starts, ends)?;
     let output_id = store.alloc(Tensor::new(data, shape, input.requires_grad)?);
 
-    if input.requires_grad {
-        tape.record(TapeEntry {
-            op: BackwardOp::Slice,
-            output_id,
-            input_ids: smallvec![x],
-            saved: SavedContext::SliceCtx {
-                input_shape: input.shape,
-                starts: starts.to_vec(),
-                ends: ends.to_vec(),
-            },
-        });
+    TapeEntry {
+        op: BackwardOp::Slice,
+        output_id,
+        input_ids: smallvec![x],
+        saved: SavedContext::SliceCtx {
+            input_shape: input.shape,
+            starts: starts.to_vec(),
+            ends: ends.to_vec(),
+        },
     }
+    .record(store, tape)?;
 
     Ok(output_id)
 }
@@ -606,10 +588,7 @@ pub fn broadcast_expand(
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
-    let (src_shape, requires_grad) = {
-        let t = store.tensor(src)?;
-        (t.shape.clone(), t.requires_grad)
-    };
+    let src_shape = store.tensor(src)?.shape.clone();
     validate_broadcast(target_shape, &src_shape)?;
 
     let use_lazy = {
@@ -637,16 +616,14 @@ pub fn broadcast_expand(
         )?;
         store.alloc(Tensor::new(out, target_shape.to_vec(), false)?)
     };
-    store.set_requires_grad(output_id, requires_grad)?;
 
-    if requires_grad {
-        tape.record(TapeEntry {
-            op: BackwardOp::BroadcastExpand,
-            output_id,
-            input_ids: smallvec![src],
-            saved: SavedContext::BroadcastExpandCtx { src_shape },
-        });
+    TapeEntry {
+        op: BackwardOp::BroadcastExpand,
+        output_id,
+        input_ids: smallvec![src],
+        saved: SavedContext::BroadcastExpandCtx { src_shape },
     }
+    .record(store, tape)?;
 
     Ok(output_id)
 }

@@ -40,10 +40,7 @@ fn gather_last_dim_device_lazy(
 ) -> Result<TensorId> {
     store.ensure_device(src)?;
 
-    let (src_shape, requires_grad) = {
-        let t = store.tensor(src)?;
-        (t.shape.clone(), t.requires_grad)
-    };
+    let src_shape = store.tensor(src)?.shape.clone();
     if src_shape.is_empty() {
         return Err(AutogradError::InvalidRank {
             expected: "at least 1",
@@ -88,19 +85,17 @@ fn gather_last_dim_device_lazy(
         .backend()
         .gather_last_dim(&src_handle, &src_shape, &ids_i32)?;
     let output_id = store.alloc_device_tensor(output_shape, out_handle)?;
-    store.set_requires_grad(output_id, requires_grad)?;
 
-    if requires_grad {
-        tape.record(TapeEntry {
-            op: BackwardOp::Gather,
-            output_id,
-            input_ids: smallvec![src],
-            saved: SavedContext::GatherCtx {
-                indices: indices.to_vec(),
-                src_shape,
-            },
-        });
+    TapeEntry {
+        op: BackwardOp::Gather,
+        output_id,
+        input_ids: smallvec![src],
+        saved: SavedContext::GatherCtx {
+            indices: indices.to_vec(),
+            src_shape,
+        },
     }
+    .record(store, tape)?;
 
     Ok(output_id)
 }
@@ -151,17 +146,16 @@ fn gather_last_dim_host_eager(
     debug_assert_eq!(output.len(), prefix_elems);
 
     let output_id = store.alloc(Tensor::new(output, output_shape, src_tensor.requires_grad)?);
-    if src_tensor.requires_grad {
-        tape.record(TapeEntry {
-            op: BackwardOp::Gather,
-            output_id,
-            input_ids: smallvec![src],
-            saved: SavedContext::GatherCtx {
-                indices: indices.to_vec(),
-                src_shape: src_tensor.shape,
-            },
-        });
+    TapeEntry {
+        op: BackwardOp::Gather,
+        output_id,
+        input_ids: smallvec![src],
+        saved: SavedContext::GatherCtx {
+            indices: indices.to_vec(),
+            src_shape: src_tensor.shape,
+        },
     }
+    .record(store, tape)?;
 
     Ok(output_id)
 }

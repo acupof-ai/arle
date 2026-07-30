@@ -60,10 +60,7 @@ fn rope_device_lazy(
     store.ensure_host(sin)?;
     store.ensure_device(x)?;
 
-    let (x_shape, requires_grad) = {
-        let tensor = store.tensor(x)?;
-        (tensor.shape.clone(), tensor.requires_grad)
-    };
+    let x_shape = store.tensor(x)?.shape.clone();
     let cos_shape = store.tensor(cos)?.shape.clone();
     let sin_shape = store.tensor(sin)?.shape.clone();
     validate_shapes(&x_shape, &cos_shape, &sin_shape)?;
@@ -83,16 +80,14 @@ fn rope_device_lazy(
         .backend()
         .rope(&x_handle, &x_shape, &cos_data, &sin_data)?;
     let output_id = store.alloc_device_tensor(x_shape, out_handle)?;
-    store.set_requires_grad(output_id, requires_grad)?;
 
-    if requires_grad {
-        tape.record(TapeEntry {
-            op: BackwardOp::RoPE,
-            output_id,
-            input_ids: smallvec![x],
-            saved: SavedContext::RoPECtx { cos, sin },
-        });
+    TapeEntry {
+        op: BackwardOp::RoPE,
+        output_id,
+        input_ids: smallvec![x],
+        saved: SavedContext::RoPECtx { cos, sin },
     }
+    .record(store, tape)?;
 
     Ok(output_id)
 }
@@ -133,14 +128,13 @@ fn rope_host_eager(
         x_tensor.shape.clone(),
         x_tensor.requires_grad,
     )?);
-    if x_tensor.requires_grad {
-        tape.record(TapeEntry {
-            op: BackwardOp::RoPE,
-            output_id,
-            input_ids: smallvec![x],
-            saved: SavedContext::RoPECtx { cos, sin },
-        });
+    TapeEntry {
+        op: BackwardOp::RoPE,
+        output_id,
+        input_ids: smallvec![x],
+        saved: SavedContext::RoPECtx { cos, sin },
     }
+    .record(store, tape)?;
 
     Ok(output_id)
 }

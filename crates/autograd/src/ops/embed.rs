@@ -44,10 +44,7 @@ fn embedding_device_lazy(
 ) -> Result<TensorId> {
     store.ensure_device(table)?;
 
-    let (table_shape, requires_grad) = {
-        let t = store.tensor(table)?;
-        (t.shape.clone(), t.requires_grad)
-    };
+    let table_shape = store.tensor(table)?.shape.clone();
     if table_shape.len() != 2 {
         return Err(AutogradError::InvalidRank {
             expected: "2",
@@ -82,19 +79,17 @@ fn embedding_device_lazy(
         .backend()
         .embedding(&table_handle, &table_shape, &ids_i32)?;
     let output_id = store.alloc_device_tensor(vec![1, seq_len, hidden], out_handle)?;
-    store.set_requires_grad(output_id, requires_grad)?;
 
-    if requires_grad {
-        tape.record(TapeEntry {
-            op: BackwardOp::Embedding,
-            output_id,
-            input_ids: smallvec![table],
-            saved: SavedContext::EmbeddingCtx {
-                indices: indices.to_vec(),
-                table_shape,
-            },
-        });
+    TapeEntry {
+        op: BackwardOp::Embedding,
+        output_id,
+        input_ids: smallvec![table],
+        saved: SavedContext::EmbeddingCtx {
+            indices: indices.to_vec(),
+            table_shape,
+        },
     }
+    .record(store, tape)?;
 
     Ok(output_id)
 }
@@ -140,17 +135,16 @@ fn embedding_host_eager(
         output_shape,
         table_tensor.requires_grad,
     )?);
-    if table_tensor.requires_grad {
-        tape.record(TapeEntry {
-            op: BackwardOp::Embedding,
-            output_id,
-            input_ids: smallvec![table],
-            saved: SavedContext::EmbeddingCtx {
-                indices: indices.to_vec(),
-                table_shape: table_tensor.shape,
-            },
-        });
+    TapeEntry {
+        op: BackwardOp::Embedding,
+        output_id,
+        input_ids: smallvec![table],
+        saved: SavedContext::EmbeddingCtx {
+            indices: indices.to_vec(),
+            table_shape: table_tensor.shape,
+        },
     }
+    .record(store, tape)?;
 
     Ok(output_id)
 }

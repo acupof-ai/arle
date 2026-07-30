@@ -15,7 +15,6 @@ pub fn add(a: TensorId, b: TensorId, store: &mut TensorStore, tape: &mut Tape) -
             got: b_shape,
         });
     }
-    let requires_grad = store.tensor(a)?.requires_grad || store.tensor(b)?.requires_grad;
 
     store.ensure_device(a)?;
     store.ensure_device(b)?;
@@ -34,16 +33,14 @@ pub fn add(a: TensorId, b: TensorId, store: &mut TensorStore, tape: &mut Tape) -
 
     let out_handle = store.backend().add(&a_handle, &b_handle, &a_shape)?;
     let output_id = store.alloc_device_tensor(a_shape, out_handle)?;
-    store.set_requires_grad(output_id, requires_grad)?;
 
-    if requires_grad {
-        tape.record(TapeEntry {
-            op: BackwardOp::Add,
-            output_id,
-            input_ids: smallvec![a, b],
-            saved: SavedContext::None,
-        });
+    TapeEntry {
+        op: BackwardOp::Add,
+        output_id,
+        input_ids: smallvec![a, b],
+        saved: SavedContext::None,
     }
+    .record(store, tape)?;
 
     Ok(output_id)
 }
@@ -76,14 +73,8 @@ fn mul_device_lazy(
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
-    let (a_shape, a_requires_grad) = {
-        let t = store.tensor(a)?;
-        (t.shape.clone(), t.requires_grad)
-    };
-    let (b_shape, b_requires_grad) = {
-        let t = store.tensor(b)?;
-        (t.shape.clone(), t.requires_grad)
-    };
+    let a_shape = store.tensor(a)?.shape.clone();
+    let b_shape = store.tensor(b)?.shape.clone();
     if a_shape != b_shape {
         return Err(AutogradError::ShapeMismatch {
             expected: a_shape,
@@ -107,18 +98,15 @@ fn mul_device_lazy(
         .clone();
 
     let out_handle = store.backend().mul(&a_handle, &b_handle, &a_shape)?;
-    let requires_grad = a_requires_grad || b_requires_grad;
     let output_id = store.alloc_device_tensor(a_shape, out_handle)?;
-    store.set_requires_grad(output_id, requires_grad)?;
 
-    if requires_grad {
-        tape.record(TapeEntry {
-            op: BackwardOp::Mul,
-            output_id,
-            input_ids: smallvec![a, b],
-            saved: SavedContext::Tensors(smallvec![a, b]),
-        });
+    TapeEntry {
+        op: BackwardOp::Mul,
+        output_id,
+        input_ids: smallvec![a, b],
+        saved: SavedContext::Tensors(smallvec![a, b]),
     }
+    .record(store, tape)?;
 
     Ok(output_id)
 }
@@ -158,17 +146,19 @@ fn mul_host_eager(
     }
 
     let data = store.backend().mul_forward(&a_data, &b_data)?;
-    let requires_grad = a_requires_grad || b_requires_grad;
-    let output_id = store.alloc(Tensor::new(data, a_shape, requires_grad)?);
+    let output_id = store.alloc(Tensor::new(
+        data,
+        a_shape,
+        a_requires_grad || b_requires_grad,
+    )?);
 
-    if requires_grad {
-        tape.record(TapeEntry {
-            op: BackwardOp::Mul,
-            output_id,
-            input_ids: smallvec![a, b],
-            saved: SavedContext::Tensors(smallvec![a, b]),
-        });
+    TapeEntry {
+        op: BackwardOp::Mul,
+        output_id,
+        input_ids: smallvec![a, b],
+        saved: SavedContext::Tensors(smallvec![a, b]),
     }
+    .record(store, tape)?;
 
     Ok(output_id)
 }
@@ -194,10 +184,7 @@ fn mul_scalar_device_lazy(
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
-    let (input_shape, requires_grad) = {
-        let tensor = store.tensor(a)?;
-        (tensor.shape.clone(), tensor.requires_grad)
-    };
+    let input_shape = store.tensor(a)?.shape.clone();
 
     store.ensure_device(a)?;
     let a_handle = store
@@ -209,16 +196,14 @@ fn mul_scalar_device_lazy(
 
     let out_handle = store.backend().mul_scalar(&a_handle, k, &input_shape)?;
     let output_id = store.alloc_device_tensor(input_shape, out_handle)?;
-    store.set_requires_grad(output_id, requires_grad)?;
 
-    if requires_grad {
-        tape.record(TapeEntry {
-            op: BackwardOp::MulScalar,
-            output_id,
-            input_ids: smallvec![a],
-            saved: SavedContext::TensorAndScalar(a, k),
-        });
+    TapeEntry {
+        op: BackwardOp::MulScalar,
+        output_id,
+        input_ids: smallvec![a],
+        saved: SavedContext::TensorAndScalar(a, k),
     }
+    .record(store, tape)?;
 
     Ok(output_id)
 }
@@ -241,14 +226,13 @@ fn mul_scalar_host_eager(
     let data = store.backend().mul_scalar_forward(&input_data, k)?;
     let output_id = store.alloc(Tensor::new(data, input_shape, requires_grad)?);
 
-    if requires_grad {
-        tape.record(TapeEntry {
-            op: BackwardOp::MulScalar,
-            output_id,
-            input_ids: smallvec![a],
-            saved: SavedContext::TensorAndScalar(a, k),
-        });
+    TapeEntry {
+        op: BackwardOp::MulScalar,
+        output_id,
+        input_ids: smallvec![a],
+        saved: SavedContext::TensorAndScalar(a, k),
     }
+    .record(store, tape)?;
 
     Ok(output_id)
 }
