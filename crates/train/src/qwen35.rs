@@ -692,7 +692,7 @@ impl Qwen35Layer {
                 mlp_chunk,
                 store,
                 tape,
-                move |st, tp_tape, inp| {
+                move |st, tp_tape, _start, inp| {
                     let shape = st
                         .get(inp[0])
                         .ok_or(AutogradError::InvalidTensorId(inp[0]))?
@@ -1619,6 +1619,34 @@ impl Qwen35Layer {
         store: &mut TensorStore,
         tape: &mut Tape,
     ) -> Result<TensorId> {
+        let local_attention_heads = tp.local_attention_heads(cfg)?;
+        let local_key_value_heads = tp.local_key_value_heads(cfg)?;
+        let kv_repeat = local_attention_heads / local_key_value_heads;
+
+        // Long-sequence single-GPU path: k/v are small (kv_dim * seq) so keep
+        // them full-sequence; chunk q_proj + SDPA + o_proj to bound the
+        // full-seq f32 GEMM-output memory (the 131K forward OOM site). CP is
+        // multi-GPU and uses its own q-shard + all-gather-kv path.
+        let attn_chunk = crate::runtime_flags::attn_seq_chunk_for_seq(batch * seq_len);
+        if !cp.is_enabled() && attn_chunk > 0 {
+            return self.forward_full_attention_chunked(
+                h,
+                attn,
+                cfg,
+                tp,
+                cos,
+                sin,
+                batch,
+                seq_len,
+                local_attention_heads,
+                local_key_value_heads,
+                kv_repeat,
+                attn_chunk,
+                store,
+                tape,
+            );
+        }
+
         // Qwen3.5 / Qwen3.6 ship a gated Q projection: q_proj rows =
         // `num_heads * head_dim * 2`, with the second half acting as a
         // per-head sigmoid gate applied to the attention output. Vanilla
@@ -1627,8 +1655,6 @@ impl Qwen35Layer {
         // selects between the two paths so `qwen35_loader` can load both
         // checkpoint families without an arch fork.
         let q_full = attn.q_proj.forward(h, store, tape)?;
-        let local_attention_heads = tp.local_attention_heads(cfg)?;
-        let local_key_value_heads = tp.local_key_value_heads(cfg)?;
         let (q, gate) = if cfg.full_attn_gated {
             let q_full = reshape(
                 q_full,
@@ -1755,6 +1781,182 @@ impl Qwen35Layer {
             tape,
         )?;
         let out = attn.o_proj.forward(attn_hidden, store, tape)?;
+        maybe_tp_all_reduce(out, tp, store, tape)
+    }
+
+    /// Long-sequence single-GPU full attention: k/v are computed full-sequence
+    /// (kv_dim is small), then q_proj + causal SDPA + o_proj are run per
+    /// sequence chunk via `checkpoint_seq_chunked`. This bounds the q/o
+    /// projection f32 outputs (and their LoRA deltas) to the chunk row count
+    /// instead of the full sequence — the 131K forward-OOM site.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_full_attention_chunked(
+        &self,
+        h: TensorId,
+        attn: &Qwen35FullAttention,
+        cfg: &Qwen35Config,
+        tp: Qwen35TensorParallelConfig,
+        cos: TensorId,
+        sin: TensorId,
+        batch: usize,
+        seq_len: usize,
+        local_attention_heads: usize,
+        local_key_value_heads: usize,
+        kv_repeat: usize,
+        chunk: usize,
+        store: &mut TensorStore,
+        tape: &mut Tape,
+    ) -> Result<TensorId> {
+        let head_dim = cfg.head_dim;
+        let rms_norm_eps = cfg.rms_norm_eps;
+        let full_attn_gated = cfg.full_attn_gated;
+
+        // k/v: small enough to keep full-sequence.
+        let k = attn.k_proj.forward(h, store, tape)?;
+        let v = attn.v_proj.forward(h, store, tape)?;
+        let k = split_heads(
+            k,
+            batch,
+            seq_len,
+            local_key_value_heads,
+            head_dim,
+            store,
+            tape,
+        )?;
+        let v = split_heads(
+            v,
+            batch,
+            seq_len,
+            local_key_value_heads,
+            head_dim,
+            store,
+            tape,
+        )?;
+        let k = qwen35_rmsnorm(k, attn.k_norm, rms_norm_eps, store, tape)?;
+        let k = rope(k, cos, sin, store, tape)?;
+        let k = repeat_kv(k, kv_repeat, store, tape)?;
+        let v = repeat_kv(v, kv_repeat, store, tape)?;
+
+        // Capture the linears and norm for the replay closure.
+        let q_proj = attn.q_proj.clone();
+        let o_proj = attn.o_proj.clone();
+        let q_norm = attn.q_norm;
+
+        // Saved inputs: k, v (full-seq intermediates), cos/sin, and the
+        // trainable q_proj/o_proj/q_norm weights. `checkpoint_seq_chunked`
+        // accumulates their gradients across chunks during backward.
+        let mut param_ids = vec![k, v, cos, sin];
+        collect_linear_ids(&q_proj, &mut param_ids);
+        collect_linear_ids(&o_proj, &mut param_ids);
+        param_ids.push(q_norm);
+
+        let out = autograd::ops::checkpoint_seq_chunked(
+            h,
+            param_ids,
+            chunk,
+            store,
+            tape,
+            move |st, tp_tape, start, inp| {
+                let h_chunk = inp[0];
+                let k = inp[1];
+                let v = inp[2];
+                let cos_full = inp[3];
+                let sin_full = inp[4];
+
+                let chunk_shape = st
+                    .get(h_chunk)
+                    .ok_or(AutogradError::InvalidTensorId(h_chunk))?
+                    .shape
+                    .clone();
+                let chunk_len = chunk_shape[1];
+
+                // q projection (with LoRA) for this chunk.
+                let q_full = q_proj.forward(h_chunk, st, tp_tape)?;
+
+                let (q, gate) = if full_attn_gated {
+                    let q_full = reshape(
+                        q_full,
+                        &[batch, chunk_len, local_attention_heads, head_dim * 2],
+                        st,
+                        tp_tape,
+                    )?;
+                    let q = slice(
+                        q_full,
+                        &[0, 0, 0, 0],
+                        &[batch, chunk_len, local_attention_heads, head_dim],
+                        st,
+                        tp_tape,
+                    )?;
+                    let gate = slice(
+                        q_full,
+                        &[0, 0, 0, head_dim],
+                        &[batch, chunk_len, local_attention_heads, head_dim * 2],
+                        st,
+                        tp_tape,
+                    )?;
+                    (
+                        transpose(q, 1, 2, st, tp_tape)?,
+                        Some(transpose(gate, 1, 2, st, tp_tape)?),
+                    )
+                } else {
+                    let q = reshape(
+                        q_full,
+                        &[batch, chunk_len, local_attention_heads, head_dim],
+                        st,
+                        tp_tape,
+                    )?;
+                    (transpose(q, 1, 2, st, tp_tape)?, None)
+                };
+
+                // q norm + rope (cos/sin sliced to this chunk's positions).
+                let q = qwen35_rmsnorm(q, q_norm, rms_norm_eps, st, tp_tape)
+                    .map_err(qwen35_to_autograd)?;
+                let cos_shape = st
+                    .get(cos_full)
+                    .ok_or(AutogradError::InvalidTensorId(cos_full))?
+                    .shape
+                    .clone();
+                let rotary_dim = cos_shape[1];
+                let cos_chunk = slice(
+                    cos_full,
+                    &[start, 0],
+                    &[start + chunk_len, rotary_dim],
+                    st,
+                    tp_tape,
+                )?;
+                let sin_chunk = slice(
+                    sin_full,
+                    &[start, 0],
+                    &[start + chunk_len, rotary_dim],
+                    st,
+                    tp_tape,
+                )?;
+                let q = rope(q, cos_chunk, sin_chunk, st, tp_tape)?;
+
+                // Causal SDPA: q at [start, start+chunk) attends k/v at [0, start+chunk).
+                let attn_hidden = causal_sdpa_recompute_with_q_start(q, k, v, start, st, tp_tape)?;
+
+                let attn_hidden = if let Some(gate) = gate {
+                    let gate = sigmoid(gate, st, tp_tape)?;
+                    mul(attn_hidden, gate, st, tp_tape)?
+                } else {
+                    attn_hidden
+                };
+
+                let attn_hidden = merge_heads(
+                    attn_hidden,
+                    batch,
+                    chunk_len,
+                    local_attention_heads,
+                    head_dim,
+                    st,
+                    tp_tape,
+                )
+                .map_err(qwen35_to_autograd)?;
+                o_proj.forward(attn_hidden, st, tp_tape)
+            },
+        )?;
+
         maybe_tp_all_reduce(out, tp, store, tape)
     }
 
