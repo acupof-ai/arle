@@ -12,7 +12,7 @@ use smallvec::smallvec;
 use crate::{
     AutogradError, Result,
     backend::{
-        Device, DeviceHandle, LinearAttentionDeviceBackwardArgs, LinearAttentionDeviceBoundaryArgs,
+        Device, LinearAttentionDeviceBackwardArgs, LinearAttentionDeviceBoundaryArgs,
         LinearAttentionDeviceForwardArgs, LinearAttentionDeviceParams,
         LinearAttentionScanBackwardArgs, LinearAttentionScanBackwardParams,
     },
@@ -514,17 +514,17 @@ pub fn linear_attention_boundary(
         ));
     }
 
-    let qkv_handle = device_handle(qkv, store)?;
-    let b_handle = device_handle(b_proj, store)?;
-    let a_handle = device_handle(a_proj, store)?;
-    let conv_handle = device_handle(conv1d_weight, store)?;
-    let dt_handle = device_handle(dt_bias, store)?;
-    let a_log_handle = device_handle(a_log, store)?;
+    let qkv_handle = store.device_handle(qkv)?;
+    let b_handle = store.device_handle(b_proj)?;
+    let a_handle = store.device_handle(a_proj)?;
+    let conv_handle = store.device_handle(conv1d_weight)?;
+    let dt_handle = store.device_handle(dt_bias)?;
+    let a_log_handle = store.device_handle(a_log)?;
     let initial_state_handle = initial_state
-        .map(|id| device_handle(id, store))
+        .map(|id| store.device_handle(id))
         .transpose()?;
     let initial_conv_handle = initial_conv_window
-        .map(|id| device_handle(id, store))
+        .map(|id| store.device_handle(id))
         .transpose()?;
     let state = store
         .backend()
@@ -768,26 +768,32 @@ pub fn linear_attention_core_with_carry_taped(
     Ok(output_id)
 }
 
+/// Packed q/k/v width, one row's worth.
+fn qkv_elems(p: LinearAttentionParams) -> usize {
+    2 * p.num_key_heads * p.key_dim + p.num_value_heads * p.value_dim
+}
+
+/// The taped f32 inputs the row kernel reads, one row's worth: qkv, z, b_proj,
+/// a_proj. Both byte counts below include it, so summing them double-counts.
+fn taped_input_elems(p: LinearAttentionParams) -> usize {
+    qkv_elems(p) + p.num_value_heads * p.value_dim + 2 * p.num_value_heads
+}
+
 /// Bytes retained by `try_linear_attention_forward_device`.
 pub fn linear_attention_ctx_bytes(params: LinearAttentionParams) -> usize {
-    let (hk, kd) = (params.num_key_heads, params.key_dim);
-    let (hv, vd) = (params.num_value_heads, params.value_dim);
+    let (hv, kd, vd) = (params.num_value_heads, params.key_dim, params.value_dim);
     let seq = params.seq_len;
-    let qkv_dim = 2 * hk * kd + hv * vd;
-    let f32_elems = seq * (qkv_dim + hv * vd + 2 * hv) + seq.div_ceil(64) * hv * kd * vd;
-    let bf16_elems = seq * qkv_dim;
+    let f32_elems = seq * taped_input_elems(params) + seq.div_ceil(64) * hv * kd * vd;
+    let bf16_elems = seq * qkv_elems(params);
     params.batch * (4 * f32_elems + 2 * bf16_elems)
 }
 
-/// Bytes `..._forward_device_row` holds live until it returns: its own buffers
-/// plus the taped f32 inputs it reads. Lives beside the kernel so a buffer change
-/// and its count move together — the caller sizing a layer can't see them.
+/// Bytes `..._forward_device_row` holds live until it returns. Beside the kernel
+/// so a buffer change and its count move together.
 pub fn linear_attention_row_transient_bytes(params: LinearAttentionParams) -> usize {
-    let (hk, kd) = (params.num_key_heads, params.key_dim);
-    let (hv, vd) = (params.num_value_heads, params.value_dim);
-    let qkv_dim = 2 * hk * kd + hv * vd;
-    // f32: a_tril, g_cumsum, and the taped qkv/z/b_proj/a_proj it reads.
-    let f32_elems = 64 * hv + hv + qkv_dim + hv * vd + 2 * hv;
+    let (hv, kd, vd) = (params.num_value_heads, params.key_dim, params.value_dim);
+    // f32: a_tril, g_cumsum, plus the taped inputs.
+    let f32_elems = 64 * hv + hv + taped_input_elems(params);
     // bf16: q/k/w, v/u/v_new/raw_output, a_inv, b/a casts.
     let bf16_elems = 3 * hv * kd + 4 * hv * vd + 64 * hv + 2 * hv;
     params
@@ -796,9 +802,11 @@ pub fn linear_attention_row_transient_bytes(params: LinearAttentionParams) -> us
         .saturating_mul(4 * f32_elems + 2 * bf16_elems)
 }
 
-#[cfg(test)]
-fn byte_count_params() -> LinearAttentionParams {
-    LinearAttentionParams {
+/// Pinned so editing the row kernel's buffers, or what it retains, forces a
+/// deliberate recount here.
+#[test]
+fn linear_attention_byte_counts_are_pinned() {
+    let p = LinearAttentionParams {
         batch: 2,
         seq_len: 65,
         num_key_heads: 2,
@@ -807,31 +815,9 @@ fn byte_count_params() -> LinearAttentionParams {
         value_dim: 5,
         conv_kernel: 4,
         eps: 1e-6,
-    }
-}
-
-#[test]
-fn linear_attention_ctx_bytes_counts_retained_tensors() {
-    assert_eq!(linear_attention_ctx_bytes(byte_count_params()), 36_060);
-}
-
-/// Pinned so editing the row kernel's buffers forces a deliberate recount here.
-#[test]
-fn linear_attention_row_transient_bytes_counts_kernel_buffers() {
-    assert_eq!(
-        linear_attention_row_transient_bytes(byte_count_params()),
-        204_880
-    );
-}
-
-fn device_handle(id: TensorId, store: &mut TensorStore) -> Result<DeviceHandle> {
-    store.ensure_device(id)?;
-    Ok(store
-        .tensor(id)?
-        .device_handle
-        .as_ref()
-        .expect("device")
-        .clone())
+    };
+    assert_eq!(linear_attention_ctx_bytes(p), 36_060);
+    assert_eq!(linear_attention_row_transient_bytes(p), 204_880);
 }
 
 fn try_linear_attention_forward_device(
@@ -854,19 +840,19 @@ fn try_linear_attention_forward_device(
         return Ok(None);
     }
 
-    let qkv_handle = device_handle(qkv, store)?;
-    let z_handle = device_handle(z, store)?;
-    let b_handle = device_handle(b_proj, store)?;
-    let a_handle = device_handle(a_proj, store)?;
-    let conv_handle = device_handle(conv1d_weight, store)?;
-    let dt_handle = device_handle(dt_bias, store)?;
-    let a_log_handle = device_handle(a_log, store)?;
-    let norm_handle = device_handle(norm_weight, store)?;
+    let qkv_handle = store.device_handle(qkv)?;
+    let z_handle = store.device_handle(z)?;
+    let b_handle = store.device_handle(b_proj)?;
+    let a_handle = store.device_handle(a_proj)?;
+    let conv_handle = store.device_handle(conv1d_weight)?;
+    let dt_handle = store.device_handle(dt_bias)?;
+    let a_log_handle = store.device_handle(a_log)?;
+    let norm_handle = store.device_handle(norm_weight)?;
     let initial_state_handle = initial_state
-        .map(|id| device_handle(id, store))
+        .map(|id| store.device_handle(id))
         .transpose()?;
     let initial_conv_handle = initial_conv_window
-        .map(|id| device_handle(id, store))
+        .map(|id| store.device_handle(id))
         .transpose()?;
 
     let Some(result) =

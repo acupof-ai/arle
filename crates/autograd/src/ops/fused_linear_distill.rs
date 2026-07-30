@@ -5,6 +5,7 @@ use smallvec::smallvec;
 use crate::{
     AutogradError, Result,
     backend::Device,
+    ops::chunk_accum::ChunkSum,
     tape::{BackwardOp, GradPairs, SavedContext, Tape, TapeEntry},
     tensor::{Tensor, TensorId, TensorStore},
 };
@@ -594,8 +595,8 @@ fn fused_linear_ce_loss_indexed_device(
     )?;
 
     let mut loss_sum = 0.0_f32;
-    let mut grad_hidden_2d_accum: Option<TensorId> = None;
-    let mut grad_weight_accum: Option<TensorId> = None;
+    let mut grad_hidden_2d_accum = ChunkSum::new();
+    let mut grad_weight_accum = ChunkSum::new();
 
     for chunk_start in (0..num_targets).step_by(chunk_rows) {
         let live_before = store.live_ids().into_iter().collect::<HashSet<_>>();
@@ -639,32 +640,14 @@ fn fused_linear_ce_loss_indexed_device(
         if requires_grad {
             let grads = chunk_tape.backward_collect(chunk_loss, store)?;
             if need_hidden_grad && let Some(&g) = grads.get(&hidden_2d) {
-                grad_hidden_2d_accum = Some(match grad_hidden_2d_accum.take() {
-                    None => store.clone_tensor(g)?,
-                    Some(acc) => {
-                        let next = crate::ops::add(acc, g, store, &mut view_tape)?;
-                        if store.get(acc).is_some() {
-                            store.free(acc)?;
-                        }
-                        next
-                    }
-                });
+                grad_hidden_2d_accum.add(g, store)?;
             }
             if need_weight_grad && let Some(&g) = grads.get(&weight) {
-                grad_weight_accum = Some(match grad_weight_accum.take() {
-                    None => store.clone_tensor(g)?,
-                    Some(acc) => {
-                        let next = crate::ops::add(acc, g, store, &mut view_tape)?;
-                        if store.get(acc).is_some() {
-                            store.free(acc)?;
-                        }
-                        next
-                    }
-                });
+                grad_weight_accum.add(g, store)?;
             }
         }
 
-        let keep = [grad_hidden_2d_accum, grad_weight_accum]
+        let keep = [grad_hidden_2d_accum.id(), grad_weight_accum.id()]
             .into_iter()
             .flatten()
             .collect::<HashSet<_>>();
@@ -673,7 +656,7 @@ fn fused_linear_ce_loss_indexed_device(
 
     let loss_id = store.alloc(Tensor::new(vec![loss_sum], Vec::new(), requires_grad)?);
     if requires_grad {
-        let grad_hidden_id = match grad_hidden_2d_accum {
+        let grad_hidden_id = match grad_hidden_2d_accum.finish(store)? {
             Some(g) => {
                 let reshaped = crate::ops::reshape(g, &shape.hidden_shape, store, &mut view_tape)?;
                 if store.get(g).is_some() {
@@ -689,7 +672,7 @@ fn fused_linear_ce_loss_indexed_device(
             input_ids: smallvec![hidden, weight],
             saved: SavedContext::FusedLinearDistillCtx {
                 grad_hidden: grad_hidden_id,
-                grad_weight: grad_weight_accum,
+                grad_weight: grad_weight_accum.finish(store)?,
             },
         }
         .record(store, tape)?;
@@ -1033,8 +1016,8 @@ fn fused_linear_pg_loss_indexed_device(
 
     let mut loss_sum = 0.0_f32;
     let mut stats = PgStats::default();
-    let mut grad_hidden_2d_accum: Option<TensorId> = None;
-    let mut grad_weight_accum: Option<TensorId> = None;
+    let mut grad_hidden_2d_accum = ChunkSum::new();
+    let mut grad_weight_accum = ChunkSum::new();
 
     for chunk_start in (0..num_targets).step_by(chunk_rows) {
         let live_before = store.live_ids().into_iter().collect::<HashSet<_>>();
@@ -1102,32 +1085,14 @@ fn fused_linear_pg_loss_indexed_device(
         if requires_grad {
             let grads = chunk_tape.backward_collect(chunk_loss, store)?;
             if need_hidden_grad && let Some(&g) = grads.get(&hidden_2d) {
-                grad_hidden_2d_accum = Some(match grad_hidden_2d_accum.take() {
-                    None => store.clone_tensor(g)?,
-                    Some(acc) => {
-                        let next = crate::ops::add(acc, g, store, &mut view_tape)?;
-                        if store.get(acc).is_some() {
-                            store.free(acc)?;
-                        }
-                        next
-                    }
-                });
+                grad_hidden_2d_accum.add(g, store)?;
             }
             if need_weight_grad && let Some(&g) = grads.get(&weight) {
-                grad_weight_accum = Some(match grad_weight_accum.take() {
-                    None => store.clone_tensor(g)?,
-                    Some(acc) => {
-                        let next = crate::ops::add(acc, g, store, &mut view_tape)?;
-                        if store.get(acc).is_some() {
-                            store.free(acc)?;
-                        }
-                        next
-                    }
-                });
+                grad_weight_accum.add(g, store)?;
             }
         }
 
-        let keep = [grad_hidden_2d_accum, grad_weight_accum]
+        let keep = [grad_hidden_2d_accum.id(), grad_weight_accum.id()]
             .into_iter()
             .flatten()
             .collect::<HashSet<_>>();
@@ -1136,7 +1101,7 @@ fn fused_linear_pg_loss_indexed_device(
 
     let loss_id = store.alloc(Tensor::new(vec![loss_sum], Vec::new(), requires_grad)?);
     if requires_grad {
-        let grad_hidden_id = match grad_hidden_2d_accum {
+        let grad_hidden_id = match grad_hidden_2d_accum.finish(store)? {
             Some(g) => {
                 let reshaped = crate::ops::reshape(g, &shape.hidden_shape, store, &mut view_tape)?;
                 if store.get(g).is_some() {
@@ -1152,7 +1117,7 @@ fn fused_linear_pg_loss_indexed_device(
             input_ids: smallvec![hidden, weight],
             saved: SavedContext::FusedLinearDistillCtx {
                 grad_hidden: grad_hidden_id,
-                grad_weight: grad_weight_accum,
+                grad_weight: grad_weight_accum.finish(store)?,
             },
         }
         .record(store, tape)?;

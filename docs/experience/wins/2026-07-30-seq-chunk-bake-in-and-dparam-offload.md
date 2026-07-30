@@ -195,6 +195,7 @@ old+new at once, the exact shape `SeqAccum` was built to forbid:
 |---|---|---:|
 | `attention.rs` grad_v, grad_k | `ops::add` on a *disabled* tape | 3 |
 | `matmul.rs` grad_b | `add_into_device` (allocs a fresh full-size buffer) | 3 |
+| `fused_linear_distill.rs` ×4 | `ops::add` on a *disabled* tape | 3 |
 | `tape.rs` d_param | `accumulate_into_device` + `offload_to_host` | 2, host-parked |
 
 Only the last was right, and it was 40 inlined lines inside a private `Tape`
@@ -205,6 +206,30 @@ ownership of their buffer; that probe is now one shared `sole_owned_handle` —
 `accumulate_into_device` previously had the requirement in a doc comment and no
 check. Net **−54 lines**, and the two attention grads drop from 3 full-size
 `[merged_heads, kv_len, head_dim]` buffers to 1.
+
+The first census of this said "four folds"; it was eight. The four in
+`fused_linear_distill.rs` are the `[masked-writeback] phase=fused_ce` stage — the
+`fused_ce` column in the table above — and one of their accumulators is the
+`[vocab, hidden]` LM-head grad. Shipping `ChunkSum` and converting half its sites
+was the same half-state the abstraction exists to prevent.
+
+**Two costs the review found that predate `ChunkSum` and are now fixed once
+instead of never.** Both were inherited verbatim from the d_param code:
+
+- *The last chunk's park was always undone.* `add` parked after every accumulate
+  including the final one; `finish` then re-uploaded the identical bytes. With
+  `forward_full_attention_chunked` passing k/v as params (24576 B/token each
+  post-`repeat_kv`), that is 1.208 GB per accumulator at seq 49152, ×2
+  accumulators ×16 full-attn layers = **77 GB of pure round trip per backward
+  step, 412 GB at 262144**, plus two stream syncs each. Only the caller knows a
+  chunk follows, so `park` is now the caller's call, guarded by `end < seq`.
+- *Every param parked regardless of size.* A `[hidden]` norm grad is 20 KB; the
+  round trip and its sync cost more than the peak it saves. `park` now honors
+  `checkpoint_offload_min_bytes` (2 MiB), the threshold the repo already had for
+  exactly this question.
+
+Neither is measured — both are pending the same 65536/131072 runs as everything
+else here.
 
 **The LA memory formula moved next to the kernel it counts.** It enumerated
 buffers inside `..._forward_device_row` (`autograd`) from `crates/train` — a

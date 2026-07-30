@@ -944,6 +944,19 @@ impl TensorStore {
         Ok(self.tensor(id)?.clone())
     }
 
+    /// The device-side `tensor_host`: residency first, then an owned handle. A
+    /// caller needing the pre-clone refcount must reach for `tensor` directly —
+    /// this bumps it.
+    pub fn device_handle(&mut self, id: TensorId) -> Result<DeviceHandle> {
+        self.ensure_device(id)?;
+        Ok(self
+            .tensor(id)?
+            .device_handle
+            .as_ref()
+            .expect("ensure_device")
+            .clone())
+    }
+
     pub(crate) fn clone_tensor(&mut self, id: TensorId) -> Result<TensorId> {
         // Wave 1 (post-M5.3b nsys attribution): preserve the device
         // handle on `Dirty::Device` tensors so the post-backward grad map

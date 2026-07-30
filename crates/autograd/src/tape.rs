@@ -1068,9 +1068,7 @@ impl Tape {
         let mut d_input = need_input_grad
             .then(|| SeqAccum::new(vec![batch, seq, dim], 1, store))
             .transpose()?;
-        // Full-seq param grads (k/v) dominate device memory; park each on host
-        // between chunks.
-        let mut d_param: Vec<ChunkSum> = param_ids.iter().map(|_| ChunkSum::new(true)).collect();
+        let mut d_param: Vec<ChunkSum> = param_ids.iter().map(|_| ChunkSum::new()).collect();
 
         let mut start = 0;
         while start < seq {
@@ -1110,9 +1108,14 @@ impl Tape {
             if let (Some(dest), Some(&g)) = (d_input.as_mut(), grads.get(&x_c)) {
                 dest.write_rows(start, g, store)?;
             }
+            // Full-seq param grads (k/v) dominate device memory; park each over
+            // the next chunk's replay, which is the only reason they are large.
             for (slot, &pid) in param_ids.iter().enumerate() {
                 if let Some(&g) = grads.get(&pid) {
                     d_param[slot].add(g, store)?;
+                    if end < seq {
+                        d_param[slot].park(store)?;
+                    }
                 }
             }
 
@@ -1317,18 +1320,8 @@ fn merge_grad(
                 .as_ref()
                 .and_then(DeviceHandle::device_buffer_strong_count)
                 == Some(1);
-            let existing_handle = store
-                .tensor(existing_grad_id)?
-                .device_handle
-                .as_ref()
-                .expect("checked above")
-                .clone();
-            let incoming_handle = store
-                .tensor(new_grad_id)?
-                .device_handle
-                .as_ref()
-                .expect("checked above")
-                .clone();
+            let existing_handle = store.device_handle(existing_grad_id)?;
+            let incoming_handle = store.device_handle(new_grad_id)?;
             let sum_handle = if uniquely_owned {
                 store.backend().accumulate_into_device(
                     &existing_handle,

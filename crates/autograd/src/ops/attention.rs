@@ -586,8 +586,8 @@ fn causal_sdpa_recompute_backward_device_chunked(
     let mut grad_q_3d = need_grad_q
         .then(|| SeqAccum::new(vec![merged_heads, q_len, head_dim], 1, store))
         .transpose()?;
-    let mut grad_k_acc = ChunkSum::new(false);
-    let mut grad_v_acc = ChunkSum::new(false);
+    let mut grad_k_acc = ChunkSum::new();
+    let mut grad_v_acc = ChunkSum::new();
 
     let mut q0 = 0usize;
     while q0 < q_len {
@@ -660,10 +660,13 @@ fn causal_sdpa_recompute_backward_device_chunked(
         // Free this chunk's `[*, rows, seq]` transients (scores/scaled/masked/
         // probs/d_probs/d_scores + q/upstream slices); keep only the running
         // accumulators. Bounds peak to O(q_chunk·seq).
-        let mut keep: HashSet<TensorId> =
-            grad_q_3d.as_ref().map(SeqAccum::id).into_iter().collect();
-        keep.extend(grad_k_acc.id());
-        keep.extend(grad_v_acc.id());
+        let keep = grad_q_3d
+            .as_ref()
+            .map(SeqAccum::id)
+            .into_iter()
+            .chain(grad_k_acc.id())
+            .chain(grad_v_acc.id())
+            .collect();
         store.free_new_except(&live_before, &keep)?;
 
         q0 = q1;
