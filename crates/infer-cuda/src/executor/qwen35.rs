@@ -1982,7 +1982,12 @@ impl Qwen35CudaExecutor {
                     })
                     .transpose()?,
             }
-            .filter(|(chain, _)| chain.len() >= 2);
+            // A chain the budget cut to bare anchor stays in the batched verify
+            // as one decode row (sglang keeps min_verify_len=1 in the ragged
+            // batch) — falling back per slot would cost a serial trunk forward
+            // each. Sampled chains keep the fallback: the rejection kernel's
+            // depth-0 path is unexercised.
+            .filter(|(chain, _)| chain.len() >= 2 || row.params.is_greedy());
             let Some((chain, partial_ctx)) = drafted else {
                 let (token, logprob) =
                     self.dspark_warm_decode_row(row, start.saturating_add(1) as u64, host_kv)?;
