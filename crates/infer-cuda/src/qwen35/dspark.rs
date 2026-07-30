@@ -1047,8 +1047,58 @@ impl Qwen35Model {
             let am = self.dspark_block_greedy(head, scratch, df, anchor)?;
             drafts.extend_from_slice(&am[first_row..block]);
         }
+        // No markov head: every row reads a precomputed logits row, so the
+        // draws do not depend on each other — issue them all, then sync once.
+        if sampling && head.markov.is_none() {
+            let n = block - first_row;
+            {
+                let elem = std::mem::size_of::<bf16>() as u64;
+                let logits = df.logits.get(ctx, vocab, block)?;
+                let (l_ptr, _gl) = logits.data.device_ptr(&ctx.stream);
+                let q_all = df.q_probs.get(ctx, n * vocab)?;
+                let (q_ptr, _gq) = q_all.device_ptr_mut(&ctx.stream);
+                let (t_ptr, _gt) = scratch.sample_tok.get(ctx, n)?.device_ptr_mut(&ctx.stream);
+                for i in 0..n {
+                    let u = unit_uniform(params.seed, SALT_DRAW, (start + first_row + i) as u64);
+                    // SAFETY: logits row `first_row + i` of `block`; q row `i`
+                    // of `n`; one i32 out slot per row.
+                    unsafe {
+                        ffi::dspark_draft_sample_cuda(
+                            (l_ptr + ((first_row + i) * vocab) as u64 * elem) as *const ffi::Half,
+                            (q_ptr + (i * vocab * 4) as u64) as *mut f32,
+                            (t_ptr + (i * 4) as u64) as *mut i32,
+                            vocab as i32,
+                            1.0 / params.temperature,
+                            params.top_k,
+                            params.top_p,
+                            params.min_p,
+                            u,
+                            ctx.stream.cu_stream(),
+                        )
+                        .result()?;
+                    }
+                }
+            }
+            ctx.sync()?;
+            let drawn: Vec<i32> = ctx
+                .stream
+                .clone_dtoh(scratch.sample_tok.get(ctx, n)?)
+                .map_err(|e| anyhow!("D2H dspark draws failed: {e}"))?;
+            for tok in drawn {
+                ensure!(
+                    (0..vocab as i32).contains(&tok),
+                    "dspark sampled draft token {tok} oob"
+                );
+                drafts.push(tok as u32);
+            }
+            df.q_rows = n;
+        }
         let mut prev = anchor;
-        let sample_rows = if sampling { first_row..block } else { 0..0 };
+        let sample_rows = if sampling && head.markov.is_some() {
+            first_row..block
+        } else {
+            0..0
+        };
         for row in sample_rows {
             // Corrected logits row: base + markov bias when the head is present
             // (`step_logits = base_row + markov_w2 · markov_w1[prev]`).
@@ -1155,6 +1205,10 @@ impl Qwen35Model {
         starts: &[usize],
         params: &[&SamplingParams],
     ) -> Result<Vec<Vec<u32>>> {
+        debug_assert!(
+            params.iter().all(|p| p.is_greedy()),
+            "batched draft is greedy-only"
+        );
         let cfg = &head.cfg;
         let ctx = &self.ctx;
         let block = cfg.block_size;
@@ -1327,78 +1381,12 @@ impl Qwen35Model {
 
         // One D2H for the whole tick.
         let ids_dev = scratch.argmax.get(ctx, rows)?;
-        let mut am = self.argmax_rows_into(scratch.logits_b.get(ctx, vocab, rows)?, ids_dev)?;
+        let am = self.argmax_rows_into(scratch.logits_b.get(ctx, vocab, rows)?, ids_dev)?;
 
         let first_row = usize::from(!cfg.next_token_heads);
-        // Sampled slots overwrite their argmax rows with device draws. Without a
-        // markov head no draw depends on another, so the whole batch goes out
-        // before a single sync — the row path pays one per draw.
-        let sampled: Vec<usize> = (0..b).filter(|&s| !params[s].is_greedy()).collect();
-        if !sampled.is_empty() {
-            let per_slot = block - first_row;
-            let elem = std::mem::size_of::<bf16>() as u64;
-            let (l_ptr, _gl) = scratch
-                .logits_b
-                .get(ctx, vocab, rows)?
-                .data
-                .device_ptr(&ctx.stream);
-            let n_out = sampled.len() * per_slot;
-            // Scoped so the D2H below can re-borrow the output slot.
-            {
-                let (t_ptr, _gt) = scratch
-                    .sample_tok
-                    .get(ctx, n_out)?
-                    .device_ptr_mut(&ctx.stream);
-                for (n, &s) in sampled.iter().enumerate() {
-                    let p = params[s];
-                    let df = &mut dfs[s];
-                    let q_all = df.q_probs.get(ctx, per_slot * vocab)?;
-                    let (q_ptr, _gq) = q_all.device_ptr_mut(&ctx.stream);
-                    for i in 0..per_slot {
-                        let row = (s * block + first_row + i) as u64;
-                        let u = unit_uniform(p.seed, SALT_DRAW, (starts[s] + first_row + i) as u64);
-                        // SAFETY: logits row `row` of a `rows`-row buffer; q row
-                        // `i` of `per_slot`; one i32 out slot per (slot, row).
-                        unsafe {
-                            ffi::dspark_draft_sample_cuda(
-                                (l_ptr + row * vocab as u64 * elem) as *const ffi::Half,
-                                (q_ptr + (i * vocab * 4) as u64) as *mut f32,
-                                (t_ptr + ((n * per_slot + i) * 4) as u64) as *mut i32,
-                                vocab as i32,
-                                1.0 / p.temperature,
-                                p.top_k,
-                                p.top_p,
-                                p.min_p,
-                                u,
-                                ctx.stream.cu_stream(),
-                            )
-                            .result()?;
-                        }
-                    }
-                    df.q_rows = per_slot;
-                }
-            }
-            ctx.sync()?;
-            let drawn: Vec<i32> = ctx
-                .stream
-                .clone_dtoh(scratch.sample_tok.get(ctx, n_out)?)
-                .map_err(|e| anyhow!("D2H dspark batched draws failed: {e}"))?;
-            for (n, &s) in sampled.iter().enumerate() {
-                for i in 0..per_slot {
-                    let tok = drawn[n * per_slot + i];
-                    ensure!(
-                        (0..vocab as i32).contains(&tok),
-                        "dspark sampled draft token {tok} oob"
-                    );
-                    am[s * block + first_row + i] = tok as u32;
-                }
-            }
-        }
         let mut chains = Vec::with_capacity(b);
         for (s, df) in dfs.iter_mut().enumerate() {
-            if params[s].is_greedy() {
-                df.q_rows = 0;
-            }
+            df.q_rows = 0;
             let src = scratch
                 .logits_b
                 .get(ctx, vocab, rows)?
