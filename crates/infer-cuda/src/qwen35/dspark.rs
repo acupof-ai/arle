@@ -1536,7 +1536,8 @@ impl Qwen35Model {
         let Some(conf) = &head.confidence else {
             return Ok(vec![usize::MAX; b]);
         };
-        if n == 0 || b == 0 {
+        // A non-positive threshold never truncates — skip the GEMM, D2H and sync.
+        if n == 0 || b == 0 || head.confidence_threshold <= 0.0 {
             return Ok(vec![usize::MAX; b]);
         }
         ensure!(

@@ -137,12 +137,31 @@ What settled it was a flag that removes one behaviour and keeps every
 instruction: `--dspark-conf-threshold 0`, matched to a head-free arm on rows and
 depth. No profiler.
 
-## Reject the truncation; `FR t0` is a champion candidate
+## DEFAULT FLIP — `--dspark-conf-threshold` 0.5 → 0
 
-**Reject the confidence head as a policy.** Every arm that acts on its verdict
-falls below *not speculating* — FR 6.3 and 5.8 tok/s against no-spec's 8.0 — and
-loosening the threshold only widens the gap, because a looser cut means a longer
-variable-length chain:
+**The shipped default was the worst arm in the table**: at c≥8 it made spec
+decode slower than not speculating. TPOT ms, one flag apart, same binary and
+dataset; no-spec is the mean of two runs that agreed to 2.7%:
+
+| arm | c=1 | c=8 | c=16 |
+|---|---:|---:|---:|
+| no-spec | 28.77 | 83.34 | 124.86 |
+| block 6, **0.5 (old)** | 10.84 | 84.67 **+1.6%** | 159.68 **+27.9%** |
+| block 6, **0 (new)** | **9.33** | **60.41 −27.5%** | **104.73 −16.1%** |
+| block 16, 0.5 | 10.31 | 91.92 **+10.3%** | 172.63 **+38.3%** |
+| block 16, 0 | **8.67** | — | **133.54** +7.0% |
+
+Worth −13.9/−28.7/−34.4% at c=1/8/16 on block 6, −15.9/−22.6% at c=1/16 on
+block 16. Only the c=1 pairs match on point order (c=16 is point 3 vs 2, c=8 is
+cross-serve), but five comparisons carry one sign at 14-34% against 2.7% noise.
+`0` also skips the head (`dspark.rs:1541`) — it can never truncate, so the GEMM,
+D2H and sync are dead work. Gate at `0`: **exact=3 DET at 512/4k/16k/32k**.
+
+Whether `FR t0` displaces `dflash6` as champion *draft* is separate and still
+open — its three c=16 trials read 104.73 / 184.77 / 235.54 ms.
+
+**Reject the confidence head as a policy.** A looser cut only widens the gap,
+because it leaves a longer variable-length chain:
 
 | threshold | depth | tok/row | rows/step | step @16 | TPOT c=16 |
 |---|---:|---:|---:|---:|---:|
@@ -160,20 +179,18 @@ the first arm to do so:
 
 | c | `dflash6` (champion) | `FR t0` 6 | Δ |
 |---|---:|---:|---:|
-| 1 | 102.0 tok/s | **107.2** | **+5.1%** |
-| 16 | 109.43 ms TPOT | **104.73 ms** | **−4.3%** |
+| 1 | 9.80 ms TPOT | **9.33 ms** | **−4.8%** |
+| 8 | 60.70 ms | **60.41 ms** | −0.5% |
+| 16 | 109.43 ms | **104.73 ms** | **−4.3%** |
 | 16 | 0.400 tok/row | **0.428** | **+7.0%** |
 
 Same 96 rows, same depth 5.00, same binary — so this is the FR *weights* being
 better than DFlash's, not the head, and not batching. It also beats `aeon6`
-(9.5 vs 9.2 tok/s). Both ends move the same way and c=1 clears the ±3% band,
-which is what a real draft-quality win looks like.
+(108.33 at c=16).
 
-Not a default flip yet: needs the third trial per the bench spec, the c=8 point,
-and a licence that shipping a checkpoint with its own confidence head switched
-off is the shape we want (the alternative is retraining the head or dropping it
-from the checkpoint). Correctness gate on `FR t0` block 6:
-**exact=3 DET at 512 / 4096 / 16384 / 32768**, 0 miss.
+Not a champion flip yet: c=8 is a wash and the third trial disagrees with itself
+(three `fr6t0` c=16 points read 104.73 / 184.77 / 235.54 ms). Correctness gate on
+`FR t0` block 6: **exact=3 DET at 512 / 4096 / 16384 / 32768**, 0 miss.
 
 ## Still open
 
@@ -181,7 +198,12 @@ from the checkpoint). Correctness gate on `FR t0` block 6:
   c=1 (109.1 vs 102.0) and block 6 wins c=16 (9.1 vs 6.9), because at c=1 the GPU
   is idle and rows are nearly free. `--dspark-block-size` is static; the decode
   batch is not.
-- **The accept rate halves at concurrency** on *every* draft (DFlash 0.509 →
+- **Accept takes two values, switching between c=2 and c=4.** `fr6t0` reads
+  0.544 at c=1 *and* c=2 (chains bit-identical, 4250) then 0.313 at c=4/8/16
+  (mean_k 1.566/1.565/1.566 across 6859/6187/6666 chains — 20× tighter than
+  sampling noise). `dflash6` shows the same two regimes. A gradient cannot do
+  that; look for what changes state at c=4.
+- **The accept rate falls with concurrency** on *every* draft (DFlash 0.509 →
   0.280), and every chain at c≥8 drafts on a rebased context
   (`partial_ctx_chains/chains` 0.75 → 1.00) while prefix reuse *improves*
   (0.883 → 1.000). A prefix-cache or sidecar restore skips the trunk prefill, so
@@ -195,6 +217,48 @@ from the checkpoint). Correctness gate on `FR t0` block 6:
   launches left in the batched draft — 160 at c=16. Same shape as the varlen
   conv1d/GDR pair already built, so a `blockIdx.y`-per-slot pointer table
   collapses them to two per layer.
+
+## Build the paper's scheduler — after the ragged-chain penalty
+
+**Retracts this entry's previous section, "do not build Algorithm 1 here."** That
+argued rows are too cheap to schedule, off a 0.53 ms marginal row cost. Wrong
+twice: 160 rows is 85 ms, **32% of the step** — a small per-row figure is not a
+small row budget; and the disproof ran the *static threshold*, which is precisely
+the prior art DSpark (arXiv 2607.05147) §3.2.2 names and replaces.
+
+The paper's premise holds on our hardware. §3.2: an extra verified token is
+near-free under light load and costs batch capacity under high concurrency.
+Measured, same draft, block the only variable:
+
+| | c=1 TPOT | c=16 TPOT |
+|---|---:|---:|
+| `dflash6` | 9.80 ms | **109.43** |
+| `dflash16` | **9.16 ms** | 144.37 |
+
+The optimum moves with load, and `--dspark-block-size` is static — the "opposite
+values at the two ends" item below is this, unsolved. In the paper's objective
+`Θ = τ·SPS(B)` (system tok/s at c=16) there is a real maximum:
+
+| arm | B | τ | Θ |
+|---|---:|---:|---:|
+| no-spec | 16 | 1.000 | 128.1 |
+| block 6 | 96 | 2.400 | **146.2** |
+| block 11 | 176 | 2.584 | 123.2 |
+| block 16 | 256 | 2.440 | **110.8 — under no-spec** |
+
+Algorithm 1 initializes `Θ_best ← R·SPS(R)` (line 6, the no-spec point) and
+breaks the moment throughput stops rising (line 13), so **it cannot ship the
+failure the 0.5 default shipped** — losing to not speculating at all. That alone
+answers the rejection.
+
+What survives: **the ragged-chain penalty blocks it.** Algorithm 1 emits unequal
+`ℓ_r` by construction, and this engine charges 3.1× for that (`fr16` at
+threshold 0 vs 0.15: 354.1 vs 1095.7 ms at 253.9 vs 256.0 rows). Fix that first
+or the scheduler loses on arrival. Then the cheap half is worth measuring alone:
+`SPS(B)` is a profiled table, and depth indexed on running-request count captures
+the c=1↔c=16 swing with no confidence head at all. Per-request allocation — the
+cumulative survival `∏c_i`, STS calibration, the batch-global greedy — is the
+second increment, not the first.
 
 ## Rule
 
