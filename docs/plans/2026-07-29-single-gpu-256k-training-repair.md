@@ -8,19 +8,50 @@
 
 ## Execution status
 
-- T1: wide elementwise, GDN, and slice offsets implemented; CUDA gate pending
-  for the final slice tranche.
+Local (Mac, no nvcc) work is committed; every CUDA-path fix is `pending-remote`
+until a pod rebuild re-runs the ladder — the 2026-07-29 ladder ran the *pre-fix*
+binary.
+
+- T1: slice offsets widened (`e01aa6606`); GDN/elementwise widened (`b5f078ae0`).
+  **Two further i32 walls found by the remote ladder and fixed this session:**
+  conv1d inner offset `src_t*channels` (`d676cbb14`) and the bf16<->f32 bridge
+  length (`15527d80c`). All three `pending-remote`.
 - T2.1: long-query fused forward implemented; CUDA 65,536 gate passed.
 - T2.2: CP-only attention deleted; both paths use rectangular recompute.
 - T2.3: 512 GiB host capture removed; CUDA boundary capture streams state only.
 - T2.4: byte-budget mono fallback and context estimator implemented.
-- T3.1: persistent CUDA gradient accumulation implemented; CUDA gate passed.
+- T3.1: persistent gradient accumulation — the shared `merge_grad` fusion still
+  used the allocating `add_into_device` (the 65,536 backward-OOM site); fixed
+  this session with a `strong_count==1` guarded in-place accumulate
+  (`84ac53fd6`, `pending-remote`).
 - T3.2: indexed CE implemented; CPU parity and exact 64K CE passed.
-- T3.3: checkpoint replay chunks MLP; device-only accumulation remains pending.
+- T3.3: MLP already seq-chunked on device (`checkpoint_seq_chunked`); NOT the
+  forward wall.
 - T4: programmatic checkpoint default aligned; remaining items pending.
-- T5: exact `b5f078ae0` passed 64K forward/CE, then OOMed in the first
-  full-attention backward replay. Last-use activation release and wide slice
-  offsets are committed in `e01aa6606`; rerun pending.
+- T5: `e01aa6606` completed a 64K update. This session's ladder (below) is the
+  latest measured evidence.
+
+### 2026-07-29 single-GPU ladder (measured, pre-fix binary)
+
+Clean H20 (GPU 4/7), ThinkingCap-Qwen3.6-27B-FP8, `--synthetic-writeback-seq`,
+lora attention-qv:
+
+| seq | terminal | note |
+|-----|----------|------|
+| 49,152 | **completed optimizer step**, loss 7.233413 | re-anchor holds; fwd 439.8s / CE 2.2s / bwd 1855s |
+| 57,344 | killed mid-backward (coordinator stop) | past the pre-fix death point |
+| 65,536 | backward OOM | `add_into_device` 3.0 GB, card at 26.8 MB free — the T3.1 site, now fixed (`84ac53fd6`) |
+| 131,072 | forward OOM | `import_local_bf16_as_f32` f32 alloc — the bf16 bridge, now widened (`15527d80c`) |
+| 262,144 | index-wall | bf16 bridge i32 guard — now widened (`15527d80c`) |
+
+Two remaining walls, both need design (not one-liners), both `pending-remote`:
+1. **backward (~57-65K):** the `merge_grad` third-buffer OOM — fix committed,
+   unverified on GPU.
+2. **forward (~131K+):** a full-seq f32 GEMM-output materialization. The exact
+   binding tensor is **unpinned** — code points to the unchunked attention q/k/v/o
+   projections, but one projection (hidden=5120 → 2.68 GB at 131K) is too small
+   to alone OOM 60 GB free. Needs op-level memory attribution before tiling; do
+   not tile the MLP (already chunked).
 
 ## Outcome
 
@@ -40,17 +71,18 @@ set, and optimizer. Passing a synthetic sub-path is diagnosis, not acceptance.
 ## Current truth
 
 - The default admission fence drops updates above 23,000 tokens.
-- The latest completed single-GPU update remains 49,152 tokens.
-- Wide elementwise, GDN, attention, and slice paths remove the known 256K
-  indexing and quadratic-attention walls; the final slice tranche is pending
-  CUDA validation.
-- No existing run proves a complete 64K, 128K, or 256K update.
-- Exact `b5f078ae0` completed 64K forward in 749.656 seconds and CE in 2.956
-  seconds. Backward OOMed after 181 seconds in layer 63 gated-q slice backward:
-  3,072 MiB requested with 25 MiB free; peak was 97,483/97,508 MiB.
+- The latest **completed** single-GPU update is 49,152 tokens (loss 7.233413,
+  this session) — a real optimizer step. The prior 65,536 evidence was
+  superseded: on a clean card the pre-fix binary OOMs at 65,536 in the backward.
+- Three CUDA-path i32/memory walls above 49,152 are fixed in local commits but
+  **not yet re-run on a GPU**: conv1d offset (`d676cbb14`), bf16 bridge length
+  (`15527d80c`), and the `merge_grad` third-buffer accumulate (`84ac53fd6`).
+- One forward wall (full-seq f32 GEMM output, ~131K+) is diagnosed but its exact
+  binding tensor is unpinned and no fix is written.
+- No existing run proves a complete 128K or 256K update.
 
-Therefore the capability is **49,152 verified; 256K unsupported** until the final
-gate below passes.
+Therefore the capability is **49,152 verified; 57,344+ pending a pod rebuild;
+256K unsupported** until the ladder is re-run and the forward wall is fixed.
 
 ## Constraints
 
