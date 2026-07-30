@@ -122,21 +122,13 @@ fn mul_host_eager(
     // `.clone()` (which asserts `dirty != Device`).
     store.ensure_host(a)?;
     store.ensure_host(b)?;
-    let (a_data, a_shape, a_requires_grad) = {
+    let (a_data, a_shape) = {
         let tensor = store.tensor(a)?;
-        (
-            tensor.data.clone(),
-            tensor.shape.clone(),
-            tensor.requires_grad,
-        )
+        (tensor.data.clone(), tensor.shape.clone())
     };
-    let (b_data, b_shape, b_requires_grad) = {
+    let (b_data, b_shape) = {
         let tensor = store.tensor(b)?;
-        (
-            tensor.data.clone(),
-            tensor.shape.clone(),
-            tensor.requires_grad,
-        )
+        (tensor.data.clone(), tensor.shape.clone())
     };
     if a_shape != b_shape {
         return Err(AutogradError::ShapeMismatch {
@@ -146,11 +138,7 @@ fn mul_host_eager(
     }
 
     let data = store.backend().mul_forward(&a_data, &b_data)?;
-    let output_id = store.alloc(Tensor::new(
-        data,
-        a_shape,
-        a_requires_grad || b_requires_grad,
-    )?);
+    let output_id = store.alloc(Tensor::new(data, a_shape, false)?);
 
     TapeEntry {
         op: BackwardOp::Mul,

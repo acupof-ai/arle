@@ -123,11 +123,7 @@ fn rope_host_eager(
         )?
     };
 
-    let output_id = store.alloc(Tensor::new(
-        output,
-        x_tensor.shape.clone(),
-        x_tensor.requires_grad,
-    )?);
+    let output_id = store.alloc(Tensor::new(output, x_tensor.shape.clone(), false)?);
     TapeEntry {
         op: BackwardOp::RoPE,
         output_id,

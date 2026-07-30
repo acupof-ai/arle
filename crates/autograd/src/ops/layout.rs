@@ -83,11 +83,7 @@ fn reshape_host_eager(
         });
     }
 
-    let output_id = store.alloc(Tensor::new(
-        input.data,
-        shape.to_vec(),
-        input.requires_grad,
-    )?);
+    let output_id = store.alloc(Tensor::new(input.data, shape.to_vec(), false)?);
     TapeEntry {
         op: BackwardOp::Reshape,
         output_id,
