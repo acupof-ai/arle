@@ -300,47 +300,46 @@ pub fn linear_attention_core(
     ];
     let output_id = store.alloc(Tensor::new(forward.output, output_shape, requires_grad)?);
 
-    if requires_grad {
-        tape.record(TapeEntry {
-            op: BackwardOp::LinearAttention,
-            output_id,
-            input_ids: smallvec![
-                qkv,
-                z,
-                b_proj,
-                a_proj,
-                conv1d_weight,
-                dt_bias,
-                a_log,
-                norm_weight
-            ],
-            saved: SavedContext::LinearAttentionCtx {
-                qkv,
-                z,
-                b_proj,
-                a_proj,
-                conv1d_weight,
-                dt_bias,
-                a_log,
-                norm_weight,
-                preact: None,
-                qkv_conv: None,
-                g: None,
-                beta: None,
-                chunk_state: None,
-                initial_state: None,
-                initial_conv_window: None,
-                batch: params.batch,
-                seq_len: params.seq_len,
-                num_key_heads: params.num_key_heads,
-                num_value_heads: params.num_value_heads,
-                key_dim: params.key_dim,
-                value_dim: params.value_dim,
-                conv_kernel: params.conv_kernel,
-                eps: params.eps,
-            },
-        });
+    TapeEntry {
+        op: BackwardOp::LinearAttention,
+        output_id,
+        input_ids: smallvec![
+            qkv,
+            z,
+            b_proj,
+            a_proj,
+            conv1d_weight,
+            dt_bias,
+            a_log,
+            norm_weight
+        ],
+        saved: SavedContext::LinearAttentionCtx {
+            qkv,
+            z,
+            b_proj,
+            a_proj,
+            conv1d_weight,
+            dt_bias,
+            a_log,
+            norm_weight,
+            preact: None,
+            qkv_conv: None,
+            g: None,
+            beta: None,
+            chunk_state: None,
+            initial_state: None,
+            initial_conv_window: None,
+            batch: params.batch,
+            seq_len: params.seq_len,
+            num_key_heads: params.num_key_heads,
+            num_value_heads: params.num_value_heads,
+            key_dim: params.key_dim,
+            value_dim: params.value_dim,
+            conv_kernel: params.conv_kernel,
+            eps: params.eps,
+        },
     }
+    .record(store, tape)?;
 
     Ok(output_id)
 }
@@ -725,47 +724,46 @@ pub fn linear_attention_core_with_carry_taped(
     ];
     let output_id = store.alloc(Tensor::new(forward.output, output_shape, requires_grad)?);
 
-    if requires_grad {
-        tape.record(TapeEntry {
-            op: BackwardOp::LinearAttention,
-            output_id,
-            input_ids: smallvec![
-                qkv,
-                z,
-                b_proj,
-                a_proj,
-                conv1d_weight,
-                dt_bias,
-                a_log,
-                norm_weight
-            ],
-            saved: SavedContext::LinearAttentionCtx {
-                qkv,
-                z,
-                b_proj,
-                a_proj,
-                conv1d_weight,
-                dt_bias,
-                a_log,
-                norm_weight,
-                preact: None,
-                qkv_conv: None,
-                g: None,
-                beta: None,
-                chunk_state: None,
-                initial_state,
-                initial_conv_window,
-                batch: params.batch,
-                seq_len: params.seq_len,
-                num_key_heads: params.num_key_heads,
-                num_value_heads: params.num_value_heads,
-                key_dim: params.key_dim,
-                value_dim: params.value_dim,
-                conv_kernel: params.conv_kernel,
-                eps: params.eps,
-            },
-        });
+    TapeEntry {
+        op: BackwardOp::LinearAttention,
+        output_id,
+        input_ids: smallvec![
+            qkv,
+            z,
+            b_proj,
+            a_proj,
+            conv1d_weight,
+            dt_bias,
+            a_log,
+            norm_weight
+        ],
+        saved: SavedContext::LinearAttentionCtx {
+            qkv,
+            z,
+            b_proj,
+            a_proj,
+            conv1d_weight,
+            dt_bias,
+            a_log,
+            norm_weight,
+            preact: None,
+            qkv_conv: None,
+            g: None,
+            beta: None,
+            chunk_state: None,
+            initial_state,
+            initial_conv_window,
+            batch: params.batch,
+            seq_len: params.seq_len,
+            num_key_heads: params.num_key_heads,
+            num_value_heads: params.num_value_heads,
+            key_dim: params.key_dim,
+            value_dim: params.value_dim,
+            conv_kernel: params.conv_kernel,
+            eps: params.eps,
+        },
     }
+    .record(store, tape)?;
 
     Ok(output_id)
 }
@@ -871,7 +869,6 @@ fn try_linear_attention_forward_device(
     ];
     let head_shape = vec![params.batch, params.seq_len, params.num_value_heads];
     let output_id = store.alloc_device_tensor(output_shape, result.output)?;
-    store.set_requires_grad(output_id, requires_grad)?;
 
     if requires_grad {
         let preact_id = store
@@ -890,7 +887,7 @@ fn try_linear_attention_forward_device(
             ],
             result.chunk_state,
         )?;
-        tape.record(TapeEntry {
+        TapeEntry {
             op: BackwardOp::LinearAttention,
             output_id,
             input_ids: smallvec![
@@ -930,7 +927,8 @@ fn try_linear_attention_forward_device(
                 conv_kernel: params.conv_kernel,
                 eps: params.eps,
             },
-        });
+        }
+        .record(store, tape)?;
     }
     Ok(Some(output_id))
 }

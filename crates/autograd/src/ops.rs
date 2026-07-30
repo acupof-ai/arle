@@ -34,6 +34,8 @@ pub mod reduce;
 pub mod ring_attention;
 #[path = "ops/rope.rs"]
 pub mod rope;
+#[path = "ops/seq_accum.rs"]
+pub mod seq_accum;
 #[path = "ops/softmax.rs"]
 pub mod softmax;
 

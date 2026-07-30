@@ -60,11 +60,8 @@ fn softmax_device_lazy(
     // tensor, but re-calling guards a future Dirty::Both path from silent
     // drift (mirrors `sum_device_lazy`).
     store.ensure_device(x)?;
-    let (input_shape, requires_grad) = {
-        let tensor = store.tensor(x)?;
-        let _ = last_dim(&tensor.shape)?;
-        (tensor.shape.clone(), tensor.requires_grad)
-    };
+    let input_shape = store.tensor(x)?.shape.clone();
+    last_dim(&input_shape)?;
     let input_handle = store
         .tensor(x)?
         .device_handle
@@ -83,16 +80,14 @@ fn softmax_device_lazy(
             .log_softmax_last_axis(&input_handle, &input_shape)?,
     };
     let output_id = store.alloc_device_tensor(input_shape, out_handle)?;
-    store.set_requires_grad(output_id, requires_grad)?;
 
-    if requires_grad {
-        tape.record(TapeEntry {
-            op: kind.backward_op(),
-            output_id,
-            input_ids: smallvec![x],
-            saved: kind.saved(output_id),
-        });
+    TapeEntry {
+        op: kind.backward_op(),
+        output_id,
+        input_ids: smallvec![x],
+        saved: kind.saved(output_id),
     }
+    .record(store, tape)?;
 
     Ok(output_id)
 }
@@ -119,14 +114,13 @@ fn softmax_host_eager(
         input.shape.clone(),
         input.requires_grad,
     )?);
-    if input.requires_grad {
-        tape.record(TapeEntry {
-            op: kind.backward_op(),
-            output_id,
-            input_ids: smallvec![x],
-            saved: kind.saved(output_id),
-        });
+    TapeEntry {
+        op: kind.backward_op(),
+        output_id,
+        input_ids: smallvec![x],
+        saved: kind.saved(output_id),
     }
+    .record(store, tape)?;
 
     Ok(output_id)
 }

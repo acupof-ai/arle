@@ -85,16 +85,17 @@ pub fn generalized_jsd_loss(
         }
     }
 
-    let loss_id = store.alloc(Tensor::new(vec![loss_sum * loss_scale], Vec::new(), true)?);
+    let loss_id = store.alloc(Tensor::new(vec![loss_sum * loss_scale], Vec::new(), false)?);
     let grad_id = store.alloc(Tensor::new(grad_student, shape.student_shape, false)?);
-    tape.record(TapeEntry {
+    TapeEntry {
         op: BackwardOp::GeneralizedJsd,
         output_id: loss_id,
         input_ids: smallvec![student_logits],
         saved: SavedContext::GeneralizedJsdCtx {
             grad_student: grad_id,
         },
-    });
+    }
+    .record(store, tape)?;
     Ok(loss_id)
 }
 
@@ -250,7 +251,7 @@ pub fn fused_linear_distill_loss(
         let grad_weight_id = grad_weight
             .map(|data| Ok(store.alloc(Tensor::new(data, shape.weight_shape.clone(), false)?)))
             .transpose()?;
-        tape.record(TapeEntry {
+        TapeEntry {
             op: BackwardOp::FusedLinearDistill,
             output_id: loss_id,
             input_ids: smallvec![hidden, weight],
@@ -258,7 +259,8 @@ pub fn fused_linear_distill_loss(
                 grad_hidden: grad_hidden_id,
                 grad_weight: grad_weight_id,
             },
-        });
+        }
+        .record(store, tape)?;
     }
 
     Ok(loss_id)
@@ -385,7 +387,7 @@ pub fn fused_linear_distill_loss_sparse(
         let grad_weight_id = grad_weight
             .map(|data| Ok(store.alloc(Tensor::new(data, shape.weight_shape.clone(), false)?)))
             .transpose()?;
-        tape.record(TapeEntry {
+        TapeEntry {
             op: BackwardOp::FusedLinearDistill,
             output_id: loss_id,
             input_ids: smallvec![hidden, weight],
@@ -393,7 +395,8 @@ pub fn fused_linear_distill_loss_sparse(
                 grad_hidden: grad_hidden_id,
                 grad_weight: grad_weight_id,
             },
-        });
+        }
+        .record(store, tape)?;
     }
 
     Ok(loss_id)
@@ -533,7 +536,7 @@ pub fn fused_linear_ce_loss_indexed(
         let grad_weight_id = grad_weight
             .map(|data| Ok(store.alloc(Tensor::new(data, shape.weight_shape.clone(), false)?)))
             .transpose()?;
-        tape.record(TapeEntry {
+        TapeEntry {
             op: BackwardOp::FusedLinearDistill,
             output_id: loss_id,
             input_ids: smallvec![hidden, weight],
@@ -541,7 +544,8 @@ pub fn fused_linear_ce_loss_indexed(
                 grad_hidden: grad_hidden_id,
                 grad_weight: grad_weight_id,
             },
-        });
+        }
+        .record(store, tape)?;
     }
 
     Ok(loss_id)
@@ -679,7 +683,7 @@ fn fused_linear_ce_loss_indexed_device(
             }
             None => None,
         };
-        tape.record(TapeEntry {
+        TapeEntry {
             op: BackwardOp::FusedLinearDistill,
             output_id: loss_id,
             input_ids: smallvec![hidden, weight],
@@ -687,7 +691,8 @@ fn fused_linear_ce_loss_indexed_device(
                 grad_hidden: grad_hidden_id,
                 grad_weight: grad_weight_accum,
             },
-        });
+        }
+        .record(store, tape)?;
     }
 
     Ok(loss_id)
@@ -973,7 +978,7 @@ pub fn fused_linear_pg_loss_indexed(
         let grad_weight_id = grad_weight
             .map(|data| Ok(store.alloc(Tensor::new(data, shape.weight_shape.clone(), false)?)))
             .transpose()?;
-        tape.record(TapeEntry {
+        TapeEntry {
             op: BackwardOp::FusedLinearDistill,
             output_id: loss_id,
             input_ids: smallvec![hidden, weight],
@@ -981,7 +986,8 @@ pub fn fused_linear_pg_loss_indexed(
                 grad_hidden: grad_hidden_id,
                 grad_weight: grad_weight_id,
             },
-        });
+        }
+        .record(store, tape)?;
     }
 
     Ok((loss_id, stats))
@@ -1140,7 +1146,7 @@ fn fused_linear_pg_loss_indexed_device(
             }
             None => None,
         };
-        tape.record(TapeEntry {
+        TapeEntry {
             op: BackwardOp::FusedLinearDistill,
             output_id: loss_id,
             input_ids: smallvec![hidden, weight],
@@ -1148,7 +1154,8 @@ fn fused_linear_pg_loss_indexed_device(
                 grad_hidden: grad_hidden_id,
                 grad_weight: grad_weight_accum,
             },
-        });
+        }
+        .record(store, tape)?;
     }
 
     Ok((loss_id, stats))

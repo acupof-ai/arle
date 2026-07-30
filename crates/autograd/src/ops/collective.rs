@@ -13,7 +13,7 @@ use crate::{
 /// returns the gradient of the distributed total loss.
 pub fn all_reduce_sum(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> Result<TensorId> {
     store.ensure_device(x)?;
-    let (shape, requires_grad, input_handle) = {
+    let (shape, input_handle) = {
         let tensor = store.tensor(x)?;
         let handle = tensor
             .device_handle
@@ -22,23 +22,21 @@ pub fn all_reduce_sum(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> 
                 "all_reduce_sum: ensure_device left tensor without a device handle",
             ))?
             .clone();
-        (tensor.shape.clone(), tensor.requires_grad, handle)
+        (tensor.shape.clone(), handle)
     };
 
     let out_handle = store
         .backend()
         .all_reduce_sum_device(&input_handle, &shape)?;
     let output_id = store.alloc_device_tensor(shape.clone(), out_handle)?;
-    store.set_requires_grad(output_id, requires_grad)?;
 
-    if requires_grad {
-        tape.record(TapeEntry {
-            op: BackwardOp::AllReduceSum,
-            output_id,
-            input_ids: smallvec![x],
-            saved: SavedContext::Shape(shape),
-        });
+    TapeEntry {
+        op: BackwardOp::AllReduceSum,
+        output_id,
+        input_ids: smallvec![x],
+        saved: SavedContext::Shape(shape),
     }
+    .record(store, tape)?;
 
     Ok(output_id)
 }
@@ -98,7 +96,7 @@ pub fn all_gather_seq(
     tape: &mut Tape,
 ) -> Result<TensorId> {
     store.ensure_device(x)?;
-    let (local_shape, requires_grad, input_handle) = {
+    let (local_shape, input_handle) = {
         let tensor = store.tensor(x)?;
         let handle = tensor
             .device_handle
@@ -107,23 +105,21 @@ pub fn all_gather_seq(
                 "all_gather_seq: ensure_device left tensor without a device handle",
             ))?
             .clone();
-        (tensor.shape.clone(), tensor.requires_grad, handle)
+        (tensor.shape.clone(), handle)
     };
 
     let out_handle = store
         .backend()
         .all_gather_seq_device(&input_handle, &local_shape)?;
     let output_id = store.alloc_device_tensor(full_shape, out_handle)?;
-    store.set_requires_grad(output_id, requires_grad)?;
 
-    if requires_grad {
-        tape.record(TapeEntry {
-            op: BackwardOp::AllGatherSeq,
-            output_id,
-            input_ids: smallvec![x],
-            saved: SavedContext::Shape(local_shape),
-        });
+    TapeEntry {
+        op: BackwardOp::AllGatherSeq,
+        output_id,
+        input_ids: smallvec![x],
+        saved: SavedContext::Shape(local_shape),
     }
+    .record(store, tape)?;
 
     Ok(output_id)
 }
@@ -174,7 +170,7 @@ pub fn reduce_scatter_sum(
     tape: &mut Tape,
 ) -> Result<TensorId> {
     store.ensure_device(x)?;
-    let (full_shape, requires_grad, input_handle) = {
+    let (full_shape, input_handle) = {
         let tensor = store.tensor(x)?;
         let handle = tensor
             .device_handle
@@ -183,23 +179,21 @@ pub fn reduce_scatter_sum(
                 "reduce_scatter_sum: ensure_device left tensor without a device handle",
             ))?
             .clone();
-        (tensor.shape.clone(), tensor.requires_grad, handle)
+        (tensor.shape.clone(), handle)
     };
 
     let out_handle = store
         .backend()
         .reduce_scatter_sum_device(&input_handle, &local_shape)?;
     let output_id = store.alloc_device_tensor(local_shape, out_handle)?;
-    store.set_requires_grad(output_id, requires_grad)?;
 
-    if requires_grad {
-        tape.record(TapeEntry {
-            op: BackwardOp::ReduceScatterSum,
-            output_id,
-            input_ids: smallvec![x],
-            saved: SavedContext::Shape(full_shape),
-        });
+    TapeEntry {
+        op: BackwardOp::ReduceScatterSum,
+        output_id,
+        input_ids: smallvec![x],
+        saved: SavedContext::Shape(full_shape),
     }
+    .record(store, tape)?;
 
     Ok(output_id)
 }

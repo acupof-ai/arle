@@ -252,19 +252,18 @@ pub fn moe_topk_softmax_with_indices(
         vec![tokens, top_k],
         input.requires_grad,
     )?);
-    if input.requires_grad {
-        tape.record(TapeEntry {
-            op: BackwardOp::MoeTopKSoftmax,
-            output_id: weights_id,
-            input_ids: smallvec![logits],
-            saved: SavedContext::MoeTopKSoftmaxCtx {
-                y: weights_id,
-                indices: indices.clone(),
-                logits_shape: input.shape,
-                top_k,
-            },
-        });
+    TapeEntry {
+        op: BackwardOp::MoeTopKSoftmax,
+        output_id: weights_id,
+        input_ids: smallvec![logits],
+        saved: SavedContext::MoeTopKSoftmaxCtx {
+            y: weights_id,
+            indices: indices.clone(),
+            logits_shape: input.shape,
+            top_k,
+        },
     }
+    .record(store, tape)?;
 
     Ok(MoeTopK {
         weights: weights_id,
@@ -387,17 +386,16 @@ pub fn moe_gather_rows(
         vec![rows.len(), cols],
         input.requires_grad,
     )?);
-    if input.requires_grad {
-        tape.record(TapeEntry {
-            op: BackwardOp::MoeGatherRows,
-            output_id,
-            input_ids: smallvec![src],
-            saved: SavedContext::MoeGatherRowsCtx {
-                rows: rows.to_vec(),
-                input_shape: input.shape,
-            },
-        });
+    TapeEntry {
+        op: BackwardOp::MoeGatherRows,
+        output_id,
+        input_ids: smallvec![src],
+        saved: SavedContext::MoeGatherRowsCtx {
+            rows: rows.to_vec(),
+            input_shape: input.shape,
+        },
     }
+    .record(store, tape)?;
     Ok(output_id)
 }
 
@@ -495,19 +493,18 @@ pub fn moe_weighted_scatter(
 
     let requires_grad = values_t.requires_grad || weights_t.requires_grad;
     let output_id = store.alloc(Tensor::new(out, vec![out_rows, hidden], requires_grad)?);
-    if requires_grad {
-        tape.record(TapeEntry {
-            op: BackwardOp::MoeWeightedScatter,
-            output_id,
-            input_ids: smallvec![values, weights],
-            saved: SavedContext::MoeWeightedScatterCtx {
-                routes: routes.to_vec(),
-                values_shape: values_t.shape,
-                weights_shape: weights_t.shape,
-                out_rows,
-            },
-        });
+    TapeEntry {
+        op: BackwardOp::MoeWeightedScatter,
+        output_id,
+        input_ids: smallvec![values, weights],
+        saved: SavedContext::MoeWeightedScatterCtx {
+            routes: routes.to_vec(),
+            values_shape: values_t.shape,
+            weights_shape: weights_t.shape,
+            out_rows,
+        },
     }
+    .record(store, tape)?;
     Ok(output_id)
 }
 
@@ -722,7 +719,7 @@ pub fn moe_grouped_linear(
                 input_ids.push(id);
             }
         }
-        tape.record(TapeEntry {
+        TapeEntry {
             op: BackwardOp::MoeGroupedLinear,
             output_id,
             input_ids,
@@ -734,7 +731,8 @@ pub fn moe_grouped_linear(
                 input_shape: input_t.shape,
                 output_shape,
             },
-        });
+        }
+        .record(store, tape)?;
     }
     Ok(output_id)
 }
@@ -1157,19 +1155,18 @@ pub fn moe_grouped_weighted_scatter(
 
     let requires_grad = values_t.requires_grad || weights_t.requires_grad;
     let output_id = store.alloc(Tensor::new(out, vec![out_rows, hidden], requires_grad)?);
-    if requires_grad {
-        tape.record(TapeEntry {
-            op: BackwardOp::MoeGroupedWeightedScatter,
-            output_id,
-            input_ids: smallvec![values, weights],
-            saved: SavedContext::MoeGroupedWeightedScatterCtx {
-                routes: routes.to_vec(),
-                values_shape: vec![experts, max_rows, hidden],
-                weights_shape: weights_t.shape,
-                out_rows,
-            },
-        });
+    TapeEntry {
+        op: BackwardOp::MoeGroupedWeightedScatter,
+        output_id,
+        input_ids: smallvec![values, weights],
+        saved: SavedContext::MoeGroupedWeightedScatterCtx {
+            routes: routes.to_vec(),
+            values_shape: vec![experts, max_rows, hidden],
+            weights_shape: weights_t.shape,
+            out_rows,
+        },
     }
+    .record(store, tape)?;
     Ok(output_id)
 }
 
