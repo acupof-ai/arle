@@ -71,24 +71,33 @@ def quant_weight_names(ref_dir: Path) -> set[str]:
 
 
 # When no quantized reference exists, quantize all 2D linear .weight tensors
-# except these — embed/lm_head set logits/inputs directly, norms are 1D, and the
-# linear-attn in_proj_a/in_proj_b are per-v-head scalar gates the CUDA loader
-# deliberately loads BF16-only (qwen35.rs load_matrix, not _quant_aware). Quant
-# scope MUST NOT exceed the loader's quant-aware coverage or serve reads I8 bytes
-# through the BF16 path and crashes. All stay high-precision (DeepSeek FP8 scope).
-ALL_LINEAR_SKIP = ("embed", "lm_head", "norm", "gate.weight", "in_proj_a", "in_proj_b", "conv1d")
+# except these. Source of truth is the CUDA loader: qwen35.rs:3296-3298 loads
+# in_proj_a/in_proj_b (per-v-head scalar gates) via BF16-only load_matrix and
+# conv1d via load_conv1d_vec — NOT load_matrix_quant_aware. Quant scope MUST NOT
+# exceed the loader's quant-aware coverage or serve reads I8 through the BF16
+# path and crashes (fixed 195ba2e5d). embed/lm_head set logits/inputs directly,
+# norms are 1D. If the loader flips any of these to quant-aware, update here —
+# or pass --ref to derive scope from a checkpoint instead of this list.
+# Matched as exact ".<name>.weight" / ".<name>_weight" endings so a broad token
+# like "norm" can't swallow an unrelated tensor in a differently-named export.
+ALL_LINEAR_SKIP_ENDINGS = (
+    "embed_tokens.weight", "lm_head.weight", "in_proj_a.weight", "in_proj_b.weight",
+    "conv1d.weight", "gate.weight",
+)
 
 
-def all_linear_names(bf16_dir: Path) -> set[str]:
-    idx = read_weight_map(bf16_dir)
+def all_linear_names(weight_map: dict[str, str]) -> set[str]:
     return {
-        k for k in idx
-        if k.endswith(".weight") and not any(s in k for s in ALL_LINEAR_SKIP)
+        k for k in weight_map
+        if k.endswith(".weight")
+        and "norm" not in k.rsplit(".", 2)[-2]  # LayerNorm scales are 1D, not linear
+        and not any(k.endswith(e) for e in ALL_LINEAR_SKIP_ENDINGS)
     }
 
 
 def run(bf16_dir: Path, ref_dir: Path | None, out_dir: Path, group_size: int) -> None:
-    quant_set = all_linear_names(bf16_dir) if ref_dir is None else quant_weight_names(ref_dir)
+    weight_map = read_weight_map(bf16_dir)
+    quant_set = all_linear_names(weight_map) if ref_dir is None else quant_weight_names(ref_dir)
     print(f"quant scope: {len(quant_set)} tensors "
           f"({'all-linear' if ref_dir is None else 'from ref'})", flush=True)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -97,7 +106,6 @@ def run(bf16_dir: Path, ref_dir: Path | None, out_dir: Path, group_size: int) ->
         if src.is_file() and not f.endswith(".safetensors"):
             shutil.copy(src, out_dir / f)
 
-    weight_map = read_weight_map(bf16_dir)
     shards: dict[str, list[str]] = {}
     for name, fname in weight_map.items():
         shards.setdefault(fname, []).append(name)
@@ -155,12 +163,14 @@ def _selfcheck() -> None:
     from fp8_cast_loss_probe import dequant as fp8_dequant
 
     torch.manual_seed(0)
-    w = torch.randn(256, 512, dtype=torch.bfloat16)
-    w += 0.3 * torch.randn(256, 1) * torch.randn(1, 512)  # heavy-tail like real weights
+    rows, cols = 256, 512
+    ng = cols // DEFAULT_GROUP
+    w = torch.randn(rows, cols, dtype=torch.bfloat16)
+    w += 0.3 * torch.randn(rows, 1) * torch.randn(1, cols)  # heavy-tail like real weights
     q, scale = per_group_int8(w, DEFAULT_GROUP)
-    assert q.shape == (256, 512) and q.dtype == torch.int8, (q.shape, q.dtype)
-    assert scale.shape == (256, 512 // DEFAULT_GROUP), scale.shape
-    deq = (q.float().view(256, 4, DEFAULT_GROUP) * scale.float().view(256, 4, 1)).view(256, 512)
+    assert q.shape == (rows, cols) and q.dtype == torch.int8, (q.shape, q.dtype)
+    assert scale.shape == (rows, ng), scale.shape
+    deq = (q.float().view(rows, ng, DEFAULT_GROUP) * scale.float().unsqueeze(-1)).view(rows, cols)
     int8_rel = ((deq - w.float()).norm() / w.float().norm()).item()
 
     fp8, sf = per_block_cast_to_fp8(w)
