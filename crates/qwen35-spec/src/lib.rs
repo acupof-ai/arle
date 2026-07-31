@@ -1210,10 +1210,11 @@ impl DsparkConfig {
                 .and_then(serde_json::Value::as_f64)
                 .map_or(default, |f| f as f32)
         };
-        // Both families may nest mask/target ids under "dflash_config" (a
-        // DSpark checkpoint's backbone IS DFlash) — nesting is a field-lookup
-        // detail only. The proposal convention is discriminated by
-        // `architectures`, matching DeepSpec's eval dispatch.
+        // The proposal convention travels as `speculative_tokens`
+        // (`block_size - 1` = same-position DFlash rows). Checkpoints converted
+        // before that field existed encode the same bit as the "dflash_config"
+        // nesting — see scripts/convert_dspark_speculators.py. `architectures`
+        // is NOT a discriminator here: the converter hardcodes "DSparkDraftModel".
         let dflash = v.get("dflash_config").filter(|d| d.is_object());
         let field = |name: &str| dflash.and_then(|d| d.get(name)).or_else(|| v.get(name));
         let mask_token_id = field("mask_token_id")
@@ -1244,6 +1245,10 @@ impl DsparkConfig {
                 "layer_types length != num_hidden_layers",
             ));
         }
+        let block_size = field("block_size")
+            .and_then(serde_json::Value::as_u64)
+            .map(|n| n as usize)
+            .ok_or(Qwen35ConfigError::InvalidConfig("block_size"))?;
         Ok(Self {
             hidden_size: usize_of("hidden_size")?,
             intermediate_size: usize_of("intermediate_size")?,
@@ -1258,18 +1263,13 @@ impl DsparkConfig {
                 .and_then(serde_json::Value::as_u64)
                 .map_or(2048, |n| n as usize),
             layer_types,
-            block_size: field("block_size")
-                .and_then(serde_json::Value::as_u64)
-                .map(|n| n as usize)
-                .ok_or(Qwen35ConfigError::InvalidConfig("block_size"))?,
+            block_size,
             mask_token_id,
             target_layer_ids,
             next_token_heads: v
-                .get("architectures")
-                .and_then(serde_json::Value::as_array)
-                .and_then(|a| a.first())
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|s| s.contains("DSpark")),
+                .get("speculative_tokens")
+                .and_then(serde_json::Value::as_u64)
+                .map_or(dflash.is_none(), |n| n as usize != block_size - 1),
         })
     }
 
@@ -1358,6 +1358,34 @@ mod dspark_schedule_tests {
             row_ms: 100.0,
         };
         assert_eq!(dspark_verify_lens(&[&hi, &hi], dear), vec![0, 0]);
+    }
+
+    /// The row convention decides where drafts start; reading it wrong is
+    /// lossless-but-useless (accept 0.54 -> 0.03, measured) and no correctness
+    /// gate sees it. `architectures` must never become the discriminator again:
+    /// the converter hardcodes "DSparkDraftModel" for both families.
+    #[test]
+    fn convention_from_speculative_tokens_then_nesting() {
+        let dir = std::env::temp_dir().join("arle-dspark-cfg-test");
+        let write = |cfg: &str| {
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("config.json"), cfg).unwrap();
+            DsparkConfig::from_dir(&dir).unwrap()
+        };
+        let body = r#""architectures":["DSparkDraftModel"],"num_hidden_layers":1,
+            "hidden_size":8,"intermediate_size":8,"num_attention_heads":1,
+            "num_key_value_heads":1,"head_dim":8,"block_size":16"#;
+        let ids = r#""mask_token_id":1,"target_layer_ids":[0]"#;
+        // Explicit field wins over the (identical-either-way) architectures string.
+        let c = write(&format!("{{{body},{ids},\"speculative_tokens\":15}}"));
+        assert!(!c.next_token_heads && c.max_draft_tokens() == 15);
+        let c = write(&format!("{{{body},{ids},\"speculative_tokens\":16}}"));
+        assert!(c.next_token_heads && c.max_draft_tokens() == 16);
+        // Legacy checkpoints: the nesting carries the same bit.
+        let c = write(&format!("{{{body},\"dflash_config\":{{{ids}}}}}"));
+        assert!(!c.next_token_heads);
+        let c = write(&format!("{{{body},{ids}}}"));
+        assert!(c.next_token_heads);
     }
 }
 

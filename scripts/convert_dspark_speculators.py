@@ -42,6 +42,7 @@ def convert_config(src):
         "rms_norm_eps": t["rms_norm_eps"],
         "layer_types": t["layer_types"],
         "block_size": block_size,
+        "speculative_tokens": proposal["speculative_tokens"],
         "markov_rank": src.get("markov_rank", 0),
         "markov_head_type": src.get("markov_head_type"),
         "enable_confidence_head": src.get("enable_confidence_head", False),
@@ -54,7 +55,9 @@ def convert_config(src):
     # deepspec target_layer_ids are layer indices — shift by -1.
     ids = [i - 1 for i in src["aux_hidden_state_layer_ids"]]
     # speculative_tokens == block_size-1 marks the same-position (DFlash) row
-    # convention; DsparkConfig keys next_token_heads off dflash_config nesting.
+    # convention. `architectures` is NOT the discriminator (it is a constant
+    # here) — the runtime reads speculative_tokens, older checkpoints without
+    # it fall back to the dflash_config nesting this writes.
     if proposal["speculative_tokens"] == block_size - 1:
         cfg["dflash_config"] = {"mask_token_id": src["mask_token_id"],
                                 "target_layer_ids": ids}
