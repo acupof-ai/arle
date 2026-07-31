@@ -9675,6 +9675,125 @@ fn cuda_write_slice_device(
 mod tests {
     use super::*;
     use crate::backend::Backend;
+    use crate::ops::ring_attention::ring_forward_tile;
+
+    // The device ring kernel (ring_block_fwd_merge + finalize) had NO coverage:
+    // CUDA world==1 takes the CPU path and the host multi-block test never touches
+    // the .cu. This drives the device kernel over TWO distinct zigzag blocks on one
+    // GPU (no NCCL — the merge/GQA/position-mask are what's under test, not the
+    // transport) and compares to the verified host `ring_forward_tile`. Config
+    // mirrors the pod failure: head_dim=128, GQA heads=4/kv=2, a zigzag shard whose
+    // back chunk (the rows that ONLY attend the remote block) is where CE blew up.
+    #[test]
+    fn device_ring_two_blocks_matches_host_reference_gqa_hd128() -> Result<()> {
+        let backend = CudaBackend::new(0)?;
+        let (heads, kv_heads, d) = (4usize, 2usize, 128usize);
+        let blk = 4usize; // rows per rank shard
+        let gqa = heads / kv_heads;
+
+        // Deterministic synthetic q/k/v, quantized to EXACT bf16 values (8-bit
+        // mantissa) so f32 host == bf16 device and the tolerance isolates a real
+        // algorithm bug from round-trip noise.
+        let synth = |n: usize, seed: u64| -> Vec<f32> {
+            let mut s = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            (0..n)
+                .map(|_| {
+                    s ^= s << 13;
+                    s ^= s >> 7;
+                    s ^= s << 17;
+                    // f32 → bf16 (truncate low 16 mantissa bits) → f32: exact on device.
+                    let raw = (((s >> 40) as f32 / (1u64 << 24) as f32) - 0.5) * 0.5;
+                    f32::from_bits(raw.to_bits() & 0xffff_0000)
+                })
+                .collect()
+        };
+
+        // rank0 zigzag shard for seq=8, cp=2: owns rows {0,1,6,7}. Block 0 = its own
+        // KV (positions 0,1,6,7); block 1 = rank1's KV (positions 2,3,4,5, delivered
+        // by the ring). q rows carry the same positions as block 0.
+        let q_pos = [0usize, 1, 6, 7];
+        let blk0_pos = [0usize, 1, 6, 7];
+        let blk1_pos = [2usize, 3, 4, 5];
+
+        let q = synth(heads * blk * d, 1); // [heads, blk, d]
+        let k0 = synth(kv_heads * blk * d, 2); // [kv_heads, blk, d]
+        let v0 = synth(kv_heads * blk * d, 3);
+        let k1 = synth(kv_heads * blk * d, 4);
+        let v1 = synth(kv_heads * blk * d, 5);
+        let scale = 1.0 / (d as f32).sqrt();
+
+        // Host reference: per q-head, attend its GQA kv-head's block0 then block1.
+        let mut ref_out = vec![0.0f32; heads * blk * d];
+        for qh in 0..heads {
+            let kvh = qh / gqa;
+            let kv_tile = kvh * blk * d;
+            let blocks: [(&[f32], &[f32], &[usize]); 2] = [
+                (
+                    &k0[kv_tile..kv_tile + blk * d],
+                    &v0[kv_tile..kv_tile + blk * d],
+                    &blk0_pos,
+                ),
+                (
+                    &k1[kv_tile..kv_tile + blk * d],
+                    &v1[kv_tile..kv_tile + blk * d],
+                    &blk1_pos,
+                ),
+            ];
+            let (o, _lse) = ring_forward_tile(
+                &q[qh * blk * d..(qh + 1) * blk * d],
+                &blocks,
+                blk,
+                d,
+                scale,
+                &q_pos,
+            );
+            ref_out[qh * blk * d..(qh + 1) * blk * d].copy_from_slice(&o);
+        }
+
+        // Device: init accumulators, feed block0 then block1 through the kernel.
+        let rows = heads * blk;
+        let up = |h: &[f32]| backend.upload(h, &[h.len()]);
+        let q_h = up(&q)?;
+        let qpos_h = up(&q_pos.iter().map(|&p| p as f32).collect::<Vec<_>>())?;
+        let mut acc_m = up(&vec![f32::NEG_INFINITY; rows])?;
+        let mut acc_l = up(&vec![0.0f32; rows])?;
+        let mut acc_o = up(&vec![0.0f32; rows * d])?;
+        let dims = RingBlockDims {
+            num_q_tiles: heads,
+            num_q_heads: heads,
+            num_kv_heads: kv_heads,
+            head_dim: d,
+            q_rows: blk,
+            blk_len: blk,
+            sm_scale: scale,
+        };
+        for (k, v, kpos) in [(&k0, &v0, &blk0_pos), (&k1, &v1, &blk1_pos)] {
+            let k_h = up(k)?;
+            let v_h = up(v)?;
+            let kpos_h = up(&kpos.iter().map(|&p| p as f32).collect::<Vec<_>>())?;
+            let (m2, l2, o2) = backend.ring_block_fwd_merge(
+                &q_h, &k_h, &v_h, &acc_m, &acc_l, &acc_o, &qpos_h, &kpos_h, dims,
+            )?;
+            acc_m = m2;
+            acc_l = l2;
+            acc_o = o2;
+        }
+        let (out_h, _lse_h) = backend.ring_block_finalize(&acc_m, &acc_l, &acc_o, rows, d)?;
+        let got = backend.readback(&out_h)?;
+
+        let max_diff = ref_out
+            .iter()
+            .zip(&got)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        // Inputs are exact bf16, so only f32 expf/accumulation differences remain
+        // (~1e-4) — far below the 5.2% pod divergence this localizes.
+        assert!(
+            max_diff < 1.0e-3,
+            "device ring != host reference: max_diff={max_diff}"
+        );
+        Ok(())
+    }
 
     #[test]
     fn bf16_device_import_roundtrip_preserves_d2d_bytes_and_widens() -> Result<()> {
