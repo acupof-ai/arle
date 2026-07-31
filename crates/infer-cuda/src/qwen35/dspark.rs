@@ -1280,6 +1280,7 @@ impl Qwen35Model {
         let embed_ms = super::mtp_phase_lap(ctx, &mut pt);
 
         let elem = std::mem::size_of::<half::f16>() as u64;
+        let (mut qkv_ms, mut attn_ms, mut mlp_ms) = (0.0f64, 0.0f64, 0.0f64);
         for (li, layer) in head.layers.iter().enumerate() {
             let cap_li = head.cap;
             let h = scratch.hidden.get(ctx, hidden, rows)?;
@@ -1292,6 +1293,7 @@ impl Qwen35Model {
             gemm_batch(ctx, &layer.k_proj, normed, k_new)?;
             let v_new = scratch.v_new.get(ctx, kv_dim, rows)?;
             gemm_batch(ctx, &layer.v_proj, normed, v_new)?;
+            qkv_ms += super::mtp_phase_lap(ctx, &mut pt);
 
             let q_prepped = scratch.q_prepped.get(ctx, q_dim, rows)?;
             let attn_heads = scratch.attn_heads.get(ctx, q_dim, rows)?;
@@ -1364,6 +1366,7 @@ impl Qwen35Model {
                 }
             }
 
+            attn_ms += super::mtp_phase_lap(ctx, &mut pt);
             let attn_out_h = scratch.attn_out_h.get(ctx, hidden, rows)?;
             gemm_batch(ctx, &layer.o_proj, attn_heads, attn_out_h)?;
             let hidden_mid = scratch.hidden_mid.get(ctx, hidden, rows)?;
@@ -1389,8 +1392,9 @@ impl Qwen35Model {
                 mlp_out,
                 scratch.hidden.get(ctx, hidden, rows)?,
             )?;
+            mlp_ms += super::mtp_phase_lap(ctx, &mut pt);
         }
-        let layers_ms = super::mtp_phase_lap(ctx, &mut pt);
+        let layers_ms = qkv_ms + attn_ms + mlp_ms;
 
         let final_normed = scratch.final_normed.get(ctx, hidden, rows)?;
         rms_norm_batch(
@@ -1447,7 +1451,8 @@ impl Qwen35Model {
         if pt.is_some() {
             let conf_ms = super::mtp_phase_lap(ctx, &mut pt);
             eprintln!(
-                "[dspark-draft-b] rows={rows} embed={embed_ms:.2} layers={layers_ms:.2} \
+                "[dspark-draft-b] rows={rows} embed={embed_ms:.2} qkv={qkv_ms:.2} \
+                 attn={attn_ms:.2} mlp={mlp_ms:.2} layers={layers_ms:.2} \
                  head={head_ms:.2} settle={settle_ms:.2} conf={conf_ms:.2} ms"
             );
         }
