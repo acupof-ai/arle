@@ -192,10 +192,12 @@ def gdr_decode_conv_gated_norm(
     conv1d, gdr_decode, rms_norm_gated as 3 separate kernels).
 
     GQA race handling: q/k channels belong to key head `kh` shared by 3 value
-    heads. Each block recomputes its own q/k conv (cheap, in registers, no
-    cross-block dependency), but the conv-STATE ring for q/k is written only by
-    the group-representative block (`vh % (num_value_heads // num_key_heads) == 0`)
-    to avoid 3 blocks racing the same ring slot; every block writes its own v ring.
+    heads across 3 separate blocks. Each block recomputes its own q/k conv from
+    the read-only input ring `conv_state`, and the advanced ring is written to a
+    SEPARATE `conv_state_out` buffer (ping-pong). Because no block writes a slot
+    another block reads, the shared q/k ring has no cross-block hazard; the
+    group-representative guard only avoids redundant q/k writes. Caller swaps
+    `conv_state`/`conv_state_out` between decode steps.
 
     conv1d math (arle conv1d_decode_batch.cu, kernel_size=4):
         sum = s0*w0 + s1*w1 + s2*w2 + x*w3     (s0..s2 = ring, x = new token)
@@ -203,9 +205,10 @@ def gdr_decode_conv_gated_norm(
         ring <- [s1, s2, x]                     (shift left, append)
 
     Buffers:
-      qkv_in    : [B, qkv_stride]  pre-conv fused q|k|v (bf16)
-      conv_w    : [qkv_stride, conv_kernel]  depthwise weights (bf16)
-      conv_state: [B, qkv_stride, conv_kernel-1]  ring, updated in place (bf16)
+      qkv_in         : [B, qkv_stride]  pre-conv fused q|k|v (bf16)
+      conv_w         : [qkv_stride, conv_kernel]  depthwise weights (bf16)
+      conv_state     : [B, qkv_stride, conv_kernel-1]  input ring (read-only)
+      conv_state_out : [B, qkv_stride, conv_kernel-1]  advanced ring (write-only)
     """
     q_dim = num_key_heads * key_dim
     k_dim = num_key_heads * key_dim
@@ -220,6 +223,7 @@ def gdr_decode_conv_gated_norm(
         qkv_in: T.Tensor((B, qkv_stride), in_dtype),
         conv_w: T.Tensor((qkv_stride, conv_kernel), in_dtype),
         conv_state: T.Tensor((B, qkv_stride, sw), in_dtype),
+        conv_state_out: T.Tensor((B, qkv_stride, sw), in_dtype),
         z: T.Tensor((B, v_dim), in_dtype),
         b_proj: T.Tensor((B, num_value_heads), in_dtype),
         a_proj: T.Tensor((B, num_value_heads), in_dtype),
@@ -271,21 +275,26 @@ def gdr_decode_conv_gated_norm(
             k_s[tv] = sk * T.sigmoid(sk)
             v_s[tv] = svv * T.sigmoid(svv)
 
-            # --- update conv rings (shift-left, append new pre-conv token) ---
-            # v ring: every block owns its v channels -> always write.
-            # q/k rings: shared across the GQA group -> only the representative writes.
+            # --- write advanced conv rings to a SEPARATE output buffer ---
+            # Ping-pong (conv_state -> conv_state_out) so no block ever writes a
+            # slot another block reads: reads above are all from conv_state, writes
+            # here all go to conv_state_out. This removes the cross-block q/k race
+            # entirely (the GQA group shares q/k channels across 3 value-head
+            # blocks). The rep-block guard still avoids redundant q/k writes; every
+            # block writes its own v channels. Caller swaps the two buffers between
+            # decode steps.
             x_v = qkv_in[bb, vc]
             for t in T.serial(sw - 1):
-                conv_state[bb, vc, t] = conv_state[bb, vc, t + 1]
-            conv_state[bb, vc, sw - 1] = x_v.astype(in_dtype)
+                conv_state_out[bb, vc, t] = conv_state[bb, vc, t + 1]
+            conv_state_out[bb, vc, sw - 1] = x_v.astype(in_dtype)
             if is_group_rep:
                 x_q = qkv_in[bb, qc]
                 x_k = qkv_in[bb, kc]
                 for t in T.serial(sw - 1):
-                    conv_state[bb, qc, t] = conv_state[bb, qc, t + 1]
-                    conv_state[bb, kc, t] = conv_state[bb, kc, t + 1]
-                conv_state[bb, qc, sw - 1] = x_q.astype(in_dtype)
-                conv_state[bb, kc, sw - 1] = x_k.astype(in_dtype)
+                    conv_state_out[bb, qc, t] = conv_state[bb, qc, t + 1]
+                    conv_state_out[bb, kc, t] = conv_state[bb, kc, t + 1]
+                conv_state_out[bb, qc, sw - 1] = x_q.astype(in_dtype)
+                conv_state_out[bb, kc, sw - 1] = x_k.astype(in_dtype)
             T.tvm_storage_sync("shared")
 
             # --- from here identical to S1a: L2-norm, g/beta, recurrence, gated RMSNorm ---
@@ -418,5 +427,88 @@ def _self_check():
     print("qwen36_gdr_decode_fused self-check PASSED (out+state within bf16 tol)")
 
 
+def _reference_conv(qkv_in, conv_w, conv_state, z, b_proj, a_proj, dt_bias, A_log,
+                    norm_weight, state, num_key_heads, num_value_heads, key_dim,
+                    val_dim, conv_kernel, eps):
+    """fp32 reference for the conv variant: depthwise K=4 conv+SiLU on every qkv
+    channel (bf16-rounded before SiLU, arle parity), then the gdr core, plus the
+    advanced ring. Mirrors gdr_decode_conv_gated_norm including the ping-pong ring.
+    """
+    import torch
+
+    B = qkv_in.shape[0]
+    sw = conv_kernel - 1
+    xf = qkv_in.float()
+    wf = conv_w.float()
+    sf = conv_state.float()
+
+    # depthwise conv1d + SiLU over every channel: sum = ring·w[:sw] + x·w[sw].
+    conv_out = torch.zeros(B, xf.shape[1], dtype=torch.float32, device=qkv_in.device)
+    ring_out = torch.zeros_like(sf)
+    for b in range(B):
+        for c in range(xf.shape[1]):
+            s = xf[b, c] * wf[c, sw]
+            for t in range(sw):
+                s = s + sf[b, c, t] * wf[c, t]
+            sb = torch.tensor(s, dtype=torch.bfloat16, device=qkv_in.device).float()
+            conv_out[b, c] = sb * torch.sigmoid(sb)
+            for t in range(sw - 1):
+                ring_out[b, c, t] = sf[b, c, t + 1]
+            ring_out[b, c, sw - 1] = torch.tensor(
+                xf[b, c], dtype=torch.bfloat16, device=qkv_in.device
+            ).float()
+
+    # feed conv'd q/k/v into the same gdr core as _reference.
+    conv_bf = conv_out.to(torch.bfloat16)
+    out, state_out = _reference(
+        conv_bf, z, b_proj, a_proj, dt_bias, A_log, norm_weight, state,
+        num_key_heads, num_value_heads, key_dim, val_dim, eps,
+    )
+    return out, state_out, ring_out.to(conv_state.dtype)
+
+
+def _self_check_conv():
+    """Validate gdr_decode_conv_gated_norm (conv folded in front) + ping-pong ring."""
+    import torch
+
+    B, NKH, NVH, KD, VD, CK, EPS = 2, QWEN36_27B_NUM_KEY_HEADS, QWEN36_27B_NUM_VALUE_HEADS, \
+        QWEN36_27B_KEY_DIM, QWEN36_27B_VAL_DIM, QWEN36_27B_CONV_KERNEL, QWEN36_27B_RMS_EPS
+    q_dim = NKH * KD
+    qkv_stride = 2 * q_dim + NVH * VD
+    v_dim = NVH * VD
+    sw = CK - 1
+    dev = "cuda"
+    torch.manual_seed(1)
+    qkv = torch.randn(B, qkv_stride, dtype=torch.bfloat16, device=dev)
+    conv_w = torch.randn(qkv_stride, CK, dtype=torch.bfloat16, device=dev) * 0.3
+    conv_state = torch.randn(B, qkv_stride, sw, dtype=torch.bfloat16, device=dev)
+    z = torch.randn(B, v_dim, dtype=torch.bfloat16, device=dev)
+    bpr = torch.randn(B, NVH, dtype=torch.bfloat16, device=dev)
+    apr = torch.randn(B, NVH, dtype=torch.bfloat16, device=dev)
+    dtb = torch.randn(NVH, dtype=torch.bfloat16, device=dev)
+    alog = torch.randn(NVH, dtype=torch.float32, device=dev)
+    nw = torch.randn(VD, dtype=torch.float32, device=dev)
+    state0 = torch.randn(B, NVH, KD, VD, dtype=torch.float32, device=dev)
+
+    out_ref, state_ref, ring_ref = _reference_conv(
+        qkv, conv_w, conv_state, z, bpr, apr, dtb, alog, nw, state0,
+        NKH, NVH, KD, VD, CK, EPS,
+    )
+
+    kernel = tilelang.compile(gdr_decode_conv_gated_norm(B=B), target="cuda")
+    st = state0.clone()
+    out = torch.zeros(B, v_dim, dtype=torch.bfloat16, device=dev)
+    ring = torch.zeros(B, qkv_stride, sw, dtype=torch.bfloat16, device=dev)
+    kernel(qkv, conv_w, conv_state, ring, z, bpr, apr, dtb, alog, nw, st, out)
+    torch.cuda.synchronize()
+
+    for name, got, ref in (("out", out, out_ref), ("state", st, state_ref), ("ring", ring, ring_ref)):
+        g, r = got.float(), ref.float()
+        within = ((g - r).abs() <= 2e-2 + 2e-2 * r.abs()).float().mean().item()
+        assert within > 0.999, f"{name}: only {within*100:.2f}% within tol"
+    print("qwen36_gdr_decode_conv self-check PASSED (out+state+ring within bf16 tol)")
+
+
 if __name__ == "__main__":
     _self_check()
+    _self_check_conv()

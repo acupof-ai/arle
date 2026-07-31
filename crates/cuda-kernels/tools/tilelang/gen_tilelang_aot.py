@@ -26,6 +26,7 @@ import re
 import shlex
 import subprocess
 import sys
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -982,8 +983,10 @@ def run_batch(manifest_path: str) -> int:
                 s = fut_to_spec[fut]
                 try:
                     results.append(fut.result())
-                except Exception as e:  # noqa: BLE001 — collect all, report, fail
-                    errors.append((s.get("out_key", s.get("kernel_name", "?")), repr(e)))
+                except Exception:  # noqa: BLE001 — collect all, report, fail
+                    errors.append(
+                        (s.get("out_key", s.get("kernel_name", "?")), traceback.format_exc())
+                    )
     for out_key, func_name, c_path in results:
         print(f"RESULT\t{out_key}\t{func_name}\t{c_path}")
     if errors:

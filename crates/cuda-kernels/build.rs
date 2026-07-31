@@ -1404,11 +1404,11 @@ fn generate_tilelang_artifacts_per_sm(
                         )
                     });
                     println!("cargo:rerun-if-changed={}", base_spec.kernel_path);
-                    results.push(PerSmSlot::Resolved((
-                        sm_token.clone(),
-                        func,
-                        out_artifact_dir.join(format!("{per_sm_out_name}.cc")),
-                    )));
+                    let restored_c = out_artifact_dir.join(format!("{per_sm_out_name}.cc"));
+                    // Warm cache still populates generated/ under ARLE_KERNEL_VENDOR,
+                    // else kernel_artifacts.sh packs a bundle missing cache-hit kernels.
+                    vendor_artifact_dir(&restored_c);
+                    results.push(PerSmSlot::Resolved((sm_token.clone(), func, restored_c)));
                     continue;
                 }
                 Err(_) if !entry.exists() => {}
@@ -1552,25 +1552,15 @@ fn run_tilelang_batch(
         .arg(&generator_path)
         .arg("--batch")
         .arg(&manifest_path)
+        // Bound the generator's fan-out with the same policy as the nvcc pool.
+        // Without this ARLE_NVCC_PARALLEL is a dead knob for the batch phase and
+        // the Python side defaults to os.cpu_count() (ignores cgroup/affinity).
+        .env(
+            "ARLE_TILELANG_BATCH_WORKERS",
+            nvcc_parallelism(jobs.len()).to_string(),
+        )
         .output()
         .unwrap_or_else(|err| panic!("failed to spawn batched TileLang AOT generator: {err}"));
-    if !output.status.success() {
-        let mut sms: Vec<String> = jobs
-            .iter()
-            .map(|j| sm_to_arch_list_token(&j.sm_token))
-            .collect();
-        sms.sort();
-        sms.dedup();
-        panic!(
-            "batched TileLang AOT generator failed ({} kernels, SM tiers {}).\nstdout: {}\nstderr: {}\n\n\
-             Hint: bump tilelang (pin lives in pyproject.toml) OR exclude a failing SM via \
-             TORCH_CUDA_ARCH_LIST. See docs/environment.md.",
-            jobs.len(),
-            sms.join(";"),
-            String::from_utf8_lossy(&output.stdout).trim(),
-            String::from_utf8_lossy(&output.stderr).trim(),
-        );
-    }
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut map = HashMap::new();
     for line in stdout.lines() {
@@ -1583,6 +1573,32 @@ fn run_tilelang_batch(
                 );
             }
         }
+    }
+    if !output.status.success() {
+        // The generator emits RESULT for every kernel that compiled before the
+        // batch failed. Publish those to the persistent cache now so a re-run gets
+        // them as hits instead of recompiling the whole batch from scratch, then
+        // fail with the original error.
+        for job in jobs {
+            if map.contains_key(&job.out_key) {
+                let _ = finalize_regen_job(job, &map);
+            }
+        }
+        let mut sms: Vec<String> = jobs
+            .iter()
+            .map(|j| sm_to_arch_list_token(&j.sm_token))
+            .collect();
+        sms.sort();
+        sms.dedup();
+        panic!(
+            "batched TileLang AOT generator failed ({} kernels, SM tiers {}).\nstdout: {}\nstderr: {}\n\n\
+             Hint: bump tilelang (pin lives in pyproject.toml) OR exclude a failing SM via \
+             TORCH_CUDA_ARCH_LIST. See docs/environment.md.",
+            jobs.len(),
+            sms.join(";"),
+            stdout.trim(),
+            String::from_utf8_lossy(&output.stderr).trim(),
+        );
     }
     for job in jobs {
         if !map.contains_key(&job.out_key) {
@@ -1657,21 +1673,30 @@ fn finalize_regen_job(
 
     // ARLE_KERNEL_VENDOR=1: mirror the regenerated artifact into the (gitignored)
     // vendored tier so `scripts/kernel_artifacts.sh pack` can bundle it.
-    if env_truthy("ARLE_KERNEL_VENDOR") {
-        let manifest_dir = PathBuf::from(
-            std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR set by cargo"),
-        );
-        let src = c_path.parent().expect("artifact .c has a parent dir");
-        let dst = manifest_dir
-            .join("generated")
-            .join(src.file_name().expect("artifact dir has a name"));
-        if src != dst {
-            let _ = std::fs::remove_dir_all(&dst);
-            copy_dir_recursive(src, &dst)
-                .unwrap_or_else(|err| panic!("vendor export {}: {err}", dst.display()));
-        }
-    }
+    vendor_artifact_dir(&c_path);
     (job.sm_token.clone(), gen_func_name, c_path)
+}
+
+/// ARLE_KERNEL_VENDOR=1: mirror an artifact dir into the (gitignored) `generated/`
+/// vendored tier so `scripts/kernel_artifacts.sh pack` can bundle it. Called for
+/// BOTH freshly regenerated artifacts and cache-restored ones — a warm cache must
+/// still populate `generated/` or the packed bundle silently omits those kernels.
+fn vendor_artifact_dir(c_path: &Path) {
+    if !env_truthy("ARLE_KERNEL_VENDOR") {
+        return;
+    }
+    let manifest_dir = PathBuf::from(
+        std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR set by cargo"),
+    );
+    let src = c_path.parent().expect("artifact .c has a parent dir");
+    let dst = manifest_dir
+        .join("generated")
+        .join(src.file_name().expect("artifact dir has a name"));
+    if src != dst {
+        let _ = std::fs::remove_dir_all(&dst);
+        copy_dir_recursive(src, &dst)
+            .unwrap_or_else(|err| panic!("vendor export {}: {err}", dst.display()));
+    }
 }
 
 /// A kernel staged for the batched build: its per-SM slots (resolved now or

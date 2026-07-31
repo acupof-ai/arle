@@ -7,9 +7,9 @@ the h->HBM epilogue write of the unfused path is dropped (the fusion win).
 Per chunk (from Kernel A's u, w, gcs, plus q, k):
   v_new     = u - w @ h                        (delta correction against carried state)
   o_inter   = (q @ h) * exp(gcs)               (contribution from prior chunks)
-  o_intra   = tril( (q @ k^T) * exp(gcs_i - gcs_j), i>j ) @ v_new   (within chunk, causal)
+  o_intra   = tril( (q @ k^T) * exp(gcs_i - gcs_j), i>=j ) @ v_new  (within chunk, causal, inclusive)
   out       = (o_inter + o_intra) * scale
-  h         = h * exp(gcs_last) + k^T @ v_new  (gated decay + rank-chunk update)
+  h         = h * exp(gcs_last) + sum_r exp(gcs_last - gcs_r) k_r^T v_new_r  (gated decay)
 
 Contractions are per-thread serial loops (thread tv owns state column h[:, tv] and
 output column, val_dim threads), mirroring the validated decode/wy kernels —
@@ -97,7 +97,7 @@ def prefill_scan_o(
                     for d in T.serial(key_dim):
                         nq[0] += qn[tv, d] * qn[tv, d]
                         nk[0] += kn[tv, d] * kn[tv, d]
-                    rq = T.rsqrt(nq[0] + 1e-12) * scale
+                    rq = T.rsqrt(nq[0] + 1e-12)
                     rk = T.rsqrt(nk[0] + 1e-12)
                     for d in T.serial(key_dim):
                         qn[tv, d] = qn[tv, d] * rq
@@ -131,7 +131,7 @@ def prefill_scan_o(
                         for d in T.serial(key_dim):
                             qk[0] += qn[r, d] * kn[p, d]
                         contrib = T.if_then_else(
-                            p < r,
+                            p <= r,
                             qk[0] * T.exp(gcs_s[r] - gcs_s[p]) * vnew[p, tv],
                             0.0,
                         )
@@ -139,13 +139,17 @@ def prefill_scan_o(
                     out[bb, s0 + r, vh, tv] = (o_inter[0] + o_intra[0]) * scale
                 T.tvm_storage_sync("shared")
 
-                # state update: h[j,tv] = h[j,tv]*exp(gcs_last) + sum_r k[r,j]*v_new[r,tv]
+                # state update: h[j,tv] = h[j,tv]*exp(gcs_last)
+                #   + sum_r exp(gcs_last - gcs_r) * k[r,j] * v_new[r,tv]
+                # The per-token exp(gcs_last - gcs_r) decay carries each token's
+                # contribution forward to the chunk boundary (matches the decode
+                # recurrence S_C = exp(gcs_C) S_0 + sum_r exp(gcs_C - gcs_r) k_r w_r^T).
                 g_last = gcs_s[chunk - 1]
                 for j in T.serial(key_dim):
                     upd = T.alloc_local((1,), accum_dtype)
                     T.clear(upd)
                     for r in T.serial(chunk):
-                        upd[0] += kn[r, j] * vnew[r, tv]
+                        upd[0] += T.exp(g_last - gcs_s[r]) * kn[r, j] * vnew[r, tv]
                     h[j, tv] = h[j, tv] * T.exp(g_last) + upd[0]
                 T.tvm_storage_sync("shared")
 
@@ -178,7 +182,11 @@ def _self_check():
         gcs_in[:, sl] = torch.cumsum(g[:, sl], dim=1)
     h0 = torch.randn(B, NVH, KD, VD, dtype=torch.float32, device=dev) * 0.1
 
-    # reference
+    # Reference derived directly from the gated-delta-rule chunk recurrence
+    # (matches the in-tree oracle gated_delta_rule.py, NOT this file's kernel):
+    #   - q L2-normalized with no extra scale; scale applied once in the epilogue
+    #   - intra-chunk causal mask is inclusive (i >= j): token r keeps its own delta
+    #   - state carries each token forward with exp(gcs_last - gcs_r)
     out_ref = torch.zeros(B, S, NVH, VD, dtype=torch.float32, device=dev)
     hT_ref = torch.zeros(B, NVH, KD, VD, dtype=torch.float32, device=dev)
     for b in range(B):
@@ -189,7 +197,7 @@ def _self_check():
                 sl = slice(ct * C, (ct + 1) * C)
                 qc = q[b, sl, kh].float()
                 kc = k[b, sl, kh].float()
-                qc = qc * torch.rsqrt((qc * qc).sum(-1, keepdim=True) + 1e-12) * scale
+                qc = qc * torch.rsqrt((qc * qc).sum(-1, keepdim=True) + 1e-12)
                 kc = kc * torch.rsqrt((kc * kc).sum(-1, keepdim=True) + 1e-12)
                 uc = u[b, sl, vh]
                 wc = w[b, sl, vh]
@@ -197,12 +205,13 @@ def _self_check():
                 vnew = uc - wc @ h                       # [C,VD]
                 o_inter = (qc @ h) * torch.exp(gcs)[:, None]
                 qk = qc @ kc.T                           # [C,C]
-                mask = torch.tril(torch.ones(C, C, device=dev), diagonal=-1)
+                mask = torch.tril(torch.ones(C, C, device=dev), diagonal=0)
                 gdiff = gcs[:, None] - gcs[None, :]
                 A = qk * torch.exp(gdiff) * mask
                 o_intra = A @ vnew
                 out_ref[b, sl, vh] = (o_inter + o_intra) * scale
-                h = h * torch.exp(gcs[-1]) + kc.T @ vnew
+                decay = torch.exp(gcs[-1] - gcs)[:, None]  # [C,1] per-token
+                h = h * torch.exp(gcs[-1]) + kc.T @ (decay * vnew)
             hT_ref[b, vh] = h
 
     kernel = tilelang.compile(prefill_scan_o(S=S, B=B), target="cuda")
