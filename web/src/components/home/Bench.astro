@@ -44,6 +44,15 @@ const tagClass = (s: BenchRow["stability"]) =>
     border: 1px solid var(--line);
     padding: 22px 24px;
     background: var(--paper);
+    transition: transform var(--t-base), border-color var(--t-base);
+  }
+  .card:hover {
+    transform: translateY(-2px);
+    border-color: var(--ink);
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .card { transition: border-color var(--t-base); }
+    .card:hover { transform: none; }
   }
   .h {
     display: flex;
