@@ -12,7 +12,7 @@ use autograd::{
     AutogradError, Device, Tape, Tensor, TensorId, TensorStore,
     ops::{
         LinearAttentionParams, MoeGroupedLinearExpert, MoeGroupedLinearInput, MoeGroupedRoute,
-        MoeTopK, add, add_broadcast, all_reduce_sum, cat_seq, causal_sdpa_recompute,
+        MoeTopK, add, add_broadcast, cat_seq, causal_sdpa_recompute,
         causal_sdpa_recompute_with_q_start, causal_sdpa_with_q_start, checkpoint_sequential,
         embedding, linear_attention_boundary, linear_attention_core,
         linear_attention_core_with_carry, linear_attention_core_with_carry_taped,
@@ -30,6 +30,7 @@ use thiserror::Error;
 use crate::lora::{
     LinearWithLora, LoraConfig, LoraTargetSet, leak_name, next_uniform, seed_from_name,
 };
+use crate::tensor_parallel::{TpContext, maybe_all_reduce};
 
 #[derive(Debug, Error)]
 pub enum Qwen35Error {
@@ -179,38 +180,23 @@ impl SequenceWindow {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Qwen35TensorParallelConfig {
-    pub rank: usize,
-    pub world_size: usize,
+/// Qwen3.5/3.6-specific TP dimension math: apply the mesh-level `TpContext`
+/// (from `crate::tensor_parallel`) to this model's head/intermediate dimensions.
+/// The coordinate view + `divide`/`maybe_all_reduce` are model-agnostic and live
+/// in `tensor_parallel`; only these `Qwen35Config`-reading shard sizes are here.
+trait Qwen35TpDims {
+    fn validate(self, cfg: &Qwen35Config) -> Result<()>;
+    fn local_attention_heads(self, cfg: &Qwen35Config) -> Result<usize>;
+    fn local_key_value_heads(self, cfg: &Qwen35Config) -> Result<usize>;
+    fn local_intermediate_size(self, cfg: &Qwen35Config) -> Result<usize>;
+    fn local_moe_intermediate_size(self, cfg: &Qwen35Config) -> Result<usize>;
+    fn local_shared_expert_intermediate_size(self, cfg: &Qwen35Config) -> Result<usize>;
+    fn full_attn_q_proj_dim(self, cfg: &Qwen35Config) -> Result<usize>;
+    fn full_attn_q_dim(self, cfg: &Qwen35Config) -> Result<usize>;
+    fn full_attn_kv_dim(self, cfg: &Qwen35Config) -> Result<usize>;
 }
 
-impl Qwen35TensorParallelConfig {
-    pub const fn single() -> Self {
-        Self {
-            rank: 0,
-            world_size: 1,
-        }
-    }
-
-    pub const fn new(rank: usize, world_size: usize) -> Self {
-        Self { rank, world_size }
-    }
-
-    /// TP placement from the one device mesh: the attention-TP sub-axis of
-    /// `infer_topo` (`attn_tp_rank` / `attn_tp_size`), so train and serve derive
-    /// TP coordinates from a single `MultiAxisConfig` instead of two private configs.
-    pub fn from_coord(cfg: infer_topo::MultiAxisConfig, coord: infer_topo::RankCoord) -> Self {
-        Self {
-            rank: coord.attn_tp_rank,
-            world_size: cfg.attn_tp_size(),
-        }
-    }
-
-    pub fn is_enabled(self) -> bool {
-        self.world_size > 1
-    }
-
+impl Qwen35TpDims for TpContext {
     fn validate(self, cfg: &Qwen35Config) -> Result<()> {
         if self.world_size == 0 {
             return Err(Qwen35Error::InvalidConfig(
@@ -241,43 +227,38 @@ impl Qwen35TensorParallelConfig {
     }
 
     fn local_attention_heads(self, cfg: &Qwen35Config) -> Result<usize> {
-        divide_tp(
-            cfg.num_attention_heads,
-            self.world_size,
-            "num_attention_heads must divide tensor-parallel world size",
-        )
+        self.divide(cfg.num_attention_heads)
+            .ok_or(Qwen35Error::InvalidConfig(
+                "num_attention_heads must divide tensor-parallel world size",
+            ))
     }
 
     fn local_key_value_heads(self, cfg: &Qwen35Config) -> Result<usize> {
-        divide_tp(
-            cfg.num_key_value_heads,
-            self.world_size,
-            "num_key_value_heads must divide tensor-parallel world size",
-        )
+        self.divide(cfg.num_key_value_heads)
+            .ok_or(Qwen35Error::InvalidConfig(
+                "num_key_value_heads must divide tensor-parallel world size",
+            ))
     }
 
     fn local_intermediate_size(self, cfg: &Qwen35Config) -> Result<usize> {
-        divide_tp(
-            cfg.intermediate_size,
-            self.world_size,
-            "intermediate_size must divide tensor-parallel world size",
-        )
+        self.divide(cfg.intermediate_size)
+            .ok_or(Qwen35Error::InvalidConfig(
+                "intermediate_size must divide tensor-parallel world size",
+            ))
     }
 
     fn local_moe_intermediate_size(self, cfg: &Qwen35Config) -> Result<usize> {
-        divide_tp(
-            cfg.moe_intermediate_size,
-            self.world_size,
-            "moe_intermediate_size must divide tensor-parallel world size",
-        )
+        self.divide(cfg.moe_intermediate_size)
+            .ok_or(Qwen35Error::InvalidConfig(
+                "moe_intermediate_size must divide tensor-parallel world size",
+            ))
     }
 
     fn local_shared_expert_intermediate_size(self, cfg: &Qwen35Config) -> Result<usize> {
-        divide_tp(
-            cfg.shared_expert_intermediate_size,
-            self.world_size,
-            "shared_expert_intermediate_size must divide tensor-parallel world size",
-        )
+        self.divide(cfg.shared_expert_intermediate_size)
+            .ok_or(Qwen35Error::InvalidConfig(
+                "shared_expert_intermediate_size must divide tensor-parallel world size",
+            ))
     }
 
     fn full_attn_q_proj_dim(self, cfg: &Qwen35Config) -> Result<usize> {
@@ -295,26 +276,6 @@ impl Qwen35TensorParallelConfig {
 
     fn full_attn_kv_dim(self, cfg: &Qwen35Config) -> Result<usize> {
         Ok(self.local_key_value_heads(cfg)? * cfg.head_dim)
-    }
-}
-
-fn divide_tp(value: usize, world_size: usize, message: &'static str) -> Result<usize> {
-    if world_size == 0 || !value.is_multiple_of(world_size) {
-        return Err(Qwen35Error::InvalidConfig(message));
-    }
-    Ok(value / world_size)
-}
-
-fn maybe_tp_all_reduce(
-    x: TensorId,
-    tp: Qwen35TensorParallelConfig,
-    store: &mut TensorStore,
-    tape: &mut Tape,
-) -> Result<TensorId> {
-    if tp.is_enabled() {
-        Ok(all_reduce_sum(x, store, tape)?)
-    } else {
-        Ok(x)
     }
 }
 
@@ -598,7 +559,7 @@ impl Qwen35Layer {
         &self,
         x: TensorId,
         cfg: &Qwen35Config,
-        tp: Qwen35TensorParallelConfig,
+        tp: TpContext,
         cp: crate::context_parallel::CpContext,
         cos: TensorId,
         sin: TensorId,
@@ -697,7 +658,7 @@ impl Qwen35Layer {
         &self,
         x: TensorId,
         cfg: &Qwen35Config,
-        tp: Qwen35TensorParallelConfig,
+        tp: TpContext,
         cos_prefix: TensorId,
         sin_prefix: TensorId,
         batch: usize,
@@ -768,7 +729,7 @@ impl Qwen35Layer {
         &self,
         x: TensorId,
         cfg: &Qwen35Config,
-        tp: Qwen35TensorParallelConfig,
+        tp: TpContext,
         cos_gen: TensorId,
         sin_gen: TensorId,
         layer_prefix: &LayerPrefix,
@@ -820,7 +781,7 @@ impl Qwen35Layer {
         layer_index: usize,
         x: TensorId,
         cfg: &Qwen35Config,
-        tp: Qwen35TensorParallelConfig,
+        tp: TpContext,
         cos: TensorId,
         sin: TensorId,
         trace: bool,
@@ -936,7 +897,7 @@ impl Qwen35Layer {
         layer_index: usize,
         x: TensorId,
         cfg: &Qwen35Config,
-        tp: Qwen35TensorParallelConfig,
+        tp: TpContext,
         cos: TensorId,
         sin: TensorId,
         route_signatures: &mut Vec<Qwen35MoeRouteSignature>,
@@ -1014,7 +975,7 @@ impl Qwen35Layer {
         layer_index: usize,
         x: TensorId,
         cfg: &Qwen35Config,
-        tp: Qwen35TensorParallelConfig,
+        tp: TpContext,
         cos: TensorId,
         sin: TensorId,
         frozen_routes: &[Qwen35MoeRouteSignature],
@@ -1144,15 +1105,7 @@ impl Qwen35Layer {
             store,
             tape,
         )?;
-        let mlp_out = self.forward_mlp(
-            h,
-            cfg,
-            Qwen35TensorParallelConfig::single(),
-            batch,
-            seq_len,
-            store,
-            tape,
-        )?;
+        let mlp_out = self.forward_mlp(h, cfg, TpContext::single(), batch, seq_len, store, tape)?;
         Ok(add(x, mlp_out, store, tape)?)
     }
 
@@ -1231,15 +1184,7 @@ impl Qwen35Layer {
         profile.post_attention_rmsnorm += started.elapsed();
 
         let started = Instant::now();
-        let mlp_out = self.forward_mlp(
-            h,
-            cfg,
-            Qwen35TensorParallelConfig::single(),
-            batch,
-            seq_len,
-            store,
-            tape,
-        )?;
+        let mlp_out = self.forward_mlp(h, cfg, TpContext::single(), batch, seq_len, store, tape)?;
         profile.mlp += started.elapsed();
 
         let started = Instant::now();
@@ -1253,7 +1198,7 @@ impl Qwen35Layer {
         &self,
         h: TensorId,
         cfg: &Qwen35Config,
-        tp: Qwen35TensorParallelConfig,
+        tp: TpContext,
         batch: usize,
         seq_len: usize,
         store: &mut TensorStore,
@@ -1273,7 +1218,7 @@ impl Qwen35Layer {
                         store.free(id)?;
                     }
                 }
-                maybe_tp_all_reduce(mlp_out, tp, store, tape)
+                Ok(maybe_all_reduce(mlp_out, tp, store, tape)?)
             }
             Qwen35Mlp::Sparse(mlp) => {
                 self.forward_sparse_mlp(mlp, h, cfg, tp, batch, seq_len, store, tape)
@@ -1287,7 +1232,7 @@ impl Qwen35Layer {
         layer_index: usize,
         h: TensorId,
         cfg: &Qwen35Config,
-        tp: Qwen35TensorParallelConfig,
+        tp: TpContext,
         batch: usize,
         seq_len: usize,
         route_signatures: &mut Vec<Qwen35MoeRouteSignature>,
@@ -1317,7 +1262,7 @@ impl Qwen35Layer {
         layer_index: usize,
         h: TensorId,
         cfg: &Qwen35Config,
-        tp: Qwen35TensorParallelConfig,
+        tp: TpContext,
         batch: usize,
         seq_len: usize,
         frozen_routes: &[Qwen35MoeRouteSignature],
@@ -1355,7 +1300,7 @@ impl Qwen35Layer {
         mlp: &Qwen35SparseMlp,
         h: TensorId,
         cfg: &Qwen35Config,
-        tp: Qwen35TensorParallelConfig,
+        tp: TpContext,
         batch: usize,
         seq_len: usize,
         store: &mut TensorStore,
@@ -1420,7 +1365,7 @@ impl Qwen35Layer {
         // Row-parallel down_proj (routed + shared) yields per-rank partial sums;
         // one all-reduce on their sum completes both across the TP group.
         let out = add(routed, shared, store, tape)?;
-        let out = maybe_tp_all_reduce(out, tp, store, tape)?;
+        let out = maybe_all_reduce(out, tp, store, tape)?;
         Ok(reshape(
             out,
             &[batch, seq_len, cfg.hidden_size],
@@ -1436,7 +1381,7 @@ impl Qwen35Layer {
         mlp: &Qwen35SparseMlp,
         h: TensorId,
         cfg: &Qwen35Config,
-        tp: Qwen35TensorParallelConfig,
+        tp: TpContext,
         batch: usize,
         seq_len: usize,
         route_signatures: &mut Vec<Qwen35MoeRouteSignature>,
@@ -1507,7 +1452,7 @@ impl Qwen35Layer {
         let shared = mul(shared, shared_expert_gate, store, tape)?;
 
         let out = add(routed, shared, store, tape)?;
-        let out = maybe_tp_all_reduce(out, tp, store, tape)?;
+        let out = maybe_all_reduce(out, tp, store, tape)?;
         Ok(reshape(
             out,
             &[batch, seq_len, cfg.hidden_size],
@@ -1523,7 +1468,7 @@ impl Qwen35Layer {
         mlp: &Qwen35SparseMlp,
         h: TensorId,
         cfg: &Qwen35Config,
-        tp: Qwen35TensorParallelConfig,
+        tp: TpContext,
         batch: usize,
         seq_len: usize,
         route: &Qwen35MoeRouteSignature,
@@ -1595,7 +1540,7 @@ impl Qwen35Layer {
         let shared = mul(shared, shared_expert_gate, store, tape)?;
 
         let out = add(routed, shared, store, tape)?;
-        let out = maybe_tp_all_reduce(out, tp, store, tape)?;
+        let out = maybe_all_reduce(out, tp, store, tape)?;
         Ok(reshape(
             out,
             &[batch, seq_len, cfg.hidden_size],
@@ -1609,7 +1554,7 @@ impl Qwen35Layer {
         h: TensorId,
         attn: &Qwen35FullAttention,
         cfg: &Qwen35Config,
-        tp: Qwen35TensorParallelConfig,
+        tp: TpContext,
         cp: crate::context_parallel::CpContext,
         cos: TensorId,
         sin: TensorId,
@@ -1775,7 +1720,7 @@ impl Qwen35Layer {
             tape,
         )?;
         let out = attn.o_proj.forward(attn_hidden, store, tape)?;
-        maybe_tp_all_reduce(out, tp, store, tape)
+        Ok(maybe_all_reduce(out, tp, store, tape)?)
     }
 
     /// Long-sequence single-GPU full attention: k/v are computed full-sequence
@@ -1789,7 +1734,7 @@ impl Qwen35Layer {
         h: TensorId,
         attn: &Qwen35FullAttention,
         cfg: &Qwen35Config,
-        tp: Qwen35TensorParallelConfig,
+        tp: TpContext,
         cos: TensorId,
         sin: TensorId,
         batch: usize,
@@ -1951,7 +1896,7 @@ impl Qwen35Layer {
             },
         )?;
 
-        maybe_tp_all_reduce(out, tp, store, tape)
+        Ok(maybe_all_reduce(out, tp, store, tape)?)
     }
 
     /// OPD frozen-prompt-KV phase 1: compute the prompt prefix's repeat_kv'd K/V
@@ -1965,7 +1910,7 @@ impl Qwen35Layer {
         h_prefix: TensorId,
         attn: &Qwen35FullAttention,
         cfg: &Qwen35Config,
-        tp: Qwen35TensorParallelConfig,
+        tp: TpContext,
         cos_prefix: TensorId,
         sin_prefix: TensorId,
         batch: usize,
@@ -2022,7 +1967,7 @@ impl Qwen35Layer {
         h_gen: TensorId,
         attn: &Qwen35FullAttention,
         cfg: &Qwen35Config,
-        tp: Qwen35TensorParallelConfig,
+        tp: TpContext,
         cos_gen: TensorId,
         sin_gen: TensorId,
         prefix_kv: &PrefixKv,
@@ -2124,7 +2069,7 @@ impl Qwen35Layer {
             tape,
         )?;
         let out = attn.o_proj.forward(attn_hidden, store, tape)?;
-        maybe_tp_all_reduce(out, tp, store, tape)
+        Ok(maybe_all_reduce(out, tp, store, tape)?)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2134,7 +2079,7 @@ impl Qwen35Layer {
         h: TensorId,
         attn: &Qwen35FullAttention,
         cfg: &Qwen35Config,
-        tp: Qwen35TensorParallelConfig,
+        tp: TpContext,
         cos: TensorId,
         sin: TensorId,
         batch: usize,
@@ -2270,7 +2215,7 @@ impl Qwen35Layer {
 
         let started = Instant::now();
         let out = attn.o_proj.forward(attn_hidden, store, tape)?;
-        let out = maybe_tp_all_reduce(out, tp, store, tape)?;
+        let out = maybe_all_reduce(out, tp, store, tape)?;
         profile.o_proj += started.elapsed();
         trace_attention_component(trace, layer_index, "o_proj", profile.o_proj);
         Ok(out)
@@ -2822,7 +2767,7 @@ impl Qwen35Layer {
 #[derive(Debug, Clone)]
 pub struct Qwen35Model {
     config: Qwen35Config,
-    tp: Qwen35TensorParallelConfig,
+    tp: TpContext,
     cp: crate::context_parallel::CpContext,
     lora: Option<LoraConfig>,
     lora_target_set: LoraTargetSet,
@@ -2879,7 +2824,7 @@ fn la_layer_peak_bytes(cfg: &Qwen35Config, batch: usize, seq_len: usize) -> usiz
 /// downstream is chunk-bounded.
 fn full_attn_layer_peak_bytes(
     cfg: &Qwen35Config,
-    tp: Qwen35TensorParallelConfig,
+    tp: TpContext,
     batch: usize,
     seq_len: usize,
 ) -> Result<usize> {
@@ -2898,7 +2843,7 @@ impl Qwen35Model {
             LoraTargetSet::AllLinear,
             None,
             false,
-            Qwen35TensorParallelConfig::single(),
+            TpContext::single(),
             Qwen35InitMode::ScratchTrain,
             store,
         )
@@ -2908,7 +2853,7 @@ impl Qwen35Model {
         &self.config
     }
 
-    pub fn tensor_parallel(&self) -> Qwen35TensorParallelConfig {
+    pub fn tensor_parallel(&self) -> TpContext {
         self.tp
     }
 
@@ -3112,7 +3057,7 @@ impl Qwen35Model {
             LoraTargetSet::AllLinear,
             None,
             false,
-            Qwen35TensorParallelConfig::single(),
+            TpContext::single(),
             Qwen35InitMode::LoraOrFrozen {
                 materialize_frozen_base: true,
             },
@@ -3130,7 +3075,7 @@ impl Qwen35Model {
             LoraTargetSet::AllLinear,
             None,
             false,
-            Qwen35TensorParallelConfig::single(),
+            TpContext::single(),
             Qwen35InitMode::LoraOrFrozen {
                 materialize_frozen_base: false,
             },
@@ -3149,7 +3094,7 @@ impl Qwen35Model {
             LoraTargetSet::AllLinear,
             None,
             false,
-            Qwen35TensorParallelConfig::single(),
+            TpContext::single(),
             Qwen35InitMode::LoraOrFrozen {
                 materialize_frozen_base: true,
             },
@@ -3179,7 +3124,7 @@ impl Qwen35Model {
             target_set,
             lora_layer_start,
             false,
-            Qwen35TensorParallelConfig::single(),
+            TpContext::single(),
             Qwen35InitMode::LoraOrFrozen {
                 materialize_frozen_base: true,
             },
@@ -3218,7 +3163,7 @@ impl Qwen35Model {
             target_set,
             lora_layer_start,
             lora_skip_experts,
-            Qwen35TensorParallelConfig::single(),
+            TpContext::single(),
             Qwen35InitMode::LoraOrFrozen {
                 materialize_frozen_base: false,
             },
@@ -3231,7 +3176,7 @@ impl Qwen35Model {
         cfg: &Qwen35Config,
         lora: LoraConfig,
         target_set: LoraTargetSet,
-        tp: Qwen35TensorParallelConfig,
+        tp: TpContext,
         store: &mut TensorStore,
     ) -> Result<Self> {
         Self::new_with_lora_targets_and_tp_layer_start(cfg, lora, target_set, None, tp, store)
@@ -3243,7 +3188,7 @@ impl Qwen35Model {
         lora: LoraConfig,
         target_set: LoraTargetSet,
         lora_layer_start: Option<usize>,
-        tp: Qwen35TensorParallelConfig,
+        tp: TpContext,
         store: &mut TensorStore,
     ) -> Result<Self> {
         Self::new_internal(
@@ -3302,7 +3247,7 @@ impl Qwen35Model {
         lora_target_set: LoraTargetSet,
         lora_layer_start: Option<usize>,
         lora_skip_experts: bool,
-        tp: Qwen35TensorParallelConfig,
+        tp: TpContext,
         mode: Qwen35InitMode,
         store: &mut TensorStore,
     ) -> Result<Self> {
@@ -5272,7 +5217,7 @@ fn linear_with_base_init(
 fn new_sparse_mlp(
     names: &Qwen35MoeTensorNames,
     cfg: &Qwen35Config,
-    tp: Qwen35TensorParallelConfig,
+    tp: TpContext,
     base_requires_grad: bool,
     materialize_frozen_base: bool,
     lora: Option<LoraConfig>,

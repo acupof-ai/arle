@@ -31,7 +31,8 @@ use train::{
     context_parallel::CpContext,
     lora::{LoraConfig, LoraTargetSet},
     opd::{WritebackLoss, masked_writeback_step},
-    qwen35::{Qwen35Model, Qwen35TensorParallelConfig},
+    qwen35::Qwen35Model,
+    tensor_parallel::TpContext,
 };
 
 #[cfg(all(feature = "cuda", feature = "nccl"))]
@@ -159,7 +160,7 @@ fn run_writeback_in(mut store: TensorStore, cp: CpContext) -> Result<f32> {
             alpha: 4.0,
         },
         LoraTargetSet::AllLinear,
-        Qwen35TensorParallelConfig::single(),
+        TpContext::single(),
         &mut store,
     )?;
     let all_params = model.all_parameter_ids();

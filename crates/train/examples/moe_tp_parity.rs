@@ -30,7 +30,8 @@ use qwen35_spec::{LayerType, Qwen35Config};
 #[cfg(all(feature = "cuda", feature = "nccl"))]
 use train::{
     lora::{LoraConfig, LoraTargetSet},
-    qwen35::{Qwen35Model, Qwen35TensorParallelConfig},
+    qwen35::Qwen35Model,
+    tensor_parallel::TpContext,
 };
 
 #[cfg(all(feature = "cuda", feature = "nccl"))]
@@ -240,7 +241,7 @@ fn rank_main(rank: usize) -> Result<()> {
     let mut tape = Tape::new();
 
     let cfg = tiny_moe_config();
-    let tp = Qwen35TensorParallelConfig::new(rank, world);
+    let tp = TpContext::new(rank, world);
     let model = Qwen35Model::new_with_lora_targets_and_tp(
         &cfg,
         LoraConfig {
