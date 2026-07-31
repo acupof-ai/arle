@@ -47,6 +47,8 @@ pub mod qwen35;
 pub mod qwen35_checkpoint;
 #[path = "qwen35_loader.rs"]
 pub mod qwen35_loader;
+#[path = "tensor_parallel.rs"]
+pub mod tensor_parallel;
 // CLI-driven runtime toggles (train flags -> statics; no env reads).
 #[path = "runtime_flags.rs"]
 mod runtime_flags;
