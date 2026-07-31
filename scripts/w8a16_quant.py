@@ -71,9 +71,12 @@ def quant_weight_names(ref_dir: Path) -> set[str]:
 
 
 # When no quantized reference exists, quantize all 2D linear .weight tensors
-# except these — embed/lm_head set logits/inputs directly, norms are 1D; all
-# stay high-precision (mirrors DeepSeek's FP8 scope).
-ALL_LINEAR_SKIP = ("embed", "lm_head", "norm", "gate.weight")
+# except these — embed/lm_head set logits/inputs directly, norms are 1D, and the
+# linear-attn in_proj_a/in_proj_b are per-v-head scalar gates the CUDA loader
+# deliberately loads BF16-only (qwen35.rs load_matrix, not _quant_aware). Quant
+# scope MUST NOT exceed the loader's quant-aware coverage or serve reads I8 bytes
+# through the BF16 path and crashes. All stay high-precision (DeepSeek FP8 scope).
+ALL_LINEAR_SKIP = ("embed", "lm_head", "norm", "gate.weight", "in_proj_a", "in_proj_b", "conv1d")
 
 
 def all_linear_names(bf16_dir: Path) -> set[str]:
