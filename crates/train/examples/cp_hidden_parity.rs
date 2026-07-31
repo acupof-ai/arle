@@ -17,7 +17,7 @@
 #[cfg(all(feature = "cuda", feature = "nccl"))]
 use anyhow::{Context, Result, ensure};
 #[cfg(all(feature = "cuda", feature = "nccl"))]
-use autograd::{TensorStore, backend_cuda::CudaBackend, tape::Tape};
+use autograd::{Tensor, TensorStore, backend_cuda::CudaBackend, tape::Tape};
 #[cfg(all(feature = "cuda", feature = "nccl"))]
 use cuda_kernels::ffi::nccl;
 #[cfg(all(feature = "cuda", feature = "nccl"))]
@@ -308,7 +308,10 @@ fn coordinator_main() -> Result<()> {
     // diverges from CE(cpu)) or the device CE PATH is wrong (all three CEs agree
     // here, but nd_parallel's device CE still diverges). This CE is f32 on all
     // inputs, so it isolates the hidden from the device CE kernel.
-    let targets: Vec<(usize, usize)> = (3..=SEQ - 2).map(|p| (p, (p * 3 + 1) % vocab)).collect();
+    // Use the REAL trajectory targets (full[p+1]) so these CE values are directly
+    // comparable to nd_parallel_parity's loss_f32/loss_single/loss_cp_sum.
+    let full = full_tokens();
+    let targets: Vec<(usize, usize)> = (3..=SEQ - 2).map(|p| (p, full[p + 1] as usize)).collect();
     let ce = |hidden: &[f32]| -> f32 {
         let n = targets.len() as f32;
         let mut sum = 0.0f32;
@@ -336,6 +339,70 @@ fn coordinator_main() -> Result<()> {
         (ce_cp - ce_cpu).abs() / ce_cpu.abs().max(1e-6),
         (ce_single - ce_cpu).abs() / ce_cpu.abs().max(1e-6)
     );
+
+    // Reproduce nd_parallel's DEVICE CE aggregation in-process on the SAME
+    // (correct) CP hidden: assemble cp_full on a CUDA store, then (a) run the device
+    // fused CE over ALL targets in one call (= single-card structure), and (b) run
+    // it per-zigzag-shard with local_of-remapped indices + inv_n=1/global and SUM
+    // (= exactly nd_parallel's CP path). If (a) ≈ ce_cpu but (b) diverges, the bug
+    // is the per-shard device CE aggregation (local_of remap / inv_n / reduction),
+    // not the kernel and not the hidden — pinned without another nd_parallel run.
+    {
+        use autograd::ops::fused_linear_distill::fused_linear_ce_loss_indexed;
+        let global_n = targets.len();
+        let inv_n = 1.0f32 / global_n as f32;
+        let dev_ce = |store: &mut TensorStore,
+                      h: &[f32],
+                      rows: usize,
+                      pos: &[i32],
+                      tgt: &[i32],
+                      inv: Option<f32>|
+         -> f32 {
+            let hid =
+                store.alloc(Tensor::new(h.to_vec(), vec![1, rows, hidden_size], false).unwrap());
+            let w =
+                store.alloc(Tensor::new(lm_head.clone(), vec![vocab, hidden_size], false).unwrap());
+            let mut tape = Tape::new();
+            tape.set_enabled(false);
+            let l =
+                fused_linear_ce_loss_indexed(hid, w, pos, tgt, 64, inv, store, &mut tape).unwrap();
+            store.to_host(l).unwrap()[0]
+        };
+        // (a) whole-seq device CE over cp_full (single-card structure).
+        let backend = CudaBackend::new(devices[0]).unwrap();
+        let mut s = TensorStore::with_backend(std::sync::Arc::new(backend));
+        let (pa, ta): (Vec<i32>, Vec<i32>) =
+            targets.iter().map(|&(p, t)| (p as i32, t as i32)).unzip();
+        let dev_whole = dev_ce(&mut s, &cp_full, SEQ, &pa, &ta, None);
+        // (b) per-shard device CE with local_of remap, inv_n=1/global, summed.
+        let mut dev_shardsum = 0.0f32;
+        for rank in 0..CP_SIZE {
+            let shard = CpContext::new(rank, CP_SIZE).shard(SEQ);
+            let rws = shard.local_rows();
+            let mut sh = Vec::with_capacity(rws.len() * hidden_size);
+            for &r in &rws {
+                sh.extend_from_slice(&cp_full[r * hidden_size..(r + 1) * hidden_size]);
+            }
+            let (pp, tt): (Vec<i32>, Vec<i32>) = targets
+                .iter()
+                .filter_map(|&(p, t)| shard.local_of(p).map(|l| (l as i32, t as i32)))
+                .unzip();
+            if pp.is_empty() {
+                continue;
+            }
+            let backend = CudaBackend::new(devices[0]).unwrap();
+            let mut s2 = TensorStore::with_backend(std::sync::Arc::new(backend));
+            dev_shardsum += dev_ce(&mut s2, &sh, rws.len(), &pp, &tt, Some(inv_n));
+        }
+        println!(
+            "DEVICE CE on cp_full: whole_seq={dev_whole:.6e} per_shard_sum={dev_shardsum:.6e} host_ce_cp={ce_cp:.6e}"
+        );
+        println!(
+            "  device_whole_vs_host={:.3e}  device_shardsum_vs_host={:.3e}  (shardsum is nd_parallel's exact CP path; if it diverges, the per-shard device CE aggregation is the bug)",
+            (dev_whole - ce_cp).abs() / ce_cp.abs().max(1e-6),
+            (dev_shardsum - ce_cp).abs() / ce_cp.abs().max(1e-6)
+        );
+    }
 
     // The real correctness question: is CP as close to f32 as single-card is? If
     // cp_vs_cpu <= single_vs_cpu (within tol), CP is not the wrong one — the
