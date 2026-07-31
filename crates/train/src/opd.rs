@@ -3109,22 +3109,19 @@ pub fn masked_writeback_step<O: Optimizer>(
             )));
         }
     }
-    // Map each masked target to its local hidden row. Under CP the shard is zigzag,
-    // so `local_of` (position → local row via the chunk map) replaces a contiguous
-    // `p - start`; off-CP `shard` is the whole sequence and `local_of(p) == p -
-    // gen_start` after the frozen-prompt rebase. Off-CP with frozen-prompt-KV the
-    // gen segment rebases by gen_start; CP disables frozen so gen_start==0 there.
-    let (position_indices, target_tokens): (Vec<i32>, Vec<i32>) = if cp.is_enabled() {
-        loss_targets
-            .iter()
-            .filter_map(|&(p, target)| shard.local_of(p).map(|local| (local as i32, target as i32)))
-            .unzip()
-    } else {
-        loss_targets
-            .iter()
-            .map(|&(p, target)| ((p - gen_start) as i32, target as i32))
-            .unzip()
-    };
+    // Map each masked target to its local hidden row. `shard.local_of` handles both
+    // paths: under CP the shard is zigzag so it maps position→local row via the chunk
+    // map (and gen_start==0, frozen disabled); off-CP the shard is the whole sequence
+    // so local_of(p)==Some(p) and the `- gen_start` rebases into the frozen-prompt gen
+    // segment. Every frozen target p >= gen_start, so the subtraction can't underflow.
+    let (position_indices, target_tokens): (Vec<i32>, Vec<i32>) = loss_targets
+        .iter()
+        .filter_map(|&(p, target)| {
+            shard
+                .local_of(p)
+                .map(|local| ((local - gen_start) as i32, target as i32))
+        })
+        .unzip();
 
     let mut tape = Tape::new();
     // Offload per-layer grad-checkpoints to host RAM only past a length that needs

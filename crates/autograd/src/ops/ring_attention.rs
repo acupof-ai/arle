@@ -469,7 +469,8 @@ pub(crate) fn cp_ring_attention_backward(
     };
     let (q, lse, out, rows, dim, cp_size, _cp_rank) =
         (*q, *lse, *out, *rows, *dim, *cp_size, *cp_rank);
-    let q_pos = q_pos.clone();
+    // Borrowed from `entry` — independent of the `&mut store` calls below, so no clone.
+    let q_pos: &[usize] = q_pos;
 
     if store.backend().device() == Device::Cuda && cp_size > 1 {
         return cp_ring_attention_backward_device(
@@ -481,7 +482,7 @@ pub(crate) fn cp_ring_attention_backward(
             output_grad_id,
             rows,
             dim,
-            &q_pos,
+            q_pos,
             cp_size,
             store,
         );
@@ -489,7 +490,7 @@ pub(crate) fn cp_ring_attention_backward(
 
     // world==1: one local block covers everything (host reference path).
     let (k, v, k_pos) = &blocks[0];
-    let (k, v, k_pos) = (*k, *v, k_pos.clone());
+    let (k, v, k_pos) = (*k, *v, k_pos.as_slice());
     let need = store.tensor(q)?.requires_grad
         || store.tensor(k)?.requires_grad
         || store.tensor(v)?.requires_grad;
@@ -517,7 +518,7 @@ pub(crate) fn cp_ring_attention_backward(
         let blocks = [(
             &kd[t * tile..t * tile + tile],
             &vd[t * tile..t * tile + tile],
-            k_pos.as_slice(),
+            k_pos,
         )];
         let (gq_t, per_block) = ring_backward_tile(
             &qd[t * tile..t * tile + tile],
@@ -528,7 +529,7 @@ pub(crate) fn cp_ring_attention_backward(
             rows,
             dim,
             scale,
-            &q_pos,
+            q_pos,
         );
         gq[t * tile..(t + 1) * tile].copy_from_slice(&gq_t);
         let (gk_t, gv_t) = &per_block[0];
