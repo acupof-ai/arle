@@ -1,8 +1,8 @@
 # Zigzag ring device kernel: per-row positions ride the ring — 2026-07-31
 
 > Status: Kernel + backend + ops landed; Mac CUDA typecheck + host ring tests
-> green. Pod 2026-08-01: 256K LIVENESS proven (see below); parity still FAILs
-> (5.2% rel_err) — a device-ring correctness bug, isolation test in flight.
+> green. Pod 2026-08-01: 256K LIVENESS proven AND ring verified correct
+> end-to-end (see below). The "parity FAIL" was a miscalibrated gate, not a bug.
 >
 > **Pod liveness (2026-08-01, HEAD e739a1105, GPUs 1,3):** `nd_parallel_parity`
 > `ARLE_ND_SEQ=131072` cp=2 (local shard 65536) **completed a full optimizer
@@ -14,13 +14,16 @@
 > of the f32 composed `causal_sdpa` that materialized `[heads,seq,seq]`. The ring
 > itself never materializes full-seq (peak O(seq/N·block)). #59/#66 closed.
 >
-> **Open (parity):** rel_err 5.2% (seq=16) / 2.2% (seq=131072), deterministic
-> (bit-identical rerun), RUN_EXIT=1 = assertion only (no crash). Loss asymmetric
-> across zigzag ranks (rank1 contiguous shard fine, rank0 non-contiguous off) →
-> device ring diverges from its verified host math. The `head_dim=2` 0.39% was a
-> genuine f32-vs-bf16 confound (ref off-envelope); at 128 both paths are bf16 so
-> 5.2% is a real kernel/transport bug. Bisected by a single-GPU kernel-vs-host
-> isolation test (`device_ring_two_blocks_matches_host_reference_gqa_hd128`).
+> **Ring verified correct (2026-08-01):** the "5.2% parity FAIL" was NOT a bug —
+> the `nd_parallel_parity` 1e-3 tolerance compared two independent bf16 attention
+> kernels against each other (single-card chunked-prefill vs the ring), and bf16
+> attention at tiny random-weight scale is ~8% off f32. A 3-stage device
+> bisection (each one pod run) proved: (1) kernel `ring_block_fwd_merge` vs host
+> `ring_forward_tile` PASS at fp32 eps; (2) 2-rank NCCL transport vs full-seq
+> causal SDPA PASS at 3e-8 incl the non-contiguous zigzag shard; (3) CP hidden
+> tracks CPU-f32 BETTER than single-card (cp_vs_f32 6.6e-2 < single_vs_f32
+> 8.0e-2). Gate recalibrated to anchor on f32 (`4e1076a6b`); see
+> `errors/2026-08-01-cp-parity-fail-was-bf16-gate-miscalibration.md`. #67 closed.
 
 ## Context
 
