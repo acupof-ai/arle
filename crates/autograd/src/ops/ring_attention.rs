@@ -30,8 +30,10 @@ pub(crate) struct BlockStats {
 }
 
 /// One block's unnormalized softmax numerator + row stats. `q`:[rows,dim],
-/// `k`/`v`:[blk,dim]. `q_abs` = absolute row of q's row 0; `k_abs` = absolute row
-/// of the block's col 0. Future-masked cols contribute nothing.
+/// `k`/`v`:[blk,dim]. `q_pos[r]` / `k_pos[c]` are the ABSOLUTE positions of q row
+/// `r` / k col `c` — arrays, not scalar bases, so a zigzag shard (non-contiguous
+/// rows) masks correctly. q row `r` attends k col `c` iff `k_pos[c] <= q_pos[r]`;
+/// cols are not assumed ordered (skip future, don't break).
 pub(crate) fn block_stats(
     q: &[f32],
     k: &[f32],
@@ -40,8 +42,8 @@ pub(crate) fn block_stats(
     blk: usize,
     dim: usize,
     scale: f32,
-    q_abs: usize,
-    k_abs: usize,
+    q_pos: &[usize],
+    k_pos: &[usize],
 ) -> BlockStats {
     let mut out = vec![0.0; rows * dim];
     let mut m = vec![f32::NEG_INFINITY; rows];
@@ -49,10 +51,10 @@ pub(crate) fn block_stats(
     let mut scores = vec![0.0f32; blk];
     for r in 0..rows {
         let mut max_s = f32::NEG_INFINITY;
-        let mut visible = 0usize;
+        let mut visible = false;
         for c in 0..blk {
-            if k_abs + c > q_abs + r {
-                break; // causal: cols are ordered, rest are future
+            if k_pos[c] > q_pos[r] {
+                continue; // future key — masked (cols not ordered under zigzag)
             }
             let mut dot = 0.0;
             for d in 0..dim {
@@ -61,13 +63,16 @@ pub(crate) fn block_stats(
             let s = dot * scale;
             scores[c] = s;
             max_s = max_s.max(s);
-            visible = c + 1;
+            visible = true;
         }
-        if visible == 0 {
+        if !visible {
             continue; // whole block is future for this row → zero contribution
         }
         let mut denom = 0.0;
-        for c in 0..visible {
+        for c in 0..blk {
+            if k_pos[c] > q_pos[r] {
+                continue;
+            }
             let p = (scores[c] - max_s).exp();
             scores[c] = p;
             denom += p;
@@ -112,7 +117,9 @@ fn merge_block(
 
 /// Ring attention forward for one (batch·head) tile over `n` KV blocks in ring
 /// order. Returns `(out [rows,dim] normalized, lse [rows])`. `blocks[j] =
-/// (k_j, v_j, k_abs_j)`. Local q covers absolute rows `[q_abs, q_abs+rows)`.
+/// (k_j, v_j, k_pos_j)` where `k_pos_j[c]` is the absolute position of block j's
+/// col c. `q_pos[r]` is the absolute position of local q row r — an array, so a
+/// zigzag (non-contiguous) shard masks correctly.
 ///
 /// Verified host kernel (see the U2 gate below). The device tape op + NCCL
 /// `ring_send_recv_kv` transport that feed remote blocks into this on GPU are the
@@ -121,18 +128,18 @@ fn merge_block(
 #[allow(clippy::type_complexity)]
 pub fn ring_forward_tile(
     q: &[f32],
-    blocks: &[(&[f32], &[f32], usize)],
+    blocks: &[(&[f32], &[f32], &[usize])],
     rows: usize,
     dim: usize,
     scale: f32,
-    q_abs: usize,
+    q_pos: &[usize],
 ) -> (Vec<f32>, Vec<f32>) {
     let mut acc_m = vec![f32::NEG_INFINITY; rows];
     let mut acc_l = vec![0.0f32; rows];
     let mut acc_out = vec![0.0f32; rows * dim];
-    for &(k, v, k_abs) in blocks {
+    for &(k, v, k_pos) in blocks {
         let blk = k.len() / dim;
-        let st = block_stats(q, k, v, rows, blk, dim, scale, q_abs, k_abs);
+        let st = block_stats(q, k, v, rows, blk, dim, scale, q_pos, k_pos);
         merge_block(&mut acc_m, &mut acc_l, &mut acc_out, &st, rows, dim);
     }
     let mut lse = vec![f32::NEG_INFINITY; rows];
@@ -157,14 +164,14 @@ pub fn ring_forward_tile(
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub fn ring_backward_tile(
     q: &[f32],
-    blocks: &[(&[f32], &[f32], usize)],
+    blocks: &[(&[f32], &[f32], &[usize])],
     out: &[f32],
     lse: &[f32],
     d_out: &[f32],
     rows: usize,
     dim: usize,
     scale: f32,
-    q_abs: usize,
+    q_pos: &[usize],
 ) -> (Vec<f32>, Vec<(Vec<f32>, Vec<f32>)>) {
     // Row delta D_r = sum_d d_out[r,d] * out[r,d] (flash backward's row correction).
     let mut delta = vec![0.0f32; rows];
@@ -175,7 +182,7 @@ pub fn ring_backward_tile(
     }
     let mut grad_q = vec![0.0f32; rows * dim];
     let mut per_block = Vec::with_capacity(blocks.len());
-    for &(k, v, k_abs) in blocks {
+    for &(k, v, k_pos) in blocks {
         let blk = k.len() / dim;
         let mut grad_k = vec![0.0f32; blk * dim];
         let mut grad_v = vec![0.0f32; blk * dim];
@@ -184,8 +191,8 @@ pub fn ring_backward_tile(
                 continue;
             }
             for c in 0..blk {
-                if k_abs + c > q_abs + r {
-                    break;
+                if k_pos[c] > q_pos[r] {
+                    continue; // future key (cols not ordered under zigzag)
                 }
                 let mut s = 0.0;
                 for d in 0..dim {
@@ -227,19 +234,20 @@ use crate::{
 use smallvec::smallvec;
 
 /// Context-parallel causal attention over the LOCAL shard. `q`/`k`/`v` are
-/// `[B,H,S,D]` — this rank's contiguous sequence shard at absolute rows
-/// `[cp_rank*S, (cp_rank+1)*S)`. On CUDA with `cp_size > 1` it runs the device
-/// ring: `cp_size` KV rotations feeding the one-block flash-2 kernel + on-device
-/// merge, never materializing the full sequence (peak O(S·D), not O(full_seq·D) —
-/// the fix for the option-B slice_bwd OOM). CPU / world==1 keep the verified host
-/// `ring_forward_tile` path (one local block, q_abs=0). Records out + per-row LSE
-/// so backward replays the flash-2 adjoint.
+/// `[B,H,S,D]` — this rank's sequence shard. `positions` gives the ABSOLUTE
+/// position of each local row: `None` = a contiguous shard at `[cp_rank*S, ..)`
+/// (byte-identical legacy path); `Some` = an explicit map, so a zigzag
+/// load-balanced shard (two non-contiguous chunks) masks causally by true
+/// position, not local row. On CUDA with `cp_size > 1` it runs the device ring;
+/// CPU / world==1 keep the verified host `ring_forward_tile` path. Records out +
+/// per-row LSE so backward replays the flash-2 adjoint.
 pub fn cp_causal_sdpa(
     q: TensorId,
     k: TensorId,
     v: TensorId,
     cp_size: usize,
     cp_rank: usize,
+    positions: Option<&[usize]>,
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
@@ -253,12 +261,20 @@ pub fn cp_causal_sdpa(
     let (b, h, s, d) = (shape[0], shape[1], shape[2], shape[3]);
 
     if store.backend().device() == Device::Cuda && cp_size > 1 {
-        return cp_causal_sdpa_device_ring(q, k, v, cp_size, cp_rank, &shape, store, tape);
+        return cp_causal_sdpa_device_ring(
+            q, k, v, cp_size, cp_rank, positions, &shape, store, tape,
+        );
     }
 
-    // CPU / world==1: the whole local sequence is one KV block at absolute row 0.
+    // CPU / world==1: the whole local sequence is one KV block. Absolute positions
+    // are `positions` if given, else the contiguous default `cp_rank*s + row` (for
+    // world==1 cp_rank is 0, so 0..s — the plain-causal case gated on CPU).
     let tiles = b * h;
     let scale = 1.0 / (d as f32).sqrt();
+    let q_pos: Vec<usize> = match positions {
+        Some(p) => p.to_vec(),
+        None => (0..s).map(|r| cp_rank * s + r).collect(),
+    };
     let qd = store.tensor_host(q)?.data;
     let kd = store.tensor_host(k)?.data;
     let vd = store.tensor_host(v)?.data;
@@ -267,8 +283,8 @@ pub fn cp_causal_sdpa(
     let mut lse = vec![0.0f32; tiles * s];
     for t in 0..tiles {
         let (qt, kt, vt) = (&qd[t * tile..], &kd[t * tile..], &vd[t * tile..]);
-        let blocks = [(&kt[..tile], &vt[..tile], 0usize)];
-        let (o, l) = ring_forward_tile(&qt[..tile], &blocks, s, d, scale, 0);
+        let blocks = [(&kt[..tile], &vt[..tile], q_pos.as_slice())];
+        let (o, l) = ring_forward_tile(&qt[..tile], &blocks, s, d, scale, &q_pos);
         out[t * tile..(t + 1) * tile].copy_from_slice(&o);
         lse[t * s..(t + 1) * s].copy_from_slice(&l);
     }
@@ -281,12 +297,12 @@ pub fn cp_causal_sdpa(
         input_ids: smallvec![q, k, v],
         saved: SavedContext::RingAttentionCtx {
             q,
-            blocks: smallvec![(k, v, 0usize)],
+            blocks: smallvec![(k, v, q_pos.clone())],
             lse: lse_id,
             out: out_id,
             rows: s,
             dim: d,
-            q_abs: 0,
+            q_pos,
             cp_size: 1,
             cp_rank: 0,
         },
@@ -300,6 +316,11 @@ pub fn cp_causal_sdpa(
 /// the kernel. Rings k and v `cp_size` times; step j attends the block owned by
 /// rank `(cp_rank - j + cp_size) % cp_size` (its rows `owner*s .. owner*s+s`),
 /// merged on-device. Every rank issues exactly `cp_size` symmetric send/recvs.
+///
+/// Contiguous shards only: the scalar-`q_abs`/`k_abs` kernel assumes each rank's
+/// rows are the contiguous block `[owner*s, owner*s+s)`. A zigzag shard
+/// (`positions.is_some()`) needs a per-row-position kernel — pending-remote, so
+/// it's a loud error here, never a silent contiguous mis-attend.
 #[allow(clippy::too_many_arguments)]
 fn cp_causal_sdpa_device_ring(
     q: TensorId,
@@ -307,10 +328,16 @@ fn cp_causal_sdpa_device_ring(
     v: TensorId,
     cp_size: usize,
     cp_rank: usize,
+    positions: Option<&[usize]>,
     shape: &[usize],
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
+    if positions.is_some() {
+        return Err(AutogradError::TapeInvariant(
+            "device ring: zigzag per-row positions need the per-row-position kernel (pending-remote)",
+        ));
+    }
     let (b, h, s, d) = (shape[0], shape[1], shape[2], shape[3]);
     let (kv_shape, kv_heads) = {
         let ks = store.tensor(k)?.shape.clone();
@@ -318,6 +345,9 @@ fn cp_causal_sdpa_device_ring(
     };
     let scale = 1.0 / (d as f32).sqrt();
     let num_q_tiles = b * h;
+    // Contiguous q positions for this rank's block — the tape ctx carries them as
+    // the Vec the host backward reads; the device kernel still uses scalar q_abs.
+    let q_pos: Vec<usize> = (0..s).map(|r| cp_rank * s + r).collect();
     let dims_for = |blk_len: usize, k_abs: usize| RingBlockDims {
         num_q_tiles,
         num_q_heads: h,
@@ -349,7 +379,7 @@ fn cp_causal_sdpa_device_ring(
     let mut k_cur = device_handle(store, k, "ring k")?;
     let mut v_cur = device_handle(store, v, "ring v")?;
     let block_elems = b * kv_heads * s * d;
-    let mut step_blocks: smallvec::SmallVec<[(TensorId, TensorId, usize); 4]> = smallvec![];
+    let mut step_blocks: smallvec::SmallVec<[(TensorId, TensorId, Vec<usize>); 4]> = smallvec![];
     for j in 0..cp_size {
         let owner = (cp_rank + cp_size - j) % cp_size;
         let k_abs = owner * s;
@@ -366,9 +396,10 @@ fn cp_causal_sdpa_device_ring(
         acc_l = l2;
         acc_o = o2;
         // Persist this step's block for backward (as tape tensors), then rotate.
+        // Contiguous block positions [k_abs, k_abs+s) for the host backward's Vec ctx.
         let k_id = store.alloc_device_tensor(kv_shape.clone(), k_cur.clone())?;
         let v_id = store.alloc_device_tensor(kv_shape.clone(), v_cur.clone())?;
-        step_blocks.push((k_id, v_id, k_abs));
+        step_blocks.push((k_id, v_id, (k_abs..k_abs + s).collect()));
         if j + 1 < cp_size {
             k_cur = store.backend().ring_send_recv_kv(&k_cur, &[block_elems])?;
             v_cur = store.backend().ring_send_recv_kv(&v_cur, &[block_elems])?;
@@ -392,7 +423,7 @@ fn cp_causal_sdpa_device_ring(
             out: out_id,
             rows: s,
             dim: d,
-            q_abs: cp_rank * s,
+            q_pos,
             cp_size,
             cp_rank,
         },
@@ -427,7 +458,7 @@ pub(crate) fn cp_ring_attention_backward(
         out,
         rows,
         dim,
-        q_abs,
+        q_pos,
         cp_size,
         cp_rank,
     } = &entry.saved
@@ -436,8 +467,9 @@ pub(crate) fn cp_ring_attention_backward(
             "ring attention backward missing RingAttentionCtx",
         ));
     };
-    let (q, lse, out, rows, dim, q_abs, cp_size, _cp_rank) =
-        (*q, *lse, *out, *rows, *dim, *q_abs, *cp_size, *cp_rank);
+    let (q, lse, out, rows, dim, cp_size, _cp_rank) =
+        (*q, *lse, *out, *rows, *dim, *cp_size, *cp_rank);
+    let q_pos = q_pos.clone();
 
     if store.backend().device() == Device::Cuda && cp_size > 1 {
         return cp_ring_attention_backward_device(
@@ -449,14 +481,15 @@ pub(crate) fn cp_ring_attention_backward(
             output_grad_id,
             rows,
             dim,
-            q_abs,
+            &q_pos,
             cp_size,
             store,
         );
     }
 
     // world==1: one local block covers everything (host reference path).
-    let (k, v, _k_abs) = blocks[0];
+    let (k, v, k_pos) = &blocks[0];
+    let (k, v, k_pos) = (*k, *v, k_pos.clone());
     let need = store.tensor(q)?.requires_grad
         || store.tensor(k)?.requires_grad
         || store.tensor(v)?.requires_grad;
@@ -484,7 +517,7 @@ pub(crate) fn cp_ring_attention_backward(
         let blocks = [(
             &kd[t * tile..t * tile + tile],
             &vd[t * tile..t * tile + tile],
-            0usize,
+            k_pos.as_slice(),
         )];
         let (gq_t, per_block) = ring_backward_tile(
             &qd[t * tile..t * tile + tile],
@@ -495,7 +528,7 @@ pub(crate) fn cp_ring_attention_backward(
             rows,
             dim,
             scale,
-            q_abs,
+            &q_pos,
         );
         gq[t * tile..(t + 1) * tile].copy_from_slice(&gq_t);
         let (gk_t, gv_t) = &per_block[0];
@@ -509,27 +542,29 @@ pub(crate) fn cp_ring_attention_backward(
 }
 
 /// Device ring backward. `input_ids = [q, k, v]` are THIS rank's local shards;
-/// `blocks[j]` are the rotated (k, v, k_abs) handles the forward saved per step.
+/// `blocks[j]` are the rotated (k, v, k_pos) handles the forward saved per step.
 /// Recompute each block's (grad_q, grad_k, grad_v) from the saved out/lse,
 /// accumulate grad_q locally, and ring grad_k/grad_v BACK to their owners: step j's
 /// block came from j hops forward, so its grad returns via `cp_size - j` more
 /// forward hops (a full loop), landing each on the rank whose LOCAL k/v produced
 /// it, where it sums. Rank-symmetric — the ring-home is a function of the hop
-/// count `j`, not of `cp_rank`.
+/// count `j`, not of `cp_rank`. Contiguous only (the scalar kernel), so positions
+/// are `pos[0]` bases; zigzag was rejected at forward.
 #[allow(clippy::too_many_arguments)]
 fn cp_ring_attention_backward_device(
     input_ids: &[TensorId],
-    blocks: &smallvec::SmallVec<[(TensorId, TensorId, usize); 4]>,
+    blocks: &smallvec::SmallVec<[(TensorId, TensorId, Vec<usize>); 4]>,
     q: TensorId,
     lse: TensorId,
     out: TensorId,
     output_grad_id: TensorId,
     rows: usize,
     dim: usize,
-    q_abs: usize,
+    q_pos: &[usize],
     cp_size: usize,
     store: &mut TensorStore,
 ) -> Result<GradPairs> {
+    let q_abs = q_pos[0]; // contiguous base (device kernel is scalar-position)
     let (k_local, v_local) = (input_ids[1], input_ids[2]);
     let need = store.tensor(q)?.requires_grad
         || store.tensor(k_local)?.requires_grad
@@ -561,7 +596,8 @@ fn cp_ring_attention_backward_device(
     // Per-step grad_k/grad_v handles, produced in forward-ring order.
     let mut step_gk: smallvec::SmallVec<[DeviceHandle; 4]> = smallvec![];
     let mut step_gv: smallvec::SmallVec<[DeviceHandle; 4]> = smallvec![];
-    for &(k_id, v_id, k_abs) in blocks.iter() {
+    for (k_id, v_id, k_pos) in blocks.iter() {
+        let (k_id, v_id, k_abs) = (*k_id, *v_id, k_pos[0]);
         let k_h = device_handle(store, k_id, "ring k")?;
         let v_h = device_handle(store, v_id, "ring v")?;
         let dims = RingBlockDims {
@@ -635,9 +671,9 @@ mod tests {
                 mx = mx.max(sc[c]);
             }
             let mut den = 0.0;
-            for c in 0..=r {
-                sc[c] = (sc[c] - mx).exp();
-                den += sc[c];
+            for s in sc.iter_mut().take(r + 1) {
+                *s = (*s - mx).exp();
+                den += *s;
             }
             for c in 0..=r {
                 let p = sc[c] / den;
@@ -703,24 +739,28 @@ mod tests {
         let mut got_gq = vec![0.0f32; seq * dim];
         let mut got_gk = vec![0.0f32; seq * dim];
         let mut got_gv = vec![0.0f32; seq * dim];
+        let k_pos_by_block: Vec<Vec<usize>> = (0..n)
+            .map(|j| (j * block_len..(j + 1) * block_len).collect())
+            .collect();
         for shard in 0..n {
             let q_abs = shard * block_len;
             let q_shard = &q[q_abs * dim..(q_abs + block_len) * dim];
             let do_shard = &d_out[q_abs * dim..(q_abs + block_len) * dim];
-            let blocks: Vec<(&[f32], &[f32], usize)> = (0..=shard)
+            let q_pos: Vec<usize> = (q_abs..q_abs + block_len).collect();
+            let blocks: Vec<(&[f32], &[f32], &[usize])> = (0..=shard)
                 .map(|j| {
                     let s = j * block_len;
                     (
                         &k[s * dim..(s + block_len) * dim],
                         &v[s * dim..(s + block_len) * dim],
-                        s,
+                        k_pos_by_block[j].as_slice(),
                     )
                 })
                 .collect();
-            let (out, lse) = ring_forward_tile(q_shard, &blocks, block_len, dim, scale, q_abs);
+            let (out, lse) = ring_forward_tile(q_shard, &blocks, block_len, dim, scale, &q_pos);
             got_out[q_abs * dim..(q_abs + block_len) * dim].copy_from_slice(&out);
             let (gq, per_block) = ring_backward_tile(
-                q_shard, &blocks, &out, &lse, do_shard, block_len, dim, scale, q_abs,
+                q_shard, &blocks, &out, &lse, do_shard, block_len, dim, scale, &q_pos,
             );
             for (r, val) in gq.iter().enumerate() {
                 got_gq[q_abs * dim + r] += val;
@@ -775,13 +815,22 @@ mod tests {
         let d_out = synth(rows * dim, 14);
 
         let spans = [(0usize, 3usize), (3, 4), (4, 7), (7, 9)];
-        let blocks: Vec<(&[f32], &[f32], usize)> = spans
+        let k_pos_by_span: Vec<Vec<usize>> = spans.iter().map(|&(a, e)| (a..e).collect()).collect();
+        let q_pos: Vec<usize> = (q_abs..q_abs + rows).collect();
+        let blocks: Vec<(&[f32], &[f32], &[usize])> = spans
             .iter()
-            .map(|&(a, e)| (&kfull[a * dim..e * dim], &vfull[a * dim..e * dim], a))
+            .zip(&k_pos_by_span)
+            .map(|(&(a, e), kp)| {
+                (
+                    &kfull[a * dim..e * dim],
+                    &vfull[a * dim..e * dim],
+                    kp.as_slice(),
+                )
+            })
             .collect();
-        let (out, lse) = ring_forward_tile(q_local, &blocks, rows, dim, scale, q_abs);
+        let (out, lse) = ring_forward_tile(q_local, &blocks, rows, dim, scale, &q_pos);
         let (gq, per_block) = ring_backward_tile(
-            q_local, &blocks, &out, &lse, &d_out, rows, dim, scale, q_abs,
+            q_local, &blocks, &out, &lse, &d_out, rows, dim, scale, &q_pos,
         );
 
         // Reference: full causal softmax for the 4 local rows against ALL keys,
@@ -800,9 +849,9 @@ mod tests {
                 mx = mx.max(sc[c]);
             }
             let mut den = 0.0;
-            for c in 0..=qrow {
-                sc[c] = (sc[c] - mx).exp();
-                den += sc[c];
+            for s in sc.iter_mut().take(qrow + 1) {
+                *s = (*s - mx).exp();
+                den += *s;
             }
             for c in 0..=qrow {
                 let p = sc[c] / den;
@@ -860,7 +909,7 @@ mod tests {
         let mut s1 = TensorStore::default();
         let mut t1 = Tape::new();
         let (q1, k1, v1) = (mk(&mut s1, 1), mk(&mut s1, 2), mk(&mut s1, 3));
-        let o1 = cp_causal_sdpa(q1, k1, v1, 1, 0, &mut s1, &mut t1).unwrap();
+        let o1 = cp_causal_sdpa(q1, k1, v1, 1, 0, None, &mut s1, &mut t1).unwrap();
         let loss1 = ops::sum(o1, &mut s1, &mut t1).unwrap();
         let g1 = t1.backward(loss1, &mut s1).unwrap();
 

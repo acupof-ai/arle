@@ -51,36 +51,68 @@ pub struct CpContext {
     pub size: usize,
 }
 
-/// A contiguous sequence shard: local rows `[start, end)` of the global sequence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A sequence shard as an ordered list of contiguous chunks of the global
+/// sequence. Contiguous shards (DP batch, single-card CP) are one chunk; CP zigzag
+/// load-balancing is two — chunk `r` and chunk `2N-1-r` of a `2N`-way split, so
+/// every rank carries the same causal-attention work (Megatron
+/// `get_batch_on_this_cp_rank`). Local row order is chunk order: chunk 0's rows,
+/// then chunk 1's. `local_rows()` is the gather index into the global sequence;
+/// `local_of()` maps a global position to its local row.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SeqShard {
-    pub start: usize,
-    pub end: usize,
+    /// Owned global ranges in local order. Each `(start, end)` is `[start, end)`.
+    chunks: Vec<(usize, usize)>,
 }
 
 impl SeqShard {
-    pub fn len(self) -> usize {
-        self.end - self.start
+    /// A single contiguous range `[start, end)` — DP batch shards and the
+    /// single-card degenerate case.
+    pub fn contiguous(start: usize, end: usize) -> Self {
+        Self {
+            chunks: vec![(start, end)],
+        }
     }
 
-    pub fn is_empty(self) -> bool {
-        self.start >= self.end
+    pub fn len(&self) -> usize {
+        self.chunks.iter().map(|&(s, e)| e - s).sum()
     }
 
-    pub fn contains(self, pos: usize) -> bool {
-        pos >= self.start && pos < self.end
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn contains(&self, pos: usize) -> bool {
+        self.chunks.iter().any(|&(s, e)| pos >= s && pos < e)
+    }
+
+    /// Global rows this rank owns, in local order — the gather index for slicing
+    /// the embedded sequence and positions down to this shard.
+    pub fn local_rows(&self) -> Vec<usize> {
+        self.chunks.iter().flat_map(|&(s, e)| s..e).collect()
+    }
+
+    /// Global position → local row index, or `None` if this shard doesn't own it.
+    /// Chunks concatenate in order, so the offset is the summed length of prior
+    /// chunks plus the in-chunk offset.
+    pub fn local_of(&self, pos: usize) -> Option<usize> {
+        let mut base = 0;
+        for &(s, e) in &self.chunks {
+            if pos >= s && pos < e {
+                return Some(base + (pos - s));
+            }
+            base += e - s;
+        }
+        None
     }
 
     /// Filter `(global_position, target)` loss pairs to those this shard owns,
-    /// rebased to shard-local row indices. A target at global position `p` lives on
-    /// the shard containing `p`; its local row is `p - start`. The global target
-    /// count (for `inv_n = 1/global_targets`) is the sum of per-shard lengths.
-    pub fn local_targets(self, positions: &[usize], targets: &[u32]) -> (Vec<usize>, Vec<u32>) {
+    /// rebased to shard-local row indices (via `local_of`). The global target count
+    /// (for `inv_n = 1/global_targets`) is the sum of per-shard lengths.
+    pub fn local_targets(&self, positions: &[usize], targets: &[u32]) -> (Vec<usize>, Vec<u32>) {
         positions
             .iter()
             .zip(targets)
-            .filter(|&(&p, _)| self.contains(p))
-            .map(|(&p, &t)| (p - self.start, t))
+            .filter_map(|(&p, &t)| self.local_of(p).map(|local| (local, t)))
             .unzip()
     }
 }
@@ -121,23 +153,31 @@ impl CpContext {
         self.size > 1
     }
 
-    /// This rank's sequence shard of a `seq_len`-long trajectory. Delegates to the
-    /// canonical even-split-remainder-to-last-rank formula (`lora_shard::shard_range`
-    /// → `infer_topo::column_shard`), so CP sequence shards line up with how base
-    /// weights and LoRA deltas are split. Equal-length shards when `seq_len % size
-    /// == 0` (an NCCL all-gather precondition); the remainder path keeps a single
-    /// node correct, callers needing the ring pad to a multiple.
+    /// This rank's zigzag load-balanced sequence shard: split the sequence into
+    /// `2*size` equal chunks, own chunk `rank` and chunk `2*size-1-rank` (one from
+    /// the front, one from the back). Under a causal mask the tail attends ~N× the
+    /// keys the head does, so pairing a front and back chunk equalizes per-rank work
+    /// and stops the ring stalling on the slowest rank (Megatron
+    /// `get_batch_on_this_cp_rank`). Requires `seq_len % (2*size) == 0` — callers pad
+    /// up. Single card is the whole sequence as one chunk (byte-identical).
     pub fn shard(self, seq_len: usize) -> SeqShard {
         if self.size <= 1 {
-            return SeqShard {
-                start: 0,
-                end: seq_len,
-            };
+            return SeqShard::contiguous(0, seq_len);
         }
-        let range = crate::lora_shard::shard_range(seq_len, self.rank, self.size);
+        let two_n = 2 * self.size;
+        debug_assert_eq!(
+            seq_len % two_n,
+            0,
+            "CP zigzag requires seq_len % (2*cp_size) == 0; pad the sequence up"
+        );
+        let chunk = seq_len / two_n;
+        let front = self.rank;
+        let back = two_n - self.rank - 1;
         SeqShard {
-            start: range.start,
-            end: range.end,
+            chunks: vec![
+                (front * chunk, (front + 1) * chunk),
+                (back * chunk, (back + 1) * chunk),
+            ],
         }
     }
 }
@@ -191,21 +231,15 @@ impl DpContext {
         self.size > 1
     }
 
-    /// This rank's disjoint slice of a `batch_len`-long trajectory list — the same
-    /// even-split-remainder-to-last-rank formula CP uses for the sequence, so DP
-    /// batch shards and CP sequence shards tile identically.
+    /// This rank's disjoint slice of a `batch_len`-long trajectory list. DP shards
+    /// the BATCH contiguously (even-split, remainder to last rank) — no zigzag: batch
+    /// items are independent, so there's no causal imbalance to balance.
     pub fn batch_shard(self, batch_len: usize) -> SeqShard {
         if self.size <= 1 {
-            return SeqShard {
-                start: 0,
-                end: batch_len,
-            };
+            return SeqShard::contiguous(0, batch_len);
         }
         let range = crate::lora_shard::shard_range(batch_len, self.rank, self.size);
-        SeqShard {
-            start: range.start,
-            end: range.end,
-        }
+        SeqShard::contiguous(range.start, range.end)
     }
 }
 
@@ -227,26 +261,23 @@ mod tests {
     fn single_is_whole_sequence() {
         let cp = CpContext::single();
         assert!(!cp.is_enabled());
-        assert_eq!(
-            cp.shard(1000),
-            SeqShard {
-                start: 0,
-                end: 1000
-            }
-        );
+        assert_eq!(cp.shard(1000), SeqShard::contiguous(0, 1000));
     }
 
+    // Zigzag: size=4 splits seq=32 into 2N=8 chunks of 4; rank r owns chunk r and
+    // chunk 2N-1-r. Every position covered exactly once, and each rank owns 2 chunks
+    // (front + back) totalling seq/size rows.
     #[test]
-    fn even_split_covers_sequence_disjointly() {
+    fn zigzag_covers_sequence_disjointly() {
         let size = 4;
-        let seq = 32;
+        let seq = 32; // 2N=8 chunks of 4
         let mut covered = vec![false; seq];
         for rank in 0..size {
             let s = CpContext::new(rank, size).shard(seq);
-            assert_eq!(s.len(), 8);
-            for slot in &mut covered[s.start..s.end] {
-                assert!(!*slot);
-                *slot = true;
+            assert_eq!(s.len(), 8, "each rank owns seq/size rows");
+            for row in s.local_rows() {
+                assert!(!covered[row], "position {row} covered twice");
+                covered[row] = true;
             }
         }
         assert!(
@@ -255,28 +286,25 @@ mod tests {
         );
     }
 
+    // Zigzag pairing for size=2, seq=8 (2N=4 chunks of 2): rank 0 owns chunks 0,3
+    // (rows 0,1,6,7), rank 1 owns chunks 1,2 (rows 2,3,4,5) — front+back balance.
     #[test]
-    fn remainder_goes_to_last_rank() {
-        let size = 3;
-        let seq = 10; // base=3, last rank takes 3..10 (4 rows)
+    fn zigzag_pairs_front_and_back() {
+        let (size, seq) = (2usize, 8usize);
         assert_eq!(
-            CpContext::new(0, size).shard(seq),
-            SeqShard { start: 0, end: 3 }
+            CpContext::new(0, size).shard(seq).local_rows(),
+            vec![0, 1, 6, 7]
         );
         assert_eq!(
-            CpContext::new(1, size).shard(seq),
-            SeqShard { start: 3, end: 6 }
-        );
-        assert_eq!(
-            CpContext::new(2, size).shard(seq),
-            SeqShard { start: 6, end: 10 }
+            CpContext::new(1, size).shard(seq).local_rows(),
+            vec![2, 3, 4, 5]
         );
     }
 
     #[test]
     fn local_targets_partition_by_owner() {
         let size = 2;
-        let seq = 8; // shards [0,4) and [4,8)
+        let seq = 8; // rank0 owns rows {0,1,6,7}, rank1 owns {2,3,4,5}
         // global targets at positions 1,4,7
         let positions = vec![1usize, 4, 7];
         let targets = vec![100u32, 200, 300];
@@ -284,14 +312,16 @@ mod tests {
         let (p0, t0) = CpContext::new(0, size)
             .shard(seq)
             .local_targets(&positions, &targets);
-        assert_eq!(p0, vec![1]); // pos 1 → local row 1
-        assert_eq!(t0, vec![100]);
+        // rank0 local order [0,1,6,7]: pos1→local 1, pos7→local 3.
+        assert_eq!(p0, vec![1, 3]);
+        assert_eq!(t0, vec![100, 300]);
 
         let (p1, t1) = CpContext::new(1, size)
             .shard(seq)
             .local_targets(&positions, &targets);
-        assert_eq!(p1, vec![0, 3]); // pos 4→row 0, pos 7→row 3
-        assert_eq!(t1, vec![200, 300]);
+        // rank1 local order [2,3,4,5]: pos4→local 2.
+        assert_eq!(p1, vec![2]);
+        assert_eq!(t1, vec![200]);
 
         // Global count = sum of local counts (the inv_n = 1/global_targets invariant).
         assert_eq!(t0.len() + t1.len(), targets.len());
@@ -347,16 +377,17 @@ mod tests {
         }
     }
 
-    // DP batch shards tile the trajectory list disjointly, remainder to last rank.
+    // DP batch shards tile the trajectory list disjointly, remainder to last rank
+    // (contiguous — DP does not zigzag).
     #[test]
     fn dp_batch_shard_partitions_disjointly() {
         let (size, batch) = (3usize, 10usize);
         let mut covered = vec![false; batch];
         for rank in 0..size {
             let s = DpContext::from_mesh(size, 1, rank).batch_shard(batch);
-            for slot in &mut covered[s.start..s.end] {
-                assert!(!*slot, "overlap");
-                *slot = true;
+            for row in s.local_rows() {
+                assert!(!covered[row], "overlap");
+                covered[row] = true;
             }
         }
         assert!(covered.iter().all(|&c| c), "every trajectory covered once");
@@ -377,10 +408,10 @@ mod tests {
     // The full parity invariant: the union of every CP shard's rebased targets
     // reconstructs the single-card target set exactly (no lost, dup, or misrebased
     // pair), and the counts sum to the global — a wrong split silently corrupts
-    // inv_n and every gradient.
+    // inv_n and every gradient. Zigzag: seq divisible by 2*size.
     #[test]
     fn shard_union_reconstructs_single_card_targets() {
-        let seq = 30;
+        let seq = 32; // 2*size=8 divides 32
         let size = 4;
         let positions: Vec<usize> = (0..seq).filter(|p| p % 3 == 0 || p % 7 == 0).collect();
         let targets: Vec<u32> = positions.iter().map(|&p| (p * 11 + 1) as u32).collect();
@@ -388,10 +419,11 @@ mod tests {
         let mut reconstructed: Vec<(usize, u32)> = Vec::new();
         for rank in 0..size {
             let shard = CpContext::new(rank, size).shard(seq);
+            let rows = shard.local_rows();
             let (local_p, local_t) = shard.local_targets(&positions, &targets);
-            // Rebase local rows back to absolute and collect.
+            // Rebase local rows back to absolute (via the gather index) and collect.
             for (lp, t) in local_p.iter().zip(&local_t) {
-                reconstructed.push((shard.start + lp, *t));
+                reconstructed.push((rows[*lp], *t));
             }
         }
         reconstructed.sort_unstable();

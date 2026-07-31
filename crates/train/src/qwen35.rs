@@ -1715,7 +1715,22 @@ impl Qwen35Layer {
                 Some(seq_len),
                 "CP: cos rows must equal local seq_len (launcher must shard positions)"
             );
-            autograd::ops::ring_attention::cp_causal_sdpa(q, k, v, cp.size, cp.rank, store, tape)?
+            // Absolute position of each local row — the zigzag shard's `local_rows`
+            // over the global sequence (`seq_len` is this rank's shard length). The
+            // ring masks causally by true position, so a zigzag shard's two chunks
+            // (front+back) attend the right prefix, not the contiguous `cp.rank*s+r`.
+            // Derived here (not threaded) as the same view opd.rs shards RoPE by.
+            let positions = cp.shard(seq_len * cp.size).local_rows();
+            autograd::ops::ring_attention::cp_causal_sdpa(
+                q,
+                k,
+                v,
+                cp.size,
+                cp.rank,
+                Some(&positions),
+                store,
+                tape,
+            )?
         } else {
             let k = repeat_kv(k, kv_repeat, store, tape)?;
             let v = repeat_kv(v, kv_repeat, store, tape)?;

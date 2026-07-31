@@ -205,12 +205,15 @@ pub enum SavedContext {
     // drive the device ring's rotation + grad ring-back (1/0 = single-block host path).
     RingAttentionCtx {
         q: TensorId,
-        blocks: SmallVec<[(TensorId, TensorId, usize); 4]>,
+        /// `(k, v, k_pos)` per ring block; `k_pos[c]` = absolute position of the
+        /// block's col c (a Vec, not a scalar base, so zigzag shards mask right).
+        blocks: SmallVec<[(TensorId, TensorId, Vec<usize>); 4]>,
         lse: TensorId,
         out: TensorId,
         rows: usize,
         dim: usize,
-        q_abs: usize,
+        /// Absolute position of each local q row (Vec — zigzag rows are not contiguous).
+        q_pos: Vec<usize>,
         cp_size: usize,
         cp_rank: usize,
     },

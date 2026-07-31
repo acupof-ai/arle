@@ -2191,25 +2191,32 @@ fn cuda_ring_block_matches_host_reference_fwd_bwd() {
     let mut host_gq = vec![0.0f32; seq * dim];
     let mut host_gk = vec![0.0f32; seq * dim];
     let mut host_gv = vec![0.0f32; seq * dim];
+    // Contiguous shards: q rows and each block's keys are absolute positions
+    // `base..base+blk`. Bind the per-block position Vecs so their borrows outlive
+    // the `blocks` slice.
+    let k_pos_by_block: Vec<Vec<usize>> =
+        (0..n).map(|j| (j * blk..(j + 1) * blk).collect()).collect();
     for shard in 0..n {
         let q_abs = shard * blk;
         let q_shard = &q[q_abs * dim..(q_abs + blk) * dim];
         let do_shard = &d_out[q_abs * dim..(q_abs + blk) * dim];
-        let blocks: Vec<(&[f32], &[f32], usize)> = (0..=shard)
+        let q_pos: Vec<usize> = (q_abs..q_abs + blk).collect();
+        let blocks: Vec<(&[f32], &[f32], &[usize])> = (0..=shard)
             .map(|j| {
                 let s = j * blk;
                 (
                     &k[s * dim..(s + blk) * dim],
                     &v[s * dim..(s + blk) * dim],
-                    s,
+                    k_pos_by_block[j].as_slice(),
                 )
             })
             .collect();
-        let (o, lse) = ring_forward_tile(q_shard, &blocks, blk, dim, scale, q_abs);
+        let (o, lse) = ring_forward_tile(q_shard, &blocks, blk, dim, scale, &q_pos);
         host_out[q_abs * dim..(q_abs + blk) * dim].copy_from_slice(&o);
         host_lse[q_abs..q_abs + blk].copy_from_slice(&lse);
-        let (gq, per_block) =
-            ring_backward_tile(q_shard, &blocks, &o, &lse, do_shard, blk, dim, scale, q_abs);
+        let (gq, per_block) = ring_backward_tile(
+            q_shard, &blocks, &o, &lse, do_shard, blk, dim, scale, &q_pos,
+        );
         for (i, val) in gq.iter().enumerate() {
             host_gq[q_abs * dim + i] += val;
         }

@@ -3065,10 +3065,11 @@ pub fn masked_writeback_step<O: Optimizer>(
     let total_targets = loss_targets.len();
     let chunk_rows = window_size; // reused: positions per fused-CE chunk.
 
-    // Context-parallel sequence shard: this rank owns absolute rows
-    // [shard.start, shard.end). `total_targets` stays GLOBAL (built over `full`)
-    // so inv_n = 1/global weights every rank's grad correctly; the post-backward
-    // all-reduce-sum then yields the exact global mean.
+    // Context-parallel sequence shard: this rank owns a zigzag pair of chunks
+    // (front + back) for balanced causal work — `shard.local_rows()` is the gather
+    // index. `total_targets` stays GLOBAL (built over `full`) so inv_n = 1/global
+    // weights every rank's grad correctly; the post-backward all-reduce-sum then
+    // yields the exact global mean.
     let shard = cp.shard(seq_len);
     // inv_n override under CP or DP (single-card keeps the fused op's local default,
     // byte-identical). CP shares ONE trajectory so total_targets is already global.
@@ -3108,20 +3109,22 @@ pub fn masked_writeback_step<O: Optimizer>(
             )));
         }
     }
-    // One rebase offset covers both paths: CP filters to this shard and rebases by
-    // shard.start; non-CP's shard is the whole sequence (filter keeps all) and
-    // rebases by gen_start (frozen-prompt-KV, disabled under CP). `shard.contains`
-    // is always true off-CP, so the single filter is byte-identical to either path.
-    let rebase = if cp.is_enabled() {
-        shard.start
+    // Map each masked target to its local hidden row. Under CP the shard is zigzag,
+    // so `local_of` (position → local row via the chunk map) replaces a contiguous
+    // `p - start`; off-CP `shard` is the whole sequence and `local_of(p) == p -
+    // gen_start` after the frozen-prompt rebase. Off-CP with frozen-prompt-KV the
+    // gen segment rebases by gen_start; CP disables frozen so gen_start==0 there.
+    let (position_indices, target_tokens): (Vec<i32>, Vec<i32>) = if cp.is_enabled() {
+        loss_targets
+            .iter()
+            .filter_map(|&(p, target)| shard.local_of(p).map(|local| (local as i32, target as i32)))
+            .unzip()
     } else {
-        gen_start
+        loss_targets
+            .iter()
+            .map(|&(p, target)| ((p - gen_start) as i32, target as i32))
+            .unzip()
     };
-    let (position_indices, target_tokens): (Vec<i32>, Vec<i32>) = loss_targets
-        .iter()
-        .filter(|&&(p, _)| shard.contains(p))
-        .map(|&(p, target)| ((p - rebase) as i32, target as i32))
-        .unzip();
 
     let mut tape = Tape::new();
     // Offload per-layer grad-checkpoints to host RAM only past a length that needs
@@ -3158,15 +3161,14 @@ pub fn masked_writeback_step<O: Optimizer>(
                 map_qwen35_forward_error("masked writeback frozen-prompt-KV student hidden", err)
             })?
     } else if cp.is_enabled() {
-        // CP: embed only this rank's shard rows; attention gathers the full KV.
-        // positions carry ABSOLUTE ids so RoPE cos/sin match the gathered prefix.
+        // CP: embed only this rank's zigzag shard rows; attention gathers the full
+        // KV. positions carry ABSOLUTE ids so RoPE cos/sin match the gathered prefix.
+        // local_rows() is the gather index (two chunks, front+back, in local order).
+        let rows = shard.local_rows();
+        let shard_ids: Vec<u32> = rows.iter().map(|&r| full[r]).collect();
+        let shard_pos: Vec<u32> = rows.iter().map(|&r| positions[r]).collect();
         student
-            .forward_hidden_states(
-                store,
-                &mut tape,
-                &full[shard.start..shard.end],
-                &positions[shard.start..shard.end],
-            )
+            .forward_hidden_states(store, &mut tape, &shard_ids, &shard_pos)
             .map_err(|err| map_qwen35_forward_error("masked writeback CP student hidden", err))?
     } else {
         student
