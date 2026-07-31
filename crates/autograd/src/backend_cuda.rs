@@ -2101,7 +2101,7 @@ impl Backend for CudaBackend {
                 .memcpy_dtod(src, &mut out)
                 .map_err(|_| AutogradError::TapeInvariant("cuda all_reduce D2D copy failed"))?;
 
-            #[cfg(feature = "nccl")]
+            #[cfg(all(feature = "nccl", not(feature = "no-cuda")))]
             if let Some(nccl) = &self.nccl {
                 let (dst_ptr, _dst_guard) = out.device_ptr_mut(&self.stream);
                 unsafe {
@@ -2148,9 +2148,9 @@ impl Backend for CudaBackend {
             // Device buffers are functional (write-fresh; see add_into_device), and
             // this branch skips the in-place NCCL write, so sharing the input Arc is
             // safe — no alloc, no D2D copy.
-            #[cfg(feature = "nccl")]
+            #[cfg(all(feature = "nccl", not(feature = "no-cuda")))]
             let world = self.nccl.as_ref().map_or(1, |nccl| nccl.world_size());
-            #[cfg(not(feature = "nccl"))]
+            #[cfg(not(all(feature = "nccl", not(feature = "no-cuda"))))]
             let world = 1usize;
             if world <= 1 {
                 return Ok(x.clone());
@@ -2158,7 +2158,7 @@ impl Backend for CudaBackend {
 
             // NCCL all-gather: shards are equal-length (seq % world == 0), so the
             // full [1, S, H] is the rank-order concatenation of each [1, S/N, H].
-            #[cfg(feature = "nccl")]
+            #[cfg(all(feature = "nccl", not(feature = "no-cuda")))]
             {
                 let full_len = local_len * world;
                 let mut out = self.stream.alloc_zeros::<f32>(full_len).map_err(|_| {
@@ -2184,7 +2184,7 @@ impl Backend for CudaBackend {
                 }
                 return Ok(DeviceHandle::Cuda(CudaStorage::new(out)));
             }
-            #[cfg(not(feature = "nccl"))]
+            #[cfg(not(all(feature = "nccl", not(feature = "no-cuda"))))]
             unreachable!("world>1 without nccl feature")
         }
     }
@@ -2207,9 +2207,9 @@ impl Backend for CudaBackend {
             let local_len = shape_size(local_shape);
             let src = self.cuda_slice(x, "reduce_scatter_sum")?;
 
-            #[cfg(feature = "nccl")]
+            #[cfg(all(feature = "nccl", not(feature = "no-cuda")))]
             let world = self.nccl.as_ref().map_or(1, |nccl| nccl.world_size());
-            #[cfg(not(feature = "nccl"))]
+            #[cfg(not(all(feature = "nccl", not(feature = "no-cuda"))))]
             let world = 1usize;
             if world <= 1 {
                 // Identity: input already this rank's [1, S/N, H] (== full at N=1).
@@ -2224,7 +2224,7 @@ impl Backend for CudaBackend {
                 return Ok(x.clone());
             }
 
-            #[cfg(feature = "nccl")]
+            #[cfg(all(feature = "nccl", not(feature = "no-cuda")))]
             {
                 if src.len() != local_len * world {
                     return Err(AutogradError::DataLengthMismatch {
@@ -2258,7 +2258,7 @@ impl Backend for CudaBackend {
                 }
                 return Ok(DeviceHandle::Cuda(CudaStorage::new(out)));
             }
-            #[cfg(not(feature = "nccl"))]
+            #[cfg(not(all(feature = "nccl", not(feature = "no-cuda"))))]
             unreachable!("world>1 without nccl feature")
         }
     }
@@ -2286,9 +2286,9 @@ impl Backend for CudaBackend {
                 });
             }
 
-            #[cfg(feature = "nccl")]
+            #[cfg(all(feature = "nccl", not(feature = "no-cuda")))]
             let world = self.nccl.as_ref().map_or(1, |nccl| nccl.world_size());
-            #[cfg(not(feature = "nccl"))]
+            #[cfg(not(all(feature = "nccl", not(feature = "no-cuda"))))]
             let world = 1usize;
             // Single rank: the ring degenerates to the local block (identity).
             if world <= 1 {
@@ -2299,7 +2299,7 @@ impl Backend for CudaBackend {
             // from (rank-1+world)%world, both inside one group so NCCL pairs the
             // matched send/recv without deadlock. Blocks are equal-length (the
             // launcher pads seq to a multiple of world), so recv fills `len`.
-            #[cfg(feature = "nccl")]
+            #[cfg(all(feature = "nccl", not(feature = "no-cuda")))]
             {
                 let nccl = self.nccl.as_ref().expect("world>1 implies nccl present");
                 let rank = nccl.rank();
@@ -2325,19 +2325,19 @@ impl Backend for CudaBackend {
                 }
                 return Ok(DeviceHandle::Cuda(CudaStorage::new(out)));
             }
-            #[cfg(not(feature = "nccl"))]
+            #[cfg(not(all(feature = "nccl", not(feature = "no-cuda"))))]
             unreachable!("world>1 without nccl feature")
         }
     }
 
     fn collective_world_rank(&self) -> (usize, usize) {
-        #[cfg(feature = "nccl")]
+        #[cfg(all(feature = "nccl", not(feature = "no-cuda")))]
         {
             self.nccl
                 .as_ref()
                 .map_or((1, 0), |nccl| (nccl.world_size(), nccl.rank()))
         }
-        #[cfg(not(feature = "nccl"))]
+        #[cfg(not(all(feature = "nccl", not(feature = "no-cuda"))))]
         {
             (1, 0)
         }
@@ -2369,9 +2369,9 @@ impl Backend for CudaBackend {
                 });
             }
 
-            #[cfg(feature = "nccl")]
+            #[cfg(all(feature = "nccl", not(feature = "no-cuda")))]
             let world = self.nccl.as_ref().map_or(1, |nccl| nccl.world_size());
-            #[cfg(not(feature = "nccl"))]
+            #[cfg(not(all(feature = "nccl", not(feature = "no-cuda"))))]
             let world = 1usize;
             // Single rank: no rank to shuffle to — identity on shape and value.
             // Share the input Arc (functional buffers) — no alloc, no D2D copy.
