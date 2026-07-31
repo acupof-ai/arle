@@ -10,7 +10,7 @@ default = []
 serde = ["dep:serde"]
 
 [dependencies]
-serde = { workspace = true, optional = true, features = ["derive"] }
+serde = { workspace = true, optional = true, features = ["derive", "rc"] }
 thiserror = { workspace = true }
 
 [lints]
