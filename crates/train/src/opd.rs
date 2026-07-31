@@ -5353,4 +5353,94 @@ mod tests {
         let targets = build_masked_loss_targets(&full, 1, &[1u8, 1]);
         assert_eq!(targets, vec![(0usize, 7usize), (1, 8)]);
     }
+
+    // The pod showed CP loss-sum 5.5% off the f32 single-card loss while the CP
+    // HIDDEN tracks f32 — isolating the bug to the masked-CE aggregation over the
+    // zigzag shards, which is pure host arithmetic. This reproduces exactly that
+    // aggregation on CPU (no ring, no GPU): given a FIXED hidden, the single-card
+    // CE over all targets must equal the sum of per-zigzag-shard CE with
+    // inv_n=1/global. The shard gathers its rows (`local_rows`), so the target at
+    // global position p uses shard-local row `local_of(p)` of the gathered hidden —
+    // the same remap opd.rs does. A wrong remap / inv_n / double-count breaks this.
+    #[test]
+    fn cp_sharded_ce_sum_equals_single_card_ce() {
+        use crate::context_parallel::CpContext;
+        use autograd::ops::fused_linear_distill::fused_linear_ce_loss_indexed;
+
+        let (seq, hidden_dim, vocab) = (16usize, 8usize, 16usize);
+        let cp_size = 2;
+        // Deterministic hidden [1, seq, hidden] and lm_head [vocab, hidden].
+        let synth = |n: usize, seed: u64| -> Vec<f32> {
+            let mut s = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            (0..n)
+                .map(|_| {
+                    s ^= s << 13;
+                    s ^= s >> 7;
+                    s ^= s << 17;
+                    ((s >> 40) as f32 / (1u64 << 24) as f32) - 0.5
+                })
+                .collect()
+        };
+        let hidden_data = synth(seq * hidden_dim, 7);
+        let weight_data = synth(vocab * hidden_dim, 9);
+
+        // Targets: predict positions 3..=14 (prompt_len 4), token cycling in-vocab.
+        let targets: Vec<(usize, usize)> =
+            (3..=seq - 2).map(|p| (p, (p * 3 + 1) % vocab)).collect();
+        let global_targets = targets.len();
+        let inv_n = 1.0f32 / global_targets as f32;
+
+        let ce = |store: &mut TensorStore,
+                  hidden: &[f32],
+                  rows: usize,
+                  pos: &[i32],
+                  tgt: &[i32],
+                  inv: Option<f32>|
+         -> f32 {
+            let h = store
+                .alloc(Tensor::new(hidden.to_vec(), vec![1, rows, hidden_dim], false).unwrap());
+            let w = store
+                .alloc(Tensor::new(weight_data.clone(), vec![vocab, hidden_dim], false).unwrap());
+            let mut tape = Tape::new();
+            tape.set_enabled(false);
+            let loss =
+                fused_linear_ce_loss_indexed(h, w, pos, tgt, 64, inv, store, &mut tape).unwrap();
+            store.to_host(loss).unwrap()[0]
+        };
+
+        // Single card: whole sequence, all targets, inv_n = 1/global (the default
+        // 1/num_targets == 1/global here since num_targets == global).
+        let mut store = TensorStore::default();
+        let (pos_all, tgt_all): (Vec<i32>, Vec<i32>) =
+            targets.iter().map(|&(p, t)| (p as i32, t as i32)).unzip();
+        let loss_single = ce(&mut store, &hidden_data, seq, &pos_all, &tgt_all, None);
+
+        // CP: each zigzag shard gathers its rows, remaps targets via local_of,
+        // inv_n = 1/global; sum over shards must equal the single-card loss.
+        let mut loss_cp = 0.0f32;
+        for rank in 0..cp_size {
+            let shard = CpContext::new(rank, cp_size).shard(seq);
+            let rows = shard.local_rows();
+            let mut shard_hidden = Vec::with_capacity(rows.len() * hidden_dim);
+            for &r in &rows {
+                shard_hidden.extend_from_slice(&hidden_data[r * hidden_dim..(r + 1) * hidden_dim]);
+            }
+            let (pos, tgt): (Vec<i32>, Vec<i32>) = targets
+                .iter()
+                .filter_map(|&(p, t)| shard.local_of(p).map(|l| (l as i32, t as i32)))
+                .unzip();
+            if pos.is_empty() {
+                continue;
+            }
+            let mut s = TensorStore::default();
+            loss_cp += ce(&mut s, &shard_hidden, rows.len(), &pos, &tgt, Some(inv_n));
+        }
+
+        let rel = (loss_single - loss_cp).abs() / loss_single.abs().max(1e-6);
+        assert!(
+            rel < 1e-5,
+            "CP-sharded CE sum {loss_cp} != single-card CE {loss_single} (rel {rel}) — \
+             masked-CE aggregation over zigzag shards is wrong"
+        );
+    }
 }
