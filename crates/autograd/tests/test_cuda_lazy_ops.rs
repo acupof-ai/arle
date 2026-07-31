@@ -2242,6 +2242,9 @@ fn cuda_ring_block_matches_host_reference_fwd_bwd() {
     for shard in 0..n {
         let q_abs = shard * blk;
         let q_h = dev_upload(&q[q_abs * dim..(q_abs + blk) * dim], blk * dim);
+        // Contiguous positions: q rows q_abs..q_abs+blk, block s rows s..s+blk.
+        let q_pos: Vec<f32> = (q_abs..q_abs + blk).map(|p| p as f32).collect();
+        let q_pos_h = dev_upload(&q_pos, blk);
         // Forward: merge blocks 0..=shard in order.
         let mut acc_m = dev_upload(&neg_inf, blk);
         let mut acc_l = dev_upload(&vec![0.0f32; blk], blk);
@@ -2250,6 +2253,8 @@ fn cuda_ring_block_matches_host_reference_fwd_bwd() {
             let s = j * blk;
             let k_h = dev_upload(&k[s * dim..(s + blk) * dim], blk * dim);
             let v_h = dev_upload(&v[s * dim..(s + blk) * dim], blk * dim);
+            let k_pos: Vec<f32> = (s..s + blk).map(|p| p as f32).collect();
+            let k_pos_h = dev_upload(&k_pos, blk);
             let dims = RingBlockDims {
                 num_q_tiles: 1,
                 num_q_heads: 1,
@@ -2257,12 +2262,12 @@ fn cuda_ring_block_matches_host_reference_fwd_bwd() {
                 head_dim: dim,
                 q_rows: blk,
                 blk_len: blk,
-                q_abs,
-                k_abs: s,
                 sm_scale: scale,
             };
             let (m2, l2, o2) = backend
-                .ring_block_fwd_merge(&q_h, &k_h, &v_h, &acc_m, &acc_l, &acc_o, dims)
+                .ring_block_fwd_merge(
+                    &q_h, &k_h, &v_h, &acc_m, &acc_l, &acc_o, &q_pos_h, &k_pos_h, dims,
+                )
                 .expect("ring fwd merge");
             acc_m = m2;
             acc_l = l2;
@@ -2281,6 +2286,8 @@ fn cuda_ring_block_matches_host_reference_fwd_bwd() {
             let s = j * blk;
             let k_h = dev_upload(&k[s * dim..(s + blk) * dim], blk * dim);
             let v_h = dev_upload(&v[s * dim..(s + blk) * dim], blk * dim);
+            let k_pos: Vec<f32> = (s..s + blk).map(|p| p as f32).collect();
+            let k_pos_h = dev_upload(&k_pos, blk);
             let dims = RingBlockDims {
                 num_q_tiles: 1,
                 num_q_heads: 1,
@@ -2288,12 +2295,12 @@ fn cuda_ring_block_matches_host_reference_fwd_bwd() {
                 head_dim: dim,
                 q_rows: blk,
                 blk_len: blk,
-                q_abs,
-                k_abs: s,
                 sm_scale: scale,
             };
             let (gq2, gk_b, gv_b) = backend
-                .ring_block_bwd(&q_h, &k_h, &v_h, &out_h, &lse_h, &do_h, &grad_q, dims)
+                .ring_block_bwd(
+                    &q_h, &k_h, &v_h, &out_h, &lse_h, &do_h, &grad_q, &q_pos_h, &k_pos_h, dims,
+                )
                 .expect("ring bwd");
             grad_q = gq2;
             let gk_v = backend.readback(&gk_b).expect("gk readback");
