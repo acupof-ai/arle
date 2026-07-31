@@ -1,7 +1,26 @@
 # Zigzag ring device kernel: per-row positions ride the ring — 2026-07-31
 
 > Status: Kernel + backend + ops landed; Mac CUDA typecheck + host ring tests
-> green. Pod >65535 zigzag parity is the gate — pending-remote (nvcc + NCCL).
+> green. Pod 2026-08-01: 256K LIVENESS proven (see below); parity still FAILs
+> (5.2% rel_err) — a device-ring correctness bug, isolation test in flight.
+>
+> **Pod liveness (2026-08-01, HEAD e739a1105, GPUs 1,3):** `nd_parallel_parity`
+> `ARLE_ND_SEQ=131072` cp=2 (local shard 65536) **completed a full optimizer
+> step** — single-card ref (`DONE loss=3.232068` over 131068 targets) then BOTH
+> CP ranks forward+CE+backward+optimizer. Peak host RSS **4.37 GB**, min
+> MemAvailable **1.57 TB**, GPU ≤20.5 GB. This is the exact stage that host-OOM'd
+> at 343 GB before; the fix was `head_dim` 2→128 in the parity model so the
+> single-card ref uses the bf16 chunked-prefill kernel (attention.rs:168) instead
+> of the f32 composed `causal_sdpa` that materialized `[heads,seq,seq]`. The ring
+> itself never materializes full-seq (peak O(seq/N·block)). #59/#66 closed.
+>
+> **Open (parity):** rel_err 5.2% (seq=16) / 2.2% (seq=131072), deterministic
+> (bit-identical rerun), RUN_EXIT=1 = assertion only (no crash). Loss asymmetric
+> across zigzag ranks (rank1 contiguous shard fine, rank0 non-contiguous off) →
+> device ring diverges from its verified host math. The `head_dim=2` 0.39% was a
+> genuine f32-vs-bf16 confound (ref off-envelope); at 128 both paths are bf16 so
+> 5.2% is a real kernel/transport bug. Bisected by a single-GPU kernel-vs-host
+> isolation test (`device_ring_two_blocks_matches_host_reference_gqa_hd128`).
 
 ## Context
 
