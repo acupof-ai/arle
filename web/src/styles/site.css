@@ -31,6 +31,31 @@ body {
 
 ::selection { background: var(--selection); color: var(--selection-fg); }
 
+/* Scroll-driven section entrance. Declarative, zero JS: each section past
+   the hero fades up as it enters view. `@supports` gates it so browsers
+   without scroll timelines just show the content — no IntersectionObserver
+   fallback to ship. */
+@supports (animation-timeline: view()) {
+  @media (prefers-reduced-motion: no-preference) {
+    .page > section {
+      animation: section-in linear both;
+      animation-timeline: view();
+      animation-range: entry 0% entry 42%;
+    }
+    /* The banded manifesto section is full-bleed; animating it would clip
+       the 50vw bleed, so it enters without transform. */
+    .page > section.band { animation-name: section-fade; }
+  }
+}
+@keyframes section-in {
+  from { opacity: 0; transform: translateY(22px); }
+  to   { opacity: 1; transform: none; }
+}
+@keyframes section-fade {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
 a {
   color: var(--ink);
   text-decoration: underline;

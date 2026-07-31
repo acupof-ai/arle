@@ -36,7 +36,9 @@ const { hero } = Astro.props;
       <span><span class="dots"><i></i><i></i><i></i></span>{hero.terminal.title}</span>
       <span>{hero.terminal.cwd}</span>
     </div>
-    <pre set:html={hero.terminal.lines.join("\n")}></pre>
+    <pre>{hero.terminal.lines.map((line, i) => (
+      <span class="tline" style={`--i: ${i}`} set:html={line === "" ? "&nbsp;" : line} />
+    ))}</pre>
   </div>
 </section>
 <style>
@@ -96,8 +98,11 @@ const { hero } = Astro.props;
     right: -0.04em;
     top: 54%;
     border-top: 0.06em solid var(--coral);
-    transform: rotate(-1.5deg);
+    transform: rotate(-1.5deg) scaleX(0);
+    transform-origin: left center;
+    animation: strike 0.5s cubic-bezier(0.6, 0, 0.3, 1) 0.7s forwards;
   }
+  @keyframes strike { to { transform: rotate(-1.5deg) scaleX(1); } }
   .hero h1 :global(.quiet) { color: var(--ink-dim); }
 
   .lede {
@@ -132,6 +137,22 @@ const { hero } = Astro.props;
     background: var(--ok);
     display: inline-block;
     flex: none;
+    position: relative;
+  }
+  /* The name promised a pulse; give the live dots a ping halo. dim = idle,
+     so it stays still. */
+  .pulse.ok::after,
+  .pulse.warn::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    border-radius: 50%;
+    background: inherit;
+    animation: ping 2s cubic-bezier(0, 0, 0.2, 1) infinite;
+  }
+  @keyframes ping {
+    0%   { transform: scale(1); opacity: 0.6; }
+    70%, 100% { transform: scale(2.6); opacity: 0; }
   }
   .pulse.warn { background: var(--warn); }
   .pulse.dim  { background: var(--ink-dim); }
@@ -229,8 +250,47 @@ const { hero } = Astro.props;
     animation: blink 1.1s steps(2) infinite;
   }
   @keyframes blink { 50% { opacity: 0; } }
+
+  /* Each doctor line prints in sequence — a terminal filling in, not a
+     wall of text. `--i` sets the stagger; the last line carries the caret. */
+  .terminal .tline {
+    display: block;
+    white-space: pre;
+    opacity: 0;
+    animation: tline-in 0.26s ease forwards;
+    animation-delay: calc(0.62s + var(--i) * 0.11s);
+  }
+  @keyframes tline-in {
+    from { opacity: 0; transform: translateY(3px); }
+    to   { opacity: 1; transform: none; }
+  }
+
+  /* Entrance cascade — the lockup builds top-down before the fold. */
+  .kicker, .lockup, .hero h1, .lede, .signals, .ctas, .terminal {
+    animation: rise 0.5s cubic-bezier(0.2, 0.7, 0.2, 1) both;
+  }
+  .kicker   { animation-delay: 0.00s; }
+  .lockup   { animation-delay: 0.06s; }
+  .hero h1  { animation-delay: 0.13s; }
+  .lede     { animation-delay: 0.21s; }
+  .signals  { animation-delay: 0.29s; }
+  .ctas     { animation-delay: 0.36s; }
+  .terminal { animation-delay: 0.44s; }
+  @keyframes rise {
+    from { opacity: 0; transform: translateY(10px); }
+    to   { opacity: 1; transform: none; }
+  }
+
   @media (prefers-reduced-motion: reduce) {
     .terminal pre :global(.caret) { animation: none; }
+    .hero h1 :global(.magic)::after { animation: none; transform: rotate(-1.5deg); }
+    .pulse.ok::after, .pulse.warn::after { animation: none; opacity: 0; }
+    .terminal .tline,
+    .kicker, .lockup, .hero h1, .lede, .signals, .ctas, .terminal {
+      animation: none;
+      opacity: 1;
+      transform: none;
+    }
   }
 
   @media (max-width: 760px) {
