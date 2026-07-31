@@ -43,6 +43,19 @@ def main() -> None:
     model = AutoModelForCausalLM.from_pretrained(model_dir, dtype=torch.bfloat16)
     model.eval()
 
+    prompts = [
+        "The capital of France is",
+        "def fibonacci(n):",
+        "Q: What is 17 times 23? A:",
+        "The three primary colors are",
+        "In 1969, humans first landed on the",
+    ]
+    # Capture reference (clean BF16) logits BEFORE the in-place quant, so only
+    # one model is ever resident — storing 5 tiny logit vectors, not a 2nd model.
+    ref_ids = [tok(p, return_tensors="pt").input_ids for p in prompts]
+    with torch.no_grad():
+        ref_logits = [model(ids).logits[0, -1].float() for ids in ref_ids]
+
     # Round-trip every 2D linear weight in place: this is the served model.
     # DeepSeek FP8 scope excludes lm_head/embed (they set logits/inputs directly);
     # --scope deepseek skips lm_head to match. Per-tensor error is logged to find
@@ -53,13 +66,13 @@ def main() -> None:
     with torch.no_grad():
         for name, p in model.named_parameters():
             if p.dim() == 2 and name.endswith(".weight") and not any(s in name for s in skip):
-                fp8, sf = per_block_cast_to_fp8(p.data.cpu())
-                deq = dequant(fp8, sf).to(p.dtype)
-                rel = ((deq.float() - p.data.cpu().float()).norm()
-                       / p.data.cpu().float().norm()).item()
+                w = p.data.cpu().float()
+                fp8, sf = per_block_cast_to_fp8(w)
+                deq = dequant(fp8, sf)
+                rel = ((deq - w).norm() / w.norm()).item()
                 worst = max(worst, rel)
                 errs.append((rel, name))
-                p.data.copy_(deq.to(p.device))
+                p.data.copy_(deq.to(p.dtype).to(p.device))
                 n_q += 1
     errs.sort(reverse=True)
     print(f"scope={scope}: quantized {n_q} linear weights, worst rel-L2 = {worst:.4f}")
@@ -67,23 +80,11 @@ def main() -> None:
     for rel, name in errs[:3]:
         print(f"    {rel:.4f}  {name}")
 
-    # Reference logits: reload a clean BF16 copy.
-    ref = AutoModelForCausalLM.from_pretrained(model_dir, dtype=torch.bfloat16).eval()
-
-    prompts = [
-        "The capital of France is",
-        "def fibonacci(n):",
-        "Q: What is 17 times 23? A:",
-        "The three primary colors are",
-        "In 1969, humans first landed on the",
-    ]
     top1_hits = top5_hits = 0
     cos_sum = rel_sum = 0.0
-    for prompt in prompts:
-        ids = tok(prompt, return_tensors="pt").input_ids
+    for prompt, ids, lr in zip(prompts, ref_ids, ref_logits):
         with torch.no_grad():
             lq = model(ids).logits[0, -1].float()
-            lr = ref(ids).logits[0, -1].float()
         aq, ar = lq.argmax().item(), lr.argmax().item()
         top1_hits += aq == ar
         top5_hits += ar in lq.topk(5).indices.tolist()
