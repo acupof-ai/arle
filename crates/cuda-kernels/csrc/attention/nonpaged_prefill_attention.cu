@@ -52,7 +52,8 @@ __global__ void nonpaged_prefill_attention_kernel(
   }
 
   __shared__ float scores[NONPAGED_PREFILL_TILE];
-  __shared__ float q_sh[NONPAGED_PREFILL_MAX_WARPS * WARP_SIZE];
+  __shared__ float warp_partials[NONPAGED_PREFILL_MAX_WARPS *
+                                 NONPAGED_PREFILL_TILE];
   __shared__ float warp_scratch[NONPAGED_PREFILL_MAX_WARPS];
   __shared__ float running_max_s;
   __shared__ float running_sum_s;
@@ -69,32 +70,31 @@ __global__ void nonpaged_prefill_attention_kernel(
   // Fold the loop-invariant int64 offset into base pointers once (this is the only
   // term that can overflow int32); the hot loop then indexes with int32 row*head_dim
   // (< max_seq_len*head_dim < 2^31), keeping no live 64-bit reg pair across the loop.
-  const __nv_bfloat16 *k_head = k_cache + (int64_t)kv_head * max_seq_len * head_dim;
+  const __nv_bfloat16 *k_base = k_cache + (int64_t)kv_head * max_seq_len * head_dim + dim;
   const __nv_bfloat16 *v_base = v_cache + (int64_t)kv_head * max_seq_len * head_dim + dim;
-
-  q_sh[dim] = q_val;
-  __syncthreads();
 
   for (int tile_start = 0; tile_start < kv_len; tile_start += NONPAGED_PREFILL_TILE) {
     int tile_len = min(NONPAGED_PREFILL_TILE, kv_len - tile_start);
 
-    // One warp owns one key and strides head_dim in registers: a single
-    // reduction per key, num_warps keys in flight. Reducing across dims instead
-    // serialized one block-wide reduction per key.
-    for (int pos = warp; pos < tile_len; pos += num_warps) {
+    for (int pos = 0; pos < tile_len; ++pos) {
       int abs_pos = tile_start + pos;
       // Softmax is permutation-invariant, so a wrapped ring walk accumulates
       // identically to a contiguous one — only the physical row differs.
       int row = ring_modulus > 0 ? ((ring_base + abs_pos) % ring_modulus) : abs_pos;
-      const __nv_bfloat16 *k_row = k_head + row * head_dim;
-      float partial = 0.0f;
-      for (int d = lane; d < head_dim; d += WARP_SIZE) {
-        partial += q_sh[d] * __bfloat162float(k_row[d]);
-      }
+      float partial = q_val * __bfloat162float(k_base[row * head_dim]);
       partial = warp_reduce_sum(partial);
       if (lane == 0) {
-        scores[pos] = partial * sm_scale;
+        warp_partials[warp * NONPAGED_PREFILL_TILE + pos] = partial;
       }
+    }
+    __syncthreads();
+
+    if (dim < tile_len) {
+      float score = 0.0f;
+      for (int w = 0; w < num_warps; ++w) {
+        score += warp_partials[w * NONPAGED_PREFILL_TILE + dim];
+      }
+      scores[dim] = score * sm_scale;
     }
     __syncthreads();
 
@@ -121,19 +121,15 @@ __global__ void nonpaged_prefill_attention_kernel(
     }
     __syncthreads();
 
-    // Exponentiate once per key, not once per key per thread.
-    if (dim < tile_len) {
-      scores[dim] = expf(scores[dim] - running_max_s);
-    }
-    __syncthreads();
-
     o_acc *= rescale_s;
     float row_sum = 0.0f;
+    float current_max = running_max_s;
     for (int pos = 0; pos < tile_len; ++pos) {
+      float weight = expf(scores[pos] - current_max);
       int abs_pos = tile_start + pos;
       int row = ring_modulus > 0 ? ((ring_base + abs_pos) % ring_modulus) : abs_pos;
-      row_sum += scores[pos];
-      o_acc += scores[pos] * __bfloat162float(v_base[row * head_dim]);
+      row_sum += weight;
+      o_acc += weight * __bfloat162float(v_base[row * head_dim]);
     }
     if (dim == 0) {
       running_sum_s += row_sum;
