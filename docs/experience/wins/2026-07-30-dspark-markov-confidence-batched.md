@@ -251,7 +251,7 @@ late to schedule" objection; only the per-request top-k allocation reads the
 current step. Their SPS cost model is `bias + α(num_reqs) + θ(total rows)` —
 the same additive decomposition we measured (116 ms + 0.53 ms/row at c=16).
 
-## Scheduler core landed — bench pending-remote
+## Scheduler core landed — measured, it wins
 
 The port's first tranche is in (same day): static truncation deleted
 (`--dspark-conf-threshold` removed), confidence → survival cumprod →
@@ -260,8 +260,26 @@ seeded), cost model `--dspark-sps-bias-ms`/`--dspark-sps-row-ms` defaulting to
 the measured 211 + 0.53. Both stacks call the one function: Qwen3.5/3.6
 batch-global (R=b), DSv4 per-slot (R=1). No lag ring (sync engine — current
 survival precedes verify), no STS (no fitted temperatures yet). Host unit gate
-`budget_scales_with_survival`; GPU A/B **pending-remote**, deliberately after
-the ragged-chain fix per the section above.
+`budget_scales_with_survival`.
+
+**GPU A/B** (H20 GPU 3, ThinkingCap-27B-FP8, block 6, agent-32k prompts,
+128 reqs/point, `scripts/`-equivalent probe at `/host/spec-phase/probe.sh`;
+needle ladder `exact=3 DET` at 512/4k/16k/32k on both spec arms):
+
+| arm | c=1 TPOT | c=16 TPOT | accept c=1 | accept c=16 | depth c=16 |
+|---|---|---|---|---|---|
+| no-spec | 78.25 ms | 262.49 ms | — | — | — |
+| DFlash blk6 (fixed 5 rows) | 21.77 ms | 162.50 ms | 0.504 | 0.275 | 5.00 |
+| fr-native blk6 + goodput | **20.93 ms** | **153.96 ms** | 0.539 | **0.402** | **3.79** |
+
+The scheduler does exactly what the model says it should: at c=1 rows are
+nearly free, it admits the full block (depth 5.00, TPOT −3.9% vs the fixed
+control); at c=16 rows are dear, it cuts the average chain to 3.79 rows, and
+accept rises 0.275 → 0.402 while TPOT drops 5.3%. Trading depth for accept
+under load is the whole point of `argmax_B τ*(B)/step_time(B)`, and it is the
+first arm to shrink the c=1 → c=16 accept collapse (−0.14 vs the control's
+−0.23) instead of merely suffering it. Spec still costs 2× TPOT at c=16 vs
+c=1 — the ragged-chain penalty above is untouched and remains the top blocker.
 
 ## Rule
 
