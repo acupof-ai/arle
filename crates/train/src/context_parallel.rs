@@ -139,6 +139,17 @@ impl CpContext {
         self.size > 1
     }
 
+    /// Sequence length rounded up to a multiple of `2*size` — the zigzag split
+    /// precondition (`shard` panics otherwise). Identity when CP is off. Pad rows go
+    /// at the tail, past every real row, so causal attention never reaches them.
+    pub fn padded_seq_len(self, seq_len: usize) -> usize {
+        if self.size <= 1 {
+            return seq_len;
+        }
+        let period = 2 * self.size;
+        seq_len.div_ceil(period) * period
+    }
+
     /// This rank's zigzag load-balanced sequence shard: split the sequence into
     /// `2*size` equal chunks, own chunk `rank` and chunk `2*size-1-rank` (one from
     /// the front, one from the back). Under a causal mask the tail attends ~N× the
@@ -151,7 +162,10 @@ impl CpContext {
             return SeqShard::contiguous(0, seq_len);
         }
         let two_n = 2 * self.size;
-        debug_assert_eq!(
+        // Always checked (not debug_assert): a silent tail-drop when seq_len isn't a
+        // multiple of 2*size would corrupt every rank's gradient invisibly. Callers
+        // (opd.rs) pad up before sharding; this fires only on a broken contract.
+        assert_eq!(
             seq_len % two_n,
             0,
             "CP zigzag requires seq_len % (2*cp_size) == 0; pad the sequence up"
@@ -428,5 +442,39 @@ mod tests {
             reconstructed, want,
             "shard union must equal single-card set"
         );
+    }
+
+    // Regression: seq=14, cp=2 is NOT a multiple of 2*size=4, so the raw zigzag
+    // dropped the tail rows 12,13 — position 12 is a loss target, so CP loss came out
+    // ~10% low (pod baseline FAIL). After padded_seq_len(14)->16 every real target
+    // position is owned by exactly one shard.
+    #[test]
+    fn padded_shard_covers_every_target_when_seq_not_divisible() {
+        let size = 2;
+        let raw = 14;
+        let padded = CpContext::new(0, size).padded_seq_len(raw);
+        assert_eq!(padded, 16);
+        // Targets predict positions prompt_len-1..=raw-2 (prompt 4): 3..=12.
+        for target in 3..=raw - 2 {
+            let owners: Vec<usize> = (0..size)
+                .filter(|&r| {
+                    CpContext::new(r, size)
+                        .shard(padded)
+                        .local_of(target)
+                        .is_some()
+                })
+                .collect();
+            assert_eq!(
+                owners.len(),
+                1,
+                "target {target} owned by {owners:?}, want exactly one"
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "seq_len % (2*cp_size) == 0")]
+    fn shard_panics_on_indivisible_seq_never_silently_drops() {
+        let _ = CpContext::new(0, 2).shard(14); // 14 % 4 != 0
     }
 }

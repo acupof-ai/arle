@@ -3038,19 +3038,19 @@ pub fn masked_writeback_step<O: Optimizer>(
     }
 
     let prompt_len = prompt_ids.len();
-    let full: Vec<u32> = prompt_ids
+    let mut full: Vec<u32> = prompt_ids
         .iter()
         .copied()
         .chain(response_ids.iter().copied())
         .collect();
-    let seq_len = full.len();
+    let mut seq_len = full.len();
     if seq_len > u32::MAX as usize {
         return Err(OpdError::InvalidInput(format!(
             "masked writeback trajectory length {seq_len} exceeds u32::MAX \
              position ids."
         )));
     }
-    let positions: Vec<u32> = (0..seq_len as u32).collect();
+    let mut positions: Vec<u32> = (0..seq_len as u32).collect();
 
     let loss_targets = build_masked_loss_targets(&full, prompt_len, response_mask);
     if loss_targets.is_empty() {
@@ -3064,6 +3064,15 @@ pub fn masked_writeback_step<O: Optimizer>(
     }
     let total_targets = loss_targets.len();
     let chunk_rows = window_size; // reused: positions per fused-CE chunk.
+
+    // Pad the tail so CP zigzag can split evenly; pad rows carry no target and are
+    // never attended (see padded_seq_len). Single card is identity.
+    let padded = cp.padded_seq_len(seq_len);
+    if padded != seq_len {
+        full.resize(padded, 0);
+        positions.extend(seq_len as u32..padded as u32);
+        seq_len = padded;
+    }
 
     // Context-parallel sequence shard: this rank owns a zigzag pair of chunks
     // (front + back) for balanced causal work — `shard.local_rows()` is the gather

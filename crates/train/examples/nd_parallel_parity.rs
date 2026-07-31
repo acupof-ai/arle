@@ -55,19 +55,25 @@ fn main() {
     eprintln!("nd_parallel_parity requires --features cuda,nccl");
 }
 
-// Prompt/response shared by the reference and every CP rank. Default seq 14 splits
-// evenly across CP_SIZE=2 (a hard all_gather precondition). A SHORT prompt (4) so
-// masked targets (predicting positions [prompt_len-1 .. seq-2]) straddle BOTH
-// shards. `ARLE_ND_SEQ` overrides the total length (must be even, >= 6) to drive a
+// Prompt/response shared by the reference and every CP rank. Default seq 16 splits
+// into 2*CP_SIZE=4 evenly (the zigzag precondition; opd.rs also pads up, but an
+// already-divisible default keeps the reference trivially aligned). A SHORT prompt
+// (4) so masked targets (predicting positions [prompt_len-1 .. seq-2]) straddle BOTH
+// shards. `ARLE_ND_SEQ` overrides the total length (must be >= 6) to drive a
 // >65535-local-seq case (131072 → local 65536, the ring path): the prompt stays 4,
 // the response fills the rest with a deterministic vocab-cycling pattern so every
 // rank builds the identical trajectory and targets still cross the shard boundary.
 #[cfg(all(feature = "cuda", feature = "nccl"))]
-fn trajectory() -> (Vec<u32>, Vec<u32>, Vec<u8>) {
-    let seq = std::env::var("ARLE_ND_SEQ")
+fn nd_seq() -> usize {
+    std::env::var("ARLE_ND_SEQ")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(14);
+        .unwrap_or(16)
+}
+
+#[cfg(all(feature = "cuda", feature = "nccl"))]
+fn trajectory() -> (Vec<u32>, Vec<u32>, Vec<u8>) {
+    let seq = nd_seq();
     let prompt: Vec<u32> = vec![1, 3, 8, 2];
     // Vocab is 16 (tiny_full_attn_config); cycle non-special ids 4..=13 so targets
     // are deterministic and never hit the eos (15) / bos (1). Response length = seq
@@ -220,7 +226,9 @@ fn tiny_full_attn_config() -> Qwen35Config {
         rope_scaling: None,
         partial_rotary_factor: 1.0,
         rotary_dim: 2,
-        rope_cache_len_hint: Some(16),
+        // RoPE cache must cover every absolute position: seq (from ARLE_ND_SEQ,
+        // padded up by opd.rs) plus headroom. seq=131072 needs 131072 rows, not 16.
+        rope_cache_len_hint: Some(nd_seq().next_power_of_two().max(16)),
         layer_types: vec![LayerType::FullAttention, LayerType::FullAttention],
         num_experts: 0,
         num_experts_per_tok: 0,
