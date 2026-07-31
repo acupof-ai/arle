@@ -729,6 +729,37 @@ pub(super) fn gemm_batch(
                 .result()?;
                 GEMV_HITS.fetch_add(1, Ordering::Relaxed);
             }
+            WeightFormat::W8A16 => {
+                let qw = weight
+                    .qweight
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("W8A16 missing qweight"))?;
+                let scales = weight
+                    .qscales
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("W8A16 missing qscales"))?;
+                ensure!(
+                    weight.group_size > 0 && weight.cols.is_multiple_of(weight.group_size),
+                    "W8A16 cols {} not group-aligned to {}",
+                    weight.cols,
+                    weight.group_size
+                );
+                let (qw_ptr, _gqw) = qw.device_ptr(&ctx.stream);
+                let (scales_ptr, _gs) = scales.device_ptr(&ctx.stream);
+                ffi::w8a16_gemv_batch_cuda(
+                    qw_ptr as *const i8,
+                    scales_ptr as *const ffi::Half,
+                    x_ptr as *const ffi::Half,
+                    out_ptr as *mut ffi::Half,
+                    x.seq_len as i32,
+                    weight.rows as i32,
+                    weight.cols as i32,
+                    weight.group_size as i32,
+                    stream,
+                )
+                .result()?;
+                GEMV_HITS.fetch_add(1, Ordering::Relaxed);
+            }
             other => bail!("gemm_batch unsupported resident quant weight format {other}"),
         }
     }
@@ -889,6 +920,36 @@ pub(super) fn gemv(
                 let (scales_ptr, _gs) = scales.device_ptr(&ctx.stream);
                 ffi::w4a16_gemv_cuda(
                     qw_ptr as *const u8,
+                    scales_ptr as *const ffi::Half,
+                    x_ptr as *const ffi::Half,
+                    out_ptr as *mut ffi::Half,
+                    weight.rows as i32,
+                    weight.cols as i32,
+                    weight.group_size as i32,
+                    stream,
+                )
+                .result()?;
+                GEMV_HITS.fetch_add(1, Ordering::Relaxed);
+            }
+            WeightFormat::W8A16 => {
+                let qw = weight
+                    .qweight
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("W8A16 missing qweight"))?;
+                let scales = weight
+                    .qscales
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("W8A16 missing qscales"))?;
+                ensure!(
+                    weight.group_size > 0 && weight.cols.is_multiple_of(weight.group_size),
+                    "W8A16 cols {} not group-aligned to {}",
+                    weight.cols,
+                    weight.group_size
+                );
+                let (qw_ptr, _gqw) = qw.device_ptr(&ctx.stream);
+                let (scales_ptr, _gs) = scales.device_ptr(&ctx.stream);
+                ffi::w8a16_gemv_cuda(
+                    qw_ptr as *const i8,
                     scales_ptr as *const ffi::Half,
                     x_ptr as *const ffi::Half,
                     out_ptr as *mut ffi::Half,
