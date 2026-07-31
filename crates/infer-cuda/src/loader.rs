@@ -2295,6 +2295,9 @@ impl SafetensorLoader {
             QuantFormat::W4A16 { group_size } => {
                 self.load_w4a16_view(ctx, view, &shard, group_size)
             }
+            QuantFormat::W8A16 { group_size } => {
+                self.load_w8a16_view(ctx, view, &shard, group_size)
+            }
         }
     }
 
@@ -2669,6 +2672,68 @@ impl SafetensorLoader {
             group_size,
         )
         .with_context(|| format!("upload W4A16 tensor {}", view.name))
+    }
+
+    /// Load a W8A16 view: signed INT8 weights (non-packed, [rows, cols]) with
+    /// per-row per-column-group BF16 scales. Mirrors `load_w4a16_view` minus the
+    /// nibble packing — the CUDA `w8a16_gemv` kernel reads 1 byte per weight.
+    fn load_w8a16_view(
+        &self,
+        ctx: &DeviceContext,
+        view: &QuantTensorView,
+        shard: &QuantMatrixShard,
+        group_size: usize,
+    ) -> Result<DeviceMatrix> {
+        let weight = self.borrow_raw_tensor(&view.name)?;
+        let rows = view.logical_shape[0];
+        let cols = view.logical_shape[1];
+        ensure!(
+            weight.dtype == Dtype::I8 && weight.shape == [rows, cols],
+            "{}: expected INT8 [{rows}, {cols}], got {:?} {:?}",
+            view.name,
+            weight.dtype,
+            weight.shape
+        );
+        let weight_shard = self.shard_raw_2d_cow(weight.bytes(), rows, cols, 1, shard)?;
+        let scale = self.borrow_raw_tensor(&view.scale_names[0])?;
+        ensure!(
+            scale.dtype == Dtype::BF16 && scale.shape == [rows, cols / group_size],
+            "{}: expected BF16 group scale [{rows}, {}], got {:?} {:?}",
+            view.scale_names[0],
+            cols / group_size,
+            scale.dtype,
+            scale.shape
+        );
+        let scale_shard =
+            self.shard_w4a16_scales_cow(scale.bytes(), rows, cols, group_size, shard)?;
+        let scale_bf16 = Self::tensor_bytes_to_bf16(
+            &view.scale_names[0],
+            scale.dtype,
+            scale_shard.bytes.as_ref(),
+        )?;
+        // SAFETY: BF16 bytes (2 bytes/elem) are a valid `&[half::bf16]` slice.
+        let scales_data: &[half::bf16] = unsafe {
+            std::slice::from_raw_parts(
+                scale_bf16.as_ptr().cast::<half::bf16>(),
+                scale_bf16.len() / 2,
+            )
+        };
+        // SAFETY: I8 bytes are a valid `&[i8]` slice (align 1, all patterns valid).
+        let qweight: &[i8] = unsafe {
+            std::slice::from_raw_parts(
+                weight_shard.bytes.as_ref().as_ptr().cast::<i8>(),
+                weight_shard.bytes.as_ref().len(),
+            )
+        };
+        DeviceMatrix::from_quantized_int8(
+            ctx,
+            qweight,
+            scales_data,
+            weight_shard.rows,
+            weight_shard.cols,
+            group_size,
+        )
+        .with_context(|| format!("upload W8A16 tensor {}", view.name))
     }
 
     fn shard_w4a16_scales_cow<'a>(

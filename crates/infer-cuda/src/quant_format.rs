@@ -29,6 +29,9 @@ pub(crate) enum QuantFormat {
     W4A16 {
         group_size: usize,
     },
+    W8A16 {
+        group_size: usize,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -218,6 +221,34 @@ pub(crate) fn detect_quant_format(
                 scale_names: vec![format!("{base}.weight_scale")],
             }
         }
+        // W8A16: signed INT8 weights, NOT packed (1 byte/elem, shape ==
+        // logical), per-row per-column-group BF16 scale. Distinct from W4A16
+        // by dtype (I8 vs U8), so no ambiguity.
+        Dtype::I8
+            if tensors
+                .get(&format!("{base}.weight_scale"))
+                .is_some_and(|s| s.dtype == Dtype::BF16) =>
+        {
+            let scale = tensor_by_name(tensors, &format!("{base}.weight_scale"))?;
+            ensure!(
+                scale.shape.len() == 2 && scale.shape[1] != 0,
+                "{name}: W8A16 weight_scale must be rank-2 with nonzero K, got {:?}",
+                scale.shape
+            );
+            let group_size = tensor.shape[1] / scale.shape[1];
+            ensure!(
+                group_size > 0 && tensor.shape[1] % group_size == 0,
+                "{name}: W8A16 logical K {} not group-aligned to {group_size}",
+                tensor.shape[1]
+            );
+            QuantTensorView {
+                name: name.to_owned(),
+                logical_shape: tensor.shape.clone(),
+                storage_dtype: tensor.dtype,
+                format: QuantFormat::W8A16 { group_size },
+                scale_names: vec![format!("{base}.weight_scale")],
+            }
+        }
         _ => return Ok(None),
     };
     validate_scale_shapes(&view, tensors)?;
@@ -347,6 +378,35 @@ pub(crate) fn validate_scale_shapes(
             );
             Ok(())
         }
+        QuantFormat::W8A16 { group_size } => {
+            ensure!(
+                view.logical_shape.len() == 2,
+                "{}: W8A16 weights must be rank-2",
+                view.name
+            );
+            ensure!(
+                view.logical_shape[1].is_multiple_of(group_size),
+                "{}: W8A16 logical K {} must be group-aligned to {group_size}",
+                view.name,
+                view.logical_shape[1]
+            );
+            let scale = tensor_by_name(tensors, &view.scale_names[0])?;
+            ensure!(
+                scale.dtype == Dtype::BF16,
+                "{}: W8A16 weight_scale must be BF16, got {:?}",
+                view.scale_names[0],
+                scale.dtype
+            );
+            let expected = [view.logical_shape[0], view.logical_shape[1] / group_size];
+            ensure!(
+                scale.shape == expected,
+                "{}: W8A16 weight_scale shape {:?} != {:?}",
+                view.scale_names[0],
+                scale.shape,
+                expected
+            );
+            Ok(())
+        }
     }
 }
 
@@ -470,6 +530,40 @@ mod tests {
                 scale_apply: ScaleApply::Multiply,
             }
         );
+    }
+
+    #[test]
+    fn w8a16_int8_detect_and_group_size() {
+        let mut tensors = BTreeMap::new();
+        let base = "model.language_model.layers.0.mlp.down_proj";
+        let weight = format!("{base}.weight");
+        // INT8 weight [512, 2048], non-packed; BF16 scale [512, 16] => group 128.
+        tensors.insert(weight.clone(), header(Dtype::I8, &[512, 2048]));
+        tensors.insert(
+            format!("{base}.weight_scale"),
+            header(Dtype::BF16, &[512, 16]),
+        );
+
+        let view = detect_quant_format(&weight, &tensors, None)
+            .unwrap()
+            .expect("W8A16 view");
+        assert_eq!(view.format, QuantFormat::W8A16 { group_size: 128 });
+        assert_eq!(view.logical_shape, vec![512, 2048]);
+        validate_scale_shapes(&view, &tensors).expect("W8A16 scale shape valid");
+
+        // Wrong scale K (not group-divisible) must reject.
+        let mut bad = tensors.clone();
+        bad.insert(
+            format!("{base}.weight_scale"),
+            header(Dtype::BF16, &[512, 15]),
+        );
+        // Wrong scale K (not group-divisible) must reject at detect.
+        let mut bad = tensors.clone();
+        bad.insert(
+            format!("{base}.weight_scale"),
+            header(Dtype::BF16, &[512, 15]),
+        );
+        assert!(detect_quant_format(&weight, &bad, None).is_err());
     }
 
     #[test]
