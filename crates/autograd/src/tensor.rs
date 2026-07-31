@@ -701,6 +701,44 @@ impl TensorStore {
     /// re-uploads it. Used to offload grad-checkpoints to host RAM during a long
     /// training forward so they don't pin ~30 GB of VRAM. Returns bytes freed.
     pub fn offload_to_host(&mut self, id: TensorId) -> Result<usize> {
+        let (size, dirty, has_handle, residency) = {
+            let t = self.tensor(id)?;
+            (
+                t.size,
+                t.dirty.clone(),
+                t.device_handle.is_some(),
+                t.checkpoint_residency,
+            )
+        };
+        // Fast path: a live device buffer read back into a pooled host buffer,
+        // reused across parks instead of a fresh Vec each call (#191). The
+        // buffer returns to the pool on the next `ensure_device` (residency ==
+        // Host branch there). Sole caller — chunk-accumulator park — is always
+        // device-resident and never L3, so the fallback below is defensive.
+        if has_handle && dirty == Dirty::Device && residency == CheckpointResidency::None {
+            let handle = self
+                .tensor(id)?
+                .device_handle
+                .as_ref()
+                .expect("has_handle")
+                .clone();
+            self.backend().eval(&[&handle])?;
+            let mut host = self.checkpoint_offload_pool.take(size);
+            self.backend().readback_into(&handle, &mut host)?;
+            let bytes = size * std::mem::size_of::<f32>();
+            let old = {
+                let t = self.raw_tensor_mut(id)?;
+                t.device_handle = None;
+                t.dirty = Dirty::Host;
+                t.checkpoint_residency = CheckpointResidency::Host;
+                std::mem::replace(&mut t.data, host)
+            };
+            if let Some(l3) = &mut self.checkpoint_l3 {
+                l3.host_bytes = l3.host_bytes.saturating_add(bytes);
+            }
+            self.checkpoint_offload_pool.recycle(old);
+            return Ok(bytes);
+        }
         self.ensure_host(id)?;
         self.discard_checkpoint_copy(id)?;
         let tensor = self.raw_tensor_mut(id)?;
@@ -869,13 +907,25 @@ impl TensorStore {
 
         match existing_grad {
             Some(existing_id) => {
-                let both_on_device = {
+                // `owned` only claims no lifetime alias (from `keep_in_grads`),
+                // not that the device buffer is unshared — grads fan out by Arc
+                // clone (clone_tensor / add_backward), so in-place would corrupt
+                // a live sibling. Probe the store-held handle's strong-count
+                // BEFORE the clone below (the clone bumps it); `Some(1)` proves
+                // sole ownership. Mirrors the tape.rs accumulate path.
+                let (both_on_device, existing_uniquely_owned) = {
                     let existing = self.tensor(existing_id)?;
                     let incoming = self.tensor(grad_id)?;
-                    existing.dirty != Dirty::Host
+                    let both = existing.dirty != Dirty::Host
                         && existing.device_handle.is_some()
                         && incoming.dirty != Dirty::Host
-                        && incoming.device_handle.is_some()
+                        && incoming.device_handle.is_some();
+                    let unique = existing
+                        .device_handle
+                        .as_ref()
+                        .and_then(DeviceHandle::device_buffer_strong_count)
+                        == Some(1);
+                    (both, unique)
                 };
                 if both_on_device {
                     let existing_handle = self
@@ -890,7 +940,7 @@ impl TensorStore {
                         .as_ref()
                         .expect("checked above")
                         .clone();
-                    let sum_handle = if owned {
+                    let sum_handle = if owned && existing_uniquely_owned {
                         self.backend().accumulate_into_device(
                             &existing_handle,
                             &incoming_handle,
@@ -1081,6 +1131,36 @@ mod tests {
         assert_eq!(tensor.dirty, Dirty::Host);
         assert!(tensor.device_handle.is_none());
         assert_eq!(tensor.data[0], 9.0);
+    }
+
+    #[test]
+    fn offload_to_host_roundtrip_preserves_data_via_pool() {
+        // #191: offload_to_host reads a device-ONLY tensor (as the chunk-
+        // accumulator holds it) back into a pooled host buffer (fast path),
+        // then ensure_device recycles it. The gate asserts (a) the fast path
+        // ran — residency flips to Host, not the old None — and (b) the round
+        // trip is bit-exact after the pooled copy.
+        let mut store = TensorStore::default();
+        let data: Vec<f32> = (0..64).map(|i| i as f32 * 0.5).collect();
+        let handle = store.backend().upload(&data, &[8, 8]).expect("upload");
+        let id = store
+            .alloc_device_tensor(vec![8, 8], handle)
+            .expect("alloc device-only");
+        assert_eq!(store.get(id).expect("tensor").dirty, Dirty::Device);
+
+        let freed = store.offload_to_host(id).expect("offload");
+        assert_eq!(freed, 64 * std::mem::size_of::<f32>());
+        {
+            let t = store.get(id).expect("tensor");
+            assert!(t.device_handle.is_none(), "device buffer released");
+            assert_eq!(t.dirty, Dirty::Host);
+            // Old discard-path left None; the pooled path marks Host so the
+            // next ensure_device recycles the buffer instead of dropping it.
+            assert_eq!(t.checkpoint_residency, CheckpointResidency::Host);
+        }
+
+        store.ensure_device(id).expect("re-upload");
+        assert_eq!(store.to_host(id).expect("host"), data);
     }
 
     #[test]
