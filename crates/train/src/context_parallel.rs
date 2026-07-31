@@ -44,7 +44,7 @@ fn env_usize(key: &str, default: usize) -> usize {
 }
 
 /// A rank's position in the context-parallel group — the `attn_cp` axis of the
-/// mesh. Mirrors `Qwen35TensorParallelConfig`, but the axis is SEQUENCE.
+/// mesh. Mirrors `TpContext`, but the axis is SEQUENCE.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CpContext {
     pub rank: usize,

@@ -21,10 +21,7 @@ use cuda_kernels::ffi::nccl;
 #[cfg(all(feature = "cuda", feature = "nccl"))]
 use qwen35_spec::{LayerType, Qwen35Config};
 #[cfg(all(feature = "cuda", feature = "nccl"))]
-use train::{
-    LoraConfig, LoraTargetSet,
-    qwen35::{Qwen35Model, Qwen35TensorParallelConfig},
-};
+use train::{LoraConfig, LoraTargetSet, qwen35::Qwen35Model, tensor_parallel::TpContext};
 
 #[cfg(all(feature = "cuda", feature = "nccl"))]
 const DEFAULT_EPS: f32 = 2.0e-3;
@@ -188,7 +185,7 @@ fn rank_main(rank: usize) -> Result<()> {
         rank: 2,
         alpha: 4.0,
     };
-    let tp = Qwen35TensorParallelConfig::new(rank, world);
+    let tp = TpContext::new(rank, world);
     let model = Qwen35Model::new_with_lora_targets_and_tp(
         &cfg,
         lora,
