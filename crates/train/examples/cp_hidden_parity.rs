@@ -151,7 +151,7 @@ fn coordinator_main() -> Result<()> {
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).with_context(|| format!("create {root}"))?;
 
-    // Single-card reference: full-seq forward, in-process on the first device.
+    // Single-card CUDA reference: full-seq forward, in-process on the first device.
     let ref_hidden = {
         let backend = CudaBackend::new(devices[0])
             .with_context(|| format!("CudaBackend::new({})", devices[0]))?;
@@ -166,7 +166,36 @@ fn coordinator_main() -> Result<()> {
             .context("single-card forward_hidden_states")?;
         store.to_host(h)?
     };
+    // CPU-f32 GROUND TRUTH: same name-seeded model on the default (CPU) backend.
+    // Disambiguates a real CP bug from a bf16-vs-f32 artifact — the single-card
+    // CUDA ref uses the bf16 prefill kernel (lossy output), the CP path is f32, so
+    // "CP != single-card" alone can't tell which is wrong. Whichever CUDA path is
+    // CLOSER to this f32 reference is the more correct one.
+    let cpu_hidden = {
+        let mut store = TensorStore::default();
+        let model = build_model(&mut store)?;
+        let full = full_tokens();
+        let pos: Vec<u32> = (0..SEQ as u32).collect();
+        let mut tape = Tape::new();
+        tape.set_enabled(false);
+        let h = model
+            .forward_hidden_states(&mut store, &mut tape, &full, &pos)
+            .context("CPU-f32 forward_hidden_states")?;
+        store.to_host(h)?
+    };
     let hidden_size = tiny_cfg().hidden_size;
+    // Single-card CUDA vs CPU-f32: the precision floor the CP path is judged against.
+    let single_vs_cpu = (0..SEQ)
+        .map(|r| {
+            let a = &ref_hidden[r * hidden_size..(r + 1) * hidden_size];
+            let b = &cpu_hidden[r * hidden_size..(r + 1) * hidden_size];
+            a.iter()
+                .zip(b)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max)
+        })
+        .fold(0.0f32, f32::max);
+    println!("single_card_cuda_vs_cpu_f32 max_diff={single_vs_cpu:.6e}");
 
     // Spawn CP ranks.
     let exe = std::env::current_exe()?;
@@ -185,9 +214,12 @@ fn coordinator_main() -> Result<()> {
         ensure!(status.success(), "CP rank {rank} exited {status:?}");
     }
 
-    // Compare each CP shard row against the single-card row at the same global pos.
+    // Compare each CP shard row against BOTH the single-card CUDA row and the
+    // CPU-f32 ground truth at the same global pos. worst = CP-vs-single (the gate);
+    // cp_vs_cpu = CP-vs-f32 (does CP track f32 better than single-card does?).
     let mut worst = 0.0f32;
     let mut worst_row = 0usize;
+    let mut cp_vs_cpu = 0.0f32;
     for rank in 0..CP_SIZE {
         let (rows, data) = read_rows(&root, rank, hidden_size)?;
         for (local, &g) in rows.iter().enumerate() {
@@ -202,8 +234,15 @@ fn coordinator_main() -> Result<()> {
                 worst = d;
                 worst_row = g;
             }
+            let cpu = &cpu_hidden[g * hidden_size..(g + 1) * hidden_size];
+            let dc = got
+                .iter()
+                .zip(cpu)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            cp_vs_cpu = cp_vs_cpu.max(dc);
         }
-        // Per-rank worst so the zigzag asymmetry (contiguous vs not) is visible.
+        // Per-rank worst (vs single-card) so the zigzag asymmetry is visible.
         let rank_worst = rows
             .iter()
             .enumerate()
@@ -216,16 +255,21 @@ fn coordinator_main() -> Result<()> {
                     .fold(0.0f32, f32::max)
             })
             .fold(0.0f32, f32::max);
-        println!("rank {rank} shard_rows={rows:?} max_diff={rank_worst:.6e}");
+        println!("rank {rank} shard_rows={rows:?} max_diff_vs_single={rank_worst:.6e}");
     }
 
     println!("cp_hidden_parity cp_size={CP_SIZE} devices={devices:?} seq={SEQ}");
-    println!("worst_row={worst_row} worst_max_diff={worst:.6e} tol={REL_TOL:.1e}");
-    ensure!(
-        worst <= REL_TOL,
-        "CP hidden mismatch: worst row {worst_row} max_diff={worst} exceeds {REL_TOL}"
+    println!(
+        "cp_vs_single={worst:.6e} (worst_row={worst_row})  cp_vs_cpu_f32={cp_vs_cpu:.6e}  single_vs_cpu_f32={single_vs_cpu:.6e}  tol={REL_TOL:.1e}"
     );
-    println!("PASS");
+    // The real correctness question: is CP as close to f32 as single-card is? If
+    // cp_vs_cpu <= single_vs_cpu (within tol), CP is not the wrong one — the
+    // cp_vs_single gap is just single-card's bf16-prefill lossiness.
+    ensure!(
+        cp_vs_cpu <= single_vs_cpu.max(REL_TOL),
+        "CP diverges from f32 ground truth MORE than single-card does: cp_vs_cpu={cp_vs_cpu} single_vs_cpu={single_vs_cpu}"
+    );
+    println!("PASS (CP tracks f32 ground truth at least as well as single-card)");
     Ok(())
 }
 
