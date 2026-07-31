@@ -2,7 +2,8 @@
    Mirrors the live cklxx/arle palette: near-monochrome with one coral
    accent (the wordmark dot) and two pinpoint status colors. */
 
-@import url("https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap");
+/* Font loading lives in Site.astro <head> — a <link> starts the fetch at
+   parse, an @import here would serialize it behind the inlined styles. */
 
 :root {
   /* paper / ink */

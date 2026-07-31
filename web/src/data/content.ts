@@ -190,7 +190,8 @@ const SIGNALS: Signal[] = [
   { html: '<b>metal</b> beta · apple silicon', dot: "warn" },
   { html: '<b>cpu</b> dev only', dot: "dim" },
   { html: '<b>api</b> openai · v1' },
-  { html: '<b>release</b> v0.1.5 · 2026-04-28' },
+  { html: '<b>spec</b> dspark · mtp' },
+  { html: '<b>release</b> v0.5.0 · 2026-07-26' },
 ];
 
 const TERMINAL_LINES_EN = [
@@ -285,6 +286,36 @@ const INSTALL_CARDS_ZH: InstallCard[] = [
 
 const BENCH_ROWS_EN: BenchRow[] = [
   {
+    date: "2026-07-29",
+    stability: "beta",
+    stabilityLabel: "beta · default-on",
+    caption:
+      '<b>cuda</b> · 1×H20 · <code>ThinkingCap-Qwen3.6-27B-FP8 + 27B-DFlash</code> · DSpark block 6, 48 req/point · spec decode was a c=1-only feature; the draft, rollback and capture now run batched',
+    cells: [
+      { key: "decode · c=1", value: "97.3", unit: "tok/s · 2.81×" },
+      { key: "tok/s · c=2", value: "+88", unit: "% vs no-spec" },
+      { key: "tok/s · c=16", value: "+17", unit: "% vs no-spec" },
+      { key: "needle gate", value: "0", unit: "errors · exact=3 DET" },
+    ],
+    cmd: "arle serve --spec-type dspark · bench-agent-32k-16x8 c-sweep",
+    href: "https://github.com/cklxx/arle/blob/main/docs/experience/wins/2026-07-29-dspark-batched-linear-capture.md",
+  },
+  {
+    date: "2026-07-28",
+    stability: "beta",
+    stabilityLabel: "beta · gate-licensed",
+    caption:
+      '<b>cuda</b> · 1×H20 · <code>Qwen3.6-35B-A3B-FP8</code> · 48 req/point · paged full attention launches once per layer, not once per row',
+    cells: [
+      { key: "ITL p50 · c=16", value: "59.5", unit: "ms · was 94.6" },
+      { key: "TPOT · c=16", value: "71.2", unit: "ms · was 105.1" },
+      { key: "FA3 launches / step", value: "10.0", unit: "was 157" },
+      { key: "c=1", value: "±0", unit: "% · wash by design" },
+    ],
+    cmd: "arle serve · bench-agent-32k-16x8, matched A/B",
+    href: "https://github.com/cklxx/arle/blob/main/docs/experience/wins/2026-07-28-fa3-one-launch-per-layer.md",
+  },
+  {
     date: "2026-06-10",
     stability: "beta",
     stabilityLabel: "beta · gate-licensed",
@@ -296,14 +327,14 @@ const BENCH_ROWS_EN: BenchRow[] = [
       { key: "decode +MTP", value: "64.2", unit: "tok/s" },
       { key: "needle-exact", value: "230K", unit: "ctx" },
     ],
-    cmd: "scripts/dsv4_lever_gate.sh",
+    cmd: "scripts/lever_gate.sh",
     href: "https://github.com/cklxx/arle/blob/main/docs/experience/wins/2026-06-08-dsv4-decode-6ms-FINAL-consolidated.md",
   },
   {
     date: "2026-05-21",
     stability: "beta",
     stabilityLabel: "beta · cycle-wrap",
-    caption: '<b>cuda</b> · RTX 4070 Ti SUPER 16GB · <code>Qwen3-0.6B real-checkpoint OPD step</code> · 32-commit session, kill-or-license-gated',
+    caption: '<b>train</b> · RTX 4070 Ti SUPER 16GB · <code>Qwen3-0.6B real-checkpoint OPD step</code> · 32-commit session, kill-or-license-gated',
     cells: [
       { key: "step", value: "0.164", unit: "s" },
       { key: "vs naive CPU", value: "~170", unit: "×" },
@@ -341,23 +372,39 @@ const BENCH_ROWS_EN: BenchRow[] = [
     cmd: "python3 scripts/bench_throughput.py --concurrency-grid 16 --max-tokens 256",
     href: "https://github.com/cklxx/arle/blob/main/docs/support-matrix.md",
   },
-  {
-    date: "2026-04-27",
-    stability: "beta",
-    stabilityLabel: "beta · validated",
-    caption: '<b>metal</b> · Apple M4 Pro · <code>Qwen3.5-0.8B Q4_K_M</code> · GGUF decode',
-    cells: [
-      { key: "gen", value: "211", unit: "tok/s" },
-      { key: "e2e", value: "202", unit: "tok/s" },
-      { key: "decode", value: "4.7", unit: "ms/tok" },
-      { key: "ttft", value: "223", unit: "ms" },
-    ],
-    cmd: "arle serve --backend metal --model-path Qwen3.5-0.8B-Q4_K_M.gguf",
-    href: "https://github.com/cklxx/arle/blob/main/docs/experience/wins/2026-04-27-bench-metal-qwen35-0p8b-gguf-q5-q8-q6qmv.md",
-  },
 ];
 
 const BENCH_ROWS_ZH: BenchRow[] = [
+  {
+    date: "2026-07-29",
+    stability: "beta",
+    stabilityLabel: "beta · 默认开启",
+    caption:
+      '<b>cuda</b> · 1×H20 · <code>ThinkingCap-Qwen3.6-27B-FP8 + 27B-DFlash</code> · DSpark block 6，48 req/point · 投机解码曾只允许 c=1；draft、rollback、capture 现在全部批处理',
+    cells: [
+      { key: "解码 · c=1", value: "97.3", unit: "tok/s · 2.81×" },
+      { key: "tok/s · c=2", value: "+88", unit: "% 对比无投机" },
+      { key: "tok/s · c=16", value: "+17", unit: "% 对比无投机" },
+      { key: "needle 闸门", value: "0", unit: "错误 · exact=3 DET" },
+    ],
+    cmd: "arle serve --spec-type dspark · bench-agent-32k-16x8 c-sweep",
+    href: "https://github.com/cklxx/arle/blob/main/docs/experience/wins/2026-07-29-dspark-batched-linear-capture.md",
+  },
+  {
+    date: "2026-07-28",
+    stability: "beta",
+    stabilityLabel: "beta · 闸门已 license",
+    caption:
+      '<b>cuda</b> · 1×H20 · <code>Qwen3.6-35B-A3B-FP8</code> · 48 req/point · 分页全注意力每层发射一次，不再每行一次',
+    cells: [
+      { key: "ITL p50 · c=16", value: "59.5", unit: "ms · 原 94.6" },
+      { key: "TPOT · c=16", value: "71.2", unit: "ms · 原 105.1" },
+      { key: "FA3 发射 / step", value: "10.0", unit: "原 157" },
+      { key: "c=1", value: "±0", unit: "% · 设计上不变" },
+    ],
+    cmd: "arle serve · bench-agent-32k-16x8，matched A/B",
+    href: "https://github.com/cklxx/arle/blob/main/docs/experience/wins/2026-07-28-fa3-one-launch-per-layer.md",
+  },
   {
     date: "2026-06-10",
     stability: "beta",
@@ -370,14 +417,14 @@ const BENCH_ROWS_ZH: BenchRow[] = [
       { key: "解码 +MTP", value: "64.2", unit: "tok/s" },
       { key: "needle 精确", value: "230K", unit: "ctx" },
     ],
-    cmd: "scripts/dsv4_lever_gate.sh",
+    cmd: "scripts/lever_gate.sh",
     href: "https://github.com/cklxx/arle/blob/main/docs/experience/wins/2026-06-08-dsv4-decode-6ms-FINAL-consolidated.md",
   },
   {
     date: "2026-05-21",
     stability: "beta",
     stabilityLabel: "beta · 周期闭环",
-    caption: '<b>cuda</b> · RTX 4070 Ti SUPER 16GB · <code>Qwen3-0.6B 真实 checkpoint OPD step</code> · 32 commit 单 session、kill-or-license 闸门',
+    caption: '<b>train</b> · RTX 4070 Ti SUPER 16GB · <code>Qwen3-0.6B 真实 checkpoint OPD step</code> · 32 commit 单 session、kill-or-license 闸门',
     cells: [
       { key: "step", value: "0.164", unit: "s" },
       { key: "对比 naive CPU", value: "~170", unit: "×" },
@@ -415,20 +462,6 @@ const BENCH_ROWS_ZH: BenchRow[] = [
     cmd: "python3 scripts/bench_throughput.py --concurrency-grid 16 --max-tokens 256",
     href: "https://github.com/cklxx/arle/blob/main/docs/support-matrix.md",
   },
-  {
-    date: "2026-04-27",
-    stability: "beta",
-    stabilityLabel: "beta · 持续验证",
-    caption: '<b>metal</b> · Apple M4 Pro · <code>Qwen3.5-0.8B Q4_K_M</code> · GGUF decode',
-    cells: [
-      { key: "生成", value: "211", unit: "tok/s" },
-      { key: "e2e", value: "202", unit: "tok/s" },
-      { key: "decode", value: "4.7", unit: "ms/tok" },
-      { key: "TTFT", value: "223", unit: "ms" },
-    ],
-    cmd: "arle serve --backend metal --model-path Qwen3.5-0.8B-Q4_K_M.gguf",
-    href: "https://github.com/cklxx/arle/blob/main/docs/experience/wins/2026-04-27-bench-metal-qwen35-0p8b-gguf-q5-q8-q6qmv.md",
-  },
 ];
 
 const MATRIX_ROWS_EN: string[][] = [
@@ -436,7 +469,7 @@ const MATRIX_ROWS_EN: string[][] = [
     "<code>cuda</code>",
     '<span class="pill ok">stable</span>',
     "Linux + NVIDIA Ampere+",
-    "Qwen3 / Qwen3.5 · DeepSeek-V4-Flash (8×H20)",
+    "Qwen3 / Qwen3.5 / Qwen3.6 · DeepSeek-V4-Flash (8×H20)",
     "FP16 / BF16 · FP8 KV (auto) · GGUF Q4_K",
     "OpenAI v1",
   ],
@@ -463,7 +496,7 @@ const MATRIX_ROWS_ZH: string[][] = [
     "<code>cuda</code>",
     '<span class="pill ok">stable</span>',
     "Linux + NVIDIA Ampere+",
-    "Qwen3 / Qwen3.5 · DeepSeek-V4-Flash（8×H20）",
+    "Qwen3 / Qwen3.5 / Qwen3.6 · DeepSeek-V4-Flash（8×H20）",
     "FP16 / BF16 · FP8 KV（auto）· GGUF Q4_K",
     "OpenAI v1",
   ],
@@ -579,14 +612,14 @@ const ARCH_ROWS: ArchRow[] = [
 
 const ARCH_FOOT_EN: string[] = [
   "<b>pure leaves</b> · infer-topo · infer-moe · infer-util",
-  "<b>specs</b> · qwen3 · qwen35 · deepseek",
+  "<b>specs</b> · qwen3 · qwen35 · deepseek · gemma",
   "<b>ffi</b> · deepep-sys · xgrammar-sys",
   "<b>train</b> · autograd + train — OPD-only since 2026-05-18",
 ];
 
 const ARCH_FOOT_ZH: string[] = [
   "<b>纯叶子</b> · infer-topo · infer-moe · infer-util",
-  "<b>specs</b> · qwen3 · qwen35 · deepseek",
+  "<b>specs</b> · qwen3 · qwen35 · deepseek · gemma",
   "<b>ffi</b> · deepep-sys · xgrammar-sys",
   "<b>train</b> · autograd + train — 2026-05-18 起仅 OPD",
 ];
@@ -595,33 +628,33 @@ const BATTLE_ROWS_EN: BattleRow[] = [
   {
     pri: "P1 · active",
     hot: true,
-    title: "Batched serving lane",
-    desc: "the keystone — KvBatchDescriptor + ModelKvAdapter batched lowering, DSv4 first; c-sweep must clear TTFT · ITL · tok/s",
-    where: "infer-core · infer-cuda · #60 #61",
+    title: "256K OPD on one GPU",
+    desc: "seq-chunked recompute shipped behind one exact fold; the verdict wants completed 65536/131072 steps, and the remaining O(seq) wall is the 48 un-chunked linear-attention layers",
+    where: "autograd · train · #188 #189",
   },
   {
-    pri: "P2 · queued",
-    title: "Speculative decoding, default-good",
-    desc: "frozen-KV MTP on DSv4 — checkpoint-native draft head, no training; whole-step decode graph re-licensed 2026-06-10",
-    where: "infer-cuda · docs/plans · #70 #62",
+    pri: "P2 · active",
+    title: "DSpark goodput scheduler",
+    desc: "Algorithm-1 verify budget shipped 2026-07-30; open walls — the verify path's per-step D2H + sync (645 MB/slot scratch against a 6-row reality) and a slot budget that starves KV",
+    where: "infer-cuda · #182 #183 #184",
   },
   {
     pri: "P3 · queued",
-    title: "Qwen3.6 CUDA + the AIPC lane",
-    desc: "second ModelKvAdapter brings Qwen3.6 to CUDA; Metal single-user convergence; HIP/ROCm enters as the third backend on the seam",
-    where: "infer-cuda · infer-metal · #65 #71",
+    title: "DSpark on DSv4, 8×H20",
+    desc: "C5 end-to-end DSpark serve on the DSv4 chain — license-or-kill against the shipped MTP draft on the same agent fingerprint",
+    where: "infer-cuda · docs/plans · #128 #123",
   },
   {
     pri: "open",
-    title: "KV-quant parity gate",
-    desc: "model-generic kv-dtype dispatch at the seam + neutral needle-gate harness — unblocks the Qwen BF16 / INT8 / FP8 / TQ4 matrix",
-    where: "infer-cuda · cuda-kernels · #68",
+    title: "Train through the inference operators",
+    desc: "Path B routes the training forward through the serving operator set — kills the duplicated-kernel SIGFPE class and unlocks a 35B MoE student",
+    where: "autograd · train · #103",
   },
   {
     pri: "open",
-    title: "Agent workloads",
-    desc: "W3/W4 cross-engine trace baseline — the harness exists, the workloads want breadth",
-    where: "crates/agent-bench · #63",
+    title: "Third backends: HIP / Vulkan",
+    desc: "HIP substrate and a coherent Vulkan forward (gfx1151, 3.0 s/tok) landed; the license is perf parity, not a boot",
+    where: "infer-hip · infer-vulkan · #71",
   },
 ];
 
@@ -629,33 +662,33 @@ const BATTLE_ROWS_ZH: BattleRow[] = [
   {
     pri: "P1 · active",
     hot: true,
-    title: "Batched serving lane",
-    desc: "keystone —— KvBatchDescriptor + ModelKvAdapter 批量下放，DSv4 先行；c-sweep 须同时过 TTFT · ITL · tok/s",
-    where: "infer-core · infer-cuda · #60 #61",
+    title: "单卡 256K OPD",
+    desc: "seq-chunked recompute 已随精确 fold 落地；verdict 还差 65536/131072 的完整 step，剩余的 O(seq) 墙是 48 层未 chunk 的线性注意力",
+    where: "autograd · train · #188 #189",
   },
   {
-    pri: "P2 · queued",
-    title: "投机解码默认好用",
-    desc: "DSv4 上的 frozen-KV MTP —— checkpoint 原生 draft head、零训练；whole-step decode graph 2026-06-10 重新 license",
-    where: "infer-cuda · docs/plans · #70 #62",
+    pri: "P2 · active",
+    title: "DSpark goodput 调度器",
+    desc: "Algorithm-1 verify budget 2026-07-30 落地；下一批墙：verify 路径逐步的 D2H + sync（6 行实际需求对着 645 MB/slot 的 scratch）、以及饿死 KV 的 slot 预算",
+    where: "infer-cuda · #182 #183 #184",
   },
   {
     pri: "P3 · queued",
-    title: "Qwen3.6 CUDA + AIPC 路线",
-    desc: "第二个 ModelKvAdapter 把 Qwen3.6 带上 CUDA；Metal 单用户收敛；HIP/ROCm 作为 seam 上的第三后端进场",
-    where: "infer-cuda · infer-metal · #65 #71",
+    title: "DSv4 上跑 DSpark（8×H20）",
+    desc: "C5 —— DSv4 链路上端到端 DSpark serve，同一份 agent 指纹对 shipped MTP draft 做 license-or-kill",
+    where: "infer-cuda · docs/plans · #128 #123",
   },
   {
     pri: "open",
-    title: "KV 量化 parity 闸门",
-    desc: "seam 层模型无关的 kv-dtype 分发 + 中立 needle 闸门 —— 解锁 Qwen BF16 / INT8 / FP8 / TQ4 矩阵",
-    where: "infer-cuda · cuda-kernels · #68",
+    title: "训练前向走推理算子",
+    desc: "Path B 把训练前向路由到 serving 算子集 —— 消灭重复 kernel 的 SIGFPE 一类问题，解锁 35B MoE student",
+    where: "autograd · train · #103",
   },
   {
     pri: "open",
-    title: "Agent workloads",
-    desc: "W3/W4 跨引擎 trace 基线 —— harness 已就绪，workload 等着扩面",
-    where: "crates/agent-bench · #63",
+    title: "第三后端：HIP / Vulkan",
+    desc: "HIP 基板与 coherent 的 Vulkan 前向（gfx1151，3.0 s/tok）已落地；license 条件是性能 parity，不是能跑",
+    where: "infer-hip · infer-vulkan · #71",
   },
 ];
 
@@ -668,6 +701,7 @@ const FILES_EN: FileRow[] = [
   { path: "/crates/cli/", desc: "arle binary · verbs · doctor", href: "https://github.com/cklxx/arle/tree/main/crates/cli" },
   { path: "/crates/infer-api/", desc: "the single public front door", href: "https://github.com/cklxx/arle/tree/main/crates/infer-api" },
   { path: "/crates/infer-core/", desc: "runtime spine · engine · scheduler · radix cache", href: "https://github.com/cklxx/arle/tree/main/crates/infer-core" },
+  { path: "/crates/train/", desc: "OPD loop · autograd tape · seq-chunked recompute", href: "https://github.com/cklxx/arle/tree/main/crates/train" },
   { path: "/crates/cuda-kernels/", desc: "cuda kernel crate · csrc · prelude", href: "https://github.com/cklxx/arle/tree/main/crates/cuda-kernels" },
   { path: "/crates/mlx-sys/", desc: "metal bridge · cmake + cc", href: "https://github.com/cklxx/arle/tree/main/crates/mlx-sys" },
   { path: "/examples/", desc: "copyable curl · Docker · Metal · tiny train smokes", href: "https://github.com/cklxx/arle/tree/main/examples" },
@@ -683,6 +717,7 @@ const FILES_ZH: FileRow[] = [
   { path: "/crates/cli/", desc: "arle 二进制 · 子命令 · doctor", href: "https://github.com/cklxx/arle/tree/main/crates/cli" },
   { path: "/crates/infer-api/", desc: "唯一的公共前门", href: "https://github.com/cklxx/arle/tree/main/crates/infer-api" },
   { path: "/crates/infer-core/", desc: "运行时主干 · engine · scheduler · radix cache", href: "https://github.com/cklxx/arle/tree/main/crates/infer-core" },
+  { path: "/crates/train/", desc: "OPD 循环 · autograd tape · seq-chunked recompute", href: "https://github.com/cklxx/arle/tree/main/crates/train" },
   { path: "/crates/cuda-kernels/", desc: "cuda kernel crate · csrc · prelude", href: "https://github.com/cklxx/arle/tree/main/crates/cuda-kernels" },
   { path: "/crates/mlx-sys/", desc: "metal 桥接 · cmake + cc", href: "https://github.com/cklxx/arle/tree/main/crates/mlx-sys" },
   { path: "/examples/", desc: "curl · Docker · Metal · tiny train 冒烟示例", href: "https://github.com/cklxx/arle/tree/main/examples" },
@@ -755,7 +790,7 @@ export const EN: Locale = {
     bench: {
       title: "Bench",
       caption:
-        'Dated, reproducible snapshots straight from <a href="https://github.com/cklxx/arle/tree/main/docs/experience/wins"><code>docs/experience/wins/</code></a>. Numbers come out of <code>scripts/bench_throughput.py</code> and the canonical step-driver smokes — nothing is curated.',
+        'Dated, reproducible snapshots straight from <a href="https://github.com/cklxx/arle/tree/main/docs/experience/wins"><code>docs/experience/wins/</code></a>. Numbers come out of <code>scripts/bench_throughput.py</code> and the <code>bench-agent</code> workload driver — nothing is curated.',
       rows: BENCH_ROWS_EN,
     },
     matrix: {
@@ -784,7 +819,7 @@ export const EN: Locale = {
     },
   },
   footer: {
-    left: "arle(1) · April 2026 · v0.1.5",
+    left: "arle(1) · July 2026 · v0.5.0",
     right: { label: "github.com/cklxx/arle", href: "https://github.com/cklxx/arle" },
   },
 };
@@ -855,7 +890,7 @@ export const ZH: Locale = {
     bench: {
       title: "基准",
       caption:
-        '直接来自 <a href="https://github.com/cklxx/arle/tree/main/docs/experience/wins"><code>docs/experience/wins/</code></a> 的带日期快照。数字出自 <code>scripts/bench_throughput.py</code> 与标准 step-driver 冒烟，未做挑选。',
+        '直接来自 <a href="https://github.com/cklxx/arle/tree/main/docs/experience/wins"><code>docs/experience/wins/</code></a> 的带日期快照。数字出自 <code>scripts/bench_throughput.py</code> 与 <code>bench-agent</code> 工作负载驱动，未做挑选。',
       rows: BENCH_ROWS_ZH,
     },
     matrix: {
@@ -884,7 +919,7 @@ export const ZH: Locale = {
     },
   },
   footer: {
-    left: "arle(1) · 2026 年 4 月 · v0.1.5",
+    left: "arle(1) · 2026 年 7 月 · v0.5.0",
     right: { label: "github.com/cklxx/arle", href: "https://github.com/cklxx/arle" },
   },
 };
