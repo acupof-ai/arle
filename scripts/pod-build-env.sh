@@ -56,6 +56,11 @@ if command -v sccache >/dev/null 2>&1; then
   export SCCACHE_DIR="${SCCACHE_DIR:-/host/sccache}"
   export SCCACHE_CACHE_SIZE="${SCCACHE_CACHE_SIZE:-50G}"
   export RUSTC_WRAPPER="${RUSTC_WRAPPER:-sccache}"
+  # Same cache for nvcc: build.rs honors ARLE_NVCC_WRAPPER for the cuda-kernels /
+  # deepep .cu compiles (docs/environment.md). Cargo has no nvcc wrapper knob, so
+  # this env var is the only place to express it. Arch is already pinned to sm_90
+  # above, so a warm build reuses the exact per-SM cubins.
+  export ARLE_NVCC_WRAPPER="${ARLE_NVCC_WRAPPER:-sccache}"
 else
   export RUSTC_WRAPPER=""
 fi
