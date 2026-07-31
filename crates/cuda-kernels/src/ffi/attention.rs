@@ -198,7 +198,9 @@ unsafe extern "C" {
     /// readback between ring steps). Functional: reads `*_in`, writes `*_out`
     /// (`[num_q_tiles, q_rows]` M/L, `[num_q_tiles, q_rows, head_dim]` O, f32) —
     /// caller inits the first block's `*_in` M to -inf, L/O to 0. Absolute causal
-    /// mask via q_abs/k_abs.
+    /// mask via per-row `q_pos`/`k_pos` (f32 device arrays, exact for seq < 2^24):
+    /// q row r attends k col c iff `k_pos[c] <= q_pos[r]` — so a zigzag shard's
+    /// non-contiguous rows/cols mask correctly. Contiguous is `pos = base..base+n`.
     pub fn ring_block_attention_fwd_merge_cuda(
         q: *const Half,
         k_blk: *const Half,
@@ -209,14 +211,14 @@ unsafe extern "C" {
         acc_m_out: *mut f32,
         acc_l_out: *mut f32,
         acc_o_out: *mut f32,
+        q_pos: *const f32,
+        k_pos: *const f32,
         num_q_tiles: i32,
         num_q_heads: i32,
         num_kv_heads: i32,
         head_dim: i32,
         q_rows: i32,
         blk_len: i32,
-        q_abs: i32,
-        k_abs: i32,
         sm_scale: f32,
         stream: CUstream,
     ) -> CUresult;
@@ -249,14 +251,14 @@ unsafe extern "C" {
         grad_q: *mut f32,
         grad_k_blk: *mut f32,
         grad_v_blk: *mut f32,
+        q_pos: *const f32,
+        k_pos: *const f32,
         num_q_tiles: i32,
         num_q_heads: i32,
         num_kv_heads: i32,
         head_dim: i32,
         q_rows: i32,
         blk_len: i32,
-        q_abs: i32,
-        k_abs: i32,
         sm_scale: f32,
         stream: CUstream,
     ) -> CUresult;

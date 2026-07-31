@@ -333,11 +333,6 @@ fn cp_causal_sdpa_device_ring(
     store: &mut TensorStore,
     tape: &mut Tape,
 ) -> Result<TensorId> {
-    if positions.is_some() {
-        return Err(AutogradError::TapeInvariant(
-            "device ring: zigzag per-row positions need the per-row-position kernel (pending-remote)",
-        ));
-    }
     let (b, h, s, d) = (shape[0], shape[1], shape[2], shape[3]);
     let (kv_shape, kv_heads) = {
         let ks = store.tensor(k)?.shape.clone();
@@ -345,18 +340,23 @@ fn cp_causal_sdpa_device_ring(
     };
     let scale = 1.0 / (d as f32).sqrt();
     let num_q_tiles = b * h;
-    // Contiguous q positions for this rank's block — the tape ctx carries them as
-    // the Vec the host backward reads; the device kernel still uses scalar q_abs.
-    let q_pos: Vec<usize> = (0..s).map(|r| cp_rank * s + r).collect();
-    let dims_for = |blk_len: usize, k_abs: usize| RingBlockDims {
+    // Absolute position of each local q row: `positions` if given (zigzag shard),
+    // else the contiguous default `cp_rank*s + row`. The kernel masks by these
+    // per-row positions (not a scalar base), so a non-contiguous zigzag shard
+    // attends the right causal prefix. f32 (exact for seq < 2^24) so positions ride
+    // the same f32 ring as k/v — each rank declares only its own, no equal-shard math.
+    let q_pos: Vec<usize> = match positions {
+        Some(p) => p.to_vec(),
+        None => (0..s).map(|r| cp_rank * s + r).collect(),
+    };
+    let q_pos_f32: Vec<f32> = q_pos.iter().map(|&p| p as f32).collect();
+    let dims = RingBlockDims {
         num_q_tiles,
         num_q_heads: h,
         num_kv_heads: kv_heads,
         head_dim: d,
         q_rows: s,
-        blk_len,
-        q_abs: cp_rank * s,
-        k_abs,
+        blk_len: s,
         sm_scale: scale,
     };
 
@@ -364,6 +364,7 @@ fn cp_causal_sdpa_device_ring(
     store.ensure_device(k)?;
     store.ensure_device(v)?;
     let q_h = device_handle(store, q, "ring q")?;
+    let q_pos_h = store.backend().upload(&q_pos_f32, &[s])?;
     let rows = num_q_tiles * s;
     // Accumulator init: M=-inf, L=0, O=0 (device-resident, f32).
     let mut acc_m = store
@@ -374,35 +375,34 @@ fn cp_causal_sdpa_device_ring(
         .backend()
         .upload(&vec![0.0f32; rows * d], &[rows * d])?;
 
-    // Rotate fresh k/v handles so the tape inputs stay immutable; save each step's
-    // block handles + k_abs for the backward replay.
+    // Rotate fresh k/v handles + their positions so the tape inputs stay immutable;
+    // save each step's block handles + k_pos Vec for the backward replay. k_pos
+    // starts as THIS rank's own positions and rings with k/v — the block arriving
+    // at step j carries the true positions of the rank that owns it (contiguous or
+    // zigzag), so no rank computes another's layout.
     let mut k_cur = device_handle(store, k, "ring k")?;
     let mut v_cur = device_handle(store, v, "ring v")?;
+    let mut kpos_cur = store.backend().upload(&q_pos_f32, &[s])?;
+    let mut kpos_vec = q_pos.clone();
     let block_elems = b * kv_heads * s * d;
     let mut step_blocks: smallvec::SmallVec<[(TensorId, TensorId, Vec<usize>); 4]> = smallvec![];
     for j in 0..cp_size {
-        let owner = (cp_rank + cp_size - j) % cp_size;
-        let k_abs = owner * s;
         let (m2, l2, o2) = store.backend().ring_block_fwd_merge(
-            &q_h,
-            &k_cur,
-            &v_cur,
-            &acc_m,
-            &acc_l,
-            &acc_o,
-            dims_for(s, k_abs),
+            &q_h, &k_cur, &v_cur, &acc_m, &acc_l, &acc_o, &q_pos_h, &kpos_cur, dims,
         )?;
         acc_m = m2;
         acc_l = l2;
         acc_o = o2;
-        // Persist this step's block for backward (as tape tensors), then rotate.
-        // Contiguous block positions [k_abs, k_abs+s) for the host backward's Vec ctx.
+        // Persist this step's block + its positions for backward, then rotate all
+        // three (k, v, k_pos) one hop so the next block's positions match its k/v.
         let k_id = store.alloc_device_tensor(kv_shape.clone(), k_cur.clone())?;
         let v_id = store.alloc_device_tensor(kv_shape.clone(), v_cur.clone())?;
-        step_blocks.push((k_id, v_id, (k_abs..k_abs + s).collect()));
+        step_blocks.push((k_id, v_id, kpos_vec.clone()));
         if j + 1 < cp_size {
             k_cur = store.backend().ring_send_recv_kv(&k_cur, &[block_elems])?;
             v_cur = store.backend().ring_send_recv_kv(&v_cur, &[block_elems])?;
+            kpos_cur = store.backend().ring_send_recv_kv(&kpos_cur, &[s])?;
+            kpos_vec = ring_rotate_positions(store, &kpos_cur, s)?;
         }
     }
 
@@ -430,6 +430,19 @@ fn cp_causal_sdpa_device_ring(
     }
     .record(store, tape)?;
     Ok(out_id)
+}
+
+/// Read back a ringed f32 position buffer to the `Vec<usize>` the tape ctx stores
+/// (backward re-uploads it). Positions are small integers exact in f32; this is one
+/// readback per ring step (cp_size total), not per row of the hot loop.
+fn ring_rotate_positions(
+    store: &mut TensorStore,
+    kpos_h: &DeviceHandle,
+    s: usize,
+) -> Result<Vec<usize>> {
+    let f = store.backend().readback(kpos_h)?;
+    debug_assert_eq!(f.len(), s);
+    Ok(f.iter().map(|&x| x.round() as usize).collect())
 }
 
 fn device_handle(store: &mut TensorStore, id: TensorId, op: &'static str) -> Result<DeviceHandle> {
@@ -565,7 +578,6 @@ fn cp_ring_attention_backward_device(
     cp_size: usize,
     store: &mut TensorStore,
 ) -> Result<GradPairs> {
-    let q_abs = q_pos[0]; // contiguous base (device kernel is scalar-position)
     let (k_local, v_local) = (input_ids[1], input_ids[2]);
     let need = store.tensor(q)?.requires_grad
         || store.tensor(k_local)?.requires_grad
@@ -588,6 +600,10 @@ fn cp_ring_attention_backward_device(
     let lse_h = device_handle(store, lse, "ring lse")?;
     store.ensure_device(output_grad_id)?;
     let dout_h = device_handle(store, output_grad_id, "ring d_out")?;
+    // q positions (this rank's rows) uploaded once; each block re-uploads its saved
+    // k positions so the kernel masks by true position (matches the forward).
+    let q_pos_f32: Vec<f32> = q_pos.iter().map(|&p| p as f32).collect();
+    let q_pos_h = store.backend().upload(&q_pos_f32, &[rows])?;
 
     // grad_q accumulates across blocks (device-resident); start at zeros.
     let mut grad_q = store.backend().upload(
@@ -598,7 +614,9 @@ fn cp_ring_attention_backward_device(
     let mut step_gk: smallvec::SmallVec<[DeviceHandle; 4]> = smallvec![];
     let mut step_gv: smallvec::SmallVec<[DeviceHandle; 4]> = smallvec![];
     for (k_id, v_id, k_pos) in blocks.iter() {
-        let (k_id, v_id, k_abs) = (*k_id, *v_id, k_pos[0]);
+        let (k_id, v_id) = (*k_id, *v_id);
+        let k_pos_f32: Vec<f32> = k_pos.iter().map(|&p| p as f32).collect();
+        let k_pos_h = store.backend().upload(&k_pos_f32, &[rows])?;
         let k_h = device_handle(store, k_id, "ring k")?;
         let v_h = device_handle(store, v_id, "ring v")?;
         let dims = RingBlockDims {
@@ -608,13 +626,11 @@ fn cp_ring_attention_backward_device(
             head_dim: d,
             q_rows: rows,
             blk_len: rows,
-            q_abs,
-            k_abs,
             sm_scale: scale,
         };
-        let (gq2, gk_b, gv_b) = store
-            .backend()
-            .ring_block_bwd(&q_h, &k_h, &v_h, &out_h, &lse_h, &dout_h, &grad_q, dims)?;
+        let (gq2, gk_b, gv_b) = store.backend().ring_block_bwd(
+            &q_h, &k_h, &v_h, &out_h, &lse_h, &dout_h, &grad_q, &q_pos_h, &k_pos_h, dims,
+        )?;
         grad_q = gq2;
         step_gk.push(gk_b);
         step_gv.push(gv_b);

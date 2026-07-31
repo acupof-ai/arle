@@ -18,8 +18,12 @@
 // *_in accumulators, computes this block's (m,l,o) online (exact softmax), merges,
 // writes to the *_out accumulators. Functional (in != out) so the ops-layer ring
 // loop threads fresh handles per block — no Arc-mutation, no cross-launch aliasing
-// (each (tile,row) is independent). Absolute causal mask: q row r (abs q_abs+r)
-// attends block col c (abs k_abs+c) iff k_abs+c <= q_abs+r.
+// (each (tile,row) is independent). Absolute causal mask by PER-ROW position:
+// q row r (abs position q_pos[r]) attends block col c (abs position k_pos[c]) iff
+// k_pos[c] <= q_pos[r]. Positions are passed as f32 device arrays (exact for
+// integers < 2^24, i.e. seq up to 16M) so they ride the existing f32 ring
+// alongside k/v — a zigzag shard's two non-contiguous chunks then mask correctly.
+// ponytail: f32 positions cap seq at 16M; switch to i32 ring transport past that.
 __global__ void ring_block_attention_fwd_merge_kernel(
     const __nv_bfloat16 *__restrict__ q,     // [Tq, q_rows, hd]
     const __nv_bfloat16 *__restrict__ k_blk, // [Tkv, blk_len, hd]
@@ -29,8 +33,10 @@ __global__ void ring_block_attention_fwd_merge_kernel(
     const float *__restrict__ acc_o_in,      // [Tq, q_rows, hd]
     float *__restrict__ acc_m_out, float *__restrict__ acc_l_out,
     float *__restrict__ acc_o_out,
+    const float *__restrict__ q_pos, // [q_rows] absolute q positions
+    const float *__restrict__ k_pos, // [blk_len] absolute k positions
     int num_q_heads, int num_kv_heads, int head_dim,
-    int q_rows, int blk_len, int q_abs, int k_abs, float sm_scale) {
+    int q_rows, int blk_len, float sm_scale) {
   // grid.x = q_row (up to 2^31-1), grid.y = tile (= b*H, small): q_rows can exceed
   // the 65535 gridDim.y cap at CP local seq > 65535, so the LARGE dim is grid.x.
   int row = blockIdx.x;
@@ -42,7 +48,7 @@ __global__ void ring_block_attention_fwd_merge_kernel(
   int qh = tile % num_q_heads;
   int gqa = num_q_heads / num_kv_heads;
   int kv_tile = b * num_kv_heads + (qh / gqa);
-  int q_pos = q_abs + row;
+  int q_abs_r = (int)q_pos[row];
   int64_t rid = (int64_t)tile * q_rows + row;
 
   const __nv_bfloat16 *q_ptr = q + rid * head_dim;
@@ -58,7 +64,7 @@ __global__ void ring_block_attention_fwd_merge_kernel(
   for (int i = 0; i < RING_MAX_DPT; ++i) o_blk[i] = 0.0f;
 
   for (int c = 0; c < blk_len; ++c) {
-    if (k_abs + c > q_pos) break; // causal: cols ordered, rest are future
+    if ((int)k_pos[c] > q_abs_r) continue; // future key (cols not ordered under zigzag)
     float partial = 0.0f;
     for (int i = 0; i < DPT; ++i) {
       int d = lane + i * WARP_SIZE;
@@ -134,8 +140,10 @@ __global__ void ring_block_attention_bwd_kernel(
     const __nv_bfloat16 *__restrict__ v_blk, const float *__restrict__ out,
     const float *__restrict__ lse, const __nv_bfloat16 *__restrict__ d_out,
     float *__restrict__ grad_q, float *__restrict__ grad_k_blk,
-    float *__restrict__ grad_v_blk, int num_q_heads, int num_kv_heads,
-    int head_dim, int q_rows, int blk_len, int q_abs, int k_abs, float sm_scale) {
+    float *__restrict__ grad_v_blk,
+    const float *__restrict__ q_pos, const float *__restrict__ k_pos,
+    int num_q_heads, int num_kv_heads,
+    int head_dim, int q_rows, int blk_len, float sm_scale) {
   // grid.x = q_row, grid.y = tile (mirror the forward — q_rows may exceed 65535).
   int row = blockIdx.x;
   int tile = blockIdx.y;
@@ -146,7 +154,7 @@ __global__ void ring_block_attention_bwd_kernel(
   int qh = tile % num_q_heads;
   int gqa = num_q_heads / num_kv_heads;
   int kv_tile = b * num_kv_heads + (qh / gqa);
-  int q_pos = q_abs + row;
+  int q_abs_r = (int)q_pos[row];
   int64_t rid = (int64_t)tile * q_rows + row;
 
   float row_lse = lse[rid];
@@ -176,7 +184,7 @@ __global__ void ring_block_attention_bwd_kernel(
   for (int i = 0; i < RING_MAX_DPT; ++i) gq[i] = 0.0f;
 
   for (int c = 0; c < blk_len; ++c) {
-    if (k_abs + c > q_pos) break;
+    if ((int)k_pos[c] > q_abs_r) continue;
     float sdot = 0.0f, dp = 0.0f;
     for (int i = 0; i < DPT; ++i) {
       int d = lane + i * WARP_SIZE;
@@ -216,9 +224,10 @@ static inline int ring_block_ok(int num_q_heads, int num_kv_heads, int head_dim,
 extern "C" cudaError_t ring_block_attention_fwd_merge_cuda(
     const uint16_t *q, const uint16_t *k_blk, const uint16_t *v_blk,
     const float *acc_m_in, const float *acc_l_in, const float *acc_o_in,
-    float *acc_m_out, float *acc_l_out, float *acc_o_out, int num_q_tiles,
+    float *acc_m_out, float *acc_l_out, float *acc_o_out,
+    const float *q_pos, const float *k_pos, int num_q_tiles,
     int num_q_heads, int num_kv_heads, int head_dim, int q_rows, int blk_len,
-    int q_abs, int k_abs, float sm_scale, cudaStream_t stream) {
+    float sm_scale, cudaStream_t stream) {
   if (!ring_block_ok(num_q_heads, num_kv_heads, head_dim, q_rows, blk_len) || num_q_tiles <= 0)
     return cudaErrorInvalidValue;
   if (q_rows == 0 || blk_len == 0) return cudaSuccess;
@@ -227,8 +236,8 @@ extern "C" cudaError_t ring_block_attention_fwd_merge_cuda(
       reinterpret_cast<const __nv_bfloat16 *>(q),
       reinterpret_cast<const __nv_bfloat16 *>(k_blk),
       reinterpret_cast<const __nv_bfloat16 *>(v_blk), acc_m_in, acc_l_in,
-      acc_o_in, acc_m_out, acc_l_out, acc_o_out, num_q_heads, num_kv_heads,
-      head_dim, q_rows, blk_len, q_abs, k_abs, sm_scale);
+      acc_o_in, acc_m_out, acc_l_out, acc_o_out, q_pos, k_pos, num_q_heads,
+      num_kv_heads, head_dim, q_rows, blk_len, sm_scale);
   return cudaGetLastError();
 }
 
@@ -248,9 +257,9 @@ extern "C" cudaError_t ring_block_attention_finalize_cuda(
 extern "C" cudaError_t ring_block_attention_bwd_cuda(
     const uint16_t *q, const uint16_t *k_blk, const uint16_t *v_blk,
     const float *out, const float *lse, const uint16_t *d_out, float *grad_q,
-    float *grad_k_blk, float *grad_v_blk, int num_q_tiles, int num_q_heads,
-    int num_kv_heads, int head_dim, int q_rows, int blk_len, int q_abs, int k_abs,
-    float sm_scale, cudaStream_t stream) {
+    float *grad_k_blk, float *grad_v_blk, const float *q_pos, const float *k_pos,
+    int num_q_tiles, int num_q_heads, int num_kv_heads, int head_dim, int q_rows,
+    int blk_len, float sm_scale, cudaStream_t stream) {
   if (!ring_block_ok(num_q_heads, num_kv_heads, head_dim, q_rows, blk_len) || num_q_tiles <= 0)
     return cudaErrorInvalidValue;
   if (q_rows == 0 || blk_len == 0) return cudaSuccess;
@@ -260,7 +269,7 @@ extern "C" cudaError_t ring_block_attention_bwd_cuda(
       reinterpret_cast<const __nv_bfloat16 *>(k_blk),
       reinterpret_cast<const __nv_bfloat16 *>(v_blk), out, lse,
       reinterpret_cast<const __nv_bfloat16 *>(d_out), grad_q, grad_k_blk,
-      grad_v_blk, num_q_heads, num_kv_heads, head_dim, q_rows, blk_len, q_abs,
-      k_abs, sm_scale);
+      grad_v_blk, q_pos, k_pos, num_q_heads, num_kv_heads, head_dim, q_rows,
+      blk_len, sm_scale);
   return cudaGetLastError();
 }

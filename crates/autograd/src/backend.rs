@@ -34,8 +34,6 @@ pub struct RingBlockDims {
     pub head_dim: usize,
     pub q_rows: usize,
     pub blk_len: usize,
-    pub q_abs: usize,
-    pub k_abs: usize,
     pub sm_scale: f32,
 }
 
@@ -740,6 +738,8 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         _acc_m: &DeviceHandle,
         _acc_l: &DeviceHandle,
         _acc_o: &DeviceHandle,
+        _q_pos: &DeviceHandle,
+        _k_pos: &DeviceHandle,
         _dims: RingBlockDims,
     ) -> Result<(DeviceHandle, DeviceHandle, DeviceHandle)> {
         Err(crate::AutogradError::TapeInvariant(
@@ -777,6 +777,8 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         _lse: &DeviceHandle,
         _d_out: &DeviceHandle,
         _grad_q: &DeviceHandle,
+        _q_pos: &DeviceHandle,
+        _k_pos: &DeviceHandle,
         _dims: RingBlockDims,
     ) -> Result<(DeviceHandle, DeviceHandle, DeviceHandle)> {
         Err(crate::AutogradError::TapeInvariant(
