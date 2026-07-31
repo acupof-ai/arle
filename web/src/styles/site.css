@@ -29,6 +29,19 @@ body {
   text-rendering: geometricPrecision;
 }
 
+/* Whisper-faint engineering grid on the paper. Cards and the dark band
+   paint solid over it, so it only shows in the gutters — poster on graph
+   paper. Fixed so it doesn't jitter on scroll; near-invisible on purpose. */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background-image: radial-gradient(var(--grid-dot) 1px, transparent 1px);
+  background-size: 26px 26px;
+}
+
 ::selection { background: var(--selection); color: var(--selection-fg); }
 
 /* Scroll-driven section entrance. Declarative, zero JS: each section past
@@ -84,6 +97,7 @@ code      { font-family: inherit; color: var(--ink); font-weight: 500; }
 @media print {
   :root { --fs-base: 11pt; }
   html, body { background: #ffffff; color: #000000; }
+  body::before { display: none; }
   .topnav, .docs-topbar, .docs-tabs, aside.docs-side, .toc { display: none !important; }
   a { color: inherit; text-decoration: underline; }
   a[href^="http"]::after {
