@@ -43,6 +43,22 @@ fn splitmix64(mut x: u64) -> u64 {
     z ^ (z >> 31)
 }
 
+/// xgrammar bitmask semantics: bit `t` set = token `t` allowed. An all-zero
+/// mask would leave nothing to draw, so it is treated as "no constraint"
+/// rather than returning a token the grammar rejects.
+#[must_use]
+pub fn apply_grammar_bitmask(logits: &[f32], mask: &[u32]) -> Vec<f32> {
+    let allowed = |t: usize| mask.get(t / 32).is_some_and(|w| w >> (t % 32) & 1 == 1);
+    if !(0..logits.len()).any(allowed) {
+        return logits.to_vec();
+    }
+    logits
+        .iter()
+        .enumerate()
+        .map(|(t, &l)| if allowed(t) { l } else { f32::NEG_INFINITY })
+        .collect()
+}
+
 /// Sample one token id from a logits row under `params`.
 ///
 /// Greedy (`temperature <= 0`) returns `argmax_logit` — bit-identical to the
@@ -67,6 +83,12 @@ pub fn sample_token_logprob(
     params: &SamplingParams,
     position: u64,
 ) -> (u32, Option<f32>) {
+    if let Some(mask) = params.grammar_bitmask.as_deref() {
+        let masked = apply_grammar_bitmask(logits, mask);
+        let mut p = params.clone();
+        p.grammar_bitmask = None;
+        return sample_token_logprob(&masked, &p, position);
+    }
     if params.is_greedy() || logits.is_empty() {
         return (argmax_logit(logits), None);
     }
@@ -184,6 +206,26 @@ mod sampler_tests {
 
     fn ramp(n: usize) -> Vec<f32> {
         (0..n).map(|i| i as f32 * 0.1).collect()
+    }
+
+    #[test]
+    fn grammar_bitmask_binds_greedy_and_sampled_draws() {
+        let logits = ramp(64);
+        let mut p = SamplingParams::default();
+        assert_eq!(sample_token_logprob(&logits, &p, 0).0, 63);
+        // Allow only token 7: both decode modes must land on it, not on the
+        // unconstrained argmax.
+        let mut mask = vec![0u32; 2];
+        mask[0] = 1 << 7;
+        p.grammar_bitmask = Some(mask.clone().into());
+        assert_eq!(sample_token_logprob(&logits, &p, 0).0, 7);
+        p.temperature = 1.0;
+        assert_eq!(sample_token_logprob(&logits, &p, 0).0, 7);
+        // An empty mask has no legal draw; fall through rather than emit a
+        // token the grammar rejects.
+        p.temperature = 0.0;
+        p.grammar_bitmask = Some(vec![0u32; 2].into());
+        assert_eq!(sample_token_logprob(&logits, &p, 0).0, 63);
     }
 
     #[test]
