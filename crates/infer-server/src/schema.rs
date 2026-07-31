@@ -489,6 +489,7 @@ fn sampling_params(
         stop_token_ids: stop_token_ids.unwrap_or_default(),
         seed,
         max_new_tokens: max_tokens,
+        grammar_bitmask: None,
     }
 }
 
