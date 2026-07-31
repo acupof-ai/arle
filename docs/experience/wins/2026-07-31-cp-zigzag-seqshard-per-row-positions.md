@@ -33,9 +33,15 @@ position** end-to-end (the user's explicit choice over a device-side remap):
   `cp_rank*s+r` (byte-identical legacy), `Some` = the zigzag map.
 - `RingAttentionCtx` carries `q_pos: Vec<usize>` + per-block `k_pos: Vec<usize>`
   (was scalar `q_abs`/`k_abs`) so backward replays the same mask.
-- `qwen35.rs` derives `positions = cp.shard(seq_len*cp.size).local_rows()` at the
-  attention call — the same mesh-derived view `opd.rs` shards RoPE by, not a new
-  threaded param. At `cp.size==1` this is `0..seq_len`, byte-identical to `None`.
+- `qwen35.rs` threads `cp_positions: Option<&[usize]>` through `Qwen35Layer::forward`
+  → `forward_full_attention` → `cp_causal_sdpa`. The value is the SAME `positions`
+  slice that `forward_batch_hidden_indices` builds cos/sin from (opd.rs supplies the
+  shard's absolute rows), so the mask and RoPE share one source of truth. Passed as
+  data, NOT re-derived from `(seq_len, cp)` — a layer can't compute global positions
+  from a local length without assuming every shard is equal, and that assumption is
+  a hardcode. Threading keeps every sharding scheme (uneven, padded, packed, future)
+  in opd.rs alone. `None` off-CP (contiguous, unused); shared as `Arc<[usize]>` so
+  the `'static` checkpoint closure can capture it.
 
 ## Verification (local, CPU)
 
@@ -71,7 +77,9 @@ check).
 
 Zigzag makes the shard non-contiguous, so any code that assumed `pos = start + row`
 breaks silently. Mask by absolute position through the whole chain (forward, tape
-ctx, backward) — a scalar base is the bug. Derive the position map from the mesh at
-the point of use (`cp.shard(...).local_rows()`), the same view the rest of the
-forward shards by; don't thread a new param. When the device path can't yet honor
-the general case, make it a loud error, never a silent contiguous fallback.
+ctx, backward) — a scalar base is the bug. Pass the positions as data from the one
+place that knows the sharding (opd.rs, the same slice that builds RoPE cos/sin);
+don't reconstruct them inside the layer from `(seq_len, cp)` — that bakes in an
+equal-shard assumption and forks the source of truth from RoPE. When the device
+path can't yet honor the general case, make it a loud error, never a silent
+contiguous fallback.

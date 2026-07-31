@@ -602,6 +602,7 @@ impl Qwen35Layer {
         cp: crate::context_parallel::CpContext,
         cos: TensorId,
         sin: TensorId,
+        cp_positions: Option<&[usize]>,
         store: &mut TensorStore,
         tape: &mut Tape,
     ) -> Result<TensorId> {
@@ -625,7 +626,18 @@ impl Qwen35Layer {
         checkpoint_replay_mem_stage(tape, store, "post_input_norm");
         let attn_out = match &self.self_attn {
             Qwen35Attention::Full(attn) => self.forward_full_attention(
-                h, attn, cfg, tp, cp, cos, sin, batch, seq_len, store, tape,
+                h,
+                attn,
+                cfg,
+                tp,
+                cp,
+                cos,
+                sin,
+                batch,
+                seq_len,
+                cp_positions,
+                store,
+                tape,
             )?,
             Qwen35Attention::Linear(attn) => {
                 self.forward_linear_attention(h, attn, cfg, cp, batch, seq_len, store, tape)?
@@ -711,6 +723,7 @@ impl Qwen35Layer {
                     sin_prefix,
                     batch,
                     gen_start,
+                    None,
                     store,
                     tape,
                 )?;
@@ -957,6 +970,7 @@ impl Qwen35Layer {
                 sin,
                 batch,
                 seq_len,
+                None,
                 store,
                 tape,
             )?,
@@ -1035,6 +1049,7 @@ impl Qwen35Layer {
                 sin,
                 batch,
                 seq_len,
+                None,
                 store,
                 tape,
             )?,
@@ -1600,6 +1615,7 @@ impl Qwen35Layer {
         sin: TensorId,
         batch: usize,
         seq_len: usize,
+        cp_positions: Option<&[usize]>,
         store: &mut TensorStore,
         tape: &mut Tape,
     ) -> Result<TensorId> {
@@ -1715,19 +1731,26 @@ impl Qwen35Layer {
                 Some(seq_len),
                 "CP: cos rows must equal local seq_len (launcher must shard positions)"
             );
-            // Absolute position of each local row — the zigzag shard's `local_rows`
-            // over the global sequence (`seq_len` is this rank's shard length). The
-            // ring masks causally by true position, so a zigzag shard's two chunks
-            // (front+back) attend the right prefix, not the contiguous `cp.rank*s+r`.
-            // Derived here (not threaded) as the same view opd.rs shards RoPE by.
-            let positions = cp.shard(seq_len * cp.size).local_rows();
+            // Absolute position of each local row — passed in as data, the SAME slice
+            // that built cos/sin, so the ring masks causally by true position and a
+            // zigzag shard's two chunks (front+back) attend the right prefix. Threaded
+            // (not re-derived) so any sharding scheme lives only in the caller (opd.rs),
+            // not here — no `global = local*size` equal-shard assumption baked in.
+            let positions = cp_positions.ok_or(AutogradError::TapeInvariant(
+                "CP full-attention requires cp_positions (the shard's absolute rows)",
+            ))?;
+            debug_assert_eq!(
+                positions.len(),
+                seq_len,
+                "CP: cp_positions must give one absolute position per local row"
+            );
             autograd::ops::ring_attention::cp_causal_sdpa(
                 q,
                 k,
                 v,
                 cp.size,
                 cp.rank,
-                Some(&positions),
+                Some(positions),
                 store,
                 tape,
             )?
@@ -4156,6 +4179,7 @@ impl Qwen35Model {
                             crate::context_parallel::CpContext::single(),
                             cos_id,
                             sin_id,
+                            None,
                             s,
                             t,
                         )
@@ -4241,6 +4265,12 @@ impl Qwen35Model {
         let cos = select_cache_rows(self.cos_cache, positions, store)?;
         let sin = select_cache_rows(self.sin_cache, positions, store)?;
 
+        // Under CP the ring masks by the shard's absolute row positions — the SAME
+        // slice that built cos/sin above. Shared as `Arc<[usize]>` so the `'static`
+        // checkpoint closure can capture it; `None` off-CP (contiguous, unused).
+        let cp_positions: Option<Arc<[usize]>> =
+            self.cp.is_enabled().then(|| Arc::from(positions.to_vec()));
+
         let mut hidden = embedding(self.embed_tokens, token_indices, store, tape)?;
         hidden = reshape(
             hidden,
@@ -4275,10 +4305,12 @@ impl Qwen35Model {
                 let layers = Arc::clone(&layers);
                 let layer_times = Arc::clone(&layer_times);
                 let layer_counts = Arc::clone(&layer_counts);
+                let cp_positions = cp_positions.clone();
                 move |idx: usize, h, s: &mut TensorStore, t: &mut Tape| {
+                    let pos = cp_positions.as_deref();
                     if !profile_enabled {
                         return layers[idx]
-                            .forward(h, &cfg, tp, cp, cos_id, sin_id, s, t)
+                            .forward(h, &cfg, tp, cp, cos_id, sin_id, pos, s, t)
                             .map_err(qwen35_to_autograd);
                     }
                     if profile_sync {
@@ -4286,7 +4318,7 @@ impl Qwen35Model {
                     }
                     let t0 = Instant::now();
                     let result = layers[idx]
-                        .forward(h, &cfg, tp, cp, cos_id, sin_id, s, t)
+                        .forward(h, &cfg, tp, cp, cos_id, sin_id, pos, s, t)
                         .map_err(qwen35_to_autograd);
                     if profile_sync {
                         let _ = s.backend().stream_synchronize();
@@ -4351,6 +4383,7 @@ impl Qwen35Model {
                     self.cp,
                     cos,
                     sin,
+                    cp_positions.as_deref(),
                     store,
                     tape,
                 )?;
