@@ -99,12 +99,13 @@ So the head does exactly what it is for — truncating lifts tokens per verify r
 shorter, *variable-length* chain eats roughly four times what the saved rows are
 worth.
 
-**Root cause open.** The workspace-slot realloc hypothesis
-(`HiddenSlot::get` exact-size reuse, `workspace.rs:56`) is weakened: the cudarc
-mempool is already a caching allocator (`CU_MEMPOOL_ATTR_RELEASE_THRESHOLD =
-u64::MAX`, `tensor.rs:370`), so a freed 47 MB logits buffer should be re-served
-without a hard cudaMalloc. What is settled is the *shape* of the cost — see the
-blk4 cross-check below: raggedness itself, not row count and not the head.
+**Root cause CLOSED 2026-07-31 — and it was never raggedness.** See
+"Raggedness is not the cost" at the end of this entry: the arms that looked
+ragged-penalized were the arms that truncated chains to the bare anchor, and
+those fell out of the batched verify into a serial per-slot decode
+(`dspark_warm_decode_row`) — one forward per dropped slot, which is the only
+mechanism in this path with a 56 ms/step magnitude. `7358cb06c` keeps
+budget-zeroed greedy chains in the batch, and the penalty does not reproduce.
 
 ## DEFAULT FLIP — `--dspark-conf-threshold` 0.5 → 0 (flag since deleted)
 
@@ -190,7 +191,7 @@ Not a champion flip yet: c=8 is a wash and the third trial disagrees with itself
   conv1d/GDR pair already built, so a `blockIdx.y`-per-slot pointer table
   collapses them to two per layer.
 
-## Build the paper's scheduler — after the ragged-chain penalty
+## Build the paper's scheduler
 
 (An earlier revision argued "do not build Algorithm 1 here" off the 0.53 ms
 marginal row cost. Wrong twice: 160 rows is 85 ms, **32% of the step** — a
@@ -230,15 +231,13 @@ breaks the moment throughput stops rising (line 13), so **it cannot ship the
 failure the 0.5 default shipped** — losing to not speculating at all. That alone
 answers the rejection.
 
-What survives: **the ragged-chain penalty blocks it.** Algorithm 1 emits unequal
-`ℓ_r` by construction, and this engine charges 3.1× for that (`fr16` at
-threshold 0 vs 0.15: 354.1 vs 1095.7 ms at 253.9 vs 256.0 rows). The zero-code
-cross-check landed the same verdict: uniform 64 rows (blk4, 103.91 ms TPOT) ≈
-uniform 96 rows (fr6t0, 104.73) while ragged **76** rows (fr6@0.5) costs 159.68 —
-fewer rows, 54% slower. Raggedness itself is the cost, not row count. Fix that
-first or the scheduler loses on arrival. sglang's deployed DSpark answers it
-with graph-tier rounding (`ragged_verify.py::round_up_grid` — pad the ragged
-layout up to pre-captured CUDA-graph tiers), not by avoiding raggedness.
+What looked like a blocker: Algorithm 1 emits unequal `ℓ_r` by construction, and
+two measurements said this engine charges 3.1× for that (`fr16` threshold 0 vs
+0.15: 354.1 vs 1095.7 ms at 253.9 vs 256.0 rows; blk4 uniform 64 rows 103.91 ms
+≈ fr6t0 uniform 96 rows 104.73 vs fr6@0.5 ragged **76** rows 159.68). **Both
+were confounded — see "Raggedness is not the cost" below.** Every penalized arm
+is a *thresholded* arm, and thresholding is the one thing that cuts chains to
+the bare anchor, which drops them out of the batched verify entirely.
 
 The port target is sglang's deployed pipeline
 (`speculative/dspark_components/`), not a home-grown subset: the confidence
@@ -278,10 +277,59 @@ control); at c=16 rows are dear, it cuts the average chain to 3.79 rows, and
 accept rises 0.275 → 0.402 while TPOT drops 5.3%. Trading depth for accept
 under load is the whole point of `argmax_B τ*(B)/step_time(B)`, and it is the
 first arm to shrink the c=1 → c=16 accept collapse (−0.14 vs the control's
-−0.23) instead of merely suffering it. Spec still costs 2× TPOT at c=16 vs
-c=1 — the ragged-chain penalty above is untouched and remains the top blocker.
+−0.23) instead of merely suffering it.
+
+## Raggedness is not the cost — the serial fallback was
+
+The scheduler was supposed to be blocked behind a 3.1× ragged-chain penalty.
+That penalty does not exist. Three hypotheses, killed in order:
+
+- **Workspace-slot realloc** (`HiddenSlot::get` exact-shape reuse): dead on
+  arithmetic. A shape change re-`zeros` the buffer, but the biggest one is
+  `[248320, rows]` logits = 47 MB ≈ 30 µs of memset; every slot in the path
+  together is ~1.5 ms against a 56 ms/step gap. Off by 40×.
+- **CUDA-graph tier miss** (the sglang `round_up_grid` story): structurally
+  impossible here. The whole-step decode graph covers `rows == 1` only
+  (`executor/qwen35.rs`), so a spec verify — uniform or ragged — is always
+  eager. There is no tier to fall out of.
+- **Serial fallback**: the only mechanism at the right magnitude. A chain cut
+  to the bare anchor used to fail the batch filter and take
+  `dspark_warm_decode_row`, one per-slot trunk forward each. Every "ragged"
+  arm in the earlier table is a *thresholded* arm — thresholding is what
+  produces bare-anchor chains — so the two variables were never separated.
+  `7358cb06c` keeps those chains in the batch as one decode row.
+
+The isolating A/B (zero code — `--dspark-sps-row-ms 0` makes rows free, so the
+budget always admits the full block; same binary, weights, prompts, GPU):
+
+| | c=1 TPOT | c=16 TPOT | c=16 depth | c=16 accept |
+|---|---:|---:|---:|---:|
+| uniform (`row_ms 0`) | 20.99 ms | 160.75 ms | 5.00 | 0.309 |
+| ragged (goodput) | 20.93 ms | **153.96 ms** | 3.79 | 0.402 |
+
+At c=1 the two arms are the same configuration by construction, and they land
+0.3% apart — that is this campaign's noise floor. At c=16 the ragged arm is
+4.2% **faster**, by about what its 1.2 fewer rows/request are worth at
+0.53 ms/row. Raggedness costs nothing measurable, `round_up_grid` is not
+needed, and the remaining c=16 cost is row count and accept rate — which is
+exactly what the budget optimizes. Spec still costs 2× TPOT at c=16 vs c=1;
+that gap is now unattributed and needs its own decomposition.
 
 ## Rule
+
+**Name the mechanism and check its magnitude before believing a measurement's
+label.** "Ragged chains cost 3.1×" survived a week and blocked a scheduler
+because nobody asked what in this engine could plausibly cost 56 ms/step. Of
+the three candidates, two die on arithmetic and structure alone — a memset is
+40× too small, and the decode graph never covers a verify — leaving the one
+that does a whole trunk forward per dropped slot. A number attached to the
+wrong noun is worse than no number: it points the fix at the wrong code.
+
+**When every arm showing an effect also shares a second setting, you measured
+the second setting.** Every "ragged" arm was a *thresholded* arm. The isolating
+A/B cost zero code — an existing flag (`--dspark-sps-row-ms 0`) makes rows free
+and turns the budget into a uniform-block emitter — and the same-config c=1
+pair fell out of it as a free 0.3% noise floor.
 
 **A claim that a path cannot be verified is a claim about the disk, and disks are
 cheap to check.** I filed "no markov checkpoint exists" after looking at one
