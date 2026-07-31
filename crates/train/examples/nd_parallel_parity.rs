@@ -205,7 +205,7 @@ fn run_writeback_in(mut store: TensorStore, cp: CpContext) -> Result<f32> {
 #[cfg(all(feature = "cuda", feature = "nccl"))]
 fn tiny_full_attn_config() -> Qwen35Config {
     Qwen35Config {
-        hidden_size: 8,
+        hidden_size: 512,
         intermediate_size: 16,
         num_hidden_layers: 2,
         vocab_size: 16,
@@ -216,7 +216,10 @@ fn tiny_full_attn_config() -> Qwen35Config {
         tie_word_embeddings: false,
         num_attention_heads: 4,
         num_key_value_heads: 2,
-        head_dim: 2,
+        // head_dim 128 (not toy 2): the single-card ref then enters the SAME bf16
+        // prefill kernel as the CP ring (envelope needs dim ∈ {128,256}). At dim 2
+        // the ref fell back to f32, so parity was f32-vs-bf16 — a ~2^-8 gap, not a bug.
+        head_dim: 128,
         linear_num_key_heads: 2,
         linear_key_head_dim: 2,
         linear_num_value_heads: 2,
@@ -225,7 +228,7 @@ fn tiny_full_attn_config() -> Qwen35Config {
         rope_theta: 10_000.0,
         rope_scaling: None,
         partial_rotary_factor: 1.0,
-        rotary_dim: 2,
+        rotary_dim: 128,
         // RoPE cache must cover every absolute position: seq (from ARLE_ND_SEQ,
         // padded up by opd.rs) plus headroom. seq=131072 needs 131072 rows, not 16.
         rope_cache_len_hint: Some(nd_seq().next_power_of_two().max(16)),
