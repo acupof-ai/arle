@@ -523,6 +523,13 @@ def _gsm8k_gold_answer(answer: str) -> str:
 
 
 def _gsm8k_extract_answer(text: str) -> str | None:
+    # Thinking models emit the whole chain-of-thought in a <think>...</think>
+    # block, then the final answer after it. The block is full of arithmetic
+    # (48/2 = 24, 48+24 = 72, ...), so scoring must look only *after* the
+    # closing tag — otherwise the last-number fallback grabs a scratch value.
+    close = text.rfind("</think>")
+    if close != -1:
+        text = text[close + len("</think>"):]
     # Prefer the `#### N` marker if the model used it.
     m = _GSM8K_ANSWER_RE.search(text)
     if m:
@@ -580,14 +587,20 @@ def run_gsm8k(
     per_question: list[dict] = []
     t0 = time.time()
     for i, ex in enumerate(pool):
-        prompt = few_shot + f"Q: {ex['question']}\nA:"
+        # Thinking models collapse on completion-endpoint few-shot (they emit
+        # 1 token and stop when they see prior `#### N` exemplars). The chat
+        # endpoint drives their trained reason-then-answer mode; a zero-shot
+        # instruction to end with `#### <number>` gives a clean extractable tail.
+        instruction = (
+            f"{ex['question']}\n\n"
+            "Solve step by step. End your response with the final numeric "
+            "answer on its own, preceded by ####."
+        )
         try:
-            # GSM8K is a multi-step reasoning task: a CoT solution routinely runs
-            # 150-400+ tokens before `####`. The old 256 cap truncated longer
-            # chains mid-reasoning (and thinking-mode models need far more) ->
-            # wrong/miss. Per-task budget; see --gsm8k-max-tokens (>=10K for
-            # thinking models).
-            resp = client.completion(prompt, max_tokens=max_tokens, temperature=0.0)
+            resp = client.chat(
+                [{"role": "user", "content": instruction}],
+                max_tokens=max_tokens, temperature=0.0,
+            )
         except (urllib.error.URLError, urllib.error.HTTPError, OSError) as exc:
             print(f"[gsm8k] sample {i} request error: {exc}", flush=True)
             invalid += 1
