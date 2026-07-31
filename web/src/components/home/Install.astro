@@ -22,7 +22,9 @@ const { cards } = Astro.props;
   .card {
     border: 1px solid var(--line);
     background: var(--paper);
+    transition: border-color var(--t-base);
   }
+  .card:hover { border-color: var(--ink); }
   .lab {
     padding: 12px 16px;
     border-bottom: 1px solid var(--line);
