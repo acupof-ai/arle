@@ -256,6 +256,34 @@ fn coordinator_main() -> Result<()> {
             })
             .fold(0.0f32, f32::max);
         println!("rank {rank} shard_rows={rows:?} max_diff_vs_single={rank_worst:.6e}");
+        // Per-TARGET-ROW diff vs f32: the loss reads hidden ONLY at target positions
+        // (predict p in prompt_len-1..=seq-2). A global max-diff hides a bias
+        // concentrated there — this is the diff the CE actually sees. prompt_len=4.
+        for (local, &g) in rows.iter().enumerate() {
+            if (3..=SEQ - 2).contains(&g) {
+                let got = &data[local * hidden_size..(local + 1) * hidden_size];
+                let cpu = &cpu_hidden[g * hidden_size..(g + 1) * hidden_size];
+                let single = &ref_hidden[g * hidden_size..(g + 1) * hidden_size];
+                let d_f32 = got
+                    .iter()
+                    .zip(cpu)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                let d_single = got
+                    .iter()
+                    .zip(single)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                let single_f32 = single
+                    .iter()
+                    .zip(cpu)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                println!(
+                    "  target row g{g}: cp_vs_f32={d_f32:.4e} cp_vs_single={d_single:.4e} single_vs_f32={single_f32:.4e}"
+                );
+            }
+        }
     }
 
     println!("cp_hidden_parity cp_size={CP_SIZE} devices={devices:?} seq={SEQ}");
