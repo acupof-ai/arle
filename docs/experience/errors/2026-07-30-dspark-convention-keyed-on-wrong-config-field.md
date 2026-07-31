@@ -37,6 +37,15 @@ Spec decode stays lossless under either reading — the needle ladder passed
 `exact=3 DET` at 512/4k/16k/32k on the broken arm. Only accept moves, and no
 assertion read it.
 
+**Blast radius reaches training, not just serving.** The flag rides on every
+captured experience (`infer-cuda/src/executor/dspark_train.rs`) and sets the
+loss alignment offset `d = usize::from(!next_token_heads)`
+(`train/src/dspark_train.rs:400`), so a DSpark training run inside the broken
+window would have learned against a one-position-shifted target — equally
+invisible, since the training gates do not read accept either. No run landed
+in the window (latest `.arle-runs/` predates it, and the window's `train/`
+commits are all CP/TP refactors), so this was a near miss.
+
 ## Fix
 
 Revert to the truthful signal and make it explicit: the converter now writes
