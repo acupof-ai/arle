@@ -12,6 +12,12 @@
 #![cfg(all(unix, feature = "cuda"))]
 
 #[cfg(feature = "nccl")]
+use std::io::{BufRead, BufReader};
+#[cfg(feature = "nccl")]
+use std::sync::Arc;
+#[cfg(feature = "nccl")]
+use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(feature = "nccl")]
 use std::time::Duration;
 
 #[cfg(feature = "nccl")]
@@ -71,6 +77,13 @@ pub(crate) fn maybe_spawn_ranks_and_wait(
         let size_env = format!("ARLE_TRAIN_{axis}_SIZE");
         let exe = std::env::current_exe().context("current_exe")?;
         let mut children: Vec<(usize, std::process::Child)> = Vec::with_capacity(size);
+        // Monotonic "last time any rank emitted a log line", in ms since `start`.
+        // A wedged collective goes silent on every rank (all block on the hung one),
+        // so any child stderr line is a group-liveness signal. Forwarder threads bump
+        // this; the wait loop measures IDLE time against it, not total wall-clock.
+        let last_progress_ms = Arc::new(AtomicU64::new(0));
+        let start = std::time::Instant::now();
+        let mut forwarders: Vec<std::thread::JoinHandle<()>> = Vec::with_capacity(size);
         for rank in 0..size {
             let device = devices.get(rank).copied().unwrap_or(rank);
             let mut cmd = std::process::Command::new(&exe);
@@ -81,6 +94,9 @@ pub(crate) fn maybe_spawn_ranks_and_wait(
             cmd.env(&size_env, size.to_string());
             cmd.env("INFER_CUDA_DEVICE", device.to_string());
             cmd.env("INFER_NCCL_UNIQUE_ID", &uid_hex);
+            // Pipe stderr so a forwarder thread can watch for liveness; the worker's
+            // own `[cpN]` prefix (install_cp_worker_logger) is preserved on re-print.
+            cmd.stderr(std::process::Stdio::piped());
             // Each rank's rollout engine is single-GPU (this launcher owns the
             // per-rank device via INFER_CUDA_DEVICE). Strip any inherited TP-serving
             // env so resolve_tp_config_from_env doesn't build a spurious rollout TP
@@ -94,29 +110,39 @@ pub(crate) fn maybe_spawn_ranks_and_wait(
             ] {
                 cmd.env_remove(k);
             }
-            let child = cmd
+            let mut child = cmd
                 .spawn()
                 .with_context(|| format!("spawn {axis} rank {rank}"))?;
             log::info!(
                 "spawned {axis} rank {rank} pid={} device={device}",
                 child.id()
             );
+            if let Some(stderr) = child.stderr.take() {
+                let progress = Arc::clone(&last_progress_ms);
+                forwarders.push(std::thread::spawn(move || {
+                    for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                        progress.store(start.elapsed().as_millis() as u64, Ordering::Relaxed);
+                        eprintln!("{line}");
+                    }
+                }));
+            }
             children.push((rank, child));
         }
 
         // Wait for the first exit; on any exit (success or crash) kill the rest so
         // a single rank's failure can't leave the others blocked in a collective.
         // A rank that HANGS inside a collective never exits, so try_wait alone can't
-        // see it — an opt-in no-progress deadline (ARLE_TRAIN_STEP_TIMEOUT_SECS)
-        // tears the group down on a hang. Off by default so a legit long step is
-        // never killed; set it to bound a ladder/OOM probe.
+        // see it — an opt-in NO-PROGRESS deadline (ARLE_TRAIN_STEP_TIMEOUT_SECS)
+        // tears the group down only after the whole group has been SILENT that long.
+        // Measuring idle-since-last-log (not total wall-clock) lets a legit slow-but-
+        // progressing step run forever while still catching a true wedge. Off by
+        // default; set it to bound a ladder/OOM probe.
         let hang_timeout = std::env::var("ARLE_TRAIN_STEP_TIMEOUT_SECS")
             .or_else(|_| std::env::var("ARLE_TRAIN_CP_STEP_TIMEOUT_SECS"))
             .ok()
             .and_then(|v| v.parse().ok())
             .filter(|&s| s > 0)
             .map(Duration::from_secs);
-        let start = std::time::Instant::now();
         let (exit_rank, code) = loop {
             if let Some(hit) = children
                 .iter_mut()
@@ -124,18 +150,21 @@ pub(crate) fn maybe_spawn_ranks_and_wait(
             {
                 break hit;
             }
-            if let Some(limit) = hang_timeout
-                && start.elapsed() > limit
-            {
-                log::error!(
-                    "no {axis} rank exited within {limit:?}; assuming a hung collective, tearing down"
-                );
-                for (rank, child) in &mut children {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    log::info!("killed hung {axis} rank {rank}");
+            if let Some(limit) = hang_timeout {
+                let idle = start.elapsed().saturating_sub(Duration::from_millis(
+                    last_progress_ms.load(Ordering::Relaxed),
+                ));
+                if idle > limit {
+                    log::error!(
+                        "no {axis} rank logged for {idle:?} (> {limit:?}); assuming a hung collective, tearing down"
+                    );
+                    for (rank, child) in &mut children {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        log::info!("killed hung {axis} rank {rank}");
+                    }
+                    anyhow::bail!("{axis} group hung: no rank progressed for {idle:?}");
                 }
-                anyhow::bail!("{axis} group hung: no rank progressed within {limit:?}");
             }
             std::thread::sleep(Duration::from_millis(100));
         };
@@ -145,6 +174,11 @@ pub(crate) fn maybe_spawn_ranks_and_wait(
                 let _ = child.kill();
                 let _ = child.wait();
             }
+        }
+        // Forwarders end when their child's stderr closes (post-kill/exit); join so
+        // buffered final lines flush before we return.
+        for f in forwarders {
+            let _ = f.join();
         }
         match code {
             Some(0) => Ok(true),
