@@ -1,8 +1,9 @@
 # W8A16 support: the kernel existed, only the wiring was missing — 2026-07-31
 
-> Status: Quantizer + numerics validated locally (self-check + end-to-end logit
-> probe). Detect/validate/load/dispatch wired, Mac CUDA typecheck + clippy green.
-> Pod serve parity (needle gate vs BF16) is the gate — pending-remote (nvcc).
+> Status: **Validated end-to-end on H20 (GPU 2).** W8A16 serve of a dense
+> Qwen3.5-0.8B loads in ~5s and matches its BF16 source byte-for-byte on greedy
+> probes. Quantizer + numerics validated locally (self-check + logit probe);
+> detect/validate/load/dispatch wired, Mac CUDA typecheck + clippy green.
 
 ## Context
 
@@ -61,6 +62,34 @@ doesn't have. (SVDQuant-style low-rank residual compensation was rejected earlie
 for the same reason FP8 block already wins: the quant residual is full-rank
 rounding noise, not low-rank outlier structure — `errors/2026-08-01`.)
 
+## Pod validation (H20, GPU 2) — and the scope-vs-coverage bug it caught
+
+Served a dense Qwen3.5-0.8B (`Qwen3_5ForConditionalGeneration`, 24 layers)
+quantized to W8A16 (208 tensors, group 128) against its BF16 source, same GPU:
+
+| prompt | W8A16 | BF16 | match |
+|---|---|---|---|
+| "The capital of France is" | " Paris.\n…" | " Paris.\n…" | byte-identical |
+| "def fibonacci(n):" | valid `if n<=0…` | same | byte-identical |
+| "2+2=" | "4, …" | "4\n…" | answer "4" identical, diverges only on trailing separator |
+
+Loaded + engine-ready in ~5s. The INT8 kernel path fires and produces correct
+inference. Two real load-time errors surfaced first — both signal, not noise:
+
+1. **Legacy `Qwen3ForCausalLM` builder is not W8A16-aware.** A Qwen3-4B W8A16
+   crashed at `q_proj.weight: clean CUDA path accepts BF16 only, got I8`. W8A16
+   dispatch is wired only into the `qwen35` builder — the arch limit is real,
+   document it, don't paper over it.
+2. **Quant scope exceeded loader coverage.** `--all-linear` quantized
+   `linear_attn.in_proj_a`/`in_proj_b` (`[16,1024]`, one scalar per v-head —
+   gates, not GEMMs), which `qwen35.rs:3296-3297` loads BF16-only by design.
+   Serve read I8 through the BF16 path and bailed. Fix: the quantizer's
+   `ALL_LINEAR_SKIP` now carries `in_proj_a`/`in_proj_b`/`conv1d` — the complete
+   BF16-only `.weight` set in the builder (`195ba2e5d`).
+
+This is why the pod gate exists: local numerics were all green (self-check, logit
+probe), but the quantizer↔loader scope contract can only fail on a real serve.
+
 ## Rules
 
 - **Audit the tree before "adding" a kernel.** Grep the FFI + enum + constructor
@@ -69,6 +98,13 @@ rounding noise, not low-rank outlier structure — `errors/2026-08-01`.)
 - **Non-packed INT8 ≠ packed INT4 — don't copy the `/2`.** The only place the
   W4A16 mirror breaks: I8 stores 1 byte/weight, U8-nibble stores 2 weights/byte.
   Every shard/shape `/2`·`*2` must go.
+- **Quant scope must be a subset of the loader's quant-aware coverage.** A
+  quantizer that quantizes more tensors than the loader routes through the
+  quant-aware path produces a checkpoint that serve reads through the BF16 path
+  and crashes on the I8 bytes. The scope list is defined by the loader, not by
+  ".weight" name-matching — enumerate every plain-`load_matrix` call in the
+  builder and skip exactly those (`embed`, `lm_head`, `in_proj_a/b`, `conv1d`).
+  Local numerics can't catch this; only a real serve can.
 - **INT8-weight is the accuracy pick, FP8 is the systems pick.** INT8 weights are
   ~2× tighter, but FP8 keeps native-format weight reads (no dequant→requant),
   train/serve format parity (Qwen/DSv4 ship FP8), and Hopper Tensor-Core
