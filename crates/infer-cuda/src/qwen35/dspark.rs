@@ -1271,11 +1271,13 @@ impl Qwen35Model {
             }
         }
 
+        let mut pt = super::dspark_phase_start(ctx);
         let ids_dev = scratch.ids.upload(ctx, &ids)?;
         let h = scratch.hidden.get(ctx, hidden, rows)?;
         embedding_batch(ctx, &self.embed_tokens, ids_dev, h)?;
         let pos_dev = scratch.start_pos_abs.upload(ctx, &pos)?;
         let win_dev = scratch.attn_win.upload(ctx, &win)?;
+        let embed_ms = super::mtp_phase_lap(ctx, &mut pt);
 
         let elem = std::mem::size_of::<half::f16>() as u64;
         for (li, layer) in head.layers.iter().enumerate() {
@@ -1388,6 +1390,7 @@ impl Qwen35Model {
                 scratch.hidden.get(ctx, hidden, rows)?,
             )?;
         }
+        let layers_ms = super::mtp_phase_lap(ctx, &mut pt);
 
         let final_normed = scratch.final_normed.get(ctx, hidden, rows)?;
         rms_norm_batch(
@@ -1400,6 +1403,7 @@ impl Qwen35Model {
         let vocab = self.output_projection().rows;
         let logits = scratch.logits_b.get(ctx, vocab, rows)?;
         gemm_batch(ctx, self.output_projection(), final_normed, logits)?;
+        let head_ms = super::mtp_phase_lap(ctx, &mut pt);
 
         // One D2H for the whole tick, and one markov settle over every slot.
         let first_row = usize::from(!cfg.next_token_heads);
@@ -1411,6 +1415,7 @@ impl Qwen35Model {
             block,
             first_row,
         )?;
+        let settle_ms = super::mtp_phase_lap(ctx, &mut pt);
 
         let n = block - first_row;
         let mut prevs = Vec::with_capacity(b * n);
@@ -1439,6 +1444,13 @@ impl Qwen35Model {
             block,
             first_row,
         )?;
+        if pt.is_some() {
+            let conf_ms = super::mtp_phase_lap(ctx, &mut pt);
+            eprintln!(
+                "[dspark-draft-b] rows={rows} embed={embed_ms:.2} layers={layers_ms:.2} \
+                 head={head_ms:.2} settle={settle_ms:.2} conf={conf_ms:.2} ms"
+            );
+        }
         let mut chains = Vec::with_capacity(b);
         for (s, &anchor) in anchors.iter().enumerate() {
             let drafts = &am[s * block + first_row..(s + 1) * block];
