@@ -551,12 +551,6 @@ mod tests {
         assert_eq!(view.logical_shape, vec![512, 2048]);
         validate_scale_shapes(&view, &tensors).expect("W8A16 scale shape valid");
 
-        // Wrong scale K (not group-divisible) must reject.
-        let mut bad = tensors.clone();
-        bad.insert(
-            format!("{base}.weight_scale"),
-            header(Dtype::BF16, &[512, 15]),
-        );
         // Wrong scale K (not group-divisible) must reject at detect.
         let mut bad = tensors.clone();
         bad.insert(
