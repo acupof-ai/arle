@@ -81,10 +81,6 @@ impl SeqShard {
         self.len() == 0
     }
 
-    pub fn contains(&self, pos: usize) -> bool {
-        self.chunks.iter().any(|&(s, e)| pos >= s && pos < e)
-    }
-
     /// Global rows this rank owns, in local order — the gather index for slicing
     /// the embedded sequence and positions down to this shard.
     pub fn local_rows(&self) -> Vec<usize> {
@@ -93,7 +89,8 @@ impl SeqShard {
 
     /// Global position → local row index, or `None` if this shard doesn't own it.
     /// Chunks concatenate in order, so the offset is the summed length of prior
-    /// chunks plus the in-chunk offset.
+    /// chunks plus the in-chunk offset. This is the shard's only membership query —
+    /// callers filter loss targets by mapping through it (`opd.rs`).
     pub fn local_of(&self, pos: usize) -> Option<usize> {
         let mut base = 0;
         for &(s, e) in &self.chunks {
@@ -103,17 +100,6 @@ impl SeqShard {
             base += e - s;
         }
         None
-    }
-
-    /// Filter `(global_position, target)` loss pairs to those this shard owns,
-    /// rebased to shard-local row indices (via `local_of`). The global target count
-    /// (for `inv_n = 1/global_targets`) is the sum of per-shard lengths.
-    pub fn local_targets(&self, positions: &[usize], targets: &[u32]) -> (Vec<usize>, Vec<u32>) {
-        positions
-            .iter()
-            .zip(targets)
-            .filter_map(|(&p, &t)| self.local_of(p).map(|local| (local, t)))
-            .unzip()
     }
 }
 
@@ -306,19 +292,24 @@ mod tests {
         let size = 2;
         let seq = 8; // rank0 owns rows {0,1,6,7}, rank1 owns {2,3,4,5}
         // global targets at positions 1,4,7
-        let positions = vec![1usize, 4, 7];
+        let positions = [1usize, 4, 7];
         let targets = vec![100u32, 200, 300];
+        // Mirror opd.rs's filter: keep targets this shard owns, rebased via local_of.
+        let local = |rank| {
+            let shard = CpContext::new(rank, size).shard(seq);
+            positions
+                .iter()
+                .zip(&targets)
+                .filter_map(|(&p, &t)| shard.local_of(p).map(|l| (l, t)))
+                .unzip::<_, _, Vec<usize>, Vec<u32>>()
+        };
 
-        let (p0, t0) = CpContext::new(0, size)
-            .shard(seq)
-            .local_targets(&positions, &targets);
+        let (p0, t0) = local(0);
         // rank0 local order [0,1,6,7]: pos1→local 1, pos7→local 3.
         assert_eq!(p0, vec![1, 3]);
         assert_eq!(t0, vec![100, 300]);
 
-        let (p1, t1) = CpContext::new(1, size)
-            .shard(seq)
-            .local_targets(&positions, &targets);
+        let (p1, t1) = local(1);
         // rank1 local order [2,3,4,5]: pos4→local 2.
         assert_eq!(p1, vec![2]);
         assert_eq!(t1, vec![200]);
@@ -420,7 +411,12 @@ mod tests {
         for rank in 0..size {
             let shard = CpContext::new(rank, size).shard(seq);
             let rows = shard.local_rows();
-            let (local_p, local_t) = shard.local_targets(&positions, &targets);
+            // Filter+rebase as opd.rs does: map each target through local_of.
+            let (local_p, local_t): (Vec<usize>, Vec<u32>) = positions
+                .iter()
+                .zip(&targets)
+                .filter_map(|(&p, &t)| shard.local_of(p).map(|l| (l, t)))
+                .unzip();
             // Rebase local rows back to absolute (via the gather index) and collect.
             for (lp, t) in local_p.iter().zip(&local_t) {
                 reconstructed.push((rows[*lp], *t));
