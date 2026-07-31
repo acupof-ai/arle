@@ -175,6 +175,10 @@ pub struct SamplingParams {
     pub seed: Option<u64>,
     /// Optional override for the number of newly generated tokens.
     pub max_new_tokens: Option<usize>,
+    /// Per-step grammar constraint (xgrammar next-token bitmask, bit set =
+    /// allowed). Host-side and backend-neutral; the engine refreshes it after
+    /// every accepted token.
+    pub grammar_bitmask: Option<std::sync::Arc<[u32]>>,
 }
 
 impl Default for SamplingParams {
@@ -191,6 +195,7 @@ impl Default for SamplingParams {
             stop_token_ids: Vec::new(),
             seed: None,
             max_new_tokens: None,
+            grammar_bitmask: None,
         }
     }
 }

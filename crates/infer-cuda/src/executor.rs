@@ -1012,7 +1012,8 @@ pub(crate) fn sample_cuda_token(
     position: u64,
 ) -> Result<u32> {
     maybe_dump_sample_topk(ctx, logits, position)?;
-    if params.is_greedy() {
+    // A grammar mask must reach the argmax, so greedy takes the host path too.
+    if params.is_greedy() && params.grammar_bitmask.is_none() {
         let token = argmax(ctx, logits)?;
         probe_decode_entropy(ctx, logits, None, token, position)?;
         return Ok(token);
@@ -1041,7 +1042,7 @@ pub(crate) fn sample_cuda_token_scratched(
     argmax_out: &mut cudarc::driver::CudaSlice<i32>,
 ) -> Result<(u32, Option<f32>)> {
     maybe_dump_sample_topk(ctx, logits, position)?;
-    if params.is_greedy() {
+    if params.is_greedy() && params.grammar_bitmask.is_none() {
         let token = crate::ops::argmax_into(ctx, logits, argmax_out)?;
         probe_decode_entropy(ctx, logits, None, token, position)?;
         return Ok((token, None));
