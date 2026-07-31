@@ -1552,16 +1552,20 @@ impl Backend for CudaBackend {
         acc_m: &DeviceHandle,
         acc_l: &DeviceHandle,
         acc_o: &DeviceHandle,
+        q_pos: &DeviceHandle,
+        k_pos: &DeviceHandle,
         dims: RingBlockDims,
     ) -> Result<(DeviceHandle, DeviceHandle, DeviceHandle)> {
         #[cfg(feature = "no-cuda")]
         {
-            let _ = (q, k_blk, v_blk, acc_m, acc_l, acc_o, dims);
+            let _ = (q, k_blk, v_blk, acc_m, acc_l, acc_o, q_pos, k_pos, dims);
             todo!("GPU required: cuda ring_block_fwd_merge is unavailable under feature no-cuda")
         }
         #[cfg(not(feature = "no-cuda"))]
         {
-            cuda_ring_block_fwd_merge(self, q, k_blk, v_blk, acc_m, acc_l, acc_o, dims)
+            cuda_ring_block_fwd_merge(
+                self, q, k_blk, v_blk, acc_m, acc_l, acc_o, q_pos, k_pos, dims,
+            )
         }
     }
 
@@ -1584,6 +1588,7 @@ impl Backend for CudaBackend {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn ring_block_bwd(
         &self,
         q: &DeviceHandle,
@@ -1593,16 +1598,20 @@ impl Backend for CudaBackend {
         lse: &DeviceHandle,
         d_out: &DeviceHandle,
         grad_q: &DeviceHandle,
+        q_pos: &DeviceHandle,
+        k_pos: &DeviceHandle,
         dims: RingBlockDims,
     ) -> Result<(DeviceHandle, DeviceHandle, DeviceHandle)> {
         #[cfg(feature = "no-cuda")]
         {
-            let _ = (q, k_blk, v_blk, out, lse, d_out, grad_q, dims);
+            let _ = (q, k_blk, v_blk, out, lse, d_out, grad_q, q_pos, k_pos, dims);
             todo!("GPU required: cuda ring_block_bwd is unavailable under feature no-cuda")
         }
         #[cfg(not(feature = "no-cuda"))]
         {
-            cuda_ring_block_bwd(self, q, k_blk, v_blk, out, lse, d_out, grad_q, dims)
+            cuda_ring_block_bwd(
+                self, q, k_blk, v_blk, out, lse, d_out, grad_q, q_pos, k_pos, dims,
+            )
         }
     }
 
@@ -4126,6 +4135,8 @@ fn cuda_ring_block_fwd_merge(
     acc_m: &DeviceHandle,
     acc_l: &DeviceHandle,
     acc_o: &DeviceHandle,
+    q_pos: &DeviceHandle,
+    k_pos: &DeviceHandle,
     dims: RingBlockDims,
 ) -> Result<(DeviceHandle, DeviceHandle, DeviceHandle)> {
     let q_slice = backend.cuda_slice(q, "ring q")?;
@@ -4137,6 +4148,8 @@ fn cuda_ring_block_fwd_merge(
     let m_in = backend.cuda_slice(acc_m, "ring acc_m")?;
     let l_in = backend.cuda_slice(acc_l, "ring acc_l")?;
     let o_in = backend.cuda_slice(acc_o, "ring acc_o")?;
+    let qpos_slice = backend.cuda_slice(q_pos, "ring q_pos")?;
+    let kpos_slice = backend.cuda_slice(k_pos, "ring k_pos")?;
     let rows = dims.num_q_tiles * dims.q_rows;
     let mut m_out = backend
         .stream
@@ -4160,9 +4173,12 @@ fn cuda_ring_block_fwd_merge(
         let (mo_ptr, _mog) = m_out.device_ptr_mut(&backend.stream);
         let (lo_ptr, _log) = l_out.device_ptr_mut(&backend.stream);
         let (oo_ptr, _oog) = o_out.device_ptr_mut(&backend.stream);
+        let (qpos_ptr, _qpg) = qpos_slice.device_ptr(&backend.stream);
+        let (kpos_ptr, _kpg) = kpos_slice.device_ptr(&backend.stream);
         check_cuda_ffi(
             // SAFETY: q/k/v are live bf16 copies; acc_*_in are f32 handles of the right
-            // length; *_out are freshly allocated rows / rows*hd; dims mirror the shapes.
+            // length; *_out are freshly allocated rows / rows*hd; q_pos/k_pos are f32
+            // handles of q_rows / blk_len; dims mirror the shapes.
             unsafe {
                 ffi::ring_block_attention_fwd_merge_cuda(
                     q_ptr as *const ffi::Half,
@@ -4174,14 +4190,14 @@ fn cuda_ring_block_fwd_merge(
                     mo_ptr as *mut f32,
                     lo_ptr as *mut f32,
                     oo_ptr as *mut f32,
+                    qpos_ptr as *const f32,
+                    kpos_ptr as *const f32,
                     ring_i32(dims.num_q_tiles, "ring num_q_tiles i32")?,
                     ring_i32(dims.num_q_heads, "ring num_q_heads i32")?,
                     ring_i32(dims.num_kv_heads, "ring num_kv_heads i32")?,
                     ring_i32(dims.head_dim, "ring head_dim i32")?,
                     ring_i32(dims.q_rows, "ring q_rows i32")?,
                     ring_i32(dims.blk_len, "ring blk_len i32")?,
-                    ring_i32(dims.q_abs, "ring q_abs i32")?,
-                    ring_i32(dims.k_abs, "ring k_abs i32")?,
                     dims.sm_scale,
                     backend.stream.cu_stream(),
                 )
@@ -4258,6 +4274,8 @@ fn cuda_ring_block_bwd(
     lse: &DeviceHandle,
     d_out: &DeviceHandle,
     grad_q: &DeviceHandle,
+    q_pos: &DeviceHandle,
+    k_pos: &DeviceHandle,
     dims: RingBlockDims,
 ) -> Result<(DeviceHandle, DeviceHandle, DeviceHandle)> {
     let q_slice = backend.cuda_slice(q, "ring bwd q")?;
@@ -4267,6 +4285,8 @@ fn cuda_ring_block_bwd(
     let lse_slice = backend.cuda_slice(lse, "ring bwd lse")?;
     let do_slice = backend.cuda_slice(d_out, "ring bwd d_out")?;
     let gq_slice = backend.cuda_slice(grad_q, "ring bwd grad_q")?;
+    let qpos_slice = backend.cuda_slice(q_pos, "ring bwd q_pos")?;
+    let kpos_slice = backend.cuda_slice(k_pos, "ring bwd k_pos")?;
     let q_bf16 = backend.local_f32_as_bf16(q_slice, q_slice.len())?;
     let k_bf16 = backend.local_f32_as_bf16(k_slice, k_slice.len())?;
     let v_bf16 = backend.local_f32_as_bf16(v_slice, v_slice.len())?;
@@ -4302,9 +4322,12 @@ fn cuda_ring_block_bwd(
         let (gq_ptr, _gqg) = gq_out.device_ptr_mut(&backend.stream);
         let (gk_ptr, _gkg) = gk.device_ptr_mut(&backend.stream);
         let (gv_ptr, _gvg) = gv.device_ptr_mut(&backend.stream);
+        let (qpos_ptr, _qpg) = qpos_slice.device_ptr(&backend.stream);
+        let (kpos_ptr, _kpg) = kpos_slice.device_ptr(&backend.stream);
         check_cuda_ffi(
             // SAFETY: bf16 copies + f32 out/lse/grad handles of matching length; gk/gv
-            // sized to one block's [Tkv, blk_len, hd]; dims mirror the shapes.
+            // sized to one block's [Tkv, blk_len, hd]; q_pos/k_pos f32 of q_rows/blk_len;
+            // dims mirror the shapes.
             unsafe {
                 ffi::ring_block_attention_bwd_cuda(
                     q_ptr as *const ffi::Half,
@@ -4316,14 +4339,14 @@ fn cuda_ring_block_bwd(
                     gq_ptr as *mut f32,
                     gk_ptr as *mut f32,
                     gv_ptr as *mut f32,
+                    qpos_ptr as *const f32,
+                    kpos_ptr as *const f32,
                     ring_i32(dims.num_q_tiles, "ring bwd num_q_tiles i32")?,
                     ring_i32(dims.num_q_heads, "ring bwd num_q_heads i32")?,
                     ring_i32(dims.num_kv_heads, "ring bwd num_kv_heads i32")?,
                     ring_i32(dims.head_dim, "ring bwd head_dim i32")?,
                     ring_i32(dims.q_rows, "ring bwd q_rows i32")?,
                     ring_i32(dims.blk_len, "ring bwd blk_len i32")?,
-                    ring_i32(dims.q_abs, "ring bwd q_abs i32")?,
-                    ring_i32(dims.k_abs, "ring bwd k_abs i32")?,
                     dims.sm_scale,
                     backend.stream.cu_stream(),
                 )
