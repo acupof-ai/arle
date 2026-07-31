@@ -1,9 +1,10 @@
 # W8A16 support: the kernel existed, only the wiring was missing — 2026-07-31
 
-> Status: **Validated end-to-end on H20 (GPU 2).** W8A16 serve of a dense
-> Qwen3.5-0.8B loads in ~5s and matches its BF16 source byte-for-byte on greedy
-> probes. Quantizer + numerics validated locally (self-check + logit probe);
-> detect/validate/load/dispatch wired, Mac CUDA typecheck + clippy green.
+> Status: **Validated end-to-end on H20, up to the 27B target.** The ISO-merged
+> Qwen3.6-27B (`iso-tc-huihui`) quantized to W8A16 (492 tensors) serves on one H20
+> and is byte-identical to its BF16 source on greedy probes; a dense 0.8B proved
+> the path first. Quantizer + numerics validated locally; detect/validate/load/
+> dispatch wired, Mac CUDA typecheck + clippy green.
 
 ## Context
 
@@ -89,6 +90,38 @@ inference. Two real load-time errors surfaced first — both signal, not noise:
 
 This is why the pod gate exists: local numerics were all green (self-check, logit
 probe), but the quantizer↔loader scope contract can only fail on a real serve.
+
+## 27B validation — the real target, at the final code
+
+The 0.8B proved the path; the 27B is what it was for. `iso-tc-huihui` (the ISO
+merge output — BF16 dense Qwen3.6-27B, 55.5 GB) → W8A16 with the final
+`e739a1105` script (520-tensor all-linear scope, **492 quantized**, group 128) →
+29 GB. Served on one H20 (68 GB free → 337K max KV tokens), loaded clean, W8A16
+kernel dispatched. All three greedy probes coherent (Paris / a correct recursive
+fibonacci / "40 mph"), and **byte-identical to the BF16 source** on every prompt.
+The merge's capability survives an 8-bit weight cast with no visible loss.
+
+## Build acceleration — measured, and two of my assumptions were wrong
+
+Tried to speed up the pod CUDA build (255 s clean). The honest result:
+
+- **Arch pinning was already on.** `scripts/pod-build-env.sh:12` already exports
+  `TORCH_CUDA_ARCH_LIST=9.0`; every sanctioned pod build already compiles sm_90
+  only (confirmed in the nvcc lines: `-gencode arch=compute_90,code=sm_90` + PTX,
+  no sm_80/86/89). The "÷4 from 4-arch default" I expected did not exist — a
+  predecessor had already pinned it. `build.rs:195`'s 4-arch default only fires
+  when no GPU is visible at build time, which the build-env overrides.
+- **nvcc-sccache is the right knob but couldn't be measured this run** — the tn
+  proxy (`127.0.0.1:1080`) was down, so sccache couldn't be installed and both
+  `RUSTC_WRAPPER` and `ARLE_NVCC_WRAPPER` were empty. The wiring is correct; its
+  payoff (warm-cache relink) awaits a run with the proxy up.
+- **`--profile release-fast` vs `--release`: 1.22×** (209 s vs 255 s clean). Modest
+  because this box's build is nvcc + arle-link bound, not Rust codegen-units, and
+  LTO-link savings were partly masked by a concurrent foreign build sharing cores.
+
+Net: the `ARLE_NVCC_WRAPPER=sccache` wiring now lives beside `RUSTC_WRAPPER` in
+`pod-build-env.sh`'s sccache block (same guard) — the canonical place, not the
+one-off spot it was first put. No hard-coded arch anywhere; the build-env owns it.
 
 ## Rules
 
