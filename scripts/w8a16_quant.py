@@ -34,6 +34,17 @@ DEFAULT_GROUP = 128
 INT8_MAX = 127.0
 
 
+def read_weight_map(model_dir: Path) -> dict[str, str]:
+    """tensor name -> shard filename, for both sharded (index.json) and
+    single-file (model.safetensors) checkpoints."""
+    idx = model_dir / "model.safetensors.index.json"
+    if idx.exists():
+        return json.load(open(idx))["weight_map"]
+    single = "model.safetensors"
+    with safe_open(str(model_dir / single), framework="pt") as f:
+        return {k: single for k in f.keys()}
+
+
 def per_group_int8(w: torch.Tensor, group_size: int) -> tuple[torch.Tensor, torch.Tensor]:
     """Per-row, per-column-group symmetric INT8. Returns (int8 [rows,cols],
     scale bf16 [rows, cols/group_size]). cols must be group-divisible."""
@@ -50,7 +61,7 @@ def per_group_int8(w: torch.Tensor, group_size: int) -> tuple[torch.Tensor, torc
 def quant_weight_names(ref_dir: Path) -> set[str]:
     """Linear .weight base names to quantize: those the reference checkpoint
     stores quantized (carry a .weight_scale or .weight_scale_inv sidecar)."""
-    idx = json.load(open(ref_dir / "model.safetensors.index.json"))["weight_map"]
+    idx = read_weight_map(ref_dir)
     out = set()
     for k in idx:
         for suf in (".weight_scale_inv", ".weight_scale"):
@@ -59,15 +70,31 @@ def quant_weight_names(ref_dir: Path) -> set[str]:
     return out
 
 
-def run(bf16_dir: Path, ref_dir: Path, out_dir: Path, group_size: int) -> None:
-    quant_set = quant_weight_names(ref_dir)
+# When no quantized reference exists, quantize all 2D linear .weight tensors
+# except these — embed/lm_head set logits/inputs directly, norms are 1D; all
+# stay high-precision (mirrors DeepSeek's FP8 scope).
+ALL_LINEAR_SKIP = ("embed", "lm_head", "norm", "gate.weight")
+
+
+def all_linear_names(bf16_dir: Path) -> set[str]:
+    idx = read_weight_map(bf16_dir)
+    return {
+        k for k in idx
+        if k.endswith(".weight") and not any(s in k for s in ALL_LINEAR_SKIP)
+    }
+
+
+def run(bf16_dir: Path, ref_dir: Path | None, out_dir: Path, group_size: int) -> None:
+    quant_set = all_linear_names(bf16_dir) if ref_dir is None else quant_weight_names(ref_dir)
+    print(f"quant scope: {len(quant_set)} tensors "
+          f"({'all-linear' if ref_dir is None else 'from ref'})", flush=True)
     out_dir.mkdir(parents=True, exist_ok=True)
     for f in os.listdir(bf16_dir):
         src = bf16_dir / f
         if src.is_file() and not f.endswith(".safetensors"):
             shutil.copy(src, out_dir / f)
 
-    weight_map = json.load(open(bf16_dir / "model.safetensors.index.json"))["weight_map"]
+    weight_map = read_weight_map(bf16_dir)
     shards: dict[str, list[str]] = {}
     for name, fname in weight_map.items():
         shards.setdefault(fname, []).append(name)
@@ -144,7 +171,8 @@ def _selfcheck() -> None:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--bf16", help="source BF16 HF checkpoint dir")
-    ap.add_argument("--ref", help="reference quantized checkpoint (defines quant scope)")
+    ap.add_argument("--ref", help="reference quantized checkpoint defining quant scope; "
+                                  "omit to quantize all linear weights (--all-linear scope)")
     ap.add_argument("--out", help="output W8A16 checkpoint dir")
     ap.add_argument("--group-size", type=int, default=DEFAULT_GROUP)
     ap.add_argument("--selfcheck", action="store_true")
@@ -152,9 +180,9 @@ def main() -> None:
     if args.selfcheck:
         _selfcheck()
         return
-    if not (args.bf16 and args.ref and args.out):
-        ap.error("--bf16, --ref, --out required (or --selfcheck)")
-    run(Path(args.bf16), Path(args.ref), Path(args.out), args.group_size)
+    if not (args.bf16 and args.out):
+        ap.error("--bf16 and --out required (or --selfcheck)")
+    run(Path(args.bf16), Path(args.ref) if args.ref else None, Path(args.out), args.group_size)
 
 
 if __name__ == "__main__":
