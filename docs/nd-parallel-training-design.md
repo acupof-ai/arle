@@ -26,9 +26,9 @@ private duplicate configs.
 
 | Axis | Core landed + CPU-gated | Pending-remote (pod NCCL) |
 |---|---|---|
-| **Mesh** | `train_mesh()` → `MultiAxisConfig`+`RankCoord`; `CpContext`/`Qwen35TensorParallelConfig`/`DpContext`/`PpContext` are derived views, one source of truth | — |
+| **Mesh** | `train_mesh()` → `MultiAxisConfig`+`RankCoord`; `CpContext`/`TpContext`/`DpContext`/`PpContext` are derived views, one source of truth | — |
 | **CP** | ring attention is the CP full-attn path (`cp_causal_sdpa`, `BackwardOp::RingAttention`) — device fwd-merge + finalize + bwd kernels (`ring_block_attention.cu`), wired in `qwen35.rs`, replacing the option-B all-gather (deleted). Sequence sharded **zigzag** load-balanced (`SeqShard`, front+back chunk pair); the ring masks causally by per-row absolute position so the two chunks attend the right prefix. Linear-attn CP is **all-to-all-to-head** (`linear_attention_core_cp`, fused-qkv per GDN): each rank runs the full-sequence recurrence for 1/N of the value-heads, exact, no cross-rank dependency. `all_to_all` (self-adjoint seq↔head, world==1 identity) + `cat` re-fuse landed + CPU-gated. world==1 ring taped grad matches `causal_sdpa_recompute`; multi-block merge+bwd matches the full-seq reference; head-split linear-attn reconstructs the full-seq recurrence on CPU | multi-rank ring transport (`ring_send_recv_kv` + all-to-all NCCL); >65535 local-seq parity; 256K liveness; zigzag load-balance c-sweep. Device per-row-position ring kernel (zigzag on GPU) is pending-remote — the device path errors loudly on `positions.is_some()`, never silently mis-attends |
-| **TP** | attention-TP live; **MoE-TP** built (column/row-parallel experts+shared, `maybe_tp_all_reduce`) | MoE finite-diff on ≥2 GPU |
+| **TP** | attention-TP live; **MoE-TP** built (column/row-parallel experts+shared). Model-agnostic core is `train::tensor_parallel` (`TpContext` + `divide` + `maybe_all_reduce`, mirror of `CpContext`/`DpContext`); qwen35-specific shard dims are a `Qwen35TpDims` trait impl | MoE finite-diff on ≥2 GPU |
 | **EP** | **live tape op** — `ep_dispatch_op`/`ep_combine_op` (`BackwardOp::EpDispatch`/`EpCombine`), backward = the transpose; dropped token gets zero grad; gated through the real tape | NCCL all-to-all transport; capacity + router aux loss; qwen35 routing hook |
 | **DP** | **wired end-to-end** — `DpContext` threaded into `masked_writeback_step`; global count all-reduce for `inv_n`; grad-reduce gate `(cp‖dp)`; `--dp-size` launcher; world==1 byte-identical | multi-rank correctness (≥2 GPU); combined CP×DP (`ncclCommSplit` subgroups) |
 | **PP** | `PpContext` layer-partition (`pipeline_parallel.rs`); 1F1B documented as wrong-fit for single-pass writeback | cross-stage activation send/recv; layer-loop split |
@@ -72,7 +72,7 @@ may depend on it without breaching backend isolation.
 | Axis | Train-side state (file:line) | Gap to "supported" |
 |---|---|---|
 | **CP** | ring attention on LOCAL shards: `cp.is_enabled()` branch qwen35.rs → `cp_causal_sdpa(q,k,v,cp.size,cp.rank,Some(positions))` on `[b,heads,seq/N,hd]`, never materializing full KV. Sequence sharded **zigzag** load-balanced (`SeqShard.shard`, front+back chunk pair); `positions` are threaded from opd.rs (the shard's absolute rows, the same slice that builds RoPE cos/sin), so the ring masks by true absolute position with one source of truth — not re-derived from `(seq_len, cp)`. Linear-attn CP is **all-to-all-to-head** (`linear_attention_core_cp`, `forward_linear_attention` `cp` param): full-seq recurrence per rank on 1/N value-heads, exact | multi-rank ring/all-to-all transport; device per-row-position ring kernel (zigzag on GPU); >65535 local-seq parity; load-balance c-sweep |
-| **TP** | attention-TP proven `a2_qwen35_tp_lora_fd.rs` L181/L191; `maybe_tp_all_reduce` L313 | **MoE MLP rejects TP** ("requires single-rank TP" L1256/L1282/L1319). MoE-TP unbuilt. |
+| **TP** | attention-TP proven `a2_qwen35_tp_lora_fd.rs` L181/L191; `tensor_parallel::maybe_all_reduce` | **MoE MLP rejects TP** ("requires single-rank TP" L1256/L1282/L1319). MoE-TP unbuilt. |
 | **EP** | **train side has none.** DeepEP dispatch/combine exist only in *serving* (`infer-cuda/moe.rs` `dsv4_moe_forward_deepep` L3781); train MoE uses grouped-linear on token rows (qwen35.rs L1355-1401), no all-to-all | Bring differentiable all-to-all into train MoE + its backward. **Real work, not wiring.** |
 | **DP** | CP's post-backward weight all-reduce (`all_reduce_cp_grads`, opd.rs L3238) is already DP-semantics | Batch-shard dataloader on `attn_dp_size>1`. Near-free once mesh drives it. |
 | **PP** | none | 1F1B over layers. Worst fit for single-pass OPD writeback (no throughput loop to amortize the bubble). Last. |
@@ -87,7 +87,7 @@ swapped — the linear-attn CP transport); `cp_causal_sdpa` + its device ring
 ## 2. Convergence (delete-style — the structural cost we pay once)
 
 Train side today has a parallel, simpler parallelism config (`CpContext` in
-opd.rs L3024; `Qwen35TensorParallelConfig` in a2). **Delete that duplication:**
+opd.rs L3024; `TpContext` in a2). **Delete that duplication:**
 train reads its coordinates from `RankCoord`/`MultiAxisConfig`, same as serving.
 `CpContext` becomes a thin view `(attn_cp_rank, attn_cp_size)` derived from the
 coord, not a second source of truth. One mesh, two consumers (serve + train).
