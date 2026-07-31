@@ -171,7 +171,7 @@ fn coordinator_main() -> Result<()> {
     // CUDA ref uses the bf16 prefill kernel (lossy output), the CP path is f32, so
     // "CP != single-card" alone can't tell which is wrong. Whichever CUDA path is
     // CLOSER to this f32 reference is the more correct one.
-    let cpu_hidden = {
+    let (cpu_hidden, lm_head, vocab) = {
         let mut store = TensorStore::default();
         let model = build_model(&mut store)?;
         let full = full_tokens();
@@ -181,7 +181,10 @@ fn coordinator_main() -> Result<()> {
         let h = model
             .forward_hidden_states(&mut store, &mut tape, &full, &pos)
             .context("CPU-f32 forward_hidden_states")?;
-        store.to_host(h)?
+        let hidden = store.to_host(h)?;
+        // lm_head weight [vocab, hidden] for the CE-from-hidden bisection below.
+        let w = store.to_host(model.lm_head_weight_id())?;
+        (hidden, w, tiny_cfg().vocab_size)
     };
     let hidden_size = tiny_cfg().hidden_size;
     // Single-card CUDA vs CPU-f32: the precision floor the CP path is judged against.
@@ -217,11 +220,18 @@ fn coordinator_main() -> Result<()> {
     // Compare each CP shard row against BOTH the single-card CUDA row and the
     // CPU-f32 ground truth at the same global pos. worst = CP-vs-single (the gate);
     // cp_vs_cpu = CP-vs-f32 (does CP track f32 better than single-card does?).
+    // Also ASSEMBLE the CP hidden into a full-seq [SEQ, hidden] buffer (each shard
+    // row placed at its global position) so we can run the loss on it below.
     let mut worst = 0.0f32;
     let mut worst_row = 0usize;
     let mut cp_vs_cpu = 0.0f32;
+    let mut cp_full = vec![0.0f32; SEQ * hidden_size];
     for rank in 0..CP_SIZE {
         let (rows, data) = read_rows(&root, rank, hidden_size)?;
+        for (local, &g) in rows.iter().enumerate() {
+            cp_full[g * hidden_size..(g + 1) * hidden_size]
+                .copy_from_slice(&data[local * hidden_size..(local + 1) * hidden_size]);
+        }
         for (local, &g) in rows.iter().enumerate() {
             let got = &data[local * hidden_size..(local + 1) * hidden_size];
             let want = &ref_hidden[g * hidden_size..(g + 1) * hidden_size];
@@ -290,6 +300,43 @@ fn coordinator_main() -> Result<()> {
     println!(
         "cp_vs_single={worst:.6e} (worst_row={worst_row})  cp_vs_cpu_f32={cp_vs_cpu:.6e}  single_vs_cpu_f32={single_vs_cpu:.6e}  tol={REL_TOL:.1e}"
     );
+
+    // The decisive bisection: run the SAME f32 CE (host, identical for all three)
+    // over the target set on each path's hidden. The nd_parallel_parity loss gap
+    // (CP 5.5% off f32) is ~4400x larger than the flat-CE hidden sensitivity can
+    // explain — so either the CP HIDDEN is loss-relevantly wrong (CE(cp_full)
+    // diverges from CE(cpu)) or the device CE PATH is wrong (all three CEs agree
+    // here, but nd_parallel's device CE still diverges). This CE is f32 on all
+    // inputs, so it isolates the hidden from the device CE kernel.
+    let targets: Vec<(usize, usize)> = (3..=SEQ - 2).map(|p| (p, (p * 3 + 1) % vocab)).collect();
+    let ce = |hidden: &[f32]| -> f32 {
+        let n = targets.len() as f32;
+        let mut sum = 0.0f32;
+        for &(p, t) in &targets {
+            let h = &hidden[p * hidden_size..(p + 1) * hidden_size];
+            let mut logits = vec![0.0f32; vocab];
+            for (v, lg) in logits.iter_mut().enumerate() {
+                let w = &lm_head[v * hidden_size..(v + 1) * hidden_size];
+                *lg = h.iter().zip(w).map(|(a, b)| a * b).sum();
+            }
+            let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let denom: f32 = logits.iter().map(|&x| (x - max).exp()).sum();
+            sum -= (logits[t] - max) - denom.ln();
+        }
+        sum / n
+    };
+    let ce_cpu = ce(&cpu_hidden);
+    let ce_single = ce(&ref_hidden);
+    let ce_cp = ce(&cp_full);
+    println!(
+        "CE(f32 kernel) on each hidden: ce_cpu={ce_cpu:.6e} ce_single={ce_single:.6e} ce_cp={ce_cp:.6e}"
+    );
+    println!(
+        "  ce_cp_vs_cpu={:.3e}  ce_single_vs_cpu={:.3e}  (if ce_cp≈ce_cpu, the CP HIDDEN is loss-correct → nd_parallel's gap is the device CE path)",
+        (ce_cp - ce_cpu).abs() / ce_cpu.abs().max(1e-6),
+        (ce_single - ce_cpu).abs() / ce_cpu.abs().max(1e-6)
+    );
+
     // The real correctness question: is CP as close to f32 as single-card is? If
     // cp_vs_cpu <= single_vs_cpu (within tol), CP is not the wrong one — the
     // cp_vs_single gap is just single-card's bf16-prefill lossiness.
