@@ -1,51 +1,78 @@
-# CP "parity FAIL" was a bf16-vs-f32 gate miscalibration, not a bug — 2026-08-01
+# CP parity FAIL was a real bug (cp split-brain), not gate miscalibration — 2026-08-01
 
 ## Context
 
 The 256K context-parallel (CP) ring landed and `nd_parallel_parity` "FAILed":
-seq=16 `rel_err=3.9e-3` at head_dim=2, then `5.2e-2` at head_dim=128, both
-against a `REL_TOL=1e-3`. The 131072 gate showed `2.2e-2`. The loss was
-asymmetric across zigzag ranks, which looked like a per-shard position bug. Two
-sessions were spent hunting a CP correctness bug that did not exist.
+seq=16 `cp_vs_f32=5.5e-2` against a single-card bf16 floor of `single_vs_f32=1.5e-5`
+— 3700× the floor. The 131072 gate had also diverged. I spent time arguing this
+was a *gate miscalibration* (two independent bf16 kernels compared at
+near-identity tolerance), recalibrated the gate to anchor on CPU-f32, ran a
+3-stage device bisection that all PASSED, and concluded "no bug." **That
+conclusion was wrong.** A real bug existed; the f32-anchored gate was right to
+fail.
 
 ## Root Cause
 
-The gate compared **two independent bf16 attention implementations against each
-other** at a near-identity tolerance: the single-card reference runs the
-bf16 chunked-prefill kernel, the CP path runs the bf16 ring kernel. bf16
-attention at a tiny random-weight scale is ~8% off f32 — so two correct bf16
-paths differ from each other by several %. `1e-3` was measuring rounding, not
-correctness. head_dim=2 only "passed closer" (0.39%) because the ref fell off
-the prefill envelope onto f32 composed SDPA — a *different* precision pairing,
-not a smaller bug. The "grows with head_dim" and "zigzag-rank-asymmetric"
-signals were both bf16-noise artifacts, not a position/gather fault.
+**A cp split-brain: two sources of truth for the CP axis.**
+`masked_writeback_step` shards the sequence using its `cp` **argument**
+(`opd.rs`: `cp.shard`, `cp.is_enabled`, inv_n). But the forward decided whether
+to run the ring by reading a **different** source — the model field `self.cp`
+(`qwen35.rs` `forward_batch_hidden_indices`). `self.cp` was set only by
+`set_cp`, whose **sole non-test caller in the whole tree was the
+`cp_hidden_parity` diagnostic**. No cli/production path called it, so `self.cp`
+was always `single()`. Net: the sequence got sharded to rows
+`[0,1,2,3,12,13,14,15]`, but `self.cp=single()` told the forward "these 8 rows
+are one contiguous block → plain attention." Each rank attended only its own KV,
+never the ring. Wrong hidden → loss 3.2425 vs f32 3.0729.
 
-Proven by a 3-stage device bisection (each a single pod run):
-1. **kernel** — hand-fed 2-block GQA zigzag `ring_block_fwd_merge` vs host
-   `ring_forward_tile`: PASS (fp32 eps).
-2. **transport** — 2-rank NCCL ring, zigzag shards, vs full-seq causal SDPA:
-   PASS (3e-8, non-contiguous shard as clean as contiguous).
-3. **forward + f32 anchor** — CP hidden vs single-card AND vs CPU-f32:
-   `cp_vs_cpu_f32=6.6e-2 < single_vs_cpu_f32=8.0e-2`. CP tracks f32 **better**
-   than the single card. A real bug drifts CP *away* from f32; this is the
-   opposite.
+Why it hid so long: `tp` (cp's peer axis) is a **constructor arg** (it shards
+weights at load, so it can't be forgotten). `cp` was bolted on as a **setter**
+that fights the "weights are `&self`, pool-shared" invariant, so nobody threaded
+it — only the diagnostic did.
+
+## The two-step error that let it stand
+
+1. First I called the 5.5% "bf16 noise" — before an f32 anchor existed. That was
+   the right instinct to *distrust bf16-vs-bf16*, wrong to stop there.
+2. After building the f32 anchor (correct move), the gate still failed 3700× the
+   floor — a genuine bug signal — but I dismissed it as "miscalibration" on the
+   strength of a **diagnostic probe** that passed at 8e-8. The probe re-ran a
+   clean device-CE on a **correctly-assembled** `cp_full` hidden. It proved the
+   CE aggregation was fine; it said nothing about the forward that feeds it,
+   because the diagnostic **called `set_cp`** and so ran the ring — the exact
+   step the shipping path skipped. A reconstruction of a path is not the path.
+
+The tell I ignored: `cp_vs_f32 / single_vs_f32 = 3700`. Two same-precision
+siblings cannot differ by 3700× the measured rounding of one of them. That ratio
+alone was proof of a defect.
 
 ## Fix
 
-Anchor the gate on the f32 ground truth, never on bf16 byte-identity
-(`4e1076a6b`): run a CPU-f32 forward and require `cp_vs_f32 <= single_vs_f32 +
-TRACK_MARGIN` (2e-2). A wrong gather/shard/position/inv_n drifts CP from f32 far
-past the margin; symmetric bf16 rounding passes. seq>4096 (f32 ref is O(seq²)
-host RAM, the wall the ring avoids) falls back to a liveness + loose
-bf16-vs-bf16 gross-error bound.
+Thread `cp` as a **forward argument** (beside `positions`) and delete the
+`self.cp` field + `set_cp` setter (`3d9bc3717`): `forward_hidden_states` and
+`forward_batch_hidden_indices` take `cp`; the non-CP internal callers pass
+`single()`; the CP writeback branch passes the real `cp`. First-principles
+placement — `tp` is model state (shards weights at load), `cp` is a forward-time
+routing choice (weights are replicated across the cp group), so it belongs with
+the call, not in the struct. `layer.forward` already took `cp` as a param; the
+field was the anomaly. Production reaches the fix for free — it already supplies
+`cp` as the step argument. Pod-verified (HEAD `3d9bc3717`, GPUs 1,3): seq=16
+`cp_vs_f32` 5.5e-2 → **2.4e-4** (~bf16 floor, 83× under the 2e-2 margin); and the
+256K rung (`ARLE_ND_SEQ=131072`, cp=2, local shard 65536 = the >65535 ring path)
+completes a full forward+backward+optimizer step with `loss_single=3.232068`,
+`loss_cp_sum=3.232163` (two ranks 1.629638 + 1.602526), `rel_err=2.958e-5` —
+~3400× under the `bf16_tol=1e-1` gross-error bound. Both RUN_EXIT=0. The ring now
+actually fires at 65536.
 
 ## Rule
 
-When a "parity FAIL" pits two independent low-precision kernels (bf16/fp8)
-against each other, the FIRST question is "what is the precision floor between
-these two paths?" — compute one bf16-vs-f32 number before hunting a bug. Two
-correct bf16 attention paths differ several % at small/random-weight scale; a
-byte-identity tolerance there is a miscalibrated gate. Anchor the gate on the
-f32 reference the low-precision paths approximate, and make the invariant "the
-new path tracks f32 at least as well as the baseline does," not "the two match."
-This is the same `correct-inference ≠ baseline-identity` trap, one layer down.
+When a value flows both as a call ARGUMENT and a struct FIELD for the same
+concept, grep every setter of the field: a setter whose only caller is a
+test/example means the shipping path silently uses the default, and the arg and
+field have quietly diverged. And when an f32-anchored parity gate fails by many×
+the same-precision floor, that is a bug — compute the floor ratio before ever
+theorizing "miscalibration," and never accept a "no bug" verdict from a
+diagnostic that reconstructs the suspect step instead of running it. Prefer
+threading a forward-time concern (CP routing) as an argument over a mutable
+setter that fights the immutable-weights invariant. See
+`wins/2026-07-31-zigzag-ring-device-kernel-per-row-positions.md`.
