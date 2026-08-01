@@ -7091,16 +7091,31 @@ impl Qwen35Model {
         // ── gated-delta rule. Decode (seq_len==1) is always the recurrent
         //    kernel. Prefill chunks default to the recurrent kernel; the
         //    FlashQLA chunked path (--qwen35-gdr-chunked) replaces the
-        //    serial token scan with chunk-parallel TileLang kernels on the
-        //    baked Qwen3.6 single-GPU shard. The legacy in-tree chunkwise
-        //    TileLang path stays dead (sm_90 hang was in ITS kernels). ──
+        //    serial token scan with chunk-parallel TileLang kernels, one AOT
+        //    instantiation per (Hg, H) geometry — unknown geometry falls back
+        //    to recurrent. The legacy in-tree chunkwise TileLang path stays
+        //    dead (sm_90 hang was in ITS kernels). ──
+        let fq_fns: Option<(ffi::FqCumsumFn, ffi::FqKktFn, ffi::FqFwdFn)> =
+            match (self.local_linear_k_heads, self.local_linear_v_heads) {
+                (16, 32) => Some((
+                    ffi::gdr_fq_cumsum_cuda as _,
+                    ffi::gdr_fq_kkt_cuda as _,
+                    ffi::gdr_fq_fwd_cuda as _,
+                )),
+                (16, 48) => Some((
+                    ffi::gdr_fq_cumsum_h48_cuda as _,
+                    ffi::gdr_fq_kkt_h48_cuda as _,
+                    ffi::gdr_fq_fwd_h48_cuda as _,
+                )),
+                _ => None,
+            };
         let use_fq_chunked = seq_len > 1
             && qwen35_gdr_chunked_enabled()
-            && self.local_linear_k_heads == 16
-            && self.local_linear_v_heads == 32
+            && fq_fns.is_some()
             && c.linear_key_head_dim == 128
             && c.linear_value_head_dim == 128;
         if use_fq_chunked {
+            let (fq_cumsum, fq_kkt, fq_fwd) = fq_fns.unwrap();
             let hg_dim = self.local_linear_k_heads * c.linear_key_head_dim;
             let fq_q = fq_q.get(&self.ctx, hg_dim, seq_len)?;
             let fq_k = fq_k.get(&self.ctx, hg_dim, seq_len)?;
@@ -7157,14 +7172,14 @@ impl Qwen35Model {
                             self.ctx.stream.cu_stream(),
                         )
                         .result()?;
-                        ffi::gdr_fq_cumsum_cuda(
+                        fq_cumsum(
                             g_ptr as *const f32,
                             gc_ptr as *mut f32,
                             seq_len as i32,
                             self.ctx.stream.cu_stream(),
                         )
                         .result()?;
-                        ffi::gdr_fq_kkt_cuda(
+                        fq_kkt(
                             k_ptr as *const ffi::Half,
                             beta_ptr as *const f32,
                             a_inv_ptr as *mut ffi::Half,
@@ -7172,7 +7187,7 @@ impl Qwen35Model {
                             self.ctx.stream.cu_stream(),
                         )
                         .result()?;
-                        ffi::gdr_fq_fwd_cuda(
+                        fq_fwd(
                             q_ptr as *const ffi::Half,
                             k_ptr as *const ffi::Half,
                             v_ptr as *const ffi::Half,

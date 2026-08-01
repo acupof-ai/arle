@@ -396,8 +396,9 @@ GDR_SPECS = {
 
 
 # FlashQLA chunked GDR fwd (tools/tilelang/flashqla_gdr.py — Hopper-only,
-# fixed Qwen3.6 H=32/Hg=16/DK=DV=128/chunk=64/block_DV=64). All dynamic shape
-# vars resolve from the single `seq_len` public scalar; batch is always 1.
+# DK=DV=128/chunk=64/block_DV=64; H/Hg per instantiation via
+# --num-q-heads/--num-kv-heads). All dynamic shape vars resolve from the
+# single `seq_len` public scalar; batch is always 1.
 FLASHQLA_SCALAR_INPUTS = {
     "batch_size": ("int32_t", "1"),
     "data_batch_size": ("int32_t", "1"),
@@ -414,7 +415,11 @@ FLASHQLA_SCALAR_INPUTS = {
     "seq_end_idx": ("int32_t", "seq_len"),
 }
 
-FLASHQLA_SPECS = {
+FLASHQLA_KEYS = ("fq_cumsum", "fq_kkt", "fq_fwd")
+
+
+def flashqla_specs(num_heads: int) -> dict:
+    return {
     "fq_cumsum": WrapperSpec(
         public_params="""    const float *g_in,
     float *g_out,
@@ -437,7 +442,7 @@ FLASHQLA_SPECS = {
         tensor_inputs={"k": "k", "b": "beta", "a": "a_inv"},
         scalar_inputs=FLASHQLA_SCALAR_INPUTS,
         prelude="",
-        grid="""    int grid_x = ceildiv_i32(seq_len, 64) * 32;
+        grid=f"""    int grid_x = ceildiv_i32(seq_len, 64) * {num_heads};
     int grid_y = 1;
     int grid_z = 1;""",
         block="256, 1, 1",
@@ -467,12 +472,12 @@ FLASHQLA_SPECS = {
         },
         scalar_inputs=FLASHQLA_SCALAR_INPUTS,
         prelude="",
-        grid="""    int grid_x = 64;  /* ceildiv(DV=128, block_DV=64) * batch(1) * H(32) */
+        grid=f"""    int grid_x = {2 * num_heads};  /* ceildiv(DV=128, block_DV=64) * batch(1) * H */
     int grid_y = 1;
     int grid_z = 1;""",
         block="512, 1, 1",
     ),
-}
+    }
 
 
 def load_module(kernel_path: str):
@@ -916,13 +921,20 @@ def main() -> int:
     elif args.kernel_family == "flashqla":
         if not args.kernel_key:
             raise RuntimeError("flashqla kernels require --kernel-key")
-        if args.kernel_key not in FLASHQLA_SPECS:
+        if args.kernel_key not in FLASHQLA_KEYS:
             raise RuntimeError(
                 f"unknown flashqla kernel key {args.kernel_key!r}; "
-                f"valid keys: {sorted(FLASHQLA_SPECS)}"
+                f"valid keys: {sorted(FLASHQLA_KEYS)}"
             )
-        prim_func = load_gdr_kernel(args.kernel_path, args.kernel_key)
-        wrapper_spec = FLASHQLA_SPECS[args.kernel_key]
+        if args.num_q_heads is None or args.num_kv_heads is None:
+            raise RuntimeError(
+                "flashqla kernels require --num-q-heads (H) and --num-kv-heads (Hg)"
+            )
+        module = load_module(args.kernel_path)
+        prim_func = module.get_kernel(
+            args.kernel_key, args.num_q_heads, args.num_kv_heads
+        )
+        wrapper_spec = flashqla_specs(args.num_q_heads)[args.kernel_key]
     else:
         if not args.kernel_key:
             raise RuntimeError("gdr kernels require --kernel-key")
