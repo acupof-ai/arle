@@ -157,7 +157,13 @@ fn forward_backward_inline(
     } else {
         let positions: Vec<u32> = (0..seq_len as u32).collect();
         model
-            .forward_hidden_states(store, &mut tape, &full, &positions)
+            .forward_hidden_states(
+                store,
+                &mut tape,
+                &full,
+                &positions,
+                train::context_parallel::CpContext::single(),
+            )
             .expect("full forward")
     };
 
