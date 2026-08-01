@@ -417,4 +417,116 @@ mod tests {
         );
         Ok(())
     }
+
+    // Host reference for the world>1 all_to_all permutation — the correctness
+    // spec the CUDA `all_to_all_device` body mirrors (backend_cuda.rs), runnable
+    // on Mac where the device path can't. Not a co-evolving oracle: `a2a_ref`
+    // assembles per-rank (slice each input along gather, concat along scatter, the
+    // body's own steps) while `expected` is built by an INDEPENDENT path (slice the
+    // full tensor along gather). The two agree only if the permutation is right.
+    fn nd_strides(shape: &[usize]) -> Vec<usize> {
+        let mut s = vec![1usize; shape.len()];
+        for i in (0..shape.len().saturating_sub(1)).rev() {
+            s[i] = s[i + 1] * shape[i + 1];
+        }
+        s
+    }
+
+    fn slice_axis(
+        src: &[f32],
+        src_shape: &[usize],
+        axis: usize,
+        start: usize,
+        end: usize,
+    ) -> (Vec<f32>, Vec<usize>) {
+        let mut out_shape = src_shape.to_vec();
+        out_shape[axis] = end - start;
+        let (ss, os) = (nd_strides(src_shape), nd_strides(&out_shape));
+        let total: usize = out_shape.iter().product();
+        let mut out = vec![0f32; total];
+        for (flat, slot) in out.iter_mut().enumerate() {
+            let (mut rem, mut sflat) = (flat, 0usize);
+            for d in 0..out_shape.len() {
+                let c = rem / os[d] + if d == axis { start } else { 0 };
+                sflat += c * ss[d];
+                rem %= os[d];
+            }
+            *slot = src[sflat];
+        }
+        (out, out_shape)
+    }
+
+    // Write `src` into `dst` at `off` along `axis` (the concat primitive).
+    fn write_at_axis(
+        dst: &mut [f32],
+        dst_shape: &[usize],
+        src: &[f32],
+        src_shape: &[usize],
+        axis: usize,
+        off: usize,
+    ) {
+        let (ds, ss) = (nd_strides(dst_shape), nd_strides(src_shape));
+        for (flat, &v) in src.iter().enumerate() {
+            let (mut rem, mut dflat) = (flat, 0usize);
+            for d in 0..src_shape.len() {
+                let c = rem / ss[d] + if d == axis { off } else { 0 };
+                dflat += c * ds[d];
+                rem %= ss[d];
+            }
+            dst[dflat] = v;
+        }
+    }
+
+    fn a2a_ref(
+        inputs: &[(Vec<f32>, Vec<usize>)],
+        scatter: usize,
+        gather: usize,
+        n: usize,
+    ) -> Vec<(Vec<f32>, Vec<usize>)> {
+        let in_shape = &inputs[0].1;
+        let (sc, g) = (in_shape[scatter], in_shape[gather] / n);
+        let mut out_shape = in_shape.to_vec();
+        out_shape[scatter] = sc * n;
+        out_shape[gather] = g;
+        (0..n)
+            .map(|j| {
+                let mut out = vec![0f32; out_shape.iter().product()];
+                for (r, (data, shape)) in inputs.iter().enumerate() {
+                    let (chunk, chunk_shape) = slice_axis(data, shape, gather, j * g, (j + 1) * g);
+                    write_at_axis(&mut out, &out_shape, &chunk, &chunk_shape, scatter, r * sc);
+                }
+                (out, out_shape.clone())
+            })
+            .collect()
+    }
+
+    fn check_a2a(full_shape: &[usize], scatter: usize, gather: usize, n: usize) {
+        let total: usize = full_shape.iter().product();
+        let full: Vec<f32> = (0..total).map(|i| i as f32).collect();
+        let sc = full_shape[scatter] / n;
+        let g = full_shape[gather] / n;
+        // Each rank owns a scatter-shard of the full tensor.
+        let inputs: Vec<(Vec<f32>, Vec<usize>)> = (0..n)
+            .map(|r| slice_axis(&full, full_shape, scatter, r * sc, (r + 1) * sc))
+            .collect();
+        let got = a2a_ref(&inputs, scatter, gather, n);
+        for j in 0..n {
+            // Independent expected: rank j holds the FULL sequence for head-slice j.
+            let expected = slice_axis(&full, full_shape, gather, j * g, (j + 1) * g);
+            assert_eq!(got[j], expected, "a2a forward mismatch at rank {j}");
+        }
+        // Self-adjoint: applying the shuffle with axes swapped reconstructs inputs.
+        let back = a2a_ref(&got, gather, scatter, n);
+        assert_eq!(back, inputs, "a2a is not self-adjoint");
+    }
+
+    #[test]
+    fn all_to_all_world2_permutation_matches_full_tensor_view() {
+        // [2,4,6]: forward callsite (scatter=seq axis 1, gather=dim axis 2) and the
+        // restore callsite (scatter=2 innermost → strided assembly, gather=1).
+        check_a2a(&[2, 4, 6], 1, 2, 2);
+        check_a2a(&[2, 4, 6], 2, 1, 2);
+        // world=4 and a non-trivial batch axis.
+        check_a2a(&[2, 8, 4], 1, 2, 4);
+    }
 }
