@@ -802,6 +802,23 @@ fn qwen35_gdr_chunked_enabled() -> bool {
     crate::runtime_flags::qwen35_gdr_chunked()
 }
 
+/// One-shot probe: stub builds (no ARLE_CUDA_ENABLE_FLASHQLA_GDR) and non-sm90
+/// devices return CUDA_ERROR_NOT_SUPPORTED from the dispatch wrapper before
+/// touching any pointer; a real kernel rejects the seq_len=0 launch with a
+/// different code. Unavailable → silently keep the recurrent scan (FA3 pattern).
+fn fq_kernels_available(cumsum: ffi::FqCumsumFn) -> bool {
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        // SAFETY: seq_len=0 → zero grid; no pointer is dereferenced.
+        let r = unsafe { cumsum(std::ptr::null(), std::ptr::null_mut(), 0, std::ptr::null_mut()) };
+        let ok = r != cudarc::driver::sys::CUresult::CUDA_ERROR_NOT_SUPPORTED;
+        if !ok {
+            log::info!("FlashQLA chunked GDR unavailable (stub build or non-sm90); using the recurrent scan");
+        }
+        ok
+    })
+}
+
 /// sm_70 (V100) has no FA3 (sm_80+ CUTLASS-3.x) and no BF16 compute — the
 /// hand-written `arle_fa2_sm70_attention_cuda` (FA2, FP16 half2 math, BF16 I/O)
 /// is the SOTA option. `major < 8` covers sm_70 and sm_75. Latched once.
@@ -7111,9 +7128,9 @@ impl Qwen35Model {
             };
         let use_fq_chunked = seq_len > 1
             && qwen35_gdr_chunked_enabled()
-            && fq_fns.is_some()
             && c.linear_key_head_dim == 128
-            && c.linear_value_head_dim == 128;
+            && c.linear_value_head_dim == 128
+            && fq_fns.is_some_and(|(cumsum, _, _)| fq_kernels_available(cumsum));
         if use_fq_chunked {
             let (fq_cumsum, fq_kkt, fq_fwd) = fq_fns.unwrap();
             let hg_dim = self.local_linear_k_heads * c.linear_key_head_dim;
