@@ -177,6 +177,44 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    /// W8A16 Marlin tensor-core path (SGLang gptq_marlin, kU8B128). sm_80+.
+    /// Repack: GPTQ-packed uint8b128 [k/4, n] i32 (int8+128, 4-per-word) → Marlin
+    /// tile layout [k/16, n*4] i32. `out` must be `alloc_zeros` of that size.
+    pub fn marlin_gptq_repack_w8a16_cuda(
+        b_q_weight: *const u32,
+        out: *mut u32,
+        size_k: i32,
+        size_n: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    /// W8A16 Marlin GEMM: C[m,n] = A[m,k] @ dequant(Marlin-packed W). BF16 acts +
+    /// BF16 permuted group scales [k/group_size, n]. `c_tmp`/`workspace` are
+    /// caller-owned reusable scratch (the decode loop is graph-captured — no
+    /// per-call malloc): size via `marlin_w8a16_c_tmp_floats` /
+    /// `marlin_w8a16_workspace_ints`, workspace zeroed once. Returns
+    /// `CUDA_ERROR_NOT_SUPPORTED` below sm_80.
+    pub fn marlin_w8a16_gemm_cuda(
+        a: *const Half,
+        b_packed: *const u32,
+        scales: *const Half,
+        c: *mut Half,
+        c_tmp: *mut f32,
+        workspace: *mut i32,
+        m: i32,
+        n: i32,
+        k: i32,
+        group_size: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    /// Float count `c_tmp` needs for `(m, sms)` (max at m>=64). Size the reusable
+    /// scratch with the largest m the decode/prefill loop will pass.
+    pub fn marlin_w8a16_c_tmp_floats(m: i32, sms: i32) -> i32;
+
+    /// Int count the Marlin lock `workspace` needs for `sms`. Zero-init once.
+    pub fn marlin_w8a16_workspace_ints(sms: i32) -> i32;
+
     pub fn w4a16_gemv_cuda(
         weight: *const u8,
         scales: *const Half,
