@@ -15,9 +15,9 @@ kept verbatim):
   - varlen and intra-card-CP variants deleted: ARLE calls this per engine
     prefill chunk with batch=1 and chains the recurrent state via
     h0/ht, so `is_varlen=False`, `is_cp=False` always.
-  - Shapes fixed to the Qwen3.6-35B GDN single-GPU shard: H=32 value heads,
-    Hg=16 key heads, DK=DV=128, chunk_size=64, scale=128^-0.5 (baked, same
-    place FLA applies it: P and O), block_DV=64 (grid = 2*H = 64 CTAs).
+  - (H, Hg) parameterized per AOT instantiation (kernels.toml rows);
+    DK=DV=128, chunk_size=64, scale=128^-0.5 (baked, same place FLA applies
+    it: P and O), block_DV=64 (fq_fwd grid = 2*H CTAs).
   - dtypes fixed: q/k/v/a bf16, g/beta fp32, h0/ht fp32 (the FLA-convention
     `[H, K, V]` V-contiguous state ARLE already standardizes on — the slot
     state pointer is passed as BOTH h0 and ht; the kernel reads h0 fully
@@ -34,14 +34,12 @@ make_linear_layout) exists in both; the AOT build is the compatibility gate.
 import tilelang
 import tilelang.language as T
 
-# Fixed Qwen3.6-35B GDN shard (single GPU). TP shards would need a second
-# (H, Hg) instantiation — gated off in Rust until baked.
-FQ_H = 32          # value heads (g/beta/A/v/o are per-H)
-FQ_HG = 16         # key heads (q/k are per-Hg; bhg = bh // (H // Hg))
+# (H, Hg) is an AOT instantiation parameter (one kernels.toml row triple per
+# geometry); DK/DV/chunk stay fixed.
 FQ_DK = 128
 FQ_DV = 128
 FQ_CHUNK = 64
-FQ_BLOCK_DV = 64   # grid = ceildiv(DV, block_DV) * H = 64 CTAs on 78 SMs
+FQ_BLOCK_DV = 64   # fq_fwd grid = ceildiv(DV, block_DV) * H
 FQ_SCALE = FQ_DK ** -0.5
 
 ACCUM_DTYPE = "float32"
@@ -58,12 +56,12 @@ PASS_CONFIGS = {
 }
 
 
-def _fq_cumsum_kernel():
+def _fq_cumsum_kernel(h, hg):
     """Chunk-local cumsum over the per-token log-decay g (pre-decay input).
 
     Upstream `tilelang_chunk_local_cumsum` non-varlen, reverse=False.
     """
-    H = FQ_H
+    H = h
     chunk_size = FQ_CHUNK
     accum_dtype = ACCUM_DTYPE
     g_dtype = G_DTYPE
@@ -120,14 +118,14 @@ def _fq_cumsum_kernel():
     return fq_cumsum_kernel
 
 
-def _fq_kkt_kernel():
+def _fq_kkt_kernel(h, hg):
     """A = (I + StrictLower(diag(beta) K K^T))^{-1}, per 64-chunk per H head.
 
     Upstream `tilelang_kkt_solve` non-varlen. 256 threads: 128 consumer
     (4-block inversion), 32 K-loader, 96 A-store, warp-specialized.
     """
-    H = FQ_H
-    Hg = FQ_HG
+    H = h
+    Hg = hg
     DK = FQ_DK
     chunk_size = FQ_CHUNK
     accum_dtype = ACCUM_DTYPE
@@ -333,7 +331,7 @@ def _fq_kkt_kernel():
     return fq_kkt_kernel
 
 
-def _fq_fwd_kernel():
+def _fq_fwd_kernel(h, hg):
     """Fused chunk-state recurrence + output, warp-specialized (512 threads).
 
     Upstream `tilelang_fused_chunk_gdr_fwd` non-varlen non-CP with
@@ -342,8 +340,8 @@ def _fq_fwd_kernel():
     reads its h0 slice fully (initial T.copy) before writing the same ht
     slice after the loop.
     """
-    H = FQ_H
-    Hg = FQ_HG
+    H = h
+    Hg = hg
     DK = FQ_DK
     DV = FQ_DV
     chunk_size = FQ_CHUNK
@@ -788,10 +786,12 @@ _KERNELS = {
 }
 
 
-def get_kernel(name: str):
+def get_kernel(name: str, h: int, hg: int):
     if name not in _KERNELS:
         raise KeyError(f"unknown flashqla_gdr kernel key {name!r}")
-    return _KERNELS[name]()
+    if h <= 0 or hg <= 0 or h % hg != 0:
+        raise ValueError(f"invalid GDN head geometry H={h}, Hg={hg}")
+    return _KERNELS[name](h, hg)
 
 
 def get_pass_configs(name: str):

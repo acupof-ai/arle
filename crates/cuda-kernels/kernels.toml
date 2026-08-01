@@ -913,10 +913,14 @@ ffi = false
 # ===========================================================================
 # FlashQLA chunked GDR fwd — sm_90 only + ARLE_CUDA_ENABLE_FLASHQLA_GDR.
 # gate="flashqla": build.rs stubs (NOT_SUPPORTED) unless flag set AND sm_90 in
-# targets. build-only (ffi=false). 3 phases.
+# targets. build-only (ffi=false). 3 phases × one row triple per GDN head
+# geometry (q_heads=H value heads, kv_heads=Hg key heads; DK=DV=128 fixed).
 # ===========================================================================
 
+# H=32/Hg=16 — Qwen3.6-35B GDN single-GPU shard.
 [[kernel]]
+q_heads = 32
+kv_heads = 16
 phase = "fq_cumsum"
 abi = "fq_cumsum_v1"
 kernel_family = "flashqla"
@@ -930,6 +934,8 @@ gate = "flashqla"
 ffi = false
 
 [[kernel]]
+q_heads = 32
+kv_heads = 16
 phase = "fq_kkt"
 abi = "fq_kkt_v1"
 kernel_family = "flashqla"
@@ -943,6 +949,8 @@ gate = "flashqla"
 ffi = false
 
 [[kernel]]
+q_heads = 32
+kv_heads = 16
 phase = "fq_fwd"
 abi = "fq_fwd_v1"
 kernel_family = "flashqla"
@@ -951,6 +959,52 @@ py_module = "tools/tilelang/flashqla_gdr.py"
 artifact_dir = "flashqla_gdr_fwd"
 kernel_name = "gdr_fq_fwd"
 out_name = "tilelang_flashqla_gdr_fwd"
+allow_sm70 = false
+gate = "flashqla"
+ffi = false
+
+# H=48/Hg=16 — ThinkingCap-Qwen3.6-27B.
+[[kernel]]
+q_heads = 48
+kv_heads = 16
+phase = "fq_cumsum"
+abi = "fq_cumsum_v1"
+kernel_family = "flashqla"
+kernel_key = "fq_cumsum"
+py_module = "tools/tilelang/flashqla_gdr.py"
+artifact_dir = "flashqla_gdr_cumsum_h48"
+kernel_name = "gdr_fq_cumsum_h48"
+out_name = "tilelang_flashqla_gdr_cumsum_h48"
+allow_sm70 = false
+gate = "flashqla"
+ffi = false
+
+[[kernel]]
+q_heads = 48
+kv_heads = 16
+phase = "fq_kkt"
+abi = "fq_kkt_v1"
+kernel_family = "flashqla"
+kernel_key = "fq_kkt"
+py_module = "tools/tilelang/flashqla_gdr.py"
+artifact_dir = "flashqla_gdr_kkt_h48"
+kernel_name = "gdr_fq_kkt_h48"
+out_name = "tilelang_flashqla_gdr_kkt_h48"
+allow_sm70 = false
+gate = "flashqla"
+ffi = false
+
+[[kernel]]
+q_heads = 48
+kv_heads = 16
+phase = "fq_fwd"
+abi = "fq_fwd_v1"
+kernel_family = "flashqla"
+kernel_key = "fq_fwd"
+py_module = "tools/tilelang/flashqla_gdr.py"
+artifact_dir = "flashqla_gdr_fwd_h48"
+kernel_name = "gdr_fq_fwd_h48"
+out_name = "tilelang_flashqla_gdr_fwd_h48"
 allow_sm70 = false
 gate = "flashqla"
 ffi = false

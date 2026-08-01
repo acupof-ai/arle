@@ -205,20 +205,40 @@ unsafe extern "C" {
 }
 
 // ============================================================================
-// FlashQLA chunked GDR fwd (board #3) — TileLang AOT, Hopper-only, fixed
-// Qwen3.6 shard H=32/Hg=16/DK=DV=128/chunk=64. Non-sm90 builds link
+// FlashQLA chunked GDR fwd — TileLang AOT, Hopper-only, DK=DV=128/chunk=64,
+// one symbol triple per (H, Hg) instantiation (kernels.toml): unsuffixed =
+// H=32/Hg=16, `_h48` = H=48/Hg=16. Non-sm90 builds link
 // CUDA_ERROR_NOT_SUPPORTED stubs; `gdr_fq_prep_cuda` is native CUDA C
-// (csrc/misc/gated_delta_rule.cu) and links everywhere.
+// (csrc/recurrent/gated_delta_rule.cu), head-count parameterized, links
+// everywhere.
 //
 // Pipeline per prefill chunk (batch=1, token-major dense tensors):
-//   prep:   qkv_conv [S, qkv_dim] -> q/k [S,16,128] l2norm'd bf16,
-//           v [S,32,128] bf16, g/beta [S,32] f32
+//   prep:   qkv_conv [S, qkv_dim] -> q/k [S,Hg,128] l2norm'd bf16,
+//           v [S,H,128] bf16, g/beta [S,H] f32
 //   cumsum: g -> g_cumsum (chunk-local, 64)
-//   kkt:    (k, beta) -> a_inv [S,32,64] bf16
-//   fwd:    (q,k,v,a_inv,g_cumsum,beta,h0) -> o [S,32,128] bf16, ht
-//           h0/ht may BOTH point at the slot state [32,128,128] f32
+//   kkt:    (k, beta) -> a_inv [S,H,64] bf16
+//   fwd:    (q,k,v,a_inv,g_cumsum,beta,h0) -> o [S,H,128] bf16, ht
+//           h0/ht may BOTH point at the slot state [H,128,128] f32
 //           (each CTA reads its h0 slice fully before writing ht).
 // ============================================================================
+
+pub type FqCumsumFn = unsafe extern "C" fn(*const f32, *mut f32, i32, CUstream) -> CUresult;
+pub type FqKktFn =
+    unsafe extern "C" fn(*const Half, *const f32, *mut Half, i32, CUstream) -> CUresult;
+#[allow(clippy::type_complexity)]
+pub type FqFwdFn = unsafe extern "C" fn(
+    *const Half,
+    *const Half,
+    *const Half,
+    *const Half,
+    *const f32,
+    *const f32,
+    *const f32,
+    *mut Half,
+    *mut f32,
+    i32,
+    CUstream,
+) -> CUresult;
 #[allow(dead_code)]
 unsafe extern "C" {
     pub fn gdr_fq_prep_cuda(
@@ -256,6 +276,35 @@ unsafe extern "C" {
     ) -> CUresult;
 
     pub fn gdr_fq_fwd_cuda(
+        q: *const Half,
+        k: *const Half,
+        v: *const Half,
+        a_inv: *const Half,
+        g_cumsum: *const f32,
+        beta: *const f32,
+        h0: *const f32,
+        o: *mut Half,
+        ht: *mut f32,
+        seq_len: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn gdr_fq_cumsum_h48_cuda(
+        g_in: *const f32,
+        g_out: *mut f32,
+        seq_len: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn gdr_fq_kkt_h48_cuda(
+        k: *const Half,
+        beta: *const f32,
+        a_inv: *mut Half,
+        seq_len: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn gdr_fq_fwd_h48_cuda(
         q: *const Half,
         k: *const Half,
         v: *const Half,
