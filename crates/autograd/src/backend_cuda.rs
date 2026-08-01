@@ -2358,7 +2358,12 @@ impl Backend for CudaBackend {
 
         #[cfg(not(feature = "no-cuda"))]
         {
-            let _ = (scatter_axis, gather_axis);
+            let rank_n = in_shape.len();
+            if scatter_axis == gather_axis || scatter_axis >= rank_n || gather_axis >= rank_n {
+                return Err(AutogradError::TapeInvariant(
+                    "all_to_all: scatter/gather axes must be distinct and in range",
+                ));
+            }
             let len = shape_size(in_shape);
             let src = self.cuda_slice(x, "all_to_all")?;
             if src.len() != len {
@@ -2379,13 +2384,119 @@ impl Backend for CudaBackend {
                 return Ok((x.clone(), in_shape.to_vec()));
             }
 
-            // world>1 needs a strided seq↔head shuffle (split scatter_axis into N,
-            // send/recv-pair each slice, concat along gather_axis) — no single NCCL
-            // primitive, and the layout kernels are pod-only (nvcc, ≥2 GPU). Loud
-            // pending-remote boundary, never a silent wrong-shape identity.
-            Err(AutogradError::TapeInvariant(
-                "all_to_all_device world>1 is pending-remote (NCCL seq↔head shuffle; needs pod)",
-            ))
+            #[cfg(all(feature = "nccl", not(feature = "no-cuda")))]
+            {
+                let n = world;
+                if !in_shape[gather_axis].is_multiple_of(n) {
+                    return Err(AutogradError::TapeInvariant(
+                        "all_to_all: gather axis not divisible by world",
+                    ));
+                }
+                // out[scatter] *= N, out[gather] /= N. Invertible under axis-swap, so
+                // the generic backward (collective.rs) reproduces in_shape exactly.
+                let g = in_shape[gather_axis] / n;
+                let mut out_shape = in_shape.to_vec();
+                out_shape[scatter_axis] *= n;
+                out_shape[gather_axis] = g;
+
+                // Send side: slice the gather axis into N equal chunks; chunk j is
+                // rank j's share (heads are outer within the axis, so a contiguous
+                // g-wide slice == that rank's head range).
+                let mut send: Vec<DeviceHandle> = Vec::with_capacity(n);
+                for j in 0..n {
+                    let mut starts = vec![0usize; rank_n];
+                    let mut ends = in_shape.to_vec();
+                    starts[gather_axis] = j * g;
+                    ends[gather_axis] = (j + 1) * g;
+                    send.push(cuda_slice_device(self, x, in_shape, &starts, &ends)?);
+                }
+                let chunk_len = len / n;
+
+                // Transport: one NCCL group of send/recv pairs. Own chunk (j==rank)
+                // is reused from `send` — no self NCCL op, no self copy, no deadlock.
+                let nccl = self.nccl.as_ref().expect("world>1 implies nccl present");
+                let rank = nccl.rank();
+                let mut recv: Vec<Option<CudaSlice<f32>>> = (0..n).map(|_| None).collect();
+                for (j, slot) in recv.iter_mut().enumerate() {
+                    if j != rank {
+                        *slot = Some(self.stream.alloc_zeros::<f32>(chunk_len).map_err(|_| {
+                            AutogradError::TapeInvariant("all_to_all recv alloc failed")
+                        })?);
+                    }
+                }
+                {
+                    let stream = self.stream.cu_stream().cast();
+                    let mut guards = Vec::new();
+                    let mut send_ptrs = Vec::new();
+                    for (j, chunk) in send.iter().enumerate() {
+                        if j != rank {
+                            let s = self.cuda_slice(chunk, "all_to_all")?;
+                            let (p, guard) = s.device_ptr(&self.stream);
+                            send_ptrs.push((j, p));
+                            guards.push(guard);
+                        }
+                    }
+                    let mut recv_ptrs = Vec::new();
+                    for (j, slot) in recv.iter_mut().enumerate() {
+                        if let Some(buf) = slot {
+                            let (p, guard) = buf.device_ptr_mut(&self.stream);
+                            recv_ptrs.push((j, p));
+                            guards.push(guard);
+                        }
+                    }
+                    nccl.group_start()
+                        .map_err(|_| AutogradError::TapeInvariant("a2a group_start failed"))?;
+                    // SAFETY: every ptr is live for the group (its guard is held in
+                    // `guards`), each chunk_len matches its buffer, and send/recv are
+                    // symmetric across ranks so NCCL pairs them inside the one group.
+                    unsafe {
+                        for &(j, p) in &send_ptrs {
+                            nccl.send(p as *const _, chunk_len, DType::F32, j, stream)
+                                .map_err(|_| AutogradError::TapeInvariant("a2a send failed"))?;
+                        }
+                        for &(j, p) in &recv_ptrs {
+                            nccl.recv(p as *mut _, chunk_len, DType::F32, j, stream)
+                                .map_err(|_| AutogradError::TapeInvariant("a2a recv failed"))?;
+                        }
+                    }
+                    nccl.group_end()
+                        .map_err(|_| AutogradError::TapeInvariant("a2a group_end failed"))?;
+                }
+
+                // Recv assembly: concat the N chunks (source-rank order) along the
+                // scatter axis. cuda_concat_parts concatenates on the outermost axis
+                // only, so transpose scatter->0, concat, transpose back — correct for
+                // any (scatter, gather) pair and any batch; identity when scatter==0.
+                let recv_handles: Vec<DeviceHandle> = (0..n)
+                    .map(|j| {
+                        if j == rank {
+                            send[rank].clone()
+                        } else {
+                            DeviceHandle::Cuda(CudaStorage::new(recv[j].take().unwrap()))
+                        }
+                    })
+                    .collect();
+                let mut chunk_shape = in_shape.to_vec();
+                chunk_shape[gather_axis] = g;
+                let transposed: Vec<(DeviceHandle, Vec<usize>)> = recv_handles
+                    .iter()
+                    .map(|h| self.transpose_axes_swap(h, &chunk_shape, 0, scatter_axis))
+                    .collect::<Result<_>>()?;
+                let parts: Vec<&CudaSlice<f32>> = transposed
+                    .iter()
+                    .map(|(h, _)| self.cuda_slice(h, "all_to_all"))
+                    .collect::<Result<_>>()?;
+                let cat = cuda_concat_parts(self, &parts)?;
+                let mut cat_shape = transposed[0].1.clone();
+                cat_shape[0] *= n;
+                let cat_h = DeviceHandle::Cuda(CudaStorage::new(cat));
+                let (out_h, produced) =
+                    self.transpose_axes_swap(&cat_h, &cat_shape, 0, scatter_axis)?;
+                debug_assert_eq!(produced, out_shape);
+                return Ok((out_h, out_shape));
+            }
+            #[cfg(not(all(feature = "nccl", not(feature = "no-cuda"))))]
+            unreachable!("world>1 without nccl feature")
         }
     }
 
