@@ -1,8 +1,8 @@
 # Zigzag ring device kernel: per-row positions ride the ring — 2026-07-31
 
 > Status: Kernel + backend + ops landed; Mac CUDA typecheck + host ring tests
-> green. Pod 2026-08-01: 256K LIVENESS proven AND ring verified correct
-> end-to-end (see below). The "parity FAIL" was a miscalibrated gate, not a bug.
+> green. Pod 2026-08-01: 256K LIVENESS proven. The ring MATH is correct, but the
+> shipping wiring was NOT — see the correction below.
 >
 > **Pod liveness (2026-08-01, HEAD e739a1105, GPUs 1,3):** `nd_parallel_parity`
 > `ARLE_ND_SEQ=131072` cp=2 (local shard 65536) **completed a full optimizer
@@ -12,18 +12,36 @@
 > at 343 GB before; the fix was `head_dim` 2→128 in the parity model so the
 > single-card ref uses the bf16 chunked-prefill kernel (attention.rs:168) instead
 > of the f32 composed `causal_sdpa` that materialized `[heads,seq,seq]`. The ring
-> itself never materializes full-seq (peak O(seq/N·block)). #59/#66 closed.
+> itself never materializes full-seq (peak O(seq/N·block)). #59/#66 closed —
+> **liveness only** (a step completes without OOM). Liveness is NOT correctness:
+> the shipping CP forward ran plain attention on each shard (below).
 >
-> **Ring verified correct (2026-08-01):** the "5.2% parity FAIL" was NOT a bug —
-> the `nd_parallel_parity` 1e-3 tolerance compared two independent bf16 attention
-> kernels against each other (single-card chunked-prefill vs the ring), and bf16
-> attention at tiny random-weight scale is ~8% off f32. A 3-stage device
-> bisection (each one pod run) proved: (1) kernel `ring_block_fwd_merge` vs host
-> `ring_forward_tile` PASS at fp32 eps; (2) 2-rank NCCL transport vs full-seq
-> causal SDPA PASS at 3e-8 incl the non-contiguous zigzag shard; (3) CP hidden
-> tracks CPU-f32 BETTER than single-card (cp_vs_f32 6.6e-2 < single_vs_f32
-> 8.0e-2). Gate recalibrated to anchor on f32 (`4e1076a6b`); see
-> `errors/2026-08-01-cp-parity-fail-was-bf16-gate-miscalibration.md`. #67 closed.
+> **CORRECTION (2026-08-01, HEAD 3d9bc3717): the "5.2% parity FAIL" WAS a real
+> bug — a cp split-brain, now fixed.** `masked_writeback_step` sharded the
+> sequence by its `cp` ARGUMENT, but the forward decided whether to ring by
+> reading a DIFFERENT source, the model field `self.cp` — set only by `set_cp`,
+> whose sole non-test caller was the `cp_hidden_parity` diagnostic. No cli/
+> production path called it, so `self.cp` was always `single()`: every CP shard
+> ran plain attention on its own rows, the ring never fired. The f32-anchored
+> gate caught it (loss_cp 3.2425 vs f32 3.0729, 5.5% = 3700× the single-card
+> bf16 floor 1.5e-5). The 3-stage device bisection below all PASSED because each
+> stage explicitly wired cp (the diagnostic calls `set_cp`) — it verified the
+> ring MATH, never the shipping FORWARD, which bypassed it. Fix: thread `cp`
+> through `forward_hidden_states`/`forward_batch_hidden_indices`, delete the
+> `self.cp` field + `set_cp` (`3d9bc3717`). Pod re-verify (seq=16 FAIL→PASS,
+> 256K rings) pending-remote. See
+> `errors/2026-08-01-cp-parity-fail-was-bf16-gate-miscalibration.md`. #67 REOPENED
+> then fixed under #69.
+>
+> **Ring math verified (2026-08-01) — with cp explicitly wired:** a 3-stage
+> device bisection (each one pod run) proved the ring itself is correct: (1)
+> kernel `ring_block_fwd_merge` vs host `ring_forward_tile` PASS at fp32 eps; (2)
+> 2-rank NCCL transport vs full-seq causal SDPA PASS at 3e-8 incl the
+> non-contiguous zigzag shard; (3) CP hidden (built with `set_cp`) tracks CPU-f32
+> as well as single-card (device CE on the reassembled hidden matched host to
+> 8e-8). These stages exercised the ring; the shipping forward did not — that
+> gap was the bug.
+
 
 ## Context
 
