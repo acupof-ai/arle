@@ -20,11 +20,13 @@ argument order back to ARLE's C ABI by parsing the generated device signature.
 
 import argparse
 import importlib.util
+import json
 import os
 import re
 import shlex
 import subprocess
 import sys
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -840,7 +842,163 @@ extern "C" CUresult {kernel_name}_cuda(
     c_path.write_text(src)
 
 
+def resolve_prim_func(kernel_family, kernel_path, num_q_heads, num_kv_heads, kernel_key):
+    """Load the PrimFunc + its WrapperSpec for one kernel (shared by single/batch)."""
+    if kernel_family == "attention":
+        if num_q_heads is None or num_kv_heads is None:
+            raise RuntimeError("attention kernels require num_q_heads and num_kv_heads")
+        return load_attention_kernel(kernel_path, num_q_heads, num_kv_heads), ATTENTION_SPEC
+    if kernel_family == "attention_bf16_split_partial":
+        if num_q_heads is None or num_kv_heads is None:
+            raise RuntimeError(
+                "attention_bf16_split_partial kernels require num_q_heads and num_kv_heads"
+            )
+        return (
+            load_attention_kernel(
+                kernel_path, num_q_heads, num_kv_heads, kernel_key=kernel_key or "split_partial"
+            ),
+            ATTENTION_BF16_SPLIT_PARTIAL_SPEC,
+        )
+    if kernel_family == "attention_bf16_split_merge":
+        if num_q_heads is None or num_kv_heads is None:
+            raise RuntimeError(
+                "attention_bf16_split_merge kernels require num_q_heads and num_kv_heads"
+            )
+        return (
+            load_attention_kernel(
+                kernel_path, num_q_heads, num_kv_heads, kernel_key=kernel_key or "split_merge"
+            ),
+            ATTENTION_BF16_SPLIT_MERGE_SPEC,
+        )
+    if kernel_family == "attention_fp8":
+        if num_q_heads is None or num_kv_heads is None:
+            raise RuntimeError("attention_fp8 kernels require num_q_heads and num_kv_heads")
+        return load_attention_kernel(kernel_path, num_q_heads, num_kv_heads), ATTENTION_FP8_SPEC
+    if kernel_family == "flashqla":
+        if not kernel_key:
+            raise RuntimeError("flashqla kernels require kernel_key")
+        if kernel_key not in FLASHQLA_SPECS:
+            raise RuntimeError(
+                f"unknown flashqla kernel key {kernel_key!r}; valid keys: {sorted(FLASHQLA_SPECS)}"
+            )
+        return load_gdr_kernel(kernel_path, kernel_key), FLASHQLA_SPECS[kernel_key]
+    if kernel_family == "gdr":
+        if not kernel_key:
+            raise RuntimeError("gdr kernels require kernel_key")
+        if kernel_key not in GDR_SPECS:
+            raise RuntimeError(
+                f"unknown GDR kernel key {kernel_key!r}; valid keys: {sorted(GDR_SPECS)}"
+            )
+        return load_gdr_kernel(kernel_path, kernel_key), GDR_SPECS[kernel_key]
+    raise RuntimeError(f"unknown kernel_family {kernel_family!r}")
+
+
+def emit_kernel(spec, target):
+    """Compile one kernel to its .cu/.cubin/.cc triple; return (out_key, func_name, c_path).
+
+    `spec` is a dict with the same fields as the single-kernel CLI args. Shared by
+    the single-kernel path and --batch. The heavy tilelang.compile() call runs
+    under whatever thread pool the caller uses.
+    """
+    # Kernel modules read this at trace time to pick the sub-sm_80 fp16-MMA path.
+    # A stale value still links, so refuse rather than emit sm_90 shapes for sm_70.
+    if os.environ.get("ARLE_TILELANG_CUDA_ARCH") != str(spec["cuda_arch"]):
+        raise RuntimeError(
+            f"ARLE_TILELANG_CUDA_ARCH is {os.environ.get('ARLE_TILELANG_CUDA_ARCH')!r} "
+            f"but {spec['out_name']} targets sm_{spec['cuda_arch']}"
+        )
+    prim_func, wrapper_spec = resolve_prim_func(
+        spec["kernel_family"], spec["kernel_path"],
+        spec.get("num_q_heads"), spec.get("num_kv_heads"), spec.get("kernel_key"),
+    )
+    out_dir = Path(spec["out_dir"]).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    pass_configs = None
+    if spec.get("kernel_key"):
+        module = load_module(spec["kernel_path"])
+        get_pc = getattr(module, "get_pass_configs", None)
+        if get_pc is not None:
+            pass_configs = get_pc(spec["kernel_key"])
+
+    device_source, kernel_func_name, parsed_args, dyn_shmem_bytes = compile_kernel(
+        prim_func, target, pass_configs=pass_configs
+    )
+    out_name = spec["out_name"]
+    device_cu_staged = out_dir / f"{out_name}_device_kernel.cu"
+    device_cu_staged.write_text(device_source)
+    cubin_path = out_dir / f"{out_name}.cubin"
+    nvcc_compile_cubin(
+        spec["nvcc"], spec.get("nvcc_wrapper", []), device_cu_staged, cubin_path,
+        spec["cuda_arch"], Path(spec["tilelang_src"]),
+        Path(spec["cutlass_include"]), Path(spec["cuda_include"]),
+    )
+    c_path = (out_dir / f"{out_name}.cc").resolve()
+    write_c_wrapper(
+        c_path, spec["kernel_name"], cubin_path, kernel_func_name,
+        parsed_args, dyn_shmem_bytes, wrapper_spec,
+    )
+    return spec.get("out_key", spec["kernel_name"]), f"{spec['kernel_name']}_cuda", str(c_path)
+
+
+def run_batch(manifest_path: str) -> int:
+    """Compile every spec in `manifest_path` (JSON list) in one process.
+
+    Imports tilelang once (vs once per subprocess) and fans the per-kernel
+    compiles across a thread pool — TileLang lowering is GIL-releasing C++ and
+    nvcc is a subprocess, so threads parallelize. Prints one RESULT line per
+    kernel: `RESULT\t<out_key>\t<func_name>\t<c_path>`. On any failure the whole
+    batch exits non-zero so build.rs surfaces it (same fail-fast as before).
+
+    One arch group at a time: kernel modules read ARLE_TILELANG_CUDA_ARCH at trace
+    time (below sm_80 it selects the fp16-MMA path), and a process-global cannot
+    hold a per-thread value. Grouping keeps the single tilelang import and the
+    within-arch fan-out, which is where the speedup lives.
+    """
+    import collections
+    import concurrent.futures
+
+    with open(manifest_path) as f:
+        specs = json.load(f)
+    # Resolve targets once; specs of the same arch share a Target object.
+    targets = {}
+    for s in specs:
+        targets.setdefault(s["target"], None)
+    for t in list(targets):
+        targets[t] = parse_target(t)
+
+    by_arch = collections.defaultdict(list)
+    for s in specs:
+        by_arch[s["cuda_arch"]].append(s)
+
+    results, errors = [], []
+    for cuda_arch, group in sorted(by_arch.items()):
+        os.environ["ARLE_TILELANG_CUDA_ARCH"] = str(cuda_arch)
+        workers = int(os.environ.get("ARLE_TILELANG_BATCH_WORKERS", "0")) or min(
+            len(group), os.cpu_count() or 1
+        )
+        with concurrent.futures.ThreadPoolExecutor(workers, "aot-batch") as ex:
+            fut_to_spec = {ex.submit(emit_kernel, s, targets[s["target"]]): s for s in group}
+            for fut in concurrent.futures.as_completed(fut_to_spec):
+                s = fut_to_spec[fut]
+                try:
+                    results.append(fut.result())
+                except Exception:  # noqa: BLE001 — collect all, report, fail
+                    errors.append(
+                        (s.get("out_key", s.get("kernel_name", "?")), traceback.format_exc())
+                    )
+    for out_key, func_name, c_path in results:
+        print(f"RESULT\t{out_key}\t{func_name}\t{c_path}")
+    if errors:
+        for out_key, err in errors:
+            print(f"BATCH_ERROR\t{out_key}\t{err}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def main() -> int:
+    if len(sys.argv) >= 3 and sys.argv[1] == "--batch":
+        return run_batch(sys.argv[2])
     parser = argparse.ArgumentParser()
     parser.add_argument("--kernel-path", required=True)
     parser.add_argument("--kernel-name", required=True)
@@ -878,99 +1036,16 @@ def main() -> int:
 
     os.environ["ARLE_TILELANG_CUDA_ARCH"] = str(args.cuda_arch)
 
-    target = parse_target(args.target)
-    if args.kernel_family == "attention":
-        if args.num_q_heads is None or args.num_kv_heads is None:
-            raise RuntimeError("attention kernels require --num-q-heads and --num-kv-heads")
-        prim_func = load_attention_kernel(args.kernel_path, args.num_q_heads, args.num_kv_heads)
-        wrapper_spec = ATTENTION_SPEC
-    elif args.kernel_family == "attention_bf16_split_partial":
-        if args.num_q_heads is None or args.num_kv_heads is None:
-            raise RuntimeError(
-                "attention_bf16_split_partial kernels require --num-q-heads and --num-kv-heads"
-            )
-        prim_func = load_attention_kernel(
-            args.kernel_path,
-            args.num_q_heads,
-            args.num_kv_heads,
-            kernel_key=args.kernel_key or "split_partial",
-        )
-        wrapper_spec = ATTENTION_BF16_SPLIT_PARTIAL_SPEC
-    elif args.kernel_family == "attention_bf16_split_merge":
-        if args.num_q_heads is None or args.num_kv_heads is None:
-            raise RuntimeError(
-                "attention_bf16_split_merge kernels require --num-q-heads and --num-kv-heads"
-            )
-        prim_func = load_attention_kernel(
-            args.kernel_path,
-            args.num_q_heads,
-            args.num_kv_heads,
-            kernel_key=args.kernel_key or "split_merge",
-        )
-        wrapper_spec = ATTENTION_BF16_SPLIT_MERGE_SPEC
-    elif args.kernel_family == "attention_fp8":
-        if args.num_q_heads is None or args.num_kv_heads is None:
-            raise RuntimeError("attention_fp8 kernels require --num-q-heads and --num-kv-heads")
-        prim_func = load_attention_kernel(args.kernel_path, args.num_q_heads, args.num_kv_heads)
-        wrapper_spec = ATTENTION_FP8_SPEC
-    elif args.kernel_family == "flashqla":
-        if not args.kernel_key:
-            raise RuntimeError("flashqla kernels require --kernel-key")
-        if args.kernel_key not in FLASHQLA_SPECS:
-            raise RuntimeError(
-                f"unknown flashqla kernel key {args.kernel_key!r}; "
-                f"valid keys: {sorted(FLASHQLA_SPECS)}"
-            )
-        prim_func = load_gdr_kernel(args.kernel_path, args.kernel_key)
-        wrapper_spec = FLASHQLA_SPECS[args.kernel_key]
-    else:
-        if not args.kernel_key:
-            raise RuntimeError("gdr kernels require --kernel-key")
-        if args.kernel_key not in GDR_SPECS:
-            raise RuntimeError(f"unknown GDR kernel key {args.kernel_key!r}; valid keys: {sorted(GDR_SPECS)}")
-        prim_func = load_gdr_kernel(args.kernel_path, args.kernel_key)
-        wrapper_spec = GDR_SPECS[args.kernel_key]
-
-    out_dir = Path(args.out_dir).resolve()
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    # Optional per-key pass configs (e.g. FlashQLA's TL_ENABLE_FAST_MATH).
-    pass_configs = None
-    if args.kernel_key:
-        module = load_module(args.kernel_path)
-        get_pc = getattr(module, "get_pass_configs", None)
-        if get_pc is not None:
-            pass_configs = get_pc(args.kernel_key)
-
-    device_source, kernel_func_name, parsed_args, dyn_shmem_bytes = compile_kernel(
-        prim_func, target, pass_configs=pass_configs
-    )
-    device_cu_staged = out_dir / f"{args.out_name}_device_kernel.cu"
-    device_cu_staged.write_text(device_source)
-    cubin_path = out_dir / f"{args.out_name}.cubin"
-    nvcc_compile_cubin(
-        args.nvcc,
-        args.nvcc_wrapper,
-        device_cu_staged,
-        cubin_path,
-        args.cuda_arch,
-        Path(args.tilelang_src),
-        Path(args.cutlass_include),
-        Path(args.cuda_include),
-    )
-
-    c_path = (out_dir / f"{args.out_name}.cc").resolve()
-    write_c_wrapper(
-        c_path,
-        args.kernel_name,
-        cubin_path,
-        kernel_func_name,
-        parsed_args,
-        dyn_shmem_bytes,
-        wrapper_spec,
-    )
-
-    print(f"FUNC_NAME={args.kernel_name}_cuda")
+    spec = {
+        "kernel_family": args.kernel_family, "kernel_path": args.kernel_path,
+        "kernel_name": args.kernel_name, "out_name": args.out_name, "out_dir": args.out_dir,
+        "target": args.target, "cuda_arch": args.cuda_arch, "kernel_key": args.kernel_key,
+        "num_q_heads": args.num_q_heads, "num_kv_heads": args.num_kv_heads,
+        "tilelang_src": args.tilelang_src, "cutlass_include": args.cutlass_include,
+        "cuda_include": args.cuda_include, "nvcc": args.nvcc, "nvcc_wrapper": args.nvcc_wrapper,
+    }
+    _, func_name, c_path = emit_kernel(spec, parse_target(args.target))
+    print(f"FUNC_NAME={func_name}")
     print(f"C_PATH={c_path}")
     return 0
 

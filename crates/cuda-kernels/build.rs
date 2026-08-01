@@ -502,7 +502,7 @@ fn normalize_ws(s: &str) -> String {
 
 /// Build the `TileLangKernelSpec` list from every registry row. The flashqla
 /// gate (sm90 + env flag) is applied per-row by the caller; SM-tier stubbing
-/// (e.g. sm_70 legacy) happens inside `build_tilelang_kernel`.
+/// (e.g. sm_70 legacy) happens inside `stage_tilelang_kernel`.
 fn registry_to_specs(reg: &Registry) -> Vec<(TileLangKernelSpec, &RegKernel)> {
     reg.kernels
         .iter()
@@ -926,6 +926,58 @@ fn tilelang_kernel_src_hash(base_spec: &TileLangKernelSpec, sm_token: &str) -> S
 /// Per-SM TileLang AOT artifact: (sm token, exported func name, generated .c path).
 type TileLangPerSmArtifact = (String, String, PathBuf);
 
+/// One per-SM slot of a kernel: either restored from vendored/cache now, or
+/// deferred to the batch (identified by `out_key`, filled post-compile).
+enum PerSmSlot {
+    Resolved(TileLangPerSmArtifact),
+    Pending { out_key: String },
+}
+
+/// A (kernel, SM) pair whose artifact was not restored from vendored/cache and
+/// must be regenerated. Collected across all kernels, compiled in ONE batched
+/// `gen_tilelang_aot.py --batch` invocation (one interpreter, one `import
+/// tilelang`, internal thread-pool over the compiles), then each job's result is
+/// finalized (meta.txt + cache staging/publish) via `finalize_regen_job`. The
+/// `_lock` field keeps the per-cache-id advisory lock held until finalize.
+struct RegenJob {
+    out_key: String,
+    sm_token: String,
+    per_sm_out_name: String,
+    per_sm_kernel_name: String,
+    out_artifact_dir: PathBuf,
+    src_hash: String,
+    cache_id: String,
+    cache_entry: Option<PathBuf>,
+    _lock: Option<File>,
+    // Generator argv fields (resolved once at collection time).
+    kernel_path: String,
+    kernel_family: String,
+    kernel_key: Option<String>,
+    num_q_heads: Option<u32>,
+    num_kv_heads: Option<u32>,
+    cuda_arch: u32,
+    target: String,
+}
+
+/// Minimal JSON string encoder (escapes the characters that occur in paths /
+/// identifiers). Avoids a serde build-dep just to emit the batch manifest.
+fn json_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 /// Persistent kernel-artifact cache root, OUTSIDE `target/` so `cargo clean` and
 /// fresh clones reuse it. `generated/` is gitignored now, so a clean/CI build
 /// regenerates every kernel (TileLang + nvcc, ~60s); this cache restores a prior
@@ -1258,8 +1310,8 @@ fn generate_tilelang_artifacts_per_sm(
     sm_targets: &[SmSpec],
     cuda_path: &str,
     base_spec: &TileLangKernelSpec,
-) -> Vec<TileLangPerSmArtifact> {
-    let generator_path = PathBuf::from("tools/tilelang/gen_tilelang_aot.py");
+    jobs: &mut Vec<RegenJob>,
+) -> Vec<PerSmSlot> {
     let manifest_dir = PathBuf::from(
         std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR set by cargo"),
     );
@@ -1322,7 +1374,7 @@ fn generate_tilelang_artifacts_per_sm(
             let consumed_c = out_artifact_dir.join(format!("{per_sm_out_name}.cc"));
             println!("cargo:rerun-if-changed={}", vendored_c.display());
             println!("cargo:rerun-if-changed={}", base_spec.kernel_path);
-            results.push((sm_token.clone(), func, consumed_c));
+            results.push(PerSmSlot::Resolved((sm_token.clone(), func, consumed_c)));
             continue;
         }
 
@@ -1352,11 +1404,11 @@ fn generate_tilelang_artifacts_per_sm(
                         )
                     });
                     println!("cargo:rerun-if-changed={}", base_spec.kernel_path);
-                    results.push((
-                        sm_token.clone(),
-                        func,
-                        out_artifact_dir.join(format!("{per_sm_out_name}.cc")),
-                    ));
+                    let restored_c = out_artifact_dir.join(format!("{per_sm_out_name}.cc"));
+                    // Warm cache still populates generated/ under ARLE_KERNEL_VENDOR,
+                    // else kernel_artifacts.sh packs a bundle missing cache-hit kernels.
+                    vendor_artifact_dir(&restored_c);
+                    results.push(PerSmSlot::Resolved((sm_token.clone(), func, restored_c)));
                     continue;
                 }
                 Err(_) if !entry.exists() => {}
@@ -1372,212 +1424,372 @@ fn generate_tilelang_artifacts_per_sm(
             }
         }
 
-        let _ = std::fs::remove_dir_all(&out_artifact_dir);
-
-        let toolchain = tl.get();
-        let mut command = Command::new(&toolchain.python);
-        let output = command
-            .arg(&generator_path)
-            .arg("--kernel-path")
-            .arg(&base_spec.kernel_path)
-            .arg("--kernel-name")
-            .arg(&per_sm_kernel_name)
-            .arg("--out-name")
-            .arg(&per_sm_out_name)
-            .arg("--out-dir")
-            .arg(&out_artifact_dir)
-            .arg("--target")
-            .arg(&target)
-            .arg("--kernel-family")
-            .arg(&base_spec.kernel_family)
-            .arg("--cuda-arch")
-            .arg(cuda_arch.to_string())
-            .arg("--tilelang-src")
-            .arg(&toolchain.src)
-            .arg("--cutlass-include")
-            .arg(&toolchain.cutlass_include)
-            .arg("--cuda-include")
-            .arg(&cuda_include)
-            .arg("--nvcc")
-            .arg(&nvcc)
-            .args(
-                wrapper
-                    .iter()
-                    .flat_map(|arg| ["--nvcc-wrapper".to_string(), arg.clone()]),
-            )
-            .args(
-                base_spec
-                    .kernel_key
-                    .as_deref()
-                    .into_iter()
-                    .flat_map(|key| ["--kernel-key".to_string(), key.to_string()]),
-            )
-            .args(
-                base_spec
-                    .num_q_heads
-                    .into_iter()
-                    .flat_map(|heads| ["--num-q-heads".to_string(), heads.to_string()]),
-            )
-            .args(
-                base_spec
-                    .num_kv_heads
-                    .into_iter()
-                    .flat_map(|heads| ["--num-kv-heads".to_string(), heads.to_string()]),
-            )
-            .output()
-            .unwrap_or_else(|err| {
-                panic!(
-                    "failed to spawn TileLang AOT generator for {} on sm_{sm_token}: {err}",
-                    base_spec.kernel_name
-                )
-            });
-
-        if !output.status.success() {
-            let other_sms: Vec<String> = sm_targets
-                .iter()
-                .filter(|s| s.sm != *sm_token)
-                .map(|s| sm_to_arch_list_token(&s.sm))
-                .collect();
-            let suggestion = if other_sms.is_empty() {
-                "all targets failed; bump tilelang in pyproject.toml or pin a working version"
-                    .to_string()
-            } else {
-                format!("TORCH_CUDA_ARCH_LIST=\"{}\"", other_sms.join(";"))
-            };
-            panic!(
-                "TileLang AOT failed to compile {} for sm_{sm_token}.\n\
-                 stdout: {}\n\
-                 stderr: {}\n\n\
-                 Hint: bump tilelang (pin lives in pyproject.toml) OR exclude sm_{sm_token} via:\n  \
-                 {suggestion}\n\
-                 See docs/environment.md.",
-                base_spec.kernel_name,
-                String::from_utf8_lossy(&output.stdout).trim(),
-                String::from_utf8_lossy(&output.stderr).trim(),
-            );
-        }
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let mut gen_func_name = None;
-        let mut c_path = None;
-        for line in stdout.lines() {
-            if let Some(value) = line.strip_prefix("FUNC_NAME=") {
-                gen_func_name = Some(value.trim().to_string());
-            } else if let Some(value) = line.strip_prefix("C_PATH=") {
-                c_path = Some(PathBuf::from(value.trim()));
-            }
-        }
-        let gen_func_name = gen_func_name.expect("TileLang generator did not print FUNC_NAME");
-        let c_path = c_path.expect("TileLang generator did not print C_PATH");
-        let output_hash = sha256_bytes(
-            &std::fs::read(&c_path)
-                .unwrap_or_else(|err| panic!("read generated output {}: {err}", c_path.display())),
-        );
-
-        std::fs::write(
-            out_artifact_dir.join("meta.txt"),
-            format!(
-                "FUNC_NAME={gen_func_name}\nSRC_HASH={src_hash}\nCACHE_ID={cache_id}\nOUTPUT_SHA256={output_hash}\n"
-            ),
-        )
-        .unwrap_or_else(|err| panic!("write meta.txt for {}: {err}", out_artifact_dir.display()));
-        validate_tilelang_artifact(&out_artifact_dir, &per_sm_out_name, &src_hash, None)
-            .unwrap_or_else(|err| panic!("validate generated artifact: {err}"));
-
-        if let Some(entry) = &cache_entry {
-            let parent = entry.parent().expect("cache entry has parent");
-            std::fs::create_dir_all(parent)
-                .unwrap_or_else(|err| panic!("create cache directory {}: {err}", parent.display()));
-            let staging =
-                entry.with_file_name(format!("{cache_id}.staging.{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&staging);
-            copy_dir_recursive(&out_artifact_dir, &staging)
-                .unwrap_or_else(|err| panic!("stage TileLang cache {}: {err}", staging.display()));
-            std::fs::write(
-                staging.join(".complete"),
-                format!("CACHE_ID={cache_id}\nOUTPUT_SHA256={output_hash}\n"),
-            )
-            .unwrap_or_else(|err| panic!("write cache marker {}: {err}", staging.display()));
-            validate_tilelang_artifact(&staging, &per_sm_out_name, &src_hash, Some(&cache_id))
-                .unwrap_or_else(|err| panic!("validate staged cache {}: {err}", staging.display()));
-            let _ = std::fs::remove_dir_all(entry);
-            std::fs::rename(&staging, entry).unwrap_or_else(|err| {
-                panic!(
-                    "publish TileLang cache {} -> {}: {err}",
-                    staging.display(),
-                    entry.display()
-                )
-            });
-        }
-
-        results.push((sm_token.clone(), gen_func_name, c_path));
-    }
-
-    // ARLE_KERNEL_VENDOR=1: mirror every consumed/restored/regenerated artifact
-    // into the (gitignored) vendored tier — `scripts/kernel_artifacts.sh pack`
-    // tars that directory into the GitHub-Release kernel bundle, and `fetch`
-    // extracts back into it so consumers build with zero Python.
-    if env_truthy("ARLE_KERNEL_VENDOR") {
-        for (_, _, c_path) in &results {
-            let src = c_path.parent().expect("artifact .c has a parent dir");
-            let dst = manifest_dir
-                .join("generated")
-                .join(src.file_name().expect("artifact dir has a name"));
-            if src != dst {
-                let _ = std::fs::remove_dir_all(&dst);
-                copy_dir_recursive(src, &dst)
-                    .unwrap_or_else(|err| panic!("vendor export {}: {err}", dst.display()));
-            }
-        }
+        // Cache miss: defer the actual compile to a single batched generator
+        // invocation. Record everything finalize needs; the advisory lock stays
+        // held (moved into the job) until the artifact is published post-batch.
+        let out_key = per_sm_kernel_name.clone();
+        jobs.push(RegenJob {
+            out_key: out_key.clone(),
+            sm_token: sm_token.clone(),
+            per_sm_out_name: per_sm_out_name.clone(),
+            per_sm_kernel_name,
+            out_artifact_dir,
+            src_hash,
+            cache_id,
+            cache_entry,
+            _lock: _cache_lock,
+            kernel_path: base_spec.kernel_path.clone(),
+            kernel_family: base_spec.kernel_family.clone(),
+            kernel_key: base_spec.kernel_key.clone(),
+            num_q_heads: base_spec.num_q_heads,
+            num_kv_heads: base_spec.num_kv_heads,
+            cuda_arch,
+            target,
+        });
+        println!("cargo:rerun-if-changed={}", base_spec.kernel_path);
+        results.push(PerSmSlot::Pending { out_key });
     }
 
     results
 }
 
-/// Build one TileLang head-config kernel for every SM target: generate
-/// per-SM artifacts, write a single dispatch wrapper exposing
-/// `<base_kernel_name>_cuda`, and append all sources to
-/// `generated_sources` for cc::Build to compile.
-fn build_tilelang_kernel(
+/// Result of one kernel from the batched generator: exported func name + .c path.
+type BatchResult = (String, PathBuf);
+
+/// Run one batched `gen_tilelang_aot.py --batch <manifest>` for every deferred
+/// job: a single interpreter imports tilelang once and compiles all jobs through
+/// an internal thread pool (TileLang lowering is GIL-releasing C++, nvcc is a
+/// subprocess, so they parallelize). Returns a map `out_key -> (func_name, .c)`.
+fn run_tilelang_batch(
+    tl: &LazyTilelang,
+    cuda_path: &str,
+    out_dir: &Path,
+    jobs: &[RegenJob],
+) -> std::collections::HashMap<String, BatchResult> {
+    use std::collections::HashMap;
+    if jobs.is_empty() {
+        return HashMap::new();
+    }
+    let generator_path = PathBuf::from("tools/tilelang/gen_tilelang_aot.py");
+    let nvcc = resolve_executable(&format!("{cuda_path}/bin/nvcc"));
+    let cuda_include = PathBuf::from(cuda_path).join("include");
+    let wrapper: Vec<String> = env_nonempty("ARLE_NVCC_WRAPPER")
+        .map(|value| {
+            value
+                .split_whitespace()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let toolchain = tl.get();
+
+    // Wipe stale out-dirs before regenerating (mirrors the pre-spawn cleanup).
+    for job in jobs {
+        let _ = std::fs::remove_dir_all(&job.out_artifact_dir);
+    }
+
+    // Build the JSON manifest by hand (no serde dep in build-deps): a list of
+    // objects with the same fields the single-kernel CLI takes plus `out_key`.
+    let mut manifest = String::from("[");
+    for (i, job) in jobs.iter().enumerate() {
+        if i > 0 {
+            manifest.push(',');
+        }
+        manifest.push('{');
+        let mut field = |k: &str, v: &str, first: bool| {
+            if !first {
+                manifest.push(',');
+            }
+            manifest.push_str(&format!("{}:{}", json_str(k), json_str(v)));
+        };
+        field("out_key", &job.out_key, true);
+        field("kernel_path", &job.kernel_path, false);
+        field("kernel_name", &job.per_sm_kernel_name, false);
+        field("out_name", &job.per_sm_out_name, false);
+        field("out_dir", &job.out_artifact_dir.to_string_lossy(), false);
+        field("target", &job.target, false);
+        field("kernel_family", &job.kernel_family, false);
+        field("tilelang_src", &toolchain.src.to_string_lossy(), false);
+        field(
+            "cutlass_include",
+            &toolchain.cutlass_include.to_string_lossy(),
+            false,
+        );
+        field("cuda_include", &cuda_include.to_string_lossy(), false);
+        field("nvcc", &nvcc.to_string_lossy(), false);
+        manifest.push_str(&format!(",{}:{}", json_str("cuda_arch"), job.cuda_arch));
+        if let Some(key) = &job.kernel_key {
+            manifest.push_str(&format!(",{}:{}", json_str("kernel_key"), json_str(key)));
+        }
+        if let Some(h) = job.num_q_heads {
+            manifest.push_str(&format!(",{}:{}", json_str("num_q_heads"), h));
+        }
+        if let Some(h) = job.num_kv_heads {
+            manifest.push_str(&format!(",{}:{}", json_str("num_kv_heads"), h));
+        }
+        if !wrapper.is_empty() {
+            manifest.push_str(&format!(
+                ",{}:[{}]",
+                json_str("nvcc_wrapper"),
+                wrapper
+                    .iter()
+                    .map(|w| json_str(w))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ));
+        }
+        manifest.push('}');
+    }
+    manifest.push(']');
+
+    let manifest_path = out_dir.join("tilelang_aot").join("batch_manifest.json");
+    std::fs::create_dir_all(manifest_path.parent().unwrap())
+        .unwrap_or_else(|err| panic!("create batch manifest dir: {err}"));
+    std::fs::write(&manifest_path, &manifest)
+        .unwrap_or_else(|err| panic!("write batch manifest {}: {err}", manifest_path.display()));
+
+    let output = Command::new(&toolchain.python)
+        .arg(&generator_path)
+        .arg("--batch")
+        .arg(&manifest_path)
+        // Bound the generator's fan-out with the same policy as the nvcc pool.
+        // Without this ARLE_NVCC_PARALLEL is a dead knob for the batch phase and
+        // the Python side defaults to os.cpu_count() (ignores cgroup/affinity).
+        .env(
+            "ARLE_TILELANG_BATCH_WORKERS",
+            nvcc_parallelism(jobs.len()).to_string(),
+        )
+        .output()
+        .unwrap_or_else(|err| panic!("failed to spawn batched TileLang AOT generator: {err}"));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut map = HashMap::new();
+    for line in stdout.lines() {
+        if let Some(rest) = line.strip_prefix("RESULT\t") {
+            let parts: Vec<&str> = rest.splitn(3, '\t').collect();
+            if parts.len() == 3 {
+                map.insert(
+                    parts[0].to_string(),
+                    (parts[1].to_string(), PathBuf::from(parts[2])),
+                );
+            }
+        }
+    }
+    if !output.status.success() {
+        // The generator emits RESULT for every kernel that compiled before the
+        // batch failed. Publish those to the persistent cache now so a re-run gets
+        // them as hits instead of recompiling the whole batch from scratch, then
+        // fail with the original error.
+        for job in jobs {
+            if map.contains_key(&job.out_key) {
+                let _ = finalize_regen_job(job, &map);
+            }
+        }
+        let mut sms: Vec<String> = jobs
+            .iter()
+            .map(|j| sm_to_arch_list_token(&j.sm_token))
+            .collect();
+        sms.sort();
+        sms.dedup();
+        panic!(
+            "batched TileLang AOT generator failed ({} kernels, SM tiers {}).\nstdout: {}\nstderr: {}\n\n\
+             Hint: bump tilelang (pin lives in pyproject.toml) OR exclude a failing SM via \
+             TORCH_CUDA_ARCH_LIST. See docs/environment.md.",
+            jobs.len(),
+            sms.join(";"),
+            stdout.trim(),
+            String::from_utf8_lossy(&output.stderr).trim(),
+        );
+    }
+    for job in jobs {
+        if !map.contains_key(&job.out_key) {
+            panic!(
+                "batched generator did not emit a RESULT for {}.\nstdout: {}\nstderr: {}",
+                job.out_key,
+                stdout.trim(),
+                String::from_utf8_lossy(&output.stderr).trim(),
+            );
+        }
+    }
+    map
+}
+
+/// Finalize one regenerated (kernel, SM) artifact: write meta.txt, validate, and
+/// publish into the persistent cache (staging + atomic rename). Byte-for-byte the
+/// same post-processing the serial path did after each single-kernel spawn.
+fn finalize_regen_job(
+    job: &RegenJob,
+    batch: &std::collections::HashMap<String, BatchResult>,
+) -> TileLangPerSmArtifact {
+    let (gen_func_name, c_path) = batch
+        .get(&job.out_key)
+        .unwrap_or_else(|| panic!("missing batch result for {}", job.out_key))
+        .clone();
+    let output_hash = sha256_bytes(
+        &std::fs::read(&c_path)
+            .unwrap_or_else(|err| panic!("read generated output {}: {err}", c_path.display())),
+    );
+    let RegenJob {
+        out_artifact_dir,
+        src_hash,
+        cache_id,
+        per_sm_out_name,
+        cache_entry,
+        ..
+    } = job;
+    std::fs::write(
+        out_artifact_dir.join("meta.txt"),
+        format!(
+            "FUNC_NAME={gen_func_name}\nSRC_HASH={src_hash}\nCACHE_ID={cache_id}\nOUTPUT_SHA256={output_hash}\n"
+        ),
+    )
+    .unwrap_or_else(|err| panic!("write meta.txt for {}: {err}", out_artifact_dir.display()));
+    validate_tilelang_artifact(out_artifact_dir, per_sm_out_name, src_hash, None)
+        .unwrap_or_else(|err| panic!("validate generated artifact: {err}"));
+
+    if let Some(entry) = cache_entry {
+        let parent = entry.parent().expect("cache entry has parent");
+        std::fs::create_dir_all(parent)
+            .unwrap_or_else(|err| panic!("create cache directory {}: {err}", parent.display()));
+        let staging = entry.with_file_name(format!("{cache_id}.staging.{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&staging);
+        copy_dir_recursive(out_artifact_dir, &staging)
+            .unwrap_or_else(|err| panic!("stage TileLang cache {}: {err}", staging.display()));
+        std::fs::write(
+            staging.join(".complete"),
+            format!("CACHE_ID={cache_id}\nOUTPUT_SHA256={output_hash}\n"),
+        )
+        .unwrap_or_else(|err| panic!("write cache marker {}: {err}", staging.display()));
+        validate_tilelang_artifact(&staging, per_sm_out_name, src_hash, Some(cache_id))
+            .unwrap_or_else(|err| panic!("validate staged cache {}: {err}", staging.display()));
+        let _ = std::fs::remove_dir_all(entry);
+        std::fs::rename(&staging, entry).unwrap_or_else(|err| {
+            panic!(
+                "publish TileLang cache {} -> {}: {err}",
+                staging.display(),
+                entry.display()
+            )
+        });
+    }
+
+    // ARLE_KERNEL_VENDOR=1: mirror the regenerated artifact into the (gitignored)
+    // vendored tier so `scripts/kernel_artifacts.sh pack` can bundle it.
+    vendor_artifact_dir(&c_path);
+    (job.sm_token.clone(), gen_func_name, c_path)
+}
+
+/// ARLE_KERNEL_VENDOR=1: mirror an artifact dir into the (gitignored) `generated/`
+/// vendored tier so `scripts/kernel_artifacts.sh pack` can bundle it. Called for
+/// BOTH freshly regenerated artifacts and cache-restored ones — a warm cache must
+/// still populate `generated/` or the packed bundle silently omits those kernels.
+fn vendor_artifact_dir(c_path: &Path) {
+    if !env_truthy("ARLE_KERNEL_VENDOR") {
+        return;
+    }
+    let manifest_dir = PathBuf::from(
+        std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR set by cargo"),
+    );
+    let src = c_path.parent().expect("artifact .c has a parent dir");
+    let dst = manifest_dir
+        .join("generated")
+        .join(src.file_name().expect("artifact dir has a name"));
+    if src != dst {
+        let _ = std::fs::remove_dir_all(&dst);
+        copy_dir_recursive(src, &dst)
+            .unwrap_or_else(|err| panic!("vendor export {}: {err}", dst.display()));
+    }
+}
+
+/// A kernel staged for the batched build: its per-SM slots (resolved now or
+/// pending the batch) plus everything `finalize_staged_kernel` needs to write
+/// the dispatch wrapper once all per-SM func names are known.
+struct StagedKernel {
+    slots: Vec<PerSmSlot>,
+    public_decl: String,
+    extern_decl: String,
+    call_args: String,
+    dispatch_dir: PathBuf,
+    wrapper_path: PathBuf,
+}
+
+/// Phase 1 of building one TileLang head-config kernel: resolve each SM target
+/// from vendored/cache, or push a `RegenJob` for the batched compile. Returns a
+/// `StagedKernel` finalized (dispatch wrapper + source collection) after the
+/// single batched generator run.
+fn stage_tilelang_kernel(
     tl: &LazyTilelang,
     out_dir: &Path,
     sm_targets: &[SmSpec],
     cuda_path: &str,
     base_spec: &TileLangKernelSpec,
-    generated_sources: &mut Vec<PathBuf>,
-) {
+    jobs: &mut Vec<RegenJob>,
+) -> StagedKernel {
     let eligible_targets: Vec<SmSpec> = sm_targets
         .iter()
         .filter(|sm| base_spec.allow_sm70 || !is_legacy_volta_sm(&sm.sm))
         .cloned()
         .collect();
-    let per_sm =
-        generate_tilelang_artifacts_per_sm(tl, out_dir, &eligible_targets, cuda_path, base_spec);
+    let slots = generate_tilelang_artifacts_per_sm(
+        tl,
+        out_dir,
+        &eligible_targets,
+        cuda_path,
+        base_spec,
+        jobs,
+    );
+    let public_name = format!("{}_cuda", base_spec.kernel_name);
+    let dispatch_dir = out_dir
+        .join("tilelang_aot")
+        .join(format!("{}_dispatch", base_spec.artifact_dir));
+    let wrapper_path = dispatch_dir.join(format!("{}_dispatch.c", base_spec.out_name));
+    StagedKernel {
+        slots,
+        public_decl: format!("{public_name}({})", base_spec.public_decl),
+        extern_decl: base_spec.extern_decl.clone(),
+        call_args: base_spec.call_args.clone(),
+        dispatch_dir,
+        wrapper_path,
+    }
+}
+
+/// Phase 2: resolve pending slots from the batch results, write the dispatch
+/// wrapper, and append all per-SM sources + the wrapper to `generated_sources`.
+fn finalize_staged_kernel(
+    staged: StagedKernel,
+    jobs_by_key: &std::collections::HashMap<String, RegenJob>,
+    batch: &std::collections::HashMap<String, BatchResult>,
+    generated_sources: &mut Vec<PathBuf>,
+) {
+    let per_sm: Vec<TileLangPerSmArtifact> = staged
+        .slots
+        .into_iter()
+        .map(|slot| match slot {
+            PerSmSlot::Resolved(art) => art,
+            PerSmSlot::Pending { out_key } => {
+                let job = jobs_by_key
+                    .get(&out_key)
+                    .unwrap_or_else(|| panic!("no RegenJob for pending slot {out_key}"));
+                finalize_regen_job(job, batch)
+            }
+        })
+        .collect();
     let pairs: Vec<(String, String)> = per_sm
         .iter()
         .map(|(sm, func, _)| (sm.clone(), func.clone()))
         .collect();
 
-    let public_name = format!("{}_cuda", base_spec.kernel_name);
-    let public_decl = format!("{public_name}({})", base_spec.public_decl);
     let wrapper_src = format_dispatch_wrapper(
-        &public_decl,
-        &base_spec.extern_decl,
-        &base_spec.call_args,
+        &staged.public_decl,
+        &staged.extern_decl,
+        &staged.call_args,
         &pairs,
     );
-
-    let dispatch_dir = out_dir
-        .join("tilelang_aot")
-        .join(format!("{}_dispatch", base_spec.artifact_dir));
-    std::fs::create_dir_all(&dispatch_dir).expect("create TileLang dispatch directory");
-    let wrapper_path = dispatch_dir.join(format!("{}_dispatch.c", base_spec.out_name));
-    std::fs::write(&wrapper_path, wrapper_src).expect("write TileLang dispatch wrapper");
+    std::fs::create_dir_all(&staged.dispatch_dir).expect("create TileLang dispatch directory");
+    std::fs::write(&staged.wrapper_path, wrapper_src).expect("write TileLang dispatch wrapper");
 
     for (_, _, c) in per_sm {
         generated_sources.push(c);
     }
-    generated_sources.push(wrapper_path);
+    generated_sources.push(staged.wrapper_path);
 }
 
 fn write_tilelang_unsupported_stub(
@@ -1624,6 +1836,12 @@ fn compile_tilelang_aot_kernels(
         .filter(|sm| sm.sm == "90")
         .cloned()
         .collect();
+    // Phase 1: stage every kernel — resolve vendored/cache hits now, collect the
+    // misses as RegenJobs. Phase 2: compile ALL misses in ONE batched generator
+    // run (one `import tilelang`, internal thread pool). Phase 3: finalize each
+    // staged kernel (fill pending slots, write dispatch wrappers, collect sources).
+    let mut staged: Vec<StagedKernel> = Vec::new();
+    let mut jobs: Vec<RegenJob> = Vec::new();
     for (spec, k) in registry_to_specs(reg) {
         if k.gate == "flashqla" {
             if !enable_flashqla_gdr || sm90_targets.is_empty() {
@@ -1636,25 +1854,27 @@ fn compile_tilelang_aot_kernels(
                     &mut generated_sources,
                 );
             } else {
-                build_tilelang_kernel(
+                staged.push(stage_tilelang_kernel(
                     &tl,
                     out_dir,
                     &sm90_targets,
                     cuda_path,
                     &spec,
-                    &mut generated_sources,
-                );
+                    &mut jobs,
+                ));
             }
         } else {
-            build_tilelang_kernel(
-                &tl,
-                out_dir,
-                sm_targets,
-                cuda_path,
-                &spec,
-                &mut generated_sources,
-            );
+            staged.push(stage_tilelang_kernel(
+                &tl, out_dir, sm_targets, cuda_path, &spec, &mut jobs,
+            ));
         }
+    }
+
+    let batch = run_tilelang_batch(&tl, cuda_path, out_dir, &jobs);
+    let jobs_by_key: std::collections::HashMap<String, RegenJob> =
+        jobs.into_iter().map(|j| (j.out_key.clone(), j)).collect();
+    for kernel in staged {
+        finalize_staged_kernel(kernel, &jobs_by_key, &batch, &mut generated_sources);
     }
 
     // Vendor the freshly-generated per-SM TileLang artifacts back into the
