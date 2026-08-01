@@ -13,7 +13,7 @@
 # codegen; nvcc 12.8 compiles the emitted .cu separately). torch pins its own
 # triton — don't re-pin it here.
 --extra-index-url https://download.pytorch.org/whl/cu129
-torch==2.12.1+cu129
+torch==2.13.0+cu129
 # apache-tvm-ffi==0.1.12 — pin carried as a comment, NOT resolver-installed:
 # tilelang 0.1.12's metadata declares apache-tvm-ffi<=0.1.11, so a single-pass
 # `pip install -r` with the pin live is ResolutionImpossible. Installers run
@@ -27,4 +27,4 @@ tilelang==0.1.12
 z3-solver==4.15.4
 
 # Model downloads in setup.sh use huggingface_hub.snapshot_download.
-huggingface_hub==1.21.0
+huggingface_hub==1.25.1
