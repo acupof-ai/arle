@@ -152,11 +152,11 @@ costs what decoding 1 costs. Spec decode is working; the intercept is the wall.
 `ARMED` but produces zero `cuGraph*` calls (its call site sits below an
 unconditional paged-KV early return).
 
-**`--qwen35-gdr-chunked true` (opt-in) is live as of 2026-08-02** for
+**`--qwen35-gdr-chunked` is DEFAULT-ON as of 2026-08-02** (`2e2ab667c`) for
 (Hg=16, H∈{32,48}), DK=DV=128: 33K cold prefill 28.95 → 21.63 s (−26%),
-greedy-64 identical
-([win](experience/wins/2026-08-02-flashqla-chunked-gdr-h48.md)). Default
-flip pending needle ladder ×3.
+needle ladder 9/9 exact both arms; stub builds and unknown geometries fall
+back to the recurrent scan via a runtime probe
+([win](experience/wins/2026-08-02-flashqla-chunked-gdr-h48.md)).
 
 ---
 

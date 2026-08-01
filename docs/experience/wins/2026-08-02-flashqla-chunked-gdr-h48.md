@@ -1,8 +1,11 @@
 # FlashQLA chunked GDR at H=48: 33K prefill −27% — 2026-08-02
 
-> Status: Shipped (`778fef873` parameterization, `5b851d193` compile fixes).
-> Flag stays **opt-in** (`--qwen35-gdr-chunked true`); default flip pending the
-> needle ladder ×3.
+> Status: Shipped and **DEFAULT-ON** (`778fef873` parameterization,
+> `5b851d193` compile fixes, `2e2ab667c` default flip + availability probe).
+> Flip license: needle ladder 1k/4k/8k ×3 both arms 9/9 exact +
+> deterministic; stub-build + default flags degrades silently (probe fallback
+> ×1, zero engine errors, 8k cold 5.1 s recurrent speed) while the real build
+> runs chunked by default (8k cold 3.6 s).
 
 ## Context
 
