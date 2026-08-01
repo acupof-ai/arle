@@ -351,7 +351,9 @@ fn run_lockstep_driver(
                         wire.max_tokens
                     );
                     let request_id = wire.request_id;
-                    let (prompt_tokens, max_tokens, sampling) = wire.submit_args();
+                    // Lockstep workers mirror rank-0 tokens; the grammar
+                    // constraint is applied once, on the rank that owns the matcher.
+                    let (prompt_tokens, max_tokens, sampling, _) = wire.submit_args();
                     engine.inject(request_id, prompt_tokens, max_tokens, sampling);
                 }
                 if !engine.is_idle() {
