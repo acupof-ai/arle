@@ -2768,7 +2768,6 @@ impl Qwen35Layer {
 pub struct Qwen35Model {
     config: Qwen35Config,
     tp: TpContext,
-    cp: crate::context_parallel::CpContext,
     lora: Option<LoraConfig>,
     lora_target_set: LoraTargetSet,
     lora_layer_start: Option<usize>,
@@ -2867,13 +2866,6 @@ impl Qwen35Model {
 
     pub fn set_gradient_checkpointing(&mut self, enabled: bool) {
         self.gradient_checkpointing = enabled;
-    }
-
-    /// Set the context-parallel group (sequence-shard axis). Known only after load
-    /// (from env at the launcher), so it's a setter, not a constructor arg. Default
-    /// `single()` = single-card, byte-identical.
-    pub fn set_cp(&mut self, cp: crate::context_parallel::CpContext) {
-        self.cp = cp;
     }
 
     /// The one checkpointing decision. Checkpointing trades a full forward
@@ -3658,7 +3650,6 @@ impl Qwen35Model {
         Ok(Self {
             config: cfg.clone(),
             tp,
-            cp: crate::context_parallel::CpContext::single(),
             lora,
             lora_target_set,
             lora_layer_start,
@@ -3806,8 +3797,15 @@ impl Qwen35Model {
         tape: &mut Tape,
     ) -> autograd::Result<TensorId> {
         let position_ids = (0..seq_len).collect::<Vec<_>>();
-        self.forward_batch_hidden_indices(store, tape, input_ids, &position_ids, batch)
-            .map_err(qwen35_to_autograd)
+        self.forward_batch_hidden_indices(
+            store,
+            tape,
+            input_ids,
+            &position_ids,
+            batch,
+            crate::context_parallel::CpContext::single(),
+        )
+        .map_err(qwen35_to_autograd)
     }
 
     pub fn forward_batch(
@@ -4063,8 +4061,14 @@ impl Qwen35Model {
         positions: &[usize],
         batch: usize,
     ) -> Result<TensorId> {
-        let hidden =
-            self.forward_batch_hidden_indices(store, tape, token_indices, positions, batch)?;
+        let hidden = self.forward_batch_hidden_indices(
+            store,
+            tape,
+            token_indices,
+            positions,
+            batch,
+            crate::context_parallel::CpContext::single(),
+        )?;
         linear_forward(hidden, self.lm_head, store, tape)
     }
 
@@ -4199,6 +4203,7 @@ impl Qwen35Model {
         token_indices: &[usize],
         positions: &[usize],
         batch: usize,
+        cp: crate::context_parallel::CpContext,
     ) -> Result<TensorId> {
         let seq_len = positions.len();
         if token_indices.len() != batch * seq_len {
@@ -4214,7 +4219,7 @@ impl Qwen35Model {
         // slice that built cos/sin above. Shared as `Arc<[usize]>` so the `'static`
         // checkpoint closure can capture it; `None` off-CP (contiguous, unused).
         let cp_positions: Option<Arc<[usize]>> =
-            self.cp.is_enabled().then(|| Arc::from(positions.to_vec()));
+            cp.is_enabled().then(|| Arc::from(positions.to_vec()));
 
         let mut hidden = embedding(self.embed_tokens, token_indices, store, tape)?;
         hidden = reshape(
@@ -4229,7 +4234,6 @@ impl Qwen35Model {
             let layers = Arc::new(self.layers.clone());
             let cfg = self.config.clone();
             let tp = self.tp;
-            let cp = self.cp;
             let (cos_id, sin_id) = (cos, sin);
 
             // Per-layer wall aggregation for ARLE_OPD_PROFILE=1 (this is the
@@ -4325,7 +4329,7 @@ impl Qwen35Model {
                     hidden,
                     &self.config,
                     self.tp,
-                    self.cp,
+                    cp,
                     cos,
                     sin,
                     cp_positions.as_deref(),
@@ -4569,6 +4573,7 @@ impl Qwen35Model {
         tape: &mut Tape,
         input_ids: &[u32],
         position_ids: &[u32],
+        cp: crate::context_parallel::CpContext,
     ) -> Result<TensorId> {
         if input_ids.len() != position_ids.len() {
             return Err(Qwen35Error::InputLenMismatch {
@@ -4586,7 +4591,7 @@ impl Qwen35Model {
             .iter()
             .map(|&id| id as usize)
             .collect::<Vec<_>>();
-        self.forward_batch_hidden_indices(store, tape, &token_indices, &positions, 1)
+        self.forward_batch_hidden_indices(store, tape, &token_indices, &positions, 1, cp)
     }
 
     /// OPD frozen-prompt-KV writeback forward: forward+backward ONLY the
@@ -4968,8 +4973,14 @@ impl Qwen35Model {
             .iter()
             .map(|&id| id as usize)
             .collect::<Vec<_>>();
-        let hidden =
-            self.forward_batch_hidden_indices(store, tape, &token_indices, &positions, 1)?;
+        let hidden = self.forward_batch_hidden_indices(
+            store,
+            tape,
+            &token_indices,
+            &positions,
+            1,
+            crate::context_parallel::CpContext::single(),
+        )?;
         self.logits_from_hidden_window(store, tape, hidden, window)
     }
 

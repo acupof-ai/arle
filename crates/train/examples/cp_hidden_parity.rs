@@ -123,11 +123,10 @@ fn rank_main(rank: usize) -> Result<()> {
     let backend = CudaBackend::new_with_nccl(device, unique_id, CP_SIZE, rank)
         .with_context(|| format!("rank {rank} CudaBackend::new_with_nccl device {device}"))?;
     let mut store = TensorStore::with_backend(std::sync::Arc::new(backend));
-    let mut model = build_model(&mut store)?;
-    model.set_cp(CpContext::from_mesh(1, CP_SIZE, rank));
+    let model = build_model(&mut store)?;
+    let cp = CpContext::from_mesh(1, CP_SIZE, rank);
 
     let full = full_tokens();
-    let cp = CpContext::from_mesh(1, CP_SIZE, rank);
     let shard = cp.shard(SEQ);
     let rows = shard.local_rows();
     let ids: Vec<u32> = rows.iter().map(|&r| full[r]).collect();
@@ -136,7 +135,7 @@ fn rank_main(rank: usize) -> Result<()> {
     let mut tape = Tape::new();
     tape.set_enabled(false);
     let hidden = model
-        .forward_hidden_states(&mut store, &mut tape, &ids, &pos)
+        .forward_hidden_states(&mut store, &mut tape, &ids, &pos, cp)
         .context("CP forward_hidden_states")?;
     let host = store.to_host(hidden)?; // [1, local_len, hidden]
     // Write "row0=..,row1=.." mapping global row -> flat hidden vector.
@@ -162,7 +161,7 @@ fn coordinator_main() -> Result<()> {
         let mut tape = Tape::new();
         tape.set_enabled(false);
         let h = model
-            .forward_hidden_states(&mut store, &mut tape, &full, &pos)
+            .forward_hidden_states(&mut store, &mut tape, &full, &pos, CpContext::single())
             .context("single-card forward_hidden_states")?;
         store.to_host(h)?
     };
@@ -179,7 +178,7 @@ fn coordinator_main() -> Result<()> {
         let mut tape = Tape::new();
         tape.set_enabled(false);
         let h = model
-            .forward_hidden_states(&mut store, &mut tape, &full, &pos)
+            .forward_hidden_states(&mut store, &mut tape, &full, &pos, CpContext::single())
             .context("CPU-f32 forward_hidden_states")?;
         let hidden = store.to_host(h)?;
         // lm_head weight [vocab, hidden] for the CE-from-hidden bisection below.
