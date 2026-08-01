@@ -434,6 +434,15 @@ pub fn linear_attention_core_cp(
     let b_proj = crate::ops::all_to_all(b_proj, 1, 2, store, tape)?;
     let a_proj = crate::ops::all_to_all(a_proj, 1, 2, store, tape)?;
 
+    // Zigzag+a2a interleaves the 2N seq blocks as [c0,c_{2N-1},c1,c_{2N-2},...];
+    // the recurrence needs true global order. `fwd` un-interleaves; `phys` (its
+    // inverse) restores the a2a layout before the output shuffle.
+    let (fwd, phys) = zigzag_block_perms(n);
+    let qkv = reorder_seq_blocks(qkv, &fwd, store, tape)?;
+    let z = reorder_seq_blocks(z, &fwd, store, tape)?;
+    let b_proj = reorder_seq_blocks(b_proj, &fwd, store, tape)?;
+    let a_proj = reorder_seq_blocks(a_proj, &fwd, store, tape)?;
+
     // Frozen weights sliced to this rank's head range. conv1d packs [q|k|v] on the
     // channel axis (same region surgery); dt_bias/a_log are per-value-head; norm is
     // per-value_dim (shared across heads → unsliced). Read-only slices — base
@@ -485,8 +494,56 @@ pub fn linear_attention_core_cp(
         store,
         tape,
     )?;
-    // [b, full_seq, v_dim/N] -> [b, local_seq, v_dim]: sequence shard restored.
+    // Global order -> a2a physical layout, then [b, full_seq, v_dim/N] ->
+    // [b, local_seq, v_dim]: sequence shard restored.
+    let out = reorder_seq_blocks(out, &phys, store, tape)?;
     crate::ops::all_to_all(out, 2, 1, store, tape)
+}
+
+/// Zigzag+a2a interleaves the `2N` equal seq blocks: rank `r` owns global chunks
+/// `r` and `2N-1-r` (in that local order), and a2a lays ranks out in order, so
+/// physical block `2r` = global chunk `r`, block `2r+1` = global chunk `2N-1-r`.
+/// Returns `(fwd, phys)`: `fwd[g]` = physical block holding global chunk `g`
+/// (un-interleave for the scan); `phys` = its inverse (re-interleave before the
+/// output a2a). Inverses by construction, checked in tests.
+fn zigzag_block_perms(n: usize) -> (Vec<usize>, Vec<usize>) {
+    let two_n = 2 * n;
+    let mut fwd = vec![0usize; two_n];
+    for r in 0..n {
+        fwd[r] = 2 * r; // global chunk r sits in physical block 2r
+        fwd[two_n - 1 - r] = 2 * r + 1; // global chunk 2N-1-r in block 2r+1
+    }
+    let mut phys = vec![0usize; two_n];
+    for (g, &p) in fwd.iter().enumerate() {
+        phys[p] = g;
+    }
+    (fwd, phys)
+}
+
+/// Permute the `perm.len()` equal blocks of `x`'s sequence axis (axis 1): output
+/// block `i` = input block `perm[i]`. Pure slice+cat, so backward reassembles the
+/// gradient blocks automatically. `full_seq % perm.len() == 0` is guaranteed by
+/// the zigzag pad.
+fn reorder_seq_blocks(
+    x: TensorId,
+    perm: &[usize],
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<TensorId> {
+    let shape = store.tensor(x)?.shape.clone();
+    let (full_seq, block) = (shape[1], shape[1] / perm.len());
+    let mut blocks = Vec::with_capacity(perm.len());
+    for &src in perm {
+        blocks.push(crate::ops::slice(
+            x,
+            &[0, src * block, 0],
+            &[shape[0], (src + 1) * block, shape[2]],
+            store,
+            tape,
+        )?);
+    }
+    debug_assert_eq!(full_seq, perm.len() * block);
+    crate::ops::cat(&blocks, 1, store, tape)
 }
 
 /// Slice the packed `[qkv_dim, conv_kernel]` conv weight to this cp rank's head
@@ -2472,4 +2529,36 @@ fn state_time_base(
     value_dim: usize,
 ) -> usize {
     (((batch * seq_len + seq) * heads + head) * key_dim) * value_dim
+}
+
+#[cfg(test)]
+mod cp_reorder_tests {
+    use super::zigzag_block_perms;
+
+    // Independent oracle: rebuild the a2a physical block layout straight from the
+    // zigzag rule (rank r owns global chunks r, 2N-1-r; a2a lays ranks in order),
+    // then check `fwd` un-interleaves it to 0..2N and `phys` is its inverse.
+    fn a2a_physical_to_global(n: usize) -> Vec<usize> {
+        let mut phys = Vec::new();
+        for r in 0..n {
+            phys.push(r);
+            phys.push(2 * n - 1 - r);
+        }
+        phys
+    }
+
+    #[test]
+    fn fwd_perm_restores_global_order_and_phys_inverts_it() {
+        for n in [1usize, 2, 4] {
+            let (fwd, phys) = zigzag_block_perms(n);
+            let physical = a2a_physical_to_global(n);
+            // Applying fwd to the physical layout yields ascending global chunks.
+            let restored: Vec<usize> = fwd.iter().map(|&p| physical[p]).collect();
+            assert_eq!(restored, (0..2 * n).collect::<Vec<_>>(), "fwd n={n}");
+            // phys ∘ fwd = identity.
+            for (p, &g) in fwd.iter().enumerate() {
+                assert_eq!(phys[g], p, "phys not inverse of fwd at n={n}");
+            }
+        }
+    }
 }
