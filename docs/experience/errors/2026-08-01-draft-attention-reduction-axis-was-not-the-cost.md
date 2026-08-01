@@ -33,34 +33,37 @@ End-to-end (`probe.sh`, block 16, 64 reqs): c=1 TPOT 9.19 → 9.04 ms, c=16
 confirms the reassociated softmax is numerically safe — it just does not pay.
 
 At 96 rows the grid is 32 heads × 96 = 3072 blocks; there is far more
-parallelism than needed to hide a per-key reduction. What is left is traffic,
-and the kernel forgoes all of it: **one block per (q_head, token) means each of
-the 8 q heads sharing a kv head re-reads that head's whole K and V window.** The
-key-major variant issues four 64-byte loads per warp where the dim-major one
-issued one 256-byte load for the same bytes, which cancels the reduction saving
-at high occupancy and loses at the middle row counts.
+parallelism than needed to hide a per-key reduction. The key-major variant also
+issues four 64-byte loads per warp where the dim-major one issued one 256-byte
+load for the same bytes, which cancels the reduction saving at high occupancy
+and loses at the middle row counts.
 
-The row scaling is the tell and it was in the data before the rewrite: 2.4 ms at
-12 rows → 28.9 ms at 96 rows is linear in rows, which is a bandwidth signature,
-not a latency one. Latency-bound work flattens as parallelism grows.
+The row scaling — 2.4 ms at 12 rows → 28.9 ms at 96 — says only that the kernel
+is *saturated*: past that point every bottleneck scales linearly. It does not
+name the unit, and the second hypothesis it suggested (GQA re-read of the K/V
+window) was also wrong. ncu on a pinned-shape standalone harness settled it:
+L2 hit rate 99.58% with L2 only 7.29% busy, so the re-read is free; the cost is
+**Compute (SM) 80.15% with the ALU pipeline at 61.9%** — a runtime-modulus IDIV
+per key per thread. Removing that IDIV won 33% in a pinned-shape microbench and
+still lost 2.7% in the serve — see
+[the second revert](2026-08-01-draft-attention-idiv-win-is-microbench-only.md).
 
 ## Fix
 
 Reverted (`aa4d2a6ec`). The change is a wash on the workload and a regression on
 part of it, so it does not earn its diff.
 
-The founded next attempt is GQA reuse: batch the `gqa_ratio` q heads sharing a
-kv head into one block so K/V is read once instead of eight times. That attacks
-the measured driver rather than the one that merely looked wrong on inspection.
 
 ## Rule
 
-**Read the scaling curve before rewriting the kernel.** A per-lap phase probe
-already emits time against row count; linear-in-work says bandwidth and flat-
-then-rising says latency, and that one plot picks the right rewrite. Naming an
+**ncu the shape that costs the time, before rewriting the kernel.** Naming an
 inefficiency from source inspection ("this reduction is obviously serial") is a
-hypothesis about the bottleneck, not a measurement of it — the same evidence bar
-that applies to a bug applies to a cost.
+hypothesis, and so is naming one from a scaling curve — a curve says the kernel
+is saturated, never which unit saturated. When the serve-side profile is
+confounded (ncu serializes launches, the batch collapses, the grid shrinks out
+of the costly regime), extract the kernel verbatim into a standalone `.cu` with
+the shape pinned from the model config. The same evidence bar that applies to a
+bug applies to a cost.
 
 **A matched A/B for a kernel needs a baseline binary from the same HEAD.** The
 pre-existing pod binary predated the phase instrumentation and had no comparable
