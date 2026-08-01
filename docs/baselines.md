@@ -148,10 +148,15 @@ costs what decoding 1 costs. Spec decode is working; the intercept is the wall.
   warm = turns 1–7. `total tok/s` = prompt+generated over wall: capacity, not
   latency.
 
-**Inert flags — do not cost these into a plan.** `--qwen35-decode-graph` prints
+**Inert flag — do not cost this into a plan.** `--qwen35-decode-graph` prints
 `ARMED` but produces zero `cuGraph*` calls (its call site sits below an
-unconditional paged-KV early return). `--qwen35-gdr-chunked` shape-guards on
-`local_linear_v_heads == 32`; this model has 48.
+unconditional paged-KV early return).
+
+**`--qwen35-gdr-chunked true` (opt-in) is live as of 2026-08-02** for
+(Hg=16, H∈{32,48}), DK=DV=128: 33K cold prefill 28.95 → 21.63 s (−26%),
+greedy-64 identical
+([win](experience/wins/2026-08-02-flashqla-chunked-gdr-h48.md)). Default
+flip pending needle ladder ×3.
 
 ---
 
