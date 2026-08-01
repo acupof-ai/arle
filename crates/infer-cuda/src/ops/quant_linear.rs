@@ -51,17 +51,36 @@ thread_local! {
         RefCell::new(QwenFp8DenseScratch::default());
 }
 
+/// Reusable Marlin W8A16 GEMM scratch: fp32-reduce `c_tmp` + int lock
+/// `workspace`. Both sizes depend only on the device SM count (constant), so
+/// they are allocated ONCE and never grow — the Qwen decode loop is CUDA-graph
+/// captured, and a per-call `cudaMalloc` would break capture (the FP8 paths use
+/// the same pre-alloc discipline). `workspace` is zeroed once at allocation
+/// (Marlin leaves the locks at 0 after each GEMM, so reuse is safe).
+#[derive(Default)]
+struct MarlinW8a16Scratch {
+    c_tmp: Option<CudaSlice<f32>>,
+    workspace: Option<CudaSlice<i32>>,
+}
+
+thread_local! {
+    static MARLIN_W8A16_SCRATCH: RefCell<MarlinW8a16Scratch> =
+        RefCell::new(MarlinW8a16Scratch::default());
+}
+
 // Qwen FP8 dense dispatch counters. Per-family split if/when more operator
 // families migrate to generated policy. fallback_count is derived (gemv +
 // dequant), not an independent atomic.
 static DEEPGEMM_HITS: AtomicU64 = AtomicU64::new(0);
 static GEMV_HITS: AtomicU64 = AtomicU64::new(0);
 static DEQUANT_GEMM_HITS: AtomicU64 = AtomicU64::new(0);
+static MARLIN_W8A16_HITS: AtomicU64 = AtomicU64::new(0);
 
 static FP8_IMPLEMENTATION_IDS: &[(&AtomicU64, &str)] = &[
     (&DEEPGEMM_HITS, "cuda.qwen.fp8_pack_deepgemm"),
     (&GEMV_HITS, "cuda.qwen.fp8_gemv"),
     (&DEQUANT_GEMM_HITS, "cuda.qwen.fp8_dequant_bf16_gemm"),
+    (&MARLIN_W8A16_HITS, "cuda.w8a16.marlin_tensorcore"),
 ];
 
 /// Cumulative operator dispatch stats for Qwen FP8 dense projection.
@@ -176,6 +195,34 @@ fn qwen_fp8_dense_sm_supports_deepgemm(ctx: &DeviceContext) -> bool {
             log::info!(
                 "Qwen FP8 dense DeepGEMM SM-gated OFF on sm_{major}{minor} (Hopper sm_90 \
                  required for wgmma); using dequant→BF16 GEMM / scalar GEMV fallback"
+            );
+        }
+        supports
+    })
+}
+
+/// W8A16 Marlin tensor-core GEMM is Ampere+ (`mma.sync.m16n8k16` + `cp.async`,
+/// gated `#if __CUDA_ARCH__ < 800` to no-op stubs in the vendored kernels). One
+/// binary runs sm_80..sm_120. Below sm_80 the shim returns NOT_SUPPORTED; cache
+/// the gate ONCE so decode dispatch avoids a per-step `cuDeviceGetAttribute`.
+/// When off, W8A16 keeps the dequant→BF16 GEMM (large M) / scalar GEMV (small M).
+fn w8a16_sm_supports_marlin(ctx: &DeviceContext) -> bool {
+    static SUPPORTS: OnceLock<bool> = OnceLock::new();
+    *SUPPORTS.get_or_init(|| {
+        // Bench A/B escape hatch: force the scalar/dequant path for a matched
+        // marlin-vs-scalar comparison on the same binary. Not a runtime knob.
+        if std::env::var_os("ARLE_W8A16_DISABLE_MARLIN").is_some() {
+            log::info!(
+                "W8A16 Marlin disabled via ARLE_W8A16_DISABLE_MARLIN — using scalar/dequant path"
+            );
+            return false;
+        }
+        let (major, _minor) = ctx.compute_capability();
+        let supports = major >= 8;
+        if !supports {
+            log::info!(
+                "W8A16 Marlin SM-gated OFF on sm_{major}x (Ampere sm_80+ required for \
+                 mma.sync tensor cores); using dequant→BF16 GEMM / scalar GEMV fallback"
             );
         }
         supports
@@ -535,6 +582,87 @@ fn try_fp8_dequant_bf16_gemm_batch(
     Ok(true)
 }
 
+/// W8A16 Marlin tensor-core GEMM (Ampere+): C[m,n] = X[m,k] @ dequant(W). Fires
+/// when the SM gate is on AND the weight was Marlin-repacked at load
+/// (`marlin_packed`/`marlin_scales` present, set by `repack_for_marlin_w8a16`).
+/// Supersedes both the scalar batched-GEMV (decode) and the dequant→cuBLAS
+/// fallback (prefill) — the win is tensor cores in decode, ~bf16 speed at INT8
+/// VRAM. Returns false (→ existing fallbacks) when off or not prepacked.
+fn try_w8a16_marlin_gemm_batch(
+    ctx: &DeviceContext,
+    weight: &DeviceMatrix,
+    x: &HiddenStates,
+    out: &mut HiddenStates,
+) -> Result<bool> {
+    if weight.weight_format != WeightFormat::W8A16 || !w8a16_sm_supports_marlin(ctx) {
+        return Ok(false);
+    }
+    let (Some(packed), Some(scales)) =
+        (weight.marlin_packed.as_ref(), weight.marlin_scales.as_ref())
+    else {
+        return Ok(false); // not repacked (unaligned shape) → fallback
+    };
+    let n = weight.rows; // output dim
+    let k = weight.cols; // contraction
+    let sms = ctx.sm_count() as i32;
+    let (packed_ptr, _gp) = packed.device_ptr(&ctx.stream);
+    let (scales_ptr, _gs) = scales.device_ptr(&ctx.stream);
+    let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
+    let stream = ctx.stream.cu_stream();
+    MARLIN_W8A16_SCRATCH.with(|cell| -> Result<()> {
+        let mut scratch = cell.borrow_mut();
+        // Allocate once at the SM-derived MAX (c_tmp caps at m=64; workspace is
+        // m-independent). Never grows → graph-capture safe. Zero the workspace at
+        // alloc; Marlin resets its locks to 0 after each GEMM, so reuse is safe.
+        if scratch.c_tmp.is_none() {
+            // SAFETY: pure size queries (arithmetic on sms), no device work.
+            let c_tmp_floats = unsafe { ffi::marlin_w8a16_c_tmp_floats(64, sms) } as usize;
+            // SAFETY: pure size query, no device work.
+            let ws_ints = unsafe { ffi::marlin_w8a16_workspace_ints(sms) } as usize;
+            scratch.c_tmp = Some(
+                ctx.stream
+                    .alloc_zeros::<f32>(c_tmp_floats)
+                    .map_err(|e| anyhow!("Marlin W8A16 c_tmp alloc failed: {e}"))?,
+            );
+            scratch.workspace = Some(
+                ctx.stream
+                    .alloc_zeros::<i32>(ws_ints)
+                    .map_err(|e| anyhow!("Marlin W8A16 workspace alloc failed: {e}"))?,
+            );
+        }
+        let c_tmp = scratch.c_tmp.as_ref().unwrap();
+        let workspace = scratch.workspace.as_ref().unwrap();
+        let (c_tmp_ptr, _gc) = c_tmp.device_ptr(&ctx.stream);
+        let (ws_ptr, _gw) = workspace.device_ptr(&ctx.stream);
+        qwen_quant_profile(ctx, "qwen/w8a16/marlin_gemm", x.seq_len, n, k, || {
+            // SAFETY: all ptrs from live device allocations; packed/scales sized by
+            // repack_for_marlin_w8a16 for these dims, x=[seq_len,k], out=[seq_len,n],
+            // c_tmp/workspace sized to the SM max above.
+            unsafe {
+                ffi::marlin_w8a16_gemm_cuda(
+                    x_ptr as *const ffi::Half,
+                    packed_ptr as *const u32,
+                    scales_ptr as *const ffi::Half,
+                    out_ptr as *mut ffi::Half,
+                    c_tmp_ptr as *mut f32,
+                    ws_ptr as *mut i32,
+                    x.seq_len as i32,
+                    n as i32,
+                    k as i32,
+                    weight.group_size as i32,
+                    stream,
+                )
+                .result()
+                .map_err(|e| anyhow!("W8A16 Marlin GEMM failed: {e}"))
+            }
+        })?;
+        Ok(())
+    })?;
+    MARLIN_W8A16_HITS.fetch_add(1, Ordering::Relaxed);
+    Ok(true)
+}
+
 /// W8A16 large-M (prefill) path: dequant INT8→BF16 once, then one cuBLAS BF16
 /// GEMM over all M rows. Mirrors `try_fp8_dequant_bf16_gemm_batch` — the scalar
 /// GEMV re-reads the weight per token (~20× slower at M=2048 and the cause of
@@ -655,6 +783,13 @@ pub(super) fn gemm_batch(
     // GEMV below). No-op on Hopper (returns false).
     if try_fp8_dequant_bf16_gemm_batch(ctx, weight, x, out)? {
         DEQUANT_GEMM_HITS.fetch_add(1, Ordering::Relaxed);
+        return Ok(());
+    }
+
+    // W8A16 tensor-core (Ampere+): Marlin GEMM when the weight was repacked at
+    // load. Supersedes both the dequant→cuBLAS prefill fallback and the scalar
+    // batched-GEMV below. Returns false on pre-sm_80 / unaligned (not repacked).
+    if try_w8a16_marlin_gemm_batch(ctx, weight, x, out)? {
         return Ok(());
     }
 

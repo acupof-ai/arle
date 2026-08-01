@@ -2725,7 +2725,7 @@ impl SafetensorLoader {
                 weight_shard.bytes.as_ref().len(),
             )
         };
-        DeviceMatrix::from_quantized_int8(
+        let mut matrix = DeviceMatrix::from_quantized_int8(
             ctx,
             qweight,
             scales_data,
@@ -2733,7 +2733,13 @@ impl SafetensorLoader {
             weight_shard.cols,
             group_size,
         )
-        .with_context(|| format!("upload W8A16 tensor {}", view.name))
+        .with_context(|| format!("upload W8A16 tensor {}", view.name))?;
+        // Build the Marlin tensor-core layout (Ampere+); no-op below sm_80 or on
+        // non-tile-aligned shapes → dispatch falls back to scalar/dequant.
+        matrix
+            .repack_for_marlin_w8a16(ctx)
+            .with_context(|| format!("Marlin W8A16 repack {}", view.name))?;
+        Ok(matrix)
     }
 
     fn shard_w4a16_scales_cow<'a>(
