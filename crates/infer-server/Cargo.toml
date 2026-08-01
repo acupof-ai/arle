@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+default = []
+# Compile the real xgrammar backend; without it `response_format` is rejected.
+grammar = ["xgrammar-sys/real"]
+
 [dependencies]
 anyhow = "1.0"
 axum = "0.8"
@@ -22,6 +27,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tokio-stream = "0.1"
 tokenizers = { workspace = true }
 uuid = { workspace = true }
+xgrammar-sys = { path = "../xgrammar-sys" }
 minijinja = { version = "2.20.0", features = ["json", "loop_controls"] }
 minijinja-contrib = { version = "2.20.0", features = ["pycompat"] }
 

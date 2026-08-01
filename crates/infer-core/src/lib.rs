@@ -113,6 +113,24 @@ impl Default for SchedulerConfig {
     }
 }
 
+/// Per-request next-token constraint. Called with `None` once at admit and with
+/// each committed token after; the returned bitmask (bit set = allowed) rides on
+/// the next step's `SamplingParams`. `None` = unconstrained from here on.
+///
+/// A callback rather than a matcher because the tokenizer lives above the
+/// engine — this keeps the grammar backend out of `infer-core` entirely.
+#[derive(Clone)]
+pub struct GrammarHook(pub std::sync::Arc<GrammarFn>);
+
+/// Committed token in, next-step bitmask out.
+pub type GrammarFn = dyn Fn(Option<u32>) -> Option<std::sync::Arc<[u32]>> + Send + Sync;
+
+impl std::fmt::Debug for GrammarHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("GrammarHook")
+    }
+}
+
 /// Options accepted at request ingress.
 #[derive(Debug, Clone, Default)]
 pub struct RequestOptions {
@@ -121,6 +139,7 @@ pub struct RequestOptions {
     pub cancelled: bool,
     /// Default: greedy / argmax.
     pub sampling: SamplingParams,
+    pub grammar: Option<GrammarHook>,
 }
 
 /// Completed request state retained after its slot has been freed.
@@ -291,6 +310,7 @@ struct RequestState {
     /// since then, so a just-resumed request runs a bit before it can be parked
     /// again — bounding ping-pong churn at num_slots=1.
     admit_gen_mark: usize,
+    grammar: Option<GrammarHook>,
 }
 
 impl RequestState {
@@ -316,7 +336,23 @@ impl RequestState {
             finish: None,
             admit_seq: 0,
             admit_gen_mark: 0,
+            grammar: None,
         }
+    }
+
+    fn with_grammar(mut self, grammar: Option<GrammarHook>) -> Self {
+        if let Some(g) = &grammar {
+            self.sampling.grammar_bitmask = (g.0)(None);
+        }
+        self.grammar = grammar;
+        self
+    }
+
+    fn advance_grammar(&mut self, token: u32) {
+        let Some(g) = self.grammar.clone() else {
+            return;
+        };
+        self.sampling.grammar_bitmask = (g.0)(Some(token));
     }
 
     fn complete_immediately(mut self, finish: FinishReason) -> Self {
@@ -964,13 +1000,16 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
             );
         }
 
-        NormalizedRequest::Waiting(RequestState::new(
-            handle,
-            prompt_tokens,
-            options.priority,
-            max_tokens,
-            sampling,
-        ))
+        NormalizedRequest::Waiting(
+            RequestState::new(
+                handle,
+                prompt_tokens,
+                options.priority,
+                max_tokens,
+                sampling,
+            )
+            .with_grammar(options.grammar),
+        )
     }
 
     fn enqueue_waiting_request(&mut self, request: RequestState, bias: WaitingInsertBias) {
@@ -1015,6 +1054,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                     .and_then(VecDeque::pop_front)
                 {
                     request.generated_tokens.push(token.token);
+                    request.advance_grammar(token.token);
                     if let Some(finish) =
                         finish_reason_for(request, &token, &self.model_stop_token_ids)
                     {
@@ -1068,6 +1108,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                     break;
                 }
                 request.generated_tokens.push(token.token);
+                request.advance_grammar(token.token);
                 let finished = finish_reason_for(request, &token, &self.model_stop_token_ids);
                 committed.push((request.handle, token));
                 token_idx += 1;
@@ -3105,6 +3146,51 @@ mod tests {
         StopTokenExecutor, TierMockExecutor, TokenBudgetGovernor, WarmupCountingExecutor,
     };
     use super::*;
+
+    /// The grammar hook must be pumped once at admit and once per committed
+    /// token, and its mask must reach the plan the executor samples from —
+    /// break any link and generation silently ignores the constraint.
+    #[test]
+    fn grammar_hook_pumps_at_admit_and_every_token() -> Result<()> {
+        use std::sync::{Arc, Mutex};
+        let seen: Arc<Mutex<Vec<Option<u32>>>> = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&seen);
+        let hook = GrammarHook(Arc::new(move |t| {
+            log.lock().unwrap().push(t);
+            Some(Arc::from([0xABCDu32].as_slice()))
+        }));
+
+        let mut engine = Engine::new(MockExecutor::ready(), MockKvPool::new(1), 1);
+        let handle = engine.submit_request_with_options(
+            vec![1, 2, 3],
+            3,
+            RequestOptions {
+                grammar: Some(hook),
+                ..RequestOptions::default()
+            },
+        );
+        engine.step()?;
+        let plan = engine.build_forward_plan();
+        if let Some(row) = plan.decode_rows.first() {
+            assert_eq!(
+                row.params.grammar_bitmask.as_deref(),
+                Some([0xABCDu32].as_slice()),
+                "the refreshed mask must ride the decode row"
+            );
+        }
+        engine.run_to_idle()?;
+        let generated = engine
+            .completed(handle)
+            .expect("completes")
+            .generated_tokens
+            .len();
+
+        let calls = seen.lock().unwrap();
+        assert_eq!(calls[0], None, "admit primes the opening mask");
+        assert_eq!(calls.len(), generated + 1);
+        assert!(calls[1..].iter().all(Option::is_some));
+        Ok(())
+    }
 
     #[test]
     fn degenerate_loop_tail_is_detected() {
