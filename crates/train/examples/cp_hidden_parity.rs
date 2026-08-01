@@ -77,7 +77,7 @@ fn tiny_cfg() -> Qwen35Config {
         partial_rotary_factor: 1.0,
         rotary_dim: 128,
         rope_cache_len_hint: Some(SEQ.next_power_of_two().max(16)),
-        layer_types: vec![LayerType::FullAttention, LayerType::FullAttention],
+        layer_types: vec![LayerType::LinearAttention, LayerType::FullAttention],
         num_experts: 0,
         num_experts_per_tok: 0,
         decoder_sparse_step: 1,
