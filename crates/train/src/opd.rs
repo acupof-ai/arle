@@ -2089,7 +2089,13 @@ fn backward_windowed_pure_kl_cached_student_hidden<T: TeacherForward + ?Sized>(
         format!("seq_len={}", rollout.len()),
     );
     let student_hidden = student
-        .forward_hidden_states(store, tape, rollout, positions)
+        .forward_hidden_states(
+            store,
+            tape,
+            rollout,
+            positions,
+            crate::context_parallel::CpContext::single(),
+        )
         .map_err(|err| map_qwen35_forward_error("student windowed KL hidden", err))?;
     log_opd_window_trace(
         "kl",
@@ -3174,11 +3180,11 @@ pub fn masked_writeback_step<O: Optimizer>(
         let shard_ids: Vec<u32> = rows.iter().map(|&r| full[r]).collect();
         let shard_pos: Vec<u32> = rows.iter().map(|&r| positions[r]).collect();
         student
-            .forward_hidden_states(store, &mut tape, &shard_ids, &shard_pos)
+            .forward_hidden_states(store, &mut tape, &shard_ids, &shard_pos, cp)
             .map_err(|err| map_qwen35_forward_error("masked writeback CP student hidden", err))?
     } else {
         student
-            .forward_hidden_states(store, &mut tape, &full, &positions)
+            .forward_hidden_states(store, &mut tape, &full, &positions, cp)
             .map_err(|err| map_qwen35_forward_error("masked writeback student hidden", err))?
     };
     let fwd_secs = t_fwd.elapsed().as_secs_f64();
@@ -3381,7 +3387,13 @@ pub fn capture_rollout_logprobs(
             })?
     } else {
         student
-            .forward_hidden_states(store, &mut tape, &full, &positions)
+            .forward_hidden_states(
+                store,
+                &mut tape,
+                &full,
+                &positions,
+                crate::context_parallel::CpContext::single(),
+            )
             .map_err(|err| map_qwen35_forward_error("rollout-logprob student hidden", err))?
     };
     let hidden_dim = *store
@@ -3559,7 +3571,13 @@ impl ValueCritic {
                 })?
         } else {
             student
-                .forward_hidden_states(store, &mut tape, &full, &positions)
+                .forward_hidden_states(
+                    store,
+                    &mut tape,
+                    &full,
+                    &positions,
+                    crate::context_parallel::CpContext::single(),
+                )
                 .map_err(|err| map_qwen35_forward_error("value-critic student hidden", err))?
         };
         let hidden_dim = *store
@@ -3875,7 +3893,13 @@ pub fn gkd_writeback_step<O: Optimizer, T: TeacherForward + ?Sized>(
     // student logits for each window are hidden[ws..we] @ lm_headᵀ (never the full
     // [seq, vocab]). The teacher scores the same window separately (frozen).
     let hidden = student
-        .forward_hidden_states(store, &mut tape, &full, &positions)
+        .forward_hidden_states(
+            store,
+            &mut tape,
+            &full,
+            &positions,
+            crate::context_parallel::CpContext::single(),
+        )
         .map_err(|err| map_qwen35_forward_error("GKD writeback student hidden", err))?;
     let hidden_dim = *store
         .get(hidden)
