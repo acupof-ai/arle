@@ -41,6 +41,7 @@ use infer_seam::{BackendExecutor, KvPool, PollResult};
 mod anthropic;
 mod coordinator;
 mod execution;
+mod grammar;
 mod metrics;
 pub mod multimodal;
 pub mod multiproc_relay;
@@ -392,7 +393,7 @@ where
         max_tokens: usize,
         sampling: SamplingParams,
     ) -> Result<RequestTicket> {
-        self.do_submit(prompt, max_tokens, sampling, None)
+        self.do_submit(prompt, max_tokens, sampling, None, None)
     }
 
     pub fn submit_streaming(
@@ -402,7 +403,20 @@ where
         sampling: SamplingParams,
     ) -> Result<(RequestTicket, Receiver<StreamItem>)> {
         let (stream_tx, stream_rx) = mpsc::channel::<StreamItem>();
-        let ticket = self.do_submit(prompt, max_tokens, sampling, Some(stream_tx))?;
+        let ticket = self.do_submit(prompt, max_tokens, sampling, Some(stream_tx), None)?;
+        Ok((ticket, stream_rx))
+    }
+
+    /// `submit_streaming` with a per-request next-token constraint.
+    pub fn submit_streaming_constrained(
+        &self,
+        prompt: Vec<u32>,
+        max_tokens: usize,
+        sampling: SamplingParams,
+        grammar: Option<infer_core::GrammarHook>,
+    ) -> Result<(RequestTicket, Receiver<StreamItem>)> {
+        let (stream_tx, stream_rx) = mpsc::channel::<StreamItem>();
+        let ticket = self.do_submit(prompt, max_tokens, sampling, Some(stream_tx), grammar)?;
         Ok((ticket, stream_rx))
     }
 
@@ -412,6 +426,7 @@ where
         max_tokens: usize,
         sampling: SamplingParams,
         stream_tx: Option<mpsc::Sender<StreamItem>>,
+        grammar: Option<infer_core::GrammarHook>,
     ) -> Result<RequestTicket> {
         let mode = if stream_tx.is_some() {
             "streaming"
@@ -433,6 +448,7 @@ where
                 handle_tx,
                 completion_tx,
                 stream_tx,
+                grammar,
             })
             .is_err()
         {
@@ -712,9 +728,15 @@ where
         }
         None => (None, None),
     };
+    let grammars = grammar::GrammarCache::new(&tokenizer)
+        .map(std::sync::Arc::new)
+        .map_err(|e| log::warn!("structured output unavailable: {e}"))
+        .ok();
     std::thread::Builder::new()
         .name("arle-local-relay-driver".to_string())
-        .spawn(move || serve_handle_relay_driver(serve, engine_recv, engine_tx, multimodal_rx))
+        .spawn(move || {
+            serve_handle_relay_driver(serve, engine_recv, engine_tx, multimodal_rx, grammars)
+        })
         .expect("spawn arle-local-relay-driver");
 
     coordinator::coordinator_router(
@@ -763,6 +785,7 @@ fn serve_handle_relay_driver<E, K>(
     mut engine_recv: multiproc_relay::LocalChannelRecv,
     engine_tx: std::sync::mpsc::SyncSender<multiproc_relay::RelayEnvelope>,
     multimodal_rx: Option<LocalMultimodalRx>,
+    grammars: Option<std::sync::Arc<grammar::GrammarCache>>,
 ) where
     E: infer_seam::BackendExecutor + 'static,
     K: infer_seam::KvPool + 'static,
@@ -868,8 +891,28 @@ fn serve_handle_relay_driver<E, K>(
                         RelayEnvelope::TickAdmissions { requests, .. } => {
                             for wire in requests {
                                 let request_id = wire.request_id;
-                                let (prompt_tokens, max_tokens, sampling) = wire.submit_args();
-                                match serve.submit_streaming(prompt_tokens, max_tokens, sampling) {
+                                let (prompt_tokens, max_tokens, sampling, format) =
+                                    wire.submit_args();
+                                let hook = match grammar::resolve(grammars.as_deref(), format) {
+                                    Ok(hook) => hook,
+                                    Err(e) => {
+                                        let _ = engine_tx.send(RelayEnvelope::Completion {
+                                            request_id,
+                                            delta: multiproc_relay::RelayCompletionDelta {
+                                                finish: true,
+                                                error: Some(e.to_string()),
+                                                ..Default::default()
+                                            },
+                                        });
+                                        continue;
+                                    }
+                                };
+                                match serve.submit_streaming_constrained(
+                                    prompt_tokens,
+                                    max_tokens,
+                                    sampling,
+                                    hook,
+                                ) {
                                     Ok((ticket, rx)) => {
                                         // Insert BEFORE handing to a worker so the
                                         // worker's remove-at-stream-end can never
@@ -1224,7 +1267,7 @@ mod tests {
         {
             let serve = Arc::clone(&serve);
             std::thread::spawn(move || {
-                serve_handle_relay_driver(serve, engine_recv, engine_tx, None)
+                serve_handle_relay_driver(serve, engine_recv, engine_tx, None, None)
             });
         }
 
@@ -1237,6 +1280,7 @@ mod tests {
                 prompt_tokens: vec![1, 2, 3],
                 max_tokens: 4,
                 sampling: SamplingParams::default(),
+                response_format: None,
             }],
         })?;
         for seq in 1..=5 {

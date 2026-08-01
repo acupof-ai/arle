@@ -118,6 +118,18 @@ impl OpenAiTokenizer {
     }
 
     /// Decode token ids into text, skipping special tokens.
+    /// Vocabulary indexed by token id, for grammar-compiler construction.
+    /// Holes (ids the vocab map skips) come back empty.
+    pub fn vocab_by_id(&self) -> Vec<String> {
+        let map = self.inner.get_vocab(true);
+        let mut out =
+            vec![String::new(); map.values().copied().max().map_or(0, |m| m as usize + 1)];
+        for (tok, id) in map {
+            out[id as usize] = tok;
+        }
+        out
+    }
+
     pub fn decode(&self, token_ids: &[u32]) -> Result<String> {
         self.inner
             .decode(token_ids, true)

@@ -106,6 +106,7 @@ pub(crate) struct Submission {
     /// Live token stream for this request: `None` for blocking `submit`, `Some`
     /// for `submit_streaming`.
     pub(crate) stream_tx: Option<Sender<StreamItem>>,
+    pub(crate) grammar: Option<infer_core::GrammarHook>,
 }
 
 /// The engine thread body: own the engine, drain submits, step, deliver.
@@ -268,6 +269,9 @@ fn engine_loop_with_tick_broadcaster<E, K>(
                     prompt_tokens: submission.prompt.clone(),
                     max_tokens: submission.max_tokens,
                     sampling: submission.sampling.clone(),
+                    // Workers mirror rank-0 tokens; the constraint is applied
+                    // once, on the rank that owns the matcher.
+                    response_format: None,
                 })
                 .collect();
             if let Some(broadcast_tick) = tick_broadcast
@@ -405,6 +409,7 @@ fn admit_submission<E, K>(
         submission.max_tokens,
         RequestOptions {
             sampling: submission.sampling,
+            grammar: submission.grammar,
             ..RequestOptions::default()
         },
     );
@@ -524,6 +529,7 @@ mod tests {
             handle_tx,
             completion_tx,
             stream_tx: None,
+            grammar: None,
         })?;
         control_tx
             .send(Box::new(|engine| {
@@ -569,6 +575,7 @@ mod tests {
             handle_tx,
             completion_tx,
             stream_tx: None,
+            grammar: None,
         })?;
         drop(submit_tx);
 

@@ -580,14 +580,29 @@ pub struct WireRequest {
     pub max_tokens: usize,
     /// Sampling parameters (rewrite [`SamplingParams`]).
     pub sampling: SamplingParams,
+    /// Structured-output constraint, resolved into a matcher engine-side.
+    #[serde(default)]
+    pub response_format: Option<crate::grammar::ResponseFormat>,
 }
 
 impl WireRequest {
     /// Reconstruct the `(prompt, max_tokens, sampling)` triple the rewrite
     /// [`crate::ServeHandle::submit`] consumes.
     #[must_use]
-    pub fn submit_args(self) -> (Vec<u32>, usize, SamplingParams) {
-        (self.prompt_tokens, self.max_tokens, self.sampling)
+    pub fn submit_args(
+        self,
+    ) -> (
+        Vec<u32>,
+        usize,
+        SamplingParams,
+        Option<crate::grammar::ResponseFormat>,
+    ) {
+        (
+            self.prompt_tokens,
+            self.max_tokens,
+            self.sampling,
+            self.response_format,
+        )
     }
 }
 
@@ -1363,6 +1378,7 @@ mod tests {
                 prompt_tokens: vec![1, 2, 3, 4],
                 max_tokens: 16,
                 sampling: SamplingParams::default(),
+                response_format: None,
             }],
         };
         let bytes = serde_json::to_vec(&env).unwrap();
@@ -1476,6 +1492,7 @@ mod tests {
                     prompt_tokens: vec![100, 200],
                     max_tokens: 1,
                     sampling: SamplingParams::default(),
+                    response_format: None,
                 }],
             })
             .unwrap();
@@ -1528,6 +1545,7 @@ mod tests {
                         prompt_tokens: vec![9],
                         max_tokens: 1,
                         sampling: SamplingParams::default(),
+                        response_format: None,
                     }],
                 },
             )
@@ -1586,6 +1604,7 @@ mod tests {
                         prompt_tokens: vec![11],
                         max_tokens: 1,
                         sampling: SamplingParams::default(),
+                        response_format: None,
                     }],
                 },
             )

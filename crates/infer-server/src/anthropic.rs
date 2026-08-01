@@ -237,6 +237,7 @@ impl MessagesRequest {
             stop: (!self.stop_sequences.is_empty()).then(|| self.stop_sequences.clone()),
             chat_template_kwargs: None,
             tools: self.tools.iter().map(to_openai_tool).collect(),
+            response_format: None,
             tool_choice: self.tool_choice.as_ref().map(to_openai_tool_choice),
         }
     }

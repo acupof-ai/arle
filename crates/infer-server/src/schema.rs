@@ -166,6 +166,10 @@ pub struct CompletionRequest {
     #[serde(default, deserialize_with = "deserialize_stop")]
     pub stop: Option<Vec<String>>,
     pub return_token_ids: Option<bool>,
+    /// OpenAI structured output. `json_schema` constrains generation to the
+    /// schema; `json_object` to any valid JSON.
+    #[serde(default)]
+    pub response_format: Option<crate::grammar::ResponseFormat>,
 }
 
 impl CompletionRequest {
@@ -233,6 +237,10 @@ pub struct ChatCompletionRequest {
     /// [`chat::ToolChoiceMode`] via [`Self::tool_choice_mode`].
     #[serde(default)]
     pub tool_choice: Option<serde_json::Value>,
+    /// OpenAI structured output. `json_schema` constrains generation to the
+    /// schema; `json_object` to any valid JSON.
+    #[serde(default)]
+    pub response_format: Option<crate::grammar::ResponseFormat>,
 }
 
 impl ChatCompletionRequest {

@@ -549,6 +549,7 @@ fn streaming_submit(
     prompt_tokens: Vec<u32>,
     max_tokens: usize,
     sampling: SamplingParams,
+    response_format: Option<crate::grammar::ResponseFormat>,
 ) -> Result<
     (
         tokio::sync::mpsc::UnboundedReceiver<RelayCompletionDelta>,
@@ -576,6 +577,7 @@ fn streaming_submit(
             prompt_tokens,
             max_tokens,
             sampling,
+            response_format,
         }))
         .map_err(|_| ApiError::internal("coordinator lockstep loop closed; cannot submit"))?;
     Ok((rx, guard))
@@ -586,9 +588,11 @@ async fn submit_and_collect(
     prompt_tokens: Vec<u32>,
     max_tokens: usize,
     sampling: SamplingParams,
+    response_format: Option<crate::grammar::ResponseFormat>,
 ) -> Result<CollectedGeneration, ApiError> {
     let prompt_len = prompt_tokens.len();
-    let (mut rx, _guard) = streaming_submit(state, prompt_tokens, max_tokens, sampling)?;
+    let (mut rx, _guard) =
+        streaming_submit(state, prompt_tokens, max_tokens, sampling, response_format)?;
     let mut generated_tokens: Vec<u32> = Vec::new();
     let mut gen_logprobs: Vec<f32> = Vec::new();
     let mut finish: Option<FinishReason> = None;
@@ -691,7 +695,13 @@ async fn completions(
 
     if request.stream.unwrap_or(false) {
         let prompt_len = prompt_tokens.len();
-        let (mut rx, guard) = streaming_submit(&state, prompt_tokens, max_tokens, sampling)?;
+        let (mut rx, guard) = streaming_submit(
+            &state,
+            prompt_tokens,
+            max_tokens,
+            sampling,
+            request.response_format.clone(),
+        )?;
         let id = format!("cmpl-{}", Uuid::new_v4().simple());
         let created = unix_time_secs();
         let model = state.model.clone();
@@ -780,7 +790,14 @@ async fn completions(
 
     let return_token_ids = request.return_token_ids.unwrap_or(false);
     let prompt_token_ids = return_token_ids.then(|| prompt_tokens.clone());
-    let outcome = submit_and_collect(&state, prompt_tokens, max_tokens, sampling).await?;
+    let outcome = submit_and_collect(
+        &state,
+        prompt_tokens,
+        max_tokens,
+        sampling,
+        request.response_format.clone(),
+    )
+    .await?;
     let text = decode(&state, &outcome.generated_tokens)?;
     Ok(Json(CompletionResponse::from_parts(
         state.model.clone(),
@@ -914,7 +931,13 @@ async fn chat_completions(
 
     if stream {
         let prompt_len = prompt_tokens.len();
-        let (mut rx, guard) = streaming_submit(&state, prompt_tokens, max_tokens, sampling)?;
+        let (mut rx, guard) = streaming_submit(
+            &state,
+            prompt_tokens,
+            max_tokens,
+            sampling,
+            request.response_format.clone(),
+        )?;
         let id = format!("chatcmpl-{}", Uuid::new_v4().simple());
         let created = unix_time_secs();
         let model = state.model.clone();
@@ -1070,7 +1093,14 @@ async fn chat_completions(
             .into_response());
     }
 
-    let outcome = submit_and_collect(&state, prompt_tokens, max_tokens, sampling).await?;
+    let outcome = submit_and_collect(
+        &state,
+        prompt_tokens,
+        max_tokens,
+        sampling,
+        request.response_format.clone(),
+    )
+    .await?;
     let decoded = decode(&state, &outcome.generated_tokens)?;
     let (content, tool_calls, split_thinking) =
         finalize_chat_content(decoded, tools_active, thinking);
@@ -1160,7 +1190,7 @@ async fn anthropic_messages(
     if request.stream.unwrap_or(false) {
         // Token sidecar rides the dump: carry the rendered prompt into the task.
         let mut sidecar = dump_path.map(|path| (path, prompt_tokens.clone()));
-        let (mut rx, guard) = streaming_submit(&state, prompt_tokens, max_tokens, sampling)?;
+        let (mut rx, guard) = streaming_submit(&state, prompt_tokens, max_tokens, sampling, None)?;
         let state_clone = Arc::clone(&state);
         // Bounded channel: backpressure keeps the task from racing too far ahead.
         let (chunk_tx, chunk_rx) =
@@ -1266,7 +1296,7 @@ async fn anthropic_messages(
     }
 
     let sidecar_prompt = dump_path.as_ref().map(|_| prompt_tokens.clone());
-    let outcome = submit_and_collect(&state, prompt_tokens, max_tokens, sampling).await?;
+    let outcome = submit_and_collect(&state, prompt_tokens, max_tokens, sampling, None).await?;
     if let (Some(path), Some(prompt)) = (dump_path, sidecar_prompt) {
         write_tokens_sidecar(
             &path,
@@ -1410,6 +1440,7 @@ mod tests {
                     prompt_tokens: vec![1],
                     max_tokens: 1,
                     sampling: SamplingParams::default(),
+                    response_format: None,
                 }],
             })
             .unwrap();
