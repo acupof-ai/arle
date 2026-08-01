@@ -487,8 +487,8 @@ impl UpdatePreset {
                     &traj.response_mask,
                     vocab,
                     window,
-                    crate::context_parallel::CpContext::single(),
-                    crate::context_parallel::DpContext::single(),
+                    crate::context_parallel::CpContext::from_env(),
+                    crate::context_parallel::DpContext::from_env(),
                     store,
                 )?;
                 stats.merge(traj_stats);
@@ -775,8 +775,8 @@ fn update_ce<O: Optimizer>(
             &traj.response_mask,
             vocab,
             window,
-            crate::context_parallel::CpContext::single(),
-            crate::context_parallel::DpContext::single(),
+            crate::context_parallel::CpContext::from_env(),
+            crate::context_parallel::DpContext::from_env(),
             store,
         )?;
         tokens += traj.response_mask.iter().filter(|&&m| m == 1).count();
