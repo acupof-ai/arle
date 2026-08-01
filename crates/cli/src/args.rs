@@ -881,8 +881,9 @@ pub(crate) struct ServeArgs {
     #[arg(long, default_value_t = 1024)]
     pub(crate) qwen35_deepgemm_min_routes: usize,
 
-    /// FlashQLA chunked GDN prefill (sm_90a baked Qwen3.6 shard only).
-    #[arg(long, default_value_t = false, action = clap::ArgAction::Set, value_name = "BOOL")]
+    /// FlashQLA chunked GDN prefill (sm_90, per-geometry AOT instantiations;
+    /// runtime-probes kernel availability and falls back to the recurrent scan).
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set, value_name = "BOOL")]
     pub(crate) qwen35_gdr_chunked: bool,
 
     /// Fast page-16 decode-metadata kernel path.
