@@ -50,9 +50,17 @@ STATE_DTYPE = "float32"
 
 PASS_CONFIGS = {
     # Upstream sets TL_ENABLE_FAST_MATH on kkt + fused fwd (exp2-heavy).
+    # TMA lowering stays off: it adds host-built descriptor params the AOT C
+    # wrapper cannot construct (tilelang 0.1.11 surfaces them as `*_desc`).
     "fq_cumsum": {},
-    "fq_kkt": {tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True},
-    "fq_fwd": {tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True},
+    "fq_kkt": {
+        tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
+        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+    },
+    "fq_fwd": {
+        tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
+        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+    },
 }
 
 
@@ -387,6 +395,7 @@ def _fq_fwd_kernel(h, hg):
         ):
             bbh, bv = bbhv // T.ceildiv(DV, block_DV), bbhv % T.ceildiv(DV, block_DV)
             bb, bh = bbh // H, bbh % H
+            bhg = bh // (H // Hg)
 
             batch_idx = bb
 
