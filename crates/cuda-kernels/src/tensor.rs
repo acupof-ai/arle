@@ -3497,6 +3497,127 @@ impl DeviceMatrix {
         Ok(())
     }
 
+    /// Build the Marlin tensor-core layout for a W8A16 weight: re-encode signed
+    /// INT8 → uint8b128 (+128), pack to GPTQ `[K/4, N]` i32, GPU-repack to Marlin
+    /// tiles, and transpose+permute the BF16 group scales to `[K/gs, N]` (Marlin's
+    /// length-64 `scale_perm`). Stores into `marlin_packed`/`marlin_scales`; the
+    /// GEMM (`marlin_w8a16_gemm_cuda`) consumes them, scales stay BF16 (matches the
+    /// bf16 kernel). No-op (leaves marlin_* None → scalar fallback) when the shape
+    /// isn't Marlin tile-aligned. SM-gated by the caller (Ampere+).
+    pub fn repack_for_marlin_w8a16(&mut self, ctx: &DeviceContext) -> Result<()> {
+        if self.weight_format != WeightFormat::W8A16
+            || self.qweight.is_none()
+            || self.qscales.is_none()
+            || self.group_size == 0
+        {
+            return Ok(());
+        }
+        // Ampere+ only (Marlin uses mma.sync/cp.async). Below sm_80 leave marlin_*
+        // None so dispatch keeps the dequant→BF16 / scalar path — the shim would
+        // otherwise return NOT_SUPPORTED and fail the load.
+        if ctx.compute_capability().0 < 8 {
+            return Ok(());
+        }
+        let n = self.rows; // output dim
+        let k = self.cols; // input dim
+        // Marlin tiles: K%tile_k(16)==0, N%tile_n(64)==0; GEMM: K%group_size==0.
+        if !k.is_multiple_of(16) || !n.is_multiple_of(64) || !k.is_multiple_of(self.group_size) {
+            log::warn!(
+                "Marlin W8A16 repack skipped: [{n}x{k}] gs={} not tile/group-aligned \
+                 (need K%16==0, N%64==0, K%gs==0); using scalar path",
+                self.group_size
+            );
+            return Ok(());
+        }
+
+        // Step 1: signed INT8 [N, K] row-major → uint8b128 GPTQ [K/4, N] i32.
+        // element (n,k): u8 = int8+128, packed 4-per-word at bits (k%4)*8.
+        let qw = self.qweight.as_ref().unwrap();
+        let weight_host: Vec<i8> = ctx
+            .stream
+            .clone_dtoh(qw)
+            .map_err(|e| anyhow!("D2H W8A16 qweight: {}", e))?;
+        let gptq_rows = k / 4;
+        let mut gptq = vec![0u32; gptq_rows * n];
+        for row_n in 0..n {
+            for col_k in 0..k {
+                let u8v = (i16::from(weight_host[row_n * k + col_k]) + 128) as u32 & 0xFF;
+                let gptq_row = col_k / 4;
+                let bit_pos = (col_k % 4) * 8;
+                gptq[gptq_row * n + row_n] |= u8v << bit_pos;
+            }
+        }
+        // SAFETY: views the live `Vec<u32>` as its byte representation (u8 align 1,
+        // len*4 bytes); `gptq` outlives the borrow.
+        let gptq_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(gptq.as_ptr().cast::<u8>(), gptq.len() * 4) };
+        let gptq_gpu: CudaSlice<u8> = ctx
+            .stream
+            .clone_htod(gptq_bytes)
+            .map_err(|e| anyhow!("H2D W8A16 GPTQ: {}", e))?;
+
+        // Marlin output: [K/16, N*4] i32 = K*N/4 i32 = K*N bytes.
+        let mut marlin_gpu: CudaSlice<u8> = ctx
+            .stream
+            .alloc_zeros(k * n)
+            .map_err(|e| anyhow!("Alloc W8A16 Marlin: {}", e))?;
+
+        // Step 2: GPTQ → Marlin tile layout on GPU.
+        {
+            let (gptq_ptr, _g1) = gptq_gpu.device_ptr(&ctx.stream);
+            let (marlin_ptr, _g2) = marlin_gpu.device_ptr_mut(&ctx.stream);
+            // SAFETY: both from live CudaSlices pinned by the guards; K*N-byte
+            // input / output verified tile-aligned above, stream-ordered.
+            unsafe {
+                ffi::marlin_gptq_repack_w8a16_cuda(
+                    gptq_ptr as *const u32,
+                    marlin_ptr as *mut u32,
+                    k as i32,
+                    n as i32,
+                    ctx.stream.cu_stream(),
+                )
+                .result()
+                .map_err(|e| anyhow!("W8A16 Marlin repack failed: {:?}", e))?;
+            }
+        }
+
+        // Step 3: scales [N, K/gs] bf16 → transpose to [K/gs, N] → Marlin permute.
+        // scale_perm is an 8×8 transpose within each 64-column block:
+        //   perm[out] = (out%8)*8 + (out/8)   (vLLM get_scale_perms, len 64).
+        // Kept BF16 (the bf16 GEMM reinterprets scales as scalar_t2).
+        let qs = self.qscales.as_ref().unwrap();
+        let scales_host: Vec<bf16> = ctx
+            .stream
+            .clone_dtoh(qs)
+            .map_err(|e| anyhow!("D2H W8A16 scales: {}", e))?;
+        let num_groups = k / self.group_size;
+        let mut scales_t = vec![bf16::from_f32(0.0); num_groups * n];
+        for row_n in 0..n {
+            for g in 0..num_groups {
+                scales_t[g * n + row_n] = scales_host[row_n * num_groups + g];
+            }
+        }
+        // Permute within each 64-block of the flattened [num_groups, N] array
+        // (N%64==0 → blocks align to N-column runs).
+        let mut scales_perm = vec![0u16; num_groups * n];
+        for block in 0..(num_groups * n / 64) {
+            let base = block * 64;
+            for out in 0..64 {
+                let src = (out % 8) * 8 + (out / 8);
+                scales_perm[base + out] = scales_t[base + src].to_bits();
+            }
+        }
+        let scales_gpu: CudaSlice<u16> = ctx
+            .stream
+            .clone_htod(&scales_perm)
+            .map_err(|e| anyhow!("H2D W8A16 Marlin scales: {}", e))?;
+
+        self.marlin_packed = Some(marlin_gpu);
+        self.marlin_scales = Some(scales_gpu);
+
+        Ok(())
+    }
+
     pub fn from_safetensors(
         ctx: &DeviceContext,
         data: &[u8],
