@@ -321,6 +321,18 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    /// W8A16 INT8 weight → BF16 via per-row per-column-group scale. Prefill
+    /// path: dequant once, then one cuBLAS BF16 GEMM over all M rows.
+    pub fn dequantize_w8a16_to_bf16_cuda(
+        weight: *const i8,
+        scales: *const Half,
+        output: *mut Half,
+        n: i32,
+        k: i32,
+        group_size: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn gemv_fp4_e2m1_group_cuda(
         weight: *const u8,
         scales: *const u8,

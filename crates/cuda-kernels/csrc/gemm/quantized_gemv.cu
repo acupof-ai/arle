@@ -143,6 +143,48 @@ extern "C" cudaError_t dequantize_fp8_block_scaled_to_bf16_cuda(
     return cudaGetLastError();
 }
 
+// W8A16 dequant: INT8 weight [N, K] × per-row per-column-group BF16 scale
+// [N, K/group_size] → BF16 [N, K]. Prefill path — dequant once (N*K), then one
+// cuBLAS BF16 GEMM over all M rows, instead of re-reading weight per token via
+// the scalar GEMV (the latter is why W8A16 TTFT was ~6x FP8's).
+__global__ void dequantize_w8a16_to_bf16_kernel(
+    const int8_t* __restrict__ weight,
+    const __nv_bfloat16* __restrict__ scales,
+    __nv_bfloat16* __restrict__ output,
+    int N,
+    int K,
+    int group_size)
+{
+    const long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    const long total = (long)N * K;
+    if (idx >= total) return;
+    const int row = (int)(idx / K);
+    const int col = (int)(idx % K);
+    const int num_groups = K / group_size;
+    const float scale = __bfloat162float(scales[row * num_groups + col / group_size]);
+    output[idx] = __float2bfloat16((float)weight[idx] * scale);
+}
+
+extern "C" cudaError_t dequantize_w8a16_to_bf16_cuda(
+    const int8_t* weight,
+    const __nv_bfloat16* scales,
+    __nv_bfloat16* output,
+    int N,
+    int K,
+    int group_size,
+    cudaStream_t stream)
+{
+    if (N <= 0 || K <= 0 || group_size <= 0 || K % group_size != 0) {
+        return cudaErrorInvalidValue;
+    }
+    const long total = (long)N * K;
+    const int threads = 256;
+    const long blocks = (total + threads - 1) / threads;
+    dequantize_w8a16_to_bf16_kernel<<<(unsigned int)blocks, threads, 0, stream>>>(
+        weight, scales, output, N, K, group_size);
+    return cudaGetLastError();
+}
+
 __device__ __forceinline__ float fp8_f32_dot16(
     const uint8_t* __restrict__ weight,
     const __nv_bfloat16* __restrict__ x)
@@ -1091,6 +1133,82 @@ __global__ void dsv4_fp4_route_gemv_batch_kernel(
             total += smem[row_in_block * warps_per_row + w];
         if (apply_route_weight) total *= dsv4_route_weight(route_meta, route);
         output[route * N + row] = __float2bfloat16(total);
+    }
+}
+
+// Batched W8A16 GEMM: B_TILE inputs share one weight read (vs B separate GEMVs
+// re-reading weight B times). Each thread holds B_TILE accumulators; weight is
+// loaded once per K-step and multiplied against B_TILE input vectors. Mirrors
+// w4a16_gemm_batch_kernel but reads INT8 directly (4 weights per uint32, no
+// nibble unpack) — this is the multi-request decode path (B>=2).
+#define W8A16_GEMM_BTILE 4
+__global__ void w8a16_gemm_batch_kernel(
+    const uint8_t* __restrict__ weight,
+    const __nv_bfloat16* __restrict__ scales,
+    const __nv_bfloat16* __restrict__ input,
+    __nv_bfloat16* __restrict__ output,
+    int B, int N, int K, int group_size)
+{
+    int row = blockIdx.x * GEMV_ROWS + threadIdx.x / (GEMV_THREADS / GEMV_ROWS);
+    int batch_base = blockIdx.y * W8A16_GEMM_BTILE;
+    int tid_in_row = threadIdx.x % (GEMV_THREADS / GEMV_ROWS);
+    int threads_per_row = GEMV_THREADS / GEMV_ROWS;
+    int lane_id = threadIdx.x % WARP_SIZE;
+    int row_in_block = threadIdx.x / threads_per_row;
+
+    if (row >= N) return;
+
+    float sum[W8A16_GEMM_BTILE];
+    #pragma unroll
+    for (int b = 0; b < W8A16_GEMM_BTILE; b++) sum[b] = 0.0f;
+
+    int num_groups = K / group_size;
+    int valid_b = min(W8A16_GEMM_BTILE, B - batch_base);
+
+    for (int k = tid_in_row * 4; k < K; k += threads_per_row * 4) {
+        float scale_f = __bfloat162float(scales[row * num_groups + k / group_size]);
+        uint32_t packed = *reinterpret_cast<const uint32_t*>(&weight[row * K + k]);
+        float w0 = (float)static_cast<int8_t>(packed) * scale_f;
+        float w1 = (float)static_cast<int8_t>(packed >> 8) * scale_f;
+        float w2 = (float)static_cast<int8_t>(packed >> 16) * scale_f;
+        float w3 = (float)static_cast<int8_t>(packed >> 24) * scale_f;
+
+        #pragma unroll
+        for (int b = 0; b < W8A16_GEMM_BTILE; b++) {
+            if (b >= valid_b) break;
+            const __nv_bfloat16* xb = input + (batch_base + b) * K;
+            sum[b] += w0 * __bfloat162float(xb[k]);
+            sum[b] += w1 * __bfloat162float(xb[k + 1]);
+            sum[b] += w2 * __bfloat162float(xb[k + 2]);
+            sum[b] += w3 * __bfloat162float(xb[k + 3]);
+        }
+    }
+
+    int warps_per_row = threads_per_row / WARP_SIZE;
+    int warp_in_row = (threadIdx.x % threads_per_row) / WARP_SIZE;
+    #pragma unroll
+    for (int b = 0; b < W8A16_GEMM_BTILE; b++) {
+        if (b < valid_b) sum[b] = warp_reduce_sum(sum[b]);
+    }
+
+    __shared__ float smem_out[GEMV_ROWS * W8A16_GEMM_BTILE * 8];
+    if (lane_id == 0) {
+        #pragma unroll
+        for (int b = 0; b < W8A16_GEMM_BTILE; b++) {
+            if (b < valid_b)
+                smem_out[(row_in_block * W8A16_GEMM_BTILE + b) * warps_per_row + warp_in_row] = sum[b];
+        }
+    }
+    __syncthreads();
+    if (tid_in_row == 0) {
+        #pragma unroll
+        for (int b = 0; b < W8A16_GEMM_BTILE; b++) {
+            if (b >= valid_b) break;
+            float total = 0.0f;
+            for (int w = 0; w < warps_per_row; w++)
+                total += smem_out[(row_in_block * W8A16_GEMM_BTILE + b) * warps_per_row + w];
+            output[(batch_base + b) * N + row] = __float2bfloat16(total);
+        }
     }
 }
 
@@ -2576,8 +2694,17 @@ cudaError_t w8a16_gemv_batch_cuda(
     const __nv_bfloat16* input, __nv_bfloat16* output,
     int B, int N, int K, int group_size, cudaStream_t stream)
 {
-    dim3 grid((N + GEMV_ROWS - 1) / GEMV_ROWS, B);
     dim3 block(GEMV_THREADS);
+    // B>=2 uses the batched GEMM (B_TILE inputs share one weight read) instead
+    // of B independent GEMVs that each re-read the full weight — that re-read is
+    // why the plain per-batch GEMV collapsed at c>1.
+    if (B >= 2) {
+        dim3 grid((N + GEMV_ROWS - 1) / GEMV_ROWS, (B + W8A16_GEMM_BTILE - 1) / W8A16_GEMM_BTILE);
+        w8a16_gemm_batch_kernel<<<grid, block, 0, stream>>>(
+            reinterpret_cast<const uint8_t*>(weight), scales, input, output, B, N, K, group_size);
+        return cudaGetLastError();
+    }
+    dim3 grid((N + GEMV_ROWS - 1) / GEMV_ROWS, B);
     w8a16_gemv_batch_kernel<<<grid, block, 0, stream>>>(
         reinterpret_cast<const uint8_t*>(weight), scales, input, output, B, N, K, group_size);
     return cudaGetLastError();
