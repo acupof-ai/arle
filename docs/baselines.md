@@ -1,333 +1,207 @@
 # Rolling performance baselines
 
-> Status: Active — one champion table per config fingerprint, newest first.
+> Status: Active — champion row + step budget per fingerprint. Best numbers
+> only; verdicts, rejected arms and analysis live in the linked entries.
 
-Screening compares new runs against the champion row — no second arm. Rules:
+Screening compares a new run against the champion row — no second arm.
 
-1. **Effect > ~10% (2× the measured cross-session drift band)**: rolling
-   baseline verdict is valid; update the champion row, archive the binary.
-2. **Effect inside the drift band (±3% measured 2026-07-16: same binary
-   lineage, different session + GPU set): never kill on ambiguity — every
-   stable positive gain is kept.** Escalate to a same-shell A/B against the
-   archived champion binary (≥3 trials/arm, median + range) to resolve sign.
-3. **Fingerprint change re-anchors**: any change to model, TP/EP, GPU set,
-   serve flags, num_slots line, dataset, driver/CUDA invalidates the row —
-   re-measure the champion before comparing.
-4. **Anchor audit**: every ~5 accepted updates (and before any default flip),
-   one A/B against the oldest archived binary bounds accumulated drift.
-5. **One workload**: every champion row runs the multi-turn long-agent dataset
-   at the TraceLab medians (bench spec §3.3), and reports cold vs warm turns
-   separately. Rows below the 2026-07-26 line predate that rule — short-prompt
-   fingerprints, or the one-shot 32k dataset that could never hit the prefix
-   cache. Historical evidence, not comparison targets; re-anchor first.
+1. **Effect > ~10%** (2× the measured drift band): verdict valid, update the
+   champion, archive the binary.
+2. **Inside the ±3% drift band**: never kill on ambiguity. Escalate to a
+   same-shell A/B against the archived champion (≥3 trials/arm, median + range).
+3. **Fingerprint change re-anchors**: model, TP/EP, GPU set, serve flags, slot
+   line, dataset, driver/CUDA. Re-measure before comparing.
+4. **Anchor audit** every ~5 accepted updates and before any default flip: one
+   A/B against the oldest archived binary bounds accumulated drift.
+5. **One workload**: the multi-turn long-agent dataset at the TraceLab medians,
+   cold and warm turns reported separately.
+
+**Stated deviation: rows run 32K, not the spec's 119K median.** Dense KV is
+64 KB/token, so 119K×c16 needs 122 GB against ~69 GB free after weights.
+A 119K row is a new anchor, not a re-measure.
 
 ```
-python3 scripts/gen_bench_prompts.py bench-agent-119k-16x8.jsonl 16 119000 214 8
+python3 scripts/gen_bench_prompts.py bench-agent-32k-16x8.jsonl 16 32000 214 8
 ```
 
-**Stated deviation: every row runs 32K, not the spec's 119K median.** Dense KV is
-64 KB/token (16 full-attn layers × 4 kv_heads × 256 head_dim × 2 × bf16), so
-119K×c16 needs 122 GB against ~69 GB free after weights; 32K needs 36 GB. Per
-rule 3 a 119K row is a new anchor, not a re-measure — until one exists, nothing
-here meets rule 5.
+---
 
-## Qwen3.6 on 1×H20 · single-GPU · eager — LONG-AGENT ANCHOR
+## Qwen3.6 · 1×H20 · single-GPU · eager — LONG-AGENT ANCHOR
 
-### CHAMPION (DSpark arm) — `51985031d` (2026-07-30) · batched draft / replay / snapshot / capture / markov+confidence · `arle-mk`
+### CHAMPION (DSpark) — `51985031d` (2026-07-30) · `arle-mk`
 
-Two drafts at one TPOT are not one result, so a spec row carries `tok/row`
-(committed tokens per verify row; plain decode = 1.0). Earlier rows lack it —
-re-measure before comparing. `prefill tok/s` dropped: formula not reproducible,
-and TTFT is the prefill SLO.
+Features on: batched draft · replay · snapshot · capture · markov+confidence
+head driving the goodput budget. Serve adds `--spec-type dspark
+--mtp-draft-model Qwen3.6-27B-DFlash --dspark-block-size 6`; `--spec-max-batch`
+is the shipped default 16.
 
-| c | arm | pt | TTFT cold | TTFT warm | TPOT | burst | decode tok/s | total tok/s | occ | prefix hit | accept | tok/row |
-|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 1 | dense DSpark 6 | 1st | 19.3 s | 1.1 s | 9.80 ms | 34.8 ms | 102.0 | 7440.7 | 0.26 | 0.883 | 0.509 | 0.591 |
-| 2 | dense DSpark 6 | 1st | — | 1.2 s | 31.26 ms | 110.8 ms | 32.0 | 8292.3 | 0.47 | 0.883 | 0.509 | 0.591 |
-| 4 | dense DSpark 6 | 2nd | — | 0.5 s | 32.10 ms | 78.2 ms | 31.2 | 25432.8 | 0.85 | 1.000 | 0.287 | 0.406 |
-| 8 | dense DSpark 6 | 2nd | — | 0.7 s | 60.70 ms | 145.7 ms | 16.5 | 31754.1 | 0.87 | 1.000 | 0.280 | 0.400 |
-| 16 | dense DSpark 6 | 3rd | 6.8 s | 1.2 s | 109.43 ms | 262.7 ms | 9.1 | 32559.0 | 0.87 | 1.000 | 0.280 | 0.400 |
+A spec row carries `tok/row` (committed tokens per verify row; plain decode
+= 1.0) and `burst`, never ITL p50 — a spec step emits `k+1` tokens back-to-back,
+so most recorded ITLs are the within-chain gap.
 
-c=2/c=4 carry `TTFT p50` in the warm column — that runner does not separate turn 0.
-Re-run through `row.py` before quoting a cold TTFT there.
+| c | pt | TTFT cold | TTFT warm | TPOT | burst | decode tok/s | total tok/s | occ | prefix hit | accept | tok/row |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 1st | 19.3 s | 1.1 s | 9.80 ms | 34.8 ms | 102.0 | 7440.7 | 0.26 | 0.883 | 0.509 | 0.591 |
+| 2 | 1st | — | 1.2 s | 31.26 ms | 110.8 ms | 32.0 | 8292.3 | 0.47 | 0.883 | 0.509 | 0.591 |
+| 4 | 2nd | — | 0.5 s | 32.10 ms | 78.2 ms | 31.2 | 25432.8 | 0.85 | 1.000 | 0.287 | 0.406 |
+| 8 | 2nd | — | 0.7 s | 60.70 ms | 145.7 ms | 16.5 | 31754.1 | 0.87 | 1.000 | 0.280 | 0.400 |
+| 16 | 3rd | 6.8 s | 1.2 s | 109.43 ms | 262.7 ms | 9.1 | 32559.0 | 0.87 | 1.000 | 0.280 | 0.400 |
 
-**`pt` (point position within its serve) is in the table because `accept` tracks
-it, not `c`.** A serve's first point misses the dataset's 16 turn-0 sessions
-(113/128 = 0.883); later points inherit the previous point's cache (128/128), and
-`accept` splits on the same line: 0.509 at both 1st points (c=1 *and* c=2, in
-different serves) vs 0.280-0.287 later. Settled at matched `c`: `FR t0` as the
-*sole* point of a fresh serve at c=16 gives accept **0.532** / tok/row 0.610
-against **0.313** / 0.428 at the same c=16 as a later point — **+70% from cache
-state, `c` fixed**. So "accept halves at concurrency" is **withdrawn** here and in
-the linked win. Mechanism: `df.rebase()` (`executor/qwen35.rs:1460`, `:1842`) — a
-prefix hit skips the trunk prefill and leaves the draft suffix-only, matching
-`partial_ctx_chains/chains` 0.75 → 1.00.
+Gate exact=3 DET at 512/4k/16k/32k. 0 errors. 126/128. `prompt_tokens` p50 34963.
 
-That cold point is **not** a TPOT trial for this row (235.54 ms / 4.2 tok/s vs
-104.73 / 9.5 warm — all 128 requests pay a full 35K prefill); cache state is part
-of the fingerprint under rule 3. It does price the cold operating point at **2.2×
-warm TPOT**.
+Two properties of this row are load-bearing when reading it:
 
-`prefix hit` is a **delta** of the cumulative `/stats` counters — the `hit_rate`
-field is lifetime-cumulative (0.872/0.933/0.955) and per-point reporting of it is
-wrong. c=1/c=2 share byte-identical `chains`/`mean_k`/`accept`: greedy on fixed
-prompts is deterministic, so a difference between two points means their
-*contexts* differed, not their sampling.
+- **`accept` tracks `pt`, not `c`.** A serve's first point misses the dataset's
+  16 turn-0 sessions; later points inherit the cache. At matched c=16: 0.532 as
+  a fresh serve's sole point vs 0.313 as a later point — **+70% from cache
+  state alone**. "Accept halves at concurrency" is withdrawn.
+- **`occ` = `out tok/s / (c × decode tok/s)`** is the fraction of wall clock a
+  slot decodes rather than waits on prefill. At 0.26–0.47 (c=1/2) `burst` is
+  inflated ~1/occ. Never read `burst` as a kernel cost.
 
-**`burst` replaces ITL p50 on a spec row; ITL p50 must not be reported for one.**
-A spec step emits `k+1` tokens back-to-back, so most recorded ITLs are the
-within-chain gap — `dflash6` c=16 reads p50 **0.02 ms** / p90 476.8 against the
-no-spec row's honest 66.00 / 444.6. `burst = TPOT × (accepted+chains)/chains` is
-the interval between one request's bursts, free from `/stats`, and degenerates to
-TPOT at `mean_k` 0 — so the two compare directly: this arm takes 2.1× the no-spec
-c=16 burst (262.7 vs 124.81 ms) to commit 2.4× the tokens.
+### CHAMPION (no-spec) — `a956f69b1` (2026-07-28) · `arle-fa3b2`
 
-**`burst` is not the GPU step; it only tracks one where `occ` is high.** `occ` =
-`out tok/s / (c × decode tok/s)` is the fraction of wall clock a slot spends
-decoding rather than waiting on prefill. At **0.26 (c=1) and 0.47 (c=2)**,
-`steps = chains/c` over-counts idle slots and inflates `burst` by ~1/occ — the
-c=1→c=2 jump 34.8 → 110.8 ms is mostly that artifact, not a 3× step. From c=4 on
-`occ` is 0.85-0.87 (no-spec 0.89), close enough for same-`c` cross-arm reads.
-Never read `burst` as a kernel cost.
-
-Re-measure of the `d05d0aee6` row on the markov/confidence batching binary:
-TPOT 9.77 → 9.80 / 60.74 → 60.70 / 107.94 → 109.43 ms (**+0.3 / −0.07 / +1.4%**,
-inside the ±3% band) — that change adds a code path DFlash never enters, and the
-row confirms it. `prompt_tokens` p50 34963.
-
-vs the dense no-spec rows below (same fingerprint; these commits touch only the
-spec path): decode 34.7 → 102.0 / 12.2 → 16.5 / 8.2 → 9.1 tok/s. TTFT unchanged.
-Serve adds `--spec-type dspark --mtp-draft-model Qwen3.6-27B-DFlash
---dspark-block-size 6`; `--spec-max-batch` is the shipped default 16.
-Gate exact=3 DET at 512/4k/16k/32k. 0 errors. 126/128.
-
-**Challenger, REJECTED as a champion change — `dspark-fr-native`** (`arle-mk`,
-same fingerprint). Predicts better everywhere (`tok/row` 0.620 vs 0.591 at 1st
-points, 0.428 vs 0.400-0.406 later), gate exact=3 DET at 512/4k/16k/32k — but
-TPOT is mixed:
-
-| c | `dflash6` TPOT | challenger TPOT | Δ |
-|---:|---:|---:|---:|
-| 1 | 9.80 ms | 9.33 ms | **−4.8%** |
-| 2 | 31.26 ms | 35.51 ms | **+13.6% worse** |
-| 4 | 32.10 ms | 31.96 ms | −0.4% |
-| 8 | 60.70 ms | 60.41 ms | −0.5% |
-| 16 | 109.43 ms | 104.73 ms | **−4.3%** |
-
-Both ends by 4-5%, loses c=2 by 13.6%, washes at c=4/8 — rule 2, no champion
-change. **The first version called it a candidate off c=1 and c=16 alone; adding
-c=2/4/8 reversed it.** Two ends are not a sweep. Open: the c=2 loss is
-unexplained, and the c=16 points sit at different `pt` (2nd vs 3rd).
-Static confidence truncation is deleted — the head now feeds the goodput
-budget (`--dspark-sps-*-ms`); at the old 0.5 threshold this checkpoint lost
-34% ([win](experience/wins/2026-07-30-dspark-markov-confidence-batched.md)).
-
-**The c=2/c=4 region is healthy.** The denominator now exists (`arle-mk`, no spec
-flags): no-spec TPOT **78.40 ms at c=2, 64.67 at c=4**, so `dflash6` runs 2.5×
-and 2.0× the no-spec rate there. Per-request decode being worst at those points
-(32.0 / 31.2 tok/s against 102.0 at c=1) is the no-spec arm's shape too, not a
-spec defect.
-
-### CHAMPION (no-spec) — `a956f69b1` (2026-07-28) · KV mirror + batched FA3 · `arle-fa3b2`
+Features on: host-authoritative KV mirror · batched FA3 (one launch per layer).
 
 | c | arm | TTFT cold | TTFT warm | TPOT | ITL p50 | decode tok/s | total tok/s |
 |---|---|---:|---:|---:|---:|---:|---:|
-| 1 | MoE no-spec | 9.2 s | 0.7 s | 16.22 ms | 16.17 ms | 61.7 | 6707.2 |
-| 8 | MoE no-spec | 0.6 s | 0.5 s | 44.10 ms | 38.31 ms | 22.7 | 27967.8 |
-| 16 | MoE no-spec | 1.8 s | 0.6 s | 73.74 ms | 60.90 ms | 13.6 | 33858.9 |
-| 1 | dense no-spec | 19.0 s | 1.0 s | 28.83 ms | 28.78 ms | 34.7 | 5028.2 |
-| 8 | dense no-spec | 1.2 s | 0.5 s | 81.87 ms | 52.30 ms | 12.2 | 24702.9 |
-| 16 | dense no-spec | 4.2 s | 0.7 s | 122.15 ms | 66.55 ms | 8.2 | 30045.6 |
+| 1 | MoE | 9.2 s | 0.7 s | 16.22 ms | 16.17 ms | 61.7 | 6707.2 |
+| 8 | MoE | 0.6 s | 0.5 s | 44.10 ms | 38.31 ms | 22.7 | 27967.8 |
+| 16 | MoE | 1.8 s | 0.6 s | 73.74 ms | 60.90 ms | 13.6 | 33858.9 |
+| 1 | dense | 19.0 s | 1.0 s | 28.83 ms | 28.78 ms | 34.7 | 5028.2 |
+| 2 | dense | — | — | 78.40 ms | — | 12.8 | — |
+| 4 | dense | — | — | 64.67 ms | — | 15.5 | — |
+| 8 | dense | 1.2 s | 0.5 s | 81.87 ms | 52.30 ms | 12.2 | 24702.9 |
+| 16 | dense | 4.2 s | 0.7 s | 122.15 ms | 66.55 ms | 8.2 | 30045.6 |
 
 ITL p50 fit: MoE `15.7 + 2.82·B` ms, dense `38.0 + 1.78·B` ms.
 Gate exact=3 DET at 512/4k/16k/32k. 0 errors. MoE 128/128, dense 126/128.
+Anchor audit 2026-07-30 re-ran this binary at −0.03 / +0.40 / +2.26% — accumulated
+drift over five accepted DSpark updates is bounded under 2.3%.
 
-**Anchor audit (rule 4), 2026-07-30** — `arle-fa3b2`, the archived binary for this
-row, re-run against its own numbers: dense no-spec TPOT 28.82 / 82.20 / 124.91 ms
-vs the 28.83 / 81.87 / 122.15 above = **−0.03 / +0.40 / +2.26%**. Accumulated
-drift over the five accepted DSpark updates and the `--spec-max-batch` flip is
-bounded under 2.3%, so those rolling verdicts hold. The audit ran alongside four
-other arms on separate GPUs and still reproduced, which also bounds the
-concurrent-arm perturbation.
+DSpark over no-spec at matched c: 2.9× (c=1), 2.5× (c=2), 2.0× (c=4), 1.4× (c=8),
+1.1× (c=16).
 
-The same no-spec arm on `51985031d` reads 28.71 / **84.47** / 124.81 ms — c=1 and
-c=16 match the archive, c=8 is +2.8%. Band edge, not reproduced at the other two
-points; rule 2 escalation (≥3 trials/arm) if it recurs. It also supplies the
-c=2/c=4 points the archive lacks: **78.40 / 64.67 ms** (decode 12.8 / 15.5 tok/s).
+### Step budget — where the time goes (2026-08-01, `nsys`, dense FP8)
 
-### PRIOR — `55bf627bc` (2026-07-28) · FA3 paged, qlen ≤ 64 · `arle-fa3c`
+The champion tables say how fast; this says what to fix. Both captures are
+GPU-idle, ThinkingCap-Qwen3.6-27B-FP8, one H20.
 
-| c | arm | TTFT cold | TTFT warm | prefill tok/s | TPOT | decode tok/s | total tok/s |
-|---|---|---:|---:|---:|---:|---:|---:|
-| 1 | dense no-spec | 48.7 s | 14.2 s | 4252 | 28.71 ms | 34.8 | 1403.3 |
-| 1 | dense DSpark 16 | 48.3 s | 13.3 s | 3801 | 9.39 ms | 106.6 | 1504.8 |
-| 1 | MoE no-spec | 18.6 s | 4.8 s | 10991 | 15.93 ms | 62.8 | 3174.0 |
-| 8 | dense no-spec | 21.9 s | 15.3 s | 4416 | 908.39 ms | 1.1 | 2007.7 |
-| 8 | dense DSpark 16 | 22.7 s | 15.7 s | 4301 | 838.64 ms | 1.2 | 2140.7 |
-| 8 | MoE no-spec | 10.9 s | 3.4 s | 11268 | 224.29 ms | 4.5 | 5689.0 |
-| 16 | dense no-spec | 75.2 s | 26.9 s | 4071 | 1822.09 ms | 0.5 | 2027.4 |
-| 16 | dense DSpark 16 | 72.3 s | 23.8 s | 4231 | 1755.26 ms | 0.6 | 2132.3 |
-| 16 | MoE no-spec | 27.5 s | 8.1 s | 10701 | 453.79 ms | 2.2 | 5759.6 |
+**Decode, 25 ms/step** (plain, no spec, 59 steps, 1094 `cudaLaunchKernel`/step):
 
-Cold/warm decode at c=1: dense no-spec 27.58/28.99 ms, DSpark 11.91/8.77 ms,
-MoE 14.98/16.10 ms. Gate exact=3 DET on every arm. 0 errors.
+| kernel | launches/step | ms | share |
+|---|---:|---:|---:|
+| `fp8_gemv_batch_kernel` | 400 | 13.8 | 66% |
+| `gemv_handwritten_kernel` (bf16) | 97 | 4.3 | 21% |
+| `gated_delta_rule_decode` | 48 | 0.80 | 4% |
+| rms_norm / add / silu | ~250 | 0.79 | 4% |
+| flash attn (16 of 64 layers are full-attn) | 16 | 0.20 | 1% |
+| GPU idle between launches | — | ~4 | 16% |
 
-### Environment (both rows above)
+Weights are 31.2 GB and H20's **measured achievable read is 3.5 TB/s** (not the
+4.02 spec sheet), so the per-step floor is 8.9 ms. The GEMVs take 18.1 ms —
+**49% of achievable**, reproducing the 51% attributed on 2026-07-10.
 
-- **Box** 1×H20 (sm_90, 78 SM), TP=1, eager, `--max-running-requests 16`.
+**Prefill, 33K in 28.6 s** (single request, 24.0 s GPU-busy, ~37K launches,
+2328 `cuMemcpyDtoH` costing 1.58 s):
+
+| kernel | launches | s | share |
+|---|---:|---:|---:|
+| `gated_delta_rule_prefill_recurrent` | 1152 | 9.37 | 33% |
+| DeepGEMM FP8, all shapes | 7936 | 8.33 | 29% |
+| TileLang full attention | 368 | 3.93 | 14% |
+| `pack_quantize` bf16→fp8 | 9600 | 1.50 | 5% |
+| conv1d / norm / silu | 3840 | 0.55 | 2% |
+| GPU idle (includes host tokenization) | — | ≤4.6 | ≤16% |
+
+Efficiency of each part against its own ceiling: DeepGEMM `gate_up` 199 TFLOPS
+and `down` 189 TFLOPS = **64–67% of the FP8 peak, healthy**; full attention
+54 TFLOPS = **36% of the BF16 peak**; the linear-attention recurrence is a
+latency chain, **5.9 µs per token per layer** (~6 dependent `__syncthreads`
+each). No free parallel axis is left — the block is already 512 threads
+(`val_dim 128 × j_slice 4`) and the token axis is the recurrence. Its
+`<<<48, ...>>>` grid starves a **78-SM** GPU only at c=1; varlen launches
+`grid(num_value_heads, batch)`. Shortening the chain (chunked matmul form) is
+the lever; widening the grid is not.
+
+Verify decomposes as **22 ms intercept + 2.48 ms/row** (5.18 ms/row at 33K), and
+the intercept equals one plain non-spec step: verifying 8 speculative tokens
+costs what decoding 1 costs. Spec decode is working; the intercept is the wall.
+
+[decode + graph-flag profile](experience/errors/2026-08-01-decode-graph-flag-is-a-noop-under-paged-kv.md) ·
+[prefill profile](experience/wins/2026-08-01-prefill-and-decode-step-budget.md) ·
+[FP8 small-M attribution](experience/wins/2026-07-10-qwen-fp8-smallm-deepgemm-crossover.md)
+
+### Environment
+
+- **Box** 1×H20 (sm_90, 78 SM, 96 GB), TP=1, eager, `--max-running-requests 16`.
 - **Models** `bottlecapai/ThinkingCap-Qwen3.6-27B-FP8` (dense, 64 layers, 16
-  full-attn, kv_heads 4) · `Qwen3.6-35B-A3B-FP8` (MoE, 40 layers, 10 full-attn,
-  kv_heads 2, 256 experts, top_k 8). Both qwen35 hybrid, head_dim 256.
+  full-attn, kv_heads 4, head_dim 256, KV 64 KB/token) · `Qwen3.6-35B-A3B-FP8`
+  (MoE, 40 layers, 10 full-attn, kv_heads 2, 256 experts, top_k 8).
 - **Dataset** `bench-agent-32k-16x8.jsonl`, sha256 `8867f63eaac2f053…`,
-  `gen_bench_prompts.py bench-agent-32k-16x8.jsonl 16 32000 214 8`.
   `prompt_tokens` p50 34828.
-- **Runner** `bench_throughput.py`, 128 req/point, `--concurrency-grid 1,8,16`,
-  max_tokens 214, greedy, seed 20260416.
-- **Gate** `needle_gate.py 512,4096,16384,32768 3 0.0`.
-- **Metric definitions** TTFT and decode are separate SLOs, never averaged.
-  Decode = token-weighted mean ITL (`Σ itl_s / count`); ITL p50 is the
-  steady-state step. Never `e2e − ttft` (this harness carries ~4.7 s teardown,
-  inflating TPOT ~1.85×). Cold = session turn 0, warm = turns 1-7. `total tok/s`
-  = prompt+generated over wall: capacity, not latency.
+- **Runner** `bench_throughput.py`, 128 req/point, max_tokens 214, greedy,
+  seed 20260416. **Gate** `needle_gate.py 512,4096,16384,32768 3 0.0`.
+- **Metrics** TTFT and decode are separate SLOs, never averaged. Decode =
+  token-weighted mean ITL (`Σ itl_s / count`); never `e2e − ttft` (this harness
+  carries ~4.7 s teardown, inflating TPOT ~1.85×). Cold = session turn 0,
+  warm = turns 1–7. `total tok/s` = prompt+generated over wall: capacity, not
+  latency.
 
-Analysis lives in the linked entries, not here:
-[KV mirror](experience/wins/2026-07-28-qwen35-host-authoritative-kv-mirror.md) ·
-[batched FA3](experience/wins/2026-07-28-fa3-one-launch-per-layer.md) ·
-[FA3 qlen coverage](experience/wins/2026-07-28-fa3-covers-every-query-length.md)
+**Inert flags — do not cost these into a plan.** `--qwen35-decode-graph` prints
+`ARMED` but produces zero `cuGraph*` calls (its call site sits below an
+unconditional paged-KV early return). `--qwen35-gdr-chunked` shape-guards on
+`local_linear_v_heads == 32`; this model has 48.
 
-## DSv4-Flash-FP8 · 4×H20 · TP=4/EP=4 · eager · port 8000
+---
+
+## DSv4-Flash-FP8 · 4×H20 · TP=4/EP=4 · eager
 
 ### CHAMPION — Base, `d0525cb06` (re-anchored 2026-07-25, #180)
 
-> **Short-prompt fingerprint, retired 2026-07-26 (rule 5).** ~3.4k-token docs
-> from the pre-long-agent `gen_bench_prompts.py`; that generator now emits the
-> 32k agent shape, so this dataset is no longer reproducible from the repo and
-> the row cannot be re-measured. Kept as evidence for the numbers it licensed.
+> Short-prompt fingerprint, retired 2026-07-26 under rule 5 — the dataset is no
+> longer reproducible from the repo. Evidence for what it licensed, not a
+> comparison target.
 
-GPUs 0-3 (H20 indices don't re-anchor — same silicon). Dataset
-`bench-prompts-20.jsonl`, sha256
-`e095ddf1fcc9325a43bb510b36e2afcb6c56d68af3ecc032503b8430b4f3fc49`
-(first 20 lines of `bench-prompts-64.jsonl`, 64 docs × 13400 chars).
+Dataset `bench-prompts-20.jsonl`, sha256 `e095ddf1fcc9325a…`, 60 s/point,
+max_tokens 256, seed 20260416. Slot line `59 slots / per_slot 338MB / 84736 tok`.
 
-Runner `bench_throughput.py` via `run_dsv4_bench.sh`, 60 s/point, seed
-20260416, max_tokens 256, no `--max-running-requests`. Slot line `59 slots /
-per_slot 338MB / budget 20584MB / 84736 tok`. chunk-2048 default. Prefix
-hit_rate 0.048 (c1) → 0.767 (c16).
+| c | complete | out tok/s | total tok/s | TTFT p50/p99 ms | ITL p50/p99 ms |
+|---|---:|---:|---:|---|---|
+| 1 | 10 | 38.66 | 456 | 1085 / 1113 | 21.9 / 41.0 |
+| 4 | 20 | 74.67 | 876 | 1447 / 2985 | 43.8 / 89.2 |
+| 8 | 40 | 152.82 | 1793 | 1069 / 1204 | 47.5 / 93.2 |
+| 16 | 48 | 197.51 | 2319 | 2238 / 2265 | 71.4 / 119.0 |
 
-| c  | complete | out tok/s | total tok/s | TTFT p50/p99 ms | ITL p50/p99 ms |
-|----|---------:|----------:|------------:|-----------------|----------------|
-| 1  | 10       | 38.66     | 456         | 1085 / 1113     | 21.9 / 41.0    |
-| 4  | 20       | 74.67     | 876         | 1447 / 2985     | 43.8 / 89.2    |
-| 8  | 40       | 152.82    | 1793        | 1069 / 1204     | 47.5 / 93.2    |
-| 16 | 48       | 197.51    | 2319        | 2238 / 2265     | 71.4 / 119.0   |
+0 errors / 0 incomplete / 0 correctness_failed at every point. c32 needs
+`--max-running-requests 32`; without it host-admission oversubscription degrades
+to preemption, not a crash (#164/#162 closed).
 
-0 errors / 0 incomplete / 0 correctness_failed at every point. Raw: pod
-`bench-output/2026-07-24-b156-d0525cb0/`. Reproduced by the `d0525cb06`
-runtime verifies (recompute-resume, band-exhaustion park-gate, both
-2026-07-25).
+**Spec decode is c=1-only on this fingerprint and not a default-flip candidate**
+— DSpark +5.0% at c=1, −23/−44/−48% at c=4/8/16; MTP negative everywhere. The
+crossover is the compute-bound transition: verify is free only while the GPU has
+idle compute.
 
-- **c32**: needs `--max-running-requests 32` (`num_slots 32, comp capacity
-  1048576 tok`); without it, host-admission oversubscription degrades to
-  preemption, not a crash (#164/#162 closed). No reproducible-dataset c32
-  throughput point yet — the retired 209.9 out tok/s ran on the lost
-  `bench-prompts.jsonl`.
-- **Why this anchor**: the prior champion's `bench-prompts.jsonl`
-  (repeated-filler, prefix hit_rate 0.925) no longer exists and has no
-  generator; `gen_bench_prompts.py` deliberately produces the non-degenerate
-  variant. Rule 3 re-anchored on the reproducible dataset. `run_dsv4_bench.sh`
-  now fails loudly on a missing dataset and records `dataset.sha256` next to
-  every result.
+---
 
-### Spec-decode arms — `6aa4ca6d1` (2026-07-25) · RETIRED short-prompt fingerprint
+## Qwen3.6-27B-W4A16 · 1×V100 (sm_70) · eager
 
-Retired 2026-07-26 (rule 5): 128-token prompts, not a serving shape. Dataset
-`dspark_natural_128in_128out.jsonl` (sha `169b7c78…`, 20 prompts),
-**max_tokens 128**, 60 s/point, c=1,4,8,16, GPUs 4-7 TP=4/EP=4. Same binary,
-same session; Δ is vs this run's own no-spec (NOT the champion — different
-workload). 0 errors all arms. Raw: pod `bench-output/2026-07-25-R2-dsv4-*`.
-
-| c  | no-spec | MTP   | MTP Δ  | DSpark | DSpark Δ |
-|----|--------:|------:|-------:|-------:|---------:|
-| 1  | 42.39   | 36.51 | −13.9% | **44.52** | **+5.0%** |
-| 4  | 79.46   | 42.57 | −46.4% | 61.00  | −23.2%   |
-| 8  | 136.44  | 51.74 | −62.1% | 76.57  | −43.9%   |
-| 16 | 174.46  | 61.94 | −64.5% | 90.66  | −48.0%   |
-
-accept_rate (server-stats): MTP ~0.15, DSpark ~0.30. Slot lines: no-spec
-`per_slot 338MB → 59 slots`, MTP `381MB → 49`, DSpark `607MB → 22`
-(`stages=3 block=5 target_layers=[40,41,42]`).
-
-- **Both spec arms are c=1-only** — DSpark +5.0% at c=1, net-negative at c≥4;
-  MTP negative everywhere on this shape. The crossover is the spec-decode
-  compute-bound transition, one mechanism (verify cost is free only while the
-  GPU has idle compute):
-
-  ```
-  each step: draft block=5 → target verifies 6 positions → commit ~2.5 tok (accept 0.30, flat vs c)
-                                      │
-              ┌───────────────────────┴───────────────────────┐
-          c=1: batch small                              c=16: batch full
-          GPU memory-bound                              GPU compute-bound
-          verify 6 pos ≈ free                           verify 6 pos = ~6× time
-              │                                                │
-        2.5 tok / ~1× time                            2.5 tok / ~6× time
-              ▼                                                ▼
-        ✅ +5%  (27B c=1 +57.5%)                    ❌ 2.5/6 ≈ 0.42 → measured 90.66/174.46 = 0.52
-  ```
-
-  Not default-flip candidates.
-- **#183 fix confirmed** — the earlier c=16 −49.9% "DSpark collapse" was the
-  train-capture per-step 2×D2H+2×sync serializing the TP=4 NCCL pipeline
-  (default-off consumer). Gated on the train sidecar now; the curve above is
-  the real spec-decode shape, no crash.
-- **#184 confirmed** — spec scratch sized to the real verify width (6/9 rows),
-  DSpark per_slot 645→607MB.
-
-## Qwen3.6-27B-W4A16 · 1×V100 (sm_70) · eager · port 8080
-
-**2026-07-21 (`aec71ef16`, V100 kernel opts + KV pool floor fix)** — synthetic
+**`aec71ef16` (2026-07-21)** — V100 kernel opts + KV pool floor fix. Synthetic
 prompts 64, 60 s/point, max_tokens 256, seed 20260416. KV pool 16384 tok BF16
-(1.1 GB), 86 slots (clamped from 256 by VRAM budget). Serve:
-`--max-total-tokens 16384`. Raw: V100 `/tmp/v100_nospec_bench.{json,csv}`.
+(1.1 GB), 86 slots. Serve `--max-total-tokens 16384`.
 
-| c  | complete | out tok/s | total tok/s | TTFT p50/p99 ms | ITL p50/p99 ms |
-|----|---------:|----------:|------------:|-----------------|----------------|
-| 1  | 11       | 22.8      | 24.4        | 251 / 304       | 40.4 / 41.6    |
-| 4  | 12       | 25.5      | 27.4        | 17799 / 25769   | 0.02* / 270    |
-| 8  | 17       | 28.4      | 30.4        | 30818 / 54318   | 0.02* / 335    |
-| 16 | 16       | 30.1      | 32.1        | 72270 / 72933   | 0.02* / 452    |
+| c | complete | out tok/s | total tok/s | TTFT p50/p99 ms | ITL p50/p99 ms |
+|---|---:|---:|---:|---|---|
+| 1 | 11 | 22.8 | 24.4 | 251 / 304 | 40.4 / 41.6 |
+| 4 | 12 | 25.5 | 27.4 | 17799 / 25769 | 0.02\* / 270 |
+| 8 | 17 | 28.4 | 30.4 | 30818 / 54318 | 0.02\* / 335 |
+| 16 | 16 | 30.1 | 32.1 | 72270 / 72933 | 0.02\* / 452 |
 
-\* ITL p50 ≈ 0.02 ms is a bench-script artifact (streaming inter-token
-sampling undercounts at c≥4); the out tok/s column is the valid throughput
-metric. c=1 ITL 40.4 ms ≈ 24.7 tok/s decode, matches the c=1 out tok/s.
+\* ITL p50 ≈ 0.02 ms is a streaming-sampling artifact at c≥4; read out tok/s.
+Decode-bound at every concurrency (+32% from c=1 to c=16); TTFT grows linearly
+with concurrency (queueing).
 
-- **Decode-bound at all concurrencies.** out tok/s scales weakly (22.8 → 30.1,
-  +32% from c=1 to c=16) — V100 sm_70 W4A16 decode is the bottleneck, not
-  scheduler/KV. TTFT grows linearly with concurrency (queueing).
-
-### DSpark arm — KILLED (−91% at c=1)
-
-Same serve + `--spec-type dspark --mtp-draft-model
-z-lab/Qwen3.6-27B-DFlash` (DFlash drafter, block=16, taps=[1,16,31,46,61]).
-39 slots (clamped by draft model VRAM +96MB/slot). Raw: V100
-`/tmp/v100_dspark_bench.{json,csv}`.
-
-| c  | complete | errors | out tok/s | ITL p50/p99 ms | Δ vs no-spec |
-|----|---------:|-------:|----------:|----------------|-------------:|
-| 1  | 2        | 0      | 2.0       | 499 / 507      | **−91.2%**   |
-| 4  | 4        | 1      | 2.0       | 0.02* / 1990   | **−92.2%**   |
-| 8  | 0        | 8      | 0.0       | n/a            | n/a          |
-| 16 | 0        | 131204 | 0.0       | n/a            | n/a          |
-
-\* ITL p50 artifact (see no-spec note); c=1 ITL 499 ms vs no-spec 40 ms =
-12.5× slower per decode step.
-
-- **KILL.** DSpark draft+verify path on V100 sm_70 adds ~460 ms/step overhead
-  (ITL 40 → 499 ms). c=8 all 8 requests error (1543 s wall); c=16 connection
-  storm (131204 errors in 60 s). Serve log: `[coordinator] lockstep stalled:
-  tick #2232128 awaiting acks (elapsed=10s)` — the TP lockstep mechanism
-  deadlocks under DSpark's multi-step proposal on single-GPU V100.
-- **Root cause hypothesis**: DSpark's `tp_lockstep_proposal/accept` was designed
-  for TP≥2 (H20); on TP=1 V100 the lockstep coordinator stalls waiting for
-  cross-rank acks that never arrive. Needs a TP=1 fast path or the lockstep
-  disabled when world_size=1.
+**DSpark on V100 is KILLED (−91% at c=1, errors at c≥8).** ITL 40 → 499 ms;
+c=16 produced 131204 errors in 60 s with `[coordinator] lockstep stalled`. The
+TP lockstep proposal path deadlocks at world_size=1 — needs a TP=1 fast path
+before this arm is retried.
