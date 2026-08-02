@@ -122,11 +122,8 @@ impl CpContext {
         Self { rank, size }
     }
 
-    /// Read the CP group from the launcher's env (`ARLE_TRAIN_WORLD_RANK` +
-    /// `ARLE_TRAIN_{CP,DP}_SIZE`), derived through the one mesh so `rank`/`size`
-    /// are the mesh's `attn_cp_rank`/`attn_cp_size`, not a private second
-    /// derivation. Defaults to `single()` when unset or misconfigured — the
-    /// byte-identical single-card path — so callers can read it unconditionally.
+    /// CP view of the launcher's mesh env; `single()` when unset or
+    /// misconfigured, so callers read it unconditionally.
     pub fn from_env() -> Self {
         let (dp, cp, world_rank) = mesh_env();
         Self::from_mesh(dp, cp, world_rank)
@@ -225,9 +222,7 @@ impl DpContext {
         }
     }
 
-    /// Read the DP group from the launcher env (`ARLE_TRAIN_WORLD_RANK` +
-    /// `ARLE_TRAIN_{CP,DP}_SIZE`), derived through the one mesh. Defaults to
-    /// `single()` when unset — the byte-identical single-card path.
+    /// DP view of the launcher's mesh env; `single()` when unset.
     pub fn from_env() -> Self {
         let (dp, cp, world_rank) = mesh_env();
         Self::from_mesh(dp, cp, world_rank)

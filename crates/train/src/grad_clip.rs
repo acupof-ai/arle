@@ -278,9 +278,8 @@ pub fn all_reduce_cp_grads(
 }
 
 /// Fail fast if the CP ranks disagree on the per-position param element counts.
-/// Under CP×DP the gather spans the CP subgroup only, while the grad all-reduce
-/// spans the world — params are data-independent, so a cp-group check catches
-/// the same construction-nondeterminism class.
+/// Under CP×DP this gather spans only the CP subgroup — params are
+/// data-independent, so that still catches construction nondeterminism.
 ///
 /// `all_reduce_cp_grads` issues one collective per param by index; NCCL matches
 /// nothing about shape, so a divergent order (e.g. a HashMap-seeded param list)
