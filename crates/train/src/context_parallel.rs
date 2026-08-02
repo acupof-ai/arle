@@ -43,6 +43,16 @@ fn env_usize(key: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+/// The launcher's mesh env contract: `(dp_size, cp_size, world_rank)`, with
+/// `world_rank = dp_rank*cp + cp_rank` (CP inner). Unset ⇒ single card.
+fn mesh_env() -> (usize, usize, usize) {
+    (
+        env_usize("ARLE_TRAIN_DP_SIZE", 1),
+        env_usize("ARLE_TRAIN_CP_SIZE", 1),
+        env_usize("ARLE_TRAIN_WORLD_RANK", 0),
+    )
+}
+
 /// A rank's position in the context-parallel group — the `attn_cp` axis of the
 /// mesh. Mirrors `TpContext`, but the axis is SEQUENCE.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,15 +122,14 @@ impl CpContext {
         Self { rank, size }
     }
 
-    /// Read the CP group from the launcher's env (`ARLE_TRAIN_CP_RANK` /
-    /// `ARLE_TRAIN_CP_SIZE`), derived through the one mesh so `rank`/`size` are the
-    /// mesh's `attn_cp_rank`/`attn_cp_size`, not a private second derivation.
-    /// Defaults to `single()` when unset or misconfigured — the byte-identical
-    /// single-card path — so callers can read it unconditionally.
+    /// Read the CP group from the launcher's env (`ARLE_TRAIN_WORLD_RANK` +
+    /// `ARLE_TRAIN_{CP,DP}_SIZE`), derived through the one mesh so `rank`/`size`
+    /// are the mesh's `attn_cp_rank`/`attn_cp_size`, not a private second
+    /// derivation. Defaults to `single()` when unset or misconfigured — the
+    /// byte-identical single-card path — so callers can read it unconditionally.
     pub fn from_env() -> Self {
-        let cp = env_usize("ARLE_TRAIN_CP_SIZE", 1);
-        let world_rank = env_usize("ARLE_TRAIN_CP_RANK", 0);
-        Self::from_mesh(1, cp, world_rank)
+        let (dp, cp, world_rank) = mesh_env();
+        Self::from_mesh(dp, cp, world_rank)
     }
 
     /// The CP view of the mesh for explicit axis sizes + world rank (pure, no env).
@@ -216,15 +225,12 @@ impl DpContext {
         }
     }
 
-    /// Read the DP group from the launcher env (`ARLE_TRAIN_DP_RANK` /
-    /// `ARLE_TRAIN_DP_SIZE`), derived through the one mesh. Defaults to `single()`
-    /// when unset — the byte-identical single-card path.
+    /// Read the DP group from the launcher env (`ARLE_TRAIN_WORLD_RANK` +
+    /// `ARLE_TRAIN_{CP,DP}_SIZE`), derived through the one mesh. Defaults to
+    /// `single()` when unset — the byte-identical single-card path.
     pub fn from_env() -> Self {
-        let dp = env_usize("ARLE_TRAIN_DP_SIZE", 1);
-        // Pure-DP world rank == the DP rank (CP inner axis is size 1 here); the
-        // combined DP×CP launcher composes the world rank from both.
-        let world_rank = env_usize("ARLE_TRAIN_DP_RANK", 0);
-        Self::from_mesh(dp, 1, world_rank)
+        let (dp, cp, world_rank) = mesh_env();
+        Self::from_mesh(dp, cp, world_rank)
     }
 
     pub fn is_enabled(self) -> bool {

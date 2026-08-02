@@ -151,6 +151,9 @@ pub struct CudaBackend {
     kernels: KernelCache,
     #[cfg(all(feature = "nccl", not(feature = "no-cuda")))]
     nccl: Option<Arc<NcclBackend>>,
+    /// CP subgroup comm under a CP×DP mesh; `None` = seq collectives use `nccl`.
+    #[cfg(all(feature = "nccl", not(feature = "no-cuda")))]
+    nccl_seq: Option<Arc<NcclBackend>>,
 }
 
 impl std::fmt::Debug for CudaBackend {
@@ -196,6 +199,8 @@ impl CudaBackend {
                 kernels,
                 #[cfg(all(feature = "nccl", not(feature = "no-cuda")))]
                 nccl: None,
+                #[cfg(all(feature = "nccl", not(feature = "no-cuda")))]
+                nccl_seq: None,
             })
         }
     }
@@ -221,6 +226,45 @@ impl CudaBackend {
         Ok(backend)
     }
 
+    /// CUDA backend for a CP×DP mesh (`world = cp*dp`, CP inner): the world comm
+    /// carries weight-grad/count all-reduces (weights replicated on every rank);
+    /// seq collectives (gather/scatter/ring/a2a) run on a `ncclCommSplit` CP
+    /// subgroup. Single-axis meshes skip the split — the world comm IS the axis
+    /// comm, byte-identical to `new_with_nccl`.
+    #[cfg(all(feature = "nccl", not(feature = "no-cuda")))]
+    pub fn new_with_mesh(
+        ordinal: usize,
+        unique_id: cuda_kernels::ffi::nccl::ncclUniqueId,
+        cp_size: usize,
+        dp_size: usize,
+        world_rank: usize,
+    ) -> Result<Self> {
+        let (cp, dp) = (cp_size.max(1), dp_size.max(1));
+        let mut backend = Self::new_with_nccl(ordinal, unique_id, cp * dp, world_rank)?;
+        if cp > 1 && dp > 1 {
+            let (dp_rank, cp_rank) = (world_rank / cp, world_rank % cp);
+            let world_comm = backend.nccl.as_ref().expect("new_with_nccl sets nccl");
+            // Collective over the world comm — every rank constructs together.
+            let seq = world_comm
+                .split(dp_rank as i32, cp_rank as i32, cp, cp_rank)
+                .map_err(|err| {
+                    AutogradError::TapeInvariant(Box::leak(
+                        format!("ncclCommSplit for the CP subgroup failed: {err:#}")
+                            .into_boxed_str(),
+                    ))
+                })?;
+            backend.nccl_seq = Some(Arc::new(seq));
+        }
+        Ok(backend)
+    }
+
+    /// The comm sequence-axis collectives run on: the CP subgroup under CP×DP,
+    /// else the world comm (single-axis mesh — identical group).
+    #[cfg(all(feature = "nccl", not(feature = "no-cuda")))]
+    fn seq_nccl(&self) -> Option<&Arc<NcclBackend>> {
+        self.nccl_seq.as_ref().or(self.nccl.as_ref())
+    }
+
     /// No-GPU stub for no-cuda builds that still type-check the nccl feature.
     #[cfg(all(feature = "nccl", feature = "no-cuda"))]
     pub fn new_with_nccl(
@@ -231,6 +275,19 @@ impl CudaBackend {
     ) -> Result<Self> {
         let _ = (ordinal, unique_id, world_size, rank);
         todo!("GPU required: CudaBackend::new_with_nccl is unavailable under feature no-cuda")
+    }
+
+    /// No-GPU stub for no-cuda builds that still type-check the nccl feature.
+    #[cfg(all(feature = "nccl", feature = "no-cuda"))]
+    pub fn new_with_mesh(
+        ordinal: usize,
+        unique_id: cuda_kernels::ffi::nccl::ncclUniqueId,
+        cp_size: usize,
+        dp_size: usize,
+        world_rank: usize,
+    ) -> Result<Self> {
+        let _ = (ordinal, unique_id, cp_size, dp_size, world_rank);
+        todo!("GPU required: CudaBackend::new_with_mesh is unavailable under feature no-cuda")
     }
 
     /// Query device VRAM `(free_bytes, total_bytes)` for the backend's CUDA
@@ -2149,7 +2206,7 @@ impl Backend for CudaBackend {
             // this branch skips the in-place NCCL write, so sharing the input Arc is
             // safe — no alloc, no D2D copy.
             #[cfg(all(feature = "nccl", not(feature = "no-cuda")))]
-            let world = self.nccl.as_ref().map_or(1, |nccl| nccl.world_size());
+            let world = self.seq_nccl().map_or(1, |nccl| nccl.world_size());
             #[cfg(not(all(feature = "nccl", not(feature = "no-cuda"))))]
             let world = 1usize;
             if world <= 1 {
@@ -2164,7 +2221,7 @@ impl Backend for CudaBackend {
                 let mut out = self.stream.alloc_zeros::<f32>(full_len).map_err(|_| {
                     AutogradError::TapeInvariant("cuda all_gather_seq full alloc failed")
                 })?;
-                let nccl = self.nccl.as_ref().expect("world>1 implies nccl present");
+                let nccl = self.seq_nccl().expect("world>1 implies nccl present");
                 // Scope the device-ptr guards so their SyncOnDrop borrow of `out`
                 // ends before `out` is moved into the handle (mirrors the implicit
                 // drop in all_reduce_sum_device's `if let` block).
@@ -2208,7 +2265,7 @@ impl Backend for CudaBackend {
             let src = self.cuda_slice(x, "reduce_scatter_sum")?;
 
             #[cfg(all(feature = "nccl", not(feature = "no-cuda")))]
-            let world = self.nccl.as_ref().map_or(1, |nccl| nccl.world_size());
+            let world = self.seq_nccl().map_or(1, |nccl| nccl.world_size());
             #[cfg(not(all(feature = "nccl", not(feature = "no-cuda"))))]
             let world = 1usize;
             if world <= 1 {
@@ -2236,7 +2293,7 @@ impl Backend for CudaBackend {
                 let mut out = self.stream.alloc_zeros::<f32>(local_len).map_err(|_| {
                     AutogradError::TapeInvariant("cuda reduce_scatter_sum alloc failed")
                 })?;
-                let nccl = self.nccl.as_ref().expect("world>1 implies nccl present");
+                let nccl = self.seq_nccl().expect("world>1 implies nccl present");
                 // Scope the device-ptr guards so their SyncOnDrop borrow of `out`
                 // ends before `out` is moved into the handle.
                 {
@@ -2287,7 +2344,7 @@ impl Backend for CudaBackend {
             }
 
             #[cfg(all(feature = "nccl", not(feature = "no-cuda")))]
-            let world = self.nccl.as_ref().map_or(1, |nccl| nccl.world_size());
+            let world = self.seq_nccl().map_or(1, |nccl| nccl.world_size());
             #[cfg(not(all(feature = "nccl", not(feature = "no-cuda"))))]
             let world = 1usize;
             // Single rank: the ring degenerates to the local block (identity).
@@ -2301,7 +2358,7 @@ impl Backend for CudaBackend {
             // launcher pads seq to a multiple of world), so recv fills `len`.
             #[cfg(all(feature = "nccl", not(feature = "no-cuda")))]
             {
-                let nccl = self.nccl.as_ref().expect("world>1 implies nccl present");
+                let nccl = self.seq_nccl().expect("world>1 implies nccl present");
                 let rank = nccl.rank();
                 let next = (rank + 1) % world;
                 let prev = (rank + world - 1) % world;
@@ -2333,8 +2390,8 @@ impl Backend for CudaBackend {
     fn collective_world_rank(&self) -> (usize, usize) {
         #[cfg(all(feature = "nccl", not(feature = "no-cuda")))]
         {
-            self.nccl
-                .as_ref()
+            // Seq-group view: the ring op positions itself with this.
+            self.seq_nccl()
                 .map_or((1, 0), |nccl| (nccl.world_size(), nccl.rank()))
         }
         #[cfg(not(all(feature = "nccl", not(feature = "no-cuda"))))]
@@ -2375,7 +2432,7 @@ impl Backend for CudaBackend {
             }
 
             #[cfg(all(feature = "nccl", not(feature = "no-cuda")))]
-            let world = self.nccl.as_ref().map_or(1, |nccl| nccl.world_size());
+            let world = self.seq_nccl().map_or(1, |nccl| nccl.world_size());
             #[cfg(not(all(feature = "nccl", not(feature = "no-cuda"))))]
             let world = 1usize;
             // Single rank: no rank to shuffle to — identity on shape and value.
@@ -2414,7 +2471,7 @@ impl Backend for CudaBackend {
 
                 // Transport: one NCCL group of send/recv pairs. Own chunk (j==rank)
                 // is reused from `send` — no self NCCL op, no self copy, no deadlock.
-                let nccl = self.nccl.as_ref().expect("world>1 implies nccl present");
+                let nccl = self.seq_nccl().expect("world>1 implies nccl present");
                 let rank = nccl.rank();
                 let mut recv: Vec<Option<CudaSlice<f32>>> = (0..n).map(|_| None).collect();
                 for (j, slot) in recv.iter_mut().enumerate() {
