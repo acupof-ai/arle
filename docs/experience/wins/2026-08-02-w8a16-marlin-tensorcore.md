@@ -21,11 +21,13 @@ kernels align to SGLang), and is zero-torch (TVM-FFI, not at::Tensor).
 
 W8A16 upcasts int8→bf16 in registers and runs `mma` at bf16 rate = ½ fp8 rate,
 so it **cannot** beat fp8 in compute-bound prefill. But decode is
-bandwidth-bound: time/step ≈ weight_bytes / HBM_bw. int8 moves 1 byte/param + a
-bf16 group scale — at g=128 that's 1.016 B/param vs bf16's 2, so the decode
-ceiling is **1.94×**, not a clean 2× (the +8 % over ½ is scales + tile layout).
-Predicted: bf16-class decode speed at fp8-class VRAM, better-than-fp8 accuracy.
-The win is decode latency + VRAM, not prefill throughput.
+latency/bandwidth-bound: time/step scales with weight bytes moved through HBM.
+int8 moves 1 byte/param + a bf16 group scale — at g=128 that's 1.016 B/param vs
+bf16's 2, so the weight-byte ratio is **1.94×**, not a clean 2×. Predicted:
+bf16-class decode at fp8-class VRAM, better-than-fp8 accuracy. (Measured: the
+1.73× win lands, but the kernel is occupancy-bound at 51 % HBM, not at the
+bandwidth wall — see Learnings; the ratio holds because both lanes sit under the
+same latency limit.) The win is decode latency + VRAM, not prefill throughput.
 
 ## Parameters
 
@@ -67,12 +69,12 @@ python3 scripts/bench_throughput.py \
 | 8 | 47.4 | 134.7 | 51.8 | (confounded) | 2.84× |
 
 **c=1 is the only clean point** — pure decode, no concurrent prefill. 26.9 vs
-bf16 46.5 ms = 1.73×, **89 % of the 1.94× weight-bandwidth ceiling** (g=128
-scales included): the predicted physics. c=4/8 mix decode ITL with in-flight
-32k-prefill stalls (bf16 c=4 is a non-monotone pothole, 166 ms > its own c=8
-51.8 ms — a scheduler artifact, not a GEMM property), so their ratios are not a
-decode measurement. Output tok/s is a prefill metric here (256-tok outputs
-behind 17–81 s TTFT).
+bf16 46.5 ms = 1.73×. Both lanes are latency-bound at c=1 (ncu: 51 % HBM, 12.5 %
+occupancy — see Learnings), so the ratio tracks the ~1.94× weight-byte ratio,
+not a bandwidth ceiling. c=4/8 mix decode ITL with in-flight 32k-prefill stalls
+(bf16 c=4 is a non-monotone pothole, 166 ms > its own c=8 51.8 ms — a scheduler
+artifact, not a GEMM property), so their ratios are not a decode measurement.
+Output tok/s is a prefill metric here (256-tok outputs behind 17–81 s TTFT).
 
 ## Results — VRAM (P1: free the int8 source after repack)
 
@@ -104,26 +106,42 @@ bf16 group-scales). KV capacity 1.74× on the same GPU — the downstream payoff
 ## Learnings
 
 **PASS at c=1: W8A16 Marlin decode is 1.73× bf16 (26.9 vs 46.5 ms ITL) at 0.58×
-the weight VRAM, sm_90, graph-captured fast path.** That's **89 % of the 1.94×
-bandwidth ceiling** (g=128 scales included) — the predicted physics. The value
-prop holds: bf16-class decode at fp8-class VRAM with better-than-fp8 accuracy.
-Not a prefill/large-batch win (bf16-rate mma) — do not bench there for a win.
+the weight VRAM, sm_90, graph-captured fast path.** The 1.73× is the weight-byte
+ratio realized in decode — both lanes move weight bytes through HBM under the
+same latency limit, so halving the bytes ≈ halves the step. The value prop
+holds: bf16-class decode at fp8-class VRAM with better-than-fp8 accuracy. Not a
+prefill/large-batch win (bf16-rate mma) — do not bench there for a win.
 
-**SOTA framing — honest bounds.** The hot GEMM is SGLang/vLLM's own
-`gptq_marlin` (their W8A16 backend is `kU8B128`, same kernel), so **per-op we
-are the SOTA kernel by provenance** — the matmul cannot be beaten, only the
-integration around it (capture / attention / sync). What is NOT yet shown is an
-end-to-end **win over SGLang**: 1.73× is vs ARLE's own bf16, not vs SGLang
-W8A16. Upgrading "near-ceiling" to "SOTA-competitive" needs a matched A/B — same
-GPU, model, weights, context, c=1 — decode tok/s + p50/p99 ITL vs SGLang itself.
+**We are NOT at the memory wall at c=1 — ncu roofline (H20, app clocks, m=1,
+2026-08-02, `/host/marlin-bench/ncu/marlin_roofline_noclk.csv`).** The Marlin
+decode GEMM achieves only **~51–53 % of peak HBM** on the large FFN shapes
+(ffn_gate_up 50.8 %, ffn_down 52.9 % — ~2.1 of the H20's ~4.0 TB/s), SM ~45 %.
+It is **occupancy/latency-bound**, not bandwidth- or compute-bound: warp
+occupancy pinned at **12.5 %** (1 of 8 slots), a single 78-block wave (1
+block/SM) that can't hide HBM latency. So an earlier draft's "at the memory wall,
+matmul cannot be beaten" was **wrong** — there is ~40 points of HBM headroom,
+gated by occupancy, that a higher-occupancy / split-K tiling could in principle
+recover. Two facts that DO hold: (1) **byte-optimal** — DRAM traffic is 92.4 MB
+for the 17408×5120 int8 weight (89.1 MB weights + scales), read exactly once, no
+redundant traffic; the headroom is latency-hiding, not wasted bytes. (2) it's
+SGLang/vLLM's own `gptq_marlin` (`kU8B128`) — the SOTA kernel **by provenance**,
+same source those stacks ship.
+
+**SOTA framing — what's proven vs not.** Provenance (same kernel) + byte-
+optimality (weight read once) + the 1.73× recorded win are real. What is NOT
+proven: (a) a physical-ceiling claim (we're at 51 % HBM, not the wall); (b) an
+end-to-end win over SGLang (1.73× is vs ARLE's own bf16). A rigorous SOTA claim
+needs either closing the occupancy gap toward the HBM wall, or a matched A/B vs
+SGLang W8A16 (same GPU/model/weights/ctx, c=1, decode tok/s + p50/p99 ITL).
 
 **Why W8A16 and not W4A16 (a stronger decode target).** Same Marlin kernel
-family runs W4A16 at a ~3.87× ceiling (0.5 B/param) — roughly 2× this path's
+family runs W4A16 at a ~3.87× byte ratio (0.5 B/param) — roughly 2× this path's
 1.94×. We chose int8 for **accuracy**: symmetric per-group int8 is near-lossless
 vs the int4 quality hit, and pairs with bf16 activations for a
 better-than-fp8-accuracy decode. If a future workload prioritizes decode speed
-over accuracy, W4A16 on the same kernel is the more aggressive SOTA lever.
+over accuracy, W4A16 on the same kernel is the more aggressive lever.
 
-Next wall: matched A/B vs SGLang W8A16 (the real SOTA-competitive claim);
-sm_120 fleet-coverage run; c-sweep on a multi-H20 box where 32k×8 isn't
-prefill-bound.
+Next lever (evidence-backed by the ncu run, in priority order): recover the c=1
+occupancy gap (12.5 % → multi-wave / split-K, the `c_tmp` fp32-reduce buffer is
+already allocated for it) — this is the real SOTA gap and needs its own measured
+before/after; then matched A/B vs SGLang W8A16; sm_120 fleet-coverage run.
