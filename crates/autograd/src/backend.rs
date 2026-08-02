@@ -1855,6 +1855,39 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         Ok((handle, out_shape))
     }
 
+    /// Concatenate N same-rank tensors along `axis` (all shapes equal off
+    /// `axis`). Default: readback each → host copy → upload. CUDA overrides with
+    /// D2D copies so activations stay device-resident — the CP linear-attn
+    /// reorder concats a full-seq tensor N× per layer, and a host round-trip
+    /// there dominates the step (256K: hours).
+    fn concat(
+        &self,
+        parts: &[(&DeviceHandle, &[usize])],
+        axis: usize,
+    ) -> Result<(DeviceHandle, Vec<usize>)> {
+        let first = parts[0].1;
+        let outer: usize = first[..axis].iter().product();
+        let inner: usize = first[axis + 1..].iter().product();
+        let axis_total: usize = parts.iter().map(|(_, s)| s[axis]).sum();
+        let mut out_shape = first.to_vec();
+        out_shape[axis] = axis_total;
+        let mut data = vec![0.0f32; outer * axis_total * inner];
+        let mut axis_off = 0usize;
+        for (handle, shape) in parts {
+            let host = self.readback(handle)?;
+            let axis_i = shape[axis];
+            for o in 0..outer {
+                let src_base = o * axis_i * inner;
+                let dst_base = (o * axis_total + axis_off) * inner;
+                let len = axis_i * inner;
+                data[dst_base..dst_base + len].copy_from_slice(&host[src_base..src_base + len]);
+            }
+            axis_off += axis_i;
+        }
+        let handle = self.upload(&data, &out_shape)?;
+        Ok((handle, out_shape))
+    }
+
     /// Write compact rank-4 `[batch, heads, src_seq, dim]` `src` into the
     /// sequence window of a preallocated `[batch, heads, max_seq, dim]` cache.
     ///

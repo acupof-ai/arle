@@ -1,7 +1,7 @@
 use smallvec::smallvec;
 
 use crate::{
-    AutogradError, Result,
+    AutogradError, DeviceHandle, Result,
     backend::{broadcast_offset, validate_broadcast},
     tape::{BackwardOp, GradPairs, SavedContext, Tape, TapeEntry},
     tensor::{Dirty, Tensor, TensorId, TensorStore},
@@ -350,6 +350,54 @@ pub fn cat(
         })
         .collect::<Result<_>>()?;
 
+    let out_shape = {
+        let mut s = first.clone();
+        s[axis] = input_shapes.iter().map(|sh| sh[axis]).sum();
+        s
+    };
+
+    // Device-lazy when every input is device-resident (same dispatch as slice):
+    // the CP reorder concats a full-seq tensor per layer, and host round-tripping
+    // it dominates the 256K step. Host path otherwise.
+    let all_device = inputs.iter().all(|&id| {
+        store
+            .tensor(id)
+            .is_ok_and(|t| t.dirty != Dirty::Host && t.device_handle.is_some())
+    });
+    if all_device {
+        for &id in inputs {
+            store.ensure_device(id)?;
+        }
+        let handles: Vec<DeviceHandle> = inputs
+            .iter()
+            .map(|&id| {
+                store
+                    .tensor(id)?
+                    .device_handle
+                    .as_ref()
+                    .ok_or(AutogradError::TapeInvariant(
+                        "cat: input missing device handle",
+                    ))
+                    .cloned()
+            })
+            .collect::<Result<_>>()?;
+        let parts: Vec<(&DeviceHandle, &[usize])> = handles
+            .iter()
+            .zip(input_shapes.iter())
+            .map(|(h, s)| (h, s.as_slice()))
+            .collect();
+        let (out_handle, produced) = store.backend().concat(&parts, axis)?;
+        let output_id = store.alloc_device_tensor(produced, out_handle)?;
+        TapeEntry {
+            op: BackwardOp::Cat,
+            output_id,
+            input_ids: inputs.iter().copied().collect(),
+            saved: SavedContext::CatCtx { axis, input_shapes },
+        }
+        .record(store, tape)?;
+        return Ok(output_id);
+    }
+
     let outer: usize = first[..axis].iter().product();
     let inner: usize = first[axis + 1..].iter().product();
     let axis_total: usize = input_shapes.iter().map(|s| s[axis]).sum();
@@ -357,8 +405,6 @@ pub fn cat(
         .iter()
         .any(|&id| store.tensor(id).is_ok_and(|t| t.requires_grad));
 
-    let mut out_shape = first.clone();
-    out_shape[axis] = axis_total;
     let mut data = vec![0.0_f32; outer * axis_total * inner];
     let mut axis_off = 0usize;
     for (i, &id) in inputs.iter().enumerate() {
@@ -394,8 +440,46 @@ pub(crate) fn cat_backward(
             "cat backward missing saved context",
         ));
     };
-    let upstream = store.tensor_host(output_grad_id)?.data.clone();
     let axis_total: usize = input_shapes.iter().map(|s| s[axis]).sum();
+
+    // Each input's grad is the upstream sliced to its axis range. When the
+    // upstream is device-resident, slice on-device (backend().slice) instead of
+    // downloading — the CP reorder's backward concats a full-seq tensor per layer.
+    let device_path_ok = {
+        let upstream = store.tensor(output_grad_id)?;
+        upstream.dirty != Dirty::Host && upstream.device_handle.is_some()
+    };
+    if device_path_ok {
+        let mut full_shape = input_shapes[0].clone();
+        full_shape[axis] = axis_total;
+        let upstream_handle = store
+            .tensor(output_grad_id)?
+            .device_handle
+            .as_ref()
+            .expect("checked above")
+            .clone();
+        let mut grads = GradPairs::new();
+        let mut axis_off = 0usize;
+        for (i, &input_id) in entry.input_ids.iter().enumerate() {
+            let axis_i = input_shapes[i][axis];
+            if store.tensor(input_id)?.requires_grad {
+                let mut starts = vec![0usize; full_shape.len()];
+                let mut ends = full_shape.clone();
+                starts[axis] = axis_off;
+                ends[axis] = axis_off + axis_i;
+                let grad_handle =
+                    store
+                        .backend()
+                        .slice(&upstream_handle, &full_shape, &starts, &ends)?;
+                let grad_id = store.alloc_device_tensor(input_shapes[i].clone(), grad_handle)?;
+                grads.push((input_id, grad_id));
+            }
+            axis_off += axis_i;
+        }
+        return Ok(grads);
+    }
+
+    let upstream = store.tensor_host(output_grad_id)?.data.clone();
     let inner: usize = input_shapes[0][axis + 1..].iter().product();
     let outer: usize = input_shapes[0][..axis].iter().product();
 

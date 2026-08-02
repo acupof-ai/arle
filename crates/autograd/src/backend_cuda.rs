@@ -2464,9 +2464,7 @@ impl Backend for CudaBackend {
                 }
 
                 // Recv assembly: concat the N chunks (source-rank order) along the
-                // scatter axis. cuda_concat_parts concatenates on the outermost axis
-                // only, so transpose scatter->0, concat, transpose back — correct for
-                // any (scatter, gather) pair and any batch; identity when scatter==0.
+                // scatter axis, on-device (see `cuda_concat_axis`).
                 let recv_handles: Vec<DeviceHandle> = (0..n)
                     .map(|j| {
                         if j == rank {
@@ -2478,20 +2476,11 @@ impl Backend for CudaBackend {
                     .collect();
                 let mut chunk_shape = in_shape.to_vec();
                 chunk_shape[gather_axis] = g;
-                let transposed: Vec<(DeviceHandle, Vec<usize>)> = recv_handles
+                let parts: Vec<(&DeviceHandle, &[usize])> = recv_handles
                     .iter()
-                    .map(|h| self.transpose_axes_swap(h, &chunk_shape, 0, scatter_axis))
-                    .collect::<Result<_>>()?;
-                let parts: Vec<&CudaSlice<f32>> = transposed
-                    .iter()
-                    .map(|(h, _)| self.cuda_slice(h, "all_to_all"))
-                    .collect::<Result<_>>()?;
-                let cat = cuda_concat_parts(self, &parts)?;
-                let mut cat_shape = transposed[0].1.clone();
-                cat_shape[0] *= n;
-                let cat_h = DeviceHandle::Cuda(CudaStorage::new(cat));
-                let (out_h, produced) =
-                    self.transpose_axes_swap(&cat_h, &cat_shape, 0, scatter_axis)?;
+                    .map(|h| (h, chunk_shape.as_slice()))
+                    .collect();
+                let (out_h, produced) = cuda_concat_axis(self, &parts, scatter_axis)?;
                 debug_assert_eq!(produced, out_shape);
                 return Ok((out_h, out_shape));
             }
@@ -3165,6 +3154,22 @@ impl Backend for CudaBackend {
         #[cfg(not(feature = "no-cuda"))]
         {
             cuda_concat_axis2_device(self, a, a_shape, b, b_shape)
+        }
+    }
+
+    fn concat(
+        &self,
+        parts: &[(&DeviceHandle, &[usize])],
+        axis: usize,
+    ) -> Result<(DeviceHandle, Vec<usize>)> {
+        #[cfg(feature = "no-cuda")]
+        {
+            let _ = (parts, axis);
+            todo!("GPU required: cuda concat is unavailable under feature no-cuda")
+        }
+        #[cfg(not(feature = "no-cuda"))]
+        {
+            cuda_concat_axis(self, parts, axis)
         }
     }
 
@@ -4597,6 +4602,31 @@ fn cuda_copy_range<T: DeviceRepr>(
         .memcpy_dtod(&src.slice(start..start + len), &mut out)
         .map_err(|_| AutogradError::TapeInvariant("cuda D2D copy failed (la row slice)"))?;
     Ok(out)
+}
+
+/// Concatenate N f32 device tensors along `axis` (equal shapes off `axis`),
+/// staying on-device. `cuda_concat_parts` only concats the outermost axis, so
+/// transpose `axis`→0, concat, transpose back — correct for any axis, identity
+/// when axis==0. Shared by `all_to_all_device` assembly and the `concat` trait.
+#[cfg(not(feature = "no-cuda"))]
+fn cuda_concat_axis(
+    backend: &CudaBackend,
+    parts: &[(&DeviceHandle, &[usize])],
+    axis: usize,
+) -> Result<(DeviceHandle, Vec<usize>)> {
+    let transposed: Vec<(DeviceHandle, Vec<usize>)> = parts
+        .iter()
+        .map(|(h, s)| backend.transpose_axes_swap(h, s, 0, axis))
+        .collect::<Result<_>>()?;
+    let slices: Vec<&CudaSlice<f32>> = transposed
+        .iter()
+        .map(|(h, _)| backend.cuda_slice(h, "concat"))
+        .collect::<Result<_>>()?;
+    let cat = cuda_concat_parts(backend, &slices)?;
+    let mut cat_shape = transposed[0].1.clone();
+    cat_shape[0] = transposed.iter().map(|(_, s)| s[0]).sum();
+    let cat_h = DeviceHandle::Cuda(CudaStorage::new(cat));
+    backend.transpose_axes_swap(&cat_h, &cat_shape, 0, axis)
 }
 
 #[cfg(not(feature = "no-cuda"))]
