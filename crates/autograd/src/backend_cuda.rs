@@ -503,6 +503,22 @@ impl CudaBackend {
         Ok(staging)
     }
 
+    /// First `len` elements of `buf` (identity when unpadded — no copy).
+    #[cfg(not(feature = "no-cuda"))]
+    fn f32_prefix(&self, buf: CudaSlice<f32>, len: usize) -> Result<CudaSlice<f32>> {
+        if buf.len() == len {
+            return Ok(buf);
+        }
+        let mut out = self
+            .stream
+            .alloc_zeros::<f32>(len)
+            .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (f32 prefix)"))?;
+        self.stream
+            .memcpy_dtod(&buf.slice(0..len), &mut out)
+            .map_err(|_| AutogradError::TapeInvariant("cuda f32 prefix copy failed"))?;
+        Ok(out)
+    }
+
     #[cfg(not(feature = "no-cuda"))]
     fn import_local_bf16_as_f32(
         &self,
@@ -786,11 +802,10 @@ impl CudaBackend {
         let n = b_shape[0];
         let a_bf16 = self.local_f32_as_bf16(a, a.len())?;
         if m == 0 || n == 0 || k == 0 {
-            let c_bf16 = self
+            let c = self
                 .stream
-                .alloc_zeros::<u16>(m * n)
+                .alloc_zeros::<f32>(m * n)
                 .map_err(|_| cuda_alloc_failed("matmul_bt_bf16_empty", vec![m, n]))?;
-            let c = self.import_local_bf16_as_f32(&c_bf16, m * n)?;
             return Ok((c, out_shape));
         }
 
@@ -813,14 +828,14 @@ impl CudaBackend {
         let a_for_gemm = padded_a.as_ref().unwrap_or(&a_bf16);
         let c_len =
             Self::checked_bf16_len(padded_m, n, "bf16 matmul_bt padded output length overflow")?;
-        let mut c_bf16 = self
+        let mut c_out = self
             .stream
-            .alloc_zeros::<u16>(c_len)
+            .alloc_zeros::<f32>(c_len)
             .map_err(|_| cuda_alloc_failed("matmul_bt_bf16", vec![padded_m, n]))?;
         {
             let (b_ptr, _b_guard) = b.device_ptr(&self.stream);
             let (a_ptr, _a_guard) = a_for_gemm.device_ptr(&self.stream);
-            let (c_ptr, _c_guard) = c_bf16.device_ptr_mut(&self.stream);
+            let (c_ptr, _c_guard) = c_out.device_ptr_mut(&self.stream);
 
             // Same row-major cuBLAS trick as the f32 path: swap operands so the
             // column-major output view is the row-major [M, N] buffer. Operand B
@@ -850,7 +865,7 @@ impl CudaBackend {
                     k_i32,
                     (&beta) as *const f32 as *const _,
                     c_ptr as *mut _,
-                    cublas_sys::cudaDataType_t::CUDA_R_16BF,
+                    cublas_sys::cudaDataType_t::CUDA_R_32F,
                     n_i32,
                     cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
                     cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
@@ -861,7 +876,7 @@ impl CudaBackend {
             }
         }
 
-        let c = self.import_local_bf16_as_f32(&c_bf16, m * n)?;
+        let c = self.f32_prefix(c_out, m * n)?;
         Ok((c, out_shape))
     }
 
@@ -892,11 +907,10 @@ impl CudaBackend {
         let k = b_shape[1];
         let a_bf16 = self.local_f32_as_bf16(a, a.len())?;
         if m == 0 || n == 0 || k == 0 {
-            let c_bf16 = self
+            let c = self
                 .stream
-                .alloc_zeros::<u16>(m * k)
+                .alloc_zeros::<f32>(m * k)
                 .map_err(|_| cuda_alloc_failed("matmul_bf16_empty", vec![m, k]))?;
-            let c = self.import_local_bf16_as_f32(&c_bf16, m * k)?;
             return Ok((c, out_shape));
         }
 
@@ -919,14 +933,14 @@ impl CudaBackend {
         let a_for_gemm = padded_a.as_ref().unwrap_or(&a_bf16);
         let c_len =
             Self::checked_bf16_len(padded_m, k, "bf16 matmul padded output length overflow")?;
-        let mut c_bf16 = self
+        let mut c_out = self
             .stream
-            .alloc_zeros::<u16>(c_len)
+            .alloc_zeros::<f32>(c_len)
             .map_err(|_| cuda_alloc_failed("matmul_bf16", vec![padded_m, k]))?;
         {
             let (b_ptr, _b_guard) = b.device_ptr(&self.stream);
             let (a_ptr, _a_guard) = a_for_gemm.device_ptr(&self.stream);
-            let (c_ptr, _c_guard) = c_bf16.device_ptr_mut(&self.stream);
+            let (c_ptr, _c_guard) = c_out.device_ptr_mut(&self.stream);
 
             // Row-major C[M,K] = A[M,N] @ B[N,K], using cuBLAS's column-major
             // view as C_col[K,M] = B_col[K,N] @ A_col[N,M]. See
@@ -950,7 +964,7 @@ impl CudaBackend {
                     n_i32,
                     (&beta) as *const f32 as *const _,
                     c_ptr as *mut _,
-                    cublas_sys::cudaDataType_t::CUDA_R_16BF,
+                    cublas_sys::cudaDataType_t::CUDA_R_32F,
                     k_i32,
                     cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
                     cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
@@ -959,7 +973,7 @@ impl CudaBackend {
             }
         }
 
-        let c = self.import_local_bf16_as_f32(&c_bf16, m * k)?;
+        let c = self.f32_prefix(c_out, m * k)?;
         Ok((c, out_shape))
     }
 
