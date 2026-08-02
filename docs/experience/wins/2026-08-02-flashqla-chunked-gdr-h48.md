@@ -1,14 +1,12 @@
 # FlashQLA chunked GDR at H=48: 33K prefill −27% — 2026-08-02
 
-> Status: **OPT-IN, correctness-blocked** (`778fef873` parameterization,
-> `5b851d193` compile fixes, `2e2ab667c` default flip, `715c37a0c` revert).
-> The flip's license (needle ladder ×3 9/9 exact both arms, greedy-64
-> byte-identity, stub-fallback verified) did not survive a real eval:
-> **GSM8K 100-sample greedy A/B = chunked 11/100 vs recurrent 46/100**, 35
-> one-directional disagreements. The perf result below stands; the path must
-> not serve until the state error is fixed. New rule: sequence-state changes
-> need a ≥100-sample long-form accuracy A/B before any default flip — the
-> needle ladder alone is not a license.
+> Status: **DEFAULT-ON** (`778fef873` parameterization, `5b851d193` compile
+> fixes, `2e2ab667c` first flip, `715c37a0c` revert on the raw-8-shot GSM
+> collapse, `c2eb5de9e` re-flip after full adjudication). Final license:
+> chat GSM8K 100 = **95/100 both arms, zero per-item disagreements**; chat
+> MMLU 80 vs 81; needle 9/9 ×2; stub-probe fallback. The collapse was bf16
+> drift on a knife-edge harness, not a kernel bug — mechanism and rules in
+> [the errors entry](../errors/2026-08-02-gdr-chunked-gsm-collapse-was-a-knife-edge-harness.md).
 
 ## Context
 

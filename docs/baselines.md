@@ -152,14 +152,14 @@ costs what decoding 1 costs. Spec decode is working; the intercept is the wall.
 `ARMED` but produces zero `cuGraph*` calls (its call site sits below an
 unconditional paged-KV early return).
 
-**`--qwen35-gdr-chunked` is OPT-IN, kernels adjudicated correct** (2026-08-02):
-33K cold prefill −26%, needle 9/9, per-layer parity ≤5.7e-3 on the failing
-request itself, **chat-template GSM 14/15 = recurrent** — the raw-8-shot
-11/100-vs-46/100 collapse was bf16 drift shifting an EOS knife edge the
-harness itself sits on (recurrent EOSes 3/12 at temp 0.7 there). Default
-flip pending a chat-format battery; raw-completion degradation is a real,
-named trade
-([error](experience/errors/2026-08-02-gdr-chunked-gsm-collapse-was-a-knife-edge-harness.md)).
+**`--qwen35-gdr-chunked` is DEFAULT-ON** (2026-08-02, `c2eb5de9e`): 33K cold
+prefill −26%; license = chat GSM8K 100 **95/100 both arms, zero
+disagreements** + chat MMLU 80 vs 81 + needle 9/9 ×2 + stub-probe fallback.
+Named trade: raw-completion few-shot can flip knife-edge boundary tokens
+(the 11/100-vs-46/100 collapse was that, not a kernel bug —
+[error](experience/errors/2026-08-02-gdr-chunked-gsm-collapse-was-a-knife-edge-harness.md));
+chat/agentic serving is parity. **TTFT-cold champion rows predate this flip
+and need a re-anchor sweep.**
 
 ---
 
