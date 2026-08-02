@@ -46,6 +46,10 @@ _gap_a_micro_workdir/
 scripts/_pod_*
 .kami-lark/*
 logs/
+# gate/serve scripts drop *.log at repo root (needle_gate_identity, serve_identity, …)
+/*.log
+# leaked absolute-path snapshot some tool writes relative-to-root
+/Users/
 data/opd-corpora/
 doc-fetch-resources/Qb9mdxvQaoJbN6xP3TGckwSBnFe/
 .arle-runs/
