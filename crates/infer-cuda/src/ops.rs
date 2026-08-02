@@ -303,6 +303,45 @@ pub(crate) fn silu_mul(
     Ok(())
 }
 
+/// Split a row-fused `[seq, 2*half]` buffer into two `[seq, half]` buffers
+/// (first half of each row → `first`, second half → `second`).
+pub(crate) fn split_halves(
+    ctx: &DeviceContext,
+    fused: &HiddenStates,
+    first: &mut HiddenStates,
+    second: &mut HiddenStates,
+) -> Result<()> {
+    ensure!(
+        first.hidden_dim == second.hidden_dim
+            && fused.hidden_dim == 2 * first.hidden_dim
+            && fused.seq_len == first.seq_len
+            && fused.seq_len == second.seq_len,
+        "split_halves shape mismatch: fused [{}, {}] vs halves [{}, {}] / [{}, {}]",
+        fused.hidden_dim,
+        fused.seq_len,
+        first.hidden_dim,
+        first.seq_len,
+        second.hidden_dim,
+        second.seq_len
+    );
+    let (fused_ptr, _gf) = fused.data.device_ptr(&ctx.stream);
+    let (first_ptr, _g1) = first.data.device_ptr_mut(&ctx.stream);
+    let (second_ptr, _g2) = second.data.device_ptr_mut(&ctx.stream);
+    // SAFETY: ptrs from live device allocations sized to the dims passed.
+    unsafe {
+        ffi::split_halves_cuda(
+            fused_ptr as *const ffi::Half,
+            first_ptr as *mut ffi::Half,
+            second_ptr as *mut ffi::Half,
+            fused.seq_len as i32,
+            first.hidden_dim as i32,
+            ctx.stream.cu_stream(),
+        )
+        .result()?;
+    }
+    Ok(())
+}
+
 /// SwiGLU over a row-fused `[seq, 2*inter]` gate_up buffer (gate = first half
 /// of each row, up = second half): `out[seq, inter] = silu(gate) * up`. The
 /// fused layout is what a single GEMM over a rows-concatenated `[2*inter, K]`
