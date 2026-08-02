@@ -1,11 +1,14 @@
 # FlashQLA chunked GDR at H=48: 33K prefill −27% — 2026-08-02
 
-> Status: Shipped and **DEFAULT-ON** (`778fef873` parameterization,
-> `5b851d193` compile fixes, `2e2ab667c` default flip + availability probe).
-> Flip license: needle ladder 1k/4k/8k ×3 both arms 9/9 exact +
-> deterministic; stub-build + default flags degrades silently (probe fallback
-> ×1, zero engine errors, 8k cold 5.1 s recurrent speed) while the real build
-> runs chunked by default (8k cold 3.6 s).
+> Status: **OPT-IN, correctness-blocked** (`778fef873` parameterization,
+> `5b851d193` compile fixes, `2e2ab667c` default flip, `715c37a0c` revert).
+> The flip's license (needle ladder ×3 9/9 exact both arms, greedy-64
+> byte-identity, stub-fallback verified) did not survive a real eval:
+> **GSM8K 100-sample greedy A/B = chunked 11/100 vs recurrent 46/100**, 35
+> one-directional disagreements. The perf result below stands; the path must
+> not serve until the state error is fixed. New rule: sequence-state changes
+> need a ≥100-sample long-form accuracy A/B before any default flip — the
+> needle ladder alone is not a license.
 
 ## Context
 
