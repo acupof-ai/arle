@@ -350,12 +350,6 @@ pub fn cat(
         })
         .collect::<Result<_>>()?;
 
-    let out_shape = {
-        let mut s = first.clone();
-        s[axis] = input_shapes.iter().map(|sh| sh[axis]).sum();
-        s
-    };
-
     // Device-lazy when every input is device-resident (same dispatch as slice),
     // else host — a host round-trip here dominates the 256K CP step.
     let all_device = inputs.iter().all(|&id| {
@@ -363,22 +357,10 @@ pub fn cat(
             .tensor(id)
             .is_ok_and(|t| t.dirty != Dirty::Host && t.device_handle.is_some())
     });
-    if all_device {
-        for &id in inputs {
-            store.ensure_device(id)?;
-        }
+    let output_id = if all_device {
         let handles: Vec<DeviceHandle> = inputs
             .iter()
-            .map(|&id| {
-                store
-                    .tensor(id)?
-                    .device_handle
-                    .as_ref()
-                    .ok_or(AutogradError::TapeInvariant(
-                        "cat: input missing device handle",
-                    ))
-                    .cloned()
-            })
+            .map(|&id| store.device_handle(id))
             .collect::<Result<_>>()?;
         let parts: Vec<(&DeviceHandle, &[usize])> = handles
             .iter()
@@ -386,39 +368,33 @@ pub fn cat(
             .map(|(h, s)| (h, s.as_slice()))
             .collect();
         let (out_handle, produced) = store.backend().concat(&parts, axis)?;
-        let output_id = store.alloc_device_tensor(produced, out_handle)?;
-        TapeEntry {
-            op: BackwardOp::Cat,
-            output_id,
-            input_ids: inputs.iter().copied().collect(),
-            saved: SavedContext::CatCtx { axis, input_shapes },
+        store.alloc_device_tensor(produced, out_handle)?
+    } else {
+        let outer: usize = first[..axis].iter().product();
+        let inner: usize = first[axis + 1..].iter().product();
+        let axis_total: usize = input_shapes.iter().map(|s| s[axis]).sum();
+        let requires_grad = inputs
+            .iter()
+            .any(|&id| store.tensor(id).is_ok_and(|t| t.requires_grad));
+        let mut out_shape = first.clone();
+        out_shape[axis] = axis_total;
+
+        let mut data = vec![0.0_f32; outer * axis_total * inner];
+        let mut axis_off = 0usize;
+        for (i, &id) in inputs.iter().enumerate() {
+            let axis_i = input_shapes[i][axis];
+            let src = store.tensor_host(id)?;
+            for o in 0..outer {
+                let src_base = o * axis_i * inner;
+                let dst_base = (o * axis_total + axis_off) * inner;
+                let len = axis_i * inner;
+                data[dst_base..dst_base + len].copy_from_slice(&src.data[src_base..src_base + len]);
+            }
+            axis_off += axis_i;
         }
-        .record(store, tape)?;
-        return Ok(output_id);
-    }
+        store.alloc(Tensor::new(data, out_shape, requires_grad)?)
+    };
 
-    let outer: usize = first[..axis].iter().product();
-    let inner: usize = first[axis + 1..].iter().product();
-    let axis_total: usize = input_shapes.iter().map(|s| s[axis]).sum();
-    let requires_grad = inputs
-        .iter()
-        .any(|&id| store.tensor(id).is_ok_and(|t| t.requires_grad));
-
-    let mut data = vec![0.0_f32; outer * axis_total * inner];
-    let mut axis_off = 0usize;
-    for (i, &id) in inputs.iter().enumerate() {
-        let axis_i = input_shapes[i][axis];
-        let src = store.tensor_host(id)?;
-        for o in 0..outer {
-            let src_base = o * axis_i * inner;
-            let dst_base = (o * axis_total + axis_off) * inner;
-            let len = axis_i * inner;
-            data[dst_base..dst_base + len].copy_from_slice(&src.data[src_base..src_base + len]);
-        }
-        axis_off += axis_i;
-    }
-
-    let output_id = store.alloc(Tensor::new(data, out_shape, requires_grad)?);
     TapeEntry {
         op: BackwardOp::Cat,
         output_id,
