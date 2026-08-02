@@ -151,8 +151,7 @@ pub struct CudaBackend {
     kernels: KernelCache,
     #[cfg(all(feature = "nccl", not(feature = "no-cuda")))]
     nccl: Option<Arc<NcclBackend>>,
-    /// The seq-collective group: the split subgroup under a composed mesh, else
-    /// the same comm as `nccl`. `None` only when `nccl` is `None` (single card).
+    /// Seq-collective comm: split subgroup when composed, else same as `nccl`.
     #[cfg(all(feature = "nccl", not(feature = "no-cuda")))]
     nccl_seq: Option<Arc<NcclBackend>>,
 }
@@ -224,20 +223,16 @@ impl CudaBackend {
             ))
         })?;
         let nccl = Arc::new(nccl);
-        // Seq collectives read exactly one field: default it to the world comm
-        // (same group); a mesh with a real subgroup overwrites it.
+        // Default seq comm = world comm; a composed mesh overwrites it.
         backend.nccl_seq = Some(nccl.clone());
         backend.nccl = Some(nccl);
         Ok(backend)
     }
 
-    /// CUDA backend for a multi-axis mesh: the world comm carries weight-grad /
-    /// count all-reduces (weights replicated on every rank); seq collectives
-    /// (gather/scatter/ring/a2a) run on a `ncclCommSplit` subgroup described by
-    /// `seq_group = (color, size, rank)` — the caller derives it from the one
-    /// mesh (`infer_topo`), keeping this crate layout-agnostic. `None` = no
-    /// subgroup, seq collectives use the world comm (byte-identical to
-    /// `new_with_nccl`).
+    /// Mesh backend: grad/count all-reduces on the world comm, seq collectives
+    /// on a `ncclCommSplit` subgroup `seq_group = (color, size, rank)`. The
+    /// caller derives the spec from the one mesh — this crate stays
+    /// layout-agnostic. `None` = no subgroup (identical to `new_with_nccl`).
     #[cfg(all(feature = "nccl", not(feature = "no-cuda")))]
     pub fn new_with_mesh(
         ordinal: usize,
@@ -263,8 +258,7 @@ impl CudaBackend {
         Ok(backend)
     }
 
-    /// The comm sequence-axis collectives run on (subgroup under a composed
-    /// mesh, else the world comm — set at construction, never a fallback).
+    /// Seq-axis comm — set at construction, never a fallback.
     #[cfg(all(feature = "nccl", not(feature = "no-cuda")))]
     fn seq_nccl(&self) -> Option<&Arc<NcclBackend>> {
         self.nccl_seq.as_ref()

@@ -2999,10 +2999,8 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
         .as_deref()
         .ok_or_else(|| anyhow!("--staged-root is required without --replay-records"))?;
 
-    // Mesh coordinator: if cp_size*dp_size > 1 and this is NOT already a spawned
-    // rank, fan out one worker per world rank and wait. MUST run before the
-    // sandbox-spawner fork and the first CUDA context below — the coordinator owns
-    // neither (each rank forks its own helper + NCCL backend).
+    // MUST run before the sandbox-spawner fork and the first CUDA context —
+    // the coordinator owns neither.
     #[cfg(all(unix, feature = "cuda"))]
     if crate::train_multiproc::maybe_spawn_mesh_and_wait(
         args.cp_size,
@@ -4694,12 +4692,8 @@ fn build_opd_store(
         use std::sync::Arc;
         let want_cuda = matches!(arg, OpdBackendArg::Cuda | OpdBackendArg::Auto);
         if want_cuda {
-            // Mesh-parallel: build an NCCL-backed backend so the shard collectives
-            // (all_gather_seq / reduce_scatter_sum / ring / a2a / weight+count
-            // all-reduce) have a communicator. The launcher publishes world rank +
-            // axis sizes + uid via env; both axes size<=1 keeps the single-card
-            // new(0) (byte-identical). Composed CP×DP splits a CP subgroup off the
-            // world comm inside new_with_mesh.
+            // Mesh env comes from the launcher; both axes size<=1 keeps the
+            // single-card new(0) byte-identical.
             let cp = train::context_parallel::CpContext::from_env();
             let dp = train::context_parallel::DpContext::from_env();
             let backend = if cp.is_enabled() || dp.is_enabled() {
@@ -4711,9 +4705,8 @@ fn build_opd_store(
                         .unwrap_or(0);
                     let uid = infer_api::nccl_unique_id_from_env()
                         .context("CP/DP: read INFER_NCCL_UNIQUE_ID")?;
-                    // World rank composes from the mesh-derived contexts (CP
-                    // inner) — the one layout authority; a composed mesh splits
-                    // a CP seq subgroup colored by the DP rank.
+                    // CP inner; the layout math lives only here, off the mesh
+                    // contexts — new_with_mesh stays layout-agnostic.
                     let world_rank = dp.rank * cp.size + cp.rank;
                     let seq_group =
                         (cp.is_enabled() && dp.is_enabled()).then_some((dp.rank, cp.size, cp.rank));

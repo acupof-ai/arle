@@ -24,11 +24,9 @@ use std::time::Duration;
 use anyhow::Context;
 use anyhow::Result;
 
-/// If this process is a spawned mesh worker (`ARLE_TRAIN_WORLD_RANK` set),
-/// install a `[cpN]`/`[dpN]`/`[cpNdpM]` stderr prefix and return true. Unlike
-/// serve's worker_entry this does NOT short-circuit dispatch — the child flows
-/// through clap into the normal agent-opd handler as its rank; `build_opd_store`
-/// reads the mesh env to build the NCCL backend (+ CP subgroup when composed).
+/// Spawned mesh worker (`ARLE_TRAIN_WORLD_RANK` set) → install a `[cpNdpM]`-style
+/// stderr prefix. Does NOT short-circuit dispatch — the child flows through clap
+/// into the normal agent-opd handler as its rank.
 pub(crate) fn install_mesh_worker_logger() -> bool {
     let Ok(rank) = std::env::var("ARLE_TRAIN_WORLD_RANK") else {
         return false;
@@ -45,13 +43,9 @@ pub(crate) fn install_mesh_worker_logger() -> bool {
     true
 }
 
-/// Coordinator side: if the mesh has more than one rank (`cp_size*dp_size > 1`)
-/// and this is NOT already a worker, mint the NCCL unique id, spawn one child per
-/// world rank (env `ARLE_TRAIN_WORLD_RANK` + both `ARLE_TRAIN_{CP,DP}_SIZE` +
-/// device + the minted uid; world rank = `dp_rank*cp + cp_rank`, CP inner), wait
-/// for the first to exit, and return `Ok(true)` so the caller returns without
-/// training itself. `Ok(false)` = run in-process (single-card, or this IS a
-/// spawned worker).
+/// Coordinator: spawn one child per world rank (`cp*dp`, CP inner) with the mesh
+/// env + minted NCCL uid, wait for the first exit. `Ok(true)` = caller returns
+/// without training; `Ok(false)` = run in-process (single card, or IS a worker).
 pub(crate) fn maybe_spawn_mesh_and_wait(
     cp_size: usize,
     dp_size: usize,

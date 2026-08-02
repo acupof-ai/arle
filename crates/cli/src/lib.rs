@@ -98,11 +98,8 @@ pub fn run() -> ExitCode {
     // multiproc coordinator was silently dropping it at `warn`.
     // Pre-clap sniff — this must run before `Args::parse` (workers/subcommands
     // early-return) and `init` is call_once, so parse-then-init is not an option.
-    // Mesh worker logger: a spawned CP/DP rank installs its own `[cpN]`/`[dpN]`/
-    // `[cpNdpM]`-prefixed logger before the generic call_once init below (which
-    // would otherwise win and drop the prefix). Unlike serve's worker_entry this
-    // does NOT short-circuit — the child flows through clap into the agent-opd
-    // handler.
+    // Mesh worker's prefixed logger must beat the call_once init below, which
+    // would otherwise win and drop the rank prefix.
     #[cfg(all(unix, feature = "cuda"))]
     let mesh_worker_logged = train_multiproc::install_mesh_worker_logger();
     #[cfg(not(all(unix, feature = "cuda")))]
