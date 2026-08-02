@@ -220,7 +220,11 @@ PY
             # serve (and every later boot) hits the warm page cache. Local dir
             # only (HF-ID model-paths resolve elsewhere); skip if already pinned.
             model_dir="$(serve_model_dir "$DIR/argv.nul" 2>/dev/null || true)"
-            if [ -n "$model_dir" ] && [ -d "$model_dir" ] && ! pgrep -f "pin_model_cache.py $model_dir" >/dev/null; then
+            # Anchor the pgrep to the exact dir at end-of-cmdline (real pin procs
+            # end in the model_dir): a bare substring would let an already-pinned
+            # /host/DSv4 suppress the pin of a prefix path like /host/DS.
+            pin_re="pin_model_cache\.py $(printf '%s' "$model_dir" | sed 's/[][\\.^$*+?(){}|]/\\&/g')\$"
+            if [ -n "$model_dir" ] && [ -d "$model_dir" ] && ! pgrep -f "$pin_re" >/dev/null; then
               setsid nohup python3 "$TREE/scripts/pin_model_cache.py" "$model_dir" \
                 >"$STATE/pin-model-cache.log" 2>&1 </dev/null &
               echo "auto-pin: launched for $model_dir (log: $STATE/pin-model-cache.log)"
