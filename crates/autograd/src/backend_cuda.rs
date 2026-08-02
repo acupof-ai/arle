@@ -258,7 +258,6 @@ impl CudaBackend {
         Ok(backend)
     }
 
-    /// Comm for `axis` — set at construction, never a fallback.
     #[cfg(all(feature = "nccl", not(feature = "no-cuda")))]
     fn comm(&self, axis: CommAxis) -> Option<&Arc<NcclBackend>> {
         match axis {

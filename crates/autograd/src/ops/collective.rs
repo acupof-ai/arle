@@ -7,8 +7,7 @@ use crate::{
     tensor::{TensorId, TensorStore},
 };
 
-/// Differentiable all-reduce sum over the world group (weight grads, counts,
-/// TP row-parallel — the tp group IS the world comm in dedicated TP runs).
+/// Differentiable all-reduce sum over the world group.
 ///
 /// Forward computes `y = sum_rank(x_rank)` through the backend collective.
 /// Backward applies the adjoint collective, so a loss evaluated on every rank
