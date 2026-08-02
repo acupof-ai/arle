@@ -1698,6 +1698,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "uuid",
+ "xgrammar-sys",
 ]
 
 [[package]]
