@@ -28,29 +28,20 @@
 #include <utility>
 
 // Upstream utils.cuh aliases; the kernels use these bare names.
-using fp32_t = float;
 using fp16_t = __half;
 using bf16_t = __nv_bfloat16;
-using fp32x2_t = float2;
 using fp16x2_t = __half2;
 using bf16x2_t = __nv_bfloat162;
 
-#ifndef SGL_DEVICE
-#define SGL_DEVICE __forceinline__ __device__
-#endif
-
 // The vendored kernels call div_ceil unqualified from inside namespace
 // device::marlin (args are int/unsigned → no ADL). Define it at global scope so
-// unqualified lookup finds it. host::div_ceil below re-exports for any qualified
-// caller.
+// unqualified lookup finds it.
 template <typename T, typename U>
 __host__ __device__ inline constexpr auto div_ceil(T a, U b) {
   return (a + b - 1) / b;
 }
 
 namespace host {
-
-using ::div_ceil;
 
 // Minimal source-location wrapper. The upstream DebugInfo derives from a
 // std::source_location; we only need file/line for panic messages, and
@@ -104,7 +95,6 @@ inline void RuntimeDeviceCheck(::cudaError_t error, DebugInfo location = {}) {
     ::host::panic(location, "CUDA error: ", ::cudaGetErrorString(error));
   }
 }
-inline void RuntimeDeviceCheck(DebugInfo location = {}) { return RuntimeDeviceCheck(::cudaGetLastError(), location); }
 
 // Plain-CUDA replacement for upstream's PDL/cluster LaunchKernel. Marlin's
 // marlin_mm/repack only ever call the 4-arg form (grid, block, stream, smem)

@@ -25,14 +25,6 @@
 
 namespace {
 
-// c_tmp float count for the fp32-reduce path (SGLang gptq_marlin.py:76-81):
-//   sms * min(ceil(m/16)*16, 64) * max_thread_n(256)
-inline int marlin_c_tmp_floats(int m, int sms) {
-  int max_m_block = ((m + 15) / 16) * 16;
-  if (max_m_block > 64) max_m_block = 64;
-  return sms * max_m_block * device::marlin::max_thread_n;
-}
-
 inline bool sm_supports_marlin(int dev, int* sms_out) {
   int major = 0;
   if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess) return false;
@@ -103,7 +95,6 @@ CUresult marlin_w8a16_gemm_cuda(
 
   int num_groups = k / group_size;
 
-  CUresult status = CUDA_SUCCESS;
   try {
     device::marlin::marlin_mm<__nv_bfloat16>(
         A, B_packed, C,
@@ -129,19 +120,25 @@ CUresult marlin_w8a16_gemm_cuda(
         false);    // is_zp_float
   } catch (...) {
     // marlin_mm panics (host::Panic/RuntimeCheck throw) on an invalid config.
-    status = CUDA_ERROR_INVALID_VALUE;
+    // A C++ exception must not cross the extern-C boundary (UB) — map to a code.
+    return CUDA_ERROR_INVALID_VALUE;
   }
 
-  if (status != CUDA_SUCCESS) return status;
   return (cudaGetLastError() == cudaSuccess) ? CUDA_SUCCESS : CUDA_ERROR_LAUNCH_FAILED;
 }
 
-// c_tmp float count for a given m/sms (SGLang gptq_marlin.py:76-81). The Rust
-// scratch allocates the m-independent MAX (m >= 64 → max_m_block = 64) once.
-int marlin_w8a16_c_tmp_floats(int m, int sms) { return marlin_c_tmp_floats(m, sms); }
+// c_tmp float count for the fp32-reduce path (SGLang gptq_marlin.py:76-81):
+//   sms * min(ceil(m/16)*16, 64) * max_thread_n(256). The Rust scratch allocates
+// the m-independent MAX (m >= 64 → max_m_block = 64) once.
+int marlin_w8a16_c_tmp_floats(int m, int sms) {
+  int max_m_block = ((m + 15) / 16) * 16;
+  if (max_m_block > 64) max_m_block = 64;
+  return sms * max_m_block * device::marlin::max_thread_n;
+}
 
-// Lock-buffer int count for the reserved workspace (>= sms; over-allocate to
-// sms * max_thread_m_blocks). Zero-initialize once on the Rust side.
+// Lock-buffer int count. Upstream sizes locks at sms * max_blocks_per_sm
+// (marlin_utils.py:416, default max_blocks_per_sm=1 → sms); 4× is headroom.
+// Zero-initialize once on the Rust side.
 int marlin_w8a16_workspace_ints(int sms) { return sms * 4; }
 
 }  // extern "C"

@@ -163,6 +163,9 @@ mod real {
         // Device W8A16 matrix (+ Marlin repack). from_quantized_int8 takes the
         // typed i8 weight + bf16 scale slices directly.
         let mut weight = DeviceMatrix::from_quantized_int8(ctx, &q, &s, n, k, GROUP)?;
+        // repack frees qweight/qscales, so upload the dequant-lane copy first.
+        let deq_qw = ctx.stream.clone_htod(&q)?;
+        let deq_qs = ctx.stream.clone_htod(&s)?;
         weight.repack_for_marlin_w8a16(ctx)?;
         ensure!(
             weight.marlin_packed.is_some(),
@@ -217,11 +220,9 @@ mod real {
         }
         // Lane 2: dequant→cuBLAS-BF16 (in-tree reference).
         {
-            let qw = weight.qweight.as_ref().unwrap();
-            let qs = weight.qscales.as_ref().unwrap();
             let wbf16 = ctx.stream.alloc_zeros::<bf16>(n * k)?;
-            let (qwp, _g0) = qw.device_ptr(&ctx.stream);
-            let (qsp, _g1) = qs.device_ptr(&ctx.stream);
+            let (qwp, _g0) = deq_qw.device_ptr(&ctx.stream);
+            let (qsp, _g1) = deq_qs.device_ptr(&ctx.stream);
             let (wp, _g2) = wbf16.device_ptr(&ctx.stream);
             let (xp, _g3) = x.device_ptr(&ctx.stream);
             let (op, _g4) = deq_out.device_ptr_mut(&ctx.stream);
