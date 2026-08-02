@@ -183,11 +183,10 @@ mod nccl_backend {
         /// membership: the number of ranks sharing `color` and this rank's `key`
         /// within that color (the caller knows both from the partition).
         ///
-        /// `// T2.3 will consume this` — DSv4 attn_tp / moe_ep sub-collectives.
+        /// Consumed by `autograd::CudaBackend::new_with_mesh` (CP×DP seq subgroup).
         ///
         /// # Errors
         /// Propagates the NCCL `ncclCommSplit` error.
-        #[allow(dead_code)] // T2.3 will consume this
         pub fn split(
             &self,
             color: i32,

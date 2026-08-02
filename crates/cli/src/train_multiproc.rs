@@ -24,37 +24,47 @@ use std::time::Duration;
 use anyhow::Context;
 use anyhow::Result;
 
-/// If this process is a spawned CP/DP worker (`ARLE_TRAIN_CP_RANK` or
-/// `ARLE_TRAIN_DP_RANK` set), install a `[cpN]`/`[dpN]` stderr prefix and return
-/// true. Unlike serve's worker_entry this does NOT short-circuit dispatch — the
-/// child flows through clap into the normal agent-opd handler as its rank;
-/// `build_opd_store` reads the CP/DP env to build the NCCL backend.
+/// If this process is a spawned mesh worker (`ARLE_TRAIN_WORLD_RANK` set),
+/// install a `[cpN]`/`[dpN]`/`[cpNdpM]` stderr prefix and return true. Unlike
+/// serve's worker_entry this does NOT short-circuit dispatch — the child flows
+/// through clap into the normal agent-opd handler as its rank; `build_opd_store`
+/// reads the mesh env to build the NCCL backend (+ CP subgroup when composed).
 pub(crate) fn install_cp_worker_logger() -> bool {
-    for (env, tag) in [("ARLE_TRAIN_CP_RANK", "cp"), ("ARLE_TRAIN_DP_RANK", "dp")] {
-        if let Ok(rank) = std::env::var(env) {
-            infer_util::logging::init_stderr_with_prefix("info", &format!("[{tag}{rank}] "));
-            return true;
-        }
-    }
-    false
+    let Ok(rank) = std::env::var("ARLE_TRAIN_WORLD_RANK") else {
+        return false;
+    };
+    let cp = train::context_parallel::CpContext::from_env();
+    let dp = train::context_parallel::DpContext::from_env();
+    let tag = match (cp.is_enabled(), dp.is_enabled()) {
+        (true, false) => format!("cp{}", cp.rank),
+        (false, true) => format!("dp{}", dp.rank),
+        (true, true) => format!("cp{}dp{}", cp.rank, dp.rank),
+        (false, false) => format!("r{rank}"),
+    };
+    infer_util::logging::init_stderr_with_prefix("info", &format!("[{tag}] "));
+    true
 }
 
-/// Coordinator side: if `size > 1` on the `axis` ("CP"/"DP") and this is NOT
-/// already a worker, mint the NCCL unique id, spawn `size` rank children (per-rank
-/// env `ARLE_TRAIN_{axis}_RANK`/`_SIZE` + device + the minted uid), wait for the
-/// first to exit, and return `Ok(true)` so the caller returns without training
-/// itself. `Ok(false)` = run in-process (single-card, or this IS a spawned worker).
-/// CP and DP are mutually exclusive here (combined needs ncclCommSplit subgroups,
-/// rejected in `build_opd_store`).
-pub(crate) fn maybe_spawn_ranks_and_wait(
-    axis: &str,
-    size: usize,
+/// Coordinator side: if the mesh has more than one rank (`cp_size*dp_size > 1`)
+/// and this is NOT already a worker, mint the NCCL unique id, spawn one child per
+/// world rank (env `ARLE_TRAIN_WORLD_RANK` + both `ARLE_TRAIN_{CP,DP}_SIZE` +
+/// device + the minted uid; world rank = `dp_rank*cp + cp_rank`, CP inner), wait
+/// for the first to exit, and return `Ok(true)` so the caller returns without
+/// training itself. `Ok(false)` = run in-process (single-card, or this IS a
+/// spawned worker).
+pub(crate) fn maybe_spawn_mesh_and_wait(
+    cp_size: usize,
+    dp_size: usize,
     devices: &[usize],
 ) -> Result<bool> {
-    if size <= 1
-        || std::env::var("ARLE_TRAIN_CP_RANK").is_ok()
-        || std::env::var("ARLE_TRAIN_DP_RANK").is_ok()
-    {
+    let (cp_size, dp_size) = (cp_size.max(1), dp_size.max(1));
+    let size = cp_size * dp_size;
+    let axis = match (cp_size > 1, dp_size > 1) {
+        (true, false) => "CP",
+        (false, true) => "DP",
+        _ => "CP×DP",
+    };
+    if size <= 1 || std::env::var("ARLE_TRAIN_WORLD_RANK").is_ok() {
         return Ok(false);
     }
 
@@ -65,16 +75,13 @@ pub(crate) fn maybe_spawn_ranks_and_wait(
     {
         let _ = devices;
         anyhow::bail!(
-            "{axis} parallelism (--{}-size {size}) requires the nccl feature; \
-             rebuild with --features cuda,nccl",
-            axis.to_lowercase()
+            "{axis} parallelism ({size} ranks) requires the nccl feature; \
+             rebuild with --features cuda,nccl"
         );
     }
 
     #[cfg(feature = "nccl")]
     {
-        let rank_env = format!("ARLE_TRAIN_{axis}_RANK");
-        let size_env = format!("ARLE_TRAIN_{axis}_SIZE");
         let exe = std::env::current_exe().context("current_exe")?;
         let mut children: Vec<(usize, std::process::Child)> = Vec::with_capacity(size);
         // Monotonic "last time any rank emitted a log line", in ms since `start`.
@@ -90,8 +97,9 @@ pub(crate) fn maybe_spawn_ranks_and_wait(
             for arg in std::env::args().skip(1) {
                 cmd.arg(arg);
             }
-            cmd.env(&rank_env, rank.to_string());
-            cmd.env(&size_env, size.to_string());
+            cmd.env("ARLE_TRAIN_WORLD_RANK", rank.to_string());
+            cmd.env("ARLE_TRAIN_CP_SIZE", cp_size.to_string());
+            cmd.env("ARLE_TRAIN_DP_SIZE", dp_size.to_string());
             cmd.env("INFER_CUDA_DEVICE", device.to_string());
             cmd.env("INFER_NCCL_UNIQUE_ID", &uid_hex);
             // Pipe stderr so a forwarder thread can watch for liveness; the worker's

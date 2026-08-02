@@ -2275,8 +2275,9 @@ pub(crate) struct TrainAgentOpdArgs {
 
     /// Data-parallel group size (batch sharded across N GPUs, one process per
     /// rank; weights replicated, grads all-reduced). 1 = single-card (default,
-    /// byte-identical). >1 spawns N ranks and requires the nccl feature. Combined
-    /// with cp_size>1 is not yet wired (needs ncclCommSplit subgroups).
+    /// byte-identical). >1 spawns N ranks and requires the nccl feature.
+    /// Composes with cp_size>1 (world = cp*dp; seq collectives run on a
+    /// ncclCommSplit CP subgroup, grad/count all-reduces on the world comm).
     #[arg(long, default_value_t = 1)]
     pub(crate) dp_size: usize,
 
@@ -2323,29 +2324,18 @@ pub(crate) struct TrainAgentOpdArgs {
 }
 
 impl TrainAgentOpdArgs {
-    /// Per-rank CUDA device ordinals for context parallelism. `--cp-devices` if
-    /// set (must be `cp_size` entries), else `0..cp_size`.
+    /// Per-rank CUDA device ordinals for the CP×DP mesh (world = cp*dp, CP
+    /// inner). `--cp-devices` (or `--dp-devices`) if set — one entry per world
+    /// rank — else `0..world`.
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-    pub(crate) fn cp_devices(&self) -> Vec<usize> {
-        match &self.cp_devices {
+    pub(crate) fn mesh_devices(&self) -> Vec<usize> {
+        let world = self.cp_size.max(1) * self.dp_size.max(1);
+        match self.cp_devices.as_ref().or(self.dp_devices.as_ref()) {
             Some(spec) => spec
                 .split(',')
                 .filter_map(|s| s.trim().parse().ok())
                 .collect(),
-            None => (0..self.cp_size.max(1)).collect(),
-        }
-    }
-
-    /// Per-rank CUDA device ordinals for data parallelism. `--dp-devices` if set
-    /// (must be `dp_size` entries), else `0..dp_size`.
-    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-    pub(crate) fn dp_devices(&self) -> Vec<usize> {
-        match &self.dp_devices {
-            Some(spec) => spec
-                .split(',')
-                .filter_map(|s| s.trim().parse().ok())
-                .collect(),
-            None => (0..self.dp_size.max(1)).collect(),
+            None => (0..world).collect(),
         }
     }
 
