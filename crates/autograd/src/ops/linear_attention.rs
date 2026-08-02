@@ -434,9 +434,7 @@ pub fn linear_attention_core_cp(
     let b_proj = crate::ops::all_to_all(b_proj, 1, 2, store, tape)?;
     let a_proj = crate::ops::all_to_all(a_proj, 1, 2, store, tape)?;
 
-    // Zigzag+a2a interleaves the 2N seq blocks as [c0,c_{2N-1},c1,c_{2N-2},...];
-    // the recurrence needs true global order. `fwd` un-interleaves; `phys` (its
-    // inverse) restores the a2a layout before the output shuffle.
+    // a2a leaves the seq blocks interleaved; the recurrence needs true global order.
     let (fwd, phys) = zigzag_block_perms(n);
     let qkv = reorder_seq_blocks(qkv, &fwd, store, tape)?;
     let z = reorder_seq_blocks(z, &fwd, store, tape)?;
@@ -494,24 +492,20 @@ pub fn linear_attention_core_cp(
         store,
         tape,
     )?;
-    // Global order -> a2a physical layout, then [b, full_seq, v_dim/N] ->
-    // [b, local_seq, v_dim]: sequence shard restored.
+    // Global order -> a2a physical layout, then restore the [b, local_seq, v_dim] shard.
     let out = reorder_seq_blocks(out, &phys, store, tape)?;
     crate::ops::all_to_all(out, 2, 1, store, tape)
 }
 
-/// Zigzag+a2a interleaves the `2N` equal seq blocks: rank `r` owns global chunks
-/// `r` and `2N-1-r` (in that local order), and a2a lays ranks out in order, so
-/// physical block `2r` = global chunk `r`, block `2r+1` = global chunk `2N-1-r`.
-/// Returns `(fwd, phys)`: `fwd[g]` = physical block holding global chunk `g`
-/// (un-interleave for the scan); `phys` = its inverse (re-interleave before the
-/// output a2a). Inverses by construction, checked in tests.
+/// `(fwd, phys)` for the `2N`-block seq permutation. Zigzag gives rank `r` global
+/// chunks `r`,`2N-1-r`; a2a lays ranks in order, so physical block `2r`=chunk `r`,
+/// `2r+1`=chunk `2N-1-r`. `fwd` un-interleaves to global order, `phys` inverts it.
 fn zigzag_block_perms(n: usize) -> (Vec<usize>, Vec<usize>) {
     let two_n = 2 * n;
     let mut fwd = vec![0usize; two_n];
     for r in 0..n {
-        fwd[r] = 2 * r; // global chunk r sits in physical block 2r
-        fwd[two_n - 1 - r] = 2 * r + 1; // global chunk 2N-1-r in block 2r+1
+        fwd[r] = 2 * r;
+        fwd[two_n - 1 - r] = 2 * r + 1;
     }
     let mut phys = vec![0usize; two_n];
     for (g, &p) in fwd.iter().enumerate() {
@@ -520,10 +514,8 @@ fn zigzag_block_perms(n: usize) -> (Vec<usize>, Vec<usize>) {
     (fwd, phys)
 }
 
-/// Permute the `perm.len()` equal blocks of `x`'s sequence axis (axis 1): output
-/// block `i` = input block `perm[i]`. Pure slice+cat, so backward reassembles the
-/// gradient blocks automatically. `full_seq % perm.len() == 0` is guaranteed by
-/// the zigzag pad.
+/// Permute `x`'s seq axis by blocks: output block `i` = input block `perm[i]`.
+/// Pure slice+cat, so backward reassembles the gradient blocks for free.
 fn reorder_seq_blocks(
     x: TensorId,
     perm: &[usize],

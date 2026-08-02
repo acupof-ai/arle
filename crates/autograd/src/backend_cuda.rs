@@ -4604,10 +4604,9 @@ fn cuda_copy_range<T: DeviceRepr>(
     Ok(out)
 }
 
-/// Concatenate N f32 device tensors along `axis` (equal shapes off `axis`),
-/// staying on-device. `cuda_concat_parts` only concats the outermost axis, so
-/// transpose `axis`→0, concat, transpose back — correct for any axis, identity
-/// when axis==0. Shared by `all_to_all_device` assembly and the `concat` trait.
+/// Concat N f32 device tensors along `axis`, on-device. `cuda_concat_parts` only
+/// does the outermost axis, so transpose `axis`→0, concat, transpose back
+/// (identity when axis==0). Shared by `all_to_all_device` assembly and `concat`.
 #[cfg(not(feature = "no-cuda"))]
 fn cuda_concat_axis(
     backend: &CudaBackend,
