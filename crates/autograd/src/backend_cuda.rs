@@ -26,7 +26,7 @@ use crate::{
 use crate::{
     Result,
     backend::{
-        Backend, CausalSdpaDeviceBackwardArgs, CausalSdpaDeviceGradTriplet, Device,
+        Backend, CausalSdpaDeviceBackwardArgs, CausalSdpaDeviceGradTriplet, CommAxis, Device,
         DeviceGradClipResult, DeviceHandle, LinearAttentionDeviceBackwardArgs,
         LinearAttentionDeviceBackwardResult, LinearAttentionDeviceBoundaryArgs,
         LinearAttentionDeviceForwardArgs, LinearAttentionDeviceForwardResult,
@@ -258,10 +258,13 @@ impl CudaBackend {
         Ok(backend)
     }
 
-    /// Seq-axis comm — set at construction, never a fallback.
+    /// Comm for `axis` — set at construction, never a fallback.
     #[cfg(all(feature = "nccl", not(feature = "no-cuda")))]
-    fn seq_nccl(&self) -> Option<&Arc<NcclBackend>> {
-        self.nccl_seq.as_ref()
+    fn comm(&self, axis: CommAxis) -> Option<&Arc<NcclBackend>> {
+        match axis {
+            CommAxis::World => self.nccl.as_ref(),
+            CommAxis::Seq => self.nccl_seq.as_ref(),
+        }
     }
 
     /// No-GPU stub for no-cuda builds that still type-check the nccl feature.
@@ -2131,10 +2134,15 @@ impl Backend for CudaBackend {
         }
     }
 
-    fn all_reduce_sum_device(&self, x: &DeviceHandle, shape: &[usize]) -> Result<DeviceHandle> {
+    fn all_reduce_sum_device(
+        &self,
+        x: &DeviceHandle,
+        shape: &[usize],
+        axis: CommAxis,
+    ) -> Result<DeviceHandle> {
         #[cfg(feature = "no-cuda")]
         {
-            let _ = (x, shape);
+            let _ = (x, shape, axis);
             todo!("GPU required: cuda all_reduce_sum_device is unavailable under feature no-cuda")
         }
 
@@ -2158,7 +2166,7 @@ impl Backend for CudaBackend {
                 .map_err(|_| AutogradError::TapeInvariant("cuda all_reduce D2D copy failed"))?;
 
             #[cfg(all(feature = "nccl", not(feature = "no-cuda")))]
-            if let Some(nccl) = &self.nccl {
+            if let Some(nccl) = self.comm(axis) {
                 let (dst_ptr, _dst_guard) = out.device_ptr_mut(&self.stream);
                 unsafe {
                     nccl.all_reduce(
@@ -2180,10 +2188,11 @@ impl Backend for CudaBackend {
         &self,
         x: &DeviceHandle,
         local_shape: &[usize],
+        axis: CommAxis,
     ) -> Result<DeviceHandle> {
         #[cfg(feature = "no-cuda")]
         {
-            let _ = (x, local_shape);
+            let _ = (x, local_shape, axis);
             todo!("GPU required: cuda all_gather_seq_device is unavailable under feature no-cuda")
         }
 
@@ -2205,7 +2214,7 @@ impl Backend for CudaBackend {
             // this branch skips the in-place NCCL write, so sharing the input Arc is
             // safe — no alloc, no D2D copy.
             #[cfg(all(feature = "nccl", not(feature = "no-cuda")))]
-            let world = self.seq_nccl().map_or(1, |nccl| nccl.world_size());
+            let world = self.comm(axis).map_or(1, |nccl| nccl.world_size());
             #[cfg(not(all(feature = "nccl", not(feature = "no-cuda"))))]
             let world = 1usize;
             if world <= 1 {
@@ -2220,7 +2229,7 @@ impl Backend for CudaBackend {
                 let mut out = self.stream.alloc_zeros::<f32>(full_len).map_err(|_| {
                     AutogradError::TapeInvariant("cuda all_gather_seq full alloc failed")
                 })?;
-                let nccl = self.seq_nccl().expect("world>1 implies nccl present");
+                let nccl = self.comm(axis).expect("world>1 implies nccl present");
                 // Scope the device-ptr guards so their SyncOnDrop borrow of `out`
                 // ends before `out` is moved into the handle (mirrors the implicit
                 // drop in all_reduce_sum_device's `if let` block).
@@ -2249,10 +2258,11 @@ impl Backend for CudaBackend {
         &self,
         x: &DeviceHandle,
         local_shape: &[usize],
+        axis: CommAxis,
     ) -> Result<DeviceHandle> {
         #[cfg(feature = "no-cuda")]
         {
-            let _ = (x, local_shape);
+            let _ = (x, local_shape, axis);
             todo!(
                 "GPU required: cuda reduce_scatter_sum_device is unavailable under feature no-cuda"
             )
@@ -2264,7 +2274,7 @@ impl Backend for CudaBackend {
             let src = self.cuda_slice(x, "reduce_scatter_sum")?;
 
             #[cfg(all(feature = "nccl", not(feature = "no-cuda")))]
-            let world = self.seq_nccl().map_or(1, |nccl| nccl.world_size());
+            let world = self.comm(axis).map_or(1, |nccl| nccl.world_size());
             #[cfg(not(all(feature = "nccl", not(feature = "no-cuda"))))]
             let world = 1usize;
             if world <= 1 {
@@ -2292,7 +2302,7 @@ impl Backend for CudaBackend {
                 let mut out = self.stream.alloc_zeros::<f32>(local_len).map_err(|_| {
                     AutogradError::TapeInvariant("cuda reduce_scatter_sum alloc failed")
                 })?;
-                let nccl = self.seq_nccl().expect("world>1 implies nccl present");
+                let nccl = self.comm(axis).expect("world>1 implies nccl present");
                 // Scope the device-ptr guards so their SyncOnDrop borrow of `out`
                 // ends before `out` is moved into the handle.
                 {
@@ -2343,7 +2353,7 @@ impl Backend for CudaBackend {
             }
 
             #[cfg(all(feature = "nccl", not(feature = "no-cuda")))]
-            let world = self.seq_nccl().map_or(1, |nccl| nccl.world_size());
+            let world = self.comm(CommAxis::Seq).map_or(1, |nccl| nccl.world_size());
             #[cfg(not(all(feature = "nccl", not(feature = "no-cuda"))))]
             let world = 1usize;
             // Single rank: the ring degenerates to the local block (identity).
@@ -2357,7 +2367,9 @@ impl Backend for CudaBackend {
             // launcher pads seq to a multiple of world), so recv fills `len`.
             #[cfg(all(feature = "nccl", not(feature = "no-cuda")))]
             {
-                let nccl = self.seq_nccl().expect("world>1 implies nccl present");
+                let nccl = self
+                    .comm(CommAxis::Seq)
+                    .expect("world>1 implies nccl present");
                 let rank = nccl.rank();
                 let next = (rank + 1) % world;
                 let prev = (rank + world - 1) % world;
@@ -2392,10 +2404,11 @@ impl Backend for CudaBackend {
         in_shape: &[usize],
         scatter_axis: usize,
         gather_axis: usize,
+        axis: CommAxis,
     ) -> Result<(DeviceHandle, Vec<usize>)> {
         #[cfg(feature = "no-cuda")]
         {
-            let _ = (x, in_shape, scatter_axis, gather_axis);
+            let _ = (x, in_shape, scatter_axis, gather_axis, axis);
             todo!("GPU required: cuda all_to_all_device is unavailable under feature no-cuda")
         }
 
@@ -2418,7 +2431,7 @@ impl Backend for CudaBackend {
             }
 
             #[cfg(all(feature = "nccl", not(feature = "no-cuda")))]
-            let world = self.seq_nccl().map_or(1, |nccl| nccl.world_size());
+            let world = self.comm(axis).map_or(1, |nccl| nccl.world_size());
             #[cfg(not(all(feature = "nccl", not(feature = "no-cuda"))))]
             let world = 1usize;
             // Single rank: no rank to shuffle to — identity on shape and value.
@@ -2457,7 +2470,7 @@ impl Backend for CudaBackend {
 
                 // Transport: one NCCL group of send/recv pairs. Own chunk (j==rank)
                 // is reused from `send` — no self NCCL op, no self copy, no deadlock.
-                let nccl = self.seq_nccl().expect("world>1 implies nccl present");
+                let nccl = self.comm(axis).expect("world>1 implies nccl present");
                 let rank = nccl.rank();
                 let mut recv: Vec<Option<CudaSlice<f32>>> = (0..n).map(|_| None).collect();
                 for (j, slot) in recv.iter_mut().enumerate() {

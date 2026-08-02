@@ -30,7 +30,7 @@ pub mod tensor;
 
 #[cfg(feature = "metal")]
 pub use backend::MlxHandle;
-pub use backend::{Backend, CpuBackend, Device, DeviceHandle};
+pub use backend::{Backend, CommAxis, CpuBackend, Device, DeviceHandle};
 pub use lr_schedule::{ConstantLr, CosineWithWarmup, LinearWarmup, LrSchedule, parse_lr_schedule};
 pub use optim::{AdamW, Optimizer};
 #[cfg(feature = "safetensors")]

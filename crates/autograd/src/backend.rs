@@ -455,6 +455,15 @@ pub struct LinearAttentionDeviceBackwardResult {
     pub dnorm: DeviceHandle,
 }
 
+/// Which communicator group a collective runs on. `Seq` is the CP subgroup
+/// under a composed mesh (== `World` on single-axis meshes); `World` spans
+/// every rank — weight-grad/count reduces and cross-replica guards.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommAxis {
+    World,
+    Seq,
+}
+
 pub trait Backend: std::fmt::Debug + Send + Sync {
     fn device(&self) -> Device;
 
@@ -1043,12 +1052,18 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         self.add_into_device(dest, src, shape)
     }
 
-    /// Device-handle all-reduce sum over the backend communicator.
+    /// Device-handle all-reduce sum over the `axis` communicator.
     /// Single-rank and CPU semantics are identity.
     ///
     /// The operation is functional: it returns a fresh handle and never
     /// mutates `x`, so tape consumers can keep sharing the input handle.
-    fn all_reduce_sum_device(&self, x: &DeviceHandle, shape: &[usize]) -> Result<DeviceHandle> {
+    fn all_reduce_sum_device(
+        &self,
+        x: &DeviceHandle,
+        shape: &[usize],
+        axis: CommAxis,
+    ) -> Result<DeviceHandle> {
+        let _ = axis;
         let host = self.readback(x)?;
         let size = shape_size(shape);
         if host.len() != size {
@@ -1069,7 +1084,9 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         &self,
         x: &DeviceHandle,
         local_shape: &[usize],
+        axis: CommAxis,
     ) -> Result<DeviceHandle> {
+        let _ = axis;
         let host = self.readback(x)?;
         let size = shape_size(local_shape);
         if host.len() != size {
@@ -1090,7 +1107,9 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         &self,
         x: &DeviceHandle,
         local_shape: &[usize],
+        axis: CommAxis,
     ) -> Result<DeviceHandle> {
+        let _ = axis;
         let host = self.readback(x)?;
         let size = shape_size(local_shape);
         if host.len() != size {
@@ -1138,8 +1157,9 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         in_shape: &[usize],
         scatter_axis: usize,
         gather_axis: usize,
+        axis: CommAxis,
     ) -> Result<(DeviceHandle, Vec<usize>)> {
-        let _ = (scatter_axis, gather_axis);
+        let _ = (scatter_axis, gather_axis, axis);
         let host = self.readback(x)?;
         let size = shape_size(in_shape);
         if host.len() != size {
