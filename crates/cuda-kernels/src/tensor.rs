@@ -3520,11 +3520,14 @@ impl DeviceMatrix {
         }
         let n = self.rows; // output dim
         let k = self.cols; // input dim
-        // Marlin tiles: K%tile_k(16)==0, N%tile_n(64)==0; GEMM: K%group_size==0.
-        if !k.is_multiple_of(16) || !n.is_multiple_of(64) || !k.is_multiple_of(self.group_size) {
+        // kU8B128 is instantiated only for gs ∈ {32,64,128}; other gs → no-op kernel.
+        if !k.is_multiple_of(16)
+            || !n.is_multiple_of(64)
+            || !k.is_multiple_of(self.group_size)
+            || !matches!(self.group_size, 32 | 64 | 128)
+        {
             log::warn!(
-                "Marlin W8A16 repack skipped: [{n}x{k}] gs={} not tile/group-aligned \
-                 (need K%16==0, N%64==0, K%gs==0); using scalar path",
+                "Marlin W8A16 repack skipped: [{n}x{k}] gs={} (need K%16, N%64, gs∈{{32,64,128}}); scalar path",
                 self.group_size
             );
             return Ok(());
@@ -3614,6 +3617,10 @@ impl DeviceMatrix {
 
         self.marlin_packed = Some(marlin_gpu);
         self.marlin_scales = Some(scales_gpu);
+        // Marlin consumes only marlin_packed/marlin_scales; drop the source int8
+        // weight + scales to realize the W8A16 VRAM win (else both resident).
+        self.qweight = None;
+        self.qscales = None;
 
         Ok(())
     }
