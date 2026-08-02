@@ -21,10 +21,11 @@ kernels align to SGLang), and is zero-torch (TVM-FFI, not at::Tensor).
 
 W8A16 upcasts int8→bf16 in registers and runs `mma` at bf16 rate = ½ fp8 rate,
 so it **cannot** beat fp8 in compute-bound prefill. But decode is
-bandwidth-bound: time/step ≈ weight_bytes / HBM_bw, and int8 moves 1 byte/param
-vs bf16's 2 → up to **2× faster decode**. Predicted: bf16-class decode speed at
-fp8-class VRAM, better-than-fp8 accuracy. The win is decode latency + VRAM, not
-prefill throughput.
+bandwidth-bound: time/step ≈ weight_bytes / HBM_bw. int8 moves 1 byte/param + a
+bf16 group scale — at g=128 that's 1.016 B/param vs bf16's 2, so the decode
+ceiling is **1.94×**, not a clean 2× (the +8 % over ½ is scales + tile layout).
+Predicted: bf16-class decode speed at fp8-class VRAM, better-than-fp8 accuracy.
+The win is decode latency + VRAM, not prefill throughput.
 
 ## Parameters
 
@@ -66,11 +67,12 @@ python3 scripts/bench_throughput.py \
 | 8 | 47.4 | 134.7 | 51.8 | (confounded) | 2.84× |
 
 **c=1 is the only clean point** — pure decode, no concurrent prefill. 26.9 vs
-bf16 46.5 ms = 1.73×, decisively **under** the 2× weight-bandwidth ceiling: the
-predicted physics. c=4/8 mix decode ITL with in-flight 32k-prefill stalls (bf16
-c=4 is a non-monotone pothole, 166 ms > its own c=8 51.8 ms — a scheduler
-artifact, not a GEMM property), so their ratios are not a decode measurement.
-Output tok/s is a prefill metric here (256-tok outputs behind 17–81 s TTFT).
+bf16 46.5 ms = 1.73×, **89 % of the 1.94× weight-bandwidth ceiling** (g=128
+scales included): the predicted physics. c=4/8 mix decode ITL with in-flight
+32k-prefill stalls (bf16 c=4 is a non-monotone pothole, 166 ms > its own c=8
+51.8 ms — a scheduler artifact, not a GEMM property), so their ratios are not a
+decode measurement. Output tok/s is a prefill metric here (256-tok outputs
+behind 17–81 s TTFT).
 
 ## Results — VRAM (P1: free the int8 source after repack)
 
@@ -102,8 +104,26 @@ bf16 group-scales). KV capacity 1.74× on the same GPU — the downstream payoff
 ## Learnings
 
 **PASS at c=1: W8A16 Marlin decode is 1.73× bf16 (26.9 vs 46.5 ms ITL) at 0.58×
-the weight VRAM, sm_90, graph-captured fast path.** The value prop holds:
-bf16-class decode at fp8-class VRAM with better-than-fp8 accuracy. Not a
-prefill/large-batch win (bf16-rate mma) — do not bench there for a win. Next
-wall: sm_120 fleet-coverage run, and c-sweep on a multi-H20 box where 32k×8
-isn't prefill-bound.
+the weight VRAM, sm_90, graph-captured fast path.** That's **89 % of the 1.94×
+bandwidth ceiling** (g=128 scales included) — the predicted physics. The value
+prop holds: bf16-class decode at fp8-class VRAM with better-than-fp8 accuracy.
+Not a prefill/large-batch win (bf16-rate mma) — do not bench there for a win.
+
+**SOTA framing — honest bounds.** The hot GEMM is SGLang/vLLM's own
+`gptq_marlin` (their W8A16 backend is `kU8B128`, same kernel), so **per-op we
+are the SOTA kernel by provenance** — the matmul cannot be beaten, only the
+integration around it (capture / attention / sync). What is NOT yet shown is an
+end-to-end **win over SGLang**: 1.73× is vs ARLE's own bf16, not vs SGLang
+W8A16. Upgrading "near-ceiling" to "SOTA-competitive" needs a matched A/B — same
+GPU, model, weights, context, c=1 — decode tok/s + p50/p99 ITL vs SGLang itself.
+
+**Why W8A16 and not W4A16 (a stronger decode target).** Same Marlin kernel
+family runs W4A16 at a ~3.87× ceiling (0.5 B/param) — roughly 2× this path's
+1.94×. We chose int8 for **accuracy**: symmetric per-group int8 is near-lossless
+vs the int4 quality hit, and pairs with bf16 activations for a
+better-than-fp8-accuracy decode. If a future workload prioritizes decode speed
+over accuracy, W4A16 on the same kernel is the more aggressive SOTA lever.
+
+Next wall: matched A/B vs SGLang W8A16 (the real SOTA-competitive claim);
+sm_120 fleet-coverage run; c-sweep on a multi-H20 box where 32k×8 isn't
+prefill-bound.
