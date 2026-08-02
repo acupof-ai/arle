@@ -90,6 +90,21 @@ if not port.isdigit() or not 1 <= int(port) <= 65535: raise SystemExit(f"invalid
 print(port)
 PY
 }
+# Model dir of a recorded `serve` argv (empty for any other command), so the
+# cold-boot auto-pin below fires only when we are about to load weights.
+serve_model_dir() {
+  python3 - "$1" <<'PY'
+import os, sys
+args = [os.fsdecode(x) for x in open(sys.argv[1], "rb").read().split(b"\0") if x]
+if not args or args[0] != "serve": raise SystemExit(0)
+i = 0
+while i < len(args):
+    a = args[i]
+    if a == "--model-path" and i + 1 < len(args): print(args[i + 1]); break
+    if a.startswith("--model-path="): print(a.split("=", 1)[1]); break
+    i += 1
+PY
+}
 
 case "${1:-}" in
   status|log|kill)
@@ -200,6 +215,16 @@ PY
           else
             # shellcheck disable=SC1091
             source "$TREE/scripts/pod-build-env.sh"
+            # Cold-boot auto-pin: /host reads at ~0.2 GB/s, so a re-read of the
+            # weights is 25 min. mlock them once, detached and idempotent, so the
+            # serve (and every later boot) hits the warm page cache. Local dir
+            # only (HF-ID model-paths resolve elsewhere); skip if already pinned.
+            model_dir="$(serve_model_dir "$DIR/argv.nul" 2>/dev/null || true)"
+            if [ -n "$model_dir" ] && [ -d "$model_dir" ] && ! pgrep -f "pin_model_cache.py $model_dir" >/dev/null; then
+              setsid nohup python3 "$TREE/scripts/pin_model_cache.py" "$model_dir" \
+                >"$STATE/pin-model-cache.log" 2>&1 </dev/null &
+              echo "auto-pin: launched for $model_dir (log: $STATE/pin-model-cache.log)"
+            fi
             if [ "${#selected_gpus[@]}" -eq 1 ]; then
               CUDA_VISIBLE_DEVICES="$selected_gpu" INFER_CUDA_DEVICE=0 python3 "$TREE/scripts/reap_run.py" "$OP" --argv-file "$DIR/argv.nul" "$binary"; rc=$?
             else
