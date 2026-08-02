@@ -455,9 +455,7 @@ pub struct LinearAttentionDeviceBackwardResult {
     pub dnorm: DeviceHandle,
 }
 
-/// Which communicator group a collective runs on. `Seq` is the CP subgroup
-/// under a composed mesh (== `World` on single-axis meshes); `World` spans
-/// every rank — weight-grad/count reduces and cross-replica guards.
+/// Communicator group: `Seq` = CP subgroup (== `World` off a composed mesh).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CommAxis {
     World,
