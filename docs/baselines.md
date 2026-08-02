@@ -152,12 +152,14 @@ costs what decoding 1 costs. Spec decode is working; the intercept is the wall.
 `ARMED` but produces zero `cuGraph*` calls (its call site sits below an
 unconditional paged-KV early return).
 
-**`--qwen35-gdr-chunked` is OPT-IN and correctness-blocked** (flipped on then
-reverted 2026-08-02, `715c37a0c`): 33K cold prefill −26% and needle 9/9 exact,
-but **GSM8K 11/100 vs recurrent 46/100** — a prefill-state error that
-long-form generation compounds and short-recall gates miss
-([win](experience/wins/2026-08-02-flashqla-chunked-gdr-h48.md) has the full
-record). Do not enable for real serving until the errors entry closes.
+**`--qwen35-gdr-chunked` is OPT-IN, kernels adjudicated correct** (2026-08-02):
+33K cold prefill −26%, needle 9/9, per-layer parity ≤5.7e-3 on the failing
+request itself, **chat-template GSM 14/15 = recurrent** — the raw-8-shot
+11/100-vs-46/100 collapse was bf16 drift shifting an EOS knife edge the
+harness itself sits on (recurrent EOSes 3/12 at temp 0.7 there). Default
+flip pending a chat-format battery; raw-completion degradation is a real,
+named trade
+([error](experience/errors/2026-08-02-gdr-chunked-gsm-collapse-was-a-knife-edge-harness.md)).
 
 ---
 
