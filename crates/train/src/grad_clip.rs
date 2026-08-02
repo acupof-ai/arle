@@ -1,7 +1,7 @@
 //! Gradient clipping — free functions (`clip_grad_norm` /
 //! `compute_global_norm_f64`) used by the OPD training loops.
 
-use autograd::{AutogradError, Device, Optimizer, TensorId, TensorStore, tensor::Dirty};
+use autograd::{AutogradError, CommAxis, Device, Optimizer, TensorId, TensorStore, tensor::Dirty};
 
 #[derive(Debug, thiserror::Error)]
 pub enum FiniteStepError {
@@ -213,7 +213,9 @@ fn try_clip_grad_norm_device(params: &[TensorId], max_norm: f32, store: &mut Ten
 /// `local` unchanged — byte-identical.
 pub fn dp_group_sum_count(local: usize, store: &mut TensorStore) -> Result<usize, AutogradError> {
     let handle = store.backend().upload(&[local as f32], &[1])?;
-    let reduced = store.backend().all_reduce_sum_device(&handle, &[1])?;
+    let reduced = store
+        .backend()
+        .all_reduce_sum_device(&handle, &[1], CommAxis::World)?;
     let summed = store.backend().readback(&reduced)?;
     Ok(summed.first().map(|&v| v.round() as usize).unwrap_or(local))
 }
@@ -271,7 +273,9 @@ pub fn all_reduce_cp_grads(
                 .clone();
             (handle, grad.shape.clone())
         };
-        let reduced = store.backend().all_reduce_sum_device(&handle, &shape)?;
+        let reduced = store
+            .backend()
+            .all_reduce_sum_device(&handle, &shape, CommAxis::World)?;
         store.replace_device_handle(grad_id, reduced)?;
     }
     Ok(())
@@ -296,7 +300,9 @@ fn assert_cp_param_layout_agrees(
         .map(|&id| store.get(id).map_or(0.0, |t| t.size as f32))
         .collect();
     let handle = store.backend().upload(&local, &[n])?;
-    let gathered = store.backend().all_gather_seq_device(&handle, &[n])?;
+    let gathered = store
+        .backend()
+        .all_gather_seq_device(&handle, &[n], CommAxis::World)?;
     let gathered = store.backend().readback(&gathered)?;
     let world = gathered.len() / n; // world==1 → identity, loop is a no-op
     for rank in 1..world {

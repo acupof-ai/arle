@@ -2,11 +2,13 @@ use smallvec::smallvec;
 
 use crate::{
     AutogradError, Result,
+    backend::CommAxis,
     tape::{BackwardOp, GradPairs, SavedContext, Tape, TapeEntry},
     tensor::{TensorId, TensorStore},
 };
 
-/// Differentiable all-reduce sum.
+/// Differentiable all-reduce sum over the world group (weight grads, counts,
+/// TP row-parallel — the tp group IS the world comm in dedicated TP runs).
 ///
 /// Forward computes `y = sum_rank(x_rank)` through the backend collective.
 /// Backward applies the adjoint collective, so a loss evaluated on every rank
@@ -25,9 +27,10 @@ pub fn all_reduce_sum(x: TensorId, store: &mut TensorStore, tape: &mut Tape) -> 
         (tensor.shape.clone(), handle)
     };
 
-    let out_handle = store
-        .backend()
-        .all_reduce_sum_device(&input_handle, &shape)?;
+    let out_handle =
+        store
+            .backend()
+            .all_reduce_sum_device(&input_handle, &shape, CommAxis::World)?;
     let output_id = store.alloc_device_tensor(shape.clone(), out_handle)?;
 
     TapeEntry {
@@ -76,9 +79,10 @@ pub(crate) fn all_reduce_sum_backward(
             "all_reduce_sum backward: upstream missing device handle",
         ))?
         .clone();
-    let grad_handle = store
-        .backend()
-        .all_reduce_sum_device(&upstream_handle, shape)?;
+    let grad_handle =
+        store
+            .backend()
+            .all_reduce_sum_device(&upstream_handle, shape, CommAxis::World)?;
     let grad_id = store.alloc_device_tensor(shape.clone(), grad_handle)?;
     Ok(smallvec![(x, grad_id)])
 }
@@ -108,9 +112,10 @@ pub fn all_gather_seq(
         (tensor.shape.clone(), handle)
     };
 
-    let out_handle = store
-        .backend()
-        .all_gather_seq_device(&input_handle, &local_shape)?;
+    let out_handle =
+        store
+            .backend()
+            .all_gather_seq_device(&input_handle, &local_shape, CommAxis::Seq)?;
     let output_id = store.alloc_device_tensor(full_shape, out_handle)?;
 
     TapeEntry {
@@ -152,9 +157,10 @@ pub(crate) fn all_gather_seq_backward(
             "all_gather_seq backward: upstream missing device handle",
         ))?
         .clone();
-    let grad_handle = store
-        .backend()
-        .reduce_scatter_sum_device(&upstream_handle, &local_shape)?;
+    let grad_handle =
+        store
+            .backend()
+            .reduce_scatter_sum_device(&upstream_handle, &local_shape, CommAxis::Seq)?;
     let grad_id = store.alloc_device_tensor(local_shape, grad_handle)?;
     Ok(smallvec![(x, grad_id)])
 }
@@ -182,9 +188,10 @@ pub fn reduce_scatter_sum(
         (tensor.shape.clone(), handle)
     };
 
-    let out_handle = store
-        .backend()
-        .reduce_scatter_sum_device(&input_handle, &local_shape)?;
+    let out_handle =
+        store
+            .backend()
+            .reduce_scatter_sum_device(&input_handle, &local_shape, CommAxis::Seq)?;
     let output_id = store.alloc_device_tensor(local_shape, out_handle)?;
 
     TapeEntry {
@@ -225,9 +232,10 @@ pub(crate) fn reduce_scatter_sum_backward(
             "reduce_scatter_sum backward: upstream missing device handle",
         ))?
         .clone();
-    let grad_handle = store
-        .backend()
-        .all_gather_seq_device(&upstream_handle, &full_shape)?;
+    let grad_handle =
+        store
+            .backend()
+            .all_gather_seq_device(&upstream_handle, &full_shape, CommAxis::Seq)?;
     let grad_id = store.alloc_device_tensor(full_shape, grad_handle)?;
     Ok(smallvec![(x, grad_id)])
 }
@@ -260,10 +268,13 @@ pub fn all_to_all(
         (tensor.shape.clone(), handle)
     };
 
-    let (out_handle, out_shape) =
-        store
-            .backend()
-            .all_to_all_device(&input_handle, &in_shape, scatter_axis, gather_axis)?;
+    let (out_handle, out_shape) = store.backend().all_to_all_device(
+        &input_handle,
+        &in_shape,
+        scatter_axis,
+        gather_axis,
+        CommAxis::Seq,
+    )?;
     let output_id = store.alloc_device_tensor(out_shape, out_handle)?;
 
     TapeEntry {
@@ -324,6 +335,7 @@ pub(crate) fn all_to_all_backward(
         &upstream_shape,
         gather_axis,
         scatter_axis,
+        CommAxis::Seq,
     )?;
     if grad_shape != in_shape {
         return Err(AutogradError::ShapeMismatch {
