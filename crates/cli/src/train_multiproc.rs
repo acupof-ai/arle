@@ -29,7 +29,7 @@ use anyhow::Result;
 /// serve's worker_entry this does NOT short-circuit dispatch — the child flows
 /// through clap into the normal agent-opd handler as its rank; `build_opd_store`
 /// reads the mesh env to build the NCCL backend (+ CP subgroup when composed).
-pub(crate) fn install_cp_worker_logger() -> bool {
+pub(crate) fn install_mesh_worker_logger() -> bool {
     let Ok(rank) = std::env::var("ARLE_TRAIN_WORLD_RANK") else {
         return false;
     };
@@ -59,14 +59,15 @@ pub(crate) fn maybe_spawn_mesh_and_wait(
 ) -> Result<bool> {
     let (cp_size, dp_size) = (cp_size.max(1), dp_size.max(1));
     let size = cp_size * dp_size;
-    let axis = match (cp_size > 1, dp_size > 1) {
-        (true, false) => "CP",
-        (false, true) => "DP",
-        _ => "CP×DP",
-    };
     if size <= 1 || std::env::var("ARLE_TRAIN_WORLD_RANK").is_ok() {
         return Ok(false);
     }
+    let axis = match (cp_size > 1, dp_size > 1) {
+        (true, true) => "CP×DP",
+        (true, false) => "CP",
+        (false, true) => "DP",
+        (false, false) => unreachable!("size > 1 above"),
+    };
 
     // Mint + publish the NCCL unique id once; children inherit it via env.
     #[cfg(feature = "nccl")]

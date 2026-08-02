@@ -151,7 +151,8 @@ pub struct CudaBackend {
     kernels: KernelCache,
     #[cfg(all(feature = "nccl", not(feature = "no-cuda")))]
     nccl: Option<Arc<NcclBackend>>,
-    /// CP subgroup comm under a CP×DP mesh; `None` = seq collectives use `nccl`.
+    /// The seq-collective group: the split subgroup under a composed mesh, else
+    /// the same comm as `nccl`. `None` only when `nccl` is `None` (single card).
     #[cfg(all(feature = "nccl", not(feature = "no-cuda")))]
     nccl_seq: Option<Arc<NcclBackend>>,
 }
@@ -222,34 +223,38 @@ impl CudaBackend {
                 format!("NcclBackend::init_rank failed for autograd: {err:#}").into_boxed_str(),
             ))
         })?;
-        backend.nccl = Some(Arc::new(nccl));
+        let nccl = Arc::new(nccl);
+        // Seq collectives read exactly one field: default it to the world comm
+        // (same group); a mesh with a real subgroup overwrites it.
+        backend.nccl_seq = Some(nccl.clone());
+        backend.nccl = Some(nccl);
         Ok(backend)
     }
 
-    /// CUDA backend for a CP×DP mesh (`world = cp*dp`, CP inner): the world comm
-    /// carries weight-grad/count all-reduces (weights replicated on every rank);
-    /// seq collectives (gather/scatter/ring/a2a) run on a `ncclCommSplit` CP
-    /// subgroup. Single-axis meshes skip the split — the world comm IS the axis
-    /// comm, byte-identical to `new_with_nccl`.
+    /// CUDA backend for a multi-axis mesh: the world comm carries weight-grad /
+    /// count all-reduces (weights replicated on every rank); seq collectives
+    /// (gather/scatter/ring/a2a) run on a `ncclCommSplit` subgroup described by
+    /// `seq_group = (color, size, rank)` — the caller derives it from the one
+    /// mesh (`infer_topo`), keeping this crate layout-agnostic. `None` = no
+    /// subgroup, seq collectives use the world comm (byte-identical to
+    /// `new_with_nccl`).
     #[cfg(all(feature = "nccl", not(feature = "no-cuda")))]
     pub fn new_with_mesh(
         ordinal: usize,
         unique_id: cuda_kernels::ffi::nccl::ncclUniqueId,
-        cp_size: usize,
-        dp_size: usize,
+        world_size: usize,
         world_rank: usize,
+        seq_group: Option<(usize, usize, usize)>,
     ) -> Result<Self> {
-        let (cp, dp) = (cp_size.max(1), dp_size.max(1));
-        let mut backend = Self::new_with_nccl(ordinal, unique_id, cp * dp, world_rank)?;
-        if cp > 1 && dp > 1 {
-            let (dp_rank, cp_rank) = (world_rank / cp, world_rank % cp);
+        let mut backend = Self::new_with_nccl(ordinal, unique_id, world_size, world_rank)?;
+        if let Some((color, size, rank)) = seq_group {
             let world_comm = backend.nccl.as_ref().expect("new_with_nccl sets nccl");
             // Collective over the world comm — every rank constructs together.
             let seq = world_comm
-                .split(dp_rank as i32, cp_rank as i32, cp, cp_rank)
+                .split(color as i32, rank as i32, size, rank)
                 .map_err(|err| {
                     AutogradError::TapeInvariant(Box::leak(
-                        format!("ncclCommSplit for the CP subgroup failed: {err:#}")
+                        format!("ncclCommSplit for the seq subgroup failed: {err:#}")
                             .into_boxed_str(),
                     ))
                 })?;
@@ -258,11 +263,11 @@ impl CudaBackend {
         Ok(backend)
     }
 
-    /// The comm sequence-axis collectives run on: the CP subgroup under CP×DP,
-    /// else the world comm (single-axis mesh — identical group).
+    /// The comm sequence-axis collectives run on (subgroup under a composed
+    /// mesh, else the world comm — set at construction, never a fallback).
     #[cfg(all(feature = "nccl", not(feature = "no-cuda")))]
     fn seq_nccl(&self) -> Option<&Arc<NcclBackend>> {
-        self.nccl_seq.as_ref().or(self.nccl.as_ref())
+        self.nccl_seq.as_ref()
     }
 
     /// No-GPU stub for no-cuda builds that still type-check the nccl feature.
@@ -282,11 +287,11 @@ impl CudaBackend {
     pub fn new_with_mesh(
         ordinal: usize,
         unique_id: cuda_kernels::ffi::nccl::ncclUniqueId,
-        cp_size: usize,
-        dp_size: usize,
+        world_size: usize,
         world_rank: usize,
+        seq_group: Option<(usize, usize, usize)>,
     ) -> Result<Self> {
-        let _ = (ordinal, unique_id, cp_size, dp_size, world_rank);
+        let _ = (ordinal, unique_id, world_size, world_rank, seq_group);
         todo!("GPU required: CudaBackend::new_with_mesh is unavailable under feature no-cuda")
     }
 
@@ -2384,19 +2389,6 @@ impl Backend for CudaBackend {
             }
             #[cfg(not(all(feature = "nccl", not(feature = "no-cuda"))))]
             unreachable!("world>1 without nccl feature")
-        }
-    }
-
-    fn collective_world_rank(&self) -> (usize, usize) {
-        #[cfg(all(feature = "nccl", not(feature = "no-cuda")))]
-        {
-            // Seq-group view: the ring op positions itself with this.
-            self.seq_nccl()
-                .map_or((1, 0), |nccl| (nccl.world_size(), nccl.rank()))
-        }
-        #[cfg(not(all(feature = "nccl", not(feature = "no-cuda"))))]
-        {
-            (1, 0)
         }
     }
 
