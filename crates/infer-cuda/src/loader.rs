@@ -1200,6 +1200,96 @@ impl SafetensorLoader {
         }
     }
 
+    /// Load two same-K projections as ONE row-fused matrix (`[a; b]` along
+    /// output rows) so a single GEMM serves both — the decode launch-count
+    /// lever (SGLang's MergedColumnParallelLinear equivalent). W8A16 pairs
+    /// fuse before the Marlin repack (fused matrix repacks + frees INT8 once);
+    /// every other format loads normally and fuses on device.
+    pub(crate) fn load_matrix_pair_fused(
+        &self,
+        ctx: &DeviceContext,
+        name_a: &str,
+        name_b: &str,
+    ) -> Result<DeviceMatrix> {
+        self.load_matrix_pair_fused_inner(ctx, name_a, name_b, None)
+    }
+
+    /// Column-sharded (TP) twin of [`Self::load_matrix_pair_fused`]: each half
+    /// is column-sharded by its own rows, then the local shards fuse.
+    pub(crate) fn load_matrix_pair_fused_column_sharded(
+        &self,
+        ctx: &DeviceContext,
+        name_a: &str,
+        name_b: &str,
+        tp: &infer_topo::TpConfig,
+    ) -> Result<DeviceMatrix> {
+        self.load_matrix_pair_fused_inner(ctx, name_a, name_b, Some(tp))
+    }
+
+    fn load_matrix_pair_fused_inner(
+        &self,
+        ctx: &DeviceContext,
+        name_a: &str,
+        name_b: &str,
+        tp: Option<&infer_topo::TpConfig>,
+    ) -> Result<DeviceMatrix> {
+        let load_one = |name: &str| -> Result<(DeviceMatrix, bool)> {
+            match self.quant_view_for(name)? {
+                Some(view) => {
+                    let shard = match tp {
+                        Some(tp) => {
+                            ensure!(
+                                view.logical_shape.len() == 2,
+                                "{name}: expected 2D matrix for pair fuse, got {:?}",
+                                view.logical_shape
+                            );
+                            QuantMatrixShard::Rows(infer_topo::column_shard(
+                                view.logical_shape[0],
+                                tp,
+                            ))
+                        }
+                        None => QuantMatrixShard::Full,
+                    };
+                    if let QuantFormat::W8A16 { group_size } = view.format {
+                        Ok((
+                            self.load_w8a16_view_unpacked(ctx, &view, &shard, group_size)?,
+                            true,
+                        ))
+                    } else {
+                        Ok((self.load_quant_or_dense_view(ctx, &view, shard)?, false))
+                    }
+                }
+                None => match tp {
+                    Some(tp) => Ok((
+                        self.load_matrix_sharded(
+                            ctx,
+                            name,
+                            infer_topo::ParallelLinearKind::Column,
+                            tp,
+                        )?,
+                        false,
+                    )),
+                    None => Ok((self.load_matrix(ctx, name)?, false)),
+                },
+            }
+        };
+        let (ma, repack_a) = load_one(name_a)?;
+        let (mb, repack_b) = load_one(name_b)?;
+        ensure!(
+            repack_a == repack_b,
+            "pair fuse {name_a}/{name_b}: mixed W8A16/non-W8A16 halves"
+        );
+        let mut fused = DeviceMatrix::fuse_rows(ctx, &ma, &mb)
+            .with_context(|| format!("pair fuse {name_a} + {name_b}"))?;
+        drop((ma, mb));
+        if repack_a {
+            fused
+                .repack_for_marlin_w8a16(ctx)
+                .with_context(|| format!("Marlin W8A16 repack fused {name_a}+{name_b}"))?;
+        }
+        Ok(fused)
+    }
+
     /// Quant-aware twin of [`Self::load_matrix_sharded`].
     pub(crate) fn load_matrix_sharded_quant_aware(
         &self,
@@ -2684,6 +2774,25 @@ impl SafetensorLoader {
         shard: &QuantMatrixShard,
         group_size: usize,
     ) -> Result<DeviceMatrix> {
+        let mut matrix = self.load_w8a16_view_unpacked(ctx, view, shard, group_size)?;
+        // Build the Marlin tensor-core layout (Ampere+); no-op below sm_80 or on
+        // non-tile-aligned shapes → dispatch falls back to scalar/dequant.
+        matrix
+            .repack_for_marlin_w8a16(ctx)
+            .with_context(|| format!("Marlin W8A16 repack {}", view.name))?;
+        Ok(matrix)
+    }
+
+    /// W8A16 view load WITHOUT the Marlin repack — the row-fusion path concats
+    /// two INT8 sources first so the fused matrix repacks (and frees its INT8)
+    /// once.
+    fn load_w8a16_view_unpacked(
+        &self,
+        ctx: &DeviceContext,
+        view: &QuantTensorView,
+        shard: &QuantMatrixShard,
+        group_size: usize,
+    ) -> Result<DeviceMatrix> {
         let weight = self.borrow_raw_tensor(&view.name)?;
         let rows = view.logical_shape[0];
         let cols = view.logical_shape[1];
@@ -2725,7 +2834,7 @@ impl SafetensorLoader {
                 weight_shard.bytes.as_ref().len(),
             )
         };
-        let mut matrix = DeviceMatrix::from_quantized_int8(
+        DeviceMatrix::from_quantized_int8(
             ctx,
             qweight,
             scales_data,
@@ -2733,13 +2842,7 @@ impl SafetensorLoader {
             weight_shard.cols,
             group_size,
         )
-        .with_context(|| format!("upload W8A16 tensor {}", view.name))?;
-        // Build the Marlin tensor-core layout (Ampere+); no-op below sm_80 or on
-        // non-tile-aligned shapes → dispatch falls back to scalar/dequant.
-        matrix
-            .repack_for_marlin_w8a16(ctx)
-            .with_context(|| format!("Marlin W8A16 repack {}", view.name))?;
-        Ok(matrix)
+        .with_context(|| format!("upload W8A16 tensor {}", view.name))
     }
 
     fn shard_w4a16_scales_cow<'a>(

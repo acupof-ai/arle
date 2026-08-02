@@ -59,7 +59,7 @@ use crate::moe::{
 use crate::moe_config::ExpertSplit;
 use crate::ops::{
     add_batch, argmax_into, argmax_row_into, copy_row_to_vec, embedding_batch, gemm_batch, gemv,
-    silu_mul, upload_i32, warm_fp8_deepgemm_dense,
+    silu_mul_fused, upload_i32, warm_fp8_deepgemm_dense,
 };
 use crate::workspace::{HiddenSlot, SliceSlot, VecSlot};
 
@@ -1939,8 +1939,8 @@ impl Qwen35SpecSlotState {
 /// | `linear.qkv_conv` | `[QKV, S]`  | conv1d prefill writes every (channel, t) |
 /// | `linear.gdr_out`  | `[Vh*Vd, S]`| gated-delta kernels write every (token, v_head, d) (one block per v_head, j_slice 0 writes the reduced output) |
 /// | `linear.normed_out`| `[Vh*Vd, S]`| `rms_norm_gated` writes every (head, d) over `Vh*S` blocks |
-/// | `dense.gate`/`up` | `[I, S]`    | `gemm_cuda` beta=0 |
-/// | `dense.act`   | `[I, S]`        | `silu_mul` writes all `I*S` |
+/// | `dense.gate_up` | `[2I, S]`     | `gemm_cuda` beta=0 (row-fused `[gate; up]`) |
+/// | `dense.act`   | `[I, S]`        | `silu_mul_fused` writes all `I*S` |
 /// | `last_hidden` | `[H]`           | `memcpy_dtod` overwrites the full vec |
 /// | `last_normed` | `[H]`           | `rms_norm_offset` writes all `H` |
 /// | `logits`      | `[V]`           | `gemv` writes every output row |
@@ -2070,8 +2070,7 @@ pub(crate) enum LinearCore<'a, 'r> {
 
 #[derive(Default)]
 pub(crate) struct DenseMlpScratch {
-    gate: HiddenSlot,
-    up: HiddenSlot,
+    gate_up: HiddenSlot,
     act: HiddenSlot,
 }
 
@@ -2137,8 +2136,7 @@ impl Qwen35Workspace {
         linear.qkv_conv.release();
         linear.gdr_out.release();
         linear.normed_out.release();
-        dense.gate.release();
-        dense.up.release();
+        dense.gate_up.release();
         dense.act.release();
         moe.release();
         last_hidden.release();
@@ -2461,9 +2459,17 @@ pub(crate) struct Qwen35Layer {
 }
 
 pub(crate) struct DenseMlp {
-    gate_proj: DeviceMatrix,
-    up_proj: DeviceMatrix,
+    /// Row-fused `[gate; up]` (`[2*inter, hidden]`): one GEMM per step feeds
+    /// the fused SwiGLU. Gate = rows `0..inter`, up = rows `inter..2*inter`.
+    gate_up_proj: DeviceMatrix,
     down_proj: DeviceMatrix,
+}
+
+impl DenseMlp {
+    /// SwiGLU intermediate width (half the fused projection's output rows).
+    fn inter_dim(&self) -> usize {
+        self.gate_up_proj.rows / 2
+    }
 }
 
 /// NextN-MTP draft head for Qwen3.6 speculative decode: one full-attention
@@ -2580,8 +2586,7 @@ struct OffloadedBlock {
 }
 
 struct OffloadedDenseMlp {
-    gate_proj: HostMatrixSnapshot,
-    up_proj: HostMatrixSnapshot,
+    gate_up_proj: HostMatrixSnapshot,
     down_proj: HostMatrixSnapshot,
 }
 
@@ -2840,8 +2845,7 @@ impl Qwen35Model {
                 }
             }
             if let Some(mlp) = &layer.mlp {
-                warm(&mlp.gate_proj)?;
-                warm(&mlp.up_proj)?;
+                warm(&mlp.gate_up_proj)?;
                 warm(&mlp.down_proj)?;
             }
             if let Some(moe) = &layer.moe {
@@ -3419,9 +3423,11 @@ impl Qwen35Model {
             } else if tp_cfg.is_single() {
                 (
                     Some(DenseMlp {
-                        gate_proj: loader
-                            .load_matrix_quant_aware(&ctx, &names.common.mlp_gate_proj)?,
-                        up_proj: loader.load_matrix_quant_aware(&ctx, &names.common.mlp_up_proj)?,
+                        gate_up_proj: loader.load_matrix_pair_fused(
+                            &ctx,
+                            &names.common.mlp_gate_proj,
+                            &names.common.mlp_up_proj,
+                        )?,
                         down_proj: loader
                             .load_matrix_quant_aware(&ctx, &names.common.mlp_down_proj)?,
                     }),
@@ -3430,16 +3436,10 @@ impl Qwen35Model {
             } else {
                 (
                     Some(DenseMlp {
-                        gate_proj: loader.load_matrix_sharded_quant_aware(
+                        gate_up_proj: loader.load_matrix_pair_fused_column_sharded(
                             &ctx,
                             &names.common.mlp_gate_proj,
-                            infer_topo::ParallelLinearKind::Column,
-                            &tp_cfg,
-                        )?,
-                        up_proj: loader.load_matrix_sharded_quant_aware(
-                            &ctx,
                             &names.common.mlp_up_proj,
-                            infer_topo::ParallelLinearKind::Column,
                             &tp_cfg,
                         )?,
                         down_proj: loader.load_matrix_sharded_quant_aware(
@@ -3609,14 +3609,11 @@ impl Qwen35Model {
 
             let mlp = match layer.mlp.as_mut() {
                 Some(dense) => {
-                    let gate_proj = dense.gate_proj.offload_to_host(&ctx)?;
-                    let up_proj = dense.up_proj.offload_to_host(&ctx)?;
+                    let gate_up_proj = dense.gate_up_proj.offload_to_host(&ctx)?;
                     let down_proj = dense.down_proj.offload_to_host(&ctx)?;
-                    freed +=
-                        gate_proj.freed_bytes() + up_proj.freed_bytes() + down_proj.freed_bytes();
+                    freed += gate_up_proj.freed_bytes() + down_proj.freed_bytes();
                     Some(OffloadedDenseMlp {
-                        gate_proj,
-                        up_proj,
+                        gate_up_proj,
                         down_proj,
                     })
                 }
@@ -3760,8 +3757,9 @@ impl Qwen35Model {
 
             match (layer.mlp.as_mut(), layer.moe.as_mut(), mlp, moe) {
                 (Some(dense), None, Some(snap), None) => {
-                    dense.gate_proj.reload_from_host(&ctx, &snap.gate_proj)?;
-                    dense.up_proj.reload_from_host(&ctx, &snap.up_proj)?;
+                    dense
+                        .gate_up_proj
+                        .reload_from_host(&ctx, &snap.gate_up_proj)?;
                     dense.down_proj.reload_from_host(&ctx, &snap.down_proj)?;
                 }
                 (None, Some(moe), None, Some(snap)) => {
@@ -5119,15 +5117,8 @@ impl Qwen35Model {
                     &mut out,
                     ctx,
                     layer_idx,
-                    "mlp.gate_proj".to_string(),
-                    &mlp.gate_proj,
-                );
-                push(
-                    &mut out,
-                    ctx,
-                    layer_idx,
-                    "mlp.up_proj".to_string(),
-                    &mlp.up_proj,
+                    "mlp.gate_up_proj".to_string(),
+                    &mlp.gate_up_proj,
                 );
                 push(
                     &mut out,
@@ -5413,10 +5404,39 @@ impl Qwen35Model {
         Ok(())
     }
 
+    /// Base-cache key for a projection. Projections that live inside a
+    /// row-fused matrix (MlpUp shares `gate_up_proj` with MlpGate) map to one
+    /// canonical key so the pristine device base is cached once per underlying
+    /// buffer — captured before either half's first merge.
+    fn lora_base_cache_key(layer_idx: usize, projection: StudentLoraProjection) -> LoraBaseKey {
+        let projection = match projection {
+            StudentLoraProjection::MlpUp => StudentLoraProjection::MlpGate,
+            other => other,
+        };
+        LoraBaseKey {
+            layer_idx,
+            projection,
+        }
+    }
+
+    /// Row offset of a projection inside its (possibly row-fused) resident
+    /// matrix: MlpUp starts at `inter_dim` inside `gate_up_proj`; everything
+    /// else starts at row 0.
+    fn lora_row_offset(&self, layer_idx: usize, projection: StudentLoraProjection) -> usize {
+        match projection {
+            StudentLoraProjection::MlpUp => self.layers[layer_idx]
+                .mlp
+                .as_ref()
+                .map(DenseMlp::inter_dim)
+                .unwrap_or(0),
+            _ => 0,
+        }
+    }
+
     /// Merge `W = base + scale·(B·A)` for one projection, entirely on device.
     /// FP8-stored targets are promoted to dense BF16 on first touch, so every
     /// projection rides one lane: pristine device base cache → rank-`rank`
-    /// GEMM + full-buffer scaled-add into the resident matrix.
+    /// GEMM + row-window scaled-add into the resident matrix.
     fn merge_lora_proj(
         &mut self,
         layer_idx: usize,
@@ -5456,7 +5476,8 @@ impl Qwen35Model {
         if adapter_is_zero {
             // Restore the pristine *device* base (no host round-trip).
             if self.lora_dirty.remove(&key) {
-                self.restore_lora_base_dev(layer_idx, projection, &key)?;
+                let cache_key = Self::lora_base_cache_key(layer_idx, projection);
+                self.restore_lora_base_dev(layer_idx, projection, &cache_key)?;
             }
             return Ok(());
         }
@@ -5480,8 +5501,11 @@ impl Qwen35Model {
         let rank = adapter.rank;
 
         // Pristine device base (device→device clone of the resident matrix on
-        // first touch — runs before any merge mutates the weight).
-        self.ensure_lora_base_dev_cached(layer_idx, projection, key)?;
+        // first touch — runs before any merge mutates the weight). Row-fused
+        // targets share one base under the canonical cache key.
+        let cache_key = Self::lora_base_cache_key(layer_idx, projection);
+        self.ensure_lora_base_dev_cached(layer_idx, projection, &cache_key)?;
+        let row_offset = self.lora_row_offset(layer_idx, projection);
 
         // Tiny host→device uploads. `a_t` is A transposed to [cols, rank]
         // row-major (== W[c,k]=A[k,c] for `lora_device_gemm`); `b` uploads as-is
@@ -5531,7 +5555,7 @@ impl Qwen35Model {
         // the whole-`self` borrow `lora_weight_target_mut` requires.
         let base_data = self
             .lora_base_dev
-            .get(key)
+            .get(&cache_key)
             .ok_or_else(|| anyhow!("layer {layer_idx} {label}: device base not cached"))?
             .data
             .clone();
@@ -5545,18 +5569,22 @@ impl Qwen35Model {
 
         let matrix = self.lora_matrix_mut(layer_idx, projection)?;
         ensure!(
-            matrix.is_dense_bf16() && matrix.rows == rows && matrix.cols == cols,
+            matrix.is_dense_bf16() && row_offset + rows <= matrix.rows && matrix.cols == cols,
             "layer {layer_idx} {label}: dense device merge shape/format mismatch \
-             ({}x{} {:?} vs {rows}x{cols})",
+             ({}x{} {:?} vs window [{row_offset}..{}]x{cols})",
             matrix.rows,
             matrix.cols,
-            matrix.weight_format()
+            matrix.weight_format(),
+            row_offset + rows
         );
+        let window = row_offset * cols..row_offset * cols + needed;
+        let base_view = base_data.slice(window.clone());
+        let mut out_view = matrix.data.slice_mut(window);
         crate::ops::lora_scaled_add_into(
             &ctx,
-            &base_data,
+            &base_view,
             &delta_view,
-            &mut matrix.data,
+            &mut out_view,
             needed,
             scale,
         )?;
@@ -5593,7 +5621,9 @@ impl Qwen35Model {
     }
 
     /// Restore a dense projection's resident matrix from its pristine device
-    /// base (device→device copy; no host round-trip).
+    /// base (device→device copy; no host round-trip). Only the projection's
+    /// own row window is restored, so the other half of a row-fused matrix
+    /// keeps its (possibly merged) state.
     fn restore_lora_base_dev(
         &mut self,
         layer_idx: usize,
@@ -5602,6 +5632,7 @@ impl Qwen35Model {
     ) -> Result<()> {
         let label = projection.label();
         let ctx = self.ctx.clone();
+        let row_offset = self.lora_row_offset(layer_idx, projection);
         let base_dev = self
             .lora_base_dev
             .get(key)
@@ -5611,11 +5642,18 @@ impl Qwen35Model {
             .data
             .clone();
         let matrix = self.lora_matrix_mut(layer_idx, projection)?;
-        ctx.stream
-            .memcpy_dtod(&base_dev, &mut matrix.data)
-            .map_err(|e| {
-                anyhow!("layer {layer_idx} {label}: device base restore D2D failed: {e}")
-            })?;
+        // The base always spans the full (possibly fused) matrix; the window is
+        // the whole buffer whenever this projection is the sole occupant.
+        let rows = match projection {
+            StudentLoraProjection::MlpGate | StudentLoraProjection::MlpUp => matrix.rows / 2,
+            _ => matrix.rows,
+        };
+        let window = row_offset * matrix.cols..(row_offset + rows) * matrix.cols;
+        let src = base_dev.slice(window.clone());
+        let mut dst = matrix.data.slice_mut(window);
+        ctx.stream.memcpy_dtod(&src, &mut dst).map_err(|e| {
+            anyhow!("layer {layer_idx} {label}: device base restore D2D failed: {e}")
+        })?;
         Ok(())
     }
 
@@ -5685,8 +5723,11 @@ impl Qwen35Model {
                     )
                 })?;
                 Ok(match projection {
-                    StudentLoraProjection::MlpGate => &dense.gate_proj,
-                    StudentLoraProjection::MlpUp => &dense.up_proj,
+                    // Gate/up live in the row-fused `gate_up_proj`; callers
+                    // address their half via `lora_row_offset`.
+                    StudentLoraProjection::MlpGate | StudentLoraProjection::MlpUp => {
+                        &dense.gate_up_proj
+                    }
                     StudentLoraProjection::MlpDown => &dense.down_proj,
                     _ => unreachable!("mlp projection arm checked above"),
                 })
@@ -5794,8 +5835,9 @@ impl Qwen35Model {
                     )
                 })?;
                 Ok(match projection {
-                    StudentLoraProjection::MlpGate => &mut dense.gate_proj,
-                    StudentLoraProjection::MlpUp => &mut dense.up_proj,
+                    StudentLoraProjection::MlpGate | StudentLoraProjection::MlpUp => {
+                        &mut dense.gate_up_proj
+                    }
                     StudentLoraProjection::MlpDown => &mut dense.down_proj,
                     _ => unreachable!("mlp projection arm checked above"),
                 })
@@ -5855,8 +5897,9 @@ impl Qwen35Model {
         }
     }
 
-    /// Dense SwiGLU MLP into `out` (`[hidden, seq]`). Every stage fully
-    /// overwrites its scratch buffer (beta=0 GEMMs + full-range silu_mul).
+    /// Dense SwiGLU MLP into `out` (`[hidden, seq]`). One GEMM over the
+    /// row-fused `[gate; up]` weight, then the fused SwiGLU reads each row's
+    /// halves in place. Every stage fully overwrites its scratch buffer.
     fn dense_mlp(
         &self,
         mlp: &DenseMlp,
@@ -5864,14 +5907,12 @@ impl Qwen35Model {
         dw: &mut DenseMlpScratch,
         out: &mut HiddenStates,
     ) -> Result<()> {
-        let inter = mlp.gate_proj.rows;
+        let inter = mlp.inter_dim();
         let seq_len = normed.seq_len;
-        let gate = dw.gate.get(&self.ctx, inter, seq_len)?;
-        let up = dw.up.get(&self.ctx, inter, seq_len)?;
-        gemm_batch(&self.ctx, &mlp.gate_proj, normed, gate)?;
-        gemm_batch(&self.ctx, &mlp.up_proj, normed, up)?;
+        let gate_up = dw.gate_up.get(&self.ctx, 2 * inter, seq_len)?;
+        gemm_batch(&self.ctx, &mlp.gate_up_proj, normed, gate_up)?;
         let act = dw.act.get(&self.ctx, inter, seq_len)?;
-        silu_mul(&self.ctx, gate, up, act)?;
+        silu_mul_fused(&self.ctx, gate_up, act)?;
         gemm_batch(&self.ctx, &mlp.down_proj, act, out)?;
         Ok(())
     }
@@ -8624,8 +8665,11 @@ fn load_qwen35_mtp_head(
         (None, Some(moe))
     } else {
         let mlp = DenseMlp {
-            gate_proj: loader.load_matrix_quant_aware(ctx, &names.layer.common.mlp_gate_proj)?,
-            up_proj: loader.load_matrix_quant_aware(ctx, &names.layer.common.mlp_up_proj)?,
+            gate_up_proj: loader.load_matrix_pair_fused(
+                ctx,
+                &names.layer.common.mlp_gate_proj,
+                &names.layer.common.mlp_up_proj,
+            )?,
             down_proj: loader.load_matrix_quant_aware(ctx, &names.layer.common.mlp_down_proj)?,
         };
         (Some(mlp), None)

@@ -1,6 +1,6 @@
 //! Device tensor types and CUDA context.
 
-use anyhow::{Result, anyhow, ensure};
+use anyhow::{Result, anyhow, bail, ensure};
 use cudarc::driver::{
     CudaContext, CudaEvent, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, DeviceRepr,
     DriverError, PinnedHostSlice, ValidAsZeroBits,
@@ -2208,6 +2208,184 @@ impl DeviceMatrix {
             tq_centroids: None,
             tq_bits: 0,
         })
+    }
+
+    /// All-default matrix around a dense `data` buffer; `fuse_rows` arms then
+    /// set their format-specific fields.
+    fn from_parts_dense(data: CudaSlice<bf16>, rows: usize, cols: usize) -> Self {
+        Self {
+            data,
+            rows,
+            cols,
+            weight_format: WeightFormat::DenseBf16,
+            qweight: None,
+            qweight_u8: None,
+            qscales: None,
+            qscale_fp8: None,
+            scale_f32: None,
+            scale2_f32: None,
+            quant_scale_rows: 0,
+            quant_scale_cols: 0,
+            quant_block_m: 0,
+            quant_block_k: 0,
+            dsv4_scales: None,
+            dsv4_scale_rows: 0,
+            dsv4_scale_cols: 0,
+            group_size: 0,
+            marlin_packed: None,
+            marlin_scales: None,
+            marlin_channel_scales: None,
+            hybrid_w4a8_qweight: None,
+            hybrid_w4a8_s_channel: None,
+            hybrid_w4a8_s_group: None,
+            hybrid_w4_fp8_qweight: None,
+            tq_packed: None,
+            tq_scales: None,
+            tq_signs: None,
+            tq_centroids: None,
+            tq_bits: 0,
+        }
+    }
+
+    /// Row-concatenate two weight matrices (`[a; b]` along output rows) so one
+    /// GEMM serves both projections — the decode launch-count lever. Formats
+    /// covered: DenseBf16 (`data`), pre-repack W8A16 (`qweight`+`qscales`;
+    /// fuse BEFORE `repack_for_marlin_w8a16` so the fused matrix repacks and
+    /// frees its INT8 source once), Fp8BlockScaled (`qweight_u8`+`scale_f32`,
+    /// needs `a.rows % block_m == 0` so the scale grids stack cleanly).
+    pub fn fuse_rows(ctx: &DeviceContext, a: &DeviceMatrix, b: &DeviceMatrix) -> Result<Self> {
+        ensure!(
+            a.weight_format == b.weight_format && a.cols == b.cols,
+            "fuse_rows needs matching format/K: {} [{}x{}] vs {} [{}x{}]",
+            a.weight_format,
+            a.rows,
+            a.cols,
+            b.weight_format,
+            b.rows,
+            b.cols
+        );
+        fn concat<T: DeviceRepr + ValidAsZeroBits>(
+            ctx: &DeviceContext,
+            x: &CudaSlice<T>,
+            y: &CudaSlice<T>,
+        ) -> Result<CudaSlice<T>> {
+            let mut out = ctx
+                .stream
+                .alloc_zeros::<T>(x.len() + y.len())
+                .map_err(|e| anyhow!("fuse_rows alloc failed: {e}"))?;
+            {
+                let src = x.slice(0..x.len());
+                let mut dst = out.slice_mut(0..x.len());
+                ctx.stream
+                    .memcpy_dtod(&src, &mut dst)
+                    .map_err(|e| anyhow!("fuse_rows D2D (first) failed: {e}"))?;
+            }
+            {
+                let src = y.slice(0..y.len());
+                let mut dst = out.slice_mut(x.len()..x.len() + y.len());
+                ctx.stream
+                    .memcpy_dtod(&src, &mut dst)
+                    .map_err(|e| anyhow!("fuse_rows D2D (second) failed: {e}"))?;
+            }
+            Ok(out)
+        }
+        let rows = a.rows + b.rows;
+        let mut fused = match a.weight_format {
+            WeightFormat::DenseBf16 => {
+                ensure!(
+                    a.data.len() == a.rows * a.cols && b.data.len() == b.rows * b.cols,
+                    "fuse_rows dense data len mismatch"
+                );
+                let mut m = Self::from_parts_dense(concat(ctx, &a.data, &b.data)?, rows, a.cols);
+                m.weight_format = WeightFormat::DenseBf16;
+                m
+            }
+            WeightFormat::W8A16 => {
+                ensure!(
+                    a.group_size == b.group_size && a.marlin_packed.is_none(),
+                    "fuse_rows W8A16 needs matching group_size and pre-repack sources"
+                );
+                let qa = a
+                    .qweight
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("a missing qweight"))?;
+                let qb = b
+                    .qweight
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("b missing qweight"))?;
+                let sa = a
+                    .qscales
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("a missing qscales"))?;
+                let sb = b
+                    .qscales
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("b missing qscales"))?;
+                let mut m = Self::from_parts_dense(
+                    ctx.stream
+                        .alloc_zeros::<bf16>(1)
+                        .map_err(|e| anyhow!("fuse_rows dummy alloc failed: {e}"))?,
+                    rows,
+                    a.cols,
+                );
+                m.weight_format = WeightFormat::W8A16;
+                m.qweight = Some(concat(ctx, qa, qb)?);
+                m.qscales = Some(concat(ctx, sa, sb)?);
+                m.group_size = a.group_size;
+                m
+            }
+            WeightFormat::Fp8BlockScaled => {
+                ensure!(
+                    a.quant_block_m == b.quant_block_m
+                        && a.quant_block_k == b.quant_block_k
+                        && a.quant_block_m > 0
+                        && a.rows.is_multiple_of(a.quant_block_m),
+                    "fuse_rows FP8 needs matching blocks and a.rows % block_m == 0 \
+                     (block {}x{}, a.rows {})",
+                    a.quant_block_m,
+                    a.quant_block_k,
+                    a.rows
+                );
+                ensure!(
+                    a.quant_scale_cols == b.quant_scale_cols,
+                    "fuse_rows FP8 scale col mismatch"
+                );
+                let qa = a
+                    .qweight_u8
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("a missing qweight_u8"))?;
+                let qb = b
+                    .qweight_u8
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("b missing qweight_u8"))?;
+                let sa = a
+                    .scale_f32
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("a missing scale_f32"))?;
+                let sb = b
+                    .scale_f32
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("b missing scale_f32"))?;
+                let mut m = Self::from_parts_dense(
+                    ctx.stream
+                        .alloc_zeros::<bf16>(1)
+                        .map_err(|e| anyhow!("fuse_rows dummy alloc failed: {e}"))?,
+                    rows,
+                    a.cols,
+                );
+                m.weight_format = WeightFormat::Fp8BlockScaled;
+                m.qweight_u8 = Some(concat(ctx, qa, qb)?);
+                m.scale_f32 = Some(concat(ctx, sa, sb)?);
+                m.quant_scale_rows = a.quant_scale_rows + b.quant_scale_rows;
+                m.quant_scale_cols = a.quant_scale_cols;
+                m.quant_block_m = a.quant_block_m;
+                m.quant_block_k = a.quant_block_k;
+                m
+            }
+            other => bail!("fuse_rows unsupported for weight format {other}"),
+        };
+        fused.rows = rows;
+        Ok(fused)
     }
 
     /// Create from INT4 packed quantized weight + bf16 scales.

@@ -303,6 +303,39 @@ pub(crate) fn silu_mul(
     Ok(())
 }
 
+/// SwiGLU over a row-fused `[seq, 2*inter]` gate_up buffer (gate = first half
+/// of each row, up = second half): `out[seq, inter] = silu(gate) * up`. The
+/// fused layout is what a single GEMM over a rows-concatenated `[2*inter, K]`
+/// weight produces, at any seq_len.
+pub(crate) fn silu_mul_fused(
+    ctx: &DeviceContext,
+    gate_up: &HiddenStates,
+    out: &mut HiddenStates,
+) -> Result<()> {
+    ensure!(
+        gate_up.hidden_dim == 2 * out.hidden_dim && gate_up.seq_len == out.seq_len,
+        "silu_mul_fused shape mismatch: gate_up [{}, {}] vs out [{}, {}]",
+        gate_up.hidden_dim,
+        gate_up.seq_len,
+        out.hidden_dim,
+        out.seq_len
+    );
+    let (gu_ptr, _gg) = gate_up.data.device_ptr(&ctx.stream);
+    let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
+    // SAFETY: ptrs from live device allocations sized to the dims passed.
+    unsafe {
+        ffi::silu_mul_fused_cuda(
+            gu_ptr as *const ffi::Half,
+            out_ptr as *mut ffi::Half,
+            gate_up.seq_len as i32,
+            out.hidden_dim as i32,
+            ctx.stream.cu_stream(),
+        )
+        .result()?;
+    }
+    Ok(())
+}
+
 /// On-device LoRA delta GEMM: `out = B · A` where `B` is `[rows, rank]` and
 /// `A` is `[rank, cols]`, producing `out` as a flat `[rows, cols]` **row-major**
 /// buffer (the same layout as a dense `DeviceMatrix.data`).
@@ -358,24 +391,21 @@ where
 /// Used for the device LoRA merge `W = base + scale·(B·A)`. `delta` is generic
 /// over the buffer view so a reused (over-sized) scratch slice works; only its
 /// first `n` elements are read.
-pub(crate) fn lora_scaled_add_into<D>(
+pub(crate) fn lora_scaled_add_into<B, D, O>(
     ctx: &DeviceContext,
-    base: &CudaSlice<bf16>,
+    base: &B,
     delta: &D,
-    out: &mut CudaSlice<bf16>,
+    out: &mut O,
     n: usize,
     scale: f32,
 ) -> Result<()>
 where
+    B: DevicePtr<bf16>,
     D: DevicePtr<bf16>,
+    O: DevicePtrMut<bf16>,
 {
-    ensure!(
-        base.len() == n && out.len() == n,
-        "lora_scaled_add_into: len mismatch base {} out {} n {}",
-        base.len(),
-        out.len(),
-        n
-    );
+    // Callers slice `base`/`out` to exactly `n` elements (row-fused weights
+    // pass a row window of the resident matrix).
     ctx.stream
         .memcpy_dtod(base, out)
         .map_err(|e| anyhow!("lora_scaled_add_into: base D2D copy failed: {e}"))?;
