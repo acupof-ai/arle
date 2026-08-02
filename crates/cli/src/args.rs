@@ -882,10 +882,11 @@ pub(crate) struct ServeArgs {
     pub(crate) qwen35_deepgemm_min_routes: usize,
 
     /// FlashQLA chunked GDN prefill (sm_90, per-geometry AOT instantiations;
-    /// runtime-probes kernel availability and falls back to the recurrent scan).
-    /// Default OFF: GSM8K 11/100 vs 46/100 recurrent (2026-08-02) — long-form
-    /// generation exposes a prefill-state error the needle gate missed.
-    #[arg(long, default_value_t = false, action = clap::ArgAction::Set, value_name = "BOOL")]
+    /// runtime-probes kernel availability and falls back to the recurrent
+    /// scan). Known trade: raw-completion few-shot can flip knife-edge
+    /// boundary tokens (chat-format quality is parity — see the 2026-08-02
+    /// verdict entry).
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set, value_name = "BOOL")]
     pub(crate) qwen35_gdr_chunked: bool,
 
     /// Fast page-16 decode-metadata kernel path.
