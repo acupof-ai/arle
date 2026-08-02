@@ -570,8 +570,7 @@ pub(crate) fn load_dspark_head(
                 input_layernorm: loader.load_vec_any(ctx, &n.input_layernorm)?,
                 post_attention_layernorm: loader.load_vec_any(ctx, &n.post_attention_layernorm)?,
                 mlp: DenseMlp {
-                    gate_proj: loader.load_matrix(ctx, &n.gate_proj)?,
-                    up_proj: loader.load_matrix(ctx, &n.up_proj)?,
+                    gate_up_proj: loader.load_matrix_pair_fused(ctx, &n.gate_proj, &n.up_proj)?,
                     down_proj: loader.load_matrix(ctx, &n.down_proj)?,
                 },
             })
