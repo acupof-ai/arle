@@ -50,7 +50,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: mozilla-actions/sccache-action@v0.0.11
 
       # Raw target/ caching on purpose (NOT Swatinem/rust-cache): rust-cache
       # prunes workspace-crate artifacts, which would drop mlx-sys' OUT_DIR
