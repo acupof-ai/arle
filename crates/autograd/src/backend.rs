@@ -1855,11 +1855,9 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         Ok((handle, out_shape))
     }
 
-    /// Concatenate N same-rank tensors along `axis` (all shapes equal off
-    /// `axis`). Default: readback each → host copy → upload. CUDA overrides with
-    /// D2D copies so activations stay device-resident — the CP linear-attn
-    /// reorder concats a full-seq tensor N× per layer, and a host round-trip
-    /// there dominates the step (256K: hours).
+    /// Concatenate N same-rank tensors along `axis` (shapes equal off `axis`).
+    /// Default readback→host→upload; CUDA overrides D2D (the CP reorder concats a
+    /// full-seq tensor per layer — a host round-trip there costs hours at 256K).
     fn concat(
         &self,
         parts: &[(&DeviceHandle, &[usize])],

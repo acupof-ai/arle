@@ -356,9 +356,8 @@ pub fn cat(
         s
     };
 
-    // Device-lazy when every input is device-resident (same dispatch as slice):
-    // the CP reorder concats a full-seq tensor per layer, and host round-tripping
-    // it dominates the 256K step. Host path otherwise.
+    // Device-lazy when every input is device-resident (same dispatch as slice),
+    // else host — a host round-trip here dominates the 256K CP step.
     let all_device = inputs.iter().all(|&id| {
         store
             .tensor(id)
@@ -442,9 +441,8 @@ pub(crate) fn cat_backward(
     };
     let axis_total: usize = input_shapes.iter().map(|s| s[axis]).sum();
 
-    // Each input's grad is the upstream sliced to its axis range. When the
-    // upstream is device-resident, slice on-device (backend().slice) instead of
-    // downloading — the CP reorder's backward concats a full-seq tensor per layer.
+    // Each input's grad is the upstream sliced to its axis range — on-device when
+    // the upstream is device-resident, else host (same round-trip concern as forward).
     let device_path_ok = {
         let upstream = store.tensor(output_grad_id)?;
         upstream.dirty != Dirty::Host && upstream.device_handle.is_some()
