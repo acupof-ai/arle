@@ -98,21 +98,22 @@ pub fn run() -> ExitCode {
     // multiproc coordinator was silently dropping it at `warn`.
     // Pre-clap sniff — this must run before `Args::parse` (workers/subcommands
     // early-return) and `init` is call_once, so parse-then-init is not an option.
-    // Context-parallel worker logger: a spawned CP rank installs its own
-    // `[cpN]`-prefixed logger before the generic call_once init below (which would
-    // otherwise win and drop the prefix). Unlike serve's worker_entry this does
-    // NOT short-circuit — the child flows through clap into the agent-opd handler.
+    // Mesh worker logger: a spawned CP/DP rank installs its own `[cpN]`/`[dpN]`/
+    // `[cpNdpM]`-prefixed logger before the generic call_once init below (which
+    // would otherwise win and drop the prefix). Unlike serve's worker_entry this
+    // does NOT short-circuit — the child flows through clap into the agent-opd
+    // handler.
     #[cfg(all(unix, feature = "cuda"))]
-    let cp_worker_logged = train_multiproc::install_cp_worker_logger();
+    let mesh_worker_logged = train_multiproc::install_mesh_worker_logger();
     #[cfg(not(all(unix, feature = "cuda")))]
-    let cp_worker_logged = false;
+    let mesh_worker_logged = false;
 
     let level = if std::env::args().any(|arg| arg == "serve") {
         "info"
     } else {
         "warn"
     };
-    if !cp_worker_logged {
+    if !mesh_worker_logged {
         infer_util::logging::init_stderr(level);
     }
 

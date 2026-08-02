@@ -1127,14 +1127,6 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         self.upload(&host, block_shape)
     }
 
-    /// This backend's collective group size / rank (from the NCCL communicator).
-    /// Default `(1, 0)` — single card / CPU / no communicator. The ring op reads
-    /// these to size the rotation and compute per-block absolute positions, the
-    /// same way `all_gather_seq_device` reads `world` from `self.nccl`.
-    fn collective_world_rank(&self) -> (usize, usize) {
-        (1, 0)
-    }
-
     /// All-to-all: split `scatter_axis` across ranks, concatenate each rank's
     /// slice along `gather_axis`. Returns `(handle, out_shape)` — the shape
     /// changes (`[seq/N,b,hidden]` → `[seq,b,hidden/N]`), so the caller can't

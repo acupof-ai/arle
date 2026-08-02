@@ -4705,18 +4705,24 @@ fn build_opd_store(
             let backend = if cp.is_enabled() || dp.is_enabled() {
                 #[cfg(feature = "nccl")]
                 {
-                    let world_rank = std::env::var("ARLE_TRAIN_WORLD_RANK")
-                        .ok()
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(0);
                     let ordinal = std::env::var("INFER_CUDA_DEVICE")
                         .ok()
                         .and_then(|v| v.parse().ok())
                         .unwrap_or(0);
                     let uid = infer_api::nccl_unique_id_from_env()
                         .context("CP/DP: read INFER_NCCL_UNIQUE_ID")?;
+                    // World rank composes from the mesh-derived contexts (CP
+                    // inner) — the one layout authority; a composed mesh splits
+                    // a CP seq subgroup colored by the DP rank.
+                    let world_rank = dp.rank * cp.size + cp.rank;
+                    let seq_group =
+                        (cp.is_enabled() && dp.is_enabled()).then_some((dp.rank, cp.size, cp.rank));
                     autograd::backend_cuda::CudaBackend::new_with_mesh(
-                        ordinal, uid, cp.size, dp.size, world_rank,
+                        ordinal,
+                        uid,
+                        cp.size * dp.size,
+                        world_rank,
+                        seq_group,
                     )
                     .context("init CUDA+NCCL backend for the CP×DP mesh")?
                 }
