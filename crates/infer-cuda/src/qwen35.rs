@@ -7133,6 +7133,14 @@ impl Qwen35Model {
             && fq_fns.is_some_and(|(cumsum, _, _)| fq_kernels_available(cumsum));
         if use_fq_chunked {
             let (fq_cumsum, fq_kkt, fq_fwd) = fq_fns.unwrap();
+            let fq_parity = std::env::var_os("ARLE_FQ_PARITY").is_some();
+            let mut fq_par_snap: Option<cudarc::driver::CudaSlice<f32>> = None;
+            if fq_parity {
+                let st = &slot.gdr_states[linear_idx];
+                let mut snap = self.ctx.stream.alloc_zeros::<f32>(st.len())?;
+                self.ctx.stream.memcpy_dtod(st, &mut snap)?;
+                fq_par_snap = Some(snap);
+            }
             let hg_dim = self.local_linear_k_heads * c.linear_key_head_dim;
             let fq_q = fq_q.get(&self.ctx, hg_dim, seq_len)?;
             let fq_k = fq_k.get(&self.ctx, hg_dim, seq_len)?;
@@ -7222,6 +7230,67 @@ impl Qwen35Model {
                     Ok(())
                 },
             )?;
+            if let Some(mut snap) = fq_par_snap {
+                drop(_g12);
+                drop(_g13);
+                let o_ref = DeviceVec::zeros(&self.ctx, seq_len * z_dim)?;
+                {
+                    let (qkv_ptr, _g0) = qkv_conv.device_ptr(&self.ctx.stream);
+                    let (b_ptr, _g1) = b_in.device_ptr(&self.ctx.stream);
+                    let (a_ptr, _g2) = a_in.device_ptr(&self.ctx.stream);
+                    let (dt_ptr, _g3) = attn.dt_bias.data.device_ptr(&self.ctx.stream);
+                    let (alog_ptr, _g4) = attn.a_log.device_ptr(&self.ctx.stream);
+                    let (s_ptr, _g5) = snap.device_ptr_mut(&self.ctx.stream);
+                    let (o_ptr, _g6) = o_ref.data.device_ptr(&self.ctx.stream);
+                    // SAFETY: same buffers/dims as the fq calls above.
+                    unsafe {
+                        ffi::gated_delta_rule_prefill_recurrent_cuda(
+                            qkv_ptr as *const ffi::Half,
+                            b_ptr as *const ffi::Half,
+                            a_ptr as *const ffi::Half,
+                            dt_ptr as *const ffi::Half,
+                            alog_ptr as *const f32,
+                            s_ptr as *mut f32,
+                            o_ptr as *mut ffi::Half,
+                            self.local_linear_k_heads as i32,
+                            self.local_linear_v_heads as i32,
+                            c.linear_key_head_dim as i32,
+                            c.linear_value_head_dim as i32,
+                            seq_len as i32,
+                            self.ctx.stream.cu_stream(),
+                        )
+                        .result()?;
+                    }
+                }
+                let a = self.ctx.stream.clone_dtoh(&*gdr_state)?;
+                let b = self.ctx.stream.clone_dtoh(&snap)?;
+                let (mut n2, mut d2) = (0f64, 0f64);
+                for (x, y) in a.iter().zip(b.iter()) {
+                    let d = (*x - *y) as f64;
+                    n2 += d * d;
+                    d2 += (*y as f64) * (*y as f64);
+                }
+                let oc = self.ctx.stream.clone_dtoh(&*gdr_out)?;
+                let orf = self.ctx.stream.clone_dtoh(&o_ref.data)?;
+                let (mut on2, mut od2) = (0f64, 0f64);
+                let (mut worst, mut worst_i) = (0f64, 0usize);
+                for (i, (x, y)) in oc.iter().zip(orf.iter()).enumerate() {
+                    let d = (x.to_f32() - y.to_f32()) as f64;
+                    on2 += d * d;
+                    od2 += (y.to_f32() as f64) * (y.to_f32() as f64);
+                    if d.abs() > worst {
+                        worst = d.abs();
+                        worst_i = i;
+                    }
+                }
+                eprintln!(
+                    "[fq-parity] layer={linear_idx} seq={seq_len} state_rel={:.3e} o_rel={:.3e} o_worst={:.3}@tok{}",
+                    (n2 / (d2 + 1e-30)).sqrt(),
+                    (on2 / (od2 + 1e-30)).sqrt(),
+                    worst,
+                    worst_i / z_dim
+                );
+            }
         }
         if !use_fq_chunked {
             let gdr_state = &mut slot.gdr_states[linear_idx];
