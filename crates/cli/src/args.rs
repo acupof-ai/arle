@@ -2268,8 +2268,9 @@ pub(crate) struct TrainAgentOpdArgs {
     #[arg(long, default_value_t = 1)]
     pub(crate) cp_size: usize,
 
-    /// Comma-separated CUDA device ordinals for the CP ranks (e.g. "0,1,2,3").
-    /// Defaults to 0..cp_size. Length must equal cp_size when set.
+    /// Comma-separated CUDA device ordinals, one per world rank of the CP×DP
+    /// mesh (world = cp_size*dp_size, CP inner; e.g. "0,1,2,3"). Defaults to
+    /// 0..world. Synonym of --dp-devices; --cp-devices wins when both are set.
     #[arg(long)]
     pub(crate) cp_devices: Option<String>,
 
@@ -2281,8 +2282,8 @@ pub(crate) struct TrainAgentOpdArgs {
     #[arg(long, default_value_t = 1)]
     pub(crate) dp_size: usize,
 
-    /// Comma-separated CUDA device ordinals for the DP ranks. Defaults to
-    /// 0..dp_size. Length must equal dp_size when set.
+    /// Comma-separated CUDA device ordinals, one per world rank of the CP×DP
+    /// mesh. Defaults to 0..world. Synonym of --cp-devices.
     #[arg(long)]
     pub(crate) dp_devices: Option<String>,
 
