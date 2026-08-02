@@ -806,9 +806,14 @@ fn qwen35_gdr_chunked_enabled() -> bool {
 /// devices return CUDA_ERROR_NOT_SUPPORTED from the dispatch wrapper before
 /// touching any pointer; a real kernel rejects the seq_len=0 launch with a
 /// different code. Unavailable → silently keep the recurrent scan (FA3 pattern).
-fn fq_kernels_available(cumsum: ffi::FqCumsumFn) -> bool {
+fn fq_kernels_available(ctx: &DeviceContext, cumsum: ffi::FqCumsumFn) -> bool {
     static AVAILABLE: OnceLock<bool> = OnceLock::new();
     *AVAILABLE.get_or_init(|| {
+        // The dispatch wrapper resolves SM via the calling thread's DRIVER
+        // context — bind first or the probe is a per-thread lottery.
+        if ctx.ctx.bind_to_thread().is_err() {
+            return false;
+        }
         // SAFETY: seq_len=0 → zero grid; no pointer is dereferenced.
         let r = unsafe { cumsum(std::ptr::null(), std::ptr::null_mut(), 0, std::ptr::null_mut()) };
         let ok = r != cudarc::driver::sys::CUresult::CUDA_ERROR_NOT_SUPPORTED;
@@ -6490,8 +6495,12 @@ impl Qwen35Model {
                         // (block+1): FA3 paged split-KV + PackGQA. The TileLang
                         // kernel it replaces pads BLOCK_M=64 around the real rows
                         // and gives one CTA per query head, 6× the KV traffic.
-                        // Prefill chunks and non-Hopper keep it.
-                        if meta.seq_len <= FA3_MAX_QLEN
+                        // batch==1 prefill chunks also route here: the 2026-07-28
+                        // kill (c=8 TTFT 12.07→18.23 s) was the one-launch-per-
+                        // request cost on ragged batches; a single request is a
+                        // single launch either way. Ragged multi-request prefill
+                        // and non-Hopper keep TileLang.
+                        if (meta.seq_len <= FA3_MAX_QLEN || meta.batch == 1)
                             && pool.format == KVFormat::BF16
                             && c.head_dim == 256
                             && qwen35_fa3_enabled(&self.ctx)
@@ -6504,7 +6513,13 @@ impl Qwen35Model {
                             // flash_api.cpp:105-108), which is what lets a paged
                             // batch share a launch — per row it was 16 CTAs on 78
                             // SMs, serialized.
-                            let splits = qwen35_fa3_decode_splits();
+                            // Split-KV pays only when q is tiny vs kv; a long
+                            // prefill chunk saturates SMs on the q axis alone.
+                            let splits = if meta.seq_len <= FA3_MAX_QLEN {
+                                qwen35_fa3_decode_splits()
+                            } else {
+                                1
+                            };
                             let accum_rows = self.local_q_heads * meta.total_q;
                             let lse = fa3_lse.get(&self.ctx, accum_rows)?;
                             let oaccum =
@@ -7130,8 +7145,17 @@ impl Qwen35Model {
             && qwen35_gdr_chunked_enabled()
             && c.linear_key_head_dim == 128
             && c.linear_value_head_dim == 128
-            && fq_fns.is_some_and(|(cumsum, _, _)| fq_kernels_available(cumsum));
+            && fq_fns.is_some_and(|(cumsum, _, _)| fq_kernels_available(&self.ctx, cumsum));
         if use_fq_chunked {
+            // The AOT dispatch wrapper resolves SM + module via the DRIVER
+            // context of the calling thread; the engine forward thread is not
+            // guaranteed to have one bound (runtime-API kernels don't need
+            // it), which made the fq path a per-thread lottery returning
+            // NOT_SUPPORTED. Bind explicitly.
+            self.ctx
+                .ctx
+                .bind_to_thread()
+                .map_err(|e| anyhow!("bind CUDA context for chunked GDR failed: {e}"))?;
             let (fq_cumsum, fq_kkt, fq_fwd) = fq_fns.unwrap();
             let fq_parity = std::env::var_os("ARLE_FQ_PARITY").is_some();
             let mut fq_par_snap: Option<cudarc::driver::CudaSlice<f32>> = None;
