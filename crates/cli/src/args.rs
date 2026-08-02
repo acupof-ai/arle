@@ -883,7 +883,9 @@ pub(crate) struct ServeArgs {
 
     /// FlashQLA chunked GDN prefill (sm_90, per-geometry AOT instantiations;
     /// runtime-probes kernel availability and falls back to the recurrent scan).
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set, value_name = "BOOL")]
+    /// Default OFF: GSM8K 11/100 vs 46/100 recurrent (2026-08-02) — long-form
+    /// generation exposes a prefill-state error the needle gate missed.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set, value_name = "BOOL")]
     pub(crate) qwen35_gdr_chunked: bool,
 
     /// Fast page-16 decode-metadata kernel path.
