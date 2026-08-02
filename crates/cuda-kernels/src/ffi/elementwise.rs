@@ -67,6 +67,15 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn split_halves_cuda(
+        fused: *const Half,
+        first: *mut Half,
+        second: *mut Half,
+        batch_size: i32,
+        half_dim: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn silu_mul_fused_cuda(
         gate_up: *const Half,
         out: *mut Half,

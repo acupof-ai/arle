@@ -29,6 +29,20 @@ __global__ void split_qkv_kernel(
     }
 }
 
+// Split a row-fused [B, 2*half] buffer into two [B, half] halves.
+__global__ void split_halves_kernel(
+    const __nv_bfloat16* __restrict__ fused,  // [B, 2*half]
+    __nv_bfloat16* __restrict__ first,        // [B, half]
+    __nv_bfloat16* __restrict__ second,       // [B, half]
+    int half_dim
+) {
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    int row = blockIdx.y;
+    if (col >= half_dim) return;
+    first[row * half_dim + col] = fused[row * 2 * half_dim + col];
+    second[row * half_dim + col] = fused[row * 2 * half_dim + half_dim + col];
+}
+
 // Fused silu_mul from merged gate+up buffer.
 // Input:  gate_up [B, 2*inter_dim] where first half = gate, second half = up
 // Output: out [B, inter_dim] = silu(gate) * up
@@ -65,6 +79,18 @@ cudaError_t split_qkv_cuda(
     split_qkv_kernel<<<grid, threads, 0, stream>>>(
         qkv, q, k, v, q_dim, kv_dim, qkv_dim
     );
+    return cudaGetLastError();
+}
+
+cudaError_t split_halves_cuda(
+    const __nv_bfloat16* fused,
+    __nv_bfloat16* first, __nv_bfloat16* second,
+    int batch_size, int half_dim,
+    cudaStream_t stream
+) {
+    int threads = 256;
+    dim3 grid((half_dim + threads - 1) / threads, batch_size);
+    split_halves_kernel<<<grid, threads, 0, stream>>>(fused, first, second, half_dim);
     return cudaGetLastError();
 }
 
