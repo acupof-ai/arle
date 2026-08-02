@@ -152,11 +152,12 @@ costs what decoding 1 costs. Spec decode is working; the intercept is the wall.
 `ARMED` but produces zero `cuGraph*` calls (its call site sits below an
 unconditional paged-KV early return).
 
-**`--qwen35-gdr-chunked` is DEFAULT-ON as of 2026-08-02** (`2e2ab667c`) for
-(Hg=16, H∈{32,48}), DK=DV=128: 33K cold prefill 28.95 → 21.63 s (−26%),
-needle ladder 9/9 exact both arms; stub builds and unknown geometries fall
-back to the recurrent scan via a runtime probe
-([win](experience/wins/2026-08-02-flashqla-chunked-gdr-h48.md)).
+**`--qwen35-gdr-chunked` is OPT-IN and correctness-blocked** (flipped on then
+reverted 2026-08-02, `715c37a0c`): 33K cold prefill −26% and needle 9/9 exact,
+but **GSM8K 11/100 vs recurrent 46/100** — a prefill-state error that
+long-form generation compounds and short-recall gates miss
+([win](experience/wins/2026-08-02-flashqla-chunked-gdr-h48.md) has the full
+record). Do not enable for real serving until the errors entry closes.
 
 ---
 
