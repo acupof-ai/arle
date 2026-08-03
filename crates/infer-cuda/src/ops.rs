@@ -303,20 +303,19 @@ pub(crate) fn silu_mul(
     Ok(())
 }
 
-/// Split a row-fused `[seq, 2*half]` buffer into two `[seq, half]` buffers
-/// (first half of each row → `first`, second half → `second`).
-pub(crate) fn split_halves(
+/// Split a row-fused `[seq, first + second]` buffer into two buffers (leading
+/// `first.hidden_dim` of each row → `first`, remainder → `second`).
+pub(crate) fn split2(
     ctx: &DeviceContext,
     fused: &HiddenStates,
     first: &mut HiddenStates,
     second: &mut HiddenStates,
 ) -> Result<()> {
     ensure!(
-        first.hidden_dim == second.hidden_dim
-            && fused.hidden_dim == 2 * first.hidden_dim
+        fused.hidden_dim == first.hidden_dim + second.hidden_dim
             && fused.seq_len == first.seq_len
             && fused.seq_len == second.seq_len,
-        "split_halves shape mismatch: fused [{}, {}] vs halves [{}, {}] / [{}, {}]",
+        "split2 shape mismatch: fused [{}, {}] vs parts [{}, {}] / [{}, {}]",
         fused.hidden_dim,
         fused.seq_len,
         first.hidden_dim,
@@ -329,12 +328,58 @@ pub(crate) fn split_halves(
     let (second_ptr, _g2) = second.data.device_ptr_mut(&ctx.stream);
     // SAFETY: ptrs from live device allocations sized to the dims passed.
     unsafe {
-        ffi::split_halves_cuda(
+        ffi::split2_cuda(
             fused_ptr as *const ffi::Half,
             first_ptr as *mut ffi::Half,
             second_ptr as *mut ffi::Half,
             fused.seq_len as i32,
             first.hidden_dim as i32,
+            second.hidden_dim as i32,
+            ctx.stream.cu_stream(),
+        )
+        .result()?;
+    }
+    Ok(())
+}
+
+/// Split a row-fused `[seq, q + 2*kv]` qkv buffer into `q`/`k`/`v` buffers.
+pub(crate) fn split_qkv(
+    ctx: &DeviceContext,
+    qkv: &HiddenStates,
+    q: &mut HiddenStates,
+    k: &mut HiddenStates,
+    v: &mut HiddenStates,
+) -> Result<()> {
+    ensure!(
+        k.hidden_dim == v.hidden_dim
+            && qkv.hidden_dim == q.hidden_dim + 2 * k.hidden_dim
+            && qkv.seq_len == q.seq_len
+            && qkv.seq_len == k.seq_len
+            && qkv.seq_len == v.seq_len,
+        "split_qkv shape mismatch: qkv [{}, {}] vs q [{}, {}] k [{}, {}] v [{}, {}]",
+        qkv.hidden_dim,
+        qkv.seq_len,
+        q.hidden_dim,
+        q.seq_len,
+        k.hidden_dim,
+        k.seq_len,
+        v.hidden_dim,
+        v.seq_len
+    );
+    let (qkv_ptr, _gf) = qkv.data.device_ptr(&ctx.stream);
+    let (q_ptr, _g1) = q.data.device_ptr_mut(&ctx.stream);
+    let (k_ptr, _g2) = k.data.device_ptr_mut(&ctx.stream);
+    let (v_ptr, _g3) = v.data.device_ptr_mut(&ctx.stream);
+    // SAFETY: ptrs from live device allocations sized to the dims passed.
+    unsafe {
+        ffi::split_qkv_cuda(
+            qkv_ptr as *const ffi::Half,
+            q_ptr as *mut ffi::Half,
+            k_ptr as *mut ffi::Half,
+            v_ptr as *mut ffi::Half,
+            qkv.seq_len as i32,
+            q.hidden_dim as i32,
+            k.hidden_dim as i32,
             ctx.stream.cu_stream(),
         )
         .result()?;

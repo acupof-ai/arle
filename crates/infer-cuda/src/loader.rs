@@ -1233,59 +1233,116 @@ impl SafetensorLoader {
         name_b: &str,
         tp: Option<&infer_topo::TpConfig>,
     ) -> Result<DeviceMatrix> {
-        let load_one = |name: &str| -> Result<(DeviceMatrix, bool)> {
-            match self.quant_view_for(name)? {
-                Some(view) => {
-                    let shard = match tp {
-                        Some(tp) => {
+        let spec_for = |name: &str| -> Result<Option<infer_topo::ShardingSpec>> {
+            let Some(tp) = tp else { return Ok(None) };
+            let rows = self.logical_rows(name)?;
+            Ok(Some(infer_topo::column_shard(rows, tp)))
+        };
+        self.load_matrices_row_fused(
+            ctx,
+            &[(name_a, spec_for(name_a)?), (name_b, spec_for(name_b)?)],
+        )
+    }
+
+    /// Logical (unsharded) output-row count of a matrix, quant-aware.
+    pub(crate) fn logical_rows(&self, name: &str) -> Result<usize> {
+        match self.quant_view_for(name)? {
+            Some(view) => {
+                ensure!(
+                    view.logical_shape.len() == 2,
+                    "{name}: expected 2D matrix, got {:?}",
+                    view.logical_shape
+                );
+                Ok(view.logical_shape[0])
+            }
+            None => {
+                let tensor = self.borrow_bf16_tensor(name)?;
+                ensure!(
+                    tensor.shape.len() == 2,
+                    "{name}: expected 2D BF16 tensor, got shape {:?}",
+                    tensor.shape
+                );
+                Ok(tensor.shape[0])
+            }
+        }
+    }
+
+    /// Load N same-K projections as ONE row-fused matrix (concatenated along
+    /// output rows, in `parts` order) so a single GEMM serves them all. Each
+    /// part carries its own optional row-shard spec (None = full matrix), so
+    /// column-parallel and head-sharded TP layouts both route here. W8A16
+    /// parts fuse before the Marlin repack (the fused matrix repacks + frees
+    /// INT8 once); every other format loads normally and fuses on device.
+    pub(crate) fn load_matrices_row_fused(
+        &self,
+        ctx: &DeviceContext,
+        parts: &[(&str, Option<infer_topo::ShardingSpec>)],
+    ) -> Result<DeviceMatrix> {
+        ensure!(parts.len() >= 2, "row fuse needs at least 2 parts");
+        let load_one =
+            |name: &str, spec: &Option<infer_topo::ShardingSpec>| -> Result<(DeviceMatrix, bool)> {
+                match self.quant_view_for(name)? {
+                    Some(view) => {
+                        let shard = match spec {
+                            Some(spec) => QuantMatrixShard::Rows(spec.clone()),
+                            None => QuantMatrixShard::Full,
+                        };
+                        if let QuantFormat::W8A16 { group_size } = view.format {
+                            Ok((
+                                self.load_w8a16_view_unpacked(ctx, &view, &shard, group_size)?,
+                                true,
+                            ))
+                        } else {
+                            Ok((self.load_quant_or_dense_view(ctx, &view, shard)?, false))
+                        }
+                    }
+                    None => match spec {
+                        Some(spec) => {
+                            const BF16_ELEM_SIZE: usize = 2;
+                            let tensor = self.borrow_bf16_tensor(name)?;
                             ensure!(
-                                view.logical_shape.len() == 2,
-                                "{name}: expected 2D matrix for pair fuse, got {:?}",
-                                view.logical_shape
+                                tensor.shape.len() == 2,
+                                "{name}: expected 2D BF16 tensor, got shape {:?}",
+                                tensor.shape
                             );
-                            QuantMatrixShard::Rows(infer_topo::column_shard(
-                                view.logical_shape[0],
-                                tp,
+                            let sharded = crate::shard_slice::shard_column_parallel(
+                                tensor.bytes(),
+                                tensor.shape[0],
+                                tensor.shape[1],
+                                BF16_ELEM_SIZE,
+                                spec,
+                            )?;
+                            Ok((
+                                DeviceMatrix::from_safetensors(
+                                    ctx,
+                                    &sharded.bytes,
+                                    sharded.rows,
+                                    sharded.cols,
+                                )
+                                .with_context(|| format!("upload row-sharded tensor {name}"))?,
+                                false,
                             ))
                         }
-                        None => QuantMatrixShard::Full,
-                    };
-                    if let QuantFormat::W8A16 { group_size } = view.format {
-                        Ok((
-                            self.load_w8a16_view_unpacked(ctx, &view, &shard, group_size)?,
-                            true,
-                        ))
-                    } else {
-                        Ok((self.load_quant_or_dense_view(ctx, &view, shard)?, false))
-                    }
+                        None => Ok((self.load_matrix(ctx, name)?, false)),
+                    },
                 }
-                None => match tp {
-                    Some(tp) => Ok((
-                        self.load_matrix_sharded(
-                            ctx,
-                            name,
-                            infer_topo::ParallelLinearKind::Column,
-                            tp,
-                        )?,
-                        false,
-                    )),
-                    None => Ok((self.load_matrix(ctx, name)?, false)),
-                },
-            }
-        };
-        let (ma, repack_a) = load_one(name_a)?;
-        let (mb, repack_b) = load_one(name_b)?;
-        ensure!(
-            repack_a == repack_b,
-            "pair fuse {name_a}/{name_b}: mixed W8A16/non-W8A16 halves"
-        );
-        let mut fused = DeviceMatrix::fuse_rows(ctx, &ma, &mb)
-            .with_context(|| format!("pair fuse {name_a} + {name_b}"))?;
-        drop((ma, mb));
-        if repack_a {
+            };
+        let (mut fused, repack) = load_one(parts[0].0, &parts[0].1)?;
+        for (name, spec) in &parts[1..] {
+            let (m, r) = load_one(name, spec)?;
+            ensure!(
+                r == repack,
+                "row fuse {}: mixed W8A16/non-W8A16 parts",
+                name
+            );
+            fused = DeviceMatrix::fuse_rows(ctx, &fused, &m)
+                .with_context(|| format!("row fuse + {name}"))?;
+        }
+        if repack {
+            let names: Vec<&str> = parts.iter().map(|(n, _)| *n).collect();
             fused
                 .repack_for_marlin_w8a16(ctx)
-                .with_context(|| format!("Marlin W8A16 repack fused {name_a}+{name_b}"))?;
+                .with_context(|| format!("Marlin W8A16 repack fused {}", names.join("+")))?;
         }
         Ok(fused)
     }
