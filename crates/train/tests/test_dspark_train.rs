@@ -123,7 +123,9 @@ fn dspark_trainer_serve_frame_and_alignment() {
     let mut target_logits: Vec<f32> = (0..2 * V).map(|i| -0.2 * (i as f32) + 0.5).collect();
     target_logits.extend(vec![f32::NAN; V]); // last row: beyond trained pairs
 
-    let accepted = 2usize;
+    // 1 of 2 trained rows accepted, so the two rows carry OPPOSITE-sign
+    // advantages — a chain-mean credit would give them the same one.
+    let accepted = 1usize;
     let exp = DsparkExperience {
         draft_tokens: chain.clone(),
         draft_logits: draft_logits.clone(),
@@ -165,11 +167,16 @@ fn dspark_trainer_serve_frame_and_alignment() {
         let s: f32 = e.iter().sum();
         e.iter().map(|&v| v / s).collect::<Vec<f32>>()
     };
-    let reward = accepted as f32 / block as f32;
-    let baseline = (1.0 - ema_alpha) * baseline_init + ema_alpha * reward;
-    let adv = reward - baseline;
+    // Per-token credit: row t is accepted iff t < accepted (verify stops at the
+    // first rejection). Baseline centres the same weighted quantity.
+    let credit = |t: usize| f32::from(t < accepted);
+    let w_of = |t: usize| (-(t as f32) / gamma).exp();
+    let wsum_all: f32 = (0..block - 1).map(w_of).sum();
+    let mean_reward: f32 = (0..block - 1).map(|t| credit(t) * w_of(t)).sum::<f32>() / wsum_all;
+    let baseline = (1.0 - ema_alpha) * baseline_init + ema_alpha * mean_reward;
     let (mut pg, mut pm, mut wsum) = (0.0f32, 0.0f32, 0.0f32);
     for t in 0..block - 1 {
+        let adv = credit(t) - baseline;
         let j = t + 1; // same-position draft row
         let cond = chain[t] as usize;
         let tok = chain[t + 1] as usize;
