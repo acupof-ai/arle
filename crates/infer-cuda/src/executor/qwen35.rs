@@ -193,12 +193,6 @@ pub(crate) struct Qwen35CudaExecutor {
     /// are capture-stable, contents refresh each step outside the graph.
     /// Empty until the lane first runs.
     paged_decode_meta: Vec<Option<crate::loader::PageMeta>>,
-    /// Same lane for the DSpark verify forward, which is the 86% term of a
-    /// spec block step and fixed-shape at one chain per tick. Keyed by chain
-    /// length: a different `--dspark-block-size` drops both and rebuilds.
-    verify_graph: Option<Qwen35DecodeGraph>,
-    verify_meta: Vec<Option<crate::loader::PageMeta>>,
-    verify_rows: usize,
     /// Lazily-built batched rows>1 decode state: a dedicated `[*, B]`
     /// workspace plus per-layer recurrent-state pointer tables (see
     /// [`crate::qwen35::Qwen35BatchDecodeState`]). `None` until the first
@@ -949,9 +943,6 @@ impl Qwen35CudaExecutor {
             decode_graph_armed,
             decode_graph: None,
             paged_decode_meta: Vec::new(),
-            verify_graph: None,
-            verify_meta: Vec::new(),
-            verify_rows: 0,
             batch_decode: None,
             kv_recall: false,
             recall_cfg: crate::recall::default_recall_config(),
@@ -2260,9 +2251,6 @@ impl Qwen35CudaExecutor {
             grow_host_slot_to(host_kv, c.slot, c.start + c.chain.len())?;
             self.mirror_host_slot(host_kv, c.slot, c.start + c.chain.len())?;
         }
-        if let Some(logits) = self.try_graph_verify(batch, chains, total_rows)? {
-            return Ok(logits);
-        }
         let Self {
             model,
             slots,
@@ -2306,131 +2294,6 @@ impl Qwen35CudaExecutor {
             })
             .collect();
         model.dspark_verify_logits(&mut fwd, workspace, chains, &mut rc, &mut ds.taps)
-    }
-
-    /// Whole-verify CUDA graph for the single-chain (c=1) spec tick — the same
-    /// capture/replay lane as [`Self::try_graph_decode_paged`], over `n` query
-    /// rows instead of one. Verify is 86% of a block step and re-issues the
-    /// full trunk launch sequence every tick, which is exactly what the graph
-    /// removes. `Ok(None)` = eager fallback; any capture/replay failure
-    /// permanently downgrades. Accept/commit/rollback stay outside.
-    fn try_graph_verify(
-        &mut self,
-        batch: &[DsparkChain],
-        chains: &[u32],
-        total_rows: usize,
-    ) -> Result<Option<cuda_kernels::prelude::HiddenStates>> {
-        if !self.decode_graph_armed
-            || !self.paged_kv_bf16()
-            || !self.model.paged_decode_fa3_active()
-        {
-            return Ok(None);
-        }
-        // Multi-chain ticks vary `total_rows` per step; only the fixed-shape
-        // single-chain case is worth a capture key.
-        let [c] = batch else { return Ok(None) };
-        let n = c.chain.len();
-        if n < 2 || n != total_rows || c.start + n > self.model.max_seq_len() {
-            return Ok(None);
-        }
-        let slot = c.slot;
-        // The eager lane derives `start_pos` from the trunk slot; this one is
-        // handed `c.start`. They must agree or the graph bakes a stale RoPE
-        // offset for the whole chain.
-        ensure!(
-            self.slots[slot].seq_len() == c.start,
-            "Qwen3.6 dspark verify graph: trunk seq_len {} != chain start {} for slot {slot}",
-            self.slots[slot].seq_len(),
-            c.start
-        );
-        if self.verify_rows != n {
-            self.verify_graph = None;
-            self.verify_meta.clear();
-            self.verify_rows = n;
-        }
-        if self.verify_graph.is_none() {
-            self.verify_graph = Some(Qwen35DecodeGraph::new(
-                self.num_slots,
-                &self.model.ctx.stream,
-            ));
-        }
-        if self.verify_meta.is_empty() {
-            self.verify_meta = (0..self.num_slots).map(|_| None).collect();
-        }
-        {
-            let pool = self.full_attn_kv.as_ref().expect("paged (gated by seeded)");
-            let capacity = self.model.max_seq_len().div_ceil(pool.page_size);
-            let meta = match &mut self.verify_meta[slot] {
-                Some(meta) => meta,
-                none => none.insert(crate::loader::PageMeta::persistent_decode(
-                    &self.model.ctx,
-                    pool.page_size,
-                    capacity,
-                    n,
-                )?),
-            };
-            meta.refresh_decode(&self.model.ctx, pool, slot, c.start)?;
-        }
-        let Self {
-            model,
-            slots,
-            verify_graph,
-            verify_meta,
-            full_attn_kv,
-            dspark,
-            ..
-        } = self;
-        let ds = dspark.as_mut().expect("dspark");
-        let dg = verify_graph.as_mut().expect("built above");
-        Self::stage_graph_step(model, dg, slot, chains, c.start, "verify ")?;
-        let Qwen35DecodeGraph { ws, graphs, .. } = dg;
-        let state = &mut graphs[slot];
-        let was_captured = state.is_captured();
-        let will_replay = was_captured && !state.is_armed_warm();
-        ds.taps
-            .prepare(ds.head.target_layer_ids(), model.config.hidden_size, n);
-        let pool = full_attn_kv.as_mut().expect("paged (gated by seeded)");
-        let meta = verify_meta[slot].as_ref().expect("built above");
-        let mut rc = crate::qwen35::Qwen35RecallForward {
-            pool,
-            meta,
-            layer0_query: None,
-        };
-        let taps = &mut ds.taps;
-        let mut fwd = vec![crate::qwen35::LinearRow {
-            slot: &mut slots[slot],
-            len: n,
-            capture: ds.spec[slot].as_mut().map(|st| &mut st.capture),
-        }];
-        let start = c.start;
-        let run = state
-            .run_or_capture(|| model.dspark_verify_captured(&mut fwd, ws, start, &mut rc, taps));
-        if let Err(e) = run {
-            warn!(
-                "Qwen3.6 dspark verify graph failed (slot {slot}, rows {n}), \
-                 downgrading to eager forward: {e}"
-            );
-            self.decode_graph_armed = false;
-            self.decode_graph = None;
-            self.verify_graph = None;
-            self.verify_meta.clear();
-            self.paged_decode_meta.clear();
-            return Ok(None);
-        }
-        let logits = model.finish_verify(&mut fwd, ws, n)?;
-        drop(fwd);
-        let dg = self.verify_graph.as_ref().expect("still present");
-        if !was_captured && dg.graphs[slot].is_captured() {
-            let captures =
-                QWEN35_GRAPH_CAPTURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            info!(
-                "[qwen35-decode-graph] captured verify slot {slot} rows {n} (captures_total={captures})"
-            );
-        }
-        if will_replay {
-            QWEN35_GRAPH_REPLAYS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-        Ok(Some(logits))
     }
 
     /// One prefill row over the recall pool (`--kv-recall`). The ONLY place the whole
@@ -2653,18 +2516,14 @@ impl Qwen35CudaExecutor {
         model: &crate::qwen35::Qwen35Model,
         dg: &mut Qwen35DecodeGraph,
         slot: usize,
-        tokens: &[u32],
+        last_token: u32,
         start_pos: usize,
         label: &str,
     ) -> Result<()> {
         let Qwen35DecodeGraph { ws, graphs, baked } = dg;
-        let (token_ids_ptr, start_pos_ptr) = model.stage_step_inputs(ws, tokens, start_pos)?;
-        // One token is a decode step (1-D logits slot); more is a spec-verify
-        // chain (`[vocab, rows]`).
-        let logits_ptr = match tokens.len() {
-            1 => model.workspace_logits_ptr(ws)?,
-            n => model.verify_logits_ptr(ws, n)?,
-        };
+        let (token_ids_ptr, start_pos_ptr) =
+            model.stage_step_inputs(ws, &[last_token], start_pos)?;
+        let logits_ptr = model.workspace_logits_ptr(ws)?;
         let bake = Qwen35GraphBake {
             token_ids_ptr,
             start_pos_ptr,
@@ -2762,7 +2621,7 @@ impl Qwen35CudaExecutor {
             .as_mut()
             .expect("decode_graph built above when armed");
         let slot = row.slot;
-        Self::stage_graph_step(model, dg, slot, &[row.last_token], row.kv_seq_len, "")?;
+        Self::stage_graph_step(model, dg, slot, row.last_token, row.kv_seq_len, "")?;
         let Qwen35DecodeGraph { ws, graphs, .. } = dg;
         let state = &mut graphs[slot];
         let was_captured = state.is_captured();
@@ -2779,7 +2638,6 @@ impl Qwen35CudaExecutor {
             );
             self.decode_graph_armed = false;
             self.decode_graph = None;
-            self.verify_graph = None;
             return Ok(None);
         }
         self.finish_graph_step(slot, was_captured, will_replay, "", row, position)
@@ -2843,7 +2701,6 @@ impl Qwen35CudaExecutor {
                     &self.model.ctx,
                     pool.page_size,
                     capacity,
-                    1,
                 )?),
             };
             meta.refresh_decode(&self.model.ctx, pool, slot, row.kv_seq_len)?;
@@ -2859,7 +2716,7 @@ impl Qwen35CudaExecutor {
         let dg = decode_graph
             .as_mut()
             .expect("decode_graph built above when armed");
-        Self::stage_graph_step(model, dg, slot, &[row.last_token], row.kv_seq_len, "paged ")?;
+        Self::stage_graph_step(model, dg, slot, row.last_token, row.kv_seq_len, "paged ")?;
         let Qwen35DecodeGraph { ws, graphs, .. } = dg;
         let state = &mut graphs[slot];
         let was_captured = state.is_captured();
@@ -2884,7 +2741,6 @@ impl Qwen35CudaExecutor {
             );
             self.decode_graph_armed = false;
             self.decode_graph = None;
-            self.verify_graph = None;
             self.paged_decode_meta.clear();
             return Ok(None);
         }
@@ -2913,7 +2769,6 @@ impl Qwen35CudaExecutor {
         // addresses — drop them wholesale. Re-built + re-captured lazily after
         // reload (the gate flag stays armed).
         self.decode_graph = None;
-        self.verify_graph = None;
         Ok(freed)
     }
 
@@ -2930,7 +2785,6 @@ impl Qwen35CudaExecutor {
             bd.release();
         }
         self.decode_graph = None;
-        self.verify_graph = None;
         Ok(())
     }
 
@@ -3712,7 +3566,6 @@ impl Qwen35CudaExecutor {
         // The merge REPLACES `DeviceMatrix` buffers (new device addresses);
         // captured decode graphs bake the old ones — drop and recapture lazily.
         self.decode_graph = None;
-        self.verify_graph = None;
         // Weight epoch changed: sidecar recurrent snapshots are as stale as the
         // radix the caller invalidates — drop every tracked sidecar blob from the
         // tier so a skipped capture never serves old-epoch state. (Blobs whose
@@ -3744,7 +3597,6 @@ impl Qwen35CudaExecutor {
     pub(crate) fn update_dspark_markov_weights(&mut self, w1: &[f32], w2: &[f32]) -> Result<()> {
         self.ensure_not_collective("update_dspark_markov_weights")?;
         self.decode_graph = None;
-        self.verify_graph = None;
         let dspark = self
             .dspark
             .as_mut()
