@@ -21,6 +21,13 @@
 #define GDR_J_SLICES 4
 #define GDR_BLOCK_DIM (GDR_VAL_DIM * GDR_J_SLICES)  // 512
 #define GDR_J_PER_SLICE (GDR_KEY_DIM / GDR_J_SLICES) // 32
+// Decode: split each head's val columns across 2 blocks (96 blocks fill the
+// 78-SM H20; 48 left 30 SMs idle) and keep the state tile in registers
+// between the decay and update passes (one DRAM read + one write instead of
+// two of each — state traffic is the whole kernel).
+#define GDR_DEC_VAL_SPLIT 2
+#define GDR_DEC_VAL_COLS (GDR_VAL_DIM / GDR_DEC_VAL_SPLIT)         // 64
+#define GDR_DEC_BLOCK_DIM (GDR_DEC_VAL_COLS * GDR_J_SLICES)        // 256
 
 __global__ void gated_delta_rule_decode_kernel(
     const __nv_bfloat16* __restrict__ qkv,   // [q_dim + k_dim + v_dim] after conv1d+SiLU
@@ -35,11 +42,13 @@ __global__ void gated_delta_rule_decode_kernel(
     int key_dim,    // 128
     int val_dim     // 128
 ) {
-    int v_head = blockIdx.x;
-    int val_idx = threadIdx.x & 0x7F;    // threadIdx.x % 128
-    int j_slice = threadIdx.x >> 7;       // threadIdx.x / 128  (0..3)
-    int warp_id = threadIdx.x >> 5;       // threadIdx.x / 32
-    int lane_id = threadIdx.x & 0x1F;     // threadIdx.x % 32
+    int v_head = blockIdx.x / GDR_DEC_VAL_SPLIT;
+    int val_base = (blockIdx.x % GDR_DEC_VAL_SPLIT) * GDR_DEC_VAL_COLS;
+    int val_col = threadIdx.x & (GDR_DEC_VAL_COLS - 1);
+    int val_idx = val_base + val_col;
+    int j_slice = threadIdx.x / GDR_DEC_VAL_COLS;  // 0..3
+    int warp_id = threadIdx.x >> 5;
+    int lane_id = threadIdx.x & 0x1F;
 
     int k_head = v_head * num_key_heads / num_value_heads;
     int q_dim_total = key_dim * num_key_heads;
@@ -48,26 +57,27 @@ __global__ void gated_delta_rule_decode_kernel(
     __shared__ float smem_q[GDR_KEY_DIM];
     __shared__ float smem_k[GDR_KEY_DIM];
     __shared__ float smem_norm[2];
-    __shared__ float warp_norms[GDR_BLOCK_DIM / WARP_SIZE];  // 16
+    __shared__ float warp_norms[GDR_DEC_BLOCK_DIM / WARP_SIZE];  // 8
     __shared__ float s_exp_g;
     __shared__ float s_beta;
-    __shared__ float smem_kv_partial[GDR_J_SLICES][GDR_VAL_DIM];
-    __shared__ float smem_out_partial[GDR_J_SLICES][GDR_VAL_DIM];
+    __shared__ float smem_kv_partial[GDR_J_SLICES][GDR_DEC_VAL_COLS];
+    __shared__ float smem_out_partial[GDR_J_SLICES][GDR_DEC_VAL_COLS];
+    __shared__ float smem_v[GDR_DEC_VAL_COLS];
 
-    // Only the first j-slice touches Q/K/V inputs. The other slices reuse
-    // shared-memory copies, avoiding 4x duplicated global loads per value dim.
-    __shared__ float smem_v[GDR_VAL_DIM];
+    // Threads 0..key_dim load the full q/k rows (independent of the val split).
     float q_val = 0.0f;
     float k_val = 0.0f;
-    if (j_slice == 0) {
-        q_val = __bfloat162float(qkv[k_head * key_dim + val_idx]);
-        k_val = __bfloat162float(qkv[q_dim_total + k_head * key_dim + val_idx]);
-        smem_v[val_idx] =
-            __bfloat162float(qkv[q_dim_total + k_dim_total + v_head * val_dim + val_idx]);
+    if (threadIdx.x < GDR_KEY_DIM) {
+        q_val = __bfloat162float(qkv[k_head * key_dim + threadIdx.x]);
+        k_val = __bfloat162float(qkv[q_dim_total + k_head * key_dim + threadIdx.x]);
+    }
+    if (threadIdx.x < GDR_DEC_VAL_COLS) {
+        smem_v[threadIdx.x] =
+            __bfloat162float(qkv[q_dim_total + k_dim_total + v_head * val_dim + val_base + threadIdx.x]);
     }
 
-    // L2 normalize q and k — only j_slice=0 contributes to avoid 4× counting
-    float q_sq = (j_slice == 0) ? q_val * q_val : 0.0f;
+    // L2 normalize q and k (sum over the first key_dim threads' squares).
+    float q_sq = q_val * q_val;
     q_sq = warp_reduce_sum(q_sq);
     if (lane_id == 0) warp_norms[warp_id] = q_sq;
     __syncthreads();
@@ -81,7 +91,7 @@ __global__ void gated_delta_rule_decode_kernel(
     // k partials below — order the consumption before the overwrite.
     __syncthreads();
 
-    float k_sq = (j_slice == 0) ? k_val * k_val : 0.0f;
+    float k_sq = k_val * k_val;
     k_sq = warp_reduce_sum(k_sq);
     if (lane_id == 0) warp_norms[warp_id] = k_sq;
     __syncthreads();
@@ -92,14 +102,9 @@ __global__ void gated_delta_rule_decode_kernel(
     }
     __syncthreads();
 
-    q_val *= smem_norm[0];
-    k_val *= smem_norm[1];
-    q_val *= rsqrtf((float)key_dim);
-
-    // j_slice=0 stores normalized q/k to shared memory for all slices to use
-    if (j_slice == 0) {
-        smem_q[val_idx] = q_val;
-        smem_k[val_idx] = k_val;
+    if (threadIdx.x < GDR_KEY_DIM) {
+        smem_q[threadIdx.x] = q_val * smem_norm[0] * rsqrtf((float)key_dim);
+        smem_k[threadIdx.x] = k_val * smem_norm[1];
     }
 
     // Compute g and beta for this value head
@@ -124,42 +129,46 @@ __global__ void gated_delta_rule_decode_kernel(
     float* my_state = state + v_head * key_dim * val_dim;
 
     int j_start = j_slice * GDR_J_PER_SLICE;
-    int j_end = j_start + GDR_J_PER_SLICE;
 
-    // Pass 1: Decay + partial kv_mem (each j_slice handles 32 j-iterations)
+    // Pass 1: decay + partial kv_mem, keeping the decayed tile in registers so
+    // pass 2 re-reads no state from DRAM.
+    float s_reg[GDR_J_PER_SLICE];
     float partial_kv = 0.0f;
-    for (int j = j_start; j < j_end; j++) {
+    #pragma unroll
+    for (int jj = 0; jj < GDR_J_PER_SLICE; jj++) {
+        int j = j_start + jj;
         float s = my_state[j * val_dim + val_idx];
         s *= exp_g;
-        my_state[j * val_dim + val_idx] = s;
+        s_reg[jj] = s;
         partial_kv += s * smem_k[j];
     }
 
     // Reduce partial kv_mem across j_slices
-    smem_kv_partial[j_slice][val_idx] = partial_kv;
+    smem_kv_partial[j_slice][val_col] = partial_kv;
     __syncthreads();
 
-    float kv_mem = smem_kv_partial[0][val_idx] + smem_kv_partial[1][val_idx]
-                 + smem_kv_partial[2][val_idx] + smem_kv_partial[3][val_idx];
+    float kv_mem = smem_kv_partial[0][val_col] + smem_kv_partial[1][val_col]
+                 + smem_kv_partial[2][val_col] + smem_kv_partial[3][val_col];
 
-    float my_delta = (smem_v[val_idx] - kv_mem) * beta;
+    float my_delta = (smem_v[val_col] - kv_mem) * beta;
 
-    // Pass 2: Rank-1 update + partial output
+    // Pass 2: rank-1 update from registers + partial output; single state write.
     float partial_out = 0.0f;
-    for (int j = j_start; j < j_end; j++) {
-        float s = my_state[j * val_dim + val_idx];
-        s += my_delta * smem_k[j];
+    #pragma unroll
+    for (int jj = 0; jj < GDR_J_PER_SLICE; jj++) {
+        int j = j_start + jj;
+        float s = s_reg[jj] + my_delta * smem_k[j];
         my_state[j * val_dim + val_idx] = s;
         partial_out += s * smem_q[j];
     }
 
     // Reduce partial output across j_slices, j_slice=0 writes result
-    smem_out_partial[j_slice][val_idx] = partial_out;
+    smem_out_partial[j_slice][val_col] = partial_out;
     __syncthreads();
 
     if (j_slice == 0) {
-        float out = smem_out_partial[0][val_idx] + smem_out_partial[1][val_idx]
-                   + smem_out_partial[2][val_idx] + smem_out_partial[3][val_idx];
+        float out = smem_out_partial[0][val_col] + smem_out_partial[1][val_col]
+                   + smem_out_partial[2][val_col] + smem_out_partial[3][val_col];
         output[v_head * val_dim + val_idx] = __float2bfloat16(out);
     }
 }
@@ -185,8 +194,9 @@ cudaError_t gated_delta_rule_decode_cuda(
     if (key_dim != GDR_KEY_DIM || val_dim != GDR_VAL_DIM) {
         return cudaErrorInvalidValue;
     }
-    // One block per value head, 512 threads (128 val_dim × 4 j_slices)
-    gated_delta_rule_decode_kernel<<<num_value_heads, GDR_BLOCK_DIM, 0, stream>>>(
+    // Two blocks per value head (64 val cols × 4 j_slices = 256 threads each).
+    gated_delta_rule_decode_kernel<<<num_value_heads * GDR_DEC_VAL_SPLIT,
+                                     GDR_DEC_BLOCK_DIM, 0, stream>>>(
         qkv, b_proj, a_proj, dt_bias, A_log,
         state, output,
         num_key_heads, num_value_heads, key_dim, val_dim
