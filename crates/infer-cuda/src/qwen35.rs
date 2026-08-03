@@ -4338,6 +4338,35 @@ impl Qwen35Model {
         self.lm_head_logits(ws, 1)
     }
 
+    /// Paged twin of [`Self::forward_decode_step_captured`]: the same staged,
+    /// host-state-free decode body, but full-attn layers attend the paged pool
+    /// through `recall`'s page table. Capture-safe iff the meta is a
+    /// [`crate::loader::PageMeta::persistent_decode`] (stable device
+    /// addresses, `seqlen_k_capture` pinned) and the FA3 BF16 lane is active
+    /// (the TileLang fallback bakes `num_pages` as a host arg).
+    pub(crate) fn forward_decode_step_paged_captured(
+        &self,
+        slot: &mut Qwen35SlotState,
+        ws: &mut Qwen35Workspace,
+        start_pos: usize,
+        recall: &mut Qwen35RecallForward,
+    ) -> Result<()> {
+        let mut rows = [LinearRow {
+            slot,
+            len: 1,
+            capture: None,
+        }];
+        self.forward_hidden_staged(&mut rows, ws, start_pos, Some(recall), None)?;
+        self.lm_head_logits(ws, 1)
+    }
+
+    /// Whether the paged decode step will take the FA3 BF16 hd256 lane — the
+    /// only paged-attention lane whose launch is CUDA-graph-capturable (the
+    /// TileLang fallback bakes `num_pages` as a host arg).
+    pub(crate) fn paged_decode_fa3_active(&self) -> bool {
+        self.config.head_dim == 256 && qwen35_fa3_enabled(&self.ctx)
+    }
+
     /// Whether every layer of this model can run the captured decode body —
     /// i.e. each MoE layer's decode step is a pure device-kernel sequence.
     /// Dense-MLP layers are always capturable; MoE layers need the device
@@ -6590,7 +6619,9 @@ impl Qwen35Model {
                                 batch: meta.batch as i32,
                                 total_q: meta.total_q as i32,
                                 seqlen_q: meta.seq_len as i32,
-                                seqlen_k: meta.kv_lens.iter().copied().max().unwrap_or(0) as i32,
+                                seqlen_k: meta.seqlen_k_capture.unwrap_or_else(|| {
+                                    meta.kv_lens.iter().copied().max().unwrap_or(0)
+                                }) as i32,
                                 num_heads: self.local_q_heads as i32,
                                 num_heads_k: self.local_kv_heads as i32,
                                 head_dim: c.head_dim as i32,
@@ -6629,6 +6660,14 @@ impl Qwen35Model {
                             }
                             return Ok(());
                         }
+                        // A persistent-decode meta means a graph capture may be
+                        // active — the TileLang lane below bakes `num_pages`
+                        // as a host arg and would replay stale, so refuse (the
+                        // capture error downgrades the lane to eager).
+                        ensure!(
+                            meta.seqlen_k_capture.is_none(),
+                            "paged decode graph capture requires the FA3 BF16 lane"
+                        );
                         match pool.format {
                             KVFormat::BF16 => {
                                 // SAFETY: kernel signature from paged_attn_v1 ABI (18-arg BF16).

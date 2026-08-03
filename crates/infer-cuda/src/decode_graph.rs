@@ -111,6 +111,7 @@ impl DecodeGraphContext {
                 new_token_rows: None,
                 prefix_token_rows: None,
                 quant_decode_meta: None,
+                seqlen_k_capture: None,
             },
             max_pages,
             key: None,

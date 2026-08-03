@@ -352,6 +352,10 @@ pub(crate) struct PageMeta {
     /// Packed fused-decode metadata `[page_indptr(b+1) | last_page_len(b)]`
     /// from `build_quantized_decode_indptr`. Quant formats only.
     pub(crate) quant_decode_meta: Option<CudaSlice<i32>>,
+    /// When set, the FA3 launch uses this as `seqlen_k` (scheduling capacity)
+    /// instead of the step's true max KV length — required under CUDA graph
+    /// capture, where the true length is only on device (`kv_lens_dev`).
+    pub(crate) seqlen_k_capture: Option<usize>,
 }
 
 impl PageMeta {
@@ -487,6 +491,7 @@ impl PageMeta {
             new_token_rows,
             prefix_token_rows,
             quant_decode_meta,
+            seqlen_k_capture: None,
         })
     }
 
@@ -498,6 +503,120 @@ impl PageMeta {
         seq_len: usize,
     ) -> Result<Self> {
         Self::for_rows(ctx, pool, &[(slot, start_pos, seq_len)])
+    }
+
+    /// Fixed-capacity single-slot decode metadata whose device buffers never
+    /// move: [`Self::refresh_decode`] rewrites the CONTENTS each step, so a
+    /// captured CUDA graph keeps reading the same addresses while the page
+    /// table grows. `capacity_pages` bounds `kv_indices`/`page_table_rect`
+    /// (also the FA3 rect row stride); `seqlen_k_capture` is pinned to the
+    /// capacity so the FA3 scheduling ceiling is capture-stable. BF16 only.
+    pub(crate) fn persistent_decode(
+        ctx: &DeviceContext,
+        page_size: usize,
+        capacity_pages: usize,
+    ) -> Result<Self> {
+        let cap = capacity_pages.max(1);
+        Ok(Self {
+            q_indptr: upload_i32(ctx, &[0, 1])?,
+            kv_indptr: upload_i32(ctx, &[0, 0])?,
+            kv_indices: upload_i32(ctx, &vec![0i32; cap])?,
+            kv_lens_dev: upload_i32(ctx, &[0])?,
+            page_table_rect: upload_i32(ctx, &vec![0i32; cap])?,
+            page_table_stride: cap,
+            kv_last_page_len: upload_i32(ctx, &[0])?,
+            page_table_offsets: upload_i32(ctx, &[0])?,
+            start_positions: upload_i32(ctx, &[0])?,
+            positions: upload_i32(ctx, &[0])?,
+            q_offsets: vec![0, 1],
+            page_offsets: vec![0, 0],
+            kv_lens: vec![0],
+            seq_len: 1,
+            total_q: 1,
+            num_pages: 0,
+            batch: 1,
+            start_pos: 0,
+            new_token_rows: None,
+            prefix_token_rows: None,
+            quant_decode_meta: None,
+            seqlen_k_capture: Some(cap * page_size),
+        })
+    }
+
+    /// Rewrite a [`Self::persistent_decode`] meta for one decode step
+    /// (`start_pos` prefix tokens + 1 new token) — contents only, no
+    /// reallocation. Must run OUTSIDE any graph capture/replay.
+    pub(crate) fn refresh_decode(
+        &mut self,
+        ctx: &DeviceContext,
+        pool: &PagedKVPool,
+        slot: usize,
+        start_pos: usize,
+    ) -> Result<()> {
+        ensure!(
+            pool.format == KVFormat::BF16,
+            "persistent decode page table is BF16-only, got {:?}",
+            pool.format
+        );
+        let total_len = start_pos + 1;
+        ensure!(
+            pool.seq_len(slot) == total_len,
+            "persistent decode refresh: pool seq_len {} != total_len {total_len} for slot {slot}",
+            pool.seq_len(slot),
+        );
+        let num_pages = total_len.div_ceil(pool.page_size);
+        let cap = self.page_table_stride;
+        ensure!(
+            num_pages <= cap,
+            "slot {slot} needs {num_pages} pages, persistent capacity is {cap}"
+        );
+        let pages = pool.page_indices(slot);
+        ensure!(
+            pages.len() >= num_pages,
+            "slot {slot} has {} pages, expected at least {num_pages}",
+            pages.len()
+        );
+        let pages_i32: Vec<i32> = pages[..num_pages].iter().map(|&p| p as i32).collect();
+        let stream = &ctx.stream;
+        stream
+            .memcpy_htod(&pages_i32, &mut self.kv_indices.slice_mut(0..num_pages))
+            .map_err(|e| anyhow!("refresh kv_indices: {e}"))?;
+        stream
+            .memcpy_htod(
+                &pages_i32,
+                &mut self.page_table_rect.slice_mut(0..num_pages),
+            )
+            .map_err(|e| anyhow!("refresh page_table_rect: {e}"))?;
+        let last_page_len = match total_len % pool.page_size {
+            0 => pool.page_size as i32,
+            l => l as i32,
+        };
+        stream
+            .memcpy_htod(&[0, num_pages as i32], &mut self.kv_indptr.slice_mut(0..2))
+            .map_err(|e| anyhow!("refresh kv_indptr: {e}"))?;
+        stream
+            .memcpy_htod(&[last_page_len], &mut self.kv_last_page_len.slice_mut(0..1))
+            .map_err(|e| anyhow!("refresh kv_last_page_len: {e}"))?;
+        stream
+            .memcpy_htod(
+                &[start_pos as i32],
+                &mut self.start_positions.slice_mut(0..1),
+            )
+            .map_err(|e| anyhow!("refresh start_positions: {e}"))?;
+        stream
+            .memcpy_htod(
+                &[(total_len - 1) as i32],
+                &mut self.positions.slice_mut(0..1),
+            )
+            .map_err(|e| anyhow!("refresh positions: {e}"))?;
+        stream
+            .memcpy_htod(&[total_len as i32], &mut self.kv_lens_dev.slice_mut(0..1))
+            .map_err(|e| anyhow!("refresh kv_lens_dev: {e}"))?;
+        self.page_offsets = vec![0, num_pages];
+        self.kv_lens = vec![total_len];
+        self.num_pages = num_pages;
+        self.start_pos = start_pos;
+        Ok(())
     }
 
     /// Session KV-recall decode page table (BF16 only): build the metadata over a
@@ -557,6 +676,7 @@ impl PageMeta {
             new_token_rows: None,
             prefix_token_rows: None,
             quant_decode_meta: None,
+            seqlen_k_capture: None,
         })
     }
 
