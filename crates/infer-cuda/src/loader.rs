@@ -1364,6 +1364,31 @@ impl SafetensorLoader {
         )
     }
 
+    /// Upload one row-shard window of a 2D BF16 tensor.
+    fn load_bf16_row_sharded(
+        &self,
+        ctx: &DeviceContext,
+        name: &str,
+        spec: &infer_topo::ShardingSpec,
+    ) -> Result<DeviceMatrix> {
+        const BF16_ELEM_SIZE: usize = 2;
+        let tensor = self.borrow_bf16_tensor(name)?;
+        ensure!(
+            tensor.shape.len() == 2,
+            "{name}: expected 2D BF16 tensor, got shape {:?}",
+            tensor.shape
+        );
+        let sharded = crate::shard_slice::shard_column_parallel(
+            tensor.bytes(),
+            tensor.shape[0],
+            tensor.shape[1],
+            BF16_ELEM_SIZE,
+            spec,
+        )?;
+        DeviceMatrix::from_safetensors(ctx, &sharded.bytes, sharded.rows, sharded.cols)
+            .with_context(|| format!("upload row-sharded tensor {name}"))
+    }
+
     /// Logical (unsharded) output-row count of a matrix, quant-aware.
     pub(crate) fn logical_rows(&self, name: &str) -> Result<usize> {
         match self.quant_view_for(name)? {
@@ -1399,6 +1424,8 @@ impl SafetensorLoader {
         parts: &[(&str, Option<infer_topo::ShardingSpec>)],
     ) -> Result<DeviceMatrix> {
         ensure!(parts.len() >= 2, "row fuse needs at least 2 parts");
+        // Returns (matrix, needs_marlin_repack) — W8A16 parts stay INT8 until
+        // the fused matrix repacks once.
         let load_one =
             |name: &str, spec: &Option<infer_topo::ShardingSpec>| -> Result<(DeviceMatrix, bool)> {
                 match self.quant_view_for(name)? {
@@ -1417,32 +1444,7 @@ impl SafetensorLoader {
                         }
                     }
                     None => match spec {
-                        Some(spec) => {
-                            const BF16_ELEM_SIZE: usize = 2;
-                            let tensor = self.borrow_bf16_tensor(name)?;
-                            ensure!(
-                                tensor.shape.len() == 2,
-                                "{name}: expected 2D BF16 tensor, got shape {:?}",
-                                tensor.shape
-                            );
-                            let sharded = crate::shard_slice::shard_column_parallel(
-                                tensor.bytes(),
-                                tensor.shape[0],
-                                tensor.shape[1],
-                                BF16_ELEM_SIZE,
-                                spec,
-                            )?;
-                            Ok((
-                                DeviceMatrix::from_safetensors(
-                                    ctx,
-                                    &sharded.bytes,
-                                    sharded.rows,
-                                    sharded.cols,
-                                )
-                                .with_context(|| format!("upload row-sharded tensor {name}"))?,
-                                false,
-                            ))
-                        }
+                        Some(spec) => Ok((self.load_bf16_row_sharded(ctx, name, spec)?, false)),
                         None => Ok((self.load_matrix(ctx, name)?, false)),
                     },
                 }
