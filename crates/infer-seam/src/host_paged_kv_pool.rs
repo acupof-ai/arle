@@ -48,6 +48,10 @@ pub struct HostPagedKvPool {
     /// double-frees on slot free and drifts `page_refs` until eviction frees
     /// nothing while the evictable count stays positive (#164 residual).
     slot_attach: HashMap<u32, u32>,
+    /// Live count of pages matching `page_is_evictable`, maintained at every
+    /// retain/release/attach/detach transition — the scheduler reads it on
+    /// every decode tick, where a full `page_refs` scan is O(cached pages).
+    evictable: usize,
     fixed_pages_per_slot: Option<usize>,
 }
 
@@ -66,6 +70,7 @@ impl HostPagedKvPool {
             slot_epoch: vec![0; num_slots],
             page_refs: HashMap::new(),
             slot_attach: HashMap::new(),
+            evictable: 0,
             fixed_pages_per_slot: None,
         }
     }
@@ -85,7 +90,19 @@ impl HostPagedKvPool {
     }
 
     fn attach(&mut self, page: u32) {
+        let was = self.page_is_evictable(page);
         *self.slot_attach.entry(page).or_insert(0) += 1;
+        self.sync_evictable(page, was);
+    }
+
+    /// Re-fold `page` into the `evictable` counter after its retain or attach
+    /// count changed. `was` is the predicate value read before the mutation.
+    fn sync_evictable(&mut self, page: u32, was: bool) {
+        match (was, self.page_is_evictable(page)) {
+            (false, true) => self.evictable += 1,
+            (true, false) => self.evictable = self.evictable.saturating_sub(1),
+            _ => {}
+        }
     }
 
     /// Drop one slot attachment for `page`, recycling it once neither a slot
@@ -96,6 +113,7 @@ impl HostPagedKvPool {
         if page == EVICTED_PAGE {
             return;
         }
+        let was = self.page_is_evictable(page);
         if let Some(count) = self.slot_attach.get_mut(&page) {
             *count = count.saturating_sub(1);
             if *count == 0 {
@@ -103,6 +121,7 @@ impl HostPagedKvPool {
                 self.maybe_free(page);
             }
         }
+        self.sync_evictable(page, was);
     }
 
     /// Push `page` to the free stack iff no retain AND no attachment holds it.
@@ -157,10 +176,7 @@ impl KvQuery for HostPagedKvPool {
     }
 
     fn resident_evictable_pages(&self) -> usize {
-        self.page_refs
-            .keys()
-            .filter(|&&page| self.page_is_evictable(page))
-            .count()
+        self.evictable
     }
 
     fn page_is_evictable(&self, page: u32) -> bool {
@@ -327,12 +343,15 @@ impl KvAllocator for HostPagedKvPool {
 impl KvPrefixStore for HostPagedKvPool {
     fn retain_pages(&mut self, pages: &[u32]) {
         for &page in pages {
+            let was = self.page_is_evictable(page);
             *self.page_refs.entry(page).or_insert(0) += 1;
+            self.sync_evictable(page, was);
         }
     }
 
     fn release_pages(&mut self, pages: &[u32]) {
         for &page in pages {
+            let was = self.page_is_evictable(page);
             if let Some(c) = self.page_refs.get_mut(&page) {
                 *c = c.saturating_sub(1);
                 if *c == 0 {
@@ -340,6 +359,7 @@ impl KvPrefixStore for HostPagedKvPool {
                     self.maybe_free(page);
                 }
             }
+            self.sync_evictable(page, was);
         }
     }
 
