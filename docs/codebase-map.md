@@ -432,7 +432,7 @@ CI (`.github/workflows/ci.yml`) builds and tests `infer-api`, `cli`, the
 ### Bench and helper entrypoints
 
 - `scripts/bench_throughput.py`: canonical streaming throughput / latency runner
-- `scripts/bench_throughput.py`: legacy helper for narrower synthetic/sharegpt runs; not canonical throughput / latency truth
+- `scripts/bench_throughput_chat.py`: legacy helper for narrower synthetic runs; not canonical throughput / latency truth
 - `scripts/bench_agent_trace.py`: agent-style trace replay
 - additional `scripts/bench_*.{sh,py}` for per-workload A/B and trace replay
 

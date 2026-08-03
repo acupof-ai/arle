@@ -2,15 +2,13 @@
 
 `ARLE` exposes an OpenAI-compatible serving surface for text generation, model
 discovery, health/readiness probes, runtime stats, and session persistence
-through the dedicated `infer` binary.
+via `arle serve`.
 
 This document is the reference map for the current HTTP boundary. Stability
 tiers still live in [docs/support-matrix.md](support-matrix.md) and
 [docs/stability-policy.md](stability-policy.md).
 
 ## Route Map
-
-This document covers the serving surface.
 
 | Category | Route | Notes |
 | --- | --- | --- |
