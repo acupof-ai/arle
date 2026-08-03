@@ -224,7 +224,14 @@ fn coordinator_main() -> Result<()> {
         // attention backwards (fused SDPA recompute vs the ring), so when the two
         // bf16 arms disagree only the f32 arm says which one drifted.
         let norm_f32 = f32_ref.norm;
-        let n_denom = norm_f32.abs().max(1.0e-12);
+        // A ~zero anchor makes both ratios ~1/eps and the comparison passes on
+        // nothing — refuse to certify instead (2026-08-04: the f32 arm returned
+        // exactly 0 for full-attention-only configs, see docs/experience/errors/).
+        ensure!(
+            norm_f32.abs() > 1.0e-9,
+            "f32 grad-norm anchor is degenerate ({norm_f32:e}) — the reference backward produced no gradient, so this gate cannot certify CP"
+        );
+        let n_denom = norm_f32.abs();
         let norm_cp_vs_f32 = (norm_cp - norm_f32).abs() / n_denom;
         let norm_single_vs_f32 = (single.norm - norm_f32).abs() / n_denom;
         println!(
