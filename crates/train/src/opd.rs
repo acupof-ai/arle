@@ -3265,15 +3265,15 @@ pub fn masked_writeback_step<O: Optimizer>(
     };
 
     let loss_value = store.to_host(loss).map_err(OpdError::from)?[0];
-    // Reported loss: the numerator is this replica's sum but inv_n is the
-    // dp-global count, so sum replica losses across dp for the true global
-    // mean (G3: reported losses came back exactly /dp_size). Same
-    // cp-rank-0-contributes rule as the count reduce — all cp ranks hold the
-    // identical replica loss. Grads are unaffected: they already sum to the
-    // exact global mean via all_reduce_cp_grads.
-    let loss_value = if dp.is_enabled() {
-        let contribution = if cp.rank == 0 { loss_value } else { 0.0 };
-        crate::grad_clip::dp_group_sum_scalar(contribution, store).map_err(OpdError::from)?
+    // Reported loss: the local numerator is only this rank's partial sum (a
+    // cp rank holds its sequence shard's targets, a dp replica its own data)
+    // while inv_n is already 1/global_count — so the world sum of every
+    // rank's partial IS the true global mean, printed identically on every
+    // rank. Measured: cp=2 shards report 4.805783/6.064485, NOT identical.
+    // Grads are unaffected: they already sum to the exact global mean via
+    // all_reduce_cp_grads.
+    let loss_value = if cp.is_enabled() || dp.is_enabled() {
+        crate::grad_clip::dp_group_sum_scalar(loss_value, store).map_err(OpdError::from)?
     } else {
         loss_value
     };
