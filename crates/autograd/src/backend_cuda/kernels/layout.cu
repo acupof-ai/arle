@@ -1,6 +1,6 @@
 extern "C" __global__ void transpose_axes_swap_f32(
-    float* __restrict__ out,
-    const float* __restrict__ x,
+    T* __restrict__ out,
+    const T* __restrict__ x,
     const int* __restrict__ old_shape,
     const int* __restrict__ new_shape,
     int rank,
@@ -34,8 +34,8 @@ extern "C" __global__ void transpose_axes_swap_f32(
 }
 
 extern "C" __global__ void slice_f32(
-    float* __restrict__ out,
-    const float* __restrict__ x,
+    T* __restrict__ out,
+    const T* __restrict__ x,
     const int* __restrict__ old_shape,
     const int* __restrict__ starts,
     const int* __restrict__ new_shape,
@@ -62,9 +62,9 @@ extern "C" __global__ void slice_f32(
 }
 
 extern "C" __global__ void concat_axis2_f32(
-    float* __restrict__ out,
-    const float* __restrict__ a,
-    const float* __restrict__ b,
+    T* __restrict__ out,
+    const T* __restrict__ a,
+    const T* __restrict__ b,
     int batch,
     int heads,
     int a_seq,
@@ -94,8 +94,8 @@ extern "C" __global__ void concat_axis2_f32(
 }
 
 extern "C" __global__ void kv_cache_write_axis2_f32(
-    float* __restrict__ dst,
-    const float* __restrict__ src,
+    T* __restrict__ dst,
+    const T* __restrict__ src,
     int batch,
     int heads,
     int max_seq,
@@ -121,8 +121,8 @@ extern "C" __global__ void kv_cache_write_axis2_f32(
 }
 
 extern "C" __global__ void slice_backward_f32(
-    float* __restrict__ grad,
-    const float* __restrict__ upstream,
+    T* __restrict__ grad,
+    const T* __restrict__ upstream,
     const int* __restrict__ input_shape,
     const int* __restrict__ starts,
     const int* __restrict__ upstream_shape,

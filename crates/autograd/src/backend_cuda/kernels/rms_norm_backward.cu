@@ -33,7 +33,7 @@
 
 extern "C" __global__ void rms_norm_inv_rms_f32(
     float* __restrict__ inv_rms,
-    const float* __restrict__ x,
+    const T* __restrict__ x,
     int cols,
     float eps
 ) {
@@ -41,11 +41,11 @@ extern "C" __global__ void rms_norm_inv_rms_f32(
     int row = blockIdx.x;
     int tid = threadIdx.x;
     int block = blockDim.x;
-    const float* row_x = x + row * cols;
+    const T* row_x = x + row * cols;
 
     float local_sq = 0.0f;
     for (int i = tid; i < cols; i += block) {
-        float v = row_x[i];
+        float v = static_cast<float>(row_x[i]);
         local_sq += v * v;
     }
     smem[tid] = local_sq;
@@ -62,9 +62,9 @@ extern "C" __global__ void rms_norm_inv_rms_f32(
 }
 
 extern "C" __global__ void rms_norm_backward_x_f32(
-    float* __restrict__ grad_x,
-    const float* __restrict__ upstream,
-    const float* __restrict__ x,
+    T* __restrict__ grad_x,
+    const T* __restrict__ upstream,
+    const T* __restrict__ x,
     const float* __restrict__ weight,
     const float* __restrict__ inv_rms,
     int cols
@@ -73,14 +73,14 @@ extern "C" __global__ void rms_norm_backward_x_f32(
     int row = blockIdx.x;
     int tid = threadIdx.x;
     int block = blockDim.x;
-    const float* row_x = x + row * cols;
-    const float* row_up = upstream + row * cols;
-    float* row_grad = grad_x + row * cols;
+    const T* row_x = x + row * cols;
+    const T* row_up = upstream + row * cols;
+    T* row_grad = grad_x + row * cols;
 
     // Phase 1: reduce dot = sum_j(upstream * weight * x).
     float local_dot = 0.0f;
     for (int i = tid; i < cols; i += block) {
-        local_dot += row_up[i] * weight[i] * row_x[i];
+        local_dot += static_cast<float>(row_up[i]) * weight[i] * static_cast<float>(row_x[i]);
     }
     smem[tid] = local_dot;
     __syncthreads();
@@ -95,14 +95,14 @@ extern "C" __global__ void rms_norm_backward_x_f32(
 
     // Phase 2: write grad_x elementwise.
     for (int i = tid; i < cols; i += block) {
-        row_grad[i] = (inv * row_up[i] * weight[i]) - (row_x[i] * inv * correction);
+        row_grad[i] = static_cast<T>((inv * static_cast<float>(row_up[i]) * weight[i]) - (static_cast<float>(row_x[i]) * inv * correction));
     }
 }
 
 extern "C" __global__ void rms_norm_backward_w_f32(
     float* __restrict__ grad_w,
-    const float* __restrict__ upstream,
-    const float* __restrict__ x,
+    const T* __restrict__ upstream,
+    const T* __restrict__ x,
     const float* __restrict__ inv_rms,
     int rows,
     int cols
@@ -114,7 +114,7 @@ extern "C" __global__ void rms_norm_backward_w_f32(
 
     float local_sum = 0.0f;
     for (int r = tid; r < rows; r += block) {
-        local_sum += upstream[r * cols + col] * x[r * cols + col] * inv_rms[r];
+        local_sum += static_cast<float>(upstream[r * cols + col]) * static_cast<float>(x[r * cols + col]) * inv_rms[r];
     }
     smem[tid] = local_sum;
     __syncthreads();

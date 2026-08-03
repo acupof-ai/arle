@@ -7,8 +7,8 @@
 // Each block handles one (batch, head, token) triple; `cos`/`sin` have
 // shape [seq, half_dim] row-major and are indexed by token.
 extern "C" __global__ void rope_f32(
-    float* __restrict__ out,
-    const float* __restrict__ x,
+    T* __restrict__ out,
+    const T* __restrict__ x,
     const float* __restrict__ cos_table,
     const float* __restrict__ sin_table,
     int batch,
@@ -29,12 +29,12 @@ extern "C" __global__ void rope_f32(
     const int cache_base = token * rot_half;
 
     for (int i = threadIdx.x; i < rot_half; i += blockDim.x) {
-        const float x0 = x[row_base + i];
-        const float x1 = x[row_base + i + rot_half];
+        const float x0 = static_cast<float>(x[row_base + i]);
+        const float x1 = static_cast<float>(x[row_base + i + rot_half]);
         const float c = cos_table[cache_base + i];
         const float s = sin_table[cache_base + i];
-        out[row_base + i] = x0 * c - x1 * s;
-        out[row_base + i + rot_half] = x1 * c + x0 * s;
+        out[row_base + i] = static_cast<T>(x0 * c - x1 * s);
+        out[row_base + i + rot_half] = static_cast<T>(x1 * c + x0 * s);
     }
     for (int i = 2 * rot_half + threadIdx.x; i < head_dim; i += blockDim.x) {
         out[row_base + i] = x[row_base + i];

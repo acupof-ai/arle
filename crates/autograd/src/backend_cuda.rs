@@ -4252,6 +4252,38 @@ fn cuda_softmax_like_device(
         });
     }
     let expected = shape_size(shape);
+    let rows = expected / last_dim;
+    let cols = i32::try_from(last_dim)
+        .map_err(|_| AutogradError::TapeInvariant("cuda softmax cols exceeds i32"))?;
+    const BLOCK: u32 = 256;
+    const SHARED: u32 = BLOCK * std::mem::size_of::<f32>() as u32;
+    if let DeviceHandle::CudaBf16(storage) = x {
+        let d_in = backend.cuda_bf16_storage_slice(storage)?;
+        if d_in.len() != expected {
+            return Err(AutogradError::DataLengthMismatch {
+                len: d_in.len(),
+                shape: shape.to_vec(),
+                size: expected,
+            });
+        }
+        let mut d_out = backend
+            .stream
+            .alloc_zeros::<u16>(expected)
+            .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
+        let func = backend.kernels.function_for(kernel_name, TapeDtype::Bf16)?;
+        launch_rows(
+            &backend.stream,
+            &func,
+            rows,
+            BLOCK,
+            SHARED,
+            |mut builder| {
+                builder.arg(&mut d_out).arg(d_in).arg(&cols);
+                builder
+            },
+        )?;
+        return Ok(DeviceHandle::CudaBf16(CudaBf16Storage::new(d_out)));
+    }
     let d_in = backend.cuda_slice(x, "softmax_last_axis")?;
     if d_in.len() != expected {
         return Err(AutogradError::DataLengthMismatch {
@@ -4261,16 +4293,11 @@ fn cuda_softmax_like_device(
         });
     }
 
-    let rows = expected / last_dim;
-    let cols = i32::try_from(last_dim)
-        .map_err(|_| AutogradError::TapeInvariant("cuda softmax cols exceeds i32"))?;
     let mut d_out = backend
         .stream
         .alloc_zeros::<f32>(expected)
         .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
 
-    const BLOCK: u32 = 256;
-    const SHARED: u32 = BLOCK * std::mem::size_of::<f32>() as u32;
     launch_rows(
         &backend.stream,
         backend.kernels.function(kernel_name)?,
@@ -4380,7 +4407,45 @@ fn cuda_log_softmax_last_axis_backward(
         });
     }
     let expected = shape_size(shape);
-    let d_up = backend.cuda_slice(upstream, "log_softmax_last_axis_backward")?;
+    let rows = expected / last_dim;
+    let cols = i32::try_from(last_dim)
+        .map_err(|_| AutogradError::TapeInvariant("cuda log_softmax_backward cols exceeds i32"))?;
+    // Lane follows the saved forward output's dtype; the other operand is
+    // harmonized so the adjoint reads the values forward produced.
+    if let DeviceHandle::CudaBf16(storage) = log_softmax_output {
+        let d_out = backend.cuda_bf16_storage_slice(storage)?;
+        let d_up_op = backend.bf16_operand(upstream, "log_softmax_last_axis_backward")?;
+        let d_up = d_up_op.get();
+        if d_up.len() != expected || d_out.len() != expected {
+            return Err(AutogradError::DataLengthMismatch {
+                len: d_up.len().min(d_out.len()),
+                shape: shape.to_vec(),
+                size: expected,
+            });
+        }
+        let mut d_grad = backend.stream.alloc_zeros::<u16>(expected).map_err(|_| {
+            AutogradError::TapeInvariant("cuda alloc_zeros failed (log_softmax_bwd)")
+        })?;
+        const BLOCK: u32 = 256;
+        const SHARED: u32 = BLOCK * std::mem::size_of::<f32>() as u32;
+        let func = backend
+            .kernels
+            .function_for("log_softmax_last_axis_backward_f32", TapeDtype::Bf16)?;
+        launch_rows(
+            &backend.stream,
+            &func,
+            rows,
+            BLOCK,
+            SHARED,
+            |mut builder| {
+                builder.arg(&mut d_grad).arg(d_up).arg(d_out).arg(&cols);
+                builder
+            },
+        )?;
+        return Ok(DeviceHandle::CudaBf16(CudaBf16Storage::new(d_grad)));
+    }
+    let d_up_op = backend.f32_operand(upstream, "log_softmax_last_axis_backward")?;
+    let d_up = d_up_op.get();
     let d_out = backend.cuda_slice(log_softmax_output, "log_softmax_last_axis_backward")?;
     if d_up.len() != expected {
         return Err(AutogradError::DataLengthMismatch {
@@ -4397,9 +4462,6 @@ fn cuda_log_softmax_last_axis_backward(
         });
     }
 
-    let rows = expected / last_dim;
-    let cols = i32::try_from(last_dim)
-        .map_err(|_| AutogradError::TapeInvariant("cuda log_softmax_backward cols exceeds i32"))?;
     let mut d_grad = backend.stream.alloc_zeros::<f32>(expected).map_err(|e| {
         eprintln!("[autograd] alloc_zeros {expected} x f32 failed (log_softmax_bwd): {e}");
         AutogradError::TapeInvariant("cuda alloc_zeros failed (log_softmax_bwd)")
@@ -4442,7 +4504,44 @@ fn cuda_softmax_last_axis_backward(
         });
     }
     let expected = shape_size(shape);
-    let d_up = backend.cuda_slice(upstream, "softmax_last_axis_backward")?;
+    let rows = expected / last_dim;
+    let cols = i32::try_from(last_dim)
+        .map_err(|_| AutogradError::TapeInvariant("cuda softmax_backward cols exceeds i32"))?;
+    if let DeviceHandle::CudaBf16(storage) = softmax_output {
+        let d_out = backend.cuda_bf16_storage_slice(storage)?;
+        let d_up_op = backend.bf16_operand(upstream, "softmax_last_axis_backward")?;
+        let d_up = d_up_op.get();
+        if d_up.len() != expected || d_out.len() != expected {
+            return Err(AutogradError::DataLengthMismatch {
+                len: d_up.len().min(d_out.len()),
+                shape: shape.to_vec(),
+                size: expected,
+            });
+        }
+        let mut d_grad = backend
+            .stream
+            .alloc_zeros::<u16>(expected)
+            .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (softmax_bwd)"))?;
+        const BLOCK: u32 = 256;
+        const SHARED: u32 = BLOCK * std::mem::size_of::<f32>() as u32;
+        let func = backend
+            .kernels
+            .function_for("softmax_last_axis_backward_f32", TapeDtype::Bf16)?;
+        launch_rows(
+            &backend.stream,
+            &func,
+            rows,
+            BLOCK,
+            SHARED,
+            |mut builder| {
+                builder.arg(&mut d_grad).arg(d_up).arg(d_out).arg(&cols);
+                builder
+            },
+        )?;
+        return Ok(DeviceHandle::CudaBf16(CudaBf16Storage::new(d_grad)));
+    }
+    let d_up_op = backend.f32_operand(upstream, "softmax_last_axis_backward")?;
+    let d_up = d_up_op.get();
     let d_out = backend.cuda_slice(softmax_output, "softmax_last_axis_backward")?;
     if d_up.len() != expected {
         return Err(AutogradError::DataLengthMismatch {
@@ -4459,9 +4558,6 @@ fn cuda_softmax_last_axis_backward(
         });
     }
 
-    let rows = expected / last_dim;
-    let cols = i32::try_from(last_dim)
-        .map_err(|_| AutogradError::TapeInvariant("cuda softmax_backward cols exceeds i32"))?;
     let mut d_grad = backend
         .stream
         .alloc_zeros::<f32>(expected)
@@ -7987,15 +8083,6 @@ fn cuda_rms_norm_device(
         });
     }
     let expected = shape_size(shape);
-    let d_x_op = backend.f32_operand(x, "rms_norm")?;
-    let d_x = d_x_op.get();
-    if d_x.len() != expected {
-        return Err(AutogradError::DataLengthMismatch {
-            len: d_x.len(),
-            shape: shape.to_vec(),
-            size: expected,
-        });
-    }
     if weight.len() != last_dim {
         return Err(AutogradError::ShapeMismatch {
             expected: vec![last_dim],
@@ -8009,13 +8096,56 @@ fn cuda_rms_norm_device(
         .stream
         .clone_htod(weight)
         .map_err(|_| AutogradError::TapeInvariant("cuda htod copy failed"))?;
+
+    const BLOCK: u32 = 256;
+    const SHARED: u32 = BLOCK * std::mem::size_of::<f32>() as u32;
+    if let DeviceHandle::CudaBf16(storage) = x {
+        let d_x = backend.cuda_bf16_storage_slice(storage)?;
+        if d_x.len() != expected {
+            return Err(AutogradError::DataLengthMismatch {
+                len: d_x.len(),
+                shape: shape.to_vec(),
+                size: expected,
+            });
+        }
+        let mut d_out = backend
+            .stream
+            .alloc_zeros::<u16>(expected)
+            .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
+        let func = backend
+            .kernels
+            .function_for("rms_norm_f32", TapeDtype::Bf16)?;
+        launch_rows(
+            &backend.stream,
+            &func,
+            rows,
+            BLOCK,
+            SHARED,
+            |mut builder| {
+                builder
+                    .arg(&mut d_out)
+                    .arg(d_x)
+                    .arg(&d_w)
+                    .arg(&cols)
+                    .arg(&eps);
+                builder
+            },
+        )?;
+        return Ok(DeviceHandle::CudaBf16(CudaBf16Storage::new(d_out)));
+    }
+    let d_x = backend.cuda_slice(x, "rms_norm")?;
+    if d_x.len() != expected {
+        return Err(AutogradError::DataLengthMismatch {
+            len: d_x.len(),
+            shape: shape.to_vec(),
+            size: expected,
+        });
+    }
     let mut d_out = backend
         .stream
         .alloc_zeros::<f32>(expected)
         .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
 
-    const BLOCK: u32 = 256;
-    const SHARED: u32 = BLOCK * std::mem::size_of::<f32>() as u32;
     launch_rows(
         &backend.stream,
         backend.kernels.function("rms_norm_f32")?,
@@ -8113,10 +8243,6 @@ fn cuda_embedding_device(
         .stream
         .clone_htod(ids)
         .map_err(|_| AutogradError::TapeInvariant("cuda htod copy failed (embedding ids)"))?;
-    let mut d_out = backend
-        .stream
-        .alloc_zeros::<f32>(out_len)
-        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (embedding)"))?;
 
     let n_i32 = i32::try_from(n_ids)
         .map_err(|_| AutogradError::TapeInvariant("cuda embedding n_ids exceeds i32"))?;
@@ -8126,7 +8252,9 @@ fn cuda_embedding_device(
         .map_err(|_| AutogradError::TapeInvariant("cuda embedding dim exceeds i32"))?;
 
     const BLOCK: u32 = 256;
-    match table {
+    // The table stays a parameter (f32 or bf16 weights); only the gathered
+    // output activation follows the tape dtype.
+    let (kernel_name, d_w_f32, d_w_bf16) = match table {
         DeviceHandle::Cuda(storage) => {
             let d_w = backend.cuda_storage_slice(storage)?;
             if d_w.len() != vocab * dim {
@@ -8136,23 +8264,7 @@ fn cuda_embedding_device(
                     size: vocab * dim,
                 });
             }
-            launch_rows(
-                &backend.stream,
-                backend.kernels.function("embedding_f32")?,
-                n_ids,
-                BLOCK,
-                0,
-                |mut builder| {
-                    builder
-                        .arg(&mut d_out)
-                        .arg(d_w)
-                        .arg(&d_ids)
-                        .arg(&n_i32)
-                        .arg(&vocab_i32)
-                        .arg(&dim_i32);
-                    builder
-                },
-            )?;
+            ("embedding_f32", Some(d_w), None)
         }
         DeviceHandle::CudaBf16(storage) => {
             let d_w = backend.cuda_bf16_storage_slice(storage)?;
@@ -8163,23 +8275,7 @@ fn cuda_embedding_device(
                     size: vocab * dim,
                 });
             }
-            launch_rows(
-                &backend.stream,
-                backend.kernels.function("embedding_bf16_to_f32")?,
-                n_ids,
-                BLOCK,
-                0,
-                |mut builder| {
-                    builder
-                        .arg(&mut d_out)
-                        .arg(d_w)
-                        .arg(&d_ids)
-                        .arg(&n_i32)
-                        .arg(&vocab_i32)
-                        .arg(&dim_i32);
-                    builder
-                },
-            )?;
+            ("embedding_bf16_to_f32", None, Some(d_w))
         }
         DeviceHandle::CudaFp8BlockScaled(_) => {
             return Err(AutogradError::TapeInvariant(
@@ -8197,8 +8293,54 @@ fn cuda_embedding_device(
                 "cuda backend cannot embedding a metal device handle",
             ));
         }
+    };
+
+    if backend.tape_bf16() {
+        let mut d_out = backend
+            .stream
+            .alloc_zeros::<u16>(out_len)
+            .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (embedding)"))?;
+        let func = backend.kernels.function_for(kernel_name, TapeDtype::Bf16)?;
+        launch_rows(&backend.stream, &func, n_ids, BLOCK, 0, |mut builder| {
+            match (&d_w_f32, &d_w_bf16) {
+                (Some(d_w), _) => builder.arg(&mut d_out).arg(*d_w),
+                (_, Some(d_w)) => builder.arg(&mut d_out).arg(*d_w),
+                _ => unreachable!("embedding table matched above"),
+            };
+            builder
+                .arg(&d_ids)
+                .arg(&n_i32)
+                .arg(&vocab_i32)
+                .arg(&dim_i32);
+            builder
+        })?;
+        return Ok(DeviceHandle::CudaBf16(CudaBf16Storage::new(d_out)));
     }
 
+    let mut d_out = backend
+        .stream
+        .alloc_zeros::<f32>(out_len)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (embedding)"))?;
+    launch_rows(
+        &backend.stream,
+        backend.kernels.function(kernel_name)?,
+        n_ids,
+        BLOCK,
+        0,
+        |mut builder| {
+            match (&d_w_f32, &d_w_bf16) {
+                (Some(d_w), _) => builder.arg(&mut d_out).arg(*d_w),
+                (_, Some(d_w)) => builder.arg(&mut d_out).arg(*d_w),
+                _ => unreachable!("embedding table matched above"),
+            };
+            builder
+                .arg(&d_ids)
+                .arg(&n_i32)
+                .arg(&vocab_i32)
+                .arg(&dim_i32);
+            builder
+        },
+    )?;
     Ok(DeviceHandle::Cuda(CudaStorage::new(d_out)))
 }
 
@@ -8888,13 +9030,6 @@ fn cuda_rope_device(
     }
     let half_dim = head_dim / 2;
     let total = batch * heads * seq * head_dim;
-    let d_x = backend.cuda_slice(x, "rope")?;
-    if d_x.len() != total {
-        return Err(AutogradError::ShapeMismatch {
-            expected: vec![total],
-            got: vec![d_x.len()],
-        });
-    }
     // Partial rotary: see `cuda_rope_forward`.
     let rot_half = cos.len().checked_div(seq).unwrap_or(0);
     if cos.len() != sin.len() || rot_half == 0 || rot_half > half_dim || cos.len() != seq * rot_half
@@ -8913,10 +9048,6 @@ fn cuda_rope_device(
         .stream
         .clone_htod(sin)
         .map_err(|_| AutogradError::TapeInvariant("cuda htod copy failed (rope sin)"))?;
-    let mut d_out = backend
-        .stream
-        .alloc_zeros::<f32>(total)
-        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (rope)"))?;
 
     let batch_i = i32::try_from(batch)
         .map_err(|_| AutogradError::TapeInvariant("cuda rope batch exceeds i32"))?;
@@ -8932,6 +9063,45 @@ fn cuda_rope_device(
     let rows = batch * heads * seq;
     let block = std::cmp::min(half_dim, 256) as u32;
     let block = block.max(1);
+    if let DeviceHandle::CudaBf16(storage) = x {
+        let d_x = backend.cuda_bf16_storage_slice(storage)?;
+        if d_x.len() != total {
+            return Err(AutogradError::ShapeMismatch {
+                expected: vec![total],
+                got: vec![d_x.len()],
+            });
+        }
+        let mut d_out = backend
+            .stream
+            .alloc_zeros::<u16>(total)
+            .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (rope)"))?;
+        let func = backend.kernels.function_for("rope_f32", TapeDtype::Bf16)?;
+        launch_rows(&backend.stream, &func, rows, block, 0, |mut builder| {
+            builder
+                .arg(&mut d_out)
+                .arg(d_x)
+                .arg(&d_cos)
+                .arg(&d_sin)
+                .arg(&batch_i)
+                .arg(&heads_i)
+                .arg(&seq_i)
+                .arg(&head_dim_i)
+                .arg(&rot_half_i);
+            builder
+        })?;
+        return Ok(DeviceHandle::CudaBf16(CudaBf16Storage::new(d_out)));
+    }
+    let d_x = backend.cuda_slice(x, "rope")?;
+    if d_x.len() != total {
+        return Err(AutogradError::ShapeMismatch {
+            expected: vec![total],
+            got: vec![d_x.len()],
+        });
+    }
+    let mut d_out = backend
+        .stream
+        .alloc_zeros::<f32>(total)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (rope)"))?;
     launch_rows(
         &backend.stream,
         backend.kernels.function("rope_f32")?,
@@ -9414,10 +9584,15 @@ fn cuda_transpose_axes_swap_device(
         return Err(AutogradError::AxisOutOfBounds { axis: axis2, rank });
     }
     let total = shape_size(old_shape);
-    let d_x = backend.cuda_slice(x, "transpose_axes_swap")?;
-    if d_x.len() != total {
+    // Pure movement: the lane follows the input handle's dtype.
+    let x_bf16 = matches!(x, DeviceHandle::CudaBf16(_));
+    let x_len = match x {
+        DeviceHandle::CudaBf16(storage) => backend.cuda_bf16_storage_slice(storage)?.len(),
+        _ => backend.cuda_slice(x, "transpose_axes_swap")?.len(),
+    };
+    if x_len != total {
         return Err(AutogradError::DataLengthMismatch {
-            len: d_x.len(),
+            len: x_len,
             shape: old_shape.to_vec(),
             size: total,
         });
@@ -9438,6 +9613,47 @@ fn cuda_transpose_axes_swap_device(
         .stream
         .clone_htod(&new_shape_i32)
         .map_err(|_| AutogradError::TapeInvariant("cuda htod copy failed (transpose shape)"))?;
+    let rank_i = i32::try_from(rank)
+        .map_err(|_| AutogradError::TapeInvariant("cuda transpose rank exceeds i32"))?;
+    let axis1_i = i32::try_from(axis1)
+        .map_err(|_| AutogradError::TapeInvariant("cuda transpose axis exceeds i32"))?;
+    let axis2_i = i32::try_from(axis2)
+        .map_err(|_| AutogradError::TapeInvariant("cuda transpose axis exceeds i32"))?;
+    let total_i = i32::try_from(total)
+        .map_err(|_| AutogradError::TapeInvariant("cuda transpose total exceeds i32"))?;
+
+    if x_bf16 {
+        let d_x = backend.cuda_bf16_slice(x, "transpose_axes_swap")?;
+        let bytes = total.saturating_mul(std::mem::size_of::<u16>());
+        let mut d_out = backend.stream.alloc_zeros::<u16>(total).map_err(|_| {
+            AutogradError::CudaAllocFailed {
+                op: "transpose",
+                shape: new_shape.clone(),
+                bytes,
+            }
+        })?;
+        let func = backend
+            .kernels
+            .function_for("transpose_axes_swap_f32", TapeDtype::Bf16)?;
+        launch_1d(&backend.stream, &func, total, |mut builder| {
+            builder
+                .arg(&mut d_out)
+                .arg(d_x)
+                .arg(&d_old_shape)
+                .arg(&d_new_shape)
+                .arg(&rank_i)
+                .arg(&axis1_i)
+                .arg(&axis2_i)
+                .arg(&total_i);
+            builder
+        })?;
+        return Ok((
+            DeviceHandle::CudaBf16(CudaBf16Storage::new(d_out)),
+            new_shape,
+        ));
+    }
+
+    let d_x = backend.cuda_slice(x, "transpose_axes_swap")?;
     let bytes = total.saturating_mul(std::mem::size_of::<f32>());
     let mut d_out =
         backend
@@ -9448,15 +9664,6 @@ fn cuda_transpose_axes_swap_device(
                 shape: new_shape.clone(),
                 bytes,
             })?;
-    let rank_i = i32::try_from(rank)
-        .map_err(|_| AutogradError::TapeInvariant("cuda transpose rank exceeds i32"))?;
-    let axis1_i = i32::try_from(axis1)
-        .map_err(|_| AutogradError::TapeInvariant("cuda transpose axis exceeds i32"))?;
-    let axis2_i = i32::try_from(axis2)
-        .map_err(|_| AutogradError::TapeInvariant("cuda transpose axis exceeds i32"))?;
-    let total_i = i32::try_from(total)
-        .map_err(|_| AutogradError::TapeInvariant("cuda transpose total exceeds i32"))?;
-
     launch_1d(
         &backend.stream,
         backend.kernels.function("transpose_axes_swap_f32")?,
@@ -9519,10 +9726,14 @@ fn cuda_slice_device(
     }
 
     let old_total = shape_size(old_shape);
-    let d_x = backend.cuda_slice(x, "slice")?;
-    if d_x.len() != old_total {
+    let x_bf16 = matches!(x, DeviceHandle::CudaBf16(_));
+    let x_len = match x {
+        DeviceHandle::CudaBf16(storage) => backend.cuda_bf16_storage_slice(storage)?.len(),
+        _ => backend.cuda_slice(x, "slice")?.len(),
+    };
+    if x_len != old_total {
         return Err(AutogradError::DataLengthMismatch {
-            len: d_x.len(),
+            len: x_len,
             shape: old_shape.to_vec(),
             size: old_total,
         });
@@ -9549,14 +9760,36 @@ fn cuda_slice_device(
         .stream
         .clone_htod(&new_shape_i32)
         .map_err(|_| AutogradError::TapeInvariant("cuda htod copy failed (slice shape)"))?;
-    let mut d_out = backend
-        .stream
-        .alloc_zeros::<f32>(total)
-        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (slice)"))?;
     let rank_i = i32::try_from(rank)
         .map_err(|_| AutogradError::TapeInvariant("cuda slice rank exceeds i32"))?;
     let total_u64 = total as u64;
 
+    if x_bf16 {
+        let d_x = backend.cuda_bf16_slice(x, "slice")?;
+        let mut d_out = backend
+            .stream
+            .alloc_zeros::<u16>(total)
+            .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (slice)"))?;
+        let func = backend.kernels.function_for("slice_f32", TapeDtype::Bf16)?;
+        launch_1d(&backend.stream, &func, total, |mut builder| {
+            builder
+                .arg(&mut d_out)
+                .arg(d_x)
+                .arg(&d_old_shape)
+                .arg(&d_starts)
+                .arg(&d_new_shape)
+                .arg(&rank_i)
+                .arg(&total_u64);
+            builder
+        })?;
+        return Ok(DeviceHandle::CudaBf16(CudaBf16Storage::new(d_out)));
+    }
+
+    let d_x = backend.cuda_slice(x, "slice")?;
+    let mut d_out = backend
+        .stream
+        .alloc_zeros::<f32>(total)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (slice)"))?;
     launch_1d(
         &backend.stream,
         backend.kernels.function("slice_f32")?,
@@ -9604,8 +9837,63 @@ fn cuda_concat_axis2_device(
     }
     let a_total = shape_size(a_shape);
     let b_total = shape_size(b_shape);
-    let d_a = backend.cuda_slice(a, "concat_axis2")?;
-    let d_b = backend.cuda_slice(b, "concat_axis2")?;
+    let out_shape = vec![a_shape[0], a_shape[1], a_shape[2] + b_shape[2], a_shape[3]];
+    let total = shape_size(&out_shape);
+    let batch_i = i32::try_from(a_shape[0])
+        .map_err(|_| AutogradError::TapeInvariant("cuda concat_axis2 batch exceeds i32"))?;
+    let heads_i = i32::try_from(a_shape[1])
+        .map_err(|_| AutogradError::TapeInvariant("cuda concat_axis2 heads exceeds i32"))?;
+    let a_seq_i = i32::try_from(a_shape[2])
+        .map_err(|_| AutogradError::TapeInvariant("cuda concat_axis2 a_seq exceeds i32"))?;
+    let b_seq_i = i32::try_from(b_shape[2])
+        .map_err(|_| AutogradError::TapeInvariant("cuda concat_axis2 b_seq exceeds i32"))?;
+    let dim_i = i32::try_from(a_shape[3])
+        .map_err(|_| AutogradError::TapeInvariant("cuda concat_axis2 dim exceeds i32"))?;
+    let total_i = i32::try_from(total)
+        .map_err(|_| AutogradError::TapeInvariant("cuda concat_axis2 total exceeds i32"))?;
+
+    // bf16 lane only when both inputs already are bf16; a mixed pair widens
+    // the bf16 side exactly instead of quantizing inside a movement op.
+    if matches!(a, DeviceHandle::CudaBf16(_)) && matches!(b, DeviceHandle::CudaBf16(_)) {
+        let d_a = backend.cuda_bf16_slice(a, "concat_axis2")?;
+        let d_b = backend.cuda_bf16_slice(b, "concat_axis2")?;
+        if d_a.len() != a_total || d_b.len() != b_total {
+            return Err(AutogradError::DataLengthMismatch {
+                len: d_a.len().min(d_b.len()),
+                shape: a_shape.to_vec(),
+                size: a_total,
+            });
+        }
+        let mut d_out = backend
+            .stream
+            .alloc_zeros::<u16>(total)
+            .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (concat_axis2)"))?;
+        let func = backend
+            .kernels
+            .function_for("concat_axis2_f32", TapeDtype::Bf16)?;
+        launch_1d(&backend.stream, &func, total, |mut builder| {
+            builder
+                .arg(&mut d_out)
+                .arg(d_a)
+                .arg(d_b)
+                .arg(&batch_i)
+                .arg(&heads_i)
+                .arg(&a_seq_i)
+                .arg(&b_seq_i)
+                .arg(&dim_i)
+                .arg(&total_i);
+            builder
+        })?;
+        return Ok((
+            DeviceHandle::CudaBf16(CudaBf16Storage::new(d_out)),
+            out_shape,
+        ));
+    }
+
+    let d_a_op = backend.f32_operand(a, "concat_axis2")?;
+    let d_b_op = backend.f32_operand(b, "concat_axis2")?;
+    let d_a = d_a_op.get();
+    let d_b = d_b_op.get();
     if d_a.len() != a_total {
         return Err(AutogradError::DataLengthMismatch {
             len: d_a.len(),
@@ -9620,26 +9908,10 @@ fn cuda_concat_axis2_device(
             size: b_total,
         });
     }
-
-    let out_shape = vec![a_shape[0], a_shape[1], a_shape[2] + b_shape[2], a_shape[3]];
-    let total = shape_size(&out_shape);
     let mut d_out = backend
         .stream
         .alloc_zeros::<f32>(total)
         .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (concat_axis2)"))?;
-    let batch_i = i32::try_from(a_shape[0])
-        .map_err(|_| AutogradError::TapeInvariant("cuda concat_axis2 batch exceeds i32"))?;
-    let heads_i = i32::try_from(a_shape[1])
-        .map_err(|_| AutogradError::TapeInvariant("cuda concat_axis2 heads exceeds i32"))?;
-    let a_seq_i = i32::try_from(a_shape[2])
-        .map_err(|_| AutogradError::TapeInvariant("cuda concat_axis2 a_seq exceeds i32"))?;
-    let b_seq_i = i32::try_from(b_shape[2])
-        .map_err(|_| AutogradError::TapeInvariant("cuda concat_axis2 b_seq exceeds i32"))?;
-    let dim_i = i32::try_from(a_shape[3])
-        .map_err(|_| AutogradError::TapeInvariant("cuda concat_axis2 dim exceeds i32"))?;
-    let total_i = i32::try_from(total)
-        .map_err(|_| AutogradError::TapeInvariant("cuda concat_axis2 total exceeds i32"))?;
-
     launch_1d(
         &backend.stream,
         backend.kernels.function("concat_axis2_f32")?,
@@ -9697,8 +9969,11 @@ fn cuda_kv_cache_write_axis2(
     }
     let dst_total = shape_size(dst_shape);
     let src_total = shape_size(src_shape);
+    // Cache lane stays f32: the sdpa consumers are untemplated, so a bf16
+    // src is widened exactly at this boundary.
     let d_dst = backend.cuda_slice(dst, "kv_cache_write_axis2")?;
-    let d_src = backend.cuda_slice(src, "kv_cache_write_axis2")?;
+    let d_src_op = backend.f32_operand(src, "kv_cache_write_axis2")?;
+    let d_src = d_src_op.get();
     if d_dst.len() != dst_total {
         return Err(AutogradError::DataLengthMismatch {
             len: d_dst.len(),
@@ -10255,11 +10530,19 @@ fn cuda_slice_backward_device(
     ends: &[usize],
 ) -> Result<DeviceHandle> {
     validate_slice_shape(input_shape, starts, ends)?;
-    let d_grad = backend
-        .stream
-        .alloc_zeros::<f32>(shape_size(input_shape))
-        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (slice_bwd)"))?;
-    let dest = DeviceHandle::Cuda(CudaStorage::new(d_grad));
+    let dest = if matches!(upstream, DeviceHandle::CudaBf16(_)) {
+        let d_grad = backend
+            .stream
+            .alloc_zeros::<u16>(shape_size(input_shape))
+            .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (slice_bwd)"))?;
+        DeviceHandle::CudaBf16(CudaBf16Storage::new(d_grad))
+    } else {
+        let d_grad = backend
+            .stream
+            .alloc_zeros::<f32>(shape_size(input_shape))
+            .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (slice_bwd)"))?;
+        DeviceHandle::Cuda(CudaStorage::new(d_grad))
+    };
     cuda_write_slice_device(backend, &dest, upstream, input_shape, starts, ends)
 }
 
@@ -10275,16 +10558,6 @@ fn cuda_write_slice_device(
     let upstream_shape = validate_slice_shape(input_shape, starts, ends)?;
     let upstream_size = shape_size(&upstream_shape);
     let input_size = shape_size(input_shape);
-    let d_dest = backend.cuda_slice(dest, "write_slice_device")?;
-    let d_up = backend.cuda_slice(upstream, "slice_backward_device")?;
-    if d_dest.len() != input_size || d_up.len() != upstream_size {
-        return Err(AutogradError::DataLengthMismatch {
-            len: d_dest.len().min(d_up.len()),
-            shape: input_shape.to_vec(),
-            size: input_size,
-        });
-    }
-
     let rank = input_shape.len();
     let input_shape_i32: Vec<i32> = input_shape.iter().map(|&d| d as i32).collect();
     let starts_i32: Vec<i32> = starts.iter().map(|&d| d as i32).collect();
@@ -10304,8 +10577,48 @@ fn cuda_write_slice_device(
     let rank_i = i32::try_from(rank)
         .map_err(|_| AutogradError::TapeInvariant("cuda slice_bwd rank exceeds i32"))?;
     let upstream_size_u64 = upstream_size as u64;
-    let (dest_ptr, _dest_guard) = d_dest.device_ptr(&backend.stream);
 
+    // Lane follows the destination's dtype; the upstream is harmonized to it.
+    if let DeviceHandle::CudaBf16(storage) = dest {
+        let d_dest = backend.cuda_bf16_storage_slice(storage)?;
+        let d_up_op = backend.bf16_operand(upstream, "slice_backward_device")?;
+        let d_up = d_up_op.get();
+        if d_dest.len() != input_size || d_up.len() != upstream_size {
+            return Err(AutogradError::DataLengthMismatch {
+                len: d_dest.len().min(d_up.len()),
+                shape: input_shape.to_vec(),
+                size: input_size,
+            });
+        }
+        let (dest_ptr, _dest_guard) = d_dest.device_ptr(&backend.stream);
+        let func = backend
+            .kernels
+            .function_for("slice_backward_f32", TapeDtype::Bf16)?;
+        launch_1d(&backend.stream, &func, upstream_size, |mut builder| {
+            builder
+                .arg(&dest_ptr)
+                .arg(d_up)
+                .arg(&d_input_shape)
+                .arg(&d_starts)
+                .arg(&d_upstream_shape)
+                .arg(&rank_i)
+                .arg(&upstream_size_u64);
+            builder
+        })?;
+        return Ok(dest.clone());
+    }
+
+    let d_dest = backend.cuda_slice(dest, "write_slice_device")?;
+    let d_up_op = backend.f32_operand(upstream, "slice_backward_device")?;
+    let d_up = d_up_op.get();
+    if d_dest.len() != input_size || d_up.len() != upstream_size {
+        return Err(AutogradError::DataLengthMismatch {
+            len: d_dest.len().min(d_up.len()),
+            shape: input_shape.to_vec(),
+            size: input_size,
+        });
+    }
+    let (dest_ptr, _dest_guard) = d_dest.device_ptr(&backend.stream);
     launch_1d(
         &backend.stream,
         backend.kernels.function("slice_backward_f32")?,
@@ -10515,10 +10828,18 @@ fn cuda_embedding_backward_device(
 ) -> Result<DeviceHandle> {
     let n_ids = indices.len();
     let expected_upstream = n_ids * hidden_dim;
-    let d_up = backend.cuda_slice(upstream, "embedding_backward_device")?;
-    if d_up.len() != expected_upstream {
+    // grad_table is always f32 (param-grad boundary); only the upstream
+    // activation grad may arrive bf16.
+    let up_bf16 = matches!(upstream, DeviceHandle::CudaBf16(_));
+    let up_len = match upstream {
+        DeviceHandle::CudaBf16(storage) => backend.cuda_bf16_storage_slice(storage)?.len(),
+        _ => backend
+            .cuda_slice(upstream, "embedding_backward_device")?
+            .len(),
+    };
+    if up_len != expected_upstream {
         return Err(AutogradError::DataLengthMismatch {
-            len: d_up.len(),
+            len: up_len,
             shape: vec![n_ids, hidden_dim],
             size: expected_upstream,
         });
@@ -10552,6 +10873,24 @@ fn cuda_embedding_backward_device(
     // n_ids = B*S = 1024 on the canonical bench shape, this dispatches
     // 4 blocks × 256 threads — atomicAdd traffic dominates, so block-size
     // selection beyond "warp-aligned" is in the noise.
+    if up_bf16 {
+        let d_up = backend.cuda_bf16_slice(upstream, "embedding_backward_device")?;
+        let func = backend
+            .kernels
+            .function_for("embedding_backward_f32", TapeDtype::Bf16)?;
+        launch_1d(&backend.stream, &func, n_ids, |mut builder| {
+            builder
+                .arg(&mut d_grad)
+                .arg(d_up)
+                .arg(&d_ids)
+                .arg(&n_ids_i32)
+                .arg(&hidden_i32)
+                .arg(&vocab_i32);
+            builder
+        })?;
+        return Ok(DeviceHandle::Cuda(CudaStorage::new(d_grad)));
+    }
+    let d_up = backend.cuda_slice(upstream, "embedding_backward_device")?;
     launch_1d(
         &backend.stream,
         backend.kernels.function("embedding_backward_f32")?,
@@ -10982,6 +11321,111 @@ fn cuda_rms_norm_backward_device(
     let total = shape_size(shape);
     let rows = total / hidden;
 
+    // Lane follows the saved x's dtype so the adjoint reads what forward saw;
+    // grad_w stays f32 (param-grad boundary) in both lanes.
+    if let DeviceHandle::CudaBf16(storage) = x {
+        let d_x = backend.cuda_bf16_storage_slice(storage)?;
+        let d_up_op = backend.bf16_operand(upstream, "rms_norm_backward_device")?;
+        let d_up = d_up_op.get();
+        let d_w = backend.cuda_slice(weight, "rms_norm_backward_device")?;
+        if d_up.len() != total || d_x.len() != total || d_w.len() != hidden {
+            return Err(AutogradError::ShapeMismatch {
+                expected: shape.to_vec(),
+                got: vec![d_up.len()],
+            });
+        }
+        let mut d_inv = backend
+            .stream
+            .alloc_zeros::<f32>(rows.max(1))
+            .map_err(|_| {
+                AutogradError::TapeInvariant("cuda alloc_zeros failed (rms_norm_backward inv_rms)")
+            })?;
+        let cols_i = i32::try_from(hidden)
+            .map_err(|_| AutogradError::TapeInvariant("cuda rms_norm_backward cols exceeds i32"))?;
+        const BLOCK: u32 = 256;
+        const SHARED: u32 = BLOCK * std::mem::size_of::<f32>() as u32;
+        if rows > 0 {
+            let func = backend
+                .kernels
+                .function_for("rms_norm_inv_rms_f32", TapeDtype::Bf16)?;
+            launch_rows(
+                &backend.stream,
+                &func,
+                rows,
+                BLOCK,
+                SHARED,
+                |mut builder| {
+                    builder.arg(&mut d_inv).arg(d_x).arg(&cols_i).arg(&eps);
+                    builder
+                },
+            )?;
+        }
+        let grad_x = if need_grad_x {
+            let mut d_grad = backend.stream.alloc_zeros::<u16>(total).map_err(|_| {
+                AutogradError::TapeInvariant("cuda alloc_zeros failed (rms_norm_backward grad_x)")
+            })?;
+            if rows > 0 {
+                let func = backend
+                    .kernels
+                    .function_for("rms_norm_backward_x_f32", TapeDtype::Bf16)?;
+                launch_rows(
+                    &backend.stream,
+                    &func,
+                    rows,
+                    BLOCK,
+                    SHARED,
+                    |mut builder| {
+                        builder
+                            .arg(&mut d_grad)
+                            .arg(d_up)
+                            .arg(d_x)
+                            .arg(d_w)
+                            .arg(&d_inv)
+                            .arg(&cols_i);
+                        builder
+                    },
+                )?;
+            }
+            Some(DeviceHandle::CudaBf16(CudaBf16Storage::new(d_grad)))
+        } else {
+            None
+        };
+        let grad_w = if need_grad_w {
+            let mut d_grad = backend.stream.alloc_zeros::<f32>(hidden).map_err(|_| {
+                AutogradError::TapeInvariant("cuda alloc_zeros failed (rms_norm_backward grad_w)")
+            })?;
+            if rows > 0 && hidden > 0 {
+                let rows_i = i32::try_from(rows).map_err(|_| {
+                    AutogradError::TapeInvariant("cuda rms_norm_backward rows exceeds i32")
+                })?;
+                let func = backend
+                    .kernels
+                    .function_for("rms_norm_backward_w_f32", TapeDtype::Bf16)?;
+                launch_rows(
+                    &backend.stream,
+                    &func,
+                    hidden,
+                    BLOCK,
+                    SHARED,
+                    |mut builder| {
+                        builder
+                            .arg(&mut d_grad)
+                            .arg(d_up)
+                            .arg(d_x)
+                            .arg(&d_inv)
+                            .arg(&rows_i)
+                            .arg(&cols_i);
+                        builder
+                    },
+                )?;
+            }
+            Some(DeviceHandle::Cuda(CudaStorage::new(d_grad)))
+        } else {
+            None
+        };
+        return Ok((grad_x, grad_w));
+    }
+
     let d_up_op = backend.f32_operand(upstream, "rms_norm_backward_device")?;
     let d_x_op = backend.f32_operand(x, "rms_norm_backward_device")?;
     let d_up = d_up_op.get();
@@ -11123,13 +11567,6 @@ fn cuda_rope_backward_device(
     }
     let half_dim = head_dim / 2;
     let total = batch * heads * seq * head_dim;
-    let d_up = backend.cuda_slice(upstream, "rope_backward_device")?;
-    if d_up.len() != total {
-        return Err(AutogradError::ShapeMismatch {
-            expected: vec![total],
-            got: vec![d_up.len()],
-        });
-    }
     // Partial rotary: see `cuda_rope_forward`.
     let rot_half = cos.len().checked_div(seq).unwrap_or(0);
     if cos.len() != sin.len() || rot_half == 0 || rot_half > half_dim || cos.len() != seq * rot_half
@@ -11148,10 +11585,6 @@ fn cuda_rope_backward_device(
         .stream
         .clone_htod(sin)
         .map_err(|_| AutogradError::TapeInvariant("cuda htod copy failed (rope_backward sin)"))?;
-    let mut d_grad = backend
-        .stream
-        .alloc_zeros::<f32>(total)
-        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (rope_backward)"))?;
 
     let batch_i = i32::try_from(batch)
         .map_err(|_| AutogradError::TapeInvariant("cuda rope_backward batch exceeds i32"))?;
@@ -11167,6 +11600,47 @@ fn cuda_rope_backward_device(
     let rows = batch * heads * seq;
     let block = std::cmp::min(half_dim, 256) as u32;
     let block = block.max(1);
+    if let DeviceHandle::CudaBf16(storage) = upstream {
+        let d_up = backend.cuda_bf16_storage_slice(storage)?;
+        if d_up.len() != total {
+            return Err(AutogradError::ShapeMismatch {
+                expected: vec![total],
+                got: vec![d_up.len()],
+            });
+        }
+        let mut d_grad = backend
+            .stream
+            .alloc_zeros::<u16>(total)
+            .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (rope_backward)"))?;
+        let func = backend
+            .kernels
+            .function_for("rope_backward_f32", TapeDtype::Bf16)?;
+        launch_rows(&backend.stream, &func, rows, block, 0, |mut builder| {
+            builder
+                .arg(&mut d_grad)
+                .arg(d_up)
+                .arg(&d_cos)
+                .arg(&d_sin)
+                .arg(&batch_i)
+                .arg(&heads_i)
+                .arg(&seq_i)
+                .arg(&head_dim_i)
+                .arg(&rot_half_i);
+            builder
+        })?;
+        return Ok(DeviceHandle::CudaBf16(CudaBf16Storage::new(d_grad)));
+    }
+    let d_up = backend.cuda_slice(upstream, "rope_backward_device")?;
+    if d_up.len() != total {
+        return Err(AutogradError::ShapeMismatch {
+            expected: vec![total],
+            got: vec![d_up.len()],
+        });
+    }
+    let mut d_grad = backend
+        .stream
+        .alloc_zeros::<f32>(total)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed (rope_backward)"))?;
     launch_rows(
         &backend.stream,
         backend.kernels.function("rope_backward_f32")?,

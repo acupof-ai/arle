@@ -11,8 +11,8 @@
 // backward kernel.
 
 extern "C" __global__ void rope_backward_f32(
-    float* __restrict__ grad_x,
-    const float* __restrict__ upstream,
+    T* __restrict__ grad_x,
+    const T* __restrict__ upstream,
     const float* __restrict__ cos_table,
     const float* __restrict__ sin_table,
     int batch,
@@ -31,13 +31,13 @@ extern "C" __global__ void rope_backward_f32(
     const int cache_base = token * rot_half;
 
     for (int i = threadIdx.x; i < rot_half; i += blockDim.x) {
-        const float gy0 = upstream[row_base + i];
-        const float gy1 = upstream[row_base + i + rot_half];
+        const float gy0 = static_cast<float>(upstream[row_base + i]);
+        const float gy1 = static_cast<float>(upstream[row_base + i + rot_half]);
         const float c = cos_table[cache_base + i];
         const float s = sin_table[cache_base + i];
         // Inline `sin -> -sin` versus the forward kernel.
-        grad_x[row_base + i] = gy0 * c + gy1 * s;
-        grad_x[row_base + i + rot_half] = gy1 * c - gy0 * s;
+        grad_x[row_base + i] = static_cast<T>(gy0 * c + gy1 * s);
+        grad_x[row_base + i + rot_half] = static_cast<T>(gy1 * c - gy0 * s);
     }
     for (int i = 2 * rot_half + threadIdx.x; i < head_dim; i += blockDim.x) {
         grad_x[row_base + i] = upstream[row_base + i];
