@@ -67,12 +67,13 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub fn split_halves_cuda(
+    pub fn split2_cuda(
         fused: *const Half,
         first: *mut Half,
         second: *mut Half,
         batch_size: i32,
-        half_dim: i32,
+        first_dim: i32,
+        second_dim: i32,
         stream: CUstream,
     ) -> CUresult;
 

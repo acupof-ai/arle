@@ -29,18 +29,23 @@ __global__ void split_qkv_kernel(
     }
 }
 
-// Split a row-fused [B, 2*half] buffer into two [B, half] halves.
-__global__ void split_halves_kernel(
-    const __nv_bfloat16* __restrict__ fused,  // [B, 2*half]
-    __nv_bfloat16* __restrict__ first,        // [B, half]
-    __nv_bfloat16* __restrict__ second,       // [B, half]
-    int half_dim
+// Split a row-fused [B, first_dim + second_dim] buffer into two parts.
+__global__ void split2_kernel(
+    const __nv_bfloat16* __restrict__ fused,  // [B, first_dim + second_dim]
+    __nv_bfloat16* __restrict__ first,        // [B, first_dim]
+    __nv_bfloat16* __restrict__ second,       // [B, second_dim]
+    int first_dim, int second_dim
 ) {
     int col = blockIdx.x * blockDim.x + threadIdx.x;
     int row = blockIdx.y;
-    if (col >= half_dim) return;
-    first[row * half_dim + col] = fused[row * 2 * half_dim + col];
-    second[row * half_dim + col] = fused[row * 2 * half_dim + half_dim + col];
+    int fused_dim = first_dim + second_dim;
+    if (col >= fused_dim) return;
+    __nv_bfloat16 val = fused[row * fused_dim + col];
+    if (col < first_dim) {
+        first[row * first_dim + col] = val;
+    } else {
+        second[row * second_dim + (col - first_dim)] = val;
+    }
 }
 
 // Fused silu_mul from merged gate+up buffer.
@@ -82,15 +87,15 @@ cudaError_t split_qkv_cuda(
     return cudaGetLastError();
 }
 
-cudaError_t split_halves_cuda(
+cudaError_t split2_cuda(
     const __nv_bfloat16* fused,
     __nv_bfloat16* first, __nv_bfloat16* second,
-    int batch_size, int half_dim,
+    int batch_size, int first_dim, int second_dim,
     cudaStream_t stream
 ) {
     int threads = 256;
-    dim3 grid((half_dim + threads - 1) / threads, batch_size);
-    split_halves_kernel<<<grid, threads, 0, stream>>>(fused, first, second, half_dim);
+    dim3 grid((first_dim + second_dim + threads - 1) / threads, batch_size);
+    split2_kernel<<<grid, threads, 0, stream>>>(fused, first, second, first_dim, second_dim);
     return cudaGetLastError();
 }
 

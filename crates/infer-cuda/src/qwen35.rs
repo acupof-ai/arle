@@ -59,7 +59,7 @@ use crate::moe::{
 use crate::moe_config::ExpertSplit;
 use crate::ops::{
     add_batch, argmax_into, argmax_row_into, copy_row_to_vec, embedding_batch, gemm_batch, gemv,
-    silu_mul_fused, split_halves, upload_i32, warm_fp8_deepgemm_dense,
+    silu_mul_fused, split_qkv, split2, upload_i32, warm_fp8_deepgemm_dense,
 };
 use crate::workspace::{HiddenSlot, SliceSlot, VecSlot};
 
@@ -1983,6 +1983,8 @@ pub(crate) struct Qwen35Workspace {
 
 #[derive(Default)]
 pub(crate) struct FullAttnScratch {
+    /// Fused `[q; k; v]` GEMM output, split into `q_full`/`k_batch`/`v_batch`.
+    qkv_fused: HiddenSlot,
     q_full: HiddenSlot,
     k_batch: HiddenSlot,
     v_batch: HiddenSlot,
@@ -2027,6 +2029,8 @@ pub(crate) struct Qwen35RecallForward<'a> {
 pub(crate) struct LinearAttnScratch {
     /// Staging for the batched spec-capture copies.
     capture_copy: Qwen35CopyScratch,
+    /// Fused `[qkv; z]` GEMM output, split into `qkv`/`z`.
+    qkvz: HiddenSlot,
     qkv: HiddenSlot,
     z: HiddenSlot,
     /// Fused `[b; a]` GEMM output (`[2*Vh, S]`), split into `b_proj`/`a_proj`.
@@ -2423,12 +2427,12 @@ pub(crate) enum Qwen35Attn {
     Linear(Box<LinearAttn>),
 }
 
-/// Gated full attention (q_proj carries the per-head sigmoid gate → rows =
-/// `heads*head_dim*2`).
+/// Gated full attention (the q rows carry the per-head sigmoid gate → q part
+/// rows = `heads*head_dim*2`).
 pub(crate) struct FullAttn {
-    q_proj: DeviceMatrix,
-    k_proj: DeviceMatrix,
-    v_proj: DeviceMatrix,
+    /// Row-fused `[q; k; v]` (`[q_gated + 2*kv, hidden]`): one GEMM per step,
+    /// split into the q/k/v buffers downstream.
+    qkv_proj: DeviceMatrix,
     o_proj: DeviceMatrix,
     q_norm: DeviceVec,
     k_norm: DeviceVec,
@@ -2436,8 +2440,9 @@ pub(crate) struct FullAttn {
 
 /// Gated-delta-rule linear attention.
 pub(crate) struct LinearAttn {
-    in_proj_qkv: DeviceMatrix,
-    in_proj_z: DeviceMatrix,
+    /// Row-fused `[qkv; z]` (`[qkv_dim + z_dim, hidden]`): one GEMM per step,
+    /// split into the conv-input qkv and the z gate downstream.
+    in_proj_qkvz: DeviceMatrix,
     /// Row-fused `[b; a]` (`[2*Vh, hidden]`): one GEMM per step, split into
     /// the per-head b/a scalars downstream. b = rows `0..Vh`, a = `Vh..2*Vh`.
     in_proj_ba: DeviceMatrix,
@@ -2595,9 +2600,7 @@ struct OffloadedDenseMlp {
 
 /// Host snapshot of a full-attention block (mirrors [`FullAttn`]).
 struct OffloadedFullAttn {
-    q_proj: HostMatrixSnapshot,
-    k_proj: HostMatrixSnapshot,
-    v_proj: HostMatrixSnapshot,
+    qkv_proj: HostMatrixSnapshot,
     o_proj: HostMatrixSnapshot,
     q_norm: Vec<bf16>,
     k_norm: Vec<bf16>,
@@ -2605,8 +2608,7 @@ struct OffloadedFullAttn {
 
 /// Host snapshot of a gated-delta linear-attention block (mirrors [`LinearAttn`]).
 struct OffloadedLinearAttn {
-    in_proj_qkv: HostMatrixSnapshot,
-    in_proj_z: HostMatrixSnapshot,
+    in_proj_qkvz: HostMatrixSnapshot,
     in_proj_ba: HostMatrixSnapshot,
     conv1d_weight: Vec<bf16>,
     dt_bias: Vec<bf16>,
@@ -2833,14 +2835,11 @@ impl Qwen35Model {
         for layer in &self.layers {
             match &layer.attn {
                 Qwen35Attn::Full(full) => {
-                    warm(&full.q_proj)?;
-                    warm(&full.k_proj)?;
-                    warm(&full.v_proj)?;
+                    warm(&full.qkv_proj)?;
                     warm(&full.o_proj)?;
                 }
                 Qwen35Attn::Linear(linear) => {
-                    warm(&linear.in_proj_qkv)?;
-                    warm(&linear.in_proj_z)?;
+                    warm(&linear.in_proj_qkvz)?;
                     warm(&linear.in_proj_ba)?;
                     warm(&linear.out_proj)?;
                 }
@@ -3265,9 +3264,14 @@ impl Qwen35Model {
                 // Single GPU: full tensors, byte-identical to the pre-TP path.
                 Qwen35AttentionTensorNames::Full(full) if tp_cfg.is_single() => {
                     Qwen35Attn::Full(Box::new(FullAttn {
-                        q_proj: loader.load_matrix_quant_aware(&ctx, &full.q_proj)?,
-                        k_proj: loader.load_matrix_quant_aware(&ctx, &full.k_proj)?,
-                        v_proj: loader.load_matrix_quant_aware(&ctx, &full.v_proj)?,
+                        qkv_proj: loader.load_matrices_row_fused(
+                            &ctx,
+                            &[
+                                (full.q_proj.as_str(), None),
+                                (full.k_proj.as_str(), None),
+                                (full.v_proj.as_str(), None),
+                            ],
+                        )?,
                         o_proj: loader.load_matrix_quant_aware(&ctx, &full.o_proj)?,
                         q_norm: loader.load_vec(&ctx, &full.q_norm)?,
                         k_norm: loader.load_vec(&ctx, &full.k_norm)?,
@@ -3282,27 +3286,30 @@ impl Qwen35Model {
                     // Q partitions by rank; K/V load the replica-aware KV block
                     // (== rank in the shard regime; shared within a replica group
                     // when kv_heads < world_size, giving identical K/V weights).
-                    q_proj: loader.load_qkv_head_sharded_quant_aware(
-                        &ctx,
-                        &full.q_proj,
-                        local_q_heads,
-                        m.head_dim * 2,
-                        tp_cfg.rank,
-                    )?,
-                    k_proj: loader.load_qkv_head_sharded_quant_aware(
-                        &ctx,
-                        &full.k_proj,
-                        local_kv_heads,
-                        m.head_dim,
-                        kv_block,
-                    )?,
-                    v_proj: loader.load_qkv_head_sharded_quant_aware(
-                        &ctx,
-                        &full.v_proj,
-                        local_kv_heads,
-                        m.head_dim,
-                        kv_block,
-                    )?,
+                    qkv_proj: {
+                        let head_spec = |name: &str, local_rows: usize, block: usize| {
+                            let total = loader.logical_rows(name)?;
+                            Ok::<_, anyhow::Error>(infer_topo::ShardingSpec {
+                                offset: block * local_rows,
+                                size: local_rows,
+                                total,
+                            })
+                        };
+                        let q_spec =
+                            head_spec(&full.q_proj, local_q_heads * m.head_dim * 2, tp_cfg.rank)?;
+                        let k_spec =
+                            head_spec(&full.k_proj, local_kv_heads * m.head_dim, kv_block)?;
+                        let v_spec =
+                            head_spec(&full.v_proj, local_kv_heads * m.head_dim, kv_block)?;
+                        loader.load_matrices_row_fused(
+                            &ctx,
+                            &[
+                                (full.q_proj.as_str(), Some(q_spec)),
+                                (full.k_proj.as_str(), Some(k_spec)),
+                                (full.v_proj.as_str(), Some(v_spec)),
+                            ],
+                        )?
+                    },
                     // Row-parallel: each rank holds the o_proj input columns of
                     // its own heads; the forward all-reduces the partial sums.
                     o_proj: loader.load_matrix_sharded_quant_aware(
@@ -3318,8 +3325,11 @@ impl Qwen35Model {
                 })),
                 Qwen35AttentionTensorNames::Linear(lin) if tp_cfg.is_single() => {
                     Qwen35Attn::Linear(Box::new(LinearAttn {
-                        in_proj_qkv: loader.load_matrix_quant_aware(&ctx, &lin.in_proj_qkv)?,
-                        in_proj_z: loader.load_matrix_quant_aware(&ctx, &lin.in_proj_z)?,
+                        in_proj_qkvz: loader.load_matrix_pair_fused(
+                            &ctx,
+                            &lin.in_proj_qkv,
+                            &lin.in_proj_z,
+                        )?,
                         in_proj_ba: loader.load_matrix_pair_fused(
                             &ctx,
                             &lin.in_proj_b,
@@ -3337,22 +3347,26 @@ impl Qwen35Model {
                         // Fused [q | k | v] blocks: shard EACH block on whole-head
                         // boundaries and re-stack this rank's three slices (a flat
                         // column shard would cut across the block boundaries).
-                        in_proj_qkv: load_linear_qkv_sharded(
-                            &loader,
-                            &ctx,
-                            &lin.in_proj_qkv,
-                            &m,
-                            &tp_cfg,
-                        )?,
-                        // z gate is v-head-major `[Vh*Vd]` (rms_norm_gated reads
-                        // the gate at `head*Vd + d`).
-                        in_proj_z: loader.load_qkv_head_sharded_quant_aware(
-                            &ctx,
-                            &lin.in_proj_z,
-                            local_linear_v_heads,
-                            m.linear_value_head_dim,
-                            tp_cfg.rank,
-                        )?,
+                        in_proj_qkvz: {
+                            let qkv = load_linear_qkv_sharded(
+                                &loader,
+                                &ctx,
+                                &lin.in_proj_qkv,
+                                &m,
+                                &tp_cfg,
+                            )?;
+                            // z gate is v-head-major `[Vh*Vd]` (rms_norm_gated
+                            // reads the gate at `head*Vd + d`).
+                            let z = loader.load_qkv_head_sharded_quant_aware(
+                                &ctx,
+                                &lin.in_proj_z,
+                                local_linear_v_heads,
+                                m.linear_value_head_dim,
+                                tp_cfg.rank,
+                            )?;
+                            DeviceMatrix::fuse_rows(&ctx, &qkv, &z)
+                                .map_err(|e| anyhow!("fuse TP in_proj_qkv + in_proj_z: {e}"))?
+                        },
                         // b/a are ONE SCALAR PER V HEAD (gated_delta_rule.cu reads
                         // `b_proj[token*Vh + v_head]`) → per-head row count 1;
                         // the local head shards row-fuse into one `[2*Vh, H]`.
@@ -3638,38 +3652,27 @@ impl Qwen35Model {
 
             let attn = match &mut layer.attn {
                 Qwen35Attn::Full(full) => {
-                    let q_proj = full.q_proj.offload_to_host(&ctx)?;
-                    let k_proj = full.k_proj.offload_to_host(&ctx)?;
-                    let v_proj = full.v_proj.offload_to_host(&ctx)?;
+                    let qkv_proj = full.qkv_proj.offload_to_host(&ctx)?;
                     let o_proj = full.o_proj.offload_to_host(&ctx)?;
                     let (q_norm, qn) = full.q_norm.offload_to_host(&ctx)?;
                     let (k_norm, kn) = full.k_norm.offload_to_host(&ctx)?;
-                    freed += q_proj.freed_bytes()
-                        + k_proj.freed_bytes()
-                        + v_proj.freed_bytes()
-                        + o_proj.freed_bytes()
-                        + qn
-                        + kn;
+                    freed += qkv_proj.freed_bytes() + o_proj.freed_bytes() + qn + kn;
                     OffloadedAttn::Full(Box::new(OffloadedFullAttn {
-                        q_proj,
-                        k_proj,
-                        v_proj,
+                        qkv_proj,
                         o_proj,
                         q_norm,
                         k_norm,
                     }))
                 }
                 Qwen35Attn::Linear(lin) => {
-                    let in_proj_qkv = lin.in_proj_qkv.offload_to_host(&ctx)?;
-                    let in_proj_z = lin.in_proj_z.offload_to_host(&ctx)?;
+                    let in_proj_qkvz = lin.in_proj_qkvz.offload_to_host(&ctx)?;
                     let in_proj_ba = lin.in_proj_ba.offload_to_host(&ctx)?;
                     let (conv1d_weight, conv_n) = lin.conv1d_weight.offload_to_host(&ctx)?;
                     let (dt_bias, dt_n) = lin.dt_bias.offload_to_host(&ctx)?;
                     let (a_log, al) = offload_raw_slice(&ctx, &mut lin.a_log)?;
                     let (norm_weight, nw) = offload_raw_slice(&ctx, &mut lin.norm_weight)?;
                     let out_proj = lin.out_proj.offload_to_host(&ctx)?;
-                    freed += in_proj_qkv.freed_bytes()
-                        + in_proj_z.freed_bytes()
+                    freed += in_proj_qkvz.freed_bytes()
                         + in_proj_ba.freed_bytes()
                         + out_proj.freed_bytes()
                         + conv_n
@@ -3677,8 +3680,7 @@ impl Qwen35Model {
                         + al
                         + nw;
                     OffloadedAttn::Linear(Box::new(OffloadedLinearAttn {
-                        in_proj_qkv,
-                        in_proj_z,
+                        in_proj_qkvz,
                         in_proj_ba,
                         conv1d_weight,
                         dt_bias,
@@ -3776,24 +3778,19 @@ impl Qwen35Model {
             match (&mut layer.attn, attn) {
                 (Qwen35Attn::Full(full), OffloadedAttn::Full(snap)) => {
                     let OffloadedFullAttn {
-                        q_proj,
-                        k_proj,
-                        v_proj,
+                        qkv_proj,
                         o_proj,
                         q_norm,
                         k_norm,
                     } = *snap;
-                    full.q_proj.reload_from_host(&ctx, &q_proj)?;
-                    full.k_proj.reload_from_host(&ctx, &k_proj)?;
-                    full.v_proj.reload_from_host(&ctx, &v_proj)?;
+                    full.qkv_proj.reload_from_host(&ctx, &qkv_proj)?;
                     full.o_proj.reload_from_host(&ctx, &o_proj)?;
                     full.q_norm.reload_from_host(&ctx, &q_norm)?;
                     full.k_norm.reload_from_host(&ctx, &k_norm)?;
                 }
                 (Qwen35Attn::Linear(lin), OffloadedAttn::Linear(snap)) => {
                     let OffloadedLinearAttn {
-                        in_proj_qkv,
-                        in_proj_z,
+                        in_proj_qkvz,
                         in_proj_ba,
                         conv1d_weight,
                         dt_bias,
@@ -3801,8 +3798,7 @@ impl Qwen35Model {
                         norm_weight,
                         out_proj,
                     } = *snap;
-                    lin.in_proj_qkv.reload_from_host(&ctx, &in_proj_qkv)?;
-                    lin.in_proj_z.reload_from_host(&ctx, &in_proj_z)?;
+                    lin.in_proj_qkvz.reload_from_host(&ctx, &in_proj_qkvz)?;
                     lin.in_proj_ba.reload_from_host(&ctx, &in_proj_ba)?;
                     lin.conv1d_weight.reload_from_host(&ctx, &conv1d_weight)?;
                     lin.dt_bias.reload_from_host(&ctx, &dt_bias)?;
@@ -5048,22 +5044,8 @@ impl Qwen35Model {
                     &mut out,
                     ctx,
                     layer_idx,
-                    "self_attn.q_proj".to_string(),
-                    &full.q_proj,
-                );
-                push(
-                    &mut out,
-                    ctx,
-                    layer_idx,
-                    "self_attn.k_proj".to_string(),
-                    &full.k_proj,
-                );
-                push(
-                    &mut out,
-                    ctx,
-                    layer_idx,
-                    "self_attn.v_proj".to_string(),
-                    &full.v_proj,
+                    "self_attn.qkv_proj".to_string(),
+                    &full.qkv_proj,
                 );
                 push(
                     &mut out,
@@ -5083,15 +5065,8 @@ impl Qwen35Model {
                     &mut out,
                     ctx,
                     layer_idx,
-                    "linear_attn.in_proj_qkv".to_string(),
-                    &lin.in_proj_qkv,
-                );
-                push(
-                    &mut out,
-                    ctx,
-                    layer_idx,
-                    "linear_attn.in_proj_z".to_string(),
-                    &lin.in_proj_z,
+                    "linear_attn.in_proj_qkvz".to_string(),
+                    &lin.in_proj_qkvz,
                 );
                 push(
                     &mut out,
@@ -5408,6 +5383,10 @@ impl Qwen35Model {
         let projection = match projection {
             StudentLoraProjection::MlpUp => StudentLoraProjection::MlpGate,
             StudentLoraProjection::LinearA => StudentLoraProjection::LinearB,
+            StudentLoraProjection::FullK | StudentLoraProjection::FullV => {
+                StudentLoraProjection::FullQ
+            }
+            StudentLoraProjection::LinearZ => StudentLoraProjection::LinearQkv,
             other => other,
         };
         LoraBaseKey {
@@ -5416,20 +5395,36 @@ impl Qwen35Model {
         }
     }
 
-    /// Row offset of a projection inside its (possibly row-fused) resident
-    /// matrix: MlpUp starts at `inter_dim` inside `gate_up_proj`, LinearA at
-    /// `Vh` inside `in_proj_ba`; everything else starts at row 0.
-    fn lora_row_offset(&self, layer_idx: usize, projection: StudentLoraProjection) -> usize {
+    /// `(row_offset, rows)` of a projection inside its (possibly row-fused)
+    /// resident matrix: e.g. MlpUp occupies `[inter_dim, inter_dim)` of
+    /// `gate_up_proj`, FullK the `[q_gated, kv)` window of `qkv_proj`. A
+    /// projection that owns its whole matrix spans `[0, matrix_rows)`.
+    fn lora_row_window(
+        &self,
+        layer_idx: usize,
+        projection: StudentLoraProjection,
+        matrix_rows: usize,
+    ) -> (usize, usize) {
         let layer = &self.layers[layer_idx];
-        match projection {
-            StudentLoraProjection::MlpUp => {
-                layer.mlp.as_ref().map(DenseMlp::inter_dim).unwrap_or(0)
-            }
-            StudentLoraProjection::LinearA => match &layer.attn {
-                Qwen35Attn::Linear(lin) => lin.in_proj_ba.rows / 2,
-                _ => 0,
-            },
+        let inter = || layer.mlp.as_ref().map(DenseMlp::inter_dim).unwrap_or(0);
+        let vh = || match &layer.attn {
+            Qwen35Attn::Linear(lin) => lin.in_proj_ba.rows / 2,
             _ => 0,
+        };
+        let q_gated = self.local_full_attn_q_proj_dim();
+        let kv = self.local_kv_heads * self.config.head_dim;
+        let qkv = self.local_linear_qkv_dim();
+        match projection {
+            StudentLoraProjection::MlpGate => (0, inter()),
+            StudentLoraProjection::MlpUp => (inter(), inter()),
+            StudentLoraProjection::LinearB => (0, vh()),
+            StudentLoraProjection::LinearA => (vh(), vh()),
+            StudentLoraProjection::FullQ => (0, q_gated),
+            StudentLoraProjection::FullK => (q_gated, kv),
+            StudentLoraProjection::FullV => (q_gated + kv, kv),
+            StudentLoraProjection::LinearQkv => (0, qkv),
+            StudentLoraProjection::LinearZ => (qkv, self.local_linear_z_dim()),
+            _ => (0, matrix_rows),
         }
     }
 
@@ -5505,7 +5500,7 @@ impl Qwen35Model {
         // targets share one base under the canonical cache key.
         let cache_key = Self::lora_base_cache_key(layer_idx, projection);
         self.ensure_lora_base_dev_cached(layer_idx, projection, &cache_key)?;
-        let row_offset = self.lora_row_offset(layer_idx, projection);
+        let (row_offset, _) = self.lora_row_window(layer_idx, projection, rows);
 
         // Tiny host→device uploads. `a_t` is A transposed to [cols, rank]
         // row-major (== W[c,k]=A[k,c] for `lora_device_gemm`); `b` uploads as-is
@@ -5632,7 +5627,6 @@ impl Qwen35Model {
     ) -> Result<()> {
         let label = projection.label();
         let ctx = self.ctx.clone();
-        let row_offset = self.lora_row_offset(layer_idx, projection);
         let base_dev = self
             .lora_base_dev
             .get(key)
@@ -5641,16 +5635,11 @@ impl Qwen35Model {
             })?
             .data
             .clone();
-        let matrix = self.lora_matrix_mut(layer_idx, projection)?;
+        let matrix_rows = self.lora_matrix(layer_idx, projection)?.rows;
         // The base always spans the full (possibly fused) matrix; the window is
         // the whole buffer whenever this projection is the sole occupant.
-        let rows = match projection {
-            StudentLoraProjection::MlpGate
-            | StudentLoraProjection::MlpUp
-            | StudentLoraProjection::LinearB
-            | StudentLoraProjection::LinearA => matrix.rows / 2,
-            _ => matrix.rows,
-        };
+        let (row_offset, rows) = self.lora_row_window(layer_idx, projection, matrix_rows);
+        let matrix = self.lora_matrix_mut(layer_idx, projection)?;
         let window = row_offset * matrix.cols..(row_offset + rows) * matrix.cols;
         let src = base_dev.slice(window.clone());
         let mut dst = matrix.data.slice_mut(window);
@@ -5689,9 +5678,11 @@ impl Qwen35Model {
                     ));
                 };
                 Ok(match projection {
-                    StudentLoraProjection::FullQ => &full.q_proj,
-                    StudentLoraProjection::FullK => &full.k_proj,
-                    StudentLoraProjection::FullV => &full.v_proj,
+                    // q/k/v live in the row-fused `qkv_proj`; callers address
+                    // their window via `lora_row_window`.
+                    StudentLoraProjection::FullQ
+                    | StudentLoraProjection::FullK
+                    | StudentLoraProjection::FullV => &full.qkv_proj,
                     StudentLoraProjection::FullO => &full.o_proj,
                     _ => unreachable!("full projection arm checked above"),
                 })
@@ -5708,8 +5699,9 @@ impl Qwen35Model {
                     ));
                 };
                 Ok(match projection {
-                    StudentLoraProjection::LinearQkv => &lin.in_proj_qkv,
-                    StudentLoraProjection::LinearZ => &lin.in_proj_z,
+                    StudentLoraProjection::LinearQkv | StudentLoraProjection::LinearZ => {
+                        &lin.in_proj_qkvz
+                    }
                     StudentLoraProjection::LinearB | StudentLoraProjection::LinearA => {
                         &lin.in_proj_ba
                     }
@@ -5802,9 +5794,9 @@ impl Qwen35Model {
                     ));
                 };
                 Ok(match projection {
-                    StudentLoraProjection::FullQ => &mut full.q_proj,
-                    StudentLoraProjection::FullK => &mut full.k_proj,
-                    StudentLoraProjection::FullV => &mut full.v_proj,
+                    StudentLoraProjection::FullQ
+                    | StudentLoraProjection::FullK
+                    | StudentLoraProjection::FullV => &mut full.qkv_proj,
                     StudentLoraProjection::FullO => &mut full.o_proj,
                     _ => unreachable!("full projection arm checked above"),
                 })
@@ -5821,8 +5813,9 @@ impl Qwen35Model {
                     ));
                 };
                 Ok(match projection {
-                    StudentLoraProjection::LinearQkv => &mut lin.in_proj_qkv,
-                    StudentLoraProjection::LinearZ => &mut lin.in_proj_z,
+                    StudentLoraProjection::LinearQkv | StudentLoraProjection::LinearZ => {
+                        &mut lin.in_proj_qkvz
+                    }
                     StudentLoraProjection::LinearB | StudentLoraProjection::LinearA => {
                         &mut lin.in_proj_ba
                     }
@@ -5987,6 +5980,7 @@ impl Qwen35Model {
         let q_proj_dim = self.local_full_attn_q_proj_dim();
 
         let FullAttnScratch {
+            qkv_fused,
             q_full,
             k_batch,
             v_batch,
@@ -6000,6 +5994,7 @@ impl Qwen35Model {
             batch_partial_m: _,
             batch_partial_l: _,
         } = fw;
+        let qkv_fused = qkv_fused.get(&self.ctx, q_proj_dim + 2 * kv_dim, seq_len)?;
         let q_full = q_full.get(&self.ctx, q_proj_dim, seq_len)?;
         let k_batch = k_batch.get(&self.ctx, kv_dim, seq_len)?;
         let v_batch = v_batch.get(&self.ctx, kv_dim, seq_len)?;
@@ -6009,9 +6004,8 @@ impl Qwen35Model {
             Some(full_idx),
             seq_len,
             || {
-                gemm_batch(&self.ctx, &attn.q_proj, normed, q_full)?;
-                gemm_batch(&self.ctx, &attn.k_proj, normed, k_batch)?;
-                gemm_batch(&self.ctx, &attn.v_proj, normed, v_batch)?;
+                gemm_batch(&self.ctx, &attn.qkv_proj, normed, qkv_fused)?;
+                split_qkv(&self.ctx, qkv_fused, q_full, k_batch, v_batch)?;
                 Ok(())
             },
         )?;
@@ -6299,6 +6293,7 @@ impl Qwen35Model {
         let stride_page = pool.kv_dim * pool.page_size;
 
         let FullAttnScratch {
+            qkv_fused,
             q_full,
             k_batch,
             v_batch,
@@ -6310,6 +6305,7 @@ impl Qwen35Model {
             fa3_semaphore,
             ..
         } = fw;
+        let qkv_fused = qkv_fused.get(&self.ctx, q_proj_dim + 2 * kv_dim, rows)?;
         let q_full = q_full.get(&self.ctx, q_proj_dim, rows)?;
         let k_batch = k_batch.get(&self.ctx, kv_dim, rows)?;
         let v_batch = v_batch.get(&self.ctx, kv_dim, rows)?;
@@ -6319,9 +6315,8 @@ impl Qwen35Model {
             Some(full_idx),
             rows,
             || {
-                gemm_batch(&self.ctx, &attn.q_proj, normed, q_full)?;
-                gemm_batch(&self.ctx, &attn.k_proj, normed, k_batch)?;
-                gemm_batch(&self.ctx, &attn.v_proj, normed, v_batch)?;
+                gemm_batch(&self.ctx, &attn.qkv_proj, normed, qkv_fused)?;
+                split_qkv(&self.ctx, qkv_fused, q_full, k_batch, v_batch)?;
                 Ok(())
             },
         )?;
@@ -6843,6 +6838,7 @@ impl Qwen35Model {
 
         let LinearAttnScratch {
             capture_copy,
+            qkvz,
             qkv,
             z,
             ba,
@@ -6859,6 +6855,7 @@ impl Qwen35Model {
             fq_g_cumsum,
             fq_beta,
         } = lw;
+        let qkvz = qkvz.get(&self.ctx, qkv_dim + z_dim, rows)?;
         let qkv = qkv.get(&self.ctx, qkv_dim, rows)?;
         let z = z.get(&self.ctx, z_dim, rows)?;
         let ba = ba.get(&self.ctx, b_dim + a_dim, rows)?;
@@ -6870,10 +6867,10 @@ impl Qwen35Model {
             Some(linear_idx),
             rows,
             || {
-                gemm_batch(&self.ctx, &attn.in_proj_qkv, normed, qkv)?;
-                gemm_batch(&self.ctx, &attn.in_proj_z, normed, z)?;
+                gemm_batch(&self.ctx, &attn.in_proj_qkvz, normed, qkvz)?;
+                split2(&self.ctx, qkvz, qkv, z)?;
                 gemm_batch(&self.ctx, &attn.in_proj_ba, normed, ba)?;
-                split_halves(&self.ctx, ba, b_proj, a_proj)?;
+                split2(&self.ctx, ba, b_proj, a_proj)?;
                 Ok(())
             },
         )?;
@@ -8282,6 +8279,7 @@ impl Qwen35Model {
         let sm_scale = 1.0f32 / (c.head_dim as f32).sqrt();
 
         let FullAttnScratch {
+            qkv_fused,
             q_full,
             k_batch,
             v_batch,
@@ -8295,12 +8293,12 @@ impl Qwen35Model {
             batch_partial_m,
             batch_partial_l,
         } = fw;
+        let qkv_fused = qkv_fused.get(&self.ctx, q_proj_dim + 2 * kv_dim, b)?;
         let q_full = q_full.get(&self.ctx, q_proj_dim, b)?;
         let k_batch = k_batch.get(&self.ctx, kv_dim, b)?;
         let v_batch = v_batch.get(&self.ctx, kv_dim, b)?;
-        gemm_batch(&self.ctx, &attn.q_proj, normed, q_full)?;
-        gemm_batch(&self.ctx, &attn.k_proj, normed, k_batch)?;
-        gemm_batch(&self.ctx, &attn.v_proj, normed, v_batch)?;
+        gemm_batch(&self.ctx, &attn.qkv_proj, normed, qkv_fused)?;
+        split_qkv(&self.ctx, qkv_fused, q_full, k_batch, v_batch)?;
 
         let attn_heads = attn_heads.get(&self.ctx, q_dim, b)?;
 
@@ -8653,9 +8651,14 @@ fn load_qwen35_mtp_head(
         unreachable!("MTP head layer is always full attention");
     };
     let attn = Qwen35Attn::Full(Box::new(FullAttn {
-        q_proj: loader.load_matrix_quant_aware(ctx, &full.q_proj)?,
-        k_proj: loader.load_matrix_quant_aware(ctx, &full.k_proj)?,
-        v_proj: loader.load_matrix_quant_aware(ctx, &full.v_proj)?,
+        qkv_proj: loader.load_matrices_row_fused(
+            ctx,
+            &[
+                (full.q_proj.as_str(), None),
+                (full.k_proj.as_str(), None),
+                (full.v_proj.as_str(), None),
+            ],
+        )?,
         o_proj: loader.load_matrix_quant_aware(ctx, &full.o_proj)?,
         q_norm: loader.load_vec(ctx, &full.q_norm)?,
         k_norm: loader.load_vec(ctx, &full.k_norm)?,
