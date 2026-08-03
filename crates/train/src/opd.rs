@@ -3087,12 +3087,14 @@ pub fn masked_writeback_step<O: Optimizer>(
     // yields the exact global mean.
     let shard = cp.shard(seq_len);
     // inv_n override under CP or DP (single-card keeps the fused op's local default,
-    // byte-identical). CP shares ONE trajectory so total_targets is already global.
-    // DP gives each rank a DIFFERENT trajectory, so the global count is the sum over
-    // the DP group. world==1 on both axes makes dp_group_sum_count identity.
+    // byte-identical). CP shares ONE trajectory so total_targets is already global;
+    // DP sums per-replica counts. The count reduce runs over the WORLD comm, so only
+    // cp rank 0 contributes — every cp rank carries the same replica-global count and
+    // would over-count by cp_size (G3: losses came back exactly /world).
     let inv_n_override = if dp.is_enabled() {
+        let contribution = if cp.rank == 0 { total_targets } else { 0 };
         let global =
-            crate::grad_clip::dp_group_sum_count(total_targets, store).map_err(OpdError::from)?;
+            crate::grad_clip::dp_group_sum_count(contribution, store).map_err(OpdError::from)?;
         crate::context_parallel::global_inv_n(global)
     } else if cp.is_enabled() {
         Some(1.0_f32 / total_targets as f32)
