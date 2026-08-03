@@ -98,7 +98,11 @@ old+new paths in the tree.
 No jargon wall, no hedging, no restating the question. If a sentence needs a
 glossary, rewrite it.
 
-**Approach-first for >3 files or architectural decisions** — outline and wait.
+**Approach-first for >3 files or architectural decisions** — outline, then
+execute. Wait for the user ONLY when there is a real tradeoff to adjudicate
+(two viable paths with different costs). No tradeoff → nothing to decide →
+don't ask. Adopting the SOTA/industry-standard approach is never a decision
+point — just execute it (2026-08-04).
 Never delete content outside the stated scope; inside it, prefer deletion-style
 refactors (collapse duplicates, converge on one flow) over layering adapters.
 
