@@ -57,6 +57,9 @@ use cudarc::driver::{
 };
 #[cfg(not(feature = "no-cuda"))]
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
+
+use crate::TapeDtype;
 
 /// Borrowed FP8 block-scaled tensor parts: (weight bytes, scales, rows, cols, block_m, block_k).
 #[cfg(not(feature = "no-cuda"))]
@@ -142,7 +145,40 @@ const LA_BWD_CHUNK_WAVE: usize = 8;
 /// cuBLAS-backed matmul plus NVRTC-compiled point kernels. Holds an
 /// `Arc<CudaStream>` + `CudaBlas` so the context lives as long as the backend;
 /// safe to share across threads.
+#[cfg(not(feature = "no-cuda"))]
+enum F32Operand<'a> {
+    Borrowed(&'a CudaSlice<f32>),
+    Imported(CudaSlice<f32>),
+}
+
+#[cfg(not(feature = "no-cuda"))]
+impl F32Operand<'_> {
+    fn get(&self) -> &CudaSlice<f32> {
+        match self {
+            Self::Borrowed(slice) => slice,
+            Self::Imported(slice) => slice,
+        }
+    }
+}
+
+#[cfg(not(feature = "no-cuda"))]
+enum Bf16Operand<'a> {
+    Borrowed(&'a CudaSlice<u16>),
+    Quantized(CudaSlice<u16>),
+}
+
+#[cfg(not(feature = "no-cuda"))]
+impl Bf16Operand<'_> {
+    fn get(&self) -> &CudaSlice<u16> {
+        match self {
+            Self::Borrowed(slice) => slice,
+            Self::Quantized(slice) => slice,
+        }
+    }
+}
+
 pub struct CudaBackend {
+    tape_dtype: AtomicU8,
     #[cfg(not(feature = "no-cuda"))]
     stream: Arc<CudaStream>,
     #[cfg(not(feature = "no-cuda"))]
@@ -194,6 +230,7 @@ impl CudaBackend {
                 .map_err(|_| AutogradError::TapeInvariant("CudaBlas::new failed"))?;
             let kernels = KernelCache::new(stream.context())?;
             Ok(Self {
+                tape_dtype: AtomicU8::new(TapeDtype::F32 as u8),
                 stream,
                 blas: Arc::new(blas),
                 kernels,
@@ -681,6 +718,69 @@ impl CudaBackend {
     }
 
     #[cfg(not(feature = "no-cuda"))]
+    fn tape_bf16(&self) -> bool {
+        self.tape_dtype.load(Ordering::Relaxed) == TapeDtype::Bf16 as u8
+    }
+
+    /// f32 view of a handle: borrows f32 storage, imports (exact widen) bf16.
+    #[cfg(not(feature = "no-cuda"))]
+    fn f32_operand<'a>(
+        &self,
+        handle: &'a DeviceHandle,
+        op: &'static str,
+    ) -> Result<F32Operand<'a>> {
+        match handle {
+            DeviceHandle::CudaBf16(storage) => {
+                let bits = self.cuda_bf16_storage_slice(storage)?;
+                Ok(F32Operand::Imported(
+                    self.import_local_bf16_as_f32(bits, bits.len())?,
+                ))
+            }
+            _ => Ok(F32Operand::Borrowed(self.cuda_slice(handle, op)?)),
+        }
+    }
+
+    /// Like `f32_operand`, but under bf16 tape dtype an f32 handle is
+    /// round-tripped through bf16 so backward reads the value forward saw.
+    #[cfg(not(feature = "no-cuda"))]
+    fn f32_operand_tape_quantized<'a>(
+        &self,
+        handle: &'a DeviceHandle,
+        op: &'static str,
+    ) -> Result<F32Operand<'a>> {
+        match handle {
+            DeviceHandle::Cuda(_) if self.tape_bf16() => {
+                let src = self.cuda_slice(handle, op)?;
+                let bits = self.local_f32_as_bf16(src, src.len())?;
+                Ok(F32Operand::Imported(
+                    self.import_local_bf16_as_f32(&bits, bits.len())?,
+                ))
+            }
+            _ => self.f32_operand(handle, op),
+        }
+    }
+
+    /// bf16 view of a handle: borrows bf16 storage, quantizes f32.
+    #[cfg(not(feature = "no-cuda"))]
+    fn bf16_operand<'a>(
+        &self,
+        handle: &'a DeviceHandle,
+        op: &'static str,
+    ) -> Result<Bf16Operand<'a>> {
+        match handle {
+            DeviceHandle::CudaBf16(storage) => Ok(Bf16Operand::Borrowed(
+                self.cuda_bf16_storage_slice(storage)?,
+            )),
+            _ => {
+                let src = self.cuda_slice(handle, op)?;
+                Ok(Bf16Operand::Quantized(
+                    self.local_f32_as_bf16(src, src.len())?,
+                ))
+            }
+        }
+    }
+
+    #[cfg(not(feature = "no-cuda"))]
     fn validate_cuda_handle_kind(&self, handle: &DeviceHandle) -> Result<()> {
         match handle {
             DeviceHandle::Cpu(_)
@@ -1070,6 +1170,18 @@ impl CudaBackend {
 impl Backend for CudaBackend {
     fn device(&self) -> Device {
         Device::Cuda
+    }
+
+    fn set_tape_dtype(&self, dtype: TapeDtype) {
+        self.tape_dtype.store(dtype as u8, Ordering::Relaxed);
+    }
+
+    fn tape_dtype(&self) -> TapeDtype {
+        if self.tape_dtype.load(Ordering::Relaxed) == TapeDtype::Bf16 as u8 {
+            TapeDtype::Bf16
+        } else {
+            TapeDtype::F32
+        }
     }
 
     fn device_synchronize(&self) -> Result<()> {
@@ -1738,7 +1850,8 @@ impl Backend for CudaBackend {
 
         #[cfg(not(feature = "no-cuda"))]
         {
-            let a = self.cuda_slice(a, "matmul")?;
+            let a_op = self.f32_operand(a, "matmul")?;
+            let a = a_op.get();
             let b = self.cuda_slice(b, "matmul")?;
             let (out, out_shape) = self.matmul_device(a, a_shape, b, b_shape)?;
             Ok((DeviceHandle::Cuda(CudaStorage::new(out)), out_shape))
@@ -1761,7 +1874,8 @@ impl Backend for CudaBackend {
         #[cfg(not(feature = "no-cuda"))]
         {
             let out_shape = matmul_bt_output_shape(a_shape, b_shape)?;
-            let d_a = self.cuda_slice(a, "matmul_bt")?;
+            let d_a_op = self.f32_operand(a, "matmul_bt")?;
+            let d_a = d_a_op.get();
             if let DeviceHandle::CudaBf16(storage) = b {
                 let d_b = self.cuda_bf16_storage_slice(storage)?;
                 if d_a.len() != shape_size(a_shape) || d_b.len() != shape_size(b_shape) {
@@ -1836,31 +1950,7 @@ impl Backend for CudaBackend {
 
         #[cfg(not(feature = "no-cuda"))]
         {
-            let a = self.cuda_slice(a, "add")?;
-            let b = self.cuda_slice(b, "add")?;
-            let size = shape_size(shape);
-            if a.len() != size || b.len() != size {
-                return Err(AutogradError::ShapeMismatch {
-                    expected: shape.to_vec(),
-                    got: vec![a.len().min(b.len())],
-                });
-            }
-
-            let mut out = self
-                .stream
-                .alloc_zeros::<f32>(size)
-                .map_err(|_| cuda_alloc_failed("add", shape.to_vec()))?;
-            let n = size as u64;
-            launch_1d(
-                &self.stream,
-                self.kernels.function("add_f32")?,
-                size,
-                |mut builder| {
-                    builder.arg(&mut out).arg(a).arg(b).arg(&n);
-                    builder
-                },
-            )?;
-            Ok(DeviceHandle::Cuda(CudaStorage::new(out)))
+            cuda_binary_1d_device(self, a, b, shape, "add_f32", "add")
         }
     }
 
@@ -1887,6 +1977,17 @@ impl Backend for CudaBackend {
         // it, so this composes into the existing device-resident chain.
         #[cfg(not(feature = "no-cuda"))]
         {
+            let imported;
+            let x = match x {
+                DeviceHandle::CudaBf16(storage) => {
+                    let bits = self.cuda_bf16_storage_slice(storage)?;
+                    imported = DeviceHandle::Cuda(CudaStorage::new(
+                        self.import_local_bf16_as_f32(bits, bits.len())?,
+                    ));
+                    &imported
+                }
+                _ => x,
+            };
             let slice = self.cuda_slice(x, "sum_all")?;
             let size = shape_size(shape);
             if slice.len() != size {
@@ -3311,11 +3412,14 @@ impl Backend for CudaBackend {
         }
         #[cfg(not(feature = "no-cuda"))]
         {
-            let d_x = self.cuda_slice(x, "reshape")?;
             let expected = shape_size(new_shape);
-            if d_x.len() != expected {
+            let len = match x {
+                DeviceHandle::CudaBf16(storage) => self.cuda_bf16_storage_slice(storage)?.len(),
+                _ => self.cuda_slice(x, "reshape")?.len(),
+            };
+            if len != expected {
                 return Err(AutogradError::DataLengthMismatch {
-                    len: d_x.len(),
+                    len,
                     shape: new_shape.to_vec(),
                     size: expected,
                 });
@@ -6733,9 +6837,11 @@ fn cuda_matmul_backward_device(
         return Ok((None, None));
     }
 
-    let d_a = backend.cuda_slice(a, "matmul_backward_device")?;
+    let d_a_op = backend.f32_operand(a, "matmul_backward_device")?;
+    let d_a = d_a_op.get();
     let d_b = backend.cuda_slice(b, "matmul_backward_device")?;
-    let d_g = backend.cuda_slice(grad_out, "matmul_backward_device")?;
+    let d_g_op = backend.f32_operand(grad_out, "matmul_backward_device")?;
+    let d_g = d_g_op.get();
 
     if d_a.len() != shape_size(a_shape)
         || d_b.len() != shape_size(b_shape)
@@ -6944,7 +7050,8 @@ fn cuda_matmul_bt_input_grad_device(
         });
     }
 
-    let d_g = backend.cuda_slice(grad_out, "matmul_bt_input_grad_device")?;
+    let d_g_op = backend.f32_operand(grad_out, "matmul_bt_input_grad_device")?;
+    let d_g = d_g_op.get();
     if d_g.len() != shape_size(grad_out_shape) {
         return Err(AutogradError::TapeInvariant(
             "cuda matmul_bt_input_grad_device grad handle size does not match shape",
@@ -7031,8 +7138,10 @@ fn cuda_matmul_bt_backward_device(
         return Ok((None, None));
     }
 
-    let d_a = backend.cuda_slice(a, "matmul_bt_backward_device")?;
-    let d_g = backend.cuda_slice(grad_out, "matmul_bt_backward_device")?;
+    let d_a_op = backend.f32_operand(a, "matmul_bt_backward_device")?;
+    let d_a = d_a_op.get();
+    let d_g_op = backend.f32_operand(grad_out, "matmul_bt_backward_device")?;
+    let d_g = d_g_op.get();
     if d_a.len() != shape_size(a_shape) || d_g.len() != shape_size(grad_out_shape) {
         return Err(AutogradError::TapeInvariant(
             "cuda matmul_bt_backward_device handle size does not match shape",
@@ -7419,9 +7528,37 @@ fn cuda_add_into_device(
     src: &DeviceHandle,
     shape: &[usize],
 ) -> Result<DeviceHandle> {
-    let d_dest = backend.cuda_slice(dest, "add_into_device")?;
-    let d_src = backend.cuda_slice(src, "add_into_device")?;
     let size = shape_size(shape);
+    // Dest dtype decides the lane: bf16 activation-grad chains stay bf16,
+    // f32 (param-grad) accumulators stay f32 with bf16 sources widened.
+    if let DeviceHandle::CudaBf16(storage) = dest {
+        let d_dest = backend.cuda_bf16_storage_slice(storage)?;
+        let d_src_op = backend.bf16_operand(src, "add_into_device")?;
+        let d_src = d_src_op.get();
+        if d_dest.len() != size || d_src.len() != size {
+            return Err(AutogradError::DataLengthMismatch {
+                len: d_dest.len().min(d_src.len()),
+                shape: shape.to_vec(),
+                size,
+            });
+        }
+        let mut d_out = backend
+            .stream
+            .alloc_zeros::<u16>(size)
+            .map_err(|e| cuda_alloc_failed_rich(backend, "add_into_device", size * 2, &e))?;
+        let n = size as u64;
+        let func = backend
+            .kernels
+            .function_for("add_into_f32", TapeDtype::Bf16)?;
+        launch_1d(&backend.stream, &func, size, |mut builder| {
+            builder.arg(&mut d_out).arg(d_dest).arg(d_src).arg(&n);
+            builder
+        })?;
+        return Ok(DeviceHandle::CudaBf16(CudaBf16Storage::new(d_out)));
+    }
+    let d_dest = backend.cuda_slice(dest, "add_into_device")?;
+    let d_src_op = backend.f32_operand(src, "add_into_device")?;
+    let d_src = d_src_op.get();
     if d_dest.len() != size || d_src.len() != size {
         return Err(AutogradError::DataLengthMismatch {
             len: d_dest.len().min(d_src.len()),
@@ -7454,9 +7591,32 @@ fn cuda_accumulate_into_device(
     src: &DeviceHandle,
     shape: &[usize],
 ) -> Result<DeviceHandle> {
-    let d_dest = backend.cuda_slice(dest, "accumulate_into_device")?;
-    let d_src = backend.cuda_slice(src, "accumulate_into_device")?;
     let size = shape_size(shape);
+    if let DeviceHandle::CudaBf16(storage) = dest {
+        let d_dest = backend.cuda_bf16_storage_slice(storage)?;
+        let d_src_op = backend.bf16_operand(src, "accumulate_into_device")?;
+        let d_src = d_src_op.get();
+        if d_dest.len() != size || d_src.len() != size {
+            return Err(AutogradError::DataLengthMismatch {
+                len: d_dest.len().min(d_src.len()),
+                shape: shape.to_vec(),
+                size,
+            });
+        }
+        let n = size as u64;
+        let func = backend
+            .kernels
+            .function_for("accumulate_into_f32", TapeDtype::Bf16)?;
+        let (dest_ptr, _dest_guard) = d_dest.device_ptr(&backend.stream);
+        launch_1d(&backend.stream, &func, size, |mut builder| {
+            builder.arg(&dest_ptr).arg(d_src).arg(&n);
+            builder
+        })?;
+        return Ok(dest.clone());
+    }
+    let d_dest = backend.cuda_slice(dest, "accumulate_into_device")?;
+    let d_src_op = backend.f32_operand(src, "accumulate_into_device")?;
+    let d_src = d_src_op.get();
     if d_dest.len() != size || d_src.len() != size {
         return Err(AutogradError::DataLengthMismatch {
             len: d_dest.len().min(d_src.len()),
@@ -7578,8 +7738,30 @@ fn cuda_unary_1d_device(
     kernel_name: &'static str,
     op_label: &'static str,
 ) -> Result<DeviceHandle> {
-    let d_in = backend.cuda_slice(x, op_label)?;
     let size = shape_size(shape);
+    if backend.tape_bf16() {
+        let d_in_op = backend.bf16_operand(x, op_label)?;
+        let d_in = d_in_op.get();
+        if d_in.len() != size {
+            return Err(AutogradError::DataLengthMismatch {
+                len: d_in.len(),
+                shape: shape.to_vec(),
+                size,
+            });
+        }
+        let mut d_out = backend
+            .stream
+            .alloc_zeros::<u16>(size)
+            .map_err(|e| cuda_alloc_failed_rich(backend, op_label, size * 2, &e))?;
+        let n = size as u64;
+        let func = backend.kernels.function_for(kernel_name, TapeDtype::Bf16)?;
+        launch_1d(&backend.stream, &func, size, |mut builder| {
+            builder.arg(&mut d_out).arg(d_in).arg(&n);
+            builder
+        })?;
+        return Ok(DeviceHandle::CudaBf16(CudaBf16Storage::new(d_out)));
+    }
+    let d_in = backend.cuda_slice(x, op_label)?;
     if d_in.len() != size {
         return Err(AutogradError::DataLengthMismatch {
             len: d_in.len(),
@@ -7613,8 +7795,30 @@ fn cuda_scalar_1d_device(
     kernel_name: &'static str,
     op_label: &'static str,
 ) -> Result<DeviceHandle> {
-    let d_in = backend.cuda_slice(x, op_label)?;
     let size = shape_size(shape);
+    if backend.tape_bf16() {
+        let d_in_op = backend.bf16_operand(x, op_label)?;
+        let d_in = d_in_op.get();
+        if d_in.len() != size {
+            return Err(AutogradError::DataLengthMismatch {
+                len: d_in.len(),
+                shape: shape.to_vec(),
+                size,
+            });
+        }
+        let mut d_out = backend
+            .stream
+            .alloc_zeros::<u16>(size)
+            .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
+        let n = size as u64;
+        let func = backend.kernels.function_for(kernel_name, TapeDtype::Bf16)?;
+        launch_1d(&backend.stream, &func, size, |mut builder| {
+            builder.arg(&mut d_out).arg(d_in).arg(&s).arg(&n);
+            builder
+        })?;
+        return Ok(DeviceHandle::CudaBf16(CudaBf16Storage::new(d_out)));
+    }
+    let d_in = backend.cuda_slice(x, op_label)?;
     if d_in.len() != size {
         return Err(AutogradError::DataLengthMismatch {
             len: d_in.len(),
@@ -7648,9 +7852,33 @@ fn cuda_binary_1d_device(
     kernel_name: &'static str,
     op_label: &'static str,
 ) -> Result<DeviceHandle> {
+    let size = shape_size(shape);
+    if backend.tape_bf16() {
+        let d_a_op = backend.bf16_operand(a, op_label)?;
+        let d_b_op = backend.bf16_operand(b, op_label)?;
+        let d_a = d_a_op.get();
+        let d_b = d_b_op.get();
+        if d_a.len() != size || d_b.len() != size {
+            return Err(AutogradError::DataLengthMismatch {
+                len: d_a.len().min(d_b.len()),
+                shape: shape.to_vec(),
+                size,
+            });
+        }
+        let mut d_out = backend
+            .stream
+            .alloc_zeros::<u16>(size)
+            .map_err(|e| cuda_alloc_failed_rich(backend, op_label, size * 2, &e))?;
+        let n = size as u64;
+        let func = backend.kernels.function_for(kernel_name, TapeDtype::Bf16)?;
+        launch_1d(&backend.stream, &func, size, |mut builder| {
+            builder.arg(&mut d_out).arg(d_a).arg(d_b).arg(&n);
+            builder
+        })?;
+        return Ok(DeviceHandle::CudaBf16(CudaBf16Storage::new(d_out)));
+    }
     let d_a = backend.cuda_slice(a, op_label)?;
     let d_b = backend.cuda_slice(b, op_label)?;
-    let size = shape_size(shape);
     if d_a.len() != size || d_b.len() != size {
         return Err(AutogradError::DataLengthMismatch {
             len: d_a.len().min(d_b.len()),
@@ -7759,7 +7987,8 @@ fn cuda_rms_norm_device(
         });
     }
     let expected = shape_size(shape);
-    let d_x = backend.cuda_slice(x, "rms_norm")?;
+    let d_x_op = backend.f32_operand(x, "rms_norm")?;
+    let d_x = d_x_op.get();
     if d_x.len() != expected {
         return Err(AutogradError::DataLengthMismatch {
             len: d_x.len(),
@@ -8965,22 +9194,6 @@ fn cuda_add_broadcast_device(
     validate_broadcast(a_shape, b_shape)?;
     let total = shape_size(a_shape);
     let b_size = shape_size(b_shape);
-    let d_a = backend.cuda_slice(a, "add_broadcast")?;
-    let d_b = backend.cuda_slice(b, "add_broadcast")?;
-    if d_a.len() != total {
-        return Err(AutogradError::DataLengthMismatch {
-            len: d_a.len(),
-            shape: a_shape.to_vec(),
-            size: total,
-        });
-    }
-    if d_b.len() != b_size {
-        return Err(AutogradError::DataLengthMismatch {
-            len: d_b.len(),
-            shape: b_shape.to_vec(),
-            size: b_size,
-        });
-    }
 
     let out_rank = a_shape.len();
     let rank_offset = out_rank - b_shape.len();
@@ -9005,15 +9218,65 @@ fn cuda_add_broadcast_device(
         .stream
         .clone_htod(&b_strides)
         .map_err(|_| AutogradError::TapeInvariant("cuda htod copy failed"))?;
-    let mut d_out = backend
-        .stream
-        .alloc_zeros::<f32>(total)
-        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
 
     let out_rank_i32 = i32::try_from(out_rank)
         .map_err(|_| AutogradError::TapeInvariant("cuda add_broadcast rank exceeds i32"))?;
     let total_i32 = i32::try_from(total)
         .map_err(|_| AutogradError::TapeInvariant("cuda add_broadcast total exceeds i32"))?;
+
+    if backend.tape_bf16() {
+        let d_a_op = backend.bf16_operand(a, "add_broadcast")?;
+        let d_b_op = backend.bf16_operand(b, "add_broadcast")?;
+        let d_a = d_a_op.get();
+        let d_b = d_b_op.get();
+        if d_a.len() != total || d_b.len() != b_size {
+            return Err(AutogradError::DataLengthMismatch {
+                len: d_a.len().min(d_b.len()),
+                shape: a_shape.to_vec(),
+                size: total,
+            });
+        }
+        let mut d_out = backend
+            .stream
+            .alloc_zeros::<u16>(total)
+            .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
+        let func = backend
+            .kernels
+            .function_for("add_broadcast_f32", TapeDtype::Bf16)?;
+        launch_1d(&backend.stream, &func, total, |mut builder| {
+            builder
+                .arg(d_a)
+                .arg(d_b)
+                .arg(&mut d_out)
+                .arg(&d_out_shape)
+                .arg(&d_b_strides)
+                .arg(&out_rank_i32)
+                .arg(&total_i32);
+            builder
+        })?;
+        return Ok(DeviceHandle::CudaBf16(CudaBf16Storage::new(d_out)));
+    }
+
+    let d_a = backend.cuda_slice(a, "add_broadcast")?;
+    let d_b = backend.cuda_slice(b, "add_broadcast")?;
+    if d_a.len() != total {
+        return Err(AutogradError::DataLengthMismatch {
+            len: d_a.len(),
+            shape: a_shape.to_vec(),
+            size: total,
+        });
+    }
+    if d_b.len() != b_size {
+        return Err(AutogradError::DataLengthMismatch {
+            len: d_b.len(),
+            shape: b_shape.to_vec(),
+            size: b_size,
+        });
+    }
+    let mut d_out = backend
+        .stream
+        .alloc_zeros::<f32>(total)
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
 
     launch_1d(
         &backend.stream,
@@ -9046,14 +9309,6 @@ fn cuda_broadcast_expand_device(
     validate_broadcast(target_shape, src_shape)?;
     let total = shape_size(target_shape);
     let src_size = shape_size(src_shape);
-    let d_src = backend.cuda_slice(src, "broadcast_expand")?;
-    if d_src.len() != src_size {
-        return Err(AutogradError::DataLengthMismatch {
-            len: d_src.len(),
-            shape: src_shape.to_vec(),
-            size: src_size,
-        });
-    }
 
     let out_rank = target_shape.len();
     let rank_offset = out_rank - src_shape.len();
@@ -9078,14 +9333,52 @@ fn cuda_broadcast_expand_device(
         .stream
         .clone_htod(&src_strides)
         .map_err(|_| AutogradError::TapeInvariant("cuda htod copy failed"))?;
-    // SAFETY: the kernel writes every element.
-    let mut d_out = unsafe { backend.stream.alloc::<f32>(total) }
-        .map_err(|_| AutogradError::TapeInvariant("cuda alloc failed"))?;
 
     let out_rank_i32 = i32::try_from(out_rank)
         .map_err(|_| AutogradError::TapeInvariant("cuda broadcast_expand rank exceeds i32"))?;
     let total_i32 = i32::try_from(total)
         .map_err(|_| AutogradError::TapeInvariant("cuda broadcast_expand total exceeds i32"))?;
+
+    if backend.tape_bf16() {
+        let d_src_op = backend.bf16_operand(src, "broadcast_expand")?;
+        let d_src = d_src_op.get();
+        if d_src.len() != src_size {
+            return Err(AutogradError::DataLengthMismatch {
+                len: d_src.len(),
+                shape: src_shape.to_vec(),
+                size: src_size,
+            });
+        }
+        // SAFETY: the kernel writes every element.
+        let mut d_out = unsafe { backend.stream.alloc::<u16>(total) }
+            .map_err(|_| AutogradError::TapeInvariant("cuda alloc failed"))?;
+        let func = backend
+            .kernels
+            .function_for("broadcast_copy_f32", TapeDtype::Bf16)?;
+        launch_1d(&backend.stream, &func, total, |mut builder| {
+            builder
+                .arg(d_src)
+                .arg(&mut d_out)
+                .arg(&d_out_shape)
+                .arg(&d_src_strides)
+                .arg(&out_rank_i32)
+                .arg(&total_i32);
+            builder
+        })?;
+        return Ok(DeviceHandle::CudaBf16(CudaBf16Storage::new(d_out)));
+    }
+
+    let d_src = backend.cuda_slice(src, "broadcast_expand")?;
+    if d_src.len() != src_size {
+        return Err(AutogradError::DataLengthMismatch {
+            len: d_src.len(),
+            shape: src_shape.to_vec(),
+            size: src_size,
+        });
+    }
+    // SAFETY: the kernel writes every element.
+    let mut d_out = unsafe { backend.stream.alloc::<f32>(total) }
+        .map_err(|_| AutogradError::TapeInvariant("cuda alloc failed"))?;
 
     launch_1d(
         &backend.stream,
@@ -10307,24 +10600,43 @@ fn cuda_add_broadcast_backward_device(
     } else {
         b_shape.iter().product()
     };
-    let d_up = backend.cuda_slice(upstream, "add_broadcast_backward_device")?;
-    if d_up.len() != a_total {
+    let up_bf16 = matches!(upstream, DeviceHandle::CudaBf16(_));
+    let up_len = match upstream {
+        DeviceHandle::CudaBf16(storage) => backend.cuda_bf16_storage_slice(storage)?.len(),
+        _ => backend
+            .cuda_slice(upstream, "add_broadcast_backward_device")?
+            .len(),
+    };
+    if up_len != a_total {
         return Err(AutogradError::DataLengthMismatch {
-            len: d_up.len(),
+            len: up_len,
             shape: a_shape.to_vec(),
             size: a_total,
         });
     }
 
-    let mut d_grad = backend
-        .stream
-        .alloc_zeros::<f32>(b_total.max(1))
-        .map_err(|_| {
-            AutogradError::TapeInvariant("cuda alloc_zeros failed (add_broadcast_backward_device)")
-        })?;
-
     if a_total == 0 || b_total == 0 || out_rank == 0 {
-        return Ok(DeviceHandle::Cuda(CudaStorage::new(d_grad)));
+        return if up_bf16 {
+            let zeros = backend
+                .stream
+                .alloc_zeros::<u16>(b_total.max(1))
+                .map_err(|_| {
+                    AutogradError::TapeInvariant(
+                        "cuda alloc_zeros failed (add_broadcast_backward_device)",
+                    )
+                })?;
+            Ok(DeviceHandle::CudaBf16(CudaBf16Storage::new(zeros)))
+        } else {
+            let zeros = backend
+                .stream
+                .alloc_zeros::<f32>(b_total.max(1))
+                .map_err(|_| {
+                    AutogradError::TapeInvariant(
+                        "cuda alloc_zeros failed (add_broadcast_backward_device)",
+                    )
+                })?;
+            Ok(DeviceHandle::Cuda(CudaStorage::new(zeros)))
+        };
     }
 
     // Build right-aligned b-strides (length=out_rank, 0 on contracted axes;
@@ -10379,6 +10691,41 @@ fn cuda_add_broadcast_backward_device(
 
     const BLOCK: u32 = 256;
     const SHARED: u32 = BLOCK * std::mem::size_of::<f32>() as u32;
+    if up_bf16 {
+        let d_up_op = backend.bf16_operand(upstream, "add_broadcast_backward_device")?;
+        let d_up = d_up_op.get();
+        let mut d_grad = backend.stream.alloc_zeros::<u16>(b_total).map_err(|_| {
+            AutogradError::TapeInvariant("cuda alloc_zeros failed (add_broadcast_backward_device)")
+        })?;
+        let func = backend
+            .kernels
+            .function_for("add_broadcast_backward_f32", TapeDtype::Bf16)?;
+        launch_rows(
+            &backend.stream,
+            &func,
+            b_total,
+            BLOCK,
+            SHARED,
+            |mut builder| {
+                builder
+                    .arg(&mut d_grad)
+                    .arg(d_up)
+                    .arg(&d_out_shape)
+                    .arg(&d_b_strides)
+                    .arg(&d_out_strides)
+                    .arg(&out_rank_i32)
+                    .arg(&b_total_i32)
+                    .arg(&contract_total_i32);
+                builder
+            },
+        )?;
+        return Ok(DeviceHandle::CudaBf16(CudaBf16Storage::new(d_grad)));
+    }
+
+    let d_up = backend.cuda_slice(upstream, "add_broadcast_backward_device")?;
+    let mut d_grad = backend.stream.alloc_zeros::<f32>(b_total).map_err(|_| {
+        AutogradError::TapeInvariant("cuda alloc_zeros failed (add_broadcast_backward_device)")
+    })?;
     launch_rows(
         &backend.stream,
         backend.kernels.function("add_broadcast_backward_f32")?,
@@ -10411,9 +10758,35 @@ fn cuda_elementwise_backward_with_saved(
     kernel_name: &'static str,
     op_label: &'static str,
 ) -> Result<DeviceHandle> {
+    let size = shape_size(shape);
+    // Adjoint of the forward's actual precision: under bf16 tape the forward
+    // consumed bf16 operands, so backward re-quantizes the same way.
+    if backend.tape_bf16() {
+        let d_up_op = backend.bf16_operand(upstream, op_label)?;
+        let d_saved_op = backend.bf16_operand(saved, op_label)?;
+        let d_up = d_up_op.get();
+        let d_saved = d_saved_op.get();
+        if d_up.len() != size || d_saved.len() != size {
+            return Err(AutogradError::DataLengthMismatch {
+                len: d_up.len().min(d_saved.len()),
+                shape: shape.to_vec(),
+                size,
+            });
+        }
+        let mut d_out = backend
+            .stream
+            .alloc_zeros::<u16>(size)
+            .map_err(|_| AutogradError::TapeInvariant("cuda alloc_zeros failed"))?;
+        let n = size as u64;
+        let func = backend.kernels.function_for(kernel_name, TapeDtype::Bf16)?;
+        launch_1d(&backend.stream, &func, size, |mut builder| {
+            builder.arg(&mut d_out).arg(d_up).arg(d_saved).arg(&n);
+            builder
+        })?;
+        return Ok(DeviceHandle::CudaBf16(CudaBf16Storage::new(d_out)));
+    }
     let d_up = backend.cuda_slice(upstream, op_label)?;
     let d_saved = backend.cuda_slice(saved, op_label)?;
-    let size = shape_size(shape);
     if d_up.len() != size || d_saved.len() != size {
         return Err(AutogradError::DataLengthMismatch {
             len: d_up.len().min(d_saved.len()),
@@ -10519,9 +10892,12 @@ fn cuda_mul_backward_device(
     if !need_grad_a && !need_grad_b {
         return Ok((None, None));
     }
-    let d_up = backend.cuda_slice(upstream, "mul_backward_device")?;
-    let d_a = backend.cuda_slice(a, "mul_backward_device")?;
-    let d_b = backend.cuda_slice(b, "mul_backward_device")?;
+    let d_up_op = backend.f32_operand(upstream, "mul_backward_device")?;
+    let d_a_op = backend.f32_operand_tape_quantized(a, "mul_backward_device")?;
+    let d_b_op = backend.f32_operand_tape_quantized(b, "mul_backward_device")?;
+    let d_up = d_up_op.get();
+    let d_a = d_a_op.get();
+    let d_b = d_b_op.get();
     let size = shape_size(shape);
     if d_up.len() != size || d_a.len() != size || d_b.len() != size {
         return Err(AutogradError::DataLengthMismatch {
@@ -10606,8 +10982,10 @@ fn cuda_rms_norm_backward_device(
     let total = shape_size(shape);
     let rows = total / hidden;
 
-    let d_up = backend.cuda_slice(upstream, "rms_norm_backward_device")?;
-    let d_x = backend.cuda_slice(x, "rms_norm_backward_device")?;
+    let d_up_op = backend.f32_operand(upstream, "rms_norm_backward_device")?;
+    let d_x_op = backend.f32_operand(x, "rms_norm_backward_device")?;
+    let d_up = d_up_op.get();
+    let d_x = d_x_op.get();
     let d_w = backend.cuda_slice(weight, "rms_norm_backward_device")?;
     if d_up.len() != total || d_x.len() != total || d_w.len() != hidden {
         return Err(AutogradError::ShapeMismatch {

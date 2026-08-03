@@ -36,8 +36,8 @@
 #endif
 
 extern "C" __global__ void add_broadcast_backward_f32(
-    float* __restrict__ grad_b,
-    const float* __restrict__ upstream,
+    T* __restrict__ grad_b,
+    const T* __restrict__ upstream,
     const int* __restrict__ out_shape,    // a_shape, length out_rank
     const int* __restrict__ b_strides,    // length out_rank, 0 on contracted axes
     const int* __restrict__ out_strides,  // contiguous row-major strides in upstream
@@ -115,7 +115,7 @@ extern "C" __global__ void add_broadcast_backward_f32(
             int d = contract_axis[j];
             lin += coord[j] * out_strides[d];
         }
-        local_sum += upstream[lin];
+        local_sum += static_cast<float>(upstream[lin]);
     }
 
     // 3. Shared-memory tree reduction.
@@ -126,6 +126,6 @@ extern "C" __global__ void add_broadcast_backward_f32(
         __syncthreads();
     }
     if (tid == 0) {
-        grad_b[b_idx] = smem[0];
+        grad_b[b_idx] = static_cast<T>(smem[0]);
     }
 }
