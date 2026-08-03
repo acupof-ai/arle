@@ -23,9 +23,11 @@
 //! L2 norms must agree. A pod 27B run had matching losses (spread 8.2e-4) but grad
 //! norms 3.744990 vs 1.984009 — a 1.89x break the loss-only gate could not see.
 //!
-//! Full-attention by default; `ARLE_ND_HYBRID=1` swaps layer 0 to linear attention
-//! so the seq<->head all-to-all transport is covered too (48 of the real 27B's 64
-//! layers are GDN, so full-attn-only certifies the minority of the model).
+//! Full-attention by default; `ARLE_ND_HYBRID=1` makes every layer but the last
+//! linear attention so the seq<->head all-to-all transport is covered too (48 of
+//! the real 27B's 64 layers are GDN, so full-attn-only certifies the minority of
+//! the model). `ARLE_ND_LAYERS=n` sets depth, `ARLE_ND_CP_SIZE=n` the world size
+//! (= the ring step count) — the two axes a bias has to scale on to matter.
 //!
 //! Run on a GPU host (>= 2 GPUs):
 //!   ARLE_ND_CUDA_DEVICES=4,5 \
@@ -49,8 +51,16 @@ use train::{
     tensor_parallel::TpContext,
 };
 
+// Ring step count is the CP world size, not the sequence length — `ARLE_ND_CP_SIZE`
+// is the only axis that varies it (default 2).
 #[cfg(all(feature = "cuda", feature = "nccl"))]
-const CP_SIZE: usize = 2;
+fn cp_size() -> usize {
+    std::env::var("ARLE_ND_CP_SIZE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(2)
+}
 // CP is CORRECT when it tracks the f32 ground truth at least as well as the
 // single card does — NOT when it byte-matches the single card. Both CUDA paths
 // run bf16 attention (chunked-prefill kernel vs the ring kernel), which at this
@@ -92,7 +102,7 @@ fn main() {
 }
 
 // Prompt/response shared by the reference and every CP rank. Default seq 16 splits
-// into 2*CP_SIZE=4 evenly (the zigzag precondition; opd.rs also pads up, but an
+// into 2*cp_size()=4 evenly (the zigzag precondition; opd.rs also pads up, but an
 // already-divisible default keeps the reference trivially aligned). A SHORT prompt
 // (4) so masked targets (predicting positions [prompt_len-1 .. seq-2]) straddle BOTH
 // shards. `ARLE_ND_SEQ` overrides the total length (must be >= 6) to drive a
@@ -146,7 +156,7 @@ fn trajectory() -> (Vec<u32>, Vec<u32>, Vec<u8>) {
 
 #[cfg(all(feature = "cuda", feature = "nccl"))]
 fn coordinator_main() -> Result<()> {
-    let devices = parse_devices(CP_SIZE)?;
+    let devices = parse_devices(cp_size())?;
     let root = std::env::var("ARLE_ND_DIR")
         .unwrap_or_else(|_| format!("/tmp/arle_nd_parallel_parity_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
@@ -156,10 +166,10 @@ fn coordinator_main() -> Result<()> {
     let single = run_writeback(devices[0], CpContext::single())?;
     let loss_single = single.loss;
 
-    // CP ranks: spawn CP_SIZE workers, each runs the same step under its shard.
+    // CP ranks: spawn cp_size() workers, each runs the same step under its shard.
     let exe = std::env::current_exe()?;
-    let mut children = Vec::with_capacity(CP_SIZE);
-    for (rank, &device) in devices.iter().enumerate().take(CP_SIZE) {
+    let mut children = Vec::with_capacity(cp_size());
+    for (rank, &device) in devices.iter().enumerate().take(cp_size()) {
         let child = std::process::Command::new(&exe)
             .env("ARLE_ND_RANK", rank.to_string())
             .env("ARLE_ND_DIR", &root)
@@ -177,9 +187,9 @@ fn coordinator_main() -> Result<()> {
     // shard partials before returning (fe6cc2346) and `all_reduce_cp_grads` sums the
     // grads, so every rank already holds the identical global value. A spread across
     // ranks is itself a reduce bug — assert it, then use rank 0 as "the" CP value.
-    let mut losses_cp = Vec::with_capacity(CP_SIZE);
-    let mut norms_cp = Vec::with_capacity(CP_SIZE);
-    for rank in 0..CP_SIZE {
+    let mut losses_cp = Vec::with_capacity(cp_size());
+    let mut norms_cp = Vec::with_capacity(cp_size());
+    for rank in 0..cp_size() {
         let step = read_loss(&root, rank)?;
         losses_cp.push(step.loss);
         norms_cp.push(step.norm);
@@ -202,7 +212,8 @@ fn coordinator_main() -> Result<()> {
     );
 
     println!(
-        "nd_parallel_parity cp_size={CP_SIZE} devices={devices:?} seq={}",
+        "nd_parallel_parity cp_size={} devices={devices:?} seq={}",
+        cp_size(),
         nd_seq()
     );
     println!("grad_norm_cp_per_rank={norms_cp:?} rank_spread={rank_spread:.3e}");
@@ -295,12 +306,12 @@ fn rank_main(rank: usize) -> Result<()> {
     let dir = std::env::var("ARLE_ND_DIR").context("ARLE_ND_DIR missing")?;
     let device = env_usize("ARLE_ND_CUDA_DEVICE", rank)?;
     let unique_id = nccl_rendezvous(rank, &dir)?;
-    let backend = CudaBackend::new_with_nccl(device, unique_id, CP_SIZE, rank)
+    let backend = CudaBackend::new_with_nccl(device, unique_id, cp_size(), rank)
         .with_context(|| format!("rank {rank} CudaBackend::new_with_nccl device {device}"))?;
     let store = TensorStore::with_backend(std::sync::Arc::new(backend));
     // Drive the CP context through the mesh (from_mesh → RankCoord), the path the
     // convergence installed, not a bespoke {rank, size}.
-    let step = run_writeback_in(store, CpContext::from_mesh(1, CP_SIZE, rank))?;
+    let step = run_writeback_in(store, CpContext::from_mesh(1, cp_size(), rank))?;
     write_loss(&dir, rank, &step)
 }
 
@@ -382,7 +393,7 @@ fn tiny_full_attn_config() -> Qwen35Config {
     Qwen35Config {
         hidden_size: 512,
         intermediate_size: 16,
-        num_hidden_layers: 2,
+        num_hidden_layers: nd_layer_types().len(),
         vocab_size: 16,
         rms_norm_eps: 1.0e-6,
         stop_token_ids: vec![15],
