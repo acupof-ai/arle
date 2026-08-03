@@ -174,6 +174,8 @@ pub fn check(result: ncclResult_t) -> anyhow::Result<()> {
     if result == ncclResult_t::Success {
         Ok(())
     } else {
+        // SAFETY: `ncclGetErrorString` returns a static NUL-terminated string owned by
+        // the library, valid for the process; we only borrow it for the format below.
         let cstr = unsafe { std::ffi::CStr::from_ptr(ncclGetErrorString(result)) };
         Err(anyhow::anyhow!(
             "NCCL error: {} ({:?})",

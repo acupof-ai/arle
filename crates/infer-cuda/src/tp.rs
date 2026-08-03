@@ -388,10 +388,10 @@ impl TpRuntime {
         // One-shot path: decode-sized bf16 messages over the GLOBAL comm only
         // (sub-comms keep NCCL). Oversized (prefill) buffers fall through.
         #[cfg(all(feature = "cuda", feature = "nccl"))]
-        if let Some(os) = &self.oneshot {
-            if buf.data.len() * 2 <= os.scratch_bytes() {
-                return os.all_reduce_sum_inplace(ctx, buf);
-            }
+        if let Some(os) = &self.oneshot
+            && buf.data.len() * 2 <= os.scratch_bytes()
+        {
+            return os.all_reduce_sum_inplace(ctx, buf);
         }
         self.all_reduce_sum_over(&self.comm, ctx, buf)
     }
@@ -605,12 +605,12 @@ impl TpRuntime {
         recvbuf: *mut std::ffi::c_void,
     ) -> anyhow::Result<()> {
         #[cfg(all(feature = "cuda", feature = "nccl"))]
-        if let Some(os) = &self.oneshot {
-            if sendcount * 2 <= os.scratch_bytes() {
-                // SAFETY: same contract as the NCCL arm below; the one-shot
-                // path stages `sendbuf` through its registered scratch.
-                return unsafe { os.all_gather_bf16(ctx, sendbuf, sendcount, recvbuf) };
-            }
+        if let Some(os) = &self.oneshot
+            && sendcount * 2 <= os.scratch_bytes()
+        {
+            // SAFETY: same contract as the NCCL arm below; the one-shot
+            // path stages `sendbuf` through its registered scratch.
+            return unsafe { os.all_gather_bf16(ctx, sendbuf, sendcount, recvbuf) };
         }
         match &self.comm {
             TpComm::Single => anyhow::bail!("single-rank raw all_gather_bf16 is not needed"),
@@ -618,6 +618,8 @@ impl TpRuntime {
             TpComm::Nccl(backend) => {
                 use cuda_kernels::collective::{CollectiveBackend, DType};
 
+                // SAFETY: this fn's contract — `sendbuf` holds `sendcount` bf16 and
+                // `recvbuf` `sendcount * world`, both live on `ctx`'s device and stream.
                 unsafe {
                     backend.all_gather(
                         sendbuf,
@@ -1064,8 +1066,9 @@ mod cuda_ipc {
         ) -> Result<Self> {
             bind(ctx)?;
             let mut ptr = 0u64;
-            // SAFETY: outputs point to live locals and `ctx` is current.
             check(
+                // SAFETY: `ptr` and the 64-byte `handle` are live out-params and `bind`
+                // above made `ctx` the current context.
                 unsafe { car::arle_car_alloc_shared(bytes, &mut ptr, handle.as_mut_ptr()) },
                 label,
             )?;
@@ -1086,6 +1089,8 @@ mod cuda_ipc {
             if self.ptr == 0 {
                 return;
             }
+            // SAFETY: non-zero `ptr` is this region's own `alloc_shared` result and
+            // `disarm` clears it once ownership moved, so this frees at most once.
             let res = unsafe { car::arle_car_free_shared(self.ptr) };
             if res != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
                 log::warn!(
@@ -1110,8 +1115,9 @@ mod cuda_ipc {
         ) -> Result<Self> {
             bind(ctx)?;
             let mut ptr = 0u64;
-            // SAFETY: `handle` is a gathered 64-byte IPC handle and `ctx` is current.
             check(
+                // SAFETY: `ptr` is a live out-param and `bind` above made `ctx` current;
+                // the callee reads 64 bytes from `handle`, whose length is unchecked here.
                 unsafe { car::arle_car_open_peer(handle.as_ptr(), &mut ptr) },
                 label,
             )?;
@@ -1132,6 +1138,8 @@ mod cuda_ipc {
             if self.ptr == 0 {
                 return;
             }
+            // SAFETY: non-zero `ptr` is this mapping's own `open_peer` result and
+            // `disarm` clears it once ownership moved, so this closes at most once.
             let res = unsafe { car::arle_car_close_peer(self.ptr) };
             if res != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
                 log::warn!(
@@ -1180,11 +1188,15 @@ mod oneshot {
     // are issued from the engine thread that owns the executor (the same
     // single-threaded discipline as every other forward-path FFI handle).
     unsafe impl Send for OneShotComm {}
+    // SAFETY: `&self` use is confined to the engine thread that owns the executor,
+    // and the handle's device state is only touched through that thread's stream.
     unsafe impl Sync for OneShotComm {}
 
     impl Drop for OneShotComm {
         fn drop(&mut self) {
             // Frees own regions + rank data, IPC-closes peer mappings.
+            // SAFETY: `handle` came from `arle_car_create` and is owned solely here —
+            // `BootHandle::into_comm` nulls the boot copy, so this destroys once.
             unsafe { car::arle_car_destroy_prod(self.handle) };
         }
     }
@@ -1212,6 +1224,8 @@ mod oneshot {
     impl Drop for BootHandle {
         fn drop(&mut self) {
             if !self.handle.is_null() {
+                // SAFETY: non-null means boot failed before `into_comm` moved ownership,
+                // so this `arle_car_create` handle is still ours to destroy.
                 unsafe { car::arle_car_destroy_prod(self.handle) };
             }
         }
@@ -1302,6 +1316,8 @@ mod oneshot {
                     ins[r] = input.ptr();
                     peer_ins.push(input);
                 }
+                // SAFETY: `sigs`/`ins` are live `world`-length arrays of device pointers —
+                // this rank's own regions plus one opened peer mapping per other rank.
                 let handle = unsafe {
                     car::arle_car_create(rank as i32, world as i32, sigs.as_ptr(), ins.as_ptr())
                 };
@@ -1356,6 +1372,8 @@ mod oneshot {
             let stream = &ctx.stream;
             // One-shot arm: fill the registered scratch, reduce into `got`.
             check(
+                // SAFETY: `scratch_ptr` is the registered SCRATCH_BYTES region and
+                // ELEMS bf16 (14 KB) fits it; `stream` is this rank's own.
                 unsafe {
                     car::arle_car_fill_bf16(
                         stream.cu_stream(),
@@ -1372,6 +1390,8 @@ mod oneshot {
             {
                 let (got_ptr, _g) = got.device_ptr_mut(stream);
                 check(
+                    // SAFETY: `got_ptr` is live for `_g` and holds ELEMS u16; `handle` is
+                    // the booted one-shot comm on this rank's `stream`.
                     unsafe {
                         car::arle_car_allreduce_bf16_into(
                             handle,
@@ -1391,6 +1411,8 @@ mod oneshot {
             {
                 let (ref_ptr, _g) = reference.device_ptr_mut(stream);
                 check(
+                    // SAFETY: `ref_ptr` is live for `_g` and holds ELEMS u16 — same seed
+                    // and count as the one-shot fill above.
                     unsafe {
                         car::arle_car_fill_bf16(
                             stream.cu_stream(),
@@ -1401,6 +1423,8 @@ mod oneshot {
                     },
                     "self-test ref fill",
                 )?;
+                // SAFETY: `ref_ptr` is live for `_g` and holds ELEMS bf16 on this rank's
+                // device; every rank runs this self-test in the same order.
                 unsafe {
                     backend.all_reduce(
                         ref_ptr as *mut std::ffi::c_void,
@@ -1496,6 +1520,8 @@ mod oneshot {
             sendcount: usize,
             recvbuf: *mut std::ffi::c_void,
         ) -> Result<()> {
+            // SAFETY: this fn's contract — sendbuf holds `sendcount` bf16 and recvbuf
+            // `world * sendcount`; caller checked `sendcount*2 <= scratch_bytes()`.
             unsafe {
                 cudarc::driver::result::memcpy_dtod_async(
                     self.scratch_ptr,
