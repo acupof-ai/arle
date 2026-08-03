@@ -409,39 +409,6 @@ static cudaError_t gemm_cublas_fallback(CublasDeviceState *state,
   return err;
 }
 
-static bool gemm_small_n_uses_gemv(int M, int N, int K) {
-  // The per-column GEMV loop re-streams the whole weight N times; one
-  // cuBLASLt pass reads it once. At N=16 the loop measured 21.6 ms on the
-  // Qwen3.6-27B lm_head (16 x 1.5 GB) vs ~1 ms for a single tensor-core pass
-  // (H20, DSpark block-16 spec decode) — keep the loop only where launch
-  // overhead can plausibly beat a weight pass.
-  // Small M underfills the one-block-per-16-rows grid: the fused [96, 5120]
-  // in_proj_ba ran 52 us latency-bound on 6 blocks vs ~8 us for cuBLASLt
-  // split-K (nsys 2026-08-03, #196 T5) — require a GPU-filling grid.
-  static constexpr int kMinGemvRows = 4096;
-  static constexpr size_t kMaxGemvSharedBytes = 48 * 1024;
-  return M >= kMinGemvRows && N > 0 && N <= 4 &&
-         static_cast<size_t>(K) * sizeof(__nv_bfloat16) <= kMaxGemvSharedBytes;
-}
-
-static cudaError_t gemm_small_n_gemv_loop(const __nv_bfloat16 *W, const __nv_bfloat16 *X,
-                                          __nv_bfloat16 *Y, int M, int N, int K,
-                                          cudaStream_t stream) {
-  int num_blocks = (M + GEMV_ROWS_PER_BLOCK - 1) / GEMV_ROWS_PER_BLOCK;
-  size_t smem_bytes = static_cast<size_t>(K) * sizeof(__nv_bfloat16);
-  for (int col = 0; col < N; ++col) {
-    const __nv_bfloat16 *x_col = X + static_cast<size_t>(col) * K;
-    __nv_bfloat16 *y_col = Y + static_cast<size_t>(col) * M;
-    gemv_handwritten_kernel<<<num_blocks, GEMV_BLOCK, smem_bytes, stream>>>(
-        W, x_col, y_col, M, K);
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-      return err;
-    }
-  }
-  return cudaSuccess;
-}
-
 // M_pf-gemm Phase 0: at first miss for a given (M,N,K), benchmark
 // all heuristic-returned algos (5 iters each) and cache the fastest.
 // cuBLAS heuristic top-1 is optimized for "average cost across many
@@ -507,10 +474,6 @@ static int device_compute_major() {
 static cudaError_t gemm_cublaslt_impl(const __nv_bfloat16 *W, const __nv_bfloat16 *X,
                                       __nv_bfloat16 *Y, int M, int N, int K,
                                       cudaStream_t stream, bool graphsafe) {
-  if (gemm_small_n_uses_gemv(M, N, K)) {
-    return gemm_small_n_gemv_loop(W, X, Y, M, N, K, stream);
-  }
-
   CublasDeviceState *state = current_device_state();
   if (state == nullptr) {
     return cudaErrorNotReady;

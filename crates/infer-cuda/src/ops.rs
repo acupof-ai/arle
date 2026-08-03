@@ -226,13 +226,18 @@ pub(crate) fn gemv(
     let (w_ptr, _gw) = weight.data.device_ptr(&ctx.stream);
     let (x_ptr, _gx) = x.data.device_ptr(&ctx.stream);
     let (out_ptr, _go) = out.data.device_ptr_mut(&ctx.stream);
+    // cuBLASLt as an N=1 GEMM: the hand-written kernel reads the lm_head at
+    // ~1.1 TB/s vs nvjet's 2.2 (nsys 2026-08-03, #196) — half the step's
+    // lm_head time for free. Capture-safe: fixed workspace, algo cached at
+    // the warm step, GemmEx fallback on a mid-capture miss.
     // SAFETY: ptrs from live device allocations sized to the dims passed.
     unsafe {
-        ffi::gemv_cuda(
+        ffi::gemm_cuda(
             w_ptr as *const ffi::Half,
             x_ptr as *const ffi::Half,
             out_ptr as *mut ffi::Half,
             weight.rows as i32,
+            1,
             weight.cols as i32,
             ctx.stream.cu_stream(),
         )
