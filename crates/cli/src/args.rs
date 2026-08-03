@@ -193,6 +193,22 @@ pub(crate) enum SaveDtypeArg {
     Bf16,
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+pub(crate) enum TapeDtypeArg {
+    F32,
+    Bf16,
+}
+
+impl TapeDtypeArg {
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    pub(crate) fn as_tape_dtype(self) -> autograd::TapeDtype {
+        match self {
+            Self::F32 => autograd::TapeDtype::F32,
+            Self::Bf16 => autograd::TapeDtype::Bf16,
+        }
+    }
+}
+
 /// Teacher source for `agent-opd --gkd` (per-token teacher-KL) replay.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
 pub(crate) enum GkdTeacherArg {
@@ -2256,6 +2272,10 @@ pub(crate) struct TrainAgentOpdArgs {
     /// Compute backend for autograd (auto picks CUDA when built with cuda).
     #[arg(long, value_enum, default_value_t = OpdBackendArg::Auto)]
     pub(crate) backend: OpdBackendArg,
+
+    /// Storage dtype for tape-saved activations (f32 default is byte-identical).
+    #[arg(long, value_enum, default_value_t = TapeDtypeArg::F32)]
+    pub(crate) tape_dtype: TapeDtypeArg,
 
     /// Diagnostic: skip the rollout and run ONE masked-CE writeback on a synthetic trajectory of this token length (find writeback OOM fast). 0 = off.
     #[arg(long, default_value_t = 0)]

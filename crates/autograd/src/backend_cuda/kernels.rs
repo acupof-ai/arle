@@ -1,4 +1,4 @@
-use crate::{AutogradError, Result};
+use crate::{AutogradError, Result, TapeDtype};
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaModule, CudaStream, LaunchArgs, LaunchConfig, sys,
 };
@@ -6,6 +6,8 @@ use cudarc::nvrtc::{Ptx, result as nvrtc_result, sys as nvrtc_sys};
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::sync::Arc;
+#[cfg(not(feature = "no-cuda"))]
+use std::sync::Mutex;
 
 #[cfg(not(feature = "no-cuda"))]
 const ELEMENTWISE_CU: &str = include_str!("kernels/elementwise.cu");
@@ -147,6 +149,17 @@ const FUNCTION_NAMES: &[&str] = &[
 pub(super) struct KernelCache {
     _module: Arc<CudaModule>,
     functions: HashMap<&'static str, CudaFunction>,
+    #[cfg(not(feature = "no-cuda"))]
+    ctx: Arc<CudaContext>,
+    #[cfg(not(feature = "no-cuda"))]
+    bf16: Mutex<Option<DtypeModule>>,
+}
+
+#[cfg(not(feature = "no-cuda"))]
+#[derive(Debug)]
+struct DtypeModule {
+    module: Arc<CudaModule>,
+    functions: HashMap<&'static str, CudaFunction>,
 }
 
 impl KernelCache {
@@ -159,7 +172,7 @@ impl KernelCache {
 
         #[cfg(not(feature = "no-cuda"))]
         {
-            let (image, arch) = compile_cubin_for_current_device(ctx)?;
+            let (image, arch) = compile_cubin_for_current_device(ctx, TapeDtype::F32)?;
             let module = ctx.load_module(image).map_err(|err| {
                 cuda_kernel_error(format!(
                     "cuda load_module failed for autograd kernels arch={arch}: {err:?}"
@@ -181,6 +194,8 @@ impl KernelCache {
             Ok(Self {
                 _module: module,
                 functions,
+                ctx: ctx.clone(),
+                bf16: Mutex::new(None),
             })
         }
     }
@@ -190,6 +205,57 @@ impl KernelCache {
             "autograd cuda kernel not found in cache",
         ))
     }
+
+    #[allow(dead_code)]
+    pub(super) fn function_for(
+        &self,
+        name: &'static str,
+        dtype: TapeDtype,
+    ) -> Result<CudaFunction> {
+        match dtype {
+            TapeDtype::F32 => self.function(name).cloned(),
+            TapeDtype::Bf16 => {
+                #[cfg(feature = "no-cuda")]
+                {
+                    let _ = name;
+                    todo!(
+                        "GPU required: cuda kernel compilation is unavailable under feature no-cuda"
+                    )
+                }
+                #[cfg(not(feature = "no-cuda"))]
+                {
+                    let mut guard = self.bf16.lock().map_err(|_| {
+                        AutogradError::TapeInvariant("autograd cuda bf16 kernel cache poisoned")
+                    })?;
+                    if guard.is_none() {
+                        let (image, arch) =
+                            compile_cubin_for_current_device(&self.ctx, TapeDtype::Bf16)?;
+                        let module = self.ctx.load_module(image).map_err(|err| {
+                            cuda_kernel_error(format!(
+                                "cuda load_module failed for autograd bf16 kernels arch={arch}: {err:?}"
+                            ))
+                        })?;
+                        *guard = Some(DtypeModule {
+                            module,
+                            functions: HashMap::new(),
+                        });
+                    }
+                    let entry = guard.as_mut().ok_or(AutogradError::TapeInvariant(
+                        "autograd cuda bf16 module missing after compile",
+                    ))?;
+                    if !entry.functions.contains_key(name) {
+                        let function = entry.module.load_function(name).map_err(|err| {
+                            cuda_kernel_error(format!(
+                                "cuda load_function failed for autograd bf16 kernel {name}: {err:?}"
+                            ))
+                        })?;
+                        entry.functions.insert(name, function);
+                    }
+                    Ok(entry.functions[name].clone())
+                }
+            }
+        }
+    }
 }
 
 #[cfg(not(feature = "no-cuda"))]
@@ -198,13 +264,16 @@ fn cuda_kernel_error(message: String) -> AutogradError {
 }
 
 #[cfg(not(feature = "no-cuda"))]
-fn compile_cubin_for_current_device(ctx: &Arc<CudaContext>) -> Result<(Ptx, &'static str)> {
+fn compile_cubin_for_current_device(
+    ctx: &Arc<CudaContext>,
+    dtype: TapeDtype,
+) -> Result<(Ptx, &'static str)> {
     let arch = current_sm_arch(ctx)?;
     // Emit SASS cubin for the exact device instead of PTX. On V100 the
     // deployment driver supports CUDA 12.2 while the available NVRTC is 12.4;
     // PTX 8.4 would fail driver JIT with CUDA_ERROR_UNSUPPORTED_PTX_VERSION,
     // but an sm_70 cubin loads cleanly and keeps the kernel code uniform.
-    let image = compile_cubin(&concat_sources(), arch).map_err(|err| {
+    let image = compile_cubin(&concat_sources(dtype), arch).map_err(|err| {
         cuda_kernel_error(format!(
             "nvrtc compile cubin failed for autograd kernels arch={arch}: {err}"
         ))
@@ -426,8 +495,13 @@ where
 }
 
 #[cfg(not(feature = "no-cuda"))]
-fn concat_sources() -> String {
+fn concat_sources(dtype: TapeDtype) -> String {
+    let prelude = match dtype {
+        TapeDtype::F32 => "using T = float;\n",
+        TapeDtype::Bf16 => "#include <cuda_bf16.h>\nusing T = __nv_bfloat16;\n",
+    };
     let mut src = [
+        prelude,
         ELEMENTWISE_CU,
         SOFTMAX_CU,
         SILU_CU,
