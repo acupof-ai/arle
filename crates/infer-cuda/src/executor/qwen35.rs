@@ -1,11 +1,9 @@
 use super::*;
 
-/// Whole-step Qwen3.5/3.6 decode graph enabled? Default ON since 2026-08-03
-/// (paged lane license: −7.9% ITL, byte-identical greedy, MMLU 84/100 vs
-/// 80-81 baseline, 4100+ counted replays); `--qwen35-decode-graph false` is
-/// the escape hatch and the same-binary A/B arm. The eager path stays the
-/// correctness floor; `Qwen35CudaExecutor::warmup` additionally gates TP and
-/// host-routed MoE off regardless of this.
+/// Whole-step Qwen3.5/3.6 decode graph enabled? Default ON;
+/// `--qwen35-decode-graph false` is the escape hatch and the same-binary A/B
+/// arm. The eager path stays the correctness floor; `Qwen35CudaExecutor::warmup`
+/// additionally gates TP and host-routed MoE off regardless of this.
 fn qwen35_decode_graph_enabled() -> bool {
     crate::runtime_flags::qwen35_decode_graph()
 }
@@ -2512,6 +2510,81 @@ impl Qwen35CudaExecutor {
         )
     }
 
+    /// Stage per-step device scalars into the graph workspace and drop the
+    /// slot's capture when any baked address drifted (release → re-alloc).
+    fn stage_graph_step(
+        model: &crate::qwen35::Qwen35Model,
+        dg: &mut Qwen35DecodeGraph,
+        slot: usize,
+        last_token: u32,
+        start_pos: usize,
+        label: &str,
+    ) -> Result<()> {
+        let Qwen35DecodeGraph { ws, graphs, baked } = dg;
+        let (token_ids_ptr, start_pos_ptr) =
+            model.stage_step_inputs(ws, &[last_token], start_pos)?;
+        let logits_ptr = model.workspace_logits_ptr(ws)?;
+        let bake = Qwen35GraphBake {
+            token_ids_ptr,
+            start_pos_ptr,
+            logits_ptr,
+            ws_epoch: ws.epoch(),
+        };
+        match baked[slot] {
+            Some(prev) if prev != bake => {
+                info!(
+                    "[qwen35-decode-graph] {label}slot {slot}: workspace addresses changed; \
+                     dropping stale capture and recapturing"
+                );
+                graphs[slot] = crate::graph::CudaGraphState::new(model.ctx.stream.clone());
+                baked[slot] = Some(bake);
+            }
+            None => baked[slot] = Some(bake),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Shared graph-lane epilogue: advance the slot, bump the reuse-evidence
+    /// counters (the license needs replay counts, not capture-exists), then
+    /// sample OUTSIDE the graph from the logits the run just wrote.
+    fn finish_graph_step(
+        &mut self,
+        slot: usize,
+        was_captured: bool,
+        will_replay: bool,
+        label: &str,
+        row: &DecodeRow,
+        position: u64,
+    ) -> Result<(u32, Option<f32>)> {
+        // Host-side state advance happens here — captured closure is host-state-free.
+        self.slots[slot].advance_seq_len(1);
+        let dg = self.decode_graph.as_ref().expect("still present");
+        if !was_captured && dg.graphs[slot].is_captured() {
+            let captures =
+                QWEN35_GRAPH_CAPTURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            let keys = dg.graphs.iter().filter(|g| g.is_captured()).count();
+            info!(
+                "[qwen35-decode-graph] captured {label}slot {slot} \
+                 (captures_total={captures}, live_keys={keys}, max_keys={})",
+                self.num_slots
+            );
+        }
+        if will_replay {
+            let replays =
+                QWEN35_GRAPH_REPLAYS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if replays.is_multiple_of(100) {
+                info!(
+                    "[qwen35-decode-graph] {label}replay_total={replays} captures_total={}",
+                    QWEN35_GRAPH_CAPTURES.load(std::sync::atomic::Ordering::Relaxed)
+                );
+            }
+        }
+        let dg = self.decode_graph.as_mut().expect("still present");
+        self.model
+            .sample_workspace_logits(&mut dg.ws, &row.params, position)
+    }
+
     /// Run one decode step through the captured whole-step graph. Returns
     /// `Ok(None)` for eager fallback (gate off, out-of-budget, or capture/replay
     /// failure which permanently downgrades to eager, never fatal).
@@ -2547,91 +2620,28 @@ impl Qwen35CudaExecutor {
         let dg = decode_graph
             .as_mut()
             .expect("decode_graph built above when armed");
-        let Qwen35DecodeGraph { ws, graphs, baked } = dg;
-        let slot_idx = row.slot;
-
-        // Stage per-step device scalars outside graph (dense stage1_write pattern).
-        let (token_ids_ptr, start_pos_ptr) =
-            model.stage_step_inputs(ws, &[row.last_token], row.kv_seq_len)?;
-        let logits_ptr = model.workspace_logits_ptr(ws)?;
-        let bake = Qwen35GraphBake {
-            token_ids_ptr,
-            start_pos_ptr,
-            logits_ptr,
-            ws_epoch: ws.epoch(),
-        };
-        match baked[slot_idx] {
-            Some(prev) if prev != bake => {
-                // Workspace addresses drifted since capture (release → re-alloc).
-                // Drop and re-capture against new addresses.
-                info!(
-                    "[qwen35-decode-graph] slot {slot_idx}: workspace addresses changed; \
-                     dropping stale capture and recapturing"
-                );
-                graphs[slot_idx] = crate::graph::CudaGraphState::new(model.ctx.stream.clone());
-                baked[slot_idx] = Some(bake);
-            }
-            None => baked[slot_idx] = Some(bake),
-            _ => {}
-        }
-
-        let state = &mut graphs[slot_idx];
+        let slot = row.slot;
+        Self::stage_graph_step(model, dg, slot, row.last_token, row.kv_seq_len, "")?;
+        let Qwen35DecodeGraph { ws, graphs, .. } = dg;
+        let state = &mut graphs[slot];
         let was_captured = state.is_captured();
         let will_replay = was_captured && !state.is_armed_warm();
-        let slot_state = &mut slots[slot_idx];
+        let slot_state = &mut slots[slot];
         let run = state
             .run_or_capture(|| model.forward_decode_step_captured(slot_state, ws, row.kv_seq_len));
         if let Err(e) = run {
             // Any capture/replay failure downgrades to eager permanently — never fatal.
             // Mid-capture error only recorded kernels, so device state untouched.
             warn!(
-                "Qwen3.5 whole-step decode graph failed (slot {slot_idx}), \
+                "Qwen3.5 whole-step decode graph failed (slot {slot}), \
                  downgrading to eager forward: {e}"
             );
             self.decode_graph_armed = false;
             self.decode_graph = None;
             return Ok(None);
         }
-        // Host-side state advance happens here — captured closure is host-state-free.
-        slots[slot_idx].advance_seq_len(1);
-
-        // Reuse-evidence probes (license needs replay counts, not capture-exists).
-        let state = &self.decode_graph.as_ref().expect("still present").graphs[slot_idx];
-        if !was_captured && state.is_captured() {
-            let captures =
-                QWEN35_GRAPH_CAPTURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            let keys = self
-                .decode_graph
-                .as_ref()
-                .expect("still present")
-                .graphs
-                .iter()
-                .filter(|g| g.is_captured())
-                .count();
-            info!(
-                "[qwen35-decode-graph] captured slot {slot_idx} \
-                 (captures_total={captures}, live_keys={keys}, max_keys={})",
-                self.num_slots
-            );
-        }
-        if will_replay {
-            let replays =
-                QWEN35_GRAPH_REPLAYS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            if replays.is_multiple_of(100) {
-                info!(
-                    "[qwen35-decode-graph] replay_total={replays} captures_total={}",
-                    QWEN35_GRAPH_CAPTURES.load(std::sync::atomic::Ordering::Relaxed)
-                );
-            }
-        }
-
-        // Sampling stays OUTSIDE the graph (argmax + D2H + sync), reading the
-        // logits the replay (or warm run) just wrote.
-        let dg = self.decode_graph.as_mut().expect("still present");
-        let token = self
-            .model
-            .sample_workspace_logits(&mut dg.ws, &row.params, position)?;
-        Ok(Some(token))
+        self.finish_graph_step(slot, was_captured, will_replay, "", row, position)
+            .map(Some)
     }
 
     /// Whole-step decode graph over the PAGED pool (the serving default): the
@@ -2706,28 +2716,8 @@ impl Qwen35CudaExecutor {
         let dg = decode_graph
             .as_mut()
             .expect("decode_graph built above when armed");
-        let Qwen35DecodeGraph { ws, graphs, baked } = dg;
-        let (token_ids_ptr, start_pos_ptr) =
-            model.stage_step_inputs(ws, &[row.last_token], row.kv_seq_len)?;
-        let logits_ptr = model.workspace_logits_ptr(ws)?;
-        let bake = Qwen35GraphBake {
-            token_ids_ptr,
-            start_pos_ptr,
-            logits_ptr,
-            ws_epoch: ws.epoch(),
-        };
-        match baked[slot] {
-            Some(prev) if prev != bake => {
-                info!(
-                    "[qwen35-decode-graph] paged slot {slot}: workspace addresses changed; \
-                     dropping stale capture and recapturing"
-                );
-                graphs[slot] = crate::graph::CudaGraphState::new(model.ctx.stream.clone());
-                baked[slot] = Some(bake);
-            }
-            None => baked[slot] = Some(bake),
-            _ => {}
-        }
+        Self::stage_graph_step(model, dg, slot, row.last_token, row.kv_seq_len, "paged ")?;
+        let Qwen35DecodeGraph { ws, graphs, .. } = dg;
         let state = &mut graphs[slot];
         let was_captured = state.is_captured();
         let will_replay = was_captured && !state.is_armed_warm();
@@ -2754,28 +2744,8 @@ impl Qwen35CudaExecutor {
             self.paged_decode_meta.clear();
             return Ok(None);
         }
-        slots[slot].advance_seq_len(1);
-        let state = &self.decode_graph.as_ref().expect("still present").graphs[slot];
-        if !was_captured && state.is_captured() {
-            let captures =
-                QWEN35_GRAPH_CAPTURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            info!("[qwen35-decode-graph] captured PAGED slot {slot} (captures_total={captures})");
-        }
-        if will_replay {
-            let replays =
-                QWEN35_GRAPH_REPLAYS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            if replays.is_multiple_of(100) {
-                info!(
-                    "[qwen35-decode-graph] paged replay_total={replays} captures_total={}",
-                    QWEN35_GRAPH_CAPTURES.load(std::sync::atomic::Ordering::Relaxed)
-                );
-            }
-        }
-        let dg = self.decode_graph.as_mut().expect("still present");
-        let token = self
-            .model
-            .sample_workspace_logits(&mut dg.ws, &row.params, position)?;
-        Ok(Some(token))
+        self.finish_graph_step(slot, was_captured, will_replay, "paged ", row, position)
+            .map(Some)
     }
 
     /// Offload the model's device weights to host RAM (OPD teacher time-share),
