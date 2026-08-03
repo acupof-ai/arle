@@ -204,7 +204,10 @@ async def send_streaming(
                         finish_reason = str(reason)
                     text = choice.get("text")
                     if text is None:
-                        text = (choice.get("delta") or {}).get("content")
+                        delta = choice.get("delta") or {}
+                        # Thinking models stream via reasoning_content; both
+                        # channels are decode steps for ITL purposes.
+                        text = delta.get("content") or delta.get("reasoning_content")
                     if not text:
                         continue
                     now = time.perf_counter()
