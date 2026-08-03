@@ -90,6 +90,20 @@ fn merge_tier_io_stats(
 /// num_slots keys; B=1/R=8/seq=1 are shape constants and kv enters via the
 /// staged device scalar, so there is exactly ONE graph per slot), replays ≈
 /// decoded tokens.
+/// Sub-phase micros inside the paged decode-graph lane, under `ARLE_STEP_PHASE`.
+/// `Engine::step` measures `submit` as one block because the CUDA submit is
+/// synchronous; this splits it into the host prologue, the GPU replay, and the
+/// sampling tail.
+static DECODE_PHASE_MICROS: [std::sync::atomic::AtomicU64; 5] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+static DECODE_PHASE_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+const DECODE_PHASE_NAMES: [&str; 5] = ["mirror", "meta", "stage", "gpu", "sample"];
+
 static QWEN35_GRAPH_CAPTURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static QWEN35_GRAPH_REPLAYS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -2680,9 +2694,24 @@ impl Qwen35CudaExecutor {
                 slot
             );
         }
+        static DPHASE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let mut dmark = DPHASE
+            .get_or_init(|| std::env::var_os("ARLE_STEP_PHASE").is_some())
+            .then(std::time::Instant::now);
+        let mut dbuf = [0u64; 5];
+        macro_rules! dphase {
+            ($i:expr) => {
+                if let Some(t) = dmark.as_mut() {
+                    let now = std::time::Instant::now();
+                    dbuf[$i] += now.duration_since(*t).as_micros() as u64;
+                    *t = now;
+                }
+            };
+        }
         // Host-side pool advance (page alloc + mirror) — identical to the eager
         // paged path, idempotent if the eager fallback re-runs it.
         self.mirror_host_slot(host_kv, slot, row.kv_seq_len + 1)?;
+        dphase!(0);
         if self.decode_graph.is_none() {
             self.decode_graph = Some(Qwen35DecodeGraph::new(
                 self.num_slots,
@@ -2705,6 +2734,7 @@ impl Qwen35CudaExecutor {
             };
             meta.refresh_decode(&self.model.ctx, pool, slot, row.kv_seq_len)?;
         }
+        dphase!(1);
         let Self {
             model,
             slots,
@@ -2717,6 +2747,7 @@ impl Qwen35CudaExecutor {
             .as_mut()
             .expect("decode_graph built above when armed");
         Self::stage_graph_step(model, dg, slot, row.last_token, row.kv_seq_len, "paged ")?;
+        dphase!(2);
         let Qwen35DecodeGraph { ws, graphs, .. } = dg;
         let state = &mut graphs[slot];
         let was_captured = state.is_captured();
@@ -2734,6 +2765,13 @@ impl Qwen35CudaExecutor {
         let run = state.run_or_capture(|| {
             model.forward_decode_step_paged_captured(slot_state, ws, row.kv_seq_len, &mut rc)
         });
+        // The replay is async, so without this the GPU wall lands in the
+        // sampling phase (which syncs on the argmax D2H) and the two cannot be
+        // told apart. Diagnostic-only: costs a full sync per step.
+        if dmark.is_some() {
+            model.ctx.sync()?;
+        }
+        dphase!(3);
         if let Err(e) = run {
             warn!(
                 "Qwen3.5 paged whole-step decode graph failed (slot {slot}), \
@@ -2744,8 +2782,26 @@ impl Qwen35CudaExecutor {
             self.paged_decode_meta.clear();
             return Ok(None);
         }
-        self.finish_graph_step(slot, was_captured, will_replay, "paged ", row, position)
-            .map(Some)
+        let out = self.finish_graph_step(slot, was_captured, will_replay, "paged ", row, position);
+        dphase!(4);
+        if dmark.is_some() {
+            for (acc, v) in DECODE_PHASE_MICROS.iter().zip(dbuf) {
+                acc.fetch_add(v, std::sync::atomic::Ordering::Relaxed);
+            }
+            let n = DECODE_PHASE_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if n.is_multiple_of(500) {
+                let parts: Vec<String> = DECODE_PHASE_NAMES
+                    .iter()
+                    .zip(DECODE_PHASE_MICROS.iter())
+                    .map(|(name, acc)| {
+                        let us = acc.load(std::sync::atomic::Ordering::Relaxed);
+                        format!("{name}={:.3}ms", us as f64 / 1000.0 / n as f64)
+                    })
+                    .collect();
+                info!("[decode-phase] steps={n} {}", parts.join(" "));
+            }
+        }
+        out.map(Some)
     }
 
     /// Offload the model's device weights to host RAM (OPD teacher time-share),

@@ -735,6 +735,10 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         // Buffered, then committed only for decode-only steps: one 32K prefill
         // costs ~25 s and would swamp a 19 ms decode step in a flat average.
         let mut phase_buf = [0u64; 6];
+        // The plan apply_output PROCESSES is the previous step's; gating only on
+        // the plan being SUBMITTED books a post-prefill radix seal (~1 s over a
+        // 33K prompt) into the decode bucket.
+        let mut applied_decode_only = true;
         macro_rules! phase {
             ($i:expr) => {
                 if let Some(t) = mark.as_mut() {
@@ -754,6 +758,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                         );
                     }
                     let plan = self.pending_plan.take().unwrap_or_else(ForwardPlan::idle);
+                    applied_decode_only = plan.prefill_rows.is_empty();
                     phase!(0);
                     self.apply_output(&plan, output)?;
                     phase!(1);
@@ -824,7 +829,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         self.inflight = Some(self.executor.submit(&plan, &mut self.kv)?);
         self.inflight_submit_at = Some(submit_at);
         phase!(5);
-        let decode_only = plan.prefill_rows.is_empty();
+        let decode_only = plan.prefill_rows.is_empty() && applied_decode_only;
         self.pending_plan = Some(plan);
         if mark.is_some() && decode_only {
             for (acc, v) in STEP_PHASE_MICROS.iter().zip(phase_buf) {
