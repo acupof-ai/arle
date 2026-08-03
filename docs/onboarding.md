@@ -146,7 +146,6 @@ Canonical bench 流程：[`bench-and-trace-spec.md`](bench-and-trace-spec.md) + 
 | 目录 | 数量级 | 说明 |
 | --- | --- | --- |
 | `docs/experience/wins/` | ~390+ | 历史 bench 记录；按日期/标签检索，不要通读 |
-| `docs/index.md` 顶部 session 快照 | — | 维护者 session 状态，会过时 |
 
 需要历史 context 时，从 canonical doc 里的链接跳转，而非从 wins 目录随机读。
 

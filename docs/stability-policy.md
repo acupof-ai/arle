@@ -4,7 +4,7 @@ This document is the single source of truth for `ARLE` stability levels,
 compatibility-sensitive surfaces, breaking-change rules, and the deprecation
 process.
 
-The rule is simple: if users can reasonably build around a documented surface,
+If users can reasonably build around a documented surface,
 maintainers must treat it carefully. Users and contributors should know what
 they can depend on, and maintainers should know what must be reviewed
 carefully.

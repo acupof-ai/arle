@@ -1,7 +1,7 @@
 # ARLE Quantization Reference
 
 Canonical map of every quantization path the runtime ships, the code that
-implements it, and what the verification status actually is. Updated on
+implements it, and what the verification status is. Updated on
 real findings from the 2026-05-26/27 KV chain. Replaces the per-row
 "Beta, benchmarked" claims in [`support-matrix.md`](support-matrix.md) §4
 with concrete evidence.
@@ -205,7 +205,7 @@ Default behavior unchanged when env unset.
 
 Default GGUF Q4_K_M on Metal goes through the exact GGUF affine/packed
 kernel. Opt-in lossy conversion to MLX-native q4 group64 via
-`AGENT_INFER_METAL_GGUF_NATIVE_Q4=all`. Faster, lossy, off by default.
+`AGENT_INFER_METAL_GGUF_NATIVE_Q4=all`. Faster.
 
 ---
 
@@ -251,7 +251,7 @@ Source: the `--kv-cache-dtype` CLI parser in `crates/cli`, carried through
 
 ---
 
-## 4. Test harness — what each one actually proves
+## 4. Test harness — what each one proves
 
 | Test | What it runs | What it proves | What it does NOT prove |
 |---|---|---|---|
