@@ -47,17 +47,31 @@ PRE_CLEAN               accept_rate=0.15574302401038287
 POST_CLEAN              accept_rate=0.15574302401038287   (after 61 steps)
 ```
 
-Identical to 17 significant figures across 61 optimizer steps. A live head whose
-`w2` grew from zero changes the draft logits, hence the drafted tokens, hence
-the accepted counts. Bit-identical counters mean the trained head **never
-reached the drafter**. The head file is written every 8 steps
-(`saved markov head at step 8/16/24…`), but no hot-swap into the engine is
-observable in the log.
+Identical to 17 significant figures across 61 optimizer steps. Each eval pass
+contributed byte-identical counts (`+1541` chains / `+23115` drafted / `+3600`
+accepted; `23115 = 1541 × 15`, the fixed DFlash draft width at block 16), so the
+passes are deterministic replays and the head changed nothing.
 
-So the experiment has one real finding, and it is not about the loss: **the
-train→serve publish path is not taking effect.** Open — it needs a direct probe
-(`update_dspark_markov_weights` reached? bias non-zero on the device?), not
-another training run.
+**It is not the publish channel** (2026-08-04). The run's log shows 7 successful
+publishes at steps 8…56 under `world_size=1`; the single `weight update failed`
+is the step-62 off-cadence publish after engine shutdown. The path
+`publish → update_dspark_markov_weights → run_on_engine → update_markov_weights`
+also invalidates the decode graph and the prefix cache at
+`executor/qwen35.rs:3647`.
+
+The head was delivered and was too small to matter. `w2` starts at 0 and AdamW
+moves each element ~lr per step, so after 61 steps at `lr = 1e-4`
+`|w2| ≤ 6.1e-3` and `bias = Σ_{r<256} w1[c][r]·w2[v][r]` lands near 1e-3 — while
+the serve adds it into a **bf16** buffer (`dspark.rs:1517`) whose half-ulp at
+|logit| 8–16 is 0.016–0.031. Two orders under the rounding floor: `base + bias`
+returns `base` bit-for-bit. Compounding it, the cold-start `w1` was
+`0.02·sin(0.1·(i mod 1000))`, which aliases with period `gcd(1000, rank)` — 125
+distinct rows for a 248320 vocab, all inside a ~4-dim subspace, and since
+`∂bias/∂w2 = w1[c]` that is the whole head's ceiling, not just the init's.
+
+Fixed in the 2026-08-04 tranche (hashed `w1` init, `lr` default 1e-3, a permanent
+`rms|w1| rms|w2| est|bias|` line at publish). Whether a rank-256 additive bias on
+frozen draft logits can move greedy acceptance **at all** is still unmeasured.
 
 ## What still stands
 
@@ -78,5 +92,9 @@ smoothing time constant (`α=0.01` ⇒ ~100 steps) and fit the constant-mean mod
 first — if that fits, there is no trend to report. Prefer the raw per-step
 value, or a metric with an independent scale, for any claim about direction.
 
-**Bit-identical counters across an intervention mean the intervention did not
-land.** Read them as a wiring check before reading them as a result.
+**Bit-identical output does not mean the intervention never arrived — it can
+mean the intervention was smaller than the arithmetic that carries it.** Before
+tracing plumbing, price the effect against the precision it has to survive: a
+correction under half an ulp of the value it is added to is discarded exactly,
+and the symptom is indistinguishable from a dead wire. Here the ~1e-3 bias met a
+0.03 bf16 floor, and seven confirmed publishes were mistaken for zero.

@@ -763,11 +763,11 @@ pub(crate) struct ServeArgs {
     #[arg(long, value_name = "FILE")]
     pub(crate) dspark_train_out: Option<PathBuf>,
 
-    /// DSpark train sidecar learning rate. The default suits adapting a
-    /// pretrained head; a head grown from `w2 = 0` needs orders more, since the
-    /// logit bias must reach the top-2 gap (O(1)) to change any decision and
-    /// AdamW moves it ~lr per step. Aggressive values risk only acceptance —
-    /// the trunk verifies every token, so correctness cannot regress.
+    /// DSpark train sidecar learning rate. The default is sized for a head grown
+    /// from `w2 = 0`: AdamW moves the bias ~lr per step and the serve adds it in
+    /// bf16, so anything below half an ulp of the base logit (~0.03) is discarded
+    /// outright. Aggressive values risk only acceptance — the trunk verifies
+    /// every token, so correctness cannot regress.
     #[arg(long, value_name = "LR")]
     pub(crate) dspark_train_lr: Option<f32>,
 
