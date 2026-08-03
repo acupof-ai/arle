@@ -2957,6 +2957,102 @@ fn validate_online_rollout_temperature(
 /// hidden tests are run on `git diff`), no text judge is loaded; passing
 /// trajectories are written back as CE targets via the same path as rubric-OPD.
 #[cfg(feature = "cuda")]
+/// Directional finite difference on one param, stepping along its own analytic
+/// gradient so ΔL = 2ε‖g‖ — a single-scalar probe drowns in bf16 loss noise.
+/// `fd/‖g‖` near 1 means that arm's gradient is right; a global norm can only say
+/// cp=1 and cp=2 disagree, not which one is wrong (#85).
+#[allow(clippy::too_many_arguments)]
+fn synthetic_writeback_fd_probe<O: autograd::Optimizer>(
+    target: &str,
+    student: &train::qwen35::Qwen35Model,
+    all_params: &[autograd::TensorId],
+    trainable: &[autograd::TensorId],
+    optimizer: &mut O,
+    prompt_ids: &[u32],
+    response_ids: &[u32],
+    response_mask: &[u8],
+    vocab: usize,
+    window_size: usize,
+    cp: train::context_parallel::CpContext,
+    dp: train::context_parallel::DpContext,
+    store: &mut autograd::TensorStore,
+) -> Result<()> {
+    use train::opd::{WritebackLoss, masked_writeback_step};
+
+    let param = student
+        .param_name_map()
+        .into_iter()
+        .chain(student.adapter_name_map())
+        .find(|(name, _)| *name == target)
+        .map(|(_, id)| id)
+        .with_context(|| format!("ARLE_OPD_FD_PARAM: no param named {target}"))?;
+    let grad = store
+        .get(param)
+        .and_then(|tensor| tensor.grad)
+        .with_context(|| format!("{target} has no gradient"))?;
+    let direction = store.to_host(grad)?;
+    let norm = direction
+        .iter()
+        .map(|&v| f64::from(v) * f64::from(v))
+        .sum::<f64>()
+        .sqrt();
+    if norm == 0.0 {
+        anyhow::bail!("{target} gradient is exactly zero — pick a param with signal");
+    }
+    let base = store.to_host(param)?;
+    let shape = store
+        .get(param)
+        .with_context(|| format!("{target} is not in the store"))?
+        .shape
+        .clone();
+    let eps: f32 = std::env::var("ARLE_OPD_FD_EPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1e-2);
+
+    let mut probes = [0.0f32; 2];
+    for (probe, sign) in probes.iter_mut().zip([1.0f32, -1.0]) {
+        let step = sign * eps / norm as f32;
+        let perturbed: Vec<f32> = base
+            .iter()
+            .zip(&direction)
+            .map(|(&w, &g)| w + step * g)
+            .collect();
+        let handle = store.backend().upload(&perturbed, &shape)?;
+        store.replace_device_handle(param, handle)?;
+        *probe = masked_writeback_step(
+            WritebackLoss::Ce,
+            student,
+            all_params,
+            trainable,
+            optimizer,
+            false,
+            prompt_ids,
+            response_ids,
+            response_mask,
+            vocab,
+            window_size,
+            cp,
+            dp,
+            store,
+        )?
+        .0;
+        optimizer.zero_grad(store, all_params);
+    }
+    let handle = store.backend().upload(&base, &shape)?;
+    store.replace_device_handle(param, handle)?;
+
+    let fd = f64::from(probes[0] - probes[1]) / (2.0 * f64::from(eps));
+    eprintln!(
+        "[param-fd] {target} analytic={norm:.6e} fd={fd:.6e} ratio={:.4} eps={eps:.1e} \
+         loss_plus={:.6} loss_minus={:.6}",
+        fd / norm,
+        probes[0],
+        probes[1]
+    );
+    Ok(())
+}
+
 fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
     use std::sync::{Arc, Mutex};
 
@@ -2965,7 +3061,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
     use train::{
         infer_student::InferStudent,
         lora::LoraConfig,
-        opd::masked_writeback_ce_step_dispatch,
+        opd::{WritebackLoss, masked_writeback_ce_step_dispatch, masked_writeback_step},
         qwen35_checkpoint::load_qwen35_lora_adapters,
         qwen35_loader::{SharedFrozenBaseEntry, load_qwen35_lora_from_hf_dir_with_shared_base},
         swe_dataset::SweTask,
@@ -3381,21 +3477,61 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
         }
         log_opd_vram("synthetic-writeback pre-writeback", &train_backend);
         let started = std::time::Instant::now();
-        let loss = masked_writeback_ce_step_dispatch(
-            &student,
-            all_params.as_slice(),
-            trainable.as_slice(),
-            &mut optimizer,
-            &prompt_ids,
-            &response_ids,
-            &response_mask,
-            vocab,
-            args.writeback_window,
-            train::context_parallel::CpContext::from_env(),
-            train::context_parallel::DpContext::from_env(),
-            &mut store,
-        )?;
+        let cp = train::context_parallel::CpContext::from_env();
+        let dp = train::context_parallel::DpContext::from_env();
+        let fd_target = std::env::var("ARLE_OPD_FD_PARAM").ok();
+        let loss = if fd_target.is_some() {
+            masked_writeback_step(
+                WritebackLoss::Ce,
+                &student,
+                all_params.as_slice(),
+                trainable.as_slice(),
+                &mut optimizer,
+                false,
+                &prompt_ids,
+                &response_ids,
+                &response_mask,
+                vocab,
+                args.writeback_window,
+                cp,
+                dp,
+                &mut store,
+            )?
+            .0
+        } else {
+            masked_writeback_ce_step_dispatch(
+                &student,
+                all_params.as_slice(),
+                trainable.as_slice(),
+                &mut optimizer,
+                &prompt_ids,
+                &response_ids,
+                &response_mask,
+                vocab,
+                args.writeback_window,
+                cp,
+                dp,
+                &mut store,
+            )?
+        };
         log_opd_vram("synthetic-writeback post-writeback", &train_backend);
+        if let Some(target) = fd_target {
+            synthetic_writeback_fd_probe(
+                &target,
+                &student,
+                all_params.as_slice(),
+                trainable.as_slice(),
+                &mut optimizer,
+                &prompt_ids,
+                &response_ids,
+                &response_mask,
+                vocab,
+                args.writeback_window,
+                cp,
+                dp,
+                &mut store,
+            )?;
+        }
         eprintln!(
             "[synthetic-writeback] DONE loss={loss:.6} elapsed={:?}",
             started.elapsed()
