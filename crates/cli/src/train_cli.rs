@@ -4712,14 +4712,23 @@ fn build_opd_store(
                     let world_rank = train::context_parallel::world_rank(cp, dp);
                     let seq_group =
                         (cp.is_enabled() && dp.is_enabled()).then_some((dp.rank, cp.size, cp.rank));
-                    autograd::backend_cuda::CudaBackend::new_with_mesh(
+                    let backend = autograd::backend_cuda::CudaBackend::new_with_mesh(
                         ordinal,
                         uid,
                         cp.size * dp.size,
                         world_rank,
                         seq_group,
                     )
-                    .context("init CUDA+NCCL backend for the CP×DP mesh")?
+                    .context("init CUDA+NCCL backend for the CP×DP mesh")?;
+                    if !backend.has_collective() {
+                        bail!(
+                            "multi-rank mesh (cp={}×dp={}) got a CUDA backend without an NCCL \
+                             communicator; refusing the silent host-transport fallback",
+                            cp.size,
+                            dp.size
+                        );
+                    }
+                    backend
                 }
                 #[cfg(not(feature = "nccl"))]
                 {
