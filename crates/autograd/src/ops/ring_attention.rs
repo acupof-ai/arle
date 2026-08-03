@@ -216,6 +216,62 @@ pub fn ring_backward_tile(
     (grad_q, per_block)
 }
 
+// --- FA3 pair decomposition ---
+//
+// The FA3 route splits a (q_pos, k_pos) block into rectangular FA3 calls: each
+// position map is 1 (contiguous) or 2 (zigzag) maximal contiguous runs, and
+// with equal-length chunk-aligned shards every (q_run, k_run) pair is either
+// strictly past (FULL), the identical diagonal (CAUSAL), or strictly future
+// (skip). Anything else is a loud error — never a silent mis-attend.
+
+/// One maximal contiguous ascending run in a position map: local rows
+/// `[row, row+len)` hold absolute positions `[abs, abs+len)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PosRun {
+    pub row: usize,
+    pub len: usize,
+    pub abs: usize,
+}
+
+/// Split a position map into its maximal contiguous (+1-step) runs.
+pub fn contiguous_pos_runs(pos: &[usize]) -> Vec<PosRun> {
+    let mut runs: Vec<PosRun> = Vec::new();
+    for (row, &abs) in pos.iter().enumerate() {
+        match runs.last_mut() {
+            Some(run) if abs == run.abs + run.len => run.len += 1,
+            _ => runs.push(PosRun { row, len: 1, abs }),
+        }
+    }
+    runs
+}
+
+/// How one (q_run, k_run) pair attends under the absolute causal mask.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PairClass {
+    /// Every key precedes every query row: full attention.
+    Full,
+    /// Identical range: the causal diagonal.
+    Causal,
+    /// Every key is strictly future: no contribution.
+    Skip,
+}
+
+/// Classify a (q_run, k_run) pair, erroring on any partial overlap — with
+/// equal-length chunk-aligned zigzag shards it cannot happen.
+pub fn classify_pair(q: PosRun, k: PosRun) -> Result<PairClass> {
+    if k.abs + k.len <= q.abs {
+        Ok(PairClass::Full)
+    } else if k.abs == q.abs && k.len == q.len {
+        Ok(PairClass::Causal)
+    } else if k.abs > q.abs + q.len - 1 {
+        Ok(PairClass::Skip)
+    } else {
+        Err(AutogradError::TapeInvariant(
+            "ring FA3: q/k runs partially overlap — shard is not chunk-aligned",
+        ))
+    }
+}
+
 // --- Differentiable tape op ---
 //
 // `cp_causal_sdpa` folds q/k/v `[B,H,S,D]` into per-(batch·head) tiles and runs
@@ -388,7 +444,8 @@ fn cp_causal_sdpa_device_ring(
     let mut step_blocks: smallvec::SmallVec<[(TensorId, TensorId, Vec<usize>); 4]> = smallvec![];
     for j in 0..cp_size {
         let (m2, l2, o2) = store.backend().ring_block_fwd_merge(
-            &q_h, &k_cur, &v_cur, &acc_m, &acc_l, &acc_o, &q_pos_h, &kpos_cur, dims,
+            &q_h, &k_cur, &v_cur, &acc_m, &acc_l, &acc_o, &q_pos_h, &kpos_cur, &q_pos, &kpos_vec,
+            dims,
         )?;
         acc_m = m2;
         acc_l = l2;
@@ -629,7 +686,8 @@ fn cp_ring_attention_backward_device(
             sm_scale: scale,
         };
         let (gq2, gk_b, gv_b) = store.backend().ring_block_bwd(
-            &q_h, &k_h, &v_h, &out_h, &lse_h, &dout_h, &grad_q, &q_pos_h, &k_pos_h, dims,
+            &q_h, &k_h, &v_h, &out_h, &lse_h, &dout_h, &grad_q, &q_pos_h, &k_pos_h, q_pos, k_pos,
+            dims,
         )?;
         grad_q = gq2;
         step_gk.push(gk_b);
@@ -892,6 +950,64 @@ mod tests {
         // grad_q is finite and shaped (sanity; full grad parity is the even-block gate).
         assert_eq!(gq.len(), rows * dim);
         assert!(gq.iter().all(|g| g.is_finite()));
+    }
+
+    // FA3 pair decomposition gate: zigzag (two-run) shards must classify every
+    // pair as full / causal / skip, and any partial overlap must error loudly —
+    // the branch logic the CUDA route dispatches on, verifiable on host.
+    #[test]
+    fn fa3_pair_decomposition_classifies_zigzag_and_rejects_overlap() {
+        // Zigzag rank-0 shard of world=2, chunk=4: q rows [0..4) ∪ [12..16);
+        // ringed block from rank 1: [4..8) ∪ [8..12) (contiguous → one run).
+        let q_pos: Vec<usize> = (0..4).chain(12..16).collect();
+        let q_runs = contiguous_pos_runs(&q_pos);
+        assert_eq!(
+            q_runs,
+            vec![
+                PosRun {
+                    row: 0,
+                    len: 4,
+                    abs: 0
+                },
+                PosRun {
+                    row: 4,
+                    len: 4,
+                    abs: 12
+                }
+            ]
+        );
+        let k_pos: Vec<usize> = (4..12).collect();
+        let k_runs = contiguous_pos_runs(&k_pos);
+        assert_eq!(k_runs.len(), 1);
+        // q run [0..4) vs k [4..12): strictly future → skip.
+        assert_eq!(
+            classify_pair(q_runs[0], k_runs[0]).unwrap(),
+            PairClass::Skip
+        );
+        // q run [12..16) vs k [4..12): strictly past → full.
+        assert_eq!(
+            classify_pair(q_runs[1], k_runs[0]).unwrap(),
+            PairClass::Full
+        );
+        // Identical range → causal diagonal.
+        assert_eq!(
+            classify_pair(q_runs[0], q_runs[0]).unwrap(),
+            PairClass::Causal
+        );
+        // Partial overlap (k [2..6) vs q [0..4)) → loud error, never mis-attend.
+        let overlap = PosRun {
+            row: 0,
+            len: 4,
+            abs: 2,
+        };
+        assert!(classify_pair(q_runs[0], overlap).is_err());
+        // Equal-start unequal-length diagonal is also an overlap error.
+        let ragged = PosRun {
+            row: 0,
+            len: 3,
+            abs: 0,
+        };
+        assert!(classify_pair(q_runs[0], ragged).is_err());
     }
 
     // The tape op governs real gradients: at world==1 cp_causal_sdpa is plain
