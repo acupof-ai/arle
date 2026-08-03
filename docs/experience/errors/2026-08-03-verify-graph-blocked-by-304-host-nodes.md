@@ -56,6 +56,36 @@ decode lane and not just the verify lane. It cost nothing here — under DSpark
 the `rows == 1` lane never runs, and both arms show 0 decode captures — but a
 per-lane failure must disable only its own lane.
 
+## The census
+
+One diagnostic build answered where the 304 live. Only variable: `capture:
+None` on the verify rows, disabling the linear-attn snapshot.
+
+| build | host memcpy nodes | total nodes |
+|---|---:|---:|
+| tranche as committed | 304 | 1817 |
+| snapshot disabled | 256 | 1721 |
+
+Qwen3.6-27B is **64 layers — 48 `linear_attention` + 16 `full_attention`**
+(`full_attention_interval: 4`), which makes both terms exact:
+
+- **48 nodes = the linear-attn snapshot**, one H2D per linear layer
+  (`batched_copy`'s pointer table). This is the part a per-layer cache slot
+  would remove.
+- **256 nodes = 64 × 4 — four H2D per layer, in every layer.** Not the
+  snapshot, not MoE-only, not attention-only: the common layer body at
+  multi-row shape.
+
+That second term is the verdict. The host coupling is not one localized
+helper to fix; it is a per-layer pattern spanning all 64 layers, so
+unblocking the verify graph means de-host-coupling the multi-row layer body
+itself. Against ~1.8 ms of launch overhead on a ~36.5 ms block step (~5% of
+DSpark throughput), that is not the next thing to do.
+
+Worth noting the same work would also make the rows>1 batched-decode path
+capturable, which is where its value actually sits — the payoff should be
+argued on that axis, not on DSpark's 5%.
+
 ## Rule
 
 **"No host coupling" is a property of a code path at a shape, not of a
@@ -66,5 +96,9 @@ truth — one rejected capture told me more than the code reading that preceded
 it.
 
 Corollary for #198: the work is not "reuse T4's machinery". It is "make the
-multi-row body device-derived", and the first deliverable is a per-node
-breakdown of the 304, not an implementation.
+multi-row layer body device-derived" — 256 of the 304 nodes are four H2D per
+layer across all 64 layers.
+
+The census cost one build and one request, and it converted "unknown scope"
+into "four per layer, everywhere". **Run the census before writing the
+implementation, not after it fails.**
