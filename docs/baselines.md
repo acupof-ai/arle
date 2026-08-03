@@ -84,11 +84,8 @@ DSpark over no-spec at matched c: 2.9× (c=1), 2.5× (c=2), 2.0× (c=4), 1.4× (
 
 ### Step budget — where the time goes (2026-08-01, `nsys`, dense FP8)
 
-> **Superseded for decode by the W8A16 anchor below (2026-08-03).** Two of
-> this section's conclusions were overturned there: the decode graph is no
-> longer unreachable (it is default-on and worth −7.9%), and "widening the
-> grid is not the lever" for `gated_delta_rule_decode` is false at c=1 decode,
-> where there is no token axis left to shorten. The prefill half stands.
+> Decode half superseded 2026-08-03 (decode graph is default-on; the GDN
+> kernel's grid and state traffic both moved). Prefill half current.
 
 The champion tables say how fast; this says what to fix. Both captures are
 GPU-idle, ThinkingCap-Qwen3.6-27B-FP8, one H20.
@@ -128,7 +125,7 @@ each). No free parallel axis is left — the block is already 512 threads
 (`val_dim 128 × j_slice 4`) and the token axis is the recurrence. Its
 `<<<48, ...>>>` grid starves a **78-SM** GPU only at c=1; varlen launches
 `grid(num_value_heads, batch)`. Shortening the chain (chunked matmul form) is
-the lever; widening the grid is not.
+the prefill lever.
 
 Verify decomposes as **22 ms intercept + 2.48 ms/row** (5.18 ms/row at 33K), and
 the intercept equals one plain non-spec step: verifying 8 speculative tokens
@@ -169,52 +166,27 @@ and need a re-anchor sweep.**
 
 ---
 
-## Qwen3.6-27B-W8A16 (Marlin) · 1×H20 · single-GPU — MATCHED-vs-SGLANG ANCHOR
-
-New anchor (rule 3): different checkpoint, dataset and metric from the
-long-agent rows above — not comparable to them. Its purpose is one question:
-against SGLang running the **same gptq_marlin kernel over the same int8
-weights**, how much of the gap is our runtime?
+## Qwen3.6-27B-W8A16 (Marlin) · 1×H20 · single-GPU
 
 Model `iso-tc-huihui-w8a16` (Huihui-Qwen3.6-27B abliterated, W8A16 gs=128,
 29 GB), GPU 6, `bench-agent-32k-64.jsonl`, c=1, 16 requests × 256 tokens,
-temperature 0, seed 20260416. Metric is decode ITL p50 (TTFT is prefill and
-not in scope here). SGLang 0.5.13 serves the mechanically repacked GPTQ v1
-twin (`scripts/w8a16_to_gptq.py`) — identical int8 values, identical kernel.
+temperature 0, seed 20260416. Decode ITL p50; TTFT not in scope.
+SGLang 0.5.13 row serves the GPTQ v1 twin repacked by
+`scripts/w8a16_to_gptq.py` — identical int8 values, identical kernel.
 
 ### CHAMPION — `f6820efa9` (2026-08-03)
 
 | arm | ITL p50 | ITL p99 |
 |---|---:|---:|
-| **ARLE, all #196 tranches + engine fix** | **18.98** | 19.52 |
+| ARLE | **18.98** | 19.52 |
 | SGLang, same kernel + same weights | 17.07 | 18.67 |
 
-Ladder, each step a matched same-protocol run:
+Greedy byte-identical to the pre-#196 binary; decode graph verified by
+counted capture/replay events (17 / 4100+ per run). Prior champion 26.88 ms
+(`3ca42b44a`).
 
-| tranche | ITL p50 | cum. |
-|---|---:|---|
-| pre-#196 | 26.88 | — |
-| T1 gate+up fusion | 26.31 | −2.1% |
-| T3 in_proj_ba fusion | 25.08 | −6.7% |
-| T5 small-M GEMV → cuBLASLt | 23.80 | −11.5% |
-| T2 qkv/qkvz fusion | 23.21 | −13.7% |
-| T4 whole-step decode graph | 21.37 | −20.5% |
-| T5b lm_head → cuBLASLt | 20.77 | −22.7% |
-| T6 GDN decode kernel | 20.19 | −24.9% |
-| resident-page O(1) counter | **18.98** | **−29.4%** |
-
-Greedy output byte-identical across every tranche except T5b (accumulation
-order changes; gated by an f32 anchor and MMLU 84/100 instead). Graphed lane
-verified by counted API events (17 captures / 4100+ replays per run), never
-by the ARMED log line.
-
-Remaining 1.9 ms vs SGLang, from the two-sided nsys ledger: FA3 decode
-config ~0.2, marlin per-launch prologue residue, and inter-kernel gap on
-~1100 graph nodes vs their ~980.
-
-[matched A/B method](experience/wins/2026-08-02-w8a16-sglang-matched-ab.md) ·
-[module ledger + T4](experience/wins/2026-08-03-t4-paged-decode-graph.md) ·
-[the host-tail find](experience/wins/2026-08-03-resident-page-scan-per-token.md)
+[method](experience/wins/2026-08-02-w8a16-sglang-matched-ab.md) ·
+[module ledger](experience/wins/2026-08-03-t4-paged-decode-graph.md)
 
 ---
 
