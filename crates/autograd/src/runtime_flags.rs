@@ -118,16 +118,17 @@ pub(crate) fn decode_attn_legacy() -> bool {
 pub(crate) fn tape_precision() -> TapePrecision {
     TapePrecision::from_u8(TAPE_PRECISION.load(Relaxed))
 }
-/// FA3 route for the CP ring per-block kernels (default ON). Env
-/// `ARLE_CP_RING_FA3=0` disables — the same-binary pod A/B lever and escape
-/// hatch; hd256 / sm90 / real-kernel-marker gating still applies at the callsite.
+/// FA3 route for the CP ring per-block kernels. Default OFF until the hd256
+/// CP grad-parity gate is green — measured 2.17x/step, but its first correctness
+/// A/B ran at hd128 where FA3 never engages. `ARLE_CP_RING_FA3=1` opts in;
+/// hd256 / sm90 / real-kernel-marker gating still applies at the callsite.
 #[cfg_attr(any(not(feature = "cuda"), feature = "no-cuda"), allow(dead_code))]
 pub(crate) fn cp_ring_fa3() -> bool {
     static CP_RING_FA3: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CP_RING_FA3.get_or_init(|| {
         std::env::var("ARLE_CP_RING_FA3")
             .ok()
-            .is_none_or(|v| !matches!(v.trim(), "0" | "false" | "off"))
+            .is_some_and(|v| matches!(v.trim(), "1" | "true" | "on"))
     })
 }
 /// `true` when retained activations + emitted grads store bf16 (CUDA-only path).
