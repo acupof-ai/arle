@@ -2979,6 +2979,12 @@ fn synthetic_writeback_fd_probe<O: autograd::Optimizer>(
 ) -> Result<()> {
     use train::opd::{WritebackLoss, masked_writeback_step};
 
+    // The caller ran with step_optimizer=false to keep the weights put, and that is
+    // the same branch that skips the CP/DP reduce (opd.rs) — so without this the
+    // probe would read this rank's un-reduced shard, not the global gradient.
+    if cp.is_enabled() || dp.is_enabled() {
+        train::grad_clip::all_reduce_cp_grads(trainable, store)?;
+    }
     let param = student
         .param_name_map()
         .into_iter()
