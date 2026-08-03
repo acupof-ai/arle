@@ -2656,11 +2656,11 @@ fn main() {
         }
     }
 
-    // FA3 hopper fwd (hdim256/bf16/sm90) — vendored at `vendor/flash-attention/`
-    // (Dao-AILab/flash-attention @ fc8cbad6, cutlass pin 71275920). Explicit
-    // opt-in (ARLE_CUDA_ENABLE_FA3=1): the 5 fwd instantiation units are
-    // nvcc-heavy and build.rs recompiles every .cu on any csrc change, so the
-    // cost is only paid on FA3-target builds.
+    // FA3 hopper fwd + bwd (hdim256/bf16/sm90) — vendored at
+    // `vendor/flash-attention/` (Dao-AILab/flash-attention @ fc8cbad6, cutlass
+    // pin 71275920). Explicit opt-in (ARLE_CUDA_ENABLE_FA3=1): the
+    // instantiation units are nvcc-heavy and build.rs recompiles every .cu on
+    // any csrc change, so the cost is only paid on FA3-target builds.
     println!("cargo:rerun-if-env-changed=ARLE_CUDA_ENABLE_FA3");
     let fa3_root = Path::new("vendor/flash-attention");
     let fa3_stub = Path::new("csrc/attention/arle_fa3_stubs.cu");
@@ -2681,6 +2681,7 @@ fn main() {
             "instantiations/flash_fwd_hdim256_bf16_packgqa_sm90.cu",
             "instantiations/flash_fwd_hdim256_bf16_paged_sm90.cu",
             "instantiations/flash_fwd_hdim256_bf16_paged_split_sm90.cu",
+            "instantiations/flash_bwd_hdim256_bf16_sm90.cu",
             "flash_fwd_combine.cu",
             // Defines prepare_varlen_num_blocks — referenced by the launch
             // template's runtime VARLEN_SWITCH even on the non-varlen path,
@@ -2943,8 +2944,8 @@ fn main() {
         // FA3 hopper units + ARLE shim. Flag set mirrors hopper/setup.py:
         // NDEBUG is upstream-marked "otherwise performance is severely
         // impacted"; EXTENDED_MMA_SHAPES is required for FA3's WGMMA tiles.
-        // DISABLE_{BACKWARD,LOCAL,APPENDKV} prune template combinations ARLE
-        // never dispatches (causal/full only, KV written by ARLE's own prep).
+        // DISABLE_{LOCAL,APPENDKV} prune template combinations ARLE never
+        // dispatches (causal/full only, KV written by ARLE's own prep).
         // The sm_90a gencode is set above (is_sm90a_only).
         if is_sm90a_only && (is_fa3_kernel || stem == "arle_fa3_shim") {
             nvcc_args.extend([
@@ -2956,7 +2957,6 @@ fn main() {
                 "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED".to_string(),
                 "-DCUTLASS_ENABLE_GDC_FOR_SM90".to_string(),
                 "-DCUTLASS_DEBUG_TRACE_LEVEL=0".to_string(),
-                "-DFLASHATTENTION_DISABLE_BACKWARD".to_string(),
                 "-DFLASHATTENTION_DISABLE_LOCAL".to_string(),
                 "-DFLASHATTENTION_DISABLE_APPENDKV".to_string(),
                 "-Xcudafe=--diag_suppress=177".to_string(),
