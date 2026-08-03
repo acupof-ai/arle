@@ -746,6 +746,9 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
     /// bf16 device-side); `acc_*` are f32. Device-only fast path — CPU/world==1
     /// route through the host `ring_forward_tile` in the ops layer, so this
     /// default never runs there; a non-CUDA caller reaching it is a bug.
+    /// `q_pos_host`/`k_pos_host` mirror the device position handles — the FA3
+    /// pair decomposition needs them host-side; the scalar kernel ignores them.
+    #[allow(clippy::too_many_arguments)]
     fn ring_block_fwd_merge(
         &self,
         _q: &DeviceHandle,
@@ -756,6 +759,8 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         _acc_o: &DeviceHandle,
         _q_pos: &DeviceHandle,
         _k_pos: &DeviceHandle,
+        _q_pos_host: &[usize],
+        _k_pos_host: &[usize],
         _dims: RingBlockDims,
     ) -> Result<(DeviceHandle, DeviceHandle, DeviceHandle)> {
         Err(crate::AutogradError::TapeInvariant(
@@ -795,6 +800,8 @@ pub trait Backend: std::fmt::Debug + Send + Sync {
         _grad_q: &DeviceHandle,
         _q_pos: &DeviceHandle,
         _k_pos: &DeviceHandle,
+        _q_pos_host: &[usize],
+        _k_pos_host: &[usize],
         _dims: RingBlockDims,
     ) -> Result<(DeviceHandle, DeviceHandle, DeviceHandle)> {
         Err(crate::AutogradError::TapeInvariant(
