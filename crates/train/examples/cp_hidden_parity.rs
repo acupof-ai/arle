@@ -66,7 +66,9 @@ fn tiny_cfg() -> Qwen35Config {
         tie_word_embeddings: false,
         num_attention_heads: 4,
         num_key_value_heads: 2,
-        head_dim: 128,
+        // head_dim 256: the production 27B full-attn dim and the only dim where
+        // `ring_fa3_route` engages — at 128 this gate only ever saw the scalar ring.
+        head_dim: 256,
         linear_num_key_heads: 2,
         linear_key_head_dim: 2,
         linear_num_value_heads: 2,
@@ -75,7 +77,7 @@ fn tiny_cfg() -> Qwen35Config {
         rope_theta: 10_000.0,
         rope_scaling: None,
         partial_rotary_factor: 1.0,
-        rotary_dim: 128,
+        rotary_dim: 256,
         rope_cache_len_hint: Some(SEQ.next_power_of_two().max(16)),
         layer_types: vec![LayerType::LinearAttention, LayerType::FullAttention],
         num_experts: 0,

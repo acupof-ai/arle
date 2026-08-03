@@ -470,7 +470,7 @@ impl UpdatePreset {
                     RatioGrain::None => unreachable!("CE path handled in update()"),
                 };
 
-                let (loss, traj_stats) = masked_writeback_step(
+                let (loss, traj_stats, _) = masked_writeback_step(
                     WritebackLoss::Pg {
                         rollout_logprobs: behavior_logprobs,
                         weight: &weights,
