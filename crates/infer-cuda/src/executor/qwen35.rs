@@ -2334,6 +2334,15 @@ impl Qwen35CudaExecutor {
             return Ok(None);
         }
         let slot = c.slot;
+        // The eager lane derives `start_pos` from the trunk slot; this one is
+        // handed `c.start`. They must agree or the graph bakes a stale RoPE
+        // offset for the whole chain.
+        ensure!(
+            self.slots[slot].seq_len() == c.start,
+            "Qwen3.6 dspark verify graph: trunk seq_len {} != chain start {} for slot {slot}",
+            self.slots[slot].seq_len(),
+            c.start
+        );
         if self.verify_rows != n {
             self.verify_graph = None;
             self.verify_meta.clear();
