@@ -2981,10 +2981,14 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
         return run_agent_opd_replay(&args, &records_path, lora, target_set);
     }
     let update_preset = args.update_preset();
-    // Per-rank serve port: CP ranks re-exec identical argv, so they'd all bind the
-    // same --serve-port. Offset by CP rank so rank>0 doesn't collide (EADDRINUSE);
-    // single-card (rank 0) keeps the exact requested port.
-    let serve_port = args.serve_port + train::context_parallel::CpContext::from_env().rank as u16;
+    // Per-rank serve port: mesh ranks re-exec identical argv, so they'd all bind
+    // the same --serve-port. Offset by WORLD rank (cp rank alone collides across
+    // dp replicas); single card keeps the exact requested port.
+    let serve_port = {
+        let cp = train::context_parallel::CpContext::from_env();
+        let dp = train::context_parallel::DpContext::from_env();
+        args.serve_port + train::context_parallel::world_rank(cp, dp) as u16
+    };
     validate_online_rollout_temperature(
         update_preset,
         args.update_strategy,
@@ -4705,9 +4709,7 @@ fn build_opd_store(
                         .unwrap_or(0);
                     let uid = infer_api::nccl_unique_id_from_env()
                         .context("CP/DP: read INFER_NCCL_UNIQUE_ID")?;
-                    // CP inner; the layout math lives only here, off the mesh
-                    // contexts — new_with_mesh stays layout-agnostic.
-                    let world_rank = dp.rank * cp.size + cp.rank;
+                    let world_rank = train::context_parallel::world_rank(cp, dp);
                     let seq_group =
                         (cp.is_enabled() && dp.is_enabled()).then_some((dp.rank, cp.size, cp.rank));
                     autograd::backend_cuda::CudaBackend::new_with_mesh(
