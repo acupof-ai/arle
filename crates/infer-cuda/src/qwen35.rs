@@ -1732,6 +1732,15 @@ pub(crate) struct Qwen35CopyScratch {
     lens: SliceSlot<i32>,
     host: Vec<u64>,
     hlen: Vec<i32>,
+    /// Last table actually uploaded, keyed by the device buffer it landed in.
+    /// The snapshot addresses are per-slot and executor-lived, so in steady
+    /// state every layer re-sends a table the device already holds — skipping
+    /// it drops ~2 pageable H2D per linear layer per spec step (and pageable
+    /// H2D is what makes a stream capture illegal).
+    sent: Vec<u64>,
+    sent_at: u64,
+    sent_len: Vec<i32>,
+    sent_len_at: u64,
 }
 
 /// Per-slot buffer addresses the varlen replay kernels index, one `[B]` table
@@ -1969,6 +1978,10 @@ pub(crate) struct Qwen35Workspace {
     last_hidden: VecSlot,
     last_normed: VecSlot,
     logits: VecSlot,
+    /// `[vocab, chain_rows]` spec-verify logits. Persistent so the captured
+    /// verify graph has a stable output address (the eager path allocated one
+    /// per block step).
+    verify_logits: HiddenSlot,
     /// Persistent argmax output (one i32) for the greedy sampling tail —
     /// removes the last steady-state per-token device allocation
     /// (`ops::argmax`'s `alloc_zeros(1)`).
@@ -2113,6 +2126,7 @@ impl Qwen35Workspace {
             last_hidden,
             last_normed,
             logits,
+            verify_logits,
             argmax_out,
             epoch: _,
         } = self;
@@ -2148,6 +2162,7 @@ impl Qwen35Workspace {
         last_hidden.release();
         last_normed.release();
         logits.release();
+        verify_logits.release();
         argmax_out.release();
     }
 }
@@ -4244,6 +4259,15 @@ impl Qwen35Model {
     /// size if absent) — the decode-graph bake fingerprint's output anchor.
     pub(crate) fn workspace_logits_ptr(&self, ws: &mut Qwen35Workspace) -> Result<u64> {
         let logits = ws.logits.get(&self.ctx, self.output_projection().rows)?;
+        let (ptr, _g) = logits.data.device_ptr(&self.ctx.stream);
+        Ok(ptr)
+    }
+
+    /// Same anchor for the `[vocab, rows]` spec-verify slot.
+    pub(crate) fn verify_logits_ptr(&self, ws: &mut Qwen35Workspace, rows: usize) -> Result<u64> {
+        let logits = ws
+            .verify_logits
+            .get(&self.ctx, self.output_projection().rows, rows)?;
         let (ptr, _g) = logits.data.device_ptr(&self.ctx.stream);
         Ok(ptr)
     }
@@ -7611,25 +7635,44 @@ impl Qwen35Model {
         );
         let ctx = &self.ctx;
         let n = dst.len();
-        s.host.clear();
-        s.host.extend_from_slice(dst);
-        s.host.extend_from_slice(src);
-        let tbl = s.ptrs.get(ctx, 2 * n)?;
-        ctx.stream
-            .memcpy_htod(&s.host, tbl)
-            .map_err(|e| anyhow!("H2D batched copy tables: {e}"))?;
-        let (base, _g) = tbl.device_ptr(&ctx.stream);
+        let Qwen35CopyScratch {
+            ptrs,
+            lens,
+            host,
+            hlen,
+            sent,
+            sent_at,
+            sent_len,
+            sent_len_at,
+        } = s;
+        host.clear();
+        host.extend_from_slice(dst);
+        host.extend_from_slice(src);
+        let tbl = ptrs.get(ctx, 2 * n)?;
+        let base = tbl.device_ptr(&ctx.stream).0;
+        if *sent_at != base || sent != host {
+            ctx.stream
+                .memcpy_htod(&*host, tbl)
+                .map_err(|e| anyhow!("H2D batched copy tables: {e}"))?;
+            *sent_at = base;
+            sent.clone_from(host);
+        }
         let (len_ptr, max_words) = if bytes.len() == 1 {
             (0u64, 0usize)
         } else {
-            s.hlen.clear();
-            s.hlen.extend(bytes.iter().map(|b| (b / 16) as i32));
-            let max = s.hlen.iter().copied().max().unwrap_or(0) as usize;
-            let d = s.lens.get(ctx, n)?;
-            ctx.stream
-                .memcpy_htod(&s.hlen, d)
-                .map_err(|e| anyhow!("H2D batched copy sizes: {e}"))?;
-            (d.device_ptr(&ctx.stream).0, max)
+            hlen.clear();
+            hlen.extend(bytes.iter().map(|b| (b / 16) as i32));
+            let max = hlen.iter().copied().max().unwrap_or(0) as usize;
+            let d = lens.get(ctx, n)?;
+            let lp = d.device_ptr(&ctx.stream).0;
+            if *sent_len_at != lp || sent_len != hlen {
+                ctx.stream
+                    .memcpy_htod(&*hlen, d)
+                    .map_err(|e| anyhow!("H2D batched copy sizes: {e}"))?;
+                *sent_len_at = lp;
+                sent_len.clone_from(hlen);
+            }
+            (lp, max)
         };
         // SAFETY: the table holds `n` dst then `n` src live addresses, each
         // buffer at least its `bytes` entry and cudaMalloc-aligned.
