@@ -408,7 +408,6 @@ impl DsparkTrainer {
         let mut cond_tokens: Vec<usize> = Vec::new(); // chain[t] — the bias condition
         let mut token_weights: Vec<f32> = Vec::new();
         let mut row_rewards: Vec<f32> = Vec::new();
-        let mut rewards = Vec::with_capacity(batch);
         for exp in experiences {
             let chain = &exp.draft_tokens;
             let draft_len = exp.draft_logits.len() / vocab_size;
@@ -416,8 +415,6 @@ impl DsparkTrainer {
             let trained = (chain.len().saturating_sub(1))
                 .min(draft_len.saturating_sub(d))
                 .min(target_len);
-            let reward = exp.accepted as f32 / exp.block_size as f32;
-            rewards.push(reward);
             for t in 0..trained {
                 let j = t + d;
                 draft_rows
@@ -433,7 +430,13 @@ impl DsparkTrainer {
                     Some(gamma) if gamma > 0.0 => (-(t as f32) / gamma).exp(),
                     _ => 1.0,
                 });
-                row_rewards.push(reward);
+                // Per-token credit, not the chain mean: verify stops at the
+                // first rejection, so `accepted` is the accepted PREFIX length
+                // and row t drafted chain[t+1], accepted iff t < accepted.
+                // Broadcasting the chain mean pushed up the log-prob of the
+                // rejected tail on every above-baseline chain — the tokens that
+                // caused the rejection.
+                row_rewards.push(f32::from(t < exp.accepted));
             }
         }
         let n_rows = pg_tokens.len();
@@ -471,7 +474,14 @@ impl DsparkTrainer {
         let token_lp_id =
             ops::gather_last_dim(log_probs_id, &pg_tokens, &mut self.store, &mut self.tape)?;
 
-        let mean_reward: f32 = rewards.iter().sum::<f32>() / batch as f32;
+        // Baseline must centre the quantity the advantage subtracts it from:
+        // the per-token credit, under the same position weighting as the loss.
+        let mean_reward: f32 = row_rewards
+            .iter()
+            .zip(&token_weights)
+            .map(|(&r, &w)| r * w)
+            .sum::<f32>()
+            / weight_sum;
         let next_baseline = if self.steps == 0 && self.config.baseline_init.is_none() {
             // Seed from data, not from a guess: an advantage centred on the
             // wrong constant is a uniform push away from whatever the drafter

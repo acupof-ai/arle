@@ -196,7 +196,12 @@ impl SpectrumProbe {
             // A cold param (w2=0 at a seedless start) has no base spectrum to be
             // isospectral against; relative drift is undefined, so report 0 rather
             // than dividing by ~0 and emitting an astronomical fake drift.
-            out.push(if den <= 1e-30 {
+            // The test must be relative to the CURRENT spectrum: `den` sums σ⁴ of
+            // a near-zero head, so an absolute floor lets a base 1e14× smaller
+            // than `now` through and reports the ratio as real drift (the
+            // warm-head run's 2.82e14).
+            let now_den: f64 = now.iter().map(|a| a * a).sum();
+            out.push(if den <= 1e-30 || den <= 1e-12 * now_den {
                 0.0
             } else {
                 (num / den).sqrt() as f32
