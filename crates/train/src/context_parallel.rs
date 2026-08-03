@@ -43,6 +43,11 @@ fn env_usize(key: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+/// `world_rank = dp_rank*cp + cp_rank` (CP inner) — the one composition site.
+pub fn world_rank(cp: CpContext, dp: DpContext) -> usize {
+    dp.rank * cp.size + cp.rank
+}
+
 /// The launcher's mesh env contract: `(dp_size, cp_size, world_rank)`, with
 /// `world_rank = dp_rank*cp + cp_rank` (CP inner). Unset ⇒ single card.
 fn mesh_env() -> (usize, usize, usize) {
