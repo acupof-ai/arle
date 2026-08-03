@@ -3307,6 +3307,21 @@ pub fn masked_writeback_step<O: Optimizer>(
         let gn = crate::grad_clip::compute_global_norm_f64(trainable_params, store);
         eprintln!("[writeback-grad] grad_norm={gn:.6e}");
     }
+    // Per-param grad norms, post-all-reduce: a global norm cannot say WHICH
+    // params diverge between cp=1 and cp=2 (#85).
+    if std::env::var("ARLE_OPD_DUMP_PARAM_GRADS").is_ok() {
+        let names: std::collections::HashMap<TensorId, &'static str> = student
+            .param_name_map()
+            .into_iter()
+            .chain(student.adapter_name_map())
+            .map(|(name, id)| (id, name))
+            .collect();
+        for &param in trainable_params {
+            let norm = crate::grad_clip::compute_global_norm_f64(&[param], store);
+            let name = names.get(&param).copied().unwrap_or("<unnamed>");
+            eprintln!("[param-grad] {name} id={param} norm={norm:.9e}");
+        }
+    }
     let t_opt = Instant::now();
     let grad_norm = if step_optimizer {
         Some(finite_optimizer_step(
