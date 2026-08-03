@@ -1,4 +1,4 @@
-# The 27B CP grad divergence is depth-compounding, and it starts below layer 27
+# The 27B CP grad divergence is depth-localized below layer 27 — and it is not depth
 
 **Date:** 2026-08-05 · **Commit:** ddee29e59 (per-param dump) · **Pod:** 8×H20, ThinkingCap-Qwen3.6-27B-FP8, seq=32768, LoRA r16 attention-qv
 
@@ -30,23 +30,38 @@ around layer 23 and saturates at 3–4× by layer 11. The gradient enters the
 backward at layer 63 correct and degrades as it propagates *down* — this is
 accumulation along the backward pass, not a per-layer bias.
 
-## Why the toy gate missed it
+## It is not depth
 
-The `nd_parallel_parity` depth sweep ran 2 / 4 / 8 / 16 layers and found no
-compounding. **The 27B's divergence only becomes visible after the gradient has
-travelled ~36 layers.** Depth 16 is inside the flat region — the toy could not
-have seen this no matter how carefully it was read. The earlier "no depth
-compounding" reading stands for depth ≤16 and does not extrapolate.
+The obvious reading — the toy depth sweep only went to 16, inside the flat
+region — was tested and **fails**. Toy hybrid, cp=2, `grad_cp_vs_f32` /
+`grad_single_vs_f32`:
+
+| depth | 16 | 32 | 48 | 64 |
+|---|---|---|---|---|
+| cp vs f32 | 2.18e-2 | 1.17e-3 | 4.63e-4 | 4.20e-3 |
+| single vs f32 | 2.38e-2 | 2.24e-4 | 9.43e-4 | 1.12e-3 |
+
+At the 27B's own depth of 64 the toy CP arm is 4.2e-3 from the f32 anchor — three
+orders below the 89% break, and non-monotone, i.e. noise. Depth is ruled out.
+
+## What is left
+
+The 27B differs from the toy on: FP8 base weights, MoE, real data, seq 32768 —
+and **checkpoint offload, which `[ckpt-gate] engage=true` confirms is live on the
+27B run and never engages on the toy.** Offload/recompute is also the only
+candidate whose effect would accumulate along the backward pass, matching the
+observed shape. An earlier seq=1024 probe shrank the gap 3.3×, which points the
+same way.
 
 ## Rule
 
-A null result on an axis bounds only the range you actually swept. "Depth does
-not compound" measured to 16 says nothing about 64; state the range with the
-conclusion or the conclusion silently becomes an extrapolation.
+A null result on an axis bounds only the range you actually swept — and when you
+extend the sweep, re-check before publishing the extrapolation. "Depth 16 was
+inside the flat region" was a clean, plausible story that measurement killed in
+one run.
 
 ## Next
 
-Toy hybrid at `ARLE_ND_LAYERS` 16 / 32 / 48 / 64, cp=2 vs single vs f32 — if the
-ratio climbs past depth ~24 the mechanism is reproducible off the 27B and can be
-bisected cheaply. If it stays flat, the cause is 27B-specific (FP8 base weights,
-MoE, seq 32768 with checkpoint offload engaged).
+27B cp=1 vs cp=2 at a seq below the checkpoint-gate threshold (`engage=false` in
+the log). If the per-layer ratios flatten, the bug is in the chunked
+recompute/offload backward under CP, not in the CP collectives.
