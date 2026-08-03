@@ -36,10 +36,19 @@ cp=8 at similar per-rank RSS. No host-allocator surgery needed to unblock.
 |---|---|---|
 | 31% | 30.2 s | ring_block_attention fwd_merge + bwd (CP ring SDPA, 16 full-attn layers) |
 | 26% | 25.8 s | linear_attention chunk grad/transfer/carry f32 (GDN backward) |
-| 13% | 12.3 s | kernel_kernel (unidentified — action item) |
+| 13% | 12.3 s | kernel_kernel = TileLang `_gdr_chunk_prepare_kernel` (GDR forward stage 1, 66 ms flat × 186 layer-forwards) |
 | 10% | ~10 s | cuBLAS GEMMs (nvjet) |
 | 7% | 6.6 s | gated_delta_rule_prefill_recurrent (23,808 launches) |
 | — | **15.9 s HtoD, 75,076 ops** | host→device uploads (93% of mem time; max single copy 468 ms) |
+
+**HtoD follow-up (sqlite over the same rep) — the 15.9 s dissolves.** ~13.5 s
+(85 MB×640 + 2.54 GB×8 + 30 MB×224) is weight/init upload confined to the first
+16 s of the capture — a capture artifact, not per-step traffic. Steady-state
+HtoD is ~2.4 s/step: 96 MB×96 + 50 MB×96, byte-exact `[4096, qkv_dim=6144]` and
+`[4096, z_dim=3072]` f32 — the GDN backward's saved qkv/z are host-resident and
+`ensure_device` (`ops/linear_attention.rs:1244`) re-uploads them, 48 layers × 2.
+The 75k count is 91% 12/8/16-byte scalar copies totalling 69 ms — noise. DtoH is
+956 copies / 3.6 ms — fully asymmetric.
 
 Layout churn (transpose/slice ~23k launches) is visible but small (2.9 s).
 Attention is O(s²): at 32768 the ring share only grows.
