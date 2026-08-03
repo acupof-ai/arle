@@ -178,6 +178,23 @@ pub fn engine_forward_busy_micros() -> u64 {
     ENGINE_FORWARD_BUSY_MICROS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Per-phase host micros inside [`Engine::step`], accumulated under
+/// `ARLE_STEP_PHASE=1`. The between-steps host section is invisible to a CUDA
+/// profile — the whole-step decode graph makes the GPU side one contiguous
+/// replay, so everything left shows up as a single per-step stall with no API
+/// calls in it (2026-08-03 ledger). This is the only instrument that splits it.
+/// Order matches [`STEP_PHASE_NAMES`].
+static STEP_PHASE_MICROS: [std::sync::atomic::AtomicU64; 6] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+static STEP_PHASE_STEPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+const STEP_PHASE_NAMES: [&str; 6] = ["poll", "apply_out", "poll_bg", "admit", "plan", "submit"];
+
 /// KV host-demoted counters. All zero unless the executor reports nonzero tier capacity.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct KvTierStats {
@@ -711,6 +728,22 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         // Cached: `step` runs per decode token and an env read takes a global lock.
         static STEP_DIAG: OnceLock<bool> = OnceLock::new();
         let diag = *STEP_DIAG.get_or_init(|| std::env::var_os("ARLE_STEP_DIAG").is_some());
+        static PHASE: OnceLock<bool> = OnceLock::new();
+        let mut mark = PHASE
+            .get_or_init(|| std::env::var_os("ARLE_STEP_PHASE").is_some())
+            .then(std::time::Instant::now);
+        // Buffered, then committed only for decode-only steps: one 32K prefill
+        // costs ~25 s and would swamp a 19 ms decode step in a flat average.
+        let mut phase_buf = [0u64; 6];
+        macro_rules! phase {
+            ($i:expr) => {
+                if let Some(t) = mark.as_mut() {
+                    let now = std::time::Instant::now();
+                    phase_buf[$i] += now.duration_since(*t).as_micros() as u64;
+                    *t = now;
+                }
+            };
+        }
         if let Some(inflight) = self.inflight.take() {
             match self.executor.poll(inflight)? {
                 PollResult::Ready(output) => {
@@ -721,7 +754,9 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
                         );
                     }
                     let plan = self.pending_plan.take().unwrap_or_else(ForwardPlan::idle);
+                    phase!(0);
                     self.apply_output(&plan, output)?;
+                    phase!(1);
                 }
                 PollResult::NotReady(inflight) => {
                     self.inflight = Some(inflight);
@@ -734,6 +769,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         }
 
         self.executor.poll_background()?;
+        phase!(2);
 
         let budget = self.governor.step_budget();
         if self.governor.should_yield() || budget.max_tokens == 0 || budget.max_micros == 0 {
@@ -750,6 +786,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         }
 
         self.admit_waiting()?;
+        phase!(3);
         if diag {
             eprintln!(
                 "[STEP-DIAG] post-admit: active={} waiting={}",
@@ -775,6 +812,7 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         }
 
         self.allocate_for_plan(&mut plan);
+        phase!(4);
         if plan.is_idle() {
             return Ok(());
         }
@@ -785,7 +823,26 @@ impl<E: BackendExecutor, K: KvPool> Engine<E, K> {
         let submit_at = std::time::Instant::now();
         self.inflight = Some(self.executor.submit(&plan, &mut self.kv)?);
         self.inflight_submit_at = Some(submit_at);
+        phase!(5);
+        let decode_only = plan.prefill_rows.is_empty();
         self.pending_plan = Some(plan);
+        if mark.is_some() && decode_only {
+            for (acc, v) in STEP_PHASE_MICROS.iter().zip(phase_buf) {
+                acc.fetch_add(v, std::sync::atomic::Ordering::Relaxed);
+            }
+            let n = STEP_PHASE_STEPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if n.is_multiple_of(500) {
+                let parts: Vec<String> = STEP_PHASE_NAMES
+                    .iter()
+                    .zip(STEP_PHASE_MICROS.iter())
+                    .map(|(name, acc)| {
+                        let us = acc.load(std::sync::atomic::Ordering::Relaxed);
+                        format!("{name}={:.3}ms", us as f64 / 1000.0 / n as f64)
+                    })
+                    .collect();
+                log::info!("[step-phase] steps={n} {}", parts.join(" "));
+            }
+        }
         Ok(())
     }
 
