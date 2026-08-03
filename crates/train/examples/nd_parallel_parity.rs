@@ -107,6 +107,20 @@ fn nd_seq() -> usize {
         .unwrap_or(16)
 }
 
+// `ARLE_ND_HYBRID=1` swaps layer 0 to linear attention, whose CP transport is the
+// seq↔head all-to-all, not the ring — the real 27B is 48/64 GDN, so a full-attn-only
+// gate certifies the minority of the model.
+#[cfg(all(feature = "cuda", feature = "nccl"))]
+fn nd_layer_types() -> Vec<LayerType> {
+    let hybrid = std::env::var("ARLE_ND_HYBRID").is_ok_and(|v| v.trim() == "1");
+    let first = if hybrid {
+        LayerType::LinearAttention
+    } else {
+        LayerType::FullAttention
+    };
+    vec![first, LayerType::FullAttention]
+}
+
 #[cfg(all(feature = "cuda", feature = "nccl"))]
 fn trajectory() -> (Vec<u32>, Vec<u32>, Vec<u8>) {
     let seq = nd_seq();
@@ -368,7 +382,7 @@ fn tiny_full_attn_config() -> Qwen35Config {
         // RoPE cache must cover every absolute position: seq (from ARLE_ND_SEQ,
         // padded up by opd.rs) plus headroom. seq=131072 needs 131072 rows, not 16.
         rope_cache_len_hint: Some(nd_seq().next_power_of_two().max(16)),
-        layer_types: vec![LayerType::FullAttention, LayerType::FullAttention],
+        layer_types: nd_layer_types(),
         num_experts: 0,
         num_experts_per_tok: 0,
         decoder_sparse_step: 1,
