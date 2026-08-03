@@ -26,6 +26,7 @@ use smallvec::smallvec;
 
 use crate::{
     AutogradError, Result,
+    backend::CommAxis,
     tape::{BackwardOp, GradPairs, SavedContext, Tape, TapeEntry},
     tensor::{Tensor, TensorId, TensorStore},
 };
@@ -144,6 +145,116 @@ pub fn ep_combine_op(
     }
     .record(store, tape)?;
     Ok(output_id)
+}
+
+/// This rank's `recv_counts` from every rank's `send_counts` row: all-gather the
+/// `[world]` rows over the expert group, take column `rank`.
+pub fn ep_exchange_counts(send_counts: &[usize], store: &mut TensorStore) -> Result<Vec<usize>> {
+    let (world, rank) = store.backend().comm_world_rank(CommAxis::Expert);
+    if world <= 1 {
+        return Ok(send_counts.to_vec());
+    }
+    if send_counts.len() != world {
+        return Err(AutogradError::TapeInvariant(
+            "ep_exchange_counts: send_counts length must equal the group size",
+        ));
+    }
+    let row: Vec<f32> = send_counts.iter().map(|&c| c as f32).collect();
+    let handle = store.backend().upload(&row, &[world])?;
+    let gathered = store
+        .backend()
+        .all_gather_seq_device(&handle, &[world], CommAxis::Expert)?;
+    let matrix = store.backend().readback(&gathered)?;
+    Ok((0..world)
+        .map(|j| matrix[j * world + rank].round() as usize)
+        .collect())
+}
+
+/// Differentiable variable-split row exchange over the expert group — the wire
+/// between dispatch (rows pre-grouped by destination rank) and the local expert
+/// compute. Backward is the reverse exchange (adjoint of a permutation).
+pub fn ep_exchange_rows_op(
+    input: TensorId,
+    send_counts: &[usize],
+    recv_counts: &[usize],
+    dim: usize,
+    store: &mut TensorStore,
+    tape: &mut Tape,
+) -> Result<TensorId> {
+    store.ensure_device(input)?;
+    let handle = store
+        .tensor(input)?
+        .device_handle
+        .as_ref()
+        .ok_or(AutogradError::TapeInvariant(
+            "ep_exchange_rows: ensure_device left tensor without a device handle",
+        ))?
+        .clone();
+    let out = store.backend().ep_exchange_rows_device(
+        &handle,
+        dim,
+        send_counts,
+        recv_counts,
+        CommAxis::Expert,
+    )?;
+    let recv_rows: usize = recv_counts.iter().sum();
+    let output_id = store.alloc_device_tensor(vec![recv_rows, dim], out)?;
+    TapeEntry {
+        op: BackwardOp::EpExchange,
+        output_id,
+        input_ids: smallvec![input],
+        saved: SavedContext::EpExchangeCtx {
+            input,
+            send_counts: send_counts.to_vec(),
+            recv_counts: recv_counts.to_vec(),
+            dim,
+        },
+    }
+    .record(store, tape)?;
+    Ok(output_id)
+}
+
+/// bwd(exchange) = exchange with the counts swapped.
+pub(crate) fn ep_exchange_backward(
+    entry: &TapeEntry,
+    output_grad_id: TensorId,
+    store: &mut TensorStore,
+) -> Result<GradPairs> {
+    let SavedContext::EpExchangeCtx {
+        input,
+        send_counts,
+        recv_counts,
+        dim,
+    } = &entry.saved
+    else {
+        return Err(AutogradError::TapeInvariant(
+            "EpExchange missing EpExchangeCtx",
+        ));
+    };
+    let (input, send_counts, recv_counts, dim) =
+        (*input, send_counts.clone(), recv_counts.clone(), *dim);
+    if !store.tensor(input)?.requires_grad {
+        return Ok(GradPairs::new());
+    }
+    store.ensure_device(output_grad_id)?;
+    let upstream = store
+        .tensor(output_grad_id)?
+        .device_handle
+        .as_ref()
+        .ok_or(AutogradError::TapeInvariant(
+            "EpExchange backward: upstream missing device handle",
+        ))?
+        .clone();
+    let grad = store.backend().ep_exchange_rows_device(
+        &upstream,
+        dim,
+        &recv_counts,
+        &send_counts,
+        CommAxis::Expert,
+    )?;
+    let send_rows: usize = send_counts.iter().sum();
+    let grad_id = store.alloc_device_tensor(vec![send_rows, dim], grad)?;
+    Ok(smallvec![(input, grad_id)])
 }
 
 fn ep_plan_ctx(entry: &TapeEntry) -> Result<(TensorId, EpPlan, usize)> {
@@ -301,5 +412,21 @@ mod tests {
         let gx = store.to_host(grads[&x]).unwrap();
         // d(sum S·x)/dx[t] = number of slots selecting t: token0→2, token1→1, token2→0.
         assert_eq!(gx, vec![2.0, 2.0, 1.0, 1.0, 0.0, 0.0]);
+    }
+
+    // world==1: exchange is identity forward AND backward (the locally-verifiable
+    // core; the multi-rank NCCL path is pod-gated like the other collectives).
+    #[test]
+    fn exchange_world1_is_identity_and_self_adjoint() {
+        use crate::{Tensor, ops, tape::Tape, tensor::TensorStore};
+        let mut store = TensorStore::default();
+        let mut tape = Tape::new();
+        let x = store.alloc(Tensor::new(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2], true).unwrap());
+        assert_eq!(ep_exchange_counts(&[2], &mut store).unwrap(), vec![2]);
+        let y = ep_exchange_rows_op(x, &[2], &[2], 2, &mut store, &mut tape).unwrap();
+        assert_eq!(store.to_host(y).unwrap(), vec![1.0, 2.0, 3.0, 4.0]);
+        let loss = ops::sum(y, &mut store, &mut tape).unwrap();
+        let grads = tape.backward(loss, &mut store).unwrap();
+        assert_eq!(store.to_host(grads[&x]).unwrap(), vec![1.0; 4]);
     }
 }

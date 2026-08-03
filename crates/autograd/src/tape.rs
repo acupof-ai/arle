@@ -199,6 +199,13 @@ pub enum SavedContext {
         num_tokens: usize,
         dim: usize,
     },
+    // Expert-parallel row exchange: per-peer row counts; backward swaps them.
+    EpExchangeCtx {
+        input: TensorId,
+        send_counts: Vec<usize>,
+        recv_counts: Vec<usize>,
+        dim: usize,
+    },
     // Ring-attention context-parallel tile: `blocks` are (k, v, k_abs) TensorIds
     // ring-delivered in forward order; `lse`/`out` are the saved per-row logsumexp
     // and normalized output the flash-2 backward replays against. `cp_size`/`cp_rank`
@@ -261,6 +268,7 @@ pub enum BackwardOp {
     AllToAll,
     EpDispatch,
     EpCombine,
+    EpExchange,
     RingAttention,
     Checkpoint,
     SeqChunkedRecompute,
@@ -309,6 +317,7 @@ impl BackwardOp {
             BackwardOp::AllToAll => "AllToAll",
             BackwardOp::EpDispatch => "EpDispatch",
             BackwardOp::EpCombine => "EpCombine",
+            BackwardOp::EpExchange => "EpExchange",
             BackwardOp::RingAttention => "RingAttention",
             BackwardOp::Checkpoint => "Checkpoint",
             BackwardOp::SeqChunkedRecompute => "SeqChunkedRecompute",
@@ -873,6 +882,9 @@ impl Tape {
                     }
                     BackwardOp::EpCombine => {
                         ops::collective_ep::ep_combine_backward(&entry, output_grad_id, store)?
+                    }
+                    BackwardOp::EpExchange => {
+                        ops::collective_ep::ep_exchange_backward(&entry, output_grad_id, store)?
                     }
                     BackwardOp::RingAttention => ops::ring_attention::cp_ring_attention_backward(
                         &entry,
