@@ -864,8 +864,9 @@ pub(crate) struct ServeArgs {
     pub(crate) probe_token_entropy: bool,
 
     // ── CUDA runtime toggles (EngineLoadConfig.cuda; defaults = shipped behavior) ──
-    /// Whole-step Qwen3.5/3.6 decode graph (opt-in until the pod license).
-    #[arg(long, default_value_t = false, action = clap::ArgAction::Set, value_name = "BOOL")]
+    /// Whole-step Qwen3.5/3.6 decode graph (paged lane licensed 2026-08-03:
+    /// −7.9% ITL, byte-identical greedy, MMLU 84/100 vs 80-81 baseline).
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set, value_name = "BOOL")]
     pub(crate) qwen35_decode_graph: bool,
 
     /// Batched rows>1 Qwen3.5/3.6 decode; false = sequential per-row A/B arm.
@@ -1612,6 +1613,10 @@ pub(crate) struct TrainOpdArgs {
     #[arg(long, value_enum, default_value_t = OpdBackendArg::Auto)]
     pub(crate) backend: OpdBackendArg,
 
+    /// Storage dtype for tape-saved activations (f32 default is byte-identical).
+    #[arg(long, value_enum, default_value_t = TapeDtypeArg::F32)]
+    pub(crate) tape_dtype: TapeDtypeArg,
+
     /// Rollout engine (CUDA only). `infer` = in-process infer engine (~5×
     /// faster; default); `train` = train-crate O(n²) A/B arm.
     #[arg(long, value_enum)]
@@ -1776,6 +1781,10 @@ pub(crate) struct TrainSelfOpdArgs {
     /// Compute backend for autograd (auto picks CUDA when built with cuda).
     #[arg(long, value_enum, default_value_t = OpdBackendArg::Auto)]
     pub(crate) backend: OpdBackendArg,
+
+    /// Storage dtype for tape-saved activations (f32 default is byte-identical).
+    #[arg(long, value_enum, default_value_t = TapeDtypeArg::F32)]
+    pub(crate) tape_dtype: TapeDtypeArg,
 
     /// Render output as JSON for scripts and CI.
     #[arg(long, default_value_t = false)]
@@ -2001,6 +2010,10 @@ pub(crate) struct TrainRubricOpdArgs {
     /// Compute backend for autograd (auto picks CUDA when built with cuda).
     #[arg(long, value_enum, default_value_t = OpdBackendArg::Auto)]
     pub(crate) backend: OpdBackendArg,
+
+    /// Storage dtype for tape-saved activations (f32 default is byte-identical).
+    #[arg(long, value_enum, default_value_t = TapeDtypeArg::F32)]
+    pub(crate) tape_dtype: TapeDtypeArg,
 
     /// Render output as JSON for scripts and CI.
     #[arg(long, default_value_t = false)]

@@ -7413,10 +7413,11 @@ fn cuda_causal_sdpa_recompute_backward_device(
         ));
     }
 
-    let d_q = backend.cuda_slice(args.q, "causal_sdpa_recompute_backward_device")?;
-    let d_k = backend.cuda_slice(args.k, "causal_sdpa_recompute_backward_device")?;
-    let d_v = backend.cuda_slice(args.v, "causal_sdpa_recompute_backward_device")?;
-    let d_up = backend.cuda_slice(args.upstream, "causal_sdpa_recompute_backward_device")?;
+    let d_q_op = backend.f32_operand(args.q, "causal_sdpa_recompute_backward_device")?;
+    let d_k_op = backend.f32_operand(args.k, "causal_sdpa_recompute_backward_device")?;
+    let d_v_op = backend.f32_operand(args.v, "causal_sdpa_recompute_backward_device")?;
+    let d_up_op = backend.f32_operand(args.upstream, "causal_sdpa_recompute_backward_device")?;
+    let (d_q, d_k, d_v, d_up) = (d_q_op.get(), d_k_op.get(), d_v_op.get(), d_up_op.get());
     if d_q.len() != total || d_k.len() != total || d_v.len() != total || d_up.len() != total {
         return Err(AutogradError::TapeInvariant(
             "cuda causal_sdpa_recompute_backward_device handle size does not match shape",
@@ -9509,9 +9510,8 @@ fn cuda_broadcast_expand_device(
     let total_i32 = i32::try_from(total)
         .map_err(|_| AutogradError::TapeInvariant("cuda broadcast_expand total exceeds i32"))?;
 
-    if backend.tape_bf16() {
-        let d_src_op = backend.bf16_operand(src, "broadcast_expand")?;
-        let d_src = d_src_op.get();
+    if let DeviceHandle::CudaBf16(storage) = src {
+        let d_src = backend.cuda_bf16_storage_slice(storage)?;
         if d_src.len() != src_size {
             return Err(AutogradError::DataLengthMismatch {
                 len: d_src.len(),
