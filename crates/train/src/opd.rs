@@ -2989,7 +2989,7 @@ pub fn masked_writeback_ce_step<O: Optimizer>(
         crate::context_parallel::DpContext::single(),
         store,
     )
-    .map(|(loss, _)| loss)
+    .map(|(loss, _, _)| loss)
 }
 
 /// Frozen prompt and trainable generated segment.
@@ -3014,6 +3014,10 @@ impl GenSegment {
 }
 
 /// One checkpointed forward, chunked loss, backward, and optional optimizer step.
+///
+/// The third return is the pre-step global grad L2 norm (post CP/DP all-reduce,
+/// pre-clip) — `None` when `step_optimizer` is false, since accumulated grads are
+/// not yet reduced. Free: `finite_optimizer_step` already computes it.
 #[allow(clippy::too_many_arguments)]
 pub fn masked_writeback_step<O: Optimizer>(
     loss_kind: WritebackLoss,
@@ -3031,7 +3035,7 @@ pub fn masked_writeback_step<O: Optimizer>(
     cp: crate::context_parallel::CpContext,
     dp: crate::context_parallel::DpContext,
     store: &mut TensorStore,
-) -> Result<(f32, PgStats)> {
+) -> Result<(f32, PgStats, Option<f64>)> {
     if prompt_ids.is_empty() {
         return Err(OpdError::InvalidInput(
             "masked writeback requires a non-empty prompt".to_owned(),
@@ -3066,7 +3070,7 @@ pub fn masked_writeback_step<O: Optimizer>(
             response_ids.len(),
             response_mask.iter().filter(|&&m| m == 1).count(),
         );
-        return Ok((0.0, PgStats::default()));
+        return Ok((0.0, PgStats::default(), None));
     }
     let total_targets = loss_targets.len();
     let chunk_rows = window_size; // reused: positions per fused-CE chunk.
@@ -3304,9 +3308,17 @@ pub fn masked_writeback_step<O: Optimizer>(
         eprintln!("[writeback-grad] grad_norm={gn:.6e}");
     }
     let t_opt = Instant::now();
-    if step_optimizer {
-        finite_optimizer_step(loss_value, trainable_params, 0.0, optimizer, store)?;
-    }
+    let grad_norm = if step_optimizer {
+        Some(finite_optimizer_step(
+            loss_value,
+            trainable_params,
+            0.0,
+            optimizer,
+            store,
+        )?)
+    } else {
+        None
+    };
     cleanup_after_backward(store, &mut tape, all_model_params, &keep_extra);
     let opt_secs = t_opt.elapsed().as_secs_f64();
     let vram_post_cleanup = log_writeback_vram(store, "masked-writeback", "post cleanup");
@@ -3321,7 +3333,7 @@ pub fn masked_writeback_step<O: Optimizer>(
 
     eprintln!("[masked-writeback] DONE loss={loss_value:.6} total_targets={total_targets}");
     // Mean CE per masked token (the fused loss already applied the 1/N mean).
-    Ok((loss_value, pg_stats))
+    Ok((loss_value, pg_stats, grad_norm))
 }
 
 /// Positions per `[rows, vocab]` logits tile in [`capture_rollout_logprobs`];
@@ -3725,7 +3737,7 @@ pub fn masked_writeback_ce_step_frozen_prompt_kv<O: Optimizer>(
         crate::context_parallel::DpContext::single(),
         store,
     )
-    .map(|(loss, _)| loss)
+    .map(|(loss, _, _)| loss)
 }
 
 /// Dispatch CE writeback with optional context parallelism.
@@ -3760,7 +3772,7 @@ pub fn masked_writeback_ce_step_dispatch<O: Optimizer>(
         dp,
         store,
     )
-    .map(|(loss, _)| loss)
+    .map(|(loss, _, _)| loss)
 }
 
 /// Group the masked (LLM-generated) predicting positions into maximal
