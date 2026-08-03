@@ -1,21 +1,30 @@
-//! DSpark train sidecar: hybrid policy-gradient + supervised logit matching.
+//! DSpark train sidecar: supervised online refinement of the Markov head.
 //!
-//! Drains the experience buffer populated by the inference hot path and runs
-//! updates against the Markov head (the DSpark-specific trainable component).
-//! The backbone transformer layers stay frozen; only `markov_w1` (embedding)
-//! and `markov_w2` (linear projection) are updated.
+//! Drains the experience buffer populated by the inference hot path. The
+//! backbone stays frozen; only `markov_w1` (embedding) and `markov_w2` (linear
+//! projection) are updated.
 //!
-//! Two complementary loss signals (cf. DeepSpec `deepspec/modeling/dspark/loss.py`):
-//! - **Policy gradient**: reward = accepted/block_size, baseline = EMA.
-//!   `pg_loss = -log π(draft_tokens) * (reward - baseline)`.
-//! - **Supervised probability matching**: dense signal from the captured
-//!   `target_logits`. `loss = Σ(softmax(draft) - softmax(target))²`.
-//!   Squared difference is a differentiable surrogate for L1/total-variation
-//!   — same gradient direction, no `abs()` op needed. Directly optimises
-//!   acceptance rate (`accept ≈ 1 - 0.5·TV`).
+//! Objective, the paper's (arXiv:2607.05147 eq. 9-12) minus the terms this
+//! sidecar has no parameters for:
 //!
-//! Per-position exponential decay (`loss_decay_gamma`) up-weights earlier
-//! tokens in the block: a mistake at position 0 voids positions 1..k.
+//! ```text
+//! ℒ = α_tv·Σ w_k‖p_k^d − p_k^t‖₁  +  (1−α_tv)·(−Σ w_k log p_k^d(x_k*))
+//!     w_k = exp(−k/γ)     x_k* = the trunk's token at position k
+//! ```
+//!
+//! `ℒ_conf` is absent because there is no confidence head here to train; it is
+//! the paper's largest term (α=1.0) and produces the adaptive block truncation
+//! that `--dspark-block-size` only approximates with a fixed length. A head
+//! with one has to come from DeepSpec's offline trainer.
+//!
+//! **This is refinement, not training from scratch.** The paper's recipe is
+//! 1.3M target-regenerated samples × 10 epochs against a whole draft backbone;
+//! an online sidecar on one serve's traffic is three orders of magnitude short
+//! of that and only ever adjusts the Markov head.
+//!
+//! There is deliberately no policy-gradient term. An earlier version had one
+//! and it drove acceptance *down*: see
+//! `docs/experience/errors/2026-08-03-dspark-pg-chain-mean-credit.md`.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -29,7 +38,7 @@ use autograd::{AdamW, CpuBackend, Tape, Tensor, TensorId, TensorStore};
 
 use crate::grad_clip::{ensure_finite_loss, finite_optimizer_step};
 
-/// One DSpark spec step's experience for RL training.
+/// One DSpark spec step's experience.
 ///
 /// Mirrors `infer_cuda::DsparkExperience`; redefined here to avoid a hard
 /// dependency on the infer-cuda crate from the train crate's non-cuda build.
@@ -99,17 +108,9 @@ pub struct DsparkTrainConfig {
     /// divides how many optimizer steps you get out of them. Measured at the real
     /// head shape: 64 -> 20.9 s/step, 8 -> 1.70 s/step. Small wins.
     pub batch_size: usize,
+    /// Smoothing for the reported accept-rate EMA. Telemetry only.
     pub baseline_ema_alpha: f32,
-    /// Starting value for the EMA baseline (the reward's running mean).
-    /// `None` (default) seeds it from the first batch's mean reward. A pinned
-    /// value biases every advantage until the EMA walks to the true mean, which
-    /// at `baseline_ema_alpha` 0.01 takes hundreds of steps: the old 0.5 default
-    /// against a measured mean reward of 0.20 left `r - baseline` negative on
-    /// every step for ~340 steps, so the policy-gradient term pushed down the
-    /// log-prob of every drafted token regardless of whether it was accepted.
-    pub baseline_init: Option<f32>,
-    /// Weight on the supervised probability-matching loss. The policy-gradient
-    /// loss receives weight `1.0 - prob_match_alpha`. Default 0.5.
+    /// Weight on `ℒ_tv`; `ℒ_ce` gets `1 - prob_match_alpha`. Default 0.9 (paper).
     pub prob_match_alpha: f32,
     /// Exponential decay scale for per-position loss weighting. Position `k` in
     /// the block is weighted `exp(-k/gamma)`. `None` disables decay (uniform).
@@ -123,10 +124,10 @@ pub struct DsparkTrainConfig {
     /// head at shutdown.
     pub save_path: Option<PathBuf>,
     /// Constrain the head to its base checkpoint's singular spectrum, letting
-    /// the optimizer move only the singular frames (ISO, arXiv:2607.19331). The
-    /// acceptance reward is the sparse verifiable kind the paper's observation
-    /// was made on; see [`crate::iso_spectrum`]. Off by default — it is an
-    /// unmeasured algorithm change on this head.
+    /// the optimizer move only the singular frames (ISO, arXiv:2607.19331); see
+    /// [`crate::iso_spectrum`]. Off by default — it is an unmeasured algorithm
+    /// change on this head, and the paper's fixed-spectrum observation was made
+    /// on RL fine-tunes, which this objective is not.
     pub iso_fixed_spectrum: bool,
     /// Steps between engine hot-swaps and checkpoint writes. Each swap is a
     /// `vocab*rank*2` bf16 H2D plus a full serve-stream sync, so doing it every
@@ -141,8 +142,7 @@ impl Default for DsparkTrainConfig {
             learning_rate: 1e-4,
             batch_size: 8,
             baseline_ema_alpha: 0.01,
-            baseline_init: None,
-            prob_match_alpha: 0.5,
+            prob_match_alpha: 0.9,
             loss_decay_gamma: Some(4.0),
             max_grad_norm: Some(1.0),
             save_path: None,
@@ -160,7 +160,7 @@ struct MarkovParams {
 }
 
 /// DSpark trainer: runs in a background thread, drains the experience
-/// buffer, and runs acceptance-weighted updates on the Markov head.
+/// buffer, and runs supervised updates on the Markov head.
 pub struct DsparkTrainer {
     config: DsparkTrainConfig,
     store: TensorStore,
@@ -178,7 +178,8 @@ pub struct DsparkTrainer {
     /// updates stay near-isospectral (the paper's premise), not just the ISO-on
     /// retraction residual.
     spectrum_probe: Option<crate::iso_spectrum::SpectrumProbe>,
-    baseline_ema: f32,
+    /// Position-weighted per-token accept rate, smoothed. Reported, never used.
+    accept_ema: f32,
     /// Per-parameter relative spectral drift measured at the last cadence — the
     /// paper's premise on this head, emitted on both ISO on/off. Empty until the
     /// first cadence.
@@ -219,7 +220,6 @@ impl DsparkTrainer {
         let store = TensorStore::with_backend(backend);
         let tape = Tape::new();
         let optim = AdamW::new(config.learning_rate, (0.9, 0.999), 1e-8, 0.0);
-        let baseline_ema = config.baseline_init.unwrap_or(0.0);
 
         Ok(Self {
             config,
@@ -232,7 +232,7 @@ impl DsparkTrainer {
             steps: 0,
             init_weights,
             optim,
-            baseline_ema,
+            accept_ema: 0.0,
             running,
         })
     }
@@ -290,6 +290,26 @@ impl DsparkTrainer {
         Ok(())
     }
 
+    /// `Σ(x ⊙ w) / weight_sum` — both loss terms are this, with sign and
+    /// position decay folded into the constant `w`.
+    fn weighted_mean(
+        &mut self,
+        x: TensorId,
+        w: &[f32],
+        shape: &[usize],
+        weight_sum: f32,
+    ) -> Result<TensorId> {
+        let w_id = self.store.from_slice(w, shape)?;
+        let prod = ops::mul(x, w_id, &mut self.store, &mut self.tape)?;
+        let total = ops::sum(prod, &mut self.store, &mut self.tape)?;
+        Ok(ops::mul_scalar(
+            total,
+            1.0 / weight_sum,
+            &mut self.store,
+            &mut self.tape,
+        )?)
+    }
+
     /// #169 case probe (`ARLE_DSPARK_DUMP=<path>`): one JSONL line per trained
     /// row — the decoded ground truth aggregate metrics kept hiding. Capped by
     /// `ARLE_DSPARK_DUMP_ROWS` (default 512), process-global.
@@ -299,7 +319,7 @@ impl DsparkTrainer {
         target: &[f32],
         pg: &[usize],
         cond: &[usize],
-        rewards: &[f32],
+        accepted: &[f32],
         vocab: usize,
     ) {
         use std::io::Write;
@@ -331,8 +351,8 @@ impl DsparkTrainer {
             let t = argmax(&target[i * vocab..(i + 1) * vocab]);
             let _ = writeln!(
                 f,
-                "{{\"cond\":{},\"drafted\":{},\"draft_argmax\":{d},\"target_argmax\":{t},\"reward\":{}}}",
-                cond[i], pg[i], rewards[i]
+                "{{\"cond\":{},\"drafted\":{},\"draft_argmax\":{d},\"target_argmax\":{t},\"accepted\":{}}}",
+                cond[i], pg[i], accepted[i]
             );
         }
         DUMPED.fetch_add(take, Ordering::Relaxed);
@@ -405,9 +425,10 @@ impl DsparkTrainer {
         let mut draft_rows: Vec<f32> = Vec::new();
         let mut target_rows: Vec<f32> = Vec::new();
         let mut pg_tokens: Vec<usize> = Vec::new(); // chain[t+1] — the drafted token
+        let mut ce_tokens: Vec<usize> = Vec::new(); // argmax target row t — the CE label
         let mut cond_tokens: Vec<usize> = Vec::new(); // chain[t] — the bias condition
         let mut token_weights: Vec<f32> = Vec::new();
-        let mut row_rewards: Vec<f32> = Vec::new();
+        let mut row_accepted: Vec<f32> = Vec::new();
         for exp in experiences {
             let chain = &exp.draft_tokens;
             let draft_len = exp.draft_logits.len() / vocab_size;
@@ -419,8 +440,18 @@ impl DsparkTrainer {
                 let j = t + d;
                 draft_rows
                     .extend_from_slice(&exp.draft_logits[j * vocab_size..(j + 1) * vocab_size]);
-                target_rows
-                    .extend_from_slice(&exp.target_logits[t * vocab_size..(t + 1) * vocab_size]);
+                let target_row = &exp.target_logits[t * vocab_size..(t + 1) * vocab_size];
+                target_rows.extend_from_slice(target_row);
+                // CE label is the TRUNK's token, not the draft's: the paper
+                // trains on target-regenerated responses, and greedy verify
+                // accepts exactly argmax of this row.
+                ce_tokens.push(
+                    target_row
+                        .iter()
+                        .enumerate()
+                        .max_by(|a, b| a.1.total_cmp(b.1))
+                        .map_or(0, |(v, _)| v),
+                );
                 pg_tokens.push(chain[t + 1] as usize);
                 cond_tokens.push(chain[t] as usize);
                 // Exponential decay over the DRAFT position t within trained
@@ -436,7 +467,7 @@ impl DsparkTrainer {
                 // Broadcasting the chain mean pushed up the log-prob of the
                 // rejected tail on every above-baseline chain — the tokens that
                 // caused the rejection.
-                row_rewards.push(f32::from(t < exp.accepted));
+                row_accepted.push(f32::from(t < exp.accepted));
             }
         }
         let n_rows = pg_tokens.len();
@@ -452,7 +483,7 @@ impl DsparkTrainer {
                 &target_rows,
                 &pg_tokens,
                 &cond_tokens,
-                &row_rewards,
+                &row_accepted,
                 vocab_size,
             );
         }
@@ -469,53 +500,17 @@ impl DsparkTrainer {
         let bias_id = ops::matmul_bt(emb_flat_id, w2_id, &mut self.store, &mut self.tape)?;
         let corrected_id = ops::add(logits_id, bias_id, &mut self.store, &mut self.tape)?;
 
-        // ---- Policy-gradient loss (acceptance-weighted) ----
+        // ℒ_ce = −Σ w · log p_draft(trunk token)
         let log_probs_id = ops::log_softmax(corrected_id, &mut self.store, &mut self.tape)?;
         let token_lp_id =
-            ops::gather_last_dim(log_probs_id, &pg_tokens, &mut self.store, &mut self.tape)?;
+            ops::gather_last_dim(log_probs_id, &ce_tokens, &mut self.store, &mut self.tape)?;
+        let neg_w: Vec<f32> = token_weights.iter().map(|&w| -w).collect();
+        let ce_id = self.weighted_mean(token_lp_id, &neg_w, &[n_rows], weight_sum)?;
 
-        // Baseline must centre the quantity the advantage subtracts it from:
-        // the per-token credit, under the same position weighting as the loss.
-        let mean_reward: f32 = row_rewards
-            .iter()
-            .zip(&token_weights)
-            .map(|(&r, &w)| r * w)
-            .sum::<f32>()
-            / weight_sum;
-        let next_baseline = if self.steps == 0 && self.config.baseline_init.is_none() {
-            // Seed from data, not from a guess: an advantage centred on the
-            // wrong constant is a uniform push away from whatever the drafter
-            // currently proposes.
-            mean_reward
-        } else {
-            (1.0 - self.config.baseline_ema_alpha) * self.baseline_ema
-                + self.config.baseline_ema_alpha * mean_reward
-        };
-        let baseline = next_baseline;
-        // Per-token advantage × position weight.
-        let weighted_adv: Vec<f32> = row_rewards
-            .iter()
-            .zip(&token_weights)
-            .map(|(&r, &w)| (r - baseline) * w)
-            .collect();
-        let adv_id = self.store.from_slice(&weighted_adv, &[n_rows])?;
-
-        let pg_weighted_id = ops::mul(token_lp_id, adv_id, &mut self.store, &mut self.tape)?;
-        let pg_neg_id = ops::mul_scalar(pg_weighted_id, -1.0, &mut self.store, &mut self.tape)?;
-        // Weighted mean: divide by sum of position weights (not token count).
-        let pg_loss_id = ops::mul_scalar(
-            ops::sum(pg_neg_id, &mut self.store, &mut self.tape)?,
-            1.0 / weight_sum,
-            &mut self.store,
-            &mut self.tape,
-        )?;
-
-        // ---- Supervised probability-matching loss ----
-        // Directly optimises acceptance rate: accept ≈ 1 - 0.5·TV(draft, target).
-        // Squared difference (Frobenius) is a differentiable surrogate for L1/TV.
+        // ℒ_tv = Σ w · ‖p_draft − p_target‖₁ — acceptance is 1 − ½·TV of exactly
+        // this. The vocab axis stays a sum; only the token axis is averaged.
         let draft_probs_id = ops::softmax(corrected_id, &mut self.store, &mut self.tape)?;
         let target_probs_id = ops::softmax(target_logits_id, &mut self.store, &mut self.tape)?;
-        // diff = softmax(draft) - softmax(target), computed in-graph.
         let neg_target_id =
             ops::mul_scalar(target_probs_id, -1.0, &mut self.store, &mut self.tape)?;
         let diff_id = ops::add(
@@ -524,39 +519,25 @@ impl DsparkTrainer {
             &mut self.store,
             &mut self.tape,
         )?;
-        let sq_diff_id = ops::mul(diff_id, diff_id, &mut self.store, &mut self.tape)?;
-        // Expand per-token weights to [n_rows, vocab] for element-wise mul.
-        let expanded_weights: Vec<f32> = token_weights
-            .iter()
-            .flat_map(|&w| vec![w; vocab_size])
-            .collect();
-        let exp_weight_id = self
+        // |x| with no abs op: fold sign(x), held constant, into the position
+        // weight — that product IS the L1 subgradient. Squaring instead is not
+        // "the same gradient direction" at production vocab: probabilities run
+        // ~1e-5, so ∂(p−q)² = 2(p−q) rescales each class by its own residual and
+        // buries the tail TV weighs equally.
+        let signed_w: Vec<f32> = self
             .store
-            .from_slice(&expanded_weights, &[n_rows, vocab_size])?;
-        let weighted_sq_id = ops::mul(sq_diff_id, exp_weight_id, &mut self.store, &mut self.tape)?;
-        // Per-token mean of the squared-L2 distribution distance ‖softmax(draft) −
-        // softmax(target)‖² — the TV surrogate from line 504, which is a SUM over
-        // vocab (TV = ½Σ|p−q|), not a mean. Dividing by vocab_size too averaged a
-        // sum-over-classes quantity as a per-class mean → ~1/248320 → the term
-        // (and its gradient) underflowed f32, making prob_match_alpha inert at
-        // production vocab scale. Normalize per token only.
-        let prob_match_loss_id = ops::mul_scalar(
-            ops::sum(weighted_sq_id, &mut self.store, &mut self.tape)?,
-            1.0 / weight_sum,
-            &mut self.store,
-            &mut self.tape,
-        )?;
+            .to_host(diff_id)?
+            .iter()
+            .enumerate()
+            .map(|(i, &d)| token_weights[i / vocab_size].copysign(d))
+            .collect();
+        let tv_id = self.weighted_mean(diff_id, &signed_w, &[n_rows, vocab_size], weight_sum)?;
 
-        // ---- Combined loss ----
-        let pg_alpha = 1.0 - self.config.prob_match_alpha;
-        let pg_scaled_id = ops::mul_scalar(pg_loss_id, pg_alpha, &mut self.store, &mut self.tape)?;
-        let pm_scaled_id = ops::mul_scalar(
-            prob_match_loss_id,
-            self.config.prob_match_alpha,
-            &mut self.store,
-            &mut self.tape,
-        )?;
-        let loss_id = ops::add(pg_scaled_id, pm_scaled_id, &mut self.store, &mut self.tape)?;
+        // ℒ = α_tv·ℒ_tv + (1 − α_tv)·ℒ_ce (paper: 0.9 / 0.1)
+        let alpha = self.config.prob_match_alpha;
+        let ce_id = ops::mul_scalar(ce_id, 1.0 - alpha, &mut self.store, &mut self.tape)?;
+        let tv_id = ops::mul_scalar(tv_id, alpha, &mut self.store, &mut self.tape)?;
+        let loss_id = ops::add(ce_id, tv_id, &mut self.store, &mut self.tape)?;
         let loss = self
             .store
             .to_host(loss_id)?
@@ -573,7 +554,21 @@ impl DsparkTrainer {
             &mut self.optim,
             &mut self.store,
         )?;
-        self.baseline_ema = next_baseline;
+        // Telemetry only — the objective is fully supervised, so this EMA no
+        // longer feeds any gradient. It is the number that says whether training
+        // is helping: per-token accept rate under the loss's position weighting.
+        let accept: f32 = row_accepted
+            .iter()
+            .zip(&token_weights)
+            .map(|(&r, &w)| r * w)
+            .sum::<f32>()
+            / weight_sum;
+        self.accept_ema = if self.steps == 0 {
+            accept
+        } else {
+            (1.0 - self.config.baseline_ema_alpha) * self.accept_ema
+                + self.config.baseline_ema_alpha * accept
+        };
         self.steps += 1;
         // ISO: polar-retract both frames back onto the orthonormal manifold, so
         // σ(U diag(Σ₀) Vᵀ) = Σ₀ exactly.
@@ -696,12 +691,10 @@ impl DsparkTrainer {
             match self.train_step(&batch) {
                 Ok(loss) => {
                     let steps = self.steps;
-                    // `pm_alpha` rides along with the drift: only the PG half of
-                    // the objective is the RLVR regime ISO's fixed-spectrum
-                    // premise was observed in, so a drift number is only
-                    // interpretable next to how much of the step was dense
-                    // self-distillation. Emitted on both ISO on/off (the probe
-                    // fills `last_iso_drift` each cadence), so the α-sweep reads it.
+                    // `pm_alpha` rides along with the drift so an α-sweep can
+                    // read whether drift scales with the dense fraction.
+                    // Emitted on both ISO on/off — the probe fills
+                    // `last_iso_drift` each cadence either way.
                     let iso = match self.last_iso_drift.as_slice() {
                         [] => String::new(),
                         drift => format!(
@@ -716,7 +709,7 @@ impl DsparkTrainer {
                     };
                     eprintln!(
                         "dspark_train: step={steps} loss={loss:.4} accept_ema={:.4} n={}{iso}",
-                        self.baseline_ema,
+                        self.accept_ema,
                         batch.len()
                     );
                     if steps.is_multiple_of(self.config.swap_every) {
@@ -817,7 +810,7 @@ impl Drop for DsparkTrainSidecarGuard {
 /// Spawn the DSpark train sidecar thread.
 ///
 /// Drains the experience buffer populated by the CUDA inference hot path, runs
-/// acceptance-weighted updates on the Markov head, and pushes updated weights
+/// supervised updates on the Markov head, and pushes updated weights
 /// back into the running engine via
 /// [`LoadedInferenceEngine::update_dspark_markov_weights`].
 ///
