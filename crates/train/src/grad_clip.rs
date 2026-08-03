@@ -25,8 +25,11 @@ pub fn compute_global_norm_f64(params: &[TensorId], store: &TensorStore) -> f64 
         let Some(grad) = store.get(grad_id) else {
             continue;
         };
-        if store.backend().device() != Device::Cpu
-            && grad.dirty != Dirty::Host
+        // Route on where the grad actually lives, not on which backend we are:
+        // `ChunkSum` allocates its accumulator device-resident on every backend, so
+        // a CPU-backend grad can carry a handle and an EMPTY `data` — reading `data`
+        // then silently contributes 0 (2026-08-04: the f32 gate anchor read 0.0).
+        if grad.dirty != Dirty::Host
             && let Some(handle) = grad.device_handle.as_ref()
         {
             total_sq_norm += store
@@ -125,7 +128,7 @@ pub fn clip_grad_norm(params: &[TensorId], max_norm: f32, store: &mut TensorStor
             let Some(grad) = store.get(grad_id) else {
                 continue;
             };
-            if store.backend().device() != Device::Cpu && grad.dirty != Dirty::Host {
+            if grad.dirty != Dirty::Host {
                 grad.device_handle
                     .as_ref()
                     .map(|handle| (handle.clone(), grad.shape.clone()))

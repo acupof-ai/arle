@@ -252,3 +252,35 @@ fn non_finite_max_norm_is_noop() {
         }
     }
 }
+
+/// A grad can be device-resident on the CPU backend too — `ChunkSum` allocates
+/// its accumulator that way, so `data` is empty and only the handle is real.
+/// Reading `data` there silently contributes 0 to the norm and scales nothing
+/// when clipping (2026-08-04: the CP gate's f32 anchor read exactly 0.0).
+#[test]
+fn cpu_backend_device_resident_grad_is_counted_and_clipped() {
+    let mut store = TensorStore::default();
+    let param = store.alloc(Tensor::new(vec![0.0; 4], vec![4], true).expect("param"));
+    let handle = store
+        .backend()
+        .upload(&[1.0, 1.0, 1.0, 1.0], &[4])
+        .expect("device grad handle");
+    let grad = store
+        .alloc_device_tensor(vec![4], handle)
+        .expect("device grad tensor");
+    store.accumulate_grad(param, grad).expect("accumulate");
+
+    let params = [param];
+    let norm = train::grad_clip::compute_global_norm_f64(&params, &store);
+    assert!(
+        (norm - 2.0).abs() < 1.0e-6,
+        "device-resident grad on the CPU backend must count toward the norm, got {norm}"
+    );
+
+    clip_grad_norm(&params, 1.0, &mut store);
+    let clipped = train::grad_clip::compute_global_norm_f64(&params, &store);
+    assert!(
+        (clipped - 1.0).abs() < 1.0e-6,
+        "clipping must scale a device-resident grad, norm stayed {clipped}"
+    );
+}
