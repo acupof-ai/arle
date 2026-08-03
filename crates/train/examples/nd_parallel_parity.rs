@@ -3,9 +3,9 @@
 //! Exercises the REAL CP path on GPU — the ring KV forward, its backward, and the
 //! post-backward CP grad all-reduce — which no local (CPU) test can reach. The
 //! single-card reference and each CP rank run the same name-seeded (deterministic)
-//! LoRA model over the same trajectory; CP shards the sequence, so the returned
-//! loss is each rank's shard contribution scaled by `1/global_targets`. Summed
-//! over ranks it is the global-mean CE.
+//! LoRA model over the same trajectory; CP shards the sequence, and the writeback
+//! world-sums the shard partials before returning, so EVERY rank already reports
+//! the global-mean CE — the gate reads rank 0, it does not sum.
 //!
 //! The gate anchors on a CPU-f32 ground truth, NOT single-card byte-identity: both
 //! CUDA paths run bf16 attention (chunked-prefill kernel for single card, the ring
@@ -23,9 +23,9 @@
 //! L2 norms must agree. A pod 27B run had matching losses (spread 8.2e-4) but grad
 //! norms 3.744990 vs 1.984009 — a 1.89x break the loss-only gate could not see.
 //!
-//! Full-attention only: option-B CP shards full-attention; linear-attn CP is the
-//! deferred/unmeasured piece (see docs/nd-parallel-training-design.md), so it is
-//! out of this gate's scope.
+//! Full-attention by default; `ARLE_ND_HYBRID=1` swaps layer 0 to linear attention
+//! so the seq<->head all-to-all transport is covered too (48 of the real 27B's 64
+//! layers are GDN, so full-attn-only certifies the minority of the model).
 //!
 //! Run on a GPU host (>= 2 GPUs):
 //!   ARLE_ND_CUDA_DEVICES=4,5 \
@@ -164,23 +164,33 @@ fn coordinator_main() -> Result<()> {
         ensure!(status.success(), "CP rank {rank} exited {status:?}");
     }
 
-    // Each rank's returned loss is its shard's CE sum / global_targets; summed over
-    // ranks that is the global-mean CE the single card computes directly. The grad
-    // norm does NOT sum: `all_reduce_cp_grads` already summed the shard partials, so
-    // every rank holds the identical global grad — a spread across ranks is itself a
-    // reduce bug, so assert it before using rank 0's value as "the" CP norm.
-    let mut loss_cp = 0.0f32;
+    // Neither loss nor grad norm sums across ranks: the writeback world-sums the
+    // shard partials before returning (fe6cc2346) and `all_reduce_cp_grads` sums the
+    // grads, so every rank already holds the identical global value. A spread across
+    // ranks is itself a reduce bug — assert it, then use rank 0 as "the" CP value.
+    let mut losses_cp = Vec::with_capacity(CP_SIZE);
     let mut norms_cp = Vec::with_capacity(CP_SIZE);
     for rank in 0..CP_SIZE {
         let step = read_loss(&root, rank)?;
-        loss_cp += step.loss;
+        losses_cp.push(step.loss);
         norms_cp.push(step.norm);
     }
+    let loss_cp = losses_cp[0];
     let norm_cp = norms_cp[0];
-    let rank_spread = norms_cp
-        .iter()
-        .map(|n| (n - norm_cp).abs() / norm_cp.abs().max(1.0e-12))
-        .fold(0.0f64, f64::max);
+    let spread = |vals: &[f64], base: f64| {
+        vals.iter()
+            .map(|v| (v - base).abs() / base.abs().max(1.0e-12))
+            .fold(0.0f64, f64::max)
+    };
+    let loss_spread = spread(
+        &losses_cp.iter().map(|&l| l as f64).collect::<Vec<_>>(),
+        loss_cp as f64,
+    );
+    let rank_spread = spread(&norms_cp, norm_cp);
+    ensure!(
+        loss_spread <= TRACK_MARGIN as f64,
+        "post-reduce CP losses differ across ranks ({losses_cp:?}) — the world sum did not converge"
+    );
 
     println!(
         "nd_parallel_parity cp_size={CP_SIZE} devices={devices:?} seq={}",
@@ -201,7 +211,7 @@ fn coordinator_main() -> Result<()> {
         let denom = loss_f32.abs().max(1.0e-6);
         let cp_vs_f32 = (loss_cp - loss_f32).abs() / denom;
         let single_vs_f32 = (loss_single - loss_f32).abs() / denom;
-        println!("loss_f32={loss_f32:.9e} loss_single={loss_single:.9e} loss_cp_sum={loss_cp:.9e}");
+        println!("loss_f32={loss_f32:.9e} loss_single={loss_single:.9e} loss_cp={loss_cp:.9e}");
         println!(
             "cp_vs_f32={cp_vs_f32:.3e} single_vs_f32={single_vs_f32:.3e} margin={TRACK_MARGIN:.1e}"
         );
@@ -240,7 +250,7 @@ fn coordinator_main() -> Result<()> {
     let denom = loss_single.abs().max(loss_cp.abs()).max(1.0e-6);
     let rel_err = (loss_single - loss_cp).abs() / denom;
     println!(
-        "loss_single={loss_single:.9e} loss_cp_sum={loss_cp:.9e} rel_err={rel_err:.3e} bf16_tol={BF16_REL_TOL:.1e} (liveness + gross-error gate; f32 ref skipped at seq>{F32_REF_MAX_SEQ})"
+        "loss_single={loss_single:.9e} loss_cp={loss_cp:.9e} rel_err={rel_err:.3e} bf16_tol={BF16_REL_TOL:.1e} (liveness + gross-error gate; f32 ref skipped at seq>{F32_REF_MAX_SEQ})"
     );
     ensure!(
         rel_err <= BF16_REL_TOL,
