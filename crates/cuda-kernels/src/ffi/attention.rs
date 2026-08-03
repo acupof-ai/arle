@@ -263,6 +263,54 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    /// FA3 pair-route ring merge (`csrc/attention/ring_fa3_merge.cu`): fold one
+    /// pair's NORMALIZED FA3 (o, lse) — block stats (m = lse, l = 1) — into the
+    /// running (M, L, O) accumulators IN PLACE (caller passes fresh copies).
+    /// `acc_*` full head-major `[tiles, seq(, d)]`; `lse_pair`/`o_pair` compact
+    /// `[heads, run_len(, d)]`; run rows `[run_start, run_start+run_len)` of
+    /// tiles `[tile_base, tile_base+num_heads)`.
+    pub fn ring_fa3_merge_pair_cuda(
+        acc_m: *mut f32,
+        acc_l: *mut f32,
+        acc_o: *mut f32,
+        lse_pair: *const f32,
+        o_pair: *const Half,
+        num_heads: i32,
+        tile_base: i32,
+        seq_len: i32,
+        run_start: i32,
+        run_len: i32,
+        head_dim: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    /// Gather one run's rows of the full `[tiles, seq]` lse into the compact
+    /// `[heads, run_len]` layout FA3's bwd expects (it takes no lse stride).
+    pub fn ring_fa3_gather_lse_cuda(
+        dst: *mut f32,
+        lse: *const f32,
+        num_heads: i32,
+        tile_base: i32,
+        seq_len: i32,
+        run_start: i32,
+        run_len: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    /// `dst[run rows] += bf16(src)`: accumulate a pair's compact
+    /// `[heads, run_len, d]` bf16 grad into the full head-major f32 buffer.
+    pub fn ring_fa3_accum_grad_bf16_cuda(
+        dst: *mut f32,
+        src: *const Half,
+        num_heads: i32,
+        tile_base: i32,
+        seq_len: i32,
+        run_start: i32,
+        run_len: i32,
+        head_dim: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     /// Hand-written FA2-style forward attention for sm_70 (V100). BF16 I/O,
     /// FP16 (half2) internal math, FP32 accumulation. Tiled online softmax
     /// (Br=8 Q tokens, Bc=16 KV tiles), causal chunked-prefill semantics.
