@@ -820,7 +820,7 @@ unsafe extern "C" {
 }
 
 // ============================================================================
-// FA3 hopper fwd shim (hdim256/bf16/sm_90a) — vendored Dao-AILab
+// FA3 hopper fwd + bwd shim (hdim256/bf16/sm_90a) — vendored Dao-AILab
 // flash-attention @ fc8cbad6, torch-free C ABI in
 // `csrc/attention/arle_fa3_shim.cu`. Build opt-in via ARLE_CUDA_ENABLE_FA3;
 // without it the stub returns `cudaErrorNotSupported` and the marker returns
@@ -898,9 +898,78 @@ pub struct ArleFa3FwdHd256Args {
     pub v_page_stride: i64,
 }
 
+/// Mirror of `ArleFa3BwdHd256Args` in `csrc/attention/arle_fa3_shim.cu`.
+/// Backward substrate: NON-varlen, NON-paged, batch=1 contiguous `[S, h, d]`
+/// bf16 views; no dropout/softcap, deterministic=false. All scratch is
+/// caller-provided; sizes use the hdim256 sm90 bwd tiles kBlockM=64 /
+/// kBlockN=80: `sq_r = round_up(seqlen_q, 64)`, `sk_r = round_up(seqlen_k,
+/// 80)`. dq_accum/dq_semaphore are zeroed by the bwd preprocess kernel;
+/// dk/dv_accum are memset to zero by the shim (upstream at::zeros semantics).
+#[repr(C)]
+pub struct ArleFa3BwdHd256Args {
+    pub q: *const Half,
+    pub k: *const Half,
+    pub v: *const Half,
+    /// Forward output, needed to recompute dP_sum.
+    pub o: *const Half,
+    pub dout: *const Half,
+    /// fp32 `num_heads * seqlen_q` from the forward.
+    pub softmax_lse: *const f32,
+    pub dq: *mut Half,
+    pub dk: *mut Half,
+    pub dv: *mut Half,
+    /// fp32 scratch, `num_heads * sq_r` elements.
+    pub softmax_d: *mut f32,
+    /// fp32 scratch, `num_heads * sq_r` elements.
+    pub softmax_lse_log2: *mut f32,
+    /// fp32 scratch, `num_heads * sq_r * 256` elements.
+    pub dq_accum: *mut f32,
+    /// fp32 scratch, `num_heads_k * sk_r * 256` elements; GQA only, else null.
+    pub dk_accum: *mut f32,
+    /// fp32 scratch, `num_heads_k * sk_r * 256` elements; GQA only, else null.
+    pub dv_accum: *mut f32,
+    /// i32 scratch, `ceil(seqlen_q / 64) * num_heads` elements.
+    pub dq_semaphore: *mut i32,
+    pub softmax_d_capacity: i64,
+    pub softmax_lse_log2_capacity: i64,
+    pub dq_accum_capacity: i64,
+    pub dk_accum_capacity: i64,
+    pub dv_accum_capacity: i64,
+    pub dq_semaphore_capacity: i64,
+    pub seqlen_q: i32,
+    pub seqlen_k: i32,
+    pub num_heads: i32,
+    pub num_heads_k: i32,
+    /// Must be 256.
+    pub head_dim: i32,
+    pub q_row_stride: i64,
+    pub k_row_stride: i64,
+    pub v_row_stride: i64,
+    pub o_row_stride: i64,
+    pub do_row_stride: i64,
+    pub dq_row_stride: i64,
+    pub dk_row_stride: i64,
+    pub dv_row_stride: i64,
+    pub q_head_stride: i64,
+    pub k_head_stride: i64,
+    pub v_head_stride: i64,
+    pub o_head_stride: i64,
+    pub do_head_stride: i64,
+    pub dq_head_stride: i64,
+    pub dk_head_stride: i64,
+    pub dv_head_stride: i64,
+    pub softmax_scale: f32,
+    pub is_causal: i32,
+}
+
 unsafe extern "C" {
     pub fn arle_fa3_fwd_hd256_bf16_cuda(
         args: *const ArleFa3FwdHd256Args,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn arle_fa3_bwd_hd256_bf16_cuda(
+        args: *const ArleFa3BwdHd256Args,
         stream: CUstream,
     ) -> CUresult;
 
