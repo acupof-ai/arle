@@ -262,6 +262,16 @@ pub enum TapeDtype {
     Bf16,
 }
 
+impl TapeDtype {
+    /// NVRTC prelude injected ahead of the kernel sources to bind `T`.
+    pub fn nvrtc_prelude(self) -> &'static str {
+        match self {
+            TapeDtype::F32 => "using T = float;\n",
+            TapeDtype::Bf16 => "#include <cuda_bf16.h>\nusing T = __nv_bfloat16;\n",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct TensorStore {
     pub tensors: Vec<Option<Tensor>>,
@@ -292,6 +302,7 @@ impl TensorStore {
 
     pub fn set_tape_dtype(&mut self, dtype: TapeDtype) {
         self.tape_dtype = dtype;
+        self.backend.set_tape_dtype(dtype);
     }
 
     pub fn tape_dtype(&self) -> TapeDtype {
@@ -1098,6 +1109,14 @@ fn shape_size(shape: &[usize]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nvrtc_prelude_binds_t_per_dtype() {
+        assert_eq!(TapeDtype::F32.nvrtc_prelude(), "using T = float;\n");
+        let bf16 = TapeDtype::Bf16.nvrtc_prelude();
+        assert!(bf16.starts_with("#include <cuda_bf16.h>\n"));
+        assert!(bf16.ends_with("using T = __nv_bfloat16;\n"));
+    }
 
     #[test]
     fn alloc_free_reuses_slot() {

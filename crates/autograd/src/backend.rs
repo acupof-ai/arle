@@ -467,6 +467,13 @@ pub enum CommAxis {
 pub trait Backend: std::fmt::Debug + Send + Sync {
     fn device(&self) -> Device;
 
+    /// Activation storage dtype for tape-saved tensors; CPU stays f32 (parity oracle).
+    fn set_tape_dtype(&self, _dtype: crate::TapeDtype) {}
+
+    fn tape_dtype(&self) -> crate::TapeDtype {
+        crate::TapeDtype::F32
+    }
+
     /// Drain all in-flight GPU work on this backend's device context
     /// (`cuCtxSynchronize` for CUDA). Default no-op for host/CPU backends.
     ///
