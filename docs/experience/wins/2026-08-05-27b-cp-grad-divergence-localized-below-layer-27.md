@@ -44,24 +44,53 @@ region — was tested and **fails**. Toy hybrid, cp=2, `grad_cp_vs_f32` /
 At the 27B's own depth of 64 the toy CP arm is 4.2e-3 from the f32 anchor — three
 orders below the 89% break, and non-monotone, i.e. noise. Depth is ruled out.
 
+## The 27B seq axis
+
+Same run at `--synthetic-writeback-seq 4096`: **7.251241 vs 5.382694 = 1.347×**,
+identical shape — layers 43–63 at parity (≤0.2%), 3–23 at 1.34–1.40. Both the
+amplitude and the onset depth scale with sequence length (onset layer 39 at
+seq 4096, layer 27 at seq 32768).
+
+## Three axes ruled out on the toy
+
+`nd_parallel_parity`, hybrid, cp=2, `grad_cp_vs_single`:
+
+| | depth 16 | 32 | 48 | **64** |
+|---|---|---|---|---|
+| cp vs f32 | 2.18e-2 | 1.17e-3 | 4.63e-4 | **4.20e-3** |
+
+| depth 64, seq | 512 | 2048 | 8192 | **32768** |
+|---|---|---|---|---|
+| cp vs single | (f32 arm) 1.1e-2 | 1.2e-2 | 3.94e-3 | **4.76e-4** |
+
+| depth 64, `ARLE_FORCE_CHECKPOINT` | off | on |
+|---|---|---|
+| seq 2048, cp vs f32 | 1.225e-2 | 1.225e-2 |
+| seq 32768, cp vs single | 4.760e-4 | 4.760e-4 |
+
+**At the 27B's own depth (64) and sequence (32768), with checkpoint offload
+forced on, the toy CP arm is 4.8e-4 from single card** — three orders below the
+89% break, and checkpointing is a wash to 7 digits. Depth, sequence length, and
+offload/recompute are each ruled out, individually and together.
+
 ## What is left
 
-The 27B differs from the toy on: FP8 base weights, MoE, real data, seq 32768 —
-and **checkpoint offload, which `[ckpt-gate] engage=true` confirms is live on the
-27B run and never engages on the toy.** Offload/recompute is also the only
-candidate whose effect would accumulate along the backward pass, matching the
-observed shape. An earlier seq=1024 probe shrank the gap 3.3×, which points the
-same way.
+FP8 base weights, MoE MLPs, the real corpus and its target mask, the real GQA
+head geometry and per-layer RoPE theta, and the 48-GDN/16-full **interleave**
+(the toy stacks 63 GDN layers under one full-attn layer rather than alternating
+1-in-4).
 
 ## Rule
 
-A null result on an axis bounds only the range you actually swept — and when you
-extend the sweep, re-check before publishing the extrapolation. "Depth 16 was
-inside the flat region" was a clean, plausible story that measurement killed in
-one run.
+A null result bounds only the range you swept — and when you extend the sweep,
+re-check before publishing the extrapolation. "Depth 16 was inside the flat
+region" was a clean, plausible story that one run killed; "checkpoint offload is
+the only thing that accumulates along the backward" was the next one, killed by
+a 7-digit wash.
 
 ## Next
 
-27B cp=1 vs cp=2 at a seq below the checkpoint-gate threshold (`engage=false` in
-the log). If the per-layer ratios flatten, the bug is in the chunked
-recompute/offload backward under CP, not in the CP collectives.
+Per-**layer** hidden-state grad norms on the 27B at cp=1 vs cp=2, not just the
+every-4th-layer LoRA sample. That names the exact layer where the two arms part
+and whether the step happens at a GDN layer, a full-attn layer, or the MoE MLP —
+which the current instrument cannot distinguish.
