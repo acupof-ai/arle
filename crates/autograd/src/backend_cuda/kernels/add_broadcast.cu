@@ -8,9 +8,9 @@
 //
 // Grid/block: 1-D, one thread per output element.
 extern "C" __global__ void add_broadcast_f32(
-    const float* __restrict__ a,
-    const float* __restrict__ b,
-    float* __restrict__ out,
+    const T* __restrict__ a,
+    const T* __restrict__ b,
+    T* __restrict__ out,
     const int* __restrict__ out_shape,
     const int* __restrict__ b_strides,
     int out_rank,
@@ -26,15 +26,15 @@ extern "C" __global__ void add_broadcast_f32(
         linear /= dim;
         b_off += coord * b_strides[d];
     }
-    out[idx] = a[idx] + b[b_off];
+    out[idx] = static_cast<T>(static_cast<float>(a[idx]) + static_cast<float>(b[b_off]));
 }
 
 // Right-aligned broadcast-copy: out[i] = src[broadcast_offset(i)]. Same stride
 // convention as add_broadcast_f32's `b`, minus the zero `a` operand — a pure
 // expand for GQA repeat_kv (no zeroed carrier, output written in full).
 extern "C" __global__ void broadcast_copy_f32(
-    const float* __restrict__ src,
-    float* __restrict__ out,
+    const T* __restrict__ src,
+    T* __restrict__ out,
     const int* __restrict__ out_shape,
     const int* __restrict__ src_strides,
     int out_rank,

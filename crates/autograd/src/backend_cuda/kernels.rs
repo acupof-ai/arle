@@ -206,7 +206,6 @@ impl KernelCache {
         ))
     }
 
-    #[allow(dead_code)]
     pub(super) fn function_for(
         &self,
         name: &'static str,
@@ -496,12 +495,8 @@ where
 
 #[cfg(not(feature = "no-cuda"))]
 fn concat_sources(dtype: TapeDtype) -> String {
-    let prelude = match dtype {
-        TapeDtype::F32 => "using T = float;\n",
-        TapeDtype::Bf16 => "#include <cuda_bf16.h>\nusing T = __nv_bfloat16;\n",
-    };
     let mut src = [
-        prelude,
+        dtype.nvrtc_prelude(),
         ELEMENTWISE_CU,
         SOFTMAX_CU,
         SILU_CU,
