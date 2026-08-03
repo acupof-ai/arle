@@ -107,18 +107,27 @@ fn nd_seq() -> usize {
         .unwrap_or(16)
 }
 
-// `ARLE_ND_HYBRID=1` swaps layer 0 to linear attention, whose CP transport is the
-// seq↔head all-to-all, not the ring — the real 27B is 48/64 GDN, so a full-attn-only
-// gate certifies the minority of the model.
+// `ARLE_ND_HYBRID=1` makes every layer but the last linear attention, whose CP
+// transport is the seq↔head all-to-all, not the ring — the real 27B is 48/64 GDN,
+// so a full-attn-only gate certifies the minority of the model. `ARLE_ND_LAYERS=n`
+// sets depth (default 2): the GDN CP path shows a systematic grad bias, and depth
+// is how you tell a per-layer constant from one that compounds toward the real 48.
 #[cfg(all(feature = "cuda", feature = "nccl"))]
 fn nd_layer_types() -> Vec<LayerType> {
+    let depth = std::env::var("ARLE_ND_LAYERS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(2)
+        .max(1);
     let hybrid = std::env::var("ARLE_ND_HYBRID").is_ok_and(|v| v.trim() == "1");
-    let first = if hybrid {
+    let lead = if hybrid {
         LayerType::LinearAttention
     } else {
         LayerType::FullAttention
     };
-    vec![first, LayerType::FullAttention]
+    let mut types = vec![lead; depth - 1];
+    types.push(LayerType::FullAttention);
+    types
 }
 
 #[cfg(all(feature = "cuda", feature = "nccl"))]
