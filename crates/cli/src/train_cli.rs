@@ -2760,6 +2760,7 @@ fn run_agent_opd_replay(
         Vec::new()
     };
     let (mut store, train_backend, backend_label) = build_opd_store(args.backend)?;
+    store.set_tape_dtype(args.tape_dtype.as_tape_dtype());
 
     eprintln!(
         "[arle train agent-opd] replay: {} record(s) from {} on {backend_label} (no rollout engine)",
@@ -3025,6 +3026,7 @@ fn run_agent_opd_impl(args: TrainAgentOpdArgs) -> Result<()> {
         .context("launch pre-CUDA sandbox-spawner helper")?;
 
     let (mut store, train_backend, _backend_label) = build_opd_store(args.backend)?;
+    store.set_tape_dtype(args.tape_dtype.as_tape_dtype());
 
     // Vocab from the checkpoint config (not the autograd student) so the rollout
     // engine can load BEFORE the autograd student when `--share-frozen-base` is
