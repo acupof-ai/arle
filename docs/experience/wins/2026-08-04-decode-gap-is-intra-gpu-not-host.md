@@ -59,26 +59,34 @@ replay**:
 | intra-GPU idle / step | ~4.3 ms | 1.68 ms |
 | **idle per launch** | **~4.0 µs** | **~1.8 µs** |
 
-## What this makes the lever
+## What the lever is NOT
 
-**Launch count** — which reverses the priority call in the superseded version.
-That version measured a norm+residual fusion opportunity at 0.156 ms of kernel
-time and dismissed it as "an order below the actual lever". At ~4 µs of dead
-time per launch it is worth its kernel time *plus* its dispatch gap:
+The first version of this section proposed **launch count**: ARLE runs 1059
+launches to SGLang's 928, so at 4.3 ms ÷ 1059 ≈ 4 µs of dead time per launch,
+fusing kernels should return real time.
 
-| fusion | launches cut | kernel ms | + gap @4 µs | total |
-|---|---:|---:|---:|---:|
-| residual add into RMSNorm (SGLang ships `FusedAddRMSNormKernel`) | 128 | 0.156 | 0.51 | **~0.67** |
-| conv1d prefill+state_update → one kernel | 48 | 0.074 | 0.19 | ~0.26 |
-| split2 / split_qkv | 64 | 0.066 | 0.26 | ~0.33 |
+**That was tested and refuted the same day.** Fusing every residual-add +
+RMSNorm pair in all three layer loops removed **192 launches per step** and
+moved the GPU wall by 0.00 ms (18.973 → 18.978/19.006). Full account in
+[2026-08-04-launch-count-is-not-the-decode-lever](../errors/2026-08-04-launch-count-is-not-the-decode-lever.md);
+that tranche is reverted and the conv1d and split fusions queued behind it are
+dead on the same evidence.
 
-Against a measured 1.91 ms residual gap (18.98 vs 17.07), those three are the
-whole thing. None is invention: SGLang runs 128 fused norm+add where ARLE runs
-256 separate kernels, and one `_causal_conv1d_update` where ARLE runs two.
+**4 µs/launch was a quotient, not a rate.** Removing 18% of the launches
+removed none of the idle.
 
-The 4 µs/launch figure is a derived average (idle ÷ launches), not a measured
-per-node cost — it sets the ranking, and each fusion still needs its own
-matched A/B before it is licensed.
+## What is still open
+
+The ~4.3 ms/step of intra-GPU idle (GPU wall 18.97 vs Σ kernel ~14.7) is now
+bounded from two sides and explained by neither:
+
+- **not host time** — 0.061 ms, measured directly above
+- **not per-launch dispatch** — 192 launches removed, 0.00 ms returned
+
+The remaining candidates are things a kernel-duration sum already counts as
+"busy" or cannot see: dependency serialization between adjacent kernels, tail
+effects on small grids, memory-system stalls. That needs `ncu` on the replayed
+graph, not another fusion.
 
 ## Rule
 
