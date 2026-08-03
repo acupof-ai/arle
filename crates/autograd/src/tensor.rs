@@ -254,6 +254,14 @@ impl CheckpointOffloadPool {
     }
 }
 
+/// Storage dtype for activation tensors saved on the tape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TapeDtype {
+    #[default]
+    F32,
+    Bf16,
+}
+
 #[derive(Debug)]
 pub struct TensorStore {
     pub tensors: Vec<Option<Tensor>>,
@@ -261,6 +269,7 @@ pub struct TensorStore {
     backend: Arc<dyn Backend>,
     checkpoint_offload_pool: CheckpointOffloadPool,
     checkpoint_l3: Option<CheckpointL3>,
+    tape_dtype: TapeDtype,
 }
 
 impl Default for TensorStore {
@@ -277,7 +286,16 @@ impl TensorStore {
             backend,
             checkpoint_offload_pool: CheckpointOffloadPool::default(),
             checkpoint_l3: CheckpointL3::from_env(),
+            tape_dtype: TapeDtype::F32,
         }
+    }
+
+    pub fn set_tape_dtype(&mut self, dtype: TapeDtype) {
+        self.tape_dtype = dtype;
+    }
+
+    pub fn tape_dtype(&self) -> TapeDtype {
+        self.tape_dtype
     }
 
     pub fn backend(&self) -> &dyn Backend {
