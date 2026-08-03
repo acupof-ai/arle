@@ -96,7 +96,7 @@ serve_model_dir() {
   python3 - "$1" <<'PY'
 import os, sys
 args = [os.fsdecode(x) for x in open(sys.argv[1], "rb").read().split(b"\0") if x]
-if not args or args[0] != "serve": raise SystemExit(0)
+if "serve" not in args: raise SystemExit(0)
 i = 0
 while i < len(args):
     a = args[i]
@@ -220,14 +220,18 @@ PY
             # serve (and every later boot) hits the warm page cache. Local dir
             # only (HF-ID model-paths resolve elsewhere); skip if already pinned.
             model_dir="$(serve_model_dir "$DIR/argv.nul" 2>/dev/null || true)"
-            # Anchor the pgrep to the exact dir at end-of-cmdline (real pin procs
-            # end in the model_dir): a bare substring would let an already-pinned
-            # /host/DSv4 suppress the pin of a prefix path like /host/DS.
-            pin_re="pin_model_cache\.py $(printf '%s' "$model_dir" | sed 's/[][\\.^$*+?(){}|]/\\&/g')\$"
-            if [ -n "$model_dir" ] && [ -d "$model_dir" ] && ! pgrep -f "$pin_re" >/dev/null; then
-              setsid nohup python3 "$TREE/scripts/pin_model_cache.py" "$model_dir" \
-                >"$STATE/pin-model-cache.log" 2>&1 </dev/null &
-              echo "auto-pin: launched for $model_dir (log: $STATE/pin-model-cache.log)"
+            # Match the exact dir at end-of-arg (cmdline-end OR a trailing flag
+            # like --glob), so a pinned /host/DSv4 never suppresses /host/DS and
+            # a manual pin with trailing flags still counts. flock serializes the
+            # check+fork so two concurrent runs of one model can't double-pin.
+            pin_dir_re="$(printf '%s' "$model_dir" | sed 's/[][\\.^$*+?(){}|]/\\&/g')"
+            if [ -n "$model_dir" ] && [ -d "$model_dir" ]; then
+              flock "$STATE/.pin.lock" bash -c '
+                pgrep -f "pin_model_cache\.py $1( |\$)" >/dev/null && exit 0
+                setsid nohup python3 "$2/scripts/pin_model_cache.py" "$3" \
+                  >"$4/pin-model-cache.log" 2>&1 </dev/null &
+                echo "auto-pin: launched for $3 (log: $4/pin-model-cache.log)"
+              ' _ "$pin_dir_re" "$TREE" "$model_dir" "$STATE"
             fi
             if [ "${#selected_gpus[@]}" -eq 1 ]; then
               CUDA_VISIBLE_DEVICES="$selected_gpu" INFER_CUDA_DEVICE=0 python3 "$TREE/scripts/reap_run.py" "$OP" --argv-file "$DIR/argv.nul" "$binary"; rc=$?
