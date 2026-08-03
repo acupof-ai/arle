@@ -1,5 +1,11 @@
 # Full-chain bf16 mixed-precision training — design + implementation spec
 
+> **STATUS 2026-08-03 — SUPERSEDED by the shipped `--tape-dtype` design**
+> (commits 23e03e590 / 42dcd537f / f2f6e5aea / 8f6deb43f): kernel templating via
+> dtype-keyed NVRTC injection, flag surface on agent-opd + opd + self-opd. The pod
+> A/B ladder is pending and MUST include the checkpoint-path no-op probe from
+> `docs/experience/errors/2026-07-27-tape-bf16-noop-on-checkpoint-path.md`.
+
 > **STATUS 2026-07-25.** S0 (config) + S1a (frozen prefix K/V) SHIPPED & correct
 > (loss byte-identical, needle 5/5 DET). **S1a REJECTED as a VRAM lever** — on
 > Qwen3.6-27B the frozen K/V is 0.13 MB/tok (16 full-attn layers of 64), ~400×
