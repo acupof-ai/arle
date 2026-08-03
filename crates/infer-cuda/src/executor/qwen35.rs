@@ -189,6 +189,11 @@ pub(crate) struct Qwen35CudaExecutor {
     /// and re-`None`d whenever baked addresses go stale: OPD weight
     /// offload/reload, student-LoRA re-merge).
     decode_graph: Option<Qwen35DecodeGraph>,
+    /// Per-slot fixed-capacity page-table metadata for the PAGED decode-graph
+    /// lane ([`crate::loader::PageMeta::persistent_decode`]): device addresses
+    /// are capture-stable, contents refresh each step outside the graph.
+    /// Empty until the lane first runs.
+    paged_decode_meta: Vec<Option<crate::loader::PageMeta>>,
     /// Lazily-built batched rows>1 decode state: a dedicated `[*, B]`
     /// workspace plus per-layer recurrent-state pointer tables (see
     /// [`crate::qwen35::Qwen35BatchDecodeState`]). `None` until the first
@@ -938,6 +943,7 @@ impl Qwen35CudaExecutor {
             num_slots,
             decode_graph_armed,
             decode_graph: None,
+            paged_decode_meta: Vec::new(),
             batch_decode: None,
             kv_recall: false,
             recall_cfg: crate::recall::default_recall_config(),
@@ -2627,6 +2633,150 @@ impl Qwen35CudaExecutor {
         Ok(Some(token))
     }
 
+    /// Whole-step decode graph over the PAGED pool (the serving default): the
+    /// same per-slot capture/replay lane as [`Self::try_graph_decode`], with
+    /// the growing page table absorbed by a fixed-capacity per-slot
+    /// [`crate::loader::PageMeta::persistent_decode`] refreshed outside the
+    /// graph, and FA3's scheduling ceiling pinned via `seqlen_k_capture`.
+    /// Returns `Ok(None)` on any gate miss (eager fallback); any
+    /// capture/replay failure permanently downgrades to eager.
+    fn try_graph_decode_paged(
+        &mut self,
+        row: &DecodeRow,
+        position: u64,
+        host_kv: &dyn KvPool,
+    ) -> Result<Option<(u32, Option<f32>)>> {
+        if !self.decode_graph_armed
+            || !self.paged_kv_bf16()
+            || !self.model.paged_decode_fa3_active()
+        {
+            return Ok(None);
+        }
+        if row.kv_seq_len + 1 > self.model.max_seq_len() {
+            return Ok(None);
+        }
+        let slot = row.slot;
+        {
+            let pool = self
+                .full_attn_kv
+                .as_ref()
+                .expect("full_attn_kv present (full_attn_paged)");
+            ensure!(
+                pool.seq_len(slot) == row.kv_seq_len,
+                "Qwen3.6 paged decode graph: pool seq_len {} != kv_seq_len {} for slot {}",
+                pool.seq_len(slot),
+                row.kv_seq_len,
+                slot
+            );
+        }
+        // Host-side pool advance (page alloc + mirror) — identical to the eager
+        // paged path, idempotent if the eager fallback re-runs it.
+        self.mirror_host_slot(host_kv, slot, row.kv_seq_len + 1)?;
+        if self.decode_graph.is_none() {
+            self.decode_graph = Some(Qwen35DecodeGraph::new(
+                self.num_slots,
+                &self.model.ctx.stream,
+            ));
+        }
+        if self.paged_decode_meta.is_empty() {
+            self.paged_decode_meta = (0..self.num_slots).map(|_| None).collect();
+        }
+        {
+            let pool = self.full_attn_kv.as_ref().expect("full_attn_kv present");
+            let capacity = self.model.max_seq_len().div_ceil(pool.page_size);
+            let meta = match &mut self.paged_decode_meta[slot] {
+                Some(meta) => meta,
+                none => none.insert(crate::loader::PageMeta::persistent_decode(
+                    &self.model.ctx,
+                    pool.page_size,
+                    capacity,
+                )?),
+            };
+            meta.refresh_decode(&self.model.ctx, pool, slot, row.kv_seq_len)?;
+        }
+        let Self {
+            model,
+            slots,
+            decode_graph,
+            paged_decode_meta,
+            full_attn_kv,
+            ..
+        } = self;
+        let dg = decode_graph
+            .as_mut()
+            .expect("decode_graph built above when armed");
+        let Qwen35DecodeGraph { ws, graphs, baked } = dg;
+        let (token_ids_ptr, start_pos_ptr) =
+            model.stage_step_inputs(ws, &[row.last_token], row.kv_seq_len)?;
+        let logits_ptr = model.workspace_logits_ptr(ws)?;
+        let bake = Qwen35GraphBake {
+            token_ids_ptr,
+            start_pos_ptr,
+            logits_ptr,
+            ws_epoch: ws.epoch(),
+        };
+        match baked[slot] {
+            Some(prev) if prev != bake => {
+                info!(
+                    "[qwen35-decode-graph] paged slot {slot}: workspace addresses changed; \
+                     dropping stale capture and recapturing"
+                );
+                graphs[slot] = crate::graph::CudaGraphState::new(model.ctx.stream.clone());
+                baked[slot] = Some(bake);
+            }
+            None => baked[slot] = Some(bake),
+            _ => {}
+        }
+        let state = &mut graphs[slot];
+        let was_captured = state.is_captured();
+        let will_replay = was_captured && !state.is_armed_warm();
+        let slot_state = &mut slots[slot];
+        let pool = full_attn_kv.as_mut().expect("full_attn_kv present");
+        let meta = paged_decode_meta[slot]
+            .as_ref()
+            .expect("persistent meta built above");
+        let mut rc = crate::qwen35::Qwen35RecallForward {
+            pool,
+            meta,
+            layer0_query: None,
+        };
+        let run = state.run_or_capture(|| {
+            model.forward_decode_step_paged_captured(slot_state, ws, row.kv_seq_len, &mut rc)
+        });
+        if let Err(e) = run {
+            warn!(
+                "Qwen3.5 paged whole-step decode graph failed (slot {slot}), \
+                 downgrading to eager forward: {e}"
+            );
+            self.decode_graph_armed = false;
+            self.decode_graph = None;
+            self.paged_decode_meta.clear();
+            return Ok(None);
+        }
+        slots[slot].advance_seq_len(1);
+        let state = &self.decode_graph.as_ref().expect("still present").graphs[slot];
+        if !was_captured && state.is_captured() {
+            let captures =
+                QWEN35_GRAPH_CAPTURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            info!("[qwen35-decode-graph] captured PAGED slot {slot} (captures_total={captures})");
+        }
+        if will_replay {
+            let replays =
+                QWEN35_GRAPH_REPLAYS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if replays.is_multiple_of(100) {
+                info!(
+                    "[qwen35-decode-graph] paged replay_total={replays} captures_total={}",
+                    QWEN35_GRAPH_CAPTURES.load(std::sync::atomic::Ordering::Relaxed)
+                );
+            }
+        }
+        let dg = self.decode_graph.as_mut().expect("still present");
+        let token = self
+            .model
+            .sample_workspace_logits(&mut dg.ws, &row.params, position)?;
+        Ok(Some(token))
+    }
+
     /// Offload the model's device weights to host RAM (OPD teacher time-share),
     /// returning the device bytes freed. Per-slot KV / recurrent state is left
     /// resident — only the shared model weights move. The forward workspace is
@@ -3055,13 +3205,17 @@ impl Qwen35CudaExecutor {
         if self.recall_active() {
             return self.decode_row_recall(row, position, host_kv);
         }
-        // Default paged decode: append + attend the full resident page set. The
-        // whole-step decode-graph lane bakes per-step device addresses (the page
-        // table grows each step), so it is bypassed under the paged default —
-        // the paged forward IS the correctness floor; the graph lane (kept below
-        // for the legacy contiguous path) is a contiguous-cache optimization a
-        // later phase re-enables over a stable paged table.
+        // Default paged decode: append + attend the full resident page set.
+        // The whole-step graph lane runs first when armed — the growing page
+        // table is absorbed by per-slot persistent metadata refreshed outside
+        // the capture; the eager paged forward stays the correctness floor
+        // and the fallback for every gate miss.
         if self.full_attn_paged() {
+            if allow_graph
+                && let Some(token) = self.try_graph_decode_paged(row, position, host_kv)?
+            {
+                return Ok(token);
+            }
             return self.decode_row_paged_default(row, position, host_kv);
         }
         // Legacy contiguous path (no paged pool — e.g. OPD weight offload dropped
