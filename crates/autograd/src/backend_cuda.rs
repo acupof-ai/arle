@@ -11222,7 +11222,7 @@ mod tests {
             let v_h = up(v)?;
             let kpos_h = up(&kpos.iter().map(|&p| p as f32).collect::<Vec<_>>())?;
             let (m2, l2, o2) = backend.ring_block_fwd_merge(
-                &q_h, &k_h, &v_h, &acc_m, &acc_l, &acc_o, &qpos_h, &kpos_h, dims,
+                &q_h, &k_h, &v_h, &acc_m, &acc_l, &acc_o, &qpos_h, &kpos_h, &q_pos, kpos, dims,
             )?;
             acc_m = m2;
             acc_l = l2;
