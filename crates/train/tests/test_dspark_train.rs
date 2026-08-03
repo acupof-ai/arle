@@ -123,8 +123,6 @@ fn dspark_trainer_serve_frame_and_alignment() {
     let mut target_logits: Vec<f32> = (0..2 * V).map(|i| -0.2 * (i as f32) + 0.5).collect();
     target_logits.extend(vec![f32::NAN; V]); // last row: beyond trained pairs
 
-    // 1 of 2 trained rows accepted, so the two rows carry OPPOSITE-sign
-    // advantages — a chain-mean credit would give them the same one.
     let accepted = 1usize;
     let exp = DsparkExperience {
         draft_tokens: chain.clone(),
@@ -136,16 +134,12 @@ fn dspark_trainer_serve_frame_and_alignment() {
         next_token_heads: false,
     };
 
-    let ema_alpha = 0.5f32;
-    let baseline_init = 0.5f32;
-    let alpha = 0.5f32; // prob_match_alpha default
+    let alpha = 0.9f32; // α_tv
     let gamma = 4.0f32;
     let config = DsparkTrainConfig {
         markov_rank: R,
         learning_rate: 1e-4,
         batch_size: 1,
-        baseline_ema_alpha: ema_alpha,
-        baseline_init: Some(baseline_init),
         prob_match_alpha: alpha,
         loss_decay_gamma: Some(gamma),
         max_grad_norm: Some(1.0),
@@ -167,19 +161,17 @@ fn dspark_trainer_serve_frame_and_alignment() {
         let s: f32 = e.iter().sum();
         e.iter().map(|&v| v / s).collect::<Vec<f32>>()
     };
-    // Per-token credit: row t is accepted iff t < accepted (verify stops at the
-    // first rejection). Baseline centres the same weighted quantity.
-    let credit = |t: usize| f32::from(t < accepted);
-    let w_of = |t: usize| (-(t as f32) / gamma).exp();
-    let wsum_all: f32 = (0..block - 1).map(w_of).sum();
-    let mean_reward: f32 = (0..block - 1).map(|t| credit(t) * w_of(t)).sum::<f32>() / wsum_all;
-    let baseline = (1.0 - ema_alpha) * baseline_init + ema_alpha * mean_reward;
-    let (mut pg, mut pm, mut wsum) = (0.0f32, 0.0f32, 0.0f32);
+    let argmax = |x: &[f32]| {
+        x.iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .unwrap()
+            .0
+    };
+    let (mut ce, mut tv, mut wsum) = (0.0f32, 0.0f32, 0.0f32);
     for t in 0..block - 1 {
-        let adv = credit(t) - baseline;
         let j = t + 1; // same-position draft row
         let cond = chain[t] as usize;
-        let tok = chain[t + 1] as usize;
         let w = (-(t as f32) / gamma).exp();
         wsum += w;
         let corrected: Vec<f32> = (0..V)
@@ -189,17 +181,13 @@ fn dspark_trainer_serve_frame_and_alignment() {
             })
             .collect();
         let p = softmax(&corrected);
-        pg += -(p[tok].ln()) * adv * w;
         let q = softmax(&target_logits[t * V..(t + 1) * V]);
-        pm += w * p
-            .iter()
-            .zip(&q)
-            .map(|(&a, &b)| (a - b) * (a - b))
-            .sum::<f32>();
+        // CE label is the TRUNK's token, not the drafted one.
+        ce += -(p[argmax(&target_logits[t * V..(t + 1) * V])].ln()) * w;
+        // TV is an L1 SUM over vocab; only the token axis is averaged.
+        tv += w * p.iter().zip(&q).map(|(&a, &b)| (a - b).abs()).sum::<f32>();
     }
-    // PM is the per-token mean of the squared-L2 distribution distance (a
-    // sum over vocab), NOT averaged over vocab — matches dspark_train.rs.
-    let expected = (1.0 - alpha) * (pg / wsum) + alpha * (pm / wsum);
+    let expected = (1.0 - alpha) * (ce / wsum) + alpha * (tv / wsum);
     assert!(
         (loss - expected).abs() < 1e-4,
         "trainer loss {loss} != serve-frame reference {expected}"
@@ -208,8 +196,8 @@ fn dspark_trainer_serve_frame_and_alignment() {
 
 #[test]
 fn dspark_trainer_converges() {
-    // If we always give the same experience with full acceptance, the trainer
-    // should increase the log-prob of those tokens (loss decreases).
+    // Repeating one experience, the head should fit the trunk's distribution
+    // on it: both CE and TV fall.
     let config = DsparkTrainConfig {
         markov_rank: RANK,
         learning_rate: 0.1,
