@@ -1,9 +1,11 @@
-# `pod.sh run` auto-pins the serve model — the 25-min cold boot is now opt-out
+# `pod.sh run` auto-fires the serve model pin — no more forgotten first-command
 
 > Measured 2026-08-03 on the 8×H20 pod. `pod.sh run ... serve` fires an
-> idempotent `mlock` of the model dir before launch; verified +30.2 GB `Mlocked`
+> idempotent `mlock` of the model dir at launch; verified +30.2 GB `Mlocked`
 > == full Qwen3.6-27B-FP8, and a second serve of the same model forks **0** new
-> pin processes.
+> pin processes. NOT measured: the cold-boot wall-clock after automation — the
+> pin runs detached and the first serve races the 274 GB pre-read, so this
+> guarantees the *trigger* fires, not that the first boot is warm.
 
 ## Context
 
